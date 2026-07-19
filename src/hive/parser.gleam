@@ -7,7 +7,9 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import gleam/string
 import hive/ast
+import hive/lexer
 import hive/token.{type Token, Token}
 
 type Toks =
@@ -67,7 +69,9 @@ fn expect_ident(tokens: Toks) -> Result(#(String, Toks), String) {
     token.Ident(name) -> Ok(#(name, tail(tokens)))
     other ->
       Error(
-        "expected an identifier but found " <> token.describe(other) <> at(tokens),
+        "expected an identifier but found "
+        <> token.describe(other)
+        <> at(tokens),
       )
   }
 }
@@ -76,11 +80,22 @@ fn expect_ident(tokens: Toks) -> Result(#(String, Toks), String) {
 // Declarations
 // ---------------------------------------------------------------------------
 
-fn parse_decls(tokens: Toks, acc: List(ast.Decl)) -> Result(List(ast.Decl), String) {
+fn parse_decls(
+  tokens: Toks,
+  acc: List(ast.Decl),
+) -> Result(List(ast.Decl), String) {
   case kind(tokens) {
     token.Eof -> Ok(list.reverse(acc))
     token.KwProc -> {
       use #(decl, rest) <- result.try(parse_proc(tokens))
+      parse_decls(rest, [decl, ..acc])
+    }
+    token.KwFunc -> {
+      use #(decl, rest) <- result.try(parse_func(tokens))
+      parse_decls(rest, [decl, ..acc])
+    }
+    token.KwQuery -> {
+      use #(decl, rest) <- result.try(parse_query(tokens))
       parse_decls(rest, [decl, ..acc])
     }
     token.KwType -> {
@@ -89,23 +104,105 @@ fn parse_decls(tokens: Toks, acc: List(ast.Decl)) -> Result(List(ast.Decl), Stri
     }
     other ->
       Error(
-        "expected `proc` or `type` at the top level but found "
+        "expected `proc`, `func`, `query` or `type` at the top level but found "
         <> token.describe(other)
         <> at(tokens),
       )
   }
 }
 
-fn parse_proc(tokens: Toks) -> Result(#(ast.Decl, Toks), String) {
-  use t1 <- result.try(expect(tokens, token.KwProc))
+// Parses the shared `<kw> name(params): ReturnType` header.
+fn parse_header(
+  tokens: Toks,
+  kw: token.Kind,
+) -> Result(#(String, List(ast.Field), ast.TypeExpr, Toks), String) {
+  use t1 <- result.try(expect(tokens, kw))
   use #(name, t2) <- result.try(expect_ident(t1))
   use t3 <- result.try(expect(t2, token.LParen))
   use #(params, t4) <- result.try(parse_params(t3, []))
   use t5 <- result.try(expect(t4, token.RParen))
   use t6 <- result.try(expect(t5, token.Colon))
   use #(ret, t7) <- result.try(parse_type_expr(t6))
-  use #(body, t8) <- result.try(parse_block(t7))
-  Ok(#(ast.ProcDecl(name, params, ret, body), t8))
+  Ok(#(name, params, ret, t7))
+}
+
+fn parse_proc(tokens: Toks) -> Result(#(ast.Decl, Toks), String) {
+  use #(name, params, ret, t1) <- result.try(parse_header(tokens, token.KwProc))
+  use #(body, t2) <- result.try(parse_block(t1))
+  Ok(#(ast.ProcDecl(name, params, ret, body), t2))
+}
+
+fn parse_func(tokens: Toks) -> Result(#(ast.Decl, Toks), String) {
+  use #(name, params, ret, t1) <- result.try(parse_header(tokens, token.KwFunc))
+  use #(body, t2) <- result.try(parse_block(t1))
+  Ok(#(ast.FuncDecl(name, params, ret, body), t2))
+}
+
+fn parse_query(tokens: Toks) -> Result(#(ast.Decl, Toks), String) {
+  use #(name, params, ret, t1) <- result.try(parse_header(
+    tokens,
+    token.KwQuery,
+  ))
+  case kind(t1) {
+    token.SqlBody(sql) -> {
+      use parts <- result.try(parse_sql_parts(sql, line(t1)))
+      Ok(#(ast.QueryDecl(name, params, ret, parts), tail(t1)))
+    }
+    other ->
+      Error(
+        "expected a `{ ...SQL... }` body for query `"
+        <> name
+        <> "` but found "
+        <> token.describe(other)
+        <> at(t1),
+      )
+  }
+}
+
+// Splits a raw SQL body into literal chunks and `{expression}` interpolations.
+fn parse_sql_parts(sql: String, line: Int) -> Result(List(ast.IPart), String) {
+  split_sql(string.to_graphemes(sql), line, "", [])
+}
+
+fn split_sql(
+  chars: List(String),
+  line: Int,
+  buf: String,
+  acc: List(ast.IPart),
+) -> Result(List(ast.IPart), String) {
+  case chars {
+    [] -> Ok(list.reverse(push_sql_lit(buf, acc)))
+    ["{", ..rest] -> take_sql_code(rest, line, "", push_sql_lit(buf, acc))
+    [c, ..rest] -> split_sql(rest, line, buf <> c, acc)
+  }
+}
+
+fn take_sql_code(
+  chars: List(String),
+  line: Int,
+  code: String,
+  acc: List(ast.IPart),
+) -> Result(List(ast.IPart), String) {
+  case chars {
+    [] ->
+      Error(
+        "unterminated `{` interpolation in a query body (line "
+        <> int.to_string(line)
+        <> ")",
+      )
+    ["}", ..rest] -> {
+      use e <- result.try(parse_sub_expr(code, line))
+      split_sql(rest, line, "", [ast.IExpr(e), ..acc])
+    }
+    [c, ..rest] -> take_sql_code(rest, line, code <> c, acc)
+  }
+}
+
+fn push_sql_lit(buf: String, acc: List(ast.IPart)) -> List(ast.IPart) {
+  case buf {
+    "" -> acc
+    _ -> [ast.ILit(buf), ..acc]
+  }
 }
 
 fn parse_params(
@@ -191,20 +288,51 @@ fn parse_type_expr(tokens: Toks) -> Result(#(ast.TypeExpr, Toks), String) {
         }
         _ -> Ok(#(None, first, t1))
       })
-      let #(dims, t3) = count_dims(t2, 0)
+      let #(dims, t3) = parse_dims(t2, [])
       Ok(#(ast.TName(pkg, name, dims), t3))
     }
   }
 }
 
-fn count_dims(tokens: Toks, n: Int) -> #(Int, Toks) {
+// Parses trailing vector markers: `[]`, `[3]`, `[dyn]` or `[dyn, 2]`. A `[`
+// that doesn't start a well-formed marker is left in place (it may be an
+// index expression instead).
+fn parse_dims(tokens: Toks, acc: List(ast.Dim)) -> #(List(ast.Dim), Toks) {
   case kind(tokens) {
-    token.LBracket ->
-      case kind(tail(tokens)) {
-        token.RBracket -> count_dims(tail(tail(tokens)), n + 1)
-        _ -> #(n, tokens)
+    token.LBracket -> {
+      let t1 = tail(tokens)
+      case kind(t1) {
+        token.RBracket -> parse_dims(tail(t1), [ast.DimEmpty, ..acc])
+        token.IntLit(n) ->
+          case kind(tail(t1)) {
+            token.RBracket ->
+              parse_dims(tail(tail(t1)), [ast.DimStatic(n), ..acc])
+            _ -> #(list.reverse(acc), tokens)
+          }
+        token.KwDyn -> {
+          let t2 = tail(t1)
+          case kind(t2) {
+            token.RBracket -> parse_dims(tail(t2), [ast.DimDyn(None), ..acc])
+            token.Comma ->
+              case kind(tail(t2)) {
+                token.IntLit(n) ->
+                  case kind(tail(tail(t2))) {
+                    token.RBracket ->
+                      parse_dims(tail(tail(tail(t2))), [
+                        ast.DimDyn(Some(n)),
+                        ..acc
+                      ])
+                    _ -> #(list.reverse(acc), tokens)
+                  }
+                _ -> #(list.reverse(acc), tokens)
+              }
+            _ -> #(list.reverse(acc), tokens)
+          }
+        }
+        _ -> #(list.reverse(acc), tokens)
       }
-    _ -> #(n, tokens)
+    }
+    _ -> #(list.reverse(acc), tokens)
   }
 }
 
@@ -244,6 +372,7 @@ fn parse_stmt(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
     token.KwReturn -> parse_return(tokens)
     token.KwIf -> parse_if(tokens)
     token.KwEcho -> parse_echo(tokens)
+    token.KwAssert -> parse_assert(tokens)
     token.Ident(name) ->
       case kind(tail(tokens)) {
         token.ColonEq -> {
@@ -262,6 +391,11 @@ fn parse_stmt(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
 fn parse_echo(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
   use #(value, t1) <- result.try(parse_expr(tail(tokens)))
   Ok(#(ast.SEcho(value), t1))
+}
+
+fn parse_assert(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
+  use #(value, t1) <- result.try(parse_expr(tail(tokens)))
+  Ok(#(ast.SAssert(value), t1))
 }
 
 // An identifier-led statement is either a typed declaration (`Type name =
@@ -330,9 +464,47 @@ fn parse_if_rest(
 // ---------------------------------------------------------------------------
 // Expressions (precedence climbing)
 // ---------------------------------------------------------------------------
+// Loosest to tightest: `||`, `&&`, `is`, comparisons, `+`/`-`, `*`/`/`, `**`,
+// postfix, primary.
 
 fn parse_expr(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
-  parse_is(tokens)
+  parse_or(tokens)
+}
+
+fn parse_or(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
+  use #(left, t1) <- result.try(parse_and(tokens))
+  parse_or_rest(left, t1)
+}
+
+fn parse_or_rest(
+  left: ast.Expr,
+  tokens: Toks,
+) -> Result(#(ast.Expr, Toks), String) {
+  case kind(tokens) {
+    token.PipePipe -> {
+      use #(right, t1) <- result.try(parse_and(tail(tokens)))
+      parse_or_rest(ast.EBinary(ast.OpOr, left, right), t1)
+    }
+    _ -> Ok(#(left, tokens))
+  }
+}
+
+fn parse_and(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
+  use #(left, t1) <- result.try(parse_is(tokens))
+  parse_and_rest(left, t1)
+}
+
+fn parse_and_rest(
+  left: ast.Expr,
+  tokens: Toks,
+) -> Result(#(ast.Expr, Toks), String) {
+  case kind(tokens) {
+    token.AmpAmp -> {
+      use #(right, t1) <- result.try(parse_is(tail(tokens)))
+      parse_and_rest(ast.EBinary(ast.OpAnd, left, right), t1)
+    }
+    _ -> Ok(#(left, tokens))
+  }
 }
 
 fn parse_is(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
@@ -392,7 +564,7 @@ fn parse_additive_rest(
 }
 
 fn parse_multiplicative(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
-  use #(left, t1) <- result.try(parse_postfix(tokens))
+  use #(left, t1) <- result.try(parse_power(tokens))
   parse_multiplicative_rest(left, t1)
 }
 
@@ -402,14 +574,26 @@ fn parse_multiplicative_rest(
 ) -> Result(#(ast.Expr, Toks), String) {
   case kind(tokens) {
     token.Star -> {
-      use #(right, t1) <- result.try(parse_postfix(tail(tokens)))
+      use #(right, t1) <- result.try(parse_power(tail(tokens)))
       parse_multiplicative_rest(ast.EBinary(ast.OpMul, left, right), t1)
     }
     token.Slash -> {
-      use #(right, t1) <- result.try(parse_postfix(tail(tokens)))
+      use #(right, t1) <- result.try(parse_power(tail(tokens)))
       parse_multiplicative_rest(ast.EBinary(ast.OpDiv, left, right), t1)
     }
     _ -> Ok(#(left, tokens))
+  }
+}
+
+// `**` is right-associative: `2 ** 3 ** 2` is `2 ** (3 ** 2)`.
+fn parse_power(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
+  use #(base, t1) <- result.try(parse_postfix(tokens))
+  case kind(t1) {
+    token.StarStar -> {
+      use #(exponent, t2) <- result.try(parse_power(tail(t1)))
+      Ok(#(ast.EBinary(ast.OpPow, base, exponent), t2))
+    }
+    _ -> Ok(#(base, t1))
   }
 }
 
@@ -469,7 +653,8 @@ fn parse_index_or_slice(
     // `[:` ... — slice with no low bound
     token.Colon ->
       case kind(tail(tokens)) {
-        token.RBracket -> Ok(#(ast.ESlice(target, None, None), tail(tail(tokens))))
+        token.RBracket ->
+          Ok(#(ast.ESlice(target, None, None), tail(tail(tokens))))
         _ -> {
           use #(high, t1) <- result.try(parse_expr(tail(tokens)))
           use t2 <- result.try(expect(t1, token.RBracket))
@@ -504,11 +689,15 @@ fn parse_index_or_slice(
 fn parse_primary(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
   case kind(tokens) {
     token.IntLit(v) -> Ok(#(ast.EInt(v), tail(tokens)))
+    token.FloatLit(v) -> Ok(#(ast.EFloat(v), tail(tokens)))
     token.StringLit(s) -> Ok(#(ast.EString(s), tail(tokens)))
+    token.StrInterp(parts) -> parse_interp(parts, line(tokens), tail(tokens))
+    token.AtomLit(name) -> Ok(#(ast.EAtom(name), tail(tokens)))
     token.KwTrue -> Ok(#(ast.EBool(True), tail(tokens)))
     token.KwFalse -> Ok(#(ast.EBool(False), tail(tokens)))
     token.Ident(name) -> Ok(#(ast.EIdent(name), tail(tokens)))
     token.KwUsing -> parse_using(tokens)
+    token.LBracket -> parse_vector(tail(tokens), [])
     token.LParen -> {
       use #(inner, t1) <- result.try(parse_expr(tail(tokens)))
       use t2 <- result.try(expect(t1, token.RParen))
@@ -516,7 +705,74 @@ fn parse_primary(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
     }
     other ->
       Error(
-        "unexpected " <> token.describe(other) <> " in an expression" <> at(tokens),
+        "unexpected "
+        <> token.describe(other)
+        <> " in an expression"
+        <> at(tokens),
+      )
+  }
+}
+
+fn parse_vector(
+  tokens: Toks,
+  acc: List(ast.Expr),
+) -> Result(#(ast.Expr, Toks), String) {
+  case kind(tokens) {
+    token.RBracket -> Ok(#(ast.EVector(list.reverse(acc)), tail(tokens)))
+    _ -> {
+      use #(item, t1) <- result.try(parse_expr(tokens))
+      case kind(t1) {
+        token.Comma -> parse_vector(tail(t1), [item, ..acc])
+        token.RBracket ->
+          Ok(#(ast.EVector(list.reverse([item, ..acc])), tail(t1)))
+        other ->
+          Error(
+            "expected `,` or `]` in a vector literal but found "
+            <> token.describe(other)
+            <> at(t1),
+          )
+      }
+    }
+  }
+}
+
+// Converts an interpolated string token into an expression by parsing each
+// captured `{...}` chunk as a full expression.
+fn parse_interp(
+  parts: List(token.StrPart),
+  line: Int,
+  rest: Toks,
+) -> Result(#(ast.Expr, Toks), String) {
+  use iparts <- result.try(
+    list.try_map(parts, fn(p) {
+      case p {
+        token.SLit(s) -> Ok(ast.ILit(s))
+        token.SCode(code) -> {
+          use e <- result.try(parse_sub_expr(code, line))
+          Ok(ast.IExpr(e))
+        }
+      }
+    }),
+  )
+  Ok(#(ast.EInterp(iparts), rest))
+}
+
+// Parses an embedded expression (from a string interpolation or a query
+// body) by re-running the lexer on the captured source.
+fn parse_sub_expr(code: String, line: Int) -> Result(ast.Expr, String) {
+  use tokens <- result.try(lexer.lex(code))
+  use #(e, rest) <- result.try(parse_expr(tokens))
+  case kind(rest) {
+    token.Eof -> Ok(e)
+    other ->
+      Error(
+        "unexpected "
+        <> token.describe(other)
+        <> " in interpolated expression `"
+        <> code
+        <> "` (line "
+        <> int.to_string(line)
+        <> ")",
       )
   }
 }

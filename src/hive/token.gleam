@@ -6,6 +6,14 @@ pub type Token {
   Token(kind: Kind, line: Int)
 }
 
+/// One piece of an interpolated string literal: either literal text or the
+/// raw source of an embedded `{expression}`, which the parser finishes
+/// parsing.
+pub type StrPart {
+  SLit(String)
+  SCode(String)
+}
+
 /// The lexical category of a token.
 ///
 /// Keywords are matched case-insensitively by the lexer (per the language
@@ -16,10 +24,18 @@ pub type Kind {
   // Literals and identifiers
   Ident(String)
   StringLit(String)
+  StrInterp(List(StrPart))
   IntLit(Int)
+  FloatLit(Float)
+  AtomLit(String)
+  /// The raw body of a `query` declaration: SQL text (already dedented) with
+  /// its `{expression}` interpolation markers still in place.
+  SqlBody(String)
 
   // Keywords
   KwProc
+  KwFunc
+  KwQuery
   KwType
   KwIf
   KwElse
@@ -32,6 +48,8 @@ pub type Kind {
   KwTrue
   KwFalse
   KwEcho
+  KwAssert
+  KwDyn
 
   // Punctuation
   LBrace
@@ -58,6 +76,9 @@ pub type Kind {
   Minus
   Star
   Slash
+  StarStar
+  AmpAmp
+  PipePipe
 
   // End of input
   Eof
@@ -69,8 +90,14 @@ pub fn describe(kind: Kind) -> String {
   case kind {
     Ident(name) -> "identifier `" <> name <> "`"
     StringLit(_) -> "string literal"
+    StrInterp(_) -> "interpolated string literal"
     IntLit(_) -> "integer literal"
+    FloatLit(_) -> "float literal"
+    AtomLit(name) -> "atom `#" <> name <> "`"
+    SqlBody(_) -> "query body"
     KwProc -> "`proc`"
+    KwFunc -> "`func`"
+    KwQuery -> "`query`"
     KwType -> "`type`"
     KwIf -> "`if`"
     KwElse -> "`else`"
@@ -83,6 +110,8 @@ pub fn describe(kind: Kind) -> String {
     KwTrue -> "`true`"
     KwFalse -> "`false`"
     KwEcho -> "`echo`"
+    KwAssert -> "`assert`"
+    KwDyn -> "`dyn`"
     LBrace -> "`{`"
     RBrace -> "`}`"
     LParen -> "`(`"
@@ -105,6 +134,9 @@ pub fn describe(kind: Kind) -> String {
     Minus -> "`-`"
     Star -> "`*`"
     Slash -> "`/`"
+    StarStar -> "`**`"
+    AmpAmp -> "`&&`"
+    PipePipe -> "`||`"
     Eof -> "end of file"
   }
 }

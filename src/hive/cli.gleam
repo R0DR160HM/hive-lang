@@ -49,6 +49,15 @@ pub fn build(entry: String) -> Result(String, String) {
     }),
   )
 
+  // copy_file does not preserve the executable bit.
+  use _ <- result.try(
+    simplifile.set_permissions_octal(dest, 0o755)
+    |> result.map_error(fn(e) {
+      "could not mark the executable as runnable: "
+      <> simplifile.describe_error(e)
+    }),
+  )
+
   Ok(dest)
 }
 
@@ -60,13 +69,15 @@ pub fn run(entry: String) -> Result(Int, String) {
 
   // Run with the working directory set to the entrypoint's directory so that
   // relative paths in the program (e.g. `using "./test.csv"`) resolve as the
-  // author expects.
+  // author expects. The executable path must be absolute: the spawned process
+  // changes into `dir` before exec, so a relative path would no longer
+  // resolve.
   let dir = dir_of(entry)
-  let exe_name = filepath.base_name(exe)
+  use exe_abs <- result.try(absolute(exe))
 
   case
     shellout.command(
-      run: "./" <> exe_name,
+      run: exe_abs,
       with: [],
       in: dir,
       opt: [shellout.LetBeStdout, shellout.LetBeStderr],
@@ -74,6 +85,19 @@ pub fn run(entry: String) -> Result(Int, String) {
   {
     Ok(_) -> Ok(0)
     Error(#(code, _)) -> Ok(code)
+  }
+}
+
+fn absolute(path: String) -> Result(String, String) {
+  case string.starts_with(path, "/") {
+    True -> Ok(path)
+    False ->
+      simplifile.current_directory()
+      |> result.map(fn(cwd) { filepath.join(normalize(cwd), path) })
+      |> result.map_error(fn(e) {
+        "could not resolve the current directory: "
+        <> simplifile.describe_error(e)
+      })
   }
 }
 

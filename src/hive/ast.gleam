@@ -14,6 +14,22 @@ pub type Decl {
     return_type: TypeExpr,
     body: List(Stmt),
   )
+  /// A `func`: a pure function (no side effects allowed in its body).
+  FuncDecl(
+    name: String,
+    params: List(Field),
+    return_type: TypeExpr,
+    body: List(Stmt),
+  )
+  /// A `query`: a pure function whose body is inline SQL. The body is a
+  /// sequence of literal SQL chunks and interpolated expressions; every
+  /// interpolated value is sanitized at runtime before entering the SQL.
+  QueryDecl(
+    name: String,
+    params: List(Field),
+    return_type: TypeExpr,
+    sql: List(IPart),
+  )
   /// An algebraic data type. When `variants` is empty the type behaves as a
   /// plain struct made of `common_fields`. When it has variants, each variant
   /// is a struct and the type is a tagged union; `common_fields` are added to
@@ -29,11 +45,22 @@ pub type Variant {
   Variant(name: String, fields: List(Field))
 }
 
+/// One `[...]` marker on a vector type.
+pub type Dim {
+  /// `T[]` — a vector of unspecified length (legacy spelling).
+  DimEmpty
+  /// `T[3]` — a vector of static length.
+  DimStatic(size: Int)
+  /// `T[dyn]` or `T[dyn, 2]` — a dynamic vector, optionally with an initial
+  /// size hint.
+  DimDyn(initial: Option(Int))
+}
+
 pub type TypeExpr {
   TVoid
   /// A named type, optionally package-qualified (e.g. `hive.TableError`),
-  /// with `dims` trailing `[]` array markers (e.g. `String[][]` -> dims 2).
-  TName(pkg: Option(String), name: String, dims: Int)
+  /// with trailing vector markers (e.g. `Str[dyn][dyn]` -> two dims).
+  TName(pkg: Option(String), name: String, dims: List(Dim))
 }
 
 pub type Stmt {
@@ -47,6 +74,8 @@ pub type Stmt {
   SReturn(value: Option(Expr))
   /// `echo value` — print any value followed by a newline.
   SEcho(value: Expr)
+  /// `assert condition` — panic at runtime when the condition is false.
+  SAssert(value: Expr)
   /// A bare expression used as a statement (e.g. a call).
   SExpr(expr: Expr)
 }
@@ -66,13 +95,31 @@ pub type BinOp {
   OpSub
   OpMul
   OpDiv
+  OpPow
+  OpAnd
+  OpOr
+}
+
+/// One piece of an interpolated string (or of a query's SQL body): literal
+/// text or an embedded expression.
+pub type IPart {
+  ILit(String)
+  IExpr(Expr)
 }
 
 pub type Expr {
   EInt(Int)
+  EFloat(Float)
   EString(String)
+  /// An interpolated string literal, e.g. `"{name} is here"`.
+  EInterp(parts: List(IPart))
+  /// `true`/`false`, which are aliases for the atoms `#True`/`#False`.
   EBool(Bool)
+  /// An atom literal, e.g. `#SomeAtom` (without the `#`).
+  EAtom(name: String)
   EIdent(String)
+  /// A vector literal, e.g. `["Hello", "World"]`.
+  EVector(items: List(Expr))
   EMember(target: Expr, field: String)
   ECall(callee: Expr, args: List(Expr))
   EIndex(target: Expr, index: Expr)

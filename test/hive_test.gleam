@@ -1,6 +1,7 @@
 import gleam/string
 import gleeunit
 import gleeunit/should
+import simplifile
 import hive/compiler
 
 pub fn main() {
@@ -116,15 +117,20 @@ pub fn result_pattern_lowers_to_predicates_test() {
 
 pub fn positional_constructor_maps_fields_test() {
   let go = compile(example)
+  // Constructors produce the union's interface type so the value can be
+  // type-asserted later regardless of how it was declared.
   should.be_true(string.contains(
     go,
-    "ParsingResultSuccess{HeaderlessTable: table[1:], Timestamp: hive.Now()}",
+    "ParsingResult(ParsingResultSuccess{HeaderlessTable: table[1:], Timestamp: hive.Now()})",
   ))
   should.be_true(string.contains(
     go,
-    "ParsingResultError{Error: error, Timestamp: hive.Now()}",
+    "ParsingResult(ParsingResultError{Error: error, Timestamp: hive.Now()})",
   ))
-  should.be_true(string.contains(go, "ParsingResultNoData{Timestamp: hive.Now()}"))
+  should.be_true(string.contains(
+    go,
+    "ParsingResult(ParsingResultNoData{Timestamp: hive.Now()})",
+  ))
 }
 
 pub fn open_slice_is_verbatim_test() {
@@ -137,6 +143,142 @@ pub fn void_proc_has_no_return_type_test() {
   let go = compile(example)
   should.be_true(string.contains(go, "func main() {"))
   should.be_true(string.contains(go, "func parse() ParsingResult {"))
+}
+
+// ---------------------------------------------------------------------------
+// Types example features
+// ---------------------------------------------------------------------------
+
+pub fn str_type_and_func_test() {
+  let go =
+    compile(
+      "func greet(name: Str): Str {\n\treturn name\n}\nproc main(): void {\n\techo greet(\"hi\")\n}\n",
+    )
+  should.be_true(string.contains(go, "func greet(name string) string {"))
+}
+
+pub fn string_interpolation_test() {
+  let go =
+    compile(
+      "func f(): Str {\n\ta := \"x\"\n\tn := 2\n\treturn \"{a} has {n}\"\n}\nproc main(): void {}\n",
+    )
+  // Str pieces concatenate directly; other types go through hive.ToStr.
+  should.be_true(string.contains(go, "(a + \" has \" + hive.ToStr(n))"))
+}
+
+pub fn multiline_string_is_dedented_test() {
+  let go =
+    compile(
+      "func f(): Str {\n\treturn `\n\t\tThis\n\t\tis\n\t\tit\n\t`\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "\"This\\nis\\nit\""))
+}
+
+pub fn vector_types_and_literals_test() {
+  let go =
+    compile(
+      "func f(): Str[3] {\n\tStr[2] a = [\"x\", \"y\"]\n\tStr[dyn] b = [\"x\"]\n\tStr[dyn, 2] c = [\"x\", \"y\"]\n\treturn a + [\"z\"]\n}\nproc main(): void {}\n",
+    )
+  // Every vector flavor becomes a Go slice; `+` concatenates via the runtime.
+  should.be_true(string.contains(go, "func f() []string {"))
+  should.be_true(string.contains(go, "var a []string = []string{\"x\", \"y\"}"))
+  should.be_true(string.contains(go, "var b []string = []string{\"x\"}"))
+  should.be_true(string.contains(go, "var c []string = []string{\"x\", \"y\"}"))
+  should.be_true(string.contains(go, "hive.Concat(a, []string{\"z\"})"))
+}
+
+pub fn atoms_get_a_table_and_constants_test() {
+  let go =
+    compile(
+      "func f(): Atom {\n\ta := #Wax\n\treturn a\n}\nproc main(): void {}\n",
+    )
+  // #False and #True always occupy slots 0 and 1; custom atoms follow.
+  should.be_true(string.contains(go, "atom_Wax hive.Atom = 2"))
+  should.be_true(string.contains(
+    go,
+    "hive.InitAtoms([]string{\"False\", \"True\", \"Wax\"})",
+  ))
+  should.be_true(string.contains(go, "func f() hive.Atom {"))
+}
+
+pub fn atom_coerces_to_str_next_to_string_test() {
+  let go =
+    compile(
+      "func f(): void {\n\tassert \"0\" + True == \"01\"\n}\nproc main(): void {}\n",
+    )
+  // True is the atom #True (value 1); as a Str it reads \"1\".
+  should.be_true(string.contains(
+    go,
+    "hive.Assert(((\"0\" + hive.AtomToStr(hive.True)) == \"01\"))",
+  ))
+}
+
+pub fn float_and_safe_division_test() {
+  let go =
+    compile(
+      "func f(): Float {\n\ta := 1.5\n\tb := 0.0\n\tn := 4\n\tm := 2\n\tk := n / m\n\tp := n ** m\n\t_unused := k + p\n\treturn a / b\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "a := 1.5"))
+  // Division is zero-safe and ** goes through the runtime.
+  should.be_true(string.contains(go, "hive.DivFloat(a, b)"))
+  should.be_true(string.contains(go, "hive.DivInt(n, m)"))
+  should.be_true(string.contains(go, "hive.PowInt(n, m)"))
+}
+
+pub fn is_binding_usable_in_same_condition_test() {
+  let go =
+    compile(
+      "type T {\n\tA {\n\t\tv: Str\n\t}\n\tB\n}\nfunc f(): Str {\n\tx := T.A(\"ok\")\n\tif x is T.A(v) && v == \"ok\" {\n\t\treturn v\n\t}\n\treturn \"no\"\n}\nproc main(): void {}\n",
+    )
+  // The right operand of && reads the binding through its accessor (safe
+  // because Go's && short-circuits), and the body re-binds it as a variable.
+  should.be_true(string.contains(go, "x.(TA)"))
+  should.be_true(string.contains(go, "(x.(TA).V == \"ok\")"))
+  should.be_true(string.contains(go, "v := x.(TA).V"))
+  // Constructors produce the interface type.
+  should.be_true(string.contains(go, "T(TA{V: \"ok\"})"))
+}
+
+pub fn query_sanitizes_interpolations_test() {
+  let go =
+    compile(
+      "query q(name: Str): Str {\n\tSELECT * FROM users u\n\tWHERE u.name = {name}\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "func q(name string) string {"))
+  should.be_true(string.contains(
+    go,
+    "return \"SELECT * FROM users u\\nWHERE u.name = \" + hive.SqlParam(name)",
+  ))
+}
+
+pub fn func_cannot_echo_test() {
+  let result =
+    compiler.compile(
+      "func f(): void {\n\techo \"nope\"\n}\nproc main(): void {}\n",
+    )
+  should.be_error(result)
+}
+
+pub fn func_cannot_call_proc_test() {
+  let result =
+    compiler.compile(
+      "proc p(): void {}\nfunc f(): void {\n\tp()\n}\nproc main(): void {}\n",
+    )
+  should.be_error(result)
+}
+
+// ---------------------------------------------------------------------------
+// The shipped code examples must always compile
+// ---------------------------------------------------------------------------
+
+pub fn basic_io_example_compiles_test() {
+  let assert Ok(src) = simplifile.read("code-examples/1 - Basic IO/basic-io.hive")
+  let assert Ok(_) = compiler.compile(src)
+}
+
+pub fn types_example_compiles_test() {
+  let assert Ok(src) = simplifile.read("code-examples/2 - Types/types.hive")
+  let assert Ok(_) = compiler.compile(src)
 }
 
 fn count_occurrences(haystack: String, needle: String) -> Int {
