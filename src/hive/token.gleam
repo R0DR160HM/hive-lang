@@ -43,7 +43,6 @@ pub type Kind {
   KwIs
   KwUsing
   KwWith
-  KwAs
   KwVoid
   KwTrue
   KwFalse
@@ -105,7 +104,6 @@ pub fn describe(kind: Kind) -> String {
     KwIs -> "`is`"
     KwUsing -> "`using`"
     KwWith -> "`with`"
-    KwAs -> "`as`"
     KwVoid -> "`void`"
     KwTrue -> "`true`"
     KwFalse -> "`false`"

@@ -95,6 +95,20 @@ SELECT * FROM users u
 WHERE u.name = 'O''Brien'
 ```
 
+**`3 - HTTP`** serves an HTTP server on port 8080 whose handler greets every
+route, logs each request, proxies `/proxy` to example.com via
+`hive.http.request`, and speaks JSON on `/greet` — decoding the request body
+against a declared type and encoding the typed reply back:
+
+```sh
+$ hive run "code-examples/3 - HTTP/http.hive" &
+Listening on http://localhost:8080
+$ curl -X POST localhost:8080/greet -d '{"name": "Ana", "details": {"mood": "curious"}}'
+{"message":"Hello Ana, glad you are curious!","timestamp":1784507444}
+$ curl -X POST localhost:8080/greet -d '{"name": 42, "details": {}}'
+{"message":"$.name: expected Str, found the number 42","timestamp":1784507444}
+```
+
 ## The language
 
 * **`proc` / `func` / `query`** — a `proc` may perform side effects; a
@@ -121,6 +135,36 @@ WHERE u.name = 'O''Brien'
   bindings are usable immediately in the same condition:
   `if x is T.A(v) && v == "ok" { ... }`.
 * **`assert cond`** panics at runtime when the condition is false.
+* **Named arguments** — funcs, procs, queries and type constructors (builtin
+  ones included) accept arguments by name: `f(b: 1, "s")`. Named arguments
+  can appear anywhere; only the unnamed ones need to be in order, filling
+  whichever parameters the named ones didn't claim. Names must exist, can't
+  repeat, and once named arguments are used the call must cover the full
+  parameter list.
+* **`hive.http`** is the HTTP standard library. `hive.http.request(req)`
+  performs a request and returns
+  `Result<hive.HttpResponse, hive.HttpError>` (a `Result.Error` means no
+  response was obtained at all). `hive.http.serve(port, handler)` blocks
+  forever serving every route through `handler`, which must be a
+  `proc (hive.HttpRequest): hive.HttpResponse` passed by name. Both are side
+  effects, so they are only available inside `proc`s. Requests and responses
+  are built positionally — `hive.HttpRequest(method, url, headers, body)`,
+  `hive.HttpResponse(status, headers, body)` — and headers are a `Table` of
+  `[name, value]` rows.
+* **`hive.json`** is the JSON standard library, built on the idea that Hive's
+  type declarations *are* the JSON schema. `hive.json.parse(text) with T`
+  derives a decoder for `T` at compile time and returns
+  `Result<T, hive.JsonError>`: missing fields, wrong types and wrong static
+  vector lengths become errors carrying the exact `path` that failed, while
+  JSON fields the type doesn't declare are simply ignored. Variants decode as
+  `{"VariantName": {...}}` (JSON `null` selects a type's first field-less
+  variant). JSON you don't want to model stays type-safe too: `with Table`
+  flattens a whole document into `[path, value]` rows, looked up with
+  `hive.json.get(table, "keys.layout")` and re-nested by the encoder.
+  `hive.json.encode(value)` derives the encoder from the static type and
+  therefore cannot fail, and `hive.json.table(text)` reads a JSON array of
+  flat objects as a headered `Table`, the same shape `using` yields from CSV.
+  All of `hive.json` is pure, so it is available inside `func`s.
 * All keywords are case-insensitive; identifiers keep their spelling.
 
 ## How Hive maps onto Go
@@ -147,6 +191,13 @@ WHERE u.name = 'O''Brien'
 | `#Atom`, `true`, `false`                | `hive.Atom` constants + a generated `hive.InitAtoms` table     |
 | `a / b`, `a ** b`                       | `hive.DivInt`/`hive.DivFloat`, `hive.PowInt`/`hive.PowFloat`   |
 | `len(t)` / `now()`                      | `len(t)` / `hive.Now()` (current Unix time)                    |
+| `hive.json.parse(t) with T`             | `hive.JsonParse(t, jsonDecode_T)` → `Result[T, JsonError]`     |
+| `hive.json.encode(v)`                   | derived `jsonEncode_T(v)` (cannot fail, so plain `string`)     |
+| `hive.json.table(t)` / `.get(tbl, p)`   | `hive.JsonTable(t)` / `hive.JsonGet(tbl, p)`                   |
+| `hive.http.request(r)`                  | `hive.HttpSend(r)` → `Result[HttpResponse, HttpError]`         |
+| `hive.http.serve(port, handler)`        | `hive.HttpServe(port, handler)` (handler passed by proc name)  |
+| `hive.HttpRequest(m, u, h, b)`          | `hive.HttpRequest{Method: m, Url: u, Headers: h, Body: b}`     |
+| `request.body` (builtin struct field)   | `request.Body` (fields capitalize to their exported Go names)  |
 | `t[1:]`                                 | `t[1:]` (slices are **inclusive** of the high bound)           |
 | `Str`, `Int`, `Bool`, `Float`, `Atom`   | `string`, `int`, `bool`, `float64`, `hive.Atom`                |
 | `Str[3]`, `Str[dyn]`, `Str[dyn, 2]`     | `[]string` (all vectors lower to slices)                       |

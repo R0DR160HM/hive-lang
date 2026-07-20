@@ -364,7 +364,6 @@ fn keyword_or_ident(word: String) -> token.Kind {
     "is" -> token.KwIs
     "using" -> token.KwUsing
     "with" -> token.KwWith
-    "as" -> token.KwAs
     "void" -> token.KwVoid
     "true" -> token.KwTrue
     "false" -> token.KwFalse

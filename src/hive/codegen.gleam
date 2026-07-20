@@ -34,10 +34,34 @@ pub type Ty {
   TyBool
   TyAtom
   TyTable
-  TyResult
+  TyResult(ok: Ty, err: Ty)
   TyVec(Ty)
   TyCustom(String)
+  /// A struct provided by the runtime (`hive.HttpRequest`, ...); the name is
+  /// unqualified, see `builtin_fields`.
+  TyBuiltin(String)
   TyUnknown
+}
+
+/// The runtime-provided struct types reachable from Hive source as `hive.X`.
+/// Field order is the positional-constructor order.
+pub fn builtin_fields(name: String) -> Option(List(#(String, Ty))) {
+  case name {
+    "HttpRequest" ->
+      Some([
+        #("method", TyStr),
+        #("url", TyStr),
+        #("headers", TyTable),
+        #("body", TyStr),
+      ])
+    "HttpResponse" ->
+      Some([#("status", TyInt), #("headers", TyTable), #("body", TyStr)])
+    "HttpError" -> Some([#("url", TyStr), #("message", TyStr)])
+    "TableError" -> Some([#("path", TyStr), #("message", TyStr)])
+    "JsonError" ->
+      Some([#("path", TyStr), #("expected", TyStr), #("found", TyStr)])
+    _ -> None
+  }
 }
 
 /// A binding introduced by an `is` pattern: name, the Go expression that
@@ -45,11 +69,50 @@ pub type Ty {
 type Bind =
   #(String, String, Ty)
 
+/// Assign call arguments to parameters: named arguments claim their
+/// parameter, then the unnamed ones fill whatever is left in declaration
+/// order. Returns the provided (name, value) pairs in declaration order plus
+/// any leftover positional arguments (validation rejects those earlier for
+/// known targets).
+pub fn assign_args(
+  args: List(ast.Arg),
+  names: List(String),
+) -> #(List(#(String, ast.Expr)), List(ast.Expr)) {
+  let named =
+    list.fold(args, dict.new(), fn(acc, a) {
+      case a.name {
+        Some(n) -> dict.insert(acc, n, a.value)
+        None -> acc
+      }
+    })
+  let positional =
+    list.filter_map(args, fn(a) {
+      case a.name {
+        None -> Ok(a.value)
+        Some(_) -> Error(Nil)
+      }
+    })
+  let #(assigned, leftover) =
+    list.fold(names, #([], positional), fn(acc, name) {
+      let #(assigned, pos) = acc
+      case dict.get(named, name) {
+        Ok(value) -> #([#(name, value), ..assigned], pos)
+        Error(_) ->
+          case pos {
+            [p, ..rest] -> #([#(name, p), ..assigned], rest)
+            [] -> #(assigned, [])
+          }
+      }
+    })
+  #(list.reverse(assigned), leftover)
+}
+
 type Env {
   Env(
     types: Dict(String, ast.Decl),
-    /// Signatures of every proc/func/query: parameter types and return type.
-    sigs: Dict(String, #(List(Ty), Ty)),
+    /// Signatures of every proc/func/query: named parameter types and the
+    /// return type.
+    sigs: Dict(String, #(List(#(String, Ty)), Ty)),
     /// Types of the local variables currently in scope.
     locals: Dict(String, Ty),
     /// Active `is`-binding substitutions: while generating the rest of a
@@ -98,8 +161,95 @@ pub fn generate(module: ast.Module) -> String {
     })
     |> string.join("\n")
 
-  let body = type_code <> "\n" <> atom_code <> fn_code
+  let json_code = gen_json_support(env, module)
+
+  let body = type_code <> "\n" <> atom_code <> json_code <> fn_code
   gen_header(body) <> "\n" <> body
+}
+
+// ---------------------------------------------------------------------------
+// hive.json usage detection
+// ---------------------------------------------------------------------------
+
+fn uses_json_module(module: ast.Module) -> Bool {
+  list.any(module.decls, fn(d) {
+    case d {
+      ast.ProcDecl(_, _, _, body) | ast.FuncDecl(_, _, _, body) ->
+        uses_json_stmts(body)
+      ast.QueryDecl(_, _, _, sql) ->
+        list.any(sql, fn(p) {
+          case p {
+            ast.ILit(_) -> False
+            ast.IExpr(e) -> uses_json_expr(e)
+          }
+        })
+      ast.TypeDecl(..) -> False
+    }
+  })
+}
+
+fn uses_json_stmts(stmts: List(ast.Stmt)) -> Bool {
+  list.any(stmts, fn(s) {
+    case s {
+      ast.SVarDecl(_, value) -> uses_json_expr(value)
+      ast.STypedDecl(_, _, value) -> uses_json_expr(value)
+      ast.SReturn(None) -> False
+      ast.SReturn(Some(e)) -> uses_json_expr(e)
+      ast.SEcho(e) -> uses_json_expr(e)
+      ast.SAssert(e) -> uses_json_expr(e)
+      ast.SExpr(e) -> uses_json_expr(e)
+      ast.SIf(branches, else_body) ->
+        list.any(branches, fn(b) {
+          uses_json_expr(b.cond) || uses_json_stmts(b.body)
+        })
+        || case else_body {
+          Some(body) -> uses_json_stmts(body)
+          None -> False
+        }
+    }
+  })
+}
+
+fn uses_json_expr(e: ast.Expr) -> Bool {
+  case e {
+    ast.EWith(_, _) -> True
+    ast.ECall(ast.EMember(ast.EMember(ast.EIdent("hive"), "json"), _), _) ->
+      True
+    ast.EInt(_)
+    | ast.EFloat(_)
+    | ast.EString(_)
+    | ast.EBool(_)
+    | ast.EAtom(_)
+    | ast.EIdent(_) -> False
+    ast.EInterp(parts) ->
+      list.any(parts, fn(p) {
+        case p {
+          ast.ILit(_) -> False
+          ast.IExpr(inner) -> uses_json_expr(inner)
+        }
+      })
+    ast.EVector(items) -> list.any(items, uses_json_expr)
+    ast.EMember(target, _) -> uses_json_expr(target)
+    ast.ECall(callee, args) ->
+      uses_json_expr(callee)
+      || list.any(args, fn(a) { uses_json_expr(a.value) })
+    ast.EIndex(target, index) ->
+      uses_json_expr(target) || uses_json_expr(index)
+    ast.ESlice(target, low, high) ->
+      uses_json_expr(target)
+      || uses_json_opt(low)
+      || uses_json_opt(high)
+    ast.EBinary(_, l, r) -> uses_json_expr(l) || uses_json_expr(r)
+    ast.EIs(subject, _) -> uses_json_expr(subject)
+    ast.EUsing(path, delim) -> uses_json_expr(path) || uses_json_opt(delim)
+  }
+}
+
+fn uses_json_opt(o: Option(ast.Expr)) -> Bool {
+  case o {
+    Some(e) -> uses_json_expr(e)
+    None -> False
+  }
 }
 
 fn collect_types(decls: List(ast.Decl)) -> Dict(String, ast.Decl) {
@@ -114,13 +264,14 @@ fn collect_types(decls: List(ast.Decl)) -> Dict(String, ast.Decl) {
 fn collect_sigs(
   types: Dict(String, ast.Decl),
   decls: List(ast.Decl),
-) -> Dict(String, #(List(Ty), Ty)) {
+) -> Dict(String, #(List(#(String, Ty)), Ty)) {
   list.fold(decls, dict.new(), fn(acc, d) {
     case d {
       ast.ProcDecl(name, params, ret, _)
       | ast.FuncDecl(name, params, ret, _)
       | ast.QueryDecl(name, params, ret, _) -> {
-        let ptys = list.map(params, fn(p) { ty_of_type_expr(types, p.typ) })
+        let ptys =
+          list.map(params, fn(p) { #(p.name, ty_of_type_expr(types, p.typ)) })
         dict.insert(acc, name, #(ptys, ty_of_type_expr(types, ret)))
       }
       ast.TypeDecl(..) -> acc
@@ -201,14 +352,15 @@ fn atoms_in_expr(e: ast.Expr, acc: List(String)) -> List(String) {
     ast.EMember(target, _) -> atoms_in_expr(target, acc)
     ast.ECall(callee, args) ->
       list.fold(args, atoms_in_expr(callee, acc), fn(acc, a) {
-        atoms_in_expr(a, acc)
+        atoms_in_expr(a.value, acc)
       })
     ast.EIndex(target, index) -> atoms_in_expr(index, atoms_in_expr(target, acc))
     ast.ESlice(target, low, high) ->
       atoms_in_opt(high, atoms_in_opt(low, atoms_in_expr(target, acc)))
     ast.EBinary(_, l, r) -> atoms_in_expr(r, atoms_in_expr(l, acc))
     ast.EIs(subject, _) -> atoms_in_expr(subject, acc)
-    ast.EUsing(path, delim, _) -> atoms_in_opt(delim, atoms_in_expr(path, acc))
+    ast.EUsing(path, delim) -> atoms_in_opt(delim, atoms_in_expr(path, acc))
+    ast.EWith(value, _) -> atoms_in_expr(value, acc)
   }
 }
 
@@ -278,6 +430,11 @@ fn gen_header(body: String) -> String {
 fn ty_of_type_expr(types: Dict(String, ast.Decl), t: ast.TypeExpr) -> Ty {
   case t {
     ast.TVoid -> TyUnknown
+    ast.TName(Some("hive"), name, dims) ->
+      case builtin_fields(name) {
+        Some(_) -> wrap_dims(TyBuiltin(name), dims)
+        None -> wrap_dims(TyUnknown, dims)
+      }
     ast.TName(Some(_), _, dims) -> wrap_dims(TyUnknown, dims)
     ast.TName(None, name, dims) -> wrap_dims(base_ty(types, name), dims)
   }
@@ -340,7 +497,8 @@ fn ty_to_go(ty: Ty) -> String {
     TyTable -> "hive.Table"
     TyVec(t) -> "[]" <> ty_to_go(t)
     TyCustom(name) -> name
-    TyResult -> "any"
+    TyBuiltin(name) -> "hive." <> name
+    TyResult(_, _) -> "any"
     TyUnknown -> "any"
   }
 }
@@ -404,6 +562,303 @@ fn gen_fields(_env: Env, fields: List(ast.Field)) -> String {
     "\t" <> exported(f.name) <> " " <> gen_type(f.typ) <> "\n"
   })
   |> string.concat
+}
+
+// ---------------------------------------------------------------------------
+// Derived JSON decoders/encoders
+// ---------------------------------------------------------------------------
+// When a module touches `hive.json`, every user type gets a derived
+// `jsonDecode_T` and `jsonEncode_T` in the generated program. Decoding is
+// strict: exact keys, exact static vector lengths, and unions read from the
+// `{"VariantName": {...}}` shape (JSON null selects the first field-less
+// variant when one exists).
+
+fn gen_json_support(env: Env, module: ast.Module) -> String {
+  case uses_json_module(module) {
+    False -> ""
+    True ->
+      module.decls
+      |> list.filter_map(fn(d) {
+        case d {
+          ast.TypeDecl(name, variants, commons) ->
+            Ok(
+              gen_json_decoder_fn(env, name, variants, commons)
+              <> gen_json_encoder_fn(env, name, variants, commons),
+            )
+          _ -> Error(Nil)
+        }
+      })
+      |> string.concat
+  }
+}
+
+/// A Go expression referencing (or inlining) the decoder for a Hive type:
+/// something of type `func(hive.JsonValue, string) (T, *hive.JsonError)`.
+fn json_decoder_ref(env: Env, t: ast.TypeExpr) -> String {
+  case t {
+    ast.TName(None, name, []) ->
+      case name {
+        "Str" | "String" -> "hive.JsonStr"
+        "Int" -> "hive.JsonInt"
+        "Float" -> "hive.JsonFloat"
+        "Bool" -> "hive.JsonBool"
+        "Atom" -> "hive.JsonAtom"
+        "Table" -> "hive.JsonFlatten"
+        _ ->
+          case dict.has_key(env.types, name) {
+            True -> "jsonDecode_" <> name
+            False -> json_decoder_unsupported(t)
+          }
+      }
+    ast.TName(pkg, name, [dim, ..rest]) -> {
+      let inner = ast.TName(pkg, name, rest)
+      let call = case dim {
+        ast.DimStatic(n) ->
+          "hive.JsonVecN(v, p, "
+          <> int.to_string(n)
+          <> ", "
+          <> json_decoder_ref(env, inner)
+          <> ")"
+        _ -> "hive.JsonVec(v, p, " <> json_decoder_ref(env, inner) <> ")"
+      }
+      "func(v hive.JsonValue, p string) ("
+      <> gen_type(t)
+      <> ", *hive.JsonError) { return "
+      <> call
+      <> " }"
+    }
+    _ -> json_decoder_unsupported(t)
+  }
+}
+
+fn json_decoder_unsupported(t: ast.TypeExpr) -> String {
+  "func(v hive.JsonValue, p string) ("
+  <> gen_type(t)
+  <> ", *hive.JsonError) { var zero "
+  <> gen_type(t)
+  <> "; return zero, &hive.JsonError{Path: p, Expected: \"a decodable type\", Found: \"an unsupported type\"} }"
+}
+
+fn gen_json_decoder_fn(
+  env: Env,
+  name: String,
+  variants: List(ast.Variant),
+  commons: List(ast.Field),
+) -> String {
+  case variants {
+    [] -> {
+      let zero = name <> "{}"
+      "func jsonDecode_"
+      <> name
+      <> "(v hive.JsonValue, path string) ("
+      <> name
+      <> ", *hive.JsonError) {\n"
+      <> "\tobj, jerr := hive.JsonObject(v, path)\n"
+      <> gen_json_bail(zero)
+      <> gen_json_field_decodes(env, commons, "path", zero, 1)
+      <> "\treturn "
+      <> name
+      <> "{"
+      <> json_field_inits(commons)
+      <> "}, nil\n}\n"
+    }
+    _ -> {
+      let null_case = case
+        commons == [],
+        list.find(variants, fn(v) { v.fields == [] })
+      {
+        True, Ok(empty) ->
+          "\tif v.Kind == 'n' {\n\t\treturn "
+          <> name
+          <> "("
+          <> name
+          <> empty.name
+          <> "{}), nil\n\t}\n"
+        _, _ -> ""
+      }
+      let cases =
+        variants
+        |> list.map(fn(v) {
+          let fields = list.append(v.fields, commons)
+          "\tcase "
+          <> gen_string_lit(v.name)
+          <> ":\n\t\tobj, jerr := hive.JsonObject(inner, path+"
+          <> gen_string_lit("." <> v.name)
+          <> ")\n"
+          <> indent_more(gen_json_bail("nil"))
+          <> indent_more(gen_json_field_decodes(
+            env,
+            fields,
+            "path+" <> gen_string_lit("." <> v.name),
+            "nil",
+            2,
+          ))
+          <> "\t\treturn "
+          <> name
+          <> "("
+          <> name
+          <> v.name
+          <> "{"
+          <> json_field_inits(fields)
+          <> "}), nil\n"
+        })
+        |> string.concat
+      let variant_names =
+        variants |> list.map(fn(v) { v.name }) |> string.join(", ")
+      "func jsonDecode_"
+      <> name
+      <> "(v hive.JsonValue, path string) ("
+      <> name
+      <> ", *hive.JsonError) {\n"
+      <> null_case
+      <> "\tkey, inner, jerr := hive.JsonVariant(v, path)\n"
+      <> gen_json_bail("nil")
+      <> "\tswitch key {\n"
+      <> cases
+      <> "\t}\n\treturn nil, &hive.JsonError{Path: path, Expected: "
+      <> gen_string_lit("one of " <> variant_names)
+      <> ", Found: hive.JsonEncodeStr(key)}\n}\n"
+    }
+  }
+}
+
+fn gen_json_bail(zero: String) -> String {
+  "\tif jerr != nil {\n\t\treturn " <> zero <> ", jerr\n\t}\n"
+}
+
+fn indent_more(code: String) -> String {
+  code
+  |> string.split("\n")
+  |> list.map(fn(l) {
+    case l {
+      "" -> ""
+      _ -> "\t" <> l
+    }
+  })
+  |> string.join("\n")
+}
+
+// JSON fields the type doesn't declare are simply ignored: only declared
+// fields are looked up (and missing ones error via JsonField).
+fn gen_json_field_decodes(
+  env: Env,
+  fields: List(ast.Field),
+  path: String,
+  zero: String,
+  indent: Int,
+) -> String {
+  let pad = tabs(indent)
+  let bail = pad <> "if jerr != nil {\n" <> pad <> "\treturn " <> zero <> ", jerr\n" <> pad <> "}\n"
+  let decodes =
+    fields
+    |> list.map(fn(f) {
+      pad
+      <> "raw_"
+      <> f.name
+      <> ", jerr := hive.JsonField(obj, "
+      <> gen_string_lit(f.name)
+      <> ", "
+      <> path
+      <> ")\n"
+      <> bail
+      <> pad
+      <> "f_"
+      <> f.name
+      <> ", jerr := "
+      <> json_decoder_ref(env, f.typ)
+      <> "(raw_"
+      <> f.name
+      <> ", "
+      <> path
+      <> "+"
+      <> gen_string_lit("." <> f.name)
+      <> ")\n"
+      <> bail
+    })
+    |> string.concat
+  // With no declared fields `obj` would be unused, which Go rejects.
+  case fields {
+    [] -> pad <> "_ = obj\n"
+    _ -> decodes
+  }
+}
+
+fn json_field_inits(fields: List(ast.Field)) -> String {
+  fields
+  |> list.map(fn(f) { exported(f.name) <> ": f_" <> f.name })
+  |> string.join(", ")
+}
+
+fn gen_json_encoder_fn(
+  env: Env,
+  name: String,
+  variants: List(ast.Variant),
+  commons: List(ast.Field),
+) -> String {
+  case variants {
+    [] ->
+      "func jsonEncode_"
+      <> name
+      <> "(x "
+      <> name
+      <> ") string {\n\treturn "
+      <> gen_json_object_encode(env, commons, "x")
+      <> "\n}\n"
+    _ -> {
+      let cases =
+        variants
+        |> list.map(fn(v) {
+          let fields = list.append(v.fields, commons)
+          "\tcase "
+          <> name
+          <> v.name
+          <> ":\n\t\t_ = v\n\t\treturn "
+          <> gen_string_lit("{\"" <> v.name <> "\":")
+          <> " + "
+          <> gen_json_object_encode(env, fields, "v")
+          <> " + "
+          <> gen_string_lit("}")
+          <> "\n"
+        })
+        |> string.concat
+      "func jsonEncode_"
+      <> name
+      <> "(x "
+      <> name
+      <> ") string {\n\tswitch v := x.(type) {\n"
+      <> cases
+      <> "\t}\n\treturn \"null\"\n}\n"
+    }
+  }
+}
+
+fn gen_json_object_encode(
+  env: Env,
+  fields: List(ast.Field),
+  receiver: String,
+) -> String {
+  case fields {
+    [] -> gen_string_lit("{}")
+    _ -> {
+      let pieces =
+        fields
+        |> list.index_map(fn(f, i) {
+          let sep = case i {
+            0 -> "{"
+            _ -> ","
+          }
+          gen_string_lit(sep <> "\"" <> f.name <> "\":")
+          <> " + "
+          <> gen_json_encode(
+            ty_of_type_expr(env.types, f.typ),
+            receiver <> "." <> exported(f.name),
+            0,
+          )
+        })
+        |> string.join(" + ")
+      pieces <> " + " <> gen_string_lit("}")
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -681,16 +1136,21 @@ fn gen_is(
   pattern: ast.Pattern,
 ) -> #(String, List(Bind)) {
   let subj = gen_expr(env, subject)
+  // Result payload types come from the subject's inferred TyResult (e.g.
+  // `using` -> Result<Table, TableError>, `hive.http.request` ->
+  // Result<HttpResponse, HttpError>).
+  let #(ok_ty, err_ty) = case infer(env, subject) {
+    TyResult(ok, err) -> #(ok, err)
+    _ -> #(TyUnknown, TyUnknown)
+  }
   case pattern {
-    // Builtin Result patterns. `using` produces Result<Table, TableError>,
-    // which is the only Result source today, so the payload types are known.
     ast.PConstructor(["Result", "Ok"], bindings) -> #(
       subj <> ".IsOk()",
-      single_binding(bindings, subj <> ".Ok()", TyTable),
+      single_binding(bindings, subj <> ".Ok()", ok_ty),
     )
     ast.PConstructor(["Result", "Error"], bindings) -> #(
       subj <> ".IsError()",
-      single_binding(bindings, subj <> ".Err()", TyUnknown),
+      single_binding(bindings, subj <> ".Err()", err_ty),
     )
     // User-defined tagged-union patterns via Go type assertions.
     ast.PConstructor([type_name, variant_name], bindings) ->
@@ -766,6 +1226,15 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
     ast.EMember(target, field) ->
       case infer(env, target) {
         TyCustom(type_name) -> field_ty(env, type_name, field)
+        TyBuiltin(name) ->
+          case builtin_fields(name) {
+            Some(fields) ->
+              case list.find(fields, fn(f) { f.0 == field }) {
+                Ok(#(_, ty)) -> ty
+                Error(_) -> TyUnknown
+              }
+            None -> TyUnknown
+          }
         _ -> TyUnknown
       }
     ast.ECall(callee, _) ->
@@ -780,6 +1249,20 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
                 Ok(#(_, ret)) -> ret
                 Error(_) -> TyUnknown
               }
+          }
+        ast.EMember(ast.EMember(ast.EIdent("hive"), "http"), "request") ->
+          TyResult(TyBuiltin("HttpResponse"), TyBuiltin("HttpError"))
+        ast.EMember(ast.EMember(ast.EIdent("hive"), "json"), fname) ->
+          case fname {
+            "table" -> TyResult(TyTable, TyBuiltin("JsonError"))
+            "get" -> TyResult(TyStr, TyBuiltin("JsonError"))
+            "encode" -> TyStr
+            _ -> TyUnknown
+          }
+        ast.EMember(ast.EIdent("hive"), name) ->
+          case builtin_fields(name) {
+            Some(_) -> TyBuiltin(name)
+            None -> TyUnknown
           }
         ast.EMember(ast.EIdent(type_name), _) ->
           case dict.has_key(env.types, type_name) {
@@ -809,7 +1292,16 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
           infer_arith(env, l, r)
       }
     ast.EIs(_, _) -> TyBool
-    ast.EUsing(_, _, _) -> TyResult
+    ast.EUsing(_, _) -> TyResult(TyTable, TyBuiltin("TableError"))
+    ast.EWith(value, typ) ->
+      case value {
+        ast.ECall(
+          ast.EMember(ast.EMember(ast.EIdent("hive"), "json"), "parse"),
+          _,
+        ) ->
+          TyResult(ty_of_type_expr(env.types, typ), TyBuiltin("JsonError"))
+        _ -> infer(env, value)
+      }
   }
 }
 
@@ -866,17 +1358,49 @@ fn gen_expr(env: Env, e: ast.Expr) -> String {
         Error(_) -> name
       }
     ast.EVector(items) -> gen_vector(env, items, TyUnknown)
-    ast.EMember(target, field) -> gen_expr(env, target) <> "." <> field
+    ast.EMember(target, field) -> {
+      // Hive fields are lowercase but compile to exported Go fields, so
+      // capitalize the access whenever the target is a known struct.
+      let field = case infer(env, target) {
+        TyBuiltin(_) -> exported(field)
+        TyCustom(type_name) ->
+          case dict.get(env.types, type_name) {
+            Ok(ast.TypeDecl(_, [], _)) -> exported(field)
+            _ -> field
+          }
+        _ -> field
+      }
+      gen_expr(env, target) <> "." <> field
+    }
     ast.EIndex(target, idx) ->
       gen_expr(env, target) <> "[" <> gen_expr(env, idx) <> "]"
     ast.ESlice(target, low, high) -> gen_slice(env, target, low, high)
     ast.EBinary(op, l, r) -> gen_binary(env, op, l, r)
-    ast.EUsing(path, delim, _) -> gen_using(env, path, delim)
+    ast.EUsing(path, delim) -> gen_using(env, path, delim)
     ast.EIs(subject, pattern) -> {
       let #(cond, _) = gen_is(env, subject, pattern)
       cond
     }
     ast.ECall(callee, args) -> gen_call(env, callee, args)
+    ast.EWith(value, typ) -> gen_with(env, value, typ)
+  }
+}
+
+// `hive.json.parse(text) with T` — the decoder is derived from T at compile
+// time (validation guarantees the value is a parse call).
+fn gen_with(env: Env, value: ast.Expr, typ: ast.TypeExpr) -> String {
+  case value {
+    ast.ECall(
+      ast.EMember(ast.EMember(ast.EIdent("hive"), "json"), "parse"),
+      args,
+    ) -> {
+      let text = case assign_args(args, ["text"]) {
+        #([#(_, t)], []) -> gen_expr(env, t)
+        _ -> gen_args(env, args)
+      }
+      "hive.JsonParse(" <> text <> ", " <> json_decoder_ref(env, typ) <> ")"
+    }
+    _ -> gen_expr(env, value)
   }
 }
 
@@ -1022,19 +1546,155 @@ fn gen_using(env: Env, path: ast.Expr, delim: Option(ast.Expr)) -> String {
   "hive.ReadCSV(" <> gen_expr(env, path) <> ", " <> delim_str <> ")"
 }
 
-fn gen_call(env: Env, callee: ast.Expr, args: List(ast.Expr)) -> String {
+fn gen_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
   case callee {
     ast.EIdent(name) -> gen_ident_call(env, name, args)
+    // The `hive.http` and `hive.json` standard library namespaces.
+    ast.EMember(ast.EMember(ast.EIdent("hive"), "http"), fname) ->
+      gen_http_call(env, fname, args)
+    ast.EMember(ast.EMember(ast.EIdent("hive"), "json"), fname) ->
+      gen_json_call(env, fname, args)
     ast.EMember(ast.EIdent(type_name), variant_name) ->
       case dict.get(env.types, type_name) {
         Ok(_) -> gen_constructor(env, type_name, variant_name, args)
-        Error(_) -> gen_plain_call(env, callee, args)
+        Error(_) ->
+          case type_name {
+            // `hive.HttpRequest(...)` etc. — positional constructors for the
+            // runtime's builtin structs.
+            "hive" ->
+              case builtin_fields(variant_name) {
+                Some(fields) ->
+                  gen_builtin_construct(env, variant_name, fields, args)
+                None -> gen_plain_call(env, callee, args)
+              }
+            _ -> gen_plain_call(env, callee, args)
+          }
       }
     _ -> gen_plain_call(env, callee, args)
   }
 }
 
-fn gen_ident_call(env: Env, name: String, args: List(ast.Expr)) -> String {
+// The validation pass (compiler.check) has already rejected unknown members,
+// bad arities and unknown named arguments, so lowering can be
+// straightforward here.
+fn gen_http_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
+  case fname {
+    "request" ->
+      case assign_args(args, ["request"]) {
+        #([#(_, req)], []) ->
+          "hive.HttpSend(" <> coerce(env, req, TyBuiltin("HttpRequest")) <> ")"
+        _ -> "hive.HttpSend(" <> gen_args(env, args) <> ")"
+      }
+    "serve" ->
+      case assign_args(args, ["port", "handler"]) {
+        #([#(_, port), #(_, handler)], []) ->
+          "hive.HttpServe("
+          <> coerce(env, port, TyInt)
+          <> ", "
+          <> gen_expr(env, handler)
+          <> ")"
+        _ -> "hive.HttpServe(" <> gen_args(env, args) <> ")"
+      }
+    _ -> "hive.Http" <> exported(fname) <> "(" <> gen_args(env, args) <> ")"
+  }
+}
+
+fn gen_json_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
+  case fname {
+    "encode" ->
+      case assign_args(args, ["value"]) {
+        #([#(_, value)], []) ->
+          gen_json_encode(infer(env, value), gen_expr(env, value), 0)
+        _ -> "hive.JsonEncodeDynamic(" <> gen_args(env, args) <> ")"
+      }
+    "table" ->
+      case assign_args(args, ["text"]) {
+        #([#(_, text)], []) -> "hive.JsonTable(" <> gen_expr(env, text) <> ")"
+        _ -> "hive.JsonTable(" <> gen_args(env, args) <> ")"
+      }
+    "get" ->
+      case assign_args(args, ["table", "path"]) {
+        #([#(_, table), #(_, path)], []) ->
+          "hive.JsonGet("
+          <> gen_expr(env, table)
+          <> ", "
+          <> coerce(env, path, TyStr)
+          <> ")"
+        _ -> "hive.JsonGet(" <> gen_args(env, args) <> ")"
+      }
+    // `parse` only occurs under `with` (validation enforces it); anything
+    // else was rejected by the validation pass.
+    _ -> "hive.JsonEncodeDynamic(" <> gen_args(env, args) <> ")"
+  }
+}
+
+// Picks the encoder for a value from its inferred type. Unknown types fall
+// back to the runtime's dynamic encoder.
+fn gen_json_encode(ty: Ty, value: String, depth: Int) -> String {
+  case ty {
+    TyStr -> "hive.JsonEncodeStr(" <> value <> ")"
+    TyInt -> "hive.JsonEncodeInt(" <> value <> ")"
+    TyFloat -> "hive.JsonEncodeFloat(" <> value <> ")"
+    TyBool -> "hive.JsonEncodeBool(" <> value <> ")"
+    TyAtom -> "hive.JsonEncodeAtom(" <> value <> ")"
+    TyTable -> "hive.JsonEncodeTable(" <> value <> ")"
+    TyCustom(name) -> "jsonEncode_" <> name <> "(" <> value <> ")"
+    TyVec(elem) -> {
+      let e = "e" <> int.to_string(depth)
+      "hive.JsonEncodeVec("
+      <> value
+      <> ", func("
+      <> e
+      <> " "
+      <> ty_to_go(elem)
+      <> ") string { return "
+      <> gen_json_encode(elem, e, depth + 1)
+      <> " })"
+    }
+    _ -> "hive.JsonEncodeDynamic(" <> value <> ")"
+  }
+}
+
+fn gen_builtin_construct(
+  env: Env,
+  name: String,
+  fields: List(#(String, Ty)),
+  args: List(ast.Arg),
+) -> String {
+  "hive."
+  <> name
+  <> "{"
+  <> gen_field_args(env, args, fields)
+  <> "}"
+}
+
+// Renders the provided arguments as a Go struct literal body, honouring
+// named arguments.
+fn gen_field_args(
+  env: Env,
+  args: List(ast.Arg),
+  fields: List(#(String, Ty)),
+) -> String {
+  let #(assigned, extra) = assign_args(args, list.map(fields, fn(f) { f.0 }))
+  let assigned_strs =
+    assigned
+    |> list.map(fn(pair) {
+      let #(fname, value) = pair
+      let ty = case list.find(fields, fn(f) { f.0 == fname }) {
+        Ok(#(_, t)) -> t
+        Error(_) -> TyUnknown
+      }
+      exported(fname) <> ": " <> coerce(env, value, ty)
+    })
+  let extra_strs =
+    extra
+    |> list.index_map(fn(e, i) {
+      "Field" <> int.to_string(i) <> ": " <> gen_expr(env, e)
+    })
+  string.join(list.append(assigned_strs, extra_strs), ", ")
+}
+
+fn gen_ident_call(env: Env, name: String, args: List(ast.Arg)) -> String {
   case name {
     "len" -> "len(" <> gen_args(env, args) <> ")"
     "now" -> "hive.Now()"
@@ -1049,12 +1709,34 @@ fn gen_ident_call(env: Env, name: String, args: List(ast.Expr)) -> String {
         Ok(ast.TypeDecl(_, [], _)) -> gen_struct_construct(env, name, args)
         _ ->
           case dict.get(env.sigs, name) {
-            Ok(#(ptys, _)) ->
-              name <> "(" <> gen_coerced_args(env, args, ptys) <> ")"
+            Ok(#(params, _)) ->
+              name <> "(" <> gen_sig_args(env, args, params) <> ")"
             Error(_) -> name <> "(" <> gen_args(env, args) <> ")"
           }
       }
   }
+}
+
+// Renders call arguments in the callee's declared parameter order, honouring
+// named arguments and coercing each value to its parameter type.
+fn gen_sig_args(
+  env: Env,
+  args: List(ast.Arg),
+  params: List(#(String, Ty)),
+) -> String {
+  let #(assigned, extra) = assign_args(args, list.map(params, fn(p) { p.0 }))
+  let assigned_strs =
+    assigned
+    |> list.map(fn(pair) {
+      let #(pname, value) = pair
+      let ty = case list.find(params, fn(p) { p.0 == pname }) {
+        Ok(#(_, t)) -> t
+        Error(_) -> TyUnknown
+      }
+      coerce(env, value, ty)
+    })
+  let extra_strs = list.map(extra, fn(e) { gen_expr(env, e) })
+  string.join(list.append(assigned_strs, extra_strs), ", ")
 }
 
 // Variant constructors produce the union's interface type so the value can be
@@ -1063,66 +1745,40 @@ fn gen_constructor(
   env: Env,
   type_name: String,
   variant_name: String,
-  args: List(ast.Expr),
+  args: List(ast.Arg),
 ) -> String {
   let struct_name = type_name <> variant_name
-  let fields = variant_fields(env, type_name, variant_name)
+  let fields =
+    variant_fields(env, type_name, variant_name)
+    |> list.map(fn(f) { #(f.name, ty_of_type_expr(env.types, f.typ)) })
   type_name
   <> "("
   <> struct_name
   <> "{"
-  <> zip_fields(env, fields, args)
+  <> gen_field_args(env, args, fields)
   <> "})"
 }
 
 fn gen_struct_construct(
   env: Env,
   type_name: String,
-  args: List(ast.Expr),
+  args: List(ast.Arg),
 ) -> String {
   let fields = case dict.get(env.types, type_name) {
-    Ok(ast.TypeDecl(_, _, commons)) -> commons
+    Ok(ast.TypeDecl(_, _, commons)) ->
+      list.map(commons, fn(f) { #(f.name, ty_of_type_expr(env.types, f.typ)) })
     _ -> []
   }
-  type_name <> "{" <> zip_fields(env, fields, args) <> "}"
+  type_name <> "{" <> gen_field_args(env, args, fields) <> "}"
 }
 
-fn zip_fields(env: Env, fields: List(ast.Field), args: List(ast.Expr)) -> String {
-  args
-  |> list.index_map(fn(arg, i) {
-    case list_at(fields, i) {
-      Some(f) ->
-        exported(f.name)
-        <> ": "
-        <> coerce(env, arg, ty_of_type_expr(env.types, f.typ))
-      None -> "Field" <> int.to_string(i) <> ": " <> gen_expr(env, arg)
-    }
-  })
-  |> string.join(", ")
-}
-
-fn gen_plain_call(env: Env, callee: ast.Expr, args: List(ast.Expr)) -> String {
+fn gen_plain_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
   gen_expr(env, callee) <> "(" <> gen_args(env, args) <> ")"
 }
 
-fn gen_args(env: Env, args: List(ast.Expr)) -> String {
+fn gen_args(env: Env, args: List(ast.Arg)) -> String {
   args
-  |> list.map(fn(a) { gen_expr(env, a) })
-  |> string.join(", ")
-}
-
-fn gen_coerced_args(
-  env: Env,
-  args: List(ast.Expr),
-  ptys: List(Ty),
-) -> String {
-  args
-  |> list.index_map(fn(arg, i) {
-    case list_at(ptys, i) {
-      Some(ty) -> coerce(env, arg, ty)
-      None -> gen_expr(env, arg)
-    }
-  })
+  |> list.map(fn(a) { gen_expr(env, a.value) })
   |> string.join(", ")
 }
 
@@ -1242,14 +1898,15 @@ fn uses_in_expr(e: ast.Expr, name: String) -> Bool {
     ast.EMember(t, _) -> uses_in_expr(t, name)
     ast.ECall(callee, args) ->
       uses_in_expr(callee, name)
-      || list.any(args, fn(a) { uses_in_expr(a, name) })
+      || list.any(args, fn(a) { uses_in_expr(a.value, name) })
     ast.EIndex(t, idx) -> uses_in_expr(t, name) || uses_in_expr(idx, name)
     ast.ESlice(t, lo, hi) ->
       uses_in_expr(t, name) || uses_in_opt(lo, name) || uses_in_opt(hi, name)
     ast.EBinary(_, l, r) -> uses_in_expr(l, name) || uses_in_expr(r, name)
     ast.EIs(subject, _) -> uses_in_expr(subject, name)
-    ast.EUsing(path, delim, _) ->
+    ast.EUsing(path, delim) ->
       uses_in_expr(path, name) || uses_in_opt(delim, name)
+    ast.EWith(value, _) -> uses_in_expr(value, name)
   }
 }
 

@@ -587,13 +587,27 @@ fn parse_multiplicative_rest(
 
 // `**` is right-associative: `2 ** 3 ** 2` is `2 ** (3 ** 2)`.
 fn parse_power(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
-  use #(base, t1) <- result.try(parse_postfix(tokens))
+  use #(base, t1) <- result.try(parse_with_type(tokens))
   case kind(t1) {
     token.StarStar -> {
       use #(exponent, t2) <- result.try(parse_power(tail(t1)))
       Ok(#(ast.EBinary(ast.OpPow, base, exponent), t2))
     }
     _ -> Ok(#(base, t1))
+  }
+}
+
+// `expr with Type` — a decode-target annotation (`hive.json.parse(x) with
+// User`). Note that `using`'s own `with <delimiter>` is consumed inside
+// `parse_using` and never reaches here.
+fn parse_with_type(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
+  use #(value, t1) <- result.try(parse_postfix(tokens))
+  case kind(t1) {
+    token.KwWith -> {
+      use #(typ, t2) <- result.try(parse_type_expr(tail(t1)))
+      Ok(#(ast.EWith(value, typ), t2))
+    }
+    _ -> Ok(#(value, t1))
   }
 }
 
@@ -625,12 +639,12 @@ fn parse_postfix_rest(
 
 fn parse_args(
   tokens: Toks,
-  acc: List(ast.Expr),
-) -> Result(#(List(ast.Expr), Toks), String) {
+  acc: List(ast.Arg),
+) -> Result(#(List(ast.Arg), Toks), String) {
   case kind(tokens) {
     token.RParen -> Ok(#(list.reverse(acc), tail(tokens)))
     _ -> {
-      use #(arg, t1) <- result.try(parse_expr(tokens))
+      use #(arg, t1) <- result.try(parse_arg(tokens))
       case kind(t1) {
         token.Comma -> parse_args(tail(t1), [arg, ..acc])
         token.RParen -> Ok(#(list.reverse([arg, ..acc]), tail(t1)))
@@ -641,6 +655,20 @@ fn parse_args(
             <> at(t1),
           )
       }
+    }
+  }
+}
+
+// An argument is either `name: expr` (named) or a plain expression.
+fn parse_arg(tokens: Toks) -> Result(#(ast.Arg, Toks), String) {
+  case kind(tokens), kind(tail(tokens)) {
+    token.Ident(name), token.Colon -> {
+      use #(value, t1) <- result.try(parse_expr(tail(tail(tokens))))
+      Ok(#(ast.Arg(Some(name), value), t1))
+    }
+    _, _ -> {
+      use #(value, t1) <- result.try(parse_expr(tokens))
+      Ok(#(ast.Arg(None, value), t1))
     }
   }
 }
@@ -787,14 +815,7 @@ fn parse_using(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
     }
     _ -> Ok(#(None, t2))
   })
-  use #(as_name, t4) <- result.try(case kind(t3) {
-    token.KwAs -> {
-      use #(n, t) <- result.try(expect_ident(tail(t3)))
-      Ok(#(Some(n), t))
-    }
-    _ -> Ok(#(None, t3))
-  })
-  Ok(#(ast.EUsing(path, delim, as_name), t4))
+  Ok(#(ast.EUsing(path, delim), t3))
 }
 
 fn parse_pattern(tokens: Toks) -> Result(#(ast.Pattern, Toks), String) {

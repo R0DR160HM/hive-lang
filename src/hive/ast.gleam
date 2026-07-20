@@ -121,7 +121,7 @@ pub type Expr {
   /// A vector literal, e.g. `["Hello", "World"]`.
   EVector(items: List(Expr))
   EMember(target: Expr, field: String)
-  ECall(callee: Expr, args: List(Expr))
+  ECall(callee: Expr, args: List(Arg))
   EIndex(target: Expr, index: Expr)
   /// `target[low:high]` where each bound is optional. Slices are inclusive of
   /// the high bound (per the language spec: `table[1:]` == `table[1:len-1]`).
@@ -129,8 +129,19 @@ pub type Expr {
   EBinary(op: BinOp, left: Expr, right: Expr)
   /// `subject is Pattern` — a boolean type-check that may bind variables.
   EIs(subject: Expr, pattern: Pattern)
-  /// `using <path> [with <delimiter>] [as <name>]`
-  EUsing(path: Expr, delimiter: Option(Expr), as_name: Option(String))
+  /// `using <path> [with <delimiter>]`
+  EUsing(path: Expr, delimiter: Option(Expr))
+  /// `hive.json.parse(text) with Type` — gives a decode target type to an
+  /// expression. Only valid on `hive.json.parse` calls.
+  EWith(value: Expr, typ: TypeExpr)
+}
+
+/// One argument in a call. Arguments may be passed by name
+/// (`f(port: 80, h)`); only the unnamed ones need to be in order — they fill
+/// whichever parameters the named arguments didn't claim, in declaration
+/// order.
+pub type Arg {
+  Arg(name: Option(String), value: Expr)
 }
 
 pub type Pattern {

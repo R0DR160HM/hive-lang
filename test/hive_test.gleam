@@ -268,8 +268,256 @@ pub fn func_cannot_call_proc_test() {
 }
 
 // ---------------------------------------------------------------------------
+// Named arguments
+// ---------------------------------------------------------------------------
+
+pub fn named_args_reorder_call_test() {
+  let go =
+    compile(
+      "func f(a: Str, b: Int): Str {\n\treturn a\n}\nproc main(): void {\n\techo f(b: 1, \"s\")\n}\n",
+    )
+  // `b` is claimed by name, so the unnamed \"s\" fills `a`.
+  should.be_true(string.contains(go, "f(\"s\", 1)"))
+}
+
+pub fn named_args_on_constructor_test() {
+  let go =
+    compile(
+      "type T {\n\tA {\n\t\tx: Str\n\t\ty: Int\n\t}\n}\nfunc f(): T {\n\treturn T.A(y: 2, \"s\")\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "T(TA{X: \"s\", Y: 2})"))
+}
+
+pub fn named_args_on_builtin_constructor_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\thive.http.serve(handler: h, port: 8080)\n}\nproc h(r: hive.HttpRequest): hive.HttpResponse {\n\treturn hive.HttpResponse(200, body: \"ok\", headers: [])\n}\n",
+    )
+  // Both the builtin call and the builtin constructor resolve named args.
+  should.be_true(string.contains(go, "hive.HttpServe(8080, h)"))
+  should.be_true(string.contains(
+    go,
+    "hive.HttpResponse{Status: 200, Headers: [][]string{}, Body: \"ok\"}",
+  ))
+}
+
+pub fn duplicate_named_arg_is_rejected_test() {
+  let result =
+    compiler.compile(
+      "func f(a: Str): Str {\n\treturn a\n}\nproc main(): void {\n\techo f(a: \"x\", a: \"y\")\n}\n",
+    )
+  should.be_error(result)
+}
+
+pub fn unknown_named_arg_is_rejected_test() {
+  let result =
+    compiler.compile(
+      "func f(a: Str): Str {\n\treturn a\n}\nproc main(): void {\n\techo f(nope: \"x\")\n}\n",
+    )
+  should.be_error(result)
+}
+
+pub fn named_arg_on_unknown_target_is_rejected_test() {
+  let result =
+    compiler.compile("proc main(): void {\n\techo len(v: [\"a\"])\n}\n")
+  should.be_error(result)
+}
+
+pub fn incomplete_named_call_is_rejected_test() {
+  // Once named arguments are used, the full parameter list must be covered.
+  let result =
+    compiler.compile(
+      "func f(a: Str, b: Int): Str {\n\treturn a\n}\nproc main(): void {\n\techo f(a: \"x\")\n}\n",
+    )
+  should.be_error(result)
+}
+
+// ---------------------------------------------------------------------------
+// The hive.http standard library
+// ---------------------------------------------------------------------------
+
+pub fn http_request_lowers_test() {
+  let go =
+    compile(
+      "proc f(): Str {\n\tr := hive.http.request(hive.HttpRequest(\"GET\", \"http://x\", [], \"\"))\n\tif r is Result.Ok(response) {\n\t\treturn response.body\n\t} else if r is Result.Error(error) {\n\t\treturn error.message\n\t}\n}\nproc main(): void {}\n",
+    )
+  // The builtin constructor is positional and the call goes through HttpSend.
+  should.be_true(string.contains(
+    go,
+    "hive.HttpSend(hive.HttpRequest{Method: \"GET\", Url: \"http://x\", Headers: [][]string{}, Body: \"\"})",
+  ))
+  // Result payloads are typed, so builtin fields capitalize correctly.
+  should.be_true(string.contains(go, "return response.Body"))
+  should.be_true(string.contains(go, "return error.Message"))
+}
+
+pub fn http_serve_lowers_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\thive.http.serve(8080, handle)\n}\nproc handle(request: hive.HttpRequest): hive.HttpResponse {\n\treturn hive.HttpResponse(200, [], request.body)\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.HttpServe(8080, handle)"))
+  should.be_true(string.contains(
+    go,
+    "func handle(request hive.HttpRequest) hive.HttpResponse {",
+  ))
+  should.be_true(string.contains(
+    go,
+    "hive.HttpResponse{Status: 200, Headers: [][]string{}, Body: request.Body}",
+  ))
+}
+
+pub fn func_cannot_use_http_test() {
+  let result =
+    compiler.compile(
+      "func f(): Str {\n\tr := hive.http.request(hive.HttpRequest(\"GET\", \"http://x\", [], \"\"))\n\treturn \"x\"\n}\nproc main(): void {}\n",
+    )
+  should.be_error(result)
+}
+
+pub fn serve_handler_must_match_signature_test() {
+  // Wrong parameter type: the handler must take exactly one hive.HttpRequest.
+  let result =
+    compiler.compile(
+      "proc main(): void {\n\thive.http.serve(8080, bad)\n}\nproc bad(x: Int): hive.HttpResponse {\n\treturn hive.HttpResponse(200, [], \"\")\n}\n",
+    )
+  should.be_error(result)
+}
+
+pub fn serve_handler_must_be_a_proc_test() {
+  let result =
+    compiler.compile(
+      "proc main(): void {\n\thive.http.serve(8080, nowhere)\n}\n",
+    )
+  should.be_error(result)
+}
+
+pub fn unknown_http_builtin_is_rejected_test() {
+  let result =
+    compiler.compile("proc main(): void {\n\thive.http.download(\"x\")\n}\n")
+  should.be_error(result)
+}
+
+// ---------------------------------------------------------------------------
+// The hive.json standard library
+// ---------------------------------------------------------------------------
+
+pub fn json_parse_with_derives_decoder_test() {
+  let go =
+    compile(
+      "type User {\n\tname: Str\n\ttags: Str[3]\n}\nfunc f(text: Str): Str {\n\tparsed := hive.json.parse(text) with User\n\tif parsed is Result.Ok(user) {\n\t\treturn user.name\n\t} else if parsed is Result.Error(error) {\n\t\treturn error.path\n\t}\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "hive.JsonParse(text, jsonDecode_User)"))
+  // Static vector lengths are checked; only declared fields are read, so
+  // unmapped JSON fields are simply ignored.
+  should.be_true(string.contains(go, "hive.JsonVecN(v, p, 3, hive.JsonStr)"))
+  should.be_false(string.contains(go, "JsonExactKeys"))
+  // Result payloads are typed: bindings capitalize builtin/struct fields.
+  should.be_true(string.contains(go, "return user.Name"))
+  should.be_true(string.contains(go, "return error.Path"))
+}
+
+pub fn json_parse_with_table_flattens_test() {
+  let go =
+    compile(
+      "func f(text: Str): Str {\n\tparsed := hive.json.parse(text) with Table\n\tif parsed is Result.Ok(table) {\n\t\tfound := hive.json.get(table, \"a.b\")\n\t\tif found is Result.Ok(value) {\n\t\t\treturn value\n\t\t}\n\t}\n\treturn \"none\"\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "hive.JsonParse(text, hive.JsonFlatten)"))
+}
+
+pub fn json_table_field_is_rejected_test() {
+  // Unmapped JSON is ignored, so a Table field has nothing to hold and the
+  // decoder derivation refuses it.
+  let result =
+    compiler.compile(
+      "type Bag {\n\tstuff: Table\n}\nfunc f(text: Str): Str {\n\tparsed := hive.json.parse(text) with Bag\n\treturn \"x\"\n}\nproc main(): void {}\n",
+    )
+  should.be_error(result)
+}
+
+pub fn json_variant_decoder_test() {
+  let go =
+    compile(
+      "type Shape {\n\tCircle {\n\t\tradius: Float\n\t}\n\tNothing\n}\nfunc f(text: Str): Str {\n\tparsed := hive.json.parse(text) with Shape\n\treturn \"ok\"\n}\nproc main(): void {}\n",
+    )
+  // Unions decode from {\"VariantName\": {...}}; null selects the first
+  // field-less variant.
+  should.be_true(string.contains(go, "key, inner, jerr := hive.JsonVariant(v, path)"))
+  should.be_true(string.contains(go, "case \"Circle\":"))
+  should.be_true(string.contains(
+    go,
+    "if v.Kind == 'n' {\n\t\treturn Shape(ShapeNothing{}), nil\n\t}",
+  ))
+}
+
+pub fn json_encode_derives_encoder_test() {
+  let go =
+    compile(
+      "type Reply {\n\tmessage: Str\n\tcount: Int\n}\nfunc f(): Str {\n\treturn hive.json.encode(Reply(\"hi\", 2))\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "jsonEncode_Reply(Reply{Message: \"hi\", Count: 2})"))
+  should.be_true(string.contains(
+    go,
+    "return \"{\\\"message\\\":\" + hive.JsonEncodeStr(x.Message) + \",\\\"count\\\":\" + hive.JsonEncodeInt(x.Count) + \"}\"",
+  ))
+}
+
+pub fn json_table_and_get_lower_test() {
+  let go =
+    compile(
+      "func f(text: Str): Str {\n\trows := hive.json.table(text)\n\tif rows is Result.Ok(table) {\n\t\tfound := hive.json.get(table, \"name\")\n\t\tif found is Result.Ok(value) {\n\t\t\treturn value\n\t\t}\n\t}\n\treturn \"none\"\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "hive.JsonTable(text)"))
+  should.be_true(string.contains(go, "hive.JsonGet(table, \"name\")"))
+}
+
+pub fn json_is_pure_test() {
+  // hive.json is allowed inside funcs (unlike hive.http).
+  let result =
+    compiler.compile(
+      "func f(text: Str): Str {\n\treturn hive.json.encode(text)\n}\nproc main(): void {}\n",
+    )
+  should.be_ok(result)
+}
+
+pub fn with_requires_json_parse_test() {
+  let result =
+    compiler.compile(
+      "proc main(): void {\n\tx := len([\"a\"]) with Int\n\techo x\n}\n",
+    )
+  should.be_error(result)
+}
+
+pub fn bare_json_parse_requires_with_test() {
+  let result =
+    compiler.compile(
+      "proc main(): void {\n\tx := hive.json.parse(\"{}\")\n\techo x\n}\n",
+    )
+  should.be_error(result)
+}
+
+pub fn with_unknown_type_is_rejected_test() {
+  let result =
+    compiler.compile(
+      "proc main(): void {\n\tx := hive.json.parse(\"{}\") with Nowhere\n\techo x\n}\n",
+    )
+  should.be_error(result)
+}
+
+pub fn unknown_json_builtin_is_rejected_test() {
+  let result =
+    compiler.compile("proc main(): void {\n\thive.json.stringify(\"x\")\n}\n")
+  should.be_error(result)
+}
+
+// ---------------------------------------------------------------------------
 // The shipped code examples must always compile
 // ---------------------------------------------------------------------------
+
+pub fn http_example_compiles_test() {
+  let assert Ok(src) = simplifile.read("code-examples/3 - HTTP/http.hive")
+  let assert Ok(_) = compiler.compile(src)
+}
 
 pub fn basic_io_example_compiles_test() {
   let assert Ok(src) = simplifile.read("code-examples/1 - Basic IO/basic-io.hive")
