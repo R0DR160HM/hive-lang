@@ -164,10 +164,14 @@ language's specification: each one compiles, builds and runs.
   does not block the caller — while `await someAsyncCall()` blocks the current
   thread until the function returns its value.
 * **Atoms** (`#SomeAtom`) are interned symbols. The compiler assigns each a
-  small integer (`#False` = 0 and `#True` = 1 always come first — `false` and
-  `true` are aliases for them) and embeds the atom table in the executable,
-  so `echo` prints an atom's name while coercion to `Str` yields its decimal
-  value (`"0" + True == "01"`).
+  small integer (`#False` = 0 and `#True` = 1 always come first) and embeds
+  the atom table in the executable, so `echo` prints an atom's name while
+  coercion to `Str` yields its decimal value (`"0" + #True == "01"`). A bare
+  atom in boolean position is truthy unless it is `#False`.
+* **Booleans** — `Bool` is a real boolean type (Go `bool`); its literals are
+  `true` and `false`. It is distinct from the `#True`/`#False` atoms above:
+  comparisons and `&&`/`||` produce `Bool`, and a `Bool` field or value holds
+  `true`/`false`, not an atom.
 * **Numbers** are `Int` or `Float` with `+ - * / **`; dividing by zero
   returns 0.
 * **Custom types** are Gleam-style ADTs: no variants ⇒ a struct, variants ⇒
@@ -327,7 +331,8 @@ Postgres is `github.com/lib/pq`.
 | `using conn with q` (SQL connection)    | `hive.SqlQuery(conn, q)` → `Result[Table, SqlError]`           |
 | `"{a} and {b}"`                         | concatenation, non-`Str` pieces via `hive.ToStr`               |
 | `[x, y] + [z]`                          | `hive.Concat([]T{x, y}, []T{z})`                               |
-| `#Atom`, `true`, `false`                | `hive.Atom` constants + a generated `hive.InitAtoms` table     |
+| `#Atom`                                 | `hive.Atom` constants + a generated `hive.InitAtoms` table     |
+| `true` / `false`                        | Go `true` / `false` (the `Bool` type, not atoms)               |
 | `a / b`, `a ** b`                       | `hive.DivInt`/`hive.DivFloat`, `hive.PowInt`/`hive.PowFloat`   |
 | `len(v)` vector / `len(s)` Str          | `len(v)` (elements) / `hive.StrLen(s)` (UTF-8 runes)           |
 | `bytes(v)` vector / `bytes(s)` Str      | `hive.Bytes(v)` (footprint) / `len(s)` (UTF-8 byte length)     |

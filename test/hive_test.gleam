@@ -204,13 +204,24 @@ pub fn atoms_get_a_table_and_constants_test() {
 pub fn atom_coerces_to_str_next_to_string_test() {
   let go =
     compile(
-      "func f(): void {\n\tassert \"0\" + True == \"01\"\n}\nproc main(): void {}\n",
+      "func f(): void {\n\tassert \"0\" + #True == \"01\"\n}\nproc main(): void {}\n",
     )
-  // True is the atom #True (value 1); as a Str it reads \"1\".
+  // #True is the atom at value 1; as a Str it reads \"1\".
   should.be_true(string.contains(
     go,
     "hive.Assert(((\"0\" + hive.AtomToStr(hive.True)) == \"01\"))",
   ))
+}
+
+pub fn bool_literals_are_go_bools_test() {
+  // `true`/`false` are the Bool type (Go bool), not atoms, so they fit a
+  // `Bool` field/return directly.
+  let go =
+    compile(
+      "type Flag {\n\ton: Bool\n}\nfunc f(): Bool {\n\tx := Flag(true)\n\treturn x.on\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "On bool"))
+  should.be_true(string.contains(go, "Flag{On: true}"))
 }
 
 pub fn float_and_safe_division_test() {

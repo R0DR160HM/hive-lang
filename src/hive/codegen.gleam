@@ -1272,8 +1272,9 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
     ast.EFloat(_) -> TyFloat
     ast.EString(_) -> TyStr
     ast.EInterp(_) -> TyStr
-    // `true`/`false` are the atoms #True/#False.
-    ast.EBool(_) -> TyAtom
+    // `true`/`false` are Bool literals (Go booleans), distinct from the
+    // `#True`/`#False` atoms.
+    ast.EBool(_) -> TyBool
     ast.EAtom(_) -> TyAtom
     ast.EIdent(name) ->
       case dict.get(env.locals, name) {
@@ -1462,8 +1463,8 @@ fn gen_expr(env: Env, e: ast.Expr) -> String {
     ast.EInterp(parts) -> gen_interp(env, parts)
     ast.EBool(b) ->
       case b {
-        True -> "hive.True"
-        False -> "hive.False"
+        True -> "true"
+        False -> "false"
       }
     ast.EAtom(name) -> gen_atom(name)
     ast.EIdent(name) ->
