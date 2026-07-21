@@ -251,15 +251,24 @@ pub fn query_sanitizes_interpolations_test() {
   ))
 }
 
-pub fn func_cannot_echo_test() {
-  let result =
-    compiler.compile(
-      "func f(): void {\n\techo \"nope\"\n}\nproc main(): void {}\n",
+pub fn func_can_echo_test() {
+  // Funcs may perform I/O, so echoing from a func is allowed.
+  let go =
+    compile("func f(): void {\n\techo \"ok\"\n}\nproc main(): void {}\n")
+  should.be_true(string.contains(go, "fmt.Println(\"ok\")"))
+}
+
+pub fn func_can_read_files_test() {
+  // `using` (file I/O) is allowed inside a func too.
+  let go =
+    compile(
+      "func f(): Str {\n\tcsv := using \"./x.csv\"\n\treturn \"ok\"\n}\nproc main(): void {}\n",
     )
-  should.be_error(result)
+  should.be_true(string.contains(go, "hive.ReadCSV(\"./x.csv\""))
 }
 
 pub fn func_cannot_call_proc_test() {
+  // The one call restriction that remains: a func may not call a proc.
   let result =
     compiler.compile(
       "proc p(): void {}\nfunc f(): void {\n\tp()\n}\nproc main(): void {}\n",
@@ -511,12 +520,13 @@ pub fn http_serve_lowers_test() {
   ))
 }
 
-pub fn func_cannot_use_http_test() {
-  let result =
-    compiler.compile(
+pub fn func_can_use_http_test() {
+  // hive.http is I/O, which funcs may now perform.
+  let go =
+    compile(
       "func f(): Str {\n\tr := hive.http.request(hive.HttpRequest(\"GET\", \"http://x\", [], \"\"))\n\treturn \"x\"\n}\nproc main(): void {}\n",
     )
-  should.be_error(result)
+  should.be_true(string.contains(go, "hive.HttpSend("))
 }
 
 pub fn serve_handler_must_match_signature_test() {

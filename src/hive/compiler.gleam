@@ -2,9 +2,11 @@
 ////
 //// Between parsing and codegen a validation pass walks every body to
 //// enforce:
-////   * the proc/func split — only `proc`s may perform side effects, so a
-////     `func` cannot `echo`, read files with `using`, use `hive.http`, or
-////     call a `proc`;
+////   * the proc/func split — a `func` may perform I/O (`echo`, `using`,
+////     `hive.http`) just like a `proc`, but it may not call a `proc` (only
+////     procs call procs) and cannot receive a mutex as a parameter;
+////   * mutability — only `mut` variables may be reassigned (`x = ...`,
+////     `v[0] = ...`) or grown with `append`;
 ////   * the `hive.http` builtins — known member names, right arity, and a
 ////     `serve` handler that really is a `proc(hive.HttpRequest):
 ////     hive.HttpResponse`;
@@ -35,15 +37,17 @@ pub fn compile(source: String) -> Result(String, String) {
 // Validation
 // ---------------------------------------------------------------------------
 
-type Kind {
-  InProc
-  InFunc
-}
-
 type Ctx {
   Ctx(
-    kind: Kind,
+    /// The callable currently being checked (used in error messages).
     name: String,
+    /// True while checking a `func` or `query` body. Funcs may perform I/O
+    /// (echo, using, hive.http) just like procs, but they may not call a
+    /// `proc` — only procs may, since procs are the ones that own and pass
+    /// mutable state (mutexes).
+    in_func: Bool,
+    /// Signatures of every declared `proc`, used to reject func→proc calls and
+    /// to validate the `hive.http.serve` handler.
     procs: Dict(String, #(List(ast.Field), ast.TypeExpr)),
     /// Parameter names of every declared proc/func/query.
     callables: Dict(String, List(String)),
@@ -80,17 +84,20 @@ fn check(module: ast.Module) -> Result(Nil, String) {
   list.try_fold(module.decls, Nil, fn(_, d) {
     case d {
       ast.ProcDecl(name, _, _, body) ->
-        check_body(Ctx(InProc, name, procs, callables, types), body)
+        check_body(Ctx(name, False, procs, callables, types), body)
+      // A `func` may perform I/O (echo, using, hive.http, ...) just like a
+      // `proc`. Its two restrictions — no mutex parameters, no calling procs —
+      // are what `in_func` marks.
       ast.FuncDecl(name, _, _, body, _) ->
-        check_body(Ctx(InFunc, name, procs, callables, types), body)
+        check_body(Ctx(name, True, procs, callables, types), body)
       ast.QueryDecl(name, _, _, sql) ->
-        // A query is pure by construction; its interpolations still get
-        // walked (they could call procs).
+        // A query is a func whose body is inline SQL; its interpolations are
+        // walked with the same func restrictions.
         list.try_fold(sql, Nil, fn(_, p) {
           case p {
             ast.ILit(_) -> Ok(Nil)
             ast.IExpr(e) ->
-              check_expr(Ctx(InFunc, name, procs, callables, types), e)
+              check_expr(Ctx(name, True, procs, callables, types), e)
           }
         })
         |> result.map(fn(_) { Nil })
@@ -98,20 +105,6 @@ fn check(module: ast.Module) -> Result(Nil, String) {
     }
   })
   |> result.map(fn(_) { Nil })
-}
-
-fn impure(ctx: Ctx, what: String) -> Result(Nil, String) {
-  case ctx.kind {
-    InProc -> Ok(Nil)
-    InFunc ->
-      Error(
-        "func `"
-        <> ctx.name
-        <> "` cannot use "
-        <> what
-        <> ": only procs may perform side effects",
-      )
-  }
 }
 
 fn check_body(ctx: Ctx, stmts: List(ast.Stmt)) -> Result(Nil, String) {
@@ -144,7 +137,6 @@ fn check_stmt(
 ) -> Result(Dict(String, Bool), String) {
   case s {
     ast.SEcho(e) -> {
-      use _ <- result.try(impure(ctx, "`echo`"))
       use _ <- result.try(check_expr(ctx, e))
       Ok(muts)
     }
@@ -256,7 +248,10 @@ fn check_append(e: ast.Expr, muts: Dict(String, Bool)) -> Result(Nil, String) {
 
 fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
   case e {
-    ast.EUsing(_, _) -> impure(ctx, "`using`")
+    // `using` (reading a file) is I/O, which funcs may now do too, so there is
+    // nothing to reject here — just walk its sub-expressions.
+    ast.EUsing(path, delim) ->
+      check_exprs(ctx, [path, ..option.values([delim])])
     // `hive.json.parse(text) with Type` — the only place `with` is allowed.
     ast.EWith(value, typ) ->
       case value {
@@ -284,7 +279,6 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
     ast.ECall(ast.EMember(ast.EMember(ast.EIdent("hive"), ns), fname), args) ->
       case ns {
         "http" -> {
-          use _ <- result.try(impure(ctx, "`hive.http." <> fname <> "`"))
           use _ <- result.try(check_http_call(ctx, fname, args))
           check_args(ctx, args)
         }
@@ -324,16 +318,16 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
       check_args(ctx, args)
     }
     ast.ECall(ast.EIdent(name), args) -> {
-      use _ <- result.try(case
-        dict.has_key(ctx.procs, name) && ctx.kind == InFunc
-      {
+      // Funcs (and queries) may do I/O, but they may not call procs — only
+      // procs call procs.
+      use _ <- result.try(case ctx.in_func && dict.has_key(ctx.procs, name) {
         True ->
           Error(
             "func `"
             <> ctx.name
             <> "` cannot call proc `"
             <> name
-            <> "`: only procs may perform side effects",
+            <> "`: funcs may perform I/O but only procs may call procs",
           )
         False -> Ok(Nil)
       })

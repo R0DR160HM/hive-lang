@@ -74,68 +74,10 @@ work around it:
 * `hive emit foo.hive` prints the generated Go without producing an
   executable, which is handy while a block is being sorted out.
 
-## The examples
-
-The language is specified by the programs in `code-examples/`; each one
-compiles, builds and runs.
-
-**`1 - Basic IO`** reads a `;`-delimited CSV into a tagged-union
-`ParsingResult`, pattern-matches on it and `echo`s the outcome. The heart of
-it compiles to:
-
-```go
-func parse() ParsingResult {
-	csv := hive.ReadCSV("./test.csv", ";")
-	if csv.IsOk() {
-		table := csv.Ok()
-		if len(table) > 1 {
-			return ParsingResult(ParsingResultSuccess{HeaderlessTable: table[1:], Timestamp: hive.Now()})
-		}
-		return ParsingResult(ParsingResultNoData{Timestamp: hive.Now()})
-	} else if csv.IsError() {
-		error := csv.Err()
-		return ParsingResult(ParsingResultError{Error: error, Timestamp: hive.Now()})
-	}
-	panic("hive: unreachable")
-}
-```
-
-**`2 - Types`** tours the type system: strings (interpolation, backtick
-multiline strings), vectors, atoms, numbers, custom types and queries, plus
-mutability (`mut`, reassignment, `append`) and async funcs (`await` and
-fire-and-forget calls on virtual threads). Running it prints:
-
-```
-Strings!
-[Vectors for the Win!]
-My name is Hive!
-True
-3
-Example
-SELECT * FROM users u
-WHERE u.name = 'O''Brien'
-Hello World!
-```
-
-**`3 - HTTP`** serves an HTTP server on port 8080 whose handler greets every
-route, logs each request, proxies `/proxy` to example.com via
-`hive.http.request`, and speaks JSON on `/greet` — decoding the request body
-against a declared type and encoding the typed reply back:
-
-```sh
-$ hive run "code-examples/3 - HTTP/http.hive" &
-Listening on http://localhost:8080
-$ curl -X POST localhost:8080/greet -d '{"name": "Ana", "details": {"mood": "curious"}}'
-{"message":"Hello Ana, glad you are curious!","timestamp":1784507444}
-$ curl -X POST localhost:8080/greet -d '{"name": 42, "details": {}}'
-{"message":"$.name: expected Str, found the number 42","timestamp":1784507444}
-```
-
 ## A taste of Hive
 
-The four kinds of callable — a pure `func`, a side-effecting `proc`, an inline
-SQL `query`, and an `async func` that runs on its own virtual thread — in one
-program:
+The four kinds of callable — a `func`, a `proc`, an inline SQL `query`, and an
+`async func` that runs on its own virtual thread — in one program:
 
 ```hive
 type Greeting {
@@ -143,7 +85,7 @@ type Greeting {
 	Casual
 }
 
-// A `func` is pure: no side effects, so it is safe to call anywhere.
+// A `func` may perform I/O, but it can't call a `proc` or take a mutex.
 func greet(name: Str, style: Greeting): Str {
 	if style is Greeting.Formal(title) {
 		return "Good evening, {title} {name}."
@@ -185,14 +127,22 @@ SELECT * FROM users WHERE name = 'O''Brien'
 await!!!
 ```
 
+More complete programs — CSV parsing with pattern matching, a full tour of the
+type system, and an HTTP server that speaks JSON — live in `code-examples/`.
+They double as the language's specification: each one compiles, builds and
+runs.
+
 ## The language
 
-* **`proc` / `func` / `query` / `async func`** — a `proc` may perform side
-  effects; a `func` is pure (using `echo`/`using` or calling a `proc` inside
-  one is a compile error). A `query` is a func whose body is inline SQL: every
-  `{param}` interpolated into it is rendered as a quoted SQL literal and
-  sanitized at runtime (`'O''Brien'` above). An `async func` runs on its own
-  virtual thread — see the concurrency bullet below. Programs start at
+* **`proc` / `func` / `query` / `async func`** — both `proc`s and `func`s may
+  perform I/O: `echo`, reading files with `using`, and `hive.http` are all
+  allowed in either. A `func` differs from a `proc` in exactly two ways: it
+  cannot receive a mutex as a parameter (a `mut` value passed to a func is seen
+  as an ordinary immutable copy), and it cannot call a `proc` (only procs call
+  procs). A `query` is a func whose body is inline SQL: every `{param}`
+  interpolated into it is rendered as a quoted SQL literal and sanitized at
+  runtime (`'O''Brien'` above). An `async func` runs on its own virtual
+  thread — see the concurrency bullet below. Programs start at
   `proc main(): void`.
 * **Strings** (`Str`) are UTF-8, support `"{expr}"` interpolation, and
   backtick multiline strings whose indentation is removed at compile time.
@@ -258,8 +208,9 @@ requires its target to be `mut` — it is the in-place way to grow a
 
 ### `hive.http`
 
-The HTTP library. Both calls are side effects, so they are only available
-inside `proc`s. Requests and responses are built positionally —
+The HTTP library. Both calls perform I/O, so — like `echo` and `using` — they
+work inside a `func` or a `proc`. Requests and responses are built
+positionally —
 `hive.HttpRequest(method, url, headers, body)`,
 `hive.HttpResponse(status, headers, body)` — and headers are a `Table` of
 `[name, value]` rows.
@@ -274,7 +225,7 @@ inside `proc`s. Requests and responses are built positionally —
 ### `hive.json`
 
 The JSON library, built on the idea that Hive's type declarations *are* the
-JSON schema. All of `hive.json` is pure, so it is available inside `func`s.
+JSON schema, and works inside both `func`s and `proc`s.
 
 * `hive.json.parse(text) with T` derives a decoder for `T` at compile time and
   returns `Result<T, hive.JsonError>`: missing fields, wrong types and wrong
