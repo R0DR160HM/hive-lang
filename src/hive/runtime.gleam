@@ -20,7 +20,13 @@ pub fn runtime_go() -> String {
   "package hive
 
 import (
+	\"crypto/hmac\"
+	\"crypto/rand\"
+	\"crypto/sha256\"
+	\"crypto/sha512\"
+	\"encoding/base64\"
 	\"encoding/csv\"
+	\"encoding/hex\"
 	\"encoding/json\"
 	\"fmt\"
 	\"io\"
@@ -721,6 +727,212 @@ func JsonEncodeDynamic(v any) string {
 	panic(\"hive: json.encode: cannot derive an encoder for this value\")
 }
 
+// ---------------------------------------------------------------------------
+// Cryptography (hive.crypto): hashes, HMAC, base64, random, and JWTs.
+// ---------------------------------------------------------------------------
+
+// CryptoError says why a crypto operation failed (invalid base64, a bad
+// token, ...). Reason is a short tag: \"Malformed\", \"BadSignature\",
+// \"Expired\", \"NotYetValid\", \"AlgorithmMismatch\" or \"ClaimType\".
+type CryptoError struct {
+	Reason  string
+	Message string
+}
+
+func (e CryptoError) Error() string {
+	return \"hive: crypto \" + e.Reason + \": \" + e.Message
+}
+
+// JwtHeader is a token's decoded (unverified) header.
+type JwtHeader struct {
+	Alg string
+	Typ string
+	Kid string
+}
+
+// hmacSha256Raw is the HMAC-SHA256 of input keyed by secret.
+func hmacSha256Raw(secret string, input string) []byte {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(input))
+	return mac.Sum(nil)
+}
+
+// Sha256 returns the lowercase-hex SHA-256 digest of input.
+func Sha256(input string) string {
+	sum := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(sum[:])
+}
+
+// Sha512 returns the lowercase-hex SHA-512 digest of input.
+func Sha512(input string) string {
+	sum := sha512.Sum512([]byte(input))
+	return hex.EncodeToString(sum[:])
+}
+
+// HmacSha256 returns the lowercase-hex HMAC-SHA256 of input under key.
+func HmacSha256(input string, key string) string {
+	return hex.EncodeToString(hmacSha256Raw(key, input))
+}
+
+// Base64Encode standard-base64-encodes input.
+func Base64Encode(input string) string {
+	return base64.StdEncoding.EncodeToString([]byte(input))
+}
+
+// Base64Decode reverses Base64Encode, or reports a CryptoError on bad input.
+func Base64Decode(input string) Result[string, CryptoError] {
+	b, err := base64.StdEncoding.DecodeString(input)
+	if err != nil {
+		return Err[string, CryptoError](CryptoError{Reason: \"Malformed\", Message: \"input is not valid base64\"})
+	}
+	return Ok[string, CryptoError](string(b))
+}
+
+// RandomHex returns n cryptographically random bytes as a 2n-char hex string.
+func RandomHex(n int) string {
+	if n <= 0 {
+		return \"\"
+	}
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return \"\"
+	}
+	return hex.EncodeToString(buf)
+}
+
+// JwtSign builds an HS256 token from an already-JSON-encoded payload and a
+// shared secret. HMAC signing cannot fail, so it returns a plain string.
+func JwtSign(payloadJSON string, secret string) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{\"alg\":\"HS256\",\"typ\":\"JWT\"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(payloadJSON))
+	input := header + \".\" + payload
+	sig := base64.RawURLEncoding.EncodeToString(hmacSha256Raw(secret, input))
+	return input + \".\" + sig
+}
+
+// jwtParsePayload runs a derived decoder over a raw JSON payload.
+func jwtParsePayload[T any](payload []byte, dec func(JsonValue, string) (T, *JsonError)) (T, *JsonError) {
+	var zero T
+	d := json.NewDecoder(strings.NewReader(string(payload)))
+	d.UseNumber()
+	v, err := parseJsonValue(d)
+	if err != nil {
+		return zero, &JsonError{Path: \"$\", Expected: \"valid JSON\", Found: err.Error()}
+	}
+	return dec(v, \"$\")
+}
+
+// jwtCheckTime enforces the exp/nbf registered claims against the current
+// time. Absent claims are skipped.
+func jwtCheckTime(payload []byte) *CryptoError {
+	var claims struct {
+		Exp json.Number `json:\"exp\"`
+		Nbf json.Number `json:\"nbf\"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return &CryptoError{Reason: \"Malformed\", Message: \"payload is not a JSON object\"}
+	}
+	now := int64(Now())
+	if claims.Exp != \"\" {
+		if exp, err := claims.Exp.Int64(); err == nil && now >= exp {
+			return &CryptoError{Reason: \"Expired\", Message: \"token has expired\"}
+		}
+	}
+	if claims.Nbf != \"\" {
+		if nbf, err := claims.Nbf.Int64(); err == nil && now < nbf {
+			return &CryptoError{Reason: \"NotYetValid\", Message: \"token is not valid yet\"}
+		}
+	}
+	return nil
+}
+
+// JwtVerify checks an HS256 token's signature and its exp/nbf claims against
+// the current time, then decodes the payload into T with the derived decoder.
+func JwtVerify[T any](token string, secret string, dec func(JsonValue, string) (T, *JsonError)) Result[T, CryptoError] {
+	fail := func(reason, msg string) Result[T, CryptoError] {
+		return Err[T, CryptoError](CryptoError{Reason: reason, Message: msg})
+	}
+	parts := strings.Split(token, \".\")
+	if len(parts) != 3 {
+		return fail(\"Malformed\", \"expected three dot-separated segments\")
+	}
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return fail(\"Malformed\", \"header is not valid base64url\")
+	}
+	var hdr struct {
+		Alg string `json:\"alg\"`
+	}
+	if err := json.Unmarshal(headerBytes, &hdr); err != nil {
+		return fail(\"Malformed\", \"header is not valid JSON\")
+	}
+	// Pin the algorithm: only HS256 is accepted, so \"none\" and any other alg
+	// are rejected outright (no algorithm-confusion surface).
+	if hdr.Alg != \"HS256\" {
+		return fail(\"AlgorithmMismatch\", \"unsupported algorithm \"+strconv.Quote(hdr.Alg)+\"; only HS256 is supported\")
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return fail(\"Malformed\", \"signature is not valid base64url\")
+	}
+	// Constant-time comparison.
+	if !hmac.Equal(sig, hmacSha256Raw(secret, parts[0]+\".\"+parts[1])) {
+		return fail(\"BadSignature\", \"signature does not match\")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return fail(\"Malformed\", \"payload is not valid base64url\")
+	}
+	if jerr := jwtCheckTime(payload); jerr != nil {
+		return Err[T, CryptoError](*jerr)
+	}
+	out, jerr := jwtParsePayload(payload, dec)
+	if jerr != nil {
+		return fail(\"ClaimType\", jerr.Error())
+	}
+	return Ok[T, CryptoError](out)
+}
+
+// JwtDecode decodes a token's payload into T WITHOUT verifying its signature
+// or time claims. Never trust the result for authorization.
+func JwtDecode[T any](token string, dec func(JsonValue, string) (T, *JsonError)) Result[T, CryptoError] {
+	parts := strings.Split(token, \".\")
+	if len(parts) < 2 {
+		return Err[T, CryptoError](CryptoError{Reason: \"Malformed\", Message: \"expected at least two dot-separated segments\"})
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return Err[T, CryptoError](CryptoError{Reason: \"Malformed\", Message: \"payload is not valid base64url\"})
+	}
+	out, jerr := jwtParsePayload(payload, dec)
+	if jerr != nil {
+		return Err[T, CryptoError](CryptoError{Reason: \"ClaimType\", Message: jerr.Error()})
+	}
+	return Ok[T, CryptoError](out)
+}
+
+// JwtReadHeader decodes a token's header (alg/typ/kid) without verifying it —
+// handy for choosing a key by \"kid\" before calling JwtVerify.
+func JwtReadHeader(token string) Result[JwtHeader, CryptoError] {
+	parts := strings.Split(token, \".\")
+	if len(parts) < 1 || parts[0] == \"\" {
+		return Err[JwtHeader, CryptoError](CryptoError{Reason: \"Malformed\", Message: \"missing header segment\"})
+	}
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return Err[JwtHeader, CryptoError](CryptoError{Reason: \"Malformed\", Message: \"header is not valid base64url\"})
+	}
+	var h struct {
+		Alg string `json:\"alg\"`
+		Typ string `json:\"typ\"`
+		Kid string `json:\"kid\"`
+	}
+	if err := json.Unmarshal(headerBytes, &h); err != nil {
+		return Err[JwtHeader, CryptoError](CryptoError{Reason: \"Malformed\", Message: \"header is not valid JSON\"})
+	}
+	return Ok[JwtHeader, CryptoError](JwtHeader{Alg: h.Alg, Typ: h.Typ, Kid: h.Kid})
+}
+
 // HttpRequest is the value consumed by `hive.http.request` and produced for
 // every incoming call handled by `hive.http.serve`. Headers are a Table of
 // [name, value] rows.
@@ -820,6 +1032,132 @@ func headerTable(h http.Header) Table {
 		}
 	}
 	return table
+}
+"
+}
+
+/// Source of the `hive/sql.go` file, written into the generated project only
+/// when the program uses `hive.sql`. It lives in its own file (rather than in
+/// `runtime.go`) so that programs which never touch SQL keep a dependency-free
+/// `go.mod` and build offline. SQLite is the pure-Go `modernc.org/sqlite`
+/// (the engine is compiled straight into the executable — no CGO, no system
+/// SQLite); Postgres is `github.com/lib/pq`.
+pub fn sql_go() -> String {
+  "package hive
+
+import (
+	\"database/sql\"
+
+	_ \"github.com/lib/pq\"
+	_ \"modernc.org/sqlite\"
+)
+
+// DatabaseDriver selects the SQL driver a connection uses. Build it with
+// hive.sql.DatabaseDriver.SQLite(), .PostgreSQL() or .Other(name).
+type DatabaseDriver struct {
+	Name string
+}
+
+// SqlError describes a failed database operation.
+type SqlError struct {
+	Message string
+}
+
+func (e SqlError) Error() string { return \"hive: sql error: \" + e.Message }
+
+// SqlConnection is a handle to an open database. The underlying *sql.DB is a
+// connection pool, so a single SqlConnection is safe for concurrent use.
+type SqlConnection struct {
+	db *sql.DB
+}
+
+// sqlDriverName maps a DatabaseDriver onto the registered database/sql driver.
+func sqlDriverName(d DatabaseDriver) string {
+	switch d.Name {
+	case \"sqlite\":
+		return \"sqlite\"
+	case \"postgres\":
+		return \"postgres\"
+	default:
+		return d.Name
+	}
+}
+
+// SqlConnect opens a pooled connection to the database at connString and
+// verifies it with a ping.
+func SqlConnect(driver DatabaseDriver, connString string) Result[SqlConnection, SqlError] {
+	db, err := sql.Open(sqlDriverName(driver), connString)
+	if err != nil {
+		return Err[SqlConnection, SqlError](SqlError{Message: err.Error()})
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return Err[SqlConnection, SqlError](SqlError{Message: err.Error()})
+	}
+	return Ok[SqlConnection, SqlError](SqlConnection{db: db})
+}
+
+// SqlPool is SqlConnect with explicit pool limits (max open and idle
+// connections).
+func SqlPool(driver DatabaseDriver, connString string, maxOpen int, maxIdle int) Result[SqlConnection, SqlError] {
+	res := SqlConnect(driver, connString)
+	if res.IsError() {
+		return res
+	}
+	conn := res.Ok()
+	conn.db.SetMaxOpenConns(maxOpen)
+	conn.db.SetMaxIdleConns(maxIdle)
+	return Ok[SqlConnection, SqlError](conn)
+}
+
+// SqlClose releases a connection pool. It is safe to call more than once.
+func SqlClose(conn SqlConnection) {
+	if conn.db != nil {
+		conn.db.Close()
+	}
+}
+
+// SqlQuery runs any SQL statement and returns its result as a Table. A query
+// that returns rows yields a header row of column names followed by one row
+// per result row; a statement that returns no rows yields an empty table.
+func SqlQuery(conn SqlConnection, query string) Result[Table, SqlError] {
+	if conn.db == nil {
+		return Err[Table, SqlError](SqlError{Message: \"connection is not open\"})
+	}
+	rows, err := conn.db.Query(query)
+	if err != nil {
+		return Err[Table, SqlError](SqlError{Message: err.Error()})
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		return Err[Table, SqlError](SqlError{Message: err.Error()})
+	}
+	if len(cols) == 0 {
+		return Ok[Table, SqlError](Table{})
+	}
+	table := Table{cols}
+	for rows.Next() {
+		cells := make([]sql.NullString, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range cells {
+			ptrs[i] = &cells[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return Err[Table, SqlError](SqlError{Message: err.Error()})
+		}
+		row := make([]string, len(cols))
+		for i, c := range cells {
+			if c.Valid {
+				row[i] = c.String
+			}
+		}
+		table = append(table, row)
+	}
+	if err := rows.Err(); err != nil {
+		return Err[Table, SqlError](SqlError{Message: err.Error()})
+	}
+	return Ok[Table, SqlError](table)
 }
 "
 }

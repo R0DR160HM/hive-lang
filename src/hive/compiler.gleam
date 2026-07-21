@@ -271,11 +271,59 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
           use _ <- result.try(check_with_type(ctx, typ))
           check_args(ctx, args)
         }
+        ast.ECall(
+          ast.EMember(ast.EMember(ast.EIdent("hive"), "crypto"), "jwtVerify"),
+          args,
+        ) -> {
+          use _ <- result.try(check_named(
+            "`hive.crypto.jwtVerify`",
+            args,
+            Some(["token", "secret"]),
+          ))
+          use _ <- result.try(case codegen.assign_args(args, ["token", "secret"]) {
+            #([_, _], []) -> Ok(Nil)
+            _ ->
+              Error(
+                "`hive.crypto.jwtVerify` takes exactly two Str arguments: a token and a secret",
+              )
+          })
+          use _ <- result.try(check_with_type(ctx, typ))
+          check_args(ctx, args)
+        }
+        ast.ECall(
+          ast.EMember(ast.EMember(ast.EIdent("hive"), "crypto"), "jwtDecode"),
+          args,
+        ) -> {
+          use _ <- result.try(check_named(
+            "`hive.crypto.jwtDecode`",
+            args,
+            Some(["token"]),
+          ))
+          use _ <- result.try(case codegen.assign_args(args, ["token"]) {
+            #([_], []) -> Ok(Nil)
+            _ ->
+              Error("`hive.crypto.jwtDecode` takes exactly one Str argument: a token")
+          })
+          use _ <- result.try(check_with_type(ctx, typ))
+          check_args(ctx, args)
+        }
         _ ->
           Error(
-            "`with <Type>` can only be applied to `hive.json.parse(...)` calls",
+            "`with <Type>` can only be applied to `hive.json.parse(...)`, "
+            <> "`hive.crypto.jwtVerify(...)` or `hive.crypto.jwtDecode(...)` calls",
           )
       }
+    // `hive.sql.DatabaseDriver.SQLite()` etc. — driver constructors.
+    ast.ECall(
+      ast.EMember(
+        ast.EMember(ast.EMember(ast.EIdent("hive"), "sql"), "DatabaseDriver"),
+        variant,
+      ),
+      args,
+    ) -> {
+      use _ <- result.try(check_sql_driver(variant, args))
+      check_args(ctx, args)
+    }
     ast.ECall(ast.EMember(ast.EMember(ast.EIdent("hive"), ns), fname), args) ->
       case ns {
         "http" -> {
@@ -286,11 +334,19 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
           use _ <- result.try(check_json_call(fname, args))
           check_args(ctx, args)
         }
+        "crypto" -> {
+          use _ <- result.try(check_crypto_call(fname, args))
+          check_args(ctx, args)
+        }
+        "sql" -> {
+          use _ <- result.try(check_sql_call(fname, args))
+          check_args(ctx, args)
+        }
         _ ->
           Error(
             "unknown builtin namespace `hive."
             <> ns
-            <> "` (available: http, json)",
+            <> "` (available: http, json, crypto, sql)",
           )
       }
     ast.ECall(ast.EMember(ast.EIdent(tname), member), args) -> {
@@ -521,6 +577,105 @@ fn check_json_call(fname: String, args: List(ast.Arg)) -> Result(Nil, String) {
         "unknown builtin `hive.json."
         <> fname
         <> "` (available: encode, get, parse, table)",
+      )
+  }
+}
+
+// ---------------------------------------------------------------------------
+// hive.crypto builtins
+// ---------------------------------------------------------------------------
+
+fn check_crypto_call(fname: String, args: List(ast.Arg)) -> Result(Nil, String) {
+  case fname {
+    "sha256" -> check_arity("`hive.crypto.sha256`", args, ["input"])
+    "sha512" -> check_arity("`hive.crypto.sha512`", args, ["input"])
+    "base64Encode" -> check_arity("`hive.crypto.base64Encode`", args, ["input"])
+    "base64Decode" -> check_arity("`hive.crypto.base64Decode`", args, ["input"])
+    "randomHex" -> check_arity("`hive.crypto.randomHex`", args, ["bytes"])
+    "hmacSha256" ->
+      check_arity("`hive.crypto.hmacSha256`", args, ["input", "key"])
+    "jwtSign" -> check_arity("`hive.crypto.jwtSign`", args, ["claims", "secret"])
+    "jwtHeader" -> check_arity("`hive.crypto.jwtHeader`", args, ["token"])
+    "jwtVerify" ->
+      Error(
+        "`hive.crypto.jwtVerify` needs a decode target: write "
+        <> "`hive.crypto.jwtVerify(token, secret) with SomeType`",
+      )
+    "jwtDecode" ->
+      Error(
+        "`hive.crypto.jwtDecode` needs a decode target: write "
+        <> "`hive.crypto.jwtDecode(token) with SomeType`",
+      )
+    _ ->
+      Error(
+        "unknown builtin `hive.crypto."
+        <> fname
+        <> "` (available: sha256, sha512, hmacSha256, base64Encode, "
+        <> "base64Decode, randomHex, jwtSign, jwtVerify, jwtDecode, jwtHeader)",
+      )
+  }
+}
+
+// ---------------------------------------------------------------------------
+// hive.sql builtins
+// ---------------------------------------------------------------------------
+
+fn check_sql_call(fname: String, args: List(ast.Arg)) -> Result(Nil, String) {
+  case fname {
+    "connect" ->
+      check_arity("`hive.sql.connect`", args, ["driver", "connString"])
+    "pool" ->
+      check_arity("`hive.sql.pool`", args, [
+        "driver",
+        "connString",
+        "maxOpen",
+        "maxIdle",
+      ])
+    "close" -> check_arity("`hive.sql.close`", args, ["connection"])
+    _ ->
+      Error(
+        "unknown builtin `hive.sql."
+        <> fname
+        <> "` (available: connect, pool, close; query with `using conn with ...`)",
+      )
+  }
+}
+
+fn check_sql_driver(
+  variant: String,
+  args: List(ast.Arg),
+) -> Result(Nil, String) {
+  case variant {
+    "SQLite" -> check_arity("`hive.sql.DatabaseDriver.SQLite`", args, [])
+    "PostgreSQL" ->
+      check_arity("`hive.sql.DatabaseDriver.PostgreSQL`", args, [])
+    "Other" -> check_arity("`hive.sql.DatabaseDriver.Other`", args, ["name"])
+    _ ->
+      Error(
+        "unknown `hive.sql.DatabaseDriver."
+        <> variant
+        <> "` (variants: SQLite, PostgreSQL, Other)",
+      )
+  }
+}
+
+// Validates a builtin call against a fixed parameter list: named arguments
+// must be known, and (positional or not) the call must cover exactly those
+// parameters with nothing left over.
+fn check_arity(
+  target: String,
+  args: List(ast.Arg),
+  names: List(String),
+) -> Result(Nil, String) {
+  use _ <- result.try(check_named(target, args, Some(names)))
+  let #(assigned, extra) = codegen.assign_args(args, names)
+  case list.length(assigned) == list.length(names) && extra == [] {
+    True -> Ok(Nil)
+    False ->
+      Error(
+        target
+        <> " takes exactly these arguments: "
+        <> string.join(names, ", "),
       )
   }
 }

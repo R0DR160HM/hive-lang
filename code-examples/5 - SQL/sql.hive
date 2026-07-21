@@ -1,0 +1,38 @@
+// The `hive.sql` standard library talks to SQLite and PostgreSQL. SQLite is
+// the pure-Go modernc driver, compiled straight into the executable, so local
+// databases work with no external install. Queries run through the overloaded
+// `using <connection> with <query>` form and come back as a Table.
+
+// A `query` builds sanitized SQL, which is the safe way to interpolate
+// parameters into a statement (note "O'Brien" -> 'O''Brien' below).
+query insertUser(id: Int, name: Str): Str {
+	INSERT INTO users (id, name) VALUES ({id}, {name})
+}
+
+proc main(): void {
+	// Open a local SQLite database (created on first use). `hive.sql.connect`
+	// uses default pool settings; `hive.sql.pool(driver, conn, maxOpen,
+	// maxIdle)` tunes the connection pool.
+	opened := hive.sql.pool(hive.sql.DatabaseDriver.SQLite(), "./demo.db", 4, 2)
+
+	if opened is Result.Ok(db) {
+		// DDL and writes run through the same `using ... with ...`; a query
+		// that returns no rows yields an empty table, which we just discard.
+		using db with "CREATE TABLE IF NOT EXISTS users (id INTEGER, name TEXT)"
+		using db with "DELETE FROM users"
+		using db with insertUser(1, "Ada")
+		using db with insertUser(2, "O'Brien")
+
+		// A SELECT returns a header row of column names, then one row per row.
+		result := using db with "SELECT id, name FROM users ORDER BY id"
+		if result is Result.Ok(rows) {
+			echo rows
+		} else if result is Result.Error(error) {
+			echo "query failed: {error.message}"
+		}
+
+		hive.sql.close(db)
+	} else if opened is Result.Error(error) {
+		echo "could not open database: {error.message}"
+	}
+}

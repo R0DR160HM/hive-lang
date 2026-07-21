@@ -681,6 +681,119 @@ pub fn unknown_json_builtin_is_rejected_test() {
 }
 
 // ---------------------------------------------------------------------------
+// The hive.crypto standard library
+// ---------------------------------------------------------------------------
+
+pub fn crypto_hashes_lower_test() {
+  let go =
+    compile(
+      "func f(): Str {\n\treturn hive.crypto.sha256(\"x\")\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "hive.Sha256(\"x\")"))
+}
+
+pub fn crypto_hmac_and_base64_lower_test() {
+  let go =
+    compile(
+      "func f(): Str {\n\th := hive.crypto.hmacSha256(\"m\", \"k\")\n\treturn hive.crypto.base64Encode(h)\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "hive.HmacSha256(\"m\", \"k\")"))
+  should.be_true(string.contains(go, "hive.Base64Encode(h)"))
+}
+
+pub fn crypto_base64_decode_returns_result_test() {
+  let go =
+    compile(
+      "func f(s: Str): Str {\n\td := hive.crypto.base64Decode(s)\n\tif d is Result.Ok(text) {\n\t\treturn text\n\t} else if d is Result.Error(error) {\n\t\treturn error.reason\n\t}\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "hive.Base64Decode(s)"))
+  // A Result payload of CryptoError capitalizes its fields.
+  should.be_true(string.contains(go, "return error.Reason"))
+}
+
+pub fn crypto_jwt_sign_and_verify_lower_test() {
+  let go =
+    compile(
+      "type Claims {\n\tsub: Str\n}\nfunc make(secret: Str): Str {\n\treturn hive.crypto.jwtSign(Claims(\"a\"), secret)\n}\nfunc read(token: Str, secret: Str): Str {\n\tv := hive.crypto.jwtVerify(token, secret) with Claims\n\tif v is Result.Ok(c) {\n\t\treturn c.sub\n\t}\n\treturn \"no\"\n}\nproc main(): void {}\n",
+    )
+  // sign reuses the derived encoder; verify reuses the derived decoder.
+  should.be_true(string.contains(go, "hive.JwtSign(jsonEncode_Claims("))
+  should.be_true(string.contains(
+    go,
+    "hive.JwtVerify(token, secret, jsonDecode_Claims)",
+  ))
+}
+
+pub fn crypto_jwt_decode_and_header_lower_test() {
+  let go =
+    compile(
+      "type Claims {\n\tsub: Str\n}\nfunc f(token: Str): Str {\n\tpeek := hive.crypto.jwtDecode(token) with Claims\n\thead := hive.crypto.jwtHeader(token)\n\tif head is Result.Ok(h) {\n\t\treturn h.alg\n\t}\n\treturn \"no\"\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "hive.JwtDecode(token, jsonDecode_Claims)"))
+  should.be_true(string.contains(go, "hive.JwtReadHeader(token)"))
+}
+
+pub fn crypto_jwt_verify_requires_with_test() {
+  // Like hive.json.parse, jwtVerify without a decode target is rejected.
+  let result =
+    compiler.compile(
+      "proc main(): void {\n\tx := hive.crypto.jwtVerify(\"t\", \"s\")\n\techo x\n}\n",
+    )
+  should.be_error(result)
+}
+
+pub fn unknown_crypto_builtin_is_rejected_test() {
+  let result =
+    compiler.compile("proc main(): void {\n\techo hive.crypto.md5(\"x\")\n}\n")
+  should.be_error(result)
+}
+
+// ---------------------------------------------------------------------------
+// The hive.sql standard library
+// ---------------------------------------------------------------------------
+
+pub fn sql_connect_and_query_lower_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\topened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"./x.db\")\n\tif opened is Result.Ok(db) {\n\t\tresult := using db with \"SELECT 1\"\n\t\tif result is Result.Ok(rows) {\n\t\t\techo rows\n\t\t}\n\t}\n}\n",
+    )
+  should.be_true(string.contains(
+    go,
+    "hive.SqlConnect(hive.DatabaseDriver{Name: \"sqlite\"}, \"./x.db\")",
+  ))
+  // `using <connection> with <query>` lowers to a SQL query, not a CSV read.
+  should.be_true(string.contains(go, "hive.SqlQuery(db, \"SELECT 1\")"))
+}
+
+pub fn sql_pool_close_and_drivers_lower_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\topened := hive.sql.pool(hive.sql.DatabaseDriver.PostgreSQL(), \"conn\", 4, 2)\n\tif opened is Result.Ok(db) {\n\t\thive.sql.close(db)\n\t}\n\tother := hive.sql.DatabaseDriver.Other(\"mysql\")\n}\n",
+    )
+  should.be_true(string.contains(
+    go,
+    "hive.SqlPool(hive.DatabaseDriver{Name: \"postgres\"}, \"conn\", 4, 2)",
+  ))
+  should.be_true(string.contains(go, "hive.SqlClose(db)"))
+  should.be_true(string.contains(go, "hive.DatabaseDriver{Name: \"mysql\"}"))
+}
+
+pub fn using_string_still_reads_csv_test() {
+  // The `using` overload must not disturb CSV reads over a Str path.
+  let go =
+    compile(
+      "proc main(): void {\n\tx := using \"./a.csv\" with \";\"\n\tif x is Result.Ok(t) {\n\t\techo t\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.ReadCSV(\"./a.csv\", \";\")"))
+}
+
+pub fn unknown_sql_builtin_is_rejected_test() {
+  let result =
+    compiler.compile("proc main(): void {\n\thive.sql.migrate(\"x\")\n}\n")
+  should.be_error(result)
+}
+
+// ---------------------------------------------------------------------------
 // The shipped code examples must always compile
 // ---------------------------------------------------------------------------
 
@@ -696,6 +809,16 @@ pub fn basic_io_example_compiles_test() {
 
 pub fn types_example_compiles_test() {
   let assert Ok(src) = simplifile.read("code-examples/2 - Types/types.hive")
+  let assert Ok(_) = compiler.compile(src)
+}
+
+pub fn crypto_example_compiles_test() {
+  let assert Ok(src) = simplifile.read("code-examples/4 - Crypto/crypto.hive")
+  let assert Ok(_) = compiler.compile(src)
+}
+
+pub fn sql_example_compiles_test() {
+  let assert Ok(src) = simplifile.read("code-examples/5 - SQL/sql.hive")
   let assert Ok(_) = compiler.compile(src)
 }
 

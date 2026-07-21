@@ -60,6 +60,11 @@ pub fn builtin_fields(name: String) -> Option(List(#(String, Ty))) {
     "TableError" -> Some([#("path", TyStr), #("message", TyStr)])
     "JsonError" ->
       Some([#("path", TyStr), #("expected", TyStr), #("found", TyStr)])
+    "CryptoError" -> Some([#("reason", TyStr), #("message", TyStr)])
+    "JwtHeader" ->
+      Some([#("alg", TyStr), #("typ", TyStr), #("kid", TyStr)])
+    "SqlError" -> Some([#("message", TyStr)])
+    "DatabaseDriver" -> Some([#("name", TyStr)])
     _ -> None
   }
 }
@@ -227,6 +232,12 @@ fn uses_json_expr(e: ast.Expr) -> Bool {
     ast.EWith(_, _) -> True
     ast.ECall(ast.EMember(ast.EMember(ast.EIdent("hive"), "json"), _), _) ->
       True
+    // `hive.crypto.jwtSign` reuses the derived JSON encoders for its claims
+    // (jwtVerify/jwtDecode are `EWith`, already covered above).
+    ast.ECall(
+      ast.EMember(ast.EMember(ast.EIdent("hive"), "crypto"), "jwtSign"),
+      _,
+    ) -> True
     ast.EInt(_)
     | ast.EFloat(_)
     | ast.EString(_)
@@ -1321,6 +1332,31 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
             "encode" -> TyStr
             _ -> TyUnknown
           }
+        ast.EMember(ast.EMember(ast.EIdent("hive"), "crypto"), fname) ->
+          case fname {
+            "sha256" | "sha512" | "hmacSha256" | "base64Encode" | "randomHex" ->
+              TyStr
+            "base64Decode" -> TyResult(TyStr, TyBuiltin("CryptoError"))
+            "jwtSign" -> TyStr
+            "jwtHeader" ->
+              TyResult(TyBuiltin("JwtHeader"), TyBuiltin("CryptoError"))
+            // jwtVerify/jwtDecode only appear under `with`, handled above.
+            _ -> TyResult(TyUnknown, TyBuiltin("CryptoError"))
+          }
+        // `hive.sql.DatabaseDriver.SQLite()` and friends build a driver value.
+        ast.EMember(
+          ast.EMember(
+            ast.EMember(ast.EIdent("hive"), "sql"),
+            "DatabaseDriver",
+          ),
+          _,
+        ) -> TyBuiltin("DatabaseDriver")
+        ast.EMember(ast.EMember(ast.EIdent("hive"), "sql"), fname) ->
+          case fname {
+            "connect" | "pool" ->
+              TyResult(TyBuiltin("SqlConnection"), TyBuiltin("SqlError"))
+            _ -> TyUnknown
+          }
         ast.EMember(ast.EIdent("hive"), name) ->
           case builtin_fields(name) {
             Some(_) -> TyBuiltin(name)
@@ -1354,7 +1390,13 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
           infer_arith(env, l, r)
       }
     ast.EIs(_, _) -> TyBool
-    ast.EUsing(_, _) -> TyResult(TyTable, TyBuiltin("TableError"))
+    // `using` is overloaded: a Str path reads a CSV; a SQL connection runs a
+    // query. The error type follows the source.
+    ast.EUsing(path, _) ->
+      case infer(env, path) {
+        TyBuiltin("SqlConnection") -> TyResult(TyTable, TyBuiltin("SqlError"))
+        _ -> TyResult(TyTable, TyBuiltin("TableError"))
+      }
     ast.EWith(value, typ) ->
       case value {
         ast.ECall(
@@ -1362,6 +1404,15 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
           _,
         ) ->
           TyResult(ty_of_type_expr(env.types, typ), TyBuiltin("JsonError"))
+        ast.ECall(
+            ast.EMember(ast.EMember(ast.EIdent("hive"), "crypto"), "jwtVerify"),
+            _,
+          )
+        | ast.ECall(
+            ast.EMember(ast.EMember(ast.EIdent("hive"), "crypto"), "jwtDecode"),
+            _,
+          ) ->
+          TyResult(ty_of_type_expr(env.types, typ), TyBuiltin("CryptoError"))
         _ -> infer(env, value)
       }
     // `await e` produces the value the awaited async function returns.
@@ -1466,6 +1517,31 @@ fn gen_with(env: Env, value: ast.Expr, typ: ast.TypeExpr) -> String {
         _ -> gen_args(env, args)
       }
       "hive.JsonParse(" <> text <> ", " <> json_decoder_ref(env, typ) <> ")"
+    }
+    // `hive.crypto.jwtVerify(token, secret) with T` verifies the token, then
+    // decodes its payload with the derived decoder for T.
+    ast.ECall(
+      ast.EMember(ast.EMember(ast.EIdent("hive"), "crypto"), "jwtVerify"),
+      args,
+    ) -> {
+      let call = case assign_args(args, ["token", "secret"]) {
+        #([#(_, token), #(_, secret)], []) ->
+          coerce(env, token, TyStr) <> ", " <> coerce(env, secret, TyStr)
+        _ -> gen_args(env, args)
+      }
+      "hive.JwtVerify(" <> call <> ", " <> json_decoder_ref(env, typ) <> ")"
+    }
+    // `hive.crypto.jwtDecode(token) with T` decodes the payload WITHOUT
+    // verifying it.
+    ast.ECall(
+      ast.EMember(ast.EMember(ast.EIdent("hive"), "crypto"), "jwtDecode"),
+      args,
+    ) -> {
+      let token = case assign_args(args, ["token"]) {
+        #([#(_, t)], []) -> coerce(env, t, TyStr)
+        _ -> gen_args(env, args)
+      }
+      "hive.JwtDecode(" <> token <> ", " <> json_decoder_ref(env, typ) <> ")"
     }
     _ -> gen_expr(env, value)
   }
@@ -1606,11 +1682,24 @@ fn gen_slice(
 }
 
 fn gen_using(env: Env, path: ast.Expr, delim: Option(ast.Expr)) -> String {
-  let delim_str = case delim {
-    Some(d) -> gen_expr(env, d)
-    None -> "\",\""
+  case infer(env, path) {
+    // `using <connection> with <query>` runs SQL and returns a Table.
+    TyBuiltin("SqlConnection") -> {
+      let query = case delim {
+        Some(q) -> coerce(env, q, TyStr)
+        None -> "\"\""
+      }
+      "hive.SqlQuery(" <> gen_expr(env, path) <> ", " <> query <> ")"
+    }
+    // `using <path> [with <delimiter>]` reads a CSV.
+    _ -> {
+      let delim_str = case delim {
+        Some(d) -> gen_expr(env, d)
+        None -> "\",\""
+      }
+      "hive.ReadCSV(" <> gen_expr(env, path) <> ", " <> delim_str <> ")"
+    }
   }
-  "hive.ReadCSV(" <> gen_expr(env, path) <> ", " <> delim_str <> ")"
 }
 
 fn gen_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
@@ -1621,6 +1710,15 @@ fn gen_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
       gen_http_call(env, fname, args)
     ast.EMember(ast.EMember(ast.EIdent("hive"), "json"), fname) ->
       gen_json_call(env, fname, args)
+    ast.EMember(ast.EMember(ast.EIdent("hive"), "crypto"), fname) ->
+      gen_crypto_call(env, fname, args)
+    // `hive.sql.DatabaseDriver.SQLite()` etc. — driver constructors.
+    ast.EMember(
+      ast.EMember(ast.EMember(ast.EIdent("hive"), "sql"), "DatabaseDriver"),
+      variant,
+    ) -> gen_sql_driver(env, variant, args)
+    ast.EMember(ast.EMember(ast.EIdent("hive"), "sql"), fname) ->
+      gen_sql_call(env, fname, args)
     ast.EMember(ast.EIdent(type_name), variant_name) ->
       case dict.get(env.types, type_name) {
         Ok(_) -> gen_constructor(env, type_name, variant_name, args)
@@ -1692,6 +1790,109 @@ fn gen_json_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
     // `parse` only occurs under `with` (validation enforces it); anything
     // else was rejected by the validation pass.
     _ -> "hive.JsonEncodeDynamic(" <> gen_args(env, args) <> ")"
+  }
+}
+
+// The `hive.crypto` namespace: hashes, HMAC, base64, random and JWTs.
+// jwtVerify/jwtDecode never reach here — they are handled under `with`.
+fn gen_crypto_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
+  case fname {
+    "sha256" -> "hive.Sha256(" <> gen_one(env, args, "input") <> ")"
+    "sha512" -> "hive.Sha512(" <> gen_one(env, args, "input") <> ")"
+    "base64Encode" ->
+      "hive.Base64Encode(" <> gen_one(env, args, "input") <> ")"
+    "base64Decode" ->
+      "hive.Base64Decode(" <> gen_one(env, args, "input") <> ")"
+    "hmacSha256" ->
+      case assign_args(args, ["input", "key"]) {
+        #([#(_, input), #(_, key)], []) ->
+          "hive.HmacSha256("
+          <> coerce(env, input, TyStr)
+          <> ", "
+          <> coerce(env, key, TyStr)
+          <> ")"
+        _ -> "hive.HmacSha256(" <> gen_args(env, args) <> ")"
+      }
+    "randomHex" ->
+      case assign_args(args, ["bytes"]) {
+        #([#(_, n)], []) -> "hive.RandomHex(" <> coerce(env, n, TyInt) <> ")"
+        _ -> "hive.RandomHex(" <> gen_args(env, args) <> ")"
+      }
+    // The claims are JSON-encoded by the derived encoder, then signed.
+    "jwtSign" ->
+      case assign_args(args, ["claims", "secret"]) {
+        #([#(_, claims), #(_, secret)], []) ->
+          "hive.JwtSign("
+          <> gen_json_encode(infer(env, claims), gen_expr(env, claims), 0)
+          <> ", "
+          <> coerce(env, secret, TyStr)
+          <> ")"
+        _ -> "hive.JwtSign(" <> gen_args(env, args) <> ")"
+      }
+    "jwtHeader" -> "hive.JwtReadHeader(" <> gen_one(env, args, "token") <> ")"
+    _ -> "hive." <> exported(fname) <> "(" <> gen_args(env, args) <> ")"
+  }
+}
+
+// A single `Str` argument, honouring the named-argument form.
+fn gen_one(env: Env, args: List(ast.Arg), name: String) -> String {
+  case assign_args(args, [name]) {
+    #([#(_, arg)], []) -> coerce(env, arg, TyStr)
+    _ -> gen_args(env, args)
+  }
+}
+
+// The `hive.sql` namespace: opening, pooling and closing connections. Queries
+// go through `using <conn> with <query>` (see gen_using).
+fn gen_sql_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
+  case fname {
+    "connect" ->
+      case assign_args(args, ["driver", "connString"]) {
+        #([#(_, driver), #(_, conn)], []) ->
+          "hive.SqlConnect("
+          <> gen_expr(env, driver)
+          <> ", "
+          <> coerce(env, conn, TyStr)
+          <> ")"
+        _ -> "hive.SqlConnect(" <> gen_args(env, args) <> ")"
+      }
+    "pool" ->
+      case assign_args(args, ["driver", "connString", "maxOpen", "maxIdle"]) {
+        #([#(_, driver), #(_, conn), #(_, max_open), #(_, max_idle)], []) ->
+          "hive.SqlPool("
+          <> gen_expr(env, driver)
+          <> ", "
+          <> coerce(env, conn, TyStr)
+          <> ", "
+          <> coerce(env, max_open, TyInt)
+          <> ", "
+          <> coerce(env, max_idle, TyInt)
+          <> ")"
+        _ -> "hive.SqlPool(" <> gen_args(env, args) <> ")"
+      }
+    "close" -> "hive.SqlClose(" <> gen_one_raw(env, args, "connection") <> ")"
+    _ -> "hive.Sql" <> exported(fname) <> "(" <> gen_args(env, args) <> ")"
+  }
+}
+
+// A single argument passed through as-is (no Str coercion — used for opaque
+// values like a connection handle).
+fn gen_one_raw(env: Env, args: List(ast.Arg), name: String) -> String {
+  case assign_args(args, [name]) {
+    #([#(_, arg)], []) -> gen_expr(env, arg)
+    _ -> gen_args(env, args)
+  }
+}
+
+// The `hive.sql.DatabaseDriver` variant constructors. Each yields a
+// `hive.DatabaseDriver` carrying the registered database/sql driver name.
+fn gen_sql_driver(env: Env, variant: String, args: List(ast.Arg)) -> String {
+  case variant {
+    "SQLite" -> "hive.DatabaseDriver{Name: \"sqlite\"}"
+    "PostgreSQL" -> "hive.DatabaseDriver{Name: \"postgres\"}"
+    "Other" ->
+      "hive.DatabaseDriver{Name: " <> gen_one(env, args, "name") <> "}"
+    _ -> "hive.DatabaseDriver{Name: \"\"}"
   }
 }
 

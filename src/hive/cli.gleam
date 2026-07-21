@@ -25,6 +25,22 @@ pub fn build(entry: String) -> Result(String, String) {
 
   use _ <- result.try(prepare_build_dir(build_dir, main_go))
 
+  // A program that uses `hive.sql` links external Go drivers, so its
+  // dependencies must be resolved (fetched on first build, then cached)
+  // before building. Programs that don't stay dependency-free and offline.
+  use _ <- result.try(case uses_sql(main_go) {
+    True ->
+      shellout.command(run: "go", with: ["mod", "tidy"], in: build_dir, opt: [])
+      |> result.map_error(fn(failure) {
+        let #(_code, message) = failure
+        "could not resolve the SQL driver dependencies (this needs network "
+        <> "access on the first build):\n\n"
+        <> message
+      })
+      |> result.map(fn(_) { Nil })
+    False -> Ok(Nil)
+  })
+
   // Best-effort formatting; ignored if gofmt is unavailable.
   let _ = shellout.command(run: "gofmt", with: ["-w", "."], in: build_dir, opt: [])
 
@@ -123,7 +139,22 @@ fn prepare_build_dir(build_dir: String, main_go: String) -> Result(Nil, String) 
   use _ <- result.try(mkdir(filepath.join(build_dir, "hive")))
   use _ <- result.try(write(filepath.join(build_dir, "go.mod"), runtime.go_mod()))
   use _ <- result.try(write(filepath.join(build_dir, "main.go"), main_go))
-  write(filepath.join(build_dir, "hive/runtime.go"), runtime.runtime_go())
+  use _ <- result.try(write(
+    filepath.join(build_dir, "hive/runtime.go"),
+    runtime.runtime_go(),
+  ))
+  // The SQL runtime (and its external drivers) is only pulled in on demand.
+  case uses_sql(main_go) {
+    True -> write(filepath.join(build_dir, "hive/sql.go"), runtime.sql_go())
+    False -> Ok(Nil)
+  }
+}
+
+/// Whether the generated program references the `hive.sql` runtime, which
+/// decides if the SQL driver file and its dependencies are needed.
+fn uses_sql(main_go: String) -> Bool {
+  string.contains(main_go, "hive.Sql")
+  || string.contains(main_go, "hive.DatabaseDriver")
 }
 
 fn mkdir(path: String) -> Result(Nil, String) {

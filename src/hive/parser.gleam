@@ -869,10 +869,14 @@ fn parse_sub_expr(code: String, line: Int) -> Result(ast.Expr, String) {
 
 fn parse_using(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
   let t1 = tail(tokens)
-  use #(path, t2) <- result.try(parse_primary(t1))
+  // Operands are parsed at the postfix level so a call (e.g. a `query`
+  // producing the SQL for `using conn with theQuery(arg)`) is consumed whole;
+  // wrap richer expressions in parentheses. `with` is not a postfix operator,
+  // so the path stops cleanly before it.
+  use #(path, t2) <- result.try(parse_postfix(t1))
   use #(delim, t3) <- result.try(case kind(t2) {
     token.KwWith -> {
-      use #(d, t) <- result.try(parse_primary(tail(t2)))
+      use #(d, t) <- result.try(parse_postfix(tail(t2)))
       Ok(#(Some(d), t))
     }
     _ -> Ok(#(None, t2))

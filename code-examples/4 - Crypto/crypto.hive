@@ -1,0 +1,76 @@
+// The `hive.crypto` standard library: general-purpose primitives (hashing,
+// HMAC, base64, secure random) plus JSON Web Tokens. Everything here is pure
+// computation, so it works inside both `func`s and `proc`s.
+
+// A JWT's claims are just a Hive type: signing encodes a value of this type as
+// the payload, and verifying decodes the payload straight back into it.
+type Session {
+	user: Str
+	role: Str
+	exp: Int
+}
+
+proc main(): void {
+	// --- General-purpose crypto -------------------------------------------
+
+	// Hashing. sha256/sha512 return a lowercase hex digest.
+	echo hive.crypto.sha256("hello")
+	echo hive.crypto.sha512("hello")
+
+	// Keyed hashing (HMAC-SHA256), also hex.
+	echo hive.crypto.hmacSha256("message", "shared-key")
+
+	// Base64 round-trip. Encoding can't fail; decoding returns a Result.
+	encoded := hive.crypto.base64Encode("Hive loves Go")
+	echo encoded
+	decoded := hive.crypto.base64Decode(encoded)
+	if decoded is Result.Ok(text) {
+		echo text
+	} else if decoded is Result.Error(error) {
+		echo "bad base64: {error.message}"
+	}
+
+	// --- JSON Web Tokens --------------------------------------------------
+
+	// A secure random 32-byte secret (64 hex chars). Non-deterministic.
+	secret := hive.crypto.randomHex(32)
+
+	// Sign: the claims are a typed value; `exp` is a Unix timestamp.
+	token := hive.crypto.jwtSign(Session("ada", "admin", now() + 3600), secret)
+
+	// Verify: the signature and `exp` are checked, then the payload is decoded
+	// straight into a Session (undeclared claims are ignored).
+	verified := hive.crypto.jwtVerify(token, secret) with Session
+	if verified is Result.Ok(session) {
+		echo "welcome {session.user} (role: {session.role})"
+	} else if verified is Result.Error(error) {
+		echo "unexpected: {error.message}"
+	}
+
+	// The wrong secret fails the signature check.
+	forged := hive.crypto.jwtVerify(token, "not-the-secret") with Session
+	if forged is Result.Error(error) {
+		echo "rejected ({error.reason}): {error.message}"
+	}
+
+	// A token whose `exp` is in the past is rejected as expired.
+	old := hive.crypto.jwtSign(Session("bob", "guest", now() - 60), secret)
+	stale := hive.crypto.jwtVerify(old, secret) with Session
+	if stale is Result.Error(error) {
+		echo "rejected ({error.reason}): {error.message}"
+	}
+
+	// `jwtHeader` peeks at the algorithm without verifying — e.g. to choose a
+	// key by `kid` before calling jwtVerify.
+	head := hive.crypto.jwtHeader(token)
+	if head is Result.Ok(h) {
+		echo "token algorithm: {h.alg}"
+	}
+
+	// `jwtDecode` reads the payload WITHOUT verifying it — never trust the
+	// result for authorization, only for inspection.
+	peeked := hive.crypto.jwtDecode(token) with Session
+	if peeked is Result.Ok(session) {
+		echo "unverified peek: {session.user}"
+	}
+}

@@ -128,9 +128,10 @@ await!!!
 ```
 
 More complete programs — CSV parsing with pattern matching, a full tour of the
-type system, and an HTTP server that speaks JSON — live in `code-examples/`.
-They double as the language's specification: each one compiles, builds and
-runs.
+type system, an HTTP server that speaks JSON, a `hive.crypto` walkthrough
+(hashing, HMAC, base64 and JWTs), and a `hive.sql` example backed by an
+embedded SQLite database — live in `code-examples/`. They double as the
+language's specification: each one compiles, builds and runs.
 
 ## The language
 
@@ -246,6 +247,60 @@ JSON schema, and works inside both `func`s and `proc`s.
   flattens a whole document into `[path, value]` rows, looked up with
   `hive.json.get(table, "keys.layout")` and re-nested by the encoder.
 
+### `hive.crypto`
+
+General-purpose cryptography plus JSON Web Tokens. All of it is pure, so it
+works inside both `func`s and `proc`s. Fallible operations return
+`Result<_, hive.CryptoError>`, whose `reason` is a short tag such as
+`"BadSignature"`, `"Expired"` or `"Malformed"`.
+
+* **Hashing** — `hive.crypto.sha256(input)` and `hive.crypto.sha512(input)`
+  return a lowercase-hex digest; `hive.crypto.hmacSha256(input, key)` is the
+  keyed (HMAC-SHA256) variant.
+* **Encoding** — `hive.crypto.base64Encode(input)` returns standard base64;
+  `hive.crypto.base64Decode(input)` returns `Result<Str, hive.CryptoError>`.
+* **Random** — `hive.crypto.randomHex(bytes)` returns that many
+  cryptographically-random bytes as a hex string, handy for secrets or nonces.
+* **JWT**, built on the same "your types are the schema" idea as `hive.json`:
+  * `hive.crypto.jwtSign(claims, secret)` encodes the typed `claims` value as
+    the payload and returns a compact HS256 token (signing can't fail, so it is
+    a plain `Str`).
+  * `hive.crypto.jwtVerify(token, secret) with T` checks the signature and the
+    `exp`/`nbf` claims against `now()`, then decodes the payload into `T`,
+    returning `Result<T, hive.CryptoError>`. Only HS256 is accepted, so
+    `alg: none` and algorithm-confusion are rejected outright.
+  * `hive.crypto.jwtDecode(token) with T` decodes the payload **without
+    verifying** it — for inspection only, never for authorization.
+  * `hive.crypto.jwtHeader(token)` reads the `hive.JwtHeader`
+    (`alg`/`typ`/`kid`) without verifying, e.g. to pick a key by `kid`.
+
+### `hive.sql`
+
+Talks to **SQLite** and **PostgreSQL**. SQLite is the pure-Go
+`modernc.org/sqlite` driver — the engine is compiled straight into your
+executable, so local databases work with no CGO and nothing to install;
+Postgres is `github.com/lib/pq`.
+
+* **Querying** reuses the `using ... with ...` form:
+  `using <connection> with <query>` runs *any* SQL and returns
+  `Result<Table, hive.SqlError>`. A query that returns rows yields a header
+  row of column names followed by one row per result row; a statement that
+  returns none (INSERT/UPDATE/DDL) yields an empty table. Build the query
+  string safely with a `query` declaration, whose `{param}`s are sanitized:
+  `using db with insertUser(1, "O'Brien")`.
+* `hive.sql.connect(driver, connString)` opens a pooled connection and returns
+  `Result<hive.SqlConnection, hive.SqlError>`; `hive.sql.pool(driver,
+  connString, maxOpen, maxIdle)` does the same with explicit pool limits;
+  `hive.sql.close(conn)` releases it.
+* The `driver` is a `hive.sql.DatabaseDriver`, built with
+  `hive.sql.DatabaseDriver.SQLite()`, `.PostgreSQL()`, or `.Other(name)` for
+  any other registered `database/sql` driver.
+
+> **Build note:** SQL programs link real Go drivers, so the **first** build of
+> a program that uses `hive.sql` runs `go mod tidy` to fetch them (network
+> required once, then cached). Programs that don't use `hive.sql` keep a
+> dependency-free `go.mod` and build fully offline, exactly as before.
+
 ## How Hive maps onto Go
 
 | Hive                                    | Go                                                             |
@@ -268,7 +323,8 @@ JSON schema, and works inside both `func`s and `proc`s.
 | `x is Result.Ok(v)` / `Result.Error(e)` | `x.IsOk()` + `v := x.Ok()` / `x.IsError()` + `e := x.Err()`    |
 | `x is T.Variant(a, _)` (user ADT)       | type assertion; bindings read fields, `_` binds nothing        |
 | `a is T.A(v) && p(v)`                   | short-circuiting `&&`; `v` reads through its accessor          |
-| `using p with d`                        | `hive.ReadCSV(p, d)` → `Result[Table, TableError]`             |
+| `using p with d` (Str path)             | `hive.ReadCSV(p, d)` → `Result[Table, TableError]`             |
+| `using conn with q` (SQL connection)    | `hive.SqlQuery(conn, q)` → `Result[Table, SqlError]`           |
 | `"{a} and {b}"`                         | concatenation, non-`Str` pieces via `hive.ToStr`               |
 | `[x, y] + [z]`                          | `hive.Concat([]T{x, y}, []T{z})`                               |
 | `#Atom`, `true`, `false`                | `hive.Atom` constants + a generated `hive.InitAtoms` table     |
@@ -283,6 +339,15 @@ JSON schema, and works inside both `func`s and `proc`s.
 | `hive.json.table(t)` / `.get(tbl, p)`   | `hive.JsonTable(t)` / `hive.JsonGet(tbl, p)`                   |
 | `hive.http.request(r)`                  | `hive.HttpSend(r)` → `Result[HttpResponse, HttpError]`         |
 | `hive.http.serve(port, handler)`        | `hive.HttpServe(port, handler)` (handler passed by proc name)  |
+| `hive.crypto.sha256/sha512(s)`          | `hive.Sha256/Sha512(s)` (lowercase-hex digest)                 |
+| `hive.crypto.hmacSha256(s, k)`          | `hive.HmacSha256(s, k)` (hex) / `randomHex(n)` → `hive.RandomHex(n)` |
+| `hive.crypto.base64Encode/Decode(s)`    | `hive.Base64Encode(s)` / `hive.Base64Decode(s)` → `Result`     |
+| `hive.crypto.jwtSign(claims, secret)`   | `hive.JwtSign(jsonEncode_T(claims), secret)` → `Str`           |
+| `hive.crypto.jwtVerify(t, s) with T`    | `hive.JwtVerify(t, s, jsonDecode_T)` → `Result[T, CryptoError]` |
+| `hive.crypto.jwtDecode(t) with T` / `.jwtHeader(t)` | `hive.JwtDecode(t, jsonDecode_T)` / `hive.JwtReadHeader(t)` |
+| `hive.sql.connect(d, s)` / `.pool(d, s, o, i)` | `hive.SqlConnect(d, s)` / `hive.SqlPool(d, s, o, i)`     |
+| `hive.sql.close(c)`                     | `hive.SqlClose(c)`                                             |
+| `hive.sql.DatabaseDriver.SQLite()`      | `hive.DatabaseDriver{Name: "sqlite"}` (also PostgreSQL/Other)  |
 | `hive.HttpRequest(m, u, h, b)`          | `hive.HttpRequest{Method: m, Url: u, Headers: h, Body: b}`     |
 | `request.body` (builtin struct field)   | `request.Body` (fields capitalize to their exported Go names)  |
 | `t[1:]`                                 | `t[1:]` (slices are **inclusive** of the high bound)           |
