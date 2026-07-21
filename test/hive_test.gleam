@@ -471,7 +471,7 @@ pub fn named_args_on_constructor_test() {
 pub fn named_args_on_builtin_constructor_test() {
   let go =
     compile(
-      "proc main(): void {\n\thive.http.serve(handler: h, port: 8080)\n}\nproc h(r: hive.HttpRequest): hive.HttpResponse {\n\treturn hive.HttpResponse(200, body: \"ok\", headers: [])\n}\n",
+      "proc main(): void {\n\thive.http.serve(handler: h, port: 8080)\n}\nproc h(r: hive.http.HttpRequest): hive.http.HttpResponse {\n\treturn hive.http.HttpResponse(200, body: \"ok\", headers: [])\n}\n",
     )
   // Both the builtin call and the builtin constructor resolve named args.
   should.be_true(string.contains(go, "hive.HttpServe(8080, h)"))
@@ -519,7 +519,7 @@ pub fn incomplete_named_call_is_rejected_test() {
 pub fn http_request_lowers_test() {
   let go =
     compile(
-      "proc f(): Str {\n\tr := hive.http.request(hive.HttpRequest(\"GET\", \"http://x\", [], \"\"))\n\tif r is Result.Ok(response) {\n\t\treturn response.body\n\t} else if r is Result.Error(error) {\n\t\treturn error.message\n\t}\n}\nproc main(): void {}\n",
+      "proc f(): Str {\n\tr := hive.http.request(hive.http.HttpRequest(\"GET\", \"http://x\", [], \"\"))\n\tif r is Result.Ok(response) {\n\t\treturn response.body\n\t} else if r is Result.Error(error) {\n\t\treturn error.message\n\t}\n}\nproc main(): void {}\n",
     )
   // The builtin constructor is positional and the call goes through HttpSend.
   should.be_true(string.contains(
@@ -534,7 +534,7 @@ pub fn http_request_lowers_test() {
 pub fn http_serve_lowers_test() {
   let go =
     compile(
-      "proc main(): void {\n\thive.http.serve(8080, handle)\n}\nproc handle(request: hive.HttpRequest): hive.HttpResponse {\n\treturn hive.HttpResponse(200, [], request.body)\n}\n",
+      "proc main(): void {\n\thive.http.serve(8080, handle)\n}\nproc handle(request: hive.http.HttpRequest): hive.http.HttpResponse {\n\treturn hive.http.HttpResponse(200, [], request.body)\n}\n",
     )
   should.be_true(string.contains(go, "hive.HttpServe(8080, handle)"))
   should.be_true(string.contains(
@@ -547,20 +547,30 @@ pub fn http_serve_lowers_test() {
   ))
 }
 
+pub fn bare_builtin_type_is_rejected_test() {
+  // The bare `hive.HttpRequest` spelling is gone; the namespaced
+  // `hive.http.HttpRequest` is required.
+  let result =
+    compiler.compile(
+      "proc main(): void {\n\techo hive.HttpRequest(\"GET\", \"http://x\", [], \"\")\n}\n",
+    )
+  should.be_error(result)
+}
+
 pub fn func_can_use_http_test() {
   // hive.http is I/O, which funcs may now perform.
   let go =
     compile(
-      "func f(): Str {\n\tr := hive.http.request(hive.HttpRequest(\"GET\", \"http://x\", [], \"\"))\n\treturn \"x\"\n}\nproc main(): void {}\n",
+      "func f(): Str {\n\tr := hive.http.request(hive.http.HttpRequest(\"GET\", \"http://x\", [], \"\"))\n\treturn \"x\"\n}\nproc main(): void {}\n",
     )
   should.be_true(string.contains(go, "hive.HttpSend("))
 }
 
 pub fn serve_handler_must_match_signature_test() {
-  // Wrong parameter type: the handler must take exactly one hive.HttpRequest.
+  // Wrong parameter type: the handler must take exactly one hive.http.HttpRequest.
   let result =
     compiler.compile(
-      "proc main(): void {\n\thive.http.serve(8080, bad)\n}\nproc bad(x: Int): hive.HttpResponse {\n\treturn hive.HttpResponse(200, [], \"\")\n}\n",
+      "proc main(): void {\n\thive.http.serve(8080, bad)\n}\nproc bad(x: Int): hive.http.HttpResponse {\n\treturn hive.http.HttpResponse(200, [], \"\")\n}\n",
     )
   should.be_error(result)
 }

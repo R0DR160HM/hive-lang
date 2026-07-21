@@ -216,21 +216,27 @@ too short to reach the matched column.
 
 ## Standard library (`hive.*`)
 
+Each module owns its types under its own namespace — `hive.http.HttpRequest`,
+`hive.json.JsonError`, `hive.crypto.CryptoError`, `hive.sql.DatabaseDriver`,
+and so on. The only builtin types that live directly on `hive` are the core
+ones the language uses without a module: `Result`, `Table` and the
+`hive.TableError` that `using` yields from a CSV.
+
 ### `hive.http`
 
 The HTTP library. Both calls perform I/O, so — like `echo` and `using` — they
 work inside a `func` or a `proc`. Requests and responses are built
 positionally —
-`hive.HttpRequest(method, url, headers, body)`,
-`hive.HttpResponse(status, headers, body)` — and headers are a `Table` of
+`hive.http.HttpRequest(method, url, headers, body)`,
+`hive.http.HttpResponse(status, headers, body)` — and headers are a `Table` of
 `[name, value]` rows.
 
 * `hive.http.request(req)` performs a request and returns
-  `Result<hive.HttpResponse, hive.HttpError>` (a `Result.Error` means no
-  response was obtained at all).
+  `Result<hive.http.HttpResponse, hive.http.HttpError>` (a `Result.Error`
+  means no response was obtained at all).
 * `hive.http.serve(port, handler)` blocks forever, serving every route through
-  `handler` — which must be a `proc (hive.HttpRequest): hive.HttpResponse`
-  passed by name.
+  `handler` — which must be a
+  `proc (hive.http.HttpRequest): hive.http.HttpResponse` passed by name.
 
 ### `hive.json`
 
@@ -238,7 +244,7 @@ The JSON library, built on the idea that Hive's type declarations *are* the
 JSON schema, and works inside both `func`s and `proc`s.
 
 * `hive.json.parse(text) with T` derives a decoder for `T` at compile time and
-  returns `Result<T, hive.JsonError>`: missing fields, wrong types and wrong
+  returns `Result<T, hive.json.JsonError>`: missing fields, wrong types and wrong
   static vector lengths become errors carrying the exact `path` that failed,
   while JSON fields the type doesn't declare are simply ignored. Variants
   decode as `{"VariantName": {...}}` (JSON `null` selects a type's first
@@ -255,14 +261,14 @@ JSON schema, and works inside both `func`s and `proc`s.
 
 General-purpose cryptography plus JSON Web Tokens. All of it is pure, so it
 works inside both `func`s and `proc`s. Fallible operations return
-`Result<_, hive.CryptoError>`, whose `reason` is a short tag such as
+`Result<_, hive.crypto.CryptoError>`, whose `reason` is a short tag such as
 `"BadSignature"`, `"Expired"` or `"Malformed"`.
 
 * **Hashing** — `hive.crypto.sha256(input)` and `hive.crypto.sha512(input)`
   return a lowercase-hex digest; `hive.crypto.hmacSha256(input, key)` is the
   keyed (HMAC-SHA256) variant.
 * **Encoding** — `hive.crypto.base64Encode(input)` returns standard base64;
-  `hive.crypto.base64Decode(input)` returns `Result<Str, hive.CryptoError>`.
+  `hive.crypto.base64Decode(input)` returns `Result<Str, hive.crypto.CryptoError>`.
 * **Random** — `hive.crypto.randomHex(bytes)` returns that many
   cryptographically-random bytes as a hex string, handy for secrets or nonces.
 * **JWT**, built on the same "your types are the schema" idea as `hive.json`:
@@ -271,11 +277,11 @@ works inside both `func`s and `proc`s. Fallible operations return
     a plain `Str`).
   * `hive.crypto.jwtVerify(token, secret) with T` checks the signature and the
     `exp`/`nbf` claims against `now()`, then decodes the payload into `T`,
-    returning `Result<T, hive.CryptoError>`. Only HS256 is accepted, so
+    returning `Result<T, hive.crypto.CryptoError>`. Only HS256 is accepted, so
     `alg: none` and algorithm-confusion are rejected outright.
   * `hive.crypto.jwtDecode(token) with T` decodes the payload **without
     verifying** it — for inspection only, never for authorization.
-  * `hive.crypto.jwtHeader(token)` reads the `hive.JwtHeader`
+  * `hive.crypto.jwtHeader(token)` reads the `hive.crypto.JwtHeader`
     (`alg`/`typ`/`kid`) without verifying, e.g. to pick a key by `kid`.
 
 ### `hive.sql`
@@ -287,13 +293,13 @@ Postgres is `github.com/lib/pq`.
 
 * **Querying** reuses the `using ... with ...` form:
   `using <connection> with <query>` runs *any* SQL and returns
-  `Result<Table, hive.SqlError>`. A query that returns rows yields a header
+  `Result<Table, hive.sql.SqlError>`. A query that returns rows yields a header
   row of column names followed by one row per result row; a statement that
   returns none (INSERT/UPDATE/DDL) yields an empty table. Build the query
   string safely with a `query` declaration, whose `{param}`s are sanitized:
   `using db with insertUser(1, "O'Brien")`.
 * `hive.sql.connect(driver, connString)` opens a pooled connection and returns
-  `Result<hive.SqlConnection, hive.SqlError>`; `hive.sql.pool(driver,
+  `Result<hive.sql.SqlConnection, hive.sql.SqlError>`; `hive.sql.pool(driver,
   connString, maxOpen, maxIdle)` does the same with explicit pool limits;
   `hive.sql.close(conn)` releases it.
 * The `driver` is a `hive.sql.DatabaseDriver`, built with
@@ -353,7 +359,7 @@ Postgres is `github.com/lib/pq`.
 | `hive.sql.connect(d, s)` / `.pool(d, s, o, i)` | `hive.SqlConnect(d, s)` / `hive.SqlPool(d, s, o, i)`     |
 | `hive.sql.close(c)`                     | `hive.SqlClose(c)`                                             |
 | `hive.sql.DatabaseDriver.SQLite()`      | `hive.DatabaseDriver{Name: "sqlite"}` (also PostgreSQL/Other)  |
-| `hive.HttpRequest(m, u, h, b)`          | `hive.HttpRequest{Method: m, Url: u, Headers: h, Body: b}`     |
+| `hive.http.HttpRequest(m, u, h, b)`     | `hive.HttpRequest{Method: m, Url: u, Headers: h, Body: b}`     |
 | `request.body` (builtin struct field)   | `request.Body` (fields capitalize to their exported Go names)  |
 | `t[1:]`                                 | `t[1:]` (slices are **inclusive** of the high bound)           |
 | `Str`, `Int`, `Bool`, `Float`, `Atom`   | `string`, `int`, `bool`, `float64`, `hive.Atom`                |

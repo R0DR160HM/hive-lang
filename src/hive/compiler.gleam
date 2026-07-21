@@ -325,29 +325,42 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
       check_args(ctx, args)
     }
     ast.ECall(ast.EMember(ast.EMember(ast.EIdent("hive"), ns), fname), args) ->
-      case ns {
-        "http" -> {
-          use _ <- result.try(check_http_call(ctx, fname, args))
+      case codegen.builtin_fields(fname) {
+        // A builtin type constructor: `hive.http.HttpRequest(...)` etc.
+        Some(fields) -> {
+          use _ <- result.try(check_named(
+            "`hive." <> ns <> "." <> fname <> "`",
+            args,
+            Some(list.map(fields, fn(f) { f.0 })),
+          ))
           check_args(ctx, args)
         }
-        "json" -> {
-          use _ <- result.try(check_json_call(fname, args))
-          check_args(ctx, args)
-        }
-        "crypto" -> {
-          use _ <- result.try(check_crypto_call(fname, args))
-          check_args(ctx, args)
-        }
-        "sql" -> {
-          use _ <- result.try(check_sql_call(fname, args))
-          check_args(ctx, args)
-        }
-        _ ->
-          Error(
-            "unknown builtin namespace `hive."
-            <> ns
-            <> "` (available: http, json, crypto, sql)",
-          )
+        // Otherwise a stdlib function in that namespace.
+        None ->
+          case ns {
+            "http" -> {
+              use _ <- result.try(check_http_call(ctx, fname, args))
+              check_args(ctx, args)
+            }
+            "json" -> {
+              use _ <- result.try(check_json_call(fname, args))
+              check_args(ctx, args)
+            }
+            "crypto" -> {
+              use _ <- result.try(check_crypto_call(fname, args))
+              check_args(ctx, args)
+            }
+            "sql" -> {
+              use _ <- result.try(check_sql_call(fname, args))
+              check_args(ctx, args)
+            }
+            _ ->
+              Error(
+                "unknown builtin namespace `hive."
+                <> ns
+                <> "` (available: http, json, crypto, sql)",
+              )
+          }
       }
     ast.ECall(ast.EMember(ast.EIdent(tname), member), args) -> {
       let target = "`" <> tname <> "." <> member <> "`"
@@ -357,14 +370,19 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
           check_named(target, args, Some(variant_field_names(decl, member)))
         Error(_) ->
           case tname {
-            // `hive.HttpRequest(...)` etc. — a builtin constructor.
+            // Builtin types are namespaced now: `hive.http.HttpRequest(...)`,
+            // not the bare `hive.HttpRequest(...)`.
             "hive" ->
               case codegen.builtin_fields(member) {
-                Some(fields) ->
-                  check_named(
-                    target,
-                    args,
-                    Some(list.map(fields, fn(f) { f.0 })),
+                Some(_) ->
+                  Error(
+                    "`hive."
+                    <> member
+                    <> "` is not a builtin; use `"
+                    <> codegen.builtin_qualifier(member)
+                    <> "."
+                    <> member
+                    <> "` instead",
                   )
                 None -> check_named(target, args, None)
               }
@@ -824,19 +842,26 @@ fn check_http_call(
 // and returning hive.HttpResponse. This is where the parameter's declared
 // shape `proc (hive.HttpRequest): hive.HttpResponse` is enforced.
 fn check_handler(ctx: Ctx, handler: ast.Expr) -> Result(Nil, String) {
+  let bad_signature =
+    "a handler must take exactly one hive.http.HttpRequest and return "
+    <> "hive.http.HttpResponse"
   case handler {
     ast.EIdent(name) ->
       case dict.get(ctx.procs, name) {
-        Ok(#(
-          [ast.Field(_, ast.TName(Some("hive"), "HttpRequest", []))],
-          ast.TName(Some("hive"), "HttpResponse", []),
-        )) -> Ok(Nil)
+        Ok(#([ast.Field(_, req)], resp)) ->
+          case
+            is_hive_type(req, "HttpRequest")
+            && is_hive_type(resp, "HttpResponse")
+          {
+            True -> Ok(Nil)
+            False ->
+              Error(
+                "proc `" <> name <> "` cannot handle HTTP requests: " <> bad_signature,
+              )
+          }
         Ok(_) ->
           Error(
-            "proc `"
-            <> name
-            <> "` cannot handle HTTP requests: a handler must take exactly one "
-            <> "hive.HttpRequest and return hive.HttpResponse",
+            "proc `" <> name <> "` cannot handle HTTP requests: " <> bad_signature,
           )
         Error(_) ->
           Error(
@@ -850,5 +875,15 @@ fn check_handler(ctx: Ctx, handler: ast.Expr) -> Result(Nil, String) {
       Error(
         "the handler passed to `hive.http.serve` must be the name of a proc",
       )
+  }
+}
+
+// Whether a type expression is the builtin `name`, referenced through its
+// own namespace (e.g. `hive.http.HttpRequest`).
+fn is_hive_type(t: ast.TypeExpr, name: String) -> Bool {
+  case t {
+    ast.TName(Some(pkg), n, []) ->
+      n == name && pkg == codegen.builtin_qualifier(name)
+    _ -> False
   }
 }

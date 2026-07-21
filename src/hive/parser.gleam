@@ -303,17 +303,38 @@ fn parse_type_expr(tokens: Toks) -> Result(#(ast.TypeExpr, Toks), String) {
   case kind(tokens) {
     token.KwVoid -> Ok(#(ast.TVoid, tail(tokens)))
     _ -> {
+      // A dotted, possibly multi-segment qualified name: `Str`, `hive.Table`,
+      // `hive.http.HttpRequest`. The last segment is the type; everything
+      // before it (joined by `.`) is the package/namespace path.
       use #(first, t1) <- result.try(expect_ident(tokens))
-      use #(pkg, name, t2) <- result.try(case kind(t1) {
-        token.Dot -> {
-          use #(second, t2b) <- result.try(expect_ident(tail(t1)))
-          Ok(#(Some(first), second, t2b))
-        }
-        _ -> Ok(#(None, first, t1))
-      })
+      use #(segments, t2) <- result.try(collect_type_segments(t1, [first]))
+      let #(pkg, name) = split_type_path(segments)
       let #(dims, t3) = parse_dims(t2, [])
       Ok(#(ast.TName(pkg, name, dims), t3))
     }
+  }
+}
+
+// Consumes further `.ident` segments of a qualified type name.
+fn collect_type_segments(
+  tokens: Toks,
+  acc: List(String),
+) -> Result(#(List(String), Toks), String) {
+  case kind(tokens) {
+    token.Dot -> {
+      use #(seg, t1) <- result.try(expect_ident(tail(tokens)))
+      collect_type_segments(t1, [seg, ..acc])
+    }
+    _ -> Ok(#(list.reverse(acc), tokens))
+  }
+}
+
+// Splits `[hive, http, HttpRequest]` into (Some("hive.http"), "HttpRequest").
+fn split_type_path(segments: List(String)) -> #(Option(String), String) {
+  case list.reverse(segments) {
+    [name] -> #(None, name)
+    [name, ..rest] -> #(Some(string.join(list.reverse(rest), ".")), name)
+    [] -> #(None, "")
   }
 }
 

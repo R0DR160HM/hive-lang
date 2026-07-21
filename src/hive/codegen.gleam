@@ -69,6 +69,19 @@ pub fn builtin_fields(name: String) -> Option(List(#(String, Ty))) {
   }
 }
 
+/// The namespace a builtin type must be referenced through (each stdlib module
+/// owns its types). The core types the language uses without a module — the
+/// `TableError` that `using` yields — stay directly on `hive`.
+pub fn builtin_qualifier(name: String) -> String {
+  case name {
+    "HttpRequest" | "HttpResponse" | "HttpError" -> "hive.http"
+    "JsonError" -> "hive.json"
+    "CryptoError" | "JwtHeader" -> "hive.crypto"
+    "SqlError" | "SqlConnection" | "DatabaseDriver" -> "hive.sql"
+    _ -> "hive"
+  }
+}
+
 /// A binding introduced by an `is` pattern: name, the Go expression that
 /// produces its value, and its inferred type.
 type Bind =
@@ -457,14 +470,26 @@ fn gen_header(body: String) -> String {
 fn ty_of_type_expr(types: Dict(String, ast.Decl), t: ast.TypeExpr) -> Ty {
   case t {
     ast.TVoid -> TyUnknown
-    ast.TName(Some("hive"), name, dims) ->
+    // A builtin type, resolved only through its own namespace
+    // (`hive.http.HttpRequest`, `hive.TableError`). A wrong or bare qualifier
+    // does not resolve.
+    ast.TName(Some(pkg), name, dims) ->
       case builtin_fields(name) {
-        Some(_) -> wrap_dims(TyBuiltin(name), dims)
+        Some(_) ->
+          case pkg == builtin_qualifier(name) {
+            True -> wrap_dims(TyBuiltin(name), dims)
+            False -> wrap_dims(TyUnknown, dims)
+          }
         None -> wrap_dims(TyUnknown, dims)
       }
-    ast.TName(Some(_), _, dims) -> wrap_dims(TyUnknown, dims)
     ast.TName(None, name, dims) -> wrap_dims(base_ty(types, name), dims)
   }
+}
+
+// Whether a type qualifier names the `hive` standard library (`hive`,
+// `hive.http`, `hive.sql`, ...).
+fn is_hive_pkg(pkg: String) -> Bool {
+  pkg == "hive" || string.starts_with(pkg, "hive.")
 }
 
 fn base_ty(types: Dict(String, ast.Decl), name: String) -> Ty {
@@ -493,7 +518,14 @@ fn gen_type(t: ast.TypeExpr) -> String {
     ast.TName(pkg, name, dims) -> {
       let prefix = string.repeat("[]", list.length(dims))
       let base = case pkg {
-        Some(p) -> p <> "." <> name
+        // A `hive.<module>` namespace is only organisational: every builtin
+        // type lives in the one Go `hive` package (`hive.http.HttpRequest`
+        // -> `hive.HttpRequest`).
+        Some(p) ->
+          case is_hive_pkg(p) {
+            True -> "hive." <> name
+            False -> p <> "." <> name
+          }
         None -> map_base_type(name)
       }
       prefix <> base
@@ -1324,26 +1356,6 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
                 Error(_) -> TyUnknown
               }
           }
-        ast.EMember(ast.EMember(ast.EIdent("hive"), "http"), "request") ->
-          TyResult(TyBuiltin("HttpResponse"), TyBuiltin("HttpError"))
-        ast.EMember(ast.EMember(ast.EIdent("hive"), "json"), fname) ->
-          case fname {
-            "table" -> TyResult(TyTable, TyBuiltin("JsonError"))
-            "get" -> TyResult(TyStr, TyBuiltin("JsonError"))
-            "encode" -> TyStr
-            _ -> TyUnknown
-          }
-        ast.EMember(ast.EMember(ast.EIdent("hive"), "crypto"), fname) ->
-          case fname {
-            "sha256" | "sha512" | "hmacSha256" | "base64Encode" | "randomHex" ->
-              TyStr
-            "base64Decode" -> TyResult(TyStr, TyBuiltin("CryptoError"))
-            "jwtSign" -> TyStr
-            "jwtHeader" ->
-              TyResult(TyBuiltin("JwtHeader"), TyBuiltin("CryptoError"))
-            // jwtVerify/jwtDecode only appear under `with`, handled above.
-            _ -> TyResult(TyUnknown, TyBuiltin("CryptoError"))
-          }
         // `hive.sql.DatabaseDriver.SQLite()` and friends build a driver value.
         ast.EMember(
           ast.EMember(
@@ -1352,16 +1364,47 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
           ),
           _,
         ) -> TyBuiltin("DatabaseDriver")
-        ast.EMember(ast.EMember(ast.EIdent("hive"), "sql"), fname) ->
-          case fname {
-            "connect" | "pool" ->
-              TyResult(TyBuiltin("SqlConnection"), TyBuiltin("SqlError"))
-            _ -> TyUnknown
-          }
-        ast.EMember(ast.EIdent("hive"), name) ->
-          case builtin_fields(name) {
-            Some(_) -> TyBuiltin(name)
-            None -> TyUnknown
+        // A `hive.<ns>.<member>` call: a builtin type constructor if the
+        // member names a builtin type, else a stdlib function's result type.
+        ast.EMember(ast.EMember(ast.EIdent("hive"), ns), fname) ->
+          case builtin_fields(fname) {
+            Some(_) -> TyBuiltin(fname)
+            None ->
+              case ns {
+                "http" ->
+                  case fname {
+                    "request" ->
+                      TyResult(TyBuiltin("HttpResponse"), TyBuiltin("HttpError"))
+                    _ -> TyUnknown
+                  }
+                "json" ->
+                  case fname {
+                    "table" -> TyResult(TyTable, TyBuiltin("JsonError"))
+                    "get" -> TyResult(TyStr, TyBuiltin("JsonError"))
+                    "encode" -> TyStr
+                    _ -> TyUnknown
+                  }
+                "crypto" ->
+                  case fname {
+                    "sha256"
+                    | "sha512"
+                    | "hmacSha256"
+                    | "base64Encode"
+                    | "randomHex" -> TyStr
+                    "base64Decode" -> TyResult(TyStr, TyBuiltin("CryptoError"))
+                    "jwtSign" -> TyStr
+                    "jwtHeader" ->
+                      TyResult(TyBuiltin("JwtHeader"), TyBuiltin("CryptoError"))
+                    _ -> TyResult(TyUnknown, TyBuiltin("CryptoError"))
+                  }
+                "sql" ->
+                  case fname {
+                    "connect" | "pool" ->
+                      TyResult(TyBuiltin("SqlConnection"), TyBuiltin("SqlError"))
+                    _ -> TyUnknown
+                  }
+                _ -> TyUnknown
+              }
           }
         ast.EMember(ast.EIdent(type_name), _) ->
           case dict.has_key(env.types, type_name) {
@@ -1706,35 +1749,32 @@ fn gen_using(env: Env, path: ast.Expr, delim: Option(ast.Expr)) -> String {
 fn gen_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
   case callee {
     ast.EIdent(name) -> gen_ident_call(env, name, args)
-    // The `hive.http` and `hive.json` standard library namespaces.
-    ast.EMember(ast.EMember(ast.EIdent("hive"), "http"), fname) ->
-      gen_http_call(env, fname, args)
-    ast.EMember(ast.EMember(ast.EIdent("hive"), "json"), fname) ->
-      gen_json_call(env, fname, args)
-    ast.EMember(ast.EMember(ast.EIdent("hive"), "crypto"), fname) ->
-      gen_crypto_call(env, fname, args)
     // `hive.sql.DatabaseDriver.SQLite()` etc. — driver constructors.
     ast.EMember(
       ast.EMember(ast.EMember(ast.EIdent("hive"), "sql"), "DatabaseDriver"),
       variant,
     ) -> gen_sql_driver(env, variant, args)
-    ast.EMember(ast.EMember(ast.EIdent("hive"), "sql"), fname) ->
-      gen_sql_call(env, fname, args)
+    // A `hive.<ns>.<member>` call: a builtin type constructor
+    // (`hive.http.HttpRequest(...)`) if the member names a builtin type,
+    // otherwise a stdlib function in that namespace.
+    ast.EMember(ast.EMember(ast.EIdent("hive"), ns), fname) ->
+      case builtin_fields(fname) {
+        Some(fields) -> gen_builtin_construct(env, fname, fields, args)
+        None ->
+          case ns {
+            "http" -> gen_http_call(env, fname, args)
+            "json" -> gen_json_call(env, fname, args)
+            "crypto" -> gen_crypto_call(env, fname, args)
+            "sql" -> gen_sql_call(env, fname, args)
+            _ -> gen_plain_call(env, callee, args)
+          }
+      }
     ast.EMember(ast.EIdent(type_name), variant_name) ->
       case dict.get(env.types, type_name) {
         Ok(_) -> gen_constructor(env, type_name, variant_name, args)
-        Error(_) ->
-          case type_name {
-            // `hive.HttpRequest(...)` etc. — positional constructors for the
-            // runtime's builtin structs.
-            "hive" ->
-              case builtin_fields(variant_name) {
-                Some(fields) ->
-                  gen_builtin_construct(env, variant_name, fields, args)
-                None -> gen_plain_call(env, callee, args)
-              }
-            _ -> gen_plain_call(env, callee, args)
-          }
+        // Builtin constructors are namespaced (`hive.http.HttpRequest(...)`),
+        // handled above; a bare `hive.X(...)` is rejected by validation.
+        Error(_) -> gen_plain_call(env, callee, args)
       }
     _ -> gen_plain_call(env, callee, args)
   }
