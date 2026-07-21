@@ -94,6 +94,10 @@ fn parse_decls(
       use #(decl, rest) <- result.try(parse_func(tokens))
       parse_decls(rest, [decl, ..acc])
     }
+    token.KwAsync -> {
+      use #(decl, rest) <- result.try(parse_async_func(tokens))
+      parse_decls(rest, [decl, ..acc])
+    }
     token.KwQuery -> {
       use #(decl, rest) <- result.try(parse_query(tokens))
       parse_decls(rest, [decl, ..acc])
@@ -104,7 +108,8 @@ fn parse_decls(
     }
     other ->
       Error(
-        "expected `proc`, `func`, `query` or `type` at the top level but found "
+        "expected `proc`, `func`, `async func`, `query` or `type` at the top "
+        <> "level but found "
         <> token.describe(other)
         <> at(tokens),
       )
@@ -135,7 +140,25 @@ fn parse_proc(tokens: Toks) -> Result(#(ast.Decl, Toks), String) {
 fn parse_func(tokens: Toks) -> Result(#(ast.Decl, Toks), String) {
   use #(name, params, ret, t1) <- result.try(parse_header(tokens, token.KwFunc))
   use #(body, t2) <- result.try(parse_block(t1))
-  Ok(#(ast.FuncDecl(name, params, ret, body), t2))
+  Ok(#(ast.FuncDecl(name, params, ret, body, False), t2))
+}
+
+// `async func name(): T { ... }` — a func that runs on its own virtual thread.
+fn parse_async_func(tokens: Toks) -> Result(#(ast.Decl, Toks), String) {
+  let t0 = tail(tokens)
+  case kind(t0) {
+    token.KwFunc -> {
+      use #(name, params, ret, t1) <- result.try(parse_header(t0, token.KwFunc))
+      use #(body, t2) <- result.try(parse_block(t1))
+      Ok(#(ast.FuncDecl(name, params, ret, body, True), t2))
+    }
+    other ->
+      Error(
+        "expected `func` after `async` but found "
+        <> token.describe(other)
+        <> at(t0),
+      )
+  }
 }
 
 fn parse_query(tokens: Toks) -> Result(#(ast.Decl, Toks), String) {
@@ -373,17 +396,41 @@ fn parse_stmt(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
     token.KwIf -> parse_if(tokens)
     token.KwEcho -> parse_echo(tokens)
     token.KwAssert -> parse_assert(tokens)
+    token.KwMut -> parse_mut(tail(tokens))
     token.Ident(name) ->
       case kind(tail(tokens)) {
         token.ColonEq -> {
           use #(value, t2) <- result.try(parse_expr(tail(tail(tokens))))
-          Ok(#(ast.SVarDecl(name, value), t2))
+          Ok(#(ast.SVarDecl(name, value, False), t2))
         }
         _ -> parse_typed_or_expr(tokens)
       }
-    _ -> {
-      use #(expr, t1) <- result.try(parse_expr(tokens))
-      Ok(#(ast.SExpr(expr), t1))
+    _ -> parse_expr_stmt(tokens)
+  }
+}
+
+// A `mut` declaration: either `mut name := value` (inferred) or
+// `mut Type name = value` (annotated). The mutable flag lets the validation
+// pass permit later reassignment.
+fn parse_mut(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
+  case kind(tokens), kind(tail(tokens)) {
+    token.Ident(name), token.ColonEq -> {
+      use #(value, t2) <- result.try(parse_expr(tail(tail(tokens))))
+      Ok(#(ast.SVarDecl(name, value, True), t2))
+    }
+    _, _ -> {
+      use #(typ, t1) <- result.try(parse_type_expr(tokens))
+      case kind(t1), kind(tail(t1)) {
+        token.Ident(vname), token.Assign -> {
+          use #(value, t2) <- result.try(parse_expr(tail(tail(t1))))
+          Ok(#(ast.STypedDecl(typ, vname, value, True), t2))
+        }
+        _, _ ->
+          Error(
+            "expected `name := value` or `Type name = value` after `mut`"
+            <> at(tokens),
+          )
+      }
     }
   }
 }
@@ -407,7 +454,7 @@ fn parse_typed_or_expr(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
       case kind(t1), kind(tail(t1)) {
         token.Ident(vname), token.Assign -> {
           use #(value, t2) <- result.try(parse_expr(tail(tail(t1))))
-          Ok(#(ast.STypedDecl(typ, vname, value), t2))
+          Ok(#(ast.STypedDecl(typ, vname, value, False), t2))
         }
         _, _ -> parse_expr_stmt(tokens)
       }
@@ -415,9 +462,18 @@ fn parse_typed_or_expr(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
   }
 }
 
+// Either a bare expression statement or a reassignment `lvalue = value`. The
+// left-hand side is parsed as an ordinary expression (so `v`, `v[0]` and
+// `v.field` all work); a trailing `=` promotes it to an assignment.
 fn parse_expr_stmt(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
   use #(expr, t1) <- result.try(parse_expr(tokens))
-  Ok(#(ast.SExpr(expr), t1))
+  case kind(t1) {
+    token.Assign -> {
+      use #(value, t2) <- result.try(parse_expr(tail(t1)))
+      Ok(#(ast.SAssign(expr, value), t2))
+    }
+    _ -> Ok(#(ast.SExpr(expr), t1))
+  }
 }
 
 fn parse_return(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
@@ -724,6 +780,12 @@ fn parse_primary(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
     token.KwTrue -> Ok(#(ast.EBool(True), tail(tokens)))
     token.KwFalse -> Ok(#(ast.EBool(False), tail(tokens)))
     token.Ident(name) -> Ok(#(ast.EIdent(name), tail(tokens)))
+    // `await <call>` binds to the postfix expression that follows, so
+    // `await f(x)` awaits the whole call.
+    token.KwAwait -> {
+      use #(inner, t1) <- result.try(parse_postfix(tail(tokens)))
+      Ok(#(ast.EAwait(inner), t1))
+    }
     token.KwUsing -> parse_using(tokens)
     token.LBracket -> parse_vector(tail(tokens), [])
     token.LParen -> {

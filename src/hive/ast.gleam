@@ -14,12 +14,16 @@ pub type Decl {
     return_type: TypeExpr,
     body: List(Stmt),
   )
-  /// A `func`: a pure function (no side effects allowed in its body).
+  /// A `func`: a pure function (no side effects allowed in its body). When
+  /// `async` is set the func was declared `async func` and runs on its own
+  /// virtual thread (goroutine): calling it bare is fire-and-forget, calling
+  /// it with `await` blocks for its value.
   FuncDecl(
     name: String,
     params: List(Field),
     return_type: TypeExpr,
     body: List(Stmt),
+    async: Bool,
   )
   /// A `query`: a pure function whose body is inline SQL. The body is a
   /// sequence of literal SQL chunks and interpolated expressions; every
@@ -64,10 +68,15 @@ pub type TypeExpr {
 }
 
 pub type Stmt {
-  /// `name := value` — type-inferred declaration.
-  SVarDecl(name: String, value: Expr)
+  /// `name := value` — type-inferred declaration. `mutable` records whether it
+  /// was declared with `mut`; only mutable variables may be reassigned.
+  SVarDecl(name: String, value: Expr, mutable: Bool)
   /// `Type name = value` — declaration with an explicit type annotation.
-  STypedDecl(typ: TypeExpr, name: String, value: Expr)
+  /// `mutable` records whether it was declared with `mut`.
+  STypedDecl(typ: TypeExpr, name: String, value: Expr, mutable: Bool)
+  /// `target = value` — reassignment of a mutable variable (or one of its
+  /// elements, e.g. `v[0] = x`).
+  SAssign(target: Expr, value: Expr)
   /// `if ... { } else if ... { } else { }`
   SIf(branches: List(Branch), else_body: Option(List(Stmt)))
   /// `return` or `return value`
@@ -134,6 +143,10 @@ pub type Expr {
   /// `hive.json.parse(text) with Type` — gives a decode target type to an
   /// expression. Only valid on `hive.json.parse` calls.
   EWith(value: Expr, typ: TypeExpr)
+  /// `await <async call>` — blocks the current virtual thread until the async
+  /// function returns its value (a bare call, without `await`, is
+  /// fire-and-forget).
+  EAwait(value: Expr)
 }
 
 /// One argument in a call. Arguments may be passed by name

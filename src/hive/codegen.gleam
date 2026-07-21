@@ -122,6 +122,9 @@ type Env {
     ret: Ty,
     /// The program's atom table: name -> compiled integer value.
     atoms: Dict(String, Int),
+    /// Names of the `async func`s: a bare call to one is fire-and-forget (a
+    /// goroutine); an `await`ed call blocks for its value.
+    asyncs: List(String),
   )
 }
 
@@ -133,7 +136,14 @@ pub fn generate(module: ast.Module) -> String {
     |> list.index_map(fn(name, i) { #(name, i) })
     |> dict.from_list
   let sigs = collect_sigs(types, module.decls)
-  let env = Env(types, sigs, dict.new(), dict.new(), TyUnknown, atoms)
+  let asyncs =
+    list.filter_map(module.decls, fn(d) {
+      case d {
+        ast.FuncDecl(name, _, _, _, True) -> Ok(name)
+        _ -> Error(Nil)
+      }
+    })
+  let env = Env(types, sigs, dict.new(), dict.new(), TyUnknown, atoms, asyncs)
 
   let type_code =
     module.decls
@@ -152,7 +162,7 @@ pub fn generate(module: ast.Module) -> String {
     |> list.filter_map(fn(d) {
       case d {
         ast.ProcDecl(name, params, ret, body)
-        | ast.FuncDecl(name, params, ret, body) ->
+        | ast.FuncDecl(name, params, ret, body, _) ->
           Ok(gen_fn_decl(env, name, params, ret, body))
         ast.QueryDecl(name, params, ret, sql) ->
           Ok(gen_query_decl(env, name, params, ret, sql))
@@ -174,7 +184,7 @@ pub fn generate(module: ast.Module) -> String {
 fn uses_json_module(module: ast.Module) -> Bool {
   list.any(module.decls, fn(d) {
     case d {
-      ast.ProcDecl(_, _, _, body) | ast.FuncDecl(_, _, _, body) ->
+      ast.ProcDecl(_, _, _, body) | ast.FuncDecl(_, _, _, body, _) ->
         uses_json_stmts(body)
       ast.QueryDecl(_, _, _, sql) ->
         list.any(sql, fn(p) {
@@ -191,8 +201,10 @@ fn uses_json_module(module: ast.Module) -> Bool {
 fn uses_json_stmts(stmts: List(ast.Stmt)) -> Bool {
   list.any(stmts, fn(s) {
     case s {
-      ast.SVarDecl(_, value) -> uses_json_expr(value)
-      ast.STypedDecl(_, _, value) -> uses_json_expr(value)
+      ast.SVarDecl(_, value, _) -> uses_json_expr(value)
+      ast.STypedDecl(_, _, value, _) -> uses_json_expr(value)
+      ast.SAssign(target, value) ->
+        uses_json_expr(target) || uses_json_expr(value)
       ast.SReturn(None) -> False
       ast.SReturn(Some(e)) -> uses_json_expr(e)
       ast.SEcho(e) -> uses_json_expr(e)
@@ -242,6 +254,7 @@ fn uses_json_expr(e: ast.Expr) -> Bool {
     ast.EBinary(_, l, r) -> uses_json_expr(l) || uses_json_expr(r)
     ast.EIs(subject, _) -> uses_json_expr(subject)
     ast.EUsing(path, delim) -> uses_json_expr(path) || uses_json_opt(delim)
+    ast.EAwait(value) -> uses_json_expr(value)
   }
 }
 
@@ -268,7 +281,7 @@ fn collect_sigs(
   list.fold(decls, dict.new(), fn(acc, d) {
     case d {
       ast.ProcDecl(name, params, ret, _)
-      | ast.FuncDecl(name, params, ret, _)
+      | ast.FuncDecl(name, params, ret, _, _)
       | ast.QueryDecl(name, params, ret, _) -> {
         let ptys =
           list.map(params, fn(p) { #(p.name, ty_of_type_expr(types, p.typ)) })
@@ -289,7 +302,7 @@ fn collect_atoms(module: ast.Module) -> List(String) {
   let found =
     list.fold(module.decls, [], fn(acc, d) {
       case d {
-        ast.ProcDecl(_, _, _, body) | ast.FuncDecl(_, _, _, body) ->
+        ast.ProcDecl(_, _, _, body) | ast.FuncDecl(_, _, _, body, _) ->
           atoms_in_stmts(body, acc)
         ast.QueryDecl(_, _, _, sql) -> atoms_in_parts(sql, acc)
         ast.TypeDecl(..) -> acc
@@ -312,8 +325,10 @@ fn add_atom(acc: List(String), name: String) -> List(String) {
 fn atoms_in_stmts(stmts: List(ast.Stmt), acc: List(String)) -> List(String) {
   list.fold(stmts, acc, fn(acc, s) {
     case s {
-      ast.SVarDecl(_, value) -> atoms_in_expr(value, acc)
-      ast.STypedDecl(_, _, value) -> atoms_in_expr(value, acc)
+      ast.SVarDecl(_, value, _) -> atoms_in_expr(value, acc)
+      ast.STypedDecl(_, _, value, _) -> atoms_in_expr(value, acc)
+      ast.SAssign(target, value) ->
+        atoms_in_expr(value, atoms_in_expr(target, acc))
       ast.SReturn(None) -> acc
       ast.SReturn(Some(e)) -> atoms_in_expr(e, acc)
       ast.SEcho(e) -> atoms_in_expr(e, acc)
@@ -361,6 +376,7 @@ fn atoms_in_expr(e: ast.Expr, acc: List(String)) -> List(String) {
     ast.EIs(subject, _) -> atoms_in_expr(subject, acc)
     ast.EUsing(path, delim) -> atoms_in_opt(delim, atoms_in_expr(path, acc))
     ast.EWith(value, _) -> atoms_in_expr(value, acc)
+    ast.EAwait(value) -> atoms_in_expr(value, acc)
   }
 }
 
@@ -978,13 +994,13 @@ fn gen_stmt(
 ) -> #(String, Env) {
   let pad = tabs(indent)
   case stmt {
-    ast.SVarDecl(name, value) -> {
+    ast.SVarDecl(name, value, _) -> {
       let ty = infer(env, value)
       let decl = pad <> name <> " := " <> gen_expr(env, value) <> "\n"
       let env2 = Env(..env, locals: dict.insert(env.locals, name, ty))
       #(decl <> guard(following, name, pad), env2)
     }
-    ast.STypedDecl(typ, name, value) -> {
+    ast.STypedDecl(typ, name, value, _) -> {
       let ty = ty_of_type_expr(env.types, typ)
       let decl =
         pad
@@ -1008,11 +1024,46 @@ fn gen_stmt(
       let #(cond, _) = gen_condition(env, e)
       #(pad <> "hive.Assert(" <> cond <> ")\n", env)
     }
-    ast.SExpr(e) -> #(pad <> gen_expr(env, e) <> "\n", env)
+    ast.SAssign(target, value) -> {
+      let ty = infer(env, target)
+      #(
+        pad <> gen_expr(env, target) <> " = " <> coerce(env, value, ty) <> "\n",
+        env,
+      )
+    }
+    // `append(v, x)` used as a statement mutates `v` in place, which Go models
+    // by reassigning the (possibly reallocated) slice back to `v`.
+    ast.SExpr(ast.ECall(ast.EIdent("append"), args)) -> {
+      let target = case args {
+        [ast.Arg(_, t), ..] -> gen_expr(env, t)
+        [] -> "_"
+      }
+      #(pad <> target <> " = " <> gen_append(env, args) <> "\n", env)
+    }
+    ast.SExpr(e) -> {
+      let code = gen_expr(env, e)
+      // A bare call to an `async func` is fire-and-forget: run it on its own
+      // goroutine so it does not block the caller.
+      let stmt = case is_async_call(env, e) {
+        True -> "go " <> code
+        False -> code
+      }
+      #(pad <> stmt <> "\n", env)
+    }
     ast.SIf(branches, else_body) -> #(
       gen_if(env, branches, else_body, indent),
       env,
     )
+  }
+}
+
+// Whether `e` is a direct call to an `async func` (so a bare-statement call is
+// fire-and-forget). An `await`ed call is an `EAwait`, not a bare `ECall`, so it
+// never matches here.
+fn is_async_call(env: Env, e: ast.Expr) -> Bool {
+  case e {
+    ast.ECall(ast.EIdent(name), _) -> list.contains(env.asyncs, name)
+    _ -> False
   }
 }
 
@@ -1237,10 +1288,19 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
           }
         _ -> TyUnknown
       }
-    ast.ECall(callee, _) ->
+    ast.ECall(callee, args) ->
       case callee {
         ast.EIdent("len") -> TyInt
+        ast.EIdent("bytes") -> TyInt
         ast.EIdent("now") -> TyInt
+        ast.EIdent("join") -> TyStr
+        ast.EIdent("split") -> TyVec(TyStr)
+        // `append` yields a vector of the same type as its first argument.
+        ast.EIdent("append") ->
+          case args {
+            [ast.Arg(_, first), ..] -> infer(env, first)
+            [] -> TyUnknown
+          }
         ast.EIdent(name) ->
           case dict.has_key(env.types, name) {
             True -> TyCustom(name)
@@ -1302,6 +1362,8 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
           TyResult(ty_of_type_expr(env.types, typ), TyBuiltin("JsonError"))
         _ -> infer(env, value)
       }
+    // `await e` produces the value the awaited async function returns.
+    ast.EAwait(value) -> infer(env, value)
   }
 }
 
@@ -1383,6 +1445,9 @@ fn gen_expr(env: Env, e: ast.Expr) -> String {
     }
     ast.ECall(callee, args) -> gen_call(env, callee, args)
     ast.EWith(value, typ) -> gen_with(env, value, typ)
+    // An async func lowers to an ordinary Go function, so `await`ing it (i.e.
+    // blocking for its value) is just calling it synchronously.
+    ast.EAwait(value) -> gen_expr(env, value)
   }
 }
 
@@ -1696,10 +1761,37 @@ fn gen_field_args(
 
 fn gen_ident_call(env: Env, name: String, args: List(ast.Arg)) -> String {
   case name {
-    "len" -> "len(" <> gen_args(env, args) <> ")"
+    // `len` counts elements of a vector but characters (runes) of a Str.
+    "len" ->
+      case args {
+        [ast.Arg(_, arg)] ->
+          case infer(env, arg) {
+            TyStr -> "hive.StrLen(" <> gen_expr(env, arg) <> ")"
+            _ -> "len(" <> gen_expr(env, arg) <> ")"
+          }
+        _ -> "len(" <> gen_args(env, args) <> ")"
+      }
+    // `bytes` reports the UTF-8 byte length of a Str, or the byte footprint
+    // (element count times element size) of a vector's contiguous storage.
+    "bytes" ->
+      case args {
+        [ast.Arg(_, arg)] ->
+          case infer(env, arg) {
+            TyStr -> "len(" <> gen_expr(env, arg) <> ")"
+            _ -> "hive.Bytes(" <> gen_expr(env, arg) <> ")"
+          }
+        _ -> "hive.Bytes(" <> gen_args(env, args) <> ")"
+      }
     "now" -> "hive.Now()"
     "print" -> "fmt.Print(" <> gen_args(env, args) <> ")"
     "println" -> "fmt.Println(" <> gen_args(env, args) <> ")"
+    // `join(vector, sep)` concatenates a Str vector into one Str.
+    "join" -> "hive.Join(" <> gen_args(env, args) <> ")"
+    // `split(str, sep)` divides a Str into a Str vector.
+    "split" -> "hive.Split(" <> gen_args(env, args) <> ")"
+    // `append(v, x...)` grows a vector (see gen_append); as a statement the
+    // caller reassigns the result back to `v`.
+    "append" -> gen_append(env, args)
     _ ->
       case dict.get(env.types, name) {
         // Bare `Type(...)` constructs the first variant (or the struct itself
@@ -1774,6 +1866,24 @@ fn gen_struct_construct(
 
 fn gen_plain_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
   gen_expr(env, callee) <> "(" <> gen_args(env, args) <> ")"
+}
+
+// `append(v, a, b, ...)` -> Go's builtin `append`, coercing every appended
+// value to the vector's element type.
+fn gen_append(env: Env, args: List(ast.Arg)) -> String {
+  case args {
+    [ast.Arg(_, target), ..rest] -> {
+      let elem = case infer(env, target) {
+        TyVec(t) -> t
+        _ -> TyUnknown
+      }
+      let items = list.map(rest, fn(a) { coerce(env, a.value, elem) })
+      "append("
+      <> string.join([gen_expr(env, target), ..items], ", ")
+      <> ")"
+    }
+    [] -> "append()"
+  }
 }
 
 fn gen_args(env: Env, args: List(ast.Arg)) -> String {
@@ -1858,8 +1968,12 @@ fn uses_in_stmts(stmts: List(ast.Stmt), name: String) -> Bool {
 
 fn uses_in_stmt(s: ast.Stmt, name: String) -> Bool {
   case s {
-    ast.SVarDecl(_, value) -> uses_in_expr(value, name)
-    ast.STypedDecl(_, _, value) -> uses_in_expr(value, name)
+    ast.SVarDecl(_, value, _) -> uses_in_expr(value, name)
+    ast.STypedDecl(_, _, value, _) -> uses_in_expr(value, name)
+    // Only the assigned value counts as a use: a bare `name = ...` writes to
+    // `name` without reading it, and Go's "declared and not used" rule needs a
+    // read. Under-counting is safe (it only adds a harmless `_ = name`).
+    ast.SAssign(_, value) -> uses_in_expr(value, name)
     ast.SReturn(None) -> False
     ast.SReturn(Some(e)) -> uses_in_expr(e, name)
     ast.SEcho(e) -> uses_in_expr(e, name)
@@ -1907,6 +2021,7 @@ fn uses_in_expr(e: ast.Expr, name: String) -> Bool {
     ast.EUsing(path, delim) ->
       uses_in_expr(path, name) || uses_in_opt(delim, name)
     ast.EWith(value, _) -> uses_in_expr(value, name)
+    ast.EAwait(value) -> uses_in_expr(value, name)
   }
 }
 

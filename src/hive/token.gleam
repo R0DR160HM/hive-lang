@@ -49,6 +49,9 @@ pub type Kind {
   KwEcho
   KwAssert
   KwDyn
+  KwMut
+  KwAsync
+  KwAwait
 
   // Punctuation
   LBrace
@@ -110,6 +113,9 @@ pub fn describe(kind: Kind) -> String {
     KwEcho -> "`echo`"
     KwAssert -> "`assert`"
     KwDyn -> "`dyn`"
+    KwMut -> "`mut`"
+    KwAsync -> "`async`"
+    KwAwait -> "`await`"
     LBrace -> "`{`"
     RBrace -> "`}`"
     LParen -> "`(`"

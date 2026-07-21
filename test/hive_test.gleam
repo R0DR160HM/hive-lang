@@ -268,6 +268,150 @@ pub fn func_cannot_call_proc_test() {
 }
 
 // ---------------------------------------------------------------------------
+// Mutability
+// ---------------------------------------------------------------------------
+
+pub fn mut_declaration_and_reassignment_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tmut x := \"a\"\n\tx = \"b\"\n\techo x\n}\n",
+    )
+  // A `mut` variable declares like any other but may be reassigned with `=`.
+  should.be_true(string.contains(go, "x := \"a\""))
+  should.be_true(string.contains(go, "x = \"b\""))
+}
+
+pub fn mut_index_assignment_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tmut v := [\"a\", \"b\"]\n\tv[0] = \"c\"\n\techo v\n}\n",
+    )
+  should.be_true(string.contains(go, "v[0] = \"c\""))
+}
+
+pub fn mut_typed_dynamic_vector_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tmut Str[dyn] v = [\"a\"]\n\tv = [\"a\", \"b\"]\n\techo v\n}\n",
+    )
+  should.be_true(string.contains(go, "var v []string = []string{\"a\"}"))
+  should.be_true(string.contains(go, "v = []string{\"a\", \"b\"}"))
+}
+
+pub fn assign_to_immutable_is_rejected_test() {
+  // `x` is immutable (no `mut`), so reassigning it is a compile error.
+  let result =
+    compiler.compile("proc main(): void {\n\tx := \"a\"\n\tx = \"b\"\n}\n")
+  should.be_error(result)
+}
+
+pub fn assign_to_parameter_is_rejected_test() {
+  // Parameters are immutable, so they cannot be reassigned.
+  let result =
+    compiler.compile(
+      "func f(a: Str): Str {\n\ta = \"b\"\n\treturn a\n}\nproc main(): void {}\n",
+    )
+  should.be_error(result)
+}
+
+// ---------------------------------------------------------------------------
+// The vector / string builtins (len, bytes, append, join, split)
+// ---------------------------------------------------------------------------
+
+pub fn len_of_vector_counts_elements_test() {
+  let go =
+    compile(
+      "func f(): Int {\n\tv := [\"a\", \"b\"]\n\treturn len(v)\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "return len(v)"))
+}
+
+pub fn len_of_string_counts_runes_test() {
+  let go =
+    compile(
+      "func f(): Int {\n\ts := \"hi\"\n\treturn len(s)\n}\nproc main(): void {}\n",
+    )
+  // A Str's length is its character (rune) count, not its Go byte length.
+  should.be_true(string.contains(go, "return hive.StrLen(s)"))
+}
+
+pub fn bytes_of_string_is_byte_length_test() {
+  let go =
+    compile(
+      "func f(): Int {\n\ts := \"hi\"\n\treturn bytes(s)\n}\nproc main(): void {}\n",
+    )
+  // A Str's byte length is Go's builtin len over the string.
+  should.be_true(string.contains(go, "return len(s)"))
+}
+
+pub fn bytes_of_vector_uses_runtime_test() {
+  let go =
+    compile(
+      "func f(): Int {\n\tv := [\"a\", \"b\"]\n\treturn bytes(v)\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "return hive.Bytes(v)"))
+}
+
+pub fn split_lowers_to_runtime_test() {
+  let go =
+    compile(
+      "func f(): Str[dyn] {\n\treturn split(\"a,b\", \",\")\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "hive.Split(\"a,b\", \",\")"))
+}
+
+pub fn append_reassigns_mutable_vector_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tmut Str[dyn] v = [\"a\"]\n\tappend(v, \"b\")\n\techo v\n}\n",
+    )
+  // `append` as a statement grows the slice and writes it back to the variable.
+  should.be_true(string.contains(go, "v = append(v, \"b\")"))
+}
+
+pub fn append_on_immutable_is_rejected_test() {
+  let result =
+    compiler.compile(
+      "proc main(): void {\n\tStr[dyn] v = [\"a\"]\n\tappend(v, \"b\")\n}\n",
+    )
+  should.be_error(result)
+}
+
+pub fn join_lowers_to_runtime_test() {
+  let go =
+    compile(
+      "func f(): Str {\n\treturn join([\"a\", \"b\"], \"-\")\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "hive.Join([]string{\"a\", \"b\"}, \"-\")"))
+}
+
+// ---------------------------------------------------------------------------
+// Async funcs and virtual threads
+// ---------------------------------------------------------------------------
+
+pub fn async_call_is_fire_and_forget_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tmut x := \"hi\"\n\twork(x)\n\tx = await work(x)\n\techo x\n}\nasync func work(text: Str): Str {\n\treturn text\n}\n",
+    )
+  // An async func lowers to an ordinary Go function.
+  should.be_true(string.contains(go, "func work(text string) string {"))
+  // A bare call runs on its own goroutine; `await` is a plain blocking call.
+  should.be_true(string.contains(go, "go work(x)"))
+  should.be_true(string.contains(go, "x = work(x)"))
+}
+
+pub fn non_async_statement_call_has_no_goroutine_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\twork()\n}\nproc work(): void {\n\techo \"x\"\n}\n",
+    )
+  // Only async calls become goroutines; ordinary proc calls do not.
+  should.be_false(string.contains(go, "go work()"))
+  should.be_true(string.contains(go, "work()"))
+}
+
+// ---------------------------------------------------------------------------
 // Named arguments
 // ---------------------------------------------------------------------------
 

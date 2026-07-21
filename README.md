@@ -55,6 +55,25 @@ in `foo.hive-build/` for inspection. `hive run` executes it with the working
 directory set to the entrypoint's folder, so relative paths such as
 `using "./test.csv"` resolve as the author expects.
 
+### Troubleshooting on Windows
+
+If `hive run` produces **no output at all** (or crashes with an `Eacces` /
+"Application Control policy has blocked this file" error), Windows is very
+likely blocking the freshly-compiled `.exe` before it can start — the program
+never runs, so none of its `echo`s appear. This is Windows Defender's
+real-time protection or SmartScreen/Application Control scanning a brand-new
+unsigned binary; it is unrelated to the compiled code (`echo` lowers to Go's
+`fmt.Println`, which behaves the same on Windows and Linux). To confirm and
+work around it:
+
+* Run the produced binary directly (`.\foo.exe`) — if that is blocked too, it
+  is the OS, not the compiler.
+* Add a Windows Defender **exclusion** for your project folder (Settings →
+  Privacy & security → Windows Security → Virus & threat protection →
+  Manage settings → Exclusions), or build into an already-excluded directory.
+* `hive emit foo.hive` prints the generated Go without producing an
+  executable, which is handy while a block is being sorted out.
+
 ## The examples
 
 The language is specified by the programs in `code-examples/`; each one
@@ -82,17 +101,20 @@ func parse() ParsingResult {
 ```
 
 **`2 - Types`** tours the type system: strings (interpolation, backtick
-multiline strings), vectors, atoms, numbers, custom types and queries.
-Running it prints:
+multiline strings), vectors, atoms, numbers, custom types and queries, plus
+mutability (`mut`, reassignment, `append`) and async funcs (`await` and
+fire-and-forget calls on virtual threads). Running it prints:
 
 ```
 Strings!
 [Vectors for the Win!]
+My name is Hive!
 True
 3
 Example
 SELECT * FROM users u
 WHERE u.name = 'O''Brien'
+Hello World!
 ```
 
 **`3 - HTTP`** serves an HTTP server on port 8080 whose handler greets every
@@ -109,19 +131,87 @@ $ curl -X POST localhost:8080/greet -d '{"name": 42, "details": {}}'
 {"message":"$.name: expected Str, found the number 42","timestamp":1784507444}
 ```
 
+## A taste of Hive
+
+The four kinds of callable — a pure `func`, a side-effecting `proc`, an inline
+SQL `query`, and an `async func` that runs on its own virtual thread — in one
+program:
+
+```hive
+type Greeting {
+	Formal { title: Str }
+	Casual
+}
+
+// A `func` is pure: no side effects, so it is safe to call anywhere.
+func greet(name: Str, style: Greeting): Str {
+	if style is Greeting.Formal(title) {
+		return "Good evening, {title} {name}."
+	}
+	return "Hey {name}!"
+}
+
+// A `query` is a pure function whose body is inline SQL; every interpolated
+// parameter is sanitized automatically (note the doubled quote in the output).
+query findUser(name: Str): Str {
+	SELECT * FROM users WHERE name = {name}
+}
+
+// An `async func` runs on its own virtual thread (a goroutine).
+async func slowShout(text: Str): Str {
+	return text + "!!!"
+}
+
+// A `proc` may perform side effects (echo, using, hive.http, ...).
+proc main(): void {
+	mut names := ["Ada", "Linus"]
+	names[0] = "Grace"
+
+	echo greet("Grace", Greeting.Formal("Dr."))
+	echo greet(names[1], Greeting.Casual())
+	echo findUser("O'Brien")
+
+	slowShout("fire-and-forget")     // does not block; the result is discarded
+	echo await slowShout("await")    // blocks until the value is ready
+}
+```
+
+Running it prints:
+
+```
+Good evening, Dr. Grace.
+Hey Linus!
+SELECT * FROM users WHERE name = 'O''Brien'
+await!!!
+```
+
 ## The language
 
-* **`proc` / `func` / `query`** — a `proc` may perform side effects; a
-  `func` is pure (using `echo`/`using` or calling a `proc` inside one is a
-  compile error). A `query` is a func whose body is inline SQL: every
+* **`proc` / `func` / `query` / `async func`** — a `proc` may perform side
+  effects; a `func` is pure (using `echo`/`using` or calling a `proc` inside
+  one is a compile error). A `query` is a func whose body is inline SQL: every
   `{param}` interpolated into it is rendered as a quoted SQL literal and
-  sanitized at runtime (`'O''Brien'` above). Programs start at
+  sanitized at runtime (`'O''Brien'` above). An `async func` runs on its own
+  virtual thread — see the concurrency bullet below. Programs start at
   `proc main(): void`.
 * **Strings** (`Str`) are UTF-8, support `"{expr}"` interpolation, and
   backtick multiline strings whose indentation is removed at compile time.
 * **Vectors** are memory-contiguous and static (`Str[3]`) or dynamic
   (`Str[dyn]`, `Str[dyn, 2]` with an initial size). All of them lower to Go
-  slices; `+` concatenates. `Table` is an alias for `Str[dyn][dyn]`.
+  slices; `+` concatenates into a new vector. `Table` is an alias for
+  `Str[dyn][dyn]`. (For `append`, `join`, `split`, `len` and `bytes` see
+  [Built-in functions](#built-in-functions).)
+* **Mutability** — variables are immutable by default; prefix a declaration
+  with `mut` (`mut x := ...`, `mut Str[dyn] v = ...`) to allow reassignment
+  (`x = ...`, `v[0] = ...`) and `append`. Conceptually a `mut T` is a
+  `Mutex<T>`: identical to `T` at runtime, but only mutexes may be altered at
+  compile time. A parameter or return of type `T` accepts a `Mutex<T>` (the
+  callee just sees an immutable `T`), never the reverse, so assigning to a
+  parameter or a plain `:=` binding is a compile error.
+* **Concurrency** — an `async func` runs on its own virtual thread (a
+  goroutine). Calling one bare is fire-and-forget — it behaves as `void` and
+  does not block the caller — while `await someAsyncCall()` blocks the current
+  thread until the function returns its value.
 * **Atoms** (`#SomeAtom`) are interned symbols. The compiler assigns each a
   small integer (`#False` = 0 and `#True` = 1 always come first — `false` and
   `true` are aliases for them) and embeds the atom table in the executable,
@@ -141,31 +231,64 @@ $ curl -X POST localhost:8080/greet -d '{"name": 42, "details": {}}'
   whichever parameters the named ones didn't claim. Names must exist, can't
   repeat, and once named arguments are used the call must cover the full
   parameter list.
-* **`hive.http`** is the HTTP standard library. `hive.http.request(req)`
-  performs a request and returns
+* All keywords are case-insensitive; identifiers keep their spelling.
+
+## Built-in functions
+
+These are always in scope — no import needed. Several are overloaded by
+argument type.
+
+| Function                | Signature                    | What it does                                                         |
+| ----------------------- | ---------------------------- | -------------------------------------------------------------------- |
+| `len(vector)`           | `len(T[]): Int`              | Number of elements in a vector.                                      |
+| `len(str)`              | `len(Str): Int`              | Number of **characters** (UTF-8 runes) in a string.                  |
+| `bytes(vector)`         | `bytes(T[]): Int`            | Byte footprint of a vector's contiguous storage (count × elem size). |
+| `bytes(str)`            | `bytes(Str): Int`            | Number of **bytes** in a string's UTF-8 encoding.                    |
+| `append(vector, value)` | `append(T[dyn], T): void`    | Grows a **mutable** dynamic vector in place with one more element.   |
+| `join(vector, sep)`     | `join(Str[], Str): Str`      | Concatenates a `Str` vector into one string, `sep` between elements. |
+| `split(str, sep)`       | `split(Str, Str): Str[]`     | Splits a string on `sep` into a `Str` vector (inverse of `join`).    |
+| `now()`                 | `now(): Int`                 | Current Unix time, in seconds.                                       |
+
+`len` and `bytes` differ only for strings: for `"café"`, `len` is `4` (runes)
+while `bytes` is `5` (the `é` is two bytes). `append` is the one builtin that
+requires its target to be `mut` — it is the in-place way to grow a
+`Str[dyn]`; `+` instead builds a brand-new vector.
+
+## Standard library (`hive.*`)
+
+### `hive.http`
+
+The HTTP library. Both calls are side effects, so they are only available
+inside `proc`s. Requests and responses are built positionally —
+`hive.HttpRequest(method, url, headers, body)`,
+`hive.HttpResponse(status, headers, body)` — and headers are a `Table` of
+`[name, value]` rows.
+
+* `hive.http.request(req)` performs a request and returns
   `Result<hive.HttpResponse, hive.HttpError>` (a `Result.Error` means no
-  response was obtained at all). `hive.http.serve(port, handler)` blocks
-  forever serving every route through `handler`, which must be a
-  `proc (hive.HttpRequest): hive.HttpResponse` passed by name. Both are side
-  effects, so they are only available inside `proc`s. Requests and responses
-  are built positionally — `hive.HttpRequest(method, url, headers, body)`,
-  `hive.HttpResponse(status, headers, body)` — and headers are a `Table` of
-  `[name, value]` rows.
-* **`hive.json`** is the JSON standard library, built on the idea that Hive's
-  type declarations *are* the JSON schema. `hive.json.parse(text) with T`
-  derives a decoder for `T` at compile time and returns
-  `Result<T, hive.JsonError>`: missing fields, wrong types and wrong static
-  vector lengths become errors carrying the exact `path` that failed, while
-  JSON fields the type doesn't declare are simply ignored. Variants decode as
-  `{"VariantName": {...}}` (JSON `null` selects a type's first field-less
-  variant). JSON you don't want to model stays type-safe too: `with Table`
+  response was obtained at all).
+* `hive.http.serve(port, handler)` blocks forever, serving every route through
+  `handler` — which must be a `proc (hive.HttpRequest): hive.HttpResponse`
+  passed by name.
+
+### `hive.json`
+
+The JSON library, built on the idea that Hive's type declarations *are* the
+JSON schema. All of `hive.json` is pure, so it is available inside `func`s.
+
+* `hive.json.parse(text) with T` derives a decoder for `T` at compile time and
+  returns `Result<T, hive.JsonError>`: missing fields, wrong types and wrong
+  static vector lengths become errors carrying the exact `path` that failed,
+  while JSON fields the type doesn't declare are simply ignored. Variants
+  decode as `{"VariantName": {...}}` (JSON `null` selects a type's first
+  field-less variant).
+* `hive.json.encode(value)` derives the encoder from the static type and
+  therefore cannot fail.
+* `hive.json.table(text)` reads a JSON array of flat objects as a headered
+  `Table`, the same shape `using` yields from CSV.
+* JSON you don't want to model stays type-safe too: `parse(text) with Table`
   flattens a whole document into `[path, value]` rows, looked up with
   `hive.json.get(table, "keys.layout")` and re-nested by the encoder.
-  `hive.json.encode(value)` derives the encoder from the static type and
-  therefore cannot fail, and `hive.json.table(text)` reads a JSON array of
-  flat objects as a headered `Table`, the same shape `using` yields from CSV.
-  All of `hive.json` is pure, so it is available inside `func`s.
-* All keywords are case-insensitive; identifiers keep their spelling.
 
 ## How Hive maps onto Go
 
@@ -179,6 +302,10 @@ $ curl -X POST localhost:8080/greet -d '{"name": 42, "details": {}}'
 | fields declared outside any variant     | appended to **every** variant struct                           |
 | `name := expr`                          | `name := expr` (type inferred)                                 |
 | `T name = expr`                         | `var name T = expr`                                            |
+| `mut name := expr` / `mut T name = e`   | same as above (`mut` is compile-time only — permits reassign)  |
+| `x = expr` / `v[0] = expr`              | `x = expr` / `v[0] = expr` (only on `mut` variables)           |
+| `async func f(): T { ... }`             | `func f() T { ... }` (an ordinary Go function)                 |
+| `f(x)` bare / `await f(x)` (async `f`)  | `go f(x)` (fire-and-forget goroutine) / `f(x)` (blocking call) |
 | `echo v`                                | `fmt.Println(v)` (stringifies any value, appends a newline)    |
 | `assert cond`                           | `hive.Assert(cond)`                                            |
 | `T.Variant(a, b)`                       | `T(TVariant{Field0: a, Field1: b})` (positional: own then common) |
@@ -190,7 +317,10 @@ $ curl -X POST localhost:8080/greet -d '{"name": 42, "details": {}}'
 | `[x, y] + [z]`                          | `hive.Concat([]T{x, y}, []T{z})`                               |
 | `#Atom`, `true`, `false`                | `hive.Atom` constants + a generated `hive.InitAtoms` table     |
 | `a / b`, `a ** b`                       | `hive.DivInt`/`hive.DivFloat`, `hive.PowInt`/`hive.PowFloat`   |
-| `len(t)` / `now()`                      | `len(t)` / `hive.Now()` (current Unix time)                    |
+| `len(v)` vector / `len(s)` Str          | `len(v)` (elements) / `hive.StrLen(s)` (UTF-8 runes)           |
+| `bytes(v)` vector / `bytes(s)` Str      | `hive.Bytes(v)` (footprint) / `len(s)` (UTF-8 byte length)     |
+| `append(v, x)` / `join(v, sep)`         | `v = append(v, x)` (statement) / `hive.Join(v, sep)`           |
+| `split(s, sep)` / `now()`               | `hive.Split(s, sep)` → `Str[dyn]` / `hive.Now()` (Unix time)   |
 | `hive.json.parse(t) with T`             | `hive.JsonParse(t, jsonDecode_T)` → `Result[T, JsonError]`     |
 | `hive.json.encode(v)`                   | derived `jsonEncode_T(v)` (cannot fail, so plain `string`)     |
 | `hive.json.table(t)` / `.get(tbl, p)`   | `hive.JsonTable(t)` / `hive.JsonGet(tbl, p)`                   |
@@ -233,4 +363,5 @@ Per the project brief, the compiler currently targets exactly the constructs
 that appear in `code-examples/`. The lexer, parser, and code generator are
 written to be extended, but there is no full type checker, no
 flow-sensitive length checking (e.g. proving `table[1:]` safe), and no
-standard library beyond the builtins listed above yet.
+standard library beyond the `hive.*` modules and builtins documented above
+yet.

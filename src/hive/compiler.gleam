@@ -64,7 +64,7 @@ fn check(module: ast.Module) -> Result(Nil, String) {
     list.fold(module.decls, dict.new(), fn(acc, d) {
       case d {
         ast.ProcDecl(name, params, _, _)
-        | ast.FuncDecl(name, params, _, _)
+        | ast.FuncDecl(name, params, _, _, _)
         | ast.QueryDecl(name, params, _, _) ->
           dict.insert(acc, name, list.map(params, fn(p) { p.name }))
         ast.TypeDecl(..) -> acc
@@ -80,9 +80,9 @@ fn check(module: ast.Module) -> Result(Nil, String) {
   list.try_fold(module.decls, Nil, fn(_, d) {
     case d {
       ast.ProcDecl(name, _, _, body) ->
-        check_stmts(Ctx(InProc, name, procs, callables, types), body)
-      ast.FuncDecl(name, _, _, body) ->
-        check_stmts(Ctx(InFunc, name, procs, callables, types), body)
+        check_body(Ctx(InProc, name, procs, callables, types), body)
+      ast.FuncDecl(name, _, _, body, _) ->
+        check_body(Ctx(InFunc, name, procs, callables, types), body)
       ast.QueryDecl(name, _, _, sql) ->
         // A query is pure by construction; its interpolations still get
         // walked (they could call procs).
@@ -114,36 +114,143 @@ fn impure(ctx: Ctx, what: String) -> Result(Nil, String) {
   }
 }
 
-fn check_stmts(ctx: Ctx, stmts: List(ast.Stmt)) -> Result(Nil, String) {
-  list.try_fold(stmts, Nil, fn(_, s) { check_stmt(ctx, s) })
+fn check_body(ctx: Ctx, stmts: List(ast.Stmt)) -> Result(Nil, String) {
+  check_stmts(ctx, stmts, dict.new())
   |> result.map(fn(_) { Nil })
 }
 
-fn check_stmt(ctx: Ctx, s: ast.Stmt) -> Result(Nil, String) {
+// Walks a statement list threading the mutability of each declared local
+// (name -> declared with `mut`?), so assignments and `append`s targeting an
+// immutable variable can be rejected. Returns the updated set so declarations
+// stay visible to the statements that follow them.
+fn check_stmts(
+  ctx: Ctx,
+  stmts: List(ast.Stmt),
+  muts: Dict(String, Bool),
+) -> Result(Dict(String, Bool), String) {
+  case stmts {
+    [] -> Ok(muts)
+    [s, ..rest] -> {
+      use muts2 <- result.try(check_stmt(ctx, s, muts))
+      check_stmts(ctx, rest, muts2)
+    }
+  }
+}
+
+fn check_stmt(
+  ctx: Ctx,
+  s: ast.Stmt,
+  muts: Dict(String, Bool),
+) -> Result(Dict(String, Bool), String) {
   case s {
     ast.SEcho(e) -> {
       use _ <- result.try(impure(ctx, "`echo`"))
-      check_expr(ctx, e)
+      use _ <- result.try(check_expr(ctx, e))
+      Ok(muts)
     }
-    ast.SVarDecl(_, value) -> check_expr(ctx, value)
-    ast.STypedDecl(_, _, value) -> check_expr(ctx, value)
-    ast.SReturn(None) -> Ok(Nil)
-    ast.SReturn(Some(e)) -> check_expr(ctx, e)
-    ast.SAssert(e) -> check_expr(ctx, e)
-    ast.SExpr(e) -> check_expr(ctx, e)
+    ast.SVarDecl(name, value, mutable) -> {
+      use _ <- result.try(check_expr(ctx, value))
+      Ok(dict.insert(muts, name, mutable))
+    }
+    ast.STypedDecl(_, name, value, mutable) -> {
+      use _ <- result.try(check_expr(ctx, value))
+      Ok(dict.insert(muts, name, mutable))
+    }
+    ast.SAssign(target, value) -> {
+      use _ <- result.try(check_assign_target(target, muts))
+      use _ <- result.try(check_expr(ctx, target))
+      use _ <- result.try(check_expr(ctx, value))
+      Ok(muts)
+    }
+    ast.SReturn(None) -> Ok(muts)
+    ast.SReturn(Some(e)) -> {
+      use _ <- result.try(check_expr(ctx, e))
+      Ok(muts)
+    }
+    ast.SAssert(e) -> {
+      use _ <- result.try(check_expr(ctx, e))
+      Ok(muts)
+    }
+    ast.SExpr(e) -> {
+      use _ <- result.try(check_append(e, muts))
+      use _ <- result.try(check_expr(ctx, e))
+      Ok(muts)
+    }
     ast.SIf(branches, else_body) -> {
       use _ <- result.try(
         list.try_fold(branches, Nil, fn(_, b) {
           use _ <- result.try(check_expr(ctx, b.cond))
-          check_stmts(ctx, b.body)
+          use _ <- result.try(check_stmts(ctx, b.body, muts))
+          Ok(Nil)
         })
         |> result.map(fn(_) { Nil }),
       )
-      case else_body {
-        Some(body) -> check_stmts(ctx, body)
+      use _ <- result.try(case else_body {
+        Some(body) -> {
+          use _ <- result.try(check_stmts(ctx, body, muts))
+          Ok(Nil)
+        }
         None -> Ok(Nil)
-      }
+      })
+      Ok(muts)
     }
+  }
+}
+
+// The root variable an lvalue ultimately assigns into: `v`, `v[i]`, `v.field`
+// and `v[a:b]` all root at `v`.
+fn assign_root(target: ast.Expr) -> Result(String, String) {
+  case target {
+    ast.EIdent(n) -> Ok(n)
+    ast.EIndex(t, _) -> assign_root(t)
+    ast.EMember(t, _) -> assign_root(t)
+    ast.ESlice(t, _, _) -> assign_root(t)
+    _ -> Error("the left-hand side of `=` is not something you can assign to")
+  }
+}
+
+fn check_assign_target(
+  target: ast.Expr,
+  muts: Dict(String, Bool),
+) -> Result(Nil, String) {
+  use root <- result.try(assign_root(target))
+  case dict.get(muts, root) {
+    Ok(True) -> Ok(Nil)
+    _ ->
+      Error(
+        "cannot assign to `"
+        <> root
+        <> "`: it is immutable — declare it with `mut` to allow reassignment",
+      )
+  }
+}
+
+// `append(v, ...)` grows a vector in place, so `v` must be a mutable variable
+// (per the spec: append "only compiles when used on mutable dynamic vectors").
+fn check_append(e: ast.Expr, muts: Dict(String, Bool)) -> Result(Nil, String) {
+  case e {
+    ast.ECall(ast.EIdent("append"), args) ->
+      case args {
+        [ast.Arg(_, target), ..] -> {
+          use root <- result.try(
+            assign_root(target)
+            |> result.replace_error(
+              "`append`'s first argument must be a mutable vector variable",
+            ),
+          )
+          case dict.get(muts, root) {
+            Ok(True) -> Ok(Nil)
+            _ ->
+              Error(
+                "`append` requires a mutable vector: `"
+                <> root
+                <> "` is immutable — declare it with `mut`",
+              )
+          }
+        }
+        [] -> Error("`append` takes a mutable vector and at least one value")
+      }
+    _ -> Ok(Nil)
   }
 }
 
@@ -275,6 +382,7 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
       check_exprs(ctx, [target, ..option.values([low, high])])
     ast.EBinary(_, l, r) -> check_exprs(ctx, [l, r])
     ast.EIs(subject, _) -> check_expr(ctx, subject)
+    ast.EAwait(value) -> check_expr(ctx, value)
   }
 }
 

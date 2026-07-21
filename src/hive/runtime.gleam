@@ -27,9 +27,11 @@ import (
 	\"math\"
 	\"net/http\"
 	\"os\"
+	\"reflect\"
 	\"strconv\"
 	\"strings\"
 	\"time\"
+	\"unicode/utf8\"
 )
 
 // Table is a grid of string cells (a CSV, headerful or headerless).
@@ -122,6 +124,33 @@ func Concat[T any](a, b []T) []T {
 	out := make([]T, 0, len(a)+len(b))
 	out = append(out, a...)
 	return append(out, b...)
+}
+
+// Join concatenates the elements of a string vector into a single string,
+// placing sep between adjacent elements (backs the `join` builtin).
+func Join(parts []string, sep string) string {
+	return strings.Join(parts, sep)
+}
+
+// Split divides s into all substrings separated by sep, returning them as a
+// vector (backs the `split` builtin). An empty separator splits into
+// individual UTF-8 characters.
+func Split(s string, sep string) []string {
+	return strings.Split(s, sep)
+}
+
+// StrLen is the length of a string in characters (UTF-8 runes), which is what
+// `len` reports for a Str — vectors instead use Go's builtin len.
+func StrLen(s string) int {
+	return utf8.RuneCountInString(s)
+}
+
+// Bytes is the size, in bytes, of a vector's contiguous backing storage: its
+// element count times the size of one element (backs `bytes` on a vector).
+// `bytes` on a Str instead reports the UTF-8 byte length of its contents.
+func Bytes[T any](v []T) int {
+	var zero T
+	return len(v) * int(reflect.TypeOf(&zero).Elem().Size())
 }
 
 // DivInt and DivFloat implement Hive division: dividing by 0 returns 0.
