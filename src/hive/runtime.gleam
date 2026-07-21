@@ -153,6 +153,45 @@ func Bytes[T any](v []T) int {
 	return len(v) * int(reflect.TypeOf(&zero).Elem().Size())
 }
 
+// Row returns a copy of the first row of t whose first cell equals key, or an
+// empty vector when no row matches (backs the `row` builtin).
+func Row(t Table, key string) []string {
+	for _, r := range t {
+		if len(r) > 0 && r[0] == key {
+			out := make([]string, len(r))
+			copy(out, r)
+			return out
+		}
+	}
+	return []string{}
+}
+
+// Column returns the cells beneath the column of t whose top (first-row) cell
+// equals key, skipping any row too short to reach that column. Returns an
+// empty vector when no column matches (backs the `column` builtin).
+func Column(t Table, key string) []string {
+	out := []string{}
+	if len(t) == 0 {
+		return out
+	}
+	col := -1
+	for i, cell := range t[0] {
+		if cell == key {
+			col = i
+			break
+		}
+	}
+	if col < 0 {
+		return out
+	}
+	for _, r := range t {
+		if col < len(r) {
+			out = append(out, r[col])
+		}
+	}
+	return out
+}
+
 // DivInt and DivFloat implement Hive division: dividing by 0 returns 0.
 func DivInt(a, b int) int {
 	if b == 0 {

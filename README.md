@@ -197,12 +197,17 @@ argument type.
 | `append(vector, value)` | `append(T[dyn], T): void`    | Grows a **mutable** dynamic vector in place with one more element.   |
 | `join(vector, sep)`     | `join(Str[], Str): Str`      | Concatenates a `Str` vector into one string, `sep` between elements. |
 | `split(str, sep)`       | `split(Str, Str): Str[]`     | Splits a string on `sep` into a `Str` vector (inverse of `join`).    |
+| `row(table, key)`       | `row(Table, Str): Str[dyn]`  | The row whose first cell equals `key`, else `[]`.                    |
+| `column(table, key)`    | `column(Table, Str): Str[dyn]`| The column whose top (first-row) cell equals `key`, else `[]`.      |
 | `now()`                 | `now(): Int`                 | Current Unix time, in seconds.                                       |
 
 `len` and `bytes` differ only for strings: for `"café"`, `len` is `4` (runes)
 while `bytes` is `5` (the `é` is two bytes). `append` is the one builtin that
 requires its target to be `mut` — it is the in-place way to grow a
-`Str[dyn]`; `+` instead builds a brand-new vector.
+`Str[dyn]`; `+` instead builds a brand-new vector. `row` and `column` look a
+value up in a `Table` by its first cell — `row` matches a row's first element,
+`column` matches a column's top (first-row) cell — and `column` skips any row
+too short to reach the matched column.
 
 ## Standard library (`hive.*`)
 
@@ -272,6 +277,7 @@ JSON schema, and works inside both `func`s and `proc`s.
 | `bytes(v)` vector / `bytes(s)` Str      | `hive.Bytes(v)` (footprint) / `len(s)` (UTF-8 byte length)     |
 | `append(v, x)` / `join(v, sep)`         | `v = append(v, x)` (statement) / `hive.Join(v, sep)`           |
 | `split(s, sep)` / `now()`               | `hive.Split(s, sep)` → `Str[dyn]` / `hive.Now()` (Unix time)   |
+| `row(t, k)` / `column(t, k)`            | `hive.Row(t, k)` / `hive.Column(t, k)` → `Str[dyn]`           |
 | `hive.json.parse(t) with T`             | `hive.JsonParse(t, jsonDecode_T)` → `Result[T, JsonError]`     |
 | `hive.json.encode(v)`                   | derived `jsonEncode_T(v)` (cannot fail, so plain `string`)     |
 | `hive.json.table(t)` / `.get(tbl, p)`   | `hive.JsonTable(t)` / `hive.JsonGet(tbl, p)`                   |

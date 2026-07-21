@@ -1295,6 +1295,8 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
         ast.EIdent("now") -> TyInt
         ast.EIdent("join") -> TyStr
         ast.EIdent("split") -> TyVec(TyStr)
+        ast.EIdent("row") -> TyVec(TyStr)
+        ast.EIdent("column") -> TyVec(TyStr)
         // `append` yields a vector of the same type as its first argument.
         ast.EIdent("append") ->
           case args {
@@ -1789,6 +1791,10 @@ fn gen_ident_call(env: Env, name: String, args: List(ast.Arg)) -> String {
     "join" -> "hive.Join(" <> gen_args(env, args) <> ")"
     // `split(str, sep)` divides a Str into a Str vector.
     "split" -> "hive.Split(" <> gen_args(env, args) <> ")"
+    // `row(table, key)` / `column(table, key)` look a row/column up by its
+    // first cell.
+    "row" -> "hive.Row(" <> gen_args(env, args) <> ")"
+    "column" -> "hive.Column(" <> gen_args(env, args) <> ")"
     // `append(v, x...)` grows a vector (see gen_append); as a statement the
     // caller reassigns the result back to `v`.
     "append" -> gen_append(env, args)

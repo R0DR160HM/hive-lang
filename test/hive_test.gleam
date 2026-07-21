@@ -369,6 +369,22 @@ pub fn split_lowers_to_runtime_test() {
   should.be_true(string.contains(go, "hive.Split(\"a,b\", \",\")"))
 }
 
+pub fn row_lowers_to_runtime_test() {
+  let go =
+    compile(
+      "func f(t: Table): Str[dyn] {\n\treturn row(t, \"I\")\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "hive.Row(t, \"I\")"))
+}
+
+pub fn column_lowers_to_runtime_test() {
+  let go =
+    compile(
+      "func f(t: Table): Str[dyn] {\n\treturn column(t, \"B\")\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "hive.Column(t, \"B\")"))
+}
+
 pub fn append_reassigns_mutable_vector_test() {
   let go =
     compile(
