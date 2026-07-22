@@ -36,6 +36,7 @@ import (
 	\"reflect\"
 	\"strconv\"
 	\"strings\"
+	\"sync\"
 	\"time\"
 	\"unicode/utf8\"
 )
@@ -354,6 +355,72 @@ func StrToFloat(s string) Result[float64, ConversionError] {
 		return Err[float64, ConversionError](ConversionError{Input: s, Message: \"not a valid number\"})
 	}
 	return Ok[float64, ConversionError](f)
+}
+
+// EnvironmentError describes a variable that could not be resolved from a
+// .env file or the OS environment.
+type EnvironmentError struct {
+	Key     string
+	Message string
+}
+
+func (e EnvironmentError) Error() string {
+	return \"hive: environment variable \" + e.Key + \": \" + e.Message
+}
+
+var envOnce sync.Once
+var envVars map[string]string
+
+// loadDotEnv reads the .env file in the working directory, or the parent
+// directory if that one is absent, into envVars. It runs once, lazily, on the
+// first EnvGet — after any startup chdir, so the working directory is the
+// entrypoint's folder. A missing or unreadable file just leaves envVars empty.
+func loadDotEnv() {
+	envVars = map[string]string{}
+	path := \"\"
+	if _, err := os.Stat(\".env\"); err == nil {
+		path = \".env\"
+	} else if _, err := os.Stat(\"../.env\"); err == nil {
+		path = \"../.env\"
+	}
+	if path == \"\" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	// Split on \\n; TrimSpace then also drops any trailing \\r on Windows files.
+	for _, line := range strings.Split(string(data), \"\\n\") {
+		line = strings.TrimSpace(line)
+		if line == \"\" || strings.HasPrefix(line, \"#\") {
+			continue
+		}
+		line = strings.TrimPrefix(line, \"export \")
+		eq := strings.Index(line, \"=\")
+		if eq < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:eq])
+		val := strings.Trim(strings.TrimSpace(line[eq+1:]), \"\\\"'\")
+		if key != \"\" {
+			envVars[key] = val
+		}
+	}
+}
+
+// EnvGet resolves a variable from the .env file first, then the OS
+// environment; a variable set in neither yields an EnvironmentError. Backs
+// hive.env.get.
+func EnvGet(key string) Result[string, EnvironmentError] {
+	envOnce.Do(loadDotEnv)
+	if v, ok := envVars[key]; ok {
+		return Ok[string, EnvironmentError](v)
+	}
+	if v, ok := os.LookupEnv(key); ok {
+		return Ok[string, EnvironmentError](v)
+	}
+	return Err[string, EnvironmentError](EnvironmentError{Key: key, Message: \"not set\"})
 }
 
 // JsonError describes why a JSON document didn't match the expected type:

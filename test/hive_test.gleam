@@ -1356,6 +1356,32 @@ pub fn continue_outside_loop_is_rejected_test() {
   |> should.be_error
 }
 
+// ---------------------------------------------------------------------------
+// hive.env
+// ---------------------------------------------------------------------------
+
+pub fn env_get_lowers_to_runtime_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tr := hive.env.get(\"HOME\")\n\tif r is Result.Ok(v) {\n\t\techo v\n\t} else if r is Result.Error(e) {\n\t\techo e.key\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.EnvGet(\"HOME\")"))
+  // `hive.env.get` yields a Result, so the `is Result.Ok/Error` narrowing works
+  // and the error's fields lower to their exported Go names.
+  should.be_true(string.contains(go, "r.IsOk()"))
+  should.be_true(string.contains(go, ".Key"))
+}
+
+pub fn env_get_requires_one_argument_test() {
+  compiler.compile("proc main(): void {\n\thive.env.get()\n}\n")
+  |> should.be_error
+}
+
+pub fn unknown_env_builtin_is_rejected_test() {
+  compiler.compile("proc main(): void {\n\thive.env.set(\"K\", \"V\")\n}\n")
+  |> should.be_error
+}
+
 fn count_occurrences(haystack: String, needle: String) -> Int {
   string.split(haystack, needle) |> length_minus_one
 }

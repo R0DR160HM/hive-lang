@@ -405,11 +405,15 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
               use _ <- result.try(check_conv_call(fname, args))
               check_args(ctx, args)
             }
+            "env" -> {
+              use _ <- result.try(check_env_call(fname, args))
+              check_args(ctx, args)
+            }
             _ ->
               Error(
                 "unknown builtin namespace `hive."
                 <> ns
-                <> "` (available: http, json, crypto, sql, conv)",
+                <> "` (available: http, json, crypto, sql, conv, env)",
               )
           }
       }
@@ -747,6 +751,20 @@ fn check_conv_call(fname: String, args: List(ast.Arg)) -> Result(Nil, String) {
         "unknown builtin `hive.conv."
         <> fname
         <> "` (available: ceil, floor, round, itf, its, fts, sti, stf)",
+      )
+  }
+}
+
+// ---------------------------------------------------------------------------
+// hive.env builtins
+// ---------------------------------------------------------------------------
+
+fn check_env_call(fname: String, args: List(ast.Arg)) -> Result(Nil, String) {
+  case fname {
+    "get" -> check_arity("`hive.env.get`", args, ["key"])
+    _ ->
+      Error(
+        "unknown builtin `hive.env." <> fname <> "` (available: get)",
       )
   }
 }

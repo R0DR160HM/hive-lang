@@ -239,7 +239,7 @@ too short to reach the matched column.
 
 Each module owns its types under its own namespace — `hive.http.HttpRequest`,
 `hive.json.JsonError`, `hive.crypto.CryptoError`, `hive.sql.DatabaseDriver`,
-`hive.conv.ConversionError`, and so on. The only builtin types that live directly on `hive` are the core
+`hive.conv.ConversionError`, `hive.env.EnvironmentError`, and so on. The only builtin types that live directly on `hive` are the core
 ones the language uses without a module: `Result`, `Table` and the
 `hive.TableError` that `using` yields from a CSV.
 
@@ -348,6 +348,23 @@ Number and string conversions. Everything here is pure, so it works inside both
   `Result<Float, hive.conv.ConversionError>`. A `ConversionError` carries the
   offending `input` and a short `message`.
 
+### `hive.env`
+
+Reads environment variables, from a `.env` file or the OS.
+
+* `hive.env.get(name)` returns `Result<Str, hive.env.EnvironmentError>`. It
+  resolves `name` in this order: the `.env` file in the program's own folder;
+  failing that, the `.env` file in the parent folder; and failing that, the OS
+  environment. A variable found in none of them yields an `EnvironmentError`
+  carrying the `key` it looked for and a short `message`.
+* The `.env` file is read **once**, when the first `get` runs. It is a plain
+  list of `NAME=value` lines: blank lines and `#` comments are ignored, an
+  optional `export ` prefix is allowed, and a value may be wrapped in single or
+  double quotes (which are stripped).
+* "The program's folder" is its working directory — which `hive run` sets to
+  the entrypoint's folder, and a built executable inherits from wherever it is
+  launched (the same rule `using "./file.csv"` follows).
+
 ## How Hive maps onto Go
 
 | Hive                                    | Go                                                             |
@@ -403,6 +420,7 @@ Number and string conversions. Everything here is pure, so it works inside both
 | `hive.conv.ceil/floor/round(f)`         | `hive.Ceil/Floor/Round(f)` → `Int`                            |
 | `hive.conv.itf(i)` / `its(i)` / `fts(f)` | `hive.IntToFloat(i)` / `hive.IntToStr(i)` / `hive.FloatToStr(f)` |
 | `hive.conv.sti(s)` / `stf(s)`           | `hive.StrToInt(s)` / `hive.StrToFloat(s)` → `Result[_, ConversionError]` |
+| `hive.env.get(name)`                    | `hive.EnvGet(name)` → `Result[Str, EnvironmentError]` (.env, then OS)   |
 | `hive.http.HttpRequest(m, u, h, b)`     | `hive.HttpRequest{Method: m, Url: u, Headers: h, Body: b}`     |
 | `request.body` (builtin struct field)   | `request.Body` (fields capitalize to their exported Go names)  |
 | `t[1:]`                                 | `t[1:]` (slices are **inclusive** of the high bound)           |

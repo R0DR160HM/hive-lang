@@ -62,6 +62,7 @@ pub fn builtin_fields(name: String) -> Option(List(#(String, Ty))) {
       Some([#("path", TyStr), #("expected", TyStr), #("found", TyStr)])
     "CryptoError" -> Some([#("reason", TyStr), #("message", TyStr)])
     "ConversionError" -> Some([#("input", TyStr), #("message", TyStr)])
+    "EnvironmentError" -> Some([#("key", TyStr), #("message", TyStr)])
     "JwtHeader" ->
       Some([#("alg", TyStr), #("typ", TyStr), #("kid", TyStr)])
     "SqlError" -> Some([#("message", TyStr)])
@@ -79,6 +80,7 @@ pub fn builtin_qualifier(name: String) -> String {
     "JsonError" -> "hive.json"
     "CryptoError" | "JwtHeader" -> "hive.crypto"
     "ConversionError" -> "hive.conv"
+    "EnvironmentError" -> "hive.env"
     "SqlError" | "SqlConnection" | "DatabaseDriver" -> "hive.sql"
     _ -> "hive"
   }
@@ -1584,6 +1586,11 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
                     "stf" -> TyResult(TyFloat, TyBuiltin("ConversionError"))
                     _ -> TyUnknown
                   }
+                "env" ->
+                  case fname {
+                    "get" -> TyResult(TyStr, TyBuiltin("EnvironmentError"))
+                    _ -> TyUnknown
+                  }
                 _ -> TyUnknown
               }
           }
@@ -1994,6 +2001,7 @@ fn gen_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
             "crypto" -> gen_crypto_call(env, fname, args)
             "sql" -> gen_sql_call(env, fname, args)
             "conv" -> gen_conv_call(env, fname, args)
+            "env" -> gen_env_call(env, fname, args)
             _ -> gen_plain_call(env, callee, args)
           }
       }
@@ -2185,6 +2193,13 @@ fn gen_conv_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
       "hive.StrToInt(" <> gen_one_coerced(env, args, "value", TyStr) <> ")"
     "stf" ->
       "hive.StrToFloat(" <> gen_one_coerced(env, args, "value", TyStr) <> ")"
+    _ -> "hive." <> exported(fname) <> "(" <> gen_args(env, args) <> ")"
+  }
+}
+
+fn gen_env_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
+  case fname {
+    "get" -> "hive.EnvGet(" <> gen_one_coerced(env, args, "key", TyStr) <> ")"
     _ -> "hive." <> exported(fname) <> "(" <> gen_args(env, args) <> ")"
   }
 }
