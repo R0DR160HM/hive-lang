@@ -51,23 +51,27 @@ ln -s "$(pwd)/hive" ~/.local/bin/hive
 
 `hive build foo.hive` writes the executable next to the entrypoint
 (`foo.exe` on Windows, `foo` elsewhere) and leaves the intermediate Go project
-in `foo.hive-build/` for inspection. `hive run` executes it with the working
-directory set to the entrypoint's folder, so relative paths such as
-`using "./test.csv"` resolve as the author expects.
+in `foo.hive-build/` for inspection. `hive run` instead compiles the generated
+Go with `go run`, so it produces **no** executable in your project — the binary
+lives only in Go's build cache — which avoids Windows Defender/SmartScreen
+scanning a freshly written `.exe`. It still runs with the working directory set
+to the entrypoint's folder, so relative paths such as `using "./test.csv"`
+resolve as the author expects (`hive run` passes that folder through to the
+program, which changes into it before `main`).
 
 ### Troubleshooting on Windows
 
-If `hive run` produces **no output at all** (or crashes with an `Eacces` /
-"Application Control policy has blocked this file" error), Windows is very
-likely blocking the freshly-compiled `.exe` before it can start — the program
-never runs, so none of its `echo`s appear. This is Windows Defender's
-real-time protection or SmartScreen/Application Control scanning a brand-new
-unsigned binary; it is unrelated to the compiled code (`echo` lowers to Go's
-`fmt.Println`, which behaves the same on Windows and Linux). To confirm and
-work around it:
+If a **built** executable (`hive build`, then `.\foo.exe`) produces **no output
+at all** (or crashes with an `Eacces` / "Application Control policy has blocked
+this file" error), Windows is very likely blocking the freshly-compiled `.exe`
+before it can start — the program never runs, so none of its `echo`s appear.
+This is Windows Defender's real-time protection or SmartScreen/Application
+Control scanning a brand-new unsigned binary; it is unrelated to the compiled
+code (`echo` lowers to Go's `fmt.Println`, which behaves the same on Windows
+and Linux). To confirm and work around it:
 
-* Run the produced binary directly (`.\foo.exe`) — if that is blocked too, it
-  is the OS, not the compiler.
+* Prefer `hive run`, which uses `go run` and never writes an `.exe` into your
+  project, so there is no fresh binary for Defender to intercept.
 * Add a Windows Defender **exclusion** for your project folder (Settings →
   Privacy & security → Windows Security → Virus & threat protection →
   Manage settings → Exclusions), or build into an already-excluded directory.

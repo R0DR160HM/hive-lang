@@ -40,6 +40,18 @@ import (
 	\"unicode/utf8\"
 )
 
+// When launched by `hive run`, the program is compiled and executed from
+// inside its .hive-build directory (via `go run`), but the author expects
+// relative paths like `using \"./data.csv\"` to resolve against the entrypoint's
+// own folder. `hive run` passes that folder in HIVE_RUN_CWD; honour it here,
+// before main runs, so those paths still work. A normally-built executable
+// never has this variable set, so this is a no-op for `hive build` output.
+func init() {
+	if dir := os.Getenv(\"HIVE_RUN_CWD\"); dir != \"\" {
+		_ = os.Chdir(dir)
+	}
+}
+
 // Table is a grid of string cells (a CSV, headerful or headerless).
 type Table = [][]string
 
