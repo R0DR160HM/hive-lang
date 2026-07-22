@@ -132,6 +132,28 @@ func Concat[T any](a, b []T) []T {
 	return append(out, b...)
 }
 
+// VecEq reports whether two vectors are equal: the same length, then equal
+// elements in order — short-circuiting on the first mismatch. Nested vectors
+// (a Table) are compared the same way recursively, so an empty vector and a
+// nil one count as equal; other element values are compared deeply. Hive's
+// == / != on vectors lower to this, since Go cannot compare slices directly.
+func VecEq(a, b any) bool {
+	va := reflect.ValueOf(a)
+	vb := reflect.ValueOf(b)
+	if va.Kind() != reflect.Slice || vb.Kind() != reflect.Slice {
+		return reflect.DeepEqual(a, b)
+	}
+	if va.Len() != vb.Len() {
+		return false
+	}
+	for i := 0; i < va.Len(); i++ {
+		if !VecEq(va.Index(i).Interface(), vb.Index(i).Interface()) {
+			return false
+		}
+	}
+	return true
+}
+
 // Join concatenates the elements of a string vector into a single string,
 // placing sep between adjacent elements (backs the `join` builtin).
 func Join(parts []string, sep string) string {
@@ -211,6 +233,23 @@ func DivFloat(a, b float64) float64 {
 		return 0
 	}
 	return a / b
+}
+
+// ModInt and ModFloat implement the % (remainder) operator. Like division, a
+// modulus of 0 returns 0 rather than panicking. Go's built-in % is
+// integer-only, so the float case uses math.Mod.
+func ModInt(a, b int) int {
+	if b == 0 {
+		return 0
+	}
+	return a % b
+}
+
+func ModFloat(a, b float64) float64 {
+	if b == 0 {
+		return 0
+	}
+	return math.Mod(a, b)
 }
 
 // PowInt and PowFloat implement the ** operator.

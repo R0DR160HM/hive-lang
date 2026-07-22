@@ -149,9 +149,11 @@ language's specification: each one compiles, builds and runs.
   backtick multiline strings whose indentation is removed at compile time.
 * **Vectors** are memory-contiguous and static (`Str[3]`) or dynamic
   (`Str[dyn]`, `Str[dyn, 2]` with an initial size). All of them lower to Go
-  slices; `+` concatenates into a new vector. `Table` is an alias for
-  `Str[dyn][dyn]`. (For `append`, `join`, `split`, `len` and `bytes` see
-  [Built-in functions](#built-in-functions).)
+  slices; `+` concatenates into a new vector. `==` and `!=` compare vectors
+  structurally — same length, then element by element (nested vectors and a
+  `Table` compare the same way), short-circuiting on the first difference.
+  `Table` is an alias for `Str[dyn][dyn]`. (For `append`, `join`, `split`,
+  `len` and `bytes` see [Built-in functions](#built-in-functions).)
 * **Mutability** — variables are immutable by default; prefix a declaration
   with `mut` (`mut x := ...`, `mut Str[dyn] v = ...`) to allow reassignment
   (`x = ...`, `v[0] = ...`) and `append`. Conceptually a `mut T` is a
@@ -172,8 +174,11 @@ language's specification: each one compiles, builds and runs.
   `true` and `false`. It is distinct from the `#True`/`#False` atoms above:
   comparisons and `&&`/`||` produce `Bool`, and a `Bool` field or value holds
   `true`/`false`, not an atom.
-* **Numbers** are `Int` or `Float` with `+ - * / **`; dividing by zero
-  returns 0.
+* **Numbers** are `Int` or `Float` with `+ - * / % **` (`%` is the remainder
+  operator, with the same precedence as `*` and `/`); dividing — or taking a
+  remainder — by zero returns 0. A mutable number supports the compound
+  assignments `+= -= *= /=` and the `++` / `--` steps (`x += 2`, `i++`), each
+  shorthand for the matching `x = x <op> ...`.
 * **Custom types** are Gleam-style ADTs: no variants ⇒ a struct, variants ⇒
   a tagged union. Fields declared outside any variant are added to every
   variant. `is` narrows a value to a variant and can bind its fields, and the
@@ -187,7 +192,10 @@ language's specification: each one compiles, builds and runs.
   (`for ; cond; { ... }` is a while loop). The iterating form
   `for each name in values { ... }` walks a vector, binding each element to an
   immutable `name` whose type is inferred from the vector; an optional
-  annotation (`for each name: T in values`) overrides that inference.
+  annotation (`for each name: T in values`) overrides that inference. Inside
+  either loop, `continue` skips to the next iteration and `break` leaves the
+  loop; both act on the innermost enclosing loop, and using them outside a loop
+  is a compile error.
 * **`assert cond`** panics at runtime when the condition is false.
 * **Named arguments** — funcs, procs, queries and type constructors (builtin
   ones included) accept arguments by name: `f(b: 1, "s")`. Named arguments
@@ -364,9 +372,11 @@ Number and string conversions. Everything here is pure, so it works inside both
 | `using conn with q` (SQL connection)    | `hive.SqlQuery(conn, q)` → `Result[Table, SqlError]`           |
 | `"{a} and {b}"`                         | concatenation, non-`Str` pieces via `hive.ToStr`               |
 | `[x, y] + [z]`                          | `hive.Concat([]T{x, y}, []T{z})`                               |
+| `v1 == v2` / `v1 != v2` (vectors)       | `hive.VecEq(v1, v2)` / `!hive.VecEq(v1, v2)` (structural)      |
 | `#Atom`                                 | `hive.Atom` constants + a generated `hive.InitAtoms` table     |
 | `true` / `false`                        | Go `true` / `false` (the `Bool` type, not atoms)               |
 | `a / b`, `a ** b`                       | `hive.DivInt`/`hive.DivFloat`, `hive.PowInt`/`hive.PowFloat`   |
+| `a % b`                                 | `hive.ModInt`/`hive.ModFloat` (remainder; `% 0` returns 0)    |
 | `len(v)` vector / `len(s)` Str          | `len(v)` (elements) / `hive.StrLen(s)` (UTF-8 runes)           |
 | `bytes(v)` vector / `bytes(s)` Str      | `hive.Bytes(v)` (footprint) / `len(s)` (UTF-8 byte length)     |
 | `append(v, x)` / `join(v, sep)`         | `v = append(v, x)` (statement) / `hive.Join(v, sep)`           |
@@ -401,7 +411,11 @@ syntax picks the right lowering (`+` on vectors vs. strings vs. numbers, atom
 → `Str` coercions, zero-safe division, vector literal element types). Hive
 relies on exhaustiveness analysis this proof-of-concept doesn't fully model,
 so any non-`void` function that doesn't syntactically end in a `return` gets
-a trailing `panic("hive: unreachable")` to satisfy the Go compiler.
+a trailing `panic("hive: unreachable")` to satisfy the Go compiler. A Hive
+identifier that happens to be a Go keyword but not a Hive one (a variable or
+function named `map`, `range`, `select`, ...) is suffixed with `_` in the
+generated Go — consistently at its definition and every use — so it never
+collides with Go's own grammar.
 
 ## How the compiler is structured
 
@@ -411,6 +425,7 @@ src/hive/token.gleam      token definitions
 src/hive/lexer.gleam      source text  -> tokens (strings, atoms, SQL bodies)
 src/hive/ast.gleam        the abstract syntax tree
 src/hive/parser.gleam     tokens       -> AST (recursive descent)
+src/hive/bounds.gleam     flow-sensitive vector index/slice bounds checking
 src/hive/codegen.gleam    AST          -> Go source (with local type inference)
 src/hive/runtime.gleam    the fixed Go `hive` runtime + go.mod
 src/hive/compiler.gleam   glue: source -> Go source, purity checks for funcs
@@ -424,7 +439,17 @@ example).
 
 Per the project brief, the compiler currently targets exactly the constructs
 that appear in `code-examples/`. The lexer, parser, and code generator are
-written to be extended, but there is no full type checker, no
-flow-sensitive length checking (e.g. proving `table[1:]` safe), and no
-standard library beyond the `hive.*` modules and builtins documented above
-yet.
+written to be extended, but there is no full type checker and no standard
+library beyond the `hive.*` modules and builtins documented above yet.
+
+One exception is **vector bounds**: a dedicated flow-sensitive pass
+(`src/hive/bounds.gleam`) proves every index and slice in range at compile
+time, so the generated Go can never panic out of bounds. Indexing a static
+vector with a literal is decided outright (`v[2]` on a `Str[3]` compiles,
+`v[3]` does not); any access whose safety isn't known must be guarded so the
+compiler can see it — `if i >= 0 && i < len(v) { v[i] }`, the condition of a
+counting `for` loop, or a `for each`, which never indexes. The `bounds`
+keyword is shorthand for that guard: `if v bounds i { ... }` means exactly
+`if i >= 0 && i < len(v) { ... }`. Anything the pass can't prove safe (a
+computed index, an unusual guard) is a compile error rather than a runtime
+crash.

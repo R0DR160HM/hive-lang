@@ -236,6 +236,43 @@ pub fn float_and_safe_division_test() {
   should.be_true(string.contains(go, "hive.PowInt(n, m)"))
 }
 
+pub fn modulo_operator_lowers_to_runtime_test() {
+  let go =
+    compile(
+      "func f(): Int {\n\tn := 17\n\tm := 5\n\tx := 17.5\n\ty := 5.0\n\t_unused := x % y\n\treturn n % m\n}\nproc main(): void {}\n",
+    )
+  // `%` is zero-safe like `/`: integers use ModInt, floats use ModFloat.
+  should.be_true(string.contains(go, "hive.ModInt(n, m)"))
+  should.be_true(string.contains(go, "hive.ModFloat(x, y)"))
+}
+
+pub fn modulo_has_multiplicative_precedence_test() {
+  // `%` binds tighter than `+`, so `2 + 3 % 2` is `2 + (3 % 2)`.
+  let go =
+    compile("func f(): Int {\n\treturn 2 + 3 % 2\n}\nproc main(): void {}\n")
+  should.be_true(string.contains(go, "(2 + hive.ModInt(3, 2))"))
+}
+
+pub fn vector_equality_lowers_to_runtime_test() {
+  // Go can't compare slices, so `==` / `!=` on vectors go through hive.VecEq.
+  let go =
+    compile(
+      "func f(): Bool {\n\ta := [\"x\", \"y\"]\n\tb := [\"x\", \"y\"]\n\t_ne := a != b\n\treturn a == b\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "hive.VecEq(a, b)"))
+  should.be_true(string.contains(go, "!hive.VecEq(a, b)"))
+}
+
+pub fn scalar_equality_stays_native_test() {
+  // Non-vector `==` keeps Go's native comparison, not VecEq.
+  let go =
+    compile(
+      "func f(): Bool {\n\ta := \"x\"\n\tb := \"y\"\n\treturn a == b\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "(a == b)"))
+  should.be_false(string.contains(go, "VecEq"))
+}
+
 pub fn is_binding_usable_in_same_condition_test() {
   let go =
     compile(
@@ -1017,6 +1054,306 @@ pub fn crypto_example_compiles_test() {
 pub fn sql_example_compiles_test() {
   let assert Ok(src) = simplifile.read("code-examples/5 - SQL/sql.hive")
   let assert Ok(_) = compiler.compile(src)
+}
+
+// ---------------------------------------------------------------------------
+// Vector bounds checking (flow-sensitive out-of-bounds prevention)
+// ---------------------------------------------------------------------------
+
+// --- Static vectors: literal index decided at compile time ---
+
+pub fn static_vector_literal_in_range_compiles_test() {
+  // `v` has length 3, so `v[2]` is provably safe.
+  compiler.compile("proc main(): void {\n\tv := [\"a\", \"b\", \"c\"]\n\techo v[2]\n}\n")
+  |> should.be_ok
+}
+
+pub fn static_vector_literal_out_of_range_is_rejected_test() {
+  // `v` has length 2, so `v[2]` is out of range.
+  compiler.compile("proc main(): void {\n\tv := [\"a\", \"b\"]\n\techo v[2]\n}\n")
+  |> should.be_error
+}
+
+pub fn static_vector_element_assignment_in_range_compiles_test() {
+  // The `mutableVector[0] = ...` shape from the types example.
+  compiler.compile(
+    "proc main(): void {\n\tmut v := [\"a\", \"b\"]\n\tv[0] = \"c\"\n}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn static_vector_element_assignment_out_of_range_is_rejected_test() {
+  compiler.compile(
+    "proc main(): void {\n\tmut v := [\"a\", \"b\"]\n\tv[2] = \"c\"\n}\n",
+  )
+  |> should.be_error
+}
+
+// --- Dynamic vectors: unguarded access is rejected ---
+
+pub fn dynamic_vector_unguarded_literal_is_rejected_test() {
+  // The spec's motivating example: `dynamicVector[3]` must be an error.
+  compiler.compile(
+    "func f(v: Str[dyn]): Str {\n\treturn v[3]\n}\nproc main(): void {}\n",
+  )
+  |> should.be_error
+}
+
+pub fn dynamic_vector_unguarded_variable_is_rejected_test() {
+  compiler.compile(
+    "func f(v: Str[dyn], i: Int): Str {\n\treturn v[i]\n}\nproc main(): void {}\n",
+  )
+  |> should.be_error
+}
+
+// --- Dynamic vectors: the guard shapes from the spec ---
+
+pub fn dynamic_vector_guarded_literal_compiles_test() {
+  // `if 3 < len(v) { v[3] }` — exactly the spec's accepted form.
+  compiler.compile(
+    "func f(v: Str[dyn]): Str {\n\tif 3 < len(v) {\n\t\treturn v[3]\n\t}\n\treturn \"\"\n}\nproc main(): void {}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn dynamic_vector_guarded_variable_compiles_test() {
+  // `if i >= 0 && i < len(v) { v[i] }` — the full guard for a variable index.
+  compiler.compile(
+    "func f(v: Str[dyn], i: Int): Str {\n\tif i >= 0 && i < len(v) {\n\t\treturn v[i]\n\t}\n\treturn \"\"\n}\nproc main(): void {}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn variable_index_without_lower_bound_is_rejected_test() {
+  // Upper bound alone is not enough for a variable index: `i >= 0` is required.
+  compiler.compile(
+    "func f(v: Str[dyn], i: Int): Str {\n\tif i < len(v) {\n\t\treturn v[i]\n\t}\n\treturn \"\"\n}\nproc main(): void {}\n",
+  )
+  |> should.be_error
+}
+
+pub fn guard_on_the_wrong_vector_is_rejected_test() {
+  // The guard proves `i < len(w)`, but the access is on `v`.
+  compiler.compile(
+    "func f(v: Str[dyn], w: Str[dyn], i: Int): Str {\n\tif i >= 0 && i < len(w) {\n\t\treturn v[i]\n\t}\n\treturn \"\"\n}\nproc main(): void {}\n",
+  )
+  |> should.be_error
+}
+
+pub fn length_bound_in_a_variable_compiles_test() {
+  // `n := len(v)` then guarding with `n` must still prove the bound.
+  compiler.compile(
+    "func f(v: Str[dyn], i: Int): Str {\n\tn := len(v)\n\tif i >= 0 && i < n {\n\t\treturn v[i]\n\t}\n\treturn \"\"\n}\nproc main(): void {}\n",
+  )
+  |> should.be_ok
+}
+
+// --- Guard clauses (early return proves the negation afterwards) ---
+
+pub fn guard_clause_early_return_compiles_test() {
+  compiler.compile(
+    "func f(v: Str[dyn], i: Int): Str {\n\tif i >= len(v) {\n\t\treturn \"\"\n\t}\n\tif i < 0 {\n\t\treturn \"\"\n\t}\n\treturn v[i]\n}\nproc main(): void {}\n",
+  )
+  |> should.be_ok
+}
+
+// --- Counting loops ---
+
+pub fn counting_loop_indexes_safely_test() {
+  // `for i := 0; i < len(v); i = i + 1 { v[i] }` — the counter is `>= 0` from
+  // its zero start and `< len(v)` from the loop condition.
+  compiler.compile(
+    "proc main(): void {\n\tv := [\"a\", \"b\", \"c\"]\n\tfor i := 0; i < len(v); i = i + 1 {\n\t\techo v[i]\n\t}\n}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn for_each_needs_no_guard_test() {
+  compiler.compile(
+    "proc main(): void {\n\tv := [\"a\", \"b\"]\n\tfor each x in v {\n\t\techo x\n\t}\n}\n",
+  )
+  |> should.be_ok
+}
+
+// --- Mutation invalidates a previously-proven bound ---
+
+pub fn reassignment_inside_guard_invalidates_bound_test() {
+  // `v` is proven long enough, then reassigned to another vector before the
+  // access — the earlier proof no longer holds.
+  compiler.compile(
+    "proc main(): void {\n\tmut Str[dyn] v = [\"a\"]\n\tmut Str[dyn] w = [\"b\"]\n\ti := 0\n\tif i >= 0 && i < len(v) {\n\t\tv = w\n\t\techo v[i]\n\t}\n}\n",
+  )
+  |> should.be_error
+}
+
+// --- Computed indices are conservatively rejected ---
+
+pub fn computed_index_is_rejected_test() {
+  // `i` is guarded, but `i + 1` is a computed expression the checker won't
+  // reason about — it must be extracted and guarded itself.
+  compiler.compile(
+    "func f(v: Str[dyn], i: Int): Str {\n\tif i >= 0 && i < len(v) {\n\t\treturn v[i + 1]\n\t}\n\treturn \"\"\n}\nproc main(): void {}\n",
+  )
+  |> should.be_error
+}
+
+// --- Slices ---
+
+pub fn slice_guarded_low_bound_compiles_test() {
+  // `v[1:]` under `if len(v) > 1` — the low bound is proven `<= len(v)`.
+  compiler.compile(
+    "func f(v: Str[dyn]): Str[dyn] {\n\tif len(v) > 1 {\n\t\treturn v[1:]\n\t}\n\treturn v\n}\nproc main(): void {}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn slice_unguarded_low_bound_is_rejected_test() {
+  compiler.compile(
+    "func f(v: Str[dyn]): Str[dyn] {\n\treturn v[1:]\n}\nproc main(): void {}\n",
+  )
+  |> should.be_error
+}
+
+pub fn slice_high_bound_out_of_range_is_rejected_test() {
+  // `v` has length 2; the inclusive high bound 5 is out of range.
+  compiler.compile(
+    "proc main(): void {\n\tv := [\"a\", \"b\"]\n\techo v[0:5]\n}\n",
+  )
+  |> should.be_error
+}
+
+// --- Monotonic literal bounds: one check covers all smaller literal indices ---
+
+pub fn proving_one_literal_bound_covers_smaller_indices_test() {
+  // `if 1 < len(v)` proves `v[1]` AND `v[0]` — no separate `0 < len(v)` needed.
+  compiler.compile(
+    "func f(v: Str[dyn]): Str {\n\tif 1 < len(v) {\n\t\techo v[0]\n\t\treturn v[1]\n\t}\n\treturn \"\"\n}\nproc main(): void {}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn literal_bound_does_not_cover_larger_indices_test() {
+  // `if 1 < len(v)` says nothing about index 2 — still rejected.
+  compiler.compile(
+    "func f(v: Str[dyn]): Str {\n\tif 1 < len(v) {\n\t\treturn v[2]\n\t}\n\treturn \"\"\n}\nproc main(): void {}\n",
+  )
+  |> should.be_error
+}
+
+pub fn variable_guard_proves_index_zero_test() {
+  // `if i >= 0 && i < len(v)` forces `len(v) >= 1`, so the literal index 0 is
+  // safe even though only `i` was named in the guard.
+  compiler.compile(
+    "func f(v: Str[dyn], i: Int): Str {\n\tif i >= 0 && i < len(v) {\n\t\techo v[0]\n\t\treturn v[i]\n\t}\n\treturn \"\"\n}\nproc main(): void {}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn variable_guard_does_not_prove_index_one_test() {
+  // `len(v) >= 1` (from `i >= 0 && i < len(v)`) does not prove `1 < len(v)`.
+  compiler.compile(
+    "func f(v: Str[dyn], i: Int): Str {\n\tif i >= 0 && i < len(v) {\n\t\treturn v[1]\n\t}\n\treturn \"\"\n}\nproc main(): void {}\n",
+  )
+  |> should.be_error
+}
+
+// ---------------------------------------------------------------------------
+// `bounds` keyword
+// ---------------------------------------------------------------------------
+
+pub fn bounds_keyword_desugars_to_guard_test() {
+  // `v bounds i` expands to `i >= 0 && i < len(v)` — which also satisfies the
+  // index-safety checker, so the guarded access compiles.
+  let go =
+    compile(
+      "func f(v: Str[dyn], i: Int): Str {\n\tif v bounds i {\n\t\treturn v[i]\n\t}\n\treturn \"\"\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "(i >= 0)"))
+  should.be_true(string.contains(go, "(i < len(v))"))
+}
+
+pub fn bounds_keyword_does_not_bypass_safety_test() {
+  // Using `bounds` on one vector does not license indexing another.
+  compiler.compile(
+    "func f(v: Str[dyn], w: Str[dyn], i: Int): Str {\n\tif w bounds i {\n\t\treturn v[i]\n\t}\n\treturn \"\"\n}\nproc main(): void {}\n",
+  )
+  |> should.be_error
+}
+
+// ---------------------------------------------------------------------------
+// Go-keyword escaping
+// ---------------------------------------------------------------------------
+
+pub fn go_keyword_identifiers_are_escaped_test() {
+  // `select` and `map` are Go keywords, not Hive keywords: escape them so the
+  // generated Go still compiles, consistently at definition and use.
+  let go =
+    compile(
+      "func select(map: Int): Int {\n\treturn map\n}\nproc main(): void {\n\techo select(1)\n}\n",
+    )
+  should.be_true(string.contains(go, "func select_(map_ int)"))
+  should.be_true(string.contains(go, "return map_"))
+  should.be_true(string.contains(go, "select_(1)"))
+}
+
+pub fn non_keyword_identifiers_are_left_alone_test() {
+  let go =
+    compile("proc main(): void {\n\tfoo := 1\n\techo foo\n}\n")
+  should.be_true(string.contains(go, "foo := 1"))
+  should.be_false(string.contains(go, "foo_"))
+}
+
+// ---------------------------------------------------------------------------
+// Compound assignment and increment / decrement
+// ---------------------------------------------------------------------------
+
+pub fn compound_assignment_operators_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tmut x := 10\n\tx += 3\n\tx -= 1\n\tx *= 2\n\tx /= 4\n\techo x\n}\n",
+    )
+  should.be_true(string.contains(go, "x = (x + 3)"))
+  should.be_true(string.contains(go, "x = (x - 1)"))
+  should.be_true(string.contains(go, "x = (x * 2)"))
+  // `/=` keeps division's zero-safety.
+  should.be_true(string.contains(go, "x = hive.DivInt(x, 4)"))
+}
+
+pub fn increment_and_decrement_operators_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tmut x := 0\n\tx++\n\tx--\n\techo x\n}\n",
+    )
+  should.be_true(string.contains(go, "x = (x + 1)"))
+  should.be_true(string.contains(go, "x = (x - 1)"))
+}
+
+pub fn compound_assignment_to_immutable_is_rejected_test() {
+  compiler.compile("proc main(): void {\n\tx := 1\n\tx += 1\n}\n")
+  |> should.be_error
+}
+
+// ---------------------------------------------------------------------------
+// break / continue
+// ---------------------------------------------------------------------------
+
+pub fn break_and_continue_lower_to_go_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tfor i := 0; i < 5; i++ {\n\t\tif i == 1 {\n\t\t\tcontinue\n\t\t}\n\t\tif i == 3 {\n\t\t\tbreak\n\t\t}\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "continue"))
+  should.be_true(string.contains(go, "break"))
+}
+
+pub fn break_outside_loop_is_rejected_test() {
+  compiler.compile("proc main(): void {\n\tbreak\n}\n")
+  |> should.be_error
+}
+
+pub fn continue_outside_loop_is_rejected_test() {
+  compiler.compile("proc main(): void {\n\tcontinue\n}\n")
+  |> should.be_error
 }
 
 fn count_occurrences(haystack: String, needle: String) -> Int {

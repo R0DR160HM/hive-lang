@@ -82,6 +82,12 @@ fn do_lex(
     ["*", "*", ..rest] -> emit(rest, line, mode, acc, token.StarStar)
     ["&", "&", ..rest] -> emit(rest, line, mode, acc, token.AmpAmp)
     ["|", "|", ..rest] -> emit(rest, line, mode, acc, token.PipePipe)
+    ["+", "+", ..rest] -> emit(rest, line, mode, acc, token.PlusPlus)
+    ["-", "-", ..rest] -> emit(rest, line, mode, acc, token.MinusMinus)
+    ["+", "=", ..rest] -> emit(rest, line, mode, acc, token.PlusEq)
+    ["-", "=", ..rest] -> emit(rest, line, mode, acc, token.MinusEq)
+    ["*", "=", ..rest] -> emit(rest, line, mode, acc, token.StarEq)
+    ["/", "=", ..rest] -> emit(rest, line, mode, acc, token.SlashEq)
 
     // Single-character punctuation and operators
     ["}", ..rest] -> emit(rest, line, mode, acc, token.RBrace)
@@ -100,6 +106,7 @@ fn do_lex(
     ["-", ..rest] -> emit(rest, line, mode, acc, token.Minus)
     ["*", ..rest] -> emit(rest, line, mode, acc, token.Star)
     ["/", ..rest] -> emit(rest, line, mode, acc, token.Slash)
+    ["%", ..rest] -> emit(rest, line, mode, acc, token.Percent)
 
     // Numbers and identifiers/keywords
     [c, ..] ->
@@ -376,6 +383,9 @@ fn keyword_or_ident(word: String) -> token.Kind {
     "for" -> token.KwFor
     "in" -> token.KwIn
     "each" -> token.KwEach
+    "bounds" -> token.KwBounds
+    "break" -> token.KwBreak
+    "continue" -> token.KwContinue
     _ -> token.Ident(word)
   }
 }

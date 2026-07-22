@@ -229,6 +229,7 @@ fn uses_json_stmts(stmts: List(ast.Stmt)) -> Bool {
       ast.SReturn(Some(e)) -> uses_json_expr(e)
       ast.SEcho(e) -> uses_json_expr(e)
       ast.SAssert(e) -> uses_json_expr(e)
+      ast.SBreak | ast.SContinue -> False
       ast.SExpr(e) -> uses_json_expr(e)
       ast.SIf(branches, else_body) ->
         list.any(branches, fn(b) {
@@ -373,6 +374,7 @@ fn atoms_in_stmts(stmts: List(ast.Stmt), acc: List(String)) -> List(String) {
       ast.SReturn(Some(e)) -> atoms_in_expr(e, acc)
       ast.SEcho(e) -> atoms_in_expr(e, acc)
       ast.SAssert(e) -> atoms_in_expr(e, acc)
+      ast.SBreak | ast.SContinue -> acc
       ast.SExpr(e) -> atoms_in_expr(e, acc)
       ast.SIf(branches, else_body) -> {
         let acc =
@@ -973,7 +975,7 @@ fn gen_fn_decl(
   let env = fn_env(env, params, ret)
   let param_str =
     params
-    |> list.map(fn(p) { p.name <> " " <> gen_type(p.typ) })
+    |> list.map(fn(p) { escape_ident(p.name) <> " " <> gen_type(p.typ) })
     |> string.join(", ")
   let ret_str = case ret {
     ast.TVoid -> ""
@@ -984,7 +986,7 @@ fn gen_fn_decl(
     _ -> gen_terminator(body)
   }
   "func "
-  <> name
+  <> escape_ident(name)
   <> "("
   <> param_str
   <> ")"
@@ -1008,7 +1010,7 @@ fn gen_query_decl(
   let env = fn_env(env, params, ret)
   let param_str =
     params
-    |> list.map(fn(p) { p.name <> " " <> gen_type(p.typ) })
+    |> list.map(fn(p) { escape_ident(p.name) <> " " <> gen_type(p.typ) })
     |> string.join(", ")
   let pieces =
     sql
@@ -1023,7 +1025,7 @@ fn gen_query_decl(
     _ -> string.join(pieces, " + ")
   }
   "func "
-  <> name
+  <> escape_ident(name)
   <> "("
   <> param_str
   <> ") "
@@ -1070,7 +1072,8 @@ fn gen_stmt(
   case stmt {
     ast.SVarDecl(name, value, _) -> {
       let ty = infer(env, value)
-      let decl = pad <> name <> " := " <> gen_expr(env, value) <> "\n"
+      let decl =
+        pad <> escape_ident(name) <> " := " <> gen_expr(env, value) <> "\n"
       let env2 = Env(..env, locals: dict.insert(env.locals, name, ty))
       #(decl <> guard(following, name, pad), env2)
     }
@@ -1079,7 +1082,7 @@ fn gen_stmt(
       let decl =
         pad
         <> "var "
-        <> name
+        <> escape_ident(name)
         <> " "
         <> gen_type(typ)
         <> " = "
@@ -1098,6 +1101,8 @@ fn gen_stmt(
       let #(cond, _) = gen_condition(env, e)
       #(pad <> "hive.Assert(" <> cond <> ")\n", env)
     }
+    ast.SBreak -> #(pad <> "break\n", env)
+    ast.SContinue -> #(pad <> "continue\n", env)
     ast.SAssign(target, value) -> {
       let ty = infer(env, target)
       #(
@@ -1162,7 +1167,7 @@ fn gen_stmt(
             || uses_in_stmts(body, name)
           {
             True -> ""
-            False -> tabs(indent + 1) <> "_ = " <> name <> "\n"
+            False -> tabs(indent + 1) <> "_ = " <> escape_ident(name) <> "\n"
           }
         None -> ""
       }
@@ -1193,12 +1198,12 @@ fn gen_stmt(
       let loop_env = Env(..env, locals: dict.insert(env.locals, name, elem_ty))
       let body_guard = case uses_in_stmts(body, name) {
         True -> ""
-        False -> tabs(indent + 1) <> "_ = " <> name <> "\n"
+        False -> tabs(indent + 1) <> "_ = " <> escape_ident(name) <> "\n"
       }
       let code =
         pad
         <> "for _, "
-        <> name
+        <> escape_ident(name)
         <> " := range "
         <> gen_expr(env, iterable)
         <> " {\n"
@@ -1219,14 +1224,14 @@ fn gen_for_clause(env: Env, stmt: ast.Stmt) -> #(String, Env) {
     ast.SVarDecl(name, value, _) -> {
       let ty = infer(env, value)
       #(
-        name <> " := " <> gen_expr(env, value),
+        escape_ident(name) <> " := " <> gen_expr(env, value),
         Env(..env, locals: dict.insert(env.locals, name, ty)),
       )
     }
     ast.STypedDecl(typ, name, value, _) -> {
       let ty = ty_of_type_expr(env.types, typ)
       #(
-        name <> " := " <> coerce(env, value, ty),
+        escape_ident(name) <> " := " <> coerce(env, value, ty),
         Env(..env, locals: dict.insert(env.locals, name, ty)),
       )
     }
@@ -1282,7 +1287,7 @@ fn is_async_call(env: Env, e: ast.Expr) -> Bool {
 fn guard(scope: List(ast.Stmt), name: String, pad: String) -> String {
   case uses_in_stmts(scope, name) {
     True -> ""
-    False -> pad <> "_ = " <> name <> "\n"
+    False -> pad <> "_ = " <> escape_ident(name) <> "\n"
   }
 }
 
@@ -1329,7 +1334,7 @@ fn gen_bindings(
   binds
   |> list.map(fn(b) {
     let #(name, rhs, _) = b
-    pad <> name <> " := " <> rhs <> "\n" <> guard(body, name, pad)
+    pad <> escape_ident(name) <> " := " <> rhs <> "\n" <> guard(body, name, pad)
   })
   |> string.concat
 }
@@ -1606,7 +1611,7 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
         | ast.OpNeq
         | ast.OpAnd
         | ast.OpOr -> TyBool
-        ast.OpAdd | ast.OpSub | ast.OpMul | ast.OpDiv | ast.OpPow ->
+        ast.OpAdd | ast.OpSub | ast.OpMul | ast.OpDiv | ast.OpMod | ast.OpPow ->
           infer_arith(env, l, r)
       }
     ast.EIs(_, _) -> TyBool
@@ -1690,7 +1695,7 @@ fn gen_expr(env: Env, e: ast.Expr) -> String {
       // Inside a condition an `is`-binding reads through its accessor.
       case dict.get(env.subst, name) {
         Ok(rhs) -> rhs
-        Error(_) -> name
+        Error(_) -> escape_ident(name)
       }
     ast.EVector(items) -> gen_vector(env, items, TyUnknown)
     ast.EMember(target, field) -> {
@@ -1836,7 +1841,12 @@ fn gen_binary(env: Env, op: ast.BinOp, l: ast.Expr, r: ast.Expr) -> String {
     }
     ast.OpAdd -> gen_add(env, l, r)
     ast.OpDiv -> gen_div(env, l, r)
+    ast.OpMod -> gen_mod(env, l, r)
     ast.OpPow -> gen_pow(env, l, r)
+    // `==` / `!=` on vectors: Go can't compare slices, so route to the runtime
+    // structural-equality helper (same length, then element-wise).
+    ast.OpEq -> gen_equality(env, l, r, True)
+    ast.OpNeq -> gen_equality(env, l, r, False)
     _ ->
       "("
       <> gen_expr(env, l)
@@ -1845,6 +1855,35 @@ fn gen_binary(env: Env, op: ast.BinOp, l: ast.Expr, r: ast.Expr) -> String {
       <> " "
       <> gen_expr(env, r)
       <> ")"
+  }
+}
+
+// `==` / `!=` between vectors (or a vector and an empty-literal `[]`) lowers to
+// `hive.VecEq`, since Go rejects `slice == slice`. Scalar operands keep Go's
+// native `==` / `!=`. `positive` is True for `==`, False for `!=`.
+fn gen_equality(env: Env, l: ast.Expr, r: ast.Expr, positive: Bool) -> String {
+  let is_vec = fn(t) {
+    case t {
+      TyVec(_) | TyTable -> True
+      _ -> False
+    }
+  }
+  case is_vec(infer(env, l)) || is_vec(infer(env, r)) {
+    True -> {
+      let call =
+        "hive.VecEq(" <> gen_expr(env, l) <> ", " <> gen_expr(env, r) <> ")"
+      case positive {
+        True -> call
+        False -> "!" <> call
+      }
+    }
+    False -> {
+      let op = case positive {
+        True -> " == "
+        False -> " != "
+      }
+      "(" <> gen_expr(env, l) <> op <> gen_expr(env, r) <> ")"
+    }
   }
 }
 
@@ -1871,6 +1910,18 @@ fn gen_div(env: Env, l: ast.Expr, r: ast.Expr) -> String {
     TyFloat, TyFloat ->
       "hive.DivFloat(" <> gen_expr(env, l) <> ", " <> gen_expr(env, r) <> ")"
     _, _ -> "(" <> gen_expr(env, l) <> " / " <> gen_expr(env, r) <> ")"
+  }
+}
+
+// Hive's `%` (remainder) mirrors division's zero-safety: a modulus of 0
+// returns 0. Go's `%` is integer-only, so a float remainder goes through
+// `math.Mod` in the runtime; unknown numeric types default to integer.
+fn gen_mod(env: Env, l: ast.Expr, r: ast.Expr) -> String {
+  case infer(env, l), infer(env, r) {
+    TyFloat, _ | _, TyFloat ->
+      "hive.ModFloat(" <> gen_expr(env, l) <> ", " <> gen_expr(env, r) <> ")"
+    _, _ ->
+      "hive.ModInt(" <> gen_expr(env, l) <> ", " <> gen_expr(env, r) <> ")"
   }
 }
 
@@ -2265,8 +2316,8 @@ fn gen_ident_call(env: Env, name: String, args: List(ast.Arg)) -> String {
         _ ->
           case dict.get(env.sigs, name) {
             Ok(#(params, _)) ->
-              name <> "(" <> gen_sig_args(env, args, params) <> ")"
-            Error(_) -> name <> "(" <> gen_args(env, args) <> ")"
+              escape_ident(name) <> "(" <> gen_sig_args(env, args, params) <> ")"
+            Error(_) -> escape_ident(name) <> "(" <> gen_args(env, args) <> ")"
           }
       }
   }
@@ -2367,6 +2418,7 @@ fn gen_binop(op: ast.BinOp) -> String {
     ast.OpSub -> "-"
     ast.OpMul -> "*"
     ast.OpDiv -> "/"
+    ast.OpMod -> "%"
     ast.OpPow -> "**"
     ast.OpAnd -> "&&"
     ast.OpOr -> "||"
@@ -2410,6 +2462,31 @@ fn exported(name: String) -> String {
   }
 }
 
+// A Hive identifier that happens to be a Go keyword would make the generated
+// Go fail to compile, so suffix it with `_`. Go keywords are all lowercase and
+// Hive identifiers keep their spelling, so only an exact lowercase match is
+// rewritten; the handful that are also Hive keywords (`func`, `for`, ...) can
+// never reach here as identifiers anyway. Struct fields and exported names are
+// capitalized elsewhere, so they can never collide.
+fn escape_ident(name: String) -> String {
+  case is_go_keyword(name) {
+    True -> name <> "_"
+    False -> name
+  }
+}
+
+fn is_go_keyword(name: String) -> Bool {
+  list.contains(
+    [
+      "break", "case", "chan", "const", "continue", "default", "defer", "else",
+      "fallthrough", "for", "func", "go", "goto", "if", "import", "interface",
+      "map", "package", "range", "return", "select", "struct", "switch", "type",
+      "var",
+    ],
+    name,
+  )
+}
+
 fn tabs(n: Int) -> String {
   string.repeat("\t", n)
 }
@@ -2441,6 +2518,7 @@ fn uses_in_stmt(s: ast.Stmt, name: String) -> Bool {
     ast.SReturn(Some(e)) -> uses_in_expr(e, name)
     ast.SEcho(e) -> uses_in_expr(e, name)
     ast.SAssert(e) -> uses_in_expr(e, name)
+    ast.SBreak | ast.SContinue -> False
     ast.SExpr(e) -> uses_in_expr(e, name)
     ast.SIf(branches, else_body) -> {
       let in_branches =

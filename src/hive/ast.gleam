@@ -103,6 +103,10 @@ pub type Stmt {
   SEcho(value: Expr)
   /// `assert condition` — panic at runtime when the condition is false.
   SAssert(value: Expr)
+  /// `break` — leave the innermost enclosing loop.
+  SBreak
+  /// `continue` — skip to the next iteration of the innermost enclosing loop.
+  SContinue
   /// A bare expression used as a statement (e.g. a call).
   SExpr(expr: Expr)
 }
@@ -122,6 +126,7 @@ pub type BinOp {
   OpSub
   OpMul
   OpDiv
+  OpMod
   OpPow
   OpAnd
   OpOr

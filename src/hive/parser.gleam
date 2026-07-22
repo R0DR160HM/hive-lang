@@ -418,6 +418,8 @@ fn parse_stmt(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
     token.KwFor -> parse_for(tokens)
     token.KwEcho -> parse_echo(tokens)
     token.KwAssert -> parse_assert(tokens)
+    token.KwBreak -> Ok(#(ast.SBreak, tail(tokens)))
+    token.KwContinue -> Ok(#(ast.SContinue, tail(tokens)))
     token.KwMut -> parse_mut(tail(tokens))
     token.Ident(name) ->
       case kind(tail(tokens)) {
@@ -494,8 +496,30 @@ fn parse_expr_stmt(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
       use #(value, t2) <- result.try(parse_expr(tail(t1)))
       Ok(#(ast.SAssign(expr, value), t2))
     }
+    // Compound assignments `x <op>= v` desugar to `x = x <op> v`; the existing
+    // mutability check and (for `/=`) zero-safe division then apply unchanged.
+    token.PlusEq -> parse_compound_assign(expr, ast.OpAdd, tail(t1))
+    token.MinusEq -> parse_compound_assign(expr, ast.OpSub, tail(t1))
+    token.StarEq -> parse_compound_assign(expr, ast.OpMul, tail(t1))
+    token.SlashEq -> parse_compound_assign(expr, ast.OpDiv, tail(t1))
+    // `x++` / `x--` desugar to `x = x + 1` / `x = x - 1`.
+    token.PlusPlus -> Ok(#(compound(expr, ast.OpAdd, ast.EInt(1)), tail(t1)))
+    token.MinusMinus -> Ok(#(compound(expr, ast.OpSub, ast.EInt(1)), tail(t1)))
     _ -> Ok(#(ast.SExpr(expr), t1))
   }
+}
+
+fn parse_compound_assign(
+  target: ast.Expr,
+  op: ast.BinOp,
+  tokens: Toks,
+) -> Result(#(ast.Stmt, Toks), String) {
+  use #(value, t1) <- result.try(parse_expr(tokens))
+  Ok(#(compound(target, op, value), t1))
+}
+
+fn compound(target: ast.Expr, op: ast.BinOp, value: ast.Expr) -> ast.Stmt {
+  ast.SAssign(target, ast.EBinary(op, target, value))
 }
 
 fn parse_return(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
@@ -664,8 +688,27 @@ fn parse_is(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
       use #(pattern, t2) <- result.try(parse_pattern(tail(t1)))
       Ok(#(ast.EIs(left, pattern), t2))
     }
+    // `vector bounds index` is sugar for `index >= 0 && index < len(vector)`.
+    // Desugaring here means codegen and the index-safety pass both understand
+    // it for free — the bounds checker already mines exactly this shape.
+    token.KwBounds -> {
+      use #(index, t2) <- result.try(parse_additive(tail(t1)))
+      Ok(#(desugar_bounds(left, index), t2))
+    }
     _ -> Ok(#(left, t1))
   }
+}
+
+fn desugar_bounds(vector: ast.Expr, index: ast.Expr) -> ast.Expr {
+  ast.EBinary(
+    ast.OpAnd,
+    ast.EBinary(ast.OpGe, index, ast.EInt(0)),
+    ast.EBinary(
+      ast.OpLt,
+      index,
+      ast.ECall(ast.EIdent("len"), [ast.Arg(None, vector)]),
+    ),
+  )
 }
 
 fn parse_comparison(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
@@ -730,6 +773,10 @@ fn parse_multiplicative_rest(
     token.Slash -> {
       use #(right, t1) <- result.try(parse_power(tail(tokens)))
       parse_multiplicative_rest(ast.EBinary(ast.OpDiv, left, right), t1)
+    }
+    token.Percent -> {
+      use #(right, t1) <- result.try(parse_power(tail(tokens)))
+      parse_multiplicative_rest(ast.EBinary(ast.OpMod, left, right), t1)
     }
     _ -> Ok(#(left, tokens))
   }

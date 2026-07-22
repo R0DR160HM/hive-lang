@@ -21,6 +21,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import hive/ast
+import hive/bounds
 import hive/codegen
 import hive/lexer
 import hive/parser
@@ -30,6 +31,7 @@ pub fn compile(source: String) -> Result(String, String) {
   use tokens <- result.try(lexer.lex(source))
   use module <- result.try(parser.parse(tokens))
   use _ <- result.try(check(module))
+  use _ <- result.try(bounds.check(module))
   Ok(codegen.generate(module))
 }
 
@@ -52,6 +54,9 @@ type Ctx {
     /// Parameter names of every declared proc/func/query.
     callables: Dict(String, List(String)),
     types: Dict(String, ast.Decl),
+    /// True while checking statements inside a loop body, so `break`/`continue`
+    /// outside any loop can be rejected.
+    in_loop: Bool,
   )
 }
 
@@ -84,12 +89,12 @@ fn check(module: ast.Module) -> Result(Nil, String) {
   list.try_fold(module.decls, Nil, fn(_, d) {
     case d {
       ast.ProcDecl(name, _, _, body) ->
-        check_body(Ctx(name, False, procs, callables, types), body)
+        check_body(Ctx(name, False, procs, callables, types, False), body)
       // A `func` may perform I/O (echo, using, hive.http, ...) just like a
       // `proc`. Its two restrictions — no mutex parameters, no calling procs —
       // are what `in_func` marks.
       ast.FuncDecl(name, _, _, body, _) ->
-        check_body(Ctx(name, True, procs, callables, types), body)
+        check_body(Ctx(name, True, procs, callables, types, False), body)
       ast.QueryDecl(name, _, _, sql) ->
         // A query is a func whose body is inline SQL; its interpolations are
         // walked with the same func restrictions.
@@ -97,7 +102,7 @@ fn check(module: ast.Module) -> Result(Nil, String) {
           case p {
             ast.ILit(_) -> Ok(Nil)
             ast.IExpr(e) ->
-              check_expr(Ctx(name, True, procs, callables, types), e)
+              check_expr(Ctx(name, True, procs, callables, types, False), e)
           }
         })
         |> result.map(fn(_) { Nil })
@@ -168,6 +173,16 @@ fn check_stmt(
       use _ <- result.try(check_expr(ctx, e))
       Ok(muts)
     }
+    ast.SBreak ->
+      case ctx.in_loop {
+        True -> Ok(muts)
+        False -> Error("`break` can only be used inside a loop")
+      }
+    ast.SContinue ->
+      case ctx.in_loop {
+        True -> Ok(muts)
+        False -> Error("`continue` can only be used inside a loop")
+      }
     ast.SIf(branches, else_body) -> {
       use _ <- result.try(
         list.try_fold(branches, Nil, fn(_, b) {
@@ -203,7 +218,8 @@ fn check_stmt(
         None -> Ok(Nil)
       })
       use _ <- result.try(
-        check_stmts(ctx, body, inner) |> result.map(fn(_) { Nil }),
+        check_stmts(Ctx(..ctx, in_loop: True), body, inner)
+        |> result.map(fn(_) { Nil }),
       )
       Ok(muts)
     }
@@ -212,7 +228,8 @@ fn check_stmt(
       // The iteration variable is a fresh, immutable binding in the body.
       let inner = dict.insert(muts, name, False)
       use _ <- result.try(
-        check_stmts(ctx, body, inner) |> result.map(fn(_) { Nil }),
+        check_stmts(Ctx(..ctx, in_loop: True), body, inner)
+        |> result.map(fn(_) { Nil }),
       )
       Ok(muts)
     }

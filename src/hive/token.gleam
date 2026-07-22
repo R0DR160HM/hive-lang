@@ -55,6 +55,9 @@ pub type Kind {
   KwFor
   KwIn
   KwEach
+  KwBounds
+  KwBreak
+  KwContinue
 
   // Punctuation
   LBrace
@@ -81,9 +84,16 @@ pub type Kind {
   Minus
   Star
   Slash
+  Percent
   StarStar
   AmpAmp
   PipePipe
+  PlusEq
+  MinusEq
+  StarEq
+  SlashEq
+  PlusPlus
+  MinusMinus
 
   // End of input
   Eof
@@ -122,6 +132,9 @@ pub fn describe(kind: Kind) -> String {
     KwFor -> "`for`"
     KwIn -> "`in`"
     KwEach -> "`each`"
+    KwBounds -> "`bounds`"
+    KwBreak -> "`break`"
+    KwContinue -> "`continue`"
     LBrace -> "`{`"
     RBrace -> "`}`"
     LParen -> "`(`"
@@ -144,9 +157,16 @@ pub fn describe(kind: Kind) -> String {
     Minus -> "`-`"
     Star -> "`*`"
     Slash -> "`/`"
+    Percent -> "`%`"
     StarStar -> "`**`"
     AmpAmp -> "`&&`"
     PipePipe -> "`||`"
+    PlusEq -> "`+=`"
+    MinusEq -> "`-=`"
+    StarEq -> "`*=`"
+    SlashEq -> "`/=`"
+    PlusPlus -> "`++`"
+    MinusMinus -> "`--`"
     Eof -> "end of file"
   }
 }
