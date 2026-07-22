@@ -88,13 +88,23 @@ fn check(module: ast.Module) -> Result(Nil, String) {
     })
   list.try_fold(module.decls, Nil, fn(_, d) {
     case d {
-      ast.ProcDecl(name, _, _, body) ->
-        check_body(Ctx(name, False, procs, callables, types, False), body)
+      ast.ProcDecl(name, _, ret, body) -> {
+        use _ <- result.try(check_body(
+          Ctx(name, False, procs, callables, types, False),
+          body,
+        ))
+        check_returns(types, name, ret, body)
+      }
       // A `func` may perform I/O (echo, using, hive.http, ...) just like a
       // `proc`. Its two restrictions — no mutex parameters, no calling procs —
       // are what `in_func` marks.
-      ast.FuncDecl(name, _, _, body, _) ->
-        check_body(Ctx(name, True, procs, callables, types, False), body)
+      ast.FuncDecl(name, _, ret, body, _) -> {
+        use _ <- result.try(check_body(
+          Ctx(name, True, procs, callables, types, False),
+          body,
+        ))
+        check_returns(types, name, ret, body)
+      }
       ast.QueryDecl(name, _, _, sql) ->
         // A query is a func whose body is inline SQL; its interpolations are
         // walked with the same func restrictions.
@@ -233,6 +243,127 @@ fn check_stmt(
       )
       Ok(muts)
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Exhaustiveness: every non-void proc/func must return on all paths
+// ---------------------------------------------------------------------------
+
+// Codegen still appends a `panic` fallback so Go accepts the output, but that
+// turns a reachable fall-through into a runtime panic. This catches those at
+// compile time. A branch that ends in `assert` counts as terminating — it is
+// Hive's panic — so an author can mark an impossible tail with `assert false`.
+fn check_returns(
+  types: Dict(String, ast.Decl),
+  name: String,
+  ret: ast.TypeExpr,
+  body: List(ast.Stmt),
+) -> Result(Nil, String) {
+  case ret {
+    ast.TVoid -> Ok(Nil)
+    _ ->
+      case terminates(types, body) {
+        True -> Ok(Nil)
+        False ->
+          Error(
+            "`"
+            <> name
+            <> "` can finish without returning a value: every path must end in "
+            <> "`return` (or `assert`, which panics). If a tail is unreachable, "
+            <> "make it explicit with a final `return` or `assert false`.",
+          )
+      }
+  }
+}
+
+// Whether a statement list always transfers control away from its end (so the
+// enclosing function never falls off it without returning).
+fn terminates(types: Dict(String, ast.Decl), stmts: List(ast.Stmt)) -> Bool {
+  case list.last(stmts) {
+    Ok(s) -> stmt_terminates(types, s)
+    Error(_) -> False
+  }
+}
+
+fn stmt_terminates(types: Dict(String, ast.Decl), s: ast.Stmt) -> Bool {
+  case s {
+    ast.SReturn(_) -> True
+    // `assert` is Hive's panic; a branch that ends in one is a terminating path.
+    ast.SAssert(_) -> True
+    ast.SIf(branches, else_body) -> {
+      let all_return =
+        list.all(branches, fn(b) { terminates(types, b.body) })
+      case else_body {
+        Some(body) -> all_return && terminates(types, body)
+        // No `else`: the branches must themselves cover the whole subject
+        // (Result's Ok+Error, or every variant of a user ADT).
+        None -> all_return && exhaustive(types, branches)
+      }
+    }
+    _ -> False
+  }
+}
+
+// Whether an else-less `if`/`else if` chain covers its subject exhaustively:
+// every branch guards on `subject is Constructor`, all on the same subject, and
+// the constructors span the whole type.
+fn exhaustive(
+  types: Dict(String, ast.Decl),
+  branches: List(ast.Branch),
+) -> Bool {
+  case list.first(branches) {
+    Ok(ast.Branch(ast.EIs(subject, _), _)) ->
+      case extract_paths(subject, branches) {
+        Ok(paths) -> covers(types, paths)
+        Error(_) -> False
+      }
+    _ -> False
+  }
+}
+
+// Each branch must be `subject is Type.Variant`, all sharing `subject`; returns
+// the list of `[Type, Variant]` paths, or Error if any branch doesn't fit.
+fn extract_paths(
+  subject: ast.Expr,
+  branches: List(ast.Branch),
+) -> Result(List(List(String)), Nil) {
+  list.try_map(branches, fn(b) {
+    case b.cond {
+      ast.EIs(s, ast.PConstructor(path, _)) ->
+        case s == subject {
+          True -> Ok(path)
+          False -> Error(Nil)
+        }
+      _ -> Error(Nil)
+    }
+  })
+}
+
+fn covers(types: Dict(String, ast.Decl), paths: List(List(String))) -> Bool {
+  case paths {
+    // Result is exhaustive exactly when both Ok and Error are matched.
+    [["Result", _], ..] ->
+      list.contains(paths, ["Result", "Ok"])
+      && list.contains(paths, ["Result", "Error"])
+    // A user ADT: all paths must name the same type, and every one of its
+    // variants must be matched.
+    [[tname, _], ..] ->
+      case dict.get(types, tname) {
+        Ok(ast.TypeDecl(_, variants, _)) -> {
+          let want = list.map(variants, fn(v) { v.name })
+          let got =
+            list.filter_map(paths, fn(p) {
+              case p {
+                [t, v] if t == tname -> Ok(v)
+                _ -> Error(Nil)
+              }
+            })
+          want != [] && list.all(want, fn(v) { list.contains(got, v) })
+        }
+        _ -> False
+      }
+    _ -> False
   }
 }
 

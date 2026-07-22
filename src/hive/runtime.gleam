@@ -145,6 +145,26 @@ func Concat[T any](a, b []T) []T {
 	return append(out, b...)
 }
 
+// Clone returns a deep copy of a vector, recursing into nested vectors (a
+// Table). Hive vectors are value types, but they lower to Go slices (which
+// share storage), so a binding that must stay independent of its source — any
+// binding where either side is immutable — is cloned rather than aliased.
+func Clone[T any](s []T) []T {
+	return cloneVec(s).([]T)
+}
+
+func cloneVec(v any) any {
+	rv := reflect.ValueOf(v)
+	if rv.Kind() != reflect.Slice {
+		return v
+	}
+	out := reflect.MakeSlice(rv.Type(), rv.Len(), rv.Len())
+	for i := 0; i < rv.Len(); i++ {
+		out.Index(i).Set(reflect.ValueOf(cloneVec(rv.Index(i).Interface())))
+	}
+	return out.Interface()
+}
+
 // VecEq reports whether two vectors are equal: the same length, then equal
 // elements in order — short-circuiting on the first mismatch. Nested vectors
 // (a Table) are compared the same way recursively, so an empty vector and a

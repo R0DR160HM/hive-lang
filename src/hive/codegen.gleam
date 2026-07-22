@@ -147,6 +147,11 @@ type Env {
     /// Names of the `async func`s: a bare call to one is fire-and-forget (a
     /// goroutine); an `await`ed call blocks for its value.
     asyncs: List(String),
+    /// Which in-scope locals were declared `mut`. Used to decide whether a
+    /// vector binding may share storage (both sides mutable) or must be cloned
+    /// (either side immutable). Names absent here are treated as immutable —
+    /// which is correct for params, `for each` bindings and `is`-bindings.
+    muts: Dict(String, Bool),
   )
 }
 
@@ -165,7 +170,8 @@ pub fn generate(module: ast.Module) -> String {
         _ -> Error(Nil)
       }
     })
-  let env = Env(types, sigs, dict.new(), dict.new(), TyUnknown, atoms, asyncs)
+  let env =
+    Env(types, sigs, dict.new(), dict.new(), TyUnknown, atoms, asyncs, dict.new())
 
   let type_code =
     module.decls
@@ -1072,15 +1078,21 @@ fn gen_stmt(
 ) -> #(String, Env) {
   let pad = tabs(indent)
   case stmt {
-    ast.SVarDecl(name, value, _) -> {
+    ast.SVarDecl(name, value, mutable) -> {
       let ty = infer(env, value)
-      let decl =
-        pad <> escape_ident(name) <> " := " <> gen_expr(env, value) <> "\n"
-      let env2 = Env(..env, locals: dict.insert(env.locals, name, ty))
+      let rhs = maybe_clone(env, mutable, value, gen_expr(env, value))
+      let decl = pad <> escape_ident(name) <> " := " <> rhs <> "\n"
+      let env2 =
+        Env(
+          ..env,
+          locals: dict.insert(env.locals, name, ty),
+          muts: dict.insert(env.muts, name, mutable),
+        )
       #(decl <> guard(following, name, pad), env2)
     }
-    ast.STypedDecl(typ, name, value, _) -> {
+    ast.STypedDecl(typ, name, value, mutable) -> {
       let ty = ty_of_type_expr(env.types, typ)
+      let rhs = maybe_clone(env, mutable, value, coerce(env, value, ty))
       let decl =
         pad
         <> "var "
@@ -1088,9 +1100,14 @@ fn gen_stmt(
         <> " "
         <> gen_type(typ)
         <> " = "
-        <> coerce(env, value, ty)
+        <> rhs
         <> "\n"
-      let env2 = Env(..env, locals: dict.insert(env.locals, name, ty))
+      let env2 =
+        Env(
+          ..env,
+          locals: dict.insert(env.locals, name, ty),
+          muts: dict.insert(env.muts, name, mutable),
+        )
       #(decl <> guard(following, name, pad), env2)
     }
     ast.SReturn(None) -> #(pad <> "return\n", env)
@@ -1107,10 +1124,16 @@ fn gen_stmt(
     ast.SContinue -> #(pad <> "continue\n", env)
     ast.SAssign(target, value) -> {
       let ty = infer(env, target)
-      #(
-        pad <> gen_expr(env, target) <> " = " <> coerce(env, value, ty) <> "\n",
-        env,
-      )
+      // A whole-variable reassignment (`b = a`) is a rebinding, so it copies
+      // when the source is immutable (the target must be mutable to be assigned
+      // at all). An element/field assignment (`v[i] = ...`) writes into
+      // existing storage and must never copy.
+      let rendered = coerce(env, value, ty)
+      let rhs = case target {
+        ast.EIdent(_) -> maybe_clone(env, True, value, rendered)
+        _ -> rendered
+      }
+      #(pad <> gen_expr(env, target) <> " = " <> rhs <> "\n", env)
     }
     // `append(v, x)` used as a statement mutates `v` in place, which Go models
     // by reassigning the (possibly reallocated) slice back to `v`.
@@ -1223,23 +1246,39 @@ fn gen_stmt(
 // and threads any variable it declares into the returned environment.
 fn gen_for_clause(env: Env, stmt: ast.Stmt) -> #(String, Env) {
   case stmt {
+    // A loop-init binding is implicitly mutable (the post clause advances it).
     ast.SVarDecl(name, value, _) -> {
       let ty = infer(env, value)
+      let rhs = maybe_clone(env, True, value, gen_expr(env, value))
       #(
-        escape_ident(name) <> " := " <> gen_expr(env, value),
-        Env(..env, locals: dict.insert(env.locals, name, ty)),
+        escape_ident(name) <> " := " <> rhs,
+        Env(
+          ..env,
+          locals: dict.insert(env.locals, name, ty),
+          muts: dict.insert(env.muts, name, True),
+        ),
       )
     }
     ast.STypedDecl(typ, name, value, _) -> {
       let ty = ty_of_type_expr(env.types, typ)
+      let rhs = maybe_clone(env, True, value, coerce(env, value, ty))
       #(
-        escape_ident(name) <> " := " <> coerce(env, value, ty),
-        Env(..env, locals: dict.insert(env.locals, name, ty)),
+        escape_ident(name) <> " := " <> rhs,
+        Env(
+          ..env,
+          locals: dict.insert(env.locals, name, ty),
+          muts: dict.insert(env.muts, name, True),
+        ),
       )
     }
     ast.SAssign(target, value) -> {
       let ty = infer(env, target)
-      #(gen_expr(env, target) <> " = " <> coerce(env, value, ty), env)
+      let rendered = coerce(env, value, ty)
+      let rhs = case target {
+        ast.EIdent(_) -> maybe_clone(env, True, value, rendered)
+        _ -> rendered
+      }
+      #(gen_expr(env, target) <> " = " <> rhs, env)
     }
     // `append(v, x)` advances a mutable vector, reassigning the result back.
     ast.SExpr(ast.ECall(ast.EIdent("append"), args)) -> {
@@ -1865,9 +1904,11 @@ fn gen_binary(env: Env, op: ast.BinOp, l: ast.Expr, r: ast.Expr) -> String {
   }
 }
 
-// `==` / `!=` between vectors (or a vector and an empty-literal `[]`) lowers to
-// `hive.VecEq`, since Go rejects `slice == slice`. Scalar operands keep Go's
-// native `==` / `!=`. `positive` is True for `==`, False for `!=`.
+// `==` / `!=` lowers to `hive.VecEq` only when *both* operands are vectors
+// (Go can't compare slices), so a vector compared against a scalar — or two
+// vectors of different element types — falls through to Go's native `==`/`!=`
+// and is rejected by the Go compiler rather than silently returning `false`.
+// `positive` is True for `==`, False for `!=`.
 fn gen_equality(env: Env, l: ast.Expr, r: ast.Expr, positive: Bool) -> String {
   let is_vec = fn(t) {
     case t {
@@ -1875,7 +1916,7 @@ fn gen_equality(env: Env, l: ast.Expr, r: ast.Expr, positive: Bool) -> String {
       _ -> False
     }
   }
-  case is_vec(infer(env, l)) || is_vec(infer(env, r)) {
+  case is_vec(infer(env, l)) && is_vec(infer(env, r)) {
     True -> {
       let call =
         "hive.VecEq(" <> gen_expr(env, l) <> ", " <> gen_expr(env, r) <> ")"
@@ -1891,6 +1932,66 @@ fn gen_equality(env: Env, l: ast.Expr, r: ast.Expr, positive: Bool) -> String {
       }
       "(" <> gen_expr(env, l) <> op <> gen_expr(env, r) <> ")"
     }
+  }
+}
+
+// Wraps a rendered vector RHS in `hive.Clone(...)` when the binding must not
+// share storage with its source. `target_mutable` is whether the binding being
+// created is `mut`.
+fn maybe_clone(
+  env: Env,
+  target_mutable: Bool,
+  value: ast.Expr,
+  rendered: String,
+) -> String {
+  case needs_copy(env, target_mutable, value) {
+    True -> "hive.Clone(" <> rendered <> ")"
+    False -> rendered
+  }
+}
+
+// A vector binding needs a copy when its RHS refers to existing storage (an
+// identifier/index/member/slice rather than a fresh literal or `+`/call result)
+// and the two ends are not both mutable. Two mutable bindings are allowed to
+// alias (shared mutable state); anything involving an immutable side is an
+// independent value and must be copied.
+fn needs_copy(env: Env, target_mutable: Bool, value: ast.Expr) -> Bool {
+  case is_vec_ty(infer(env, value)) && aliases_storage(value) {
+    False -> False
+    // Alias source of vector type: copy unless both ends are mutable.
+    True ->
+      case target_mutable && source_mutable(env, value) {
+        True -> False
+        False -> True
+      }
+  }
+}
+
+fn is_vec_ty(ty: Ty) -> Bool {
+  case ty {
+    TyVec(_) | TyTable -> True
+    _ -> False
+  }
+}
+
+fn aliases_storage(e: ast.Expr) -> Bool {
+  case e {
+    ast.EIdent(_) | ast.EMember(_, _) | ast.EIndex(_, _) | ast.ESlice(_, _, _) ->
+      True
+    _ -> False
+  }
+}
+
+fn source_mutable(env: Env, e: ast.Expr) -> Bool {
+  case e {
+    ast.EIdent(n) ->
+      case dict.get(env.muts, n) {
+        Ok(m) -> m
+        Error(_) -> False
+      }
+    ast.EMember(t, _) | ast.EIndex(t, _) | ast.ESlice(t, _, _) ->
+      source_mutable(env, t)
+    _ -> False
   }
 }
 

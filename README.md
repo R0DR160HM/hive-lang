@@ -155,9 +155,13 @@ language's specification: each one compiles, builds and runs.
   (`Str[dyn]`, `Str[dyn, 2]` with an initial size). All of them lower to Go
   slices; `+` concatenates into a new vector. `==` and `!=` compare vectors
   structurally — same length, then element by element (nested vectors and a
-  `Table` compare the same way), short-circuiting on the first difference.
-  `Table` is an alias for `Str[dyn][dyn]`. (For `append`, `join`, `split`,
-  `len` and `bytes` see [Built-in functions](#built-in-functions).)
+  `Table` compare the same way), short-circuiting on the first difference;
+  comparing a vector to a non-vector is a compile error, not a silent `false`.
+  Vectors are **value types**: binding one to another (`ys := xs`) copies it, so
+  a later mutation of one is not seen through the other. The one exception is a
+  binding where *both* sides are `mut` — those are allowed to alias shared
+  mutable state. `Table` is an alias for `Str[dyn][dyn]`. (For `append`, `join`,
+  `split`, `len` and `bytes` see [Built-in functions](#built-in-functions).)
 * **Mutability** — variables are immutable by default; prefix a declaration
   with `mut` (`mut x := ...`, `mut Str[dyn] v = ...`) to allow reassignment
   (`x = ...`, `v[0] = ...`) and `append`. Conceptually a `mut T` is a
@@ -431,9 +435,15 @@ Reads environment variables, from a `.env` file or the OS.
 Codegen runs a lightweight type-inference pass over locals so overloaded
 syntax picks the right lowering (`+` on vectors vs. strings vs. numbers, atom
 → `Str` coercions, zero-safe division, vector literal element types). Hive
-relies on exhaustiveness analysis this proof-of-concept doesn't fully model,
-so any non-`void` function that doesn't syntactically end in a `return` gets
-a trailing `panic("hive: unreachable")` to satisfy the Go compiler. A Hive
+requires every non-`void` `proc`/`func` to return on every path: a path
+terminates by ending in `return`, in `assert` (Hive's panic — handy for a tail
+you know is unreachable, e.g. `assert false`), in an `if`/`else` whose every
+branch terminates, or in an else-less `if`/`else if` chain that covers its
+subject's whole type (a `Result`'s `Ok`+`Error`, or every variant of an ADT).
+Anything else is a compile error. For an accepted function that doesn't
+syntactically end in `return` (an exhaustive match), codegen still appends a
+`panic("hive: unreachable")` to satisfy the Go compiler; it is now genuinely
+unreachable. A Hive
 identifier that happens to be a Go keyword but not a Hive one (a variable or
 function named `map`, `range`, `select`, ...) is suffixed with `_` in the
 generated Go — consistently at its definition and every use — so it never

@@ -1382,6 +1382,91 @@ pub fn unknown_env_builtin_is_rejected_test() {
   |> should.be_error
 }
 
+// ---------------------------------------------------------------------------
+// Strict vector equality (a vector vs a non-vector no longer silently false)
+// ---------------------------------------------------------------------------
+
+pub fn vector_compared_to_scalar_uses_native_equality_test() {
+  // Must NOT route to VecEq (which would silently return false); it stays a
+  // plain `==` so the Go compiler rejects the type mismatch.
+  let go =
+    compile("proc main(): void {\n\txs := [1, 2, 3]\n\techo xs == 5\n}\n")
+  should.be_true(string.contains(go, "(xs == 5)"))
+  should.be_false(string.contains(go, "VecEq"))
+}
+
+pub fn vector_vs_vector_still_uses_runtime_equality_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\ta := [1, 2]\n\tb := [1, 2]\n\techo a == b\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.VecEq(a, b)"))
+}
+
+// ---------------------------------------------------------------------------
+// Vector copy-on-binding (value semantics unless both sides are mutable)
+// ---------------------------------------------------------------------------
+
+pub fn immutable_vector_binding_is_cloned_test() {
+  // `ys` is immutable, so it gets an independent copy of `xs`.
+  let go =
+    compile(
+      "proc main(): void {\n\tmut xs := [1, 2, 3]\n\tys := xs\n\txs[0] = 9\n\techo ys[0]\n}\n",
+    )
+  should.be_true(string.contains(go, "ys := hive.Clone(xs)"))
+}
+
+pub fn both_mutable_vector_binding_is_shared_test() {
+  // Two mutable bindings are allowed to alias (shared mutable state).
+  let go =
+    compile(
+      "proc main(): void {\n\tmut xs := [1, 2, 3]\n\tmut ys := xs\n\txs[0] = 9\n\techo ys[0]\n}\n",
+    )
+  should.be_true(string.contains(go, "ys := xs"))
+  should.be_false(string.contains(go, "Clone"))
+}
+
+pub fn fresh_vector_binding_is_not_cloned_test() {
+  // A vector literal is already fresh — no copy needed.
+  let go =
+    compile("proc main(): void {\n\tys := [1, 2, 3]\n\techo ys[0]\n}\n")
+  should.be_false(string.contains(go, "Clone"))
+}
+
+// ---------------------------------------------------------------------------
+// Exhaustiveness: non-void proc/func must return on every path
+// ---------------------------------------------------------------------------
+
+pub fn non_exhaustive_function_is_rejected_test() {
+  compiler.compile(
+    "func f(cond: Bool): Int {\n\tif cond {\n\t\treturn 1\n\t}\n}\nproc main(): void {}\n",
+  )
+  |> should.be_error
+}
+
+pub fn assert_tail_counts_as_terminating_test() {
+  // `assert` is Hive's panic; it makes a tail a terminating path.
+  compiler.compile(
+    "func f(cond: Bool): Int {\n\tif cond {\n\t\treturn 1\n\t}\n\tassert false\n}\nproc main(): void {}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn exhaustive_variant_match_needs_no_final_return_test() {
+  // Covering every variant of the subject's type is exhaustive without an else.
+  compiler.compile(
+    "type T {\n\tA\n\tB\n}\nfunc f(x: T): Int {\n\tif x is T.A {\n\t\treturn 1\n\t} else if x is T.B {\n\t\treturn 2\n\t}\n}\nproc main(): void {}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn non_exhaustive_variant_match_is_rejected_test() {
+  compiler.compile(
+    "type T {\n\tA\n\tB\n}\nfunc f(x: T): Int {\n\tif x is T.A {\n\t\treturn 1\n\t}\n}\nproc main(): void {}\n",
+  )
+  |> should.be_error
+}
+
 fn count_occurrences(haystack: String, needle: String) -> Int {
   string.split(haystack, needle) |> length_minus_one
 }
