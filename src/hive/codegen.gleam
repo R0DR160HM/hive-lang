@@ -61,6 +61,7 @@ pub fn builtin_fields(name: String) -> Option(List(#(String, Ty))) {
     "JsonError" ->
       Some([#("path", TyStr), #("expected", TyStr), #("found", TyStr)])
     "CryptoError" -> Some([#("reason", TyStr), #("message", TyStr)])
+    "ConversionError" -> Some([#("input", TyStr), #("message", TyStr)])
     "JwtHeader" ->
       Some([#("alg", TyStr), #("typ", TyStr), #("kid", TyStr)])
     "SqlError" -> Some([#("message", TyStr)])
@@ -77,6 +78,7 @@ pub fn builtin_qualifier(name: String) -> String {
     "HttpRequest" | "HttpResponse" | "HttpError" -> "hive.http"
     "JsonError" -> "hive.json"
     "CryptoError" | "JwtHeader" -> "hive.crypto"
+    "ConversionError" -> "hive.conv"
     "SqlError" | "SqlConnection" | "DatabaseDriver" -> "hive.sql"
     _ -> "hive"
   }
@@ -236,8 +238,22 @@ fn uses_json_stmts(stmts: List(ast.Stmt)) -> Bool {
           Some(body) -> uses_json_stmts(body)
           None -> False
         }
+      ast.SFor(init, cond, post, body) ->
+        uses_json_opt_stmt(init)
+        || uses_json_opt(cond)
+        || uses_json_opt_stmt(post)
+        || uses_json_stmts(body)
+      ast.SForEach(_, _, iterable, body) ->
+        uses_json_expr(iterable) || uses_json_stmts(body)
     }
   })
+}
+
+fn uses_json_opt_stmt(o: Option(ast.Stmt)) -> Bool {
+  case o {
+    Some(s) -> uses_json_stmts([s])
+    None -> False
+  }
 }
 
 fn uses_json_expr(e: ast.Expr) -> Bool {
@@ -368,8 +384,23 @@ fn atoms_in_stmts(stmts: List(ast.Stmt), acc: List(String)) -> List(String) {
           None -> acc
         }
       }
+      ast.SFor(init, cond, post, body) -> {
+        let acc = atoms_in_opt_stmt(init, acc)
+        let acc = atoms_in_opt(cond, acc)
+        let acc = atoms_in_opt_stmt(post, acc)
+        atoms_in_stmts(body, acc)
+      }
+      ast.SForEach(_, _, iterable, body) ->
+        atoms_in_stmts(body, atoms_in_expr(iterable, acc))
     }
   })
+}
+
+fn atoms_in_opt_stmt(o: Option(ast.Stmt), acc: List(String)) -> List(String) {
+  case o {
+    Some(s) -> atoms_in_stmts([s], acc)
+    None -> acc
+  }
 }
 
 fn atoms_in_parts(parts: List(ast.IPart), acc: List(String)) -> List(String) {
@@ -1097,6 +1128,142 @@ fn gen_stmt(
       gen_if(env, branches, else_body, indent),
       env,
     )
+    // A C-style loop maps straight onto Go's `for init; cond; post { }`. The
+    // loop variable is scoped to the loop (env is returned unchanged), matching
+    // Go's own scoping.
+    ast.SFor(init, cond, post, body) -> {
+      let #(init_str, loop_env) = case init {
+        Some(s) -> gen_for_clause(env, s)
+        None -> #("", env)
+      }
+      let cond_str = case cond {
+        Some(e) -> {
+          let #(c, _) = gen_condition(loop_env, e)
+          c
+        }
+        None -> ""
+      }
+      let #(post_str, _) = case post {
+        Some(s) -> gen_for_clause(loop_env, s)
+        None -> #("", loop_env)
+      }
+      let loop_var = case init {
+        Some(ast.SVarDecl(name, _, _)) | Some(ast.STypedDecl(_, name, _, _)) ->
+          Some(name)
+        _ -> None
+      }
+      // Go rejects a loop variable that is never read; guard the rare case
+      // where it appears in none of the condition, post clause or body.
+      let body_guard = case loop_var {
+        Some(name) ->
+          case
+            uses_in_opt(cond, name)
+            || uses_in_opt_stmt(post, name)
+            || uses_in_stmts(body, name)
+          {
+            True -> ""
+            False -> tabs(indent + 1) <> "_ = " <> name <> "\n"
+          }
+        None -> ""
+      }
+      let code =
+        pad
+        <> "for "
+        <> init_str
+        <> "; "
+        <> cond_str
+        <> "; "
+        <> post_str
+        <> " {\n"
+        <> body_guard
+        <> gen_stmts(loop_env, body, indent + 1)
+        <> pad
+        <> "}\n"
+      #(code, env)
+    }
+    // A for-each iterates a vector with Go's `range`, binding the value (the
+    // index is discarded).
+    ast.SForEach(name, elem_type, iterable, body) -> {
+      // The element type comes from an explicit `name: T` annotation when one
+      // is given, otherwise it is inferred from the vector being iterated.
+      let elem_ty = case elem_type {
+        Some(t) -> ty_of_type_expr(env.types, t)
+        None -> elem_ty_of(infer(env, iterable))
+      }
+      let loop_env = Env(..env, locals: dict.insert(env.locals, name, elem_ty))
+      let body_guard = case uses_in_stmts(body, name) {
+        True -> ""
+        False -> tabs(indent + 1) <> "_ = " <> name <> "\n"
+      }
+      let code =
+        pad
+        <> "for _, "
+        <> name
+        <> " := range "
+        <> gen_expr(env, iterable)
+        <> " {\n"
+        <> body_guard
+        <> gen_stmts(loop_env, body, indent + 1)
+        <> pad
+        <> "}\n"
+      #(code, env)
+    }
+  }
+}
+
+// Generates the inline Go for a for-loop's init or post clause (no leading
+// indentation, no trailing newline — it sits inside the `for ( ; ; )` header)
+// and threads any variable it declares into the returned environment.
+fn gen_for_clause(env: Env, stmt: ast.Stmt) -> #(String, Env) {
+  case stmt {
+    ast.SVarDecl(name, value, _) -> {
+      let ty = infer(env, value)
+      #(
+        name <> " := " <> gen_expr(env, value),
+        Env(..env, locals: dict.insert(env.locals, name, ty)),
+      )
+    }
+    ast.STypedDecl(typ, name, value, _) -> {
+      let ty = ty_of_type_expr(env.types, typ)
+      #(
+        name <> " := " <> coerce(env, value, ty),
+        Env(..env, locals: dict.insert(env.locals, name, ty)),
+      )
+    }
+    ast.SAssign(target, value) -> {
+      let ty = infer(env, target)
+      #(gen_expr(env, target) <> " = " <> coerce(env, value, ty), env)
+    }
+    // `append(v, x)` advances a mutable vector, reassigning the result back.
+    ast.SExpr(ast.ECall(ast.EIdent("append"), args)) -> {
+      let target = case args {
+        [ast.Arg(_, t), ..] -> gen_expr(env, t)
+        [] -> "_"
+      }
+      #(target <> " = " <> gen_append(env, args), env)
+    }
+    ast.SExpr(e) -> #(gen_expr(env, e), env)
+    // Other statement shapes aren't valid init/post clauses; emit nothing.
+    _ -> #("", env)
+  }
+}
+
+// `uses_in_stmt` lifted over an optional statement (for a for loop's post
+// clause).
+fn uses_in_opt_stmt(o: Option(ast.Stmt), name: String) -> Bool {
+  case o {
+    Some(s) -> uses_in_stmt(s, name)
+    None -> False
+  }
+}
+
+// The element type produced by iterating a value of the given type: a vector
+// yields its element type, and a Table (a `Str[dyn][dyn]`) yields a row.
+fn elem_ty_of(ty: Ty) -> Ty {
+  case ty {
+    TyVec(t) -> t
+    TyTable -> TyVec(TyStr)
+    _ -> TyUnknown
   }
 }
 
@@ -1401,6 +1568,15 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
                   case fname {
                     "connect" | "pool" ->
                       TyResult(TyBuiltin("SqlConnection"), TyBuiltin("SqlError"))
+                    _ -> TyUnknown
+                  }
+                "conv" ->
+                  case fname {
+                    "ceil" | "floor" | "round" -> TyInt
+                    "itf" -> TyFloat
+                    "its" | "fts" -> TyStr
+                    "sti" -> TyResult(TyInt, TyBuiltin("ConversionError"))
+                    "stf" -> TyResult(TyFloat, TyBuiltin("ConversionError"))
                     _ -> TyUnknown
                   }
                 _ -> TyUnknown
@@ -1766,6 +1942,7 @@ fn gen_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
             "json" -> gen_json_call(env, fname, args)
             "crypto" -> gen_crypto_call(env, fname, args)
             "sql" -> gen_sql_call(env, fname, args)
+            "conv" -> gen_conv_call(env, fname, args)
             _ -> gen_plain_call(env, callee, args)
           }
       }
@@ -1934,6 +2111,44 @@ fn gen_sql_driver(env: Env, variant: String, args: List(ast.Arg)) -> String {
     "Other" ->
       "hive.DatabaseDriver{Name: " <> gen_one(env, args, "name") <> "}"
     _ -> "hive.DatabaseDriver{Name: \"\"}"
+  }
+}
+
+// The `hive.conv` namespace: numeric rounding (ceil/floor/round), widening
+// (itf), rendering (its/fts) and fallible parsing (sti/stf). Each takes a
+// single argument, coerced to the type its Go helper expects.
+fn gen_conv_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
+  case fname {
+    "ceil" -> "hive.Ceil(" <> gen_one_coerced(env, args, "value", TyFloat) <> ")"
+    "floor" ->
+      "hive.Floor(" <> gen_one_coerced(env, args, "value", TyFloat) <> ")"
+    "round" ->
+      "hive.Round(" <> gen_one_coerced(env, args, "value", TyFloat) <> ")"
+    "itf" ->
+      "hive.IntToFloat(" <> gen_one_coerced(env, args, "value", TyInt) <> ")"
+    "its" ->
+      "hive.IntToStr(" <> gen_one_coerced(env, args, "value", TyInt) <> ")"
+    "fts" ->
+      "hive.FloatToStr(" <> gen_one_coerced(env, args, "value", TyFloat) <> ")"
+    "sti" ->
+      "hive.StrToInt(" <> gen_one_coerced(env, args, "value", TyStr) <> ")"
+    "stf" ->
+      "hive.StrToFloat(" <> gen_one_coerced(env, args, "value", TyStr) <> ")"
+    _ -> "hive." <> exported(fname) <> "(" <> gen_args(env, args) <> ")"
+  }
+}
+
+// A single argument coerced to the given type, honouring the named-argument
+// form.
+fn gen_one_coerced(
+  env: Env,
+  args: List(ast.Arg),
+  name: String,
+  ty: Ty,
+) -> String {
+  case assign_args(args, [name]) {
+    #([#(_, arg)], []) -> coerce(env, arg, ty)
+    _ -> gen_args(env, args)
   }
 }
 
@@ -2238,6 +2453,13 @@ fn uses_in_stmt(s: ast.Stmt, name: String) -> Bool {
       }
       in_branches || in_else
     }
+    ast.SFor(init, cond, post, body) ->
+      uses_in_opt_stmt(init, name)
+      || uses_in_opt(cond, name)
+      || uses_in_opt_stmt(post, name)
+      || uses_in_stmts(body, name)
+    ast.SForEach(_, _, iterable, body) ->
+      uses_in_expr(iterable, name) || uses_in_stmts(body, name)
   }
 }
 

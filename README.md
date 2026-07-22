@@ -179,6 +179,15 @@ language's specification: each one compiles, builds and runs.
   variant. `is` narrows a value to a variant and can bind its fields, and the
   bindings are usable immediately in the same condition:
   `if x is T.A(v) && v == "ok" { ... }`.
+* **Loops** come in two shapes. The C-style counting loop
+  `for <init>; <cond>; <post> { ... }` runs `init` once, then repeats the body
+  while `cond` holds, running `post` after each pass — its counter is scoped to
+  the loop and implicitly mutable, so `for i := 0; i < 10; i = i + 1 { ... }`
+  needs no `mut`. Any of the three clauses may be omitted
+  (`for ; cond; { ... }` is a while loop). The iterating form
+  `for each name in values { ... }` walks a vector, binding each element to an
+  immutable `name` whose type is inferred from the vector; an optional
+  annotation (`for each name: T in values`) overrides that inference.
 * **`assert cond`** panics at runtime when the condition is false.
 * **Named arguments** — funcs, procs, queries and type constructors (builtin
   ones included) accept arguments by name: `f(b: 1, "s")`. Named arguments
@@ -218,7 +227,7 @@ too short to reach the matched column.
 
 Each module owns its types under its own namespace — `hive.http.HttpRequest`,
 `hive.json.JsonError`, `hive.crypto.CryptoError`, `hive.sql.DatabaseDriver`,
-and so on. The only builtin types that live directly on `hive` are the core
+`hive.conv.ConversionError`, and so on. The only builtin types that live directly on `hive` are the core
 ones the language uses without a module: `Result`, `Table` and the
 `hive.TableError` that `using` yields from a CSV.
 
@@ -311,6 +320,22 @@ Postgres is `github.com/lib/pq`.
 > required once, then cached). Programs that don't use `hive.sql` keep a
 > dependency-free `go.mod` and build fully offline, exactly as before.
 
+### `hive.conv`
+
+Number and string conversions. Everything here is pure, so it works inside both
+`func`s and `proc`s.
+
+* **Rounding** (`Float -> Int`) — `hive.conv.ceil(value)`,
+  `hive.conv.floor(value)` and `hive.conv.round(value)` (round half away from
+  zero).
+* **Widening / rendering** — `hive.conv.itf(value)` widens an `Int` to a
+  `Float`; `hive.conv.its(value)` renders an `Int` as a `Str`, and
+  `hive.conv.fts(value)` a `Float` as a `Str`.
+* **Parsing** — `hive.conv.sti(text)` parses a `Str` into
+  `Result<Int, hive.conv.ConversionError>` and `hive.conv.stf(text)` into
+  `Result<Float, hive.conv.ConversionError>`. A `ConversionError` carries the
+  offending `input` and a short `message`.
+
 ## How Hive maps onto Go
 
 | Hive                                    | Go                                                             |
@@ -325,6 +350,8 @@ Postgres is `github.com/lib/pq`.
 | `T name = expr`                         | `var name T = expr`                                            |
 | `mut name := expr` / `mut T name = e`   | same as above (`mut` is compile-time only — permits reassign)  |
 | `x = expr` / `v[0] = expr`              | `x = expr` / `v[0] = expr` (only on `mut` variables)           |
+| `for i := 0; i < n; i = i + 1 { }`      | `for i := 0; i < n; i = i + 1 { }` (counter scoped to the loop) |
+| `for each x in v { }`                   | `for _, x := range v { }` (binds the value, discards the index) |
 | `async func f(): T { ... }`             | `func f() T { ... }` (an ordinary Go function)                 |
 | `f(x)` bare / `await f(x)` (async `f`)  | `go f(x)` (fire-and-forget goroutine) / `f(x)` (blocking call) |
 | `echo v`                                | `fmt.Println(v)` (stringifies any value, appends a newline)    |
@@ -359,6 +386,9 @@ Postgres is `github.com/lib/pq`.
 | `hive.sql.connect(d, s)` / `.pool(d, s, o, i)` | `hive.SqlConnect(d, s)` / `hive.SqlPool(d, s, o, i)`     |
 | `hive.sql.close(c)`                     | `hive.SqlClose(c)`                                             |
 | `hive.sql.DatabaseDriver.SQLite()`      | `hive.DatabaseDriver{Name: "sqlite"}` (also PostgreSQL/Other)  |
+| `hive.conv.ceil/floor/round(f)`         | `hive.Ceil/Floor/Round(f)` → `Int`                            |
+| `hive.conv.itf(i)` / `its(i)` / `fts(f)` | `hive.IntToFloat(i)` / `hive.IntToStr(i)` / `hive.FloatToStr(f)` |
+| `hive.conv.sti(s)` / `stf(s)`           | `hive.StrToInt(s)` / `hive.StrToFloat(s)` → `Result[_, ConversionError]` |
 | `hive.http.HttpRequest(m, u, h, b)`     | `hive.HttpRequest{Method: m, Url: u, Headers: h, Body: b}`     |
 | `request.body` (builtin struct field)   | `request.Body` (fields capitalize to their exported Go names)  |
 | `t[1:]`                                 | `t[1:]` (slices are **inclusive** of the high bound)           |

@@ -52,6 +52,9 @@ pub type Kind {
   KwMut
   KwAsync
   KwAwait
+  KwFor
+  KwIn
+  KwEach
 
   // Punctuation
   LBrace
@@ -116,6 +119,9 @@ pub fn describe(kind: Kind) -> String {
     KwMut -> "`mut`"
     KwAsync -> "`async`"
     KwAwait -> "`await`"
+    KwFor -> "`for`"
+    KwIn -> "`in`"
+    KwEach -> "`each`"
     LBrace -> "`{`"
     RBrace -> "`}`"
     LParen -> "`(`"

@@ -815,6 +815,182 @@ pub fn unknown_sql_builtin_is_rejected_test() {
 }
 
 // ---------------------------------------------------------------------------
+// For loops
+// ---------------------------------------------------------------------------
+
+pub fn c_style_for_lowers_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tmut sum := 0\n\tfor i := 0; i < 3; i = i + 1 {\n\t\tsum = sum + i\n\t}\n\techo sum\n}\n",
+    )
+  // The three clauses map straight onto Go's `for init; cond; post`.
+  should.be_true(string.contains(go, "for i := 0; (i < 3); i = (i + 1) {"))
+  should.be_true(string.contains(go, "sum = (sum + i)"))
+}
+
+pub fn c_style_for_counter_is_implicitly_mutable_test() {
+  // The loop variable declared in `init` may be advanced by `post` (a
+  // reassignment) with no `mut` keyword — it is mutable by construction.
+  let result =
+    compiler.compile(
+      "proc main(): void {\n\tfor i := 0; i < 3; i = i + 1 {\n\t\techo i\n\t}\n}\n",
+    )
+  should.be_ok(result)
+}
+
+pub fn c_style_for_typed_init_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tfor Int i = 0; i < 2; i = i + 1 {\n\t\techo i\n\t}\n}\n",
+    )
+  // A typed init clause still lowers to a short var decl (Go infers the type).
+  should.be_true(string.contains(go, "for i := 0; (i < 2); i = (i + 1) {"))
+}
+
+pub fn c_style_for_allows_empty_clauses_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tmut i := 0\n\tfor ; i < 3; {\n\t\ti = i + 1\n\t}\n\techo i\n}\n",
+    )
+  // Absent init and post leave their slots empty, like a Go while-style for.
+  should.be_true(string.contains(go, "for ; (i < 3);  {"))
+}
+
+pub fn for_each_lowers_to_range_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tnames := [\"a\", \"b\"]\n\tfor each name in names {\n\t\techo name\n\t}\n}\n",
+    )
+  // Iterating a vector discards the index and binds the value.
+  should.be_true(string.contains(go, "for _, name := range names {"))
+  should.be_true(string.contains(go, "fmt.Println(name)"))
+}
+
+pub fn for_each_infers_binding_type_from_vector_test() {
+  // With no annotation the element type is inferred from the vector, so member
+  // access on a struct element still capitalizes to the exported Go field.
+  let go =
+    compile(
+      "type User {\n\tname: Str\n}\nproc main(): void {\n\tusers := [User(\"a\"), User(\"b\")]\n\tfor each u in users {\n\t\techo u.name\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "for _, u := range"))
+  should.be_true(string.contains(go, "fmt.Println(u.Name)"))
+}
+
+pub fn for_each_optional_annotation_still_works_test() {
+  // An explicit `name: T` annotation remains valid and overrides inference.
+  let go =
+    compile(
+      "proc main(): void {\n\tnames := [\"a\", \"b\"]\n\tfor each name: Str in names {\n\t\techo name\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "for _, name := range names {"))
+}
+
+pub fn for_each_unused_binding_gets_guard_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tmut c := 0\n\tfor each x in [1, 2, 3] {\n\t\tc = c + 1\n\t}\n\techo c\n}\n",
+    )
+  // Go rejects an unused range binding, so an unread element gets `_ = x`.
+  should.be_true(string.contains(go, "_ = x"))
+}
+
+pub fn for_each_binding_is_immutable_test() {
+  // The iteration variable is a fresh immutable binding, so reassigning it is
+  // a compile error.
+  let result =
+    compiler.compile(
+      "proc main(): void {\n\tfor each x in [1, 2] {\n\t\tx = 5\n\t}\n}\n",
+    )
+  should.be_error(result)
+}
+
+pub fn for_loop_variable_does_not_leak_test() {
+  // The counter is scoped to the loop, so a later declaration may reuse the
+  // name without clashing.
+  let result =
+    compiler.compile(
+      "proc main(): void {\n\tfor i := 0; i < 2; i = i + 1 {\n\t\techo i\n\t}\n\ti := 99\n\techo i\n}\n",
+    )
+  should.be_ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// The hive.conv standard library
+// ---------------------------------------------------------------------------
+
+pub fn conv_rounding_lowers_test() {
+  let go =
+    compile(
+      "func f(): Int {\n\treturn hive.conv.ceil(3.2)\n}\nproc main(): void {\n\techo hive.conv.floor(3.8)\n\techo hive.conv.round(2.5)\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.Ceil(3.2)"))
+  should.be_true(string.contains(go, "hive.Floor(3.8)"))
+  should.be_true(string.contains(go, "hive.Round(2.5)"))
+}
+
+pub fn conv_value_and_string_conversions_lower_test() {
+  let go =
+    compile(
+      "func f(): Str {\n\tx := hive.conv.itf(7)\n\ta := hive.conv.its(42)\n\treturn a + hive.conv.fts(3.14)\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "hive.IntToFloat(7)"))
+  should.be_true(string.contains(go, "hive.IntToStr(42)"))
+  should.be_true(string.contains(go, "hive.FloatToStr(3.14)"))
+}
+
+pub fn conv_parse_returns_result_test() {
+  let go =
+    compile(
+      "func f(s: Str): Int {\n\tparsed := hive.conv.sti(s)\n\tif parsed is Result.Ok(n) {\n\t\treturn n\n\t} else if parsed is Result.Error(e) {\n\t\techo e.message\n\t\techo e.input\n\t}\n\treturn 0\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "hive.StrToInt(s)"))
+  should.be_true(string.contains(go, "parsed.IsOk()"))
+  // The Ok payload is an Int (so `return n` is a plain int return), and the
+  // ConversionError fields capitalize to their exported Go names.
+  should.be_true(string.contains(go, "n := parsed.Ok()"))
+  should.be_true(string.contains(go, "e.Message"))
+  should.be_true(string.contains(go, "e.Input"))
+}
+
+pub fn conv_stf_parses_float_test() {
+  let go =
+    compile(
+      "func f(s: Str): Float {\n\tparsed := hive.conv.stf(s)\n\tif parsed is Result.Ok(x) {\n\t\treturn x\n\t}\n\treturn 0.0\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "hive.StrToFloat(s)"))
+}
+
+pub fn conv_is_pure_test() {
+  // hive.conv is pure, so it is allowed inside a func.
+  let result =
+    compiler.compile(
+      "func f(): Str {\n\treturn hive.conv.its(5)\n}\nproc main(): void {}\n",
+    )
+  should.be_ok(result)
+}
+
+pub fn conv_named_argument_test() {
+  let go =
+    compile(
+      "func f(): Str {\n\treturn hive.conv.its(value: 5)\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "hive.IntToStr(5)"))
+}
+
+pub fn unknown_conv_builtin_is_rejected_test() {
+  let result =
+    compiler.compile("proc main(): void {\n\techo hive.conv.dtoi(3.0)\n}\n")
+  should.be_error(result)
+}
+
+pub fn conv_wrong_arity_is_rejected_test() {
+  let result =
+    compiler.compile("proc main(): void {\n\techo hive.conv.ceil(1.0, 2.0)\n}\n")
+  should.be_error(result)
+}
+
+// ---------------------------------------------------------------------------
 // The shipped code examples must always compile
 // ---------------------------------------------------------------------------
 

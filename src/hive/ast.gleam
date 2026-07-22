@@ -79,6 +79,24 @@ pub type Stmt {
   SAssign(target: Expr, value: Expr)
   /// `if ... { } else if ... { } else { }`
   SIf(branches: List(Branch), else_body: Option(List(Stmt)))
+  /// `for <init>; <cond>; <post> { }` — a C-style counting loop. Any of the
+  /// three clauses may be absent. The variable declared in `init` is scoped to
+  /// the loop and is implicitly mutable, so `post` may advance it.
+  SFor(
+    init: Option(Stmt),
+    cond: Option(Expr),
+    post: Option(Stmt),
+    body: List(Stmt),
+  )
+  /// `for each name in iterable { }` — iterate a vector, binding each element
+  /// to `name` for the duration of the body. The element type is inferred from
+  /// the vector; an optional `name: T` annotation overrides that inference.
+  SForEach(
+    name: String,
+    elem_type: Option(TypeExpr),
+    iterable: Expr,
+    body: List(Stmt),
+  )
   /// `return` or `return value`
   SReturn(value: Option(Expr))
   /// `echo value` — print any value followed by a newline.

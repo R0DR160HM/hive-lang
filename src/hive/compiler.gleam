@@ -186,6 +186,36 @@ fn check_stmt(
       })
       Ok(muts)
     }
+    ast.SFor(init, cond, post, body) -> {
+      // The init clause introduces the loop variable, whose mutability is
+      // visible to the condition, the post clause and the body — all scoped to
+      // the loop, so the outer `muts` is returned unchanged afterwards.
+      use inner <- result.try(case init {
+        Some(s) -> check_stmt(ctx, s, muts)
+        None -> Ok(muts)
+      })
+      use _ <- result.try(case cond {
+        Some(e) -> check_expr(ctx, e)
+        None -> Ok(Nil)
+      })
+      use _ <- result.try(case post {
+        Some(s) -> check_stmt(ctx, s, inner) |> result.map(fn(_) { Nil })
+        None -> Ok(Nil)
+      })
+      use _ <- result.try(
+        check_stmts(ctx, body, inner) |> result.map(fn(_) { Nil }),
+      )
+      Ok(muts)
+    }
+    ast.SForEach(name, _, iterable, body) -> {
+      use _ <- result.try(check_expr(ctx, iterable))
+      // The iteration variable is a fresh, immutable binding in the body.
+      let inner = dict.insert(muts, name, False)
+      use _ <- result.try(
+        check_stmts(ctx, body, inner) |> result.map(fn(_) { Nil }),
+      )
+      Ok(muts)
+    }
   }
 }
 
@@ -354,11 +384,15 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
               use _ <- result.try(check_sql_call(fname, args))
               check_args(ctx, args)
             }
+            "conv" -> {
+              use _ <- result.try(check_conv_call(fname, args))
+              check_args(ctx, args)
+            }
             _ ->
               Error(
                 "unknown builtin namespace `hive."
                 <> ns
-                <> "` (available: http, json, crypto, sql)",
+                <> "` (available: http, json, crypto, sql, conv)",
               )
           }
       }
@@ -673,6 +707,29 @@ fn check_sql_driver(
         "unknown `hive.sql.DatabaseDriver."
         <> variant
         <> "` (variants: SQLite, PostgreSQL, Other)",
+      )
+  }
+}
+
+// ---------------------------------------------------------------------------
+// hive.conv builtins
+// ---------------------------------------------------------------------------
+
+fn check_conv_call(fname: String, args: List(ast.Arg)) -> Result(Nil, String) {
+  case fname {
+    "ceil" -> check_arity("`hive.conv.ceil`", args, ["value"])
+    "floor" -> check_arity("`hive.conv.floor`", args, ["value"])
+    "round" -> check_arity("`hive.conv.round`", args, ["value"])
+    "itf" -> check_arity("`hive.conv.itf`", args, ["value"])
+    "its" -> check_arity("`hive.conv.its`", args, ["value"])
+    "fts" -> check_arity("`hive.conv.fts`", args, ["value"])
+    "sti" -> check_arity("`hive.conv.sti`", args, ["value"])
+    "stf" -> check_arity("`hive.conv.stf`", args, ["value"])
+    _ ->
+      Error(
+        "unknown builtin `hive.conv."
+        <> fname
+        <> "` (available: ceil, floor, round, itf, its, fts, sti, stf)",
       )
   }
 }

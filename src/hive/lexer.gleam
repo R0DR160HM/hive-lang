@@ -373,6 +373,9 @@ fn keyword_or_ident(word: String) -> token.Kind {
     "mut" -> token.KwMut
     "async" -> token.KwAsync
     "await" -> token.KwAwait
+    "for" -> token.KwFor
+    "in" -> token.KwIn
+    "each" -> token.KwEach
     _ -> token.Ident(word)
   }
 }

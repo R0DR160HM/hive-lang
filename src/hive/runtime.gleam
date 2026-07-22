@@ -258,6 +258,53 @@ func Now() int {
 	return int(time.Now().Unix())
 }
 
+// ---------------------------------------------------------------------------
+// Conversions (hive.conv): numeric rounding plus value/string conversions.
+// ---------------------------------------------------------------------------
+
+// ConversionError describes a Str that could not be parsed into a number.
+type ConversionError struct {
+	Input   string
+	Message string
+}
+
+func (e ConversionError) Error() string {
+	return \"hive: conversion error for \" + strconv.Quote(e.Input) + \": \" + e.Message
+}
+
+// Ceil, Floor and Round convert a Float to the Int nearest it in the named
+// direction (Round rounds halves away from zero).
+func Ceil(x float64) int  { return int(math.Ceil(x)) }
+func Floor(x float64) int { return int(math.Floor(x)) }
+func Round(x float64) int { return int(math.Round(x)) }
+
+// IntToFloat widens an Int to a Float.
+func IntToFloat(x int) float64 { return float64(x) }
+
+// IntToStr renders an Int in base 10.
+func IntToStr(x int) string { return strconv.Itoa(x) }
+
+// FloatToStr renders a Float in its shortest round-trippable form.
+func FloatToStr(x float64) string { return strconv.FormatFloat(x, 'g', -1, 64) }
+
+// StrToInt parses a base-10 Int, or reports a ConversionError.
+func StrToInt(s string) Result[int, ConversionError] {
+	i, err := strconv.Atoi(s)
+	if err != nil {
+		return Err[int, ConversionError](ConversionError{Input: s, Message: \"not a valid integer\"})
+	}
+	return Ok[int, ConversionError](i)
+}
+
+// StrToFloat parses a Float, or reports a ConversionError.
+func StrToFloat(s string) Result[float64, ConversionError] {
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return Err[float64, ConversionError](ConversionError{Input: s, Message: \"not a valid number\"})
+	}
+	return Ok[float64, ConversionError](f)
+}
+
 // JsonError describes why a JSON document didn't match the expected type:
 // the exact path that failed, what the type expected there, and what the
 // document actually held.

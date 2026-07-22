@@ -415,6 +415,7 @@ fn parse_stmt(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
   case kind(tokens) {
     token.KwReturn -> parse_return(tokens)
     token.KwIf -> parse_if(tokens)
+    token.KwFor -> parse_for(tokens)
     token.KwEcho -> parse_echo(tokens)
     token.KwAssert -> parse_assert(tokens)
     token.KwMut -> parse_mut(tail(tokens))
@@ -536,6 +537,78 @@ fn parse_if_rest(
       }
     _ -> Ok(#(ast.SIf(list.reverse(branches), None), tokens))
   }
+}
+
+// A `for` loop, in one of two shapes: the C-style
+// `for <init>; <cond>; <post> { }` or the iterating
+// `for each name: T in iterable { }`.
+fn parse_for(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
+  let t0 = tail(tokens)
+  case kind(t0) {
+    token.KwEach -> parse_for_each(tail(t0))
+    _ -> parse_for_c(t0)
+  }
+}
+
+// `for each name in iterable { body }`. The element type is inferred from the
+// vector; an optional `name: T` annotation overrides that inference.
+fn parse_for_each(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
+  use #(name, t1) <- result.try(expect_ident(tokens))
+  use #(elem_type, t2) <- result.try(case kind(t1) {
+    token.Colon -> {
+      use #(typ, t) <- result.try(parse_type_expr(tail(t1)))
+      Ok(#(Some(typ), t))
+    }
+    _ -> Ok(#(None, t1))
+  })
+  use t3 <- result.try(expect(t2, token.KwIn))
+  use #(iterable, t4) <- result.try(parse_expr(t3))
+  use #(body, t5) <- result.try(parse_block(t4))
+  Ok(#(ast.SForEach(name, elem_type, iterable, body), t5))
+}
+
+// `for <init>; <cond>; <post> { body }`. Each of the three clauses is
+// optional (an empty init/post is just absent, an empty condition loops until
+// something else stops it), matching the standard C-style shape.
+fn parse_for_c(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
+  use #(init, t1) <- result.try(case kind(tokens) {
+    token.Semicolon -> Ok(#(None, tokens))
+    _ -> {
+      use #(s, t) <- result.try(parse_for_init(tokens))
+      Ok(#(Some(s), t))
+    }
+  })
+  use t2 <- result.try(expect(t1, token.Semicolon))
+  use #(cond, t3) <- result.try(case kind(t2) {
+    token.Semicolon -> Ok(#(None, t2))
+    _ -> {
+      use #(e, t) <- result.try(parse_expr(t2))
+      Ok(#(Some(e), t))
+    }
+  })
+  use t4 <- result.try(expect(t3, token.Semicolon))
+  use #(post, t5) <- result.try(case kind(t4) {
+    token.LBrace -> Ok(#(None, t4))
+    _ -> {
+      use #(s, t) <- result.try(parse_stmt(t4))
+      Ok(#(Some(s), t))
+    }
+  })
+  use #(body, t6) <- result.try(parse_block(t5))
+  Ok(#(ast.SFor(init, cond, post, body), t6))
+}
+
+// The init clause is an ordinary statement, but a variable it declares is
+// forced mutable: the loop's post clause advances it (`i = i + 1`), which the
+// mutability check would otherwise reject.
+fn parse_for_init(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
+  use #(stmt, rest) <- result.try(parse_stmt(tokens))
+  let stmt = case stmt {
+    ast.SVarDecl(name, value, _) -> ast.SVarDecl(name, value, True)
+    ast.STypedDecl(typ, name, value, _) -> ast.STypedDecl(typ, name, value, True)
+    _ -> stmt
+  }
+  Ok(#(stmt, rest))
 }
 
 // ---------------------------------------------------------------------------
