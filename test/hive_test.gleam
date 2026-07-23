@@ -1408,12 +1408,16 @@ pub fn vector_vs_vector_still_uses_runtime_equality_test() {
 // ---------------------------------------------------------------------------
 
 pub fn immutable_vector_binding_is_cloned_test() {
-  // `ys` is immutable, so it gets an independent copy of `xs`.
+  // `ys` is immutable and `xs` is mutated afterwards, so `ys` must be an
+  // independent snapshot. The copy is type-directed (no reflection): a flat
+  // Int vector clones with hive.CloneVec.
   let go =
     compile(
       "proc main(): void {\n\tmut xs := [1, 2, 3]\n\tys := xs\n\txs[0] = 9\n\techo ys[0]\n}\n",
     )
-  should.be_true(string.contains(go, "ys := hive.Clone(xs)"))
+  should.be_true(string.contains(go, "ys := hive.CloneVec(xs)"))
+  // The reflective runtime Clone is gone.
+  should.be_false(string.contains(go, "hive.Clone("))
 }
 
 pub fn both_mutable_vector_binding_is_shared_test() {
@@ -1431,6 +1435,127 @@ pub fn fresh_vector_binding_is_not_cloned_test() {
   let go =
     compile("proc main(): void {\n\tys := [1, 2, 3]\n\techo ys[0]\n}\n")
   should.be_false(string.contains(go, "Clone"))
+}
+
+pub fn both_immutable_vector_binding_is_aliased_test() {
+  // Neither end can ever mutate the shared storage, so no copy is needed even
+  // though `ys` binds an existing vector.
+  let go =
+    compile(
+      "proc main(): void {\n\txs := [1, 2, 3]\n\tys := xs\n\techo xs[0]\n\techo ys[0]\n}\n",
+    )
+  should.be_true(string.contains(go, "ys := xs"))
+  should.be_false(string.contains(go, "Clone"))
+}
+
+pub fn unmutated_mutable_target_is_not_cloned_test() {
+  // (B) `ys` is `mut` but never written through, so it stays a cheap alias of
+  // the immutable `xs` — the shared storage is never mutated.
+  let go =
+    compile(
+      "proc main(): void {\n\txs := [1, 2, 3]\n\tmut ys := xs\n\techo ys[0]\n}\n",
+    )
+  should.be_true(string.contains(go, "ys := xs"))
+  should.be_false(string.contains(go, "Clone"))
+}
+
+pub fn mutated_mutable_target_is_cloned_test() {
+  // (B) The moment `ys` is written through, it must own its storage.
+  let go =
+    compile(
+      "proc main(): void {\n\txs := [1, 2, 3]\n\tmut ys := xs\n\tys[0] = 9\n\techo xs[0]\n}\n",
+    )
+  should.be_true(string.contains(go, "ys := hive.CloneVec(xs)"))
+}
+
+pub fn mutable_target_aliased_onward_is_cloned_test() {
+  // (B) `ys` is never written through directly, but it is handed to another
+  // mutable binding that could be — so it is not inert and must be copied.
+  let go =
+    compile(
+      "proc main(): void {\n\txs := [1, 2, 3]\n\tmut ys := xs\n\tmut zs := ys\n\tzs[0] = 9\n\techo xs[0]\n}\n",
+    )
+  should.be_true(string.contains(go, "ys := hive.CloneVec(xs)"))
+}
+
+pub fn dead_mutable_source_is_moved_test() {
+  // (C) `xs` is mutable but never mutated again after `ys` binds it, so the
+  // immutable `ys` may take it over (a move) instead of copying.
+  let go =
+    compile(
+      "proc main(): void {\n\tmut xs := [1, 2, 3]\n\txs[0] = 5\n\tys := xs\n\techo ys[0]\n}\n",
+    )
+  should.be_true(string.contains(go, "ys := xs"))
+  should.be_false(string.contains(go, "Clone"))
+}
+
+pub fn live_mutable_source_is_cloned_test() {
+  // (C) When the mutable source keeps being mutated after the binding, the
+  // immutable snapshot must be copied.
+  let go =
+    compile(
+      "proc main(): void {\n\tmut xs := [1, 2, 3]\n\tys := xs\n\txs[0] = 5\n\techo ys[0]\n}\n",
+    )
+  should.be_true(string.contains(go, "ys := hive.CloneVec(xs)"))
+}
+
+pub fn table_binding_uses_type_directed_clone_test() {
+  // A Table copies through the dedicated deep helper, not reflection.
+  let go =
+    compile(
+      "proc main(): void {\n\tmut t := [[\"a\"], [\"b\"]]\n\tsnap := t\n\tt[0] = [\"z\"]\n\techo snap\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.CloneVecFn("))
+  should.be_false(string.contains(go, "hive.Clone("))
+}
+
+pub fn struct_with_vector_field_deep_clones_test() {
+  // A struct holding a vector gets a generated clone_T that recurses into the
+  // vector field, so mutating the copy cannot leak into the original.
+  // `b` is a mutable copy of the immutable `a` and is handed to another
+  // mutable binding, so it must own its storage — including the vector field.
+  let go =
+    compile(
+      "type Bag {\n\titems: Int[3]\n}\nproc main(): void {\n\ta := Bag(items: [1, 2, 3])\n\tmut b := a\n\tmut c := b\n\techo c.items\n}\n",
+    )
+  // The binding delegates to the generated deep-clone function.
+  should.be_true(string.contains(go, "b := clone_Bag(a)"))
+  // Which itself re-copies the vector field.
+  should.be_true(string.contains(go, "func clone_Bag(x Bag) Bag"))
+  should.be_true(string.contains(go, "x.Items = hive.CloneVec(x.Items)"))
+}
+
+pub fn source_laundered_through_call_is_cloned_test() {
+  // A move would be unsound: `row` binds a slice returned from a call on `xs`,
+  // which may share xs's backing array, and then writes through it. Because
+  // `xs` escapes into that call, the immutable `ys` must be an independent copy
+  // rather than a cheap alias.
+  let go =
+    compile(
+      "func firstOf(v: Int[dyn]): Int[dyn] {\n\treturn v\n}\nproc main(): void {\n\tmut xs := [1, 2, 3]\n\tys := xs\n\tmut row := firstOf(xs)\n\tif 0 < len(row) {\n\t\trow[0] = 9\n\t}\n\techo ys\n}\n",
+    )
+  should.be_true(string.contains(go, "ys := hive.CloneVec(xs)"))
+}
+
+pub fn target_laundered_through_call_is_cloned_test() {
+  // The both-immutable alias is likewise withheld when the target escapes into
+  // a call whose result is mutated — the shared storage would no longer be a
+  // stable snapshot.
+  let go =
+    compile(
+      "func firstOf(v: Int[dyn]): Int[dyn] {\n\treturn v\n}\nproc main(): void {\n\txs := [1, 2, 3]\n\tys := xs\n\tmut row := firstOf(ys)\n\tif 0 < len(row) {\n\t\trow[0] = 9\n\t}\n\techo xs\n}\n",
+    )
+  should.be_true(string.contains(go, "ys := hive.CloneVec(xs)"))
+}
+
+pub fn struct_without_vector_field_needs_no_clone_test() {
+  // A scalar-only struct is fully isolated by Go's own value copy — no helper.
+  let go =
+    compile(
+      "type Point {\n\tx: Int\n\ty: Int\n}\nproc main(): void {\n\ta := Point(x: 1, y: 2)\n\tmut b := a\n\tb.x = 9\n\techo a.x\n}\n",
+    )
+  should.be_false(string.contains(go, "clone_Point"))
+  should.be_true(string.contains(go, "b := a"))
 }
 
 // ---------------------------------------------------------------------------

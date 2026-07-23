@@ -152,6 +152,12 @@ type Env {
     /// (either side immutable). Names absent here are treated as immutable —
     /// which is correct for params, `for each` bindings and `is`-bindings.
     muts: Dict(String, Bool),
+    /// Locals whose storage is shared with another *mutable* binding (created
+    /// by a `mut b = a` where both ends are mutable). Such a variable has a
+    /// live mutable alias, so it is not eligible to be *moved* into an
+    /// immutable binding (see `aliased_source` / `bind_rhs`): something else
+    /// may still mutate it.
+    aliased: Dict(String, Bool),
   )
 }
 
@@ -171,7 +177,17 @@ pub fn generate(module: ast.Module) -> String {
       }
     })
   let env =
-    Env(types, sigs, dict.new(), dict.new(), TyUnknown, atoms, asyncs, dict.new())
+    Env(
+      types,
+      sigs,
+      dict.new(),
+      dict.new(),
+      TyUnknown,
+      atoms,
+      asyncs,
+      dict.new(),
+      dict.new(),
+    )
 
   let type_code =
     module.decls
@@ -201,7 +217,9 @@ pub fn generate(module: ast.Module) -> String {
 
   let json_code = gen_json_support(env, module)
 
-  let body = type_code <> "\n" <> atom_code <> json_code <> fn_code
+  let clone_code = gen_clone_support(env, module)
+
+  let body = type_code <> "\n" <> atom_code <> clone_code <> json_code <> fn_code
   gen_header(body) <> "\n" <> body
 }
 
@@ -1080,19 +1098,38 @@ fn gen_stmt(
   case stmt {
     ast.SVarDecl(name, value, mutable) -> {
       let ty = infer(env, value)
-      let rhs = maybe_clone(env, mutable, value, gen_expr(env, value))
+      let #(rhs, shared) =
+        bind_rhs(
+          env,
+          ty,
+          Some(name),
+          mutable,
+          value,
+          gen_expr(env, value),
+          following,
+        )
       let decl = pad <> escape_ident(name) <> " := " <> rhs <> "\n"
       let env2 =
         Env(
           ..env,
           locals: dict.insert(env.locals, name, ty),
           muts: dict.insert(env.muts, name, mutable),
+          aliased: record_alias(env, name, value, shared),
         )
       #(decl <> guard(following, name, pad), env2)
     }
     ast.STypedDecl(typ, name, value, mutable) -> {
       let ty = ty_of_type_expr(env.types, typ)
-      let rhs = maybe_clone(env, mutable, value, coerce(env, value, ty))
+      let #(rhs, shared) =
+        bind_rhs(
+          env,
+          ty,
+          Some(name),
+          mutable,
+          value,
+          coerce(env, value, ty),
+          following,
+        )
       let decl =
         pad
         <> "var "
@@ -1107,6 +1144,7 @@ fn gen_stmt(
           ..env,
           locals: dict.insert(env.locals, name, ty),
           muts: dict.insert(env.muts, name, mutable),
+          aliased: record_alias(env, name, value, shared),
         )
       #(decl <> guard(following, name, pad), env2)
     }
@@ -1124,16 +1162,23 @@ fn gen_stmt(
     ast.SContinue -> #(pad <> "continue\n", env)
     ast.SAssign(target, value) -> {
       let ty = infer(env, target)
-      // A whole-variable reassignment (`b = a`) is a rebinding, so it copies
-      // when the source is immutable (the target must be mutable to be assigned
-      // at all). An element/field assignment (`v[i] = ...`) writes into
-      // existing storage and must never copy.
+      // A whole-variable reassignment (`b = a`) rebinds `b`, so it follows the
+      // same copy rule as a declaration — the target is mutable by definition,
+      // since only `mut` variables can be assigned. An element/field
+      // assignment (`v[i] = ...`) writes into existing storage and never copies.
       let rendered = coerce(env, value, ty)
-      let rhs = case target {
-        ast.EIdent(_) -> maybe_clone(env, True, value, rendered)
-        _ -> rendered
+      let #(rhs, aliased2) = case target {
+        ast.EIdent(n) -> {
+          let #(r, shared) =
+            bind_rhs(env, ty, Some(n), True, value, rendered, following)
+          #(r, record_alias(env, n, value, shared))
+        }
+        _ -> #(rendered, env.aliased)
       }
-      #(pad <> gen_expr(env, target) <> " = " <> rhs <> "\n", env)
+      #(
+        pad <> gen_expr(env, target) <> " = " <> rhs <> "\n",
+        Env(..env, aliased: aliased2),
+      )
     }
     // `append(v, x)` used as a statement mutates `v` in place, which Go models
     // by reassigning the (possibly reallocated) slice back to `v`.
@@ -1249,7 +1294,7 @@ fn gen_for_clause(env: Env, stmt: ast.Stmt) -> #(String, Env) {
     // A loop-init binding is implicitly mutable (the post clause advances it).
     ast.SVarDecl(name, value, _) -> {
       let ty = infer(env, value)
-      let rhs = maybe_clone(env, True, value, gen_expr(env, value))
+      let rhs = bind_rhs_noscope(env, ty, True, value, gen_expr(env, value))
       #(
         escape_ident(name) <> " := " <> rhs,
         Env(
@@ -1261,7 +1306,7 @@ fn gen_for_clause(env: Env, stmt: ast.Stmt) -> #(String, Env) {
     }
     ast.STypedDecl(typ, name, value, _) -> {
       let ty = ty_of_type_expr(env.types, typ)
-      let rhs = maybe_clone(env, True, value, coerce(env, value, ty))
+      let rhs = bind_rhs_noscope(env, ty, True, value, coerce(env, value, ty))
       #(
         escape_ident(name) <> " := " <> rhs,
         Env(
@@ -1275,7 +1320,7 @@ fn gen_for_clause(env: Env, stmt: ast.Stmt) -> #(String, Env) {
       let ty = infer(env, target)
       let rendered = coerce(env, value, ty)
       let rhs = case target {
-        ast.EIdent(_) -> maybe_clone(env, True, value, rendered)
+        ast.EIdent(_) -> bind_rhs_noscope(env, ty, True, value, rendered)
         _ -> rendered
       }
       #(gen_expr(env, target) <> " = " <> rhs, env)
@@ -1935,45 +1980,24 @@ fn gen_equality(env: Env, l: ast.Expr, r: ast.Expr, positive: Bool) -> String {
   }
 }
 
-// Wraps a rendered vector RHS in `hive.Clone(...)` when the binding must not
-// share storage with its source. `target_mutable` is whether the binding being
-// created is `mut`.
-fn maybe_clone(
-  env: Env,
-  target_mutable: Bool,
-  value: ast.Expr,
-  rendered: String,
-) -> String {
-  case needs_copy(env, target_mutable, value) {
-    True -> "hive.Clone(" <> rendered <> ")"
-    False -> rendered
-  }
-}
+// ---------------------------------------------------------------------------
+// Value-semantics for vectors and structs: copy-on-binding
+// ---------------------------------------------------------------------------
+// Hive values have value semantics, but vectors/Tables (and structs that
+// contain them) lower to Go slices, which share storage. So a binding whose
+// RHS aliases existing storage may need a copy to keep the two ends
+// independent. The rule preserves one invariant:
+//
+//   Storage observed by any *immutable* binding is never mutated in place.
+//
+// The compiler enforces that only `mut` variables can be written through
+// (`v[i] = …`, `v.f = …`, `append(v, …)`), so an immutable binding never
+// mutates; the copy exists only to stop a *mutable* alias from doing so.
+// `bind_rhs` decides, per binding, between an alias (cheap) and a copy.
 
-// A vector binding needs a copy when its RHS refers to existing storage (an
-// identifier/index/member/slice rather than a fresh literal or `+`/call result)
-// and the two ends are not both mutable. Two mutable bindings are allowed to
-// alias (shared mutable state); anything involving an immutable side is an
-// independent value and must be copied.
-fn needs_copy(env: Env, target_mutable: Bool, value: ast.Expr) -> Bool {
-  case is_vec_ty(infer(env, value)) && aliases_storage(value) {
-    False -> False
-    // Alias source of vector type: copy unless both ends are mutable.
-    True ->
-      case target_mutable && source_mutable(env, value) {
-        True -> False
-        False -> True
-      }
-  }
-}
-
-fn is_vec_ty(ty: Ty) -> Bool {
-  case ty {
-    TyVec(_) | TyTable -> True
-    _ -> False
-  }
-}
-
+// Whether an RHS expression refers to already-existing storage (so a binding
+// to it would alias), rather than producing a fresh value (a literal, a
+// `+`/`append` result, a call).
 fn aliases_storage(e: ast.Expr) -> Bool {
   case e {
     ast.EIdent(_) | ast.EMember(_, _) | ast.EIndex(_, _) | ast.ESlice(_, _, _) ->
@@ -1982,16 +2006,425 @@ fn aliases_storage(e: ast.Expr) -> Bool {
   }
 }
 
+// Whether the storage an alias expression reaches belongs to a `mut` variable.
 fn source_mutable(env: Env, e: ast.Expr) -> Bool {
-  case e {
-    ast.EIdent(n) ->
+  case expr_root(e) {
+    Some(n) ->
       case dict.get(env.muts, n) {
         Ok(m) -> m
         Error(_) -> False
       }
-    ast.EMember(t, _) | ast.EIndex(t, _) | ast.ESlice(t, _, _) ->
-      source_mutable(env, t)
+    None -> False
+  }
+}
+
+// The root variable an alias expression is rooted at (`v` in `v`, `v[i]`,
+// `v.f`, `v[a:b]`), if any.
+fn expr_root(e: ast.Expr) -> Option(String) {
+  case e {
+    ast.EIdent(n) -> Some(n)
+    ast.EMember(t, _) | ast.EIndex(t, _) | ast.ESlice(t, _, _) -> expr_root(t)
+    _ -> None
+  }
+}
+
+// Decides how a binding `target := value` treats an RHS, returning the
+// rendered RHS (aliased as-is or wrapped in a copy) and whether it created a
+// *shared mutable alias* (so the caller can record it). `ty` is the binding's
+// type, `target_name` the bound name (`None` for anonymous assignment
+// targets), `target_mutable` whether it is `mut`, and `following` the
+// statements that can still see the binding (its scope tail).
+fn bind_rhs(
+  env: Env,
+  ty: Ty,
+  target_name: Option(String),
+  target_mutable: Bool,
+  value: ast.Expr,
+  rendered: String,
+  following: List(ast.Stmt),
+) -> #(String, Bool) {
+  // Cheap `aliases_storage` gate first: most RHSs are fresh values, and skipping
+  // the type-graph walk for them keeps this off the common path.
+  case aliases_storage(value) && needs_deep_copy_ty(env, ty) {
+    // A scalar, or a fresh value — nothing is shared, so never copy.
+    False -> #(rendered, False)
+    True -> {
+      // Alias if `keep`, else emit a deep copy. `shared` marks a both-mutable
+      // alias so the caller records it.
+      let decide = fn(keep, shared) {
+        case keep {
+          True -> #(rendered, shared)
+          False -> #(gen_clone(env, ty, rendered, 0), False)
+        }
+      }
+      // The shared storage stays a stable snapshot only if BOTH ends are frozen
+      // after this binding — never mutated and never let escape into a position
+      // (a value, a call argument, a container) that could seed a new mutable
+      // alias. Computed lazily: the both-mutable arm never needs the scan.
+      let ends_frozen = fn() {
+        frozen_opt(target_name, following)
+        && frozen_opt(expr_root(value), following)
+      }
+      case target_mutable, source_mutable(env, value) {
+        // Both mutable: shared mutable state is intentional; record the alias.
+        True, True -> decide(True, True)
+        // Immutable source (target mutability is irrelevant): the source is a
+        // snapshot both ends read. Alias while it provably stays frozen, else
+        // copy — an immutable value must never observe a later change.
+        _, False -> decide(ends_frozen(), False)
+        // Immutable target, mutable source: a move. Alias only when the source
+        // has no pre-existing mutable alias and both ends stay frozen.
+        False, True ->
+          decide(!aliased_source(env, value) && ends_frozen(), False)
+      }
+    }
+  }
+}
+
+// A scope-free copy decision for for-loop init/post clauses, where the loop
+// body (the binding's real scope) is not available to scan. Without that scope
+// only the mutability-only rule holds: alias when both ends agree on
+// mutability (both immutable, or both mutable — the intentional shared case),
+// otherwise copy. Because it can't record shared aliases, loop-init bindings
+// are simply left out of `aliased`; being loop-scoped, they never outlive the
+// loop to be moved elsewhere.
+fn bind_rhs_noscope(
+  env: Env,
+  ty: Ty,
+  target_mutable: Bool,
+  value: ast.Expr,
+  rendered: String,
+) -> String {
+  case aliases_storage(value) && needs_deep_copy_ty(env, ty) {
+    False -> rendered
+    True ->
+      case target_mutable == source_mutable(env, value) {
+        True -> rendered
+        False -> gen_clone(env, ty, rendered, 0)
+      }
+  }
+}
+
+// Whether the source alias-expression's root variable already has a live
+// mutable alias (recorded from an earlier `mut b = a` sharing). Such a source
+// must not be moved into an immutable binding — something else can still
+// mutate it.
+fn aliased_source(env: Env, value: ast.Expr) -> Bool {
+  case expr_root(value) {
+    Some(root) ->
+      case dict.get(env.aliased, root) {
+        Ok(a) -> a
+        Error(_) -> False
+      }
+    None -> True
+  }
+}
+
+// `frozen`, lifted over an optional variable name — the `None` cases (an
+// anonymous assignment LHS, or a source alias-expression with no root) are
+// never treated as frozen. Callers pass the target name directly and the
+// source through `expr_root`.
+fn frozen_opt(name: Option(String), following: List(ast.Stmt)) -> Bool {
+  case name {
+    Some(n) -> frozen(n, following)
+    None -> False
+  }
+}
+
+// Whether `name`'s storage stays constant throughout `stmts`: it is never
+// written through in place (`name[i] = …`, `name.f = …`, `append(name, …)`)
+// and never escapes into a position that could seed a new — possibly mutable —
+// alias of it (a binding/assignment value, a `return`, a call argument, or a
+// container literal). Plain reads (`echo`, `assert`, conditions, indexing for
+// a read) leave the storage untouched and are fine.
+//
+// This is deliberately conservative: a vector that escapes into a function
+// call is assumed to gain an alias, because a Go-lowered function may return a
+// slice that shares its argument's backing array. Missing such an escape would
+// let a mutation leak into a value meant to be independent, so when in doubt
+// the binding copies.
+fn frozen(name: String, stmts: List(ast.Stmt)) -> Bool {
+  !var_mutated_in_stmts(stmts, name) && !may_escape_stmts(stmts, name)
+}
+
+// Records a shared mutable alias between a new binding and its source root, so
+// later move decisions know the storage still has a live mutable owner.
+fn record_alias(
+  env: Env,
+  name: String,
+  value: ast.Expr,
+  shared: Bool,
+) -> Dict(String, Bool) {
+  case shared {
+    False -> env.aliased
+    True -> {
+      let a = dict.insert(env.aliased, name, True)
+      case expr_root(value) {
+        Some(root) -> dict.insert(a, root, True)
+        None -> a
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Type-directed cloning
+// ---------------------------------------------------------------------------
+
+// Whether a binding of this type could still share storage after a plain Go
+// value-copy — i.e. it is (or contains) a vector/Table. This is the entry
+// point every caller uses; `is_deep_ty` carries the recursion's `seen` seed.
+fn needs_deep_copy_ty(env: Env, ty: Ty) -> Bool {
+  is_deep_ty(env, ty, [])
+}
+
+fn is_deep_ty(env: Env, ty: Ty, seen: List(String)) -> Bool {
+  case ty {
+    TyVec(_) | TyTable -> True
+    TyCustom(name) ->
+      case list.contains(seen, name) {
+        // A recursive field reaches back to a type already being examined; it
+        // adds no *new* storage to reason about here.
+        True -> False
+        False ->
+          case dict.get(env.types, name) {
+            Ok(ast.TypeDecl(_, variants, commons)) ->
+              variants
+              |> list.flat_map(fn(v) { v.fields })
+              |> list.append(commons)
+              |> list.any(fn(f) {
+                is_deep_ty(env, ty_of_type_expr(env.types, f.typ), [
+                  name,
+                  ..seen
+                ])
+              })
+            _ -> False
+          }
+      }
+    // Scalars and atoms own no storage. Builtins and Results are treated as
+    // leaves too, by design: they lower to opaque runtime structs whose
+    // internals aren't the language's to deep-copy (matching the pre-existing
+    // behaviour that never cloned them).
     _ -> False
+  }
+}
+
+// Emits Go that deep-copies `rendered` (a value of type `ty`) so the result
+// shares no storage with it: vectors copy their backing array (recursing into
+// element types that own storage), Tables use the runtime helper, and user
+// structs/unions delegate to their generated `clone_T`. Leaf types need no
+// copy. `depth` keeps nested closure parameter names distinct.
+fn gen_clone(env: Env, ty: Ty, rendered: String, depth: Int) -> String {
+  case ty {
+    TyVec(elem) ->
+      case needs_deep_copy_ty(env, elem) {
+        False -> "hive.CloneVec(" <> rendered <> ")"
+        True -> {
+          let e = "e" <> int.to_string(depth)
+          let go = ty_to_go(elem)
+          "hive.CloneVecFn("
+          <> rendered
+          <> ", func("
+          <> e
+          <> " "
+          <> go
+          <> ") "
+          <> go
+          <> " { return "
+          <> gen_clone(env, elem, e, depth + 1)
+          <> " })"
+        }
+      }
+    TyTable -> "hive.CloneTable(" <> rendered <> ")"
+    TyCustom(name) ->
+      case needs_deep_copy_ty(env, ty) {
+        True -> "clone_" <> name <> "(" <> rendered <> ")"
+        False -> rendered
+      }
+    _ -> rendered
+  }
+}
+
+// A `clone_T` deep-copy function for every user type that owns storage. Types
+// with only scalar fields need none (Go's value-copy already isolates them).
+// Emitting an unused one is harmless — Go permits unused package-level funcs.
+fn gen_clone_support(env: Env, module: ast.Module) -> String {
+  module.decls
+  |> list.filter_map(fn(d) {
+    case d {
+      ast.TypeDecl(name, variants, commons) ->
+        case needs_deep_copy_ty(env, TyCustom(name)) {
+          True -> Ok(gen_clone_fn(env, name, variants, commons))
+          False -> Error(Nil)
+        }
+      _ -> Error(Nil)
+    }
+  })
+  |> string.join("\n")
+}
+
+fn gen_clone_fn(
+  env: Env,
+  name: String,
+  variants: List(ast.Variant),
+  commons: List(ast.Field),
+) -> String {
+  case variants {
+    // A plain struct: `x` is a value copy already, so only its storage-owning
+    // fields need to be re-copied before it is returned.
+    [] ->
+      "func clone_"
+      <> name
+      <> "(x "
+      <> name
+      <> ") "
+      <> name
+      <> " {\n"
+      <> gen_clone_fields(env, commons, "x", 1)
+      <> "\treturn x\n}\n"
+    // A tagged union: clone the concrete variant, then re-wrap it.
+    _ -> {
+      let cases =
+        variants
+        |> list.map(fn(v) {
+          let fields = list.append(v.fields, commons)
+          "\tcase "
+          <> name
+          <> v.name
+          <> ":\n"
+          <> gen_clone_fields(env, fields, "v", 2)
+          <> "\t\treturn "
+          <> name
+          <> "(v)\n"
+        })
+        |> string.concat
+      "func clone_"
+      <> name
+      <> "(x "
+      <> name
+      <> ") "
+      <> name
+      <> " {\n\tswitch v := x.(type) {\n"
+      <> cases
+      <> "\t}\n\treturn x\n}\n"
+    }
+  }
+}
+
+fn gen_clone_fields(
+  env: Env,
+  fields: List(ast.Field),
+  receiver: String,
+  indent: Int,
+) -> String {
+  let pad = tabs(indent)
+  fields
+  |> list.filter_map(fn(f) {
+    let fty = ty_of_type_expr(env.types, f.typ)
+    case needs_deep_copy_ty(env, fty) {
+      False -> Error(Nil)
+      True -> {
+        let access = receiver <> "." <> exported(f.name)
+        Ok(pad <> access <> " = " <> gen_clone(env, fty, access, 0) <> "\n")
+      }
+    }
+  })
+  |> string.concat
+}
+
+// Whether `name`'s storage is written through anywhere in `stmts` (an element
+// or field assignment, or an `append` statement rooted at it). A whole-name
+// rebind (`name = …`) is not an in-place write and does not count.
+fn var_mutated_in_stmts(stmts: List(ast.Stmt), name: String) -> Bool {
+  list.any(stmts, fn(s) { var_mutated_in_stmt(s, name) })
+}
+
+// The match is exhaustive on purpose (no catch-all): a new mutating statement
+// form should fail to compile here rather than silently weaken the analysis.
+fn var_mutated_in_stmt(s: ast.Stmt, name: String) -> Bool {
+  case s {
+    // An element/field write is the only assignment shape that mutates storage
+    // in place; a whole-name rebind (`name = …`) does not.
+    ast.SAssign(target, _) ->
+      case target {
+        ast.EIndex(_, _) | ast.EMember(_, _) | ast.ESlice(_, _, _) ->
+          expr_root(target) == Some(name)
+        _ -> False
+      }
+    ast.SExpr(ast.ECall(ast.EIdent("append"), [ast.Arg(_, target), ..])) ->
+      expr_root(target) == Some(name)
+    ast.SExpr(_) -> False
+    ast.SIf(branches, else_body) ->
+      list.any(branches, fn(b) { var_mutated_in_stmts(b.body, name) })
+      || case else_body {
+        Some(body) -> var_mutated_in_stmts(body, name)
+        None -> False
+      }
+    ast.SFor(init, _, post, body) ->
+      var_mutated_in_opt(init, name)
+      || var_mutated_in_opt(post, name)
+      || var_mutated_in_stmts(body, name)
+    ast.SForEach(_, _, _, body) -> var_mutated_in_stmts(body, name)
+    // Bindings, returns and value-only statements don't write through `name`.
+    ast.SVarDecl(_, _, _)
+    | ast.STypedDecl(_, _, _, _)
+    | ast.SReturn(_)
+    | ast.SEcho(_)
+    | ast.SAssert(_)
+    | ast.SBreak
+    | ast.SContinue -> False
+  }
+}
+
+fn var_mutated_in_opt(o: Option(ast.Stmt), name: String) -> Bool {
+  case o {
+    Some(s) -> var_mutated_in_stmt(s, name)
+    None -> False
+  }
+}
+
+// Whether `name` could escape into a new alias anywhere in `stmts`: it appears
+// in the value of a binding or assignment, in a `return`, or as an argument to
+// a call (including `append`) — any position where a lowered Go function might
+// capture or hand back a slice that shares its backing array. Reads that keep
+// no reference — `echo`, `assert`, loop conditions, the subject a `for each`
+// ranges over — do not count. Over-approximating (copying when unsure) keeps
+// value semantics intact; under-approximating would let mutations leak.
+fn may_escape_stmts(stmts: List(ast.Stmt), name: String) -> Bool {
+  list.any(stmts, fn(s) { may_escape_stmt(s, name) })
+}
+
+fn may_escape_stmt(s: ast.Stmt, name: String) -> Bool {
+  case s {
+    // A binding or assignment captures the value under a new (or existing)
+    // name; treat any mention as a potential alias.
+    ast.SVarDecl(_, value, _)
+    | ast.STypedDecl(_, _, value, _)
+    | ast.SAssign(_, value) -> uses_in_expr(value, name)
+    ast.SReturn(Some(value)) -> uses_in_expr(value, name)
+    ast.SReturn(None) -> False
+    // Reads that retain no reference.
+    ast.SEcho(_) | ast.SAssert(_) | ast.SBreak | ast.SContinue -> False
+    // A call may return or retain a slice aliasing one of its arguments.
+    ast.SExpr(e) -> uses_in_expr(e, name)
+    ast.SIf(branches, else_body) ->
+      list.any(branches, fn(b) { may_escape_stmts(b.body, name) })
+      || case else_body {
+        Some(body) -> may_escape_stmts(body, name)
+        None -> False
+      }
+    ast.SFor(init, _, post, body) ->
+      may_escape_opt(init, name)
+      || may_escape_opt(post, name)
+      || may_escape_stmts(body, name)
+    ast.SForEach(_, _, _, body) -> may_escape_stmts(body, name)
+  }
+}
+
+fn may_escape_opt(o: Option(ast.Stmt), name: String) -> Bool {
+  case o {
+    Some(s) -> may_escape_stmt(s, name)
+    None -> False
   }
 }
 

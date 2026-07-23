@@ -1,0 +1,97 @@
+// Value semantics: how Hive keeps immutable data immutable.
+//
+// Vectors, Tables and any struct that contains them are VALUE TYPES. Binding
+// one name to another is conceptually a copy — so a later change to one side
+// is never observed through the other. This matters because those types lower
+// to Go slices, which share their backing storage by default; Hive copies at
+// the binding so that sharing can't leak a mutation into a value that was
+// supposed to stand still.
+//
+// The copy is only inserted when it is actually needed. The compiler proves,
+// per binding, whether the two names can safely share storage instead:
+//
+//   * both sides immutable            -> share  (neither can ever mutate it)
+//   * both sides `mut`                -> share  (shared mutable state is the point)
+//   * a `mut` binding never written   -> share  (it behaves immutably)
+//   * a source with no more mutations -> share  (nothing can change it again)
+//   * otherwise                       -> copy
+//
+// When a copy is made it is DEEP and type-directed: a flat vector copies its
+// backing array, a nested vector (or Table) copies every level, and a struct
+// copies its vector fields too — all without runtime reflection.
+
+proc main(): void {
+	echo snapshotIsIndependent()
+	echo mutableSharesStorage()
+	echo deepCopyOfNestedVectors()
+	echo structFieldsAreDeepCopied()
+}
+
+// An immutable binding is a stable snapshot: mutating the original afterwards
+// does not change it, because it received its own copy.
+proc snapshotIsIndependent(): Str {
+	mut original := [1, 2, 3]
+	snapshot := original      // copied: `original` is mutated below
+
+	original[0] = 99          // in-place write, allowed only because `original` is `mut`
+
+	// `snapshot` still reads [1 2 3]; `original` reads [99 2 3].
+	echo snapshot
+	echo original
+	return "snapshot stays independent of later mutations"
+}
+
+// Two `mut` bindings are allowed to alias the SAME storage — this is the one
+// case where sharing is intended, so no copy is made.
+proc mutableSharesStorage(): Str {
+	mut a := [1, 2, 3]
+	mut b := a                // shared: both sides are `mut`
+
+	b[0] = 99                 // writes through the storage both names see
+
+	// Both `a` and `b` now read [99 2 3].
+	echo a
+	echo b
+	return "two mut bindings share one storage"
+}
+
+// The copy recurses: a snapshot of a nested vector is independent all the way
+// down, so mutating an inner row of the original leaves the snapshot untouched.
+proc deepCopyOfNestedVectors(): Str {
+	mut grid := [[1, 2], [3, 4]]
+	snapshot := grid          // deep-copied: every row gets its own storage
+
+	// Take a `mut` view of the first row and change it in place. The guard is
+	// needed because a row reached through an index has no compile-time length.
+	mut firstRow := grid[0]
+	if 0 < len(firstRow) {
+		firstRow[0] = 99
+	}
+
+	// `snapshot` still reads [[1 2] [3 4]]; `grid` reads [[99 2] [3 4]].
+	echo snapshot
+	echo grid
+	return "nested vectors are copied at every level"
+}
+
+type Basket {
+	items: Int[dyn]
+}
+
+// A struct that holds a vector is a value type too. Copying the struct copies
+// its vector field, so the snapshot's items can't be changed through the
+// original's storage.
+proc structFieldsAreDeepCopied(): Str {
+	mut basket := Basket(items: [1, 2, 3])
+	snapshot := basket        // deep-copied: `items` gets its own storage
+
+	mut itemsView := basket.items
+	if 0 < len(itemsView) {
+		itemsView[0] = 99
+	}
+
+	// `snapshot.items` still reads [1 2 3]; `basket.items` reads [99 2 3].
+	echo snapshot.items
+	echo basket.items
+	return "struct vector fields are copied, not shared"
+}

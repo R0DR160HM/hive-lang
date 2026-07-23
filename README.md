@@ -133,9 +133,10 @@ await!!!
 
 More complete programs — CSV parsing with pattern matching, a full tour of the
 type system, an HTTP server that speaks JSON, a `hive.crypto` walkthrough
-(hashing, HMAC, base64 and JWTs), and a `hive.sql` example backed by an
-embedded SQLite database — live in `code-examples/`. They double as the
-language's specification: each one compiles, builds and runs.
+(hashing, HMAC, base64 and JWTs), a `hive.sql` example backed by an embedded
+SQLite database, and a tour of Hive's copy-on-binding [value
+semantics](#value-semantics-copy-on-binding) — live in `code-examples/`. They
+double as the language's specification: each one compiles, builds and runs.
 
 ## The language
 
@@ -158,10 +159,17 @@ language's specification: each one compiles, builds and runs.
   `Table` compare the same way), short-circuiting on the first difference;
   comparing a vector to a non-vector is a compile error, not a silent `false`.
   Vectors are **value types**: binding one to another (`ys := xs`) copies it, so
-  a later mutation of one is not seen through the other. The one exception is a
-  binding where *both* sides are `mut` — those are allowed to alias shared
-  mutable state. `Table` is an alias for `Str[dyn][dyn]`. (For `append`, `join`,
-  `split`, `len` and `bytes` see [Built-in functions](#built-in-functions).)
+  a later mutation of one is never seen through the other. The copy is *deep* and
+  *type-directed* — nested vectors, a `Table` and the vector fields of a struct
+  are all copied, with no runtime reflection. It is also only emitted when it is
+  actually needed: the compiler aliases the storage instead whenever that is
+  provably indistinguishable — when both sides are immutable, when a `mut`
+  binding is never written through, or when the source is never mutated again —
+  and two `mut` bindings always alias, deliberately sharing mutable state.
+  `Table` is an alias for `Str[dyn][dyn]`. See
+  [Value semantics](#value-semantics-copy-on-binding) for the full rule and a
+  runnable tour. (For `append`, `join`, `split`, `len` and `bytes` see
+  [Built-in functions](#built-in-functions).)
 * **Mutability** — variables are immutable by default; prefix a declaration
   with `mut` (`mut x := ...`, `mut Str[dyn] v = ...`) to allow reassignment
   (`x = ...`, `v[0] = ...`) and `append`. Conceptually a `mut T` is a
@@ -212,6 +220,47 @@ language's specification: each one compiles, builds and runs.
   repeat, and once named arguments are used the call must cover the full
   parameter list.
 * All keywords are case-insensitive; identifiers keep their spelling.
+
+## Value semantics (copy-on-binding)
+
+Vectors, `Table`s and structs that contain them are **value types**, but they
+lower to Go slices, which share their backing storage. To keep the value
+semantics honest, a binding whose right-hand side names existing storage
+(`ys := xs`, `ys := xs[i]`, `ys := rec.field`, …) may need to **copy** so the
+two names can't observe each other's mutations. A fresh right-hand side (a
+literal, a `+` concatenation, a function result) is already independent and is
+never copied.
+
+Only in-place writes can break value semantics, and the compiler already
+enforces that only `mut` variables can be written through (`v[i] = …`,
+`v.f = …`, `append(v, …)`). So the invariant to preserve is simply: *storage
+that an immutable binding observes is never mutated in place afterwards.* Each
+binding is classified by the mutability of its two ends:
+
+| target ⟵ source          | decision                                                             |
+| ------------------------- | -------------------------------------------------------------------- |
+| immutable ⟵ immutable    | **alias** — neither side can ever mutate the shared storage          |
+| `mut` ⟵ `mut`            | **alias** — shared mutable state is the intent                       |
+| `mut` ⟵ immutable        | **alias** if the target is never written through, else **copy**      |
+| immutable ⟵ `mut`        | **alias** if the source is never mutated again, else **copy**        |
+
+An alias is only chosen when it is provably indistinguishable from a copy. The
+analysis is deliberately conservative: if the variable escapes into a function
+call or a constructed value (where a returned or embedded slice might alias its
+backing array), it is treated as possibly-mutated and the binding copies. Two
+`mut` bindings always alias — that is how you opt into shared mutable state.
+
+When a copy *is* made it is **deep and type-directed** — no runtime reflection:
+
+* a flat vector copies its backing array (`hive.CloneVec`);
+* a nested vector or `Table` copies every level (`hive.CloneVecFn` /
+  `hive.CloneTable`);
+* a struct or tagged union copies its storage-owning fields through a generated
+  `clone_T` (scalar-only types need nothing — Go's value copy already isolates
+  them).
+
+See [`code-examples/6 - Value Semantics`](code-examples/6%20-%20Value%20Semantics/value-semantics.hive)
+for a runnable walkthrough of each case.
 
 ## Built-in functions
 
@@ -383,6 +432,7 @@ Reads environment variables, from a `.env` file or the OS.
 | `T name = expr`                         | `var name T = expr`                                            |
 | `mut name := expr` / `mut T name = e`   | same as above (`mut` is compile-time only — permits reassign)  |
 | `x = expr` / `v[0] = expr`              | `x = expr` / `v[0] = expr` (only on `mut` variables)           |
+| `ys := xs` (needs a copy — see [value semantics](#value-semantics-copy-on-binding)) | `ys := hive.CloneVec(xs)` / `hive.CloneVecFn(..)` / `hive.CloneTable(..)` / `clone_T(..)` |
 | `for i := 0; i < n; i = i + 1 { }`      | `for i := 0; i < n; i = i + 1 { }` (counter scoped to the loop) |
 | `for each x in v { }`                   | `for _, x := range v { }` (binds the value, discards the index) |
 | `async func f(): T { ... }`             | `func f() T { ... }` (an ordinary Go function)                 |

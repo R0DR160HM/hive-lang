@@ -145,24 +145,40 @@ func Concat[T any](a, b []T) []T {
 	return append(out, b...)
 }
 
-// Clone returns a deep copy of a vector, recursing into nested vectors (a
-// Table). Hive vectors are value types, but they lower to Go slices (which
-// share storage), so a binding that must stay independent of its source — any
-// binding where either side is immutable — is cloned rather than aliased.
-func Clone[T any](s []T) []T {
-	return cloneVec(s).([]T)
+// CloneVec returns a shallow copy of a vector: a fresh backing array holding
+// the same elements (each copied by Go assignment). Hive vectors are value
+// types but lower to Go slices (which share storage), so a binding that must
+// stay independent of its source is copied rather than aliased. This is the
+// right copy when the element type owns no storage of its own (a scalar, atom,
+// or struct without vector fields); deeper element types use CloneVecFn.
+func CloneVec[T any](s []T) []T {
+	if s == nil {
+		return nil
+	}
+	out := make([]T, len(s))
+	copy(out, s)
+	return out
 }
 
-func cloneVec(v any) any {
-	rv := reflect.ValueOf(v)
-	if rv.Kind() != reflect.Slice {
-		return v
+// CloneVecFn is CloneVec for element types that themselves own storage (nested
+// vectors, or structs with vector fields): every element is passed through
+// clone so the copy shares nothing with the original.
+func CloneVecFn[T any](s []T, clone func(T) T) []T {
+	if s == nil {
+		return nil
 	}
-	out := reflect.MakeSlice(rv.Type(), rv.Len(), rv.Len())
-	for i := 0; i < rv.Len(); i++ {
-		out.Index(i).Set(reflect.ValueOf(cloneVec(rv.Index(i).Interface())))
+	out := make([]T, len(s))
+	for i := range s {
+		out[i] = clone(s[i])
 	}
-	return out.Interface()
+	return out
+}
+
+// CloneTable deep-copies a Table ([][]string): a fresh outer slice whose rows
+// are themselves fresh, so neither the grid nor any row shares storage with
+// the original.
+func CloneTable(t Table) Table {
+	return CloneVecFn(t, CloneVec[string])
 }
 
 // VecEq reports whether two vectors are equal: the same length, then equal
