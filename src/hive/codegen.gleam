@@ -456,10 +456,26 @@ fn atoms_in_expr(e: ast.Expr, acc: List(String)) -> List(String) {
     ast.ESlice(target, low, high) ->
       atoms_in_opt(high, atoms_in_opt(low, atoms_in_expr(target, acc)))
     ast.EBinary(_, l, r) -> atoms_in_expr(r, atoms_in_expr(l, acc))
-    ast.EIs(subject, _) -> atoms_in_expr(subject, acc)
+    ast.EIs(subject, pattern) ->
+      atoms_in_pattern(pattern, atoms_in_expr(subject, acc))
     ast.EUsing(path, delim) -> atoms_in_opt(delim, atoms_in_expr(path, acc))
     ast.EWith(value, _) -> atoms_in_expr(value, acc)
     ast.EAwait(value) -> atoms_in_expr(value, acc)
+  }
+}
+
+// Atom literals can appear as vector-pattern element literals (`v is [#Ok]`),
+// which must still be registered in the program's atom table.
+fn atoms_in_pattern(pattern: ast.Pattern, acc: List(String)) -> List(String) {
+  case pattern {
+    ast.PVector(elems, _) ->
+      list.fold(elems, acc, fn(acc, e) {
+        case e {
+          ast.PElemLit(v) -> atoms_in_expr(v, acc)
+          ast.PElemBind(_) -> acc
+        }
+      })
+    ast.PConstructor(_, _) | ast.PString(_) -> acc
   }
 }
 
@@ -1508,6 +1524,133 @@ fn gen_is(
     ast.PConstructor([type_name, variant_name], bindings) ->
       gen_adt_is(env, subj, type_name, variant_name, bindings)
     ast.PConstructor(_, _) -> #(gen_expr(env, subject), [])
+    ast.PVector(elems, rest) -> gen_vector_is(env, subject, subj, elems, rest)
+    ast.PString(parts) -> gen_string_is(subj, parts)
+  }
+}
+
+// `v is ["a", x, ...tail]` — a length check plus element-wise checks, with
+// element and tail bindings introduced in the branch body. Each literal
+// element reuses the ordinary equality lowering (so string/number/atom and
+// nested-vector literals each compare correctly); each named element binds
+// `v[i]` and a trailing `...tail` binds the reslice `v[n:]`. Like every other
+// `is`-binding these alias the subject's storage rather than copying it, which
+// is sound because bindings are immutable.
+fn gen_vector_is(
+  env: Env,
+  subject: ast.Expr,
+  subj: String,
+  elems: List(ast.PatElem),
+  rest: Option(String),
+) -> #(String, List(Bind)) {
+  let vec_ty = infer(env, subject)
+  let elem_ty = case vec_ty {
+    TyVec(t) -> t
+    TyTable -> TyVec(TyStr)
+    _ -> TyUnknown
+  }
+  let n = list.length(elems)
+  let len_conds = case rest, n {
+    // A fixed-length pattern matches only a vector of exactly that length.
+    None, _ -> ["len(" <> subj <> ") == " <> int.to_string(n)]
+    // `[...tail]` (a bare rest) accepts any vector, so no length check.
+    Some(_), 0 -> []
+    // `[a, b, ...tail]` needs at least the fixed elements present.
+    Some(_), _ -> ["len(" <> subj <> ") >= " <> int.to_string(n)]
+  }
+  let #(elem_conds, elem_binds) =
+    elems
+    |> list.index_map(fn(elem, i) { #(elem, i) })
+    |> list.fold(#([], []), fn(acc, pair) {
+      let #(conds, binds) = acc
+      let #(elem, i) = pair
+      case elem {
+        ast.PElemLit(lit) -> {
+          let c =
+            gen_equality(env, ast.EIndex(subject, ast.EInt(i)), lit, True)
+          #([c, ..conds], binds)
+        }
+        ast.PElemBind("_") -> #(conds, binds)
+        ast.PElemBind(name) -> #(conds, [
+          #(name, subj <> "[" <> int.to_string(i) <> "]", elem_ty),
+          ..binds
+        ])
+      }
+    })
+  let rest_binds = case rest {
+    Some("_") | None -> []
+    Some(name) -> [#(name, subj <> "[" <> int.to_string(n) <> ":]", vec_ty)]
+  }
+  let conds = list.append(len_conds, list.reverse(elem_conds))
+  let cond = case conds {
+    [] -> "true"
+    _ -> string.join(conds, " && ")
+  }
+  #(cond, list.append(list.reverse(elem_binds), rest_binds))
+}
+
+// `path is "/api/{id}/{name}/delete"` — a string template match. With no holes
+// it is a plain equality; with holes it lowers to `hive.MatchPattern`, which
+// returns the captures (nil on no match). Each named hole reads its capture
+// back out. The match is recomputed once per binding rather than stashed in a
+// temp — it is a pure function of the subject, so this is sound, and real
+// patterns hold a handful of holes over short strings.
+fn gen_string_is(subj: String, parts: List(ast.StrPat)) -> #(String, List(Bind)) {
+  let #(prefix, holes) = split_string_pattern(parts)
+  case holes {
+    [] -> #(subj <> " == " <> gen_string_lit(prefix), [])
+    _ -> {
+      let seps_go =
+        "[]string{"
+        <> string.join(list.map(holes, fn(h) { gen_string_lit(h.1) }), ", ")
+        <> "}"
+      let match_call =
+        "hive.MatchPattern("
+        <> subj
+        <> ", "
+        <> gen_string_lit(prefix)
+        <> ", "
+        <> seps_go
+        <> ")"
+      let binds =
+        holes
+        |> list.index_map(fn(h, i) { #(h.0, i) })
+        |> list.filter(fn(pair) { pair.0 != "_" })
+        |> list.map(fn(pair) {
+          let #(name, i) = pair
+          #(name, match_call <> "[" <> int.to_string(i) <> "]", TyStr)
+        })
+      #(match_call <> " != nil", binds)
+    }
+  }
+}
+
+// Splits a string pattern into its leading literal prefix and, for each hole in
+// order, the literal that terminates it — `""` for a hole that runs to the end
+// of the string. The parts always alternate literal/hole (the lexer merges
+// adjacent literal text and the parser rejects adjacent holes), so a hole is
+// followed either by its separator literal or by the end of the pattern.
+fn split_string_pattern(
+  parts: List(ast.StrPat),
+) -> #(String, List(#(String, String))) {
+  case parts {
+    [ast.SPatLit(s), ..rest] -> #(s, collect_holes(rest, []))
+    _ -> #("", collect_holes(parts, []))
+  }
+}
+
+fn collect_holes(
+  parts: List(ast.StrPat),
+  acc: List(#(String, String)),
+) -> List(#(String, String)) {
+  case parts {
+    [ast.SPatHole(name), ast.SPatLit(sep), ..rest] ->
+      collect_holes(rest, [#(name, sep), ..acc])
+    [ast.SPatHole(name), ..rest] -> collect_holes(rest, [#(name, ""), ..acc])
+    // A literal that does not follow a hole cannot occur given the parser's
+    // guarantees; skip it to stay total.
+    [ast.SPatLit(_), ..rest] -> collect_holes(rest, acc)
+    [] -> list.reverse(acc)
   }
 }
 

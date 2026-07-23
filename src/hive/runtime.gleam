@@ -222,6 +222,43 @@ func StrLen(s string) int {
 	return utf8.RuneCountInString(s)
 }
 
+// MatchPattern matches s against a string-pattern template and returns the
+// captured hole values in order, or nil when s does not match. This backs Hive
+// patterns such as `path is \"/api/{id}/{name}/delete\"`.
+//
+// The template is described by a leading literal prefix and, for each hole in
+// order, the literal that terminates it. seps[i] is the literal following hole
+// i; an empty seps[i] means hole i runs to the end of the input (only the last
+// hole can be terminated this way). Matching is left-to-right and non-greedy:
+// each hole captures the shortest run of text up to the next occurrence of its
+// terminating literal, so a `{seg}` between two `/` never swallows a `/`. The
+// template must describe the whole string — any trailing input is a no-match.
+func MatchPattern(s string, prefix string, seps []string) []string {
+	if !strings.HasPrefix(s, prefix) {
+		return nil
+	}
+	s = s[len(prefix):]
+	caps := make([]string, len(seps))
+	for i, sep := range seps {
+		if sep == \"\" {
+			// The final hole captures whatever is left.
+			caps[i] = s
+			s = s[len(s):]
+			continue
+		}
+		idx := strings.Index(s, sep)
+		if idx < 0 {
+			return nil
+		}
+		caps[i] = s[:idx]
+		s = s[idx+len(sep):]
+	}
+	if s != \"\" {
+		return nil
+	}
+	return caps
+}
+
 // Bytes is the size, in bytes, of a vector's contiguous backing storage: its
 // element count times the size of one element (backs `bytes` on a vector).
 // `bytes` on a Str instead reports the UTF-8 byte length of its contents.

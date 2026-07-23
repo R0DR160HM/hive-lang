@@ -1026,14 +1026,152 @@ fn parse_using(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
 }
 
 fn parse_pattern(tokens: Toks) -> Result(#(ast.Pattern, Toks), String) {
-  use #(first, t1) <- result.try(expect_ident(tokens))
-  use #(path, t2) <- result.try(parse_pattern_path(t1, [first]))
-  case kind(t2) {
-    token.LParen -> {
-      use #(bindings, t3) <- result.try(parse_bindings(tail(t2), []))
-      Ok(#(ast.PConstructor(path, bindings), t3))
+  case kind(tokens) {
+    // `["a", x, ...tail]` — a vector pattern.
+    token.LBracket -> parse_vector_pattern(tail(tokens), [])
+    // `"/health"` — a string pattern with no holes (an exact match).
+    token.StringLit(s) -> Ok(#(ast.PString([ast.SPatLit(s)]), tail(tokens)))
+    // `"/api/{id}/{name}/delete"` — a string template pattern.
+    token.StrInterp(parts) -> {
+      use spats <- result.try(str_pattern_parts(parts, line(tokens)))
+      Ok(#(ast.PString(spats), tail(tokens)))
     }
-    _ -> Ok(#(ast.PConstructor(path, []), t2))
+    // `Type.Variant(bindings)` — a constructor pattern.
+    _ -> {
+      use #(first, t1) <- result.try(expect_ident(tokens))
+      use #(path, t2) <- result.try(parse_pattern_path(t1, [first]))
+      case kind(t2) {
+        token.LParen -> {
+          use #(bindings, t3) <- result.try(parse_bindings(tail(t2), []))
+          Ok(#(ast.PConstructor(path, bindings), t3))
+        }
+        _ -> Ok(#(ast.PConstructor(path, []), t2))
+      }
+    }
+  }
+}
+
+// A vector pattern's elements, up to the closing `]`. A trailing `...name`
+// captures the leftover elements and, per the grammar, may only appear last.
+fn parse_vector_pattern(
+  tokens: Toks,
+  acc: List(ast.PatElem),
+) -> Result(#(ast.Pattern, Toks), String) {
+  case kind(tokens) {
+    token.RBracket -> Ok(#(ast.PVector(list.reverse(acc), None), tail(tokens)))
+    token.Ellipsis -> {
+      use #(name, t1) <- result.try(expect_ident(tail(tokens)))
+      use t2 <- result.try(expect(t1, token.RBracket))
+      Ok(#(ast.PVector(list.reverse(acc), Some(name)), t2))
+    }
+    _ -> {
+      use #(elem, t1) <- result.try(parse_pattern_elem(tokens))
+      case kind(t1) {
+        token.Comma -> parse_vector_pattern(tail(t1), [elem, ..acc])
+        token.RBracket ->
+          Ok(#(ast.PVector(list.reverse([elem, ..acc]), None), tail(t1)))
+        token.Ellipsis ->
+          Error(
+            "a `...` rest in a vector pattern must be separated from the "
+            <> "previous element by a `,`"
+            <> at(t1),
+          )
+        other ->
+          Error(
+            "expected `,` or `]` in a vector pattern but found "
+            <> token.describe(other)
+            <> at(t1),
+          )
+      }
+    }
+  }
+}
+
+// One element of a vector pattern: a literal to match, or a name to bind. A
+// bare identifier always *binds* (it introduces a new name), following the
+// usual pattern-matching convention; `_` binds nothing.
+fn parse_pattern_elem(tokens: Toks) -> Result(#(ast.PatElem, Toks), String) {
+  use #(e, t1) <- result.try(parse_expr(tokens))
+  case e {
+    ast.EString(_)
+    | ast.EInt(_)
+    | ast.EFloat(_)
+    | ast.EBool(_)
+    | ast.EAtom(_) -> Ok(#(ast.PElemLit(e), t1))
+    ast.EIdent(name) -> Ok(#(ast.PElemBind(name), t1))
+    _ ->
+      Error(
+        "a vector pattern element must be a literal (string, number, boolean "
+        <> "or atom) or a binding name"
+        <> at(tokens),
+      )
+  }
+}
+
+// Turns an interpolated-string token into the pieces of a string pattern: each
+// literal chunk must match verbatim, each `{name}` hole binds a capture. Holes
+// must be plain binding names and two holes may not sit side by side (with no
+// literal between them the split point would be ambiguous).
+fn str_pattern_parts(
+  parts: List(token.StrPart),
+  line: Int,
+) -> Result(List(ast.StrPat), String) {
+  use spats <- result.try(
+    list.try_map(parts, fn(p) {
+      case p {
+        token.SLit(s) -> Ok(ast.SPatLit(s))
+        token.SCode(code) -> {
+          use name <- result.try(hole_name(code, line))
+          Ok(ast.SPatHole(name))
+        }
+      }
+    }),
+  )
+  use _ <- result.try(check_no_adjacent_holes(spats, line))
+  Ok(spats)
+}
+
+fn hole_name(code: String, line: Int) -> Result(String, String) {
+  case string.trim(code) {
+    "" ->
+      Error(
+        "an empty `{}` hole is not allowed in a string pattern (line "
+        <> int.to_string(line)
+        <> ")",
+      )
+    trimmed -> {
+      use e <- result.try(parse_sub_expr(code, line))
+      case e {
+        ast.EIdent(name) -> Ok(name)
+        _ ->
+          Error(
+            "a `{...}` hole in a string pattern must be a single binding name, "
+            <> "but found `"
+            <> trimmed
+            <> "` (line "
+            <> int.to_string(line)
+            <> ")",
+          )
+      }
+    }
+  }
+}
+
+fn check_no_adjacent_holes(
+  parts: List(ast.StrPat),
+  line: Int,
+) -> Result(Nil, String) {
+  case parts {
+    [ast.SPatHole(_), ast.SPatHole(_), ..] ->
+      Error(
+        "two `{...}` holes in a string pattern must be separated by some "
+        <> "literal text, otherwise where one ends and the next begins is "
+        <> "ambiguous (line "
+        <> int.to_string(line)
+        <> ")",
+      )
+    [_, ..rest] -> check_no_adjacent_holes(rest, line)
+    [] -> Ok(Nil)
   }
 }
 

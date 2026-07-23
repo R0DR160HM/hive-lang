@@ -98,6 +98,9 @@ fn do_lex(
     [":", ..rest] -> emit(rest, line, mode, acc, token.Colon)
     [";", ..rest] -> emit(rest, line, mode, acc, token.Semicolon)
     [",", ..rest] -> emit(rest, line, mode, acc, token.Comma)
+    // `...` (the vector-pattern rest marker) must be matched before a single
+    // `.`, since the lexer commits to the first pattern that fits.
+    [".", ".", ".", ..rest] -> emit(rest, line, mode, acc, token.Ellipsis)
     [".", ..rest] -> emit(rest, line, mode, acc, token.Dot)
     [">", ..rest] -> emit(rest, line, mode, acc, token.Gt)
     ["<", ..rest] -> emit(rest, line, mode, acc, token.Lt)

@@ -71,6 +71,8 @@ pub type Kind {
   Semicolon
   Comma
   Dot
+  /// `...` — the rest marker in a vector pattern (`[a, ...tail]`).
+  Ellipsis
 
   // Operators
   Gt
@@ -146,6 +148,7 @@ pub fn describe(kind: Kind) -> String {
     Semicolon -> "`;`"
     Comma -> "`,`"
     Dot -> "`.`"
+    Ellipsis -> "`...`"
     Gt -> "`>`"
     Lt -> "`<`"
     Ge -> "`>=`"

@@ -1,0 +1,114 @@
+// Pattern matching
+// ================
+// The `is` operator checks a value against a pattern. When it matches, it
+// narrows the value's type and binds parts of it to fresh names — usable right
+// away, both in the rest of the same condition (after `&&`) and in the branch
+// body. Hive matches four kinds of thing: tagged-union variants, `Result`s,
+// vectors, and strings. This program tours all four; every branch below is a
+// plain `if`/`else if`, since `is` is just an expression that returns a `Bool`.
+
+type Shape {
+	Circle {
+		radius: Int
+	}
+	Rectangle {
+		width: Int
+		height: Int
+	}
+	Point
+}
+
+// 1. Tagged-union (ADT) patterns
+// ------------------------------
+// `value is Type.Variant(a, b)` matches a single variant and binds its fields
+// by position; `_` matches a field without binding it. The branches here cover
+// every variant of `Shape`, so no `else` is needed: the compiler proves the
+// match is exhaustive (drop one branch and it refuses to compile).
+func describe(shape: Shape): Str {
+	if shape is Shape.Circle(r) {
+		return "circle, radius " + hive.conv.its(r)
+	} else if shape is Shape.Rectangle(w, h) {
+		return "rectangle, " + hive.conv.its(w) + "x" + hive.conv.its(h)
+	} else if shape is Shape.Point {
+		return "a single point"
+	}
+}
+
+// 2. Result patterns
+// ------------------
+// `Result.Ok(v)` and `Result.Error(e)` unwrap a fallible value and bind the
+// payload. Matching both is exhaustive. The `Result` here comes from
+// `hive.conv.sti`, which parses a Str into an Int.
+func parseAge(text: Str): Str {
+	parsed := hive.conv.sti(text)
+	if parsed is Result.Ok(age) {
+		return text + " -> age " + hive.conv.its(age)
+	} else if parsed is Result.Error(problem) {
+		return text + " -> " + problem.message
+	}
+}
+
+// 3. Vector patterns
+// ------------------
+// A vector pattern matches positionally. A literal element must be equal, a
+// bare name binds that element, `_` skips one, and a trailing `...rest` binds
+// the leftover elements as a vector — which also relaxes the length from an
+// exact count to a minimum. A pattern with no `...rest` matches only a vector
+// of exactly that length.
+func route(command: Str[dyn]): Str {
+	// `direction` binds command[1]; `steps` binds command[2:].
+	if command is ["move", direction, ...steps] {
+		return "move " + direction + " (" + hive.conv.its(len(steps)) + " extra arg(s))"
+	} else if command is ["stop"] {
+		return "halt"
+	} else if command is [single] {
+		return "one-word command: " + single
+	}
+	return "unrecognised command"
+}
+
+// 4. String patterns
+// ------------------
+// A string pattern is a template: literal text that must match verbatim, plus
+// `{name}` holes that bind the text between literals — including holes in the
+// MIDDLE of the string. Matching is non-greedy, so a `{seg}` between two `/`
+// never swallows a `/`; a hole with no literal after it runs to the end of the
+// string; and the template must cover the whole string. A hole-less pattern
+// (like "/health") is a plain exact match.
+func handle(path: Str): Str {
+	if path is "/health" {
+		return "200 health check"
+	} else if path is "/users/{id}/posts/{postId}" {
+		return "user " + id + ", post " + postId
+	} else if path is "/users/{id}" {
+		return "user " + id
+	} else if path is "/files/{rest}" {
+		// A trailing hole captures everything left, slashes included.
+		return "file at " + rest
+	}
+	return "404 not found"
+}
+
+proc main(): void {
+	echo "-- tagged-union patterns --"
+	echo describe(Shape.Circle(5))
+	echo describe(Shape.Rectangle(3, 4))
+	echo describe(Shape.Point())
+
+	echo "-- result patterns --"
+	echo parseAge("42")
+	echo parseAge("twelve")
+
+	echo "-- vector patterns --"
+	echo route(["move", "north", "10", "20"])
+	echo route(["stop"])
+	echo route(["jump"])
+	echo route(["a", "b", "c", "d"])
+
+	echo "-- string patterns --"
+	echo handle("/health")
+	echo handle("/users/7/posts/99")
+	echo handle("/users/7")
+	echo handle("/files/img/logo.png")
+	echo handle("/nope")
+}

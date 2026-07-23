@@ -131,10 +131,40 @@ SELECT * FROM users WHERE name = 'O''Brien'
 await!!!
 ```
 
-More complete programs — CSV parsing with pattern matching, a full tour of the
-type system, an HTTP server that speaks JSON, a `hive.crypto` walkthrough
-(hashing, HMAC, base64 and JWTs), a `hive.sql` example backed by an embedded
-SQLite database, and a tour of Hive's copy-on-binding [value
+Pattern matching with `is` — beyond the tagged-union variants and `Result`s
+above (`x is T.Variant(field)`, `r is Result.Ok(v)`), it also destructures
+**vectors** and **strings**, binding parts of the value as it matches:
+
+```hive
+proc main(): void {
+	// Vectors match positionally; a trailing `...rest` binds the leftovers.
+	command := ["move", "north", "10", "20"]
+	if command is ["move", direction, ...steps] {
+		echo "go " + direction + " (" + hive.conv.its(len(steps)) + " args)"
+	}
+
+	// Strings match a template of literal text and `{hole}` captures, including
+	// holes in the middle. Matching is non-greedy and covers the whole string.
+	path := "/users/7/posts/99"
+	if path is "/users/{id}/posts/{postId}" {
+		echo "user " + id + ", post " + postId
+	} else if path is "/health" {          // a hole-less pattern is exact match
+		echo "health check"
+	}
+}
+```
+
+Prints:
+
+```
+go north (2 args)
+user 7, post 99
+```
+
+More complete programs — CSV parsing and a full tour of pattern matching (every
+form above), the type system, an HTTP server that speaks JSON, a `hive.crypto`
+walkthrough (hashing, HMAC, base64 and JWTs), a `hive.sql` example backed by an
+embedded SQLite database, and a tour of Hive's copy-on-binding [value
 semantics](#value-semantics-copy-on-binding) — live in `code-examples/`. They
 double as the language's specification: each one compiles, builds and runs.
 
@@ -200,6 +230,20 @@ double as the language's specification: each one compiles, builds and runs.
   variant. `is` narrows a value to a variant and can bind its fields, and the
   bindings are usable immediately in the same condition:
   `if x is T.A(v) && v == "ok" { ... }`.
+* **Pattern matching** with `is` also destructures vectors and strings, binding
+  as it matches. A **vector pattern** matches positionally: `v is ["a", x]`
+  requires exactly two elements whose first equals `"a"` and binds the second
+  to `x`; a trailing `...rest` (`v is ["a", x, ...rest]`) relaxes the length to
+  a lower bound and binds the leftover elements as a vector. Element positions
+  are literals to match (`"a"`, `3`, `#Atom`), a name to bind, or `_` to skip.
+  A **string pattern** is a template of literal text and `{name}` holes:
+  `path is "/api/v1/{id}/{name}/delete"` matches only when the whole string
+  fits the template and binds `id` and `name` to the text spanning each hole —
+  including holes in the *middle* of the string. Matching is non-greedy, so a
+  hole between two `/` never swallows a `/`; a hole with no literal after it
+  runs to the end. Holes must be plain binding names and two holes may not sit
+  side by side (the split point would be ambiguous) — both are compile errors.
+  A hole-less string pattern (`path is "/health"`) is just an exact match.
 * **Loops** come in two shapes. The C-style counting loop
   `for <init>; <cond>; <post> { ... }` runs `init` once, then repeats the body
   while `cond` holds, running `post` after each pass — its counter is scoped to

@@ -87,6 +87,118 @@ pub fn adt_pattern_match_test() {
   should.be_false(string.contains(go, "_ := parsedCsv"))
 }
 
+pub fn vector_pattern_length_and_element_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tv := [\"a\", \"b\", \"c\"]\n\tif v is [\"a\", x, ...tail] {\n\t\techo x\n\t\techo tail\n\t}\n}\n",
+    )
+  // A rest `...tail` makes the length a lower bound, and literal elements
+  // compare positionally while `_`/named elements do not add a check.
+  should.be_true(string.contains(go, "len(v) >= 2"))
+  should.be_true(string.contains(go, "(v[0] == \"a\")"))
+  // The named element and the rest bind into the branch body.
+  should.be_true(string.contains(go, "x := v[1]"))
+  should.be_true(string.contains(go, "tail := v[2:]"))
+}
+
+pub fn vector_pattern_fixed_length_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tv := [\"a\", \"b\"]\n\tif v is [\"a\", \"b\"] {\n\t\techo \"hi\"\n\t}\n}\n",
+    )
+  // No rest: the length must match exactly.
+  should.be_true(string.contains(go, "len(v) == 2"))
+  should.be_false(string.contains(go, "len(v) >= 2"))
+}
+
+pub fn vector_pattern_wildcard_binds_nothing_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tv := [\"a\", \"b\"]\n\tif v is [_, x] {\n\t\techo x\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "x := v[1]"))
+  // `_` introduces no binding.
+  should.be_false(string.contains(go, "_ := v[0]"))
+}
+
+pub fn string_pattern_exact_match_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tp := \"/health\"\n\tif p is \"/health\" {\n\t\techo \"ok\"\n\t}\n}\n",
+    )
+  // A hole-less string pattern is a plain equality, not a MatchPattern call.
+  should.be_true(string.contains(go, "p == \"/health\""))
+  should.be_false(string.contains(go, "MatchPattern"))
+}
+
+pub fn string_pattern_template_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tp := \"/api/v1/1/bob/delete\"\n\tif p is \"/api/v1/{id}/{name}/delete\" {\n\t\techo id\n\t\techo name\n\t}\n}\n",
+    )
+  // The leading literal becomes the prefix; each hole's terminating literal
+  // becomes a separator (the last hole here ends on "/delete").
+  should.be_true(string.contains(
+    go,
+    "hive.MatchPattern(p, \"/api/v1/\", []string{\"/\", \"/delete\"})",
+  ))
+  should.be_true(string.contains(go, "!= nil"))
+  // Captures read back positionally in the branch body.
+  should.be_true(string.contains(
+    go,
+    "id := hive.MatchPattern(p, \"/api/v1/\", []string{\"/\", \"/delete\"})[0]",
+  ))
+  should.be_true(string.contains(
+    go,
+    "name := hive.MatchPattern(p, \"/api/v1/\", []string{\"/\", \"/delete\"})[1]",
+  ))
+}
+
+pub fn string_pattern_trailing_hole_captures_to_end_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tp := \"/files/a/b\"\n\tif p is \"/files/{path}\" {\n\t\techo path\n\t}\n}\n",
+    )
+  // A hole that is the final piece runs to the end of the string, encoded as
+  // an empty terminating separator.
+  should.be_true(string.contains(
+    go,
+    "hive.MatchPattern(p, \"/files/\", []string{\"\"})",
+  ))
+}
+
+pub fn string_pattern_adjacent_holes_rejected_test() {
+  let result =
+    compiler.compile(
+      "proc main(): void {\n\tp := \"ab\"\n\tif p is \"{a}{b}\" {\n\t\techo a\n\t}\n}\n",
+    )
+  should.be_error(result)
+}
+
+pub fn string_pattern_non_ident_hole_rejected_test() {
+  let result =
+    compiler.compile(
+      "proc main(): void {\n\tp := \"ab\"\n\tif p is \"/{a.b}/\" {\n\t\techo \"x\"\n\t}\n}\n",
+    )
+  should.be_error(result)
+}
+
+pub fn vector_pattern_rest_must_be_last_test() {
+  let result =
+    compiler.compile(
+      "proc main(): void {\n\tv := [\"a\"]\n\tif v is [...tail, \"x\"] {\n\t\techo tail\n\t}\n}\n",
+    )
+  should.be_error(result)
+}
+
+pub fn vector_pattern_bad_element_rejected_test() {
+  let result =
+    compiler.compile(
+      "proc main(): void {\n\tv := [\"a\"]\n\tif v is [x + 1] {\n\t\techo \"x\"\n\t}\n}\n",
+    )
+  should.be_error(result)
+}
+
 pub fn tagged_union_becomes_interface_test() {
   let go = compile(example)
   should.be_true(string.contains(go, "type ParsingResult interface"))

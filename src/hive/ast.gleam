@@ -183,4 +183,36 @@ pub type Arg {
 pub type Pattern {
   /// e.g. `Result.Ok(table)` -> path ["Result", "Ok"], bindings ["table"].
   PConstructor(path: List(String), bindings: List(String))
+  /// A vector pattern, e.g. `["a", x, ...tail]`: a fixed sequence of element
+  /// sub-patterns matched positionally, with an optional `...rest` tail.
+  /// `rest` is `None` for a fixed-length pattern (`["a", "b"]`, matches only a
+  /// vector of exactly that length) and `Some(name)` when a trailing `...name`
+  /// is present (matches a vector of *at least* that length, binding the
+  /// leftover elements to `name`; the name is `_` when the tail is discarded).
+  PVector(elems: List(PatElem), rest: Option(String))
+  /// A string template pattern, e.g. `"/api/{id}/{name}/delete"`: literal text
+  /// that must match verbatim interleaved with `{name}` holes that bind the
+  /// text spanning to the next literal. A pattern with no holes is a plain
+  /// exact-match against the literal.
+  PString(parts: List(StrPat))
+}
+
+/// One element of a vector pattern.
+pub type PatElem {
+  /// A literal the corresponding element must equal (a string, number,
+  /// boolean, or atom literal).
+  PElemLit(value: Expr)
+  /// A binding: an identifier that captures the element. The name `_` matches
+  /// any element and binds nothing.
+  PElemBind(name: String)
+}
+
+/// One piece of a string template pattern.
+pub type StrPat {
+  /// Literal text that must appear verbatim at this position.
+  SPatLit(text: String)
+  /// A `{name}` hole binding the text that spans to the next literal (or to
+  /// the end of the string when it is the final piece). The name `_` matches
+  /// but binds nothing.
+  SPatHole(name: String)
 }
