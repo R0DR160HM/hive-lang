@@ -1,0 +1,81 @@
+# syntax=docker/dockerfile:1
+#
+# Build a Hive program in the cloud and ship only the resulting native binary.
+#
+#   Stage 1 (builder): Gleam runs the Hive compiler; the compiler shells out to
+#                      Go to turn the generated Go into a native executable.
+#   Stage 2 (runtime): just the compiled program — no Gleam, Erlang or Go.
+#
+# Assumes this repo (the compiler) is the build context and your program lives
+# at ./app.hive. Build & run:
+#
+#   docker build -f Dockerfile.example -t my-hive-app .
+#   docker run --rm my-hive-app
+
+##############################################################################
+# Stage 1 — builder
+##############################################################################
+# Erlang/OTP is Gleam's runtime; the README verifies OTP 27/28.
+FROM erlang:28-slim AS builder
+
+# Pin the toolchain versions the README verifies against. Override at build
+# time with e.g. --build-arg GO_VERSION=1.26.1
+ARG GLEAM_VERSION=1.16.0
+ARG GO_VERSION=1.26.0
+ARG TARGETARCH             # injected by BuildKit: "amd64" or "arm64"
+
+# curl + certs only to fetch the toolchains below.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+
+# --- Fetch Gleam (static release binary) ---------------------------------
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      amd64) garch=x86_64 ;; \
+      arm64) garch=aarch64 ;; \
+      *) echo "unsupported arch: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/gleam.tar.gz \
+      "https://github.com/gleam-lang/gleam/releases/download/v${GLEAM_VERSION}/gleam-v${GLEAM_VERSION}-${garch}-unknown-linux-musl.tar.gz"; \
+    tar -xzf /tmp/gleam.tar.gz -C /usr/local/bin; \
+    rm /tmp/gleam.tar.gz; \
+    gleam --version
+
+# --- Fetch Go ------------------------------------------------------------
+RUN set -eux; \
+    curl -fsSL -o /tmp/go.tar.gz \
+      "https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz"; \
+    tar -C /usr/local -xzf /tmp/go.tar.gz; \
+    rm /tmp/go.tar.gz
+ENV PATH="/usr/local/go/bin:${PATH}"
+RUN go version
+
+# --- Build the Hive compiler (this Gleam project) ------------------------
+WORKDIR /opt/hive
+COPY gleam.toml manifest.toml ./
+COPY src ./src
+RUN gleam deps download           # warm the dependency cache
+
+# --- Compile your Hive program to a native binary ------------------------
+# `hive build` writes the executable next to the entrypoint (so /app/app here)
+# and leaves the intermediate Go project in /app/app.hive-build/.
+# CGO_ENABLED=0 gives a static binary that runs in a bare runtime image; the
+# bundled SQLite driver is pure Go, so this stays fully functional.
+ENV CGO_ENABLED=0
+COPY app.hive /app/app.hive
+RUN gleam run -- build /app/app.hive \
+ && test -x /app/app               # fail the build early if no binary appeared
+
+##############################################################################
+# Stage 2 — runtime (minimal: only the compiled program)
+##############################################################################
+FROM gcr.io/distroless/static-debian12 AS runtime
+WORKDIR /app
+COPY --from=builder /app/app /usr/local/bin/app
+
+# If your program reads relative files (a CSV via `using "./x.csv"`, a `.env`),
+# copy them next to the working directory and they resolve as expected:
+#   COPY --from=builder /app/data ./data
+
+ENTRYPOINT ["/usr/local/bin/app"]
