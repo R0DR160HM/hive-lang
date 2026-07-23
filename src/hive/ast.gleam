@@ -65,6 +65,11 @@ pub type TypeExpr {
   /// A named type, optionally package-qualified (e.g. `hive.TableError`),
   /// with trailing vector markers (e.g. `Str[dyn][dyn]` -> two dims).
   TName(pkg: Option(String), name: String, dims: List(Dim))
+  /// A function type, spelled like a declaration without a name:
+  /// `func(Int, Str): Bool` (pure) or `proc(Req): Resp` (impure). `pure`
+  /// separates the two. A `func` value may be used where a `proc` type is
+  /// expected (pure widens to impure), but not the reverse.
+  TFunc(pure: Bool, params: List(TypeExpr), ret: TypeExpr)
 }
 
 pub type Stmt {
@@ -103,6 +108,10 @@ pub type Stmt {
   SEcho(value: Expr)
   /// `assert condition` — panic at runtime when the condition is false.
   SAssert(value: Expr)
+  /// `panic value` — stop the program immediately, showing `value` rendered as
+  /// a string (the same conversion `echo` uses). Unlike `assert`, it always
+  /// fires and takes any value, not just a boolean.
+  SPanic(value: Expr)
   /// `break` — leave the innermost enclosing loop.
   SBreak
   /// `continue` — skip to the next iteration of the innermost enclosing loop.

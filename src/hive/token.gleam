@@ -48,6 +48,7 @@ pub type Kind {
   KwFalse
   KwEcho
   KwAssert
+  KwPanic
   KwDyn
   KwMut
   KwAsync
@@ -127,6 +128,7 @@ pub fn describe(kind: Kind) -> String {
     KwFalse -> "`false`"
     KwEcho -> "`echo`"
     KwAssert -> "`assert`"
+    KwPanic -> "`panic`"
     KwDyn -> "`dyn`"
     KwMut -> "`mut`"
     KwAsync -> "`async`"

@@ -40,6 +40,12 @@ pub type Ty {
   /// A struct provided by the runtime (`hive.HttpRequest`, ...); the name is
   /// unqualified, see `builtin_fields`.
   TyBuiltin(String)
+  /// A first-class function value. `pure` is True for a `func`, False for a
+  /// `proc`; both lower to the same Go `func(...)` type.
+  TyFunc(pure: Bool, params: List(Ty), ret: Ty)
+  /// The absence of a value — only meaningful as a function type's return, so
+  /// a `proc(T): void` value lowers to `func(T)` with no Go return type.
+  TyVoid
   TyUnknown
 }
 
@@ -67,6 +73,12 @@ pub fn builtin_fields(name: String) -> Option(List(#(String, Ty))) {
       Some([#("alg", TyStr), #("typ", TyStr), #("kid", TyStr)])
     "SqlError" -> Some([#("message", TyStr)])
     "DatabaseDriver" -> Some([#("name", TyStr)])
+    // An open database connection. It is opaque — it exposes no fields — but it
+    // is still a named builtin type, so a parameter or variable can be declared
+    // `hive.sql.SqlConnection`. Registering it here is what lets its type
+    // resolve to `TyBuiltin("SqlConnection")`, which `using ... with ...` needs
+    // in order to run a SQL query rather than read a CSV.
+    "SqlConnection" -> Some([])
     _ -> None
   }
 }
@@ -158,6 +170,11 @@ type Env {
     /// immutable binding (see `aliased_source` / `bind_rhs`): something else
     /// may still mutate it.
     aliased: Dict(String, Bool),
+    /// Every user-declared proc/func/query, keyed by name: whether it is pure
+    /// (a func/query) and its full parameter list and return type. Powers
+    /// first-class function values — the closure a partial application lowers
+    /// to needs the exact parameter and return types.
+    fns: Dict(String, #(Bool, List(ast.Field), ast.TypeExpr)),
   )
 }
 
@@ -176,6 +193,7 @@ pub fn generate(module: ast.Module) -> String {
         _ -> Error(Nil)
       }
     })
+  let fns = collect_fns(module.decls)
   let env =
     Env(
       types,
@@ -187,6 +205,7 @@ pub fn generate(module: ast.Module) -> String {
       asyncs,
       dict.new(),
       dict.new(),
+      fns,
     )
 
   let type_code =
@@ -254,7 +273,7 @@ fn uses_json_stmts(stmts: List(ast.Stmt)) -> Bool {
       ast.SReturn(None) -> False
       ast.SReturn(Some(e)) -> uses_json_expr(e)
       ast.SEcho(e) -> uses_json_expr(e)
-      ast.SAssert(e) -> uses_json_expr(e)
+      ast.SAssert(e) | ast.SPanic(e) -> uses_json_expr(e)
       ast.SBreak | ast.SContinue -> False
       ast.SExpr(e) -> uses_json_expr(e)
       ast.SIf(branches, else_body) ->
@@ -341,6 +360,24 @@ fn collect_types(decls: List(ast.Decl)) -> Dict(String, ast.Decl) {
   })
 }
 
+// Records each user callable's purity, parameters and return type for
+// first-class function support. A `proc` is impure; a `func`/`query` is pure.
+fn collect_fns(
+  decls: List(ast.Decl),
+) -> Dict(String, #(Bool, List(ast.Field), ast.TypeExpr)) {
+  list.fold(decls, dict.new(), fn(acc, d) {
+    case d {
+      ast.ProcDecl(name, params, ret, _) ->
+        dict.insert(acc, name, #(False, params, ret))
+      ast.FuncDecl(name, params, ret, _, _) ->
+        dict.insert(acc, name, #(True, params, ret))
+      ast.QueryDecl(name, params, ret, _) ->
+        dict.insert(acc, name, #(True, params, ret))
+      ast.TypeDecl(..) -> acc
+    }
+  })
+}
+
 fn collect_sigs(
   types: Dict(String, ast.Decl),
   decls: List(ast.Decl),
@@ -399,7 +436,7 @@ fn atoms_in_stmts(stmts: List(ast.Stmt), acc: List(String)) -> List(String) {
       ast.SReturn(None) -> acc
       ast.SReturn(Some(e)) -> atoms_in_expr(e, acc)
       ast.SEcho(e) -> atoms_in_expr(e, acc)
-      ast.SAssert(e) -> atoms_in_expr(e, acc)
+      ast.SAssert(e) | ast.SPanic(e) -> atoms_in_expr(e, acc)
       ast.SBreak | ast.SContinue -> acc
       ast.SExpr(e) -> atoms_in_expr(e, acc)
       ast.SIf(branches, else_body) -> {
@@ -558,6 +595,21 @@ fn ty_of_type_expr(types: Dict(String, ast.Decl), t: ast.TypeExpr) -> Ty {
         None -> wrap_dims(TyUnknown, dims)
       }
     ast.TName(None, name, dims) -> wrap_dims(base_ty(types, name), dims)
+    ast.TFunc(pure, params, ret) ->
+      TyFunc(
+        pure,
+        list.map(params, fn(p) { ty_of_type_expr(types, p) }),
+        fn_ret_ty(types, ret),
+      )
+  }
+}
+
+// A function type's return, keeping `void` distinct (so a `proc(T): void` value
+// lowers to `func(T)` with no Go return) rather than collapsing it to unknown.
+fn fn_ret_ty(types: Dict(String, ast.Decl), ret: ast.TypeExpr) -> Ty {
+  case ret {
+    ast.TVoid -> TyVoid
+    _ -> ty_of_type_expr(types, ret)
   }
 }
 
@@ -590,6 +642,14 @@ fn wrap_dims(base: Ty, dims: List(ast.Dim)) -> Ty {
 fn gen_type(t: ast.TypeExpr) -> String {
   case t {
     ast.TVoid -> ""
+    ast.TFunc(_, params, ret) -> {
+      let ps = params |> list.map(gen_type) |> string.join(", ")
+      let r = case ret {
+        ast.TVoid -> ""
+        _ -> " " <> gen_type(ret)
+      }
+      "func(" <> ps <> ")" <> r
+    }
     ast.TName(pkg, name, dims) -> {
       let prefix = string.repeat("[]", list.length(dims))
       let base = case pkg {
@@ -633,6 +693,15 @@ fn ty_to_go(ty: Ty) -> String {
     TyCustom(name) -> name
     TyBuiltin(name) -> "hive." <> name
     TyResult(_, _) -> "any"
+    TyFunc(_, params, ret) -> {
+      let ps = params |> list.map(ty_to_go) |> string.join(", ")
+      let r = case ret {
+        TyVoid -> ""
+        _ -> " " <> ty_to_go(ret)
+      }
+      "func(" <> ps <> ")" <> r
+    }
+    TyVoid -> ""
     TyUnknown -> "any"
   }
 }
@@ -1083,7 +1152,9 @@ fn gen_query_decl(
 // `panic` to satisfy the Go compiler (it is genuinely unreachable at runtime).
 fn gen_terminator(body: List(ast.Stmt)) -> String {
   case list.last(body) {
-    Ok(ast.SReturn(_)) -> ""
+    // A body already ending in `return` or `panic` terminates on its own, so no
+    // fallback is needed.
+    Ok(ast.SReturn(_)) | Ok(ast.SPanic(_)) -> ""
     _ -> "\tpanic(\"hive: unreachable\")\n"
   }
 }
@@ -1174,6 +1245,12 @@ fn gen_stmt(
       let #(cond, _) = gen_condition(env, e)
       #(pad <> "hive.Assert(" <> cond <> ")\n", env)
     }
+    // `panic value` renders the value the same way `echo` does (via
+    // hive.Show), then aborts.
+    ast.SPanic(e) -> #(
+      pad <> "panic(hive.Show(" <> gen_expr(env, e) <> "))\n",
+      env,
+    )
     ast.SBreak -> #(pad <> "break\n", env)
     ast.SContinue -> #(pad <> "continue\n", env)
     ast.SAssign(target, value) -> {
@@ -1712,7 +1789,17 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
     ast.EIdent(name) ->
       case dict.get(env.locals, name) {
         Ok(ty) -> ty
-        Error(_) -> TyUnknown
+        // A bare reference to a user callable is a function value.
+        Error(_) ->
+          case dict.get(env.fns, name) {
+            Ok(#(pure, params, ret)) ->
+              TyFunc(
+                pure,
+                list.map(params, fn(p) { ty_of_type_expr(env.types, p.typ) }),
+                fn_ret_ty(env.types, ret),
+              )
+            Error(_) -> TyUnknown
+          }
       }
     ast.EVector(items) ->
       case items {
@@ -1749,12 +1836,23 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
             [] -> TyUnknown
           }
         ast.EIdent(name) ->
-          case dict.has_key(env.types, name) {
-            True -> TyCustom(name)
+          case has_hole(args) {
+            // A call with `_` placeholders is a partial application, whose
+            // value is a function taking the holes as its parameters.
+            True -> partial_ty(env, name, args)
             False ->
-              case dict.get(env.sigs, name) {
-                Ok(#(_, ret)) -> ret
-                Error(_) -> TyUnknown
+              case dict.get(env.locals, name) {
+                // Calling a function-valued local yields its return type.
+                Ok(TyFunc(_, _, ret)) -> ret
+                _ ->
+                  case dict.has_key(env.types, name) {
+                    True -> TyCustom(name)
+                    False ->
+                      case dict.get(env.sigs, name) {
+                        Ok(#(_, ret)) -> ret
+                        Error(_) -> TyUnknown
+                      }
+                  }
               }
           }
         // `hive.sql.DatabaseDriver.SQLite()` and friends build a driver value.
@@ -2514,6 +2612,7 @@ fn var_mutated_in_stmt(s: ast.Stmt, name: String) -> Bool {
     | ast.SReturn(_)
     | ast.SEcho(_)
     | ast.SAssert(_)
+    | ast.SPanic(_)
     | ast.SBreak
     | ast.SContinue -> False
   }
@@ -2547,7 +2646,8 @@ fn may_escape_stmt(s: ast.Stmt, name: String) -> Bool {
     ast.SReturn(Some(value)) -> uses_in_expr(value, name)
     ast.SReturn(None) -> False
     // Reads that retain no reference.
-    ast.SEcho(_) | ast.SAssert(_) | ast.SBreak | ast.SContinue -> False
+    ast.SEcho(_) | ast.SAssert(_) | ast.SPanic(_) | ast.SBreak | ast.SContinue ->
+      False
     // A call may return or retain a slice aliasing one of its arguments.
     ast.SExpr(e) -> uses_in_expr(e, name)
     ast.SIf(branches, else_body) ->
@@ -2962,6 +3062,88 @@ fn gen_field_args(
 }
 
 fn gen_ident_call(env: Env, name: String, args: List(ast.Arg)) -> String {
+  // A call carrying `_` placeholders is a partial application of a user
+  // callable: it builds a closure rather than calling. (The compiler has
+  // already rejected placeholders anywhere else.)
+  case has_hole(args) && dict.has_key(env.fns, name) {
+    True -> gen_partial(env, name, args)
+    False -> gen_ident_call_full(env, name, args)
+  }
+}
+
+// Lowers `f(a, _, c)` to `func(h0 T) R { return f(a, h0, c) }`: each `_`
+// becomes a fresh parameter (typed from f's signature, in hole order), each
+// supplied argument is captured by value where it is written.
+fn gen_partial(env: Env, name: String, args: List(ast.Arg)) -> String {
+  let assert Ok(#(_pure, params, ret)) = dict.get(env.fns, name)
+  let #(assigned, _) = assign_args(args, list.map(params, fn(p) { p.name }))
+  // `assigned` and `params` are both in declaration order; pair them so each
+  // argument knows its parameter's type.
+  let paired = list.zip(assigned, params)
+  let hole_params =
+    paired
+    |> list.index_map(fn(pair, i) { #(pair, i) })
+    |> list.filter_map(fn(entry) {
+      let #(#(#(_, expr), field), i) = entry
+      case is_hole_expr(expr) {
+        True -> Ok("_h" <> int.to_string(i) <> " " <> gen_type(field.typ))
+        False -> Error(Nil)
+      }
+    })
+    |> string.join(", ")
+  let call_args =
+    paired
+    |> list.index_map(fn(pair, i) { #(pair, i) })
+    |> list.map(fn(entry) {
+      let #(#(#(_, expr), field), i) = entry
+      case is_hole_expr(expr) {
+        True -> "_h" <> int.to_string(i)
+        False -> coerce(env, expr, ty_of_type_expr(env.types, field.typ))
+      }
+    })
+    |> string.join(", ")
+  let call = escape_ident(name) <> "(" <> call_args <> ")"
+  let #(ret_go, body) = case ret {
+    ast.TVoid -> #("", call)
+    _ -> #(" " <> gen_type(ret), "return " <> call)
+  }
+  "func(" <> hole_params <> ")" <> ret_go <> " { " <> body <> " }"
+}
+
+fn has_hole(args: List(ast.Arg)) -> Bool {
+  list.any(args, fn(a) { is_hole_expr(a.value) })
+}
+
+fn is_hole_expr(e: ast.Expr) -> Bool {
+  case e {
+    ast.EIdent("_") -> True
+    _ -> False
+  }
+}
+
+// The result type of a partial application `name(...)`: a function value whose
+// parameters are the hole positions (in order) and whose return matches the
+// wrapped callable.
+fn partial_ty(env: Env, name: String, args: List(ast.Arg)) -> Ty {
+  case dict.get(env.fns, name) {
+    Ok(#(pure, params, ret)) -> {
+      let #(assigned, _) = assign_args(args, list.map(params, fn(p) { p.name }))
+      let hole_tys =
+        list.zip(assigned, params)
+        |> list.filter_map(fn(pair) {
+          let #(#(_, expr), field) = pair
+          case is_hole_expr(expr) {
+            True -> Ok(ty_of_type_expr(env.types, field.typ))
+            False -> Error(Nil)
+          }
+        })
+      TyFunc(pure, hole_tys, fn_ret_ty(env.types, ret))
+    }
+    Error(_) -> TyUnknown
+  }
+}
+
+fn gen_ident_call_full(env: Env, name: String, args: List(ast.Arg)) -> String {
   case name {
     // `len` counts elements of a vector but characters (runes) of a Str.
     "len" ->
@@ -3209,7 +3391,7 @@ fn uses_in_stmt(s: ast.Stmt, name: String) -> Bool {
     ast.SReturn(None) -> False
     ast.SReturn(Some(e)) -> uses_in_expr(e, name)
     ast.SEcho(e) -> uses_in_expr(e, name)
-    ast.SAssert(e) -> uses_in_expr(e, name)
+    ast.SAssert(e) | ast.SPanic(e) -> uses_in_expr(e, name)
     ast.SBreak | ast.SContinue -> False
     ast.SExpr(e) -> uses_in_expr(e, name)
     ast.SIf(branches, else_body) -> {

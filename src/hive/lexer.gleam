@@ -379,6 +379,7 @@ fn keyword_or_ident(word: String) -> token.Kind {
     "false" -> token.KwFalse
     "echo" -> token.KwEcho
     "assert" -> token.KwAssert
+    "panic" -> token.KwPanic
     "dyn" -> token.KwDyn
     "mut" -> token.KwMut
     "async" -> token.KwAsync

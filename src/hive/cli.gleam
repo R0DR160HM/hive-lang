@@ -177,9 +177,22 @@ fn prepare_build_dir(build_dir: String, main_go: String) -> Result(Nil, String) 
     runtime.runtime_go(),
   ))
   // The SQL runtime (and its external drivers) is only pulled in on demand.
+  // When the program does not use SQL, remove any sql.go left over from an
+  // earlier build in this same directory: go.mod is regenerated
+  // dependency-free on every build, so a stale sql.go would fail to resolve
+  // its driver imports even though nothing references them. `delete_all` is a
+  // no-op when the file is already absent.
+  let sql_path = filepath.join(build_dir, "hive/sql.go")
   case uses_sql(main_go) {
-    True -> write(filepath.join(build_dir, "hive/sql.go"), runtime.sql_go())
-    False -> Ok(Nil)
+    True -> write(sql_path, runtime.sql_go())
+    False ->
+      simplifile.delete_all([sql_path])
+      |> result.map_error(fn(e) {
+        "could not remove a stale "
+        <> sql_path
+        <> ": "
+        <> simplifile.describe_error(e)
+      })
   }
 }
 

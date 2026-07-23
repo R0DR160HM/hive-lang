@@ -1,0 +1,54 @@
+query createTable(): Str {
+	CREATE TABLE cache (
+		name VARCHAR(255) PRIMARY KEY,
+		value TEXT NOT NULL,
+		created_at TEXT DEFAULT CURRENT_TIMESTAMP 
+	)
+}
+
+query insert(name: Str, value: Str): Str {
+	INSERT INTO cache (name, value) VALUES ({name}, {value})
+}
+
+query get(name: Str): Str {
+	SELECT value FROM cache WHERE name = {name} 
+}
+
+proc main(): void {
+	opened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), ":memory:")
+	if opened is Result.Ok(db) {
+
+		if using db with createTable() is Result.Error(err) {
+			panic err
+		}
+
+		mut port := 8081 
+		if hive.env.get("PORT") is Result.Ok(pStr) && hive.conv.sti(pStr) is Result.Ok(p) {
+			port = p
+		}
+
+		echo "Listening on port {port}"
+		hive.http.serve(port, handler(_, db))
+
+	} else if opened is Result.Error(err) {
+		panic err
+	}
+}
+
+proc handler(req: hive.http.HttpRequest, db: hive.sql.SqlConnection): hive.http.HttpResponse {
+	if req.method == "POST" && req.url is "/set/{name}" {
+		if using db with insert(name, req.body) is Result.Ok(_) {
+			return hive.http.HttpResponse(200, [["Content-Type", "text/plain"]], "OK!")
+		}
+		return hive.http.HttpResponse(500, [["Content-Type", "text/plain"]], "Internal Server Error!")
+	}
+	if req.method == "GET" && req.url is "/get/{name}" {
+		if using db with get(name) is Result.Ok(table) && table is [_header, row] && row is [value] {
+			return hive.http.HttpResponse(200, [["Content-Type", "text/plain"]], value)
+		}
+		return hive.http.HttpResponse(500, [["Content-Type", "text/plain"]], "Internal Server Error!")
+
+	}
+	return hive.http.HttpResponse(404, [["Content-Type", "text/plain"]], "Not Found!")
+
+}

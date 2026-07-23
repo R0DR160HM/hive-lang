@@ -164,7 +164,8 @@ user 7, post 99
 More complete programs — CSV parsing and a full tour of pattern matching (every
 form above), the type system, an HTTP server that speaks JSON, a `hive.crypto`
 walkthrough (hashing, HMAC, base64 and JWTs), a `hive.sql` example backed by an
-embedded SQLite database, and a tour of Hive's copy-on-binding [value
+embedded SQLite database, a tour of first-class functions and partial
+application, and a tour of Hive's copy-on-binding [value
 semantics](#value-semantics-copy-on-binding) — live in `code-examples/`. They
 double as the language's specification: each one compiles, builds and runs.
 
@@ -244,6 +245,19 @@ double as the language's specification: each one compiles, builds and runs.
   runs to the end. Holes must be plain binding names and two holes may not sit
   side by side (the split point would be ambiguous) — both are compile errors.
   A hole-less string pattern (`path is "/health"`) is just an exact match.
+* **First-class functions** — a proc or func is a value you can pass, store and
+  call later. Its type is written like a declaration with the name dropped:
+  `func(Int): Int` (pure) or `proc(hive.http.HttpRequest): hive.http.HttpResponse`
+  (impure), usable as a parameter, return or variable type. A value is produced
+  by a **bare reference** (the callable's name on its own), or by a **partial
+  application** — a call with `_` holes, e.g. `handler(_, db)`, which fixes the
+  supplied arguments and leaves each `_` as a parameter of the resulting
+  function (in order), capturing the rest by value. So
+  `hive.http.serve(8080, handler(_, db))` adapts a two-argument `handler` into
+  the one-argument handler `serve` expects. The `proc`/`func` split is
+  preserved through values: a `func` value may be used where a `proc` is
+  expected (pure widens to impure), but a `proc` value may not fill a `func`
+  slot, and a `func` still cannot *call* a proc value.
 * **Loops** come in two shapes. The C-style counting loop
   `for <init>; <cond>; <post> { ... }` runs `init` once, then repeats the body
   while `cond` holds, running `post` after each pass — its counter is scoped to
@@ -257,6 +271,13 @@ double as the language's specification: each one compiles, builds and runs.
   loop; both act on the innermost enclosing loop, and using them outside a loop
   is a compile error.
 * **`assert cond`** panics at runtime when the condition is false.
+* **`panic value`** stops the program immediately, showing `value` rendered as
+  a string exactly the way `echo` displays it — so `panic err` prints the
+  error's message and an atom prints its name (not its decimal form). Unlike
+  `assert`, it always fires and takes any value, not just a boolean. Because it
+  never returns, a branch or tail ending in `panic` counts as a terminating
+  path (so `panic "unreachable"` can close off an impossible tail, like
+  `assert false`).
 * **Named arguments** — funcs, procs, queries and type constructors (builtin
   ones included) accept arguments by name: `f(b: 1, "s")`. Named arguments
   can appear anywhere; only the unnamed ones need to be in order, filling
@@ -483,6 +504,7 @@ Reads environment variables, from a `.env` file or the OS.
 | `f(x)` bare / `await f(x)` (async `f`)  | `go f(x)` (fire-and-forget goroutine) / `f(x)` (blocking call) |
 | `echo v`                                | `fmt.Println(v)` (stringifies any value, appends a newline)    |
 | `assert cond`                           | `hive.Assert(cond)`                                            |
+| `panic value`                           | `panic(hive.Show(value))` (renders `value` like `echo`)        |
 | `T.Variant(a, b)`                       | `T(TVariant{Field0: a, Field1: b})` (positional: own then common) |
 | `x is Result.Ok(v)` / `Result.Error(e)` | `x.IsOk()` + `v := x.Ok()` / `x.IsError()` + `e := x.Err()`    |
 | `x is T.Variant(a, _)` (user ADT)       | type assertion; bindings read fields, `_` binds nothing        |
@@ -505,7 +527,9 @@ Reads environment variables, from a `.env` file or the OS.
 | `hive.json.encode(v)`                   | derived `jsonEncode_T(v)` (cannot fail, so plain `string`)     |
 | `hive.json.table(t)` / `.get(tbl, p)`   | `hive.JsonTable(t)` / `hive.JsonGet(tbl, p)`                   |
 | `hive.http.request(r)`                  | `hive.HttpSend(r)` → `Result[HttpResponse, HttpError]`         |
-| `hive.http.serve(port, handler)`        | `hive.HttpServe(port, handler)` (handler passed by proc name)  |
+| `hive.http.serve(port, handler)`        | `hive.HttpServe(port, handler)` (handler is any function value) |
+| `f` (bare reference)                    | `f` (the Go function value)                                    |
+| `f(a, _, c)` (partial application)      | `func(h T) R { return f(a, h, c) }` (a closure; `_`→ parameter) |
 | `hive.crypto.sha256/sha512(s)`          | `hive.Sha256/Sha512(s)` (lowercase-hex digest)                 |
 | `hive.crypto.hmacSha256(s, k)`          | `hive.HmacSha256(s, k)` (hex) / `randomHex(n)` → `hive.RandomHex(n)` |
 | `hive.crypto.base64Encode/Decode(s)`    | `hive.Base64Encode(s)` / `hive.Base64Decode(s)` → `Result`     |
@@ -530,8 +554,9 @@ Codegen runs a lightweight type-inference pass over locals so overloaded
 syntax picks the right lowering (`+` on vectors vs. strings vs. numbers, atom
 → `Str` coercions, zero-safe division, vector literal element types). Hive
 requires every non-`void` `proc`/`func` to return on every path: a path
-terminates by ending in `return`, in `assert` (Hive's panic — handy for a tail
-you know is unreachable, e.g. `assert false`), in an `if`/`else` whose every
+terminates by ending in `return`, in `assert` or `panic` (both handy for a tail
+you know is unreachable, e.g. `assert false` or `panic "unreachable"`), in an
+`if`/`else` whose every
 branch terminates, or in an else-less `if`/`else if` chain that covers its
 subject's whole type (a `Result`'s `Ok`+`Error`, or every variant of an ADT).
 Anything else is a compile error. For an accepted function that doesn't

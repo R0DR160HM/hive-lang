@@ -57,6 +57,10 @@ type Ctx {
     /// True while checking statements inside a loop body, so `break`/`continue`
     /// outside any loop can be rejected.
     in_loop: Bool,
+    /// Full parameter list of every declared proc/func/query, so an argument
+    /// passed to a `func`-typed parameter can be checked for purity (a `func`
+    /// slot accepts only a func value; a `proc` slot accepts either).
+    fn_params: Dict(String, List(ast.Field)),
   )
 }
 
@@ -79,6 +83,15 @@ fn check(module: ast.Module) -> Result(Nil, String) {
         ast.TypeDecl(..) -> acc
       }
     })
+  let fn_params =
+    list.fold(module.decls, dict.new(), fn(acc, d) {
+      case d {
+        ast.ProcDecl(name, params, _, _)
+        | ast.FuncDecl(name, params, _, _, _)
+        | ast.QueryDecl(name, params, _, _) -> dict.insert(acc, name, params)
+        ast.TypeDecl(..) -> acc
+      }
+    })
   let types =
     list.fold(module.decls, dict.new(), fn(acc, d) {
       case d {
@@ -90,7 +103,7 @@ fn check(module: ast.Module) -> Result(Nil, String) {
     case d {
       ast.ProcDecl(name, _, ret, body) -> {
         use _ <- result.try(check_body(
-          Ctx(name, False, procs, callables, types, False),
+          Ctx(name, False, procs, callables, types, False, fn_params),
           body,
         ))
         check_returns(types, name, ret, body)
@@ -100,7 +113,7 @@ fn check(module: ast.Module) -> Result(Nil, String) {
       // are what `in_func` marks.
       ast.FuncDecl(name, _, ret, body, _) -> {
         use _ <- result.try(check_body(
-          Ctx(name, True, procs, callables, types, False),
+          Ctx(name, True, procs, callables, types, False, fn_params),
           body,
         ))
         check_returns(types, name, ret, body)
@@ -112,7 +125,10 @@ fn check(module: ast.Module) -> Result(Nil, String) {
           case p {
             ast.ILit(_) -> Ok(Nil)
             ast.IExpr(e) ->
-              check_expr(Ctx(name, True, procs, callables, types, False), e)
+              check_expr(
+                Ctx(name, True, procs, callables, types, False, fn_params),
+                e,
+              )
           }
         })
         |> result.map(fn(_) { Nil })
@@ -175,6 +191,10 @@ fn check_stmt(
       Ok(muts)
     }
     ast.SAssert(e) -> {
+      use _ <- result.try(check_expr(ctx, e))
+      Ok(muts)
+    }
+    ast.SPanic(e) -> {
       use _ <- result.try(check_expr(ctx, e))
       Ok(muts)
     }
@@ -289,8 +309,9 @@ fn terminates(types: Dict(String, ast.Decl), stmts: List(ast.Stmt)) -> Bool {
 fn stmt_terminates(types: Dict(String, ast.Decl), s: ast.Stmt) -> Bool {
   case s {
     ast.SReturn(_) -> True
-    // `assert` is Hive's panic; a branch that ends in one is a terminating path.
-    ast.SAssert(_) -> True
+    // `assert` and `panic` both stop the path here, so a branch ending in
+    // either is a terminating path.
+    ast.SAssert(_) | ast.SPanic(_) -> True
     ast.SIf(branches, else_body) -> {
       let all_return =
         list.all(branches, fn(b) { terminates(types, b.body) })
@@ -579,8 +600,13 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
     }
     ast.ECall(ast.EIdent(name), args) -> {
       // Funcs (and queries) may do I/O, but they may not call procs — only
-      // procs call procs.
-      use _ <- result.try(case ctx.in_func && dict.has_key(ctx.procs, name) {
+      // procs call procs. A partial application (`p(_, x)`) merely *wraps* the
+      // proc into a value; it does not call it, so it stays allowed in a func.
+      use _ <- result.try(case
+        ctx.in_func
+        && dict.has_key(ctx.procs, name)
+        && !has_placeholder(args)
+      {
         True ->
           Error(
             "func `"
@@ -608,6 +634,7 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
             Error(_) -> check_named(target, args, None)
           }
       })
+      use _ <- result.try(check_fn_arg_purity(ctx, name, args))
       check_args(ctx, args)
     }
     ast.ECall(callee, args) -> {
@@ -647,6 +674,69 @@ fn check_exprs(ctx: Ctx, exprs: List(ast.Expr)) -> Result(Nil, String) {
 
 fn check_args(ctx: Ctx, args: List(ast.Arg)) -> Result(Nil, String) {
   check_exprs(ctx, list.map(args, fn(a) { a.value }))
+}
+
+// Whether any argument is a `_` placeholder — i.e. the call is a partial
+// application (`f(_, x)`) that builds a function value rather than calling.
+fn has_placeholder(args: List(ast.Arg)) -> Bool {
+  list.any(args, fn(a) {
+    case a.value {
+      ast.EIdent("_") -> True
+      _ -> False
+    }
+  })
+}
+
+// A `func`-typed parameter is pure, so it may only receive a func value; a
+// `proc`-typed parameter accepts either (a func widens to a proc). This
+// enforces that rule for the argument shapes whose purity the checker can see
+// exactly — a bare reference to, or a partial application of, a declared
+// callable. A function value carried in through a local or parameter is not
+// inspectable here (the checker does no type inference), so those cases fall
+// through to Go's structural types. A partial application of `name` itself is
+// a wrapper, not a call, so its arguments are not checked against `name`.
+fn check_fn_arg_purity(
+  ctx: Ctx,
+  name: String,
+  args: List(ast.Arg),
+) -> Result(Nil, String) {
+  case has_placeholder(args), dict.get(ctx.fn_params, name) {
+    False, Ok(params) -> {
+      let #(assigned, _) =
+        codegen.assign_args(args, list.map(params, fn(p) { p.name }))
+      list.zip(assigned, params)
+      |> list.try_fold(Nil, fn(_, pair) {
+        let #(#(_, arg), field) = pair
+        case field.typ, value_is_proc(ctx, arg) {
+          ast.TFunc(True, _, _), True ->
+            Error(
+              "the `"
+              <> field.name
+              <> "` parameter of `"
+              <> name
+              <> "` is a `func` (pure), so it cannot receive a proc value — a "
+              <> "proc may perform side effects a func must not",
+            )
+          _, _ -> Ok(Nil)
+        }
+      })
+      |> result.map(fn(_) { Nil })
+    }
+    _, _ -> Ok(Nil)
+  }
+}
+
+// Whether an expression is a function value known to be impure (a proc): a bare
+// reference to a proc, or a partial application of one. Anything else — a func
+// reference, or a value arriving through a local/parameter — is not treated as
+// a known proc value here.
+fn value_is_proc(ctx: Ctx, e: ast.Expr) -> Bool {
+  case e {
+    ast.EIdent(n) -> dict.has_key(ctx.procs, n)
+    ast.ECall(ast.EIdent(n), inner) ->
+      has_placeholder(inner) && dict.has_key(ctx.procs, n)
+    _ -> False
+  }
 }
 
 fn variant_field_names(decl: ast.Decl, variant: String) -> List(String) {
@@ -1069,6 +1159,10 @@ fn check_handler(ctx: Ctx, handler: ast.Expr) -> Result(Nil, String) {
     "a handler must take exactly one hive.http.HttpRequest and return "
     <> "hive.http.HttpResponse"
   case handler {
+    // A partial application (or any call producing a function value), e.g.
+    // `handler(_, db)`. Its exact shape is enforced by Go's typed HttpServe
+    // signature; here we just let it through.
+    ast.ECall(..) -> Ok(Nil)
     ast.EIdent(name) ->
       case dict.get(ctx.procs, name) {
         Ok(#([ast.Field(_, req)], resp)) ->

@@ -302,6 +302,10 @@ fn parse_fields(
 fn parse_type_expr(tokens: Toks) -> Result(#(ast.TypeExpr, Toks), String) {
   case kind(tokens) {
     token.KwVoid -> Ok(#(ast.TVoid, tail(tokens)))
+    // A function type mirrors a declaration with the name dropped:
+    // `func(Int, Str): Bool` / `proc(Req): Resp`.
+    token.KwFunc -> parse_fn_type(tail(tokens), True)
+    token.KwProc -> parse_fn_type(tail(tokens), False)
     _ -> {
       // A dotted, possibly multi-segment qualified name: `Str`, `hive.Table`,
       // `hive.http.HttpRequest`. The last segment is the type; everything
@@ -311,6 +315,42 @@ fn parse_type_expr(tokens: Toks) -> Result(#(ast.TypeExpr, Toks), String) {
       let #(pkg, name) = split_type_path(segments)
       let #(dims, t3) = parse_dims(t2, [])
       Ok(#(ast.TName(pkg, name, dims), t3))
+    }
+  }
+}
+
+// A function type: the opening keyword is already consumed. Parses
+// `(T1, T2, ...): Ret`.
+fn parse_fn_type(
+  tokens: Toks,
+  pure: Bool,
+) -> Result(#(ast.TypeExpr, Toks), String) {
+  use t1 <- result.try(expect(tokens, token.LParen))
+  use #(params, t2) <- result.try(parse_type_list(t1, []))
+  use t3 <- result.try(expect(t2, token.Colon))
+  use #(ret, t4) <- result.try(parse_type_expr(t3))
+  Ok(#(ast.TFunc(pure, params, ret), t4))
+}
+
+// A comma-separated list of type expressions ending at `)`.
+fn parse_type_list(
+  tokens: Toks,
+  acc: List(ast.TypeExpr),
+) -> Result(#(List(ast.TypeExpr), Toks), String) {
+  case kind(tokens) {
+    token.RParen -> Ok(#(list.reverse(acc), tail(tokens)))
+    _ -> {
+      use #(typ, t1) <- result.try(parse_type_expr(tokens))
+      case kind(t1) {
+        token.Comma -> parse_type_list(tail(t1), [typ, ..acc])
+        token.RParen -> Ok(#(list.reverse([typ, ..acc]), tail(t1)))
+        other ->
+          Error(
+            "expected `,` or `)` in a function type's parameters but found "
+            <> token.describe(other)
+            <> at(t1),
+          )
+      }
     }
   }
 }
@@ -418,6 +458,7 @@ fn parse_stmt(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
     token.KwFor -> parse_for(tokens)
     token.KwEcho -> parse_echo(tokens)
     token.KwAssert -> parse_assert(tokens)
+    token.KwPanic -> parse_panic(tokens)
     token.KwBreak -> Ok(#(ast.SBreak, tail(tokens)))
     token.KwContinue -> Ok(#(ast.SContinue, tail(tokens)))
     token.KwMut -> parse_mut(tail(tokens))
@@ -467,6 +508,11 @@ fn parse_echo(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
 fn parse_assert(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
   use #(value, t1) <- result.try(parse_expr(tail(tokens)))
   Ok(#(ast.SAssert(value), t1))
+}
+
+fn parse_panic(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
+  use #(value, t1) <- result.try(parse_expr(tail(tokens)))
+  Ok(#(ast.SPanic(value), t1))
 }
 
 // An identifier-led statement is either a typed declaration (`Type name =

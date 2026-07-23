@@ -118,7 +118,9 @@ func AtomToStr(a Atom) string { return strconv.Itoa(int(a)) }
 // Bool reports whether an atom is truthy (anything but #False).
 func Bool(a Atom) bool { return a != False }
 
-// ToStr converts any Hive value to its Str form (used by interpolation).
+// ToStr converts any Hive value to its Str form (used by interpolation and
+// string coercion). Note that an Atom renders as its decimal value here, which
+// is the language's coercion rule (\"0\" + #True == \"01\").
 func ToStr(v any) string {
 	switch x := v.(type) {
 	case string:
@@ -129,6 +131,11 @@ func ToStr(v any) string {
 		return fmt.Sprint(v)
 	}
 }
+
+// Show renders a value exactly as `echo` displays it — same as fmt's default
+// formatting, so an Atom shows its NAME (via Atom.String()) rather than the
+// decimal form ToStr produces. Backs `panic value`.
+func Show(v any) string { return fmt.Sprint(v) }
 
 // Assert panics when a runtime assertion fails.
 func Assert(cond bool) {

@@ -739,6 +739,72 @@ pub fn unknown_http_builtin_is_rejected_test() {
 }
 
 // ---------------------------------------------------------------------------
+// First-class functions and partial application
+// ---------------------------------------------------------------------------
+
+const fns_example = "func applyTwice(f: func(Int): Int, x: Int): Int {\n\treturn f(f(x))\n}\nfunc addN(n: Int, x: Int): Int {\n\treturn n + x\n}\nproc main(): void {\n\tadd5 := addN(5, _)\n\techo add5(10)\n\techo applyTwice(add5, 1)\n\tinc := addN(1, _)\n\tg := inc\n\techo g(41)\n}\n"
+
+pub fn partial_application_lowers_to_closure_test() {
+  let go = compile(fns_example)
+  // `addN(5, _)` fixes the first argument and leaves a hole for the second.
+  should.be_true(string.contains(
+    go,
+    "add5 := func(_h1 int) int { return addN(5, _h1) }",
+  ))
+}
+
+pub fn function_typed_parameter_renders_test() {
+  let go = compile(fns_example)
+  // `f: func(Int): Int` lowers to a Go function type.
+  should.be_true(string.contains(go, "func applyTwice(f func(int) int, x int) int"))
+}
+
+pub fn bare_reference_and_call_of_function_value_test() {
+  let go = compile(fns_example)
+  // A bare reference is just the value; calling a function-valued local is a
+  // plain call.
+  should.be_true(string.contains(go, "g := inc"))
+  should.be_true(string.contains(go, "g(41)"))
+}
+
+pub fn serve_accepts_partial_application_handler_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tdb := \"d\"\n\thive.http.serve(8080, handler(_, db))\n}\nproc handler(req: hive.http.HttpRequest, db: Str): hive.http.HttpResponse {\n\treturn hive.http.HttpResponse(200, [], db)\n}\n",
+    )
+  should.be_true(string.contains(
+    go,
+    "hive.HttpServe(8080, func(_h0 hive.HttpRequest) hive.HttpResponse { return handler(_h0, db) })",
+  ))
+}
+
+pub fn func_typed_param_rejects_a_proc_value_test() {
+  // A `func` parameter is pure, so a proc value cannot fill it.
+  let result =
+    compiler.compile(
+      "func callF(f: func(Int): Int): Int {\n\treturn f(1)\n}\nproc impureFn(x: Int): Int {\n\treturn x\n}\nproc main(): void {\n\techo callF(impureFn)\n}\n",
+    )
+  should.be_error(result)
+}
+
+pub fn proc_typed_param_accepts_a_func_value_test() {
+  // A `proc` parameter accepts either (a pure func widens to an impure proc).
+  compiler.compile(
+    "proc callP(f: proc(Int): Int): Int {\n\treturn f(1)\n}\nfunc pureFn(x: Int): Int {\n\treturn x\n}\nproc main(): void {\n\techo callP(pureFn)\n}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn partial_application_of_proc_allowed_in_func_test() {
+  // Wrapping a proc into a value does not *call* it, so it stays legal even
+  // inside a func body.
+  compiler.compile(
+    "proc effect(a: Int, b: Int): Int {\n\treturn a + b\n}\nfunc makeAdder(n: Int): proc(Int): Int {\n\treturn effect(n, _)\n}\nproc main(): void {\n\tadd := makeAdder(3)\n\techo add(4)\n}\n",
+  )
+  |> should.be_ok
+}
+
+// ---------------------------------------------------------------------------
 // The hive.json standard library
 // ---------------------------------------------------------------------------
 
@@ -1687,6 +1753,41 @@ pub fn assert_tail_counts_as_terminating_test() {
     "func f(cond: Bool): Int {\n\tif cond {\n\t\treturn 1\n\t}\n\tassert false\n}\nproc main(): void {}\n",
   )
   |> should.be_ok
+}
+
+pub fn panic_renders_value_like_echo_test() {
+  let go =
+    compile("proc main(): void {\n\tpanic \"boom\"\n}\n")
+  // `panic value` renders via hive.Show (echo's formatting), then aborts.
+  should.be_true(string.contains(go, "panic(hive.Show(\"boom\"))"))
+}
+
+pub fn panic_accepts_any_value_test() {
+  // Unlike `assert` (boolean only), `panic` stringifies whatever it is given.
+  let go =
+    compile(
+      "proc main(): void {\n\tn := 7\n\tpanic \"n is \" + hive.conv.its(n)\n}\n",
+    )
+  should.be_true(string.contains(go, "panic(hive.Show("))
+}
+
+pub fn panic_tail_counts_as_terminating_test() {
+  // A branch/tail ending in `panic` is a terminating path, so a value-returning
+  // function needs no further `return`.
+  compiler.compile(
+    "func f(cond: Bool): Int {\n\tif cond {\n\t\treturn 1\n\t}\n\tpanic \"unreachable\"\n}\nproc main(): void {}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn panic_tail_emits_no_unreachable_fallback_test() {
+  let go =
+    compile(
+      "func f(cond: Bool): Int {\n\tif cond {\n\t\treturn 1\n\t}\n\tpanic \"boom\"\n}\nproc main(): void {}\n",
+    )
+  // The body already terminates in a panic, so codegen adds no synthetic
+  // `panic(\"hive: unreachable\")` after it.
+  should.be_false(string.contains(go, "hive: unreachable"))
 }
 
 pub fn exhaustive_variant_match_needs_no_final_return_test() {

@@ -158,7 +158,7 @@ fn check_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
       use _ <- result.try(check_expr(env, e))
       Ok(env)
     }
-    ast.SEcho(e) | ast.SAssert(e) -> {
+    ast.SEcho(e) | ast.SAssert(e) | ast.SPanic(e) -> {
       use _ <- result.try(check_expr(env, e))
       Ok(env)
     }
@@ -990,7 +990,8 @@ fn assign_root(target: ast.Expr) -> Option(String) {
 // is a `return`, or a `break`/`continue` that leaves the enclosing loop body.
 fn diverges(stmts: List(ast.Stmt)) -> Bool {
   case list.last(stmts) {
-    Ok(ast.SReturn(_)) | Ok(ast.SBreak) | Ok(ast.SContinue) -> True
+    Ok(ast.SReturn(_)) | Ok(ast.SBreak) | Ok(ast.SContinue) | Ok(ast.SPanic(_)) ->
+      True
     _ -> False
   }
 }
