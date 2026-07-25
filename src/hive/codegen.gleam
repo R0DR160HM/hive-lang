@@ -43,6 +43,12 @@ pub type Ty {
   /// A first-class function value. `pure` is True for a `func`, False for a
   /// `proc`; both lower to the same Go `func(...)` type.
   TyFunc(pure: Bool, params: List(Ty), ret: Ty)
+  /// A handle to an `async func` call still running on its own goroutine — the
+  /// value a bare async call evaluates to (Hive's `async T`). It has no surface
+  /// spelling: it is only ever inferred, held in a local binding, and consumed
+  /// by `await` (which unwraps it back to `inner`). Lowers to
+  /// `*hive.Async[inner]`.
+  TyAsync(inner: Ty)
   /// The absence of a value — only meaningful as a function type's return, so
   /// a `proc(T): void` value lowers to `func(T)` with no Go return type.
   TyVoid
@@ -703,6 +709,17 @@ fn ty_to_go(ty: Ty) -> String {
     }
     TyVoid -> ""
     TyUnknown -> "any"
+    TyAsync(inner) -> "*hive.Async[" <> async_inner_go(inner) <> "]"
+  }
+}
+
+// The Go spelling of a task's result type. A void `async func` yields no value,
+// so its handle carries `hive.Unit` (an empty struct) — awaited only to join on
+// its completion.
+fn async_inner_go(inner: Ty) -> String {
+  case inner {
+    TyVoid -> "hive.Unit"
+    _ -> ty_to_go(inner)
   }
 }
 
@@ -1282,16 +1299,19 @@ fn gen_stmt(
       }
       #(pad <> target <> " = " <> gen_append(env, args) <> "\n", env)
     }
-    ast.SExpr(e) -> {
-      let code = gen_expr(env, e)
-      // A bare call to an `async func` is fire-and-forget: run it on its own
-      // goroutine so it does not block the caller.
-      let stmt = case is_async_call(env, e) {
-        True -> "go " <> code
-        False -> code
+    // A bare call to an `async func` as a statement is fire-and-forget: run it
+    // on its own goroutine and discard the result. `go f(x)` is the cheapest
+    // lowering (no handle, no channel) — the `hive.Spawn` handle form is only
+    // needed when the result is kept (an RHS, a vector element).
+    ast.SExpr(ast.ECall(ast.EIdent(name), args) as call) ->
+      case list.contains(env.asyncs, name) {
+        True -> #(
+          pad <> "go " <> gen_call(env, ast.EIdent(name), args) <> "\n",
+          env,
+        )
+        False -> #(pad <> gen_expr(env, call) <> "\n", env)
       }
-      #(pad <> stmt <> "\n", env)
-    }
+    ast.SExpr(e) -> #(pad <> gen_expr(env, e) <> "\n", env)
     ast.SIf(branches, else_body) -> #(
       gen_if(env, branches, else_body, indent),
       env,
@@ -1448,16 +1468,6 @@ fn elem_ty_of(ty: Ty) -> Ty {
     TyVec(t) -> t
     TyTable -> TyVec(TyStr)
     _ -> TyUnknown
-  }
-}
-
-// Whether `e` is a direct call to an `async func` (so a bare-statement call is
-// fire-and-forget). An `await`ed call is an `EAwait`, not a bare `ECall`, so it
-// never matches here.
-fn is_async_call(env: Env, e: ast.Expr) -> Bool {
-  case e {
-    ast.ECall(ast.EIdent(name), _) -> list.contains(env.asyncs, name)
-    _ -> False
   }
 }
 
@@ -1824,7 +1834,6 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
       case callee {
         ast.EIdent("len") -> TyInt
         ast.EIdent("bytes") -> TyInt
-        ast.EIdent("now") -> TyInt
         ast.EIdent("join") -> TyStr
         ast.EIdent("split") -> TyVec(TyStr)
         ast.EIdent("row") -> TyVec(TyStr)
@@ -1849,7 +1858,13 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
                     True -> TyCustom(name)
                     False ->
                       case dict.get(env.sigs, name) {
-                        Ok(#(_, ret)) -> ret
+                        // A bare call to an `async func` does not block; it
+                        // spawns the work and evaluates to a handle (`async T`).
+                        Ok(#(_, ret)) ->
+                          case list.contains(env.asyncs, name) {
+                            True -> TyAsync(ret)
+                            False -> ret
+                          }
                         Error(_) -> TyUnknown
                       }
                   }
@@ -1916,6 +1931,24 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
                     "get" -> TyResult(TyStr, TyBuiltin("EnvironmentError"))
                     _ -> TyUnknown
                   }
+                "term" ->
+                  case fname {
+                    "read" -> TyStr
+                    "args" -> TyVec(TyStr)
+                    // `print` is a void statement.
+                    _ -> TyVoid
+                  }
+                "task" ->
+                  case fname {
+                    // `sleep` is a void statement.
+                    _ -> TyVoid
+                  }
+                "time" ->
+                  case fname {
+                    "now" | "timezoneOffset" -> TyInt
+                    "timezone" | "format" -> TyStr
+                    _ -> TyUnknown
+                  }
                 _ -> TyUnknown
               }
           }
@@ -1972,8 +2005,16 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
           TyResult(ty_of_type_expr(env.types, typ), TyBuiltin("CryptoError"))
         _ -> infer(env, value)
       }
-    // `await e` produces the value the awaited async function returns.
-    ast.EAwait(value) -> infer(env, value)
+    // `await` resolves a task to its value: a handle `async T` yields `T`, and
+    // a vector of handles `(async T)[]` yields `T[]` (a barrier over all of
+    // them). A direct `await asyncCall()` infers `TyAsync(T)` for the inner
+    // call and so lands on the same `TyAsync(t) -> t` rule.
+    ast.EAwait(value) ->
+      case infer(env, value) {
+        TyAsync(t) -> t
+        TyVec(TyAsync(t)) -> TyVec(t)
+        other -> other
+      }
   }
 }
 
@@ -2053,11 +2094,59 @@ fn gen_expr(env: Env, e: ast.Expr) -> String {
       let #(cond, _) = gen_is(env, subject, pattern)
       cond
     }
+    // A bare async call in value position (an RHS, a vector element, ...)
+    // spawns the work on its own goroutine and evaluates to a handle. Used as a
+    // statement the handle is simply discarded — that is fire-and-forget, and
+    // `gen_stmt` keeps emitting the cheaper `go f(x)` for that case.
+    ast.ECall(ast.EIdent(name), args) ->
+      case list.contains(env.asyncs, name) {
+        True -> gen_spawn(env, name, args)
+        False -> gen_call(env, ast.EIdent(name), args)
+      }
     ast.ECall(callee, args) -> gen_call(env, callee, args)
     ast.EWith(value, typ) -> gen_with(env, value, typ)
-    // An async func lowers to an ordinary Go function, so `await`ing it (i.e.
-    // blocking for its value) is just calling it synchronously.
-    ast.EAwait(value) -> gen_expr(env, value)
+    ast.EAwait(value) -> gen_await(env, value)
+  }
+}
+
+// `spawn f(args)`: run the async func on its own goroutine and hand back a
+// handle. The closure captures the exact call so its result type matches the
+// declared return; a void async func yields `hive.Unit` so the handle can still
+// be joined on.
+fn gen_spawn(env: Env, name: String, args: List(ast.Arg)) -> String {
+  let call = gen_call(env, ast.EIdent(name), args)
+  let ret = case dict.get(env.fns, name) {
+    Ok(#(_, _, r)) -> r
+    Error(_) -> ast.TVoid
+  }
+  case ret {
+    ast.TVoid ->
+      "hive.Spawn(func() hive.Unit { " <> call <> "; return hive.Unit{} })"
+    _ -> "hive.Spawn(func() " <> gen_type(ret) <> " { return " <> call <> " })"
+  }
+}
+
+// `await e`. A direct `await asyncCall()` needs no handle at all — it is just a
+// synchronous call, so it allocates neither goroutine nor channel. Otherwise the
+// operand is a held handle (`h.Await()`) or a vector of handles
+// (`hive.AwaitAll(hs)` — a barrier that preserves index order).
+fn gen_await(env: Env, value: ast.Expr) -> String {
+  case value {
+    ast.ECall(ast.EIdent(name), args) ->
+      case list.contains(env.asyncs, name) {
+        True -> gen_call(env, ast.EIdent(name), args)
+        False -> await_handle(env, value)
+      }
+    _ -> await_handle(env, value)
+  }
+}
+
+fn await_handle(env: Env, value: ast.Expr) -> String {
+  case infer(env, value) {
+    TyVec(TyAsync(_)) -> "hive.AwaitAll(" <> gen_expr(env, value) <> ")"
+    TyAsync(_) -> gen_expr(env, value) <> ".Await()"
+    // Not actually a task — leave it be; the type checkers reject this shape.
+    _ -> gen_expr(env, value)
   }
 }
 
@@ -2779,6 +2868,9 @@ fn gen_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
             "sql" -> gen_sql_call(env, fname, args)
             "conv" -> gen_conv_call(env, fname, args)
             "env" -> gen_env_call(env, fname, args)
+            "term" -> gen_term_call(env, fname, args)
+            "task" -> gen_task_call(env, fname, args)
+            "time" -> gen_time_call(env, fname, args)
             _ -> gen_plain_call(env, callee, args)
           }
       }
@@ -2981,6 +3073,54 @@ fn gen_env_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
   }
 }
 
+// The `hive.term` namespace: line-oriented terminal I/O.
+//   * `print` writes a line to stdout — the same lowering as `echo`.
+//   * `read` blocks the calling virtual thread on a line of stdin (only that
+//     goroutine parks; others keep running).
+//   * `args` is the program's command-line arguments (excluding the program
+//     name) as a `Str[dyn]`.
+fn gen_term_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
+  case fname {
+    "print" -> "fmt.Println(" <> gen_one_coerced(env, args, "text", TyStr) <> ")"
+    "read" -> "hive.TermRead()"
+    "args" -> "hive.TermArgs()"
+    _ -> "hive." <> exported(fname) <> "(" <> gen_args(env, args) <> ")"
+  }
+}
+
+// The `hive.task` namespace: scheduling controls over the virtual threads an
+// `async func` runs on.
+//   * `sleep` parks the calling goroutine for a number of milliseconds.
+fn gen_task_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
+  case fname {
+    "sleep" -> "hive.Sleep(" <> gen_one_coerced(env, args, "ms", TyInt) <> ")"
+    _ -> "hive." <> exported(fname) <> "(" <> gen_args(env, args) <> ")"
+  }
+}
+
+// The `hive.time` namespace: the wall clock and calendar formatting.
+//   * `now` is the current Unix time in seconds.
+//   * `timezone` / `timezoneOffset` describe the machine's local zone.
+//   * `format` renders a Unix time (local) with a strftime-style template.
+fn gen_time_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
+  case fname {
+    "now" -> "hive.Now()"
+    "timezone" -> "hive.Timezone()"
+    "timezoneOffset" -> "hive.TimezoneOffset()"
+    "format" ->
+      case assign_args(args, ["time", "template"]) {
+        #([#(_, time), #(_, template)], []) ->
+          "hive.TimeFormat("
+          <> coerce(env, time, TyInt)
+          <> ", "
+          <> coerce(env, template, TyStr)
+          <> ")"
+        _ -> "hive.TimeFormat(" <> gen_args(env, args) <> ")"
+      }
+    _ -> "hive." <> exported(fname) <> "(" <> gen_args(env, args) <> ")"
+  }
+}
+
 // A single argument coerced to the given type, honouring the named-argument
 // form.
 fn gen_one_coerced(
@@ -3166,7 +3306,6 @@ fn gen_ident_call_full(env: Env, name: String, args: List(ast.Arg)) -> String {
           }
         _ -> "hive.Bytes(" <> gen_args(env, args) <> ")"
       }
-    "now" -> "hive.Now()"
     "print" -> "fmt.Print(" <> gen_args(env, args) <> ")"
     "println" -> "fmt.Println(" <> gen_args(env, args) <> ")"
     // `join(vector, sep)` concatenates a Str vector into one Str.

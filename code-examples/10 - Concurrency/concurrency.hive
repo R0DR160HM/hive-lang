@@ -1,0 +1,68 @@
+// Concurrency
+// ===========
+// An `async func` runs on its own virtual thread (a goroutine). What happens
+// at the *call site* decides how you interact with it — there is no Future or
+// Promise type to name, and nothing dynamically typed:
+//
+//   f(x)            (as a statement)  fire-and-forget: spawn, discard result
+//   h := f(x)                          spawn, keep the handle  (type: `async T`)
+//   await f(x)                         spawn + wait inline, yields T
+//   await h                            wait on a held handle, yields T
+//   await [f(a), f(b)]                 wait on all, in order,  yields T[]
+//
+// `async T` — the type of a held handle — is inferred, never written. You can
+// bind it and `await` it; you cannot annotate it, return it, pass it, or use it
+// as a plain `T` (await it first). So a task can never outlive the scope that
+// spawned it. `await` is idempotent: awaiting a finished task returns instantly,
+// and the same handle may be awaited more than once.
+
+// Two async funcs. Being funcs they can perform I/O but take no mutex; each
+// runs on its own virtual thread when called.
+async func slowShout(text: Str): Str {
+	hive.task.sleep(1000)
+	return text + "!!!"
+}
+
+async func lengthOf(text: Str): Int {
+	return len(text)
+}
+
+proc main(): void {
+	// 1. Fire-and-forget. As a bare statement the result is discarded and the
+	// caller does not block — the work runs on its own thread.
+	slowShout("logged in the background")
+
+	// 2. Await inline. This blocks until the value is ready; a direct
+	// `await someCall()` needs no handle, so it costs nothing extra.
+	echo await slowShout("await")
+
+	// 3. Spawn now, await later. Binding a bare async call keeps the running
+	// task as a handle. We do other work while it runs, then join on it — which
+	// returns immediately if it already finished.
+	job := slowShout("started early")
+	echo "...doing other work while it runs..."
+	echo await job
+	echo await job // idempotent: awaiting again is instant and yields the same value
+
+	// 4. Await many of the same type, all at once. A vector of handles awaits
+	// into a statically-sized, fully-typed vector (`Str[3]`) — never a dynamic
+	// or `Any` vector. All three run concurrently; the `await` is one barrier.
+	Str[3] shouts = await [slowShout("a"), slowShout("b"), slowShout("c")]
+	echo shouts[0] + " " + shouts[1] + " " + shouts[2]
+
+	// The handles can also be held first and awaited later as a group.
+	greetings := [slowShout("hello"), slowShout("world")]
+	echo "...both greetings are already running..."
+	Str[2] ready = await greetings
+	echo ready[0] + " / " + ready[1]
+
+	// 5. Await many of *different* types at once. Spawn each up front, then
+	// await each: because they were all started first, the awaits overlap and
+	// the total wait is the slowest one — not the sum. Fully typed, no tuple and
+	// no vector needed.
+	shout := slowShout("mixed")
+	size := lengthOf("mixed")
+	Str message = await shout
+	Int count = await size
+	echo message + " has base length " + hive.conv.its(count)
+}

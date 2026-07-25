@@ -20,6 +20,7 @@ pub fn runtime_go() -> String {
   "package hive
 
 import (
+	\"bufio\"
 	\"crypto/hmac\"
 	\"crypto/rand\"
 	\"crypto/sha256\"
@@ -186,6 +187,65 @@ func CloneVecFn[T any](s []T, clone func(T) T) []T {
 // the original.
 func CloneTable(t Table) Table {
 	return CloneVecFn(t, CloneVec[string])
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency: async tasks (`async T`)
+// ---------------------------------------------------------------------------
+
+// Unit is the value of a task produced by a void `async func` — a task joined
+// on for its completion, not for a result.
+type Unit = struct{}
+
+// Async is a handle to a value being computed on its own goroutine — the
+// lowering of Hive's inferred `async T`. It is never named in Hive source;
+// Spawn produces it and Await consumes it.
+type Async[T any] struct {
+	done  chan struct{}
+	val   T
+	panic any
+}
+
+// Spawn starts f on a new goroutine right away and returns a handle to its
+// eventual result without blocking the caller. A panic inside the task is
+// captured and re-raised at the Await site (so failures stay local to the code
+// that needed the value); a handle that is never awaited swallows it, rather
+// than tearing down an unrelated goroutine.
+func Spawn[T any](f func() T) *Async[T] {
+	a := &Async[T]{done: make(chan struct{})}
+	go func() {
+		defer close(a.done)
+		defer func() {
+			if r := recover(); r != nil {
+				a.panic = r
+			}
+		}()
+		a.val = f()
+	}()
+	return a
+}
+
+// Await blocks until the task has produced its value, then returns it. `done`
+// is closed exactly once, so receiving from it never blocks again: awaiting an
+// already-finished task returns instantly, and a task may be awaited any number
+// of times, always yielding the same value.
+func (a *Async[T]) Await() T {
+	<-a.done
+	if a.panic != nil {
+		panic(a.panic)
+	}
+	return a.val
+}
+
+// AwaitAll waits for every task and returns their values index-aligned with the
+// input — position i holds task i's result regardless of the order the tasks
+// finished in. It is the barrier behind `await` on a vector of handles.
+func AwaitAll[T any](hs []*Async[T]) []T {
+	out := make([]T, len(hs))
+	for i, h := range hs {
+		out[i] = h.Await()
+	}
+	return out
 }
 
 // VecEq reports whether two vectors are equal: the same length, then equal
@@ -385,9 +445,98 @@ func ReadCSV(path string, delimiter string) Result[Table, TableError] {
 	return Ok[Table, TableError](rows)
 }
 
-// Now returns the current Unix time in seconds.
+// ---------------------------------------------------------------------------
+// Time and date (hive.time)
+// ---------------------------------------------------------------------------
+
+// Now returns the current Unix time in seconds. Backs hive.time.now.
 func Now() int {
 	return int(time.Now().Unix())
+}
+
+// Timezone returns the name (or abbreviation) of the machine's local time zone
+// at this instant — \"UTC\", \"PST\", \"-03\", and so on. Backs hive.time.timezone.
+func Timezone() string {
+	name, _ := time.Now().Zone()
+	return name
+}
+
+// TimezoneOffset returns the local zone's current offset from UTC in minutes,
+// east of UTC being positive (so UTC+2 is 120 and UTC-3 is -180). Backs
+// hive.time.timezoneOffset.
+func TimezoneOffset() int {
+	_, seconds := time.Now().Zone()
+	return seconds / 60
+}
+
+// TimeFormat renders a Unix time (seconds), in local time, using a
+// strftime-style template. Unknown \"%x\" escapes are emitted verbatim. Backs
+// hive.time.format. Supported directives:
+//
+//	%Y year (4 digits)   %y year (2 digits)   %m month 01-12  %d day 01-31
+//	%H hour 00-23        %I hour 01-12        %M minute       %S second
+//	%p AM/PM             %j day-of-year       %Z zone name    %z zone offset
+//	%A/%a weekday (full/short)   %B/%b month name (full/short)   %% literal %
+func TimeFormat(t int, template string) string {
+	tm := time.Unix(int64(t), 0)
+	var b strings.Builder
+	runes := []rune(template)
+	for i := 0; i < len(runes); i++ {
+		if runes[i] != '%' || i+1 >= len(runes) {
+			b.WriteRune(runes[i])
+			continue
+		}
+		i++
+		switch runes[i] {
+		case 'Y':
+			fmt.Fprintf(&b, \"%04d\", tm.Year())
+		case 'y':
+			fmt.Fprintf(&b, \"%02d\", tm.Year()%100)
+		case 'm':
+			fmt.Fprintf(&b, \"%02d\", int(tm.Month()))
+		case 'd':
+			fmt.Fprintf(&b, \"%02d\", tm.Day())
+		case 'H':
+			fmt.Fprintf(&b, \"%02d\", tm.Hour())
+		case 'I':
+			h := tm.Hour() % 12
+			if h == 0 {
+				h = 12
+			}
+			fmt.Fprintf(&b, \"%02d\", h)
+		case 'M':
+			fmt.Fprintf(&b, \"%02d\", tm.Minute())
+		case 'S':
+			fmt.Fprintf(&b, \"%02d\", tm.Second())
+		case 'p':
+			if tm.Hour() < 12 {
+				b.WriteString(\"AM\")
+			} else {
+				b.WriteString(\"PM\")
+			}
+		case 'j':
+			fmt.Fprintf(&b, \"%03d\", tm.YearDay())
+		case 'A':
+			b.WriteString(tm.Weekday().String())
+		case 'a':
+			b.WriteString(tm.Weekday().String()[:3])
+		case 'B':
+			b.WriteString(tm.Month().String())
+		case 'b':
+			b.WriteString(tm.Month().String()[:3])
+		case 'Z':
+			name, _ := tm.Zone()
+			b.WriteString(name)
+		case 'z':
+			b.WriteString(tm.Format(\"-0700\"))
+		case '%':
+			b.WriteByte('%')
+		default:
+			b.WriteByte('%')
+			b.WriteRune(runes[i])
+		}
+	}
+	return b.String()
 }
 
 // ---------------------------------------------------------------------------
@@ -501,6 +650,52 @@ func EnvGet(key string) Result[string, EnvironmentError] {
 		return Ok[string, EnvironmentError](v)
 	}
 	return Err[string, EnvironmentError](EnvironmentError{Key: key, Message: \"not set\"})
+}
+
+// ---------------------------------------------------------------------------
+// Terminal I/O (hive.term)
+// ---------------------------------------------------------------------------
+
+// One shared buffered reader over stdin: created once so bytes read past a
+// newline in one TermRead are not lost before the next.
+var stdinReader = bufio.NewReader(os.Stdin)
+
+// TermRead blocks until the user finishes a line of input and returns it
+// without the trailing newline (and without a trailing CR on Windows input).
+// The read parks only the calling goroutine — the Go scheduler keeps other
+// virtual threads running on other OS threads. At end of input it returns
+// whatever preceded EOF (\"\" if nothing). Backs hive.term.read.
+func TermRead() string {
+	line, err := stdinReader.ReadString('\\n')
+	line = strings.TrimRight(line, \"\\n\")
+	line = strings.TrimRight(line, \"\\r\")
+	if err != nil && line == \"\" {
+		return \"\"
+	}
+	return line
+}
+
+// TermArgs returns the command-line arguments the program was run with, in
+// order and excluding the program name (os.Args[0]). Backs hive.term.args.
+func TermArgs() []string {
+	args := os.Args[1:]
+	out := make([]string, len(args))
+	copy(out, args)
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// Task scheduling (hive.task)
+// ---------------------------------------------------------------------------
+
+// Sleep parks the calling goroutine for ms milliseconds; only that virtual
+// thread waits, so others keep running. A non-positive duration returns at
+// once. Backs hive.task.sleep.
+func Sleep(ms int) {
+	if ms <= 0 {
+		return
+	}
+	time.Sleep(time.Duration(ms) * time.Millisecond)
 }
 
 // JsonError describes why a JSON document didn't match the expected type:

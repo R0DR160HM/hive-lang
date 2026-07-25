@@ -36,11 +36,11 @@ proc parse(): ParsingResult {
 \tcsv := using \"./test.csv\" with \";\"
 \tif csv is Result.Ok(table) {
 \t\tif len(table) > 1 {
-\t\t\treturn ParsingResult.Success(table[1:], now())
+\t\t\treturn ParsingResult.Success(table[1:], hive.time.now())
 \t\t}
-\t\treturn ParsingResult.NoData(now());
+\t\treturn ParsingResult.NoData(hive.time.now());
 \t} else if csv is Result.Error(error) {
-\t\treturn ParsingResult.Error(error, now());
+\t\treturn ParsingResult.Error(error, hive.time.now());
 \t}
 }
 "
@@ -1802,6 +1802,171 @@ pub fn non_exhaustive_variant_match_is_rejected_test() {
   compiler.compile(
     "type T {\n\tA\n\tB\n}\nfunc f(x: T): Int {\n\tif x is T.A {\n\t\treturn 1\n\t}\n}\nproc main(): void {}\n",
   )
+  |> should.be_error
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency: async / await
+// ---------------------------------------------------------------------------
+
+// Wraps a `main` body with two async funcs to exercise the call-site forms.
+fn async_prog(body: String) -> String {
+  "async func slowShout(text: Str): Str {\n\treturn text + \"!!!\"\n}\n"
+  <> "async func lengthOf(text: Str): Int {\n\treturn len(text)\n}\n"
+  <> "proc main(): void {\n"
+  <> body
+  <> "}\n"
+}
+
+pub fn async_bare_statement_is_fire_and_forget_test() {
+  let go = compile(async_prog("\tslowShout(\"hi\")\n"))
+  // A bare async call as a statement runs on a goroutine, result discarded — no
+  // handle, no channel.
+  should.be_true(string.contains(go, "go slowShout(\"hi\")"))
+  should.be_false(string.contains(go, "hive.Spawn"))
+}
+
+pub fn async_direct_await_is_synchronous_test() {
+  let go = compile(async_prog("\techo await slowShout(\"hi\")\n"))
+  // `await someCall()` on a direct call needs neither goroutine nor channel.
+  should.be_true(string.contains(go, "fmt.Println(slowShout(\"hi\"))"))
+  should.be_false(string.contains(go, "hive.Spawn"))
+  should.be_false(string.contains(go, ".Await()"))
+}
+
+pub fn async_bound_call_spawns_a_handle_test() {
+  let go = compile(async_prog("\tjob := slowShout(\"hi\")\n\techo await job\n"))
+  should.be_true(string.contains(
+    go,
+    "job := hive.Spawn(func() string { return slowShout(\"hi\") })",
+  ))
+  should.be_true(string.contains(go, "fmt.Println(job.Await())"))
+}
+
+pub fn async_await_vector_joins_all_test() {
+  let go =
+    compile(async_prog(
+      "\tStr[2] r = await [slowShout(\"a\"), slowShout(\"b\")]\n\techo r[0]\n",
+    ))
+  // A vector of handles awaits into a statically-typed vector via AwaitAll.
+  should.be_true(string.contains(go, "hive.AwaitAll([]*hive.Async[string]{"))
+  should.be_true(string.contains(go, "var r []string ="))
+}
+
+pub fn async_heterogeneous_join_keeps_types_test() {
+  let go =
+    compile(async_prog(
+      "\tsize := lengthOf(\"x\")\n\tshout := slowShout(\"y\")\n\tInt n = await size\n\tStr s = await shout\n\techo n\n\techo s\n",
+    ))
+  // Two differently-typed tasks, each spawned then awaited — fully typed, no
+  // vector and no tuple involved.
+  should.be_true(string.contains(go, "hive.Spawn(func() int { return lengthOf"))
+  should.be_true(string.contains(
+    go,
+    "hive.Spawn(func() string { return slowShout",
+  ))
+  should.be_true(string.contains(go, "var n int = size.Await()"))
+  should.be_true(string.contains(go, "var s string = shout.Await()"))
+}
+
+// ---------------------------------------------------------------------------
+// hive.term
+// ---------------------------------------------------------------------------
+
+pub fn term_print_lowers_to_println_test() {
+  let go =
+    compile("proc main(): void {\n\thive.term.print(\"hi\")\n}\n")
+  should.be_true(string.contains(go, "fmt.Println(\"hi\")"))
+}
+
+pub fn term_read_lowers_to_runtime_test() {
+  let go =
+    compile("proc main(): void {\n\tline := hive.term.read()\n\techo line\n}\n")
+  should.be_true(string.contains(go, "line := hive.TermRead()"))
+}
+
+pub fn term_args_is_a_string_vector_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tas := hive.term.args()\n\techo len(as)\n}\n",
+    )
+  should.be_true(string.contains(go, "as := hive.TermArgs()"))
+}
+
+pub fn term_unknown_member_is_rejected_test() {
+  compiler.compile("proc main(): void {\n\thive.term.beep()\n}\n")
+  |> should.be_error
+}
+
+pub fn term_print_wrong_arity_is_rejected_test() {
+  compiler.compile("proc main(): void {\n\thive.term.print(\"a\", \"b\")\n}\n")
+  |> should.be_error
+}
+
+// ---------------------------------------------------------------------------
+// hive.task
+// ---------------------------------------------------------------------------
+
+pub fn task_sleep_lowers_to_runtime_test() {
+  let go = compile("proc main(): void {\n\thive.task.sleep(250)\n}\n")
+  should.be_true(string.contains(go, "hive.Sleep(250)"))
+}
+
+pub fn task_unknown_member_is_rejected_test() {
+  compiler.compile("proc main(): void {\n\thive.task.nap(5)\n}\n")
+  |> should.be_error
+}
+
+pub fn task_sleep_wrong_arity_is_rejected_test() {
+  compiler.compile("proc main(): void {\n\thive.task.sleep()\n}\n")
+  |> should.be_error
+}
+
+// ---------------------------------------------------------------------------
+// hive.time
+// ---------------------------------------------------------------------------
+
+pub fn time_now_lowers_to_runtime_test() {
+  let go = compile("proc main(): void {\n\techo hive.time.now()\n}\n")
+  should.be_true(string.contains(go, "hive.Now()"))
+}
+
+pub fn time_zone_helpers_lower_to_runtime_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\techo hive.time.timezone()\n\techo hive.time.timezoneOffset()\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.Timezone()"))
+  should.be_true(string.contains(go, "hive.TimezoneOffset()"))
+}
+
+pub fn time_format_lowers_to_runtime_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\techo hive.time.format(hive.time.now(), \"%Y-%m-%d\")\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.TimeFormat(hive.Now(), \"%Y-%m-%d\")"))
+}
+
+pub fn bare_now_is_rejected_with_migration_hint_test() {
+  compiler.compile("proc main(): void {\n\techo now()\n}\n")
+  |> should.be_error
+}
+
+pub fn user_defined_now_still_works_test() {
+  compiler.compile(
+    "func now(): Int {\n\treturn 42\n}\nproc main(): void {\n\techo now()\n}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn time_unknown_member_is_rejected_test() {
+  compiler.compile("proc main(): void {\n\techo hive.time.epoch()\n}\n")
+  |> should.be_error
+}
+
+pub fn time_format_wrong_arity_is_rejected_test() {
+  compiler.compile("proc main(): void {\n\techo hive.time.format(0)\n}\n")
   |> should.be_error
 }
 

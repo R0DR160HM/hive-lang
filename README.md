@@ -57,7 +57,9 @@ lives only in Go's build cache — which avoids Windows Defender/SmartScreen
 scanning a freshly written `.exe`. It still runs with the working directory set
 to the entrypoint's folder, so relative paths such as `using "./test.csv"`
 resolve as the author expects (`hive run` passes that folder through to the
-program, which changes into it before `main`).
+program, which changes into it before `main`). Anything after the entrypoint is
+forwarded to the program as its own command-line arguments
+(`hive run foo.hive a b c`), readable via `hive.term.args()`.
 
 ### Troubleshooting on Windows
 
@@ -165,9 +167,11 @@ More complete programs — CSV parsing and a full tour of pattern matching (ever
 form above), the type system, an HTTP server that speaks JSON, a `hive.crypto`
 walkthrough (hashing, HMAC, base64 and JWTs), a `hive.sql` example backed by an
 embedded SQLite database, a tour of first-class functions and partial
-application, and a tour of Hive's copy-on-binding [value
-semantics](#value-semantics-copy-on-binding) — live in `code-examples/`. They
-double as the language's specification: each one compiles, builds and runs.
+application, a tour of Hive's copy-on-binding [value
+semantics](#value-semantics-copy-on-binding), and a tour of concurrency
+(spawning tasks, holding handles and awaiting one or many) — live in
+`code-examples/`. They double as the language's specification: each one
+compiles, builds and runs.
 
 ## The language
 
@@ -209,9 +213,22 @@ double as the language's specification: each one compiles, builds and runs.
   callee just sees an immutable `T`), never the reverse, so assigning to a
   parameter or a plain `:=` binding is a compile error.
 * **Concurrency** — an `async func` runs on its own virtual thread (a
-  goroutine). Calling one bare is fire-and-forget — it behaves as `void` and
-  does not block the caller — while `await someAsyncCall()` blocks the current
-  thread until the function returns its value.
+  goroutine). The call site decides how you interact with it, with no Future or
+  Promise type to name and nothing dynamically typed. A bare call spawns the
+  work; `await` waits for it. As a statement (`f(x)`) the result is discarded —
+  fire-and-forget, the caller does not block. Bound (`h := f(x)`) it keeps the
+  running task as a *handle*; `await h` then blocks for its value, returning
+  instantly if the task already finished. `await f(x)` is the two combined:
+  spawn and wait inline. To wait on many tasks at once, `await` a vector of
+  handles: `await [f(a), f(b), f(c)]` runs all three concurrently and resolves,
+  in order, to a statically-sized vector of their results (`Str[3]`) — one
+  barrier, fully typed. Tasks of *different* types are joined the same way:
+  spawn each, then `await` each; because they all started first, the total wait
+  is the slowest, not the sum. A handle's type (`async T`) is inferred and never
+  written: you may bind it and `await` it, but not annotate, return, pass, or
+  use it as a plain `T`, so a task can never outlive the scope that spawned it.
+  `await` is idempotent — the same handle may be awaited more than once. See
+  `code-examples/10 - Concurrency`.
 * **Atoms** (`#SomeAtom`) are interned symbols. The compiler assigns each a
   small integer (`#False` = 0 and `#True` = 1 always come first) and embeds
   the atom table in the executable, so `echo` prints an atom's name while
@@ -343,7 +360,6 @@ argument type.
 | `split(str, sep)`       | `split(Str, Str): Str[]`     | Splits a string on `sep` into a `Str` vector (inverse of `join`).    |
 | `row(table, key)`       | `row(Table, Str): Str[dyn]`  | The row whose first cell equals `key`, else `[]`.                    |
 | `column(table, key)`    | `column(Table, Str): Str[dyn]`| The column whose top (first-row) cell equals `key`, else `[]`.      |
-| `now()`                 | `now(): Int`                 | Current Unix time, in seconds.                                       |
 
 `len` and `bytes` differ only for strings: for `"café"`, `len` is `4` (runes)
 while `bytes` is `5` (the `é` is two bytes). `append` is the one builtin that
@@ -415,7 +431,7 @@ works inside both `func`s and `proc`s. Fallible operations return
     the payload and returns a compact HS256 token (signing can't fail, so it is
     a plain `Str`).
   * `hive.crypto.jwtVerify(token, secret) with T` checks the signature and the
-    `exp`/`nbf` claims against `now()`, then decodes the payload into `T`,
+    `exp`/`nbf` claims against the current time, then decodes the payload into `T`,
     returning `Result<T, hive.crypto.CryptoError>`. Only HS256 is accepted, so
     `alg: none` and algorithm-confusion are rejected outright.
   * `hive.crypto.jwtDecode(token) with T` decodes the payload **without
@@ -483,6 +499,57 @@ Reads environment variables, from a `.env` file or the OS.
   the entrypoint's folder, and a built executable inherits from wherever it is
   launched (the same rule `using "./file.csv"` follows).
 
+### `hive.term`
+
+Line-oriented terminal I/O.
+
+* `hive.term.print(text)` writes a line to stdout — the same lowering as
+  `echo`, but restricted to a `Str`.
+* `hive.term.read()` blocks until the user finishes a line of input and returns
+  it as a `Str`, stripped of the trailing newline. It parks only the calling
+  virtual thread: called inside an `async func`, the rest of the program keeps
+  running on other threads while that goroutine waits. At end of input it
+  returns whatever preceded EOF (`""` if nothing).
+* `hive.term.args()` returns the command-line arguments the program was started
+  with — in order, excluding the program name — as a `Str[dyn]`. `hive run`
+  forwards anything after the entrypoint (`hive run app.hive a b c`), and a
+  built executable receives them from the shell directly.
+
+### `hive.task`
+
+Scheduling controls over the virtual threads an `async func` runs on.
+
+* `hive.task.sleep(ms)` parks the calling virtual thread for `ms` milliseconds
+  and returns nothing. Only that goroutine waits — others keep running — so two
+  tasks that each `sleep`, spawned and then awaited together, finish in about
+  the longer of the two, not the sum. A non-positive `ms` returns immediately.
+
+### `hive.time`
+
+The wall clock and calendar formatting. Times are plain `Int`s — Unix seconds.
+
+* `hive.time.now()` returns the current Unix time in seconds. (This was the bare
+  `now()` builtin; it now lives here, and a stray `now()` reports as much.)
+* `hive.time.timezone()` returns the machine's local zone name or abbreviation
+  at this instant (`"UTC"`, `"PST"`, `"-03"`, ...), and
+  `hive.time.timezoneOffset()` its current offset from UTC in **minutes**, east
+  of UTC positive (so UTC+2 is `120`, UTC−3 is `-180`).
+* `hive.time.format(time, template)` renders a Unix time, in local time, with a
+  `strftime`-style template — familiar rather than Go's reference-date layout.
+  Unrecognized `%x` escapes pass through verbatim. Directives:
+
+  | | | | |
+  |---|---|---|---|
+  | `%Y` year (4) | `%y` year (2) | `%m` month `01`–`12` | `%d` day `01`–`31` |
+  | `%H` hour `00`–`23` | `%I` hour `01`–`12` | `%M` minute | `%S` second |
+  | `%p` `AM`/`PM` | `%j` day-of-year | `%Z` zone name | `%z` zone offset |
+  | `%A`/`%a` weekday | `%B`/`%b` month name | `%%` literal `%` | |
+
+  ```hive
+  echo hive.time.format(hive.time.now(), "%Y-%m-%d %H:%M:%S")
+  echo hive.time.format(1700000000, "%A, %d %B %Y")   // Tuesday, 14 November 2023
+  ```
+
 ## How Hive maps onto Go
 
 | Hive                                    | Go                                                             |
@@ -501,7 +568,9 @@ Reads environment variables, from a `.env` file or the OS.
 | `for i := 0; i < n; i = i + 1 { }`      | `for i := 0; i < n; i = i + 1 { }` (counter scoped to the loop) |
 | `for each x in v { }`                   | `for _, x := range v { }` (binds the value, discards the index) |
 | `async func f(): T { ... }`             | `func f() T { ... }` (an ordinary Go function)                 |
-| `f(x)` bare / `await f(x)` (async `f`)  | `go f(x)` (fire-and-forget goroutine) / `f(x)` (blocking call) |
+| `f(x)` bare stmt / `await f(x)` (async `f`) | `go f(x)` (fire-and-forget goroutine) / `f(x)` (blocking call) |
+| `h := f(x)` (async `f`) / `await h`     | `h := hive.Spawn(func() T { return f(x) })` / `h.Await()`      |
+| `await [f(a), f(b)]` (async `f`)        | `hive.AwaitAll([]*hive.Async[T]{ hive.Spawn(..), hive.Spawn(..) })` |
 | `echo v`                                | `fmt.Println(v)` (stringifies any value, appends a newline)    |
 | `assert cond`                           | `hive.Assert(cond)`                                            |
 | `panic value`                           | `panic(hive.Show(value))` (renders `value` like `echo`)        |
@@ -521,7 +590,7 @@ Reads environment variables, from a `.env` file or the OS.
 | `len(v)` vector / `len(s)` Str          | `len(v)` (elements) / `hive.StrLen(s)` (UTF-8 runes)           |
 | `bytes(v)` vector / `bytes(s)` Str      | `hive.Bytes(v)` (footprint) / `len(s)` (UTF-8 byte length)     |
 | `append(v, x)` / `join(v, sep)`         | `v = append(v, x)` (statement) / `hive.Join(v, sep)`           |
-| `split(s, sep)` / `now()`               | `hive.Split(s, sep)` → `Str[dyn]` / `hive.Now()` (Unix time)   |
+| `split(s, sep)`                         | `hive.Split(s, sep)` → `Str[dyn]`                             |
 | `row(t, k)` / `column(t, k)`            | `hive.Row(t, k)` / `hive.Column(t, k)` → `Str[dyn]`           |
 | `hive.json.parse(t) with T`             | `hive.JsonParse(t, jsonDecode_T)` → `Result[T, JsonError]`     |
 | `hive.json.encode(v)`                   | derived `jsonEncode_T(v)` (cannot fail, so plain `string`)     |

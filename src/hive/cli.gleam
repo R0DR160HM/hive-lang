@@ -1,6 +1,7 @@
 //// Build/run orchestration: writes the generated Go project to disk, invokes
 //// the Go toolchain, and (for `run`) executes the resulting binary.
 
+import gleam/list
 import gleam/result
 import gleam/string
 import filepath
@@ -72,7 +73,7 @@ pub fn build(entry: String) -> Result(String, String) {
 /// build directory, the program's working directory is passed through
 /// HIVE_RUN_CWD so relative paths (`using "./test.csv"`) still resolve against
 /// the entrypoint's folder — the runtime `chdir`s to it before `main`.
-pub fn run(entry: String) -> Result(Int, String) {
+pub fn run(entry: String, program_args: List(String)) -> Result(Int, String) {
   let entry = normalize(entry)
 
   use source <- result.try(read(entry))
@@ -93,7 +94,9 @@ pub fn run(entry: String) -> Result(Int, String) {
   case
     shellout.command(
       run: "go",
-      with: ["run", "."],
+      // `go run . <args>` forwards the trailing arguments to the program, so
+      // `hive.term.args()` sees the same list a built binary would.
+      with: list.append(["run", "."], program_args),
       in: build_dir,
       opt: [
         shellout.LetBeStdout,

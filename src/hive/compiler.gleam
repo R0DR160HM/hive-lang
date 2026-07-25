@@ -561,11 +561,23 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
               use _ <- result.try(check_env_call(fname, args))
               check_args(ctx, args)
             }
+            "term" -> {
+              use _ <- result.try(check_term_call(fname, args))
+              check_args(ctx, args)
+            }
+            "task" -> {
+              use _ <- result.try(check_task_call(fname, args))
+              check_args(ctx, args)
+            }
+            "time" -> {
+              use _ <- result.try(check_time_call(fname, args))
+              check_args(ctx, args)
+            }
             _ ->
               Error(
                 "unknown builtin namespace `hive."
                 <> ns
-                <> "` (available: http, json, crypto, sql, conv, env)",
+                <> "` (available: http, json, crypto, sql, conv, env, term, task, time)",
               )
           }
       }
@@ -599,6 +611,20 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
       check_args(ctx, args)
     }
     ast.ECall(ast.EIdent(name), args) -> {
+      // `now()` used to be a bare builtin; it now lives in `hive.time`. Point
+      // there — unless the program defines its own `now`, in which case the
+      // ordinary rules below apply.
+      use _ <- result.try(case
+        name == "now"
+        && !dict.has_key(ctx.callables, name)
+        && !dict.has_key(ctx.types, name)
+      {
+        True ->
+          Error(
+            "`now()` has moved to the `hive.time` module — call `hive.time.now()`",
+          )
+        False -> Ok(Nil)
+      })
       // Funcs (and queries) may do I/O, but they may not call procs — only
       // procs call procs. A partial application (`p(_, x)`) merely *wraps* the
       // proc into a value; it does not call it, so it stays allowed in a func.
@@ -986,6 +1012,45 @@ fn check_env_call(fname: String, args: List(ast.Arg)) -> Result(Nil, String) {
     _ ->
       Error(
         "unknown builtin `hive.env." <> fname <> "` (available: get)",
+      )
+  }
+}
+
+fn check_term_call(fname: String, args: List(ast.Arg)) -> Result(Nil, String) {
+  case fname {
+    "print" -> check_arity("`hive.term.print`", args, ["text"])
+    "read" -> check_arity("`hive.term.read`", args, [])
+    "args" -> check_arity("`hive.term.args`", args, [])
+    _ ->
+      Error(
+        "unknown builtin `hive.term."
+        <> fname
+        <> "` (available: print, read, args)",
+      )
+  }
+}
+
+fn check_task_call(fname: String, args: List(ast.Arg)) -> Result(Nil, String) {
+  case fname {
+    "sleep" -> check_arity("`hive.task.sleep`", args, ["ms"])
+    _ ->
+      Error(
+        "unknown builtin `hive.task." <> fname <> "` (available: sleep)",
+      )
+  }
+}
+
+fn check_time_call(fname: String, args: List(ast.Arg)) -> Result(Nil, String) {
+  case fname {
+    "now" -> check_arity("`hive.time.now`", args, [])
+    "timezone" -> check_arity("`hive.time.timezone`", args, [])
+    "timezoneOffset" -> check_arity("`hive.time.timezoneOffset`", args, [])
+    "format" -> check_arity("`hive.time.format`", args, ["time", "template"])
+    _ ->
+      Error(
+        "unknown builtin `hive.time."
+        <> fname
+        <> "` (available: now, timezone, timezoneOffset, format)",
       )
   }
 }

@@ -12,10 +12,12 @@ import shellout
 pub fn main() {
   case argv.load().arguments {
     ["build", entry] -> do_build(entry)
-    ["run", entry] -> do_run(entry)
+    // Anything after the entrypoint is forwarded to the program as its own
+    // command-line arguments (readable via `hive.term.args()`).
+    ["run", entry, ..program_args] -> do_run(entry, program_args)
     ["emit", entry] -> do_emit(entry)
 
-    ["build", ..] | ["run", ..] | ["emit", ..] ->
+    ["build", ..] | ["emit", ..] ->
       fail("that command takes exactly one entrypoint file")
     _ -> print_usage()
   }
@@ -28,8 +30,8 @@ fn do_build(entry: String) -> Nil {
   }
 }
 
-fn do_run(entry: String) -> Nil {
-  case cli.run(entry) {
+fn do_run(entry: String, program_args: List(String)) -> Nil {
+  case cli.run(entry, program_args) {
     Ok(0) -> Nil
     Ok(code) -> shellout.exit(code)
     Error(message) -> fail(message)
