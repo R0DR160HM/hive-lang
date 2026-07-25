@@ -3,7 +3,19 @@
 import gleam/option.{type Option}
 
 pub type Module {
-  Module(decls: List(Decl))
+  Module(imports: List(Import), decls: List(Decl))
+}
+
+/// `import ../lib/strings` or `import ../lib/strings as text` — a module-level
+/// declaration bringing another file's declarations into scope under a name.
+///
+/// `path` is relative to the importing file's own directory, with the `.hive`
+/// extension left off. `alias` is the name the module is reached through
+/// (`text.slugify(...)`), defaulting to the path's last segment. Imports are
+/// resolved and merged away before the rest of the pipeline runs, so only
+/// `hive/modules` ever sees them.
+pub type Import {
+  Import(path: String, alias: String, line: Int)
 }
 
 pub type Decl {

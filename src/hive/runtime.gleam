@@ -1,8 +1,16 @@
-//// The generated Go project's fixed pieces: its `go.mod` and the `hive`
-//// runtime package that backs the language's builtins (`Table`, `TableError`,
-//// `Result`, `Atom`, `using`/`ReadCSV`, `now`/`Now`, vector concatenation,
-//// safe division, `**`, `assert`, SQL parameter sanitization and the
-//// `hive.http` standard library).
+//// The generated Go project's fixed pieces: its `go.mod`, the core `hive`
+//// runtime package that backs the language itself (`Table`, `TableError`,
+//// `Result`, `Atom`, `using`/`ReadCSV`, vector concatenation, safe division,
+//// `**`, `assert`, SQL parameter sanitization) and one file per standard
+//// library module (`hive.net`, `hive.json`, `hive.crypto`, ...).
+////
+//// Only the modules a program actually uses are written into its build
+//// directory — see `modules` and `hive/cli`. Everything lands in the same Go
+//// package (`hive`), so a module's file may call into the core runtime and
+//// into any module it lists in `requires`, but nothing else.
+
+import gleam/list
+import gleam/string
 
 /// The Go module name for every generated program. Because each program is
 /// built in its own isolated directory this can be a fixed name.
@@ -12,7 +20,158 @@ pub fn go_mod() -> String {
   "module " <> go_module <> "\n\ngo 1.26\n"
 }
 
-/// Source of the `hive` runtime package (written to `hive/runtime.go`).
+// ---------------------------------------------------------------------------
+// The optional standard library modules
+// ---------------------------------------------------------------------------
+
+/// One standard library module's Go source, written into the generated project
+/// only when the program uses it.
+///
+/// `markers` are the `hive.X` references a program that uses the module is
+/// guaranteed to carry in its generated `main.go` — matching any one of them
+/// pulls the module in. `requires` names the other modules this one's own Go
+/// source calls into, so a module is never written without the definitions it
+/// needs (the core `runtime.go` is always present, and every module may use
+/// it).
+pub type Module {
+  Module(
+    name: String,
+    /// Path within the build directory.
+    file: String,
+    source: fn() -> String,
+    markers: List(String),
+    requires: List(String),
+  )
+}
+
+/// Every module that is included on demand. The core runtime is not listed: it
+/// is always written.
+pub fn modules() -> List(Module) {
+  [
+    Module(
+      name: "net",
+      file: "hive/net.go",
+      source: net_go,
+      markers: ["hive.Http", "hive.Ws", "hive.Socket"],
+      requires: [],
+    ),
+    Module(
+      name: "json",
+      file: "hive/json.go",
+      source: json_go,
+      markers: ["hive.Json"],
+      requires: [],
+    ),
+    Module(
+      name: "crypto",
+      file: "hive/crypto.go",
+      source: crypto_go,
+      markers: [
+        "hive.Sha", "hive.Hmac", "hive.Base64", "hive.RandomHex", "hive.Jwt",
+        "hive.CryptoError",
+      ],
+      // JWTs decode their payload with the JSON module's derived decoders and
+      // check exp/nbf against `Now`.
+      requires: ["json", "time"],
+    ),
+    Module(
+      name: "conv",
+      file: "hive/conv.go",
+      source: conv_go,
+      markers: [
+        "hive.Ceil", "hive.Floor", "hive.Round", "hive.IntTo", "hive.FloatTo",
+        "hive.StrTo", "hive.ConversionError",
+      ],
+      requires: [],
+    ),
+    Module(
+      name: "env",
+      file: "hive/env.go",
+      source: env_go,
+      markers: ["hive.Env"],
+      requires: [],
+    ),
+    Module(
+      name: "term",
+      file: "hive/term.go",
+      source: term_go,
+      markers: ["hive.Term"],
+      requires: [],
+    ),
+    Module(
+      name: "task",
+      file: "hive/task.go",
+      source: task_go,
+      markers: ["hive.Sleep"],
+      requires: [],
+    ),
+    Module(
+      name: "time",
+      file: "hive/time.go",
+      source: time_go,
+      markers: ["hive.Now", "hive.Timezone", "hive.TimeFormat"],
+      requires: [],
+    ),
+    Module(
+      name: "sql",
+      file: "hive/sql.go",
+      source: sql_go,
+      // Deliberately spelled out rather than matched on a `hive.Sql` prefix:
+      // `hive.SqlParam` (query interpolation) lives in the core runtime, and
+      // matching it here would drag the external drivers into a program that
+      // never opens a connection.
+      markers: [
+        "hive.SqlConnect", "hive.SqlPool", "hive.SqlClose", "hive.SqlQuery",
+        "hive.SqlError", "hive.SqlConnection", "hive.DatabaseDriver",
+      ],
+      requires: [],
+    ),
+  ]
+}
+
+/// The standard library modules a generated program needs, by name: every
+/// module whose markers appear in the given `main.go`, plus — transitively —
+/// the modules those ones call into themselves (`hive.crypto` decodes JWT
+/// payloads with `hive.json` and reads the clock through `hive.time`).
+///
+/// A module nothing reaches for is left out of the build entirely, so a program
+/// that never opens a socket does not compile the networking runtime, and one
+/// that never opens a database neither downloads nor links the SQL drivers.
+pub fn needed_modules(main_go: String) -> List(String) {
+  let direct =
+    modules()
+    |> list.filter(fn(module) {
+      list.any(module.markers, fn(marker) { string.contains(main_go, marker) })
+    })
+    |> list.map(fn(module) { module.name })
+  with_requirements(direct, direct)
+}
+
+// Grows `found` with everything reachable through `requires`, one layer at a
+// time, until a layer adds nothing new.
+fn with_requirements(layer: List(String), found: List(String)) -> List(String) {
+  let next =
+    layer
+    |> list.flat_map(fn(name) {
+      case list.find(modules(), fn(module) { module.name == name }) {
+        Ok(module) -> module.requires
+        Error(_) -> []
+      }
+    })
+    |> list.unique
+    |> list.filter(fn(name) { !list.contains(found, name) })
+  case next {
+    [] -> found
+    _ -> with_requirements(next, list.append(found, next))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The core runtime (always written)
+// ---------------------------------------------------------------------------
+
+/// Source of the core `hive` runtime (written to `hive/runtime.go`): what the
+/// language itself needs, independent of any standard library module.
 ///
 /// `Table` is a type *alias* for `[][]string` so tables and `Str[dyn][dyn]`
 /// values interconvert freely, as the language spec requires.
@@ -20,25 +179,13 @@ pub fn runtime_go() -> String {
   "package hive
 
 import (
-	\"bufio\"
-	\"crypto/hmac\"
-	\"crypto/rand\"
-	\"crypto/sha256\"
-	\"crypto/sha512\"
-	\"encoding/base64\"
 	\"encoding/csv\"
-	\"encoding/hex\"
-	\"encoding/json\"
 	\"fmt\"
-	\"io\"
 	\"math\"
-	\"net/http\"
 	\"os\"
 	\"reflect\"
 	\"strconv\"
 	\"strings\"
-	\"sync\"
-	\"time\"
 	\"unicode/utf8\"
 )
 
@@ -421,7 +568,9 @@ func PowFloat(a, b float64) float64 { return math.Pow(a, b) }
 
 // SqlParam renders a value as a single-quoted SQL literal, doubling any
 // embedded single quotes so interpolated parameters cannot break out of the
-// literal (the sanitization behind query interpolation).
+// literal (the sanitization behind query interpolation). It lives here rather
+// than in the SQL module because a `query` declaration's interpolations are
+// lowered whether or not the program ever opens a connection.
 func SqlParam(v any) string {
 	return \"'\" + strings.ReplaceAll(ToStr(v), \"'\", \"''\") + \"'\"
 }
@@ -444,259 +593,729 @@ func ReadCSV(path string, delimiter string) Result[Table, TableError] {
 	}
 	return Ok[Table, TableError](rows)
 }
+"
+}
 
 // ---------------------------------------------------------------------------
-// Time and date (hive.time)
+// hive.net
 // ---------------------------------------------------------------------------
 
-// Now returns the current Unix time in seconds. Backs hive.time.now.
-func Now() int {
-	return int(time.Now().Unix())
+/// Source of `hive/net.go`: the networking module (`hive.net`). HTTP client and
+/// server, WebSocket client and server, and raw TCP client and server.
+///
+/// The WebSocket half implements RFC 6455 directly on a hijacked connection
+/// rather than pulling in a third-party library, so a program that speaks
+/// WebSocket still builds offline with a dependency-free `go.mod`.
+pub fn net_go() -> String {
+  "package hive
+
+import (
+	\"bufio\"
+	\"crypto/rand\"
+	\"crypto/sha1\"
+	\"crypto/tls\"
+	\"encoding/base64\"
+	\"encoding/binary\"
+	\"errors\"
+	\"io\"
+	\"net\"
+	\"net/http\"
+	\"net/url\"
+	\"strconv\"
+	\"strings\"
+	\"sync\"
+	\"time\"
+)
+
+// ---------------------------------------------------------------------------
+// HTTP
+// ---------------------------------------------------------------------------
+
+// HttpRequest is the value consumed by `hive.net.httpRequest` and produced for
+// every incoming call handled by `hive.net.httpServe`. Headers are a Table of
+// [name, value] rows.
+type HttpRequest struct {
+	Method  string
+	Url     string
+	Headers Table
+	Body    string
 }
 
-// Timezone returns the name (or abbreviation) of the machine's local time zone
-// at this instant — \"UTC\", \"PST\", \"-03\", and so on. Backs hive.time.timezone.
-func Timezone() string {
-	name, _ := time.Now().Zone()
-	return name
+// HttpResponse is what `hive.net.httpRequest` yields and what an `httpServe` handler
+// returns.
+type HttpResponse struct {
+	Status  int
+	Headers Table
+	Body    string
 }
 
-// TimezoneOffset returns the local zone's current offset from UTC in minutes,
-// east of UTC being positive (so UTC+2 is 120 and UTC-3 is -180). Backs
-// hive.time.timezoneOffset.
-func TimezoneOffset() int {
-	_, seconds := time.Now().Zone()
-	return seconds / 60
+// HttpError describes a request that produced no response at all (bad URL,
+// connection refused, timeout, unreadable body).
+type HttpError struct {
+	Url     string
+	Message string
 }
 
-// TimeFormat renders a Unix time (seconds), in local time, using a
-// strftime-style template. Unknown \"%x\" escapes are emitted verbatim. Backs
-// hive.time.format. Supported directives:
-//
-//	%Y year (4 digits)   %y year (2 digits)   %m month 01-12  %d day 01-31
-//	%H hour 00-23        %I hour 01-12        %M minute       %S second
-//	%p AM/PM             %j day-of-year       %Z zone name    %z zone offset
-//	%A/%a weekday (full/short)   %B/%b month name (full/short)   %% literal %
-func TimeFormat(t int, template string) string {
-	tm := time.Unix(int64(t), 0)
-	var b strings.Builder
-	runes := []rune(template)
-	for i := 0; i < len(runes); i++ {
-		if runes[i] != '%' || i+1 >= len(runes) {
-			b.WriteRune(runes[i])
-			continue
+func (e HttpError) Error() string {
+	return \"hive: http error for \" + e.Url + \": \" + e.Message
+}
+
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
+// HttpSend backs `hive.net.httpRequest`: it performs the request and returns
+// the response, or an HttpError when no response was obtained.
+func HttpSend(req HttpRequest) Result[HttpResponse, HttpError] {
+	fail := func(err error) Result[HttpResponse, HttpError] {
+		return Err[HttpResponse, HttpError](HttpError{Url: req.Url, Message: err.Error()})
+	}
+	hreq, err := http.NewRequest(strings.ToUpper(req.Method), req.Url, strings.NewReader(req.Body))
+	if err != nil {
+		return fail(err)
+	}
+	for _, row := range req.Headers {
+		if len(row) >= 2 {
+			hreq.Header.Add(row[0], row[1])
 		}
-		i++
-		switch runes[i] {
-		case 'Y':
-			fmt.Fprintf(&b, \"%04d\", tm.Year())
-		case 'y':
-			fmt.Fprintf(&b, \"%02d\", tm.Year()%100)
-		case 'm':
-			fmt.Fprintf(&b, \"%02d\", int(tm.Month()))
-		case 'd':
-			fmt.Fprintf(&b, \"%02d\", tm.Day())
-		case 'H':
-			fmt.Fprintf(&b, \"%02d\", tm.Hour())
-		case 'I':
-			h := tm.Hour() % 12
-			if h == 0 {
-				h = 12
+	}
+	resp, err := httpClient.Do(hreq)
+	if err != nil {
+		return fail(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fail(err)
+	}
+	return Ok[HttpResponse, HttpError](HttpResponse{
+		Status:  resp.StatusCode,
+		Headers: headerTable(resp.Header),
+		Body:    string(body),
+	})
+}
+
+// HttpServe backs `hive.net.httpServe`: it serves every route through the given
+// handler and blocks forever (it panics if the listener cannot start).
+func HttpServe(port int, handler func(HttpRequest) HttpResponse) {
+	mux := http.NewServeMux()
+	mux.HandleFunc(\"/\", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		resp := handler(HttpRequest{
+			Method:  r.Method,
+			Url:     r.URL.String(),
+			Headers: headerTable(r.Header),
+			Body:    string(body),
+		})
+		for _, row := range resp.Headers {
+			if len(row) >= 2 {
+				w.Header().Add(row[0], row[1])
 			}
-			fmt.Fprintf(&b, \"%02d\", h)
-		case 'M':
-			fmt.Fprintf(&b, \"%02d\", tm.Minute())
-		case 'S':
-			fmt.Fprintf(&b, \"%02d\", tm.Second())
-		case 'p':
-			if tm.Hour() < 12 {
-				b.WriteString(\"AM\")
-			} else {
-				b.WriteString(\"PM\")
+		}
+		status := resp.Status
+		if status == 0 {
+			status = 200
+		}
+		w.WriteHeader(status)
+		io.WriteString(w, resp.Body)
+	})
+	if err := http.ListenAndServe(\":\"+strconv.Itoa(port), mux); err != nil {
+		panic(\"hive: net.httpServe: \" + err.Error())
+	}
+}
+
+func headerTable(h http.Header) Table {
+	table := Table{}
+	for name, values := range h {
+		for _, value := range values {
+			table = append(table, []string{name, value})
+		}
+	}
+	return table
+}
+
+// ---------------------------------------------------------------------------
+// WebSockets (RFC 6455)
+// ---------------------------------------------------------------------------
+
+// The fixed GUID every handshake mixes into the client's key to prove that the
+// peer really understood the upgrade (RFC 6455 §1.3).
+const wsGUID = \"258EAFA5-E914-47DA-95CA-C5AB0DC85B16\"
+
+// A frame whose length header exceeds this is refused rather than allocated, so
+// a hostile peer cannot exhaust memory with one number.
+const wsMaxPayload = 32 << 20
+
+// Frame opcodes.
+const (
+	wsContinuation byte = 0x0
+	wsText         byte = 0x1
+	wsBinary       byte = 0x2
+	wsCloseOp      byte = 0x8
+	wsPing         byte = 0x9
+	wsPong         byte = 0xA
+)
+
+// WsError says why a WebSocket operation failed. Reason is a short tag:
+// \"Handshake\", \"Protocol\", \"Closed\", \"Send\" or \"Receive\".
+type WsError struct {
+	Reason  string
+	Message string
+}
+
+func (e WsError) Error() string {
+	return \"hive: websocket \" + e.Reason + \": \" + e.Message
+}
+
+// WsConnection is an open WebSocket. It is opaque in Hive: messages move
+// through hive.net.wsSend and hive.net.wsReceive. Sending is safe from any
+// number of virtual threads at once (writes are serialised), but one thread
+// should own the receiving side — two concurrent receives would each take half
+// of a fragmented message.
+type WsConnection struct {
+	ws *wsSocket
+}
+
+type wsSocket struct {
+	conn net.Conn
+	r    *bufio.Reader
+	// A client must mask every frame it sends and a server must not, which is
+	// the only difference between the two ends.
+	masking bool
+	// The HTTP request that opened the connection (hive.net.wsRequest).
+	req HttpRequest
+	// Guards writes and the closed flag; a message may be sent from any thread.
+	mu     sync.Mutex
+	closed bool
+	// Payload accumulated so far across a fragmented message. Only the
+	// receiving thread touches these.
+	frag   []byte
+	fragOp byte
+}
+
+// readFrame reads one whole frame off the wire and unmasks its payload.
+func (s *wsSocket) readFrame() (byte, bool, []byte, error) {
+	var head [2]byte
+	if _, err := io.ReadFull(s.r, head[:]); err != nil {
+		return 0, false, nil, err
+	}
+	fin := head[0]&0x80 != 0
+	opcode := head[0] & 0x0F
+	masked := head[1]&0x80 != 0
+	length := uint64(head[1] & 0x7F)
+	switch length {
+	case 126:
+		var ext [2]byte
+		if _, err := io.ReadFull(s.r, ext[:]); err != nil {
+			return 0, false, nil, err
+		}
+		length = uint64(binary.BigEndian.Uint16(ext[:]))
+	case 127:
+		var ext [8]byte
+		if _, err := io.ReadFull(s.r, ext[:]); err != nil {
+			return 0, false, nil, err
+		}
+		length = binary.BigEndian.Uint64(ext[:])
+	}
+	if length > wsMaxPayload {
+		return 0, false, nil, errors.New(\"the peer announced a frame larger than the 32MiB limit\")
+	}
+	var mask [4]byte
+	if masked {
+		if _, err := io.ReadFull(s.r, mask[:]); err != nil {
+			return 0, false, nil, err
+		}
+	}
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(s.r, payload); err != nil {
+		return 0, false, nil, err
+	}
+	if masked {
+		for i := range payload {
+			payload[i] ^= mask[i%4]
+		}
+	}
+	return opcode, fin, payload, nil
+}
+
+// writeFrame sends one unfragmented frame, masking the payload with a fresh
+// random key when this end is the client.
+func (s *wsSocket) writeFrame(opcode byte, payload []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New(\"the connection is closed\")
+	}
+	maskBit := byte(0)
+	if s.masking {
+		maskBit = 0x80
+	}
+	n := len(payload)
+	frame := []byte{0x80 | opcode}
+	switch {
+	case n < 126:
+		frame = append(frame, maskBit|byte(n))
+	case n <= 0xFFFF:
+		frame = append(frame, maskBit|126)
+		var ext [2]byte
+		binary.BigEndian.PutUint16(ext[:], uint16(n))
+		frame = append(frame, ext[:]...)
+	default:
+		frame = append(frame, maskBit|127)
+		var ext [8]byte
+		binary.BigEndian.PutUint64(ext[:], uint64(n))
+		frame = append(frame, ext[:]...)
+	}
+	if s.masking {
+		var mask [4]byte
+		if _, err := rand.Read(mask[:]); err != nil {
+			return err
+		}
+		frame = append(frame, mask[:]...)
+		for i := 0; i < n; i++ {
+			frame = append(frame, payload[i]^mask[i%4])
+		}
+	} else {
+		frame = append(frame, payload...)
+	}
+	_, err := s.conn.Write(frame)
+	return err
+}
+
+// close shuts the underlying connection down exactly once, so a handler that
+// closes explicitly and the deferred close of a served connection cannot fight.
+func (s *wsSocket) close() {
+	s.mu.Lock()
+	already := s.closed
+	s.closed = true
+	s.mu.Unlock()
+	if !already {
+		_ = s.conn.Close()
+	}
+}
+
+// receive returns the payload of the next data message, answering pings and
+// stitching continuation frames back together on the way. A close frame, or a
+// connection that has gone away, ends the wait with a \"Closed\" error.
+func (s *wsSocket) receive() (string, *WsError) {
+	for {
+		opcode, fin, payload, err := s.readFrame()
+		if err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				s.close()
+				return \"\", &WsError{Reason: \"Closed\", Message: \"the peer closed the connection\"}
 			}
-		case 'j':
-			fmt.Fprintf(&b, \"%03d\", tm.YearDay())
-		case 'A':
-			b.WriteString(tm.Weekday().String())
-		case 'a':
-			b.WriteString(tm.Weekday().String()[:3])
-		case 'B':
-			b.WriteString(tm.Month().String())
-		case 'b':
-			b.WriteString(tm.Month().String()[:3])
-		case 'Z':
-			name, _ := tm.Zone()
-			b.WriteString(name)
-		case 'z':
-			b.WriteString(tm.Format(\"-0700\"))
-		case '%':
-			b.WriteByte('%')
+			return \"\", &WsError{Reason: \"Receive\", Message: err.Error()}
+		}
+		switch opcode {
+		case wsPing:
+			// A pong must echo the ping's payload back unchanged.
+			if err := s.writeFrame(wsPong, payload); err != nil {
+				return \"\", &WsError{Reason: \"Send\", Message: err.Error()}
+			}
+		case wsPong:
+			// An unsolicited pong is just a keepalive; keep waiting.
+		case wsCloseOp:
+			_ = s.writeFrame(wsCloseOp, payload)
+			s.close()
+			return \"\", &WsError{Reason: \"Closed\", Message: \"the peer closed the connection\"}
+		case wsText, wsBinary:
+			if fin {
+				return string(payload), nil
+			}
+			s.frag = append([]byte{}, payload...)
+			s.fragOp = opcode
+		case wsContinuation:
+			if s.fragOp == 0 {
+				return \"\", &WsError{
+					Reason:  \"Protocol\",
+					Message: \"a continuation frame arrived with no message to continue\",
+				}
+			}
+			s.frag = append(s.frag, payload...)
+			if fin {
+				message := string(s.frag)
+				s.frag, s.fragOp = nil, 0
+				return message, nil
+			}
 		default:
-			b.WriteByte('%')
-			b.WriteRune(runes[i])
+			return \"\", &WsError{
+				Reason:  \"Protocol\",
+				Message: \"unknown opcode \" + strconv.Itoa(int(opcode)),
+			}
 		}
 	}
-	return b.String()
 }
 
-// ---------------------------------------------------------------------------
-// Conversions (hive.conv): numeric rounding plus value/string conversions.
-// ---------------------------------------------------------------------------
-
-// ConversionError describes a Str that could not be parsed into a number.
-type ConversionError struct {
-	Input   string
-	Message string
+// wsAcceptKey is the Sec-WebSocket-Accept value proving we saw the client's key.
+func wsAcceptKey(key string) string {
+	sum := sha1.Sum([]byte(key + wsGUID))
+	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
-func (e ConversionError) Error() string {
-	return \"hive: conversion error for \" + strconv.Quote(e.Input) + \": \" + e.Message
-}
-
-// Ceil, Floor and Round convert a Float to the Int nearest it in the named
-// direction (Round rounds halves away from zero).
-func Ceil(x float64) int  { return int(math.Ceil(x)) }
-func Floor(x float64) int { return int(math.Floor(x)) }
-func Round(x float64) int { return int(math.Round(x)) }
-
-// IntToFloat widens an Int to a Float.
-func IntToFloat(x int) float64 { return float64(x) }
-
-// IntToStr renders an Int in base 10.
-func IntToStr(x int) string { return strconv.Itoa(x) }
-
-// FloatToStr renders a Float in its shortest round-trippable form.
-func FloatToStr(x float64) string { return strconv.FormatFloat(x, 'g', -1, 64) }
-
-// StrToInt parses a base-10 Int, or reports a ConversionError.
-func StrToInt(s string) Result[int, ConversionError] {
-	i, err := strconv.Atoi(s)
+// wsAccept completes the server side of the handshake, hijacking the connection
+// away from net/http so frames can be read and written directly. A rejected
+// handshake is answered here, so the caller only has to give up.
+func wsAccept(w http.ResponseWriter, r *http.Request) (*wsSocket, error) {
+	key := r.Header.Get(\"Sec-WebSocket-Key\")
+	upgrading := strings.Contains(strings.ToLower(r.Header.Get(\"Connection\")), \"upgrade\") &&
+		strings.EqualFold(r.Header.Get(\"Upgrade\"), \"websocket\")
+	if !upgrading || key == \"\" {
+		http.Error(w, \"expected a WebSocket upgrade request\", http.StatusBadRequest)
+		return nil, errors.New(\"not a WebSocket upgrade request\")
+	}
+	if version := r.Header.Get(\"Sec-WebSocket-Version\"); version != \"13\" {
+		w.Header().Set(\"Sec-WebSocket-Version\", \"13\")
+		http.Error(w, \"unsupported WebSocket version \"+version, http.StatusBadRequest)
+		return nil, errors.New(\"unsupported WebSocket version \" + version)
+	}
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, \"this connection cannot be upgraded\", http.StatusInternalServerError)
+		return nil, errors.New(\"the connection cannot be hijacked\")
+	}
+	// Read the request body before hijacking: afterwards net/http is out of the
+	// picture and the socket carries frames, not HTTP.
+	body, _ := io.ReadAll(r.Body)
+	conn, rw, err := hijacker.Hijack()
 	if err != nil {
-		return Err[int, ConversionError](ConversionError{Input: s, Message: \"not a valid integer\"})
+		return nil, err
 	}
-	return Ok[int, ConversionError](i)
+	handshake := \"HTTP/1.1 101 Switching Protocols\\r\\n\" +
+		\"Upgrade: websocket\\r\\n\" +
+		\"Connection: Upgrade\\r\\n\" +
+		\"Sec-WebSocket-Accept: \" + wsAcceptKey(key) + \"\\r\\n\\r\\n\"
+	if _, err := rw.WriteString(handshake); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := rw.Flush(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	// rw.Reader may already hold bytes the client pipelined behind the
+	// handshake, so the frame reader must be that same buffered reader.
+	return &wsSocket{
+		conn: conn,
+		r:    rw.Reader,
+		req: HttpRequest{
+			Method:  r.Method,
+			Url:     r.URL.String(),
+			Headers: headerTable(r.Header),
+			Body:    string(body),
+		},
+	}, nil
 }
 
-// StrToFloat parses a Float, or reports a ConversionError.
-func StrToFloat(s string) Result[float64, ConversionError] {
-	f, err := strconv.ParseFloat(s, 64)
+// WsConnect opens a client WebSocket to a ws:// or wss:// URL. Backs
+// hive.net.wsConnect.
+func WsConnect(rawURL string) Result[WsConnection, WsError] {
+	fail := func(reason string, message string) Result[WsConnection, WsError] {
+		return Err[WsConnection, WsError](WsError{Reason: reason, Message: message})
+	}
+	target, err := url.Parse(rawURL)
 	if err != nil {
-		return Err[float64, ConversionError](ConversionError{Input: s, Message: \"not a valid number\"})
+		return fail(\"Handshake\", \"cannot parse the URL: \"+err.Error())
 	}
-	return Ok[float64, ConversionError](f)
-}
-
-// EnvironmentError describes a variable that could not be resolved from a
-// .env file or the OS environment.
-type EnvironmentError struct {
-	Key     string
-	Message string
-}
-
-func (e EnvironmentError) Error() string {
-	return \"hive: environment variable \" + e.Key + \": \" + e.Message
-}
-
-var envOnce sync.Once
-var envVars map[string]string
-
-// loadDotEnv reads the .env file in the working directory, or the parent
-// directory if that one is absent, into envVars. It runs once, lazily, on the
-// first EnvGet — after any startup chdir, so the working directory is the
-// entrypoint's folder. A missing or unreadable file just leaves envVars empty.
-func loadDotEnv() {
-	envVars = map[string]string{}
-	path := \"\"
-	if _, err := os.Stat(\".env\"); err == nil {
-		path = \".env\"
-	} else if _, err := os.Stat(\"../.env\"); err == nil {
-		path = \"../.env\"
+	secure := false
+	switch strings.ToLower(target.Scheme) {
+	case \"ws\", \"http\":
+	case \"wss\", \"https\":
+		secure = true
+	default:
+		return fail(\"Handshake\", \"unsupported scheme \"+strconv.Quote(target.Scheme)+\"; expected ws:// or wss://\")
 	}
+	address := target.Host
+	if target.Port() == \"\" {
+		if secure {
+			address = net.JoinHostPort(address, \"443\")
+		} else {
+			address = net.JoinHostPort(address, \"80\")
+		}
+	}
+	conn, err := net.DialTimeout(\"tcp\", address, 30*time.Second)
+	if err != nil {
+		return fail(\"Handshake\", err.Error())
+	}
+	if secure {
+		secured := tls.Client(conn, &tls.Config{ServerName: target.Hostname()})
+		if err := secured.Handshake(); err != nil {
+			_ = conn.Close()
+			return fail(\"Handshake\", err.Error())
+		}
+		conn = secured
+	}
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		_ = conn.Close()
+		return fail(\"Handshake\", err.Error())
+	}
+	key := base64.StdEncoding.EncodeToString(nonce[:])
+	path := target.RequestURI()
 	if path == \"\" {
-		return
+		path = \"/\"
 	}
-	data, err := os.ReadFile(path)
+	request := \"GET \" + path + \" HTTP/1.1\\r\\n\" +
+		\"Host: \" + target.Host + \"\\r\\n\" +
+		\"Upgrade: websocket\\r\\n\" +
+		\"Connection: Upgrade\\r\\n\" +
+		\"Sec-WebSocket-Key: \" + key + \"\\r\\n\" +
+		\"Sec-WebSocket-Version: 13\\r\\n\\r\\n\"
+	if _, err := io.WriteString(conn, request); err != nil {
+		_ = conn.Close()
+		return fail(\"Handshake\", err.Error())
+	}
+	// The response is parsed out of the buffered reader that then goes on to
+	// read frames, so nothing the server sent immediately after 101 is lost.
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, nil)
 	if err != nil {
+		_ = conn.Close()
+		return fail(\"Handshake\", err.Error())
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		_ = conn.Close()
+		return fail(\"Handshake\", \"the server answered \"+strconv.Itoa(resp.StatusCode)+\" instead of 101\")
+	}
+	if resp.Header.Get(\"Sec-WebSocket-Accept\") != wsAcceptKey(key) {
+		_ = conn.Close()
+		return fail(\"Handshake\", \"the server's Sec-WebSocket-Accept does not match the key we sent\")
+	}
+	return Ok[WsConnection, WsError](WsConnection{ws: &wsSocket{
+		conn:    conn,
+		r:       reader,
+		masking: true,
+		req: HttpRequest{
+			Method:  \"GET\",
+			Url:     rawURL,
+			Headers: headerTable(resp.Header),
+		},
+	}})
+}
+
+// WsSend delivers one text message and reports how many bytes it carried.
+// Backs hive.net.wsSend.
+func WsSend(c WsConnection, message string) Result[int, WsError] {
+	if c.ws == nil {
+		return Err[int, WsError](WsError{Reason: \"Closed\", Message: \"the connection is not open\"})
+	}
+	if err := c.ws.writeFrame(wsText, []byte(message)); err != nil {
+		return Err[int, WsError](WsError{Reason: \"Send\", Message: err.Error()})
+	}
+	return Ok[int, WsError](len(message))
+}
+
+// WsReceive blocks the calling virtual thread until the peer sends a message,
+// then returns its payload. Pings are answered and fragmented messages
+// reassembled along the way; a connection the peer has closed is a
+// Result.Error whose reason is \"Closed\". Backs hive.net.wsReceive.
+func WsReceive(c WsConnection) Result[string, WsError] {
+	if c.ws == nil {
+		return Err[string, WsError](WsError{Reason: \"Closed\", Message: \"the connection is not open\"})
+	}
+	message, werr := c.ws.receive()
+	if werr != nil {
+		return Err[string, WsError](*werr)
+	}
+	return Ok[string, WsError](message)
+}
+
+// WsRequest is the HTTP request that opened the connection — its method, url
+// and headers — so a server handler can route or authenticate. Backs
+// hive.net.wsRequest.
+func WsRequest(c WsConnection) HttpRequest {
+	if c.ws == nil {
+		return HttpRequest{Headers: Table{}}
+	}
+	return c.ws.req
+}
+
+// WsClose sends a normal-closure frame and shuts the connection down. Calling
+// it more than once is harmless. Backs hive.net.wsClose.
+func WsClose(c WsConnection) {
+	if c.ws == nil {
 		return
 	}
-	// Split on \\n; TrimSpace then also drops any trailing \\r on Windows files.
-	for _, line := range strings.Split(string(data), \"\\n\") {
-		line = strings.TrimSpace(line)
-		if line == \"\" || strings.HasPrefix(line, \"#\") {
-			continue
+	// 1000 (normal closure), big-endian, as the close frame's payload.
+	_ = c.ws.writeFrame(wsCloseOp, []byte{0x03, 0xE8})
+	c.ws.close()
+}
+
+// WsServe accepts WebSocket connections on port and runs handler once per
+// connection, each on its own virtual thread; the connection is closed when the
+// handler returns. It blocks forever, and panics if the listener cannot start.
+// Backs hive.net.wsServe.
+func WsServe(port int, handler func(WsConnection)) {
+	mux := http.NewServeMux()
+	mux.HandleFunc(\"/\", func(w http.ResponseWriter, r *http.Request) {
+		socket, err := wsAccept(w, r)
+		if err != nil {
+			// wsAccept has already answered the rejected handshake.
+			return
 		}
-		line = strings.TrimPrefix(line, \"export \")
-		eq := strings.Index(line, \"=\")
-		if eq < 0 {
-			continue
-		}
-		key := strings.TrimSpace(line[:eq])
-		val := strings.Trim(strings.TrimSpace(line[eq+1:]), \"\\\"'\")
-		if key != \"\" {
-			envVars[key] = val
-		}
+		defer socket.close()
+		handler(WsConnection{ws: socket})
+	})
+	if err := http.ListenAndServe(\":\"+strconv.Itoa(port), mux); err != nil {
+		panic(\"hive: net.wsServe: \" + err.Error())
 	}
 }
 
-// EnvGet resolves a variable from the .env file first, then the OS
-// environment; a variable set in neither yields an EnvironmentError. Backs
-// hive.env.get.
-func EnvGet(key string) Result[string, EnvironmentError] {
-	envOnce.Do(loadDotEnv)
-	if v, ok := envVars[key]; ok {
-		return Ok[string, EnvironmentError](v)
-	}
-	if v, ok := os.LookupEnv(key); ok {
-		return Ok[string, EnvironmentError](v)
-	}
-	return Err[string, EnvironmentError](EnvironmentError{Key: key, Message: \"not set\"})
+// ---------------------------------------------------------------------------
+// Raw TCP sockets
+// ---------------------------------------------------------------------------
+
+// SocketError says why a socket operation failed. Reason is a short tag:
+// \"Connect\", \"Closed\", \"Send\" or \"Receive\".
+type SocketError struct {
+	Reason  string
+	Message string
 }
 
-// ---------------------------------------------------------------------------
-// Terminal I/O (hive.term)
-// ---------------------------------------------------------------------------
+func (e SocketError) Error() string {
+	return \"hive: socket \" + e.Reason + \": \" + e.Message
+}
 
-// One shared buffered reader over stdin: created once so bytes read past a
-// newline in one TermRead are not lost before the next.
-var stdinReader = bufio.NewReader(os.Stdin)
+// SocketConnection is an open TCP stream. Reads go through one buffered
+// reader, so hive.net.socketReceive and hive.net.socketReceiveLine can be
+// mixed on the same connection without losing bytes between them.
+type SocketConnection struct {
+	sock *socket
+}
 
-// TermRead blocks until the user finishes a line of input and returns it
-// without the trailing newline (and without a trailing CR on Windows input).
-// The read parks only the calling goroutine — the Go scheduler keeps other
-// virtual threads running on other OS threads. At end of input it returns
-// whatever preceded EOF (\"\" if nothing). Backs hive.term.read.
-func TermRead() string {
-	line, err := stdinReader.ReadString('\\n')
+type socket struct {
+	conn net.Conn
+	r    *bufio.Reader
+}
+
+// SocketConnect dials a TCP server. Backs hive.net.socketConnect.
+func SocketConnect(host string, port int) Result[SocketConnection, SocketError] {
+	address := net.JoinHostPort(host, strconv.Itoa(port))
+	conn, err := net.DialTimeout(\"tcp\", address, 30*time.Second)
+	if err != nil {
+		return Err[SocketConnection, SocketError](SocketError{Reason: \"Connect\", Message: err.Error()})
+	}
+	return Ok[SocketConnection, SocketError](SocketConnection{
+		sock: &socket{conn: conn, r: bufio.NewReader(conn)},
+	})
+}
+
+// SocketSend writes data to the stream and returns the number of bytes written.
+// Backs hive.net.socketSend.
+func SocketSend(c SocketConnection, data string) Result[int, SocketError] {
+	if c.sock == nil {
+		return Err[int, SocketError](SocketError{Reason: \"Closed\", Message: \"the connection is not open\"})
+	}
+	n, err := c.sock.conn.Write([]byte(data))
+	if err != nil {
+		return Err[int, SocketError](SocketError{Reason: \"Send\", Message: err.Error()})
+	}
+	return Ok[int, SocketError](n)
+}
+
+// SocketReceive blocks until at least one byte arrives and returns up to limit
+// bytes of it — a short read is normal on a stream, so a protocol that needs a
+// fixed number of bytes must keep calling. A peer that has closed the stream
+// yields a Result.Error whose reason is \"Closed\". Backs hive.net.socketReceive.
+func SocketReceive(c SocketConnection, limit int) Result[string, SocketError] {
+	if c.sock == nil {
+		return Err[string, SocketError](SocketError{Reason: \"Closed\", Message: \"the connection is not open\"})
+	}
+	if limit <= 0 {
+		return Ok[string, SocketError](\"\")
+	}
+	buf := make([]byte, limit)
+	n, err := c.sock.r.Read(buf)
+	if n > 0 {
+		return Ok[string, SocketError](string(buf[:n]))
+	}
+	if err == io.EOF {
+		return Err[string, SocketError](SocketError{Reason: \"Closed\", Message: \"the peer closed the connection\"})
+	}
+	if err != nil {
+		return Err[string, SocketError](SocketError{Reason: \"Receive\", Message: err.Error()})
+	}
+	return Ok[string, SocketError](\"\")
+}
+
+// SocketReceiveLine blocks until a newline arrives and returns the line without
+// its trailing \"\\n\" (or \"\\r\\n\") — the read for line-oriented protocols. Backs
+// hive.net.socketReceiveLine.
+func SocketReceiveLine(c SocketConnection) Result[string, SocketError] {
+	if c.sock == nil {
+		return Err[string, SocketError](SocketError{Reason: \"Closed\", Message: \"the connection is not open\"})
+	}
+	line, err := c.sock.r.ReadString('\\n')
 	line = strings.TrimRight(line, \"\\n\")
 	line = strings.TrimRight(line, \"\\r\")
-	if err != nil && line == \"\" {
+	if err != nil {
+		// Whatever preceded the EOF is still a line worth delivering; only an
+		// empty tail means the stream is done.
+		if line != \"\" {
+			return Ok[string, SocketError](line)
+		}
+		if err == io.EOF {
+			return Err[string, SocketError](SocketError{Reason: \"Closed\", Message: \"the peer closed the connection\"})
+		}
+		return Err[string, SocketError](SocketError{Reason: \"Receive\", Message: err.Error()})
+	}
+	return Ok[string, SocketError](line)
+}
+
+// SocketPeer is the connection's remote address (\"host:port\"). Backs
+// hive.net.socketPeer.
+func SocketPeer(c SocketConnection) string {
+	if c.sock == nil {
 		return \"\"
 	}
-	return line
+	return c.sock.conn.RemoteAddr().String()
 }
 
-// TermArgs returns the command-line arguments the program was run with, in
-// order and excluding the program name (os.Args[0]). Backs hive.term.args.
-func TermArgs() []string {
-	args := os.Args[1:]
-	out := make([]string, len(args))
-	copy(out, args)
-	return out
-}
-
-// ---------------------------------------------------------------------------
-// Task scheduling (hive.task)
-// ---------------------------------------------------------------------------
-
-// Sleep parks the calling goroutine for ms milliseconds; only that virtual
-// thread waits, so others keep running. A non-positive duration returns at
-// once. Backs hive.task.sleep.
-func Sleep(ms int) {
-	if ms <= 0 {
-		return
+// SocketClose shuts the connection down. Calling it more than once is
+// harmless. Backs hive.net.socketClose.
+func SocketClose(c SocketConnection) {
+	if c.sock != nil {
+		_ = c.sock.conn.Close()
 	}
-	time.Sleep(time.Duration(ms) * time.Millisecond)
 }
+
+// SocketServe accepts TCP connections on port and runs handler once per
+// connection, each on its own virtual thread; the connection is closed when the
+// handler returns. It blocks forever, and panics if the listener cannot start.
+// Backs hive.net.socketServe.
+func SocketServe(port int, handler func(SocketConnection)) {
+	listener, err := net.Listen(\"tcp\", \":\"+strconv.Itoa(port))
+	if err != nil {
+		panic(\"hive: net.socketServe: \" + err.Error())
+	}
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			// One peer vanishing mid-handshake must not take the server down.
+			continue
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			handler(SocketConnection{sock: &socket{conn: c, r: bufio.NewReader(c)}})
+		}(conn)
+	}
+}
+"
+}
+
+// ---------------------------------------------------------------------------
+// hive.json
+// ---------------------------------------------------------------------------
+
+/// Source of `hive/json.go`: the JSON module (`hive.json`). The decoders and
+/// encoders here are the pieces the compiler's derived `jsonDecode_T` /
+/// `jsonEncode_T` functions are built out of.
+pub fn json_go() -> String {
+  "package hive
+
+import (
+	\"encoding/json\"
+	\"strconv\"
+	\"strings\"
+)
 
 // JsonError describes why a JSON document didn't match the expected type:
 // the exact path that failed, what the type expected there, and what the
@@ -1166,10 +1785,31 @@ func JsonEncodeDynamic(v any) string {
 	}
 	panic(\"hive: json.encode: cannot derive an encoder for this value\")
 }
+"
+}
 
 // ---------------------------------------------------------------------------
-// Cryptography (hive.crypto): hashes, HMAC, base64, random, and JWTs.
+// hive.crypto
 // ---------------------------------------------------------------------------
+
+/// Source of `hive/crypto.go`: the cryptography module (`hive.crypto`) —
+/// hashes, HMAC, base64, random bytes, and JSON Web Tokens. JWT payloads are
+/// decoded with the JSON module's machinery and their exp/nbf claims checked
+/// against the time module's clock, so both are pulled in alongside it.
+pub fn crypto_go() -> String {
+  "package hive
+
+import (
+	\"crypto/hmac\"
+	\"crypto/rand\"
+	\"crypto/sha256\"
+	\"crypto/sha512\"
+	\"encoding/base64\"
+	\"encoding/hex\"
+	\"encoding/json\"
+	\"strconv\"
+	\"strings\"
+)
 
 // CryptoError says why a crypto operation failed (invalid base64, a bad
 // token, ...). Reason is a short tag: \"Malformed\", \"BadSignature\",
@@ -1372,116 +2012,336 @@ func JwtReadHeader(token string) Result[JwtHeader, CryptoError] {
 	}
 	return Ok[JwtHeader, CryptoError](JwtHeader{Alg: h.Alg, Typ: h.Typ, Kid: h.Kid})
 }
-
-// HttpRequest is the value consumed by `hive.http.request` and produced for
-// every incoming call handled by `hive.http.serve`. Headers are a Table of
-// [name, value] rows.
-type HttpRequest struct {
-	Method  string
-	Url     string
-	Headers Table
-	Body    string
+"
 }
 
-// HttpResponse is what `hive.http.request` yields and what a `serve` handler
-// returns.
-type HttpResponse struct {
-	Status  int
-	Headers Table
-	Body    string
-}
+// ---------------------------------------------------------------------------
+// hive.conv
+// ---------------------------------------------------------------------------
 
-// HttpError describes a request that produced no response at all (bad URL,
-// connection refused, timeout, unreadable body).
-type HttpError struct {
-	Url     string
+/// Source of `hive/conv.go`: the conversion module (`hive.conv`) — numeric
+/// rounding plus value/string conversions.
+pub fn conv_go() -> String {
+  "package hive
+
+import (
+	\"math\"
+	\"strconv\"
+)
+
+// ConversionError describes a Str that could not be parsed into a number.
+type ConversionError struct {
+	Input   string
 	Message string
 }
 
-func (e HttpError) Error() string {
-	return \"hive: http error for \" + e.Url + \": \" + e.Message
+func (e ConversionError) Error() string {
+	return \"hive: conversion error for \" + strconv.Quote(e.Input) + \": \" + e.Message
 }
 
-var httpClient = &http.Client{Timeout: 30 * time.Second}
+// Ceil, Floor and Round convert a Float to the Int nearest it in the named
+// direction (Round rounds halves away from zero).
+func Ceil(x float64) int  { return int(math.Ceil(x)) }
+func Floor(x float64) int { return int(math.Floor(x)) }
+func Round(x float64) int { return int(math.Round(x)) }
 
-// HttpSend backs `hive.http.request`: it performs the request and returns
-// the response, or an HttpError when no response was obtained.
-func HttpSend(req HttpRequest) Result[HttpResponse, HttpError] {
-	fail := func(err error) Result[HttpResponse, HttpError] {
-		return Err[HttpResponse, HttpError](HttpError{Url: req.Url, Message: err.Error()})
-	}
-	hreq, err := http.NewRequest(strings.ToUpper(req.Method), req.Url, strings.NewReader(req.Body))
+// IntToFloat widens an Int to a Float.
+func IntToFloat(x int) float64 { return float64(x) }
+
+// IntToStr renders an Int in base 10.
+func IntToStr(x int) string { return strconv.Itoa(x) }
+
+// FloatToStr renders a Float in its shortest round-trippable form.
+func FloatToStr(x float64) string { return strconv.FormatFloat(x, 'g', -1, 64) }
+
+// StrToInt parses a base-10 Int, or reports a ConversionError.
+func StrToInt(s string) Result[int, ConversionError] {
+	i, err := strconv.Atoi(s)
 	if err != nil {
-		return fail(err)
+		return Err[int, ConversionError](ConversionError{Input: s, Message: \"not a valid integer\"})
 	}
-	for _, row := range req.Headers {
-		if len(row) >= 2 {
-			hreq.Header.Add(row[0], row[1])
-		}
-	}
-	resp, err := httpClient.Do(hreq)
-	if err != nil {
-		return fail(err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fail(err)
-	}
-	return Ok[HttpResponse, HttpError](HttpResponse{
-		Status:  resp.StatusCode,
-		Headers: headerTable(resp.Header),
-		Body:    string(body),
-	})
+	return Ok[int, ConversionError](i)
 }
 
-// HttpServe backs `hive.http.serve`: it serves every route through the given
-// handler and blocks forever (it panics if the listener cannot start).
-func HttpServe(port int, handler func(HttpRequest) HttpResponse) {
-	mux := http.NewServeMux()
-	mux.HandleFunc(\"/\", func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		resp := handler(HttpRequest{
-			Method:  r.Method,
-			Url:     r.URL.String(),
-			Headers: headerTable(r.Header),
-			Body:    string(body),
-		})
-		for _, row := range resp.Headers {
-			if len(row) >= 2 {
-				w.Header().Add(row[0], row[1])
-			}
-		}
-		status := resp.Status
-		if status == 0 {
-			status = 200
-		}
-		w.WriteHeader(status)
-		io.WriteString(w, resp.Body)
-	})
-	if err := http.ListenAndServe(\":\"+strconv.Itoa(port), mux); err != nil {
-		panic(\"hive: http.serve: \" + err.Error())
+// StrToFloat parses a Float, or reports a ConversionError.
+func StrToFloat(s string) Result[float64, ConversionError] {
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return Err[float64, ConversionError](ConversionError{Input: s, Message: \"not a valid number\"})
 	}
-}
-
-func headerTable(h http.Header) Table {
-	table := Table{}
-	for name, values := range h {
-		for _, value := range values {
-			table = append(table, []string{name, value})
-		}
-	}
-	return table
+	return Ok[float64, ConversionError](f)
 }
 "
 }
 
-/// Source of the `hive/sql.go` file, written into the generated project only
-/// when the program uses `hive.sql`. It lives in its own file (rather than in
-/// `runtime.go`) so that programs which never touch SQL keep a dependency-free
-/// `go.mod` and build offline. SQLite is the pure-Go `modernc.org/sqlite`
-/// (the engine is compiled straight into the executable — no CGO, no system
-/// SQLite); Postgres is `github.com/lib/pq`.
+// ---------------------------------------------------------------------------
+// hive.env
+// ---------------------------------------------------------------------------
+
+/// Source of `hive/env.go`: the environment module (`hive.env`) — variables
+/// resolved from a `.env` file, then from the OS environment.
+pub fn env_go() -> String {
+  "package hive
+
+import (
+	\"os\"
+	\"strings\"
+	\"sync\"
+)
+
+// EnvironmentError describes a variable that could not be resolved from a
+// .env file or the OS environment.
+type EnvironmentError struct {
+	Key     string
+	Message string
+}
+
+func (e EnvironmentError) Error() string {
+	return \"hive: environment variable \" + e.Key + \": \" + e.Message
+}
+
+var envOnce sync.Once
+var envVars map[string]string
+
+// loadDotEnv reads the .env file in the working directory, or the parent
+// directory if that one is absent, into envVars. It runs once, lazily, on the
+// first EnvGet — after any startup chdir, so the working directory is the
+// entrypoint's folder. A missing or unreadable file just leaves envVars empty.
+func loadDotEnv() {
+	envVars = map[string]string{}
+	path := \"\"
+	if _, err := os.Stat(\".env\"); err == nil {
+		path = \".env\"
+	} else if _, err := os.Stat(\"../.env\"); err == nil {
+		path = \"../.env\"
+	}
+	if path == \"\" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	// Split on \\n; TrimSpace then also drops any trailing \\r on Windows files.
+	for _, line := range strings.Split(string(data), \"\\n\") {
+		line = strings.TrimSpace(line)
+		if line == \"\" || strings.HasPrefix(line, \"#\") {
+			continue
+		}
+		line = strings.TrimPrefix(line, \"export \")
+		eq := strings.Index(line, \"=\")
+		if eq < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:eq])
+		val := strings.Trim(strings.TrimSpace(line[eq+1:]), \"\\\"'\")
+		if key != \"\" {
+			envVars[key] = val
+		}
+	}
+}
+
+// EnvGet resolves a variable from the .env file first, then the OS
+// environment; a variable set in neither yields an EnvironmentError. Backs
+// hive.env.get.
+func EnvGet(key string) Result[string, EnvironmentError] {
+	envOnce.Do(loadDotEnv)
+	if v, ok := envVars[key]; ok {
+		return Ok[string, EnvironmentError](v)
+	}
+	if v, ok := os.LookupEnv(key); ok {
+		return Ok[string, EnvironmentError](v)
+	}
+	return Err[string, EnvironmentError](EnvironmentError{Key: key, Message: \"not set\"})
+}
+"
+}
+
+// ---------------------------------------------------------------------------
+// hive.term
+// ---------------------------------------------------------------------------
+
+/// Source of `hive/term.go`: the terminal module (`hive.term`) — line-oriented
+/// stdin and the program's arguments. (`hive.term.print` needs no runtime: it
+/// lowers to the same `fmt.Println` as `echo`.)
+pub fn term_go() -> String {
+  "package hive
+
+import (
+	\"bufio\"
+	\"os\"
+	\"strings\"
+)
+
+// One shared buffered reader over stdin: created once so bytes read past a
+// newline in one TermRead are not lost before the next.
+var stdinReader = bufio.NewReader(os.Stdin)
+
+// TermRead blocks until the user finishes a line of input and returns it
+// without the trailing newline (and without a trailing CR on Windows input).
+// The read parks only the calling goroutine — the Go scheduler keeps other
+// virtual threads running on other OS threads. At end of input it returns
+// whatever preceded EOF (\"\" if nothing). Backs hive.term.read.
+func TermRead() string {
+	line, err := stdinReader.ReadString('\\n')
+	line = strings.TrimRight(line, \"\\n\")
+	line = strings.TrimRight(line, \"\\r\")
+	if err != nil && line == \"\" {
+		return \"\"
+	}
+	return line
+}
+
+// TermArgs returns the command-line arguments the program was run with, in
+// order and excluding the program name (os.Args[0]). Backs hive.term.args.
+func TermArgs() []string {
+	args := os.Args[1:]
+	out := make([]string, len(args))
+	copy(out, args)
+	return out
+}
+"
+}
+
+// ---------------------------------------------------------------------------
+// hive.task
+// ---------------------------------------------------------------------------
+
+/// Source of `hive/task.go`: the task module (`hive.task`) — scheduling
+/// controls over the virtual threads an `async func` runs on.
+pub fn task_go() -> String {
+  "package hive
+
+import \"time\"
+
+// Sleep parks the calling goroutine for ms milliseconds; only that virtual
+// thread waits, so others keep running. A non-positive duration returns at
+// once. Backs hive.task.sleep.
+func Sleep(ms int) {
+	if ms <= 0 {
+		return
+	}
+	time.Sleep(time.Duration(ms) * time.Millisecond)
+}
+"
+}
+
+// ---------------------------------------------------------------------------
+// hive.time
+// ---------------------------------------------------------------------------
+
+/// Source of `hive/time.go`: the time module (`hive.time`) — the wall clock,
+/// the local zone, and strftime-style formatting.
+pub fn time_go() -> String {
+  "package hive
+
+import (
+	\"fmt\"
+	\"strings\"
+	\"time\"
+)
+
+// Now returns the current Unix time in seconds. Backs hive.time.now.
+func Now() int {
+	return int(time.Now().Unix())
+}
+
+// Timezone returns the name (or abbreviation) of the machine's local time zone
+// at this instant — \"UTC\", \"PST\", \"-03\", and so on. Backs hive.time.timezone.
+func Timezone() string {
+	name, _ := time.Now().Zone()
+	return name
+}
+
+// TimezoneOffset returns the local zone's current offset from UTC in minutes,
+// east of UTC being positive (so UTC+2 is 120 and UTC-3 is -180). Backs
+// hive.time.timezoneOffset.
+func TimezoneOffset() int {
+	_, seconds := time.Now().Zone()
+	return seconds / 60
+}
+
+// TimeFormat renders a Unix time (seconds), in local time, using a
+// strftime-style template. Unknown \"%x\" escapes are emitted verbatim. Backs
+// hive.time.format. Supported directives:
+//
+//	%Y year (4 digits)   %y year (2 digits)   %m month 01-12  %d day 01-31
+//	%H hour 00-23        %I hour 01-12        %M minute       %S second
+//	%p AM/PM             %j day-of-year       %Z zone name    %z zone offset
+//	%A/%a weekday (full/short)   %B/%b month name (full/short)   %% literal %
+func TimeFormat(t int, template string) string {
+	tm := time.Unix(int64(t), 0)
+	var b strings.Builder
+	runes := []rune(template)
+	for i := 0; i < len(runes); i++ {
+		if runes[i] != '%' || i+1 >= len(runes) {
+			b.WriteRune(runes[i])
+			continue
+		}
+		i++
+		switch runes[i] {
+		case 'Y':
+			fmt.Fprintf(&b, \"%04d\", tm.Year())
+		case 'y':
+			fmt.Fprintf(&b, \"%02d\", tm.Year()%100)
+		case 'm':
+			fmt.Fprintf(&b, \"%02d\", int(tm.Month()))
+		case 'd':
+			fmt.Fprintf(&b, \"%02d\", tm.Day())
+		case 'H':
+			fmt.Fprintf(&b, \"%02d\", tm.Hour())
+		case 'I':
+			h := tm.Hour() % 12
+			if h == 0 {
+				h = 12
+			}
+			fmt.Fprintf(&b, \"%02d\", h)
+		case 'M':
+			fmt.Fprintf(&b, \"%02d\", tm.Minute())
+		case 'S':
+			fmt.Fprintf(&b, \"%02d\", tm.Second())
+		case 'p':
+			if tm.Hour() < 12 {
+				b.WriteString(\"AM\")
+			} else {
+				b.WriteString(\"PM\")
+			}
+		case 'j':
+			fmt.Fprintf(&b, \"%03d\", tm.YearDay())
+		case 'A':
+			b.WriteString(tm.Weekday().String())
+		case 'a':
+			b.WriteString(tm.Weekday().String()[:3])
+		case 'B':
+			b.WriteString(tm.Month().String())
+		case 'b':
+			b.WriteString(tm.Month().String()[:3])
+		case 'Z':
+			name, _ := tm.Zone()
+			b.WriteString(name)
+		case 'z':
+			b.WriteString(tm.Format(\"-0700\"))
+		case '%':
+			b.WriteByte('%')
+		default:
+			b.WriteByte('%')
+			b.WriteRune(runes[i])
+		}
+	}
+	return b.String()
+}
+"
+}
+
+// ---------------------------------------------------------------------------
+// hive.sql
+// ---------------------------------------------------------------------------
+
+/// Source of `hive/sql.go`: the SQL module (`hive.sql`). It is the one module
+/// that links external Go drivers, so a program which never opens a connection
+/// keeps a dependency-free `go.mod` and builds offline. SQLite is the pure-Go
+/// `modernc.org/sqlite` (the engine is compiled straight into the executable —
+/// no CGO, no system SQLite); Postgres is `github.com/lib/pq`.
 pub fn sql_go() -> String {
   "package hive
 

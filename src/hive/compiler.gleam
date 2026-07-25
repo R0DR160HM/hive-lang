@@ -3,13 +3,14 @@
 //// Between parsing and codegen a validation pass walks every body to
 //// enforce:
 ////   * the proc/func split — a `func` may perform I/O (`echo`, `using`,
-////     `hive.http`) just like a `proc`, but it may not call a `proc` (only
+////     `hive.net`) just like a `proc`, but it may not call a `proc` (only
 ////     procs call procs) and cannot receive a mutex as a parameter;
 ////   * mutability — only `mut` variables may be reassigned (`x = ...`,
 ////     `v[0] = ...`) or grown with `append`;
-////   * the `hive.http` builtins — known member names, right arity, and a
-////     `serve` handler that really is a `proc(hive.HttpRequest):
-////     hive.HttpResponse`;
+////   * the `hive.net` builtins — known member names, right arity, and a
+////     handler that really has the shape its server calls it with (a
+////     `proc(hive.net.HttpRequest): hive.net.HttpResponse` for `serve`, a
+////     `proc(hive.net.WsConnection): void` for `wsServe`, ...);
 ////   * named arguments — the target must be known (a declared callable, a
 ////     type constructor, or a builtin), every name must exist, no name may
 ////     repeat, and once named arguments are used the call must line up with
@@ -23,13 +24,26 @@ import gleam/string
 import hive/ast
 import hive/bounds
 import hive/codegen
-import hive/lexer
-import hive/parser
+import hive/modules
 
-/// Compile Hive source into the contents of the generated `main.go`.
+/// Compile the program rooted at `entry` — a path to a `.hive` file — into the
+/// contents of the generated `main.go`, resolving its `import` graph first.
+pub fn compile_file(entry: String) -> Result(String, String) {
+  use module <- result.try(modules.load(entry))
+  finish(module)
+}
+
+/// Compile Hive source held in memory into the contents of the generated
+/// `main.go`. Any `import` it carries resolves relative to the current working
+/// directory, since the source itself has no location of its own.
 pub fn compile(source: String) -> Result(String, String) {
-  use tokens <- result.try(lexer.lex(source))
-  use module <- result.try(parser.parse(tokens))
+  use module <- result.try(modules.load_source(source, ".", "the source"))
+  finish(module)
+}
+
+// Everything past import resolution, which works on one flat module and so does
+// not care how many files it came from.
+fn finish(module: ast.Module) -> Result(String, String) {
   use _ <- result.try(check(module))
   use _ <- result.try(bounds.check(module))
   Ok(codegen.generate(module))
@@ -44,12 +58,12 @@ type Ctx {
     /// The callable currently being checked (used in error messages).
     name: String,
     /// True while checking a `func` or `query` body. Funcs may perform I/O
-    /// (echo, using, hive.http) just like procs, but they may not call a
+    /// (echo, using, hive.net) just like procs, but they may not call a
     /// `proc` — only procs may, since procs are the ones that own and pass
     /// mutable state (mutexes).
     in_func: Bool,
     /// Signatures of every declared `proc`, used to reject func→proc calls and
-    /// to validate the `hive.http.serve` handler.
+    /// to validate the handler passed to a `hive.net` server.
     procs: Dict(String, #(List(ast.Field), ast.TypeExpr)),
     /// Parameter names of every declared proc/func/query.
     callables: Dict(String, List(String)),
@@ -65,6 +79,7 @@ type Ctx {
 }
 
 fn check(module: ast.Module) -> Result(Nil, String) {
+  use _ <- result.try(check_has_main(module))
   let procs =
     list.fold(module.decls, dict.new(), fn(acc, d) {
       case d {
@@ -108,7 +123,7 @@ fn check(module: ast.Module) -> Result(Nil, String) {
         ))
         check_returns(types, name, ret, body)
       }
-      // A `func` may perform I/O (echo, using, hive.http, ...) just like a
+      // A `func` may perform I/O (echo, using, hive.net, ...) just like a
       // `proc`. Its two restrictions — no mutex parameters, no calling procs —
       // are what `in_func` marks.
       ast.FuncDecl(name, _, ret, body, _) -> {
@@ -136,6 +151,29 @@ fn check(module: ast.Module) -> Result(Nil, String) {
     }
   })
   |> result.map(fn(_) { Nil })
+}
+
+// A program starts at `proc main(): void`. Only the entrypoint's `main` keeps
+// that name through import flattening, so a module meant to be imported has
+// none — and building one directly would otherwise fail as a Go linker error
+// rather than something an author can act on.
+fn check_has_main(module: ast.Module) -> Result(Nil, String) {
+  let has_main =
+    list.any(module.decls, fn(d) {
+      case d {
+        ast.ProcDecl("main", [], ast.TVoid, _) -> True
+        _ -> False
+      }
+    })
+  case has_main {
+    True -> Ok(Nil)
+    False ->
+      Error(
+        "this program has no entrypoint: it needs a `proc main(): void`. (A "
+        <> "module written to be imported by another file has none — build the "
+        <> "file with `main` in it instead.)",
+      )
+  }
 }
 
 fn check_body(ctx: Ctx, stmts: List(ast.Stmt)) -> Result(Nil, String) {
@@ -525,7 +563,7 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
     }
     ast.ECall(ast.EMember(ast.EMember(ast.EIdent("hive"), ns), fname), args) ->
       case codegen.builtin_fields(fname) {
-        // A builtin type constructor: `hive.http.HttpRequest(...)` etc.
+        // A builtin type constructor: `hive.net.HttpRequest(...)` etc.
         Some(fields) -> {
           use _ <- result.try(check_named(
             "`hive." <> ns <> "." <> fname <> "`",
@@ -537,8 +575,8 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
         // Otherwise a stdlib function in that namespace.
         None ->
           case ns {
-            "http" -> {
-              use _ <- result.try(check_http_call(ctx, fname, args))
+            "net" -> {
+              use _ <- result.try(check_net_call(ctx, fname, args))
               check_args(ctx, args)
             }
             "json" -> {
@@ -577,7 +615,7 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
               Error(
                 "unknown builtin namespace `hive."
                 <> ns
-                <> "` (available: http, json, crypto, sql, conv, env, term, task, time)",
+                <> "` (available: net, json, crypto, sql, conv, env, term, task, time)",
               )
           }
       }
@@ -589,7 +627,7 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
           check_named(target, args, Some(variant_field_names(decl, member)))
         Error(_) ->
           case tname {
-            // Builtin types are namespaced now: `hive.http.HttpRequest(...)`,
+            // Builtin types are namespaced now: `hive.net.HttpRequest(...)`,
             // not the bare `hive.HttpRequest(...)`.
             "hive" ->
               case codegen.builtin_fields(member) {
@@ -1170,18 +1208,19 @@ fn check_decodable_field(
 }
 
 // ---------------------------------------------------------------------------
-// hive.http builtins
+// hive.net builtins
 // ---------------------------------------------------------------------------
 
-fn check_http_call(
+fn check_net_call(
   ctx: Ctx,
   fname: String,
   args: List(ast.Arg),
 ) -> Result(Nil, String) {
   case fname {
-    "request" -> {
+    // --- HTTP ---
+    "httpRequest" -> {
       use _ <- result.try(check_named(
-        "`hive.http.request`",
+        "`hive.net.httpRequest`",
         args,
         Some(["request"]),
       ))
@@ -1189,83 +1228,162 @@ fn check_http_call(
         #([_], []) -> Ok(Nil)
         _ ->
           Error(
-            "`hive.http.request` takes exactly one hive.HttpRequest argument",
+            "`hive.net.httpRequest` takes exactly one hive.net.HttpRequest argument",
           )
       }
     }
-    "serve" -> {
-      use _ <- result.try(check_named(
-        "`hive.http.serve`",
-        args,
-        Some(["port", "handler"]),
-      ))
-      case codegen.assign_args(args, ["port", "handler"]) {
-        #([#(_, _), #(_, handler)], []) -> check_handler(ctx, handler)
-        _ ->
-          Error(
-            "`hive.http.serve` takes exactly two arguments: a port and a handler proc",
-          )
-      }
-    }
+    "httpServe" -> check_serve_call(ctx, "httpServe", args, ServeHttp)
+    // Every call in this module now names its protocol, so the two bare HTTP
+    // spellings point at their replacements rather than reading as unknown
+    // members next to `wsServe` and `socketServe`.
+    "request" ->
+      Error(
+        "`hive.net.request` is now `hive.net.httpRequest` — every call in "
+        <> "`hive.net` names its protocol (httpRequest, wsSend, socketSend, ...)",
+      )
+    "serve" ->
+      Error(
+        "`hive.net.serve` is now `hive.net.httpServe` — every call in "
+        <> "`hive.net` names its protocol (httpServe, wsServe, socketServe)",
+      )
+    // --- WebSockets ---
+    "wsConnect" -> check_arity("`hive.net.wsConnect`", args, ["url"])
+    "wsSend" ->
+      check_arity("`hive.net.wsSend`", args, ["connection", "message"])
+    "wsReceive" -> check_arity("`hive.net.wsReceive`", args, ["connection"])
+    "wsRequest" -> check_arity("`hive.net.wsRequest`", args, ["connection"])
+    "wsClose" -> check_arity("`hive.net.wsClose`", args, ["connection"])
+    "wsServe" -> check_serve_call(ctx, "wsServe", args, ServeWs)
+    // --- Raw TCP ---
+    "socketConnect" ->
+      check_arity("`hive.net.socketConnect`", args, ["host", "port"])
+    "socketSend" ->
+      check_arity("`hive.net.socketSend`", args, ["connection", "data"])
+    "socketReceive" ->
+      check_arity("`hive.net.socketReceive`", args, ["connection", "bytes"])
+    "socketReceiveLine" ->
+      check_arity("`hive.net.socketReceiveLine`", args, ["connection"])
+    "socketPeer" -> check_arity("`hive.net.socketPeer`", args, ["connection"])
+    "socketClose" -> check_arity("`hive.net.socketClose`", args, ["connection"])
+    "socketServe" -> check_serve_call(ctx, "socketServe", args, ServeSocket)
     _ ->
       Error(
-        "unknown builtin `hive.http."
+        "unknown builtin `hive.net."
         <> fname
-        <> "` (available: request, serve)",
+        <> "` (available: httpRequest, httpServe; wsConnect, wsSend, "
+        <> "wsReceive, wsRequest, wsClose, wsServe; socketConnect, socketSend, "
+        <> "socketReceive, socketReceiveLine, socketPeer, socketClose, "
+        <> "socketServe)",
       )
   }
 }
 
-// The handler must be the name of a proc taking exactly one hive.HttpRequest
-// and returning hive.HttpResponse. This is where the parameter's declared
-// shape `proc (hive.HttpRequest): hive.HttpResponse` is enforced.
-fn check_handler(ctx: Ctx, handler: ast.Expr) -> Result(Nil, String) {
+// Which of the three servers a handler is being checked for. Each one calls its
+// handler with a different value, so each demands a different signature.
+type ServeKind {
+  ServeHttp
+  ServeWs
+  ServeSocket
+}
+
+// The parameter type a handler of this kind receives, and the type it must
+// return (`None` for a `void` handler).
+fn serve_signature(kind: ServeKind) -> #(String, Option(String)) {
+  case kind {
+    ServeHttp -> #("HttpRequest", Some("HttpResponse"))
+    ServeWs -> #("WsConnection", None)
+    ServeSocket -> #("SocketConnection", None)
+  }
+}
+
+fn check_serve_call(
+  ctx: Ctx,
+  fname: String,
+  args: List(ast.Arg),
+  kind: ServeKind,
+) -> Result(Nil, String) {
+  let target = "`hive.net." <> fname <> "`"
+  use _ <- result.try(check_named(target, args, Some(["port", "handler"])))
+  case codegen.assign_args(args, ["port", "handler"]) {
+    #([#(_, _), #(_, handler)], []) ->
+      check_handler(ctx, fname, handler, kind)
+    _ ->
+      Error(
+        target
+        <> " takes exactly two arguments: a port and a handler proc",
+      )
+  }
+}
+
+// The handler must be the name of a proc with the shape the server calls it
+// with — `proc (hive.net.HttpRequest): hive.net.HttpResponse` for `serve`, and
+// `proc (hive.net.WsConnection): void` / `proc (hive.net.SocketConnection):
+// void` for the other two. This is where that declared shape is enforced.
+fn check_handler(
+  ctx: Ctx,
+  fname: String,
+  handler: ast.Expr,
+  kind: ServeKind,
+) -> Result(Nil, String) {
+  let #(param, ret) = serve_signature(kind)
   let bad_signature =
-    "a handler must take exactly one hive.http.HttpRequest and return "
-    <> "hive.http.HttpResponse"
+    "a handler for `hive.net."
+    <> fname
+    <> "` must take exactly one hive.net."
+    <> param
+    <> " and return "
+    <> case ret {
+      Some(r) -> "hive.net." <> r
+      None -> "void"
+    }
   case handler {
     // A partial application (or any call producing a function value), e.g.
-    // `handler(_, db)`. Its exact shape is enforced by Go's typed HttpServe
+    // `handler(_, db)`. Its exact shape is enforced by Go's typed server
     // signature; here we just let it through.
     ast.ECall(..) -> Ok(Nil)
     ast.EIdent(name) ->
       case dict.get(ctx.procs, name) {
-        Ok(#([ast.Field(_, req)], resp)) ->
+        Ok(#([ast.Field(_, got_param)], got_ret)) ->
           case
-            is_hive_type(req, "HttpRequest")
-            && is_hive_type(resp, "HttpResponse")
+            is_hive_type(got_param, param) && returns_hive_type(got_ret, ret)
           {
             True -> Ok(Nil)
-            False ->
-              Error(
-                "proc `" <> name <> "` cannot handle HTTP requests: " <> bad_signature,
-              )
+            False -> Error("proc `" <> name <> "` cannot be used: " <> bad_signature)
           }
-        Ok(_) ->
-          Error(
-            "proc `" <> name <> "` cannot handle HTTP requests: " <> bad_signature,
-          )
+        Ok(_) -> Error("proc `" <> name <> "` cannot be used: " <> bad_signature)
         Error(_) ->
           Error(
-            "the handler passed to `hive.http.serve` must be the name of a "
-            <> "proc, but `"
+            "the handler passed to `hive.net."
+            <> fname
+            <> "` must be the name of a proc, but `"
             <> name
             <> "` is not one",
           )
       }
     _ ->
       Error(
-        "the handler passed to `hive.http.serve` must be the name of a proc",
+        "the handler passed to `hive.net."
+        <> fname
+        <> "` must be the name of a proc",
       )
   }
 }
 
 // Whether a type expression is the builtin `name`, referenced through its
-// own namespace (e.g. `hive.http.HttpRequest`).
+// own namespace (e.g. `hive.net.HttpRequest`).
 fn is_hive_type(t: ast.TypeExpr, name: String) -> Bool {
   case t {
     ast.TName(Some(pkg), n, []) ->
       n == name && pkg == codegen.builtin_qualifier(name)
     _ -> False
+  }
+}
+
+// The handler's return, which is either a named builtin or `void`.
+fn returns_hive_type(t: ast.TypeExpr, want: Option(String)) -> Bool {
+  case want, t {
+    Some(name), _ -> is_hive_type(t, name)
+    None, ast.TVoid -> True
+    None, _ -> False
   }
 }

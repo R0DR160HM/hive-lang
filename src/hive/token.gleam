@@ -31,8 +31,13 @@ pub type Kind {
   /// The raw body of a `query` declaration: SQL text (already dedented) with
   /// its `{expression}` interpolation markers still in place.
   SqlBody(String)
+  /// The path in an `import`, captured verbatim up to the next whitespace:
+  /// `../lib/strings`. It is not tokenized as punctuation, since `.`, `..` and
+  /// `/` all mean something else in Hive.
+  PathLit(String)
 
   // Keywords
+  KwImport
   KwProc
   KwFunc
   KwQuery
@@ -113,6 +118,8 @@ pub fn describe(kind: Kind) -> String {
     FloatLit(_) -> "float literal"
     AtomLit(name) -> "atom `#" <> name <> "`"
     SqlBody(_) -> "query body"
+    PathLit(path) -> "module path `" <> path <> "`"
+    KwImport -> "`import`"
     KwProc -> "`proc`"
     KwFunc -> "`func`"
     KwQuery -> "`query`"

@@ -4,12 +4,14 @@
 //// reporting, and matches keywords case-insensitively (identifiers keep their
 //// original spelling).
 ////
-//// Two constructs need light context tracking:
+//// Three constructs need light context tracking:
 ////   * Double-quoted strings may contain `{expression}` interpolations; the
 ////     expression source is captured raw for the parser to finish.
 ////   * After the `query` keyword, the `{ ... }` block is raw SQL rather than
 ////     Hive statements, so it is captured verbatim (dedented, with its own
 ////     `{param}` interpolations left in place).
+////   * After the `import` keyword comes a file path, whose `.`, `..` and `/`
+////     would each otherwise lex as an operator, so it is taken whole.
 
 import gleam/float
 import gleam/int
@@ -22,12 +24,14 @@ const alpha = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
 
 const digits = "0123456789"
 
-/// What the lexer expects next: `AwaitSql` is active between the `query`
+/// What the lexer expects next. `AwaitSql` is active between the `query`
 /// keyword and its opening `{`, which switches brace handling to raw SQL
-/// capture.
+/// capture; `AwaitPath` is active right after `import`, where the source is a
+/// file path rather than Hive tokens.
 type Mode {
   Normal
   AwaitSql
+  AwaitPath
 }
 
 /// Lex the whole source. Returns the token list (terminated by `Eof`) or a
@@ -44,6 +48,20 @@ pub fn lex(source: String) -> Result(List(Token), String) {
 }
 
 fn do_lex(
+  chars: List(String),
+  line: Int,
+  mode: Mode,
+  acc: List(Token),
+) -> Result(List(Token), String) {
+  case mode {
+    // Between `import` and its path the source is a relative file path, whose
+    // `.`, `..` and `/` would otherwise each lex as an operator.
+    AwaitPath -> lex_import_path(chars, line, acc)
+    Normal | AwaitSql -> do_lex_token(chars, line, mode, acc)
+  }
+}
+
+fn do_lex_token(
   chars: List(String),
   line: Int,
   mode: Mode,
@@ -70,7 +88,8 @@ fn do_lex(
     ["{", ..rest] ->
       case mode {
         AwaitSql -> lex_sql(rest, line, acc, 1, "")
-        Normal -> emit(rest, line, mode, acc, token.LBrace)
+        // AwaitPath never reaches here: do_lex peels the path off first.
+        Normal | AwaitPath -> emit(rest, line, mode, acc, token.LBrace)
       }
 
     // Two-character operators (must precede their single-character prefixes)
@@ -257,6 +276,44 @@ fn lex_atom(
 }
 
 // ---------------------------------------------------------------------------
+// Import paths
+// ---------------------------------------------------------------------------
+
+// Captures an `import`'s path verbatim: leading blanks are skipped, then
+// everything up to the next whitespace is the path (`../lib/strings`,
+// `./helpers`, `sibling`). Ordinary tokenizing resumes afterwards, so an
+// optional `as <name>` and the next declaration lex as usual.
+fn lex_import_path(
+  chars: List(String),
+  line: Int,
+  acc: List(Token),
+) -> Result(List(Token), String) {
+  case chars {
+    [" ", ..rest] | ["\t", ..rest] | ["\r", ..rest] ->
+      lex_import_path(rest, line, acc)
+    _ -> {
+      let #(taken, rest) = take_while(chars, is_path_char)
+      case taken {
+        [] ->
+          Error(
+            "expected a module path after `import` on line "
+            <> int.to_string(line),
+          )
+        _ ->
+          do_lex(rest, line, Normal, [
+            Token(token.PathLit(string.concat(taken)), line),
+            ..acc
+          ])
+      }
+    }
+  }
+}
+
+fn is_path_char(c: String) -> Bool {
+  c != " " && c != "\t" && c != "\n" && c != "\r"
+}
+
+// ---------------------------------------------------------------------------
 // Query SQL bodies
 // ---------------------------------------------------------------------------
 
@@ -354,9 +411,11 @@ fn lex_ident(
   let #(taken, rest) = take_while(chars, is_ident_continue)
   let word = string.concat(taken)
   let kind = keyword_or_ident(word)
-  // The body that follows a `query` header is raw SQL, not statements.
+  // The body that follows a `query` header is raw SQL, not statements, and what
+  // follows `import` is a path, not tokens.
   let mode = case kind {
     token.KwQuery -> AwaitSql
+    token.KwImport -> AwaitPath
     _ -> mode
   }
   do_lex(rest, line, mode, [Token(kind, line), ..acc])
@@ -364,6 +423,7 @@ fn lex_ident(
 
 fn keyword_or_ident(word: String) -> token.Kind {
   case string.lowercase(word) {
+    "import" -> token.KwImport
     "proc" -> token.KwProc
     "func" -> token.KwFunc
     "query" -> token.KwQuery

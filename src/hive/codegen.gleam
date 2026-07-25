@@ -69,6 +69,14 @@ pub fn builtin_fields(name: String) -> Option(List(#(String, Ty))) {
     "HttpResponse" ->
       Some([#("status", TyInt), #("headers", TyTable), #("body", TyStr)])
     "HttpError" -> Some([#("url", TyStr), #("message", TyStr)])
+    "WsError" -> Some([#("reason", TyStr), #("message", TyStr)])
+    "SocketError" -> Some([#("reason", TyStr), #("message", TyStr)])
+    // An open WebSocket and an open TCP stream. Both are opaque — they expose
+    // no fields — but registering them here is what lets a parameter or
+    // variable be declared `hive.net.WsConnection` / `hive.net.SocketConnection`
+    // and resolve to a `TyBuiltin`, which the handler checks rely on.
+    "WsConnection" -> Some([])
+    "SocketConnection" -> Some([])
     "TableError" -> Some([#("path", TyStr), #("message", TyStr)])
     "JsonError" ->
       Some([#("path", TyStr), #("expected", TyStr), #("found", TyStr)])
@@ -94,7 +102,9 @@ pub fn builtin_fields(name: String) -> Option(List(#(String, Ty))) {
 /// `TableError` that `using` yields — stay directly on `hive`.
 pub fn builtin_qualifier(name: String) -> String {
   case name {
-    "HttpRequest" | "HttpResponse" | "HttpError" -> "hive.http"
+    "HttpRequest" | "HttpResponse" | "HttpError" -> "hive.net"
+    "WsConnection" | "WsError" -> "hive.net"
+    "SocketConnection" | "SocketError" -> "hive.net"
     "JsonError" -> "hive.json"
     "CryptoError" | "JwtHeader" -> "hive.crypto"
     "ConversionError" -> "hive.conv"
@@ -589,7 +599,7 @@ fn ty_of_type_expr(types: Dict(String, ast.Decl), t: ast.TypeExpr) -> Ty {
   case t {
     ast.TVoid -> TyUnknown
     // A builtin type, resolved only through its own namespace
-    // (`hive.http.HttpRequest`, `hive.TableError`). A wrong or bare qualifier
+    // (`hive.net.HttpRequest`, `hive.TableError`). A wrong or bare qualifier
     // does not resolve.
     ast.TName(Some(pkg), name, dims) ->
       case builtin_fields(name) {
@@ -620,7 +630,7 @@ fn fn_ret_ty(types: Dict(String, ast.Decl), ret: ast.TypeExpr) -> Ty {
 }
 
 // Whether a type qualifier names the `hive` standard library (`hive`,
-// `hive.http`, `hive.sql`, ...).
+// `hive.net`, `hive.sql`, ...).
 fn is_hive_pkg(pkg: String) -> Bool {
   pkg == "hive" || string.starts_with(pkg, "hive.")
 }
@@ -660,7 +670,7 @@ fn gen_type(t: ast.TypeExpr) -> String {
       let prefix = string.repeat("[]", list.length(dims))
       let base = case pkg {
         // A `hive.<module>` namespace is only organisational: every builtin
-        // type lives in the one Go `hive` package (`hive.http.HttpRequest`
+        // type lives in the one Go `hive` package (`hive.net.HttpRequest`
         // -> `hive.HttpRequest`).
         Some(p) ->
           case is_hive_pkg(p) {
@@ -1592,7 +1602,7 @@ fn gen_is(
 ) -> #(String, List(Bind)) {
   let subj = gen_expr(env, subject)
   // Result payload types come from the subject's inferred TyResult (e.g.
-  // `using` -> Result<Table, TableError>, `hive.http.request` ->
+  // `using` -> Result<Table, TableError>, `hive.net.httpRequest` ->
   // Result<HttpResponse, HttpError>).
   let #(ok_ty, err_ty) = case infer(env, subject) {
     TyResult(ok, err) -> #(ok, err)
@@ -1885,10 +1895,25 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
             Some(_) -> TyBuiltin(fname)
             None ->
               case ns {
-                "http" ->
+                "net" ->
                   case fname {
-                    "request" ->
+                    "httpRequest" ->
                       TyResult(TyBuiltin("HttpResponse"), TyBuiltin("HttpError"))
+                    "wsConnect" ->
+                      TyResult(TyBuiltin("WsConnection"), TyBuiltin("WsError"))
+                    // The Ok payload of a send is the byte count it carried.
+                    "wsSend" -> TyResult(TyInt, TyBuiltin("WsError"))
+                    "wsReceive" -> TyResult(TyStr, TyBuiltin("WsError"))
+                    "wsRequest" -> TyBuiltin("HttpRequest")
+                    "socketConnect" ->
+                      TyResult(
+                        TyBuiltin("SocketConnection"),
+                        TyBuiltin("SocketError"),
+                      )
+                    "socketSend" -> TyResult(TyInt, TyBuiltin("SocketError"))
+                    "socketReceive" | "socketReceiveLine" ->
+                      TyResult(TyStr, TyBuiltin("SocketError"))
+                    "socketPeer" -> TyStr
                     _ -> TyUnknown
                   }
                 "json" ->
@@ -2855,14 +2880,14 @@ fn gen_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
       variant,
     ) -> gen_sql_driver(env, variant, args)
     // A `hive.<ns>.<member>` call: a builtin type constructor
-    // (`hive.http.HttpRequest(...)`) if the member names a builtin type,
+    // (`hive.net.HttpRequest(...)`) if the member names a builtin type,
     // otherwise a stdlib function in that namespace.
     ast.EMember(ast.EMember(ast.EIdent("hive"), ns), fname) ->
       case builtin_fields(fname) {
         Some(fields) -> gen_builtin_construct(env, fname, fields, args)
         None ->
           case ns {
-            "http" -> gen_http_call(env, fname, args)
+            "net" -> gen_net_call(env, fname, args)
             "json" -> gen_json_call(env, fname, args)
             "crypto" -> gen_crypto_call(env, fname, args)
             "sql" -> gen_sql_call(env, fname, args)
@@ -2877,7 +2902,7 @@ fn gen_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
     ast.EMember(ast.EIdent(type_name), variant_name) ->
       case dict.get(env.types, type_name) {
         Ok(_) -> gen_constructor(env, type_name, variant_name, args)
-        // Builtin constructors are namespaced (`hive.http.HttpRequest(...)`),
+        // Builtin constructors are namespaced (`hive.net.HttpRequest(...)`),
         // handled above; a bare `hive.X(...)` is rejected by validation.
         Error(_) -> gen_plain_call(env, callee, args)
       }
@@ -2885,28 +2910,98 @@ fn gen_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
   }
 }
 
-// The validation pass (compiler.check) has already rejected unknown members,
-// bad arities and unknown named arguments, so lowering can be
-// straightforward here.
-fn gen_http_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
+// The `hive.net` namespace: HTTP, WebSockets and raw TCP. The validation pass
+// (compiler.check) has already rejected unknown members, bad arities and
+// unknown named arguments, so lowering can be straightforward here.
+fn gen_net_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
   case fname {
-    "request" ->
+    // --- HTTP ---
+    "httpRequest" ->
       case assign_args(args, ["request"]) {
         #([#(_, req)], []) ->
           "hive.HttpSend(" <> coerce(env, req, TyBuiltin("HttpRequest")) <> ")"
         _ -> "hive.HttpSend(" <> gen_args(env, args) <> ")"
       }
-    "serve" ->
-      case assign_args(args, ["port", "handler"]) {
-        #([#(_, port), #(_, handler)], []) ->
-          "hive.HttpServe("
-          <> coerce(env, port, TyInt)
+    "httpServe" -> gen_serve_call(env, "hive.HttpServe", args)
+    // --- WebSockets ---
+    "wsConnect" ->
+      "hive.WsConnect(" <> gen_one_coerced(env, args, "url", TyStr) <> ")"
+    "wsSend" ->
+      case assign_args(args, ["connection", "message"]) {
+        #([#(_, conn), #(_, message)], []) ->
+          "hive.WsSend("
+          <> gen_expr(env, conn)
           <> ", "
-          <> gen_expr(env, handler)
+          <> coerce(env, message, TyStr)
           <> ")"
-        _ -> "hive.HttpServe(" <> gen_args(env, args) <> ")"
+        _ -> "hive.WsSend(" <> gen_args(env, args) <> ")"
       }
-    _ -> "hive.Http" <> exported(fname) <> "(" <> gen_args(env, args) <> ")"
+    "wsReceive" -> "hive.WsReceive(" <> gen_connection(env, args) <> ")"
+    "wsRequest" -> "hive.WsRequest(" <> gen_connection(env, args) <> ")"
+    "wsClose" -> "hive.WsClose(" <> gen_connection(env, args) <> ")"
+    "wsServe" -> gen_serve_call(env, "hive.WsServe", args)
+    // --- Raw TCP ---
+    "socketConnect" ->
+      case assign_args(args, ["host", "port"]) {
+        #([#(_, host), #(_, port)], []) ->
+          "hive.SocketConnect("
+          <> coerce(env, host, TyStr)
+          <> ", "
+          <> coerce(env, port, TyInt)
+          <> ")"
+        _ -> "hive.SocketConnect(" <> gen_args(env, args) <> ")"
+      }
+    "socketSend" ->
+      case assign_args(args, ["connection", "data"]) {
+        #([#(_, conn), #(_, data)], []) ->
+          "hive.SocketSend("
+          <> gen_expr(env, conn)
+          <> ", "
+          <> coerce(env, data, TyStr)
+          <> ")"
+        _ -> "hive.SocketSend(" <> gen_args(env, args) <> ")"
+      }
+    "socketReceive" ->
+      case assign_args(args, ["connection", "bytes"]) {
+        #([#(_, conn), #(_, bytes)], []) ->
+          "hive.SocketReceive("
+          <> gen_expr(env, conn)
+          <> ", "
+          <> coerce(env, bytes, TyInt)
+          <> ")"
+        _ -> "hive.SocketReceive(" <> gen_args(env, args) <> ")"
+      }
+    "socketReceiveLine" ->
+      "hive.SocketReceiveLine(" <> gen_connection(env, args) <> ")"
+    "socketPeer" -> "hive.SocketPeer(" <> gen_connection(env, args) <> ")"
+    "socketClose" -> "hive.SocketClose(" <> gen_connection(env, args) <> ")"
+    "socketServe" -> gen_serve_call(env, "hive.SocketServe", args)
+    _ -> "hive." <> exported(fname) <> "(" <> gen_args(env, args) <> ")"
+  }
+}
+
+// `serve` / `wsServe` / `socketServe` all take the same (port, handler) pair;
+// the handler is emitted as-is, since it is already a Go function value (a
+// named proc, or the closure a partial application lowers to).
+fn gen_serve_call(env: Env, runtime_fn: String, args: List(ast.Arg)) -> String {
+  case assign_args(args, ["port", "handler"]) {
+    #([#(_, port), #(_, handler)], []) ->
+      runtime_fn
+      <> "("
+      <> coerce(env, port, TyInt)
+      <> ", "
+      <> gen_expr(env, handler)
+      <> ")"
+    _ -> runtime_fn <> "(" <> gen_args(env, args) <> ")"
+  }
+}
+
+// The lone `connection` argument shared by most of the WebSocket and socket
+// calls. A connection is an opaque handle, so it needs no coercion.
+fn gen_connection(env: Env, args: List(ast.Arg)) -> String {
+  case assign_args(args, ["connection"]) {
+    #([#(_, conn)], []) -> gen_expr(env, conn)
+    _ -> gen_args(env, args)
   }
 }
 

@@ -110,7 +110,7 @@ async func slowShout(text: Str): Str {
 	return text + "!!!"
 }
 
-// A `proc` may perform side effects (echo, using, hive.http, ...).
+// A `proc` may perform side effects (echo, using, hive.net, ...).
 proc main(): void {
 	mut names := ["Ada", "Linus"]
 	names[0] = "Grace"
@@ -164,19 +164,22 @@ user 7, post 99
 ```
 
 More complete programs — CSV parsing and a full tour of pattern matching (every
-form above), the type system, an HTTP server that speaks JSON, a `hive.crypto`
+form above), the type system, an HTTP server that speaks JSON, a WebSocket
+echo server talking to its own client, a line-oriented raw TCP server doing the
+same, a `hive.crypto`
 walkthrough (hashing, HMAC, base64 and JWTs), a `hive.sql` example backed by an
 embedded SQLite database, a tour of first-class functions and partial
 application, a tour of Hive's copy-on-binding [value
-semantics](#value-semantics-copy-on-binding), and a tour of concurrency
-(spawning tasks, holding handles and awaiting one or many) — live in
+semantics](#value-semantics-copy-on-binding), a tour of concurrency
+(spawning tasks, holding handles and awaiting one or many), and a three-file
+program showing `import` — live in
 `code-examples/`. They double as the language's specification: each one
 compiles, builds and runs.
 
 ## The language
 
 * **`proc` / `func` / `query` / `async func`** — both `proc`s and `func`s may
-  perform I/O: `echo`, reading files with `using`, and `hive.http` are all
+  perform I/O: `echo`, reading files with `using`, and `hive.net` are all
   allowed in either. A `func` differs from a `proc` in exactly two ways: it
   cannot receive a mutex as a parameter (a `mut` value passed to a func is seen
   as an ordinary immutable copy), and it cannot call a `proc` (only procs call
@@ -184,7 +187,10 @@ compiles, builds and runs.
   interpolated into it is rendered as a quoted SQL literal and sanitized at
   runtime (`'O''Brien'` above). An `async func` runs on its own virtual
   thread — see the concurrency bullet below. Programs start at
-  `proc main(): void`.
+  `proc main(): void`, in the file you hand to `hive build`/`hive run`.
+* **Multiple files** — `import <path>`, written outside any callable, brings
+  another `.hive` file's declarations into scope. See
+  [`## Multiple files`](#multiple-files) below.
 * **Strings** (`Str`) are UTF-8, support `"{expr}"` interpolation, and
   backtick multiline strings whose indentation is removed at compile time.
 * **Vectors** are memory-contiguous and static (`Str[3]`) or dynamic
@@ -264,13 +270,13 @@ compiles, builds and runs.
   A hole-less string pattern (`path is "/health"`) is just an exact match.
 * **First-class functions** — a proc or func is a value you can pass, store and
   call later. Its type is written like a declaration with the name dropped:
-  `func(Int): Int` (pure) or `proc(hive.http.HttpRequest): hive.http.HttpResponse`
+  `func(Int): Int` (pure) or `proc(hive.net.HttpRequest): hive.net.HttpResponse`
   (impure), usable as a parameter, return or variable type. A value is produced
   by a **bare reference** (the callable's name on its own), or by a **partial
   application** — a call with `_` holes, e.g. `handler(_, db)`, which fixes the
   supplied arguments and leaves each `_` as a parameter of the resulting
   function (in order), capturing the rest by value. So
-  `hive.http.serve(8080, handler(_, db))` adapts a two-argument `handler` into
+  `hive.net.httpServe(8080, handler(_, db))` adapts a two-argument `handler` into
   the one-argument handler `serve` expects. The `proc`/`func` split is
   preserved through values: a `func` value may be used where a `proc` is
   expected (pure widens to impure), but a `proc` value may not fill a `func`
@@ -371,27 +377,92 @@ too short to reach the matched column.
 
 ## Standard library (`hive.*`)
 
-Each module owns its types under its own namespace — `hive.http.HttpRequest`,
+Each module owns its types under its own namespace — `hive.net.HttpRequest`,
 `hive.json.JsonError`, `hive.crypto.CryptoError`, `hive.sql.DatabaseDriver`,
 `hive.conv.ConversionError`, `hive.env.EnvironmentError`, and so on. The only builtin types that live directly on `hive` are the core
 ones the language uses without a module: `Result`, `Table` and the
 `hive.TableError` that `using` yields from a CSV.
 
-### `hive.http`
+**A module you don't use is not in your build.** The generated Go project always
+carries the core runtime, but each `hive.*` module is written into it — and so
+compiled and linked — only when the program actually references that module (see
+`hive/runtime.gleam`'s module table and `hive/cli.gleam`). A module a used one
+depends on internally comes along too: `hive.crypto` decodes JWT payloads with
+`hive.json` and checks `exp`/`nbf` against `hive.time`, so reaching for a JWT
+pulls in all three. This is why `hive.sql` is the only module that costs you
+anything at build time: it is the only one that links external Go drivers, and a
+program that never opens a connection neither downloads nor links them, staying
+dependency-free and buildable offline.
 
-The HTTP library. Both calls perform I/O, so — like `echo` and `using` — they
-work inside a `func` or a `proc`. Requests and responses are built
-positionally —
-`hive.http.HttpRequest(method, url, headers, body)`,
-`hive.http.HttpResponse(status, headers, body)` — and headers are a `Table` of
+### `hive.net`
+
+The networking library: HTTP, WebSockets and raw TCP, clients and servers.
+Everything here performs I/O, so — like `echo` and `using` — it works inside a
+`func` or a `proc`. All of it is built on Go's standard library alone, so a
+program that speaks any of these still builds offline with no dependencies.
+
+Each of the three servers blocks forever, so it usually goes on a virtual
+thread of its own (`async func`), and each runs its handler once per
+request/connection on a virtual thread of its own too. Every call in the module
+names its protocol — `httpRequest`, `wsSend`, `socketReceive` — so nothing here
+reads as "the" default one. A handler is passed **by
+name**, and its declared shape is checked at compile time — including through a
+partial application like `handler(_, db)`.
+
+**HTTP.** Requests and responses are built positionally —
+`hive.net.HttpRequest(method, url, headers, body)`,
+`hive.net.HttpResponse(status, headers, body)` — and headers are a `Table` of
 `[name, value]` rows.
 
-* `hive.http.request(req)` performs a request and returns
-  `Result<hive.http.HttpResponse, hive.http.HttpError>` (a `Result.Error`
+* `hive.net.httpRequest(req)` performs a request and returns
+  `Result<hive.net.HttpResponse, hive.net.HttpError>` (a `Result.Error`
   means no response was obtained at all).
-* `hive.http.serve(port, handler)` blocks forever, serving every route through
-  `handler` — which must be a
-  `proc (hive.http.HttpRequest): hive.http.HttpResponse` passed by name.
+* `hive.net.httpServe(port, handler)` serves every route through `handler`, a
+  `proc (hive.net.HttpRequest): hive.net.HttpResponse`.
+
+**WebSockets** (RFC 6455). The handshake, frame headers, masking, ping/pong and
+fragmentation are the runtime's business; a program only ever sees whole
+messages as `Str`. A `hive.net.WsConnection` is opaque, and a
+`hive.net.WsError`'s `reason` is a short tag — `"Handshake"`, `"Protocol"`,
+`"Closed"`, `"Send"` or `"Receive"`.
+
+* `hive.net.wsConnect(url)` opens a client connection to a `ws://` or `wss://`
+  URL (`wss://` negotiates TLS) →
+  `Result<hive.net.WsConnection, hive.net.WsError>`.
+* `hive.net.wsServe(port, handler)` accepts connections, with `handler` a
+  `proc (hive.net.WsConnection): void`. The connection closes when it returns.
+* `hive.net.wsSend(connection, message)` sends one text message →
+  `Result<Int, hive.net.WsError>`, the `Int` being the bytes it carried.
+* `hive.net.wsReceive(connection)` blocks for the next message →
+  `Result<Str, hive.net.WsError>`. A peer that hangs up is a `Result.Error`
+  whose reason is `"Closed"` — the ordinary end of a conversation. One virtual
+  thread should own a connection's receiving side.
+* `hive.net.wsRequest(connection)` is the `hive.net.HttpRequest` that opened the
+  connection, so a handler can route on its `url` or authenticate from its
+  `headers`.
+* `hive.net.wsClose(connection)` sends a close frame and shuts down; calling it
+  twice is harmless.
+
+**Raw TCP.** A stream, not a queue of messages: `socketReceive` hands back
+whatever has arrived so far, so the protocol has to say where a message ends.
+A `hive.net.SocketConnection` is opaque, and a `hive.net.SocketError`'s
+`reason` is `"Connect"`, `"Closed"`, `"Send"` or `"Receive"`.
+
+* `hive.net.socketConnect(host, port)` dials a server →
+  `Result<hive.net.SocketConnection, hive.net.SocketError>`.
+* `hive.net.socketServe(port, handler)` accepts connections, with `handler` a
+  `proc (hive.net.SocketConnection): void`. The connection closes when it
+  returns.
+* `hive.net.socketSend(connection, data)` → `Result<Int, hive.net.SocketError>`,
+  the `Int` being the bytes written.
+* `hive.net.socketReceive(connection, bytes)` blocks until at least one byte
+  arrives and returns up to `bytes` of it → `Result<Str, _>`. A short read is
+  normal, so code needing an exact count must keep asking.
+* `hive.net.socketReceiveLine(connection)` blocks for a whole line and returns
+  it without the trailing `"\n"` (or `"\r\n"`) → `Result<Str, _>` — the read for
+  line-oriented protocols.
+* `hive.net.socketPeer(connection)` is the remote address (`"host:port"`), and
+  `hive.net.socketClose(connection)` shuts the connection down.
 
 ### `hive.json`
 
@@ -550,6 +621,62 @@ The wall clock and calendar formatting. Times are plain `Int`s — Unix seconds.
   echo hive.time.format(1700000000, "%A, %d %B %Y")   // Tuesday, 14 November 2023
   ```
 
+## Multiple files
+
+A Hive program can span as many files as you like. `import`, written outside any
+`proc` or `func`, brings another file's declarations into scope:
+
+```hive
+import ./lib/text
+import ./lib/inventory as stock
+
+proc main(): void {
+	echo text.repeat("=", 28)
+	echo stock.line(stock.Item("Beeswax", 450))
+}
+```
+
+* The **path is relative to the importing file's own directory** and leaves the
+  `.hive` extension off, so `./lib/text` is `lib/text.hive` next door and
+  `../../shared/text` climbs out first. It is the file's location that matters,
+  not where you happen to run `hive` from.
+* A module is reached through a **name**: the file's own name by default
+  (`./lib/text` → `text`), or whatever `as` gives it. Use `as` when two modules
+  would otherwise collide, when a name would clash with something the importing
+  file declares, or when the file name isn't usable as a name at all
+  (`./lib/text-utils` needs one).
+* **Everything a module declares is visible** — procs, funcs, queries and types.
+  There is no `pub`/`priv` distinction yet.
+* Modules may import modules of their own, and a file is **loaded once** however
+  many modules reach for it.
+* **Import cycles are rejected**, whether direct (a file importing itself) or
+  round any number of steps. The error prints the loop it found:
+
+  ```
+  hive: this import forms a cycle:
+
+      lib/inventory.hive
+        -> lib/pricing.hive
+        -> lib/inventory.hive
+  ```
+
+Names carry no baggage across a module boundary: a type or function only ever
+means what the module you read it in says it means. Two files may each declare
+their own `Align` and both stay distinct types, referenced as `Align` in one and
+`text.Align` in the other. An imported type is constructed, annotated and
+matched through the same name its module is reached by
+(`text.Align.Left()`, a `text.Align` parameter, `style is text.Align.Left`), and
+an imported callable is an ordinary value — partially applicable
+(`text.repeat("~", _)`) and passable like any other.
+
+Under the hood the whole program becomes **one Go package**: the entrypoint keeps
+its own names and every imported module's declarations are given a prefix of
+their own, so `hive emit` shows `text_0_repeat` beside your untouched `main`. A
+local binding still shadows a module-level name of the same shape, exactly as it
+does in a single file.
+
+See [`code-examples/11 - Modules`](code-examples/11%20-%20Modules/modules.hive).
+
 ## How Hive maps onto Go
 
 | Hive                                    | Go                                                             |
@@ -595,8 +722,15 @@ The wall clock and calendar formatting. Times are plain `Int`s — Unix seconds.
 | `hive.json.parse(t) with T`             | `hive.JsonParse(t, jsonDecode_T)` → `Result[T, JsonError]`     |
 | `hive.json.encode(v)`                   | derived `jsonEncode_T(v)` (cannot fail, so plain `string`)     |
 | `hive.json.table(t)` / `.get(tbl, p)`   | `hive.JsonTable(t)` / `hive.JsonGet(tbl, p)`                   |
-| `hive.http.request(r)`                  | `hive.HttpSend(r)` → `Result[HttpResponse, HttpError]`         |
-| `hive.http.serve(port, handler)`        | `hive.HttpServe(port, handler)` (handler is any function value) |
+| `hive.net.httpRequest(r)`               | `hive.HttpSend(r)` → `Result[HttpResponse, HttpError]`         |
+| `hive.net.httpServe(port, handler)`     | `hive.HttpServe(port, handler)` (handler is any function value) |
+| `hive.net.wsConnect(u)` / `.wsServe(p, h)` | `hive.WsConnect(u)` → `Result[WsConnection, WsError]` / `hive.WsServe(p, h)` |
+| `hive.net.wsSend(c, m)` / `.wsReceive(c)` | `hive.WsSend(c, m)` → `Result[Int, _]` / `hive.WsReceive(c)` → `Result[Str, _]` |
+| `hive.net.wsRequest(c)` / `.wsClose(c)` | `hive.WsRequest(c)` → `HttpRequest` / `hive.WsClose(c)`         |
+| `hive.net.socketConnect(h, p)` / `.socketServe(p, h)` | `hive.SocketConnect(h, p)` → `Result[SocketConnection, SocketError]` / `hive.SocketServe(p, h)` |
+| `hive.net.socketSend(c, d)` / `.socketReceive(c, n)` | `hive.SocketSend(c, d)` → `Result[Int, _]` / `hive.SocketReceive(c, n)` → `Result[Str, _]` |
+| `hive.net.socketReceiveLine(c)`         | `hive.SocketReceiveLine(c)` → `Result[Str, SocketError]` (newline trimmed) |
+| `hive.net.socketPeer(c)` / `.socketClose(c)` | `hive.SocketPeer(c)` → `Str` / `hive.SocketClose(c)`       |
 | `f` (bare reference)                    | `f` (the Go function value)                                    |
 | `f(a, _, c)` (partial application)      | `func(h T) R { return f(a, h, c) }` (a closure; `_`→ parameter) |
 | `hive.crypto.sha256/sha512(s)`          | `hive.Sha256/Sha512(s)` (lowercase-hex digest)                 |
@@ -612,7 +746,7 @@ The wall clock and calendar formatting. Times are plain `Int`s — Unix seconds.
 | `hive.conv.itf(i)` / `its(i)` / `fts(f)` | `hive.IntToFloat(i)` / `hive.IntToStr(i)` / `hive.FloatToStr(f)` |
 | `hive.conv.sti(s)` / `stf(s)`           | `hive.StrToInt(s)` / `hive.StrToFloat(s)` → `Result[_, ConversionError]` |
 | `hive.env.get(name)`                    | `hive.EnvGet(name)` → `Result[Str, EnvironmentError]` (.env, then OS)   |
-| `hive.http.HttpRequest(m, u, h, b)`     | `hive.HttpRequest{Method: m, Url: u, Headers: h, Body: b}`     |
+| `hive.net.HttpRequest(m, u, h, b)`      | `hive.HttpRequest{Method: m, Url: u, Headers: h, Body: b}`     |
 | `request.body` (builtin struct field)   | `request.Body` (fields capitalize to their exported Go names)  |
 | `t[1:]`                                 | `t[1:]` (slices are **inclusive** of the high bound)           |
 | `Str`, `Int`, `Bool`, `Float`, `Atom`   | `string`, `int`, `bool`, `float64`, `hive.Atom`                |
@@ -645,9 +779,12 @@ src/hive/token.gleam      token definitions
 src/hive/lexer.gleam      source text  -> tokens (strings, atoms, SQL bodies)
 src/hive/ast.gleam        the abstract syntax tree
 src/hive/parser.gleam     tokens       -> AST (recursive descent)
+src/hive/modules.gleam    resolves the `import` graph (rejecting cycles) and
+                          flattens the whole program into one module
 src/hive/bounds.gleam     flow-sensitive vector index/slice bounds checking
 src/hive/codegen.gleam    AST          -> Go source (with local type inference)
-src/hive/runtime.gleam    the fixed Go `hive` runtime + go.mod
+src/hive/runtime.gleam    go.mod, the core Go `hive` runtime, and one Go
+                          source per `hive.*` module (written on demand)
 src/hive/compiler.gleam   glue: source -> Go source, purity checks for funcs
 src/hive/cli.gleam        writes the Go project, drives the Go toolchain
 ```

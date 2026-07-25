@@ -16,8 +16,8 @@ type Toks =
   List(Token)
 
 pub fn parse(tokens: Toks) -> Result(ast.Module, String) {
-  use decls <- result.try(parse_decls(tokens, []))
-  Ok(ast.Module(decls))
+  use #(imports, decls) <- result.try(parse_decls(tokens, [], []))
+  Ok(ast.Module(imports, decls))
 }
 
 // ---------------------------------------------------------------------------
@@ -82,37 +82,114 @@ fn expect_ident(tokens: Toks) -> Result(#(String, Toks), String) {
 
 fn parse_decls(
   tokens: Toks,
+  imports: List(ast.Import),
   acc: List(ast.Decl),
-) -> Result(List(ast.Decl), String) {
+) -> Result(#(List(ast.Import), List(ast.Decl)), String) {
   case kind(tokens) {
-    token.Eof -> Ok(list.reverse(acc))
+    token.Eof -> Ok(#(list.reverse(imports), list.reverse(acc)))
+    token.KwImport -> {
+      use #(imp, rest) <- result.try(parse_import(tokens))
+      parse_decls(rest, [imp, ..imports], acc)
+    }
     token.KwProc -> {
       use #(decl, rest) <- result.try(parse_proc(tokens))
-      parse_decls(rest, [decl, ..acc])
+      parse_decls(rest, imports, [decl, ..acc])
     }
     token.KwFunc -> {
       use #(decl, rest) <- result.try(parse_func(tokens))
-      parse_decls(rest, [decl, ..acc])
+      parse_decls(rest, imports, [decl, ..acc])
     }
     token.KwAsync -> {
       use #(decl, rest) <- result.try(parse_async_func(tokens))
-      parse_decls(rest, [decl, ..acc])
+      parse_decls(rest, imports, [decl, ..acc])
     }
     token.KwQuery -> {
       use #(decl, rest) <- result.try(parse_query(tokens))
-      parse_decls(rest, [decl, ..acc])
+      parse_decls(rest, imports, [decl, ..acc])
     }
     token.KwType -> {
       use #(decl, rest) <- result.try(parse_type(tokens))
-      parse_decls(rest, [decl, ..acc])
+      parse_decls(rest, imports, [decl, ..acc])
     }
     other ->
       Error(
-        "expected `proc`, `func`, `async func`, `query` or `type` at the top "
-        <> "level but found "
+        "expected `import`, `proc`, `func`, `async func`, `query` or `type` at "
+        <> "the top level but found "
         <> token.describe(other)
         <> at(tokens),
       )
+  }
+}
+
+// `import ../lib/strings` or `import ../lib/strings as text`. The lexer has
+// already captured the path as one token, so all that is left is the optional
+// `as <name>`. Since every other top-level declaration starts with a keyword, a
+// bare identifier in that position can only be the `as`.
+fn parse_import(tokens: Toks) -> Result(#(ast.Import, Toks), String) {
+  let at_line = line(tokens)
+  let t0 = tail(tokens)
+  use #(path, t1) <- result.try(case kind(t0) {
+    token.PathLit(path) -> Ok(#(path, tail(t0)))
+    other ->
+      Error(
+        "expected a module path after `import` but found "
+        <> token.describe(other)
+        <> at(t0),
+      )
+  })
+  case kind(t1) {
+    token.Ident(word) ->
+      case string.lowercase(word) {
+        "as" -> {
+          use #(alias, t2) <- result.try(expect_ident(tail(t1)))
+          Ok(#(ast.Import(path, alias, at_line), t2))
+        }
+        _ ->
+          Error(
+            "expected `as` or the next declaration after `import "
+            <> path
+            <> "` but found identifier `"
+            <> word
+            <> "`"
+            <> at(t1),
+          )
+      }
+    _ -> {
+      use alias <- result.try(default_alias(path, at_line))
+      Ok(#(ast.Import(path, alias, at_line), t1))
+    }
+  }
+}
+
+// Without `as`, a module is named after its file: `../lib/strings` -> `strings`.
+// A file name Hive source could not spell as a name needs the explicit form.
+fn default_alias(path: String, at_line: Int) -> Result(String, String) {
+  let base =
+    string.split(path, "/") |> list.last |> result.unwrap("")
+  case is_usable_name(base) {
+    True -> Ok(base)
+    False ->
+      Error(
+        "`import "
+        <> path
+        <> "` needs a name of its own: `"
+        <> base
+        <> "` cannot be used as one — write `import "
+        <> path
+        <> " as <name>` (line "
+        <> int.to_string(at_line)
+        <> ")",
+      )
+  }
+}
+
+// Whether a word is something Hive source can write as a name: exactly one
+// identifier token, so punctuation and keywords are both rejected. Asking the
+// lexer keeps this in step with the real rules.
+fn is_usable_name(word: String) -> Bool {
+  case lexer.lex(word) {
+    Ok([Token(token.Ident(name), _), Token(token.Eof, _)]) -> name == word
+    _ -> False
   }
 }
 
@@ -308,7 +385,7 @@ fn parse_type_expr(tokens: Toks) -> Result(#(ast.TypeExpr, Toks), String) {
     token.KwProc -> parse_fn_type(tail(tokens), False)
     _ -> {
       // A dotted, possibly multi-segment qualified name: `Str`, `hive.Table`,
-      // `hive.http.HttpRequest`. The last segment is the type; everything
+      // `hive.net.HttpRequest`. The last segment is the type; everything
       // before it (joined by `.`) is the package/namespace path.
       use #(first, t1) <- result.try(expect_ident(tokens))
       use #(segments, t2) <- result.try(collect_type_segments(t1, [first]))
@@ -369,7 +446,7 @@ fn collect_type_segments(
   }
 }
 
-// Splits `[hive, http, HttpRequest]` into (Some("hive.http"), "HttpRequest").
+// Splits `[hive, net, HttpRequest]` into (Some("hive.net"), "HttpRequest").
 fn split_type_path(segments: List(String)) -> #(Option(String), String) {
   case list.reverse(segments) {
     [name] -> #(None, name)

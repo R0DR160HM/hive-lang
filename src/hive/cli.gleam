@@ -1,5 +1,11 @@
 //// Build/run orchestration: writes the generated Go project to disk, invokes
 //// the Go toolchain, and (for `run`) executes the resulting binary.
+////
+//// The generated project carries only what the program uses: the core runtime
+//// always, and each `hive.*` standard library module only when the compiled
+//// code references it (see `needed_modules`). That keeps a program that never
+//// opens a socket or a database from compiling — or, for `hive.sql`, from
+//// downloading — the machinery behind either.
 
 import gleam/list
 import gleam/result
@@ -15,8 +21,7 @@ import hive/runtime
 pub fn build(entry: String) -> Result(String, String) {
   let entry = normalize(entry)
 
-  use source <- result.try(read(entry))
-  use main_go <- result.try(compiler.compile(source))
+  use main_go <- result.try(compiler.compile_file(entry))
 
   let dir = dir_of(entry)
   let base = filepath.strip_extension(filepath.base_name(entry))
@@ -76,8 +81,7 @@ pub fn build(entry: String) -> Result(String, String) {
 pub fn run(entry: String, program_args: List(String)) -> Result(Int, String) {
   let entry = normalize(entry)
 
-  use source <- result.try(read(entry))
-  use main_go <- result.try(compiler.compile(source))
+  use main_go <- result.try(compiler.compile_file(entry))
 
   let dir = dir_of(entry)
   let base = filepath.strip_extension(filepath.base_name(entry))
@@ -114,7 +118,7 @@ pub fn run(entry: String, program_args: List(String)) -> Result(Int, String) {
 // dependencies must be resolved (fetched on first build, then cached) before
 // the Go toolchain runs. Programs that don't stay dependency-free and offline.
 fn resolve_sql_deps(build_dir: String, main_go: String) -> Result(Nil, String) {
-  case uses_sql(main_go) {
+  case list.contains(runtime.needed_modules(main_go), "sql") {
     True ->
       shellout.command(run: "go", with: ["mod", "tidy"], in: build_dir, opt: [])
       |> result.map_error(fn(failure) {
@@ -155,20 +159,12 @@ fn is_absolute(path: String) -> Bool {
 
 /// Compile `entry` and return the generated Go `main.go` source (no build).
 pub fn emit(entry: String) -> Result(String, String) {
-  use source <- result.try(read(normalize(entry)))
-  compiler.compile(source)
+  compiler.compile_file(normalize(entry))
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn read(path: String) -> Result(String, String) {
-  simplifile.read(path)
-  |> result.map_error(fn(e) {
-    "could not read " <> path <> ": " <> simplifile.describe_error(e)
-  })
-}
 
 fn prepare_build_dir(build_dir: String, main_go: String) -> Result(Nil, String) {
   use _ <- result.try(mkdir(build_dir))
@@ -179,31 +175,28 @@ fn prepare_build_dir(build_dir: String, main_go: String) -> Result(Nil, String) 
     filepath.join(build_dir, "hive/runtime.go"),
     runtime.runtime_go(),
   ))
-  // The SQL runtime (and its external drivers) is only pulled in on demand.
-  // When the program does not use SQL, remove any sql.go left over from an
-  // earlier build in this same directory: go.mod is regenerated
-  // dependency-free on every build, so a stale sql.go would fail to resolve
-  // its driver imports even though nothing references them. `delete_all` is a
-  // no-op when the file is already absent.
-  let sql_path = filepath.join(build_dir, "hive/sql.go")
-  case uses_sql(main_go) {
-    True -> write(sql_path, runtime.sql_go())
-    False ->
-      simplifile.delete_all([sql_path])
-      |> result.map_error(fn(e) {
-        "could not remove a stale "
-        <> sql_path
-        <> ": "
-        <> simplifile.describe_error(e)
-      })
-  }
-}
-
-/// Whether the generated program references the `hive.sql` runtime, which
-/// decides if the SQL driver file and its dependencies are needed.
-fn uses_sql(main_go: String) -> Bool {
-  string.contains(main_go, "hive.Sql")
-  || string.contains(main_go, "hive.DatabaseDriver")
+  // Each standard library module is written only when the program actually
+  // reaches for it, and any module file left over from an earlier build in this
+  // same directory is removed. Everything under `hive/` compiles as one Go
+  // package, so a stale file would still be built — and a stale `sql.go` would
+  // fail outright, since go.mod is regenerated dependency-free on every build.
+  // `delete_all` is a no-op when the file is already absent.
+  let needed = runtime.needed_modules(main_go)
+  list.try_fold(runtime.modules(), Nil, fn(_, module) {
+    let path = filepath.join(build_dir, module.file)
+    case list.contains(needed, module.name) {
+      True -> write(path, module.source())
+      False ->
+        simplifile.delete_all([path])
+        |> result.map_error(fn(e) {
+          "could not remove a stale "
+          <> path
+          <> ": "
+          <> simplifile.describe_error(e)
+        })
+    }
+  })
+  |> result.map(fn(_) { Nil })
 }
 
 fn mkdir(path: String) -> Result(Nil, String) {

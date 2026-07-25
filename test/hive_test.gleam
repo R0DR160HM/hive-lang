@@ -1,8 +1,10 @@
+import gleam/list
 import gleam/string
 import gleeunit
 import gleeunit/should
 import simplifile
 import hive/compiler
+import hive/runtime
 
 pub fn main() {
   gleeunit.main()
@@ -620,7 +622,7 @@ pub fn named_args_on_constructor_test() {
 pub fn named_args_on_builtin_constructor_test() {
   let go =
     compile(
-      "proc main(): void {\n\thive.http.serve(handler: h, port: 8080)\n}\nproc h(r: hive.http.HttpRequest): hive.http.HttpResponse {\n\treturn hive.http.HttpResponse(200, body: \"ok\", headers: [])\n}\n",
+      "proc main(): void {\n\thive.net.httpServe(handler: h, port: 8080)\n}\nproc h(r: hive.net.HttpRequest): hive.net.HttpResponse {\n\treturn hive.net.HttpResponse(200, body: \"ok\", headers: [])\n}\n",
     )
   // Both the builtin call and the builtin constructor resolve named args.
   should.be_true(string.contains(go, "hive.HttpServe(8080, h)"))
@@ -662,13 +664,13 @@ pub fn incomplete_named_call_is_rejected_test() {
 }
 
 // ---------------------------------------------------------------------------
-// The hive.http standard library
+// The hive.net standard library
 // ---------------------------------------------------------------------------
 
 pub fn http_request_lowers_test() {
   let go =
     compile(
-      "proc f(): Str {\n\tr := hive.http.request(hive.http.HttpRequest(\"GET\", \"http://x\", [], \"\"))\n\tif r is Result.Ok(response) {\n\t\treturn response.body\n\t} else if r is Result.Error(error) {\n\t\treturn error.message\n\t}\n}\nproc main(): void {}\n",
+      "proc f(): Str {\n\tr := hive.net.httpRequest(hive.net.HttpRequest(\"GET\", \"http://x\", [], \"\"))\n\tif r is Result.Ok(response) {\n\t\treturn response.body\n\t} else if r is Result.Error(error) {\n\t\treturn error.message\n\t}\n}\nproc main(): void {}\n",
     )
   // The builtin constructor is positional and the call goes through HttpSend.
   should.be_true(string.contains(
@@ -683,7 +685,7 @@ pub fn http_request_lowers_test() {
 pub fn http_serve_lowers_test() {
   let go =
     compile(
-      "proc main(): void {\n\thive.http.serve(8080, handle)\n}\nproc handle(request: hive.http.HttpRequest): hive.http.HttpResponse {\n\treturn hive.http.HttpResponse(200, [], request.body)\n}\n",
+      "proc main(): void {\n\thive.net.httpServe(8080, handle)\n}\nproc handle(request: hive.net.HttpRequest): hive.net.HttpResponse {\n\treturn hive.net.HttpResponse(200, [], request.body)\n}\n",
     )
   should.be_true(string.contains(go, "hive.HttpServe(8080, handle)"))
   should.be_true(string.contains(
@@ -698,7 +700,7 @@ pub fn http_serve_lowers_test() {
 
 pub fn bare_builtin_type_is_rejected_test() {
   // The bare `hive.HttpRequest` spelling is gone; the namespaced
-  // `hive.http.HttpRequest` is required.
+  // `hive.net.HttpRequest` is required.
   let result =
     compiler.compile(
       "proc main(): void {\n\techo hive.HttpRequest(\"GET\", \"http://x\", [], \"\")\n}\n",
@@ -706,20 +708,20 @@ pub fn bare_builtin_type_is_rejected_test() {
   should.be_error(result)
 }
 
-pub fn func_can_use_http_test() {
-  // hive.http is I/O, which funcs may now perform.
+pub fn func_can_use_net_test() {
+  // hive.net is I/O, which funcs may now perform.
   let go =
     compile(
-      "func f(): Str {\n\tr := hive.http.request(hive.http.HttpRequest(\"GET\", \"http://x\", [], \"\"))\n\treturn \"x\"\n}\nproc main(): void {}\n",
+      "func f(): Str {\n\tr := hive.net.httpRequest(hive.net.HttpRequest(\"GET\", \"http://x\", [], \"\"))\n\treturn \"x\"\n}\nproc main(): void {}\n",
     )
   should.be_true(string.contains(go, "hive.HttpSend("))
 }
 
 pub fn serve_handler_must_match_signature_test() {
-  // Wrong parameter type: the handler must take exactly one hive.http.HttpRequest.
+  // Wrong parameter type: the handler must take exactly one hive.net.HttpRequest.
   let result =
     compiler.compile(
-      "proc main(): void {\n\thive.http.serve(8080, bad)\n}\nproc bad(x: Int): hive.http.HttpResponse {\n\treturn hive.http.HttpResponse(200, [], \"\")\n}\n",
+      "proc main(): void {\n\thive.net.httpServe(8080, bad)\n}\nproc bad(x: Int): hive.net.HttpResponse {\n\treturn hive.net.HttpResponse(200, [], \"\")\n}\n",
     )
   should.be_error(result)
 }
@@ -727,15 +729,169 @@ pub fn serve_handler_must_match_signature_test() {
 pub fn serve_handler_must_be_a_proc_test() {
   let result =
     compiler.compile(
-      "proc main(): void {\n\thive.http.serve(8080, nowhere)\n}\n",
+      "proc main(): void {\n\thive.net.httpServe(8080, nowhere)\n}\n",
     )
   should.be_error(result)
 }
 
-pub fn unknown_http_builtin_is_rejected_test() {
+pub fn unknown_net_builtin_is_rejected_test() {
   let result =
-    compiler.compile("proc main(): void {\n\thive.http.download(\"x\")\n}\n")
+    compiler.compile("proc main(): void {\n\thive.net.download(\"x\")\n}\n")
   should.be_error(result)
+}
+
+pub fn old_http_namespace_is_rejected_test() {
+  // `hive.http` is gone; the module is `hive.net` now.
+  let result =
+    compiler.compile("proc main(): void {\n\thive.http.serve(8080, h)\n}\n")
+  should.be_error(result)
+}
+
+pub fn bare_http_call_names_are_rejected_test() {
+  // Every `hive.net` call names its protocol, so the old bare spellings point
+  // at their replacements instead of reading as unknown members.
+  let served =
+    compiler.compile("proc main(): void {\n\thive.net.serve(8080, h)\n}\n")
+  should.be_error(served)
+  case served {
+    Error(message) ->
+      should.be_true(string.contains(message, "hive.net.httpServe"))
+    Ok(_) -> panic as "expected an error"
+  }
+  let requested =
+    compiler.compile(
+      "proc main(): void {\n\techo hive.net.request(hive.net.HttpRequest(\"GET\", \"http://x\", [], \"\")) is Result.Ok(_)\n}\n",
+    )
+  should.be_error(requested)
+  case requested {
+    Error(message) ->
+      should.be_true(string.contains(message, "hive.net.httpRequest"))
+    Ok(_) -> panic as "expected an error"
+  }
+}
+
+// ---------------------------------------------------------------------------
+// hive.net: WebSockets
+// ---------------------------------------------------------------------------
+
+const ws_example = "proc main(): void {
+\thive.net.wsServe(9001, handle)
+}
+proc handle(connection: hive.net.WsConnection): void {
+\topening := hive.net.wsRequest(connection)
+\techo opening.url
+\tincoming := hive.net.wsReceive(connection)
+\tif incoming is Result.Ok(message) {
+\t\tsent := hive.net.wsSend(connection, message)
+\t\tif sent is Result.Ok(count) {
+\t\t\techo count
+\t\t}
+\t} else if incoming is Result.Error(error) {
+\t\techo error.reason
+\t}
+\thive.net.wsClose(connection)
+}
+"
+
+pub fn ws_server_lowers_test() {
+  let go = compile(ws_example)
+  should.be_true(string.contains(go, "hive.WsServe(9001, handle)"))
+  // A ws handler is a void proc over an opaque connection.
+  should.be_true(string.contains(
+    go,
+    "func handle(connection hive.WsConnection) {",
+  ))
+  should.be_true(string.contains(go, "hive.WsRequest(connection)"))
+  should.be_true(string.contains(go, "hive.WsReceive(connection)"))
+  should.be_true(string.contains(go, "hive.WsSend(connection, message)"))
+  should.be_true(string.contains(go, "hive.WsClose(connection)"))
+  // `wsRequest` yields an HttpRequest, so its fields capitalize.
+  should.be_true(string.contains(go, "opening.Url"))
+}
+
+pub fn ws_client_lowers_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\topened := hive.net.wsConnect(\"ws://x/y\")\n\tif opened is Result.Ok(c) {\n\t\thive.net.wsClose(c)\n\t} else if opened is Result.Error(error) {\n\t\techo error.message\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.WsConnect(\"ws://x/y\")"))
+  should.be_true(string.contains(go, "echo.Message") == False)
+  should.be_true(string.contains(go, "error.Message"))
+}
+
+pub fn ws_handler_must_be_void_over_a_connection_test() {
+  // An HTTP handler's shape is not a WebSocket handler's shape.
+  let result =
+    compiler.compile(
+      "proc main(): void {\n\thive.net.wsServe(9001, h)\n}\nproc h(r: hive.net.HttpRequest): hive.net.HttpResponse {\n\treturn hive.net.HttpResponse(200, [], \"\")\n}\n",
+    )
+  should.be_error(result)
+}
+
+pub fn ws_send_arity_is_checked_test() {
+  let result =
+    compiler.compile(
+      "proc main(): void {\n\topened := hive.net.wsConnect(\"ws://x\")\n\tif opened is Result.Ok(c) {\n\t\thive.net.wsSend(c)\n\t}\n}\n",
+    )
+  should.be_error(result)
+}
+
+// ---------------------------------------------------------------------------
+// hive.net: raw TCP sockets
+// ---------------------------------------------------------------------------
+
+const socket_example = "proc main(): void {
+\thive.net.socketServe(9002, handle)
+}
+proc handle(connection: hive.net.SocketConnection): void {
+\techo hive.net.socketPeer(connection)
+\tline := hive.net.socketReceiveLine(connection)
+\tif line is Result.Ok(text) {
+\t\thive.net.socketSend(connection, text)
+\t} else if line is Result.Error(error) {
+\t\techo error.reason
+\t}
+\thive.net.socketClose(connection)
+}
+"
+
+pub fn socket_server_lowers_test() {
+  let go = compile(socket_example)
+  should.be_true(string.contains(go, "hive.SocketServe(9002, handle)"))
+  should.be_true(string.contains(
+    go,
+    "func handle(connection hive.SocketConnection) {",
+  ))
+  should.be_true(string.contains(go, "hive.SocketPeer(connection)"))
+  should.be_true(string.contains(go, "hive.SocketReceiveLine(connection)"))
+  should.be_true(string.contains(go, "hive.SocketSend(connection, text)"))
+  should.be_true(string.contains(go, "hive.SocketClose(connection)"))
+}
+
+pub fn socket_client_lowers_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\topened := hive.net.socketConnect(\"localhost\", 9002)\n\tif opened is Result.Ok(c) {\n\t\tchunk := hive.net.socketReceive(c, 256)\n\t\tif chunk is Result.Ok(text) {\n\t\t\techo text\n\t\t}\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.SocketConnect(\"localhost\", 9002)"))
+  should.be_true(string.contains(go, "hive.SocketReceive(c, 256)"))
+}
+
+pub fn socket_handler_must_take_a_socket_connection_test() {
+  let result =
+    compiler.compile(
+      "proc main(): void {\n\thive.net.socketServe(9002, h)\n}\nproc h(c: hive.net.WsConnection): void {\n\thive.net.wsClose(c)\n}\n",
+    )
+  should.be_error(result)
+}
+
+pub fn net_calls_accept_named_arguments_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\topened := hive.net.socketConnect(port: 9002, host: \"localhost\")\n\tif opened is Result.Ok(c) {\n\t\tchunk := hive.net.socketReceive(bytes: 64, connection: c)\n\t\tif chunk is Result.Ok(text) {\n\t\t\techo text\n\t\t}\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.SocketConnect(\"localhost\", 9002)"))
+  should.be_true(string.contains(go, "hive.SocketReceive(c, 64)"))
 }
 
 // ---------------------------------------------------------------------------
@@ -770,7 +926,7 @@ pub fn bare_reference_and_call_of_function_value_test() {
 pub fn serve_accepts_partial_application_handler_test() {
   let go =
     compile(
-      "proc main(): void {\n\tdb := \"d\"\n\thive.http.serve(8080, handler(_, db))\n}\nproc handler(req: hive.http.HttpRequest, db: Str): hive.http.HttpResponse {\n\treturn hive.http.HttpResponse(200, [], db)\n}\n",
+      "proc main(): void {\n\tdb := \"d\"\n\thive.net.httpServe(8080, handler(_, db))\n}\nproc handler(req: hive.net.HttpRequest, db: Str): hive.net.HttpResponse {\n\treturn hive.net.HttpResponse(200, [], db)\n}\n",
     )
   should.be_true(string.contains(
     go,
@@ -878,7 +1034,7 @@ pub fn json_table_and_get_lower_test() {
 }
 
 pub fn json_is_pure_test() {
-  // hive.json is allowed inside funcs (unlike hive.http).
+  // hive.json is allowed inside funcs (unlike hive.net).
   let result =
     compiler.compile(
       "func f(text: Str): Str {\n\treturn hive.json.encode(text)\n}\nproc main(): void {}\n",
@@ -1206,12 +1362,232 @@ pub fn conv_wrong_arity_is_rejected_test() {
 }
 
 // ---------------------------------------------------------------------------
+// Standard library modules are only built when they are used
+// ---------------------------------------------------------------------------
+
+// The module names a program's generated Go pulls into the build.
+fn used_modules(source: String) -> List(String) {
+  runtime.needed_modules(compile(source))
+}
+
+pub fn unused_modules_are_left_out_test() {
+  // A program that only echoes needs nothing but the core runtime.
+  should.equal(used_modules("proc main(): void {\n\techo \"hi\"\n}\n"), [])
+}
+
+pub fn used_module_is_pulled_in_test() {
+  should.equal(
+    used_modules(
+      "proc main(): void {\n\techo hive.conv.its(1)\n\techo hive.time.now()\n}\n",
+    ),
+    ["conv", "time"],
+  )
+}
+
+pub fn net_module_is_pulled_in_by_each_protocol_test() {
+  let http =
+    used_modules(
+      "proc main(): void {\n\thive.net.httpServe(80, h)\n}\nproc h(r: hive.net.HttpRequest): hive.net.HttpResponse {\n\treturn hive.net.HttpResponse(200, [], \"\")\n}\n",
+    )
+  should.be_true(list.contains(http, "net"))
+  let ws =
+    used_modules(
+      "proc main(): void {\n\thive.net.wsServe(80, h)\n}\nproc h(c: hive.net.WsConnection): void {\n\thive.net.wsClose(c)\n}\n",
+    )
+  should.be_true(list.contains(ws, "net"))
+  let socket =
+    used_modules(
+      "proc main(): void {\n\thive.net.socketServe(80, h)\n}\nproc h(c: hive.net.SocketConnection): void {\n\thive.net.socketClose(c)\n}\n",
+    )
+  should.be_true(list.contains(socket, "net"))
+}
+
+pub fn module_requirements_are_pulled_in_test() {
+  // hive.crypto's JWTs decode with hive.json and check exp/nbf against
+  // hive.time, so both come along even though the source never names them.
+  let used =
+    used_modules(
+      "type Claims {\n\tsub: Str\n}\nproc main(): void {\n\techo hive.crypto.jwtSign(Claims(\"me\"), \"secret\")\n}\n",
+    )
+  should.be_true(list.contains(used, "crypto"))
+  should.be_true(list.contains(used, "json"))
+  should.be_true(list.contains(used, "time"))
+}
+
+pub fn query_interpolation_does_not_pull_in_sql_test() {
+  // Query interpolation lowers to hive.SqlParam, which lives in the core
+  // runtime — a program that never opens a connection must not drag the
+  // external SQL drivers in.
+  let used =
+    used_modules(
+      "query find(name: Str): Table {\n\tSELECT * FROM t WHERE n = {name}\n}\nproc main(): void {\n\techo \"built\"\n}\n",
+    )
+  should.be_false(list.contains(used, "sql"))
+}
+
+pub fn sql_module_is_pulled_in_by_a_connection_test() {
+  let used =
+    used_modules(
+      "proc main(): void {\n\tc := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"f.db\")\n\tif c is Result.Ok(conn) {\n\t\thive.sql.close(conn)\n\t} else if c is Result.Error(e) {\n\t\techo e.message\n\t}\n}\n",
+    )
+  should.be_true(list.contains(used, "sql"))
+}
+
+// ---------------------------------------------------------------------------
+// Multi-file programs (`import`)
+// ---------------------------------------------------------------------------
+
+// Compiles a fixture program under test/modules/, imports and all.
+fn compile_program(name: String) -> String {
+  let assert Ok(go) = compiler.compile_file("test/modules/" <> name <> ".hive")
+  go
+}
+
+fn program_error(name: String) -> String {
+  let assert Error(message) =
+    compiler.compile_file("test/modules/" <> name <> ".hive")
+  message
+}
+
+pub fn import_brings_in_another_module_test() {
+  let go = compile_program("uses-lib")
+  // The entrypoint keeps its own names; the imported module's are prefixed.
+  should.be_true(string.contains(go, "func main() {"))
+  should.be_true(string.contains(go, "func lib_0_shout(word string) string {"))
+  should.be_true(string.contains(go, "lib_0_shout(\"hi\")"))
+  should.be_true(string.contains(go, "lib_0_decorate("))
+}
+
+pub fn imported_types_stay_distinct_from_local_ones_test() {
+  // Both files declare a `Style`; they must not collapse into one Go type.
+  let go = compile_program("uses-lib")
+  should.be_true(string.contains(go, "type Style interface {"))
+  should.be_true(string.contains(go, "type lib_0_Style interface {"))
+  should.be_true(string.contains(go, "StyleBoxed struct"))
+  should.be_true(string.contains(go, "lib_0_StyleLoud struct"))
+  // An imported type annotates a local and drives a pattern.
+  should.be_true(string.contains(go, "var loud lib_0_Style"))
+  should.be_true(string.contains(go, "loud.(lib_0_StyleLoud)"))
+}
+
+pub fn transitive_imports_are_loaded_once_test() {
+  // diamond.hive imports lib directly and middle.hive imports it too, so lib's
+  // declarations must appear exactly once in the flattened program.
+  let go = compile_program("diamond")
+  should.be_true(string.contains(go, "viaMiddle"))
+  let copies =
+    string.split(go, "func lib_0_shout(word string) string {")
+    |> list.length
+  should.equal(copies, 2)
+}
+
+pub fn locals_still_shadow_module_level_names_test() {
+  // Every name in shadow-lib.hive collides with its own `value` func; the
+  // renaming must respect scopes rather than rewriting every match.
+  let go = compile_program("shadow")
+  // The bare calls reach the renamed module-level func...
+  should.be_true(string.contains(go, "return shadow_lib_0_value()"))
+  // ...while the local, the parameter and the loop/pattern bindings do not.
+  should.be_true(string.contains(go, "value := \"local-var\"\n\treturn value"))
+  should.be_true(string.contains(
+    go,
+    "func shadow_lib_0_useParam(value string) string {\n\treturn value",
+  ))
+  // A local named like the import is field access, not a module reference.
+  should.be_true(string.contains(go, "return helper.Label"))
+}
+
+pub fn self_import_is_rejected_test() {
+  should.be_true(string.contains(program_error("self"), "cycle"))
+}
+
+pub fn two_step_import_cycle_is_rejected_test() {
+  let message = program_error("cycle-a")
+  should.be_true(string.contains(message, "cycle"))
+  should.be_true(string.contains(message, "cycle-a.hive"))
+  should.be_true(string.contains(message, "cycle-b.hive"))
+}
+
+pub fn three_step_import_cycle_is_rejected_test() {
+  let message = program_error("deep-a")
+  should.be_true(string.contains(message, "cycle"))
+  should.be_true(string.contains(message, "deep-b.hive"))
+  should.be_true(string.contains(message, "deep-c.hive"))
+}
+
+pub fn unknown_member_of_a_module_is_rejected_test() {
+  let message = program_error("missing-member")
+  should.be_true(string.contains(message, "has no `nope`"))
+}
+
+pub fn missing_module_file_is_rejected_test() {
+  let message = program_error("missing-file")
+  should.be_true(string.contains(message, "nowhere.hive"))
+}
+
+pub fn import_named_hive_is_rejected_test() {
+  let message = program_error("named-hive")
+  should.be_true(string.contains(message, "standard library"))
+}
+
+pub fn import_clashing_with_a_declaration_is_rejected_test() {
+  let message = program_error("alias-clash")
+  should.be_true(string.contains(message, "same name as a declaration"))
+}
+
+pub fn import_path_needs_a_usable_name_test() {
+  // `lib-with-dashes` cannot be a name, so `as` is required.
+  let result =
+    compiler.compile("import ./lib-with-dashes\nproc main(): void {}\n")
+  should.be_error(result)
+  case result {
+    Error(message) -> should.be_true(string.contains(message, "as <name>"))
+    Ok(_) -> panic as "expected an error"
+  }
+}
+
+pub fn in_memory_source_resolves_imports_from_the_cwd_test() {
+  // `compile` has no file of its own, so its imports resolve against the
+  // working directory.
+  let go =
+    compile(
+      "import ./test/modules/lib as helper\nproc main(): void {\n\techo helper.shout(\"hi\")\n}\n",
+    )
+  should.be_true(string.contains(go, "lib_0_shout(\"hi\")"))
+}
+
+pub fn a_program_without_imports_is_unchanged_test() {
+  // Nothing is renamed when there is nothing to merge.
+  let go = compile("func helper(): Str {\n\treturn \"x\"\n}\nproc main(): void {\n\techo helper()\n}\n")
+  should.be_true(string.contains(go, "func helper() string {"))
+  should.be_true(string.contains(go, "fmt.Println(helper())"))
+}
+
+// ---------------------------------------------------------------------------
 // The shipped code examples must always compile
 // ---------------------------------------------------------------------------
 
 pub fn http_example_compiles_test() {
-  let assert Ok(src) = simplifile.read("code-examples/3 - HTTP/http.hive")
+  let assert Ok(src) = simplifile.read("code-examples/3 - Networking/http.hive")
   let assert Ok(_) = compiler.compile(src)
+}
+
+pub fn websockets_example_compiles_test() {
+  let assert Ok(src) =
+    simplifile.read("code-examples/3 - Networking/websockets.hive")
+  let assert Ok(_) = compiler.compile(src)
+}
+
+pub fn sockets_example_compiles_test() {
+  let assert Ok(src) =
+    simplifile.read("code-examples/3 - Networking/sockets.hive")
+  let assert Ok(_) = compiler.compile(src)
+}
+
+pub fn modules_example_compiles_test() {
+  // Read through compile_file, since this one spans three files.
+  let assert Ok(_) =
+    compiler.compile_file("code-examples/11 - Modules/modules.hive")
 }
 
 pub fn basic_io_example_compiles_test() {
