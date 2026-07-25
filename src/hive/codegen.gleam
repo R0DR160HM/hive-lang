@@ -83,6 +83,8 @@ pub fn builtin_fields(name: String) -> Option(List(#(String, Ty))) {
     "CryptoError" -> Some([#("reason", TyStr), #("message", TyStr)])
     "ConversionError" -> Some([#("input", TyStr), #("message", TyStr)])
     "EnvironmentError" -> Some([#("key", TyStr), #("message", TyStr)])
+    "FileError" ->
+      Some([#("path", TyStr), #("reason", TyStr), #("message", TyStr)])
     "JwtHeader" ->
       Some([#("alg", TyStr), #("typ", TyStr), #("kid", TyStr)])
     "SqlError" -> Some([#("message", TyStr)])
@@ -109,6 +111,7 @@ pub fn builtin_qualifier(name: String) -> String {
     "CryptoError" | "JwtHeader" -> "hive.crypto"
     "ConversionError" -> "hive.conv"
     "EnvironmentError" -> "hive.env"
+    "FileError" -> "hive.file"
     "SqlError" | "SqlConnection" | "DatabaseDriver" -> "hive.sql"
     _ -> "hive"
   }
@@ -355,7 +358,8 @@ fn uses_json_expr(e: ast.Expr) -> Bool {
       || uses_json_opt(high)
     ast.EBinary(_, l, r) -> uses_json_expr(l) || uses_json_expr(r)
     ast.EIs(subject, _) -> uses_json_expr(subject)
-    ast.EUsing(path, delim) -> uses_json_expr(path) || uses_json_opt(delim)
+    ast.EUsing(source, kind) ->
+      uses_json_expr(source) || list.any(ast.using_exprs(kind), uses_json_expr)
     ast.EAwait(value) -> uses_json_expr(value)
   }
 }
@@ -511,7 +515,10 @@ fn atoms_in_expr(e: ast.Expr, acc: List(String)) -> List(String) {
     ast.EBinary(_, l, r) -> atoms_in_expr(r, atoms_in_expr(l, acc))
     ast.EIs(subject, pattern) ->
       atoms_in_pattern(pattern, atoms_in_expr(subject, acc))
-    ast.EUsing(path, delim) -> atoms_in_opt(delim, atoms_in_expr(path, acc))
+    ast.EUsing(source, kind) ->
+      list.fold(ast.using_exprs(kind), atoms_in_expr(source, acc), fn(a, e) {
+        atoms_in_expr(e, a)
+      })
     ast.EWith(value, _) -> atoms_in_expr(value, acc)
     ast.EAwait(value) -> atoms_in_expr(value, acc)
   }
@@ -1504,9 +1511,23 @@ fn gen_if(
         0 -> pad <> "if "
         _ -> " else if "
       }
-      let #(cond_str, binds) = gen_condition(env, b.cond)
+      // A subject that does work — a call, a `using` read, an `await` — is read
+      // once to test it and again for every value the pattern binds, so it is
+      // evaluated into the `if`'s own init statement instead of being repeated.
+      // Only the leftmost test can move there: whether anything further right
+      // runs at all depends on what came before it.
+      let #(init, hoisted) = case hoistable_subject(b.cond) {
+        Some(subject) -> {
+          let name =
+            "_u" <> int.to_string(indent) <> "_" <> int.to_string(i)
+          #(name <> " := " <> gen_expr(env, subject) <> "; ", Some(name))
+        }
+        None -> #("", None)
+      }
+      let #(cond_str, binds) = gen_condition_as(env, b.cond, hoisted)
       let benv = bind_locals(env, binds)
       opener
+      <> init
       <> cond_str
       <> " {\n"
       <> gen_bindings(binds, b.body, indent + 1)
@@ -1569,6 +1590,46 @@ fn bind_subst(env: Env, binds: List(Bind)) -> Env {
 // the right operand is generated with `x` substituted by its accessor; Go's
 // short-circuiting `&&` guarantees the accessor only runs after the type
 // check passed.
+// The leftmost test's subject when it must not be evaluated twice.
+fn hoistable_subject(cond: ast.Expr) -> Option(ast.Expr) {
+  case leftmost_test(cond) {
+    ast.EIs(subject, _) ->
+      case ast.repeatable(subject) {
+        True -> None
+        False -> Some(subject)
+      }
+    _ -> None
+  }
+}
+
+// An `&&` only reaches its right side once the left has held, so the left-hand
+// spine is the part of a condition that always runs.
+fn leftmost_test(cond: ast.Expr) -> ast.Expr {
+  case cond {
+    ast.EBinary(ast.OpAnd, left, _) -> leftmost_test(left)
+    _ -> cond
+  }
+}
+
+// As `gen_condition`, but `held` names the temporary the leftmost test's subject
+// has already been evaluated into.
+fn gen_condition_as(
+  env: Env,
+  cond: ast.Expr,
+  held: Option(String),
+) -> #(String, List(Bind)) {
+  case cond, held {
+    ast.EIs(subject, pattern), Some(name) ->
+      gen_is_as(env, subject, name, pattern)
+    ast.EBinary(ast.OpAnd, l, r), Some(_) -> {
+      let #(lc, lb) = gen_condition_as(env, l, held)
+      let #(rc, rb) = gen_condition(bind_subst(env, lb), r)
+      #("(" <> lc <> ") && (" <> rc <> ")", list.append(lb, rb))
+    }
+    _, _ -> gen_condition(env, cond)
+  }
+}
+
 fn gen_condition(env: Env, cond: ast.Expr) -> #(String, List(Bind)) {
   case cond {
     ast.EIs(subject, pattern) -> gen_is(env, subject, pattern)
@@ -1600,7 +1661,18 @@ fn gen_is(
   subject: ast.Expr,
   pattern: ast.Pattern,
 ) -> #(String, List(Bind)) {
-  let subj = gen_expr(env, subject)
+  gen_is_as(env, subject, gen_expr(env, subject), pattern)
+}
+
+// `subj` is the Go expression the subject reads as — normally the subject itself,
+// but the name of a temporary when it was too costly (or too observable) to
+// evaluate more than once.
+fn gen_is_as(
+  env: Env,
+  subject: ast.Expr,
+  subj: String,
+  pattern: ast.Pattern,
+) -> #(String, List(Bind)) {
   // Result payload types come from the subject's inferred TyResult (e.g.
   // `using` -> Result<Table, TableError>, `hive.net.httpRequest` ->
   // Result<HttpResponse, HttpError>).
@@ -1620,7 +1692,7 @@ fn gen_is(
     // User-defined tagged-union patterns via Go type assertions.
     ast.PConstructor([type_name, variant_name], bindings) ->
       gen_adt_is(env, subj, type_name, variant_name, bindings)
-    ast.PConstructor(_, _) -> #(gen_expr(env, subject), [])
+    ast.PConstructor(_, _) -> #(subj, [])
     ast.PVector(elems, rest) -> gen_vector_is(env, subject, subj, elems, rest)
     ast.PString(parts) -> gen_string_is(subj, parts)
   }
@@ -1916,6 +1988,18 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
                     "socketPeer" -> TyStr
                     _ -> TyUnknown
                   }
+                "file" ->
+                  case fname {
+                    "read" -> TyResult(TyStr, TyBuiltin("FileError"))
+                    "lines" | "list" ->
+                      TyResult(TyVec(TyStr), TyBuiltin("FileError"))
+                    "write" | "append" | "size" | "copy" ->
+                      TyResult(TyInt, TyBuiltin("FileError"))
+                    "delete" | "makeDir" | "move" ->
+                      TyResult(TyBool, TyBuiltin("FileError"))
+                    "exists" -> TyBool
+                    _ -> TyUnknown
+                  }
                 "json" ->
                   case fname {
                     "table" -> TyResult(TyTable, TyBuiltin("JsonError"))
@@ -2005,12 +2089,15 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
           infer_arith(env, l, r)
       }
     ast.EIs(_, _) -> TyBool
-    // `using` is overloaded: a Str path reads a CSV; a SQL connection runs a
-    // query. The error type follows the source.
-    ast.EUsing(path, _) ->
-      case infer(env, path) {
-        TyBuiltin("SqlConnection") -> TyResult(TyTable, TyBuiltin("SqlError"))
-        _ -> TyResult(TyTable, TyBuiltin("TableError"))
+    // Each `using` form names what it reads, so its result type is fixed: a CSV
+    // is one Table, a spreadsheet is one per sheet, and a query's failures come
+    // from the database rather than the filesystem.
+    ast.EUsing(_, kind) ->
+      case kind {
+        ast.UsingCsv(_) -> TyResult(TyTable, TyBuiltin("TableError"))
+        ast.UsingXlsx | ast.UsingOds ->
+          TyResult(TyVec(TyTable), TyBuiltin("TableError"))
+        ast.UsingQuery(_) -> TyResult(TyTable, TyBuiltin("SqlError"))
       }
     ast.EWith(value, typ) ->
       case value {
@@ -2114,7 +2201,7 @@ fn gen_expr(env: Env, e: ast.Expr) -> String {
       gen_expr(env, target) <> "[" <> gen_expr(env, idx) <> "]"
     ast.ESlice(target, low, high) -> gen_slice(env, target, low, high)
     ast.EBinary(op, l, r) -> gen_binary(env, op, l, r)
-    ast.EUsing(path, delim) -> gen_using(env, path, delim)
+    ast.EUsing(source, kind) -> gen_using(env, source, kind)
     ast.EIs(subject, pattern) -> {
       let #(cond, _) = gen_is(env, subject, pattern)
       cond
@@ -2850,25 +2937,30 @@ fn gen_slice(
   gen_expr(env, target) <> "[" <> low_str <> ":" <> high_str <> "]"
 }
 
-fn gen_using(env: Env, path: ast.Expr, delim: Option(ast.Expr)) -> String {
-  case infer(env, path) {
-    // `using <connection> with <query>` runs SQL and returns a Table.
-    TyBuiltin("SqlConnection") -> {
-      let query = case delim {
-        Some(q) -> coerce(env, q, TyStr)
-        None -> "\"\""
-      }
-      "hive.SqlQuery(" <> gen_expr(env, path) <> ", " <> query <> ")"
-    }
-    // `using <path> [with <delimiter>]` reads a CSV.
-    _ -> {
-      let delim_str = case delim {
-        Some(d) -> gen_expr(env, d)
-        None -> "\",\""
-      }
-      "hive.ReadCSV(" <> gen_expr(env, path) <> ", " <> delim_str <> ")"
-    }
+// Each `using` form lowers to the reader it names. Because the format is in the
+// source rather than sniffed from the path at runtime, a program that never
+// reads a spreadsheet never pulls `hive/sheets.go` (and so archive/zip and
+// encoding/xml) into its build.
+fn gen_using(env: Env, source: ast.Expr, kind: ast.UsingKind) -> String {
+  case kind {
+    ast.UsingQuery(query) ->
+      "hive.SqlQuery("
+      <> gen_expr(env, source)
+      <> ", "
+      <> coerce(env, query, TyStr)
+      <> ")"
+    ast.UsingXlsx -> "hive.ReadXlsx(" <> coerce(env, source, TyStr) <> ")"
+    ast.UsingOds -> "hive.ReadOds(" <> coerce(env, source, TyStr) <> ")"
+    ast.UsingCsv(separator) -> gen_read_csv(env, source, separator)
   }
+}
+
+fn gen_read_csv(env: Env, path: ast.Expr, delim: Option(ast.Expr)) -> String {
+  let separator = case delim {
+    Some(d) -> coerce(env, d, TyStr)
+    None -> "\",\""
+  }
+  "hive.ReadCSV(" <> coerce(env, path, TyStr) <> ", " <> separator <> ")"
 }
 
 fn gen_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
@@ -2888,6 +2980,7 @@ fn gen_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
         None ->
           case ns {
             "net" -> gen_net_call(env, fname, args)
+            "file" -> gen_file_call(env, fname, args)
             "json" -> gen_json_call(env, fname, args)
             "crypto" -> gen_crypto_call(env, fname, args)
             "sql" -> gen_sql_call(env, fname, args)
@@ -3002,6 +3095,45 @@ fn gen_connection(env: Env, args: List(ast.Arg)) -> String {
   case assign_args(args, ["connection"]) {
     #([#(_, conn)], []) -> gen_expr(env, conn)
     _ -> gen_args(env, args)
+  }
+}
+
+// The `hive.file` namespace: general filesystem reads and writes. Contents move
+// as Str, which carries bytes, so binary files round-trip unchanged.
+fn gen_file_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
+  case fname {
+    "read" -> "hive.FileRead(" <> gen_one(env, args, "path") <> ")"
+    "lines" -> "hive.FileLines(" <> gen_one(env, args, "path") <> ")"
+    "exists" -> "hive.FileExists(" <> gen_one(env, args, "path") <> ")"
+    "size" -> "hive.FileSize(" <> gen_one(env, args, "path") <> ")"
+    "delete" -> "hive.FileDelete(" <> gen_one(env, args, "path") <> ")"
+    "list" -> "hive.FileList(" <> gen_one(env, args, "path") <> ")"
+    "makeDir" -> "hive.FileMakeDir(" <> gen_one(env, args, "path") <> ")"
+    "write" -> gen_two_strs(env, args, "hive.FileWrite", "path", "contents")
+    "append" -> gen_two_strs(env, args, "hive.FileAppend", "path", "contents")
+    "copy" -> gen_two_strs(env, args, "hive.FileCopy", "from", "to")
+    "move" -> gen_two_strs(env, args, "hive.FileMove", "from", "to")
+    _ -> "hive.File" <> exported(fname) <> "(" <> gen_args(env, args) <> ")"
+  }
+}
+
+// Two Str arguments, honouring the named-argument form.
+fn gen_two_strs(
+  env: Env,
+  args: List(ast.Arg),
+  runtime_fn: String,
+  first: String,
+  second: String,
+) -> String {
+  case assign_args(args, [first, second]) {
+    #([#(_, a), #(_, b)], []) ->
+      runtime_fn
+      <> "("
+      <> coerce(env, a, TyStr)
+      <> ", "
+      <> coerce(env, b, TyStr)
+      <> ")"
+    _ -> runtime_fn <> "(" <> gen_args(env, args) <> ")"
   }
 }
 
@@ -3674,8 +3806,9 @@ fn uses_in_expr(e: ast.Expr, name: String) -> Bool {
       uses_in_expr(t, name) || uses_in_opt(lo, name) || uses_in_opt(hi, name)
     ast.EBinary(_, l, r) -> uses_in_expr(l, name) || uses_in_expr(r, name)
     ast.EIs(subject, _) -> uses_in_expr(subject, name)
-    ast.EUsing(path, delim) ->
-      uses_in_expr(path, name) || uses_in_opt(delim, name)
+    ast.EUsing(source, kind) ->
+      uses_in_expr(source, name)
+      || list.any(ast.using_exprs(kind), fn(e) { uses_in_expr(e, name) })
     ast.EWith(value, _) -> uses_in_expr(value, name)
     ast.EAwait(value) -> uses_in_expr(value, name)
   }

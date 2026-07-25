@@ -1,6 +1,7 @@
 //// The Hive abstract syntax tree.
 
-import gleam/option.{type Option}
+import gleam/list
+import gleam/option.{type Option, None, Some}
 
 pub type Module {
   Module(imports: List(Import), decls: List(Decl))
@@ -182,8 +183,9 @@ pub type Expr {
   EBinary(op: BinOp, left: Expr, right: Expr)
   /// `subject is Pattern` — a boolean type-check that may bind variables.
   EIs(subject: Expr, pattern: Pattern)
-  /// `using <path> [with <delimiter>]`
-  EUsing(path: Expr, delimiter: Option(Expr))
+  /// `using <source> <kind>` — reads a table. What `source` is, and what comes
+  /// back, depends on the kind (see `UsingKind`).
+  EUsing(source: Expr, kind: UsingKind)
   /// `hive.json.parse(text) with Type` — gives a decode target type to an
   /// expression. Only valid on `hive.json.parse` calls.
   EWith(value: Expr, typ: TypeExpr)
@@ -191,6 +193,70 @@ pub type Expr {
   /// function returns its value (a bare call, without `await`, is
   /// fire-and-forget).
   EAwait(value: Expr)
+}
+
+/// Which kind of table a `using` expression reads. Naming the format in the
+/// source (rather than inferring it from the path at runtime) is what lets the
+/// compiler pick the right reader — and leave the spreadsheet machinery out of a
+/// build that never touches a spreadsheet.
+pub type UsingKind {
+  /// `using <path>` or `using <path> as csv [separating by <sep>]` — a CSV,
+  /// comma-separated when no separator is given. Yields
+  /// `Result<Table, hive.TableError>`.
+  UsingCsv(separator: Option(Expr))
+  /// `using <path> as xlsx` — every sheet of an Excel workbook, in workbook
+  /// order. Yields `Result<Table[dyn], hive.TableError>`.
+  UsingXlsx
+  /// `using <path> as ods` — every table of an OpenDocument spreadsheet, in
+  /// document order. Yields `Result<Table[dyn], hive.TableError>`.
+  UsingOds
+  /// `using <connection> run <query>` — runs SQL on an open connection. Yields
+  /// `Result<Table, hive.sql.SqlError>`.
+  UsingQuery(query: Expr)
+}
+
+/// Whether an expression can be evaluated more than once without changing what
+/// the program does: no call, no `using` read, no `with` decode, no `await`, so
+/// nothing observable happens and nothing costly is recomputed.
+///
+/// Codegen reads a pattern's subject once to test it and again for every value it
+/// binds, so a subject that is *not* repeatable has to be held in a temporary
+/// first — otherwise `if hive.file.write(p, c) is Result.Ok(n)` would write the
+/// file twice.
+pub fn repeatable(e: Expr) -> Bool {
+  case e {
+    EInt(_) | EFloat(_) | EString(_) | EBool(_) | EAtom(_) | EIdent(_) -> True
+    EMember(target, _) -> repeatable(target)
+    EIndex(target, index) -> repeatable(target) && repeatable(index)
+    ESlice(target, low, high) ->
+      repeatable(target)
+      && list.all(option.values([low, high]), repeatable)
+    EVector(items) -> list.all(items, repeatable)
+    EInterp(parts) -> list.all(parts, repeatable_part)
+    EBinary(_, left, right) -> repeatable(left) && repeatable(right)
+    EIs(subject, _) -> repeatable(subject)
+    // Each of these does work: a call runs a body, `using` reads a file or a
+    // database, `with` decodes, and a bare async call under `await` spawns.
+    ECall(_, _) | EUsing(_, _) | EWith(_, _) | EAwait(_) -> False
+  }
+}
+
+fn repeatable_part(part: IPart) -> Bool {
+  case part {
+    ILit(_) -> True
+    IExpr(inner) -> repeatable(inner)
+  }
+}
+
+/// The sub-expressions a `using` kind carries: a CSV's separator, or a query's
+/// SQL. The traversals that only need to reach every expression use this instead
+/// of matching each kind for themselves.
+pub fn using_exprs(kind: UsingKind) -> List(Expr) {
+  case kind {
+    UsingCsv(Some(separator)) -> [separator]
+    UsingCsv(None) | UsingXlsx | UsingOds -> []
+    UsingQuery(query) -> [query]
+  }
 }
 
 /// One argument in a call. Arguments may be passed by name

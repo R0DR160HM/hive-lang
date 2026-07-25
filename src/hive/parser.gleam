@@ -1131,21 +1131,89 @@ fn parse_sub_expr(code: String, line: Int) -> Result(ast.Expr, String) {
   }
 }
 
+// `using <path>`, `using <path> as csv [separating by <sep>]`,
+// `using <path> as xlsx`, `using <path> as ods`, or
+// `using <connection> run <query>`.
+//
+// `as`, `csv`, `xlsx`, `ods`, `separating`, `by` and `run` are matched as plain
+// words rather than keywords, so a variable or proc named `run` or `by` still
+// works everywhere else in the language.
 fn parse_using(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
   let t1 = tail(tokens)
-  // Operands are parsed at the postfix level so a call (e.g. a `query`
-  // producing the SQL for `using conn with theQuery(arg)`) is consumed whole;
-  // wrap richer expressions in parentheses. `with` is not a postfix operator,
-  // so the path stops cleanly before it.
-  use #(path, t2) <- result.try(parse_postfix(t1))
-  use #(delim, t3) <- result.try(case kind(t2) {
-    token.KwWith -> {
-      use #(d, t) <- result.try(parse_postfix(tail(t2)))
-      Ok(#(Some(d), t))
+  // Operands are parsed at the postfix level so a call (e.g. a `query` producing
+  // the SQL for `using conn run theQuery(arg)`) is consumed whole; wrap richer
+  // expressions in parentheses. None of the words below is a postfix operator,
+  // so the source expression stops cleanly before them.
+  use #(source, t2) <- result.try(parse_postfix(t1))
+  case kind(t2), word(t2) {
+    // `using ... with ...` used to mean both a CSV delimiter and a SQL query,
+    // told apart by the source's type. Both now say which they are.
+    token.KwWith, _ ->
+      Error(
+        "`using ... with ...` has been split into two forms that each name what "
+        <> "they read: `using <path> as csv separating by <separator>` for a "
+        <> "delimited file, and `using <connection> run <query>` for SQL"
+        <> at(t2),
+      )
+    _, Some("as") -> parse_using_format(source, tail(t2))
+    _, Some("run") -> {
+      use #(query, t3) <- result.try(parse_postfix(tail(t2)))
+      Ok(#(ast.EUsing(source, ast.UsingQuery(query)), t3))
     }
-    _ -> Ok(#(None, t2))
-  })
-  Ok(#(ast.EUsing(path, delim), t3))
+    // Bare `using <path>` is a comma-separated CSV.
+    _, _ -> Ok(#(ast.EUsing(source, ast.UsingCsv(None)), t2))
+  }
+}
+
+// The format word after `as`, plus `separating by <sep>` when the format is csv.
+fn parse_using_format(
+  source: ast.Expr,
+  tokens: Toks,
+) -> Result(#(ast.Expr, Toks), String) {
+  case word(tokens) {
+    Some("csv") -> {
+      let t1 = tail(tokens)
+      case word(t1) {
+        Some("separating") ->
+          case word(tail(t1)) {
+            Some("by") -> {
+              use #(separator, t2) <- result.try(parse_postfix(tail(tail(t1))))
+              Ok(#(ast.EUsing(source, ast.UsingCsv(Some(separator))), t2))
+            }
+            _ ->
+              Error(
+                "expected `by` after `separating`"
+                <> at(tail(t1)),
+              )
+          }
+        _ -> Ok(#(ast.EUsing(source, ast.UsingCsv(None)), t1))
+      }
+    }
+    Some("xlsx") -> Ok(#(ast.EUsing(source, ast.UsingXlsx), tail(tokens)))
+    Some("ods") -> Ok(#(ast.EUsing(source, ast.UsingOds), tail(tokens)))
+    Some(other) ->
+      Error(
+        "`using ... as "
+        <> other
+        <> "` is not a table format (expected `csv`, `xlsx` or `ods`)"
+        <> at(tokens),
+      )
+    None ->
+      Error(
+        "expected a table format after `as` (`csv`, `xlsx` or `ods`) but found "
+        <> token.describe(kind(tokens))
+        <> at(tokens),
+      )
+  }
+}
+
+// The identifier at the front of `tokens`, lowercased — the language matches its
+// keywords case-insensitively, and these words follow suit.
+fn word(tokens: Toks) -> Option(String) {
+  case kind(tokens) {
+    token.Ident(name) -> Some(string.lowercase(name))
+    _ -> None
+  }
 }
 
 fn parse_pattern(tokens: Toks) -> Result(#(ast.Pattern, Toks), String) {

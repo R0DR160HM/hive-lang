@@ -171,8 +171,8 @@ walkthrough (hashing, HMAC, base64 and JWTs), a `hive.sql` example backed by an
 embedded SQLite database, a tour of first-class functions and partial
 application, a tour of Hive's copy-on-binding [value
 semantics](#value-semantics-copy-on-binding), a tour of concurrency
-(spawning tasks, holding handles and awaiting one or many), and a three-file
-program showing `import` — live in
+(spawning tasks, holding handles and awaiting one or many), a three-file program
+showing `import`, and a walk through spreadsheets and `hive.file` — live in
 `code-examples/`. They double as the language's specification: each one
 compiles, builds and runs.
 
@@ -375,6 +375,51 @@ value up in a `Table` by its first cell — `row` matches a row's first element,
 `column` matches a column's top (first-row) cell — and `column` skips any row
 too short to reach the matched column.
 
+## Reading tables (`using`)
+
+`using` reads a table. Each form says in the source what it is reading, which is
+what lets the compiler pick the reader — and leave the machinery for the others
+out of the build:
+
+```hive
+using "./data.csv"                            // a comma-separated CSV
+using "./data.tsv" as csv separating by "\t"  // another separator
+using "./book.xlsx" as xlsx                   // every sheet of a workbook
+using "./book.ods" as ods                     // every table of an ODS
+using db run "SELECT * FROM users"            // SQL on an open connection
+```
+
+| form | yields |
+| ---- | ------ |
+| `using <path>` / `... as csv [separating by <sep>]` | `Result<Table, hive.TableError>` |
+| `using <path> as xlsx` / `as ods` | `Result<Table[dyn], hive.TableError>` |
+| `using <connection> run <query>` | `Result<Table, hive.sql.SqlError>` |
+
+`as csv` is optional — a bare `using <path>` is a comma-separated CSV, and
+`separating by` overrides the comma. A CSV is a single table, so it comes back as
+one `Table`. A **spreadsheet holds many**, so xlsx and ods come back as a
+`Table[dyn]` — one `Table` per sheet, in the order the document keeps them (an
+empty sheet is an empty `Table`, so the positions still line up with the
+document). Both formats are read with nothing but Go's standard library, so a
+program that opens a workbook still builds offline.
+
+Spreadsheet cells arrive as the file stores them, with one exception worth
+knowing: **xlsx keeps a date as a day count**, so a date column would read as
+`46228`. The cell's number format is consulted to catch exactly those and render
+them as `2026-07-25` (or `2026-07-25 14:30:00`, or `14:30:00` for a time-only
+cell). Numbers, booleans and cached formula results pass through untouched. An
+ods stores real dates, so nothing has to be undone there. Rows are padded to the
+widest row in their sheet, since a spreadsheet stores no trailing blanks.
+
+* **Querying** uses the `run` form: `using <connection> run <query>` runs *any*
+  SQL and returns `Result<Table, hive.sql.SqlError>`. A query that returns rows
+  yields a header row of column names followed by one row per result row; a
+  statement that returns none (INSERT/UPDATE/DDL) yields an empty table. Build
+  the query string safely with a `query` declaration, whose `{param}`s are
+  sanitized: `using db run insertUser(1, "O'Brien")`.
+
+See [`code-examples/12 - Files and Spreadsheets`](code-examples/12%20-%20Files%20and%20Spreadsheets/files-and-spreadsheets.hive).
+
 ## Standard library (`hive.*`)
 
 Each module owns its types under its own namespace — `hive.net.HttpRequest`,
@@ -464,6 +509,32 @@ A `hive.net.SocketConnection` is opaque, and a `hive.net.SocketError`'s
 * `hive.net.socketPeer(connection)` is the remote address (`"host:port"`), and
   `hive.net.socketClose(connection)` shuts the connection down.
 
+### `hive.file`
+
+General filesystem access, for the files `using` does not cover. Contents move as
+`Str`, which holds bytes rather than validated text, so a binary file survives a
+read/write round trip unchanged. Everything fallible returns
+`Result<_, hive.file.FileError>`, whose `reason` is a short tag — `"NotFound"`,
+`"Permission"`, `"Exists"` or `"Io"` — alongside the `path` and the underlying
+`message`.
+
+* `hive.file.read(path)` → `Result<Str, _>` is the whole file;
+  `hive.file.lines(path)` → `Result<Str[dyn], _>` splits it on newlines, dropping
+  the empty piece a trailing newline leaves and any Windows carriage returns.
+* `hive.file.write(path, contents)` replaces a file, creating it when absent, and
+  `hive.file.append(path, contents)` adds to the end of one. Both return
+  `Result<Int, _>` — the bytes written. Neither creates missing parent
+  directories.
+* `hive.file.exists(path)` → `Bool` (a directory counts) and
+  `hive.file.size(path)` → `Result<Int, _>` in bytes.
+* `hive.file.delete(path)` removes a file, or a directory that is already empty.
+* `hive.file.list(path)` → `Result<Str[dyn], _>` is a directory's entry names,
+  sorted and without any leading path; `hive.file.makeDir(path)` creates a
+  directory along with any missing parents, and is not an error when it is
+  already there.
+* `hive.file.copy(from, to)` → `Result<Int, _>` copies contents over `to`,
+  replacing it; `hive.file.move(from, to)` renames, which is also how one moves.
+
 ### `hive.json`
 
 The JSON library, built on the idea that Hive's type declarations *are* the
@@ -517,13 +588,8 @@ Talks to **SQLite** and **PostgreSQL**. SQLite is the pure-Go
 executable, so local databases work with no CGO and nothing to install;
 Postgres is `github.com/lib/pq`.
 
-* **Querying** reuses the `using ... with ...` form:
-  `using <connection> with <query>` runs *any* SQL and returns
-  `Result<Table, hive.sql.SqlError>`. A query that returns rows yields a header
-  row of column names followed by one row per result row; a statement that
-  returns none (INSERT/UPDATE/DDL) yields an empty table. Build the query
-  string safely with a `query` declaration, whose `{param}`s are sanitized:
-  `using db with insertUser(1, "O'Brien")`.
+* **Querying** uses the `using <connection> run <query>` form — see
+  [`## Reading tables`](#reading-tables-using) above.
 * `hive.sql.connect(driver, connString)` opens a pooled connection and returns
   `Result<hive.sql.SqlConnection, hive.sql.SqlError>`; `hive.sql.pool(driver,
   connString, maxOpen, maxIdle)` does the same with explicit pool limits;
@@ -705,8 +771,10 @@ See [`code-examples/11 - Modules`](code-examples/11%20-%20Modules/modules.hive).
 | `x is Result.Ok(v)` / `Result.Error(e)` | `x.IsOk()` + `v := x.Ok()` / `x.IsError()` + `e := x.Err()`    |
 | `x is T.Variant(a, _)` (user ADT)       | type assertion; bindings read fields, `_` binds nothing        |
 | `a is T.A(v) && p(v)`                   | short-circuiting `&&`; `v` reads through its accessor          |
-| `using p with d` (Str path)             | `hive.ReadCSV(p, d)` → `Result[Table, TableError]`             |
-| `using conn with q` (SQL connection)    | `hive.SqlQuery(conn, q)` → `Result[Table, SqlError]`           |
+| `using p` / `using p as csv separating by d` | `hive.ReadCSV(p, d)` → `Result[Table, TableError]`       |
+| `using p as xlsx` / `as ods`            | `hive.ReadXlsx(p)` / `hive.ReadOds(p)` → `Result[[]Table, TableError]` |
+| `using conn run q`                      | `hive.SqlQuery(conn, q)` → `Result[Table, SqlError]`           |
+| `if <call> is Result.Ok(v)`             | `if _u := <call>; _u.IsOk() { v := _u.Ok()` (evaluated once)    |
 | `"{a} and {b}"`                         | concatenation, non-`Str` pieces via `hive.ToStr`               |
 | `[x, y] + [z]`                          | `hive.Concat([]T{x, y}, []T{z})`                               |
 | `v1 == v2` / `v1 != v2` (vectors)       | `hive.VecEq(v1, v2)` / `!hive.VecEq(v1, v2)` (structural)      |
@@ -784,7 +852,8 @@ src/hive/modules.gleam    resolves the `import` graph (rejecting cycles) and
 src/hive/bounds.gleam     flow-sensitive vector index/slice bounds checking
 src/hive/codegen.gleam    AST          -> Go source (with local type inference)
 src/hive/runtime.gleam    go.mod, the core Go `hive` runtime, and one Go
-                          source per `hive.*` module (written on demand)
+                          source per module written on demand — the `hive.*`
+                          library plus the xlsx/ods readers
 src/hive/compiler.gleam   glue: source -> Go source, purity checks for funcs
 src/hive/cli.gleam        writes the Go project, drives the Go toolchain
 ```

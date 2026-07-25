@@ -624,10 +624,20 @@ fn rewrite_expr(
       use pattern <- result.try(rewrite_pattern(rw, pattern))
       Ok(ast.EIs(subject, pattern))
     }
-    ast.EUsing(path, delimiter) -> {
-      use path <- result.try(rewrite_expr(rw, path, locals))
-      use delimiter <- result.try(rewrite_optional(rw, delimiter, locals))
-      Ok(ast.EUsing(path, delimiter))
+    ast.EUsing(source, kind) -> {
+      use source <- result.try(rewrite_expr(rw, source, locals))
+      use kind <- result.try(case kind {
+        ast.UsingCsv(separator) -> {
+          use separator <- result.try(rewrite_optional(rw, separator, locals))
+          Ok(ast.UsingCsv(separator))
+        }
+        ast.UsingQuery(query) -> {
+          use query <- result.try(rewrite_expr(rw, query, locals))
+          Ok(ast.UsingQuery(query))
+        }
+        ast.UsingXlsx | ast.UsingOds -> Ok(kind)
+      })
+      Ok(ast.EUsing(source, kind))
     }
     ast.EWith(value, typ) -> {
       use value <- result.try(rewrite_expr(rw, value, locals))
@@ -805,10 +815,10 @@ fn pattern_bindings(e: ast.Expr) -> List(String) {
           ast.IExpr(inner) -> pattern_bindings(inner)
         }
       })
-    ast.EUsing(path, delimiter) ->
+    ast.EUsing(source, kind) ->
       list.append(
-        pattern_bindings(path),
-        list.flat_map(option.values([delimiter]), pattern_bindings),
+        pattern_bindings(source),
+        list.flat_map(ast.using_exprs(kind), pattern_bindings),
       )
     ast.EWith(value, _) -> pattern_bindings(value)
     ast.EAwait(value) -> pattern_bindings(value)

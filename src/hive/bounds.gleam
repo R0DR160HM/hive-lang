@@ -358,8 +358,8 @@ fn check_expr(env: Env, e: ast.Expr) -> Result(Nil, String) {
       |> result.map(fn(_) { Nil })
     ast.EVector(items) -> check_exprs(env, items)
     ast.EIs(subject, _) -> check_expr(env, subject)
-    ast.EUsing(path, delim) ->
-      check_exprs(env, [path, ..option.values([delim])])
+    ast.EUsing(source, kind) ->
+      check_exprs(env, [source, ..ast.using_exprs(kind)])
     ast.EWith(value, _) -> check_expr(env, value)
     ast.EAwait(value) -> check_expr(env, value)
     ast.EInt(_)

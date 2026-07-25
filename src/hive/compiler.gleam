@@ -487,8 +487,8 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
   case e {
     // `using` (reading a file) is I/O, which funcs may now do too, so there is
     // nothing to reject here — just walk its sub-expressions.
-    ast.EUsing(path, delim) ->
-      check_exprs(ctx, [path, ..option.values([delim])])
+    ast.EUsing(source, kind) ->
+      check_exprs(ctx, [source, ..ast.using_exprs(kind)])
     // `hive.json.parse(text) with Type` — the only place `with` is allowed.
     ast.EWith(value, typ) ->
       case value {
@@ -579,6 +579,10 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
               use _ <- result.try(check_net_call(ctx, fname, args))
               check_args(ctx, args)
             }
+            "file" -> {
+              use _ <- result.try(check_file_call(fname, args))
+              check_args(ctx, args)
+            }
             "json" -> {
               use _ <- result.try(check_json_call(fname, args))
               check_args(ctx, args)
@@ -615,7 +619,8 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
               Error(
                 "unknown builtin namespace `hive."
                 <> ns
-                <> "` (available: net, json, crypto, sql, conv, env, term, task, time)",
+                <> "` (available: net, file, json, crypto, sql, conv, env, "
+                <> "term, task, time)",
               )
           }
       }
@@ -886,6 +891,33 @@ fn find_duplicate(names: List(String)) -> Option(String) {
         True -> Some(n)
         False -> find_duplicate(rest)
       }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// hive.file builtins
+// ---------------------------------------------------------------------------
+
+fn check_file_call(fname: String, args: List(ast.Arg)) -> Result(Nil, String) {
+  case fname {
+    "read" -> check_arity("`hive.file.read`", args, ["path"])
+    "lines" -> check_arity("`hive.file.lines`", args, ["path"])
+    "exists" -> check_arity("`hive.file.exists`", args, ["path"])
+    "size" -> check_arity("`hive.file.size`", args, ["path"])
+    "delete" -> check_arity("`hive.file.delete`", args, ["path"])
+    "list" -> check_arity("`hive.file.list`", args, ["path"])
+    "makeDir" -> check_arity("`hive.file.makeDir`", args, ["path"])
+    "write" -> check_arity("`hive.file.write`", args, ["path", "contents"])
+    "append" -> check_arity("`hive.file.append`", args, ["path", "contents"])
+    "copy" -> check_arity("`hive.file.copy`", args, ["from", "to"])
+    "move" -> check_arity("`hive.file.move`", args, ["from", "to"])
+    _ ->
+      Error(
+        "unknown builtin `hive.file."
+        <> fname
+        <> "` (available: read, lines, write, append, exists, size, delete, "
+        <> "list, makeDir, copy, move)",
+      )
   }
 }
 

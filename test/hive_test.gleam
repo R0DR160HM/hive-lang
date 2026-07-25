@@ -35,7 +35,7 @@ type ParsingResult {
 }
 
 proc parse(): ParsingResult {
-\tcsv := using \"./test.csv\" with \";\"
+\tcsv := using \"./test.csv\" as csv separating by \";\"
 \tif csv is Result.Ok(table) {
 \t\tif len(table) > 1 {
 \t\t\treturn ParsingResult.Success(table[1:], hive.time.now())
@@ -1147,13 +1147,13 @@ pub fn unknown_crypto_builtin_is_rejected_test() {
 pub fn sql_connect_and_query_lower_test() {
   let go =
     compile(
-      "proc main(): void {\n\topened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"./x.db\")\n\tif opened is Result.Ok(db) {\n\t\tresult := using db with \"SELECT 1\"\n\t\tif result is Result.Ok(rows) {\n\t\t\techo rows\n\t\t}\n\t}\n}\n",
+      "proc main(): void {\n\topened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"./x.db\")\n\tif opened is Result.Ok(db) {\n\t\tresult := using db run \"SELECT 1\"\n\t\tif result is Result.Ok(rows) {\n\t\t\techo rows\n\t\t}\n\t}\n}\n",
     )
   should.be_true(string.contains(
     go,
     "hive.SqlConnect(hive.DatabaseDriver{Name: \"sqlite\"}, \"./x.db\")",
   ))
-  // `using <connection> with <query>` lowers to a SQL query, not a CSV read.
+  // `using <connection> run <query>` lowers to a SQL query, not a CSV read.
   should.be_true(string.contains(go, "hive.SqlQuery(db, \"SELECT 1\")"))
 }
 
@@ -1174,7 +1174,7 @@ pub fn using_string_still_reads_csv_test() {
   // The `using` overload must not disturb CSV reads over a Str path.
   let go =
     compile(
-      "proc main(): void {\n\tx := using \"./a.csv\" with \";\"\n\tif x is Result.Ok(t) {\n\t\techo t\n\t}\n}\n",
+      "proc main(): void {\n\tx := using \"./a.csv\" as csv separating by \";\"\n\tif x is Result.Ok(t) {\n\t\techo t\n\t}\n}\n",
     )
   should.be_true(string.contains(go, "hive.ReadCSV(\"./a.csv\", \";\")"))
 }
@@ -1564,6 +1564,194 @@ pub fn a_program_without_imports_is_unchanged_test() {
 }
 
 // ---------------------------------------------------------------------------
+// The `using` forms
+// ---------------------------------------------------------------------------
+
+pub fn bare_using_is_a_comma_separated_csv_test() {
+  let go = compile("proc main(): void {\n\tt := using \"./a.csv\"\n\techo t\n}\n")
+  should.be_true(string.contains(go, "hive.ReadCSV(\"./a.csv\", \",\")"))
+}
+
+pub fn using_as_csv_defaults_to_a_comma_test() {
+  let go =
+    compile("proc main(): void {\n\tt := using \"./a.csv\" as csv\n\techo t\n}\n")
+  should.be_true(string.contains(go, "hive.ReadCSV(\"./a.csv\", \",\")"))
+}
+
+pub fn using_as_csv_takes_a_separator_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tt := using \"./a.csv\" as csv separating by \";\"\n\techo t\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.ReadCSV(\"./a.csv\", \";\")"))
+}
+
+pub fn using_as_xlsx_reads_every_sheet_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tbook := using \"./b.xlsx\" as xlsx\n\tif book is Result.Ok(sheets) {\n\t\techo len(sheets)\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.ReadXlsx(\"./b.xlsx\")"))
+}
+
+pub fn using_as_ods_reads_every_sheet_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tbook := using \"./b.ods\" as ods\n\tif book is Result.Ok(sheets) {\n\t\techo len(sheets)\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.ReadOds(\"./b.ods\")"))
+}
+
+pub fn a_spreadsheet_yields_a_vector_of_tables_test() {
+  // A sheet indexed out of the result has to infer as a Table, so `column` and
+  // `row` apply to it. (The index needs the bounds checker's usual guard.)
+  let go =
+    compile(
+      "proc main(): void {\n\tbook := using \"./b.xlsx\" as xlsx\n\tif book is Result.Ok(sheets) {\n\t\tif 0 < len(sheets) {\n\t\t\techo column(sheets[0], \"item\")\n\t\t}\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.Column(sheets[0], \"item\")"))
+  // The Ok payload is a slice of Tables, which is what makes that index a Table.
+  should.be_true(string.contains(go, "sheets := "))
+}
+
+pub fn using_run_lowers_to_a_sql_query_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\topened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"./x.db\")\n\tif opened is Result.Ok(db) {\n\t\tresult := using db run \"SELECT 1\"\n\t\tif result is Result.Ok(rows) {\n\t\t\techo rows\n\t\t}\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.SqlQuery(db, \"SELECT 1\")"))
+}
+
+pub fn old_using_with_syntax_is_rejected_test() {
+  // The one form that meant both a delimiter and a query is now two.
+  let delimited =
+    compiler.compile(
+      "proc main(): void {\n\tt := using \"./a.csv\" with \";\"\n\techo t\n}\n",
+    )
+  should.be_error(delimited)
+  case delimited {
+    Error(message) -> {
+      should.be_true(string.contains(message, "separating by"))
+      should.be_true(string.contains(message, "run <query>"))
+    }
+    Ok(_) -> panic as "expected an error"
+  }
+}
+
+pub fn unknown_using_format_is_rejected_test() {
+  let result =
+    compiler.compile(
+      "proc main(): void {\n\tt := using \"./a.parquet\" as parquet\n\techo t\n}\n",
+    )
+  should.be_error(result)
+}
+
+pub fn spreadsheet_readers_are_only_built_when_asked_for_test() {
+  // A CSV read needs nothing beyond the core runtime; a spreadsheet is what
+  // pulls archive/zip and encoding/xml in.
+  should.equal(
+    used_modules("proc main(): void {\n\tt := using \"./a.csv\"\n\techo t\n}\n"),
+    [],
+  )
+  let sheets =
+    used_modules(
+      "proc main(): void {\n\tb := using \"./b.xlsx\" as xlsx\n\techo b\n}\n",
+    )
+  should.equal(sheets, ["sheets"])
+  let ods =
+    used_modules(
+      "proc main(): void {\n\tb := using \"./b.ods\" as ods\n\techo b\n}\n",
+    )
+  should.equal(ods, ["sheets"])
+}
+
+// ---------------------------------------------------------------------------
+// hive.file
+// ---------------------------------------------------------------------------
+
+pub fn file_calls_lower_to_the_runtime_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tif hive.file.write(\"a.txt\", \"x\") is Result.Ok(n) {\n\t\techo n\n\t}\n\tif hive.file.read(\"a.txt\") is Result.Ok(text) {\n\t\techo text\n\t}\n\tif hive.file.lines(\"a.txt\") is Result.Ok(lines) {\n\t\techo len(lines)\n\t}\n\techo hive.file.exists(\"a.txt\")\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.FileWrite(\"a.txt\", \"x\")"))
+  should.be_true(string.contains(go, "hive.FileRead(\"a.txt\")"))
+  should.be_true(string.contains(go, "hive.FileLines(\"a.txt\")"))
+  should.be_true(string.contains(go, "hive.FileExists(\"a.txt\")"))
+}
+
+pub fn file_error_fields_are_typed_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tif hive.file.read(\"a.txt\") is Result.Error(error) {\n\t\techo error.reason\n\t\techo error.path\n\t\techo error.message\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "error.Reason"))
+  should.be_true(string.contains(go, "error.Path"))
+  should.be_true(string.contains(go, "error.Message"))
+}
+
+pub fn file_calls_accept_named_arguments_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tif hive.file.copy(to: \"b.txt\", from: \"a.txt\") is Result.Ok(n) {\n\t\techo n\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.FileCopy(\"a.txt\", \"b.txt\")"))
+}
+
+pub fn unknown_file_builtin_is_rejected_test() {
+  let result =
+    compiler.compile("proc main(): void {\n\thive.file.chmod(\"a.txt\")\n}\n")
+  should.be_error(result)
+}
+
+pub fn file_module_is_only_built_when_used_test() {
+  should.equal(
+    used_modules(
+      "proc main(): void {\n\techo hive.file.exists(\"a.txt\")\n}\n",
+    ),
+    ["file"],
+  )
+}
+
+// ---------------------------------------------------------------------------
+// A pattern's subject is evaluated once
+// ---------------------------------------------------------------------------
+
+pub fn a_matched_call_runs_once_test() {
+  // Codegen reads a subject to test it and again for each value it binds, so a
+  // call has to be held in a temporary first — otherwise the write happens twice.
+  let go =
+    compile(
+      "proc main(): void {\n\tif hive.file.write(\"a.txt\", \"x\") is Result.Ok(n) {\n\t\techo n\n\t}\n}\n",
+    )
+  should.equal(
+    string.split(go, "hive.FileWrite(\"a.txt\", \"x\")") |> list.length,
+    2,
+  )
+  should.be_true(string.contains(go, ":= hive.FileWrite(\"a.txt\", \"x\"); "))
+}
+
+pub fn a_matched_using_runs_once_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tif using \"./a.csv\" is Result.Ok(t) {\n\t\techo t\n\t}\n}\n",
+    )
+  should.equal(
+    string.split(go, "hive.ReadCSV(\"./a.csv\", \",\")") |> list.length,
+    2,
+  )
+}
+
+pub fn a_repeatable_subject_is_not_hoisted_test() {
+  // A plain local costs nothing to read twice, so it stays inline.
+  let go =
+    compile(
+      "proc main(): void {\n\tr := using \"./a.csv\"\n\tif r is Result.Ok(t) {\n\t\techo t\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "if r.IsOk() {"))
+}
+
+// ---------------------------------------------------------------------------
 // The shipped code examples must always compile
 // ---------------------------------------------------------------------------
 
@@ -1588,6 +1776,14 @@ pub fn modules_example_compiles_test() {
   // Read through compile_file, since this one spans three files.
   let assert Ok(_) =
     compiler.compile_file("code-examples/11 - Modules/modules.hive")
+}
+
+pub fn files_and_spreadsheets_example_compiles_test() {
+  let assert Ok(src) =
+    simplifile.read(
+      "code-examples/12 - Files and Spreadsheets/files-and-spreadsheets.hive",
+    )
+  let assert Ok(_) = compiler.compile(src)
 }
 
 pub fn basic_io_example_compiles_test() {
