@@ -486,7 +486,7 @@ pub fn assign_to_parameter_is_rejected_test() {
 }
 
 // ---------------------------------------------------------------------------
-// The vector / string builtins (len, bytes, append, join, split)
+// The vector / string builtins (len, bytes, append, join, split, indexOf)
 // ---------------------------------------------------------------------------
 
 pub fn len_of_vector_counts_elements_test() {
@@ -570,6 +570,46 @@ pub fn join_lowers_to_runtime_test() {
       "func f(): Str {\n\treturn join([\"a\", \"b\"], \"-\")\n}\nproc main(): void {}\n",
     )
   should.be_true(string.contains(go, "hive.Join([]string{\"a\", \"b\"}, \"-\")"))
+}
+
+pub fn index_of_vector_lowers_to_runtime_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tv := [\"a\", \"b\"]\n\tr := indexOf(v, \"b\")\n\tif r is Result.Ok(i) {\n\t\techo i\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.IndexOf(v, \"b\")"))
+  should.be_true(string.contains(go, "r.IsOk()"))
+}
+
+pub fn index_of_string_searches_substring_test() {
+  // A Str subject picks the substring overload, whose index counts runes.
+  let go =
+    compile(
+      "proc main(): void {\n\ts := \"hello\"\n\tr := indexOf(s, \"ll\")\n\tif r is Result.Ok(i) {\n\t\techo i\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.IndexOfStr(s, \"ll\")"))
+}
+
+pub fn index_of_renders_the_sought_value_as_the_element_type_test() {
+  // Searching a Table for a row: the literal must land as a []string, not as
+  // whatever a bare vector literal would default to.
+  let go =
+    compile(
+      "proc main(): void {\n\tStr[dyn][dyn] t = [[\"a\", \"b\"]]\n\tr := indexOf(t, [\"a\", \"b\"])\n\tif r is Result.Ok(i) {\n\t\techo t[i]\n\t}\n}\n",
+    )
+  should.be_true(string.contains(
+    go,
+    "hive.IndexOf(t, []string{\"a\", \"b\"})",
+  ))
+}
+
+pub fn index_of_miss_carries_false_test() {
+  // The Error payload is a plain Bool, so it binds and echoes as one.
+  let go =
+    compile(
+      "proc main(): void {\n\tv := [\"a\"]\n\tr := indexOf(v, \"z\")\n\tif r is Result.Error(missed) {\n\t\techo missed\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "missed := r.Err()"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1936,6 +1976,129 @@ pub fn reassignment_inside_guard_invalidates_bound_test() {
   |> should.be_error
 }
 
+pub fn reassignment_inside_a_branch_invalidates_a_static_length_test() {
+  // The branch may or may not have run, and the vector it binds is shorter —
+  // so after the `if`, `v`'s length is no longer the literal's.
+  compiler.compile(
+    "proc main(): void {\n\tmut v := [\"a\", \"b\", \"c\"]\n\tif len(v) > 0 {\n\t\tv = [\"x\"]\n\t}\n\techo v[2]\n}\n",
+  )
+  |> should.be_error
+}
+
+pub fn reassignment_inside_a_loop_invalidates_a_static_length_test() {
+  compiler.compile(
+    "proc main(): void {\n\tmut v := [\"a\", \"b\", \"c\"]\n\tfor i := 0; i < 2; i = i + 1 {\n\t\tv = [\"x\"]\n\t}\n\techo v[2]\n}\n",
+  )
+  |> should.be_error
+}
+
+pub fn declared_length_survives_a_matching_reassignment_test() {
+  // A *declared* length is different: every assignment is held to it, so it is
+  // still the vector's length after the branch.
+  compiler.compile(
+    "proc main(): void {\n\tmut Str[3] v = [\"a\", \"b\", \"c\"]\n\tif len(v) > 0 {\n\t\tv = [\"x\", \"y\", \"z\"]\n\t}\n\techo v[2]\n}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn element_write_inside_a_branch_keeps_the_static_length_test() {
+  // Writing *through* the name replaces an element, not the vector, so the
+  // length the compiler knows is still the right one.
+  compiler.compile(
+    "proc main(): void {\n\tmut v := [\"a\", \"b\", \"c\"]\n\tif len(v) > 0 {\n\t\tv[0] = \"x\"\n\t}\n\techo v[2]\n}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn append_inside_a_branch_keeps_the_static_length_test() {
+  // `append` only grows the vector, so every position already proven stays.
+  compiler.compile(
+    "proc main(): void {\n\tmut v := [\"a\", \"b\", \"c\"]\n\tif len(v) > 0 {\n\t\tappend(v, \"x\")\n\t}\n\techo v[2]\n}\n",
+  )
+  |> should.be_ok
+}
+
+// --- Declared lengths are promises the whole program is held to ---
+
+pub fn declaration_rejects_a_vector_of_the_wrong_length_test() {
+  compiler.compile(
+    "proc main(): void {\n\tStr[3] v = [\"a\", \"b\"]\n\techo v[0]\n}\n",
+  )
+  |> should.be_error
+}
+
+pub fn assignment_rejects_a_vector_of_the_wrong_length_test() {
+  compiler.compile(
+    "proc main(): void {\n\tmut Str[3] v = [\"a\", \"b\", \"c\"]\n\tv = [\"x\"]\n\techo v[0]\n}\n",
+  )
+  |> should.be_error
+}
+
+pub fn argument_rejects_a_vector_of_the_wrong_length_test() {
+  // Without this the callee's body would index a `Str[3]` that isn't one.
+  compiler.compile(
+    "func f(v: Str[3]): Str {\n\treturn v[2]\n}\nproc main(): void {\n\techo f([\"a\"])\n}\n",
+  )
+  |> should.be_error
+}
+
+pub fn return_rejects_a_vector_of_the_wrong_length_test() {
+  compiler.compile(
+    "func f(): Str[3] {\n\treturn [\"a\", \"b\"]\n}\nproc main(): void {\n\techo f()[0]\n}\n",
+  )
+  |> should.be_error
+}
+
+pub fn element_slot_rejects_a_vector_of_the_wrong_length_test() {
+  // `t[0]` is a `Str[2]` slot, so the row written into it must be one.
+  compiler.compile(
+    "proc main(): void {\n\tmut Str[2][2] t = [[\"a\", \"b\"], [\"c\", \"d\"]]\n\tt[0] = [\"x\"]\n\techo t[0][0]\n}\n",
+  )
+  |> should.be_error
+}
+
+pub fn nested_rows_of_a_literal_are_checked_test() {
+  // `Str[2][3]`: two rows of three, and the second row is short.
+  compiler.compile(
+    "proc main(): void {\n\tStr[2][3] t = [[\"a\", \"b\", \"c\"], [\"d\", \"e\"]]\n\techo t[0][0]\n}\n",
+  )
+  |> should.be_error
+}
+
+pub fn a_length_that_is_not_known_cannot_fill_a_static_slot_test() {
+  // `split` can return any number of parts, so it is not a `Str[3]`.
+  compiler.compile(
+    "proc main(): void {\n\tStr[3] parts = split(\"a,b,c\", \",\")\n\techo parts[2]\n}\n",
+  )
+  |> should.be_error
+}
+
+pub fn declared_length_accepts_a_call_return_and_a_concatenation_test() {
+  // A declared return type carries its length to the call site, and `+`
+  // concatenates, so both are known well enough to fill a `Str[3]`.
+  compiler.compile(
+    "func three(): Str[3] {\n\treturn [\"a\", \"b\", \"c\"]\n}\nproc main(): void {\n\tStr[3] a = three()\n\tStr[2] b = [\"x\", \"y\"]\n\tStr[3] c = b + [\"z\"]\n\techo a[2] + c[2]\n}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn dynamic_declarations_promise_nothing_test() {
+  // `[dyn]` says the length varies, so any vector fits — and indexing it still
+  // needs a guard.
+  compiler.compile(
+    "proc main(): void {\n\tStr[dyn] v = [\"a\"]\n\tStr[dyn, 2] w = [\"a\", \"b\", \"c\"]\n\techo len(v) + len(w)\n}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn a_local_that_shadows_a_callable_is_not_held_to_its_parameters_test() {
+  // `pick` here is a function value, not the `Str[3]`-taking declaration.
+  compiler.compile(
+    "func pick(v: Str[3]): Str {\n\treturn v[0]\n}\nfunc take(v: Str[dyn]): Str {\n\treturn \"\"\n}\nproc main(): void {\n\tpick := take\n\techo pick([\"a\"])\n}\n",
+  )
+  |> should.be_ok
+}
+
 // --- Computed indices are conservatively rejected ---
 
 pub fn computed_index_is_rejected_test() {
@@ -2003,6 +2166,67 @@ pub fn variable_guard_does_not_prove_index_one_test() {
   // `len(v) >= 1` (from `i >= 0 && i < len(v)`) does not prove `1 < len(v)`.
   compiler.compile(
     "func f(v: Str[dyn], i: Int): Str {\n\tif i >= 0 && i < len(v) {\n\t\treturn v[1]\n\t}\n\treturn \"\"\n}\nproc main(): void {}\n",
+  )
+  |> should.be_error
+}
+
+// --- `indexOf`: an Ok payload is a bounded index by construction ---
+
+pub fn index_of_result_needs_no_guard_test() {
+  // `i` came out of a search of `v`, so it is a position `v` has: no
+  // `i >= 0 && i < len(v)` guard is required to use it.
+  compiler.compile(
+    "func f(v: Str[dyn]): Str {\n\tr := indexOf(v, \"x\")\n\tif r is Result.Ok(i) {\n\t\treturn v[i]\n\t}\n\treturn \"\"\n}\nproc main(): void {}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn index_of_matched_inline_needs_no_guard_test() {
+  // The same when the call is narrowed on the spot rather than bound first.
+  compiler.compile(
+    "func f(v: Str[dyn]): Str {\n\tif indexOf(v, \"x\") is Result.Ok(i) {\n\t\treturn v[i]\n\t}\n\treturn \"\"\n}\nproc main(): void {}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn index_of_result_proves_the_vector_is_non_empty_test() {
+  // `0 <= i < len(v)` forces `len(v) >= 1`, so the literal index 0 rides along.
+  compiler.compile(
+    "func f(v: Str[dyn]): Str {\n\tif indexOf(v, \"x\") is Result.Ok(i) {\n\t\techo v[i]\n\t\treturn v[0]\n\t}\n\treturn \"\"\n}\nproc main(): void {}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn index_of_index_does_not_license_another_vector_test() {
+  // An index found in `v` says nothing about `w`'s length.
+  compiler.compile(
+    "func f(v: Str[dyn], w: Str[dyn]): Str {\n\tr := indexOf(v, \"x\")\n\tif r is Result.Ok(i) {\n\t\treturn w[i]\n\t}\n\treturn \"\"\n}\nproc main(): void {}\n",
+  )
+  |> should.be_error
+}
+
+pub fn index_of_index_is_dropped_when_the_vector_is_rebound_test() {
+  // The searched vector is replaced before the result is used, so the position
+  // it reported may no longer exist.
+  compiler.compile(
+    "proc main(): void {\n\tmut v := [\"a\", \"b\", \"c\"]\n\tr := indexOf(v, \"c\")\n\tv = [\"z\"]\n\tif r is Result.Ok(i) {\n\t\techo v[i]\n\t}\n}\n",
+  )
+  |> should.be_error
+}
+
+pub fn index_of_index_survives_an_append_test() {
+  // `append` only grows the vector, so a position it already had stays valid.
+  compiler.compile(
+    "proc main(): void {\n\tmut Str[dyn] v = [\"a\", \"b\"]\n\tr := indexOf(v, \"b\")\n\tappend(v, \"c\")\n\tif r is Result.Ok(i) {\n\t\techo v[i]\n\t}\n}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn is_binding_shadows_an_earlier_bounded_index_test() {
+  // The inner `is` rebinds `i` to a position in `b`; what was proven about the
+  // outer `i` (a position in `a`) no longer holds for it.
+  compiler.compile(
+    "func f(a: Str[dyn], b: Str[dyn]): Str {\n\tra := indexOf(a, \"x\")\n\tif ra is Result.Ok(i) {\n\t\trb := indexOf(b, \"y\")\n\t\tif rb is Result.Ok(i) {\n\t\t\treturn a[i]\n\t\t}\n\t}\n\treturn \"\"\n}\nproc main(): void {}\n",
   )
   |> should.be_error
 }

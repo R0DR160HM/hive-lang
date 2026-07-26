@@ -194,7 +194,11 @@ compiles, builds and runs.
 * **Strings** (`Str`) are UTF-8, support `"{expr}"` interpolation, and
   backtick multiline strings whose indentation is removed at compile time.
 * **Vectors** are memory-contiguous and static (`Str[3]`) or dynamic
-  (`Str[dyn]`, `Str[dyn, 2]` with an initial size). All of them lower to Go
+  (`Str[dyn]`, `Str[dyn, 2]` with an initial size). A static length is
+  enforced, not advertised: a `Str[3]` slot only ever takes a vector of three,
+  wherever the value comes from (see
+  [vector bounds](#scope)), which is what lets `v[2]` on one compile with no
+  guard. All of them lower to Go
   slices; `+` concatenates into a new vector. `==` and `!=` compare vectors
   structurally — same length, then element by element (nested vectors and a
   `Table` compare the same way), short-circuiting on the first difference;
@@ -209,8 +213,8 @@ compiles, builds and runs.
   and two `mut` bindings always alias, deliberately sharing mutable state.
   `Table` is an alias for `Str[dyn][dyn]`. See
   [Value semantics](#value-semantics-copy-on-binding) for the full rule and a
-  runnable tour. (For `append`, `join`, `split`, `len` and `bytes` see
-  [Built-in functions](#built-in-functions).)
+  runnable tour. (For `append`, `join`, `split`, `indexOf`, `len` and `bytes`
+  see [Built-in functions](#built-in-functions).)
 * **Mutability** — variables are immutable by default; prefix a declaration
   with `mut` (`mut x := ...`, `mut Str[dyn] v = ...`) to allow reassignment
   (`x = ...`, `v[0] = ...`) and `append`. Conceptually a `mut T` is a
@@ -364,6 +368,8 @@ argument type.
 | `append(vector, value)` | `append(T[dyn], T): void`    | Grows a **mutable** dynamic vector in place with one more element.   |
 | `join(vector, sep)`     | `join(Str[], Str): Str`      | Concatenates a `Str` vector into one string, `sep` between elements. |
 | `split(str, sep)`       | `split(Str, Str): Str[]`     | Splits a string on `sep` into a `Str` vector (inverse of `join`).    |
+| `indexOf(vector, value)`| `indexOf(T[], T): Result<Int, Bool>` | Position of the first element equal to `value`, else `Error(false)`. |
+| `indexOf(str, sub)`     | `indexOf(Str, Str): Result<Int, Bool>` | Position, in characters, of the first occurrence of `sub`, else `Error(false)`. |
 | `row(table, key)`       | `row(Table, Str): Str[dyn]`  | The row whose first cell equals `key`, else `[]`.                    |
 | `column(table, key)`    | `column(Table, Str): Str[dyn]`| The column whose top (first-row) cell equals `key`, else `[]`.      |
 
@@ -374,6 +380,39 @@ requires its target to be `mut` — it is the in-place way to grow a
 value up in a `Table` by its first cell — `row` matches a row's first element,
 `column` matches a column's top (first-row) cell — and `column` skips any row
 too short to reach the matched column.
+
+### `indexOf` returns an index you can use
+
+`indexOf` searches a vector for an element (compared the way `==` compares it, so
+a vector of vectors matches structurally) or a `Str` for a substring. It is
+fallible, so it answers with a `Result`: `Ok(i)` carries the position, and the
+`Error` payload is just `false` — there is nothing to say about a miss beyond
+that it missed.
+
+The point of returning a position rather than a `-1` is that **an `Ok` payload is
+always a position the vector really has**. The bounds checker knows that, so the
+index arrives already proven `>= 0` and `< len(v)` — inside the `Ok` branch you
+index with no guard of your own:
+
+```hive
+found := indexOf(names, "bob")
+if found is Result.Ok(i) {
+    echo "{i}: {names[i]}"   // no `i >= 0 && i < len(names)` needed
+} else if found is Result.Error(_) {
+    echo "no bob here"
+}
+```
+
+The proof is tied to the vector that was searched, and only for as long as that
+vector means the same thing: an index found in `a` still needs a guard to index
+`b`, and rebinding the vector (`v = [...]`) between the search and the use drops
+it. Matching the call inline — `if indexOf(names, "bob") is Result.Ok(i)` —
+works the same way.
+
+On a `Str` the position counts **characters** (UTF-8 runes), so it lines up with
+what `len` reports there. Searching an empty `Str` never succeeds, not even for
+an empty needle: that keeps the same promise the vector form makes — an `Ok`
+index always points at something that is really there.
 
 ## Reading tables (`using`)
 
@@ -597,6 +636,44 @@ Postgres is `github.com/lib/pq`.
 * The `driver` is a `hive.sql.DatabaseDriver`, built with
   `hive.sql.DatabaseDriver.SQLite()`, `.PostgreSQL()`, or `.Other(name)` for
   any other registered `database/sql` driver.
+
+A `hive.sql.SqlConnection` is a **connection pool**, not a single connection, so
+one is safe to hold for the life of the program and to share across virtual
+threads — open it once in `main` and pass it along (a partial application like
+`handler(_, db)` is the usual way). Never open one per query: for a file-backed
+database that is merely wasteful, but for an in-memory one it is worse than that.
+
+#### In-memory SQLite
+
+A plain `:memory:` database belongs to the **connection**, not the process: each
+connection gets a private, empty database that vanishes when it closes. Combined
+with pooling, that has a sharp edge — under concurrency the pool opens further
+connections, and each one lands on a database of its own:
+
+| connection string | one query at a time | eight at once |
+| ----------------- | ------------------- | ------------- |
+| `:memory:`, default pool | works | fails intermittently: `no such table` |
+| `:memory:`, `pool(…, 1, 1)` | works | works, one query at a time |
+| `file::memory:?cache=shared` | works | works |
+
+The first row is the trap: a program that passes every test single-threaded starts
+failing once requests overlap — exactly what happens behind
+`hive.net.httpServe`, which runs each request on its own virtual thread.
+
+So for an in-memory database, ask for a **shared cache**:
+
+```hive
+opened := hive.sql.pool(hive.sql.DatabaseDriver.SQLite(), "file::memory:?cache=shared", 8, 1)
+```
+
+Every pooled connection then sees the same database. Pinning the pool to one
+connection instead — `hive.sql.pool(driver, ":memory:", 1, 1)` — is also correct,
+but it serializes every query and gives up the concurrency you had. Two things to
+know about shared cache: the database lives only while at least one connection is
+open, which is what the `maxIdle` of 1 above guarantees rather than leaves to the
+pool's defaults; and it locks at table granularity, so a very write-heavy
+concurrent workload can meet contention that a file-backed database in WAL mode
+would not.
 
 > **Build note:** SQL programs link real Go drivers, so the **first** build of
 > a program that uses `hive.sql` runs `go mod tidy` to fetch them (network
@@ -876,6 +953,38 @@ vector with a literal is decided outright (`v[2]` on a `Str[3]` compiles,
 compiler can see it — `if i >= 0 && i < len(v) { v[i] }`, the condition of a
 counting `for` loop, or a `for each`, which never indexes. The `bounds`
 keyword is shorthand for that guard: `if v bounds i { ... }` means exactly
-`if i >= 0 && i < len(v) { ... }`. Anything the pass can't prove safe (a
-computed index, an unusual guard) is a compile error rather than a runtime
-crash.
+`if i >= 0 && i < len(v) { ... }`; an index that came from
+[`indexOf`](#indexof-returns-an-index-you-can-use) needs no guard at all.
+Anything the pass can't prove safe (a computed index, an unusual guard) is a
+compile error rather than a runtime crash.
+
+A **declared** length is a promise, not a hint. `Str[3]` means three, so every
+value that lands in such a slot — an initialiser, a later assignment, an
+argument, a returned value, a row written into a `Str[2][2]` — has to be a
+vector of exactly that many elements, and a length the compiler can't see is
+rejected too:
+
+```hive
+mut Str[3] v = ["a", "b", "c"]
+v = ["x", "y", "z"]              // fine — still three
+v = ["x"]                        // compile error: `v` is declared `Str[3]`
+Str[3] parts = split(line, ",")  // compile error: that length isn't known
+```
+
+Because the promise is kept everywhere, a declared length is never lost: `v[2]`
+above stays legal after the reassignment, and a `Str[3]` parameter can be
+indexed inside the callee without a guard, since every call site was checked.
+The escape, as always, is `[dyn]`: `Str[dyn]` promises nothing and guards its
+indexes.
+
+An **inferred** length is weaker, because nothing constrains what comes next:
+`mut v := ["a", "b", "c"]` knows it holds three today, and keeps that through
+writes *through* the name (`v[i] = x` swaps an element without changing the
+length, `append(v, x)` only grows it), but loses it the moment the name is
+rebound — including in a branch or loop body that may not even run:
+
+```hive
+mut v := ["a", "b", "c"]
+if changed { v = ["x"] }
+echo v[2]                   // compile error: v's length is no longer known
+```

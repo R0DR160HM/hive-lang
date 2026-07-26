@@ -1920,6 +1920,9 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
         ast.EIdent("split") -> TyVec(TyStr)
         ast.EIdent("row") -> TyVec(TyStr)
         ast.EIdent("column") -> TyVec(TyStr)
+        // `indexOf` yields the position it found, or an Error carrying `false`
+        // (there is nothing to say about a miss beyond that it missed).
+        ast.EIdent("indexOf") -> TyResult(TyInt, TyBool)
         // `append` yields a vector of the same type as its first argument.
         ast.EIdent("append") ->
           case args {
@@ -3539,6 +3542,33 @@ fn gen_ident_call_full(env: Env, name: String, args: List(ast.Arg)) -> String {
     "join" -> "hive.Join(" <> gen_args(env, args) <> ")"
     // `split(str, sep)` divides a Str into a Str vector.
     "split" -> "hive.Split(" <> gen_args(env, args) <> ")"
+    // `indexOf` searches a vector for an element, or a Str for a substring.
+    // The sought value is rendered as the element type the subject holds, so a
+    // vector literal (`indexOf(table, ["a", "b"])`) lands as one.
+    "indexOf" ->
+      case args {
+        [ast.Arg(_, subject), ast.Arg(_, value)] -> {
+          let subj = gen_expr(env, subject)
+          case infer(env, subject) {
+            TyStr ->
+              "hive.IndexOfStr("
+              <> subj
+              <> ", "
+              <> coerce(env, value, TyStr)
+              <> ")"
+            TyVec(elem) ->
+              "hive.IndexOf(" <> subj <> ", " <> coerce(env, value, elem) <> ")"
+            TyTable ->
+              "hive.IndexOf("
+              <> subj
+              <> ", "
+              <> coerce(env, value, TyVec(TyStr))
+              <> ")"
+            _ -> "hive.IndexOf(" <> gen_args(env, args) <> ")"
+          }
+        }
+        _ -> "hive.IndexOf(" <> gen_args(env, args) <> ")"
+      }
     // `row(table, key)` / `column(table, key)` look a row/column up by its
     // first cell.
     "row" -> "hive.Row(" <> gen_args(env, args) <> ")"

@@ -5,6 +5,10 @@
 //// (`v[a:b]`) is in range, so the generated Go can never panic with an
 //// out-of-bounds error. Anything it cannot prove safe is a compile error.
 ////
+//// It is also where a declared length is *enforced*: a `Str[3]` slot only ever
+//// accepts a vector of three, which is what makes the declaration worth
+//// trusting when an index into it is decided.
+////
 //// The rules mirror the language spec:
 ////   * On a static vector (`Str[3]`) indexed by an integer literal, the check
 ////     is decided outright: `v[2]` compiles, `v[3]` does not.
@@ -14,6 +18,17 @@
 ////     (`if i >= 0 && i < len(v) { v[i] }`). Integer literals are always `>= 0`
 ////     (the lexer never produces a negative literal), so a literal index only
 ////     needs the upper bound.
+////   * An index that came out of `indexOf` needs no guard at all: an `Ok`
+////     payload is by construction a position the searched vector has, so
+////     narrowing the result (`if r is Result.Ok(i)`) proves both bounds for
+////     `i` — on that vector, and only until the vector is rebound.
+////   * What is *inferred* about a vector survives writes through it
+////     (`v[i] = x` keeps the length; `append(v, x)` only grows it) but not a
+////     replacement of the binding (`v = ...`), which may make it shorter —
+////     including one in a branch or loop body that may never run.
+////   * A *declared* length is instead enforced everywhere a value can reach
+////     the slot — initialiser, assignment, argument, return — so it holds for
+////     the life of the program and survives a reassignment.
 ////
 //// The analysis is deliberately *sound, not complete*: it never lets a real
 //// out-of-bounds access through, but it will reject safe programs whose safety
@@ -26,7 +41,9 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import gleam/string
 import hive/ast
+import hive/codegen
 
 // ---------------------------------------------------------------------------
 // Length classes and facts
@@ -66,14 +83,33 @@ type Fact {
   LeVar(a: String, b: String)
 }
 
+/// What a callable declared about itself, so a call site can be held to its
+/// parameter lengths and a call's value can be given its return type.
+type Sig {
+  Sig(params: List(ast.Field), ret: ast.TypeExpr, async: Bool)
+}
+
 type Env {
   Env(
     /// Every declared type, so member/field lengths and custom types resolve.
     types: Dict(String, ast.Decl),
+    /// Every callable's signature, by name.
+    fns: Dict(String, Sig),
+    /// The callable being checked: its name (for error text) and the return
+    /// type every `return` in the body has to fit.
+    owner: String,
+    ret: ast.TypeExpr,
+    /// Names the body binds locally. A call through one of them reaches a
+    /// value, not the module-level declaration it shadows, so that
+    /// declaration's parameter lengths say nothing about it.
+    shadowed: List(String),
     /// Length knowledge for the locals currently in scope.
     lengths: Dict(String, LenInfo),
     /// `n := len(v)` records `n -> v` here, so `i < n` proves `i < len(v)`.
     aliases: Dict(String, String),
+    /// `r := indexOf(v, x)` records `r -> v` here, so narrowing `r` with
+    /// `is Result.Ok(i)` proves `0 <= i < len(v)`.
+    searches: Dict(String, String),
     /// The facts proven to hold at this point.
     facts: List(Fact),
   )
@@ -91,10 +127,12 @@ pub fn check(module: ast.Module) -> Result(Nil, String) {
         _ -> acc
       }
     })
+  let fns = signatures(module.decls)
   list.try_fold(module.decls, Nil, fn(_, d) {
     case d {
-      ast.ProcDecl(_, params, _, body) | ast.FuncDecl(_, params, _, body, _) ->
-        check_body(types, params, body)
+      ast.ProcDecl(name, params, ret, body)
+      | ast.FuncDecl(name, params, ret, body, _) ->
+        check_body(types, fns, name, params, ret, body)
       // A query's body is SQL; its interpolations can't index a vector, and
       // the main validation pass already walks them.
       ast.QueryDecl(..) | ast.TypeDecl(..) -> Ok(Nil)
@@ -103,17 +141,68 @@ pub fn check(module: ast.Module) -> Result(Nil, String) {
   |> result.map(fn(_) { Nil })
 }
 
+fn signatures(decls: List(ast.Decl)) -> Dict(String, Sig) {
+  list.fold(decls, dict.new(), fn(acc, d) {
+    case d {
+      ast.ProcDecl(name, params, ret, _) | ast.QueryDecl(name, params, ret, _) ->
+        dict.insert(acc, name, Sig(params, ret, False))
+      ast.FuncDecl(name, params, ret, _, async) ->
+        dict.insert(acc, name, Sig(params, ret, async))
+      ast.TypeDecl(..) -> acc
+    }
+  })
+}
+
 fn check_body(
   types: Dict(String, ast.Decl),
+  fns: Dict(String, Sig),
+  name: String,
   params: List(ast.Field),
+  ret: ast.TypeExpr,
   body: List(ast.Stmt),
 ) -> Result(Nil, String) {
   let lengths =
     list.fold(params, dict.new(), fn(acc, p) {
       dict.insert(acc, p.name, FromType(p.typ))
     })
-  let env = Env(types, lengths, dict.new(), [])
+  let env =
+    Env(
+      types,
+      fns,
+      name,
+      ret,
+      declared_names(body),
+      lengths,
+      dict.new(),
+      dict.new(),
+      [],
+    )
   check_stmts(env, body) |> result.map(fn(_) { Nil })
+}
+
+// Every name the body binds, anywhere in it — a declaration, a loop variable,
+// an `is` binding in a guard.
+fn declared_names(stmts: List(ast.Stmt)) -> List(String) {
+  list.flat_map(stmts, fn(s) {
+    case s {
+      ast.SVarDecl(name, _, _) | ast.STypedDecl(_, name, _, _) -> [name]
+      ast.SForEach(name, _, _, body) -> [name, ..declared_names(body)]
+      ast.SFor(init, cond, post, body) ->
+        list.flatten([
+          declared_names(option.values([init, post])),
+          is_bindings(option.unwrap(cond, ast.EBool(True))),
+          declared_names(body),
+        ])
+      ast.SIf(branches, else_body) ->
+        list.flatten([
+          list.flat_map(branches, fn(b) {
+            list.append(is_bindings(b.cond), declared_names(b.body))
+          }),
+          declared_names(option.unwrap(else_body, [])),
+        ])
+      _ -> []
+    }
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +227,7 @@ fn check_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
     }
     ast.STypedDecl(typ, name, value, _) -> {
       use _ <- result.try(check_expr(env, value))
+      use _ <- result.try(check_fits(env, typ, value, "`" <> name <> "`"))
       let env2 = forget(env, [name])
       Ok(Env(..env2, lengths: dict.insert(env2.lengths, name, FromType(typ))))
     }
@@ -145,17 +235,40 @@ fn check_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
       // A `v[i] = x` lvalue indexes `v`, so it must be proven in range too.
       use _ <- result.try(check_lvalue(env, target))
       use _ <- result.try(check_expr(env, value))
+      // Whatever the target was declared to hold, it still has to hold.
+      use _ <- result.try(case type_of(env, target) {
+        Some(t) -> check_fits(env, t, value, slot_of(target))
+        None -> Ok(Nil)
+      })
       // Reassigning the whole variable changes its length; assigning an
-      // element (`v[i] = x`) does not.
+      // element (`v[i] = x`) does not. A declared type is not up for revision,
+      // and every assignment to it has just been checked against it, so it
+      // outlives the rebinding.
       case target {
-        ast.EIdent(n) ->
-          Ok(record_binding(forget(env, [n]), n, value))
+        ast.EIdent(n) -> {
+          let declared = case dict.get(env.lengths, n) {
+            Ok(FromType(t)) -> Some(t)
+            _ -> None
+          }
+          let env2 = record_binding(forget(env, [n]), n, value)
+          Ok(case declared {
+            Some(t) ->
+              Env(..env2, lengths: dict.insert(env2.lengths, n, FromType(t)))
+            None -> env2
+          })
+        }
         _ -> Ok(env)
       }
     }
     ast.SReturn(None) -> Ok(env)
     ast.SReturn(Some(e)) -> {
       use _ <- result.try(check_expr(env, e))
+      use _ <- result.try(check_fits(
+        env,
+        env.ret,
+        e,
+        "the return of `" <> env.owner <> "`",
+      ))
       Ok(env)
     }
     ast.SEcho(e) | ast.SAssert(e) | ast.SPanic(e) -> {
@@ -181,7 +294,7 @@ fn check_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
         name,
       ])
       use _ <- result.try(check_stmts(inner, body))
-      Ok(forget(env, mutated_in(body)))
+      Ok(forget_writes(env, body))
     }
   }
 }
@@ -194,7 +307,7 @@ fn check_if(
   use _ <- result.try(
     list.try_fold(branches, Nil, fn(_, b) {
       use _ <- result.try(check_expr(env, b.cond))
-      let benv = Env(..env, facts: list.append(facts_from(env, b.cond), env.facts))
+      let benv = narrow(env, b.cond, facts_from(env, b.cond))
       use _ <- result.try(check_stmts(benv, b.body))
       Ok(Nil)
     })
@@ -205,17 +318,14 @@ fn check_if(
     None -> Ok(Nil)
   })
 
-  // Facts about any variable a branch reassigns are no longer reliable in the
-  // fall-through.
-  let mutated =
+  // What a branch may have done to a variable is not reliable in the
+  // fall-through, whichever branch ran.
+  let taken =
     list.append(
-      list.flat_map(branches, fn(b) { mutated_in(b.body) }),
-      case else_body {
-        Some(body) -> mutated_in(body)
-        None -> []
-      },
+      list.flat_map(branches, fn(b) { b.body }),
+      option.unwrap(else_body, []),
     )
-  let cont = forget(env, mutated)
+  let cont = forget_writes(env, taken)
 
   // Guard-clause: `if <cond> { return }` (a single branch, no else, that
   // definitely leaves the function) proves `not cond` for everything after it.
@@ -268,8 +378,8 @@ fn check_for(
   use _ <- result.try(check_stmts(benv, body))
 
   // The loop may run zero times and its counter is out of scope afterwards, so
-  // nothing it establishes survives; drop facts about anything it mutated.
-  Ok(forget(env, list.append(mutated_in(body), post_mutates(post))))
+  // nothing it establishes survives; drop what it wrote to.
+  Ok(forget_writes(env, list.append(body, option.values([post]))))
 }
 
 // Whether the loop counter can be shown to stay `>= 0`: it is initialised to a
@@ -307,13 +417,6 @@ fn post_keeps_nonneg(post: Option(ast.Stmt), name: String) -> Bool {
   }
 }
 
-fn post_mutates(post: Option(ast.Stmt)) -> List(String) {
-  case post {
-    Some(s) -> mutated_in([s])
-    None -> []
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Expressions — walk every sub-expression, checking each index/slice site
 // ---------------------------------------------------------------------------
@@ -335,18 +438,19 @@ fn check_expr(env: Env, e: ast.Expr) -> Result(Nil, String) {
     // the right runs only when the left is false.
     ast.EBinary(ast.OpAnd, l, r) -> {
       use _ <- result.try(check_expr(env, l))
-      check_expr(Env(..env, facts: list.append(facts_from(env, l), env.facts)), r)
+      check_expr(narrow(env, l, facts_from(env, l)), r)
     }
     ast.EBinary(ast.OpOr, l, r) -> {
       use _ <- result.try(check_expr(env, l))
-      check_expr(
-        Env(..env, facts: list.append(facts_from_neg(env, l), env.facts)),
-        r,
-      )
+      check_expr(narrow(env, l, facts_from_neg(env, l)), r)
     }
     ast.EBinary(_, l, r) -> check_exprs(env, [l, r])
-    ast.ECall(callee, args) ->
-      check_exprs(env, [callee, ..list.map(args, fn(a) { a.value })])
+    ast.ECall(callee, args) -> {
+      use _ <- result.try(
+        check_exprs(env, [callee, ..list.map(args, fn(a) { a.value })]),
+      )
+      check_arg_lengths(env, callee, args)
+    }
     ast.EMember(target, _) -> check_expr(env, target)
     ast.EInterp(parts) ->
       list.try_fold(parts, Nil, fn(_, p) {
@@ -392,6 +496,148 @@ fn check_lvalue(env: Env, target: ast.Expr) -> Result(Nil, String) {
     }
     ast.EMember(t, _) -> check_lvalue(env, t)
     _ -> Ok(Nil)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Declared lengths
+// ---------------------------------------------------------------------------
+
+// A static dimension is a promise, not a hint: `Str[3]` means *three*, so every
+// value that lands in such a slot — an initialiser, a later assignment, an
+// argument, a returned value — must be a vector of exactly that many elements.
+// Holding the whole program to it is what lets an index into a `Str[3]` be
+// decided outright, and what lets that knowledge survive a reassignment.
+fn check_fits(
+  env: Env,
+  typ: ast.TypeExpr,
+  value: ast.Expr,
+  slot: String,
+) -> Result(Nil, String) {
+  case outer_dim(typ) {
+    // No declared length: nothing was promised, so nothing to keep.
+    Dyn -> Ok(Nil)
+    Static(n) ->
+      case outer_len(env, value) {
+        Static(m) if m == n -> check_elements(env, typ, value, slot)
+        Static(m) ->
+          Error(
+            slot
+            <> " is declared `"
+            <> show_type(typ)
+            <> "`, so it takes a vector of exactly "
+            <> int.to_string(n)
+            <> " "
+            <> plural(n, "element")
+            <> " — this one has "
+            <> int.to_string(m)
+            <> ".",
+          )
+        Dyn ->
+          Error(
+            slot
+            <> " is declared `"
+            <> show_type(typ)
+            <> "`, but this value's length isn't known at compile time. Give it "
+            <> "a value of the same static length, or declare "
+            <> slot
+            <> " with `[dyn]` and guard its indexes.",
+          )
+      }
+  }
+}
+
+// A vector literal shows its inner lengths too, so `Str[2][3]` checks every row.
+fn check_elements(
+  env: Env,
+  typ: ast.TypeExpr,
+  value: ast.Expr,
+  slot: String,
+) -> Result(Nil, String) {
+  case value, drop_dim(typ) {
+    ast.EVector(items), Some(inner) ->
+      list.try_fold(items, Nil, fn(_, item) {
+        check_fits(env, inner, item, "an element of " <> slot)
+      })
+      |> result.map(fn(_) { Nil })
+    _, _ -> Ok(Nil)
+  }
+}
+
+// Every argument that lands in a parameter with a declared length must have
+// that length: the callee's body is checked against its own declarations, so
+// the call is where the promise is made. A `_` hole passes nothing, and a name
+// that is a local (a function value, say) is not the declaration it shadows.
+fn check_arg_lengths(
+  env: Env,
+  callee: ast.Expr,
+  args: List(ast.Arg),
+) -> Result(Nil, String) {
+  case callee {
+    ast.EIdent(f) ->
+      case list.contains(env.shadowed, f), dict.get(env.fns, f) {
+        False, Ok(Sig(params, _, _)) -> {
+          let #(assigned, _) =
+            codegen.assign_args(args, list.map(params, fn(p) { p.name }))
+          list.try_fold(assigned, Nil, fn(_, pair) {
+            let #(pname, value) = pair
+            case list.find(params, fn(p) { p.name == pname }), value {
+              _, ast.EIdent("_") -> Ok(Nil)
+              Ok(p), _ ->
+                check_fits(
+                  env,
+                  p.typ,
+                  value,
+                  "parameter `" <> pname <> "` of `" <> f <> "`",
+                )
+              Error(_), _ -> Ok(Nil)
+            }
+          })
+          |> result.map(fn(_) { Nil })
+        }
+        _, _ -> Ok(Nil)
+      }
+    _ -> Ok(Nil)
+  }
+}
+
+// How an assignment target is named in the error text.
+fn slot_of(target: ast.Expr) -> String {
+  case target {
+    ast.EIdent(n) -> "`" <> n <> "`"
+    ast.EMember(ast.EIdent(o), f) -> "`" <> o <> "." <> f <> "`"
+    ast.EIndex(t, _) -> "an element of " <> slot_of(t)
+    _ -> "this slot"
+  }
+}
+
+fn plural(n: Int, word: String) -> String {
+  case n {
+    1 -> word
+    _ -> word <> "s"
+  }
+}
+
+fn show_type(t: ast.TypeExpr) -> String {
+  case t {
+    ast.TVoid -> "void"
+    ast.TFunc(_, _, _) -> "a function"
+    ast.TName(pkg, name, dims) ->
+      case pkg {
+        Some(p) -> p <> "."
+        None -> ""
+      }
+      <> name
+      <> string.concat(list.map(dims, show_dim))
+  }
+}
+
+fn show_dim(d: ast.Dim) -> String {
+  case d {
+    ast.DimEmpty -> "[]"
+    ast.DimStatic(n) -> "[" <> int.to_string(n) <> "]"
+    ast.DimDyn(None) -> "[dyn]"
+    ast.DimDyn(Some(n)) -> "[dyn, " <> int.to_string(n) <> "]"
   }
 }
 
@@ -696,6 +942,15 @@ fn facts_from(env: Env, e: ast.Expr) -> List(Fact) {
     ast.EBinary(ast.OpLe, a, b) -> le_facts(env, a, b)
     // `a >= b` is `b <= a`.
     ast.EBinary(ast.OpGe, a, b) -> le_facts(env, b, a)
+    // `r is Result.Ok(i)` where `r` searched a vector with `indexOf`: an Ok
+    // payload is a position that vector really has, which is the whole point of
+    // returning one — so `i` arrives already proven `>= 0` and `< len(v)` and
+    // indexes `v` with no guard of its own.
+    ast.EIs(subject, ast.PConstructor(["Result", "Ok"], [i])) ->
+      case i != "_", searched_vector(env, subject) {
+        True, Some(v) -> [Ge0(i), LtLen(i, v)]
+        _, _ -> []
+      }
     _ -> []
   }
 }
@@ -781,6 +1036,17 @@ fn as_len(env: Env, e: ast.Expr) -> Option(String) {
   }
 }
 
+// The vector an `indexOf` result searched: the call itself when it is matched
+// inline (`if indexOf(v, x) is Result.Ok(i)`), otherwise whatever vector the
+// name was bound from (`r := indexOf(v, x)`).
+fn searched_vector(env: Env, e: ast.Expr) -> Option(String) {
+  case e {
+    ast.ECall(ast.EIdent("indexOf"), [ast.Arg(_, v), _]) -> key(v)
+    ast.EIdent(n) -> dict.get(env.searches, n) |> option.from_result
+    _ -> None
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Length resolution
 // ---------------------------------------------------------------------------
@@ -796,11 +1062,25 @@ fn outer_len(env: Env, expr: ast.Expr) -> Len {
         Ok(FromType(t)) -> outer_dim(t)
         Error(_) -> Dyn
       }
-    ast.EIndex(_, _) | ast.EMember(_, _) ->
+    ast.EIndex(_, _) | ast.EMember(_, _) | ast.ECall(_, _) ->
       case type_of(env, expr) {
         Some(t) -> outer_dim(t)
         None -> Dyn
       }
+    // `a + b` concatenates two vectors, so their lengths add.
+    ast.EBinary(ast.OpAdd, l, r) ->
+      case outer_len(env, l), outer_len(env, r) {
+        Static(a), Static(b) -> Static(a + b)
+        _, _ -> Dyn
+      }
+    // Awaiting a vector of handles resolves to a vector of the same arity, and
+    // awaiting one call gives that call's value.
+    ast.EAwait(ast.ECall(ast.EIdent(f), _)) ->
+      case dict.get(env.fns, f) {
+        Ok(Sig(_, ret, _)) -> outer_dim(ret)
+        Error(_) -> Dyn
+      }
+    ast.EAwait(inner) -> outer_len(env, inner)
     // A slice's length is not known statically.
     _ -> Dyn
   }
@@ -823,6 +1103,13 @@ fn type_of(env: Env, expr: ast.Expr) -> Option(ast.TypeExpr) {
     ast.EMember(target, field) ->
       case type_of(env, target) {
         Some(ast.TName(None, tname, [])) -> field_type(env, tname, field)
+        _ -> None
+      }
+    // A call's value is its declared return — except for a bare call to an
+    // `async func`, which is a handle; only `await` reaches the value.
+    ast.ECall(ast.EIdent(f), _) ->
+      case dict.get(env.fns, f) {
+        Ok(Sig(_, ret, False)) -> Some(ret)
         _ -> None
       }
     _ -> None
@@ -872,35 +1159,61 @@ fn drop_dim(t: ast.TypeExpr) -> Option(ast.TypeExpr) {
 // Record what a `:=` or `=` teaches us about the bound name's length. The name's
 // stale facts have already been dropped by the caller.
 fn record_binding(env: Env, name: String, value: ast.Expr) -> Env {
-  let lengths = dict.delete(env.lengths, name)
-  let aliases = dict.delete(env.aliases, name)
+  let base =
+    Env(
+      ..env,
+      lengths: dict.delete(env.lengths, name),
+      aliases: dict.delete(env.aliases, name),
+      searches: dict.delete(env.searches, name),
+    )
   case value {
     // A vector literal has a known static length.
     ast.EVector(items) ->
-      Env(..env, lengths: dict.insert(lengths, name, LitLen(list.length(items))),
-        aliases: aliases)
+      Env(
+        ..base,
+        lengths: dict.insert(base.lengths, name, LitLen(list.length(items))),
+      )
     // `n := len(v)` — remember that `n` is `len(v)`.
     ast.ECall(ast.EIdent("len"), [ast.Arg(_, v)]) ->
       case key(v) {
-        Some(vk) -> Env(..env, lengths: lengths, aliases: dict.insert(aliases, name, vk))
-        None -> Env(..env, lengths: lengths, aliases: aliases)
+        Some(vk) -> Env(..base, aliases: dict.insert(base.aliases, name, vk))
+        None -> base
       }
-    // `a := b` copies whatever length knowledge `b` has (assignment copies).
+    // `r := indexOf(v, x)` — remember which vector `r` searched, so the index
+    // it carries can be recognised as one of `v`'s own positions.
+    ast.ECall(ast.EIdent("indexOf"), [ast.Arg(_, v), _]) ->
+      case key(v) {
+        Some(vk) -> Env(..base, searches: dict.insert(base.searches, name, vk))
+        None -> base
+      }
+    // `a := b` copies whatever length knowledge `b` has (assignment copies) —
+    // and, for a search result, which vector it came from.
     ast.EIdent(other) -> {
-      let lengths2 = case dict.get(env.lengths, other) {
-        Ok(info) -> dict.insert(lengths, name, info)
-        Error(_) -> lengths
+      let lengths = case dict.get(env.lengths, other) {
+        Ok(info) -> dict.insert(base.lengths, name, info)
+        Error(_) -> base.lengths
       }
-      Env(..env, lengths: lengths2, aliases: aliases)
+      let searches = case dict.get(env.searches, other) {
+        Ok(vk) -> dict.insert(base.searches, name, vk)
+        Error(_) -> base.searches
+      }
+      Env(..base, lengths: lengths, searches: searches)
     }
-    // Indexing/member access that yields a vector keeps its declared type.
-    ast.EIndex(_, _) | ast.EMember(_, _) ->
+    // Indexing, member access or a call: the declared type says it all, and it
+    // keeps the inner dimensions a bare length would lose.
+    ast.EIndex(_, _) | ast.EMember(_, _) | ast.ECall(_, _) ->
       case type_of(env, value) {
-        Some(t) -> Env(..env, lengths: dict.insert(lengths, name, FromType(t)),
-          aliases: aliases)
-        None -> Env(..env, lengths: lengths, aliases: aliases)
+        Some(t) ->
+          Env(..base, lengths: dict.insert(base.lengths, name, FromType(t)))
+        None -> base
       }
-    _ -> Env(..env, lengths: lengths, aliases: aliases)
+    // Anything else keeps whatever outer length its shape reveals — a `+`
+    // concatenation, an awaited vector of handles.
+    _ ->
+      case outer_len(env, value) {
+        Static(n) -> Env(..base, lengths: dict.insert(base.lengths, name, LitLen(n)))
+        Dyn -> base
+      }
   }
 }
 
@@ -913,16 +1226,96 @@ fn forget(env: Env, names: List(String)) -> Env {
     _ -> {
       let facts =
         list.filter(env.facts, fn(f) { !fact_mentions(f, names) })
-      let aliases =
-        env.aliases
-        |> dict.to_list
-        |> list.filter(fn(pair) {
-          !list.contains(names, pair.0) && !list.contains(names, pair.1)
-        })
-        |> dict.from_list
-      Env(..env, facts: facts, aliases: aliases)
+      // A record is dropped when either end is touched: the alias/search itself
+      // may have been rebound, or the vector it speaks about may have been.
+      Env(
+        ..env,
+        facts: facts,
+        aliases: drop_mentions(env.aliases, names),
+        searches: drop_mentions(env.searches, names),
+      )
     }
   }
+}
+
+// The environment a guarded body — or the right operand of `&&`/`||` — is
+// analysed in: whatever the condition binds with `is` shadows the name it had
+// before, so that name's old length and facts are dropped before the facts the
+// condition proves are added.
+fn narrow(env: Env, cond: ast.Expr, facts: List(Fact)) -> Env {
+  let shadowed = is_bindings(cond)
+  let env2 = case shadowed {
+    [] -> env
+    _ -> forget(env, shadowed) |> drop_lengths(shadowed)
+  }
+  Env(..env2, facts: list.append(facts, env2.facts))
+}
+
+// Every name an `is` in this condition binds.
+fn is_bindings(e: ast.Expr) -> List(String) {
+  case e {
+    ast.EIs(subject, pattern) ->
+      list.append(is_bindings(subject), pattern_bindings(pattern))
+    ast.EBinary(_, l, r) -> list.append(is_bindings(l), is_bindings(r))
+    _ -> []
+  }
+}
+
+fn pattern_bindings(p: ast.Pattern) -> List(String) {
+  let names = case p {
+    ast.PConstructor(_, bindings) -> bindings
+    ast.PVector(elems, rest) ->
+      list.append(
+        list.filter_map(elems, fn(el) {
+          case el {
+            ast.PElemBind(n) -> Ok(n)
+            ast.PElemLit(_) -> Error(Nil)
+          }
+        }),
+        option.values([rest]),
+      )
+    ast.PString(parts) ->
+      list.filter_map(parts, fn(part) {
+        case part {
+          ast.SPatHole(n) -> Ok(n)
+          ast.SPatLit(_) -> Error(Nil)
+        }
+      })
+  }
+  // `_` binds nothing, so it shadows nothing.
+  list.filter(names, fn(n) { n != "_" })
+}
+
+// What survives a block whose control flow the analysis does not follow (an
+// `if` seen from the fall-through, a loop that may run any number of times):
+// facts about anything it wrote to are dropped, and a vector it rebound also
+// loses its length — unless that length was *declared*, since every assignment
+// has been held to the declaration.
+fn forget_writes(env: Env, stmts: List(ast.Stmt)) -> Env {
+  let inferred =
+    list.filter(reassigned_in(stmts), fn(n) {
+      case dict.get(env.lengths, n) {
+        Ok(LitLen(_)) -> True
+        _ -> False
+      }
+    })
+  forget(env, mutated_in(stmts)) |> drop_lengths(inferred)
+}
+
+fn drop_lengths(env: Env, names: List(String)) -> Env {
+  Env(..env, lengths: list.fold(names, env.lengths, dict.delete))
+}
+
+fn drop_mentions(
+  d: Dict(String, String),
+  names: List(String),
+) -> Dict(String, String) {
+  d
+  |> dict.to_list
+  |> list.filter(fn(pair) {
+    !list.contains(names, pair.0) && !list.contains(names, pair.1)
+  })
+  |> dict.from_list
 }
 
 fn fact_mentions(f: Fact, names: List(String)) -> Bool {
@@ -982,6 +1375,34 @@ fn assign_root(target: ast.Expr) -> Option(String) {
     ast.EIndex(t, _) | ast.EMember(t, _) | ast.ESlice(t, _, _) ->
       assign_root(t)
     _ -> None
+  }
+}
+
+// The variables a block *replaces* wholesale (`v = ...`), as opposed to writes
+// that go through the name (`v[i] = x`, `v.f = x`, `append(v, x)`). Only a
+// replacement can shorten a vector, so only a replacement costs it its known
+// length — an element write leaves the length alone and `append` only grows it,
+// which keeps every position the analysis already proved.
+fn reassigned_in(stmts: List(ast.Stmt)) -> List(String) {
+  list.flat_map(stmts, reassigned_in_stmt)
+}
+
+fn reassigned_in_stmt(s: ast.Stmt) -> List(String) {
+  case s {
+    ast.SAssign(ast.EIdent(n), _) -> [n]
+    ast.SIf(branches, else_body) ->
+      list.append(
+        list.flat_map(branches, fn(b) { reassigned_in(b.body) }),
+        reassigned_in(option.unwrap(else_body, [])),
+      )
+    ast.SFor(init, _, post, body) ->
+      list.flatten([
+        reassigned_in(option.values([init])),
+        reassigned_in(option.values([post])),
+        reassigned_in(body),
+      ])
+    ast.SForEach(_, _, _, body) -> reassigned_in(body)
+    _ -> []
   }
 }
 

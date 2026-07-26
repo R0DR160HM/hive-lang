@@ -453,6 +453,40 @@ func StrLen(s string) int {
 	return utf8.RuneCountInString(s)
 }
 
+// IndexOf returns the position of the first element of v equal to value, or
+// Error(false) when v holds no such element (backs the `indexOf` builtin on a
+// vector). Elements are compared the way Hive's == compares them, so a vector
+// of vectors matches structurally.
+//
+// An Ok payload is always a position v really has (0 <= i < len(v)) — the
+// compiler's bounds pass relies on that to let the index be used unguarded.
+func IndexOf[T any](v []T, value T) Result[int, bool] {
+	for i, x := range v {
+		if VecEq(x, value) {
+			return Ok[int, bool](i)
+		}
+	}
+	return Err[int, bool](false)
+}
+
+// IndexOfStr returns the position of the first occurrence of sub in s, counted
+// in characters (UTF-8 runes) so it lines up with what `len` reports for a Str,
+// or Error(false) when sub does not occur (backs `indexOf` on a Str).
+//
+// Searching an empty string never succeeds, not even for an empty needle: that
+// keeps the same invariant the vector form has — an Ok payload always points at
+// a character s really has.
+func IndexOfStr(s string, sub string) Result[int, bool] {
+	if s == \"\" {
+		return Err[int, bool](false)
+	}
+	i := strings.Index(s, sub)
+	if i < 0 {
+		return Err[int, bool](false)
+	}
+	return Ok[int, bool](utf8.RuneCountInString(s[:i]))
+}
+
 // MatchPattern matches s against a string-pattern template and returns the
 // captured hole values in order, or nil when s does not match. This backs Hive
 // patterns such as `path is \"/api/{id}/{name}/delete\"`.
