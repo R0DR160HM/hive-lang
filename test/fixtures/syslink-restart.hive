@@ -1,0 +1,59 @@
+// Does a named address survive its service being replaced?
+
+type Ping {
+	Who
+	Iam { who: Str }
+}
+
+proc first(n: Int, m: Ping, from: hive.syslink.Envelope): Int {
+	if m is Ping.Who {
+		hive.syslink.answer(from, Ping.Iam("first"))
+	}
+	return n + 1
+}
+
+proc second(n: Int, m: Ping, from: hive.syslink.Envelope): Int {
+	if m is Ping.Who {
+		hive.syslink.answer(from, Ping.Iam("second"))
+	}
+	return n + 1
+}
+
+proc main(): void {
+	if hive.syslink.listen("127.0.0.1:9800") is Result.Error(e) {
+		panic e
+	}
+
+	a := hive.syslink.spawn(first, 0)
+	if hive.syslink.register(#Inbox, a) is Result.Error(e) {
+		panic e
+	}
+
+	// An address taken BEFORE the restart, and kept across it.
+	held := hive.syslink.at(#Inbox)
+
+	before := await hive.syslink.send(held, Ping.Who()) with timeout 1000
+	if before is Result.Ok(r) && r is Ping.Iam(who) {
+		echo "before restart: {who}"
+	} else if before is Result.Error(err) {
+		echo "before restart: {err.reason}"
+	}
+
+	// The service dies and a replacement takes the same name.
+	hive.syslink.stop(held)
+	hive.task.sleep(200)
+
+	b := hive.syslink.spawn(second, 0)
+	if hive.syslink.register(#Inbox, b) is Result.Error(e) {
+		panic e
+	}
+
+	// The held address must now reach the replacement. If it still points at the
+	// dead mailbox, this times out and the messages vanish.
+	after := await hive.syslink.send(held, Ping.Who()) with timeout 1000
+	if after is Result.Ok(r) && r is Ping.Iam(who) {
+		echo "after restart:  {who}"
+	} else if after is Result.Error(err) {
+		echo "after restart:  FAILED ({err.reason}) — the address went stale"
+	}
+}

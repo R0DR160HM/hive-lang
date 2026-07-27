@@ -1,54 +1,237 @@
+// EXAMPLE APP — a distributed online cache
+// ========================================
+// Three nodes, each with an HTTP front door and a private in-memory database,
+// gossiping over `hive.syslink`. A name lives on exactly one node — whoever
+// stored it last — and any node can serve a read for it.
+//
+//   POST /set/{name}   store on THIS node, and tell the peers to drop their copy
+//   GET  /get/{name}   answer from THIS node, or ask the peers if it is not here
+//
+// RUN IT — three terminals, all on localhost. Each node is told where it lives,
+// where its peers live, and which HTTP port to serve:
+//
+//   hive run cache.hive    # 127.0.0.1:9100 | 127.0.0.1:9101,127.0.0.1:9102 | 8081
+//   hive run cache.hive    # 127.0.0.1:9101 | 127.0.0.1:9100,127.0.0.1:9102 | 8082
+//   hive run cache.hive    # 127.0.0.1:9102 | 127.0.0.1:9100,127.0.0.1:9101 | 8083
+//
+// All three run identical code. A node is identified by where it is, so the peer
+// list is ordinary data — a vector here, but equally a config file, an env var or
+// a DNS lookup — and the cluster's size is not fixed when the program is written.
+//
+//   curl -X POST -d 'from A' localhost:8081/set/greeting
+//   curl localhost:8083/get/greeting     # C has no copy, so it asks A and B
+//   curl -X POST -d 'from C' localhost:8083/set/greeting
+//   curl localhost:8081/get/greeting     # A dropped its copy; it asks and finds C's
+//
+// Two structural points worth copying into your own services:
+//
+//   1. The service OWNS the database — nothing else touches it. Every request
+//      arrives as a message and is handled one at a time, so there is no mutex
+//      anywhere and no way for two requests to race on the same row. The fold is
+//      the mutex.
+//   2. A service NEVER awaits another service from inside its own turn. Its turn
+//      would be blocked while it waited, so two nodes that asked each other at
+//      the same moment would deadlock. Fan-out to peers happens in the HTTP
+//      handler (which is its own virtual thread and holds nothing up), and the
+//      invalidation broadcast is fire-and-forget.
+
+// The mailbox type is the whole protocol: what a node can be asked, and what it
+// answers. A service replies with one of its own messages, so `is` narrows a
+// reply exactly like anything else.
+type Cache {
+	// From this node's own HTTP handler.
+	Store { name: Str, value: Str }
+	Stored { name: Str }
+	// Between nodes. A `Lookup` is answered from the receiver's own database and
+	// is never forwarded — that is what stops a query circling the cluster.
+	Lookup { name: Str }
+	Found { name: Str, value: Str }
+	Missing { name: Str }
+	// "I own this name now, drop your copy."
+	Invalidate { name: Str }
+}
+
+// A service's state can be anything, including a database handle. Here it is the
+// connection plus the addresses this node gossips to.
+type Node {
+	db: hive.sql.SqlConnection
+	peers: Str[dyn]
+}
+
 query createTable(): Str {
 	CREATE TABLE cache (
 		name VARCHAR(255) PRIMARY KEY,
 		value TEXT NOT NULL,
-		created_at TEXT DEFAULT CURRENT_TIMESTAMP 
+		created_at TEXT DEFAULT CURRENT_TIMESTAMP
 	)
 }
 
-query insert(name: Str, value: Str): Str {
-	INSERT INTO cache (name, value) VALUES ({name}, {value})
+query upsert(name: Str, value: Str): Str {
+	INSERT OR REPLACE INTO cache (name, value) VALUES ({name}, {value})
 }
 
-query get(name: Str): Str {
-	SELECT value FROM cache WHERE name = {name} 
+query lookup(name: Str): Str {
+	SELECT value FROM cache WHERE name = {name}
+}
+
+query forget(name: Str): Str {
+	DELETE FROM cache WHERE name = {name}
+}
+
+// The cache service. One turn per message, in order, with the database to
+// itself.
+proc cache(node: Node, msg: Cache, from: hive.syslink.Envelope): Node {
+	if msg is Cache.Store(name, value) {
+		if using node.db run upsert(name, value) is Result.Error(err) {
+			echo "  ! could not store {name}: {err.message}"
+			return node
+		}
+		echo "  [db] stored {name}"
+
+		// Tell the peers their copies are stale. Bare statements, so nothing is
+		// awaited and this turn cannot be held up by a slow or absent peer — a
+		// send never blocks and never fails.
+		for each endpoint in node.peers {
+			hive.syslink.send(hive.syslink.on(endpoint, #Cache), Cache.Invalidate(name))
+		}
+
+		hive.syslink.answer(from, Cache.Stored(name))
+		return node
+	}
+
+	if msg is Cache.Lookup(name) {
+		// This node's own database only.
+		if using node.db run lookup(name) is Result.Ok(rows) && rows is [_header, row] && row is [value] {
+			hive.syslink.answer(from, Cache.Found(name, value))
+			return node
+		}
+		hive.syslink.answer(from, Cache.Missing(name))
+		return node
+	}
+
+	if msg is Cache.Invalidate(name) {
+		if using node.db run forget(name) is Result.Error(err) {
+			echo "  ! could not drop {name}: {err.message}"
+			return node
+		}
+		// A delete that matched nothing is not a failure, and this node may well
+		// never have held the name — so the message says what is now true rather
+		// than claiming a row was removed.
+		echo "  [db] {name} is owned by another node now"
+		return node
+	}
+
+	// Stored / Found / Missing are answers, not requests: nothing sends them here,
+	// and a service that receives one has nothing to do with it. Note that this
+	// branch answers nothing — so if anything ever did *await* one of them, it
+	// would come straight back as `NoReply` rather than hanging until its timeout.
+	// Every envelope in this handler only ever reaches `answer`, so the compiler
+	// can see that no reply is ever coming once a turn ends.
+	return node
+}
+
+// The HTTP front door. It never touches the database — it asks the service, like
+// any other client would.
+proc handler(
+	req: hive.net.HttpRequest,
+	peers: Str[dyn],
+): hive.net.HttpResponse {
+	// `at` reaches a service on this node without needing to know where "here"
+	// is. Only the service name is an atom.
+	mine := hive.syslink.at(#Cache)
+
+	if req.method == "POST" && req.url is "/set/{name}" {
+		stored := await hive.syslink.send(mine, Cache.Store(name, req.body)) with timeout 2000
+		if stored is Result.Ok(reply) && reply is Cache.Stored(_) {
+			return plain(200, "stored\n")
+		}
+		if stored is Result.Error(err) {
+			return plain(500, "the cache did not answer: {err.reason}\n")
+		}
+		return plain(500, "the cache refused to store that\n")
+	}
+
+	if req.method == "GET" && req.url is "/get/{name}" {
+		// Ask this node first.
+		here := await hive.syslink.send(mine, Cache.Lookup(name)) with timeout 2000
+		if here is Result.Ok(reply) && reply is Cache.Found(_, value) {
+			return plain(200, value)
+		}
+
+		// Not here, so ask the peers, stopping at the first one that has it. A
+		// handler runs on its own virtual thread and is not a service, so blocking
+		// it holds nothing up, and a peer that is down comes back as a
+		// Result.Error rather than hanging.
+		//
+		// This asks them one at a time, which short-circuits on a hit but pays a
+		// full timeout per dead peer. Where the peer set is fixed you can fan out
+		// instead — `await [send(a, ...), send(b, ...)] with timeout 2000` is one
+		// barrier with a single deadline for all of them.
+		for each endpoint in peers {
+			answer := await hive.syslink.send(
+				hive.syslink.on(endpoint, #Cache),
+				Cache.Lookup(name),
+			) with timeout 2000
+			if answer is Result.Ok(reply) && reply is Cache.Found(_, value) {
+				return plain(200, value)
+			}
+		}
+		return plain(404, "no node has {name}\n")
+	}
+
+	return plain(404, "try POST /set/<name> or GET /get/<name>\n")
+}
+
+func plain(status: Int, body: Str): hive.net.HttpResponse {
+	return hive.net.HttpResponse(status, [["Content-Type", "text/plain"]], body)
 }
 
 proc main(): void {
-	opened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), ":memory:")
+	// An in-memory SQLite database belongs to its *connection*, so a pool would
+	// otherwise hand out connections onto private, empty databases — and a
+	// program that passes every single-threaded test then fails with `no such
+	// table` once requests overlap. Asking for a shared cache is what makes every
+	// pooled connection see the same database, and the maxIdle of 1 keeps that
+	// database alive rather than leaving it to the pool's defaults.
+	opened := hive.sql.pool(
+		hive.sql.DatabaseDriver.SQLite(),
+		"file::memory:?cache=shared",
+		8,
+		1,
+	)
+	if opened is Result.Error(err) {
+		panic err
+	}
 	if opened is Result.Ok(db) {
-
 		if using db run createTable() is Result.Error(err) {
 			panic err
 		}
 
-		mut port := 8081 
-		if hive.env.get("PORT") is Result.Ok(pStr) && hive.conv.sti(pStr) is Result.Ok(p) {
-			port = p
+		echo "This node's own ip:port, for the other nodes to dial?"
+		me := hive.term.read()
+
+		echo "The other nodes' ip:port, comma separated?"
+		peers := split(hive.term.read(), ",")
+
+		echo "Which HTTP port should this node serve on?"
+		mut http := 8081
+		if hive.conv.sti(hive.term.read()) is Result.Ok(chosen) {
+			http = chosen
 		}
 
-		echo "Listening on port {port}"
-		hive.net.httpServe(port, handler(_, db))
-
-	} else if opened is Result.Error(err) {
-		panic err
-	}
-}
-
-proc handler(req: hive.net.HttpRequest, db: hive.sql.SqlConnection): hive.net.HttpResponse {
-	if req.method == "POST" && req.url is "/set/{name}" {
-		if using db run insert(name, req.body) is Result.Ok(_) {
-			return hive.net.HttpResponse(200, [["Content-Type", "text/plain"]], "OK!")
+		// Nothing is dialed here. The endpoint is what peers dial and what this
+		// node advertises, so an address it hands out stays dialable even after
+		// being passed on again.
+		if hive.syslink.listen(me) is Result.Error(err) {
+			panic err
 		}
-		return hive.net.HttpResponse(500, [["Content-Type", "text/plain"]], "Internal Server Error!")
-	}
-	if req.method == "GET" && req.url is "/get/{name}" {
-		if using db run get(name) is Result.Ok(table) && table is [_header, row] && row is [value] {
-			return hive.net.HttpResponse(200, [["Content-Type", "text/plain"]], value)
+
+		box := hive.syslink.spawn(cache, Node(db, peers))
+		if hive.syslink.register(#Cache, box) is Result.Error(err) {
+			panic err
 		}
-		return hive.net.HttpResponse(500, [["Content-Type", "text/plain"]], "Internal Server Error!")
 
+		echo "node {me} ready — HTTP on {http}, gossiping with {len(peers)} peers"
+		hive.net.httpServe(http, handler(_, peers))
 	}
-	return hive.net.HttpResponse(404, [["Content-Type", "text/plain"]], "Not Found!")
-
 }

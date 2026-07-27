@@ -465,7 +465,11 @@ fn check_expr(env: Env, e: ast.Expr) -> Result(Nil, String) {
     ast.EUsing(source, kind) ->
       check_exprs(env, [source, ..ast.using_exprs(kind)])
     ast.EWith(value, _) -> check_expr(env, value)
-    ast.EAwait(value) -> check_expr(env, value)
+    ast.EAwait(value, timeout) ->
+      check_exprs(env, case timeout {
+        Some(ms) -> [value, ms]
+        None -> [value]
+      })
     ast.EInt(_)
     | ast.EFloat(_)
     | ast.EString(_)
@@ -1075,12 +1079,12 @@ fn outer_len(env: Env, expr: ast.Expr) -> Len {
       }
     // Awaiting a vector of handles resolves to a vector of the same arity, and
     // awaiting one call gives that call's value.
-    ast.EAwait(ast.ECall(ast.EIdent(f), _)) ->
+    ast.EAwait(ast.ECall(ast.EIdent(f), _), _) ->
       case dict.get(env.fns, f) {
         Ok(Sig(_, ret, _)) -> outer_dim(ret)
         Error(_) -> Dyn
       }
-    ast.EAwait(inner) -> outer_len(env, inner)
+    ast.EAwait(inner, _) -> outer_len(env, inner)
     // A slice's length is not known statically.
     _ -> Dyn
   }

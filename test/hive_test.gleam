@@ -1846,6 +1846,349 @@ pub fn sql_example_compiles_test() {
   let assert Ok(_) = compiler.compile(src)
 }
 
+// A named address is the only kind that survives its service being replaced: it
+// is re-resolved through the registry on every send, so a replacement registered
+// under the same atom is picked up by every holder. The fixture exercises that
+// across a real restart; here we at least hold the shape to the compiler.
+pub fn syslink_named_address_survives_a_restart_test() {
+  let assert Ok(src) = simplifile.read("test/fixtures/syslink-restart.hive")
+  let assert Ok(_) = compiler.compile(src)
+}
+
+// The last argument of the generated `SyslinkSpawn` call: the compiler's verdict
+// on whether this handler's envelope can outlive its turn. Read off the text
+// rather than matched loosely, so a change in the digest before it cannot make
+// the assertion pass or fail by accident.
+fn spawn_verdict(go: String) -> String {
+  let assert [_, after, ..] = string.split(go, "hive.SyslinkSpawn(")
+  let assert [call, ..] = string.split(after, ")\n")
+  let assert [verdict, ..] =
+    call |> string.split(", ") |> list.reverse
+  verdict
+}
+
+// ---------------------------------------------------------------------------
+// Failing an unanswered request fast
+// ---------------------------------------------------------------------------
+// The runtime may fail a request the instant a turn ends without answering it —
+// but only for a handler whose envelope provably cannot outlive that turn. The
+// compiler decides, and passes its verdict as the last argument to spawn.
+
+pub fn syslink_noreply_fixture_compiles_test() {
+  let assert Ok(src) = simplifile.read("test/fixtures/syslink-noreply.hive")
+  let assert Ok(_) = compiler.compile(src)
+}
+
+// An envelope that only ever reaches `answer` cannot outlive its turn.
+pub fn syslink_envelope_confined_to_its_turn_test() {
+  let assert Ok(go) =
+    compiler.compile(
+      "type Op {\n\tGo\n}\n\nproc box(n: Int, op: Op, from: hive.syslink.Envelope): Int {\n\thive.syslink.answer(from, Op.Go())\n\treturn n\n}\n\nproc main(): void {\n\thive.syslink.spawn(box, 0)\n}\n",
+    )
+  spawn_verdict(go) |> should.equal("true")
+}
+
+// `self` and `monitor` do not keep the reply token either, so they are not
+// escapes — otherwise a service that watches anything would lose the fast
+// failure for no reason.
+pub fn syslink_self_and_monitor_are_not_escapes_test() {
+  let assert Ok(go) =
+    compiler.compile(
+      "type Op {\n\tGo { peer: hive.syslink.Address }\n}\n\nproc box(n: Int, op: Op, from: hive.syslink.Envelope): Int {\n\tif op is Op.Go(peer) {\n\t\thive.syslink.monitor(from, peer, Op.Go(hive.syslink.self(from)))\n\t}\n\treturn n\n}\n\nproc main(): void {\n\thive.syslink.spawn(box, 0)\n}\n",
+    )
+  spawn_verdict(go) |> should.equal("true")
+}
+
+// Handing the envelope to a task lets an answer arrive after the turn, so the
+// fast failure has to be switched off or it would cut off a live request.
+pub fn syslink_envelope_handed_to_a_task_defers_test() {
+  let assert Ok(go) =
+    compiler.compile(
+      "type Op {\n\tGo\n}\n\nasync func later(from: hive.syslink.Envelope): void {\n\thive.syslink.answer(from, Op.Go())\n}\n\nproc box(n: Int, op: Op, from: hive.syslink.Envelope): Int {\n\tlater(from)\n\treturn n\n}\n\nproc main(): void {\n\thive.syslink.spawn(box, 0)\n}\n",
+    )
+  spawn_verdict(go) |> should.equal("false")
+}
+
+// So does keeping it in the service's own state, which is the other way a reply
+// legitimately arrives on a later turn.
+pub fn syslink_envelope_kept_in_state_defers_test() {
+  let assert Ok(go) =
+    compiler.compile(
+      "type Op {\n\tGo\n}\n\ntype Held {\n\twaiting: hive.syslink.Envelope\n}\n\nproc box(h: Held, op: Op, from: hive.syslink.Envelope): Held {\n\treturn Held(from)\n}\n\nproc main(): void {\n\thive.syslink.spawn(box, Held(hive.syslink.Envelope()))\n}\n",
+    )
+  spawn_verdict(go) |> should.equal("false")
+}
+
+pub fn distributed_cache_example_compiles_test() {
+  let assert Ok(src) =
+    simplifile.read(
+      "code-examples/9 - EXAMPLE APP - Online Cache/cache.hive",
+    )
+  let assert Ok(_) = compiler.compile(src)
+}
+
+pub fn distributed_actors_example_compiles_test() {
+  let assert Ok(src) =
+    simplifile.read(
+      "code-examples/13 - Distributed Actors/distributed-actors.hive",
+    )
+  let assert Ok(_) = compiler.compile(src)
+}
+
+// ---------------------------------------------------------------------------
+// hive.syslink: addressable services, local or on another node
+// ---------------------------------------------------------------------------
+
+// A minimal well-formed service, reused by the tests below.
+const service_prelude = "type Op {\n\tPut { key: Str }\n\tCount\n}\n\nproc box(seen: Int, op: Op, from: hive.syslink.Envelope): Int {\n\tif op is Op.Put(key) {\n\t\techo key\n\t\treturn seen + 1\n\t}\n\thive.syslink.answer(from, seen)\n\treturn seen\n}\n"
+
+pub fn syslink_spawn_send_and_register_compiles_test() {
+  compiler.compile(
+    service_prelude
+    <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tif hive.syslink.register(#Inbox, b) is Result.Error(e) {\n\t\tpanic e\n\t}\n\thive.syslink.send(b, Op.Put(\"k\"))\n}\n",
+  )
+  |> should.be_ok
+}
+
+// The handler is the fold over the mailbox, so the state going in and the state
+// coming out have to be the same type.
+pub fn syslink_handler_must_return_its_state_type_test() {
+  compiler.compile(
+    "type Op {\n\tPut { key: Str }\n}\n\nproc box(seen: Int, op: Op, from: hive.syslink.Envelope): Str {\n\treturn \"nope\"\n}\n\nproc main(): void {\n\thive.syslink.spawn(box, 0)\n}\n",
+  )
+  |> should.be_error
+}
+
+pub fn syslink_handler_needs_an_envelope_test() {
+  compiler.compile(
+    "type Op {\n\tPut { key: Str }\n}\n\nproc box(seen: Int, op: Op, extra: Str): Int {\n\treturn seen\n}\n\nproc main(): void {\n\thive.syslink.spawn(box, 0)\n}\n",
+  )
+  |> should.be_error
+}
+
+pub fn syslink_handler_must_be_a_proc_test() {
+  compiler.compile(
+    service_prelude
+    <> "proc main(): void {\n\thive.syslink.spawn(nosuchproc, 0)\n}\n",
+  )
+  |> should.be_error
+}
+
+// A registered name and a node role come from a closed set of atoms. That is
+// what makes the registry knowable at compile time, so a computed name has to be
+// rejected rather than silently giving up the checking it buys.
+pub fn syslink_names_must_be_atom_literals_test() {
+  compiler.compile(
+    service_prelude
+    <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tname := \"Inbox\"\n\thive.syslink.register(name, b)\n}\n",
+  )
+  |> should.be_error
+}
+
+// A service on this node is reached by name alone; one elsewhere by the endpoint
+// its node can be dialed at. Only the service name is an atom — the endpoint is
+// ordinary data, so a cluster's size need not be known when the program is
+// written.
+pub fn syslink_at_and_on_compile_test() {
+  compiler.compile(
+    service_prelude
+    <> "proc main(): void {\n\thive.syslink.send(hive.syslink.at(#Inbox), Op.Put(\"k\"))\n\tfor each e in split(\"a:1,b:2\", \",\") {\n\t\thive.syslink.send(hive.syslink.on(e, #Inbox), Op.Put(\"k\"))\n\t}\n}\n",
+  )
+  |> should.be_ok
+}
+
+// The node roles that `at` used to take were atoms too. Removing them is what
+// lets a peer list be computed, so the old two-atom spelling must not silently
+// mean something else.
+pub fn syslink_node_roles_are_gone_test() {
+  compiler.compile(
+    service_prelude
+    <> "proc main(): void {\n\thive.syslink.peer(#There, \"127.0.0.1:9100\")\n}\n",
+  )
+  |> should.be_error
+}
+
+pub fn syslink_on_endpoint_may_be_computed_test() {
+  compiler.compile(
+    service_prelude
+    <> "proc main(): void {\n\thost := \"10.0.0.4\"\n\thive.syslink.send(hive.syslink.on(host + \":9100\", #Inbox), Op.Put(\"k\"))\n}\n",
+  )
+  |> should.be_ok
+}
+
+// The service name still may not be, since the registry it keys is what the
+// compiler knows at compile time.
+pub fn syslink_on_service_name_must_be_an_atom_test() {
+  compiler.compile(
+    service_prelude
+    <> "proc main(): void {\n\tn := \"Inbox\"\n\thive.syslink.send(hive.syslink.on(\"10.0.0.4:9100\", n), Op.Put(\"k\"))\n}\n",
+  )
+  |> should.be_error
+}
+
+// There is no separate `call`: one `send` serves both, and the call site decides
+// which it is. The old spelling gets an error that says so.
+pub fn syslink_has_no_call_member_test() {
+  compiler.compile(
+    service_prelude
+    <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\thive.syslink.call(b, Op.Count(), 1000)\n}\n",
+  )
+  |> should.be_error
+}
+
+// Discarded, a send is a cast: nothing is registered for a reply, so it lowers
+// to the cheaper runtime call.
+pub fn syslink_discarded_send_is_a_cast_test() {
+  let assert Ok(go) =
+    compiler.compile(
+      service_prelude
+      <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\thive.syslink.send(b, Op.Put(\"k\"))\n}\n",
+    )
+  string.contains(go, "hive.SyslinkSend(") |> should.be_true
+  string.contains(go, "hive.SyslinkSendAwaitable(") |> should.be_false
+}
+
+// Awaited, the very same statement is a request — and the answer needs no type
+// annotation, because a service replies with one of its own messages.
+pub fn syslink_awaited_send_is_a_request_test() {
+  let assert Ok(go) =
+    compiler.compile(
+      service_prelude
+      <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tif await hive.syslink.send(b, Op.Count()) is Result.Ok(reply) {\n\t\tif reply is Op.Put(k) {\n\t\t\techo k\n\t\t}\n\t}\n}\n",
+    )
+  string.contains(go, "hive.SyslinkSendAwaitable(") |> should.be_true
+  string.contains(go, "hive.SyslinkAwait(") |> should.be_true
+}
+
+// A request can be held and awaited later, which is what makes it worth having a
+// value at all.
+pub fn syslink_held_request_compiles_test() {
+  compiler.compile(
+    service_prelude
+    <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tpending := hive.syslink.send(b, Op.Count())\n\techo \"meanwhile\"\n\tif await pending with timeout 250 is Result.Error(e) {\n\t\techo e.reason\n\t}\n}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn syslink_await_many_requests_compiles_test() {
+  compiler.compile(
+    service_prelude
+    <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tboth := await [hive.syslink.send(b, Op.Count()), hive.syslink.send(b, Op.Count())] with timeout 500\n\tif both[0] is Result.Ok(_) {\n\t\techo \"first answered\"\n\t}\n}\n",
+  )
+  |> should.be_ok
+}
+
+// ---------------------------------------------------------------------------
+// `await ... with timeout <ms>`
+// ---------------------------------------------------------------------------
+
+const async_prelude = "async func slow(text: Str): Str {\n\treturn text\n}\n"
+
+// Bounding the wait on a plain task is what gives it a failure case, so the
+// award becomes a Result exactly when the clause is written.
+pub fn await_timeout_yields_a_result_test() {
+  compiler.compile(
+    async_prelude
+    <> "proc main(): void {\n\th := slow(\"x\")\n\tif await h with timeout 50 is Result.Error(err) {\n\t\techo err.message\n\t\techo err.waited\n\t}\n}\n",
+  )
+  |> should.be_ok
+}
+
+// Without the clause the same await yields the plain value and lowers to a bare
+// `.Await()`. (Hive has no full type checker, so *treating* that value as a
+// Result is caught by the Go compiler rather than here — the observable
+// difference at this level is the lowering.)
+pub fn await_without_timeout_yields_the_value_test() {
+  let assert Ok(go) =
+    compiler.compile(
+      async_prelude
+      <> "proc main(): void {\n\th := slow(\"x\")\n\techo await h\n}\n",
+    )
+  string.contains(go, "h.Await()") |> should.be_true
+  string.contains(go, "AwaitTimeout") |> should.be_false
+}
+
+pub fn await_timeout_on_a_vector_compiles_test() {
+  compiler.compile(
+    async_prelude
+    <> "proc main(): void {\n\ths := [slow(\"a\"), slow(\"b\")]\n\tif await hs with timeout 500 is Result.Ok(done) {\n\t\techo join(done, \",\")\n\t}\n}\n",
+  )
+  |> should.be_ok
+}
+
+// A direct `await call()` normally needs no handle at all, but a bounded one does
+// — something has to still be running when the wait gives up.
+pub fn await_timeout_on_a_direct_call_spawns_a_handle_test() {
+  let assert Ok(go) =
+    compiler.compile(
+      async_prelude
+      <> "proc main(): void {\n\tif await slow(\"x\") with timeout 50 is Result.Ok(v) {\n\t\techo v\n\t}\n}\n",
+    )
+  string.contains(go, "hive.AwaitTimeout(hive.Spawn(") |> should.be_true
+}
+
+pub fn with_timeout_only_follows_an_await_test() {
+  compiler.compile("proc main(): void {\n\techo 1 with timeout 50\n}\n")
+  |> should.be_error
+}
+
+// `timeout` is deliberately not a reserved word: it means something only in the
+// two-token `with timeout` clause, so it stays usable as an ordinary name.
+pub fn timeout_is_still_a_usable_identifier_test() {
+  compiler.compile(
+    "proc main(): void {\n\ttimeout := 30\n\techo timeout\n}\n",
+  )
+  |> should.be_ok
+}
+
+// The clause stops before `is`, so the comparison is not folded into the
+// millisecond count.
+pub fn timeout_clause_stops_before_is_test() {
+  let assert Ok(go) =
+    compiler.compile(
+      async_prelude
+      <> "proc main(): void {\n\th := slow(\"x\")\n\tif await h with timeout 50 is Result.Ok(v) {\n\t\techo v\n\t}\n}\n",
+    )
+  string.contains(go, "50.IsOk()") |> should.be_false
+  string.contains(go, ", 50)") |> should.be_true
+}
+
+pub fn syslink_unknown_member_is_rejected_test() {
+  compiler.compile(
+    "proc main(): void {\n\thive.syslink.broadcast(#Inbox)\n}\n",
+  )
+  |> should.be_error
+}
+
+// A service outlives the scope that spawned it, so its address is an ordinary
+// value: it can be a parameter, a field, and travel inside a message.
+pub fn syslink_address_is_a_plain_value_test() {
+  compiler.compile(
+    "type Op {\n\tWatch { peer: hive.syslink.Address }\n}\n\nproc box(n: Int, op: Op, from: hive.syslink.Envelope): Int {\n\tif op is Op.Watch(peer) {\n\t\thive.syslink.monitor(from, peer, Op.Watch(hive.syslink.self(from)))\n\t}\n\treturn n\n}\n\nproc pass(a: hive.syslink.Address): void {\n\thive.syslink.send(a, Op.Watch(a))\n}\n\nproc main(): void {\n\tpass(hive.syslink.spawn(box, 0))\n}\n",
+  )
+  |> should.be_ok
+}
+
+// The digest travels in every frame so a peer built from a different
+// declaration fails loudly instead of decoding another type's bytes. Sender and
+// recipient must therefore agree on it within one build.
+pub fn syslink_send_and_spawn_agree_on_the_digest_test() {
+  let assert Ok(go) =
+    compiler.compile(
+      service_prelude
+      <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\thive.syslink.send(b, Op.Put(\"k\"))\n}\n",
+    )
+  // Both call sites name the same 32-bit digest, so exactly one distinct value
+  // appears across the spawn and the send.
+  let digests =
+    go
+    |> string.split("0x")
+    |> list.drop(1)
+    |> list.map(fn(rest) { string.slice(rest, 0, 8) })
+    |> list.unique
+  digests |> list.length |> should.equal(1)
+}
+
 // ---------------------------------------------------------------------------
 // Vector bounds checking (flow-sensitive out-of-bounds prevention)
 // ---------------------------------------------------------------------------

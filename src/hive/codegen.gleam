@@ -49,6 +49,24 @@ pub type Ty {
   /// by `await` (which unwraps it back to `inner`). Lowers to
   /// `*hive.Async[inner]`.
   TyAsync(inner: Ty)
+  /// The address of a `hive.syslink` service, carrying the type of the mailbox
+  /// it delivers to. Like `async T` the payload type has no surface spelling:
+  /// it is inferred from the handler a service was spawned with, or from the
+  /// registry entry a name resolves to, which is what lets `send` be checked
+  /// against the mailbox it is addressing. An *annotated*
+  /// `hive.syslink.Address` carries `TyUnknown` and is simply unchecked.
+  /// Unlike `async T` an address is a plain value: it outlives its scope, can
+  /// be stored and sent, and is never awaited.
+  TyAddress(msg: Ty)
+  /// A `hive.syslink` request in flight — what a kept `send` evaluates to. Like
+  /// `async T` it has no surface spelling and is only ever inferred, bound and
+  /// consumed by `await`, which resolves it to `Result<msg, SyslinkError>`. A
+  /// service answers with one of its own messages, so the reply type *is* the
+  /// mailbox type and no annotation is needed anywhere.
+  ///
+  /// It is not a `TyAsync`: no goroutine is waiting behind it. The answer
+  /// arrives on the connection's reader, so the wait happens at the `await`.
+  TyPending(msg: Ty)
   /// The absence of a value — only meaningful as a function type's return, so
   /// a `proc(T): void` value lowers to `func(T)` with no Go return type.
   TyVoid
@@ -95,6 +113,17 @@ pub fn builtin_fields(name: String) -> Option(List(#(String, Ty))) {
     // resolve to `TyBuiltin("SqlConnection")`, which `using ... with ...` needs
     // in order to run a SQL query rather than read a CSV.
     "SqlConnection" -> Some([])
+    // A service address and a turn's envelope. Both are opaque — an address is
+    // produced by `spawn`/`at`/`self` and an envelope only ever arrives as a
+    // handler's third parameter — but registering them here is what lets a
+    // parameter, field or variable be declared `hive.syslink.Address` /
+    // `hive.syslink.Envelope` and resolve to a known type, which the handler
+    // shape check relies on.
+    "Address" -> Some([])
+    "Envelope" -> Some([])
+    "SyslinkError" -> Some([#("reason", TyStr), #("message", TyStr)])
+    // What `await ... with timeout <ms>` yields when the wait runs out.
+    "TimeoutError" -> Some([#("waited", TyInt), #("message", TyStr)])
     _ -> None
   }
 }
@@ -113,6 +142,8 @@ pub fn builtin_qualifier(name: String) -> String {
     "EnvironmentError" -> "hive.env"
     "FileError" -> "hive.file"
     "SqlError" | "SqlConnection" | "DatabaseDriver" -> "hive.sql"
+    "Address" | "Envelope" | "SyslinkError" -> "hive.syslink"
+    "TimeoutError" -> "hive.task"
     _ -> "hive"
   }
 }
@@ -194,6 +225,17 @@ type Env {
     /// first-class function values — the closure a partial application lowers
     /// to needs the exact parameter and return types.
     fns: Dict(String, #(Bool, List(ast.Field), ast.TypeExpr)),
+    /// The program's service registry, known at compile time: registered name
+    /// -> the message type of the mailbox behind it. Registered names come
+    /// from a closed set of atoms and cannot be computed, so this table is
+    /// complete for every name this program registers — which is what lets
+    /// `hive.syslink.at(#Node, #Name)` infer its mailbox type instead of being
+    /// told, and lets a `send` to a remote service be type-checked at all.
+    mailboxes: Dict(String, ast.TypeExpr),
+    /// Every proc/func body, keyed by name. Needed to answer questions about a
+    /// callable that are not visible from its signature — such as whether a
+    /// service handler ever lets its envelope outlive the turn it arrived in.
+    bodies: Dict(String, List(ast.Stmt)),
   )
 }
 
@@ -225,6 +267,8 @@ pub fn generate(module: ast.Module) -> String {
       dict.new(),
       dict.new(),
       fns,
+      collect_mailboxes(module, fns),
+      collect_bodies(module.decls),
     )
 
   let type_code =
@@ -253,12 +297,410 @@ pub fn generate(module: ast.Module) -> String {
     })
     |> string.join("\n")
 
-  let json_code = gen_json_support(env, module)
+  // Whether the program reached for syslink is decided by the code just
+  // generated, the same way `runtime.needed_modules` decides which library
+  // modules to write at all.
+  let json_code =
+    gen_json_support(env, module, string.contains(fn_code, "hive.Syslink"))
 
   let clone_code = gen_clone_support(env, module)
 
   let body = type_code <> "\n" <> atom_code <> clone_code <> json_code <> fn_code
   gen_header(body) <> "\n" <> body
+}
+
+// ---------------------------------------------------------------------------
+// The compile-time service registry
+// ---------------------------------------------------------------------------
+// Registered names are atoms, and an atom cannot be computed: the set of names
+// a program uses is closed and known before it runs. That is what makes this
+// table possible, and it is what Erlang cannot have — `list_to_atom/1` means a
+// registered name there is never knowable at compile time.
+//
+// The table pairs each registered name with the message type of the mailbox
+// behind it, by following `register(#Name, …)` back to the handler the service
+// was spawned with. Two shapes are resolved, which between them cover how the
+// call is actually written:
+//
+//     hive.syslink.register(#Inbox, hive.syslink.spawn(inbox, 0))
+//     box := hive.syslink.spawn(inbox, 0)
+//     hive.syslink.register(#Inbox, box)
+//
+// Anything else leaves the name unresolved, and an `at` on it needs a `with`
+// clause to say what it expects — which is also the escape hatch for a cluster
+// whose nodes are not all the same binary.
+
+fn collect_bodies(decls: List(ast.Decl)) -> Dict(String, List(ast.Stmt)) {
+  list.fold(decls, dict.new(), fn(acc, d) {
+    case d {
+      ast.ProcDecl(name, _, _, body) | ast.FuncDecl(name, _, _, body, _) ->
+        dict.insert(acc, name, body)
+      _ -> acc
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Does a service handler's envelope outlive its turn?
+// ---------------------------------------------------------------------------
+// The runtime wants to fail a request the moment a turn ends without answering
+// it, so that forgetting to reply on one branch reads as "handled but never
+// answered" instead of a timeout five seconds later. That is only safe when no
+// answer can still be coming — which is a question about where the envelope
+// goes, and one the compiler can settle.
+//
+// The envelope cannot outlive the turn if it appears *only* as the subject of
+// `answer`, `self` and `monitor` — the three calls the runtime controls, none of
+// which keep the reply token. Anywhere else it might be stored in the returned
+// state, captured by a spawned task, or handed to another callable, and the
+// answer may genuinely still be on its way, so the automatic reply is switched
+// off for that handler.
+//
+// The analysis is deliberately conservative and per-handler, exactly like the
+// copy-vs-alias rule for value semantics: an escape anywhere disables it
+// everywhere in that service, and being unsure counts as an escape. Getting it
+// wrong that way costs a timeout; the other way would cut off a live request.
+
+fn bool_lit(b: Bool) -> String {
+  case b {
+    True -> "true"
+    False -> "false"
+  }
+}
+
+// Whether the runtime may fail an unanswered request as soon as the turn ends.
+fn replies_in_turn(env: Env, handler: ast.Expr) -> Bool {
+  let name = case handler {
+    ast.EIdent(n) -> Some(n)
+    ast.ECall(ast.EIdent(n), _) -> Some(n)
+    _ -> None
+  }
+  case name {
+    None -> False
+    Some(n) ->
+      case dict.get(env.fns, n), dict.get(env.bodies, n) {
+        Ok(#(_, params, _)), Ok(body) ->
+          case envelope_param(params) {
+            // No envelope parameter at all: nothing can answer, so an unanswered
+            // request is always final.
+            None -> True
+            Some(envelope) -> !escapes_in_stmts(envelope, body)
+          }
+        _, _ -> False
+      }
+  }
+}
+
+// The handler's envelope parameter, found by its type rather than its position,
+// so a partial application is read the same way as a bare name.
+fn envelope_param(params: List(ast.Field)) -> Option(String) {
+  params
+  |> list.find(fn(p) {
+    case p.typ {
+      ast.TName(Some("hive.syslink"), "Envelope", []) -> True
+      _ -> False
+    }
+  })
+  |> option.from_result
+  |> option.map(fn(p) { p.name })
+}
+
+fn escapes_in_stmts(name: String, stmts: List(ast.Stmt)) -> Bool {
+  list.any(stmts, fn(s) { escapes_in_stmt(name, s) })
+}
+
+fn escapes_in_stmt(name: String, s: ast.Stmt) -> Bool {
+  case s {
+    ast.SVarDecl(_, value, _) | ast.STypedDecl(_, _, value, _) ->
+      escapes_in_expr(name, value)
+    ast.SAssign(target, value) ->
+      escapes_in_expr(name, target) || escapes_in_expr(name, value)
+    ast.SReturn(Some(e)) -> escapes_in_expr(name, e)
+    ast.SReturn(None) | ast.SBreak | ast.SContinue -> False
+    ast.SEcho(e) | ast.SAssert(e) | ast.SPanic(e) | ast.SExpr(e) ->
+      escapes_in_expr(name, e)
+    ast.SIf(branches, else_body) ->
+      list.any(branches, fn(b) {
+        escapes_in_expr(name, b.cond) || escapes_in_stmts(name, b.body)
+      })
+      || case else_body {
+        Some(body) -> escapes_in_stmts(name, body)
+        None -> False
+      }
+    ast.SFor(init, cond, post, body) ->
+      case init {
+        Some(i) -> escapes_in_stmt(name, i)
+        None -> False
+      }
+      || case cond {
+        Some(c) -> escapes_in_expr(name, c)
+        None -> False
+      }
+      || case post {
+        Some(p) -> escapes_in_stmt(name, p)
+        None -> False
+      }
+      || escapes_in_stmts(name, body)
+    ast.SForEach(_, _, iterable, body) ->
+      escapes_in_expr(name, iterable) || escapes_in_stmts(name, body)
+  }
+}
+
+fn escapes_in_expr(name: String, e: ast.Expr) -> Bool {
+  case e {
+    // The three calls that consume an envelope without keeping it. The envelope
+    // may be their first argument; everything else is still checked, so
+    // `monitor(from, peer, Msg.Watch(self(from)))` reads as no escape while
+    // `monitor(from, peer, Msg.Hold(from))` reads as one.
+    ast.ECall(
+      ast.EMember(ast.EMember(ast.EIdent("hive"), "syslink"), fname),
+      args,
+    ) if fname == "answer" || fname == "self" || fname == "monitor" -> {
+      let params = case fname {
+        "answer" -> ["from", "value"]
+        "self" -> ["from"]
+        _ -> ["from", "target", "message"]
+      }
+      let #(assigned, extra) = assign_args(args, params)
+      case assigned {
+        [#(_, first), ..rest] ->
+          // Anything more elaborate than the bare name in the envelope slot is
+          // not something this pass will vouch for.
+          case first {
+            ast.EIdent(n) if n == name ->
+              list.any(rest, fn(pair) { escapes_in_expr(name, pair.1) })
+              || list.any(extra, fn(a) { escapes_in_expr(name, a) })
+            _ ->
+              escapes_in_expr(name, first)
+              || list.any(rest, fn(pair) { escapes_in_expr(name, pair.1) })
+              || list.any(extra, fn(a) { escapes_in_expr(name, a) })
+          }
+        [] -> list.any(extra, fn(a) { escapes_in_expr(name, a) })
+      }
+    }
+    // A bare mention anywhere else: it could be going anywhere.
+    ast.EIdent(n) -> n == name
+    ast.ECall(callee, args) ->
+      escapes_in_expr(name, callee)
+      || list.any(args, fn(a) { escapes_in_expr(name, a.value) })
+    ast.EMember(target, _) -> escapes_in_expr(name, target)
+    ast.EVector(items) -> list.any(items, fn(i) { escapes_in_expr(name, i) })
+    ast.EIndex(target, index) ->
+      escapes_in_expr(name, target) || escapes_in_expr(name, index)
+    ast.ESlice(target, low, high) ->
+      escapes_in_expr(name, target)
+      || case low {
+        Some(l) -> escapes_in_expr(name, l)
+        None -> False
+      }
+      || case high {
+        Some(h) -> escapes_in_expr(name, h)
+        None -> False
+      }
+    ast.EBinary(_, l, r) ->
+      escapes_in_expr(name, l) || escapes_in_expr(name, r)
+    ast.EIs(subject, _) -> escapes_in_expr(name, subject)
+    ast.EUsing(source, kind) ->
+      escapes_in_expr(name, source)
+      || list.any(ast.using_exprs(kind), fn(x) { escapes_in_expr(name, x) })
+    ast.EWith(value, _) -> escapes_in_expr(name, value)
+    ast.EAwait(value, timeout) ->
+      escapes_in_expr(name, value)
+      || case timeout {
+        Some(ms) -> escapes_in_expr(name, ms)
+        None -> False
+      }
+    ast.EInterp(parts) ->
+      list.any(parts, fn(p) {
+        case p {
+          ast.ILit(_) -> False
+          ast.IExpr(inner) -> escapes_in_expr(name, inner)
+        }
+      })
+    ast.EInt(_) | ast.EFloat(_) | ast.EString(_) | ast.EBool(_) | ast.EAtom(_) ->
+      False
+  }
+}
+
+fn collect_mailboxes(
+  module: ast.Module,
+  fns: Dict(String, #(Bool, List(ast.Field), ast.TypeExpr)),
+) -> Dict(String, ast.TypeExpr) {
+  module.decls
+  |> list.fold(dict.new(), fn(acc, d) {
+    case d {
+      ast.ProcDecl(_, _, _, body) | ast.FuncDecl(_, _, _, body, _) ->
+        mailboxes_in_stmts(body, fns, dict.new(), acc).1
+      _ -> acc
+    }
+  })
+}
+
+// Walks a body carrying two tables: `spawned` maps a local variable to the
+// message type of the service it holds, and `found` is the registry being
+// built.
+fn mailboxes_in_stmts(
+  stmts: List(ast.Stmt),
+  fns: Dict(String, #(Bool, List(ast.Field), ast.TypeExpr)),
+  spawned: Dict(String, ast.TypeExpr),
+  found: Dict(String, ast.TypeExpr),
+) -> #(Dict(String, ast.TypeExpr), Dict(String, ast.TypeExpr)) {
+  list.fold(stmts, #(spawned, found), fn(acc, s) {
+    let #(sp, fd) = acc
+    case s {
+      ast.SVarDecl(name, value, _) | ast.STypedDecl(_, name, value, _) ->
+        case spawn_msg_type(value, fns) {
+          Some(msg) -> #(dict.insert(sp, name, msg), fd)
+          None -> #(sp, register_in_expr(value, fns, sp, fd))
+        }
+      ast.SExpr(e) | ast.SEcho(e) | ast.SAssert(e) | ast.SPanic(e) -> #(
+        sp,
+        register_in_expr(e, fns, sp, fd),
+      )
+      ast.SReturn(Some(e)) -> #(sp, register_in_expr(e, fns, sp, fd))
+      ast.SReturn(None) | ast.SBreak | ast.SContinue -> acc
+      ast.SAssign(_, value) -> #(sp, register_in_expr(value, fns, sp, fd))
+      ast.SIf(branches, else_body) -> {
+        let after =
+          list.fold(branches, acc, fn(inner, b) {
+            mailboxes_in_stmts(b.body, fns, inner.0, inner.1)
+          })
+        case else_body {
+          Some(body) -> mailboxes_in_stmts(body, fns, after.0, after.1)
+          None -> after
+        }
+      }
+      ast.SFor(_, _, _, body) | ast.SForEach(_, _, _, body) ->
+        mailboxes_in_stmts(body, fns, sp, fd)
+    }
+  })
+}
+
+// `hive.syslink.register(#Name, …)` anywhere in an expression.
+fn register_in_expr(
+  e: ast.Expr,
+  fns: Dict(String, #(Bool, List(ast.Field), ast.TypeExpr)),
+  spawned: Dict(String, ast.TypeExpr),
+  found: Dict(String, ast.TypeExpr),
+) -> Dict(String, ast.TypeExpr) {
+  case e {
+    ast.ECall(
+      ast.EMember(ast.EMember(ast.EIdent("hive"), "syslink"), "register"),
+      args,
+    ) ->
+      case assign_args(args, ["name", "address"]) {
+        #([#(_, ast.EAtom(name)), #(_, address)], []) ->
+          case spawn_msg_type(address, fns) {
+            Some(msg) -> dict.insert(found, name, msg)
+            None ->
+              case address {
+                ast.EIdent(v) ->
+                  case dict.get(spawned, v) {
+                    Ok(msg) -> dict.insert(found, name, msg)
+                    Error(_) -> found
+                  }
+                _ -> found
+              }
+          }
+        _ -> found
+      }
+    // `register` is normally a statement, but it can sit inside an `if` guard
+    // (`if register(...) is Result.Ok(a)`), so keep looking through the shapes
+    // that can hold a call.
+    ast.ECall(_, args) ->
+      list.fold(args, found, fn(acc, a) {
+        register_in_expr(a.value, fns, spawned, acc)
+      })
+    ast.EBinary(_, l, r) ->
+      register_in_expr(r, fns, spawned, register_in_expr(l, fns, spawned, found))
+    ast.EIs(value, _) | ast.EWith(value, _) | ast.EAwait(value, _) ->
+      register_in_expr(value, fns, spawned, found)
+    _ -> found
+  }
+}
+
+// The message type of `hive.syslink.spawn(handler, state)`, read off the
+// handler's own declaration.
+fn spawn_msg_type(
+  e: ast.Expr,
+  fns: Dict(String, #(Bool, List(ast.Field), ast.TypeExpr)),
+) -> Option(ast.TypeExpr) {
+  case e {
+    ast.ECall(
+      ast.EMember(ast.EMember(ast.EIdent("hive"), "syslink"), "spawn"),
+      args,
+    ) ->
+      case assign_args(args, ["handler", "state"]) {
+        #([#(_, handler), #(_, _)], []) -> handler_msg_type(handler, fns)
+        _ -> None
+      }
+    _ -> None
+  }
+}
+
+/// The message type a spawn handler accepts: the second of the three
+/// parameters the runtime fills (state, message, envelope).
+pub fn handler_msg_type(
+  handler: ast.Expr,
+  fns: Dict(String, #(Bool, List(ast.Field), ast.TypeExpr)),
+) -> Option(ast.TypeExpr) {
+  case handler_params(handler, fns) {
+    [_, msg, ..] -> Some(msg)
+    _ -> None
+  }
+}
+
+/// The parameters a handler expression leaves for the runtime to fill: all of
+/// them for a bare name, and only the `_` holes for a partial application
+/// (`inbox(_, _, _, db)`), which is what makes the shape check see through one.
+pub fn handler_params(
+  handler: ast.Expr,
+  fns: Dict(String, #(Bool, List(ast.Field), ast.TypeExpr)),
+) -> List(ast.TypeExpr) {
+  case handler {
+    ast.EIdent(name) ->
+      case dict.get(fns, name) {
+        Ok(#(_, params, _)) -> list.map(params, fn(p) { p.typ })
+        Error(_) -> []
+      }
+    ast.ECall(ast.EIdent(name), args) ->
+      case dict.get(fns, name) {
+        Ok(#(_, params, _)) -> {
+          let #(assigned, _) =
+            assign_args(args, list.map(params, fn(p) { p.name }))
+          list.zip(assigned, params)
+          |> list.filter_map(fn(pair) {
+            let #(#(_, expr), field) = pair
+            case is_hole_expr(expr) {
+              True -> Ok(field.typ)
+              False -> Error(Nil)
+            }
+          })
+        }
+        Error(_) -> []
+      }
+    _ -> []
+  }
+}
+
+/// The return type of a handler expression, for the shape check.
+pub fn handler_ret(
+  handler: ast.Expr,
+  fns: Dict(String, #(Bool, List(ast.Field), ast.TypeExpr)),
+) -> Option(ast.TypeExpr) {
+  let name = case handler {
+    ast.EIdent(n) -> Some(n)
+    ast.ECall(ast.EIdent(n), _) -> Some(n)
+    _ -> None
+  }
+  case name {
+    Some(n) ->
+      case dict.get(fns, n) {
+        Ok(#(_, _, ret)) -> Some(ret)
+        Error(_) -> None
+      }
+    None -> None
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +802,7 @@ fn uses_json_expr(e: ast.Expr) -> Bool {
     ast.EIs(subject, _) -> uses_json_expr(subject)
     ast.EUsing(source, kind) ->
       uses_json_expr(source) || list.any(ast.using_exprs(kind), uses_json_expr)
-    ast.EAwait(value) -> uses_json_expr(value)
+    ast.EAwait(value, _) -> uses_json_expr(value)
   }
 }
 
@@ -520,7 +962,7 @@ fn atoms_in_expr(e: ast.Expr, acc: List(String)) -> List(String) {
         atoms_in_expr(e, a)
       })
     ast.EWith(value, _) -> atoms_in_expr(value, acc)
-    ast.EAwait(value) -> atoms_in_expr(value, acc)
+    ast.EAwait(value, _) -> atoms_in_expr(value, acc)
   }
 }
 
@@ -612,7 +1054,15 @@ fn ty_of_type_expr(types: Dict(String, ast.Decl), t: ast.TypeExpr) -> Ty {
       case builtin_fields(name) {
         Some(_) ->
           case pkg == builtin_qualifier(name) {
-            True -> wrap_dims(TyBuiltin(name), dims)
+            // An address written out in an annotation has no message type to
+            // carry (there is no surface syntax for one), so it is the
+            // unchecked form. An address that came from `spawn` or `at` keeps
+            // the mailbox type inference gave it.
+            True ->
+              case name {
+                "Address" -> wrap_dims(TyAddress(TyUnknown), dims)
+                _ -> wrap_dims(TyBuiltin(name), dims)
+              }
             False -> wrap_dims(TyUnknown, dims)
           }
         None -> wrap_dims(TyUnknown, dims)
@@ -727,6 +1177,8 @@ fn ty_to_go(ty: Ty) -> String {
     TyVoid -> ""
     TyUnknown -> "any"
     TyAsync(inner) -> "*hive.Async[" <> async_inner_go(inner) <> "]"
+    TyAddress(_) -> "hive.Address"
+    TyPending(msg) -> "*hive.SyslinkPending[" <> async_inner_go(msg) <> "]"
   }
 }
 
@@ -810,8 +1262,11 @@ fn gen_fields(_env: Env, fields: List(ast.Field)) -> String {
 // `{"VariantName": {...}}` shape (JSON null selects the first field-less
 // variant when one exists).
 
-fn gen_json_support(env: Env, module: ast.Module) -> String {
-  case uses_json_module(module) {
+// `force` is set when something other than `hive.json` needs the derived
+// codecs: a syslink program encodes messages with exactly the ones a type
+// declaration already produces, even if it never mentions `hive.json` itself.
+fn gen_json_support(env: Env, module: ast.Module, force: Bool) -> String {
+  case force || uses_json_module(module) {
     False -> ""
     True ->
       module.decls
@@ -833,6 +1288,9 @@ fn gen_json_support(env: Env, module: ast.Module) -> String {
 /// something of type `func(hive.JsonValue, string) (T, *hive.JsonError)`.
 fn json_decoder_ref(env: Env, t: ast.TypeExpr) -> String {
   case t {
+    // A service address travels inside a message, so it needs a codec of its
+    // own: it is the one builtin whose value means something on another node.
+    ast.TName(Some("hive.syslink"), "Address", []) -> "hive.JsonAddress"
     ast.TName(None, name, []) ->
       case name {
         "Str" | "String" -> "hive.JsonStr"
@@ -1316,6 +1774,14 @@ fn gen_stmt(
       }
       #(pad <> target <> " = " <> gen_append(env, args) <> "\n", env)
     }
+    // `hive.syslink.send(...)` as a bare statement wants no answer, so it lowers
+    // to the cast: nothing is registered for a reply and nothing can be awaited.
+    // The same call keeping its value is a request instead — the call site
+    // decides, just as it does for an `async func` below.
+    ast.SExpr(ast.ECall(
+      ast.EMember(ast.EMember(ast.EIdent("hive"), "syslink"), "send"),
+      args,
+    )) -> #(pad <> gen_syslink_send(env, args, False) <> "\n", env)
     // A bare call to an `async func` as a statement is fire-and-forget: run it
     // on its own goroutine and discard the result. `go f(x)` is the cheapest
     // lowering (no handle, no channel) — the `hive.Spawn` handle form is only
@@ -2055,6 +2521,52 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
                     // `sleep` is a void statement.
                     _ -> TyVoid
                   }
+                "syslink" ->
+                  case fname {
+                    // A spawned service's address carries the type of the
+                    // mailbox behind it, read off the handler it was given.
+                    "spawn" ->
+                      case assign_args(args, ["handler", "state"]) {
+                        #([#(_, handler), _], []) ->
+                          TyAddress(handler_msg_ty(env, handler))
+                        _ -> TyAddress(TyUnknown)
+                      }
+                    // Neither `at` nor `on` needs a `with`: the service name is
+                    // an atom, so the registry that answers "what does this
+                    // mailbox take?" is known at compile time. The node is just
+                    // an endpoint and tells the compiler nothing, which is
+                    // exactly why it does not need to be an atom.
+                    "at" ->
+                      case assign_args(args, ["name"]) {
+                        #([#(_, ast.EAtom(name))], []) ->
+                          registered_address(env, name)
+                        _ -> TyAddress(TyUnknown)
+                      }
+                    "on" ->
+                      case assign_args(args, ["endpoint", "name"]) {
+                        #([_, #(_, ast.EAtom(name))], []) ->
+                          registered_address(env, name)
+                        _ -> TyAddress(TyUnknown)
+                      }
+                    "self" -> TyAddress(TyUnknown)
+                    "register" ->
+                      TyResult(
+                        TyAddress(TyUnknown),
+                        TyBuiltin("SyslinkError"),
+                      )
+                    "listen" -> TyResult(TyStr, TyBuiltin("SyslinkError"))
+                    "node" -> TyStr
+                    // A kept `send` is a request in flight. Discarded as a
+                    // statement it is a cast, which never reaches `infer`.
+                    "send" ->
+                      case assign_args(args, ["address", "message"]) {
+                        #([#(_, address), #(_, message)], []) ->
+                          TyPending(syslink_reply_ty(env, address, message))
+                        _ -> TyPending(TyUnknown)
+                      }
+                    // answer, monitor, peer and stop are void statements.
+                    _ -> TyVoid
+                  }
                 "time" ->
                   case fname {
                     "now" | "timezoneOffset" -> TyInt
@@ -2124,11 +2636,21 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
     // a vector of handles `(async T)[]` yields `T[]` (a barrier over all of
     // them). A direct `await asyncCall()` infers `TyAsync(T)` for the inner
     // call and so lands on the same `TyAsync(t) -> t` rule.
-    ast.EAwait(value) ->
-      case infer(env, value) {
-        TyAsync(t) -> t
-        TyVec(TyAsync(t)) -> TyVec(t)
-        other -> other
+    ast.EAwait(value, timeout) ->
+      case infer(env, value), timeout {
+        // A syslink request answers with a Result either way; a bound on the
+        // wait only adds a reason to its error, never a second Result around it.
+        TyPending(m), _ -> TyResult(m, TyBuiltin("SyslinkError"))
+        TyVec(TyPending(m)), _ ->
+          TyVec(TyResult(m, TyBuiltin("SyslinkError")))
+        // Bounding the wait on a plain task is what gives it a failure case at
+        // all, so the type gains a Result exactly when the clause is written.
+        TyAsync(t), Some(_) -> TyResult(t, TyBuiltin("TimeoutError"))
+        TyAsync(t), None -> t
+        TyVec(TyAsync(t)), Some(_) ->
+          TyResult(TyVec(t), TyBuiltin("TimeoutError"))
+        TyVec(TyAsync(t)), None -> TyVec(t)
+        other, _ -> other
       }
   }
 }
@@ -2220,7 +2742,7 @@ fn gen_expr(env: Env, e: ast.Expr) -> String {
       }
     ast.ECall(callee, args) -> gen_call(env, callee, args)
     ast.EWith(value, typ) -> gen_with(env, value, typ)
-    ast.EAwait(value) -> gen_await(env, value)
+    ast.EAwait(value, timeout) -> gen_await(env, value, timeout)
   }
 }
 
@@ -2241,27 +2763,56 @@ fn gen_spawn(env: Env, name: String, args: List(ast.Arg)) -> String {
   }
 }
 
-// `await e`. A direct `await asyncCall()` needs no handle at all — it is just a
-// synchronous call, so it allocates neither goroutine nor channel. Otherwise the
-// operand is a held handle (`h.Await()`) or a vector of handles
-// (`hive.AwaitAll(hs)` — a barrier that preserves index order).
-fn gen_await(env: Env, value: ast.Expr) -> String {
+// `await e`, with the optional `with timeout <ms>`. A direct `await asyncCall()`
+// needs no handle at all — it is just a synchronous call, so it allocates
+// neither goroutine nor channel. A *bounded* one does need a handle, because
+// something has to be left running while the wait gives up. Otherwise the
+// operand is a held handle, a vector of handles (a barrier that preserves index
+// order), or a syslink request in flight.
+//
+// `0` milliseconds means "no bound of its own": the plain awaits ignore it and
+// syslink falls back to its own default patience.
+fn gen_await(env: Env, value: ast.Expr, timeout: Option(ast.Expr)) -> String {
+  let ms = case timeout {
+    Some(e) -> coerce(env, e, TyInt)
+    None -> "0"
+  }
   case value {
     ast.ECall(ast.EIdent(name), args) ->
-      case list.contains(env.asyncs, name) {
-        True -> gen_call(env, ast.EIdent(name), args)
-        False -> await_handle(env, value)
+      case list.contains(env.asyncs, name), timeout {
+        True, None -> gen_call(env, ast.EIdent(name), args)
+        True, Some(_) ->
+          "hive.AwaitTimeout(" <> gen_spawn(env, name, args) <> ", " <> ms <> ")"
+        False, _ -> await_handle(env, value, timeout, ms)
       }
-    _ -> await_handle(env, value)
+    _ -> await_handle(env, value, timeout, ms)
   }
 }
 
-fn await_handle(env: Env, value: ast.Expr) -> String {
-  case infer(env, value) {
-    TyVec(TyAsync(_)) -> "hive.AwaitAll(" <> gen_expr(env, value) <> ")"
-    TyAsync(_) -> gen_expr(env, value) <> ".Await()"
+fn await_handle(
+  env: Env,
+  value: ast.Expr,
+  timeout: Option(ast.Expr),
+  ms: String,
+) -> String {
+  let operand = gen_expr(env, value)
+  case infer(env, value), timeout {
+    // A syslink request already answers with a Result, so a bound on the wait
+    // becomes one more reason inside that error rather than a second Result
+    // wrapped around the first.
+    TyPending(_), _ -> "hive.SyslinkAwait(" <> operand <> ", " <> ms <> ")"
+    TyVec(TyPending(_)), _ ->
+      "hive.SyslinkAwaitAll(" <> operand <> ", " <> ms <> ")"
+    // A plain task has no failure channel at all, so bounding the wait is what
+    // introduces one.
+    TyVec(TyAsync(_)), Some(_) ->
+      "hive.AwaitAllTimeout(" <> operand <> ", " <> ms <> ")"
+    TyVec(TyAsync(_)), None -> "hive.AwaitAll(" <> operand <> ")"
+    TyAsync(_), Some(_) ->
+      "hive.AwaitTimeout(" <> operand <> ", " <> ms <> ")"
+    TyAsync(_), None -> operand <> ".Await()"
     // Not actually a task — leave it be; the type checkers reject this shape.
-    _ -> gen_expr(env, value)
+    _, _ -> operand
   }
 }
 
@@ -2991,6 +3542,7 @@ fn gen_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
             "env" -> gen_env_call(env, fname, args)
             "term" -> gen_term_call(env, fname, args)
             "task" -> gen_task_call(env, fname, args)
+            "syslink" -> gen_syslink_call(env, fname, args)
             "time" -> gen_time_call(env, fname, args)
             _ -> gen_plain_call(env, callee, args)
           }
@@ -3089,6 +3641,375 @@ fn gen_serve_call(env: Env, runtime_fn: String, args: List(ast.Arg)) -> String {
       <> gen_expr(env, handler)
       <> ")"
     _ -> runtime_fn <> "(" <> gen_args(env, args) <> ")"
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The `hive.syslink` namespace
+// ---------------------------------------------------------------------------
+// Every call that puts a message anywhere carries three extra arguments the
+// Hive source never mentions: an encoder, a decoder, and the structural digest
+// of the message type. They are what let one statement serve a mailbox in this
+// process and a service on another machine.
+
+fn gen_syslink_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
+  case fname {
+    "listen" ->
+      "hive.SyslinkListen("
+      <> gen_one_coerced(env, args, "endpoint", TyStr)
+      <> ")"
+    "node" -> "hive.SyslinkNode()"
+    // `spawn` installs the handler as the fold over the mailbox, plus the
+    // decoder for messages that arrive from another node.
+    "spawn" ->
+      case assign_args(args, ["handler", "state"]) {
+        #([#(_, handler), #(_, state)], []) -> {
+          let msg = handler_msg_type(handler, env.fns)
+          "hive.SyslinkSpawn("
+          <> gen_expr(env, handler)
+          <> ", "
+          // The initial state crosses into the service's own thread and is only
+          // ever touched there afterwards, so it is copied on the way in for the
+          // same reason a message is: nothing the spawner does later may be
+          // visible inside the service.
+          <> gen_copied(env, state)
+          <> ", "
+          <> syslink_decoder(env, msg)
+          <> ", "
+          <> syslink_digest(env, msg)
+          <> ", "
+          // Whether an unanswered request may be failed the instant the turn
+          // ends. See `replies_in_turn`.
+          <> bool_lit(replies_in_turn(env, handler))
+          <> ")"
+        }
+        _ -> "hive.SyslinkSpawn(" <> gen_args(env, args) <> ")"
+      }
+    "register" ->
+      case assign_args(args, ["name", "address"]) {
+        #([#(_, name), #(_, address)], []) ->
+          "hive.SyslinkRegister("
+          <> gen_expr(env, name)
+          <> ", "
+          <> gen_expr(env, address)
+          <> ")"
+        _ -> "hive.SyslinkRegister(" <> gen_args(env, args) <> ")"
+      }
+    // `at` is a service on this node, `on` the same service somewhere else. A
+    // node is identified by where it is — an endpoint resolvable at runtime
+    // through DNS or configuration — so the cluster's size never has to be known
+    // when the program is written.
+    "at" -> "hive.SyslinkAt(" <> gen_one_raw(env, args, "name") <> ")"
+    "on" ->
+      case assign_args(args, ["endpoint", "name"]) {
+        #([#(_, endpoint), #(_, name)], []) ->
+          "hive.SyslinkOn("
+          <> coerce(env, endpoint, TyStr)
+          <> ", "
+          <> gen_expr(env, name)
+          <> ")"
+        _ -> "hive.SyslinkOn(" <> gen_args(env, args) <> ")"
+      }
+    // Reached only where the value is kept, so this is the request form: it
+    // registers somewhere for the answer to land and returns without waiting.
+    // A `send` written as a bare statement is intercepted in `gen_stmt` and
+    // lowers to the cheaper cast instead — the call site decides, exactly as it
+    // does for an `async func`.
+    //
+    // Either way the message is copied on its way in, as binding it to a new
+    // name would copy it. That is the invariant the whole module rests on: a
+    // local send and a remote one are indistinguishable, so the recipient can
+    // never observe the sender mutating a message afterwards.
+    "send" -> gen_syslink_send(env, args, True)
+    "answer" ->
+      case assign_args(args, ["from", "value"]) {
+        #([#(_, from), #(_, value)], []) ->
+          "hive.SyslinkAnswer("
+          <> gen_expr(env, from)
+          <> ", "
+          <> gen_copied(env, value)
+          <> ", "
+          <> syslink_encoder_ty(infer(env, value))
+          <> ")"
+        _ -> "hive.SyslinkAnswer(" <> gen_args(env, args) <> ")"
+      }
+    "self" -> "hive.SyslinkSelf(" <> gen_one_raw(env, args, "from") <> ")"
+    "monitor" ->
+      case assign_args(args, ["from", "target", "message"]) {
+        #([#(_, from), #(_, target), #(_, message)], []) -> {
+          let msg = syslink_msg_of(env, ast.EIdent("_"), message)
+          "hive.SyslinkMonitor("
+          <> gen_expr(env, from)
+          <> ", "
+          <> gen_expr(env, target)
+          <> ", "
+          <> gen_copied(env, message)
+          <> ", "
+          <> syslink_encoder(env, msg)
+          <> ", "
+          <> syslink_digest(env, msg)
+          <> ")"
+        }
+        _ -> "hive.SyslinkMonitor(" <> gen_args(env, args) <> ")"
+      }
+    "stop" -> "hive.SyslinkStop(" <> gen_one_raw(env, args, "address") <> ")"
+    _ -> "hive.Syslink" <> exported(fname) <> "(" <> gen_args(env, args) <> ")"
+  }
+}
+
+// `hive.syslink.send(address, message)`. `awaitable` distinguishes the two
+// shapes the same statement takes: kept, it is a request with somewhere for the
+// answer to arrive; discarded, it is a cast that allocates nothing.
+fn gen_syslink_send(env: Env, args: List(ast.Arg), awaitable: Bool) -> String {
+  case assign_args(args, ["address", "message"]) {
+    #([#(_, address), #(_, message)], []) -> {
+      let msg = syslink_msg_of(env, address, message)
+      let head = case awaitable {
+        True -> "hive.SyslinkSendAwaitable("
+        False -> "hive.SyslinkSend("
+      }
+      // A service answers with one of its own messages, so the decoder for the
+      // answer is the very same one the mailbox uses. That is what removes the
+      // reply-type annotation from the await site entirely.
+      let tail = case awaitable {
+        True -> ", hive.SyslinkReplyDecoder(" <> syslink_decoder_ref(env, msg) <> ")"
+        False -> ""
+      }
+      head
+      <> gen_expr(env, address)
+      <> ", "
+      <> gen_copied(env, message)
+      <> ", "
+      <> syslink_encoder(env, msg)
+      <> ", "
+      <> syslink_digest(env, msg)
+      <> tail
+      <> ")"
+    }
+    _ -> "hive.SyslinkSend(" <> gen_args(env, args) <> ")"
+  }
+}
+
+fn syslink_decoder_ref(env: Env, msg: Option(ast.TypeExpr)) -> String {
+  case msg {
+    Some(typ) -> json_decoder_ref(env, typ)
+    None -> "hive.JsonFlatten"
+  }
+}
+
+// The message type a send is carrying: the mailbox type the address resolves
+// to when that is known (so the digest matches the recipient's), otherwise the
+// message expression's own type.
+fn syslink_msg_of(
+  env: Env,
+  address: ast.Expr,
+  message: ast.Expr,
+) -> Option(ast.TypeExpr) {
+  case infer(env, address) {
+    TyAddress(TyUnknown) | TyUnknown -> ty_type_expr(infer(env, message))
+    TyAddress(_) ->
+      // The address knows its mailbox type, but the digest has to be computed
+      // from a type *expression*; the message's own type is the same one when
+      // the program type-checks, and it is what is written at the call site.
+      ty_type_expr(infer(env, message))
+    _ -> ty_type_expr(infer(env, message))
+  }
+}
+
+// A best-effort type expression for an inferred type, so a derived codec can be
+// named for it. Only the shapes a message can actually have need to work.
+fn ty_type_expr(ty: Ty) -> Option(ast.TypeExpr) {
+  case ty {
+    TyStr -> Some(ast.TName(None, "Str", []))
+    TyInt -> Some(ast.TName(None, "Int", []))
+    TyFloat -> Some(ast.TName(None, "Float", []))
+    TyBool -> Some(ast.TName(None, "Bool", []))
+    TyAtom -> Some(ast.TName(None, "Atom", []))
+    TyTable -> Some(ast.TName(None, "Table", []))
+    TyCustom(name) -> Some(ast.TName(None, name, []))
+    TyVec(inner) ->
+      case ty_type_expr(inner) {
+        Some(ast.TName(pkg, name, dims)) ->
+          Some(ast.TName(pkg, name, [ast.DimDyn(None), ..dims]))
+        _ -> None
+      }
+    _ -> None
+  }
+}
+
+// A message is copied on its way into a mailbox, using the same deep,
+// type-directed copy a binding uses — never runtime reflection, and never at all
+// when the type owns no storage to share.
+fn gen_copied(env: Env, e: ast.Expr) -> String {
+  let ty = infer(env, e)
+  let rendered = gen_expr(env, e)
+  case needs_deep_copy_ty(env, ty) {
+    True -> gen_clone(env, ty, rendered, 0)
+    False -> rendered
+  }
+}
+
+// The mailbox type behind a registered service name, when the program registers
+// it somewhere. Registered names are atoms and cannot be computed, so this table
+// is complete for every name this build publishes.
+fn registered_address(env: Env, name: String) -> Ty {
+  case dict.get(env.mailboxes, name) {
+    Ok(typ) -> TyAddress(ty_of_type_expr(env.types, typ))
+    Error(_) -> TyAddress(TyUnknown)
+  }
+}
+
+// What awaiting a request resolves to. A service answers with one of its own
+// messages, so this is the mailbox type — taken from the address when the
+// registry knows it, and otherwise from the message being sent, which is the
+// same type whenever the program is right.
+fn syslink_reply_ty(env: Env, address: ast.Expr, message: ast.Expr) -> Ty {
+  case infer(env, address) {
+    TyAddress(TyUnknown) -> infer(env, message)
+    TyAddress(known) -> known
+    _ -> infer(env, message)
+  }
+}
+
+// The inferred message type of a spawn handler, for the address it produces.
+fn handler_msg_ty(env: Env, handler: ast.Expr) -> Ty {
+  case handler_msg_type(handler, env.fns) {
+    Some(typ) -> ty_of_type_expr(env.types, typ)
+    None -> TyUnknown
+  }
+}
+
+fn syslink_encoder(env: Env, msg: Option(ast.TypeExpr)) -> String {
+  case msg {
+    Some(typ) -> "hive.SyslinkEncoder(" <> json_encoder_ref(env, typ) <> ")"
+    None -> "hive.SyslinkEncoder(hive.JsonEncodeDynamic)"
+  }
+}
+
+fn syslink_encoder_ty(ty: Ty) -> String {
+  case ty_type_expr(ty) {
+    Some(_) ->
+      "hive.SyslinkEncoder(func(_v "
+      <> ty_to_go(ty)
+      <> ") string { return "
+      <> gen_json_encode(ty, "_v", 0)
+      <> " })"
+    None -> "hive.SyslinkEncoder(hive.JsonEncodeDynamic)"
+  }
+}
+
+fn syslink_decoder(env: Env, msg: Option(ast.TypeExpr)) -> String {
+  case msg {
+    Some(typ) -> "hive.SyslinkDecoder(" <> json_decoder_ref(env, typ) <> ")"
+    None -> "nil"
+  }
+}
+
+// A structural fingerprint of the message type, carried in every frame so a
+// peer built from a different declaration fails loudly instead of decoding
+// another type's bytes into this one.
+fn syslink_digest(env: Env, msg: Option(ast.TypeExpr)) -> String {
+  case msg {
+    None -> "0"
+    Some(typ) ->
+      "0x" <> pad_hex(fnv1a(type_signature(env.types, typ)))
+  }
+}
+
+fn pad_hex(n: Int) -> String {
+  let s = int.to_base16(n) |> string.lowercase
+  string.repeat("0", int.max(0, 8 - string.length(s))) <> s
+}
+
+// The signature a digest is taken over: the type's own spelling plus, for a
+// user type, every variant and field it declares, recursively. Two builds whose
+// declarations differ in any way a decoder would notice produce different
+// digests.
+fn type_signature(types: Dict(String, ast.Decl), typ: ast.TypeExpr) -> String {
+  type_signature_seen(types, typ, [])
+}
+
+fn type_signature_seen(
+  types: Dict(String, ast.Decl),
+  typ: ast.TypeExpr,
+  seen: List(String),
+) -> String {
+  case typ {
+    ast.TVoid -> "void"
+    ast.TFunc(_, _, _) -> "func"
+    ast.TName(pkg, name, dims) -> {
+      let base = case pkg {
+        Some(p) -> p <> "." <> name
+        None -> name
+      }
+      let suffix =
+        dims
+        |> list.map(fn(d) {
+          case d {
+            ast.DimStatic(n) -> "[" <> int.to_string(n) <> "]"
+            _ -> "[dyn]"
+          }
+        })
+        |> string.concat
+      // A recursive type stops at its own name: the cycle adds no information a
+      // decoder could differ on, and expanding it would not terminate.
+      case dict.get(types, name), list.contains(seen, name) {
+        Ok(ast.TypeDecl(_, variants, commons)), False -> {
+          let inner = [name, ..seen]
+          let fields =
+            list.append(
+              list.flat_map(variants, fn(v) {
+                [v.name, ..list.map(v.fields, fn(f) {
+                  f.name <> ":" <> type_signature_seen(types, f.typ, inner)
+                })]
+              }),
+              list.map(commons, fn(f) {
+                f.name <> ":" <> type_signature_seen(types, f.typ, inner)
+              }),
+            )
+          base <> "{" <> string.join(fields, ",") <> "}" <> suffix
+        }
+        _, _ -> base <> suffix
+      }
+    }
+  }
+}
+
+// FNV-1a, 32-bit. Small, deterministic and identical in any build of the
+// compiler, which is all a digest needs.
+fn fnv1a(text: String) -> Int {
+  text
+  |> string.to_utf_codepoints
+  |> list.fold(2_166_136_261, fn(hash, cp) {
+    let h = int.bitwise_exclusive_or(hash, string.utf_codepoint_to_int(cp))
+    int.bitwise_and(h * 16_777_619, 4_294_967_295)
+  })
+}
+
+/// A Go expression referencing the encoder for a Hive type: something of type
+/// `func(T) string`. The mirror of `json_decoder_ref`.
+fn json_encoder_ref(env: Env, t: ast.TypeExpr) -> String {
+  let ty = ty_of_type_expr(env.types, t)
+  case t {
+    ast.TName(None, name, []) ->
+      case name {
+        _ ->
+          case dict.has_key(env.types, name) {
+            True -> "jsonEncode_" <> name
+            False ->
+              "func(_v "
+              <> ty_to_go(ty)
+              <> ") string { return "
+              <> gen_json_encode(ty, "_v", 0)
+              <> " }"
+          }
+      }
+    _ ->
+      "func(_v "
+      <> ty_to_go(ty)
+      <> ") string { return "
+      <> gen_json_encode(ty, "_v", 0)
+      <> " }"
   }
 }
 
@@ -3376,6 +4297,7 @@ fn gen_json_encode(ty: Ty, value: String, depth: Int) -> String {
     TyAtom -> "hive.JsonEncodeAtom(" <> value <> ")"
     TyTable -> "hive.JsonEncodeTable(" <> value <> ")"
     TyCustom(name) -> "jsonEncode_" <> name <> "(" <> value <> ")"
+    TyAddress(_) -> "hive.JsonEncodeAddress(" <> value <> ")"
     TyVec(elem) -> {
       let e = "e" <> int.to_string(depth)
       "hive.JsonEncodeVec("
@@ -3840,7 +4762,7 @@ fn uses_in_expr(e: ast.Expr, name: String) -> Bool {
       uses_in_expr(source, name)
       || list.any(ast.using_exprs(kind), fn(e) { uses_in_expr(e, name) })
     ast.EWith(value, _) -> uses_in_expr(value, name)
-    ast.EAwait(value) -> uses_in_expr(value, name)
+    ast.EAwait(value, _) -> uses_in_expr(value, name)
   }
 }
 

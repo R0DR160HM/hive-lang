@@ -192,7 +192,12 @@ pub type Expr {
   /// `await <async call>` — blocks the current virtual thread until the async
   /// function returns its value (a bare call, without `await`, is
   /// fire-and-forget).
-  EAwait(value: Expr)
+  /// `await <expr>`, with the optional `with timeout <ms>` clause that bounds
+  /// how long the wait may take. The clause changes the *type* of the await:
+  /// without it an `async T` yields `T`, with it a `Result<T,
+  /// hive.task.TimeoutError>` — running out of patience is a value, not a
+  /// crash. A timed-out task is not cancelled; only the waiting stops.
+  EAwait(value: Expr, timeout: Option(Expr))
 }
 
 /// Which kind of table a `using` expression reads. Naming the format in the
@@ -237,7 +242,7 @@ pub fn repeatable(e: Expr) -> Bool {
     EIs(subject, _) -> repeatable(subject)
     // Each of these does work: a call runs a body, `using` reads a file or a
     // database, `with` decodes, and a bare async call under `await` spawns.
-    ECall(_, _) | EUsing(_, _) | EWith(_, _) | EAwait(_) -> False
+    ECall(_, _) | EUsing(_, _) | EWith(_, _) | EAwait(_, _) -> False
   }
 }
 

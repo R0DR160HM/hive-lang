@@ -547,7 +547,9 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
         _ ->
           Error(
             "`with <Type>` can only be applied to `hive.json.parse(...)`, "
-            <> "`hive.crypto.jwtVerify(...)` or `hive.crypto.jwtDecode(...)` calls",
+            <> "`hive.crypto.jwtVerify(...)` or `hive.crypto.jwtDecode(...)` "
+            <> "calls. (`with timeout <ms>` is a different clause and belongs "
+            <> "on an `await`.)",
           )
       }
     // `hive.sql.DatabaseDriver.SQLite()` etc. — driver constructors.
@@ -611,6 +613,10 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
               use _ <- result.try(check_task_call(fname, args))
               check_args(ctx, args)
             }
+            "syslink" -> {
+              use _ <- result.try(check_syslink_call(ctx, fname, args))
+              check_args(ctx, args)
+            }
             "time" -> {
               use _ <- result.try(check_time_call(fname, args))
               check_args(ctx, args)
@@ -620,7 +626,7 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
                 "unknown builtin namespace `hive."
                 <> ns
                 <> "` (available: net, file, json, crypto, sql, conv, env, "
-                <> "term, task, time)",
+                <> "term, task, syslink, time)",
               )
           }
       }
@@ -732,7 +738,7 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
       check_exprs(ctx, [target, ..option.values([low, high])])
     ast.EBinary(_, l, r) -> check_exprs(ctx, [l, r])
     ast.EIs(subject, _) -> check_expr(ctx, subject)
-    ast.EAwait(value) -> check_expr(ctx, value)
+    ast.EAwait(value, _) -> check_expr(ctx, value)
   }
 }
 
@@ -1398,6 +1404,157 @@ fn check_handler(
         <> fname
         <> "` must be the name of a proc",
       )
+  }
+}
+
+// ---------------------------------------------------------------------------
+// hive.syslink
+// ---------------------------------------------------------------------------
+
+fn check_syslink_call(
+  ctx: Ctx,
+  fname: String,
+  args: List(ast.Arg),
+) -> Result(Nil, String) {
+  case fname {
+    "listen" -> check_arity("`hive.syslink.listen`", args, ["endpoint"])
+    "node" -> check_arity("`hive.syslink.node`", args, [])
+    // Node roles used to be atoms too. They earned nothing: routing wants an
+    // endpoint that can be resolved at runtime, and there is no name for an
+    // authenticated peer to impersonate, so all they did was force the cluster's
+    // size to be known when the program was written.
+    "peer" | "endpoint" ->
+      Error(
+        "`hive.syslink."
+        <> fname
+        <> "` is gone: a node is identified by where it is, not by a name. Pass "
+        <> "the endpoint straight to `hive.syslink.on(\"10.0.0.4:9100\", #Cache)` "
+        <> "— it can come from config, DNS or a vector, so a cluster no longer "
+        <> "has to be a fixed set of roles",
+      )
+    "spawn" -> {
+      use _ <- result.try(check_arity(
+        "`hive.syslink.spawn`",
+        args,
+        ["handler", "state"],
+      ))
+      case codegen.assign_args(args, ["handler", "state"]) {
+        #([#(_, handler), _], []) -> check_service_handler(ctx, handler)
+        _ -> Ok(Nil)
+      }
+    }
+    "register" ->
+      check_atom_named(
+        "`hive.syslink.register`",
+        args,
+        ["name", "address"],
+        ["name"],
+      )
+    "at" -> check_atom_named("`hive.syslink.at`", args, ["name"], ["name"])
+    "on" ->
+      check_atom_named("`hive.syslink.on`", args, ["endpoint", "name"], ["name"])
+    "send" -> check_arity("`hive.syslink.send`", args, ["address", "message"])
+    "answer" -> check_arity("`hive.syslink.answer`", args, ["from", "value"])
+    "self" -> check_arity("`hive.syslink.self`", args, ["from"])
+    "monitor" ->
+      check_arity("`hive.syslink.monitor`", args, ["from", "target", "message"])
+    "stop" -> check_arity("`hive.syslink.stop`", args, ["address"])
+    // There is no separate `call`: one `send` serves both, and what the call
+    // site does with its value decides which it was.
+    "call" ->
+      Error(
+        "there is no `hive.syslink.call` — `hive.syslink.send` is the only way "
+        <> "to reach a service, and the call site decides what it means: as a "
+        <> "statement it is fire-and-forget, and `await`ed it waits for the "
+        <> "service's answer (`await hive.syslink.send(cache, Op.Count())`, "
+        <> "optionally bounded with `with timeout <ms>`)",
+      )
+    _ ->
+      Error(
+        "unknown builtin `hive.syslink."
+        <> fname
+        <> "` (available: listen, node; spawn, register, at, on, stop; send, "
+        <> "answer, self, monitor)",
+      )
+  }
+}
+
+// A registered name and a node role are atoms, never computed: that is what
+// makes the registry knowable at compile time, so `at` needs no `with` clause
+// and a `send` to another machine can be type-checked at all.
+fn check_atom_named(
+  target: String,
+  args: List(ast.Arg),
+  names: List(String),
+  must_be_atoms: List(String),
+) -> Result(Nil, String) {
+  use _ <- result.try(check_arity(target, args, names))
+  let #(assigned, _) = codegen.assign_args(args, names)
+  list.try_fold(list.zip(assigned, names), Nil, fn(_, pair) {
+    let #(#(_, value), name) = pair
+    case list.contains(must_be_atoms, name), value {
+      True, ast.EAtom(_) -> Ok(Nil)
+      True, _ ->
+        Error(
+          target
+          <> "'s `"
+          <> name
+          <> "` must be an atom literal (`#Cache`), not a computed value — "
+          <> "names come from a closed set so the compiler knows every service "
+          <> "the program addresses",
+        )
+      False, _ -> Ok(Nil)
+    }
+  })
+}
+
+// A service handler is the fold over its mailbox: it takes the state, one
+// message and the turn's envelope, and returns the next state. The state going
+// in and the state coming out have to be the same type, which is what makes the
+// fold well-founded — and it is why a service needs no mutex.
+fn check_service_handler(ctx: Ctx, handler: ast.Expr) -> Result(Nil, String) {
+  let shape =
+    "a handler for `hive.syslink.spawn` must be a proc taking (state, message, "
+    <> "hive.syslink.Envelope) and returning the state's own type"
+  case handler {
+    // A partial application (`inbox(_, _, _, db)`) fixes some arguments and
+    // leaves the rest as holes. Go's typed spawn signature enforces the result,
+    // exactly as it does for the `hive.net` servers.
+    ast.ECall(..) -> Ok(Nil)
+    ast.EIdent(name) ->
+      case dict.get(ctx.procs, name) {
+        Ok(#([state, _message, envelope], ret)) ->
+          case is_hive_type(envelope.typ, "Envelope"), ret == state.typ {
+            False, _ ->
+              Error(
+                "proc `"
+                <> name
+                <> "` cannot be used: its third parameter must be a "
+                <> "hive.syslink.Envelope — "
+                <> shape,
+              )
+            _, False ->
+              Error(
+                "proc `"
+                <> name
+                <> "` cannot be used: it must return the same type as its "
+                <> "first parameter, since each turn hands the next turn its "
+                <> "state — "
+                <> shape,
+              )
+            True, True -> Ok(Nil)
+          }
+        Ok(_) -> Error("proc `" <> name <> "` cannot be used: " <> shape)
+        Error(_) ->
+          Error(
+            "the handler passed to `hive.syslink.spawn` must be the name of a "
+            <> "proc, but `"
+            <> name
+            <> "` is not one",
+          )
+      }
+    _ ->
+      Error("the handler passed to `hive.syslink.spawn` must be the name of a proc")
   }
 }
 

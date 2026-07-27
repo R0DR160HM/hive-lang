@@ -171,7 +171,11 @@ walkthrough (hashing, HMAC, base64 and JWTs), a `hive.sql` example backed by an
 embedded SQLite database, a tour of first-class functions and partial
 application, a tour of Hive's copy-on-binding [value
 semantics](#value-semantics-copy-on-binding), a tour of concurrency
-(spawning tasks, holding handles and awaiting one or many), a three-file program
+(spawning tasks, holding handles and awaiting one or many), a two-node
+[`hive.syslink`](#hivesyslink) program whose services talk to each other across
+two terminals or two machines, a three-node distributed cache that combines
+`hive.syslink` with `hive.sql` (one owner per key, invalidated across the cluster
+on every write), a three-file program
 showing `import`, and a walk through spreadsheets and `hive.file` — live in
 `code-examples/`. They double as the language's specification: each one
 compiles, builds and runs.
@@ -237,8 +241,31 @@ compiles, builds and runs.
   is the slowest, not the sum. A handle's type (`async T`) is inferred and never
   written: you may bind it and `await` it, but not annotate, return, pass, or
   use it as a plain `T`, so a task can never outlive the scope that spawned it.
-  `await` is idempotent — the same handle may be awaited more than once. See
-  `code-examples/10 - Concurrency`.
+  `await` is idempotent — the same handle may be awaited more than once. Any
+  `await` may be bounded with the optional
+  [`with timeout <ms>`](#hivetask) clause, which turns its result into a
+  `Result<T, hive.task.TimeoutError>` — the timeout abandons the waiting, not the
+  work. See `code-examples/10 - Concurrency`.
+* **Distribution** — [`hive.syslink`](#hivesyslink) adds *services*: long-lived,
+  addressable things with a mailbox and private state, reached by the same
+  statement whether they live in this process or on another machine.
+  `hive.syslink.send(address, message)` is the only way to reach one, and — as
+  with an `async func` — the call site decides what it means: as a statement it
+  is fire-and-forget, kept it is a request in flight, and `await`ed it yields
+  `Result<Message, hive.syslink.SyslinkError>`. A service answers with one of its
+  own messages, so the reply type is the mailbox type and nothing needs
+  annotating. A *service* is named by an atom, which is what lets the compiler
+  know the whole registry; a *node* has no name at all — it is identified by the
+  endpoint it can be dialed at, so a peer list is ordinary runtime data. A service
+  is not an `async T` — its
+  address is an ordinary value that outlives every scope, can be stored, can be
+  sent inside a message, and is never awaited. Its handler is a fold over the
+  mailbox (`proc (State, Message, hive.syslink.Envelope): State`), so a service
+  needs no mutex at all. A service name is an atom, which is what lets the
+  compiler know the whole registry — and a named address is the only kind that
+  survives its service being restarted. A node has no name: it is identified by
+  the endpoint it can be dialed at, so a peer list is ordinary runtime data. A
+  `panic` inside a service kills only that service, not the node.
 * **Atoms** (`#SomeAtom`) are interned symbols. The compiler assigns each a
   small integer (`#False` = 0 and `#True` = 1 always come first) and embeds
   the atom table in the executable, so `echo` prints an atom's name while
@@ -301,7 +328,9 @@ compiles, builds and runs.
 * **`panic value`** stops the program immediately, showing `value` rendered as
   a string exactly the way `echo` displays it — so `panic err` prints the
   error's message and an atom prints its name (not its decimal form). Unlike
-  `assert`, it always fires and takes any value, not just a boolean. Because it
+  `assert`, it always fires and takes any value, not just a boolean. The one
+  exception is inside a [`hive.syslink`](#hivesyslink) service, where a panic
+  kills only that service and leaves the node running. Because it
   never returns, a branch or tail ending in `panic` counts as a terminating
   path (so `panic "unreachable"` can close off an impossible tail, like
   `assert false`).
@@ -463,7 +492,8 @@ See [`code-examples/12 - Files and Spreadsheets`](code-examples/12%20-%20Files%2
 
 Each module owns its types under its own namespace — `hive.net.HttpRequest`,
 `hive.json.JsonError`, `hive.crypto.CryptoError`, `hive.sql.DatabaseDriver`,
-`hive.conv.ConversionError`, `hive.env.EnvironmentError`, and so on. The only builtin types that live directly on `hive` are the core
+`hive.conv.ConversionError`, `hive.env.EnvironmentError`,
+`hive.syslink.Address`, `hive.task.TimeoutError`, and so on. The only builtin types that live directly on `hive` are the core
 ones the language uses without a module: `Result`, `Table` and the
 `hive.TableError` that `using` yields from a CSV.
 
@@ -733,10 +763,278 @@ Line-oriented terminal I/O.
 
 Scheduling controls over the virtual threads an `async func` runs on.
 
+* **`await <handle> with timeout <ms>`** bounds how long a wait may take. The
+  clause is optional and may follow **any** `await`, and it changes what the
+  await yields: without it you get the value, with it a
+  `Result<T, hive.task.TimeoutError>` — running out of patience is a value to
+  handle, not a crash. A `TimeoutError` carries `waited` (the milliseconds asked
+  for) and a `message`. On a vector of handles the timeout is **one deadline
+  across the whole barrier** (`await [a, b] with timeout 500` means "both within
+  half a second"), and the whole vector fails together.
+
+  A timeout abandons the **waiting**, not the work: a virtual thread cannot be
+  stopped from the outside, so the task runs on and only its result is dropped.
+  That is also why the same handle can be awaited again afterwards, with more
+  patience or none at all, and still yield its value.
+
+  ```hive
+  patient := slowShout("worth waiting for")
+  if await patient with timeout 100 is Result.Error(err) {
+  	echo "gave up after " + hive.conv.its(err.waited) + "ms"
+  }
+  echo await patient          // the task kept running; this still gets it
+  ```
+
+  On a [`hive.syslink`](#hivesyslink) request the clause folds into that module's
+  own error instead of wrapping a second `Result` around the first, so
+  `await hive.syslink.send(a, m) with timeout 250` is still a
+  `Result<Message, hive.syslink.SyslinkError>` whose reason is `"Timeout"`.
+  Omitted, syslink waits its own default (5s).
+
+  `timeout` is not a reserved word — it means something only in this two-token
+  clause, so it stays usable as an ordinary variable name.
 * `hive.task.sleep(ms)` parks the calling virtual thread for `ms` milliseconds
   and returns nothing. Only that goroutine waits — others keep running — so two
   tasks that each `sleep`, spawned and then awaited together, finish in about
   the longer of the two, not the sum. A non-positive `ms` returns immediately.
+
+### `hive.syslink`
+
+Addressable **services**, in this process or on another machine, reached by the
+same statement either way. A service is long-lived, owns private state only it
+can touch, and has an identity you can pass around.
+
+A service is deliberately **not** an `async T`. The two features do not overlap:
+
+| | `async T` | `hive.syslink.Address` |
+| --- | --- | --- |
+| lifetime | scoped — cannot outlive its spawner | unscoped — outlives everything |
+| identity | none (a join point) | yes, that is the point |
+| interaction | `await`, yields `T` | `send`, yields nothing |
+| as a value | cannot be stored, returned or passed | ordinary value; can even be sent inside a message |
+
+**The handler is a fold over the mailbox.** `proc (State, Message,
+hive.syslink.Envelope): State` — state in, one message, the turn's envelope, and
+the next state out. The compiler enforces that the state going in and the state
+coming out are the same type. There is no mutex and no `mut` anywhere: the fold
+*is* the mutex, which is the whole payoff of the model.
+
+```hive
+type Op {
+	Put { key: Str, value: Str }
+	Count
+}
+
+proc cache(rows: Table, op: Op, from: hive.syslink.Envelope): Table {
+	if op is Op.Put(key, value) {
+		mut next := rows
+		append(next, [key, value])
+		return next
+	}
+	hive.syslink.answer(from, len(rows))
+	return rows
+}
+```
+
+**Nodes.** A node has no name: it is identified by **where it is**. An endpoint is
+deployment data — an IP, a DNS name, a value from config — so it is a `Str`, and a
+peer list can be computed, read from a file or resolved through DNS. There is no
+port-mapper daemon and no cluster-wide name registry.
+
+* `hive.syslink.listen(endpoint)` starts accepting connections →
+  `Result<Str, hive.syslink.SyslinkError>`. The endpoint is what this node tells
+  peers to dial it on (`"10.0.0.4:9100"`); the port is taken from it and bound on
+  every interface. Advertising it is what keeps an address this node hands out
+  dialable even after a peer passes it on again.
+* `hive.syslink.node()` is the endpoint this node advertises.
+
+Nothing is dialed until there is a message to carry, and a connection is filed
+under the peer's *advertised* endpoint rather than the string that was dialed — so
+`"localhost:9101"` and `"127.0.0.1:9101"` share one connection instead of quietly
+opening two and splitting the ordering guarantee between them.
+
+**Services.**
+
+* `hive.syslink.spawn(handler, state)` starts a service and returns its
+  address without blocking. The handler is passed **by name** and its shape is
+  checked at compile time, including through a partial application
+  (`cache(_, _, _, db)`).
+* `hive.syslink.register(name, address)` publishes a service under a name →
+  `Result<hive.syslink.Address, _>` (`"Taken"` if the name is in use).
+* `hive.syslink.at(name)` is the address of a named service **on this node**, and
+  `hive.syslink.on(endpoint, name)` the same service on the node reachable at
+  `endpoint`. Both perform **no I/O and cannot fail** — they are address
+  construction, not a lookup, which is what lets a program name a service that is
+  not running yet, or a node that is temporarily down, and still type-check and
+  run.
+* `hive.syslink.stop(address)` shuts a service down; calling it twice is
+  harmless.
+
+**Messages.** There is exactly **one** way to reach a service, and — as with an
+`async func` — what the *call site* does with it decides what it means:
+
+```hive
+hive.syslink.send(inbox, Note.Say("hi"))          // statement: fire-and-forget
+pending := hive.syslink.send(cache, Op.Count())   // keep the request in flight
+answer := await pending                            // wait for it
+answer := await pending with timeout 250           // ...for at most 250ms
+answer := await hive.syslink.send(cache, Op.Count())        // spawn + wait
+both := await [hive.syslink.send(a, m), hive.syslink.send(b, m)]  // one barrier
+```
+
+* As a **statement**, `hive.syslink.send(address, message)` returns `void` and
+  **never blocks and never fails.** A dead or unreachable recipient is not an
+  error at the send site — that is precisely what keeps a local send and a remote
+  one the same statement, and failure is discovered through a monitor instead.
+  Nothing is registered for a reply, so this is also the cheapest form.
+* **Kept**, the same call is a *request in flight*. Its type is inferred and has
+  no surface spelling, exactly like `async T`: you may bind it and `await` it,
+  and nothing else. (It is not an `async T` underneath — no goroutine is parked
+  waiting, because the answer arrives on the connection's own reader.)
+* **`await`ing** it yields `Result<Message, hive.syslink.SyslinkError>`. This is
+  the one place in the module that reports failure, because it is the only one
+  with somewhere to report to: a `"Timeout"`, a service that died mid-request
+  (`"Down"` / `"NoProc"`), an unreachable node (`"Unreachable"`), a payload that
+  would not decode (`"Decode"`) and a request the service handled but never
+  answered (`"NoReply"`) all arrive here. Awaiting is idempotent for a settled
+  answer; a *timed-out* request deliberately is not settled, so the same handle
+  may be awaited again with more patience.
+* **The reply type is the mailbox type**, so nothing is ever annotated. A service
+  answers with one of *its own* messages, which makes a mailbox type the whole
+  protocol — requests and responses together — and lets `is` narrow a reply
+  exactly like anything else.
+* Either way the message is copied on its way in, using the same deep,
+  type-directed copy [a binding uses](#value-semantics-copy-on-binding), so the
+  recipient can never observe the sender mutating it afterwards.
+* `hive.syslink.answer(from, value)` replies to whoever is awaiting. If the
+  sender discarded its request nothing is waiting, so it is a no-op — one handler
+  serves both shapes without caring which it was.
+
+**Forgetting to answer fails fast, and you write nothing to get it.** Missing a
+reply on one branch is the easiest mistake to make in service code, and waiting
+out a timeout is a miserable way to be told — it points at the network when the
+problem is a missing line. So a request a service handles without answering comes
+straight back as `"NoReply"`, naming the service. The same goes for a message the
+service could not decode or whose type it does not handle: the runtime already
+knows no answer is coming, so it says so instead of staying quiet.
+
+The compiler decides which services this applies to, by asking where the
+envelope goes:
+
+* If a handler's envelope only ever reaches `answer`, `self` or `monitor` — the
+  three calls the runtime controls, none of which keep the reply token — it
+  cannot outlive the turn it arrived in. Once that turn ends, no answer can still
+  be coming, so an unanswered request is failed at once.
+* If the envelope goes anywhere else — stored in the returned state, handed to an
+  `async func`, passed to one of your own procs — a reply may genuinely still be
+  on its way, and the runtime keeps waiting exactly as before. That is what makes
+  the *deferred* reply possible: hand the envelope to a task and the service's
+  turn ends immediately without the caller being cut off.
+
+```hive
+// Answered or not, within the turn -> a forgotten reply fails immediately.
+proc tidy(n: Int, m: Ask, from: hive.syslink.Envelope): Int {
+	if m is Ask.Now { hive.syslink.answer(from, Ask.Reply("here")) }
+	return n + 1                       // Ask.Later gets `NoReply` at once
+}
+
+// The envelope leaves the turn, so the answer is allowed to arrive later.
+proc patient(n: Int, m: Ask, from: hive.syslink.Envelope): Int {
+	answerLater(from)                  // an async func, replies when it is done
+	return n + 1
+}
+```
+
+The analysis is per handler and deliberately conservative, in the same spirit as
+the [copy-vs-alias rule](#value-semantics-copy-on-binding): one escape anywhere
+switches the fast failure off for that whole service, and anything it cannot
+vouch for counts as an escape. Being wrong that way costs a timeout; being wrong
+the other way would cut off a live request.
+* `hive.syslink.self(from)` is the running service's own address.
+* `hive.syslink.monitor(from, target, message)` asks to be told when `target`
+  dies, by delivering a message **the watcher chose itself**. That is what keeps
+  a mailbox a single user type, with no builtin envelope union mixed into it. A
+  monitor fires exactly once, and a target on a node that cannot even be reached
+  fires it immediately.
+
+**A crash is local to its service.** A `panic` inside a service body kills only
+that service: its monitors are told, its callers stop waiting, and the node keeps
+running. This is the one place `panic` does not stop the program, and it is what
+makes supervision meaningful — "let it crash" is worthless if crashing takes the
+node down with it.
+
+**The registry is known at compile time.** A *service* name is an atom, and an
+atom cannot be computed, so the set of names a program publishes is closed and
+knowable before it runs. The compiler therefore pairs every `register(#Name, …)`
+with the message type of the mailbox behind it, which is why neither
+`at(#Name)` nor `on(endpoint, #Name)` needs a `with` clause to say what it
+expects, and why the digest below is computed from a type the compiler resolved
+rather than one the programmer restated. Erlang cannot do this at all:
+`list_to_atom/1` means a registered name there is never known at compile time.
+
+A service name is also the only kind of address that **survives its service
+dying**: a named address is re-resolved through the registry on every send, so a
+replacement registered under the same atom is picked up by every holder without
+any of them noticing. An anonymous address carries a mailbox id and is dangling
+the moment its service exits. That indirection — not lookup — is what names are
+for, and it is what supervision will be built on.
+
+Nodes deliberately have no such names. A node identity would have to be resolved
+to an endpoint at runtime anyway, and there is nothing for a peer to impersonate
+when you reached it by dialing it, so making one an atom bought nothing and cost
+the ability to compute a peer list.
+
+**On the wire.** One persistent, multiplexed connection per node *pair*, carrying
+length-prefixed frames — not one per service and not one per message, because
+message order is guaranteed between a pair of nodes and that requires exactly one
+FIFO pipe per pair. Connections are dialed lazily on the first message that needs
+one, and either end may dial; when both do at once, exactly one survives (the one
+dialed by the lexicographically smaller endpoint). Replies travel back over the same
+pipe, so a node that can only dial out still takes part fully. A heartbeat runs
+every 15s and three missed ticks declares the node down, failing its outstanding
+calls and firing its monitors. The outbox is unbounded — a bounded one would make
+`send` block — but past a high-water mark the node is declared unreachable rather
+than growing forever, which turns a memory problem into the failure the program
+already handles. **Delivery is best-effort:** messages queued when a node is
+declared down are dropped, and reconnecting does not resurrect them.
+
+Messages cross as JSON, using the very same derived codecs `hive.json` builds
+from a type declaration — so nothing new has to be derived for a type to be
+sendable. Every frame carries a 32-bit structural **digest** of the message type,
+so a peer built from a different declaration fails loudly instead of decoding
+another type's bytes. Payloads are decoded on the *recipient's own turn*, so a
+bad message fails as that service's problem rather than resetting a connection
+shared with every other service on the node.
+
+**Always encrypted.** Every connection is TLS 1.3, mutually authenticated, with
+no plaintext path and no capability flag that could negotiate one away — on
+loopback and plain IPs included. Certificates are ephemeral Ed25519, generated at
+boot and never written to disk: they carry keys, not identity. Identity comes
+from a cluster secret proven over the pair of certificates *as each side locally
+sees them*, which is what stops an attacker who terminates TLS on both ends from
+relaying one side's proof to the other. There is no node name in the proof because
+there is no node name to claim: you reached a node by dialing it. The
+secret never crosses the wire and never encrypts anything — TLS 1.3 is always
+ECDHE, so leaking it tomorrow does not decrypt traffic captured today. It comes
+from `HIVE_SYSLINK_KEY`, or from `~/.hive/syslink.key`, which is generated with
+32 random bytes (mode 0600) on first use — so two nodes on one machine are
+authenticated with no setup at all, and spanning machines means copying that one
+file.
+
+Set `HIVE_SYSLINK_STRICT=1` to force **local** sends through the same
+encode/decode path a remote one takes. A message that could not survive the wire
+then fails in a single-process run instead of the first time a peer is added.
+
+Not yet built: rejecting a mismatched `send` at compile time (the registry knows
+each mailbox's type, but a wrong-typed message is currently caught by the digest
+at runtime — the recipient drops it and says so — rather than refused by the
+compiler), message fragmentation (a frame over 8 MB is refused rather than split,
+so a very large message can head-of-line block its node pair), a WebSocket
+transport for environments that only forward HTTP, pinned per-node keys as an
+alternative to the shared secret, and supervision trees. See
+`code-examples/13 - Distributed Actors`, which runs as two nodes in two terminals
+or on two machines, and `code-examples/9 - EXAMPLE APP - Online Cache`, a
+three-node cache that reads its peer list at startup.
 
 ### `hive.time`
 
@@ -841,6 +1139,8 @@ See [`code-examples/11 - Modules`](code-examples/11%20-%20Modules/modules.hive).
 | `f(x)` bare stmt / `await f(x)` (async `f`) | `go f(x)` (fire-and-forget goroutine) / `f(x)` (blocking call) |
 | `h := f(x)` (async `f`) / `await h`     | `h := hive.Spawn(func() T { return f(x) })` / `h.Await()`      |
 | `await [f(a), f(b)]` (async `f`)        | `hive.AwaitAll([]*hive.Async[T]{ hive.Spawn(..), hive.Spawn(..) })` |
+| `await h with timeout ms`               | `hive.AwaitTimeout(h, ms)` → `Result[T, TimeoutError]`          |
+| `await [f(a), f(b)] with timeout ms`    | `hive.AwaitAllTimeout(hs, ms)` → `Result[[]T, TimeoutError]`     |
 | `echo v`                                | `fmt.Println(v)` (stringifies any value, appends a newline)    |
 | `assert cond`                           | `hive.Assert(cond)`                                            |
 | `panic value`                           | `panic(hive.Show(value))` (renders `value` like `echo`)        |
@@ -894,6 +1194,18 @@ See [`code-examples/11 - Modules`](code-examples/11%20-%20Modules/modules.hive).
 | `hive.net.HttpRequest(m, u, h, b)`      | `hive.HttpRequest{Method: m, Url: u, Headers: h, Body: b}`     |
 | `request.body` (builtin struct field)   | `request.Body` (fields capitalize to their exported Go names)  |
 | `t[1:]`                                 | `t[1:]` (slices are **inclusive** of the high bound)           |
+| `hive.syslink.listen(endpoint)`          | `hive.SyslinkListen(endpoint)` → `Result[Str, SyslinkError]`     |
+| `hive.syslink.spawn(handler, state)`    | `hive.SyslinkSpawn(handler, state, dec, digest, repliesInTurn)` → `hive.Address` |
+| `hive.syslink.register(#N, a)`           | `hive.SyslinkRegister(atom_N, a)` → `Result[Address, SyslinkError]` |
+| `hive.syslink.at(#N)` / `.on(endpoint, #N)` | `hive.SyslinkAt(atom_N)` / `hive.SyslinkOn(endpoint, atom_N)`  |
+| `hive.syslink.send(a, msg)` (statement) | `hive.SyslinkSend(a, clone_T(msg), enc, digest)` (a cast: copied in, never fails) |
+| `h := hive.syslink.send(a, msg)`        | `hive.SyslinkSendAwaitable(a, clone_T(msg), enc, digest, dec)` → `*hive.SyslinkPending[M]` |
+| `await h` / `await h with timeout ms`   | `hive.SyslinkAwait(h, 0)` / `hive.SyslinkAwait(h, ms)` → `Result[M, SyslinkError]` |
+| `await [send(..), send(..)] with timeout ms` | `hive.SyslinkAwaitAll(ps, ms)` → `[]Result[M, SyslinkError]`  |
+| `hive.syslink.answer(from, v)` / `.self(from)` | `hive.SyslinkAnswer(from, v, enc)` / `hive.SyslinkSelf(from)` |
+| `hive.syslink.monitor(from, t, msg)`    | `hive.SyslinkMonitor(from, t, msg, enc, digest)`                |
+| `hive.syslink.stop(a)` / `.node()`      | `hive.SyslinkStop(a)` / `hive.SyslinkNode()` → `string`         |
+| `hive.syslink.Address` / `.Envelope`    | `hive.Address` / `hive.Envelope` (message type inferred, never written) |
 | `Str`, `Int`, `Bool`, `Float`, `Atom`   | `string`, `int`, `bool`, `float64`, `hive.Atom`                |
 | `Str[3]`, `Str[dyn]`, `Str[dyn, 2]`     | `[]string` (all vectors lower to slices)                       |
 | `Table`, `hive.TableError`, `Result`    | provided by the generated `hive` runtime package               |

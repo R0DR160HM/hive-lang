@@ -1,0 +1,59 @@
+type Ask {
+	Answered
+	Forgotten
+	Later
+	Reply { text: Str }
+}
+
+// This handler's envelope never leaves the turn — it only ever reaches `answer`
+// — so an unanswered request can be failed the moment the turn ends.
+proc tidy(n: Int, m: Ask, from: hive.syslink.Envelope): Int {
+	if m is Ask.Answered {
+		hive.syslink.answer(from, Ask.Reply("here you go"))
+		return n + 1
+	}
+	// Deliberately forgets to answer.
+	return n + 1
+}
+
+// This one hands the envelope to a task, so a reply may still be coming and the
+// automatic failure is switched off.
+proc patient(n: Int, m: Ask, from: hive.syslink.Envelope): Int {
+	if m is Ask.Later {
+		answerLater(from)
+		return n + 1
+	}
+	return n + 1
+}
+
+async func answerLater(from: hive.syslink.Envelope): void {
+	hive.task.sleep(300)
+	hive.syslink.answer(from, Ask.Reply("took my time"))
+}
+
+proc main(): void {
+	if hive.syslink.listen("127.0.0.1:9810") is Result.Error(e) {
+		panic e
+	}
+	a := hive.syslink.spawn(tidy, 0)
+	b := hive.syslink.spawn(patient, 0)
+
+	got := await hive.syslink.send(a, Ask.Answered()) with timeout 3000
+	if got is Result.Ok(r) && r is Ask.Reply(text) {
+		echo "answered:   {text}"
+	}
+
+	// Should come back at once, naming what happened — not after 3 seconds.
+	missed := await hive.syslink.send(a, Ask.Forgotten()) with timeout 3000
+	if missed is Result.Error(err) {
+		echo "forgotten:  {err.reason} — {err.message}"
+	}
+
+	// Must still work: the reply arrives from the task, 300ms later.
+	late := await hive.syslink.send(b, Ask.Later()) with timeout 3000
+	if late is Result.Ok(r) && r is Ask.Reply(text) {
+		echo "deferred:   {text}"
+	} else if late is Result.Error(err) {
+		echo "deferred:   BROKEN ({err.reason})"
+	}
+}
