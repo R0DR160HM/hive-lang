@@ -22,6 +22,7 @@ import gleam/float
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/string
 import hive/ast
 import hive/runtime
@@ -220,6 +221,11 @@ type Env {
     /// immutable binding (see `aliased_source` / `bind_rhs`): something else
     /// may still mutate it.
     aliased: Dict(String, Bool),
+    /// Names that *are* another expression rather than a variable of their own:
+    /// what a `mut b = a` between two mutable ends lowers to. Both names render
+    /// as the same Go lvalue, which is what makes the sharing survive `append`
+    /// (see `shares_storage`).
+    renames: Dict(String, String),
     /// Every user-declared proc/func/query, keyed by name: whether it is pure
     /// (a func/query) and its full parameter list and return type. Powers
     /// first-class function values — the closure a partial application lowers
@@ -239,11 +245,13 @@ type Env {
   )
 }
 
-pub fn generate(module: ast.Module) -> String {
+// The module-wide environment: everything known before any body is walked.
+// Shared by `generate` and `check_types`, so the check sees exactly the types
+// generation will.
+fn module_env(module: ast.Module) -> Env {
   let types = collect_types(module.decls)
-  let atom_table = collect_atoms(module)
   let atoms =
-    atom_table
+    collect_atoms(module)
     |> list.index_map(fn(name, i) { #(name, i) })
     |> dict.from_list
   let sigs = collect_sigs(types, module.decls)
@@ -255,21 +263,26 @@ pub fn generate(module: ast.Module) -> String {
       }
     })
   let fns = collect_fns(module.decls)
-  let env =
-    Env(
-      types,
-      sigs,
-      dict.new(),
-      dict.new(),
-      TyUnknown,
-      atoms,
-      asyncs,
-      dict.new(),
-      dict.new(),
-      fns,
-      collect_mailboxes(module, fns),
-      collect_bodies(module.decls),
-    )
+  Env(
+    types,
+    sigs,
+    dict.new(),
+    dict.new(),
+    TyUnknown,
+    atoms,
+    asyncs,
+    dict.new(),
+    dict.new(),
+    dict.new(),
+    fns,
+    collect_mailboxes(module, fns),
+    collect_bodies(module.decls),
+  )
+}
+
+pub fn generate(module: ast.Module) -> String {
+  let atom_table = collect_atoms(module)
+  let env = module_env(module)
 
   let type_code =
     module.decls
@@ -307,6 +320,204 @@ pub fn generate(module: ast.Module) -> String {
 
   let body = type_code <> "\n" <> atom_code <> clone_code <> json_code <> fn_code
   gen_header(body) <> "\n" <> body
+}
+
+// ---------------------------------------------------------------------------
+// Checks that need the inferred type of an expression
+// ---------------------------------------------------------------------------
+
+/// Rejects the constructs codegen has no honest lowering for. This lives here,
+/// rather than in the main validation pass, because deciding it takes the same
+/// local inference generation uses: whether `s[0]` indexes a vector or a `Str`
+/// is a question about the type of `s`.
+pub fn check_types(module: ast.Module) -> Result(Nil, String) {
+  let env = module_env(module)
+  list.try_fold(module.decls, Nil, fn(_, d) {
+    case d {
+      ast.ProcDecl(_, params, ret, body)
+      | ast.FuncDecl(_, params, ret, body, _) ->
+        walk_stmts(fn_env(env, params, ret), body)
+        |> result.map(fn(_) { Nil })
+      ast.QueryDecl(_, params, ret, sql) -> {
+        let qenv = fn_env(env, params, ret)
+        list.try_fold(sql, Nil, fn(_, part) {
+          case part {
+            ast.ILit(_) -> Ok(Nil)
+            ast.IExpr(e) -> walk_expr(qenv, e)
+          }
+        })
+        |> result.map(fn(_) { Nil })
+      }
+      ast.TypeDecl(..) -> Ok(Nil)
+    }
+  })
+  |> result.map(fn(_) { Nil })
+}
+
+// Walks a body the way `gen_stmts` does — threading each declaration into scope
+// so later expressions infer against it — and checks every expression on the
+// way.
+fn walk_stmts(env: Env, stmts: List(ast.Stmt)) -> Result(Env, String) {
+  list.try_fold(env, over: stmts, with: fn(env, s) { walk_stmt(env, s) })
+}
+
+fn walk_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
+  case s {
+    ast.SVarDecl(name, value, mutable) -> {
+      use _ <- result.try(walk_expr(env, value))
+      Ok(
+        Env(
+          ..env,
+          locals: dict.insert(env.locals, name, infer(env, value)),
+          muts: dict.insert(env.muts, name, mutable),
+        ),
+      )
+    }
+    ast.STypedDecl(typ, name, value, mutable) -> {
+      use _ <- result.try(walk_expr(env, value))
+      Ok(
+        Env(
+          ..env,
+          locals: dict.insert(
+            env.locals,
+            name,
+            ty_of_type_expr(env.types, typ),
+          ),
+          muts: dict.insert(env.muts, name, mutable),
+        ),
+      )
+    }
+    ast.SAssign(target, value) -> {
+      use _ <- result.try(walk_expr(env, target))
+      use _ <- result.try(walk_expr(env, value))
+      Ok(env)
+    }
+    ast.SReturn(Some(e))
+    | ast.SEcho(e)
+    | ast.SAssert(e)
+    | ast.SPanic(e)
+    | ast.SExpr(e) -> {
+      use _ <- result.try(walk_expr(env, e))
+      Ok(env)
+    }
+    ast.SReturn(None) | ast.SBreak | ast.SContinue -> Ok(env)
+    ast.SIf(branches, else_body) -> {
+      use _ <- result.try(
+        list.try_fold(branches, Nil, fn(_, b) {
+          use _ <- result.try(walk_expr(env, b.cond))
+          // Whatever the condition's `is` patterns bind is in scope in the body,
+          // with the types the generated accessors have.
+          let #(_, binds) = gen_condition(env, b.cond)
+          use _ <- result.try(walk_stmts(bind_locals(env, binds), b.body))
+          Ok(Nil)
+        }),
+      )
+      use _ <- result.try(
+        walk_stmts(env, option.unwrap(else_body, [])) |> result.map(fn(_) { Nil }),
+      )
+      Ok(env)
+    }
+    ast.SFor(init, cond, post, body) -> {
+      use ienv <- result.try(case init {
+        Some(st) -> walk_stmt(env, st)
+        None -> Ok(env)
+      })
+      use _ <- result.try(case cond {
+        Some(e) -> walk_expr(ienv, e)
+        None -> Ok(Nil)
+      })
+      use _ <- result.try(case post {
+        Some(st) -> walk_stmt(ienv, st) |> result.map(fn(_) { Nil })
+        None -> Ok(Nil)
+      })
+      use _ <- result.try(walk_stmts(ienv, body))
+      // The counter is scoped to the loop.
+      Ok(env)
+    }
+    ast.SForEach(name, elem_type, iterable, body) -> {
+      use _ <- result.try(walk_expr(env, iterable))
+      let elem_ty = case elem_type {
+        Some(t) -> ty_of_type_expr(env.types, t)
+        None -> elem_ty_of(infer(env, iterable))
+      }
+      use _ <- result.try(walk_stmts(
+        Env(..env, locals: dict.insert(env.locals, name, elem_ty)),
+        body,
+      ))
+      Ok(env)
+    }
+  }
+}
+
+fn walk_expr(env: Env, e: ast.Expr) -> Result(Nil, String) {
+  use _ <- result.try(check_indexable(env, e))
+  case e {
+    ast.EInt(_)
+    | ast.EFloat(_)
+    | ast.EString(_)
+    | ast.EBool(_)
+    | ast.EAtom(_)
+    | ast.EIdent(_) -> Ok(Nil)
+    ast.EMember(target, _) | ast.EIs(target, _) | ast.EWith(target, _) ->
+      walk_expr(env, target)
+    ast.EIndex(target, index) -> walk_exprs(env, [target, index])
+    ast.ESlice(target, low, high) ->
+      walk_exprs(env, [target, ..option.values([low, high])])
+    ast.EBinary(_, l, r) -> walk_exprs(env, [l, r])
+    ast.EVector(items) -> walk_exprs(env, items)
+    ast.EInterp(parts) ->
+      list.try_fold(parts, Nil, fn(_, part) {
+        case part {
+          ast.ILit(_) -> Ok(Nil)
+          ast.IExpr(inner) -> walk_expr(env, inner)
+        }
+      })
+      |> result.map(fn(_) { Nil })
+    ast.ECall(callee, args) ->
+      walk_exprs(env, [callee, ..list.map(args, fn(a) { a.value })])
+    ast.EUsing(source, kind) ->
+      walk_exprs(env, [source, ..ast.using_exprs(kind)])
+    ast.EAwait(value, timeout) ->
+      walk_exprs(env, [value, ..option.values([timeout])])
+  }
+}
+
+fn walk_exprs(env: Env, exprs: List(ast.Expr)) -> Result(Nil, String) {
+  list.try_fold(exprs, Nil, fn(_, e) { walk_expr(env, e) })
+  |> result.map(fn(_) { Nil })
+}
+
+// `[...]` on a `Str`. Go would index the string's *bytes*, which is the wrong
+// unit twice over: `len` on a Str counts characters, so a guard written against
+// it does not bound the access the way it reads, and a byte plucked out of the
+// middle of a multi-byte character is not a character at all — slicing one out
+// produces a `Str` that is no longer valid UTF-8. Rather than pick a lowering
+// that is quietly wrong, the language has no `Str` subscript: reach for
+// `split`, `indexOf`, or a string pattern (`s is "{head}/{tail}"`).
+fn check_indexable(env: Env, e: ast.Expr) -> Result(Nil, String) {
+  let #(target, what) = case e {
+    ast.EIndex(t, _) -> #(Some(t), "indexed")
+    ast.ESlice(t, _, _) -> #(Some(t), "sliced")
+    _ -> #(None, "")
+  }
+  case target {
+    None -> Ok(Nil)
+    Some(t) ->
+      case infer(env, t) {
+        TyStr ->
+          Error(
+            "a `Str` cannot be "
+            <> what
+            <> ": `[...]` addresses bytes, while a `Str` is a sequence of "
+            <> "characters (`len` counts those), so the two never line up and "
+            <> "a byte out of the middle of a character is not text. Use "
+            <> "`split(s, sep)` to get at the pieces, `indexOf(s, sub)` to "
+            <> "find one, or a string pattern (`s is \"{head}/{tail}\"`) to "
+            <> "take it apart.",
+          )
+        _ -> Ok(Nil)
+      }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1677,55 +1888,67 @@ fn gen_stmt(
   case stmt {
     ast.SVarDecl(name, value, mutable) -> {
       let ty = infer(env, value)
-      let #(rhs, shared) =
-        bind_rhs(
-          env,
-          ty,
-          Some(name),
-          mutable,
-          value,
-          gen_expr(env, value),
-          following,
-        )
-      let decl = pad <> escape_ident(name) <> " := " <> rhs <> "\n"
-      let env2 =
-        Env(
-          ..env,
-          locals: dict.insert(env.locals, name, ty),
-          muts: dict.insert(env.muts, name, mutable),
-          aliased: record_alias(env, name, value, shared),
-        )
-      #(decl <> guard(following, name, pad), env2)
+      case shares_storage(env, ty, mutable, value) {
+        // Shared mutable state: the name *is* the source, so no variable of its
+        // own and nothing to keep in step.
+        True -> #("", share_env(env, name, ty, mutable, value))
+        False -> {
+          let #(rhs, shared) =
+            bind_rhs(
+              env,
+              ty,
+              Some(name),
+              mutable,
+              value,
+              gen_expr(env, value),
+              following,
+            )
+          let decl = pad <> escape_ident(name) <> " := " <> rhs <> "\n"
+          let env2 =
+            Env(
+              ..env,
+              locals: dict.insert(env.locals, name, ty),
+              muts: dict.insert(env.muts, name, mutable),
+              aliased: record_alias(env, name, value, shared),
+            )
+          #(decl <> guard(following, name, pad), env2)
+        }
+      }
     }
     ast.STypedDecl(typ, name, value, mutable) -> {
       let ty = ty_of_type_expr(env.types, typ)
-      let #(rhs, shared) =
-        bind_rhs(
-          env,
-          ty,
-          Some(name),
-          mutable,
-          value,
-          coerce(env, value, ty),
-          following,
-        )
-      let decl =
-        pad
-        <> "var "
-        <> escape_ident(name)
-        <> " "
-        <> gen_type(typ)
-        <> " = "
-        <> rhs
-        <> "\n"
-      let env2 =
-        Env(
-          ..env,
-          locals: dict.insert(env.locals, name, ty),
-          muts: dict.insert(env.muts, name, mutable),
-          aliased: record_alias(env, name, value, shared),
-        )
-      #(decl <> guard(following, name, pad), env2)
+      case shares_storage(env, ty, mutable, value) {
+        True -> #("", share_env(env, name, ty, mutable, value))
+        False -> {
+          let #(rhs, shared) =
+            bind_rhs(
+              env,
+              ty,
+              Some(name),
+              mutable,
+              value,
+              coerce(env, value, ty),
+              following,
+            )
+          let decl =
+            pad
+            <> "var "
+            <> escape_ident(name)
+            <> " "
+            <> gen_type(typ)
+            <> " = "
+            <> rhs
+            <> "\n"
+          let env2 =
+            Env(
+              ..env,
+              locals: dict.insert(env.locals, name, ty),
+              muts: dict.insert(env.muts, name, mutable),
+              aliased: record_alias(env, name, value, shared),
+            )
+          #(decl <> guard(following, name, pad), env2)
+        }
+      }
     }
     ast.SReturn(None) -> #(pad <> "return\n", env)
     ast.SReturn(Some(e)) -> #(
@@ -1882,6 +2105,25 @@ fn gen_stmt(
   }
 }
 
+// The environment after a sharing binding: the new name renders as the source's
+// lvalue, and both ends are recorded as having a live mutable alias so neither
+// can later be *moved* into an immutable binding.
+fn share_env(
+  env: Env,
+  name: String,
+  ty: Ty,
+  mutable: Bool,
+  value: ast.Expr,
+) -> Env {
+  Env(
+    ..env,
+    locals: dict.insert(env.locals, name, ty),
+    muts: dict.insert(env.muts, name, mutable),
+    aliased: record_alias(env, name, value, True),
+    renames: dict.insert(env.renames, name, gen_expr(env, value)),
+  )
+}
+
 // Generates the inline Go for a for-loop's init or post clause (no leading
 // indentation, no trailing newline — it sits inside the `for ( ; ; )` header)
 // and threads any variable it declares into the returned environment.
@@ -1963,7 +2205,156 @@ fn guard(scope: List(ast.Stmt), name: String, pad: String) -> String {
   }
 }
 
+// A subject that does work — a call, a `using` read, an `await` — is read once
+// to test it and again for every value the pattern binds, so it has to be
+// evaluated into a temporary first. Go's `if` has exactly one init slot for that,
+// which serves the leftmost test; when a test further right needs one too, one
+// slot is not enough, and the operands cannot all be hoisted ahead of the `if`
+// either — `&&` short-circuits, so a later subject must not run unless the
+// earlier tests held.
+//
+// Both forms are emitted, and the flat one is chosen whenever it suffices, which
+// is nearly always.
 fn gen_if(
+  env: Env,
+  branches: List(ast.Branch),
+  else_body: Option(List(ast.Stmt)),
+  indent: Int,
+) -> String {
+  case branches {
+    [] ->
+      case else_body {
+        Some(body) -> gen_stmts(env, body, indent)
+        None -> ""
+      }
+    _ ->
+      case list.any(branches, fn(b) { needs_nesting(b.cond) }) {
+        False -> gen_if_flat(env, branches, else_body, indent)
+        True -> gen_if_nested(env, branches, else_body, indent)
+      }
+  }
+}
+
+// The `&&`-separated tests of a condition, left to right. Only `&&` splits one:
+// an `||` operand may or may not run, and no binding escapes one anyway.
+fn and_spine(cond: ast.Expr) -> List(ast.Expr) {
+  case cond {
+    ast.EBinary(ast.OpAnd, l, r) ->
+      list.append(and_spine(l), and_spine(r))
+    _ -> [cond]
+  }
+}
+
+// Whether a condition needs a temporary anywhere but its leftmost test — the one
+// place the flat form can put one.
+fn needs_nesting(cond: ast.Expr) -> Bool {
+  case and_spine(cond) {
+    [] | [_] -> False
+    [_, ..rest] -> list.any(rest, fn(t) { hoistable_subject(t) != None })
+  }
+}
+
+// One nested `if` per `&&`-separated test, each with an init slot of its own.
+// Nesting reproduces the short-circuit exactly, and it turns every pattern's
+// bindings into ordinary variables that the tests to their right — and the body —
+// read like any other local.
+//
+// What nesting costs is the `else`: a chain that fails part-way falls out of the
+// middle rather than off the end, so anything that has to run when the whole
+// condition was false hangs off a flag the innermost body sets.
+fn gen_if_nested(
+  env: Env,
+  branches: List(ast.Branch),
+  else_body: Option(List(ast.Stmt)),
+  indent: Int,
+) -> String {
+  let pad = tabs(indent)
+  case branches {
+    [] ->
+      case else_body {
+        Some(body) -> gen_stmts(env, body, indent)
+        None -> ""
+      }
+    [b, ..rest] -> {
+      // A flag is only needed when something has to run on the false path.
+      let has_tail = rest != [] || else_body != None
+      let flag = "_m" <> int.to_string(indent)
+      let #(open, benv, depth) =
+        gen_nested_tests(env, and_spine(b.cond), b.body, indent, 0)
+      let inner = tabs(indent + depth)
+      let head = case has_tail {
+        True -> pad <> flag <> " := false\n"
+        False -> ""
+      }
+      let set = case has_tail {
+        True -> inner <> flag <> " = true\n"
+        False -> ""
+      }
+      let tail = case has_tail {
+        True ->
+          pad
+          <> "if !"
+          <> flag
+          <> " {\n"
+          <> gen_if(env, rest, else_body, indent + 1)
+          <> pad
+          <> "}\n"
+        False -> ""
+      }
+      head
+      <> open
+      <> set
+      <> gen_stmts(benv, b.body, indent + depth)
+      <> close_braces(indent, depth)
+      <> tail
+    }
+  }
+}
+
+fn gen_nested_tests(
+  env: Env,
+  tests: List(ast.Expr),
+  body: List(ast.Stmt),
+  indent: Int,
+  level: Int,
+) -> #(String, Env, Int) {
+  case tests {
+    [] -> #("", env, level)
+    [t, ..rest] -> {
+      let pad = tabs(indent + level)
+      let #(init, hoisted) = case hoistable_subject(t) {
+        Some(subject) -> {
+          let name =
+            "_u" <> int.to_string(indent) <> "_" <> int.to_string(level)
+          #(name <> " := " <> gen_expr(env, subject) <> "; ", Some(name))
+        }
+        None -> #("", None)
+      }
+      let #(cond_str, binds) = gen_condition_as(env, t, hoisted)
+      let open =
+        pad
+        <> "if "
+        <> init
+        <> cond_str
+        <> " {\n"
+        <> gen_bindings(binds, body, indent + level + 1)
+      let #(more, fenv, depth) =
+        gen_nested_tests(bind_locals(env, binds), rest, body, indent, level + 1)
+      #(open <> more, fenv, depth)
+    }
+  }
+}
+
+// The closing braces for `depth` nested `if`s opened at `indent`, innermost
+// first.
+fn close_braces(indent: Int, depth: Int) -> String {
+  case depth {
+    0 -> ""
+    _ -> tabs(indent + depth - 1) <> "}\n" <> close_braces(indent, depth - 1)
+  }
+}
+
+fn gen_if_flat(
   env: Env,
   branches: List(ast.Branch),
   else_body: Option(List(ast.Stmt)),
@@ -2702,10 +3093,15 @@ fn gen_expr(env: Env, e: ast.Expr) -> String {
       }
     ast.EAtom(name) -> gen_atom(name)
     ast.EIdent(name) ->
-      // Inside a condition an `is`-binding reads through its accessor.
+      // Inside a condition an `is`-binding reads through its accessor; a name
+      // that shares another's storage reads through to it.
       case dict.get(env.subst, name) {
         Ok(rhs) -> rhs
-        Error(_) -> escape_ident(name)
+        Error(_) ->
+          case dict.get(env.renames, name) {
+            Ok(lvalue) -> lvalue
+            Error(_) -> escape_ident(name)
+          }
       }
     ast.EVector(items) -> gen_vector(env, items, TyUnknown)
     ast.EMember(target, field) -> {
@@ -2750,16 +3146,71 @@ fn gen_expr(env: Env, e: ast.Expr) -> String {
 // handle. The closure captures the exact call so its result type matches the
 // declared return; a void async func yields `hive.Unit` so the handle can still
 // be joined on.
+//
+// The arguments have to be evaluated *before* the goroutine starts, not inside
+// the closure: for a `mut` argument the evaluation is the copy that keeps the
+// task from sharing the caller's storage, and a copy made on the new goroutine
+// would race with the caller it is supposed to be protecting against. So when
+// any argument needs that treatment the whole spawn is wrapped in a thunk that
+// runs in the caller, binds each argument, and only then spawns. (A `go f(x)`
+// fire-and-forget statement needs none of this: Go evaluates a `go` statement's
+// arguments in the calling goroutine already.)
 fn gen_spawn(env: Env, name: String, args: List(ast.Arg)) -> String {
-  let call = gen_call(env, ast.EIdent(name), args)
   let ret = case dict.get(env.fns, name) {
     Ok(#(_, _, r)) -> r
     Error(_) -> ast.TVoid
   }
-  case ret {
-    ast.TVoid ->
-      "hive.Spawn(func() hive.Unit { " <> call <> "; return hive.Unit{} })"
-    _ -> "hive.Spawn(func() " <> gen_type(ret) <> " { return " <> call <> " })"
+  let spawn = fn(call) {
+    case ret {
+      ast.TVoid ->
+        "hive.Spawn(func() hive.Unit { " <> call <> "; return hive.Unit{} })"
+      _ -> "hive.Spawn(func() " <> gen_type(ret) <> " { return " <> call <> " })"
+    }
+  }
+  // Which arguments are copied in — the ones whose evaluation must not be
+  // deferred onto the new goroutine.
+  let copied =
+    list.index_map(args, fn(a, i) { #(i, a) })
+    |> list.filter(fn(entry) {
+      let #(_, a) = entry
+      gen_arg(env, a.value, TyUnknown) != gen_expr(env, a.value)
+    })
+  case copied {
+    [] -> spawn(gen_call(env, ast.EIdent(name), args))
+    _ -> {
+      // Bind each copied argument to a local in the caller, then hand the
+      // locals to the call. `_a<i>` cannot collide: Hive identifiers never
+      // start with an underscore.
+      let binds =
+        copied
+        |> list.map(fn(entry) {
+          let #(i, a) = entry
+          "_a"
+          <> int.to_string(i)
+          <> " := "
+          <> gen_arg(env, a.value, TyUnknown)
+          <> "; "
+        })
+        |> string.concat
+      let inner_args =
+        list.index_map(args, fn(a, i) {
+          case list.key_find(copied, i) {
+            Ok(_) -> ast.Arg(a.name, ast.EIdent("_a" <> int.to_string(i)))
+            Error(_) -> a
+          }
+        })
+      let handle_ty = case ret {
+        ast.TVoid -> "*hive.Async[hive.Unit]"
+        _ -> "*hive.Async[" <> async_inner_go(ty_of_type_expr(env.types, ret)) <> "]"
+      }
+      "func() "
+      <> handle_ty
+      <> " { "
+      <> binds
+      <> "return "
+      <> spawn(gen_call(env, ast.EIdent(name), inner_args))
+      <> " }()"
+    }
   }
 }
 
@@ -2990,6 +3441,81 @@ fn gen_equality(env: Env, l: ast.Expr, r: ast.Expr, positive: Bool) -> String {
 // (`v[i] = …`, `v.f = …`, `append(v, …)`), so an immutable binding never
 // mutates; the copy exists only to stop a *mutable* alias from doing so.
 // `bind_rhs` decides, per binding, between an alias (cheap) and a copy.
+
+// An argument that names `mut` storage is copied on its way in.
+//
+// A parameter is an immutable binding of its own: the callee sees a plain `T`,
+// never the caller's `Mutex<T>`. That is only true if the callee cannot observe
+// the caller mutating it afterwards, and sharing the backing array makes it
+// false two ways over. The mild way is that the callee may keep the slice — in a
+// value it returns, a struct it builds, a message it sends — and see later
+// writes through it. The severe way is an `async func`, which runs *while* the
+// caller carries on: the two then read and write the same array concurrently,
+// which is a data race, not merely a surprising read.
+//
+// So the copy is unconditional on mutability rather than argued away per call
+// site. It is still type-directed and still free for anything that owns no
+// storage — a scalar, an atom, a struct of scalars — so the cost falls only on
+// the arguments that could actually be shared.
+fn gen_arg(env: Env, value: ast.Expr, expect: Ty) -> String {
+  let rendered = coerce(env, value, expect)
+  // A parameter of unknown type (a call through a function value, a leftover
+  // positional) is copied at whatever the argument itself is.
+  let ty = case expect {
+    TyUnknown -> infer(env, value)
+    _ -> expect
+  }
+  case
+    aliases_storage(value)
+    && source_mutable(env, value)
+    && needs_deep_copy_ty(env, ty)
+  {
+    True -> gen_clone(env, ty, rendered, 0)
+    False -> rendered
+  }
+}
+
+// Two `mut` bindings deliberately share storage: `mut b = a` is how one opts
+// into shared mutable state, and every change through either name has to be
+// visible through the other.
+//
+// Two Go variables cannot deliver that. They start out holding the same slice
+// header, but `append` returns a *new* header — so `append(a, x)` rebinds `a`
+// alone, and from then on the two names are only related by whether Go happened
+// to reuse the backing array, which depends on spare capacity. That made
+// aliasing hold or break for reasons the source never mentions.
+//
+// So the second name is not given a variable at all: it renders as the first,
+// and there is one header for both. `append(b, x)` then *is* `a = append(a, x)`,
+// and an element write through either is seen through both, capacity or no
+// capacity.
+//
+// Two conditions narrow it. The type must own storage — sharing is about a
+// backing array, and `mut b = a` on an `Int` is an ordinary independent copy.
+// And the source must name the same storage every time it is evaluated, which a
+// subscript does not: `i` in `mut b = a[i]` can move, so that binding keeps its
+// own header.
+fn shares_storage(
+  env: Env,
+  ty: Ty,
+  target_mutable: Bool,
+  value: ast.Expr,
+) -> Bool {
+  target_mutable
+  && source_mutable(env, value)
+  && stable_lvalue(value)
+  && needs_deep_copy_ty(env, ty)
+}
+
+// An expression naming the same storage on every evaluation: a variable, or a
+// field path rooted at one.
+fn stable_lvalue(e: ast.Expr) -> Bool {
+  case e {
+    ast.EIdent(_) -> True
+    ast.EMember(target, _) -> stable_lvalue(target)
+    _ -> False
+  }
+}
 
 // Whether an RHS expression refers to already-existing storage (so a binding
 // to it would alias), rather than producing a fresh value (a literal, a
@@ -3830,7 +4356,7 @@ fn ty_type_expr(ty: Ty) -> Option(ast.TypeExpr) {
     TyVec(inner) ->
       case ty_type_expr(inner) {
         Some(ast.TName(pkg, name, dims)) ->
-          Some(ast.TName(pkg, name, [ast.DimDyn(None), ..dims]))
+          Some(ast.TName(pkg, name, [ast.DimDyn, ..dims]))
         _ -> None
       }
     _ -> None
@@ -4343,12 +4869,12 @@ fn gen_field_args(
         Ok(#(_, t)) -> t
         Error(_) -> TyUnknown
       }
-      exported(fname) <> ": " <> coerce(env, value, ty)
+      exported(fname) <> ": " <> gen_arg(env, value, ty)
     })
   let extra_strs =
     extra
     |> list.index_map(fn(e, i) {
-      "Field" <> int.to_string(i) <> ": " <> gen_expr(env, e)
+      "Field" <> int.to_string(i) <> ": " <> gen_arg(env, e, TyUnknown)
     })
   string.join(list.append(assigned_strs, extra_strs), ", ")
 }
@@ -4390,7 +4916,9 @@ fn gen_partial(env: Env, name: String, args: List(ast.Arg)) -> String {
       let #(#(#(_, expr), field), i) = entry
       case is_hole_expr(expr) {
         True -> "_h" <> int.to_string(i)
-        False -> coerce(env, expr, ty_of_type_expr(env.types, field.typ))
+        // A captured argument is held by the closure for as long as the value
+        // lives, so it is copied in exactly as a direct call's would be.
+        False -> gen_arg(env, expr, ty_of_type_expr(env.types, field.typ))
       }
     })
     |> string.join(", ")
@@ -4531,9 +5059,9 @@ fn gen_sig_args(
         Ok(#(_, t)) -> t
         Error(_) -> TyUnknown
       }
-      coerce(env, value, ty)
+      gen_arg(env, value, ty)
     })
-  let extra_strs = list.map(extra, fn(e) { gen_expr(env, e) })
+  let extra_strs = list.map(extra, fn(e) { gen_arg(env, e, TyUnknown) })
   string.join(list.append(assigned_strs, extra_strs), ", ")
 }
 
@@ -4571,7 +5099,11 @@ fn gen_struct_construct(
 }
 
 fn gen_plain_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
-  gen_expr(env, callee) <> "(" <> gen_args(env, args) <> ")"
+  let rendered =
+    args
+    |> list.map(fn(a) { gen_arg(env, a.value, TyUnknown) })
+    |> string.join(", ")
+  gen_expr(env, callee) <> "(" <> rendered <> ")"
 }
 
 // `append(v, a, b, ...)` -> Go's builtin `append`, coercing every appended

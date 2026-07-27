@@ -45,6 +45,7 @@ pub fn compile(source: String) -> Result(String, String) {
 // not care how many files it came from.
 fn finish(module: ast.Module) -> Result(String, String) {
   use _ <- result.try(check(module))
+  use _ <- result.try(codegen.check_types(module))
   use _ <- result.try(bounds.check(module))
   Ok(codegen.generate(module))
 }
@@ -80,6 +81,7 @@ type Ctx {
 
 fn check(module: ast.Module) -> Result(Nil, String) {
   use _ <- result.try(check_has_main(module))
+  use _ <- result.try(check_decl_types(module.decls))
   let procs =
     list.fold(module.decls, dict.new(), fn(acc, d) {
       case d {
@@ -153,6 +155,87 @@ fn check(module: ast.Module) -> Result(Nil, String) {
   |> result.map(fn(_) { Nil })
 }
 
+// ---------------------------------------------------------------------------
+// Where an unsized vector type may appear
+// ---------------------------------------------------------------------------
+//
+// `T[]` says only "a vector of T, of some length". That is exactly what a
+// parameter wants — it accepts any vector of the right element type, and the
+// callee guards every access into it, having been promised nothing. It is
+// exactly what a variable, field or return must *not* be: each of those names
+// storage, and storage has to declare which of the two real kinds it is
+// (`T[3]`, whose length is a promise checked everywhere a value can reach it, or
+// `T[dyn]`, which promises nothing and guards its indexes) for the bounds pass
+// to have anything to reason about.
+
+// Every type written in a declaration, checked in the position it appears in.
+fn check_decl_types(decls: List(ast.Decl)) -> Result(Nil, String) {
+  list.try_fold(decls, Nil, fn(_, d) {
+    case d {
+      ast.ProcDecl(name, params, ret, _)
+      | ast.FuncDecl(name, params, ret, _, _)
+      | ast.QueryDecl(name, params, ret, _) -> {
+        use _ <- result.try(
+          list.try_fold(params, Nil, fn(_, p) {
+            check_param_type(p.typ, "parameter `" <> p.name <> "` of `" <> name <> "`")
+          }),
+        )
+        check_sized(ret, "the return type of `" <> name <> "`")
+      }
+      ast.TypeDecl(name, variants, commons) -> {
+        let fields =
+          list.append(list.flat_map(variants, fn(v) { v.fields }), commons)
+        list.try_fold(fields, Nil, fn(_, f) {
+          check_sized(f.typ, "field `" <> f.name <> "` of type `" <> name <> "`")
+        })
+      }
+    }
+  })
+  |> result.map(fn(_) { Nil })
+}
+
+// A parameter's own type may be unsized. A function *type* in that position
+// carries positions of its own: its parameters are parameter positions too, its
+// return is not.
+fn check_param_type(t: ast.TypeExpr, where: String) -> Result(Nil, String) {
+  case t {
+    ast.TName(_, _, _) | ast.TVoid -> Ok(Nil)
+    ast.TFunc(_, params, ret) -> {
+      use _ <- result.try(
+        list.try_fold(params, Nil, fn(_, p) { check_param_type(p, where) }),
+      )
+      check_sized(ret, "the return type in " <> where)
+    }
+  }
+}
+
+// A position that names storage: reject `T[]` anywhere in it.
+fn check_sized(t: ast.TypeExpr, where: String) -> Result(Nil, String) {
+  case t {
+    ast.TVoid -> Ok(Nil)
+    ast.TName(_, _, dims) ->
+      case list.contains(dims, ast.DimEmpty) {
+        False -> Ok(Nil)
+        True ->
+          Error(
+            where
+            <> " is declared `"
+            <> ast.show_type(t)
+            <> "`, but `[]` only says \"a vector of some length\" — which is a "
+            <> "promise a parameter can make and storage cannot. Declare it "
+            <> "`[dyn]` (any length, guarded indexes) or give it a static "
+            <> "length like `[3]`.",
+          )
+      }
+    ast.TFunc(_, params, ret) -> {
+      use _ <- result.try(
+        list.try_fold(params, Nil, fn(_, p) { check_param_type(p, where) }),
+      )
+      check_sized(ret, "the return type in " <> where)
+    }
+  }
+}
+
 // A program starts at `proc main(): void`. Only the entrypoint's `main` keeps
 // that name through import flattening, so a module meant to be imported has
 // none — and building one directly would otherwise fail as a Go linker error
@@ -213,7 +296,8 @@ fn check_stmt(
       use _ <- result.try(check_expr(ctx, value))
       Ok(dict.insert(muts, name, mutable))
     }
-    ast.STypedDecl(_, name, value, mutable) -> {
+    ast.STypedDecl(typ, name, value, mutable) -> {
+      use _ <- result.try(check_sized(typ, "`" <> name <> "`"))
       use _ <- result.try(check_expr(ctx, value))
       Ok(dict.insert(muts, name, mutable))
     }
@@ -291,7 +375,11 @@ fn check_stmt(
       )
       Ok(muts)
     }
-    ast.SForEach(name, _, iterable, body) -> {
+    ast.SForEach(name, elem_type, iterable, body) -> {
+      use _ <- result.try(case elem_type {
+        Some(t) -> check_sized(t, "the element type of `" <> name <> "`")
+        None -> Ok(Nil)
+      })
       use _ <- result.try(check_expr(ctx, iterable))
       // The iteration variable is a fresh, immutable binding in the body.
       let inner = dict.insert(muts, name, False)

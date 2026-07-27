@@ -455,9 +455,9 @@ fn split_type_path(segments: List(String)) -> #(Option(String), String) {
   }
 }
 
-// Parses trailing vector markers: `[]`, `[3]`, `[dyn]` or `[dyn, 2]`. A `[`
-// that doesn't start a well-formed marker is left in place (it may be an
-// index expression instead).
+// Parses trailing vector markers: `[]`, `[3]` or `[dyn]`. A `[` that doesn't
+// start a well-formed marker is left in place (it may be an index expression
+// instead).
 fn parse_dims(tokens: Toks, acc: List(ast.Dim)) -> #(List(ast.Dim), Toks) {
   case kind(tokens) {
     token.LBracket -> {
@@ -470,26 +470,11 @@ fn parse_dims(tokens: Toks, acc: List(ast.Dim)) -> #(List(ast.Dim), Toks) {
               parse_dims(tail(tail(t1)), [ast.DimStatic(n), ..acc])
             _ -> #(list.reverse(acc), tokens)
           }
-        token.KwDyn -> {
-          let t2 = tail(t1)
-          case kind(t2) {
-            token.RBracket -> parse_dims(tail(t2), [ast.DimDyn(None), ..acc])
-            token.Comma ->
-              case kind(tail(t2)) {
-                token.IntLit(n) ->
-                  case kind(tail(tail(t2))) {
-                    token.RBracket ->
-                      parse_dims(tail(tail(tail(t2))), [
-                        ast.DimDyn(Some(n)),
-                        ..acc
-                      ])
-                    _ -> #(list.reverse(acc), tokens)
-                  }
-                _ -> #(list.reverse(acc), tokens)
-              }
+        token.KwDyn ->
+          case kind(tail(t1)) {
+            token.RBracket -> parse_dims(tail(tail(t1)), [ast.DimDyn, ..acc])
             _ -> #(list.reverse(acc), tokens)
           }
-        }
         _ -> #(list.reverse(acc), tokens)
       }
     }
@@ -880,7 +865,7 @@ fn parse_additive_rest(
 }
 
 fn parse_multiplicative(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
-  use #(left, t1) <- result.try(parse_power(tokens))
+  use #(left, t1) <- result.try(parse_unary(tokens))
   parse_multiplicative_rest(left, t1)
 }
 
@@ -890,27 +875,51 @@ fn parse_multiplicative_rest(
 ) -> Result(#(ast.Expr, Toks), String) {
   case kind(tokens) {
     token.Star -> {
-      use #(right, t1) <- result.try(parse_power(tail(tokens)))
+      use #(right, t1) <- result.try(parse_unary(tail(tokens)))
       parse_multiplicative_rest(ast.EBinary(ast.OpMul, left, right), t1)
     }
     token.Slash -> {
-      use #(right, t1) <- result.try(parse_power(tail(tokens)))
+      use #(right, t1) <- result.try(parse_unary(tail(tokens)))
       parse_multiplicative_rest(ast.EBinary(ast.OpDiv, left, right), t1)
     }
     token.Percent -> {
-      use #(right, t1) <- result.try(parse_power(tail(tokens)))
+      use #(right, t1) <- result.try(parse_unary(tail(tokens)))
       parse_multiplicative_rest(ast.EBinary(ast.OpMod, left, right), t1)
     }
     _ -> Ok(#(left, tokens))
   }
 }
 
-// `**` is right-associative: `2 ** 3 ** 2` is `2 ** (3 ** 2)`.
+// Prefix `-`. It binds tighter than `* / %` but looser than `**`, which is the
+// conventional arithmetic reading: `-2 ** 2` is `-(2 ** 2)`, while `2 * -3` and
+// `2 ** -3` both put the minus on the operand it is written against.
+//
+// Applied to a numeric literal the sign is folded straight into the literal, so
+// `-3` is one `EInt(-3)` rather than a subtraction — which is what lets a
+// negative literal be recognised as one everywhere downstream (the bounds pass
+// in particular reasons about literal indexes). Anything else negates by
+// subtracting from zero, so no unary node is needed in the AST.
+fn parse_unary(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
+  case kind(tokens) {
+    token.Minus -> {
+      use #(operand, t1) <- result.try(parse_unary(tail(tokens)))
+      case operand {
+        ast.EInt(v) -> Ok(#(ast.EInt(0 - v), t1))
+        ast.EFloat(v) -> Ok(#(ast.EFloat(0.0 -. v), t1))
+        _ -> Ok(#(ast.EBinary(ast.OpSub, ast.EInt(0), operand), t1))
+      }
+    }
+    _ -> parse_power(tokens)
+  }
+}
+
+// `**` is right-associative: `2 ** 3 ** 2` is `2 ** (3 ** 2)`. Its exponent is
+// parsed at the unary level so `2 ** -3` reads the sign as part of the exponent.
 fn parse_power(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
   use #(base, t1) <- result.try(parse_with_type(tokens))
   case kind(t1) {
     token.StarStar -> {
-      use #(exponent, t2) <- result.try(parse_power(tail(t1)))
+      use #(exponent, t2) <- result.try(parse_unary(tail(t1)))
       Ok(#(ast.EBinary(ast.OpPow, base, exponent), t2))
     }
     _ -> Ok(#(base, t1))

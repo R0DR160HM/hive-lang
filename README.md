@@ -196,13 +196,23 @@ compiles, builds and runs.
   another `.hive` file's declarations into scope. See
   [`## Multiple files`](#multiple-files) below.
 * **Strings** (`Str`) are UTF-8, support `"{expr}"` interpolation, and
-  backtick multiline strings whose indentation is removed at compile time.
-* **Vectors** are memory-contiguous and static (`Str[3]`) or dynamic
-  (`Str[dyn]`, `Str[dyn, 2]` with an initial size). A static length is
+  backtick multiline strings whose indentation is removed at compile time. A
+  `Str` has no subscript: `s[0]` and `s[1:3]` are compile errors, because
+  `[...]` addresses bytes while a `Str` is a sequence of characters (which is
+  what `len` counts), so the two never line up and a byte from the middle of a
+  character is not text. Take a string apart with `split`, find in it with
+  `indexOf`, or match it with a [string pattern](#the-language).
+* **Vectors** are memory-contiguous and either static (`Str[3]`) or dynamic
+  (`Str[dyn]`). A static length is
   enforced, not advertised: a `Str[3]` slot only ever takes a vector of three,
   wherever the value comes from (see
   [vector bounds](#scope)), which is what lets `v[2]` on one compile with no
-  guard. All of them lower to Go
+  guard. A third spelling, `Str[]`, is legal **only as a parameter**: it
+  promises nothing about the length and accepts any vector of the right element
+  type, so one helper serves callers holding a `Str[3]` and a `Str[dyn]` alike.
+  Anything that names storage — a variable, a field, a return — has to say which
+  of the two real kinds it is, since a promise is the only thing an index can
+  rest on. All of them lower to Go
   slices; `+` concatenates into a new vector. `==` and `!=` compare vectors
   structurally — same length, then element by element (nested vectors and a
   `Table` compare the same way), short-circuiting on the first difference;
@@ -225,7 +235,10 @@ compiles, builds and runs.
   `Mutex<T>`: identical to `T` at runtime, but only mutexes may be altered at
   compile time. A parameter or return of type `T` accepts a `Mutex<T>` (the
   callee just sees an immutable `T`), never the reverse, so assigning to a
-  parameter or a plain `:=` binding is a compile error.
+  parameter or a plain `:=` binding is a compile error. A mutex passed as an
+  argument is **copied** on the way in, so the callee's immutable view really is
+  one: it cannot see the caller's later writes, whether the two run in sequence
+  or — for an `async func` — at the same time.
 * **Concurrency** — an `async func` runs on its own virtual thread (a
   goroutine). The call site decides how you interact with it, with no Future or
   Promise type to name and nothing dynamically typed. A bare call spawns the
@@ -279,7 +292,11 @@ compiles, builds and runs.
   operator, with the same precedence as `*` and `/`); dividing — or taking a
   remainder — by zero returns 0. A mutable number supports the compound
   assignments `+= -= *= /=` and the `++` / `--` steps (`x += 2`, `i++`), each
-  shorthand for the matching `x = x <op> ...`.
+  shorthand for the matching `x = x <op> ...`. Prefix `-` negates; it binds
+  tighter than `* / %` and looser than `**`, so `-2 ** 2` is `-(2 ** 2)` while
+  `2 ** -3` reads the sign as part of the exponent. See
+  [Arithmetic at the edges](#arithmetic-at-the-edges) for what overflow, a
+  negative exponent, and converting a non-finite `Float` do.
 * **Custom types** are Gleam-style ADTs: no variants ⇒ a struct, variants ⇒
   a tagged union. Fields declared outside any variant are added to every
   variant. `is` narrows a value to a variant and can bind its fields, and the
@@ -371,6 +388,30 @@ call or a constructed value (where a returned or embedded slice might alias its
 backing array), it is treated as possibly-mutated and the binding copies. Two
 `mut` bindings always alias — that is how you opt into shared mutable state.
 
+Shared mutable state is shared **completely**. Every change through either name
+is visible through the other, including `append`:
+
+```hive
+mut a := ["x", "y", "z"]
+mut b := a
+append(b, "w")       // len(a) is now 4
+a[0] = "changed"     // b[0] is "changed"
+b = ["replaced"]     // rebinding one rebinds both; len(a) is 1
+```
+
+Two Go slice variables could not deliver that — `append` returns a *new* slice
+header, so growing one name would quietly stop the two from sharing, or not,
+depending on whether the backing array happened to have spare capacity. So the
+second name is not given a variable at all: it compiles to the first, and there
+is one slice header for both. The one case this does not cover is a source that
+does not name the same storage every time it is read — `mut b = a[i]` can be a
+different element each time `i` moves — so that binding keeps a header of its
+own.
+
+Passing a mutex to a proc or func is the opposite case and always **copies** (see
+[Mutability](#the-language)): the callee is handed an immutable `T`, and it would
+not be one if the caller could still write to it.
+
 When a copy *is* made it is **deep and type-directed** — no runtime reflection:
 
 * a flat vector copies its backing array (`hive.CloneVec`);
@@ -382,6 +423,37 @@ When a copy *is* made it is **deep and type-directed** — no runtime reflection
 
 See [`code-examples/6 - Value Semantics`](code-examples/6%20-%20Value%20Semantics/value-semantics.hive)
 for a runnable walkthrough of each case.
+
+## Arithmetic at the edges
+
+Most of arithmetic is unsurprising. These are the cases where it is worth saying
+exactly what happens, so nothing here is left to chance:
+
+| expression                        | result                                          |
+| --------------------------------- | ----------------------------------------------- |
+| `a / 0`, `a % 0` (`Int` or `Float`) | `0` — division and remainder by zero are values, not crashes |
+| `Int` overflow (`+ - * **`)       | wraps, two's-complement, silently               |
+| `2 ** 100`                        | `0` — the wrap above, reached by repeated multiplication |
+| `n ** k` with `k < 0` (`Int`)     | `0`, including `1 ** -1`                        |
+| `n ** 0`                          | `1`                                             |
+| `-7 % 3`                          | `-1` — the remainder takes the sign of the dividend |
+| `10.0 ** 400.0`                   | `+Inf` — `Float` arithmetic does produce non-finite values |
+
+`Int` is a 64-bit signed integer and its overflow **wraps**; it is not checked
+and not an error, so `9223372036854775807 + 1` is the most negative `Int`. `**`
+on `Int`s is repeated multiplication and wraps the same way. A negative `Int`
+exponent has no integral answer, so it yields `0` rather than a fraction — which
+means `1 ** -1` is `0`, not `1`. If you want the mathematical answer, work in
+`Float`, where `**` is real exponentiation.
+
+One case is **deliberately unspecified**: converting a `Float` that is `+Inf`,
+`-Inf`, `NaN`, or simply too large to an `Int` (`hive.conv.ceil`, `floor`,
+`round`). Go leaves that conversion implementation-dependent, and Hive does not
+paper over it, so the value you get may differ between Go versions and between
+architectures — today, on amd64, all four give the most negative `Int`. Non-finite
+values reach a program through `Float` overflow (`10.0 ** 400.0`) and through
+`hive.conv.stf("Inf")`, so check for the range you expect before converting if it
+matters.
 
 ## Built-in functions
 
@@ -1131,6 +1203,7 @@ See [`code-examples/11 - Modules`](code-examples/11%20-%20Modules/modules.hive).
 | `name := expr`                          | `name := expr` (type inferred)                                 |
 | `T name = expr`                         | `var name T = expr`                                            |
 | `mut name := expr` / `mut T name = e`   | same as above (`mut` is compile-time only — permits reassign)  |
+| `mut b = a` (both `mut`, owns storage)  | no variable at all — `b` compiles to `a`, so one slice header is shared |
 | `x = expr` / `v[0] = expr`              | `x = expr` / `v[0] = expr` (only on `mut` variables)           |
 | `ys := xs` (needs a copy — see [value semantics](#value-semantics-copy-on-binding)) | `ys := hive.CloneVec(xs)` / `hive.CloneVecFn(..)` / `hive.CloneTable(..)` / `clone_T(..)` |
 | `for i := 0; i < n; i = i + 1 { }`      | `for i := 0; i < n; i = i + 1 { }` (counter scoped to the loop) |
@@ -1152,12 +1225,13 @@ See [`code-examples/11 - Modules`](code-examples/11%20-%20Modules/modules.hive).
 | `using p as xlsx` / `as ods`            | `hive.ReadXlsx(p)` / `hive.ReadOds(p)` → `Result[[]Table, TableError]` |
 | `using conn run q`                      | `hive.SqlQuery(conn, q)` → `Result[Table, SqlError]`           |
 | `if <call> is Result.Ok(v)`             | `if _u := <call>; _u.IsOk() { v := _u.Ok()` (evaluated once)    |
+| `if p && <call> is Result.Ok(v)`        | one nested `if` per `&&` test, so each has an init slot of its own (still evaluated once, still short-circuiting) |
 | `"{a} and {b}"`                         | concatenation, non-`Str` pieces via `hive.ToStr`               |
 | `[x, y] + [z]`                          | `hive.Concat([]T{x, y}, []T{z})`                               |
 | `v1 == v2` / `v1 != v2` (vectors)       | `hive.VecEq(v1, v2)` / `!hive.VecEq(v1, v2)` (structural)      |
 | `#Atom`                                 | `hive.Atom` constants + a generated `hive.InitAtoms` table     |
 | `true` / `false`                        | Go `true` / `false` (the `Bool` type, not atoms)               |
-| `a / b`, `a ** b`                       | `hive.DivInt`/`hive.DivFloat`, `hive.PowInt`/`hive.PowFloat`   |
+| `a / b`, `a ** b`                       | `hive.DivInt`/`hive.DivFloat`, `hive.PowInt`/`hive.PowFloat` (see [edges](#arithmetic-at-the-edges)) |
 | `a % b`                                 | `hive.ModInt`/`hive.ModFloat` (remainder; `% 0` returns 0)    |
 | `len(v)` vector / `len(s)` Str          | `len(v)` (elements) / `hive.StrLen(s)` (UTF-8 runes)           |
 | `bytes(v)` vector / `bytes(s)` Str      | `hive.Bytes(v)` (footprint) / `len(s)` (UTF-8 byte length)     |
@@ -1176,6 +1250,7 @@ See [`code-examples/11 - Modules`](code-examples/11%20-%20Modules/modules.hive).
 | `hive.net.socketSend(c, d)` / `.socketReceive(c, n)` | `hive.SocketSend(c, d)` → `Result[Int, _]` / `hive.SocketReceive(c, n)` → `Result[Str, _]` |
 | `hive.net.socketReceiveLine(c)`         | `hive.SocketReceiveLine(c)` → `Result[Str, SocketError]` (newline trimmed) |
 | `hive.net.socketPeer(c)` / `.socketClose(c)` | `hive.SocketPeer(c)` → `Str` / `hive.SocketClose(c)`       |
+| `f(mutVec)` (argument names `mut` storage) | `f(hive.CloneVec(mutVec))` (copied in, so the callee's `T` really is immutable) |
 | `f` (bare reference)                    | `f` (the Go function value)                                    |
 | `f(a, _, c)` (partial application)      | `func(h T) R { return f(a, h, c) }` (a closure; `_`→ parameter) |
 | `hive.crypto.sha256/sha512(s)`          | `hive.Sha256/Sha512(s)` (lowercase-hex digest)                 |
@@ -1207,12 +1282,15 @@ See [`code-examples/11 - Modules`](code-examples/11%20-%20Modules/modules.hive).
 | `hive.syslink.stop(a)` / `.node()`      | `hive.SyslinkStop(a)` / `hive.SyslinkNode()` → `string`         |
 | `hive.syslink.Address` / `.Envelope`    | `hive.Address` / `hive.Envelope` (message type inferred, never written) |
 | `Str`, `Int`, `Bool`, `Float`, `Atom`   | `string`, `int`, `bool`, `float64`, `hive.Atom`                |
-| `Str[3]`, `Str[dyn]`, `Str[dyn, 2]`     | `[]string` (all vectors lower to slices)                       |
+| `Str[3]`, `Str[dyn]`, `Str[]`           | `[]string` (all vectors lower to slices)                       |
 | `Table`, `hive.TableError`, `Result`    | provided by the generated `hive` runtime package               |
 
 Codegen runs a lightweight type-inference pass over locals so overloaded
 syntax picks the right lowering (`+` on vectors vs. strings vs. numbers, atom
-→ `Str` coercions, zero-safe division, vector literal element types). Hive
+→ `Str` coercions, zero-safe division, vector literal element types). The same
+pass decides the constructs that have no honest lowering — indexing a `Str` is
+the one that exists today — so they are rejected as Hive errors rather than
+emitted as Go that either fails to compile or quietly means something else. Hive
 requires every non-`void` `proc`/`func` to return on every path: a path
 terminates by ending in `return`, in `assert` or `panic` (both handy for a tail
 you know is unreachable, e.g. `assert false` or `panic "unreachable"`), in an
@@ -1272,7 +1350,8 @@ compile error rather than a runtime crash.
 
 A **declared** length is a promise, not a hint. `Str[3]` means three, so every
 value that lands in such a slot — an initialiser, a later assignment, an
-argument, a returned value, a row written into a `Str[2][2]` — has to be a
+argument, a **field of a constructed value**, a returned value, a row written
+into a `Str[2][2]` — has to be a
 vector of exactly that many elements, and a length the compiler can't see is
 rejected too:
 
@@ -1288,6 +1367,42 @@ above stays legal after the reassignment, and a `Str[3]` parameter can be
 indexed inside the callee without a guard, since every call site was checked.
 The escape, as always, is `[dyn]`: `Str[dyn]` promises nothing and guards its
 indexes.
+
+Because keeping a promise means keeping it at *every* call site, a callable with
+a statically-sized parameter is restricted as a **value**. It may be bound to an
+immutable name — a bare reference or a partial application — and called through
+it, and those calls are checked exactly as direct ones are:
+
+```hive
+proc takes(v: Str[3]): void { echo v[2] }
+
+f := takes
+f(["a", "b", "c"])               // fine
+f(["a"])                         // compile error: `f` holds a `Str[3]` taker
+```
+
+It may not be handed on any further — passed as an argument, returned, stored in
+a vector or a field — because the eventual call would happen somewhere with no
+idea what was promised. The same reason rules out a `mut` holder, which could be
+pointed at a different callable after the fact. Declaring the parameter `Str[dyn]`
+or `Str[]` lifts every one of these restrictions, at the cost of guarding the
+index inside the callee.
+
+A vector inside a **struct** is a vector like any other, with the same
+guarantees. A `Str[3]` field is enforced wherever a value reaches it — including
+at construction — and so can be indexed unguarded; a `Str[dyn]` field guards its
+indexes, and replacing the field (`b.items = …`) costs it whatever had been
+proven about the old value, exactly as rebinding a variable does:
+
+```hive
+type Box { items: Str[dyn] }
+
+mut b := Box(["a", "b", "c"])
+if 2 < len(b.items) {
+    b.items = ["one"]
+    echo b.items[2]              // compile error: that proof died with the old value
+}
+```
 
 An **inferred** length is weaker, because nothing constrains what comes next:
 `mut v := ["a", "b", "c"]` knows it holds three today, and keeps that through

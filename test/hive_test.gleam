@@ -25,7 +25,7 @@ const example = "proc main(): void {
 
 type ParsingResult {
 \tSuccess {
-\t\theaderlessTable: String[][]
+\t\theaderlessTable: String[dyn][dyn]
 \t}
 \tNoData
 \tError {
@@ -291,7 +291,7 @@ pub fn multiline_string_is_dedented_test() {
 pub fn vector_types_and_literals_test() {
   let go =
     compile(
-      "func f(): Str[3] {\n\tStr[2] a = [\"x\", \"y\"]\n\tStr[dyn] b = [\"x\"]\n\tStr[dyn, 2] c = [\"x\", \"y\"]\n\treturn a + [\"z\"]\n}\nproc main(): void {}\n",
+      "func f(): Str[3] {\n\tStr[2] a = [\"x\", \"y\"]\n\tStr[dyn] b = [\"x\"]\n\tStr[2] c = [\"x\", \"y\"]\n\treturn a + [\"z\"]\n}\nproc main(): void {}\n",
     )
   // Every vector flavor becomes a Go slice; `+` concatenates via the runtime.
   should.be_true(string.contains(go, "func f() []string {"))
@@ -2429,7 +2429,7 @@ pub fn dynamic_declarations_promise_nothing_test() {
   // `[dyn]` says the length varies, so any vector fits — and indexing it still
   // needs a guard.
   compiler.compile(
-    "proc main(): void {\n\tStr[dyn] v = [\"a\"]\n\tStr[dyn, 2] w = [\"a\", \"b\", \"c\"]\n\techo len(v) + len(w)\n}\n",
+    "proc main(): void {\n\tStr[dyn] v = [\"a\"]\n\tStr[dyn] w = [\"a\", \"b\", \"c\"]\n\techo len(v) + len(w)\n}\n",
   )
   |> should.be_ok
 }
@@ -2738,13 +2738,28 @@ pub fn immutable_vector_binding_is_cloned_test() {
 }
 
 pub fn both_mutable_vector_binding_is_shared_test() {
-  // Two mutable bindings are allowed to alias (shared mutable state).
+  // Two mutable bindings share storage (shared mutable state is the intent).
+  // They share it by *name*: `ys` gets no slice header of its own, so every read
+  // and write through it goes to `xs`. Two headers would only stay in step until
+  // an `append` reallocated one of them.
   let go =
     compile(
       "proc main(): void {\n\tmut xs := [1, 2, 3]\n\tmut ys := xs\n\txs[0] = 9\n\techo ys[0]\n}\n",
     )
-  should.be_true(string.contains(go, "ys := xs"))
+  should.be_false(string.contains(go, "ys"))
+  should.be_true(string.contains(go, "fmt.Println(xs[0])"))
   should.be_false(string.contains(go, "Clone"))
+}
+
+pub fn append_does_not_sever_a_shared_binding_test() {
+  // `append` on either name has to be seen through the other: it lowers to a
+  // reassignment of the one shared header, not of a private copy.
+  let go =
+    compile(
+      "proc main(): void {\n\tmut xs := [1, 2, 3]\n\tmut ys := xs\n\tappend(ys, 4)\n\txs[0] = 9\n\techo ys[0]\n\techo len(xs)\n}\n",
+    )
+  should.be_true(string.contains(go, "xs = append(xs, 4)"))
+  should.be_false(string.contains(go, "ys"))
 }
 
 pub fn fresh_vector_binding_is_not_cloned_test() {
@@ -3125,4 +3140,294 @@ fn list_length(items: List(a)) -> Int {
     [] -> 0
     [_, ..rest] -> 1 + list_length(rest)
   }
+}
+
+// ---------------------------------------------------------------------------
+// A `Str` has no subscript
+// ---------------------------------------------------------------------------
+
+pub fn indexing_a_str_is_rejected_test() {
+  // Go would index the bytes, while `len` counts characters — so the guard and
+  // the access would be in different units, and a byte out of the middle of a
+  // character is not text.
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {\n\ts := \"caf\"\n\tn := len(s)\n\tif 0 < n {\n\t\techo s[0]\n\t}\n}\n",
+    )
+  should.be_true(string.contains(msg, "cannot be indexed"))
+}
+
+pub fn slicing_a_str_is_rejected_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {\n\ts := \"cafe\"\n\tn := len(s)\n\tif 2 < n {\n\t\techo s[0:2]\n\t}\n}\n",
+    )
+  should.be_true(string.contains(msg, "cannot be sliced"))
+}
+
+pub fn indexing_a_vector_is_still_fine_test() {
+  let go =
+    compile("proc main(): void {\n\tv := [\"a\", \"b\"]\n\techo v[1]\n}\n")
+  should.be_true(string.contains(go, "v[1]"))
+}
+
+// ---------------------------------------------------------------------------
+// Negative literals
+// ---------------------------------------------------------------------------
+
+pub fn negative_literals_parse_test() {
+  // `-` binds tighter than `* / %` and looser than `**`.
+  let go =
+    compile(
+      "proc main(): void {\n\techo 2 ** -3\n\techo -7 % 3\n\techo -2 ** 2\n\tx := -5\n\techo x\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.PowInt(2, -3)"))
+  should.be_true(string.contains(go, "hive.ModInt(-7, 3)"))
+  // -2 ** 2 is -(2 ** 2), so the negation wraps the power.
+  should.be_true(string.contains(go, "(0 - hive.PowInt(2, 2))"))
+  should.be_true(string.contains(go, "x := -5"))
+}
+
+pub fn a_negative_literal_index_is_rejected_test() {
+  // Nothing can bring it into range, so it needs no guard to be refused.
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {\n\tv := [\"a\", \"b\"]\n\techo v[-1]\n}\n",
+    )
+  should.be_true(string.contains(msg, "negative"))
+}
+
+pub fn a_negative_loop_counter_is_not_assumed_nonneg_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {\n\tStr[dyn] v = [\"a\"]\n\tfor i := -3; i < len(v); i = i + 1 {\n\t\techo v[i]\n\t}\n}\n",
+    )
+  should.be_true(string.contains(msg, ">= 0"))
+}
+
+// ---------------------------------------------------------------------------
+// `T[]` is a parameter-only spelling
+// ---------------------------------------------------------------------------
+
+pub fn unsized_vector_is_accepted_as_a_parameter_test() {
+  // It promises nothing, so it takes a static vector and a dynamic one alike.
+  let go =
+    compile(
+      "func first(v: Str[]): Str {\n\tif len(v) > 0 {\n\t\treturn v[0]\n\t}\n\treturn \"\"\n}\nproc main(): void {\n\tStr[2] a = [\"a\", \"b\"]\n\tStr[dyn] b = [\"c\"]\n\techo first(a)\n\techo first(b)\n}\n",
+    )
+  should.be_true(string.contains(go, "func first(v []string) string {"))
+}
+
+pub fn unsized_vector_is_rejected_as_a_variable_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {\n\tStr[] v = [\"a\"]\n\techo len(v)\n}\n",
+    )
+  should.be_true(string.contains(msg, "`[]` only says"))
+}
+
+pub fn unsized_vector_is_rejected_as_a_return_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "func f(): Str[] {\n\treturn [\"a\"]\n}\nproc main(): void {\n\techo len(f())\n}\n",
+    )
+  should.be_true(string.contains(msg, "`[]` only says"))
+}
+
+pub fn unsized_vector_is_rejected_as_a_field_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "type Box {\n\titems: Str[]\n}\nproc main(): void {\n\tb := Box([\"a\"])\n\techo len(b.items)\n}\n",
+    )
+  should.be_true(string.contains(msg, "`[]` only says"))
+}
+
+// ---------------------------------------------------------------------------
+// A vector inside a struct is a vector like any other
+// ---------------------------------------------------------------------------
+
+pub fn replacing_a_field_drops_what_was_proven_about_it_test() {
+  // The guard proved a length for the *old* vector; assigning a new one to the
+  // field says nothing about it, exactly as rebinding a variable would.
+  let assert Error(msg) =
+    compiler.compile(
+      "type Box {\n\titems: Str[dyn]\n}\nproc main(): void {\n\tmut b := Box([\"a\", \"b\", \"c\"])\n\ti := 2\n\tif i >= 0 && i < len(b.items) {\n\t\tb.items = [\"one\"]\n\t\techo b.items[i]\n\t}\n}\n",
+    )
+  should.be_true(string.contains(msg, "cannot prove"))
+}
+
+pub fn replacing_a_field_drops_an_index_of_proof_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "type Box {\n\titems: Str[dyn]\n}\nproc main(): void {\n\tmut b := Box([\"a\", \"b\", \"c\"])\n\tr := indexOf(b.items, \"c\")\n\tif r is Result.Ok(i) {\n\t\tb.items = [\"one\"]\n\t\techo b.items[i]\n\t}\n}\n",
+    )
+  should.be_true(string.contains(msg, "cannot prove"))
+}
+
+pub fn a_guarded_field_index_is_still_accepted_test() {
+  compiler.compile(
+    "type Box {\n\titems: Str[dyn]\n}\nproc main(): void {\n\tb := Box([\"a\", \"b\", \"c\"])\n\ti := 2\n\tif i >= 0 && i < len(b.items) {\n\t\techo b.items[i]\n\t}\n}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn a_static_field_length_is_enforced_at_construction_test() {
+  // A `Str[3]` field can be indexed unguarded, so every construction has to be
+  // held to it — otherwise the trust rests on nothing.
+  let assert Error(msg) =
+    compiler.compile(
+      "type Trio {\n\tthree: Str[3]\n}\nproc main(): void {\n\tt := Trio([\"x\", \"y\"])\n\techo t.three[2]\n}\n",
+    )
+  should.be_true(string.contains(msg, "exactly 3"))
+}
+
+pub fn a_static_field_can_be_indexed_unguarded_test() {
+  compiler.compile(
+    "type Trio {\n\tthree: Str[3]\n}\nproc main(): void {\n\tt := Trio([\"x\", \"y\", \"z\"])\n\techo t.three[2]\n}\n",
+  )
+  |> should.be_ok
+}
+
+// ---------------------------------------------------------------------------
+// A length promise survives being held as a function value
+// ---------------------------------------------------------------------------
+
+pub fn a_call_through_a_bound_reference_is_held_to_its_lengths_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "proc takes(v: Str[3]): void {\n\techo v[2]\n}\nproc main(): void {\n\tf := takes\n\tf([\"a\"])\n}\n",
+    )
+  should.be_true(string.contains(msg, "exactly 3"))
+}
+
+pub fn a_correct_call_through_a_bound_reference_is_accepted_test() {
+  compiler.compile(
+    "proc takes(v: Str[3]): void {\n\techo v[2]\n}\nproc main(): void {\n\tf := takes\n\tf([\"a\", \"b\", \"c\"])\n}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn a_call_through_a_partial_application_is_held_to_its_lengths_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "proc takes(v: Str[3], tag: Str): void {\n\techo tag\n\techo v[2]\n}\nproc main(): void {\n\tg := takes(_, \"t\")\n\tg([\"a\"])\n}\n",
+    )
+  should.be_true(string.contains(msg, "exactly 3"))
+}
+
+pub fn handing_on_a_static_length_taker_is_rejected_test() {
+  // The eventual call would happen where the promise is not known.
+  let assert Error(msg) =
+    compiler.compile(
+      "proc takes(v: Str[3]): void {\n\techo v[2]\n}\nproc apply(g: proc(Str[dyn]): void, arg: Str[dyn]): void {\n\tg(arg)\n}\nproc main(): void {\n\tmut Str[dyn] one = [\"a\"]\n\tapply(takes, one)\n}\n",
+    )
+  should.be_true(string.contains(msg, "cannot be used as a value here"))
+}
+
+pub fn a_mut_holder_of_a_static_length_taker_is_rejected_test() {
+  // A reassignment could point the name at a different callable, leaving calls
+  // already checked against the old one checking the wrong signature.
+  let assert Error(msg) =
+    compiler.compile(
+      "proc takes(v: Str[3]): void {\n\techo v[2]\n}\nproc main(): void {\n\tmut f := takes\n\tf([\"a\", \"b\", \"c\"])\n}\n",
+    )
+  should.be_true(string.contains(msg, "cannot be `mut`"))
+}
+
+pub fn passing_a_dyn_taker_as_a_value_is_unaffected_test() {
+  // Nothing was promised, so the value travels freely.
+  compiler.compile(
+    "proc takes(v: Str[dyn]): void {\n\techo len(v)\n}\nproc apply(g: proc(Str[dyn]): void, arg: Str[dyn]): void {\n\tg(arg)\n}\nproc main(): void {\n\tStr[dyn] one = [\"a\"]\n\tapply(takes, one)\n}\n",
+  )
+  |> should.be_ok
+}
+
+// ---------------------------------------------------------------------------
+// An `is` subject runs exactly once, wherever it sits in the condition
+// ---------------------------------------------------------------------------
+
+pub fn a_non_leftmost_subject_runs_once_test() {
+  // The subject is read to test it and again for every value it binds. Only the
+  // leftmost test can use Go's single `if` init slot, so a later one gets a
+  // nested `if` of its own rather than being emitted twice.
+  let go =
+    compile(
+      "proc main(): void {\n\tok := true\n\tif ok && hive.file.append(\"p\", \"X\") is Result.Ok(n) {\n\t\techo n\n\t}\n}\n",
+    )
+  should.equal(
+    string.split(go, "hive.FileAppend(\"p\", \"X\")") |> list.length,
+    2,
+  )
+}
+
+pub fn a_non_leftmost_subject_keeps_its_else_test() {
+  // A nested chain falls out of the middle, so the `else` hangs off a flag.
+  let go =
+    compile(
+      "proc main(): void {\n\tok := true\n\tif ok && hive.file.append(\"p\", \"X\") is Result.Ok(n) {\n\t\techo n\n\t} else {\n\t\techo \"no\"\n\t}\n}\n",
+    )
+  should.equal(
+    string.split(go, "hive.FileAppend(\"p\", \"X\")") |> list.length,
+    2,
+  )
+  should.be_true(string.contains(go, "fmt.Println(\"no\")"))
+}
+
+pub fn two_non_leftmost_subjects_each_run_once_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tok := true\n\tif ok && hive.file.append(\"a\", \"X\") is Result.Ok(n) && hive.file.append(\"b\", \"Y\") is Result.Ok(m) {\n\t\techo n + m\n\t}\n}\n",
+    )
+  should.equal(string.split(go, "hive.FileAppend(\"a\"") |> list.length, 2)
+  should.equal(string.split(go, "hive.FileAppend(\"b\"") |> list.length, 2)
+}
+
+pub fn a_leftmost_subject_still_uses_the_init_slot_test() {
+  // The flat form is kept wherever it suffices.
+  let go =
+    compile(
+      "proc main(): void {\n\tif hive.file.append(\"p\", \"X\") is Result.Ok(n) && n > 0 {\n\t\techo n\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "if _u1_0 := hive.FileAppend"))
+}
+
+// ---------------------------------------------------------------------------
+// A mutex is copied into a callee
+// ---------------------------------------------------------------------------
+
+pub fn a_mut_argument_is_copied_in_test() {
+  // The callee is handed an immutable `T`, which it would not be if the caller
+  // could still write through the same backing array.
+  let go =
+    compile(
+      "proc show(v: Str[dyn]): void {\n\techo len(v)\n}\nproc main(): void {\n\tmut v := [\"a\"]\n\tshow(v)\n\tv[0] = \"b\"\n}\n",
+    )
+  should.be_true(string.contains(go, "show(hive.CloneVec(v))"))
+}
+
+pub fn an_immutable_argument_is_not_copied_test() {
+  let go =
+    compile(
+      "proc show(v: Str[dyn]): void {\n\techo len(v)\n}\nproc main(): void {\n\tv := [\"a\"]\n\tshow(v)\n}\n",
+    )
+  should.be_false(string.contains(go, "Clone"))
+}
+
+pub fn a_spawned_task_copies_before_it_starts_test() {
+  // A copy made on the new goroutine would race with the caller it exists to
+  // protect against, so the arguments are bound in the caller first.
+  let go =
+    compile(
+      "async func work(v: Str[dyn]): Int {\n\treturn len(v)\n}\nproc main(): void {\n\tmut v := [\"a\"]\n\th := work(v)\n\tv[0] = \"b\"\n\techo await h\n}\n",
+    )
+  should.be_true(string.contains(go, "_a0 := hive.CloneVec(v); return hive.Spawn("))
+}
+
+pub fn a_mut_argument_to_a_constructor_is_copied_in_test() {
+  // A constructed value keeps the vector for as long as it lives.
+  let go =
+    compile(
+      "type Box {\n\titems: Str[dyn]\n}\nproc main(): void {\n\tmut v := [\"a\"]\n\tb := Box(v)\n\tv[0] = \"b\"\n\techo len(b.items)\n}\n",
+    )
+  should.be_true(string.contains(go, "Items: hive.CloneVec(v)"))
 }

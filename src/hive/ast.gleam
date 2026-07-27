@@ -1,7 +1,9 @@
 //// The Hive abstract syntax tree.
 
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/string
 
 pub type Module {
   Module(imports: List(Import), decls: List(Decl))
@@ -64,13 +66,16 @@ pub type Variant {
 
 /// One `[...]` marker on a vector type.
 pub type Dim {
-  /// `T[]` — a vector of unspecified length (legacy spelling).
+  /// `T[]` — a vector whose length is not part of the type. It promises
+  /// nothing, so every access into it is guarded, and it accepts *any* vector
+  /// of the right element type. Legal only in a parameter position: a variable,
+  /// field or return has to say which of the two real kinds it is.
   DimEmpty
-  /// `T[3]` — a vector of static length.
+  /// `T[3]` — a vector of static length. The length is a promise enforced
+  /// everywhere a value can reach the slot.
   DimStatic(size: Int)
-  /// `T[dyn]` or `T[dyn, 2]` — a dynamic vector, optionally with an initial
-  /// size hint.
-  DimDyn(initial: Option(Int))
+  /// `T[dyn]` — a dynamic vector. Its length is not known at compile time.
+  DimDyn
 }
 
 pub type TypeExpr {
@@ -218,6 +223,36 @@ pub type UsingKind {
   /// `using <connection> run <query>` — runs SQL on an open connection. Yields
   /// `Result<Table, hive.sql.SqlError>`.
   UsingQuery(query: Expr)
+}
+
+/// A type written the way source spells it, for error messages.
+pub fn show_type(t: TypeExpr) -> String {
+  case t {
+    TVoid -> "void"
+    TFunc(pure, params, ret) ->
+      case pure {
+        True -> "func("
+        False -> "proc("
+      }
+      <> string.join(list.map(params, show_type), ", ")
+      <> "): "
+      <> show_type(ret)
+    TName(pkg, name, dims) ->
+      case pkg {
+        Some(p) -> p <> "."
+        None -> ""
+      }
+      <> name
+      <> string.concat(list.map(dims, show_dim))
+  }
+}
+
+pub fn show_dim(d: Dim) -> String {
+  case d {
+    DimEmpty -> "[]"
+    DimStatic(n) -> "[" <> int.to_string(n) <> "]"
+    DimDyn -> "[dyn]"
+  }
 }
 
 /// Whether an expression can be evaluated more than once without changing what
