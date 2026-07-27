@@ -644,9 +644,16 @@ fn rewrite_expr(
       use typ <- result.try(rewrite_type(rw, typ))
       Ok(ast.EWith(value, typ))
     }
-    ast.EAwait(value) -> {
+    ast.EAwait(value, timeout) -> {
       use value <- result.try(rewrite_expr(rw, value, locals))
-      Ok(ast.EAwait(value))
+      use timeout <- result.try(case timeout {
+        option.Some(ms) -> {
+          use ms <- result.try(rewrite_expr(rw, ms, locals))
+          Ok(option.Some(ms))
+        }
+        option.None -> Ok(option.None)
+      })
+      Ok(ast.EAwait(value, timeout))
     }
     ast.EInt(_)
     | ast.EFloat(_)
@@ -821,7 +828,7 @@ fn pattern_bindings(e: ast.Expr) -> List(String) {
         list.flat_map(ast.using_exprs(kind), pattern_bindings),
       )
     ast.EWith(value, _) -> pattern_bindings(value)
-    ast.EAwait(value) -> pattern_bindings(value)
+    ast.EAwait(value, _) -> pattern_bindings(value)
     _ -> []
   }
 }

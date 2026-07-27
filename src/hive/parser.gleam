@@ -923,11 +923,48 @@ fn parse_power(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
 fn parse_with_type(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
   use #(value, t1) <- result.try(parse_postfix(tokens))
   case kind(t1) {
-    token.KwWith -> {
-      use #(typ, t2) <- result.try(parse_type_expr(tail(t1)))
-      Ok(#(ast.EWith(value, typ), t2))
-    }
+    token.KwWith ->
+      // Two unrelated clauses share the `with` keyword. `with timeout <ms>`
+      // bounds an `await`; anything else names a decode target. They are told
+      // apart here so `timeout` never gets read as a type name — and so
+      // `timeout` stays a perfectly ordinary identifier everywhere else.
+      case is_timeout_word(tail(t1)) {
+        True -> {
+          // Parsed at the arithmetic level, not as a full expression: the clause
+          // has to stop before `is` and `&&`, so
+          // `await h with timeout 500 is Result.Ok(v)` reads as
+          // `(await h with timeout 500) is Result.Ok(v)` rather than folding the
+          // comparison into the millisecond count. `with timeout base * 2` still
+          // works.
+          use #(ms, t2) <- result.try(parse_additive(tail(tail(t1))))
+          case value {
+            ast.EAwait(inner, None) -> Ok(#(ast.EAwait(inner, Some(ms)), t2))
+            ast.EAwait(_, Some(_)) ->
+              Error("this `await` already has a `with timeout` clause")
+            _ ->
+              Error(
+                "`with timeout <ms>` may only follow an `await` — it bounds how "
+                <> "long the wait may take",
+              )
+          }
+        }
+        False -> {
+          use #(typ, t2) <- result.try(parse_type_expr(tail(t1)))
+          Ok(#(ast.EWith(value, typ), t2))
+        }
+      }
     _ -> Ok(#(value, t1))
+  }
+}
+
+// `timeout` in `with timeout <ms>`. Matched case-insensitively like every other
+// keyword, but deliberately not lexed as one: making it a reserved word would
+// stop anyone naming a variable `timeout`, and this is the only position where
+// the spelling means anything.
+fn is_timeout_word(tokens: Toks) -> Bool {
+  case kind(tokens) {
+    token.Ident(name) -> string.lowercase(name) == "timeout"
+    _ -> False
   }
 }
 
@@ -1048,7 +1085,7 @@ fn parse_primary(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
     // `await f(x)` awaits the whole call.
     token.KwAwait -> {
       use #(inner, t1) <- result.try(parse_postfix(tail(tokens)))
-      Ok(#(ast.EAwait(inner), t1))
+      Ok(#(ast.EAwait(inner, None), t1))
     }
     token.KwUsing -> parse_using(tokens)
     token.LBracket -> parse_vector(tail(tokens), [])
