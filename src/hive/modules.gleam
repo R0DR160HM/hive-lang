@@ -382,7 +382,7 @@ fn rewrite_decl(rw: Rw, decl: ast.Decl) -> Result(ast.Decl, String) {
     ast.QueryDecl(name, params, ret, sql) -> {
       use params <- result.try(rewrite_fields(rw, params))
       use ret <- result.try(rewrite_type(rw, ret))
-      use sql <- result.try(rewrite_parts(rw, sql, field_names(params)))
+      use sql <- result.try(rewrite_sql(rw, sql, field_names(params)))
       Ok(ast.QueryDecl(flat(rw, name), params, ret, sql))
     }
     ast.TypeDecl(name, variants, commons) -> {
@@ -635,6 +635,10 @@ fn rewrite_expr(
           use query <- result.try(rewrite_expr(rw, query, locals))
           Ok(ast.UsingQuery(query))
         }
+        ast.UsingRaw(text) -> {
+          use text <- result.try(rewrite_expr(rw, text, locals))
+          Ok(ast.UsingRaw(text))
+        }
         ast.UsingXlsx | ast.UsingOds -> Ok(kind)
       })
       Ok(ast.EUsing(source, kind))
@@ -703,25 +707,81 @@ fn resolve_name(rw: Rw, name: String, locals: List(String)) -> String {
   }
 }
 
+fn rewrite_types(
+  rw: Rw,
+  types: List(ast.TypeExpr),
+) -> Result(List(ast.TypeExpr), String) {
+  list.try_map(types, fn(t) { rewrite_type(rw, t) })
+}
+
+// A query body: literal SQL is left alone, every expression in it is rewritten.
+fn rewrite_sql(
+  rw: Rw,
+  parts: List(ast.SqlPart),
+  scope: List(String),
+) -> Result(List(ast.SqlPart), String) {
+  list.try_map(parts, fn(part) {
+    case part {
+      ast.SqlLit(_) -> Ok(part)
+      ast.SqlParam(e) -> {
+        use e2 <- result.try(rewrite_expr(rw, e, scope))
+        Ok(ast.SqlParam(e2))
+      }
+      ast.SqlWhere(group) -> {
+        use g <- result.try(rewrite_group(rw, group, scope))
+        Ok(ast.SqlWhere(g))
+      }
+    }
+  })
+}
+
+fn rewrite_group(
+  rw: Rw,
+  group: ast.SqlGroup,
+  scope: List(String),
+) -> Result(ast.SqlGroup, String) {
+  use items <- result.try(
+    list.try_map(group.items, fn(item) {
+      case item {
+        ast.SqlCond(cond, body) -> {
+          use c <- result.try(rewrite_expr(rw, cond, scope))
+          use b <- result.try(rewrite_sql(rw, body, scope))
+          Ok(ast.SqlCond(c, b))
+        }
+        ast.SqlNested(inner) -> {
+          use g <- result.try(rewrite_group(rw, inner, scope))
+          Ok(ast.SqlNested(g))
+        }
+      }
+    }),
+  )
+  Ok(ast.SqlGroup(group.conjunction, items))
+}
+
 fn rewrite_type(rw: Rw, typ: ast.TypeExpr) -> Result(ast.TypeExpr, String) {
   case typ {
     ast.TVoid -> Ok(typ)
-    ast.TName(None, name, dims) ->
+    // Type arguments name types too, so they are rewritten alongside the head.
+    ast.TName(None, name, args, dims) -> {
+      use args <- result.try(rewrite_types(rw, args))
       case dict.get(rw.own, name) {
-        Ok(flat) -> Ok(ast.TName(None, flat, dims))
-        Error(_) -> Ok(typ)
+        Ok(flat) -> Ok(ast.TName(None, flat, args, dims))
+        Error(_) -> Ok(ast.TName(None, name, args, dims))
       }
-    ast.TName(Some(pkg), name, dims) ->
+    }
+    ast.TName(Some(pkg), name, args, dims) -> {
+      use args <- result.try(rewrite_types(rw, args))
       case is_hive_pkg(pkg), dict.get(rw.modules, pkg) {
         // `hive.net.HttpRequest` and friends belong to the standard library.
-        True, _ -> Ok(typ)
+        True, _ -> Ok(ast.TName(Some(pkg), name, args, dims))
         False, Ok(members) ->
           case dict.get(members, name) {
-            Ok(flat) -> Ok(ast.TName(None, flat, dims))
+            Ok(flat) -> Ok(ast.TName(None, flat, args, dims))
             Error(_) -> Error(unknown_member(rw, pkg, name))
           }
-        False, Error(_) -> Ok(typ)
+        False, Error(_) -> Ok(ast.TName(Some(pkg), name, args, dims))
       }
+    }
     ast.TFunc(pure, params, ret) -> {
       use params <- result.try(
         list.try_map(params, fn(p) { rewrite_type(rw, p) }),

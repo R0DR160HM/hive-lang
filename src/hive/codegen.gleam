@@ -71,6 +71,11 @@ pub type Ty {
   /// The absence of a value — only meaningful as a function type's return, so
   /// a `proc(T): void` value lowers to `func(T)` with no Go return type.
   TyVoid
+  /// A type variable: a name in a signature that is neither a builtin nor a
+  /// declared type, which makes the callable generic in it. Monomorphization
+  /// substitutes every one away before any other pass runs, so nothing
+  /// downstream ever meets one.
+  TyVar(name: String)
   TyUnknown
 }
 
@@ -106,7 +111,7 @@ pub fn builtin_fields(name: String) -> Option(List(#(String, Ty))) {
       Some([#("path", TyStr), #("reason", TyStr), #("message", TyStr)])
     "JwtHeader" ->
       Some([#("alg", TyStr), #("typ", TyStr), #("kid", TyStr)])
-    "SqlError" -> Some([#("message", TyStr)])
+    "SqlError" -> Some([#("reason", TyStr), #("message", TyStr)])
     "DatabaseDriver" -> Some([#("name", TyStr)])
     // An open database connection. It is opaque — it exposes no fields — but it
     // is still a named builtin type, so a parameter or variable can be declared
@@ -192,7 +197,7 @@ pub fn assign_args(
   #(list.reverse(assigned), leftover)
 }
 
-type Env {
+pub type Env {
   Env(
     types: Dict(String, ast.Decl),
     /// Signatures of every proc/func/query: named parameter types and the
@@ -248,7 +253,7 @@ type Env {
 // The module-wide environment: everything known before any body is walked.
 // Shared by `generate` and `check_types`, so the check sees exactly the types
 // generation will.
-fn module_env(module: ast.Module) -> Env {
+pub fn module_env(module: ast.Module) -> Env {
   let types = collect_types(module.decls)
   let atoms =
     collect_atoms(module)
@@ -278,6 +283,25 @@ fn module_env(module: ast.Module) -> Env {
     collect_mailboxes(module, fns),
     collect_bodies(module.decls),
   )
+}
+
+/// Bind a local into an environment, for passes that walk bodies themselves.
+pub fn with_local(env: Env, name: String, ty: Ty) -> Env {
+  Env(..env, locals: dict.insert(env.locals, name, ty))
+}
+
+/// The declared types of a module, as `ty_of_type_expr` wants them.
+pub fn env_types(env: Env) -> Dict(String, ast.Decl) {
+  env.types
+}
+
+/// The bindings a condition's `is` patterns introduce, with their types.
+pub fn condition_binds(env: Env, cond: ast.Expr) -> List(#(String, Ty)) {
+  let #(_, binds) = gen_condition(env, cond)
+  list.map(binds, fn(b) {
+    let #(name, _, ty) = b
+    #(name, ty)
+  })
 }
 
 pub fn generate(module: ast.Module) -> String {
@@ -317,8 +341,10 @@ pub fn generate(module: ast.Module) -> String {
     gen_json_support(env, module, string.contains(fn_code, "hive.Syslink"))
 
   let clone_code = gen_clone_support(env, module)
+  let row_code = gen_sql_row_support(env, module)
 
-  let body = type_code <> "\n" <> atom_code <> clone_code <> json_code <> fn_code
+  let body =
+    type_code <> "\n" <> atom_code <> clone_code <> row_code <> json_code <> fn_code
   gen_header(body) <> "\n" <> body
 }
 
@@ -340,12 +366,7 @@ pub fn check_types(module: ast.Module) -> Result(Nil, String) {
         |> result.map(fn(_) { Nil })
       ast.QueryDecl(_, params, ret, sql) -> {
         let qenv = fn_env(env, params, ret)
-        list.try_fold(sql, Nil, fn(_, part) {
-          case part {
-            ast.ILit(_) -> Ok(Nil)
-            ast.IExpr(e) -> walk_expr(qenv, e)
-          }
-        })
+        list.try_fold(ast.sql_exprs(sql), Nil, fn(_, e) { walk_expr(qenv, e) })
         |> result.map(fn(_) { Nil })
       }
       ast.TypeDecl(..) -> Ok(Nil)
@@ -608,7 +629,7 @@ fn envelope_param(params: List(ast.Field)) -> Option(String) {
   params
   |> list.find(fn(p) {
     case p.typ {
-      ast.TName(Some("hive.syslink"), "Envelope", []) -> True
+      ast.TName(Some("hive.syslink"), "Envelope", _, []) -> True
       _ -> False
     }
   })
@@ -924,12 +945,7 @@ fn uses_json_module(module: ast.Module) -> Bool {
       ast.ProcDecl(_, _, _, body) | ast.FuncDecl(_, _, _, body, _) ->
         uses_json_stmts(body)
       ast.QueryDecl(_, _, _, sql) ->
-        list.any(sql, fn(p) {
-          case p {
-            ast.ILit(_) -> False
-            ast.IExpr(e) -> uses_json_expr(e)
-          }
-        })
+        list.any(ast.sql_exprs(sql), uses_json_expr)
       ast.TypeDecl(..) -> False
     }
   })
@@ -1081,7 +1097,8 @@ fn collect_atoms(module: ast.Module) -> List(String) {
       case d {
         ast.ProcDecl(_, _, _, body) | ast.FuncDecl(_, _, _, body, _) ->
           atoms_in_stmts(body, acc)
-        ast.QueryDecl(_, _, _, sql) -> atoms_in_parts(sql, acc)
+        ast.QueryDecl(_, _, _, sql) ->
+          list.fold(ast.sql_exprs(sql), acc, fn(a, e) { atoms_in_expr(e, a) })
         ast.TypeDecl(..) -> acc
       }
     })
@@ -1255,13 +1272,13 @@ fn gen_header(body: String) -> String {
 // Types (Hive -> Go, and Hive -> inferred Ty)
 // ---------------------------------------------------------------------------
 
-fn ty_of_type_expr(types: Dict(String, ast.Decl), t: ast.TypeExpr) -> Ty {
+pub fn ty_of_type_expr(types: Dict(String, ast.Decl), t: ast.TypeExpr) -> Ty {
   case t {
     ast.TVoid -> TyUnknown
     // A builtin type, resolved only through its own namespace
     // (`hive.net.HttpRequest`, `hive.TableError`). A wrong or bare qualifier
     // does not resolve.
-    ast.TName(Some(pkg), name, dims) ->
+    ast.TName(Some(pkg), name, _, dims) ->
       case builtin_fields(name) {
         Some(_) ->
           case pkg == builtin_qualifier(name) {
@@ -1278,7 +1295,13 @@ fn ty_of_type_expr(types: Dict(String, ast.Decl), t: ast.TypeExpr) -> Ty {
           }
         None -> wrap_dims(TyUnknown, dims)
       }
-    ast.TName(None, name, dims) -> wrap_dims(base_ty(types, name), dims)
+    // `Result<T, E>` is the one builtin whose arguments say what it holds.
+    ast.TName(None, "Result", [ok, err], dims) ->
+      wrap_dims(
+        TyResult(ty_of_type_expr(types, ok), ty_of_type_expr(types, err)),
+        dims,
+      )
+    ast.TName(None, name, _, dims) -> wrap_dims(base_ty(types, name), dims)
     ast.TFunc(pure, params, ret) ->
       TyFunc(
         pure,
@@ -1314,7 +1337,9 @@ fn base_ty(types: Dict(String, ast.Decl), name: String) -> Ty {
     _ ->
       case dict.has_key(types, name) {
         True -> TyCustom(name)
-        False -> TyUnknown
+        // Neither builtin nor declared: a type variable. This is exactly the
+        // notation the builtin table has always used — `indexOf(T[], T)`.
+        False -> TyVar(name)
       }
   }
 }
@@ -1334,7 +1359,17 @@ fn gen_type(t: ast.TypeExpr) -> String {
       }
       "func(" <> ps <> ")" <> r
     }
-    ast.TName(pkg, name, dims) -> {
+    // `Result<T, E>` lowers to the runtime's generic struct.
+    ast.TName(None, "Result", [ok, err], dims) ->
+      string.repeat("[]", list.length(dims))
+      <> "hive.Result["
+      <> gen_type(ok)
+      <> ", "
+      <> gen_type(err)
+      <> "]"
+    // Every other type argument is substituted away by monomorphization, so
+    // nothing else reaches codegen still carrying one.
+    ast.TName(pkg, name, _, dims) -> {
       let prefix = string.repeat("[]", list.length(dims))
       let base = case pkg {
         // A `hive.<module>` namespace is only organisational: every builtin
@@ -1376,7 +1411,8 @@ fn ty_to_go(ty: Ty) -> String {
     TyVec(t) -> "[]" <> ty_to_go(t)
     TyCustom(name) -> name
     TyBuiltin(name) -> "hive." <> name
-    TyResult(_, _) -> "any"
+    TyResult(ok, err) ->
+      "hive.Result[" <> ty_to_go(ok) <> ", " <> ty_to_go(err) <> "]"
     TyFunc(_, params, ret) -> {
       let ps = params |> list.map(ty_to_go) |> string.join(", ")
       let r = case ret {
@@ -1387,6 +1423,9 @@ fn ty_to_go(ty: Ty) -> String {
     }
     TyVoid -> ""
     TyUnknown -> "any"
+    // Monomorphization substitutes every variable before codegen runs, so one
+    // reaching here would be a compiler bug rather than a program error.
+    TyVar(name) -> name
     TyAsync(inner) -> "*hive.Async[" <> async_inner_go(inner) <> "]"
     TyAddress(_) -> "hive.Address"
     TyPending(msg) -> "*hive.SyslinkPending[" <> async_inner_go(msg) <> "]"
@@ -1501,8 +1540,8 @@ fn json_decoder_ref(env: Env, t: ast.TypeExpr) -> String {
   case t {
     // A service address travels inside a message, so it needs a codec of its
     // own: it is the one builtin whose value means something on another node.
-    ast.TName(Some("hive.syslink"), "Address", []) -> "hive.JsonAddress"
-    ast.TName(None, name, []) ->
+    ast.TName(Some("hive.syslink"), "Address", _, []) -> "hive.JsonAddress"
+    ast.TName(None, name, _, []) ->
       case name {
         "Str" | "String" -> "hive.JsonStr"
         "Int" -> "hive.JsonInt"
@@ -1516,8 +1555,8 @@ fn json_decoder_ref(env: Env, t: ast.TypeExpr) -> String {
             False -> json_decoder_unsupported(t)
           }
       }
-    ast.TName(pkg, name, [dim, ..rest]) -> {
-      let inner = ast.TName(pkg, name, rest)
+    ast.TName(pkg, name, args, [dim, ..rest]) -> {
+      let inner = ast.TName(pkg, name, args, rest)
       let call = case dim {
         ast.DimStatic(n) ->
           "hive.JsonVecN(v, p, "
@@ -1771,7 +1810,7 @@ fn gen_json_object_encode(
 // Procs, funcs and queries
 // ---------------------------------------------------------------------------
 
-fn fn_env(env: Env, params: List(ast.Field), ret: ast.TypeExpr) -> Env {
+pub fn fn_env(env: Env, params: List(ast.Field), ret: ast.TypeExpr) -> Env {
   let locals =
     list.fold(params, dict.new(), fn(acc, p) {
       dict.insert(acc, p.name, ty_of_type_expr(env.types, p.typ))
@@ -1814,39 +1853,205 @@ fn gen_fn_decl(
 // A query is a pure function that assembles its inline SQL into a string;
 // every interpolated value passes through hive.SqlParam, which quotes and
 // sanitizes it at runtime.
+// A query lowers to a Go function returning the SQL text and the values its
+// placeholders bind to. Nothing a caller supplies ever enters the text — an
+// interpolation becomes a `?` and the value joins the argument slice — so a
+// query cannot be made to mean something other than what it says.
+//
+// A `where { ... }` block is built at runtime from the predicates whose
+// conditions hold, which is why the body is statements rather than one
+// expression.
 fn gen_query_decl(
   env: Env,
   name: String,
   params: List(ast.Field),
   ret: ast.TypeExpr,
-  sql: List(ast.IPart),
+  sql: List(ast.SqlPart),
 ) -> String {
   let env = fn_env(env, params, ret)
   let param_str =
     params
     |> list.map(fn(p) { escape_ident(p.name) <> " " <> gen_type(p.typ) })
     |> string.join(", ")
-  let pieces =
-    sql
-    |> list.map(fn(p) {
-      case p {
-        ast.ILit(s) -> gen_string_lit(s)
-        ast.IExpr(e) -> "hive.SqlParam(" <> gen_expr(env, e) <> ")"
-      }
-    })
-  let value = case pieces {
-    [] -> "\"\""
-    _ -> string.join(pieces, " + ")
-  }
+  let #(body, _) = gen_sql_parts(env, sql, 1, 0)
   "func "
   <> escape_ident(name)
   <> "("
   <> param_str
-  <> ") "
-  <> gen_type(ret)
-  <> " {\n\treturn "
-  <> value
-  <> "\n}\n"
+  <> ") hive.SqlFragment {\n\t_sql := \"\"\n\t_args := []any{}\n"
+  <> body
+  <> "\treturn hive.SqlFragment{Text: _sql, Args: _args}\n}\n"
+}
+
+// Statements appending each piece to `_sql` / `_args`. `n` numbers the
+// temporaries so nested groups do not collide.
+fn gen_sql_parts(
+  env: Env,
+  parts: List(ast.SqlPart),
+  indent: Int,
+  n: Int,
+) -> #(String, Int) {
+  let pad = tabs(indent)
+  list.fold(parts, #("", n), fn(acc, part) {
+    let #(code, n) = acc
+    case part {
+      ast.SqlLit(text) -> #(code <> pad <> "_sql += " <> gen_string_lit(text) <> "\n", n)
+      ast.SqlParam(e) -> #(
+        code
+        <> pad
+        <> "_sql += \"?\"\n"
+        <> pad
+        <> "_args = append(_args, "
+        <> gen_expr(env, e)
+        <> ")\n",
+        n,
+      )
+      ast.SqlWhere(group) -> {
+        let frag = "_w" <> int.to_string(n)
+        let #(build, n2) = gen_sql_group(env, group, indent, n + 1, frag)
+        #(
+          code
+          <> build
+          <> pad
+          <> "if "
+          <> frag
+          <> ".Text != \"\" {\n"
+          <> pad
+          <> "\t_sql += \" WHERE \" + "
+          <> frag
+          <> ".Text\n"
+          <> pad
+          <> "\t_args = append(_args, "
+          <> frag
+          <> ".Args...)\n"
+          <> pad
+          <> "}\n",
+          n2,
+        )
+      }
+    }
+  })
+}
+
+// Collects a group's present predicates into one fragment. A group that
+// contributes nothing yields empty text, so it disappears rather than leaving a
+// dangling connective; one that contributes more than one predicate is
+// parenthesised, so nesting cannot change how the surrounding connective binds.
+fn gen_sql_group(
+  env: Env,
+  group: ast.SqlGroup,
+  indent: Int,
+  n: Int,
+  into: String,
+) -> #(String, Int) {
+  let pad = tabs(indent)
+  let acc = "_p" <> int.to_string(n)
+  let #(items, n2) =
+    list.fold(group.items, #("", n + 1), fn(state, item) {
+      let #(code, n) = state
+      case item {
+        ast.SqlCond(cond, body) -> {
+          let #(cond_str, _) = gen_condition(env, cond)
+          let #(text, args, n2) = gen_predicate(env, body, n)
+          #(
+            code
+            <> pad
+            <> "if "
+            <> cond_str
+            <> " {\n"
+            <> pad
+            <> "\t"
+            <> acc
+            <> " = append("
+            <> acc
+            <> ", hive.SqlFragment{Text: "
+            <> text
+            <> ", Args: []any{"
+            <> args
+            <> "}})\n"
+            <> pad
+            <> "}\n",
+            n2,
+          )
+        }
+        ast.SqlNested(inner) -> {
+          let frag = "_w" <> int.to_string(n)
+          let #(build, n2) = gen_sql_group(env, inner, indent, n + 1, frag)
+          #(
+            code
+            <> build
+            <> pad
+            <> "if "
+            <> frag
+            <> ".Text != \"\" {\n"
+            <> pad
+            <> "\t"
+            <> acc
+            <> " = append("
+            <> acc
+            <> ", "
+            <> frag
+            <> ")\n"
+            <> pad
+            <> "}\n",
+            n2,
+          )
+        }
+      }
+    })
+  let sep = case group.conjunction {
+    True -> "\" AND \""
+    False -> "\" OR \""
+  }
+  // The outermost group is the WHERE clause itself, so it needs no parentheses.
+  let paren = case string.starts_with(into, "_w0") {
+    True -> "false"
+    False -> "true"
+  }
+  #(
+    pad
+    <> acc
+    <> " := []hive.SqlFragment{}\n"
+    <> items
+    <> pad
+    <> into
+    <> " := hive.SqlJoin("
+    <> acc
+    <> ", "
+    <> sep
+    <> ", "
+    <> paren
+    <> ")\n",
+    n2,
+  )
+}
+
+// One predicate's text and the values it binds, as two Go expressions.
+fn gen_predicate(
+  env: Env,
+  body: List(ast.SqlPart),
+  n: Int,
+) -> #(String, String, Int) {
+  let texts =
+    list.filter_map(body, fn(part) {
+      case part {
+        ast.SqlLit(t) -> Ok(gen_string_lit(t))
+        ast.SqlParam(_) -> Ok("\"?\"")
+        ast.SqlWhere(_) -> Error(Nil)
+      }
+    })
+  let args =
+    list.filter_map(body, fn(part) {
+      case part {
+        ast.SqlParam(e) -> Ok(gen_expr(env, e))
+        _ -> Error(Nil)
+      }
+    })
+  let text = case texts {
+    [] -> "\"\""
+    _ -> string.join(texts, " + ")
+  }
+  #(text, string.join(args, ", "), n)
 }
 
 // Go requires every path of a non-void function to return. Hive relies on
@@ -2188,7 +2393,7 @@ fn uses_in_opt_stmt(o: Option(ast.Stmt), name: String) -> Bool {
 
 // The element type produced by iterating a value of the given type: a vector
 // yields its element type, and a Table (a `Str[dyn][dyn]`) yields a row.
-fn elem_ty_of(ty: Ty) -> Ty {
+pub fn elem_ty_of(ty: Ty) -> Ty {
   case ty {
     TyVec(t) -> t
     TyTable -> TyVec(TyStr)
@@ -2725,7 +2930,7 @@ fn gen_adt_is(
 // Type inference
 // ---------------------------------------------------------------------------
 
-fn infer(env: Env, e: ast.Expr) -> Ty {
+pub fn infer(env: Env, e: ast.Expr) -> Ty {
   case e {
     ast.EInt(_) -> TyInt
     ast.EFloat(_) -> TyFloat
@@ -3003,7 +3208,14 @@ fn infer(env: Env, e: ast.Expr) -> Ty {
         ast.UsingCsv(_) -> TyResult(TyTable, TyBuiltin("TableError"))
         ast.UsingXlsx | ast.UsingOds ->
           TyResult(TyVec(TyTable), TyBuiltin("TableError"))
-        ast.UsingQuery(_) -> TyResult(TyTable, TyBuiltin("SqlError"))
+        // A typed query's rows are whatever it declared them to be; a raw one
+        // has no declaration to consult, so it stays a Table.
+        ast.UsingQuery(q) ->
+          case query_rows(env, q) {
+            RowsNone -> TyResult(TyInt, TyBuiltin("SqlError"))
+            RowsOf(elem) -> TyResult(TyVec(elem), TyBuiltin("SqlError"))
+          }
+        ast.UsingRaw(_) -> TyResult(TyTable, TyBuiltin("SqlError"))
       }
     ast.EWith(value, typ) ->
       case value {
@@ -3323,6 +3535,10 @@ fn gen_atom(name: String) -> String {
 /// vector literal adopts the expected element type).
 fn coerce(env: Env, e: ast.Expr, expect: Ty) -> String {
   case expect, e {
+    // `Result.Ok(v)` / `Result.Error(e)` need both payload types, and the slot
+    // the value is landing in is what knows them.
+    TyResult(ok, err), ast.ECall(ast.EMember(ast.EIdent("Result"), variant), args) ->
+      gen_result_ctor(env, variant, args, ok, err)
     TyVec(elem), ast.EVector(items) -> gen_vector(env, items, elem)
     TyTable, ast.EVector(items) -> gen_vector(env, items, TyVec(TyStr))
     TyStr, _ ->
@@ -4023,16 +4239,147 @@ fn gen_slice(
 // encoding/xml) into its build.
 fn gen_using(env: Env, source: ast.Expr, kind: ast.UsingKind) -> String {
   case kind {
-    ast.UsingQuery(query) ->
-      "hive.SqlQuery("
-      <> gen_expr(env, source)
-      <> ", "
-      <> coerce(env, query, TyStr)
-      <> ")"
+    // `run raw <text>` keeps the untyped path: nothing is known about the shape
+    // of what comes back, so it comes back as a Table with its header row.
+    ast.UsingRaw(text) ->
+      "hive.SqlQuery(" <> gen_expr(env, source) <> ", " <> coerce(env, text, TyStr) <> ")"
+    ast.UsingQuery(query) -> gen_run_query(env, source, query)
     ast.UsingXlsx -> "hive.ReadXlsx(" <> coerce(env, source, TyStr) <> ")"
     ast.UsingOds -> "hive.ReadOds(" <> coerce(env, source, TyStr) <> ")"
     ast.UsingCsv(separator) -> gen_read_csv(env, source, separator)
   }
+}
+
+// What a query's declared rows say to do with it: statements report how many
+// rows they touched, single-column results come back as a vector of that
+// column, and a row type comes back mapped.
+fn gen_run_query(env: Env, source: ast.Expr, query: ast.Expr) -> String {
+  let conn = gen_expr(env, source)
+  let stmt = gen_expr(env, query)
+  case query_rows(env, query) {
+    RowsNone -> "hive.SqlExec(" <> conn <> ", " <> stmt <> ")"
+    RowsOf(ty) ->
+      "hive.SqlRows("
+      <> conn
+      <> ", "
+      <> stmt
+      <> ", "
+      <> gen_row_mapper(env, ty)
+      <> ")"
+  }
+}
+
+type QueryRows {
+  RowsNone
+  RowsOf(Ty)
+}
+
+fn query_rows(env: Env, query: ast.Expr) -> QueryRows {
+  case query {
+    ast.ECall(ast.EIdent(name), _) ->
+      case dict.get(env.fns, name) {
+        Ok(#(_, _, ast.TVoid)) -> RowsNone
+        Ok(#(_, _, ret)) ->
+          case ty_of_type_expr(env.types, ret) {
+            TyVec(elem) -> RowsOf(elem)
+            TyTable -> RowsOf(TyVec(TyStr))
+            other -> RowsOf(other)
+          }
+        Error(_) -> RowsOf(TyVec(TyStr))
+      }
+    _ -> RowsOf(TyVec(TyStr))
+  }
+}
+
+// A function from one row of cells to a value of the declared type. A cell that
+// does not fit its field is an error rather than a zero, which is the same
+// answer the derived JSON decoder gives to a value of the wrong shape.
+fn gen_row_mapper(_env: Env, ty: Ty) -> String {
+  case ty {
+    TyCustom(name) -> "sqlRow_" <> name
+    _ ->
+      "func(_r []string) ("
+      <> ty_to_go(ty)
+      <> ", error) {\n\tif len(_r) != 1 { var _z "
+      <> ty_to_go(ty)
+      <> "; return _z, hive.SqlShapeError(1, len(_r)) }\n\treturn "
+      <> gen_cell_convert(ty, "_r[0]", gen_string_lit("1"))
+      <> "\n}"
+  }
+}
+
+// Converting one cell. The error names the column so a bad value is traceable.
+fn gen_cell_convert(ty: Ty, cell: String, column: String) -> String {
+  case ty {
+    TyStr -> "hive.SqlCellStr(" <> cell <> ", " <> column <> ")"
+    TyInt -> "hive.SqlCellInt(" <> cell <> ", " <> column <> ")"
+    TyFloat -> "hive.SqlCellFloat(" <> cell <> ", " <> column <> ")"
+    TyBool -> "hive.SqlCellBool(" <> cell <> ", " <> column <> ")"
+    // Anything else is handed over as text; a row can only hold scalars.
+    _ -> "hive.SqlCellStr(" <> cell <> ", " <> column <> ")"
+  }
+}
+
+// One `sqlRow_T` per row type reached by a typed query.
+fn gen_sql_row_support(env: Env, module: ast.Module) -> String {
+  let wanted = list.unique(row_types(env, module.decls))
+  wanted
+  |> list.filter_map(fn(name) {
+    case dict.get(env.types, name) {
+      Ok(ast.TypeDecl(_, [], fields)) -> Ok(gen_sql_row_fn(env, name, fields))
+      _ -> Error(Nil)
+    }
+  })
+  |> string.concat
+}
+
+fn gen_sql_row_fn(env: Env, name: String, fields: List(ast.Field)) -> String {
+  let n = list.length(fields)
+  let checks =
+    fields
+    |> list.index_map(fn(f, i) {
+      let ty = ty_of_type_expr(env.types, f.typ)
+      let idx = int.to_string(i)
+      "\tf" <> idx <> ", err" <> idx <> " := "
+      <> gen_cell_convert(ty, "_r[" <> idx <> "]", gen_string_lit(f.name))
+      <> "\n\tif err" <> idx <> " != nil { return " <> name <> "{}, err" <> idx <> " }\n"
+    })
+    |> string.concat
+  let assigns =
+    fields
+    |> list.index_map(fn(f, i) { exported(f.name) <> ": f" <> int.to_string(i) })
+    |> string.join(", ")
+  "func sqlRow_"
+  <> name
+  <> "(_r []string) ("
+  <> name
+  <> ", error) {\n\tif len(_r) != "
+  <> int.to_string(n)
+  <> " { return "
+  <> name
+  <> "{}, hive.SqlShapeError("
+  <> int.to_string(n)
+  <> ", len(_r)) }\n"
+  <> checks
+  <> "\treturn "
+  <> name
+  <> "{"
+  <> assigns
+  <> "}, nil\n}\n"
+}
+
+// Every custom type a typed query returns rows of.
+fn row_types(env: Env, decls: List(ast.Decl)) -> List(String) {
+  list.filter_map(decls, fn(d) {
+    case d {
+      ast.QueryDecl(_, _, ret, _) ->
+        case ty_of_type_expr(env.types, ret) {
+          TyVec(TyCustom(name)) -> Ok(name)
+          _ -> Error(Nil)
+        }
+      _ -> Error(Nil)
+    }
+  })
 }
 
 fn gen_read_csv(env: Env, path: ast.Expr, delim: Option(ast.Expr)) -> String {
@@ -4073,6 +4420,18 @@ fn gen_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
             _ -> gen_plain_call(env, callee, args)
           }
       }
+    ast.EMember(ast.EIdent("Result"), variant) -> {
+      let #(ok, err) = case env.ret {
+        TyResult(o, e) -> #(o, e)
+        _ ->
+          case variant, args {
+            "Ok", [ast.Arg(_, v)] -> #(infer(env, v), TyUnknown)
+            _, [ast.Arg(_, v)] -> #(TyUnknown, infer(env, v))
+            _, _ -> #(TyUnknown, TyUnknown)
+          }
+      }
+      gen_result_ctor(env, variant, args, ok, err)
+    }
     ast.EMember(ast.EIdent(type_name), variant_name) ->
       case dict.get(env.types, type_name) {
         Ok(_) -> gen_constructor(env, type_name, variant_name, args)
@@ -4346,17 +4705,17 @@ fn syslink_msg_of(
 // named for it. Only the shapes a message can actually have need to work.
 fn ty_type_expr(ty: Ty) -> Option(ast.TypeExpr) {
   case ty {
-    TyStr -> Some(ast.TName(None, "Str", []))
-    TyInt -> Some(ast.TName(None, "Int", []))
-    TyFloat -> Some(ast.TName(None, "Float", []))
-    TyBool -> Some(ast.TName(None, "Bool", []))
-    TyAtom -> Some(ast.TName(None, "Atom", []))
-    TyTable -> Some(ast.TName(None, "Table", []))
-    TyCustom(name) -> Some(ast.TName(None, name, []))
+    TyStr -> Some(ast.TName(None, "Str", [], []))
+    TyInt -> Some(ast.TName(None, "Int", [], []))
+    TyFloat -> Some(ast.TName(None, "Float", [], []))
+    TyBool -> Some(ast.TName(None, "Bool", [], []))
+    TyAtom -> Some(ast.TName(None, "Atom", [], []))
+    TyTable -> Some(ast.TName(None, "Table", [], []))
+    TyCustom(name) -> Some(ast.TName(None, name, [], []))
     TyVec(inner) ->
       case ty_type_expr(inner) {
-        Some(ast.TName(pkg, name, dims)) ->
-          Some(ast.TName(pkg, name, [ast.DimDyn, ..dims]))
+        Some(ast.TName(pkg, name, args, dims)) ->
+          Some(ast.TName(pkg, name, args, [ast.DimDyn, ..dims]))
         _ -> None
       }
     _ -> None
@@ -4463,10 +4822,23 @@ fn type_signature_seen(
   case typ {
     ast.TVoid -> "void"
     ast.TFunc(_, _, _) -> "func"
-    ast.TName(pkg, name, dims) -> {
+    ast.TName(pkg, name, args, dims) -> {
       let base = case pkg {
         Some(p) -> p <> "." <> name
         None -> name
+      }
+      // Arguments distinguish `Box<Str>` from `Box<Int>` on the wire, so they
+      // belong in the signature the digest is taken over.
+      let base = case args {
+        [] -> base
+        _ ->
+          base
+          <> "<"
+          <> string.join(
+            list.map(args, fn(a) { type_signature_seen(types, a, seen) }),
+            ",",
+          )
+          <> ">"
       }
       let suffix =
         dims
@@ -4517,7 +4889,7 @@ fn fnv1a(text: String) -> Int {
 fn json_encoder_ref(env: Env, t: ast.TypeExpr) -> String {
   let ty = ty_of_type_expr(env.types, t)
   case t {
-    ast.TName(None, name, []) ->
+    ast.TName(None, name, _, []) ->
       case name {
         _ ->
           case dict.has_key(env.types, name) {
@@ -5096,6 +5468,26 @@ fn gen_struct_construct(
     _ -> []
   }
   type_name <> "{" <> gen_field_args(env, args, fields) <> "}"
+}
+
+// `Result.Ok(v)` -> `hive.Ok[T, E](v)`, `Result.Error(e)` -> `hive.Err[T, E](e)`.
+// Go needs both parameters spelled out at the construction, which is why the
+// expected type has to reach here rather than being inferred from the payload.
+fn gen_result_ctor(
+  env: Env,
+  variant: String,
+  args: List(ast.Arg),
+  ok: Ty,
+  err: Ty,
+) -> String {
+  let params = "[" <> ty_to_go(ok) <> ", " <> ty_to_go(err) <> "]"
+  case variant, args {
+    "Ok", [ast.Arg(_, v)] -> "hive.Ok" <> params <> "(" <> coerce(env, v, ok) <> ")"
+    "Error", [ast.Arg(_, v)] ->
+      "hive.Err" <> params <> "(" <> coerce(env, v, err) <> ")"
+    _, _ ->
+      "hive.Ok" <> params <> "(" <> gen_args(env, args) <> ")"
+  }
 }
 
 fn gen_plain_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {

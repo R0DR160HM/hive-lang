@@ -603,7 +603,7 @@ fn promising_param(params: List(ast.Field)) -> Option(ast.Field) {
 
 fn has_static_dim(t: ast.TypeExpr) -> Bool {
   case t {
-    ast.TName(_, _, dims) ->
+    ast.TName(_, _, _, dims) ->
       list.any(dims, fn(d) {
         case d {
           ast.DimStatic(_) -> True
@@ -1348,7 +1348,7 @@ fn type_of(env: Env, expr: ast.Expr) -> Option(ast.TypeExpr) {
       }
     ast.EMember(target, field) ->
       case type_of(env, target) {
-        Some(ast.TName(None, tname, [])) -> field_type(env, tname, field)
+        Some(ast.TName(None, tname, _, [])) -> field_type(env, tname, field)
         _ -> None
       }
     // A call's value is its declared return — except for a bare call to an
@@ -1371,7 +1371,7 @@ fn type_of(env: Env, expr: ast.Expr) -> Option(ast.TypeExpr) {
 
 fn constructed_type(env: Env, name: String) -> Option(ast.TypeExpr) {
   case dict.get(env.types, name) {
-    Ok(ast.TypeDecl(tname, _, _)) -> Some(ast.TName(None, tname, []))
+    Ok(ast.TypeDecl(tname, _, _)) -> Some(ast.TName(None, tname, [], []))
     _ -> None
   }
 }
@@ -1396,7 +1396,7 @@ fn field_type(
 
 fn outer_dim(t: ast.TypeExpr) -> Len {
   case t {
-    ast.TName(_, _, [dim, ..]) ->
+    ast.TName(_, _, _, [dim, ..]) ->
       case dim {
         ast.DimStatic(n) -> Static(n)
         ast.DimDyn | ast.DimEmpty -> Dyn
@@ -1407,7 +1407,8 @@ fn outer_dim(t: ast.TypeExpr) -> Len {
 
 fn drop_dim(t: ast.TypeExpr) -> Option(ast.TypeExpr) {
   case t {
-    ast.TName(pkg, name, [_, ..rest]) -> Some(ast.TName(pkg, name, rest))
+    ast.TName(pkg, name, args, [_, ..rest]) ->
+      Some(ast.TName(pkg, name, args, rest))
     _ -> None
   }
 }

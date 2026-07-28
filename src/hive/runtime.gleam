@@ -172,6 +172,11 @@ pub fn modules() -> List(Module) {
       markers: [
         "hive.SqlConnect", "hive.SqlPool", "hive.SqlClose", "hive.SqlQuery",
         "hive.SqlError", "hive.SqlConnection", "hive.DatabaseDriver",
+        // A `query` declaration builds one of these even in a program that
+        // never opens a connection, so declaring one is enough to need the
+        // module.
+        "hive.SqlFragment", "hive.SqlRows", "hive.SqlExec", "hive.SqlCell",
+        "hive.SqlJoin", "hive.SqlShapeError",
       ],
       requires: [],
     ),
@@ -3253,6 +3258,8 @@ pub fn sql_go() -> String {
 
 import (
 	\"database/sql\"
+	\"strconv\"
+	\"strings\"
 
 	_ \"github.com/lib/pq\"
 	_ \"modernc.org/sqlite\"
@@ -3264,17 +3271,198 @@ type DatabaseDriver struct {
 	Name string
 }
 
-// SqlError describes a failed database operation.
+// SqlError describes a failed database operation. Reason is a short tag —
+// \"Connection\", \"Query\", \"Shape\" or \"Convert\" — so a caller can tell a
+// database that is down from a value that did not fit the type it was declared
+// with, which are very different things to do something about.
 type SqlError struct {
+	Reason  string
 	Message string
 }
 
-func (e SqlError) Error() string { return \"hive: sql error: \" + e.Message }
+func (e SqlError) Error() string {
+	return \"hive: sql error (\" + e.Reason + \"): \" + e.Message
+}
+
+// SqlFragment is a piece of SQL text together with the values its placeholders
+// bind to. A query declaration builds one; nothing a caller supplies ever
+// reaches Text, which is what makes the text mean only what the query says.
+type SqlFragment struct {
+	Text string
+	Args []any
+}
+
+// SqlJoin combines the fragments a `where` block collected. No fragments means
+// empty text, so the clause disappears rather than leaving a dangling
+// connective; more than one is parenthesised when asked, so a nested group
+// cannot change how the surrounding connective binds.
+func SqlJoin(parts []SqlFragment, sep string, paren bool) SqlFragment {
+	if len(parts) == 0 {
+		return SqlFragment{}
+	}
+	texts := make([]string, len(parts))
+	args := []any{}
+	for i, p := range parts {
+		texts[i] = p.Text
+		args = append(args, p.Args...)
+	}
+	text := strings.Join(texts, sep)
+	if paren && len(parts) > 1 {
+		text = \"(\" + text + \")\"
+	}
+	return SqlFragment{Text: text, Args: args}
+}
+
+// Queries are built with `?` placeholders; PostgreSQL wants $1, $2, ... instead.
+// Rewriting here rather than at build time is what lets one query declaration
+// serve every driver.
+func sqlPlaceholders(conn SqlConnection, text string) string {
+	if conn.driver != \"postgres\" {
+		return text
+	}
+	var b strings.Builder
+	n := 0
+	for _, r := range text {
+		if r == '?' {
+			n++
+			b.WriteString(\"$\" + strconv.Itoa(n))
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// SqlExec runs a statement that returns no rows and reports how many it
+// affected — which is how a delete says whether it matched anything.
+func SqlExec(conn SqlConnection, stmt SqlFragment) Result[int, SqlError] {
+	if conn.db == nil {
+		return Err[int, SqlError](SqlError{Reason: \"Connection\", Message: \"connection is not open\"})
+	}
+	res, err := conn.db.Exec(sqlPlaceholders(conn, stmt.Text), stmt.Args...)
+	if err != nil {
+		return Err[int, SqlError](SqlError{Reason: \"Query\", Message: err.Error()})
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		// A driver that cannot count is not a failure of the statement itself.
+		return Ok[int, SqlError](0)
+	}
+	return Ok[int, SqlError](int(n))
+}
+
+// SqlRows runs a query and maps every row through `row`, which the compiler
+// derived from the type the query declared. A cell that does not fit its field
+// stops the read and comes back as an error, rather than becoming a zero.
+func SqlRows[T any](
+	conn SqlConnection,
+	stmt SqlFragment,
+	row func([]string) (T, error),
+) Result[[]T, SqlError] {
+	out := []T{}
+	if conn.db == nil {
+		return Err[[]T, SqlError](SqlError{Reason: \"Connection\", Message: \"connection is not open\"})
+	}
+	rows, err := conn.db.Query(sqlPlaceholders(conn, stmt.Text), stmt.Args...)
+	if err != nil {
+		return Err[[]T, SqlError](SqlError{Reason: \"Query\", Message: err.Error()})
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		return Err[[]T, SqlError](SqlError{Reason: \"Query\", Message: err.Error()})
+	}
+	for rows.Next() {
+		cells := make([]sql.NullString, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range cells {
+			ptrs[i] = &cells[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return Err[[]T, SqlError](SqlError{Reason: \"Query\", Message: err.Error()})
+		}
+		flat := make([]string, len(cols))
+		for i, c := range cells {
+			if c.Valid {
+				flat[i] = c.String
+			}
+		}
+		v, err := row(flat)
+		if err != nil {
+			if se, ok := err.(SqlError); ok {
+				return Err[[]T, SqlError](se)
+			}
+			return Err[[]T, SqlError](SqlError{Reason: \"Convert\", Message: err.Error()})
+		}
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return Err[[]T, SqlError](SqlError{Reason: \"Query\", Message: err.Error()})
+	}
+	return Ok[[]T, SqlError](out)
+}
+
+// SqlShapeError reports a row that arrived with the wrong number of columns —
+// which the compiler checks the query text for, so it means the database
+// disagreed with the query at runtime.
+func SqlShapeError(want, got int) error {
+	return SqlError{
+		Reason: \"Shape\",
+		Message: \"expected \" + strconv.Itoa(want) + \" columns but the row had \" +
+			strconv.Itoa(got),
+	}
+}
+
+func sqlCellError(column, value, want string) error {
+	return SqlError{
+		Reason:  \"Convert\",
+		Message: \"column \" + column + \" held \" + strconv.Quote(value) + \", which is not \" + want,
+	}
+}
+
+// The cell conversions a generated row mapper uses. A Str needs no converting,
+// but it keeps the same shape as the others so the generated code is uniform.
+func SqlCellStr(cell string, column string) (string, error) {
+	_ = column
+	return cell, nil
+}
+
+func SqlCellInt(cell string, column string) (int, error) {
+	v, err := strconv.Atoi(strings.TrimSpace(cell))
+	if err != nil {
+		return 0, sqlCellError(column, cell, \"an Int\")
+	}
+	return v, nil
+}
+
+func SqlCellFloat(cell string, column string) (float64, error) {
+	v, err := strconv.ParseFloat(strings.TrimSpace(cell), 64)
+	if err != nil {
+		return 0, sqlCellError(column, cell, \"a Float\")
+	}
+	return v, nil
+}
+
+// Booleans have no single spelling across databases: SQLite stores 0/1,
+// PostgreSQL answers t/f, and some schemas keep the word. All of them are
+// accepted; anything else is an error rather than a silent false.
+func SqlCellBool(cell string, column string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(cell)) {
+	case \"1\", \"t\", \"true\", \"y\", \"yes\":
+		return true, nil
+	case \"0\", \"f\", \"false\", \"n\", \"no\":
+		return false, nil
+	}
+	return false, sqlCellError(column, cell, \"a Bool\")
+}
 
 // SqlConnection is a handle to an open database. The underlying *sql.DB is a
 // connection pool, so a single SqlConnection is safe for concurrent use.
 type SqlConnection struct {
 	db *sql.DB
+	// Which driver this connection speaks, so placeholders can be written in the
+	// dialect it expects.
+	driver string
 }
 
 // sqlDriverName maps a DatabaseDriver onto the registered database/sql driver.
@@ -3294,13 +3482,13 @@ func sqlDriverName(d DatabaseDriver) string {
 func SqlConnect(driver DatabaseDriver, connString string) Result[SqlConnection, SqlError] {
 	db, err := sql.Open(sqlDriverName(driver), connString)
 	if err != nil {
-		return Err[SqlConnection, SqlError](SqlError{Message: err.Error()})
+		return Err[SqlConnection, SqlError](SqlError{Reason: \"Query\", Message: err.Error()})
 	}
 	if err := db.Ping(); err != nil {
 		db.Close()
-		return Err[SqlConnection, SqlError](SqlError{Message: err.Error()})
+		return Err[SqlConnection, SqlError](SqlError{Reason: \"Query\", Message: err.Error()})
 	}
-	return Ok[SqlConnection, SqlError](SqlConnection{db: db})
+	return Ok[SqlConnection, SqlError](SqlConnection{db: db, driver: sqlDriverName(driver)})
 }
 
 // SqlPool is SqlConnect with explicit pool limits (max open and idle
@@ -3328,16 +3516,16 @@ func SqlClose(conn SqlConnection) {
 // per result row; a statement that returns no rows yields an empty table.
 func SqlQuery(conn SqlConnection, query string) Result[Table, SqlError] {
 	if conn.db == nil {
-		return Err[Table, SqlError](SqlError{Message: \"connection is not open\"})
+		return Err[Table, SqlError](SqlError{Reason: \"Connection\", Message: \"connection is not open\"})
 	}
 	rows, err := conn.db.Query(query)
 	if err != nil {
-		return Err[Table, SqlError](SqlError{Message: err.Error()})
+		return Err[Table, SqlError](SqlError{Reason: \"Query\", Message: err.Error()})
 	}
 	defer rows.Close()
 	cols, err := rows.Columns()
 	if err != nil {
-		return Err[Table, SqlError](SqlError{Message: err.Error()})
+		return Err[Table, SqlError](SqlError{Reason: \"Query\", Message: err.Error()})
 	}
 	if len(cols) == 0 {
 		return Ok[Table, SqlError](Table{})
@@ -3350,7 +3538,7 @@ func SqlQuery(conn SqlConnection, query string) Result[Table, SqlError] {
 			ptrs[i] = &cells[i]
 		}
 		if err := rows.Scan(ptrs...); err != nil {
-			return Err[Table, SqlError](SqlError{Message: err.Error()})
+			return Err[Table, SqlError](SqlError{Reason: \"Query\", Message: err.Error()})
 		}
 		row := make([]string, len(cols))
 		for i, c := range cells {
@@ -3361,7 +3549,7 @@ func SqlQuery(conn SqlConnection, query string) Result[Table, SqlError] {
 		table = append(table, row)
 	}
 	if err := rows.Err(); err != nil {
-		return Err[Table, SqlError](SqlError{Message: err.Error()})
+		return Err[Table, SqlError](SqlError{Reason: \"Query\", Message: err.Error()})
 	}
 	return Ok[Table, SqlError](table)
 }

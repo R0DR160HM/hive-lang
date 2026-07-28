@@ -1,12 +1,95 @@
 // The `hive.sql` standard library talks to SQLite and PostgreSQL. SQLite is
 // the pure-Go modernc driver, compiled straight into the executable, so local
-// databases work with no external install. Queries run through the overloaded
-// `using <connection> run <query>` form and come back as a Table.
+// databases work with no external install.
+//
+// A `query` declares what its ROWS are, and that is what `using <connection>
+// run <query>` gives back:
+//
+//   query q(...): Row[dyn]   one Row per row   Result<Row[dyn], SqlError>
+//   query q(...): Str[dyn]   a single column   Result<Str[dyn], SqlError>
+//   query q(...): void       no rows           Result<Int, SqlError>, the
+//                                              number of rows it affected
+//
+// Interpolated parameters never enter the SQL text. `{name}` becomes a
+// placeholder and the value is bound alongside it, so nothing a caller supplies
+// can change what the statement means — not even "O'Brien".
 
-// A `query` builds sanitized SQL, which is the safe way to interpolate
-// parameters into a statement (note "O'Brien" -> 'O''Brien' below).
-query insertUser(id: Int, name: Str): Str {
-	INSERT INTO users (id, name) VALUES ({id}, {name})
+type User {
+	id:     Int
+	name:   Str
+	active: Bool
+}
+
+query createUsers(): void {
+	CREATE TABLE IF NOT EXISTS users (
+		id INTEGER,
+		name TEXT,
+		active INTEGER NOT NULL DEFAULT 1
+	)
+}
+
+query clearUsers(): void {
+	DELETE FROM users
+}
+
+query insertUser(id: Int, name: Str, active: Bool): void {
+	INSERT INTO users (id, name, active) VALUES ({id}, {name}, {active})
+}
+
+// The columns are matched to `User`'s fields by name, and each cell is converted
+// to the type its field declared. Booleans have no single spelling across
+// databases — SQLite stores 0/1, PostgreSQL answers t/f — so all of them are
+// accepted and anything else is an error rather than a silent false.
+query allUsers(): User[dyn] {
+	SELECT id, name, active FROM users ORDER BY id
+}
+
+// A single column comes back as a vector of that column — no row type needed.
+query userNames(): Str[dyn] {
+	SELECT name FROM users ORDER BY name
+}
+
+// Filters that are each present or absent — which is what most "dynamic"
+// queries really are, and it needs no string building. The block ANDs what is
+// present; a nested `or { }` flips the connective for its own predicates.
+//
+// A group that contributes nothing disappears rather than leaving a dangling
+// connective, and if no predicate is present at all there is no WHERE clause —
+// so there is no `WHERE 1 = 1` to write. A group with more than one predicate is
+// parenthesised, so nesting cannot change how the surrounding connective binds.
+query findUsers(
+	name: Str,
+	minId: Int,
+	onlyActive: Bool,
+	onlyFirst: Bool,
+): User[dyn] {
+	SELECT id, name, active FROM users
+	where {
+		if name != "" { name = {name} }
+		if minId > 0 { id >= {minId} }
+		or {
+			if onlyActive { active = 1 }
+			if onlyFirst { id = 1 }
+		}
+	}
+	ORDER BY id
+}
+
+// `Result<T, E>` is an ordinary type you can write down, so a helper can take
+// one. (Before type arguments existed there was no way to spell this.)
+proc report(label: Str, result: Result<User[dyn], hive.sql.SqlError>): void {
+	if result is Result.Error(error) {
+		echo "{label}: {error.reason}: {error.message}"
+		return
+	}
+	if result is Result.Ok(users) {
+		mut Str[dyn] names = []
+		for each user in users {
+			append(names, user.name)
+		}
+		listed := join(names, ", ")
+		echo "{label}: {listed}"
+	}
 }
 
 proc main(): void {
@@ -15,24 +98,54 @@ proc main(): void {
 	// maxIdle)` tunes the connection pool.
 	opened := hive.sql.pool(hive.sql.DatabaseDriver.SQLite(), "./demo.db", 4, 2)
 
-	if opened is Result.Ok(db) {
-		// DDL and writes go through the same `using ... run ...`; a query
-		// that returns no rows yields an empty table, which we just discard.
-		using db run "CREATE TABLE IF NOT EXISTS users (id INTEGER, name TEXT)"
-		using db run "DELETE FROM users"
-		using db run insertUser(1, "Ada")
-		using db run insertUser(2, "O'Brien")
+	if opened is Result.Error(error) {
+		echo "could not open database: {error.reason}: {error.message}"
+		return
+	}
 
-		// A SELECT returns a header row of column names, then one row per row.
-		result := using db run "SELECT id, name FROM users ORDER BY id"
-		if result is Result.Ok(rows) {
-			echo rows
-		} else if result is Result.Error(error) {
-			echo "query failed: {error.message}"
+	if opened is Result.Ok(db) {
+		if using db run createUsers() is Result.Error(error) { panic error }
+		if using db run clearUsers() is Result.Error(error) { panic error }
+
+		// A statement reports how many rows it touched.
+		if using db run insertUser(1, "Ada", true) is Result.Ok(n) {
+			echo "inserted {n} row"
+		}
+		if using db run insertUser(2, "O'Brien", true) is Result.Error(e) { panic e }
+		if using db run insertUser(3, "Retired", false) is Result.Error(e) { panic e }
+
+		// Typed rows: `user.name`, not a cell looked up by header.
+		result := using db run allUsers()
+		if result is Result.Error(error) {
+			echo "query failed: {error.reason}: {error.message}"
+		}
+		if result is Result.Ok(users) {
+			for each user in users {
+				echo "{user.id}: {user.name} (active {user.active})"
+			}
+			// A row type is an ordinary type, so the derived JSON encoder works
+			// on it with nothing to write by hand.
+			echo hive.json.encode(users)
+		}
+
+		if using db run userNames() is Result.Ok(names) {
+			listed := join(names, ", ")
+			echo "names: {listed}"
+		}
+
+		// Every combination of the filters, including none of them.
+		report("no filters", using db run findUsers("", 0, false, false))
+		report("id >= 2", using db run findUsers("", 2, false, false))
+		report("active or first", using db run findUsers("", 0, true, true))
+		report("all at once", using db run findUsers("", 2, true, true))
+
+		// SQL assembled at runtime has a shape nothing can know, so it says so
+		// with `run raw` and comes back as a Table — header row and all. Every
+		// place SQL is built rather than declared is greppable for exactly this.
+		if using db run raw "SELECT count(*) AS total FROM users" is Result.Ok(t) {
+			echo t
 		}
 
 		hive.sql.close(db)
-	} else if opened is Result.Error(error) {
-		echo "could not open database: {error.message}"
 	}
 }

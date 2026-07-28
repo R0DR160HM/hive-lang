@@ -1,0 +1,121 @@
+// Generics
+// ========
+// A name in a signature that is neither a builtin nor a declared type is a
+// TYPE VARIABLE, and it makes the callable generic in it. This is exactly the
+// notation the builtin table has always used to describe the builtins:
+//
+//     len(T[]): Int
+//     indexOf(T[], T): Result<Int, Bool>
+//     append(T[dyn], T): void
+//
+// There is no runtime to any of it. Every call site is resolved at compile
+// time: the type arguments are read off the argument types, and one concrete
+// copy is emitted per distinct set of them — `first_Str`, `first_Int`. No
+// boxing, no dispatch, no reflection.
+//
+// Because each copy is an ordinary declaration, every check runs on it
+// separately. Two of them get *sharper* for it: an instantiation at `Str[3]` is
+// held to that length while one at `Str[dyn]` guards its indexes, which is the
+// right answer for both.
+
+// --- Generic callables ------------------------------------------------------
+
+// `T[]` is a vector of some length, of some element type. Nothing is promised
+// about the length, so the access is guarded — as it would be for any `[]`.
+func first(v: T[]): Result<T, Bool> {
+	if len(v) > 0 {
+		return Result.Ok(v[0])
+	}
+	return Result.Error(false)
+}
+
+func firstOr(v: T[], fallback: T): T {
+	if first(v) is Result.Ok(found) {
+		return found
+	}
+	return fallback
+}
+
+// Two variables, inferred independently at each call.
+func pairUp(a: A, b: B): Str {
+	return "{a} / {b}"
+}
+
+// Procs can be generic too.
+proc showAll(label: Str, v: T[]): void {
+	echo "{label}:"
+	for each item in v {
+		echo "  - {item}"
+	}
+}
+
+// --- Generic types ----------------------------------------------------------
+
+// A type whose fields mention variables is generic in them, in first-appearance
+// order, and is written out where it is used: `Box<Str>`.
+type Box {
+	items: T[dyn]
+	label: Str
+}
+
+// A generic tagged union. Each instantiation gets its own clone, its own JSON
+// codec and its own structural digest, so `Either<Str, Int>` and
+// `Either<Int, Str>` are different types all the way down to the wire.
+type Either {
+	Left { left: A }
+	Right { right: B }
+}
+
+func sizeOf(b: Box<Str>): Str {
+	return "{b.label} holds {len(b.items)}"
+}
+
+proc main(): void {
+	Str[2] names = ["ada", "grace"]
+	Int[dyn] counts = [7, 8, 9]
+	Str[dyn] nothing = []
+
+	// One `first`, three instantiations — chosen by the argument, never written.
+	if first(names) is Result.Ok(n) { echo n }
+	if first(counts) is Result.Ok(c) { echo c }
+	if first(nothing) is Result.Error(_) { echo "nothing there" }
+
+	echo firstOr(nothing, "a fallback")
+	echo pairUp(len(names), firstOr(names, "nobody"))
+
+	showAll("names", names)
+	showAll("counts", counts)
+
+	// Generic types. The arguments are written on the declaration, which is also
+	// what tells a variant constructor which instantiation it is building.
+	Box<Str> people = Box(["ada", "grace"], "people")
+	Box<Int> tallies = Box([1, 2, 3], "tallies")
+	echo sizeOf(people)
+	echo "{tallies.label} holds {len(tallies.items)}"
+
+	Either<Str, Int> went = Either.Left("went left")
+	if went is Either.Left(v) { echo v }
+
+	Either<Str, Int> answer = Either.Right(42)
+	if answer is Either.Right(n) { echo n }
+
+	// The derived JSON encoder comes free, per instantiation.
+	echo hive.json.encode(people)
+	echo hive.json.encode(tallies)
+}
+
+// --- What is rejected -------------------------------------------------------
+//
+// A generic callable cannot be used as a VALUE. Which copy a call reaches is
+// decided by the argument types, and a value carries none:
+//
+//     f := first            // compile error
+//
+// A variable that appears only in the return type has nothing to be inferred
+// from, so there is no way to say which copy is wanted:
+//
+//     func makeOne(n: Int): T { ... }   // compile error at the call
+//
+// And a generic that instantiates itself at an ever-larger type would never
+// settle, so the expansion is capped and overrunning it is a compile error
+// rather than a hung build.

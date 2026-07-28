@@ -401,16 +401,41 @@ pub fn is_binding_usable_in_same_condition_test() {
   should.be_true(string.contains(go, "T(TA{V: \"ok\"})"))
 }
 
-pub fn query_sanitizes_interpolations_test() {
+pub fn query_binds_interpolations_as_placeholders_test() {
+  // An interpolated value never enters the SQL text: it becomes a placeholder
+  // and the value is bound alongside, so nothing a caller supplies can change
+  // what the statement means.
   let go =
     compile(
-      "query q(name: Str): Str {\n\tSELECT * FROM users u\n\tWHERE u.name = {name}\n}\nproc main(): void {}\n",
+      "type U {\n\tname: Str\n}\nquery q(name: Str): U[dyn] {\n\tSELECT name FROM users u\n\tWHERE u.name = {name}\n}\nproc main(): void {}\n",
     )
-  should.be_true(string.contains(go, "func q(name string) string {"))
-  should.be_true(string.contains(
-    go,
-    "return \"SELECT * FROM users u\\nWHERE u.name = \" + hive.SqlParam(name)",
-  ))
+  should.be_true(string.contains(go, "func q(name string) hive.SqlFragment {"))
+  should.be_true(string.contains(go, "_sql += \"?\""))
+  should.be_true(string.contains(go, "_args = append(_args, name)"))
+  // The value is never spliced into the text.
+  should.be_false(string.contains(go, "hive.SqlParam(name)"))
+}
+
+pub fn a_where_block_builds_its_clause_test() {
+  // Present predicates are ANDed; a nested group is ORed and parenthesised;
+  // nothing present means no WHERE clause at all.
+  let go =
+    compile(
+      "type U {\n\tname: Str\n}\nquery q(a: Str, b: Int, c: Bool): U[dyn] {\n\tSELECT name FROM users\n\twhere {\n\t\tif a != \"\" { name = {a} }\n\t\tor {\n\t\t\tif b > 0 { n >= {b} }\n\t\t\tif c { flag = 1 }\n\t\t}\n\t}\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "hive.SqlJoin(_p3, \" OR \", true)"))
+  should.be_true(string.contains(go, "hive.SqlJoin(_p1, \" AND \", false)"))
+  should.be_true(string.contains(go, "_sql += \" WHERE \" + _w0.Text"))
+}
+
+pub fn where_in_plain_sql_is_still_literal_test() {
+  // A `where` block only opens when a `{` follows it, so ordinary SQL is safe.
+  let go =
+    compile(
+      "type U {\n\tname: Str\n}\nquery q(n: Str): U[dyn] {\n\tSELECT name FROM users WHERE name = {n}\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "WHERE name = "))
+  should.be_false(string.contains(go, "hive.SqlJoin"))
 }
 
 pub fn func_can_echo_test() {
@@ -1187,14 +1212,23 @@ pub fn unknown_crypto_builtin_is_rejected_test() {
 pub fn sql_connect_and_query_lower_test() {
   let go =
     compile(
-      "proc main(): void {\n\topened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"./x.db\")\n\tif opened is Result.Ok(db) {\n\t\tresult := using db run \"SELECT 1\"\n\t\tif result is Result.Ok(rows) {\n\t\t\techo rows\n\t\t}\n\t}\n}\n",
+      "proc main(): void {\n\topened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"./x.db\")\n\tif opened is Result.Ok(db) {\n\t\tresult := using db run raw \"SELECT 1\"\n\t\tif result is Result.Ok(rows) {\n\t\t\techo rows\n\t\t}\n\t}\n}\n",
     )
   should.be_true(string.contains(
     go,
     "hive.SqlConnect(hive.DatabaseDriver{Name: \"sqlite\"}, \"./x.db\")",
   ))
-  // `using <connection> run <query>` lowers to a SQL query, not a CSV read.
+  // `run raw` keeps the untyped path: a Table, not a CSV read.
   should.be_true(string.contains(go, "hive.SqlQuery(db, \"SELECT 1\")"))
+}
+
+pub fn running_bare_sql_text_without_raw_is_rejected_test() {
+  // A declared query is what knows the shape of the rows; text does not.
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {\n\topened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"./x.db\")\n\tif opened is Result.Ok(db) {\n\t\tresult := using db run \"SELECT 1\"\n\t\techo result\n\t}\n}\n",
+    )
+  should.be_true(string.contains(msg, "run raw"))
 }
 
 pub fn sql_pool_close_and_drivers_lower_test() {
@@ -1454,14 +1488,18 @@ pub fn module_requirements_are_pulled_in_test() {
   should.be_true(list.contains(used, "time"))
 }
 
-pub fn query_interpolation_does_not_pull_in_sql_test() {
-  // Query interpolation lowers to hive.SqlParam, which lives in the core
-  // runtime — a program that never opens a connection must not drag the
-  // external SQL drivers in.
+pub fn declaring_a_query_pulls_in_sql_test() {
+  // A query builds a hive.SqlFragment, which lives in the SQL module — so
+  // declaring one is enough to need it, even without opening a connection.
   let used =
     used_modules(
-      "query find(name: Str): Table {\n\tSELECT * FROM t WHERE n = {name}\n}\nproc main(): void {\n\techo \"built\"\n}\n",
+      "query find(name: Str): Str[dyn] {\n\tSELECT n FROM t WHERE n = {name}\n}\nproc main(): void {\n\techo \"built\"\n}\n",
     )
+  should.be_true(list.contains(used, "sql"))
+}
+
+pub fn a_program_without_sql_does_not_pull_it_in_test() {
+  let used = used_modules("proc main(): void {\n\techo \"built\"\n}\n")
   should.be_false(list.contains(used, "sql"))
 }
 
@@ -1657,7 +1695,7 @@ pub fn a_spreadsheet_yields_a_vector_of_tables_test() {
 pub fn using_run_lowers_to_a_sql_query_test() {
   let go =
     compile(
-      "proc main(): void {\n\topened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"./x.db\")\n\tif opened is Result.Ok(db) {\n\t\tresult := using db run \"SELECT 1\"\n\t\tif result is Result.Ok(rows) {\n\t\t\techo rows\n\t\t}\n\t}\n}\n",
+      "proc main(): void {\n\topened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"./x.db\")\n\tif opened is Result.Ok(db) {\n\t\tresult := using db run raw \"SELECT 1\"\n\t\tif result is Result.Ok(rows) {\n\t\t\techo rows\n\t\t}\n\t}\n}\n",
     )
   should.be_true(string.contains(go, "hive.SqlQuery(db, \"SELECT 1\")"))
 }
@@ -3430,4 +3468,238 @@ pub fn a_mut_argument_to_a_constructor_is_copied_in_test() {
       "type Box {\n\titems: Str[dyn]\n}\nproc main(): void {\n\tmut v := [\"a\"]\n\tb := Box(v)\n\tv[0] = \"b\"\n\techo len(b.items)\n}\n",
     )
   should.be_true(string.contains(go, "Items: hive.CloneVec(v)"))
+}
+
+// ---------------------------------------------------------------------------
+// Generics
+// ---------------------------------------------------------------------------
+
+pub fn a_generic_func_is_monomorphized_per_call_test() {
+  // One copy per distinct set of type arguments, chosen by the argument types.
+  let go =
+    compile(
+      "func first(v: T[], f: T): T {\n\tif len(v) > 0 {\n\t\treturn v[0]\n\t}\n\treturn f\n}\nproc main(): void {\n\tStr[dyn] a = [\"x\"]\n\tInt[dyn] b = [1]\n\techo first(a, \"z\")\n\techo first(b, 0)\n}\n",
+    )
+  should.be_true(string.contains(go, "func first_Str(v []string, f string) string {"))
+  should.be_true(string.contains(go, "func first_Int(v []int, f int) int {"))
+  should.be_true(string.contains(go, "first_Str(a, \"z\")"))
+  should.be_true(string.contains(go, "first_Int(b, 0)"))
+  // The generic original is not emitted.
+  should.be_false(string.contains(go, "func first(v"))
+}
+
+pub fn a_generic_reused_at_one_type_is_emitted_once_test() {
+  let go =
+    compile(
+      "func id(v: T): T {\n\treturn v\n}\nproc main(): void {\n\techo id(\"a\")\n\techo id(\"b\")\n}\n",
+    )
+  should.equal(string.split(go, "func id_Str(") |> list.length, 2)
+}
+
+pub fn generics_take_two_variables_independently_test() {
+  let go =
+    compile(
+      "func pair(a: A, b: B): Str {\n\treturn \"{a}{b}\"\n}\nproc main(): void {\n\techo pair(1, \"x\")\n\techo pair(1, 2)\n}\n",
+    )
+  should.be_true(string.contains(go, "func pair_Int_Str("))
+  should.be_true(string.contains(go, "func pair_Int_Int("))
+}
+
+pub fn a_nested_generic_call_resolves_test() {
+  // `outer(inner(v))` cannot be resolved until `inner`'s instantiation exists,
+  // so the expansion runs to a fixpoint rather than failing on the first pass.
+  let go =
+    compile(
+      "func id(v: T): T {\n\treturn v\n}\nfunc twice(v: T): T {\n\treturn id(id(v))\n}\nproc main(): void {\n\techo twice(\"a\")\n}\n",
+    )
+  should.be_true(string.contains(go, "func twice_Str("))
+  should.be_true(string.contains(go, "func id_Str("))
+}
+
+pub fn an_instantiation_keeps_its_own_length_promise_test() {
+  // At Str[3] the length is a promise, so the index is decided outright.
+  compiler.compile(
+    "func third(v: T[3]): T {\n\treturn v[2]\n}\nproc main(): void {\n\tStr[3] a = [\"x\", \"y\", \"z\"]\n\techo third(a)\n}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn an_instantiation_is_held_to_its_length_promise_test() {
+  // A dynamic vector has no length the compiler can see, so it cannot fill a
+  // slot that promises three.
+  let assert Error(unknown) =
+    compiler.compile(
+      "func third(v: T[3]): T {\n\treturn v[2]\n}\nproc main(): void {\n\tStr[dyn] a = [\"x\"]\n\techo third(a)\n}\n",
+    )
+  should.be_true(string.contains(unknown, "isn't known at compile time"))
+
+  // A literal of the wrong length is counted outright.
+  let assert Error(wrong) =
+    compiler.compile(
+      "func third(v: T[3]): T {\n\treturn v[2]\n}\nproc main(): void {\n\techo third([\"x\", \"y\"])\n}\n",
+    )
+  should.be_true(string.contains(wrong, "exactly 3"))
+}
+
+pub fn a_generic_cannot_be_used_as_a_value_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "func id(v: T): T {\n\treturn v\n}\nproc apply(g: func(Str): Str): Str {\n\treturn g(\"a\")\n}\nproc main(): void {\n\techo apply(id)\n}\n",
+    )
+  should.be_true(string.contains(msg, "cannot be used as a value"))
+}
+
+pub fn a_variable_only_in_the_return_is_rejected_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "func make(n: Int): T {\n\treturn n\n}\nproc main(): void {\n\techo make(1)\n}\n",
+    )
+  should.be_true(string.contains(msg, "no argument pins it down"))
+}
+
+pub fn a_runaway_instantiation_is_a_compile_error_test() {
+  // A generic that instantiates itself at an ever-larger type would never
+  // settle; the cap turns that into a diagnostic rather than a hung build.
+  let assert Error(msg) =
+    compiler.compile(
+      "func grow(v: T[]): Int {\n\tinner := [v]\n\treturn len(grow(inner))\n}\nproc main(): void {\n\tStr[dyn] xs = [\"a\"]\n\techo grow(xs)\n}\n",
+    )
+  should.be_true(
+    string.contains(msg, "did not settle") || string.contains(msg, "more than"),
+  )
+}
+
+pub fn result_is_a_writable_type_test() {
+  // `Result<T, E>` had no surface syntax before type arguments existed.
+  let go =
+    compile(
+      "func first(v: T[]): Result<T, Bool> {\n\tif len(v) > 0 {\n\t\treturn Result.Ok(v[0])\n\t}\n\treturn Result.Error(false)\n}\nproc main(): void {\n\tStr[dyn] a = [\"x\"]\n\tif first(a) is Result.Ok(v) {\n\t\techo v\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.Result[string, bool]"))
+  should.be_true(string.contains(go, "hive.Ok[string, bool]"))
+  should.be_true(string.contains(go, "hive.Err[string, bool]"))
+}
+
+pub fn a_generic_type_is_monomorphized_per_use_test() {
+  let go =
+    compile(
+      "type Box {\n\titems: T[dyn]\n}\nproc main(): void {\n\tBox<Str> a = Box([\"x\"])\n\tBox<Int> b = Box([1])\n\techo len(a.items) + len(b.items)\n}\n",
+    )
+  should.be_true(string.contains(go, "type Box_Str struct {"))
+  should.be_true(string.contains(go, "type Box_Int struct {"))
+  should.be_true(string.contains(go, "Items []string"))
+  should.be_true(string.contains(go, "Items []int"))
+}
+
+pub fn a_generic_union_narrows_through_its_instantiation_test() {
+  let go =
+    compile(
+      "type Either {\n\tLeft { left: A }\n\tRight { right: B }\n}\nproc main(): void {\n\tEither<Str, Int> e = Either.Left(\"a\")\n\tif e is Either.Left(v) {\n\t\techo v\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "Either_Str_IntLeft"))
+}
+
+pub fn a_generic_type_needs_its_arguments_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "type Box {\n\titems: T[dyn]\n}\nproc main(): void {\n\tBox b = Box([\"x\"])\n\techo len(b.items)\n}\n",
+    )
+  should.be_true(string.contains(msg, "needs its type arguments"))
+}
+
+// ---------------------------------------------------------------------------
+// Typed queries
+// ---------------------------------------------------------------------------
+
+pub fn a_void_query_reports_rows_affected_test() {
+  let go =
+    compile(
+      "query wipe(): void {\n\tDELETE FROM t\n}\nproc main(): void {\n\topened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"x.db\")\n\tif opened is Result.Ok(db) {\n\t\tif using db run wipe() is Result.Ok(n) {\n\t\t\techo n\n\t\t}\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.SqlExec(db, wipe())"))
+}
+
+pub fn a_row_query_maps_through_a_generated_mapper_test() {
+  let go =
+    compile(
+      "type U {\n\tid: Int\n\tname: Str\n}\nquery all(): U[dyn] {\n\tSELECT id, name FROM users\n}\nproc main(): void {\n\topened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"x.db\")\n\tif opened is Result.Ok(db) {\n\t\tif using db run all() is Result.Ok(rows) {\n\t\t\techo len(rows)\n\t\t}\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.SqlRows(db, all(), sqlRow_U)"))
+  should.be_true(string.contains(go, "func sqlRow_U(_r []string) (U, error) {"))
+  // Cells are converted to the field's declared type, and a miss is an error.
+  should.be_true(string.contains(go, "hive.SqlCellInt(_r[0], \"id\")"))
+  should.be_true(string.contains(go, "hive.SqlCellStr(_r[1], \"name\")"))
+  should.be_true(string.contains(go, "hive.SqlShapeError(2, len(_r))"))
+}
+
+pub fn a_single_column_query_needs_no_row_type_test() {
+  let go =
+    compile(
+      "query names(): Str[dyn] {\n\tSELECT name FROM users\n}\nproc main(): void {\n\topened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"x.db\")\n\tif opened is Result.Ok(db) {\n\t\tif using db run names() is Result.Ok(ns) {\n\t\t\techo join(ns, \",\")\n\t\t}\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.SqlRows(db, names(),"))
+  should.be_true(string.contains(go, "hive.SqlShapeError(1, len(_r))"))
+}
+
+// ---------------------------------------------------------------------------
+// `SELECT *` against a declared row type
+// ---------------------------------------------------------------------------
+
+fn star_query(ret: String, sql: String) -> Result(String, String) {
+  compiler.compile(
+    "type U {\n\tid: Int\n\tname: Str\n}\nquery q(): "
+    <> ret
+    <> " {\n\t"
+    <> sql
+    <> "\n}\nproc main(): void {}\n",
+  )
+}
+
+pub fn select_star_into_a_row_type_is_rejected_test() {
+  let assert Error(msg) = star_query("U[dyn]", "SELECT * FROM users")
+  should.be_true(string.contains(msg, "does not say how many columns"))
+}
+
+pub fn a_qualified_star_is_rejected_test() {
+  let assert Error(msg) = star_query("U[dyn]", "SELECT u.* FROM users u")
+  should.be_true(string.contains(msg, "`u.*`"))
+}
+
+pub fn distinct_star_is_rejected_test() {
+  let assert Error(msg) = star_query("U[dyn]", "SELECT DISTINCT * FROM users")
+  should.be_true(string.contains(msg, "does not say how many columns"))
+}
+
+pub fn select_star_into_a_scalar_is_rejected_test() {
+  // Case-insensitively, like every other keyword.
+  let assert Error(msg) = star_query("Str[dyn]", "select * from users")
+  should.be_true(string.contains(msg, "does not say how many columns"))
+}
+
+pub fn select_star_into_a_table_is_allowed_test() {
+  // A Table promises nothing about its shape, so there is nothing to break.
+  star_query("Table", "SELECT * FROM users") |> should.be_ok
+}
+
+pub fn select_star_in_a_void_statement_is_allowed_test() {
+  // Its select list is a subquery, not a result.
+  star_query("void", "INSERT INTO a SELECT * FROM b") |> should.be_ok
+}
+
+pub fn count_star_is_not_a_star_test() {
+  star_query("Int[dyn]", "SELECT count(*) FROM users") |> should.be_ok
+}
+
+pub fn a_multiplication_is_not_a_star_test() {
+  star_query("Int[dyn]", "SELECT a * 2 FROM users") |> should.be_ok
+}
+
+pub fn a_star_in_a_subquery_is_not_this_querys_test() {
+  star_query("U[dyn]", "SELECT id, name FROM u WHERE x IN (SELECT * FROM y)")
+  |> should.be_ok
+}
+
+pub fn a_star_inside_a_sql_string_is_not_a_star_test() {
+  star_query("Str[dyn]", "SELECT name FROM users WHERE note = '* nope *'")
+  |> should.be_ok
 }
