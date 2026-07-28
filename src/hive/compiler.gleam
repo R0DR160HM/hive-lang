@@ -24,6 +24,7 @@ import gleam/string
 import hive/ast
 import hive/bounds
 import hive/codegen
+import hive/generics
 import hive/modules
 
 /// Compile the program rooted at `entry` — a path to a `.hive` file — into the
@@ -44,7 +45,12 @@ pub fn compile(source: String) -> Result(String, String) {
 // Everything past import resolution, which works on one flat module and so does
 // not care how many files it came from.
 fn finish(module: ast.Module) -> Result(String, String) {
+  // Generic callables are resolved into concrete ones first, so every pass
+  // after this one sees ordinary declarations and checks each instantiation on
+  // its own terms.
+  use module <- result.try(generics.expand(module))
   use _ <- result.try(check(module))
+  use _ <- result.try(codegen.check_types(module))
   use _ <- result.try(bounds.check(module))
   Ok(codegen.generate(module))
 }
@@ -75,11 +81,15 @@ type Ctx {
     /// passed to a `func`-typed parameter can be checked for purity (a `func`
     /// slot accepts only a func value; a `proc` slot accepts either).
     fn_params: Dict(String, List(ast.Field)),
+    /// Names of the declared `query`s. `using ... run` needs one: a query is
+    /// what knows the shape of what comes back.
+    queries: List(String),
   )
 }
 
 fn check(module: ast.Module) -> Result(Nil, String) {
   use _ <- result.try(check_has_main(module))
+  use _ <- result.try(check_decl_types(module.decls))
   let procs =
     list.fold(module.decls, dict.new(), fn(acc, d) {
       case d {
@@ -114,11 +124,18 @@ fn check(module: ast.Module) -> Result(Nil, String) {
         _ -> acc
       }
     })
+  let queries =
+    list.filter_map(module.decls, fn(d) {
+      case d {
+        ast.QueryDecl(name, _, _, _) -> Ok(name)
+        _ -> Error(Nil)
+      }
+    })
   list.try_fold(module.decls, Nil, fn(_, d) {
     case d {
       ast.ProcDecl(name, _, ret, body) -> {
         use _ <- result.try(check_body(
-          Ctx(name, False, procs, callables, types, False, fn_params),
+          Ctx(name, False, procs, callables, types, False, fn_params, queries),
           body,
         ))
         check_returns(types, name, ret, body)
@@ -128,29 +145,317 @@ fn check(module: ast.Module) -> Result(Nil, String) {
       // are what `in_func` marks.
       ast.FuncDecl(name, _, ret, body, _) -> {
         use _ <- result.try(check_body(
-          Ctx(name, True, procs, callables, types, False, fn_params),
+          Ctx(name, True, procs, callables, types, False, fn_params, queries),
           body,
         ))
         check_returns(types, name, ret, body)
       }
       ast.QueryDecl(name, _, _, sql) ->
-        // A query is a func whose body is inline SQL; its interpolations are
-        // walked with the same func restrictions.
-        list.try_fold(sql, Nil, fn(_, p) {
-          case p {
-            ast.ILit(_) -> Ok(Nil)
-            ast.IExpr(e) ->
-              check_expr(
-                Ctx(name, True, procs, callables, types, False, fn_params),
-                e,
-              )
-          }
+        // A query is a func whose body is inline SQL; every expression in it —
+        // an interpolated value or a `where` predicate's condition — is walked
+        // with the same func restrictions.
+        list.try_fold(ast.sql_exprs(sql), Nil, fn(_, e) {
+          check_expr(
+            Ctx(name, True, procs, callables, types, False, fn_params, queries),
+            e,
+          )
         })
         |> result.map(fn(_) { Nil })
       ast.TypeDecl(..) -> Ok(Nil)
     }
   })
   |> result.map(fn(_) { Nil })
+}
+
+// ---------------------------------------------------------------------------
+// Where an unsized vector type may appear
+// ---------------------------------------------------------------------------
+//
+// `T[]` says only "a vector of T, of some length". That is exactly what a
+// parameter wants — it accepts any vector of the right element type, and the
+// callee guards every access into it, having been promised nothing. It is
+// exactly what a variable, field or return must *not* be: each of those names
+// storage, and storage has to declare which of the two real kinds it is
+// (`T[3]`, whose length is a promise checked everywhere a value can reach it, or
+// `T[dyn]`, which promises nothing and guards its indexes) for the bounds pass
+// to have anything to reason about.
+
+// Every type written in a declaration, checked in the position it appears in.
+fn check_decl_types(decls: List(ast.Decl)) -> Result(Nil, String) {
+  list.try_fold(decls, Nil, fn(_, d) {
+    case d {
+      ast.ProcDecl(name, params, ret, _)
+      | ast.FuncDecl(name, params, ret, _, _) -> {
+        use _ <- result.try(
+          list.try_fold(params, Nil, fn(_, p) {
+            check_param_type(p.typ, "parameter `" <> p.name <> "` of `" <> name <> "`")
+          }),
+        )
+        check_sized(ret, "the return type of `" <> name <> "`")
+      }
+      ast.QueryDecl(name, params, ret, sql) -> {
+        use _ <- result.try(
+          list.try_fold(params, Nil, fn(_, p) {
+            check_param_type(p.typ, "parameter `" <> p.name <> "` of `" <> name <> "`")
+          }),
+        )
+        use _ <- result.try(check_sized(ret, "the return type of `" <> name <> "`"))
+        check_select_star(name, ret, sql)
+      }
+      ast.TypeDecl(name, variants, commons) -> {
+        let fields =
+          list.append(list.flat_map(variants, fn(v) { v.fields }), commons)
+        list.try_fold(fields, Nil, fn(_, f) {
+          check_sized(f.typ, "field `" <> f.name <> "` of type `" <> name <> "`")
+        })
+      }
+    }
+  })
+  |> result.map(fn(_) { Nil })
+}
+
+// A parameter's own type may be unsized. A function *type* in that position
+// carries positions of its own: its parameters are parameter positions too, its
+// return is not.
+fn check_param_type(t: ast.TypeExpr, where: String) -> Result(Nil, String) {
+  case t {
+    ast.TName(_, _, _, _) | ast.TVoid -> Ok(Nil)
+    ast.TFunc(_, params, ret) -> {
+      use _ <- result.try(
+        list.try_fold(params, Nil, fn(_, p) { check_param_type(p, where) }),
+      )
+      check_sized(ret, "the return type in " <> where)
+    }
+  }
+}
+
+// A position that names storage: reject `T[]` anywhere in it.
+fn check_sized(t: ast.TypeExpr, where: String) -> Result(Nil, String) {
+  case t {
+    ast.TVoid -> Ok(Nil)
+    ast.TName(_, _, _, dims) ->
+      case list.contains(dims, ast.DimEmpty) {
+        False -> Ok(Nil)
+        True ->
+          Error(
+            where
+            <> " is declared `"
+            <> ast.show_type(t)
+            <> "`, but `[]` only says \"a vector of some length\" — which is a "
+            <> "promise a parameter can make and storage cannot. Declare it "
+            <> "`[dyn]` (any length, guarded indexes) or give it a static "
+            <> "length like `[3]`.",
+          )
+      }
+    ast.TFunc(_, params, ret) -> {
+      use _ <- result.try(
+        list.try_fold(params, Nil, fn(_, p) { check_param_type(p, where) }),
+      )
+      check_sized(ret, "the return type in " <> where)
+    }
+  }
+}
+
+// `using <connection> run <query>` wants a declared query: the query is what
+// says how many columns come back and what they are called, which is the whole
+// reason its result can be typed. SQL assembled at runtime says none of that, so
+// it goes through `run raw` and comes back as a Table.
+fn check_run_target(ctx: Ctx, kind: ast.UsingKind) -> Result(Nil, String) {
+  case kind {
+    ast.UsingQuery(ast.ECall(ast.EIdent(name), _)) ->
+      case list.contains(ctx.queries, name) {
+        True -> Ok(Nil)
+        False ->
+          Error(
+            "`using ... run "
+            <> name
+            <> "(...)` needs `"
+            <> name
+            <> "` to be a declared `query`. If you are running SQL you built at "
+            <> "runtime, say so with `run raw` — it comes back as a `Table`, "
+            <> "since nothing is known about its shape.",
+          )
+      }
+    ast.UsingQuery(_) ->
+      Error(
+        "`using ... run ...` takes a declared `query`, which is what knows the "
+        <> "shape of the rows. To run SQL text directly, use `run raw <text>` "
+        <> "and take a `Table` back.",
+      )
+    _ -> Ok(Nil)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// `SELECT *` and a declared row type
+// ---------------------------------------------------------------------------
+
+// A star says neither how many columns come back nor what they are called, so
+// there is nothing to match a row type's fields against — and the shape it
+// stands for changes the day someone adds a column to the table. It stays legal
+// for a `Table`, which promises nothing anyway, and for a `void` statement,
+// whose select list (if it has one) is a subquery rather than a result.
+fn check_select_star(
+  name: String,
+  ret: ast.TypeExpr,
+  sql: List(ast.SqlPart),
+) -> Result(Nil, String) {
+  case ret {
+    ast.TVoid -> Ok(Nil)
+    ast.TName(None, "Table", _, _) -> Ok(Nil)
+    _ ->
+      case list.find(select_list(sql_text(sql)), is_star) {
+        Error(_) -> Ok(Nil)
+        Ok(item) ->
+          Error(
+            "`"
+            <> name
+            <> "` selects `"
+            <> item
+            <> "`, which does not say how many columns it returns or what they "
+            <> "are called — so there is nothing to match `"
+            <> ast.show_type(ret)
+            <> "`'s fields against. List the columns, or declare the query as "
+            <> "returning a `Table` and take the rows untyped.",
+          )
+      }
+  }
+}
+
+// The body's literal SQL, with each interpolation standing in as a placeholder.
+// A `where` block only ever follows the select list, so it contributes nothing
+// worth reading here.
+fn sql_text(parts: List(ast.SqlPart)) -> String {
+  parts
+  |> list.map(fn(part) {
+    case part {
+      ast.SqlLit(text) -> text
+      ast.SqlParam(_) -> "?"
+      ast.SqlWhere(_) -> " "
+    }
+  })
+  |> string.concat
+}
+
+// The comma-separated items of the first top-level `SELECT`. Anything inside
+// quotes or parentheses is skipped, so a subquery's star and `count(*)` are
+// both left alone.
+fn select_list(text: String) -> List(String) {
+  case after_select(string.to_graphemes(text), 0, False, " ") {
+    None -> []
+    Some(rest) ->
+      rest
+      |> take_until_from(0, False, "", " ")
+      |> string.to_graphemes
+      |> split_columns(0, False, "", [])
+  }
+}
+
+fn after_select(
+  chars: List(String),
+  depth: Int,
+  quoted: Bool,
+  prev: String,
+) -> Option(List(String)) {
+  case chars {
+    [] -> None
+    ["'", ..rest] -> after_select(rest, depth, !quoted, "'")
+    [c, ..rest] if quoted -> after_select(rest, depth, quoted, c)
+    ["(", ..rest] -> after_select(rest, depth + 1, quoted, "(")
+    [")", ..rest] -> after_select(rest, depth - 1, quoted, ")")
+    [c, ..rest] ->
+      case depth == 0 && !is_word_char(prev) && matches_word(chars, "select") {
+        True -> Some(list.drop(chars, 6))
+        False -> after_select(rest, depth, quoted, c)
+      }
+  }
+}
+
+fn take_until_from(
+  chars: List(String),
+  depth: Int,
+  quoted: Bool,
+  buf: String,
+  prev: String,
+) -> String {
+  case chars {
+    [] -> buf
+    ["'", ..rest] -> take_until_from(rest, depth, !quoted, buf <> "'", "'")
+    [c, ..rest] if quoted -> take_until_from(rest, depth, quoted, buf <> c, c)
+    ["(", ..rest] -> take_until_from(rest, depth + 1, quoted, buf <> "(", "(")
+    [")", ..rest] -> take_until_from(rest, depth - 1, quoted, buf <> ")", ")")
+    [c, ..rest] ->
+      case depth == 0 && !is_word_char(prev) && matches_word(chars, "from") {
+        True -> buf
+        False -> take_until_from(rest, depth, quoted, buf <> c, c)
+      }
+  }
+}
+
+fn split_columns(
+  chars: List(String),
+  depth: Int,
+  quoted: Bool,
+  buf: String,
+  acc: List(String),
+) -> List(String) {
+  case chars {
+    [] -> list.reverse(push_column(buf, acc))
+    ["'", ..rest] -> split_columns(rest, depth, !quoted, buf <> "'", acc)
+    [c, ..rest] if quoted -> split_columns(rest, depth, quoted, buf <> c, acc)
+    ["(", ..rest] -> split_columns(rest, depth + 1, quoted, buf <> "(", acc)
+    [")", ..rest] -> split_columns(rest, depth - 1, quoted, buf <> ")", acc)
+    [",", ..rest] if depth == 0 ->
+      split_columns(rest, depth, quoted, "", push_column(buf, acc))
+    [c, ..rest] -> split_columns(rest, depth, quoted, buf <> c, acc)
+  }
+}
+
+fn push_column(buf: String, acc: List(String)) -> List(String) {
+  case string.trim(buf) {
+    "" -> acc
+    trimmed -> [trimmed, ..acc]
+  }
+}
+
+// A star expansion: a bare `*`, or a qualified `t.*`. `DISTINCT`/`ALL` may sit
+// in front of the first column, and `count(*)` is a call rather than a star.
+fn is_star(column: String) -> Bool {
+  let bare =
+    column
+    |> strip_leading_word("distinct")
+    |> strip_leading_word("all")
+    |> string.trim
+  bare == "*" || string.ends_with(bare, ".*")
+}
+
+fn strip_leading_word(column: String, word: String) -> String {
+  let lower = string.lowercase(string.trim(column))
+  case string.starts_with(lower, word <> " ") {
+    True -> string.drop_start(string.trim(column), string.length(word))
+    False -> column
+  }
+}
+
+fn matches_word(chars: List(String), word: String) -> Bool {
+  let n = string.length(word)
+  let head = chars |> list.take(n) |> string.concat |> string.lowercase
+  case head == word {
+    False -> False
+    True ->
+      case list.drop(chars, n) {
+        [] -> True
+        [c, ..] -> !is_word_char(c)
+      }
+  }
+}
+
+fn is_word_char(c: String) -> Bool {
+  case c {
+    "_" -> True
+    "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" -> True
+    _ -> string.lowercase(c) != string.uppercase(c)
+  }
 }
 
 // A program starts at `proc main(): void`. Only the entrypoint's `main` keeps
@@ -213,7 +518,8 @@ fn check_stmt(
       use _ <- result.try(check_expr(ctx, value))
       Ok(dict.insert(muts, name, mutable))
     }
-    ast.STypedDecl(_, name, value, mutable) -> {
+    ast.STypedDecl(typ, name, value, mutable) -> {
+      use _ <- result.try(check_sized(typ, "`" <> name <> "`"))
       use _ <- result.try(check_expr(ctx, value))
       Ok(dict.insert(muts, name, mutable))
     }
@@ -291,7 +597,11 @@ fn check_stmt(
       )
       Ok(muts)
     }
-    ast.SForEach(name, _, iterable, body) -> {
+    ast.SForEach(name, elem_type, iterable, body) -> {
+      use _ <- result.try(case elem_type {
+        Some(t) -> check_sized(t, "the element type of `" <> name <> "`")
+        None -> Ok(Nil)
+      })
       use _ <- result.try(check_expr(ctx, iterable))
       // The iteration variable is a fresh, immutable binding in the body.
       let inner = dict.insert(muts, name, False)
@@ -487,8 +797,10 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
   case e {
     // `using` (reading a file) is I/O, which funcs may now do too, so there is
     // nothing to reject here — just walk its sub-expressions.
-    ast.EUsing(source, kind) ->
+    ast.EUsing(source, kind) -> {
+      use _ <- result.try(check_run_target(ctx, kind))
       check_exprs(ctx, [source, ..ast.using_exprs(kind)])
+    }
     // `hive.json.parse(text) with Type` — the only place `with` is allowed.
     ast.EWith(value, typ) ->
       case value {
@@ -1158,7 +1470,7 @@ fn check_arity(
 // so there is nothing for a Table field to hold.
 fn check_with_type(ctx: Ctx, t: ast.TypeExpr) -> Result(Nil, String) {
   case t {
-    ast.TName(None, name, _) ->
+    ast.TName(None, name, _, _) ->
       case name {
         "Str" | "String" | "Int" | "Float" | "Bool" | "Atom" | "Table" ->
           Ok(Nil)
@@ -1202,7 +1514,7 @@ fn check_decodable_field(
   visited: List(String),
 ) -> Result(Nil, String) {
   case f.typ {
-    ast.TName(None, name, _) ->
+    ast.TName(None, name, _, _) ->
       case name {
         "Str" | "String" | "Int" | "Float" | "Bool" | "Atom" -> Ok(Nil)
         "Table" ->
@@ -1562,7 +1874,7 @@ fn check_service_handler(ctx: Ctx, handler: ast.Expr) -> Result(Nil, String) {
 // own namespace (e.g. `hive.net.HttpRequest`).
 fn is_hive_type(t: ast.TypeExpr, name: String) -> Bool {
   case t {
-    ast.TName(Some(pkg), n, []) ->
+    ast.TName(Some(pkg), n, _, []) ->
       n == name && pkg == codegen.builtin_qualifier(name)
     _ -> False
   }

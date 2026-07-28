@@ -15,9 +15,9 @@
 ////   * On any vector of unknown length, an index must be guarded so the
 ////     compiler can see it is in range: `if i < len(v) { v[i] }`.
 ////   * A variable index must additionally be proven `>= 0`
-////     (`if i >= 0 && i < len(v) { v[i] }`). Integer literals are always `>= 0`
-////     (the lexer never produces a negative literal), so a literal index only
-////     needs the upper bound.
+////     (`if i >= 0 && i < len(v) { v[i] }`). A *literal* index carries its own
+////     sign, so it only needs the upper bound — a negative one is rejected
+////     outright, since nothing can make it in range.
 ////   * An index that came out of `indexOf` needs no guard at all: an `Ok`
 ////     payload is by construction a position the searched vector has, so
 ////     narrowing the result (`if r is Result.Ok(i)`) proves both bounds for
@@ -110,6 +110,12 @@ type Env {
     /// `r := indexOf(v, x)` records `r -> v` here, so narrowing `r` with
     /// `is Result.Ok(i)` proves `0 <= i < len(v)`.
     searches: Dict(String, String),
+    /// Locals holding a *function value*, and the parameters still open on it —
+    /// all of them for a bare reference (`f := takes`), just the `_` holes for a
+    /// partial application (`g := takes(_, db)`). A call through such a name
+    /// reaches the value, so this is what its arguments are held to; the
+    /// module-level declaration the name shadows says nothing about it.
+    fnvals: Dict(String, List(ast.Field)),
     /// The facts proven to hold at this point.
     facts: List(Fact),
   )
@@ -175,6 +181,7 @@ fn check_body(
       lengths,
       dict.new(),
       dict.new(),
+      dict.new(),
       [],
     )
   check_stmts(env, body) |> result.map(fn(_) { Nil })
@@ -221,14 +228,14 @@ fn check_stmts(env: Env, stmts: List(ast.Stmt)) -> Result(Env, String) {
 
 fn check_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
   case s {
-    ast.SVarDecl(name, value, _) -> {
-      use _ <- result.try(check_expr(env, value))
+    ast.SVarDecl(name, value, mutable) -> {
+      use _ <- result.try(check_binding_value(env, name, value, mutable))
       Ok(record_binding(forget(env, [name]), name, value))
     }
-    ast.STypedDecl(typ, name, value, _) -> {
-      use _ <- result.try(check_expr(env, value))
+    ast.STypedDecl(typ, name, value, mutable) -> {
+      use _ <- result.try(check_binding_value(env, name, value, mutable))
       use _ <- result.try(check_fits(env, typ, value, "`" <> name <> "`"))
-      let env2 = forget(env, [name])
+      let env2 = record_binding(forget(env, [name]), name, value)
       Ok(Env(..env2, lengths: dict.insert(env2.lengths, name, FromType(typ))))
     }
     ast.SAssign(target, value) -> {
@@ -240,10 +247,10 @@ fn check_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
         Some(t) -> check_fits(env, t, value, slot_of(target))
         None -> Ok(Nil)
       })
-      // Reassigning the whole variable changes its length; assigning an
-      // element (`v[i] = x`) does not. A declared type is not up for revision,
-      // and every assignment to it has just been checked against it, so it
-      // outlives the rebinding.
+      // Replacing storage wholesale changes its length; writing *into* existing
+      // storage (`v[i] = x`, `v.f.g = x`) does not. A declared type is not up
+      // for revision, and every assignment to it has just been checked against
+      // it, so it outlives the rebinding.
       case target {
         ast.EIdent(n) -> {
           let declared = case dict.get(env.lengths, n) {
@@ -257,6 +264,16 @@ fn check_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
             None -> env2
           })
         }
+        // `b.items = …` replaces a field's vector exactly as `v = …` replaces a
+        // variable's, so it costs that field the same knowledge — a vector
+        // inside a struct is not a weaker vector. What the field was *declared*
+        // to hold still holds (the assignment was just checked against it); what
+        // was merely proven about the old value does not.
+        ast.EMember(_, _) ->
+          case key(target) {
+            Some(k) -> Ok(forget(env, [k]))
+            None -> Ok(env)
+          }
         _ -> Ok(env)
       }
     }
@@ -391,8 +408,8 @@ fn counter_ge0(
   body: List(ast.Stmt),
 ) -> List(Fact) {
   case init {
-    Some(ast.SVarDecl(name, ast.EInt(_), _))
-    | Some(ast.STypedDecl(_, name, ast.EInt(_), _)) ->
+    Some(ast.SVarDecl(name, ast.EInt(start), _))
+    | Some(ast.STypedDecl(_, name, ast.EInt(start), _)) if start >= 0 ->
       case list.contains(mutated_in(body), name), post_keeps_nonneg(post, name) {
         False, True -> [Ge0(name)]
         _, _ -> []
@@ -404,11 +421,12 @@ fn counter_ge0(
 fn post_keeps_nonneg(post: Option(ast.Stmt), name: String) -> Bool {
   case post {
     None -> True
-    // `i = i + k` / `i = k + i` with a non-negative literal `k`.
+    // `i = i + k` / `i = k + i` with a non-negative literal `k`. A negative
+    // step can walk the counter below zero, so it keeps nothing.
     Some(ast.SAssign(ast.EIdent(n), ast.EBinary(ast.OpAdd, l, r))) if n == name ->
       case l, r {
-        ast.EIdent(m), ast.EInt(_) -> m == name
-        ast.EInt(_), ast.EIdent(m) -> m == name
+        ast.EIdent(m), ast.EInt(k) -> m == name && k >= 0
+        ast.EInt(k), ast.EIdent(m) -> m == name && k >= 0
         _, _ -> False
       }
     // A post step that touches a different variable is fine.
@@ -446,9 +464,20 @@ fn check_expr(env: Env, e: ast.Expr) -> Result(Nil, String) {
     }
     ast.EBinary(_, l, r) -> check_exprs(env, [l, r])
     ast.ECall(callee, args) -> {
-      use _ <- result.try(
-        check_exprs(env, [callee, ..list.map(args, fn(a) { a.value })]),
-      )
+      // A plain name in callee position is a call, not a value; any other
+      // callee shape (a member path, a value another call handed back) is still
+      // an expression to walk.
+      use _ <- result.try(case callee {
+        ast.EIdent(_) -> Ok(Nil)
+        _ -> check_expr(env, callee)
+      })
+      use _ <- result.try(check_exprs(env, list.map(args, fn(a) { a.value })))
+      // A call written with `_` holes is a function *value*, so reaching it here
+      // — anywhere but the right-hand side of a binding — is a hand-off.
+      use _ <- result.try(case has_hole(args) {
+        True -> check_value_escape(env, e)
+        False -> Ok(Nil)
+      })
       check_arg_lengths(env, callee, args)
     }
     ast.EMember(target, _) -> check_expr(env, target)
@@ -470,12 +499,14 @@ fn check_expr(env: Env, e: ast.Expr) -> Result(Nil, String) {
         Some(ms) -> [value, ms]
         None -> [value]
       })
+    // A bare name that reaches here is being read as a value. For a callable
+    // that is a hand-off of whatever its parameters promise.
+    ast.EIdent(_) -> check_value_escape(env, e)
     ast.EInt(_)
     | ast.EFloat(_)
     | ast.EString(_)
     | ast.EBool(_)
-    | ast.EAtom(_)
-    | ast.EIdent(_) -> Ok(Nil)
+    | ast.EAtom(_) -> Ok(Nil)
   }
 }
 
@@ -504,6 +535,168 @@ fn check_lvalue(env: Env, target: ast.Expr) -> Result(Nil, String) {
 }
 
 // ---------------------------------------------------------------------------
+// Function values and the promise they carry
+// ---------------------------------------------------------------------------
+//
+// A statically-sized parameter (`Str[3]`) is a promise made at every call site,
+// which is what lets the callee index it without a guard. A function *value*
+// carries that promise around with it, so the promise has to be kept wherever
+// the value is eventually called.
+//
+// It is kept for a value bound to a name (`f := takes`, `g := takes(_, db)`):
+// the name's open parameters are recorded, and a call through it is held to them
+// exactly as a direct call would be. It cannot be kept once the value is handed
+// to someone else — passed as an argument, returned, stored in a vector or a
+// field — because the call then happens somewhere with no idea what was
+// promised. Rather than let the promise lapse silently (which is an
+// out-of-bounds panic waiting to happen), that hand-off is rejected, and the fix
+// is to declare the parameter `[dyn]` or `[]` so there is no promise to keep.
+
+// The callable a function-value expression refers to, and the parameters still
+// open on it: every parameter for a bare reference, only the `_` holes for a
+// partial application. `None` when the expression is not a function value the
+// analysis can follow.
+fn open_params(env: Env, e: ast.Expr) -> Option(#(String, List(ast.Field))) {
+  case e {
+    // A local shadows the declaration of the same name, so it is consulted first.
+    ast.EIdent(n) ->
+      case dict.get(env.fnvals, n) {
+        Ok(params) -> Some(#(n, params))
+        Error(_) ->
+          case list.contains(env.shadowed, n), dict.get(env.fns, n) {
+            False, Ok(Sig(params, _, _)) -> Some(#(n, params))
+            _, _ -> None
+          }
+      }
+    // `takes(_, db)` — the holes are what is left to supply.
+    ast.ECall(ast.EIdent(f), args) ->
+      case has_hole(args), list.contains(env.shadowed, f), dict.get(env.fns, f) {
+        True, False, Ok(Sig(params, _, _)) -> {
+          let #(assigned, _) =
+            codegen.assign_args(args, list.map(params, fn(p) { p.name }))
+          let holes =
+            list.filter_map(assigned, fn(pair) {
+              let #(pname, value) = pair
+              case value {
+                ast.EIdent("_") ->
+                  list.find(params, fn(p) { p.name == pname })
+                _ -> Error(Nil)
+              }
+            })
+          Some(#(f, holes))
+        }
+        _, _, _ -> None
+      }
+    _ -> None
+  }
+}
+
+fn has_hole(args: List(ast.Arg)) -> Bool {
+  list.any(args, fn(a) { a.value == ast.EIdent("_") })
+}
+
+// The first still-open parameter whose declared length is a promise.
+fn promising_param(params: List(ast.Field)) -> Option(ast.Field) {
+  list.find(params, fn(p) { has_static_dim(p.typ) })
+  |> option.from_result
+}
+
+fn has_static_dim(t: ast.TypeExpr) -> Bool {
+  case t {
+    ast.TName(_, _, _, dims) ->
+      list.any(dims, fn(d) {
+        case d {
+          ast.DimStatic(_) -> True
+          ast.DimEmpty | ast.DimDyn -> False
+        }
+      })
+    // A function type's own parameters are promises its *caller* keeps, not
+    // ones this value carries.
+    ast.TFunc(_, _, _) | ast.TVoid -> False
+  }
+}
+
+// The right-hand side of a binding is the one place a function value carrying a
+// length promise may be read: the name it lands on is followed from here on, so
+// a call through it is still held to the promise. That only works while the name
+// keeps holding the same value, so such a binding may not be `mut` — a
+// reassignment could put a different callable behind the name, and calls already
+// checked against the old one would be checking the wrong signature.
+fn check_binding_value(
+  env: Env,
+  name: String,
+  value: ast.Expr,
+  mutable: Bool,
+) -> Result(Nil, String) {
+  case open_params(env, value) {
+    Some(#(who, params)) ->
+      case promising_param(params), mutable {
+        None, _ -> check_inner(env, value)
+        Some(_), False -> check_inner(env, value)
+        Some(p), True ->
+          Error(
+            "`"
+            <> name
+            <> "` cannot be `mut` and hold `"
+            <> who
+            <> "`: its parameter `"
+            <> p.name
+            <> "` is declared `"
+            <> ast.show_type(p.typ)
+            <> "`, and every call through `"
+            <> name
+            <> "` is held to that length — which only means something while `"
+            <> name
+            <> "` keeps holding this one callable. Drop the `mut`, or declare `"
+            <> p.name
+            <> "` as `[dyn]` (or `[]`, for a parameter).",
+          )
+      }
+    None -> check_expr(env, value)
+  }
+}
+
+// A function-value right-hand side, walked without treating the reference itself
+// as a hand-off: a partial application's supplied arguments still need checking.
+fn check_inner(env: Env, value: ast.Expr) -> Result(Nil, String) {
+  case value {
+    ast.EIdent(_) -> Ok(Nil)
+    ast.ECall(callee, args) -> {
+      use _ <- result.try(check_exprs(env, list.map(args, fn(a) { a.value })))
+      check_arg_lengths(env, callee, args)
+    }
+    _ -> check_expr(env, value)
+  }
+}
+
+// A function value in a position the promise cannot survive.
+fn check_value_escape(env: Env, e: ast.Expr) -> Result(Nil, String) {
+  case open_params(env, e) {
+    None -> Ok(Nil)
+    Some(#(who, params)) ->
+      case promising_param(params) {
+        None -> Ok(Nil)
+        Some(p) ->
+          Error(
+            "`"
+            <> who
+            <> "` cannot be used as a value here: its parameter `"
+            <> p.name
+            <> "` is declared `"
+            <> ast.show_type(p.typ)
+            <> "`, and that length is a promise every call site is held to — "
+            <> "which cannot be done once the value is passed on, since the "
+            <> "call then happens where the promise is not known. Bind it to a "
+            <> "name and call it there, or declare `"
+            <> p.name
+            <> "` as `[dyn]` (or `[]`, for a parameter) so there is no length "
+            <> "to promise.",
+          )
+      }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Declared lengths
 // ---------------------------------------------------------------------------
 
@@ -528,7 +721,7 @@ fn check_fits(
           Error(
             slot
             <> " is declared `"
-            <> show_type(typ)
+            <> ast.show_type(typ)
             <> "`, so it takes a vector of exactly "
             <> int.to_string(n)
             <> " "
@@ -541,7 +734,7 @@ fn check_fits(
           Error(
             slot
             <> " is declared `"
-            <> show_type(typ)
+            <> ast.show_type(typ)
             <> "`, but this value's length isn't known at compile time. Give it "
             <> "a value of the same static length, or declare "
             <> slot
@@ -578,31 +771,92 @@ fn check_arg_lengths(
   args: List(ast.Arg),
 ) -> Result(Nil, String) {
   case callee {
+    // A local holding a function value is called *through that value*, so its
+    // recorded open parameters — not those of the declaration it shadows — are
+    // what the arguments are held to.
     ast.EIdent(f) ->
-      case list.contains(env.shadowed, f), dict.get(env.fns, f) {
-        False, Ok(Sig(params, _, _)) -> {
-          let #(assigned, _) =
-            codegen.assign_args(args, list.map(params, fn(p) { p.name }))
-          list.try_fold(assigned, Nil, fn(_, pair) {
-            let #(pname, value) = pair
-            case list.find(params, fn(p) { p.name == pname }), value {
-              _, ast.EIdent("_") -> Ok(Nil)
-              Ok(p), _ ->
-                check_fits(
-                  env,
-                  p.typ,
-                  value,
-                  "parameter `" <> pname <> "` of `" <> f <> "`",
-                )
-              Error(_), _ -> Ok(Nil)
-            }
-          })
-          |> result.map(fn(_) { Nil })
-        }
-        _, _ -> Ok(Nil)
+      case dict.get(env.fnvals, f) {
+        Ok(open) ->
+          check_slot_lengths(
+            env,
+            args,
+            open,
+            "of the function held by `" <> f <> "`",
+          )
+        Error(_) ->
+          case list.contains(env.shadowed, f), dict.get(env.fns, f) {
+            False, Ok(Sig(params, _, _)) ->
+              check_slot_lengths(env, args, params, "of `" <> f <> "`")
+            // Not a callable: a constructor for a variant-less type, or for the
+            // first variant of a union.
+            False, Error(_) ->
+              case dict.get(env.types, f) {
+                Ok(ast.TypeDecl(_, [first, ..], _)) ->
+                  check_field_lengths(env, args, f, first.name)
+                Ok(ast.TypeDecl(_, [], commons)) ->
+                  check_slot_lengths(env, args, commons, "of `" <> f <> "`")
+                _ -> Ok(Nil)
+              }
+            _, _ -> Ok(Nil)
+          }
+      }
+    // `T.Variant(...)` — a field's declared length is a promise like a
+    // parameter's, and a construction is where it is made, so it is checked
+    // here. Without this, trusting a `Str[3]` field enough to index it
+    // unguarded would rest on nothing.
+    ast.EMember(ast.EIdent(t), variant) ->
+      case dict.get(env.types, t) {
+        Ok(ast.TypeDecl(..)) -> check_field_lengths(env, args, t, variant)
+        _ -> Ok(Nil)
       }
     _ -> Ok(Nil)
   }
+}
+
+// A variant's own fields come first, then the type's common fields — the
+// positional order a constructor takes.
+fn check_field_lengths(
+  env: Env,
+  args: List(ast.Arg),
+  type_name: String,
+  variant: String,
+) -> Result(Nil, String) {
+  case dict.get(env.types, type_name) {
+    Ok(ast.TypeDecl(_, variants, commons)) -> {
+      let fields = case list.find(variants, fn(v) { v.name == variant }) {
+        Ok(v) -> list.append(v.fields, commons)
+        Error(_) -> commons
+      }
+      check_slot_lengths(
+        env,
+        args,
+        fields,
+        "of `" <> type_name <> "." <> variant <> "`",
+      )
+    }
+    _ -> Ok(Nil)
+  }
+}
+
+// Holds each argument to the declared length of the slot it lands in. A `_` hole
+// passes nothing, so it is skipped.
+fn check_slot_lengths(
+  env: Env,
+  args: List(ast.Arg),
+  slots: List(ast.Field),
+  owner: String,
+) -> Result(Nil, String) {
+  let #(assigned, _) =
+    codegen.assign_args(args, list.map(slots, fn(s) { s.name }))
+  list.try_fold(assigned, Nil, fn(_, pair) {
+    let #(sname, value) = pair
+    case list.find(slots, fn(s) { s.name == sname }), value {
+      _, ast.EIdent("_") -> Ok(Nil)
+      Ok(s), _ -> check_fits(env, s.typ, value, "`" <> sname <> "` " <> owner)
+      Error(_), _ -> Ok(Nil)
+    }
+  })
+  |> result.map(fn(_) { Nil })
 }
 
 // How an assignment target is named in the error text.
@@ -622,29 +876,6 @@ fn plural(n: Int, word: String) -> String {
   }
 }
 
-fn show_type(t: ast.TypeExpr) -> String {
-  case t {
-    ast.TVoid -> "void"
-    ast.TFunc(_, _, _) -> "a function"
-    ast.TName(pkg, name, dims) ->
-      case pkg {
-        Some(p) -> p <> "."
-        None -> ""
-      }
-      <> name
-      <> string.concat(list.map(dims, show_dim))
-  }
-}
-
-fn show_dim(d: ast.Dim) -> String {
-  case d {
-    ast.DimEmpty -> "[]"
-    ast.DimStatic(n) -> "[" <> int.to_string(n) <> "]"
-    ast.DimDyn(None) -> "[dyn]"
-    ast.DimDyn(Some(n)) -> "[dyn, " <> int.to_string(n) <> "]"
-  }
-}
-
 // ---------------------------------------------------------------------------
 // The index and slice obligations
 // ---------------------------------------------------------------------------
@@ -653,7 +884,14 @@ fn check_index(env: Env, target: ast.Expr, idx: ast.Expr) -> Result(Nil, String)
   let len = outer_len(env, target)
   let vec = key(target)
   case idx {
-    // A literal index: always `>= 0`, so only the upper bound remains.
+    // A literal index carries its own lower bound: a negative one can never be
+    // in range, whatever the vector, so it is rejected without further ado.
+    ast.EInt(k) if k < 0 ->
+      Error(
+        "index "
+        <> int.to_string(k)
+        <> " is negative, so it is out of range for any vector",
+      )
     ast.EInt(k) ->
       case len {
         Static(n) ->
@@ -763,7 +1001,7 @@ fn has_ge0(env: Env, i: String) -> Bool {
 
 fn has_ge0_expr(env: Env, e: ast.Expr) -> Bool {
   case e {
-    ast.EInt(_) -> True
+    ast.EInt(k) -> k >= 0
     _ ->
       case key(e) {
         Some(k) -> has_ge0(env, k)
@@ -794,7 +1032,7 @@ fn has_lt_len_expr(env: Env, e: ast.Expr, vec: Option(String), len: Len) -> Bool
   case e {
     ast.EInt(k) ->
       case len {
-        Static(n) -> k < n
+        Static(n) -> k >= 0 && k < n
         Dyn -> has_lt_len_lit(env, k, vec)
       }
     _ ->
@@ -814,7 +1052,7 @@ fn has_le_len(env: Env, e: ast.Expr, vec: Option(String), len: Len) -> Bool {
   case e {
     ast.EInt(k) ->
       case len {
-        Static(n) -> k <= n
+        Static(n) -> k >= 0 && k <= n
         Dyn -> has_le_len_lit(env, k, vec)
       }
     _ ->
@@ -845,6 +1083,7 @@ fn has_le_len_fact(env: Env, i: String, vec: Option(String)) -> Bool {
 // `k < m <= len(v)`. So `if 1 < len(v) { ... }` alone proves `v[0]` safe too.
 fn has_lt_len_lit(env: Env, k: Int, vec: Option(String)) -> Bool {
   case vec {
+    _ if k < 0 -> False
     None -> False
     Some(v) ->
       list.any(env.facts, fn(f) {
@@ -864,6 +1103,7 @@ fn has_lt_len_lit(env: Env, k: Int, vec: Option(String)) -> Bool {
 // literal bound `m >= k`, strict or not, implies `k <= len(v)`.
 fn has_le_len_lit(env: Env, k: Int, vec: Option(String)) -> Bool {
   case vec {
+    _ if k < 0 -> False
     None -> False
     Some(v) ->
       list.any(env.facts, fn(f) {
@@ -986,9 +1226,10 @@ fn lt_facts(env: Env, a: ast.Expr, b: ast.Expr) -> List(Fact) {
       }
     _, _ -> []
   }
-  // `k < b` with a non-negative literal `k` proves `b >= 0`.
+  // `k < b` with a non-negative literal `k` proves `b >= 0`. A negative `k`
+  // proves nothing: `-5 < b` leaves `b` free to be negative too.
   let nonneg = case a, key(b) {
-    ast.EInt(_), Some(ib) -> [Ge0(ib)]
+    ast.EInt(k), Some(ib) if k >= 0 -> [Ge0(ib)]
     _, _ -> []
   }
   // Two plain index terms give `a <= b`.
@@ -1018,9 +1259,10 @@ fn le_facts(env: Env, a: ast.Expr, b: ast.Expr) -> List(Fact) {
       }
     _, _ -> []
   }
-  // `k <= b` with a non-negative literal `k` proves `b >= 0`.
+  // `k <= b` with a non-negative literal `k` proves `b >= 0`. A negative `k`
+  // proves nothing.
   let nonneg = case a, key(b) {
-    ast.EInt(_), Some(ib) -> [Ge0(ib)]
+    ast.EInt(k), Some(ib) if k >= 0 -> [Ge0(ib)]
     _, _ -> []
   }
   let ordered = case as_len(env, a), as_len(env, b), key(a), key(b) {
@@ -1106,7 +1348,7 @@ fn type_of(env: Env, expr: ast.Expr) -> Option(ast.TypeExpr) {
       }
     ast.EMember(target, field) ->
       case type_of(env, target) {
-        Some(ast.TName(None, tname, [])) -> field_type(env, tname, field)
+        Some(ast.TName(None, tname, _, [])) -> field_type(env, tname, field)
         _ -> None
       }
     // A call's value is its declared return — except for a bare call to an
@@ -1114,8 +1356,22 @@ fn type_of(env: Env, expr: ast.Expr) -> Option(ast.TypeExpr) {
     ast.ECall(ast.EIdent(f), _) ->
       case dict.get(env.fns, f) {
         Ok(Sig(_, ret, False)) -> Some(ret)
-        _ -> None
+        Ok(Sig(_, _, True)) -> None
+        // Not a callable: a constructor. `Box(...)` makes a `Box`, which is how
+        // the declared lengths of a struct's fields become reachable — a `Str[3]`
+        // field is a promise like any other, and a `[dyn]` one guards its
+        // indexes like any other.
+        Error(_) -> constructed_type(env, f)
       }
+    // `Shape.Circle(...)` — a variant constructor makes a value of the union.
+    ast.ECall(ast.EMember(ast.EIdent(t), _), _) -> constructed_type(env, t)
+    _ -> None
+  }
+}
+
+fn constructed_type(env: Env, name: String) -> Option(ast.TypeExpr) {
+  case dict.get(env.types, name) {
+    Ok(ast.TypeDecl(tname, _, _)) -> Some(ast.TName(None, tname, [], []))
     _ -> None
   }
 }
@@ -1140,10 +1396,10 @@ fn field_type(
 
 fn outer_dim(t: ast.TypeExpr) -> Len {
   case t {
-    ast.TName(_, _, [dim, ..]) ->
+    ast.TName(_, _, _, [dim, ..]) ->
       case dim {
         ast.DimStatic(n) -> Static(n)
-        ast.DimDyn(_) | ast.DimEmpty -> Dyn
+        ast.DimDyn | ast.DimEmpty -> Dyn
       }
     _ -> Dyn
   }
@@ -1151,7 +1407,8 @@ fn outer_dim(t: ast.TypeExpr) -> Len {
 
 fn drop_dim(t: ast.TypeExpr) -> Option(ast.TypeExpr) {
   case t {
-    ast.TName(pkg, name, [_, ..rest]) -> Some(ast.TName(pkg, name, rest))
+    ast.TName(pkg, name, args, [_, ..rest]) ->
+      Some(ast.TName(pkg, name, args, rest))
     _ -> None
   }
 }
@@ -1169,6 +1426,12 @@ fn record_binding(env: Env, name: String, value: ast.Expr) -> Env {
       lengths: dict.delete(env.lengths, name),
       aliases: dict.delete(env.aliases, name),
       searches: dict.delete(env.searches, name),
+      // A function value bound to this name is what a call through it reaches;
+      // anything else bound here means the name no longer holds one.
+      fnvals: case open_params(env, value) {
+        Some(#(_, open)) -> dict.insert(env.fnvals, name, open)
+        None -> dict.delete(env.fnvals, name)
+      },
     )
   case value {
     // A vector literal has a known static length.
@@ -1317,7 +1580,7 @@ fn drop_mentions(
   d
   |> dict.to_list
   |> list.filter(fn(pair) {
-    !list.contains(names, pair.0) && !list.contains(names, pair.1)
+    !key_touched(pair.0, names) && !key_touched(pair.1, names)
   })
   |> dict.from_list
 }
@@ -1325,9 +1588,16 @@ fn drop_mentions(
 fn fact_mentions(f: Fact, names: List(String)) -> Bool {
   case f {
     LtLen(a, b) | LeLen(a, b) | LeVar(a, b) ->
-      list.contains(names, a) || list.contains(names, b)
-    LtConst(a, _) | Ge0(a) -> list.contains(names, a)
+      key_touched(a, names) || key_touched(b, names)
+    LtConst(a, _) | Ge0(a) -> key_touched(a, names)
   }
+}
+
+// Whether forgetting `names` reaches the normalized key `k`. A name reaches its
+// own key and every member path rooted at it: rebinding `b` can put a different
+// vector behind `b.items`, so anything proven about `b.items` goes with it.
+fn key_touched(k: String, names: List(String)) -> Bool {
+  list.any(names, fn(n) { k == n || string.starts_with(k, n <> ".") })
 }
 
 // The root variables reassigned (`x = ...`, `v[i] = ...`) or grown

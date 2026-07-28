@@ -25,7 +25,7 @@ const example = "proc main(): void {
 
 type ParsingResult {
 \tSuccess {
-\t\theaderlessTable: String[][]
+\t\theaderlessTable: String[dyn][dyn]
 \t}
 \tNoData
 \tError {
@@ -291,7 +291,7 @@ pub fn multiline_string_is_dedented_test() {
 pub fn vector_types_and_literals_test() {
   let go =
     compile(
-      "func f(): Str[3] {\n\tStr[2] a = [\"x\", \"y\"]\n\tStr[dyn] b = [\"x\"]\n\tStr[dyn, 2] c = [\"x\", \"y\"]\n\treturn a + [\"z\"]\n}\nproc main(): void {}\n",
+      "func f(): Str[3] {\n\tStr[2] a = [\"x\", \"y\"]\n\tStr[dyn] b = [\"x\"]\n\tStr[2] c = [\"x\", \"y\"]\n\treturn a + [\"z\"]\n}\nproc main(): void {}\n",
     )
   // Every vector flavor becomes a Go slice; `+` concatenates via the runtime.
   should.be_true(string.contains(go, "func f() []string {"))
@@ -401,16 +401,41 @@ pub fn is_binding_usable_in_same_condition_test() {
   should.be_true(string.contains(go, "T(TA{V: \"ok\"})"))
 }
 
-pub fn query_sanitizes_interpolations_test() {
+pub fn query_binds_interpolations_as_placeholders_test() {
+  // An interpolated value never enters the SQL text: it becomes a placeholder
+  // and the value is bound alongside, so nothing a caller supplies can change
+  // what the statement means.
   let go =
     compile(
-      "query q(name: Str): Str {\n\tSELECT * FROM users u\n\tWHERE u.name = {name}\n}\nproc main(): void {}\n",
+      "type U {\n\tname: Str\n}\nquery q(name: Str): U[dyn] {\n\tSELECT name FROM users u\n\tWHERE u.name = {name}\n}\nproc main(): void {}\n",
     )
-  should.be_true(string.contains(go, "func q(name string) string {"))
-  should.be_true(string.contains(
-    go,
-    "return \"SELECT * FROM users u\\nWHERE u.name = \" + hive.SqlParam(name)",
-  ))
+  should.be_true(string.contains(go, "func q(name string) hive.SqlFragment {"))
+  should.be_true(string.contains(go, "_sql += \"?\""))
+  should.be_true(string.contains(go, "_args = append(_args, name)"))
+  // The value is never spliced into the text.
+  should.be_false(string.contains(go, "hive.SqlParam(name)"))
+}
+
+pub fn a_where_block_builds_its_clause_test() {
+  // Present predicates are ANDed; a nested group is ORed and parenthesised;
+  // nothing present means no WHERE clause at all.
+  let go =
+    compile(
+      "type U {\n\tname: Str\n}\nquery q(a: Str, b: Int, c: Bool): U[dyn] {\n\tSELECT name FROM users\n\twhere {\n\t\tif a != \"\" { name = {a} }\n\t\tor {\n\t\t\tif b > 0 { n >= {b} }\n\t\t\tif c { flag = 1 }\n\t\t}\n\t}\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "hive.SqlJoin(_p3, \" OR \", true)"))
+  should.be_true(string.contains(go, "hive.SqlJoin(_p1, \" AND \", false)"))
+  should.be_true(string.contains(go, "_sql += \" WHERE \" + _w0.Text"))
+}
+
+pub fn where_in_plain_sql_is_still_literal_test() {
+  // A `where` block only opens when a `{` follows it, so ordinary SQL is safe.
+  let go =
+    compile(
+      "type U {\n\tname: Str\n}\nquery q(n: Str): U[dyn] {\n\tSELECT name FROM users WHERE name = {n}\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "WHERE name = "))
+  should.be_false(string.contains(go, "hive.SqlJoin"))
 }
 
 pub fn func_can_echo_test() {
@@ -1187,14 +1212,23 @@ pub fn unknown_crypto_builtin_is_rejected_test() {
 pub fn sql_connect_and_query_lower_test() {
   let go =
     compile(
-      "proc main(): void {\n\topened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"./x.db\")\n\tif opened is Result.Ok(db) {\n\t\tresult := using db run \"SELECT 1\"\n\t\tif result is Result.Ok(rows) {\n\t\t\techo rows\n\t\t}\n\t}\n}\n",
+      "proc main(): void {\n\topened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"./x.db\")\n\tif opened is Result.Ok(db) {\n\t\tresult := using db run raw \"SELECT 1\"\n\t\tif result is Result.Ok(rows) {\n\t\t\techo rows\n\t\t}\n\t}\n}\n",
     )
   should.be_true(string.contains(
     go,
     "hive.SqlConnect(hive.DatabaseDriver{Name: \"sqlite\"}, \"./x.db\")",
   ))
-  // `using <connection> run <query>` lowers to a SQL query, not a CSV read.
+  // `run raw` keeps the untyped path: a Table, not a CSV read.
   should.be_true(string.contains(go, "hive.SqlQuery(db, \"SELECT 1\")"))
+}
+
+pub fn running_bare_sql_text_without_raw_is_rejected_test() {
+  // A declared query is what knows the shape of the rows; text does not.
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {\n\topened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"./x.db\")\n\tif opened is Result.Ok(db) {\n\t\tresult := using db run \"SELECT 1\"\n\t\techo result\n\t}\n}\n",
+    )
+  should.be_true(string.contains(msg, "run raw"))
 }
 
 pub fn sql_pool_close_and_drivers_lower_test() {
@@ -1454,14 +1488,18 @@ pub fn module_requirements_are_pulled_in_test() {
   should.be_true(list.contains(used, "time"))
 }
 
-pub fn query_interpolation_does_not_pull_in_sql_test() {
-  // Query interpolation lowers to hive.SqlParam, which lives in the core
-  // runtime — a program that never opens a connection must not drag the
-  // external SQL drivers in.
+pub fn declaring_a_query_pulls_in_sql_test() {
+  // A query builds a hive.SqlFragment, which lives in the SQL module — so
+  // declaring one is enough to need it, even without opening a connection.
   let used =
     used_modules(
-      "query find(name: Str): Table {\n\tSELECT * FROM t WHERE n = {name}\n}\nproc main(): void {\n\techo \"built\"\n}\n",
+      "query find(name: Str): Str[dyn] {\n\tSELECT n FROM t WHERE n = {name}\n}\nproc main(): void {\n\techo \"built\"\n}\n",
     )
+  should.be_true(list.contains(used, "sql"))
+}
+
+pub fn a_program_without_sql_does_not_pull_it_in_test() {
+  let used = used_modules("proc main(): void {\n\techo \"built\"\n}\n")
   should.be_false(list.contains(used, "sql"))
 }
 
@@ -1657,7 +1695,7 @@ pub fn a_spreadsheet_yields_a_vector_of_tables_test() {
 pub fn using_run_lowers_to_a_sql_query_test() {
   let go =
     compile(
-      "proc main(): void {\n\topened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"./x.db\")\n\tif opened is Result.Ok(db) {\n\t\tresult := using db run \"SELECT 1\"\n\t\tif result is Result.Ok(rows) {\n\t\t\techo rows\n\t\t}\n\t}\n}\n",
+      "proc main(): void {\n\topened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"./x.db\")\n\tif opened is Result.Ok(db) {\n\t\tresult := using db run raw \"SELECT 1\"\n\t\tif result is Result.Ok(rows) {\n\t\t\techo rows\n\t\t}\n\t}\n}\n",
     )
   should.be_true(string.contains(go, "hive.SqlQuery(db, \"SELECT 1\")"))
 }
@@ -2429,7 +2467,7 @@ pub fn dynamic_declarations_promise_nothing_test() {
   // `[dyn]` says the length varies, so any vector fits — and indexing it still
   // needs a guard.
   compiler.compile(
-    "proc main(): void {\n\tStr[dyn] v = [\"a\"]\n\tStr[dyn, 2] w = [\"a\", \"b\", \"c\"]\n\techo len(v) + len(w)\n}\n",
+    "proc main(): void {\n\tStr[dyn] v = [\"a\"]\n\tStr[dyn] w = [\"a\", \"b\", \"c\"]\n\techo len(v) + len(w)\n}\n",
   )
   |> should.be_ok
 }
@@ -2738,13 +2776,28 @@ pub fn immutable_vector_binding_is_cloned_test() {
 }
 
 pub fn both_mutable_vector_binding_is_shared_test() {
-  // Two mutable bindings are allowed to alias (shared mutable state).
+  // Two mutable bindings share storage (shared mutable state is the intent).
+  // They share it by *name*: `ys` gets no slice header of its own, so every read
+  // and write through it goes to `xs`. Two headers would only stay in step until
+  // an `append` reallocated one of them.
   let go =
     compile(
       "proc main(): void {\n\tmut xs := [1, 2, 3]\n\tmut ys := xs\n\txs[0] = 9\n\techo ys[0]\n}\n",
     )
-  should.be_true(string.contains(go, "ys := xs"))
+  should.be_false(string.contains(go, "ys"))
+  should.be_true(string.contains(go, "fmt.Println(xs[0])"))
   should.be_false(string.contains(go, "Clone"))
+}
+
+pub fn append_does_not_sever_a_shared_binding_test() {
+  // `append` on either name has to be seen through the other: it lowers to a
+  // reassignment of the one shared header, not of a private copy.
+  let go =
+    compile(
+      "proc main(): void {\n\tmut xs := [1, 2, 3]\n\tmut ys := xs\n\tappend(ys, 4)\n\txs[0] = 9\n\techo ys[0]\n\techo len(xs)\n}\n",
+    )
+  should.be_true(string.contains(go, "xs = append(xs, 4)"))
+  should.be_false(string.contains(go, "ys"))
 }
 
 pub fn fresh_vector_binding_is_not_cloned_test() {
@@ -3125,4 +3178,528 @@ fn list_length(items: List(a)) -> Int {
     [] -> 0
     [_, ..rest] -> 1 + list_length(rest)
   }
+}
+
+// ---------------------------------------------------------------------------
+// A `Str` has no subscript
+// ---------------------------------------------------------------------------
+
+pub fn indexing_a_str_is_rejected_test() {
+  // Go would index the bytes, while `len` counts characters — so the guard and
+  // the access would be in different units, and a byte out of the middle of a
+  // character is not text.
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {\n\ts := \"caf\"\n\tn := len(s)\n\tif 0 < n {\n\t\techo s[0]\n\t}\n}\n",
+    )
+  should.be_true(string.contains(msg, "cannot be indexed"))
+}
+
+pub fn slicing_a_str_is_rejected_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {\n\ts := \"cafe\"\n\tn := len(s)\n\tif 2 < n {\n\t\techo s[0:2]\n\t}\n}\n",
+    )
+  should.be_true(string.contains(msg, "cannot be sliced"))
+}
+
+pub fn indexing_a_vector_is_still_fine_test() {
+  let go =
+    compile("proc main(): void {\n\tv := [\"a\", \"b\"]\n\techo v[1]\n}\n")
+  should.be_true(string.contains(go, "v[1]"))
+}
+
+// ---------------------------------------------------------------------------
+// Negative literals
+// ---------------------------------------------------------------------------
+
+pub fn negative_literals_parse_test() {
+  // `-` binds tighter than `* / %` and looser than `**`.
+  let go =
+    compile(
+      "proc main(): void {\n\techo 2 ** -3\n\techo -7 % 3\n\techo -2 ** 2\n\tx := -5\n\techo x\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.PowInt(2, -3)"))
+  should.be_true(string.contains(go, "hive.ModInt(-7, 3)"))
+  // -2 ** 2 is -(2 ** 2), so the negation wraps the power.
+  should.be_true(string.contains(go, "(0 - hive.PowInt(2, 2))"))
+  should.be_true(string.contains(go, "x := -5"))
+}
+
+pub fn a_negative_literal_index_is_rejected_test() {
+  // Nothing can bring it into range, so it needs no guard to be refused.
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {\n\tv := [\"a\", \"b\"]\n\techo v[-1]\n}\n",
+    )
+  should.be_true(string.contains(msg, "negative"))
+}
+
+pub fn a_negative_loop_counter_is_not_assumed_nonneg_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {\n\tStr[dyn] v = [\"a\"]\n\tfor i := -3; i < len(v); i = i + 1 {\n\t\techo v[i]\n\t}\n}\n",
+    )
+  should.be_true(string.contains(msg, ">= 0"))
+}
+
+// ---------------------------------------------------------------------------
+// `T[]` is a parameter-only spelling
+// ---------------------------------------------------------------------------
+
+pub fn unsized_vector_is_accepted_as_a_parameter_test() {
+  // It promises nothing, so it takes a static vector and a dynamic one alike.
+  let go =
+    compile(
+      "func first(v: Str[]): Str {\n\tif len(v) > 0 {\n\t\treturn v[0]\n\t}\n\treturn \"\"\n}\nproc main(): void {\n\tStr[2] a = [\"a\", \"b\"]\n\tStr[dyn] b = [\"c\"]\n\techo first(a)\n\techo first(b)\n}\n",
+    )
+  should.be_true(string.contains(go, "func first(v []string) string {"))
+}
+
+pub fn unsized_vector_is_rejected_as_a_variable_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {\n\tStr[] v = [\"a\"]\n\techo len(v)\n}\n",
+    )
+  should.be_true(string.contains(msg, "`[]` only says"))
+}
+
+pub fn unsized_vector_is_rejected_as_a_return_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "func f(): Str[] {\n\treturn [\"a\"]\n}\nproc main(): void {\n\techo len(f())\n}\n",
+    )
+  should.be_true(string.contains(msg, "`[]` only says"))
+}
+
+pub fn unsized_vector_is_rejected_as_a_field_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "type Box {\n\titems: Str[]\n}\nproc main(): void {\n\tb := Box([\"a\"])\n\techo len(b.items)\n}\n",
+    )
+  should.be_true(string.contains(msg, "`[]` only says"))
+}
+
+// ---------------------------------------------------------------------------
+// A vector inside a struct is a vector like any other
+// ---------------------------------------------------------------------------
+
+pub fn replacing_a_field_drops_what_was_proven_about_it_test() {
+  // The guard proved a length for the *old* vector; assigning a new one to the
+  // field says nothing about it, exactly as rebinding a variable would.
+  let assert Error(msg) =
+    compiler.compile(
+      "type Box {\n\titems: Str[dyn]\n}\nproc main(): void {\n\tmut b := Box([\"a\", \"b\", \"c\"])\n\ti := 2\n\tif i >= 0 && i < len(b.items) {\n\t\tb.items = [\"one\"]\n\t\techo b.items[i]\n\t}\n}\n",
+    )
+  should.be_true(string.contains(msg, "cannot prove"))
+}
+
+pub fn replacing_a_field_drops_an_index_of_proof_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "type Box {\n\titems: Str[dyn]\n}\nproc main(): void {\n\tmut b := Box([\"a\", \"b\", \"c\"])\n\tr := indexOf(b.items, \"c\")\n\tif r is Result.Ok(i) {\n\t\tb.items = [\"one\"]\n\t\techo b.items[i]\n\t}\n}\n",
+    )
+  should.be_true(string.contains(msg, "cannot prove"))
+}
+
+pub fn a_guarded_field_index_is_still_accepted_test() {
+  compiler.compile(
+    "type Box {\n\titems: Str[dyn]\n}\nproc main(): void {\n\tb := Box([\"a\", \"b\", \"c\"])\n\ti := 2\n\tif i >= 0 && i < len(b.items) {\n\t\techo b.items[i]\n\t}\n}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn a_static_field_length_is_enforced_at_construction_test() {
+  // A `Str[3]` field can be indexed unguarded, so every construction has to be
+  // held to it — otherwise the trust rests on nothing.
+  let assert Error(msg) =
+    compiler.compile(
+      "type Trio {\n\tthree: Str[3]\n}\nproc main(): void {\n\tt := Trio([\"x\", \"y\"])\n\techo t.three[2]\n}\n",
+    )
+  should.be_true(string.contains(msg, "exactly 3"))
+}
+
+pub fn a_static_field_can_be_indexed_unguarded_test() {
+  compiler.compile(
+    "type Trio {\n\tthree: Str[3]\n}\nproc main(): void {\n\tt := Trio([\"x\", \"y\", \"z\"])\n\techo t.three[2]\n}\n",
+  )
+  |> should.be_ok
+}
+
+// ---------------------------------------------------------------------------
+// A length promise survives being held as a function value
+// ---------------------------------------------------------------------------
+
+pub fn a_call_through_a_bound_reference_is_held_to_its_lengths_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "proc takes(v: Str[3]): void {\n\techo v[2]\n}\nproc main(): void {\n\tf := takes\n\tf([\"a\"])\n}\n",
+    )
+  should.be_true(string.contains(msg, "exactly 3"))
+}
+
+pub fn a_correct_call_through_a_bound_reference_is_accepted_test() {
+  compiler.compile(
+    "proc takes(v: Str[3]): void {\n\techo v[2]\n}\nproc main(): void {\n\tf := takes\n\tf([\"a\", \"b\", \"c\"])\n}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn a_call_through_a_partial_application_is_held_to_its_lengths_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "proc takes(v: Str[3], tag: Str): void {\n\techo tag\n\techo v[2]\n}\nproc main(): void {\n\tg := takes(_, \"t\")\n\tg([\"a\"])\n}\n",
+    )
+  should.be_true(string.contains(msg, "exactly 3"))
+}
+
+pub fn handing_on_a_static_length_taker_is_rejected_test() {
+  // The eventual call would happen where the promise is not known.
+  let assert Error(msg) =
+    compiler.compile(
+      "proc takes(v: Str[3]): void {\n\techo v[2]\n}\nproc apply(g: proc(Str[dyn]): void, arg: Str[dyn]): void {\n\tg(arg)\n}\nproc main(): void {\n\tmut Str[dyn] one = [\"a\"]\n\tapply(takes, one)\n}\n",
+    )
+  should.be_true(string.contains(msg, "cannot be used as a value here"))
+}
+
+pub fn a_mut_holder_of_a_static_length_taker_is_rejected_test() {
+  // A reassignment could point the name at a different callable, leaving calls
+  // already checked against the old one checking the wrong signature.
+  let assert Error(msg) =
+    compiler.compile(
+      "proc takes(v: Str[3]): void {\n\techo v[2]\n}\nproc main(): void {\n\tmut f := takes\n\tf([\"a\", \"b\", \"c\"])\n}\n",
+    )
+  should.be_true(string.contains(msg, "cannot be `mut`"))
+}
+
+pub fn passing_a_dyn_taker_as_a_value_is_unaffected_test() {
+  // Nothing was promised, so the value travels freely.
+  compiler.compile(
+    "proc takes(v: Str[dyn]): void {\n\techo len(v)\n}\nproc apply(g: proc(Str[dyn]): void, arg: Str[dyn]): void {\n\tg(arg)\n}\nproc main(): void {\n\tStr[dyn] one = [\"a\"]\n\tapply(takes, one)\n}\n",
+  )
+  |> should.be_ok
+}
+
+// ---------------------------------------------------------------------------
+// An `is` subject runs exactly once, wherever it sits in the condition
+// ---------------------------------------------------------------------------
+
+pub fn a_non_leftmost_subject_runs_once_test() {
+  // The subject is read to test it and again for every value it binds. Only the
+  // leftmost test can use Go's single `if` init slot, so a later one gets a
+  // nested `if` of its own rather than being emitted twice.
+  let go =
+    compile(
+      "proc main(): void {\n\tok := true\n\tif ok && hive.file.append(\"p\", \"X\") is Result.Ok(n) {\n\t\techo n\n\t}\n}\n",
+    )
+  should.equal(
+    string.split(go, "hive.FileAppend(\"p\", \"X\")") |> list.length,
+    2,
+  )
+}
+
+pub fn a_non_leftmost_subject_keeps_its_else_test() {
+  // A nested chain falls out of the middle, so the `else` hangs off a flag.
+  let go =
+    compile(
+      "proc main(): void {\n\tok := true\n\tif ok && hive.file.append(\"p\", \"X\") is Result.Ok(n) {\n\t\techo n\n\t} else {\n\t\techo \"no\"\n\t}\n}\n",
+    )
+  should.equal(
+    string.split(go, "hive.FileAppend(\"p\", \"X\")") |> list.length,
+    2,
+  )
+  should.be_true(string.contains(go, "fmt.Println(\"no\")"))
+}
+
+pub fn two_non_leftmost_subjects_each_run_once_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tok := true\n\tif ok && hive.file.append(\"a\", \"X\") is Result.Ok(n) && hive.file.append(\"b\", \"Y\") is Result.Ok(m) {\n\t\techo n + m\n\t}\n}\n",
+    )
+  should.equal(string.split(go, "hive.FileAppend(\"a\"") |> list.length, 2)
+  should.equal(string.split(go, "hive.FileAppend(\"b\"") |> list.length, 2)
+}
+
+pub fn a_leftmost_subject_still_uses_the_init_slot_test() {
+  // The flat form is kept wherever it suffices.
+  let go =
+    compile(
+      "proc main(): void {\n\tif hive.file.append(\"p\", \"X\") is Result.Ok(n) && n > 0 {\n\t\techo n\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "if _u1_0 := hive.FileAppend"))
+}
+
+// ---------------------------------------------------------------------------
+// A mutex is copied into a callee
+// ---------------------------------------------------------------------------
+
+pub fn a_mut_argument_is_copied_in_test() {
+  // The callee is handed an immutable `T`, which it would not be if the caller
+  // could still write through the same backing array.
+  let go =
+    compile(
+      "proc show(v: Str[dyn]): void {\n\techo len(v)\n}\nproc main(): void {\n\tmut v := [\"a\"]\n\tshow(v)\n\tv[0] = \"b\"\n}\n",
+    )
+  should.be_true(string.contains(go, "show(hive.CloneVec(v))"))
+}
+
+pub fn an_immutable_argument_is_not_copied_test() {
+  let go =
+    compile(
+      "proc show(v: Str[dyn]): void {\n\techo len(v)\n}\nproc main(): void {\n\tv := [\"a\"]\n\tshow(v)\n}\n",
+    )
+  should.be_false(string.contains(go, "Clone"))
+}
+
+pub fn a_spawned_task_copies_before_it_starts_test() {
+  // A copy made on the new goroutine would race with the caller it exists to
+  // protect against, so the arguments are bound in the caller first.
+  let go =
+    compile(
+      "async func work(v: Str[dyn]): Int {\n\treturn len(v)\n}\nproc main(): void {\n\tmut v := [\"a\"]\n\th := work(v)\n\tv[0] = \"b\"\n\techo await h\n}\n",
+    )
+  should.be_true(string.contains(go, "_a0 := hive.CloneVec(v); return hive.Spawn("))
+}
+
+pub fn a_mut_argument_to_a_constructor_is_copied_in_test() {
+  // A constructed value keeps the vector for as long as it lives.
+  let go =
+    compile(
+      "type Box {\n\titems: Str[dyn]\n}\nproc main(): void {\n\tmut v := [\"a\"]\n\tb := Box(v)\n\tv[0] = \"b\"\n\techo len(b.items)\n}\n",
+    )
+  should.be_true(string.contains(go, "Items: hive.CloneVec(v)"))
+}
+
+// ---------------------------------------------------------------------------
+// Generics
+// ---------------------------------------------------------------------------
+
+pub fn a_generic_func_is_monomorphized_per_call_test() {
+  // One copy per distinct set of type arguments, chosen by the argument types.
+  let go =
+    compile(
+      "func first(v: T[], f: T): T {\n\tif len(v) > 0 {\n\t\treturn v[0]\n\t}\n\treturn f\n}\nproc main(): void {\n\tStr[dyn] a = [\"x\"]\n\tInt[dyn] b = [1]\n\techo first(a, \"z\")\n\techo first(b, 0)\n}\n",
+    )
+  should.be_true(string.contains(go, "func first_Str(v []string, f string) string {"))
+  should.be_true(string.contains(go, "func first_Int(v []int, f int) int {"))
+  should.be_true(string.contains(go, "first_Str(a, \"z\")"))
+  should.be_true(string.contains(go, "first_Int(b, 0)"))
+  // The generic original is not emitted.
+  should.be_false(string.contains(go, "func first(v"))
+}
+
+pub fn a_generic_reused_at_one_type_is_emitted_once_test() {
+  let go =
+    compile(
+      "func id(v: T): T {\n\treturn v\n}\nproc main(): void {\n\techo id(\"a\")\n\techo id(\"b\")\n}\n",
+    )
+  should.equal(string.split(go, "func id_Str(") |> list.length, 2)
+}
+
+pub fn generics_take_two_variables_independently_test() {
+  let go =
+    compile(
+      "func pair(a: A, b: B): Str {\n\treturn \"{a}{b}\"\n}\nproc main(): void {\n\techo pair(1, \"x\")\n\techo pair(1, 2)\n}\n",
+    )
+  should.be_true(string.contains(go, "func pair_Int_Str("))
+  should.be_true(string.contains(go, "func pair_Int_Int("))
+}
+
+pub fn a_nested_generic_call_resolves_test() {
+  // `outer(inner(v))` cannot be resolved until `inner`'s instantiation exists,
+  // so the expansion runs to a fixpoint rather than failing on the first pass.
+  let go =
+    compile(
+      "func id(v: T): T {\n\treturn v\n}\nfunc twice(v: T): T {\n\treturn id(id(v))\n}\nproc main(): void {\n\techo twice(\"a\")\n}\n",
+    )
+  should.be_true(string.contains(go, "func twice_Str("))
+  should.be_true(string.contains(go, "func id_Str("))
+}
+
+pub fn an_instantiation_keeps_its_own_length_promise_test() {
+  // At Str[3] the length is a promise, so the index is decided outright.
+  compiler.compile(
+    "func third(v: T[3]): T {\n\treturn v[2]\n}\nproc main(): void {\n\tStr[3] a = [\"x\", \"y\", \"z\"]\n\techo third(a)\n}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn an_instantiation_is_held_to_its_length_promise_test() {
+  // A dynamic vector has no length the compiler can see, so it cannot fill a
+  // slot that promises three.
+  let assert Error(unknown) =
+    compiler.compile(
+      "func third(v: T[3]): T {\n\treturn v[2]\n}\nproc main(): void {\n\tStr[dyn] a = [\"x\"]\n\techo third(a)\n}\n",
+    )
+  should.be_true(string.contains(unknown, "isn't known at compile time"))
+
+  // A literal of the wrong length is counted outright.
+  let assert Error(wrong) =
+    compiler.compile(
+      "func third(v: T[3]): T {\n\treturn v[2]\n}\nproc main(): void {\n\techo third([\"x\", \"y\"])\n}\n",
+    )
+  should.be_true(string.contains(wrong, "exactly 3"))
+}
+
+pub fn a_generic_cannot_be_used_as_a_value_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "func id(v: T): T {\n\treturn v\n}\nproc apply(g: func(Str): Str): Str {\n\treturn g(\"a\")\n}\nproc main(): void {\n\techo apply(id)\n}\n",
+    )
+  should.be_true(string.contains(msg, "cannot be used as a value"))
+}
+
+pub fn a_variable_only_in_the_return_is_rejected_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "func make(n: Int): T {\n\treturn n\n}\nproc main(): void {\n\techo make(1)\n}\n",
+    )
+  should.be_true(string.contains(msg, "no argument pins it down"))
+}
+
+pub fn a_runaway_instantiation_is_a_compile_error_test() {
+  // A generic that instantiates itself at an ever-larger type would never
+  // settle; the cap turns that into a diagnostic rather than a hung build.
+  let assert Error(msg) =
+    compiler.compile(
+      "func grow(v: T[]): Int {\n\tinner := [v]\n\treturn len(grow(inner))\n}\nproc main(): void {\n\tStr[dyn] xs = [\"a\"]\n\techo grow(xs)\n}\n",
+    )
+  should.be_true(
+    string.contains(msg, "did not settle") || string.contains(msg, "more than"),
+  )
+}
+
+pub fn result_is_a_writable_type_test() {
+  // `Result<T, E>` had no surface syntax before type arguments existed.
+  let go =
+    compile(
+      "func first(v: T[]): Result<T, Bool> {\n\tif len(v) > 0 {\n\t\treturn Result.Ok(v[0])\n\t}\n\treturn Result.Error(false)\n}\nproc main(): void {\n\tStr[dyn] a = [\"x\"]\n\tif first(a) is Result.Ok(v) {\n\t\techo v\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.Result[string, bool]"))
+  should.be_true(string.contains(go, "hive.Ok[string, bool]"))
+  should.be_true(string.contains(go, "hive.Err[string, bool]"))
+}
+
+pub fn a_generic_type_is_monomorphized_per_use_test() {
+  let go =
+    compile(
+      "type Box {\n\titems: T[dyn]\n}\nproc main(): void {\n\tBox<Str> a = Box([\"x\"])\n\tBox<Int> b = Box([1])\n\techo len(a.items) + len(b.items)\n}\n",
+    )
+  should.be_true(string.contains(go, "type Box_Str struct {"))
+  should.be_true(string.contains(go, "type Box_Int struct {"))
+  should.be_true(string.contains(go, "Items []string"))
+  should.be_true(string.contains(go, "Items []int"))
+}
+
+pub fn a_generic_union_narrows_through_its_instantiation_test() {
+  let go =
+    compile(
+      "type Either {\n\tLeft { left: A }\n\tRight { right: B }\n}\nproc main(): void {\n\tEither<Str, Int> e = Either.Left(\"a\")\n\tif e is Either.Left(v) {\n\t\techo v\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "Either_Str_IntLeft"))
+}
+
+pub fn a_generic_type_needs_its_arguments_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "type Box {\n\titems: T[dyn]\n}\nproc main(): void {\n\tBox b = Box([\"x\"])\n\techo len(b.items)\n}\n",
+    )
+  should.be_true(string.contains(msg, "needs its type arguments"))
+}
+
+// ---------------------------------------------------------------------------
+// Typed queries
+// ---------------------------------------------------------------------------
+
+pub fn a_void_query_reports_rows_affected_test() {
+  let go =
+    compile(
+      "query wipe(): void {\n\tDELETE FROM t\n}\nproc main(): void {\n\topened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"x.db\")\n\tif opened is Result.Ok(db) {\n\t\tif using db run wipe() is Result.Ok(n) {\n\t\t\techo n\n\t\t}\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.SqlExec(db, wipe())"))
+}
+
+pub fn a_row_query_maps_through_a_generated_mapper_test() {
+  let go =
+    compile(
+      "type U {\n\tid: Int\n\tname: Str\n}\nquery all(): U[dyn] {\n\tSELECT id, name FROM users\n}\nproc main(): void {\n\topened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"x.db\")\n\tif opened is Result.Ok(db) {\n\t\tif using db run all() is Result.Ok(rows) {\n\t\t\techo len(rows)\n\t\t}\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.SqlRows(db, all(), sqlRow_U)"))
+  should.be_true(string.contains(go, "func sqlRow_U(_r []string) (U, error) {"))
+  // Cells are converted to the field's declared type, and a miss is an error.
+  should.be_true(string.contains(go, "hive.SqlCellInt(_r[0], \"id\")"))
+  should.be_true(string.contains(go, "hive.SqlCellStr(_r[1], \"name\")"))
+  should.be_true(string.contains(go, "hive.SqlShapeError(2, len(_r))"))
+}
+
+pub fn a_single_column_query_needs_no_row_type_test() {
+  let go =
+    compile(
+      "query names(): Str[dyn] {\n\tSELECT name FROM users\n}\nproc main(): void {\n\topened := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"x.db\")\n\tif opened is Result.Ok(db) {\n\t\tif using db run names() is Result.Ok(ns) {\n\t\t\techo join(ns, \",\")\n\t\t}\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.SqlRows(db, names(),"))
+  should.be_true(string.contains(go, "hive.SqlShapeError(1, len(_r))"))
+}
+
+// ---------------------------------------------------------------------------
+// `SELECT *` against a declared row type
+// ---------------------------------------------------------------------------
+
+fn star_query(ret: String, sql: String) -> Result(String, String) {
+  compiler.compile(
+    "type U {\n\tid: Int\n\tname: Str\n}\nquery q(): "
+    <> ret
+    <> " {\n\t"
+    <> sql
+    <> "\n}\nproc main(): void {}\n",
+  )
+}
+
+pub fn select_star_into_a_row_type_is_rejected_test() {
+  let assert Error(msg) = star_query("U[dyn]", "SELECT * FROM users")
+  should.be_true(string.contains(msg, "does not say how many columns"))
+}
+
+pub fn a_qualified_star_is_rejected_test() {
+  let assert Error(msg) = star_query("U[dyn]", "SELECT u.* FROM users u")
+  should.be_true(string.contains(msg, "`u.*`"))
+}
+
+pub fn distinct_star_is_rejected_test() {
+  let assert Error(msg) = star_query("U[dyn]", "SELECT DISTINCT * FROM users")
+  should.be_true(string.contains(msg, "does not say how many columns"))
+}
+
+pub fn select_star_into_a_scalar_is_rejected_test() {
+  // Case-insensitively, like every other keyword.
+  let assert Error(msg) = star_query("Str[dyn]", "select * from users")
+  should.be_true(string.contains(msg, "does not say how many columns"))
+}
+
+pub fn select_star_into_a_table_is_allowed_test() {
+  // A Table promises nothing about its shape, so there is nothing to break.
+  star_query("Table", "SELECT * FROM users") |> should.be_ok
+}
+
+pub fn select_star_in_a_void_statement_is_allowed_test() {
+  // Its select list is a subquery, not a result.
+  star_query("void", "INSERT INTO a SELECT * FROM b") |> should.be_ok
+}
+
+pub fn count_star_is_not_a_star_test() {
+  star_query("Int[dyn]", "SELECT count(*) FROM users") |> should.be_ok
+}
+
+pub fn a_multiplication_is_not_a_star_test() {
+  star_query("Int[dyn]", "SELECT a * 2 FROM users") |> should.be_ok
+}
+
+pub fn a_star_in_a_subquery_is_not_this_querys_test() {
+  star_query("U[dyn]", "SELECT id, name FROM u WHERE x IN (SELECT * FROM y)")
+  |> should.be_ok
+}
+
+pub fn a_star_inside_a_sql_string_is_not_a_star_test() {
+  star_query("Str[dyn]", "SELECT name FROM users WHERE note = '* nope *'")
+  |> should.be_ok
 }

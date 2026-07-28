@@ -99,10 +99,26 @@ func greet(name: Str, style: Greeting): Str {
 	return "Hey {name}!"
 }
 
-// A `query` is a pure function whose body is inline SQL; every interpolated
-// parameter is sanitized automatically (note the doubled quote in the output).
-query findUser(name: Str): Str {
-	SELECT * FROM users WHERE name = {name}
+// A `query` is a pure function whose body is inline SQL. Its return type says
+// what its ROWS are — one User per row here — so the columns are checked against
+// User's fields and the mapper is generated. An interpolated parameter never
+// enters the SQL text: it becomes a placeholder, bound alongside.
+type User {
+	id: Int
+	name: Str
+}
+
+query findUser(name: Str): User[dyn] {
+	SELECT id, name FROM users WHERE name = {name}
+}
+
+// A type variable makes a callable generic. Resolved entirely at compile time:
+// one copy per element type it is called with.
+func first(v: T[]): Result<T, Bool> {
+	if len(v) > 0 {
+		return Result.Ok(v[0])
+	}
+	return Result.Error(false)
 }
 
 // An `async func` runs on its own virtual thread (a goroutine).
@@ -117,7 +133,11 @@ proc main(): void {
 
 	echo greet("Grace", Greeting.Formal("Dr."))
 	echo greet(names[1], Greeting.Casual())
-	echo findUser("O'Brien")
+
+	// `first` is generic: one definition, a concrete copy per element type.
+	if first(names) is Result.Ok(who) {
+		echo "first up: {who}"
+	}
 
 	slowShout("fire-and-forget")     // does not block; the result is discarded
 	echo await slowShout("await")    // blocks until the value is ready
@@ -129,7 +149,7 @@ Running it prints:
 ```
 Good evening, Dr. Grace.
 Hey Linus!
-SELECT * FROM users WHERE name = 'O''Brien'
+first up: Grace
 await!!!
 ```
 
@@ -187,22 +207,34 @@ compiles, builds and runs.
   allowed in either. A `func` differs from a `proc` in exactly two ways: it
   cannot receive a mutex as a parameter (a `mut` value passed to a func is seen
   as an ordinary immutable copy), and it cannot call a `proc` (only procs call
-  procs). A `query` is a func whose body is inline SQL: every `{param}`
-  interpolated into it is rendered as a quoted SQL literal and sanitized at
-  runtime (`'O''Brien'` above). An `async func` runs on its own virtual
+  procs). A `query` is a func whose body is inline SQL and whose
+  return type describes its **rows** — see
+  [typed queries](#queries-are-typed-by-their-rows). An interpolated `{param}`
+  never enters the SQL text: it becomes a placeholder and the value is bound
+  alongside it. An `async func` runs on its own virtual
   thread — see the concurrency bullet below. Programs start at
   `proc main(): void`, in the file you hand to `hive build`/`hive run`.
 * **Multiple files** — `import <path>`, written outside any callable, brings
   another `.hive` file's declarations into scope. See
   [`## Multiple files`](#multiple-files) below.
 * **Strings** (`Str`) are UTF-8, support `"{expr}"` interpolation, and
-  backtick multiline strings whose indentation is removed at compile time.
-* **Vectors** are memory-contiguous and static (`Str[3]`) or dynamic
-  (`Str[dyn]`, `Str[dyn, 2]` with an initial size). A static length is
+  backtick multiline strings whose indentation is removed at compile time. A
+  `Str` has no subscript: `s[0]` and `s[1:3]` are compile errors, because
+  `[...]` addresses bytes while a `Str` is a sequence of characters (which is
+  what `len` counts), so the two never line up and a byte from the middle of a
+  character is not text. Take a string apart with `split`, find in it with
+  `indexOf`, or match it with a [string pattern](#the-language).
+* **Vectors** are memory-contiguous and either static (`Str[3]`) or dynamic
+  (`Str[dyn]`). A static length is
   enforced, not advertised: a `Str[3]` slot only ever takes a vector of three,
   wherever the value comes from (see
   [vector bounds](#scope)), which is what lets `v[2]` on one compile with no
-  guard. All of them lower to Go
+  guard. A third spelling, `Str[]`, is legal **only as a parameter**: it
+  promises nothing about the length and accepts any vector of the right element
+  type, so one helper serves callers holding a `Str[3]` and a `Str[dyn]` alike.
+  Anything that names storage — a variable, a field, a return — has to say which
+  of the two real kinds it is, since a promise is the only thing an index can
+  rest on. All of them lower to Go
   slices; `+` concatenates into a new vector. `==` and `!=` compare vectors
   structurally — same length, then element by element (nested vectors and a
   `Table` compare the same way), short-circuiting on the first difference;
@@ -225,7 +257,10 @@ compiles, builds and runs.
   `Mutex<T>`: identical to `T` at runtime, but only mutexes may be altered at
   compile time. A parameter or return of type `T` accepts a `Mutex<T>` (the
   callee just sees an immutable `T`), never the reverse, so assigning to a
-  parameter or a plain `:=` binding is a compile error.
+  parameter or a plain `:=` binding is a compile error. A mutex passed as an
+  argument is **copied** on the way in, so the callee's immutable view really is
+  one: it cannot see the caller's later writes, whether the two run in sequence
+  or — for an `async func` — at the same time.
 * **Concurrency** — an `async func` runs on its own virtual thread (a
   goroutine). The call site decides how you interact with it, with no Future or
   Promise type to name and nothing dynamically typed. A bare call spawns the
@@ -279,7 +314,11 @@ compiles, builds and runs.
   operator, with the same precedence as `*` and `/`); dividing — or taking a
   remainder — by zero returns 0. A mutable number supports the compound
   assignments `+= -= *= /=` and the `++` / `--` steps (`x += 2`, `i++`), each
-  shorthand for the matching `x = x <op> ...`.
+  shorthand for the matching `x = x <op> ...`. Prefix `-` negates; it binds
+  tighter than `* / %` and looser than `**`, so `-2 ** 2` is `-(2 ** 2)` while
+  `2 ** -3` reads the sign as part of the exponent. See
+  [Arithmetic at the edges](#arithmetic-at-the-edges) for what overflow, a
+  negative exponent, and converting a non-finite `Float` do.
 * **Custom types** are Gleam-style ADTs: no variants ⇒ a struct, variants ⇒
   a tagged union. Fields declared outside any variant are added to every
   variant. `is` narrows a value to a variant and can bind its fields, and the
@@ -299,6 +338,23 @@ compiles, builds and runs.
   runs to the end. Holes must be plain binding names and two holes may not sit
   side by side (the split point would be ambiguous) — both are compile errors.
   A hole-less string pattern (`path is "/health"`) is just an exact match.
+* **Generics** — a name in a signature that is neither a builtin nor a declared
+  type is a **type variable**, and it makes the callable generic in it:
+  `func first(v: T[]): Result<T, Bool>`. That is the notation the
+  [builtin table](#built-in-functions) has always used for `len`, `indexOf` and
+  `append`; it is now available to ordinary code. A type declaration whose
+  fields mention variables is generic the same way, and is written out where it
+  is used (`Box<Str>`, `Either<Str, Int>`).
+  Nothing about it is dynamic: every call site is resolved at compile time, with
+  the type arguments read off the argument types, and one concrete copy emitted
+  per distinct set of them — no boxing, no dispatch, no reflection. Because each
+  copy is an ordinary declaration, every check runs on it separately, so an
+  instantiation at `Str[3]` is held to that length while one at `Str[dyn]` guards
+  its indexes. A generic callable cannot be used as a *value* (which copy a call
+  reaches is decided by the argument types, and a value carries none), and a
+  variable that appears only in the return type has nothing to be inferred from;
+  both are compile errors. See
+  [`code-examples/14 - Generics`](code-examples/14%20-%20Generics/generics.hive).
 * **First-class functions** — a proc or func is a value you can pass, store and
   call later. Its type is written like a declaration with the name dropped:
   `func(Int): Int` (pure) or `proc(hive.net.HttpRequest): hive.net.HttpResponse`
@@ -371,6 +427,30 @@ call or a constructed value (where a returned or embedded slice might alias its
 backing array), it is treated as possibly-mutated and the binding copies. Two
 `mut` bindings always alias — that is how you opt into shared mutable state.
 
+Shared mutable state is shared **completely**. Every change through either name
+is visible through the other, including `append`:
+
+```hive
+mut a := ["x", "y", "z"]
+mut b := a
+append(b, "w")       // len(a) is now 4
+a[0] = "changed"     // b[0] is "changed"
+b = ["replaced"]     // rebinding one rebinds both; len(a) is 1
+```
+
+Two Go slice variables could not deliver that — `append` returns a *new* slice
+header, so growing one name would quietly stop the two from sharing, or not,
+depending on whether the backing array happened to have spare capacity. So the
+second name is not given a variable at all: it compiles to the first, and there
+is one slice header for both. The one case this does not cover is a source that
+does not name the same storage every time it is read — `mut b = a[i]` can be a
+different element each time `i` moves — so that binding keeps a header of its
+own.
+
+Passing a mutex to a proc or func is the opposite case and always **copies** (see
+[Mutability](#the-language)): the callee is handed an immutable `T`, and it would
+not be one if the caller could still write to it.
+
 When a copy *is* made it is **deep and type-directed** — no runtime reflection:
 
 * a flat vector copies its backing array (`hive.CloneVec`);
@@ -382,6 +462,37 @@ When a copy *is* made it is **deep and type-directed** — no runtime reflection
 
 See [`code-examples/6 - Value Semantics`](code-examples/6%20-%20Value%20Semantics/value-semantics.hive)
 for a runnable walkthrough of each case.
+
+## Arithmetic at the edges
+
+Most of arithmetic is unsurprising. These are the cases where it is worth saying
+exactly what happens, so nothing here is left to chance:
+
+| expression                        | result                                          |
+| --------------------------------- | ----------------------------------------------- |
+| `a / 0`, `a % 0` (`Int` or `Float`) | `0` — division and remainder by zero are values, not crashes |
+| `Int` overflow (`+ - * **`)       | wraps, two's-complement, silently               |
+| `2 ** 100`                        | `0` — the wrap above, reached by repeated multiplication |
+| `n ** k` with `k < 0` (`Int`)     | `0`, including `1 ** -1`                        |
+| `n ** 0`                          | `1`                                             |
+| `-7 % 3`                          | `-1` — the remainder takes the sign of the dividend |
+| `10.0 ** 400.0`                   | `+Inf` — `Float` arithmetic does produce non-finite values |
+
+`Int` is a 64-bit signed integer and its overflow **wraps**; it is not checked
+and not an error, so `9223372036854775807 + 1` is the most negative `Int`. `**`
+on `Int`s is repeated multiplication and wraps the same way. A negative `Int`
+exponent has no integral answer, so it yields `0` rather than a fraction — which
+means `1 ** -1` is `0`, not `1`. If you want the mathematical answer, work in
+`Float`, where `**` is real exponentiation.
+
+One case is **deliberately unspecified**: converting a `Float` that is `+Inf`,
+`-Inf`, `NaN`, or simply too large to an `Int` (`hive.conv.ceil`, `floor`,
+`round`). Go leaves that conversion implementation-dependent, and Hive does not
+paper over it, so the value you get may differ between Go versions and between
+architectures — today, on amd64, all four give the most negative `Int`. Non-finite
+values reach a program through `Float` overflow (`10.0 ** 400.0`) and through
+`hive.conv.stf("Inf")`, so check for the range you expect before converting if it
+matters.
 
 ## Built-in functions
 
@@ -454,14 +565,16 @@ using "./data.csv"                            // a comma-separated CSV
 using "./data.tsv" as csv separating by "\t"  // another separator
 using "./book.xlsx" as xlsx                   // every sheet of a workbook
 using "./book.ods" as ods                     // every table of an ODS
-using db run "SELECT * FROM users"            // SQL on an open connection
+using db run allUsers()                       // a declared query, typed rows
+using db run raw someSqlText                  // SQL built at runtime, a Table
 ```
 
 | form | yields |
 | ---- | ------ |
 | `using <path>` / `... as csv [separating by <sep>]` | `Result<Table, hive.TableError>` |
 | `using <path> as xlsx` / `as ods` | `Result<Table[dyn], hive.TableError>` |
-| `using <connection> run <query>` | `Result<Table, hive.sql.SqlError>` |
+| `using <connection> run <query>` | whatever the query declared its rows to be |
+| `using <connection> run raw <text>` | `Result<Table, hive.sql.SqlError>` |
 
 `as csv` is optional — a bare `using <path>` is a comma-separated CSV, and
 `separating by` overrides the comma. A CSV is a single table, so it comes back as
@@ -479,12 +592,10 @@ cell). Numbers, booleans and cached formula results pass through untouched. An
 ods stores real dates, so nothing has to be undone there. Rows are padded to the
 widest row in their sheet, since a spreadsheet stores no trailing blanks.
 
-* **Querying** uses the `run` form: `using <connection> run <query>` runs *any*
-  SQL and returns `Result<Table, hive.sql.SqlError>`. A query that returns rows
-  yields a header row of column names followed by one row per result row; a
-  statement that returns none (INSERT/UPDATE/DDL) yields an empty table. Build
-  the query string safely with a `query` declaration, whose `{param}`s are
-  sanitized: `using db run insertUser(1, "O'Brien")`.
+* **Querying** uses the `run` form, and what it gives back is what the query
+  declared — see [typed queries](#queries-are-typed-by-their-rows). `run raw` is
+  the escape hatch for SQL assembled at runtime: nothing can know its shape, so
+  it comes back as a `Table` with its header row, exactly as reading a CSV does.
 
 See [`code-examples/12 - Files and Spreadsheets`](code-examples/12%20-%20Files%20and%20Spreadsheets/files-and-spreadsheets.hive).
 
@@ -658,7 +769,7 @@ executable, so local databases work with no CGO and nothing to install;
 Postgres is `github.com/lib/pq`.
 
 * **Querying** uses the `using <connection> run <query>` form — see
-  [`## Reading tables`](#reading-tables-using) above.
+  [Queries are typed by their rows](#queries-are-typed-by-their-rows) below.
 * `hive.sql.connect(driver, connString)` opens a pooled connection and returns
   `Result<hive.sql.SqlConnection, hive.sql.SqlError>`; `hive.sql.pool(driver,
   connString, maxOpen, maxIdle)` does the same with explicit pool limits;
@@ -672,6 +783,110 @@ one is safe to hold for the life of the program and to share across virtual
 threads — open it once in `main` and pass it along (a partial application like
 `handler(_, db)` is the usual way). Never open one per query: for a file-backed
 database that is merely wasteful, but for an in-memory one it is worse than that.
+
+#### Queries are typed by their rows
+
+A `query`'s return type describes what comes back, not the SQL text:
+
+| declared | `using conn run q(...)` yields |
+| -------- | ------------------------------- |
+| `Row[dyn]` (a declared type) | `Result<Row[dyn], hive.sql.SqlError>` |
+| `Str[dyn]`, `Int[dyn]`, … (a scalar) | that column, as a vector |
+| `void` | `Result<Int, hive.sql.SqlError>` — the number of rows it affected |
+
+```hive
+type User {
+	id:   Int
+	name: Str
+}
+
+query allUsers(): User[dyn] {
+	SELECT id, name FROM users ORDER BY id
+}
+
+query userNames(): Str[dyn] {          // one column needs no row type
+	SELECT name FROM users
+}
+
+query deleteUser(id: Int): void {      // a statement reports what it touched
+	DELETE FROM users WHERE id = {id}
+}
+```
+
+Columns are matched to the row type's fields **by name**, so reordering the
+`SELECT` cannot silently remap them — and a column whose name differs from its
+field needs an alias (`SELECT u.name AS author`). A row type holds scalars only.
+
+**`SELECT *` is a compile error** against a declared row type. It says neither
+how many columns come back nor what they are called, so there is nothing to
+match the fields against — and what it stands for changes the day somebody adds
+a column to the table. Spell the columns out, or declare the query as returning
+a `Table` and take the rows untyped:
+
+```hive
+query allUsers(): User[dyn] {
+	SELECT * FROM users           // compile error: `q` selects `*`
+}
+```
+
+The rule is about the *result*, so it costs nothing elsewhere: `count(*)` is a
+call rather than a star, `a * 2` is multiplication, a star inside a subquery
+belongs to that subquery, and a `void` statement's select list (`INSERT INTO a
+SELECT * FROM b`) is not a result at all. All four still compile.
+
+**Values are bound, never spliced.** An interpolated `{param}` becomes a
+placeholder and the value travels beside the text as an argument, so nothing a
+caller supplies can change what a statement means. The dialect is handled for
+you: queries are written with `?` and rewritten to `$1, $2, …` for PostgreSQL by
+the connection, which is what lets one declaration serve both drivers.
+
+What is still a runtime `hive.sql.SqlError`, because nothing at compile time can
+know it, with a `reason` telling them apart:
+
+| `reason` | what happened |
+| -------- | ------------- |
+| `"Connection"` | the connection is not open |
+| `"Query"` | the driver rejected the SQL, or the read failed |
+| `"Shape"` | the row came back with a different number of columns |
+| `"Convert"` | a cell did not fit the type its field was declared with |
+
+#### Optional filters: `where { }`
+
+Most "dynamic" queries are a fixed query with optional predicates, and that
+needs no string building. A `where` block ANDs the predicates whose conditions
+hold; a nested `or { }` or `and { }` flips the connective:
+
+```hive
+query findColonies(apiary: Str, minFrames: Int, small: Bool, huge: Bool): Colony[dyn] {
+	SELECT name, apiary, frames FROM colonies
+	where {
+		if apiary != ""   { apiary = {apiary} }
+		if minFrames > 0  { frames >= {minFrames} }
+		or {
+			if small { frames < 4 }
+			if huge  { frames > 10 }
+		}
+	}
+	ORDER BY name
+}
+```
+
+A group that contributes nothing disappears rather than leaving a dangling
+connective, and if no predicate is present at all there is no `WHERE` clause —
+so there is no `WHERE 1 = 1` to write. A group contributing more than one
+predicate is parenthesised, so nesting cannot change how the surrounding
+connective binds. Every branch's text is fixed at compile time; only which
+branches are taken is decided at runtime.
+
+Two things a `where` block deliberately cannot do. A **column name or sort
+direction** can never be a parameter — `ORDER BY {col}` would sort by a constant
+string — so make the choices a variant type and dispatch to one query per
+ordering; the compiler then checks the match is exhaustive and injecting a column
+name is structurally impossible. And **SQL you genuinely assemble yourself** —
+an admin console, ad-hoc reporting — goes through `run raw`, which is untyped by
+construction and greppable by design.
+
+See [`code-examples/5 - SQL`](code-examples/5%20-%20SQL/sql.hive).
 
 #### In-memory SQLite
 
@@ -1124,13 +1339,16 @@ See [`code-examples/11 - Modules`](code-examples/11%20-%20Modules/modules.hive).
 | --------------------------------------- | -------------------------------------------------------------- |
 | `proc`/`func` `name(): T { ... }`       | `func name() T { ... }`                                        |
 | `proc main(): void`                     | `func main()`                                                  |
-| `query q(p: Str): Str { SQL {p} }`      | `func q(p string) string { return "SQL " + hive.SqlParam(p) }`  |
+| `query q(p: Str): Row[dyn] { SQL {p} }` | `func q(p string) hive.SqlFragment` — text with `?`, plus the bound args |
+| `query q(...): void`                    | run with `hive.SqlExec` → `Result[int, SqlError]` (rows affected) |
+| `where { if c { … } or { … } }`         | fragments collected at runtime, joined by `hive.SqlJoin`        |
 | `type T { }` (no variants)              | a `struct`                                                     |
 | `type T { A {..} B }` (variants)        | an `interface` + one `struct` per variant (a tagged union)     |
 | fields declared outside any variant     | appended to **every** variant struct                           |
 | `name := expr`                          | `name := expr` (type inferred)                                 |
 | `T name = expr`                         | `var name T = expr`                                            |
 | `mut name := expr` / `mut T name = e`   | same as above (`mut` is compile-time only — permits reassign)  |
+| `mut b = a` (both `mut`, owns storage)  | no variable at all — `b` compiles to `a`, so one slice header is shared |
 | `x = expr` / `v[0] = expr`              | `x = expr` / `v[0] = expr` (only on `mut` variables)           |
 | `ys := xs` (needs a copy — see [value semantics](#value-semantics-copy-on-binding)) | `ys := hive.CloneVec(xs)` / `hive.CloneVecFn(..)` / `hive.CloneTable(..)` / `clone_T(..)` |
 | `for i := 0; i < n; i = i + 1 { }`      | `for i := 0; i < n; i = i + 1 { }` (counter scoped to the loop) |
@@ -1150,14 +1368,16 @@ See [`code-examples/11 - Modules`](code-examples/11%20-%20Modules/modules.hive).
 | `a is T.A(v) && p(v)`                   | short-circuiting `&&`; `v` reads through its accessor          |
 | `using p` / `using p as csv separating by d` | `hive.ReadCSV(p, d)` → `Result[Table, TableError]`       |
 | `using p as xlsx` / `as ods`            | `hive.ReadXlsx(p)` / `hive.ReadOds(p)` → `Result[[]Table, TableError]` |
-| `using conn run q`                      | `hive.SqlQuery(conn, q)` → `Result[Table, SqlError]`           |
+| `using conn run q(...)`                 | `hive.SqlRows(conn, q(...), sqlRow_T)` → `Result[[]T, SqlError]` |
+| `using conn run raw text`               | `hive.SqlQuery(conn, text)` → `Result[Table, SqlError]`         |
 | `if <call> is Result.Ok(v)`             | `if _u := <call>; _u.IsOk() { v := _u.Ok()` (evaluated once)    |
+| `if p && <call> is Result.Ok(v)`        | one nested `if` per `&&` test, so each has an init slot of its own (still evaluated once, still short-circuiting) |
 | `"{a} and {b}"`                         | concatenation, non-`Str` pieces via `hive.ToStr`               |
 | `[x, y] + [z]`                          | `hive.Concat([]T{x, y}, []T{z})`                               |
 | `v1 == v2` / `v1 != v2` (vectors)       | `hive.VecEq(v1, v2)` / `!hive.VecEq(v1, v2)` (structural)      |
 | `#Atom`                                 | `hive.Atom` constants + a generated `hive.InitAtoms` table     |
 | `true` / `false`                        | Go `true` / `false` (the `Bool` type, not atoms)               |
-| `a / b`, `a ** b`                       | `hive.DivInt`/`hive.DivFloat`, `hive.PowInt`/`hive.PowFloat`   |
+| `a / b`, `a ** b`                       | `hive.DivInt`/`hive.DivFloat`, `hive.PowInt`/`hive.PowFloat` (see [edges](#arithmetic-at-the-edges)) |
 | `a % b`                                 | `hive.ModInt`/`hive.ModFloat` (remainder; `% 0` returns 0)    |
 | `len(v)` vector / `len(s)` Str          | `len(v)` (elements) / `hive.StrLen(s)` (UTF-8 runes)           |
 | `bytes(v)` vector / `bytes(s)` Str      | `hive.Bytes(v)` (footprint) / `len(s)` (UTF-8 byte length)     |
@@ -1176,6 +1396,10 @@ See [`code-examples/11 - Modules`](code-examples/11%20-%20Modules/modules.hive).
 | `hive.net.socketSend(c, d)` / `.socketReceive(c, n)` | `hive.SocketSend(c, d)` → `Result[Int, _]` / `hive.SocketReceive(c, n)` → `Result[Str, _]` |
 | `hive.net.socketReceiveLine(c)`         | `hive.SocketReceiveLine(c)` → `Result[Str, SocketError]` (newline trimmed) |
 | `hive.net.socketPeer(c)` / `.socketClose(c)` | `hive.SocketPeer(c)` → `Str` / `hive.SocketClose(c)`       |
+| `f(mutVec)` (argument names `mut` storage) | `f(hive.CloneVec(mutVec))` (copied in, so the callee's `T` really is immutable) |
+| `func f(v: T[]): T` at `T = Str`        | `func f_Str(v []string) string` (one copy per instantiation)   |
+| `type Box { items: T[dyn] }` at `Str`   | `type Box_Str struct { Items []string }` (+ its own clone/codec) |
+| `Result<T, E>`                          | `hive.Result[T, E]`; `Result.Ok(v)` → `hive.Ok[T, E](v)`        |
 | `f` (bare reference)                    | `f` (the Go function value)                                    |
 | `f(a, _, c)` (partial application)      | `func(h T) R { return f(a, h, c) }` (a closure; `_`→ parameter) |
 | `hive.crypto.sha256/sha512(s)`          | `hive.Sha256/Sha512(s)` (lowercase-hex digest)                 |
@@ -1207,12 +1431,15 @@ See [`code-examples/11 - Modules`](code-examples/11%20-%20Modules/modules.hive).
 | `hive.syslink.stop(a)` / `.node()`      | `hive.SyslinkStop(a)` / `hive.SyslinkNode()` → `string`         |
 | `hive.syslink.Address` / `.Envelope`    | `hive.Address` / `hive.Envelope` (message type inferred, never written) |
 | `Str`, `Int`, `Bool`, `Float`, `Atom`   | `string`, `int`, `bool`, `float64`, `hive.Atom`                |
-| `Str[3]`, `Str[dyn]`, `Str[dyn, 2]`     | `[]string` (all vectors lower to slices)                       |
+| `Str[3]`, `Str[dyn]`, `Str[]`           | `[]string` (all vectors lower to slices)                       |
 | `Table`, `hive.TableError`, `Result`    | provided by the generated `hive` runtime package               |
 
 Codegen runs a lightweight type-inference pass over locals so overloaded
 syntax picks the right lowering (`+` on vectors vs. strings vs. numbers, atom
-→ `Str` coercions, zero-safe division, vector literal element types). Hive
+→ `Str` coercions, zero-safe division, vector literal element types). The same
+pass decides the constructs that have no honest lowering — indexing a `Str` is
+the one that exists today — so they are rejected as Hive errors rather than
+emitted as Go that either fails to compile or quietly means something else. Hive
 requires every non-`void` `proc`/`func` to return on every path: a path
 terminates by ending in `return`, in `assert` or `panic` (both handy for a tail
 you know is unreachable, e.g. `assert false` or `panic "unreachable"`), in an
@@ -1238,6 +1465,9 @@ src/hive/ast.gleam        the abstract syntax tree
 src/hive/parser.gleam     tokens       -> AST (recursive descent)
 src/hive/modules.gleam    resolves the `import` graph (rejecting cycles) and
                           flattens the whole program into one module
+src/hive/generics.gleam   monomorphization: one concrete copy of a generic
+                          callable or type per set of type arguments it is
+                          used at, so every later pass sees ordinary code
 src/hive/bounds.gleam     flow-sensitive vector index/slice bounds checking
 src/hive/codegen.gleam    AST          -> Go source (with local type inference)
 src/hive/runtime.gleam    go.mod, the core Go `hive` runtime, and one Go
@@ -1272,7 +1502,8 @@ compile error rather than a runtime crash.
 
 A **declared** length is a promise, not a hint. `Str[3]` means three, so every
 value that lands in such a slot — an initialiser, a later assignment, an
-argument, a returned value, a row written into a `Str[2][2]` — has to be a
+argument, a **field of a constructed value**, a returned value, a row written
+into a `Str[2][2]` — has to be a
 vector of exactly that many elements, and a length the compiler can't see is
 rejected too:
 
@@ -1288,6 +1519,42 @@ above stays legal after the reassignment, and a `Str[3]` parameter can be
 indexed inside the callee without a guard, since every call site was checked.
 The escape, as always, is `[dyn]`: `Str[dyn]` promises nothing and guards its
 indexes.
+
+Because keeping a promise means keeping it at *every* call site, a callable with
+a statically-sized parameter is restricted as a **value**. It may be bound to an
+immutable name — a bare reference or a partial application — and called through
+it, and those calls are checked exactly as direct ones are:
+
+```hive
+proc takes(v: Str[3]): void { echo v[2] }
+
+f := takes
+f(["a", "b", "c"])               // fine
+f(["a"])                         // compile error: `f` holds a `Str[3]` taker
+```
+
+It may not be handed on any further — passed as an argument, returned, stored in
+a vector or a field — because the eventual call would happen somewhere with no
+idea what was promised. The same reason rules out a `mut` holder, which could be
+pointed at a different callable after the fact. Declaring the parameter `Str[dyn]`
+or `Str[]` lifts every one of these restrictions, at the cost of guarding the
+index inside the callee.
+
+A vector inside a **struct** is a vector like any other, with the same
+guarantees. A `Str[3]` field is enforced wherever a value reaches it — including
+at construction — and so can be indexed unguarded; a `Str[dyn]` field guards its
+indexes, and replacing the field (`b.items = …`) costs it whatever had been
+proven about the old value, exactly as rebinding a variable does:
+
+```hive
+type Box { items: Str[dyn] }
+
+mut b := Box(["a", "b", "c"])
+if 2 < len(b.items) {
+    b.items = ["one"]
+    echo b.items[2]              // compile error: that proof died with the old value
+}
+```
 
 An **inferred** length is weaker, because nothing constrains what comes next:
 `mut v := ["a", "b", "c"]` knows it holds three today, and keeps that through

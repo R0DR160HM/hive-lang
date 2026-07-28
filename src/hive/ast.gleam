@@ -1,7 +1,9 @@
 //// The Hive abstract syntax tree.
 
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/string
 
 pub type Module {
   Module(imports: List(Import), decls: List(Decl))
@@ -38,14 +40,17 @@ pub type Decl {
     body: List(Stmt),
     async: Bool,
   )
-  /// A `query`: a pure function whose body is inline SQL. The body is a
-  /// sequence of literal SQL chunks and interpolated expressions; every
-  /// interpolated value is sanitized at runtime before entering the SQL.
+  /// A `query`: a pure function whose body is inline SQL.
+  ///
+  /// `return_type` describes the *rows*, not the SQL text: a row type
+  /// (`User[dyn]`), a scalar for a single-column result (`Str[dyn]`), or `void`
+  /// for a statement that returns none, whose result is the number of rows it
+  /// affected.
   QueryDecl(
     name: String,
     params: List(Field),
     return_type: TypeExpr,
-    sql: List(IPart),
+    sql: List(SqlPart),
   )
   /// An algebraic data type. When `variants` is empty the type behaves as a
   /// plain struct made of `common_fields`. When it has variants, each variant
@@ -64,20 +69,34 @@ pub type Variant {
 
 /// One `[...]` marker on a vector type.
 pub type Dim {
-  /// `T[]` — a vector of unspecified length (legacy spelling).
+  /// `T[]` — a vector whose length is not part of the type. It promises
+  /// nothing, so every access into it is guarded, and it accepts *any* vector
+  /// of the right element type. Legal only in a parameter position: a variable,
+  /// field or return has to say which of the two real kinds it is.
   DimEmpty
-  /// `T[3]` — a vector of static length.
+  /// `T[3]` — a vector of static length. The length is a promise enforced
+  /// everywhere a value can reach the slot.
   DimStatic(size: Int)
-  /// `T[dyn]` or `T[dyn, 2]` — a dynamic vector, optionally with an initial
-  /// size hint.
-  DimDyn(initial: Option(Int))
+  /// `T[dyn]` — a dynamic vector. Its length is not known at compile time.
+  DimDyn
 }
 
 pub type TypeExpr {
   TVoid
-  /// A named type, optionally package-qualified (e.g. `hive.TableError`),
-  /// with trailing vector markers (e.g. `Str[dyn][dyn]` -> two dims).
-  TName(pkg: Option(String), name: String, dims: List(Dim))
+  /// A named type, optionally package-qualified (e.g. `hive.TableError`), with
+  /// type arguments (`Result<Int, Bool>`, `Box<Str>`) and trailing vector
+  /// markers (e.g. `Str[dyn][dyn]` -> two dims).
+  ///
+  /// A `name` that is neither a builtin nor a declared type is a **type
+  /// variable**: `func first(v: T[]): T` is generic in `T`, which is exactly
+  /// how the builtin table has always been written. Variables are substituted
+  /// away by monomorphization, so nothing downstream ever sees one.
+  TName(
+    pkg: Option(String),
+    name: String,
+    args: List(TypeExpr),
+    dims: List(Dim),
+  )
   /// A function type, spelled like a declaration without a name:
   /// `func(Int, Str): Bool` (pure) or `proc(Req): Resp` (impure). `pure`
   /// separates the two. A `func` value may be used where a `proc` type is
@@ -154,11 +173,58 @@ pub type BinOp {
   OpOr
 }
 
-/// One piece of an interpolated string (or of a query's SQL body): literal
-/// text or an embedded expression.
+/// One piece of an interpolated string: literal text or an embedded
+/// expression.
 pub type IPart {
   ILit(String)
   IExpr(Expr)
+}
+
+/// One piece of a query's SQL body.
+pub type SqlPart {
+  /// Literal SQL, verbatim.
+  SqlLit(String)
+  /// An interpolated value. It never enters the SQL text: it becomes a
+  /// placeholder, and the value is bound alongside.
+  SqlParam(Expr)
+  /// A `where { ... }` block — predicates that are each present or absent at
+  /// runtime, combined into a `WHERE` clause (or into nothing at all, when none
+  /// of them are present).
+  SqlWhere(group: SqlGroup)
+}
+
+/// A group of conditional predicates and the connective joining them. A `where`
+/// block is an `and` group; a nested `or { }` / `and { }` flips it.
+pub type SqlGroup {
+  SqlGroup(conjunction: Bool, items: List(SqlItem))
+}
+
+pub type SqlItem {
+  /// `if <cond> { <sql> }` — one predicate, included when `cond` holds.
+  SqlCond(cond: Expr, body: List(SqlPart))
+  /// A nested group, parenthesised when it contributes more than one predicate.
+  SqlNested(group: SqlGroup)
+}
+
+/// Every expression a query body carries, for the traversals that only need to
+/// reach them.
+pub fn sql_exprs(parts: List(SqlPart)) -> List(Expr) {
+  list.flat_map(parts, fn(part) {
+    case part {
+      SqlLit(_) -> []
+      SqlParam(e) -> [e]
+      SqlWhere(group) -> group_exprs(group)
+    }
+  })
+}
+
+fn group_exprs(group: SqlGroup) -> List(Expr) {
+  list.flat_map(group.items, fn(item) {
+    case item {
+      SqlCond(cond, body) -> [cond, ..sql_exprs(body)]
+      SqlNested(inner) -> group_exprs(inner)
+    }
+  })
 }
 
 pub type Expr {
@@ -215,9 +281,47 @@ pub type UsingKind {
   /// `using <path> as ods` — every table of an OpenDocument spreadsheet, in
   /// document order. Yields `Result<Table[dyn], hive.TableError>`.
   UsingOds
-  /// `using <connection> run <query>` — runs SQL on an open connection. Yields
-  /// `Result<Table, hive.sql.SqlError>`.
+  /// `using <connection> run <query>` — runs a declared query on an open
+  /// connection. What it yields is what the query declared its rows to be.
   UsingQuery(query: Expr)
+  /// `using <connection> run raw <text>` — runs SQL assembled at runtime.
+  /// Nothing is known about the shape of what comes back, so it yields
+  /// `Result<Table, hive.sql.SqlError>` with the header row intact.
+  UsingRaw(text: Expr)
+}
+
+/// A type written the way source spells it, for error messages.
+pub fn show_type(t: TypeExpr) -> String {
+  case t {
+    TVoid -> "void"
+    TFunc(pure, params, ret) ->
+      case pure {
+        True -> "func("
+        False -> "proc("
+      }
+      <> string.join(list.map(params, show_type), ", ")
+      <> "): "
+      <> show_type(ret)
+    TName(pkg, name, args, dims) ->
+      case pkg {
+        Some(p) -> p <> "."
+        None -> ""
+      }
+      <> name
+      <> case args {
+        [] -> ""
+        _ -> "<" <> string.join(list.map(args, show_type), ", ") <> ">"
+      }
+      <> string.concat(list.map(dims, show_dim))
+  }
+}
+
+pub fn show_dim(d: Dim) -> String {
+  case d {
+    DimEmpty -> "[]"
+    DimStatic(n) -> "[" <> int.to_string(n) <> "]"
+    DimDyn -> "[dyn]"
+  }
 }
 
 /// Whether an expression can be evaluated more than once without changing what
@@ -261,6 +365,7 @@ pub fn using_exprs(kind: UsingKind) -> List(Expr) {
     UsingCsv(Some(separator)) -> [separator]
     UsingCsv(None) | UsingXlsx | UsingOds -> []
     UsingQuery(query) -> [query]
+    UsingRaw(text) -> [text]
   }
 }
 

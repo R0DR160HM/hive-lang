@@ -259,21 +259,220 @@ fn parse_query(tokens: Toks) -> Result(#(ast.Decl, Toks), String) {
   }
 }
 
-// Splits a raw SQL body into literal chunks and `{expression}` interpolations.
-fn parse_sql_parts(sql: String, line: Int) -> Result(List(ast.IPart), String) {
-  split_sql(string.to_graphemes(sql), line, "", [])
+// A query body is literal SQL with two things woven through it: `{expression}`
+// interpolations, which never enter the text (they become placeholders bound
+// alongside it), and `where { ... }` blocks, whose predicates are each present
+// or absent at runtime.
+//
+// The lexer hands the body over as one verbatim string with its braces
+// balanced, so the split happens here. A `{` is an interpolation unless the word
+// in front of it opened a block.
+fn parse_sql_parts(sql: String, line: Int) -> Result(List(ast.SqlPart), String) {
+  use #(parts, rest) <- result.try(
+    split_sql(string.to_graphemes(sql), line, "", [], False),
+  )
+  case rest {
+    [] -> Ok(parts)
+    _ -> Error("unexpected `}` in a query body (line " <> int.to_string(line) <> ")")
+  }
 }
 
+// Reads SQL until the body ends, or — when `nested` — until the `}` that closes
+// the block being read. Returns what it read and whatever is left.
 fn split_sql(
   chars: List(String),
   line: Int,
   buf: String,
-  acc: List(ast.IPart),
-) -> Result(List(ast.IPart), String) {
+  acc: List(ast.SqlPart),
+  nested: Bool,
+) -> Result(#(List(ast.SqlPart), List(String)), String) {
   case chars {
-    [] -> Ok(list.reverse(push_sql_lit(buf, acc)))
-    ["{", ..rest] -> take_sql_code(rest, line, "", push_sql_lit(buf, acc))
-    [c, ..rest] -> split_sql(rest, line, buf <> c, acc)
+    [] ->
+      case nested {
+        True ->
+          Error(
+            "unterminated block in a query body (line "
+            <> int.to_string(line)
+            <> ")",
+          )
+        False -> Ok(#(list.reverse(push_sql_lit(buf, acc)), []))
+      }
+    ["}", ..rest] if nested -> Ok(#(list.reverse(push_sql_lit(buf, acc)), rest))
+    ["{", ..rest] -> {
+      use #(e, after) <- result.try(take_sql_code(rest, line, ""))
+      split_sql(after, line, "", [ast.SqlParam(e), ..push_sql_lit(buf, acc)], nested)
+    }
+    _ ->
+      // A `where` block only starts at a word boundary and only when a `{`
+      // follows it — so both `nowhere` and an ordinary `WHERE name = {x}` stay
+      // literal SQL.
+      case opens_where(chars, buf) {
+        True -> {
+          let after_kw = list.drop(chars, 5)
+          use #(group, rest) <- result.try(parse_group(after_kw, line, True))
+          split_sql(
+            rest,
+            line,
+            "",
+            [ast.SqlWhere(group), ..push_sql_lit(buf, acc)],
+            nested,
+          )
+        }
+        False ->
+          case chars {
+            [c, ..rest] -> split_sql(rest, line, buf <> c, acc, nested)
+            [] -> Ok(#(list.reverse(push_sql_lit(buf, acc)), []))
+          }
+      }
+  }
+}
+
+fn opens_where(chars: List(String), buf: String) -> Bool {
+  starts_word(chars, "where")
+  && ends_word(buf)
+  && case skip_space(list.drop(chars, 5)) {
+    ["{", ..] -> True
+    _ -> False
+  }
+}
+
+// `{ if <cond> { ... } or { ... } ... }` — the items of one group. `conjunction`
+// says how they join; a nested `or`/`and` flips it.
+fn parse_group(
+  chars: List(String),
+  line: Int,
+  conjunction: Bool,
+) -> Result(#(ast.SqlGroup, List(String)), String) {
+  use rest <- result.try(expect_brace(skip_space(chars), line))
+  use #(items, after) <- result.try(parse_items(rest, line, []))
+  Ok(#(ast.SqlGroup(conjunction, items), after))
+}
+
+fn parse_items(
+  chars: List(String),
+  line: Int,
+  acc: List(ast.SqlItem),
+) -> Result(#(List(ast.SqlItem), List(String)), String) {
+  let chars = skip_space(chars)
+  case chars {
+    [] ->
+      Error(
+        "unterminated `where` block in a query body (line "
+        <> int.to_string(line)
+        <> ")",
+      )
+    ["}", ..rest] -> Ok(#(list.reverse(acc), rest))
+    _ ->
+      case starts_word(chars, "if"), starts_word(chars, "or"), starts_word(chars, "and") {
+        True, _, _ -> {
+          // The condition runs to the `{` that opens the predicate.
+          use #(cond_text, after_cond) <- result.try(
+            take_until_brace(list.drop(chars, 2), line, ""),
+          )
+          use cond <- result.try(parse_sub_expr(cond_text, line))
+          use #(body, after) <- result.try(
+            split_sql(after_cond, line, "", [], True),
+          )
+          parse_items(after, line, [ast.SqlCond(cond, body), ..acc])
+        }
+        _, True, _ -> {
+          use #(group, after) <- result.try(
+            parse_group(list.drop(chars, 2), line, False),
+          )
+          parse_items(after, line, [ast.SqlNested(group), ..acc])
+        }
+        _, _, True -> {
+          use #(group, after) <- result.try(
+            parse_group(list.drop(chars, 3), line, True),
+          )
+          parse_items(after, line, [ast.SqlNested(group), ..acc])
+        }
+        _, _, _ ->
+          Error(
+            "a `where` block holds `if <condition> { ... }` predicates and "
+            <> "nested `and { ... }` / `or { ... }` groups; found something "
+            <> "else (line "
+            <> int.to_string(line)
+            <> ")",
+          )
+      }
+  }
+}
+
+// The text of an `if` condition: everything up to the `{` that opens its body.
+fn take_until_brace(
+  chars: List(String),
+  line: Int,
+  buf: String,
+) -> Result(#(String, List(String)), String) {
+  case chars {
+    [] ->
+      Error(
+        "expected `{` after an `if` condition in a `where` block (line "
+        <> int.to_string(line)
+        <> ")",
+      )
+    ["{", ..rest] -> Ok(#(buf, rest))
+    [c, ..rest] -> take_until_brace(rest, line, buf <> c)
+  }
+}
+
+fn expect_brace(chars: List(String), line: Int) -> Result(List(String), String) {
+  case chars {
+    ["{", ..rest] -> Ok(rest)
+    _ ->
+      Error(
+        "expected `{` to open a `where` group (line "
+        <> int.to_string(line)
+        <> ")",
+      )
+  }
+}
+
+fn skip_space(chars: List(String)) -> List(String) {
+  case chars {
+    [" ", ..rest] | ["\t", ..rest] | ["\n", ..rest] | ["\r", ..rest] ->
+      skip_space(rest)
+    _ -> chars
+  }
+}
+
+// Whether `chars` begins with `word` (case-insensitively) followed by something
+// that is not a word character — so `and` matches but `android` does not.
+fn starts_word(chars: List(String), word: String) -> Bool {
+  let n = string.length(word)
+  let head =
+    chars |> list.take(n) |> string.concat |> string.lowercase
+  case head == word {
+    False -> False
+    True ->
+      case list.drop(chars, n) {
+        [] -> True
+        [c, ..] -> !is_word_char(c)
+      }
+  }
+}
+
+// Whether what has been read so far ends at a word boundary, so a keyword
+// starting here really is one.
+fn ends_word(buf: String) -> Bool {
+  case string.last(buf) {
+    Error(_) -> True
+    Ok(c) -> !is_word_char(c)
+  }
+}
+
+fn is_word_char(c: String) -> Bool {
+  case c {
+    "_" -> True
+    _ -> string.lowercase(c) != string.uppercase(c) || is_digit(c)
+  }
+}
+
+fn is_digit(c: String) -> Bool {
+  case c {
+    "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" -> True
+    _ -> False
   }
 }
 
@@ -281,8 +480,7 @@ fn take_sql_code(
   chars: List(String),
   line: Int,
   code: String,
-  acc: List(ast.IPart),
-) -> Result(List(ast.IPart), String) {
+) -> Result(#(ast.Expr, List(String)), String) {
   case chars {
     [] ->
       Error(
@@ -292,16 +490,16 @@ fn take_sql_code(
       )
     ["}", ..rest] -> {
       use e <- result.try(parse_sub_expr(code, line))
-      split_sql(rest, line, "", [ast.IExpr(e), ..acc])
+      Ok(#(e, rest))
     }
-    [c, ..rest] -> take_sql_code(rest, line, code <> c, acc)
+    [c, ..rest] -> take_sql_code(rest, line, code <> c)
   }
 }
 
-fn push_sql_lit(buf: String, acc: List(ast.IPart)) -> List(ast.IPart) {
+fn push_sql_lit(buf: String, acc: List(ast.SqlPart)) -> List(ast.SqlPart) {
   case buf {
     "" -> acc
-    _ -> [ast.ILit(buf), ..acc]
+    _ -> [ast.SqlLit(buf), ..acc]
   }
 }
 
@@ -390,8 +588,9 @@ fn parse_type_expr(tokens: Toks) -> Result(#(ast.TypeExpr, Toks), String) {
       use #(first, t1) <- result.try(expect_ident(tokens))
       use #(segments, t2) <- result.try(collect_type_segments(t1, [first]))
       let #(pkg, name) = split_type_path(segments)
-      let #(dims, t3) = parse_dims(t2, [])
-      Ok(#(ast.TName(pkg, name, dims), t3))
+      use #(args, t3) <- result.try(parse_type_args(t2))
+      let #(dims, t4) = parse_dims(t3, [])
+      Ok(#(ast.TName(pkg, name, args, dims), t4))
     }
   }
 }
@@ -432,6 +631,32 @@ fn parse_type_list(
   }
 }
 
+// Parses `<A, B>` type arguments, if present. Angle brackets only ever appear in
+// a type position, so there is no ambiguity with the comparison operators.
+fn parse_type_args(tokens: Toks) -> Result(#(List(ast.TypeExpr), Toks), String) {
+  case kind(tokens) {
+    token.Lt -> parse_type_args_rest(tail(tokens), [])
+    _ -> Ok(#([], tokens))
+  }
+}
+
+fn parse_type_args_rest(
+  tokens: Toks,
+  acc: List(ast.TypeExpr),
+) -> Result(#(List(ast.TypeExpr), Toks), String) {
+  use #(arg, t1) <- result.try(parse_type_expr(tokens))
+  case kind(t1) {
+    token.Comma -> parse_type_args_rest(tail(t1), [arg, ..acc])
+    token.Gt -> Ok(#(list.reverse([arg, ..acc]), tail(t1)))
+    other ->
+      Error(
+        "expected `,` or `>` in type arguments but found "
+        <> token.describe(other)
+        <> at(t1),
+      )
+  }
+}
+
 // Consumes further `.ident` segments of a qualified type name.
 fn collect_type_segments(
   tokens: Toks,
@@ -455,9 +680,9 @@ fn split_type_path(segments: List(String)) -> #(Option(String), String) {
   }
 }
 
-// Parses trailing vector markers: `[]`, `[3]`, `[dyn]` or `[dyn, 2]`. A `[`
-// that doesn't start a well-formed marker is left in place (it may be an
-// index expression instead).
+// Parses trailing vector markers: `[]`, `[3]` or `[dyn]`. A `[` that doesn't
+// start a well-formed marker is left in place (it may be an index expression
+// instead).
 fn parse_dims(tokens: Toks, acc: List(ast.Dim)) -> #(List(ast.Dim), Toks) {
   case kind(tokens) {
     token.LBracket -> {
@@ -470,26 +695,11 @@ fn parse_dims(tokens: Toks, acc: List(ast.Dim)) -> #(List(ast.Dim), Toks) {
               parse_dims(tail(tail(t1)), [ast.DimStatic(n), ..acc])
             _ -> #(list.reverse(acc), tokens)
           }
-        token.KwDyn -> {
-          let t2 = tail(t1)
-          case kind(t2) {
-            token.RBracket -> parse_dims(tail(t2), [ast.DimDyn(None), ..acc])
-            token.Comma ->
-              case kind(tail(t2)) {
-                token.IntLit(n) ->
-                  case kind(tail(tail(t2))) {
-                    token.RBracket ->
-                      parse_dims(tail(tail(tail(t2))), [
-                        ast.DimDyn(Some(n)),
-                        ..acc
-                      ])
-                    _ -> #(list.reverse(acc), tokens)
-                  }
-                _ -> #(list.reverse(acc), tokens)
-              }
+        token.KwDyn ->
+          case kind(tail(t1)) {
+            token.RBracket -> parse_dims(tail(tail(t1)), [ast.DimDyn, ..acc])
             _ -> #(list.reverse(acc), tokens)
           }
-        }
         _ -> #(list.reverse(acc), tokens)
       }
     }
@@ -880,7 +1090,7 @@ fn parse_additive_rest(
 }
 
 fn parse_multiplicative(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
-  use #(left, t1) <- result.try(parse_power(tokens))
+  use #(left, t1) <- result.try(parse_unary(tokens))
   parse_multiplicative_rest(left, t1)
 }
 
@@ -890,27 +1100,51 @@ fn parse_multiplicative_rest(
 ) -> Result(#(ast.Expr, Toks), String) {
   case kind(tokens) {
     token.Star -> {
-      use #(right, t1) <- result.try(parse_power(tail(tokens)))
+      use #(right, t1) <- result.try(parse_unary(tail(tokens)))
       parse_multiplicative_rest(ast.EBinary(ast.OpMul, left, right), t1)
     }
     token.Slash -> {
-      use #(right, t1) <- result.try(parse_power(tail(tokens)))
+      use #(right, t1) <- result.try(parse_unary(tail(tokens)))
       parse_multiplicative_rest(ast.EBinary(ast.OpDiv, left, right), t1)
     }
     token.Percent -> {
-      use #(right, t1) <- result.try(parse_power(tail(tokens)))
+      use #(right, t1) <- result.try(parse_unary(tail(tokens)))
       parse_multiplicative_rest(ast.EBinary(ast.OpMod, left, right), t1)
     }
     _ -> Ok(#(left, tokens))
   }
 }
 
-// `**` is right-associative: `2 ** 3 ** 2` is `2 ** (3 ** 2)`.
+// Prefix `-`. It binds tighter than `* / %` but looser than `**`, which is the
+// conventional arithmetic reading: `-2 ** 2` is `-(2 ** 2)`, while `2 * -3` and
+// `2 ** -3` both put the minus on the operand it is written against.
+//
+// Applied to a numeric literal the sign is folded straight into the literal, so
+// `-3` is one `EInt(-3)` rather than a subtraction — which is what lets a
+// negative literal be recognised as one everywhere downstream (the bounds pass
+// in particular reasons about literal indexes). Anything else negates by
+// subtracting from zero, so no unary node is needed in the AST.
+fn parse_unary(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
+  case kind(tokens) {
+    token.Minus -> {
+      use #(operand, t1) <- result.try(parse_unary(tail(tokens)))
+      case operand {
+        ast.EInt(v) -> Ok(#(ast.EInt(0 - v), t1))
+        ast.EFloat(v) -> Ok(#(ast.EFloat(0.0 -. v), t1))
+        _ -> Ok(#(ast.EBinary(ast.OpSub, ast.EInt(0), operand), t1))
+      }
+    }
+    _ -> parse_power(tokens)
+  }
+}
+
+// `**` is right-associative: `2 ** 3 ** 2` is `2 ** (3 ** 2)`. Its exponent is
+// parsed at the unary level so `2 ** -3` reads the sign as part of the exponent.
 fn parse_power(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
   use #(base, t1) <- result.try(parse_with_type(tokens))
   case kind(t1) {
     token.StarStar -> {
-      use #(exponent, t2) <- result.try(parse_power(tail(t1)))
+      use #(exponent, t2) <- result.try(parse_unary(tail(t1)))
       Ok(#(ast.EBinary(ast.OpPow, base, exponent), t2))
     }
     _ -> Ok(#(base, t1))
@@ -1194,8 +1428,20 @@ fn parse_using(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
       )
     _, Some("as") -> parse_using_format(source, tail(t2))
     _, Some("run") -> {
-      use #(query, t3) <- result.try(parse_postfix(tail(t2)))
-      Ok(#(ast.EUsing(source, ast.UsingQuery(query)), t3))
+      let t3 = tail(t2)
+      case word(t3) {
+        // `run raw <text>` runs SQL assembled at runtime. Saying so is the
+        // point: it is the one form whose shape nothing can be known about, and
+        // spelling it out makes every such place greppable.
+        Some("raw") -> {
+          use #(text, t4) <- result.try(parse_postfix(tail(t3)))
+          Ok(#(ast.EUsing(source, ast.UsingRaw(text)), t4))
+        }
+        _ -> {
+          use #(query, t4) <- result.try(parse_postfix(t3))
+          Ok(#(ast.EUsing(source, ast.UsingQuery(query)), t4))
+        }
+      }
     }
     // Bare `using <path>` is a comma-separated CSV.
     _, _ -> Ok(#(ast.EUsing(source, ast.UsingCsv(None)), t2))

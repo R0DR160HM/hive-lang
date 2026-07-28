@@ -58,7 +58,11 @@ type Node {
 	peers: Str[dyn]
 }
 
-query createTable(): Str {
+// A query declares its rows. `void` means it returns none, so running it yields
+// the number of rows it affected; a single column comes back as a vector of that
+// column. Interpolated values never enter the SQL text — they become
+// placeholders bound alongside it.
+query createTable(): void {
 	CREATE TABLE cache (
 		name VARCHAR(255) PRIMARY KEY,
 		value TEXT NOT NULL,
@@ -66,15 +70,15 @@ query createTable(): Str {
 	)
 }
 
-query upsert(name: Str, value: Str): Str {
+query upsert(name: Str, value: Str): void {
 	INSERT OR REPLACE INTO cache (name, value) VALUES ({name}, {value})
 }
 
-query lookup(name: Str): Str {
+query lookup(name: Str): Str[dyn] {
 	SELECT value FROM cache WHERE name = {name}
 }
 
-query forget(name: Str): Str {
+query forget(name: Str): void {
 	DELETE FROM cache WHERE name = {name}
 }
 
@@ -83,7 +87,7 @@ query forget(name: Str): Str {
 proc cache(node: Node, msg: Cache, from: hive.syslink.Envelope): Node {
 	if msg is Cache.Store(name, value) {
 		if using node.db run upsert(name, value) is Result.Error(err) {
-			echo "  ! could not store {name}: {err.message}"
+			echo "  ! could not store {name}: {err.reason}: {err.message}"
 			return node
 		}
 		echo "  [db] stored {name}"
@@ -100,8 +104,10 @@ proc cache(node: Node, msg: Cache, from: hive.syslink.Envelope): Node {
 	}
 
 	if msg is Cache.Lookup(name) {
-		// This node's own database only.
-		if using node.db run lookup(name) is Result.Ok(rows) && rows is [_header, row] && row is [value] {
+		// This node's own database only. The query returns one column, so the
+		// result is a vector of values — no header row to skip, and exactly one
+		// of them is the hit.
+		if using node.db run lookup(name) is Result.Ok(values) && values is [value] {
 			hive.syslink.answer(from, Cache.Found(name, value))
 			return node
 		}
@@ -110,14 +116,16 @@ proc cache(node: Node, msg: Cache, from: hive.syslink.Envelope): Node {
 	}
 
 	if msg is Cache.Invalidate(name) {
-		if using node.db run forget(name) is Result.Error(err) {
-			echo "  ! could not drop {name}: {err.message}"
+		dropped := using node.db run forget(name)
+		if dropped is Result.Error(err) {
+			echo "  ! could not drop {name}: {err.reason}: {err.message}"
 			return node
 		}
-		// A delete that matched nothing is not a failure, and this node may well
-		// never have held the name — so the message says what is now true rather
-		// than claiming a row was removed.
-		echo "  [db] {name} is owned by another node now"
+		// A statement reports how many rows it touched, so this node can say
+		// whether it actually held the name rather than guessing.
+		if dropped is Result.Ok(n) && n > 0 {
+			echo "  [db] dropped {name}; another node owns it now"
+		}
 		return node
 	}
 
