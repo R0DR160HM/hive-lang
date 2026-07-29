@@ -8,8 +8,12 @@ executable for the current platform.
 ```
 hive build <entrypoint.hive>   # compile to a native executable
 hive run   <entrypoint.hive>   # compile and run
+hive check <entrypoint.hive>   # report any errors, without building anything
 hive emit  <entrypoint.hive>   # print the generated Go (handy for debugging)
 ```
+
+Errors are reported as `file:line: message`, so an editor can jump straight to
+one — see [Editor support](#editor-support).
 
 ## Requirements
 
@@ -79,6 +83,43 @@ and Linux). To confirm and work around it:
   Manage settings → Exclusions), or build into an already-excluded directory.
 * `hive emit foo.hive` prints the generated Go without producing an
   executable, which is handy while a block is being sorted out.
+
+## Editor support
+
+Every error the compiler reports opens with where it happened:
+
+```
+code-examples/2 - Types/types.hive:41: expected `]` but found `,`
+```
+
+That is the shape editors expect, so wiring one up needs nothing more than a
+compile command and a pattern to read its output with. In Vim or Neovim:
+
+```vim
+setlocal makeprg=hive\ check\ %:S
+setlocal errorformat=%-G\ %.%#,%f:%l:\ %m,%-G%.%#
+```
+
+`hive check` runs every compiler pass and stops before the Go toolchain, so it
+answers as fast as the Hive front end does and writes nothing next to the file —
+which is what makes it usable on every save. `:make` then fills the quickfix
+list, and `:cn` walks the errors.
+
+The two `%-G` items discard what is not a diagnostic: the first drops the
+indented continuation lines of a message that runs on (so one error stays one
+entry), the last drops everything else.
+
+Two limits worth knowing:
+
+* **Errors from the passes after parsing land on line 1.** Mutability, bounds,
+  the proc/func split and the type checks all run on a flattened module whose
+  nodes carry no source positions yet, so the file is as precise as they get.
+  The message names the declaration it is about.
+* **In a program with imports, those same errors are reported against the
+  entrypoint**, even when the declaration at fault came from an imported
+  module — flattening is what discards which file each declaration came from.
+  Errors the lexer, parser and import resolver raise do name the right file and
+  line, because those run per file.
 
 ## A taste of Hive
 

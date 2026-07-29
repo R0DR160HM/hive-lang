@@ -24,14 +24,19 @@ import gleam/string
 import hive/ast
 import hive/bounds
 import hive/codegen
+import hive/diagnostic
 import hive/generics
 import hive/modules
 
 /// Compile the program rooted at `entry` — a path to a `.hive` file — into the
 /// contents of the generated `main.go`, resolving its `import` graph first.
 pub fn compile_file(entry: String) -> Result(String, String) {
+  // `load`'s errors already carry the file and line they happened on; the passes
+  // `finish` runs work on a flattened module whose nodes carry no positions, so
+  // theirs are reported against the entrypoint as a whole.
   use module <- result.try(modules.load(entry))
   finish(module)
+  |> result.map_error(diagnostic.whole_file(entry, _))
 }
 
 /// Compile Hive source held in memory into the contents of the generated
@@ -40,6 +45,7 @@ pub fn compile_file(entry: String) -> Result(String, String) {
 pub fn compile(source: String) -> Result(String, String) {
   use module <- result.try(modules.load_source(source, ".", "the source"))
   finish(module)
+  |> result.map_error(diagnostic.whole_file("the source", _))
 }
 
 // Everything past import resolution, which works on one flat module and so does

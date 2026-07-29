@@ -2,6 +2,7 @@
 #
 #     .\hive.ps1 build path\to\foo.hive
 #     .\hive.ps1 run   path\to\foo.hive
+#     .\hive.ps1 check path\to\foo.hive
 #     .\hive.ps1 emit  path\to\foo.hive
 #
 # instead of `gleam run -- <args>`. File arguments are resolved to absolute

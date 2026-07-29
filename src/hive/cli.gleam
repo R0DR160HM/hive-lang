@@ -162,6 +162,15 @@ pub fn emit(entry: String) -> Result(String, String) {
   compiler.compile_file(normalize(entry))
 }
 
+/// Run every check on `entry` and throw the generated Go away, which is all an
+/// editor asking "is this file good?" needs. It skips the Go toolchain
+/// altogether — no build directory, no `go build`, nothing written next to the
+/// entrypoint — so it answers in the time the Hive passes take on their own.
+pub fn check(entry: String) -> Result(Nil, String) {
+  compiler.compile_file(normalize(entry))
+  |> result.map(fn(_) { Nil })
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

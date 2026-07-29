@@ -18,6 +18,7 @@ import gleam/int
 import gleam/list
 import gleam/result
 import gleam/string
+import hive/diagnostic
 import hive/token.{type Token, Token}
 
 const alpha = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
@@ -136,12 +137,7 @@ fn do_lex_token(
         True, _ -> lex_number(chars, line, mode, acc)
         _, True -> lex_ident(chars, line, mode, acc)
         _, _ ->
-          Error(
-            "unexpected character `"
-            <> c
-            <> "` on line "
-            <> int.to_string(line),
-          )
+          Error(diagnostic.at(line, "unexpected character `" <> c <> "`"))
       }
   }
 }
@@ -169,7 +165,7 @@ fn lex_string(
   buf: String,
 ) -> Result(List(Token), String) {
   case chars {
-    [] -> Error("unterminated string literal on line " <> int.to_string(line))
+    [] -> Error(diagnostic.at(line, "unterminated string literal"))
     ["\"", ..rest] -> {
       let tok = case parts {
         [] -> token.StringLit(buf)
@@ -212,10 +208,10 @@ fn lex_interp_code(
 ) -> Result(List(Token), String) {
   case chars {
     [] ->
-      Error(
-        "unterminated `{` interpolation in a string on line "
-        <> int.to_string(line),
-      )
+      Error(diagnostic.at(
+        line,
+        "unterminated `{` interpolation in a string",
+      ))
     ["}", ..rest] ->
       lex_string(rest, line, mode, acc, [token.SCode(code), ..parts], "")
     ["\n", ..rest] ->
@@ -238,10 +234,7 @@ fn lex_backtick(
 ) -> Result(List(Token), String) {
   case chars {
     [] ->
-      Error(
-        "unterminated multiline string starting on line "
-        <> int.to_string(start_line),
-      )
+      Error(diagnostic.at(start_line, "unterminated multiline string"))
     ["`", ..rest] ->
       do_lex(rest, line, mode, [
         Token(token.StringLit(dedent(buf)), start_line),
@@ -265,8 +258,7 @@ fn lex_atom(
 ) -> Result(List(Token), String) {
   let #(taken, rest) = take_while(chars, is_ident_continue)
   case taken {
-    [] ->
-      Error("expected an atom name after `#` on line " <> int.to_string(line))
+    [] -> Error(diagnostic.at(line, "expected an atom name after `#`"))
     _ ->
       do_lex(rest, line, mode, [
         Token(token.AtomLit(string.concat(taken)), line),
@@ -295,10 +287,7 @@ fn lex_import_path(
       let #(taken, rest) = take_while(chars, is_path_char)
       case taken {
         [] ->
-          Error(
-            "expected a module path after `import` on line "
-            <> int.to_string(line),
-          )
+          Error(diagnostic.at(line, "expected a module path after `import`"))
         _ ->
           do_lex(rest, line, Normal, [
             Token(token.PathLit(string.concat(taken)), line),
@@ -327,7 +316,7 @@ fn lex_sql(
   buf: String,
 ) -> Result(List(Token), String) {
   case chars {
-    [] -> Error("unterminated query body on line " <> int.to_string(line))
+    [] -> Error(diagnostic.at(line, "unterminated query body"))
     ["{", ..rest] -> lex_sql(rest, line, acc, depth + 1, buf <> "{")
     ["}", ..rest] ->
       case depth {
@@ -378,8 +367,7 @@ fn lex_number(
                 Token(token.FloatLit(value), line),
                 ..acc
               ])
-            Error(_) ->
-              Error("invalid float literal on line " <> int.to_string(line))
+            Error(_) -> Error(diagnostic.at(line, "invalid float literal"))
           }
         }
         False -> lex_int(taken, rest, line, mode, acc)
@@ -398,7 +386,7 @@ fn lex_int(
   case int.parse(string.concat(taken)) {
     Ok(value) ->
       do_lex(rest, line, mode, [Token(token.IntLit(value), line), ..acc])
-    Error(_) -> Error("invalid integer literal on line " <> int.to_string(line))
+    Error(_) -> Error(diagnostic.at(line, "invalid integer literal"))
   }
 }
 

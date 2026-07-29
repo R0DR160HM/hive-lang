@@ -23,6 +23,7 @@ import gleam/string
 import filepath
 import simplifile
 import hive/ast
+import hive/diagnostic
 import hive/lexer
 import hive/parser
 
@@ -50,7 +51,7 @@ pub fn load(entry: String) -> Result(ast.Module, String) {
       "could not read " <> entry <> ": " <> simplifile.describe_error(e)
     }),
   )
-  use module <- result.try(parse_module(text, None))
+  use module <- result.try(parse_module(text, entry))
   use key <- result.try(canonical(entry))
   build(Source(key, directory_of(entry), entry, module), entry)
 }
@@ -63,7 +64,7 @@ pub fn load_source(
   dir: String,
   display: String,
 ) -> Result(ast.Module, String) {
-  use module <- result.try(parse_module(source, None))
+  use module <- result.try(parse_module(source, display))
   // The key only has to be distinct from every real file's absolute path, which
   // a bare name never is, and nothing can import the in-memory entry anyway.
   build(Source("<entry>", normalize(dir), display, module), display)
@@ -95,7 +96,11 @@ fn resolve(
         list.try_fold(src.module.imports, done, fn(acc, imp) {
           use dep <- result.try(load_import(src, imp))
           case list.any(chain, fn(s) { s.key == dep.key }) {
-            True -> Error(cycle_error(chain, dep))
+            True ->
+              Error(diagnostic.in_file(
+                src.display,
+                diagnostic.at(imp.line, cycle_error(chain, dep)),
+              ))
             False -> resolve(dep, chain, acc)
           }
         }),
@@ -131,19 +136,21 @@ fn load_import(from: Source, imp: ast.Import) -> Result(Source, String) {
   use text <- result.try(
     simplifile.read(path)
     |> result.map_error(fn(e) {
-      "`import "
-      <> imp.path
-      <> "` in "
-      <> from.display
-      <> " (line "
-      <> int.to_string(imp.line)
-      <> ") does not name a readable file — looked for "
-      <> display
-      <> ": "
-      <> simplifile.describe_error(e)
+      diagnostic.in_file(
+        from.display,
+        diagnostic.at(
+          imp.line,
+          "`import "
+            <> imp.path
+            <> "` does not name a readable file — looked for "
+            <> display
+            <> ": "
+            <> simplifile.describe_error(e),
+        ),
+      )
     }),
   )
-  use module <- result.try(parse_module(text, Some(display)))
+  use module <- result.try(parse_module(text, display))
   Ok(Source(key, directory_of(path), display, module))
 }
 
@@ -153,20 +160,13 @@ fn import_path(from_dir: String, path: String) -> String {
   filepath.join(from_dir, normalize(path)) <> ".hive"
 }
 
-fn parse_module(
-  text: String,
-  display: Option(String),
-) -> Result(ast.Module, String) {
+// The lexer and parser know which line an error sits on but not which file they
+// were handed, so this is where the file goes in front of it — the only place
+// holding both.
+fn parse_module(text: String, file: String) -> Result(ast.Module, String) {
   lexer.lex(text)
   |> result.try(parser.parse)
-  |> result.map_error(fn(message) {
-    // An imported module's errors say which file they came from; the entry's
-    // do not, since there is only one file it could be.
-    case display {
-      Some(name) -> "in " <> name <> ": " <> message
-      None -> message
-    }
-  })
+  |> result.map_error(diagnostic.in_file(file, _))
 }
 
 // ---------------------------------------------------------------------------
@@ -213,42 +213,41 @@ fn context(src: Source, exports: Dict(String, Dict(String, String))) {
   let own = dict.get(exports, src.key) |> result.unwrap(dict.new())
   use modules <- result.try(
     list.try_fold(src.module.imports, dict.new(), fn(acc, imp) {
-      let at = " (" <> src.display <> " line " <> int.to_string(imp.line) <> ")"
+      // Every error below is about this one `import` line, in this one file.
+      let here = fn(message) {
+        diagnostic.in_file(src.display, diagnostic.at(imp.line, message))
+      }
       use _ <- result.try(case imp.alias {
         "hive" ->
-          Error(
+          Error(here(
             "an import cannot be named `hive`: that name belongs to the "
-            <> "standard library"
-            <> at,
-          )
+            <> "standard library",
+          ))
         _ -> Ok(Nil)
       })
       use _ <- result.try(case dict.has_key(acc, imp.alias) {
         True ->
-          Error(
+          Error(here(
             "two imports are both named `"
             <> imp.alias
-            <> "` — give one of them a different name with `as`"
-            <> at,
-          )
+            <> "` — give one of them a different name with `as`",
+          ))
         False -> Ok(Nil)
       })
       use _ <- result.try(case dict.has_key(own, imp.alias) {
         True ->
-          Error(
+          Error(here(
             "the import `"
             <> imp.alias
             <> "` has the same name as a declaration in this module — rename "
-            <> "one of them, or import with `as`"
-            <> at,
-          )
+            <> "one of them, or import with `as`",
+          ))
         False -> Ok(Nil)
       })
       use key <- result.try(canonical(import_path(src.dir, imp.path)))
       case dict.get(exports, key) {
         Ok(dep) -> Ok(dict.insert(acc, imp.alias, dep))
-        Error(_) ->
-          Error("could not resolve `import " <> imp.path <> "`" <> at)
+        Error(_) -> Error(here("could not resolve `import " <> imp.path <> "`"))
       }
     }),
   )
@@ -954,7 +953,21 @@ fn is_absolute(path: String) -> Bool {
 // `code-examples/x/../lib/text.hive` reads better as `code-examples/lib/text.hive`
 // in a message. A path that climbs above its own top cannot be collapsed, so it
 // is shown as written.
+// How a module is named in diagnostics, with `.` and `..` collapsed out of it so
+// the path reads as somewhere you could go and look.
+//
+// `filepath.expand` does that collapsing, but it reasons in POSIX terms: a
+// leading `C:` is not a root it recognises, so a Windows path comes back with
+// its drive lowercased and the slash after it doubled — which is no longer a
+// path an editor can open. The drive is split off and put back verbatim.
 fn shorten(path: String) -> String {
+  case string.split_once(path, ":/") {
+    Ok(#(drive, rest)) -> drive <> ":/" <> expand(rest)
+    Error(_) -> expand(path)
+  }
+}
+
+fn expand(path: String) -> String {
   filepath.expand(path) |> result.unwrap(path)
 }
 

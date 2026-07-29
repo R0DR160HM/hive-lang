@@ -3,12 +3,12 @@
 //// Each helper consumes tokens from the front of the list and returns the
 //// produced node together with the remaining tokens, or an error message.
 
-import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import hive/ast
+import hive/diagnostic
 import hive/lexer
 import hive/token.{type Token, Token}
 
@@ -46,21 +46,25 @@ fn tail(tokens: Toks) -> Toks {
   }
 }
 
-fn at(tokens: Toks) -> String {
-  " (line " <> int.to_string(line(tokens)) <> ")"
+/// Report `message` against the line the next token starts on. Every error the
+/// parser raises goes through here, so each one leaves already carrying its
+/// position — see `hive/diagnostic` for the shape and why it is written rather
+/// than recovered.
+fn at(tokens: Toks, message: String) -> String {
+  diagnostic.at(line(tokens), message)
 }
 
 fn expect(tokens: Toks, k: token.Kind) -> Result(Toks, String) {
   case kind(tokens) == k {
     True -> Ok(tail(tokens))
     False ->
-      Error(
+      Error(at(
+        tokens,
         "expected "
-        <> token.describe(k)
-        <> " but found "
-        <> token.describe(kind(tokens))
-        <> at(tokens),
-      )
+          <> token.describe(k)
+          <> " but found "
+          <> token.describe(kind(tokens)),
+      ))
   }
 }
 
@@ -68,11 +72,10 @@ fn expect_ident(tokens: Toks) -> Result(#(String, Toks), String) {
   case kind(tokens) {
     token.Ident(name) -> Ok(#(name, tail(tokens)))
     other ->
-      Error(
-        "expected an identifier but found "
-        <> token.describe(other)
-        <> at(tokens),
-      )
+      Error(at(
+        tokens,
+        "expected an identifier but found " <> token.describe(other),
+      ))
   }
 }
 
@@ -112,12 +115,12 @@ fn parse_decls(
       parse_decls(rest, imports, [decl, ..acc])
     }
     other ->
-      Error(
+      Error(at(
+        tokens,
         "expected `import`, `proc`, `func`, `async func`, `query` or `type` at "
-        <> "the top level but found "
-        <> token.describe(other)
-        <> at(tokens),
-      )
+          <> "the top level but found "
+          <> token.describe(other),
+      ))
   }
 }
 
@@ -131,11 +134,11 @@ fn parse_import(tokens: Toks) -> Result(#(ast.Import, Toks), String) {
   use #(path, t1) <- result.try(case kind(t0) {
     token.PathLit(path) -> Ok(#(path, tail(t0)))
     other ->
-      Error(
+      Error(at(
+        t0,
         "expected a module path after `import` but found "
-        <> token.describe(other)
-        <> at(t0),
-      )
+          <> token.describe(other),
+      ))
   })
   case kind(t1) {
     token.Ident(word) ->
@@ -145,14 +148,14 @@ fn parse_import(tokens: Toks) -> Result(#(ast.Import, Toks), String) {
           Ok(#(ast.Import(path, alias, at_line), t2))
         }
         _ ->
-          Error(
+          Error(at(
+            t1,
             "expected `as` or the next declaration after `import "
-            <> path
-            <> "` but found identifier `"
-            <> word
-            <> "`"
-            <> at(t1),
-          )
+              <> path
+              <> "` but found identifier `"
+              <> word
+              <> "`",
+          ))
       }
     _ -> {
       use alias <- result.try(default_alias(path, at_line))
@@ -169,17 +172,16 @@ fn default_alias(path: String, at_line: Int) -> Result(String, String) {
   case is_usable_name(base) {
     True -> Ok(base)
     False ->
-      Error(
+      Error(diagnostic.at(
+        at_line,
         "`import "
-        <> path
-        <> "` needs a name of its own: `"
-        <> base
-        <> "` cannot be used as one — write `import "
-        <> path
-        <> " as <name>` (line "
-        <> int.to_string(at_line)
-        <> ")",
-      )
+          <> path
+          <> "` needs a name of its own: `"
+          <> base
+          <> "` cannot be used as one — write `import "
+          <> path
+          <> " as <name>`",
+      ))
   }
 }
 
@@ -230,11 +232,10 @@ fn parse_async_func(tokens: Toks) -> Result(#(ast.Decl, Toks), String) {
       Ok(#(ast.FuncDecl(name, params, ret, body, True), t2))
     }
     other ->
-      Error(
-        "expected `func` after `async` but found "
-        <> token.describe(other)
-        <> at(t0),
-      )
+      Error(at(
+        t0,
+        "expected `func` after `async` but found " <> token.describe(other),
+      ))
   }
 }
 
@@ -249,13 +250,13 @@ fn parse_query(tokens: Toks) -> Result(#(ast.Decl, Toks), String) {
       Ok(#(ast.QueryDecl(name, params, ret, parts), tail(t1)))
     }
     other ->
-      Error(
+      Error(at(
+        t1,
         "expected a `{ ...SQL... }` body for query `"
-        <> name
-        <> "` but found "
-        <> token.describe(other)
-        <> at(t1),
-      )
+          <> name
+          <> "` but found "
+          <> token.describe(other),
+      ))
   }
 }
 
@@ -273,7 +274,7 @@ fn parse_sql_parts(sql: String, line: Int) -> Result(List(ast.SqlPart), String) 
   )
   case rest {
     [] -> Ok(parts)
-    _ -> Error("unexpected `}` in a query body (line " <> int.to_string(line) <> ")")
+    _ -> Error(diagnostic.at(line, "unexpected `}` in a query body"))
   }
 }
 
@@ -290,11 +291,7 @@ fn split_sql(
     [] ->
       case nested {
         True ->
-          Error(
-            "unterminated block in a query body (line "
-            <> int.to_string(line)
-            <> ")",
-          )
+          Error(diagnostic.at(line, "unterminated block in a query body"))
         False -> Ok(#(list.reverse(push_sql_lit(buf, acc)), []))
       }
     ["}", ..rest] if nested -> Ok(#(list.reverse(push_sql_lit(buf, acc)), rest))
@@ -356,11 +353,7 @@ fn parse_items(
   let chars = skip_space(chars)
   case chars {
     [] ->
-      Error(
-        "unterminated `where` block in a query body (line "
-        <> int.to_string(line)
-        <> ")",
-      )
+      Error(diagnostic.at(line, "unterminated `where` block in a query body"))
     ["}", ..rest] -> Ok(#(list.reverse(acc), rest))
     _ ->
       case starts_word(chars, "if"), starts_word(chars, "or"), starts_word(chars, "and") {
@@ -388,13 +381,12 @@ fn parse_items(
           parse_items(after, line, [ast.SqlNested(group), ..acc])
         }
         _, _, _ ->
-          Error(
+          Error(diagnostic.at(
+            line,
             "a `where` block holds `if <condition> { ... }` predicates and "
-            <> "nested `and { ... }` / `or { ... }` groups; found something "
-            <> "else (line "
-            <> int.to_string(line)
-            <> ")",
-          )
+              <> "nested `and { ... }` / `or { ... }` groups; found something "
+              <> "else",
+          ))
       }
   }
 }
@@ -407,11 +399,10 @@ fn take_until_brace(
 ) -> Result(#(String, List(String)), String) {
   case chars {
     [] ->
-      Error(
-        "expected `{` after an `if` condition in a `where` block (line "
-        <> int.to_string(line)
-        <> ")",
-      )
+      Error(diagnostic.at(
+        line,
+        "expected `{` after an `if` condition in a `where` block",
+      ))
     ["{", ..rest] -> Ok(#(buf, rest))
     [c, ..rest] -> take_until_brace(rest, line, buf <> c)
   }
@@ -421,11 +412,7 @@ fn expect_brace(chars: List(String), line: Int) -> Result(List(String), String) 
   case chars {
     ["{", ..rest] -> Ok(rest)
     _ ->
-      Error(
-        "expected `{` to open a `where` group (line "
-        <> int.to_string(line)
-        <> ")",
-      )
+      Error(diagnostic.at(line, "expected `{` to open a `where` group"))
   }
 }
 
@@ -483,11 +470,10 @@ fn take_sql_code(
 ) -> Result(#(ast.Expr, List(String)), String) {
   case chars {
     [] ->
-      Error(
-        "unterminated `{` interpolation in a query body (line "
-        <> int.to_string(line)
-        <> ")",
-      )
+      Error(diagnostic.at(
+        line,
+        "unterminated `{` interpolation in a query body",
+      ))
     ["}", ..rest] -> {
       use e <- result.try(parse_sub_expr(code, line))
       Ok(#(e, rest))
@@ -621,11 +607,11 @@ fn parse_type_list(
         token.Comma -> parse_type_list(tail(t1), [typ, ..acc])
         token.RParen -> Ok(#(list.reverse([typ, ..acc]), tail(t1)))
         other ->
-          Error(
+          Error(at(
+            t1,
             "expected `,` or `)` in a function type's parameters but found "
-            <> token.describe(other)
-            <> at(t1),
-          )
+              <> token.describe(other),
+          ))
       }
     }
   }
@@ -649,11 +635,11 @@ fn parse_type_args_rest(
     token.Comma -> parse_type_args_rest(tail(t1), [arg, ..acc])
     token.Gt -> Ok(#(list.reverse([arg, ..acc]), tail(t1)))
     other ->
-      Error(
+      Error(at(
+        t1,
         "expected `,` or `>` in type arguments but found "
-        <> token.describe(other)
-        <> at(t1),
-      )
+          <> token.describe(other),
+      ))
   }
 }
 
@@ -723,7 +709,7 @@ fn parse_stmts(
   case kind(tokens) {
     token.RBrace -> Ok(#(list.reverse(acc), tail(tokens)))
     token.Semicolon -> parse_stmts(tail(tokens), acc)
-    token.Eof -> Error("unexpected end of file inside a block" <> at(tokens))
+    token.Eof -> Error(at(tokens, "unexpected end of file inside a block"))
     _ -> {
       use #(stmt, t1) <- result.try(parse_stmt(tokens))
       parse_stmts(skip_semicolons(t1), [stmt, ..acc])
@@ -778,10 +764,10 @@ fn parse_mut(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
           Ok(#(ast.STypedDecl(typ, vname, value, True), t2))
         }
         _, _ ->
-          Error(
-            "expected `name := value` or `Type name = value` after `mut`"
-            <> at(tokens),
-          )
+          Error(at(
+            tokens,
+            "expected `name := value` or `Type name = value` after `mut`",
+          ))
       }
     }
   }
@@ -1174,12 +1160,13 @@ fn parse_with_type(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
           case value {
             ast.EAwait(inner, None) -> Ok(#(ast.EAwait(inner, Some(ms)), t2))
             ast.EAwait(_, Some(_)) ->
-              Error("this `await` already has a `with timeout` clause")
+              Error(at(t1, "this `await` already has a `with timeout` clause"))
             _ ->
-              Error(
+              Error(at(
+                t1,
                 "`with timeout <ms>` may only follow an `await` — it bounds how "
-                <> "long the wait may take",
-              )
+                  <> "long the wait may take",
+              ))
           }
         }
         False -> {
@@ -1240,11 +1227,11 @@ fn parse_args(
         token.Comma -> parse_args(tail(t1), [arg, ..acc])
         token.RParen -> Ok(#(list.reverse([arg, ..acc]), tail(t1)))
         other ->
-          Error(
+          Error(at(
+            t1,
             "expected `,` or `)` in argument list but found "
-            <> token.describe(other)
-            <> at(t1),
-          )
+              <> token.describe(other),
+          ))
       }
     }
   }
@@ -1295,11 +1282,11 @@ fn parse_index_or_slice(
             }
           }
         other ->
-          Error(
+          Error(at(
+            t1,
             "expected `]` or `:` in index/slice but found "
-            <> token.describe(other)
-            <> at(t1),
-          )
+              <> token.describe(other),
+          ))
       }
     }
   }
@@ -1329,12 +1316,10 @@ fn parse_primary(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
       Ok(#(inner, t2))
     }
     other ->
-      Error(
-        "unexpected "
-        <> token.describe(other)
-        <> " in an expression"
-        <> at(tokens),
-      )
+      Error(at(
+        tokens,
+        "unexpected " <> token.describe(other) <> " in an expression",
+      ))
   }
 }
 
@@ -1351,11 +1336,11 @@ fn parse_vector(
         token.RBracket ->
           Ok(#(ast.EVector(list.reverse([item, ..acc])), tail(t1)))
         other ->
-          Error(
+          Error(at(
+            t1,
             "expected `,` or `]` in a vector literal but found "
-            <> token.describe(other)
-            <> at(t1),
-          )
+              <> token.describe(other),
+          ))
       }
     }
   }
@@ -1390,15 +1375,14 @@ fn parse_sub_expr(code: String, line: Int) -> Result(ast.Expr, String) {
   case kind(rest) {
     token.Eof -> Ok(e)
     other ->
-      Error(
+      Error(diagnostic.at(
+        line,
         "unexpected "
-        <> token.describe(other)
-        <> " in interpolated expression `"
-        <> code
-        <> "` (line "
-        <> int.to_string(line)
-        <> ")",
-      )
+          <> token.describe(other)
+          <> " in interpolated expression `"
+          <> code
+          <> "`",
+      ))
   }
 }
 
@@ -1420,12 +1404,12 @@ fn parse_using(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
     // `using ... with ...` used to mean both a CSV delimiter and a SQL query,
     // told apart by the source's type. Both now say which they are.
     token.KwWith, _ ->
-      Error(
+      Error(at(
+        t2,
         "`using ... with ...` has been split into two forms that each name what "
-        <> "they read: `using <path> as csv separating by <separator>` for a "
-        <> "delimited file, and `using <connection> run <query>` for SQL"
-        <> at(t2),
-      )
+          <> "they read: `using <path> as csv separating by <separator>` for a "
+          <> "delimited file, and `using <connection> run <query>` for SQL",
+      ))
     _, Some("as") -> parse_using_format(source, tail(t2))
     _, Some("run") -> {
       let t3 = tail(t2)
@@ -1463,11 +1447,7 @@ fn parse_using_format(
               use #(separator, t2) <- result.try(parse_postfix(tail(tail(t1))))
               Ok(#(ast.EUsing(source, ast.UsingCsv(Some(separator))), t2))
             }
-            _ ->
-              Error(
-                "expected `by` after `separating`"
-                <> at(tail(t1)),
-              )
+            _ -> Error(at(tail(t1), "expected `by` after `separating`"))
           }
         _ -> Ok(#(ast.EUsing(source, ast.UsingCsv(None)), t1))
       }
@@ -1475,18 +1455,18 @@ fn parse_using_format(
     Some("xlsx") -> Ok(#(ast.EUsing(source, ast.UsingXlsx), tail(tokens)))
     Some("ods") -> Ok(#(ast.EUsing(source, ast.UsingOds), tail(tokens)))
     Some(other) ->
-      Error(
+      Error(at(
+        tokens,
         "`using ... as "
-        <> other
-        <> "` is not a table format (expected `csv`, `xlsx` or `ods`)"
-        <> at(tokens),
-      )
+          <> other
+          <> "` is not a table format (expected `csv`, `xlsx` or `ods`)",
+      ))
     None ->
-      Error(
+      Error(at(
+        tokens,
         "expected a table format after `as` (`csv`, `xlsx` or `ods`) but found "
-        <> token.describe(kind(tokens))
-        <> at(tokens),
-      )
+          <> token.describe(kind(tokens)),
+      ))
   }
 }
 
@@ -1545,17 +1525,17 @@ fn parse_vector_pattern(
         token.RBracket ->
           Ok(#(ast.PVector(list.reverse([elem, ..acc]), None), tail(t1)))
         token.Ellipsis ->
-          Error(
+          Error(at(
+            t1,
             "a `...` rest in a vector pattern must be separated from the "
-            <> "previous element by a `,`"
-            <> at(t1),
-          )
+              <> "previous element by a `,`",
+          ))
         other ->
-          Error(
+          Error(at(
+            t1,
             "expected `,` or `]` in a vector pattern but found "
-            <> token.describe(other)
-            <> at(t1),
-          )
+              <> token.describe(other),
+          ))
       }
     }
   }
@@ -1574,11 +1554,11 @@ fn parse_pattern_elem(tokens: Toks) -> Result(#(ast.PatElem, Toks), String) {
     | ast.EAtom(_) -> Ok(#(ast.PElemLit(e), t1))
     ast.EIdent(name) -> Ok(#(ast.PElemBind(name), t1))
     _ ->
-      Error(
+      Error(at(
+        tokens,
         "a vector pattern element must be a literal (string, number, boolean "
-        <> "or atom) or a binding name"
-        <> at(tokens),
-      )
+          <> "or atom) or a binding name",
+      ))
   }
 }
 
@@ -1608,24 +1588,22 @@ fn str_pattern_parts(
 fn hole_name(code: String, line: Int) -> Result(String, String) {
   case string.trim(code) {
     "" ->
-      Error(
-        "an empty `{}` hole is not allowed in a string pattern (line "
-        <> int.to_string(line)
-        <> ")",
-      )
+      Error(diagnostic.at(
+        line,
+        "an empty `{}` hole is not allowed in a string pattern",
+      ))
     trimmed -> {
       use e <- result.try(parse_sub_expr(code, line))
       case e {
         ast.EIdent(name) -> Ok(name)
         _ ->
-          Error(
+          Error(diagnostic.at(
+            line,
             "a `{...}` hole in a string pattern must be a single binding name, "
-            <> "but found `"
-            <> trimmed
-            <> "` (line "
-            <> int.to_string(line)
-            <> ")",
-          )
+              <> "but found `"
+              <> trimmed
+              <> "`",
+          ))
       }
     }
   }
@@ -1637,13 +1615,12 @@ fn check_no_adjacent_holes(
 ) -> Result(Nil, String) {
   case parts {
     [ast.SPatHole(_), ast.SPatHole(_), ..] ->
-      Error(
+      Error(diagnostic.at(
+        line,
         "two `{...}` holes in a string pattern must be separated by some "
-        <> "literal text, otherwise where one ends and the next begins is "
-        <> "ambiguous (line "
-        <> int.to_string(line)
-        <> ")",
-      )
+          <> "literal text, otherwise where one ends and the next begins is "
+          <> "ambiguous",
+      ))
     [_, ..rest] -> check_no_adjacent_holes(rest, line)
     [] -> Ok(Nil)
   }
@@ -1674,11 +1651,11 @@ fn parse_bindings(
         token.Comma -> parse_bindings(tail(t1), [name, ..acc])
         token.RParen -> Ok(#(list.reverse([name, ..acc]), tail(t1)))
         other ->
-          Error(
+          Error(at(
+            t1,
             "expected `,` or `)` in pattern bindings but found "
-            <> token.describe(other)
-            <> at(t1),
-          )
+              <> token.describe(other),
+          ))
       }
     }
   }
