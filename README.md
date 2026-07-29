@@ -325,8 +325,8 @@ compiles, builds and runs.
 * **Distribution** — [`hive.syslink`](#hivesyslink) adds *services*: long-lived,
   addressable things with a mailbox and private state, reached by the same
   statement whether they live in this process or on another machine.
-  `hive.syslink.send(address, message)` is the only way to reach one, and — as
-  with an `async func` — the call site decides what it means: as a statement it
+  Calling the address — `address(message)` — is the only way to reach one, and —
+  as with an `async func` — the call site decides what it means: as a statement it
   is fire-and-forget, kept it is a request in flight, and `await`ed it yields
   `Result<Message, hive.syslink.SyslinkError>`. A service answers with one of its
   own messages, so the reply type is the mailbox type and nothing needs
@@ -1043,7 +1043,7 @@ Scheduling controls over the virtual threads an `async func` runs on.
 
   On a [`hive.syslink`](#hivesyslink) request the clause folds into that module's
   own error instead of wrapping a second `Result` around the first, so
-  `await hive.syslink.send(a, m) with timeout 250` is still a
+  `await a(m) with timeout 250` is still a
   `Result<Message, hive.syslink.SyslinkError>` whose reason is `"Timeout"`.
   Omitted, syslink waits its own default (5s).
 
@@ -1066,8 +1066,9 @@ A service is deliberately **not** an `async T`. The two features do not overlap:
 | --- | --- | --- |
 | lifetime | scoped — cannot outlive its spawner | unscoped — outlives everything |
 | identity | none (a join point) | yes, that is the point |
-| interaction | `await`, yields `T` | `send`, yields nothing |
+| interaction | `await`, yields `T` | called with a message; as a statement yields nothing |
 | as a value | cannot be stored, returned or passed | ordinary value; can even be sent inside a message |
+| callable | no — it is already running | yes, and calling it *is* the send |
 
 **The handler is a fold over the mailbox.** `proc (State, Message,
 hive.syslink.Envelope): State` — state in, one message, the turn's envelope, and
@@ -1126,19 +1127,29 @@ opening two and splitting the ordering guarantee between them.
 * `hive.syslink.stop(address)` shuts a service down; calling it twice is
   harmless.
 
-**Messages.** There is exactly **one** way to reach a service, and — as with an
-`async func` — what the *call site* does with it decides what it means:
+**Messages: an address is called.** There is exactly **one** way to reach a
+service — you *call its address* — and, as with an `async func`, what the *call
+site* does with it decides what it means. There is no `send` and no `call`: an
+address is not a handle you pass to some function, it is the thing you call.
 
 ```hive
-hive.syslink.send(inbox, Note.Say("hi"))          // statement: fire-and-forget
-pending := hive.syslink.send(cache, Op.Count())   // keep the request in flight
-answer := await pending                            // wait for it
-answer := await pending with timeout 250           // ...for at most 250ms
-answer := await hive.syslink.send(cache, Op.Count())        // spawn + wait
-both := await [hive.syslink.send(a, m), hive.syslink.send(b, m)]  // one barrier
+inbox(Note.Say("hi"))                    // statement: fire-and-forget
+pending := cache(Op.Count())             // keep the request in flight
+answer := await pending                  // wait for it
+answer := await pending with timeout 250 // ...for at most 250ms
+answer := await cache(Op.Count())        // send + wait
+both := await [a(m), b(m)]               // one barrier, one deadline
 ```
 
-* As a **statement**, `hive.syslink.send(address, message)` returns `void` and
+The callee's *type* is what makes this a send, never its spelling, so a local, a
+parameter, a vector element and a fresh `at(#Name)` are all callable the same way
+— and an address that shares a name with a declared func resolves to the address,
+exactly as a local shadows a declaration everywhere else. An address carries one
+message and nothing else: a second argument, a named argument, a missing message
+and a partial application (`c(_)`) are each rejected by name, because each is a
+mistake about what the value is.
+
+* As a **statement**, `address(message)` returns `void` and
   **never blocks and never fails.** A dead or unreachable recipient is not an
   error at the send site — that is precisely what keeps a local send and a remote
   one the same statement, and failure is discovered through a monitor instead.
@@ -1281,8 +1292,8 @@ Set `HIVE_SYSLINK_STRICT=1` to force **local** sends through the same
 encode/decode path a remote one takes. A message that could not survive the wire
 then fails in a single-process run instead of the first time a peer is added.
 
-Not yet built: rejecting a mismatched `send` at compile time (the registry knows
-each mailbox's type, but a wrong-typed message is currently caught by the digest
+Not yet built: rejecting a mismatched message at the call site at compile time
+(the registry knows each mailbox's type, but a wrong-typed message is caught by the digest
 at runtime — the recipient drops it and says so — rather than refused by the
 compiler), message fragmentation (a frame over 8 MB is refused rather than split,
 so a very large message can head-of-line block its node pair), a WebSocket
@@ -1463,10 +1474,10 @@ See [`code-examples/11 - Modules`](code-examples/11%20-%20Modules/modules.hive).
 | `hive.syslink.spawn(handler, state)`    | `hive.SyslinkSpawn(handler, state, dec, digest, repliesInTurn)` → `hive.Address` |
 | `hive.syslink.register(#N, a)`           | `hive.SyslinkRegister(atom_N, a)` → `Result[Address, SyslinkError]` |
 | `hive.syslink.at(#N)` / `.on(endpoint, #N)` | `hive.SyslinkAt(atom_N)` / `hive.SyslinkOn(endpoint, atom_N)`  |
-| `hive.syslink.send(a, msg)` (statement) | `hive.SyslinkSend(a, clone_T(msg), enc, digest)` (a cast: copied in, never fails) |
-| `h := hive.syslink.send(a, msg)`        | `hive.SyslinkSendAwaitable(a, clone_T(msg), enc, digest, dec)` → `*hive.SyslinkPending[M]` |
+| `a(msg)` (statement)                    | `hive.SyslinkSend(a, clone_T(msg), enc, digest)` (a cast: copied in, never fails) |
+| `h := a(msg)`                           | `hive.SyslinkSendAwaitable(a, clone_T(msg), enc, digest, dec)` → `*hive.SyslinkPending[M]` |
 | `await h` / `await h with timeout ms`   | `hive.SyslinkAwait(h, 0)` / `hive.SyslinkAwait(h, ms)` → `Result[M, SyslinkError]` |
-| `await [send(..), send(..)] with timeout ms` | `hive.SyslinkAwaitAll(ps, ms)` → `[]Result[M, SyslinkError]`  |
+| `await [a(m1), b(m2)] with timeout ms`  | `hive.SyslinkAwaitAll(ps, ms)` → `[]Result[M, SyslinkError]`  |
 | `hive.syslink.answer(from, v)` / `.self(from)` | `hive.SyslinkAnswer(from, v, enc)` / `hive.SyslinkSelf(from)` |
 | `hive.syslink.monitor(from, t, msg)`    | `hive.SyslinkMonitor(from, t, msg, enc, digest)`                |
 | `hive.syslink.stop(a)` / `.node()`      | `hive.SyslinkStop(a)` / `hive.SyslinkNode()` → `string`         |

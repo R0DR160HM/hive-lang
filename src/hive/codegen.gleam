@@ -472,6 +472,7 @@ fn walk_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
 
 fn walk_expr(env: Env, e: ast.Expr) -> Result(Nil, String) {
   use _ <- result.try(check_indexable(env, e))
+  use _ <- result.try(check_address_call(env, e))
   case e {
     ast.EInt(_)
     | ast.EFloat(_)
@@ -506,6 +507,55 @@ fn walk_expr(env: Env, e: ast.Expr) -> Result(Nil, String) {
 fn walk_exprs(env: Env, exprs: List(ast.Expr)) -> Result(Nil, String) {
   list.try_fold(exprs, Nil, fn(_, e) { walk_expr(env, e) })
   |> result.map(fn(_) { Nil })
+}
+
+// Calling a service address carries exactly one message, and nothing else. The
+// address is a mailbox, not a function: there is no second parameter to name, no
+// hole to leave for later, and nothing to overload. Every other shape is a
+// mistake about what the value is, so each is named rather than lowered.
+fn check_address_call(env: Env, e: ast.Expr) -> Result(Nil, String) {
+  case e {
+    ast.ECall(callee, args) ->
+      case address_call_msg(env, callee) {
+        None -> Ok(Nil)
+        Some(_) ->
+          case args {
+            [ast.Arg(Some(label), _)] ->
+              Error(
+                "a service address takes its message as a plain argument, so `"
+                <> label
+                <> ":` has nothing to name — write `address(message)`. A mailbox "
+                <> "has one message per turn, not a parameter list.",
+              )
+            [ast.Arg(None, ast.EIdent("_"))] ->
+              Error(
+                "a service address cannot be partially applied: `_` leaves a "
+                <> "hole for an argument that arrives later, and a send has "
+                <> "nothing to wait for — the message is the whole call. Pass "
+                <> "the address itself if you meant to hand the service on; it "
+                <> "is an ordinary value and can even travel inside a message.",
+              )
+            [_] -> Ok(Nil)
+            [] ->
+              Error(
+                "calling a service address sends it a message, so it needs one: "
+                <> "`address(message)`. To reach a service without saying "
+                <> "anything, give its mailbox a field-less variant and send "
+                <> "that.",
+              )
+            _ ->
+              Error(
+                "a service address is called with exactly one message, and "
+                <> int.to_string(list.length(args))
+                <> " were passed. A mailbox handles one message per turn, so a "
+                <> "second argument has nowhere to go — put the extra data in "
+                <> "the message type instead, which is also what makes it "
+                <> "checkable and sendable to another node.",
+              )
+          }
+      }
+    _ -> Ok(Nil)
+  }
 }
 
 // `[...]` on a `Str`. Go would index the string's *bytes*, which is the wrong
@@ -2202,25 +2252,30 @@ fn gen_stmt(
       }
       #(pad <> target <> " = " <> gen_append(env, args) <> "\n", env)
     }
-    // `hive.syslink.send(...)` as a bare statement wants no answer, so it lowers
-    // to the cast: nothing is registered for a reply and nothing can be awaited.
-    // The same call keeping its value is a request instead — the call site
-    // decides, just as it does for an `async func` below.
-    ast.SExpr(ast.ECall(
-      ast.EMember(ast.EMember(ast.EIdent("hive"), "syslink"), "send"),
-      args,
-    )) -> #(pad <> gen_syslink_send(env, args, False) <> "\n", env)
+    // An address called as a bare statement wants no answer, so it lowers to the
+    // cast: nothing is registered for a reply and nothing can be awaited. The
+    // same call keeping its value is a request instead — the call site decides,
+    // just as it does for an `async func` below.
+    //
     // A bare call to an `async func` as a statement is fire-and-forget: run it
     // on its own goroutine and discard the result. `go f(x)` is the cheapest
     // lowering (no handle, no channel) — the `hive.Spawn` handle form is only
     // needed when the result is kept (an RHS, a vector element).
-    ast.SExpr(ast.ECall(ast.EIdent(name), args) as call) ->
-      case list.contains(env.asyncs, name) {
-        True -> #(
-          pad <> "go " <> gen_call(env, ast.EIdent(name), args) <> "\n",
+    ast.SExpr(ast.ECall(callee, args) as call) ->
+      case is_address_call(env, callee), callee {
+        True, _ -> #(
+          pad <> gen_address_send(env, callee, args, False) <> "\n",
           env,
         )
-        False -> #(pad <> gen_expr(env, call) <> "\n", env)
+        False, ast.EIdent(name) ->
+          case list.contains(env.asyncs, name) {
+            True -> #(
+              pad <> "go " <> gen_call(env, ast.EIdent(name), args) <> "\n",
+              env,
+            )
+            False -> #(pad <> gen_expr(env, call) <> "\n", env)
+          }
+        False, _ -> #(pad <> gen_expr(env, call) <> "\n", env)
       }
     ast.SExpr(e) -> #(pad <> gen_expr(env, e) <> "\n", env)
     ast.SIf(branches, else_body) -> #(
@@ -2974,210 +3029,19 @@ pub fn infer(env: Env, e: ast.Expr) -> Ty {
           }
         _ -> TyUnknown
       }
+    // Calling an address is a request in flight, whose answer is the mailbox's
+    // own type. Discarded as a statement it is a cast, which never reaches
+    // `infer`. The address test comes first so an address-typed local wins over
+    // a func of the same name, matching how a local shadows a declaration
+    // everywhere else.
     ast.ECall(callee, args) ->
-      case callee {
-        ast.EIdent("len") -> TyInt
-        ast.EIdent("bytes") -> TyInt
-        ast.EIdent("join") -> TyStr
-        ast.EIdent("split") -> TyVec(TyStr)
-        ast.EIdent("row") -> TyVec(TyStr)
-        ast.EIdent("column") -> TyVec(TyStr)
-        // `indexOf` yields the position it found, or an Error carrying `false`
-        // (there is nothing to say about a miss beyond that it missed).
-        ast.EIdent("indexOf") -> TyResult(TyInt, TyBool)
-        // `append` yields a vector of the same type as its first argument.
-        ast.EIdent("append") ->
-          case args {
-            [ast.Arg(_, first), ..] -> infer(env, first)
-            [] -> TyUnknown
+      case address_call_msg(env, callee) {
+        Some(_) ->
+          case address_call_arg(args) {
+            Some(message) -> TyPending(syslink_reply_ty(env, callee, message))
+            None -> TyPending(TyUnknown)
           }
-        ast.EIdent(name) ->
-          case has_hole(args) {
-            // A call with `_` placeholders is a partial application, whose
-            // value is a function taking the holes as its parameters.
-            True -> partial_ty(env, name, args)
-            False ->
-              case dict.get(env.locals, name) {
-                // Calling a function-valued local yields its return type.
-                Ok(TyFunc(_, _, ret)) -> ret
-                _ ->
-                  case dict.has_key(env.types, name) {
-                    True -> TyCustom(name)
-                    False ->
-                      case dict.get(env.sigs, name) {
-                        // A bare call to an `async func` does not block; it
-                        // spawns the work and evaluates to a handle (`async T`).
-                        Ok(#(_, ret)) ->
-                          case list.contains(env.asyncs, name) {
-                            True -> TyAsync(ret)
-                            False -> ret
-                          }
-                        Error(_) -> TyUnknown
-                      }
-                  }
-              }
-          }
-        // `hive.sql.DatabaseDriver.SQLite()` and friends build a driver value.
-        ast.EMember(
-          ast.EMember(
-            ast.EMember(ast.EIdent("hive"), "sql"),
-            "DatabaseDriver",
-          ),
-          _,
-        ) -> TyBuiltin("DatabaseDriver")
-        // A `hive.<ns>.<member>` call: a builtin type constructor if the
-        // member names a builtin type, else a stdlib function's result type.
-        ast.EMember(ast.EMember(ast.EIdent("hive"), ns), fname) ->
-          case builtin_fields(fname) {
-            Some(_) -> TyBuiltin(fname)
-            None ->
-              case ns {
-                "net" ->
-                  case fname {
-                    "httpRequest" ->
-                      TyResult(TyBuiltin("HttpResponse"), TyBuiltin("HttpError"))
-                    "wsConnect" ->
-                      TyResult(TyBuiltin("WsConnection"), TyBuiltin("WsError"))
-                    // The Ok payload of a send is the byte count it carried.
-                    "wsSend" -> TyResult(TyInt, TyBuiltin("WsError"))
-                    "wsReceive" -> TyResult(TyStr, TyBuiltin("WsError"))
-                    "wsRequest" -> TyBuiltin("HttpRequest")
-                    "socketConnect" ->
-                      TyResult(
-                        TyBuiltin("SocketConnection"),
-                        TyBuiltin("SocketError"),
-                      )
-                    "socketSend" -> TyResult(TyInt, TyBuiltin("SocketError"))
-                    "socketReceive" | "socketReceiveLine" ->
-                      TyResult(TyStr, TyBuiltin("SocketError"))
-                    "socketPeer" -> TyStr
-                    _ -> TyUnknown
-                  }
-                "file" ->
-                  case fname {
-                    "read" -> TyResult(TyStr, TyBuiltin("FileError"))
-                    "lines" | "list" ->
-                      TyResult(TyVec(TyStr), TyBuiltin("FileError"))
-                    "write" | "append" | "size" | "copy" ->
-                      TyResult(TyInt, TyBuiltin("FileError"))
-                    "delete" | "makeDir" | "move" ->
-                      TyResult(TyBool, TyBuiltin("FileError"))
-                    "exists" -> TyBool
-                    _ -> TyUnknown
-                  }
-                "json" ->
-                  case fname {
-                    "table" -> TyResult(TyTable, TyBuiltin("JsonError"))
-                    "get" -> TyResult(TyStr, TyBuiltin("JsonError"))
-                    "encode" -> TyStr
-                    _ -> TyUnknown
-                  }
-                "crypto" ->
-                  case fname {
-                    "sha256"
-                    | "sha512"
-                    | "hmacSha256"
-                    | "base64Encode"
-                    | "randomHex" -> TyStr
-                    "base64Decode" -> TyResult(TyStr, TyBuiltin("CryptoError"))
-                    "jwtSign" -> TyStr
-                    "jwtHeader" ->
-                      TyResult(TyBuiltin("JwtHeader"), TyBuiltin("CryptoError"))
-                    _ -> TyResult(TyUnknown, TyBuiltin("CryptoError"))
-                  }
-                "sql" ->
-                  case fname {
-                    "connect" | "pool" ->
-                      TyResult(TyBuiltin("SqlConnection"), TyBuiltin("SqlError"))
-                    _ -> TyUnknown
-                  }
-                "conv" ->
-                  case fname {
-                    "ceil" | "floor" | "round" -> TyInt
-                    "itf" -> TyFloat
-                    "its" | "fts" -> TyStr
-                    "sti" -> TyResult(TyInt, TyBuiltin("ConversionError"))
-                    "stf" -> TyResult(TyFloat, TyBuiltin("ConversionError"))
-                    _ -> TyUnknown
-                  }
-                "env" ->
-                  case fname {
-                    "get" -> TyResult(TyStr, TyBuiltin("EnvironmentError"))
-                    _ -> TyUnknown
-                  }
-                "term" ->
-                  case fname {
-                    "read" -> TyStr
-                    "args" -> TyVec(TyStr)
-                    // `print` is a void statement.
-                    _ -> TyVoid
-                  }
-                "task" ->
-                  case fname {
-                    // `sleep` is a void statement.
-                    _ -> TyVoid
-                  }
-                "syslink" ->
-                  case fname {
-                    // A spawned service's address carries the type of the
-                    // mailbox behind it, read off the handler it was given.
-                    "spawn" ->
-                      case assign_args(args, ["handler", "state"]) {
-                        #([#(_, handler), _], []) ->
-                          TyAddress(handler_msg_ty(env, handler))
-                        _ -> TyAddress(TyUnknown)
-                      }
-                    // Neither `at` nor `on` needs a `with`: the service name is
-                    // an atom, so the registry that answers "what does this
-                    // mailbox take?" is known at compile time. The node is just
-                    // an endpoint and tells the compiler nothing, which is
-                    // exactly why it does not need to be an atom.
-                    "at" ->
-                      case assign_args(args, ["name"]) {
-                        #([#(_, ast.EAtom(name))], []) ->
-                          registered_address(env, name)
-                        _ -> TyAddress(TyUnknown)
-                      }
-                    "on" ->
-                      case assign_args(args, ["endpoint", "name"]) {
-                        #([_, #(_, ast.EAtom(name))], []) ->
-                          registered_address(env, name)
-                        _ -> TyAddress(TyUnknown)
-                      }
-                    "self" -> TyAddress(TyUnknown)
-                    "register" ->
-                      TyResult(
-                        TyAddress(TyUnknown),
-                        TyBuiltin("SyslinkError"),
-                      )
-                    "listen" -> TyResult(TyStr, TyBuiltin("SyslinkError"))
-                    "node" -> TyStr
-                    // A kept `send` is a request in flight. Discarded as a
-                    // statement it is a cast, which never reaches `infer`.
-                    "send" ->
-                      case assign_args(args, ["address", "message"]) {
-                        #([#(_, address), #(_, message)], []) ->
-                          TyPending(syslink_reply_ty(env, address, message))
-                        _ -> TyPending(TyUnknown)
-                      }
-                    // answer, monitor, peer and stop are void statements.
-                    _ -> TyVoid
-                  }
-                "time" ->
-                  case fname {
-                    "now" | "timezoneOffset" -> TyInt
-                    "timezone" | "format" -> TyStr
-                    _ -> TyUnknown
-                  }
-                _ -> TyUnknown
-              }
-          }
-        ast.EMember(ast.EIdent(type_name), _) ->
-          case dict.has_key(env.types, type_name) {
-            True -> TyCustom(type_name)
-            False -> TyUnknown
-          }
-        _ -> TyUnknown
+        None -> infer_plain_call(env, callee, args)
       }
     ast.EIndex(target, _) ->
       case infer(env, target) {
@@ -3255,6 +3119,209 @@ pub fn infer(env: Env, e: ast.Expr) -> Ty {
         TyVec(TyAsync(t)), None -> TyVec(t)
         other, _ -> other
       }
+  }
+}
+
+// The type of an ordinary call: a builtin, a type constructor, a func-valued
+// local, a declared proc/func, or a member of a stdlib namespace. Calling a
+// service address is none of these, and `infer` has already settled that case
+// before anything reaches here.
+fn infer_plain_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> Ty {
+  case callee {
+    ast.EIdent("len") -> TyInt
+    ast.EIdent("bytes") -> TyInt
+    ast.EIdent("join") -> TyStr
+    ast.EIdent("split") -> TyVec(TyStr)
+    ast.EIdent("row") -> TyVec(TyStr)
+    ast.EIdent("column") -> TyVec(TyStr)
+    // `indexOf` yields the position it found, or an Error carrying `false`
+    // (there is nothing to say about a miss beyond that it missed).
+    ast.EIdent("indexOf") -> TyResult(TyInt, TyBool)
+    // `append` yields a vector of the same type as its first argument.
+    ast.EIdent("append") ->
+      case args {
+        [ast.Arg(_, first), ..] -> infer(env, first)
+        [] -> TyUnknown
+      }
+    ast.EIdent(name) ->
+      case has_hole(args) {
+        // A call with `_` placeholders is a partial application, whose
+        // value is a function taking the holes as its parameters.
+        True -> partial_ty(env, name, args)
+        False ->
+          case dict.get(env.locals, name) {
+            // Calling a function-valued local yields its return type.
+            Ok(TyFunc(_, _, ret)) -> ret
+            _ ->
+              case dict.has_key(env.types, name) {
+                True -> TyCustom(name)
+                False ->
+                  case dict.get(env.sigs, name) {
+                    // A bare call to an `async func` does not block; it
+                    // spawns the work and evaluates to a handle (`async T`).
+                    Ok(#(_, ret)) ->
+                      case list.contains(env.asyncs, name) {
+                        True -> TyAsync(ret)
+                        False -> ret
+                      }
+                    Error(_) -> TyUnknown
+                  }
+              }
+          }
+      }
+    // `hive.sql.DatabaseDriver.SQLite()` and friends build a driver value.
+    ast.EMember(
+      ast.EMember(
+        ast.EMember(ast.EIdent("hive"), "sql"),
+        "DatabaseDriver",
+      ),
+      _,
+    ) -> TyBuiltin("DatabaseDriver")
+    // A `hive.<ns>.<member>` call: a builtin type constructor if the
+    // member names a builtin type, else a stdlib function's result type.
+    ast.EMember(ast.EMember(ast.EIdent("hive"), ns), fname) ->
+      case builtin_fields(fname) {
+        Some(_) -> TyBuiltin(fname)
+        None ->
+          case ns {
+            "net" ->
+              case fname {
+                "httpRequest" ->
+                  TyResult(TyBuiltin("HttpResponse"), TyBuiltin("HttpError"))
+                "wsConnect" ->
+                  TyResult(TyBuiltin("WsConnection"), TyBuiltin("WsError"))
+                // The Ok payload of a send is the byte count it carried.
+                "wsSend" -> TyResult(TyInt, TyBuiltin("WsError"))
+                "wsReceive" -> TyResult(TyStr, TyBuiltin("WsError"))
+                "wsRequest" -> TyBuiltin("HttpRequest")
+                "socketConnect" ->
+                  TyResult(
+                    TyBuiltin("SocketConnection"),
+                    TyBuiltin("SocketError"),
+                  )
+                "socketSend" -> TyResult(TyInt, TyBuiltin("SocketError"))
+                "socketReceive" | "socketReceiveLine" ->
+                  TyResult(TyStr, TyBuiltin("SocketError"))
+                "socketPeer" -> TyStr
+                _ -> TyUnknown
+              }
+            "file" ->
+              case fname {
+                "read" -> TyResult(TyStr, TyBuiltin("FileError"))
+                "lines" | "list" ->
+                  TyResult(TyVec(TyStr), TyBuiltin("FileError"))
+                "write" | "append" | "size" | "copy" ->
+                  TyResult(TyInt, TyBuiltin("FileError"))
+                "delete" | "makeDir" | "move" ->
+                  TyResult(TyBool, TyBuiltin("FileError"))
+                "exists" -> TyBool
+                _ -> TyUnknown
+              }
+            "json" ->
+              case fname {
+                "table" -> TyResult(TyTable, TyBuiltin("JsonError"))
+                "get" -> TyResult(TyStr, TyBuiltin("JsonError"))
+                "encode" -> TyStr
+                _ -> TyUnknown
+              }
+            "crypto" ->
+              case fname {
+                "sha256"
+                | "sha512"
+                | "hmacSha256"
+                | "base64Encode"
+                | "randomHex" -> TyStr
+                "base64Decode" -> TyResult(TyStr, TyBuiltin("CryptoError"))
+                "jwtSign" -> TyStr
+                "jwtHeader" ->
+                  TyResult(TyBuiltin("JwtHeader"), TyBuiltin("CryptoError"))
+                _ -> TyResult(TyUnknown, TyBuiltin("CryptoError"))
+              }
+            "sql" ->
+              case fname {
+                "connect" | "pool" ->
+                  TyResult(TyBuiltin("SqlConnection"), TyBuiltin("SqlError"))
+                _ -> TyUnknown
+              }
+            "conv" ->
+              case fname {
+                "ceil" | "floor" | "round" -> TyInt
+                "itf" -> TyFloat
+                "its" | "fts" -> TyStr
+                "sti" -> TyResult(TyInt, TyBuiltin("ConversionError"))
+                "stf" -> TyResult(TyFloat, TyBuiltin("ConversionError"))
+                _ -> TyUnknown
+              }
+            "env" ->
+              case fname {
+                "get" -> TyResult(TyStr, TyBuiltin("EnvironmentError"))
+                _ -> TyUnknown
+              }
+            "term" ->
+              case fname {
+                "read" -> TyStr
+                "args" -> TyVec(TyStr)
+                // `print` is a void statement.
+                _ -> TyVoid
+              }
+            "task" ->
+              case fname {
+                // `sleep` is a void statement.
+                _ -> TyVoid
+              }
+            "syslink" ->
+              case fname {
+                // A spawned service's address carries the type of the
+                // mailbox behind it, read off the handler it was given.
+                "spawn" ->
+                  case assign_args(args, ["handler", "state"]) {
+                    #([#(_, handler), _], []) ->
+                      TyAddress(handler_msg_ty(env, handler))
+                    _ -> TyAddress(TyUnknown)
+                  }
+                // Neither `at` nor `on` needs a `with`: the service name is
+                // an atom, so the registry that answers "what does this
+                // mailbox take?" is known at compile time. The node is just
+                // an endpoint and tells the compiler nothing, which is
+                // exactly why it does not need to be an atom.
+                "at" ->
+                  case assign_args(args, ["name"]) {
+                    #([#(_, ast.EAtom(name))], []) ->
+                      registered_address(env, name)
+                    _ -> TyAddress(TyUnknown)
+                  }
+                "on" ->
+                  case assign_args(args, ["endpoint", "name"]) {
+                    #([_, #(_, ast.EAtom(name))], []) ->
+                      registered_address(env, name)
+                    _ -> TyAddress(TyUnknown)
+                  }
+                "self" -> TyAddress(TyUnknown)
+                "register" ->
+                  TyResult(
+                    TyAddress(TyUnknown),
+                    TyBuiltin("SyslinkError"),
+                  )
+                "listen" -> TyResult(TyStr, TyBuiltin("SyslinkError"))
+                "node" -> TyStr
+                // answer, monitor, peer and stop are void statements.
+                _ -> TyVoid
+              }
+            "time" ->
+              case fname {
+                "now" | "timezoneOffset" -> TyInt
+                "timezone" | "format" -> TyStr
+                _ -> TyUnknown
+              }
+            _ -> TyUnknown
+          }
+      }
+    ast.EMember(ast.EIdent(type_name), _) ->
+      case dict.has_key(env.types, type_name) {
+        True -> TyCustom(type_name)
+        False -> TyUnknown
+      }
+    _ -> TyUnknown
   }
 }
 
@@ -3339,16 +3406,29 @@ fn gen_expr(env: Env, e: ast.Expr) -> String {
       let #(cond, _) = gen_is(env, subject, pattern)
       cond
     }
+    // Calling an address in value position is the request form: it registers
+    // somewhere for the answer to land and returns without waiting. As a bare
+    // statement `gen_stmt` lowers the same call to the cheaper cast instead.
+    //
+    // Either way the message is copied on its way in, as binding it to a new
+    // name would copy it. That is the invariant the whole module rests on: a
+    // local send and a remote one are indistinguishable, so the recipient can
+    // never observe the sender mutating a message afterwards.
+    //
     // A bare async call in value position (an RHS, a vector element, ...)
     // spawns the work on its own goroutine and evaluates to a handle. Used as a
     // statement the handle is simply discarded — that is fire-and-forget, and
     // `gen_stmt` keeps emitting the cheaper `go f(x)` for that case.
-    ast.ECall(ast.EIdent(name), args) ->
-      case list.contains(env.asyncs, name) {
-        True -> gen_spawn(env, name, args)
-        False -> gen_call(env, ast.EIdent(name), args)
+    ast.ECall(callee, args) ->
+      case is_address_call(env, callee), callee {
+        True, _ -> gen_address_send(env, callee, args, True)
+        False, ast.EIdent(name) ->
+          case list.contains(env.asyncs, name) {
+            True -> gen_spawn(env, name, args)
+            False -> gen_call(env, ast.EIdent(name), args)
+          }
+        False, _ -> gen_call(env, callee, args)
       }
-    ast.ECall(callee, args) -> gen_call(env, callee, args)
     ast.EWith(value, typ) -> gen_with(env, value, typ)
     ast.EAwait(value, timeout) -> gen_await(env, value, timeout)
   }
@@ -3441,12 +3521,23 @@ fn gen_await(env: Env, value: ast.Expr, timeout: Option(ast.Expr)) -> String {
     None -> "0"
   }
   case value {
+    // An address call is a syslink request, never a task, however it is spelled
+    // — so it goes to `await_handle` even where the callee shares a name with an
+    // `async func`, matching the shadowing `infer` and `gen_expr` apply.
     ast.ECall(ast.EIdent(name), args) ->
-      case list.contains(env.asyncs, name), timeout {
-        True, None -> gen_call(env, ast.EIdent(name), args)
-        True, Some(_) ->
-          "hive.AwaitTimeout(" <> gen_spawn(env, name, args) <> ", " <> ms <> ")"
-        False, _ -> await_handle(env, value, timeout, ms)
+      case is_address_call(env, ast.EIdent(name)) {
+        True -> await_handle(env, value, timeout, ms)
+        False ->
+          case list.contains(env.asyncs, name), timeout {
+            True, None -> gen_call(env, ast.EIdent(name), args)
+            True, Some(_) ->
+              "hive.AwaitTimeout("
+              <> gen_spawn(env, name, args)
+              <> ", "
+              <> ms
+              <> ")"
+            False, _ -> await_handle(env, value, timeout, ms)
+          }
       }
     _ -> await_handle(env, value, timeout, ms)
   }
@@ -4595,17 +4686,6 @@ fn gen_syslink_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
           <> ")"
         _ -> "hive.SyslinkOn(" <> gen_args(env, args) <> ")"
       }
-    // Reached only where the value is kept, so this is the request form: it
-    // registers somewhere for the answer to land and returns without waiting.
-    // A `send` written as a bare statement is intercepted in `gen_stmt` and
-    // lowers to the cheaper cast instead — the call site decides, exactly as it
-    // does for an `async func`.
-    //
-    // Either way the message is copied on its way in, as binding it to a new
-    // name would copy it. That is the invariant the whole module rests on: a
-    // local send and a remote one are indistinguishable, so the recipient can
-    // never observe the sender mutating a message afterwards.
-    "send" -> gen_syslink_send(env, args, True)
     "answer" ->
       case assign_args(args, ["from", "value"]) {
         #([#(_, from), #(_, value)], []) ->
@@ -4642,37 +4722,87 @@ fn gen_syslink_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
   }
 }
 
-// `hive.syslink.send(address, message)`. `awaitable` distinguishes the two
-// shapes the same statement takes: kept, it is a request with somewhere for the
-// answer to arrive; discarded, it is a cast that allocates nothing.
-fn gen_syslink_send(env: Env, args: List(ast.Arg), awaitable: Bool) -> String {
-  case assign_args(args, ["address", "message"]) {
-    #([#(_, address), #(_, message)], []) -> {
-      let msg = syslink_msg_of(env, address, message)
-      let head = case awaitable {
-        True -> "hive.SyslinkSendAwaitable("
-        False -> "hive.SyslinkSend("
-      }
-      // A service answers with one of its own messages, so the decoder for the
-      // answer is the very same one the mailbox uses. That is what removes the
-      // reply-type annotation from the await site entirely.
-      let tail = case awaitable {
-        True -> ", hive.SyslinkReplyDecoder(" <> syslink_decoder_ref(env, msg) <> ")"
-        False -> ""
-      }
-      head
-      <> gen_expr(env, address)
-      <> ", "
-      <> gen_copied(env, message)
-      <> ", "
-      <> syslink_encoder(env, msg)
-      <> ", "
-      <> syslink_digest(env, msg)
-      <> tail
-      <> ")"
-    }
-    _ -> "hive.SyslinkSend(" <> gen_args(env, args) <> ")"
+// ---------------------------------------------------------------------------
+// A service address is callable
+// ---------------------------------------------------------------------------
+// `c(message)` *is* the send — there is no `hive.syslink.send`, exactly as there
+// is no `spawn` keyword in front of an `async func` call. What the call site
+// does with the value decides what the call means: discarded it is a cast, kept
+// it is a request in flight, and `await`ed it is that request's answer.
+//
+// Dispatch is by the callee's *type*, never by its spelling, so a local, a
+// parameter, a vector element and a fresh `at(#Name)` are all callable the same
+// way. An address that shares a name with a declared func resolves to the
+// address, because a local shadows a declaration everywhere else in the language
+// too.
+fn address_call_msg(env: Env, callee: ast.Expr) -> Option(Ty) {
+  case infer(env, callee) {
+    TyAddress(msg) -> Some(msg)
+    _ -> None
   }
+}
+
+fn is_address_call(env: Env, callee: ast.Expr) -> Bool {
+  case address_call_msg(env, callee) {
+    Some(_) -> True
+    None -> False
+  }
+}
+
+// The one message an address is called with. `check_address_call` has already
+// rejected every other shape, so this only has to name the good one.
+fn address_call_arg(args: List(ast.Arg)) -> Option(ast.Expr) {
+  case args {
+    [ast.Arg(None, message)] -> Some(message)
+    _ -> None
+  }
+}
+
+fn gen_address_send(
+  env: Env,
+  callee: ast.Expr,
+  args: List(ast.Arg),
+  awaitable: Bool,
+) -> String {
+  case address_call_arg(args) {
+    Some(message) -> gen_send_parts(env, callee, message, awaitable)
+    // Unreachable: `check_address_call` fails the compile first. Codegen stays
+    // total rather than crashing on a shape the checker owns.
+    None -> gen_send_parts(env, callee, ast.EIdent("_"), awaitable)
+  }
+}
+
+// `awaitable` distinguishes the two shapes the same call takes: kept, it is a
+// request with somewhere for the answer to arrive; discarded, it is a cast that
+// allocates nothing.
+fn gen_send_parts(
+  env: Env,
+  address: ast.Expr,
+  message: ast.Expr,
+  awaitable: Bool,
+) -> String {
+  let msg = syslink_msg_of(env, address, message)
+  let head = case awaitable {
+    True -> "hive.SyslinkSendAwaitable("
+    False -> "hive.SyslinkSend("
+  }
+  // A service answers with one of its own messages, so the decoder for the
+  // answer is the very same one the mailbox uses. That is what removes the
+  // reply-type annotation from the await site entirely.
+  let tail = case awaitable {
+    True -> ", hive.SyslinkReplyDecoder(" <> syslink_decoder_ref(env, msg) <> ")"
+    False -> ""
+  }
+  head
+  <> gen_expr(env, address)
+  <> ", "
+  <> gen_copied(env, message)
+  <> ", "
+  <> syslink_encoder(env, msg)
+  <> ", "
+  <> syslink_digest(env, msg)
+  <> tail
+  <> ")"
 }
 
 fn syslink_decoder_ref(env: Env, msg: Option(ast.TypeExpr)) -> String {

@@ -96,7 +96,8 @@ proc cache(node: Node, msg: Cache, from: hive.syslink.Envelope): Node {
 		// awaited and this turn cannot be held up by a slow or absent peer — a
 		// send never blocks and never fails.
 		for each endpoint in node.peers {
-			hive.syslink.send(hive.syslink.on(endpoint, #Cache), Cache.Invalidate(name))
+			peer := hive.syslink.on(endpoint, #Cache)
+			peer(Cache.Invalidate(name))
 		}
 
 		hive.syslink.answer(from, Cache.Stored(name))
@@ -149,7 +150,7 @@ proc handler(
 	mine := hive.syslink.at(#Cache)
 
 	if req.method == "POST" && req.url is "/set/{name}" {
-		stored := await hive.syslink.send(mine, Cache.Store(name, req.body)) with timeout 2000
+		stored := await mine(Cache.Store(name, req.body)) with timeout 2000
 		if stored is Result.Ok(reply) && reply is Cache.Stored(_) {
 			return plain(200, "stored\n")
 		}
@@ -161,7 +162,7 @@ proc handler(
 
 	if req.method == "GET" && req.url is "/get/{name}" {
 		// Ask this node first.
-		here := await hive.syslink.send(mine, Cache.Lookup(name)) with timeout 2000
+		here := await mine(Cache.Lookup(name)) with timeout 2000
 		if here is Result.Ok(reply) && reply is Cache.Found(_, value) {
 			return plain(200, value)
 		}
@@ -173,13 +174,11 @@ proc handler(
 		//
 		// This asks them one at a time, which short-circuits on a hit but pays a
 		// full timeout per dead peer. Where the peer set is fixed you can fan out
-		// instead — `await [send(a, ...), send(b, ...)] with timeout 2000` is one
-		// barrier with a single deadline for all of them.
+		// instead — `await [a(...), b(...)] with timeout 2000` is one barrier with
+		// a single deadline for all of them.
 		for each endpoint in peers {
-			answer := await hive.syslink.send(
-				hive.syslink.on(endpoint, #Cache),
-				Cache.Lookup(name),
-			) with timeout 2000
+			peer := hive.syslink.on(endpoint, #Cache)
+			answer := await peer(Cache.Lookup(name)) with timeout 2000
 			if answer is Result.Ok(reply) && reply is Cache.Found(_, value) {
 				return plain(200, value)
 			}

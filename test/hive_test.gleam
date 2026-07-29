@@ -1983,7 +1983,7 @@ const service_prelude = "type Op {\n\tPut { key: Str }\n\tCount\n}\n\nproc box(s
 pub fn syslink_spawn_send_and_register_compiles_test() {
   compiler.compile(
     service_prelude
-    <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tif hive.syslink.register(#Inbox, b) is Result.Error(e) {\n\t\tpanic e\n\t}\n\thive.syslink.send(b, Op.Put(\"k\"))\n}\n",
+    <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tif hive.syslink.register(#Inbox, b) is Result.Error(e) {\n\t\tpanic e\n\t}\n\tb(Op.Put(\"k\"))\n}\n",
   )
   |> should.be_ok
 }
@@ -2030,7 +2030,7 @@ pub fn syslink_names_must_be_atom_literals_test() {
 pub fn syslink_at_and_on_compile_test() {
   compiler.compile(
     service_prelude
-    <> "proc main(): void {\n\thive.syslink.send(hive.syslink.at(#Inbox), Op.Put(\"k\"))\n\tfor each e in split(\"a:1,b:2\", \",\") {\n\t\thive.syslink.send(hive.syslink.on(e, #Inbox), Op.Put(\"k\"))\n\t}\n}\n",
+    <> "proc main(): void {\n\thive.syslink.at(#Inbox)(Op.Put(\"k\"))\n\tfor each e in split(\"a:1,b:2\", \",\") {\n\t\thive.syslink.on(e, #Inbox)(Op.Put(\"k\"))\n\t}\n}\n",
   )
   |> should.be_ok
 }
@@ -2049,7 +2049,7 @@ pub fn syslink_node_roles_are_gone_test() {
 pub fn syslink_on_endpoint_may_be_computed_test() {
   compiler.compile(
     service_prelude
-    <> "proc main(): void {\n\thost := \"10.0.0.4\"\n\thive.syslink.send(hive.syslink.on(host + \":9100\", #Inbox), Op.Put(\"k\"))\n}\n",
+    <> "proc main(): void {\n\thost := \"10.0.0.4\"\n\thive.syslink.on(host + \":9100\", #Inbox)(Op.Put(\"k\"))\n}\n",
   )
   |> should.be_ok
 }
@@ -2059,13 +2059,13 @@ pub fn syslink_on_endpoint_may_be_computed_test() {
 pub fn syslink_on_service_name_must_be_an_atom_test() {
   compiler.compile(
     service_prelude
-    <> "proc main(): void {\n\tn := \"Inbox\"\n\thive.syslink.send(hive.syslink.on(\"10.0.0.4:9100\", n), Op.Put(\"k\"))\n}\n",
+    <> "proc main(): void {\n\tn := \"Inbox\"\n\thive.syslink.on(\"10.0.0.4:9100\", n)(Op.Put(\"k\"))\n}\n",
   )
   |> should.be_error
 }
 
-// There is no separate `call`: one `send` serves both, and the call site decides
-// which it is. The old spelling gets an error that says so.
+// There is no `send` and no `call`: an address is called directly, and the call
+// site decides what the call means. Both old spellings get an error that says so.
 pub fn syslink_has_no_call_member_test() {
   compiler.compile(
     service_prelude
@@ -2074,13 +2074,89 @@ pub fn syslink_has_no_call_member_test() {
   |> should.be_error
 }
 
+pub fn syslink_has_no_send_member_test() {
+  compiler.compile(
+    service_prelude
+    <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\thive.syslink.send(b, Op.Count())\n}\n",
+  )
+  |> should.be_error
+}
+
+// An address is a mailbox, not a function: it carries exactly one message, so
+// every other call shape is a mistake about what the value is and is named as
+// one rather than lowered.
+pub fn syslink_address_call_needs_a_message_test() {
+  compiler.compile(
+    service_prelude
+    <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tb()\n}\n",
+  )
+  |> should.be_error
+}
+
+pub fn syslink_address_call_takes_one_message_test() {
+  compiler.compile(
+    service_prelude
+    <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tb(Op.Count(), Op.Count())\n}\n",
+  )
+  |> should.be_error
+}
+
+pub fn syslink_address_call_has_no_named_argument_test() {
+  compiler.compile(
+    service_prelude
+    <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tb(message: Op.Count())\n}\n",
+  )
+  |> should.be_error
+}
+
+// A hole waits for an argument that arrives later; a send has nothing to wait
+// for, so an address cannot be partially applied.
+pub fn syslink_address_cannot_be_partially_applied_test() {
+  compiler.compile(
+    service_prelude
+    <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tlater := b(_)\n\tlater(Op.Count())\n}\n",
+  )
+  |> should.be_error
+}
+
+// Dispatch is by the callee's type, never by its spelling — so an address that
+// arrived as a parameter is callable exactly like one that was just spawned.
+pub fn syslink_address_parameter_is_callable_test() {
+  let assert Ok(go) =
+    compiler.compile(
+      service_prelude
+      <> "proc tell(a: hive.syslink.Address): void {\n\ta(Op.Put(\"k\"))\n}\n\nproc main(): void {\n\ttell(hive.syslink.spawn(box, 0))\n}\n",
+    )
+  string.contains(go, "hive.SyslinkSend(") |> should.be_true
+}
+
+// The same goes for an address that came out of the registry, called on the spot.
+pub fn syslink_at_result_is_callable_test() {
+  compiler.compile(
+    service_prelude
+    <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tif hive.syslink.register(#Inbox, b) is Result.Error(e) {\n\t\tpanic e\n\t}\n\thive.syslink.at(#Inbox)(Op.Put(\"k\"))\n}\n",
+  )
+  |> should.be_ok
+}
+
+// A local address shadows a declared func of the same name, exactly as a local
+// shadows a declaration everywhere else in the language.
+pub fn syslink_address_shadows_a_func_of_the_same_name_test() {
+  let assert Ok(go) =
+    compiler.compile(
+      service_prelude
+      <> "func b(n: Int): Int {\n\treturn n\n}\n\nproc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tb(Op.Put(\"k\"))\n}\n",
+    )
+  string.contains(go, "hive.SyslinkSend(") |> should.be_true
+}
+
 // Discarded, a send is a cast: nothing is registered for a reply, so it lowers
 // to the cheaper runtime call.
 pub fn syslink_discarded_send_is_a_cast_test() {
   let assert Ok(go) =
     compiler.compile(
       service_prelude
-      <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\thive.syslink.send(b, Op.Put(\"k\"))\n}\n",
+      <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tb(Op.Put(\"k\"))\n}\n",
     )
   string.contains(go, "hive.SyslinkSend(") |> should.be_true
   string.contains(go, "hive.SyslinkSendAwaitable(") |> should.be_false
@@ -2092,7 +2168,7 @@ pub fn syslink_awaited_send_is_a_request_test() {
   let assert Ok(go) =
     compiler.compile(
       service_prelude
-      <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tif await hive.syslink.send(b, Op.Count()) is Result.Ok(reply) {\n\t\tif reply is Op.Put(k) {\n\t\t\techo k\n\t\t}\n\t}\n}\n",
+      <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tif await b(Op.Count()) is Result.Ok(reply) {\n\t\tif reply is Op.Put(k) {\n\t\t\techo k\n\t\t}\n\t}\n}\n",
     )
   string.contains(go, "hive.SyslinkSendAwaitable(") |> should.be_true
   string.contains(go, "hive.SyslinkAwait(") |> should.be_true
@@ -2103,7 +2179,7 @@ pub fn syslink_awaited_send_is_a_request_test() {
 pub fn syslink_held_request_compiles_test() {
   compiler.compile(
     service_prelude
-    <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tpending := hive.syslink.send(b, Op.Count())\n\techo \"meanwhile\"\n\tif await pending with timeout 250 is Result.Error(e) {\n\t\techo e.reason\n\t}\n}\n",
+    <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tpending := b(Op.Count())\n\techo \"meanwhile\"\n\tif await pending with timeout 250 is Result.Error(e) {\n\t\techo e.reason\n\t}\n}\n",
   )
   |> should.be_ok
 }
@@ -2111,7 +2187,7 @@ pub fn syslink_held_request_compiles_test() {
 pub fn syslink_await_many_requests_compiles_test() {
   compiler.compile(
     service_prelude
-    <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tboth := await [hive.syslink.send(b, Op.Count()), hive.syslink.send(b, Op.Count())] with timeout 500\n\tif both[0] is Result.Ok(_) {\n\t\techo \"first answered\"\n\t}\n}\n",
+    <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tboth := await [b(Op.Count()), b(Op.Count())] with timeout 500\n\tif both[0] is Result.Ok(_) {\n\t\techo \"first answered\"\n\t}\n}\n",
   )
   |> should.be_ok
 }
@@ -2202,7 +2278,7 @@ pub fn syslink_unknown_member_is_rejected_test() {
 // value: it can be a parameter, a field, and travel inside a message.
 pub fn syslink_address_is_a_plain_value_test() {
   compiler.compile(
-    "type Op {\n\tWatch { peer: hive.syslink.Address }\n}\n\nproc box(n: Int, op: Op, from: hive.syslink.Envelope): Int {\n\tif op is Op.Watch(peer) {\n\t\thive.syslink.monitor(from, peer, Op.Watch(hive.syslink.self(from)))\n\t}\n\treturn n\n}\n\nproc pass(a: hive.syslink.Address): void {\n\thive.syslink.send(a, Op.Watch(a))\n}\n\nproc main(): void {\n\tpass(hive.syslink.spawn(box, 0))\n}\n",
+    "type Op {\n\tWatch { peer: hive.syslink.Address }\n}\n\nproc box(n: Int, op: Op, from: hive.syslink.Envelope): Int {\n\tif op is Op.Watch(peer) {\n\t\thive.syslink.monitor(from, peer, Op.Watch(hive.syslink.self(from)))\n\t}\n\treturn n\n}\n\nproc pass(a: hive.syslink.Address): void {\n\ta(Op.Watch(a))\n}\n\nproc main(): void {\n\tpass(hive.syslink.spawn(box, 0))\n}\n",
   )
   |> should.be_ok
 }
@@ -2214,7 +2290,7 @@ pub fn syslink_send_and_spawn_agree_on_the_digest_test() {
   let assert Ok(go) =
     compiler.compile(
       service_prelude
-      <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\thive.syslink.send(b, Op.Put(\"k\"))\n}\n",
+      <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tb(Op.Put(\"k\"))\n}\n",
     )
   // Both call sites name the same 32-bit digest, so exactly one distinct value
   // appears across the spawn and the send.

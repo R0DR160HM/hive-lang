@@ -1771,28 +1771,31 @@ fn check_syslink_call(
     "at" -> check_atom_named("`hive.syslink.at`", args, ["name"], ["name"])
     "on" ->
       check_atom_named("`hive.syslink.on`", args, ["endpoint", "name"], ["name"])
-    "send" -> check_arity("`hive.syslink.send`", args, ["address", "message"])
     "answer" -> check_arity("`hive.syslink.answer`", args, ["from", "value"])
     "self" -> check_arity("`hive.syslink.self`", args, ["from"])
     "monitor" ->
       check_arity("`hive.syslink.monitor`", args, ["from", "target", "message"])
     "stop" -> check_arity("`hive.syslink.stop`", args, ["address"])
-    // There is no separate `call`: one `send` serves both, and what the call
-    // site does with its value decides which it was.
-    "call" ->
+    // There is no `send` and no `call`: an address *is* the way to reach its
+    // service, so it is called directly and the call site decides what the call
+    // means — exactly as it does for an `async func`.
+    "send" | "call" ->
       Error(
-        "there is no `hive.syslink.call` — `hive.syslink.send` is the only way "
-        <> "to reach a service, and the call site decides what it means: as a "
-        <> "statement it is fire-and-forget, and `await`ed it waits for the "
-        <> "service's answer (`await hive.syslink.send(cache, Op.Count())`, "
-        <> "optionally bounded with `with timeout <ms>`)",
+        "there is no `hive.syslink."
+        <> fname
+        <> "` — a service address is called directly, and what the call site "
+        <> "does with it decides what it means: `cache(Op.Count())` as a "
+        <> "statement is fire-and-forget, `p := cache(Op.Count())` keeps the "
+        <> "request in flight, and `await cache(Op.Count())` waits for the "
+        <> "service's answer (optionally bounded with `with timeout <ms>`)",
       )
     _ ->
       Error(
         "unknown builtin `hive.syslink."
         <> fname
-        <> "` (available: listen, node; spawn, register, at, on, stop; send, "
-        <> "answer, self, monitor)",
+        <> "` (available: listen, node; spawn, register, at, on, stop; answer, "
+        <> "self, monitor). A service is reached by calling its address — "
+        <> "`cache(Op.Count())` — not through a function in this module.",
       )
   }
 }

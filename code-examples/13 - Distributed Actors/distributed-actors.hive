@@ -3,18 +3,21 @@
 // A `hive.syslink` *service* is a long-lived, addressable thing with a mailbox
 // and private state. The point of the module is that one statement reaches it
 // whether it is a mailbox in this process or a service on another machine — and
-// there is only ever the one statement. What the *call site* does with it decides
-// what it means, exactly as it does for an `async func`:
+// there is only ever the one statement: you *call the address*. What the *call
+// site* does with it decides what it means, exactly as it does for an
+// `async func`:
 //
-//   hive.syslink.send(a, msg)                   (statement) fire-and-forget
-//   h := hive.syslink.send(a, msg)              keep the request in flight
-//   await hive.syslink.send(a, msg)             wait for the answer -> Result
-//   await h                                     wait on one held earlier
-//   await h with timeout 500                    ...for at most half a second
-//   await [send(a, m1), send(b, m2)]            wait on many, one deadline
+//   a(msg)                          (statement) fire-and-forget
+//   h := a(msg)                     keep the request in flight
+//   await a(msg)                    wait for the answer -> Result
+//   await h                         wait on one held earlier
+//   await h with timeout 500        ...for at most half a second
+//   await [a(m1), b(m2)]            wait on many, one deadline
 //
-// There is no separate `call`. A service answers with one of *its own* messages,
-// so the reply type is the mailbox type and nothing has to be annotated.
+// There is no `send` and no `call` — an address is not a handle you pass to a
+// function, it is the thing you call. A service answers with one of *its own*
+// messages, so the reply type is the mailbox type and nothing has to be
+// annotated.
 //
 // ANSWERING, AND FORGETTING TO
 // ----------------------------
@@ -162,17 +165,17 @@ proc chat(mine: hive.syslink.Address, theirs: hive.syslink.Address): void {
 		panic err
 	}
 
-	hive.syslink.send(mine, Note.Say("a local note"))
+	mine(Note.Say("a local note"))
 
 	echo "Press enter once the other node is listening."
 	hive.term.read()
 
-	hive.syslink.send(theirs, Note.Say("hello from the other node"))
-	hive.syslink.send(mine, Note.Watch(theirs))
+	theirs(Note.Say("hello from the other node"))
+	mine(Note.Watch(theirs))
 
 	// The same `send`, but its value is kept — so it is a request, in flight
 	// while we get on with something else.
-	pending := hive.syslink.send(theirs, Note.HowMany())
+	pending := theirs(Note.HowMany())
 	echo "...the question is already on the wire..."
 
 	// `await` is the one place in the module that reports failure, because it is
@@ -191,8 +194,8 @@ proc chat(mine: hive.syslink.Address, theirs: hive.syslink.Address): void {
 	// inferred — a vector of `Result`s — and, as everywhere else in Hive, a
 	// `Result`'s payload has no surface spelling to annotate it with.
 	both := await [
-		hive.syslink.send(theirs, Note.HowMany()),
-		hive.syslink.send(mine, Note.HowMany()),
+		theirs(Note.HowMany()),
+		mine(Note.HowMany()),
 	] with timeout 4000
 	if both[0] is Result.Ok(there) && there is Note.Counted(n) {
 		echo "asked again, and the peer says {n}"
@@ -204,7 +207,7 @@ proc chat(mine: hive.syslink.Address, theirs: hive.syslink.Address): void {
 	// Forgetting to answer, seen from the caller's side. `inbox` handles this and
 	// never replies — and because its envelope cannot outlive the turn, this comes
 	// straight back rather than waiting out the four seconds asked for.
-	ignored := await hive.syslink.send(mine, Note.Ignore()) with timeout 4000
+	ignored := await mine(Note.Ignore()) with timeout 4000
 	if ignored is Result.Error(err) {
 		echo "forgot to answer: {err.reason} — {err.message}"
 	}
@@ -213,19 +216,19 @@ proc chat(mine: hive.syslink.Address, theirs: hive.syslink.Address): void {
 	// so an answer may still be coming and nothing is failed early: the reply
 	// turns up 400ms later and the `await` is what waits for it.
 	slow := hive.syslink.spawn(unhurried, 0)
-	late := await hive.syslink.send(slow, Note.Say("take your time")) with timeout 4000
+	late := await slow(Note.Say("take your time")) with timeout 4000
 	if late is Result.Ok(reply) && reply is Note.Late(text) {
 		echo "answered late:    {text}"
 	}
 
 	echo "Type `boom` to crash the peer's inbox, or enter to finish."
 	if hive.term.read() == "boom" {
-		hive.syslink.send(theirs, Note.Explode())
+		theirs(Note.Explode())
 		hive.task.sleep(1000)
 
 		// The service is gone, but its node is fine — so this reports NoProc
 		// rather than hanging, and the peer is still up to say so.
-		if await hive.syslink.send(theirs, Note.HowMany()) with timeout 2000
+		if await theirs(Note.HowMany()) with timeout 2000
 			is Result.Error(err) {
 			echo "asking again: {err.reason} — {err.message}"
 		}
