@@ -23,6 +23,7 @@ import gleam/result
 import gleam/string
 import hive/ast
 import hive/bounds
+import hive/builtins
 import hive/codegen
 import hive/diagnostic
 import hive/generics
@@ -180,11 +181,21 @@ fn check(module: ast.Module) -> Result(Nil, String) {
 // `T[]` says only "a vector of T, of some length". That is exactly what a
 // parameter wants — it accepts any vector of the right element type, and the
 // callee guards every access into it, having been promised nothing. It is
-// exactly what a variable, field or return must *not* be: each of those names
-// storage, and storage has to declare which of the two real kinds it is
-// (`T[3]`, whose length is a promise checked everywhere a value can reach it, or
-// `T[dyn]`, which promises nothing and guards its indexes) for the bounds pass
-// to have anything to reason about.
+// exactly what a variable or field must *not* be: each of those names storage,
+// and storage has to declare which of the two real kinds it is (`T[3]`, whose
+// length is a promise checked everywhere a value can reach it, or `T[dyn]`,
+// which promises nothing and guards its indexes) for the bounds pass to have
+// anything to reason about.
+//
+// A *return* is neither. It names no storage of its own — it says what the
+// caller gets — and the only thing a caller can do with a length is rely on it,
+// so a return has exactly two things to say: a static length is a promise
+// (`T[3]`), and everything else is "some length". `T[]` and `T[dyn]` are that
+// same second answer, and the bounds pass already treats them as one (both are
+// `Dyn`, so every index into the result is guarded). Which of the two the callee
+// keeps its own values in is its business, and `T[]` is how a signature says so
+// — which is what lets a generic hand back a vector without naming a kind for
+// it.
 
 // Every type written in a declaration, checked in the position it appears in.
 fn check_decl_types(decls: List(ast.Decl)) -> Result(Nil, String) {
@@ -197,7 +208,7 @@ fn check_decl_types(decls: List(ast.Decl)) -> Result(Nil, String) {
             check_param_type(p.typ, "parameter `" <> p.name <> "` of `" <> name <> "`")
           }),
         )
-        check_sized(ret, "the return type of `" <> name <> "`")
+        check_return_type(ret, "the return type of `" <> name <> "`")
       }
       ast.QueryDecl(name, params, ret, sql) -> {
         use _ <- result.try(
@@ -205,7 +216,10 @@ fn check_decl_types(decls: List(ast.Decl)) -> Result(Nil, String) {
             check_param_type(p.typ, "parameter `" <> p.name <> "` of `" <> name <> "`")
           }),
         )
-        use _ <- result.try(check_sized(ret, "the return type of `" <> name <> "`"))
+        use _ <- result.try(check_return_type(
+          ret,
+          "the return type of `" <> name <> "`",
+        ))
         check_select_star(name, ret, sql)
       }
       ast.TypeDecl(name, variants, commons) -> {
@@ -221,8 +235,8 @@ fn check_decl_types(decls: List(ast.Decl)) -> Result(Nil, String) {
 }
 
 // A parameter's own type may be unsized. A function *type* in that position
-// carries positions of its own: its parameters are parameter positions too, its
-// return is not.
+// carries positions of its own: its parameters are parameter positions too, and
+// its return is a return position.
 fn check_param_type(t: ast.TypeExpr, where: String) -> Result(Nil, String) {
   case t {
     ast.TName(_, _, _, _) | ast.TVoid -> Ok(Nil)
@@ -230,7 +244,23 @@ fn check_param_type(t: ast.TypeExpr, where: String) -> Result(Nil, String) {
       use _ <- result.try(
         list.try_fold(params, Nil, fn(_, p) { check_param_type(p, where) }),
       )
-      check_sized(ret, "the return type in " <> where)
+      check_return_type(ret, "the return type in " <> where)
+    }
+  }
+}
+
+// A return position: `T[]` is fine, since a return owns no storage and "some
+// length" is a complete answer for a caller. A function type nested in one
+// carries positions of its own, so the recursion sorts them out rather than
+// waving the whole thing through.
+fn check_return_type(t: ast.TypeExpr, where: String) -> Result(Nil, String) {
+  case t {
+    ast.TVoid | ast.TName(_, _, _, _) -> Ok(Nil)
+    ast.TFunc(_, params, ret) -> {
+      use _ <- result.try(
+        list.try_fold(params, Nil, fn(_, p) { check_param_type(p, where) }),
+      )
+      check_return_type(ret, "the return type in " <> where)
     }
   }
 }
@@ -248,16 +278,16 @@ fn check_sized(t: ast.TypeExpr, where: String) -> Result(Nil, String) {
             <> " is declared `"
             <> ast.show_type(t)
             <> "`, but `[]` only says \"a vector of some length\" — which is a "
-            <> "promise a parameter can make and storage cannot. Declare it "
-            <> "`[dyn]` (any length, guarded indexes) or give it a static "
-            <> "length like `[3]`.",
+            <> "promise a parameter or a return can make and storage cannot. "
+            <> "Declare it `[dyn]` (any length, guarded indexes) or give it a "
+            <> "static length like `[3]`.",
           )
       }
     ast.TFunc(_, params, ret) -> {
       use _ <- result.try(
         list.try_fold(params, Nil, fn(_, p) { check_param_type(p, where) }),
       )
-      check_sized(ret, "the return type in " <> where)
+      check_return_type(ret, "the return type in " <> where)
     }
   }
 }
@@ -772,9 +802,11 @@ fn check_assign_target(
 
 // `append(v, ...)` grows a vector in place, so `v` must be a mutable variable
 // (per the spec: append "only compiles when used on mutable dynamic vectors").
+// Only the builtin is meant: a program's own `append` is an ordinary callable and
+// its first argument is nothing special.
 fn check_append(e: ast.Expr, muts: Dict(String, Bool)) -> Result(Nil, String) {
   case e {
-    ast.ECall(ast.EIdent("append"), args) ->
+    ast.ECall(ast.EMember(ast.EIdent("hive"), "append"), args) ->
       case args {
         [ast.Arg(_, target), ..] -> {
           use root <- result.try(
@@ -956,11 +988,17 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
           check_named(target, args, Some(variant_field_names(decl, member)))
         Error(_) ->
           case tname {
-            // Builtin types are namespaced now: `hive.net.HttpRequest(...)`,
-            // not the bare `hive.HttpRequest(...)`.
             "hive" ->
-              case codegen.builtin_fields(member) {
-                Some(_) ->
+              case builtins.is_global(member), codegen.builtin_fields(member) {
+                // `hive.len(v)`, `hive.map(v, f)` — a global builtin named the
+                // long way, which is how a program that declared a `len` or a
+                // `map` of its own still reaches this one. It is also what a bare
+                // call became when nothing shadowed it, so most of these were
+                // never written by hand.
+                True, _ -> check_named(target, args, None)
+                // Builtin types are namespaced now: `hive.net.HttpRequest(...)`,
+                // not the bare `hive.HttpRequest(...)`.
+                False, Some(_) ->
                   Error(
                     "`hive."
                     <> member
@@ -970,7 +1008,16 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
                     <> member
                     <> "` instead",
                   )
-                None -> check_named(target, args, None)
+                False, None ->
+                  Error(
+                    "`hive."
+                    <> member
+                    <> "` is not a builtin. The ones reached directly on `hive` "
+                    <> "are the globals ("
+                    <> string.join(builtins.globals(), ", ")
+                    <> "); everything else lives in a module, as in "
+                    <> "`hive.file.read` or `hive.conv.sti`.",
+                  )
               }
             _ -> check_named(target, args, None)
           }

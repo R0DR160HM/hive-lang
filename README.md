@@ -270,12 +270,16 @@ compiles, builds and runs.
   enforced, not advertised: a `Str[3]` slot only ever takes a vector of three,
   wherever the value comes from (see
   [vector bounds](#scope)), which is what lets `v[2]` on one compile with no
-  guard. A third spelling, `Str[]`, is legal **only as a parameter**: it
-  promises nothing about the length and accepts any vector of the right element
-  type, so one helper serves callers holding a `Str[3]` and a `Str[dyn]` alike.
-  Anything that names storage — a variable, a field, a return — has to say which
-  of the two real kinds it is, since a promise is the only thing an index can
-  rest on. All of them lower to Go
+  guard. A third spelling, `Str[]`, is a **signature** spelling: it promises
+  nothing about the length and accepts any vector of the right element type, so
+  one helper serves callers holding a `Str[3]` and a `Str[dyn]` alike. It is legal
+  in a parameter, and in a **return** — a return names no storage, it says what
+  the caller gets, and "some length" is a complete answer there (`Str[]` and
+  `Str[dyn]` are the same promise to a caller: none, so every index into the
+  result is guarded). Which of the two kinds the callee kept the value in is its
+  own business, and `Str[]` is how a signature says so. What *does* name storage —
+  a variable or a field — has to say which of the two real kinds it is, since a
+  promise is the only thing an index can rest on. All of them lower to Go
   slices; `+` concatenates into a new vector. `==` and `!=` compare vectors
   structurally — same length, then element by element (nested vectors and a
   `Table` compare the same way), short-circuiting on the first difference;
@@ -386,6 +390,14 @@ compiles, builds and runs.
   `append`; it is now available to ordinary code. A type declaration whose
   fields mention variables is generic the same way, and is written out where it
   is used (`Box<Str>`, `Either<Str, Int>`).
+  A variable is pinned down by wherever it appears in the parameters — including
+  *inside* a parameter's own type, which is what makes a higher-order generic
+  work: in
+  `func filterMap(values: T[], transform: func(T): Result<K, E>): K[]`
+  the call says what `T` is by the vector it passes and what `K` and `E` are by
+  the function it passes. The body may write those variables down too
+  (`mut K[dyn] out = []`, `for each v: T in values`, `Box<T> b = ...`); each copy
+  substitutes through its own body.
   Nothing about it is dynamic: every call site is resolved at compile time, with
   the type arguments read off the argument types, and one concrete copy emitted
   per distinct set of them — no boxing, no dispatch, no reflection. Because each
@@ -538,7 +550,9 @@ matters.
 ## Built-in functions
 
 These are always in scope — no import needed. Several are overloaded by
-argument type.
+argument type. A declaration of your own with one of these names
+[wins](#a-declaration-of-your-own-wins), and the builtin stays reachable as
+`hive.<name>`.
 
 | Function                | Signature                    | What it does                                                         |
 | ----------------------- | ---------------------------- | -------------------------------------------------------------------- |
@@ -553,6 +567,49 @@ argument type.
 | `indexOf(str, sub)`     | `indexOf(Str, Str): Result<Int, Bool>` | Position, in characters, of the first occurrence of `sub`, else `Error(false)`. |
 | `row(table, key)`       | `row(Table, Str): Str[dyn]`  | The row whose first cell equals `key`, else `[]`.                    |
 | `column(table, key)`    | `column(Table, Str): Str[dyn]`| The column whose top (first-row) cell equals `key`, else `[]`.      |
+| `map(values, transform)`| `map(T[], func(T): K): K[]`  | Every element, transformed. Same length, same order.                 |
+| `filter(values, keep)`  | `filter(T[], func(T): Bool): T[]` | The elements `keep` says yes to, in order.                      |
+| `filterMap(values, transform)` | `filterMap(T[], func(T): Result<K, E>): K[]` | Transform and select in one pass: the `Ok` payloads. |
+
+### A declaration of your own wins
+
+If your program declares a `func`, `proc`, `query` or type named `len`, `map`,
+`join` — any of the names above — **that** is what your bare calls mean, with its
+own parameters and its own arity. A name you declared quietly reading as somebody
+else's function is not a surprise a compiler should spring on you, and it would
+make adding a builtin a breaking change for every program that had already used
+the word.
+
+The builtin is still there as `hive.<name>`:
+
+```hive
+func len(label: Str, extra: Int): Str {   // ours
+    return "{label}{extra}"
+}
+
+proc main(): void {
+    Str[dyn] v = ["a", "b"]
+    echo len("x", 2)          // ours: "x2"
+    echo hive.len(v)          // the builtin: 2
+    echo hive.join(v, "-")    // the long name works whether or not you shadowed
+}
+```
+
+A **local binding** shadows a builtin the same way (`filter := addN(1, _)` then
+`filter(41)`), and so does a parameter. Shadowing is **per module**: another
+module's declarations are only ever reached through its alias (`text.map(...)`),
+so a `map` declared in one file leaves every other file's bare `map` alone.
+
+Two things follow from the builtin being a distinct thing rather than a fallback.
+Only the builtin `append` requires a `mut` target — a declared `append` is an
+ordinary callable whose first argument is nothing special. And only the builtin
+`indexOf` hands back an index the [bounds pass](#indexof-returns-an-index-you-can-use)
+will accept unguarded; a declared one promises nothing, so its result is guarded
+like any other integer.
+
+Compiler-generated code uses the long name for this reason: `v bounds i` desugars
+to `hive.len(v)`, so the guard means the same thing in a program that has taken
+`len` for itself.
 
 `len` and `bytes` differ only for strings: for `"café"`, `len` is `4` (runes)
 while `bytes` is `5` (the `é` is two bytes). `append` is the one builtin that
@@ -561,6 +618,57 @@ requires its target to be `mut` — it is the in-place way to grow a
 value up in a `Table` by its first cell — `row` matches a row's first element,
 `column` matches a column's top (first-row) cell — and `column` skips any row
 too short to reach the matched column.
+
+### Walking a vector: `map`, `filter`, `filterMap`
+
+These three take a vector and a [function value](#first-class-functions) over its
+elements, and each hands back a new vector:
+
+```hive
+func double(n: Int): Int  { return n * 2 }
+func isEven(n: Int): Bool { return n % 2 == 0 }
+
+func asPort(s: Str): Result<Int, Bool> {
+    parsed := hive.conv.sti(s)
+    if parsed is Result.Ok(n) && n > 0 && n < 65536 {
+        return Result.Ok(n)
+    }
+    return Result.Error(false)
+}
+
+proc main(): void {
+    Int[dyn] nums = [1, 2, 3, 4]
+
+    echo len(map(nums, double))            // 4 — every element, doubled
+    echo len(filter(nums, isEven))         // 2 — the ones that passed
+    echo len(map(nums, double(_)))         // a partial application works too
+
+    // `filterMap` transforms *and* selects: an `Ok` carries the element's new
+    // value, an `Error` says it has no place in the output. One pass, and the
+    // things that failed to convert simply are not there.
+    Str[dyn] raw = ["8080", "nope", "443"]
+    Int[dyn] ports = filterMap(raw, asPort)
+    echo len(ports)                        // 2
+}
+```
+
+The function is a `func`, never a `proc`. A walk says nothing about the order its
+function runs in or how often, so there is nowhere to hang a side effect — and
+that is also what lets a `func` body use one. To walk a vector with a proc, write
+a `for each` loop, which does say.
+
+Each of the three is specific about what its function answers with, and a
+mismatch is a compile error rather than a Go one: `filter` wants a `Bool`,
+`filterMap` a `Result`, and `map` wants *something* (a `void` function collects
+nothing — that too is a `for each` loop).
+
+The vector goes in the way it would go into any `T[]` parameter, so the copy
+rules of [value semantics](#value-semantics-copy-on-binding) apply unchanged: a
+`mut` vector is copied in, and the elements the new vector holds are its own.
+
+Like every builtin, these yield to a declaration of your own and stay reachable as
+`hive.map` / `hive.filter` / `hive.filterMap` — see
+[A declaration of your own wins](#a-declaration-of-your-own-wins).
 
 ### `indexOf` returns an index you can use
 
@@ -1435,6 +1543,8 @@ See [`code-examples/11 - Modules`](code-examples/11%20-%20Modules/modules.hive).
 | `bytes(v)` vector / `bytes(s)` Str      | `hive.Bytes(v)` (footprint) / `len(s)` (UTF-8 byte length)     |
 | `append(v, x)` / `join(v, sep)`         | `v = append(v, x)` (statement) / `hive.Join(v, sep)`           |
 | `split(s, sep)`                         | `hive.Split(s, sep)` → `Str[dyn]`                             |
+| `map(v, f)` / `filter(v, f)`            | `hive.Map(v, f)` / `hive.Filter(v, f)` (Go generics; type arguments inferred) |
+| `filterMap(v, f)`                       | `hive.FilterMap(v, f)` (keeps the `Ok` payloads)              |
 | `row(t, k)` / `column(t, k)`            | `hive.Row(t, k)` / `hive.Column(t, k)` → `Str[dyn]`           |
 | `hive.json.parse(t) with T`             | `hive.JsonParse(t, jsonDecode_T)` → `Result[T, JsonError]`     |
 | `hive.json.encode(v)`                   | derived `jsonEncode_T(v)` (cannot fail, so plain `string`)     |

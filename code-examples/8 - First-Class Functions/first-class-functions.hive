@@ -26,6 +26,38 @@ func mulN(n: Int, x: Int): Int {
 	return n * x
 }
 
+// --- Walking a vector -------------------------------------------------------
+// `map`, `filter` and `filterMap` are builtins that take a vector and a function
+// over its elements. Each hands back a NEW vector; none of them touch the one
+// they were given.
+//
+//     map(T[], func(T): K): K[]                    every element, transformed
+//     filter(T[], func(T): Bool): T[]              the ones that passed
+//     filterMap(T[], func(T): Result<K, E>): K[]   transform and select at once
+//
+// The function is a `func`, never a `proc`: a walk says nothing about the order
+// its function runs in, or how often, so there is nowhere to hang a side effect.
+// That is also what lets a `func` body use one. To walk with a proc, write a
+// `for each` loop — which does say.
+
+func isEven(n: Int): Bool {
+	return n % 2 == 0
+}
+
+func label(n: Int): Str {
+	return "#{n}"
+}
+
+// `filterMap` is the one that earns its keep on input you do not trust: the
+// `Error` case is how an element says it has no place in the output, so parsing
+// and discarding happen in one pass and there is no half-converted vector.
+func asPort(s: Str): Result<Int, Bool> {
+	if hive.conv.sti(s) is Result.Ok(n) && n > 0 && n < 65536 {
+		return Result.Ok(n)
+	}
+	return Result.Error(false)
+}
+
 proc main(): void {
 	// Partial application fixes the first argument and leaves the second open,
 	// producing a `func(Int): Int`.
@@ -45,4 +77,55 @@ proc main(): void {
 
 	// A partial application can also be written inline as an argument.
 	echo twice(addN(5, _), 0)
+
+	// The vector walks. Anything that is a function value works as the argument:
+	// a bare reference, or a partial application.
+	Int[dyn] nums = [1, 2, 3, 4]
+
+	Str[dyn] labels = map(nums, label)
+	echo join(labels, " ")
+
+	Int[dyn] evens = filter(nums, isEven)
+	echo join(map(evens, label), " ")
+
+	// A partial application walks just as well as a named func.
+	Int[dyn] tenfold = map(nums, mulN(10, _))
+	echo join(map(tenfold, label), " ")
+
+	// `filterMap` on input that might not convert: three strings in, two ports
+	// out, and nothing in between to check.
+	Str[dyn] raw = ["8080", "nope", "443"]
+	Int[dyn] ports = filterMap(raw, asPort)
+	echo "{len(ports)} of {len(raw)} were ports: {join(map(ports, label), " ")}"
+
+	// A local shadows a builtin, like any other name. `filter` here is a
+	// function value, so `filter(...)` calls it and not the builtin.
+	filter := mulN(2, _)
+	echo filter(21)
+
+	// The builtin is still reachable by its long name — which is what a program
+	// that declared its own `filter` (or `len`, or `map`) uses. See the note at
+	// the bottom of this file.
+	echo len(hive.filter(nums, isEven))
 }
+
+// --- Your own name wins -----------------------------------------------------
+// A declaration of your own with a builtin's name is the one your bare calls
+// mean, with its own parameters and its own arity:
+//
+//     func len(label: Str, extra: Int): Str { ... }
+//
+//     echo len("x", 2)       // ours
+//     echo hive.len(v)       // the builtin, still here
+//
+// A name you declared quietly reading as somebody else's function is not a
+// surprise a compiler should spring on you — and it would make adding a builtin
+// a breaking change for every program that had already used the word. Locals and
+// parameters shadow the same way, and shadowing is per module: another module's
+// declarations are only ever reached through its alias, so a `map` declared in
+// one file leaves every other file's bare `map` alone.
+//
+// Because the builtin is a distinct thing rather than a fallback, what it
+// promises belongs to it alone. Only the builtin `append` requires a `mut`
+// target; only the builtin `indexOf` hands back an index the bounds checker
+// takes unguarded. A declared one is an ordinary callable that promises neither.

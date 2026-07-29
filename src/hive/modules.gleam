@@ -23,6 +23,7 @@ import gleam/string
 import filepath
 import simplifile
 import hive/ast
+import hive/builtins
 import hive/diagnostic
 import hive/lexer
 import hive/parser
@@ -573,14 +574,29 @@ fn rewrite_expr(
       Ok(ast.EMember(target, member))
     }
     ast.ECall(callee, args) -> {
-      use callee <- result.try(rewrite_expr(rw, callee, locals))
       use args <- result.try(
         list.try_map(args, fn(a) {
           use value <- result.try(rewrite_expr(rw, a.value, locals))
           Ok(ast.Arg(a.name, value))
         }),
       )
-      Ok(ast.ECall(callee, args))
+      case callee {
+        // A bare builtin name that nothing else answers to is that builtin,
+        // written out as `hive.<name>` so no later pass has to work it out again.
+        ast.EIdent(name) ->
+          case reaches_builtin(rw, name, locals) {
+            True -> Ok(ast.ECall(builtins.qualified(name), args))
+            False ->
+              Ok(ast.ECall(
+                ast.EIdent(resolve_name(rw, name, locals)),
+                args,
+              ))
+          }
+        _ -> {
+          use callee <- result.try(rewrite_expr(rw, callee, locals))
+          Ok(ast.ECall(callee, args))
+        }
+      }
     }
     ast.EIndex(target, index) -> {
       use target <- result.try(rewrite_expr(rw, target, locals))
@@ -704,6 +720,19 @@ fn resolve_name(rw: Rw, name: String, locals: List(String)) -> String {
     True -> name
     False -> flat(rw, name)
   }
+}
+
+// Whether a bare call on `name` reaches a global builtin — which it does only
+// when nothing nearer answers to the name: no local binding, and no declaration
+// of this module's own. A program that declares `func map` means *its* map
+// everywhere it writes one, and reaches this one as `hive.map`.
+//
+// Only this module's declarations can shadow: another module's are reached
+// through its alias (`text.map(...)`), which is not a bare name at all.
+fn reaches_builtin(rw: Rw, name: String, locals: List(String)) -> Bool {
+  builtins.is_global(name)
+  && !list.contains(locals, name)
+  && !dict.has_key(rw.own, name)
 }
 
 fn rewrite_types(

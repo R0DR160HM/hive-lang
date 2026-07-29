@@ -8,6 +8,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import hive/ast
+import hive/builtins
 import hive/diagnostic
 import hive/lexer
 import hive/token.{type Token, Token}
@@ -1018,6 +1019,9 @@ fn parse_is(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
   }
 }
 
+// The `len` here is written qualified. A desugaring stands in for what the author
+// wrote, so it has to mean the same thing in a program that declared a `len` of
+// its own as in one that did not — and only `hive.len` does.
 fn desugar_bounds(vector: ast.Expr, index: ast.Expr) -> ast.Expr {
   ast.EBinary(
     ast.OpAnd,
@@ -1025,7 +1029,7 @@ fn desugar_bounds(vector: ast.Expr, index: ast.Expr) -> ast.Expr {
     ast.EBinary(
       ast.OpLt,
       index,
-      ast.ECall(ast.EIdent("len"), [ast.Arg(None, vector)]),
+      ast.ECall(builtins.qualified("len"), [ast.Arg(None, vector)]),
     ),
   )
 }

@@ -25,6 +25,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import hive/ast
+import hive/builtins
 import hive/runtime
 
 /// The inferred Hive type of an expression, as far as codegen needs to know.
@@ -473,6 +474,7 @@ fn walk_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
 fn walk_expr(env: Env, e: ast.Expr) -> Result(Nil, String) {
   use _ <- result.try(check_indexable(env, e))
   use _ <- result.try(check_address_call(env, e))
+  use _ <- result.try(check_walk_call(env, e))
   case e {
     ast.EInt(_)
     | ast.EFloat(_)
@@ -555,6 +557,225 @@ fn check_address_call(env: Env, e: ast.Expr) -> Result(Nil, String) {
           }
       }
     _ -> Ok(Nil)
+  }
+}
+
+// `map`, `filter` and `filterMap` each take a vector and a function over its
+// elements, and each is specific about what that function answers with. Getting
+// any of it wrong has to be said here: the call lowers to a Go generic helper the
+// source never mentions, so a mismatch left to Go reports against `hive.Map[T,
+// K]` and names neither the builtin nor the argument that was wrong.
+fn check_walk_call(env: Env, e: ast.Expr) -> Result(Nil, String) {
+  case walk_called(e) {
+    None -> Ok(Nil)
+    Some(#(name, [ast.Arg(_, subject), ast.Arg(_, f)])) -> {
+      use elem <- result.try(walk_elem_ty(env, name, subject))
+      check_walk_fn(env, name, elem, f)
+    }
+    Some(#(name, args)) ->
+      Error(
+        "`"
+        <> name
+        <> "` takes a vector and a function over its elements — "
+        <> int.to_string(list.length(args))
+        <> " "
+        <> plural(list.length(args), "argument")
+        <> case list.length(args) {
+          1 -> " was"
+          _ -> " were"
+        }
+        <> " passed. Write `"
+        <> name
+        <> "(values, "
+        <> walk_fn_example(name)
+        <> ")`.",
+      )
+  }
+}
+
+// The walk an expression calls, with its arguments.
+fn walk_called(e: ast.Expr) -> Option(#(String, List(ast.Arg))) {
+  case e {
+    ast.ECall(callee, args) ->
+      case builtins.called(callee) {
+        Some(name) ->
+          case name {
+            "map" | "filter" | "filterMap" -> Some(#(name, args))
+            _ -> None
+          }
+        None -> None
+      }
+    _ -> None
+  }
+}
+
+// The element type the function will be handed. A subject that is not a vector
+// at all is the mistake, not the function.
+fn walk_elem_ty(env: Env, name: String, subject: ast.Expr) -> Result(Ty, String) {
+  case infer(env, subject) {
+    TyVec(elem) -> Ok(elem)
+    // A Table is a vector of rows, so it walks a row at a time.
+    TyTable -> Ok(TyVec(TyStr))
+    // Nothing was pinned down; there is no mismatch to report.
+    TyUnknown -> Ok(TyUnknown)
+    TyStr ->
+      Error(
+        "`"
+        <> name
+        <> "` walks a vector, and a `Str` is not one — it is a sequence of "
+        <> "characters, which `[...]` and `len` treat as a unit. Use "
+        <> "`split(s, sep)` to get a vector of its pieces first.",
+      )
+    other ->
+      Error(
+        "`"
+        <> name
+        <> "` walks a vector, and this is a `"
+        <> show_ty(other)
+        <> "`. Give it the vector whose elements the function should see.",
+      )
+  }
+}
+
+// The function, checked against what the builtin will do with it: it takes one
+// element and answers with the one thing this builtin can use.
+fn check_walk_fn(
+  env: Env,
+  name: String,
+  elem: Ty,
+  f: ast.Expr,
+) -> Result(Nil, String) {
+  case infer(env, f) {
+    TyFunc(pure, params, ret) -> {
+      // Every one of the three is a pure walk: nothing about it says in which
+      // order, or how many times, the function runs. A `proc` is exactly the
+      // thing that would notice, and letting one in would also be a way for a
+      // `func` body to reach side effects it may not have.
+      use _ <- result.try(case pure {
+        True -> Ok(Nil)
+        False ->
+          Error(
+            "`"
+            <> name
+            <> "` takes a `func` (pure), and this is a `proc`: a walk says "
+            <> "nothing about the order its function runs in, or how often, so "
+            <> "there is nowhere to hang a side effect. Use `for each` to walk "
+            <> "a vector with a proc.",
+          )
+      })
+      use _ <- result.try(case params {
+        [param] -> check_walk_param(name, elem, param)
+        _ ->
+          Error(
+            "the function `"
+            <> name
+            <> "` is given takes one element at a time, and this one takes "
+            <> int.to_string(list.length(params))
+            <> " "
+            <> plural(list.length(params), "parameter")
+            <> ". Fix the extra ones in place with a partial application — "
+            <> "`f(fixed, _)` leaves the element as the only one left open.",
+          )
+      })
+      check_walk_ret(name, ret)
+    }
+    // A function value the checker cannot see the shape of; Go still has the
+    // real type and will not let a non-function through.
+    TyUnknown -> Ok(Nil)
+    other ->
+      Error(
+        "`"
+        <> name
+        <> "` walks a vector with a function, and this is a `"
+        <> show_ty(other)
+        <> "`. Pass a `func` by name, or a partial application of one "
+        <> "(`f(fixed, _)`).",
+      )
+  }
+}
+
+fn check_walk_param(name: String, elem: Ty, param: Ty) -> Result(Nil, String) {
+  case ty_accepts(param, elem) {
+    True -> Ok(Nil)
+    False ->
+      Error(
+        "`"
+        <> name
+        <> "` is walking a vector of `"
+        <> show_ty(elem)
+        <> "`, so the function has to take one — this one takes a `"
+        <> show_ty(param)
+        <> "`.",
+      )
+  }
+}
+
+fn check_walk_ret(name: String, ret: Ty) -> Result(Nil, String) {
+  case name, ret {
+    "filter", TyBool -> Ok(Nil)
+    "filter", other ->
+      Error(
+        "`filter` keeps the elements its function says yes to, so that function "
+        <> "answers `Bool` — this one answers `"
+        <> show_ty(other)
+        <> "`. To transform elements instead, use `map`; to do both at once, "
+        <> "return a `Result` and use `filterMap`.",
+      )
+    "filterMap", TyResult(_, _) -> Ok(Nil)
+    "filterMap", other ->
+      Error(
+        "`filterMap` transforms and selects in one pass, so its function answers "
+        <> "a `Result`: an `Ok` carries the element's new value and an `Error` "
+        <> "says it has no place in the output. This one answers `"
+        <> show_ty(other)
+        <> "`. Use `map` when every element has a new value, or `filter` when "
+        <> "none of them change.",
+      )
+    "map", TyVoid ->
+      Error(
+        "`map` collects what its function returns, and this one returns nothing. "
+        <> "A walk that only performs effects is a `for each` loop.",
+      )
+    _, _ -> Ok(Nil)
+  }
+}
+
+// Whether a value of type `arg` may land in a slot of type `param`. Only a
+// mismatch both sides are known well enough to prove is one: `TyUnknown` stands
+// for "could not tell", on either side and at any depth, and a type variable can
+// only be left over from a signature monomorphization has yet to reach.
+fn ty_accepts(param: Ty, arg: Ty) -> Bool {
+  case param, arg {
+    TyUnknown, _ | _, TyUnknown -> True
+    TyVar(_), _ | _, TyVar(_) -> True
+    // An atom renders as its Str form wherever a Str is wanted.
+    TyStr, TyAtom -> True
+    // A Table *is* a vector of rows of Str, spelled shorter.
+    TyTable, TyVec(TyVec(TyStr)) | TyVec(TyVec(TyStr)), TyTable -> True
+    TyVec(p), TyVec(a) -> ty_accepts(p, a)
+    TyResult(po, pe), TyResult(ao, ae) ->
+      ty_accepts(po, ao) && ty_accepts(pe, ae)
+    TyAsync(p), TyAsync(a) -> ty_accepts(p, a)
+    TyAddress(p), TyAddress(a) -> ty_accepts(p, a)
+    TyPending(p), TyPending(a) -> ty_accepts(p, a)
+    // A func value widens to a proc slot, never the other way round — so the
+    // only rejected pairing is a proc arriving at a pure slot.
+    TyFunc(pp, pparams, pret), TyFunc(ap, aparams, aret) ->
+      !{ pp && !ap }
+      && list.length(pparams) == list.length(aparams)
+      && list.all(list.zip(pparams, aparams), fn(pair) {
+        ty_accepts(pair.0, pair.1)
+      })
+      && ty_accepts(pret, aret)
+    _, _ -> param == arg
+  }
+}
+
+// What one of the three builtins would be written with, for the arity message.
+fn walk_fn_example(name: String) -> String {
+  case name {
+    "filter" -> "keep"
+    _ -> "transform"
   }
 }
 
@@ -1482,6 +1703,45 @@ fn ty_to_go(ty: Ty) -> String {
   }
 }
 
+// An inferred type written the way Hive source spells it, for error messages.
+// The types with no surface syntax (a task handle, a service address) say what
+// they are in words instead, since there is nothing to quote.
+fn show_ty(ty: Ty) -> String {
+  case ty {
+    TyStr -> "Str"
+    TyInt -> "Int"
+    TyFloat -> "Float"
+    TyBool -> "Bool"
+    TyAtom -> "Atom"
+    TyTable -> "Table"
+    TyVoid -> "void"
+    TyCustom(name) -> name
+    TyBuiltin(name) -> builtin_qualifier(name) <> "." <> name
+    TyVec(elem) -> show_ty(elem) <> "[]"
+    TyResult(ok, err) -> "Result<" <> show_ty(ok) <> ", " <> show_ty(err) <> ">"
+    TyFunc(pure, params, ret) ->
+      case pure {
+        True -> "func("
+        False -> "proc("
+      }
+      <> string.join(list.map(params, show_ty), ", ")
+      <> "): "
+      <> show_ty(ret)
+    TyAsync(inner) -> "async " <> show_ty(inner)
+    TyAddress(_) -> "a service address"
+    TyPending(_) -> "a request in flight"
+    TyVar(name) -> name
+    TyUnknown -> "value of no known type"
+  }
+}
+
+fn plural(n: Int, word: String) -> String {
+  case n {
+    1 -> word
+    _ -> word <> "s"
+  }
+}
+
 // The Go spelling of a task's result type. A void `async func` yields no value,
 // so its handle carries `hive.Unit` (an empty struct) — awaited only to join on
 // its completion.
@@ -2244,8 +2504,10 @@ fn gen_stmt(
       )
     }
     // `append(v, x)` used as a statement mutates `v` in place, which Go models
-    // by reassigning the (possibly reallocated) slice back to `v`.
-    ast.SExpr(ast.ECall(ast.EIdent("append"), args)) -> {
+    // by reassigning the (possibly reallocated) slice back to `v`. The callee is
+    // the qualified builtin, which is what a bare `append` became unless the
+    // program declared its own (see `hive/builtins`).
+    ast.SExpr(ast.ECall(ast.EMember(ast.EIdent("hive"), "append"), args)) -> {
       let target = case args {
         [ast.Arg(_, t), ..] -> gen_expr(env, t)
         [] -> "_"
@@ -2424,7 +2686,7 @@ fn gen_for_clause(env: Env, stmt: ast.Stmt) -> #(String, Env) {
       #(gen_expr(env, target) <> " = " <> rhs, env)
     }
     // `append(v, x)` advances a mutable vector, reassigning the result back.
-    ast.SExpr(ast.ECall(ast.EIdent("append"), args)) -> {
+    ast.SExpr(ast.ECall(ast.EMember(ast.EIdent("hive"), "append"), args)) -> {
       let target = case args {
         [ast.Arg(_, t), ..] -> gen_expr(env, t)
         [] -> "_"
@@ -3127,48 +3389,37 @@ pub fn infer(env: Env, e: ast.Expr) -> Ty {
 // service address is none of these, and `infer` has already settled that case
 // before anything reaches here.
 fn infer_plain_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> Ty {
-  case callee {
-    ast.EIdent("len") -> TyInt
-    ast.EIdent("bytes") -> TyInt
-    ast.EIdent("join") -> TyStr
-    ast.EIdent("split") -> TyVec(TyStr)
-    ast.EIdent("row") -> TyVec(TyStr)
-    ast.EIdent("column") -> TyVec(TyStr)
+  // A global builtin arrives written out as `hive.<name>` (see `hive/builtins`),
+  // so this is the whole of it: a bare name below is the program's own.
+  case builtins.called(callee) {
+    Some(name) -> infer_global_builtin(env, name, args)
+    None -> infer_other_call(env, callee, args)
+  }
+}
+
+fn infer_global_builtin(env: Env, name: String, args: List(ast.Arg)) -> Ty {
+  case name {
+    "len" | "bytes" -> TyInt
+    "join" -> TyStr
+    "split" | "row" | "column" -> TyVec(TyStr)
     // `indexOf` yields the position it found, or an Error carrying `false`
     // (there is nothing to say about a miss beyond that it missed).
-    ast.EIdent("indexOf") -> TyResult(TyInt, TyBool)
+    "indexOf" -> TyResult(TyInt, TyBool)
     // `append` yields a vector of the same type as its first argument.
-    ast.EIdent("append") ->
+    "append" ->
       case args {
         [ast.Arg(_, first), ..] -> infer(env, first)
         [] -> TyUnknown
       }
-    ast.EIdent(name) ->
-      case has_hole(args) {
-        // A call with `_` placeholders is a partial application, whose
-        // value is a function taking the holes as its parameters.
-        True -> partial_ty(env, name, args)
-        False ->
-          case dict.get(env.locals, name) {
-            // Calling a function-valued local yields its return type.
-            Ok(TyFunc(_, _, ret)) -> ret
-            _ ->
-              case dict.has_key(env.types, name) {
-                True -> TyCustom(name)
-                False ->
-                  case dict.get(env.sigs, name) {
-                    // A bare call to an `async func` does not block; it
-                    // spawns the work and evaluates to a handle (`async T`).
-                    Ok(#(_, ret)) ->
-                      case list.contains(env.asyncs, name) {
-                        True -> TyAsync(ret)
-                        False -> ret
-                      }
-                    Error(_) -> TyUnknown
-                  }
-              }
-          }
-      }
+    "map" | "filter" | "filterMap" -> walk_builtin_ty(env, name, args)
+    // `print` and `println` are void statements.
+    _ -> TyVoid
+  }
+}
+
+fn infer_other_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> Ty {
+  case callee {
+    ast.EIdent(name) -> infer_ident_call(env, name, args)
     // `hive.sql.DatabaseDriver.SQLite()` and friends build a driver value.
     ast.EMember(
       ast.EMember(
@@ -3322,6 +3573,72 @@ fn infer_plain_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> Ty {
         False -> TyUnknown
       }
     _ -> TyUnknown
+  }
+}
+
+// A bare `name(...)`: a partial application, a func-valued local, a type
+// constructor, or a declared callable.
+fn infer_ident_call(env: Env, name: String, args: List(ast.Arg)) -> Ty {
+  case has_hole(args) {
+    // A call with `_` placeholders is a partial application, whose value is a
+    // function taking the holes as its parameters.
+    True -> partial_ty(env, name, args)
+    False ->
+      case dict.get(env.locals, name) {
+        // Calling a function-valued local yields its return type.
+        Ok(TyFunc(_, _, ret)) -> ret
+        _ ->
+          case dict.has_key(env.types, name) {
+            True -> TyCustom(name)
+            False ->
+              case dict.get(env.sigs, name) {
+                // A bare call to an `async func` does not block; it spawns the
+                // work and evaluates to a handle (`async T`).
+                Ok(#(_, ret)) ->
+                  case list.contains(env.asyncs, name) {
+                    True -> TyAsync(ret)
+                    False -> ret
+                  }
+                Error(_) -> TyUnknown
+              }
+          }
+      }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The vector-walking builtins
+// ---------------------------------------------------------------------------
+// `map`, `filter` and `filterMap` each walk a vector with a function value and
+// hand back a new vector. In the notation the builtin table uses:
+//
+//     map(T[], func(T): K): K[]
+//     filter(T[], func(T): Bool): T[]
+//     filterMap(T[], func(T): Result<K, E>): K[]
+//
+// There is no monomorphization to any of them: they lower to one Go generic
+// helper each, and Go infers the type arguments from the call. What comes back
+// is read off the function that was passed, which is where `K` lives — and for
+// `filterMap` it is the *Ok* payload, an Error being how an element says it has
+// no place in the output.
+
+// The result type of one of the walks. A call that is not the two-argument shape
+// is rejected by `check_walk_call` in its own words; there is nothing to read a
+// type off in the meantime.
+fn walk_builtin_ty(env: Env, name: String, args: List(ast.Arg)) -> Ty {
+  case args {
+    [ast.Arg(_, subject), ast.Arg(_, f)] ->
+      case name, infer(env, f) {
+        // `filter` returns what it was given, minus some of it — a Table stays a
+        // Table, and a vector keeps its element type.
+        "filter", _ -> infer(env, subject)
+        "map", TyFunc(_, _, ret) -> TyVec(ret)
+        "filterMap", TyFunc(_, _, TyResult(ok, _)) -> TyVec(ok)
+        // The function is not one whose return can be seen from here; the
+        // element type is unknown rather than wrong.
+        _, _ -> TyVec(TyUnknown)
+      }
+    _ -> TyVec(TyUnknown)
   }
 }
 
@@ -4180,8 +4497,10 @@ fn var_mutated_in_stmt(s: ast.Stmt, name: String) -> Bool {
           expr_root(target) == Some(name)
         _ -> False
       }
-    ast.SExpr(ast.ECall(ast.EIdent("append"), [ast.Arg(_, target), ..])) ->
-      expr_root(target) == Some(name)
+    ast.SExpr(ast.ECall(
+      ast.EMember(ast.EIdent("hive"), "append"),
+      [ast.Arg(_, target), ..],
+    )) -> expr_root(target) == Some(name)
     ast.SExpr(_) -> False
     ast.SIf(branches, else_body) ->
       list.any(branches, fn(b) { var_mutated_in_stmts(b.body, name) })
@@ -4482,6 +4801,13 @@ fn gen_read_csv(env: Env, path: ast.Expr, delim: Option(ast.Expr)) -> String {
 }
 
 fn gen_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
+  case builtins.called(callee) {
+    Some(name) -> gen_global_builtin(env, name, args)
+    None -> gen_other_call(env, callee, args)
+  }
+}
+
+fn gen_other_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
   case callee {
     ast.EIdent(name) -> gen_ident_call(env, name, args)
     // `hive.sql.DatabaseDriver.SQLite()` etc. — driver constructors.
@@ -5387,7 +5713,7 @@ fn gen_ident_call(env: Env, name: String, args: List(ast.Arg)) -> String {
   // already rejected placeholders anywhere else.)
   case has_hole(args) && dict.has_key(env.fns, name) {
     True -> gen_partial(env, name, args)
-    False -> gen_ident_call_full(env, name, args)
+    False -> gen_declared_call(env, name, args)
   }
 }
 
@@ -5465,7 +5791,10 @@ fn partial_ty(env: Env, name: String, args: List(ast.Arg)) -> Ty {
   }
 }
 
-fn gen_ident_call_full(env: Env, name: String, args: List(ast.Arg)) -> String {
+// One of the global builtins, which by this point is always written `hive.<name>`
+// (see `hive/builtins`) — so nothing here has to wonder whether the program meant
+// its own declaration of the name.
+fn gen_global_builtin(env: Env, name: String, args: List(ast.Arg)) -> String {
   case name {
     // `len` counts elements of a vector but characters (runes) of a Str.
     "len" ->
@@ -5528,20 +5857,54 @@ fn gen_ident_call_full(env: Env, name: String, args: List(ast.Arg)) -> String {
     // `append(v, x...)` grows a vector (see gen_append); as a statement the
     // caller reassigns the result back to `v`.
     "append" -> gen_append(env, args)
+    // `map`/`filter`/`filterMap` walk a vector with a function value.
+    _ -> gen_walk_builtin(env, name, args)
+  }
+}
+
+// A call to something the program declared: a type constructor, or a
+// proc/func/query.
+fn gen_declared_call(env: Env, name: String, args: List(ast.Arg)) -> String {
+  case dict.get(env.types, name) {
+    // Bare `Type(...)` constructs the first variant (or the struct itself for a
+    // variant-less type).
+    Ok(ast.TypeDecl(_, [first, ..], _)) ->
+      gen_constructor(env, name, first.name, args)
+    Ok(ast.TypeDecl(_, [], _)) -> gen_struct_construct(env, name, args)
     _ ->
-      case dict.get(env.types, name) {
-        // Bare `Type(...)` constructs the first variant (or the struct itself
-        // for a variant-less type).
-        Ok(ast.TypeDecl(_, [first, ..], _)) ->
-          gen_constructor(env, name, first.name, args)
-        Ok(ast.TypeDecl(_, [], _)) -> gen_struct_construct(env, name, args)
-        _ ->
-          case dict.get(env.sigs, name) {
-            Ok(#(params, _)) ->
-              escape_ident(name) <> "(" <> gen_sig_args(env, args, params) <> ")"
-            Error(_) -> escape_ident(name) <> "(" <> gen_args(env, args) <> ")"
-          }
+      case dict.get(env.sigs, name) {
+        Ok(#(params, _)) ->
+          escape_ident(name) <> "(" <> gen_sig_args(env, args, params) <> ")"
+        Error(_) -> escape_ident(name) <> "(" <> gen_args(env, args) <> ")"
       }
+  }
+}
+
+// `map(v, f)` -> `hive.Map(v, f)`, and likewise for the other two. Go infers the
+// helper's type arguments from the two it is handed, so nothing has to be spelled
+// out here.
+//
+// The vector goes in the way it would go into any `T[]` parameter — copied when
+// it is storage a `mut` binding can still change — so the elements the new vector
+// holds belong to the value that comes back, not to something the caller may
+// still be writing to.
+fn gen_walk_builtin(env: Env, name: String, args: List(ast.Arg)) -> String {
+  let helper = case name {
+    "map" -> "hive.Map"
+    "filter" -> "hive.Filter"
+    _ -> "hive.FilterMap"
+  }
+  case args {
+    [ast.Arg(_, subject), ast.Arg(_, f)] ->
+      helper
+      <> "("
+      <> gen_arg(env, subject, infer(env, subject))
+      <> ", "
+      <> gen_expr(env, f)
+      <> ")"
+    // The arity check has already rejected anything else; this only keeps the
+    // renderer total.
+    _ -> helper <> "(" <> gen_args(env, args) <> ")"
   }
 }
 
@@ -5715,19 +6078,40 @@ fn exported(name: String) -> String {
 // never reach here as identifiers anyway. Struct fields and exported names are
 // capitalized elsewhere, so they can never collide.
 fn escape_ident(name: String) -> String {
-  case is_go_keyword(name) {
+  case is_go_reserved(name) {
     True -> name <> "_"
     False -> name
   }
 }
 
-fn is_go_keyword(name: String) -> Bool {
+// Names that mean something to Go already, and so cannot be the ones a Hive
+// declaration, parameter or local is emitted under.
+//
+// The keywords would not parse. Go's predeclared *functions* would, and would then
+// quietly win: Go lets them be shadowed, so a program declaring its own `len`
+// would emit `func len(...)` at package scope and every `len(v)` the compiler
+// generated — for a `hive.len`, for a `bounds` guard, for any vector's length —
+// would reach that instead. Renaming is what lets a program take `len` or
+// `append` for itself and still get the builtin by its long name.
+//
+// Go's predeclared *types* and constants (`error`, `string`, `nil`) are left
+// alone. They are the names a Hive program is most likely to want (`error` above
+// all), nothing here generates a call to one, and they were never renamed before.
+// A program that declares a top-level `error` still collides with the `error` in
+// a generated SQL mapper's signature — that is a hazard of its own, older than
+// this list and not one builtin resolution introduced.
+fn is_go_reserved(name: String) -> Bool {
   list.contains(
     [
+      // Keywords.
       "break", "case", "chan", "const", "continue", "default", "defer", "else",
       "fallthrough", "for", "func", "go", "goto", "if", "import", "interface",
       "map", "package", "range", "return", "select", "struct", "switch", "type",
       "var",
+      // Predeclared functions.
+      "append", "cap", "clear", "close", "complex", "copy", "delete", "imag",
+      "len", "make", "max", "min", "new", "panic", "print", "println", "real",
+      "recover",
     ],
     name,
   )

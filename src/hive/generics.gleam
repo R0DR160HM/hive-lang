@@ -13,6 +13,17 @@
 //// types, and one concrete copy of the callable is emitted per distinct set of
 //// them (`first_Str`, `first_Int`). The generic original is dropped.
 ////
+//// Inference unifies an argument against the parameter's whole type, not just
+//// its head, so a variable is pinned down wherever it appears — including inside
+//// a parameter that is itself a function. That is what makes a higher-order
+//// generic work:
+////
+////     func filterMap(v: T[], f: func(T): Result<K, E>): K[] { ... }
+////
+//// `T` comes from the vector, `K` and `E` from the function. A copy substitutes
+//// through its *body* as well as its signature, since a body writes types down
+//// of its own (`mut K[dyn] out = []`, `for each x: T in v`, `Box<T> b = ...`).
+////
 //// Doing it as an AST-to-AST pass, rather than inside codegen, is what keeps
 //// the guarantees intact — every instantiation is an ordinary Hive declaration
 //// that the validation, type and bounds passes then check like any other. Two
@@ -1299,9 +1310,11 @@ fn decl_params(d: ast.Decl) -> List(ast.Field) {
   }
 }
 
-// The concrete copy: the same body under a new name, with every variable in the
-// signature replaced. The body needs no rewriting of its own — it refers to the
-// parameters by name, and their types have just changed underneath it.
+// The concrete copy: the same body under a new name, with every variable
+// replaced — in the signature, and in the body too. A body writes types down of
+// its own (`mut K[dyn] out = []`, `for each x: T in v`, `parse(s) with T`), and
+// those name the same variables the signature does, so leaving them alone would
+// emit a declaration mentioning a type that does not exist.
 fn specialize(
   d: ast.Decl,
   mangled: String,
@@ -1314,18 +1327,184 @@ fn specialize(
         mangled,
         list.map(params, sub),
         substitute(subst, ret),
-        body,
+        substitute_stmts(subst, body),
       )
     ast.FuncDecl(_, params, ret, body, async) ->
       ast.FuncDecl(
         mangled,
         list.map(params, sub),
         substitute(subst, ret),
-        body,
+        substitute_stmts(subst, body),
         async,
       )
     ast.QueryDecl(_, params, ret, sql) ->
-      ast.QueryDecl(mangled, list.map(params, sub), substitute(subst, ret), sql)
+      ast.QueryDecl(
+        mangled,
+        list.map(params, sub),
+        substitute(subst, ret),
+        substitute_sql(subst, sql),
+      )
     ast.TypeDecl(..) -> d
   }
+}
+
+// ---------------------------------------------------------------------------
+// Substituting through a body
+// ---------------------------------------------------------------------------
+// Three places in a body write a type down — a typed declaration, a `for each`
+// element annotation, and a `with` decode target. Everything else here is the
+// traversal that reaches them.
+
+fn substitute_stmts(
+  subst: Dict(String, ast.TypeExpr),
+  stmts: List(ast.Stmt),
+) -> List(ast.Stmt) {
+  list.map(stmts, substitute_stmt(subst, _))
+}
+
+fn substitute_stmt(
+  subst: Dict(String, ast.TypeExpr),
+  s: ast.Stmt,
+) -> ast.Stmt {
+  case s {
+    ast.SVarDecl(name, value, mutable) ->
+      ast.SVarDecl(name, substitute_expr(subst, value), mutable)
+    ast.STypedDecl(typ, name, value, mutable) ->
+      ast.STypedDecl(
+        substitute(subst, typ),
+        name,
+        substitute_expr(subst, value),
+        mutable,
+      )
+    ast.SAssign(target, value) ->
+      ast.SAssign(
+        substitute_expr(subst, target),
+        substitute_expr(subst, value),
+      )
+    ast.SIf(branches, else_body) ->
+      ast.SIf(
+        list.map(branches, fn(b) {
+          ast.Branch(
+            substitute_expr(subst, b.cond),
+            substitute_stmts(subst, b.body),
+          )
+        }),
+        option.map(else_body, substitute_stmts(subst, _)),
+      )
+    ast.SFor(init, cond, post, body) ->
+      ast.SFor(
+        option.map(init, substitute_stmt(subst, _)),
+        option.map(cond, substitute_expr(subst, _)),
+        option.map(post, substitute_stmt(subst, _)),
+        substitute_stmts(subst, body),
+      )
+    ast.SForEach(name, elem_type, iterable, body) ->
+      ast.SForEach(
+        name,
+        option.map(elem_type, substitute(subst, _)),
+        substitute_expr(subst, iterable),
+        substitute_stmts(subst, body),
+      )
+    ast.SReturn(value) ->
+      ast.SReturn(option.map(value, substitute_expr(subst, _)))
+    ast.SEcho(e) -> ast.SEcho(substitute_expr(subst, e))
+    ast.SAssert(e) -> ast.SAssert(substitute_expr(subst, e))
+    ast.SPanic(e) -> ast.SPanic(substitute_expr(subst, e))
+    ast.SExpr(e) -> ast.SExpr(substitute_expr(subst, e))
+    ast.SBreak | ast.SContinue -> s
+  }
+}
+
+fn substitute_expr(
+  subst: Dict(String, ast.TypeExpr),
+  e: ast.Expr,
+) -> ast.Expr {
+  case e {
+    ast.EWith(value, typ) ->
+      ast.EWith(substitute_expr(subst, value), substitute(subst, typ))
+    ast.EVector(items) ->
+      ast.EVector(list.map(items, substitute_expr(subst, _)))
+    ast.EInterp(parts) ->
+      ast.EInterp(
+        list.map(parts, fn(part) {
+          case part {
+            ast.ILit(_) -> part
+            ast.IExpr(inner) -> ast.IExpr(substitute_expr(subst, inner))
+          }
+        }),
+      )
+    ast.EMember(target, field) ->
+      ast.EMember(substitute_expr(subst, target), field)
+    ast.ECall(callee, args) ->
+      ast.ECall(
+        substitute_expr(subst, callee),
+        list.map(args, fn(a) { ast.Arg(a.name, substitute_expr(subst, a.value)) }),
+      )
+    ast.EIndex(target, index) ->
+      ast.EIndex(
+        substitute_expr(subst, target),
+        substitute_expr(subst, index),
+      )
+    ast.ESlice(target, low, high) ->
+      ast.ESlice(
+        substitute_expr(subst, target),
+        option.map(low, substitute_expr(subst, _)),
+        option.map(high, substitute_expr(subst, _)),
+      )
+    ast.EBinary(op, l, r) ->
+      ast.EBinary(op, substitute_expr(subst, l), substitute_expr(subst, r))
+    ast.EIs(subject, pattern) ->
+      ast.EIs(substitute_expr(subst, subject), pattern)
+    ast.EUsing(source, kind) ->
+      ast.EUsing(substitute_expr(subst, source), case kind {
+        ast.UsingCsv(sep) ->
+          ast.UsingCsv(option.map(sep, substitute_expr(subst, _)))
+        ast.UsingQuery(q) -> ast.UsingQuery(substitute_expr(subst, q))
+        ast.UsingRaw(text) -> ast.UsingRaw(substitute_expr(subst, text))
+        ast.UsingXlsx | ast.UsingOds -> kind
+      })
+    ast.EAwait(value, timeout) ->
+      ast.EAwait(
+        substitute_expr(subst, value),
+        option.map(timeout, substitute_expr(subst, _)),
+      )
+    ast.EInt(_)
+    | ast.EFloat(_)
+    | ast.EString(_)
+    | ast.EBool(_)
+    | ast.EAtom(_)
+    | ast.EIdent(_) -> e
+  }
+}
+
+fn substitute_sql(
+  subst: Dict(String, ast.TypeExpr),
+  parts: List(ast.SqlPart),
+) -> List(ast.SqlPart) {
+  list.map(parts, fn(part) {
+    case part {
+      ast.SqlLit(_) -> part
+      ast.SqlParam(e) -> ast.SqlParam(substitute_expr(subst, e))
+      ast.SqlWhere(group) -> ast.SqlWhere(substitute_group(subst, group))
+    }
+  })
+}
+
+fn substitute_group(
+  subst: Dict(String, ast.TypeExpr),
+  group: ast.SqlGroup,
+) -> ast.SqlGroup {
+  ast.SqlGroup(
+    group.conjunction,
+    list.map(group.items, fn(item) {
+      case item {
+        ast.SqlCond(cond, body) ->
+          ast.SqlCond(
+            substitute_expr(subst, cond),
+            substitute_sql(subst, body),
+          )
+        ast.SqlNested(inner) -> ast.SqlNested(substitute_group(subst, inner))
+      }
+    }),
+  )
 }

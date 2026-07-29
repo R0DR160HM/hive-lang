@@ -1273,10 +1273,12 @@ fn le_facts(env: Env, a: ast.Expr, b: ast.Expr) -> List(Fact) {
 }
 
 // If `e` denotes `len(v)` — either literally `len(v)` or a variable bound to
-// it via `n := len(v)` — return `v`'s normalized key.
+// it via `n := len(v)` — return `v`'s normalized key. The builtin arrives
+// qualified (see `hive/builtins`), so a program's own `len` is not mistaken for
+// one whose result bounds anything.
 fn as_len(env: Env, e: ast.Expr) -> Option(String) {
   case e {
-    ast.ECall(ast.EIdent("len"), [ast.Arg(_, v)]) -> key(v)
+    ast.ECall(ast.EMember(ast.EIdent("hive"), "len"), [ast.Arg(_, v)]) -> key(v)
     ast.EIdent(n) -> dict.get(env.aliases, n) |> option.from_result
     _ -> None
   }
@@ -1287,7 +1289,8 @@ fn as_len(env: Env, e: ast.Expr) -> Option(String) {
 // name was bound from (`r := indexOf(v, x)`).
 fn searched_vector(env: Env, e: ast.Expr) -> Option(String) {
   case e {
-    ast.ECall(ast.EIdent("indexOf"), [ast.Arg(_, v), _]) -> key(v)
+    ast.ECall(ast.EMember(ast.EIdent("hive"), "indexOf"), [ast.Arg(_, v), _]) ->
+      key(v)
     ast.EIdent(n) -> dict.get(env.searches, n) |> option.from_result
     _ -> None
   }
@@ -1441,14 +1444,14 @@ fn record_binding(env: Env, name: String, value: ast.Expr) -> Env {
         lengths: dict.insert(base.lengths, name, LitLen(list.length(items))),
       )
     // `n := len(v)` — remember that `n` is `len(v)`.
-    ast.ECall(ast.EIdent("len"), [ast.Arg(_, v)]) ->
+    ast.ECall(ast.EMember(ast.EIdent("hive"), "len"), [ast.Arg(_, v)]) ->
       case key(v) {
         Some(vk) -> Env(..base, aliases: dict.insert(base.aliases, name, vk))
         None -> base
       }
     // `r := indexOf(v, x)` — remember which vector `r` searched, so the index
     // it carries can be recognised as one of `v`'s own positions.
-    ast.ECall(ast.EIdent("indexOf"), [ast.Arg(_, v), _]) ->
+    ast.ECall(ast.EMember(ast.EIdent("hive"), "indexOf"), [ast.Arg(_, v), _]) ->
       case key(v) {
         Some(vk) -> Env(..base, searches: dict.insert(base.searches, name, vk))
         None -> base
@@ -1613,7 +1616,10 @@ fn mutated_in_stmt(s: ast.Stmt) -> List(String) {
         Some(n) -> [n]
         None -> []
       }
-    ast.SExpr(ast.ECall(ast.EIdent("append"), [ast.Arg(_, target), ..])) ->
+    ast.SExpr(ast.ECall(
+      ast.EMember(ast.EIdent("hive"), "append"),
+      [ast.Arg(_, target), ..],
+    )) ->
       case assign_root(target) {
         Some(n) -> [n]
         None -> []

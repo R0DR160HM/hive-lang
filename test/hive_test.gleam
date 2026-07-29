@@ -1884,6 +1884,20 @@ pub fn sql_example_compiles_test() {
   let assert Ok(_) = compiler.compile(src)
 }
 
+pub fn first_class_functions_example_compiles_test() {
+  let assert Ok(src) =
+    simplifile.read(
+      "code-examples/8 - First-Class Functions/first-class-functions.hive",
+    )
+  let assert Ok(_) = compiler.compile(src)
+}
+
+pub fn generics_example_compiles_test() {
+  let assert Ok(src) =
+    simplifile.read("code-examples/14 - Generics/generics.hive")
+  let assert Ok(_) = compiler.compile(src)
+}
+
 // A named address is the only kind that survives its service being replaced: it
 // is re-resolved through the registry on every send, so a replacement registered
 // under the same atom is picked up by every holder. The fixture exercises that
@@ -3320,7 +3334,7 @@ pub fn a_negative_loop_counter_is_not_assumed_nonneg_test() {
 }
 
 // ---------------------------------------------------------------------------
-// `T[]` is a parameter-only spelling
+// `T[]` is a signature spelling: parameters and returns, never storage
 // ---------------------------------------------------------------------------
 
 pub fn unsized_vector_is_accepted_as_a_parameter_test() {
@@ -3340,12 +3354,40 @@ pub fn unsized_vector_is_rejected_as_a_variable_test() {
   should.be_true(string.contains(msg, "`[]` only says"))
 }
 
-pub fn unsized_vector_is_rejected_as_a_return_test() {
-  let assert Error(msg) =
-    compiler.compile(
+pub fn unsized_vector_is_accepted_as_a_return_test() {
+  // A return names no storage of its own — it says what the caller gets — and
+  // "some length" is a complete answer there. Which kind the callee kept the
+  // value in is its own business.
+  let go =
+    compile(
       "func f(): Str[] {\n\treturn [\"a\"]\n}\nproc main(): void {\n\techo len(f())\n}\n",
     )
-  should.be_true(string.contains(msg, "`[]` only says"))
+  should.be_true(string.contains(go, "func f() []string {"))
+}
+
+pub fn an_unsized_return_promises_no_length_test() {
+  // Which is the whole point of it: `[]` and `[dyn]` are the same answer to a
+  // caller, so a static slot cannot be filled from one and an index into the
+  // result needs a guard.
+  let assert Error(static_slot) =
+    compiler.compile(
+      "func f(): Str[] {\n\treturn [\"a\", \"b\"]\n}\nproc main(): void {\n\tStr[2] v = f()\n\techo v[0]\n}\n",
+    )
+  should.be_true(string.contains(static_slot, "isn't known at compile time"))
+
+  let assert Error(unguarded) =
+    compiler.compile(
+      "func f(): Str[] {\n\treturn [\"a\"]\n}\nproc main(): void {\n\tv := f()\n\techo v[0]\n}\n",
+    )
+  should.be_true(string.contains(unguarded, "cannot prove"))
+}
+
+pub fn an_unsized_return_is_accepted_in_a_function_type_test() {
+  // A function type's return is a return position like any other.
+  compiler.compile(
+    "func pieces(s: Str): Str[] {\n\treturn split(s, \",\")\n}\nfunc count(f: func(Str): Str[], s: Str): Int {\n\treturn len(f(s))\n}\nproc main(): void {\n\techo count(pieces, \"a,b\")\n}\n",
+  )
+  |> should.be_ok
 }
 
 pub fn unsized_vector_is_rejected_as_a_field_test() {
@@ -3681,6 +3723,386 @@ pub fn a_generic_type_needs_its_arguments_test() {
       "type Box {\n\titems: T[dyn]\n}\nproc main(): void {\n\tBox b = Box([\"x\"])\n\techo len(b.items)\n}\n",
     )
   should.be_true(string.contains(msg, "needs its type arguments"))
+}
+
+pub fn a_generic_body_substitutes_the_types_it_writes_test() {
+  // A body writes types down of its own, and they name the same variables the
+  // signature does. Leaving them alone would emit `var kept []T`.
+  let go =
+    compile(
+      "func repack(values: T[]): T[] {\n\tmut T[dyn] kept = []\n\tfor each value: T in values {\n\t\tappend(kept, value)\n\t}\n\treturn kept\n}\nproc main(): void {\n\tStr[dyn] a = [\"x\"]\n\tInt[dyn] b = [1]\n\techo len(repack(a)) + len(repack(b))\n}\n",
+    )
+  should.be_true(string.contains(go, "var kept []string = []string{}"))
+  should.be_true(string.contains(go, "var kept []int = []int{}"))
+  should.be_false(string.contains(go, "[]T"))
+}
+
+pub fn a_generic_body_instantiates_a_generic_type_at_a_variable_test() {
+  // `Box<T>` in a body is `Box<Str>` once the copy knows what `T` is, and that
+  // instantiation is generated like any other.
+  let go =
+    compile(
+      "type Box {\n\titems: T[dyn]\n}\nfunc boxUp(values: T[]): Box<T> {\n\tBox<T> boxed = Box(values)\n\treturn boxed\n}\nproc main(): void {\n\tStr[dyn] a = [\"x\"]\n\techo len(boxUp(a).items)\n}\n",
+    )
+  should.be_true(string.contains(go, "type Box_Str struct {"))
+  should.be_true(string.contains(go, "func boxUp_Str(values []string) Box_Str {"))
+}
+
+pub fn a_variable_is_inferred_through_a_function_parameter_test() {
+  // `K` and `E` appear only inside the callback's type, which is still a
+  // parameter — so the call pins them down exactly as a plain argument would.
+  let go =
+    compile(
+      "func filterMap(values: T[], transform: func(T): Result<K, E>): K[] {\n\tmut K[dyn] out = []\n\tfor each value in values {\n\t\tif transform(value) is Result.Ok(mapped) {\n\t\t\tappend(out, mapped)\n\t\t}\n\t}\n\treturn out\n}\nfunc parseIt(s: Str): Result<Int, Bool> {\n\treturn Result.Ok(1)\n}\nproc main(): void {\n\tStr[dyn] raw = [\"1\"]\n\tInt[dyn] ones = filterMap(raw, parseIt)\n\techo len(ones)\n}\n",
+    )
+  should.be_true(string.contains(
+    go,
+    "func filterMap_Str_Int_Bool(values []string, transform func(string) hive.Result[int, bool]) []int {",
+  ))
+  should.be_true(string.contains(go, "var out []int = []int{}"))
+}
+
+// ---------------------------------------------------------------------------
+// `map`, `filter` and `filterMap`
+// ---------------------------------------------------------------------------
+
+const walkers = "func double(n: Int): Int {\n\treturn n * 2\n}\nfunc isEven(n: Int): Bool {\n\treturn n % 2 == 0\n}\nfunc show(n: Int): Str {\n\treturn \"{n}\"\n}\nfunc hasOne(row: Str[]): Bool {\n\treturn len(row) == 1\n}\nfunc parseIt(s: Str): Result<Int, Bool> {\n\tif s == \"1\" {\n\t\treturn Result.Ok(1)\n\t}\n\treturn Result.Error(false)\n}\n"
+
+fn walk(body: String) -> Result(String, String) {
+  compiler.compile(walkers <> "proc main(): void {\n" <> body <> "}\n")
+}
+
+fn walk_go(body: String) -> String {
+  let assert Ok(go) = walk(body)
+  go
+}
+
+fn walk_error(body: String) -> String {
+  let assert Error(msg) = walk(body)
+  msg
+}
+
+pub fn map_yields_what_its_transform_returns_test() {
+  let go =
+    walk_go(
+      "\tInt[dyn] v = [1, 2]\n\tStr[dyn] shown = map(v, show)\n\techo join(shown, \",\")\n",
+    )
+  should.be_true(string.contains(go, "var shown []string = hive.Map(v, show)"))
+}
+
+pub fn filter_keeps_the_vectors_own_type_test() {
+  let go =
+    walk_go("\tInt[dyn] v = [1, 2]\n\tInt[dyn] evens = filter(v, isEven)\n\techo len(evens)\n")
+  should.be_true(string.contains(go, "var evens []int = hive.Filter(v, isEven)"))
+}
+
+pub fn filter_map_yields_the_ok_payload_test() {
+  let go =
+    walk_go(
+      "\tStr[dyn] raw = [\"1\", \"x\"]\n\tInt[dyn] ones = filterMap(raw, parseIt)\n\techo len(ones)\n",
+    )
+  should.be_true(string.contains(
+    go,
+    "var ones []int = hive.FilterMap(raw, parseIt)",
+  ))
+}
+
+pub fn a_walk_takes_a_partial_application_test() {
+  let go =
+    walk_go("\tInt[dyn] v = [1, 2]\n\tInt[dyn] doubled = map(v, double(_))\n\techo len(doubled)\n")
+  should.be_true(string.contains(go, "hive.Map(v, func(_h0 int) int {"))
+}
+
+pub fn a_walk_copies_a_mutable_vector_in_test() {
+  // The vector goes in the way it would go into any `T[]` parameter, so the
+  // elements the result holds are not ones the caller can still write to.
+  let go =
+    walk_go(
+      "\tmut Str[dyn][dyn] rows = [[\"a\"]]\n\tStr[dyn][dyn] kept = filter(rows, hasOne)\n\techo len(kept)\n",
+    )
+  should.be_true(string.contains(go, "hive.Filter(hive.CloneVecFn(rows,"))
+}
+
+pub fn a_walk_is_available_in_a_func_body_test() {
+  // Every walk is pure, so a `func` may use one — nothing about it is a proc.
+  walk("\tInt[dyn] v = [1]\n\techo len(map(v, double))\n") |> should.be_ok
+  compiler.compile(
+    "func double(n: Int): Int {\n\treturn n * 2\n}\nfunc total(v: Int[]): Int {\n\treturn len(map(v, double))\n}\nproc main(): void {\n\tInt[dyn] v = [1]\n\techo total(v)\n}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn a_walk_rejects_a_proc_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "proc shout(n: Int): Int {\n\techo n\n\treturn n\n}\nproc main(): void {\n\tInt[dyn] v = [1]\n\techo len(map(v, shout))\n}\n",
+    )
+  should.be_true(string.contains(msg, "takes a `func` (pure)"))
+}
+
+pub fn filter_needs_a_bool_test() {
+  let msg = walk_error("\tInt[dyn] v = [1]\n\techo len(filter(v, show))\n")
+  should.be_true(string.contains(msg, "answers `Bool`"))
+}
+
+pub fn filter_map_needs_a_result_test() {
+  let msg = walk_error("\tInt[dyn] v = [1]\n\techo len(filterMap(v, show))\n")
+  should.be_true(string.contains(msg, "answers a `Result`"))
+}
+
+pub fn map_needs_a_value_back_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "func nothing(n: Int): void {\n\treturn\n}\nproc main(): void {\n\tInt[dyn] v = [1]\n\techo len(map(v, nothing))\n}\n",
+    )
+  should.be_true(string.contains(msg, "returns nothing"))
+}
+
+pub fn a_walk_needs_a_vector_test() {
+  let msg = walk_error("\techo len(map(\"abc\", show))\n")
+  should.be_true(string.contains(msg, "walks a vector"))
+}
+
+pub fn a_walk_needs_the_right_element_type_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "func upper(s: Str): Str {\n\treturn s\n}\nproc main(): void {\n\tInt[dyn] v = [1]\n\techo len(map(v, upper))\n}\n",
+    )
+  should.be_true(string.contains(msg, "walking a vector of `Int`"))
+}
+
+pub fn a_walk_needs_a_one_element_function_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "func addN(a: Int, b: Int): Int {\n\treturn a + b\n}\nproc main(): void {\n\tInt[dyn] v = [1]\n\techo len(map(v, addN))\n}\n",
+    )
+  should.be_true(string.contains(msg, "one element at a time"))
+}
+
+pub fn a_walk_needs_two_arguments_test() {
+  let msg = walk_error("\tInt[dyn] v = [1]\n\techo len(map(v))\n")
+  should.be_true(string.contains(msg, "1 argument was passed"))
+}
+
+pub fn a_walk_takes_no_named_arguments_test() {
+  let msg = walk_error("\tInt[dyn] v = [1]\n\techo len(map(values: v, transform: show))\n")
+  should.be_true(string.contains(msg, "does not accept named arguments"))
+}
+
+// ---------------------------------------------------------------------------
+// A declaration wins over a builtin; `hive.<name>` always reaches the builtin
+// ---------------------------------------------------------------------------
+
+pub fn a_declaration_wins_over_a_builtin_test() {
+  // A name you declared is the one your calls mean — including its own arity,
+  // which the builtin's would have rejected.
+  let go =
+    compile(
+      "func len(label: Str, extra: Int): Str {
+	return \"{label}{extra}\"
+}
+proc main(): void {
+	echo len(\"x\", 2)
+}
+",
+    )
+  // `len` is a Go builtin, so the declaration is renamed — left alone it would
+  // shadow the `len` every generated vector length uses.
+  should.be_true(string.contains(
+    go,
+    "func len_(label string, extra int) string {",
+  ))
+  should.be_true(string.contains(go, "len_(\"x\", 2)"))
+}
+
+pub fn a_shadowed_builtin_is_reached_by_its_long_name_test() {
+  let go =
+    compile(
+      "func len(label: Str, extra: Int): Str {
+	return \"{label}{extra}\"
+}
+proc main(): void {
+	Str[dyn] v = [\"a\", \"b\"]
+	echo len(\"x\", 2)
+	echo hive.len(v)
+	echo hive.join(v, \"-\")
+}
+",
+    )
+  should.be_true(string.contains(go, "len_(\"x\", 2)"))
+  should.be_true(string.contains(go, "fmt.Println(len(v))"))
+  should.be_true(string.contains(go, "hive.Join(v, \"-\")"))
+}
+
+pub fn a_local_wins_over_a_builtin_test() {
+  let go =
+    compile(
+      "func addN(a: Int, b: Int): Int {
+	return a + b
+}
+proc main(): void {
+	filter := addN(1, _)
+	echo filter(41)
+}
+",
+    )
+  should.be_false(string.contains(go, "hive.Filter("))
+}
+
+pub fn a_program_keeps_its_own_map_test() {
+  let go =
+    compile(
+      "func map(a: Int, b: Int, c: Int): Int {
+	return a + b + c
+}
+proc main(): void {
+	echo map(1, 2, 3)
+}
+",
+    )
+  should.be_true(string.contains(go, "func map_(a int, b int, c int) int {"))
+  should.be_true(string.contains(go, "map_(1, 2, 3)"))
+  should.be_false(string.contains(go, "hive.Map("))
+}
+
+pub fn a_declared_append_is_an_ordinary_callable_test() {
+  // The mutability rule belongs to the builtin: a declared `append` has no
+  // special first argument, and an immutable one is nobody's error.
+  let go =
+    compile(
+      "func append(a: Str, b: Str): Str {
+	return a + b
+}
+proc main(): void {
+	x := \"a\"
+	echo append(x, \"b\")
+}
+",
+    )
+  should.be_true(string.contains(
+    go,
+    "func append_(a string, b string) string {",
+  ))
+  should.be_true(string.contains(go, "append_(x, \"b\")"))
+}
+
+pub fn the_builtin_append_still_needs_a_mut_target_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "func append(a: Str, b: Str): Str {
+	return a + b
+}
+proc main(): void {
+	Str[dyn] v = [\"a\"]
+	hive.append(v, \"b\")
+}
+",
+    )
+  should.be_true(string.contains(msg, "requires a mutable vector"))
+}
+
+pub fn a_bounds_guard_is_not_captured_by_a_declared_len_test() {
+  // `v bounds i` desugars to a length check, and a desugaring has to mean the
+  // same thing in a program that declared a `len` of its own.
+  let go =
+    compile(
+      "func len(label: Str): Str {
+	return label
+}
+proc main(): void {
+	Str[dyn] v = [\"a\", \"b\"]
+	i := 1
+	if v bounds i {
+		echo v[i]
+	}
+}
+",
+    )
+  should.be_true(string.contains(go, "(i < len(v))"))
+}
+
+pub fn a_declared_index_of_carries_no_proof_test() {
+  // The bounds pass trusts the *builtin* `indexOf` to hand back a position the
+  // vector really has. A program's own says nothing of the kind.
+  let assert Error(msg) =
+    compiler.compile(
+      "func indexOf(v: Str[], x: Str): Result<Int, Bool> {
+	return Result.Ok(9999)
+}
+proc main(): void {
+	Str[dyn] v = [\"a\"]
+	if indexOf(v, \"a\") is Result.Ok(i) {
+		echo v[i]
+	}
+}
+",
+    )
+  should.be_true(string.contains(msg, "cannot prove"))
+
+  // The builtin's proof survives, reached the long way.
+  compiler.compile(
+    "func indexOf(v: Str[], x: Str): Result<Int, Bool> {
+	return Result.Ok(9999)
+}
+proc main(): void {
+	Str[dyn] v = [\"a\"]
+	if hive.indexOf(v, \"a\") is Result.Ok(i) {
+		echo v[i]
+	}
+}
+",
+  )
+  |> should.be_ok
+}
+
+pub fn shadowing_is_per_module_test() {
+  // The entry declares `map`; the imported module does not, so a bare `map`
+  // there is still the builtin. Another module's declarations are only ever
+  // reached through its alias, so they cannot shadow anything here.
+  let assert Ok(go) =
+    compiler.compile_file("test/modules/shadowed-builtin.hive")
+  should.be_true(string.contains(go, "func map_(a int, b int) int {"))
+  should.be_true(string.contains(go, "map_(6, 7)"))
+  // The library module's own `map(v, double)` reached the builtin.
+  should.be_true(string.contains(go, "hive.Map(v, "))
+}
+
+pub fn an_unknown_hive_member_is_named_test() {
+  let assert Error(msg) =
+    compiler.compile("proc main(): void {
+	echo hive.nope(1)
+}
+")
+  should.be_true(string.contains(msg, "`hive.nope` is not a builtin"))
+  should.be_true(string.contains(msg, "lives in a module"))
+}
+
+pub fn a_bare_hive_builtin_type_still_points_at_its_module_test() {
+  // The older message for `hive.HttpRequest(...)` is not swallowed by the new
+  // global-builtin arm.
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {
+	r := hive.HttpRequest(\"GET\")
+	echo r.method
+}
+",
+    )
+  should.be_true(string.contains(msg, "hive.net.HttpRequest"))
+}
+
+pub fn a_walk_composes_with_a_generic_test() {
+  // The generic's callback type is what pins `K` and `E` down; once the copy is
+  // concrete, `filterMap` reads its result off that same substituted type.
+  let go =
+    compile(
+      "func onlyOk(values: T[], check: func(T): Result<K, E>): K[] {\n\treturn filterMap(values, check)\n}\nfunc parseIt(s: Str): Result<Int, Bool> {\n\treturn Result.Ok(1)\n}\nproc main(): void {\n\tStr[dyn] raw = [\"1\"]\n\tInt[dyn] ones = onlyOk(raw, parseIt)\n\techo len(ones)\n}\n",
+    )
+  should.be_true(string.contains(
+    go,
+    "func onlyOk_Str_Int_Bool(values []string, check func(string) hive.Result[int, bool]) []int {",
+  ))
+  should.be_true(string.contains(go, "return hive.FilterMap(values, check)"))
 }
 
 // ---------------------------------------------------------------------------

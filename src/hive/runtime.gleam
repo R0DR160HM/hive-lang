@@ -524,6 +524,44 @@ func IndexOfStr(s string, sub string) Result[int, bool] {
 	return Ok[int, bool](utf8.RuneCountInString(s[:i]))
 }
 
+// Map applies f to every element of v, in order, and returns the results as a
+// new vector of the same length (backs the `map` builtin). v is not touched.
+func Map[T any, K any](v []T, f func(T) K) []K {
+	out := make([]K, len(v))
+	for i, x := range v {
+		out[i] = f(x)
+	}
+	return out
+}
+
+// Filter returns the elements of v that keep reports true for, in order (backs
+// the `filter` builtin). The result is always non-nil, so an empty one is an
+// empty vector rather than a missing one.
+func Filter[T any](v []T, keep func(T) bool) []T {
+	out := []T{}
+	for _, x := range v {
+		if keep(x) {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// FilterMap applies f to every element of v and keeps the payloads of the Ok
+// results, in order (backs the `filterMap` builtin). One pass transforms and
+// selects at once: an Error is how f says an element has no place in the output,
+// and the error value itself is discarded — nothing downstream could tell which
+// element it came from.
+func FilterMap[T any, K any, E any](v []T, f func(T) Result[K, E]) []K {
+	out := []K{}
+	for _, x := range v {
+		if r := f(x); r.IsOk() {
+			out = append(out, r.Ok())
+		}
+	}
+	return out
+}
+
 // MatchPattern matches s against a string-pattern template and returns the
 // captured hole values in order, or nil when s does not match. This backs Hive
 // patterns such as `path is \"/api/{id}/{name}/delete\"`.
