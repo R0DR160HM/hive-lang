@@ -15,6 +15,7 @@ import shellout
 import simplifile
 import hive/compiler
 import hive/runtime
+import hive/spawn
 
 /// Compile `entry` to Go, then build a native executable with the Go compiler.
 /// On success returns the path to the produced executable.
@@ -95,23 +96,30 @@ pub fn run(entry: String, program_args: List(String)) -> Result(Int, String) {
 
   use dir_abs <- result.try(absolute(dir))
 
-  case
-    shellout.command(
-      run: "go",
-      // `go run . <args>` forwards the trailing arguments to the program, so
-      // `hive.term.args()` sees the same list a built binary would.
-      with: list.append(["run", "."], program_args),
-      in: build_dir,
-      opt: [
-        shellout.LetBeStdout,
-        shellout.LetBeStderr,
-        shellout.SetEnvironment([#("HIVE_RUN_CWD", dir_abs)]),
-      ],
-    )
-  {
-    Ok(_) -> Ok(0)
-    Error(#(code, _)) -> Ok(code)
+  // Where this program's input is handed over, for one that reads at all —
+  // `hive.term.read()` is what lowers to `hive.TermRead`. Nothing is relayed to
+  // a program that never reads. The path is absolute because the program is
+  // chdir'd to its own folder before `main` runs.
+  let input_relay = case string.contains(main_go, "hive.TermRead(") {
+    True ->
+      filepath.join(
+        filepath.join(dir_abs, base <> ".hive-build"),
+        "stdin-relay",
+      )
+    False -> ""
   }
+
+  // Not `shellout`: it closes the standard input of what it spawns, which
+  // leaves `hive.term.read()` reading end of file. See `hive/spawn`.
+  Ok(spawn.run(
+    "go",
+    // `go run . <args>` forwards the trailing arguments to the program, so
+    // `hive.term.args()` sees the same list a built binary would.
+    list.append(["run", "."], program_args),
+    build_dir,
+    [#("HIVE_RUN_CWD", dir_abs)],
+    input_relay,
+  ))
 }
 
 // A program that uses `hive.sql` links external Go drivers, so its

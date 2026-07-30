@@ -3167,6 +3167,21 @@ pub fn term_read_lowers_to_runtime_test() {
   should.be_true(string.contains(go, "line := hive.TermRead()"))
 }
 
+// `hive run` decides whether to relay its own standard input to the program by
+// looking for this call in the generated Go, and hands the input over in the
+// file it names in HIVE_RUN_STDIN_FILE (see `hive/spawn` and hive_spawn_ffi).
+// Spell either of the two halves differently and a program's reads go back to
+// returning "" without ever waiting, which is what these pin down.
+pub fn term_read_is_what_hive_run_relays_input_for_test() {
+  let go =
+    compile("proc main(): void {\n\tline := hive.term.read()\n\techo line\n}\n")
+  should.be_true(string.contains(go, "hive.TermRead("))
+  should.be_true(string.contains(
+    runtime.term_go(),
+    "os.Getenv(\"HIVE_RUN_STDIN_FILE\")",
+  ))
+}
+
 pub fn term_args_is_a_string_vector_test() {
   let go =
     compile(

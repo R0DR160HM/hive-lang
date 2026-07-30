@@ -2295,27 +2295,107 @@ pub fn term_go() -> String {
 
 import (
 	\"bufio\"
+	\"io\"
 	\"os\"
 	\"strings\"
+	\"sync\"
+	\"time\"
 )
 
-// One shared buffered reader over stdin: created once so bytes read past a
-// newline in one TermRead are not lost before the next.
-var stdinReader = bufio.NewReader(os.Stdin)
+// Under `hive run` the input does not arrive on standard input. The compiler
+// cannot hand the terminal it owns to the program it spawns, and a pipe it wrote
+// into would be worse than nothing: input the program had not read by the time
+// it exited would be left in that pipe, and the failed write costs the compiler
+// the status the program exited with. So it copies what it reads into this file
+// instead, and creates a file alongside it — same path, `.end` on the end — once
+// there is no more input coming. Empty for a program started from a shell, which
+// has a standard input of its own.
+var stdinRelay = os.Getenv(\"HIVE_RUN_STDIN_FILE\")
 
-// TermRead blocks until the user finishes a line of input and returns it
-// without the trailing newline (and without a trailing CR on Windows input).
-// The read parks only the calling goroutine — the Go scheduler keeps other
-// virtual threads running on other OS threads. At end of input it returns
-// whatever preceded EOF (\"\" if nothing). Backs hive.term.read.
+// How long to leave a relay that has run dry before looking again. Short enough
+// to be lost in the time between a line being typed and the prompt for the next
+// one appearing.
+const stdinRelayWait = 10 * time.Millisecond
+
+// The lock is what makes reading from two virtual threads at once safe: a line
+// goes to exactly one of them, where sharing the reader would have them each
+// take part of it.
+var (
+	stdinMu     sync.Mutex
+	stdinSource *bufio.Reader
+	stdinEnded  bool
+	// A line the relay has not finished being written yet, held on to until the
+	// rest of it arrives.
+	stdinPartial []byte
+)
+
+// TermRead blocks until the user finishes a line of input and returns it without
+// the trailing newline (and without a trailing CR on Windows input). The read
+// parks only the calling goroutine — the Go scheduler keeps other virtual threads
+// running on other OS threads. At end of input it returns whatever preceded EOF
+// (\"\" if nothing), and every read after that returns \"\" straight away rather
+// than waiting. Backs hive.term.read.
 func TermRead() string {
-	line, err := stdinReader.ReadString('\\n')
-	line = strings.TrimRight(line, \"\\n\")
-	line = strings.TrimRight(line, \"\\r\")
-	if err != nil && line == \"\" {
+	stdinMu.Lock()
+	defer stdinMu.Unlock()
+	if stdinEnded {
 		return \"\"
 	}
+	if stdinSource == nil {
+		source, err := openStdin()
+		if err != nil {
+			stdinEnded = true
+			return \"\"
+		}
+		stdinSource = bufio.NewReader(source)
+	}
+	// Set once the end of the relay has been seen, so that the look after it —
+	// which is what catches input written just before the compiler said it had
+	// finished — happens exactly once.
+	confirmed := false
+	for {
+		chunk, err := stdinSource.ReadString('\\n')
+		stdinPartial = append(stdinPartial, chunk...)
+		if strings.HasSuffix(chunk, \"\\n\") {
+			return takeLine()
+		}
+		// There is no more to be had for the moment. On a real standard input
+		// that is the end of the input; on a relay it may only mean the compiler
+		// has yet to write the rest.
+		if stdinRelay == \"\" || err != io.EOF || confirmed {
+			stdinEnded = true
+			return takeLine()
+		}
+		if relayEnded() {
+			confirmed = true
+		} else {
+			time.Sleep(stdinRelayWait)
+		}
+	}
+}
+
+func openStdin() (*os.File, error) {
+	if stdinRelay == \"\" {
+		return os.Stdin, nil
+	}
+	return os.Open(stdinRelay)
+}
+
+// takeLine hands over what has been read of the current line, trimmed of the
+// line ending, and starts the next one.
+func takeLine() string {
+	line := strings.TrimRight(string(stdinPartial), \"\\n\")
+	line = strings.TrimRight(line, \"\\r\")
+	stdinPartial = nil
 	return line
+}
+
+// Whether the compiler has said there is no more input coming. It flushes what
+// it has read before creating this file, so everything written before it is
+// there to be read by the time it appears.
+func relayEnded() bool {
+	_, err := os.Stat(stdinRelay + \".end\")
+	return err == nil
 }
 
 // TermArgs returns the command-line arguments the program was run with, in
