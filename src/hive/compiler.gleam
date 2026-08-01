@@ -522,15 +522,52 @@ fn check_body(ctx: Ctx, stmts: List(ast.Stmt)) -> Result(Nil, String) {
   |> result.map(fn(_) { Nil })
 }
 
-// Walks a statement list threading the mutability of each declared local
-// (name -> declared with `mut`?), so assignments and `append`s targeting an
-// immutable variable can be rejected. Returns the updated set so declarations
-// stay visible to the statements that follow them.
+/// Whether a local's declaration allows `append` to grow it.
+///
+/// `append` grows a vector in place, which only a `[dyn]` one can do — a static
+/// length is a promise, and a promise cannot be grown out of. The three cases are
+/// kept apart so the error can say which mistake was made.
+type Grow {
+  /// Declared with an explicit `[dyn]` outer dimension (or a `Table`, which is
+  /// `Str[dyn][dyn]`). This is the only growable kind.
+  Growable
+  /// Bound with `:=`, so the length was read off the value. An inferred length is
+  /// a static one: `:=` never produces a dynamic vector, since a dynamic vector
+  /// is exactly the thing whose length is *not* part of what the value showed.
+  Inferred
+  /// Declared with a static length (`Str[3]`), or not a vector at all.
+  Fixed
+}
+
+/// What a local binding permits: `mut` allows writing to it at all, and `grow`
+/// allows `append` specifically.
+type Binding {
+  Binding(mutable: Bool, grow: Grow)
+}
+
+/// The `grow` a written-out type declares. Only the **outer** dimension matters,
+/// since that is the vector `append` would grow — `Str[3][dyn]` is three vectors
+/// of `Str[dyn]`, so appending to it is growing a static three.
+fn declared_grow(t: ast.TypeExpr) -> Grow {
+  case t {
+    // `Table` is an alias for `Str[dyn][dyn]`, kept unexpanded in the AST.
+    ast.TName(None, "Table", _, []) -> Growable
+    ast.TName(_, _, _, [ast.DimDyn, ..]) -> Growable
+    // `T[]` promises nothing about the length, but it is a signature-only
+    // spelling: a local declared with it is rejected before this point.
+    _ -> Fixed
+  }
+}
+
+// Walks a statement list threading what each declared local permits (`mut`, and
+// whether `append` may grow it), so assignments and `append`s targeting a local
+// that does not allow them can be rejected. Returns the updated set so
+// declarations stay visible to the statements that follow them.
 fn check_stmts(
   ctx: Ctx,
   stmts: List(ast.Stmt),
-  muts: Dict(String, Bool),
-) -> Result(Dict(String, Bool), String) {
+  muts: Dict(String, Binding),
+) -> Result(Dict(String, Binding), String) {
   case stmts {
     [] -> Ok(muts)
     [s, ..rest] -> {
@@ -543,8 +580,8 @@ fn check_stmts(
 fn check_stmt(
   ctx: Ctx,
   s: ast.Stmt,
-  muts: Dict(String, Bool),
-) -> Result(Dict(String, Bool), String) {
+  muts: Dict(String, Binding),
+) -> Result(Dict(String, Binding), String) {
   case s {
     ast.SEcho(e) -> {
       use _ <- result.try(check_expr(ctx, e))
@@ -552,12 +589,12 @@ fn check_stmt(
     }
     ast.SVarDecl(name, value, mutable) -> {
       use _ <- result.try(check_expr(ctx, value))
-      Ok(dict.insert(muts, name, mutable))
+      Ok(dict.insert(muts, name, Binding(mutable, Inferred)))
     }
     ast.STypedDecl(typ, name, value, mutable) -> {
       use _ <- result.try(check_sized(typ, "`" <> name <> "`"))
       use _ <- result.try(check_expr(ctx, value))
-      Ok(dict.insert(muts, name, mutable))
+      Ok(dict.insert(muts, name, Binding(mutable, declared_grow(typ))))
     }
     ast.SAssign(target, value) -> {
       use _ <- result.try(check_assign_target(target, muts))
@@ -640,7 +677,7 @@ fn check_stmt(
       })
       use _ <- result.try(check_expr(ctx, iterable))
       // The iteration variable is a fresh, immutable binding in the body.
-      let inner = dict.insert(muts, name, False)
+      let inner = dict.insert(muts, name, Binding(False, Fixed))
       use _ <- result.try(
         check_stmts(Ctx(..ctx, in_loop: True), body, inner)
         |> result.map(fn(_) { Nil }),
@@ -786,11 +823,11 @@ fn assign_root(target: ast.Expr) -> Result(String, String) {
 
 fn check_assign_target(
   target: ast.Expr,
-  muts: Dict(String, Bool),
+  muts: Dict(String, Binding),
 ) -> Result(Nil, String) {
   use root <- result.try(assign_root(target))
   case dict.get(muts, root) {
-    Ok(True) -> Ok(Nil)
+    Ok(Binding(True, _)) -> Ok(Nil)
     _ ->
       Error(
         "cannot assign to `"
@@ -800,11 +837,20 @@ fn check_assign_target(
   }
 }
 
-// `append(v, ...)` grows a vector in place, so `v` must be a mutable variable
-// (per the spec: append "only compiles when used on mutable dynamic vectors").
+// `append(v, ...)` grows a vector in place, so `v` must be a **mutable dynamic**
+// vector — the two halves of what the spec says: append "only compiles when used
+// on mutable dynamic vectors".
+//
+// Dynamic is the half that has to be *declared*. A `mut v := [...]` binding reads
+// its length off the value, and a length read off a value is a static one, so it
+// is not something `append` can grow; `mut Str[dyn] v = [...]` is. Requiring the
+// explicit type is what keeps "does this vector have a known length?" answerable
+// by reading its declaration, which is the same property every rule in the bounds
+// pass rests on.
+//
 // Only the builtin is meant: a program's own `append` is an ordinary callable and
 // its first argument is nothing special.
-fn check_append(e: ast.Expr, muts: Dict(String, Bool)) -> Result(Nil, String) {
+fn check_append(e: ast.Expr, muts: Dict(String, Binding)) -> Result(Nil, String) {
   case e {
     ast.ECall(ast.EMember(ast.EIdent("hive"), "append"), args) ->
       case args {
@@ -816,8 +862,23 @@ fn check_append(e: ast.Expr, muts: Dict(String, Bool)) -> Result(Nil, String) {
             ),
           )
           case dict.get(muts, root) {
-            Ok(True) -> Ok(Nil)
-            _ ->
+            Ok(Binding(True, Growable)) -> Ok(Nil)
+            // A member or index path (`append(box.items, x)`) is rooted at a
+            // variable whose own type says nothing about the field being grown,
+            // so there is nothing to check beyond its mutability.
+            Ok(Binding(True, _)) ->
+              case target {
+                ast.EIdent(_) -> Error(not_growable(root, muts))
+                _ -> Ok(Nil)
+              }
+            Ok(Binding(False, _)) ->
+              Error(
+                "`append` requires a mutable vector: `"
+                <> root
+                <> "` is immutable — declare it with `mut`",
+              )
+            // Not a local at all: a parameter, which is never mutable.
+            Error(_) ->
               Error(
                 "`append` requires a mutable vector: `"
                 <> root
@@ -828,6 +889,26 @@ fn check_append(e: ast.Expr, muts: Dict(String, Bool)) -> Result(Nil, String) {
         [] -> Error("`append` takes a mutable vector and at least one value")
       }
     _ -> Ok(Nil)
+  }
+}
+
+fn not_growable(root: String, muts: Dict(String, Binding)) -> String {
+  case dict.get(muts, root) {
+    Ok(Binding(_, Inferred)) ->
+      "`append` requires a dynamic vector, and `"
+      <> root
+      <> "` is not one: it was bound with `:=`, which reads the length off the "
+      <> "value — an inferred length is a static one. Declare it explicitly to "
+      <> "make it dynamic: `mut "
+      <> root
+      <> "` needs a type such as `mut Str[dyn] "
+      <> root
+      <> " = ...`."
+    _ ->
+      "`append` requires a dynamic vector: `"
+      <> root
+      <> "` is declared with a static length, which is a promise it cannot grow "
+      <> "out of. Declare it `[dyn]` to allow appending."
   }
 }
 

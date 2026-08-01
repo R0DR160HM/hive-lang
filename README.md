@@ -1,9 +1,19 @@
 # Hive
 
-A compiler, written in [Gleam](https://gleam.run), for **Hive** — a
-memory-managed, table-based language that compiles to Go. The compiler lowers
-Hive source to Go, then invokes the Go toolchain to produce a native
-executable for the current platform.
+**Hive** is a memory-managed, table-based language. Tables are a built-in idea
+rather than a library, values behave like values, and a good deal of what other
+languages leave to runtime — every vector index, every branch of a match, the
+columns a SQL query comes back with — is settled at compile time instead.
+
+This repository is its compiler, written in [Gleam](https://gleam.run). It
+lowers Hive source to Go and invokes the Go toolchain, which produces a native
+executable for the current platform. You never write or read that Go, but a few
+of Hive's rules make more sense once you know what they become — see
+[How Hive maps onto Go](#how-hive-maps-onto-go).
+
+New here? [`docs/tour.html`](docs/tour.html) is a slow, one-idea-at-a-time tour
+of the whole language (in English and Portuguese). This README is the reference:
+organised by feature rather than by lesson.
 
 ```
 hive build <entrypoint.hive>   # compile to a native executable
@@ -54,16 +64,14 @@ ln -s "$(pwd)/hive" ~/.local/bin/hive
 ```
 
 `hive build foo.hive` writes the executable next to the entrypoint
-(`foo.exe` on Windows, `foo` elsewhere) and leaves the intermediate Go project
-in `foo.hive-build/` for inspection. `hive run` instead compiles the generated
-Go with `go run`, so it produces **no** executable in your project — the binary
-lives only in Go's build cache — which avoids Windows Defender/SmartScreen
-scanning a freshly written `.exe`. It still runs with the working directory set
-to the entrypoint's folder, so relative paths such as `using "./test.csv"`
-resolve as the author expects (`hive run` passes that folder through to the
-program, which changes into it before `main`). Anything after the entrypoint is
-forwarded to the program as its own command-line arguments
-(`hive run foo.hive a b c`), readable via `hive.term.args()`.
+(`foo.exe` on Windows, `foo` elsewhere) and leaves the intermediate project in
+`foo.hive-build/` for inspection. `hive run` produces **no** executable in your
+project — the binary lives only in the build cache — which is why it is the
+better default on Windows (see below). It runs with the working directory set to
+the entrypoint's folder, so relative paths such as `using "./test.csv"` resolve
+as the author expects. Anything after the entrypoint is forwarded to the program
+as its own command-line arguments (`hive run foo.hive a b c`), readable via
+`hive.term.args()`.
 
 ### Troubleshooting on Windows
 
@@ -72,17 +80,16 @@ at all** (or crashes with an `Eacces` / "Application Control policy has blocked
 this file" error), Windows is very likely blocking the freshly-compiled `.exe`
 before it can start — the program never runs, so none of its `echo`s appear.
 This is Windows Defender's real-time protection or SmartScreen/Application
-Control scanning a brand-new unsigned binary; it is unrelated to the compiled
-code (`echo` lowers to Go's `fmt.Println`, which behaves the same on Windows
-and Linux). To confirm and work around it:
+Control scanning a brand-new unsigned binary; it is unrelated to your code, which
+behaves the same on Windows and Linux. To confirm and work around it:
 
-* Prefer `hive run`, which uses `go run` and never writes an `.exe` into your
-  project, so there is no fresh binary for Defender to intercept.
+* Prefer `hive run`, which never writes an `.exe` into your project, so there is
+  no fresh binary for Defender to intercept.
 * Add a Windows Defender **exclusion** for your project folder (Settings →
   Privacy & security → Windows Security → Virus & threat protection →
   Manage settings → Exclusions), or build into an already-excluded directory.
-* `hive emit foo.hive` prints the generated Go without producing an
-  executable, which is handy while a block is being sorted out.
+* `hive emit foo.hive` produces no executable at all, which is handy while a
+  block is being sorted out.
 
 ## Editor support
 
@@ -266,7 +273,11 @@ compiles, builds and runs.
   character is not text. Take a string apart with `split`, find in it with
   `indexOf`, or match it with a [string pattern](#the-language).
 * **Vectors** are memory-contiguous and either static (`Str[3]`) or dynamic
-  (`Str[dyn]`). A static length is
+  (`Str[dyn]`). Which of the two a name holds is what its **declaration** says,
+  never what its value happened to show: a `:=` binding always infers a *static*
+  length, so a dynamic vector has to be written out (`mut Str[dyn] v = [...]`).
+  That is also exactly what `append` requires, since a static length is a promise
+  it could not grow out of. A static length is
   enforced, not advertised: a `Str[3]` slot only ever takes a vector of three,
   wherever the value comes from (see
   [vector bounds](#scope)), which is what lets `v[2]` on one compile with no
@@ -484,14 +495,16 @@ Shared mutable state is shared **completely**. Every change through either name
 is visible through the other, including `append`:
 
 ```hive
-mut a := ["x", "y", "z"]
-mut b := a
-append(b, "w")       // len(a) is now 4
-a[0] = "changed"     // b[0] is "changed"
-b = ["replaced"]     // rebinding one rebinds both; len(a) is 1
+mut Str[dyn] a = ["x", "y", "z"]
+mut Str[dyn] b = a
+append(b, "w")            // len(a) is now 4
+if 0 < len(a) {
+	a[0] = "changed"      // b[0] is "changed" too
+}
+b = ["replaced"]          // rebinding one rebinds both; len(a) is 1
 ```
 
-Two Go slice variables could not deliver that — `append` returns a *new* slice
+Two independent slice variables could not deliver that — `append` returns a *new* slice
 header, so growing one name would quietly stop the two from sharing, or not,
 depending on whether the backing array happened to have spare capacity. So the
 second name is not given a variable at all: it compiles to the first, and there
@@ -613,15 +626,15 @@ to `hive.len(v)`, so the guard means the same thing in a program that has taken
 
 `len` and `bytes` differ only for strings: for `"café"`, `len` is `4` (runes)
 while `bytes` is `5` (the `é` is two bytes). `append` is the one builtin that
-requires its target to be `mut` — it is the in-place way to grow a
-`Str[dyn]`; `+` instead builds a brand-new vector. `row` and `column` look a
+requires its target to be `mut`, and it must also be **declared** `[dyn]`: it is
+the in-place way to grow a `Str[dyn]`, while `+` builds a brand-new vector. `row` and `column` look a
 value up in a `Table` by its first cell — `row` matches a row's first element,
 `column` matches a column's top (first-row) cell — and `column` skips any row
 too short to reach the matched column.
 
 ### Walking a vector: `map`, `filter`, `filterMap`
 
-These three take a vector and a [function value](#first-class-functions) over its
+These three take a vector and a [function value](#the-language) over its
 elements, and each hands back a new vector:
 
 ```hive
@@ -730,8 +743,8 @@ using db run raw someSqlText                  // SQL built at runtime, a Table
 one `Table`. A **spreadsheet holds many**, so xlsx and ods come back as a
 `Table[dyn]` — one `Table` per sheet, in the order the document keeps them (an
 empty sheet is an empty `Table`, so the positions still line up with the
-document). Both formats are read with nothing but Go's standard library, so a
-program that opens a workbook still builds offline.
+document). Both readers are dependency-free, so a program that opens a workbook
+still builds offline.
 
 Spreadsheet cells arrive as the file stores them, with one exception worth
 knowing: **xlsx keeps a date as a day count**, so a date column would read as
@@ -757,23 +770,25 @@ Each module owns its types under its own namespace — `hive.net.HttpRequest`,
 ones the language uses without a module: `Result`, `Table` and the
 `hive.TableError` that `using` yields from a CSV.
 
-**A module you don't use is not in your build.** The generated Go project always
+**A module you don't use is not in your build.** The generated project always
 carries the core runtime, but each `hive.*` module is written into it — and so
 compiled and linked — only when the program actually references that module (see
 `hive/runtime.gleam`'s module table and `hive/cli.gleam`). A module a used one
 depends on internally comes along too: `hive.crypto` decodes JWT payloads with
 `hive.json` and checks `exp`/`nbf` against `hive.time`, so reaching for a JWT
-pulls in all three. This is why `hive.sql` is the only module that costs you
-anything at build time: it is the only one that links external Go drivers, and a
-program that never opens a connection neither downloads nor links them, staying
-dependency-free and buildable offline.
+pulls in all three.
+
+Every module but one is written against the target's standard library alone, so
+HTTP, WebSockets, TCP, JSON, cryptography and spreadsheets all build offline with
+no dependencies. `hive.sql` is the exception, and the only module that costs you
+anything at build time: it links external database drivers, and a program that
+never opens a connection neither downloads nor links them.
 
 ### `hive.net`
 
 The networking library: HTTP, WebSockets and raw TCP, clients and servers.
 Everything here performs I/O, so — like `echo` and `using` — it works inside a
-`func` or a `proc`. All of it is built on Go's standard library alone, so a
-program that speaks any of these still builds offline with no dependencies.
+`func` or a `proc`, and none of it adds a dependency to your build.
 
 Each of the three servers blocks forever, so it usually goes on a virtual
 thread of its own (`async func`), and each runs its handler once per
@@ -1192,7 +1207,7 @@ type Op {
 
 proc cache(rows: Table, op: Op, from: hive.syslink.Envelope): Table {
 	if op is Op.Put(key, value) {
-		mut next := rows
+		mut Table next = rows
 		append(next, [key, value])
 		return next
 	}
@@ -1495,127 +1510,62 @@ See [`code-examples/11 - Modules`](code-examples/11%20-%20Modules/modules.hive).
 
 ## How Hive maps onto Go
 
+Hive lowers to Go, and the Go toolchain turns that into the executable. You never
+have to read the result — `hive emit` is there if you want to — but a handful of
+Hive's rules are easier to trust once you know what they become. These are the
+mappings worth knowing:
+
 | Hive                                    | Go                                                             |
 | --------------------------------------- | -------------------------------------------------------------- |
-| `proc`/`func` `name(): T { ... }`       | `func name() T { ... }`                                        |
-| `proc main(): void`                     | `func main()`                                                  |
-| `query q(p: Str): Row[dyn] { SQL {p} }` | `func q(p string) hive.SqlFragment` — text with `?`, plus the bound args |
-| `query q(...): void`                    | run with `hive.SqlExec` → `Result[int, SqlError]` (rows affected) |
-| `where { if c { … } or { … } }`         | fragments collected at runtime, joined by `hive.SqlJoin`        |
-| `type T { }` (no variants)              | a `struct`                                                     |
-| `type T { A {..} B }` (variants)        | an `interface` + one `struct` per variant (a tagged union)     |
+| `proc` / `func` / `async func`          | an ordinary `func`; `proc main(): void` → `func main()`        |
+| `query q(p: Str): Row[dyn]`             | a function returning SQL text with `?` plus the bound args     |
+| `type T { }` / `type T { A {..} B }`    | a `struct` / an `interface` + one struct per variant           |
 | fields declared outside any variant     | appended to **every** variant struct                           |
-| `name := expr`                          | `name := expr` (type inferred)                                 |
-| `T name = expr`                         | `var name T = expr`                                            |
-| `mut name := expr` / `mut T name = e`   | same as above (`mut` is compile-time only — permits reassign)  |
-| `mut b = a` (both `mut`, owns storage)  | no variable at all — `b` compiles to `a`, so one slice header is shared |
-| `x = expr` / `v[0] = expr`              | `x = expr` / `v[0] = expr` (only on `mut` variables)           |
-| `ys := xs` (needs a copy — see [value semantics](#value-semantics-copy-on-binding)) | `ys := hive.CloneVec(xs)` / `hive.CloneVecFn(..)` / `hive.CloneTable(..)` / `clone_T(..)` |
-| `for i := 0; i < n; i = i + 1 { }`      | `for i := 0; i < n; i = i + 1 { }` (counter scoped to the loop) |
-| `for each x in v { }`                   | `for _, x := range v { }` (binds the value, discards the index) |
-| `async func f(): T { ... }`             | `func f() T { ... }` (an ordinary Go function)                 |
-| `f(x)` bare stmt / `await f(x)` (async `f`) | `go f(x)` (fire-and-forget goroutine) / `f(x)` (blocking call) |
-| `h := f(x)` (async `f`) / `await h`     | `h := hive.Spawn(func() T { return f(x) })` / `h.Await()`      |
-| `await [f(a), f(b)]` (async `f`)        | `hive.AwaitAll([]*hive.Async[T]{ hive.Spawn(..), hive.Spawn(..) })` |
-| `await h with timeout ms`               | `hive.AwaitTimeout(h, ms)` → `Result[T, TimeoutError]`          |
-| `await [f(a), f(b)] with timeout ms`    | `hive.AwaitAllTimeout(hs, ms)` → `Result[[]T, TimeoutError]`     |
-| `echo v`                                | `fmt.Println(v)` (stringifies any value, appends a newline)    |
-| `assert cond`                           | `hive.Assert(cond)`                                            |
-| `panic value`                           | `panic(hive.Show(value))` (renders `value` like `echo`)        |
-| `T.Variant(a, b)`                       | `T(TVariant{Field0: a, Field1: b})` (positional: own then common) |
-| `x is Result.Ok(v)` / `Result.Error(e)` | `x.IsOk()` + `v := x.Ok()` / `x.IsError()` + `e := x.Err()`    |
-| `x is T.Variant(a, _)` (user ADT)       | type assertion; bindings read fields, `_` binds nothing        |
-| `a is T.A(v) && p(v)`                   | short-circuiting `&&`; `v` reads through its accessor          |
-| `using p` / `using p as csv separating by d` | `hive.ReadCSV(p, d)` → `Result[Table, TableError]`       |
-| `using p as xlsx` / `as ods`            | `hive.ReadXlsx(p)` / `hive.ReadOds(p)` → `Result[[]Table, TableError]` |
-| `using conn run q(...)`                 | `hive.SqlRows(conn, q(...), sqlRow_T)` → `Result[[]T, SqlError]` |
-| `using conn run raw text`               | `hive.SqlQuery(conn, text)` → `Result[Table, SqlError]`         |
-| `if <call> is Result.Ok(v)`             | `if _u := <call>; _u.IsOk() { v := _u.Ok()` (evaluated once)    |
-| `if p && <call> is Result.Ok(v)`        | one nested `if` per `&&` test, so each has an init slot of its own (still evaluated once, still short-circuiting) |
+| `Str`, `Int`, `Float`, `Bool`, `Atom`   | `string`, `int`, `float64`, `bool`, `hive.Atom`                |
+| `Str[3]`, `Str[dyn]`, `Str[]`           | `[]string` — all three are slices, which is why [value semantics](#value-semantics-copy-on-binding) exist |
+| `mut`                                   | nothing at all: it is compile-time only                        |
+| `mut b = a` (both `mut`, owns storage)  | no variable — `b` compiles to `a`, so one slice header is shared |
+| `ys := xs` (needs a copy)               | a generated deep clone, chosen by the static type              |
+| `f(mutVec)` (argument names `mut` storage) | `f(hive.CloneVec(mutVec))` — copied in, so the callee's `T` really is immutable |
+| `f(x)` bare stmt / `await f(x)` (async) | `go f(x)` / a blocking call                                    |
+| `h := f(x)` / `await h`                 | `hive.Spawn(..)` / `h.Await()`; `await h with timeout ms` → a `Result` |
+| `await [f(a), f(b)]`                    | `hive.AwaitAll(..)` → a statically-sized vector                |
+| `for each x in v { }`                   | `for _, x := range v { }`                                      |
+| `x is Result.Ok(v)` / `x is T.Variant(a, _)` | `IsOk()` + accessor / a type assertion; `_` binds nothing |
+| `if <call> is Result.Ok(v)`             | one `if` with an init slot, so the call is evaluated once       |
 | `"{a} and {b}"`                         | concatenation, non-`Str` pieces via `hive.ToStr`               |
-| `[x, y] + [z]`                          | `hive.Concat([]T{x, y}, []T{z})`                               |
-| `v1 == v2` / `v1 != v2` (vectors)       | `hive.VecEq(v1, v2)` / `!hive.VecEq(v1, v2)` (structural)      |
-| `#Atom`                                 | `hive.Atom` constants + a generated `hive.InitAtoms` table     |
-| `true` / `false`                        | Go `true` / `false` (the `Bool` type, not atoms)               |
-| `a / b`, `a ** b`                       | `hive.DivInt`/`hive.DivFloat`, `hive.PowInt`/`hive.PowFloat` (see [edges](#arithmetic-at-the-edges)) |
-| `a % b`                                 | `hive.ModInt`/`hive.ModFloat` (remainder; `% 0` returns 0)    |
-| `len(v)` vector / `len(s)` Str          | `len(v)` (elements) / `hive.StrLen(s)` (UTF-8 runes)           |
-| `bytes(v)` vector / `bytes(s)` Str      | `hive.Bytes(v)` (footprint) / `len(s)` (UTF-8 byte length)     |
-| `append(v, x)` / `join(v, sep)`         | `v = append(v, x)` (statement) / `hive.Join(v, sep)`           |
-| `split(s, sep)`                         | `hive.Split(s, sep)` → `Str[dyn]`                             |
-| `map(v, f)` / `filter(v, f)`            | `hive.Map(v, f)` / `hive.Filter(v, f)` (Go generics; type arguments inferred) |
-| `filterMap(v, f)`                       | `hive.FilterMap(v, f)` (keeps the `Ok` payloads)              |
-| `row(t, k)` / `column(t, k)`            | `hive.Row(t, k)` / `hive.Column(t, k)` → `Str[dyn]`           |
-| `hive.json.parse(t) with T`             | `hive.JsonParse(t, jsonDecode_T)` → `Result[T, JsonError]`     |
-| `hive.json.encode(v)`                   | derived `jsonEncode_T(v)` (cannot fail, so plain `string`)     |
-| `hive.json.table(t)` / `.get(tbl, p)`   | `hive.JsonTable(t)` / `hive.JsonGet(tbl, p)`                   |
-| `hive.net.httpRequest(r)`               | `hive.HttpSend(r)` → `Result[HttpResponse, HttpError]`         |
-| `hive.net.httpServe(port, handler)`     | `hive.HttpServe(port, handler)` (handler is any function value) |
-| `hive.net.wsConnect(u)` / `.wsServe(p, h)` | `hive.WsConnect(u)` → `Result[WsConnection, WsError]` / `hive.WsServe(p, h)` |
-| `hive.net.wsSend(c, m)` / `.wsReceive(c)` | `hive.WsSend(c, m)` → `Result[Int, _]` / `hive.WsReceive(c)` → `Result[Str, _]` |
-| `hive.net.wsRequest(c)` / `.wsClose(c)` | `hive.WsRequest(c)` → `HttpRequest` / `hive.WsClose(c)`         |
-| `hive.net.socketConnect(h, p)` / `.socketServe(p, h)` | `hive.SocketConnect(h, p)` → `Result[SocketConnection, SocketError]` / `hive.SocketServe(p, h)` |
-| `hive.net.socketSend(c, d)` / `.socketReceive(c, n)` | `hive.SocketSend(c, d)` → `Result[Int, _]` / `hive.SocketReceive(c, n)` → `Result[Str, _]` |
-| `hive.net.socketReceiveLine(c)`         | `hive.SocketReceiveLine(c)` → `Result[Str, SocketError]` (newline trimmed) |
-| `hive.net.socketPeer(c)` / `.socketClose(c)` | `hive.SocketPeer(c)` → `Str` / `hive.SocketClose(c)`       |
-| `f(mutVec)` (argument names `mut` storage) | `f(hive.CloneVec(mutVec))` (copied in, so the callee's `T` really is immutable) |
-| `func f(v: T[]): T` at `T = Str`        | `func f_Str(v []string) string` (one copy per instantiation)   |
-| `type Box { items: T[dyn] }` at `Str`   | `type Box_Str struct { Items []string }` (+ its own clone/codec) |
-| `Result<T, E>`                          | `hive.Result[T, E]`; `Result.Ok(v)` → `hive.Ok[T, E](v)`        |
-| `f` (bare reference)                    | `f` (the Go function value)                                    |
-| `f(a, _, c)` (partial application)      | `func(h T) R { return f(a, h, c) }` (a closure; `_`→ parameter) |
-| `hive.crypto.sha256/sha512(s)`          | `hive.Sha256/Sha512(s)` (lowercase-hex digest)                 |
-| `hive.crypto.hmacSha256(s, k)`          | `hive.HmacSha256(s, k)` (hex) / `randomHex(n)` → `hive.RandomHex(n)` |
-| `hive.crypto.base64Encode/Decode(s)`    | `hive.Base64Encode(s)` / `hive.Base64Decode(s)` → `Result`     |
-| `hive.crypto.jwtSign(claims, secret)`   | `hive.JwtSign(jsonEncode_T(claims), secret)` → `Str`           |
-| `hive.crypto.jwtVerify(t, s) with T`    | `hive.JwtVerify(t, s, jsonDecode_T)` → `Result[T, CryptoError]` |
-| `hive.crypto.jwtDecode(t) with T` / `.jwtHeader(t)` | `hive.JwtDecode(t, jsonDecode_T)` / `hive.JwtReadHeader(t)` |
-| `hive.sql.connect(d, s)` / `.pool(d, s, o, i)` | `hive.SqlConnect(d, s)` / `hive.SqlPool(d, s, o, i)`     |
-| `hive.sql.close(c)`                     | `hive.SqlClose(c)`                                             |
-| `hive.sql.DatabaseDriver.SQLite()`      | `hive.DatabaseDriver{Name: "sqlite"}` (also PostgreSQL/Other)  |
-| `hive.conv.ceil/floor/round(f)`         | `hive.Ceil/Floor/Round(f)` → `Int`                            |
-| `hive.conv.itf(i)` / `its(i)` / `fts(f)` | `hive.IntToFloat(i)` / `hive.IntToStr(i)` / `hive.FloatToStr(f)` |
-| `hive.conv.sti(s)` / `stf(s)`           | `hive.StrToInt(s)` / `hive.StrToFloat(s)` → `Result[_, ConversionError]` |
-| `hive.env.get(name)`                    | `hive.EnvGet(name)` → `Result[Str, EnvironmentError]` (.env, then OS)   |
-| `hive.net.HttpRequest(m, u, h, b)`      | `hive.HttpRequest{Method: m, Url: u, Headers: h, Body: b}`     |
-| `request.body` (builtin struct field)   | `request.Body` (fields capitalize to their exported Go names)  |
-| `t[1:]`                                 | `t[1:]` (slices are **inclusive** of the high bound)           |
-| `hive.syslink.listen(endpoint)`          | `hive.SyslinkListen(endpoint)` → `Result[Str, SyslinkError]`     |
-| `hive.syslink.spawn(handler, state)`    | `hive.SyslinkSpawn(handler, state, dec, digest, repliesInTurn)` → `hive.Address` |
-| `hive.syslink.register(#N, a)`           | `hive.SyslinkRegister(atom_N, a)` → `Result[Address, SyslinkError]` |
-| `hive.syslink.at(#N)` / `.on(endpoint, #N)` | `hive.SyslinkAt(atom_N)` / `hive.SyslinkOn(endpoint, atom_N)`  |
-| `a(msg)` (statement)                    | `hive.SyslinkSend(a, clone_T(msg), enc, digest)` (a cast: copied in, never fails) |
-| `h := a(msg)`                           | `hive.SyslinkSendAwaitable(a, clone_T(msg), enc, digest, dec)` → `*hive.SyslinkPending[M]` |
-| `await h` / `await h with timeout ms`   | `hive.SyslinkAwait(h, 0)` / `hive.SyslinkAwait(h, ms)` → `Result[M, SyslinkError]` |
-| `await [a(m1), b(m2)] with timeout ms`  | `hive.SyslinkAwaitAll(ps, ms)` → `[]Result[M, SyslinkError]`  |
-| `hive.syslink.answer(from, v)` / `.self(from)` | `hive.SyslinkAnswer(from, v, enc)` / `hive.SyslinkSelf(from)` |
-| `hive.syslink.monitor(from, t, msg)`    | `hive.SyslinkMonitor(from, t, msg, enc, digest)`                |
-| `hive.syslink.stop(a)` / `.node()`      | `hive.SyslinkStop(a)` / `hive.SyslinkNode()` → `string`         |
-| `hive.syslink.Address` / `.Envelope`    | `hive.Address` / `hive.Envelope` (message type inferred, never written) |
-| `Str`, `Int`, `Bool`, `Float`, `Atom`   | `string`, `int`, `bool`, `float64`, `hive.Atom`                |
-| `Str[3]`, `Str[dyn]`, `Str[]`           | `[]string` (all vectors lower to slices)                       |
-| `Table`, `hive.TableError`, `Result`    | provided by the generated `hive` runtime package               |
+| `[x, y] + [z]` / `v1 == v2`             | `hive.Concat(..)` / `hive.VecEq(..)` (structural)              |
+| `t[1:3]`                                | `t[1:4]` — Hive's high bound is **inclusive**                   |
+| `#Atom`                                 | a small integer constant + a generated atom table              |
+| `a / b`, `a ** b`, `a % b`              | `hive.DivInt`, `hive.PowInt`, `hive.ModInt` (see [edges](#arithmetic-at-the-edges)) |
+| `echo v` / `assert c` / `panic v`       | `fmt.Println(v)` / `hive.Assert(c)` / `panic(hive.Show(v))`     |
+| `f` (bare reference) / `f(a, _, c)`     | the function value / a closure whose parameter is the hole      |
+| `func f(v: T[]): T` at `T = Str`        | `func f_Str(v []string) string` — one copy per instantiation    |
+| `using p` / `using conn run q(..)` / `run raw t` | `hive.ReadCSV(..)` / `hive.SqlRows(..)` / `hive.SqlQuery(..)`, each → a `Result` |
+| a `hive.*` library call                 | a call of the same name on the generated `hive` runtime package (`hive.json.parse` → `hive.JsonParse`, `hive.syslink.spawn` → `hive.SyslinkSpawn`, …) |
+| `Result<T, E>`, `Table`, `hive.TableError` | provided by that runtime package                            |
+
+Two rules are worth stating outside the table. Hive requires every non-`void`
+`proc`/`func` to **return on every path**: a path terminates by ending in
+`return`, in `assert` or `panic` (both handy for a tail you know is unreachable),
+in an `if`/`else` whose every branch terminates, or in an else-less
+`if`/`else if` chain that covers its subject's whole type (a `Result`'s `Ok` +
+`Error`, or every variant of an ADT). Anything else is a compile error. For an
+accepted function that doesn't syntactically end in `return`, codegen appends a
+`panic("hive: unreachable")` to satisfy the Go compiler; it is now genuinely
+unreachable.
+
+And a Hive identifier that happens to be a Go keyword but not a Hive one (a
+variable or function named `map`, `range`, `select`, ...) is suffixed with `_` in
+the generated Go — consistently at its definition and every use — so it never
+collides with Go's own grammar.
 
 Codegen runs a lightweight type-inference pass over locals so overloaded
 syntax picks the right lowering (`+` on vectors vs. strings vs. numbers, atom
 → `Str` coercions, zero-safe division, vector literal element types). The same
 pass decides the constructs that have no honest lowering — indexing a `Str` is
 the one that exists today — so they are rejected as Hive errors rather than
-emitted as Go that either fails to compile or quietly means something else. Hive
-requires every non-`void` `proc`/`func` to return on every path: a path
-terminates by ending in `return`, in `assert` or `panic` (both handy for a tail
-you know is unreachable, e.g. `assert false` or `panic "unreachable"`), in an
-`if`/`else` whose every
-branch terminates, or in an else-less `if`/`else if` chain that covers its
-subject's whole type (a `Result`'s `Ok`+`Error`, or every variant of an ADT).
-Anything else is a compile error. For an accepted function that doesn't
-syntactically end in `return` (an exhaustive match), codegen still appends a
-`panic("hive: unreachable")` to satisfy the Go compiler; it is now genuinely
-unreachable. A Hive
-identifier that happens to be a Go keyword but not a Hive one (a variable or
-function named `map`, `range`, `select`, ...) is suffixed with `_` in the
-generated Go — consistently at its definition and every use — so it never
-collides with Go's own grammar.
+emitted as code that either fails to compile or quietly means something else.
 
 ## How the compiler is structured
 
@@ -1719,13 +1669,29 @@ if 2 < len(b.items) {
 ```
 
 An **inferred** length is weaker, because nothing constrains what comes next:
-`mut v := ["a", "b", "c"]` knows it holds three today, and keeps that through
-writes *through* the name (`v[i] = x` swaps an element without changing the
-length, `append(v, x)` only grows it), but loses it the moment the name is
-rebound — including in a branch or loop body that may not even run:
+`mut v := ["a", "b", "c"]` knows it holds three today, and keeps that through a
+write *through* the name (`v[i] = x` swaps an element without changing the
+length), but loses it the moment the name is rebound — including in a branch or
+loop body that may not even run:
 
 ```hive
 mut v := ["a", "b", "c"]
 if changed { v = ["x"] }
 echo v[2]                   // compile error: v's length is no longer known
 ```
+
+Being *dynamic*, though, is not inferred at all — it is declared. A `:=` binding
+reads its length off the value it was handed, and a length read off a value is a
+static one, so `append` has nothing there to grow:
+
+```hive
+mut v := ["a", "b", "c"]
+append(v, "d")                   // compile error: `v` is not a dynamic vector
+
+mut Str[dyn] w = ["a", "b", "c"]
+append(w, "d")                   // fine — `w` promises nothing about its length
+```
+
+Which keeps one question answerable by reading a declaration alone: *does this
+vector have a length the compiler knows?* Every rule above rests on that, and an
+inferred `[dyn]` would have made the answer depend on how the value arrived.

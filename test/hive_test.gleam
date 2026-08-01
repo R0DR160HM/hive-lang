@@ -2481,10 +2481,51 @@ pub fn element_write_inside_a_branch_keeps_the_static_length_test() {
   |> should.be_ok
 }
 
-pub fn append_inside_a_branch_keeps_the_static_length_test() {
-  // `append` only grows the vector, so every position already proven stays.
+pub fn append_inside_a_branch_keeps_a_proven_position_test() {
+  // `append` only grows the vector, so a position already proven stays proven.
   compiler.compile(
-    "proc main(): void {\n\tmut v := [\"a\", \"b\", \"c\"]\n\tif len(v) > 0 {\n\t\tappend(v, \"x\")\n\t}\n\techo v[2]\n}\n",
+    "proc main(): void {\n\tmut Str[dyn] v = [\"a\", \"b\", \"c\"]\n\tif 2 < len(v) {\n\t\tappend(v, \"x\")\n\t\techo v[2]\n\t}\n}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn append_needs_a_vector_declared_dyn_test() {
+  // A `:=` binding reads its length off the value, and a length read off a value
+  // is a static one — so it is not something `append` can grow. Being dynamic has
+  // to be declared.
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {\n\tmut v := [\"a\", \"b\", \"c\"]\n\tappend(v, \"d\")\n}\n",
+    )
+  should.be_true(string.contains(msg, "requires a dynamic vector"))
+  should.be_true(string.contains(msg, "bound with `:=`"))
+}
+
+pub fn append_rejects_a_static_length_test() {
+  // The other half of the same rule: a declared length is a promise, and a promise
+  // cannot be grown out of.
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {\n\tmut Str[3] v = [\"a\", \"b\", \"c\"]\n\tappend(v, \"d\")\n}\n",
+    )
+  should.be_true(string.contains(msg, "requires a dynamic vector"))
+  should.be_true(string.contains(msg, "static length"))
+}
+
+pub fn append_still_grows_a_dyn_field_of_a_mut_struct_test() {
+  // A `[dyn]` field is reached through a variable whose own type says nothing
+  // about it, so the field keeps working — only the plain-variable form is held
+  // to the declaration rule above.
+  compiler.compile(
+    "type Box { items: Str[dyn] }\nproc main(): void {\n\tmut b := Box([\"a\"])\n\tappend(b.items, \"c\")\n\techo b.items\n}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn append_grows_a_table_test() {
+  // `Table` is an alias for `Str[dyn][dyn]`, so a row can be appended to one.
+  compiler.compile(
+    "proc main(): void {\n\tmut Table t = [[\"a\", \"b\"]]\n\tappend(t, [\"c\", \"d\"])\n\techo t\n}\n",
   )
   |> should.be_ok
 }
@@ -2884,7 +2925,7 @@ pub fn append_does_not_sever_a_shared_binding_test() {
   // reassignment of the one shared header, not of a private copy.
   let go =
     compile(
-      "proc main(): void {\n\tmut xs := [1, 2, 3]\n\tmut ys := xs\n\tappend(ys, 4)\n\txs[0] = 9\n\techo ys[0]\n\techo len(xs)\n}\n",
+      "proc main(): void {\n\tmut Int[dyn] xs = [1, 2, 3]\n\tmut Int[dyn] ys = xs\n\tappend(ys, 4)\n\tif 0 < len(xs) {\n\t\txs[0] = 9\n\t}\n\tif 0 < len(ys) {\n\t\techo ys[0]\n\t}\n\techo len(xs)\n}\n",
     )
   should.be_true(string.contains(go, "xs = append(xs, 4)"))
   should.be_false(string.contains(go, "ys"))
