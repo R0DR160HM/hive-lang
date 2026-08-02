@@ -306,11 +306,11 @@ pub fn atoms_get_a_table_and_constants_test() {
     compile(
       "func f(): Atom {\n\ta := #Wax\n\treturn a\n}\nproc main(): void {}\n",
     )
-  // #False and #True always occupy slots 0 and 1; custom atoms follow.
-  should.be_true(string.contains(go, "atom_Wax hive.Atom = 2"))
+  // #Nil always occupies slot 0; the program's own atoms follow.
+  should.be_true(string.contains(go, "atom_Wax hive.Atom = 1"))
   should.be_true(string.contains(
     go,
-    "hive.InitAtoms([]string{\"False\", \"True\", \"Wax\"})",
+    "hive.InitAtoms([]string{\"Nil\", \"Wax\"})",
   ))
   should.be_true(string.contains(go, "func f() hive.Atom {"))
 }
@@ -318,13 +318,76 @@ pub fn atoms_get_a_table_and_constants_test() {
 pub fn atom_coerces_to_str_next_to_string_test() {
   let go =
     compile(
-      "func f(): void {\n\tassert \"0\" + #True == \"01\"\n}\nproc main(): void {}\n",
+      "func f(): void {\n\tassert \"0\" + #Nil == \"00\"\n}\nproc main(): void {}\n",
     )
-  // #True is the atom at value 1; as a Str it reads \"1\".
+  // #Nil is the atom at value 0; as a Str it reads \"0\".
   should.be_true(string.contains(
     go,
-    "hive.Assert(((\"0\" + hive.AtomToStr(hive.True)) == \"01\"))",
+    "hive.Assert(((\"0\" + hive.AtomToStr(hive.Nil)) == \"00\"))",
   ))
+}
+
+pub fn an_atom_is_not_a_condition_test() {
+  // An atom is a label, not a yes or a no. It used to be truthy-unless-zero,
+  // which made `if flag` a question about a numbering the program never chose.
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {\n\tflag := #Ready\n\tif flag {\n\t\techo 1\n\t}\n}\n",
+    )
+  should.be_true(string.contains(msg, "an atom is not a condition"))
+}
+
+pub fn an_atom_is_not_a_condition_inside_a_combination_test() {
+  // `&&` and `||` combine conditions, so each side is a boolean position.
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {\n\tflag := #Ready\n\tif true && flag {\n\t\techo 1\n\t}\n}\n",
+    )
+  should.be_true(string.contains(msg, "an atom is not a condition"))
+}
+
+pub fn an_atom_is_not_an_assert_or_a_loop_condition_test() {
+  let assert Error(a) =
+    compiler.compile("proc main(): void {\n\tassert #Ready\n}\n")
+  should.be_true(string.contains(a, "an atom is not a condition"))
+  let assert Error(b) =
+    compiler.compile(
+      "proc main(): void {\n\tfor ; #Ready; {\n\t\techo 1\n\t}\n}\n",
+    )
+  should.be_true(string.contains(b, "an atom is not a condition"))
+}
+
+pub fn atoms_are_compared_with_eq_test() {
+  // The replacement, and it lowers to a plain comparison with no coercion.
+  let go =
+    compile(
+      "proc main(): void {\n\tflag := #Ready\n\tif flag == #Ready {\n\t\techo 1\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "if (flag == atom_Ready) {"))
+  should.be_false(string.contains(go, "hive.Bool("))
+}
+
+pub fn true_and_false_are_ordinary_atoms_test() {
+  // Nothing is reserved but #Nil: an atom spelled #True is one the program
+  // declared, and it lands wherever its first mention puts it.
+  let go =
+    compile(
+      "func f(): Atom {\n\ta := #Wax\n\tb := #True\n\techo b\n\treturn a\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "atom_Wax hive.Atom = 1"))
+  should.be_true(string.contains(go, "atom_True hive.Atom = 2"))
+  should.be_true(string.contains(
+    go,
+    "hive.InitAtoms([]string{\"Nil\", \"Wax\", \"True\"})",
+  ))
+}
+
+pub fn a_program_naming_no_atom_of_its_own_emits_no_table_test() {
+  // #Nil alone is the runtime's default table, so there is nothing to register.
+  let go =
+    compile("proc main(): void {\n\techo #Nil\n}\n")
+  should.be_false(string.contains(go, "hive.InitAtoms"))
+  should.be_true(string.contains(go, "hive.Nil"))
 }
 
 pub fn bool_literals_are_go_bools_test() {

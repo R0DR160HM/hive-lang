@@ -218,6 +218,27 @@ pub fn sql_exprs(parts: List(SqlPart)) -> List(Expr) {
   })
 }
 
+/// Every *condition* a query body carries — the `if <cond>` of each predicate in
+/// a `where` block. These sit in boolean position, so they are held to the same
+/// rule as an ordinary `if`.
+pub fn sql_conds(parts: List(SqlPart)) -> List(Expr) {
+  list.flat_map(parts, fn(part) {
+    case part {
+      SqlLit(_) | SqlParam(_) -> []
+      SqlWhere(group) -> group_conds(group)
+    }
+  })
+}
+
+fn group_conds(group: SqlGroup) -> List(Expr) {
+  list.flat_map(group.items, fn(item) {
+    case item {
+      SqlCond(cond, body) -> [cond, ..sql_conds(body)]
+      SqlNested(inner) -> group_conds(inner)
+    }
+  })
+}
+
 fn group_exprs(group: SqlGroup) -> List(Expr) {
   list.flat_map(group.items, fn(item) {
     case item {
@@ -233,7 +254,7 @@ pub type Expr {
   EString(String)
   /// An interpolated string literal, e.g. `"{name} is here"`.
   EInterp(parts: List(IPart))
-  /// `true`/`false`, which are aliases for the atoms `#True`/`#False`.
+  /// `true`/`false` — the Bool literals. These are not atoms.
   EBool(Bool)
   /// An atom literal, e.g. `#SomeAtom` (without the `#`).
   EAtom(name: String)

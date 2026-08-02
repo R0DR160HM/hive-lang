@@ -7,7 +7,7 @@
 ////     which is also the positional order used by constructors.
 ////   * Vectors (`Str[3]`, `Str[dyn]`, ...) all become Go slices.
 ////   * Atoms become `hive.Atom` values; the compiler assigns each distinct
-////     atom a small integer (#False=0, #True=1 first) and registers the name
+////     atom a small integer (#Nil=0 always first) and registers the name
 ////     table so `echo` can print an atom's visual form.
 ////   * `Result` and `Table`/`TableError` are provided by the generated `hive`
 ////     runtime package.
@@ -367,7 +367,13 @@ pub fn check_types(module: ast.Module) -> Result(Nil, String) {
         |> result.map(fn(_) { Nil })
       ast.QueryDecl(_, params, ret, sql) -> {
         let qenv = fn_env(env, params, ret)
-        list.try_fold(ast.sql_exprs(sql), Nil, fn(_, e) { walk_expr(qenv, e) })
+        use _ <- result.try(
+          list.try_fold(ast.sql_exprs(sql), Nil, fn(_, e) { walk_expr(qenv, e) }),
+        )
+        // A `where { if <cond> { ... } }` predicate is a boolean position too.
+        list.try_fold(ast.sql_conds(sql), Nil, fn(_, e) {
+          check_condition(qenv, e)
+        })
         |> result.map(fn(_) { Nil })
       }
       ast.TypeDecl(..) -> Ok(Nil)
@@ -414,11 +420,12 @@ fn walk_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
       use _ <- result.try(walk_expr(env, value))
       Ok(env)
     }
-    ast.SReturn(Some(e))
-    | ast.SEcho(e)
-    | ast.SAssert(e)
-    | ast.SPanic(e)
-    | ast.SExpr(e) -> {
+    ast.SAssert(e) -> {
+      use _ <- result.try(walk_expr(env, e))
+      use _ <- result.try(check_condition(env, e))
+      Ok(env)
+    }
+    ast.SReturn(Some(e)) | ast.SEcho(e) | ast.SPanic(e) | ast.SExpr(e) -> {
       use _ <- result.try(walk_expr(env, e))
       Ok(env)
     }
@@ -427,6 +434,7 @@ fn walk_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
       use _ <- result.try(
         list.try_fold(branches, Nil, fn(_, b) {
           use _ <- result.try(walk_expr(env, b.cond))
+          use _ <- result.try(check_condition(env, b.cond))
           // Whatever the condition's `is` patterns bind is in scope in the body,
           // with the types the generated accessors have.
           let #(_, binds) = gen_condition(env, b.cond)
@@ -445,7 +453,10 @@ fn walk_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
         None -> Ok(env)
       })
       use _ <- result.try(case cond {
-        Some(e) -> walk_expr(ienv, e)
+        Some(e) -> {
+          use _ <- result.try(walk_expr(ienv, e))
+          check_condition(ienv, e)
+        }
         None -> Ok(Nil)
       })
       use _ <- result.try(case post {
@@ -468,6 +479,33 @@ fn walk_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
       ))
       Ok(env)
     }
+  }
+}
+
+/// An `Atom` is not a condition. It used to be — truthy unless it was the atom
+/// at zero — but that made `if flag` read as a question about which atom it was,
+/// answered by a numbering the program never chose. Comparing says what is meant
+/// and costs one operator: `if flag == #Ready`.
+///
+/// `&&` and `||` combine conditions, so each of their sides is a boolean
+/// position too, and an `is` test is a condition already.
+fn check_condition(env: Env, cond: ast.Expr) -> Result(Nil, String) {
+  case cond {
+    ast.EBinary(ast.OpAnd, l, r) | ast.EBinary(ast.OpOr, l, r) -> {
+      use _ <- result.try(check_condition(env, l))
+      check_condition(env, r)
+    }
+    ast.EIs(_, _) -> Ok(Nil)
+    _ ->
+      case infer(env, cond) {
+        TyAtom ->
+          Error(
+            "an atom is not a condition: it is a label, not a yes or a no. "
+            <> "Compare it with the one you mean (`== #SomeAtom`), or use a "
+            <> "`Bool`.",
+          )
+        _ -> Ok(Nil)
+      }
   }
 }
 
@@ -1359,8 +1397,11 @@ fn collect_sigs(
 // ---------------------------------------------------------------------------
 // The atom table
 // ---------------------------------------------------------------------------
-// Atoms are collected in order of appearance; #False and #True always occupy
-// slots 0 and 1 ("the first atoms to be included on the table").
+// Atoms are collected in order of appearance. `#Nil` is the one atom the
+// compiler provides, and it always occupies slot 0 — so it is the atom a
+// program can name without declaring it, and the falsy one in boolean position.
+// Everything else, `#True` and `#False` included, is an ordinary atom that
+// exists only because the program mentioned it.
 
 fn collect_atoms(module: ast.Module) -> List(String) {
   let found =
@@ -1376,8 +1417,8 @@ fn collect_atoms(module: ast.Module) -> List(String) {
   let customs =
     found
     |> list.reverse
-    |> list.filter(fn(name) { name != "False" && name != "True" })
-  ["False", "True", ..customs]
+    |> list.filter(fn(name) { name != "Nil" })
+  ["Nil", ..customs]
 }
 
 fn add_atom(acc: List(String), name: String) -> List(String) {
@@ -1487,18 +1528,18 @@ fn atoms_in_opt(o: Option(ast.Expr), acc: List(String)) -> List(String) {
   }
 }
 
-// Emits the atom constants and the init that registers the name table. When
-// the program only ever uses #True/#False the runtime's default table
+// Emits the atom constants and the init that registers the name table. When the
+// program names no atom of its own, the runtime's default table (`#Nil` alone)
 // suffices and nothing is emitted.
 fn gen_atom_setup(table: List(String)) -> String {
-  let customs = list.drop(table, 2)
+  let customs = list.drop(table, 1)
   case customs {
     [] -> ""
     _ -> {
       let consts =
         customs
         |> list.index_map(fn(name, i) {
-          "\tatom_" <> name <> " hive.Atom = " <> int.to_string(i + 2) <> "\n"
+          "\tatom_" <> name <> " hive.Atom = " <> int.to_string(i + 1) <> "\n"
         })
         |> string.concat
       let names =
@@ -3024,14 +3065,9 @@ fn gen_condition(env: Env, cond: ast.Expr) -> #(String, List(Bind)) {
       let #(rc, _) = gen_condition(env, r)
       #("(" <> lc <> ") || (" <> rc <> ")", [])
     }
-    _ -> {
-      let code = gen_expr(env, cond)
-      // A bare atom in boolean position is truthy unless it is #False.
-      case infer(env, cond) {
-        TyAtom -> #("hive.Bool(" <> code <> ")", [])
-        _ -> #(code, [])
-      }
-    }
+    // An atom is not a condition (see `check_condition`), so by the time codegen
+    // runs there is nothing left to coerce.
+    _ -> #(gen_expr(env, cond), [])
   }
 }
 
@@ -3253,8 +3289,8 @@ pub fn infer(env: Env, e: ast.Expr) -> Ty {
     ast.EFloat(_) -> TyFloat
     ast.EString(_) -> TyStr
     ast.EInterp(_) -> TyStr
-    // `true`/`false` are Bool literals (Go booleans), distinct from the
-    // `#True`/`#False` atoms.
+    // `true`/`false` are Bool literals (Go booleans). They are not atoms at
+    // all — an atom named `#True` is just an atom the program declared.
     ast.EBool(_) -> TyBool
     ast.EAtom(_) -> TyAtom
     ast.EIdent(name) ->
@@ -3932,8 +3968,8 @@ fn gen_with(env: Env, value: ast.Expr, typ: ast.TypeExpr) -> String {
 
 fn gen_atom(name: String) -> String {
   case name {
-    "False" -> "hive.False"
-    "True" -> "hive.True"
+    // The one atom the runtime already knows; everything else is generated.
+    "Nil" -> "hive.Nil"
     _ -> "atom_" <> name
   }
 }

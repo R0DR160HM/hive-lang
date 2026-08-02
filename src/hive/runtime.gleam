@@ -290,17 +290,19 @@ func (r Result[T, E]) Ok() T         { return r.value }
 func (r Result[T, E]) Err() E        { return r.err }
 
 // Atom is an interned symbol. The compiler assigns every distinct atom in
-// the program a small integer value (#False is always 0 and #True always 1)
-// and registers the table of names via InitAtoms, so an echoed atom can show
-// its visual form.
+// the program a small integer value and registers the table of names via
+// InitAtoms, so an echoed atom can show its visual form.
+//
+// #Nil is the only atom the language provides, and it is always 0 — which is
+// what makes it the falsy atom in boolean position. Every other atom, including
+// one spelled #True, exists because a program mentioned it.
 type Atom int
 
 const (
-	False Atom = 0
-	True  Atom = 1
+	Nil Atom = 0
 )
 
-var atomNames = []string{\"False\", \"True\"}
+var atomNames = []string{\"Nil\"}
 
 // InitAtoms installs the program's atom table (called from generated code).
 func InitAtoms(names []string) { atomNames = names }
@@ -314,15 +316,12 @@ func (a Atom) String() string {
 }
 
 // AtomToStr is the Str form of an atom: the decimal digits of its compiled
-// value (so \"0\" + True == \"01\").
+// value (so \"0\" + Nil == \"00\").
 func AtomToStr(a Atom) string { return strconv.Itoa(int(a)) }
-
-// Bool reports whether an atom is truthy (anything but #False).
-func Bool(a Atom) bool { return a != False }
 
 // ToStr converts any Hive value to its Str form (used by interpolation and
 // string coercion). Note that an Atom renders as its decimal value here, which
-// is the language's coercion rule (\"0\" + #True == \"01\").
+// is the language's coercion rule (\"0\" + #Nil == \"00\").
 func ToStr(v any) string {
 	switch x := v.(type) {
 	case string:
@@ -3704,7 +3703,7 @@ import (
 // value. Local code that works is therefore code that still works once the
 // service moves to another node.
 
-// atomNone is the \"no atom\" sentinel. Zero is taken (#False), so a negative
+// atomNone is the \"no atom\" sentinel. Zero is taken (#Nil), so a negative
 // value is used: no compiled atom is ever negative.
 const atomNone Atom = -1
 

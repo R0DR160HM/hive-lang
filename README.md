@@ -358,14 +358,19 @@ compiles, builds and runs.
   the endpoint it can be dialed at, so a peer list is ordinary runtime data. A
   `panic` inside a service kills only that service, not the node.
 * **Atoms** (`#SomeAtom`) are interned symbols. The compiler assigns each a
-  small integer (`#False` = 0 and `#True` = 1 always come first) and embeds
-  the atom table in the executable, so `echo` prints an atom's name while
-  coercion to `Str` yields its decimal value (`"0" + #True == "01"`). A bare
-  atom in boolean position is truthy unless it is `#False`.
+  small integer and embeds the atom table in the executable, so `echo` prints an
+  atom's name while coercion to `Str` yields its decimal value. **`#Nil` is the
+  only atom the language provides**, and it is always the first on the table, so
+  `"0" + #Nil == "00"`. Everything else — including an atom you happen to spell
+  `#True` — exists only because your program mentioned it, and lands wherever its
+  first mention puts it. An atom is **not** a condition: it is a label, not a yes
+  or a no, so `if flag` is a compile error. Compare it with the one you mean —
+  `if flag == #Ready` — or use a `Bool`.
 * **Booleans** — `Bool` is a real boolean type (Go `bool`); its literals are
-  `true` and `false`. It is distinct from the `#True`/`#False` atoms above:
-  comparisons and `&&`/`||` produce `Bool`, and a `Bool` field or value holds
-  `true`/`false`, not an atom.
+  `true` and `false`. It is not an atom and has nothing to do with the atom
+  table: comparisons and `&&`/`||` produce `Bool`, and a `Bool` field or value
+  holds `true`/`false`. Writing `#True` gets you an ordinary atom of your own,
+  which is a different type from `true`.
 * **Numbers** are `Int` or `Float` with `+ - * / % **` (`%` is the remainder
   operator, with the same precedence as `*` and `/`); dividing — or taking a
   remainder — by zero returns 0. A mutable number supports the compound
