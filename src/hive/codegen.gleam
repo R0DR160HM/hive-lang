@@ -1400,8 +1400,8 @@ fn collect_sigs(
 // Atoms are collected in order of appearance. `#Nil` is the one atom the
 // compiler provides, and it always occupies slot 0 — so it is the atom a
 // program can name without declaring it, and the falsy one in boolean position.
-// Everything else, `#True` and `#False` included, is an ordinary atom that
-// exists only because the program mentioned it.
+// Everything else is an ordinary atom that exists only because the program
+// mentioned it.
 
 fn collect_atoms(module: ast.Module) -> List(String) {
   let found =
@@ -3289,8 +3289,7 @@ pub fn infer(env: Env, e: ast.Expr) -> Ty {
     ast.EFloat(_) -> TyFloat
     ast.EString(_) -> TyStr
     ast.EInterp(_) -> TyStr
-    // `true`/`false` are Bool literals (Go booleans). They are not atoms at
-    // all — an atom named `#True` is just an atom the program declared.
+    // `true`/`false` are Bool literals (Go booleans), never atoms.
     ast.EBool(_) -> TyBool
     ast.EAtom(_) -> TyAtom
     ast.EIdent(name) ->

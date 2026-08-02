@@ -361,16 +361,14 @@ compiles, builds and runs.
   small integer and embeds the atom table in the executable, so `echo` prints an
   atom's name while coercion to `Str` yields its decimal value. **`#Nil` is the
   only atom the language provides**, and it is always the first on the table, so
-  `"0" + #Nil == "00"`. Everything else — including an atom you happen to spell
-  `#True` — exists only because your program mentioned it, and lands wherever its
-  first mention puts it. An atom is **not** a condition: it is a label, not a yes
+  `"0" + #Nil == "00"`. Every other atom exists only because your program
+  mentioned it, and lands wherever its first mention puts it. An atom is **not**
+  a condition: it is a label, not a yes
   or a no, so `if flag` is a compile error. Compare it with the one you mean —
   `if flag == #Ready` — or use a `Bool`.
 * **Booleans** — `Bool` is a real boolean type (Go `bool`); its literals are
-  `true` and `false`. It is not an atom and has nothing to do with the atom
-  table: comparisons and `&&`/`||` produce `Bool`, and a `Bool` field or value
-  holds `true`/`false`. Writing `#True` gets you an ordinary atom of your own,
-  which is a different type from `true`.
+  `true` and `false`. Comparisons and `&&`/`||` produce `Bool`, and a `Bool`
+  field or value holds `true`/`false`.
 * **Numbers** are `Int` or `Float` with `+ - * / % **` (`%` is the remainder
   operator, with the same precedence as `*` and `/`); dividing — or taking a
   remainder — by zero returns 0. A mutable number supports the compound

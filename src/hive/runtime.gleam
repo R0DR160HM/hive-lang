@@ -293,9 +293,8 @@ func (r Result[T, E]) Err() E        { return r.err }
 // the program a small integer value and registers the table of names via
 // InitAtoms, so an echoed atom can show its visual form.
 //
-// #Nil is the only atom the language provides, and it is always 0 — which is
-// what makes it the falsy atom in boolean position. Every other atom, including
-// one spelled #True, exists because a program mentioned it.
+// #Nil is the only atom the language provides, and it is always 0. Every other
+// atom exists because a program mentioned it.
 type Atom int
 
 const (
