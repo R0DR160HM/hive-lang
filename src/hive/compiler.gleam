@@ -1750,6 +1750,9 @@ fn check_net_call(
     "socketPeer" -> check_arity("`hive.net.socketPeer`", args, ["connection"])
     "socketClose" -> check_arity("`hive.net.socketClose`", args, ["connection"])
     "socketServe" -> check_serve_call(ctx, "socketServe", args, ServeSocket)
+    // --- The network underneath all three ---
+    "resolve" -> check_arity("`hive.net.resolve`", args, ["name"])
+    "localAddress" -> check_arity("`hive.net.localAddress`", args, [])
     _ ->
       Error(
         "unknown builtin `hive.net."
@@ -1757,7 +1760,7 @@ fn check_net_call(
         <> "` (available: httpRequest, httpServe; wsConnect, wsSend, "
         <> "wsReceive, wsRequest, wsClose, wsServe; socketConnect, socketSend, "
         <> "socketReceive, socketReceiveLine, socketPeer, socketClose, "
-        <> "socketServe)",
+        <> "socketServe; resolve, localAddress)",
       )
   }
 }
@@ -1865,6 +1868,7 @@ fn check_syslink_call(
   case fname {
     "listen" -> check_arity("`hive.syslink.listen`", args, ["endpoint"])
     "node" -> check_arity("`hive.syslink.node`", args, [])
+    "peers" -> check_arity("`hive.syslink.peers`", args, [])
     // Node roles used to be atoms too. They earned nothing: routing wants an
     // endpoint that can be resolved at runtime, and there is no name for an
     // authenticated peer to impersonate, so all they did was force the cluster's
@@ -1921,8 +1925,8 @@ fn check_syslink_call(
       Error(
         "unknown builtin `hive.syslink."
         <> fname
-        <> "` (available: listen, node; spawn, register, at, on, stop; answer, "
-        <> "self, monitor). A service is reached by calling its address — "
+        <> "` (available: listen, node, peers; spawn, register, at, on, stop; "
+        <> "answer, self, monitor). A service is reached by calling its address — "
         <> "`cache(Op.Count())` — not through a function in this module.",
       )
   }

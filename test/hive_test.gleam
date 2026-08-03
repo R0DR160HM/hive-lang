@@ -1013,6 +1013,93 @@ pub fn socket_handler_must_take_a_socket_connection_test() {
   should.be_error(result)
 }
 
+// ---------------------------------------------------------------------------
+// hive.net: names, and where this machine is
+// ---------------------------------------------------------------------------
+
+const addresses_example = "proc main(): void {
+\tfound := hive.net.resolve(\"cache-0.internal\")
+\tif found is Result.Ok(addresses) {
+\t\tfor each address in addresses {
+\t\t\techo address
+\t\t}
+\t} else if found is Result.Error(error) {
+\t\techo error.reason
+\t\techo error.message
+\t}
+\there := hive.net.localAddress()
+\tif here is Result.Ok(ip) {
+\t\techo ip
+\t}
+}
+"
+
+pub fn resolve_and_local_address_lower_test() {
+  let go = compile(addresses_example)
+  should.be_true(string.contains(go, "hive.NetResolve(\"cache-0.internal\")"))
+  should.be_true(string.contains(go, "hive.NetLocalAddress()"))
+  // The error is a NetError: `reason` and `message`, like WsError and
+  // SocketError next to it.
+  should.be_true(string.contains(go, ".Reason"))
+  should.be_true(string.contains(go, ".Message"))
+}
+
+pub fn resolve_yields_every_address_behind_a_name_test() {
+  // A name stands for however many addresses are behind it, so the Ok payload is
+  // a vector — walkable without an index, and `len`-able.
+  let go =
+    compile(
+      "proc main(): void {\n\tfound := hive.net.resolve(\"cache-0.internal\")\n\tif found is Result.Ok(addresses) {\n\t\techo len(addresses)\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.NetResolve(\"cache-0.internal\")"))
+  should.be_true(string.contains(go, "len("))
+}
+
+pub fn resolve_takes_a_name_test() {
+  // A resolve with nothing to resolve, and one with a spare argument.
+  should.be_error(
+    compiler.compile("proc main(): void {\n\thive.net.resolve()\n}\n"),
+  )
+  should.be_error(compiler.compile(
+    "proc main(): void {\n\thive.net.resolve(\"a\", \"b\")\n}\n",
+  ))
+}
+
+pub fn resolve_accepts_a_named_argument_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tfound := hive.net.resolve(name: \"cache-0.internal\")\n\tif found is Result.Ok(a) {\n\t\techo len(a)\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.NetResolve(\"cache-0.internal\")"))
+}
+
+pub fn local_address_takes_no_arguments_test() {
+  should.be_error(compiler.compile(
+    "proc main(): void {\n\thive.net.localAddress(\"eth0\")\n}\n",
+  ))
+}
+
+pub fn net_error_is_reached_through_its_module_test() {
+  // Every stdlib module owns its types, so the bare `hive.NetError` is refused
+  // and pointed at `hive.net.NetError`.
+  should.be_error(compiler.compile(
+    "proc main(): void {\n\techo hive.NetError(\"a\", \"b\").reason\n}\n",
+  ))
+  let go =
+    compile(
+      "proc report(error: hive.net.NetError): void {\n\techo \"{error.reason}: {error.message}\"\n}\nproc main(): void {\n\tfound := hive.net.resolve(\"nowhere.invalid\")\n\tif found is Result.Error(error) {\n\t\treport(error)\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "func report(error hive.NetError)"))
+}
+
+pub fn a_bad_net_member_names_the_new_calls_test() {
+  // The "available" list an unknown member is answered with has to name them,
+  // or they are undiscoverable from the one place someone looks.
+  let assert Error(msg) =
+    compiler.compile("proc main(): void {\n\thive.net.lookup(\"x\")\n}\n")
+  should.be_true(string.contains(msg, "resolve, localAddress"))
+}
+
 pub fn net_calls_accept_named_arguments_test() {
   let go =
     compile(
@@ -1537,6 +1624,45 @@ pub fn net_module_is_pulled_in_by_each_protocol_test() {
       "proc main(): void {\n\thive.net.socketServe(80, h)\n}\nproc h(c: hive.net.SocketConnection): void {\n\thive.net.socketClose(c)\n}\n",
     )
   should.be_true(list.contains(socket, "net"))
+  // The two calls that name no protocol carry no protocol's prefix either, so
+  // they need a marker of their own — without it a program that only resolves a
+  // name would be built without the module that resolves it.
+  let names =
+    used_modules(
+      "proc main(): void {\n\tfound := hive.net.resolve(\"cache-0.internal\")\n\tif found is Result.Ok(a) {\n\t\techo len(a)\n\t}\n}\n",
+    )
+  should.be_true(list.contains(names, "net"))
+  let local =
+    used_modules(
+      "proc main(): void {\n\there := hive.net.localAddress()\n\tif here is Result.Ok(ip) {\n\t\techo ip\n\t}\n}\n",
+    )
+  should.be_true(list.contains(local, "net"))
+}
+
+// The health check shrinks its own period: a probe that goes unanswered brings
+// the next one forward by a step, so silence costs 15 + 10 + 5 = 30s rather than
+// the 45 three full periods would spend. The schedule lives in the runtime
+// rather than in generated code, so this pins the pieces it is derived from.
+pub fn syslink_health_check_shrinks_its_period_test() {
+  let source = runtime.syslink_net_go()
+  should.be_true(string.contains(source, "syslinkTickEvery = 15 * time.Second"))
+  should.be_true(string.contains(source, "syslinkTickStep  = 5 * time.Second"))
+  // The budget is derived from those two, never written down a third time.
+  should.be_true(string.contains(
+    source,
+    "for wait := syslinkTickEvery; wait > 0; wait -= syslinkTickStep {",
+  ))
+  // An unanswered probe brings the next one forward...
+  should.be_true(string.contains(source, "wait -= syslinkTickStep"))
+  // ...and one word from the peer puts the period back to full.
+  should.be_true(string.contains(source, "wait = syslinkTickEvery"))
+  // A check is a round trip, because "somebody spoke lately" cannot tell a live
+  // peer from one whose own period misses the window being watched.
+  should.be_true(string.contains(source, "kindPong"))
+  should.be_true(string.contains(
+    source,
+    "s.enqueue(writeFrame(frame{kind: kindPong}))",
+  ))
 }
 
 pub fn module_requirements_are_pulled_in_test() {
@@ -2139,6 +2265,59 @@ pub fn syslink_on_service_name_must_be_an_atom_test() {
     <> "proc main(): void {\n\tn := \"Inbox\"\n\thive.syslink.on(\"10.0.0.4:9100\", n)(Op.Put(\"k\"))\n}\n",
   )
   |> should.be_error
+}
+
+// `peers` is the nodes this one is connected to right now, each as the endpoint
+// it advertised — so an entry is exactly what `on` takes, which is what makes it
+// the answer to "who can I call later?".
+pub fn syslink_peers_lowers_test() {
+  let go =
+    compile(
+      service_prelude
+      <> "proc main(): void {\n\tfor each endpoint in hive.syslink.peers() {\n\t\thive.syslink.on(endpoint, #Inbox)(Op.Count())\n\t}\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.SyslinkPeers()"))
+  should.be_true(string.contains(go, "hive.SyslinkOn(endpoint,"))
+}
+
+// A vector of endpoints: countable, walkable, and needing no annotation.
+pub fn syslink_peers_is_a_vector_of_endpoints_test() {
+  let go =
+    compile(
+      service_prelude
+      <> "proc main(): void {\n\tconnected := hive.syslink.peers()\n\techo len(connected)\n\techo join(connected, \", \")\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.SyslinkPeers()"))
+  should.be_true(string.contains(go, "hive.Join("))
+}
+
+pub fn syslink_peers_takes_no_arguments_test() {
+  // Which node's peers? There is only one answer, so there is nothing to pass.
+  compiler.compile(
+    service_prelude
+    <> "proc main(): void {\n\techo len(hive.syslink.peers(\"127.0.0.1:9100\"))\n}\n",
+  )
+  |> should.be_error
+}
+
+pub fn syslink_peers_is_offered_by_name_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      service_prelude
+      <> "proc main(): void {\n\thive.syslink.connections()\n}\n",
+    )
+  should.be_true(string.contains(msg, "listen, node, peers"))
+}
+
+// A program that only asks who it is talking to still needs the module.
+pub fn syslink_peers_pulls_in_the_module_test() {
+  let modules =
+    used_modules(
+      service_prelude
+      <> "proc main(): void {\n\techo len(hive.syslink.peers())\n}\n",
+    )
+  should.be_true(list.contains(modules, "syslink"))
+  should.be_true(list.contains(modules, "syslinknet"))
 }
 
 // There is no `send` and no `call`: an address is called directly, and the call

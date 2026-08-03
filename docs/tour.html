@@ -5432,6 +5432,14 @@ normal</b> and code needing an exact count has to keep asking.</p>
 <p><code>socketConnect(host, port)</code> dials, <code>socketPeer</code> is the remote address, and
 <code>socketClose</code> shuts it down. A <code>SocketError</code>'s reason is
 <code>"Connect"</code>, <code>"Closed"</code>, <code>"Send"</code> or <code>"Receive"</code>.</p>
+<p>Two calls in the module name no protocol at all, because they are the network the other three are
+built on. <code>hive.net.resolve(name)</code> turns a host name into <b>every</b> address behind it —
+<code>Result&lt;Str[], hive.net.NetError&gt;</code>, in the resolver's own order, since rotating the
+answers is how a name balances load — and <code>hive.net.localAddress()</code> is the address other
+machines reach this one on, asked of the routing table rather than guessed from the first interface in
+the list. Nothing is sent to find out either one. Loopback is deliberately not an answer: a machine
+holding only <code>127.0.0.1</code> has no address a peer could dial, and <code>"NoAddress"</code> is
+far more use than one that works right up until the other end is on another host.</p>
 <div class="crumb">A server and its own client, in one program each:
 <code>code-examples/3 - Networking/</code></div>
 </div>
@@ -5464,6 +5472,15 @@ curta é normal</b> e código que precisa de uma contagem exata tem que continua
 <p><code>socketConnect(host, port)</code> disca, <code>socketPeer</code> é o endereço remoto, e
 <code>socketClose</code> encerra. O motivo de um <code>SocketError</code> é
 <code>"Connect"</code>, <code>"Closed"</code>, <code>"Send"</code> ou <code>"Receive"</code>.</p>
+<p>Duas chamadas do módulo não nomeiam protocolo nenhum, porque são a rede sobre a qual os outros três
+são construídos. O <code>hive.net.resolve(name)</code> transforma um nome de host em <b>todos</b> os
+endereços atrás dele — <code>Result&lt;Str[], hive.net.NetError&gt;</code>, na ordem do próprio
+resolvedor, já que girar as respostas é como um nome equilibra carga — e o
+<code>hive.net.localAddress()</code> é o endereço pelo qual outras máquinas alcançam esta, perguntado
+à tabela de rotas em vez de adivinhado pela primeira interface da lista. Nada é enviado para descobrir
+nenhum dos dois. Loopback deliberadamente não é resposta: uma máquina que só tem
+<code>127.0.0.1</code> não tem endereço que um par possa discar, e <code>"NoAddress"</code> serve
+muito mais que um que funciona até a outra ponta estar em outra máquina.</p>
 <div class="crumb">Um servidor e o cliente dele, um programa cada:
 <code>code-examples/3 - Networking/</code></div>
 </div>
@@ -6035,6 +6052,12 @@ resolved through DNS. There is no port-mapper daemon and no cluster-wide name re
 peers to dial it on — and the port is taken from it and bound on every interface. Advertising it is
 what keeps an address this node hands out dialable even after a peer passes it on again.
 <code>hive.syslink.node()</code> gives you that endpoint back.</p>
+<p><code>hive.syslink.peers()</code> is the other half of that: every node this one is connected to
+<em>right now</em>, each as the endpoint it advertised, sorted. It keeps no bookkeeping of its own,
+because a connection <b>is</b> the record — so sending to a node puts it in the list, a node that
+dials in appears without this node doing anything, and losing the connection takes it out again. Every
+entry is exactly what <code>on</code> takes, which is what makes it the answer to "who can I call
+later?".</p>
 <p>Node identity would have to be resolved to an endpoint at runtime anyway, and there is nothing for
 a peer to impersonate when you reached it by dialing it — so making one an atom would have bought
 nothing and cost the ability to compute a peer list.</p>
@@ -6054,6 +6077,12 @@ cluster.</p>
 pares para discarem — e a porta é tirada dele e ligada em todas as interfaces. Anunciar isso é o que
 mantém discável um endereço que este nó entrega, mesmo depois de um par repassá-lo. O
 <code>hive.syslink.node()</code> devolve esse endpoint.</p>
+<p>O <code>hive.syslink.peers()</code> é a outra metade disso: todos os nós a que este está conectado
+<em>agora</em>, cada um como o endpoint que anunciou, ordenados. Ele não guarda registro próprio,
+porque uma conexão <b>é</b> o registro — então mandar mensagem para um nó o coloca na lista, um nó que
+disca para cá aparece sem este nó fazer nada, e perder a conexão o tira de novo. Cada entrada é
+exatamente o que o <code>on</code> recebe, e é isso que faz dela a resposta para "para quem eu posso
+ligar depois?".</p>
 <p>Uma identidade de nó teria que ser resolvida para um endpoint em tempo de execução de todo jeito, e
 não há nada para um par personificar quando você o alcançou discando para ele — então fazer disso um
 átomo não compraria nada e custaria a capacidade de calcular uma lista de pares.</p>
@@ -6071,9 +6100,12 @@ is guaranteed between a pair of nodes, and that requires exactly one pipe per pa
 dialed lazily on the first message that needs one, either end may dial, and when both do at once
 exactly one survives. Replies travel back over the same pipe, so a node that can only dial out still
 takes part fully.</li>
-<li><b>Delivery is best-effort.</b> A heartbeat runs every 15 seconds and three missed ticks declares
-a node down, failing its outstanding calls and firing its monitors. Messages queued when a node is
-declared down are <em>dropped</em>, and reconnecting does not resurrect them.</li>
+<li><b>Delivery is best-effort.</b> A health check runs every 15 seconds, and each one that goes
+unanswered brings the next one <b>forward</b> by 5 — 15s, then 10s, then 5s — so a node that has gone
+quiet is declared down after 30 seconds rather than the 45 three full periods would spend, failing its
+outstanding calls and firing its monitors. The check is a round trip (a tick, answered with a pong),
+and any frame at all counts as an answer. Messages queued when a node is declared down are
+<em>dropped</em>, and reconnecting does not resurrect them.</li>
 <li><b>Messages cross as JSON</b>, using the very same derived codecs from step 112 — so nothing new
 has to be derived for a type to be sendable. Every frame carries a structural <b>digest</b> of the
 message type, so a peer built from a different declaration fails loudly instead of decoding another
@@ -6112,10 +6144,12 @@ mensagens é garantida entre um par de nós, e isso exige exatamente um tubo por
 discadas na primeira mensagem que precisa de uma, qualquer ponta pode discar, e quando as duas discam
 ao mesmo tempo exatamente uma sobrevive. As respostas voltam pelo mesmo tubo, então um nó que só
 consegue discar para fora participa plenamente.</li>
-<li><b>A entrega é de melhor esforço.</b> Um heartbeat roda a cada 15 segundos e três batidas perdidas
-declaram um nó fora do ar, falhando as chamadas pendentes dele e disparando os monitores. Mensagens
-enfileiradas quando um nó é declarado fora do ar são <em>descartadas</em>, e reconectar não as
-ressuscita.</li>
+<li><b>A entrega é de melhor esforço.</b> Uma verificação de saúde roda a cada 15 segundos, e cada uma
+que fica sem resposta adianta a próxima em 5 — 15s, depois 10s, depois 5s — então um nó que ficou
+quieto é declarado fora do ar em 30 segundos em vez dos 45 que três períodos inteiros gastariam,
+falhando as chamadas pendentes dele e disparando os monitores. A verificação é uma ida e volta (um
+tick, respondido com um pong), e qualquer frame conta como resposta. Mensagens enfileiradas quando um
+nó é declarado fora do ar são <em>descartadas</em>, e reconectar não as ressuscita.</li>
 <li><b>As mensagens atravessam como JSON</b>, usando os mesmos codecs derivados do passo 112 — então
 nada novo precisa ser derivado para um tipo ser enviável. Cada frame carrega um <b>digest</b>
 estrutural do tipo da mensagem, então um par construído a partir de outra declaração falha alto em vez

@@ -52,7 +52,10 @@ pub fn modules() -> List(Module) {
       name: "net",
       file: "hive/net.go",
       source: net_go,
-      markers: ["hive.Http", "hive.Ws", "hive.Socket"],
+      // `hive.Net` is the resolver, this machine's own address and the error
+      // both answer with — the calls that name no protocol, and so carry no
+      // protocol's prefix.
+      markers: ["hive.Http", "hive.Ws", "hive.Socket", "hive.Net"],
       requires: [],
     ),
     Module(
@@ -725,7 +728,9 @@ func ReadCSV(path string, delimiter string) Result[Table, TableError] {
 // ---------------------------------------------------------------------------
 
 /// Source of `hive/net.go`: the networking module (`hive.net`). HTTP client and
-/// server, WebSocket client and server, and raw TCP client and server.
+/// server, WebSocket client and server, raw TCP client and server, and the
+/// network underneath all three — name resolution and this machine's own
+/// address.
 ///
 /// The WebSocket half implements RFC 6455 directly on a hijacked connection
 /// rather than pulling in a third-party library, so a program that speaks
@@ -735,6 +740,7 @@ pub fn net_go() -> String {
 
 import (
 	\"bufio\"
+	\"context\"
 	\"crypto/rand\"
 	\"crypto/sha1\"
 	\"crypto/tls\"
@@ -1421,6 +1427,143 @@ func SocketServe(port int, handler func(SocketConnection)) {
 			handler(SocketConnection{sock: &socket{conn: c, r: bufio.NewReader(c)}})
 		}(conn)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// The network underneath: names, and where this machine is
+// ---------------------------------------------------------------------------
+
+// NetError says why a name could not be resolved, or why this machine could not
+// say where it is. Reason is a short tag, in the same spirit as WsError and
+// SocketError: \"NotFound\", \"Lookup\" or \"NoAddress\".
+//
+// Neither of these two calls is HTTP, WebSocket or TCP — they are the network
+// all three are built on — which is why they answer with an error of their own
+// rather than borrowing one that would misname the failure.
+type NetError struct {
+	Reason  string
+	Message string
+}
+
+func (e NetError) Error() string {
+	return \"hive: net \" + e.Reason + \": \" + e.Message
+}
+
+func netFail[T any](reason, message string) Result[T, NetError] {
+	return Err[T, NetError](NetError{Reason: reason, Message: message})
+}
+
+// netResolveTimeout bounds a lookup. The system resolver has timeouts of its
+// own, but they are the machine's business and differ by platform; a name that
+// cannot be answered in ten seconds has failed as far as a program is concerned.
+const netResolveTimeout = 10 * time.Second
+
+// NetResolve resolves a host name to every address behind it, in the order the
+// resolver handed them back — which is information rather than noise: a
+// resolver that rotates its answers is how a name balances load, and sorting
+// them would throw that away.
+//
+// It takes a name, not an endpoint: \"cache-0.internal\", never
+// \"cache-0.internal:9100\". An address literal resolves to itself, so a program
+// that accepts \"either a name or an IP\" from configuration does not have to tell
+// the two apart before asking.
+//
+// A name that does not exist is a \"NotFound\" — it is the answer, not a
+// malfunction — while a resolver that could not be reached at all is a
+// \"Lookup\". Backs hive.net.resolve.
+func NetResolve(name string) Result[[]string, NetError] {
+	if strings.TrimSpace(name) == \"\" {
+		return netFail[[]string](\"NotFound\", \"there is no name here to resolve\")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), netResolveTimeout)
+	defer cancel()
+	addresses, err := net.DefaultResolver.LookupHost(ctx, name)
+	if err != nil {
+		var dns *net.DNSError
+		if errors.As(err, &dns) && dns.IsNotFound {
+			return netFail[[]string](\"NotFound\", \"no address is registered for \"+name)
+		}
+		return netFail[[]string](\"Lookup\", \"could not resolve \"+name+\": \"+err.Error())
+	}
+	if len(addresses) == 0 {
+		return netFail[[]string](\"NotFound\", \"no address is registered for \"+name)
+	}
+	return Ok[[]string, NetError](addresses)
+}
+
+// NetLocalAddress is the address other machines reach this one on: the source
+// address the operating system would stamp on a packet leaving by the default
+// route. Asking the routing table is what makes it the *right* interface on a
+// machine that has several — a container on both a bridge and an overlay, a
+// laptop on Wi-Fi and Ethernet at once — where taking the first interface in the
+// list is a coin flip.
+//
+// Nothing is sent. A UDP \"connection\" only fixes the socket's peer, and it is
+// that which makes the kernel choose a route and bind a source address. The
+// address it names is in TEST-NET-1 (RFC 5737), reserved for documentation, so
+// no machine anybody actually runs is named here.
+//
+// Loopback is deliberately not an answer. A machine holding only 127.0.0.1 has
+// no address a peer could dial, and saying so is far more use than handing back
+// one that works right until the second node turns out to be on another host.
+// Backs hive.net.localAddress.
+func NetLocalAddress() Result[string, NetError] {
+	if probe, err := net.Dial(\"udp\", \"192.0.2.1:9\"); err == nil {
+		host, _, splitErr := net.SplitHostPort(probe.LocalAddr().String())
+		probe.Close()
+		if splitErr == nil {
+			if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() && !ip.IsUnspecified() {
+				return Ok[string, NetError](ip.String())
+			}
+		}
+	}
+	// No default route to consult — an isolated container, or a machine with its
+	// networking down. What the interfaces themselves carry is the next best
+	// answer, IPv4 first because that is what a syslink endpoint is usually
+	// written with.
+	if address, ok := netInterfaceAddress(false); ok {
+		return Ok[string, NetError](address)
+	}
+	if address, ok := netInterfaceAddress(true); ok {
+		return Ok[string, NetError](address)
+	}
+	return netFail[string](\"NoAddress\",
+		\"this machine has no address a peer could reach it on — only loopback\")
+}
+
+// netInterfaceAddress is the first address carried by an interface that is up
+// and is not loopback. `v6` chooses between the two families, so IPv4 can be
+// preferred without the answer degrading into \"whichever came first\".
+// Link-local addresses are skipped: reaching one needs the scope it belongs to,
+// which is not something an endpoint in a config file carries.
+func netInterfaceAddress(v6 bool) (string, bool) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return \"\", false
+	}
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addresses, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, address := range addresses {
+			cidr, ok := address.(*net.IPNet)
+			if !ok || cidr.IP == nil {
+				continue
+			}
+			if cidr.IP.IsLoopback() || cidr.IP.IsLinkLocalUnicast() {
+				continue
+			}
+			if (cidr.IP.To4() == nil) != v6 {
+				continue
+			}
+			return cidr.IP.String(), true
+		}
+	}
+	return \"\", false
 }
 "
 }
@@ -4670,6 +4813,7 @@ import (
 	\"math/big\"
 	\"os\"
 	\"path/filepath\"
+	\"sort\"
 	\"strconv\"
 	\"strings\"
 	\"sync\"
@@ -4698,12 +4842,27 @@ import (
 // sides from relaying one side's proof to the other.
 
 const (
-	syslinkMagic     = \"HIVE-SL1\"
+	syslinkMagic = \"HIVE-SL1\"
+	// The period between health checks while a peer is answering, and how much a
+	// check that went unanswered brings the next one forward. A peer that looks
+	// unwell is probed *more* eagerly rather than less: 15s, then 10s, then 5s.
 	syslinkTickEvery = 15 * time.Second
-	syslinkTickMiss  = 3
+	syslinkTickStep  = 5 * time.Second
 	syslinkMaxFrame  = 8 << 20  // a frame larger than this is refused, not buffered
 	syslinkMaxOutbox = 64 << 20 // past this a node is declared unreachable
 )
+
+// syslinkSilenceBudget is how long a peer may go without a word before its
+// connection is declared dead: the sum of the shrinking probe periods, which is
+// 30s for 15s and 5s. Deriving it keeps those two constants the only place the
+// timing is written down.
+func syslinkSilenceBudget() time.Duration {
+	total := time.Duration(0)
+	for wait := syslinkTickEvery; wait > 0; wait -= syslinkTickStep {
+		total += wait
+	}
+	return total
+}
 
 type frameKind byte
 
@@ -4722,6 +4881,12 @@ const (
 	// watching mailbox, `ref` the monitor id it was registered under, and the
 	// payload is the death message the watcher chose.
 	kindDown
+	// kindPong answers a kindTick, which is what makes a health check a round
+	// trip. \"Somebody said something lately\" is not enough on its own: both ends
+	// probe on schedules of their own, so a period that happens not to line up
+	// with the shrinking window this node is watching would read as silence from
+	// a peer that is perfectly healthy.
+	kindPong
 )
 
 // frame is one multiplexed message. `name` addresses a registered service and
@@ -4765,6 +4930,30 @@ func SyslinkNode() string {
 	nodeMu.RLock()
 	defer nodeMu.RUnlock()
 	return selfEndpoint
+}
+
+// SyslinkPeers is every node this one is connected to right now, each as the
+// endpoint it advertised — the string to hand to `on`, not whatever string was
+// dialed to reach it.
+//
+// It needs no bookkeeping of its own because a connection *is* the record: both
+// ends of a pair share one, filed under the peer's advertised endpoint whether
+// this node accepted it or opened it to carry a message. So sending to a node
+// puts it in this list, a node that dials in appears in it without this node
+// doing anything, and losing the connection — for any reason, including a failed
+// health check — takes it out again.
+//
+// Sorted, because a Go map has no order and a peer list that reshuffles between
+// two reads is a miserable thing to program against. Backs hive.syslink.peers.
+func SyslinkPeers() []string {
+	nodeMu.RLock()
+	peers := make([]string, 0, len(sessions))
+	for node := range sessions {
+		peers = append(peers, node)
+	}
+	nodeMu.RUnlock()
+	sort.Strings(peers)
+	return peers
 }
 
 // SyslinkListen starts accepting connections from other nodes. `endpoint` is what
@@ -4939,8 +5128,13 @@ func (s *session) writer() {
 
 func (s *session) reader() {
 	r := bufio.NewReader(s.conn)
+	// A read deadline one step behind the health check, as a backstop for a
+	// connection that is wedged rather than idle. The check is meant to win that
+	// race: it knows the peer stopped answering and can say so, where a deadline
+	// can only report that nothing arrived.
+	quiet := syslinkSilenceBudget() + syslinkTickStep
 	for {
-		s.conn.SetReadDeadline(time.Now().Add(syslinkTickEvery * syslinkTickMiss))
+		s.conn.SetReadDeadline(time.Now().Add(quiet))
 		f, err := readFrame(r)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -4953,22 +5147,50 @@ func (s *session) reader() {
 		s.mu.Lock()
 		s.lastSeen = time.Now()
 		s.mu.Unlock()
-		if f.kind != kindTick {
+		switch f.kind {
+		case kindTick:
+			s.enqueue(writeFrame(frame{kind: kindPong}))
+		case kindPong:
+			// The stamp above was the whole point of it.
+		default:
 			routeFrame(s.node, f)
 		}
 	}
 }
 
+// ticker is the health check. It sends a probe, and if nothing has come back by
+// the time the next one falls due it brings that one forward by syslinkTickStep
+// instead of waiting out another full period — 15s, then 10s, then 5s, and then
+// the peer is declared unreachable. Silence therefore costs 30 seconds rather
+// than the 45 a fixed period would spend, and the checks bunch up exactly when
+// there is something to find out.
+//
+// Any frame at all counts as an answer, since anything arriving proves what a
+// pong proves; one word from the peer puts the period back to full.
 func (s *session) ticker() {
-	t := time.NewTicker(syslinkTickEvery)
-	defer t.Stop()
-	for range t.C {
+	wait := syslinkTickEvery
+	// The first probe goes out now rather than a period from now, so the first
+	// look at `lastSeen` is asking after an answer this node actually asked for.
+	probed := time.Now()
+	s.enqueue(writeFrame(frame{kind: kindTick}))
+	for {
+		time.Sleep(wait)
 		s.mu.Lock()
-		closed := s.closed
+		closed, answered := s.closed, s.lastSeen.After(probed)
 		s.mu.Unlock()
 		if closed {
 			return
 		}
+		if answered {
+			wait = syslinkTickEvery
+		} else {
+			wait -= syslinkTickStep
+			if wait <= 0 {
+				s.shutdown(\"it answered no health check in \" + syslinkSilenceBudget().String())
+				return
+			}
+		}
+		probed = time.Now()
 		s.enqueue(writeFrame(frame{kind: kindTick}))
 	}
 }

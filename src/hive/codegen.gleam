@@ -96,6 +96,9 @@ pub fn builtin_fields(name: String) -> Option(List(#(String, Ty))) {
     "HttpError" -> Some([#("url", TyStr), #("message", TyStr)])
     "WsError" -> Some([#("reason", TyStr), #("message", TyStr)])
     "SocketError" -> Some([#("reason", TyStr), #("message", TyStr)])
+    // What the two calls in the module that name no protocol answer with:
+    // resolving a name, and asking where this machine is.
+    "NetError" -> Some([#("reason", TyStr), #("message", TyStr)])
     // An open WebSocket and an open TCP stream. Both are opaque — they expose
     // no fields — but registering them here is what lets a parameter or
     // variable be declared `hive.net.WsConnection` / `hive.net.SocketConnection`
@@ -143,6 +146,7 @@ pub fn builtin_qualifier(name: String) -> String {
     "HttpRequest" | "HttpResponse" | "HttpError" -> "hive.net"
     "WsConnection" | "WsError" -> "hive.net"
     "SocketConnection" | "SocketError" -> "hive.net"
+    "NetError" -> "hive.net"
     "JsonError" -> "hive.json"
     "CryptoError" | "JwtHeader" -> "hive.crypto"
     "ConversionError" -> "hive.conv"
@@ -3489,6 +3493,10 @@ fn infer_other_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> Ty {
                 "socketReceive" | "socketReceiveLine" ->
                   TyResult(TyStr, TyBuiltin("SocketError"))
                 "socketPeer" -> TyStr
+                // A name stands for however many addresses are behind it, so
+                // the vector is the honest answer even when there is one.
+                "resolve" -> TyResult(TyVec(TyStr), TyBuiltin("NetError"))
+                "localAddress" -> TyResult(TyStr, TyBuiltin("NetError"))
                 _ -> TyUnknown
               }
             "file" ->
@@ -3590,7 +3598,8 @@ fn infer_other_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> Ty {
                   )
                 "listen" -> TyResult(TyStr, TyBuiltin("SyslinkError"))
                 "node" -> TyStr
-                // answer, monitor, peer and stop are void statements.
+                "peers" -> TyVec(TyStr)
+                // answer, monitor and stop are void statements.
                 _ -> TyVoid
               }
             "time" ->
@@ -4961,6 +4970,11 @@ fn gen_net_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
     "socketPeer" -> "hive.SocketPeer(" <> gen_connection(env, args) <> ")"
     "socketClose" -> "hive.SocketClose(" <> gen_connection(env, args) <> ")"
     "socketServe" -> gen_serve_call(env, "hive.SocketServe", args)
+    // Neither of these names a protocol, so neither carries one's prefix —
+    // which is also what the `hive.Net` module marker matches on.
+    "resolve" ->
+      "hive.NetResolve(" <> gen_one_coerced(env, args, "name", TyStr) <> ")"
+    "localAddress" -> "hive.NetLocalAddress()"
     _ -> "hive." <> exported(fname) <> "(" <> gen_args(env, args) <> ")"
   }
 }
@@ -4996,6 +5010,7 @@ fn gen_syslink_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
       <> gen_one_coerced(env, args, "endpoint", TyStr)
       <> ")"
     "node" -> "hive.SyslinkNode()"
+    "peers" -> "hive.SyslinkPeers()"
     // `spawn` installs the handler as the fold over the mailbox, plus the
     // decoder for messages that arrive from another node.
     "spawn" ->

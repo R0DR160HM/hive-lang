@@ -856,6 +856,27 @@ A `hive.net.SocketConnection` is opaque, and a `hive.net.SocketError`'s
 * `hive.net.socketPeer(connection)` is the remote address (`"host:port"`), and
   `hive.net.socketClose(connection)` shuts the connection down.
 
+**Names, and where this machine is.** Two calls name no protocol, because they
+are the network the other three are built on. A `hive.net.NetError`'s `reason` is
+`"NotFound"`, `"Lookup"` or `"NoAddress"`.
+
+* `hive.net.resolve(name)` resolves a host name to **every** address behind it →
+  `Result<Str[], hive.net.NetError>`, in the order the resolver gave them —
+  which is information rather than noise, since rotating the answers is how a
+  name balances load. It takes a name, not an endpoint (`"cache-0.internal"`,
+  never `"cache-0.internal:9100"`), and an address literal resolves to itself, so
+  a program that accepts "either a name or an IP" from configuration need not tell
+  the two apart before asking. A name nobody registered is a `"NotFound"` — the
+  answer, not a malfunction — while a resolver that could not be reached at all
+  is a `"Lookup"`.
+* `hive.net.localAddress()` is the address other machines reach this one on →
+  `Result<Str, hive.net.NetError>`: the source address the operating system would
+  stamp on a packet leaving by the default route, which is what makes it the
+  *right* interface on a machine that has several. Nothing is sent to find out.
+  Loopback is deliberately not an answer — a machine holding only `127.0.0.1` has
+  no address a peer could dial, and `"NoAddress"` is far more use than one that
+  works right up until the other node turns out to be on another host.
+
 ### `hive.file`
 
 General filesystem access, for the files `using` does not cover. Contents move as
@@ -1230,6 +1251,14 @@ port-mapper daemon and no cluster-wide name registry.
   every interface. Advertising it is what keeps an address this node hands out
   dialable even after a peer passes it on again.
 * `hive.syslink.node()` is the endpoint this node advertises.
+* `hive.syslink.peers()` is every node this one is connected to **right now**,
+  each as the endpoint it advertised → `Str[]`, sorted. It keeps no bookkeeping of
+  its own because a connection *is* the record: one pipe per node pair, filed
+  under the peer's advertised endpoint whichever end opened it. So sending to a
+  node puts it in the list, a node that dials in appears without this node doing
+  anything, and losing the connection — a peer that quit, or one that stopped
+  answering its health checks — takes it out again. Every entry is exactly what
+  `on` takes, which is what makes this the answer to "who can I call later?".
 
 Nothing is dialed until there is a message to carry, and a connection is filed
 under the peer's *advertised* endpoint rather than the string that was dialed — so
@@ -1383,9 +1412,16 @@ message order is guaranteed between a pair of nodes and that requires exactly on
 FIFO pipe per pair. Connections are dialed lazily on the first message that needs
 one, and either end may dial; when both do at once, exactly one survives (the one
 dialed by the lexicographically smaller endpoint). Replies travel back over the same
-pipe, so a node that can only dial out still takes part fully. A heartbeat runs
-every 15s and three missed ticks declares the node down, failing its outstanding
-calls and firing its monitors. The outbox is unbounded — a bounded one would make
+pipe, so a node that can only dial out still takes part fully. A health check
+runs every 15s, and each one that goes unanswered brings the next **forward** by
+5s — 15s, then 10s, then 5s — so a node that has gone quiet is declared down
+after 30s rather than the 45 three full periods would spend, failing its
+outstanding calls and firing its monitors. Any frame at all counts as an answer,
+and hearing from the peer puts the period back to full; the check itself is a
+round trip (a tick, answered with a pong), because with both ends probing on
+schedules of their own, "somebody spoke lately" cannot tell a live peer from one
+whose period happens to miss the shrinking window being watched. The outbox is
+unbounded — a bounded one would make
 `send` block — but past a high-water mark the node is declared unreachable rather
 than growing forever, which turns a memory problem into the failure the program
 already handles. **Delivery is best-effort:** messages queued when a node is
