@@ -103,10 +103,16 @@ fn parse_decls(
       use #(decl, rest) <- result.try(parse_func(tokens))
       parse_decls(rest, imports, [decl, ..acc])
     }
-    token.KwAsync -> {
-      use #(decl, rest) <- result.try(parse_async_func(tokens))
-      parse_decls(rest, imports, [decl, ..acc])
-    }
+    // `async` used to be a declaration modifier. Nothing about a declaration
+    // decides how it runs any more, so the word only means something at a call.
+    token.KwAsync ->
+      Error(at(
+        tokens,
+        "`async` is not part of a declaration: every func and proc blocks its "
+          <> "caller, and `async` is written at the *call* instead — `async "
+          <> "slowThing(x)` runs it on its own virtual thread and does not wait. "
+          <> "Declare this one as a plain `func`.",
+      ))
     token.KwQuery -> {
       use #(decl, rest) <- result.try(parse_query(tokens))
       parse_decls(rest, imports, [decl, ..acc])
@@ -118,7 +124,7 @@ fn parse_decls(
     other ->
       Error(at(
         tokens,
-        "expected `import`, `proc`, `func`, `async func`, `query` or `type` at "
+        "expected `import`, `proc`, `func`, `query` or `type` at "
           <> "the top level but found "
           <> token.describe(other),
       ))
@@ -220,24 +226,7 @@ fn parse_proc(tokens: Toks) -> Result(#(ast.Decl, Toks), String) {
 fn parse_func(tokens: Toks) -> Result(#(ast.Decl, Toks), String) {
   use #(name, params, ret, t1) <- result.try(parse_header(tokens, token.KwFunc))
   use #(body, t2) <- result.try(parse_block(t1))
-  Ok(#(ast.FuncDecl(name, params, ret, body, False), t2))
-}
-
-// `async func name(): T { ... }` — a func that runs on its own virtual thread.
-fn parse_async_func(tokens: Toks) -> Result(#(ast.Decl, Toks), String) {
-  let t0 = tail(tokens)
-  case kind(t0) {
-    token.KwFunc -> {
-      use #(name, params, ret, t1) <- result.try(parse_header(t0, token.KwFunc))
-      use #(body, t2) <- result.try(parse_block(t1))
-      Ok(#(ast.FuncDecl(name, params, ret, body, True), t2))
-    }
-    other ->
-      Error(at(
-        t0,
-        "expected `func` after `async` but found " <> token.describe(other),
-      ))
-  }
+  Ok(#(ast.FuncDecl(name, params, ret, body), t2))
 }
 
 fn parse_query(tokens: Toks) -> Result(#(ast.Decl, Toks), String) {
@@ -735,6 +724,7 @@ fn parse_stmt(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
     token.KwPanic -> parse_panic(tokens)
     token.KwBreak -> Ok(#(ast.SBreak, tail(tokens)))
     token.KwContinue -> Ok(#(ast.SContinue, tail(tokens)))
+    token.KwAsync -> parse_async(tokens)
     token.KwMut -> parse_mut(tail(tokens))
     token.Ident(name) ->
       case kind(tail(tokens)) {
@@ -771,6 +761,26 @@ fn parse_mut(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
           ))
       }
     }
+  }
+}
+
+// `async <call>` — spawn it and carry on. The operand is parsed at the postfix
+// level, which is exactly a call and nothing more: `async` has no value, so
+// there is no larger expression for it to sit inside. Anything else that parsed
+// is named here rather than left to a later pass, because the mistake is about
+// the shape of the statement.
+fn parse_async(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
+  use #(operand, t1) <- result.try(parse_postfix(tail(tokens)))
+  case operand {
+    ast.ECall(_, _) -> Ok(#(ast.SAsync(operand), t1))
+    _ ->
+      Error(at(
+        tokens,
+        "`async` takes a call — `async slowThing(x)` runs it on its own virtual "
+          <> "thread and does not wait for it. There is nothing else to fire off: "
+          <> "every other expression is already finished by the time it is "
+          <> "written.",
+      ))
   }
 }
 
@@ -937,6 +947,19 @@ fn parse_for_c(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
       use #(s, t) <- result.try(parse_stmt(t4))
       Ok(#(Some(s), t))
     }
+  })
+  // A loop's init and post clauses run once per iteration around a condition, and
+  // fire-and-forget has nothing to contribute to either — nothing it started can
+  // be seen by the condition it would be advancing.
+  use _ <- result.try(case init, post {
+    Some(ast.SAsync(_)), _ | _, Some(ast.SAsync(_)) ->
+      Error(at(
+        tokens,
+        "`async` cannot be a loop's init or post clause: those exist to set up "
+          <> "and advance the condition, and a call nothing waits for has no "
+          <> "value to advance it with. Put it in the body instead.",
+      ))
+    _, _ -> Ok(Nil)
   })
   use #(body, t6) <- result.try(parse_block(t5))
   Ok(#(ast.SFor(init, cond, post, body), t6))
@@ -1149,27 +1172,34 @@ fn parse_with_type(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
   case kind(t1) {
     token.KwWith ->
       // Two unrelated clauses share the `with` keyword. `with timeout <ms>`
-      // bounds an `await`; anything else names a decode target. They are told
+      // bounds a wait; anything else names a decode target. They are told
       // apart here so `timeout` never gets read as a type name — and so
       // `timeout` stays a perfectly ordinary identifier everywhere else.
       case is_timeout_word(tail(t1)) {
         True -> {
           // Parsed at the arithmetic level, not as a full expression: the clause
           // has to stop before `is` and `&&`, so
-          // `await h with timeout 500 is Result.Ok(v)` reads as
-          // `(await h with timeout 500) is Result.Ok(v)` rather than folding the
+          // `f(x) with timeout 500 is Result.Ok(v)` reads as
+          // `(f(x) with timeout 500) is Result.Ok(v)` rather than folding the
           // comparison into the millisecond count. `with timeout base * 2` still
           // works.
           use #(ms, t2) <- result.try(parse_additive(tail(tail(t1))))
           case value {
-            ast.EAwait(inner, None) -> Ok(#(ast.EAwait(inner, Some(ms)), t2))
+            // Anything that waits may be bounded: one blocking call, or the
+            // whole barrier of an await-all.
+            ast.EAwait(calls, None) -> Ok(#(ast.EAwait(calls, Some(ms)), t2))
             ast.EAwait(_, Some(_)) ->
               Error(at(t1, "this `await` already has a `with timeout` clause"))
+            ast.ECall(_, _) -> Ok(#(ast.ETimed(value, ms), t2))
+            ast.ETimed(_, _) ->
+              Error(at(t1, "this call already has a `with timeout` clause"))
             _ ->
               Error(at(
                 t1,
-                "`with timeout <ms>` may only follow an `await` — it bounds how "
-                  <> "long the wait may take",
+                "`with timeout <ms>` bounds how long a wait may take, so it "
+                  <> "belongs on something that waits: a call (`f(x) with "
+                  <> "timeout 500`) or an await-all (`await [f(a), f(b)] with "
+                  <> "timeout 500`)",
               ))
           }
         }
@@ -1306,12 +1336,39 @@ fn parse_primary(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
     token.KwTrue -> Ok(#(ast.EBool(True), tail(tokens)))
     token.KwFalse -> Ok(#(ast.EBool(False), tail(tokens)))
     token.Ident(name) -> Ok(#(ast.EIdent(name), tail(tokens)))
-    // `await <call>` binds to the postfix expression that follows, so
-    // `await f(x)` awaits the whole call.
-    token.KwAwait -> {
-      use #(inner, t1) <- result.try(parse_postfix(tail(tokens)))
-      Ok(#(ast.EAwait(inner, None), t1))
-    }
+    // `await [f(a), g(b)]` — the await-all, and the only `await` there is. A
+    // single call needs no keyword (calling it blocks already), so the `[` is
+    // required and its absence is worth saying out loud.
+    token.KwAwait ->
+      case kind(tail(tokens)) {
+        token.LBracket -> {
+          use #(calls, t1) <- result.try(parse_await_calls(
+            tail(tail(tokens)),
+            [],
+          ))
+          Ok(#(ast.EAwait(calls, None), t1))
+        }
+        other ->
+          Error(at(
+            tail(tokens),
+            "`await` takes a list of calls to run all at once — `await [f(a), "
+              <> "f(b)]` — but found "
+              <> token.describe(other)
+              <> ". One call on its own needs no `await`: calling it already "
+              <> "blocks until it answers.",
+          ))
+      }
+    // `async` fires a call off and keeps nothing, so there is no value for it
+    // to be. That is the trade the model makes: no handle to hold means no
+    // handle to leak, and the way to get a result back is to wait for it.
+    token.KwAsync ->
+      Error(at(
+        tokens,
+        "`async` has no value: it starts the call and does not wait, so there "
+          <> "is nothing for it to evaluate to. Drop the `async` to wait for the "
+          <> "result here, or use `await [f(a), f(b)]` to run several at once and "
+          <> "collect all of their results.",
+      ))
     token.KwUsing -> parse_using(tokens)
     token.LBracket -> parse_vector(tail(tokens), [])
     token.LParen -> {
@@ -1324,6 +1381,50 @@ fn parse_primary(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
         tokens,
         "unexpected " <> token.describe(other) <> " in an expression",
       ))
+  }
+}
+
+// The `[...]` of an await-all. It looks like a vector literal and is not one:
+// its elements are calls to *start*, so each has to be a call and the list is
+// held by the `await` itself rather than becoming a value of its own.
+fn parse_await_calls(
+  tokens: Toks,
+  acc: List(ast.Expr),
+) -> Result(#(List(ast.Expr), Toks), String) {
+  case kind(tokens) {
+    token.RBracket ->
+      case acc {
+        [] ->
+          Error(at(
+            tokens,
+            "`await []` waits for nothing at all. List the calls to run "
+              <> "together: `await [f(a), f(b)]`.",
+          ))
+        _ -> Ok(#(list.reverse(acc), tail(tokens)))
+      }
+    _ -> {
+      use #(item, t1) <- result.try(parse_expr(tokens))
+      use _ <- result.try(case item {
+        ast.ECall(_, _) -> Ok(Nil)
+        _ ->
+          Error(at(
+            tokens,
+            "`await` runs each of its calls on its own virtual thread, so every "
+              <> "entry has to be a call — this one is not. A value that is "
+              <> "already in hand has nothing to wait for.",
+          ))
+      })
+      case kind(t1) {
+        token.Comma -> parse_await_calls(tail(t1), [item, ..acc])
+        token.RBracket -> Ok(#(list.reverse([item, ..acc]), tail(t1)))
+        other ->
+          Error(at(
+            t1,
+            "expected `,` or `]` in an `await` list but found "
+              <> token.describe(other),
+          ))
+      }
+    }
   }
 }
 

@@ -29,11 +29,12 @@
 //      arrives as a message and is handled one at a time, so there is no mutex
 //      anywhere and no way for two requests to race on the same row. The fold is
 //      the mutex.
-//   2. A service NEVER awaits another service from inside its own turn. Its turn
-//      would be blocked while it waited, so two nodes that asked each other at
-//      the same moment would deadlock. Fan-out to peers happens in the HTTP
+//   2. A service NEVER waits for another service from inside its own turn. Its
+//      turn would be blocked while it waited, so two nodes that asked each other
+//      at the same moment would deadlock. Fan-out to peers happens in the HTTP
 //      handler (which is its own virtual thread and holds nothing up), and the
-//      invalidation broadcast is fire-and-forget.
+//      invalidation broadcast goes out with `async` — the form that waits for
+//      nothing and cannot fail.
 
 // The mailbox type is the whole protocol: what a node can be asked, and what it
 // answers. A service replies with one of its own messages, so `is` narrows a
@@ -92,12 +93,12 @@ proc cache(node: Node, msg: Cache, from: hive.syslink.Envelope): Node {
 		}
 		echo "  [db] stored {name}"
 
-		// Tell the peers their copies are stale. Bare statements, so nothing is
-		// awaited and this turn cannot be held up by a slow or absent peer — a
+		// Tell the peers their copies are stale. `async`, so nothing is waited for
+		// and this turn cannot be held up by a slow or absent peer — that form of
 		// send never blocks and never fails.
 		for each endpoint in node.peers {
 			peer := hive.syslink.on(endpoint, #Cache)
-			peer(Cache.Invalidate(name))
+			async peer(Cache.Invalidate(name))
 		}
 
 		hive.syslink.answer(from, Cache.Stored(name))
@@ -132,7 +133,7 @@ proc cache(node: Node, msg: Cache, from: hive.syslink.Envelope): Node {
 
 	// Stored / Found / Missing are answers, not requests: nothing sends them here,
 	// and a service that receives one has nothing to do with it. Note that this
-	// branch answers nothing — so if anything ever did *await* one of them, it
+	// branch answers nothing — so if anything ever did *wait* for one of them, it
 	// would come straight back as `NoReply` rather than hanging until its timeout.
 	// Every envelope in this handler only ever reaches `answer`, so the compiler
 	// can see that no reply is ever coming once a turn ends.
@@ -150,7 +151,7 @@ proc handler(
 	mine := hive.syslink.at(#Cache)
 
 	if req.method == "POST" && req.url is "/set/{name}" {
-		stored := await mine(Cache.Store(name, req.body)) with timeout 2000
+		stored := mine(Cache.Store(name, req.body)) with timeout 2000
 		if stored is Result.Ok(reply) && reply is Cache.Stored(_) {
 			return plain(200, "stored\n")
 		}
@@ -162,7 +163,7 @@ proc handler(
 
 	if req.method == "GET" && req.url is "/get/{name}" {
 		// Ask this node first.
-		here := await mine(Cache.Lookup(name)) with timeout 2000
+		here := mine(Cache.Lookup(name)) with timeout 2000
 		if here is Result.Ok(reply) && reply is Cache.Found(_, value) {
 			return plain(200, value)
 		}
@@ -178,7 +179,7 @@ proc handler(
 		// a single deadline for all of them.
 		for each endpoint in peers {
 			peer := hive.syslink.on(endpoint, #Cache)
-			answer := await peer(Cache.Lookup(name)) with timeout 2000
+			answer := peer(Cache.Lookup(name)) with timeout 2000
 			if answer is Result.Ok(reply) && reply is Cache.Found(_, value) {
 				return plain(200, value)
 			}

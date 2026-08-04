@@ -107,8 +107,8 @@ pub fn modules() -> List(Module) {
       name: "task",
       file: "hive/task.go",
       source: task_go,
-      // `await ... with timeout <ms>` lives here too: bounding a wait is
-      // scheduling, and a program that never bounds one does not link it.
+      // `with timeout <ms>` lives here too: bounding a wait is scheduling, and
+      // a program that never bounds one does not link it.
       markers: [
         "hive.Sleep", "hive.AwaitTimeout", "hive.AwaitAllTimeout",
         "hive.TimeoutError",
@@ -394,16 +394,17 @@ func CloneTable(t Table) Table {
 }
 
 // ---------------------------------------------------------------------------
-// Concurrency: async tasks (`async T`)
+// Concurrency: running a call on its own goroutine
 // ---------------------------------------------------------------------------
 
-// Unit is the value of a task produced by a void `async func` — a task joined
-// on for its completion, not for a result.
+// Unit is what a spawned `void` call carries — waited on to know it finished,
+// not for a result.
 type Unit = struct{}
 
-// Async is a handle to a value being computed on its own goroutine — the
-// lowering of Hive's inferred `async T`. It is never named in Hive source;
-// Spawn produces it and Await consumes it.
+// Async is a value being computed on its own goroutine. Nothing in Hive source
+// evaluates to one: it is scaffolding for the two forms that wait for calls they
+// started — `await [f(a), f(b)]` and `f(x) with timeout ms` — and Spawn produces
+// it while Await consumes it, both inside one generated expression.
 type Async[T any] struct {
 	done  chan struct{}
 	val   T
@@ -443,7 +444,7 @@ func (a *Async[T]) Await() T {
 
 // AwaitAll waits for every task and returns their values index-aligned with the
 // input — position i holds task i's result regardless of the order the tasks
-// finished in. It is the barrier behind `await` on a vector of handles.
+// finished in. It is the barrier behind `await [f(a), f(b)]`.
 func AwaitAll[T any](hs []*Async[T]) []T {
 	out := make([]T, len(hs))
 	for i, h := range hs {
@@ -580,51 +581,6 @@ func SortBy[T any](v []T, first func(T, T) bool) []T {
 	out := make([]T, len(v))
 	copy(out, v)
 	sort.SliceStable(out, func(i, j int) bool { return first(out[i], out[j]) })
-	return out
-}
-
-// MapAsync, FilterAsync and FilterMapAsync back the three walks when the
-// function they were handed is an `async func`. A walk applies its function to
-// every element independently, so all of the calls are known before the first
-// one runs: each is spawned at once and the whole walk then costs the slowest
-// element rather than the sum of all of them.
-//
-// The vector each answers with is exactly the one its sequential twin gives —
-// same elements, same order. The walk awaits every task before it returns, so no
-// handle is ever produced and no task can outlive the call.
-func MapAsync[T any, K any](v []T, f func(T) K) []K {
-	hs := make([]*Async[K], len(v))
-	for i, x := range v {
-		hs[i] = Spawn(func() K { return f(x) })
-	}
-	return AwaitAll(hs)
-}
-
-func FilterAsync[T any](v []T, keep func(T) bool) []T {
-	hs := make([]*Async[bool], len(v))
-	for i, x := range v {
-		hs[i] = Spawn(func() bool { return keep(x) })
-	}
-	out := []T{}
-	for i, ok := range AwaitAll(hs) {
-		if ok {
-			out = append(out, v[i])
-		}
-	}
-	return out
-}
-
-func FilterMapAsync[T any, K any, E any](v []T, f func(T) Result[K, E]) []K {
-	hs := make([]*Async[Result[K, E]], len(v))
-	for i, x := range v {
-		hs[i] = Spawn(func() Result[K, E] { return f(x) })
-	}
-	out := []K{}
-	for _, r := range AwaitAll(hs) {
-		if r.IsOk() {
-			out = append(out, r.Ok())
-		}
-	}
 	return out
 }
 
@@ -2673,7 +2629,7 @@ func TermArgs() []string {
 // ---------------------------------------------------------------------------
 
 /// Source of `hive/task.go`: the task module (`hive.task`) — scheduling
-/// controls over the virtual threads an `async func` runs on.
+/// controls over the virtual threads a call can be put on.
 pub fn task_go() -> String {
   "package hive
 
@@ -2692,8 +2648,8 @@ func Sleep(ms int) {
 	time.Sleep(time.Duration(ms) * time.Millisecond)
 }
 
-// TimeoutError is what an `await ... with timeout <ms>` yields when the wait
-// runs out. Backs hive.task.TimeoutError.
+// TimeoutError is what a `with timeout <ms>` clause yields when the wait runs
+// out. Backs hive.task.TimeoutError.
 type TimeoutError struct {
 	Waited  int
 	Message string
@@ -2713,9 +2669,7 @@ func timedOut[T any](ms int) Result[T, TimeoutError] {
 //
 // The task is NOT cancelled when the wait expires: a goroutine cannot be stopped
 // from the outside, so the work carries on and only its result is abandoned. The
-// timeout is a failure of *waiting*, not of the work — which is also why the
-// same handle can be awaited again afterwards, with a longer patience if you
-// like.
+// timeout is a failure of *waiting*, not of the work.
 func AwaitTimeout[T any](a *Async[T], ms int) Result[T, TimeoutError] {
 	if ms <= 0 {
 		return Ok[T, TimeoutError](a.Await())
@@ -2732,8 +2686,8 @@ func AwaitTimeout[T any](a *Async[T], ms int) Result[T, TimeoutError] {
 	}
 }
 
-// AwaitAllTimeout is the same for a vector of handles: one deadline across the
-// whole barrier, not ms per task, so `await [a, b, c] with timeout 500` means
+// AwaitAllTimeout is the same for a whole await-all: one deadline across the
+// barrier, not ms per task, so `await [a(x), b(y), c(z)] with timeout 500` means
 // \"all three within half a second\".
 func AwaitAllTimeout[T any](hs []*Async[T], ms int) Result[[]T, TimeoutError] {
 	if ms <= 0 {
@@ -3953,8 +3907,9 @@ import (
 // hive.syslink — addressable services, in this process or on another machine
 // ---------------------------------------------------------------------------
 // A service is long-lived, has an identity you can pass around, and owns
-// private state that only it can touch. It is deliberately not an `async T`: it
-// outlives the scope that spawned it and is never awaited.
+// private state that only it can touch: its address is an ordinary value that
+// outlives the scope that spawned it, can be stored, and can travel inside a
+// message.
 //
 // Every choice here exists to make a send behave the same whether the recipient
 // is a mailbox in this process or a service on another machine: the message is
@@ -4664,17 +4619,18 @@ func failCallsToNode(node string, reason string) {
 	}
 }
 
-// syslinkDefaultWait is how long an awaited request waits when the await site
+// syslinkDefaultWait is how long a send waits for its answer when the call site
 // gives no `with timeout` of its own.
 const syslinkDefaultWait = 5000
 
-// SyslinkPending is a request in flight — what `hive.syslink.send` evaluates to
-// when its value is kept rather than discarded.
+// SyslinkPending is a request in flight: the send has gone out and the answer has
+// not arrived yet.
 //
 // It is deliberately not an *Async: no goroutine is parked waiting for the
-// answer. The reply arrives on the connection's own reader goroutine, so a held
-// request costs a channel and nothing else, and the waiting happens at the
-// `await` site where the patience is specified.
+// answer. The reply arrives on the connection's own reader goroutine, so a
+// request costs a channel and nothing else, and the waiting happens where the
+// patience is specified — which is why an await-all over sends spawns nothing at
+// all.
 type SyslinkPending[M any] struct {
 	ref    uint64
 	reply  chan answer
@@ -4686,8 +4642,8 @@ type SyslinkPending[M any] struct {
 }
 
 // SyslinkSendAwaitable starts a request and returns immediately. The message has
-// already been copied by the caller, exactly as for a discarded send: whether an
-// answer is wanted changes nothing about how the message travels.
+// already been copied by the caller, exactly as for a fire-and-forget send:
+// whether an answer is wanted changes nothing about how the message travels.
 func SyslinkSendAwaitable[M any](
 	addr Address,
 	msg M,

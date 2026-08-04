@@ -29,16 +29,16 @@ pub type Decl {
     return_type: TypeExpr,
     body: List(Stmt),
   )
-  /// A `func`: a pure function (no side effects allowed in its body). When
-  /// `async` is set the func was declared `async func` and runs on its own
-  /// virtual thread (goroutine): calling it bare is fire-and-forget, calling
-  /// it with `await` blocks for its value.
+  /// A `func`: a pure function (no side effects allowed in its body).
+  ///
+  /// Nothing about a declaration says how it runs: every call blocks its
+  /// caller, and a call site that does not want to wait says so with `async`
+  /// (see `SAsync`).
   FuncDecl(
     name: String,
     params: List(Field),
     return_type: TypeExpr,
     body: List(Stmt),
-    async: Bool,
   )
   /// A `query`: a pure function whose body is inline SQL.
   ///
@@ -148,6 +148,13 @@ pub type Stmt {
   SBreak
   /// `continue` — skip to the next iteration of the innermost enclosing loop.
   SContinue
+  /// `async <call>` — run the call on its own virtual thread and carry on
+  /// without waiting for it. Fire-and-forget is the whole of what it is: there
+  /// is no handle, so nothing is left behind to read a result from, and the
+  /// call cannot appear where a value is wanted. Every *other* call blocks its
+  /// caller, which is why this is a statement of its own rather than a
+  /// modifier on a declaration.
+  SAsync(call: Expr)
   /// A bare expression used as a statement (e.g. a call).
   SExpr(expr: Expr)
 }
@@ -276,15 +283,23 @@ pub type Expr {
   /// `hive.json.parse(text) with Type` — gives a decode target type to an
   /// expression. Only valid on `hive.json.parse` calls.
   EWith(value: Expr, typ: TypeExpr)
-  /// `await <async call>` — blocks the current virtual thread until the async
-  /// function returns its value (a bare call, without `await`, is
-  /// fire-and-forget).
-  /// `await <expr>`, with the optional `with timeout <ms>` clause that bounds
-  /// how long the wait may take. The clause changes the *type* of the await:
-  /// without it an `async T` yields `T`, with it a `Result<T,
-  /// hive.task.TimeoutError>` — running out of patience is a value, not a
-  /// crash. A timed-out task is not cancelled; only the waiting stops.
-  EAwait(value: Expr, timeout: Option(Expr))
+  /// `await [f(a), g(b), h(c)]` — the *await-all*: every call in the list runs
+  /// on its own virtual thread and the whole list is one barrier, resolving in
+  /// order to a statically-sized vector of their results (`T[3]` here). It is
+  /// the only form of `await` there is: one call on its own needs no keyword,
+  /// because calling it already blocks for its value.
+  ///
+  /// `timeout` is the optional `with timeout <ms>` clause. It is one deadline
+  /// across the whole barrier, and it changes what the await yields: without it
+  /// the vector, with it a `Result<T[], hive.task.TimeoutError>` — running out
+  /// of patience is a value, not a crash. It abandons the waiting, not the
+  /// work.
+  EAwait(calls: List(Expr), timeout: Option(Expr))
+  /// `<call> with timeout <ms>` — a single blocking call, bounded. It yields
+  /// `Result<T, hive.task.TimeoutError>` where the plain call yields `T`; on a
+  /// `hive.syslink` send the bound folds into that module's own error instead
+  /// of wrapping a second `Result` around the first.
+  ETimed(call: Expr, ms: Expr)
 }
 
 /// Which kind of table a `using` expression reads. Naming the format in the
@@ -366,8 +381,9 @@ pub fn repeatable(e: Expr) -> Bool {
     EBinary(_, left, right) -> repeatable(left) && repeatable(right)
     EIs(subject, _) -> repeatable(subject)
     // Each of these does work: a call runs a body, `using` reads a file or a
-    // database, `with` decodes, and a bare async call under `await` spawns.
-    ECall(_, _) | EUsing(_, _) | EWith(_, _) | EAwait(_, _) -> False
+    // database, `with` decodes, and an `await` spawns every call it holds.
+    ECall(_, _) | EUsing(_, _) | EWith(_, _) | EAwait(_, _) | ETimed(_, _) ->
+      False
   }
 }
 

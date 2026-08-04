@@ -1219,15 +1219,15 @@ compilação: nenhum dos dois é um mutex.</p>
 <div lang="en">
 <p>If a func or proc receives a mutable value, the callee sees an immutable
 <code>T</code> — and Hive makes that view honest by <b>copying the value on the way in</b>.</p>
-<figure class="code"><pre><code class="hive">async func report(frames: Int[dyn]): Str {
+<figure class="code"><pre><code class="hive">func report(frames: Int[dyn]): Str {
 	return "counted {len(frames)} supers"
 }
 
 proc main(): void {
 	mut Int[dyn] frames = [10, 9, 11]
-	pending := report(frames)      // frames is copied in, here and now
-	append(frames, 12)             // the callee never sees this
-	echo await pending
+	counted := await [report(frames)]  // frames is copied in, here and now
+	append(frames, 12)                 // the callee never sees this
+	echo counted[0]
 }</code></pre></figure>
 <div class="out"><span class="lbl">prints</span><pre>counted 3 supers</pre></div>
 <p>The callee's <code>Int[dyn]</code> would not really be immutable if the caller could keep
@@ -1240,15 +1240,15 @@ it must — which is the subject of Part V.</p></div>
 <div lang="pt">
 <p>Se uma func ou proc recebe um valor mutável, quem foi chamado vê um <code>T</code>
 imutável — e o Hive torna essa visão honesta <b>copiando o valor na entrada</b>.</p>
-<figure class="code"><pre><code class="hive">async func report(frames: Int[dyn]): Str {
+<figure class="code"><pre><code class="hive">func report(frames: Int[dyn]): Str {
 	return "counted {len(frames)} supers"
 }
 
 proc main(): void {
 	mut Int[dyn] frames = [10, 9, 11]
-	pending := report(frames)      // frames é copiado na entrada, aqui e agora
-	append(frames, 12)             // quem foi chamado nunca vê isto
-	echo await pending
+	counted := await [report(frames)]  // frames é copiado na entrada, aqui e agora
+	append(frames, 12)                 // quem foi chamado nunca vê isto
+	echo counted[0]
 }</code></pre></figure>
 <div class="out"><span class="lbl">imprime</span><pre>counted 3 supers</pre></div>
 <p>O <code>Int[dyn]</code> de quem foi chamado não seria de fato imutável se quem chamou pudesse
@@ -2834,14 +2834,12 @@ than a puzzling one from further down: <code>filter</code> wants a <code>Bool</c
 <code>filterMap</code> a <code>Result</code>, and <code>map</code> wants
 <em>something</em> — a <code>void</code> function collects nothing, so that too is a
 <code>for each</code> loop.</p>
-<p>Hand a walk an <code>async func</code> (step 86) and it runs <b>every element at once</b>, waiting
-for them all before it answers. No <code>await</code> is written: a walk applies its function to each
-element independently, so all of its calls are known before the first one runs — which is what lets
-them go together, and what lets the answer come back complete. Same type, same elements, same order;
-only the wall-clock changes.</p>
-<figure class="code"><pre><code class="hive">async func fetch(url: Str): Str { ... }
-
-bodies := map(urls, fetch)     // all at once — costs the slowest, not the sum</code></pre></figure>
+<p>A walk is <b>sequential</b>, always: one call per element, in order, on the calling thread.
+Nothing in <code>map(urls, fetch)</code> says how <code>fetch</code> runs, and a builtin is the last
+place a program should hide a decision like that. To run a batch of calls together, write the
+await-all (step 90) — which is also where the count of them lives.</p>
+<figure class="code"><pre><code class="hive">bodies := map(urls, fetch)                          // one at a time, in order
+Str[3] some = await [fetch(a), fetch(b), fetch(c)]   // all three at once</code></pre></figure>
 </div>
 <div lang="pt">
 <p>Três builtins recebem um vetor e uma função sobre os elementos dele, e cada um devolve um vetor
@@ -2882,14 +2880,12 @@ escreva um laço <code>for each</code>, que diz.</p>
 um erro confuso mais abaixo: o <code>filter</code> quer um <code>Bool</code>, o <code>filterMap</code> um
 <code>Result</code>, e o <code>map</code> quer <em>alguma coisa</em> — uma função <code>void</code> não
 coleta nada, então isso também é um laço <code>for each</code>.</p>
-<p>Dê a uma caminhada uma <code>async func</code> (passo 86) e ela roda <b>todos os elementos de uma
-vez</b>, esperando por todos antes de responder. Nenhum <code>await</code> é escrito: uma caminhada
-aplica a função a cada elemento de forma independente, então todas as chamadas são conhecidas antes de
-a primeira rodar — é isso que permite que sigam juntas, e que a resposta volte completa. Mesmo tipo,
-mesmos elementos, mesma ordem; só o tempo de relógio muda.</p>
-<figure class="code"><pre><code class="hive">async func fetch(url: Str): Str { ... }
-
-bodies := map(urls, fetch)     // todas de uma vez — custa a mais lenta, não a soma</code></pre></figure>
+<p>Uma caminhada é <b>sequencial</b>, sempre: uma chamada por elemento, em ordem, na thread que
+chamou. Nada em <code>map(urls, fetch)</code> diz como o <code>fetch</code> roda, e um builtin é o
+último lugar onde um programa deveria esconder uma decisão dessas. Para rodar um lote de chamadas
+junto, escreva o await-all (passo 90) — que é também onde mora a contagem delas.</p>
+<figure class="code"><pre><code class="hive">bodies := map(urls, fetch)                          // uma por vez, em ordem
+Str[3] some = await [fetch(a), fetch(b), fetch(c)]   // as três de uma vez</code></pre></figure>
 </div>
 </section>
 
@@ -2923,10 +2919,9 @@ echo join(sort(words, longerFirst), "|")     // apple|pear|fig</code></pre></fig
 So the answer depends on the input alone, even when your ordering only looks at one field and says
 nothing about two rows that share it.</p>
 <p>As with a walk, the function is a <code>func</code>, never a <code>proc</code> — a sort says nothing
-about how many comparisons it makes or in what order, so there is nowhere to hang a side effect. It may
-not be an <code>async func</code> either: a walk knows all of its calls up front, but a sort chooses each
-comparison from how the last one answered, so there is only ever one to make and nothing for concurrency
-to overlap.</p>
+about how many comparisons it makes or in what order, so there is nowhere to hang a side effect. Nor is
+there anything for concurrency to overlap: a sort chooses each comparison from how the last one answered,
+so there is only ever one to make.</p>
 </div>
 <div lang="pt">
 <p>Com um argumento, ordena os elementos pela ordem do próprio tipo deles. Como uma caminhada, devolve um
@@ -2957,9 +2952,8 @@ chegaram. Então a resposta depende só da entrada, mesmo quando a sua ordem olh
 nada sobre duas linhas que o compartilham.</p>
 <p>Como numa caminhada, a função é uma <code>func</code>, nunca um <code>proc</code> — uma ordenação não
 diz nada sobre quantas comparações faz nem em que ordem, então não há onde pendurar um efeito colateral.
-Também não pode ser uma <code>async func</code>: uma caminhada conhece todas as suas chamadas de antemão,
-mas uma ordenação escolhe cada comparação a partir de como a anterior respondeu, então só existe uma para
-fazer por vez e nada que a concorrência possa sobrepor.</p>
+Nem há o que a concorrência possa sobrepor: uma ordenação escolhe cada comparação a partir de como a
+anterior respondeu, então só existe uma para fazer por vez.</p>
 </div>
 </section>
 
@@ -4012,251 +4006,264 @@ tem um teto: passar do teto é erro de compilação, e não um build que nunca t
 <div class="part-head" id="p11">
   <div class="lbl"><span class="mark"></span><span lang="en">Part XI</span><span lang="pt">Parte XI</span></div>
   <h2><span lang="en">Concurrency</span><span lang="pt">Concorrência</span></h2>
-  <p class="sub"><span lang="en">One keyword on the declaration, and then the call site decides
-  everything.</span><span lang="pt">Uma palavra na declaração, e daí o ponto de chamada decide
+  <p class="sub"><span lang="en">Nothing on the declaration, and then the call site decides
+  everything.</span><span lang="pt">Nada na declaração, e daí o ponto de chamada decide
   todo o resto.</span></p>
 </div>
 
 <section class="s" id="s86">
-<h3><span class="n">86</span><span lang="en">An <code>async func</code></span><span lang="pt">Uma <code>async func</code></span></h3>
+<h3><span class="n">86</span><span lang="en">Every call blocks</span><span lang="pt">Toda chamada bloqueia</span></h3>
 <div lang="en">
-<p>Put <code>async</code> in front of a func and every call to it runs on its own <b>virtual
-thread</b> — a thread the runtime multiplexes onto real ones, cheap enough to have thousands
-of.</p>
-<figure class="code"><pre><code class="hive">async func slowShout(text: Str): Str {
+<p>Start from the rule, because everything in this part follows from it: <b>a call blocks the
+thread that made it</b>, and waits for its value. Always.</p>
+<figure class="code"><pre><code class="hive">func slowShout(text: Str): Str {
 	hive.task.sleep(1000)
 	return text + "!!!"
 }</code></pre></figure>
-<p>That is the entire declaration side of Hive's concurrency. There is no <code>Future</code>,
-no <code>Promise</code>, no executor to configure, and nothing dynamically typed. What varies is
-how you <em>call</em> it — and there are exactly five shapes, which the next steps take one at a
-time.</p>
+<p>Notice what the declaration says about concurrency: nothing at all. It is an ordinary
+<code>func</code>. There is no <code>async func</code>, no <code>Future</code>, no
+<code>Promise</code>, no executor to configure, and nothing dynamically typed — because the
+declaration is the wrong place to decide any of it. Whoever calls a function is the one who knows
+whether they need its answer.</p>
+<p>So the whole of Hive's concurrency lives at the <em>call site</em>, in three shapes the next
+steps take one at a time.</p>
 </div>
 <div lang="pt">
-<p>Coloque <code>async</code> na frente de uma func e cada chamada a ela roda na própria
-<b>thread virtual</b> — uma thread que o runtime multiplexa sobre threads reais, barata o
-suficiente para você ter milhares.</p>
-<figure class="code"><pre><code class="hive">async func slowShout(text: Str): Str {
+<p>Comece pela regra, porque tudo nesta parte decorre dela: <b>uma chamada bloqueia a thread que
+a fez</b>, e espera pelo valor dela. Sempre.</p>
+<figure class="code"><pre><code class="hive">func slowShout(text: Str): Str {
 	hive.task.sleep(1000)
 	return text + "!!!"
 }</code></pre></figure>
-<p>Esse é o lado da declaração inteiro na concorrência do Hive. Não há <code>Future</code>, não
-há <code>Promise</code>, não há executor para configurar, e nada de tipagem dinâmica. O que varia
-é como você <em>chama</em> — e existem exatamente cinco formas, que os próximos passos veem uma
-por uma.</p>
+<p>Repare no que a declaração diz sobre concorrência: absolutamente nada. É uma <code>func</code>
+comum. Não existe <code>async func</code>, não há <code>Future</code>, não há
+<code>Promise</code>, não há executor para configurar, e nada de tipagem dinâmica — porque a
+declaração é o lugar errado para decidir qualquer disso. Quem chama uma função é quem sabe se
+precisa da resposta dela.</p>
+<p>Então toda a concorrência do Hive vive no <em>ponto de chamada</em>, em três formas que os
+próximos passos veem uma por uma.</p>
 </div>
 </section>
 
 <section class="s" id="s87">
-<h3><span class="n">87</span><span lang="en">As a statement: fire and forget</span><span lang="pt">Como comando: dispare e esqueça</span></h3>
+<h3><span class="n">87</span><span lang="en">Waiting for one: just call it</span><span lang="pt">Esperando por uma: só chame</span></h3>
 <div lang="en">
-<p>Call it and ignore the result. The work starts; the caller carries straight on.</p>
-<figure class="code"><pre><code class="hive">proc main(): void {
-	slowShout("logged in the background")
-	echo "main did not wait"
-}</code></pre></figure>
-<div class="out"><span class="lbl">prints</span><pre>main did not wait</pre></div>
-<p>The returned value is discarded, and nothing anywhere is waiting for it. This is how you
-start a server that blocks forever without blocking the program that started it — you will see
-exactly that in Part XIV.</p>
+<p>The first shape is the one you already know how to write.</p>
+<figure class="code"><pre><code class="hive">echo slowShout("waited for")</code></pre></figure>
+<div class="out"><span class="lbl">prints (a second later)</span><pre>waited for!!!</pre></div>
+<p>Its type is the func's return type — a <code>Str</code> here — with nothing wrapped around it.
+And it costs nothing to arrange: no virtual thread is created, no channel is allocated, nothing is
+scheduled. It is a function call.</p>
+<p>That is worth stating because in a language with an <code>async</code> keyword you might expect
+the plain form to be the special one. Here it is the other way round: waiting is the default, and
+you pay only for <em>not</em> waiting.</p>
 </div>
 <div lang="pt">
-<p>Chame e ignore o resultado. O trabalho começa; quem chamou segue em frente.</p>
-<figure class="code"><pre><code class="hive">proc main(): void {
-	slowShout("logged in the background")
-	echo "main did not wait"
-}</code></pre></figure>
-<div class="out"><span class="lbl">imprime</span><pre>main did not wait</pre></div>
-<p>O valor de retorno é descartado, e nada em lugar nenhum está esperando por ele. É assim que
-você inicia um servidor que bloqueia para sempre sem bloquear o programa que o iniciou — você vê
-exatamente isso na Parte XIV.</p>
+<p>A primeira forma é a que você já sabe escrever.</p>
+<figure class="code"><pre><code class="hive">echo slowShout("waited for")</code></pre></figure>
+<div class="out"><span class="lbl">imprime (um segundo depois)</span><pre>waited for!!!</pre></div>
+<p>O tipo dela é o tipo de retorno da func — um <code>Str</code>, aqui — sem nada embrulhado em
+volta. E não custa nada para montar: nenhuma thread virtual é criada, nenhum canal é alocado, nada
+é agendado. É uma chamada de função.</p>
+<p>Vale dizer isso porque, numa linguagem com uma palavra <code>async</code>, você poderia esperar
+que a forma pura fosse a especial. Aqui é o contrário: esperar é o padrão, e você paga apenas por
+<em>não</em> esperar.</p>
 </div>
 </section>
 
 <section class="s" id="s88">
-<h3><span class="n">88</span><span lang="en"><code>await</code>, inline</span><span lang="pt"><code>await</code>, na hora</span></h3>
+<h3><span class="n">88</span><span lang="en"><code>async</code>: fire and forget</span><span lang="pt"><code>async</code>: dispare e esqueça</span></h3>
 <div lang="en">
-<p>Put <code>await</code> in front of the call and it becomes spawn-and-wait: the value comes
-back, and the caller blocks until it does.</p>
-<figure class="code"><pre><code class="hive">echo await slowShout("await")</code></pre></figure>
-<div class="out"><span class="lbl">prints (a second later)</span><pre>await!!!</pre></div>
-<p>Read that as an ordinary call that happens to have run somewhere else. Its type is the func's
-return type — a <code>Str</code> here — with nothing wrapped around it.</p>
+<p>Put <code>async</code> in front of a call and it runs on its own <b>virtual thread</b> — a
+thread the runtime multiplexes onto real ones, cheap enough to have thousands of — while the
+caller carries straight on.</p>
+<figure class="code"><pre><code class="hive">proc main(): void {
+	async slowShout("logged in the background")
+	echo "main did not wait"
+}</code></pre></figure>
+<div class="out"><span class="lbl">prints</span><pre>main did not wait</pre></div>
+<p>Fire-and-forget is the whole of what it is. Nothing comes back: <code>async</code> is a
+<b>statement</b>, not an expression, so there is nowhere for it to appear that a value is wanted.
+<code>h := async f(x)</code> is a compile error, and the message says so.</p>
+<p>It works on any call — a <code>func</code>, a <code>proc</code>, a <code>query</code>, the
+standard library, a service (Part XV). This is how you start a server that blocks forever without
+blocking the program that started it, which you will see in Part XIV.</p>
+<div class="no"><span class="lbl">does not compile</span><pre><code class="hive">async len(v)</code></pre>
+<p class="why">The one group of calls <code>async</code> refuses: the global builtins exist for the
+value they hand back, so firing one off would leave nothing of it. <code>async</code> is for work
+that takes time.</p></div>
 </div>
 <div lang="pt">
-<p>Coloque <code>await</code> na frente da chamada e ela passa a ser dispare-e-espere: o valor
-volta, e quem chamou bloqueia até ele voltar.</p>
-<figure class="code"><pre><code class="hive">echo await slowShout("await")</code></pre></figure>
-<div class="out"><span class="lbl">imprime (um segundo depois)</span><pre>await!!!</pre></div>
-<p>Leia isso como uma chamada comum que por acaso rodou em outro lugar. O tipo dela é o tipo de
-retorno da func — um <code>Str</code>, aqui — sem nada embrulhado em volta.</p>
+<p>Coloque <code>async</code> na frente de uma chamada e ela roda na própria <b>thread
+virtual</b> — uma thread que o runtime multiplexa sobre threads reais, barata o suficiente para
+você ter milhares — enquanto quem chamou segue em frente.</p>
+<figure class="code"><pre><code class="hive">proc main(): void {
+	async slowShout("logged in the background")
+	echo "main did not wait"
+}</code></pre></figure>
+<div class="out"><span class="lbl">imprime</span><pre>main did not wait</pre></div>
+<p>Dispare-e-esqueça é tudo o que ela é. Nada volta: <code>async</code> é um <b>comando</b>, não
+uma expressão, então não há onde ela aparecer que se queira um valor. <code>h := async f(x)</code>
+é erro de compilação, e a mensagem diz isso.</p>
+<p>Funciona em qualquer chamada — uma <code>func</code>, um <code>proc</code>, uma
+<code>query</code>, a biblioteca padrão, um serviço (Parte XV). É assim que você inicia um servidor
+que bloqueia para sempre sem bloquear o programa que o iniciou, o que você vê na Parte XIV.</p>
+<div class="no"><span class="lbl">não compila</span><pre><code class="hive">async len(v)</code></pre>
+<p class="why">O único grupo de chamadas que o <code>async</code> recusa: os builtins globais
+existem pelo valor que devolvem, então dispará-los não deixaria nada deles. <code>async</code> é
+para trabalho que leva tempo.</p></div>
 </div>
 </section>
 
 <section class="s" id="s89">
-<h3><span class="n">89</span><span lang="en">Keeping a handle</span><span lang="pt">Guardando um handle</span></h3>
+<h3><span class="n">89</span><span lang="en">There is no handle</span><span lang="pt">Não existe handle</span></h3>
 <div lang="en">
-<p>Bind the bare call to a name and you keep the running task as a <b>handle</b>. The work is
-already going; <code>await</code> collects it whenever you are ready.</p>
-<figure class="code"><pre><code class="hive">proc main(): void {
-	job := slowShout("started early")
-	echo "...doing other work while it runs..."
-	echo await job
-}</code></pre></figure>
-<div class="out"><span class="lbl">prints</span><pre>...doing other work while it runs...
-started early!!!</pre></div>
-<p>The handle's type is <code>async Str</code>, and here is the unusual part: <b>you can never
-write that type down</b>. It is inferred, and the only two things you may do with a handle are
-bind it and <code>await</code> it. You cannot annotate it, return it, pass it to anything, store
-it in a vector, or use it as a plain <code>Str</code>.</p>
-<p>That restriction is doing real work. Because a handle cannot leave the scope that made it, a
-task can never outlive its spawner, and there is no way to end up holding a reference to work
-whose context is gone.</p>
-<p>The one vector of handles you <em>can</em> build is the one step 90 is about — <code>await [f(a),
-f(b)]</code>, several at once. It is held to the same rule: bind it or await it, and nothing else. A
-vector that escaped would carry its tasks out just as surely as a lone handle would.</p>
+<p>This is the step to read twice, because it is what the model buys you. Since
+<code>async</code> keeps nothing back, <b>there is no handle</b>: no <code>Future</code> to store,
+no task object to pass around, no half-finished value to accidentally hold on to.</p>
+<p>Which means a task can never outlive the scope that started it in a way anything can observe,
+there is no way to end up with a reference to work whose context is gone, and — the part worth
+noticing — <b>every expression in Hive has a type you could write down</b>. A language with
+handles has to invent one that you may hold but never annotate, never return and never pass. Hive
+has nothing of the kind.</p>
+<p>The cost is honest and it is stated in the next two steps: if you want a result, you wait for
+it, and if you want several at once, you say so in one place.</p>
 </div>
 <div lang="pt">
-<p>Vincule a chamada nua a um nome e você guarda a tarefa em execução como um <b>handle</b>. O
-trabalho já está rolando; o <code>await</code> recolhe quando você quiser.</p>
-<figure class="code"><pre><code class="hive">proc main(): void {
-	job := slowShout("started early")
-	echo "...doing other work while it runs..."
-	echo await job
-}</code></pre></figure>
-<div class="out"><span class="lbl">imprime</span><pre>...doing other work while it runs...
-started early!!!</pre></div>
-<p>O tipo do handle é <code>async Str</code>, e aqui vem a parte incomum: <b>você nunca pode
-escrever esse tipo</b>. Ele é inferido, e as únicas duas coisas que você pode fazer com um handle
-são vinculá-lo e dar <code>await</code> nele. Você não pode anotá-lo, retorná-lo, passá-lo para
-nada, guardá-lo num vetor, nem usá-lo como um <code>Str</code> comum.</p>
-<p>Essa restrição trabalha de verdade. Como um handle não pode sair do escopo que o criou, uma
-tarefa nunca sobrevive a quem a disparou, e não há como acabar segurando uma referência a um
-trabalho cujo contexto já foi.</p>
-<p>O único vetor de handles que você <em>pode</em> montar é o do passo 90 — <code>await [f(a),
-f(b)]</code>, vários de uma vez. Ele segue a mesma regra: vincule ou dê await, e nada além disso. Um
-vetor que escapasse levaria as tarefas para fora tão certamente quanto um handle sozinho.</p>
+<p>Este é o passo para ler duas vezes, porque é o que o modelo te dá. Como o <code>async</code>
+não guarda nada, <b>não existe handle</b>: nenhum <code>Future</code> para guardar, nenhum objeto
+de tarefa para passar adiante, nenhum valor meio-pronto para você segurar sem querer.</p>
+<p>O que significa que uma tarefa nunca sobrevive ao escopo que a iniciou de um jeito observável,
+não há como acabar com uma referência a um trabalho cujo contexto já foi, e — a parte que vale
+notar — <b>toda expressão em Hive tem um tipo que você poderia escrever</b>. Uma linguagem com
+handles precisa inventar um que você pode segurar mas nunca anotar, nunca retornar e nunca passar.
+Hive não tem nada do gênero.</p>
+<p>O custo é honesto e está nos dois próximos passos: se você quer um resultado, espera por ele; e
+se quer vários de uma vez, diz isso num único lugar.</p>
 </div>
 </section>
 
-
 <section class="s" id="s90">
-<h3><span class="n">90</span><span lang="en">Awaiting many of one type</span><span lang="pt">Esperando vários de um tipo</span></h3>
+<h3><span class="n">90</span><span lang="en">Many at once: <code>await [ ... ]</code></span><span lang="pt">Vários de uma vez: <code>await [ ... ]</code></span></h3>
 <div lang="en">
-<p><code>await</code> a <b>vector of handles</b> and you get one barrier: all of them run
-concurrently, and the result is a statically-sized vector of their values, in order.</p>
+<p>The third shape, and the only <code>await</code> there is. List the calls and every one of them
+starts on its own thread; the whole list is <b>one barrier</b>, resolving in order to a
+statically-sized vector of their values.</p>
 <figure class="code"><pre><code class="hive">Str[3] shouts = await [slowShout("a"), slowShout("b"), slowShout("c")]
 echo shouts[0] + " " + shouts[1] + " " + shouts[2]</code></pre></figure>
-<p>Three tasks, one second each, about one second in total. And note the type:
-<code>Str[3]</code> — statically sized, so <code>shouts[2]</code> needs no guard. Not a dynamic
-vector, and certainly nothing untyped.</p>
-<p>The handles can equally be held first and awaited later as a group:</p>
-<figure class="code"><pre><code class="hive">greetings := [slowShout("hello"), slowShout("world")]
-echo "...both greetings are already running..."
-Str[2] ready = await greetings</code></pre></figure>
+<p>Three calls, one second each, about one second in total. And note the type:
+<code>Str[3]</code> — the length is how many calls you wrote, so <code>shouts[2]</code> needs no
+guard. Not a dynamic vector, and certainly nothing untyped.</p>
+<p>Every entry has to be a <b>call</b> — a value already in hand has nothing to wait for — and
+they all have to answer with the same type, since one barrier resolves to one vector. A list of
+one is legal, and still means "on its own thread, then wait".</p>
+<p>Read the keyword as "await all". There is deliberately no <code>await</code> for a single
+call: calling it already waits (step 87), so a keyword there would say nothing.</p>
 </div>
 <div lang="pt">
-<p>Dê <code>await</code> num <b>vetor de handles</b> e você tem uma barreira só: todos rodam
-concorrentemente, e o resultado é um vetor de tamanho estático com os valores deles, em ordem.</p>
+<p>A terceira forma, e o único <code>await</code> que existe. Liste as chamadas e cada uma delas
+começa na própria thread; a lista inteira é <b>uma barreira só</b>, que resolve em ordem para um
+vetor de tamanho estático com os valores delas.</p>
 <figure class="code"><pre><code class="hive">Str[3] shouts = await [slowShout("a"), slowShout("b"), slowShout("c")]
 echo shouts[0] + " " + shouts[1] + " " + shouts[2]</code></pre></figure>
-<p>Três tarefas, um segundo cada, cerca de um segundo no total. E repare no tipo:
-<code>Str[3]</code> — tamanho estático, então <code>shouts[2]</code> não precisa de guarda. Não é
-um vetor dinâmico, e definitivamente não é nada sem tipo.</p>
-<p>Os handles também podem ser guardados primeiro e esperados depois, em grupo:</p>
-<figure class="code"><pre><code class="hive">greetings := [slowShout("hello"), slowShout("world")]
-echo "...both greetings are already running..."
-Str[2] ready = await greetings</code></pre></figure>
+<p>Três chamadas, um segundo cada, cerca de um segundo no total. E repare no tipo:
+<code>Str[3]</code> — o tamanho é quantas chamadas você escreveu, então <code>shouts[2]</code> não
+precisa de guarda. Não é um vetor dinâmico, e definitivamente não é nada sem tipo.</p>
+<p>Cada entrada tem de ser uma <b>chamada</b> — um valor que você já tem não tem o que esperar — e
+todas têm de responder com o mesmo tipo, já que uma barreira resolve para um vetor. Uma lista de
+um é válida, e ainda quer dizer "na própria thread, depois espere".</p>
+<p>Leia a palavra como "espere todos". Deliberadamente não existe <code>await</code> para uma
+chamada só: chamá-la já espera (passo 87), então uma palavra ali não diria nada.</p>
 </div>
 </section>
 
 <section class="s" id="s91">
-<h3><span class="n">91</span><span lang="en">Awaiting different types</span><span lang="pt">Esperando tipos diferentes</span></h3>
+<h3><span class="n">91</span><span lang="en">Different types, one at a time</span><span lang="pt">Tipos diferentes, uma por vez</span></h3>
 <div lang="en">
-<p>A vector needs one element type, so tasks of <em>different</em> types are joined a different
-way: spawn each one first, then await each one.</p>
-<figure class="code"><pre><code class="hive">shout := slowShout("mixed")      // both are already running
-size  := lengthOf("mixed")
-
-Str message = await shout
-Int count   = await size
+<p>A vector needs one element type, so work of <em>different</em> types is not an await-all. You
+wait for each call in turn:</p>
+<figure class="code"><pre><code class="hive">Str message = slowShout("mixed")
+Int count   = lengthOf("mixed")
 echo message + " has base length " + hive.conv.its(count)</code></pre></figure>
-<p>Because they all started before the first <code>await</code>, the waits overlap and the total
-is <b>the slowest, not the sum</b>. Fully typed, and no tuple type needed to hold them.</p>
-<p>The order you await in does not change the total, which is worth internalising: the waiting
-is not the work.</p>
+<p>And that costs <b>the sum, not the slowest</b> — two calls, one after the other. Which is
+exactly what the code says it does, and that is the point: there is no arrangement of these two
+lines that overlaps them while still handing you both values, and none that pretends to.</p>
+<p>When it matters, give the two jobs a common answer to give — a shared union, a
+<code>Result</code>, a struct — and they become one await-all.</p>
 </div>
 <div lang="pt">
-<p>Um vetor precisa de um tipo de elemento, então tarefas de tipos <em>diferentes</em> se juntam
-de outra forma: dispare cada uma primeiro, depois espere cada uma.</p>
-<figure class="code"><pre><code class="hive">shout := slowShout("mixed")      // as duas já estão rodando
-size  := lengthOf("mixed")
-
-Str message = await shout
-Int count   = await size
+<p>Um vetor precisa de um tipo de elemento, então trabalho de tipos <em>diferentes</em> não é um
+await-all. Você espera por cada chamada na sua vez:</p>
+<figure class="code"><pre><code class="hive">Str message = slowShout("mixed")
+Int count   = lengthOf("mixed")
 echo message + " has base length " + hive.conv.its(count)</code></pre></figure>
-<p>Como todas começaram antes do primeiro <code>await</code>, as esperas se sobrepõem e o total é
-<b>a mais lenta, não a soma</b>. Tudo tipado, e sem precisar de tupla para segurá-las.</p>
-<p>A ordem em que você espera não muda o total, e vale internalizar isso: a espera não é o
-trabalho.</p>
+<p>E isso custa <b>a soma, não a mais lenta</b> — duas chamadas, uma depois da outra. O que é
+exatamente o que o código diz que faz, e esse é o ponto: não existe arranjo dessas duas linhas que
+as sobreponha e ainda te entregue os dois valores, e nenhum que finja isso.</p>
+<p>Quando importar, dê aos dois trabalhos uma resposta comum a dar — uma união compartilhada, um
+<code>Result</code>, um struct — e eles passam a ser um await-all.</p>
 </div>
 </section>
 
 <section class="s" id="s92">
-<h3><span class="n">92</span><span lang="en"><code>await</code> is idempotent</span><span lang="pt"><code>await</code> é idempotente</span></h3>
+<h3><span class="n">92</span><span lang="en">Waiting for work with no value</span><span lang="pt">Esperando trabalho sem valor</span></h3>
 <div lang="en">
-<p>Awaiting a handle twice is allowed, and the second one returns instantly with the same
-value.</p>
-<figure class="code"><pre><code class="hive">job := slowShout("started early")
-echo await job     // waits
-echo await job     // instant, same value</code></pre></figure>
-<p>So a handle is not consumed by being awaited, and awaiting a task that has already finished
-costs nothing. You do not have to arrange your code so that each handle is collected exactly
-once.</p>
+<p>An await-all over <code>void</code> calls has no value to resolve to, so it is a statement:
+"both of these, then carry on".</p>
+<figure class="code"><pre><code class="hive">await [note("first"), note("second")]
+echo "both notes are in"</code></pre></figure>
+<p>This is the shape to reach for when you want a batch of side effects to finish before the next
+line — several files written, several services told — without caring what any of them answered.
+Each still runs on its own thread, so the batch costs the slowest of them.</p>
+<p>Compare it with <code>async</code>: fire-and-forget never waits, and this waits for all of
+them. Between the two you have every combination there is, and both say which they are.</p>
 </div>
 <div lang="pt">
-<p>Esperar o mesmo handle duas vezes é permitido, e a segunda vez retorna na hora com o mesmo
-valor.</p>
-<figure class="code"><pre><code class="hive">job := slowShout("started early")
-echo await job     // espera
-echo await job     // instantâneo, mesmo valor</code></pre></figure>
-<p>Ou seja, um handle não é consumido por ser esperado, e esperar uma tarefa que já terminou não
-custa nada. Você não precisa organizar o código para que cada handle seja recolhido exatamente
-uma vez.</p>
+<p>Um await-all sobre chamadas <code>void</code> não tem valor para resolver, então é um comando:
+"as duas, e então siga".</p>
+<figure class="code"><pre><code class="hive">await [note("first"), note("second")]
+echo "both notes are in"</code></pre></figure>
+<p>Esta é a forma para quando você quer que um lote de efeitos termine antes da próxima linha —
+vários arquivos escritos, vários serviços avisados — sem se importar com o que cada um respondeu.
+Cada uma ainda roda na própria thread, então o lote custa a mais lenta delas.</p>
+<p>Compare com o <code>async</code>: dispare-e-esqueça nunca espera, e este espera por todas.
+Entre os dois você tem todas as combinações que existem, e os dois dizem qual são.</p>
 </div>
 </section>
 
 <section class="s" id="s93">
 <h3><span class="n">93</span><span lang="en">Bounding the wait: <code>with timeout</code></span><span lang="pt">Limitando a espera: <code>with timeout</code></span></h3>
 <div lang="en">
-<p>An optional clause may follow <b>any</b> <code>await</code>, and it changes what the await
-gives you: without it, the value; with it, a <code>Result</code>.</p>
-<figure class="code"><pre><code class="hive">patient := slowShout("worth waiting for")
-if await patient with timeout 100 is Result.Error(err) {
+<p>An optional clause may follow anything that waits — a call, or a whole await-all — and it
+changes what that gives you: without it, the value; with it, a <code>Result</code>.</p>
+<figure class="code"><pre><code class="hive">if slowShout("worth waiting for") with timeout 100 is Result.Error(err) {
 	echo "gave up after " + hive.conv.its(err.waited) + "ms: " + err.message
 }</code></pre></figure>
 <div class="out"><span class="lbl">prints</span><pre>gave up after 100ms: the task did not finish within 100ms</pre></div>
 <p>Running out of patience is a value to handle, not a crash. The error carries
 <code>waited</code> — the milliseconds you asked for — and a <code>message</code>.</p>
-<p>On a vector of handles the timeout is <b>one deadline across the whole barrier</b>:
-<code>await [a, b] with timeout 500</code> means "both of them within half a second", and the
-whole vector fails together.</p>
+<p>On an await-all the timeout is <b>one deadline across the whole barrier</b>:
+<code>await [f(a), f(b)] with timeout 500</code> means "both of them within half a second", and
+the whole vector fails together.</p>
+<p>A <code>void</code> call has no value for the <code>Result</code> to carry, so bounding one is
+refused rather than given a type with no spelling.</p>
 <p>One nicety: <code>timeout</code> is not a reserved word. It means something only in this
 two-token clause, so it stays available as an ordinary variable name.</p>
 </div>
 <div lang="pt">
-<p>Uma cláusula opcional pode seguir <b>qualquer</b> <code>await</code>, e ela muda o que o await
-devolve: sem ela, o valor; com ela, um <code>Result</code>.</p>
-<figure class="code"><pre><code class="hive">patient := slowShout("worth waiting for")
-if await patient with timeout 100 is Result.Error(err) {
+<p>Uma cláusula opcional pode seguir qualquer coisa que espera — uma chamada, ou um await-all
+inteiro — e ela muda o que aquilo devolve: sem ela, o valor; com ela, um <code>Result</code>.</p>
+<figure class="code"><pre><code class="hive">if slowShout("worth waiting for") with timeout 100 is Result.Error(err) {
 	echo "gave up after " + hive.conv.its(err.waited) + "ms: " + err.message
 }</code></pre></figure>
 <div class="out"><span class="lbl">imprime</span><pre>gave up after 100ms: the task did not finish within 100ms</pre></div>
 <p>Perder a paciência é um valor a tratar, não um crash. O erro carrega <code>waited</code> — os
 milissegundos que você pediu — e uma <code>message</code>.</p>
-<p>Num vetor de handles o timeout é <b>um prazo só para a barreira inteira</b>:
-<code>await [a, b] with timeout 500</code> quer dizer "os dois dentro de meio segundo", e o vetor
-inteiro falha junto.</p>
+<p>Num await-all o timeout é <b>um prazo só para a barreira inteira</b>:
+<code>await [f(a), f(b)] with timeout 500</code> quer dizer "os dois dentro de meio segundo", e o
+vetor inteiro falha junto.</p>
+<p>Uma chamada <code>void</code> não tem valor para o <code>Result</code> carregar, então limitar
+uma delas é recusado em vez de receber um tipo sem grafia.</p>
 <p>Um detalhe simpático: <code>timeout</code> não é palavra reservada. Ela significa algo apenas
 nessa cláusula de dois tokens, então continua disponível como nome de variável.</p>
 </div>
@@ -4266,70 +4273,69 @@ nessa cláusula de dois tokens, então continua disponível como nome de variáv
 <h3><span class="n">94</span><span lang="en">A timeout abandons the wait, not the work</span><span lang="pt">Um timeout abandona a espera, não o trabalho</span></h3>
 <div lang="en">
 <p>This is the step to remember. A virtual thread cannot be stopped from the outside, so a
-timeout does not cancel anything — it stops <em>you</em> waiting. The task runs on, and only its
+timeout does not cancel anything — it stops <em>you</em> waiting. The call runs on, and only its
 result was dropped.</p>
-<figure class="code"><pre><code class="hive">patient := slowShout("worth waiting for")
-if await patient with timeout 100 is Result.Error(err) {
+<figure class="code"><pre><code class="hive">if slowShout("worth waiting for") with timeout 100 is Result.Error(err) {
 	echo "gave up after " + hive.conv.its(err.waited) + "ms"
 }
-echo await patient          // the task kept running; this still gets it</code></pre></figure>
+echo "carrying on while it finishes somewhere else"</code></pre></figure>
 <div class="out"><span class="lbl">prints</span><pre>gave up after 100ms
-worth waiting for!!!</pre></div>
-<p>Which is also <em>why</em> the same handle can be awaited again afterwards — with more
-patience, or with none at all — and still yield its value. A timed-out request is deliberately
-not a settled one.</p>
+carrying on while it finishes somewhere else</pre></div>
+<p>So a bounded call is two decisions in one line: start the work, and give up on hearing about it
+after 100ms. If you want the answer after all, ask again with more patience — that starts fresh
+work, and the abandoned one finishes unattended.</p>
 </div>
 <div lang="pt">
 <p>Este é o passo para guardar. Uma thread virtual não pode ser parada de fora, então um timeout
-não cancela nada — ele para <em>você</em> de esperar. A tarefa continua, e só o resultado dela foi
+não cancela nada — ele para <em>você</em> de esperar. A chamada continua, e só o resultado dela foi
 descartado.</p>
-<figure class="code"><pre><code class="hive">patient := slowShout("worth waiting for")
-if await patient with timeout 100 is Result.Error(err) {
+<figure class="code"><pre><code class="hive">if slowShout("worth waiting for") with timeout 100 is Result.Error(err) {
 	echo "gave up after " + hive.conv.its(err.waited) + "ms"
 }
-echo await patient          // a tarefa continuou; este ainda pega o valor</code></pre></figure>
+echo "carrying on while it finishes somewhere else"</code></pre></figure>
 <div class="out"><span class="lbl">imprime</span><pre>gave up after 100ms
-worth waiting for!!!</pre></div>
-<p>E é também <em>por isso</em> que o mesmo handle pode ser esperado de novo depois — com mais
-paciência, ou com nenhuma — e ainda entregar o valor. Um pedido que estourou o prazo
-deliberadamente não está resolvido.</p>
+carrying on while it finishes somewhere else</pre></div>
+<p>Ou seja, uma chamada limitada são duas decisões numa linha: comece o trabalho, e desista de
+saber dele depois de 100ms. Se você quiser a resposta afinal, peça de novo com mais paciência —
+isso começa um trabalho novo, e o abandonado termina sem ninguém olhando.</p>
 </div>
 </section>
 <section class="s" id="s95">
 <h3><span class="n">95</span><span lang="en">The shapes, on a timeline</span><span lang="pt">As formas, numa linha do tempo</span></h3>
 <div lang="en">
 <p>All of it in one picture, now that every piece has been introduced. Play each shape and watch
-where the calling thread waits — and, in the last two, where it does not.</p>
+where the calling thread waits — and, in two of them, where it does not.</p>
 </div>
 <div lang="pt">
 <p>Tudo numa imagem só, agora que cada peça foi apresentada. Rode cada forma e veja onde a thread
-que chamou espera — e, nas duas últimas, onde ela não espera.</p>
+que chamou espera — e, em duas delas, onde ela não espera.</p>
 </div>
 <figure class="viz" data-viz="async">
   <div class="stage" role="img" aria-label="Timeline of virtual threads for each call-site shape"></div>
   <div class="ctl">
-    <button type="button" data-act="forget" aria-pressed="true"><code>f(x)</code></button>
-    <button type="button" data-act="inline"><code>await f(x)</code></button>
-    <button type="button" data-act="hold"><code>h := f(x) … await h</code></button>
+    <button type="button" data-act="plain" aria-pressed="true"><code>f(x)</code></button>
+    <button type="button" data-act="forget"><code>async f(x)</code></button>
     <button type="button" data-act="many"><code>await [f(a), f(b), f(c)]</code></button>
-    <button type="button" data-act="mixed"><code>two types, both spawned first</code></button>
-    <button type="button" data-act="timeout"><code>await h with timeout 100</code></button>
+    <button type="button" data-act="mixed"><code>two types, in turn</code></button>
+    <button type="button" data-act="timeout"><code>f(x) with timeout 100</code></button>
   </div>
   <figcaption>
     <span lang="en">The top lane is the thread that called. Each lane below it is a virtual
-    thread of its own. Amber is running work; the hatched stretch is the caller blocked in an
-    <code>await</code>.</span>
+    thread of its own. Amber is running work; the hatched stretch is the caller blocked waiting for
+    something it started.</span>
     <span lang="pt">A faixa de cima é a thread que chamou. Cada faixa abaixo é uma thread virtual
-    própria. Âmbar é trabalho rodando; o trecho hachurado é a chamadora bloqueada num
-    <code>await</code>.</span>
+    própria. Âmbar é trabalho rodando; o trecho hachurado é a chamadora bloqueada esperando por
+    algo que ela começou.</span>
   </figcaption>
   <div class="viz-fallback">
-    <p lang="en">Each shape differs only in when the calling thread blocks: never for a bare
-    statement, immediately for <code>await f(x)</code>, later for a held handle, once for a whole
-    vector of handles, and not at all past the deadline when a timeout is given.</p>
-    <p lang="pt">Cada forma difere apenas em quando a thread chamadora bloqueia: nunca, num
-    comando puro; imediatamente, em <code>await f(x)</code>; depois, num handle guardado; uma vez
-    só, num vetor de handles; e não além do prazo, quando há um timeout.</p>
+    <p lang="en">Each shape differs only in where the work runs and whether the caller waits: on
+    the calling thread for a plain call, on a thread of its own and never waited for with
+    <code>async</code>, on one thread each behind a single barrier for an await-all, and only up to
+    the deadline when a timeout is given.</p>
+    <p lang="pt">Cada forma difere apenas em onde o trabalho roda e se a chamadora espera: na
+    própria thread que chamou, numa chamada pura; numa thread própria e sem ninguém esperando, com
+    <code>async</code>; numa thread cada atrás de uma barreira só, num await-all; e apenas até o
+    prazo, quando há um timeout.</p>
   </div>
 </figure>
 </section>
@@ -4340,8 +4346,8 @@ que chamou espera — e, nas duas últimas, onde ela não espera.</p>
 <p>Parks the calling virtual thread for a number of milliseconds. Only that thread — everything
 else keeps running.</p>
 <figure class="code"><pre><code class="hive">hive.task.sleep(200)     // let a listener bind before dialling it</code></pre></figure>
-<p>So two tasks that each sleep a second, spawned and then awaited together, finish in about a
-second rather than two. A non-positive argument returns immediately.</p>
+<p>So two calls that each sleep a second, waited for together in one <code>await</code>, finish in
+about a second rather than two. A non-positive argument returns immediately.</p>
 <p>It is also the honest way to write the small waits a demo needs — letting a server bind before
 a client connects, or letting a last line land before the program exits.</p>
 <div class="crumb">All of this part, runnable:
@@ -4351,8 +4357,8 @@ a client connects, or letting a last line land before the program exits.</p>
 <p>Estaciona a thread virtual que chamou por um número de milissegundos. Só aquela thread — todo
 o resto continua rodando.</p>
 <figure class="code"><pre><code class="hive">hive.task.sleep(200)     // deixe um listener subir antes de discar para ele</code></pre></figure>
-<p>Então duas tarefas que dormem um segundo cada, disparadas e depois esperadas juntas, terminam
-em cerca de um segundo, não dois. Um argumento não-positivo retorna na hora.</p>
+<p>Então duas chamadas que dormem um segundo cada, esperadas juntas num <code>await</code>,
+terminam em cerca de um segundo, não dois. Um argumento não-positivo retorna na hora.</p>
 <p>É também o jeito honesto de escrever as esperinhas que uma demo precisa — deixar um servidor
 subir antes de um cliente conectar, ou deixar a última linha sair antes de o programa
 terminar.</p>
@@ -4667,15 +4673,15 @@ criam diretórios pai que faltem — para isso existe o <code>makeDir</code>.</p
 <div class="part-head" id="p13">
   <div class="lbl"><span class="mark"></span><span lang="en">Part XIII</span><span lang="pt">Parte XIII</span></div>
   <h2><span lang="en">SQL</span><span lang="pt">SQL</span></h2>
-  <p class="sub"><span lang="en">A fourth kind of callable whose body is SQL and whose return type
-  describes its rows.</span><span lang="pt">Um quarto tipo de callable cujo corpo é SQL e cujo
+  <p class="sub"><span lang="en">A third kind of callable whose body is SQL and whose return type
+  describes its rows.</span><span lang="pt">Um terceiro tipo de callable cujo corpo é SQL e cujo
   tipo de retorno descreve suas linhas.</span></p>
 </div>
 
 <section class="s" id="s102">
-<h3><span class="n">102</span><span lang="en"><code>query</code>: the fourth callable</span><span lang="pt"><code>query</code>: o quarto callable</span></h3>
+<h3><span class="n">102</span><span lang="en"><code>query</code>: the third callable</span><span lang="pt"><code>query</code>: o terceiro callable</span></h3>
 <div lang="en">
-<p>You have met <code>proc</code>, <code>func</code> and <code>async func</code>. The fourth is a
+<p>You have met <code>proc</code> and <code>func</code>. The third is a
 <code>query</code>: a func whose body is inline SQL.</p>
 <figure class="code"><pre><code class="hive">type User {
 	id:   Int
@@ -4688,11 +4694,11 @@ query findUser(name: Str): User[dyn] {
 <p>The SQL is not a string. It is the body, written where a body goes, and the compiler reads it —
 which is what lets it check the columns, generate the row mapper, and refuse a query that cannot
 mean what it says.</p>
-<p>You run one with the <code>using … run</code> form from step 95:</p>
+<p>You run one with the <code>using … run</code> form:</p>
 <figure class="code"><pre><code class="hive">result := using db run findUser("Ada")</code></pre></figure>
 </div>
 <div lang="pt">
-<p>Você já conheceu <code>proc</code>, <code>func</code> e <code>async func</code>. O quarto é o
+<p>Você já conheceu <code>proc</code> e <code>func</code>. O terceiro é o
 <code>query</code>: uma func cujo corpo é SQL embutido.</p>
 <figure class="code"><pre><code class="hive">type User {
 	id:   Int
@@ -4705,7 +4711,7 @@ query findUser(name: Str): User[dyn] {
 <p>O SQL não é uma string. Ele é o corpo, escrito onde um corpo vai, e o compilador o lê — é isso
 que permite conferir as colunas, gerar o mapeador de linhas e recusar uma query que não pode
 significar o que diz.</p>
-<p>Você roda uma com a forma <code>using … run</code> do passo 95:</p>
+<p>Você roda uma com a forma <code>using … run</code>:</p>
 <figure class="code"><pre><code class="hive">result := using db run findUser("Ada")</code></pre></figure>
 </div>
 </section>
@@ -5499,7 +5505,7 @@ if result is Result.Ok(response) {
 }</code></pre></figure>
 <div class="note"><span class="k">Two things to know</span>
 <p><code>httpServe</code> blocks forever, so it usually goes on a virtual thread of its own —
-<code>async func</code>, called as a statement (step 84). And it runs your handler <b>once per
+started with <code>async</code> (step 88). And it runs your handler <b>once per
 request, on its own virtual thread</b>, which is what makes step 108's in-memory trap matter.</p></div>
 </div>
 <div lang="pt">
@@ -5530,7 +5536,7 @@ if result is Result.Ok(response) {
 }</code></pre></figure>
 <div class="note"><span class="k">Duas coisas para saber</span>
 <p>O <code>httpServe</code> bloqueia para sempre, então normalmente vai numa thread virtual própria
-— <code>async func</code>, chamada como comando (passo 84). E ele roda seu handler <b>uma vez por
+— iniciado com <code>async</code> (passo 88). E ele roda seu handler <b>uma vez por
 pedido, em thread virtual própria</b>, que é o que faz a pegadinha do passo 108 importar.</p></div>
 </div>
 </section>
@@ -5560,8 +5566,8 @@ business — a program only ever sees whole messages, as <code>Str</code>.</p>
 	}
 }
 
-async func serveForever(): void {
-	hive.net.wsServe(9001, echoBack)
+func serveForever(): void {
+	hive.net.wsServe(9001, echoBack)     // started with `async serveForever()`
 }</code></pre></figure>
 <p>The handler is a <code>proc(WsConnection): void</code>, run once per connection on its own
 virtual thread, and the connection closes when it returns. <code>wsSend</code> reports the bytes
@@ -5594,8 +5600,8 @@ runtime — um programa só vê mensagens inteiras, como <code>Str</code>.</p>
 	}
 }
 
-async func serveForever(): void {
-	hive.net.wsServe(9001, echoBack)
+func serveForever(): void {
+	hive.net.wsServe(9001, echoBack)     // started with `async serveForever()`
 }</code></pre></figure>
 <p>O handler é um <code>proc(WsConnection): void</code>, rodado uma vez por conexão em thread
 virtual própria, e a conexão fecha quando ele retorna. O <code>wsSend</code> reporta os bytes que a
@@ -5734,7 +5740,7 @@ for each arg in hive.term.args() {
 }</code></pre></figure>
 <p><code>read()</code> blocks until the user finishes a line and returns it without the trailing
 newline. At end of input it returns whatever preceded EOF (<code>""</code> if nothing).</p>
-<p>It parks only the <b>calling</b> virtual thread — so called inside an <code>async func</code>,
+<p>It parks only the <b>calling</b> virtual thread — so on a thread started with <code>async</code>,
 the rest of the program keeps running while that thread waits for a human.</p>
 <p><code>args()</code> is the command-line arguments in order, excluding the program name, as a
 <code>Str[dyn]</code>. <code>print(text)</code> is <code>echo</code> restricted to a
@@ -5749,8 +5755,8 @@ for each arg in hive.term.args() {
 }</code></pre></figure>
 <p>O <code>read()</code> bloqueia até o usuário terminar uma linha e a devolve sem a quebra final. No
 fim da entrada, devolve o que vier antes do EOF (<code>""</code> se não vier nada).</p>
-<p>Ele estaciona apenas a thread virtual <b>que chamou</b> — então, chamado dentro de uma
-<code>async func</code>, o resto do programa continua rodando enquanto aquela thread espera por um
+<p>Ele estaciona apenas a thread virtual <b>que chamou</b> — então, numa thread iniciada com
+<code>async</code>, o resto do programa continua rodando enquanto aquela thread espera por um
 humano.</p>
 <p><code>args()</code> são os argumentos de linha de comando em ordem, sem o nome do programa, como
 um <code>Str[dyn]</code>. <code>print(texto)</code> é o <code>echo</code> restrito a um
@@ -5811,34 +5817,34 @@ literalmente.</p>
 <div lang="en">
 <p><code>hive.syslink</code> adds <b>services</b>: long-lived things that own private state only
 they can touch, have an identity you can pass around, and receive messages in a mailbox.</p>
-<p>A service is deliberately <em>not</em> an <code>async</code> handle. The two do not overlap, and
-the contrast is the fastest way to see what a service is for:</p>
+<p>A service is a different thing from a call you did not wait for, and the contrast is the
+fastest way to see what a service is for:</p>
 <table class="t">
-<tr><th></th><th><code>async T</code></th><th><code>hive.syslink.Address</code></th></tr>
-<tr><td>lifetime</td><td>scoped — cannot outlive its spawner</td><td>unscoped — outlives everything</td></tr>
-<tr><td>identity</td><td>none, it is a join point</td><td>yes, that is the point</td></tr>
-<tr><td>interaction</td><td><code>await</code>, yields <code>T</code></td><td>called with a message</td></tr>
-<tr><td>as a value</td><td>cannot be stored, returned or passed</td><td>ordinary value; can be sent inside a message</td></tr>
-<tr><td>callable</td><td>no — it is already running</td><td>yes, and calling it <em>is</em> the send</td></tr>
+<tr><th></th><th><code>async f(x)</code></th><th><code>hive.syslink.Address</code></th></tr>
+<tr><td>lifetime</td><td>as long as the call takes</td><td>unscoped — outlives everything</td></tr>
+<tr><td>identity</td><td>none, there is nothing to hold</td><td>yes, that is the point</td></tr>
+<tr><td>interaction</td><td>none — it keeps nothing back</td><td>called with a message</td></tr>
+<tr><td>as a value</td><td>it has none at all</td><td>ordinary value; can be sent inside a message</td></tr>
+<tr><td>result</td><td>none; to get one, wait for the call</td><td>the answer, when you wait for it</td></tr>
 </table>
-<p>So Part XI is for work you start and collect. This part is for things that exist, hold state, and
+<p>So Part XI is for work you start and wait for. This part is for things that exist, hold state, and
 answer questions — a cache, a session store, a queue, a device driver.</p>
 </div>
 <div lang="pt">
 <p>O <code>hive.syslink</code> acrescenta <b>serviços</b>: coisas de vida longa que possuem estado
 privado que só elas tocam, têm uma identidade que você pode passar adiante, e recebem mensagens numa
 caixa.</p>
-<p>Um serviço deliberadamente <em>não</em> é um handle <code>async</code>. Os dois não se sobrepõem,
-e o contraste é o jeito mais rápido de ver para que serve um serviço:</p>
+<p>Um serviço é uma coisa diferente de uma chamada que você não esperou, e o contraste é o jeito
+mais rápido de ver para que serve um serviço:</p>
 <table class="t">
-<tr><th></th><th><code>async T</code></th><th><code>hive.syslink.Address</code></th></tr>
-<tr><td>tempo de vida</td><td>com escopo — não sobrevive a quem o disparou</td><td>sem escopo — sobrevive a tudo</td></tr>
-<tr><td>identidade</td><td>nenhuma, é um ponto de junção</td><td>sim, é justamente o ponto</td></tr>
-<tr><td>interação</td><td><code>await</code>, entrega <code>T</code></td><td>chamado com uma mensagem</td></tr>
-<tr><td>como valor</td><td>não pode ser guardado, retornado ou passado</td><td>valor comum; pode ir dentro de uma mensagem</td></tr>
-<tr><td>chamável</td><td>não — já está rodando</td><td>sim, e chamá-lo <em>é</em> o envio</td></tr>
+<tr><th></th><th><code>async f(x)</code></th><th><code>hive.syslink.Address</code></th></tr>
+<tr><td>tempo de vida</td><td>o tempo que a chamada levar</td><td>sem escopo — sobrevive a tudo</td></tr>
+<tr><td>identidade</td><td>nenhuma, não há o que segurar</td><td>sim, é justamente o ponto</td></tr>
+<tr><td>interação</td><td>nenhuma — não guarda nada</td><td>chamado com uma mensagem</td></tr>
+<tr><td>como valor</td><td>ela não tem valor nenhum</td><td>valor comum; pode ir dentro de uma mensagem</td></tr>
+<tr><td>resultado</td><td>nenhum; para ter um, espere a chamada</td><td>a resposta, quando você espera por ela</td></tr>
 </table>
-<p>Então a Parte XI é para trabalho que você inicia e recolhe. Esta parte é para coisas que existem,
+<p>Então a Parte XI é para trabalho que você inicia e espera. Esta parte é para coisas que existem,
 guardam estado e respondem perguntas — um cache, um repositório de sessões, uma fila, um driver de
 dispositivo.</p>
 </div>
@@ -5941,34 +5947,30 @@ chamá-lo duas vezes é inofensivo.</p>
 <div lang="en">
 <p>There is exactly <b>one</b> way to reach a service: you call its address. There is no
 <code>send</code> and no <code>call</code> — an address is not a handle you pass to some function, it
-is the thing you call. And as with an <code>async func</code>, the call site decides what it
+is the thing you call. And as with a func, the call site decides what it
 means.</p>
-<figure class="code"><pre><code class="hive">inbox(Note.Say("hi"))                    // statement: fire-and-forget
-pending := cache(Op.Count())             // keep the request in flight
-answer  := await pending                 // wait for it
-answer  := await pending with timeout 250 // ...for at most 250ms
-answer  := await cache(Op.Count())       // send + wait
-both    := await [a(m), b(m)]            // one barrier, one deadline</code></pre></figure>
+<figure class="code"><pre><code class="hive">answer := cache(Op.Count())                  // send it, wait for the answer
+answer := cache(Op.Count()) with timeout 250 // ...for at most 250ms
+async inbox(Note.Say("hi"))                  // send it, wait for nothing
+both   := await [a(m), b(m)]                 // both, one barrier, one deadline</code></pre></figure>
 </div>
 <div lang="pt">
 <p>Existe exatamente <b>um</b> jeito de alcançar um serviço: você chama o endereço dele. Não há
 <code>send</code> nem <code>call</code> — um endereço não é um handle que você passa para alguma
-função, ele é a coisa que você chama. E, como numa <code>async func</code>, o ponto de chamada
+função, ele é a coisa que você chama. E, como numa func, o ponto de chamada
 decide o que aquilo significa.</p>
-<figure class="code"><pre><code class="hive">inbox(Note.Say("hi"))                    // comando: dispare e esqueça
-pending := cache(Op.Count())             // mantém o pedido em voo
-answer  := await pending                 // espera por ele
-answer  := await pending with timeout 250 // ...por no máximo 250ms
-answer  := await cache(Op.Count())       // envia + espera
-both    := await [a(m), b(m)]            // uma barreira, um prazo</code></pre></figure>
+<figure class="code"><pre><code class="hive">answer := cache(Op.Count())                  // envia e espera a resposta
+answer := cache(Op.Count()) with timeout 250 // ...por no máximo 250ms
+async inbox(Note.Say("hi"))                  // envia e não espera nada
+both   := await [a(m), b(m)]                 // os dois, uma barreira, um prazo</code></pre></figure>
 </div>
 <figure class="viz" data-viz="cluster">
   <div class="stage" role="img" aria-label="Two nodes, each with a service, exchanging messages over a single encrypted connection"></div>
   <div class="ctl">
-    <button type="button" data-act="send" aria-pressed="true"><code>theirs(Note.Say("hi"))</code></button>
-    <button type="button" data-act="request"><code>await theirs(Note.HowMany())</code></button>
-    <button type="button" data-act="noreply"><code>await mine(Note.Ignore())</code></button>
-    <button type="button" data-act="crash"><code>theirs(Note.Explode())</code></button>
+    <button type="button" data-act="send" aria-pressed="true"><code>async theirs(Note.Say("hi"))</code></button>
+    <button type="button" data-act="request"><code>theirs(Note.HowMany())</code></button>
+    <button type="button" data-act="noreply"><code>mine(Note.Ignore())</code></button>
+    <button type="button" data-act="crash"><code>async theirs(Note.Explode())</code></button>
     <button type="button" data-act="reset"><span lang="en">reset</span><span lang="pt">reiniciar</span></button>
   </div>
   <figcaption>
@@ -5984,21 +5986,21 @@ both    := await [a(m), b(m)]            // uma barreira, um prazo</code></pre><
     <code>mine(…)</code>: o mesmo comando, mas ele nunca chega ao fio.</span>
   </figcaption>
   <div class="viz-fallback">
-    <p lang="en">A statement send crosses once and nothing comes back. A kept request crosses,
-    waits for the service's turn, and the answer returns on the same connection. A send to a
+    <p lang="en">An <code>async</code> send crosses once and nothing comes back. A plain send
+    crosses, waits for the service's turn, and the answer returns on the same connection. A send to a
     service on this node never crosses at all, and an unanswered request there comes straight back
     as <code>NoReply</code>. A panic removes the service and leaves the node running.</p>
-    <p lang="pt">Um envio como comando atravessa uma vez e nada volta. Um pedido guardado atravessa,
-    espera o turno do serviço, e a resposta volta pela mesma conexão. Um envio a um serviço deste nó
-    não atravessa nada, e um pedido não respondido ali volta na hora como <code>NoReply</code>. Um
-    panic remove o serviço e deixa o nó rodando.</p>
+    <p lang="pt">Um envio com <code>async</code> atravessa uma vez e nada volta. Um envio puro
+    atravessa, espera o turno do serviço, e a resposta volta pela mesma conexão. Um envio a um
+    serviço deste nó não atravessa nada, e um pedido não respondido ali volta na hora como
+    <code>NoReply</code>. Um panic remove o serviço e deixa o nó rodando.</p>
   </div>
 </figure>
 <div lang="en">
-<p>Three properties of the statement form are worth stating outright. It returns <code>void</code>,
-it <b>never blocks</b>, and it <b>never fails</b> — a dead or unreachable recipient is not an error
-at the send site. That is precisely what keeps a local send and a remote one the same statement, and
-failure is discovered through a monitor instead (step 129).</p>
+<p>Three properties of the <code>async</code> form are worth stating outright. It returns
+<code>void</code>, it <b>never blocks</b>, and it <b>never fails</b> — a dead or unreachable
+recipient is not an error at the send site. That is precisely what keeps a local send and a remote
+one the same statement, and failure is discovered through a monitor instead (step 129).</p>
 <p>The callee's <em>type</em> is what makes a call a send, never its spelling. A local, a parameter,
 a vector element and a fresh <code>at(#Name)</code> are all called the same way, and an address that
 shares a name with a declared func resolves to the address — exactly as a local shadows a
@@ -6008,7 +6010,7 @@ message and a partial application <code>c(_)</code> are each rejected by name, b
 mistake about what the value is.</p>
 </div>
 <div lang="pt">
-<p>Três propriedades da forma de comando merecem ser ditas em voz alta. Ela retorna
+<p>Três propriedades da forma com <code>async</code> merecem ser ditas em voz alta. Ela retorna
 <code>void</code>, <b>nunca bloqueia</b>, e <b>nunca falha</b> — um destinatário morto ou inacessível
 não é erro no ponto de envio. É exatamente isso que mantém um envio local e um remoto como o mesmo
 comando, e a falha é descoberta por um monitor (passo 129).</p>
@@ -6032,7 +6034,7 @@ requests and responses together — and nothing anywhere needs annotating.</p>
 	HowMany                  // a request...
 	Counted { seen: Int }    // ...and the shape of its answer
 }</code></pre></figure>
-<figure class="code"><pre><code class="hive">answer := await pending with timeout 4000
+<figure class="code"><pre><code class="hive">answer := theirs(Note.HowMany()) with timeout 4000
 if answer is Result.Ok(reply) &amp;&amp; reply is Note.Counted(count) {
 	echo "the peer's inbox has seen {count} notes"
 } else if answer is Result.Error(err) {
@@ -6041,7 +6043,7 @@ if answer is Result.Ok(reply) &amp;&amp; reply is Note.Counted(count) {
 <p>Two <code>is</code> tests, chained with the <code>&amp;&amp;</code> from step 72: the first
 unwraps the <code>Result</code>, the second narrows the reply to the variant you expected. Nothing
 new to learn — a reply narrows exactly like any other value.</p>
-<p><code>await</code> is the one place in the module that reports failure, because it is the only one
+<p>Waiting for a send is the one place in the module that reports failure, because it is the only one
 with somewhere to report to. Six reasons arrive here:</p>
 <table class="t">
 <tr><td><code>"Timeout"</code></td><td>you ran out of patience</td></tr>
@@ -6059,7 +6061,7 @@ protocolo inteiro — pedidos e respostas juntos — e nada em lugar nenhum prec
 	HowMany                  // um pedido...
 	Counted { seen: Int }    // ...e a forma da resposta dele
 }</code></pre></figure>
-<figure class="code"><pre><code class="hive">answer := await pending with timeout 4000
+<figure class="code"><pre><code class="hive">answer := theirs(Note.HowMany()) with timeout 4000
 if answer is Result.Ok(reply) &amp;&amp; reply is Note.Counted(count) {
 	echo "the peer's inbox has seen {count} notes"
 } else if answer is Result.Error(err) {
@@ -6068,7 +6070,7 @@ if answer is Result.Ok(reply) &amp;&amp; reply is Note.Counted(count) {
 <p>Dois testes <code>is</code>, ligados pelo <code>&amp;&amp;</code> do passo 72: o primeiro
 desempacota o <code>Result</code>, o segundo estreita a resposta para a variante que você esperava.
 Nada novo para aprender — uma resposta estreita exatamente como qualquer outro valor.</p>
-<p>O <code>await</code> é o único lugar do módulo que reporta falha, porque é o único que tem para
+<p>Esperar por um envio é o único lugar do módulo que reporta falha, porque é o único que tem para
 quem reportar. Seis motivos chegam aqui:</p>
 <table class="t">
 <tr><td><code>"Timeout"</code></td><td>você perdeu a paciência</td></tr>
@@ -6083,8 +6085,8 @@ quem reportar. Seis motivos chegam aqui:</p>
 <section class="s" id="s130">
 <h3><span class="n">130</span><span lang="en">Forgetting to answer fails fast</span><span lang="pt">Esquecer de responder falha rápido</span></h3>
 <div lang="en">
-<p><code>hive.syslink.answer(from, value)</code> replies to whoever is awaiting. If the sender
-discarded its request, nothing is waiting and it is a no-op — so one handler serves both shapes
+<p><code>hive.syslink.answer(from, value)</code> replies to whoever is waiting. If the sender used
+<code>async</code>, nothing is waiting and it is a no-op — so one handler serves both shapes
 without caring which it was.</p>
 <p>Missing a reply on <em>one branch</em> is the easiest mistake to make in service code, and waiting
 out a timeout is a miserable way to be told: it points at the network when the problem is a missing
@@ -6104,8 +6106,8 @@ unanswered request is failed immediately.</p>
 </div>
 <div lang="pt">
 <p>O <code>hive.syslink.answer(from, valor)</code> responde a quem estiver esperando. Se quem enviou
-descartou o pedido, ninguém está esperando e isso é um no-op — então um handler serve as duas formas
-sem se importar com qual era.</p>
+usou <code>async</code>, ninguém está esperando e isso é um no-op — então um handler serve as duas
+formas sem se importar com qual era.</p>
 <p>Esquecer a resposta em <em>um ramo</em> é o erro mais fácil de cometer em código de serviço, e
 esperar um timeout inteiro é um jeito péssimo de ser avisado: aponta para a rede quando o problema é
 uma linha faltando. Então um pedido que um serviço trata sem responder volta na hora como
@@ -6128,21 +6130,21 @@ resposta pode estar vindo, então um pedido não respondido falha imediatamente.
 <h3><span class="n">131</span><span lang="en">…unless the envelope leaves the turn</span><span lang="pt">…a menos que o envelope saia do turno</span></h3>
 <div lang="en">
 <p>The other side of the same rule, and the thing it makes possible. If the envelope goes anywhere
-else — stored in the returned state, handed to an <code>async func</code>, passed to one of your own
-procs — a reply may genuinely still be on its way, and the runtime keeps waiting.</p>
+else — stored in the returned state, handed to a call the handler does not wait for, passed to one of
+your own procs — a reply may genuinely still be on its way, and the runtime keeps waiting.</p>
 <figure class="code"><pre><code class="hive">// The envelope leaves the turn, so the answer is allowed to arrive later.
 proc unhurried(handled: Int, note: Note, from: hive.syslink.Envelope): Int {
-	answerLate(from)                  // an async func: replies when it is done
+	async answerLate(from)            // replies when it is done; nothing waits here
 	return handled + 1
 }
 
-async func answerLate(from: hive.syslink.Envelope): void {
+func answerLate(from: hive.syslink.Envelope): void {
 	hive.task.sleep(400)
 	hive.syslink.answer(from, Note.Late("worth the wait"))
 }</code></pre></figure>
-<p>That is the <b>deferred reply</b>: hand the envelope to a task and the service's turn ends
-immediately — the mailbox is free for the next message — without the caller being cut off. It is the
-pattern for work too slow to hold a mailbox open for.</p>
+<p>That is the <b>deferred reply</b>: hand the envelope to an <code>async</code> call and the
+service's turn ends immediately — the mailbox is free for the next message — without the caller being
+cut off. It is the pattern for work too slow to hold a mailbox open for.</p>
 <p>The analysis is per handler and deliberately conservative, in the same spirit as step 45: one
 escape anywhere switches the fast failure off for that whole service, and anything it cannot vouch
 for counts as an escape. Being wrong that way costs a timeout; being wrong the other way would cut
@@ -6150,21 +6152,21 @@ off a live request.</p>
 </div>
 <div lang="pt">
 <p>O outro lado da mesma regra, e o que ela viabiliza. Se o envelope vai para qualquer outro lugar —
-guardado no estado retornado, entregue a uma <code>async func</code>, passado para um proc seu — uma
-resposta pode realmente estar a caminho, e o runtime continua esperando.</p>
+guardado no estado retornado, entregue a uma chamada que o handler não espera, passado para um proc
+seu — uma resposta pode realmente estar a caminho, e o runtime continua esperando.</p>
 <figure class="code"><pre><code class="hive">// O envelope sai do turno, então a resposta pode chegar depois.
 proc unhurried(handled: Int, note: Note, from: hive.syslink.Envelope): Int {
-	answerLate(from)                  // uma async func: responde quando terminar
+	async answerLate(from)            // responde quando terminar; nada espera aqui
 	return handled + 1
 }
 
-async func answerLate(from: hive.syslink.Envelope): void {
+func answerLate(from: hive.syslink.Envelope): void {
 	hive.task.sleep(400)
 	hive.syslink.answer(from, Note.Late("worth the wait"))
 }</code></pre></figure>
-<p>Essa é a <b>resposta diferida</b>: entregue o envelope a uma tarefa e o turno do serviço termina na
-hora — a caixa fica livre para a próxima mensagem — sem cortar quem chamou. É o padrão para trabalho
-lento demais para manter uma caixa aberta.</p>
+<p>Essa é a <b>resposta diferida</b>: entregue o envelope a uma chamada com <code>async</code> e o
+turno do serviço termina na hora — a caixa fica livre para a próxima mensagem — sem cortar quem
+chamou. É o padrão para trabalho lento demais para manter uma caixa aberta.</p>
 <p>A análise é por handler e deliberadamente conservadora, no mesmo espírito do passo 45: um escape em
 qualquer lugar desliga a falha rápida para aquele serviço inteiro, e tudo que ela não pode garantir
 conta como escape. Errar desse lado custa um timeout; errar do outro cortaria um pedido vivo.</p>
@@ -6597,8 +6599,8 @@ ones worth knowing.</p>
 <tr><td><code>Str[3]</code>, <code>Str[dyn]</code>, <code>Str[]</code></td><td>all three become a slice — which is <em>why</em> Part V exists</td></tr>
 <tr><td><code>mut</code></td><td>nothing — it is compile-time only</td></tr>
 <tr><td><code>mut b = a</code> (both <code>mut</code>)</td><td>no variable at all: <code>b</code> compiles to <code>a</code>, one header for both</td></tr>
-<tr><td><code>async func</code>, called bare</td><td>a goroutine — the virtual thread of Part XI</td></tr>
-<tr><td><code>await h</code></td><td>a blocking join on that task</td></tr>
+<tr><td><code>async f(x)</code></td><td><code>go f(x)</code> — the virtual thread of Part XI</td></tr>
+<tr><td><code>await [f(a), f(b)]</code></td><td>one goroutine each, then a blocking join on both</td></tr>
 <tr><td><code>ys := xs</code> needing a copy</td><td>a generated clone, chosen by the type (step 44)</td></tr>
 <tr><td><code>func f(v: T[])</code> at <code>T = Str</code></td><td><code>f_Str</code> — one copy per instantiation</td></tr>
 <tr><td><code>f(a, _, c)</code></td><td>a closure whose parameter is the hole</td></tr>
@@ -6628,8 +6630,8 @@ então aqui estão as que valem a pena.</p>
 <tr><td><code>Str[3]</code>, <code>Str[dyn]</code>, <code>Str[]</code></td><td>os três se tornam um slice — que é <em>por que</em> a Parte V existe</td></tr>
 <tr><td><code>mut</code></td><td>nada — existe só em tempo de compilação</td></tr>
 <tr><td><code>mut b = a</code> (os dois <code>mut</code>)</td><td>nenhuma variável: <code>b</code> compila para <code>a</code>, um header para os dois</td></tr>
-<tr><td><code>async func</code>, chamada pura</td><td>uma goroutine — a thread virtual da Parte XI</td></tr>
-<tr><td><code>await h</code></td><td>uma junção bloqueante naquela tarefa</td></tr>
+<tr><td><code>async f(x)</code></td><td><code>go f(x)</code> — a thread virtual da Parte XI</td></tr>
+<tr><td><code>await [f(a), f(b)]</code></td><td>uma goroutine para cada, e uma junção bloqueante nas duas</td></tr>
 <tr><td><code>ys := xs</code> que precisa de cópia</td><td>um clone gerado, escolhido pelo tipo (passo 44)</td></tr>
 <tr><td><code>func f(v: T[])</code> em <code>T = Str</code></td><td><code>f_Str</code> — uma cópia por instanciação</td></tr>
 <tr><td><code>f(a, _, c)</code></td><td>uma closure cujo parâmetro é o buraco</td></tr>
@@ -7150,9 +7152,9 @@ function vizCluster(fig,stage,say){
   var TL=Timeline();
   var TXT={
     en:{idle:"two nodes, one persistent encrypted connection between them",
-        send:"a(msg) as a statement · never blocks, never fails — nothing comes back",
+        send:"async a(msg) · never blocks, never fails — nothing comes back",
         sendDone:"delivered into the mailbox; the sender never learned whether it arrived",
-        request:"await a(msg) · the request waits for the service's own turn",
+        request:"a(msg) · the send waits for the service's own turn",
         reply:"the answer returns on the same connection → Result<Note, SyslinkError>",
         noreply:"mine(…) is the service on THIS node — a local send, never touching the connection",
         noreplyDone:'it handled the message and never answered, so "NoReply" comes straight back — no timeout waited out',
@@ -7160,9 +7162,9 @@ function vizCluster(fig,stage,say){
         crashDone:'…kills only that service. The node is still up, so this reports "NoProc"',
         monitor:"the monitor fires exactly once, delivering the message the watcher chose"},
     pt:{idle:"dois nós, uma conexão cifrada persistente entre eles",
-        send:"a(msg) como comando · nunca bloqueia, nunca falha — nada volta",
+        send:"async a(msg) · nunca bloqueia, nunca falha — nada volta",
         sendDone:"entregue na caixa; quem enviou nunca soube se chegou",
-        request:"await a(msg) · o pedido espera o turno do próprio serviço",
+        request:"a(msg) · o envio espera o turno do próprio serviço",
         reply:"a resposta volta pela mesma conexão → Result<Note, SyslinkError>",
         noreply:"mine(…) é o serviço DESTE nó — um envio local, que nem toca a conexão",
         noreplyDone:'ele tratou a mensagem e nunca respondeu, então o "NoReply" volta na hora — sem esperar timeout',
@@ -7302,44 +7304,36 @@ function vizAsync(fig,stage,say){
   cv.style.display="block"; cv.style.width="100%"; cv.style.height="100%";
   stage.insertBefore(cv,stage.firstChild);
   var g=cv.getContext("2d");
-  var col=C(), t=0, mode="forget";
+  var col=C(), t=0, mode="plain";
 
   var SC={
+    plain:{lanes:[
+      {n:"main",b:[[0,.1,"run"],[.1,.86,"task"],[.86,1,"run"]]}]},
     forget:{lanes:[
       {n:"main",b:[[0,.12,"run"],[.12,1,"run"]]},
-      {n:"slowShout(x)",b:[[.12,.9,"task"]]}]},
-    inline:{lanes:[
-      {n:"main",b:[[0,.1,"run"],[.1,.86,"wait"],[.86,1,"run"]]},
-      {n:"slowShout(x)",b:[[.1,.86,"task"]]}]},
-    hold:{lanes:[
-      {n:"main",b:[[0,.1,"run"],[.1,.5,"run"],[.5,.86,"wait"],[.86,1,"run"]]},
-      {n:"slowShout(x)",b:[[.1,.86,"task"]]}]},
+      {n:"async slowShout(x)",b:[[.12,.9,"task"]]}]},
     many:{lanes:[
       {n:"main",b:[[0,.1,"run"],[.1,.88,"wait"],[.88,1,"run"]]},
       {n:"f(a)",b:[[.1,.72,"task"]]},
       {n:"f(b)",b:[[.1,.88,"task"]]},
       {n:"f(c)",b:[[.1,.6,"task"]]}]},
     mixed:{lanes:[
-      {n:"main",b:[[0,.1,"run"],[.1,.86,"wait"],[.86,1,"run"]]},
-      {n:"slowShout(x)",b:[[.1,.86,"task"]]},
-      {n:"lengthOf(x)",b:[[.1,.22,"task"]]}]},
+      {n:"main",b:[[0,.06,"run"],[.06,.62,"task"],[.62,.9,"task"],[.9,1,"run"]]}]},
     timeout:{lanes:[
-      {n:"main",b:[[0,.08,"run"],[.08,.36,"wait"],[.36,.46,"run"],[.46,.9,"wait"],[.9,1,"run"]]},
+      {n:"main",b:[[0,.08,"run"],[.08,.36,"wait"],[.36,1,"run"]]},
       {n:"slowShout(x)",b:[[.08,.9,"task"]]}],deadline:.36}
   };
   var TXT={
-    en:{forget:"the caller never blocks; the result is discarded",
-        inline:"await f(x) · spawn and wait in one expression",
-        hold:"spawned early, collected late — the wait is only what was left",
-        many:"one barrier over three tasks: the total is the slowest, not the sum",
-        mixed:"different types: spawn both first, then await each — the waits overlap",
-        timeout:"the deadline ends the waiting, not the work — the task runs on and can be awaited again"},
-    pt:{forget:"quem chamou nunca bloqueia; o resultado é descartado",
-        inline:"await f(x) · dispara e espera numa única expressão",
-        hold:"disparado cedo, recolhido tarde — a espera é só o que sobrou",
-        many:"uma barreira sobre três tarefas: o total é a mais lenta, não a soma",
-        mixed:"tipos diferentes: dispare as duas primeiro, depois espere cada uma — as esperas se sobrepõem",
-        timeout:"o prazo encerra a espera, não o trabalho — a tarefa segue e pode ser esperada de novo"}
+    en:{plain:"f(x) · the work runs on the calling thread; nothing is scheduled",
+        forget:"async f(x) · its own thread, and the caller never waits for it",
+        many:"await [...] · one barrier over three threads: the total is the slowest, not the sum",
+        mixed:"different types: one call, then the next — the total is the sum, and the code says so",
+        timeout:"the deadline ends the waiting, not the work — the call runs on, unattended"},
+    pt:{plain:"f(x) · o trabalho roda na thread que chamou; nada é agendado",
+        forget:"async f(x) · thread própria, e quem chamou nunca espera por ela",
+        many:"await [...] · uma barreira sobre três threads: o total é a mais lenta, não a soma",
+        mixed:"tipos diferentes: uma chamada, depois a outra — o total é a soma, e o código diz isso",
+        timeout:"o prazo encerra a espera, não o trabalho — a chamada segue, sem ninguém olhando"}
   };
   function speak(){ say.textContent=TXT[lang()][mode]; }
 

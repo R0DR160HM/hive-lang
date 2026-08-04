@@ -701,29 +701,103 @@ pub fn index_of_miss_carries_false_test() {
 }
 
 // ---------------------------------------------------------------------------
-// Async funcs and virtual threads
+// Calls, virtual threads and `async`
 // ---------------------------------------------------------------------------
 
-pub fn async_call_is_fire_and_forget_test() {
+pub fn a_call_blocks_and_async_does_not_test() {
   let go =
     compile(
-      "proc main(): void {\n\tmut x := \"hi\"\n\twork(x)\n\tx = await work(x)\n\techo x\n}\nasync func work(text: Str): Str {\n\treturn text\n}\n",
+      "proc main(): void {\n\tmut x := \"hi\"\n\tasync work(x)\n\tx = work(x)\n\techo x\n}\nfunc work(text: Str): Str {\n\treturn text\n}\n",
     )
-  // An async func lowers to an ordinary Go function.
+  // Nothing about the declaration says how it runs.
   should.be_true(string.contains(go, "func work(text string) string {"))
-  // A bare call runs on its own goroutine; `await` is a plain blocking call.
+  // `async` at the call site is the goroutine; the plain call blocks.
   should.be_true(string.contains(go, "go work(x)"))
   should.be_true(string.contains(go, "x = work(x)"))
 }
 
-pub fn non_async_statement_call_has_no_goroutine_test() {
+pub fn a_statement_call_has_no_goroutine_test() {
   let go =
     compile(
       "proc main(): void {\n\twork()\n}\nproc work(): void {\n\techo \"x\"\n}\n",
     )
-  // Only async calls become goroutines; ordinary proc calls do not.
+  // A call discarded as a statement still waits for it: only `async` spawns.
   should.be_false(string.contains(go, "go work()"))
   should.be_true(string.contains(go, "work()"))
+}
+
+pub fn async_is_not_a_declaration_modifier_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "async func work(): Str {\n\treturn \"x\"\n}\nproc main(): void {\n\techo work()\n}\n",
+    )
+  should.be_true(string.contains(msg, "`async` is not part of a declaration"))
+}
+
+pub fn async_has_no_value_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "func work(): Str {\n\treturn \"x\"\n}\nproc main(): void {\n\th := async work()\n\techo h\n}\n",
+    )
+  should.be_true(string.contains(msg, "`async` has no value"))
+}
+
+pub fn async_takes_a_call_test() {
+  let assert Error(msg) =
+    compiler.compile("proc main(): void {\n\tasync \"hi\"\n}\n")
+  should.be_true(string.contains(msg, "`async` takes a call"))
+}
+
+pub fn async_rejects_a_global_builtin_test() {
+  // Firing off a builtin leaves nothing behind: its whole purpose is its value.
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {\n\tv := [\"a\"]\n\tasync len(v)\n}\n",
+    )
+  should.be_true(string.contains(msg, "fires a call off and keeps nothing"))
+}
+
+pub fn async_rejects_a_partial_application_test() {
+  // `f(1, _)` makes a function value; nothing runs until something calls it.
+  let assert Error(msg) =
+    compiler.compile(
+      "func add(a: Int, b: Int): Int {\n\treturn a + b\n}\nproc main(): void {\n\tasync add(1, _)\n}\n",
+    )
+  should.be_true(string.contains(msg, "makes this a partial application"))
+}
+
+pub fn async_rejects_a_constructor_test() {
+  // A constructor builds a value and runs no body, so there is nothing to spawn.
+  let assert Error(own) =
+    compiler.compile(
+      "type Box {\n\tn: Int\n}\nproc main(): void {\n\tasync Box(1)\n}\n",
+    )
+  should.be_true(string.contains(own, "is a constructor"))
+
+  let assert Error(builtin) =
+    compiler.compile(
+      "proc main(): void {\n\tasync hive.net.HttpRequest(\"GET\", \"http://x\", [], \"\")\n}\n",
+    )
+  should.be_true(string.contains(builtin, "is a constructor"))
+}
+
+pub fn async_is_not_a_loop_clause_test() {
+  // A loop's init and post exist to set up and advance the condition, and a call
+  // nothing waits for has no value to advance it with.
+  let assert Error(msg) =
+    compiler.compile(
+      "func f(): Int {\n\treturn 1\n}\nproc main(): void {\n\tfor async f(); true; {\n\t\tbreak\n\t}\n}\n",
+    )
+  should.be_true(string.contains(msg, "cannot be a loop's init or post clause"))
+}
+
+pub fn async_works_on_a_proc_and_on_the_standard_library_test() {
+  let go =
+    compile(
+      "proc log(text: Str): void {\n\techo text\n}\nproc main(): void {\n\tasync log(\"x\")\n\tasync hive.task.sleep(10)\n}\n",
+    )
+  should.be_true(string.contains(go, "go log(\"x\")"))
+  should.be_true(string.contains(go, "go hive.Sleep(10)"))
 }
 
 // ---------------------------------------------------------------------------
@@ -2140,12 +2214,13 @@ pub fn syslink_self_and_monitor_are_not_escapes_test() {
   spawn_verdict(go) |> should.equal("true")
 }
 
-// Handing the envelope to a task lets an answer arrive after the turn, so the
-// fast failure has to be switched off or it would cut off a live request.
+// Handing the envelope to a call the handler does not wait for lets an answer
+// arrive after the turn, so the fast failure has to be switched off or it would
+// cut off a live request.
 pub fn syslink_envelope_handed_to_a_task_defers_test() {
   let assert Ok(go) =
     compiler.compile(
-      "type Op {\n\tGo\n}\n\nasync func later(from: hive.syslink.Envelope): void {\n\thive.syslink.answer(from, Op.Go())\n}\n\nproc box(n: Int, op: Op, from: hive.syslink.Envelope): Int {\n\tlater(from)\n\treturn n\n}\n\nproc main(): void {\n\thive.syslink.spawn(box, 0)\n}\n",
+      "type Op {\n\tGo\n}\n\nfunc later(from: hive.syslink.Envelope): void {\n\thive.syslink.answer(from, Op.Go())\n}\n\nproc box(n: Int, op: Op, from: hive.syslink.Envelope): Int {\n\tasync later(from)\n\treturn n\n}\n\nproc main(): void {\n\thive.syslink.spawn(box, 0)\n}\n",
     )
   spawn_verdict(go) |> should.equal("false")
 }
@@ -2381,7 +2456,7 @@ pub fn syslink_address_parameter_is_callable_test() {
   let assert Ok(go) =
     compiler.compile(
       service_prelude
-      <> "proc tell(a: hive.syslink.Address): void {\n\ta(Op.Put(\"k\"))\n}\n\nproc main(): void {\n\ttell(hive.syslink.spawn(box, 0))\n}\n",
+      <> "proc tell(a: hive.syslink.Address): void {\n\tasync a(Op.Put(\"k\"))\n}\n\nproc main(): void {\n\ttell(hive.syslink.spawn(box, 0))\n}\n",
     )
   string.contains(go, "hive.SyslinkSend(") |> should.be_true
 }
@@ -2401,105 +2476,121 @@ pub fn syslink_address_shadows_a_func_of_the_same_name_test() {
   let assert Ok(go) =
     compiler.compile(
       service_prelude
-      <> "func b(n: Int): Int {\n\treturn n\n}\n\nproc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tb(Op.Put(\"k\"))\n}\n",
+      <> "func b(n: Int): Int {\n\treturn n\n}\n\nproc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tasync b(Op.Put(\"k\"))\n}\n",
     )
   string.contains(go, "hive.SyslinkSend(") |> should.be_true
 }
 
-// Discarded, a send is a cast: nothing is registered for a reply, so it lowers
-// to the cheaper runtime call.
+// `async`, a send is a cast: nothing is registered for a reply, so it lowers to
+// the cheaper runtime call and cannot fail.
 pub fn syslink_discarded_send_is_a_cast_test() {
   let assert Ok(go) =
     compiler.compile(
       service_prelude
-      <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tb(Op.Put(\"k\"))\n}\n",
+      <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tasync b(Op.Put(\"k\"))\n}\n",
     )
   string.contains(go, "hive.SyslinkSend(") |> should.be_true
   string.contains(go, "hive.SyslinkSendAwaitable(") |> should.be_false
 }
 
-// Awaited, the very same statement is a request — and the answer needs no type
-// annotation, because a service replies with one of its own messages.
+// Written plainly, the very same call is a request that waits for the answer —
+// and the answer needs no type annotation, because a service replies with one of
+// its own messages.
 pub fn syslink_awaited_send_is_a_request_test() {
   let assert Ok(go) =
     compiler.compile(
       service_prelude
-      <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tif await b(Op.Count()) is Result.Ok(reply) {\n\t\tif reply is Op.Put(k) {\n\t\t\techo k\n\t\t}\n\t}\n}\n",
+      <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tif b(Op.Count()) is Result.Ok(reply) {\n\t\tif reply is Op.Put(k) {\n\t\t\techo k\n\t\t}\n\t}\n}\n",
     )
   string.contains(go, "hive.SyslinkSendAwaitable(") |> should.be_true
   string.contains(go, "hive.SyslinkAwait(") |> should.be_true
 }
 
-// A request can be held and awaited later, which is what makes it worth having a
-// value at all.
+// The wait can be bounded, and running out of patience folds into syslink's own
+// error rather than wrapping a second Result around the first.
 pub fn syslink_held_request_compiles_test() {
   compiler.compile(
     service_prelude
-    <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tpending := b(Op.Count())\n\techo \"meanwhile\"\n\tif await pending with timeout 250 is Result.Error(e) {\n\t\techo e.reason\n\t}\n}\n",
+    <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tif b(Op.Count()) with timeout 250 is Result.Error(e) {\n\t\techo e.reason\n\t}\n}\n",
   )
   |> should.be_ok
 }
 
+// An await-all over sends needs no goroutine at all: each send registers for its
+// answer, and the barrier waits on the connection's reader.
 pub fn syslink_await_many_requests_compiles_test() {
-  compiler.compile(
-    service_prelude
-    <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tboth := await [b(Op.Count()), b(Op.Count())] with timeout 500\n\tif both[0] is Result.Ok(_) {\n\t\techo \"first answered\"\n\t}\n}\n",
-  )
-  |> should.be_ok
+  let assert Ok(go) =
+    compiler.compile(
+      service_prelude
+      <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tboth := await [b(Op.Count()), b(Op.Count())] with timeout 500\n\tif both[0] is Result.Ok(_) {\n\t\techo \"first answered\"\n\t}\n}\n",
+    )
+  string.contains(go, "hive.SyslinkAwaitAll(") |> should.be_true
+  string.contains(go, "hive.Spawn(") |> should.be_false
 }
 
 // ---------------------------------------------------------------------------
-// `await ... with timeout <ms>`
+// `with timeout <ms>`
 // ---------------------------------------------------------------------------
 
-const async_prelude = "async func slow(text: Str): Str {\n\treturn text\n}\n"
+const async_prelude = "func slow(text: Str): Str {\n\treturn text\n}\n"
 
-// Bounding the wait on a plain task is what gives it a failure case, so the
-// award becomes a Result exactly when the clause is written.
+// Bounding a wait is what gives it a failure case, so the call becomes a Result
+// exactly when the clause is written.
 pub fn await_timeout_yields_a_result_test() {
   compiler.compile(
     async_prelude
-    <> "proc main(): void {\n\th := slow(\"x\")\n\tif await h with timeout 50 is Result.Error(err) {\n\t\techo err.message\n\t\techo err.waited\n\t}\n}\n",
+    <> "proc main(): void {\n\tif slow(\"x\") with timeout 50 is Result.Error(err) {\n\t\techo err.message\n\t\techo err.waited\n\t}\n}\n",
   )
   |> should.be_ok
 }
 
-// Without the clause the same await yields the plain value and lowers to a bare
-// `.Await()`. (Hive has no full type checker, so *treating* that value as a
-// Result is caught by the Go compiler rather than here — the observable
-// difference at this level is the lowering.)
+// Without the clause the same call yields the plain value and waits as long as it
+// takes — no goroutine, no channel, nothing to schedule.
 pub fn await_without_timeout_yields_the_value_test() {
   let assert Ok(go) =
     compiler.compile(
-      async_prelude
-      <> "proc main(): void {\n\th := slow(\"x\")\n\techo await h\n}\n",
+      async_prelude <> "proc main(): void {\n\techo slow(\"x\")\n}\n",
     )
-  string.contains(go, "h.Await()") |> should.be_true
+  string.contains(go, "fmt.Println(slow(\"x\"))") |> should.be_true
   string.contains(go, "AwaitTimeout") |> should.be_false
+  string.contains(go, "hive.Spawn(") |> should.be_false
 }
 
+// One deadline across a whole await-all, not one per call.
 pub fn await_timeout_on_a_vector_compiles_test() {
-  compiler.compile(
-    async_prelude
-    <> "proc main(): void {\n\ths := [slow(\"a\"), slow(\"b\")]\n\tif await hs with timeout 500 is Result.Ok(done) {\n\t\techo join(done, \",\")\n\t}\n}\n",
-  )
-  |> should.be_ok
+  let assert Ok(go) =
+    compiler.compile(
+      async_prelude
+      <> "proc main(): void {\n\tif await [slow(\"a\"), slow(\"b\")] with timeout 500 is Result.Ok(done) {\n\t\techo join(done, \",\")\n\t}\n}\n",
+    )
+  string.contains(go, "hive.AwaitAllTimeout(") |> should.be_true
 }
 
-// A direct `await call()` normally needs no handle at all, but a bounded one does
-// — something has to still be running when the wait gives up.
+// A bounded call needs a task even though only one call is involved: something
+// has to still be running when the wait gives up.
 pub fn await_timeout_on_a_direct_call_spawns_a_handle_test() {
   let assert Ok(go) =
     compiler.compile(
       async_prelude
-      <> "proc main(): void {\n\tif await slow(\"x\") with timeout 50 is Result.Ok(v) {\n\t\techo v\n\t}\n}\n",
+      <> "proc main(): void {\n\tif slow(\"x\") with timeout 50 is Result.Ok(v) {\n\t\techo v\n\t}\n}\n",
     )
   string.contains(go, "hive.AwaitTimeout(hive.Spawn(") |> should.be_true
 }
 
-pub fn with_timeout_only_follows_an_await_test() {
+// The clause bounds a wait, so there has to be a wait to bound.
+pub fn with_timeout_only_follows_a_wait_test() {
   compiler.compile("proc main(): void {\n\techo 1 with timeout 50\n}\n")
   |> should.be_error
+}
+
+// A `void` call has no value for the Result to carry, so bounding one is refused
+// rather than lowered to a type with no spelling.
+pub fn with_timeout_needs_a_value_to_carry_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "proc work(): void {\n\techo \"x\"\n}\nproc main(): void {\n\tif work() with timeout 50 is Result.Ok(_) {\n\t\techo \"done\"\n\t}\n}\n",
+    )
+  should.be_true(string.contains(msg, "there is nothing for it to carry"))
 }
 
 // `timeout` is deliberately not a reserved word: it means something only in the
@@ -2517,7 +2608,7 @@ pub fn timeout_clause_stops_before_is_test() {
   let assert Ok(go) =
     compiler.compile(
       async_prelude
-      <> "proc main(): void {\n\th := slow(\"x\")\n\tif await h with timeout 50 is Result.Ok(v) {\n\t\techo v\n\t}\n}\n",
+      <> "proc main(): void {\n\tif slow(\"x\") with timeout 50 is Result.Ok(v) {\n\t\techo v\n\t}\n}\n",
     )
   string.contains(go, "50.IsOk()") |> should.be_false
   string.contains(go, ", 50)") |> should.be_true
@@ -3371,156 +3462,129 @@ pub fn non_exhaustive_variant_match_is_rejected_test() {
 }
 
 // ---------------------------------------------------------------------------
-// Concurrency: async / await
+// Concurrency: `async` and the await-all
 // ---------------------------------------------------------------------------
 
-// Wraps a `main` body with two async funcs to exercise the call-site forms.
+// Wraps a `main` body with two ordinary funcs to exercise the call-site forms.
 fn async_prog(body: String) -> String {
-  "async func slowShout(text: Str): Str {\n\treturn text + \"!!!\"\n}\n"
-  <> "async func lengthOf(text: Str): Int {\n\treturn len(text)\n}\n"
+  "func slowShout(text: Str): Str {\n\treturn text + \"!!!\"\n}\n"
+  <> "func lengthOf(text: Str): Int {\n\treturn len(text)\n}\n"
   <> "proc main(): void {\n"
   <> body
   <> "}\n"
 }
 
-pub fn async_bare_statement_is_fire_and_forget_test() {
-  let go = compile(async_prog("\tslowShout(\"hi\")\n"))
-  // A bare async call as a statement runs on a goroutine, result discarded — no
-  // handle, no channel.
+pub fn async_statement_is_fire_and_forget_test() {
+  let go = compile(async_prog("\tasync slowShout(\"hi\")\n"))
+  // `async` runs the call on a goroutine and keeps nothing — no handle, no
+  // channel.
   should.be_true(string.contains(go, "go slowShout(\"hi\")"))
   should.be_false(string.contains(go, "hive.Spawn"))
 }
 
-pub fn async_direct_await_is_synchronous_test() {
-  let go = compile(async_prog("\techo await slowShout(\"hi\")\n"))
-  // `await someCall()` on a direct call needs neither goroutine nor channel.
+pub fn a_plain_call_waits_without_scheduling_anything_test() {
+  let go = compile(async_prog("\techo slowShout(\"hi\")\n"))
+  // Waiting for one call is just calling it: neither goroutine nor channel.
   should.be_true(string.contains(go, "fmt.Println(slowShout(\"hi\"))"))
   should.be_false(string.contains(go, "hive.Spawn"))
   should.be_false(string.contains(go, ".Await()"))
 }
 
-pub fn async_bound_call_spawns_a_handle_test() {
-  let go = compile(async_prog("\tjob := slowShout(\"hi\")\n\techo await job\n"))
-  should.be_true(string.contains(
-    go,
-    "job := hive.Spawn(func() string { return slowShout(\"hi\") })",
-  ))
-  should.be_true(string.contains(go, "fmt.Println(job.Await())"))
-}
-
-pub fn async_await_vector_joins_all_test() {
+pub fn await_all_spawns_each_call_and_joins_them_test() {
   let go =
     compile(async_prog(
       "\tStr[2] r = await [slowShout(\"a\"), slowShout(\"b\")]\n\techo r[0]\n",
     ))
-  // A vector of handles awaits into a statically-typed vector via AwaitAll.
+  // Every call is started, then one barrier resolves them in order into a
+  // statically-typed vector.
   should.be_true(string.contains(go, "hive.AwaitAll([]*hive.Async[string]{"))
+  should.be_true(string.contains(
+    go,
+    "hive.Spawn(func() string { return slowShout(\"a\") })",
+  ))
   should.be_true(string.contains(go, "var r []string ="))
 }
 
-pub fn async_heterogeneous_join_keeps_types_test() {
+pub fn await_all_of_one_is_still_a_barrier_test() {
+  let go = compile(async_prog("\techo len(await [slowShout(\"a\")])\n"))
+  should.be_true(string.contains(go, "hive.AwaitAll([]*hive.Async[string]{"))
+}
+
+pub fn await_all_length_is_how_many_calls_were_written_test() {
+  // Three calls make a `Str[3]`, so index 2 is in range and index 3 is not.
+  compiler.compile(async_prog(
+    "\tr := await [slowShout(\"a\"), slowShout(\"b\"), slowShout(\"c\")]\n\techo r[2]\n",
+  ))
+  |> should.be_ok
+  compiler.compile(async_prog(
+    "\tr := await [slowShout(\"a\"), slowShout(\"b\"), slowShout(\"c\")]\n\techo r[3]\n",
+  ))
+  |> should.be_error
+}
+
+pub fn await_all_over_void_calls_waits_for_them_all_test() {
   let go =
-    compile(async_prog(
-      "\tsize := lengthOf(\"x\")\n\tshout := slowShout(\"y\")\n\tInt n = await size\n\tStr s = await shout\n\techo n\n\techo s\n",
-    ))
-  // Two differently-typed tasks, each spawned then awaited — fully typed, no
-  // vector and no tuple involved.
-  should.be_true(string.contains(go, "hive.Spawn(func() int { return lengthOf"))
+    compile(
+      "proc log(text: Str): void {\n\techo text\n}\nproc main(): void {\n\tawait [log(\"a\"), log(\"b\")]\n}\n",
+    )
+  // Nothing to carry, so the task carries `hive.Unit` and the barrier's value is
+  // discarded.
+  should.be_true(string.contains(go, "hive.AwaitAll([]*hive.Async[hive.Unit]{"))
   should.be_true(string.contains(
     go,
-    "hive.Spawn(func() string { return slowShout",
+    "hive.Spawn(func() hive.Unit { log(\"a\"); return hive.Unit{} })",
   ))
-  should.be_true(string.contains(go, "var n int = size.Await()"))
-  should.be_true(string.contains(go, "var s string = shout.Await()"))
 }
 
-// --- a handle may be bound and awaited, and nothing else ---
-
-fn handle_error(body: String) -> String {
-  let assert Error(msg) = compiler.compile(async_prog(body))
-  msg
-}
-
-pub fn a_handle_cannot_be_passed_test() {
-  // Was accepted, then failed in the generated Go against a name the source
-  // never mentions: `cannot use h (variable of type *hive.Async[int])`.
+pub fn await_all_needs_calls_test() {
+  // A value already in hand has nothing to wait for.
   let assert Error(msg) =
-    compiler.compile(
-      "async func slow(n: Int): Int {\n\treturn n\n}\nfunc takes(x: Int): Int {\n\treturn x\n}\nproc main(): void {\n\th := slow(1)\n\techo takes(h)\n}\n",
-    )
-  should.be_true(string.contains(msg, "a task handle cannot be used here"))
+    compiler.compile(async_prog("\tx := \"a\"\n\techo len(await [x])\n"))
+  should.be_true(string.contains(msg, "every entry has to be a call"))
 }
 
-pub fn a_handle_cannot_be_echoed_test() {
-  // Was accepted and *ran*, printing the Go pointer: `&{0x… 0 <nil>}`.
-  let msg = handle_error("\th := slowShout(\"hi\")\n\techo h\n")
-  should.be_true(string.contains(msg, "a task handle cannot be used here"))
-  should.be_true(string.contains(msg, "reached with `await`"))
-}
-
-pub fn a_handle_cannot_be_returned_or_annotated_test() {
-  let assert Error(returned) =
-    compiler.compile(
-      "async func slow(n: Int): Int {\n\treturn n\n}\nfunc hold(): Int {\n\th := slow(1)\n\treturn h\n}\nproc main(): void {\n\techo hold()\n}\n",
-    )
-  should.be_true(string.contains(returned, "a task handle cannot be used here"))
-
-  let assert Error(annotated) =
-    compiler.compile(
-      "async func slow(n: Int): Int {\n\treturn n\n}\nproc main(): void {\n\tInt h = slow(1)\n\techo h\n}\n",
-    )
-  should.be_true(string.contains(annotated, "a task handle cannot be used here"))
-}
-
-pub fn a_handle_cannot_be_stored_test() {
-  let msg =
-    handle_error(
-      "\th := slowShout(\"hi\")\n\tmut Str[dyn] box = []\n\tappend(box, h)\n\techo len(box)\n",
-    )
-  should.be_true(string.contains(msg, "a task handle cannot be used here"))
-}
-
-pub fn a_vector_of_handles_cannot_be_passed_test() {
-  // The same rule one level up. `await [f(a), f(b)]` makes one of these, and
-  // until it is awaited it is just as escapable as a lone handle.
+pub fn await_all_needs_one_type_test() {
+  // One barrier resolves to one vector, and a vector holds one type.
   let assert Error(msg) =
-    compiler.compile(
-      "async func slow(n: Int): Int {\n\treturn n\n}\nfunc takes(v: Int[]): Int {\n\treturn len(v)\n}\nproc main(): void {\n\techo takes([slow(1), slow(2)])\n}\n",
-    )
-  should.be_true(string.contains(
-    msg,
-    "a vector of task handles cannot be used here",
-  ))
+    compiler.compile(async_prog(
+      "\tr := await [slowShout(\"a\"), lengthOf(\"b\")]\n\techo len(r)\n",
+    ))
+  should.be_true(string.contains(msg, "has to answer with the same type"))
+  should.be_true(string.contains(msg, "Str and Int"))
 }
 
-pub fn a_vector_of_handles_cannot_be_indexed_or_walked_test() {
-  let indexed = handle_error("\techo [slowShout(\"a\"), slowShout(\"b\")][0]\n")
-  should.be_true(string.contains(indexed, "a task handle cannot be used here"))
-
-  let walked =
-    handle_error(
-      "\ths := [slowShout(\"a\"), slowShout(\"b\")]\n\tfor each h in hs {\n\t\techo h\n\t}\n",
-    )
-  should.be_true(string.contains(
-    walked,
-    "a vector of task handles cannot be used here",
-  ))
+pub fn await_all_is_not_empty_test() {
+  let assert Error(msg) =
+    compiler.compile(async_prog("\techo len(await [])\n"))
+  should.be_true(string.contains(msg, "waits for nothing at all"))
 }
 
-pub fn every_legal_handle_form_still_compiles_test() {
-  // The rule only closes what was never meant to be open: binding, awaiting
-  // (twice, inline, with a timeout, and a whole vector at once) and discarding
-  // all keep working.
+pub fn a_single_call_needs_no_await_test() {
+  let assert Error(msg) =
+    compiler.compile(async_prog("\techo await slowShout(\"a\")\n"))
+  should.be_true(string.contains(msg, "takes a list of calls"))
+}
+
+// Differently-typed work is waited for one call at a time, and each of those is
+// an ordinary blocking call — nothing left to name, nothing left to leak.
+pub fn differently_typed_calls_are_waited_for_in_sequence_test() {
+  let go =
+    compile(async_prog(
+      "\tStr s = slowShout(\"y\")\n\tInt n = lengthOf(\"x\")\n\techo s\n\techo n\n",
+    ))
+  should.be_true(string.contains(go, "var s string = slowShout(\"y\")"))
+  should.be_true(string.contains(go, "var n int = lengthOf(\"x\")"))
+  should.be_false(string.contains(go, "hive.Spawn"))
+}
+
+// Every concurrent form together, to keep the surface honest about what compiles.
+pub fn every_concurrent_form_still_compiles_test() {
   compiler.compile(async_prog(
-    "\tslowShout(\"a\")\n"
-    <> "\th := slowShout(\"b\")\n"
-    <> "\techo await h\n"
-    <> "\techo await h\n"
-    <> "\techo await slowShout(\"c\")\n"
+    "\tasync slowShout(\"a\")\n"
+    <> "\techo slowShout(\"b\")\n"
     <> "\techo len(await [slowShout(\"d\"), slowShout(\"e\")])\n"
-    <> "\ths := [slowShout(\"f\"), slowShout(\"g\")]\n"
-    <> "\techo len(await hs)\n"
-    <> "\tif await h with timeout 1000 is Result.Ok(v) {\n\t\techo v\n\t}\n",
+    <> "\tif slowShout(\"f\") with timeout 1000 is Result.Ok(v) {\n\t\techo v\n\t}\n"
+    <> "\tif await [slowShout(\"g\")] with timeout 1000 is Result.Ok(all) {\n\t\techo len(all)\n\t}\n",
   ))
   |> should.be_ok
 }
@@ -3980,9 +4044,19 @@ pub fn a_spawned_task_copies_before_it_starts_test() {
   // protect against, so the arguments are bound in the caller first.
   let go =
     compile(
-      "async func work(v: Str[dyn]): Int {\n\treturn len(v)\n}\nproc main(): void {\n\tmut v := [\"a\"]\n\th := work(v)\n\tv[0] = \"b\"\n\techo await h\n}\n",
+      "func work(v: Str[dyn]): Int {\n\treturn len(v)\n}\nproc main(): void {\n\tmut v := [\"a\"]\n\tn := await [work(v)]\n\tv[0] = \"b\"\n\techo n[0]\n}\n",
     )
   should.be_true(string.contains(go, "_a0 := hive.CloneVec(v); return hive.Spawn("))
+}
+
+pub fn a_fire_and_forget_call_copies_in_the_caller_test() {
+  // `go f(x)` evaluates its arguments in the calling goroutine already, so the
+  // copy needs no thunk around it — and still happens before the task starts.
+  let go =
+    compile(
+      "func work(v: Str[dyn]): Int {\n\treturn len(v)\n}\nproc main(): void {\n\tmut v := [\"a\"]\n\tasync work(v)\n\tv[0] = \"b\"\n\techo len(v)\n}\n",
+    )
+  should.be_true(string.contains(go, "go work(hive.CloneVec(v))"))
 }
 
 pub fn a_mut_argument_to_a_constructor_is_copied_in_test() {
@@ -4295,44 +4369,31 @@ pub fn a_walk_takes_no_named_arguments_test() {
   should.be_true(string.contains(msg, "does not accept named arguments"))
 }
 
-// --- an `async func` transform makes the walk concurrent ---
+// --- a walk is sequential, always ---
 
-const async_walkers = "func labelBody(n: Int): Str {\n\treturn \"#{n}\"\n}\nfunc isEvenBody(n: Int): Bool {\n\treturn n % 2 == 0\n}\nfunc asPortBody(s: Str): Result<Int, Bool> {\n\treturn Result.Ok(1)\n}\nasync func label(n: Int): Str {\n\treturn labelBody(n)\n}\nasync func isEven(n: Int): Bool {\n\treturn isEvenBody(n)\n}\nasync func asPort(s: Str): Result<Int, Bool> {\n\treturn asPortBody(s)\n}\n"
+const async_walkers = "func label(n: Int): Str {\n\treturn \"#{n}\"\n}\nfunc isEven(n: Int): Bool {\n\treturn n % 2 == 0\n}\nfunc asPort(s: Str): Result<Int, Bool> {\n\treturn Result.Ok(1)\n}\n"
 
 fn async_walk(body: String) -> Result(String, String) {
   compiler.compile(async_walkers <> "proc main(): void {\n" <> body <> "}\n")
 }
 
-pub fn a_walk_over_an_async_func_runs_every_element_at_once_test() {
-  // All of a walk's calls are known before the first one runs, so they all go
-  // at once and the walk awaits them before answering.
+pub fn a_walk_is_sequential_test() {
+  // Concurrency is written where it happens, never hidden inside a builtin whose
+  // signature says nothing about it. Each walk has exactly one lowering.
   let assert Ok(m) = async_walk("\tInt[dyn] v = [1]\n\techo len(map(v, label))\n")
-  should.be_true(string.contains(m, "hive.MapAsync(v, label)"))
+  should.be_true(string.contains(m, "hive.Map(v, label)"))
+  should.be_false(string.contains(m, "hive.Spawn"))
 
-  let assert Ok(f) = async_walk("\tInt[dyn] v = [1]\n\techo len(filter(v, isEven))\n")
-  should.be_true(string.contains(f, "hive.FilterAsync(v, isEven)"))
+  let assert Ok(f) =
+    async_walk("\tInt[dyn] v = [1]\n\techo len(filter(v, isEven))\n")
+  should.be_true(string.contains(f, "hive.Filter(v, isEven)"))
 
   let assert Ok(fm) =
     async_walk("\tStr[dyn] r = [\"1\"]\n\techo len(filterMap(r, asPort))\n")
-  should.be_true(string.contains(fm, "hive.FilterMapAsync(r, asPort)"))
+  should.be_true(string.contains(fm, "hive.FilterMap(r, asPort)"))
 }
 
-pub fn a_plain_func_walk_stays_sequential_test() {
-  let assert Ok(go) =
-    async_walk("\tInt[dyn] v = [1]\n\techo len(map(v, labelBody))\n")
-  should.be_true(string.contains(go, "hive.Map(v, labelBody)"))
-  should.be_false(string.contains(go, "MapAsync"))
-}
-
-pub fn an_async_walk_has_the_same_type_as_a_sync_one_test() {
-  // `async` is about how long the walk takes, not what it answers with: same
-  // element type, so the result still lands in a declared `Str[dyn]`.
-  async_walk("\tInt[dyn] v = [1]\n\tStr[dyn] out = map(v, label)\n\techo len(out)\n")
-  |> should.be_ok
-}
-
-pub fn an_async_map_still_preserves_the_length_test() {
-  // Spawning does not change how many come back, so the bounds pass is unmoved.
+pub fn a_walk_preserves_the_length_test() {
   async_walk("\tInt[3] v = [1, 2, 3]\n\tout := map(v, label)\n\techo out[2]\n")
   |> should.be_ok
   let assert Error(msg) =
@@ -4340,34 +4401,24 @@ pub fn an_async_map_still_preserves_the_length_test() {
   should.be_true(string.contains(msg, "out of range for a vector of length 3"))
 }
 
-pub fn an_async_walk_never_yields_a_handle_test() {
-  // The walk awaits everything before it returns, so nothing escapes — the
-  // result is an ordinary vector that can be passed on.
-  async_walk(
-    "\tInt[dyn] v = [1]\n\techo join(map(v, label), \",\")\n\tfor each s in map(v, label) {\n\t\techo s\n\t}\n",
+// To run a batch of calls together you write the await-all yourself, which is
+// also where the count of them lives.
+pub fn a_batch_of_calls_runs_together_through_await_test() {
+  let assert Ok(go) =
+    async_walk(
+      "\tStr[2] both = await [label(1), label(2)]\n\techo join(both, \",\")\n",
+    )
+  should.be_true(string.contains(go, "hive.AwaitAll([]*hive.Async[string]{"))
+}
+
+// Nothing about a walk is concurrent any more, so a closure that fixes some of
+// the arguments is an ordinary function value like any other (see
+// `a_walk_takes_a_partial_application_test` above for the lowering).
+pub fn a_walk_takes_a_partially_applied_multi_arg_func_test() {
+  compiler.compile(
+    "func addN(a: Int, b: Int): Int {\n\treturn a + b\n}\nproc main(): void {\n\tInt[dyn] v = [1]\n\techo len(map(v, addN(10, _)))\n}\n",
   )
   |> should.be_ok
-}
-
-pub fn sort_rejects_an_async_comparator_test() {
-  // A sort picks each comparison from how the last one answered, so there is
-  // never more than one call to make and nothing to overlap.
-  let assert Error(msg) =
-    compiler.compile(
-      "async func desc(a: Int, b: Int): Bool {\n\treturn a > b\n}\nproc main(): void {\n\tInt[dyn] v = [3, 1]\n\techo len(sort(v, desc))\n}\n",
-    )
-  should.be_true(string.contains(msg, "cannot order by an `async func`"))
-  should.be_true(string.contains(msg, "Order by a plain `func`"))
-}
-
-pub fn a_walk_rejects_a_partial_application_of_an_async_func_test() {
-  // Previously emitted Go that did not compile: the closure's construction was
-  // spawned, rather than the call it stands for.
-  let assert Error(msg) =
-    compiler.compile(
-      "async func addN(a: Int, b: Int): Int {\n\treturn a + b\n}\nproc main(): void {\n\tInt[dyn] v = [1]\n\techo len(map(v, addN(10, _)))\n}\n",
-    )
-  should.be_true(string.contains(msg, "partial application of one is not a value"))
 }
 
 // --- `map` preserves its input's length; `filter`/`filterMap` cannot ---

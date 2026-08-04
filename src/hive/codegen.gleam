@@ -45,30 +45,14 @@ pub type Ty {
   /// A first-class function value. `pure` is True for a `func`, False for a
   /// `proc`; both lower to the same Go `func(...)` type.
   TyFunc(pure: Bool, params: List(Ty), ret: Ty)
-  /// A handle to an `async func` call still running on its own goroutine — the
-  /// value a bare async call evaluates to (Hive's `async T`). It has no surface
-  /// spelling: it is only ever inferred, held in a local binding, and consumed
-  /// by `await` (which unwraps it back to `inner`). Lowers to
-  /// `*hive.Async[inner]`.
-  TyAsync(inner: Ty)
   /// The address of a `hive.syslink` service, carrying the type of the mailbox
-  /// it delivers to. Like `async T` the payload type has no surface spelling:
-  /// it is inferred from the handler a service was spawned with, or from the
-  /// registry entry a name resolves to, which is what lets `send` be checked
-  /// against the mailbox it is addressing. An *annotated*
-  /// `hive.syslink.Address` carries `TyUnknown` and is simply unchecked.
-  /// Unlike `async T` an address is a plain value: it outlives its scope, can
-  /// be stored and sent, and is never awaited.
+  /// it delivers to. The payload type has no surface spelling: it is inferred
+  /// from the handler a service was spawned with, or from the registry entry a
+  /// name resolves to, which is what lets a send be checked against the mailbox
+  /// it is addressing. An *annotated* `hive.syslink.Address` carries
+  /// `TyUnknown` and is simply unchecked. An address is an ordinary value: it
+  /// outlives every scope, can be stored, and can travel inside a message.
   TyAddress(msg: Ty)
-  /// A `hive.syslink` request in flight — what a kept `send` evaluates to. Like
-  /// `async T` it has no surface spelling and is only ever inferred, bound and
-  /// consumed by `await`, which resolves it to `Result<msg, SyslinkError>`. A
-  /// service answers with one of its own messages, so the reply type *is* the
-  /// mailbox type and no annotation is needed anywhere.
-  ///
-  /// It is not a `TyAsync`: no goroutine is waiting behind it. The answer
-  /// arrives on the connection's reader, so the wait happens at the `await`.
-  TyPending(msg: Ty)
   /// The absence of a value — only meaningful as a function type's return, so
   /// a `proc(T): void` value lowers to `func(T)` with no Go return type.
   TyVoid
@@ -217,9 +201,6 @@ pub type Env {
     ret: Ty,
     /// The program's atom table: name -> compiled integer value.
     atoms: Dict(String, Int),
-    /// Names of the `async func`s: a bare call to one is fire-and-forget (a
-    /// goroutine); an `await`ed call blocks for its value.
-    asyncs: List(String),
     /// Which in-scope locals were declared `mut`. Used to decide whether a
     /// vector binding may share storage (both sides mutable) or must be cloned
     /// (either side immutable). Names absent here are treated as immutable —
@@ -265,13 +246,6 @@ pub fn module_env(module: ast.Module) -> Env {
     |> list.index_map(fn(name, i) { #(name, i) })
     |> dict.from_list
   let sigs = collect_sigs(types, module.decls)
-  let asyncs =
-    list.filter_map(module.decls, fn(d) {
-      case d {
-        ast.FuncDecl(name, _, _, _, True) -> Ok(name)
-        _ -> Error(Nil)
-      }
-    })
   let fns = collect_fns(module.decls)
   Env(
     types,
@@ -280,7 +254,6 @@ pub fn module_env(module: ast.Module) -> Env {
     dict.new(),
     TyUnknown,
     atoms,
-    asyncs,
     dict.new(),
     dict.new(),
     dict.new(),
@@ -330,7 +303,7 @@ pub fn generate(module: ast.Module) -> String {
     |> list.filter_map(fn(d) {
       case d {
         ast.ProcDecl(name, params, ret, body)
-        | ast.FuncDecl(name, params, ret, body, _) ->
+        | ast.FuncDecl(name, params, ret, body) ->
           Ok(gen_fn_decl(env, name, params, ret, body))
         ast.QueryDecl(name, params, ret, sql) ->
           Ok(gen_query_decl(env, name, params, ret, sql))
@@ -374,7 +347,7 @@ pub fn check_types(module: ast.Module) -> Result(Nil, String) {
   list.try_fold(module.decls, Nil, fn(_, d) {
     case d {
       ast.ProcDecl(_, params, ret, body)
-      | ast.FuncDecl(_, params, ret, body, _) ->
+      | ast.FuncDecl(_, params, ret, body) ->
         walk_stmts(fn_env(env, params, ret), body)
         |> result.map(fn(_) { Nil })
       ast.QueryDecl(_, params, ret, sql) -> {
@@ -414,9 +387,6 @@ fn walk_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
       )
     }
     ast.STypedDecl(typ, name, value, mutable) -> {
-      // `h := f(x)` keeps a handle; an annotation is the one thing a handle has
-      // no spelling for, so a typed declaration cannot hold one.
-      use _ <- result.try(no_handle(env, value))
       use _ <- result.try(walk_expr(env, value))
       Ok(
         Env(
@@ -431,15 +401,11 @@ fn walk_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
       )
     }
     ast.SAssign(target, value) -> {
-      // Reassignment is not a fresh binding: the name already has a type, and a
-      // handle has none to match.
-      use _ <- result.try(no_handles(env, [target, value]))
       use _ <- result.try(walk_expr(env, target))
       use _ <- result.try(walk_expr(env, value))
       Ok(env)
     }
     ast.SAssert(e) -> {
-      use _ <- result.try(no_handle(env, e))
       use _ <- result.try(walk_expr(env, e))
       use _ <- result.try(check_condition(env, e))
       Ok(env)
@@ -449,10 +415,14 @@ fn walk_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
       use _ <- result.try(check_discarded_sort(env, e))
       Ok(env)
     }
-    // A return would carry the task out of the scope that spawned it; `echo` and
-    // `panic` would render it as whatever Go prints a pointer as.
+    // `async <call>` fires the call off and keeps nothing, so the only thing to
+    // check is the call itself — and that firing it off leaves something behind.
+    ast.SAsync(call) -> {
+      use _ <- result.try(check_fire_and_forget(env, call))
+      use _ <- result.try(walk_expr(env, call))
+      Ok(env)
+    }
     ast.SReturn(Some(e)) | ast.SEcho(e) | ast.SPanic(e) -> {
-      use _ <- result.try(no_handle(env, e))
       use _ <- result.try(walk_expr(env, e))
       Ok(env)
     }
@@ -481,7 +451,6 @@ fn walk_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
       })
       use _ <- result.try(case cond {
         Some(e) -> {
-          use _ <- result.try(no_handle(ienv, e))
           use _ <- result.try(walk_expr(ienv, e))
           check_condition(ienv, e)
         }
@@ -496,9 +465,6 @@ fn walk_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
       Ok(env)
     }
     ast.SForEach(name, elem_type, iterable, body) -> {
-      // Walking a vector of handles would bind each element as a handle, which
-      // is a name for a task with no way to read it.
-      use _ <- result.try(no_handle(env, iterable))
       use _ <- result.try(walk_expr(env, iterable))
       let elem_ty = case elem_type {
         Some(t) -> ty_of_type_expr(env.types, t)
@@ -552,100 +518,154 @@ fn walk_expr(env: Env, e: ast.Expr) -> Result(Nil, String) {
     | ast.EBool(_)
     | ast.EAtom(_)
     | ast.EIdent(_) -> Ok(Nil)
-    ast.EMember(target, _) | ast.EIs(target, _) | ast.EWith(target, _) -> {
-      use _ <- result.try(no_handle(env, target))
+    ast.EMember(target, _) | ast.EIs(target, _) | ast.EWith(target, _) ->
       walk_expr(env, target)
-    }
-    ast.EIndex(target, index) -> {
-      use _ <- result.try(no_handles(env, [target, index]))
-      walk_exprs(env, [target, index])
-    }
-    ast.ESlice(target, low, high) -> {
-      let parts = [target, ..option.values([low, high])]
-      use _ <- result.try(no_handles(env, parts))
-      walk_exprs(env, parts)
-    }
-    ast.EBinary(_, l, r) -> {
-      use _ <- result.try(no_handles(env, [l, r]))
-      walk_exprs(env, [l, r])
-    }
-    // A vector literal's elements may be handles — `await [f(a), f(b)]` is the
-    // whole point. The literal itself is then held to the same rule as any other
-    // value by whatever consumes it, which is where an unawaited one is caught.
+    ast.EIndex(target, index) -> walk_exprs(env, [target, index])
+    ast.ESlice(target, low, high) ->
+      walk_exprs(env, [target, ..option.values([low, high])])
+    ast.EBinary(_, l, r) -> walk_exprs(env, [l, r])
     ast.EVector(items) -> walk_exprs(env, items)
     ast.EInterp(parts) ->
       list.try_fold(parts, Nil, fn(_, part) {
         case part {
           ast.ILit(_) -> Ok(Nil)
-          ast.IExpr(inner) -> {
-            use _ <- result.try(no_handle(env, inner))
-            walk_expr(env, inner)
-          }
+          ast.IExpr(inner) -> walk_expr(env, inner)
         }
       })
       |> result.map(fn(_) { Nil })
-    ast.ECall(callee, args) -> {
-      let values = list.map(args, fn(a) { a.value })
-      use _ <- result.try(no_handles(env, values))
-      walk_exprs(env, [callee, ..values])
+    ast.ECall(callee, args) ->
+      walk_exprs(env, [callee, ..list.map(args, fn(a) { a.value })])
+    ast.EUsing(source, kind) ->
+      walk_exprs(env, [source, ..ast.using_exprs(kind)])
+    ast.EAwait(calls, timeout) -> {
+      use _ <- result.try(check_await(env, calls, timeout))
+      walk_exprs(env, list.append(calls, option.values([timeout])))
     }
-    ast.EUsing(source, kind) -> {
-      let parts = [source, ..ast.using_exprs(kind)]
-      use _ <- result.try(no_handles(env, parts))
-      walk_exprs(env, parts)
-    }
-    // `await` is the one thing that reads a handle, so its operand is the one
-    // place a handle belongs. A `with timeout` bound is an ordinary Int.
-    ast.EAwait(value, timeout) -> {
-      use _ <- result.try(no_handles(env, option.values([timeout])))
-      walk_exprs(env, [value, ..option.values([timeout])])
+    ast.ETimed(call, ms) -> {
+      use _ <- result.try(check_timed(env, call))
+      walk_exprs(env, [call, ms])
     }
   }
 }
 
-// A task handle may be **bound** and **awaited**, and nothing else: not
-// annotated, not passed, not returned, not indexed, not echoed. That is what
-// keeps a task from outliving the scope that spawned it, and it is what lets the
-// handle have no surface type at all.
-//
-// The rule holds for a *vector* of handles too. `await [f(a), f(b)]` makes one,
-// and until this it was the only safe thing to do with one: bound and indexed it
-// yielded a `*hive.Async` printed as a pointer, and passed to a `T[]` parameter
-// it produced a Go type error against a generated name the source never
-// mentions.
-fn no_handle(env: Env, e: ast.Expr) -> Result(Nil, String) {
-  case handle_kind(infer(env, e)) {
-    None -> Ok(Nil)
-    Some(what) ->
-      Error(
-        what
-        <> " cannot be used here. A task's value is reached with `await` and "
-        <> "nowhere else — `await h`, or `await [f(a), f(b)]` for several at "
-        <> "once, which resolves them in order. Keeping one in any other way "
-        <> "(passing it, returning it, storing it, indexing it) is what would "
-        <> "let the task outlive the scope that spawned it, so it has no type "
-        <> "to be written down as. Await it where its value is wanted.",
-      )
+// `async <call>` throws the result away, so the call has to be one there is a
+// point in starting: work that takes time. The global builtins are the one group
+// that never is — `len`, `join`, `append` and the rest only compute a value or
+// rearrange the caller's own storage, and a value nobody can read is no value at
+// all.
+fn check_fire_and_forget(env: Env, call: ast.Expr) -> Result(Nil, String) {
+  case call {
+    ast.ECall(callee, args) ->
+      case builtins.called(callee), has_hole(args), constructs(env, callee) {
+        Some(name), _, _ ->
+          Error(
+            "`async` fires a call off and keeps nothing of it, and `"
+            <> name
+            <> "` is a builtin whose whole purpose is the value it hands back — "
+            <> "there would be nothing left of the call. `async` is for work "
+            <> "that takes time: your own procs and funcs, the standard library, "
+            <> "a service.",
+          )
+        // `f(1, _)` does not call `f`: it makes a function value that will,
+        // later, when something calls it. There is no work here to start.
+        _, True, _ ->
+          Error(
+            "`async` needs a call, and a `_` makes this a partial application — "
+            <> "a function value waiting for the argument that fills the hole. "
+            <> "Nothing runs until something calls it, so there is nothing to "
+            <> "fire off. Pass the whole argument, or bind the value and `async` "
+            <> "a call through it.",
+          )
+        // A constructor builds a value out of what it was handed; there is no
+        // body to run and nothing to wait for even if you wanted to.
+        _, _, Some(what) ->
+          Error(
+            "`async` needs a call that does work, and `"
+            <> what
+            <> "` is a constructor: it builds a value out of its arguments and "
+            <> "runs no body. There is nothing to put on a thread of its own.",
+          )
+        None, False, None -> Ok(Nil)
+      }
+    _ -> Ok(Nil)
   }
 }
 
-fn no_handles(env: Env, exprs: List(ast.Expr)) -> Result(Nil, String) {
-  list.try_fold(exprs, Nil, fn(_, e) { no_handle(env, e) })
-  |> result.map(fn(_) { Nil })
-}
-
-// How a type carries a running task, for the error text. Nesting deeper than one
-// vector has no spelling and no `await` that reads it, so it reports as the
-// vector case rather than going unnoticed.
-fn handle_kind(t: Ty) -> Option(String) {
-  case t {
-    TyAsync(_) -> Some("a task handle")
-    TyVec(inner) ->
-      case handle_kind(inner) {
-        Some(_) -> Some("a vector of task handles")
+// The type a callee constructs, if constructing is all it does — a declared type
+// by its bare name, one of its variants, or a runtime struct like
+// `hive.net.HttpRequest`.
+fn constructs(env: Env, callee: ast.Expr) -> Option(String) {
+  case callee {
+    ast.EIdent(name) ->
+      case dict.has_key(env.types, name) {
+        True -> Some(name)
+        False -> None
+      }
+    ast.EMember(ast.EIdent(name), variant) ->
+      case dict.has_key(env.types, name) {
+        True -> Some(name <> "." <> variant)
+        False -> None
+      }
+    ast.EMember(ast.EMember(ast.EIdent("hive"), ns), fname) ->
+      case builtin_fields(fname) {
+        Some(_) -> Some("hive." <> ns <> "." <> fname)
         None -> None
       }
     _ -> None
+  }
+}
+
+// Every entry of an await-all is started before any of them is waited for, so
+// they all have to answer with the same kind of thing — the barrier resolves to
+// one vector, and a vector holds one type. Void calls are allowed and give a
+// barrier with no value: `await [p(a), p(b)]` as a statement means "both of
+// these, then carry on".
+fn check_await(
+  env: Env,
+  calls: List(ast.Expr),
+  timeout: Option(ast.Expr),
+) -> Result(Nil, String) {
+  let tys = list.map(calls, fn(c) { call_ty(env, c) })
+  use _ <- result.try(case tys {
+    [first, ..rest] ->
+      case list.all(rest, fn(t) { ty_accepts(first, t) || ty_accepts(t, first) }) {
+        True -> Ok(Nil)
+        False ->
+          Error(
+            "an `await` list resolves to one vector, so every call in it has to "
+            <> "answer with the same type — this one holds "
+            <> string.join(list.unique(list.map(tys, show_ty)), " and ")
+            <> ". Calls of different types are waited for one at a time, which "
+            <> "still overlaps nothing: run them in sequence, or give them a "
+            <> "common type to answer with.",
+          )
+      }
+    [] -> Ok(Nil)
+  })
+  case timeout, tys {
+    Some(_), [TyVoid, ..] ->
+      Error(
+        "`with timeout` answers with a `Result` carrying whatever was waited "
+        <> "for, and these calls return `void` — there is nothing for it to "
+        <> "carry. Have them return something (a `Bool` is enough) if the "
+        <> "deadline needs to be a value you can handle.",
+      )
+    _, _ -> Ok(Nil)
+  }
+}
+
+// The same rule for a single bounded call: a `Result<void, _>` has no spelling,
+// so there has to be a value to hand back.
+fn check_timed(env: Env, call: ast.Expr) -> Result(Nil, String) {
+  case call_ty(env, call) {
+    TyVoid ->
+      Error(
+        "`with timeout` answers with a `Result` carrying the value that was "
+        <> "waited for, and this call returns `void` — there is nothing for it "
+        <> "to carry. Have it return something (a `Bool` is enough) if the "
+        <> "deadline needs to be a value you can handle.",
+      )
+    _ -> Ok(Nil)
   }
 }
 
@@ -713,7 +733,6 @@ fn check_walk_call(env: Env, e: ast.Expr) -> Result(Nil, String) {
     None -> Ok(Nil)
     Some(#(name, [ast.Arg(_, subject), ast.Arg(_, f)])) -> {
       use elem <- result.try(walk_elem_ty(env, name, subject))
-      use _ <- result.try(check_async_partial(env, f))
       check_walk_fn(env, name, elem, f)
     }
     Some(#(name, args)) ->
@@ -835,45 +854,6 @@ fn check_walk_fn(
         <> "`. Pass a `func` by name, or a partial application of one "
         <> "(`f(fixed, _)`).",
       )
-  }
-}
-
-// Whether an expression names an `async func` by its bare name, which is the
-// one shape a walk can make concurrent. A *partial application* of one cannot
-// be: `TyFunc` carries no asyncness, so the closure it builds would be spawned
-// where the call should be (see `check_async_partial`).
-fn names_async_func(env: Env, f: ast.Expr) -> Bool {
-  case f {
-    ast.EIdent(name) -> list.contains(env.asyncs, name)
-    _ -> False
-  }
-}
-
-// A partial application of an `async func` has no honest lowering: a bare call
-// to one spawns, so `addN(10, _)` spawns the making of the closure rather than
-// the call it stands for, and the Go that comes out does not compile. Saying so
-// here beats two errors against `hive.Map[T, K]` and a generated hole name.
-fn check_async_partial(env: Env, f: ast.Expr) -> Result(Nil, String) {
-  case f {
-    ast.ECall(ast.EIdent(name), args) ->
-      case
-        list.contains(env.asyncs, name)
-        && list.any(args, fn(a) { a.value == ast.EIdent("_") })
-      {
-        False -> Ok(Nil)
-        True ->
-          Error(
-            "`"
-            <> name
-            <> "` is an `async func`, and a partial application of one is not a "
-            <> "value this can hold: a bare call to an async func spawns, so "
-            <> "there is nothing left to stand for the call itself. Pass the "
-            <> "async func by name — the walk then runs every element at once "
-            <> "and awaits them all — or wrap it in a plain `func` that fixes "
-            <> "the other arguments.",
-          )
-      }
-    _ -> Ok(Nil)
   }
 }
 
@@ -1021,7 +1001,6 @@ fn no_order_reason(env: Env, ty: Ty, seen: List(String)) -> String {
   case ty {
     TyUnknown -> "the element type is not known here"
     TyFunc(_, _, _) -> "a function value has no order"
-    TyAsync(_) -> "a task handle has no order"
     TyAddress(_) -> "a service address has no order"
     TyBuiltin(name) ->
       "`hive."
@@ -1083,24 +1062,6 @@ fn unordered_field(env: Env, name: String, seen: List(String)) -> String {
 // The comparator of the two-argument form: a pure `func` over two elements
 // answering which of them comes first.
 fn check_sort_fn(env: Env, elem: Ty, f: ast.Expr) -> Result(Nil, String) {
-  // A walk can go concurrent because every call it will make is known before the
-  // first one runs. A sort's are not: which pair it compares next depends on how
-  // the last comparison answered, so there is never more than one call to make
-  // at a time. An async comparator would be spawned and immediately waited for,
-  // once per comparison — strictly slower than a plain `func`, and with the
-  // goroutine churn on top.
-  use _ <- result.try(case names_async_func(env, f) {
-    False -> Ok(Nil)
-    True ->
-      Error(
-        "`sort` cannot order by an `async func`. A walk runs every element at "
-        <> "once because it knows all of its calls up front; a sort picks each "
-        <> "comparison from how the previous one answered, so there is only "
-        <> "ever one to make and nothing to overlap — every call would be "
-        <> "spawned and waited for on the spot. Order by a plain `func`.",
-      )
-  })
-  use _ <- result.try(check_async_partial(env, f))
   case infer(env, f) {
     TyFunc(pure, params, ret) -> {
       // A sort says nothing about how many comparisons it makes or in what
@@ -1264,9 +1225,7 @@ fn ty_accepts(param: Ty, arg: Ty) -> Bool {
     TyVec(p), TyVec(a) -> ty_accepts(p, a)
     TyResult(po, pe), TyResult(ao, ae) ->
       ty_accepts(po, ao) && ty_accepts(pe, ae)
-    TyAsync(p), TyAsync(a) -> ty_accepts(p, a)
     TyAddress(p), TyAddress(a) -> ty_accepts(p, a)
-    TyPending(p), TyPending(a) -> ty_accepts(p, a)
     // A func value widens to a proc slot, never the other way round — so the
     // only rejected pairing is a proc arriving at a pure slot.
     TyFunc(pp, pparams, pret), TyFunc(ap, aparams, aret) ->
@@ -1345,7 +1304,7 @@ fn check_indexable(env: Env, e: ast.Expr) -> Result(Nil, String) {
 fn collect_bodies(decls: List(ast.Decl)) -> Dict(String, List(ast.Stmt)) {
   list.fold(decls, dict.new(), fn(acc, d) {
     case d {
-      ast.ProcDecl(name, _, _, body) | ast.FuncDecl(name, _, _, body, _) ->
+      ast.ProcDecl(name, _, _, body) | ast.FuncDecl(name, _, _, body) ->
         dict.insert(acc, name, body)
       _ -> acc
     }
@@ -1429,7 +1388,7 @@ fn escapes_in_stmt(name: String, s: ast.Stmt) -> Bool {
       escapes_in_expr(name, target) || escapes_in_expr(name, value)
     ast.SReturn(Some(e)) -> escapes_in_expr(name, e)
     ast.SReturn(None) | ast.SBreak | ast.SContinue -> False
-    ast.SEcho(e) | ast.SAssert(e) | ast.SPanic(e) | ast.SExpr(e) ->
+    ast.SEcho(e) | ast.SAssert(e) | ast.SPanic(e) | ast.SExpr(e) | ast.SAsync(e) ->
       escapes_in_expr(name, e)
     ast.SIf(branches, else_body) ->
       list.any(branches, fn(b) {
@@ -1516,12 +1475,14 @@ fn escapes_in_expr(name: String, e: ast.Expr) -> Bool {
       escapes_in_expr(name, source)
       || list.any(ast.using_exprs(kind), fn(x) { escapes_in_expr(name, x) })
     ast.EWith(value, _) -> escapes_in_expr(name, value)
-    ast.EAwait(value, timeout) ->
-      escapes_in_expr(name, value)
+    ast.EAwait(calls, timeout) ->
+      list.any(calls, fn(c) { escapes_in_expr(name, c) })
       || case timeout {
         Some(ms) -> escapes_in_expr(name, ms)
         None -> False
       }
+    ast.ETimed(call, ms) ->
+      escapes_in_expr(name, call) || escapes_in_expr(name, ms)
     ast.EInterp(parts) ->
       list.any(parts, fn(p) {
         case p {
@@ -1541,7 +1502,7 @@ fn collect_mailboxes(
   module.decls
   |> list.fold(dict.new(), fn(acc, d) {
     case d {
-      ast.ProcDecl(_, _, _, body) | ast.FuncDecl(_, _, _, body, _) ->
+      ast.ProcDecl(_, _, _, body) | ast.FuncDecl(_, _, _, body) ->
         mailboxes_in_stmts(body, fns, dict.new(), acc).1
       _ -> acc
     }
@@ -1565,7 +1526,7 @@ fn mailboxes_in_stmts(
           Some(msg) -> #(dict.insert(sp, name, msg), fd)
           None -> #(sp, register_in_expr(value, fns, sp, fd))
         }
-      ast.SExpr(e) | ast.SEcho(e) | ast.SAssert(e) | ast.SPanic(e) -> #(
+      ast.SExpr(e) | ast.SEcho(e) | ast.SAssert(e) | ast.SPanic(e) | ast.SAsync(e) -> #(
         sp,
         register_in_expr(e, fns, sp, fd),
       )
@@ -1625,8 +1586,10 @@ fn register_in_expr(
       })
     ast.EBinary(_, l, r) ->
       register_in_expr(r, fns, spawned, register_in_expr(l, fns, spawned, found))
-    ast.EIs(value, _) | ast.EWith(value, _) | ast.EAwait(value, _) ->
+    ast.EIs(value, _) | ast.EWith(value, _) | ast.ETimed(value, _) ->
       register_in_expr(value, fns, spawned, found)
+    ast.EAwait(calls, _) ->
+      list.fold(calls, found, fn(acc, c) { register_in_expr(c, fns, spawned, acc) })
     _ -> found
   }
 }
@@ -1722,7 +1685,7 @@ pub fn handler_ret(
 fn uses_json_module(module: ast.Module) -> Bool {
   list.any(module.decls, fn(d) {
     case d {
-      ast.ProcDecl(_, _, _, body) | ast.FuncDecl(_, _, _, body, _) ->
+      ast.ProcDecl(_, _, _, body) | ast.FuncDecl(_, _, _, body) ->
         uses_json_stmts(body)
       ast.QueryDecl(_, _, _, sql) ->
         list.any(ast.sql_exprs(sql), uses_json_expr)
@@ -1743,7 +1706,7 @@ fn uses_json_stmts(stmts: List(ast.Stmt)) -> Bool {
       ast.SEcho(e) -> uses_json_expr(e)
       ast.SAssert(e) | ast.SPanic(e) -> uses_json_expr(e)
       ast.SBreak | ast.SContinue -> False
-      ast.SExpr(e) -> uses_json_expr(e)
+      ast.SExpr(e) | ast.SAsync(e) -> uses_json_expr(e)
       ast.SIf(branches, else_body) ->
         list.any(branches, fn(b) {
           uses_json_expr(b.cond) || uses_json_stmts(b.body)
@@ -1809,7 +1772,8 @@ fn uses_json_expr(e: ast.Expr) -> Bool {
     ast.EIs(subject, _) -> uses_json_expr(subject)
     ast.EUsing(source, kind) ->
       uses_json_expr(source) || list.any(ast.using_exprs(kind), uses_json_expr)
-    ast.EAwait(value, _) -> uses_json_expr(value)
+    ast.EAwait(calls, _) -> list.any(calls, uses_json_expr)
+    ast.ETimed(call, ms) -> uses_json_expr(call) || uses_json_expr(ms)
   }
 }
 
@@ -1838,7 +1802,7 @@ fn collect_fns(
     case d {
       ast.ProcDecl(name, params, ret, _) ->
         dict.insert(acc, name, #(False, params, ret))
-      ast.FuncDecl(name, params, ret, _, _) ->
+      ast.FuncDecl(name, params, ret, _) ->
         dict.insert(acc, name, #(True, params, ret))
       ast.QueryDecl(name, params, ret, _) ->
         dict.insert(acc, name, #(True, params, ret))
@@ -1854,7 +1818,7 @@ fn collect_sigs(
   list.fold(decls, dict.new(), fn(acc, d) {
     case d {
       ast.ProcDecl(name, params, ret, _)
-      | ast.FuncDecl(name, params, ret, _, _)
+      | ast.FuncDecl(name, params, ret, _)
       | ast.QueryDecl(name, params, ret, _) -> {
         let ptys =
           list.map(params, fn(p) { #(p.name, ty_of_type_expr(types, p.typ)) })
@@ -1878,7 +1842,7 @@ fn collect_atoms(module: ast.Module) -> List(String) {
   let found =
     list.fold(module.decls, [], fn(acc, d) {
       case d {
-        ast.ProcDecl(_, _, _, body) | ast.FuncDecl(_, _, _, body, _) ->
+        ast.ProcDecl(_, _, _, body) | ast.FuncDecl(_, _, _, body) ->
           atoms_in_stmts(body, acc)
         ast.QueryDecl(_, _, _, sql) ->
           list.fold(ast.sql_exprs(sql), acc, fn(a, e) { atoms_in_expr(e, a) })
@@ -1911,7 +1875,7 @@ fn atoms_in_stmts(stmts: List(ast.Stmt), acc: List(String)) -> List(String) {
       ast.SEcho(e) -> atoms_in_expr(e, acc)
       ast.SAssert(e) | ast.SPanic(e) -> atoms_in_expr(e, acc)
       ast.SBreak | ast.SContinue -> acc
-      ast.SExpr(e) -> atoms_in_expr(e, acc)
+      ast.SExpr(e) | ast.SAsync(e) -> atoms_in_expr(e, acc)
       ast.SIf(branches, else_body) -> {
         let acc =
           list.fold(branches, acc, fn(acc, b) {
@@ -1973,7 +1937,9 @@ fn atoms_in_expr(e: ast.Expr, acc: List(String)) -> List(String) {
         atoms_in_expr(e, a)
       })
     ast.EWith(value, _) -> atoms_in_expr(value, acc)
-    ast.EAwait(value, _) -> atoms_in_expr(value, acc)
+    ast.EAwait(calls, _) ->
+      list.fold(calls, acc, fn(acc, c) { atoms_in_expr(c, acc) })
+    ast.ETimed(call, ms) -> atoms_in_expr(ms, atoms_in_expr(call, acc))
   }
 }
 
@@ -2209,15 +2175,13 @@ fn ty_to_go(ty: Ty) -> String {
     // Monomorphization substitutes every variable before codegen runs, so one
     // reaching here would be a compiler bug rather than a program error.
     TyVar(name) -> name
-    TyAsync(inner) -> "*hive.Async[" <> async_inner_go(inner) <> "]"
     TyAddress(_) -> "hive.Address"
-    TyPending(msg) -> "*hive.SyslinkPending[" <> async_inner_go(msg) <> "]"
   }
 }
 
-// An inferred type written the way Hive source spells it, for error messages.
-// The types with no surface syntax (a task handle, a service address) say what
-// they are in words instead, since there is nothing to quote.
+// An inferred type written the way Hive source spells it, for error messages. A
+// service address has no surface syntax, so it says what it is in words instead;
+// every other type can be quoted as source would write it.
 fn show_ty(ty: Ty) -> String {
   case ty {
     TyStr -> "Str"
@@ -2239,9 +2203,7 @@ fn show_ty(ty: Ty) -> String {
       <> string.join(list.map(params, show_ty), ", ")
       <> "): "
       <> show_ty(ret)
-    TyAsync(inner) -> "async " <> show_ty(inner)
     TyAddress(_) -> "a service address"
-    TyPending(_) -> "a request in flight"
     TyVar(name) -> name
     TyUnknown -> "value of no known type"
   }
@@ -2254,9 +2216,9 @@ fn plural(n: Int, word: String) -> String {
   }
 }
 
-// The Go spelling of a task's result type. A void `async func` yields no value,
-// so its handle carries `hive.Unit` (an empty struct) — awaited only to join on
-// its completion.
+// The Go spelling of what a spawned call hands back. A `void` call yields no
+// value, so its task carries `hive.Unit` (an empty struct) — waited on only to
+// know it finished.
 fn async_inner_go(inner: Ty) -> String {
   case inner {
     TyVoid -> "hive.Unit"
@@ -3033,32 +2995,22 @@ fn gen_stmt(
         Some(code) -> #(pad <> code <> "\n", env)
         None -> #(pad <> gen_expr(env, call) <> "\n", env)
       }
-    // An address called as a bare statement wants no answer, so it lowers to the
-    // cast: nothing is registered for a reply and nothing can be awaited. The
-    // same call keeping its value is a request instead — the call site decides,
-    // just as it does for an `async func` below.
-    //
-    // A bare call to an `async func` as a statement is fire-and-forget: run it
-    // on its own goroutine and discard the result. `go f(x)` is the cheapest
-    // lowering (no handle, no channel) — the `hive.Spawn` handle form is only
-    // needed when the result is kept (an RHS, a vector element).
-    ast.SExpr(ast.ECall(callee, args) as call) ->
-      case is_address_call(env, callee), callee {
-        True, _ -> #(
-          pad <> gen_address_send(env, callee, args, False) <> "\n",
-          env,
-        )
-        False, ast.EIdent(name) ->
-          case list.contains(env.asyncs, name) {
-            True -> #(
-              pad <> "go " <> gen_call(env, ast.EIdent(name), args) <> "\n",
-              env,
-            )
-            False -> #(pad <> gen_expr(env, call) <> "\n", env)
-          }
-        False, _ -> #(pad <> gen_expr(env, call) <> "\n", env)
-      }
     ast.SExpr(e) -> #(pad <> gen_expr(env, e) <> "\n", env)
+    // `async <call>` is fire-and-forget. For an ordinary call `go f(x)` is the
+    // cheapest lowering there is — no handle, no channel — and Go evaluates the
+    // arguments in the *calling* goroutine, which is what keeps a `mut`
+    // argument's copy on this side of the fence.
+    //
+    // For a service address it is the cast: nothing is registered for a reply,
+    // so it never blocks and never fails. The same call *waited* for is a
+    // request — the call site decides, exactly as it does for a func.
+    ast.SAsync(ast.ECall(callee, args)) ->
+      case is_address_call(env, callee) {
+        True -> #(pad <> gen_address_send(env, callee, args, False) <> "\n", env)
+        False -> #(pad <> "go " <> gen_call(env, callee, args) <> "\n", env)
+      }
+    // Unreachable: the parser only builds an `SAsync` around a call.
+    ast.SAsync(e) -> #(pad <> gen_expr(env, e) <> "\n", env)
     ast.SIf(branches, else_body) -> #(
       gen_if(env, branches, else_body, indent),
       env,
@@ -3810,18 +3762,23 @@ pub fn infer(env: Env, e: ast.Expr) -> Ty {
           }
         _ -> TyUnknown
       }
-    // Calling an address is a request in flight, whose answer is the mailbox's
-    // own type. Discarded as a statement it is a cast, which never reaches
+    // Calling an address sends the message and waits for the service's answer,
+    // which is one of the mailbox's own messages — so that is the type, wrapped
+    // in the one `Result` this module reports its failures through. `async
+    // addr(m)` waits for nothing and is a statement, so it never reaches
     // `infer`. The address test comes first so an address-typed local wins over
     // a func of the same name, matching how a local shadows a declaration
     // everywhere else.
     ast.ECall(callee, args) ->
       case address_call_msg(env, callee) {
         Some(_) ->
-          case address_call_arg(args) {
-            Some(message) -> TyPending(syslink_reply_ty(env, callee, message))
-            None -> TyPending(TyUnknown)
-          }
+          TyResult(
+            case address_call_arg(args) {
+              Some(message) -> syslink_reply_ty(env, callee, message)
+              None -> TyUnknown
+            },
+            TyBuiltin("SyslinkError"),
+          )
         None -> infer_plain_call(env, callee, args)
       }
     ast.EIndex(target, _) ->
@@ -3880,25 +3837,25 @@ pub fn infer(env: Env, e: ast.Expr) -> Ty {
           TyResult(ty_of_type_expr(env.types, typ), TyBuiltin("CryptoError"))
         _ -> infer(env, value)
       }
-    // `await` resolves a task to its value: a handle `async T` yields `T`, and
-    // a vector of handles `(async T)[]` yields `T[]` (a barrier over all of
-    // them). A direct `await asyncCall()` infers `TyAsync(T)` for the inner
-    // call and so lands on the same `TyAsync(t) -> t` rule.
-    ast.EAwait(value, timeout) ->
-      case infer(env, value), timeout {
-        // A syslink request answers with a Result either way; a bound on the
-        // wait only adds a reason to its error, never a second Result around it.
-        TyPending(m), _ -> TyResult(m, TyBuiltin("SyslinkError"))
-        TyVec(TyPending(m)), _ ->
-          TyVec(TyResult(m, TyBuiltin("SyslinkError")))
-        // Bounding the wait on a plain task is what gives it a failure case at
-        // all, so the type gains a Result exactly when the clause is written.
-        TyAsync(t), Some(_) -> TyResult(t, TyBuiltin("TimeoutError"))
-        TyAsync(t), None -> t
-        TyVec(TyAsync(t)), Some(_) ->
-          TyResult(TyVec(t), TyBuiltin("TimeoutError"))
-        TyVec(TyAsync(t)), None -> TyVec(t)
-        other, _ -> other
+    // An await-all resolves to a vector holding one result per call, in the
+    // order they were written.
+    ast.EAwait(calls, timeout) -> {
+      let elems = TyVec(await_elem_ty(env, calls))
+      case timeout, is_all_sends(env, calls) {
+        None, _ -> elems
+        // A send answers with a Result either way; a bound on the wait only adds
+        // a reason to its error, never a second Result around it.
+        Some(_), True -> elems
+        Some(_), False -> TyResult(elems, TyBuiltin("TimeoutError"))
+      }
+    }
+    // Bounding a single call is what gives it a failure case at all, so the type
+    // gains a Result exactly when the clause is written — except on a send,
+    // which already had one.
+    ast.ETimed(call, _) ->
+      case is_send(env, call) {
+        True -> infer(env, call)
+        False -> TyResult(call_ty(env, call), TyBuiltin("TimeoutError"))
       }
   }
 }
@@ -4123,13 +4080,7 @@ fn infer_ident_call(env: Env, name: String, args: List(ast.Arg)) -> Ty {
             True -> TyCustom(name)
             False ->
               case dict.get(env.sigs, name) {
-                // A bare call to an `async func` does not block; it spawns the
-                // work and evaluates to a handle (`async T`).
-                Ok(#(_, ret)) ->
-                  case list.contains(env.asyncs, name) {
-                    True -> TyAsync(ret)
-                    False -> ret
-                  }
+                Ok(#(_, ret)) -> ret
                 Error(_) -> TyUnknown
               }
           }
@@ -4254,57 +4205,58 @@ fn gen_expr(env: Env, e: ast.Expr) -> String {
       let #(cond, _) = gen_is(env, subject, pattern)
       cond
     }
-    // Calling an address in value position is the request form: it registers
-    // somewhere for the answer to land and returns without waiting. As a bare
-    // statement `gen_stmt` lowers the same call to the cheaper cast instead.
+    // Calling an address sends the message and waits for the service's answer,
+    // like any other call. `async` in front of it (see `gen_stmt`) is the cast
+    // that waits for nothing.
     //
     // Either way the message is copied on its way in, as binding it to a new
     // name would copy it. That is the invariant the whole module rests on: a
     // local send and a remote one are indistinguishable, so the recipient can
     // never observe the sender mutating a message afterwards.
-    //
-    // A bare async call in value position (an RHS, a vector element, ...)
-    // spawns the work on its own goroutine and evaluates to a handle. Used as a
-    // statement the handle is simply discarded — that is fire-and-forget, and
-    // `gen_stmt` keeps emitting the cheaper `go f(x)` for that case.
     ast.ECall(callee, args) ->
-      case is_address_call(env, callee), callee {
-        True, _ -> gen_address_send(env, callee, args, True)
-        False, ast.EIdent(name) ->
-          case list.contains(env.asyncs, name) {
-            True -> gen_spawn(env, name, args)
-            False -> gen_call(env, ast.EIdent(name), args)
-          }
-        False, _ -> gen_call(env, callee, args)
+      case is_address_call(env, callee) {
+        True -> gen_send_and_wait(env, callee, args, "0")
+        False -> gen_call(env, callee, args)
       }
     ast.EWith(value, typ) -> gen_with(env, value, typ)
-    ast.EAwait(value, timeout) -> gen_await(env, value, timeout)
+    ast.EAwait(calls, timeout) -> gen_await(env, calls, timeout)
+    ast.ETimed(call, ms) -> gen_timed(env, call, ms)
   }
 }
 
-// `spawn f(args)`: run the async func on its own goroutine and hand back a
-// handle. The closure captures the exact call so its result type matches the
-// declared return; a void async func yields `hive.Unit` so the handle can still
-// be joined on.
+// Runs one call on its own goroutine and hands back the handle to wait on. No
+// Hive expression evaluates to that handle — it is scaffolding for the two forms
+// that wait for something they started: an await-all and a bounded call.
+//
+// The closure captures the exact call so its result type matches the call's own;
+// a `void` call yields `hive.Unit` so the handle still has something to carry.
 //
 // The arguments have to be evaluated *before* the goroutine starts, not inside
 // the closure: for a `mut` argument the evaluation is the copy that keeps the
 // task from sharing the caller's storage, and a copy made on the new goroutine
 // would race with the caller it is supposed to be protecting against. So when
 // any argument needs that treatment the whole spawn is wrapped in a thunk that
-// runs in the caller, binds each argument, and only then spawns. (A `go f(x)`
-// fire-and-forget statement needs none of this: Go evaluates a `go` statement's
-// arguments in the calling goroutine already.)
-fn gen_spawn(env: Env, name: String, args: List(ast.Arg)) -> String {
-  let ret = case dict.get(env.fns, name) {
-    Ok(#(_, _, r)) -> r
-    Error(_) -> ast.TVoid
+// runs in the caller, binds each argument, and only then spawns. (An `async f(x)`
+// statement needs none of this: it lowers to `go f(x)`, and Go evaluates a `go`
+// statement's arguments in the calling goroutine already.)
+fn gen_spawn(env: Env, call: ast.Expr) -> String {
+  let ty = call_ty(env, call)
+  let #(callee, args) = case call {
+    ast.ECall(c, a) -> #(c, a)
+    other -> #(other, [])
   }
-  let spawn = fn(call) {
-    case ret {
-      ast.TVoid ->
-        "hive.Spawn(func() hive.Unit { " <> call <> "; return hive.Unit{} })"
-      _ -> "hive.Spawn(func() " <> gen_type(ret) <> " { return " <> call <> " })"
+  let one = fn(inner) {
+    case ty {
+      TyVoid ->
+        "hive.Spawn(func() hive.Unit { " <> inner <> "; return hive.Unit{} })"
+      _ ->
+        "hive.Spawn(func() " <> async_inner_go(ty) <> " { return " <> inner <> " })"
+    }
+  }
+  let body = fn(a) {
+    case is_address_call(env, callee) {
+      True -> gen_send_and_wait(env, callee, a, "0")
+      False -> gen_call(env, callee, a)
     }
   }
   // Which arguments are copied in — the ones whose evaluation must not be
@@ -4316,7 +4268,7 @@ fn gen_spawn(env: Env, name: String, args: List(ast.Arg)) -> String {
       gen_arg(env, a.value, TyUnknown) != gen_expr(env, a.value)
     })
   case copied {
-    [] -> spawn(gen_call(env, ast.EIdent(name), args))
+    [] -> one(body(args))
     _ -> {
       // Bind each copied argument to a local in the caller, then hand the
       // locals to the call. `_a<i>` cannot collide: Hive identifiers never
@@ -4339,83 +4291,126 @@ fn gen_spawn(env: Env, name: String, args: List(ast.Arg)) -> String {
             Error(_) -> a
           }
         })
-      let handle_ty = case ret {
-        ast.TVoid -> "*hive.Async[hive.Unit]"
-        _ -> "*hive.Async[" <> async_inner_go(ty_of_type_expr(env.types, ret)) <> "]"
-      }
-      "func() "
-      <> handle_ty
-      <> " { "
+      "func() *hive.Async["
+      <> async_inner_go(ty)
+      <> "] { "
       <> binds
       <> "return "
-      <> spawn(gen_call(env, ast.EIdent(name), inner_args))
+      <> one(body(inner_args))
       <> " }()"
     }
   }
 }
 
-// `await e`, with the optional `with timeout <ms>`. A direct `await asyncCall()`
-// needs no handle at all — it is just a synchronous call, so it allocates
-// neither goroutine nor channel. A *bounded* one does need a handle, because
-// something has to be left running while the wait gives up. Otherwise the
-// operand is a held handle, a vector of handles (a barrier that preserves index
-// order), or a syslink request in flight.
+// `await [f(a), f(b)]`, with the optional `with timeout <ms>`. Every call is
+// started, then the whole list is one barrier resolving in index order.
 //
-// `0` milliseconds means "no bound of its own": the plain awaits ignore it and
-// syslink falls back to its own default patience.
-fn gen_await(env: Env, value: ast.Expr, timeout: Option(ast.Expr)) -> String {
+// A list of *service* sends needs no goroutine at all: each send registers for
+// its answer and returns, and the barrier waits on the connection's reader — so
+// that case keeps syslink's own lowering, with the bound folded into its error
+// rather than a second `Result` wrapped around the first.
+//
+// `0` milliseconds means "no bound of its own": syslink then falls back to its
+// own default patience.
+fn gen_await(env: Env, calls: List(ast.Expr), timeout: Option(ast.Expr)) -> String {
   let ms = case timeout {
     Some(e) -> coerce(env, e, TyInt)
     None -> "0"
   }
-  case value {
-    // An address call is a syslink request, never a task, however it is spelled
-    // — so it goes to `await_handle` even where the callee shares a name with an
-    // `async func`, matching the shadowing `infer` and `gen_expr` apply.
-    ast.ECall(ast.EIdent(name), args) ->
-      case is_address_call(env, ast.EIdent(name)) {
-        True -> await_handle(env, value, timeout, ms)
-        False ->
-          case list.contains(env.asyncs, name), timeout {
-            True, None -> gen_call(env, ast.EIdent(name), args)
-            True, Some(_) ->
-              "hive.AwaitTimeout("
-              <> gen_spawn(env, name, args)
-              <> ", "
-              <> ms
-              <> ")"
-            False, _ -> await_handle(env, value, timeout, ms)
-          }
+  case is_all_sends(env, calls) {
+    True -> {
+      let sends =
+        calls
+        |> list.map(fn(c) { gen_send(env, c) })
+        |> string.join(", ")
+      "hive.SyslinkAwaitAll([]*hive.SyslinkPending["
+      <> async_inner_go(send_msg_ty(env, calls))
+      <> "]{"
+      <> sends
+      <> "}, "
+      <> ms
+      <> ")"
+    }
+    False -> {
+      let handles =
+        calls
+        |> list.map(fn(c) { gen_spawn(env, c) })
+        |> string.join(", ")
+      let vec =
+        "[]*hive.Async["
+        <> async_inner_go(await_elem_ty(env, calls))
+        <> "]{"
+        <> handles
+        <> "}"
+      case timeout {
+        Some(_) -> "hive.AwaitAllTimeout(" <> vec <> ", " <> ms <> ")"
+        None -> "hive.AwaitAll(" <> vec <> ")"
       }
-    _ -> await_handle(env, value, timeout, ms)
+    }
   }
 }
 
-fn await_handle(
-  env: Env,
-  value: ast.Expr,
-  timeout: Option(ast.Expr),
-  ms: String,
-) -> String {
-  let operand = gen_expr(env, value)
-  case infer(env, value), timeout {
-    // A syslink request already answers with a Result, so a bound on the wait
-    // becomes one more reason inside that error rather than a second Result
-    // wrapped around the first.
-    TyPending(_), _ -> "hive.SyslinkAwait(" <> operand <> ", " <> ms <> ")"
-    TyVec(TyPending(_)), _ ->
-      "hive.SyslinkAwaitAll(" <> operand <> ", " <> ms <> ")"
-    // A plain task has no failure channel at all, so bounding the wait is what
-    // introduces one.
-    TyVec(TyAsync(_)), Some(_) ->
-      "hive.AwaitAllTimeout(" <> operand <> ", " <> ms <> ")"
-    TyVec(TyAsync(_)), None -> "hive.AwaitAll(" <> operand <> ")"
-    TyAsync(_), Some(_) ->
-      "hive.AwaitTimeout(" <> operand <> ", " <> ms <> ")"
-    TyAsync(_), None -> operand <> ".Await()"
-    // Not actually a task — leave it be; the type checkers reject this shape.
-    _, _ -> operand
+// What a request in flight carries, for the Go type of the vector an all-sends
+// barrier waits on: the *message* a service answers with, which is the `Ok` side
+// of what the await resolves to.
+fn send_msg_ty(env: Env, calls: List(ast.Expr)) -> Ty {
+  case await_elem_ty(env, calls) {
+    TyResult(msg, _) -> msg
+    other -> other
   }
+}
+
+// What one entry of an await-all answers with. `check_await` has already held
+// every entry to the same type, so the first one speaks for all of them.
+fn await_elem_ty(env: Env, calls: List(ast.Expr)) -> Ty {
+  case calls {
+    [first, ..] -> call_ty(env, first)
+    [] -> TyVoid
+  }
+}
+
+// `<call> with timeout <ms>` — one call, bounded. A service send bounds its own
+// wait; anything else is spawned so that something is left running when the wait
+// gives up, which is exactly what "the timeout abandons the waiting, not the
+// work" means.
+fn gen_timed(env: Env, call: ast.Expr, ms: ast.Expr) -> String {
+  let bound = coerce(env, ms, TyInt)
+  case is_send(env, call) {
+    True -> gen_send_and_wait_expr(env, call, bound)
+    False -> "hive.AwaitTimeout(" <> gen_spawn(env, call) <> ", " <> bound <> ")"
+  }
+}
+
+// What a call answers with, telling `void` apart from "no idea". Ordinary
+// inference maps both onto `TyUnknown`, a distinction that costs nothing
+// anywhere else and everything here: a task carries `hive.Unit` when there is no
+// value, and a `Result` cannot carry one at all.
+fn call_ty(env: Env, call: ast.Expr) -> Ty {
+  case call {
+    ast.ECall(ast.EIdent(name), _) ->
+      case dict.get(env.locals, name), dict.get(env.fns, name) {
+        // A local holding a function value shadows the declaration, exactly as
+        // it does everywhere else.
+        Ok(TyFunc(_, _, ret)), _ -> ret
+        _, Ok(#(_, _, ast.TVoid)) -> TyVoid
+        _, _ -> infer(env, call)
+      }
+    _ -> infer(env, call)
+  }
+}
+
+// Whether a call is a message to a service address rather than an ordinary call.
+fn is_send(env: Env, call: ast.Expr) -> Bool {
+  case call {
+    ast.ECall(callee, _) -> is_address_call(env, callee)
+    _ -> False
+  }
+}
+
+// Whether every entry of an await-all is a send, which is the case that needs no
+// goroutines and carries syslink's own error.
+fn is_all_sends(env: Env, calls: List(ast.Expr)) -> Bool {
+  list.all(calls, fn(c) { is_send(env, c) })
 }
 
 // `hive.json.parse(text) with T` — the decoder is derived from T at compile
@@ -5032,6 +5027,9 @@ fn var_mutated_in_stmt(s: ast.Stmt, name: String) -> Bool {
       ast.EMember(ast.EIdent("hive"), "append"),
       [ast.Arg(_, target), ..],
     )) -> expr_root(target) == Some(name)
+    // `async <call>` copies every argument on the way in (see `gen_spawn`), so
+    // it cannot write to storage this scope can see.
+    ast.SAsync(_) -> False
     // A discarded `sort` on mut storage reorders that storage (see
     // `gen_sort_in_place`), so it is a write like any other — and has to be
     // counted here, or an immutable binding could be aliased to a vector this
@@ -5100,7 +5098,7 @@ fn may_escape_stmt(s: ast.Stmt, name: String) -> Bool {
     ast.SEcho(_) | ast.SAssert(_) | ast.SPanic(_) | ast.SBreak | ast.SContinue ->
       False
     // A call may return or retain a slice aliasing one of its arguments.
-    ast.SExpr(e) -> uses_in_expr(e, name)
+    ast.SExpr(e) | ast.SAsync(e) -> uses_in_expr(e, name)
     ast.SIf(branches, else_body) ->
       list.any(branches, fn(b) { may_escape_stmts(b.body, name) })
       || case else_body {
@@ -5601,10 +5599,10 @@ fn gen_syslink_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
 // ---------------------------------------------------------------------------
 // A service address is callable
 // ---------------------------------------------------------------------------
-// `c(message)` *is* the send — there is no `hive.syslink.send`, exactly as there
-// is no `spawn` keyword in front of an `async func` call. What the call site
-// does with the value decides what the call means: discarded it is a cast, kept
-// it is a request in flight, and `await`ed it is that request's answer.
+// `c(message)` *is* the send — there is no `hive.syslink.send`. Which of the two
+// sends it is comes from the call site, exactly as it does for a func: written
+// plainly it waits for the service's answer, and `async c(message)` is the cast
+// that waits for nothing.
 //
 // Dispatch is by the callee's *type*, never by its spelling, so a local, a
 // parameter, a vector element and a fresh `at(#Name)` are all callable the same
@@ -5645,6 +5643,38 @@ fn gen_address_send(
     // Unreachable: `check_address_call` fails the compile first. Codegen stays
     // total rather than crashing on a shape the checker owns.
     None -> gen_send_parts(env, callee, ast.EIdent("_"), awaitable)
+  }
+}
+
+// The awaitable half of a send on its own — the request, registered for its
+// answer but not yet waited for. It is what an await-all over sends collects
+// before its single barrier.
+fn gen_send(env: Env, call: ast.Expr) -> String {
+  case call {
+    ast.ECall(callee, args) -> gen_address_send(env, callee, args, True)
+    other -> gen_expr(env, other)
+  }
+}
+
+// A send and the wait for its answer, which is what a plain `addr(message)` is.
+// `ms` bounds the wait; `"0"` leaves syslink its own default patience.
+fn gen_send_and_wait(
+  env: Env,
+  callee: ast.Expr,
+  args: List(ast.Arg),
+  ms: String,
+) -> String {
+  "hive.SyslinkAwait("
+  <> gen_address_send(env, callee, args, True)
+  <> ", "
+  <> ms
+  <> ")"
+}
+
+fn gen_send_and_wait_expr(env: Env, call: ast.Expr, ms: String) -> String {
+  case call {
+    ast.ECall(callee, args) -> gen_send_and_wait(env, callee, args, ms)
+    other -> gen_expr(env, other)
   }
 }
 
@@ -6441,22 +6471,13 @@ fn gen_declared_call(env: Env, name: String, args: List(ast.Arg)) -> String {
 // holds belong to the value that comes back, not to something the caller may
 // still be writing to.
 fn gen_walk_builtin(env: Env, name: String, args: List(ast.Arg)) -> String {
-  // An `async func` transform makes the walk concurrent: every element's call is
-  // known before the first one runs, so they all go at once and the walk awaits
-  // them before it answers. The vector that comes back is the same either way —
-  // same elements, same order, same type — so `async` is purely about how long
-  // the walk takes, and there is nothing for the call site to decide.
-  let concurrent = case args {
-    [_, ast.Arg(_, f)] -> names_async_func(env, f)
-    _ -> False
-  }
-  let helper = case name, concurrent {
-    "map", False -> "hive.Map"
-    "map", True -> "hive.MapAsync"
-    "filter", False -> "hive.Filter"
-    "filter", True -> "hive.FilterAsync"
-    _, False -> "hive.FilterMap"
-    _, True -> "hive.FilterMapAsync"
+  // A walk is sequential, always. Concurrency is written where it happens — a
+  // call the caller does not wait for, or an `await` over several — and never
+  // hidden inside a builtin whose signature says nothing about it.
+  let helper = case name {
+    "map" -> "hive.Map"
+    "filter" -> "hive.Filter"
+    _ -> "hive.FilterMap"
   }
   case args {
     [ast.Arg(_, subject), ast.Arg(_, f)] ->
@@ -6997,7 +7018,7 @@ fn uses_in_stmt(s: ast.Stmt, name: String) -> Bool {
     ast.SEcho(e) -> uses_in_expr(e, name)
     ast.SAssert(e) | ast.SPanic(e) -> uses_in_expr(e, name)
     ast.SBreak | ast.SContinue -> False
-    ast.SExpr(e) -> uses_in_expr(e, name)
+    ast.SExpr(e) | ast.SAsync(e) -> uses_in_expr(e, name)
     ast.SIf(branches, else_body) -> {
       let in_branches =
         list.any(branches, fn(b) {
@@ -7048,7 +7069,11 @@ fn uses_in_expr(e: ast.Expr, name: String) -> Bool {
       uses_in_expr(source, name)
       || list.any(ast.using_exprs(kind), fn(e) { uses_in_expr(e, name) })
     ast.EWith(value, _) -> uses_in_expr(value, name)
-    ast.EAwait(value, _) -> uses_in_expr(value, name)
+    ast.EAwait(calls, timeout) ->
+      list.any(calls, fn(c) { uses_in_expr(c, name) })
+      || uses_in_opt(timeout, name)
+    ast.ETimed(call, ms) ->
+      uses_in_expr(call, name) || uses_in_expr(ms, name)
   }
 }
 

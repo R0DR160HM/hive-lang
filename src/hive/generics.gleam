@@ -224,7 +224,7 @@ fn collect_types(decls: List(ast.Decl)) -> Dict(String, ast.Decl) {
 fn decl_name(d: ast.Decl) -> Option(String) {
   case d {
     ast.ProcDecl(name, _, _, _)
-    | ast.FuncDecl(name, _, _, _, _)
+    | ast.FuncDecl(name, _, _, _)
     | ast.QueryDecl(name, _, _, _)
     | ast.TypeDecl(name, _, _) -> Some(name)
   }
@@ -237,7 +237,7 @@ fn collect_generics(
   list.fold(decls, dict.new(), fn(acc, d) {
     case d {
       ast.ProcDecl(name, params, ret, _)
-      | ast.FuncDecl(name, params, ret, _, _)
+      | ast.FuncDecl(name, params, ret, _)
       | ast.QueryDecl(name, params, ret, _) -> {
         let vars =
           list.fold(
@@ -621,12 +621,12 @@ fn walk_decl(
       use #(body2, st2) <- result.try(walk_stmts(st, benv, body))
       Ok(#(ast.ProcDecl(name, params, ret, body2), st2))
     }
-    ast.FuncDecl(name, params, ret, body, async) -> {
+    ast.FuncDecl(name, params, ret, body) -> {
       let #(params, ret, st) = rewrite_signature(st, params, ret)
       let st = State(..st, ret_type: Some(ret))
       let benv = codegen.fn_env(env, params, ret)
       use #(body2, st2) <- result.try(walk_stmts(st, benv, body))
-      Ok(#(ast.FuncDecl(name, params, ret, body2, async), st2))
+      Ok(#(ast.FuncDecl(name, params, ret, body2), st2))
     }
     ast.QueryDecl(name, params, ret, sql) -> {
       let #(params, ret, st) = rewrite_signature(st, params, ret)
@@ -740,6 +740,10 @@ fn walk_stmt(
     ast.SExpr(e) -> {
       use #(e2, st2) <- result.try(walk_expr(st, env, e))
       Ok(#(ast.SExpr(e2), env, st2))
+    }
+    ast.SAsync(call) -> {
+      use #(c2, st2) <- result.try(walk_expr(st, env, call))
+      Ok(#(ast.SAsync(c2), env, st2))
     }
     ast.SReturn(None) | ast.SBreak | ast.SContinue -> Ok(#(s, env, st))
     ast.SIf(branches, else_body) -> {
@@ -1056,10 +1060,15 @@ fn walk_expr(
       use #(v2, st2) <- result.try(walk_expr(st, env, value))
       Ok(#(ast.EWith(v2, typ), st2))
     }
-    ast.EAwait(value, timeout) -> {
-      use #(v2, st2) <- result.try(walk_expr(st, env, value))
+    ast.EAwait(calls, timeout) -> {
+      use #(calls2, st2) <- result.try(walk_exprs(st, env, calls))
       use #(t2, st3) <- result.try(walk_opt(st2, env, timeout))
-      Ok(#(ast.EAwait(v2, t2), st3))
+      Ok(#(ast.EAwait(calls2, t2), st3))
+    }
+    ast.ETimed(call, ms) -> {
+      use #(c2, st2) <- result.try(walk_expr(st, env, call))
+      use #(ms2, st3) <- result.try(walk_expr(st2, env, ms))
+      Ok(#(ast.ETimed(c2, ms2), st3))
     }
     ast.EUsing(source, kind) -> {
       use #(s2, st2) <- result.try(walk_expr(st, env, source))
@@ -1304,7 +1313,7 @@ fn infer_type_args(
 fn decl_params(d: ast.Decl) -> List(ast.Field) {
   case d {
     ast.ProcDecl(_, params, _, _)
-    | ast.FuncDecl(_, params, _, _, _)
+    | ast.FuncDecl(_, params, _, _)
     | ast.QueryDecl(_, params, _, _) -> params
     ast.TypeDecl(..) -> []
   }
@@ -1329,13 +1338,12 @@ fn specialize(
         substitute(subst, ret),
         substitute_stmts(subst, body),
       )
-    ast.FuncDecl(_, params, ret, body, async) ->
+    ast.FuncDecl(_, params, ret, body) ->
       ast.FuncDecl(
         mangled,
         list.map(params, sub),
         substitute(subst, ret),
         substitute_stmts(subst, body),
-        async,
       )
     ast.QueryDecl(_, params, ret, sql) ->
       ast.QueryDecl(
@@ -1411,6 +1419,7 @@ fn substitute_stmt(
     ast.SAssert(e) -> ast.SAssert(substitute_expr(subst, e))
     ast.SPanic(e) -> ast.SPanic(substitute_expr(subst, e))
     ast.SExpr(e) -> ast.SExpr(substitute_expr(subst, e))
+    ast.SAsync(call) -> ast.SAsync(substitute_expr(subst, call))
     ast.SBreak | ast.SContinue -> s
   }
 }
@@ -1463,11 +1472,13 @@ fn substitute_expr(
         ast.UsingRaw(text) -> ast.UsingRaw(substitute_expr(subst, text))
         ast.UsingXlsx | ast.UsingOds -> kind
       })
-    ast.EAwait(value, timeout) ->
+    ast.EAwait(calls, timeout) ->
       ast.EAwait(
-        substitute_expr(subst, value),
+        list.map(calls, substitute_expr(subst, _)),
         option.map(timeout, substitute_expr(subst, _)),
       )
+    ast.ETimed(call, ms) ->
+      ast.ETimed(substitute_expr(subst, call), substitute_expr(subst, ms))
     ast.EInt(_)
     | ast.EFloat(_)
     | ast.EString(_)

@@ -109,7 +109,7 @@ fn check(module: ast.Module) -> Result(Nil, String) {
     list.fold(module.decls, dict.new(), fn(acc, d) {
       case d {
         ast.ProcDecl(name, params, _, _)
-        | ast.FuncDecl(name, params, _, _, _)
+        | ast.FuncDecl(name, params, _, _)
         | ast.QueryDecl(name, params, _, _) ->
           dict.insert(acc, name, list.map(params, fn(p) { p.name }))
         ast.TypeDecl(..) -> acc
@@ -119,7 +119,7 @@ fn check(module: ast.Module) -> Result(Nil, String) {
     list.fold(module.decls, dict.new(), fn(acc, d) {
       case d {
         ast.ProcDecl(name, params, _, _)
-        | ast.FuncDecl(name, params, _, _, _)
+        | ast.FuncDecl(name, params, _, _)
         | ast.QueryDecl(name, params, _, _) -> dict.insert(acc, name, params)
         ast.TypeDecl(..) -> acc
       }
@@ -150,7 +150,7 @@ fn check(module: ast.Module) -> Result(Nil, String) {
       // A `func` may perform I/O (echo, using, hive.net, ...) just like a
       // `proc`. Its two restrictions — no mutex parameters, no calling procs —
       // are what `in_func` marks.
-      ast.FuncDecl(name, _, ret, body, _) -> {
+      ast.FuncDecl(name, _, ret, body) -> {
         use _ <- result.try(check_body(
           Ctx(name, True, procs, callables, types, False, fn_params, queries),
           body,
@@ -202,7 +202,7 @@ fn check_decl_types(decls: List(ast.Decl)) -> Result(Nil, String) {
   list.try_fold(decls, Nil, fn(_, d) {
     case d {
       ast.ProcDecl(name, params, ret, _)
-      | ast.FuncDecl(name, params, ret, _, _) -> {
+      | ast.FuncDecl(name, params, ret, _) -> {
         use _ <- result.try(
           list.try_fold(params, Nil, fn(_, p) {
             check_param_type(p.typ, "parameter `" <> p.name <> "` of `" <> name <> "`")
@@ -645,6 +645,13 @@ fn check_stmt(
       use _ <- result.try(check_expr(ctx, e))
       Ok(muts)
     }
+    // `async <call>` is checked exactly as the same call would be written
+    // plainly: the rules about what may call what are about the callee, not
+    // about who waits for it. A func still cannot reach a proc this way.
+    ast.SAsync(call) -> {
+      use _ <- result.try(check_expr(ctx, call))
+      Ok(muts)
+    }
     ast.SBreak ->
       case ctx.in_loop {
         True -> Ok(muts)
@@ -1005,7 +1012,7 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
             "`with <Type>` can only be applied to `hive.json.parse(...)`, "
             <> "`hive.crypto.jwtVerify(...)` or `hive.crypto.jwtDecode(...)` "
             <> "calls. (`with timeout <ms>` is a different clause and belongs "
-            <> "on an `await`.)",
+            <> "on a call, or on an `await`.)",
           )
       }
     // `hive.sql.DatabaseDriver.SQLite()` etc. — driver constructors.
@@ -1209,7 +1216,9 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
       check_exprs(ctx, [target, ..option.values([low, high])])
     ast.EBinary(_, l, r) -> check_exprs(ctx, [l, r])
     ast.EIs(subject, _) -> check_expr(ctx, subject)
-    ast.EAwait(value, _) -> check_expr(ctx, value)
+    ast.EAwait(calls, timeout) ->
+      check_exprs(ctx, list.append(calls, option.values([timeout])))
+    ast.ETimed(call, ms) -> check_exprs(ctx, [call, ms])
   }
 }
 
@@ -1935,16 +1944,16 @@ fn check_syslink_call(
     "stop" -> check_arity("`hive.syslink.stop`", args, ["address"])
     // There is no `send` and no `call`: an address *is* the way to reach its
     // service, so it is called directly and the call site decides what the call
-    // means — exactly as it does for an `async func`.
+    // means — exactly as it does for a func.
     "send" | "call" ->
       Error(
         "there is no `hive.syslink."
         <> fname
         <> "` — a service address is called directly, and what the call site "
-        <> "does with it decides what it means: `cache(Op.Count())` as a "
-        <> "statement is fire-and-forget, `p := cache(Op.Count())` keeps the "
-        <> "request in flight, and `await cache(Op.Count())` waits for the "
-        <> "service's answer (optionally bounded with `with timeout <ms>`)",
+        <> "does with it decides what it means: `cache(Op.Count())` waits for "
+        <> "the service's answer (optionally bounded with `with timeout <ms>`), "
+        <> "`async cache(Op.Count())` sends it and does not wait, and `await "
+        <> "[a(m), b(m)]` sends both and waits for the pair",
       )
     _ ->
       Error(

@@ -1,88 +1,85 @@
 // Concurrency
 // ===========
-// An `async func` runs on its own virtual thread (a goroutine). What happens
-// at the *call site* decides how you interact with it — there is no Future or
-// Promise type to name, and nothing dynamically typed:
+// Every call blocks the caller. Nothing about a declaration says otherwise —
+// there is no `async func`, no Future and no Promise type to name — so what a
+// call means is decided where it is written:
 //
-//   f(x)            (as a statement)  fire-and-forget: spawn, discard result
-//   h := f(x)                          spawn, keep the handle  (type: `async T`)
-//   await f(x)                         spawn + wait inline, yields T
-//   await h                            wait on a held handle, yields T
-//   await [f(a), f(b)]                 wait on all, in order,  yields T[]
+//   f(x)                       wait for it, yields T
+//   async f(x)   (a statement) fire-and-forget: its own thread, no result
+//   f(x) with timeout 500      wait at most 500ms, yields Result<T, _>
+//   await [f(a), f(b)]         run both at once, wait for both, yields T[2]
 //
-// `async T` — the type of a held handle — is inferred, never written. You can
-// bind it and `await` it; you cannot annotate it, return it, pass it, or use it
-// as a plain `T` (await it first). So a task can never outlive the scope that
-// spawned it. `await` is idempotent: awaiting a finished task returns instantly,
-// and the same handle may be awaited more than once.
+// `async` has no value: it starts the call and keeps nothing, so there is no
+// handle to hold, to pass, or to leak out of the scope that spawned it. Which is
+// why the language needs no type for one — every expression here has a type you
+// could write down.
 
-// Two async funcs. Being funcs they can perform I/O but take no mutex; each
-// runs on its own virtual thread when called.
-async func slowShout(text: Str): Str {
+// Two ordinary funcs. Being funcs they can perform I/O but take no mutex.
+func slowShout(text: Str): Str {
 	hive.task.sleep(1000)
 	return text + "!!!"
 }
 
-async func lengthOf(text: Str): Int {
+func lengthOf(text: Str): Int {
 	return len(text)
 }
 
 proc main(): void {
-	// 1. Fire-and-forget. As a bare statement the result is discarded and the
-	// caller does not block — the work runs on its own thread.
-	slowShout("logged in the background")
+	// 1. Fire-and-forget. `async` puts the call on its own thread and carries
+	// on. Nothing comes back — that is the whole of the trade.
+	async slowShout("logged in the background")
 
-	// 2. Await inline. This blocks until the value is ready; a direct
-	// `await someCall()` needs no handle, so it costs nothing extra.
-	echo await slowShout("await")
+	// 2. A plain call. It blocks until the value is ready, and costs neither a
+	// goroutine nor a channel: it is a function call.
+	echo slowShout("blocking")
 
-	// 3. Spawn now, await later. Binding a bare async call keeps the running
-	// task as a handle. We do other work while it runs, then join on it — which
-	// returns immediately if it already finished.
-	job := slowShout("started early")
-	echo "...doing other work while it runs..."
-	echo await job
-	echo await job // idempotent: awaiting again is instant and yields the same value
-
-	// 4. Await many of the same type, all at once. A vector of handles awaits
-	// into a statically-sized, fully-typed vector (`Str[3]`) — never a dynamic
-	// or `Any` vector. All three run concurrently; the `await` is one barrier.
+	// 3. Many at once: the await-all. Every call in the list starts, then the
+	// whole list is one barrier resolving in order into a statically-sized,
+	// fully-typed vector (`Str[3]`) — never a dynamic or `Any` vector. All three
+	// sleep for a second, and this takes about one.
 	Str[3] shouts = await [slowShout("a"), slowShout("b"), slowShout("c")]
 	echo shouts[0] + " " + shouts[1] + " " + shouts[2]
 
-	// The handles can also be held first and awaited later as a group.
-	greetings := [slowShout("hello"), slowShout("world")]
-	echo "...both greetings are already running..."
-	Str[2] ready = await greetings
-	echo ready[0] + " / " + ready[1]
+	// A list of one is legal and still means "on its own thread, then wait".
+	Str[1] alone = await [slowShout("just me")]
+	echo alone[0]
 
-	// 5. Await many of *different* types at once. Spawn each up front, then
-	// await each: because they were all started first, the awaits overlap and
-	// the total wait is the slowest one — not the sum. Fully typed, no tuple and
-	// no vector needed.
-	shout := slowShout("mixed")
-	size := lengthOf("mixed")
-	Str message = await shout
-	Int count = await size
+	// 4. Void calls are waited for the same way. There is no value, so the
+	// barrier has none either — it is a statement meaning "both of these, then
+	// carry on".
+	await [note("first"), note("second")]
+
+	// 5. Work of *different* types is waited for one call at a time. Each is an
+	// ordinary blocking call, so this costs the sum rather than the slowest —
+	// which is exactly what the writing says it does.
+	Str message = slowShout("mixed")
+	Int count = lengthOf("mixed")
 	echo message + " has base length " + hive.conv.its(count)
 
-	// 6. Bounding the wait. `with timeout <ms>` may follow any `await`, and it
-	// changes what the await yields: without it you get the value, with it you
-	// get a `Result` — running out of patience is a value to handle, not a crash.
-	patient := slowShout("worth waiting for")
-	if await patient with timeout 100 is Result.Error(err) {
+	// 6. Bounding a wait. `with timeout <ms>` may follow any call, and it changes
+	// what the call yields: without it the value, with it a `Result` — running
+	// out of patience is a value to handle, not a crash.
+	if slowShout("worth waiting for") with timeout 100 is Result.Error(err) {
 		echo "gave up after " + hive.conv.its(err.waited) + "ms: " + err.message
 	}
 
 	// The timeout abandons the *waiting*, not the work: a virtual thread cannot
-	// be stopped from outside, so the task ran on regardless. Awaiting it again
-	// — with more patience, or none at all — still yields its value.
-	echo await patient
+	// be stopped from outside, so that shout ran to completion regardless — its
+	// result was simply dropped. Asking again with more patience gets one.
+	if slowShout("worth waiting for") with timeout 2000 is Result.Ok(value) {
+		echo "waited long enough: " + value
+	}
 
-	// A vector of handles takes one deadline across the whole barrier, so this
-	// means "both of them within two seconds", not two seconds each.
-	pair := [slowShout("first"), slowShout("second")]
-	if await pair with timeout 2000 is Result.Ok(done) {
+	// An await-all takes one deadline across the whole barrier, so this means
+	// "both of them within two seconds", not two seconds each.
+	if await [slowShout("first"), slowShout("second")] with timeout 2000
+		is Result.Ok(done)
+	{
 		echo join(done, " / ")
 	}
+}
+
+proc note(text: Str): void {
+	hive.task.sleep(200)
+	echo "noted " + text
 }

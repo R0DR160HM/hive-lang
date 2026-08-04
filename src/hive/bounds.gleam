@@ -86,7 +86,7 @@ type Fact {
 /// What a callable declared about itself, so a call site can be held to its
 /// parameter lengths and a call's value can be given its return type.
 type Sig {
-  Sig(params: List(ast.Field), ret: ast.TypeExpr, async: Bool)
+  Sig(params: List(ast.Field), ret: ast.TypeExpr)
 }
 
 type Env {
@@ -137,7 +137,7 @@ pub fn check(module: ast.Module) -> Result(Nil, String) {
   list.try_fold(module.decls, Nil, fn(_, d) {
     case d {
       ast.ProcDecl(name, params, ret, body)
-      | ast.FuncDecl(name, params, ret, body, _) ->
+      | ast.FuncDecl(name, params, ret, body) ->
         check_body(types, fns, name, params, ret, body)
       // A query's body is SQL; its interpolations can't index a vector, and
       // the main validation pass already walks them.
@@ -150,10 +150,10 @@ pub fn check(module: ast.Module) -> Result(Nil, String) {
 fn signatures(decls: List(ast.Decl)) -> Dict(String, Sig) {
   list.fold(decls, dict.new(), fn(acc, d) {
     case d {
-      ast.ProcDecl(name, params, ret, _) | ast.QueryDecl(name, params, ret, _) ->
-        dict.insert(acc, name, Sig(params, ret, False))
-      ast.FuncDecl(name, params, ret, _, async) ->
-        dict.insert(acc, name, Sig(params, ret, async))
+      ast.ProcDecl(name, params, ret, _)
+      | ast.FuncDecl(name, params, ret, _)
+      | ast.QueryDecl(name, params, ret, _) ->
+        dict.insert(acc, name, Sig(params, ret))
       ast.TypeDecl(..) -> acc
     }
   })
@@ -292,7 +292,7 @@ fn check_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
       use _ <- result.try(check_expr(env, e))
       Ok(env)
     }
-    ast.SExpr(e) -> {
+    ast.SExpr(e) | ast.SAsync(e) -> {
       // `append(v, x)` only ever grows `v`, so any `i < len(v)` fact stays
       // true afterwards — nothing to forget.
       use _ <- result.try(check_expr(env, e))
@@ -494,11 +494,12 @@ fn check_expr(env: Env, e: ast.Expr) -> Result(Nil, String) {
     ast.EUsing(source, kind) ->
       check_exprs(env, [source, ..ast.using_exprs(kind)])
     ast.EWith(value, _) -> check_expr(env, value)
-    ast.EAwait(value, timeout) ->
+    ast.EAwait(calls, timeout) ->
       check_exprs(env, case timeout {
-        Some(ms) -> [value, ms]
-        None -> [value]
+        Some(ms) -> list.append(calls, [ms])
+        None -> calls
       })
+    ast.ETimed(call, ms) -> check_exprs(env, [call, ms])
     // A bare name that reaches here is being read as a value. For a callable
     // that is a hand-off of whatever its parameters promise.
     ast.EIdent(_) -> check_value_escape(env, e)
@@ -564,14 +565,14 @@ fn open_params(env: Env, e: ast.Expr) -> Option(#(String, List(ast.Field))) {
         Ok(params) -> Some(#(n, params))
         Error(_) ->
           case list.contains(env.shadowed, n), dict.get(env.fns, n) {
-            False, Ok(Sig(params, _, _)) -> Some(#(n, params))
+            False, Ok(Sig(params, _)) -> Some(#(n, params))
             _, _ -> None
           }
       }
     // `takes(_, db)` — the holes are what is left to supply.
     ast.ECall(ast.EIdent(f), args) ->
       case has_hole(args), list.contains(env.shadowed, f), dict.get(env.fns, f) {
-        True, False, Ok(Sig(params, _, _)) -> {
+        True, False, Ok(Sig(params, _)) -> {
           let #(assigned, _) =
             codegen.assign_args(args, list.map(params, fn(p) { p.name }))
           let holes =
@@ -785,7 +786,7 @@ fn check_arg_lengths(
           )
         Error(_) ->
           case list.contains(env.shadowed, f), dict.get(env.fns, f) {
-            False, Ok(Sig(params, _, _)) ->
+            False, Ok(Sig(params, _)) ->
               check_slot_lengths(env, args, params, "of `" <> f <> "`")
             // Not a callable: a constructor for a variant-less type, or for the
             // first variant of a union.
@@ -1340,14 +1341,12 @@ fn outer_len(env: Env, expr: ast.Expr) -> Len {
         Static(a), Static(b) -> Static(a + b)
         _, _ -> Dyn
       }
-    // Awaiting a vector of handles resolves to a vector of the same arity, and
-    // awaiting one call gives that call's value.
-    ast.EAwait(ast.ECall(ast.EIdent(f), _), _) ->
-      case dict.get(env.fns, f) {
-        Ok(Sig(_, ret, _)) -> outer_dim(ret)
-        Error(_) -> Dyn
-      }
-    ast.EAwait(inner, _) -> outer_len(env, inner)
+    // An await-all resolves to a vector holding one result per call, so its
+    // length is how many calls were written. That holds for the bounded form
+    // too: on a service send the deadline folds into syslink's own error and the
+    // vector comes back as it is, and where it does wrap a `Result` the vector
+    // inside has the same length anyway.
+    ast.EAwait(calls, _) -> Static(list.length(calls))
     // A slice's length is not known statically.
     _ -> Dyn
   }
@@ -1372,12 +1371,10 @@ fn type_of(env: Env, expr: ast.Expr) -> Option(ast.TypeExpr) {
         Some(ast.TName(None, tname, _, [])) -> field_type(env, tname, field)
         _ -> None
       }
-    // A call's value is its declared return — except for a bare call to an
-    // `async func`, which is a handle; only `await` reaches the value.
+    // A call's value is its declared return.
     ast.ECall(ast.EIdent(f), _) ->
       case dict.get(env.fns, f) {
-        Ok(Sig(_, ret, False)) -> Some(ret)
-        Ok(Sig(_, _, True)) -> None
+        Ok(Sig(_, ret)) -> Some(ret)
         // Not a callable: a constructor. `Box(...)` makes a `Box`, which is how
         // the declared lengths of a struct's fields become reachable — a `Str[3]`
         // field is a promise like any other, and a `[dyn]` one guards its

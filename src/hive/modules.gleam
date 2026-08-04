@@ -267,7 +267,7 @@ fn own_names(module: ast.Module, prefix: String) -> Dict(String, String) {
 fn decl_name(decl: ast.Decl) -> String {
   case decl {
     ast.ProcDecl(name, _, _, _)
-    | ast.FuncDecl(name, _, _, _, _)
+    | ast.FuncDecl(name, _, _, _)
     | ast.QueryDecl(name, _, _, _)
     | ast.TypeDecl(name, _, _) -> name
   }
@@ -373,11 +373,11 @@ fn rewrite_decl(rw: Rw, decl: ast.Decl) -> Result(ast.Decl, String) {
       use body <- result.try(rewrite_body(rw, body, field_names(params)))
       Ok(ast.ProcDecl(flat(rw, name), params, ret, body))
     }
-    ast.FuncDecl(name, params, ret, body, is_async) -> {
+    ast.FuncDecl(name, params, ret, body) -> {
       use params <- result.try(rewrite_fields(rw, params))
       use ret <- result.try(rewrite_type(rw, ret))
       use body <- result.try(rewrite_body(rw, body, field_names(params)))
-      Ok(ast.FuncDecl(flat(rw, name), params, ret, body, is_async))
+      Ok(ast.FuncDecl(flat(rw, name), params, ret, body))
     }
     ast.QueryDecl(name, params, ret, sql) -> {
       use params <- result.try(rewrite_fields(rw, params))
@@ -544,6 +544,10 @@ fn rewrite_stmt(
       use e <- result.try(rewrite_expr(rw, e, locals))
       Ok(#(ast.SExpr(e), locals))
     }
+    ast.SAsync(call) -> {
+      use call <- result.try(rewrite_expr(rw, call, locals))
+      Ok(#(ast.SAsync(call), locals))
+    }
     ast.SBreak | ast.SContinue -> Ok(#(stmt, locals))
   }
 }
@@ -663,8 +667,10 @@ fn rewrite_expr(
       use typ <- result.try(rewrite_type(rw, typ))
       Ok(ast.EWith(value, typ))
     }
-    ast.EAwait(value, timeout) -> {
-      use value <- result.try(rewrite_expr(rw, value, locals))
+    ast.EAwait(calls, timeout) -> {
+      use calls <- result.try(
+        list.try_map(calls, fn(c) { rewrite_expr(rw, c, locals) }),
+      )
       use timeout <- result.try(case timeout {
         option.Some(ms) -> {
           use ms <- result.try(rewrite_expr(rw, ms, locals))
@@ -672,7 +678,12 @@ fn rewrite_expr(
         }
         option.None -> Ok(option.None)
       })
-      Ok(ast.EAwait(value, timeout))
+      Ok(ast.EAwait(calls, timeout))
+    }
+    ast.ETimed(call, ms) -> {
+      use call <- result.try(rewrite_expr(rw, call, locals))
+      use ms <- result.try(rewrite_expr(rw, ms, locals))
+      Ok(ast.ETimed(call, ms))
     }
     ast.EInt(_)
     | ast.EFloat(_)
@@ -915,8 +926,8 @@ fn pattern_bindings(e: ast.Expr) -> List(String) {
         pattern_bindings(source),
         list.flat_map(ast.using_exprs(kind), pattern_bindings),
       )
-    ast.EWith(value, _) -> pattern_bindings(value)
-    ast.EAwait(value, _) -> pattern_bindings(value)
+    ast.EWith(value, _) | ast.ETimed(value, _) -> pattern_bindings(value)
+    ast.EAwait(calls, _) -> list.flat_map(calls, pattern_bindings)
     _ -> []
   }
 }

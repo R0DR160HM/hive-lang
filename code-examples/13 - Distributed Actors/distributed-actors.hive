@@ -4,15 +4,12 @@
 // and private state. The point of the module is that one statement reaches it
 // whether it is a mailbox in this process or a service on another machine — and
 // there is only ever the one statement: you *call the address*. What the *call
-// site* does with it decides what it means, exactly as it does for an
-// `async func`:
+// site* does with it decides what it means, exactly as it does for a func:
 //
-//   a(msg)                          (statement) fire-and-forget
-//   h := a(msg)                     keep the request in flight
-//   await a(msg)                    wait for the answer -> Result
-//   await h                         wait on one held earlier
-//   await h with timeout 500        ...for at most half a second
-//   await [a(m1), b(m2)]            wait on many, one deadline
+//   a(msg)                          send it, wait for the answer -> Result
+//   a(msg) with timeout 500         ...for at most half a second
+//   async a(msg)        (statement) send it and do not wait: never fails
+//   await [a(m1), b(m2)]            send both, one barrier, one deadline
 //
 // There is no `send` and no `call` — an address is not a handle you pass to a
 // function, it is the thing you call. A service answers with one of *its own*
@@ -30,14 +27,13 @@
 // either way. If a handler's envelope only ever reaches `answer`, `self` or
 // `monitor`, it cannot outlive the turn it arrived in, so once the turn ends no
 // answer can possibly still be coming. If the envelope goes anywhere else —
-// stored in the state, handed to a task — a reply may genuinely still be on its
-// way, and the runtime keeps waiting instead. Both cases are shown below:
-// `inbox` is the first kind, `unhurried` the second.
+// stored in the state, handed to a call the handler does not wait for — a reply
+// may genuinely still be on its way, and the runtime keeps waiting instead. Both
+// cases are shown below: `inbox` is the first kind, `unhurried` the second.
 //
-// A service is NOT an `async func`. An `async T` handle is scoped — it cannot
-// outlive the scope that spawned it, and you await it for a value. An address is
-// a plain value: it outlives everything, can be stored, can be sent inside a
-// message, and is never awaited. The two features do not overlap.
+// An address is an ordinary value, and that is what separates a service from a
+// call you did not wait for: `async f(x)` keeps nothing at all, while an address
+// outlives everything, can be stored, and can travel inside a message.
 //
 // RUN IT — two terminals on one machine:
 //
@@ -85,9 +81,9 @@ proc inbox(seen: Int, note: Note, from: hive.syslink.Envelope): Int {
 		echo "  [inbox] {text}"
 		return seen + 1
 	} else if note is Note.HowMany {
-		// `answer` replies to whoever is awaiting. If the sender discarded its
-		// request, nothing is waiting and this is a no-op — one handler serves
-		// both shapes without caring which it was.
+		// `answer` replies to whoever is waiting. If the sender used `async`,
+		// nothing is waiting and this is a no-op — one handler serves both
+		// shapes without caring which it was.
 		hive.syslink.answer(from, Note.Counted(seen))
 		return seen
 	} else if note is Note.Counted(count) {
@@ -105,7 +101,7 @@ proc inbox(seen: Int, note: Note, from: hive.syslink.Envelope): Int {
 	} else if note is Note.Ignore {
 		// Handled, and deliberately not answered. Every envelope in this handler
 		// only ever reaches `answer` and `monitor`, so the compiler knows none of
-		// them can outlive their turn: whoever is awaiting this is told at once.
+		// them can outlive their turn: whoever is waiting is told at once.
 		echo "  [inbox] ignoring that one on purpose"
 		return seen
 	} else if note is Note.Late(text) {
@@ -117,16 +113,16 @@ proc inbox(seen: Int, note: Note, from: hive.syslink.Envelope): Int {
 	panic "the inbox was asked to explode"
 }
 
-// A service that answers from a task instead of from its turn — the pattern for
-// work too slow to hold a mailbox open for. Handing the envelope to `answerLate`
-// lets it outlive the turn, so the compiler switches the automatic `NoReply` off
-// for this handler and the caller's `await` waits for the real answer.
+// A service that answers from another thread instead of from its turn — the
+// pattern for work too slow to hold a mailbox open for. `async answerLate(from)`
+// lets the envelope outlive the turn, so the compiler switches the automatic
+// `NoReply` off for this handler and the caller waits for the real answer.
 proc unhurried(handled: Int, note: Note, from: hive.syslink.Envelope): Int {
-	answerLate(from)
+	async answerLate(from)
 	return handled + 1
 }
 
-async func answerLate(from: hive.syslink.Envelope): void {
+func answerLate(from: hive.syslink.Envelope): void {
 	hive.task.sleep(400)
 	hive.syslink.answer(from, Note.Late("worth the wait"))
 }
@@ -165,7 +161,10 @@ proc chat(mine: hive.syslink.Address, theirs: hive.syslink.Address): void {
 		panic err
 	}
 
-	mine(Note.Say("a local note"))
+	// Nothing is waiting for a reply to a `Say`, so it is sent with `async`: that
+	// form never blocks and never fails, which is precisely what keeps a local
+	// send and a remote one the same statement.
+	async mine(Note.Say("a local note"))
 
 	echo "Press enter once the other node is listening."
 	hive.term.read()
@@ -174,8 +173,8 @@ proc chat(mine: hive.syslink.Address, theirs: hive.syslink.Address): void {
 	// other node is in our peer list only if *it* has already sent us something.
 	echo "peers before the first send: {len(hive.syslink.peers())}"
 
-	theirs(Note.Say("hello from the other node"))
-	mine(Note.Watch(theirs))
+	async theirs(Note.Say("hello from the other node"))
+	async mine(Note.Watch(theirs))
 
 	// ...and now it is there, because a connection *is* the list: one pipe per
 	// node pair, filed under the endpoint the peer advertised no matter which end
@@ -188,26 +187,21 @@ proc chat(mine: hive.syslink.Address, theirs: hive.syslink.Address): void {
 		echo "  connected to {endpoint}"
 	}
 
-	// The same `send`, but its value is kept — so it is a request, in flight
-	// while we get on with something else.
-	pending := theirs(Note.HowMany())
-	echo "...the question is already on the wire..."
-
-	// `await` is the one place in the module that reports failure, because it is
-	// the only one with somewhere to report to. A timeout, a service that died
-	// mid-request and an unreachable node all arrive here as a Result.Error.
-	// `with timeout` bounds the wait; leave it off and syslink waits its own
-	// default instead.
-	answer := await pending with timeout 4000
+	// The same call *without* `async` is a request: it waits for the answer. This
+	// is the one place in the module that reports failure, because it is the only
+	// one with somewhere to report to — a timeout, a service that died mid-request
+	// and an unreachable node all arrive here as a Result.Error. `with timeout`
+	// bounds the wait; leave it off and syslink waits its own default instead.
+	answer := theirs(Note.HowMany()) with timeout 4000
 	if answer is Result.Ok(reply) && reply is Note.Counted(count) {
 		echo "the peer's inbox has seen {count} notes"
 	} else if answer is Result.Error(err) {
 		echo "could not ask the peer: {err.reason} — {err.message}"
 	}
 
-	// Many at once: one barrier, one deadline, answers in order. The type is
-	// inferred — a vector of `Result`s — and, as everywhere else in Hive, a
-	// `Result`'s payload has no surface spelling to annotate it with.
+	// Many at once: both go out, then one barrier with one deadline resolves them
+	// in order. Waiting for a batch of sends spawns nothing at all — each answer
+	// arrives on its own connection's reader.
 	both := await [
 		theirs(Note.HowMany()),
 		mine(Note.HowMany()),
@@ -222,28 +216,28 @@ proc chat(mine: hive.syslink.Address, theirs: hive.syslink.Address): void {
 	// Forgetting to answer, seen from the caller's side. `inbox` handles this and
 	// never replies — and because its envelope cannot outlive the turn, this comes
 	// straight back rather than waiting out the four seconds asked for.
-	ignored := await mine(Note.Ignore()) with timeout 4000
+	ignored := mine(Note.Ignore()) with timeout 4000
 	if ignored is Result.Error(err) {
 		echo "forgot to answer: {err.reason} — {err.message}"
 	}
 
-	// The other side of the same rule. `unhurried` hands its envelope to a task,
-	// so an answer may still be coming and nothing is failed early: the reply
-	// turns up 400ms later and the `await` is what waits for it.
+	// The other side of the same rule. `unhurried` hands its envelope to a call it
+	// does not wait for, so an answer may still be coming and nothing is failed
+	// early: the reply turns up 400ms later, and this call is what waits for it.
 	slow := hive.syslink.spawn(unhurried, 0)
-	late := await slow(Note.Say("take your time")) with timeout 4000
+	late := slow(Note.Say("take your time")) with timeout 4000
 	if late is Result.Ok(reply) && reply is Note.Late(text) {
 		echo "answered late:    {text}"
 	}
 
 	echo "Type `boom` to crash the peer's inbox, or enter to finish."
 	if hive.term.read() == "boom" {
-		theirs(Note.Explode())
+		async theirs(Note.Explode())
 		hive.task.sleep(1000)
 
 		// The service is gone, but its node is fine — so this reports NoProc
 		// rather than hanging, and the peer is still up to say so.
-		if await theirs(Note.HowMany()) with timeout 2000
+		if theirs(Note.HowMany()) with timeout 2000
 			is Result.Error(err) {
 			echo "asking again: {err.reason} — {err.message}"
 		}

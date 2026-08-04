@@ -130,8 +130,8 @@ Two limits worth knowing:
 
 ## A taste of Hive
 
-The four kinds of callable — a `func`, a `proc`, an inline SQL `query`, and an
-`async func` that runs on its own virtual thread — in one program:
+The three kinds of callable — a `func`, a `proc` and an inline SQL `query` — and
+what a call site can decide to do with one, in one program:
 
 ```hive
 type Greeting {
@@ -169,8 +169,9 @@ func first(v: T[]): Result<T, Bool> {
 	return Result.Error(false)
 }
 
-// An `async func` runs on its own virtual thread (a goroutine).
-async func slowShout(text: Str): Str {
+// Nothing about a declaration says how it runs: every call blocks its caller,
+// and a call site that does not want to wait says so with `async`.
+func slowShout(text: Str): Str {
 	return text + "!!!"
 }
 
@@ -187,8 +188,8 @@ proc main(): void {
 		echo "first up: {who}"
 	}
 
-	slowShout("fire-and-forget")     // does not block; the result is discarded
-	echo await slowShout("await")    // blocks until the value is ready
+	async slowShout("fire-and-forget")   // its own thread; no result to read
+	echo slowShout("waited for")         // blocks until the value is ready
 }
 ```
 
@@ -198,7 +199,7 @@ Running it prints:
 Good evening, Dr. Grace.
 Hey Linus!
 first up: Grace
-await!!!
+waited for!!!
 ```
 
 Pattern matching with `is` — beyond the tagged-union variants and `Result`s
@@ -239,7 +240,7 @@ walkthrough (hashing, HMAC, base64 and JWTs), a `hive.sql` example backed by an
 embedded SQLite database, a tour of first-class functions and partial
 application, a tour of Hive's copy-on-binding [value
 semantics](#value-semantics-copy-on-binding), a tour of concurrency
-(spawning tasks, holding handles and awaiting one or many), a two-node
+(firing a call off, waiting for one, and waiting for many at once), a two-node
 [`hive.syslink`](#hivesyslink) program whose services talk to each other across
 two terminals or two machines, a three-node distributed cache that combines
 `hive.syslink` with `hive.sql` (one owner per key, invalidated across the cluster
@@ -250,7 +251,7 @@ compiles, builds and runs.
 
 ## The language
 
-* **`proc` / `func` / `query` / `async func`** — both `proc`s and `func`s may
+* **`proc` / `func` / `query`** — both `proc`s and `func`s may
   perform I/O: `echo`, reading files with `using`, and `hive.net` are all
   allowed in either. A `func` differs from a `proc` in exactly two ways: it
   cannot receive a mutex as a parameter (a `mut` value passed to a func is seen
@@ -259,8 +260,9 @@ compiles, builds and runs.
   return type describes its **rows** — see
   [typed queries](#queries-are-typed-by-their-rows). An interpolated `{param}`
   never enters the SQL text: it becomes a placeholder and the value is bound
-  alongside it. An `async func` runs on its own virtual
-  thread — see the concurrency bullet below. Programs start at
+  alongside it. **Nothing about a declaration says how it runs**: every call
+  blocks its caller, and the *call site* decides otherwise — see the concurrency
+  bullet below. Programs start at
   `proc main(): void`, in the file you hand to `hive build`/`hive run`.
 * **Multiple files** — `import <path>`, written outside any callable, brings
   another `.hive` file's declarations into scope. See
@@ -317,52 +319,62 @@ compiles, builds and runs.
   parameter or a plain `:=` binding is a compile error. A mutex passed as an
   argument is **copied** on the way in, so the callee's immutable view really is
   one: it cannot see the caller's later writes, whether the two run in sequence
-  or — for an `async func` — at the same time.
-* **Concurrency** — an `async func` runs on its own virtual thread (a
-  goroutine). The call site decides how you interact with it, with no Future or
-  Promise type to name and nothing dynamically typed. A bare call spawns the
-  work; `await` waits for it. As a statement (`f(x)`) the result is discarded —
-  fire-and-forget, the caller does not block. Bound (`h := f(x)`) it keeps the
-  running task as a *handle*; `await h` then blocks for its value, returning
-  instantly if the task already finished. `await f(x)` is the two combined:
-  spawn and wait inline. To wait on many tasks at once, `await` a vector of
-  handles: `await [f(a), f(b), f(c)]` runs all three concurrently and resolves,
-  in order, to a statically-sized vector of their results (`Str[3]`) — one
-  barrier, fully typed. Tasks of *different* types are joined the same way:
-  spawn each, then `await` each; because they all started first, the total wait
-  is the slowest, not the sum. A handle's type (`async T`) is inferred and never
-  written: you may bind it and `await` it, but not annotate, return, pass, store,
-  index, echo, or otherwise use it as a plain `T`, so a task can never outlive
-  the scope that spawned it. **A vector of handles is held to the same rule** —
-  `await [f(a), f(b)]` builds one, and until it is awaited it can be bound and
-  nothing else, since a vector that escaped would carry its tasks out just as
-  surely. Every one of these is a compile error naming the handle, rather than
-  something the Go compiler reports against a generated type.
-  `await` is idempotent — the same handle may be awaited more than once. Any
-  `await` may be bounded with the optional
-  [`with timeout <ms>`](#hivetask) clause, which turns its result into a
-  `Result<T, hive.task.TimeoutError>` — the timeout abandons the waiting, not the
-  work. See `code-examples/10 - Concurrency`.
+  or — for an `async` call — at the same time.
+* **Concurrency** — **every call blocks its caller.** Nothing about a
+  declaration says otherwise, so there is no `async func`, no Future and no
+  Promise type to name; what a call means is decided where it is written:
+  * `f(x)` waits for it and yields `T`. It costs neither a goroutine nor a
+    channel — it is a function call.
+  * `async f(x)`, as a **statement**, runs it on its own virtual thread (a
+    goroutine) and carries on. Fire-and-forget is the whole of what it is:
+    nothing comes back, so `async` has no value and cannot appear where one is
+    wanted. That is what leaves no handle to hold, to pass, or to leak out of the
+    scope that started it — and why the language needs no type for one. It works
+    on any call: a `func`, a `proc`, a `query`, the standard library, a
+    [service](#hivesyslink). What it refuses, it refuses by name — a global
+    builtin (`len`, `append` and the rest exist for the value they hand back, so
+    firing one off would leave nothing of it), a constructor (it builds a value
+    and runs no body), and a partial application (`f(1, _)` makes a function
+    value; nothing runs until something calls it).
+  * `await [f(a), f(b), f(c)]` is the **await-all**, and the only `await` there
+    is: every call in the list starts on its own thread and the whole list is one
+    barrier, resolving *in order* to a statically-sized, fully-typed vector of
+    their results (`Str[3]`) — never a dynamic or `Any` vector. Three calls that
+    each take a second take about a second. A list of one is legal and still
+    means "on its own thread, then wait". Over `void` calls the barrier has no
+    value either, and is a statement meaning "both of these, then carry on".
+    Every entry has to be a call (a value already in hand has nothing to wait
+    for) and they all have to answer with the same type, since one barrier
+    resolves to one vector.
+  * Work of **different types** is waited for one call at a time — each of those
+    is an ordinary blocking call, so it costs the sum rather than the slowest,
+    which is exactly what the writing says it does.
+
+  Any wait may be bounded with the optional [`with timeout <ms>`](#hivetask)
+  clause, which turns its result into a `Result<T, hive.task.TimeoutError>` — on
+  an await-all it is one deadline across the whole barrier. The timeout abandons
+  the waiting, not the work. See `code-examples/10 - Concurrency`.
 * **Distribution** — [`hive.syslink`](#hivesyslink) adds *services*: long-lived,
   addressable things with a mailbox and private state, reached by the same
   statement whether they live in this process or on another machine.
   Calling the address — `address(message)` — is the only way to reach one, and —
-  as with an `async func` — the call site decides what it means: as a statement it
-  is fire-and-forget, kept it is a request in flight, and `await`ed it yields
-  `Result<Message, hive.syslink.SyslinkError>`. A service answers with one of its
-  own messages, so the reply type is the mailbox type and nothing needs
+  as with a func — the call site decides what it means: written plainly it waits
+  for the service's answer and yields
+  `Result<Message, hive.syslink.SyslinkError>`, and `async address(message)` is
+  the send that waits for nothing and cannot fail. A service answers with one of
+  its own messages, so the reply type is the mailbox type and nothing needs
   annotating. A *service* is named by an atom, which is what lets the compiler
   know the whole registry; a *node* has no name at all — it is identified by the
-  endpoint it can be dialed at, so a peer list is ordinary runtime data. A service
-  is not an `async T` — its
-  address is an ordinary value that outlives every scope, can be stored, can be
-  sent inside a message, and is never awaited. Its handler is a fold over the
-  mailbox (`proc (State, Message, hive.syslink.Envelope): State`), so a service
-  needs no mutex at all. A service name is an atom, which is what lets the
-  compiler know the whole registry — and a named address is the only kind that
-  survives its service being restarted. A node has no name: it is identified by
-  the endpoint it can be dialed at, so a peer list is ordinary runtime data. A
-  `panic` inside a service kills only that service, not the node.
+  endpoint it can be dialed at, so a peer list is ordinary runtime data. An
+  address is an ordinary value that outlives every scope, can be stored, and can
+  travel inside a message — which is the difference between a service and a call
+  you did not wait for, since `async f(x)` keeps nothing at all. Its handler is a
+  fold over the mailbox (`proc (State, Message, hive.syslink.Envelope): State`),
+  so a service needs no mutex at all. A service name is an atom, which is what
+  lets the compiler know the whole registry — and a named address is the only
+  kind that survives its service being restarted. A node has no name: it is
+  identified by the endpoint it can be dialed at, so a peer list is ordinary
+  runtime data. A `panic` inside a service kills only that service, not the node.
 * **Atoms** (`#SomeAtom`) are interned symbols. The compiler assigns each a
   small integer and embeds the atom table in the executable, so `echo` prints an
   atom's name while coercion to `Str` yields its decimal value. **`#Nil` is the
@@ -707,36 +719,21 @@ comes out than went in — and a maximum can never put an index in range, becaus
 a filter that keeps nothing is always a possibility. Their results are guarded
 like any other vector of unknown length, even when the input's length was known.
 
-#### Walking with an `async func`
+#### A walk is sequential
 
-Hand a walk an [`async func`](#the-language) and it runs **every element at
-once**, then waits for them all before it answers:
+A walk calls its function once per element, in order, on the calling thread. It
+is never quietly concurrent: nothing in `map(urls, fetch)` says how `fetch` runs,
+and a builtin is the last place a program should hide a decision like that.
+
+To run a batch of calls together, write the [await-all](#the-language) — which is
+also where the count of them lives:
 
 ```hive
-async func fetch(url: Str): Str { ... }
+func fetch(url: Str): Str { ... }
 
-bodies := map(urls, fetch)      // all concurrent; costs the slowest, not the sum
-live   := filter(urls, reaches) // every check at once, then the ones that passed
+bodies := map(urls, fetch)                        // one at a time, in order
+Str[3] some = await [fetch(a), fetch(b), fetch(c)] // all three at once
 ```
-
-No `await` is written, and none is needed. A walk applies its function to each
-element independently, so *all* of its calls are known before the first one runs
-— which is exactly the condition for running them together, and is also why the
-result can be handed back complete. `await` earns its place where the alternative
-is not waiting (a bare call is fire-and-forget, a bound one is a handle you
-hold); a walk has no such alternative, so there is nothing for the call site to
-decide.
-
-What comes back is what the sequential walk would give: **same type, same
-elements, same order**, same declared length. `async` changes how long the walk
-takes and nothing else. Because the walk awaits every task before returning, no
-handle is produced and no task outlives the call.
-
-`sort` is the exception, and it is refused rather than quietly accepted. A walk
-knows all of its calls up front; a sort picks each comparison from how the
-previous one answered, so there is only ever one to make and nothing to overlap —
-every call would be spawned and waited for on the spot, which is strictly slower
-than a plain `func`.
 
 The vector goes in the way it would go into any `T[]` parameter, so the copy
 rules of [value semantics](#value-semantics-copy-on-binding) apply unchanged: a
@@ -778,7 +775,7 @@ except those there is no honest order for:
 | `Result<T, E>` | every `Error` before every `Ok`; two of a kind by their payloads |
 | a struct | field by field, in declaration order — the first field they differ on decides |
 | a tagged union | by **variant** first, in the order the variants were declared, then by that variant's fields |
-| a function value, a task handle, a service address | none — a compile error, naming the part at fault |
+| a function value, a service address | none — a compile error, naming the part at fault |
 
 The ordering is chosen by the element's static type and emitted inline, the same
 way a deep copy is: no runtime reflection, no boxing, no dispatch. A struct or
@@ -798,10 +795,9 @@ byName := sort(users, olderThan(_, _))   // a partial application works too
 That is also the answer for an element type with no default order — anything can
 be sorted once you say how. As with a walk, the function is a `func`, never a
 `proc`: a sort says nothing about how many comparisons it makes or in what order,
-so there is nowhere to hang a side effect. It may not be an `async func` either —
-unlike a [walk](#walking-with-an-async-func), a sort chooses each comparison from
-how the last one answered, so there is never more than one call to make and
-nothing for concurrency to overlap.
+so there is nowhere to hang a side effect. Nor is there anything to gain from
+running the comparisons concurrently: a sort chooses each comparison from how the
+last one answered, so there is never more than one call to make.
 
 The sort is **stable** — elements neither of which comes first keep the order
 they arrived in. That is what makes `sort` a function of its input alone even
@@ -970,7 +966,7 @@ Everything here performs I/O, so — like `echo` and `using` — it works inside
 `func` or a `proc`, and none of it adds a dependency to your build.
 
 Each of the three servers blocks forever, so it usually goes on a virtual
-thread of its own (`async func`), and each runs its handler once per
+thread of its own (`async serveForever()`), and each runs its handler once per
 request/connection on a virtual thread of its own too. Every call in the module
 names its protocol — `httpRequest`, `wsSend`, `socketReceive` — so nothing here
 reads as "the" default one. A handler is passed **by
@@ -1330,7 +1326,7 @@ Line-oriented terminal I/O.
   `echo`, but restricted to a `Str`.
 * `hive.term.read()` blocks until the user finishes a line of input and returns
   it as a `Str`, stripped of the trailing newline. It parks only the calling
-  virtual thread: called inside an `async func`, the rest of the program keeps
+  virtual thread: reached through an `async` call, the rest of the program keeps
   running on other threads while that goroutine waits. At end of input it
   returns whatever preceded EOF (`""` if nothing).
 * `hive.term.args()` returns the command-line arguments the program was started
@@ -1340,33 +1336,33 @@ Line-oriented terminal I/O.
 
 ### `hive.task`
 
-Scheduling controls over the virtual threads an `async func` runs on.
+Scheduling controls over the virtual threads a call can be put on.
 
-* **`await <handle> with timeout <ms>`** bounds how long a wait may take. The
-  clause is optional and may follow **any** `await`, and it changes what the
-  await yields: without it you get the value, with it a
+* **`with timeout <ms>`** bounds how long a wait may take. The clause is optional
+  and may follow anything that waits — a call (`f(x) with timeout 500`) or an
+  [await-all](#the-language) (`await [f(a), f(b)] with timeout 500`) — and it
+  changes what that yields: without it you get the value, with it a
   `Result<T, hive.task.TimeoutError>` — running out of patience is a value to
   handle, not a crash. A `TimeoutError` carries `waited` (the milliseconds asked
-  for) and a `message`. On a vector of handles the timeout is **one deadline
-  across the whole barrier** (`await [a, b] with timeout 500` means "both within
-  half a second"), and the whole vector fails together.
+  for) and a `message`. On an await-all the timeout is **one deadline
+  across the whole barrier** (`await [f(a), f(b)] with timeout 500` means "both
+  within half a second"), and the whole vector fails together.
 
   A timeout abandons the **waiting**, not the work: a virtual thread cannot be
-  stopped from the outside, so the task runs on and only its result is dropped.
-  That is also why the same handle can be awaited again afterwards, with more
-  patience or none at all, and still yield its value.
+  stopped from the outside, so the call runs on and only its result is dropped.
 
   ```hive
-  patient := slowShout("worth waiting for")
-  if await patient with timeout 100 is Result.Error(err) {
+  if slowShout("worth waiting for") with timeout 100 is Result.Error(err) {
   	echo "gave up after " + hive.conv.its(err.waited) + "ms"
   }
-  echo await patient          // the task kept running; this still gets it
   ```
+
+  A `void` call has no value for the `Result` to carry, so bounding one is
+  refused rather than lowered to a type with no spelling.
 
   On a [`hive.syslink`](#hivesyslink) request the clause folds into that module's
   own error instead of wrapping a second `Result` around the first, so
-  `await a(m) with timeout 250` is still a
+  `a(m) with timeout 250` is still a
   `Result<Message, hive.syslink.SyslinkError>` whose reason is `"Timeout"`.
   Omitted, syslink waits its own default (5s).
 
@@ -1374,7 +1370,7 @@ Scheduling controls over the virtual threads an `async func` runs on.
   clause, so it stays usable as an ordinary variable name.
 * `hive.task.sleep(ms)` parks the calling virtual thread for `ms` milliseconds
   and returns nothing. Only that goroutine waits — others keep running — so two
-  tasks that each `sleep`, spawned and then awaited together, finish in about
+  calls that each `sleep`, waited for together in one `await`, finish in about
   the longer of the two, not the sum. A non-positive `ms` returns immediately.
 
 ### `hive.syslink`
@@ -1383,15 +1379,16 @@ Addressable **services**, in this process or on another machine, reached by the
 same statement either way. A service is long-lived, owns private state only it
 can touch, and has an identity you can pass around.
 
-A service is deliberately **not** an `async T`. The two features do not overlap:
+A service is a different thing from a call you did not wait for, and the contrast
+is worth spelling out:
 
-| | `async T` | `hive.syslink.Address` |
+| | `async f(x)` | `hive.syslink.Address` |
 | --- | --- | --- |
-| lifetime | scoped — cannot outlive its spawner | unscoped — outlives everything |
-| identity | none (a join point) | yes, that is the point |
-| interaction | `await`, yields `T` | called with a message; as a statement yields nothing |
-| as a value | cannot be stored, returned or passed | ordinary value; can even be sent inside a message |
-| callable | no — it is already running | yes, and calling it *is* the send |
+| lifetime | as long as the call takes | unscoped — outlives everything |
+| identity | none (there is nothing to hold) | yes, that is the point |
+| interaction | none — it keeps nothing back | called with a message, and calling it *is* the send |
+| as a value | it has none at all | ordinary value; can even be sent inside a message |
+| result | none; to get one, wait for the call | `Result<Message, SyslinkError>` when you wait for it |
 
 **The handler is a fold over the mailbox.** `proc (State, Message,
 hive.syslink.Envelope): State` — state in, one message, the turn's envelope, and
@@ -1459,17 +1456,15 @@ opening two and splitting the ordering guarantee between them.
   harmless.
 
 **Messages: an address is called.** There is exactly **one** way to reach a
-service — you *call its address* — and, as with an `async func`, what the *call
-site* does with it decides what it means. There is no `send` and no `call`: an
+service — you *call its address* — and, as with a func, what the *call site* does
+with it decides what it means. There is no `send` and no `call`: an
 address is not a handle you pass to some function, it is the thing you call.
 
 ```hive
-inbox(Note.Say("hi"))                    // statement: fire-and-forget
-pending := cache(Op.Count())             // keep the request in flight
-answer := await pending                  // wait for it
-answer := await pending with timeout 250 // ...for at most 250ms
-answer := await cache(Op.Count())        // send + wait
-both := await [a(m), b(m)]               // one barrier, one deadline
+async inbox(Note.Say("hi"))          // send it, wait for nothing
+answer := cache(Op.Count())          // send it and wait for the answer
+answer := cache(Op.Count()) with timeout 250 // ...for at most 250ms
+both := await [a(m), b(m)]           // send both, one barrier, one deadline
 ```
 
 The callee's *type* is what makes this a send, never its spelling, so a local, a
@@ -1480,23 +1475,23 @@ message and nothing else: a second argument, a named argument, a missing message
 and a partial application (`c(_)`) are each rejected by name, because each is a
 mistake about what the value is.
 
-* As a **statement**, `address(message)` returns `void` and
+* Written **plainly**, `address(message)` sends it and waits for the answer,
+  yielding `Result<Message, hive.syslink.SyslinkError>`. This is the one place in
+  the module that reports failure, because it is the only one
+  with somewhere to report to: a `"Timeout"`, a service that died mid-request
+  (`"Down"` / `"NoProc"`), an unreachable node (`"Unreachable"`), a payload that
+  would not decode (`"Decode"`) and a request the service handled but never
+  answered (`"NoReply"`) all arrive here.
+* With **`async`**, the same call returns `void` and
   **never blocks and never fails.** A dead or unreachable recipient is not an
   error at the send site — that is precisely what keeps a local send and a remote
   one the same statement, and failure is discovered through a monitor instead.
   Nothing is registered for a reply, so this is also the cheapest form.
-* **Kept**, the same call is a *request in flight*. Its type is inferred and has
-  no surface spelling, exactly like `async T`: you may bind it and `await` it,
-  and nothing else. (It is not an `async T` underneath — no goroutine is parked
-  waiting, because the answer arrives on the connection's own reader.)
-* **`await`ing** it yields `Result<Message, hive.syslink.SyslinkError>`. This is
-  the one place in the module that reports failure, because it is the only one
-  with somewhere to report to: a `"Timeout"`, a service that died mid-request
-  (`"Down"` / `"NoProc"`), an unreachable node (`"Unreachable"`), a payload that
-  would not decode (`"Decode"`) and a request the service handled but never
-  answered (`"NoReply"`) all arrive here. Awaiting is idempotent for a settled
-  answer; a *timed-out* request deliberately is not settled, so the same handle
-  may be awaited again with more patience.
+* An **[await-all](#the-language)** over sends is one barrier with one deadline,
+  and spawns nothing at all: each send registers for its answer and returns, and
+  the waiting happens on the connection's own reader.
+* A **bounded** send folds the deadline into syslink's own error rather than
+  wrapping a second `Result` around the first, so its reason is `"Timeout"`.
 * **The reply type is the mailbox type**, so nothing is ever annotated. A service
   answers with one of *its own* messages, which makes a mailbox type the whole
   protocol — requests and responses together — and lets `is` narrow a reply
@@ -1504,9 +1499,9 @@ mistake about what the value is.
 * Either way the message is copied on its way in, using the same deep,
   type-directed copy [a binding uses](#value-semantics-copy-on-binding), so the
   recipient can never observe the sender mutating it afterwards.
-* `hive.syslink.answer(from, value)` replies to whoever is awaiting. If the
-  sender discarded its request nothing is waiting, so it is a no-op — one handler
-  serves both shapes without caring which it was.
+* `hive.syslink.answer(from, value)` replies to whoever is waiting. If the sender
+  used `async` nothing is waiting, so it is a no-op — one handler serves both
+  shapes without caring which it was.
 
 **Forgetting to answer fails fast, and you write nothing to get it.** Missing a
 reply on one branch is the easiest mistake to make in service code, and waiting
@@ -1523,11 +1518,12 @@ envelope goes:
   three calls the runtime controls, none of which keep the reply token — it
   cannot outlive the turn it arrived in. Once that turn ends, no answer can still
   be coming, so an unanswered request is failed at once.
-* If the envelope goes anywhere else — stored in the returned state, handed to an
-  `async func`, passed to one of your own procs — a reply may genuinely still be
-  on its way, and the runtime keeps waiting exactly as before. That is what makes
-  the *deferred* reply possible: hand the envelope to a task and the service's
-  turn ends immediately without the caller being cut off.
+* If the envelope goes anywhere else — stored in the returned state, handed to a
+  call the handler does not wait for, passed to one of your own procs — a reply
+  may genuinely still be on its way, and the runtime keeps waiting exactly as
+  before. That is what makes the *deferred* reply possible: hand the envelope to
+  an `async` call and the service's turn ends immediately without the caller
+  being cut off.
 
 ```hive
 // Answered or not, within the turn -> a forgotten reply fails immediately.
@@ -1538,7 +1534,7 @@ proc tidy(n: Int, m: Ask, from: hive.syslink.Envelope): Int {
 
 // The envelope leaves the turn, so the answer is allowed to arrive later.
 proc patient(n: Int, m: Ask, from: hive.syslink.Envelope): Int {
-	answerLater(from)                  // an async func, replies when it is done
+	async answerLater(from)            // replies when it is done; nothing waits here
 	return n + 1
 }
 ```
@@ -1732,7 +1728,7 @@ mappings worth knowing:
 
 | Hive                                    | Go                                                             |
 | --------------------------------------- | -------------------------------------------------------------- |
-| `proc` / `func` / `async func`          | an ordinary `func`; `proc main(): void` → `func main()`        |
+| `proc` / `func`                         | an ordinary `func`; `proc main(): void` → `func main()`        |
 | `query q(p: Str): Row[dyn]`             | a function returning SQL text with `?` plus the bound args     |
 | `type T { }` / `type T { A {..} B }`    | a `struct` / an `interface` + one struct per variant           |
 | fields declared outside any variant     | appended to **every** variant struct                           |
@@ -1742,9 +1738,10 @@ mappings worth knowing:
 | `mut b = a` (both `mut`, owns storage)  | no variable — `b` compiles to `a`, so one slice header is shared |
 | `ys := xs` (needs a copy)               | a generated deep clone, chosen by the static type              |
 | `f(mutVec)` (argument names `mut` storage) | `f(hive.CloneVec(mutVec))` — copied in, so the callee's `T` really is immutable |
-| `f(x)` bare stmt / `await f(x)` (async) | `go f(x)` / a blocking call                                    |
-| `h := f(x)` / `await h`                 | `hive.Spawn(..)` / `h.Await()`; `await h with timeout ms` → a `Result` |
-| `await [f(a), f(b)]`                    | `hive.AwaitAll(..)` → a statically-sized vector                |
+| `f(x)` / `async f(x)`                   | a plain call / `go f(x)`                                       |
+| `f(x) with timeout ms`                  | `hive.AwaitTimeout(hive.Spawn(..), ms)` → a `Result`           |
+| `await [f(a), f(b)]`                    | `hive.AwaitAll(..)` over one `hive.Spawn` each → a statically-sized vector |
+| `addr(m)` / `async addr(m)`             | a send that waits for its answer / `hive.SyslinkSend(..)`, which cannot fail |
 | `for each x in v { }`                   | `for _, x := range v { }`                                      |
 | `x is Result.Ok(v)` / `x is T.Variant(a, _)` | `IsOk()` + accessor / a type assertion; `_` binds nothing |
 | `if <call> is Result.Ok(v)`             | one `if` with an init slot, so the call is evaluated once       |
