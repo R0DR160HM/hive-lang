@@ -3434,6 +3434,97 @@ pub fn async_heterogeneous_join_keeps_types_test() {
   should.be_true(string.contains(go, "var s string = shout.Await()"))
 }
 
+// --- a handle may be bound and awaited, and nothing else ---
+
+fn handle_error(body: String) -> String {
+  let assert Error(msg) = compiler.compile(async_prog(body))
+  msg
+}
+
+pub fn a_handle_cannot_be_passed_test() {
+  // Was accepted, then failed in the generated Go against a name the source
+  // never mentions: `cannot use h (variable of type *hive.Async[int])`.
+  let assert Error(msg) =
+    compiler.compile(
+      "async func slow(n: Int): Int {\n\treturn n\n}\nfunc takes(x: Int): Int {\n\treturn x\n}\nproc main(): void {\n\th := slow(1)\n\techo takes(h)\n}\n",
+    )
+  should.be_true(string.contains(msg, "a task handle cannot be used here"))
+}
+
+pub fn a_handle_cannot_be_echoed_test() {
+  // Was accepted and *ran*, printing the Go pointer: `&{0x… 0 <nil>}`.
+  let msg = handle_error("\th := slowShout(\"hi\")\n\techo h\n")
+  should.be_true(string.contains(msg, "a task handle cannot be used here"))
+  should.be_true(string.contains(msg, "reached with `await`"))
+}
+
+pub fn a_handle_cannot_be_returned_or_annotated_test() {
+  let assert Error(returned) =
+    compiler.compile(
+      "async func slow(n: Int): Int {\n\treturn n\n}\nfunc hold(): Int {\n\th := slow(1)\n\treturn h\n}\nproc main(): void {\n\techo hold()\n}\n",
+    )
+  should.be_true(string.contains(returned, "a task handle cannot be used here"))
+
+  let assert Error(annotated) =
+    compiler.compile(
+      "async func slow(n: Int): Int {\n\treturn n\n}\nproc main(): void {\n\tInt h = slow(1)\n\techo h\n}\n",
+    )
+  should.be_true(string.contains(annotated, "a task handle cannot be used here"))
+}
+
+pub fn a_handle_cannot_be_stored_test() {
+  let msg =
+    handle_error(
+      "\th := slowShout(\"hi\")\n\tmut Str[dyn] box = []\n\tappend(box, h)\n\techo len(box)\n",
+    )
+  should.be_true(string.contains(msg, "a task handle cannot be used here"))
+}
+
+pub fn a_vector_of_handles_cannot_be_passed_test() {
+  // The same rule one level up. `await [f(a), f(b)]` makes one of these, and
+  // until it is awaited it is just as escapable as a lone handle.
+  let assert Error(msg) =
+    compiler.compile(
+      "async func slow(n: Int): Int {\n\treturn n\n}\nfunc takes(v: Int[]): Int {\n\treturn len(v)\n}\nproc main(): void {\n\techo takes([slow(1), slow(2)])\n}\n",
+    )
+  should.be_true(string.contains(
+    msg,
+    "a vector of task handles cannot be used here",
+  ))
+}
+
+pub fn a_vector_of_handles_cannot_be_indexed_or_walked_test() {
+  let indexed = handle_error("\techo [slowShout(\"a\"), slowShout(\"b\")][0]\n")
+  should.be_true(string.contains(indexed, "a task handle cannot be used here"))
+
+  let walked =
+    handle_error(
+      "\ths := [slowShout(\"a\"), slowShout(\"b\")]\n\tfor each h in hs {\n\t\techo h\n\t}\n",
+    )
+  should.be_true(string.contains(
+    walked,
+    "a vector of task handles cannot be used here",
+  ))
+}
+
+pub fn every_legal_handle_form_still_compiles_test() {
+  // The rule only closes what was never meant to be open: binding, awaiting
+  // (twice, inline, with a timeout, and a whole vector at once) and discarding
+  // all keep working.
+  compiler.compile(async_prog(
+    "\tslowShout(\"a\")\n"
+    <> "\th := slowShout(\"b\")\n"
+    <> "\techo await h\n"
+    <> "\techo await h\n"
+    <> "\techo await slowShout(\"c\")\n"
+    <> "\techo len(await [slowShout(\"d\"), slowShout(\"e\")])\n"
+    <> "\ths := [slowShout(\"f\"), slowShout(\"g\")]\n"
+    <> "\techo len(await hs)\n"
+    <> "\tif await h with timeout 1000 is Result.Ok(v) {\n\t\techo v\n\t}\n",
+  ))
+  |> should.be_ok
+}
+
 // ---------------------------------------------------------------------------
 // hive.term
 // ---------------------------------------------------------------------------
@@ -3652,38 +3743,55 @@ pub fn unsized_vector_is_rejected_as_a_variable_test() {
   should.be_true(string.contains(msg, "`[]` only says"))
 }
 
-pub fn unsized_vector_is_accepted_as_a_return_test() {
-  // A return names no storage of its own — it says what the caller gets — and
-  // "some length" is a complete answer there. Which kind the callee kept the
-  // value in is its own business.
-  let go =
-    compile(
+pub fn unsized_vector_is_rejected_as_a_return_test() {
+  // A return is where the caller is told what it is getting, and `[]`, `[dyn]`
+  // and `[3]` are three different answers to them. `[]` and `[dyn]` happen to
+  // be the *same* answer, which is the reason to have only one spelling of it:
+  // two invite the reader to hunt for a difference that isn't there.
+  let assert Error(msg) =
+    compiler.compile(
       "func f(): Str[] {\n\treturn [\"a\"]\n}\nproc main(): void {\n\techo len(f())\n}\n",
     )
-  should.be_true(string.contains(go, "func f() []string {"))
+  should.be_true(string.contains(msg, "the return type of `f` is declared `Str[]`"))
+  should.be_true(string.contains(msg, "a return is where the caller is told"))
+  should.be_true(string.contains(msg, "`[]` stays available on a parameter"))
 }
 
-pub fn an_unsized_return_promises_no_length_test() {
-  // Which is the whole point of it: `[]` and `[dyn]` are the same answer to a
-  // caller, so a static slot cannot be filled from one and an index into the
-  // result needs a guard.
+pub fn a_dynamic_return_is_what_an_unsized_one_meant_test() {
+  // `[dyn]` is the spelling that survives, and it promises exactly what `[]`
+  // used to: nothing. A static slot cannot be filled from one, and an index
+  // into the result needs a guard.
+  compile("func f(): Str[dyn] {\n\treturn [\"a\"]\n}\nproc main(): void {\n\techo len(f())\n}\n")
+  |> string.contains("func f() []string {")
+  |> should.be_true
+
   let assert Error(static_slot) =
     compiler.compile(
-      "func f(): Str[] {\n\treturn [\"a\", \"b\"]\n}\nproc main(): void {\n\tStr[2] v = f()\n\techo v[0]\n}\n",
+      "func f(): Str[dyn] {\n\treturn [\"a\", \"b\"]\n}\nproc main(): void {\n\tStr[2] v = f()\n\techo v[0]\n}\n",
     )
   should.be_true(string.contains(static_slot, "isn't known at compile time"))
 
   let assert Error(unguarded) =
     compiler.compile(
-      "func f(): Str[] {\n\treturn [\"a\"]\n}\nproc main(): void {\n\tv := f()\n\techo v[0]\n}\n",
+      "func f(): Str[dyn] {\n\treturn [\"a\"]\n}\nproc main(): void {\n\tv := f()\n\techo v[0]\n}\n",
     )
   should.be_true(string.contains(unguarded, "cannot prove"))
 }
 
-pub fn an_unsized_return_is_accepted_in_a_function_type_test() {
-  // A function type's return is a return position like any other.
+pub fn an_unsized_return_is_rejected_inside_a_function_type_test() {
+  // A function type's return is a return position like any other, wherever the
+  // type itself appears — including in a parameter, where `[]` is fine for the
+  // parameter's own vectors but not for what the function it holds gives back.
+  let assert Error(msg) =
+    compiler.compile(
+      "func pieces(s: Str): Str[dyn] {\n\treturn split(s, \",\")\n}\nfunc count(f: func(Str): Str[], s: Str): Int {\n\treturn len(f(s))\n}\nproc main(): void {\n\techo count(pieces, \"a,b\")\n}\n",
+    )
+  should.be_true(string.contains(msg, "the return type in parameter `f` of `count`"))
+
+  // Spelled `[dyn]`, the same program is fine — and `[]` still serves the
+  // parameter that takes the vector.
   compiler.compile(
-    "func pieces(s: Str): Str[] {\n\treturn split(s, \",\")\n}\nfunc count(f: func(Str): Str[], s: Str): Int {\n\treturn len(f(s))\n}\nproc main(): void {\n\techo count(pieces, \"a,b\")\n}\n",
+    "func pieces(s: Str): Str[dyn] {\n\treturn split(s, \",\")\n}\nfunc count(f: func(Str): Str[dyn], s: Str): Int {\n\treturn len(f(s))\n}\nfunc total(v: Str[]): Int {\n\treturn len(v)\n}\nproc main(): void {\n\techo count(pieces, \"a,b\")\n\techo total([\"a\"])\n}\n",
   )
   |> should.be_ok
 }
@@ -4028,7 +4136,7 @@ pub fn a_generic_body_substitutes_the_types_it_writes_test() {
   // signature does. Leaving them alone would emit `var kept []T`.
   let go =
     compile(
-      "func repack(values: T[]): T[] {\n\tmut T[dyn] kept = []\n\tfor each value: T in values {\n\t\tappend(kept, value)\n\t}\n\treturn kept\n}\nproc main(): void {\n\tStr[dyn] a = [\"x\"]\n\tInt[dyn] b = [1]\n\techo len(repack(a)) + len(repack(b))\n}\n",
+      "func repack(values: T[]): T[dyn] {\n\tmut T[dyn] kept = []\n\tfor each value: T in values {\n\t\tappend(kept, value)\n\t}\n\treturn kept\n}\nproc main(): void {\n\tStr[dyn] a = [\"x\"]\n\tInt[dyn] b = [1]\n\techo len(repack(a)) + len(repack(b))\n}\n",
     )
   should.be_true(string.contains(go, "var kept []string = []string{}"))
   should.be_true(string.contains(go, "var kept []int = []int{}"))
@@ -4051,7 +4159,7 @@ pub fn a_variable_is_inferred_through_a_function_parameter_test() {
   // parameter — so the call pins them down exactly as a plain argument would.
   let go =
     compile(
-      "func filterMap(values: T[], transform: func(T): Result<K, E>): K[] {\n\tmut K[dyn] out = []\n\tfor each value in values {\n\t\tif transform(value) is Result.Ok(mapped) {\n\t\t\tappend(out, mapped)\n\t\t}\n\t}\n\treturn out\n}\nfunc parseIt(s: Str): Result<Int, Bool> {\n\treturn Result.Ok(1)\n}\nproc main(): void {\n\tStr[dyn] raw = [\"1\"]\n\tInt[dyn] ones = filterMap(raw, parseIt)\n\techo len(ones)\n}\n",
+      "func filterMap(values: T[], transform: func(T): Result<K, E>): K[dyn] {\n\tmut K[dyn] out = []\n\tfor each value in values {\n\t\tif transform(value) is Result.Ok(mapped) {\n\t\t\tappend(out, mapped)\n\t\t}\n\t}\n\treturn out\n}\nfunc parseIt(s: Str): Result<Int, Bool> {\n\treturn Result.Ok(1)\n}\nproc main(): void {\n\tStr[dyn] raw = [\"1\"]\n\tInt[dyn] ones = filterMap(raw, parseIt)\n\techo len(ones)\n}\n",
     )
   should.be_true(string.contains(
     go,
@@ -4185,6 +4293,505 @@ pub fn a_walk_needs_two_arguments_test() {
 pub fn a_walk_takes_no_named_arguments_test() {
   let msg = walk_error("\tInt[dyn] v = [1]\n\techo len(map(values: v, transform: show))\n")
   should.be_true(string.contains(msg, "does not accept named arguments"))
+}
+
+// --- an `async func` transform makes the walk concurrent ---
+
+const async_walkers = "func labelBody(n: Int): Str {\n\treturn \"#{n}\"\n}\nfunc isEvenBody(n: Int): Bool {\n\treturn n % 2 == 0\n}\nfunc asPortBody(s: Str): Result<Int, Bool> {\n\treturn Result.Ok(1)\n}\nasync func label(n: Int): Str {\n\treturn labelBody(n)\n}\nasync func isEven(n: Int): Bool {\n\treturn isEvenBody(n)\n}\nasync func asPort(s: Str): Result<Int, Bool> {\n\treturn asPortBody(s)\n}\n"
+
+fn async_walk(body: String) -> Result(String, String) {
+  compiler.compile(async_walkers <> "proc main(): void {\n" <> body <> "}\n")
+}
+
+pub fn a_walk_over_an_async_func_runs_every_element_at_once_test() {
+  // All of a walk's calls are known before the first one runs, so they all go
+  // at once and the walk awaits them before answering.
+  let assert Ok(m) = async_walk("\tInt[dyn] v = [1]\n\techo len(map(v, label))\n")
+  should.be_true(string.contains(m, "hive.MapAsync(v, label)"))
+
+  let assert Ok(f) = async_walk("\tInt[dyn] v = [1]\n\techo len(filter(v, isEven))\n")
+  should.be_true(string.contains(f, "hive.FilterAsync(v, isEven)"))
+
+  let assert Ok(fm) =
+    async_walk("\tStr[dyn] r = [\"1\"]\n\techo len(filterMap(r, asPort))\n")
+  should.be_true(string.contains(fm, "hive.FilterMapAsync(r, asPort)"))
+}
+
+pub fn a_plain_func_walk_stays_sequential_test() {
+  let assert Ok(go) =
+    async_walk("\tInt[dyn] v = [1]\n\techo len(map(v, labelBody))\n")
+  should.be_true(string.contains(go, "hive.Map(v, labelBody)"))
+  should.be_false(string.contains(go, "MapAsync"))
+}
+
+pub fn an_async_walk_has_the_same_type_as_a_sync_one_test() {
+  // `async` is about how long the walk takes, not what it answers with: same
+  // element type, so the result still lands in a declared `Str[dyn]`.
+  async_walk("\tInt[dyn] v = [1]\n\tStr[dyn] out = map(v, label)\n\techo len(out)\n")
+  |> should.be_ok
+}
+
+pub fn an_async_map_still_preserves_the_length_test() {
+  // Spawning does not change how many come back, so the bounds pass is unmoved.
+  async_walk("\tInt[3] v = [1, 2, 3]\n\tout := map(v, label)\n\techo out[2]\n")
+  |> should.be_ok
+  let assert Error(msg) =
+    async_walk("\tInt[3] v = [1, 2, 3]\n\tout := map(v, label)\n\techo out[3]\n")
+  should.be_true(string.contains(msg, "out of range for a vector of length 3"))
+}
+
+pub fn an_async_walk_never_yields_a_handle_test() {
+  // The walk awaits everything before it returns, so nothing escapes — the
+  // result is an ordinary vector that can be passed on.
+  async_walk(
+    "\tInt[dyn] v = [1]\n\techo join(map(v, label), \",\")\n\tfor each s in map(v, label) {\n\t\techo s\n\t}\n",
+  )
+  |> should.be_ok
+}
+
+pub fn sort_rejects_an_async_comparator_test() {
+  // A sort picks each comparison from how the last one answered, so there is
+  // never more than one call to make and nothing to overlap.
+  let assert Error(msg) =
+    compiler.compile(
+      "async func desc(a: Int, b: Int): Bool {\n\treturn a > b\n}\nproc main(): void {\n\tInt[dyn] v = [3, 1]\n\techo len(sort(v, desc))\n}\n",
+    )
+  should.be_true(string.contains(msg, "cannot order by an `async func`"))
+  should.be_true(string.contains(msg, "Order by a plain `func`"))
+}
+
+pub fn a_walk_rejects_a_partial_application_of_an_async_func_test() {
+  // Previously emitted Go that did not compile: the closure's construction was
+  // spawned, rather than the call it stands for.
+  let assert Error(msg) =
+    compiler.compile(
+      "async func addN(a: Int, b: Int): Int {\n\treturn a + b\n}\nproc main(): void {\n\tInt[dyn] v = [1]\n\techo len(map(v, addN(10, _)))\n}\n",
+    )
+  should.be_true(string.contains(msg, "partial application of one is not a value"))
+}
+
+// --- `map` preserves its input's length; `filter`/`filterMap` cannot ---
+
+pub fn map_preserves_a_static_length_test() {
+  // Same length, same order — so a `map` of a `Str[2]` is two elements, and the
+  // last one is indexable with no guard.
+  walk("\tInt[2] v = [1, 2]\n\tdoubled := map(v, double)\n\techo doubled[1]\n")
+  |> should.be_ok
+}
+
+pub fn map_preserves_a_length_past_its_end_test() {
+  let msg = walk_error("\tInt[2] v = [1, 2]\n\tdoubled := map(v, double)\n\techo doubled[2]\n")
+  should.be_true(string.contains(msg, "out of range for a vector of length 2"))
+}
+
+pub fn a_mapped_length_fills_a_declared_slot_test() {
+  // The length is a real one, so it satisfies a `Str[2]` promise — and fails a
+  // `Str[3]` one, rather than being waved through as unknown.
+  walk("\tInt[2] v = [1, 2]\n\tInt[2] out = map(v, double)\n\techo out[1]\n")
+  |> should.be_ok
+  let msg = walk_error("\tInt[2] v = [1, 2]\n\tInt[3] out = map(v, double)\n\techo out[0]\n")
+  should.be_true(string.contains(msg, "exactly 3 elements — this one has 2"))
+}
+
+pub fn mapped_lengths_chain_and_compose_test() {
+  // A map of a map is still that length, and two of them concatenated add up
+  // the way any two static vectors do.
+  walk(
+    "\tInt[2] v = [1, 2]\n\tboth := map(v, double) + map(map(v, double), double)\n\techo both[3]\n",
+  )
+  |> should.be_ok
+  let msg =
+    walk_error(
+      "\tInt[2] v = [1, 2]\n\tboth := map(v, double) + map(v, double)\n\techo both[4]\n",
+    )
+  should.be_true(string.contains(msg, "out of range for a vector of length 4"))
+}
+
+pub fn map_over_a_dynamic_vector_stays_dynamic_test() {
+  // Nothing is invented: a length that was not known going in is not known
+  // coming out.
+  let msg = walk_error("\tInt[dyn] v = [1, 2]\n\tdoubled := map(v, double)\n\techo doubled[0]\n")
+  should.be_true(string.contains(msg, "cannot prove index 0 is in range"))
+}
+
+pub fn filter_does_not_preserve_a_length_test() {
+  // `filter` and `filterMap` select, so what is knowable about them is a
+  // maximum, not a length — and a maximum can never put an index in range,
+  // since keeping nothing is always a possibility.
+  let kept = walk_error("\tInt[2] v = [1, 2]\n\tevens := filter(v, isEven)\n\techo evens[0]\n")
+  should.be_true(string.contains(kept, "cannot prove index 0 is in range"))
+  let mapped =
+    walk_error("\tStr[2] v = [\"1\", \"x\"]\n\tones := filterMap(v, parseIt)\n\techo ones[0]\n")
+  should.be_true(string.contains(mapped, "cannot prove index 0 is in range"))
+}
+
+pub fn a_declared_map_promises_no_length_test() {
+  // The length comes from the *builtin*. A `map` of your own is an ordinary
+  // callable, and its `T[]` return promises nothing.
+  let assert Error(msg) =
+    compiler.compile(
+      "func map(values: Int[], by: Int): Int[dyn] {\n\treturn values\n}\nproc main(): void {\n\tInt[2] v = [1, 2]\n\tc := map(v, 2)\n\techo c[1]\n}\n",
+    )
+  should.be_true(string.contains(msg, "cannot prove index 1 is in range"))
+}
+
+pub fn a_mapped_length_is_a_static_one_test() {
+  // Inferred means static, so `append` is refused exactly as it is for any
+  // other `:=` binding.
+  let msg =
+    walk_error("\tInt[2] v = [1, 2]\n\tmut c := map(v, double)\n\tappend(c, 3)\n\techo c[0]\n")
+  should.be_true(string.contains(msg, "requires a dynamic vector"))
+}
+
+// ---------------------------------------------------------------------------
+// `sort`
+// ---------------------------------------------------------------------------
+
+const sorters = "func desc(a: Int, b: Int): Bool {\n\treturn a > b\n}\nfunc byLen(a: Str, b: Str): Bool {\n\treturn len(a) < len(b)\n}\nfunc twice(n: Int): Int {\n\treturn n * 2\n}\n"
+
+fn srt(body: String) -> Result(String, String) {
+  compiler.compile(sorters <> "proc main(): void {\n" <> body <> "}\n")
+}
+
+fn srt_go(body: String) -> String {
+  let assert Ok(go) = srt(body)
+  go
+}
+
+fn srt_error(body: String) -> String {
+  let assert Error(msg) = srt(body)
+  msg
+}
+
+// --- the default ordering, chosen by the element's static type ---
+
+pub fn sort_orders_numbers_and_strings_test() {
+  // Everything Go compares with `<` goes through one generic helper.
+  let go = srt_go("\tInt[dyn] v = [3, 1]\n\techo len(sort(v))\n")
+  should.be_true(string.contains(go, "hive.SortBy(v, hive.LessOrdered[int])"))
+  let s = srt_go("\tStr[dyn] v = [\"b\", \"a\"]\n\techo len(sort(v))\n")
+  should.be_true(string.contains(s, "hive.SortBy(v, hive.LessOrdered[string])"))
+  let f = srt_go("\tFloat[dyn] v = [2.0, 1.0]\n\techo len(sort(v))\n")
+  should.be_true(string.contains(
+    f,
+    "hive.SortBy(v, hive.LessOrdered[float64])",
+  ))
+}
+
+pub fn sort_orders_bools_false_first_test() {
+  let go = srt_go("\tBool[dyn] v = [true, false]\n\techo len(sort(v))\n")
+  should.be_true(string.contains(go, "hive.SortBy(v, hive.LessBool)"))
+}
+
+pub fn sort_orders_atoms_by_value_test() {
+  // By the integer the compiler assigned, not by the name: an atom's name is a
+  // thing to log, not a thing to compute with. `hive.Atom` is a defined `int`,
+  // so the same ordered helper serves it.
+  let go = srt_go("\tAtom[dyn] v = [#Zebra, #Apple]\n\techo len(sort(v))\n")
+  should.be_true(string.contains(
+    go,
+    "hive.SortBy(v, hive.LessOrdered[hive.Atom])",
+  ))
+}
+
+pub fn sort_orders_vectors_lexicographically_test() {
+  let go =
+    srt_go("\tStr[dyn][dyn] v = [[\"b\"], [\"a\"]]\n\techo len(sort(v))\n")
+  should.be_true(string.contains(
+    go,
+    "hive.SortBy(v, func(a0, b0 []string) bool { return hive.LessVec(a0, b0, hive.LessOrdered[string]) })",
+  ))
+}
+
+pub fn sort_orders_a_table_a_row_at_a_time_test() {
+  let go = srt_go("\tTable t = [[\"b\"], [\"a\"]]\n\techo len(sort(t))\n")
+  should.be_true(string.contains(
+    go,
+    "hive.SortBy(t, func(a0, b0 []string) bool { return hive.LessVec(a0, b0, hive.LessOrdered[string]) })",
+  ))
+}
+
+pub fn sort_orders_results_error_first_test() {
+  let go =
+    srt_go(
+      "\tResult<Int, Bool>[dyn] v = [Result.Ok(1)]\n\techo len(sort(v))\n",
+    )
+  should.be_true(string.contains(
+    go,
+    "hive.LessResult(a0, b0, hive.LessOrdered[int], hive.LessBool)",
+  ))
+}
+
+// --- a generated `less_T` for user types ---
+
+pub fn sort_orders_a_struct_field_by_field_test() {
+  let assert Ok(go) =
+    compiler.compile(
+      "type User {\n\tage: Int\n\tname: Str\n}\nproc main(): void {\n\tUser[dyn] v = [User(1, \"a\")]\n\techo len(sort(v))\n}\n",
+    )
+  should.be_true(string.contains(go, "func less_User(a, b User) bool {"))
+  // Fields decide in declaration order: `age` first, `name` only on a tie.
+  should.be_true(string.contains(
+    go,
+    "if l0 := hive.LessOrdered[int]; l0(a.Age, b.Age) {",
+  ))
+  should.be_true(string.contains(
+    go,
+    "if l1 := hive.LessOrdered[string]; l1(a.Name, b.Name) {",
+  ))
+  should.be_true(string.contains(go, "hive.SortBy(v, less_User)"))
+}
+
+pub fn sort_orders_a_union_by_declaration_order_test() {
+  // The variant decides first, and it does so by the order the author declared
+  // them in — the one order they actually chose.
+  let assert Ok(go) =
+    compiler.compile(
+      "type Shape {\n\tCircle { r: Int }\n\tDot\n}\nproc main(): void {\n\tShape[dyn] v = [Shape.Dot()]\n\techo len(sort(v))\n}\n",
+    )
+  should.be_true(string.contains(go, "func rank_Shape(x Shape) int {"))
+  should.be_true(string.contains(go, "case ShapeCircle:\n\t\treturn 0\n"))
+  should.be_true(string.contains(go, "case ShapeDot:\n\t\treturn 1\n"))
+  should.be_true(string.contains(
+    go,
+    "if ra, rb := rank_Shape(a), rank_Shape(b); ra != rb {",
+  ))
+  // A field-less variant compares nothing, so the switch value goes unnamed
+  // there rather than being bound and left unused.
+  should.be_true(string.contains(go, "case ShapeDot:\n\t\treturn false\n"))
+}
+
+pub fn sort_orders_a_recursive_type_through_itself_test() {
+  // `less_Node` is what orders a Node's own Node-valued field.
+  let assert Ok(go) =
+    compiler.compile(
+      "type Node {\n\tlabel: Str\n\tkids: Node[dyn]\n}\nproc main(): void {\n\tNode[dyn] v = [Node(\"a\", [])]\n\techo len(sort(v))\n}\n",
+    )
+  should.be_true(string.contains(go, "func less_Node(a, b Node) bool {"))
+  should.be_true(string.contains(go, "hive.LessVec(a0, b0, less_Node)"))
+}
+
+// --- the comparator form ---
+
+pub fn sort_takes_a_comparator_test() {
+  let go = srt_go("\tInt[dyn] v = [3, 1]\n\techo len(sort(v, desc))\n")
+  should.be_true(string.contains(go, "hive.SortBy(v, desc)"))
+}
+
+pub fn sort_takes_a_partial_application_test() {
+  let assert Ok(go) =
+    compiler.compile(
+      "func nth(k: Int, a: Str, b: Str): Bool {\n\treturn len(a) + k < len(b)\n}\nproc main(): void {\n\tStr[dyn] v = [\"a\"]\n\techo len(sort(v, nth(0, _, _)))\n}\n",
+    )
+  should.be_true(string.contains(
+    go,
+    "hive.SortBy(v, func(_h1 string, _h2 string) bool { return nth(0, _h1, _h2) })",
+  ))
+}
+
+// --- length is preserved, in both forms ---
+
+pub fn sort_preserves_a_static_length_test() {
+  srt("\tInt[3] v = [3, 1, 2]\n\techo sort(v)[2]\n") |> should.be_ok
+  srt("\tInt[3] v = [3, 1, 2]\n\techo sort(v, desc)[2]\n") |> should.be_ok
+}
+
+pub fn sort_preserves_a_length_past_its_end_test() {
+  let msg = srt_error("\tInt[3] v = [3, 1, 2]\n\techo sort(v)[3]\n")
+  should.be_true(string.contains(msg, "out of range for a vector of length 3"))
+}
+
+pub fn a_sorted_length_composes_with_map_and_concat_test() {
+  srt(
+    "\tInt[2] v = [2, 1]\n\tboth := sort(v) + map(sort(v, desc), twice)\n\techo both[3]\n",
+  )
+  |> should.be_ok
+  let msg =
+    srt_error("\tInt[2] v = [2, 1]\n\tboth := sort(v) + sort(v)\n\techo both[4]\n")
+  should.be_true(string.contains(msg, "out of range for a vector of length 4"))
+}
+
+pub fn sort_over_a_dynamic_vector_stays_dynamic_test() {
+  let msg = srt_error("\tInt[dyn] v = [3, 1]\n\techo sort(v)[0]\n")
+  should.be_true(string.contains(msg, "cannot prove index 0 is in range"))
+}
+
+// --- what `sort` refuses ---
+
+pub fn sort_needs_a_vector_test() {
+  let msg = srt_error("\techo len(sort(\"abc\"))\n")
+  should.be_true(string.contains(msg, "orders a vector, and a `Str` is not one"))
+  let other = srt_error("\techo len(sort(3))\n")
+  should.be_true(string.contains(other, "orders a vector, and this is a `Int`"))
+}
+
+pub fn sort_needs_an_orderable_element_test() {
+  // The message names the part at fault, not just the outermost type: the
+  // one-argument form has to *build* an ordering, so it cannot shrug.
+  let assert Error(msg) =
+    compiler.compile(
+      "func d(n: Int): Int {\n\treturn n\n}\ntype Box {\n\trun: func(Int): Int\n}\nproc main(): void {\n\tBox[dyn] v = [Box(d)]\n\techo len(sort(v))\n}\n",
+    )
+  should.be_true(string.contains(msg, "`Box` has none"))
+  should.be_true(string.contains(
+    msg,
+    "its field `run` is a `func(Int): Int`, and a function value has no order",
+  ))
+  should.be_true(string.contains(msg, "sort(values, comesFirst)"))
+}
+
+pub fn sort_rejects_a_proc_comparator_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "proc noisy(a: Int, b: Int): Bool {\n\techo a\n\treturn a < b\n}\nproc main(): void {\n\tInt[dyn] v = [1]\n\techo len(sort(v, noisy))\n}\n",
+    )
+  should.be_true(string.contains(msg, "takes a `func` (pure), and this is a `proc`"))
+}
+
+pub fn sort_needs_one_or_two_arguments_test() {
+  let none = srt_error("\techo len(sort())\n")
+  should.be_true(string.contains(none, "0 arguments were passed"))
+  let three =
+    srt_error("\tInt[dyn] v = [1]\n\techo len(sort(v, desc, desc))\n")
+  should.be_true(string.contains(three, "3 arguments were passed"))
+}
+
+pub fn sort_comparator_takes_two_elements_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "func one(a: Int): Bool {\n\treturn a > 0\n}\nproc main(): void {\n\tInt[dyn] v = [1]\n\techo len(sort(v, one))\n}\n",
+    )
+  should.be_true(string.contains(msg, "compares two elements"))
+  should.be_true(string.contains(msg, "takes 1 parameter"))
+}
+
+pub fn sort_comparator_answers_a_bool_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "func bad(a: Int, b: Int): Int {\n\treturn a - b\n}\nproc main(): void {\n\tInt[dyn] v = [1]\n\techo len(sort(v, bad))\n}\n",
+    )
+  should.be_true(string.contains(msg, "answers `Bool` — this one answers `Int`"))
+}
+
+pub fn sort_comparator_takes_the_element_type_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "func strs(a: Str, b: Str): Bool {\n\treturn a < b\n}\nproc main(): void {\n\tInt[dyn] v = [1]\n\techo len(sort(v, strs))\n}\n",
+    )
+  should.be_true(string.contains(msg, "ordering a vector of `Int`"))
+}
+
+// --- the builtin, and a declaration of your own ---
+
+pub fn a_declared_sort_wins_test() {
+  // An ordinary callable: its `Int[]` return promises no length, and its second
+  // parameter is nothing special.
+  let assert Error(msg) =
+    compiler.compile(
+      "func sort(v: Int[], flag: Bool): Int[dyn] {\n\treturn v\n}\nproc main(): void {\n\tInt[3] v = [3, 1, 2]\n\tc := sort(v, true)\n\techo c[1]\n}\n",
+    )
+  should.be_true(string.contains(msg, "cannot prove index 1 is in range"))
+}
+
+pub fn hive_sort_reaches_the_builtin_test() {
+  let assert Ok(go) =
+    compiler.compile(
+      "func sort(v: Int[], flag: Bool): Int[dyn] {\n\treturn v\n}\nproc main(): void {\n\tInt[3] v = [3, 1, 2]\n\techo hive.sort(v)[2]\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.SortBy(v, hive.LessOrdered[int])"))
+}
+
+// --- discarded, on mut storage: sorted in place ---
+
+pub fn a_discarded_sort_on_a_mut_vector_sorts_in_place_test() {
+  // Both conditions met, so there is nothing for a copy to protect: no argument
+  // clone and no copy inside the helper.
+  let go = srt_go("\tmut Int[dyn] v = [3, 1]\n\tsort(v)\n\techo len(v)\n")
+  should.be_true(string.contains(
+    go,
+    "hive.SortInPlace(v, hive.LessOrdered[int])",
+  ))
+  should.be_false(string.contains(go, "hive.SortBy"))
+}
+
+pub fn a_discarded_sort_in_place_takes_a_comparator_test() {
+  let go = srt_go("\tmut Int[dyn] v = [3, 1]\n\tsort(v, desc)\n\techo len(v)\n")
+  should.be_true(string.contains(go, "hive.SortInPlace(v, desc)"))
+}
+
+pub fn a_discarded_sort_in_place_reaches_a_field_or_element_test() {
+  // Any mut storage the subject names, not just a bare variable: a slice header
+  // into the same backing array is what makes the reorder land where it should.
+  let assert Ok(field) =
+    compiler.compile(
+      "type Box {\n\titems: Int[dyn]\n}\nproc main(): void {\n\tmut Box b = Box([3, 1])\n\tsort(b.items)\n\techo len(b.items)\n}\n",
+    )
+  should.be_true(string.contains(field, "hive.SortInPlace(b.Items,"))
+}
+
+pub fn a_kept_sort_is_never_in_place_test() {
+  // The expression form has to keep answering with a new vector and leaving the
+  // subject alone, or every `b := sort(a)` would quietly reorder `a` too.
+  let go =
+    srt_go("\tmut Int[dyn] v = [3, 1]\n\tout := sort(v)\n\techo len(out) + len(v)\n")
+  should.be_true(string.contains(go, "hive.SortBy(hive.CloneVec(v),"))
+  should.be_false(string.contains(go, "hive.SortInPlace"))
+}
+
+pub fn a_discarded_sort_on_an_immutable_vector_is_rejected_test() {
+  // `mut` is what makes writing allowed at all: an immutable binding's storage
+  // is never mutated in place, which is what the copy-on-binding analysis rests
+  // on. So this cannot sort in place — and a discarded sort that does not sort
+  // in place is dead code wearing the shape of the form that does.
+  let msg = srt_error("\tInt[dyn] v = [3, 1]\n\tsort(v)\n\techo len(v)\n")
+  should.be_true(string.contains(msg, "throws away the vector it answers with"))
+  should.be_true(string.contains(msg, "`v` is not `mut`"))
+  should.be_true(string.contains(msg, "sorted := sort(...)"))
+}
+
+pub fn a_discarded_sort_of_an_unstored_vector_is_rejected_test() {
+  // Nothing to write to at all, so the message says that rather than pointing
+  // at a `mut` that would not help.
+  let msg = srt_error("\tStr[dyn] s = [\"b,a\"]\n\tsort(split(\"b,a\", \",\"))\n\techo len(s)\n")
+  should.be_true(string.contains(msg, "not stored anywhere"))
+}
+
+pub fn a_discarded_sort_is_fine_in_a_loop_clause_test() {
+  // The check runs wherever a statement does, including a `for` init/post.
+  let msg =
+    srt_error("\tInt[dyn] v = [3, 1]\n\tfor i := 0; i < 1; sort(v) {\n\t\techo i\n\t}\n")
+  should.be_true(string.contains(msg, "`v` is not `mut`"))
+  srt("\tmut Int[dyn] v = [3, 1]\n\tfor i := 0; i < 1; sort(v) {\n\t\techo i\n\t}\n")
+  |> should.be_ok
+}
+
+pub fn an_in_place_sort_counts_as_a_write_for_aliasing_test() {
+  // The one that would be a silent miscompile: `b := a` may only alias `a` when
+  // `a` is never mutated in place afterwards, and a discarded `sort(a)` now is
+  // exactly that. Without counting it, `b` would be reordered underneath.
+  let go =
+    srt_go("\tmut Int[dyn] a = [3, 1]\n\tb := a\n\tsort(a)\n\techo len(b)\n")
+  should.be_true(string.contains(go, "b := hive.CloneVec(a)"))
+  should.be_true(string.contains(go, "hive.SortInPlace(a,"))
+}
+
+pub fn two_mut_bindings_share_an_in_place_sort_test() {
+  // Shared mutable state is shared completely: `mut d = c` is one slice header
+  // for both names, so sorting through either is seen through both.
+  let go =
+    srt_go(
+      "\tmut Int[dyn] c = [3, 1]\n\tmut Int[dyn] d = c\n\tsort(c)\n\techo len(d)\n",
+    )
+  should.be_true(string.contains(go, "hive.SortInPlace(c,"))
+  // `d` is not given a variable of its own; it renders as `c`.
+  should.be_false(string.contains(go, "d :="))
+}
+
+pub fn sort_copies_a_mutable_vector_in_test() {
+  // The vector goes in as it would into any `T[]` parameter, so the caller can
+  // keep writing to theirs without the sorted one changing under it.
+  let go = srt_go("\tmut Int[dyn] v = [3, 1]\n\techo len(sort(v))\n")
+  should.be_true(string.contains(go, "hive.SortBy(hive.CloneVec(v),"))
 }
 
 // ---------------------------------------------------------------------------
@@ -4394,7 +5001,7 @@ pub fn a_walk_composes_with_a_generic_test() {
   // concrete, `filterMap` reads its result off that same substituted type.
   let go =
     compile(
-      "func onlyOk(values: T[], check: func(T): Result<K, E>): K[] {\n\treturn filterMap(values, check)\n}\nfunc parseIt(s: Str): Result<Int, Bool> {\n\treturn Result.Ok(1)\n}\nproc main(): void {\n\tStr[dyn] raw = [\"1\"]\n\tInt[dyn] ones = onlyOk(raw, parseIt)\n\techo len(ones)\n}\n",
+      "func onlyOk(values: T[], check: func(T): Result<K, E>): K[dyn] {\n\treturn filterMap(values, check)\n}\nfunc parseIt(s: Str): Result<Int, Bool> {\n\treturn Result.Ok(1)\n}\nproc main(): void {\n\tStr[dyn] raw = [\"1\"]\n\tInt[dyn] ones = onlyOk(raw, parseIt)\n\techo len(ones)\n}\n",
     )
   should.be_true(string.contains(
     go,

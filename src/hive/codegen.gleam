@@ -346,10 +346,18 @@ pub fn generate(module: ast.Module) -> String {
     gen_json_support(env, module, string.contains(fn_code, "hive.Syslink"))
 
   let clone_code = gen_clone_support(env, module)
+  let less_code = gen_less_support(env, module)
   let row_code = gen_sql_row_support(env, module)
 
   let body =
-    type_code <> "\n" <> atom_code <> clone_code <> row_code <> json_code <> fn_code
+    type_code
+    <> "\n"
+    <> atom_code
+    <> clone_code
+    <> less_code
+    <> row_code
+    <> json_code
+    <> fn_code
   gen_header(body) <> "\n" <> body
 }
 
@@ -406,6 +414,9 @@ fn walk_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
       )
     }
     ast.STypedDecl(typ, name, value, mutable) -> {
+      // `h := f(x)` keeps a handle; an annotation is the one thing a handle has
+      // no spelling for, so a typed declaration cannot hold one.
+      use _ <- result.try(no_handle(env, value))
       use _ <- result.try(walk_expr(env, value))
       Ok(
         Env(
@@ -420,16 +431,28 @@ fn walk_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
       )
     }
     ast.SAssign(target, value) -> {
+      // Reassignment is not a fresh binding: the name already has a type, and a
+      // handle has none to match.
+      use _ <- result.try(no_handles(env, [target, value]))
       use _ <- result.try(walk_expr(env, target))
       use _ <- result.try(walk_expr(env, value))
       Ok(env)
     }
     ast.SAssert(e) -> {
+      use _ <- result.try(no_handle(env, e))
       use _ <- result.try(walk_expr(env, e))
       use _ <- result.try(check_condition(env, e))
       Ok(env)
     }
-    ast.SReturn(Some(e)) | ast.SEcho(e) | ast.SPanic(e) | ast.SExpr(e) -> {
+    ast.SExpr(e) -> {
+      use _ <- result.try(walk_expr(env, e))
+      use _ <- result.try(check_discarded_sort(env, e))
+      Ok(env)
+    }
+    // A return would carry the task out of the scope that spawned it; `echo` and
+    // `panic` would render it as whatever Go prints a pointer as.
+    ast.SReturn(Some(e)) | ast.SEcho(e) | ast.SPanic(e) -> {
+      use _ <- result.try(no_handle(env, e))
       use _ <- result.try(walk_expr(env, e))
       Ok(env)
     }
@@ -458,6 +481,7 @@ fn walk_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
       })
       use _ <- result.try(case cond {
         Some(e) -> {
+          use _ <- result.try(no_handle(ienv, e))
           use _ <- result.try(walk_expr(ienv, e))
           check_condition(ienv, e)
         }
@@ -472,6 +496,9 @@ fn walk_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
       Ok(env)
     }
     ast.SForEach(name, elem_type, iterable, body) -> {
+      // Walking a vector of handles would bind each element as a handle, which
+      // is a name for a task with no way to read it.
+      use _ <- result.try(no_handle(env, iterable))
       use _ <- result.try(walk_expr(env, iterable))
       let elem_ty = case elem_type {
         Some(t) -> ty_of_type_expr(env.types, t)
@@ -517,6 +544,7 @@ fn walk_expr(env: Env, e: ast.Expr) -> Result(Nil, String) {
   use _ <- result.try(check_indexable(env, e))
   use _ <- result.try(check_address_call(env, e))
   use _ <- result.try(check_walk_call(env, e))
+  use _ <- result.try(check_sort_call(env, e))
   case e {
     ast.EInt(_)
     | ast.EFloat(_)
@@ -524,27 +552,100 @@ fn walk_expr(env: Env, e: ast.Expr) -> Result(Nil, String) {
     | ast.EBool(_)
     | ast.EAtom(_)
     | ast.EIdent(_) -> Ok(Nil)
-    ast.EMember(target, _) | ast.EIs(target, _) | ast.EWith(target, _) ->
+    ast.EMember(target, _) | ast.EIs(target, _) | ast.EWith(target, _) -> {
+      use _ <- result.try(no_handle(env, target))
       walk_expr(env, target)
-    ast.EIndex(target, index) -> walk_exprs(env, [target, index])
-    ast.ESlice(target, low, high) ->
-      walk_exprs(env, [target, ..option.values([low, high])])
-    ast.EBinary(_, l, r) -> walk_exprs(env, [l, r])
+    }
+    ast.EIndex(target, index) -> {
+      use _ <- result.try(no_handles(env, [target, index]))
+      walk_exprs(env, [target, index])
+    }
+    ast.ESlice(target, low, high) -> {
+      let parts = [target, ..option.values([low, high])]
+      use _ <- result.try(no_handles(env, parts))
+      walk_exprs(env, parts)
+    }
+    ast.EBinary(_, l, r) -> {
+      use _ <- result.try(no_handles(env, [l, r]))
+      walk_exprs(env, [l, r])
+    }
+    // A vector literal's elements may be handles — `await [f(a), f(b)]` is the
+    // whole point. The literal itself is then held to the same rule as any other
+    // value by whatever consumes it, which is where an unawaited one is caught.
     ast.EVector(items) -> walk_exprs(env, items)
     ast.EInterp(parts) ->
       list.try_fold(parts, Nil, fn(_, part) {
         case part {
           ast.ILit(_) -> Ok(Nil)
-          ast.IExpr(inner) -> walk_expr(env, inner)
+          ast.IExpr(inner) -> {
+            use _ <- result.try(no_handle(env, inner))
+            walk_expr(env, inner)
+          }
         }
       })
       |> result.map(fn(_) { Nil })
-    ast.ECall(callee, args) ->
-      walk_exprs(env, [callee, ..list.map(args, fn(a) { a.value })])
-    ast.EUsing(source, kind) ->
-      walk_exprs(env, [source, ..ast.using_exprs(kind)])
-    ast.EAwait(value, timeout) ->
+    ast.ECall(callee, args) -> {
+      let values = list.map(args, fn(a) { a.value })
+      use _ <- result.try(no_handles(env, values))
+      walk_exprs(env, [callee, ..values])
+    }
+    ast.EUsing(source, kind) -> {
+      let parts = [source, ..ast.using_exprs(kind)]
+      use _ <- result.try(no_handles(env, parts))
+      walk_exprs(env, parts)
+    }
+    // `await` is the one thing that reads a handle, so its operand is the one
+    // place a handle belongs. A `with timeout` bound is an ordinary Int.
+    ast.EAwait(value, timeout) -> {
+      use _ <- result.try(no_handles(env, option.values([timeout])))
       walk_exprs(env, [value, ..option.values([timeout])])
+    }
+  }
+}
+
+// A task handle may be **bound** and **awaited**, and nothing else: not
+// annotated, not passed, not returned, not indexed, not echoed. That is what
+// keeps a task from outliving the scope that spawned it, and it is what lets the
+// handle have no surface type at all.
+//
+// The rule holds for a *vector* of handles too. `await [f(a), f(b)]` makes one,
+// and until this it was the only safe thing to do with one: bound and indexed it
+// yielded a `*hive.Async` printed as a pointer, and passed to a `T[]` parameter
+// it produced a Go type error against a generated name the source never
+// mentions.
+fn no_handle(env: Env, e: ast.Expr) -> Result(Nil, String) {
+  case handle_kind(infer(env, e)) {
+    None -> Ok(Nil)
+    Some(what) ->
+      Error(
+        what
+        <> " cannot be used here. A task's value is reached with `await` and "
+        <> "nowhere else — `await h`, or `await [f(a), f(b)]` for several at "
+        <> "once, which resolves them in order. Keeping one in any other way "
+        <> "(passing it, returning it, storing it, indexing it) is what would "
+        <> "let the task outlive the scope that spawned it, so it has no type "
+        <> "to be written down as. Await it where its value is wanted.",
+      )
+  }
+}
+
+fn no_handles(env: Env, exprs: List(ast.Expr)) -> Result(Nil, String) {
+  list.try_fold(exprs, Nil, fn(_, e) { no_handle(env, e) })
+  |> result.map(fn(_) { Nil })
+}
+
+// How a type carries a running task, for the error text. Nesting deeper than one
+// vector has no spelling and no `await` that reads it, so it reports as the
+// vector case rather than going unnoticed.
+fn handle_kind(t: Ty) -> Option(String) {
+  case t {
+    TyAsync(_) -> Some("a task handle")
+    TyVec(inner) ->
+      case handle_kind(inner) {
+        Some(_) -> Some("a vector of task handles")
+        None -> None
+      }
+    _ -> None
   }
 }
 
@@ -612,6 +713,7 @@ fn check_walk_call(env: Env, e: ast.Expr) -> Result(Nil, String) {
     None -> Ok(Nil)
     Some(#(name, [ast.Arg(_, subject), ast.Arg(_, f)])) -> {
       use elem <- result.try(walk_elem_ty(env, name, subject))
+      use _ <- result.try(check_async_partial(env, f))
       check_walk_fn(env, name, elem, f)
     }
     Some(#(name, args)) ->
@@ -736,6 +838,45 @@ fn check_walk_fn(
   }
 }
 
+// Whether an expression names an `async func` by its bare name, which is the
+// one shape a walk can make concurrent. A *partial application* of one cannot
+// be: `TyFunc` carries no asyncness, so the closure it builds would be spawned
+// where the call should be (see `check_async_partial`).
+fn names_async_func(env: Env, f: ast.Expr) -> Bool {
+  case f {
+    ast.EIdent(name) -> list.contains(env.asyncs, name)
+    _ -> False
+  }
+}
+
+// A partial application of an `async func` has no honest lowering: a bare call
+// to one spawns, so `addN(10, _)` spawns the making of the closure rather than
+// the call it stands for, and the Go that comes out does not compile. Saying so
+// here beats two errors against `hive.Map[T, K]` and a generated hole name.
+fn check_async_partial(env: Env, f: ast.Expr) -> Result(Nil, String) {
+  case f {
+    ast.ECall(ast.EIdent(name), args) ->
+      case
+        list.contains(env.asyncs, name)
+        && list.any(args, fn(a) { a.value == ast.EIdent("_") })
+      {
+        False -> Ok(Nil)
+        True ->
+          Error(
+            "`"
+            <> name
+            <> "` is an `async func`, and a partial application of one is not a "
+            <> "value this can hold: a bare call to an async func spawns, so "
+            <> "there is nothing left to stand for the call itself. Pass the "
+            <> "async func by name — the walk then runs every element at once "
+            <> "and awaits them all — or wrap it in a plain `func` that fixes "
+            <> "the other arguments.",
+          )
+      }
+    _ -> Ok(Nil)
+  }
+}
+
 fn check_walk_param(name: String, elem: Ty, param: Ty) -> Result(Nil, String) {
   case ty_accepts(param, elem) {
     True -> Ok(Nil)
@@ -779,6 +920,332 @@ fn check_walk_ret(name: String, ret: Ty) -> Result(Nil, String) {
         <> "A walk that only performs effects is a `for each` loop.",
       )
     _, _ -> Ok(Nil)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// `sort`
+// ---------------------------------------------------------------------------
+
+// `sort(values)` orders a vector by its element type's own ordering, and
+// `sort(values, comesFirst)` by one the program supplies. Both are checked here
+// for the reason the walks are: the call lowers to a Go generic helper the
+// source never mentions, so a mismatch left to Go would report against
+// `hive.SortBy[T]` and name neither the builtin nor the argument that was wrong.
+fn check_sort_call(env: Env, e: ast.Expr) -> Result(Nil, String) {
+  case sort_called(e) {
+    None -> Ok(Nil)
+    Some([ast.Arg(_, subject)]) -> {
+      use elem <- result.try(sort_subject_ty(env, subject))
+      check_default_order(env, elem)
+    }
+    Some([ast.Arg(_, subject), ast.Arg(_, first)]) -> {
+      use elem <- result.try(sort_subject_ty(env, subject))
+      check_sort_fn(env, elem, first)
+    }
+    Some(args) ->
+      Error(
+        "`sort` takes a vector, and optionally a function that orders two of "
+        <> "its elements — "
+        <> int.to_string(list.length(args))
+        <> " "
+        <> plural(list.length(args), "argument")
+        <> case list.length(args) {
+          1 -> " was"
+          _ -> " were"
+        }
+        <> " passed. Write `sort(values)` or `sort(values, comesFirst)`.",
+      )
+  }
+}
+
+// The arguments of a `sort` call, when that is what the expression is.
+fn sort_called(e: ast.Expr) -> Option(List(ast.Arg)) {
+  case e {
+    ast.ECall(callee, args) ->
+      case builtins.is_call(callee, "sort") {
+        True -> Some(args)
+        False -> None
+      }
+    _ -> None
+  }
+}
+
+// The element type being put in order. A subject that is not a vector at all is
+// the mistake, not the ordering.
+fn sort_subject_ty(env: Env, subject: ast.Expr) -> Result(Ty, String) {
+  case infer(env, subject) {
+    TyVec(elem) -> Ok(elem)
+    // A Table is a vector of rows, so it sorts a row at a time.
+    TyTable -> Ok(TyVec(TyStr))
+    TyUnknown -> Ok(TyUnknown)
+    TyStr ->
+      Error(
+        "`sort` orders a vector, and a `Str` is not one — it is a sequence of "
+        <> "characters, which `[...]` and `len` treat as a unit. Use "
+        <> "`split(s, sep)` to get a vector of its pieces first.",
+      )
+    other ->
+      Error(
+        "`sort` orders a vector, and this is a `"
+        <> show_ty(other)
+        <> "`. Give it the vector whose elements should be put in order.",
+      )
+  }
+}
+
+// The one-argument form has to *build* an ordering, so unlike a walk it cannot
+// shrug at a type it could not read. An element type with no order — or none
+// that can be seen from here — is a compile error naming the part at fault,
+// because the alternative is emitting a comparison that quietly says "never
+// first" and returns the vector untouched.
+fn check_default_order(env: Env, elem: Ty) -> Result(Nil, String) {
+  case orderable(env, elem) {
+    True -> Ok(Nil)
+    False ->
+      Error(
+        "`sort(values)` puts elements in their own type's order, and `"
+        <> show_ty(elem)
+        <> "` has none: "
+        <> no_order_reason(env, elem, [])
+        <> ". Say which of two comes first yourself — "
+        <> "`sort(values, comesFirst)` — and any type can be ordered.",
+      )
+  }
+}
+
+// Names the part that has no order, so the message points at the field or the
+// element rather than only at the outermost type. `seen` stops a pair of types
+// that reach each other from being described forever.
+fn no_order_reason(env: Env, ty: Ty, seen: List(String)) -> String {
+  case ty {
+    TyUnknown -> "the element type is not known here"
+    TyFunc(_, _, _) -> "a function value has no order"
+    TyAsync(_) -> "a task handle has no order"
+    TyAddress(_) -> "a service address has no order"
+    TyBuiltin(name) ->
+      "`hive."
+      <> name
+      <> "` is a runtime struct, whose fields are not the language's to order"
+    TyVec(elem) ->
+      "it holds `"
+      <> show_ty(elem)
+      <> "`, and "
+      <> no_order_reason(env, elem, seen)
+    TyResult(ok, err) ->
+      case orderable(env, ok) {
+        False ->
+          "its `Ok` carries `"
+          <> show_ty(ok)
+          <> "`, and "
+          <> no_order_reason(env, ok, seen)
+        True ->
+          "its `Error` carries `"
+          <> show_ty(err)
+          <> "`, and "
+          <> no_order_reason(env, err, seen)
+      }
+    TyCustom(name) ->
+      case list.contains(seen, name) {
+        True -> "there is no ordering for it"
+        False -> unordered_field(env, name, [name, ..seen])
+      }
+    _ -> "there is no ordering for it"
+  }
+}
+
+fn unordered_field(env: Env, name: String, seen: List(String)) -> String {
+  case dict.get(env.types, name) {
+    Ok(ast.TypeDecl(_, variants, commons)) -> {
+      let fields =
+        variants |> list.flat_map(fn(v) { v.fields }) |> list.append(commons)
+      let culprit =
+        list.find(fields, fn(f) {
+          !is_orderable(env, ty_of_type_expr(env.types, f.typ), [name])
+        })
+      case culprit {
+        Ok(f) -> {
+          let fty = ty_of_type_expr(env.types, f.typ)
+          "its field `"
+          <> f.name
+          <> "` is a `"
+          <> show_ty(fty)
+          <> "`, and "
+          <> no_order_reason(env, fty, seen)
+        }
+        Error(_) -> "there is no ordering for it"
+      }
+    }
+    _ -> "it is not a type this program declares"
+  }
+}
+
+// The comparator of the two-argument form: a pure `func` over two elements
+// answering which of them comes first.
+fn check_sort_fn(env: Env, elem: Ty, f: ast.Expr) -> Result(Nil, String) {
+  // A walk can go concurrent because every call it will make is known before the
+  // first one runs. A sort's are not: which pair it compares next depends on how
+  // the last comparison answered, so there is never more than one call to make
+  // at a time. An async comparator would be spawned and immediately waited for,
+  // once per comparison — strictly slower than a plain `func`, and with the
+  // goroutine churn on top.
+  use _ <- result.try(case names_async_func(env, f) {
+    False -> Ok(Nil)
+    True ->
+      Error(
+        "`sort` cannot order by an `async func`. A walk runs every element at "
+        <> "once because it knows all of its calls up front; a sort picks each "
+        <> "comparison from how the previous one answered, so there is only "
+        <> "ever one to make and nothing to overlap — every call would be "
+        <> "spawned and waited for on the spot. Order by a plain `func`.",
+      )
+  })
+  use _ <- result.try(check_async_partial(env, f))
+  case infer(env, f) {
+    TyFunc(pure, params, ret) -> {
+      // A sort says nothing about how many comparisons it makes or in what
+      // order, so — exactly as for a walk — there is nowhere to hang an effect.
+      use _ <- result.try(case pure {
+        True -> Ok(Nil)
+        False ->
+          Error(
+            "`sort` takes a `func` (pure), and this is a `proc`: a sort says "
+            <> "nothing about how many comparisons it makes, or in what order, "
+            <> "so there is nowhere to hang a side effect.",
+          )
+      })
+      use _ <- result.try(case params {
+        [left, right] ->
+          case ty_accepts(left, elem) && ty_accepts(right, elem) {
+            True -> Ok(Nil)
+            False ->
+              Error(
+                "`sort` is ordering a vector of `"
+                <> show_ty(elem)
+                <> "`, so its function takes two of them — this one takes a `"
+                <> show_ty(left)
+                <> "` and a `"
+                <> show_ty(right)
+                <> "`.",
+              )
+          }
+        _ ->
+          Error(
+            "the function `sort` is given compares two elements, and this one "
+            <> "takes "
+            <> int.to_string(list.length(params))
+            <> " "
+            <> plural(list.length(params), "parameter")
+            <> ". Fix the extra ones in place with a partial application — "
+            <> "`f(fixed, _, _)` leaves the two elements as the ones still open.",
+          )
+      })
+      case ret {
+        TyBool | TyUnknown -> Ok(Nil)
+        other ->
+          Error(
+            "`sort` asks its function which of two elements comes first, so "
+            <> "that function answers `Bool` — this one answers `"
+            <> show_ty(other)
+            <> "`.",
+          )
+      }
+    }
+    // A function value the checker cannot see the shape of; Go still has the
+    // real type and will not let a non-function through.
+    TyUnknown -> Ok(Nil)
+    other ->
+      Error(
+        "`sort` orders a vector with a function, and this is a `"
+        <> show_ty(other)
+        <> "`. Pass a `func` by name, or a partial application of one "
+        <> "(`f(fixed, _, _)`).",
+      )
+  }
+}
+
+// A `sort` whose value is thrown away only means something when it sorts in
+// place, and it does that on `mut` storage alone. Anywhere else the statement
+// sorts a copy that is discarded the instant it is made — dead code wearing the
+// exact shape of the in-place form, which is the last thing that should compile
+// quietly.
+fn check_discarded_sort(env: Env, e: ast.Expr) -> Result(Nil, String) {
+  case sort_called(e) {
+    Some([ast.Arg(_, subject)]) | Some([ast.Arg(_, subject), _]) ->
+      case sorts_in_place(env, subject) {
+        True -> Ok(Nil)
+        False -> Error(discarded_sort_error(subject))
+      }
+    // A wrong arity has its own say in `check_sort_call`.
+    Some(_) | None -> Ok(Nil)
+  }
+}
+
+fn discarded_sort_error(subject: ast.Expr) -> String {
+  let opening =
+    "this `sort` throws away the vector it answers with, and that only means "
+    <> "something when it sorts in place — which it does on `mut` storage. "
+  case aliases_storage(subject), expr_root(subject) {
+    True, Some(root) ->
+      opening
+      <> "`"
+      <> root
+      <> "` is not `mut`, so there is nothing here to write to: the sorted "
+      <> "vector would be dropped the moment it was made. Declare `"
+      <> root
+      <> "` as `mut` to sort it where it lies, or keep the answer — "
+      <> "`sorted := sort(...)` leaves the original alone."
+    _, _ ->
+      opening
+      <> "This one is handed a vector that is not stored anywhere, so there is "
+      <> "nothing for it to sort in place. Keep the answer instead: "
+      <> "`sorted := sort(...)`."
+  }
+}
+
+// Whether a `sort` on this subject would sort in place: it has to name storage,
+// and that storage has to be one the program may write through. The lowering and
+// the discarded-statement check share this so the two can never drift apart.
+fn sorts_in_place(env: Env, subject: ast.Expr) -> Bool {
+  aliases_storage(subject) && source_mutable(env, subject)
+}
+
+// Whether `sort` has a default ordering for `ty`. Every native type has one; a
+// vector or a `Result` has one when what it holds does; a struct or union has
+// one when every field does. Nothing else does — a function value, a task
+// handle, a service address and a runtime struct are all things there is no
+// honest order for, and the two-argument form is how you order them anyway.
+fn orderable(env: Env, ty: Ty) -> Bool {
+  is_orderable(env, ty, [])
+}
+
+fn is_orderable(env: Env, ty: Ty, seen: List(String)) -> Bool {
+  case ty {
+    TyStr | TyInt | TyFloat | TyBool | TyAtom | TyTable -> True
+    TyVec(elem) -> is_orderable(env, elem, seen)
+    TyResult(ok, err) ->
+      is_orderable(env, ok, seen) && is_orderable(env, err, seen)
+    TyCustom(name) ->
+      case list.contains(seen, name) {
+        // A field reaching back to a type already being examined is ordered by
+        // the very `less_T` being defined for it, which will exist.
+        True -> True
+        False ->
+          case dict.get(env.types, name) {
+            Ok(ast.TypeDecl(_, variants, commons)) ->
+              variants
+              |> list.flat_map(fn(v) { v.fields })
+              |> list.append(commons)
+              |> list.all(fn(f) {
+                is_orderable(env, ty_of_type_expr(env.types, f.typ), [
+                  name,
+                  ..seen
+                ])
+              })
+            _ -> False
+          }
+      }
+    _ -> False
   }
 }
 
@@ -2559,6 +3026,13 @@ fn gen_stmt(
       }
       #(pad <> target <> " = " <> gen_append(env, args) <> "\n", env)
     }
+    // `sort(v)` / `sort(v, first)` as a statement throws the sorted vector away,
+    // so on mut storage it sorts that storage instead of a copy of it.
+    ast.SExpr(ast.ECall(ast.EMember(ast.EIdent("hive"), "sort"), args) as call) ->
+      case gen_sort_in_place(env, args) {
+        Some(code) -> #(pad <> code <> "\n", env)
+        None -> #(pad <> gen_expr(env, call) <> "\n", env)
+      }
     // An address called as a bare statement wants no answer, so it lowers to the
     // cast: nothing is registered for a reply and nothing can be awaited. The
     // same call keeping its value is a request instead — the call site decides,
@@ -2738,6 +3212,12 @@ fn gen_for_clause(env: Env, stmt: ast.Stmt) -> #(String, Env) {
       }
       #(target <> " = " <> gen_append(env, args), env)
     }
+    // As above: discarded, on mut storage, so it sorts that storage.
+    ast.SExpr(ast.ECall(ast.EMember(ast.EIdent("hive"), "sort"), args) as call) ->
+      case gen_sort_in_place(env, args) {
+        Some(code) -> #(code, env)
+        None -> #(gen_expr(env, call), env)
+      }
     ast.SExpr(e) -> #(gen_expr(env, e), env)
     // Other statement shapes aren't valid init/post clauses; emit nothing.
     _ -> #("", env)
@@ -3451,6 +3931,13 @@ fn infer_global_builtin(env: Env, name: String, args: List(ast.Arg)) -> Ty {
         [] -> TyUnknown
       }
     "map" | "filter" | "filterMap" -> walk_builtin_ty(env, name, args)
+    // `sort` reorders a vector; it never changes what the vector holds, so a
+    // Table stays a Table and every other vector keeps its element type.
+    "sort" ->
+      case args {
+        [ast.Arg(_, subject), ..] -> infer(env, subject)
+        [] -> TyUnknown
+      }
     // `print` and `println` are void statements.
     _ -> TyVoid
   }
@@ -3656,9 +4143,9 @@ fn infer_ident_call(env: Env, name: String, args: List(ast.Arg)) -> Ty {
 // `map`, `filter` and `filterMap` each walk a vector with a function value and
 // hand back a new vector. In the notation the builtin table uses:
 //
-//     map(T[], func(T): K): K[]
-//     filter(T[], func(T): Bool): T[]
-//     filterMap(T[], func(T): Result<K, E>): K[]
+//     map(T[], func(T): K): K[dyn]
+//     filter(T[], func(T): Bool): T[dyn]
+//     filterMap(T[], func(T): Result<K, E>): K[dyn]
 //
 // There is no monomorphization to any of them: they lower to one Go generic
 // helper each, and Go infers the type arguments from the call. What comes back
@@ -4545,6 +5032,19 @@ fn var_mutated_in_stmt(s: ast.Stmt, name: String) -> Bool {
       ast.EMember(ast.EIdent("hive"), "append"),
       [ast.Arg(_, target), ..],
     )) -> expr_root(target) == Some(name)
+    // A discarded `sort` on mut storage reorders that storage (see
+    // `gen_sort_in_place`), so it is a write like any other — and has to be
+    // counted here, or an immutable binding could be aliased to a vector this
+    // statement is about to rearrange underneath it.
+    //
+    // Whether the in-place form is actually chosen also depends on the subject
+    // being `mut`, which this analysis is one of the inputs to; counting the
+    // statement whenever it *names* `name` is the conservative side of that
+    // circle, and costs at most a copy that was not needed.
+    ast.SExpr(ast.ECall(
+      ast.EMember(ast.EIdent("hive"), "sort"),
+      [ast.Arg(_, target), ..],
+    )) -> aliases_storage(target) && expr_root(target) == Some(name)
     ast.SExpr(_) -> False
     ast.SIf(branches, else_body) ->
       list.any(branches, fn(b) { var_mutated_in_stmts(b.body, name) })
@@ -5907,6 +6407,8 @@ fn gen_global_builtin(env: Env, name: String, args: List(ast.Arg)) -> String {
     // `append(v, x...)` grows a vector (see gen_append); as a statement the
     // caller reassigns the result back to `v`.
     "append" -> gen_append(env, args)
+    // `sort(v)` / `sort(v, comesFirst)` reorder a vector.
+    "sort" -> gen_sort(env, args)
     // `map`/`filter`/`filterMap` walk a vector with a function value.
     _ -> gen_walk_builtin(env, name, args)
   }
@@ -5939,10 +6441,22 @@ fn gen_declared_call(env: Env, name: String, args: List(ast.Arg)) -> String {
 // holds belong to the value that comes back, not to something the caller may
 // still be writing to.
 fn gen_walk_builtin(env: Env, name: String, args: List(ast.Arg)) -> String {
-  let helper = case name {
-    "map" -> "hive.Map"
-    "filter" -> "hive.Filter"
-    _ -> "hive.FilterMap"
+  // An `async func` transform makes the walk concurrent: every element's call is
+  // known before the first one runs, so they all go at once and the walk awaits
+  // them before it answers. The vector that comes back is the same either way —
+  // same elements, same order, same type — so `async` is purely about how long
+  // the walk takes, and there is nothing for the call site to decide.
+  let concurrent = case args {
+    [_, ast.Arg(_, f)] -> names_async_func(env, f)
+    _ -> False
+  }
+  let helper = case name, concurrent {
+    "map", False -> "hive.Map"
+    "map", True -> "hive.MapAsync"
+    "filter", False -> "hive.Filter"
+    "filter", True -> "hive.FilterAsync"
+    _, False -> "hive.FilterMap"
+    _, True -> "hive.FilterMapAsync"
   }
   case args {
     [ast.Arg(_, subject), ast.Arg(_, f)] ->
@@ -5956,6 +6470,290 @@ fn gen_walk_builtin(env: Env, name: String, args: List(ast.Arg)) -> String {
     // renderer total.
     _ -> helper <> "(" <> gen_args(env, args) <> ")"
   }
+}
+
+// `sort(v)` -> `hive.SortBy(v, <the default ordering of v's elements>)` and
+// `sort(v, first)` -> `hive.SortBy(v, first)`.
+//
+// The one-argument form is where an ordering is *built*, and it is built the way
+// a deep copy is (see `gen_clone`): chosen by the element's static type and
+// emitted inline, so there is no runtime reflection, no boxing and no dispatch.
+// The vector goes in as it would into any `T[]` parameter — copied when it is
+// storage a `mut` binding can still change — and `hive.SortBy` copies again
+// before reordering, since sorting in place would be visible through every other
+// name for the same storage.
+fn gen_sort(env: Env, args: List(ast.Arg)) -> String {
+  case args {
+    [ast.Arg(_, subject)] -> {
+      let subject_ty = infer(env, subject)
+      "hive.SortBy("
+      <> gen_arg(env, subject, subject_ty)
+      <> ", "
+      <> gen_less(env, sort_elem_of(subject_ty), 0)
+      <> ")"
+    }
+    [ast.Arg(_, subject), ast.Arg(_, first)] ->
+      "hive.SortBy("
+      <> gen_arg(env, subject, infer(env, subject))
+      <> ", "
+      <> gen_expr(env, first)
+      <> ")"
+    // The arity check has already rejected anything else; this only keeps the
+    // renderer total.
+    _ -> "hive.SortBy(" <> gen_args(env, args) <> ")"
+  }
+}
+
+// A `sort` written as a STATEMENT on mut storage sorts that storage in place:
+// `hive.SortInPlace(v, ...)`, with neither the argument copy nor `SortBy`'s own.
+// `None` when either condition is missing, and the call then lowers as the
+// ordinary expression it is.
+//
+// Both conditions carry weight. **Discarded** is what makes reordering the
+// original the only sensible reading — an expression `sort(v)` answers with a
+// new vector and leaves `v` alone, and that has to keep being true or every
+// `b := sort(a)` would quietly reorder `a` too. **`mut`** is what makes writing
+// allowed at all: that storage an immutable binding observes is never mutated in
+// place is the invariant the whole copy-on-binding analysis rests on (see
+// `var_mutated_in_stmt`, which counts this statement as the write it is).
+fn gen_sort_in_place(env: Env, args: List(ast.Arg)) -> Option(String) {
+  case args {
+    [ast.Arg(_, subject)] | [ast.Arg(_, subject), _] ->
+      case sorts_in_place(env, subject) {
+        True -> {
+          let less = case args {
+            [_, ast.Arg(_, first)] -> gen_expr(env, first)
+            _ -> gen_less(env, sort_elem_of(infer(env, subject)), 0)
+          }
+          Some(
+            "hive.SortInPlace(" <> gen_expr(env, subject) <> ", " <> less <> ")",
+          )
+        }
+        False -> None
+      }
+    _ -> None
+  }
+}
+
+// The element type of what is being sorted, total where `sort_subject_ty` is
+// fallible: the checker has already reported anything that is not a vector.
+fn sort_elem_of(ty: Ty) -> Ty {
+  case ty {
+    TyVec(elem) -> elem
+    TyTable -> TyVec(TyStr)
+    _ -> TyUnknown
+  }
+}
+
+// A Go expression of type `func(T, T) bool` giving `ty`'s default ordering.
+// `depth` keeps the parameter names of nested closures distinct, as `gen_clone`
+// does. Only types `orderable` accepts reach here.
+fn gen_less(env: Env, ty: Ty, depth: Int) -> String {
+  case ty {
+    // Everything Go can compare with `<` directly. An atom orders by its
+    // compiled value: `hive.Atom` is a defined `int`, so it belongs here rather
+    // than getting an ordering of its own — the name is for logging, not for
+    // computing with.
+    TyInt | TyFloat | TyStr | TyAtom ->
+      "hive.LessOrdered[" <> ty_to_go(ty) <> "]"
+    TyBool -> "hive.LessBool"
+    TyVec(elem) -> gen_less_vec(env, ty_to_go(ty), elem, depth)
+    TyTable -> gen_less_vec(env, ty_to_go(ty), TyVec(TyStr), depth)
+    TyResult(ok, err) -> {
+      let #(a, b) = less_params(depth)
+      "func("
+      <> a
+      <> ", "
+      <> b
+      <> " "
+      <> ty_to_go(ty)
+      <> ") bool { return hive.LessResult("
+      <> a
+      <> ", "
+      <> b
+      <> ", "
+      <> gen_less(env, ok, depth + 1)
+      <> ", "
+      <> gen_less(env, err, depth + 1)
+      <> ") }"
+    }
+    TyCustom(name) -> "less_" <> name
+    // `check_default_order` has already rejected every type with no ordering;
+    // this only keeps the renderer total.
+    _ -> "func(_, _ " <> ty_to_go(ty) <> ") bool { return false }"
+  }
+}
+
+fn gen_less_vec(env: Env, go_ty: String, elem: Ty, depth: Int) -> String {
+  let #(a, b) = less_params(depth)
+  "func("
+  <> a
+  <> ", "
+  <> b
+  <> " "
+  <> go_ty
+  <> ") bool { return hive.LessVec("
+  <> a
+  <> ", "
+  <> b
+  <> ", "
+  <> gen_less(env, elem, depth + 1)
+  <> ") }"
+}
+
+fn less_params(depth: Int) -> #(String, String) {
+  let d = int.to_string(depth)
+  #("a" <> d, "b" <> d)
+}
+
+// A `less_T` default-ordering function for every user type that has one.
+//
+// A union orders by **variant first**, in the order the variants were declared —
+// that is the one order the author actually chose, and unlike the variant's name
+// it does not change meaning when a variant is renamed. Within a variant, and for
+// a plain struct, fields order left to right: the variant's own first, then the
+// type's common ones, which is the order a constructor takes them in.
+//
+// Emitting an unused one is harmless (Go permits unused package-level funcs),
+// which is what lets this mirror `gen_clone_support` and stay independent of
+// which types a program happens to sort.
+fn gen_less_support(env: Env, module: ast.Module) -> String {
+  module.decls
+  |> list.filter_map(fn(d) {
+    case d {
+      ast.TypeDecl(name, variants, commons) ->
+        case orderable(env, TyCustom(name)) {
+          True -> Ok(gen_less_fn(env, name, variants, commons))
+          False -> Error(Nil)
+        }
+      _ -> Error(Nil)
+    }
+  })
+  |> string.join("\n")
+}
+
+fn gen_less_fn(
+  env: Env,
+  name: String,
+  variants: List(ast.Variant),
+  commons: List(ast.Field),
+) -> String {
+  case variants {
+    // A plain struct: compare its fields in order, and report neither-first when
+    // they all tie.
+    [] ->
+      "func less_"
+      <> name
+      <> "(a, b "
+      <> name
+      <> ") bool {\n"
+      <> gen_less_fields(env, commons, "a", "b", 1)
+      <> "\treturn false\n}\n"
+    _ -> {
+      // Two different variants are settled by declaration order alone; two of
+      // the same are settled by that variant's fields.
+      let ranked =
+        variants
+        |> list.index_map(fn(v, i) {
+          "\tcase " <> name <> v.name <> ":\n\t\treturn " <> int.to_string(i) <> "\n"
+        })
+        |> string.concat
+      let bodies =
+        variants
+        |> list.map(fn(v) {
+          let fields = list.append(v.fields, commons)
+          let head = "\tcase " <> name <> v.name <> ":\n"
+          case fields {
+            // Nothing to compare, so nothing to name: two of a field-less
+            // variant are equal, and binding the switch value here would leave
+            // it unused.
+            [] -> head <> "\t\treturn false\n"
+            _ ->
+              head
+              <> "\t\tw := b.("
+              <> name
+              <> v.name
+              <> ")\n"
+              <> gen_less_fields(env, fields, "v", "w", 2)
+              <> "\t\treturn false\n"
+          }
+        })
+        |> string.concat
+      // The switch value is only bound when some variant has a field to read it
+      // for; Go rejects one that no clause uses.
+      let subject = case
+        list.any(variants, fn(v) { list.append(v.fields, commons) != [] })
+      {
+        True -> "\tswitch v := a.(type) {\n"
+        False -> "\tswitch a.(type) {\n"
+      }
+      "func rank_"
+      <> name
+      <> "(x "
+      <> name
+      <> ") int {\n\tswitch x.(type) {\n"
+      <> ranked
+      <> "\t}\n\treturn -1\n}\n\nfunc less_"
+      <> name
+      <> "(a, b "
+      <> name
+      <> ") bool {\n\tif ra, rb := rank_"
+      <> name
+      <> "(a), rank_"
+      <> name
+      <> "(b); ra != rb {\n\t\treturn ra < rb\n\t}\n"
+      <> subject
+      <> bodies
+      <> "\t}\n\treturn false\n}\n"
+    }
+  }
+}
+
+// One `if`/`else if` per field: the first field the two differ on decides, and
+// a field they tie on falls through to the next. Binding the ordering to a name
+// keeps a nested closure from being written out twice.
+fn gen_less_fields(
+  env: Env,
+  fields: List(ast.Field),
+  left: String,
+  right: String,
+  indent: Int,
+) -> String {
+  let pad = tabs(indent)
+  fields
+  |> list.index_map(fn(f, i) {
+    let fty = ty_of_type_expr(env.types, f.typ)
+    let l = "l" <> int.to_string(i)
+    let a = left <> "." <> exported(f.name)
+    let b = right <> "." <> exported(f.name)
+    pad
+    <> "if "
+    <> l
+    <> " := "
+    <> gen_less(env, fty, 0)
+    <> "; "
+    <> l
+    <> "("
+    <> a
+    <> ", "
+    <> b
+    <> ") {\n"
+    <> pad
+    <> "\treturn true\n"
+    <> pad
+    <> "} else if "
+    <> l
+    <> "("
+    <> b
+    <> ", "
+    <> a
+    <> ") {\n"
+    <> pad
+    <> "\treturn false\n"
+    <> pad
+    <> "}\n"
+  })
+  |> string.concat
 }
 
 // Renders call arguments in the callee's declared parameter order, honouring

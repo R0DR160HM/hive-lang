@@ -18,7 +18,7 @@
 //// a parameter that is itself a function. That is what makes a higher-order
 //// generic work:
 ////
-////     func filterMap(v: T[], f: func(T): Result<K, E>): K[] { ... }
+////     func filterMap(v: T[], f: func(T): Result<K, E>): K[dyn] { ... }
 ////
 //// `T` comes from the vector, `K` and `E` from the function. A copy substitutes
 //// through its *body* as well as its signature, since a body writes types down

@@ -236,11 +236,13 @@ pub fn runtime_go() -> String {
   "package hive
 
 import (
+	\"cmp\"
 	\"encoding/csv\"
 	\"fmt\"
 	\"math\"
 	\"os\"
 	\"reflect\"
+	\"sort\"
 	\"strconv\"
 	\"strings\"
 	\"unicode/utf8\"
@@ -561,6 +563,122 @@ func FilterMap[T any, K any, E any](v []T, f func(T) Result[K, E]) []K {
 		}
 	}
 	return out
+}
+
+// SortBy returns a new vector holding v's elements ordered by first, which
+// reports whether one element comes before another (backs the `sort` builtin).
+// v itself is never touched: sorting in place would be visible through every
+// other name for the same storage, and Hive vectors are values.
+//
+// The sort is STABLE — elements that neither comes before keep the order they
+// arrived in. That is what makes `sort` a function of its input alone even when
+// `first` is a partial order (it says nothing about two equal-ranked elements)
+// or an inconsistent one (a comparator that contradicts itself still yields the
+// same answer for the same input, rather than whatever the pivots happened to
+// do).
+func SortBy[T any](v []T, first func(T, T) bool) []T {
+	out := make([]T, len(v))
+	copy(out, v)
+	sort.SliceStable(out, func(i, j int) bool { return first(out[i], out[j]) })
+	return out
+}
+
+// MapAsync, FilterAsync and FilterMapAsync back the three walks when the
+// function they were handed is an `async func`. A walk applies its function to
+// every element independently, so all of the calls are known before the first
+// one runs: each is spawned at once and the whole walk then costs the slowest
+// element rather than the sum of all of them.
+//
+// The vector each answers with is exactly the one its sequential twin gives —
+// same elements, same order. The walk awaits every task before it returns, so no
+// handle is ever produced and no task can outlive the call.
+func MapAsync[T any, K any](v []T, f func(T) K) []K {
+	hs := make([]*Async[K], len(v))
+	for i, x := range v {
+		hs[i] = Spawn(func() K { return f(x) })
+	}
+	return AwaitAll(hs)
+}
+
+func FilterAsync[T any](v []T, keep func(T) bool) []T {
+	hs := make([]*Async[bool], len(v))
+	for i, x := range v {
+		hs[i] = Spawn(func() bool { return keep(x) })
+	}
+	out := []T{}
+	for i, ok := range AwaitAll(hs) {
+		if ok {
+			out = append(out, v[i])
+		}
+	}
+	return out
+}
+
+func FilterMapAsync[T any, K any, E any](v []T, f func(T) Result[K, E]) []K {
+	hs := make([]*Async[Result[K, E]], len(v))
+	for i, x := range v {
+		hs[i] = Spawn(func() Result[K, E] { return f(x) })
+	}
+	out := []K{}
+	for _, r := range AwaitAll(hs) {
+		if r.IsOk() {
+			out = append(out, r.Ok())
+		}
+	}
+	return out
+}
+
+// SortInPlace reorders v itself, with no copy at either end. It backs a `sort`
+// written as a STATEMENT on a mut vector: the value it would have answered with
+// is discarded, and the storage is the caller's to write, so there is nothing
+// left for a copy to protect. Stable, exactly as SortBy is.
+func SortInPlace[T any](v []T, first func(T, T) bool) {
+	sort.SliceStable(v, func(i, j int) bool { return first(v[i], v[j]) })
+}
+
+// LessOrdered is the default ordering of every type Go can compare directly:
+// Int and Float ascend numerically, Str ascends by UTF-8 byte order (which for
+// valid UTF-8 is code point order), and an Atom ascends by its compiled value —
+// Atom is a defined int, so it satisfies cmp.Ordered and needs no helper of its
+// own. A name is a thing to log, not a thing to compute with.
+func LessOrdered[T cmp.Ordered](a, b T) bool { return a < b }
+
+// LessBool orders false before true.
+func LessBool(a, b bool) bool { return !a && b }
+
+// LessVec is the default ordering of vectors: lexicographic by element, and on
+// a shared prefix the shorter one comes first. `less` orders the elements.
+func LessVec[T any](a, b []T, less func(T, T) bool) bool {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if less(a[i], b[i]) {
+			return true
+		}
+		if less(b[i], a[i]) {
+			return false
+		}
+	}
+	return len(a) < len(b)
+}
+
+// LessResult is the default ordering of a Result: every Error comes before
+// every Ok (a miss sorts ahead of a hit), and two of a kind are ordered by
+// their payloads.
+func LessResult[T any, E any](
+	a, b Result[T, E],
+	lessOk func(T, T) bool,
+	lessErr func(E, E) bool,
+) bool {
+	if a.IsOk() != b.IsOk() {
+		return !a.IsOk()
+	}
+	if a.IsOk() {
+		return lessOk(a.Ok(), b.Ok())
+	}
+	return lessErr(a.Err(), b.Err())
 }
 
 // MatchPattern matches s against a string-pattern template and returns the

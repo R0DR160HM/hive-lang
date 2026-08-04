@@ -1311,6 +1311,24 @@ fn outer_len(env: Env, expr: ast.Expr) -> Len {
         Ok(FromType(t)) -> outer_dim(t)
         Error(_) -> Dyn
       }
+    // `map` is length-preserving — same length, same order — so its result is
+    // exactly as long as what went in, whoever the transform is.
+    //
+    // `filter` and `filterMap` deliberately stay `Dyn`. What is knowable about
+    // them is a *maximum* (they select from their input, so never more than went
+    // in), and a maximum can never put an index in range: a filter that keeps
+    // nothing is always a possibility, so `filter(v, p)[0]` has to be guarded
+    // even when `v` is a `Str[9]`.
+    ast.ECall(ast.EMember(ast.EIdent("hive"), "map"), [ast.Arg(_, subject), _]) ->
+      outer_len(env, subject)
+    // `sort` reorders and nothing else, so it is length-preserving for the same
+    // reason — in either of its forms, since the comparator only decides where
+    // the elements land, never how many there are.
+    ast.ECall(ast.EMember(ast.EIdent("hive"), "sort"), [ast.Arg(_, subject)])
+    | ast.ECall(ast.EMember(ast.EIdent("hive"), "sort"), [
+        ast.Arg(_, subject),
+        _,
+      ]) -> outer_len(env, subject)
     ast.EIndex(_, _) | ast.EMember(_, _) | ast.ECall(_, _) ->
       case type_of(env, expr) {
         Some(t) -> outer_dim(t)
@@ -1475,15 +1493,25 @@ fn record_binding(env: Env, name: String, value: ast.Expr) -> Env {
       case type_of(env, value) {
         Some(t) ->
           Env(..base, lengths: dict.insert(base.lengths, name, FromType(t)))
-        None -> base
+        // No declared type to read it off — but the call's *shape* may still
+        // say a length, as a `map` over a vector of known length does.
+        None -> record_outer_len(base, env, name, value)
       }
     // Anything else keeps whatever outer length its shape reveals — a `+`
     // concatenation, an awaited vector of handles.
-    _ ->
-      case outer_len(env, value) {
-        Static(n) -> Env(..base, lengths: dict.insert(base.lengths, name, LitLen(n)))
-        Dyn -> base
-      }
+    _ -> record_outer_len(base, env, name, value)
+  }
+}
+
+// Record whatever outer length the shape of `value` reveals, and nothing when it
+// reveals none. `base` is the environment being built up for the binding; `env`
+// is the one the value is read in — the pre-binding one, since the right-hand
+// side is evaluated before the name is bound.
+fn record_outer_len(base: Env, env: Env, name: String, value: ast.Expr) -> Env {
+  case outer_len(env, value) {
+    Static(n) ->
+      Env(..base, lengths: dict.insert(base.lengths, name, LitLen(n)))
+    Dyn -> base
   }
 }
 

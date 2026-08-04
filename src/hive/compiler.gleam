@@ -249,13 +249,38 @@ fn check_param_type(t: ast.TypeExpr, where: String) -> Result(Nil, String) {
   }
 }
 
-// A return position: `T[]` is fine, since a return owns no storage and "some
-// length" is a complete answer for a caller. A function type nested in one
-// carries positions of its own, so the recursion sorts them out rather than
-// waving the whole thing through.
+// A return position: `T[]` is rejected here, unlike in a parameter.
+//
+// `[]` means "a vector of some length", which is exactly what a *caller* needs
+// told — a returned `Str[]` and a returned `Str[dyn]` are the same promise to
+// them (none, so every index is guarded), and a returned `Str[3]` is a very
+// different one. Which of the three it is settles how the caller may use the
+// value, so it is not a detail the callee gets to leave open: two spellings for
+// one meaning only invite the reader to hunt for a difference that isn't there.
+// A parameter is the other way round — there `[]` lets one helper serve callers
+// holding a `Str[3]` and a `Str[dyn]` alike, which is a real thing to say.
+//
+// A function type nested in a return carries positions of its own, so the
+// recursion sorts them out rather than waving the whole thing through.
 fn check_return_type(t: ast.TypeExpr, where: String) -> Result(Nil, String) {
   case t {
-    ast.TVoid | ast.TName(_, _, _, _) -> Ok(Nil)
+    ast.TVoid -> Ok(Nil)
+    ast.TName(_, _, _, dims) ->
+      case list.contains(dims, ast.DimEmpty) {
+        False -> Ok(Nil)
+        True ->
+          Error(
+            where
+            <> " is declared `"
+            <> ast.show_type(t)
+            <> "`, but `[]` only says \"a vector of some length\", and a return "
+            <> "is where the caller is told what it is getting. Declare it "
+            <> "`[dyn]` (any length, guarded indexes) — which is what `[]` "
+            <> "already means to a caller — or give it a static length like "
+            <> "`[3]`, which promises one. `[]` stays available on a parameter, "
+            <> "where accepting either kind is the point.",
+          )
+      }
     ast.TFunc(_, params, ret) -> {
       use _ <- result.try(
         list.try_fold(params, Nil, fn(_, p) { check_param_type(p, where) }),

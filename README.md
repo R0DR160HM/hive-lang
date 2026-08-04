@@ -281,14 +281,15 @@ compiles, builds and runs.
   enforced, not advertised: a `Str[3]` slot only ever takes a vector of three,
   wherever the value comes from (see
   [vector bounds](#scope)), which is what lets `v[2]` on one compile with no
-  guard. A third spelling, `Str[]`, is a **signature** spelling: it promises
+  guard. A third spelling, `Str[]`, is a **parameter** spelling: it promises
   nothing about the length and accepts any vector of the right element type, so
-  one helper serves callers holding a `Str[3]` and a `Str[dyn]` alike. It is legal
-  in a parameter, and in a **return** — a return names no storage, it says what
-  the caller gets, and "some length" is a complete answer there (`Str[]` and
-  `Str[dyn]` are the same promise to a caller: none, so every index into the
-  result is guarded). Which of the two kinds the callee kept the value in is its
-  own business, and `Str[]` is how a signature says so. What *does* name storage —
+  one helper serves callers holding a `Str[3]` and a `Str[dyn]` alike. That is
+  the whole of where it is legal. A **return** has to say which kind it is
+  (`Str[dyn]` or `Str[3]`), because a return is where the caller is told what it
+  is getting, and the two are different answers: one guards every index, the
+  other indexes freely. `Str[]` and `Str[dyn]` would be the *same* answer there —
+  which is the reason to keep only one spelling of it, since two invite the
+  reader to hunt for a difference that isn't there. What *names storage* —
   a variable or a field — has to say which of the two real kinds it is, since a
   promise is the only thing an index can rest on. All of them lower to Go
   slices; `+` concatenates into a new vector. `==` and `!=` compare vectors
@@ -330,8 +331,13 @@ compiles, builds and runs.
   barrier, fully typed. Tasks of *different* types are joined the same way:
   spawn each, then `await` each; because they all started first, the total wait
   is the slowest, not the sum. A handle's type (`async T`) is inferred and never
-  written: you may bind it and `await` it, but not annotate, return, pass, or
-  use it as a plain `T`, so a task can never outlive the scope that spawned it.
+  written: you may bind it and `await` it, but not annotate, return, pass, store,
+  index, echo, or otherwise use it as a plain `T`, so a task can never outlive
+  the scope that spawned it. **A vector of handles is held to the same rule** —
+  `await [f(a), f(b)]` builds one, and until it is awaited it can be bound and
+  nothing else, since a vector that escaped would carry its tasks out just as
+  surely. Every one of these is a compile error naming the handle, rather than
+  something the Go compiler reports against a generated type.
   `await` is idempotent — the same handle may be awaited more than once. Any
   `await` may be bounded with the optional
   [`with timeout <ms>`](#hivetask) clause, which turns its result into a
@@ -407,7 +413,7 @@ compiles, builds and runs.
   A variable is pinned down by wherever it appears in the parameters — including
   *inside* a parameter's own type, which is what makes a higher-order generic
   work: in
-  `func filterMap(values: T[], transform: func(T): Result<K, E>): K[]`
+  `func filterMap(values: T[], transform: func(T): Result<K, E>): K[dyn]`
   the call says what `T` is by the vector it passes and what `K` and `E` are by
   the function it passes. The body may write those variables down too
   (`mut K[dyn] out = []`, `for each v: T in values`, `Box<T> b = ...`); each copy
@@ -578,14 +584,16 @@ argument type. A declaration of your own with one of these names
 | `bytes(str)`            | `bytes(Str): Int`            | Number of **bytes** in a string's UTF-8 encoding.                    |
 | `append(vector, value)` | `append(T[dyn], T): void`    | Grows a **mutable** dynamic vector in place with one more element.   |
 | `join(vector, sep)`     | `join(Str[], Str): Str`      | Concatenates a `Str` vector into one string, `sep` between elements. |
-| `split(str, sep)`       | `split(Str, Str): Str[]`     | Splits a string on `sep` into a `Str` vector (inverse of `join`).    |
+| `split(str, sep)`       | `split(Str, Str): Str[dyn]`  | Splits a string on `sep` into a `Str` vector (inverse of `join`).    |
 | `indexOf(vector, value)`| `indexOf(T[], T): Result<Int, Bool>` | Position of the first element equal to `value`, else `Error(false)`. |
 | `indexOf(str, sub)`     | `indexOf(Str, Str): Result<Int, Bool>` | Position, in characters, of the first occurrence of `sub`, else `Error(false)`. |
 | `row(table, key)`       | `row(Table, Str): Str[dyn]`  | The row whose first cell equals `key`, else `[]`.                    |
 | `column(table, key)`    | `column(Table, Str): Str[dyn]`| The column whose top (first-row) cell equals `key`, else `[]`.      |
-| `map(values, transform)`| `map(T[], func(T): K): K[]`  | Every element, transformed. Same length, same order.                 |
-| `filter(values, keep)`  | `filter(T[], func(T): Bool): T[]` | The elements `keep` says yes to, in order.                      |
-| `filterMap(values, transform)` | `filterMap(T[], func(T): Result<K, E>): K[]` | Transform and select in one pass: the `Ok` payloads. |
+| `map(values, transform)`| `map(T[], func(T): K): K[dyn]` | Every element, transformed. Same length, same order.                 |
+| `filter(values, keep)`  | `filter(T[], func(T): Bool): T[dyn]` | The elements `keep` says yes to, in order.                      |
+| `filterMap(values, transform)` | `filterMap(T[], func(T): Result<K, E>): K[dyn]` | Transform and select in one pass: the `Ok` payloads. |
+| `sort(values)`          | `sort(T[]): T[dyn]`          | The elements in their own type's order. Discarded on a `mut` vector, sorts [in place](#sorting-in-place). |
+| `sort(values, first)`   | `sort(T[], func(T, T): Bool): T[dyn]` | The elements in the order `first` gives.                    |
 
 ### A declaration of your own wins
 
@@ -629,8 +637,10 @@ to `hive.len(v)`, so the guard means the same thing in a program that has taken
 
 `len` and `bytes` differ only for strings: for `"café"`, `len` is `4` (runes)
 while `bytes` is `5` (the `é` is two bytes). `append` is the one builtin that
-requires its target to be `mut`, and it must also be **declared** `[dyn]`: it is
-the in-place way to grow a `Str[dyn]`, while `+` builds a brand-new vector. `row` and `column` look a
+*requires* its target to be `mut`, and it must also be **declared** `[dyn]`: it is
+the in-place way to grow a `Str[dyn]`, while `+` builds a brand-new vector.
+(`sort` is the one builtin that *notices* a `mut` target without requiring one —
+see [sorting in place](#sorting-in-place).) `row` and `column` look a
 value up in a `Table` by its first cell — `row` matches a row's first element,
 `column` matches a column's top (first-row) cell — and `column` skips any row
 too short to reach the matched column.
@@ -678,6 +688,56 @@ mismatch is a compile error rather than a Go one: `filter` wants a `Bool`,
 `filterMap` a `Result`, and `map` wants *something* (a `void` function collects
 nothing — that too is a `for each` loop).
 
+`map` is **length-preserving**, and the [bounds pass](#scope) knows it: mapping a
+vector whose length is known gives a vector of that same length, whoever the
+transform is. So the result is indexed on the same terms the input was, and it
+keeps a declared length's promise:
+
+```hive
+Int[2] v = [1, 2]
+doubled := map(v, double)
+echo doubled[1]                 // no guard — a `map` of two is two
+Int[2] fixed = map(v, double)   // fills a declared `Int[2]` slot
+Int[3] wrong = map(v, double)   // compile error: that is two elements, not three
+```
+
+`filter` and `filterMap` are **not**, and deliberately claim nothing. What is
+knowable about them is a *maximum* — they select from their input, so no more
+comes out than went in — and a maximum can never put an index in range, because
+a filter that keeps nothing is always a possibility. Their results are guarded
+like any other vector of unknown length, even when the input's length was known.
+
+#### Walking with an `async func`
+
+Hand a walk an [`async func`](#the-language) and it runs **every element at
+once**, then waits for them all before it answers:
+
+```hive
+async func fetch(url: Str): Str { ... }
+
+bodies := map(urls, fetch)      // all concurrent; costs the slowest, not the sum
+live   := filter(urls, reaches) // every check at once, then the ones that passed
+```
+
+No `await` is written, and none is needed. A walk applies its function to each
+element independently, so *all* of its calls are known before the first one runs
+— which is exactly the condition for running them together, and is also why the
+result can be handed back complete. `await` earns its place where the alternative
+is not waiting (a bare call is fire-and-forget, a bound one is a handle you
+hold); a walk has no such alternative, so there is nothing for the call site to
+decide.
+
+What comes back is what the sequential walk would give: **same type, same
+elements, same order**, same declared length. `async` changes how long the walk
+takes and nothing else. Because the walk awaits every task before returning, no
+handle is produced and no task outlives the call.
+
+`sort` is the exception, and it is refused rather than quietly accepted. A walk
+knows all of its calls up front; a sort picks each comparison from how the
+previous one answered, so there is only ever one to make and nothing to overlap —
+every call would be spawned and waited for on the spot, which is strictly slower
+than a plain `func`.
+
 The vector goes in the way it would go into any `T[]` parameter, so the copy
 rules of [value semantics](#value-semantics-copy-on-binding) apply unchanged: a
 `mut` vector is copied in, and the elements the new vector holds are its own.
@@ -685,6 +745,122 @@ rules of [value semantics](#value-semantics-copy-on-binding) apply unchanged: a
 Like every builtin, these yield to a declaration of your own and stay reachable as
 `hive.map` / `hive.filter` / `hive.filterMap` — see
 [A declaration of your own wins](#a-declaration-of-your-own-wins).
+
+### Putting a vector in order: `sort`
+
+`sort` hands back a new vector holding the same elements in order. The original
+is never touched — sorting in place would be visible through every other name
+for the same storage, and vectors are
+[values](#value-semantics-copy-on-binding).
+
+```hive
+func longerFirst(a: Str, b: Str): Bool { return len(a) > len(b) }
+
+proc main(): void {
+    Str[3] words = ["pear", "apple", "fig"]
+
+    echo join(sort(words), "|")              // apple|fig|pear
+    echo join(sort(words, longerFirst), "|") // apple|pear|fig
+    echo join(words, "|")                    // pear|apple|fig — untouched
+}
+```
+
+**One argument** orders elements by their own type's order. Every type has one
+except those there is no honest order for:
+
+| element | order |
+| ------- | ----- |
+| `Int`, `Float` | numeric, ascending |
+| `Str`   | by UTF-8 byte order, which for text is code point order |
+| `Bool`  | `false` before `true` |
+| `Atom`  | by its **compiled value** — the small integer the compiler assigned it, which is its identity; a name is for logging, not for computing with. That value is wherever the atom's first mention put it, so add an atom above an existing one and a sorted vector of them reorders |
+| a vector, a `Table` | lexicographic by element, and on a shared prefix the shorter one first |
+| `Result<T, E>` | every `Error` before every `Ok`; two of a kind by their payloads |
+| a struct | field by field, in declaration order — the first field they differ on decides |
+| a tagged union | by **variant** first, in the order the variants were declared, then by that variant's fields |
+| a function value, a task handle, a service address | none — a compile error, naming the part at fault |
+
+The ordering is chosen by the element's static type and emitted inline, the same
+way a deep copy is: no runtime reflection, no boxing, no dispatch. A struct or
+union gets a generated `less_T` alongside its `clone_T`, and a type that reaches
+back into itself is ordered by that very function.
+
+**Two arguments** order by a `func` of your own, which answers whether its first
+element comes before its second:
+
+```hive
+func byAge(a: User, b: User): Bool { return a.age < b.age }
+
+sorted := sort(users, byAge)
+byName := sort(users, olderThan(_, _))   // a partial application works too
+```
+
+That is also the answer for an element type with no default order — anything can
+be sorted once you say how. As with a walk, the function is a `func`, never a
+`proc`: a sort says nothing about how many comparisons it makes or in what order,
+so there is nowhere to hang a side effect. It may not be an `async func` either —
+unlike a [walk](#walking-with-an-async-func), a sort chooses each comparison from
+how the last one answered, so there is never more than one call to make and
+nothing for concurrency to overlap.
+
+The sort is **stable** — elements neither of which comes first keep the order
+they arrived in. That is what makes `sort` a function of its input alone even
+when the ordering is partial (a comparator that only looks at one field says
+nothing about two rows sharing it) or inconsistent (one that contradicts itself
+still gives the same answer for the same input, rather than whatever the pivots
+happened to do).
+
+Both forms are **length-preserving**, exactly as
+[`map`](#walking-a-vector-map-filter-filtermap) is: a comparator decides where
+elements land, never how many there are. So `sort(v)` on a `Str[3]` is three
+elements, indexable on the same terms `v` was, and it fills a declared `Str[3]`.
+
+#### Sorting in place
+
+A `sort` written as a **statement** throws away the vector it answers with. When
+the vector it was given is `mut`, that is taken at its word: the storage is
+reordered where it lies, with no copy at either end.
+
+```hive
+mut Str[dyn] names = ["pear", "apple"]
+
+sort(names)                  // in place — `names` is now sorted
+sorted := sort(names)        // NOT in place — a new vector, `names` untouched
+```
+
+Both conditions have to hold, and each is doing work:
+
+* **Discarded.** A `sort` whose value is kept has to keep answering with a new
+  vector, or `b := sort(a)` would quietly reorder `a` as well.
+* **`mut`.** That storage an immutable binding can see is never rewritten
+  underneath it is the invariant all of
+  [value semantics](#value-semantics-copy-on-binding) rests on.
+
+And a discarded `sort` that *can't* sort in place is a **compile error**, not a
+statement that quietly does nothing:
+
+```hive
+Int[dyn] v = [3, 1, 2]
+sort(v)                  // compile error: `v` is not `mut`
+sort(split(line, ","))   // compile error: nothing to sort in place
+```
+
+Both would sort a copy and drop it the instant it was made — dead code wearing
+the exact shape of the form that works. The fix is whichever you meant: declare
+the vector `mut` to sort it where it lies, or keep the answer.
+
+The subject can be any `mut` storage, not only a bare variable — `sort(b.items)`
+and `sort(rows[i])` reorder the field and the row. And because an in-place sort
+*is* a write, the copy-on-binding analysis counts it as one: in
+
+```hive
+mut Int[dyn] a = [3, 1, 2]
+b := a          // copies, because...
+sort(a)         // ...this rewrites `a`, and `b` must not follow
+```
+
+`b` gets a copy rather than aliasing `a`. Two `mut` bindings still share
+completely, so sorting through either is seen through both.
 
 ### `indexOf` returns an index you can use
 
@@ -1650,6 +1826,17 @@ keyword is shorthand for that guard: `if v bounds i { ... }` means exactly
 [`indexOf`](#indexof-returns-an-index-you-can-use) needs no guard at all.
 Anything the pass can't prove safe (a computed index, an unusual guard) is a
 compile error rather than a runtime crash.
+
+A known length also **survives the operations that can't lose it**, so whole-vector
+code stays as indexable as the literals it started from. Concatenation adds the
+two lengths (`Str[2] + Str[8]` is eight-plus-two elements, and fills a `Str[10]`
+slot), while [`map`](#walking-a-vector-map-filter-filtermap) and
+[`sort`](#putting-a-vector-in-order-sort) each carry their input's length through
+unchanged — one transforms elements and the other moves them, and neither
+changes how many there are. They compose, so `map(a, f) + sort(b)` is as long as
+`a + b`. If *either* side of a concatenation is unknown the result is unknown —
+there is no "at least this many" — and `filter`/`filterMap` never carry a length
+at all, for the reason given in their section.
 
 A **declared** length is a promise, not a hint. `Str[3]` means three, so every
 value that lands in such a slot — an initialiser, a later assignment, an
