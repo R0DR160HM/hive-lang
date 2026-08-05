@@ -8,6 +8,7 @@
 //// downloading — the machinery behind either.
 
 import gleam/list
+import gleam/option.{None}
 import gleam/result
 import gleam/string
 import filepath
@@ -16,6 +17,7 @@ import simplifile
 import hive/compiler
 import hive/runtime
 import hive/spawn
+import hive/testreport
 
 /// Compile `entry` to Go, then build a native executable with the Go compiler.
 /// On success returns the path to the produced executable.
@@ -122,6 +124,88 @@ pub fn run(entry: String, program_args: List(String)) -> Result(Int, String) {
   ))
 }
 
+/// Compile `entry` together with its tests and run them, reporting what passed
+/// and how much of the program was exercised. Returns the rendered report and
+/// whether every test passed.
+///
+/// The runner is `go test`, which the generated project is already set up for:
+/// `main_test.go` is the same package as `main.go`, so a test reaches everything
+/// the program declares without any of it being exported on purpose. Coverage is
+/// not a mode — `-coverprofile` is always passed, because a test run that does
+/// not say what it missed has answered half the question.
+pub fn run_tests(entry: String) -> Result(#(String, Bool), String) {
+  let entry = normalize(entry)
+
+  use build <- result.try(compiler.compile_tests_file(entry))
+
+  let dir = dir_of(entry)
+  let base = filepath.strip_extension(filepath.base_name(entry))
+  let build_dir = filepath.join(dir, base <> ".hive-build")
+  let profile = "coverage.out"
+
+  let both = build.main_go <> build.test_go
+  use _ <- result.try(prepare_build_dir_for(build_dir, build.main_go, both))
+  use _ <- result.try(write(
+    filepath.join(build_dir, "main_test.go"),
+    build.test_go,
+  ))
+  use _ <- result.try(resolve_sql_deps(build_dir, both))
+
+  // Best-effort formatting; ignored if gofmt is unavailable. The coverage report
+  // locates each declaration by reading the finished file, so it does not matter
+  // whether this ran.
+  let _ = shellout.command(run: "gofmt", with: ["-w", "."], in: build_dir, opt: [])
+
+  // A failing suite is a non-zero exit, which `shellout` reports as an error —
+  // and its output is the report. So both outcomes carry output and only a
+  // missing toolchain is a real failure; `go test` says so on the first line.
+  let outcome =
+    shellout.command(
+      run: "go",
+      with: ["test", "-v", "-coverprofile=" <> profile, "."],
+      in: build_dir,
+      opt: [],
+    )
+  use #(output, passed) <- result.try(case outcome {
+    Ok(output) -> Ok(#(output, True))
+    Error(#(_code, output)) ->
+      case looks_like_a_run(output) {
+        True -> Ok(#(output, False))
+        False ->
+          Error("the Go toolchain could not run the tests:\n\n" <> output)
+      }
+  })
+
+  // Read back what was actually compiled: `gofmt` may have moved every line, and
+  // the declaration positions have to match the file the profile describes.
+  let compiled =
+    simplifile.read(filepath.join(build_dir, "main.go"))
+    |> result.unwrap(build.main_go)
+  let coverage =
+    simplifile.read(filepath.join(build_dir, profile))
+    |> result.map(fn(text) {
+      testreport.parse_coverage(text, compiled, build.origins)
+    })
+    |> result.unwrap(None)
+
+  let report =
+    testreport.Report(
+      testreport.parse_results(output, build.test_names),
+      coverage,
+    )
+  use dir_abs <- result.try(absolute(dir))
+  Ok(#(testreport.render(testreport.relative_to(report, dir_abs)), passed))
+}
+
+// Whether output came from a suite that ran (and failed) rather than from a
+// toolchain that could not start one. A run always reports on the package it
+// built, whatever the tests did.
+fn looks_like_a_run(output: String) -> Bool {
+  string.contains(output, "--- FAIL")
+  || string.contains(output, "=== RUN")
+  || string.contains(output, "FAIL\t")
+}
+
 // A program that uses `hive.sql` links external Go drivers, so its
 // dependencies must be resolved (fetched on first build, then cached) before
 // the Go toolchain runs. Programs that don't stay dependency-free and offline.
@@ -175,8 +259,7 @@ pub fn emit(entry: String) -> Result(String, String) {
 /// altogether — no build directory, no `go build`, nothing written next to the
 /// entrypoint — so it answers in the time the Hive passes take on their own.
 pub fn check(entry: String) -> Result(Nil, String) {
-  compiler.compile_file(normalize(entry))
-  |> result.map(fn(_) { Nil })
+  compiler.check_file(normalize(entry))
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +267,17 @@ pub fn check(entry: String) -> Result(Nil, String) {
 // ---------------------------------------------------------------------------
 
 fn prepare_build_dir(build_dir: String, main_go: String) -> Result(Nil, String) {
+  prepare_build_dir_for(build_dir, main_go, main_go)
+}
+
+// `references` is the generated Go that decides which standard library modules
+// get written. It is `main_go` for a build, and `main.go` *plus* `main_test.go`
+// for a test run — a `hive.task.sleep` only a test reaches still has to be there.
+fn prepare_build_dir_for(
+  build_dir: String,
+  main_go: String,
+  references: String,
+) -> Result(Nil, String) {
   use _ <- result.try(mkdir(build_dir))
   use _ <- result.try(mkdir(filepath.join(build_dir, "hive")))
   use _ <- result.try(write(filepath.join(build_dir, "go.mod"), runtime.go_mod()))
@@ -198,7 +292,7 @@ fn prepare_build_dir(build_dir: String, main_go: String) -> Result(Nil, String) 
   // package, so a stale file would still be built — and a stale `sql.go` would
   // fail outright, since go.mod is regenerated dependency-free on every build.
   // `delete_all` is a no-op when the file is already absent.
-  let needed = runtime.needed_modules(main_go)
+  let needed = runtime.needed_modules(references)
   list.try_fold(runtime.modules(), Nil, fn(_, module) {
     let path = filepath.join(build_dir, module.file)
     case list.contains(needed, module.name) {

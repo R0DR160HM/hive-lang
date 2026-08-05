@@ -41,6 +41,7 @@ pub type Kind {
   KwProc
   KwFunc
   KwQuery
+  KwTest
   KwType
   KwIf
   KwElse
@@ -123,6 +124,7 @@ pub fn describe(kind: Kind) -> String {
     KwProc -> "`proc`"
     KwFunc -> "`func`"
     KwQuery -> "`query`"
+    KwTest -> "`test`"
     KwType -> "`type`"
     KwIf -> "`if`"
     KwElse -> "`else`"

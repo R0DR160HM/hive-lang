@@ -3,6 +3,7 @@
 //// Each helper consumes tokens from the front of the list and returns the
 //// produced node together with the remaining tokens, or an error message.
 
+import gleam/dict
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -18,7 +19,7 @@ type Toks =
 
 pub fn parse(tokens: Toks) -> Result(ast.Module, String) {
   use #(imports, decls) <- result.try(parse_decls(tokens, [], []))
-  Ok(ast.Module(imports, decls))
+  Ok(ast.Module(imports, decls, dict.new()))
 }
 
 // ---------------------------------------------------------------------------
@@ -121,10 +122,14 @@ fn parse_decls(
       use #(decl, rest) <- result.try(parse_type(tokens))
       parse_decls(rest, imports, [decl, ..acc])
     }
+    token.KwTest -> {
+      use #(decl, rest) <- result.try(parse_test(tokens))
+      parse_decls(rest, imports, [decl, ..acc])
+    }
     other ->
       Error(at(
         tokens,
-        "expected `import`, `proc`, `func`, `query` or `type` at "
+        "expected `import`, `proc`, `func`, `query`, `type` or `test` at "
           <> "the top level but found "
           <> token.describe(other),
       ))
@@ -227,6 +232,35 @@ fn parse_func(tokens: Toks) -> Result(#(ast.Decl, Toks), String) {
   use #(name, params, ret, t1) <- result.try(parse_header(tokens, token.KwFunc))
   use #(body, t2) <- result.try(parse_block(t1))
   Ok(#(ast.FuncDecl(name, params, ret, body), t2))
+}
+
+// `test "what should be true" { ... }`. The name is a string rather than an
+// identifier because it is prose, not something anything calls: a test takes no
+// parameters and returns nothing, so there is no signature to write and no call
+// site to write one for.
+fn parse_test(tokens: Toks) -> Result(#(ast.Decl, Toks), String) {
+  let at_line = line(tokens)
+  let t0 = tail(tokens)
+  use #(name, t1) <- result.try(case kind(t0) {
+    token.StringLit(name) -> Ok(#(name, tail(t0)))
+    // An interpolated name would have to be built at runtime, and a test's name
+    // is chosen when it is written.
+    token.StrInterp(_) ->
+      Error(at(
+        t0,
+        "a test's name is a plain string: it says what should be true, so there "
+          <> "is nothing in it to interpolate",
+      ))
+    other ->
+      Error(at(
+        t0,
+        "expected a test name in quotes (`test \"an empty cart costs nothing\" "
+          <> "{ ... }`) but found "
+          <> token.describe(other),
+      ))
+  })
+  use #(body, t2) <- result.try(parse_block(t1))
+  Ok(#(ast.TestDecl(name, body, "", at_line), t2))
 }
 
 fn parse_query(tokens: Toks) -> Result(#(ast.Decl, Toks), String) {
@@ -488,8 +522,15 @@ fn parse_params(
     _ -> {
       use #(pname, t1) <- result.try(expect_ident(tokens))
       use t2 <- result.try(expect(t1, token.Colon))
+      // `name: mut T` — the parameter is the caller's mutex, not a view of it.
+      // This is the one type position where `mut` is part of the spelling, which
+      // is why the type parser itself rejects it (see `parse_type_expr`).
+      let #(mutable, t2) = case kind(t2) {
+        token.KwMut -> #(True, tail(t2))
+        _ -> #(False, t2)
+      }
       use #(ptype, t3) <- result.try(parse_type_expr(t2))
-      let param = ast.Field(pname, ptype)
+      let param = ast.Field(pname, ptype, mutable)
       case kind(t3) {
         token.Comma -> parse_params(tail(t3), [param, ..acc])
         _ -> Ok(#(list.reverse([param, ..acc]), t3))
@@ -525,7 +566,10 @@ fn parse_type_items(
         // `name: Type` — a common field shared by every variant
         token.Colon -> {
           use #(ftype, t2) <- result.try(parse_type_expr(tail(t1)))
-          parse_type_items(t2, variants, [ast.Field(name, ftype), ..commons])
+          parse_type_items(t2, variants, [
+            ast.Field(name, ftype, False),
+            ..commons
+          ])
         }
         // `Name` — a bare variant with no fields
         _ -> parse_type_items(t1, [ast.Variant(name, []), ..variants], commons)
@@ -545,7 +589,7 @@ fn parse_fields(
       use #(fname, t1) <- result.try(expect_ident(tokens))
       use t2 <- result.try(expect(t1, token.Colon))
       use #(ftype, t3) <- result.try(parse_type_expr(t2))
-      parse_fields(t3, [ast.Field(fname, ftype), ..acc])
+      parse_fields(t3, [ast.Field(fname, ftype, False), ..acc])
     }
   }
 }
@@ -553,6 +597,19 @@ fn parse_fields(
 fn parse_type_expr(tokens: Toks) -> Result(#(ast.TypeExpr, Toks), String) {
   case kind(tokens) {
     token.KwVoid -> Ok(#(ast.TVoid, tail(tokens)))
+    // `mut` is not part of a type. It marks a *binding* — a declaration, or a
+    // `proc` parameter, which `parse_params` reads before handing the rest here.
+    // Everywhere else there is no binding for it to describe: a field's
+    // mutability is its owner's, a return hands back a value the caller binds
+    // however it likes, and a function type names no parameters to bind.
+    token.KwMut ->
+      Error(at(
+        tokens,
+        "`mut` is not part of a type. A mutex is a binding: a declaration "
+          <> "(`mut Str[dyn] v = ...`) or a `proc` parameter (`v: mut "
+          <> "Str[dyn]`). A field, a return type and a function type each bind "
+          <> "nothing, so there is nothing here for `mut` to make mutable.",
+      ))
     // A function type mirrors a declaration with the name dropped:
     // `func(Int, Str): Bool` / `proc(Req): Resp`.
     token.KwFunc -> parse_fn_type(tail(tokens), True)
@@ -789,9 +846,13 @@ fn parse_echo(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
   Ok(#(ast.SEcho(value), t1))
 }
 
+// The `assert` keyword's own line travels with the statement: it is where a
+// failure will be reported, and by the time anything reports one the tokens are
+// long gone.
 fn parse_assert(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
+  let at_line = line(tokens)
   use #(value, t1) <- result.try(parse_expr(tail(tokens)))
-  Ok(#(ast.SAssert(value), t1))
+  Ok(#(ast.SAssert(value, at_line), t1))
 }
 
 fn parse_panic(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {

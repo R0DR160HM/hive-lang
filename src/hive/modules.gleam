@@ -204,8 +204,24 @@ fn flatten(
       Ok(ast.Module(
         [],
         list.flat_map(list.append(entry, rest), fn(pair) { pair.1 }),
+        origins(sources, prefixes),
       ))
   }
+}
+
+// Every declaration's flat name mapped back to how the author wrote it. This is
+// the inverse of the renaming `choose_prefixes` decided, and it is the only place
+// the two spellings are both in hand.
+fn origins(
+  sources: List(Source),
+  prefixes: Dict(String, String),
+) -> Dict(String, ast.Origin) {
+  list.fold(sources, dict.new(), fn(acc, src) {
+    let prefix = dict.get(prefixes, src.key) |> result.unwrap("")
+    list.fold(declared_names(src.module.decls), acc, fn(acc, name) {
+      dict.insert(acc, prefix <> name, ast.Origin(name, src.display))
+    })
+  })
 }
 
 // Builds one module's rewrite context, checking its imports name real modules
@@ -258,19 +274,23 @@ fn context(src: Source, exports: Dict(String, Dict(String, String))) {
 /// Every name a module declares, mapped to the name it carries in the flattened
 /// program.
 fn own_names(module: ast.Module, prefix: String) -> Dict(String, String) {
-  list.fold(module.decls, dict.new(), fn(acc, decl) {
-    let name = decl_name(decl)
+  list.fold(declared_names(module.decls), dict.new(), fn(acc, name) {
     dict.insert(acc, name, prefix <> name)
   })
 }
 
-fn decl_name(decl: ast.Decl) -> String {
-  case decl {
-    ast.ProcDecl(name, _, _, _)
-    | ast.FuncDecl(name, _, _, _)
-    | ast.QueryDecl(name, _, _, _)
-    | ast.TypeDecl(name, _, _) -> name
-  }
+// The names a module declares. A test declares none: it is named in prose, and
+// nothing imports or calls it — a `test` is reached only by running the suite.
+fn declared_names(decls: List(ast.Decl)) -> List(String) {
+  list.filter_map(decls, fn(decl) {
+    case decl {
+      ast.ProcDecl(name, _, _, _)
+      | ast.FuncDecl(name, _, _, _)
+      | ast.QueryDecl(name, _, _, _)
+      | ast.TypeDecl(name, _, _) -> Ok(name)
+      ast.TestDecl(..) -> Error(Nil)
+    }
+  })
 }
 
 // A prefix for each module's flattened declarations. The entry module keeps its
@@ -281,7 +301,7 @@ fn choose_prefixes(
   entry_key: String,
 ) -> Dict(String, String) {
   let declared =
-    list.flat_map(sources, fn(s) { list.map(s.module.decls, decl_name) })
+    list.flat_map(sources, fn(s) { declared_names(s.module.decls) })
   let #(prefixes, _) =
     list.index_fold(sources, #(dict.new(), []), fn(acc, src, index) {
       let #(map, taken) = acc
@@ -379,6 +399,15 @@ fn rewrite_decl(rw: Rw, decl: ast.Decl) -> Result(ast.Decl, String) {
       use body <- result.try(rewrite_body(rw, body, field_names(params)))
       Ok(ast.FuncDecl(flat(rw, name), params, ret, body))
     }
+    // A test's body is rewritten like any other, so `cart.total(...)` inside it
+    // resolves to the flat name — which is what lets a test module import the
+    // module it tests.
+    ast.TestDecl(name, body, _, line) -> {
+      use body <- result.try(rewrite_body(rw, body, []))
+      // `rw.where` is the file this declaration was written in, which is where a
+      // failure inside it has to be reported.
+      Ok(ast.TestDecl(name, body, rw.where, line))
+    }
     ast.QueryDecl(name, params, ret, sql) -> {
       use params <- result.try(rewrite_fields(rw, params))
       use ret <- result.try(rewrite_type(rw, ret))
@@ -408,7 +437,7 @@ fn rewrite_fields(
 ) -> Result(List(ast.Field), String) {
   list.try_map(fields, fn(f) {
     use typ <- result.try(rewrite_type(rw, f.typ))
-    Ok(ast.Field(f.name, typ))
+    Ok(ast.Field(f.name, typ, f.mutable))
   })
 }
 
@@ -532,9 +561,9 @@ fn rewrite_stmt(
       use e <- result.try(rewrite_expr(rw, e, locals))
       Ok(#(ast.SEcho(e), locals))
     }
-    ast.SAssert(e) -> {
+    ast.SAssert(e, line) -> {
       use e <- result.try(rewrite_expr(rw, e, locals))
-      Ok(#(ast.SAssert(e), locals))
+      Ok(#(ast.SAssert(e, line), locals))
     }
     ast.SPanic(e) -> {
       use e <- result.try(rewrite_expr(rw, e, locals))

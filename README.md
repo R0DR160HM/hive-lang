@@ -73,6 +73,13 @@ as the author expects. Anything after the entrypoint is forwarded to the program
 as its own command-line arguments (`hive run foo.hive a b c`), readable via
 `hive.term.args()`.
 
+`hive test foo.hive` runs the program's [tests](#testing) and reports coverage;
+it exits non-zero if any test failed, so it is the thing a commit hook or a CI
+step runs. `hive check foo.hive` runs every compiler pass and builds nothing,
+which is what an editor wants — and unlike `build` and `run` it asks for no
+entrypoint, since a file holding only tests, or only declarations for another
+file to import, is a perfectly good file.
+
 ### Troubleshooting on Windows
 
 If a **built** executable (`hive build`, then `.\foo.exe`) produces **no output
@@ -139,7 +146,8 @@ type Greeting {
 	Casual
 }
 
-// A `func` may perform I/O, but it can't call a `proc` or take a mutex.
+// A `func` may perform I/O, but it can't call a `proc` or declare a mutex
+// parameter.
 func greet(name: Str, style: Greeting): Str {
 	if style is Greeting.Formal(title) {
 		return "Good evening, {title} {name}."
@@ -251,12 +259,16 @@ compiles, builds and runs.
 
 ## The language
 
+* **`test`** — a unit test, named in prose: `test "an empty cart costs nothing"
+  { ... }`. It is run by [`hive test`](#testing), never called, so it takes no
+  parameters and returns nothing. Its body is an ordinary `proc` body, and
+  `assert` inside it records a failure instead of stopping the program.
 * **`proc` / `func` / `query`** — both `proc`s and `func`s may
   perform I/O: `echo`, reading files with `using`, and `hive.net` are all
   allowed in either. A `func` differs from a `proc` in exactly two ways: it
-  cannot receive a mutex as a parameter (a `mut` value passed to a func is seen
-  as an ordinary immutable copy), and it cannot call a `proc` (only procs call
-  procs). A `query` is a func whose body is inline SQL and whose
+  cannot declare a mutex parameter (`v: mut T` — a `mut` value passed to a func
+  is seen as an ordinary immutable copy instead), and it cannot call a `proc`
+  (only procs call procs). A `query` is a func whose body is inline SQL and whose
   return type describes its **rows** — see
   [typed queries](#queries-are-typed-by-their-rows). An interpolated `{param}`
   never enters the SQL text: it becomes a placeholder and the value is bound
@@ -316,10 +328,24 @@ compiles, builds and runs.
   `Mutex<T>`: identical to `T` at runtime, but only mutexes may be altered at
   compile time. A parameter or return of type `T` accepts a `Mutex<T>` (the
   callee just sees an immutable `T`), never the reverse, so assigning to a
-  parameter or a plain `:=` binding is a compile error. A mutex passed as an
-  argument is **copied** on the way in, so the callee's immutable view really is
+  parameter or a plain `:=` binding is a compile error. A mutex passed into such a
+  parameter is **copied** on the way in, so the callee's immutable view really is
   one: it cannot see the caller's later writes, whether the two run in sequence
   or — for an `async` call — at the same time.
+
+  A `proc` — and only a `proc` — may ask for the mutex *itself*, by writing the
+  parameter `v: mut T`. The argument then has to be a `mut` variable, or a path
+  into one, and what the callee gets is that storage rather than a view of it: it
+  may reassign it, write its elements, and `append` to it, and every one of those
+  is visible through the caller's name afterwards. **Whether it shares depends on
+  the call site, not the declaration**: a call you wait for hands over the
+  caller's storage, and an `async` or `await`ed one hands over a copy — a thread
+  of its own gets storage of its own, which is what keeps a fired-off call from
+  racing the caller it was fired off from. `mut` cannot appear anywhere else a
+  type can: not on a field, not on a return, not in a `proc(...)` type. Each of
+  those binds nothing, and a function value has no call site to take a mutex from,
+  so a callable with one can be neither referenced (`f`) nor partially applied
+  (`f(1, _)`).
 * **Concurrency** — **every call blocks its caller.** Nothing about a
   declaration says otherwise, so there is no `async func`, no Future and no
   Promise type to name; what a call means is decided where it is written:
@@ -534,9 +560,48 @@ does not name the same storage every time it is read — `mut b = a[i]` can be a
 different element each time `i` moves — so that binding keeps a header of its
 own.
 
-Passing a mutex to a proc or func is the opposite case and always **copies** (see
-[Mutability](#the-language)): the callee is handed an immutable `T`, and it would
-not be one if the caller could still write to it.
+Passing a mutex into an ordinary `T` parameter is the opposite case and always
+**copies** (see [Mutability](#the-language)): the callee is handed an immutable
+`T`, and it would not be one if the caller could still write to it.
+
+A `mut T` parameter is the third case, and the only one where storage crosses a
+call boundary on purpose:
+
+```hive
+proc grow(vec: mut Str[dyn], tag: Str): void {
+	append(vec, tag)
+}
+
+proc main(): void {
+	mut Str[dyn] v = ["a"]
+	grow(v, "b")          // waited for: v is now ["a", "b"]
+	async grow(v, "c")    // fired off: the thread grows a copy; v is untouched
+}
+```
+
+It lowers to a pointer (`vec *[]string`), because a shared backing array would not
+survive `append` — that returns a *new* slice header, and the caller has to see the
+new one. Reads and writes in the callee go through it (`(*vec)`), which is the same
+machinery `mut b = a` uses one scope down: the name is an expression, not a
+variable of its own.
+
+The `async` half needs the copy to be made on the **caller's** side of the fence,
+so the argument is bound to a temporary first and the callee is handed *its*
+address:
+
+```go
+{ _a0 := hive.CloneVec(v); go grow(&_a0, "c") }
+```
+
+The same applies to a call inside `await [...]`, and to a mutex call nested in a
+spawned call's arguments (`await [twice(grow(v, "b"))]`) — that one is hoisted out
+and run in the caller, since running it on the new thread would be the very race
+the copy exists to prevent.
+
+One consequence for the [bounds pass](#scope): a
+callee holding a mutex may rebind the vector to a shorter one, so passing a
+variable to a `mut` parameter costs it every length and index fact already proved
+about it.
 
 When a copy *is* made it is **deep and type-directed** — no runtime reflection:
 
@@ -1719,6 +1784,94 @@ does in a single file.
 
 See [`code-examples/11 - Modules`](code-examples/11%20-%20Modules/modules.hive).
 
+## Testing
+
+A test is a top-level declaration, alongside `proc`, `func`, `query` and `type`:
+
+```hive
+import ./cart
+
+test "an empty cart costs nothing" {
+	cart.Item[0] empty = []
+	assert cart.total(empty) == 0
+}
+```
+
+Run them with **`hive test <entrypoint.hive>`**. There is nothing to install and
+nothing to register: no framework, no third-party library, no `describe`/`it`, no
+assertion vocabulary beyond the `assert` the language already has.
+
+A test is named **in prose** because a test name is documentation, not something
+anything calls — and for the same reason it takes no parameters and returns
+nothing (`return value` inside one is a compile error; a bare `return` to leave
+early is fine). Tests may live beside the code they are about or in a file of
+their own; a file holding only tests needs no `main`, and `hive test` on a
+program runs every test in every file the entrypoint reaches.
+
+### `assert` means the same thing, and does something different
+
+`assert` is the keyword you already have, and it says what it always says: this
+must hold. What changes is the consequence, and — as everywhere else in Hive —
+that is decided by *where it is written*. In ordinary code a failed assertion has
+proved the **program** wrong, so it stops. Inside a test it has proved the
+**test** wrong, so the failure is recorded and the rest of the suite still runs.
+
+A failed comparison shows both sides. The compiler has the source text and the
+static types, so neither the condition nor the values have to be spelled out in a
+message by hand:
+
+```
+  PASS  an empty cart costs nothing
+  FAIL  lines add up
+        cart.test.hive:33: assert cart.total(two) == 17
+          left:  16
+          right: 17
+
+  2 tests: 1 passed, 1 failed
+```
+
+A test that **panics** fails on its own rather than taking the suite with it, so
+one broken test cannot hide every result after it.
+
+### Coverage is not a separate command
+
+Every `hive test` run reports it. A run that does not say what it *missed* has
+answered half the question, so there is no flag to remember and no second command
+to forget:
+
+```
+  6 tests: 6 passed
+  coverage: 87.5% of statements (7/8)
+  never exercised: describe
+```
+
+The percentage counts statements of your own declarations — the clone helpers,
+ordering helpers, atom table and JSON marshalling the compiler emits alongside
+them are nobody's code and are not something a test can be said to have missed.
+`never exercised` names the declarations no test reached at all, which is usually
+the line worth acting on. With more than one file in the program, a per-file
+breakdown is printed too.
+
+`hive test` exits non-zero when any test fails, which is what makes it the thing
+a commit hook or a CI step runs.
+
+### What runs it
+
+`go test`. Hive already generates a Go module and drives the Go toolchain, and
+that toolchain ships a runner: isolation per test, filtering by name, timing,
+exit codes and coverage instrumentation. None of it is reimplemented here. The
+tests are generated into a `main_test.go` in the same Go package as `main.go`,
+which is what lets a test reach every proc, func and type the program declares
+without any of them being exported, or named, or otherwise made testable on
+purpose.
+
+Two things a runner cannot know and a compiler can are added on top: which
+`.hive` line a failure belongs to — the generated Go carries `//line` directives,
+so positions are the author's file rather than the compiler's — and what the
+values on either side of a failed comparison actually were.
+
+See [`code-examples/15 - Testing`](code-examples/15%20-%20Testing/cart.test.hive).
+
 ## How Hive maps onto Go
 
 Hive lowers to Go, and the Go toolchain turns that into the executable. You never
@@ -1734,10 +1887,16 @@ mappings worth knowing:
 | fields declared outside any variant     | appended to **every** variant struct                           |
 | `Str`, `Int`, `Float`, `Bool`, `Atom`   | `string`, `int`, `float64`, `bool`, `hive.Atom`                |
 | `Str[3]`, `Str[dyn]`, `Str[]`           | `[]string` — all three are slices, which is why [value semantics](#value-semantics-copy-on-binding) exist |
-| `mut`                                   | nothing at all: it is compile-time only                        |
+| `test "..." { }`                        | a `t.Run(...)` in a generated `main_test.go`, run by `go test` |
+| `assert c` (in ordinary code)           | `hive.Assert(c)` — a panic                                     |
+| `assert c` (inside a `test`)            | a recorded failure quoting `c` and, for a comparison, both sides |
+| `mut` (on a declaration)                | nothing at all: it is compile-time only                        |
 | `mut b = a` (both `mut`, owns storage)  | no variable — `b` compiles to `a`, so one slice header is shared |
 | `ys := xs` (needs a copy)               | a generated deep clone, chosen by the static type              |
 | `f(mutVec)` (argument names `mut` storage) | `f(hive.CloneVec(mutVec))` — copied in, so the callee's `T` really is immutable |
+| `p(v: mut T)` (a mutex parameter)       | `p(v *T)`, read and written through `(*v)`                      |
+| `p(mutVec)` (waited for)                | `p(&mutVec)` — the callee writes the caller's own storage       |
+| `async p(mutVec)` (fired off)           | `{ _a0 := hive.CloneVec(mutVec); go p(&_a0) }` — the thread gets its own |
 | `f(x)` / `async f(x)`                   | a plain call / `go f(x)`                                       |
 | `f(x) with timeout ms`                  | `hive.AwaitTimeout(hive.Spawn(..), ms)` → a `Result`           |
 | `await [f(a), f(b)]`                    | `hive.AwaitAll(..)` over one `hive.Spawn` each → a statically-sized vector |
@@ -1799,6 +1958,8 @@ src/hive/runtime.gleam    go.mod, the core Go `hive` runtime, and one Go
                           library plus the xlsx/ods readers
 src/hive/compiler.gleam   glue: source -> Go source, purity checks for funcs
 src/hive/cli.gleam        writes the Go project, drives the Go toolchain
+src/hive/testreport.gleam turns `go test` output and its coverage profile into
+                          the report `hive test` prints
 ```
 
 Run the tests with `gleam test` (they include compiling every shipped

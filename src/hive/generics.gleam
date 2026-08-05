@@ -128,7 +128,11 @@ fn run_rounds(
   // The module as it stands this round, so inference can see the signatures of
   // the instantiations already made.
   let staged =
-    ast.Module(module.imports, list.append(concrete, instantiated(wanted)))
+    ast.Module(
+      module.imports,
+      list.append(concrete, instantiated(wanted)),
+      module.origins,
+    )
   let env = codegen.module_env(staged)
 
   // Instantiated types are ordinary declarations from here on, so they must be
@@ -162,7 +166,11 @@ fn run_rounds(
     // A full round added nothing and left nothing unresolved: every call now
     // names a concrete callable.
     True, [] ->
-      Ok(ast.Module(module.imports, list.append(rewritten, inst_rewritten)))
+      Ok(ast.Module(
+        module.imports,
+        list.append(rewritten, inst_rewritten),
+        module.origins,
+      ))
     // Nothing new, but something still cannot be resolved — so it never will be.
     True, [why, ..] -> Error(why)
     False, _ ->
@@ -227,6 +235,8 @@ fn decl_name(d: ast.Decl) -> Option(String) {
     | ast.FuncDecl(name, _, _, _)
     | ast.QueryDecl(name, _, _, _)
     | ast.TypeDecl(name, _, _) -> Some(name)
+    // A test is named in prose and declares no name of its own.
+    ast.TestDecl(..) -> None
   }
 }
 
@@ -250,7 +260,9 @@ fn collect_generics(
           _ -> dict.insert(acc, name, Generic(d, vars))
         }
       }
-      ast.TypeDecl(..) -> acc
+      // A test has no signature, so it is never generic itself. Its *body* may
+      // still call something that is, which the body walk instantiates.
+      ast.TypeDecl(..) | ast.TestDecl(..) -> acc
     }
   })
 }
@@ -555,7 +567,9 @@ fn specialize_type(
   mangled: String,
   subst: Dict(String, ast.TypeExpr),
 ) -> ast.Decl {
-  let sub = fn(f: ast.Field) { ast.Field(f.name, substitute(subst, f.typ)) }
+  let sub = fn(f: ast.Field) {
+    ast.Field(f.name, substitute(subst, f.typ), f.mutable)
+  }
   case d {
     ast.TypeDecl(_, variants, commons) ->
       ast.TypeDecl(
@@ -635,6 +649,14 @@ fn walk_decl(
       use #(sql2, st2) <- result.try(walk_sql(st, benv, sql))
       Ok(#(ast.QueryDecl(name, params, ret, sql2), st2))
     }
+    // A test body is walked like a proc body with no signature, so a generic
+    // call made only from a test still gets its concrete copy emitted.
+    ast.TestDecl(name, body, file, line) -> {
+      let benv = codegen.fn_env(env, [], ast.TVoid)
+      let st = State(..st, ret_type: Some(ast.TVoid))
+      use #(body2, st2) <- result.try(walk_stmts(st, benv, body))
+      Ok(#(ast.TestDecl(name, body2, file, line), st2))
+    }
     ast.TypeDecl(name, variants, commons) -> {
       let #(variants, st) =
         list.fold(variants, #([], st), fn(acc, v) {
@@ -665,7 +687,7 @@ fn rewrite_fields(
   list.fold(fields, #([], st), fn(acc, f) {
     let #(seen, st) = acc
     let #(t2, st2) = rewrite_type(st, f.typ)
-    #([ast.Field(f.name, t2), ..seen], st2)
+    #([ast.Field(f.name, t2, f.mutable), ..seen], st2)
   })
   |> fn(acc) {
     let #(seen, st) = acc
@@ -729,9 +751,9 @@ fn walk_stmt(
       use #(e2, st2) <- result.try(walk_expr(st, env, e))
       Ok(#(ast.SEcho(e2), env, st2))
     }
-    ast.SAssert(e) -> {
+    ast.SAssert(e, line) -> {
       use #(e2, st2) <- result.try(walk_expr(st, env, e))
-      Ok(#(ast.SAssert(e2), env, st2))
+      Ok(#(ast.SAssert(e2, line), env, st2))
     }
     ast.SPanic(e) -> {
       use #(e2, st2) <- result.try(walk_expr(st, env, e))
@@ -1315,7 +1337,7 @@ fn decl_params(d: ast.Decl) -> List(ast.Field) {
     ast.ProcDecl(_, params, _, _)
     | ast.FuncDecl(_, params, _, _)
     | ast.QueryDecl(_, params, _, _) -> params
-    ast.TypeDecl(..) -> []
+    ast.TypeDecl(..) | ast.TestDecl(..) -> []
   }
 }
 
@@ -1329,7 +1351,9 @@ fn specialize(
   mangled: String,
   subst: Dict(String, ast.TypeExpr),
 ) -> ast.Decl {
-  let sub = fn(f: ast.Field) { ast.Field(f.name, substitute(subst, f.typ)) }
+  let sub = fn(f: ast.Field) {
+    ast.Field(f.name, substitute(subst, f.typ), f.mutable)
+  }
   case d {
     ast.ProcDecl(_, params, ret, body) ->
       ast.ProcDecl(
@@ -1352,7 +1376,9 @@ fn specialize(
         substitute(subst, ret),
         substitute_sql(subst, sql),
       )
-    ast.TypeDecl(..) -> d
+    // Only a declaration with a signature is ever specialized, and a test has
+    // none — so there is no copy of one to make.
+    ast.TypeDecl(..) | ast.TestDecl(..) -> d
   }
 }
 
@@ -1416,7 +1442,7 @@ fn substitute_stmt(
     ast.SReturn(value) ->
       ast.SReturn(option.map(value, substitute_expr(subst, _)))
     ast.SEcho(e) -> ast.SEcho(substitute_expr(subst, e))
-    ast.SAssert(e) -> ast.SAssert(substitute_expr(subst, e))
+    ast.SAssert(e, line) -> ast.SAssert(substitute_expr(subst, e), line)
     ast.SPanic(e) -> ast.SPanic(substitute_expr(subst, e))
     ast.SExpr(e) -> ast.SExpr(substitute_expr(subst, e))
     ast.SAsync(call) -> ast.SAsync(substitute_expr(subst, call))

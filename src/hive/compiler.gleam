@@ -4,7 +4,10 @@
 //// enforce:
 ////   * the proc/func split — a `func` may perform I/O (`echo`, `using`,
 ////     `hive.net`) just like a `proc`, but it may not call a `proc` (only
-////     procs call procs) and cannot receive a mutex as a parameter;
+////     procs call procs) and may not declare a mutex parameter (`v: mut T`),
+////     which only a `proc` can;
+////   * mutex parameters — the argument filling one must name storage its caller
+////     may write to, and a callable holding one cannot become a function value;
 ////   * mutability — only `mut` variables may be reassigned (`x = ...`,
 ////     `v[0] = ...`) or grown with `append`;
 ////   * the `hive.net` builtins — known member names, right arity, and a
@@ -31,13 +34,87 @@ import hive/modules
 
 /// Compile the program rooted at `entry` — a path to a `.hive` file — into the
 /// contents of the generated `main.go`, resolving its `import` graph first.
+///
+/// This is the path something is going to *run*, so the program needs a `main`.
 pub fn compile_file(entry: String) -> Result(String, String) {
+  compile_entry(entry, True)
+}
+
+/// Run every check on `entry` and throw the generated Go away.
+///
+/// Unlike `compile_file` this asks for no entrypoint: a file holding only tests,
+/// or only declarations for something else to import, is a perfectly good file
+/// and an editor asking "is this good?" should be told so.
+pub fn check_file(entry: String) -> Result(Nil, String) {
+  compile_entry(entry, False) |> result.map(fn(_) { Nil })
+}
+
+fn compile_entry(entry: String, needs_main: Bool) -> Result(String, String) {
   // `load`'s errors already carry the file and line they happened on; the passes
   // `finish` runs work on a flattened module whose nodes carry no positions, so
   // theirs are reported against the entrypoint as a whole.
   use module <- result.try(modules.load(entry))
-  finish(module)
+  finish(module, needs_main)
   |> result.map_error(diagnostic.whole_file(entry, _))
+}
+
+/// Everything `hive test` needs from the compiler: the program, its tests, and
+/// the table that maps a flattened declaration name back to how it was written.
+pub type TestBuild {
+  TestBuild(
+    main_go: String,
+    test_go: String,
+    /// Flat name -> the name and file the author wrote, for reporting coverage
+    /// in the program's own terms.
+    origins: Dict(String, ast.Origin),
+    /// The tests, in declaration order — which is the order they run in.
+    test_names: List(String),
+  )
+}
+
+/// Compile the program rooted at `entry` for `hive test`: the same `main.go` a
+/// build would produce, minus the tests, plus the `main_test.go` holding them.
+///
+/// A program with no tests is an error rather than an empty run: `hive test` was
+/// asked to do something, and there is nothing it could have done.
+pub fn compile_tests_file(entry: String) -> Result(TestBuild, String) {
+  use module <- result.try(modules.load(entry))
+  use module <- result.try(
+    generics.expand(module)
+    |> result.map_error(diagnostic.whole_file(entry, _)),
+  )
+  use build <- result.try(
+    finish_tests(module)
+    |> result.map_error(diagnostic.whole_file(entry, _)),
+  )
+  Ok(build)
+}
+
+fn finish_tests(module: ast.Module) -> Result(TestBuild, String) {
+  use _ <- result.try(check(module, False))
+  use _ <- result.try(codegen.check_types(module))
+  use _ <- result.try(bounds.check(module))
+  case codegen.generate_tests(module) {
+    Some(test_go) ->
+      Ok(TestBuild(
+        codegen.generate(module),
+        test_go,
+        module.origins,
+        list.filter_map(tests_of(module), fn(d) {
+          case d {
+            ast.TestDecl(name, _, _, _) -> Ok(name)
+            _ -> Error(Nil)
+          }
+        }),
+      ))
+    None ->
+      Error(
+        "this program declares no tests. A test is a top-level declaration of "
+        <> "its own:\n\n    test \"an empty cart costs nothing\" {\n        assert "
+        <> "total([]) == 0\n    }\n\nWrite one beside the code it is about, or in "
+        <> "a file that imports it.",
+      )
+  }
 }
 
 /// Compile Hive source held in memory into the contents of the generated
@@ -45,18 +122,28 @@ pub fn compile_file(entry: String) -> Result(String, String) {
 /// directory, since the source itself has no location of its own.
 pub fn compile(source: String) -> Result(String, String) {
   use module <- result.try(modules.load_source(source, ".", "the source"))
-  finish(module)
+  finish(module, True)
   |> result.map_error(diagnostic.whole_file("the source", _))
+}
+
+/// Run every check on in-memory source and throw the generated Go away — the
+/// counterpart of `check_file`, and like it, content with a file that holds only
+/// tests or only declarations to import.
+pub fn check_source(source: String) -> Result(Nil, String) {
+  use module <- result.try(modules.load_source(source, ".", "the source"))
+  finish(module, False)
+  |> result.map_error(diagnostic.whole_file("the source", _))
+  |> result.map(fn(_) { Nil })
 }
 
 // Everything past import resolution, which works on one flat module and so does
 // not care how many files it came from.
-fn finish(module: ast.Module) -> Result(String, String) {
+fn finish(module: ast.Module, needs_main: Bool) -> Result(String, String) {
   // Generic callables are resolved into concrete ones first, so every pass
   // after this one sees ordinary declarations and checks each instantiation on
   // its own terms.
   use module <- result.try(generics.expand(module))
-  use _ <- result.try(check(module))
+  use _ <- result.try(check(module, needs_main))
   use _ <- result.try(codegen.check_types(module))
   use _ <- result.try(bounds.check(module))
   Ok(codegen.generate(module))
@@ -94,8 +181,15 @@ type Ctx {
   )
 }
 
-fn check(module: ast.Module) -> Result(Nil, String) {
-  use _ <- result.try(check_has_main(module))
+fn check(module: ast.Module, needs_main: Bool) -> Result(Nil, String) {
+  use _ <- result.try(case needs_main {
+    True -> check_has_main(module)
+    // `hive check` and `hive test` are both happy with a file that only holds
+    // tests, or only declarations something else imports. Only something that
+    // has to *run* needs somewhere to start.
+    False -> Ok(Nil)
+  })
+  use _ <- result.try(check_test_names(module))
   use _ <- result.try(check_decl_types(module.decls))
   let procs =
     list.fold(module.decls, dict.new(), fn(acc, d) {
@@ -112,7 +206,7 @@ fn check(module: ast.Module) -> Result(Nil, String) {
         | ast.FuncDecl(name, params, _, _)
         | ast.QueryDecl(name, params, _, _) ->
           dict.insert(acc, name, list.map(params, fn(p) { p.name }))
-        ast.TypeDecl(..) -> acc
+        ast.TypeDecl(..) | ast.TestDecl(..) -> acc
       }
     })
   let fn_params =
@@ -121,7 +215,7 @@ fn check(module: ast.Module) -> Result(Nil, String) {
         ast.ProcDecl(name, params, _, _)
         | ast.FuncDecl(name, params, _, _)
         | ast.QueryDecl(name, params, _, _) -> dict.insert(acc, name, params)
-        ast.TypeDecl(..) -> acc
+        ast.TypeDecl(..) | ast.TestDecl(..) -> acc
       }
     })
   let types =
@@ -140,24 +234,29 @@ fn check(module: ast.Module) -> Result(Nil, String) {
     })
   list.try_fold(module.decls, Nil, fn(_, d) {
     case d {
-      ast.ProcDecl(name, _, ret, body) -> {
+      ast.ProcDecl(name, params, ret, body) -> {
         use _ <- result.try(check_body(
           Ctx(name, False, procs, callables, types, False, fn_params, queries),
+          params,
           body,
         ))
         check_returns(types, name, ret, body)
       }
       // A `func` may perform I/O (echo, using, hive.net, ...) just like a
-      // `proc`. Its two restrictions — no mutex parameters, no calling procs —
-      // are what `in_func` marks.
-      ast.FuncDecl(name, _, ret, body) -> {
+      // `proc`. Of its two restrictions, `in_func` marks the one that is about
+      // the body — no calling procs; the other is about the signature and is
+      // checked straight off the parameter list.
+      ast.FuncDecl(name, params, ret, body) -> {
+        use _ <- result.try(check_pure_params("func", name, params))
         use _ <- result.try(check_body(
           Ctx(name, True, procs, callables, types, False, fn_params, queries),
+          params,
           body,
         ))
         check_returns(types, name, ret, body)
       }
-      ast.QueryDecl(name, _, _, sql) ->
+      ast.QueryDecl(name, params, _, sql) -> {
+        use _ <- result.try(check_pure_params("query", name, params))
         // A query is a func whose body is inline SQL; every expression in it —
         // an interpolated value or a `where` predicate's condition — is walked
         // with the same func restrictions.
@@ -168,10 +267,82 @@ fn check(module: ast.Module) -> Result(Nil, String) {
           )
         })
         |> result.map(fn(_) { Nil })
+      }
+      // A test body is a proc body: it may call procs and perform I/O, it takes
+      // no parameters, and there is nothing for it to return. `assert` inside it
+      // means something different from `assert` anywhere else — see codegen —
+      // but nothing about *checking* the body changes.
+      ast.TestDecl(name, body, _, _) -> {
+        let owner = "test `" <> name <> "`"
+        use _ <- result.try(check_body(
+          Ctx(owner, False, procs, callables, types, False, fn_params, queries),
+          [],
+          body,
+        ))
+        check_test_returns(owner, body)
+      }
       ast.TypeDecl(..) -> Ok(Nil)
     }
   })
   |> result.map(fn(_) { Nil })
+}
+
+// A test answers to nobody, so `return value` inside one has nowhere to put the
+// value. A bare `return` is fine: it leaves the test early, which is an ordinary
+// thing to want after a check that has already failed.
+fn check_test_returns(owner: String, body: List(ast.Stmt)) -> Result(Nil, String) {
+  case list.any(body, returns_a_value) {
+    False -> Ok(Nil)
+    True ->
+      Error(
+        owner
+        <> " cannot return a value: a test is run, not called, so there is "
+        <> "nobody to hand one to. Use `assert` to say what should be true, or a "
+        <> "bare `return` to leave the test early.",
+      )
+  }
+}
+
+fn returns_a_value(s: ast.Stmt) -> Bool {
+  case s {
+    ast.SReturn(Some(_)) -> True
+    ast.SReturn(None) -> False
+    ast.SIf(branches, else_body) ->
+      list.any(branches, fn(b) { list.any(b.body, returns_a_value) })
+      || list.any(option.unwrap(else_body, []), returns_a_value)
+    ast.SFor(_, _, _, body) | ast.SForEach(_, _, _, body) ->
+      list.any(body, returns_a_value)
+    _ -> False
+  }
+}
+
+// Only a `proc` may take a mutex. Holding one is permission to write through it,
+// and writing through it is the side effect a `func` is the absence of — a walk
+// says nothing about the order its function runs in or how often, and neither
+// does a `query`'s SQL. A `func` may still be *passed* a `mut` value; it just
+// sees the immutable `T` underneath, which is the whole of what it promises.
+fn check_pure_params(
+  what: String,
+  owner: String,
+  params: List(ast.Field),
+) -> Result(Nil, String) {
+  case list.find(params, fn(p) { p.mutable }) {
+    Error(_) -> Ok(Nil)
+    Ok(p) ->
+      Error(
+        what
+        <> " `"
+        <> owner
+        <> "` cannot receive a mutex: `"
+        <> p.name
+        <> ": mut ...` would let it write to storage its caller can still see, "
+        <> "and that is the side effect a "
+        <> what
+        <> " is the absence of. Make it a `proc`, or take the value (`"
+        <> p.name
+        <> ": ...`) and hand back a new one.",
+      )
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +400,8 @@ fn check_decl_types(decls: List(ast.Decl)) -> Result(Nil, String) {
           check_sized(f.typ, "field `" <> f.name <> "` of type `" <> name <> "`")
         })
       }
+      // A test has no signature, so there is no type written in its declaration.
+      ast.TestDecl(..) -> Ok(Nil)
     }
   })
   |> result.map(fn(_) { Nil })
@@ -523,6 +696,9 @@ fn is_word_char(c: String) -> Bool {
 // that name through import flattening, so a module meant to be imported has
 // none — and building one directly would otherwise fail as a Go linker error
 // rather than something an author can act on.
+// What a program needs to be run: somewhere to start. A file holding only tests
+// is not one, which is why `hive build` and `hive run` ask for this and
+// `hive check` and `hive test` do not.
 fn check_has_main(module: ast.Module) -> Result(Nil, String) {
   let has_main =
     list.any(module.decls, fn(d) {
@@ -534,16 +710,89 @@ fn check_has_main(module: ast.Module) -> Result(Nil, String) {
   case has_main {
     True -> Ok(Nil)
     False ->
+      case tests_of(module) {
+        // Tests but no `main`: this is a test file, and the mistake is the verb.
+        [_, ..] ->
+          Error(
+            "this file holds tests and no `proc main(): void`, so there is "
+            <> "nothing here to run — run its tests instead:\n\n    hive test "
+            <> "<this file>",
+          )
+        [] ->
+          Error(
+            "this program has no entrypoint: it needs a `proc main(): void`. (A "
+            <> "module written to be imported by another file has none — build "
+            <> "the file with `main` in it instead.)",
+          )
+      }
+  }
+}
+
+/// Every test in the program, in declaration order.
+///
+/// Flattening merges the whole import graph into one module, so this is every
+/// test in every file the entrypoint reaches — which is what makes `hive test`
+/// on a program run its tests wherever they were written.
+pub fn tests_of(module: ast.Module) -> List(ast.Decl) {
+  list.filter(module.decls, fn(d) {
+    case d {
+      ast.TestDecl(..) -> True
+      _ -> False
+    }
+  })
+}
+
+// Two tests with the same name would be indistinguishable in the output, and the
+// name is the only thing identifying one — there is no declaration to look up.
+fn check_test_names(module: ast.Module) -> Result(Nil, String) {
+  let names =
+    list.filter_map(module.decls, fn(d) {
+      case d {
+        ast.TestDecl(name, _, _, _) -> Ok(name)
+        _ -> Error(Nil)
+      }
+    })
+  case first_repeat(names, []) {
+    None -> Ok(Nil)
+    Some(name) ->
       Error(
-        "this program has no entrypoint: it needs a `proc main(): void`. (A "
-        <> "module written to be imported by another file has none — build the "
-        <> "file with `main` in it instead.)",
+        "two tests are both named \""
+        <> name
+        <> "\". A test's name is the only thing that identifies it in the "
+        <> "output, so each one has to say something different.",
       )
   }
 }
 
-fn check_body(ctx: Ctx, stmts: List(ast.Stmt)) -> Result(Nil, String) {
-  check_stmts(ctx, stmts, dict.new())
+fn first_repeat(names: List(String), seen: List(String)) -> Option(String) {
+  case names {
+    [] -> None
+    [n, ..rest] ->
+      case list.contains(seen, n) {
+        True -> Some(n)
+        False -> first_repeat(rest, [n, ..seen])
+      }
+  }
+}
+
+// A body starts with its parameters already in scope. An ordinary one is an
+// immutable binding and so is absent from `muts`, which is what makes assigning
+// to it an error; a `mut` one is the caller's mutex and permits everything a
+// `mut` local does, `append` included when the type it was declared with is
+// `[dyn]`.
+fn check_body(
+  ctx: Ctx,
+  params: List(ast.Field),
+  stmts: List(ast.Stmt),
+) -> Result(Nil, String) {
+  let muts =
+    list.fold(params, dict.new(), fn(acc, p) {
+      case p.mutable {
+        True -> dict.insert(acc, p.name, Binding(True, declared_grow(p.typ)))
+        False -> acc
+      }
+    })
+  check_stmts(ctx, stmts, muts)
   |> result.map(fn(_) { Nil })
 }
 
@@ -632,7 +881,7 @@ fn check_stmt(
       use _ <- result.try(check_expr(ctx, e))
       Ok(muts)
     }
-    ast.SAssert(e) -> {
+    ast.SAssert(e, _) -> {
       use _ <- result.try(check_expr(ctx, e))
       Ok(muts)
     }
@@ -764,7 +1013,7 @@ fn stmt_terminates(types: Dict(String, ast.Decl), s: ast.Stmt) -> Bool {
     ast.SReturn(_) -> True
     // `assert` and `panic` both stop the path here, so a branch ending in
     // either is a terminating path.
-    ast.SAssert(_) | ast.SPanic(_) -> True
+    ast.SAssert(_, _) | ast.SPanic(_) -> True
     ast.SIf(branches, else_body) -> {
       let all_return =
         list.all(branches, fn(b) { terminates(types, b.body) })
@@ -1188,6 +1437,10 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
           }
       })
       use _ <- result.try(check_fn_arg_purity(ctx, name, args))
+      use _ <- result.try(case has_placeholder(args) {
+        True -> check_no_mutex_param(ctx, name, "a partial application of")
+        False -> Ok(Nil)
+      })
       check_args(ctx, args)
     }
     ast.ECall(callee, args) -> {
@@ -1199,8 +1452,10 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
     | ast.EFloat(_)
     | ast.EString(_)
     | ast.EBool(_)
-    | ast.EAtom(_)
-    | ast.EIdent(_) -> Ok(Nil)
+    | ast.EAtom(_) -> Ok(Nil)
+    // A bare name here is the callable used as a *value*. (A call spells its own
+    // arm above and never reaches this one.)
+    ast.EIdent(name) -> check_no_mutex_param(ctx, name, "a reference to")
     ast.EInterp(parts) ->
       list.try_fold(parts, Nil, fn(_, p) {
         case p {
@@ -1278,6 +1533,44 @@ fn check_fn_arg_purity(
       |> result.map(fn(_) { Nil })
     }
     _, _ -> Ok(Nil)
+  }
+}
+
+// A mutex parameter is a promise about the *call site*: the argument names
+// storage the caller can still see, and whether the call is waited for decides
+// whether the callee shares that storage or a copy of it. A function value keeps
+// neither. It outlives the scope that built it, so there is no caller left to
+// point at, and it is called from wherever it ends up — a position that never
+// said which of the two it wanted. So the two shapes that turn a callable into a
+// value are named here rather than lowered: `f` on its own, and `f(1, _)`.
+fn check_no_mutex_param(
+  ctx: Ctx,
+  name: String,
+  how: String,
+) -> Result(Nil, String) {
+  case dict.get(ctx.fn_params, name) {
+    Error(_) -> Ok(Nil)
+    Ok(params) ->
+      case list.find(params, fn(p) { p.mutable }) {
+        Error(_) -> Ok(Nil)
+        Ok(p) ->
+          Error(
+            how
+            <> " `"
+            <> name
+            <> "` cannot be a value: its `"
+            <> p.name
+            <> "` parameter is a mutex, and a function value has no call site to "
+            <> "take one from — it is called from wherever it is stored, long "
+            <> "after the storage `"
+            <> p.name
+            <> "` would have named. Call `"
+            <> name
+            <> "` where the mutex is, or give it a plain `"
+            <> p.name
+            <> ": ...` parameter and hand back what it produced.",
+          )
+      }
   }
 }
 
@@ -1864,7 +2157,25 @@ fn check_handler(
     ast.ECall(..) -> Ok(Nil)
     ast.EIdent(name) ->
       case dict.get(ctx.procs, name) {
-        Ok(#([ast.Field(_, got_param)], got_ret)) ->
+        // A server calls its handler on a connection of its own, so there is no
+        // caller to hand a mutex to — and nothing it could point at that would
+        // still be there by the time the handler runs.
+        Ok(#([ast.Field(pname, _, True)], _)) ->
+          Error(
+            "proc `"
+            <> name
+            <> "` cannot be used as a `hive.net."
+            <> fname
+            <> "` handler: its `"
+            <> pname
+            <> "` parameter is a mutex. A server calls the handler itself, on a "
+            <> "request it built, so there is no caller whose storage `"
+            <> pname
+            <> "` could name. Take the value (`"
+            <> pname
+            <> ": ...`) and hand back what you want done with it.",
+          )
+        Ok(#([ast.Field(_, got_param, False)], got_ret)) ->
           case
             is_hive_type(got_param, param) && returns_hive_type(got_ret, ret)
           {

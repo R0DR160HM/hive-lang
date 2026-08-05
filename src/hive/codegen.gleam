@@ -233,6 +233,16 @@ pub type Env {
     /// callable that are not visible from its signature — such as whether a
     /// service handler ever lets its envelope outlive the turn it arrived in.
     bodies: Dict(String, List(ast.Stmt)),
+    /// The `.hive` file being generated *as a test*, when that is what is being
+    /// generated. Present only while walking a `test` body, and it carries the
+    /// file name because that is what a failure has to be reported against —
+    /// which is also what makes it the flag for "an `assert` here records a
+    /// failure rather than stopping the program".
+    test_file: Option(String),
+    /// Flat declaration name -> how the author wrote it. Only needed where
+    /// generated *text* names a declaration back to them — which is a failed
+    /// `assert`, quoting the condition that did not hold.
+    origins: Dict(String, ast.Origin),
   )
 }
 
@@ -260,6 +270,8 @@ pub fn module_env(module: ast.Module) -> Env {
     fns,
     collect_mailboxes(module, fns),
     collect_bodies(module.decls),
+    None,
+    module.origins,
   )
 }
 
@@ -307,7 +319,9 @@ pub fn generate(module: ast.Module) -> String {
           Ok(gen_fn_decl(env, name, params, ret, body))
         ast.QueryDecl(name, params, ret, sql) ->
           Ok(gen_query_decl(env, name, params, ret, sql))
-        ast.TypeDecl(..) -> Error(Nil)
+        // A test is not part of the program. It is emitted into its own file by
+        // `generate_tests`, which is compiled only by `hive test`.
+        ast.TypeDecl(..) | ast.TestDecl(..) -> Error(Nil)
       }
     })
     |> string.join("\n")
@@ -333,6 +347,274 @@ pub fn generate(module: ast.Module) -> String {
     <> fn_code
   gen_header(body) <> "\n" <> body
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+// A program's tests are generated into a file of their own, compiled only by
+// `hive test`. It is the same Go package as `main.go`, which is what lets a test
+// reach every proc, func and type the program declares without any of them being
+// exported, or named, or otherwise made testable on purpose.
+//
+// The runner is Go's own. `go test` already isolates each test, keeps going after
+// a failure, filters by name, times what it ran and reports coverage — so nothing
+// here implements any of that. What this file *does* add is the two things a
+// runner cannot know and a compiler can: which `.hive` line a failure belongs to
+// (via `//line`, so the position is the author's file rather than this generated
+// one), and what the values on either side of a failed comparison actually were.
+
+/// The contents of the generated `main_test.go`, or `None` when the program has
+/// no tests.
+pub fn generate_tests(module: ast.Module) -> Option(String) {
+  let env = module_env(module)
+  let tests =
+    module.decls
+    |> list.filter_map(fn(d) {
+      case d {
+        ast.TestDecl(name, body, file, line) ->
+          Ok(gen_test(env, name, body, file, line))
+        _ -> Error(Nil)
+      }
+    })
+  case tests {
+    [] -> None
+    _ -> {
+      let body =
+        test_helpers
+        <> "\nfunc TestHive(t *testing.T) {\n"
+        <> string.concat(tests)
+        <> "}\n"
+      Some(gen_test_header(body) <> "\n" <> body)
+    }
+  }
+}
+
+// One test: a subtest named the way the author named it, and a `recover` so that
+// a test which panics is a test that failed rather than a suite that stopped.
+// Go's own runner re-panics and aborts the binary, which would let one broken
+// test hide every result after it.
+fn gen_test(
+  env: Env,
+  name: String,
+  body: List(ast.Stmt),
+  file: String,
+  line: Int,
+) -> String {
+  let env = Env(..fn_env(env, [], ast.TVoid), test_file: Some(file))
+  "\tt.Run("
+  <> gen_string_lit(name)
+  <> ", func(t *testing.T) {\n"
+  <> "\t\tdefer hiveTestRecover(t)\n"
+  <> at_line(file, line)
+  <> gen_stmts(env, body, 2)
+  <> "\t})\n"
+}
+
+// `assert` inside a test. The condition is rendered once for Go to evaluate and
+// once as the source the author wrote, and a comparison also hands over both
+// sides — a bare "assertion failed" is the one thing every test framework is
+// judged on and the one thing a library cannot improve without reflection.
+fn gen_test_assert(
+  env: Env,
+  cond: ast.Expr,
+  line: Int,
+  file: String,
+  pad: String,
+) -> String {
+  let #(rendered, _) = gen_condition(env, cond)
+  let source = gen_string_lit(unwrapped(as_written(env, file, cond)))
+  let call = case cond {
+    // Only a comparison has two sides worth showing. `&&`/`||` do not: the
+    // interesting values are further in, and printing the operands of an `and`
+    // as `true`/`false` says nothing the condition did not already say.
+    ast.EBinary(op, left, right) ->
+      case is_comparison(op) {
+        True ->
+          "hiveTestAssertCmp(t, "
+          <> rendered
+          <> ", "
+          <> source
+          <> ", hive.Show("
+          <> gen_expr(env, left)
+          <> "), hive.Show("
+          <> gen_expr(env, right)
+          <> "))"
+        False -> "hiveTestAssert(t, " <> rendered <> ", " <> source <> ")"
+      }
+    _ -> "hiveTestAssert(t, " <> rendered <> ", " <> source <> ")"
+  }
+  at_line(file, line) <> pad <> call <> "\n"
+}
+
+// An assert's condition, as source. `show_expr` parenthesises every binary
+// operation because the tree no longer says which parentheses were written; at
+// the very top there is nothing to disambiguate against, so they only add noise.
+fn unwrapped(e: ast.Expr) -> String {
+  case e {
+    ast.EBinary(op, l, r) ->
+      ast.show_expr(l) <> " " <> show_binop(op) <> " " <> ast.show_expr(r)
+    _ -> ast.show_expr(e)
+  }
+}
+
+fn show_binop(op: ast.BinOp) -> String {
+  // `show_expr` of a two-sided expression is the operator with its operands, so
+  // this reads the operator back out of it rather than repeating the table.
+  let rendered = ast.show_expr(ast.EBinary(op, ast.EIdent("_"), ast.EIdent("_")))
+  rendered
+  |> string.drop_start(3)
+  |> string.drop_end(3)
+}
+
+// The condition with every flattened name put back the way it was written.
+//
+// Imports are merged away long before codegen — `cart.total` is `cart_0_total` by
+// the time anything here sees it — and quoting that back at someone would show
+// them a name they never typed. A declaration from another file is re-qualified
+// with that file's base name, which is the alias an `import` gives it unless the
+// author renamed it.
+fn as_written(env: Env, here: String, e: ast.Expr) -> ast.Expr {
+  case e {
+    // A bare call to a global builtin was rewritten to `hive.len` during import
+    // flattening, so that every pass after it reads one answer. Quoting that back
+    // would show a spelling the author only needs when they have taken the name
+    // for something of their own.
+    ast.EMember(ast.EIdent("hive"), name) ->
+      case builtins.is_global(name) {
+        True -> ast.EIdent(name)
+        False -> e
+      }
+    ast.EIdent(name) ->
+      case dict.get(env.origins, name) {
+        Ok(ast.Origin(written, file)) if file == here -> ast.EIdent(written)
+        Ok(ast.Origin(written, file)) ->
+          ast.EIdent(module_alias(file) <> "." <> written)
+        Error(_) -> e
+      }
+    ast.EVector(items) -> ast.EVector(list.map(items, as_written(env, here, _)))
+    ast.EMember(target, field) ->
+      ast.EMember(as_written(env, here, target), field)
+    ast.ECall(callee, args) ->
+      ast.ECall(
+        as_written(env, here, callee),
+        list.map(args, fn(a) { ast.Arg(a.name, as_written(env, here, a.value)) }),
+      )
+    ast.EIndex(target, index) ->
+      ast.EIndex(as_written(env, here, target), as_written(env, here, index))
+    ast.ESlice(target, low, high) ->
+      ast.ESlice(
+        as_written(env, here, target),
+        option.map(low, as_written(env, here, _)),
+        option.map(high, as_written(env, here, _)),
+      )
+    ast.EBinary(op, l, r) ->
+      ast.EBinary(op, as_written(env, here, l), as_written(env, here, r))
+    ast.EIs(subject, pattern) ->
+      ast.EIs(as_written(env, here, subject), pattern)
+    ast.EWith(value, typ) -> ast.EWith(as_written(env, here, value), typ)
+    ast.ETimed(call, ms) ->
+      ast.ETimed(as_written(env, here, call), as_written(env, here, ms))
+    ast.EAwait(calls, timeout) ->
+      ast.EAwait(
+        list.map(calls, as_written(env, here, _)),
+        option.map(timeout, as_written(env, here, _)),
+      )
+    ast.EInterp(parts) ->
+      ast.EInterp(
+        list.map(parts, fn(p) {
+          case p {
+            ast.IExpr(inner) -> ast.IExpr(as_written(env, here, inner))
+            ast.ILit(_) -> p
+          }
+        }),
+      )
+    ast.EUsing(source, kind) -> ast.EUsing(as_written(env, here, source), kind)
+    ast.EInt(_)
+    | ast.EFloat(_)
+    | ast.EString(_)
+    | ast.EBool(_)
+    | ast.EAtom(_) -> e
+  }
+}
+
+// A file path reduced to the name an `import` of it defaults to: its base name
+// without the extension, and without a `.test`-style qualifier getting in the way.
+fn module_alias(file: String) -> String {
+  file
+  |> string.split("/")
+  |> list.last
+  |> result.unwrap(file)
+  |> string.split(".")
+  |> list.first
+  |> result.unwrap(file)
+}
+
+fn is_comparison(op: ast.BinOp) -> Bool {
+  case op {
+    ast.OpEq | ast.OpNeq | ast.OpGt | ast.OpLt | ast.OpGe | ast.OpLe -> True
+    _ -> False
+  }
+}
+
+// A `//line` directive, which makes the Go compiler and everything reading its
+// position information — a test failure, a panic, the coverage profile — report
+// the `.hive` file instead of the generated one. It has to start at column 1 to
+// be a directive at all, and it names the line *after* itself, so it goes
+// immediately before the statement it belongs to.
+fn at_line(file: String, line: Int) -> String {
+  case file {
+    "" -> ""
+    _ -> "//line " <> file <> ":" <> int.to_string(line) <> "\n"
+  }
+}
+
+// The `testing` import is unconditional (this file is one long test function),
+// and `hive` is needed by every failure that shows a value.
+fn gen_test_header(body: String) -> String {
+  let imports =
+    list.flatten([
+      ["\t\"testing\""],
+      case string.contains(body, "fmt.") {
+        True -> ["\t\"fmt\""]
+        False -> []
+      },
+      case string.contains(body, "hive.") {
+        True -> ["\t\"" <> runtime.go_module <> "/hive\""]
+        False -> []
+      },
+    ])
+  "package main\n\nimport (\n" <> string.join(imports, "\n") <> "\n)\n"
+}
+
+// `t.Helper()` is what makes a failure point at the `assert` rather than at these
+// few lines: it tells Go's runner to report the caller's position, and the caller
+// is preceded by a `//line` naming the author's file.
+const test_helpers = "
+func hiveTestAssert(t *testing.T, ok bool, source string) {
+	t.Helper()
+	if !ok {
+		t.Errorf(\"assert %s\", source)
+	}
+}
+
+func hiveTestAssertCmp(t *testing.T, ok bool, source, left, right string) {
+	t.Helper()
+	if !ok {
+		t.Errorf(\"assert %s\\n  left:  %s\\n  right: %s\", source, left, right)
+	}
+}
+
+// A panic is this test failing, not the suite ending.
+//
+// Where it came from is not reported: the only position available is a line of
+// generated Go, and a location the reader cannot open is worse than none. What
+// panicked is in the message, and which test was running is in the report.
+func hiveTestRecover(t *testing.T) {
+	if r := recover(); r != nil {
+		t.Errorf(\"panicked: %v\", r)
+	}
+}
+"
 
 // ---------------------------------------------------------------------------
 // Checks that need the inferred type of an expression
@@ -361,6 +643,10 @@ pub fn check_types(module: ast.Module) -> Result(Nil, String) {
         })
         |> result.map(fn(_) { Nil })
       }
+      // A test body is a proc body that takes nothing and returns nothing.
+      ast.TestDecl(_, body, _, _) ->
+        walk_stmts(fn_env(env, [], ast.TVoid), body)
+        |> result.map(fn(_) { Nil })
       ast.TypeDecl(..) -> Ok(Nil)
     }
   })
@@ -405,7 +691,7 @@ fn walk_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
       use _ <- result.try(walk_expr(env, value))
       Ok(env)
     }
-    ast.SAssert(e) -> {
+    ast.SAssert(e, _) -> {
       use _ <- result.try(walk_expr(env, e))
       use _ <- result.try(check_condition(env, e))
       Ok(env)
@@ -511,6 +797,7 @@ fn walk_expr(env: Env, e: ast.Expr) -> Result(Nil, String) {
   use _ <- result.try(check_address_call(env, e))
   use _ <- result.try(check_walk_call(env, e))
   use _ <- result.try(check_sort_call(env, e))
+  use _ <- result.try(check_mut_args(env, e))
   case e {
     ast.EInt(_)
     | ast.EFloat(_)
@@ -545,6 +832,74 @@ fn walk_expr(env: Env, e: ast.Expr) -> Result(Nil, String) {
       use _ <- result.try(check_timed(env, call))
       walk_exprs(env, [call, ms])
     }
+  }
+}
+
+// A mutex parameter is filled with the caller's own storage, so the argument has
+// to *be* storage the caller may write to: a `mut` variable, or a path into one.
+// Neither half is a formality. Without an lvalue there is no address to hand over
+// and nothing for a write in the callee to land on; without `mut` the caller has
+// promised the opposite of what it is being asked for, and one of the two names
+// for that storage would be able to change it while the other believes nothing
+// can.
+//
+// The rule does not soften for `async`, which copies the argument in and writes
+// only to the copy. `mut` is written on the declaration, and what the declaration
+// asks for should not depend on how far away the call site happens to be — a call
+// that compiles waited-for should compile fired-off, and the other way round.
+fn check_mut_args(env: Env, e: ast.Expr) -> Result(Nil, String) {
+  case e {
+    ast.ECall(ast.EIdent(fname) as callee, args) -> {
+      let by_index = list.index_map(args, fn(a, i) { #(i, a.value) })
+      list.try_fold(mut_arg_slots(env, callee, args), Nil, fn(_, slot) {
+        let #(i, pname) = slot
+        case list.key_find(by_index, i) {
+          Error(_) -> Ok(Nil)
+          Ok(value) ->
+            case aliases_storage(value), source_mutable(env, value) {
+              True, True -> Ok(Nil)
+              False, _ ->
+                Error(
+                  "the `"
+                  <> pname
+                  <> "` parameter of `"
+                  <> fname
+                  <> "` is a mutex, so it takes the caller's own storage — and "
+                  <> "this argument is a value, which is nobody's. Bind it first "
+                  <> "(`mut ... = ...`) and pass the name, or give `"
+                  <> pname
+                  <> "` a plain type and let it return what it made.",
+                )
+              True, False ->
+                Error(
+                  "the `"
+                  <> pname
+                  <> "` parameter of `"
+                  <> fname
+                  <> "` is a mutex, and `"
+                  <> root_name(value)
+                  <> "` is immutable — passing it would hand `"
+                  <> fname
+                  <> "` a write to storage its owner believes nothing can change. "
+                  <> "Declare `"
+                  <> root_name(value)
+                  <> "` with `mut`, or call a version of `"
+                  <> fname
+                  <> "` that takes the value.",
+                )
+            }
+        }
+      })
+      |> result.map(fn(_) { Nil })
+    }
+    _ -> Ok(Nil)
+  }
+}
+
+fn root_name(e: ast.Expr) -> String {
+  case expr_root(e) {
+    Some(n) -> n
+    None -> "this argument"
   }
 }
 
@@ -1388,7 +1743,7 @@ fn escapes_in_stmt(name: String, s: ast.Stmt) -> Bool {
       escapes_in_expr(name, target) || escapes_in_expr(name, value)
     ast.SReturn(Some(e)) -> escapes_in_expr(name, e)
     ast.SReturn(None) | ast.SBreak | ast.SContinue -> False
-    ast.SEcho(e) | ast.SAssert(e) | ast.SPanic(e) | ast.SExpr(e) | ast.SAsync(e) ->
+    ast.SEcho(e) | ast.SAssert(e, _) | ast.SPanic(e) | ast.SExpr(e) | ast.SAsync(e) ->
       escapes_in_expr(name, e)
     ast.SIf(branches, else_body) ->
       list.any(branches, fn(b) {
@@ -1526,7 +1881,7 @@ fn mailboxes_in_stmts(
           Some(msg) -> #(dict.insert(sp, name, msg), fd)
           None -> #(sp, register_in_expr(value, fns, sp, fd))
         }
-      ast.SExpr(e) | ast.SEcho(e) | ast.SAssert(e) | ast.SPanic(e) | ast.SAsync(e) -> #(
+      ast.SExpr(e) | ast.SEcho(e) | ast.SAssert(e, _) | ast.SPanic(e) | ast.SAsync(e) -> #(
         sp,
         register_in_expr(e, fns, sp, fd),
       )
@@ -1689,6 +2044,9 @@ fn uses_json_module(module: ast.Module) -> Bool {
         uses_json_stmts(body)
       ast.QueryDecl(_, _, _, sql) ->
         list.any(ast.sql_exprs(sql), uses_json_expr)
+      // The generated helpers live in `main.go`, and the test file is the same
+      // Go package, so a test reaching for JSON needs them emitted too.
+      ast.TestDecl(_, body, _, _) -> uses_json_stmts(body)
       ast.TypeDecl(..) -> False
     }
   })
@@ -1704,7 +2062,7 @@ fn uses_json_stmts(stmts: List(ast.Stmt)) -> Bool {
       ast.SReturn(None) -> False
       ast.SReturn(Some(e)) -> uses_json_expr(e)
       ast.SEcho(e) -> uses_json_expr(e)
-      ast.SAssert(e) | ast.SPanic(e) -> uses_json_expr(e)
+      ast.SAssert(e, _) | ast.SPanic(e) -> uses_json_expr(e)
       ast.SBreak | ast.SContinue -> False
       ast.SExpr(e) | ast.SAsync(e) -> uses_json_expr(e)
       ast.SIf(branches, else_body) ->
@@ -1806,7 +2164,8 @@ fn collect_fns(
         dict.insert(acc, name, #(True, params, ret))
       ast.QueryDecl(name, params, ret, _) ->
         dict.insert(acc, name, #(True, params, ret))
-      ast.TypeDecl(..) -> acc
+      // Nothing calls a test, so it is in no table of things that can be called.
+      ast.TypeDecl(..) | ast.TestDecl(..) -> acc
     }
   })
 }
@@ -1824,7 +2183,7 @@ fn collect_sigs(
           list.map(params, fn(p) { #(p.name, ty_of_type_expr(types, p.typ)) })
         dict.insert(acc, name, #(ptys, ty_of_type_expr(types, ret)))
       }
-      ast.TypeDecl(..) -> acc
+      ast.TypeDecl(..) | ast.TestDecl(..) -> acc
     }
   })
 }
@@ -1846,6 +2205,9 @@ fn collect_atoms(module: ast.Module) -> List(String) {
           atoms_in_stmts(body, acc)
         ast.QueryDecl(_, _, _, sql) ->
           list.fold(ast.sql_exprs(sql), acc, fn(a, e) { atoms_in_expr(e, a) })
+        // There is one atom table for the whole package, and the test file reads
+        // it, so an atom only a test names still has to be in it.
+        ast.TestDecl(_, body, _, _) -> atoms_in_stmts(body, acc)
         ast.TypeDecl(..) -> acc
       }
     })
@@ -1873,7 +2235,7 @@ fn atoms_in_stmts(stmts: List(ast.Stmt), acc: List(String)) -> List(String) {
       ast.SReturn(None) -> acc
       ast.SReturn(Some(e)) -> atoms_in_expr(e, acc)
       ast.SEcho(e) -> atoms_in_expr(e, acc)
-      ast.SAssert(e) | ast.SPanic(e) -> atoms_in_expr(e, acc)
+      ast.SAssert(e, _) | ast.SPanic(e) -> atoms_in_expr(e, acc)
       ast.SBreak | ast.SContinue -> acc
       ast.SExpr(e) | ast.SAsync(e) -> atoms_in_expr(e, acc)
       ast.SIf(branches, else_body) -> {
@@ -2599,7 +2961,52 @@ pub fn fn_env(env: Env, params: List(ast.Field), ret: ast.TypeExpr) -> Env {
     list.fold(params, dict.new(), fn(acc, p) {
       dict.insert(acc, p.name, ty_of_type_expr(env.types, p.typ))
     })
-  Env(..env, locals: locals, subst: dict.new(), ret: ty_of_type_expr(env.types, ret))
+  // A `mut` parameter arrives as a pointer to the caller's variable (see
+  // `gen_param`), so the name reads and writes through it. That is the same
+  // machinery `mut b = a` uses: the Hive name is an *expression*, not a Go
+  // variable of its own, which is what makes `append` land on the caller's slice
+  // header instead of on a local copy of it. `muts` records that the parameter
+  // may be written at all, so a binding off it shares rather than copies.
+  let muts =
+    list.fold(params, dict.new(), fn(acc, p) {
+      case p.mutable {
+        True -> dict.insert(acc, p.name, True)
+        False -> acc
+      }
+    })
+  let renames =
+    list.fold(params, dict.new(), fn(acc, p) {
+      case p.mutable {
+        True -> dict.insert(acc, p.name, "(*" <> escape_ident(p.name) <> ")")
+        False -> acc
+      }
+    })
+  Env(
+    ..env,
+    locals: locals,
+    subst: dict.new(),
+    muts: muts,
+    aliased: dict.new(),
+    renames: renames,
+    ret: ty_of_type_expr(env.types, ret),
+  )
+}
+
+// A parameter list. A `mut` one is a pointer: Hive's promise is that a write in
+// the callee lands on the caller's variable, and for a vector that has to survive
+// `append` — which returns a *new* slice header, so a shared backing array is not
+// enough on its own. One indirection covers every type the same way, and a
+// pointer to a `T` is `T`'s own storage rather than a second copy of it.
+fn gen_params(params: List(ast.Field)) -> String {
+  params
+  |> list.map(fn(p) {
+    let ptr = case p.mutable {
+      True -> "*"
+      False -> ""
+    }
+    escape_ident(p.name) <> " " <> ptr <> gen_type(p.typ)
+  })
+  |> string.join(", ")
 }
 
 fn gen_fn_decl(
@@ -2610,10 +3017,7 @@ fn gen_fn_decl(
   body: List(ast.Stmt),
 ) -> String {
   let env = fn_env(env, params, ret)
-  let param_str =
-    params
-    |> list.map(fn(p) { escape_ident(p.name) <> " " <> gen_type(p.typ) })
-    |> string.join(", ")
+  let param_str = gen_params(params)
   let ret_str = case ret {
     ast.TVoid -> ""
     _ -> " " <> gen_type(ret)
@@ -2653,10 +3057,7 @@ fn gen_query_decl(
   sql: List(ast.SqlPart),
 ) -> String {
   let env = fn_env(env, params, ret)
-  let param_str =
-    params
-    |> list.map(fn(p) { escape_ident(p.name) <> " " <> gen_type(p.typ) })
-    |> string.join(", ")
+  let param_str = gen_params(params)
   let #(body, _) = gen_sql_parts(env, sql, 1, 0)
   "func "
   <> escape_ident(name)
@@ -2893,11 +3294,12 @@ fn gen_stmt(
               following,
             )
           let decl = pad <> escape_ident(name) <> " := " <> rhs <> "\n"
+          let base = shadow(env, name)
           let env2 =
             Env(
-              ..env,
-              locals: dict.insert(env.locals, name, ty),
-              muts: dict.insert(env.muts, name, mutable),
+              ..base,
+              locals: dict.insert(base.locals, name, ty),
+              muts: dict.insert(base.muts, name, mutable),
               aliased: record_alias(env, name, value, shared),
             )
           #(decl <> guard(following, name, pad), env2)
@@ -2928,11 +3330,12 @@ fn gen_stmt(
             <> " = "
             <> rhs
             <> "\n"
+          let base = shadow(env, name)
           let env2 =
             Env(
-              ..env,
-              locals: dict.insert(env.locals, name, ty),
-              muts: dict.insert(env.muts, name, mutable),
+              ..base,
+              locals: dict.insert(base.locals, name, ty),
+              muts: dict.insert(base.muts, name, mutable),
               aliased: record_alias(env, name, value, shared),
             )
           #(decl <> guard(following, name, pad), env2)
@@ -2945,10 +3348,18 @@ fn gen_stmt(
       env,
     )
     ast.SEcho(e) -> #(pad <> "fmt.Println(" <> gen_expr(env, e) <> ")\n", env)
-    ast.SAssert(e) -> {
-      let #(cond, _) = gen_condition(env, e)
-      #(pad <> "hive.Assert(" <> cond <> ")\n", env)
-    }
+    // `assert` says a condition must hold. What happens when it does not is
+    // decided by where it is written: in ordinary code the program has been
+    // proved wrong and stops, and inside a `test` the *test* has been proved
+    // wrong, so the failure is recorded and the rest of the suite still runs.
+    ast.SAssert(e, line) ->
+      case env.test_file {
+        None -> {
+          let #(cond, _) = gen_condition(env, e)
+          #(pad <> "hive.Assert(" <> cond <> ")\n", env)
+        }
+        Some(file) -> #(gen_test_assert(env, e, line, file, pad), env)
+      }
     // `panic value` renders the value the same way `echo` does (via
     // hive.Show), then aborts.
     ast.SPanic(e) -> #(
@@ -3007,7 +3418,24 @@ fn gen_stmt(
     ast.SAsync(ast.ECall(callee, args)) ->
       case is_address_call(env, callee) {
         True -> #(pad <> gen_address_send(env, callee, args, False) <> "\n", env)
-        False -> #(pad <> "go " <> gen_call(env, callee, args) <> "\n", env)
+        False ->
+          // A mutex argument is the exception to "Go already evaluates them
+          // here": what it evaluates to is an address, and an address is exactly
+          // the sharing an `async` call must not have. So the copy is bound
+          // first, in a block that keeps the temporary out of the caller's own
+          // scope, and the goroutine is handed the copy's address.
+          case hoist_args(env, callee, args, False) {
+            #("", _) -> #(pad <> "go " <> gen_call(env, callee, args) <> "\n", env)
+            #(binds, inner) -> #(
+              pad
+                <> "{ "
+                <> binds
+                <> "go "
+                <> gen_call(env, callee, inner)
+                <> " }\n",
+              env,
+            )
+          }
       }
     // Unreachable: the parser only builds an `SAsync` around a call.
     ast.SAsync(e) -> #(pad <> gen_expr(env, e) <> "\n", env)
@@ -3077,7 +3505,8 @@ fn gen_stmt(
         Some(t) -> ty_of_type_expr(env.types, t)
         None -> elem_ty_of(infer(env, iterable))
       }
-      let loop_env = Env(..env, locals: dict.insert(env.locals, name, elem_ty))
+      let base = shadow(env, name)
+      let loop_env = Env(..base, locals: dict.insert(base.locals, name, elem_ty))
       let body_guard = case uses_in_stmts(body, name) {
         True -> ""
         False -> tabs(indent + 1) <> "_ = " <> escape_ident(name) <> "\n"
@@ -3096,6 +3525,19 @@ fn gen_stmt(
       #(code, env)
     }
   }
+}
+
+// A fresh binding of `name` takes the name back. Whatever the outer one was — a
+// mutex parameter reading through `(*p)`, a `mut b = a` rendering as `a` — the
+// new one is a Go variable of its own, so every trace of the old spelling has to
+// go or the body would read through to storage the name no longer means.
+fn shadow(env: Env, name: String) -> Env {
+  Env(
+    ..env,
+    renames: dict.delete(env.renames, name),
+    muts: dict.delete(env.muts, name),
+    aliased: dict.delete(env.aliased, name),
+  )
 }
 
 // The environment after a sharing binding: the new name renders as the source's
@@ -4259,22 +4701,63 @@ fn gen_spawn(env: Env, call: ast.Expr) -> String {
       False -> gen_call(env, callee, a)
     }
   }
-  // Which arguments are copied in — the ones whose evaluation must not be
-  // deferred onto the new goroutine.
-  let copied =
+  case hoist_args(env, callee, args, True) {
+    #("", _) -> one(body(args))
+    #(binds, inner_args) ->
+      "func() *hive.Async["
+      <> async_inner_go(ty)
+      <> "] { "
+      <> binds
+      <> "return "
+      <> one(body(inner_args))
+      <> " }()"
+  }
+}
+
+// The arguments a call must evaluate in the *caller* before the new thread
+// starts, bound to locals, with the call rewritten to read them. `#("", args)`
+// when there are none.
+//
+// An argument filling a **mutex** parameter always needs it, and needs it for a
+// reason no amount of care about *where* the argument is evaluated can fix: what
+// it evaluates to is an address, and an address points at the caller's variable
+// from wherever it is read. What crosses to another thread is a copy — so the
+// copy is what the temporary holds, and the callee is handed *its* address. This
+// is the one place the two halves of `mut` come apart: waited for, the callee
+// shares the caller's storage; fired off, it gets storage of its own.
+//
+// `copies` adds the arguments that merely clone (`gen_arg`). A closure defers its
+// arguments onto the new goroutine, where a clone would race the caller it exists
+// to protect against, so `gen_spawn` asks for them. A `go f(x)` statement does
+// not: Go evaluates its arguments in the calling goroutine already, and hoisting
+// them would only put a thunk around a copy that was already on the right side of
+// the fence.
+//
+// `_a<i>` cannot collide: Hive identifiers never start with an underscore.
+fn hoist_args(
+  env: Env,
+  callee: ast.Expr,
+  args: List(ast.Arg),
+  copies: Bool,
+) -> #(String, List(ast.Arg)) {
+  let mut_slots = mut_arg_slots(env, callee, args) |> list.map(fn(s) { s.0 })
+  let hoisted =
     list.index_map(args, fn(a, i) { #(i, a) })
     |> list.filter(fn(entry) {
-      let #(_, a) = entry
-      gen_arg(env, a.value, TyUnknown) != gen_expr(env, a.value)
+      let #(i, a) = entry
+      list.contains(mut_slots, i)
+      || has_mutex_call(env, a.value)
+      || {
+        copies && gen_arg(env, a.value, TyUnknown) != gen_expr(env, a.value)
+      }
     })
-  case copied {
-    [] -> one(body(args))
+  case hoisted {
+    [] -> #("", args)
     _ -> {
-      // Bind each copied argument to a local in the caller, then hand the
-      // locals to the call. `_a<i>` cannot collide: Hive identifiers never
-      // start with an underscore.
+      // `gen_arg` is the copy either way: it clones what owns storage, and for
+      // anything else Go's `:=` is already a copy of the value.
       let binds =
-        copied
+        hoisted
         |> list.map(fn(entry) {
           let #(i, a) = entry
           "_a"
@@ -4286,19 +4769,120 @@ fn gen_spawn(env: Env, call: ast.Expr) -> String {
         |> string.concat
       let inner_args =
         list.index_map(args, fn(a, i) {
-          case list.key_find(copied, i) {
+          case list.key_find(hoisted, i) {
             Ok(_) -> ast.Arg(a.name, ast.EIdent("_a" <> int.to_string(i)))
             Error(_) -> a
           }
         })
-      "func() *hive.Async["
-      <> async_inner_go(ty)
-      <> "] { "
-      <> binds
-      <> "return "
-      <> one(body(inner_args))
-      <> " }()"
+      #(binds, inner_args)
     }
+  }
+}
+
+// Whether evaluating an expression takes a mutex anywhere inside it — a nested
+// call, an index, a vector literal, however deep.
+//
+// A spawn evaluates its arguments inside the closure unless they are hoisted, and
+// `f(g(v))` where `g` holds a mutex would then run `g` on the *new* thread while
+// the caller carries on through storage `g` is writing to. That is the race the
+// whole copy-on-`async` rule exists to rule out, so an argument with a mutex call
+// in it is evaluated in the caller like any other argument that touches the
+// caller's storage. The call itself still shares — it was written waited-for, and
+// hoisting is where it is waited for.
+fn has_mutex_call(env: Env, e: ast.Expr) -> Bool {
+  let takes_mutex = case e {
+    ast.ECall(ast.EIdent(name), _) -> mut_param_names(env, name) != []
+    _ -> False
+  }
+  takes_mutex || list.any(sub_exprs(e), has_mutex_call(env, _))
+}
+
+// One level of an expression's children.
+fn sub_exprs(e: ast.Expr) -> List(ast.Expr) {
+  case e {
+    ast.EInt(_)
+    | ast.EFloat(_)
+    | ast.EString(_)
+    | ast.EBool(_)
+    | ast.EAtom(_)
+    | ast.EIdent(_) -> []
+    ast.EInterp(parts) ->
+      list.filter_map(parts, fn(p) {
+        case p {
+          ast.IExpr(inner) -> Ok(inner)
+          ast.ILit(_) -> Error(Nil)
+        }
+      })
+    ast.EVector(items) -> items
+    ast.EMember(target, _) | ast.EIs(target, _) | ast.EWith(target, _) -> [
+      target,
+    ]
+    ast.ECall(callee, args) -> [callee, ..list.map(args, fn(a) { a.value })]
+    ast.EIndex(target, index) -> [target, index]
+    ast.ESlice(target, low, high) -> [
+      target,
+      ..option.values([low, high])
+    ]
+    ast.EBinary(_, l, r) -> [l, r]
+    ast.EUsing(source, kind) -> [source, ..ast.using_exprs(kind)]
+    ast.EAwait(calls, timeout) -> list.append(calls, option.values([timeout]))
+    ast.ETimed(call, ms) -> [call, ms]
+  }
+}
+
+// The positions in `args` that fill a mutex parameter. Named arguments claim
+// their parameter first and the unnamed ones fill what is left, exactly as
+// `assign_args` has them do — so which slot an argument lands in is a question
+// about the whole list, not about the argument.
+fn mut_arg_slots(
+  env: Env,
+  callee: ast.Expr,
+  args: List(ast.Arg),
+) -> List(#(Int, String)) {
+  case callee {
+    ast.EIdent(name) ->
+      case mut_param_names(env, name), dict.get(env.fns, name) {
+        [], _ -> []
+        muts, Ok(#(_, params, _)) -> {
+          let claimed =
+            list.filter_map(args, fn(a) {
+              case a.name {
+                Some(n) -> Ok(n)
+                None -> Error(Nil)
+              }
+            })
+          let unclaimed =
+            params
+            |> list.map(fn(p) { p.name })
+            |> list.filter(fn(n) { !list.contains(claimed, n) })
+          // Walk the arguments in order, handing each unnamed one the next
+          // unclaimed parameter.
+          list.index_map(args, fn(a, i) { #(i, a) })
+          |> list.fold(#([], unclaimed), fn(acc, entry) {
+            let #(slots, left) = acc
+            let #(i, a) = entry
+            let #(pname, left) = case a.name {
+              Some(n) -> #(Some(n), left)
+              None ->
+                case left {
+                  [n, ..rest] -> #(Some(n), rest)
+                  [] -> #(None, [])
+                }
+            }
+            case pname {
+              Some(n) ->
+                case list.contains(muts, n) {
+                  True -> #([#(i, n), ..slots], left)
+                  False -> #(slots, left)
+                }
+              None -> #(slots, left)
+            }
+          })
+          |> fn(acc) { acc.0 }
+        }
+        _, Error(_) -> []
+      }
+    _ -> []
   }
 }
 
@@ -4592,14 +5176,16 @@ fn gen_equality(env: Env, l: ast.Expr, r: ast.Expr, positive: Bool) -> String {
 // mutates; the copy exists only to stop a *mutable* alias from doing so.
 // `bind_rhs` decides, per binding, between an alias (cheap) and a copy.
 
-// An argument that names `mut` storage is copied on its way in.
+// An argument that names `mut` storage is copied on its way into an ordinary
+// parameter. (A `mut` parameter is the other case entirely and never comes
+// through here — see `gen_mut_arg`.)
 //
-// A parameter is an immutable binding of its own: the callee sees a plain `T`,
-// never the caller's `Mutex<T>`. That is only true if the callee cannot observe
-// the caller mutating it afterwards, and sharing the backing array makes it
-// false two ways over. The mild way is that the callee may keep the slice — in a
-// value it returns, a struct it builds, a message it sends — and see later
-// writes through it. The severe way is an `async func`, which runs *while* the
+// An ordinary parameter is an immutable binding of its own: the callee sees a
+// plain `T`, never the caller's `Mutex<T>`. That is only true if the callee cannot
+// observe the caller mutating it afterwards, and sharing the backing array makes
+// it false two ways over. The mild way is that the callee may keep the slice — in
+// a value it returns, a struct it builds, a message it sends — and see later
+// writes through it. The severe way is an `async` call, which runs *while* the
 // caller carries on: the two then read and write the same array concurrently,
 // which is a data race, not merely a surprising read.
 //
@@ -5060,7 +5646,7 @@ fn var_mutated_in_stmt(s: ast.Stmt, name: String) -> Bool {
     | ast.STypedDecl(_, _, _, _)
     | ast.SReturn(_)
     | ast.SEcho(_)
-    | ast.SAssert(_)
+    | ast.SAssert(_, _)
     | ast.SPanic(_)
     | ast.SBreak
     | ast.SContinue -> False
@@ -5095,7 +5681,7 @@ fn may_escape_stmt(s: ast.Stmt, name: String) -> Bool {
     ast.SReturn(Some(value)) -> uses_in_expr(value, name)
     ast.SReturn(None) -> False
     // Reads that retain no reference.
-    ast.SEcho(_) | ast.SAssert(_) | ast.SPanic(_) | ast.SBreak | ast.SContinue ->
+    ast.SEcho(_) | ast.SAssert(_, _) | ast.SPanic(_) | ast.SBreak | ast.SContinue ->
       False
     // A call may return or retain a slice aliasing one of its arguments.
     ast.SExpr(e) | ast.SAsync(e) -> uses_in_expr(e, name)
@@ -6456,9 +7042,23 @@ fn gen_declared_call(env: Env, name: String, args: List(ast.Arg)) -> String {
     _ ->
       case dict.get(env.sigs, name) {
         Ok(#(params, _)) ->
-          escape_ident(name) <> "(" <> gen_sig_args(env, args, params) <> ")"
+          escape_ident(name)
+          <> "("
+          <> gen_sig_args(env, args, params, mut_param_names(env, name))
+          <> ")"
         Error(_) -> escape_ident(name) <> "(" <> gen_args(env, args) <> ")"
       }
+  }
+}
+
+// Which of a callable's parameters are mutexes. `sigs` carries types, and a type
+// does not say this — `mut` is a property of the binding — so the answer comes
+// from the declaration itself.
+fn mut_param_names(env: Env, name: String) -> List(String) {
+  case dict.get(env.fns, name) {
+    Ok(#(_, params, _)) ->
+      params |> list.filter(fn(p) { p.mutable }) |> list.map(fn(p) { p.name })
+    Error(_) -> []
   }
 }
 
@@ -6783,6 +7383,7 @@ fn gen_sig_args(
   env: Env,
   args: List(ast.Arg),
   params: List(#(String, Ty)),
+  mut_params: List(String),
 ) -> String {
   let #(assigned, extra) = assign_args(args, list.map(params, fn(p) { p.0 }))
   let assigned_strs =
@@ -6793,10 +7394,38 @@ fn gen_sig_args(
         Ok(#(_, t)) -> t
         Error(_) -> TyUnknown
       }
-      gen_arg(env, value, ty)
+      case list.contains(mut_params, pname) {
+        True -> gen_mut_arg(env, value)
+        False -> gen_arg(env, value, ty)
+      }
     })
   let extra_strs = list.map(extra, fn(e) { gen_arg(env, e, TyUnknown) })
   string.join(list.append(assigned_strs, extra_strs), ", ")
+}
+
+// The argument for a mutex parameter: the caller's storage itself, handed over as
+// its address. Nothing is copied — that *is* the difference between this and
+// `gen_arg`, and validation has already held the argument to being an lvalue
+// rooted at a `mut` binding, so there is always an address to take.
+//
+// A mutex passed straight on to a further call is already a pointer, and taking
+// the address of what it points at (`&(*p)`) only spells `p` the long way.
+fn gen_mut_arg(env: Env, value: ast.Expr) -> String {
+  case value {
+    ast.EIdent(n) ->
+      case is_mut_param(env, n) {
+        True -> escape_ident(n)
+        False -> "&" <> gen_expr(env, value)
+      }
+    _ -> "&" <> gen_expr(env, value)
+  }
+}
+
+// Whether a name is a `mut` parameter of the body being generated — the one case
+// where a pointer is already in hand. `fn_env` renders such a name as `(*p)`, so
+// the rename is what identifies it.
+fn is_mut_param(env: Env, name: String) -> Bool {
+  dict.get(env.renames, name) == Ok("(*" <> escape_ident(name) <> ")")
 }
 
 // Variant constructors produce the union's interface type so the value can be
@@ -7016,7 +7645,7 @@ fn uses_in_stmt(s: ast.Stmt, name: String) -> Bool {
     ast.SReturn(None) -> False
     ast.SReturn(Some(e)) -> uses_in_expr(e, name)
     ast.SEcho(e) -> uses_in_expr(e, name)
-    ast.SAssert(e) | ast.SPanic(e) -> uses_in_expr(e, name)
+    ast.SAssert(e, _) | ast.SPanic(e) -> uses_in_expr(e, name)
     ast.SBreak | ast.SContinue -> False
     ast.SExpr(e) | ast.SAsync(e) -> uses_in_expr(e, name)
     ast.SIf(branches, else_body) -> {

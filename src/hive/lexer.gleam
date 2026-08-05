@@ -415,6 +415,7 @@ fn keyword_or_ident(word: String) -> token.Kind {
     "proc" -> token.KwProc
     "func" -> token.KwFunc
     "query" -> token.KwQuery
+    "test" -> token.KwTest
     "type" -> token.KwType
     "if" -> token.KwIf
     "else" -> token.KwElse

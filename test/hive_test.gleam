@@ -1,10 +1,18 @@
+import gleam/dict
 import gleam/list
+import gleam/option.{Some}
+import gleam/result
 import gleam/string
 import gleeunit
 import gleeunit/should
 import simplifile
+import hive/ast
+import hive/codegen
 import hive/compiler
+import hive/generics
+import hive/modules
 import hive/runtime
+import hive/testreport
 
 pub fn main() {
   gleeunit.main()
@@ -4059,6 +4067,222 @@ pub fn a_fire_and_forget_call_copies_in_the_caller_test() {
   should.be_true(string.contains(go, "go work(hive.CloneVec(v))"))
 }
 
+// ---------------------------------------------------------------------------
+// A `mut` parameter: the caller's mutex itself
+// ---------------------------------------------------------------------------
+
+const grow = "proc grow(vec: mut Str[dyn], tag: Str): Int {
+\tappend(vec, tag)
+\treturn len(vec)
+}
+"
+
+pub fn a_mutex_parameter_is_a_pointer_test() {
+  // A vector's `append` returns a new slice header, so sharing the backing array
+  // is not enough on its own — the callee has to be able to write the header the
+  // caller reads.
+  let go = compile(grow <> "proc main(): void {
+\tmut Str[dyn] v = [\"a\"]
+\techo grow(v, \"b\")
+}
+")
+  should.be_true(string.contains(go, "func grow(vec *[]string, tag string) int"))
+  should.be_true(string.contains(go, "(*vec) = append((*vec), tag)"))
+}
+
+pub fn a_waited_for_call_shares_the_callers_storage_test() {
+  let go = compile(grow <> "proc main(): void {
+\tmut Str[dyn] v = [\"a\"]
+\techo grow(v, \"b\")
+}
+")
+  should.be_true(string.contains(go, "grow(&v, \"b\")"))
+  should.be_false(string.contains(go, "Clone"))
+}
+
+pub fn a_fired_off_call_gets_a_copy_test() {
+  // `async` is the one place the two halves of `mut` come apart: what crosses to
+  // another thread is a copy, and the callee is handed *its* address.
+  let go = compile(grow <> "proc main(): void {
+\tmut Str[dyn] v = [\"a\"]
+\tasync grow(v, \"b\")
+}
+")
+  should.be_true(string.contains(
+    go,
+    "{ _a0 := hive.CloneVec(v); go grow(&_a0, \"b\") }",
+  ))
+}
+
+pub fn an_awaited_call_gets_a_copy_test() {
+  let go = compile(grow <> "proc main(): void {
+\tmut Str[dyn] v = [\"a\"]
+\techo await [grow(v, \"b\")]
+}
+")
+  should.be_true(string.contains(go, "_a0 := hive.CloneVec(v)"))
+  should.be_true(string.contains(go, "grow(&_a0, \"b\")"))
+}
+
+pub fn a_mutex_passed_on_stays_the_same_pointer_test() {
+  // `&(*vec)` is only `vec` spelled the long way.
+  let go =
+    compile(
+      grow
+      <> "proc outer(vec: mut Str[dyn]): void {\n\techo grow(vec, \"x\")\n}\nproc main(): void {\n\tmut Str[dyn] v = [\"a\"]\n\touter(v)\n}\n",
+    )
+  should.be_true(string.contains(go, "grow(vec, \"x\")"))
+  should.be_true(string.contains(go, "outer(&v)"))
+}
+
+pub fn a_mutex_call_inside_a_spawned_argument_runs_in_the_caller_test() {
+  // Left in the closure, `grow` would write the caller's storage from the new
+  // thread while the caller carries on reading it.
+  let go =
+    compile(
+      grow
+      <> "func twice(n: Int): Int {\n\treturn n * 2\n}\nproc main(): void {\n\tmut Str[dyn] v = [\"a\"]\n\techo await [twice(grow(v, \"b\"))]\n}\n",
+    )
+  should.be_true(string.contains(go, "_a0 := grow(&v, \"b\")"))
+  should.be_true(string.contains(go, "return twice(_a0)"))
+}
+
+pub fn a_mutex_parameter_may_be_reassigned_test() {
+  let go =
+    compile(
+      "proc replace(vec: mut Str[dyn]): void {\n\tvec = [\"only\"]\n}\nproc main(): void {\n\tmut Str[dyn] v = [\"a\"]\n\treplace(v)\n\techo v\n}\n",
+    )
+  should.be_true(string.contains(go, "(*vec) = []string{\"only\"}"))
+}
+
+pub fn a_scalar_mutex_parameter_works_too_test() {
+  let go =
+    compile(
+      "proc bump(n: mut Int): void {\n\tn = n + 1\n}\nproc main(): void {\n\tmut n := 1\n\tbump(n)\n\techo n\n}\n",
+    )
+  should.be_true(string.contains(go, "func bump(n *int)"))
+  should.be_true(string.contains(go, "(*n) = ((*n) + 1)"))
+  should.be_true(string.contains(go, "bump(&n)"))
+}
+
+pub fn a_struct_mutex_parameter_writes_the_callers_field_test() {
+  let go =
+    compile(
+      "type Box {\n\tcount: Int\n}\nproc fill(b: mut Box): void {\n\tb.count = 7\n}\nproc main(): void {\n\tmut Box b = Box(1)\n\tfill(b)\n\techo b.count\n}\n",
+    )
+  should.be_true(string.contains(go, "func fill(b *Box)"))
+  should.be_true(string.contains(go, "(*b).Count = 7"))
+  should.be_true(string.contains(go, "fill(&b)"))
+}
+
+pub fn a_binding_off_a_mutex_parameter_shares_it_test() {
+  // Two `mut` ends share, exactly as they do for two locals.
+  let go =
+    compile(
+      "proc grow(vec: mut Str[dyn]): void {\n\tmut Str[dyn] also = vec\n\tappend(also, \"x\")\n}\nproc main(): void {\n\tmut Str[dyn] v = [\"a\"]\n\tgrow(v)\n\techo v\n}\n",
+    )
+  should.be_true(string.contains(go, "(*vec) = append((*vec), \"x\")"))
+  should.be_false(string.contains(go, "Clone"))
+}
+
+pub fn a_mutex_parameter_passed_to_a_value_slot_is_copied_test() {
+  // Going the other way is the ordinary rule: a `T` slot never sees a mutex.
+  let go =
+    compile(
+      "func size(v: Str[dyn]): Int {\n\treturn len(v)\n}\nproc grow(vec: mut Str[dyn]): void {\n\techo size(vec)\n}\nproc main(): void {\n\tmut Str[dyn] v = [\"a\"]\n\tgrow(v)\n}\n",
+    )
+  should.be_true(string.contains(go, "size(hive.CloneVec((*vec)))"))
+}
+
+pub fn mut_is_not_part_of_a_type_test() {
+  // A field, a return and a function type each bind nothing.
+  should.be_error(compiler.compile(
+    "type Box {\n\titems: mut Str[dyn]\n}\nproc main(): void {\n\techo 1\n}\n",
+  ))
+  should.be_error(compiler.compile(
+    "proc f(): mut Str[dyn] {\n\treturn [\"a\"]\n}\nproc main(): void {\n\techo f()\n}\n",
+  ))
+  should.be_error(compiler.compile(
+    "proc run(f: proc(mut Int): void): void {\n\techo 1\n}\nproc main(): void {\n\techo 1\n}\n",
+  ))
+}
+
+pub fn a_func_cannot_receive_a_mutex_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "func f(vec: mut Str[dyn]): Int {\n\treturn len(vec)\n}\nproc main(): void {\n\tmut Str[dyn] v = [\"a\"]\n\techo f(v)\n}\n",
+    )
+  should.be_true(string.contains(msg, "cannot receive a mutex"))
+}
+
+pub fn a_query_cannot_receive_a_mutex_test() {
+  should.be_error(compiler.compile(
+    "query rows(v: mut Str[dyn]): Str[dyn] {\n\tSELECT name FROM t\n}\nproc main(): void {\n\techo 1\n}\n",
+  ))
+}
+
+pub fn a_mutex_slot_refuses_a_value_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      grow <> "proc main(): void {\n\techo grow([\"a\"], \"b\")\n}\n",
+    )
+  should.be_true(string.contains(msg, "takes the caller's own storage"))
+}
+
+pub fn a_mutex_slot_refuses_an_immutable_binding_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      grow
+      <> "proc main(): void {\n\tStr[dyn] v = [\"a\"]\n\techo grow(v, \"b\")\n}\n",
+    )
+  should.be_true(string.contains(msg, "is immutable"))
+}
+
+pub fn a_mutex_slot_accepts_a_path_into_mut_storage_test() {
+  let go =
+    compile(
+      "type Box {\n\titems: Str[dyn]\n}\nproc grow(vec: mut Str[dyn]): void {\n\tappend(vec, \"x\")\n}\nproc main(): void {\n\tmut Box b = Box([\"a\"])\n\tgrow(b.items)\n\techo b.items\n}\n",
+    )
+  should.be_true(string.contains(go, "grow(&b.Items)"))
+}
+
+pub fn a_mutex_callable_cannot_become_a_value_test() {
+  let assert Error(partial) =
+    compiler.compile(
+      grow
+      <> "proc main(): void {\n\tmut Str[dyn] v = [\"a\"]\n\tg := grow(v, _)\n\techo g(\"x\")\n}\n",
+    )
+  should.be_true(string.contains(partial, "cannot be a value"))
+  let assert Error(reference) =
+    compiler.compile(
+      grow
+      <> "func apply(f: proc(Str): Int): Int {\n\treturn 0\n}\nproc main(): void {\n\techo apply(grow)\n}\n",
+    )
+  should.be_true(string.contains(reference, "cannot be a value"))
+}
+
+pub fn a_mutex_proc_cannot_serve_http_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "proc handle(r: mut hive.net.HttpRequest): hive.net.HttpResponse {\n\treturn hive.net.HttpResponse(200, [], \"ok\")\n}\nproc main(): void {\n\thive.net.httpServe(8080, handle)\n}\n",
+    )
+  should.be_true(string.contains(msg, "is a mutex"))
+}
+
+pub fn a_mutex_call_forgets_what_was_proven_test() {
+  // The callee can rebind the caller's vector to a shorter one, so a length read
+  // off a literal cannot survive the call.
+  should.be_true(
+    compiler.compile(
+      "proc main(): void {\n\tmut v := [\"a\", \"b\"]\n\techo v[1]\n}\n",
+    )
+    |> result.is_ok,
+  )
+  should.be_error(compiler.compile(
+    "proc replace(vec: mut Str[dyn]): void {\n\tvec = [\"only\"]\n}\nproc main(): void {\n\tmut v := [\"a\", \"b\"]\n\treplace(v)\n\techo v[1]\n}\n",
+  ))
+}
+
 pub fn a_mut_argument_to_a_constructor_is_copied_in_test() {
   // A constructed value keeps the vector for as long as it lives.
   let go =
@@ -5156,4 +5380,297 @@ pub fn a_star_in_a_subquery_is_not_this_querys_test() {
 pub fn a_star_inside_a_sql_string_is_not_a_star_test() {
   star_query("Str[dyn]", "SELECT name FROM users WHERE note = '* nope *'")
   |> should.be_ok
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests: `test` declarations, and the report `hive test` prints
+// ---------------------------------------------------------------------------
+
+fn test_go(src: String) -> String {
+  let assert Ok(module) = modules.load_source(src, ".", "cart.hive")
+  let assert Ok(module) = generics.expand(module)
+  let assert Some(go) = codegen.generate_tests(module)
+  go
+}
+
+pub fn a_test_becomes_a_go_subtest_test() {
+  let go =
+    test_go(
+      "test \"an empty cart costs nothing\" {\n\tassert 1 == 1\n}\n",
+    )
+  should.be_true(string.contains(go, "func TestHive(t *testing.T)"))
+  should.be_true(string.contains(
+    go,
+    "t.Run(\"an empty cart costs nothing\", func(t *testing.T) {",
+  ))
+}
+
+pub fn a_test_recovers_from_a_panic_test() {
+  // Go's own runner re-panics and aborts the binary, which would let one broken
+  // test hide every result after it.
+  let go = test_go("test \"boom\" {\n\tpanic \"x\"\n}\n")
+  should.be_true(string.contains(go, "defer hiveTestRecover(t)"))
+}
+
+pub fn an_assert_in_a_test_records_rather_than_panics_test() {
+  let go = test_go("test \"t\" {\n\tassert 1 == 2\n}\n")
+  should.be_true(string.contains(go, "hiveTestAssertCmp(t,"))
+  should.be_false(string.contains(go, "hive.Assert("))
+}
+
+pub fn an_assert_outside_a_test_still_panics_test() {
+  let go = compile("proc main(): void {\n\tassert 1 == 1\n}\n")
+  should.be_true(string.contains(go, "hive.Assert("))
+}
+
+pub fn a_failed_comparison_shows_both_sides_test() {
+  let go =
+    test_go("func f(): Int {\n\treturn 1\n}\ntest \"t\" {\n\tassert f() == 2\n}\n")
+  should.be_true(string.contains(go, "\"f() == 2\""))
+  should.be_true(string.contains(go, "hive.Show(f())"))
+  should.be_true(string.contains(go, "hive.Show(2)"))
+}
+
+pub fn a_quoted_condition_uses_the_authors_names_test() {
+  // Two rewrites happen before codegen and neither belongs in a message: a bare
+  // builtin becomes `hive.len`, and an imported name becomes its flat name.
+  let go = test_go("test \"t\" {\n\tv := [\"a\"]\n\tassert len(v) == 3\n}\n")
+  should.be_true(string.contains(go, "\"len(v) == 3\""))
+  should.be_false(string.contains(go, "hive.len(v) == 3"))
+}
+
+pub fn a_non_comparison_assert_shows_only_the_source_test() {
+  // The operands of an `&&` are `true`/`false`, which says nothing the condition
+  // did not already say.
+  let go =
+    test_go("func f(): Bool {\n\treturn true\n}\ntest \"t\" {\n\tassert f()\n}\n")
+  should.be_true(string.contains(go, "hiveTestAssert(t,"))
+  should.be_false(string.contains(go, "hiveTestAssertCmp(t,"))
+}
+
+pub fn a_failure_points_at_the_hive_line_test() {
+  let go = test_go("test \"t\" {\n\techo \"a\"\n\tassert 1 == 2\n}\n")
+  // `//line` has to start at column 1 to be a directive, and it names the line
+  // after itself.
+  should.be_true(string.contains(go, "\n//line cart.hive:3\n"))
+}
+
+pub fn tests_are_left_out_of_the_program_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\techo \"hi\"\n}\ntest \"t\" {\n\tassert 1 == 1\n}\n",
+    )
+  should.be_false(string.contains(go, "testing"))
+  should.be_false(string.contains(go, "TestHive"))
+}
+
+pub fn a_test_may_call_a_proc_test() {
+  let go =
+    test_go(
+      "proc save(): Bool {\n\treturn true\n}\ntest \"t\" {\n\tassert save()\n}\n",
+    )
+  should.be_true(string.contains(go, "save()"))
+}
+
+pub fn an_atom_only_a_test_names_is_in_the_table_test() {
+  // There is one atom table for the whole package and the test file reads it.
+  let go =
+    compile(
+      "proc main(): void {\n\techo \"hi\"\n}\ntest \"t\" {\n\tassert #Ready == #Ready\n}\n",
+    )
+  should.be_true(string.contains(go, "Ready"))
+}
+
+pub fn a_func_may_not_be_named_test_test() {
+  // `test` is a keyword now, so it cannot also be a declaration's name.
+  should.be_error(compiler.compile(
+    "func test(): Int {\n\treturn 1\n}\nproc main(): void {\n\techo test()\n}\n",
+  ))
+}
+
+pub fn a_test_needs_a_quoted_name_test() {
+  should.be_error(compiler.check_source("test ok {\n\tassert 1 == 1\n}\n"))
+}
+
+pub fn duplicate_test_names_are_rejected_test() {
+  let assert Error(msg) =
+    compiler.check_source(
+      "test \"same\" {\n\tassert 1 == 1\n}\ntest \"same\" {\n\tassert 2 == 2\n}\n",
+    )
+  should.be_true(string.contains(msg, "both named"))
+}
+
+pub fn a_test_cannot_return_a_value_test() {
+  let assert Error(msg) =
+    compiler.check_source("test \"t\" {\n\treturn 1\n}\n")
+  should.be_true(string.contains(msg, "cannot return a value"))
+}
+
+pub fn a_test_may_return_early_test() {
+  test_go("test \"t\" {\n\tif 1 == 1 {\n\t\treturn\n\t}\n\tassert 1 == 2\n}\n")
+  |> string.contains("return")
+  |> should.be_true
+}
+
+pub fn a_bounds_error_in_a_test_is_still_an_error_test() {
+  // A test is ordinary Hive code and every pass applies to it.
+  should.be_error(compiler.check_source(
+    "test \"t\" {\n\tv := [\"a\"]\n\tassert v[3] == \"a\"\n}\n",
+  ))
+}
+
+pub fn a_file_of_only_tests_checks_clean_test() {
+  // No `main` is needed to be a good file, only to be a runnable one.
+  compiler.check_source("test \"t\" {\n\tassert 1 == 1\n}\n") |> should.be_ok
+}
+
+pub fn a_file_of_only_tests_cannot_be_run_test() {
+  let assert Error(msg) =
+    compiler.compile("test \"t\" {\n\tassert 1 == 1\n}\n")
+  should.be_true(string.contains(msg, "hive test"))
+}
+
+// --- the report ------------------------------------------------------------
+
+const go_test_output = "=== RUN   TestHive
+=== RUN   TestHive/an_empty_cart_costs_nothing
+=== RUN   TestHive/quantities_multiply
+    cart.hive:12: assert total(items) == 6
+        left:  5
+        right: 6
+--- FAIL: TestHive (0.00s)
+    --- PASS: TestHive/an_empty_cart_costs_nothing (0.00s)
+    --- FAIL: TestHive/quantities_multiply (0.00s)
+FAIL
+coverage: 57.1% of statements
+FAIL\thiveapp\t0.002s
+FAIL
+"
+
+pub fn the_report_reads_pass_and_fail_per_test_test() {
+  let results =
+    testreport.parse_results(go_test_output, [
+      "an empty cart costs nothing",
+      "quantities multiply",
+    ])
+  should.equal(list.map(results, fn(r) { r.outcome }), [
+    testreport.Passed,
+    testreport.Failed,
+  ])
+}
+
+pub fn the_report_keeps_a_failures_detail_test() {
+  let results =
+    testreport.parse_results(go_test_output, [
+      "an empty cart costs nothing",
+      "quantities multiply",
+    ])
+  let assert [_, failed] = results
+  should.equal(list.length(failed.detail), 3)
+  should.be_true(string.contains(
+    string.join(failed.detail, "\n"),
+    "cart.hive:12: assert total(items) == 6",
+  ))
+}
+
+pub fn the_report_reports_in_declaration_order_test() {
+  // Not the order Go happened to finish them in.
+  let results =
+    testreport.parse_results(go_test_output, [
+      "quantities multiply",
+      "an empty cart costs nothing",
+    ])
+  should.equal(list.map(results, fn(r) { r.name }), [
+    "quantities multiply",
+    "an empty cart costs nothing",
+  ])
+}
+
+pub fn a_test_go_never_reported_on_counts_as_failed_test() {
+  let results = testreport.parse_results(go_test_output, ["never ran"])
+  should.equal(list.map(results, fn(r) { r.outcome }), [testreport.Failed])
+}
+
+const main_go = "package main
+
+func total(v []int) int {
+	s := 0
+	return s
+}
+
+func discount(a int) int {
+	return a
+}
+
+func clone_Item(x Item) Item {
+	return x
+}
+"
+
+fn origins() {
+  dict.from_list([
+    #("total", ast.Origin("total", "cart.hive")),
+    #("discount", ast.Origin("discount", "cart.hive")),
+  ])
+}
+
+pub fn coverage_locates_each_declaration_test() {
+  should.equal(testreport.spans_of(main_go, origins()), [
+    #("total", "cart.hive", 3, 6),
+    #("discount", "cart.hive", 8, 10),
+  ])
+}
+
+pub fn coverage_ignores_generated_helpers_test() {
+  // `clone_Item` is not something anyone wrote, so it is not something a test
+  // can be said to have missed.
+  let profile =
+    "mode: set
+hiveapp/main.go:3.24,6.2 2 1
+hiveapp/main.go:8.23,10.2 1 0
+hiveapp/main.go:12.32,14.2 1 0
+"
+  let assert Some(coverage) =
+    testreport.parse_coverage(profile, main_go, origins())
+  should.equal(coverage.covered, 2)
+  should.equal(coverage.total, 3)
+}
+
+pub fn coverage_names_what_was_never_exercised_test() {
+  let profile =
+    "mode: set
+hiveapp/main.go:3.24,6.2 2 1
+hiveapp/main.go:8.23,10.2 1 0
+"
+  let assert Some(coverage) =
+    testreport.parse_coverage(profile, main_go, origins())
+  should.equal(coverage.untouched, ["discount"])
+}
+
+pub fn coverage_is_reported_per_file_test() {
+  let profile =
+    "mode: set
+hiveapp/main.go:3.24,6.2 2 1
+hiveapp/main.go:8.23,10.2 1 0
+"
+  let assert Some(coverage) =
+    testreport.parse_coverage(profile, main_go, origins())
+  should.equal(coverage.files, [#("cart.hive", 2, 3)])
+}
+
+pub fn the_rendered_report_states_the_tally_and_coverage_test() {
+  let report =
+    testreport.Report(
+      testreport.parse_results(go_test_output, [
+        "an empty cart costs nothing",
+        "quantities multiply",
+      ]),
+      Some(testreport.Coverage(2, 3, ["discount"], [#("cart.hive", 2, 3)])),
+    )
+  let text = testreport.render(report)
+  should.be_true(string.contains(text, "PASS  an empty cart costs nothing"))
+  should.be_true(string.contains(text, "FAIL  quantities multiply"))
+  should.be_true(string.contains(text, "2 tests: 1 passed, 1 failed"))
+  should.be_true(string.contains(text, "coverage: 66.7% of statements (2/3)"))
+  should.be_true(string.contains(text, "never exercised: discount"))
 }

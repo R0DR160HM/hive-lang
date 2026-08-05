@@ -139,6 +139,10 @@ pub fn check(module: ast.Module) -> Result(Nil, String) {
       ast.ProcDecl(name, params, ret, body)
       | ast.FuncDecl(name, params, ret, body) ->
         check_body(types, fns, name, params, ret, body)
+      // A test's body is checked like any other — an index it cannot prove safe
+      // is a compile error there too, since a test is ordinary Hive code.
+      ast.TestDecl(name, body, _, _) ->
+        check_body(types, fns, "test \"" <> name <> "\"", [], ast.TVoid, body)
       // A query's body is SQL; its interpolations can't index a vector, and
       // the main validation pass already walks them.
       ast.QueryDecl(..) | ast.TypeDecl(..) -> Ok(Nil)
@@ -154,7 +158,7 @@ fn signatures(decls: List(ast.Decl)) -> Dict(String, Sig) {
       | ast.FuncDecl(name, params, ret, _)
       | ast.QueryDecl(name, params, ret, _) ->
         dict.insert(acc, name, Sig(params, ret))
-      ast.TypeDecl(..) -> acc
+      ast.TypeDecl(..) | ast.TestDecl(..) -> acc
     }
   })
 }
@@ -221,8 +225,130 @@ fn check_stmts(env: Env, stmts: List(ast.Stmt)) -> Result(Env, String) {
     [] -> Ok(env)
     [s, ..rest] -> {
       use env2 <- result.try(check_stmt(env, s))
-      check_stmts(env2, rest)
+      check_stmts(forget_mutexes(env2, s), rest)
     }
+  }
+}
+
+// What survives handing a variable to a mutex parameter: nothing this pass had
+// proved about it.
+//
+// Every other way a vector changes is one this pass can see the shape of. An
+// element write leaves the length alone; `append` only grows it, so a position
+// already proven in range stays in range. A callee holding the mutex is under no
+// such limit — `v = ["x"]` inside it replaces the caller's vector with a shorter
+// one, and a length read off a literal (`mut v := ["a", "b"]`) would go on
+// claiming a `v[1]` that is no longer there. So the length goes with the facts.
+//
+// The rule does not ask whether the call was waited for, though only a waited-for
+// one really shares (an `async` call is handed a copy). Forgetting a fact only
+// ever costs a proof, never soundness, and "a mutex was passed" is the shape the
+// author can see in the source.
+fn forget_mutexes(env: Env, s: ast.Stmt) -> Env {
+  let names = mutex_roots(env, s)
+  forget(env, names) |> drop_lengths(names)
+}
+
+// The variables a statement hands to a mutex parameter, anywhere in it.
+fn mutex_roots(env: Env, s: ast.Stmt) -> List(String) {
+  stmt_exprs(s)
+  |> list.flat_map(calls_in)
+  |> list.flat_map(fn(call) {
+    let #(name, args) = call
+    case dict.get(env.fns, name) {
+      Error(_) -> []
+      Ok(Sig(params, _)) ->
+        mutex_args(params, args)
+        |> list.filter_map(fn(a) {
+          case assign_root(a) {
+            Some(root) -> Ok(root)
+            None -> Error(Nil)
+          }
+        })
+    }
+  })
+  |> list.unique
+}
+
+// The arguments landing in a mutex slot. Named arguments claim their parameter
+// and the unnamed ones fill what is left, as `codegen.assign_args` has them do.
+fn mutex_args(params: List(ast.Field), args: List(ast.Arg)) -> List(ast.Expr) {
+  let #(assigned, _) =
+    codegen.assign_args(args, list.map(params, fn(p) { p.name }))
+  list.filter_map(assigned, fn(pair) {
+    let #(pname, value) = pair
+    case list.find(params, fn(p) { p.name == pname && p.mutable }) {
+      Ok(_) -> Ok(value)
+      Error(_) -> Error(Nil)
+    }
+  })
+}
+
+// Every call to a bare name in an expression, innermost included.
+fn calls_in(e: ast.Expr) -> List(#(String, List(ast.Arg))) {
+  let here = case e {
+    ast.ECall(ast.EIdent(name), args) -> [#(name, args)]
+    _ -> []
+  }
+  list.append(here, list.flat_map(sub_exprs(e), calls_in))
+}
+
+fn sub_exprs(e: ast.Expr) -> List(ast.Expr) {
+  case e {
+    ast.EInt(_)
+    | ast.EFloat(_)
+    | ast.EString(_)
+    | ast.EBool(_)
+    | ast.EAtom(_)
+    | ast.EIdent(_) -> []
+    ast.EInterp(parts) ->
+      list.filter_map(parts, fn(p) {
+        case p {
+          ast.IExpr(inner) -> Ok(inner)
+          ast.ILit(_) -> Error(Nil)
+        }
+      })
+    ast.EVector(items) -> items
+    ast.EMember(target, _) | ast.EIs(target, _) | ast.EWith(target, _) -> [
+      target,
+    ]
+    ast.ECall(callee, args) -> [callee, ..list.map(args, fn(a) { a.value })]
+    ast.EIndex(target, index) -> [target, index]
+    ast.ESlice(target, low, high) -> [target, ..option.values([low, high])]
+    ast.EBinary(_, l, r) -> [l, r]
+    ast.EUsing(source, kind) -> [source, ..ast.using_exprs(kind)]
+    ast.EAwait(calls, timeout) -> list.append(calls, option.values([timeout]))
+    ast.ETimed(call, ms) -> [call, ms]
+  }
+}
+
+// Every expression a statement evaluates, including those in nested blocks. A
+// nested block's own writes are handled by `forget_writes`; this is only about
+// finding the calls.
+fn stmt_exprs(s: ast.Stmt) -> List(ast.Expr) {
+  case s {
+    ast.SVarDecl(_, value, _) | ast.STypedDecl(_, _, value, _) -> [value]
+    ast.SAssign(target, value) -> [target, value]
+    ast.SReturn(value) -> option.values([value])
+    ast.SEcho(e) | ast.SAssert(e, _) | ast.SPanic(e) | ast.SExpr(e) | ast.SAsync(e) -> [
+      e,
+    ]
+    ast.SBreak | ast.SContinue -> []
+    ast.SIf(branches, else_body) ->
+      list.append(
+        list.flat_map(branches, fn(b) { [b.cond, ..list.flat_map(b.body, stmt_exprs)] }),
+        list.flat_map(option.unwrap(else_body, []), stmt_exprs),
+      )
+    ast.SFor(init, cond, post, body) ->
+      list.flatten([
+        list.flat_map(option.values([init, post]), stmt_exprs),
+        option.values([cond]),
+        list.flat_map(body, stmt_exprs),
+      ])
+    ast.SForEach(_, _, iterable, body) -> [
+      iterable,
+      ..list.flat_map(body, stmt_exprs)
+    ]
   }
 }
 
@@ -288,7 +414,7 @@ fn check_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
       ))
       Ok(env)
     }
-    ast.SEcho(e) | ast.SAssert(e) | ast.SPanic(e) -> {
+    ast.SEcho(e) | ast.SAssert(e, _) | ast.SPanic(e) -> {
       use _ <- result.try(check_expr(env, e))
       Ok(env)
     }

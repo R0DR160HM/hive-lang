@@ -1,12 +1,31 @@
 //// The Hive abstract syntax tree.
 
+import gleam/dict.{type Dict}
+import gleam/float
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
 
 pub type Module {
-  Module(imports: List(Import), decls: List(Decl))
+  Module(
+    imports: List(Import),
+    decls: List(Decl),
+    /// Flat declaration name -> the name and file the author actually wrote, for
+    /// anything that has to report a declaration back to them. Flattening
+    /// renames every imported declaration (`grow` in `helpers.hive` becomes
+    /// `helpers_0_grow`), and by the time coverage or a diagnostic wants to name
+    /// one, the file it came from is the only place that spelling exists.
+    ///
+    /// Empty until `hive/modules` flattens; the entry module's own declarations
+    /// map to themselves.
+    origins: Dict(String, Origin),
+  )
+}
+
+/// Where a declaration was written, as the author would name it.
+pub type Origin {
+  Origin(name: String, file: String)
 }
 
 /// `import ../lib/strings` or `import ../lib/strings as text` — a module-level
@@ -57,10 +76,31 @@ pub type Decl {
   /// is a struct and the type is a tagged union; `common_fields` are added to
   /// every variant.
   TypeDecl(name: String, variants: List(Variant), common_fields: List(Field))
+  /// `test "what should be true" { ... }` — one unit test.
+  ///
+  /// A test is named in prose because that is what a test name is for, and it
+  /// takes no parameters and returns nothing: there is no caller to give it
+  /// either. The body is an ordinary `proc` body, so it may call procs and do
+  /// I/O, and `assert` inside it records a failure rather than aborting (see
+  /// `SAssert`).
+  ///
+  /// `file` and `line` are where the declaration opens — the position a failure
+  /// or a panic inside the body is reported against. The parser cannot know the
+  /// file (it is handed tokens, not a path), so `file` is filled in by
+  /// `hive/modules` while flattening, which is the one pass holding both.
+  TestDecl(name: String, body: List(Stmt), file: String, line: Int)
 }
 
+/// A named, typed slot: a parameter of a callable, or a field of a type.
+///
+/// `mutable` is what a parameter written `name: mut T` records — the callee is
+/// handed the caller's `Mutex<T>` itself rather than an immutable view of it, so
+/// a write in the callee lands on the caller's variable. Only a `proc` may
+/// declare one, and only when the call is waited for; an `async` call copies the
+/// argument in instead (see `SAsync`). It is always `False` on a type's fields,
+/// whose mutability is the binding's, not the field's.
 pub type Field {
-  Field(name: String, typ: TypeExpr)
+  Field(name: String, typ: TypeExpr, mutable: Bool)
 }
 
 pub type Variant {
@@ -138,8 +178,15 @@ pub type Stmt {
   SReturn(value: Option(Expr))
   /// `echo value` — print any value followed by a newline.
   SEcho(value: Expr)
-  /// `assert condition` — panic at runtime when the condition is false.
-  SAssert(value: Expr)
+  /// `assert condition` — the condition must hold. What happens when it does
+  /// not is decided by where it is written: in ordinary code it panics, and
+  /// inside a `test` it records a failure and lets the rest of the suite run.
+  ///
+  /// `line` is the only source position in the statement tree, and it is here
+  /// because a failed assertion is the one diagnostic a *reader of the output*
+  /// has to locate in their own file — every other position the compiler reports
+  /// belongs to a pass that runs before this point.
+  SAssert(value: Expr, line: Int)
   /// `panic value` — stop the program immediately, showing `value` rendered as
   /// a string (the same conversion `echo` uses). Unlike `assert`, it always
   /// fires and takes any value, not just a boolean.
@@ -357,6 +404,160 @@ pub fn show_dim(d: Dim) -> String {
     DimEmpty -> "[]"
     DimStatic(n) -> "[" <> int.to_string(n) <> "]"
     DimDyn -> "[dyn]"
+  }
+}
+
+/// An expression written the way its source spelled it.
+///
+/// This is for quoting an expression *back to the person who wrote it* — a failed
+/// `assert` shows the condition that did not hold — so it aims to be recognisable
+/// rather than to round-trip. Parentheses are put back around every binary
+/// operation, since the tree no longer records which ones were written; a literal
+/// is rendered the way Hive spells it, not the way Go does.
+pub fn show_expr(e: Expr) -> String {
+  case e {
+    EInt(n) -> int.to_string(n)
+    EFloat(f) -> float_source(f)
+    EString(s) -> "\"" <> escape_source(s) <> "\""
+    EInterp(parts) ->
+      "\""
+      <> string.concat(
+        list.map(parts, fn(p) {
+          case p {
+            ILit(text) -> escape_source(text)
+            IExpr(inner) -> "{" <> show_expr(inner) <> "}"
+          }
+        }),
+      )
+      <> "\""
+    EBool(True) -> "true"
+    EBool(False) -> "false"
+    EAtom(name) -> "#" <> name
+    EIdent(name) -> name
+    EVector(items) -> "[" <> show_list(items) <> "]"
+    EMember(target, field) -> show_expr(target) <> "." <> field
+    ECall(callee, args) ->
+      show_expr(callee)
+      <> "("
+      <> string.join(
+        list.map(args, fn(a) {
+          case a.name {
+            Some(name) -> name <> ": " <> show_expr(a.value)
+            None -> show_expr(a.value)
+          }
+        }),
+        ", ",
+      )
+      <> ")"
+    EIndex(target, index) ->
+      show_expr(target) <> "[" <> show_expr(index) <> "]"
+    ESlice(target, low, high) ->
+      show_expr(target)
+      <> "["
+      <> show_bound(low)
+      <> ":"
+      <> show_bound(high)
+      <> "]"
+    EBinary(op, left, right) ->
+      "(" <> show_expr(left) <> " " <> show_op(op) <> " " <> show_expr(right) <> ")"
+    EIs(subject, pattern) ->
+      show_expr(subject) <> " is " <> show_pattern(pattern)
+    // These carry more than an expression's worth of syntax, and an assertion
+    // that leans on one is better read in the file than paraphrased here.
+    EUsing(source, _) -> "using " <> show_expr(source)
+    EWith(value, typ) -> show_expr(value) <> " with " <> show_type(typ)
+    EAwait(calls, timeout) ->
+      "await ["
+      <> show_list(calls)
+      <> "]"
+      <> case timeout {
+        Some(ms) -> " with timeout " <> show_expr(ms)
+        None -> ""
+      }
+    ETimed(call, ms) -> show_expr(call) <> " with timeout " <> show_expr(ms)
+  }
+}
+
+fn show_list(items: List(Expr)) -> String {
+  string.join(list.map(items, show_expr), ", ")
+}
+
+fn show_bound(bound: Option(Expr)) -> String {
+  case bound {
+    Some(e) -> show_expr(e)
+    None -> ""
+  }
+}
+
+// `1.0` survives Gleam's own float formatting; what needs care is that Hive
+// writes a float with a decimal point even when it is whole.
+fn float_source(f: Float) -> String {
+  let text = float.to_string(f)
+  case string.contains(text, ".") || string.contains(text, "e") {
+    True -> text
+    False -> text <> ".0"
+  }
+}
+
+// Put back the escapes the lexer took out, so the quoted source reads as source.
+fn escape_source(s: String) -> String {
+  s
+  |> string.replace("\\", "\\\\")
+  |> string.replace("\"", "\\\"")
+  |> string.replace("\n", "\\n")
+  |> string.replace("\t", "\\t")
+  |> string.replace("\r", "\\r")
+}
+
+fn show_op(op: BinOp) -> String {
+  case op {
+    OpGt -> ">"
+    OpLt -> "<"
+    OpGe -> ">="
+    OpLe -> "<="
+    OpEq -> "=="
+    OpNeq -> "!="
+    OpAdd -> "+"
+    OpSub -> "-"
+    OpMul -> "*"
+    OpDiv -> "/"
+    OpMod -> "%"
+    OpPow -> "**"
+    OpAnd -> "&&"
+    OpOr -> "||"
+  }
+}
+
+fn show_pattern(p: Pattern) -> String {
+  case p {
+    PConstructor(path, []) -> string.join(path, ".")
+    PConstructor(path, bindings) ->
+      string.join(path, ".") <> "(" <> string.join(bindings, ", ") <> ")"
+    PVector(elems, rest) -> {
+      let parts =
+        list.map(elems, fn(el) {
+          case el {
+            PElemLit(value) -> show_expr(value)
+            PElemBind(name) -> name
+          }
+        })
+      let parts = case rest {
+        Some(name) -> list.append(parts, ["..." <> name])
+        None -> parts
+      }
+      "[" <> string.join(parts, ", ") <> "]"
+    }
+    PString(parts) ->
+      "\""
+      <> string.concat(
+        list.map(parts, fn(part) {
+          case part {
+            SPatLit(text) -> escape_source(text)
+            SPatHole(name) -> "{" <> name <> "}"
+          }
+        }),
+      )
+      <> "\""
   }
 }
 
