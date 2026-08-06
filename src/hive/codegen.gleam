@@ -4411,7 +4411,9 @@ fn infer_other_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> Ty {
                 | "hmacSha256"
                 | "base64Encode"
                 | "randomHex" -> TyStr
-                "base64Decode" -> TyResult(TyStr, TyBuiltin("CryptoError"))
+                "base64Decode" | "decrypt" ->
+                  TyResult(TyStr, TyBuiltin("CryptoError"))
+                "encrypt" -> TyStr
                 "jwtSign" -> TyStr
                 "jwtHeader" ->
                   TyResult(TyBuiltin("JwtHeader"), TyBuiltin("CryptoError"))
@@ -4439,7 +4441,7 @@ fn infer_other_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> Ty {
               }
             "term" ->
               case fname {
-                "read" -> TyStr
+                "read" | "readSecret" -> TyStr
                 "args" -> TyVec(TyStr)
                 // `print` is a void statement.
                 _ -> TyVoid
@@ -6635,6 +6637,10 @@ fn gen_crypto_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
         #([#(_, n)], []) -> "hive.RandomHex(" <> coerce(env, n, TyInt) <> ")"
         _ -> "hive.RandomHex(" <> gen_args(env, args) <> ")"
       }
+    "encrypt" ->
+      gen_two_strings(env, args, "hive.Encrypt", ["plaintext", "password"])
+    "decrypt" ->
+      gen_two_strings(env, args, "hive.Decrypt", ["ciphertext", "password"])
     // The claims are JSON-encoded by the derived encoder, then signed.
     "jwtSign" ->
       case assign_args(args, ["claims", "secret"]) {
@@ -6648,6 +6654,25 @@ fn gen_crypto_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
       }
     "jwtHeader" -> "hive.JwtReadHeader(" <> gen_one(env, args, "token") <> ")"
     _ -> "hive." <> exported(fname) <> "(" <> gen_args(env, args) <> ")"
+  }
+}
+
+// Two `Str` arguments, honouring the named-argument form.
+fn gen_two_strings(
+  env: Env,
+  args: List(ast.Arg),
+  callee: String,
+  names: List(String),
+) -> String {
+  case assign_args(args, names) {
+    #([#(_, first), #(_, second)], []) ->
+      callee
+      <> "("
+      <> coerce(env, first, TyStr)
+      <> ", "
+      <> coerce(env, second, TyStr)
+      <> ")"
+    _ -> callee <> "(" <> gen_args(env, args) <> ")"
   }
 }
 
@@ -6748,12 +6773,15 @@ fn gen_env_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
 //   * `print` writes a line to stdout — the same lowering as `echo`.
 //   * `read` blocks the calling virtual thread on a line of stdin (only that
 //     goroutine parks; others keep running).
+//   * `readSecret` is that same read with the terminal's echo turned off, so a
+//     password is not left on screen as it is typed.
 //   * `args` is the program's command-line arguments (excluding the program
 //     name) as a `Str[dyn]`.
 fn gen_term_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
   case fname {
     "print" -> "fmt.Println(" <> gen_one_coerced(env, args, "text", TyStr) <> ")"
     "read" -> "hive.TermRead()"
+    "readSecret" -> "hive.TermReadSecret()"
     "args" -> "hive.TermArgs()"
     _ -> "hive." <> exported(fname) <> "(" <> gen_args(env, args) <> ")"
   }

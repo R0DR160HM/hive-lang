@@ -71,7 +71,7 @@ pub fn modules() -> List(Module) {
       source: crypto_go,
       markers: [
         "hive.Sha", "hive.Hmac", "hive.Base64", "hive.RandomHex", "hive.Jwt",
-        "hive.CryptoError",
+        "hive.CryptoError", "hive.Encrypt", "hive.Decrypt",
       ],
       // JWTs decode their payload with the JSON module's derived decoders and
       // check exp/nbf against `Now`.
@@ -101,6 +101,34 @@ pub fn modules() -> List(Module) {
       file: "hive/term.go",
       source: term_go,
       markers: ["hive.Term"],
+      requires: [],
+    ),
+    Module(
+      name: "term_secret",
+      file: "hive/term_secret.go",
+      source: term_secret_go,
+      // `hive.Term` above matches this call too, so `term.go` — whose TermRead
+      // this one reads through — comes along on its own; `requires` says so
+      // rather than leaning on the spelling of another module's marker.
+      markers: ["hive.TermReadSecret"],
+      requires: ["term", "term_secret_unix", "term_secret_windows"],
+    ),
+    // The two halves of turning the echo off, one per platform. Neither is ever
+    // matched on its own — nothing in a generated `main.go` names them — so they
+    // carry no markers and arrive only with `term_secret`. Both are written and
+    // the build tag at the top of each leaves one of them out of the build.
+    Module(
+      name: "term_secret_unix",
+      file: "hive/term_secret_unix.go",
+      source: term_secret_unix_go,
+      markers: [],
+      requires: [],
+    ),
+    Module(
+      name: "term_secret_windows",
+      file: "hive/term_secret_windows.go",
+      source: term_secret_windows_go,
+      markers: [],
       requires: [],
     ),
     Module(
@@ -2141,7 +2169,10 @@ pub fn crypto_go() -> String {
   "package hive
 
 import (
+	\"crypto/aes\"
+	\"crypto/cipher\"
 	\"crypto/hmac\"
+	\"crypto/pbkdf2\"
 	\"crypto/rand\"
 	\"crypto/sha256\"
 	\"crypto/sha512\"
@@ -2219,6 +2250,105 @@ func RandomHex(n int) string {
 		return \"\"
 	}
 	return hex.EncodeToString(buf)
+}
+
+// What Encrypt writes and Decrypt reads, base64 over the lot so it goes into a
+// file or a JSON field as it is:
+//
+//	version | salt | nonce | ciphertext and its authentication tag
+//
+// The version says how the key was derived from the password, so that making
+// that harder later leaves everything already encrypted readable.
+const (
+	encryptVersion = 1
+	encryptSaltLen = 16
+	// AES-256.
+	encryptKeyLen = 32
+)
+
+// encryptWork is how much work deriving the key from the password is, for a
+// message of the given version — the cost an attacker pays on every guess. The
+// 600,000 rounds of PBKDF2-HMAC-SHA256 behind version 1 are what OWASP asks for.
+func encryptWork(version byte) (int, bool) {
+	switch version {
+	case 1:
+		return 600000, true
+	}
+	return 0, false
+}
+
+// encryptCipher derives the key from password and salt and answers with AES-GCM
+// under it. False if the platform has no AES, which is not something to carry
+// on encrypting past.
+func encryptCipher(password string, salt []byte, work int) (cipher.AEAD, bool) {
+	key, err := pbkdf2.Key(sha256.New, password, salt, work, encryptKeyLen)
+	if err != nil {
+		return nil, false
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, false
+	}
+	sealed, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, false
+	}
+	return sealed, true
+}
+
+// Encrypt seals plaintext under a key derived from password with AES-256-GCM,
+// and returns it base64-encoded. The salt and the nonce are drawn afresh on
+// every call, so the same text under the same password never comes out the same
+// twice, and the tag GCM leaves on the end is what lets Decrypt tell an edited
+// message from an intact one. Backs hive.crypto.encrypt.
+func Encrypt(plaintext string, password string) string {
+	salt := make([]byte, encryptSaltLen)
+	// Since Go 1.24 this cannot fail: it fills the buffer or the program dies
+	// with the operating system's random source.
+	rand.Read(salt)
+	work, _ := encryptWork(encryptVersion)
+	sealer, ok := encryptCipher(password, salt, work)
+	if !ok {
+		return \"\"
+	}
+	nonce := make([]byte, sealer.NonceSize())
+	rand.Read(nonce)
+	message := []byte{encryptVersion}
+	message = append(message, salt...)
+	message = append(message, nonce...)
+	message = sealer.Seal(message, nonce, []byte(plaintext), nil)
+	return base64.StdEncoding.EncodeToString(message)
+}
+
+// Decrypt opens what Encrypt sealed, or says why it could not. A wrong password
+// and a message edited since it was encrypted fail the same way — the tag does
+// not check out either way, and which of the two it was is not something the
+// tag can tell. Backs hive.crypto.decrypt.
+func Decrypt(ciphertext string, password string) Result[string, CryptoError] {
+	message, err := base64.StdEncoding.DecodeString(ciphertext)
+	if err != nil {
+		return Err[string, CryptoError](CryptoError{Reason: \"Malformed\", Message: \"input is not valid base64\"})
+	}
+	if len(message) < 1+encryptSaltLen {
+		return Err[string, CryptoError](CryptoError{Reason: \"Malformed\", Message: \"input is too short to be an encrypted message\"})
+	}
+	work, known := encryptWork(message[0])
+	if !known {
+		return Err[string, CryptoError](CryptoError{Reason: \"Malformed\", Message: \"unknown encrypted message version \" + strconv.Itoa(int(message[0]))})
+	}
+	opener, ok := encryptCipher(password, message[1:1+encryptSaltLen], work)
+	if !ok {
+		return Err[string, CryptoError](CryptoError{Reason: \"Malformed\", Message: \"could not derive a key from the password\"})
+	}
+	rest := message[1+encryptSaltLen:]
+	if len(rest) < opener.NonceSize() {
+		return Err[string, CryptoError](CryptoError{Reason: \"Malformed\", Message: \"input is too short to be an encrypted message\"})
+	}
+	plaintext, err := opener.Open(nil, rest[:opener.NonceSize()], rest[opener.NonceSize():], nil)
+	if err != nil {
+		return Err[string, CryptoError](CryptoError{Reason: \"BadSignature\", Message: \"wrong password, or the message was changed after it was encrypted\"})
+	}
+	return Ok[string, CryptoError](string(plaintext))
 }
 
 // JwtSign builds an HS256 token from an already-JSON-encoded payload and a
@@ -2620,6 +2750,253 @@ func TermArgs() []string {
 	out := make([]string, len(args))
 	copy(out, args)
 	return out
+}
+"
+}
+
+/// Source of `hive/term_secret.go`: the read that hides what is typed
+/// (`hive.term.readSecret`). Kept out of `term.go` so that a program which only
+/// reads visibly is not built with the terminal handling — and the process
+/// spawning on unix — that hiding needs.
+///
+/// The two `termEchoOff` implementations it calls are in `term_secret_unix.go`
+/// and `term_secret_windows.go`; build tags leave exactly one of them in a build.
+pub fn term_secret_go() -> String {
+  "package hive
+
+import (
+	\"fmt\"
+	\"os\"
+	\"os/signal\"
+	\"sync\"
+	\"syscall\"
+)
+
+// How many reads are in progress with the echo turned off, so that two virtual
+// threads asking for a secret at once turn it off once and put it back once:
+// the first of them to finish must not uncover what the other is still typing.
+// `interrupts` is what watches for the program being ended at the prompt.
+var (
+	echoMu      sync.Mutex
+	echoReaders int
+	echoRestore func()
+	interrupts  chan os.Signal
+)
+
+// TermReadSecret reads a line exactly as TermRead does, with the terminal's echo
+// turned off while it waits — what the user types is not shown as it is typed.
+// It returns the line without the trailing newline, and parks only the calling
+// virtual thread. Backs hive.term.readSecret.
+//
+// The echo belongs to the terminal rather than to this program's standard input,
+// which is why that is where it is turned off: under `hive run` the line is
+// typed at the compiler's terminal and reaches this program through a relay file
+// (see TermRead), so the terminal is the only thing the two have in common.
+//
+// Where there is no terminal to turn the echo off on — input redirected from a
+// file, a job started with no terminal at all — the line is read all the same,
+// and only the hiding of it is lost.
+func TermReadSecret() string {
+	hidden := hideEcho()
+	line := TermRead()
+	showEcho()
+	// The Return that ended the line was not echoed either, so the cursor is
+	// still sitting at the end of the prompt. Move it on, as the echo of that
+	// Return would have.
+	if hidden {
+		fmt.Println()
+	}
+	return line
+}
+
+// hideEcho turns the echo off for this read and reports whether it is off —
+// false where there is no terminal, and so a visible read for the caller to
+// account for. Paired with showEcho.
+func hideEcho() bool {
+	echoMu.Lock()
+	defer echoMu.Unlock()
+	if echoReaders == 0 {
+		if restore, ok := termEchoOff(); ok {
+			echoRestore = restore
+			catchInterrupts()
+		}
+	}
+	echoReaders++
+	return echoRestore != nil
+}
+
+// showEcho puts the echo back once the last of the reads holding it off is done.
+func showEcho() {
+	echoMu.Lock()
+	defer echoMu.Unlock()
+	echoReaders--
+	if echoReaders == 0 {
+		restoreEcho()
+	}
+}
+
+// restoreEcho puts the echo back and stops watching for interrupts. Called with
+// echoMu held. Stopping before closing is what keeps the signal package from
+// ever sending down a channel that is already closed.
+func restoreEcho() {
+	if interrupts != nil {
+		signal.Stop(interrupts)
+		close(interrupts)
+		interrupts = nil
+	}
+	if echoRestore != nil {
+		echoRestore()
+		echoRestore = nil
+	}
+}
+
+// catchInterrupts watches, for as long as the echo is off, for the signals that
+// would otherwise end the program on the spot. A Return is not the only way out
+// of a prompt — the user can interrupt the program at one — and a terminal left
+// with its echo off shows nothing of what is typed into the shell that gets it
+// back. So the program still ends, after putting the echo back first. Called
+// with echoMu held.
+func catchInterrupts() {
+	interrupts = make(chan os.Signal, 1)
+	signal.Notify(interrupts, os.Interrupt, syscall.SIGTERM)
+	go func(caught chan os.Signal) {
+		// Closed rather than signalled: the read finished on its own and has
+		// put the echo back already.
+		if _, ok := <-caught; !ok {
+			return
+		}
+		echoMu.Lock()
+		restoreEcho()
+		echoMu.Unlock()
+		// The status a shell reports for a program an interrupt ended.
+		os.Exit(130)
+	}(interrupts)
+}
+"
+}
+
+/// Source of `hive/term_secret_unix.go`: turning the terminal's echo off
+/// everywhere that is not Windows.
+pub fn term_secret_unix_go() -> String {
+  "//go:build !windows
+
+package hive
+
+import (
+	\"os\"
+	\"os/exec\"
+)
+
+// termEchoOff turns the terminal's echo off and answers with what puts it back,
+// or ok false if there is no terminal to turn it off on.
+//
+// Which terminal is not this program's standard input: under `hive run` the line
+// is typed at the compiler, which relays it here through a file (see TermRead),
+// so the echo to stop is the one happening over there. The terminal itself is
+// what the two have in common, and the setting belongs to the device rather than
+// to the file description any one process holds it through — so reaching it
+// through any of these is as good as any other:
+//
+//   - /dev/tty, the controlling terminal, for a program run from a shell;
+//   - standard error, for one run under `hive run`, which is spawned into a
+//     session of its own — it has no controlling terminal to open by name, but
+//     the compiler does pass its standard error straight through to the
+//     terminal;
+//   - standard input, for anything else that happens to be a terminal.
+//
+// `stty` does the work rather than an ioctl of this program's own: the termios
+// request numbers differ between Linux and the BSDs (macOS included), where the
+// command is the same on every unix.
+func termEchoOff() (func(), bool) {
+	if tty, err := os.OpenFile(\"/dev/tty\", os.O_RDWR, 0); err == nil {
+		if stty(tty, \"-echo\") {
+			return func() {
+				stty(tty, \"echo\")
+				tty.Close()
+			}, true
+		}
+		tty.Close()
+	}
+	for _, stream := range []*os.File{os.Stderr, os.Stdin} {
+		if stty(stream, \"-echo\") {
+			terminal := stream
+			return func() { stty(terminal, \"echo\") }, true
+		}
+	}
+	return nil, false
+}
+
+// stty applies one terminal setting to tty, which it hands over as the standard
+// input of the command — the terminal `stty` acts on is its own — and reports
+// whether that worked.
+func stty(tty *os.File, setting string) bool {
+	command := exec.Command(\"stty\", setting)
+	command.Stdin = tty
+	return command.Run() == nil
+}
+"
+}
+
+/// Source of `hive/term_secret_windows.go`: turning the console's echo off on
+/// Windows, where there is no `stty` and the mode is a property of the console
+/// rather than of a device file.
+pub fn term_secret_windows_go() -> String {
+  "//go:build windows
+
+package hive
+
+import (
+	\"syscall\"
+	\"unsafe\"
+)
+
+// The console input mode bit that shows what is typed. Only it is cleared: the
+// line input bit stays on, so the console still gathers a whole line and hands
+// it over on Return — it just does not print it along the way.
+const enableEchoInput = 0x0004
+
+var (
+	kernel32           = syscall.NewLazyDLL(\"kernel32.dll\")
+	procGetConsoleMode = kernel32.NewProc(\"GetConsoleMode\")
+	procSetConsoleMode = kernel32.NewProc(\"SetConsoleMode\")
+)
+
+// termEchoOff turns the console's echo off and answers with what puts it back,
+// or ok false where there is no console (a program run with its input
+// redirected, or with no console attached at all).
+//
+// CONIN$ names the console's input buffer, which every process attached to the
+// console shares — under `hive run` that includes the compiler, which is the one
+// actually reading what is typed. This program's own standard input is a pipe
+// there, and has no console mode to change.
+func termEchoOff() (func(), bool) {
+	console, err := syscall.Open(\"CONIN$\", syscall.O_RDWR, 0)
+	if err != nil {
+		return nil, false
+	}
+	mode, ok := consoleMode(console)
+	if !ok || !setConsoleMode(console, mode&^enableEchoInput) {
+		syscall.Close(console)
+		return nil, false
+	}
+	return func() {
+		setConsoleMode(console, mode)
+		syscall.Close(console)
+	}, true
+}
+
+func consoleMode(console syscall.Handle) (uint32, bool) {
+	var mode uint32
+	done, _, _ := procGetConsoleMode.Call(
+		uintptr(console),
+		uintptr(unsafe.Pointer(&mode)),
+	)
+	return mode, done != 0
+}
+
+func setConsoleMode(console syscall.Handle, mode uint32) bool {
+	done, _, _ := procSetConsoleMode.Call(uintptr(console), uintptr(mode))
+	return done != 0
 }
 "
 }

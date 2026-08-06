@@ -1431,6 +1431,50 @@ pub fn crypto_jwt_verify_requires_with_test() {
   should.be_error(result)
 }
 
+pub fn crypto_encrypt_lowers_test() {
+  let go =
+    compile(
+      "func f(secret: Str, password: Str): Str {\n\treturn hive.crypto.encrypt(secret, password)\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "hive.Encrypt(secret, password)"))
+}
+
+// The arguments can be named, and naming them says nothing about the order they
+// are written in — as everywhere else in the language.
+pub fn crypto_encrypt_takes_named_arguments_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\techo hive.crypto.encrypt(password: \"pw\", plaintext: \"secret\")\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.Encrypt(\"secret\", \"pw\")"))
+}
+
+pub fn crypto_decrypt_returns_result_test() {
+  let go =
+    compile(
+      "func f(sealed: Str, password: Str): Str {\n\topened := hive.crypto.decrypt(sealed, password)\n\tif opened is Result.Ok(text) {\n\t\treturn text\n\t} else if opened is Result.Error(error) {\n\t\treturn error.reason\n\t}\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "hive.Decrypt(sealed, password)"))
+  should.be_true(string.contains(go, "return error.Reason"))
+}
+
+// Every marker the module is linked by has to be one the generated Go actually
+// carries: a program encrypting and nothing else would be built without the
+// module that encrypts it if this one were spelled differently.
+pub fn encrypting_pulls_in_the_crypto_module_test() {
+  should.equal(
+    used_modules(
+      "proc main(): void {\n\techo hive.crypto.encrypt(\"secret\", \"pw\")\n}\n",
+    ),
+    ["crypto", "json", "time"],
+  )
+}
+
+pub fn crypto_encrypt_wrong_arity_is_rejected_test() {
+  compiler.compile("proc main(): void {\n\techo hive.crypto.encrypt(\"x\")\n}\n")
+  |> should.be_error
+}
+
 pub fn unknown_crypto_builtin_is_rejected_test() {
   let result =
     compiler.compile("proc main(): void {\n\techo hive.crypto.md5(\"x\")\n}\n")
@@ -3626,6 +3670,70 @@ pub fn term_read_is_what_hive_run_relays_input_for_test() {
     runtime.term_go(),
     "os.Getenv(\"HIVE_RUN_STDIN_FILE\")",
   ))
+}
+
+pub fn term_read_secret_lowers_to_runtime_test() {
+  let go =
+    compile("proc main(): void {\n\tpw := hive.term.readSecret()\n\techo pw\n}\n")
+  should.be_true(string.contains(go, "pw := hive.TermReadSecret()"))
+}
+
+pub fn term_read_secret_is_a_string_test() {
+  compiler.compile(
+    "proc main(): void {\n\tStr pw = hive.term.readSecret()\n\techo pw\n}\n",
+  )
+  |> should.be_ok
+}
+
+// A program whose only read is a hidden one still needs `hive run` to relay the
+// input to it: `hive.TermReadSecret` reads through the same `TermRead`, and
+// nothing reaches that without the relay. `hive/cli` looks for both spellings —
+// the second is not a `hive.TermRead(` — and this is the half of that contract
+// living in the generated Go.
+pub fn term_read_secret_is_what_hive_run_relays_input_for_test() {
+  let go =
+    compile("proc main(): void {\n\tpw := hive.term.readSecret()\n\techo pw\n}\n")
+  should.be_true(string.contains(go, "hive.TermReadSecret("))
+  should.be_false(string.contains(go, "hive.TermRead()"))
+  should.be_true(string.contains(runtime.term_secret_go(), "TermRead()"))
+}
+
+// The echo is turned off per platform, and neither half of that is named in a
+// generated `main.go` — so they come along with the module that calls them
+// rather than on a marker of their own. Both are written; the build tag at the
+// top of each is what leaves one of them out of the build.
+pub fn hidden_read_pulls_in_both_halves_of_turning_the_echo_off_test() {
+  let hidden =
+    used_modules(
+      "proc main(): void {\n\tpw := hive.term.readSecret()\n\techo pw\n}\n",
+    )
+  should.be_true(list.contains(hidden, "term"))
+  should.be_true(list.contains(hidden, "term_secret"))
+  should.be_true(list.contains(hidden, "term_secret_unix"))
+  should.be_true(list.contains(hidden, "term_secret_windows"))
+  should.be_true(string.contains(
+    runtime.term_secret_unix_go(),
+    "//go:build !windows",
+  ))
+  should.be_true(string.contains(
+    runtime.term_secret_windows_go(),
+    "//go:build windows",
+  ))
+}
+
+// A program that only reads visibly is not built with any of it — the terminal
+// handling, and the process spawning it does on unix, are what a hidden read
+// costs and nothing else should pay it.
+pub fn visible_read_leaves_out_the_hiding_test() {
+  should.equal(
+    used_modules("proc main(): void {\n\tline := hive.term.read()\n\techo line\n}\n"),
+    ["term"],
+  )
+}
+
+pub fn term_read_secret_wrong_arity_is_rejected_test() {
+  compiler.compile("proc main(): void {\n\techo hive.term.readSecret(\"pw\")\n}\n")
+  |> should.be_error
 }
 
 pub fn term_args_is_a_string_vector_test() {

@@ -244,7 +244,9 @@ More complete programs — CSV parsing and a full tour of pattern matching (ever
 form above), the type system, an HTTP server that speaks JSON, a WebSocket
 echo server talking to its own client, a line-oriented raw TCP server doing the
 same, a `hive.crypto`
-walkthrough (hashing, HMAC, base64 and JWTs), a `hive.sql` example backed by an
+walkthrough (hashing, HMAC, encryption, base64 and JWTs), an encrypted
+command-line password manager whose master password never appears on screen —
+with a suite of its own, run by `hive test` — a `hive.sql` example backed by an
 embedded SQLite database, a tour of first-class functions and partial
 application, a tour of Hive's copy-on-binding [value
 semantics](#value-semantics-copy-on-binding), a tour of concurrency
@@ -1169,6 +1171,20 @@ works inside both `func`s and `proc`s. Fallible operations return
 * **Hashing** — `hive.crypto.sha256(input)` and `hive.crypto.sha512(input)`
   return a lowercase-hex digest; `hive.crypto.hmacSha256(input, key)` is the
   keyed (HMAC-SHA256) variant.
+* **Encryption** — `hive.crypto.encrypt(plaintext, password)` seals a string
+  under a password with **AES-256-GCM** and returns it base64-encoded (sealing
+  can't fail, so it is a plain `Str`);
+  `hive.crypto.decrypt(ciphertext, password)` opens it again, returning
+  `Result<Str, hive.crypto.CryptoError>`.
+
+  The key is derived from the password with 600,000 rounds of PBKDF2-HMAC-SHA256
+  over a random salt, and the salt and nonce are drawn afresh on every call — so
+  the same text under the same password never encrypts alike, and an attacker
+  pays that derivation on every password they guess at. GCM's authentication tag
+  travels with the ciphertext, so a message edited after it was encrypted is
+  rejected rather than opened into something else: it fails as
+  `"BadSignature"`, which is also what a wrong password gives (the tag cannot
+  tell you which of the two it was).
 * **Encoding** — `hive.crypto.base64Encode(input)` returns standard base64;
   `hive.crypto.base64Decode(input)` returns `Result<Str, hive.crypto.CryptoError>`.
 * **Random** — `hive.crypto.randomHex(bytes)` returns that many
@@ -1394,6 +1410,20 @@ Line-oriented terminal I/O.
   virtual thread: reached through an `async` call, the rest of the program keeps
   running on other threads while that goroutine waits. At end of input it
   returns whatever preceded EOF (`""` if nothing).
+* `hive.term.readSecret()` is that same read with the terminal's echo turned off
+  while it waits: a password is not left on the screen as it is typed, and the
+  cursor moves to the next line when the user presses Return. It reads through
+  the same input `read()` does, so everything above holds for it too — the
+  parking, the `""` at end of input, and the line arriving stripped of its
+  newline.
+
+  The echo is put back before the call returns, and also if the program is
+  interrupted at the prompt (which ends it with status 130, as an uncaught
+  interrupt does) — a terminal is never left hiding what is typed into the shell
+  that gets it back. Where there is no terminal at all — input redirected from a
+  file, a job started without one — the line is read exactly as `read()` reads
+  it, and only the hiding of it is lost. See
+  [`code-examples/16 - EXAMPLE APP - Password Vault`](code-examples/16%20-%20EXAMPLE%20APP%20-%20Password%20Vault/vault.hive).
 * `hive.term.args()` returns the command-line arguments the program was started
   with — in order, excluding the program name — as a `Str[dyn]`. `hive run`
   forwards anything after the entrypoint (`hive run app.hive a b c`), and a

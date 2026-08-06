@@ -99,10 +99,14 @@ pub fn run(entry: String, program_args: List(String)) -> Result(Int, String) {
   use dir_abs <- result.try(absolute(dir))
 
   // Where this program's input is handed over, for one that reads at all —
-  // `hive.term.read()` is what lowers to `hive.TermRead`. Nothing is relayed to
-  // a program that never reads. The path is absolute because the program is
-  // chdir'd to its own folder before `main` runs.
-  let input_relay = case string.contains(main_go, "hive.TermRead(") {
+  // `hive.term.read()` is what lowers to `hive.TermRead`, and
+  // `hive.term.readSecret()` to `hive.TermReadSecret`, which reads through it.
+  // Nothing is relayed to a program that never reads. The path is absolute
+  // because the program is chdir'd to its own folder before `main` runs.
+  let reads_input =
+    string.contains(main_go, "hive.TermRead(")
+    || string.contains(main_go, "hive.TermReadSecret(")
+  let input_relay = case reads_input {
     True ->
       filepath.join(
         filepath.join(dir_abs, base <> ".hive-build"),

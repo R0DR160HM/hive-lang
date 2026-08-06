@@ -1763,6 +1763,10 @@ fn check_crypto_call(fname: String, args: List(ast.Arg)) -> Result(Nil, String) 
     "randomHex" -> check_arity("`hive.crypto.randomHex`", args, ["bytes"])
     "hmacSha256" ->
       check_arity("`hive.crypto.hmacSha256`", args, ["input", "key"])
+    "encrypt" ->
+      check_arity("`hive.crypto.encrypt`", args, ["plaintext", "password"])
+    "decrypt" ->
+      check_arity("`hive.crypto.decrypt`", args, ["ciphertext", "password"])
     "jwtSign" -> check_arity("`hive.crypto.jwtSign`", args, ["claims", "secret"])
     "jwtHeader" -> check_arity("`hive.crypto.jwtHeader`", args, ["token"])
     "jwtVerify" ->
@@ -1779,8 +1783,9 @@ fn check_crypto_call(fname: String, args: List(ast.Arg)) -> Result(Nil, String) 
       Error(
         "unknown builtin `hive.crypto."
         <> fname
-        <> "` (available: sha256, sha512, hmacSha256, base64Encode, "
-        <> "base64Decode, randomHex, jwtSign, jwtVerify, jwtDecode, jwtHeader)",
+        <> "` (available: sha256, sha512, hmacSha256, encrypt, decrypt, "
+        <> "base64Encode, base64Decode, randomHex, jwtSign, jwtVerify, "
+        <> "jwtDecode, jwtHeader)",
       )
   }
 }
@@ -1869,12 +1874,13 @@ fn check_term_call(fname: String, args: List(ast.Arg)) -> Result(Nil, String) {
   case fname {
     "print" -> check_arity("`hive.term.print`", args, ["text"])
     "read" -> check_arity("`hive.term.read`", args, [])
+    "readSecret" -> check_arity("`hive.term.readSecret`", args, [])
     "args" -> check_arity("`hive.term.args`", args, [])
     _ ->
       Error(
         "unknown builtin `hive.term."
         <> fname
-        <> "` (available: print, read, args)",
+        <> "` (available: print, read, readSecret, args)",
       )
   }
 }
