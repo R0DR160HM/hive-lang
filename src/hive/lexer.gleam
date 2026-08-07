@@ -1,8 +1,11 @@
 //// The lexer turns Hive source text into a flat list of tokens.
 ////
 //// It skips `//` line comments and whitespace, tracks line numbers for error
-//// reporting, and matches keywords case-insensitively (identifiers keep their
-//// original spelling).
+//// reporting, and matches keywords exactly: every keyword is lower case and
+//// only lower case, so `IF` is not `if` — and it is not a name either, since
+//// reading it as one would hide the mistake somewhere else entirely. What a
+//// name may look like is `hive/naming`'s business, and the one it settles here
+//// is the atom, whose spelling the lexer is the last to hold.
 ////
 //// Three constructs need light context tracking:
 ////   * Double-quoted strings may contain `{expression}` interpolations; the
@@ -16,9 +19,11 @@
 import gleam/float
 import gleam/int
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import hive/diagnostic
+import hive/naming
 import hive/token.{type Token, Token}
 
 const alpha = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
@@ -88,7 +93,7 @@ fn do_lex_token(
     // A `{` right after a query header opens the raw SQL body.
     ["{", ..rest] ->
       case mode {
-        AwaitSql -> lex_sql(rest, line, acc, 1, "")
+        AwaitSql -> lex_sql(rest, line, line, acc, 1, "")
         // AwaitPath never reaches here: do_lex peels the path off first.
         Normal | AwaitPath -> emit(rest, line, mode, acc, token.LBrace)
       }
@@ -259,11 +264,16 @@ fn lex_atom(
   let #(taken, rest) = take_while(chars, is_ident_continue)
   case taken {
     [] -> Error(diagnostic.at(line, "expected an atom name after `#`"))
-    _ ->
-      do_lex(rest, line, mode, [
-        Token(token.AtomLit(string.concat(taken)), line),
-        ..acc
-      ])
+    _ -> {
+      // An atom is written where it is used and declared nowhere, so this is
+      // the only place its spelling is ever looked at.
+      let name = string.concat(taken)
+      use _ <- result.try(
+        naming.check(naming.Atom, name)
+        |> result.map_error(diagnostic.at(line, _)),
+      )
+      do_lex(rest, line, mode, [Token(token.AtomLit(name), line), ..acc])
+    }
   }
 }
 
@@ -308,27 +318,34 @@ fn is_path_char(c: String) -> Bool {
 
 // Captures everything between the query's braces verbatim, tracking nested
 // braces so `{param}` interpolations stay inside the body.
+//
+// The token carries the line the body *opens* on, not the one it closes on:
+// everything anyone says about a query body — a keyword miscased, a malformed
+// `WHERE` block — is said about the body as a whole, and the query is easier to
+// find by its first line than its last.
 fn lex_sql(
   chars: List(String),
+  start_line: Int,
   line: Int,
   acc: List(Token),
   depth: Int,
   buf: String,
 ) -> Result(List(Token), String) {
   case chars {
-    [] -> Error(diagnostic.at(line, "unterminated query body"))
-    ["{", ..rest] -> lex_sql(rest, line, acc, depth + 1, buf <> "{")
+    [] -> Error(diagnostic.at(start_line, "unterminated query body"))
+    ["{", ..rest] -> lex_sql(rest, start_line, line, acc, depth + 1, buf <> "{")
     ["}", ..rest] ->
       case depth {
         1 ->
           do_lex(rest, line, Normal, [
-            Token(token.SqlBody(dedent(strip_comment_lines(buf))), line),
+            Token(token.SqlBody(dedent(strip_comment_lines(buf))), start_line),
             ..acc
           ])
-        _ -> lex_sql(rest, line, acc, depth - 1, buf <> "}")
+        _ -> lex_sql(rest, start_line, line, acc, depth - 1, buf <> "}")
       }
-    ["\n", ..rest] -> lex_sql(rest, line + 1, acc, depth, buf <> "\n")
-    [c, ..rest] -> lex_sql(rest, line, acc, depth, buf <> c)
+    ["\n", ..rest] ->
+      lex_sql(rest, start_line, line + 1, acc, depth, buf <> "\n")
+    [c, ..rest] -> lex_sql(rest, start_line, line, acc, depth, buf <> c)
   }
 }
 
@@ -398,7 +415,9 @@ fn lex_ident(
 ) -> Result(List(Token), String) {
   let #(taken, rest) = take_while(chars, is_ident_continue)
   let word = string.concat(taken)
-  let kind = keyword_or_ident(word)
+  use kind <- result.try(
+    keyword_or_ident(word) |> result.map_error(diagnostic.at(line, _)),
+  )
   // The body that follows a `query` header is raw SQL, not statements, and what
   // follows `import` is a path, not tokens.
   let mode = case kind {
@@ -409,37 +428,64 @@ fn lex_ident(
   do_lex(rest, line, mode, [Token(kind, line), ..acc])
 }
 
-fn keyword_or_ident(word: String) -> token.Kind {
-  case string.lowercase(word) {
-    "import" -> token.KwImport
-    "proc" -> token.KwProc
-    "func" -> token.KwFunc
-    "query" -> token.KwQuery
-    "test" -> token.KwTest
-    "type" -> token.KwType
-    "if" -> token.KwIf
-    "else" -> token.KwElse
-    "return" -> token.KwReturn
-    "is" -> token.KwIs
-    "using" -> token.KwUsing
-    "with" -> token.KwWith
-    "void" -> token.KwVoid
-    "true" -> token.KwTrue
-    "false" -> token.KwFalse
-    "echo" -> token.KwEcho
-    "assert" -> token.KwAssert
-    "panic" -> token.KwPanic
-    "dyn" -> token.KwDyn
-    "mut" -> token.KwMut
-    "async" -> token.KwAsync
-    "await" -> token.KwAwait
-    "for" -> token.KwFor
-    "in" -> token.KwIn
-    "each" -> token.KwEach
-    "bounds" -> token.KwBounds
-    "break" -> token.KwBreak
-    "continue" -> token.KwContinue
-    _ -> token.Ident(word)
+// A word is a keyword when it is spelled the way the language spells one, and a
+// name when no keyword answers to it in any casing. What is left — `IF`, `Proc`,
+// `VOID` — is neither: it is a keyword written wrong, and saying so is the whole
+// reason this is not simply read as a name. A program that meant it as one has a
+// name to change; a program that meant the keyword has a shout to quieten. Both
+// are told here rather than somewhere further on where the shape of the mistake
+// is no longer visible.
+fn keyword_or_ident(word: String) -> Result(token.Kind, String) {
+  case keyword(word) {
+    Some(kind) -> Ok(kind)
+    None ->
+      case keyword(string.lowercase(word)) {
+        Some(_) ->
+          Error(
+            naming.miscased_keyword(word)
+            <> " — or, if a name was meant, one the language has not already "
+            <> "taken. A keyword is reserved however it is spelled, so `"
+            <> word
+            <> "` is no more a name than `"
+            <> string.lowercase(word)
+            <> "` is.",
+          )
+        None -> Ok(token.Ident(word))
+      }
+  }
+}
+
+fn keyword(word: String) -> Option(token.Kind) {
+  case word {
+    "import" -> Some(token.KwImport)
+    "proc" -> Some(token.KwProc)
+    "func" -> Some(token.KwFunc)
+    "query" -> Some(token.KwQuery)
+    "test" -> Some(token.KwTest)
+    "type" -> Some(token.KwType)
+    "if" -> Some(token.KwIf)
+    "else" -> Some(token.KwElse)
+    "return" -> Some(token.KwReturn)
+    "is" -> Some(token.KwIs)
+    "using" -> Some(token.KwUsing)
+    "with" -> Some(token.KwWith)
+    "void" -> Some(token.KwVoid)
+    "true" -> Some(token.KwTrue)
+    "false" -> Some(token.KwFalse)
+    "echo" -> Some(token.KwEcho)
+    "assert" -> Some(token.KwAssert)
+    "panic" -> Some(token.KwPanic)
+    "dyn" -> Some(token.KwDyn)
+    "mut" -> Some(token.KwMut)
+    "async" -> Some(token.KwAsync)
+    "await" -> Some(token.KwAwait)
+    "for" -> Some(token.KwFor)
+    "in" -> Some(token.KwIn)
+    "each" -> Some(token.KwEach)
+    "bounds" -> Some(token.KwBounds)
+    "break" -> Some(token.KwBreak)
+    "continue" -> Some(token.KwContinue)
+    _ -> None
   }
 }
 

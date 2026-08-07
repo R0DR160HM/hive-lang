@@ -509,7 +509,30 @@ compiles, builds and runs.
   whichever parameters the named ones didn't claim. Names must exist, can't
   repeat, and once named arguments are used the call must cover the full
   parameter list.
-* All keywords are case-insensitive; identifiers keep their spelling.
+* **Names have shapes, and a name's shape says what it is.** Keywords are lower
+  case and only lower case: `PROC` is not `proc`, and it is not a name either —
+  a keyword is reserved however it is spelled. Everything else follows what it
+  names:
+  * `camelCase` — variables, parameters, fields, every `proc`, `func` and
+    `query`, and the name an `import` is reached through, which reads as the
+    variable it stands in for.
+  * `UPPER_CASE` — a variable that is never reassigned, which is how a constant
+    is written. A `mut` variable may not be written this way, nor may a loop
+    counter, which is one.
+  * `PascalCase` — types, their variants and atoms: `User`, `Result.Ok`,
+    `#Ready`. The types the language declares are spelled no differently from
+    yours, so `Str` is a type and `str` is not.
+
+  A name may open with a single `_` — `_scratch`, `_helperOf`, `_MAX` — an
+  informal note that it is private, or is here only because something had to be.
+  The compiler asks nothing of the prefix and offers nothing for it. On its own,
+  `_` is the binding that throws its value away.
+
+  SQL keeps its own convention rather than Hive's: inside a `query` body the SQL
+  keywords are **upper case** (`SELECT`, `FROM`, `WHERE`), and everything else
+  in there is a name the database chose, which keeps whatever spelling it has
+  over there. One that collides with a keyword says so the way SQL always has —
+  in quotes: `SELECT "order" FROM ...`.
 
 ## Value semantics (copy-on-binding)
 
@@ -1291,16 +1314,18 @@ know it, with a `reason` telling them apart:
 | `"Shape"` | the row came back with a different number of columns |
 | `"Convert"` | a cell did not fit the type its field was declared with |
 
-#### Optional filters: `where { }`
+#### Optional filters: `WHERE { }`
 
 Most "dynamic" queries are a fixed query with optional predicates, and that
-needs no string building. A `where` block ANDs the predicates whose conditions
-hold; a nested `or { }` or `and { }` flips the connective:
+needs no string building. A `WHERE` block ANDs the predicates whose conditions
+hold; a nested `or { }` or `and { }` flips the connective. The block is written
+in upper case, like the clause it becomes; what decides which predicates go into
+it is Hive's own `if`, `and` and `or`, written like the rest of your program:
 
 ```hive
 query findColonies(apiary: Str, minFrames: Int, small: Bool, huge: Bool): Colony[dyn] {
 	SELECT name, apiary, frames FROM colonies
-	where {
+	WHERE {
 		if apiary != ""   { apiary = {apiary} }
 		if minFrames > 0  { frames >= {minFrames} }
 		or {
@@ -1319,7 +1344,7 @@ predicate is parenthesised, so nesting cannot change how the surrounding
 connective binds. Every branch's text is fixed at compile time; only which
 branches are taken is decided at runtime.
 
-Two things a `where` block deliberately cannot do. A **column name or sort
+Two things a `WHERE` block deliberately cannot do. A **column name or sort
 direction** can never be a parameter — `ORDER BY {col}` would sort by a constant
 string — so make the choices a variant type and dispatch to one query per
 ordering; the compiler then checks the match is exhaustive and injecting a column

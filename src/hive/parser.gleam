@@ -2,6 +2,11 @@
 ////
 //// Each helper consumes tokens from the front of the list and returns the
 //// produced node together with the remaining tokens, or an error message.
+////
+//// It is also where a name's spelling is held to the rules in `hive/naming`.
+//// This is the pass that knows what a name *is* — the same identifier token is
+//// a type in one position and a field in the next — and the last one holding
+//// the line to report it against.
 
 import gleam/dict
 import gleam/list
@@ -12,6 +17,7 @@ import hive/ast
 import hive/builtins
 import hive/diagnostic
 import hive/lexer
+import hive/naming
 import hive/token.{type Token, Token}
 
 type Toks =
@@ -78,6 +84,104 @@ fn expect_ident(tokens: Toks) -> Result(#(String, Toks), String) {
         tokens,
         "expected an identifier but found " <> token.describe(other),
       ))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Names
+// ---------------------------------------------------------------------------
+
+// The same identifier token is a type in one position and a field in the next,
+// so which shape it has to have is decided here, where the position is known —
+// and reported against the token itself, which is the last place its line is
+// still in hand.
+fn expect_name(
+  tokens: Toks,
+  role: naming.Role,
+) -> Result(#(String, Toks), String) {
+  use #(name, rest) <- result.try(expect_ident(tokens))
+  use _ <- result.try(named(tokens, role, name))
+  Ok(#(name, rest))
+}
+
+fn named(tokens: Toks, role: naming.Role, name: String) -> Result(Nil, String) {
+  naming.check(role, name) |> result.map_error(at(tokens, _))
+}
+
+// Every name a type expression carries. Types are checked from here rather than
+// inside `parse_type_expr`, which is also asked to read things that turn out not
+// to be types at all (see `parse_typed_or_expr`) and whose failure there has to
+// stay an ordinary one — so the check happens where the type is committed to.
+fn check_type(typ: ast.TypeExpr, tokens: Toks) -> Result(Nil, String) {
+  case typ {
+    ast.TVoid -> Ok(Nil)
+    ast.TFunc(_, params, ret) -> {
+      use _ <- result.try(check_types(params, tokens))
+      check_type(ret, tokens)
+    }
+    ast.TName(pkg, name, args, _) -> {
+      use _ <- result.try(case pkg {
+        Some(path) -> check_qualifier(string.split(path, "."), tokens)
+        None -> Ok(Nil)
+      })
+      use _ <- result.try(named(tokens, naming.Type, name))
+      check_types(args, tokens)
+    }
+  }
+}
+
+fn check_types(types: List(ast.TypeExpr), tokens: Toks) -> Result(Nil, String) {
+  list.try_map(types, check_type(_, tokens)) |> result.replace(Nil)
+}
+
+// What stands in front of a name: the module it was imported as
+// (`hive.net.HttpRequest`), and — in a pattern — the type a variant belongs to
+// (`Result.Ok`). Both spellings are allowed in front, since only the last
+// segment says which of the two the qualifier was.
+fn check_qualifier(segments: List(String), tokens: Toks) -> Result(Nil, String) {
+  list.try_map(segments, fn(segment) {
+    case
+      naming.fits(naming.Module, segment) || naming.fits(naming.Type, segment)
+    {
+      True -> Ok(Nil)
+      False ->
+        Error(at(
+          tokens,
+          "`"
+            <> segment
+            <> "` is neither a module nor a type, and what stands in front of a "
+            <> "name is one or the other: a module in camelCase "
+            <> "(`hive.sql.SqlError`) or the type a variant belongs to in "
+            <> "PascalCase (`Result.Ok`).",
+        ))
+    }
+  })
+  |> result.replace(Nil)
+}
+
+// A word that is a keyword only where it is written — `as`, `run`, `raw`, `csv`
+// — is matched by the parser rather than lexed, which is what keeps `run` and
+// `by` usable as names everywhere else. The lexer's rule that a keyword is lower
+// case cannot reach those, so it is applied here, in the positions where nothing
+// but the keyword could have been meant.
+fn miscased(word: String, want: String) -> Bool {
+  word != want && string.lowercase(word) == want
+}
+
+// What to say about the word standing where `want` had to be: that it is `want`
+// shouted, or `otherwise` when it is something else entirely.
+fn expected_word(
+  found: Option(String),
+  want: String,
+  otherwise: String,
+) -> String {
+  case found {
+    Some(word) ->
+      case miscased(word, want) {
+        True -> naming.miscased_keyword(word) <> "."
+        False -> otherwise
+      }
+    None -> otherwise
   }
 }
 
@@ -154,20 +258,26 @@ fn parse_import(tokens: Toks) -> Result(#(ast.Import, Toks), String) {
   })
   case kind(t1) {
     token.Ident(word) ->
-      case string.lowercase(word) {
+      case word {
         "as" -> {
-          use #(alias, t2) <- result.try(expect_ident(tail(t1)))
+          use #(alias, t2) <- result.try(expect_name(tail(t1), naming.Module))
           Ok(#(ast.Import(path, alias, at_line), t2))
         }
+        // Nothing but `as` can follow a path, so a word that is `as` shouted is
+        // that, rather than a name that has turned up in an impossible place.
         _ ->
-          Error(at(
-            t1,
-            "expected `as` or the next declaration after `import "
-              <> path
-              <> "` but found identifier `"
-              <> word
-              <> "`",
-          ))
+          case miscased(word, "as") {
+            True -> Error(at(t1, naming.miscased_keyword(word) <> "."))
+            False ->
+              Error(at(
+                t1,
+                "expected `as` or the next declaration after `import "
+                  <> path
+                  <> "` but found identifier `"
+                  <> word
+                  <> "`",
+              ))
+          }
       }
     _ -> {
       use alias <- result.try(default_alias(path, at_line))
@@ -182,7 +292,16 @@ fn default_alias(path: String, at_line: Int) -> Result(String, String) {
   let base =
     string.split(path, "/") |> list.last |> result.unwrap("")
   case is_usable_name(base) {
-    True -> Ok(base)
+    True -> {
+      // A file whose name is not a name — `String_Utils.hive` — needs the
+      // explicit form too: what it would be reached through has to read like
+      // any other name in the program.
+      use _ <- result.try(
+        naming.check(naming.Module, base)
+        |> result.map_error(diagnostic.at(at_line, _)),
+      )
+      Ok(base)
+    }
     False ->
       Error(diagnostic.at(
         at_line,
@@ -213,12 +332,13 @@ fn parse_header(
   kw: token.Kind,
 ) -> Result(#(String, List(ast.Field), ast.TypeExpr, Toks), String) {
   use t1 <- result.try(expect(tokens, kw))
-  use #(name, t2) <- result.try(expect_ident(t1))
+  use #(name, t2) <- result.try(expect_name(t1, naming.Callable))
   use t3 <- result.try(expect(t2, token.LParen))
   use #(params, t4) <- result.try(parse_params(t3, []))
   use t5 <- result.try(expect(t4, token.RParen))
   use t6 <- result.try(expect(t5, token.Colon))
   use #(ret, t7) <- result.try(parse_type_expr(t6))
+  use _ <- result.try(check_type(ret, t6))
   Ok(#(name, params, ret, t7))
 }
 
@@ -297,7 +417,10 @@ fn parse_sql_parts(sql: String, line: Int) -> Result(List(ast.SqlPart), String) 
     split_sql(string.to_graphemes(sql), line, "", [], False),
   )
   case rest {
-    [] -> Ok(parts)
+    [] -> {
+      use _ <- result.try(check_sql_case(parts, line))
+      Ok(parts)
+    }
     _ -> Error(diagnostic.at(line, "unexpected `}` in a query body"))
   }
 }
@@ -324,11 +447,11 @@ fn split_sql(
       split_sql(after, line, "", [ast.SqlParam(e), ..push_sql_lit(buf, acc)], nested)
     }
     _ ->
-      // A `where` block only starts at a word boundary and only when a `{`
-      // follows it — so both `nowhere` and an ordinary `WHERE name = {x}` stay
+      // A `WHERE` block only starts at a word boundary and only when a `{`
+      // follows it — so both `NOWHERE` and an ordinary `WHERE name = {x}` stay
       // literal SQL.
-      case opens_where(chars, buf) {
-        True -> {
+      case opens_where(chars, buf), miscased_where(chars, buf) {
+        True, _ -> {
           let after_kw = list.drop(chars, 5)
           use #(group, rest) <- result.try(parse_group(after_kw, line, True))
           split_sql(
@@ -339,7 +462,17 @@ fn split_sql(
             nested,
           )
         }
-        False ->
+        // A bare word in front of a `{` is nothing SQL has, so this is the
+        // block opener and not something that merely reads like one.
+        _, True ->
+          Error(diagnostic.at(
+            line,
+            "the block that becomes a `WHERE` clause is written the way the "
+              <> "clause is — `WHERE { ... }`, in upper case like the SQL "
+              <> "around it. The `if`, `and` and `or` inside it are Hive's own "
+              <> "words rather than SQL's, and stay in lower case.",
+          ))
+        _, _ ->
           case chars {
             [c, ..rest] -> split_sql(rest, line, buf <> c, acc, nested)
             [] -> Ok(#(list.reverse(push_sql_lit(buf, acc)), []))
@@ -349,9 +482,15 @@ fn split_sql(
 }
 
 fn opens_where(chars: List(String), buf: String) -> Bool {
-  starts_word(chars, "where")
-  && ends_word(buf)
-  && case skip_space(list.drop(chars, 5)) {
+  starts_word(chars, "WHERE") && ends_word(buf) && opens_block(chars)
+}
+
+fn miscased_where(chars: List(String), buf: String) -> Bool {
+  starts_word_anycase(chars, "where") && ends_word(buf) && opens_block(chars)
+}
+
+fn opens_block(chars: List(String)) -> Bool {
+  case skip_space(list.drop(chars, 5)) {
     ["{", ..] -> True
     _ -> False
   }
@@ -404,13 +543,27 @@ fn parse_items(
           )
           parse_items(after, line, [ast.SqlNested(group), ..acc])
         }
-        _, _, _ ->
-          Error(diagnostic.at(
-            line,
-            "a `where` block holds `if <condition> { ... }` predicates and "
-              <> "nested `and { ... }` / `or { ... }` groups; found something "
-              <> "else",
-          ))
+        _, _, _ -> {
+          let found = head_word(chars)
+          case list.contains(["if", "or", "and"], string.lowercase(found)) {
+            True ->
+              Error(diagnostic.at(
+                line,
+                naming.miscased_keyword(found)
+                  <> ". Inside a `WHERE` block these are Hive's own words, not "
+                  <> "SQL's: the block is upper case because it becomes a "
+                  <> "clause, and what decides what goes into it is written "
+                  <> "like the rest of your program.",
+              ))
+            False ->
+              Error(diagnostic.at(
+                line,
+                "a `WHERE` block holds `if <condition> { ... }` predicates and "
+                  <> "nested `and { ... }` / `or { ... }` groups; found "
+                  <> "something else",
+              ))
+          }
+        }
       }
   }
 }
@@ -448,18 +601,165 @@ fn skip_space(chars: List(String)) -> List(String) {
   }
 }
 
-// Whether `chars` begins with `word` (case-insensitively) followed by something
-// that is not a word character — so `and` matches but `android` does not.
+// Whether `chars` begins with `word`, followed by something that is not a word
+// character — so `and` matches but `android` does not. The comparison is exact:
+// a query body holds two languages, and which one a word belongs to is written
+// into it. `WHERE` is the clause it becomes; `if` is Hive's.
 fn starts_word(chars: List(String), word: String) -> Bool {
-  let n = string.length(word)
-  let head =
-    chars |> list.take(n) |> string.concat |> string.lowercase
-  case head == word {
-    False -> False
-    True ->
-      case list.drop(chars, n) {
-        [] -> True
-        [c, ..] -> !is_word_char(c)
+  head_word(chars) == word
+}
+
+// The same, ignoring case — for telling a miscased keyword apart from something
+// that was never one.
+fn starts_word_anycase(chars: List(String), word: String) -> Bool {
+  string.lowercase(head_word(chars)) == string.lowercase(word)
+}
+
+// The word `chars` opens with, empty when it does not open with one.
+fn head_word(chars: List(String)) -> String {
+  let #(taken, _) = take_word(chars)
+  string.concat(taken)
+}
+
+fn take_word(chars: List(String)) -> #(List(String), List(String)) {
+  case chars {
+    [c, ..rest] ->
+      case is_word_char(c) {
+        True -> {
+          let #(taken, remaining) = take_word(rest)
+          #([c, ..taken], remaining)
+        }
+        False -> #([], chars)
+      }
+    [] -> #([], [])
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The case of SQL
+// ---------------------------------------------------------------------------
+// A query body is SQL, and SQL writes its keywords in upper case. Everything
+// else in there is a name somebody else chose — a table, a column, an alias —
+// and keeps whatever spelling that database gave it, which is why only the words
+// below are looked at and why the list holds none of the type names a `CREATE
+// TABLE` uses: `text` and `date` are columns far more often than they are
+// anything else.
+//
+// A table or column that really is called `order` says so the way SQL has always
+// said it, in quotes — and quoted names are skipped here along with string
+// literals and comments, so writing one is all it takes.
+
+/// The words that shape a statement rather than name something in it.
+const sql_keywords = [
+  "add", "all", "alter", "and", "any", "as", "asc", "autoincrement", "begin",
+  "between", "by", "cascade", "case", "check", "collate", "column", "commit",
+  "conflict", "constraint", "create", "cross", "default", "delete", "desc",
+  "distinct", "do", "drop", "else", "end", "except", "exists", "foreign",
+  "from", "full", "group", "having", "if", "in", "index", "inner", "insert",
+  "intersect", "into", "is", "join", "key", "left", "like", "limit", "natural",
+  "not", "nothing", "null", "offset", "on", "or", "order", "outer", "primary",
+  "recursive", "references", "returning", "right", "rollback", "select", "set",
+  "table", "then", "transaction", "truncate", "union", "unique", "update",
+  "using", "values", "view", "when", "where", "with",
+]
+
+fn check_sql_case(parts: List(ast.SqlPart), line: Int) -> Result(Nil, String) {
+  list.try_map(parts, fn(part) {
+    case part {
+      ast.SqlLit(text) -> scan_sql(string.to_graphemes(text), line, False)
+      // An interpolated value never enters the text — it becomes a placeholder
+      // — and the expression behind it is Hive's, checked as Hive's.
+      ast.SqlParam(_) -> Ok(Nil)
+      ast.SqlWhere(group) -> check_sql_group(group, line)
+    }
+  })
+  |> result.replace(Nil)
+}
+
+fn check_sql_group(group: ast.SqlGroup, line: Int) -> Result(Nil, String) {
+  list.try_map(group.items, fn(item) {
+    case item {
+      ast.SqlCond(_, body) -> check_sql_case(body, line)
+      ast.SqlNested(inner) -> check_sql_group(inner, line)
+    }
+  })
+  |> result.replace(Nil)
+}
+
+// `qualified` is set by a `.`: what follows one is a column of whatever came
+// before it, so `t.order` is left alone.
+fn scan_sql(
+  chars: List(String),
+  line: Int,
+  qualified: Bool,
+) -> Result(Nil, String) {
+  case chars {
+    [] -> Ok(Nil)
+    ["-", "-", ..rest] -> scan_sql(drop_line(rest), line, False)
+    ["/", "*", ..rest] -> scan_sql(drop_block_comment(rest), line, False)
+    ["'", ..rest] -> scan_sql(drop_quoted(rest, "'"), line, False)
+    ["\"", ..rest] -> scan_sql(drop_quoted(rest, "\""), line, False)
+    ["`", ..rest] -> scan_sql(drop_quoted(rest, "`"), line, False)
+    [".", ..rest] -> scan_sql(rest, line, True)
+    [c, ..rest] ->
+      case is_word_char(c) {
+        False -> scan_sql(rest, line, False)
+        True -> {
+          let #(taken, after) = take_word(chars)
+          use _ <- result.try(case qualified {
+            True -> Ok(Nil)
+            False -> check_sql_word(string.concat(taken), line)
+          })
+          scan_sql(after, line, False)
+        }
+      }
+  }
+}
+
+fn check_sql_word(word: String, line: Int) -> Result(Nil, String) {
+  case
+    word == string.uppercase(word)
+    || !list.contains(sql_keywords, string.lowercase(word))
+  {
+    True -> Ok(Nil)
+    False ->
+      Error(diagnostic.at(
+        line,
+        "`"
+          <> word
+          <> "` is a SQL keyword, and SQL writes its keywords in upper case: `"
+          <> string.uppercase(word)
+          <> "`. If it is the name of a table or a column, say so the way SQL "
+          <> "does — in quotes: \""
+          <> word
+          <> "\".",
+      ))
+  }
+}
+
+fn drop_line(chars: List(String)) -> List(String) {
+  case chars {
+    [] -> []
+    ["\n", ..rest] -> rest
+    [_, ..rest] -> drop_line(rest)
+  }
+}
+
+fn drop_block_comment(chars: List(String)) -> List(String) {
+  case chars {
+    [] -> []
+    ["*", "/", ..rest] -> rest
+    [_, ..rest] -> drop_block_comment(rest)
+  }
+}
+
+fn drop_quoted(chars: List(String), quote: String) -> List(String) {
+  case chars {
+    [] -> []
+    [c, ..rest] ->
+      case c == quote {
+        True -> rest
+        False -> drop_quoted(rest, quote)
       }
   }
 }
@@ -520,7 +820,7 @@ fn parse_params(
   case kind(tokens) {
     token.RParen -> Ok(#(list.reverse(acc), tokens))
     _ -> {
-      use #(pname, t1) <- result.try(expect_ident(tokens))
+      use #(pname, t1) <- result.try(expect_name(tokens, naming.Parameter))
       use t2 <- result.try(expect(t1, token.Colon))
       // `name: mut T` — the parameter is the caller's mutex, not a view of it.
       // This is the one type position where `mut` is part of the spelling, which
@@ -530,6 +830,7 @@ fn parse_params(
         _ -> #(False, t2)
       }
       use #(ptype, t3) <- result.try(parse_type_expr(t2))
+      use _ <- result.try(check_type(ptype, t2))
       let param = ast.Field(pname, ptype, mutable)
       case kind(t3) {
         token.Comma -> parse_params(tail(t3), [param, ..acc])
@@ -541,7 +842,7 @@ fn parse_params(
 
 fn parse_type(tokens: Toks) -> Result(#(ast.Decl, Toks), String) {
   use t1 <- result.try(expect(tokens, token.KwType))
-  use #(name, t2) <- result.try(expect_ident(t1))
+  use #(name, t2) <- result.try(expect_name(t1, naming.Type))
   use t3 <- result.try(expect(t2, token.LBrace))
   use #(variants, commons, t4) <- result.try(parse_type_items(t3, [], []))
   Ok(#(ast.TypeDecl(name, variants, commons), t4))
@@ -555,24 +856,33 @@ fn parse_type_items(
   case kind(tokens) {
     token.RBrace ->
       Ok(#(list.reverse(variants), list.reverse(commons), tail(tokens)))
+    // What follows the name says which of the two this is, and the name's own
+    // shape says it again: a variant is PascalCase and a field camelCase, so the
+    // two never read as each other even at a glance.
     _ -> {
       use #(name, t1) <- result.try(expect_ident(tokens))
       case kind(t1) {
         // `Name { ... }` — a variant carrying fields
         token.LBrace -> {
+          use _ <- result.try(named(tokens, naming.Variant, name))
           use #(fields, t2) <- result.try(parse_fields(tail(t1), []))
           parse_type_items(t2, [ast.Variant(name, fields), ..variants], commons)
         }
         // `name: Type` — a common field shared by every variant
         token.Colon -> {
+          use _ <- result.try(named(tokens, naming.Field, name))
           use #(ftype, t2) <- result.try(parse_type_expr(tail(t1)))
+          use _ <- result.try(check_type(ftype, tail(t1)))
           parse_type_items(t2, variants, [
             ast.Field(name, ftype, False),
             ..commons
           ])
         }
         // `Name` — a bare variant with no fields
-        _ -> parse_type_items(t1, [ast.Variant(name, []), ..variants], commons)
+        _ -> {
+          use _ <- result.try(named(tokens, naming.Variant, name))
+          parse_type_items(t1, [ast.Variant(name, []), ..variants], commons)
+        }
       }
     }
   }
@@ -586,9 +896,10 @@ fn parse_fields(
     token.RBrace -> Ok(#(list.reverse(acc), tail(tokens)))
     token.Comma -> parse_fields(tail(tokens), acc)
     _ -> {
-      use #(fname, t1) <- result.try(expect_ident(tokens))
+      use #(fname, t1) <- result.try(expect_name(tokens, naming.Field))
       use t2 <- result.try(expect(t1, token.Colon))
       use #(ftype, t3) <- result.try(parse_type_expr(t2))
+      use _ <- result.try(check_type(ftype, t2))
       parse_fields(t3, [ast.Field(fname, ftype, False), ..acc])
     }
   }
@@ -786,6 +1097,7 @@ fn parse_stmt(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
     token.Ident(name) ->
       case kind(tail(tokens)) {
         token.ColonEq -> {
+          use _ <- result.try(named(tokens, naming.Variable, name))
           use #(value, t2) <- result.try(parse_expr(tail(tail(tokens))))
           Ok(#(ast.SVarDecl(name, value, False), t2))
         }
@@ -801,6 +1113,7 @@ fn parse_stmt(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
 fn parse_mut(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
   case kind(tokens), kind(tail(tokens)) {
     token.Ident(name), token.ColonEq -> {
+      use _ <- result.try(named(tokens, naming.MutVariable, name))
       use #(value, t2) <- result.try(parse_expr(tail(tail(tokens))))
       Ok(#(ast.SVarDecl(name, value, True), t2))
     }
@@ -808,6 +1121,8 @@ fn parse_mut(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
       use #(typ, t1) <- result.try(parse_type_expr(tokens))
       case kind(t1), kind(tail(t1)) {
         token.Ident(vname), token.Assign -> {
+          use _ <- result.try(check_type(typ, tokens))
+          use _ <- result.try(named(t1, naming.MutVariable, vname))
           use #(value, t2) <- result.try(parse_expr(tail(tail(t1))))
           Ok(#(ast.STypedDecl(typ, vname, value, True), t2))
         }
@@ -867,7 +1182,11 @@ fn parse_typed_or_expr(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
   case parse_type_expr(tokens) {
     Ok(#(typ, t1)) ->
       case kind(t1), kind(tail(t1)) {
+        // Committed: this is a declaration, so the type it names is one too and
+        // is held to a type's spelling from here on.
         token.Ident(vname), token.Assign -> {
+          use _ <- result.try(check_type(typ, tokens))
+          use _ <- result.try(named(t1, naming.Variable, vname))
           use #(value, t2) <- result.try(parse_expr(tail(tail(t1))))
           Ok(#(ast.STypedDecl(typ, vname, value, False), t2))
         }
@@ -968,10 +1287,11 @@ fn parse_for(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
 // `for each name in iterable { body }`. The element type is inferred from the
 // vector; an optional `name: T` annotation overrides that inference.
 fn parse_for_each(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
-  use #(name, t1) <- result.try(expect_ident(tokens))
+  use #(name, t1) <- result.try(expect_name(tokens, naming.Binding))
   use #(elem_type, t2) <- result.try(case kind(t1) {
     token.Colon -> {
       use #(typ, t) <- result.try(parse_type_expr(tail(t1)))
+      use _ <- result.try(check_type(typ, tail(t1)))
       Ok(#(Some(typ), t))
     }
     _ -> Ok(#(None, t1))
@@ -1028,14 +1348,22 @@ fn parse_for_c(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
 
 // The init clause is an ordinary statement, but a variable it declares is
 // forced mutable: the loop's post clause advances it (`i = i + 1`), which the
-// mutability check would otherwise reject.
+// mutability check would otherwise reject. Its name is checked again for the
+// same reason — a counter is not a constant, whatever it looked like when
+// `parse_stmt` read it as an ordinary declaration.
 fn parse_for_init(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
   use #(stmt, rest) <- result.try(parse_stmt(tokens))
-  let stmt = case stmt {
-    ast.SVarDecl(name, value, _) -> ast.SVarDecl(name, value, True)
-    ast.STypedDecl(typ, name, value, _) -> ast.STypedDecl(typ, name, value, True)
-    _ -> stmt
-  }
+  use stmt <- result.try(case stmt {
+    ast.SVarDecl(name, value, _) -> {
+      use _ <- result.try(named(tokens, naming.MutVariable, name))
+      Ok(ast.SVarDecl(name, value, True))
+    }
+    ast.STypedDecl(typ, name, value, _) -> {
+      use _ <- result.try(named(tokens, naming.MutVariable, name))
+      Ok(ast.STypedDecl(typ, name, value, True))
+    }
+    _ -> Ok(stmt)
+  })
   Ok(#(stmt, rest))
 }
 
@@ -1266,6 +1594,7 @@ fn parse_with_type(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
         }
         False -> {
           use #(typ, t2) <- result.try(parse_type_expr(tail(t1)))
+          use _ <- result.try(check_type(typ, tail(t1)))
           Ok(#(ast.EWith(value, typ), t2))
         }
       }
@@ -1273,13 +1602,15 @@ fn parse_with_type(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
   }
 }
 
-// `timeout` in `with timeout <ms>`. Matched case-insensitively like every other
-// keyword, but deliberately not lexed as one: making it a reserved word would
-// stop anyone naming a variable `timeout`, and this is the only position where
-// the spelling means anything.
+// `timeout` in `with timeout <ms>`. Lower case like every keyword, but
+// deliberately not lexed as one: making it a reserved word would stop anyone
+// naming a variable `timeout`, and this is the only position where the spelling
+// means anything. It is also the one position where the *other* casings are
+// taken: `with Timeout` names a decode target, and a type may well be called
+// that.
 fn is_timeout_word(tokens: Toks) -> Bool {
   case kind(tokens) {
-    token.Ident(name) -> string.lowercase(name) == "timeout"
+    token.Ident(name) -> name == "timeout"
     _ -> False
   }
 }
@@ -1558,7 +1889,10 @@ fn parse_sub_expr(code: String, line: Int) -> Result(ast.Expr, String) {
 //
 // `as`, `csv`, `xlsx`, `ods`, `separating`, `by` and `run` are matched as plain
 // words rather than keywords, so a variable or proc named `run` or `by` still
-// works everywhere else in the language.
+// works everywhere else in the language. Each is spelled in lower case, like
+// every keyword — and, unlike a lexed one, a different spelling here is simply
+// a name, since the next statement may well start with one. The positions that
+// admit nothing but the keyword say so instead (see `parse_using_format`).
 fn parse_using(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
   let t1 = tail(tokens)
   // Operands are parsed at the postfix level so a call (e.g. a `query` producing
@@ -1579,6 +1913,16 @@ fn parse_using(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
     _, Some("as") -> parse_using_format(source, tail(t2))
     _, Some("run") -> {
       let t3 = tail(t2)
+      // Anything else here is the query being run, and a query is camelCase —
+      // so `RAW` is this word shouted rather than something to call.
+      use _ <- result.try(case word(t3) {
+        Some(other) ->
+          case miscased(other, "raw") {
+            True -> Error(at(t3, naming.miscased_keyword(other) <> "."))
+            False -> Ok(Nil)
+          }
+        None -> Ok(Nil)
+      })
       case word(t3) {
         // `run raw <text>` runs SQL assembled at runtime. Saying so is the
         // point: it is the one form whose shape nothing can be known about, and
@@ -1613,7 +1957,13 @@ fn parse_using_format(
               use #(separator, t2) <- result.try(parse_postfix(tail(tail(t1))))
               Ok(#(ast.EUsing(source, ast.UsingCsv(Some(separator))), t2))
             }
-            _ -> Error(at(tail(t1), "expected `by` after `separating`"))
+            // `separating` promises a `by`, so nothing else can be standing
+            // here — including this one shouted.
+            found ->
+              Error(at(
+                tail(t1),
+                expected_word(found, "by", "expected `by` after `separating`"),
+              ))
           }
         _ -> Ok(#(ast.EUsing(source, ast.UsingCsv(None)), t1))
       }
@@ -1621,12 +1971,16 @@ fn parse_using_format(
     Some("xlsx") -> Ok(#(ast.EUsing(source, ast.UsingXlsx), tail(tokens)))
     Some("ods") -> Ok(#(ast.EUsing(source, ast.UsingOds), tail(tokens)))
     Some(other) ->
-      Error(at(
-        tokens,
-        "`using ... as "
-          <> other
-          <> "` is not a table format (expected `csv`, `xlsx` or `ods`)",
-      ))
+      case list.any(["csv", "xlsx", "ods"], miscased(other, _)) {
+        True -> Error(at(tokens, naming.miscased_keyword(other) <> "."))
+        False ->
+          Error(at(
+            tokens,
+            "`using ... as "
+              <> other
+              <> "` is not a table format (expected `csv`, `xlsx` or `ods`)",
+          ))
+      }
     None ->
       Error(at(
         tokens,
@@ -1636,11 +1990,11 @@ fn parse_using_format(
   }
 }
 
-// The identifier at the front of `tokens`, lowercased — the language matches its
-// keywords case-insensitively, and these words follow suit.
+// The identifier at the front of `tokens`, spelled the way the source spelled
+// it: the words compared against it are keywords, so they are matched exactly.
 fn word(tokens: Toks) -> Option(String) {
   case kind(tokens) {
-    token.Ident(name) -> Some(string.lowercase(name))
+    token.Ident(name) -> Some(name)
     _ -> None
   }
 }
@@ -1660,6 +2014,7 @@ fn parse_pattern(tokens: Toks) -> Result(#(ast.Pattern, Toks), String) {
     _ -> {
       use #(first, t1) <- result.try(expect_ident(tokens))
       use #(path, t2) <- result.try(parse_pattern_path(t1, [first]))
+      use _ <- result.try(check_pattern_path(path, tokens))
       case kind(t2) {
         token.LParen -> {
           use #(bindings, t3) <- result.try(parse_bindings(tail(t2), []))
@@ -1680,7 +2035,7 @@ fn parse_vector_pattern(
   case kind(tokens) {
     token.RBracket -> Ok(#(ast.PVector(list.reverse(acc), None), tail(tokens)))
     token.Ellipsis -> {
-      use #(name, t1) <- result.try(expect_ident(tail(tokens)))
+      use #(name, t1) <- result.try(expect_name(tail(tokens), naming.Binding))
       use t2 <- result.try(expect(t1, token.RBracket))
       Ok(#(ast.PVector(list.reverse(acc), Some(name)), t2))
     }
@@ -1718,7 +2073,10 @@ fn parse_pattern_elem(tokens: Toks) -> Result(#(ast.PatElem, Toks), String) {
     | ast.EFloat(_)
     | ast.EBool(_)
     | ast.EAtom(_) -> Ok(#(ast.PElemLit(e), t1))
-    ast.EIdent(name) -> Ok(#(ast.PElemBind(name), t1))
+    ast.EIdent(name) -> {
+      use _ <- result.try(named(tokens, naming.Binding, name))
+      Ok(#(ast.PElemBind(name), t1))
+    }
     _ ->
       Error(at(
         tokens,
@@ -1761,7 +2119,13 @@ fn hole_name(code: String, line: Int) -> Result(String, String) {
     trimmed -> {
       use e <- result.try(parse_sub_expr(code, line))
       case e {
-        ast.EIdent(name) -> Ok(name)
+        ast.EIdent(name) -> {
+          use _ <- result.try(
+            naming.check(naming.Binding, name)
+            |> result.map_error(diagnostic.at(line, _)),
+          )
+          Ok(name)
+        }
         _ ->
           Error(diagnostic.at(
             line,
@@ -1792,6 +2156,20 @@ fn check_no_adjacent_holes(
   }
 }
 
+// What a pattern matches is a type or one of its variants, whatever stands in
+// front of it: `Result.Ok`, `Str`, `hive.sql.SqlError`. The last segment is the
+// one being matched, so it is spelled as a type; the qualifiers in front are a
+// module or a type of their own.
+fn check_pattern_path(path: List(String), tokens: Toks) -> Result(Nil, String) {
+  case list.reverse(path) {
+    [matched, ..qualifiers] -> {
+      use _ <- result.try(check_qualifier(list.reverse(qualifiers), tokens))
+      named(tokens, naming.Type, matched)
+    }
+    [] -> Ok(Nil)
+  }
+}
+
 fn parse_pattern_path(
   tokens: Toks,
   acc: List(String),
@@ -1812,7 +2190,7 @@ fn parse_bindings(
   case kind(tokens) {
     token.RParen -> Ok(#(list.reverse(acc), tail(tokens)))
     _ -> {
-      use #(name, t1) <- result.try(expect_ident(tokens))
+      use #(name, t1) <- result.try(expect_name(tokens, naming.Binding))
       case kind(t1) {
         token.Comma -> parse_bindings(tail(t1), [name, ..acc])
         token.RParen -> Ok(#(list.reverse([name, ..acc]), tail(t1)))

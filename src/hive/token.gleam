@@ -16,10 +16,10 @@ pub type StrPart {
 
 /// The lexical category of a token.
 ///
-/// Keywords are matched case-insensitively by the lexer (per the language
-/// spec: "all keywords are case insensitive"), so by the time a `Kind` is
-/// produced the original casing of a keyword no longer matters. Identifiers,
-/// on the other hand, keep their original spelling.
+/// A keyword is lower case and nothing else, so a `Kw...` here was spelled that
+/// one way in the source and any other spelling was rejected before a token
+/// existed. Identifiers keep the spelling they were written with, which is what
+/// the naming rules are checked against as they are parsed.
 pub type Kind {
   // Literals and identifiers
   Ident(String)

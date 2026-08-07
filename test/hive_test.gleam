@@ -492,7 +492,7 @@ pub fn a_where_block_builds_its_clause_test() {
   // nothing present means no WHERE clause at all.
   let go =
     compile(
-      "type U {\n\tname: Str\n}\nquery q(a: Str, b: Int, c: Bool): U[dyn] {\n\tSELECT name FROM users\n\twhere {\n\t\tif a != \"\" { name = {a} }\n\t\tor {\n\t\t\tif b > 0 { n >= {b} }\n\t\t\tif c { flag = 1 }\n\t\t}\n\t}\n}\nproc main(): void {}\n",
+      "type U {\n\tname: Str\n}\nquery q(a: Str, b: Int, c: Bool): U[dyn] {\n\tSELECT name FROM users\n\tWHERE {\n\t\tif a != \"\" { name = {a} }\n\t\tor {\n\t\t\tif b > 0 { n >= {b} }\n\t\t\tif c { flag = 1 }\n\t\t}\n\t}\n}\nproc main(): void {}\n",
     )
   should.be_true(string.contains(go, "hive.SqlJoin(_p3, \" OR \", true)"))
   should.be_true(string.contains(go, "hive.SqlJoin(_p1, \" AND \", false)"))
@@ -5457,8 +5457,7 @@ pub fn distinct_star_is_rejected_test() {
 }
 
 pub fn select_star_into_a_scalar_is_rejected_test() {
-  // Case-insensitively, like every other keyword.
-  let assert Error(msg) = star_query("Str[dyn]", "select * from users")
+  let assert Error(msg) = star_query("Str[dyn]", "SELECT * FROM users")
   should.be_true(string.contains(msg, "does not say how many columns"))
 }
 
@@ -5781,4 +5780,162 @@ pub fn the_rendered_report_states_the_tally_and_coverage_test() {
   should.be_true(string.contains(text, "2 tests: 1 passed, 1 failed"))
   should.be_true(string.contains(text, "coverage: 66.7% of statements (2/3)"))
   should.be_true(string.contains(text, "never exercised: discount"))
+}
+
+// ---------------------------------------------------------------------------
+// How a name is spelled
+// ---------------------------------------------------------------------------
+
+fn rejected(src: String) -> String {
+  let assert Error(message) = compiler.compile(src)
+  message
+}
+
+pub fn a_keyword_is_lower_case_and_nothing_else_test() {
+  let message = rejected("PROC main(): void {}\n")
+  should.be_true(string.contains(message, "keyword written the wrong way"))
+  should.be_true(string.contains(message, "Write `proc`"))
+}
+
+pub fn a_keyword_in_another_casing_is_not_a_name_test() {
+  // Reserved however it is spelled: reading `If` as a name of its own would
+  // leave the mistake to be found somewhere else entirely.
+  let message = rejected("proc main(): void {\n\tIf := 1\n}\n")
+  should.be_true(string.contains(message, "keyword written the wrong way"))
+}
+
+pub fn a_callable_is_camel_case_test() {
+  let message = rejected("proc do_the_thing(): void {}\nproc main(): void {}\n")
+  should.be_true(string.contains(message, "is not how a callable is named"))
+  should.be_true(string.contains(message, "`doTheThing`"))
+}
+
+pub fn a_parameter_is_camel_case_test() {
+  let message =
+    rejected("proc f(User_Name: Str): void {}\nproc main(): void {}\n")
+  should.be_true(string.contains(message, "is not how a parameter is named"))
+  should.be_true(string.contains(message, "`userName`"))
+}
+
+pub fn a_type_and_its_variants_are_pascal_case_test() {
+  let message =
+    rejected("type user_row {\n\tid: Int\n}\nproc main(): void {}\n")
+  should.be_true(string.contains(message, "is not how a type is named"))
+  should.be_true(string.contains(message, "`UserRow`"))
+
+  let message = rejected("type U {\n\tok\n\tError\n}\nproc main(): void {}\n")
+  should.be_true(string.contains(message, "is not how a variant is named"))
+  should.be_true(string.contains(message, "`Ok`"))
+}
+
+pub fn a_field_is_camel_case_test() {
+  let message =
+    rejected("type U {\n\tcreated_at: Str\n}\nproc main(): void {}\n")
+  should.be_true(string.contains(message, "is not how a field is named"))
+  should.be_true(string.contains(message, "`createdAt`"))
+}
+
+pub fn a_variable_nothing_reassigns_may_be_upper_case_test() {
+  let go = compile("proc main(): void {\n\tMAX_TRIES := 3\n\techo MAX_TRIES\n}\n")
+  should.be_true(string.contains(go, "MAX_TRIES := 3"))
+}
+
+pub fn a_mut_variable_may_not_be_written_as_a_constant_test() {
+  let message = rejected("proc main(): void {\n\tmut MAX_TRIES := 3\n}\n")
+  should.be_true(string.contains(message, "is written as a constant"))
+  should.be_true(string.contains(message, "`maxTries`"))
+}
+
+pub fn a_loop_counter_may_not_be_written_as_a_constant_test() {
+  // The init clause declares a variable the post clause advances, so it is a
+  // `mut` whatever it looked like on the way in.
+  let message =
+    rejected("proc main(): void {\n\tfor I := 0; I < 3; I++ {\n\t\techo I\n\t}\n}\n")
+  should.be_true(string.contains(message, "is written as a constant"))
+}
+
+pub fn a_binding_is_camel_case_or_a_discard_test() {
+  let message =
+    rejected(
+      "proc main(): void {\n\tv := [\"a\"]\n\tif v is [First] {\n\t\techo First\n\t}\n}\n",
+    )
+  should.be_true(string.contains(message, "is not how a binding is named"))
+  should.be_true(string.contains(message, "`_` to throw the value away"))
+
+  compile("proc main(): void {\n\tv := [\"a\"]\n\tif v is [_] {\n\t\techo v\n\t}\n}\n")
+}
+
+pub fn an_atom_is_pascal_case_test() {
+  let message = rejected("proc main(): void {\n\ta := #ready\n\techo a\n}\n")
+  should.be_true(string.contains(message, "is not how an atom is written"))
+  should.be_true(string.contains(message, "`#Ready`"))
+}
+
+pub fn a_name_may_open_with_an_underscore_test() {
+  // Informal, and the compiler asks nothing of it: private, or here only
+  // because something had to be.
+  let go =
+    compile(
+      "func _helperOf(v: Str): Str {\n\treturn v\n}\nproc main(): void {\n\t_scratch := _helperOf(\"x\")\n\techo _scratch\n}\n",
+    )
+  should.be_true(string.contains(go, "_scratch := _helperOf"))
+}
+
+pub fn a_doubled_underscore_is_not_a_prefix_test() {
+  let message = rejected("proc main(): void {\n\t__scratch := 1\n}\n")
+  should.be_true(string.contains(message, "is not how a variable is named"))
+}
+
+// ---------------------------------------------------------------------------
+// The case of SQL
+// ---------------------------------------------------------------------------
+
+pub fn sql_keywords_are_upper_case_test() {
+  let message =
+    rejected("query q(): Str[dyn] {\n\tselect name from users\n}\nproc main(): void {}\n")
+  should.be_true(string.contains(message, "`select` is a SQL keyword"))
+  should.be_true(string.contains(message, "`SELECT`"))
+}
+
+pub fn a_quoted_name_keeps_its_own_spelling_test() {
+  // Names are the database's, not Hive's — and one that collides with a keyword
+  // says so the way SQL always has.
+  let go =
+    compile(
+      "query q(): Str[dyn] {\n\tSELECT \"order\" FROM users\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(go, "SELECT \\\"order\\\" FROM users"))
+}
+
+pub fn a_column_of_something_is_left_alone_test() {
+  compile(
+    "query q(): Str[dyn] {\n\tSELECT u.key FROM users u\n}\nproc main(): void {}\n",
+  )
+}
+
+pub fn a_where_block_is_written_like_the_clause_it_becomes_test() {
+  let message =
+    rejected(
+      "type U {\n\tname: Str\n}\nquery q(a: Str): U[dyn] {\n\tSELECT name FROM users\n\twhere {\n\t\tif a != \"\" { name = {a} }\n\t}\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(
+    message,
+    "the block that becomes a `WHERE` clause",
+  ))
+}
+
+pub fn the_words_inside_a_where_block_are_hives_own_test() {
+  let message =
+    rejected(
+      "type U {\n\tname: Str\n}\nquery q(a: Str): U[dyn] {\n\tSELECT name FROM users\n\tWHERE {\n\t\tIF a != \"\" { name = {a} }\n\t}\n}\nproc main(): void {}\n",
+    )
+  should.be_true(string.contains(message, "keyword written the wrong way"))
+  should.be_true(string.contains(message, "Hive's own words"))
+}
+
+pub fn a_contextual_keyword_is_lower_case_too_test() {
+  let message =
+    rejected("proc main(): void {\n\tt := using \"./x.csv\" as CSV\n\techo t\n}\n")
+  should.be_true(string.contains(message, "keyword written the wrong way"))
+  should.be_true(string.contains(message, "Write `csv`"))
 }
