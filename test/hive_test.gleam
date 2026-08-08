@@ -1949,6 +1949,79 @@ pub fn in_memory_source_resolves_imports_from_the_cwd_test() {
   should.be_true(string.contains(go, "lib_0_shout(\"hi\")"))
 }
 
+// ---------------------------------------------------------------------------
+// Aliasing a standard library module (`import hive.<module> as <name>`)
+// ---------------------------------------------------------------------------
+
+pub fn stdlib_import_aliases_a_module_test() {
+  // `c.its(...)` has to reach exactly what `hive.conv.its(...)` reaches.
+  let go =
+    compile(
+      "import hive.conv as c\nproc main(): void {\n\techo c.its(42)\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.IntToStr(42)"))
+}
+
+pub fn stdlib_import_without_as_is_named_after_its_module_test() {
+  let go =
+    compile(
+      "import hive.file\nproc main(): void {\n\techo file.exists(\"./x\")\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.FileExists(\"./x\")"))
+}
+
+pub fn stdlib_alias_resolves_in_type_annotations_test() {
+  let go =
+    compile(
+      "import hive.net as web\n"
+      <> "proc handle(req: web.HttpRequest): web.HttpResponse {\n"
+      <> "\treturn web.HttpResponse(200, [], req.url)\n"
+      <> "}\n"
+      <> "proc main(): void {\n\tweb.httpServe(8080, handle)\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.HttpRequest"))
+  should.be_true(string.contains(go, "hive.HttpResponse"))
+  should.be_true(string.contains(go, "hive.HttpServe(8080, handle)"))
+}
+
+pub fn a_local_shadows_a_stdlib_alias_test() {
+  // The alias is a name like any other, so a local of the same name wins and
+  // `conv.x` is ordinary field access rather than a library call.
+  let go =
+    compile(
+      "type Box { conv: Str }\n"
+      <> "import hive.conv\n"
+      <> "proc main(): void {\n"
+      <> "\tconv := Box(\"mine\")\n"
+      <> "\techo conv.conv\n"
+      <> "}\n",
+    )
+  should.be_true(string.contains(go, "conv.Conv"))
+  should.be_false(string.contains(go, "hive.IntToStr"))
+}
+
+pub fn an_unknown_stdlib_module_is_rejected_test() {
+  let assert Error(msg) =
+    compiler.compile("import hive.nope\nproc main(): void {\n\techo 1\n}\n")
+  should.be_true(string.contains(msg, "does not name a standard library"))
+  should.be_true(string.contains(msg, "hive.ui"))
+}
+
+pub fn importing_hive_itself_is_rejected_test() {
+  let assert Error(msg) =
+    compiler.compile("import hive as h\nproc main(): void {\n\techo 1\n}\n")
+  should.be_true(string.contains(msg, "one module at a time"))
+}
+
+pub fn two_stdlib_imports_cannot_share_a_name_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "import hive.conv as c\nimport hive.file as c\n"
+      <> "proc main(): void {\n\techo 1\n}\n",
+    )
+  should.be_true(string.contains(msg, "two imports are both named"))
+}
+
 pub fn a_program_without_imports_is_unchanged_test() {
   // Nothing is renamed when there is nothing to merge.
   let go = compile("func helper(): Str {\n\treturn \"x\"\n}\nproc main(): void {\n\techo helper()\n}\n")
@@ -2211,6 +2284,289 @@ pub fn generics_example_compiles_test() {
   let assert Ok(src) =
     simplifile.read("code-examples/14 - Generics/generics.hive")
   let assert Ok(_) = compiler.compile(src)
+}
+
+// The WebSocket handshake mixes a fixed GUID into the client's key, and it has
+// to be that GUID to the character. Nothing in this repository would notice a
+// wrong one on its own: `wsConnect` and `wsServe` mix in the same constant, so
+// Hive's client and Hive's server agree with each other however wrong it is,
+// and the shipped websockets example passes either way. Every browser refuses
+// the handshake.
+//
+// So the constant is held against the worked example in RFC 6455 §1.3, which is
+// the only witness that does not share the bug.
+// The value below is transcribed from the RFC, not from the runtime — which is
+// the entire point of the test. Checked against the RFC's worked example:
+// SHA-1("dGhlIHNhbXBsZSBub25jZQ==" <> this) base64-encodes to
+// "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", the accept value the RFC prints.
+pub fn ws_handshake_guid_matches_the_rfc_test() {
+  let go = runtime.net_go()
+  let assert [_, after, ..] = string.split(go, "const wsGUID = \"")
+  let assert [guid, ..] = string.split(after, "\"")
+  guid |> should.equal("258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+}
+
+pub fn chat_example_compiles_test() {
+  let assert Ok(_) =
+    compiler.compile_file(
+      "code-examples/17 - EXAMPLE APP - Chat with User Interface/chat.hive",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// hive.ui
+// ---------------------------------------------------------------------------
+
+// A widget's attributes and its payload, each landing in the right slot. This
+// is the shape every widget has, and the reason there are no optional
+// parameters anywhere in the module: an absent attribute is an empty vector.
+pub fn ui_widget_lowers_attributes_and_payload_test() {
+  let go =
+    compile(
+      "import hive.ui\n"
+      <> "func v(): ui.View {\n"
+      <> "\treturn ui.row([ui.gap(8), ui.pad(16)], [ui.text([], \"hi\")])\n"
+      <> "}\n"
+      <> "proc main(): void {\n\techo ui.html(v())\n}\n",
+    )
+  should.be_true(string.contains(
+    go,
+    "hive.UiRow([]hive.Attr{hive.UiAttrGap(8), hive.UiAttrPad(16)}",
+  ))
+  should.be_true(string.contains(go, "hive.UiText([]hive.Attr{}, \"hi\")"))
+}
+
+// An empty attribute vector is an ordinary value, not a special case.
+pub fn ui_widget_takes_no_attributes_test() {
+  let go =
+    compile(
+      "import hive.ui\n"
+      <> "func v(): ui.View {\n\treturn ui.column([], [ui.spacer(), ui.none()])\n}\n"
+      <> "proc main(): void {\n\techo ui.html(v())\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.UiSpacer()"))
+  should.be_true(string.contains(go, "hive.UiNone()"))
+}
+
+// Each enumeration is a named Go type carrying its variant's own name, so what
+// reaches the renderer says what it is rather than where it sat in a table.
+pub fn ui_enums_lower_to_named_values_test() {
+  let go =
+    compile(
+      "import hive.ui\n"
+      <> "func v(): ui.View {\n"
+      <> "\treturn ui.text([ui.tone(ui.Tone.Danger()), ui.size(ui.TextSize.Title())], \"x\")\n"
+      <> "}\n"
+      <> "proc main(): void {\n\techo ui.html(v())\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.UiAttrTone(hive.Tone(\"Danger\"))"))
+  should.be_true(string.contains(
+    go,
+    "hive.UiAttrSize(hive.TextSize(\"Title\"))",
+  ))
+}
+
+// A link is the one widget that works without an event, which is what lets a
+// page rendered as text be navigated. Its destination is a parameter, so it
+// cannot be left off.
+pub fn ui_link_lowers_href_and_label_test() {
+  let go =
+    compile(
+      "import hive.ui\n"
+      <> "func v(): ui.View {\n"
+      <> "\treturn ui.link([ui.pad(4)], \"/explore\", \"Explore\")\n"
+      <> "}\n"
+      <> "proc main(): void {\n\techo ui.html(v())\n}\n",
+    )
+  should.be_true(string.contains(
+    go,
+    "hive.UiLink([]hive.Attr{hive.UiAttrPad(4)}, \"/explore\", \"Explore\")",
+  ))
+}
+
+pub fn ui_link_needs_a_destination_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "import hive.ui\n"
+      <> "proc main(): void {\n\techo ui.html(ui.link([], \"Explore\"))\n}\n",
+    )
+  should.be_true(string.contains(msg, "hive.ui.link"))
+  should.be_true(string.contains(msg, "href"))
+}
+
+// `background` takes the same `Tone` `tone` does — one enumeration, two places
+// it can land.
+pub fn ui_background_takes_a_tone_test() {
+  let go =
+    compile(
+      "import hive.ui\n"
+      <> "func v(): ui.View {\n"
+      <> "\treturn ui.text([ui.background(ui.Tone.Danger())], \"x\")\n"
+      <> "}\n"
+      <> "proc main(): void {\n\techo ui.html(v())\n}\n",
+    )
+  should.be_true(string.contains(
+    go,
+    "hive.UiAttrBackground(hive.Tone(\"Danger\"))",
+  ))
+}
+
+// The two tones that carry a colour lower to a call rather than to a bare
+// string, because the payload is checked at runtime — a colour is computed at
+// least as often as it is written down.
+pub fn ui_colour_tones_lower_to_checked_calls_test() {
+  let go =
+    compile(
+      "import hive.ui\n"
+      <> "func v(): ui.View {\n"
+      <> "\treturn ui.text([ui.tone(ui.Tone.HEX(\"#ff8800\")), "
+      <> "ui.background(ui.Tone.RGBA(1, 2, 3, 255))], \"x\")\n"
+      <> "}\n"
+      <> "proc main(): void {\n\techo ui.html(v())\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.UiToneHex(\"#ff8800\")"))
+  should.be_true(string.contains(go, "hive.UiToneRGBA(1, 2, 3, 255)"))
+}
+
+// Each enumeration is a closed set, so a variant it does not have is a mistake
+// reported here rather than a class name nothing in the stylesheet answers for.
+pub fn ui_unknown_enum_variant_is_rejected_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "import hive.ui\n"
+      <> "proc main(): void {\n"
+      <> "\techo ui.html(ui.text([ui.tone(ui.Tone.Crimson())], \"x\"))\n}\n",
+    )
+  should.be_true(string.contains(msg, "`hive.ui.Tone` has no variant `Crimson`"))
+  should.be_true(string.contains(msg, "Danger"))
+}
+
+pub fn ui_colour_tone_arity_is_enforced_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "import hive.ui\n"
+      <> "proc main(): void {\n"
+      <> "\techo ui.html(ui.text([ui.tone(ui.Tone.RGBA(1, 2))], \"x\"))\n}\n",
+    )
+  should.be_true(string.contains(msg, "hive.ui.Tone.RGBA"))
+  should.be_true(string.contains(msg, "alpha"))
+}
+
+// An event attribute holds its message as an `any`: the runtime never looks
+// inside one, it hands it back to the fold. A handler of what the user did is
+// wrapped so the message type it returns survives that.
+pub fn ui_event_attribute_wraps_its_handler_test() {
+  let go =
+    compile(
+      "import hive.ui\n"
+      <> "type Msg {\n\tTyped { text: Str }\n}\n"
+      <> "func v(): ui.View {\n"
+      <> "\treturn ui.input([ui.onInput(Msg.Typed(_))], \"\")\n"
+      <> "}\n"
+      <> "proc main(): void {\n\techo ui.html(v())\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.UiAttrOnInput(func(_ev string) any"))
+}
+
+// A constructor with a hole is a function value that builds the variant. It is
+// what makes `Msg.Typed(_)` fill a slot wanting `func(Str): Msg`.
+pub fn constructor_partial_application_builds_a_closure_test() {
+  let go =
+    compile(
+      "type Msg {\n\tTyped { text: Str }\n\tAt { x: Int, y: Int }\n}\n"
+      <> "proc main(): void {\n"
+      <> "\tf := Msg.Typed(_)\n"
+      <> "\tg := Msg.At(1, _)\n"
+      <> "\techo f(\"hi\")\n"
+      <> "\techo g(2)\n"
+      <> "}\n",
+    )
+  should.be_true(string.contains(
+    go,
+    "func(_h0 string) Msg { return Msg(MsgTyped{Text: _h0}) }",
+  ))
+  // The supplied argument is captured where it was written; only the hole
+  // becomes a parameter.
+  should.be_true(string.contains(
+    go,
+    "func(_h1 int) Msg { return Msg(MsgAt{X: 1, Y: _h1}) }",
+  ))
+}
+
+// A window is a syslink service, so it is spawned as one — same handler shape,
+// same derived decoder, same digest.
+pub fn ui_window_spawns_a_service_test() {
+  let go =
+    compile(
+      "import hive.ui\n"
+      <> "type Msg {\n\tPing\n}\n"
+      <> "func v(n: Int): ui.View {\n\treturn ui.text([], \"x\")\n}\n"
+      <> "proc up(n: Int, m: Msg, e: hive.syslink.Envelope): Int {\n\treturn n\n}\n"
+      <> "proc main(): void {\n\tui.window(\"T\", v, up, 0)\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.UiWindow(\"T\", v, up, 0,"))
+  should.be_true(string.contains(go, "hive.SyslinkDecoder("))
+}
+
+// The window's fold is held to the service handler's shape, because a window is
+// a service. The message names the real requirement rather than the symptom.
+pub fn ui_window_rejects_a_handler_of_the_wrong_shape_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "import hive.ui\n"
+      <> "type Msg {\n\tPing\n}\n"
+      <> "func v(n: Int): ui.View {\n\treturn ui.text([], \"x\")\n}\n"
+      <> "proc up(n: Int, m: Msg): Int {\n\treturn n\n}\n"
+      <> "proc main(): void {\n\tui.window(\"T\", v, up, 0)\n}\n",
+    )
+  should.be_true(string.contains(msg, "hive.syslink.Envelope"))
+}
+
+// Drawing is a function of the state. A proc could act, and a repaint happens
+// on every change — so whatever it did would happen again with it.
+pub fn ui_window_rejects_a_proc_as_its_view_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "import hive.ui\n"
+      <> "type Msg {\n\tPing\n}\n"
+      <> "proc v(n: Int): ui.View {\n\techo n\n\treturn ui.text([], \"x\")\n}\n"
+      <> "proc up(n: Int, m: Msg, e: hive.syslink.Envelope): Int {\n\treturn n\n}\n"
+      <> "proc main(): void {\n\tui.window(\"T\", v, up, 0)\n}\n",
+    )
+  should.be_true(string.contains(msg, "cannot be a view"))
+}
+
+pub fn ui_unknown_widget_lists_what_exists_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "import hive.ui\n"
+      <> "proc main(): void {\n\techo ui.html(ui.marquee([], \"x\"))\n}\n",
+    )
+  should.be_true(string.contains(msg, "unknown builtin `hive.ui.marquee`"))
+  should.be_true(string.contains(msg, "overlay"))
+}
+
+// A widget's arity is fixed, and it is read from the same table codegen emits
+// from — so nothing can pass the check and then lower to something else.
+pub fn ui_widget_arity_is_enforced_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "import hive.ui\n"
+      <> "proc main(): void {\n\techo ui.html(ui.text([]))\n}\n",
+    )
+  should.be_true(string.contains(msg, "hive.ui.text"))
+}
+
+// The module arrives only when it is used, like every other one.
+pub fn ui_module_is_only_written_when_used_test() {
+  let assert Ok(without) = compiler.compile("proc main(): void {\n\techo 1\n}\n")
+  should.be_false(string.contains(without, "hive.Ui"))
+  let with_ui =
+    compile(
+      "import hive.ui\n"
+      <> "proc main(): void {\n\techo ui.html(ui.text([], \"x\"))\n}\n",
+    )
+  should.be_true(string.contains(with_ui, "hive.UiHTML"))
 }
 
 // A named address is the only kind that survives its service being replaced: it

@@ -255,7 +255,9 @@ semantics](#value-semantics-copy-on-binding), a tour of concurrency
 two terminals or two machines, a three-node distributed cache that combines
 `hive.syslink` with `hive.sql` (one owner per key, invalidated across the cluster
 on every write), a three-file program
-showing `import`, and a walk through spreadsheets and `hive.file` — live in
+showing `import`, a walk through spreadsheets and `hive.file`, and a serverless
+chat between two nodes whose [`hive.ui`](#hiveui) windows publish themselves as
+[`hive.syslink`](#hivesyslink) services and post straight to each other — live in
 `code-examples/`. They double as the language's specification: each one
 compiles, builds and runs.
 
@@ -477,7 +479,17 @@ compiles, builds and runs.
   supplied arguments and leaves each `_` as a parameter of the resulting
   function (in order), capturing the rest by value. So
   `hive.net.httpServe(8080, handler(_, db))` adapts a two-argument `handler` into
-  the one-argument handler `serve` expects. The `proc`/`func` split is
+  the one-argument handler `serve` expects.
+
+  A **constructor** may be partially applied too, and it means the same thing:
+  `Msg.Changed(_)` is a `func(Str): Msg` that builds the variant. It is not a
+  callable — there is no body to run and no declared return type to read — but
+  each `_` still becomes a parameter in hole order, everything supplied is still
+  captured where it was written, and what comes back is typed as the union,
+  since that is what a variant is once built. This is the spelling a
+  [`hive.ui`](#hiveui) event attribute wants: `ui.onInput(Msg.Changed(_))`.
+
+  The `proc`/`func` split is
   preserved through values: a `func` value may be used where a `proc` is
   expected (pure widens to impure), but a `proc` value may not fill a `func`
   slot, and a `func` still cannot *call* a proc value.
@@ -1031,9 +1043,15 @@ See [`code-examples/12 - Files and Spreadsheets`](code-examples/12%20-%20Files%2
 Each module owns its types under its own namespace — `hive.net.HttpRequest`,
 `hive.json.JsonError`, `hive.crypto.CryptoError`, `hive.sql.DatabaseDriver`,
 `hive.conv.ConversionError`, `hive.env.EnvironmentError`,
-`hive.syslink.Address`, `hive.task.TimeoutError`, and so on. The only builtin types that live directly on `hive` are the core
+`hive.syslink.Address`, `hive.task.TimeoutError`, `hive.ui.View`, and so on. The only builtin types that live directly on `hive` are the core
 ones the language uses without a module: `Result`, `Table` and the
 `hive.TableError` that `using` yields from a CSV.
+
+A module reached often can be given a **short name** with the same `import`
+other files use — `import hive.ui` makes `ui.row(...)` mean `hive.ui.row(...)`.
+It is a spelling and nothing more: both forms are always available and neither
+changes what is built. See
+[Importing a standard library module](#importing-a-standard-library-module).
 
 **A module you don't use is not in your build.** The generated project always
 carries the core runtime, but each `hive.*` module is written into it — and so
@@ -1783,6 +1801,233 @@ The wall clock and calendar formatting. Times are plain `Int`s — Unix seconds.
   echo hive.time.format(1700000000, "%A, %d %B %Y")   // Tuesday, 14 November 2023
   ```
 
+### `hive.ui`
+
+User interfaces. A **view is a value** — a tree of widgets built by the calls
+below — and what paints it is decided somewhere else entirely:
+
+* `hive.ui.window(title, view, update, state)` opens a window on this machine
+  and does not return.
+* `hive.ui.html(view)` renders the same tree as a fragment of HTML, and
+  `hive.ui.page(title, view)` as a whole document — which is what an
+  [`httpServe`](#hivenet) handler answers with.
+
+Nothing in a view knows which of those is happening, and neither has to be
+chosen when the view is written. Everything here is written against the target's
+standard library, so a program with a window still builds offline into one
+executable with no dependencies.
+
+**The window is a [service](#hivesyslink).** `update` is the same fold a
+`hive.syslink.spawn` handler is — `proc (State, Message, hive.syslink.Envelope):
+State` — and is checked as one, so a window has an address, needs no mutex, and
+can be posted to by a background task or by another machine. That is also why
+the module needs no notion of a *command*: `update` is a proc, so work that must
+not block the screen is an ordinary call you did not wait for.
+
+```hive
+import hive.ui
+
+type Msg {
+	Refresh
+	Loaded { rows: Table }
+}
+
+func view(model: Model): ui.View {
+	return ui.column([ui.pad(16), ui.gap(12)], [
+		ui.text([ui.size(ui.TextSize.Title())], "Orders"),
+		ui.button([ui.on(Msg.Refresh()), ui.busy(model.busy)], "Refresh"),
+		ui.table([], model.rows)
+	])
+}
+
+proc update(model: Model, msg: Msg, from: hive.syslink.Envelope): Model {
+	if msg is Msg.Refresh {
+		async reload(hive.syslink.self(from))   // off it goes; nothing to hold
+		return Model(model.rows, true)
+	}
+	if msg is Msg.Loaded(rows) {
+		return Model(rows, false)
+	}
+	return model
+}
+
+proc reload(window: hive.syslink.Address): void {
+	if using "./orders.csv" is Result.Ok(rows) {
+		async window(Msg.Loaded(rows))
+	}
+}
+```
+
+**The view is a `func`, and that is not a formality.** A func cannot call a proc
+and cannot hold a mutex, so drawing cannot act — which matters because a repaint
+happens on every change, and anything a view did would happen again with it. A
+proc handed to `window` is rejected by name.
+
+**Every widget takes the same two things: its attributes, then its payload.**
+There are no optional parameters in Hive, so what would be an optional argument
+elsewhere is an entry in the attribute vector — and an empty one, `[]`, is an
+ordinary value rather than a special case.
+
+| Widget | Payload | Is |
+| --- | --- | --- |
+| `row(attrs, children)` | `View[]` | children laid out across |
+| `column(attrs, children)` | `View[]` | children laid out down |
+| `spacer()` | — | the gap that takes what is left |
+| `overlay(attrs, child)` | `View` | drawn above everything, with a backdrop |
+| `text(attrs, content)` | `Str` | the one true leaf |
+| `image(attrs, src, alt)` | `Str, Str` | a picture, described |
+| `icon(attrs, name)` | `Icon` | one of a closed set |
+| `link(attrs, href, label)` | `Str, Str` | a destination, which needs no event to work |
+| `button(attrs, label)` | `Str` | |
+| `input(attrs, value)` | `Str` | one line; `kind` says which sort |
+| `textarea(attrs, value)` | `Str` | several lines |
+| `checkbox(attrs, label, checked)` | `Str, Bool` | label included, and clickable |
+| `select(attrs, options, chosen)` | `Str[], Str` | |
+| `table(attrs, rows)` | `Table` | the headered `Table` everything else hands back |
+| `spinner(attrs)` | — | |
+| `none()` | — | nothing — and it keeps its place among its siblings |
+
+Sixteen, and the rule that decided the number: a widget is here only if it
+cannot be composed from the others *and* needs something the renderer has that
+Hive does not. A card is a `column` with padding, a toast is an `overlay` and a
+message, a divider is a `row` with a border — all of those are `func`s you
+write, which is also the proof that the set is enough.
+
+`table` takes a headered `Table` — the very shape a CSV read with
+[`using`](#reading-tables-using), a [`hive.sql`](#hivesql) result and a
+[`hive.json`](#hivejson) document all arrive as — so putting data on screen is
+one call rather than a loop.
+
+**`link` is the one widget that works without an event**, and that is what it is
+for. A message needs somewhere to send it, and a page rendered by `ui.page` has
+no socket — so a view built only from buttons is fully alive in a window and
+completely inert as a page. An `<a href>` needs no socket, no handler and no
+state.
+
+A link may carry both, and usually should:
+
+```hive
+ui.link([ui.on(Msg.Went(Route.Explore()))], "/explore", "Explore")
+```
+
+The window follows the **message** and the served page follows the **href**, from
+the identical tree — so one nav rail works in both. A link carrying no message
+navigates in either. A plain link *inside* something that does carry a message
+wins the click, since it is the more specific thing that was clicked; a link
+carrying its own message never navigates away from the window it was meant to
+update. Where a link may point is a closed set — a path within the page, a
+relative path, or `http`, `https`, `mailto` — and anything else, `javascript:`
+above all, renders as no destination at all.
+
+**Attributes** are semantic tokens rather than CSS values, which is what lets one
+view render as a window, as a page, and — for whatever comes later — somewhere
+with no CSS at all. `tone` and `background` are the one deliberate exception, and
+[colour](#colour) below says what that costs.
+
+| | |
+| --- | --- |
+| **Layout** | `gap(Int)` `pad(Int)` `width(Int)` `height(Int)` `grow(Int)` `align(Align)` `justify(Justify)` `scroll(Axis)` |
+| **Text** | `size(TextSize)` `heading(Int)` `tone(Tone)` |
+| **Colour** | `background(Tone)` — the same `Tone`, behind the content instead of in it |
+| **State** | `disabled(Bool)` `busy(Bool)` `placeholder(Str)` `hint(Str)` `kind(InputKind)` |
+| **Events** | `on(Msg)` `onDismiss(Msg)` `onInput(f)` `onSubmit(f)` `onChoose(f)` `onToggle(f)` `onPick(f)` `onSort(f)` |
+
+`on` and `onDismiss` carry the message itself. The rest carry a **function** of
+what the user did — `func(Str): Msg` for the three that read text,
+`func(Bool): Msg` for `onToggle`, `func(Int): Msg` for `onPick` and `onSort` —
+which is what a [constructor with a hole](#the-language) is for:
+`ui.onInput(Msg.Changed(_))`.
+
+The enumerations the module owns are ordinary types, reached the way every other
+one is (`ui.Tone.Danger()`), and each is a **closed set** so a renderer can
+answer for all of it. None of them is an atom, deliberately: the atom table
+belongs to your program, and a library that added to it would renumber the atoms
+you wrote.
+
+| Type | Variants |
+| --- | --- |
+| `Align` | `Start` `Center` `End` `Stretch` |
+| `Justify` | `Start` `Center` `End` `Between` |
+| `TextSize` | `Title` `Subtitle` `Body` `Caption` |
+| `Tone` | `Normal` `Muted` `Good` `Warn` `Danger` `HEX(Str)` `RGBA(Int, Int, Int, Int)` |
+| `Axis` | `Horizontal` `Vertical` `Both` |
+| `InputKind` | `Text` `Number` `Date` `Password` `Search` |
+| `Icon` | `Search` `Close` `Check` `Plus` `Minus` `Up` `Down` `Left` `Right` `Warning` `Info` `Star` `Heart` `Reply` `Repeat` `Trash` `User` `Menu` |
+
+#### Colour
+
+`Tone` is the one enumeration that is not only a closed set. Past the five roles
+above, two variants carry a colour outright:
+
+```hive
+ui.text([ui.tone(ui.Tone.Danger())], "!")               // a role
+ui.text([ui.background(ui.Tone.HEX("#1d9bf0"))], "!")   // a colour
+ui.text([ui.background(ui.Tone.RGBA(29, 155, 240, 255))], "!")
+```
+
+A **role** becomes a class the stylesheet answers for; a **colour** becomes a
+declaration. Which of the two you wrote is what decides, and the renderer makes
+that call — a program cannot ask for a class.
+
+That distinction is the whole cost, and it is worth naming. A view built only
+from roles draws anywhere, including on a target with no notion of colour at
+all; `HEX` and `RGBA` are the two calls that spend that property, and a renderer
+that cannot paint a colour has nothing to fall back on but `Normal`. Reach for
+them when the colour is genuinely **data** — one per user, per category, per
+series — and for a role when it means *good*, *risky* or *quiet*, because a role
+is the only one of the two a theme can restyle.
+
+Two practical notes. A colour is **checked, not trusted**: `HEX` takes `#` and
+then 3, 4, 6 or 8 hex digits, and anything else is `Normal` rather than text
+smuggled into a stylesheet — so a colour read from a config file is safe to pass
+straight through. `RGBA` clamps each channel to `0`–`255` (alpha included, which
+reaches CSS as the fraction it stands for) rather than refusing, because a colour
+is computed at least as often as it is written down. And a **role brings a
+readable foreground with it** — `background(Tone.Danger())` sets its own text
+colour — while a computed colour brings nothing, so the contrast is yours:
+
+```hive
+ui.link(
+	[ui.background(chipColour(person.handle)), ui.tone(ui.Tone.HEX("#ffffff"))],
+	"/profile/{person.handle}",
+	person.name
+)
+```
+
+**A view is a value, so a test can read one.** `hive.ui.html` is the same
+renderer a served page uses and needs no browser, no screenshot and no socket —
+which makes "the button is disabled while the draft is empty" something a
+[`test`](#testing) can assert rather than something a person has to notice.
+
+**How the window is opened.** `window` binds a port the operating system chooses
+on the loopback interface only, puts a random token in the URL, and starts a
+browser already installed on the machine in application mode — a real window
+with no address bar or tabs. Chrome, Edge, Chromium, Brave and Vivaldi are
+tried on Linux and on Windows; failing all of them it falls back to an ordinary
+tab, and failing that it prints the URL. None of them is linked into your binary:
+each is a program that may or may not be there, which is what keeps a window
+free of build dependencies on every platform.
+
+A served page has nowhere to send an event back to, so `html` and `page` write
+no handler ids at all — the messages in the tree are simply not recorded. That
+is the honest rendering of a page with no socket behind it.
+
+The whole page is re-rendered on each turn and swapped in, with focus and the
+caret preserved; there is no tree diffing yet, which is a thing to add rather
+than a thing to design around — the view is already a value, so nothing above
+has to change for it.
+
+See [`code-examples/17 - EXAMPLE APP - Chat with User
+Interface`](code-examples/17%20-%20EXAMPLE%20APP%20-%20Chat%20with%20User%20Interface/chat.hive) — two
+peers with no server between them, each a window you talk from and a mailbox the
+other one posts to. It is worth reading for what a window being a **service**
+buys: it publishes *itself* with
+`hive.syslink.register(#Chat, hive.syslink.self(from))`, so the far node reaches
+the screen with `hive.syslink.on(peer, #Chat)` and an ordinary send. Nothing in
+the file formats a line, parses one or escapes anything — a message is a value
+and the compiler derives the codec, so the two ends cannot disagree about a wire
+format because neither of them has one.
+
 ## Multiple files
 
 A Hive program can span as many files as you like. `import`, written outside any
@@ -1821,6 +2066,38 @@ proc main(): void {
         -> lib/pricing.hive
         -> lib/inventory.hive
   ```
+
+### Importing a standard library module
+
+The same `import` gives a **`hive.*` module** a short name, which is worth having
+anywhere one is reached often — a view tree names its module on every node:
+
+```hive
+import hive.ui
+import hive.net as web
+
+func view(model: Model): ui.View {
+	return ui.row([ui.gap(8)], [ui.text([], model.title)])
+}
+
+proc handle(request: web.HttpRequest): web.HttpResponse {
+	return web.HttpResponse(200, [], "ok")
+}
+```
+
+It is the same feature and the same rules — the alias is a name like any other,
+so a local of that name shadows it, two imports may not share one, and it may
+not collide with something the file declares. Three things are particular to it:
+
+* The path is the module and nothing else: `import hive.ui`, never
+  `import hive.ui.View`. What a module holds is reached *through* the name.
+* Without `as`, the name is the module's own last segment — `import hive.ui`
+  gives `ui`.
+* Nothing is imported into the program. The alias is a **spelling**: `ui.row`
+  and `hive.ui.row` are the same call, both are always available, and neither
+  changes what is linked into the build. `import hive` is not a thing to write —
+  the library is reached a module at a time, and the global builtins (`len`,
+  `map`, `sort`, ...) were never behind an import at all.
 
 Names carry no baggage across a module boundary: a type or function only ever
 means what the module you read it in says it means. Two files may each declare
@@ -1969,6 +2246,11 @@ mappings worth knowing:
 | `func f(v: T[]): T` at `T = Str`        | `func f_Str(v []string) string` — one copy per instantiation    |
 | `using p` / `using conn run q(..)` / `run raw t` | `hive.ReadCSV(..)` / `hive.SqlRows(..)` / `hive.SqlQuery(..)`, each → a `Result` |
 | a `hive.*` library call                 | a call of the same name on the generated `hive` runtime package (`hive.json.parse` → `hive.JsonParse`, `hive.syslink.spawn` → `hive.SyslinkSpawn`, …) |
+| `import hive.ui as ui`, then `ui.row(..)` | nothing — the alias is resolved during import flattening, so codegen only ever sees `hive.ui.row` |
+| `Msg.Changed(_)` (a constructor hole)   | `func(_h0 string) Msg { return Msg(MsgChanged{Text: _h0}) }` |
+| `ui.row(attrs, kids)` / `ui.Tone.Danger()` | `hive.UiRow(..)` / `hive.Tone("Danger")` — an enum is a named string type carrying its variant's name |
+| `ui.Tone.HEX(s)` / `ui.Tone.RGBA(r, g, b, a)` | `hive.UiToneHex(s)` / `hive.UiToneRGBA(..)` — a call rather than a bare string, because the payload is validated and clamped where it lands |
+| `ui.window(t, view, update, s)`         | `hive.UiWindow(..)`, which spawns the fold as a syslink service and serves the view to it |
 | `Result<T, E>`, `Table`, `hive.TableError` | provided by that runtime package                            |
 
 Two rules are worth stating outside the table. Hive requires every non-`void`

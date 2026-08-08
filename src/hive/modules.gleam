@@ -14,6 +14,7 @@
 //// (`hive/compiler`, `hive/bounds`) and codegen need to know nothing about
 //// imports at all.
 
+import gleam/bool
 import gleam/dict.{type Dict}
 import gleam/int
 import gleam/list
@@ -95,6 +96,10 @@ fn resolve(
       let chain = [src, ..chain]
       use done <- result.try(
         list.try_fold(src.module.imports, done, fn(acc, imp) {
+          // A standard library import names no file, so there is no graph to
+          // walk into and nothing that could close a cycle. `context` is where
+          // it is checked and given its meaning.
+          use <- bool.guard(builtins.names_stdlib(imp.path), Ok(acc))
           use dep <- result.try(load_import(src, imp))
           case list.any(chain, fn(s) { s.key == dep.key }) {
             True ->
@@ -228,8 +233,8 @@ fn origins(
 // and do not collide with each other or with its own declarations.
 fn context(src: Source, exports: Dict(String, Dict(String, String))) {
   let own = dict.get(exports, src.key) |> result.unwrap(dict.new())
-  use modules <- result.try(
-    list.try_fold(src.module.imports, dict.new(), fn(acc, imp) {
+  use imports <- result.try(
+    list.try_fold(src.module.imports, #(dict.new(), dict.new()), fn(acc, imp) {
       // Every error below is about this one `import` line, in this one file.
       let here = fn(message) {
         diagnostic.in_file(src.display, diagnostic.at(imp.line, message))
@@ -242,7 +247,10 @@ fn context(src: Source, exports: Dict(String, Dict(String, String))) {
           ))
         _ -> Ok(Nil)
       })
-      use _ <- result.try(case dict.has_key(acc, imp.alias) {
+      let #(modules, stdlib) = acc
+      use _ <- result.try(case
+        dict.has_key(modules, imp.alias) || dict.has_key(stdlib, imp.alias)
+      {
         True ->
           Error(here(
             "two imports are both named `"
@@ -261,14 +269,48 @@ fn context(src: Source, exports: Dict(String, Dict(String, String))) {
           ))
         False -> Ok(Nil)
       })
-      use key <- result.try(canonical(import_path(src.dir, imp.path)))
-      case dict.get(exports, key) {
-        Ok(dep) -> Ok(dict.insert(acc, imp.alias, dep))
-        Error(_) -> Error(here("could not resolve `import " <> imp.path <> "`"))
+      // A standard library import is a second name for a module that is always
+      // there, so it resolves against the module list rather than the disk.
+      case builtins.names_stdlib(imp.path) {
+        True ->
+          case builtins.stdlib_import(imp.path) {
+            Some(name) -> Ok(#(modules, dict.insert(stdlib, imp.alias, name)))
+            None -> Error(here(unknown_stdlib(imp.path)))
+          }
+        False -> {
+          use key <- result.try(canonical(import_path(src.dir, imp.path)))
+          case dict.get(exports, key) {
+            Ok(dep) -> Ok(#(dict.insert(modules, imp.alias, dep), stdlib))
+            Error(_) ->
+              Error(here("could not resolve `import " <> imp.path <> "`"))
+          }
+        }
       }
     }),
   )
-  Ok(Rw(own, modules, src.display))
+  let #(modules, stdlib) = imports
+  Ok(Rw(own, modules, stdlib, src.display))
+}
+
+// A `hive.` import that does not name a module. `hive` on its own is called out
+// separately: it is not a misspelling but a misunderstanding — the standard
+// library is reached a module at a time, and `hive.len` and friends need no
+// import at all.
+fn unknown_stdlib(path: String) -> String {
+  case path {
+    "hive" ->
+      "`import hive` does not name a module: the standard library is imported "
+      <> "one module at a time (`import hive.ui`), and the global builtins "
+      <> "(`len`, `map`, `sort`, ...) are already in scope without any import"
+    _ ->
+      "`import "
+      <> path
+      <> "` does not name a standard library module. The modules are: "
+      <> string.join(
+        list.map(builtins.stdlib_modules(), fn(m) { "hive." <> m }),
+        ", ",
+      )
+  }
 }
 
 /// Every name a module declares, mapped to the name it carries in the flattened
@@ -370,9 +412,19 @@ type Rw {
     own: Dict(String, String),
     /// Import name -> that module's export table.
     modules: Dict(String, Dict(String, String)),
+    /// Import name -> the standard library module it stands for (`ui` -> `ui`
+    /// for `import hive.ui as ui`). A name in here is rewritten back to its
+    /// qualified spelling rather than resolved to a declaration: the standard
+    /// library is not flattened into the program, it is named in it.
+    stdlib: Dict(String, String),
     /// The module being rewritten, for error messages.
     where: String,
   )
+}
+
+// `hive.<module>.<member>` — the spelling every later pass matches on.
+fn qualify(module: String, member: String) -> ast.Expr {
+  ast.EMember(ast.EMember(ast.EIdent("hive"), module), member)
 }
 
 fn unknown_member(rw: Rw, alias: String, member: String) -> String {
@@ -598,6 +650,18 @@ fn rewrite_expr(
           case dict.get(members, member) {
             Ok(name) -> Ok(ast.EIdent(name))
             Error(_) -> Error(unknown_member(rw, alias, member))
+          }
+        // `ui.row` / `ui.View` where `ui` is `import hive.ui as ui`: written
+        // back out as the qualified spelling, so every pass after this one sees
+        // the standard library named the one way it has always been named.
+        False, Error(_) ->
+          case dict.get(rw.stdlib, alias) {
+            Ok(module) -> Ok(qualify(module, member))
+            Error(_) ->
+              Ok(ast.EMember(
+                ast.EIdent(resolve_name(rw, alias, locals)),
+                member,
+              ))
           }
         _, _ ->
           Ok(ast.EMember(ast.EIdent(resolve_name(rw, alias, locals)), member))
@@ -847,7 +911,13 @@ fn rewrite_type(rw: Rw, typ: ast.TypeExpr) -> Result(ast.TypeExpr, String) {
             Ok(flat) -> Ok(ast.TName(None, flat, args, dims))
             Error(_) -> Error(unknown_member(rw, pkg, name))
           }
-        False, Error(_) -> Ok(ast.TName(Some(pkg), name, args, dims))
+        // `ui.View` with `import hive.ui as ui` — the same type, spelled short.
+        False, Error(_) ->
+          case dict.get(rw.stdlib, pkg) {
+            Ok(module) ->
+              Ok(ast.TName(Some("hive." <> module), name, args, dims))
+            Error(_) -> Ok(ast.TName(Some(pkg), name, args, dims))
+          }
       }
     }
     ast.TFunc(pure, params, ret) -> {
@@ -894,7 +964,25 @@ fn rewrite_pattern_path(
                 Ok(flat) -> Ok([flat])
                 Error(_) -> Error(unknown_member(rw, first, second))
               }
-            Error(_) -> Ok(path)
+            Error(_) ->
+              case dict.get(rw.stdlib, first) {
+                // `ui.Align` names a type, and a type is not a pattern — the
+                // variant is the part that decides whether a value matches.
+                Ok(module) ->
+                  Error(
+                    "`"
+                    <> string.join(path, ".")
+                    <> "` does not name a pattern: `hive."
+                    <> module
+                    <> "."
+                    <> second
+                    <> "` is a type, so a variant of it has to be named too "
+                    <> "(in "
+                    <> rw.where
+                    <> ")",
+                  )
+                Error(_) -> Ok(path)
+              }
           }
       }
     [alias, type_name, variant] ->
@@ -905,15 +993,21 @@ fn rewrite_pattern_path(
             Error(_) -> Error(unknown_member(rw, alias, type_name))
           }
         Error(_) ->
-          Error(
-            "`"
-            <> string.join(path, ".")
-            <> "` does not name a pattern: `"
-            <> alias
-            <> "` is not an imported module (in "
-            <> rw.where
-            <> ")",
-          )
+          case dict.get(rw.stdlib, alias) {
+            // `ui.Align.Center` — written back out in full, which is the same
+            // path an unaliased `hive.ui.Align.Center` already arrives as.
+            Ok(module) -> Ok(["hive", module, type_name, variant])
+            Error(_) ->
+              Error(
+                "`"
+                <> string.join(path, ".")
+                <> "` does not name a pattern: `"
+                <> alias
+                <> "` is not an imported module (in "
+                <> rw.where
+                <> ")",
+              )
+          }
       }
     _ -> Ok(path)
   }

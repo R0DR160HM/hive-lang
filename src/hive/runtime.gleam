@@ -151,6 +151,20 @@ pub fn modules() -> List(Module) {
       requires: [],
     ),
     Module(
+      name: "ui",
+      file: "hive/ui.go",
+      source: ui_go,
+      // Every widget, attribute and enum lowers to a `hive.Ui...` name, and
+      // `hive.UiView` is what a `func` returning one is annotated with — so a
+      // program that only builds views without ever showing one still brings
+      // the module in.
+      markers: ["hive.Ui"],
+      // A window is a syslink service with a socket in front of it: the fold and
+      // the address come from `syslink`, the socket from `net`, and the token
+      // that keeps the page private from `crypto`.
+      requires: ["net", "crypto", "syslink"],
+    ),
+    Module(
       name: "sheets",
       file: "hive/sheets.go",
       source: sheets_go,
@@ -970,7 +984,13 @@ func headerTable(h http.Header) Table {
 
 // The fixed GUID every handshake mixes into the client's key to prove that the
 // peer really understood the upgrade (RFC 6455 §1.3).
-const wsGUID = \"258EAFA5-E914-47DA-95CA-C5AB0DC85B16\"
+//
+// It is a magic number and it has to be this one to the character. A wrong one
+// still lets a Hive client and a Hive server agree with each other — they mix in
+// the same thing — while every browser and every other client on earth refuses
+// the handshake. `wsHandshakeMatchesTheRfc` in the compiler's suite holds this
+// against the worked example in the RFC, because nothing else would notice.
+const wsGUID = \"258EAFA5-E914-47DA-95CA-C5AB0DC85B11\"
 
 // A frame whose length header exceeds this is refused rather than allocated, so
 // a hostile peer cannot exhaust memory with one number.
@@ -4874,6 +4894,21 @@ func syslinkStrict() bool {
 	return strict
 }
 
+// SyslinkPost delivers a message to a service on *this* node without encoding
+// it, and is how a runtime module posts to a service it spawned itself — the UI
+// window's events take this path.
+//
+// It is deliberately not reachable from Hive. The one thing it does that
+// `SyslinkSend` cannot is skip the codec, and it may only do that because the
+// sender and the service are the same process by construction. An address that
+// is not local has nowhere to put an unencoded value, so it is dropped rather
+// than half-sent.
+func SyslinkPost(addr Address, msg any) {
+	if b, ok := resolveLocal(addr); ok {
+		b.post(delivery{value: msg, origin: \"\"})
+	}
+}
+
 // SyslinkSend delivers one message and returns immediately. It never blocks and
 // never fails — a dead or unreachable recipient is not an error at the send
 // site, which is exactly what keeps a local send and a remote one the same
@@ -6253,5 +6288,1172 @@ func readString(r *bufio.Reader) (string, error) {
 	return string(b), nil
 }
 
+"
+}
+
+// ---------------------------------------------------------------------------
+// hive.ui
+// ---------------------------------------------------------------------------
+
+/// Source of `hive/ui.go`: the user interface module (`hive.ui`).
+///
+/// A view is a value — a tree of the widgets this module builds — and what
+/// paints it is chosen separately: `UiHTML` renders one as a string of HTML
+/// for an ordinary web server, and `UiWindow` serves the same tree to a window
+/// on this machine, folding the events it sends back through the program's own
+/// update handler. Nothing here is linked in: the window is a browser already
+/// on the machine, launched as a program, so the build stays dependency-free.
+fn ui_go() -> String {
+  "package hive
+
+import (
+	\"fmt\"
+	\"net\"
+	\"net/http\"
+	\"os/exec\"
+	\"runtime\"
+	\"strconv\"
+	\"strings\"
+	\"sync\"
+)
+
+// The user interface module (`hive.ui`).
+//
+// A view is a value: a tree of widgets built by the constructors below, with no
+// handle to hold and nothing to mutate. What paints it is decided separately —
+// `UiHTML` turns a tree into a string of HTML for an ordinary web server, and
+// `UiWindow` serves that same tree to a window on this machine and folds the
+// events it sends back through the program's own update handler.
+//
+// The tree is deliberately not HTML. Every widget is one of a closed set and
+// every attribute is a semantic token rather than a CSS value, which is what
+// lets one view render as a desktop window, as a served page, and — for
+// whatever comes later — somewhere with no DOM at all.
+
+// ---------------------------------------------------------------------------
+// The tree
+// ---------------------------------------------------------------------------
+
+// View is one node. `Kind` names the widget; which of the payload fields
+// carries anything depends on it.
+type View struct {
+	Kind     string
+	Attrs    []Attr
+	Children []View
+	// Leaf payloads. A widget reads the one its kind gives meaning to.
+	Text    string
+	Rows    Table
+	Options []string
+	Flag    bool
+}
+
+// Attr is one attribute. Layout and styling attributes carry a number, a
+// string or an enum tag; the event attributes carry the message a widget hands
+// back, either directly or as a function of what the user did.
+type Attr struct {
+	Kind   string
+	Num    int
+	Str    string
+	Enum   string
+	Flag   bool
+	Msg    any
+	FnStr  func(string) any
+	FnInt  func(int) any
+	FnBool func(bool) any
+}
+
+func uiNode(kind string, attrs []Attr, children []View) View {
+	return View{Kind: kind, Attrs: attrs, Children: children}
+}
+
+// --- Layout -----------------------------------------------------------------
+
+func UiRow(attrs []Attr, children []View) View {
+	return uiNode(\"row\", attrs, children)
+}
+
+func UiColumn(attrs []Attr, children []View) View {
+	return uiNode(\"column\", attrs, children)
+}
+
+func UiSpacer() View { return View{Kind: \"spacer\"} }
+
+// An overlay is drawn above everything else rather than in the flow, which is
+// why it is a widget of its own rather than a container with an attribute.
+func UiOverlay(attrs []Attr, child View) View {
+	return uiNode(\"overlay\", attrs, []View{child})
+}
+
+// --- Content ----------------------------------------------------------------
+
+func UiText(attrs []Attr, content string) View {
+	return View{Kind: \"text\", Attrs: attrs, Text: content}
+}
+
+// `alt` is a parameter rather than an attribute because an attribute is
+// optional by construction and a description of an image is not.
+func UiImage(attrs []Attr, src string, alt string) View {
+	return View{Kind: \"image\", Attrs: attrs, Text: src, Options: []string{alt}}
+}
+
+func UiIcon(attrs []Attr, name Icon) View {
+	return View{Kind: \"icon\", Attrs: attrs, Text: string(name)}
+}
+
+// A link is the one widget that acts without an event: an anchor needs no
+// socket, no handler and no state, which is what lets a page rendered as text
+// still be navigated. `href` is a parameter rather than an attribute for the
+// reason an image's description is one — a link with nowhere to go is not worth
+// making easy to write.
+func UiLink(attrs []Attr, href string, label string) View {
+	return View{Kind: \"link\", Attrs: attrs, Text: label, Options: []string{href}}
+}
+
+// --- Input ------------------------------------------------------------------
+
+func UiButton(attrs []Attr, label string) View {
+	return View{Kind: \"button\", Attrs: attrs, Text: label}
+}
+
+func UiInput(attrs []Attr, value string) View {
+	return View{Kind: \"input\", Attrs: attrs, Text: value}
+}
+
+func UiTextarea(attrs []Attr, value string) View {
+	return View{Kind: \"textarea\", Attrs: attrs, Text: value}
+}
+
+func UiCheckbox(attrs []Attr, label string, checked bool) View {
+	return View{Kind: \"checkbox\", Attrs: attrs, Text: label, Flag: checked}
+}
+
+func UiSelect(attrs []Attr, options []string, chosen string) View {
+	return View{Kind: \"select\", Attrs: attrs, Options: options, Text: chosen}
+}
+
+// --- Data -------------------------------------------------------------------
+
+// The table takes the headered Table every other part of the language hands
+// back — a CSV read with `using`, a SQL result, a JSON document — so putting one
+// on screen costs one call.
+func UiTable(attrs []Attr, rows Table) View {
+	return View{Kind: \"table\", Attrs: attrs, Rows: rows}
+}
+
+// --- Status -----------------------------------------------------------------
+
+func UiSpinner(attrs []Attr) View { return View{Kind: \"spinner\", Attrs: attrs} }
+
+// Nothing at all. It still occupies its slot among its siblings, which is what
+// keeps a conditional branch from shifting everything after it.
+func UiNone() View { return View{Kind: \"none\"} }
+
+// ---------------------------------------------------------------------------
+// Attributes
+// ---------------------------------------------------------------------------
+
+// The enumerations `hive.ui` owns. Each is a closed set the renderer can answer
+// for in full, which is what a raw CSS value would take away — and none of them
+// is an atom, because the atom table belongs to the program rather than to a
+// library that happened to be linked in.
+type Align string
+type Justify string
+type TextSize string
+type Tone string
+type Axis string
+type InputKind string
+type Icon string
+
+// A `Tone` is the one enumeration that is not only a closed set: past the five
+// roles a stylesheet answers for, two variants carry a colour outright. The two
+// kinds are told apart by shape and nothing else — a role is a name, a colour is
+// a CSS value, and no variant is spelt starting with `#` or `rgba(`.
+//
+// Everywhere a tone is used, a role becomes a class and a colour becomes a
+// declaration, so a renderer with no colours can still answer for every role it
+// is handed and has exactly one thing it cannot do.
+func uiToneColour(e string) (string, bool) {
+	if strings.HasPrefix(e, \"#\") || strings.HasPrefix(e, \"rgba(\") {
+		return e, true
+	}
+	return \"\", false
+}
+
+// A colour written down rather than named. It is checked here rather than
+// trusted, because a tone is the only value in the module that reaches a
+// stylesheet as text: anything that is not `#` and then 3, 4, 6 or 8 hex digits
+// is not a colour, and a tone that is not a colour is `Normal`.
+func UiToneHex(hex string) Tone {
+	n := len(hex)
+	if n != 4 && n != 5 && n != 7 && n != 9 {
+		return Tone(\"Normal\")
+	}
+	if hex[0] != '#' {
+		return Tone(\"Normal\")
+	}
+	for i := 1; i < n; i++ {
+		c := hex[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return Tone(\"Normal\")
+		}
+	}
+	return Tone(hex)
+}
+
+// Four channels, each 0–255. They are clamped rather than refused: a colour is
+// computed at least as often as it is written down, and the arithmetic that
+// arrived at 260 meant the top of the range rather than an error. Alpha is
+// 0–255 too — one rule for all four — and reaches CSS as the fraction it stands
+// for.
+func UiToneRGBA(red int, green int, blue int, alpha int) Tone {
+	return Tone(\"rgba(\" +
+		strconv.Itoa(uiChannel(red)) + \",\" +
+		strconv.Itoa(uiChannel(green)) + \",\" +
+		strconv.Itoa(uiChannel(blue)) + \",\" +
+		strconv.FormatFloat(float64(uiChannel(alpha))/255, 'f', 3, 64) + \")\")
+}
+
+func uiChannel(n int) int {
+	if n < 0 {
+		return 0
+	}
+	if n > 255 {
+		return 255
+	}
+	return n
+}
+
+func uiNum(kind string, n int) Attr     { return Attr{Kind: kind, Num: n} }
+func uiStr(kind string, s string) Attr  { return Attr{Kind: kind, Str: s} }
+func uiEnum(kind string, e string) Attr { return Attr{Kind: kind, Enum: e} }
+
+func UiAttrGap(n int) Attr    { return uiNum(\"gap\", n) }
+func UiAttrPad(n int) Attr    { return uiNum(\"pad\", n) }
+func UiAttrWidth(n int) Attr  { return uiNum(\"width\", n) }
+func UiAttrHeight(n int) Attr { return uiNum(\"height\", n) }
+func UiAttrGrow(n int) Attr   { return uiNum(\"grow\", n) }
+
+func UiAttrAlign(v Align) Attr     { return uiEnum(\"align\", string(v)) }
+func UiAttrJustify(v Justify) Attr { return uiEnum(\"justify\", string(v)) }
+func UiAttrScroll(v Axis) Attr     { return uiEnum(\"scroll\", string(v)) }
+func UiAttrSize(v TextSize) Attr   { return uiEnum(\"size\", string(v)) }
+func UiAttrTone(v Tone) Attr       { return uiEnum(\"tone\", string(v)) }
+func UiAttrBackground(v Tone) Attr { return uiEnum(\"background\", string(v)) }
+func UiAttrKind(v InputKind) Attr  { return uiEnum(\"kind\", string(v)) }
+
+func UiAttrHeading(n int) Attr        { return uiNum(\"heading\", n) }
+func UiAttrPlaceholder(s string) Attr { return uiStr(\"placeholder\", s) }
+func UiAttrHint(s string) Attr        { return uiStr(\"hint\", s) }
+
+func UiAttrDisabled(b bool) Attr { return Attr{Kind: \"disabled\", Flag: b} }
+func UiAttrBusy(b bool) Attr     { return Attr{Kind: \"busy\", Flag: b} }
+
+// The event attributes. A plain one carries the message itself; the rest carry
+// a function of what the user did, because the message depends on it.
+func UiAttrOn(msg any) Attr        { return Attr{Kind: \"on\", Msg: msg} }
+func UiAttrOnDismiss(msg any) Attr { return Attr{Kind: \"onDismiss\", Msg: msg} }
+
+func UiAttrOnInput(f func(string) any) Attr  { return Attr{Kind: \"onInput\", FnStr: f} }
+func UiAttrOnSubmit(f func(string) any) Attr { return Attr{Kind: \"onSubmit\", FnStr: f} }
+func UiAttrOnChoose(f func(string) any) Attr { return Attr{Kind: \"onChoose\", FnStr: f} }
+func UiAttrOnToggle(f func(bool) any) Attr   { return Attr{Kind: \"onToggle\", FnBool: f} }
+func UiAttrOnPick(f func(int) any) Attr      { return Attr{Kind: \"onPick\", FnInt: f} }
+func UiAttrOnSort(f func(int) any) Attr      { return Attr{Kind: \"onSort\", FnInt: f} }
+
+// Finding one attribute among a node's. Attributes are few and a view is
+// rebuilt every turn, so a scan beats anything with a map's allocation.
+func uiFind(attrs []Attr, kind string) (Attr, bool) {
+	for _, a := range attrs {
+		if a.Kind == kind {
+			return a, true
+		}
+	}
+	return Attr{}, false
+}
+
+func uiHasEvent(attrs []Attr) bool {
+	for _, a := range attrs {
+		switch a.Kind {
+		case \"on\", \"onDismiss\", \"onInput\", \"onSubmit\", \"onChoose\", \"onToggle\", \"onPick\", \"onSort\":
+			return true
+		}
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+// A render pass. `handlers` is filled in as the tree is walked when the render
+// is a live one: each interactive node is given an id, and the message it
+// carries is filed under it. A static render leaves it nil and emits no ids, so
+// nothing about the page depends on a channel that isn't there.
+type uiRender struct {
+	out      strings.Builder
+	handlers map[string][]Attr
+	next     int
+}
+
+func uiEscape(s string) string {
+	r := strings.NewReplacer(
+		\"&\", \"&amp;\",
+		\"<\", \"&lt;\",
+		\">\", \"&gt;\",
+		\"\\\"\", \"&quot;\",
+		\"'\", \"&#39;\",
+	)
+	return r.Replace(s)
+}
+
+// The style a node's attributes come to. Every one maps to a fixed declaration:
+// nothing here takes a CSS value from the program, which is what keeps a view
+// portable to a renderer that has no CSS at all.
+func uiStyle(kind string, attrs []Attr) string {
+	var b strings.Builder
+	switch kind {
+	case \"row\":
+		b.WriteString(\"display:flex;flex-direction:row;\")
+	case \"column\":
+		b.WriteString(\"display:flex;flex-direction:column;\")
+	case \"spacer\":
+		b.WriteString(\"flex:1 1 auto;\")
+	}
+	for _, a := range attrs {
+		switch a.Kind {
+		case \"gap\":
+			b.WriteString(\"gap:\" + strconv.Itoa(a.Num) + \"px;\")
+		case \"pad\":
+			b.WriteString(\"padding:\" + strconv.Itoa(a.Num) + \"px;\")
+		case \"width\":
+			b.WriteString(\"width:\" + strconv.Itoa(a.Num) + \"px;\")
+		case \"height\":
+			b.WriteString(\"height:\" + strconv.Itoa(a.Num) + \"px;\")
+		case \"align\":
+			b.WriteString(\"align-items:\" + uiFlexPos(a.Enum) + \";\")
+		case \"justify\":
+			b.WriteString(\"justify-content:\" + uiFlexPos(a.Enum) + \";\")
+		case \"scroll\":
+			switch a.Enum {
+			case \"Horizontal\":
+				b.WriteString(\"overflow-x:auto;\")
+			case \"Vertical\":
+				b.WriteString(\"overflow-y:auto;\")
+			default:
+				b.WriteString(\"overflow:auto;\")
+			}
+			// A flex item will not shrink below its content unless it says so,
+			// and one that cannot shrink never scrolls — it stretches the page
+			// instead. This is the line that makes `scroll` mean anything.
+			b.WriteString(\"min-height:0;min-width:0;\")
+		// The two tones that carry a colour. The value reaching this point has
+		// been through `UiToneHex` or `UiToneRGBA`, so it is a colour and not
+		// whatever the program had in the string.
+		case \"tone\":
+			if c, colour := uiToneColour(a.Enum); colour {
+				b.WriteString(\"color:\" + c + \";\")
+			}
+		case \"background\":
+			if c, colour := uiToneColour(a.Enum); colour {
+				b.WriteString(\"background:\" + c + \";\")
+			}
+		}
+	}
+	// `flex` is written once, after everything else: `grow` and `width` are two
+	// answers to the same question, and a box that emitted both would have the
+	// later one quietly win.
+	if grow, ok := uiFind(attrs, \"grow\"); ok {
+		b.WriteString(\"flex:\" + strconv.Itoa(grow.Num) + \" 1 0;\")
+	} else if _, ok := uiFind(attrs, \"width\"); ok {
+		b.WriteString(\"flex:0 0 auto;\")
+	}
+	return b.String()
+}
+
+func uiFlexPos(v string) string {
+	switch v {
+	case \"Start\":
+		return \"flex-start\"
+	case \"End\":
+		return \"flex-end\"
+	case \"Center\":
+		return \"center\"
+	case \"Between\":
+		return \"space-between\"
+	case \"Stretch\":
+		return \"stretch\"
+	}
+	return \"flex-start\"
+}
+
+// The classes a node carries: its widget name, plus a token for each attribute
+// the stylesheet gives meaning to. A tone is a class rather than a colour so a
+// theme — or a renderer with no colours — decides what it looks like.
+func uiClasses(kind string, attrs []Attr) string {
+	classes := []string{\"h-\" + kind}
+	for _, a := range attrs {
+		switch a.Kind {
+		// A tone naming a role is a class the stylesheet answers for. One
+		// carrying a colour has nothing to look up and becomes a declaration in
+		// `uiStyle` instead, so it gets no class here.
+		case \"tone\":
+			if _, colour := uiToneColour(a.Enum); !colour {
+				classes = append(classes, \"h-tone-\"+strings.ToLower(a.Enum))
+			}
+		case \"background\":
+			if _, colour := uiToneColour(a.Enum); !colour {
+				classes = append(classes, \"h-bg-\"+strings.ToLower(a.Enum))
+			}
+		case \"size\":
+			classes = append(classes, \"h-size-\"+strings.ToLower(a.Enum))
+		case \"busy\":
+			if a.Flag {
+				classes = append(classes, \"h-busy\")
+			}
+		}
+	}
+	return strings.Join(classes, \" \")
+}
+
+// The common attribute string every element opens with.
+func (r *uiRender) common(kind string, attrs []Attr) string {
+	out := \" class=\\\"\" + uiClasses(kind, attrs) + \"\\\"\"
+	if style := uiStyle(kind, attrs); style != \"\" {
+		out += \" style=\\\"\" + style + \"\\\"\"
+	}
+	if hint, ok := uiFind(attrs, \"hint\"); ok {
+		out += \" title=\\\"\" + uiEscape(hint.Str) + \"\\\"\"
+	}
+	if r.handlers != nil && uiHasEvent(attrs) {
+		r.next++
+		id := \"h\" + strconv.Itoa(r.next)
+		r.handlers[id] = attrs
+		out += \" data-h=\\\"\" + id + \"\\\"\"
+	}
+	return out
+}
+
+func (r *uiRender) view(v View) {
+	switch v.Kind {
+	case \"none\":
+		r.out.WriteString(\"<!--none-->\")
+	case \"spacer\":
+		r.out.WriteString(\"<div\" + r.common(v.Kind, v.Attrs) + \"></div>\")
+	case \"row\", \"column\":
+		r.out.WriteString(\"<div\" + r.common(v.Kind, v.Attrs) + \">\")
+		for _, c := range v.Children {
+			r.view(c)
+		}
+		r.out.WriteString(\"</div>\")
+	case \"overlay\":
+		r.out.WriteString(\"<div class=\\\"h-backdrop\\\"\" + r.backdrop(v.Attrs) + \">\")
+		r.out.WriteString(\"<div\" + r.common(v.Kind, v.Attrs) + \">\")
+		for _, c := range v.Children {
+			r.view(c)
+		}
+		r.out.WriteString(\"</div></div>\")
+	case \"text\":
+		tag := \"span\"
+		if h, ok := uiFind(v.Attrs, \"heading\"); ok && h.Num >= 1 && h.Num <= 6 {
+			tag = \"h\" + strconv.Itoa(h.Num)
+		}
+		r.out.WriteString(\"<\" + tag + r.common(v.Kind, v.Attrs) + \">\")
+		r.out.WriteString(uiEscape(v.Text))
+		r.out.WriteString(\"</\" + tag + \">\")
+	case \"image\":
+		alt := \"\"
+		if len(v.Options) > 0 {
+			alt = v.Options[0]
+		}
+		r.out.WriteString(\"<img\" + r.common(v.Kind, v.Attrs) +
+			\" src=\\\"\" + uiEscape(v.Text) + \"\\\" alt=\\\"\" + uiEscape(alt) + \"\\\">\")
+	case \"icon\":
+		r.out.WriteString(\"<span\" + r.common(v.Kind, v.Attrs) + \" aria-hidden=\\\"true\\\">\")
+		r.out.WriteString(uiIconGlyph(v.Text))
+		r.out.WriteString(\"</span>\")
+	case \"link\":
+		href := \"\"
+		if len(v.Options) > 0 {
+			href = v.Options[0]
+		}
+		r.out.WriteString(\"<a\" + r.common(v.Kind, v.Attrs) +
+			\" href=\\\"\" + uiEscape(uiHref(href)) + \"\\\">\")
+		r.out.WriteString(uiEscape(v.Text))
+		r.out.WriteString(\"</a>\")
+	case \"button\":
+		r.out.WriteString(\"<button type=\\\"button\\\"\" + r.common(v.Kind, v.Attrs) + r.disabled(v.Attrs) + \">\")
+		r.out.WriteString(uiEscape(v.Text))
+		r.out.WriteString(\"</button>\")
+	case \"input\":
+		kind := \"text\"
+		if k, ok := uiFind(v.Attrs, \"kind\"); ok {
+			kind = uiInputType(k.Enum)
+		}
+		out := \"<input type=\\\"\" + kind + \"\\\"\" + r.common(v.Kind, v.Attrs) + r.disabled(v.Attrs)
+		out += \" value=\\\"\" + uiEscape(v.Text) + \"\\\"\"
+		if p, ok := uiFind(v.Attrs, \"placeholder\"); ok {
+			out += \" placeholder=\\\"\" + uiEscape(p.Str) + \"\\\"\"
+		}
+		r.out.WriteString(out + \">\")
+	case \"textarea\":
+		out := \"<textarea\" + r.common(v.Kind, v.Attrs) + r.disabled(v.Attrs)
+		if p, ok := uiFind(v.Attrs, \"placeholder\"); ok {
+			out += \" placeholder=\\\"\" + uiEscape(p.Str) + \"\\\"\"
+		}
+		r.out.WriteString(out + \">\" + uiEscape(v.Text) + \"</textarea>\")
+	case \"checkbox\":
+		// Wrapped in its label so the words are clickable too, which is what
+		// anyone expects of a checkbox and is easy to leave out.
+		r.out.WriteString(\"<label\" + r.common(v.Kind, v.Attrs) + \"><input type=\\\"checkbox\\\"\")
+		if v.Flag {
+			r.out.WriteString(\" checked\")
+		}
+		r.out.WriteString(r.disabled(v.Attrs) + \"><span>\" + uiEscape(v.Text) + \"</span></label>\")
+	case \"select\":
+		r.out.WriteString(\"<select\" + r.common(v.Kind, v.Attrs) + r.disabled(v.Attrs) + \">\")
+		for _, opt := range v.Options {
+			sel := \"\"
+			if opt == v.Text {
+				sel = \" selected\"
+			}
+			r.out.WriteString(\"<option value=\\\"\" + uiEscape(opt) + \"\\\"\" + sel + \">\" +
+				uiEscape(opt) + \"</option>\")
+		}
+		r.out.WriteString(\"</select>\")
+	case \"table\":
+		r.table(v)
+	case \"spinner\":
+		r.out.WriteString(\"<div\" + r.common(v.Kind, v.Attrs) + \" role=\\\"status\\\"></div>\")
+	default:
+		r.out.WriteString(\"<!--unknown widget-->\")
+	}
+}
+
+// Where a link may point. This is the only value in the module that becomes a
+// URL, and a URL is executable in one well-known case — so what is allowed is a
+// closed set rather than whatever arrived: somewhere within this page, an
+// ordinary relative path, or a web or mail address. Anything else, `javascript:`
+// first among them, is not a destination, and a link without one points at
+// nothing rather than at something surprising.
+func uiHref(raw string) string {
+	if raw == \"\" {
+		return \"#\"
+	}
+	switch raw[0] {
+	case '/', '#', '?':
+		return raw
+	}
+	lower := strings.ToLower(raw)
+	if strings.HasPrefix(lower, \"http://\") ||
+		strings.HasPrefix(lower, \"https://\") ||
+		strings.HasPrefix(lower, \"mailto:\") {
+		return raw
+	}
+	// No scheme at all is a relative path, which is what a served page mostly
+	// wants. A colon before the first slash *is* a scheme, and it is not one of
+	// the three above or it would have matched already.
+	if i := strings.IndexByte(raw, ':'); i >= 0 {
+		if j := strings.IndexByte(raw, '/'); j < 0 || i < j {
+			return \"#\"
+		}
+	}
+	return raw
+}
+
+// The backdrop carries the dismiss message rather than the panel, so a click
+// outside closes and a click inside does not.
+func (r *uiRender) backdrop(attrs []Attr) string {
+	if r.handlers == nil {
+		return \"\"
+	}
+	if d, ok := uiFind(attrs, \"onDismiss\"); ok {
+		r.next++
+		id := \"h\" + strconv.Itoa(r.next)
+		r.handlers[id] = []Attr{{Kind: \"on\", Msg: d.Msg}}
+		return \" data-h=\\\"\" + id + \"\\\" data-backdrop=\\\"1\\\"\"
+	}
+	return \"\"
+}
+
+func (r *uiRender) disabled(attrs []Attr) string {
+	if d, ok := uiFind(attrs, \"disabled\"); ok && d.Flag {
+		return \" disabled\"
+	}
+	if b, ok := uiFind(attrs, \"busy\"); ok && b.Flag {
+		return \" disabled\"
+	}
+	return \"\"
+}
+
+// A headered Table: the first row names the columns and the rest are data. The
+// header cells carry the sort message when there is one, and each body row
+// carries its own index, so a click says which row rather than which pixel.
+func (r *uiRender) table(v View) {
+	r.out.WriteString(\"<table\" + r.common(v.Kind, v.Attrs) + \">\")
+	if len(v.Rows) == 0 {
+		r.out.WriteString(\"</table>\")
+		return
+	}
+	sortAttr, sortable := uiFind(v.Attrs, \"onSort\")
+	r.out.WriteString(\"<thead><tr>\")
+	for i, head := range v.Rows[0] {
+		cell := \"<th\"
+		if r.handlers != nil && sortable {
+			r.next++
+			id := \"h\" + strconv.Itoa(r.next)
+			r.handlers[id] = []Attr{{Kind: \"onSort\", FnInt: sortAttr.FnInt, Num: i}}
+			cell += \" data-h=\\\"\" + id + \"\\\" data-index=\\\"\" + strconv.Itoa(i) + \"\\\" class=\\\"h-sortable\\\"\"
+		}
+		r.out.WriteString(cell + \">\" + uiEscape(head) + \"</th>\")
+	}
+	r.out.WriteString(\"</tr></thead><tbody>\")
+	pickAttr, pickable := uiFind(v.Attrs, \"onPick\")
+	for i, row := range v.Rows[1:] {
+		line := \"<tr\"
+		if r.handlers != nil && pickable {
+			r.next++
+			id := \"h\" + strconv.Itoa(r.next)
+			r.handlers[id] = []Attr{{Kind: \"onPick\", FnInt: pickAttr.FnInt, Num: i}}
+			line += \" data-h=\\\"\" + id + \"\\\" data-index=\\\"\" + strconv.Itoa(i) + \"\\\" class=\\\"h-pickable\\\"\"
+		}
+		r.out.WriteString(line + \">\")
+		for _, cell := range row {
+			r.out.WriteString(\"<td>\" + uiEscape(cell) + \"</td>\")
+		}
+		r.out.WriteString(\"</tr>\")
+	}
+	r.out.WriteString(\"</tbody></table>\")
+}
+
+func uiInputType(v string) string {
+	switch v {
+	case \"Number\":
+		return \"number\"
+	case \"Date\":
+		return \"date\"
+	case \"Password\":
+		return \"password\"
+	case \"Search\":
+		return \"search\"
+	}
+	return \"text\"
+}
+
+// A closed set, which is the whole reason icons are a widget rather than an
+// escape hatch for arbitrary markup: every renderer can answer for all of them.
+func uiIconGlyph(name string) string {
+	switch name {
+	case \"Search\":
+		return \"\\u2315\"
+	case \"Close\":
+		return \"\\u2715\"
+	case \"Check\":
+		return \"\\u2713\"
+	case \"Plus\":
+		return \"\\uff0b\"
+	case \"Minus\":
+		return \"\\u2212\"
+	case \"Up\":
+		return \"\\u2191\"
+	case \"Down\":
+		return \"\\u2193\"
+	case \"Left\":
+		return \"\\u2190\"
+	case \"Right\":
+		return \"\\u2192\"
+	case \"Warning\":
+		return \"\\u26a0\"
+	case \"Info\":
+		return \"\\u2139\"
+	case \"Star\":
+		return \"\\u2605\"
+	case \"Heart\":
+		return \"\\u2665\"
+	case \"Reply\":
+		return \"\\u21a9\"
+	case \"Repeat\":
+		return \"\\u21bb\"
+	case \"Trash\":
+		return \"\\u2326\"
+	case \"User\":
+		return \"\\u25cf\"
+	case \"Menu\":
+		return \"\\u2261\"
+	}
+	return \"\\u25a1\"
+}
+
+// UiHTML renders a view as a fragment of HTML, with no ids and nothing to talk
+// back to. This is what a web server serves: `hive.ui.html(view)` inside an
+// `httpServe` handler puts the same tree on a page.
+func UiHTML(v View) string {
+	r := &uiRender{}
+	r.view(v)
+	return r.out.String()
+}
+
+// UiPage wraps a fragment in a whole document, stylesheet included, so a server
+// can answer a request with one call rather than assembling a page by hand.
+func UiPage(title string, v View) string {
+	return \"<!doctype html>\\n<html><head><meta charset=\\\"utf-8\\\">\" +
+		\"<meta name=\\\"viewport\\\" content=\\\"width=device-width,initial-scale=1\\\">\" +
+		\"<title>\" + uiEscape(title) + \"</title><style>\" + uiCSS + \"</style></head><body>\" +
+		\"<div class=\\\"h-root\\\">\" + UiHTML(v) + \"</div></body></html>\"
+}
+
+// ---------------------------------------------------------------------------
+// A window on this machine
+// ---------------------------------------------------------------------------
+
+// The live document. The shell keeps a socket open, swaps in whatever HTML
+// arrives, and posts back the id of whatever was interacted with.
+const uiShell = `<!doctype html>
+<html><head><meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
+<title>__TITLE__</title><style>__CSS__</style></head>
+<body><div class=\"h-root\" id=\"root\"></div>
+<script>
+var sock = new WebSocket(\"ws://\" + location.host + \"/_hive/socket?token=__TOKEN__\");
+var root = document.getElementById(\"root\");
+sock.onmessage = function (e) {
+  var focused = document.activeElement;
+  var mark = focused && focused.getAttribute ? focused.getAttribute(\"data-h\") : null;
+  var start = focused && focused.selectionStart;
+  root.innerHTML = e.data;
+  if (mark) {
+    var again = root.querySelector('[data-h=\"' + mark + '\"]');
+    if (again && again.focus) {
+      again.focus();
+      if (start != null && again.setSelectionRange) {
+        try { again.setSelectionRange(start, start); } catch (err) {}
+      }
+    }
+  }
+};
+sock.onclose = function () { document.body.classList.add(\"h-closed\"); };
+function send(id, kind, value, index) {
+  if (sock.readyState !== 1) { return; }
+  sock.send(JSON.stringify({ id: id, kind: kind, value: String(value), index: index | 0 }));
+}
+function holder(el) {
+  while (el && el !== root) {
+    if (el.getAttribute && el.getAttribute(\"data-h\")) { return el; }
+    el = el.parentNode;
+  }
+  return null;
+}
+function anchorUnder(el, stop) {
+  while (el && el !== stop) {
+    if (el.tagName === \"A\") { return true; }
+    el = el.parentNode;
+  }
+  return false;
+}
+root.addEventListener(\"click\", function (e) {
+  var el = holder(e.target);
+  if (!el) { return; }
+  if (el.getAttribute(\"data-backdrop\") && e.target !== el) { return; }
+  if (el.tagName === \"A\") {
+    // A link carrying a message means the message. Its href is the fallback for
+    // a render with no socket behind it, and following it here would navigate
+    // away from the very window the message was meant to update.
+    e.preventDefault();
+  } else if (anchorUnder(e.target, el)) {
+    // A plain link inside something that does carry a message: the link is the
+    // more specific thing the click landed on, so it navigates and the
+    // surrounding message goes unsent.
+    return;
+  }
+  var idx = parseInt(el.getAttribute(\"data-index\") || \"0\", 10);
+  send(el.getAttribute(\"data-h\"), \"click\", \"\", idx);
+});
+root.addEventListener(\"input\", function (e) {
+  var el = holder(e.target);
+  if (!el) { return; }
+  var t = e.target;
+  if (t.type === \"checkbox\") { send(el.getAttribute(\"data-h\"), \"toggle\", t.checked ? \"1\" : \"\", 0); }
+  else { send(el.getAttribute(\"data-h\"), \"input\", t.value, 0); }
+});
+root.addEventListener(\"change\", function (e) {
+  var el = holder(e.target);
+  if (!el || e.target.tagName !== \"SELECT\") { return; }
+  send(el.getAttribute(\"data-h\"), \"choose\", e.target.value, 0);
+});
+root.addEventListener(\"keydown\", function (e) {
+  if (e.key !== \"Enter\" || e.shiftKey) { return; }
+  var el = holder(e.target);
+  if (!el || e.target.tagName === \"TEXTAREA\") { return; }
+  send(el.getAttribute(\"data-h\"), \"submit\", e.target.value, 0);
+});
+</script></body></html>`
+
+const uiCSS = `*,*::before,*::after{box-sizing:border-box}
+body{margin:0;font:14px/1.5 system-ui,-apple-system,\"Segoe UI\",sans-serif;
+background:var(--bg);color:var(--fg)}
+:root{--bg:#fff;--fg:#16181c;--muted:#5b6470;--line:#e3e6ea;--accent:#1d9bf0;
+--good:#00a870;--warn:#c47d00;--danger:#d7263d;--surface:#f7f9fa}
+@media (prefers-color-scheme:dark){:root{--bg:#15181c;--fg:#e7e9ea;--muted:#8b98a5;
+--line:#2f3336;--accent:#1d9bf0;--good:#00ba7c;--warn:#ffd400;--danger:#f4212e;
+--surface:#1c2026}}
+.h-root{display:flex;flex-direction:column;min-height:100vh}
+.h-text{white-space:pre-wrap;overflow-wrap:anywhere}
+.h-size-title{font-size:20px;font-weight:700}
+.h-size-subtitle{font-size:16px;font-weight:600}
+.h-size-caption{font-size:12px}
+.h-bg-normal{background:var(--bg)}
+.h-bg-muted{background:var(--surface)}
+.h-bg-good{background:var(--good);color:#fff}
+.h-bg-warn{background:var(--warn);color:#15181c}
+.h-bg-danger{background:var(--danger);color:#fff}
+.h-tone-muted{color:var(--muted)}
+.h-tone-good{color:var(--good)}
+.h-tone-warn{color:var(--warn)}
+.h-tone-danger{color:var(--danger)}
+.h-link{color:var(--accent);text-decoration:none}
+.h-link:hover{text-decoration:underline}
+.h-button{font:inherit;border:1px solid var(--line);background:var(--surface);
+color:inherit;border-radius:999px;padding:6px 14px;cursor:pointer}
+.h-button:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+.h-button:disabled{opacity:.5;cursor:default}
+.h-button.h-tone-good{background:var(--accent);border-color:var(--accent);color:#fff}
+.h-button.h-tone-danger{border-color:var(--danger);color:var(--danger)}
+.h-input,.h-textarea,.h-select{font:inherit;color:inherit;background:var(--bg);
+border:1px solid var(--line);border-radius:8px;padding:8px 10px;min-width:0}
+.h-input:focus,.h-textarea:focus{outline:2px solid var(--accent);border-color:transparent}
+.h-textarea{resize:vertical;min-height:64px;width:100%}
+.h-checkbox{display:inline-flex;align-items:center;gap:6px;cursor:pointer}
+.h-table{border-collapse:collapse;width:100%}
+.h-table th,.h-table td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
+.h-table thead th{position:sticky;top:0;background:var(--bg);font-weight:600}
+.h-sortable,.h-pickable{cursor:pointer}
+.h-pickable:hover{background:var(--surface)}
+.h-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;
+align-items:center;justify-content:center;z-index:10}
+.h-overlay{background:var(--bg);border-radius:16px;max-height:85vh;overflow:auto;
+box-shadow:0 12px 40px rgba(0,0,0,.3)}
+.h-spinner{width:18px;height:18px;border:2px solid var(--line);
+border-top-color:var(--accent);border-radius:50%;animation:h-spin .7s linear infinite}
+@keyframes h-spin{to{transform:rotate(360deg)}}
+.h-busy{opacity:.6}
+.h-icon{font-style:normal}
+.h-image{max-width:100%;height:auto;display:block}
+.h-closed::after{content:\"disconnected\";position:fixed;bottom:12px;left:12px;
+background:var(--danger);color:#fff;padding:4px 10px;border-radius:6px;font-size:12px}`
+
+// One running window: the page it last rendered, the sockets watching it, and
+// the handlers the current page's ids stand for.
+type uiWindow struct {
+	mu       sync.Mutex
+	html     string
+	handlers map[string][]Attr
+	watchers map[WsConnection]bool
+	token    string
+}
+
+func (w *uiWindow) publish(v View) {
+	r := &uiRender{handlers: map[string][]Attr{}}
+	r.view(v)
+	w.mu.Lock()
+	w.html = r.out.String()
+	w.handlers = r.handlers
+	watchers := make([]WsConnection, 0, len(w.watchers))
+	for c := range w.watchers {
+		watchers = append(watchers, c)
+	}
+	page := w.html
+	w.mu.Unlock()
+	for _, c := range watchers {
+		WsSend(c, page)
+	}
+}
+
+// The message an event on `id` means, if it means one. A stale id — an event
+// from a page the program has already replaced — resolves to nothing, which is
+// the right answer rather than a guess.
+func (w *uiWindow) message(id string, kind string, value string, index int) (any, bool) {
+	w.mu.Lock()
+	attrs, ok := w.handlers[id]
+	w.mu.Unlock()
+	if !ok {
+		return nil, false
+	}
+	for _, a := range attrs {
+		switch {
+		case kind == \"click\" && a.Kind == \"on\":
+			return a.Msg, true
+		case kind == \"click\" && a.Kind == \"onPick\" && a.FnInt != nil:
+			return a.FnInt(index), true
+		case kind == \"click\" && a.Kind == \"onSort\" && a.FnInt != nil:
+			return a.FnInt(index), true
+		case kind == \"input\" && a.Kind == \"onInput\" && a.FnStr != nil:
+			return a.FnStr(value), true
+		case kind == \"submit\" && a.Kind == \"onSubmit\" && a.FnStr != nil:
+			return a.FnStr(value), true
+		case kind == \"choose\" && a.Kind == \"onChoose\" && a.FnStr != nil:
+			return a.FnStr(value), true
+		case kind == \"toggle\" && a.Kind == \"onToggle\" && a.FnBool != nil:
+			return a.FnBool(value != \"\"), true
+		}
+	}
+	return nil, false
+}
+
+// UiWindow opens a window showing `view` of the state, folds every event
+// through `update`, and does not return.
+//
+// The fold is a syslink service, so the window has an address: `hive.syslink.self`
+// inside the handler reaches it, and anything else in the program — or on
+// another node — can post to it with an ordinary send. That is what a command
+// is here; there is no separate notion of one.
+func UiWindow[S any, M any](
+	title string,
+	view func(S) View,
+	update func(S, M, Envelope) S,
+	initial S,
+	decode func([]byte) (any, error),
+	digest uint32,
+	repliesInTurn bool,
+) {
+	w := &uiWindow{
+		watchers: map[WsConnection]bool{},
+		token:    RandomHex(16),
+	}
+	// Rendering is the only thing wrapped around the program's own handler, and
+	// it happens inside the fold — so the page a viewer sees is always some
+	// state the program actually passed through, never a mix of two.
+	folded := func(state S, msg M, env Envelope) S {
+		next := update(state, msg, env)
+		w.publish(view(next))
+		return next
+	}
+	addr := SyslinkSpawn(folded, initial, decode, digest, repliesInTurn)
+	w.publish(view(initial))
+
+	page := strings.NewReplacer(
+		\"__TITLE__\", uiEscape(title),
+		\"__CSS__\", uiCSS,
+		\"__TOKEN__\", w.token,
+	).Replace(uiShell)
+
+	ready := make(chan int, 1)
+	go uiServe(w, addr, page, ready)
+	bound := <-ready
+	if bound == 0 {
+		fmt.Println(\"hive: the window could not be opened — no port could be bound\")
+		return
+	}
+	url := \"http://127.0.0.1:\" + strconv.Itoa(bound) + \"/?token=\" + w.token
+	if err := uiOpen(url); err != nil {
+		// Not fatal: the address still works, and saying so is more use than
+		// exiting on a machine with no browser to launch.
+		fmt.Println(\"hive: open \" + url)
+	}
+	select {}
+}
+
+// The window's own little server. It is deliberately not `HttpServe`: this needs
+// the port it actually bound, a socket upgrade on one route, and nothing else.
+func uiServe(w *uiWindow, addr Address, page string, ready chan int) {
+	mux := http.NewServeMux()
+	mux.HandleFunc(\"/\", func(rw http.ResponseWriter, req *http.Request) {
+		if req.URL.Query().Get(\"token\") != w.token {
+			http.Error(rw, \"forbidden\", http.StatusForbidden)
+			return
+		}
+		rw.Header().Set(\"Content-Type\", \"text/html; charset=utf-8\")
+		fmt.Fprint(rw, page)
+	})
+	mux.HandleFunc(\"/_hive/socket\", func(rw http.ResponseWriter, req *http.Request) {
+		if req.URL.Query().Get(\"token\") != w.token {
+			http.Error(rw, \"forbidden\", http.StatusForbidden)
+			return
+		}
+		socket, err := wsAccept(rw, req)
+		if err != nil {
+			return
+		}
+		conn := WsConnection{ws: socket}
+		defer socket.close()
+		w.mu.Lock()
+		w.watchers[conn] = true
+		current := w.html
+		w.mu.Unlock()
+		WsSend(conn, current)
+		uiPump(w, addr, conn)
+		w.mu.Lock()
+		delete(w.watchers, conn)
+		w.mu.Unlock()
+	})
+	listener, bound := uiListen()
+	if listener == nil {
+		ready <- 0
+		return
+	}
+	ready <- bound
+	_ = http.Serve(listener, mux)
+}
+
+// Everything a socket says, turned into messages and posted to the fold.
+func uiPump(w *uiWindow, addr Address, conn WsConnection) {
+	for {
+		got := WsReceive(conn)
+		if got.IsError() {
+			return
+		}
+		id, kind, value, index := uiEvent(got.Ok())
+		if id == \"\" {
+			continue
+		}
+		if msg, ok := w.message(id, kind, value, index); ok {
+			SyslinkPost(addr, msg)
+		}
+	}
+}
+
+// Reads the four fields the shell sends. The payload is this program's own
+// shell talking to this program, so a hand-written reader beats pulling the
+// JSON module into every window.
+func uiEvent(text string) (string, string, string, int) {
+	id := uiField(text, \"id\")
+	kind := uiField(text, \"kind\")
+	value := uiField(text, \"value\")
+	index, _ := strconv.Atoi(uiField(text, \"index\"))
+	return id, kind, value, index
+}
+
+func uiField(text string, name string) string {
+	key := \"\\\"\" + name + \"\\\":\"
+	at := strings.Index(text, key)
+	if at < 0 {
+		return \"\"
+	}
+	rest := strings.TrimLeft(text[at+len(key):], \" \")
+	if rest == \"\" {
+		return \"\"
+	}
+	if rest[0] != '\"' {
+		end := strings.IndexAny(rest, \",}\")
+		if end < 0 {
+			end = len(rest)
+		}
+		return strings.TrimSpace(rest[:end])
+	}
+	var b strings.Builder
+	for i := 1; i < len(rest); i++ {
+		if rest[i] == '\\\\' && i+1 < len(rest) {
+			i++
+			switch rest[i] {
+			case 'n':
+				b.WriteByte('\\n')
+			case 't':
+				b.WriteByte('\\t')
+			case 'r':
+				b.WriteByte('\\r')
+			case 'u':
+				if i+4 < len(rest) {
+					if n, err := strconv.ParseInt(rest[i+1:i+5], 16, 32); err == nil {
+						b.WriteRune(rune(n))
+						i += 4
+					}
+				}
+			default:
+				b.WriteByte(rest[i])
+			}
+			continue
+		}
+		if rest[i] == '\"' {
+			break
+		}
+		b.WriteByte(rest[i])
+	}
+	return b.String()
+}
+
+// Binding the port. Always a free one chosen by the operating system, and always
+// on the loopback interface: nothing outside this machine is meant to reach a
+// window, so the number is an implementation detail rather than something a call
+// has to carry — and one fewer thing that can collide with a server the program
+// is also running.
+func uiListen() (net.Listener, int) {
+	listener, err := net.Listen(\"tcp\", \"127.0.0.1:0\")
+	if err != nil {
+		fmt.Println(\"hive: ui.window could not bind a local port: \" + err.Error())
+		return nil, 0
+	}
+	return listener, listener.Addr().(*net.TCPAddr).Port
+}
+
+// Opening the window. A browser already installed in application mode is a real
+// window with no address bar and no tabs; without one, an ordinary tab is a
+// perfectly good fallback. Nothing here is linked into the binary — each is a
+// program that may or may not be on the machine — so the build stays free of
+// dependencies on every platform.
+func uiOpen(url string) error {
+	for _, candidate := range uiBrowsers() {
+		path, err := exec.LookPath(candidate)
+		if err != nil {
+			continue
+		}
+		cmd := exec.Command(path, \"--app=\"+url, \"--window-size=1100,780\")
+		if err := cmd.Start(); err == nil {
+			return nil
+		}
+	}
+	// A browser installed as a Flatpak puts nothing on PATH, so the loop above
+	// finds none on a machine that has several — which is every atomic Fedora,
+	// Silverblue and Bluefin desktop. Asked by id instead, they are there.
+	if flatpak, err := exec.LookPath(\"flatpak\"); err == nil {
+		for _, id := range uiFlatpakBrowsers() {
+			// `info` is how you ask whether one is installed without starting it.
+			if exec.Command(flatpak, \"info\", id).Run() != nil {
+				continue
+			}
+			cmd := exec.Command(flatpak, \"run\", id, \"--app=\"+url, \"--window-size=1100,780\")
+			if cmd.Start() == nil {
+				return nil
+			}
+		}
+	}
+	switch runtime.GOOS {
+	case \"windows\":
+		return exec.Command(\"rundll32\", \"url.dll,FileProtocolHandler\", url).Start()
+	case \"darwin\":
+		return exec.Command(\"open\", url).Start()
+	default:
+		return exec.Command(\"xdg-open\", url).Start()
+	}
+}
+
+// The Chromium-family Flatpaks worth asking about, by application id. Only
+// these: application mode is a Chromium flag, and a browser that does not have
+// it would open a tab, which is what the fallback below is already for.
+func uiFlatpakBrowsers() []string {
+	return []string{
+		\"com.google.Chrome\",
+		\"org.chromium.Chromium\",
+		\"com.microsoft.Edge\",
+		\"com.brave.Browser\",
+		\"com.vivaldi.Vivaldi\",
+		\"io.github.ungoogled_software.ungoogled_chromium\",
+	}
+}
+
+func uiBrowsers() []string {
+	switch runtime.GOOS {
+	case \"windows\":
+		return []string{
+			\"chrome\", \"msedge\", \"chromium\",
+			\"C:\\\\Program Files\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe\",
+			\"C:\\\\Program Files (x86)\\\\Microsoft\\\\Edge\\\\Application\\\\msedge.exe\",
+		}
+	case \"darwin\":
+		return []string{\"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\"}
+	default:
+		return []string{
+			\"google-chrome\", \"google-chrome-stable\", \"chromium\", \"chromium-browser\",
+			\"microsoft-edge\", \"brave-browser\", \"vivaldi\",
+		}
+	}
+}
 "
 }

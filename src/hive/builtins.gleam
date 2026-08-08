@@ -24,6 +24,7 @@
 
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/string
 import hive/ast
 
 /// Every builtin reachable by a bare name, in the order the documentation lists
@@ -42,6 +43,45 @@ pub fn globals() -> List(String) {
 /// Whether `name` is one of the builtins reachable by a bare name.
 pub fn is_global(name: String) -> Bool {
   list.contains(globals(), name)
+}
+
+/// Every standard library module a program can name, which is also every module
+/// an `import hive.<name>` may alias.
+///
+/// This is the *user-facing* list rather than `hive/runtime`'s: that one also
+/// carries the pieces a module is split into for the build (the two halves of
+/// turning terminal echo off, syslink's wire), which no program ever writes
+/// down. A name here is one that appears in a program as `hive.<name>.<thing>`.
+pub fn stdlib_modules() -> List(String) {
+  [
+    "net", "file", "json", "crypto", "sql", "conv", "env", "term", "task",
+    "syslink", "time", "ui",
+  ]
+}
+
+/// The standard library module an `import` path names, if it names one.
+///
+/// `hive.ui` is the whole of the spelling: a stdlib import is a module, never a
+/// path into one, so `hive.ui.View` is not something to import — it is reached
+/// through whatever the module was aliased as.
+pub fn stdlib_import(path: String) -> Option(String) {
+  case string.split(path, ".") {
+    ["hive", name] ->
+      case list.contains(stdlib_modules(), name) {
+        True -> Some(name)
+        False -> None
+      }
+    _ -> None
+  }
+}
+
+/// Whether an import path is aimed at the standard library at all — `hive`
+/// alone, or any `hive.` spelling, real module or not.
+///
+/// A path that starts this way is never looked for on disk, so a misspelt module
+/// is reported as a misspelt module rather than as a missing file.
+pub fn names_stdlib(path: String) -> Bool {
+  path == "hive" || string.starts_with(path, "hive.")
 }
 
 /// The spelling that always reaches the builtin: `hive.<name>`.

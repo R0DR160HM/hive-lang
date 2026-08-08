@@ -1275,6 +1275,19 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
       use _ <- result.try(check_sql_driver(variant, args))
       check_args(ctx, args)
     }
+    // `hive.ui.Tone.Danger()`, `hive.ui.Icon.Star()` — the module's
+    // enumerations. Each is a closed set, so a variant that is not in it is a
+    // mistake worth reporting here rather than a class name nothing styles.
+    ast.ECall(
+      ast.EMember(
+        ast.EMember(ast.EMember(ast.EIdent("hive"), "ui"), enum_name),
+        variant,
+      ),
+      args,
+    ) -> {
+      use _ <- result.try(check_ui_enum(enum_name, variant, args))
+      check_args(ctx, args)
+    }
     ast.ECall(ast.EMember(ast.EMember(ast.EIdent("hive"), ns), fname), args) ->
       case codegen.builtin_fields(fname) {
         // A builtin type constructor: `hive.net.HttpRequest(...)` etc.
@@ -1333,12 +1346,16 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
               use _ <- result.try(check_time_call(fname, args))
               check_args(ctx, args)
             }
+            "ui" -> {
+              use _ <- result.try(check_ui_call(ctx, fname, args))
+              check_args(ctx, args)
+            }
             _ ->
               Error(
                 "unknown builtin namespace `hive."
                 <> ns
                 <> "` (available: net, file, json, crypto, sql, conv, env, "
-                <> "term, task, syslink, time)",
+                <> "term, task, syslink, time, ui)",
               )
           }
       }
@@ -1892,6 +1909,148 @@ fn check_task_call(fname: String, args: List(ast.Arg)) -> Result(Nil, String) {
       Error(
         "unknown builtin `hive.task." <> fname <> "` (available: sleep)",
       )
+  }
+}
+
+// `hive.ui`. Every widget and attribute has a fixed parameter list read from
+// the same table codegen emits from, so there is no shape a call can pass this
+// check with and then fail to lower.
+fn check_ui_call(
+  ctx: Ctx,
+  fname: String,
+  args: List(ast.Arg),
+) -> Result(Nil, String) {
+  let target = "`hive.ui." <> fname <> "`"
+  case fname {
+    "window" -> {
+      use _ <- result.try(check_arity(
+        "`hive.ui.window`",
+        args,
+        ["title", "view", "update", "state"],
+      ))
+      case codegen.assign_args(args, ["title", "view", "update", "state"]) {
+        #([_, #(_, view), #(_, update), _], []) -> {
+          // The fold is a service handler and is held to exactly that shape —
+          // a window *is* a service, so there is one rule rather than two.
+          use _ <- result.try(check_service_handler(ctx, update))
+          check_ui_view_fn(ctx, view)
+        }
+        _ -> Ok(Nil)
+      }
+    }
+    "html" -> check_arity(target, args, ["view"])
+    "page" -> check_arity(target, args, ["title", "view"])
+    _ ->
+      case codegen.ui_widget_params(fname) {
+        Some(names) -> check_arity(target, args, names)
+        None ->
+          case list.contains(codegen.ui_attr_names(), fname) {
+            True -> check_arity(target, args, [fname])
+            False ->
+              Error(
+                "unknown builtin `hive.ui."
+                <> fname
+                <> "`.\n\nThe widgets are: "
+                <> string.join(ui_widget_list(), ", ")
+                <> ".\nThe attributes are: "
+                <> string.join(codegen.ui_attr_names(), ", ")
+                <> ".\nAnd `window`, `html` and `page` show a view or turn one "
+                <> "into text.",
+              )
+          }
+      }
+  }
+}
+
+fn ui_widget_list() -> List(String) {
+  [
+    "row", "column", "spacer", "overlay", "text", "image", "icon", "link",
+    "button", "input", "textarea", "checkbox", "select", "table", "spinner",
+    "none",
+  ]
+}
+
+// One of `hive.ui`'s enumerations, named through the module: the variant has to
+// be one it really has, and it takes whatever that variant carries — nothing,
+// for all but the two tones that hold a colour.
+//
+// An enumeration this doesn't know is left alone rather than rejected: the same
+// spelling reaches `hive.ui.View` and `hive.ui.Attr`, which are types rather
+// than closed sets and have no variants to check against.
+fn check_ui_enum(
+  enum_name: String,
+  variant: String,
+  args: List(ast.Arg),
+) -> Result(Nil, String) {
+  case codegen.builtin_variants(enum_name) {
+    None -> Ok(Nil)
+    Some(variants) ->
+      case list.contains(variants, variant) {
+        False ->
+          Error(
+            "`hive.ui."
+            <> enum_name
+            <> "` has no variant `"
+            <> variant
+            <> "` (available: "
+            <> string.join(variants, ", ")
+            <> ")",
+          )
+        True ->
+          check_arity(
+            "`hive.ui." <> enum_name <> "." <> variant <> "`",
+            args,
+            codegen.ui_enum_params(enum_name, variant),
+          )
+      }
+  }
+}
+
+// The view a window is given: one parameter — the state — and nothing else.
+// It has to be a `func`, which the purity rules already enforce wherever the
+// name is declared; what is checked here is that the window can actually call
+// it with the one thing it has.
+fn check_ui_view_fn(ctx: Ctx, view: ast.Expr) -> Result(Nil, String) {
+  let shape =
+    "a view for `hive.ui.window` takes the state and returns the tree to "
+    <> "draw: `func(State): hive.ui.View`"
+  case view {
+    // A partial application fixes whatever else the view needs (`view(_, theme)`)
+    // and leaves the state as its one hole. Go's typed signature settles the
+    // rest, exactly as it does for a `hive.net` server's handler.
+    ast.ECall(..) -> Ok(Nil)
+    ast.EIdent(name) ->
+      case dict.get(ctx.fn_params, name) {
+        Ok([_]) ->
+          case dict.has_key(ctx.procs, name) {
+            // A view may not be a proc. Drawing is a function of the state and
+            // nothing else — a view that could act would be one whose effects
+            // fire again on every repaint.
+            True ->
+              Error(
+                "proc `"
+                <> name
+                <> "` cannot be a view: "
+                <> shape
+                <> ", and a proc may act. A repaint happens whenever the state "
+                <> "changes, so anything a view did would happen again with it.",
+              )
+            False -> Ok(Nil)
+          }
+        Ok(_) ->
+          Error(
+            "`"
+            <> name
+            <> "` cannot be a view: it takes the wrong number of parameters — "
+            <> shape
+            <> ". Anything else it needs is fixed at the call with a partial "
+            <> "application, as in `"
+            <> name
+            <> "(_, theme)`.",
+          )
+        Error(_) -> Ok(Nil)
+      }
+    _ -> Ok(Nil)
   }
 }
 

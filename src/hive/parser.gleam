@@ -8,6 +8,7 @@
 //// a type in one position and a field in the next — and the last one holding
 //// the line to report it against.
 
+import gleam/bool
 import gleam/dict
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -288,9 +289,19 @@ fn parse_import(tokens: Toks) -> Result(#(ast.Import, Toks), String) {
 
 // Without `as`, a module is named after its file: `../lib/strings` -> `strings`.
 // A file name Hive source could not spell as a name needs the explicit form.
+//
+// A standard library module is named after its own last segment instead
+// (`import hive.ui` -> `ui`), since it has no file to be named after and that
+// segment is already the name every unaliased mention of it uses.
 fn default_alias(path: String, at_line: Int) -> Result(String, String) {
-  let base =
-    string.split(path, "/") |> list.last |> result.unwrap("")
+  use <- bool.guard(
+    builtins.names_stdlib(path),
+    // Whether it names a real module is `hive/modules`' question rather than
+    // this one's, so even a misspelt one is named here and reported there —
+    // where the answer can list the modules that do exist.
+    Ok(string.split(path, ".") |> list.last |> result.unwrap(path)),
+  )
+  let base = string.split(path, "/") |> list.last |> result.unwrap("")
   case is_usable_name(base) {
     True -> {
       // A file whose name is not a name — `String_Utils.hive` — needs the

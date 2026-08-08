@@ -17,6 +17,7 @@
 //// `hive.Concat`, atoms coerce to their decimal Str form next to strings,
 //// division becomes zero-safe, and vector literals get their Go element type.
 
+import gleam/bool
 import gleam/dict.{type Dict}
 import gleam/float
 import gleam/int
@@ -118,7 +119,64 @@ pub fn builtin_fields(name: String) -> Option(List(#(String, Ty))) {
     "SyslinkError" -> Some([#("reason", TyStr), #("message", TyStr)])
     // What `await ... with timeout <ms>` yields when the wait runs out.
     "TimeoutError" -> Some([#("waited", TyInt), #("message", TyStr)])
+    // A view and one of its attributes. Both are opaque — a view is built by
+    // the widget calls and an attribute by the attribute calls, and neither is
+    // taken apart again — but registering them is what lets a `func` returning
+    // `hive.ui.View` be written down, which is how a view is composed at all.
+    "View" | "Attr" -> Some([])
+    // The enumerations `hive.ui` owns. Each is a closed set, so a renderer can
+    // answer for every one of them — which an atom, belonging to the program
+    // rather than to the library, could never promise.
+    "Align"
+    | "Justify"
+    | "TextSize"
+    | "Tone"
+    | "Axis"
+    | "InputKind"
+    | "Icon" -> Some([])
     _ -> None
+  }
+}
+
+/// The variants of a builtin enumeration, in declaration order — which is also
+/// the order `sort` puts them in.
+///
+/// A builtin type with variants is reached the way the language's own are
+/// (`hive.ui.Tone.Danger()`), and this is the table that says which spellings
+/// exist. Naming a variant that isn't here is a compile error rather than a Go
+/// one, so the mistake is reported where it was made.
+pub fn builtin_variants(name: String) -> Option(List(String)) {
+  case name {
+    "Align" -> Some(["Start", "Center", "End", "Stretch"])
+    "Justify" -> Some(["Start", "Center", "End", "Between"])
+    "TextSize" -> Some(["Title", "Subtitle", "Body", "Caption"])
+    // The five roles a stylesheet answers for, then the two that carry a colour
+    // themselves. A payload variant sorts after every plain one, which is what
+    // putting them last says.
+    "Tone" -> Some(["Normal", "Muted", "Good", "Warn", "Danger", "HEX", "RGBA"])
+    "Axis" -> Some(["Horizontal", "Vertical", "Both"])
+    "InputKind" -> Some(["Text", "Number", "Date", "Password", "Search"])
+    "Icon" ->
+      Some([
+        "Search", "Close", "Check", "Plus", "Minus", "Up", "Down", "Left",
+        "Right", "Warning", "Info", "Star", "Heart", "Reply", "Repeat", "Trash",
+        "User", "Menu",
+      ])
+    _ -> None
+  }
+}
+
+/// The parameters a `hive.ui` enumeration variant takes.
+///
+/// Almost every variant is a bare name and takes nothing — `Tone.Danger()`,
+/// `Icon.Star()`. The two exceptions carry a colour, and this is the table that
+/// says what each wants, so validation and lowering read the same thing and a
+/// call cannot pass one and fail the other.
+pub fn ui_enum_params(enum_name: String, variant: String) -> List(String) {
+  case enum_name, variant {
+    "Tone", "HEX" -> ["hex"]
+    "Tone", "RGBA" -> ["red", "green", "blue", "alpha"]
+    _, _ -> []
   }
 }
 
@@ -139,6 +197,9 @@ pub fn builtin_qualifier(name: String) -> String {
     "SqlError" | "SqlConnection" | "DatabaseDriver" -> "hive.sql"
     "Address" | "Envelope" | "SyslinkError" -> "hive.syslink"
     "TimeoutError" -> "hive.task"
+    "View" | "Attr" -> "hive.ui"
+    "Align" | "Justify" | "TextSize" | "Tone" | "Axis" | "InputKind" | "Icon" ->
+      "hive.ui"
     _ -> "hive"
   }
 }
@@ -4353,6 +4414,15 @@ fn infer_other_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> Ty {
       ),
       _,
     ) -> TyBuiltin("DatabaseDriver")
+    // `hive.ui.Tone.Danger()` and the rest of the module's enumerations.
+    ast.EMember(
+      ast.EMember(ast.EMember(ast.EIdent("hive"), "ui"), enum_name),
+      _,
+    ) ->
+      case builtin_variants(enum_name) {
+        Some(_) -> TyBuiltin(enum_name)
+        None -> TyUnknown
+      }
     // A `hive.<ns>.<member>` call: a builtin type constructor if the
     // member names a builtin type, else a stdlib function's result type.
     ast.EMember(ast.EMember(ast.EIdent("hive"), ns), fname) ->
@@ -4451,6 +4521,7 @@ fn infer_other_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> Ty {
                 // `sleep` is a void statement.
                 _ -> TyVoid
               }
+            "ui" -> ui_call_type(fname)
             "syslink" ->
               case fname {
                 // A spawned service's address carries the type of the
@@ -5945,6 +6016,27 @@ fn gen_other_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
       ast.EMember(ast.EMember(ast.EIdent("hive"), "sql"), "DatabaseDriver"),
       variant,
     ) -> gen_sql_driver(env, variant, args)
+    // `hive.ui.Tone.HEX("#1d9bf0")` and `hive.ui.Tone.RGBA(29, 155, 240, 255)`
+    // carry a colour rather than naming a role, so each lowers to a call that
+    // checks its payload instead of to a bare string. That check is the runtime's
+    // rather than the compiler's because a colour is as often computed as it is
+    // written down, and only one of those can be read off the source.
+    ast.EMember(
+      ast.EMember(ast.EMember(ast.EIdent("hive"), "ui"), "Tone"),
+      "HEX",
+    ) -> "hive.UiToneHex(" <> gen_one_coerced(env, args, "hex", TyStr) <> ")"
+    ast.EMember(
+      ast.EMember(ast.EMember(ast.EIdent("hive"), "ui"), "Tone"),
+      "RGBA",
+    ) -> gen_ui_tone_rgba(env, args)
+    // `hive.ui.Tone.Danger()` etc. Each enumeration is a named Go string type
+    // and each variant its own name, so the value carries what it is called
+    // rather than a number whose meaning depends on the declaration order.
+    ast.EMember(
+      ast.EMember(ast.EMember(ast.EIdent("hive"), "ui"), enum_name),
+      variant,
+    ) if enum_name != "View" && enum_name != "Attr" ->
+      "hive." <> enum_name <> "(\"" <> variant <> "\")"
     // A `hive.<ns>.<member>` call: a builtin type constructor
     // (`hive.net.HttpRequest(...)`) if the member names a builtin type,
     // otherwise a stdlib function in that namespace.
@@ -5964,6 +6056,7 @@ fn gen_other_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
             "task" -> gen_task_call(env, fname, args)
             "syslink" -> gen_syslink_call(env, fname, args)
             "time" -> gen_time_call(env, fname, args)
+            "ui" -> gen_ui_call(env, fname, args)
             _ -> gen_plain_call(env, callee, args)
           }
       }
@@ -6726,6 +6819,279 @@ fn gen_one_raw(env: Env, args: List(ast.Arg), name: String) -> String {
   }
 }
 
+// ---------------------------------------------------------------------------
+// hive.ui
+// ---------------------------------------------------------------------------
+
+/// Every widget, with the payload it takes after its attributes. A widget's
+/// arity never varies: there are no optional parameters in Hive, so what would
+/// be an optional argument elsewhere is an entry in the attribute vector, and an
+/// empty one is an ordinary value.
+fn ui_widgets() -> List(#(String, List(#(String, Ty)))) {
+  [
+    #("row", [#("children", TyVec(TyBuiltin("View")))]),
+    #("column", [#("children", TyVec(TyBuiltin("View")))]),
+    #("spacer", []),
+    #("overlay", [#("child", TyBuiltin("View"))]),
+    #("text", [#("content", TyStr)]),
+    // A description is a parameter rather than an attribute: an attribute is
+    // optional by construction, and an image without one is not a thing to make
+    // easy to write.
+    #("image", [#("src", TyStr), #("alt", TyStr)]),
+    #("icon", [#("name", TyBuiltin("Icon"))]),
+    // A destination is a parameter rather than an attribute for the same reason
+    // an image's description is: a link with nowhere to go is not a thing to
+    // make easy to write. It is also the one widget that needs no event to
+    // work, which is what lets a served page navigate at all.
+    #("link", [#("href", TyStr), #("label", TyStr)]),
+    #("button", [#("label", TyStr)]),
+    #("input", [#("value", TyStr)]),
+    #("textarea", [#("value", TyStr)]),
+    #("checkbox", [#("label", TyStr), #("checked", TyBool)]),
+    #("select", [#("options", TyVec(TyStr)), #("chosen", TyStr)]),
+    #("table", [#("rows", TyTable)]),
+    #("spinner", []),
+    #("none", []),
+  ]
+}
+
+/// Every attribute, and the single value it carries.
+///
+/// The event attributes take a message, or a function of what the user did to
+/// one; everything else is a number, a string, a flag or one of the module's
+/// enumerations.
+///
+/// `tone` and `background` are the two that can carry a colour outright, via
+/// `Tone.HEX` and `Tone.RGBA`. Everything else here is a token the renderer
+/// gives meaning to, and a view built only from tokens still draws on a target
+/// with no CSS at all — which is the property those two variants spend. A
+/// renderer that cannot paint a colour falls back to the tone's role, and
+/// `Normal` is what a colour it cannot use comes to.
+fn ui_attrs() -> List(#(String, Ty)) {
+  [
+    #("gap", TyInt),
+    #("pad", TyInt),
+    #("width", TyInt),
+    #("height", TyInt),
+    #("grow", TyInt),
+    #("heading", TyInt),
+    #("align", TyBuiltin("Align")),
+    #("justify", TyBuiltin("Justify")),
+    #("scroll", TyBuiltin("Axis")),
+    #("size", TyBuiltin("TextSize")),
+    #("tone", TyBuiltin("Tone")),
+    #("background", TyBuiltin("Tone")),
+    #("kind", TyBuiltin("InputKind")),
+    #("placeholder", TyStr),
+    #("hint", TyStr),
+    #("disabled", TyBool),
+    #("busy", TyBool),
+    #("on", TyUnknown),
+    #("onDismiss", TyUnknown),
+    #("onInput", TyUnknown),
+    #("onSubmit", TyUnknown),
+    #("onChoose", TyUnknown),
+    #("onToggle", TyUnknown),
+    #("onPick", TyUnknown),
+    #("onSort", TyUnknown),
+  ]
+}
+
+/// The full parameter list of a widget — its attributes, then whatever its kind
+/// takes. `None` when the name is not a widget.
+///
+/// The compiler's argument checking and codegen read the same table, so a
+/// widget cannot be accepted with one shape and emitted with another.
+pub fn ui_widget_params(name: String) -> Option(List(String)) {
+  case list.key_find(ui_widgets(), name) {
+    Ok([]) -> Some([])
+    Ok(payload) -> Some(["attrs", ..list.map(payload, fn(p) { p.0 })])
+    Error(_) -> None
+  }
+}
+
+/// Every attribute's name. Each takes exactly one argument, named after itself.
+pub fn ui_attr_names() -> List(String) {
+  list.map(ui_attrs(), fn(a) { a.0 })
+}
+
+/// The Go parameter an event attribute's function is handed, if it takes one.
+/// A plain `on` carries the message itself and has no argument to be a function
+/// of, so it is not in here.
+fn ui_event_arg(name: String) -> Option(String) {
+  case name {
+    "onInput" | "onSubmit" | "onChoose" -> Some("string")
+    "onToggle" -> Some("bool")
+    "onPick" | "onSort" -> Some("int")
+    _ -> None
+  }
+}
+
+fn ui_call_type(fname: String) -> Ty {
+  case list.key_find(ui_widgets(), fname) {
+    Ok(_) -> TyBuiltin("View")
+    Error(_) ->
+      case list.key_find(ui_attrs(), fname) {
+        Ok(_) -> TyBuiltin("Attr")
+        Error(_) ->
+          case fname {
+            "html" | "page" -> TyStr
+            // `window` does not return: it shows the view and folds events
+            // until the program ends.
+            _ -> TyVoid
+          }
+      }
+  }
+}
+
+fn gen_ui_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
+  case fname {
+    "window" -> gen_ui_window(env, args)
+    "html" ->
+      "hive.UiHTML("
+      <> gen_one_coerced(env, args, "view", TyBuiltin("View"))
+      <> ")"
+    "page" ->
+      case assign_args(args, ["title", "view"]) {
+        #([#(_, title), #(_, view)], []) ->
+          "hive.UiPage("
+          <> coerce(env, title, TyStr)
+          <> ", "
+          <> coerce(env, view, TyBuiltin("View"))
+          <> ")"
+        _ -> "hive.UiPage(" <> gen_args(env, args) <> ")"
+      }
+    _ ->
+      case list.key_find(ui_widgets(), fname) {
+        Ok(payload) -> gen_ui_widget(env, fname, payload, args)
+        Error(_) ->
+          case list.key_find(ui_attrs(), fname) {
+            Ok(carries) -> gen_ui_attr(env, fname, carries, args)
+            Error(_) ->
+              "hive.Ui" <> exported(fname) <> "(" <> gen_args(env, args) <> ")"
+          }
+      }
+  }
+}
+
+// The four channels of an `RGBA` tone, each an `Int`. Validation has already
+// held the call to four arguments, so a shape that does not fit is lowered
+// verbatim and left to say so.
+fn gen_ui_tone_rgba(env: Env, args: List(ast.Arg)) -> String {
+  let names = ui_enum_params("Tone", "RGBA")
+  case assign_args(args, names) {
+    #(given, []) if given != [] ->
+      case list.length(given) == list.length(names) {
+        True ->
+          "hive.UiToneRGBA("
+          <> {
+            given
+            |> list.map(fn(pair) { coerce(env, pair.1, TyInt) })
+            |> string.join(", ")
+          }
+          <> ")"
+        False -> "hive.UiToneRGBA(" <> gen_args(env, args) <> ")"
+      }
+    _ -> "hive.UiToneRGBA(" <> gen_args(env, args) <> ")"
+  }
+}
+
+// A widget: its attributes, then whatever its kind takes. `spacer` and `none`
+// carry neither, and are the only calls in the module that take nothing at all —
+// there is nothing to configure about a gap or about nothing.
+fn gen_ui_widget(
+  env: Env,
+  fname: String,
+  payload: List(#(String, Ty)),
+  args: List(ast.Arg),
+) -> String {
+  let go = "hive.Ui" <> exported(fname)
+  case payload {
+    [] -> go <> "()"
+    _ -> {
+      let names = ["attrs", ..list.map(payload, fn(p) { p.0 })]
+      let types = [TyVec(TyBuiltin("Attr")), ..list.map(payload, fn(p) { p.1 })]
+      let #(given, extra) = assign_args(args, names)
+      case extra == [] && list.length(given) == list.length(names) {
+        True ->
+          go
+          <> "("
+          <> {
+            list.zip(given, types)
+            |> list.map(fn(pair) {
+              let #(#(_, value), want) = pair
+              coerce(env, value, want)
+            })
+            |> string.join(", ")
+          }
+          <> ")"
+        False -> go <> "(" <> gen_args(env, args) <> ")"
+      }
+    }
+  }
+}
+
+// An attribute. The event ones are the only interesting case: the runtime holds
+// a message as an `any`, because it never looks inside one — it hands it back to
+// the fold, which is the only thing that knows what it is. A handler that takes
+// what the user did is wrapped so its own return type survives that.
+fn gen_ui_attr(
+  env: Env,
+  fname: String,
+  carries: Ty,
+  args: List(ast.Arg),
+) -> String {
+  let go = "hive.UiAttr" <> exported(fname)
+  let value = case assign_args(args, [fname]) {
+    #([#(_, v)], []) -> Some(v)
+    _ -> None
+  }
+  case value {
+    None -> go <> "(" <> gen_args(env, args) <> ")"
+    Some(v) ->
+      case ui_event_arg(fname) {
+        Some(arg_go) ->
+          go
+          <> "(func(_ev "
+          <> arg_go
+          <> ") any { return ("
+          <> gen_expr(env, v)
+          <> ")(_ev) })"
+        None -> go <> "(" <> coerce(env, v, carries) <> ")"
+      }
+  }
+}
+
+// A window is a syslink service with a page in front of it, so it is spawned
+// exactly as `hive.syslink.spawn` spawns one — same handler shape, same derived
+// decoder, same digest. What the module adds is the render after each turn and
+// the socket that carries it.
+fn gen_ui_window(env: Env, args: List(ast.Arg)) -> String {
+  case assign_args(args, ["title", "view", "update", "state"]) {
+    #([#(_, title), #(_, view), #(_, update), #(_, state)], []) -> {
+      let msg = handler_msg_type(update, env.fns)
+      "hive.UiWindow("
+      <> coerce(env, title, TyStr)
+      <> ", "
+      <> gen_expr(env, view)
+      <> ", "
+      <> gen_expr(env, update)
+      <> ", "
+      // The initial state crosses into the service's own thread, so it is
+      // copied on the way in for the same reason `spawn`'s is.
+      <> gen_copied(env, state)
+      <> ", "
+      <> syslink_decoder(env, msg)
+      <> ", "
+      <> syslink_digest(env, msg)
+      <> ", "
+      <> bool_lit(replies_in_turn(env, update))
+      <> ")"
+    }
+    _ -> "hive.UiWindow(" <> gen_args(env, args) <> ")"
+  }
+}
+
 // The `hive.sql.DatabaseDriver` variant constructors. Each yields a
 // `hive.DatabaseDriver` carrying the registered database/sql driver name.
 fn gen_sql_driver(env: Env, variant: String, args: List(ast.Arg)) -> String {
@@ -7464,6 +7830,9 @@ fn gen_constructor(
   variant_name: String,
   args: List(ast.Arg),
 ) -> String {
+  use <- bool.lazy_guard(has_hole(args), fn() {
+    gen_constructor_partial(env, type_name, variant_name, args)
+  })
   let struct_name = type_name <> variant_name
   let fields =
     variant_fields(env, type_name, variant_name)
@@ -7474,6 +7843,59 @@ fn gen_constructor(
   <> "{"
   <> gen_field_args(env, args, fields)
   <> "})"
+}
+
+// `Msg.Changed(_)` — a constructor with holes, which is a function value that
+// builds the variant rather than a variant.
+//
+// A constructor is not a callable, so this is not `gen_partial`: there is no
+// body to call and no return type to read off a declaration. What it shares is
+// the rule — each `_` becomes a parameter, in the order the holes appear, and
+// everything supplied is captured where it was written. The result is typed as
+// the union itself, since that is what a variant is once built, and it is what
+// makes `Msg.Changed(_)` fill a `func(Str): Msg` slot.
+fn gen_constructor_partial(
+  env: Env,
+  type_name: String,
+  variant_name: String,
+  args: List(ast.Arg),
+) -> String {
+  let fields = variant_fields(env, type_name, variant_name)
+  let #(assigned, _) = assign_args(args, list.map(fields, fn(f) { f.name }))
+  let paired = list.zip(assigned, fields) |> list.index_map(fn(p, i) { #(p, i) })
+  let hole_params =
+    paired
+    |> list.filter_map(fn(entry) {
+      let #(#(#(_, expr), field), i) = entry
+      case is_hole_expr(expr) {
+        True -> Ok("_h" <> int.to_string(i) <> " " <> gen_type(field.typ))
+        False -> Error(Nil)
+      }
+    })
+    |> string.join(", ")
+  let struct_fields =
+    paired
+    |> list.map(fn(entry) {
+      let #(#(#(fname, expr), field), i) = entry
+      let value = case is_hole_expr(expr) {
+        True -> "_h" <> int.to_string(i)
+        False -> gen_arg(env, expr, ty_of_type_expr(env.types, field.typ))
+      }
+      exported(fname) <> ": " <> value
+    })
+    |> string.join(", ")
+  "func("
+  <> hole_params
+  <> ") "
+  <> type_name
+  <> " { return "
+  <> type_name
+  <> "("
+  <> type_name
+  <> variant_name
+  <> "{"
+  <> struct_fields
+  <> "}) }"
 }
 
 fn gen_struct_construct(
