@@ -717,12 +717,12 @@ fn walk_stmt(
   s: ast.Stmt,
 ) -> Result(#(ast.Stmt, codegen.Env, State), String) {
   case s {
-    ast.SVarDecl(name, value, mutable) -> {
+    ast.SVarDecl(name, value, mutable, deferred) -> {
       use #(v2, st2) <- result.try(walk_expr(st, env, value))
       let env2 = codegen.with_local(env, name, codegen.infer(env, v2))
-      Ok(#(ast.SVarDecl(name, v2, mutable), env2, st2))
+      Ok(#(ast.SVarDecl(name, v2, mutable, deferred), env2, st2))
     }
-    ast.STypedDecl(typ, name, value, mutable) -> {
+    ast.STypedDecl(typ, name, value, mutable, deferred) -> {
       let #(typ, st) = rewrite_type(st, typ)
       let value = retarget(st, typ, value)
       use #(v2, st2) <- result.try(walk_expr(st, env, value))
@@ -732,7 +732,7 @@ fn walk_stmt(
           name,
           codegen.ty_of_type_expr(codegen.env_types(env), typ),
         )
-      Ok(#(ast.STypedDecl(typ, name, v2, mutable), env2, st2))
+      Ok(#(ast.STypedDecl(typ, name, v2, mutable, deferred), env2, st2))
     }
     ast.SAssign(target, value) -> {
       use #(t2, st2) <- result.try(walk_expr(st, env, target))
@@ -1401,14 +1401,15 @@ fn substitute_stmt(
   s: ast.Stmt,
 ) -> ast.Stmt {
   case s {
-    ast.SVarDecl(name, value, mutable) ->
-      ast.SVarDecl(name, substitute_expr(subst, value), mutable)
-    ast.STypedDecl(typ, name, value, mutable) ->
+    ast.SVarDecl(name, value, mutable, deferred) ->
+      ast.SVarDecl(name, substitute_expr(subst, value), mutable, deferred)
+    ast.STypedDecl(typ, name, value, mutable, deferred) ->
       ast.STypedDecl(
         substitute(subst, typ),
         name,
         substitute_expr(subst, value),
         mutable,
+        deferred,
       )
     ast.SAssign(target, value) ->
       ast.SAssign(

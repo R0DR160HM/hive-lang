@@ -36,7 +36,7 @@ import hive/ast
 pub fn globals() -> List(String) {
   [
     "len", "bytes", "print", "println", "join", "split", "indexOf", "row",
-    "column", "append", "map", "filter", "filterMap", "sort",
+    "column", "append", "prepend", "drop", "map", "filter", "filterMap", "sort",
   ]
 }
 

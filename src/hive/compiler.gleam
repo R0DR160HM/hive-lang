@@ -20,6 +20,7 @@
 ////     the full parameter list.
 
 import gleam/dict.{type Dict}
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -257,6 +258,11 @@ fn check(module: ast.Module, needs_main: Bool) -> Result(Nil, String) {
       }
       ast.QueryDecl(name, params, _, sql) -> {
         use _ <- result.try(check_pure_params("query", name, params))
+        // A query body holds no statements, so the vector writers are held to
+        // their rule here rather than in `check_stmt`. A query has only
+        // parameters, and a parameter is never mutable, so any of them in there is
+        // refused — with the same message it gets anywhere else.
+        use _ <- result.try(check_writes_in(ast.sql_exprs(sql), dict.new()))
         // A query is a func whose body is inline SQL; every expression in it —
         // an interpolated value or a `where` predicate's condition — is walked
         // with the same func restrictions.
@@ -856,16 +862,17 @@ fn check_stmt(
   s: ast.Stmt,
   muts: Dict(String, Binding),
 ) -> Result(Dict(String, Binding), String) {
+  use _ <- result.try(check_vector_writes(s, muts))
   case s {
     ast.SEcho(e) -> {
       use _ <- result.try(check_expr(ctx, e))
       Ok(muts)
     }
-    ast.SVarDecl(name, value, mutable) -> {
+    ast.SVarDecl(name, value, mutable, _) -> {
       use _ <- result.try(check_expr(ctx, value))
       Ok(dict.insert(muts, name, Binding(mutable, Inferred)))
     }
-    ast.STypedDecl(typ, name, value, mutable) -> {
+    ast.STypedDecl(typ, name, value, mutable, _) -> {
       use _ <- result.try(check_sized(typ, "`" <> name <> "`"))
       use _ <- result.try(check_expr(ctx, value))
       Ok(dict.insert(muts, name, Binding(mutable, declared_grow(typ))))
@@ -1135,48 +1142,60 @@ fn check_append(e: ast.Expr, muts: Dict(String, Binding)) -> Result(Nil, String)
   case e {
     ast.ECall(ast.EMember(ast.EIdent("hive"), "append"), args) ->
       case args {
-        [ast.Arg(_, target), ..] -> {
-          use root <- result.try(
-            assign_root(target)
-            |> result.replace_error(
-              "`append`'s first argument must be a mutable vector variable",
-            ),
-          )
-          case dict.get(muts, root) {
-            Ok(Binding(True, Growable)) -> Ok(Nil)
-            // A member or index path (`append(box.items, x)`) is rooted at a
-            // variable whose own type says nothing about the field being grown,
-            // so there is nothing to check beyond its mutability.
-            Ok(Binding(True, _)) ->
-              case target {
-                ast.EIdent(_) -> Error(not_growable(root, muts))
-                _ -> Ok(Nil)
-              }
-            Ok(Binding(False, _)) ->
-              Error(
-                "`append` requires a mutable vector: `"
-                <> root
-                <> "` is immutable — declare it with `mut`",
-              )
-            // Not a local at all: a parameter, which is never mutable.
-            Error(_) ->
-              Error(
-                "`append` requires a mutable vector: `"
-                <> root
-                <> "` is immutable — declare it with `mut`",
-              )
-          }
-        }
+        [ast.Arg(_, target), ..] -> check_writable("append", target, muts)
         [] -> Error("`append` takes a mutable vector and at least one value")
       }
     _ -> Ok(Nil)
   }
 }
 
-fn not_growable(root: String, muts: Dict(String, Binding)) -> String {
+// The first argument of `append`, `prepend` and `drop`: the vector each writes
+// through, which has to be a **mutable dynamic** one.
+fn check_writable(
+  what: String,
+  target: ast.Expr,
+  muts: Dict(String, Binding),
+) -> Result(Nil, String) {
+  use root <- result.try(
+    assign_root(target)
+    |> result.replace_error(
+      "`" <> what <> "`'s first argument must be a mutable vector variable",
+    ),
+  )
+  case dict.get(muts, root) {
+    Ok(Binding(True, Growable)) -> Ok(Nil)
+    // A member or index path (`append(box.items, x)`) is rooted at a variable
+    // whose own type says nothing about the field being written, so there is
+    // nothing to check beyond its mutability.
+    Ok(Binding(True, _)) ->
+      case target {
+        ast.EIdent(_) -> Error(not_growable(what, root, muts))
+        _ -> Ok(Nil)
+      }
+    Ok(Binding(False, _)) -> Error(not_mutable(what, root))
+    // Not a local at all: a parameter, which is never mutable.
+    Error(_) -> Error(not_mutable(what, root))
+  }
+}
+
+fn not_mutable(what: String, root: String) -> String {
+  "`"
+  <> what
+  <> "` requires a mutable vector: `"
+  <> root
+  <> "` is immutable — declare it with `mut`"
+}
+
+fn not_growable(
+  what: String,
+  root: String,
+  muts: Dict(String, Binding),
+) -> String {
   case dict.get(muts, root) {
     Ok(Binding(_, Inferred)) ->
-      "`append` requires a dynamic vector, and `"
+      "`"
+      <> what
+      <> "` requires a dynamic vector, and `"
       <> root
       <> "` is not one: it was bound with `:=`, which reads the length off the "
       <> "value — an inferred length is a static one. Declare it explicitly to "
@@ -1186,10 +1205,124 @@ fn not_growable(root: String, muts: Dict(String, Binding)) -> String {
       <> root
       <> " = ...`."
     _ ->
-      "`append` requires a dynamic vector: `"
+      "`"
+      <> what
+      <> "` requires a dynamic vector: `"
       <> root
       <> "` is declared with a static length, which is a promise it cannot grow "
-      <> "out of. Declare it `[dyn]` to allow appending."
+      <> "out of. Declare it `[dyn]` to allow "
+      <> case what {
+        "drop" -> "removing from it."
+        "prepend" -> "prepending."
+        _ -> "appending."
+      }
+  }
+}
+
+// `prepend(v, x)` and `drop(v, low, high)` write *through* their first argument
+// rather than handing back a new vector, so unlike `append` — whose expression
+// form is an ordinary value that copies — every place either of them is written
+// is a write, and the same "mutable dynamic vector" rule applies to all of them.
+//
+// Only the statement's own expressions are looked at, not those in a nested
+// block: each of those statements is checked in its own turn, where the scope is
+// the one it really has.
+fn check_vector_writes(
+  s: ast.Stmt,
+  muts: Dict(String, Binding),
+) -> Result(Nil, String) {
+  let exprs = own_exprs(s)
+  use _ <- result.try(check_writes_in(exprs, muts))
+  // `prepend` hands nothing back, so a statement of its own is the only place it
+  // can stand. `drop` may stand anywhere: it answers with what it removed.
+  case s, list.any(list.flat_map(exprs, writer_calls), fn(c) { c.0 == "prepend" })
+  {
+    _, False -> Ok(Nil)
+    ast.SExpr(ast.ECall(ast.EMember(ast.EIdent("hive"), "prepend"), _)), _ ->
+      Ok(Nil)
+    _, _ ->
+      Error(
+        "`prepend` answers with nothing — it puts the value at the front of the "
+        <> "vector you gave it — so it cannot be used where a value is wanted. "
+        <> "Write it as a statement of its own; the vector it changed is the "
+        <> "result. (`drop` is the one that hands something back: the elements "
+        <> "it removed.)",
+      )
+  }
+}
+
+// Each writer call in these expressions, held to its arity and to the vector it
+// is allowed to write through. `muts` is the bindings in scope; a name absent
+// from it is immutable, which is what a parameter always is.
+fn check_writes_in(
+  exprs: List(ast.Expr),
+  muts: Dict(String, Binding),
+) -> Result(Nil, String) {
+  list.try_fold(list.flat_map(exprs, writer_calls), Nil, fn(_, call) {
+    let #(what, args) = call
+    use _ <- result.try(check_writer_arity(what, args))
+    case args {
+      [ast.Arg(_, target), ..] -> check_writable(what, target, muts)
+      [] -> Ok(Nil)
+    }
+  })
+  |> result.map(fn(_) { Nil })
+}
+
+// Every `prepend`/`drop` call inside an expression, by name. Only the qualified
+// spelling counts: a bare one that reached the builtin was rewritten to it during
+// import flattening, and one still bare is the program's own declaration.
+fn writer_calls(e: ast.Expr) -> List(#(String, List(ast.Arg))) {
+  let here = case e {
+    ast.ECall(ast.EMember(ast.EIdent("hive"), name), args) ->
+      case name {
+        "prepend" | "drop" -> [#(name, args)]
+        _ -> []
+      }
+    _ -> []
+  }
+  list.append(here, list.flat_map(ast.sub_exprs(e), writer_calls))
+}
+
+// The expressions a statement evaluates *itself*, leaving out any nested block:
+// the statements in one are checked in their own turn, with the scope they have
+// there rather than this one's.
+fn own_exprs(s: ast.Stmt) -> List(ast.Expr) {
+  case s {
+    ast.SVarDecl(_, value, _, _) | ast.STypedDecl(_, _, value, _, _) -> [value]
+    ast.SAssign(target, value) -> [target, value]
+    ast.SReturn(value) -> option.values([value])
+    ast.SEcho(e) | ast.SAssert(e, _) | ast.SPanic(e) | ast.SExpr(e) | ast.SAsync(e) -> [
+      e,
+    ]
+    ast.SBreak | ast.SContinue -> []
+    ast.SIf(branches, _) -> list.map(branches, fn(b) { b.cond })
+    ast.SFor(_, cond, _, _) -> option.values([cond])
+    ast.SForEach(_, _, iterable, _) -> [iterable]
+  }
+}
+
+fn check_writer_arity(
+  what: String,
+  args: List(ast.Arg),
+) -> Result(Nil, String) {
+  case what, list.length(args) {
+    "prepend", 2 -> Ok(Nil)
+    "prepend", n ->
+      Error(
+        "`prepend` takes a mutable vector and one value to put at its front, so "
+        <> "two arguments — this call has "
+        <> int.to_string(n)
+        <> ". (`append` is the variadic one.)",
+      )
+    "drop", 3 -> Ok(Nil)
+    _, n ->
+      Error(
+        "`drop` takes a mutable vector and the two bounds of what to remove — "
+        <> "`drop(v, 1, 2)` — so three arguments, and this call has "
+        <> int.to_string(n)
+        <> ". Both bounds are inclusive, as they are in a slice.",
+      )
   }
 }
 

@@ -723,7 +723,8 @@ fn walk_stmts(env: Env, stmts: List(ast.Stmt)) -> Result(Env, String) {
 
 fn walk_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
   case s {
-    ast.SVarDecl(name, value, mutable) -> {
+    ast.SVarDecl(name, value, mutable, deferred) -> {
+      use _ <- result.try(check_deferred(env, name, value, deferred))
       use _ <- result.try(walk_expr(env, value))
       Ok(
         Env(
@@ -733,7 +734,8 @@ fn walk_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
         ),
       )
     }
-    ast.STypedDecl(typ, name, value, mutable) -> {
+    ast.STypedDecl(typ, name, value, mutable, deferred) -> {
+      use _ <- result.try(check_deferred(env, name, value, deferred))
       use _ <- result.try(walk_expr(env, value))
       Ok(
         Env(
@@ -1007,6 +1009,86 @@ fn check_fire_and_forget(env: Env, call: ast.Expr) -> Result(Nil, String) {
   }
 }
 
+// `x := async <call>` keeps the result, so the objection `check_fire_and_forget`
+// raises does not apply — but the other half of it does. What earns a thread of
+// its own is work that takes time, and a call that is finished the moment it is
+// written has nothing to wait for: the binding would cost a goroutine and a
+// channel to deliver a value the caller could have had for free.
+//
+// The `void` case is the one this form adds. There is nothing for the name to
+// hold, so the binding cannot mean anything at all — and the statement that says
+// "start this and do not wait" already exists.
+fn check_deferred(
+  env: Env,
+  name: String,
+  call: ast.Expr,
+  deferred: Bool,
+) -> Result(Nil, String) {
+  case deferred {
+    False -> Ok(Nil)
+    True ->
+      case call {
+        ast.ECall(callee, args) ->
+          case
+            builtins.called(callee),
+            has_hole(args),
+            constructs(env, callee),
+            call_ty(env, call)
+          {
+            Some(builtin), _, _, _ ->
+              Error(
+                "`"
+                <> builtin
+                <> "` answers immediately, so there is nothing for `"
+                <> name
+                <> "` to wait for — starting a thread to carry the value would "
+                <> "cost more than computing it. Bind it plainly: `"
+                <> name
+                <> " := "
+                <> builtin
+                <> "(...)`. `async` is for work that takes time.",
+              )
+            _, True, _, _ ->
+              Error(
+                "`async` needs a call, and a `_` makes this a partial application "
+                <> "— a function value waiting for the argument that fills the "
+                <> "hole. Nothing runs until something calls it, so there is "
+                <> "nothing for `"
+                <> name
+                <> "` to be waiting on. Pass the whole argument, or bind the "
+                <> "function value plainly and `async` a call through it.",
+              )
+            _, _, Some(what), _ ->
+              Error(
+                "`async` needs a call that does work, and `"
+                <> what
+                <> "` is a constructor: it builds a value out of its arguments and "
+                <> "runs no body. It is finished as soon as it is written, so "
+                <> "there is nothing for `"
+                <> name
+                <> "` to wait for.",
+              )
+            _, _, _, TyVoid ->
+              Error(
+                "`"
+                <> name
+                <> "` has nothing to hold: this call answers with `void`, and a "
+                <> "name whose value arrives later needs a value to arrive. Drop "
+                <> "the name — `async "
+                <> ast.show_expr(call)
+                <> "` starts the call and waits for nothing — or wait for it with "
+                <> "`await ["
+                <> ast.show_expr(call)
+                <> "]` if the point is knowing when it finished.",
+              )
+            None, False, None, _ -> Ok(Nil)
+          }
+        // Unreachable: the parser only sets `deferred` on a call.
+        _ -> Ok(Nil)
+      }
+  }
+}
+
 // The type a callee constructs, if constructing is all it does — a declared type
 // by its bare name, one of its variants, or a runtime struct like
 // `hive.net.HttpRequest`.
@@ -1017,6 +1099,9 @@ fn constructs(env: Env, callee: ast.Expr) -> Option(String) {
         True -> Some(name)
         False -> None
       }
+    // `Result` is built in rather than declared, so it is not in `types` and has
+    // to be named here — its two variants construct exactly like any other.
+    ast.EMember(ast.EIdent("Result"), variant) -> Some("Result." <> variant)
     ast.EMember(ast.EIdent(name), variant) ->
       case dict.has_key(env.types, name) {
         True -> Some(name <> "." <> variant)
@@ -1798,7 +1883,7 @@ fn escapes_in_stmts(name: String, stmts: List(ast.Stmt)) -> Bool {
 
 fn escapes_in_stmt(name: String, s: ast.Stmt) -> Bool {
   case s {
-    ast.SVarDecl(_, value, _) | ast.STypedDecl(_, _, value, _) ->
+    ast.SVarDecl(_, value, _, _) | ast.STypedDecl(_, _, value, _, _) ->
       escapes_in_expr(name, value)
     ast.SAssign(target, value) ->
       escapes_in_expr(name, target) || escapes_in_expr(name, value)
@@ -1937,7 +2022,7 @@ fn mailboxes_in_stmts(
   list.fold(stmts, #(spawned, found), fn(acc, s) {
     let #(sp, fd) = acc
     case s {
-      ast.SVarDecl(name, value, _) | ast.STypedDecl(_, name, value, _) ->
+      ast.SVarDecl(name, value, _, _) | ast.STypedDecl(_, name, value, _, _) ->
         case spawn_msg_type(value, fns) {
           Some(msg) -> #(dict.insert(sp, name, msg), fd)
           None -> #(sp, register_in_expr(value, fns, sp, fd))
@@ -2116,8 +2201,8 @@ fn uses_json_module(module: ast.Module) -> Bool {
 fn uses_json_stmts(stmts: List(ast.Stmt)) -> Bool {
   list.any(stmts, fn(s) {
     case s {
-      ast.SVarDecl(_, value, _) -> uses_json_expr(value)
-      ast.STypedDecl(_, _, value, _) -> uses_json_expr(value)
+      ast.SVarDecl(_, value, _, _) -> uses_json_expr(value)
+      ast.STypedDecl(_, _, value, _, _) -> uses_json_expr(value)
       ast.SAssign(target, value) ->
         uses_json_expr(target) || uses_json_expr(value)
       ast.SReturn(None) -> False
@@ -2289,8 +2374,8 @@ fn add_atom(acc: List(String), name: String) -> List(String) {
 fn atoms_in_stmts(stmts: List(ast.Stmt), acc: List(String)) -> List(String) {
   list.fold(stmts, acc, fn(acc, s) {
     case s {
-      ast.SVarDecl(_, value, _) -> atoms_in_expr(value, acc)
-      ast.STypedDecl(_, _, value, _) -> atoms_in_expr(value, acc)
+      ast.SVarDecl(_, value, _, _) -> atoms_in_expr(value, acc)
+      ast.STypedDecl(_, _, value, _, _) -> atoms_in_expr(value, acc)
       ast.SAssign(target, value) ->
         atoms_in_expr(value, atoms_in_expr(target, acc))
       ast.SReturn(None) -> acc
@@ -3337,7 +3422,22 @@ fn gen_stmt(
 ) -> #(String, Env) {
   let pad = tabs(indent)
   case stmt {
-    ast.SVarDecl(name, value, mutable) -> {
+    // `name := async <call>` / `T name = async <call>`: the call goes onto its own
+    // virtual thread here and the *name* is what waits for it, at every place it
+    // is read (see `gen_deferred`). Both forms lower the same way; only the type
+    // the name is known by differs, which is the annotation's whole job.
+    ast.SVarDecl(name, call, _, True) ->
+      gen_deferred(env, name, call, infer(env, call), following, pad)
+    ast.STypedDecl(typ, name, call, _, True) ->
+      gen_deferred(
+        env,
+        name,
+        call,
+        ty_of_type_expr(env.types, typ),
+        following,
+        pad,
+      )
+    ast.SVarDecl(name, value, mutable, _) -> {
       let ty = infer(env, value)
       case shares_storage(env, ty, mutable, value) {
         // Shared mutable state: the name *is* the source, so no variable of its
@@ -3367,7 +3467,7 @@ fn gen_stmt(
         }
       }
     }
-    ast.STypedDecl(typ, name, value, mutable) -> {
+    ast.STypedDecl(typ, name, value, mutable, _) -> {
       let ty = ty_of_type_expr(env.types, typ)
       case shares_storage(env, ty, mutable, value) {
         True -> #("", share_env(env, name, ty, mutable, value))
@@ -3524,8 +3624,8 @@ fn gen_stmt(
         None -> #("", loop_env)
       }
       let loop_var = case init {
-        Some(ast.SVarDecl(name, _, _)) | Some(ast.STypedDecl(_, name, _, _)) ->
-          Some(name)
+        Some(ast.SVarDecl(name, _, _, _))
+        | Some(ast.STypedDecl(_, name, _, _, _)) -> Some(name)
         _ -> None
       }
       // Go rejects a loop variable that is never read; guard the rare case
@@ -3588,10 +3688,61 @@ fn gen_stmt(
   }
 }
 
+// `name := async <call>` — the third thing a call site can say about waiting. The
+// call is started here, exactly as an await-all starts each of its own, and the
+// task is kept in a variable belonging to the generated code. The Hive name is
+// then not a variable at all but a *read through that task*: every place the
+// source mentions it waits for the value, and every place after the first gets it
+// for nothing, since `Await` blocks once and answers the same value ever after.
+//
+// So the binding's type is the call's return type with nothing wrapped around it.
+// There is no handle type in the language to be the type of, nothing to unwrap,
+// and no way to forget to. And two of these one after another are two threads
+// running at once whatever their types — the gap an await-all cannot close, since
+// one barrier resolves to one vector and a vector holds one type.
+//
+// A name nothing ever reads still ran: the thread was started, and the task is
+// discarded the way any unused binding is. A panic inside it goes with it, rather
+// than tearing the program down from a thread nobody was waiting on — which is
+// what `async <call>` on its own does too.
+fn gen_deferred(
+  env: Env,
+  name: String,
+  call: ast.Expr,
+  ty: Ty,
+  following: List(ast.Stmt),
+  pad: String,
+) -> #(String, Env) {
+  let task = task_var(name)
+  let start = pad <> task <> " := " <> gen_spawn(env, call) <> "\n"
+  let unread = case uses_in_stmts(following, name) {
+    True -> ""
+    False -> pad <> "_ = " <> task <> "\n"
+  }
+  let base = shadow(env, name)
+  #(
+    start <> unread,
+    Env(
+      ..base,
+      locals: dict.insert(base.locals, name, ty),
+      muts: dict.insert(base.muts, name, False),
+      renames: dict.insert(base.renames, name, task <> ".Await()"),
+    ),
+  )
+}
+
+// The generated variable holding a deferred binding's task. Hive identifiers
+// never start with an underscore, so it cannot collide with the name it is named
+// after, nor with anything else in scope.
+fn task_var(name: String) -> String {
+  "_task_" <> name
+}
+
 // A fresh binding of `name` takes the name back. Whatever the outer one was — a
-// mutex parameter reading through `(*p)`, a `mut b = a` rendering as `a` — the
-// new one is a Go variable of its own, so every trace of the old spelling has to
-// go or the body would read through to storage the name no longer means.
+// mutex parameter reading through `(*p)`, a `mut b = a` rendering as `a`, an
+// `async` binding reading through its task — the new one is a Go variable of its
+// own, so every trace of the old spelling has to go or the body would read
+// through to storage the name no longer means.
 fn shadow(env: Env, name: String) -> Env {
   Env(
     ..env,
@@ -3626,7 +3777,7 @@ fn share_env(
 fn gen_for_clause(env: Env, stmt: ast.Stmt) -> #(String, Env) {
   case stmt {
     // A loop-init binding is implicitly mutable (the post clause advances it).
-    ast.SVarDecl(name, value, _) -> {
+    ast.SVarDecl(name, value, _, _) -> {
       let ty = infer(env, value)
       let rhs = bind_rhs_noscope(env, ty, True, value, gen_expr(env, value))
       #(
@@ -3638,7 +3789,7 @@ fn gen_for_clause(env: Env, stmt: ast.Stmt) -> #(String, Env) {
         ),
       )
     }
-    ast.STypedDecl(typ, name, value, _) -> {
+    ast.STypedDecl(typ, name, value, _, _) -> {
       let ty = ty_of_type_expr(env.types, typ)
       let rhs = bind_rhs_noscope(env, ty, True, value, coerce(env, value, ty))
       #(
@@ -4384,8 +4535,11 @@ fn infer_global_builtin(env: Env, name: String, args: List(ast.Arg)) -> Ty {
     // `indexOf` yields the position it found, or an Error carrying `false`
     // (there is nothing to say about a miss beyond that it missed).
     "indexOf" -> TyResult(TyInt, TyBool)
-    // `append` yields a vector of the same type as its first argument.
-    "append" ->
+    // `append` yields a vector of the same type as its first argument, and so
+    // does `drop`: what it hands back is the elements it took out. (`drop`'s
+    // *length* is another matter, and not one the type lattice tracks — see
+    // `hive/bounds`, which treats it as unknown, since it is.)
+    "append" | "drop" ->
       case args {
         [ast.Arg(_, first), ..] -> infer(env, first)
         [] -> TyUnknown
@@ -4865,6 +5019,12 @@ fn hoist_args(
 fn has_mutex_call(env: Env, e: ast.Expr) -> Bool {
   let takes_mutex = case e {
     ast.ECall(ast.EIdent(name), _) -> mut_param_names(env, name) != []
+    // `prepend` and `drop` are handed the caller's vector by address, which is
+    // the same thing a mutex parameter is handed, so they are hoisted for exactly
+    // the same reason: run on the new thread, either would be rearranging storage
+    // the caller is still reading.
+    ast.ECall(ast.EMember(ast.EIdent("hive"), "prepend"), _)
+    | ast.ECall(ast.EMember(ast.EIdent("hive"), "drop"), _) -> True
     _ -> False
   }
   takes_mutex || list.any(sub_exprs(e), has_mutex_call(env, _))
@@ -5715,8 +5875,8 @@ fn var_mutated_in_stmt(s: ast.Stmt, name: String) -> Bool {
       || var_mutated_in_stmts(body, name)
     ast.SForEach(_, _, _, body) -> var_mutated_in_stmts(body, name)
     // Bindings, returns and value-only statements don't write through `name`.
-    ast.SVarDecl(_, _, _)
-    | ast.STypedDecl(_, _, _, _)
+    ast.SVarDecl(_, _, _, _)
+    | ast.STypedDecl(_, _, _, _, _)
     | ast.SReturn(_)
     | ast.SEcho(_)
     | ast.SAssert(_, _)
@@ -5748,8 +5908,8 @@ fn may_escape_stmt(s: ast.Stmt, name: String) -> Bool {
   case s {
     // A binding or assignment captures the value under a new (or existing)
     // name; treat any mention as a potential alias.
-    ast.SVarDecl(_, value, _)
-    | ast.STypedDecl(_, _, value, _)
+    ast.SVarDecl(_, value, _, _)
+    | ast.STypedDecl(_, _, value, _, _)
     | ast.SAssign(_, value) -> uses_in_expr(value, name)
     ast.SReturn(Some(value)) -> uses_in_expr(value, name)
     ast.SReturn(None) -> False
@@ -7417,6 +7577,13 @@ fn gen_global_builtin(env: Env, name: String, args: List(ast.Arg)) -> String {
     // `append(v, x...)` grows a vector (see gen_append); as a statement the
     // caller reassigns the result back to `v`.
     "append" -> gen_append(env, args)
+    // `prepend(v, x)` and `drop(v, a, b)` write through their first argument
+    // rather than handing back a new vector to reassign, so each is given the
+    // vector's address — the same thing a `mut` parameter is given, and for the
+    // same reason: growing or shrinking a slice produces a new header, and the
+    // caller has to end up holding it.
+    "prepend" -> gen_prepend(env, args)
+    "drop" -> gen_drop(env, args)
     // `sort(v)` / `sort(v, comesFirst)` reorder a vector.
     "sort" -> gen_sort(env, args)
     // `map`/`filter`/`filterMap` walk a vector with a function value.
@@ -7440,7 +7607,11 @@ fn gen_declared_call(env: Env, name: String, args: List(ast.Arg)) -> String {
           <> "("
           <> gen_sig_args(env, args, params, mut_param_names(env, name))
           <> ")"
-        Error(_) -> escape_ident(name) <> "(" <> gen_args(env, args) <> ")"
+        // Not a declaration: a local holding a function value, which is read
+        // however that local reads — through an `is`-binding's accessor, a mutex
+        // parameter's pointer, an `async` binding's task.
+        Error(_) ->
+          gen_expr(env, ast.EIdent(name)) <> "(" <> gen_args(env, args) <> ")"
       }
   }
 }
@@ -7957,6 +8128,39 @@ fn gen_append(env: Env, args: List(ast.Arg)) -> String {
   }
 }
 
+// `prepend(v, x)` -> `hive.Prepend(&v, x)`, coercing the value to the vector's
+// element type. The address is taken the way a `mut` argument's is, so a mutex
+// parameter (already a pointer) is passed straight on rather than pointed at
+// twice.
+fn gen_prepend(env: Env, args: List(ast.Arg)) -> String {
+  case args {
+    [ast.Arg(_, target), ast.Arg(_, value)] ->
+      "hive.Prepend("
+      <> gen_mut_arg(env, target)
+      <> ", "
+      <> coerce(env, value, elem_ty_of(infer(env, target)))
+      <> ")"
+    _ -> "hive.Prepend(" <> gen_args(env, args) <> ")"
+  }
+}
+
+// `drop(v, low, high)` -> `hive.Drop(&v, low, high)`: the elements are removed
+// from the caller's own vector and handed back, so this is an expression *and* a
+// write, and the address is what makes both possible in one.
+fn gen_drop(env: Env, args: List(ast.Arg)) -> String {
+  case args {
+    [ast.Arg(_, target), ast.Arg(_, low), ast.Arg(_, high)] ->
+      "hive.Drop("
+      <> gen_mut_arg(env, target)
+      <> ", "
+      <> coerce(env, low, TyInt)
+      <> ", "
+      <> coerce(env, high, TyInt)
+      <> ")"
+    _ -> "hive.Drop(" <> gen_args(env, args) <> ")"
+  }
+}
+
 fn gen_args(env: Env, args: List(ast.Arg)) -> String {
   args
   |> list.map(fn(a) { gen_expr(env, a.value) })
@@ -8086,8 +8290,8 @@ fn uses_in_stmts(stmts: List(ast.Stmt), name: String) -> Bool {
 
 fn uses_in_stmt(s: ast.Stmt, name: String) -> Bool {
   case s {
-    ast.SVarDecl(_, value, _) -> uses_in_expr(value, name)
-    ast.STypedDecl(_, _, value, _) -> uses_in_expr(value, name)
+    ast.SVarDecl(_, value, _, _) -> uses_in_expr(value, name)
+    ast.STypedDecl(_, _, value, _, _) -> uses_in_expr(value, name)
     // Only the assigned value counts as a use: a bare `name = ...` writes to
     // `name` without reading it, and Go's "declared and not used" rule needs a
     // read. Under-counting is safe (it only adds a harmless `_ = name`).

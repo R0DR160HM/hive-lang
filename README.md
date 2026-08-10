@@ -178,7 +178,7 @@ func first(v: T[]): Result<T, Bool> {
 }
 
 // Nothing about a declaration says how it runs: every call blocks its caller,
-// and a call site that does not want to wait says so with `async`.
+// and a call site that does not want to wait yet says so with `async`.
 func slowShout(text: Str): Str {
 	return text + "!!!"
 }
@@ -197,7 +197,9 @@ proc main(): void {
 	}
 
 	async slowShout("fire-and-forget")   // its own thread; no result to read
+	later := async slowShout("started")  // its own thread; kept for later
 	echo slowShout("waited for")         // blocks until the value is ready
+	echo later                           // waits here, if it has not finished
 }
 ```
 
@@ -208,6 +210,7 @@ Good evening, Dr. Grace.
 Hey Linus!
 first up: Grace
 waited for!!!
+started!!!
 ```
 
 Pattern matching with `is` — beyond the tagged-union variants and `Result`s
@@ -342,10 +345,10 @@ compiles, builds and runs.
   into one, and what the callee gets is that storage rather than a view of it: it
   may reassign it, write its elements, and `append` to it, and every one of those
   is visible through the caller's name afterwards. **Whether it shares depends on
-  the call site, not the declaration**: a call you wait for hands over the
+  the call site, not the declaration**: a call you wait for *there* hands over the
   caller's storage, and an `async` or `await`ed one hands over a copy — a thread
-  of its own gets storage of its own, which is what keeps a fired-off call from
-  racing the caller it was fired off from. `mut` cannot appear anywhere else a
+  of its own gets storage of its own, which is what keeps a call running alongside
+  the caller from racing it. `mut` cannot appear anywhere else a
   type can: not on a field, not on a return, not in a `proc(...)` type. Each of
   those binds nothing, and a function value has no call site to take a mutex from,
   so a callable with one can be neither referenced (`f`) nor partially applied
@@ -356,16 +359,28 @@ compiles, builds and runs.
   * `f(x)` waits for it and yields `T`. It costs neither a goroutine nor a
     channel — it is a function call.
   * `async f(x)`, as a **statement**, runs it on its own virtual thread (a
-    goroutine) and carries on. Fire-and-forget is the whole of what it is:
-    nothing comes back, so `async` has no value and cannot appear where one is
-    wanted. That is what leaves no handle to hold, to pass, or to leak out of the
-    scope that started it — and why the language needs no type for one. It works
+    goroutine) and carries on. Fire-and-forget is the whole of what it is: the
+    result is discarded, and nothing is left behind to read one from. It works
     on any call: a `func`, a `proc`, a `query`, the standard library, a
     [service](#hivesyslink). What it refuses, it refuses by name — a global
     builtin (`len`, `append` and the rest exist for the value they hand back, so
     firing one off would leave nothing of it), a constructor (it builds a value
     and runs no body), and a partial application (`f(1, _)` makes a function
     value; nothing runs until something calls it).
+  * `x := async f(a)` — or `T x = async f(a)` — starts the call the same way and
+    **keeps its result**: the wait happens wherever `x` is *read*, and only if the
+    call has not finished by then. It is the middle ground between the two above,
+    and the only place `async` may appear other than a statement of its own.
+    `x`'s type is the call's return type with nothing wrapped around it (`Str`,
+    not a Future of one) — there is no handle type in the language, nothing to
+    unwrap, and no way to forget to. Reading `x` again is free and always answers
+    the same value; a panic inside the call is raised at the first read, and if
+    nothing ever reads `x` the work still runs and the panic is dropped with the
+    result. It refuses the same three immediate calls `async` does, and a `void`
+    call besides (there would be nothing for the name to hold). `mut` cannot be
+    combined with it — the name is work in flight, not storage — and neither can
+    `with timeout`, which needs one moment to measure from where this has as many
+    as it has reads.
   * `await [f(a), f(b), f(c)]` is the **await-all**, and the only `await` there
     is: every call in the list starts on its own thread and the whole list is one
     barrier, resolving *in order* to a statically-sized, fully-typed vector of
@@ -376,14 +391,23 @@ compiles, builds and runs.
     Every entry has to be a call (a value already in hand has nothing to wait
     for) and they all have to answer with the same type, since one barrier
     resolves to one vector.
-  * Work of **different types** is waited for one call at a time — each of those
-    is an ordinary blocking call, so it costs the sum rather than the slowest,
-    which is exactly what the writing says it does.
+  * Work of **different types** is what the `async` binding is for: an await-all
+    resolves to one vector and a vector holds one type, so several calls that
+    answer differently are given names instead. `s := async slowShout("a")` then
+    `n := async slowCount("bb")` are two threads running at once, and each is
+    waited for where its own name is read.
 
-  Any wait may be bounded with the optional [`with timeout <ms>`](#hivetask)
-  clause, which turns its result into a `Result<T, hive.task.TimeoutError>` — on
-  an await-all it is one deadline across the whole barrier. The timeout abandons
-  the waiting, not the work. See `code-examples/10 - Concurrency`.
+    ```hive
+    rows  := async loadRows()        // Str[dyn]  — starts now
+    total := async countAll()        // Int       — starts now, alongside
+    echo "loaded {len(rows)} of {total}"   // waits for both, here
+    ```
+
+  Any wait *written where it happens* may be bounded with the optional
+  [`with timeout <ms>`](#hivetask) clause, which turns its result into a
+  `Result<T, hive.task.TimeoutError>` — on an await-all it is one deadline across
+  the whole barrier. The timeout abandons the waiting, not the work. See
+  `code-examples/10 - Concurrency`.
 * **Distribution** — [`hive.syslink`](#hivesyslink) adds *services*: long-lived,
   addressable things with a mailbox and private state, reached by the same
   statement whether they live in this process or on another machine.
@@ -616,6 +640,10 @@ proc main(): void {
 }
 ```
 
+Whether the call's result is kept makes no difference to this: `n := async
+count(v, "c")` gets storage of its own too. What decides is the thread, not the
+name.
+
 It lowers to a pointer (`vec *[]string`), because a shared backing array would not
 survive `append` — that returns a *new* slice header, and the caller has to see the
 new one. Reads and writes in the callee go through it (`(*vec)`), which is the same
@@ -697,6 +725,8 @@ argument type. A declaration of your own with one of these names
 | `bytes(vector)`         | `bytes(T[]): Int`            | Byte footprint of a vector's contiguous storage (count × elem size). |
 | `bytes(str)`            | `bytes(Str): Int`            | Number of **bytes** in a string's UTF-8 encoding.                    |
 | `append(vector, value)` | `append(T[dyn], T): void`    | Grows a **mutable** dynamic vector in place with one more element.   |
+| `prepend(vector, value)`| `prepend(T[dyn], T): void`   | The same, at the **front**. Costs the length of the vector (the elements move), where `append` costs nothing. |
+| `drop(vector, low, high)`| `drop(T[dyn], Int, Int): T[dyn]` | Removes `low` through `high` — **both inclusive**, as everywhere else — from a **mutable** dynamic vector and hands them back. Bounds are [proven in range](#scope) like a slice's. |
 | `join(vector, sep)`     | `join(Str[], Str): Str`      | Concatenates a `Str` vector into one string, `sep` between elements. |
 | `split(str, sep)`       | `split(Str, Str): Str[dyn]`  | Splits a string on `sep` into a `Str` vector (inverse of `join`).    |
 | `indexOf(vector, value)`| `indexOf(T[], T): Result<Int, Bool>` | Position of the first element equal to `value`, else `Error(false)`. |
@@ -844,6 +874,51 @@ rules of [value semantics](#value-semantics-copy-on-binding) apply unchanged: a
 Like every builtin, these yield to a declaration of your own and stay reachable as
 `hive.map` / `hive.filter` / `hive.filterMap` — see
 [A declaration of your own wins](#a-declaration-of-your-own-wins).
+
+### Growing and shrinking: `append`, `prepend`, `drop`
+
+Three builtins write *through* a vector rather than handing back a new one, and
+all three ask for the same thing: a **mutable dynamic** vector (`mut T[dyn]`).
+Dynamic has to be declared, because a `mut v := [...]` binding reads its length
+off the value and a length read off a value is a static one — a promise the
+vector cannot then grow out of.
+
+```hive
+proc main(): void {
+    mut Str[dyn] queue = ["b", "c"]
+
+    append(queue, "d")           // [b, c, d]
+    prepend(queue, "a")          // [a, b, c, d]
+
+    if 1 < len(queue) {
+        taken := drop(queue, 0, 1)   // takes [a, b], leaves [c, d]
+        echo taken
+    }
+    echo queue
+}
+```
+
+`prepend` is `append`'s other end, and it costs what that implies: every element
+moves up one, so it is the length of the vector where `append` is nothing.
+
+`drop` removes a **range**, `low` through `high` with **both ends inclusive** —
+the same bounds a slice has (`v[1:2]`), because they are the same two numbers.
+What it hands back is what it removed, so it is both a value and a write:
+
+* Its bounds are proven in range at compile time exactly as a slice's are, so on
+  a dynamic vector they need a guard: `if 1 < len(v) { … }` proves the high bound
+  and, with it, a low bound of 0 (a length is never negative). Crossed bounds
+  (`drop(v, 2, 1)`) take nothing and hand back an empty vector — the same as the
+  slice they describe.
+* It is the one builtin that makes a vector **shorter**, so it costs that vector
+  whatever the [bounds pass](#scope) had proved about it. A `v[1]` proven safe
+  before a `drop(v, 0, 0)` needs proving again after — which is exactly the
+  position that may no longer be there.
+* Used as a statement its result is simply discarded, which is the ordinary way to
+  remove elements you have no further use for.
+
+`prepend`, by contrast, hands nothing back: the vector you gave it *is* the
+result, so it may only stand as a statement of its own.
 
 ### Putting a vector in order: `sort`
 
@@ -1526,7 +1601,7 @@ is worth spelling out:
 | identity | none (there is nothing to hold) | yes, that is the point |
 | interaction | none — it keeps nothing back | called with a message, and calling it *is* the send |
 | as a value | it has none at all | ordinary value; can even be sent inside a message |
-| result | none; to get one, wait for the call | `Result<Message, SyslinkError>` when you wait for it |
+| result | none; give the call a name (`x := async f(x)`) to keep one | `Result<Message, SyslinkError>` when you wait for it |
 
 **The handler is a fold over the mailbox.** `proc (State, Message,
 hive.syslink.Envelope): State` — state in, one message, the turn's envelope, and
@@ -1563,7 +1638,7 @@ port-mapper daemon and no cluster-wide name registry.
   dialable even after a peer passes it on again.
 * `hive.syslink.node()` is the endpoint this node advertises.
 * `hive.syslink.peers()` is every node this one is connected to **right now**,
-  each as the endpoint it advertised → `Str[]`, sorted. It keeps no bookkeeping of
+  each as the endpoint it advertised → `Str[dyn]`, sorted. It keeps no bookkeeping of
   its own because a connection *is* the record: one pipe per node pair, filed
   under the peer's advertised endpoint whichever end opened it. So sending to a
   node puts it in the list, a node that dials in appears without this node doing
@@ -1602,6 +1677,7 @@ address is not a handle you pass to some function, it is the thing you call.
 async inbox(Note.Say("hi"))          // send it, wait for nothing
 answer := cache(Op.Count())          // send it and wait for the answer
 answer := cache(Op.Count()) with timeout 250 // ...for at most 250ms
+later := async cache(Op.Count())     // send it now, wait where `later` is read
 both := await [a(m), b(m)]           // send both, one barrier, one deadline
 ```
 
@@ -1620,11 +1696,17 @@ mistake about what the value is.
   (`"Down"` / `"NoProc"`), an unreachable node (`"Unreachable"`), a payload that
   would not decode (`"Decode"`) and a request the service handled but never
   answered (`"NoReply"`) all arrive here.
-* With **`async`**, the same call returns `void` and
+* With **`async`** as a statement, the same call returns `void` and
   **never blocks and never fails.** A dead or unreachable recipient is not an
   error at the send site — that is precisely what keeps a local send and a remote
   one the same statement, and failure is discovered through a monitor instead.
   Nothing is registered for a reply, so this is also the cheapest form.
+* Given a **name** (`later := async cache(Op.Count())`), it is a request again —
+  registered for its answer, and reporting the same failures — but the waiting
+  happens wherever `later` is read rather than on the spot. This is how a program
+  sends to several services at once when their replies are of different mailbox
+  types, and how it fills a screen from a service while it goes on doing something
+  else.
 * An **[await-all](#the-language)** over sends is one barrier with one deadline,
   and spawns nothing at all: each send registers for its answer and returns, and
   the waiting happens on the connection's own reader.
@@ -2230,9 +2312,12 @@ mappings worth knowing:
 | `p(mutVec)` (waited for)                | `p(&mutVec)` — the callee writes the caller's own storage       |
 | `async p(mutVec)` (fired off)           | `{ _a0 := hive.CloneVec(mutVec); go p(&_a0) }` — the thread gets its own |
 | `f(x)` / `async f(x)`                   | a plain call / `go f(x)`                                       |
+| `x := async f(a)`                       | `_task_x := hive.Spawn(..)`, and every read of `x` becomes `_task_x.Await()` |
 | `f(x) with timeout ms`                  | `hive.AwaitTimeout(hive.Spawn(..), ms)` → a `Result`           |
 | `await [f(a), f(b)]`                    | `hive.AwaitAll(..)` over one `hive.Spawn` each → a statically-sized vector |
 | `addr(m)` / `async addr(m)`             | a send that waits for its answer / `hive.SyslinkSend(..)`, which cannot fail |
+| `append(v, x)` (a statement)            | `v = append(v, x)` — Go's own, with the new header written back |
+| `prepend(v, x)` / `drop(v, a, b)`       | `hive.Prepend(&v, x)` / `hive.Drop(&v, a, b)` — the address, since both rewrite the header |
 | `for each x in v { }`                   | `for _, x := range v { }`                                      |
 | `x is Result.Ok(v)` / `x is T.Variant(a, _)` | `IsOk()` + accessor / a type assertion; `_` binds nothing |
 | `if <call> is Result.Ok(v)`             | one `if` with an init slot, so the call is evaluated once       |

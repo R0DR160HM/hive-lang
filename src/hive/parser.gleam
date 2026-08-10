@@ -1109,8 +1109,8 @@ fn parse_stmt(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
       case kind(tail(tokens)) {
         token.ColonEq -> {
           use _ <- result.try(named(tokens, naming.Variable, name))
-          use #(value, t2) <- result.try(parse_expr(tail(tail(tokens))))
-          Ok(#(ast.SVarDecl(name, value, False), t2))
+          use #(value, deferred, t2) <- result.try(parse_init(tail(tail(tokens))))
+          Ok(#(ast.SVarDecl(name, value, False, deferred), t2))
         }
         _ -> parse_typed_or_expr(tokens)
       }
@@ -1125,8 +1125,9 @@ fn parse_mut(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
   case kind(tokens), kind(tail(tokens)) {
     token.Ident(name), token.ColonEq -> {
       use _ <- result.try(named(tokens, naming.MutVariable, name))
+      use _ <- result.try(no_mut_async(tail(tail(tokens))))
       use #(value, t2) <- result.try(parse_expr(tail(tail(tokens))))
-      Ok(#(ast.SVarDecl(name, value, True), t2))
+      Ok(#(ast.SVarDecl(name, value, True, False), t2))
     }
     _, _ -> {
       use #(typ, t1) <- result.try(parse_type_expr(tokens))
@@ -1134,8 +1135,9 @@ fn parse_mut(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
         token.Ident(vname), token.Assign -> {
           use _ <- result.try(check_type(typ, tokens))
           use _ <- result.try(named(t1, naming.MutVariable, vname))
+          use _ <- result.try(no_mut_async(tail(tail(t1))))
           use #(value, t2) <- result.try(parse_expr(tail(tail(t1))))
-          Ok(#(ast.STypedDecl(typ, vname, value, True), t2))
+          Ok(#(ast.STypedDecl(typ, vname, value, True, False), t2))
         }
         _, _ ->
           Error(at(
@@ -1147,15 +1149,22 @@ fn parse_mut(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
   }
 }
 
-// `async <call>` — spawn it and carry on. The operand is parsed at the postfix
-// level, which is exactly a call and nothing more: `async` has no value, so
-// there is no larger expression for it to sit inside. Anything else that parsed
-// is named here rather than left to a later pass, because the mistake is about
-// the shape of the statement.
+// `async <call>` as a statement — spawn it and keep nothing.
 fn parse_async(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
+  use #(call, t1) <- result.try(parse_async_call(tokens))
+  Ok(#(ast.SAsync(call), t1))
+}
+
+// The call an `async` fires off, in either of the two positions the word is
+// allowed. The operand is parsed at the postfix level, which is exactly a call
+// and nothing more: `async` is not an operator over expressions, so there is no
+// larger one for it to sit inside. Anything else that parsed is named here
+// rather than left to a later pass, because the mistake is about the shape of
+// the statement.
+fn parse_async_call(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
   use #(operand, t1) <- result.try(parse_postfix(tail(tokens)))
   case operand {
-    ast.ECall(_, _) -> Ok(#(ast.SAsync(operand), t1))
+    ast.ECall(_, _) -> Ok(#(operand, t1))
     _ ->
       Error(at(
         tokens,
@@ -1164,6 +1173,61 @@ fn parse_async(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
           <> "every other expression is already finished by the time it is "
           <> "written.",
       ))
+  }
+}
+
+// The value side of a declaration, and the one position where `async` keeps its
+// result: `name := async <call>` starts the call now and lets the *name* do the
+// waiting, at the first place it is read. The flag that comes back says which of
+// the two it was; everywhere else an initializer is an ordinary expression, and
+// `async` in one is caught by `parse_primary`.
+fn parse_init(tokens: Toks) -> Result(#(ast.Expr, Bool, Toks), String) {
+  case kind(tokens) {
+    token.KwAsync -> {
+      use #(call, t1) <- result.try(parse_async_call(tokens))
+      use _ <- result.try(no_deferred_timeout(t1))
+      Ok(#(call, True, t1))
+    }
+    _ -> {
+      use #(value, t1) <- result.try(parse_expr(tokens))
+      Ok(#(value, False, t1))
+    }
+  }
+}
+
+// `mut` asks for storage that can be written to; an `async` binding is a value
+// still being computed somewhere else. Nothing sensible comes of the two
+// together, so the combination is refused where it is written rather than
+// half-honoured later.
+fn no_mut_async(tokens: Toks) -> Result(Nil, String) {
+  case kind(tokens) {
+    token.KwAsync ->
+      Error(at(
+        tokens,
+        "`mut` and `async` cannot be combined: `x := async f()` names work that "
+          <> "is still running, and the wait for it happens wherever the name is "
+          <> "read — there is no storage of its own to assign to afterwards. Drop "
+          <> "the `mut`, or wait for the call (`mut x := f()`) and reassign that.",
+      ))
+    _ -> Ok(Nil)
+  }
+}
+
+// A bound on an `async` binding would have nothing fixed to measure: the wait
+// happens wherever the name is read, so the same variable could answer one read
+// with a value and the next with a timeout.
+fn no_deferred_timeout(tokens: Toks) -> Result(Nil, String) {
+  case kind(tokens), is_timeout_word(tail(tokens)) {
+    token.KwWith, True ->
+      Error(at(
+        tokens,
+        "`with timeout` cannot bound an `async` binding: the wait happens "
+          <> "wherever the name is read, so there is no one moment for the bound "
+          <> "to run from — two reads would get two different answers. Bound the "
+          <> "wait itself instead: `r := f(x) with timeout 500`, or "
+          <> "`r := await [f(x), g(y)] with timeout 500` for several at once.",
+      ))
+    _, _ -> Ok(Nil)
   }
 }
 
@@ -1198,8 +1262,8 @@ fn parse_typed_or_expr(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
         token.Ident(vname), token.Assign -> {
           use _ <- result.try(check_type(typ, tokens))
           use _ <- result.try(named(t1, naming.Variable, vname))
-          use #(value, t2) <- result.try(parse_expr(tail(tail(t1))))
-          Ok(#(ast.STypedDecl(typ, vname, value, False), t2))
+          use #(value, deferred, t2) <- result.try(parse_init(tail(tail(t1))))
+          Ok(#(ast.STypedDecl(typ, vname, value, False, deferred), t2))
         }
         _, _ -> parse_expr_stmt(tokens)
       }
@@ -1353,6 +1417,20 @@ fn parse_for_c(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
       ))
     _, _ -> Ok(Nil)
   })
+  // Nor can an `async` *binding*: a loop counter is advanced by its post clause,
+  // and a name whose value arrives from somewhere else is not something this loop
+  // can advance.
+  use _ <- result.try(case defers(init) || defers(post) {
+    True ->
+      Error(at(
+        tokens,
+        "an `async` binding cannot be a loop's init or post clause: the counter "
+          <> "those clauses set up is advanced by the loop itself, and work "
+          <> "running on another thread is not. Start it before the loop and read "
+          <> "the name inside.",
+      ))
+    False -> Ok(Nil)
+  })
   use #(body, t6) <- result.try(parse_block(t5))
   Ok(#(ast.SFor(init, cond, post, body), t6))
 }
@@ -1365,17 +1443,27 @@ fn parse_for_c(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
 fn parse_for_init(tokens: Toks) -> Result(#(ast.Stmt, Toks), String) {
   use #(stmt, rest) <- result.try(parse_stmt(tokens))
   use stmt <- result.try(case stmt {
-    ast.SVarDecl(name, value, _) -> {
+    ast.SVarDecl(name, value, _, deferred) -> {
       use _ <- result.try(named(tokens, naming.MutVariable, name))
-      Ok(ast.SVarDecl(name, value, True))
+      Ok(ast.SVarDecl(name, value, True, deferred))
     }
-    ast.STypedDecl(typ, name, value, _) -> {
+    ast.STypedDecl(typ, name, value, _, deferred) -> {
       use _ <- result.try(named(tokens, naming.MutVariable, name))
-      Ok(ast.STypedDecl(typ, name, value, True))
+      Ok(ast.STypedDecl(typ, name, value, True, deferred))
     }
     _ -> Ok(stmt)
   })
   Ok(#(stmt, rest))
+}
+
+// Whether a loop clause is an `async` binding — the one declaration shape whose
+// value is not in hand by the time the clause has run.
+fn defers(clause: Option(ast.Stmt)) -> Bool {
+  case clause {
+    Some(ast.SVarDecl(_, _, _, deferred)) -> deferred
+    Some(ast.STypedDecl(_, _, _, _, deferred)) -> deferred
+    _ -> False
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1761,16 +1849,19 @@ fn parse_primary(tokens: Toks) -> Result(#(ast.Expr, Toks), String) {
               <> "blocks until it answers.",
           ))
       }
-    // `async` fires a call off and keeps nothing, so there is no value for it
-    // to be. That is the trade the model makes: no handle to hold means no
-    // handle to leak, and the way to get a result back is to wait for it.
+    // `async` is not an expression: it says how a call is *run*, and the only
+    // places that question can be asked are a statement of its own and the value
+    // side of a declaration (`parse_init`). Anywhere else — inside an argument,
+    // an operand, a condition — the value is wanted right there, which is what
+    // an ordinary call already does.
     token.KwAsync ->
       Error(at(
         tokens,
-        "`async` has no value: it starts the call and does not wait, so there "
-          <> "is nothing for it to evaluate to. Drop the `async` to wait for the "
-          <> "result here, or use `await [f(a), f(b)]` to run several at once and "
-          <> "collect all of their results.",
+        "`async` has no value of its own: it says how a call runs, not what it "
+          <> "evaluates to, so it cannot sit inside a larger expression. Give it a "
+          <> "name and read the name here — `x := async f(a)` starts the call now "
+          <> "and waits at the first place `x` is read — or drop the `async` to "
+          <> "wait for the result on the spot.",
       ))
     token.KwUsing -> parse_using(tokens)
     token.LBracket -> parse_vector(tail(tokens), [])

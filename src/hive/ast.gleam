@@ -96,9 +96,10 @@ pub type Decl {
 /// `mutable` is what a parameter written `name: mut T` records — the callee is
 /// handed the caller's `Mutex<T>` itself rather than an immutable view of it, so
 /// a write in the callee lands on the caller's variable. Only a `proc` may
-/// declare one, and only when the call is waited for; an `async` call copies the
-/// argument in instead (see `SAsync`). It is always `False` on a type's fields,
-/// whose mutability is the binding's, not the field's.
+/// declare one, and only when the caller waits for the call right there; any
+/// `async` call copies the argument in instead, whether it keeps the result
+/// (see `SVarDecl`'s `deferred`) or not (see `SAsync`). It is always `False` on
+/// a type's fields, whose mutability is the binding's, not the field's.
 pub type Field {
   Field(name: String, typ: TypeExpr, mutable: Bool)
 }
@@ -147,10 +148,25 @@ pub type TypeExpr {
 pub type Stmt {
   /// `name := value` — type-inferred declaration. `mutable` records whether it
   /// was declared with `mut`; only mutable variables may be reassigned.
-  SVarDecl(name: String, value: Expr, mutable: Bool)
+  ///
+  /// `deferred` is what `name := async <call>` records: the call starts now, on
+  /// its own virtual thread, and the wait for its value happens at the first
+  /// place the *name* is read (see `SAsync` for the sibling form that keeps
+  /// nothing). The binding's type is the call's return type either way — there
+  /// is no handle type in the language — so `deferred` changes only *when* the
+  /// value arrives, never what it is. It implies `value` is an `ECall` and
+  /// `mutable` is `False`, both of which the parser guarantees.
+  SVarDecl(name: String, value: Expr, mutable: Bool, deferred: Bool)
   /// `Type name = value` — declaration with an explicit type annotation.
-  /// `mutable` records whether it was declared with `mut`.
-  STypedDecl(typ: TypeExpr, name: String, value: Expr, mutable: Bool)
+  /// `mutable` records whether it was declared with `mut`; `deferred` carries
+  /// the same meaning it has on `SVarDecl`.
+  STypedDecl(
+    typ: TypeExpr,
+    name: String,
+    value: Expr,
+    mutable: Bool,
+    deferred: Bool,
+  )
   /// `target = value` — reassignment of a mutable variable (or one of its
   /// elements, e.g. `v[0] = x`).
   SAssign(target: Expr, value: Expr)
@@ -196,11 +212,14 @@ pub type Stmt {
   /// `continue` — skip to the next iteration of the innermost enclosing loop.
   SContinue
   /// `async <call>` — run the call on its own virtual thread and carry on
-  /// without waiting for it. Fire-and-forget is the whole of what it is: there
-  /// is no handle, so nothing is left behind to read a result from, and the
-  /// call cannot appear where a value is wanted. Every *other* call blocks its
-  /// caller, which is why this is a statement of its own rather than a
-  /// modifier on a declaration.
+  /// without waiting for it. Fire-and-forget is the whole of what it is: the
+  /// result is discarded, so nothing is left behind to read one from. Every
+  /// *other* call blocks its caller, which is why this is a statement of its
+  /// own rather than a modifier on a declaration.
+  ///
+  /// Bound to a name (`x := async <call>`) the same call keeps its result and is
+  /// waited for where the name is read; that is a declaration, not this — see
+  /// `SVarDecl`'s `deferred`.
   SAsync(call: Expr)
   /// A bare expression used as a statement (e.g. a call).
   SExpr(expr: Expr)
@@ -592,6 +611,35 @@ fn repeatable_part(part: IPart) -> Bool {
   case part {
     ILit(_) -> True
     IExpr(inner) -> repeatable(inner)
+  }
+}
+
+/// The expressions one expression is built out of, one level down. Every
+/// traversal that only wants to *reach* every sub-expression walks this rather
+/// than matching each form for itself.
+///
+/// The match is exhaustive on purpose (no catch-all): a new expression form has
+/// to say what it is made of here, rather than quietly hiding its operands from
+/// every pass that uses this.
+pub fn sub_exprs(e: Expr) -> List(Expr) {
+  case e {
+    EInt(_) | EFloat(_) | EString(_) | EBool(_) | EAtom(_) | EIdent(_) -> []
+    EInterp(parts) ->
+      list.filter_map(parts, fn(p) {
+        case p {
+          IExpr(inner) -> Ok(inner)
+          ILit(_) -> Error(Nil)
+        }
+      })
+    EVector(items) -> items
+    EMember(target, _) | EIs(target, _) | EWith(target, _) -> [target]
+    ECall(callee, args) -> [callee, ..list.map(args, fn(a) { a.value })]
+    EIndex(target, index) -> [target, index]
+    ESlice(target, low, high) -> [target, ..option.values([low, high])]
+    EBinary(_, l, r) -> [l, r]
+    EUsing(source, kind) -> [source, ..using_exprs(kind)]
+    EAwait(calls, timeout) -> list.append(calls, option.values([timeout]))
+    ETimed(call, ms) -> [call, ms]
   }
 }
 

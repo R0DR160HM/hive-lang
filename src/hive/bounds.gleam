@@ -196,7 +196,7 @@ fn check_body(
 fn declared_names(stmts: List(ast.Stmt)) -> List(String) {
   list.flat_map(stmts, fn(s) {
     case s {
-      ast.SVarDecl(name, _, _) | ast.STypedDecl(_, name, _, _) -> [name]
+      ast.SVarDecl(name, _, _, _) | ast.STypedDecl(_, name, _, _, _) -> [name]
       ast.SForEach(name, _, _, body) -> [name, ..declared_names(body)]
       ast.SFor(init, cond, post, body) ->
         list.flatten([
@@ -225,7 +225,7 @@ fn check_stmts(env: Env, stmts: List(ast.Stmt)) -> Result(Env, String) {
     [] -> Ok(env)
     [s, ..rest] -> {
       use env2 <- result.try(check_stmt(env, s))
-      check_stmts(forget_mutexes(env2, s), rest)
+      check_stmts(forget_shrinks(forget_mutexes(env2, s), s), rest)
     }
   }
 }
@@ -247,6 +247,41 @@ fn check_stmts(env: Env, stmts: List(ast.Stmt)) -> Result(Env, String) {
 fn forget_mutexes(env: Env, s: ast.Stmt) -> Env {
   let names = mutex_roots(env, s)
   forget(env, names) |> drop_lengths(names)
+}
+
+// What survives a `drop`: nothing this pass had proved about the vector it took
+// elements out of.
+//
+// This is the one builtin that makes a vector *shorter*, which puts it with `v =
+// ...` rather than with `append`: an `i < len(v)` proven before it may simply not
+// hold after, and a length read off a literal would go on claiming positions that
+// have been removed. So the length goes with the facts, exactly as a replacement
+// costs them.
+//
+// It applies wherever the call is written — a statement of its own, a binding, an
+// argument — because the removal happens wherever it is written. A `drop` inside a
+// nested block is forgotten by `forget_writes` along with everything else that
+// block touched.
+fn forget_shrinks(env: Env, s: ast.Stmt) -> Env {
+  let names = shrunk_roots(s)
+  forget(env, names) |> drop_lengths(names)
+}
+
+// The vectors a statement takes elements out of: the first argument of every
+// `drop` anywhere in it.
+fn shrunk_roots(s: ast.Stmt) -> List(String) {
+  stmt_exprs(s)
+  |> list.flat_map(drops_in)
+  |> list.unique
+}
+
+fn drops_in(e: ast.Expr) -> List(String) {
+  let here = case e {
+    ast.ECall(ast.EMember(ast.EIdent("hive"), "drop"), [ast.Arg(_, target), ..]) ->
+      option.values([assign_root(target)])
+    _ -> []
+  }
+  list.append(here, list.flat_map(ast.sub_exprs(e), drops_in))
 }
 
 // The variables a statement hands to a mutex parameter, anywhere in it.
@@ -290,36 +325,7 @@ fn calls_in(e: ast.Expr) -> List(#(String, List(ast.Arg))) {
     ast.ECall(ast.EIdent(name), args) -> [#(name, args)]
     _ -> []
   }
-  list.append(here, list.flat_map(sub_exprs(e), calls_in))
-}
-
-fn sub_exprs(e: ast.Expr) -> List(ast.Expr) {
-  case e {
-    ast.EInt(_)
-    | ast.EFloat(_)
-    | ast.EString(_)
-    | ast.EBool(_)
-    | ast.EAtom(_)
-    | ast.EIdent(_) -> []
-    ast.EInterp(parts) ->
-      list.filter_map(parts, fn(p) {
-        case p {
-          ast.IExpr(inner) -> Ok(inner)
-          ast.ILit(_) -> Error(Nil)
-        }
-      })
-    ast.EVector(items) -> items
-    ast.EMember(target, _) | ast.EIs(target, _) | ast.EWith(target, _) -> [
-      target,
-    ]
-    ast.ECall(callee, args) -> [callee, ..list.map(args, fn(a) { a.value })]
-    ast.EIndex(target, index) -> [target, index]
-    ast.ESlice(target, low, high) -> [target, ..option.values([low, high])]
-    ast.EBinary(_, l, r) -> [l, r]
-    ast.EUsing(source, kind) -> [source, ..ast.using_exprs(kind)]
-    ast.EAwait(calls, timeout) -> list.append(calls, option.values([timeout]))
-    ast.ETimed(call, ms) -> [call, ms]
-  }
+  list.append(here, list.flat_map(ast.sub_exprs(e), calls_in))
 }
 
 // Every expression a statement evaluates, including those in nested blocks. A
@@ -327,7 +333,7 @@ fn sub_exprs(e: ast.Expr) -> List(ast.Expr) {
 // finding the calls.
 fn stmt_exprs(s: ast.Stmt) -> List(ast.Expr) {
   case s {
-    ast.SVarDecl(_, value, _) | ast.STypedDecl(_, _, value, _) -> [value]
+    ast.SVarDecl(_, value, _, _) | ast.STypedDecl(_, _, value, _, _) -> [value]
     ast.SAssign(target, value) -> [target, value]
     ast.SReturn(value) -> option.values([value])
     ast.SEcho(e) | ast.SAssert(e, _) | ast.SPanic(e) | ast.SExpr(e) | ast.SAsync(e) -> [
@@ -354,11 +360,11 @@ fn stmt_exprs(s: ast.Stmt) -> List(ast.Expr) {
 
 fn check_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
   case s {
-    ast.SVarDecl(name, value, mutable) -> {
+    ast.SVarDecl(name, value, mutable, _) -> {
       use _ <- result.try(check_binding_value(env, name, value, mutable))
       Ok(record_binding(forget(env, [name]), name, value))
     }
-    ast.STypedDecl(typ, name, value, mutable) -> {
+    ast.STypedDecl(typ, name, value, mutable, _) -> {
       use _ <- result.try(check_binding_value(env, name, value, mutable))
       use _ <- result.try(check_fits(env, typ, value, "`" <> name <> "`"))
       let env2 = record_binding(forget(env, [name]), name, value)
@@ -534,8 +540,8 @@ fn counter_ge0(
   body: List(ast.Stmt),
 ) -> List(Fact) {
   case init {
-    Some(ast.SVarDecl(name, ast.EInt(start), _))
-    | Some(ast.STypedDecl(_, name, ast.EInt(start), _)) if start >= 0 ->
+    Some(ast.SVarDecl(name, ast.EInt(start), _, _))
+    | Some(ast.STypedDecl(_, name, ast.EInt(start), _, _)) if start >= 0 ->
       case list.contains(mutated_in(body), name), post_keeps_nonneg(post, name) {
         False, True -> [Ge0(name)]
         _, _ -> []
@@ -575,7 +581,7 @@ fn check_expr(env: Env, e: ast.Expr) -> Result(Nil, String) {
     ast.ESlice(target, low, high) -> {
       use _ <- result.try(check_expr(env, target))
       use _ <- result.try(check_exprs(env, option.values([low, high])))
-      check_slice(env, target, low, high)
+      check_slice(env, "slice", target, low, high)
     }
     // `&&` short-circuits, so the right operand is evaluated only when the left
     // is true: its facts hold while checking the right. `||` is the mirror —
@@ -604,6 +610,7 @@ fn check_expr(env: Env, e: ast.Expr) -> Result(Nil, String) {
         True -> check_value_escape(env, e)
         False -> Ok(Nil)
       })
+      use _ <- result.try(check_drop(env, callee, args))
       check_arg_lengths(env, callee, args)
     }
     ast.EMember(target, _) -> check_expr(env, target)
@@ -654,7 +661,7 @@ fn check_lvalue(env: Env, target: ast.Expr) -> Result(Nil, String) {
     ast.ESlice(t, low, high) -> {
       use _ <- result.try(check_lvalue(env, t))
       use _ <- result.try(check_exprs(env, option.values([low, high])))
-      check_slice(env, t, low, high)
+      check_slice(env, "slice", t, low, high)
     }
     ast.EMember(t, _) -> check_lvalue(env, t)
     _ -> Ok(Nil)
@@ -1066,6 +1073,7 @@ fn check_index(env: Env, target: ast.Expr, idx: ast.Expr) -> Result(Nil, String)
 
 fn check_slice(
   env: Env,
+  what: String,
   target: ast.Expr,
   low: Option(ast.Expr),
   high: Option(ast.Expr),
@@ -1081,7 +1089,9 @@ fn check_slice(
         True -> Ok(Nil)
         False ->
           Error(
-            "cannot prove the low bound of this slice on `"
+            "cannot prove the low bound of this "
+            <> what
+            <> " on `"
             <> describe(target)
             <> "` is in range (needs `low >= 0` and `low <= len(...)`)",
           )
@@ -1096,7 +1106,9 @@ fn check_slice(
         True -> Ok(Nil)
         False ->
           Error(
-            "cannot prove the high bound of this slice on `"
+            "cannot prove the high bound of this "
+            <> what
+            <> " on `"
             <> describe(target)
             <> "` is in range (needs `high >= 0` and `high < len(...)`)",
           )
@@ -1109,11 +1121,33 @@ fn check_slice(
         True -> Ok(Nil)
         False ->
           Error(
-            "cannot prove this slice's bounds don't cross on `"
+            "cannot prove this "
+            <> what
+            <> "'s bounds don't cross on `"
             <> describe(target)
             <> "` (needs `low <= high + 1`)",
           )
       }
+    _, _ -> Ok(Nil)
+  }
+}
+
+// `drop(v, low, high)` takes the elements from `low` to `high` out of `v` and
+// hands them back. Those are a slice's two bounds, inclusive at both ends the way
+// a slice's are, so they are held to a slice's rule by running a slice's check —
+// there is no second notion of "in range" to get subtly wrong.
+//
+// A call with the wrong number of arguments has already been rejected by the
+// validation pass; here it simply has no bounds to check.
+fn check_drop(
+  env: Env,
+  callee: ast.Expr,
+  args: List(ast.Arg),
+) -> Result(Nil, String) {
+  case callee, args {
+    ast.EMember(ast.EIdent("hive"), "drop"),
+      [ast.Arg(_, target), ast.Arg(_, low), ast.Arg(_, high)]
+    -> check_slice(env, "`drop`", target, Some(low), Some(high))
     _, _ -> Ok(Nil)
   }
 }
@@ -1228,9 +1262,16 @@ fn has_lt_len_lit(env: Env, k: Int, vec: Option(String)) -> Bool {
 
 // The same monotonicity for `k <= len(v)` (a slice's low bound): any known
 // literal bound `m >= k`, strict or not, implies `k <= len(v)`.
+//
+// Zero needs no fact at all: a vector's length is never negative, so `0 <=
+// len(v)` holds for every vector there is. It is the low bound of `v[0:h]` and of
+// `drop(v, 0, h)`, and reporting it as unproven would send the reader looking for
+// a guard against the one thing that cannot go wrong — the high bound is what
+// those still have to prove.
 fn has_le_len_lit(env: Env, k: Int, vec: Option(String)) -> Bool {
   case vec {
     _ if k < 0 -> False
+    _ if k == 0 -> True
     None -> False
     Some(v) ->
       list.any(env.facts, fn(f) {
@@ -1761,6 +1802,14 @@ fn mutated_in(stmts: List(ast.Stmt)) -> List(String) {
 }
 
 fn mutated_in_stmt(s: ast.Stmt) -> List(String) {
+  // A `drop` writes through the vector it names from wherever it is written, not
+  // only from a statement of its own, so it is collected by walking rather than
+  // by matching a statement shape.
+  let dropped = shrunk_roots(s)
+  list.append(dropped, mutated_in_stmt_shape(s))
+}
+
+fn mutated_in_stmt_shape(s: ast.Stmt) -> List(String) {
   case s {
     ast.SAssign(target, _) ->
       case assign_root(target) {
@@ -1769,6 +1818,10 @@ fn mutated_in_stmt(s: ast.Stmt) -> List(String) {
       }
     ast.SExpr(ast.ECall(
       ast.EMember(ast.EIdent("hive"), "append"),
+      [ast.Arg(_, target), ..],
+    ))
+    | ast.SExpr(ast.ECall(
+      ast.EMember(ast.EIdent("hive"), "prepend"),
       [ast.Arg(_, target), ..],
     )) ->
       case assign_root(target) {

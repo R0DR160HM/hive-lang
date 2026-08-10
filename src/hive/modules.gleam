@@ -532,14 +532,17 @@ fn rewrite_stmt(
   locals: List(String),
 ) -> Result(#(ast.Stmt, List(String)), String) {
   case stmt {
-    ast.SVarDecl(name, value, mutable) -> {
+    ast.SVarDecl(name, value, mutable, deferred) -> {
       use value <- result.try(rewrite_expr(rw, value, locals))
-      Ok(#(ast.SVarDecl(name, value, mutable), [name, ..locals]))
+      Ok(#(ast.SVarDecl(name, value, mutable, deferred), [name, ..locals]))
     }
-    ast.STypedDecl(typ, name, value, mutable) -> {
+    ast.STypedDecl(typ, name, value, mutable, deferred) -> {
       use typ <- result.try(rewrite_type(rw, typ))
       use value <- result.try(rewrite_expr(rw, value, locals))
-      Ok(#(ast.STypedDecl(typ, name, value, mutable), [name, ..locals]))
+      Ok(#(
+        ast.STypedDecl(typ, name, value, mutable, deferred),
+        [name, ..locals],
+      ))
     }
     ast.SAssign(target, value) -> {
       use target <- result.try(rewrite_expr(rw, target, locals))

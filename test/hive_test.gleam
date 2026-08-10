@@ -660,6 +660,138 @@ pub fn append_on_immutable_is_rejected_test() {
   should.be_error(result)
 }
 
+pub fn prepend_puts_a_value_at_the_front_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tmut Str[dyn] v = [\"b\"]\n\tprepend(v, \"a\")\n\techo v\n}\n",
+    )
+  // The vector's *address* is what crosses, so the new header lands on the
+  // caller's own variable — no reassignment to write back.
+  should.be_true(string.contains(go, "hive.Prepend(&v, \"a\")"))
+}
+
+pub fn prepend_takes_a_mutex_parameter_straight_on_test() {
+  let go =
+    compile(
+      "proc push(v: mut Str[dyn], entry: Str): void {\n\tprepend(v, entry)\n}\nproc main(): void {\n\tmut Str[dyn] q = [\"b\"]\n\tpush(q, \"a\")\n\techo q\n}\n",
+    )
+  // A mutex parameter is already a pointer; pointing at what it points at would
+  // only spell it the long way.
+  should.be_true(string.contains(go, "hive.Prepend(v, entry)"))
+}
+
+pub fn prepend_needs_a_mutable_dynamic_vector_test() {
+  let assert Error(immutable) =
+    compiler.compile(
+      "proc main(): void {\n\tStr[dyn] v = [\"b\"]\n\tprepend(v, \"a\")\n}\n",
+    )
+  should.be_true(string.contains(immutable, "`prepend` requires a mutable vector"))
+
+  let assert Error(inferred) =
+    compiler.compile(
+      "proc main(): void {\n\tmut v := [\"b\"]\n\tprepend(v, \"a\")\n}\n",
+    )
+  should.be_true(string.contains(inferred, "requires a dynamic vector"))
+}
+
+// It changes the vector you gave it; there is nothing left over to be a value.
+pub fn prepend_has_no_value_test() {
+  let assert Error(bound) =
+    compiler.compile(
+      "proc main(): void {\n\tmut Str[dyn] v = [\"b\"]\n\tx := prepend(v, \"a\")\n\techo x\n}\n",
+    )
+  should.be_true(string.contains(bound, "`prepend` answers with nothing"))
+
+  let assert Error(echoed) =
+    compiler.compile(
+      "proc main(): void {\n\tmut Str[dyn] v = [\"b\"]\n\techo prepend(v, \"a\")\n}\n",
+    )
+  should.be_true(string.contains(echoed, "answers with nothing"))
+}
+
+pub fn prepend_takes_exactly_one_value_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {\n\tmut Str[dyn] v = [\"c\"]\n\tprepend(v, \"a\", \"b\")\n}\n",
+    )
+  should.be_true(string.contains(msg, "so two arguments"))
+}
+
+pub fn drop_removes_an_inclusive_range_and_hands_it_back_test() {
+  let go =
+    compile(
+      "proc main(): void {\n\tmut Str[dyn] v = [\"a\", \"b\", \"c\"]\n\tif 1 < len(v) {\n\t\ttaken := drop(v, 0, 1)\n\t\techo taken\n\t}\n\techo v\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.Drop(&v, 0, 1)"))
+}
+
+pub fn drop_is_also_a_statement_test() {
+  // Discarding what it removed is a perfectly good reason to call it.
+  let go =
+    compile(
+      "proc main(): void {\n\tmut Str[dyn] v = [\"a\", \"b\"]\n\tif 0 < len(v) {\n\t\tdrop(v, 0, 0)\n\t}\n\techo v\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.Drop(&v, 0, 0)"))
+}
+
+// The forms that spawn through a *closure* — an `async` binding, an await-all, a
+// bounded call — evaluate their arguments on the new thread unless those are
+// hoisted, and a `drop` there would be rearranging the caller's own vector while
+// the caller carries on through it. That is a real data race (Go's detector says
+// so), and it is the one the copy-on-`async` rule exists to rule out.
+pub fn a_drop_inside_a_spawned_call_runs_in_the_caller_test() {
+  let prog = fn(body) {
+    "func count(v: Str[dyn]): Int {\n\treturn len(v)\n}\nproc main(): void {\n\tmut Str[dyn] v = [\"a\", \"b\"]\n\tif 0 < len(v) {\n"
+    <> body
+    <> "\t}\n\techo v\n}\n"
+  }
+  // The `drop` is bound in the caller, and only the count crosses.
+  let deferred = compile(prog("\t\tn := async count(drop(v, 0, 0))\n\t\techo n\n"))
+  should.be_true(string.contains(
+    deferred,
+    "_a0 := hive.Drop(&v, 0, 0); return hive.Spawn(",
+  ))
+  let barrier = compile(prog("\t\techo len(await [count(drop(v, 0, 0))])\n"))
+  should.be_true(string.contains(
+    barrier,
+    "_a0 := hive.Drop(&v, 0, 0); return hive.Spawn(",
+  ))
+  // The statement form is hoisted too, though there Go would have evaluated the
+  // argument in the calling goroutine anyway — a `go` statement's arguments always
+  // are. Keeping the shape uniform costs a block and nothing else.
+  let statement = compile(prog("\t\tasync count(drop(v, 0, 0))\n"))
+  should.be_true(string.contains(
+    statement,
+    "{ _a0 := hive.Drop(&v, 0, 0); go count(_a0) }",
+  ))
+}
+
+pub fn drop_needs_a_mutable_dynamic_vector_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {\n\tStr[dyn] v = [\"a\"]\n\tif 0 < len(v) {\n\t\techo drop(v, 0, 0)\n\t}\n}\n",
+    )
+  should.be_true(string.contains(msg, "`drop` requires a mutable vector"))
+}
+
+// A query body holds no statements, so the rule is enforced over its expressions
+// directly. It has only parameters, and a parameter is never mutable.
+pub fn a_query_body_cannot_write_through_a_vector_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "type User {\n\tid: Int\n\tname: Str\n}\nquery byName(names: Str[dyn]): User[dyn] {\n\tSELECT id, name FROM users WHERE name = {drop(names, 0, 0)}\n}\nproc main(): void {\n\techo \"x\"\n}\n",
+    )
+  should.be_true(string.contains(msg, "`drop` requires a mutable vector"))
+}
+
+pub fn drop_takes_both_bounds_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "proc main(): void {\n\tmut Str[dyn] v = [\"a\"]\n\techo drop(v, 0)\n}\n",
+    )
+  should.be_true(string.contains(msg, "so three arguments"))
+}
+
 pub fn join_lowers_to_runtime_test() {
   let go =
     compile(
@@ -742,12 +874,24 @@ pub fn async_is_not_a_declaration_modifier_test() {
   should.be_true(string.contains(msg, "`async` is not part of a declaration"))
 }
 
-pub fn async_has_no_value_test() {
+pub fn async_has_no_value_inside_an_expression_test() {
+  // Bound to a name it keeps its result (see the deferred-binding tests); inside
+  // a larger expression the value is wanted right there, which is a plain call.
   let assert Error(msg) =
     compiler.compile(
-      "func work(): Str {\n\treturn \"x\"\n}\nproc main(): void {\n\th := async work()\n\techo h\n}\n",
+      "func work(): Str {\n\treturn \"x\"\n}\nproc main(): void {\n\techo len(async work())\n}\n",
     )
-  should.be_true(string.contains(msg, "`async` has no value"))
+  should.be_true(string.contains(msg, "`async` has no value of its own"))
+}
+
+pub fn async_is_not_a_value_to_assign_test() {
+  // Reassignment is not a declaration: there is storage on the left already, and
+  // an `async` binding is not storage.
+  let assert Error(msg) =
+    compiler.compile(
+      "func work(): Str {\n\treturn \"x\"\n}\nproc main(): void {\n\tmut h := \"a\"\n\th = async work()\n\techo h\n}\n",
+    )
+  should.be_true(string.contains(msg, "`async` has no value of its own"))
 }
 
 pub fn async_takes_a_call_test() {
@@ -2914,6 +3058,21 @@ pub fn syslink_awaited_send_is_a_request_test() {
   string.contains(go, "hive.SyslinkAwait(") |> should.be_true
 }
 
+// Bound to a name, the request goes out now and the answer is waited for wherever
+// the name is read — the third thing a send's call site can say.
+pub fn syslink_deferred_send_is_a_request_waited_for_later_test() {
+  let assert Ok(go) =
+    compiler.compile(
+      service_prelude
+      <> "proc main(): void {\n\tb := hive.syslink.spawn(box, 0)\n\tr := async b(Op.Count())\n\techo \"sent\"\n\tif r is Result.Ok(reply) {\n\t\tif reply is Op.Put(k) {\n\t\t\techo k\n\t\t}\n\t}\n}\n",
+    )
+  // Registered for a reply, like any request — and the waiting happens on the
+  // task's own thread, so the caller reaches the `echo` without blocking.
+  string.contains(go, "hive.SyslinkSendAwaitable(") |> should.be_true
+  string.contains(go, "_task_r := hive.Spawn(") |> should.be_true
+  string.contains(go, "_task_r.Await()") |> should.be_true
+}
+
 // The wait can be bounded, and running out of patience folds into syslink's own
 // error rather than wrapping a second Result around the first.
 pub fn syslink_held_request_compiles_test() {
@@ -3384,6 +3543,59 @@ pub fn slice_high_bound_out_of_range_is_rejected_test() {
   // `v` has length 2; the inclusive high bound 5 is out of range.
   compiler.compile(
     "proc main(): void {\n\tv := [\"a\", \"b\"]\n\techo v[0:5]\n}\n",
+  )
+  |> should.be_error
+}
+
+pub fn a_low_bound_of_zero_needs_no_proof_test() {
+  // A vector's length is never negative, so `0 <= len(v)` holds for every vector
+  // there is. Only the high bound of `v[0:]` is left to prove, and an omitted one
+  // is the last index.
+  compiler.compile(
+    "func f(v: Str[dyn]): Str[dyn] {\n\treturn v[0:]\n}\nproc main(): void {}\n",
+  )
+  |> should.be_ok
+}
+
+// --- `drop` is bounded exactly as a slice is ---
+
+pub fn drop_bounds_are_checked_like_a_slices_test() {
+  let prog = fn(body) {
+    "proc main(): void {\n\tmut Str[dyn] v = [\"a\", \"b\", \"c\"]\n" <> body <> "}\n"
+  }
+  // Guarded, the high bound is proven and the low bound of 0 needs no proof.
+  compiler.compile(prog(
+    "\tif 1 < len(v) {\n\t\techo drop(v, 0, 1)\n\t}\n",
+  ))
+  |> should.be_ok
+  // Unguarded, it is the same rejection a slice would get.
+  let assert Error(msg) = compiler.compile(prog("\techo drop(v, 0, 1)\n"))
+  should.be_true(string.contains(msg, "high bound of this `drop`"))
+}
+
+pub fn drop_costs_the_vector_what_was_proven_about_it_test() {
+  // This is the one builtin that makes a vector *shorter*, so a position proven
+  // in range before it is not in range after — whether the call was a statement
+  // or the value of a binding.
+  let assert Error(statement) =
+    compiler.compile(
+      "proc main(): void {\n\tmut Str[dyn] v = [\"a\", \"b\"]\n\tif 1 < len(v) {\n\t\tdrop(v, 0, 0)\n\t\techo v[1]\n\t}\n}\n",
+    )
+  should.be_true(string.contains(statement, "cannot prove index 1"))
+
+  let assert Error(bound) =
+    compiler.compile(
+      "proc main(): void {\n\tmut Str[dyn] v = [\"a\", \"b\"]\n\tif 1 < len(v) {\n\t\ttaken := drop(v, 0, 0)\n\t\techo taken\n\t\techo v[1]\n\t}\n}\n",
+    )
+  should.be_true(string.contains(bound, "cannot prove index 1"))
+}
+
+pub fn what_drop_hands_back_has_no_known_length_test() {
+  // How many elements came out depends on bounds that are not always literals, so
+  // the result promises nothing — every index into it is guarded like any other
+  // dynamic vector's.
+  compiler.compile(
+    "proc main(): void {\n\tmut Str[dyn] v = [\"a\", \"b\"]\n\tif 1 < len(v) {\n\t\ttaken := drop(v, 0, 1)\n\t\techo taken[0]\n\t}\n}\n",
   )
   |> should.be_error
 }
@@ -3973,8 +4185,8 @@ pub fn a_single_call_needs_no_await_test() {
   should.be_true(string.contains(msg, "takes a list of calls"))
 }
 
-// Differently-typed work is waited for one call at a time, and each of those is
-// an ordinary blocking call — nothing left to name, nothing left to leak.
+// Written plainly, differently-typed calls are waited for one at a time: each is
+// an ordinary blocking call and nothing is scheduled.
 pub fn differently_typed_calls_are_waited_for_in_sequence_test() {
   let go =
     compile(async_prog(
@@ -3985,14 +4197,195 @@ pub fn differently_typed_calls_are_waited_for_in_sequence_test() {
   should.be_false(string.contains(go, "hive.Spawn"))
 }
 
+// ---------------------------------------------------------------------------
+// Concurrency: `x := async f()`, the binding that waits where it is read
+// ---------------------------------------------------------------------------
+
+pub fn deferred_binding_starts_the_call_and_waits_at_the_read_test() {
+  let go = compile(async_prog("\tx := async slowShout(\"a\")\n\techo x\n"))
+  // Started here, like any spawned call...
+  should.be_true(string.contains(
+    go,
+    "_task_x := hive.Spawn(func() string { return slowShout(\"a\") })",
+  ))
+  // ...and the name is a read through the task, not a variable of its own.
+  should.be_true(string.contains(go, "fmt.Println(_task_x.Await())"))
+  should.be_false(string.contains(go, "\tx := "))
+}
+
+// The binding's type is the call's return type with nothing wrapped around it:
+// there is no handle in the language, so an annotation names the plain type and a
+// read needs no unwrapping.
+pub fn deferred_binding_has_the_calls_own_type_test() {
+  let go =
+    compile(async_prog(
+      "\tStr s = async slowShout(\"a\")\n\tInt n = async lengthOf(\"bb\")\n\techo s + \"!\"\n\techo n + 1\n",
+    ))
+  should.be_true(string.contains(
+    go,
+    "_task_s := hive.Spawn(func() string { return slowShout(\"a\") })",
+  ))
+  should.be_true(string.contains(go, "(_task_s.Await() + \"!\")"))
+  should.be_true(string.contains(go, "(_task_n.Await() + 1)"))
+}
+
+// The gap the await-all cannot close: one barrier resolves to one vector, and a
+// vector holds one type. Two bindings are two threads, whatever they answer with.
+pub fn deferred_bindings_run_differently_typed_work_at_once_test() {
+  let go =
+    compile(async_prog(
+      "\ts := async slowShout(\"a\")\n\tn := async lengthOf(\"bb\")\n\techo s\n\techo n\n",
+    ))
+  let assert Ok(#(before, _)) = string.split_once(go, "_task_s.Await()")
+  // Both are started before either is waited for.
+  should.be_true(string.contains(before, "_task_s := hive.Spawn("))
+  should.be_true(string.contains(before, "_task_n := hive.Spawn("))
+}
+
+// `Await` blocks once and answers the same value ever after, so reading the name
+// again costs nothing and cannot see a different value.
+pub fn a_deferred_binding_may_be_read_more_than_once_test() {
+  let go =
+    compile(async_prog("\tx := async slowShout(\"a\")\n\techo x\n\techo x + x\n"))
+  should.be_true(string.contains(go, "fmt.Println(_task_x.Await())"))
+  should.be_true(string.contains(
+    go,
+    "fmt.Println((_task_x.Await() + _task_x.Await()))",
+  ))
+}
+
+// A binding whose value feeds another one waits on the *second* thread, not in the
+// caller: two threads, one dependency, and nothing blocking where they were
+// written.
+pub fn a_deferred_binding_may_feed_another_test() {
+  let go =
+    compile(async_prog(
+      "\ts := async slowShout(\"a\")\n\tn := async lengthOf(s)\n\techo n\n",
+    ))
+  should.be_true(string.contains(
+    go,
+    "_task_n := hive.Spawn(func() int { return lengthOf(_task_s.Await()) })",
+  ))
+}
+
+// The thread was started, so the work happens; the name simply nobody reads. That
+// is `async` on its own, arrived at from the other direction.
+pub fn an_unread_deferred_binding_still_runs_test() {
+  let go = compile(async_prog("\tx := async slowShout(\"a\")\n\techo \"done\"\n"))
+  should.be_true(string.contains(go, "_task_x := hive.Spawn("))
+  should.be_true(string.contains(go, "_ = _task_x"))
+}
+
+// Step 90's rule, unchanged: a thread of its own gets storage of its own, whether
+// the call's result is kept or not.
+pub fn a_deferred_binding_copies_a_mutex_argument_test() {
+  let go =
+    compile(
+      "proc grow(log: mut Str[dyn], entry: Str): Int {\n\tappend(log, entry)\n\treturn len(log)\n}\nproc main(): void {\n\tmut Str[dyn] log = [\"a\"]\n\tn := async grow(log, \"b\")\n\techo n\n\techo len(log)\n}\n",
+    )
+  // The copy is bound in the caller and the task is handed *its* address.
+  should.be_true(string.contains(go, "_a0 := hive.CloneVec(log)"))
+  should.be_true(string.contains(go, "grow(&_a0, \"b\")"))
+}
+
+pub fn a_deferred_binding_is_never_mutable_test() {
+  let assert Error(msg) =
+    compiler.compile(async_prog("\tmut x := async slowShout(\"a\")\n\techo x\n"))
+  should.be_true(string.contains(msg, "`mut` and `async` cannot be combined"))
+
+  let assert Error(annotated) =
+    compiler.compile(async_prog(
+      "\tmut Str x = async slowShout(\"a\")\n\techo x\n",
+    ))
+  should.be_true(string.contains(annotated, "cannot be combined"))
+}
+
+// Nothing arrives from a `void` call, and the statement for starting one without
+// waiting already exists.
+pub fn a_deferred_binding_needs_a_value_to_wait_for_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "proc log(text: Str): void {\n\techo text\n}\nproc main(): void {\n\tx := async log(\"a\")\n\techo \"done\"\n}\n",
+    )
+  should.be_true(string.contains(msg, "`x` has nothing to hold"))
+  should.be_true(string.contains(msg, "answers with `void`"))
+}
+
+// A bound needs one moment to run from, and the wait has no fixed moment: it
+// happens wherever the name is read, which may be more than one place.
+pub fn a_deferred_binding_cannot_be_bounded_test() {
+  let assert Error(msg) =
+    compiler.compile(async_prog(
+      "\tx := async slowShout(\"a\") with timeout 500\n\techo x\n",
+    ))
+  should.be_true(string.contains(
+    msg,
+    "`with timeout` cannot bound an `async` binding",
+  ))
+}
+
+// What earns a thread is work that takes time. A call already finished by the time
+// it is written has nothing for the name to be waiting on.
+pub fn a_deferred_binding_rejects_calls_that_answer_immediately_test() {
+  let assert Error(builtin) =
+    compiler.compile(
+      "proc main(): void {\n\tv := [\"a\"]\n\tn := async len(v)\n\techo n\n}\n",
+    )
+  should.be_true(string.contains(builtin, "`len` answers immediately"))
+
+  let assert Error(ctor) =
+    compiler.compile(
+      "type Box {\n\tn: Int\n}\nproc main(): void {\n\tb := async Box(1)\n\techo b.n\n}\n",
+    )
+  should.be_true(string.contains(ctor, "is a constructor"))
+
+  let assert Error(result_ctor) =
+    compiler.compile(
+      "proc main(): void {\n\tr := async Result.Ok(1)\n\tif r is Result.Ok(n) {\n\t\techo n\n\t}\n}\n",
+    )
+  should.be_true(string.contains(result_ctor, "`Result.Ok` is a constructor"))
+
+  let assert Error(partial) =
+    compiler.compile(
+      "func add(a: Int, b: Int): Int {\n\treturn a + b\n}\nproc main(): void {\n\tg := async add(1, _)\n\techo g(2)\n}\n",
+    )
+  should.be_true(string.contains(partial, "makes this a partial application"))
+}
+
+pub fn a_deferred_binding_is_not_a_loop_clause_test() {
+  let assert Error(msg) =
+    compiler.compile(
+      "func f(): Int {\n\treturn 1\n}\nproc main(): void {\n\tfor i := async f(); i < 3; i++ {\n\t\techo i\n\t}\n}\n",
+    )
+  should.be_true(string.contains(
+    msg,
+    "an `async` binding cannot be a loop's init or post clause",
+  ))
+}
+
+// A vector arriving later is still a vector of the length its type promises, so
+// the bounds analysis holds every access into it to the same rule.
+pub fn a_deferred_vector_keeps_its_length_test() {
+  compiler.compile(
+    "func rows(): Str[3] {\n\treturn [\"a\", \"b\", \"c\"]\n}\nproc main(): void {\n\tv := async rows()\n\techo v[2]\n}\n",
+  )
+  |> should.be_ok
+  compiler.compile(
+    "func rows(): Str[3] {\n\treturn [\"a\", \"b\", \"c\"]\n}\nproc main(): void {\n\tv := async rows()\n\techo v[3]\n}\n",
+  )
+  |> should.be_error
+}
+
 // Every concurrent form together, to keep the surface honest about what compiles.
 pub fn every_concurrent_form_still_compiles_test() {
   compiler.compile(async_prog(
     "\tasync slowShout(\"a\")\n"
     <> "\techo slowShout(\"b\")\n"
+    <> "\tc := async slowShout(\"c\")\n"
     <> "\techo len(await [slowShout(\"d\"), slowShout(\"e\")])\n"
     <> "\tif slowShout(\"f\") with timeout 1000 is Result.Ok(v) {\n\t\techo v\n\t}\n"
-    <> "\tif await [slowShout(\"g\")] with timeout 1000 is Result.Ok(all) {\n\t\techo len(all)\n\t}\n",
+    <> "\tif await [slowShout(\"g\")] with timeout 1000 is Result.Ok(all) {\n\t\techo len(all)\n\t}\n"
+    <> "\techo c\n",
   ))
   |> should.be_ok
 }
@@ -5576,6 +5969,22 @@ proc main(): void {
   should.be_true(string.contains(go, "len_(\"x\", 2)"))
   should.be_true(string.contains(go, "fmt.Println(len(v))"))
   should.be_true(string.contains(go, "hive.Join(v, \"-\")"))
+}
+
+// `drop` and `prepend` are words a program may well want, so the rule that a
+// declaration of your own wins has to hold for them too — and the long name has
+// to keep reaching the builtin.
+pub fn the_vector_writers_can_be_taken_over_test() {
+  let go =
+    compile(
+      "func drop(what: Str): Str {\n\treturn \"dropped {what}\"\n}\nproc prepend(label: Str): void {\n\techo label\n}\nproc main(): void {\n\tmut Str[dyn] v = [\"b\"]\n\techo drop(\"the ball\")\n\tprepend(\"a label\")\n\thive.prepend(v, \"a\")\n\tif 0 < len(v) {\n\t\techo hive.drop(v, 0, 0)\n\t}\n}\n",
+    )
+  // Theirs are ordinary calls...
+  should.be_true(string.contains(go, "drop(\"the ball\")"))
+  should.be_true(string.contains(go, "prepend(\"a label\")"))
+  // ...and the builtins are still there under `hive.`.
+  should.be_true(string.contains(go, "hive.Prepend(&v, \"a\")"))
+  should.be_true(string.contains(go, "hive.Drop(&v, 0, 0)"))
 }
 
 pub fn a_local_wins_over_a_builtin_test() {

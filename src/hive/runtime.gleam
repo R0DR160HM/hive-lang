@@ -435,6 +435,35 @@ func CloneTable(t Table) Table {
 	return CloneVecFn(t, CloneVec[string])
 }
 
+// Prepend puts value at the front of the vector the pointer names (`prepend`).
+// It takes the vector's *address* for the same reason the generated code
+// reassigns after `append`: growing a slice returns a new header, and the caller
+// has to end up holding that one. The elements move, so it costs the length of
+// the vector — the price of the front, where append pays nothing for the back.
+func Prepend[T any](v *[]T, value T) {
+	out := make([]T, 0, len(*v)+1)
+	out = append(out, value)
+	*v = append(out, (*v)...)
+}
+
+// Drop removes the elements from low to high — inclusive of both, as every
+// bound in Hive is — from the vector the pointer names, and returns them
+// (`drop`). The bounds are proven in range at compile time (see hive/bounds),
+// exactly as a slice's are; crossed bounds take nothing and hand back an empty
+// vector, which is what the equivalent slice would have been.
+//
+// The removed elements are copied out before the gap is closed, since closing it
+// writes over them.
+func Drop[T any](v *[]T, low, high int) []T {
+	if high < low {
+		return []T{}
+	}
+	out := make([]T, high-low+1)
+	copy(out, (*v)[low:high+1])
+	*v = append((*v)[:low], (*v)[high+1:]...)
+	return out
+}
+
 // ---------------------------------------------------------------------------
 // Concurrency: running a call on its own goroutine
 // ---------------------------------------------------------------------------

@@ -6,13 +6,15 @@
 //
 //   f(x)                       wait for it, yields T
 //   async f(x)   (a statement) fire-and-forget: its own thread, no result
+//   x := async f(a)            its own thread, and the wait moves to `x`
 //   f(x) with timeout 500      wait at most 500ms, yields Result<T, _>
 //   await [f(a), f(b)]         run both at once, wait for both, yields T[2]
 //
-// `async` has no value: it starts the call and keeps nothing, so there is no
-// handle to hold, to pass, or to leak out of the scope that spawned it. Which is
-// why the language needs no type for one — every expression here has a type you
-// could write down.
+// None of these has a Future in it. `async f(x)` on its own keeps nothing, so
+// there is nothing to hold; given a name, what the name holds is the call's own
+// return type — `Str`, not a promise of one — and reading it is what waits. So
+// every expression here has a type you could write down, and there is nowhere to
+// forget an `.await`.
 
 // Two ordinary funcs. Being funcs they can perform I/O but take no mutex.
 func slowShout(text: Str): Str {
@@ -20,7 +22,10 @@ func slowShout(text: Str): Str {
 	return text + "!!!"
 }
 
-func lengthOf(text: Str): Int {
+// A second slow func, answering with a *different* type — the shape the named
+// `async` binding exists for.
+func slowCount(text: Str): Int {
+	hive.task.sleep(1000)
 	return len(text)
 }
 
@@ -33,7 +38,21 @@ proc main(): void {
 	// goroutine nor a channel: it is a function call.
 	echo slowShout("blocking")
 
-	// 3. Many at once: the await-all. Every call in the list starts, then the
+	// 3. The middle way: give the call a name. `x := async f(a)` starts it on its
+	// own thread exactly as the statement does, and *keeps* the result — the wait
+	// happens wherever `x` is read, and only if the call has not finished by then.
+	// Between a plain call (which always waits) and `async` (which never does).
+	held := async slowShout("started early")
+	echo "main carried on"          // the shout has a second to run in
+	echo held                       // waits here for whatever is left of it
+	echo len(held)                  // free: the value is in hand now
+
+	// `held` is a plain `Str`. There is no handle type in the language, nothing to
+	// unwrap, and no way to forget to — and a second read cannot answer with
+	// anything else. A name nothing ever reads is `async` on its own, arrived at
+	// from the other direction: the work runs, the result is dropped.
+
+	// 4. Many at once: the await-all. Every call in the list starts, then the
 	// whole list is one barrier resolving in order into a statically-sized,
 	// fully-typed vector (`Str[3]`) — never a dynamic or `Any` vector. All three
 	// sleep for a second, and this takes about one.
@@ -44,19 +63,20 @@ proc main(): void {
 	Str[1] alone = await [slowShout("just me")]
 	echo alone[0]
 
-	// 4. Void calls are waited for the same way. There is no value, so the
+	// 5. Void calls are waited for the same way. There is no value, so the
 	// barrier has none either — it is a statement meaning "both of these, then
 	// carry on".
 	await [note("first"), note("second")]
 
-	// 5. Work of *different* types is waited for one call at a time. Each is an
-	// ordinary blocking call, so this costs the sum rather than the slowest —
-	// which is exactly what the writing says it does.
-	Str message = slowShout("mixed")
-	Int count = lengthOf("mixed")
+	// 6. Work of *different* types. One barrier resolves to one vector and a
+	// vector holds one type, so an await-all cannot mix them — names can. Two
+	// threads, two types, and each waited for where its own name is read, so this
+	// takes about a second rather than two.
+	Str message = async slowShout("mixed")
+	Int count = async slowCount("mixed")
 	echo message + " has base length " + hive.conv.its(count)
 
-	// 6. Bounding a wait. `with timeout <ms>` may follow any call, and it changes
+	// 7. Bounding a wait. `with timeout <ms>` may follow any call, and it changes
 	// what the call yields: without it the value, with it a `Result` — running
 	// out of patience is a value to handle, not a crash.
 	if slowShout("worth waiting for") with timeout 100 is Result.Error(err) {
@@ -78,7 +98,7 @@ proc main(): void {
 		echo join(done, " / ")
 	}
 
-	// 7. A mutex parameter, and the one place the call site changes what an
+	// 8. A mutex parameter, and the one place the call site changes what an
 	// argument *is*. `collect` asks for the vector itself (`log: mut Str[dyn]`),
 	// not a view of it, so it can append to storage its caller keeps reading.
 	mut Str[dyn] log = ["start"]
@@ -89,7 +109,8 @@ proc main(): void {
 
 	// Fired off, it is not. A thread of its own gets storage of its own — the
 	// copy is made here, before the thread starts, so there is no moment where
-	// both sides could write the same array. `log` never sees "fired".
+	// both sides could write the same array. `log` never sees "fired". Keeping the
+	// call's result would change nothing about this: what decides is the thread.
 	async collect(log, "fired")
 	hive.task.sleep(400)
 	echo log
