@@ -18,6 +18,7 @@ organised by feature rather than by lesson.
 ```
 hive build <entrypoint.hive>   # compile to a native executable
 hive run   <entrypoint.hive>   # compile and run
+hive test  <entrypoint.hive>   # run the program's tests, with coverage
 hive check <entrypoint.hive>   # report any errors, without building anything
 hive emit  <entrypoint.hive>   # print the generated Go (handy for debugging)
 ```
