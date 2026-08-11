@@ -1,0 +1,800 @@
+// Tests for the shooter
+// =====================
+// A multiplayer game is the last place you would expect to be able to test
+// anything without running it, and that is exactly what the split in `fps.hive`
+// buys: walking, falling, aiming, hitting and the roster gossip are all `func`s of
+// the state, so every one of them can be called here — with no window, no mouse,
+// no browser and no second machine.
+//
+// What cannot be called is `update`, and that is deliberate: it is a handler, an
+// envelope is opaque, and one only ever arrives as a handler's own argument. So
+// everything it decides lives in the funcs below it, and this file is the proof
+// that this was worth doing.
+//
+//   hive test fps.test.hive
+
+import ./fps
+import hive.ui
+import hive.math
+
+// A player standing still in open ground, facing down -Z (which is where yaw 0
+// looks), with nobody else about.
+//
+// The spot matters and is worth saying why: the middle of the arena is a block, so
+// a player at the origin would be *inside* it — unable to walk, unable to jump
+// without hitting their head, and unable to shoot anything but the block they are
+// standing in. Every test below reads better from somewhere there is room.
+func still(): fps.Model {
+	mut fps.Model model = fps.start("127.0.0.1:9200", "")
+	model.screen = fps.Screen.Arena()
+	model.body = fps.Body(10.0, 0.0, 8.0, 0.0, 0.0, 0.0, 100)
+	return model
+}
+
+// A second of walking, one real frame at a time. Nothing steps a player 6 metres
+// at once — `stepped` caps a frame at a twentieth of a second — and a test that
+// did would be testing something the game never does.
+func walking(model: fps.Model, seconds: Float): fps.Body {
+	mut fps.Model moving = model
+	mut fps.Body body = model.body
+	frames := hive.conv.round(seconds * 60.0)
+	for i := 0; i < frames; i++ {
+		moving.body = body
+		body = fps.walked(moving, 1.0 / 60.0)
+	}
+	return body
+}
+
+func holding(model: fps.Model, keys: Str[]): fps.Model {
+	mut fps.Model next = model
+	mut Str[dyn] held = []
+	for each key in keys {
+		append(held, key)
+	}
+	next.held = held
+	return next
+}
+
+func standing(endpoint: Str, x: Float, z: Float): fps.Foe {
+	return fps.Foe(endpoint, "Bob", x, 0.0, z, 0.0, 100, 0)
+}
+
+func facing(model: fps.Model, yaw: Float, pitch: Float): fps.Model {
+	mut fps.Model next = model
+	next.body.yaw = yaw
+	next.body.pitch = pitch
+	return next
+}
+
+func joined(model: fps.Model, foes: fps.Foe[]): fps.Model {
+	mut fps.Model next = model
+	mut fps.Foe[dyn] others = []
+	for each foe in foes {
+		append(others, foe)
+	}
+	next.others = others
+	return next
+}
+
+// ---------------------------------------------------------------------------
+// Walking
+// ---------------------------------------------------------------------------
+
+// A second of W at yaw 0 goes to -Z and nowhere else. This is the one test that
+// pins the convention the whole file depends on: forward is where the eye points,
+// and at yaw 0 that is -Z.
+test "walking forward goes the way you are looking" {
+	from := still().body
+	after := walking(holding(still(), ["w"]), 1.0)
+	// A second at 6.4 metres a second, all of it towards -Z.
+	assert after.z < from.z - 6.0
+	assert after.z > from.z - 7.0
+	assert math.abs(after.x - from.x) < 0.001
+}
+
+test "a quarter turn to the right sends the same key east" {
+	// Yaw -pi/2 is a quarter turn clockwise seen from above, so forward is +X.
+	turned := facing(holding(still(), ["w"]), 0.0 - math.pi() / 2.0, 0.0)
+	after := walking(turned, 1.0)
+	assert after.x > still().body.x + 6.0
+	assert math.abs(after.z - still().body.z) < 0.001
+}
+
+test "strafing is sideways, not forwards" {
+	after := walking(holding(still(), ["d"]), 1.0)
+	assert after.x > still().body.x + 6.0
+	assert math.abs(after.z - still().body.z) < 0.001
+}
+
+// Two keys are one direction, not two speeds. Without normalising, a diagonal
+// would be 1.41 times as fast as a straight line — which is the oldest bug in
+// first-person movement.
+test "holding two keys does not make you faster" {
+	from := still().body
+	straight := walking(holding(still(), ["w"]), 1.0)
+	diagonal := walking(holding(still(), ["w", "d"]), 1.0)
+	far := math.hypot(straight.x - from.x, straight.z - from.z)
+	slant := math.hypot(diagonal.x - from.x, diagonal.z - from.z)
+	assert math.abs(far - slant) < 0.01
+}
+
+test "opposite keys cancel" {
+	from := still().body
+	after := walking(holding(still(), ["w", "s"]), 1.0)
+	assert math.hypot(after.x - from.x, after.z - from.z) < 0.001
+}
+
+test "a wall stops you, and does not stop you sliding along it" {
+	// The north wall's inner face is at z = -19.5, and a player is 0.36 wide.
+	mut fps.Model model = holding(still(), ["w"])
+	model.body.z = 0.0 - 16.0
+	after := walking(model, 2.0)
+	assert after.z > 0.0 - 19.2
+	assert after.z < 0.0 - 19.0
+
+	// The same wall, pressed into while walking east along it: the step across is
+	// given up on its own, so sliding along a wall works.
+	mut fps.Model against = model
+	against.body.z = after.z
+	sliding := walking(holding(against, ["w", "d"]), 1.0)
+	assert sliding.x > model.body.x + 3.0
+	assert sliding.z > 0.0 - 19.2
+}
+
+// ---------------------------------------------------------------------------
+// Falling and jumping
+// ---------------------------------------------------------------------------
+
+test "standing on the ground stays on the ground" {
+	after := fps.walked(still(), 0.1)
+	assert after.y == 0.0
+	assert after.fall == 0.0
+}
+
+test "space goes up, and gravity brings it back" {
+	up := fps.walked(holding(still(), ["space"]), 1.0 / 60.0)
+	assert up.y > 0.0
+	assert up.fall > 0.0
+
+	// Let go and give it two seconds: what goes up comes down to the floor and
+	// stops there.
+	mut fps.Model flying = still()
+	flying.body = up
+	falling := walking(flying, 2.0)
+	assert falling.y == 0.0
+	assert falling.fall == 0.0
+}
+
+test "a crate can be stood on" {
+	// The crate at (-8, -6) is 1.2 tall, so its lid is at 1.2 — and a player
+	// dropped from head height above it lands on the lid rather than through it.
+	mut fps.Model model = still()
+	model.body = fps.Body(0.0 - 8.0, 3.0, 0.0 - 6.0, 0.0, 0.0, 0.0, 100)
+	assert walking(model, 2.0).y == 1.2
+}
+
+// Falling fast enough to pass a lid inside one frame still lands on it. The step
+// is what is tested against, not the place the step ended.
+test "a fast fall does not go through a crate" {
+	mut fps.Model model = still()
+	model.body = fps.Body(0.0 - 8.0, 1.4, 0.0 - 6.0, 0.0 - 9.0, 0.0, 0.0, 100)
+	after := fps.walked(model, 1.0 / 30.0)
+	assert after.y == 1.2
+	assert after.fall == 0.0
+}
+
+// ---------------------------------------------------------------------------
+// Looking
+// ---------------------------------------------------------------------------
+
+test "the mouse turns you, and pitch stops short of straight up" {
+	turned := fps.turned(still(), 100.0, 0.0)
+	assert turned.yaw < 0.0
+
+	// Ten thousand pixels upwards is still not further than the clamp allows.
+	craned := fps.turned(still(), 0.0, 0.0 - 10000.0)
+	assert craned.pitch == 1.35
+	planted := fps.turned(still(), 0.0, 10000.0)
+	assert planted.pitch == 0.0 - 1.35
+}
+
+// ---------------------------------------------------------------------------
+// Shooting
+// ---------------------------------------------------------------------------
+
+// Somebody six metres along -Z, which is where a player at yaw 0 is looking.
+func ahead(model: fps.Model, metres: Float): fps.Foe {
+	return standing("127.0.0.1:9201", model.body.x, model.body.z - metres)
+}
+
+// What a shot found, asked about in the two ways the tests want. A `Struck` is a
+// closed set, so these are the whole of it.
+func shooting(shot: fps.Shot, endpoint: Str): Bool {
+	if shot.at is fps.Struck.Player(who) {
+		return who == endpoint
+	}
+	return false
+}
+
+func missed(shot: fps.Shot): Bool {
+	return shot.at is fps.Struck.Nobody
+}
+
+test "a shot down the middle finds somebody standing in front of you" {
+	model := joined(still(), [ahead(still(), 6.0)])
+	shot := fps.aimed(model)
+	assert shooting(shot, "127.0.0.1:9201")
+	// The tracer ends where the bullet stopped, which is at them rather than
+	// somewhere beyond them.
+	assert shot.bz > still().body.z - 6.5
+	assert shot.bz < still().body.z - 5.5
+}
+
+test "a shot into the sky finds nobody" {
+	model := joined(facing(still(), 0.0, 1.3), [ahead(still(), 6.0)])
+	assert missed(fps.aimed(model))
+}
+
+test "somebody behind you is not in front of you" {
+	model := joined(still(), [ahead(still(), 0.0 - 6.0)])
+	assert missed(fps.aimed(model))
+}
+
+// The point of the arena having a middle: cover. The block at the origin is 2
+// metres tall and 6 across, and a player on the far side of it cannot be shot
+// through it — which is the same `entry` test the bullet uses on every wall.
+test "cover works" {
+	mut fps.Model model = still()
+	model.body = fps.Body(0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 100)
+	behind := standing("127.0.0.1:9201", 0.0, 0.0 - 10.0)
+	assert missed(fps.aimed(joined(model, [behind])))
+
+	// Standing on top of that same block and aiming down at them, the shot goes
+	// over the edge and lands. The pitch is worked out rather than guessed: from
+	// this eye to that chest is the angle it is.
+	mut fps.Model high = model
+	high.body = fps.Body(0.0, 2.0, 2.9, 0.0, 0.0, 0.0, 100)
+	high.body.pitch = math.atan2(fps.chest() - (2.0 + fps.eyes()), 12.9)
+	assert shooting(fps.aimed(joined(high, [behind])), "127.0.0.1:9201")
+}
+
+test "a dead player is not a target" {
+	mut fps.Foe down = ahead(still(), 6.0)
+	down.health = 0
+	assert missed(fps.aimed(joined(still(), [down])))
+}
+
+test "a shot with nobody about still stops at the wall" {
+	shot := fps.aimed(still())
+	assert missed(shot)
+	// The north wall's near face is at z = -19.5, and the bullet gets that far and
+	// no further.
+	assert shot.bz > 0.0 - 19.6
+	assert shot.bz < 0.0 - 19.4
+}
+
+test "three bullets are enough and two are not" {
+	one := fps.wounded(still(), fps.damage())
+	assert one.body.health == 66
+	two := fps.wounded(one, fps.damage())
+	assert two.body.health == 32
+	assert fps.alive(two)
+	three := fps.wounded(two, fps.damage())
+	assert three.body.health == 0
+	assert fps.alive(three) == false
+	assert three.deaths == 1
+}
+
+test "going down lets go of every key" {
+	holding := holding(still(), ["w", "mouse1"])
+	assert len(fps.wounded(holding, 100).held) == 0
+}
+
+test "health does not go below nothing" {
+	assert fps.wounded(still(), 500).body.health == 0
+}
+
+test "a tracer fades, and a fresh one lives a moment" {
+	mut fps.Tracer[dyn] shots = [
+		fps.Tracer(0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 100),
+		fps.Tracer(0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 20)
+	]
+	assert len(fps.fading(shots, 30)) == 1
+}
+
+// ---------------------------------------------------------------------------
+// The dead
+// ---------------------------------------------------------------------------
+
+// One of this node's own, standing where it is put.
+func rising(id: Int, x: Float, z: Float): fps.Zombie {
+	return fps.Zombie("127.0.0.1:9200", id, x, 0.0, z, 0.0, 68, 0)
+}
+
+func carrying(model: fps.Model, pack: fps.Zombie[]): fps.Model {
+	mut fps.Model next = model
+	mut fps.Zombie[dyn] mine = []
+	for each zombie in pack {
+		append(mine, zombie)
+	}
+	next.pack = mine
+	return next
+}
+
+test "the dead walk at whoever is nearest" {
+	// One two metres behind the player, which is further than it can reach.
+	mut fps.Model model = carrying(still(), [rising(1, still().body.x, still().body.z + 3.0)])
+	after := fps.shambled(model, 100)
+	assert len(after.horde) == 1
+	assert len(after.bitten) == 0
+	for each zombie in after.horde {
+		// It closed the distance, and it is facing what it is chasing.
+		assert zombie.z < still().body.z + 3.0
+		assert math.abs(zombie.x - still().body.x) < 0.001
+	}
+}
+
+test "one within reach bites, and does not bite again straight away" {
+	mut fps.Model model = carrying(still(), [rising(1, still().body.x, still().body.z + 1.0)])
+	first := fps.shambled(model, 100)
+	assert len(first.bitten) == 1
+	assert indexOf(first.bitten, "127.0.0.1:9200") is Result.Ok(_)
+
+	// Its jaw is on a cooldown now, so the next frame is quiet.
+	mut fps.Model again = model
+	again.pack = first.horde
+	assert len(fps.shambled(again, 100).bitten) == 0
+
+	// The frame the cooldown runs out in is the frame it bites again.
+	assert len(fps.shambled(again, 900).bitten) == 1
+}
+
+test "a player who is down is not worth chasing" {
+	mut fps.Model model = carrying(still(), [rising(1, 0.0, 0.0)])
+	model.body.health = 0
+	// Nobody left to hunt, so it stays where it is and bites nothing.
+	after := fps.shambled(model, 100)
+	assert len(after.bitten) == 0
+	for each zombie in after.horde {
+		assert zombie.x == 0.0
+		assert zombie.z == 0.0
+	}
+}
+
+test "the pack fills up to the number this node is carrying, one at a time" {
+	mut fps.Model model = still()
+	model.want = 3
+	model.sprout = 0
+	assert fps.due(model)
+	one := fps.raised(model, fps.Spot(0.0, 0.0, 0.0))
+	assert len(one.pack) == 1
+	// Not again until the timer comes round.
+	assert fps.due(one) == false
+	assert fps.due(fps.waiting(one, 500)) == false
+	assert fps.due(fps.waiting(one, 1400))
+}
+
+test "a full pack rolls a new number for next time" {
+	mut fps.Model model = carrying(still(), [rising(1, 0.0, 0.0), rising(2, 1.0, 1.0)])
+	model.want = 2
+	assert fps.full(model)
+	assert fps.due(model) == false
+	assert fps.carrying(model, 5).want == 5
+}
+
+test "the dead this node carries belong to it" {
+	raised := fps.raised(still(), fps.Spot(3.0, 4.0, 0.0))
+	for each zombie in raised.pack {
+		assert zombie.owner == "127.0.0.1:9200"
+		assert zombie.health == 68
+		assert zombie.x == 3.0
+		assert zombie.z == 4.0
+	}
+}
+
+// Where one may be raised. The distance is the rule worth testing: a zombie that
+// turned up at arm's length would be a free bite rather than a fright.
+test "the dead do not rise on top of anybody" {
+	me := still().body
+	// Fourteen metres away across open ground, then three, then eight.
+	assert fps.decent(still(), me.x, me.z - 14.0)
+	assert fps.decent(still(), me.x + 3.0, me.z) == false
+	assert fps.decent(still(), me.x, me.z - 8.0) == false
+
+	// Another player counts too, wherever this node's own player is.
+	crowded := joined(still(), [standing("127.0.0.1:9201", 0.0 - 12.0, 0.0)])
+	assert fps.decent(crowded, 0.0 - 11.0, 0.0) == false
+	assert fps.decent(crowded, 0.0, 0.0 - 14.0)
+}
+
+test "the dead do not rise inside a wall, a crate or the sky" {
+	far := still()
+	// The block in the middle of the arena, and the far side of the north wall.
+	assert fps.decent(far, 0.0, 0.0) == false
+	assert fps.decent(far, 0.0, 0.0 - 25.0) == false
+	assert fps.decent(far, 25.0, 0.0) == false
+	// The crate at (-8, -6) is solid; the ground beside it is not.
+	assert fps.decent(far, 0.0 - 8.0, 0.0 - 6.0) == false
+	assert fps.decent(far, 0.0 - 11.0, 0.0 - 6.0)
+}
+
+test "a player who is down does not keep the dead away" {
+	mut fps.Model gone = still()
+	gone.body.health = 0
+	assert fps.decent(gone, gone.body.x + 2.0, gone.body.z)
+}
+
+test "two shots put one down, and the second one is the one that did it" {
+	mut fps.Model model = carrying(still(), [rising(7, 0.0, 0.0)])
+	assert fps.finished(model, 7, fps.damage()) == false
+	once := fps.clawed(model, 7, fps.damage())
+	assert len(once.pack) == 1
+	assert fps.finished(once, 7, fps.damage())
+	twice := fps.clawed(once, 7, fps.damage())
+	// The fallen are not left lying: a pack is what is standing.
+	assert len(twice.pack) == 0
+}
+
+test "a shot at somebody else's zombie says whose it is" {
+	mut fps.Zombie theirs = fps.Zombie("127.0.0.1:9201", 4, still().body.x,
+		0.0, still().body.z - 5.0, 0.0, 68, 0)
+	mut fps.Model model = still()
+	append(model.swarm, theirs)
+	shot := fps.aimed(model)
+	assert shot.at is fps.Struck.Undead
+	if shot.at is fps.Struck.Undead(owner, id) {
+		assert owner == "127.0.0.1:9201"
+		assert id == 4
+	}
+}
+
+test "whatever is in front is what is hit" {
+	// A zombie two metres away and a player six: the zombie is what stops the
+	// bullet, and shooting it in the back is a perfectly good idea.
+	blocking := carrying(joined(still(), [ahead(still(), 6.0)]),
+		[rising(1, still().body.x, still().body.z - 2.0)])
+	assert fps.aimed(blocking).at is fps.Struck.Undead
+
+	// The other way round, the player is nearer.
+	mut fps.Model behind = carrying(joined(still(), [ahead(still(), 2.0)]),
+		[rising(1, still().body.x, still().body.z - 6.0)])
+	assert shooting(fps.aimed(behind), "127.0.0.1:9201")
+}
+
+test "what another node says about its pack replaces only its own" {
+	mut fps.Model model = still()
+	append(model.swarm, fps.Zombie("127.0.0.1:9201", 1, 0.0, 0.0, 0.0, 0.0, 68, 0))
+	append(model.swarm, fps.Zombie("127.0.0.1:9202", 1, 5.0, 0.0, 5.0, 0.0, 68, 0))
+	mut fps.Zombie[dyn] fresh = [
+		fps.Zombie("127.0.0.1:9201", 1, 9.0, 0.0, 9.0, 0.0, 34, 0),
+		fps.Zombie("127.0.0.1:9201", 2, 8.0, 0.0, 8.0, 0.0, 68, 0)
+	]
+	after := fps.told(model, "127.0.0.1:9201", fresh)
+	assert len(after.swarm) == 3
+	assert len(filter(after.swarm, ownedBy(_, "127.0.0.1:9202"))) == 1
+	assert len(filter(after.swarm, ownedBy(_, "127.0.0.1:9201"))) == 2
+}
+
+func ownedBy(zombie: fps.Zombie, endpoint: Str): Bool {
+	return zombie.owner == endpoint
+}
+
+test "everything standing is drawn, whoever is moving it" {
+	mut fps.Model model = carrying(still(), [rising(1, 0.0, 0.0)])
+	append(model.swarm, fps.Zombie("127.0.0.1:9201", 1, 4.0, 0.0, 4.0, 0.0, 68, 0))
+	assert len(fps.mob(model)) == 2
+	// Four shapes each: a body, a head and two arms reaching.
+	assert len(fps.world(model)) == len(fps.world(still())) + 8
+}
+
+test "a zombie greys as it is shot" {
+	assert fps.rot(68) != fps.rot(20)
+}
+
+test "hex digits are the number they spell" {
+	assert fps.hexOf("ff") == 255
+	assert fps.hexOf("10") == 16
+	assert fps.hexOf("0") == 0
+	// Anything that is not a digit contributes nothing rather than failing.
+	assert fps.hexOf("z") == 0
+}
+
+// ---------------------------------------------------------------------------
+// Alone, and not alone
+// ---------------------------------------------------------------------------
+
+// The whole of "single player" is this: a fact about the roster, not a mode. Both
+// of these assertions are the same line of code answering differently, which is
+// the point — nothing switches over, and there is no match to restart.
+test "a node by itself is playing alone, and stops being the moment somebody knocks" {
+	assert fps.alone(still())
+	assert fps.alone(fps.met(still(), "127.0.0.1:9201", "Bob")) == false
+	// And back again when they go.
+	together := fps.met(still(), "127.0.0.1:9201", "Bob")
+	assert fps.alone(fps.parted(together, "127.0.0.1:9201"))
+}
+
+test "the panel says which kind of game it is" {
+	alone := hive.ui.html(fps.mode(still()))
+	assert indexOf(alone, "alone") is Result.Ok(_)
+	together := hive.ui.html(fps.mode(fps.met(still(), "127.0.0.1:9201", "Bob")))
+	assert indexOf(together, "2 playing") is Result.Ok(_)
+	assert indexOf(together, "kills") is Result.Ok(_)
+}
+
+// ---------------------------------------------------------------------------
+// Coming back
+// ---------------------------------------------------------------------------
+
+test "you come back where there is the most room" {
+	// Three of the four corners taken. The fourth is where a player belongs.
+	crowded := joined(still(), [
+		standing("127.0.0.1:9201", 0.0 - 16.0, 0.0 - 16.0),
+		standing("127.0.0.1:9202", 16.0, 0.0 - 16.0),
+		standing("127.0.0.1:9203", 16.0, 16.0)
+	])
+	room := fps.vacancy(crowded)
+	assert room.x == 0.0 - 16.0
+	assert room.z == 16.0
+}
+
+test "two nodes on one machine start apart" {
+	assert fps.mySpot("127.0.0.1:9200").x != fps.mySpot("127.0.0.1:9201").x
+		|| fps.mySpot("127.0.0.1:9200").z != fps.mySpot("127.0.0.1:9201").z
+}
+
+test "an endpoint that makes no sense still gets a corner" {
+	assert fps.portOf("nonsense") == 0
+	assert fps.portOf("127.0.0.1:9203") == 9203
+}
+
+// ---------------------------------------------------------------------------
+// The mesh
+// ---------------------------------------------------------------------------
+
+test "meeting somebody twice is meeting them once" {
+	once := fps.met(still(), "127.0.0.1:9201", "Bob")
+	twice := fps.met(once, "127.0.0.1:9201", "Bob")
+	assert len(twice.others) == 1
+}
+
+test "somebody who rejoins under a new name is the same node" {
+	renamed := fps.met(fps.met(still(), "127.0.0.1:9201", "Bob"), "127.0.0.1:9201", "Roberta")
+	assert len(renamed.others) == 1
+	assert len(filter(renamed.others, named(_, "Roberta"))) == 1
+}
+
+func named(foe: fps.Foe, who: Str): Bool {
+	return foe.who == who
+}
+
+test "a node never meets itself" {
+	assert len(fps.met(still(), "127.0.0.1:9200", "Ada").others) == 0
+}
+
+// The gossip, in one assertion: what this node hands out is itself plus everyone
+// it knows, and what it greets out of somebody else's roster is everyone it has
+// not met — itself excluded. That pair is what makes a chain of introductions
+// into a mesh, and what makes it terminate.
+test "a roster carries this node and everyone it has met" {
+	known := fps.met(fps.met(still(), "127.0.0.1:9201", "Bob"), "127.0.0.1:9202", "Cai")
+	list := fps.roster(known)
+	assert len(list) == 3
+	assert indexOf(list, "127.0.0.1:9200") is Result.Ok(_)
+	assert indexOf(list, "127.0.0.1:9202") is Result.Ok(_)
+}
+
+test "only strangers are greeted" {
+	known := fps.met(still(), "127.0.0.1:9201", "Bob")
+	mut Str[dyn] heard = ["127.0.0.1:9200", "127.0.0.1:9201", "127.0.0.1:9202"]
+	fresh := fps.strangers(known, heard)
+	assert len(fresh) == 1
+	assert indexOf(fresh, "127.0.0.1:9202") is Result.Ok(_)
+}
+
+test "a player who leaves is gone from the roster" {
+	known := fps.met(fps.met(still(), "127.0.0.1:9201", "Bob"), "127.0.0.1:9202", "Cai")
+	assert len(fps.parted(known, "127.0.0.1:9201").others) == 1
+}
+
+test "where somebody is comes from what they last said" {
+	known := fps.met(still(), "127.0.0.1:9201", "Bob")
+	moved := fps.moved(known, fps.Msg.Moved("127.0.0.1:9201", "Bob", 3.0, 0.0, 4.0, 1.0, 66))
+	assert len(filter(moved.others, at(_, 3.0, 4.0))) == 1
+	assert len(filter(moved.others, hurt(_, 66))) == 1
+}
+
+func at(foe: fps.Foe, x: Float, z: Float): Bool {
+	return foe.x == x && foe.z == z
+}
+
+func hurt(foe: fps.Foe, health: Int): Bool {
+	return foe.health == health
+}
+
+// A `Moved` from somebody nobody has met adds them. That is what makes the mesh
+// tolerant of the order things arrive in: a position can turn up before the
+// introduction it belongs to.
+test "hearing a stranger move introduces them" {
+	moved := fps.moved(still(), fps.Msg.Moved("127.0.0.1:9209", "Zoe", 1.0, 0.0, 1.0, 0.0, 100))
+	assert len(moved.others) == 1
+}
+
+test "a kill is credited to whoever the victim named" {
+	known := fps.met(still(), "127.0.0.1:9201", "Bob")
+	scored := map(known.others, fps.credited(_, "127.0.0.1:9201"))
+	assert len(filter(scored, scoring(_, 1))) == 1
+}
+
+func scoring(foe: fps.Foe, score: Int): Bool {
+	return foe.score == score
+}
+
+// ---------------------------------------------------------------------------
+// The screen
+// ---------------------------------------------------------------------------
+// A view is a value, so a test can read one. `hive.ui.html` is the same renderer a
+// served page uses and needs no browser, no screenshot and no socket.
+
+test "the lobby will not let you join without a name and somewhere to go" {
+	// A fresh model is in the lobby, with nothing typed in either field.
+	bare := hive.ui.html(fps.view(fps.start("127.0.0.1:9200", "")))
+	assert indexOf(bare, "disabled") is Result.Ok(_)
+
+	mut fps.Model filled = fps.start("127.0.0.1:9200", "127.0.0.1:9201")
+	filled.me = "Ada"
+	assert indexOf(hive.ui.html(fps.view(filled)), "disabled") is Result.Error(_)
+}
+
+test "a name is a name, and spaces are not" {
+	assert fps.usable("Ada")
+	assert fps.usable("   ") == false
+	assert fps.usable("") == false
+}
+
+test "the panel says what is in front of the game" {
+	mut fps.Model down = still()
+	down.body.health = 0
+	down.down = 1200
+	assert indexOf(hive.ui.html(fps.panel(down)), "You went down") is Result.Ok(_)
+
+	waiting := still()
+	assert indexOf(hive.ui.html(fps.panel(waiting)), "Click to play") is Result.Ok(_)
+
+	mut fps.Model playing = still()
+	playing.aiming = true
+	assert hive.ui.html(fps.panel(playing)) == "<!--none-->"
+}
+
+test "the mouse is only asked for while the game is being played" {
+	assert fps.playing(still())
+	mut fps.Model reading = still()
+	reading.board = true
+	assert fps.playing(reading) == false
+	assert fps.playing(fps.start("127.0.0.1:9200", "")) == false
+}
+
+test "the health bar empties as the health goes" {
+	full := hive.ui.html(fps.bar(100))
+	// Ten cells, and at full health every one of them is the good colour.
+	assert len(split(full, "h-bg-good")) == 11
+	assert len(split(hive.ui.html(fps.bar(50)), "h-bg-warn")) == 6
+	assert len(split(hive.ui.html(fps.bar(10)), "h-bg-danger")) == 2
+}
+
+test "a name cannot smuggle markup onto the screen" {
+	mut fps.Model model = still()
+	model.me = "<script>alert(1)</script>"
+	page := hive.ui.html(fps.view(model))
+	assert indexOf(page, "<script>") is Result.Error(_)
+	assert indexOf(page, "&lt;script&gt;") is Result.Ok(_)
+}
+
+// A scene is a value too, so what is *in* the world is as readable as the panel
+// around it — no picture required.
+test "the world holds the arena, and a player is four shapes of it" {
+	empty := len(fps.world(still()))
+	crowded := len(fps.world(joined(still(), [standing("127.0.0.1:9201", 2.0, 2.0)])))
+	assert crowded == empty + 4
+
+	// Somebody who has gone down is one shape lying on the floor, not four.
+	mut fps.Foe fallen = standing("127.0.0.1:9201", 2.0, 2.0)
+	fallen.health = 0
+	assert len(fps.world(joined(still(), [fallen]))) == empty + 1
+}
+
+test "every tracer in the model is a line in the world" {
+	mut fps.Model shooting = still()
+	append(shooting.tracers, fps.Tracer(0.0, 1.0, 0.0, 0.0, 1.0, 0.0 - 9.0, 120))
+	assert len(fps.world(shooting)) == len(fps.world(still())) + 1
+}
+
+test "two players are told apart by colour, and it does not depend on their name" {
+	assert fps.colour("127.0.0.1:9200") != fps.colour("127.0.0.1:9201")
+}
+
+test "the score lists you and everybody else" {
+	known := fps.met(fps.met(still(), "127.0.0.1:9201", "Bob"), "127.0.0.1:9202", "Cai")
+	board := hive.ui.html(fps.scores(known))
+	assert indexOf(board, "(you)") is Result.Ok(_)
+	assert indexOf(board, "Bob") is Result.Ok(_)
+	assert indexOf(board, "127.0.0.1:9202") is Result.Ok(_)
+}
+
+// The guess is built out of wherever this node is, so it is right on any address
+// rather than only on a loopback one — which is the point of asking the machine
+// where it is instead of writing it down.
+test "the lobby guesses the other terminal on whatever address this node has" {
+	assert fps.facing("127.0.0.1:9200") == "127.0.0.1:9201"
+	assert fps.facing("192.168.1.20:9201") == "192.168.1.20:9200"
+	assert fps.facing("10.0.0.4:9200") == "10.0.0.4:9201"
+	// Any other port is somebody's deliberate choice, and there is nothing to
+	// guess from it.
+	assert fps.facing("10.0.0.4:7000") == ""
+}
+
+test "an endpoint comes apart into a host and a port" {
+	assert fps.hostOf("192.168.1.20:9200") == "192.168.1.20"
+	assert fps.portOf("192.168.1.20:9200") == 9200
+	assert fps.hostOf("nonsense") == "nonsense"
+}
+
+test "a tracer is drawn between where the shot started and where it stopped" {
+	shot := fps.aimed(joined(still(), [ahead(still(), 6.0)]))
+	drawn := fps.tracing(shot)
+	assert drawn.az == shot.az
+	assert drawn.bz == shot.bz
+	assert drawn.life > 0
+}
+
+// Enter on either field means Join, and the text is thrown away: it is already in
+// the model.
+test "pressing enter in a field joins" {
+	assert fps.joinedOf("whatever") is fps.Msg.Joined
+}
+
+test "letting go of one key keeps the others" {
+	assert fps.isNotKey("w", "space")
+	assert fps.isNotKey("w", "w") == false
+}
+
+// ---------------------------------------------------------------------------
+// The frame
+// ---------------------------------------------------------------------------
+
+test "a frame reloads, fades and moves, all at once" {
+	mut fps.Model firing = holding(still(), ["w"])
+	firing.cooldown = 100
+	append(firing.tracers, fps.Tracer(0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 60))
+	after := fps.stepped(firing, 40)
+	assert after.cooldown == 60
+	assert len(after.tracers) == 1
+	assert after.body.z < still().body.z
+}
+
+test "a reload cannot go past ready" {
+	mut fps.Model waiting = still()
+	waiting.cooldown = 10
+	assert fps.stepped(waiting, 40).cooldown == 0
+}
+
+// A frame that took a quarter of a second — a window that was hidden, or a machine
+// that was busy — moves a player by a twentieth of a second's worth. A world
+// stepped by the real gap would teleport them through a wall.
+test "a very late frame does not teleport anybody" {
+	late := fps.stepped(holding(still(), ["w"]), 250)
+	assert late.body.z > 0.0 - 0.35
+}
+
+test "somebody who is down does not walk, and comes back when the count runs out" {
+	mut fps.Model gone = holding(still(), ["w"])
+	gone.body.health = 0
+	gone.down = 30
+	waiting := fps.stepped(gone, 10)
+	assert waiting.body.z == still().body.z
+	assert fps.alive(waiting) == false
+
+	back := fps.stepped(waiting, 40)
+	assert fps.alive(back)
+	assert back.body.health == 100
+}

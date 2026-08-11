@@ -61,8 +61,8 @@ pub fn is_global(name: String) -> Bool {
 /// down. A name here is one that appears in a program as `hive.<name>.<thing>`.
 pub fn stdlib_modules() -> List(String) {
   [
-    "net", "file", "json", "crypto", "sql", "map", "conv", "env", "term",
-    "task", "syslink", "time", "ui",
+    "net", "file", "json", "crypto", "sql", "map", "conv", "math", "env",
+    "term", "task", "syslink", "time", "ui",
   ]
 }
 

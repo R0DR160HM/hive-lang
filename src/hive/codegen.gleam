@@ -127,7 +127,12 @@ pub fn builtin_fields(name: String) -> Option(List(#(String, Ty))) {
     // the widget calls and an attribute by the attribute calls, and neither is
     // taken apart again — but registering them is what lets a `func` returning
     // `hive.ui.View` be written down, which is how a view is composed at all.
-    "View" | "Attr" -> Some([])
+    //
+    // A `Shape` is the same thing one dimension further out: what goes in a
+    // `hive.ui.scene`, and a type of its own rather than a `View` so that a box
+    // in a column and a button in a scene are both refused rather than quietly
+    // dropped by the renderer.
+    "View" | "Attr" | "Shape" -> Some([])
     // The enumerations `hive.ui` owns. Each is a closed set, so a renderer can
     // answer for every one of them — which an atom, belonging to the program
     // rather than to the library, could never promise.
@@ -202,7 +207,7 @@ pub fn builtin_qualifier(name: String) -> String {
     "Address" | "Envelope" | "SyslinkError" -> "hive.syslink"
     "TimeoutError" -> "hive.task"
     "Map" -> "hive.map"
-    "View" | "Attr" -> "hive.ui"
+    "View" | "Attr" | "Shape" -> "hive.ui"
     "Align" | "Justify" | "TextSize" | "Tone" | "Axis" | "InputKind" | "Icon" ->
       "hive.ui"
     _ -> "hive"
@@ -5024,6 +5029,8 @@ fn infer_other_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> Ty {
                 "stf" -> TyResult(TyFloat, TyBuiltin("ConversionError"))
                 _ -> TyUnknown
               }
+            // Every `hive.math` function answers with a `Float`, `pi` included.
+            "math" -> TyFloat
             "env" ->
               case fname {
                 "get" -> TyResult(TyStr, TyBuiltin("EnvironmentError"))
@@ -6912,7 +6919,7 @@ fn gen_other_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
     ast.EMember(
       ast.EMember(ast.EMember(ast.EIdent("hive"), "ui"), enum_name),
       variant,
-    ) if enum_name != "View" && enum_name != "Attr" ->
+    ) if enum_name != "View" && enum_name != "Attr" && enum_name != "Shape" ->
       "hive." <> enum_name <> "(\"" <> variant <> "\")"
     // A `hive.<ns>.<member>` call: a builtin type constructor
     // (`hive.net.HttpRequest(...)`) if the member names a builtin type,
@@ -6929,6 +6936,7 @@ fn gen_other_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
             "sql" -> gen_sql_call(env, fname, args)
             "map" -> gen_map_call(env, fname, args)
             "conv" -> gen_conv_call(env, fname, args)
+            "math" -> gen_math_call(env, fname, args)
             "env" -> gen_env_call(env, fname, args)
             "term" -> gen_term_call(env, fname, args)
             "task" -> gen_task_call(env, fname, args)
@@ -7728,8 +7736,57 @@ fn ui_widgets() -> List(#(String, List(#(String, Ty)))) {
     #("checkbox", [#("label", TyStr), #("checked", TyBool)]),
     #("select", [#("options", TyVec(TyStr)), #("chosen", TyStr)]),
     #("table", [#("rows", TyTable)]),
+    // Three dimensions. The payload is a vector of `Shape` rather than of `View`,
+    // which is the whole of how a scene is kept apart from the page around it:
+    // what goes in one is a closed set of solids, and a button is not one of
+    // them. Where the eye is and what it can see are attributes, because there
+    // is exactly one camera per scene and it is configuration rather than
+    // content.
+    #("scene", [#("shapes", TyVec(TyBuiltin("Shape")))]),
     #("spinner", []),
     #("none", []),
+  ]
+}
+
+/// Every shape a scene can hold, with the payload it takes after its attributes.
+///
+/// The set is small on purpose, and the rule that decided it is the widgets':
+/// a shape is here only if it cannot be made out of the others *and* the renderer
+/// has something for it that Hive does not. A crate is a `box`, a barrel is a
+/// `cylinder`, a player is a box and a sphere, a tracer is a `line` — all of them
+/// `func`s you write, which is the proof the set is enough.
+///
+/// Dimensions are the payload rather than attributes because they are what the
+/// shape *is*: a sphere without a radius is not a sphere with a default one.
+/// Where it stands and which way it faces are attributes, because a shape at the
+/// origin facing forward is a perfectly ordinary thing to want.
+fn ui_shapes() -> List(#(String, List(#(String, Ty)))) {
+  [
+    #(
+      "box",
+      [#("width", TyFloat), #("height", TyFloat), #("depth", TyFloat)],
+    ),
+    #("sphere", [#("radius", TyFloat)]),
+    #("cylinder", [#("radius", TyFloat), #("height", TyFloat)]),
+    // A floor. It lies flat without being turned, which is what a floor does.
+    #("ground", [#("width", TyFloat), #("depth", TyFloat)]),
+    // Words in the world, always facing whoever is looking — a name over
+    // somebody's head. A label you could only read from one side would not be
+    // one, which is why it takes no `turn`.
+    #("label", [#("words", TyStr)]),
+    // The one shape that carries both its ends: a line is *between* two places
+    // and has no third one of its own, so it takes no `at`.
+    #(
+      "line",
+      [
+        #("fromX", TyFloat),
+        #("fromY", TyFloat),
+        #("fromZ", TyFloat),
+        #("toX", TyFloat),
+        #("toY", TyFloat),
+        #("toZ", TyFloat),
+      ],
+    ),
   ]
 }
 
@@ -7772,6 +7829,36 @@ fn ui_attrs() -> List(#(String, Ty)) {
     #("onToggle", TyUnknown),
     #("onPick", TyUnknown),
     #("onSort", TyUnknown),
+    // The scene's own. Everything above means something on any widget; these mean
+    // something on a `scene` and are ignored anywhere else, for the reason `pad`
+    // is ignored on a `spacer` — an attribute is a token the renderer may or may
+    // not have a use for.
+    #("paint", TyBuiltin("Tone")),
+    #("lens", TyInt),
+    #("fog", TyInt),
+    #("grab", TyBool),
+    #("crosshair", TyBool),
+    #("onFrame", TyUnknown),
+    #("onKeyDown", TyUnknown),
+    #("onKeyUp", TyUnknown),
+    #("onLook", TyUnknown),
+    #("onGrab", TyUnknown),
+  ]
+}
+
+/// The attributes that carry more than one number, and what each number is
+/// called. They are all the scene's: a place and a heading are the only things in
+/// the module that cannot be said with one value.
+///
+/// Three `Float`s rather than one vector, deliberately. A program's own idea of a
+/// point is its own — a struct with names, most likely — and a library type it
+/// had to convert into would be one more thing between the state and the picture.
+fn ui_multi_attrs() -> List(#(String, List(String))) {
+  [
+    #("at", ["x", "y", "z"]),
+    #("turn", ["x", "y", "z"]),
+    #("eye", ["x", "y", "z"]),
+    #("aim", ["yaw", "pitch"]),
   ]
 }
 
@@ -7788,20 +7875,56 @@ pub fn ui_widget_params(name: String) -> Option(List(String)) {
   }
 }
 
-/// Every attribute's name. Each takes exactly one argument, named after itself.
-pub fn ui_attr_names() -> List(String) {
-  list.map(ui_attrs(), fn(a) { a.0 })
+/// The full parameter list of a shape, the same way `ui_widget_params` answers
+/// for a widget. `None` when the name is not a shape.
+pub fn ui_shape_params(name: String) -> Option(List(String)) {
+  case list.key_find(ui_shapes(), name) {
+    Ok(payload) -> Some(["attrs", ..list.map(payload, fn(p) { p.0 })])
+    Error(_) -> None
+  }
 }
 
-/// The Go parameter an event attribute's function is handed, if it takes one.
-/// A plain `on` carries the message itself and has no argument to be a function
-/// of, so it is not in here.
-fn ui_event_arg(name: String) -> Option(String) {
+/// Every shape's name, in the order the documentation lists them.
+pub fn ui_shape_names() -> List(String) {
+  list.map(ui_shapes(), fn(s) { s.0 })
+}
+
+/// Every attribute's name.
+pub fn ui_attr_names() -> List(String) {
+  list.append(
+    list.map(ui_attrs(), fn(a) { a.0 }),
+    list.map(ui_multi_attrs(), fn(a) { a.0 }),
+  )
+}
+
+/// What one attribute takes. Almost every one takes a single argument named after
+/// itself; the scene's places and headings take a few numbers, and this is the
+/// one table that says which. `None` when the name is not an attribute.
+pub fn ui_attr_params(name: String) -> Option(List(String)) {
+  case list.key_find(ui_multi_attrs(), name) {
+    Ok(names) -> Some(names)
+    Error(_) ->
+      case list.key_find(ui_attrs(), name) {
+        Ok(_) -> Some([name])
+        Error(_) -> None
+      }
+  }
+}
+
+/// The Go parameters an event attribute's function is handed, if it takes any.
+/// A plain `on` carries the message itself and has nothing to be a function of,
+/// so it answers with the empty list.
+fn ui_event_args(name: String) -> List(String) {
   case name {
-    "onInput" | "onSubmit" | "onChoose" -> Some("string")
-    "onToggle" -> Some("bool")
-    "onPick" | "onSort" -> Some("int")
-    _ -> None
+    "onInput" | "onSubmit" | "onChoose" -> ["string"]
+    "onKeyDown" | "onKeyUp" -> ["string"]
+    "onToggle" | "onGrab" -> ["bool"]
+    "onPick" | "onSort" | "onFrame" -> ["int"]
+    // How far the mouse moved, across and down. The one event that reports two
+    // numbers — and a two-hole constructor (`Msg.Looked(_, _)`) is already a
+    // function of exactly that shape.
+    "onLook" -> ["float64", "float64"]
+    _ -> []
   }
 }
 
@@ -7809,14 +7932,18 @@ fn ui_call_type(fname: String) -> Ty {
   case list.key_find(ui_widgets(), fname) {
     Ok(_) -> TyBuiltin("View")
     Error(_) ->
-      case list.key_find(ui_attrs(), fname) {
-        Ok(_) -> TyBuiltin("Attr")
+      case list.key_find(ui_shapes(), fname) {
+        Ok(_) -> TyBuiltin("Shape")
         Error(_) ->
-          case fname {
-            "html" | "page" -> TyStr
-            // `window` does not return: it shows the view and folds events
-            // until the program ends.
-            _ -> TyVoid
+          case ui_attr_params(fname) {
+            Some(_) -> TyBuiltin("Attr")
+            None ->
+              case fname {
+                "html" | "page" -> TyStr
+                // `window` does not return: it shows the view and folds events
+                // until the program ends.
+                _ -> TyVoid
+              }
           }
       }
   }
@@ -7843,10 +7970,29 @@ fn gen_ui_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
       case list.key_find(ui_widgets(), fname) {
         Ok(payload) -> gen_ui_widget(env, fname, payload, args)
         Error(_) ->
-          case list.key_find(ui_attrs(), fname) {
-            Ok(carries) -> gen_ui_attr(env, fname, carries, args)
+          // A shape lowers exactly as a widget does — attributes, then whatever
+          // its kind takes — and answers with a `Shape` instead of a `View`.
+          case list.key_find(ui_shapes(), fname) {
+            Ok(payload) -> gen_ui_widget(env, fname, payload, args)
             Error(_) ->
-              "hive.Ui" <> exported(fname) <> "(" <> gen_args(env, args) <> ")"
+              case list.key_find(ui_multi_attrs(), fname) {
+                Ok(names) ->
+                  "hive.UiAttr"
+                  <> exported(fname)
+                  <> "("
+                  <> gen_all_coerced(env, args, names, TyFloat)
+                  <> ")"
+                Error(_) ->
+                  case list.key_find(ui_attrs(), fname) {
+                    Ok(carries) -> gen_ui_attr(env, fname, carries, args)
+                    Error(_) ->
+                      "hive.Ui"
+                      <> exported(fname)
+                      <> "("
+                      <> gen_args(env, args)
+                      <> ")"
+                  }
+              }
           }
       }
   }
@@ -7927,15 +8073,29 @@ fn gen_ui_attr(
   case value {
     None -> go <> "(" <> gen_args(env, args) <> ")"
     Some(v) ->
-      case ui_event_arg(fname) {
-        Some(arg_go) ->
+      case ui_event_args(fname) {
+        [] -> go <> "(" <> coerce(env, v, carries) <> ")"
+        arg_gos -> {
+          // One parameter per thing the event reports, named `_ev0`, `_ev1`, and
+          // handed straight to whatever the program gave — a func, or a
+          // constructor with that many holes.
+          let params =
+            arg_gos
+            |> list.index_map(fn(ty, i) { "_ev" <> int.to_string(i) <> " " <> ty })
+            |> string.join(", ")
+          let passed =
+            arg_gos
+            |> list.index_map(fn(_, i) { "_ev" <> int.to_string(i) })
+            |> string.join(", ")
           go
-          <> "(func(_ev "
-          <> arg_go
+          <> "(func("
+          <> params
           <> ") any { return ("
           <> gen_expr(env, v)
-          <> ")(_ev) })"
-        None -> go <> "(" <> coerce(env, v, carries) <> ")"
+          <> ")("
+          <> passed
+          <> ") })"
+        }
       }
   }
 }
@@ -8116,6 +8276,34 @@ fn gen_conv_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
   }
 }
 
+// The `hive.math` namespace. Every function takes and answers with a `Float`,
+// so the whole of the lowering is the name and how many arguments to coerce.
+fn gen_math_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
+  let go = "hive.Math" <> exported(fname)
+  case math_params(fname) {
+    [] -> go <> "()"
+    names ->
+      go
+      <> "("
+      <> gen_all_coerced(env, args, names, TyFloat)
+      <> ")"
+  }
+}
+
+// What each `hive.math` function takes, by name — the same list the compiler
+// checks the call against, so a call cannot be accepted with one shape and
+// lowered with another.
+fn math_params(fname: String) -> List(String) {
+  case fname {
+    "pi" -> []
+    "atan2" -> ["y", "x"]
+    "hypot" -> ["x", "y"]
+    "min" | "max" -> ["a", "b"]
+    "clamp" -> ["value", "low", "high"]
+    _ -> ["x"]
+  }
+}
+
 fn gen_env_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
   case fname {
     "get" -> "hive.EnvGet(" <> gen_one_coerced(env, args, "key", TyStr) <> ")"
@@ -8185,6 +8373,26 @@ fn gen_one_coerced(
   case assign_args(args, [name]) {
     #([#(_, arg)], []) -> coerce(env, arg, ty)
     _ -> gen_args(env, args)
+  }
+}
+
+// Several arguments, all of one type — a call whose parameters differ in name
+// and in nothing else (`hive.math`'s, a scene attribute's three coordinates). A
+// call that does not fill them is lowered verbatim and left to the checks that
+// already rejected it.
+fn gen_all_coerced(
+  env: Env,
+  args: List(ast.Arg),
+  names: List(String),
+  ty: Ty,
+) -> String {
+  let #(given, extra) = assign_args(args, names)
+  case extra == [] && list.length(given) == list.length(names) {
+    True ->
+      given
+      |> list.map(fn(pair) { coerce(env, pair.1, ty) })
+      |> string.join(", ")
+    False -> gen_args(env, args)
   }
 }
 

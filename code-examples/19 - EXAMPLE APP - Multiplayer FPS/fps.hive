@@ -1,0 +1,2083 @@
+// A shooter for as many machines as you like
+// ==========================================
+// Three dimensions, a mouse, and no server. Every node runs this same file, holds
+// its own player and its own pack of the dead, and tells the others what both are
+// doing; nothing in the mesh is in charge, and nothing is a client.
+//
+// **Alone it is you against the dead. With anybody else it is you against them and
+// the dead**, and there is no switch between the two: playing alone is what it is
+// called when the roster has one name in it. Somebody knocking on a single-player
+// game turns it into a multiplayer one without either node doing anything about
+// it, and them leaving turns it back.
+//
+// RUN IT — two terminals on one machine:
+//
+//   hive run fps.hive          listens on this machine's address, port 9200
+//   hive run fps.hive 9201     the same address, port 9201
+//
+// The address is **not** written down anywhere in this file: it is asked of the
+// machine with `hive.net.localAddress` (see `hereOn` at the bottom), so the
+// endpoint a node hands out is one another machine can actually dial. Which is the
+// whole difference between a game two terminals can play and a game two computers
+// can. Both nodes print what they came up with on the way up.
+//
+// Who to join through is asked for on screen, filled in with the obvious guess —
+// this machine, the other port — so on one machine you type nothing. A third and a
+// fourth terminal need only a port of their own and somebody to join through,
+// which may be *any* node already playing, since joining through one is joining
+// through all of them (see "The mesh" below):
+//
+//   hive run fps.hive 9202 9200
+//   hive run fps.hive 9203 9202
+//
+// That second argument only fills the lobby field in for you.
+//
+// TWO MACHINES need nothing else: start each one, read the endpoint it printed,
+// and type that into the other's lobby. An argument with a colon in it is taken as
+// the endpoint itself (`hive run fps.hive 10.0.0.4:9200`), which is what a node
+// behind a router or on a chosen interface advertises. Every connection is TLS 1.3
+// either way; the nodes only have to share a cluster key, generated into
+// ~/.hive/syslink.key on first run — copy that file across, or set
+// HIVE_SYSLINK_KEY the same in both.
+//
+// Or press "Play alone" and give nobody's address at all — the node still
+// listens, so a second terminal can join the game you are already in.
+//
+// PLAYING: click the picture to take the mouse. W A S D walks, space jumps, the
+// mouse looks, the left button shoots, tab shows the score, escape gives the
+// mouse back. Shoot the dead before they reach you; two bullets each.
+//
+// WHAT DOES THE WORK
+// ------------------
+// Three things, and the file is organised as the three of them:
+//
+//   * `hive.ui.scene` draws. A scene is a **value** — a camera and a vector of
+//     shapes — rebuilt by an ordinary `func` from the state, sixty times a
+//     second. Nothing here holds a mesh, a material or a canvas: `world` below
+//     answers "what is there right now", the same way `view` answers "what does
+//     the panel say right now".
+//
+//   * `hive.math` moves. Which way "forward" is, whether a bullet met anybody,
+//     how far away they were — all of it is arithmetic on the state, written in
+//     Hive, in `func`s a test can call. None of it is in the browser.
+//
+//   * `hive.syslink` connects. Each node publishes its window under `#Arena`, so
+//     "tell everyone where I am" is an ordinary send to an address, and being
+//     told is one more variant arriving at the same fold as the keyboard.
+//
+// THE DEAD BELONG TO SOMEBODY
+// ---------------------------
+// Every player carries a pack of one to five zombies, rolled for by their own
+// node, and **that node is the only one that moves them**. Everybody else draws
+// them from what they are told, sixty times a second, exactly as they draw the
+// other players. So the horde grows with the room, nobody is in charge of it, and
+// a pack whose owner quits leaves with them — because nothing else was ever
+// pretending to know where they were.
+//
+// It falls out of one rule, which is the same rule the players follow: the node
+// that owns a thing is the only node that changes it. A shot at somebody else's
+// zombie is a message to them, exactly as a shot at a player is a message to that
+// player; a bite is a message from the pack's owner to whoever was bitten; and a
+// shot at one of your own answers itself, in the same turn, with no message at
+// all.
+//
+// THE MESH
+// --------
+// Nobody keeps a list of who is playing. A node knows one endpoint to start
+// with — the one you typed — and asks it who *it* knows; every stranger that
+// comes back is greeted in turn, and each greeting is answered with a roster too.
+// So the introductions spread until everyone has met everyone, and a node that
+// joins through any one player has joined through all of them.
+//
+// WHAT IS NOT GUARANTEED, AND WHY THAT IS THE HONEST ANSWER
+// --------------------------------------------------------
+// There is no referee, so each node is trusted with exactly the two facts only it
+// can know: where its own player is, and whether it was hit. A shot is decided by
+// the shooter (it has the aim), and the damage is applied by the target (it has
+// the health) — which is why a kill is credited by the *victim*, in a `Killed`
+// message, rather than claimed by the shooter. Two nodes can briefly disagree
+// about a near miss, because each is drawing the other where it last heard it
+// was. A tournament would need an authority; a game between friends does not, and
+// this is what not having one costs.
+
+import hive.ui
+import hive.math
+import hive.conv
+
+// ---------------------------------------------------------------------------
+// What crosses between the nodes
+// ---------------------------------------------------------------------------
+
+// One mailbox, one type — the window's *and* the node's. A key you pressed and a
+// player who moved on another machine arrive at the same fold and are told apart
+// only by which variant they are.
+type Msg {
+	// From the screen.
+	NameTyped { text: Str }
+	PeerTyped { text: Str }
+	Joined
+	Alone
+	Left
+	Pressed { key: Str }
+	Released { key: Str }
+	Looked { dx: Float, dy: Float }
+	Grabbed { on: Bool }
+	Tick { ms: Int }
+
+	// From the other nodes. `Hello` is the only one anybody waits for an answer
+	// to, and `Here` is that answer — carrying the roster that grows the mesh,
+	// and whatever is loose in the arena so a newcomer arrives into the game
+	// already in progress rather than into an empty one.
+	Hello { endpoint: Str, who: Str }
+	Here { endpoint: Str, who: Str, roster: Str[dyn], horde: Zombie[dyn] }
+	Moved {
+		endpoint: Str
+		who: Str
+		x: Float
+		y: Float
+		z: Float
+		yaw: Float
+		health: Int
+	}
+	// A shot somebody else fired, so every screen draws the same tracer.
+	Saw { ax: Float, ay: Float, az: Float, bx: Float, by: Float, bz: Float }
+	// "I shot you." The damage is applied by whoever receives this, because they
+	// are the one holding that player's health.
+	Hit { endpoint: Str, who: Str, damage: Int }
+	// "You shot me." Sent by the player who went down, which makes it the one
+	// claim about a kill that comes from the node entitled to make it.
+	Killed { endpoint: Str, who: Str }
+	Gone { endpoint: Str }
+
+	// --- the dead ---
+	//
+	// Every node keeps a pack of its own (see "The dead"), and these are the four
+	// messages that arrangement needs: what my pack is doing, that somebody shot
+	// one of them, that one of mine bit you, and that one of yours finished off
+	// one of mine. Each one follows the rule the players already follow — the node
+	// that owns a thing is the only node that changes it.
+	Pack { endpoint: Str, horde: Zombie[dyn] }
+	Clawed { endpoint: Str, id: Int, damage: Int }
+	Bitten { damage: Int }
+	Felled
+
+	// From the greeter, which runs off the fold's thread.
+	Met { endpoint: Str, who: Str, roster: Str[dyn], horde: Zombie[dyn] }
+	Unreachable { endpoint: Str }
+}
+
+// ---------------------------------------------------------------------------
+// The state
+// ---------------------------------------------------------------------------
+
+type Screen {
+	Lobby
+	Arena
+}
+
+// My own player. `y` is the ground under the feet, not the eye — the eye is a
+// constant above it, and keeping the two apart is what makes standing on a crate
+// mean anything.
+type Body {
+	x: Float
+	y: Float
+	z: Float
+	fall: Float
+	yaw: Float
+	pitch: Float
+	health: Int
+}
+
+// Somebody else, as last heard from. This is not a live handle on them: it is a
+// message that arrived, and the picture is drawn from it.
+type Foe {
+	endpoint: Str
+	who: Str
+	x: Float
+	y: Float
+	z: Float
+	yaw: Float
+	health: Int
+	score: Int
+}
+
+// One of the dead. `owner` is the node whose pack it belongs to — the only node
+// that moves it, and the one a shot at it is reported to — and `id` is that node's
+// own numbering. The pair is what makes "that one there" mean the same thing on
+// two machines.
+type Zombie {
+	owner: Str
+	id: Int
+	x: Float
+	y: Float
+	z: Float
+	yaw: Float
+	health: Int
+	bite: Int
+}
+
+// Somebody a zombie might walk towards. It is a flat little type on purpose: the
+// horde does not care whether it is chasing this node's player or a player on
+// another machine, and the code that steers it should not have to ask.
+type Prey {
+	endpoint: Str
+	x: Float
+	z: Float
+}
+
+// One step of the horde: where they all are now, and who they reached. The bites
+// are handed back rather than sent, because working out what happened is a `func`
+// and telling somebody about it is a `proc`.
+type Assault {
+	horde: Zombie[dyn]
+	bitten: Str[dyn]
+}
+
+// What a shot found. `Nobody` is a miss, and the two others say which of the two
+// kinds of thing it was — because a player is told they were hit and the horde's
+// keeper is told a zombie was, and those go to different nodes.
+type Struck {
+	Nobody
+	Player { endpoint: Str }
+	Undead { owner: Str, id: Int }
+}
+
+// A shot, briefly. `life` is how many milliseconds it still has to be seen for.
+type Tracer {
+	ax: Float
+	ay: Float
+	az: Float
+	bx: Float
+	by: Float
+	bz: Float
+	life: Int
+}
+
+// One solid thing in the arena. The same vector is what gets drawn, what a player
+// bumps into and what a bullet stops at — one description, three uses, and no way
+// for the picture to disagree with the collisions.
+type Block {
+	x: Float
+	y: Float
+	z: Float
+	w: Float
+	h: Float
+	d: Float
+	shade: Str
+}
+
+// Where somebody comes back after they go down.
+type Spot {
+	x: Float
+	z: Float
+	yaw: Float
+}
+
+// What a shot did. A pure `func` works this out and a `proc` sends it, which is
+// the split that lets a test fire a gun without a network.
+type Shot {
+	at: Struck
+	ax: Float
+	ay: Float
+	az: Float
+	bx: Float
+	by: Float
+	bz: Float
+}
+
+type Model {
+	me: Str
+	mine: Str
+	peer: Str
+	screen: Screen
+	aiming: Bool
+	trouble: Str
+
+	body: Body
+	held: Str[dyn]
+	others: Foe[dyn]
+	tracers: Tracer[dyn]
+	// This node's own pack, which it moves, and everybody else's, which it is
+	// told about. Keeping them apart is what keeps the rule visible: one of these
+	// is this program's to change and the other is not.
+	pack: Zombie[dyn]
+	swarm: Zombie[dyn]
+	want: Int
+
+	kills: Int
+	felled: Int
+	deaths: Int
+	cooldown: Int
+	down: Int
+	beat: Int
+	sprout: Int
+	nextId: Int
+	board: Bool
+	nodes: Str[dyn]
+}
+
+// ---------------------------------------------------------------------------
+// The arena
+// ---------------------------------------------------------------------------
+
+// Written down once, as data. Four walls and some cover, and every one of them is
+// a box — which is the whole geometry vocabulary this game needs.
+func arena(): Block[dyn] {
+	mut Block[dyn] blocks = [
+		Block(0.0, 2.0, -20.0, 40.0, 4.0, 1.0, "#7d6b58"),
+		Block(0.0, 2.0, 20.0, 40.0, 4.0, 1.0, "#7d6b58"),
+		Block(-20.0, 2.0, 0.0, 1.0, 4.0, 40.0, "#7d6b58"),
+		Block(20.0, 2.0, 0.0, 1.0, 4.0, 40.0, "#7d6b58"),
+
+		// Cover in the middle, and a pair of towers to jump onto.
+		Block(0.0, 1.0, 0.0, 6.0, 2.0, 6.0, "#8a9aa8"),
+		Block(-8.0, 0.6, -6.0, 2.4, 1.2, 2.4, "#c98b4b"),
+		Block(8.0, 0.6, 6.0, 2.4, 1.2, 2.4, "#c98b4b"),
+		Block(-8.0, 0.6, 6.0, 2.4, 1.2, 2.4, "#c98b4b"),
+		Block(8.0, 0.6, -6.0, 2.4, 1.2, 2.4, "#c98b4b"),
+		Block(-13.0, 1.5, 0.0, 3.0, 3.0, 3.0, "#6f7f8c"),
+		Block(13.0, 1.5, 0.0, 3.0, 3.0, 3.0, "#6f7f8c"),
+		Block(0.0, 0.5, -12.0, 5.0, 1.0, 1.6, "#c98b4b"),
+		Block(0.0, 0.5, 12.0, 5.0, 1.0, 1.6, "#c98b4b")
+	]
+	return blocks
+}
+
+// Which corner to start in: the one this node's port picks. Two players on one
+// machine always differ in it, and it costs no round trip to agree on — there is
+// nobody to ask when you are the first one here.
+func mySpot(mine: Str): Spot {
+	return spot(portOf(mine))
+}
+
+// The port out of an "ip:port". A `Str` is what an endpoint is, so this is
+// ordinary string work — and an endpoint that does not parse gets the first
+// corner rather than an error, because where you start is not worth failing over.
+func portOf(endpoint: Str): Int {
+	parts := split(endpoint, ":")
+	if parts bounds 1 {
+		if conv.sti(parts[1]) is Result.Ok(port) {
+			return port
+		}
+	}
+	return 0
+}
+
+// Where to come back after going down: the corner with the most room, which is
+// the corner whose nearest player is furthest away. A game that dropped you on
+// top of whoever killed you would be a worse game, and picking the emptiest of
+// four is two lines of arithmetic over state this node already has.
+func vacancy(model: Model): Spot {
+	mut Spot best = spot(0)
+	mut Float room = 0.0 - 1.0
+	for i := 0; i < 4; i++ {
+		corner := spot(i)
+		nearest := lonely(model.others, corner)
+		if nearest > room {
+			room = nearest
+			best = corner
+		}
+	}
+	return best
+}
+
+// How far the closest living player is from a corner — a very long way, when
+// there is nobody about.
+func lonely(others: Foe[], corner: Spot): Float {
+	mut Float least = 1000.0
+	for each foe in others {
+		if foe.health > 0 {
+			gap := math.hypot(foe.x - corner.x, foe.z - corner.z)
+			if gap < least {
+				least = gap
+			}
+		}
+	}
+	return least
+}
+
+// The four corners. `n` is taken modulo four, so a port or an index may be handed
+// in without either of them having to know how many there are.
+func spot(n: Int): Spot {
+	which := n % 4
+	if which == 0 {
+		return Spot(-16.0, -16.0, 0.8)
+	}
+	if which == 1 {
+		return Spot(16.0, -16.0, 2.4)
+	}
+	if which == 2 {
+		return Spot(16.0, 16.0, 3.9)
+	}
+	return Spot(-16.0, 16.0, 5.5)
+}
+
+// ---------------------------------------------------------------------------
+// Moving
+// ---------------------------------------------------------------------------
+// Everything from here to "Shooting" is a `func` of the state. That is not
+// tidiness: a `func` cannot act, so none of it can send a message or touch the
+// screen by accident — and `fps.test.hive` walks a player into a wall without a
+// window, a mouse or a second machine anywhere.
+
+// How fast a player walks, in metres per second, and how hard the world pulls.
+func speed(): Float {
+	return 6.4
+}
+
+func gravity(): Float {
+	return 20.0
+}
+
+// How high the eye is above the feet, and how wide a player is. The second one is
+// used twice — to stop them walking through walls, and to work out whether a
+// bullet found them — so it is written once.
+func eyes(): Float {
+	return 1.62
+}
+
+func girth(): Float {
+	return 0.36
+}
+
+// One frame. Look and shoot arrive as their own messages; this is the part that
+// happens whether or not anything did: the walking, the falling, the reload, and
+// the tracers going out.
+func stepped(model: Model, ms: Int): Model {
+	dt := math.min(conv.itf(ms) / 1000.0, 0.05)
+	mut Model next = model
+	next.cooldown = floored(model.cooldown - ms)
+	next.tracers = fading(model.tracers, ms)
+	next.beat = model.beat - ms
+
+	if alive(model) == false {
+		next.down = model.down - ms
+		if next.down <= 0 {
+			next.body = fresh(vacancy(model))
+		}
+		return next
+	}
+
+	next.body = walked(model, dt)
+	return next
+}
+
+// Where a body ends up after `dt` seconds of whatever is held down.
+//
+// The two horizontal steps are taken one at a time, and each is given up
+// separately if it would end inside something. That is what lets a player slide
+// along a wall they are pushing into instead of stopping dead against it.
+func walked(model: Model, dt: Float): Body {
+	blocks := arena()
+	mut Body body = model.body
+
+	ahead := axis(model, "w", "s")
+	side := axis(model, "d", "a")
+	if ahead != 0.0 || side != 0.0 {
+		// Forward is where the eye is pointing, flattened: rotating (0, 0, -1) by
+		// the yaw gives (-sin, -cos), and right is the same turn a quarter later.
+		fx := 0.0 - math.sin(body.yaw)
+		fz := 0.0 - math.cos(body.yaw)
+		mut Float dx = fx * ahead + math.cos(body.yaw) * side
+		mut Float dz = fz * ahead + (0.0 - math.sin(body.yaw)) * side
+		// Diagonals are not faster. The length is what is normalised, so holding
+		// two keys turns you rather than launching you.
+		length := math.hypot(dx, dz)
+		if length > 0.0 {
+			step := speed() * dt / length
+			dx = dx * step
+			dz = dz * step
+		}
+		if clear(blocks, body.x + dx, body.y, body.z) {
+			body.x = body.x + dx
+		}
+		if clear(blocks, body.x, body.y, body.z + dz) {
+			body.z = body.z + dz
+		}
+	}
+
+	// Down, then what stopped it. A jump is a push upwards and nothing else; the
+	// same three lines bring it back.
+	body.fall = body.fall - gravity() * dt
+	if held(model, "space") && grounded(model) {
+		body.fall = 7.4
+	}
+	was := body.y
+	body.y = body.y + body.fall * dt
+	// The lid to land on is looked for across the whole step, not at the end of
+	// it. Falling fast, a foot that was above a crate is below it by the time the
+	// step is over — and asking "is there a lid near where I am now" would miss
+	// it and drop the player through the crate.
+	floor := ledge(blocks, body.x, body.z, math.max(was, body.y))
+	if body.y <= floor {
+		body.y = floor
+		body.fall = 0.0
+	}
+	// A jump into the underside of something stops there rather than passing
+	// through it.
+	if body.fall > 0.0 && clear(blocks, body.x, body.y, body.z) == false {
+		body.y = body.y - body.fall * dt
+		body.fall = 0.0
+	}
+	return body
+}
+
+// Which way one pair of keys adds up to: forwards, backwards, or nowhere.
+func axis(model: Model, plus: Str, minus: Str): Float {
+	mut Float total = 0.0
+	if held(model, plus) {
+		total = total + 1.0
+	}
+	if held(model, minus) {
+		total = total - 1.0
+	}
+	return total
+}
+
+func held(model: Model, key: Str): Bool {
+	if indexOf(model.held, key) is Result.Ok(_) {
+		return true
+	}
+	return false
+}
+
+func grounded(model: Model): Bool {
+	return model.body.y <= ledge(arena(), model.body.x, model.body.z, model.body.y) + 0.02
+}
+
+func alive(model: Model): Bool {
+	return model.body.health > 0
+}
+
+// Whether a player standing at this spot is inside nothing. A block whose top is
+// at or below the feet is not in the way — that is what makes a crate something
+// you climb onto rather than something you bump into.
+func clear(blocks: Block[], x: Float, y: Float, z: Float): Bool {
+	for each block in blocks {
+		if inside(block, x, y, z) {
+			return false
+		}
+	}
+	return true
+}
+
+func inside(block: Block, x: Float, y: Float, z: Float): Bool {
+	if block.y + block.h / 2.0 <= y + 0.35 {
+		return false
+	}
+	if x + girth() < block.x - block.w / 2.0 || x - girth() > block.x + block.w / 2.0 {
+		return false
+	}
+	if z + girth() < block.z - block.d / 2.0 || z - girth() > block.z + block.d / 2.0 {
+		return false
+	}
+	if y + eyes() < block.y - block.h / 2.0 || y > block.y + block.h / 2.0 {
+		return false
+	}
+	return true
+}
+
+// The highest thing under the feet: the top of a block being stood on, or the
+// ground. Only a top the feet are already at or above counts, so walking into the
+// side of a crate does not lift anybody onto it.
+func ledge(blocks: Block[], x: Float, z: Float, y: Float): Float {
+	mut Float top = 0.0
+	for each block in blocks {
+		if over(block, x, z) {
+			lid := block.y + block.h / 2.0
+			if lid <= y + 0.35 && lid > top {
+				top = lid
+			}
+		}
+	}
+	return top
+}
+
+func over(block: Block, x: Float, z: Float): Bool {
+	if x + girth() < block.x - block.w / 2.0 || x - girth() > block.x + block.w / 2.0 {
+		return false
+	}
+	if z + girth() < block.z - block.d / 2.0 || z - girth() > block.z + block.d / 2.0 {
+		return false
+	}
+	return true
+}
+
+// Turning. The mouse reports how far it moved and the model decides what that is
+// worth; pitch stops short of straight up and straight down, because there is
+// nothing above the top of the sky to look at and rolling over would be worse.
+func turned(model: Model, dx: Float, dy: Float): Body {
+	mut Body body = model.body
+	body.yaw = body.yaw - dx * 0.0024
+	body.pitch = math.clamp(body.pitch - dy * 0.0024, 0.0 - 1.35, 1.35)
+	return body
+}
+
+func fresh(spot: Spot): Body {
+	return Body(spot.x, 0.0, spot.z, 0.0, spot.yaw, 0.0, 100)
+}
+
+// ---------------------------------------------------------------------------
+// The dead
+// ---------------------------------------------------------------------------
+// **Every player brings their own dead.** A node keeps a pack of one to five
+// zombies — a number it rolls for itself — steps them, spawns them, and applies
+// what people shoot at them; everybody else draws them from what they are told.
+// So the horde grows with the room without anybody agreeing on anything, and no
+// node is in charge of the game.
+//
+// That the *owner* simulates its own pack is the whole design, and it is the same
+// rule the players already follow: the node that owns a thing is the only node
+// that changes it. Two nodes stepping one zombie would disagree within a second,
+// and "who shot it" would have no answer at all. Here a shot at a zombie is a
+// message to whoever owns it, exactly as a shot at a player is a message to that
+// player — and a pack whose owner quits leaves with them, because nothing else was
+// ever pretending to know where they were.
+//
+// It also settles what "single player" means: nothing. A node alone in the roster
+// is fighting its own pack and nobody else's, and the moment somebody knocks the
+// two packs are simply both there. No match to restart and no mode to switch.
+
+// Every zombie anybody has, mine and everybody else's, as one vector — which is
+// what gets drawn and what a bullet is checked against. `owner` is what tells the
+// two apart, and it is where a shot is reported to.
+func mob(model: Model): Zombie[dyn] {
+	mut Zombie[dyn] all = []
+	for each zombie in model.pack {
+		append(all, zombie)
+	}
+	for each zombie in model.swarm {
+		append(all, zombie)
+	}
+	return all
+}
+
+// Playing alone is not a mode this program has; it is a fact about the roster. A
+// node with nobody else in it is fighting the dead only, and the moment somebody
+// knocks it is not. Going back the other way is a `Gone` message.
+func alone(model: Model): Bool {
+	return len(model.others) == 0
+}
+
+// Slower than a player — you can always outrun one — but not by so much that
+// backing away is a plan. Four of them coming from different directions is the
+// problem, and that is what running out of room feels like.
+func zombieSpeed(): Float {
+	return 3.9
+}
+
+func reach(): Float {
+	return 1.5
+}
+
+func teeth(): Int {
+	return 17
+}
+
+// Everybody a zombie might go after: this node's player and every other one it
+// has heard from, minus whoever is currently down. A pack belongs to one node but
+// hunts *anybody* — which is what makes another player's zombies your problem too.
+func prey(model: Model): Prey[dyn] {
+	mut Prey[dyn] living = []
+	if alive(model) {
+		append(living, Prey(model.mine, model.body.x, model.body.z))
+	}
+	for each foe in model.others {
+		if foe.health > 0 {
+			append(living, Prey(foe.endpoint, foe.x, foe.z))
+		}
+	}
+	return living
+}
+
+// One step of this node's own pack: each of them walks at whoever is nearest and
+// bites them if it can reach. The bites come back in a list rather than being
+// sent, because this is a `func` — which is what lets a test stand a zombie next
+// to a player and check that it bit them.
+func shambled(model: Model, ms: Int): Assault {
+	dt := math.min(conv.itf(ms) / 1000.0, 0.05)
+	blocks := arena()
+	hunted := prey(model)
+	mut Zombie[dyn] stepped = []
+	mut Str[dyn] bitten = []
+
+	for each zombie in model.pack {
+		mut Zombie next = zombie
+		next.bite = floored(zombie.bite - ms)
+		target := nearest(hunted, zombie.x, zombie.z)
+		if target.endpoint != "" {
+			toX := target.x - zombie.x
+			toZ := target.z - zombie.z
+			away := math.hypot(toX, toZ)
+			// Facing is worked out even when it cannot move: a zombie stuck behind
+			// a crate still looks at what it wants.
+			next.yaw = math.atan2(0.0 - toX, 0.0 - toZ)
+			if away <= reach() && next.bite == 0 {
+				next.bite = 900
+				append(bitten, target.endpoint)
+			}
+			if away > reach() && away > 0.0 {
+				step := zombieSpeed() * dt / away
+				onX := zombie.x + toX * step
+				onZ := zombie.z + toZ * step
+				if clear(blocks, onX, zombie.y, zombie.z) {
+					next.x = onX
+				}
+				if clear(blocks, next.x, zombie.y, onZ) {
+					next.z = onZ
+				}
+			}
+		}
+		append(stepped, next)
+	}
+	return Assault(stepped, bitten)
+}
+
+func nearest(hunted: Prey[], x: Float, z: Float): Prey {
+	mut Prey closest = Prey("", 0.0, 0.0)
+	mut Float least = 1000.0
+	for each one in hunted {
+		gap := math.hypot(one.x - x, one.z - z)
+		if gap < least {
+			least = gap
+			closest = one
+		}
+	}
+	return closest
+}
+
+// Keeping the pack up to strength is four small questions, and none of them needs
+// a random number — which is what lets every one of them be a `func` a test can
+// call. The fold asks them in order and does the two things that *are* impure:
+// rolling how many to carry, and rolling where to raise the next one.
+
+// The clock between one rising and the next.
+func waiting(model: Model, ms: Int): Model {
+	mut Model next = model
+	next.sprout = model.sprout - ms
+	return next
+}
+
+func due(model: Model): Bool {
+	return model.sprout <= 0 && len(model.pack) < model.want
+}
+
+func full(model: Model): Bool {
+	return len(model.pack) >= model.want
+}
+
+// How many to carry from here on. Rolled again every time the pack is complete, so
+// a player who clears their five may find themselves with one, or five again, and
+// never knows which.
+func carrying(model: Model, rolled: Int): Model {
+	mut Model next = model
+	next.want = rolled
+	return next
+}
+
+// One more of them, at a place the fold found. It arrives standing, whole, and
+// already looking for somebody.
+func raised(model: Model, where: Spot): Model {
+	mut Model next = model
+	next.sprout = 1400
+	next.nextId = model.nextId + 1
+	append(next.pack, Zombie(model.mine, next.nextId, where.x, 0.0, where.z,
+		where.yaw, 68, 0))
+	return next
+}
+
+// Whether a place is fit to raise one in: inside the walls, not inside anything
+// solid, and — the rule that matters — not on top of anybody. A zombie that
+// appears at arm's length is not a fright, it is a free bite, and the distance
+// here is roughly "far enough that you get to hear it coming".
+func decent(model: Model, x: Float, z: Float): Bool {
+	if math.abs(x) > 18.0 || math.abs(z) > 18.0 {
+		return false
+	}
+	if clear(arena(), x, 0.0, z) == false {
+		return false
+	}
+	for each one in prey(model) {
+		if math.hypot(one.x - x, one.z - z) < 9.0 {
+			return false
+		}
+	}
+	return true
+}
+
+// What somebody shot, applied — and only ever by the node whose pack it is, which
+// is what stops two nodes each deciding they killed the same zombie. The fallen
+// are dropped here rather than left lying: a pack is what is standing.
+func clawed(model: Model, id: Int, hurt: Int): Model {
+	mut Model next = model
+	next.pack = standing(map(model.pack, wounding(_, id, hurt)))
+	return next
+}
+
+func wounding(zombie: Zombie, id: Int, hurt: Int): Zombie {
+	if zombie.id != id {
+		return zombie
+	}
+	return Zombie(zombie.owner, zombie.id, zombie.x, zombie.y, zombie.z,
+		zombie.yaw, floored(zombie.health - hurt), zombie.bite)
+}
+
+// Whether that shot is the one that finishes it. The owner asks *before* applying
+// the damage, because "it was standing and now it is not" is the only moment worth
+// telling the shooter about.
+func finished(model: Model, id: Int, hurt: Int): Bool {
+	for each zombie in model.pack {
+		if zombie.id == id {
+			return zombie.health > 0 && zombie.health - hurt <= 0
+		}
+	}
+	return false
+}
+
+func standing(horde: Zombie[]): Zombie[dyn] {
+	mut Zombie[dyn] left = []
+	for each zombie in horde {
+		if zombie.health > 0 {
+			append(left, zombie)
+		}
+	}
+	return left
+}
+
+// What another node just said its pack is doing. Their word replaces whatever we
+// had of theirs and touches nothing else — the same rule as a player's position,
+// for the same reason: they are the only node entitled to say.
+func told(model: Model, endpoint: Str, pack: Zombie[]): Model {
+	mut Model next = model
+	mut Zombie[dyn] others = filter(model.swarm, notOwnedBy(_, endpoint))
+	for each zombie in pack {
+		append(others, zombie)
+	}
+	next.swarm = others
+	return next
+}
+
+func notOwnedBy(zombie: Zombie, endpoint: Str): Bool {
+	return zombie.owner != endpoint
+}
+
+// ---------------------------------------------------------------------------
+// Shooting
+// ---------------------------------------------------------------------------
+
+// Where the bullet went and whom it found. Hit-scan: the shot arrives the instant
+// it is fired, which is what every game of this kind does and what makes the
+// answer a `func` of the state rather than something to simulate.
+//
+// The eye is the origin; the direction is the aim in full, pitch included. A
+// player is a sphere around their chest, a wall is a box, and the nearest of the
+// two is what the bullet met.
+func aimed(model: Model): Shot {
+	ox := model.body.x
+	oy := model.body.y + eyes()
+	oz := model.body.z
+	flat := math.cos(model.body.pitch)
+	dx := 0.0 - math.sin(model.body.yaw) * flat
+	dy := math.sin(model.body.pitch)
+	dz := 0.0 - math.cos(model.body.yaw) * flat
+
+	// The wall is what the bullet meets if nothing else does, and everything else
+	// has to be nearer than it to count. Players and zombies are checked the same
+	// way and against the same distance, so whichever is in front is what is hit —
+	// a zombie between you and somebody else is cover, and shooting it in the back
+	// is a perfectly good idea.
+	mut Float best = wall(arena(), ox, oy, oz, dx, dy, dz)
+	mut Struck at = Struck.Nobody()
+	for each foe in model.others {
+		if foe.health > 0 {
+			hit := struck(foe.x, foe.y, foe.z, ox, oy, oz, dx, dy, dz)
+			if hit >= 0.0 && hit < best {
+				best = hit
+				at = Struck.Player(foe.endpoint)
+			}
+		}
+	}
+	for each zombie in mob(model) {
+		hit := struck(zombie.x, zombie.y, zombie.z, ox, oy, oz, dx, dy, dz)
+		if hit >= 0.0 && hit < best {
+			best = hit
+			at = Struck.Undead(zombie.owner, zombie.id)
+		}
+	}
+	return Shot(at, ox, oy, oz, ox + dx * best, oy + dy * best, oz + dz * best)
+}
+
+// How far the shot travels before something solid stops it — or as far as anybody
+// can see, when nothing does.
+func wall(
+	blocks: Block[],
+	ox: Float,
+	oy: Float,
+	oz: Float,
+	dx: Float,
+	dy: Float,
+	dz: Float
+): Float {
+	mut Float nearest = 90.0
+	for each block in blocks {
+		reach := entry(block, ox, oy, oz, dx, dy, dz)
+		if reach >= 0.0 && reach < nearest {
+			nearest = reach
+		}
+	}
+	return nearest
+}
+
+// Where a ray enters a box, or a negative answer if it never does.
+//
+// The classic slab test: a box is three pairs of parallel planes, the ray is
+// inside the box between entering the last of them and leaving the first. Written
+// with `enters` and `exits` below so the three axes read the same.
+func entry(
+	block: Block,
+	ox: Float,
+	oy: Float,
+	oz: Float,
+	dx: Float,
+	dy: Float,
+	dz: Float
+): Float {
+	near := math.max(
+		math.max(
+			enters(ox, dx, block.x - block.w / 2.0, block.x + block.w / 2.0),
+			enters(oy, dy, block.y - block.h / 2.0, block.y + block.h / 2.0)
+		),
+		enters(oz, dz, block.z - block.d / 2.0, block.z + block.d / 2.0)
+	)
+	far := math.min(
+		math.min(
+			exits(ox, dx, block.x - block.w / 2.0, block.x + block.w / 2.0),
+			exits(oy, dy, block.y - block.h / 2.0, block.y + block.h / 2.0)
+		),
+		exits(oz, dz, block.z - block.d / 2.0, block.z + block.d / 2.0)
+	)
+	if far < near || far < 0.0 {
+		return 0.0 - 1.0
+	}
+	return math.max(near, 0.0)
+}
+
+// Where the ray crosses into one slab, and where it crosses out. A ray going
+// nowhere along an axis is either inside that slab for its whole length or
+// outside it for the whole length, and the two absurd distances say which — which
+// is what keeps a division by zero out of it.
+func enters(o: Float, d: Float, low: Float, high: Float): Float {
+	if math.abs(d) < 0.000001 {
+		if o < low || o > high {
+			return 1000000.0
+		}
+		return 0.0 - 1000000.0
+	}
+	return math.min((low - o) / d, (high - o) / d)
+}
+
+func exits(o: Float, d: Float, low: Float, high: Float): Float {
+	if math.abs(d) < 0.000001 {
+		if o < low || o > high {
+			return 0.0 - 1000000.0
+		}
+		return 1000000.0
+	}
+	return math.max((low - o) / d, (high - o) / d)
+}
+
+// What a player is, to a bullet: one sphere around the chest, this high above
+// their feet and this wide. It covers the body and the head, and it deliberately
+// does not cover the legs — a shot at somebody's shins misses, which is a rule
+// worth having on purpose rather than a rule that fell out of the arithmetic.
+func chest(): Float {
+	return 1.15
+}
+
+func build(): Float {
+	return 0.7
+}
+
+// How far along the ray somebody was hit, or a negative answer for a miss. The
+// nearest point on the ray to their chest, and whether that is within arm's
+// length of it. It takes three numbers rather than a player because the living
+// and the dead are shot at in exactly the same way.
+func struck(
+	atX: Float,
+	atY: Float,
+	atZ: Float,
+	ox: Float,
+	oy: Float,
+	oz: Float,
+	dx: Float,
+	dy: Float,
+	dz: Float
+): Float {
+	cx := atX - ox
+	cy := atY + chest() - oy
+	cz := atZ - oz
+	along := cx * dx + cy * dy + cz * dz
+	if along < 0.0 {
+		return 0.0 - 1.0
+	}
+	offX := cx - dx * along
+	offY := cy - dy * along
+	offZ := cz - dz * along
+	if math.sqrt(offX * offX + offY * offY + offZ * offZ) > build() {
+		return 0.0 - 1.0
+	}
+	return along
+}
+
+// Bullets do 34, so three of them are enough and two are not.
+func damage(): Int {
+	return 34
+}
+
+// Milliseconds and health are `Int`s, and `hive.math` is `Float` throughout — so
+// this is where the two meet, and it needs nothing from a library. Hive never
+// widens a number behind your back (`hive.conv.itf` is how one crosses), which is
+// what makes `math.max(0, health)` a compile error rather than a surprise.
+func floored(n: Int): Int {
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+func wounded(model: Model, hurt: Int): Model {
+	mut Model next = model
+	next.body.health = floored(model.body.health - hurt)
+	if next.body.health == 0 {
+		next.deaths = model.deaths + 1
+		next.down = 2400
+		next.held = nothing()
+	}
+	return next
+}
+
+func fading(tracers: Tracer[], ms: Int): Tracer[dyn] {
+	mut Tracer[dyn] left = []
+	for each tracer in tracers {
+		if tracer.life > ms {
+			append(left, Tracer(tracer.ax, tracer.ay, tracer.az, tracer.bx,
+				tracer.by, tracer.bz, tracer.life - ms))
+		}
+	}
+	return left
+}
+
+func tracing(shot: Shot): Tracer {
+	return Tracer(shot.ax, shot.ay, shot.az, shot.bx, shot.by, shot.bz, 120)
+}
+
+// ---------------------------------------------------------------------------
+// Hearing from the others
+// ---------------------------------------------------------------------------
+
+func met(model: Model, endpoint: Str, who: Str): Model {
+	mut Model next = model
+	if endpoint == model.mine {
+		return next
+	}
+	if knows(model.others, endpoint) {
+		next.others = map(model.others, renamed(_, endpoint, who))
+		return next
+	}
+	append(next.others, Foe(endpoint, who, 0.0, 0.0, 0.0, 0.0, 100, 0))
+	return next
+}
+
+// Somebody moved. This replaces what we had for them rather than adding to it —
+// the message *is* their position, and the last one to arrive is the truth.
+func moved(model: Model, msg: Msg): Model {
+	if msg is Msg.Moved(endpoint, who, x, y, z, yaw, health) {
+		mut Model next = met(model, endpoint, who)
+		next.others = map(next.others, placed(_, endpoint, who, x, y, z, yaw, health))
+		return next
+	}
+	return model
+}
+
+func placed(
+	foe: Foe,
+	endpoint: Str,
+	who: Str,
+	x: Float,
+	y: Float,
+	z: Float,
+	yaw: Float,
+	health: Int
+): Foe {
+	if foe.endpoint != endpoint {
+		return foe
+	}
+	return Foe(endpoint, who, x, y, z, yaw, health, foe.score)
+}
+
+func credited(foe: Foe, endpoint: Str): Foe {
+	if foe.endpoint != endpoint {
+		return foe
+	}
+	return Foe(foe.endpoint, foe.who, foe.x, foe.y, foe.z, foe.yaw, foe.health,
+		foe.score + 1)
+}
+
+func renamed(foe: Foe, endpoint: Str, who: Str): Foe {
+	if foe.endpoint != endpoint {
+		return foe
+	}
+	return Foe(endpoint, who, foe.x, foe.y, foe.z, foe.yaw, foe.health, foe.score)
+}
+
+func parted(model: Model, endpoint: Str): Model {
+	mut Model next = model
+	next.others = filter(model.others, isNot(_, endpoint))
+	return next
+}
+
+func isNot(foe: Foe, endpoint: Str): Bool {
+	return foe.endpoint != endpoint
+}
+
+func knows(others: Foe[], endpoint: Str): Bool {
+	for each foe in others {
+		if foe.endpoint == endpoint {
+			return true
+		}
+	}
+	return false
+}
+
+func endpointOf(foe: Foe): Str {
+	return foe.endpoint
+}
+
+// Everybody this node has met, itself included — the answer a `Hello` comes back
+// with, and the reason joining through one player is joining through all of them.
+func roster(model: Model): Str[dyn] {
+	mut Str[dyn] all = [model.mine]
+	for each endpoint in map(model.others, endpointOf) {
+		append(all, endpoint)
+	}
+	return all
+}
+
+// Which of a roster are worth greeting: not me, and not somebody already known.
+func strangers(model: Model, heard: Str[]): Str[dyn] {
+	mut Str[dyn] fresh = []
+	for each endpoint in heard {
+		if endpoint != model.mine && knows(model.others, endpoint) == false {
+			append(fresh, endpoint)
+		}
+	}
+	return fresh
+}
+
+func usable(name: Str): Bool {
+	return join(split(name, " "), "") != ""
+}
+
+func ready(model: Model): Bool {
+	return usable(model.me) && usable(model.peer)
+}
+
+// ---------------------------------------------------------------------------
+// The picture
+// ---------------------------------------------------------------------------
+
+// A scene is a value, so this is a `func` like any other view — and, like any
+// other view, it cannot act. Sixty of these are built a second and thrown away;
+// if drawing could send a message, every frame would send it again.
+func world(model: Model): ui.Shape[dyn] {
+	mut ui.Shape[dyn] shapes = [
+		ui.ground([ui.at(0.0, 0.0, 0.0), ui.paint(ui.Tone.HEX("#5f9e4a"))], 44.0, 44.0)
+	]
+	for each block in arena() {
+		append(shapes, ui.box(
+			[
+				ui.at(block.x, block.y, block.z),
+				ui.paint(ui.Tone.HEX(block.shade))
+			],
+			block.w,
+			block.h,
+			block.d
+		))
+	}
+	for each foe in model.others {
+		for each piece in player(foe) {
+			append(shapes, piece)
+		}
+	}
+	// Every pack in the arena, mine and everybody else's, drawn the same way —
+	// which is the point of `mob`: from here they are all just things standing
+	// about, and whose they are only matters when one is shot.
+	for each zombie in mob(model) {
+		for each piece in walker(zombie) {
+			append(shapes, piece)
+		}
+	}
+	for each tracer in model.tracers {
+		append(shapes, ui.line(
+			[ui.paint(ui.Tone.HEX("#ffe066"))],
+			tracer.ax,
+			tracer.ay,
+			tracer.az,
+			tracer.bx,
+			tracer.by,
+			tracer.bz
+		))
+	}
+	return shapes
+}
+
+// Somebody else: a body, a head, a snout to show which way they are facing, and
+// their name above them. Four shapes and a colour computed from their endpoint —
+// which is what `Tone.HEX` is for, since there is no role called "the other
+// player" and no closed set could have one.
+func player(foe: Foe): ui.Shape[dyn] {
+	mut ui.Shape[dyn] pieces = []
+	if foe.health <= 0 {
+		// Down, and lying where they fell rather than gone: a game that hides its
+		// dead makes the two seconds before they are back read as a disconnection.
+		append(pieces, ui.box(
+			[ui.at(foe.x, foe.y + 0.15, foe.z), ui.paint(ui.Tone.Muted())],
+			1.2,
+			0.3,
+			0.6
+		))
+		return pieces
+	}
+	shade := colour(foe.endpoint)
+	append(pieces, ui.box(
+		[
+			ui.at(foe.x, foe.y + 0.62, foe.z),
+			ui.turn(0.0, foe.yaw, 0.0),
+			ui.paint(shade)
+		],
+		0.62,
+		1.24,
+		0.42
+	))
+	append(pieces, ui.sphere(
+		[ui.at(foe.x, foe.y + 1.48, foe.z), ui.paint(ui.Tone.HEX("#f2d3ae"))],
+		0.26
+	))
+	// Where they are looking, so a player about to be shot at can tell.
+	append(pieces, ui.box(
+		[
+			ui.at(
+				foe.x - math.sin(foe.yaw) * 0.42,
+				foe.y + 1.2,
+				foe.z - math.cos(foe.yaw) * 0.42
+			),
+			ui.turn(0.0, foe.yaw, 0.0),
+			ui.paint(ui.Tone.HEX("#2b2f36"))
+		],
+		0.12,
+		0.12,
+		0.7
+	))
+	append(pieces, ui.label(
+		[ui.at(foe.x, foe.y + 2.1, foe.z), ui.paint(ui.Tone.HEX("#ffffff"))],
+		"{foe.who}  {foe.health}"
+	))
+	return pieces
+}
+
+// One of the dead: a hunched body, a head, and two arms held out in front — which
+// is the whole of what makes a box read as a zombie rather than as a crate. They
+// go grey as they are shot, so how much fight is left in one is something you can
+// see rather than something you have to remember.
+func walker(zombie: Zombie): ui.Shape[dyn] {
+	skin := rot(zombie.health)
+	mut ui.Shape[dyn] pieces = [
+		ui.box(
+			[
+				ui.at(zombie.x, zombie.y + 0.6, zombie.z),
+				ui.turn(0.0, zombie.yaw, 0.0),
+				ui.paint(skin)
+			],
+			0.56,
+			1.2,
+			0.38
+		),
+		ui.sphere(
+			[ui.at(zombie.x, zombie.y + 1.42, zombie.z), ui.paint(skin)],
+			0.25
+		)
+	]
+	// The arms, reaching. Both are the same box moved out to either side of
+	// wherever the thing is facing, which is two lines of trigonometry and the
+	// only reason a zombie needs any.
+	across := 0.26
+	ahead := 0.34
+	for each side in [0.0 - 1.0, 1.0] {
+		append(pieces, ui.box(
+			[
+				ui.at(
+					zombie.x - math.sin(zombie.yaw) * ahead + math.cos(zombie.yaw) * across * side,
+					zombie.y + 0.95,
+					zombie.z - math.cos(zombie.yaw) * ahead - math.sin(zombie.yaw) * across * side
+				),
+				ui.turn(0.0, zombie.yaw, 0.0),
+				ui.paint(skin)
+			],
+			0.16,
+			0.16,
+			0.62
+		))
+	}
+	return pieces
+}
+
+// Green, and staying green: a shot one goes darker and duller rather than grey, so
+// how much fight is left in it is something you can see without ever having to
+// wonder what you are looking at.
+//
+// `Tone.RGBA` is what a computed colour is for, and it is worth saying why it is
+// not `Tone.HEX` of a string built here: `HEX` is *checked*, so a colour that is
+// not `#` and then hex digits comes back as `Normal` rather than as whatever was
+// in the string. Which is the right behaviour — and the reason to hand the
+// channels over as the numbers they already are.
+func rot(health: Int): ui.Tone {
+	gone := 68 - floored(health)
+	fade := gone * 100 / 68
+	return ui.Tone.RGBA(58 + fade / 4, 186 - fade * 3 / 5, 52 + fade / 5, 255)
+}
+
+// A colour per player, computed from where they are. This is what `Tone.RGBA` is
+// for: there is no role called "the other player", and no closed set could have
+// one — the colour has to come from the value.
+//
+// It is the same on every screen, which matters more than it looks: "the green one
+// shot me" has to mean the same thing on both machines. The port carries the
+// weight because it is the part of an endpoint that actually differs between two
+// players on one machine; `bytes` alone would give every 14-character endpoint the
+// same colour, which is to say every player in a local game.
+//
+// The channels stay dark enough for the white name above them to read. A role
+// brings a legible foreground with it; a colour you computed brings nothing, so
+// the contrast is yours to get right.
+func colour(endpoint: Str): ui.Tone {
+	seed := portOf(endpoint) * 37 + bytes(endpoint) * 101
+	return ui.Tone.RGBA(50 + seed % 130, 50 + seed * 7 % 140, 80 + seed * 13 % 120, 255)
+}
+
+func view(model: Model): ui.View {
+	if model.screen is Screen.Lobby {
+		return ui.column([ui.grow(1)], [lobby(model)])
+	}
+	return ui.column([ui.height(0), ui.grow(1)], [
+		hud(model),
+		ui.scene(
+			[
+				ui.grow(1),
+				// The eye, and where it is looking. Both come straight out of the
+				// state: the camera is not something this program owns, it is
+				// something it describes.
+				ui.eye(model.body.x, model.body.y + eyes(), model.body.z),
+				ui.aim(model.body.yaw, model.body.pitch),
+				ui.lens(78),
+				ui.fog(70),
+				ui.background(ui.Tone.HEX("#8ecbff")),
+				// The mouse is asked for while the game is being played and given
+				// back the moment anything is in front of it.
+				ui.grab(playing(model)),
+				ui.crosshair(model.aiming && alive(model)),
+				ui.onFrame(Msg.Tick(_)),
+				ui.onKeyDown(Msg.Pressed(_)),
+				ui.onKeyUp(Msg.Released(_)),
+				ui.onLook(Msg.Looked(_, _)),
+				ui.onGrab(Msg.Grabbed(_))
+			],
+			world(model)
+		),
+		footer(model),
+		panel(model)
+	])
+}
+
+// Whether the mouse should be captured: playing, not reading the score, not
+// waiting to come back.
+func playing(model: Model): Bool {
+	return model.board == false && model.screen is Screen.Arena
+}
+
+func hud(model: Model): ui.View {
+	return ui.row([ui.pad(10), ui.gap(14), ui.align(ui.Align.Center())], [
+		ui.text([ui.size(ui.TextSize.Subtitle()), ui.heading(1)], model.me),
+		bar(model.body.health),
+		ui.text([], "{model.body.health}"),
+		ui.spacer(),
+		ui.text([ui.tone(ui.Tone.Warn())], "{len(mob(model))} up"),
+		ui.text([ui.tone(ui.Tone.Good())], "felled {model.felled}"),
+		mode(model),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			model.mine),
+		ui.button([ui.on(Msg.Left()), ui.tone(ui.Tone.Danger())], "Leave")
+	])
+}
+
+// What kind of game this is, which is not a setting anywhere: it is read off the
+// roster every time the screen is drawn. Alone, there is nobody to shoot but the
+// dead; with anybody else, there is.
+func mode(model: Model): ui.View {
+	if alone(model) {
+		return ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"alone · you and the dead")
+	}
+	return ui.row([ui.gap(10), ui.align(ui.Align.Center())], [
+		ui.text([ui.tone(ui.Tone.Good())], "kills {model.kills}"),
+		ui.text([ui.tone(ui.Tone.Danger())], "deaths {model.deaths}"),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"{len(model.others) + 1} playing")
+	])
+}
+
+// Ten cells, however many of them are left. A bar is a row of small boxes, which
+// is the sort of thing the widget set is meant to be enough for.
+func bar(health: Int): ui.View {
+	mut ui.View[dyn] cells = []
+	for i := 0; i < 10; i++ {
+		append(cells, ui.text(
+			[ui.width(10), ui.height(12), ui.background(shade(health, i))],
+			" "
+		))
+	}
+	return ui.row([ui.gap(2), ui.align(ui.Align.Center())], cells)
+}
+
+func shade(health: Int, cell: Int): ui.Tone {
+	if health <= cell * 10 {
+		return ui.Tone.HEX("#2f343b")
+	}
+	if health <= 30 {
+		return ui.Tone.Danger()
+	}
+	if health <= 60 {
+		return ui.Tone.Warn()
+	}
+	return ui.Tone.Good()
+}
+
+func footer(model: Model): ui.View {
+	return ui.row([ui.pad(8), ui.gap(12), ui.align(ui.Align.Center())], [
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"W A S D walk · space jumps · mouse looks · left button shoots · tab for the score · escape to let the mouse go"),
+		ui.spacer(),
+		trouble(model.trouble)
+	])
+}
+
+func trouble(why: Str): ui.View {
+	if why == "" {
+		return ui.none()
+	}
+	return ui.text([ui.tone(ui.Tone.Danger()), ui.size(ui.TextSize.Caption())], why)
+}
+
+// Whatever is in front of the game right now: the score, the two seconds after
+// being shot, or nothing. An overlay is the widget for exactly this, and it is
+// what also takes the mouse back — the picture behind it keeps being drawn.
+func panel(model: Model): ui.View {
+	if model.board {
+		return ui.overlay([ui.pad(20), ui.onDismiss(Msg.Grabbed(true))], scores(model))
+	}
+	if alive(model) == false {
+		return ui.overlay([ui.pad(28)], ui.column([ui.gap(8), ui.align(ui.Align.Center())], [
+			ui.text([ui.size(ui.TextSize.Title()), ui.tone(ui.Tone.Danger())], "You went down"),
+			ui.text([ui.tone(ui.Tone.Muted())], "back in {seconds(model.down)}")
+		]))
+	}
+	if model.aiming == false {
+		return ui.overlay([ui.pad(24)], ui.column([ui.gap(6), ui.align(ui.Align.Center())], [
+			ui.icon([ui.tone(ui.Tone.Good())], ui.Icon.Star()),
+			ui.text([ui.size(ui.TextSize.Subtitle())], "Click to play"),
+			ui.text([ui.tone(ui.Tone.Muted()), ui.size(ui.TextSize.Caption())],
+				"escape gives the mouse back")
+		]))
+	}
+	return ui.none()
+}
+
+// Whole seconds only. The panel is redrawn whenever it changes, and a countdown
+// in milliseconds would be a new document sixty times a second.
+func seconds(ms: Int): Str {
+	return "{ms / 1000 + 1}s"
+}
+
+func scores(model: Model): ui.View {
+	mut ui.View[dyn] rows = [
+		ui.row([ui.gap(12)], [
+			ui.text([ui.size(ui.TextSize.Subtitle())], "{model.me} (you)"),
+			ui.spacer(),
+			ui.text([ui.tone(ui.Tone.Good())], "{model.kills}"),
+			ui.text([ui.tone(ui.Tone.Muted())], "{model.deaths}")
+		])
+	]
+	for each foe in model.others {
+		append(rows, ui.row([ui.gap(12)], [
+			ui.text([ui.background(colour(foe.endpoint)),
+				ui.tone(ui.Tone.HEX("#ffffff")), ui.pad(2)], " {foe.who} "),
+			ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+				foe.endpoint),
+			ui.spacer(),
+			ui.text([ui.tone(ui.Tone.Good())], "{foe.score}")
+		]))
+	}
+	append(rows, ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+		"tab closes this"))
+	return ui.column([ui.gap(8), ui.width(420)], rows)
+}
+
+func lobby(model: Model): ui.View {
+	return ui.column([ui.pad(32), ui.gap(12), ui.width(470)], [
+		ui.row([ui.gap(8), ui.align(ui.Align.Center())], [
+			ui.icon([ui.tone(ui.Tone.Good())], ui.Icon.Star()),
+			ui.text([ui.size(ui.TextSize.Title()), ui.heading(1)], "Hive Arena")
+		]),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())], "Your name"),
+		ui.input([ui.onInput(Msg.NameTyped(_)), ui.onSubmit(joinedOf),
+			ui.placeholder("Ada")], model.me),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"Somebody already playing"),
+		ui.input([ui.onInput(Msg.PeerTyped(_)), ui.onSubmit(joinedOf),
+			ui.placeholder("127.0.0.1:9201")], model.peer),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"This node is listening on {model.mine}. Anybody they have met, you meet."),
+		ui.row([ui.gap(8), ui.align(ui.Align.Center())], [
+			trouble(model.trouble),
+			ui.spacer(),
+			// Alone needs nobody's address, and it is not a different game: this
+			// node is still listening, so anybody who turns up joins the one you
+			// are already playing.
+			ui.button([ui.on(Msg.Alone()), ui.disabled(usable(model.me) == false)],
+				"Play alone"),
+			ui.button([ui.on(Msg.Joined()), ui.tone(ui.Tone.Good()),
+				ui.disabled(ready(model) == false)], "Join somebody")
+		])
+	])
+}
+
+// `onSubmit` hands back what was typed and neither of these cares: it is already
+// in the model.
+func joinedOf(_typed: Str): Msg {
+	return Msg.Joined()
+}
+
+// ---------------------------------------------------------------------------
+// The fold
+// ---------------------------------------------------------------------------
+
+// The window's mailbox and the node's. A key, a mouse, a frame and another
+// machine all arrive here, and there is one `is` chain for the lot — which is the
+// claim `hive.syslink` makes, holding as far as the keyboard.
+//
+// There is no mutex in this program. The fold is the mutex.
+proc update(model: Model, msg: Msg, from: hive.syslink.Envelope): Model {
+	mut Model next = model
+
+	if msg is Msg.Tick(ms) {
+		return ticked(model, ms)
+	}
+	if msg is Msg.Looked(dx, dy) {
+		if alive(model) {
+			next.body = turned(model, dx, dy)
+		}
+		return next
+	}
+	if msg is Msg.Pressed(key) {
+		if key == "tab" {
+			next.board = model.board == false
+			return next
+		}
+		if held(model, key) == false {
+			append(next.held, key)
+		}
+		return next
+	}
+	if msg is Msg.Released(key) {
+		next.held = filter(model.held, isNotKey(_, key))
+		return next
+	}
+	if msg is Msg.Grabbed(on) {
+		next.aiming = on
+		// Letting the mouse go is how you get out, so it closes the score too —
+		// otherwise escape would leave the panel up with nothing holding it.
+		if on {
+			next.board = false
+		}
+		return next
+	}
+	if msg is Msg.NameTyped(text) {
+		next.me = text
+		return next
+	}
+	if msg is Msg.PeerTyped(text) {
+		next.peer = text
+		return next
+	}
+	if msg is Msg.Joined {
+		return joined(model, from)
+	}
+	if msg is Msg.Alone {
+		// The same start, minus the knocking. The window is still published and
+		// the node is still listening, which is the whole reason this is not a
+		// separate mode: somebody knocking turns it into a multiplayer game
+		// without this program doing anything about it.
+		return arrived(model, from)
+	}
+	if msg is Msg.Left {
+		return leaving(model)
+	}
+
+	// --- from the other machines ---
+
+	// The one message anybody waits for an answer to, and this is the branch that
+	// answers it. A service replies with one of its *own* messages, so the reply
+	// type is the mailbox type and nothing is annotated.
+	if msg is Msg.Hello(endpoint, who) {
+		hive.syslink.answer(from, Msg.Here(model.mine, model.me, roster(model),
+			model.pack))
+		mut Model greeted = met(model, endpoint, who)
+		greeted.nodes = hive.syslink.peers()
+		// Somebody being here answers "is anybody there?" as well as a reply would
+		// have. A node that was unreachable when we knocked and has since knocked
+		// back is not a problem any more, and leaving the warning up would be
+		// telling the player something that stopped being true.
+		greeted.trouble = ""
+		return greeted
+	}
+	if msg is Msg.Met(endpoint, who, heard, theirs) {
+		mut Model known = told(met(model, endpoint, who), endpoint, theirs)
+		// Everybody they know, greeted in turn. This is the line that turns a
+		// chain of introductions into a mesh — and it terminates because only
+		// strangers are greeted, and greeting one makes them known.
+		introduce(known, strangers(known, heard), hive.syslink.self(from))
+		known.nodes = hive.syslink.peers()
+		known.trouble = ""
+		return known
+	}
+	if msg is Msg.Moved {
+		return moved(model, msg)
+	}
+	if msg is Msg.Saw(ax, ay, az, bx, by, bz) {
+		append(next.tracers, Tracer(ax, ay, az, bx, by, bz, 120))
+		return next
+	}
+	if msg is Msg.Hit(endpoint, who, hurt) {
+		mut Model bleeding = wounded(model, hurt)
+		// Going down is mine to report, and the credit goes back to whoever did
+		// it. Nobody else can honestly say this happened.
+		if alive(model) && alive(bleeding) == false {
+			far := hive.syslink.on(endpoint, #Arena)
+			async far(Msg.Killed(model.mine, model.me))
+		}
+		return bleeding
+	}
+	if msg is Msg.Killed(endpoint, who) {
+		next.kills = model.kills + 1
+		next.others = map(model.others, credited(_, endpoint))
+		return next
+	}
+	// --- the dead ---
+
+	if msg is Msg.Pack(endpoint, theirs) {
+		return told(model, endpoint, theirs)
+	}
+	// Somebody shot one of mine. Only this node can say what that does, because
+	// only this node is moving them.
+	if msg is Msg.Clawed(endpoint, id, hurt) {
+		if finished(model, id, hurt) {
+			hunter := hive.syslink.on(endpoint, #Arena)
+			async hunter(Msg.Felled())
+		}
+		return clawed(model, id, hurt)
+	}
+	if msg is Msg.Bitten(hurt) {
+		return wounded(model, hurt)
+	}
+	if msg is Msg.Felled {
+		next.felled = model.felled + 1
+		return next
+	}
+
+	if msg is Msg.Gone(endpoint) {
+		mut Model without = parted(model, endpoint)
+		// Their pack goes with them: nothing else was ever pretending to know
+		// where those were, so leaving them on the screen would be drawing a
+		// simulation that has stopped.
+		without.swarm = filter(model.swarm, notOwnedBy(_, endpoint))
+		without.nodes = hive.syslink.peers()
+		return without
+	}
+	if msg is Msg.Unreachable(endpoint) {
+		next.trouble = "No answer from {endpoint}. Is it running?"
+		return next
+	}
+	// `Here` only ever comes back as the answer to a `Hello`, never into the
+	// mailbox — but it is one of the mailbox's messages, so it has a branch.
+	return model
+}
+
+func isNotKey(had: Str, key: Str): Bool {
+	return had != key
+}
+
+// One frame: step the world and this node's own pack, fire if the trigger is
+// down, and now and then tell everybody what both are doing.
+proc ticked(model: Model, ms: Int): Model {
+	mut Model next = stepped(model, ms)
+
+	// This node's own dead. They are stepped here — on the fold's thread, in the
+	// same turn as everything else — so a frame is one consistent picture: the
+	// player has moved, the pack has moved, and nothing was half way.
+	assault := shambled(model, ms)
+	next.pack = assault.horde
+	next = waiting(next, ms)
+	if due(next) {
+		next = raised(next, somewhere(next))
+	}
+	if full(next) {
+		next = carrying(next, roll())
+	}
+	for each endpoint in assault.bitten {
+		if endpoint == model.mine {
+			next = wounded(next, teeth())
+		}
+		if endpoint != model.mine {
+			far := hive.syslink.on(endpoint, #Arena)
+			async far(Msg.Bitten(teeth()))
+		}
+	}
+
+	if held(model, "mouse1") && model.cooldown <= 0 && alive(model) {
+		shot := aimed(model)
+		next.cooldown = 190
+		append(next.tracers, tracing(shot))
+		next = fire(next, shot)
+	}
+
+	// Fifteen times a second rather than sixty. The others draw this player and
+	// this pack from the last thing they heard, and hearing it every four frames
+	// is enough to look continuous — while sending sixty would be four times the
+	// traffic for a difference nobody can see.
+	if next.beat <= 0 {
+		next.beat = 66
+		announce(next)
+	}
+	return next
+}
+
+// The tracer goes to everybody so that every screen sees the same shot. What was
+// hit goes to exactly one node — the player who was hit, or whoever owns the
+// zombie that was — because that is the node entitled to say what it did.
+//
+// A zombie of this node's own is the one case that answers itself: no message, no
+// waiting, and the score goes up in the same turn.
+proc fire(model: Model, shot: Shot): Model {
+	for each foe in model.others {
+		far := hive.syslink.on(foe.endpoint, #Arena)
+		async far(Msg.Saw(shot.ax, shot.ay, shot.az, shot.bx, shot.by, shot.bz))
+	}
+	if shot.at is Struck.Player(endpoint) {
+		hurt := hive.syslink.on(endpoint, #Arena)
+		async hurt(Msg.Hit(model.mine, model.me, damage()))
+	}
+	if shot.at is Struck.Undead(owner, id) {
+		if owner == model.mine {
+			mut Model mine = model
+			if finished(model, id, damage()) {
+				mine.felled = model.felled + 1
+			}
+			return clawed(mine, id, damage())
+		}
+		theirs := hive.syslink.on(owner, #Arena)
+		async theirs(Msg.Clawed(model.mine, id, damage()))
+	}
+	return model
+}
+
+// A number between one and five that nobody can predict, which is what decides how
+// many of the dead this node is carrying. `hive.crypto` is where the randomness
+// comes from — the same call a token is made with — and `roll` is a `proc` because
+// finding out is *doing* something: a `func` handed the same state twice has to
+// answer the same way twice, and this one must not.
+proc roll(): Int {
+	return 1 + hexOf(hive.crypto.randomHex(2)) % 5
+}
+
+// Somewhere in the arena to raise one, which is a guess checked against `decent`
+// rather than a place worked out — the same way you would find a free seat in a
+// room. Twelve tries is plenty when nine metres is all that is being asked for,
+// and if the arena really is that crowded the emptiest corner is a better answer
+// than a thirteenth guess.
+proc somewhere(model: Model): Spot {
+	for i := 0; i < 12; i++ {
+		x := loose()
+		z := loose()
+		if decent(model, x, z) {
+			return Spot(x, z, 0.0)
+		}
+	}
+	return vacancy(model)
+}
+
+// A coordinate anywhere between the walls, to the centimetre.
+proc loose(): Float {
+	return conv.itf(hexOf(hive.crypto.randomHex(4)) % 3600) / 100.0 - 18.0
+}
+
+// Hex digits into the number they spell. `hive.conv.sti` reads base ten, and this
+// is base sixteen — four lines, and the whole of what a `randomHex` needs to
+// become a number.
+func hexOf(text: Str): Int {
+	mut Int total = 0
+	for each digit in split(text, "") {
+		if indexOf("0123456789abcdef", digit) is Result.Ok(value) {
+			total = total * 16 + value
+		}
+	}
+	return total
+}
+
+// Where this player is and what its pack is doing, to everybody who might be
+// drawing either. `async` is the send that waits for nothing and cannot fail —
+// which is what a position update wants to be: the next one is along in 66
+// milliseconds, and a lost one is not worth reporting, let alone waiting for.
+proc announce(model: Model): void {
+	for each foe in model.others {
+		far := hive.syslink.on(foe.endpoint, #Arena)
+		async far(Msg.Moved(model.mine, model.me, model.body.x, model.body.y,
+			model.body.z, model.body.yaw, model.body.health))
+		async far(Msg.Pack(model.mine, model.pack))
+	}
+}
+
+// Joining is walking in and then going knocking.
+proc joined(model: Model, from: hive.syslink.Envelope): Model {
+	mut Model next = arrived(model, from)
+	if next.screen is Screen.Lobby {
+		return next
+	}
+	// Off the fold's thread. A greeting is a *waited* call and the fold must not
+	// wait: a screen that stops drawing while it dials is the one thing a game may
+	// never do.
+	async greet(model.peer, model.mine, model.me, hive.syslink.self(from))
+	return next
+}
+
+// Walking into the arena, which is the same thing whether anybody else is in it.
+// The registration is what makes this screen addressable from another machine, and
+// it happens here rather than in `main` because a service's address does not exist
+// until the service is running — inside the fold is the first place there is one.
+proc arrived(model: Model, from: hive.syslink.Envelope): Model {
+	mut Model next = model
+	if hive.syslink.register(#Arena, hive.syslink.self(from)) is Result.Error(problem) {
+		if problem.reason != "Taken" {
+			next.trouble = "Could not publish this window — {problem.message}"
+			return next
+		}
+	}
+	next.screen = Screen.Arena()
+	next.body = fresh(mySpot(model.mine))
+	next.trouble = ""
+	next.nodes = hive.syslink.peers()
+	// How many of the dead this node is carrying tonight. The first of them is
+	// along within a second, since the pack starts empty and wants filling.
+	next.want = roll()
+	next.sprout = 600
+	return next
+}
+
+// Everybody a peer told us about, greeted the same way we greeted the peer.
+proc introduce(model: Model, fresh: Str[], window: hive.syslink.Address): void {
+	for each endpoint in fresh {
+		async greet(endpoint, model.mine, model.me, window)
+	}
+}
+
+// "Is anybody there?", asked properly — and the one call in the program that
+// waits for an answer, so the one that can report a failure. It retries because
+// two nodes started a second apart would otherwise knock at a window that has not
+// been published yet, and a knock is safe to repeat: `met` renames an endpoint it
+// already knows rather than adding it twice.
+proc greet(peer: Str, mine: Str, me: Str, window: hive.syslink.Address): void {
+	for i := 0; i < 5; i++ {
+		far := hive.syslink.on(peer, #Arena)
+		answer := far(Msg.Hello(mine, me)) with timeout 2000
+		if answer is Result.Ok(reply) {
+			if reply is Msg.Here(endpoint, who, roster, horde) {
+				async window(Msg.Met(endpoint, who, roster, horde))
+				return
+			}
+		}
+		hive.task.sleep(400)
+	}
+	async window(Msg.Unreachable(peer))
+}
+
+proc leaving(model: Model): Model {
+	for each foe in model.others {
+		far := hive.syslink.on(foe.endpoint, #Arena)
+		async far(Msg.Gone(model.mine))
+	}
+	mut Model next = model
+	next.screen = Screen.Lobby()
+	next.others = nobody()
+	next.tracers = notracers()
+	// Both packs go: this node's own because it has stopped stepping them, and
+	// everybody else's because it has stopped listening.
+	next.pack = noone()
+	next.swarm = noone()
+	next.held = nothing()
+	next.aiming = false
+	next.board = false
+	return next
+}
+
+// ---------------------------------------------------------------------------
+
+func nobody(): Foe[dyn] {
+	mut Foe[dyn] none = []
+	return none
+}
+
+func notracers(): Tracer[dyn] {
+	mut Tracer[dyn] none = []
+	return none
+}
+
+func noone(): Zombie[dyn] {
+	mut Zombie[dyn] none = []
+	return none
+}
+
+func nothing(): Str[dyn] {
+	mut Str[dyn] none = []
+	return none
+}
+
+func nowhere(): Str[dyn] {
+	mut Str[dyn] none = []
+	return none
+}
+
+func start(mine: Str, peer: Str): Model {
+	return Model(
+		"",
+		mine,
+		peer,
+		Screen.Lobby(),
+		false,
+		"",
+		fresh(spot(0)),
+		nothing(),
+		nobody(),
+		notracers(),
+		noone(),
+		noone(),
+		1,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		false,
+		nowhere()
+	)
+}
+
+// The obvious guess for somebody to join through, so two terminals on one machine
+// need no typing: this same machine, on the other port of the pair. It is built
+// out of wherever this node actually is rather than from an address written down
+// here, so the guess is right on a laptop, in a container and on somebody else's
+// network.
+func facing(mine: Str): Str {
+	port := portOf(mine)
+	if port == 9200 {
+		return "{hostOf(mine)}:9201"
+	}
+	if port == 9201 {
+		return "{hostOf(mine)}:9200"
+	}
+	return ""
+}
+
+// The host half of an "ip:port". Its twin is `portOf`, and the two of them are the
+// whole of what this program does to an endpoint — which is the point of an
+// endpoint being a `Str`: it is deployment data, and string work is all it takes.
+func hostOf(endpoint: Str): Str {
+	parts := split(endpoint, ":")
+	if parts bounds 0 {
+		return parts[0]
+	}
+	return endpoint
+}
+
+// Where this node tells peers to dial it — **asked of the machine, not written
+// down**. A node has no name in `hive.syslink`; it is identified by where it is,
+// so this endpoint is the one thing about the program that has to be true.
+//
+// `hive.net.localAddress` is the answer to exactly that question: the source
+// address the operating system would stamp on a packet leaving by the default
+// route, which is the right one on a machine with several interfaces. Loopback is
+// deliberately *not* something it answers with — a machine holding only
+// `127.0.0.1` has no address a peer could dial, and it says so rather than handing
+// back one that works until the second player turns out to be on another host.
+// That case is the one place below where the loopback address is the right answer
+// rather than a lazy one: two terminals on a machine with its networking down can
+// still play each other.
+proc hereOn(port: Int): Str {
+	if hive.net.localAddress() is Result.Ok(address) {
+		return "{address}:{port}"
+	}
+	return "127.0.0.1:{port}"
+}
+
+// What the command line asked for. A bare port is a port on this machine's own
+// address; anything with a colon in it is taken as the endpoint itself, which is
+// what a node behind a router — or on a chosen interface — needs to advertise.
+proc advertised(given: Str): Str {
+	if indexOf(given, ":") is Result.Ok(_) {
+		return given
+	}
+	if conv.sti(given) is Result.Ok(port) {
+		return hereOn(port)
+	}
+	return hereOn(9200)
+}
+
+proc main(): void {
+	args := hive.term.args()
+	mut Str mine = hereOn(9200)
+	if args bounds 0 {
+		mine = advertised(args[0])
+	}
+	// A second argument fills the lobby's "somebody already playing" field in
+	// advance, which is what a fourth terminal wants — and what a script driving
+	// the game wants, since it is then the only thing that differs between nodes.
+	// It is a convenience and nothing more: the field is still there, still
+	// editable, and joining still goes through it.
+	mut Str through = facing(mine)
+	if args bounds 1 {
+		through = advertised(args[1])
+	}
+
+	// The node starts accepting before the window opens. A node has no name — it
+	// is identified by where it is — so this endpoint is ordinary runtime data.
+	if hive.syslink.listen(mine) is Result.Error(problem) {
+		panic problem
+	}
+	echo "listening on {mine}"
+
+	// Opens a real application window: an installed Chrome or Edge in app mode,
+	// and an ordinary tab where there is none. three.js was fetched once when this
+	// program was first compiled and is inside the executable, so this runs with
+	// no network and nothing installed.
+	ui.window("Hive Arena — {mine}", view, update, start(mine, through))
+}

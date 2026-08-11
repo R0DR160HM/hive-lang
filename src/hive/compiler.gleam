@@ -2041,6 +2041,10 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
               use _ <- result.try(check_conv_call(fname, args))
               check_args(ctx, args)
             }
+            "math" -> {
+              use _ <- result.try(check_math_call(fname, args))
+              check_args(ctx, args)
+            }
             "env" -> {
               use _ <- result.try(check_env_call(fname, args))
               check_args(ctx, args)
@@ -2069,8 +2073,8 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
               Error(
                 "unknown builtin namespace `hive."
                 <> ns
-                <> "` (available: net, file, json, crypto, sql, map, conv, env, "
-                <> "term, task, syslink, time, ui)",
+                <> "` (available: net, file, json, crypto, sql, map, conv, math, "
+                <> "env, term, task, syslink, time, ui)",
               )
           }
       }
@@ -2629,6 +2633,34 @@ fn check_conv_call(fname: String, args: List(ast.Arg)) -> Result(Nil, String) {
 }
 
 // ---------------------------------------------------------------------------
+// hive.math builtins
+// ---------------------------------------------------------------------------
+
+// `hive.math`. Every one of these takes and answers with a `Float`, so the only
+// thing to check is how many arguments arrived — and the two that take a pair
+// name them, because `atan2(y, x)` in the other order is a silent bug rather
+// than an error.
+fn check_math_call(fname: String, args: List(ast.Arg)) -> Result(Nil, String) {
+  let target = "`hive.math." <> fname <> "`"
+  case fname {
+    "pi" -> check_arity(target, args, [])
+    "sin" | "cos" | "tan" | "asin" | "acos" | "sqrt" | "abs" ->
+      check_arity(target, args, ["x"])
+    "atan2" -> check_arity(target, args, ["y", "x"])
+    "hypot" -> check_arity(target, args, ["x", "y"])
+    "min" | "max" -> check_arity(target, args, ["a", "b"])
+    "clamp" -> check_arity(target, args, ["value", "low", "high"])
+    _ ->
+      Error(
+        "unknown builtin `hive.math."
+        <> fname
+        <> "` (available: pi, sin, cos, tan, asin, acos, atan2, sqrt, hypot, "
+        <> "abs, min, max, clamp)",
+      )
+  }
+}
+
+// ---------------------------------------------------------------------------
 // hive.env builtins
 // ---------------------------------------------------------------------------
 
@@ -2699,19 +2731,25 @@ fn check_ui_call(
       case codegen.ui_widget_params(fname) {
         Some(names) -> check_arity(target, args, names)
         None ->
-          case list.contains(codegen.ui_attr_names(), fname) {
-            True -> check_arity(target, args, [fname])
-            False ->
-              Error(
-                "unknown builtin `hive.ui."
-                <> fname
-                <> "`.\n\nThe widgets are: "
-                <> string.join(ui_widget_list(), ", ")
-                <> ".\nThe attributes are: "
-                <> string.join(codegen.ui_attr_names(), ", ")
-                <> ".\nAnd `window`, `html` and `page` show a view or turn one "
-                <> "into text.",
-              )
+          case codegen.ui_shape_params(fname) {
+            Some(names) -> check_arity(target, args, names)
+            None ->
+              case codegen.ui_attr_params(fname) {
+                Some(names) -> check_arity(target, args, names)
+                None ->
+                  Error(
+                    "unknown builtin `hive.ui."
+                    <> fname
+                    <> "`.\n\nThe widgets are: "
+                    <> string.join(ui_widget_list(), ", ")
+                    <> ".\nThe shapes a `scene` holds are: "
+                    <> string.join(codegen.ui_shape_names(), ", ")
+                    <> ".\nThe attributes are: "
+                    <> string.join(codegen.ui_attr_names(), ", ")
+                    <> ".\nAnd `window`, `html` and `page` show a view or turn one "
+                    <> "into text.",
+                  )
+              }
           }
       }
   }
@@ -2720,8 +2758,8 @@ fn check_ui_call(
 fn ui_widget_list() -> List(String) {
   [
     "row", "column", "spacer", "overlay", "text", "image", "icon", "link",
-    "button", "input", "textarea", "checkbox", "select", "table", "spinner",
-    "none",
+    "button", "input", "textarea", "checkbox", "select", "table", "scene",
+    "spinner", "none",
   ]
 }
 

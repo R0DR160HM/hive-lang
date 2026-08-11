@@ -40,6 +40,11 @@ Go must be on your `PATH` (the compiler shells out to `go build` and
 `go env GOEXE`). `git` is needed only by a program that imports from a
 repository, and only until that repository has been cloned once.
 
+Two kinds of program need **network access on their first build**, and neither
+needs it again or at run time: one that opens a [database](#hivesql), whose
+drivers are Go modules, and one that draws a [3D scene](#three-dimensions-scene),
+which is compiled against a pinned three.js. Everything else builds offline.
+
 ## Usage
 
 The CLI is a Gleam program. You can invoke it directly:
@@ -1141,11 +1146,18 @@ depends on internally comes along too: `hive.crypto` decodes JWT payloads with
 `hive.json` and checks `exp`/`nbf` against `hive.time`, so reaching for a JWT
 pulls in all three.
 
-Every module but one is written against the target's standard library alone, so
-HTTP, WebSockets, TCP, JSON, cryptography and spreadsheets all build offline with
-no dependencies. `hive.sql` is the exception, and the only module that costs you
-anything at build time: it links external database drivers, and a program that
-never opens a connection neither downloads nor links them.
+Every module but two is written against the target's standard library alone, so
+HTTP, WebSockets, TCP, JSON, cryptography, spreadsheets and windows all build
+offline with no dependencies. The two exceptions are the only things that cost
+you anything at build time, both on the same terms — fetched on the first build
+that needs them, cached, and never linked into a program that does not:
+
+* `hive.sql` links external database drivers, and a program that never opens a
+  connection neither downloads nor links them.
+* [`hive.ui.scene`](#three-dimensions-scene) — the 3D part of `hive.ui`, and only
+  that part — is drawn with three.js, which is fetched against a pinned digest
+  and embedded in the executable. A window that draws no scene never goes near
+  it.
 
 ### `hive.net`
 
@@ -1595,6 +1607,50 @@ Number and string conversions. Everything here is pure, so it works inside both
   `Result<Float, hive.conv.ConversionError>`. A `ConversionError` carries the
   offending `input` and a short `message`.
 
+### `hive.math`
+
+The arithmetic the operators cannot spell. Everything here is pure, so it works
+inside both `func`s and `proc`s — which is what lets a view compute a position, a
+`func` decide whether a shot hit, and a test check either without a machine to run
+it on.
+
+| | |
+| --- | --- |
+| **Constants** | `pi()` |
+| **Angles** | `sin(x)` `cos(x)` `tan(x)` `asin(x)` `acos(x)` `atan2(y, x)` |
+| **Distances** | `sqrt(x)` `hypot(x, y)` `abs(x)` |
+| **Bounds** | `min(a, b)` `max(a, b)` `clamp(value, low, high)` |
+
+**Every one of them takes and answers with a `Float`**, and there is no integer
+twin. That is one rule for thirteen functions, and it is the same rule the rest of
+the language keeps: Hive never widens a number behind your back, so an `Int` goes
+in through [`hive.conv.itf`](#hiveconv) and `hive.math.max(0, health)` is a
+compile error rather than a surprise. Clamping an `Int` is an `if`, and needs no
+library.
+
+```hive
+import hive.math
+
+// Where "forward" is, for something facing `yaw`: rotating (0, 0, -1) about the
+// vertical, which is two calls and no matrix.
+func forward(yaw: Float): Float {
+	return 0.0 - math.sin(yaw)
+}
+
+func distance(ax: Float, az: Float, bx: Float, bz: Float): Float {
+	return math.hypot(bx - ax, bz - az)
+}
+```
+
+Nothing here reports an error, because none of these *have* one. A value outside a
+function's domain answers with the non-finite `Float` the arithmetic already
+produces — `sqrt(-1.0)` and `asin(1.5)` are `NaN`, exactly as `10.0 ** 400.0` is
+`+Inf` — and [Arithmetic at the edges](#arithmetic-at-the-edges) is where that is
+spelled out. Two details worth knowing: `atan2` takes the two legs rather than
+their ratio, which is what lets it tell the four quadrants apart; and `clamp` is
+exactly `min(max(value, low), high)`, so bounds the wrong way round answer with
+`high`.
+
 ### `hive.env`
 
 Reads environment variables, from a `.env` file or the OS.
@@ -1952,6 +2008,23 @@ alternative to the shared secret, and supervision trees. See
 or on two machines, and `code-examples/9 - EXAMPLE APP - Online Cache`, a
 three-node cache that reads its peer list at startup.
 
+`code-examples/19 - EXAMPLE APP - Multiplayer FPS` builds a **mesh** out of these
+calls and nothing else: a node joins by knocking on *one* endpoint it was given,
+the answer carries that node's roster, every stranger in it is knocked on in turn,
+and each of those answers with a roster too — so joining through one player is
+joining through all of them, and nobody keeps a list of who is playing.
+
+It is also worth reading for what it does with **ownership**, which is the whole of
+what a mesh has instead of an authority. Every node owns its player *and* a pack of
+monsters, and the rule is that the node which owns a thing is the only node that
+changes it: a shot at a player is a message to that player, who applies the damage
+and — if it killed them — credits the kill back, so the one claim about a death
+comes from the node entitled to make it; a shot at somebody's monster is a message
+to them; a shot at one of your own answers itself with no message at all. Nothing
+is negotiated, nothing is elected, and "single player" is not a mode but a roster
+with one name in it: somebody knocking turns it into a multiplayer game without
+either side doing anything about it, and a pack whose owner quits leaves with them.
+
 ### `hive.time`
 
 The wall clock and calendar formatting. Times are plain `Int`s — Unix seconds.
@@ -2061,10 +2134,11 @@ ordinary value rather than a special case.
 | `checkbox(attrs, label, checked)` | `Str, Bool` | label included, and clickable |
 | `select(attrs, options, chosen)` | `Str[], Str` | |
 | `table(attrs, rows)` | `Table` | the headered `Table` everything else hands back |
+| `scene(attrs, shapes)` | `Shape[]` | [three dimensions](#three-dimensions-scene) |
 | `spinner(attrs)` | — | |
 | `none()` | — | nothing — and it keeps its place among its siblings |
 
-Sixteen, and the rule that decided the number: a widget is here only if it
+Seventeen, and the rule that decided the number: a widget is here only if it
 cannot be composed from the others *and* needs something the renderer has that
 Hive does not. A card is a `column` with padding, a toast is an `overlay` and a
 message, a divider is a `row` with a border — all of those are `func`s you
@@ -2171,6 +2245,127 @@ ui.link(
 )
 ```
 
+#### Three dimensions: `scene`
+
+`scene(attrs, shapes)` is a widget like any other — attributes, then a payload —
+and it draws a world in the box it occupies. The payload is a vector of
+**`hive.ui.Shape`**, which is a different type from `View` on purpose: a box in a
+column and a button in a scene are both mistakes, and two closed sets are what
+makes them mistakes the compiler catches rather than things the renderer quietly
+drops.
+
+A scene is a **value**, exactly like the panel around it. There is no canvas to
+hold, no mesh to keep, nothing to add to and nothing to free: an ordinary `func`
+answers "what is there now" from the state, sixty times a second, and the renderer
+works out what changed. That is the whole model, and it is why a world can be
+tested without a window — `len(world(model))` is an assertion.
+
+```hive
+ui.scene(
+	[
+		ui.grow(1),
+		ui.eye(player.x, player.y + 1.62, player.z),   // where you are
+		ui.aim(player.yaw, player.pitch),              // where you are looking
+		ui.lens(78), ui.fog(70),
+		ui.background(ui.Tone.HEX("#8ecbff")),         // the sky
+		ui.grab(playing), ui.crosshair(aiming),
+		ui.onFrame(Msg.Tick(_)),
+		ui.onKeyDown(Msg.Pressed(_)), ui.onKeyUp(Msg.Released(_)),
+		ui.onLook(Msg.Looked(_, _))
+	],
+	world(model)
+)
+```
+
+**The shapes.** Six, chosen by the rule that chose the widgets: a shape is here
+only if it cannot be built from the others. A crate is a `box`, a barrel is a
+`cylinder`, a player is a box and a sphere, a tracer is a `line` — all `func`s you
+write. Dimensions are the payload rather than attributes because they are what the
+shape *is*; where it stands and which way it faces are attributes, because
+standing at the origin facing forward is an ordinary thing to want.
+
+| Shape | Payload | Is |
+| --- | --- | --- |
+| `box(attrs, width, height, depth)` | `Float, Float, Float` | |
+| `sphere(attrs, radius)` | `Float` | |
+| `cylinder(attrs, radius, height)` | `Float, Float` | |
+| `ground(attrs, width, depth)` | `Float, Float` | a plane that lies flat without being turned |
+| `label(attrs, words)` | `Str` | words in the world, always facing whoever is looking |
+| `line(attrs, fromX, fromY, fromZ, toX, toY, toZ)` | six `Float`s | the one shape carrying both its ends, so it takes no `at` |
+
+**The attributes a scene and its shapes take.** All of them are ordinary
+`hive.ui` attributes and mean nothing on a widget that has no use for them, the
+way `pad` means nothing on a `spacer`. Distances are in whatever unit you decide a
+`1.0` is (metres, below); angles are in radians.
+
+| | |
+| --- | --- |
+| **On a shape** | `at(x, y, z)` `turn(x, y, z)` `paint(Tone)` |
+| **On the scene** | `eye(x, y, z)` `aim(yaw, pitch)` `lens(Int)` — the field of view in degrees — `fog(Int)` — the distance the sky swallows things at — `background(Tone)` for the sky, `grab(Bool)`, `crosshair(Bool)` |
+| **Events** | `onFrame(f)` `onKeyDown(f)` `onKeyUp(f)` `onLook(f)` `onGrab(f)` |
+
+`paint` and `background` take the same [`Tone`](#colour) everything else does: the
+five roles answer with a fixed colour in a world (there is no stylesheet in a
+scene), and `HEX`/`RGBA` are for a colour that is genuinely data — one per player.
+
+**Which way is forward.** `aim(0.0, 0.0)` looks down **-Z**, with **+X** to the
+right and **+Y** up; yaw turns about the vertical and pitch tilts. So forward is
+`(-sin(yaw), -cos(yaw))` and right is `(cos(yaw), -sin(yaw))` — two
+[`hive.math`](#hivemath) calls, and the only convention you have to hold on to.
+
+**The events, and what each reports.**
+
+* `onFrame(f)` — `func(Int): Msg`, the milliseconds since the last frame. It is
+  the browser's own frame: the refresh rate, stopped while the window is hidden,
+  never twice for one paint. A gap longer than 100ms is reported as 100, because
+  it means the window was busy and a world stepped by the real gap would teleport.
+* `onKeyDown(f)` / `onKeyUp(f)` — `func(Str): Msg`. A letter or digit is itself
+  and everything else is the word for it: `"space"`, `"shift"`, `"ctrl"`, `"alt"`,
+  `"tab"`, `"enter"`, `"escape"`, `"up"`, `"down"`, `"left"`, `"right"`, and the
+  mouse buttons as `"mouse1"`, `"mouse2"`, `"mouse3"` — holding a trigger is the
+  same kind of thing as holding W, so it arrives the same way. Nothing repeats
+  while a key is held, keys typed into an `input` are not reported at all, and
+  everything held is released when the window loses focus.
+* `onLook(f)` — `func(Float, Float): Msg`, how far the mouse moved across and
+  down since the last frame, and the one event that reports two numbers. A
+  [constructor with two holes](#the-language) (`Msg.Looked(_, _)`) is already a
+  function of exactly that shape.
+* `onGrab(f)` — `func(Bool): Msg`, whether the window is holding the mouse now.
+
+**Holding the mouse.** `grab(true)` asks for the pointer, which a browser only
+grants on a click. So while it is on, a click anywhere in the window takes the
+mouse — *except* on something the program is listening to, where a button stays a
+button and a field stays a field. That is wider than "click the picture" on
+purpose: a program that has not got the mouse yet usually says so with a panel
+drawn over the picture, and a panel that swallowed the very click it was asking
+for would be a circle with no way out. The click that takes the mouse is not also
+passed on as a `"mouse1"`, for the same reason.
+
+Escape gives the mouse back, and so does `grab(false)`; either way `onGrab` says
+so, which is how a program knows to put its menu up. `crosshair(true)` draws the
+aiming mark in the middle of the box.
+
+**What it costs, and what it does not.** A scene's contents travel on a frame of
+their own, separate from the document — so a world redrawn sixty times a second
+does not re-render the panel around it, and the canvas is never replaced. The
+renderer keeps a geometry per shape-and-size, a material per colour and a texture
+per label, and reuses the object in each slot while it still stands for the same
+thing; a moving world is a position written into a mesh that is already there.
+
+Two limits worth knowing. **A window draws one scene** — a view with two of them
+draws the first and says so on stdout. And a scene rendered by `ui.html` or
+`ui.page` is an **empty box**: a served page has no socket, so it has no frames
+to draw, exactly as a button on such a page has nowhere to send its message.
+
+**three.js is fetched at compile time, and only for a scene.** The library is
+pinned to one version *and* to the SHA-256 of each of its files; a download that
+hashes differently fails the build rather than being used or cached. It is fetched
+once (into `~/.hive/vendor`), embedded into the executable, and served by the
+window itself — so the program you ship is still a single file that runs with no
+network, and a program that draws no scene neither downloads nor carries it. The
+first build of a scene is the only one that needs the network; see
+`src/hive/vendor.gleam`.
+
 **A view is a value, so a test can read one.** `hive.ui.html` is the same
 renderer a served page uses and needs no browser, no screenshot and no socket —
 which makes "the button is disabled while the draft is empty" something a
@@ -2185,14 +2380,35 @@ tab, and failing that it prints the URL. None of them is linked into your binary
 each is a program that may or may not be there, which is what keeps a window
 free of build dependencies on every platform.
 
+**Closing the window ends the program.** `window` does not return and there is
+nothing left to serve once the last page has gone, so a process that outlived its
+window would be one nobody can see, nobody can reach and nobody thought to stop —
+still holding a port and still answering as a `hive.syslink` node. A page being
+*reloaded* is not a window being closed, and the difference is a second and a half:
+if nothing has reconnected by then, the program says so and exits. A window that
+never opened at all is untouched by this — nothing connected, so nothing left, and
+the program goes on waiting for somebody to open the URL it printed.
+
 A served page has nowhere to send an event back to, so `html` and `page` write
 no handler ids at all — the messages in the tree are simply not recorded. That
 is the honest rendering of a page with no socket behind it.
 
-The whole page is re-rendered on each turn and swapped in, with focus and the
-caret preserved; there is no tree diffing yet, which is a thing to add rather
-than a thing to design around — the view is already a value, so nothing above
-has to change for it.
+The whole page is re-rendered on each turn, and swapped in when it came out
+different, with focus and the caret preserved; a turn that changed nothing visible
+sends nothing at all. There is no tree diffing yet, which is a thing to add rather
+than a thing to design around — the view is already a value, so nothing above has
+to change for it. (A [scene](#three-dimensions-scene) is the reason that matters
+already: its contents travel on a frame of their own, so a world redrawn sixty
+times a second leaves the document around it alone.)
+
+See [`code-examples/19 - EXAMPLE APP - Multiplayer
+FPS`](code-examples/19%20-%20EXAMPLE%20APP%20-%20Multiplayer%20FPS/fps.hive) for the
+scene, the mouse and the keyboard put to work: a first-person shooter — alone
+against the dead, or against other players and the dead — over a peer-to-peer
+mesh, where the arena, the collisions, the bullets and the monsters are all
+`func`s of the state. So `fps.test.hive` walks a player into a wall, shoots one
+through a crate, and has a zombie bite somebody, with no window, no mouse and no
+second machine anywhere.
 
 See [`code-examples/17 - EXAMPLE APP - Chat with User
 Interface`](code-examples/17%20-%20EXAMPLE%20APP%20-%20Chat%20with%20User%20Interface/chat.hive) — two

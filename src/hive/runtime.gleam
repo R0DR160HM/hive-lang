@@ -88,6 +88,15 @@ pub fn modules() -> List(Module) {
       requires: [],
     ),
     Module(
+      name: "math",
+      file: "hive/math.go",
+      source: math_go,
+      // Every function lowers to a `hive.Math...` name, and nothing else in the
+      // runtime is spelled that way.
+      markers: ["hive.Math"],
+      requires: [],
+    ),
+    Module(
       name: "map",
       file: "hive/map.go",
       source: map_go,
@@ -174,6 +183,30 @@ pub fn modules() -> List(Module) {
       // the address come from `syslink`, the socket from `net`, and the token
       // that keeps the page private from `crypto`.
       requires: ["net", "crypto", "syslink"],
+    ),
+    Module(
+      name: "uiscene",
+      file: "hive/ui_scene.go",
+      source: ui_scene_go,
+      // Every one of these is a scene and nothing else: the widget, the shapes
+      // that go in one, the type a `func` returning shapes is annotated with, and
+      // the attributes only a scene gives meaning to. Any of them is enough,
+      // because a program that builds a shape it never draws still has to
+      // compile — and this is the module that says what a `Shape` is.
+      //
+      // The list is spelled out rather than matched on a prefix for the reason
+      // `hive.sql`'s is: this is the module that carries a download, so what
+      // brings it into a build has to be exactly what needs it.
+      markers: [
+        "hive.UiScene", "hive.Shape", "hive.UiBox", "hive.UiSphere",
+        "hive.UiCylinder", "hive.UiGround", "hive.UiLabel", "hive.UiLine",
+        "hive.UiAttrAt", "hive.UiAttrTurn", "hive.UiAttrPaint", "hive.UiAttrEye",
+        "hive.UiAttrAim", "hive.UiAttrLens", "hive.UiAttrFog", "hive.UiAttrGrab",
+        "hive.UiAttrCrosshair", "hive.UiAttrOnFrame", "hive.UiAttrOnKeyDown",
+        "hive.UiAttrOnKeyUp", "hive.UiAttrOnLook", "hive.UiAttrOnGrab",
+      ],
+      // The scene is drawn in a window, and a window is the rest of `hive.ui`.
+      requires: ["ui"],
     ),
     Module(
       name: "sheets",
@@ -2610,6 +2643,64 @@ func StrToFloat(s string) Result[float64, ConversionError] {
 		return Err[float64, ConversionError](ConversionError{Input: s, Message: \"not a valid number\"})
 	}
 	return Ok[float64, ConversionError](f)
+}
+"
+}
+
+// ---------------------------------------------------------------------------
+// hive.math
+// ---------------------------------------------------------------------------
+
+/// Source of `hive/math.go`: the mathematics module (`hive.math`) — the
+/// functions arithmetic operators cannot spell.
+///
+/// Every one of them takes and answers with a `Float`, with no integer twin: an
+/// `Int` widens with `hive.conv.itf`, and one rule for thirteen functions is
+/// worth more than the keystrokes an overload would save. Nothing here reports
+/// an error, because none of these *have* one — a value outside a function's
+/// domain answers with the non-finite `Float` the arithmetic already produces,
+/// which is the same answer `10.0 ** 400.0` gives.
+pub fn math_go() -> String {
+  "package hive
+
+import \"math\"
+
+// The mathematics module (`hive.math`). Go's own `math` answers for all of it,
+// so this file is a naming layer and nothing more — which is deliberate: the
+// functions have one meaning each, and a wrapper that improved on them would be
+// a second meaning to learn.
+
+func MathPi() float64 { return math.Pi }
+
+func MathSin(x float64) float64 { return math.Sin(x) }
+func MathCos(x float64) float64 { return math.Cos(x) }
+func MathTan(x float64) float64 { return math.Tan(x) }
+
+// The inverses. Asked for a value outside -1..1, both answer NaN rather than
+// clamping: a cosine of 1.5 was a mistake somewhere earlier, and quietly
+// answering `0` would bury it.
+func MathAsin(x float64) float64 { return math.Asin(x) }
+func MathAcos(x float64) float64 { return math.Acos(x) }
+
+// Atan2 takes the two legs rather than their ratio, which is what lets it tell
+// the four quadrants apart — and `Atan2(0, 0)` is `0`.
+func MathAtan2(y float64, x float64) float64 { return math.Atan2(y, x) }
+
+func MathSqrt(x float64) float64 { return math.Sqrt(x) }
+
+// Hypot is the diagonal, computed without squaring the legs first — so a vector
+// long enough to overflow the square of its own length still measures.
+func MathHypot(x float64, y float64) float64 { return math.Hypot(x, y) }
+
+func MathAbs(x float64) float64             { return math.Abs(x) }
+func MathMin(a float64, b float64) float64  { return math.Min(a, b) }
+func MathMax(a float64, b float64) float64  { return math.Max(a, b) }
+
+// Clamp is exactly the composition its name stands for, which settles the one
+// question it raises: bounds the wrong way round (`low` above `high`) answer
+// with `high`, because that is what taking the smaller of the two does last.
+func MathClamp(value float64, low float64, high float64) float64 {
+	return math.Min(math.Max(value, low), high)
 }
 "
 }
@@ -6636,11 +6727,13 @@ import (
 	\"fmt\"
 	\"net\"
 	\"net/http\"
+	\"os\"
 	\"os/exec\"
 	\"runtime\"
 	\"strconv\"
 	\"strings\"
 	\"sync\"
+	\"time\"
 )
 
 // The user interface module (`hive.ui`).
@@ -6686,6 +6779,14 @@ type Attr struct {
 	FnStr  func(string) any
 	FnInt  func(int) any
 	FnBool func(bool) any
+	// Several numbers at once: a position, a rotation, a heading. These are the
+	// scene's attributes, and the only ones in the module that carry more than
+	// one — nothing in this file knows what they mean, which is deliberate.
+	// `hive/ui_scene.go` builds them and reads them back.
+	Nums []float64
+	// The one event that reports two numbers instead of a value: how far the
+	// mouse moved while the window was holding it.
+	FnLook func(float64, float64) any
 }
 
 func uiNode(kind string, attrs []Attr, children []View) View {
@@ -6902,6 +7003,11 @@ func uiHasEvent(attrs []Attr) bool {
 		switch a.Kind {
 		case \"on\", \"onDismiss\", \"onInput\", \"onSubmit\", \"onChoose\", \"onToggle\", \"onPick\", \"onSort\":
 			return true
+		// A scene's own events. They are listed here rather than anywhere the
+		// scene module can reach because this is what gives a node its id, and a
+		// scene with nothing but a frame handler still needs one.
+		case \"onFrame\", \"onKeyDown\", \"onKeyUp\", \"onLook\", \"onGrab\":
+			return true
 		}
 	}
 	return false
@@ -6919,6 +7025,12 @@ type uiRender struct {
 	out      strings.Builder
 	handlers map[string][]Attr
 	next     int
+	// What each scene in the tree wants drawn, in the order the scenes appear.
+	// The element itself carries only its index: a scene's contents travel on a
+	// frame of their own, so a world that moves sixty times a second does not
+	// re-send the document around it — and the canvas showing it is never
+	// replaced, which is the other half of the same point.
+	scenes []string
 }
 
 func uiEscape(s string) string {
@@ -7036,6 +7148,13 @@ func uiClasses(kind string, attrs []Attr) string {
 			if a.Flag {
 				classes = append(classes, \"h-busy\")
 			}
+		// A scene's aiming mark. It is a class rather than something drawn in the
+		// world because it belongs to the viewport rather than to the world: it has
+		// no position in it, and nothing in the scene can stand in front of it.
+		case \"crosshair\":
+			if a.Flag {
+				classes = append(classes, \"h-aiming\")
+			}
 		}
 	}
 	return strings.Join(classes, \" \")
@@ -7146,6 +7265,18 @@ func (r *uiRender) view(v View) {
 				uiEscape(opt) + \"</option>\")
 		}
 		r.out.WriteString(\"</select>\")
+	case \"scene\":
+		// The box a scene is drawn in, and nothing else: what to draw is in
+		// `v.Text` — already the frame the window will send — and it goes into
+		// `r.scenes` rather than into the document. A static render (`ui.html`,
+		// `ui.page`) has no socket to send frames down, so it leaves an empty box.
+		at := len(r.scenes)
+		r.scenes = append(r.scenes, v.Text)
+		out := \"<div\" + r.common(v.Kind, v.Attrs)
+		if r.handlers != nil {
+			out += \" data-scene=\\\"\" + strconv.Itoa(at) + \"\\\"\"
+		}
+		r.out.WriteString(out + \"></div>\")
 	case \"table\":
 		r.table(v)
 	case \"spinner\":
@@ -7333,6 +7464,11 @@ func UiPage(title string, v View) string {
 
 // The live document. The shell keeps a socket open, swaps in whatever HTML
 // arrives, and posts back the id of whatever was interacted with.
+//
+// Two kinds of frame arrive down the socket, told apart by their first
+// character: `H` is the document, and `S` is what the scenes in it want drawn.
+// The split is what lets a scene be redrawn every frame — the document is only
+// re-sent when it changed, and the canvas is never touched by a swap at all.
 const uiShell = `<!doctype html>
 <html><head><meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
@@ -7341,11 +7477,31 @@ const uiShell = `<!doctype html>
 <script>
 var sock = new WebSocket(\"ws://\" + location.host + \"/_hive/socket?token=__TOKEN__\");
 var root = document.getElementById(\"root\");
+var paintScene = null;
+var attachScene = null;
+var pendingScene = null;
+// Where a module that draws inside the window registers itself: the first is
+// handed each scene frame, and the second is called whenever the document was
+// swapped, so whatever it draws on can find its box again. The shell knows only
+// that something may want these — never what it does with them.
+window.hiveSceneReady = function (paint, attach) {
+  paintScene = paint;
+  attachScene = attach;
+  attach();
+  if (pendingScene !== null) { paint(pendingScene); pendingScene = null; }
+};
 sock.onmessage = function (e) {
+  var body = e.data.slice(1);
+  if (e.data.charAt(0) === \"S\") {
+    // A frame that arrives before the drawing module has loaded is kept, not
+    // dropped: it is the only description of the world there is.
+    if (paintScene) { paintScene(body); } else { pendingScene = body; }
+    return;
+  }
   var focused = document.activeElement;
   var mark = focused && focused.getAttribute ? focused.getAttribute(\"data-h\") : null;
   var start = focused && focused.selectionStart;
-  root.innerHTML = e.data;
+  root.innerHTML = body;
   if (mark) {
     var again = root.querySelector('[data-h=\"' + mark + '\"]');
     if (again && again.focus) {
@@ -7355,6 +7511,7 @@ sock.onmessage = function (e) {
       }
     }
   }
+  if (attachScene) { attachScene(); }
 };
 sock.onclose = function () { document.body.classList.add(\"h-closed\"); };
 function send(id, kind, value, index) {
@@ -7411,7 +7568,9 @@ root.addEventListener(\"keydown\", function (e) {
   if (!el || e.target.tagName === \"TEXTAREA\") { return; }
   send(el.getAttribute(\"data-h\"), \"submit\", e.target.value, 0);
 });
-</script></body></html>`
+</script>
+__EXTRA__
+</body></html>`
 
 const uiCSS = `*,*::before,*::after{box-sizing:border-box}
 body{margin:0;font:14px/1.5 system-ui,-apple-system,\"Segoe UI\",sans-serif;
@@ -7464,13 +7623,22 @@ border-top-color:var(--accent);border-radius:50%;animation:h-spin .7s linear inf
 .h-icon{font-style:normal}
 .h-image{max-width:100%;height:auto;display:block}
 .h-closed::after{content:\"disconnected\";position:fixed;bottom:12px;left:12px;
-background:var(--danger);color:#fff;padding:4px 10px;border-radius:6px;font-size:12px}`
+background:var(--danger);color:#fff;padding:4px 10px;border-radius:6px;font-size:12px}
+.h-scene{position:relative;overflow:hidden;min-height:0;min-width:0;background:#0b0d10}
+.h-canvas{position:fixed;z-index:2;overflow:hidden}
+.h-canvas>canvas{display:block;width:100%;height:100%}
+.h-aiming{cursor:none}
+.h-aiming::before,.h-aiming::after{content:\"\";position:absolute;left:50%;top:50%;
+background:#fff;opacity:.8;pointer-events:none}
+.h-aiming::before{width:2px;height:15px;margin:-7px 0 0 -1px}
+.h-aiming::after{width:15px;height:2px;margin:-1px 0 0 -7px}`
 
 // One running window: the page it last rendered, the sockets watching it, and
 // the handlers the current page's ids stand for.
 type uiWindow struct {
 	mu       sync.Mutex
 	html     string
+	scene    string
 	handlers map[string][]Attr
 	watchers map[WsConnection]bool
 	token    string
@@ -7480,16 +7648,86 @@ func (w *uiWindow) publish(v View) {
 	r := &uiRender{handlers: map[string][]Attr{}}
 	r.view(v)
 	w.mu.Lock()
-	w.html = r.out.String()
+	html := r.out.String()
+	scene := uiScenes(r.scenes)
+	// What actually changed. A window with no scene in it is exactly what it was
+	// before: one frame per turn, and nothing here costs it anything.
+	document := html != w.html
+	world := scene != w.scene
+	w.html = html
+	w.scene = scene
 	w.handlers = r.handlers
 	watchers := make([]WsConnection, 0, len(w.watchers))
 	for c := range w.watchers {
 		watchers = append(watchers, c)
 	}
-	page := w.html
 	w.mu.Unlock()
 	for _, c := range watchers {
-		WsSend(c, page)
+		if document {
+			WsSend(c, \"H\"+html)
+		}
+		if world {
+			WsSend(c, \"S\"+scene)
+		}
+	}
+}
+
+// The scene frame: every scene in the tree, by the index its element carries.
+// A tree with no scene in it has no frame at all, which is what keeps the whole
+// mechanism invisible to a window that never draws one.
+func uiScenes(scenes []string) string {
+	if len(scenes) == 0 {
+		return \"\"
+	}
+	// A window draws one scene. A view holding several is a mistake worth saying
+	// out loud once — the alternative is a second picture that is silently blank,
+	// which is the kind of thing somebody debugs for an hour.
+	if len(scenes) > 1 {
+		uiSceneCrowd.Do(func() {
+			fmt.Println(\"hive: a window draws one scene, and this view has \" +
+				strconv.Itoa(len(scenes)) + \" — the first one is the one on screen\")
+		})
+	}
+	return \"[\" + strings.Join(scenes, \",\") + \"]\"
+}
+
+var uiSceneCrowd sync.Once
+
+// Two numbers in one event's value (\"12.5,-4\"), which is how far the mouse
+// moved. Anything that is not a pair of numbers is no movement at all.
+func uiPair(text string) (float64, float64) {
+	at := strings.IndexByte(text, ',')
+	if at < 0 {
+		return 0, 0
+	}
+	x, errX := strconv.ParseFloat(strings.TrimSpace(text[:at]), 64)
+	y, errY := strconv.ParseFloat(strings.TrimSpace(text[at+1:]), 64)
+	if errX != nil || errY != nil {
+		return 0, 0
+	}
+	return x, y
+}
+
+// Closing the window ends the program.
+//
+// A window *is* the program here — `UiWindow` does not return, and there is
+// nothing left to serve once the last page has gone — so a process that outlived
+// its window would be one nobody can see, nobody can reach, and nobody thought to
+// stop. It keeps a port bound and a syslink node answering, which is worse than
+// unhelpful on a machine somebody is trying to run two of these on.
+//
+// The wait is what tells a closed window from a reloaded one. A program whose
+// window never opened at all is untouched by this: nothing ever connected, so
+// nothing ever left, and it goes on waiting for somebody to open the URL it
+// printed.
+func (w *uiWindow) linger() {
+	time.Sleep(1500 * time.Millisecond)
+	w.mu.Lock()
+	gone := len(w.watchers) == 0
+	w.mu.Unlock()
+	if gone {
+		fmt.Println(\"hive: the window was closed\")
+		os.Exit(0)
 	}
 }
 
@@ -7518,6 +7756,20 @@ func (w *uiWindow) message(id string, kind string, value string, index int) (any
 		case kind == \"choose\" && a.Kind == \"onChoose\" && a.FnStr != nil:
 			return a.FnStr(value), true
 		case kind == \"toggle\" && a.Kind == \"onToggle\" && a.FnBool != nil:
+			return a.FnBool(value != \"\"), true
+		// A scene's events. A frame carries how long the last one took, a key
+		// carries its own name, a look carries how far the mouse moved, and a grab
+		// carries whether the window is holding the mouse now.
+		case kind == \"frame\" && a.Kind == \"onFrame\" && a.FnInt != nil:
+			return a.FnInt(index), true
+		case kind == \"keydown\" && a.Kind == \"onKeyDown\" && a.FnStr != nil:
+			return a.FnStr(value), true
+		case kind == \"keyup\" && a.Kind == \"onKeyUp\" && a.FnStr != nil:
+			return a.FnStr(value), true
+		case kind == \"look\" && a.Kind == \"onLook\" && a.FnLook != nil:
+			dx, dy := uiPair(value)
+			return a.FnLook(dx, dy), true
+		case kind == \"grab\" && a.Kind == \"onGrab\" && a.FnBool != nil:
 			return a.FnBool(value != \"\"), true
 		}
 	}
@@ -7559,6 +7811,7 @@ func UiWindow[S any, M any](
 		\"__TITLE__\", uiEscape(title),
 		\"__CSS__\", uiCSS,
 		\"__TOKEN__\", w.token,
+		\"__EXTRA__\", uiExtraScript,
 	).Replace(uiShell)
 
 	ready := make(chan int, 1)
@@ -7577,10 +7830,21 @@ func UiWindow[S any, M any](
 	select {}
 }
 
+// What a module that draws inside a window adds to it: a script the shell puts
+// on the page, and whatever that script has to load. Both are empty here and
+// filled in by `hive/ui_scene.go`, which is written into the build only when the
+// program draws a scene — so a window that draws none serves nothing extra and
+// carries no script it does not use.
+var uiExtraScript string
+var uiExtraRoutes = map[string]func(http.ResponseWriter, *http.Request){}
+
 // The window's own little server. It is deliberately not `HttpServe`: this needs
 // the port it actually bound, a socket upgrade on one route, and nothing else.
 func uiServe(w *uiWindow, addr Address, page string, ready chan int) {
 	mux := http.NewServeMux()
+	for path, handler := range uiExtraRoutes {
+		mux.HandleFunc(path, handler)
+	}
 	mux.HandleFunc(\"/\", func(rw http.ResponseWriter, req *http.Request) {
 		if req.URL.Query().Get(\"token\") != w.token {
 			http.Error(rw, \"forbidden\", http.StatusForbidden)
@@ -7603,12 +7867,25 @@ func uiServe(w *uiWindow, addr Address, page string, ready chan int) {
 		w.mu.Lock()
 		w.watchers[conn] = true
 		current := w.html
+		world := w.scene
 		w.mu.Unlock()
-		WsSend(conn, current)
+		// A page that has just connected is behind on both frames, whether or not
+		// either has changed lately.
+		WsSend(conn, \"H\"+current)
+		if world != \"\" {
+			WsSend(conn, \"S\"+world)
+		}
 		uiPump(w, addr, conn)
 		w.mu.Lock()
 		delete(w.watchers, conn)
+		empty := len(w.watchers) == 0
 		w.mu.Unlock()
+		// The window has gone. Whether it is *coming back* is the only question,
+		// and waiting a moment is how you tell: a page being reloaded is back
+		// within it, and a window that was closed is not.
+		if empty {
+			go w.linger()
+		}
 	})
 	listener, bound := uiListen()
 	if listener == nil {
@@ -7781,5 +8058,941 @@ func uiBrowsers() []string {
 		}
 	}
 }
+"
+}
+
+// ---------------------------------------------------------------------------
+// hive.ui's scene
+// ---------------------------------------------------------------------------
+
+/// Source of `hive/ui_scene.go`: the part of `hive.ui` that draws in three
+/// dimensions (`ui.scene` and the shapes that go in one).
+///
+/// It is a module of its own for the reason `hive.sql` is: it is the only part of
+/// the language that carries something downloaded — the three.js build the
+/// browser draws with, fetched once at compile time and embedded here — so a
+/// program with a window but no scene never brings it near the build. See
+/// `hive/vendor`.
+///
+/// The division of labour is the one the rest of the module already keeps. A
+/// scene is a **value**: a camera and a vector of shapes, rebuilt by an ordinary
+/// `func` whenever the state changes, with no handle to hold and nothing to
+/// mutate. What the page does with it — cache a geometry, reuse a mesh, keep a
+/// texture for a name that has not changed — is the renderer's business, and none
+/// of it is visible from Hive.
+fn ui_scene_go() -> String {
+  "package hive
+
+import (
+	\"embed\"
+	\"math\"
+	\"net/http\"
+	\"strconv\"
+	\"strings\"
+)
+
+// `hive.ui`'s third dimension.
+//
+// A scene is a widget like any other — it takes attributes, it has a payload,
+// and a `func` builds it — and it renders to a box on the page that a small
+// three.js program draws into. What makes it different from every other widget
+// is that the box is *kept*: the payload travels on a frame of its own (see
+// `publish` in ui.go), so the world can be redrawn sixty times a second without
+// the document around it being re-sent or the canvas being replaced.
+//
+// The shapes are a closed set, and the attributes are semantic tokens, for the
+// same reason the widgets are: `at`, `turn` and `paint` mean something to any
+// renderer that can draw at all, where a mesh, a material and a shader would
+// mean something only to this one.
+
+// ---------------------------------------------------------------------------
+// three.js
+// ---------------------------------------------------------------------------
+
+// The library, fetched at compile time against a pinned digest and embedded
+// here. Nothing is loaded from the network when the program runs: a built Hive
+// program is one file, and a window opening a socket to a CDN would make that
+// untrue.
+//
+//go:embed three.module.min.js three.core.min.js
+var uiSceneLib embed.FS
+
+// What the window serves and what it puts on the page. This runs because the
+// file is in the build, and the file is in the build because the program draws a
+// scene — which is the whole of how `hive.ui` learns that it has a third
+// dimension today.
+func init() {
+	uiExtraScript = \"<script type=\\\"module\\\" src=\\\"/_hive/scene.js\\\"></script>\"
+	uiExtraRoutes[\"/_hive/scene.js\"] = uiSceneText(\"text/javascript\", uiSceneJS)
+	uiExtraRoutes[\"/_hive/three.module.min.js\"] = uiSceneAsset(\"three.module.min.js\")
+	uiExtraRoutes[\"/_hive/three.core.min.js\"] = uiSceneAsset(\"three.core.min.js\")
+}
+
+func uiSceneText(mime string, body string) func(http.ResponseWriter, *http.Request) {
+	return func(rw http.ResponseWriter, _ *http.Request) {
+		rw.Header().Set(\"Content-Type\", mime+\"; charset=utf-8\")
+		rw.Header().Set(\"Cache-Control\", \"no-store\")
+		_, _ = rw.Write([]byte(body))
+	}
+}
+
+// A file out of the embedded library. It carries no token: it is the same public
+// library bytes on every machine, it says nothing about the program serving it,
+// and the page that loads it was already let in.
+func uiSceneAsset(name string) func(http.ResponseWriter, *http.Request) {
+	return func(rw http.ResponseWriter, _ *http.Request) {
+		body, err := uiSceneLib.ReadFile(name)
+		if err != nil {
+			http.Error(rw, \"not found\", http.StatusNotFound)
+			return
+		}
+		rw.Header().Set(\"Content-Type\", \"text/javascript; charset=utf-8\")
+		// The bytes are pinned to a version, so a page may keep them for as long
+		// as it likes.
+		rw.Header().Set(\"Cache-Control\", \"public, max-age=31536000, immutable\")
+		_, _ = rw.Write(body)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The shapes
+// ---------------------------------------------------------------------------
+
+// Shape is one thing in a scene. `Kind` names it, `Nums` carries the dimensions
+// its kind takes, and `Text` the words a label shows — the same arrangement
+// `View` uses, and for the same reason: a shape is a value with nothing behind
+// it.
+//
+// A shape is deliberately *not* a `View`. They are two closed sets with two
+// different meanings, and keeping them apart is what makes a box inside a column
+// — or a button inside a scene — something the compiler refuses rather than
+// something the renderer quietly drops.
+type Shape struct {
+	Kind  string
+	Attrs []Attr
+	Nums  []float64
+	Text  string
+}
+
+func UiBox(attrs []Attr, width float64, height float64, depth float64) Shape {
+	return Shape{Kind: \"box\", Attrs: attrs, Nums: []float64{width, height, depth}}
+}
+
+func UiSphere(attrs []Attr, radius float64) Shape {
+	return Shape{Kind: \"sphere\", Attrs: attrs, Nums: []float64{radius}}
+}
+
+func UiCylinder(attrs []Attr, radius float64, height float64) Shape {
+	return Shape{Kind: \"cylinder\", Attrs: attrs, Nums: []float64{radius, height}}
+}
+
+// A plane that lies flat, because that is what a floor is. It takes no rotation
+// to be one — the geometry is built lying down — so the common case costs
+// nothing and `turn` still means what it means everywhere else.
+func UiGround(attrs []Attr, width float64, depth float64) Shape {
+	return Shape{Kind: \"ground\", Attrs: attrs, Nums: []float64{width, depth}}
+}
+
+// Words standing in the world at a position, always turned to face whoever is
+// looking. A name over somebody's head is the case this is for, and it is why it
+// takes no rotation: a label you can read from one side only is not a label.
+func UiLabel(attrs []Attr, words string) Shape {
+	return Shape{Kind: \"label\", Attrs: attrs, Text: words}
+}
+
+// The one shape whose position is its payload rather than an attribute: a line
+// is *between* two places, and there is no third one to call its own. A tracer
+// is what this is for.
+func UiLine(attrs []Attr, fromX float64, fromY float64, fromZ float64, toX float64, toY float64, toZ float64) Shape {
+	return Shape{
+		Kind:  \"line\",
+		Attrs: attrs,
+		Nums:  []float64{fromX, fromY, fromZ, toX, toY, toZ},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The attributes a scene and its shapes take
+// ---------------------------------------------------------------------------
+
+func uiNums(kind string, values []float64) Attr {
+	return Attr{Kind: kind, Nums: values}
+}
+
+func UiAttrAt(x float64, y float64, z float64) Attr {
+	return uiNums(\"at\", []float64{x, y, z})
+}
+
+func UiAttrTurn(x float64, y float64, z float64) Attr {
+	return uiNums(\"turn\", []float64{x, y, z})
+}
+
+func UiAttrPaint(v Tone) Attr { return uiEnum(\"paint\", string(v)) }
+
+func UiAttrEye(x float64, y float64, z float64) Attr {
+	return uiNums(\"eye\", []float64{x, y, z})
+}
+
+func UiAttrAim(yaw float64, pitch float64) Attr {
+	return uiNums(\"aim\", []float64{yaw, pitch})
+}
+
+func UiAttrLens(fov int) Attr        { return uiNum(\"lens\", fov) }
+func UiAttrFog(far int) Attr         { return uiNum(\"fog\", far) }
+func UiAttrGrab(on bool) Attr        { return Attr{Kind: \"grab\", Flag: on} }
+func UiAttrCrosshair(on bool) Attr   { return Attr{Kind: \"crosshair\", Flag: on} }
+
+func UiAttrOnFrame(f func(int) any) Attr    { return Attr{Kind: \"onFrame\", FnInt: f} }
+func UiAttrOnKeyDown(f func(string) any) Attr { return Attr{Kind: \"onKeyDown\", FnStr: f} }
+func UiAttrOnKeyUp(f func(string) any) Attr   { return Attr{Kind: \"onKeyUp\", FnStr: f} }
+func UiAttrOnGrab(f func(bool) any) Attr      { return Attr{Kind: \"onGrab\", FnBool: f} }
+
+func UiAttrOnLook(f func(float64, float64) any) Attr {
+	return Attr{Kind: \"onLook\", FnLook: f}
+}
+
+// ---------------------------------------------------------------------------
+// The frame a scene comes to
+// ---------------------------------------------------------------------------
+
+// UiScene is the widget. The tree keeps the attributes — the layout ones are
+// what put the box on the page — and the whole description of the world is
+// written out here, once, into the payload the window sends on its own frame.
+func UiScene(attrs []Attr, shapes []Shape) View {
+	var b strings.Builder
+	b.WriteString(\"{\")
+	uiSceneCamera(&b, attrs)
+	b.WriteString(\",\\\"o\\\":[\")
+	for i, s := range shapes {
+		if i > 0 {
+			b.WriteString(\",\")
+		}
+		uiSceneShape(&b, s)
+	}
+	b.WriteString(\"]}\")
+	return View{Kind: \"scene\", Attrs: attrs, Text: b.String()}
+}
+
+// Where the eye is, where it is looking, and what the world around it looks
+// like. Every one of these has an answer whether or not the program gave one:
+// a scene with no camera attributes at all is a metre and a half above the
+// origin looking down -Z, which is a view of *something* rather than a blank.
+func uiSceneCamera(b *strings.Builder, attrs []Attr) {
+	b.WriteString(\"\\\"eye\\\":\" + uiSceneVec(uiSceneNums(attrs, \"eye\", []float64{0, 1.7, 0})))
+	b.WriteString(\",\\\"aim\\\":\" + uiSceneVec(uiSceneNums(attrs, \"aim\", []float64{0, 0})))
+	if lens, ok := uiFind(attrs, \"lens\"); ok {
+		b.WriteString(\",\\\"lens\\\":\" + strconv.Itoa(lens.Num))
+	}
+	if fog, ok := uiFind(attrs, \"fog\"); ok {
+		b.WriteString(\",\\\"fog\\\":\" + strconv.Itoa(fog.Num))
+	}
+	// The sky is the widget's own `background`, which is the same attribute a
+	// column paints itself with: what is behind the content, in the one place
+	// where what is behind the content is the sky.
+	if sky, ok := uiFind(attrs, \"background\"); ok {
+		b.WriteString(\",\\\"sky\\\":\\\"\" + uiSceneTone(sky.Enum, \"#8ecbff\") + \"\\\"\")
+	}
+	if grab, ok := uiFind(attrs, \"grab\"); ok && grab.Flag {
+		b.WriteString(\",\\\"grab\\\":1\")
+	}
+	// Which events the program is actually listening for. A page that would only
+	// be telling the fold about frames nobody folds says nothing instead.
+	b.WriteString(\",\\\"on\\\":\\\"\" + uiSceneWants(attrs) + \"\\\"\")
+}
+
+func uiSceneWants(attrs []Attr) string {
+	var b strings.Builder
+	if _, ok := uiFind(attrs, \"onFrame\"); ok {
+		b.WriteString(\"f\")
+	}
+	if _, ok := uiFind(attrs, \"onKeyDown\"); ok {
+		b.WriteString(\"k\")
+	}
+	if _, ok := uiFind(attrs, \"onKeyUp\"); ok {
+		b.WriteString(\"u\")
+	}
+	if _, ok := uiFind(attrs, \"onLook\"); ok {
+		b.WriteString(\"l\")
+	}
+	if _, ok := uiFind(attrs, \"onGrab\"); ok {
+		b.WriteString(\"g\")
+	}
+	return b.String()
+}
+
+func uiSceneShape(b *strings.Builder, s Shape) {
+	b.WriteString(\"{\\\"k\\\":\\\"\" + s.Kind + \"\\\"\")
+	b.WriteString(\",\\\"c\\\":\\\"\" + uiSceneTone(uiSceneEnum(s.Attrs, \"paint\"), \"#cfd6de\") + \"\\\"\")
+	// A line carries both its ends in its payload, so it has no position of its
+	// own and no rotation to apply to it.
+	if s.Kind != \"line\" {
+		b.WriteString(\",\\\"p\\\":\" + uiSceneVec(uiSceneNums(s.Attrs, \"at\", []float64{0, 0, 0})))
+		if turn, ok := uiFind(s.Attrs, \"turn\"); ok && uiSceneAny(turn.Nums) {
+			b.WriteString(\",\\\"r\\\":\" + uiSceneVec(turn.Nums))
+		}
+	}
+	if len(s.Nums) > 0 {
+		b.WriteString(\",\\\"d\\\":\" + uiSceneVec(s.Nums))
+	}
+	if s.Text != \"\" {
+		b.WriteString(\",\\\"x\\\":\" + uiSceneStr(s.Text))
+	}
+	b.WriteString(\"}\")
+}
+
+// The colour a `Tone` comes to in a world. A role has to be answered with a
+// value here rather than with a class — there is no stylesheet in a scene — so
+// these five are the palette, and they are the same five the page uses.
+func uiSceneTone(enum string, fallback string) string {
+	if colour, ok := uiToneColour(enum); ok {
+		return colour
+	}
+	switch enum {
+	case \"Normal\":
+		return \"#d8dee6\"
+	case \"Muted\":
+		return \"#8b98a5\"
+	case \"Good\":
+		return \"#2fbf71\"
+	case \"Warn\":
+		return \"#f0b429\"
+	case \"Danger\":
+		return \"#e14b3a\"
+	}
+	return fallback
+}
+
+func uiSceneEnum(attrs []Attr, kind string) string {
+	if a, ok := uiFind(attrs, kind); ok {
+		return a.Enum
+	}
+	return \"\"
+}
+
+func uiSceneNums(attrs []Attr, kind string, fallback []float64) []float64 {
+	if a, ok := uiFind(attrs, kind); ok && len(a.Nums) == len(fallback) {
+		return a.Nums
+	}
+	return fallback
+}
+
+func uiSceneAny(nums []float64) bool {
+	for _, n := range nums {
+		if n != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func uiSceneVec(nums []float64) string {
+	var b strings.Builder
+	b.WriteString(\"[\")
+	for i, n := range nums {
+		if i > 0 {
+			b.WriteString(\",\")
+		}
+		b.WriteString(uiSceneF(n))
+	}
+	b.WriteString(\"]\")
+	return b.String()
+}
+
+// A number in a frame: three decimals, which is a millimetre in a world measured
+// in metres, and nothing after that. A frame is sent sixty times a second, so the
+// digits nobody can see are worth leaving out.
+//
+// Non-finite values are written as `0`. That is not politeness: JSON has no
+// spelling for NaN, so a single one would make the whole frame unreadable and
+// stop the picture dead — a shape at the origin is a far better answer than a
+// window that freezes because some velocity divided by zero.
+func uiSceneF(v float64) string {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return \"0\"
+	}
+	text := strconv.FormatFloat(v, 'f', 3, 64)
+	if strings.Contains(text, \".\") {
+		text = strings.TrimRight(text, \"0\")
+		text = strings.TrimSuffix(text, \".\")
+	}
+	if text == \"\" || text == \"-\" || text == \"-0\" {
+		return \"0\"
+	}
+	return text
+}
+
+// A label's words as a JSON string. The words are whatever the program had, so
+// they are escaped rather than trusted — and they never reach the document at
+// all: a label is drawn into the picture, not written into the page.
+func uiSceneStr(text string) string {
+	var b strings.Builder
+	b.WriteString(\"\\\"\")
+	for _, r := range text {
+		switch r {
+		case '\"':
+			b.WriteString(\"\\\\\\\"\")
+		case '\\\\':
+			b.WriteString(\"\\\\\\\\\")
+		case '\\n':
+			b.WriteString(\"\\\\n\")
+		case '\\r':
+			b.WriteString(\"\\\\r\")
+		case '\\t':
+			b.WriteString(\"\\\\t\")
+		default:
+			if r < 0x20 {
+				b.WriteString(\"\\\\u00\" + string(\"0123456789abcdef\"[r>>4]) + string(\"0123456789abcdef\"[r&0xf]))
+				continue
+			}
+			b.WriteRune(r)
+		}
+	}
+	b.WriteString(\"\\\"\")
+	return b.String()
+}
+" <> ui_scene_js()
+}
+
+/// The page's half of a scene: the module the window serves at `/_hive/scene.js`.
+///
+/// It is the only part of `hive.ui` that is a *renderer* rather than a
+/// description — and everything it does that the description does not mention is
+/// there to make sixty frames a second cheap: one canvas that outlives every
+/// repaint, geometries and materials kept by shape and by colour, a mesh reused
+/// in place while it still stands for the same thing, and nothing sent back to
+/// the program that the program did not ask to hear.
+///
+/// It talks to the shell through exactly two things — `hiveSceneReady`, to be
+/// handed each frame, and `send`, to report what the player did. Neither knows
+/// anything about three.js, which is what keeps three.js out of every window that
+/// draws no scene.
+fn ui_scene_js() -> String {
+  "
+// The page's half of `hive.ui.scene`, served at /_hive/scene.js.
+const uiSceneJS = `
+import * as THREE from \"./three.module.min.js\";
+
+// The canvas lives here, outside the element the window swaps on every repaint.
+// That is not a detail: a canvas inside it would be destroyed by each swap, and
+// with it the WebGL context, every geometry on the card and — the one that is
+// impossible to work around — the pointer lock, which the browser drops the
+// moment the element holding it leaves the document.
+var holder = document.createElement(\"div\");
+holder.className = \"h-canvas\";
+holder.style.display = \"none\";
+document.body.appendChild(holder);
+
+var renderer = null, stage = null, camera = null;
+var host = null, handle = \"\", world = null;
+var seen = {left: -1, top: -1, width: -1, height: -1};
+var live = [], geoms = new Map(), mats = new Map(), inks = new Map(), signs = new Map();
+var skins = new Map();
+var want = \"\", grabbing = false, lookX = 0, lookY = 0, last = 0, dirty = false;
+var held = {};
+
+function boot() {
+  renderer = new THREE.WebGLRenderer({antialias: true});
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  stage = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera(75, 1, 0.08, 800);
+  // Yaw, then pitch. With the default order a camera that is looking up rolls as
+  // it turns, which is the one thing an eye never does.
+  camera.rotation.order = \"YXZ\";
+  // A fixed rig, because lighting is not something a scene describes: two lights,
+  // one from the sky and one from a sun, chosen so that a solid painted a colour
+  // comes out *that* colour with a shaded side. Brighter than this and every
+  // surface saturates to white, which is the failure worth guarding against —
+  // three.js takes these in physical units, where 1 is already a full-strength
+  // white surface facing the light.
+  stage.add(new THREE.HemisphereLight(0xffffff, 0x4a5568, 0.65));
+  var sun = new THREE.DirectionalLight(0xffffff, 1.35);
+  sun.position.set(6, 14, 8);
+  stage.add(sun);
+  holder.appendChild(renderer.domElement);
+  listen();
+}
+
+// --- the box the picture goes in -------------------------------------------
+
+// Called after every document swap: the element is a new one each time, so what
+// is found again here is where the canvas has to be laid over.
+function attach() {
+  var el = document.querySelector(\".h-scene[data-scene]\");
+  if (!el) {
+    host = null;
+    handle = \"\";
+    holder.style.display = \"none\";
+    release();
+    return;
+  }
+  host = el;
+  handle = el.getAttribute(\"data-h\") || \"\";
+  if (!renderer) { boot(); }
+  holder.style.display = \"block\";
+  follow(true);
+}
+
+function follow(force) {
+  if (!host || !renderer) { return; }
+  var mark = host.classList.contains(\"h-aiming\") ? \"h-canvas h-aiming\" : \"h-canvas\";
+  if (holder.className !== mark) { holder.className = mark; }
+  var r = host.getBoundingClientRect();
+  var w = Math.max(1, Math.round(r.width)), h = Math.max(1, Math.round(r.height));
+  if (!force && r.left === seen.left && r.top === seen.top && w === seen.width && h === seen.height) {
+    return;
+  }
+  seen = {left: r.left, top: r.top, width: w, height: h};
+  holder.style.left = r.left + \"px\";
+  holder.style.top = r.top + \"px\";
+  holder.style.width = w + \"px\";
+  holder.style.height = h + \"px\";
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  dirty = true;
+}
+
+// --- one frame -------------------------------------------------------------
+
+function paint(text) {
+  var frames = JSON.parse(text);
+  if (!frames.length) { return; }
+  if (!renderer) { boot(); }
+  world = frames[0];
+  apply(world);
+  dirty = true;
+}
+
+function apply(w) {
+  want = w.on || \"\";
+  var sky = w.sky ? ink(w.sky) : null;
+  if (sky) { stage.background = sky; }
+  if (w.fog) {
+    if (!stage.fog) { stage.fog = new THREE.Fog(0x8ecbff, 1, 100); }
+    if (sky) { stage.fog.color = sky; }
+    // The attribute is the distance at which the sky swallows things whole, and
+    // the haze starts at half of it — near enough to give depth, far enough that
+    // an arena that size is not looked at through a mist.
+    stage.fog.near = w.fog * 0.5;
+    stage.fog.far = w.fog;
+  } else if (stage.fog) {
+    stage.fog = null;
+  }
+  camera.position.set(w.eye[0], w.eye[1], w.eye[2]);
+  camera.rotation.set(w.aim[1], w.aim[0], 0);
+  var lens = w.lens || 75;
+  if (camera.fov !== lens) { camera.fov = lens; camera.updateProjectionMatrix(); }
+  shapes(w.o || []);
+  // Letting go is the program's to decide; taking hold needs a click, which is
+  // the browser's rule and not ours.
+  if (!w.grab && grabbing) { document.exitPointerLock(); }
+}
+
+// The shapes, matched against what is already on the card slot by slot. A view
+// built by the same code every frame lists the same things in the same order, so
+// nearly every frame is a position and a rotation written into a mesh that was
+// already there — and one that genuinely became something else is rebuilt.
+function shapes(list) {
+  for (var i = 0; i < list.length; i++) {
+    var s = list[i], sig = signature(s), o = live[i];
+    if (!o || o.userData.sig !== sig) {
+      if (o) { stage.remove(o); }
+      o = build(s, sig);
+      live[i] = o;
+      stage.add(o);
+    }
+    put(o, s);
+  }
+  for (var j = list.length; j < live.length; j++) { stage.remove(live[j]); }
+  live.length = list.length;
+}
+
+// What makes a shape the same shape as the one in this slot last frame. Position,
+// rotation and colour are left out on purpose — those are written into whatever
+// is there. A line leaves its ends out too: they are its payload, and a tracer
+// that had to be rebuilt every frame would be a new buffer sixty times a second.
+function signature(s) {
+  if (s.k === \"line\") { return \"line\"; }
+  if (s.k === \"label\") { return \"label|\" + (s.x || \"\") + \"|\" + s.c; }
+  return s.k + \"|\" + (s.d ? s.d.join(\",\") : \"\");
+}
+
+function build(s, sig) {
+  var made;
+  if (s.k === \"line\") {
+    var g = new THREE.BufferGeometry();
+    g.setAttribute(\"position\", new THREE.BufferAttribute(new Float32Array(6), 3));
+    made = new THREE.Line(g, new THREE.LineBasicMaterial({color: 0xffffff}));
+    made.frustumCulled = false;
+  } else if (s.k === \"label\") {
+    var tex = sign(s.x || \"\", s.c);
+    made = new THREE.Sprite(new THREE.SpriteMaterial({map: tex, transparent: true, depthWrite: false}));
+    made.scale.set(0.42 * tex.userData.aspect, 0.42, 1);
+  } else {
+    var geo = geoms.get(sig);
+    if (!geo) { geo = solid(s); geoms.set(sig, geo); }
+    made = new THREE.Mesh(geo, paintOf(s));
+  }
+  made.userData.sig = sig;
+  return made;
+}
+
+function solid(s) {
+  var d = s.d || [1, 1, 1];
+  if (s.k === \"sphere\") { return new THREE.SphereGeometry(d[0], 18, 12); }
+  if (s.k === \"cylinder\") { return new THREE.CylinderGeometry(d[0], d[0], d[1], 20); }
+  if (s.k === \"ground\") {
+    var flat = new THREE.PlaneGeometry(d[0], d[1]);
+    flat.rotateX(-Math.PI / 2);
+    return flat;
+  }
+  return new THREE.BoxGeometry(d[0], d[1], d[2]);
+}
+
+function put(o, s) {
+  if (s.k === \"line\") {
+    var p = o.geometry.attributes.position;
+    for (var i = 0; i < 6; i++) { p.array[i] = s.d[i]; }
+    p.needsUpdate = true;
+    o.material.color.setStyle(s.c);
+    return;
+  }
+  o.position.set(s.p[0], s.p[1], s.p[2]);
+  if (s.k === \"label\") { return; }
+  if (s.r) { o.rotation.set(s.r[0], s.r[1], s.r[2]); }
+  else if (o.rotation.x || o.rotation.y || o.rotation.z) { o.rotation.set(0, 0, 0); }
+  var m = paintOf(s);
+  if (o.material !== m) { o.material = m; }
+}
+
+function ink(hex) {
+  var c = inks.get(hex);
+  if (!c) { c = new THREE.Color(); c.setStyle(hex); inks.set(hex, c); }
+  return c;
+}
+
+// One material per colour *and* grain, shared by every shape wearing it. Toon
+// shading is what makes a scene of plain solids read as a drawing rather than as
+// a render, and the grain below is what stops each face reading as a flat card.
+function paintOf(s) {
+  var tile = tiling(s);
+  var key = s.k + \"|\" + s.c + \"|\" + tile[0] + \",\" + tile[1];
+  var m = mats.get(key);
+  if (!m) {
+    // The colour is in the texture rather than on the material: a map multiplies
+    // the material's colour, so setting both would square it.
+    m = new THREE.MeshToonMaterial({map: grain(s.k, s.c, tile)});
+    mats.set(key, m);
+  }
+  return m;
+}
+
+// How many times the grain repeats across a shape, so that a wall and a crate
+// have the same size of grain rather than the same *number* of it. Roughly one
+// tile every two metres, and never fewer than one.
+function tiling(s) {
+  var d = s.d || [1, 1, 1];
+  if (s.k === \"ground\") { return [span(d[0], 3), span(d[1], 3)]; }
+  if (s.k === \"sphere\") { return [2, 1]; }
+  if (s.k === \"cylinder\") { return [span(d[0] * 6, 2), span(d[1], 2)]; }
+  return [span(d[0], 2), span(d[1], 2)];
+}
+
+function span(metres, per) {
+  return Math.max(1, Math.round(metres / per));
+}
+
+// The grain itself, drawn here rather than loaded from anywhere. A scene is a
+// value and a Hive program is one file, so a texture that had to ship as an image
+// would make both of those untrue — and a pattern a canvas can draw in twenty
+// lines is all \"not a flat card\" takes.
+//
+// Every pattern is painted in translucent black and white *over* the colour, so
+// one drawing serves every colour it is asked for: a green crate and a brown one
+// are the same planks.
+function grain(kind, colour, tile) {
+  var key = kind + \"|\" + colour + \"|\" + tile[0] + \",\" + tile[1];
+  var kept = skins.get(key);
+  if (kept) { return kept; }
+  var size = 128;
+  var canvas = document.createElement(\"canvas\");
+  canvas.width = size;
+  canvas.height = size;
+  var ctx = canvas.getContext(\"2d\");
+  ctx.fillStyle = colour;
+  ctx.fillRect(0, 0, size, size);
+  if (kind === \"ground\") { turf(ctx, size); }
+  else if (kind === \"cylinder\") { staves(ctx, size); }
+  else if (kind === \"sphere\") { speckle(ctx, size, 90, 0.05); }
+  else { planks(ctx, size); }
+  var tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(tile[0], tile[1]);
+  tex.anisotropy = 4;
+  skins.set(key, tex);
+  return tex;
+}
+
+// Grass: short strokes leaning two ways, over a light mottling. The mottling is
+// kept faint and the strokes many — the other way round reads as mud.
+function turf(ctx, size) {
+  speckle(ctx, size, 70, 0.035);
+  for (var i = 0; i < 200; i++) {
+    var x = Math.random() * size, y = Math.random() * size;
+    var lean = (Math.random() - 0.5) * 4;
+    ctx.strokeStyle = i % 2 ? \"rgba(0,0,0,0.10)\" : \"rgba(255,255,255,0.10)\";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x + lean, y - 5 - Math.random() * 4);
+    ctx.stroke();
+  }
+}
+
+// Boards: a panel edge and a couple of seams, which is what makes a box read as a
+// crate, a wall or a door rather than as a cube.
+function planks(ctx, size) {
+  speckle(ctx, size, 70, 0.04);
+  ctx.strokeStyle = \"rgba(0,0,0,0.22)\";
+  ctx.lineWidth = 3;
+  ctx.strokeRect(1.5, 1.5, size - 3, size - 3);
+  ctx.strokeStyle = \"rgba(0,0,0,0.13)\";
+  ctx.lineWidth = 2;
+  for (var i = 1; i < 3; i++) {
+    ctx.beginPath();
+    ctx.moveTo(0, size * i / 3);
+    ctx.lineTo(size, size * i / 3);
+    ctx.stroke();
+  }
+  ctx.strokeStyle = \"rgba(255,255,255,0.10)\";
+  ctx.lineWidth = 1;
+  for (var j = 1; j < 3; j++) {
+    ctx.beginPath();
+    ctx.moveTo(0, size * j / 3 + 2);
+    ctx.lineTo(size, size * j / 3 + 2);
+    ctx.stroke();
+  }
+}
+
+// Staves, for anything round: vertical bands, lighter on one side of each seam.
+function staves(ctx, size) {
+  speckle(ctx, size, 60, 0.04);
+  for (var i = 0; i < 8; i++) {
+    var x = size * i / 8;
+    ctx.fillStyle = \"rgba(0,0,0,0.16)\";
+    ctx.fillRect(x, 0, 2, size);
+    ctx.fillStyle = \"rgba(255,255,255,0.09)\";
+    ctx.fillRect(x + 2, 0, 2, size);
+  }
+}
+
+// The mottling every pattern starts from: dots of light and dark, which is what
+// keeps a large flat face from banding.
+function speckle(ctx, size, count, strength) {
+  for (var i = 0; i < count; i++) {
+    var light = i % 2 === 0;
+    ctx.fillStyle = light ? \"rgba(255,255,255,\" + strength + \")\"
+                          : \"rgba(0,0,0,\" + (strength * 1.4) + \")\";
+    var r = 1 + Math.random() * 3;
+    ctx.beginPath();
+    ctx.arc(Math.random() * size, Math.random() * size, r, 0, 6.284);
+    ctx.fill();
+  }
+}
+
+// A label is words drawn once onto a canvas and kept: a name over somebody's head
+// does not change while they are running around, so the texture for it is made
+// the first time it is seen and reused every frame after.
+function sign(text, colour) {
+  var key = text + \"|\" + colour;
+  var kept = signs.get(key);
+  if (kept) { return kept; }
+  var pad = 16, size = 52;
+  var face = \"bold \" + size + \"px system-ui, -apple-system, Segoe UI, sans-serif\";
+  var canvas = document.createElement(\"canvas\");
+  var ctx = canvas.getContext(\"2d\");
+  ctx.font = face;
+  canvas.width = Math.ceil(ctx.measureText(text).width) + pad * 2;
+  canvas.height = size + pad * 2;
+  // Sizing the canvas resets everything about the context, so the font goes on
+  // again after it.
+  ctx = canvas.getContext(\"2d\");
+  ctx.font = face;
+  ctx.fillStyle = \"rgba(10,12,16,0.5)\";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = colour;
+  ctx.textBaseline = \"middle\";
+  ctx.fillText(text, pad, canvas.height / 2 + 2);
+  var tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.userData.aspect = canvas.width / canvas.height;
+  signs.set(key, tex);
+  return tex;
+}
+
+// --- the clock -------------------------------------------------------------
+
+// The browser's own frame, which is the only clock worth stepping a picture by:
+// it is the refresh rate, it stops while the window is hidden, and it never runs
+// twice for one paint.
+function tick(now) {
+  requestAnimationFrame(tick);
+  if (!renderer || !host) { last = now; return; }
+  follow(false);
+  if (lookX || lookY) {
+    if (want.indexOf(\"l\") >= 0) { post(\"look\", round(lookX) + \",\" + round(lookY), 0); }
+    lookX = 0;
+    lookY = 0;
+  }
+  if (dirty) { renderer.render(stage, camera); dirty = false; }
+  var ms = last ? Math.round(now - last) : 0;
+  last = now;
+  // Told after the picture is on screen rather than before, so the program is
+  // working out the next frame while this one is being looked at. A gap longer
+  // than a tenth of a second is reported as that: it means the window was busy
+  // or hidden, and a world stepped by the real gap would teleport.
+  if (ms > 0 && want.indexOf(\"f\") >= 0) { post(\"frame\", \"\", Math.min(100, ms)); }
+}
+requestAnimationFrame(tick);
+
+function round(n) { return Math.round(n * 100) / 100; }
+
+// Nothing is sent while the socket is behind. A frame the program has not folded
+// yet is not made any fresher by queueing another one after it.
+function post(kind, value, index) {
+  if (!handle || sock.readyState !== 1 || sock.bufferedAmount > 65536) { return; }
+  send(handle, kind, value, index);
+}
+
+// --- what the player did ---------------------------------------------------
+
+function listen() {
+  // Taking the mouse is watched for on the whole document rather than on the
+  // canvas, and that is not laziness. A browser only grants the pointer on a
+  // click, and a panel drawn over the picture — \"click to play\", the thing a
+  // program puts up *because* it does not have the mouse yet — is above the
+  // canvas and would swallow the very click that was meant to take it. Asking for
+  // the mouse anywhere it was not clearly asked for something else is what breaks
+  // that circle, and it cannot be done by folding the click through the program:
+  // by the time a message comes back, the browser no longer counts it as a
+  // gesture.
+  document.addEventListener(\"mousedown\", function (e) {
+    if (world && world.grab && !grabbing) {
+      if (interactive(e.target)) { return; }
+      renderer.domElement.requestPointerLock();
+      // The click that takes hold of the mouse is not also a shot.
+      e.preventDefault();
+      return;
+    }
+    if (grabbing || holder.contains(e.target)) { down(\"mouse\" + (e.button + 1)); }
+  });
+  document.addEventListener(\"mouseup\", function (e) {
+    if (grabbing || holder.contains(e.target)) { up(\"mouse\" + (e.button + 1)); }
+  });
+  holder.addEventListener(\"contextmenu\", function (e) { if (grabbing) { e.preventDefault(); } });
+  document.addEventListener(\"pointerlockchange\", function () {
+    grabbing = document.pointerLockElement === renderer.domElement;
+    // Escape gives the mouse back, and anything still held down at that moment
+    // is not held any more.
+    if (!grabbing) { release(); }
+    if (want.indexOf(\"g\") >= 0) { post(\"grab\", grabbing ? \"1\" : \"\", 0); }
+  });
+  document.addEventListener(\"mousemove\", function (e) {
+    if (!grabbing) { return; }
+    lookX += e.movementX || 0;
+    lookY += e.movementY || 0;
+  });
+  window.addEventListener(\"keydown\", function (e) {
+    if (typing()) { return; }
+    var k = named(e);
+    if (!k) { return; }
+    if (grabbing && swallow(k)) { e.preventDefault(); }
+    // Held is held: the operating system's repeat is not a second press.
+    if (e.repeat) { return; }
+    down(k);
+  });
+  window.addEventListener(\"keyup\", function (e) {
+    if (typing()) { return; }
+    var k = named(e);
+    if (k) { up(k); }
+  });
+  // A key held as the window loses focus would otherwise still be held when it
+  // comes back — a player who alt-tabbed mid-stride and returned to find
+  // themselves still running.
+  window.addEventListener(\"blur\", release);
+}
+
+// Whether a click landed on something the program is listening to — a button, a
+// field, a link, a row that carries a message. Those keep their click; everything
+// else is fair game for taking the mouse. The scene itself is excluded: it carries
+// a handler of its own, and clicking the picture is the most obvious way there is
+// to say \"give me the mouse\".
+function interactive(el) {
+  while (el && el !== document.body) {
+    if (el.classList && el.classList.contains(\"h-scene\")) { return false; }
+    if (el.getAttribute && el.getAttribute(\"data-h\")) { return true; }
+    var tag = el.tagName;
+    if (tag === \"BUTTON\" || tag === \"A\" || tag === \"INPUT\" || tag === \"TEXTAREA\" ||
+        tag === \"SELECT\" || tag === \"LABEL\") {
+      return true;
+    }
+    el = el.parentNode;
+  }
+  return false;
+}
+
+// Typing is typing. A window with a text field in it must not read the field as
+// movement, and this is the whole rule that keeps the two apart.
+function typing() {
+  var el = document.activeElement;
+  if (!el || el === document.body) { return false; }
+  var tag = el.tagName;
+  return tag === \"INPUT\" || tag === \"TEXTAREA\" || tag === \"SELECT\" || el.isContentEditable;
+}
+
+// The keys the page would otherwise act on itself while the mouse is held: space
+// and the arrows scroll, and tab walks out of the window.
+function swallow(k) {
+  return k === \"space\" || k === \"tab\" || k === \"up\" || k === \"down\" ||
+    k === \"left\" || k === \"right\";
+}
+
+function down(k) {
+  if (held[k]) { return; }
+  held[k] = true;
+  if (want.indexOf(\"k\") >= 0) { post(\"keydown\", k, 0); }
+}
+
+function up(k) {
+  if (!held[k]) { return; }
+  delete held[k];
+  if (want.indexOf(\"u\") >= 0) { post(\"keyup\", k, 0); }
+}
+
+function release() {
+  for (var k in held) {
+    if (want.indexOf(\"u\") >= 0) { post(\"keyup\", k, 0); }
+  }
+  held = {};
+}
+
+// One name per key, and the same name on every keyboard layout the browser can
+// report: a letter or a digit is itself, and everything else is the word for it.
+function named(e) {
+  var k = e.key;
+  if (!k) { return \"\"; }
+  if (k === \" \" || k === \"Spacebar\") { return \"space\"; }
+  if (k === \"Control\") { return \"ctrl\"; }
+  if (k === \"ArrowUp\") { return \"up\"; }
+  if (k === \"ArrowDown\") { return \"down\"; }
+  if (k === \"ArrowLeft\") { return \"left\"; }
+  if (k === \"ArrowRight\") { return \"right\"; }
+  return k.toLowerCase();
+}
+
+window.hiveSceneReady(paint, attach);
+`
 "
 }

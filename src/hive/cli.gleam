@@ -19,6 +19,7 @@ import hive/compiler
 import hive/runtime
 import hive/spawn
 import hive/testreport
+import hive/vendor
 
 /// Compile `entry` to Go, then build a native executable with the Go compiler.
 /// On success returns the path to the produced executable.
@@ -375,21 +376,32 @@ fn prepare_build_dir_for(
   // fail outright, since go.mod is regenerated dependency-free on every build.
   // `delete_all` is a no-op when the file is already absent.
   let needed = runtime.needed_modules(references)
-  list.try_fold(runtime.modules(), Nil, fn(_, module) {
-    let path = filepath.join(build_dir, module.file)
-    case list.contains(needed, module.name) {
-      True -> write(path, module.source())
-      False ->
-        simplifile.delete_all([path])
-        |> result.map_error(fn(e) {
-          "could not remove a stale "
-          <> path
-          <> ": "
-          <> simplifile.describe_error(e)
-        })
-    }
-  })
-  |> result.map(fn(_) { Nil })
+  use _ <- result.try(
+    list.try_fold(runtime.modules(), Nil, fn(_, module) {
+      let path = filepath.join(build_dir, module.file)
+      case list.contains(needed, module.name) {
+        True -> write(path, module.source())
+        False ->
+          simplifile.delete_all([path])
+          |> result.map_error(fn(e) {
+            "could not remove a stale "
+            <> path
+            <> ": "
+            <> simplifile.describe_error(e)
+          })
+      }
+    }),
+  )
+  // The one module that is not source: a scene is drawn with three.js, which is
+  // fetched once and embedded in the executable (see `hive/vendor`). It sits
+  // beside `ui_scene.go` because that is the file that embeds it, and it is
+  // removed again the moment the program stops drawing — for the same reason a
+  // stale module file is.
+  let scene_dir = filepath.join(build_dir, "hive")
+  case list.contains(needed, "uiscene") {
+    True -> vendor.place_three(scene_dir)
+    False -> vendor.clear_three(scene_dir)
+  }
 }
 
 fn mkdir(path: String) -> Result(Nil, String) {

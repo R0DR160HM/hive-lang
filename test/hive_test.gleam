@@ -2623,7 +2623,31 @@ pub fn ui_event_attribute_wraps_its_handler_test() {
       <> "}\n"
       <> "proc main(): void {\n\techo ui.html(v())\n}\n",
     )
-  should.be_true(string.contains(go, "hive.UiAttrOnInput(func(_ev string) any"))
+  should.be_true(string.contains(go, "hive.UiAttrOnInput(func(_ev0 string) any"))
+}
+
+// The one event that reports two things — how far the mouse moved — and the one
+// wrapper that therefore takes two parameters. A constructor with two holes is
+// already a function of exactly that shape, so nothing else has to change for it.
+pub fn ui_look_attribute_takes_two_test() {
+  let go =
+    compile(
+      "import hive.ui\n"
+      <> "type Msg {\n\tLooked { dx: Float, dy: Float }\n}\n"
+      <> "func v(): ui.View {\n"
+      <> "\treturn ui.scene([ui.onLook(Msg.Looked(_, _))], shapes())\n"
+      <> "}\n"
+      <> "func shapes(): ui.Shape[dyn] {\n"
+      <> "\tmut ui.Shape[dyn] only = [ui.sphere([], 1.0)]\n"
+      <> "\treturn only\n"
+      <> "}\n"
+      <> "proc main(): void {\n\techo ui.html(v())\n}\n",
+    )
+  should.be_true(string.contains(
+    go,
+    "hive.UiAttrOnLook(func(_ev0 float64, _ev1 float64) any",
+  ))
+  should.be_true(string.contains(go, "hive.UiSphere([]hive.Attr{}, 1.0)"))
 }
 
 // A constructor with a hole is a function value that builds the variant. It is
