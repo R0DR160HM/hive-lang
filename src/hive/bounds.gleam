@@ -144,8 +144,10 @@ pub fn check(module: ast.Module) -> Result(Nil, String) {
       ast.TestDecl(name, body, _, _) ->
         check_body(types, fns, "test \"" <> name <> "\"", [], ast.TVoid, body)
       // A query's body is SQL; its interpolations can't index a vector, and
-      // the main validation pass already walks them.
-      ast.QueryDecl(..) | ast.TypeDecl(..) -> Ok(Nil)
+      // the main validation pass already walks them. A Go function's body is Go:
+      // there is no Hive index in it to prove anything about, and what it hands
+      // back is a vector of no known length like any other call's.
+      ast.QueryDecl(..) | ast.ForeignDecl(..) | ast.TypeDecl(..) -> Ok(Nil)
     }
   })
   |> result.map(fn(_) { Nil })
@@ -156,7 +158,8 @@ fn signatures(decls: List(ast.Decl)) -> Dict(String, Sig) {
     case d {
       ast.ProcDecl(name, params, ret, _)
       | ast.FuncDecl(name, params, ret, _)
-      | ast.QueryDecl(name, params, ret, _) ->
+      | ast.QueryDecl(name, params, ret, _)
+      | ast.ForeignDecl(name, params, ret, _, _, _) ->
         dict.insert(acc, name, Sig(params, ret))
       ast.TypeDecl(..) | ast.TestDecl(..) -> acc
     }

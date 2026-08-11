@@ -17,6 +17,7 @@ import gleam/string
 import hive/ast
 import hive/builtins
 import hive/diagnostic
+import hive/imports
 import hive/lexer
 import hive/naming
 import hive/token.{type Token, Token}
@@ -26,7 +27,7 @@ type Toks =
 
 pub fn parse(tokens: Toks) -> Result(ast.Module, String) {
   use #(imports, decls) <- result.try(parse_decls(tokens, [], []))
-  Ok(ast.Module(imports, decls, dict.new()))
+  Ok(ast.Module(imports, decls, dict.new(), []))
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +302,25 @@ fn default_alias(path: String, at_line: Int) -> Result(String, String) {
     // where the answer can list the modules that do exist.
     Ok(string.split(path, ".") |> list.last |> result.unwrap(path)),
   )
-  let base = string.split(path, "/") |> list.last |> result.unwrap("")
+  // A remote import is named after the file *inside* the repository, not after
+  // the repository or its host: `.../hive-lang/src/text` is `text`, the same name
+  // `./src/text` next door would have had. Asking what the path names is also
+  // where a URL that names no file at all is caught, which is a better answer
+  // than a name derived from a path that was never one.
+  use inside <- result.try(case imports.classify(path) {
+    Ok(imports.RemoteHive(_, inside)) | Ok(imports.RemoteGo(_, inside)) ->
+      Ok(inside)
+    Ok(_) -> Ok(path)
+    Error(why) -> Error(diagnostic.at(at_line, why))
+  })
+  // A Go import writes its extension (`./util.go`), and the module is named
+  // after the file either way — so the extension comes off before the name is
+  // read, exactly as a `.hive` one was never written at all.
+  let base =
+    string.split(inside, "/")
+    |> list.last
+    |> result.unwrap("")
+    |> strip_go
   case is_usable_name(base) {
     True -> {
       // A file whose name is not a name — `String_Utils.hive` — needs the
@@ -324,6 +343,13 @@ fn default_alias(path: String, at_line: Int) -> Result(String, String) {
           <> path
           <> " as <name>`",
       ))
+  }
+}
+
+fn strip_go(base: String) -> String {
+  case string.ends_with(base, ".go") {
+    True -> string.drop_end(base, 3)
+    False -> base
   }
 }
 

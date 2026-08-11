@@ -14,6 +14,13 @@
 //// `hive.len(v)`), which is why the desugaring cannot be captured by a
 //// declaration either.
 ////
+//// One name is both a builtin and a module: `hive.map(v, f)` is the walk and
+//// `hive.map.get(m, k)` is the dictionary. Nothing has to choose between them,
+//// because the two are told apart by shape rather than by name — a call *on*
+//// `hive.map` is the builtin, and a call on a member of it is the module. So
+//// `import hive.map` is an ordinary import (its alias is `map`, and a bare
+//// `map(v, f)` in that file still means the builtin).
+////
 //// Which of the two a bare call means is settled during import flattening (see
 //// `hive/modules`), the one place that knows both the declarations able to shadow
 //// a builtin — a module's own, since an imported name is only ever reached
@@ -54,8 +61,8 @@ pub fn is_global(name: String) -> Bool {
 /// down. A name here is one that appears in a program as `hive.<name>.<thing>`.
 pub fn stdlib_modules() -> List(String) {
   [
-    "net", "file", "json", "crypto", "sql", "conv", "env", "term", "task",
-    "syslink", "time", "ui",
+    "net", "file", "json", "crypto", "sql", "map", "conv", "env", "term",
+    "task", "syslink", "time", "ui",
   ]
 }
 

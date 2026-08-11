@@ -7,12 +7,18 @@ import gleeunit
 import gleeunit/should
 import simplifile
 import hive/ast
+import hive/builtins
 import hive/codegen
 import hive/compiler
+import hive/ffi
 import hive/generics
+import hive/imports
+import hive/lexer
 import hive/modules
+import hive/parser
 import hive/runtime
 import hive/testreport
+import hive/token
 
 pub fn main() {
   gleeunit.main()
@@ -2383,9 +2389,17 @@ pub fn sockets_example_compiles_test() {
 }
 
 pub fn modules_example_compiles_test() {
-  // Read through compile_file, since this one spans three files.
+  // Read through compile_file, since this one spans several files — and two
+  // languages: it imports a Go file (which needs the Go toolchain to read) and a
+  // module from a repository (which needs the clone the lock file pins, fetched
+  // once).
   let assert Ok(_) =
     compiler.compile_file("code-examples/11 - Modules/modules.hive")
+}
+
+pub fn maps_example_compiles_test() {
+  let assert Ok(src) = simplifile.read("code-examples/18 - Maps/maps.hive")
+  compile(src)
 }
 
 pub fn files_and_spreadsheets_example_compiles_test() {
@@ -6703,4 +6717,615 @@ pub fn a_contextual_keyword_is_lower_case_too_test() {
     rejected("proc main(): void {\n\tt := using \"./x.csv\" as CSV\n\techo t\n}\n")
   should.be_true(string.contains(message, "keyword written the wrong way"))
   should.be_true(string.contains(message, "Write `csv`"))
+}
+
+// ---------------------------------------------------------------------------
+// hive.map — the dictionary
+// ---------------------------------------------------------------------------
+
+const mapped = "proc main(): void {\n\tmut hive.map.Map<Str, Int> ages = hive.map.new()\n\thive.map.set(ages, \"ada\", 36)\n\techo len(ages)\n}\n"
+
+fn in_main(body: String) -> String {
+  compile("proc main(): void {\n" <> body <> "}\n")
+}
+
+fn map_error(body: String) -> String {
+  rejected("proc main(): void {\n" <> body <> "}\n")
+}
+
+pub fn a_map_lowers_to_the_runtimes_dict_test() {
+  let go = compile(mapped)
+  // The Hive type is `hive.map.Map<K, T>`; the Go one is Dict, because `Map` in
+  // the runtime is already the walk builtin.
+  should.be_true(string.contains(go, "var ages hive.Dict[string, int]"))
+  should.be_true(string.contains(go, "hive.NewDict[string, int]()"))
+  should.be_true(string.contains(go, "hive.DictSet(&ages, \"ada\", 36)"))
+  // `len` on a map counts its pairs.
+  should.be_true(string.contains(go, "hive.DictLen(ages)"))
+}
+
+pub fn the_map_module_is_only_linked_when_it_is_used_test() {
+  // A program that walks a vector emits `hive.Map(...)` — the builtin — and must
+  // not drag the dictionary in with it.
+  should.be_false(list.contains(
+    used_modules(
+      "func double(n: Int): Int {\n\treturn n * 2\n}\nproc main(): void {\n\techo map([1, 2], double)\n}\n",
+    ),
+    "map",
+  ))
+  should.be_true(list.contains(used_modules(mapped), "map"))
+}
+
+pub fn a_lookup_answers_with_a_result_test() {
+  let go =
+    in_main(
+      "\tmut hive.map.Map<Str, Int> m = hive.map.new()\n\tif hive.map.get(m, \"a\") is Result.Ok(n) {\n\t\techo n\n\t}\n",
+    )
+  should.be_true(string.contains(go, "hive.DictGet(m, \"a\")"))
+  should.be_true(string.contains(go, ".Ok()"))
+}
+
+pub fn keys_and_values_are_vectors_of_the_maps_own_types_test() {
+  let go =
+    in_main(
+      "\tmut hive.map.Map<Int, Str> m = hive.map.new()\n\tInt[dyn] ks = hive.map.keys(m)\n\tStr[dyn] vs = hive.map.values(m)\n\techo ks\n\techo vs\n",
+    )
+  should.be_true(string.contains(go, "var ks []int = hive.DictKeys(m)"))
+  should.be_true(string.contains(go, "var vs []string = hive.DictValues(m)"))
+}
+
+pub fn values_that_own_storage_come_out_copied_test() {
+  // A vector inside a map is the map's. What `values` hands back is the
+  // caller's, so it is cloned on the way out.
+  let go =
+    in_main(
+      "\tmut hive.map.Map<Str, Str[dyn]> m = hive.map.new()\n\techo hive.map.values(m)\n",
+    )
+  should.be_true(string.contains(go, "hive.CloneVecFn(hive.DictValues(m)"))
+}
+
+pub fn a_map_binding_copies_test() {
+  // Value semantics: an immutable binding of a `mut` map must not observe the
+  // writes that follow it.
+  let go =
+    in_main(
+      "\tmut hive.map.Map<Str, Int> a = hive.map.new()\n\thive.map.Map<Str, Int> b = a\n\thive.map.set(a, \"x\", 1)\n\techo b\n",
+    )
+  should.be_true(string.contains(go, "hive.CloneDict(a)"))
+}
+
+pub fn a_map_of_vectors_copies_every_level_test() {
+  let go =
+    in_main(
+      "\tmut hive.map.Map<Str, Str[dyn]> a = hive.map.new()\n\thive.map.Map<Str, Str[dyn]> b = a\n\thive.map.set(a, \"x\", [\"y\"])\n\techo b\n",
+    )
+  should.be_true(string.contains(go, "hive.CloneDictFn(a,"))
+}
+
+pub fn two_maps_compare_by_their_pairs_test() {
+  let go =
+    in_main(
+      "\tmut hive.map.Map<Str, Int> a = hive.map.new()\n\tmut hive.map.Map<Str, Int> b = hive.map.new()\n\techo a == b\n",
+    )
+  should.be_true(string.contains(go, "hive.DictEq(a, b)"))
+}
+
+pub fn a_table_reads_as_a_map_and_back_test() {
+  let go =
+    in_main(
+      "\tTable t = [[\"host\", \"local\"]]\n\thive.map.Map<Str, Str> m = hive.map.fromTable(t)\n\techo hive.map.toTable(m)\n",
+    )
+  should.be_true(string.contains(go, "hive.DictFromTable(t)"))
+  should.be_true(string.contains(go, "hive.DictToTable(m)"))
+}
+
+pub fn a_composite_key_is_a_struct_of_scalars_test() {
+  let go =
+    compile(
+      "type Point {\n\tx: Int\n\ty: Int\n}\nproc main(): void {\n\tmut hive.map.Map<Point, Str> m = hive.map.new()\n\thive.map.set(m, Point(1, 2), \"here\")\n\techo len(m)\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.Dict[Point, string]"))
+}
+
+pub fn storage_cannot_be_a_key_test() {
+  let message =
+    map_error(
+      "\tmut hive.map.Map<Str[dyn], Int> m = hive.map.new()\n\techo len(m)\n",
+    )
+  should.be_true(string.contains(message, "cannot be a key"))
+  should.be_true(string.contains(message, "compared and hashed whole"))
+}
+
+pub fn a_key_struct_holding_storage_is_not_a_key_either_test() {
+  let message =
+    rejected(
+      "type Box {\n\titems: Str[dyn]\n}\nproc main(): void {\n\tmut hive.map.Map<Box, Int> m = hive.map.new()\n\techo len(m)\n}\n",
+    )
+  should.be_true(string.contains(message, "cannot be a key"))
+}
+
+pub fn the_map_needs_its_module_in_front_test() {
+  let message = map_error("\tMap<Str, Int> m = hive.map.new()\n\techo len(m)\n")
+  should.be_true(string.contains(
+    message,
+    "the dictionary is `hive.map.Map<K, T>`",
+  ))
+}
+
+pub fn a_map_names_both_halves_of_what_it_holds_test() {
+  let message =
+    map_error("\tmut hive.map.Map<Str> m = hive.map.new()\n\techo len(m)\n")
+  should.be_true(string.contains(message, "names both halves"))
+}
+
+pub fn an_empty_map_needs_somewhere_that_says_what_it_holds_test() {
+  let message = map_error("\tm := hive.map.new()\n\techo len(m)\n")
+  should.be_true(string.contains(message, "nothing here says what it holds"))
+}
+
+pub fn an_empty_map_may_be_returned_and_passed_test() {
+  // A declared return type says what it holds, and so does a parameter.
+  compile(
+    "func empty(): hive.map.Map<Str, Int> {\n\treturn hive.map.new()\n}\nproc show(m: hive.map.Map<Str, Int>): void {\n\techo len(m)\n}\nproc main(): void {\n\tshow(hive.map.new())\n\tshow(empty())\n}\n",
+  )
+}
+
+pub fn writing_to_a_map_needs_mut_test() {
+  let message =
+    map_error(
+      "\thive.map.Map<Str, Int> m = hive.map.new()\n\thive.map.set(m, \"a\", 1)\n",
+    )
+  should.be_true(string.contains(message, "needs a mutable map"))
+}
+
+pub fn deleting_from_a_map_needs_mut_too_test() {
+  let message =
+    map_error(
+      "\thive.map.Map<Str, Int> m = hive.map.new()\n\thive.map.delete(m, \"a\")\n",
+    )
+  should.be_true(string.contains(message, "needs a mutable map"))
+}
+
+pub fn a_map_parameter_may_be_written_when_it_is_a_mutex_test() {
+  let go =
+    compile(
+      "proc put(m: mut hive.map.Map<Str, Int>, key: Str): void {\n\thive.map.set(m, key, 1)\n}\nproc main(): void {\n\tmut hive.map.Map<Str, Int> m = hive.map.new()\n\tput(m, \"a\")\n\techo len(m)\n}\n",
+    )
+  // A mutex parameter is already a pointer, so it is passed straight on.
+  should.be_true(string.contains(go, "hive.DictSet(m, key, 1)"))
+}
+
+pub fn a_value_has_to_be_what_the_map_holds_test() {
+  let message =
+    map_error(
+      "\tmut hive.map.Map<Str, Int> m = hive.map.new()\n\thive.map.set(m, \"a\", \"one\")\n",
+    )
+  should.be_true(string.contains(message, "the value `hive.map.set` stores"))
+}
+
+pub fn a_key_has_to_be_what_the_map_is_keyed_by_test() {
+  let message =
+    map_error(
+      "\tmut hive.map.Map<Int, Str> m = hive.map.new()\n\techo hive.map.has(m, \"a\")\n",
+    )
+  should.be_true(string.contains(message, "the key `hive.map.has` looks up"))
+}
+
+pub fn a_map_is_not_indexed_test() {
+  let message =
+    map_error("\tmut hive.map.Map<Str, Int> m = hive.map.new()\n\techo m[0]\n")
+  should.be_true(string.contains(message, "a map cannot be indexed"))
+  should.be_true(string.contains(message, "hive.map.get(m, key)"))
+}
+
+pub fn a_map_is_not_walked_by_for_each_test() {
+  let message =
+    map_error(
+      "\tmut hive.map.Map<Str, Int> m = hive.map.new()\n\tfor each k in m {\n\t\techo k\n\t}\n",
+    )
+  should.be_true(string.contains(message, "`for each` walks a vector"))
+  should.be_true(string.contains(message, "hive.map.keys(m)"))
+}
+
+pub fn a_vector_builtin_says_so_when_it_is_given_a_map_test() {
+  let message =
+    map_error("\tmut hive.map.Map<Str, Int> m = hive.map.new()\n\tappend(m, 1)\n")
+  should.be_true(string.contains(message, "`append` works on a vector"))
+}
+
+pub fn a_map_has_no_order_to_sort_by_test() {
+  let message =
+    rejected(
+      "proc main(): void {\n\tmut hive.map.Map<Str, Int> a = hive.map.new()\n\tmut hive.map.Map<Str, Int>[dyn] ms = [a]\n\techo sort(ms)\n}\n",
+    )
+  should.be_true(string.contains(message, "a map has no order"))
+}
+
+pub fn bytes_is_not_a_question_about_a_map_test() {
+  let message =
+    map_error("\tmut hive.map.Map<Str, Int> m = hive.map.new()\n\techo bytes(m)\n")
+  should.be_true(string.contains(message, "`bytes` counts a `Str`"))
+}
+
+pub fn a_map_cannot_be_encoded_as_json_test() {
+  let message =
+    map_error(
+      "\tmut hive.map.Map<Str, Int> m = hive.map.new()\n\techo hive.json.encode(m)\n",
+    )
+  should.be_true(string.contains(message, "`hive.json.encode` cannot encode"))
+  should.be_true(string.contains(message, "hive.map.toTable(m)"))
+}
+
+pub fn a_map_cannot_travel_in_a_message_test() {
+  let message =
+    rejected(
+      "proc box(state: Int, msg: hive.map.Map<Str, Int>, from: hive.syslink.Envelope): Int {\n\treturn state\n}\nproc main(): void {\n\techo hive.syslink.spawn(box, 0)\n}\n",
+    )
+  should.be_true(string.contains(message, "carries a map"))
+}
+
+pub fn the_size_of_a_map_is_len_test() {
+  let message =
+    map_error(
+      "\tmut hive.map.Map<Str, Int> m = hive.map.new()\n\techo hive.map.size(m)\n",
+    )
+  should.be_true(string.contains(message, "`len(m)` counts a map's pairs"))
+}
+
+pub fn the_map_module_is_one_a_program_can_name_test() {
+  should.be_true(list.contains(builtins.stdlib_modules(), "map"))
+}
+
+pub fn an_alias_reaches_the_map_module_test() {
+  // `import hive.map` names it `map`, which coexists with the walk builtin: a
+  // call *on* the name is the module, and a bare `map(v, f)` is the builtin.
+  let go =
+    compile(
+      "import hive.map\nfunc double(n: Int): Int {\n\treturn n * 2\n}\nproc main(): void {\n\tmut map.Map<Str, Int> m = map.new()\n\tmap.set(m, \"a\", 1)\n\techo len(m)\n\techo map([1], double)\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.DictSet(&m, \"a\", 1)"))
+  should.be_true(string.contains(go, "hive.Map([]int{1}, double)"))
+}
+
+pub fn a_generic_may_be_instantiated_at_a_map_test() {
+  let go =
+    compile(
+      "func firstOr(vs: hive.map.Map<Str, Int>[], fallback: hive.map.Map<Str, Int>): hive.map.Map<Str, Int> {\n\tif 0 < len(vs) {\n\t\treturn vs[0]\n\t}\n\treturn fallback\n}\nproc main(): void {\n\tmut hive.map.Map<Str, Int> a = hive.map.new()\n\techo firstOr([a], a)\n}\n",
+    )
+  should.be_true(string.contains(go, "hive.Dict[string, int]"))
+}
+
+// ---------------------------------------------------------------------------
+// What an import path names
+// ---------------------------------------------------------------------------
+
+pub fn a_local_path_names_a_hive_module_test() {
+  should.equal(imports.classify("./lib/text"), Ok(imports.LocalHive("./lib/text")))
+  should.equal(imports.classify("../shared/text"), Ok(imports.LocalHive("../shared/text")))
+}
+
+pub fn a_go_extension_is_written_and_a_hive_one_is_not_test() {
+  should.equal(imports.classify("./util.go"), Ok(imports.LocalGo("./util.go")))
+  // `.hive` is never written, so a path ending in it is an ordinary path — one
+  // naming a file called `util.hive.hive`.
+  should.equal(
+    imports.classify("./util.hive"),
+    Ok(imports.LocalHive("./util.hive")),
+  )
+}
+
+pub fn a_stdlib_path_names_no_file_test() {
+  should.equal(imports.classify("hive.ui"), Ok(imports.Stdlib("hive.ui")))
+}
+
+pub fn a_url_is_a_host_an_owner_and_a_repository_test() {
+  should.equal(
+    imports.classify("https://github.com/owner/repo/src/foo"),
+    Ok(imports.RemoteHive(
+      imports.Repo("https://github.com/owner/repo", option.None),
+      "src/foo",
+    )),
+  )
+}
+
+pub fn a_revision_goes_on_the_repository_test() {
+  should.equal(
+    imports.classify("https://github.com/owner/repo@a1b2c3/src/foo"),
+    Ok(imports.RemoteHive(
+      imports.Repo("https://github.com/owner/repo", option.Some("a1b2c3")),
+      "src/foo",
+    )),
+  )
+}
+
+pub fn a_remote_path_may_name_a_go_file_test() {
+  should.equal(
+    imports.classify("https://github.com/owner/repo/go/util.go"),
+    Ok(imports.RemoteGo(
+      imports.Repo("https://github.com/owner/repo", option.None),
+      "go/util.go",
+    )),
+  )
+}
+
+pub fn a_url_naming_no_file_is_rejected_test() {
+  let assert Error(message) = imports.classify("https://github.com/owner/repo")
+  should.be_true(string.contains(message, "no file inside it"))
+  let assert Error(shallow) = imports.classify("https://github.com/owner")
+  should.be_true(string.contains(shallow, "a host, an owner and a repository"))
+}
+
+pub fn an_empty_revision_is_rejected_test() {
+  let assert Error(message) =
+    imports.classify("https://github.com/owner/repo@/src/foo")
+  should.be_true(string.contains(message, "names no revision after it"))
+}
+
+pub fn a_clone_is_keyed_by_its_commit_test() {
+  let dir = imports.clone_dir("https://github.com/owner/repo", "abc123")
+  should.be_true(string.contains(dir, "github.com_owner_repo@abc123"))
+}
+
+// ---------------------------------------------------------------------------
+// Import paths in source
+// ---------------------------------------------------------------------------
+
+pub fn a_quoted_import_path_may_hold_spaces_test() {
+  let assert Ok(tokens) = lexer.lex("import \"./lib/my file\"\n")
+  should.be_true(list.contains(
+    list.map(tokens, fn(t: token.Token) { t.kind }),
+    token.PathLit("./lib/my file"),
+  ))
+}
+
+pub fn a_quoted_path_still_takes_an_alias_test() {
+  let assert Ok(tokens) = lexer.lex("import \"./lib/my file\" as f\n")
+  let kinds = list.map(tokens, fn(t: token.Token) { t.kind })
+  should.be_true(list.contains(kinds, token.PathLit("./lib/my file")))
+  should.be_true(list.contains(kinds, token.Ident("as")))
+}
+
+pub fn an_unclosed_import_quote_says_so_test() {
+  let assert Error(message) = lexer.lex("import \"./lib/text\nproc main(): void {}\n")
+  should.be_true(string.contains(message, "never closes it"))
+}
+
+pub fn a_go_import_is_named_after_its_file_test() {
+  // `./lib/measures.go` -> `measures`: the extension comes off before the name
+  // is read, exactly as a `.hive` one was never written.
+  let assert Error(message) =
+    compiler.compile("import ./lib/measures.go\nproc main(): void {\n\techo measures.nope()\n}\n")
+  // It got as far as looking for the file, which means the name was accepted.
+  should.be_true(string.contains(message, "does not name a readable file"))
+}
+
+pub fn a_remote_import_is_named_after_the_file_in_the_repository_test() {
+  // Not after the repository, and not after the host: `.../src/text` is `text`.
+  let assert Error(message) =
+    compiler.compile(
+      "import https://github.com/owner/repo/src/text\nproc main(): void {\n\techo text.repeat(\"=\", 3)\n}\n",
+    )
+  // Whatever went wrong, it was not the name: a bad one is reported before any
+  // fetch is attempted.
+  should.be_false(string.contains(message, "needs a name of its own"))
+}
+
+pub fn a_url_that_names_no_file_is_reported_at_the_import_test() {
+  let assert Error(message) =
+    compiler.compile("import https://github.com/owner\nproc main(): void {}\n")
+  should.be_true(string.contains(message, "a host, an owner and a repository"))
+}
+
+// ---------------------------------------------------------------------------
+// Calling Go
+// ---------------------------------------------------------------------------
+
+// The wrapper codegen is exercised directly, by handing it the declarations a
+// `.go` import produces. Reading a real Go file needs the Go toolchain, which the
+// unit suite deliberately does not depend on.
+fn foreign_module(decls: List(ast.Decl), types: List(#(String, String))) -> String {
+  codegen.generate(ast.Module(
+    [],
+    decls,
+    dict.new(),
+    [ast.Foreign("./util.go", "ffi_util_1", types, False)],
+  ))
+}
+
+fn main_calling(body: String) -> ast.Decl {
+  let assert Ok([decl, ..]) =
+    Ok(parsed_decls("proc main(): void {\n" <> body <> "}\n"))
+  decl
+}
+
+fn parsed_decls(source: String) -> List(ast.Decl) {
+  let assert Ok(tokens) = lexer.lex(source)
+  let assert Ok(module) = parser.parse(tokens)
+  module.decls
+}
+
+fn str() -> ast.TypeExpr {
+  ast.TName(option.None, "Str", [], [])
+}
+
+fn int_ty() -> ast.TypeExpr {
+  ast.TName(option.None, "Int", [], [])
+}
+
+pub fn a_go_function_becomes_a_wrapper_test() {
+  let go =
+    foreign_module(
+      [
+        ast.ForeignDecl(
+          "util_0_slugify",
+          [ast.Field("s", str(), False)],
+          str(),
+          "ffi_util_1",
+          "Slugify",
+          1,
+        ),
+        main_calling("\techo util_0_slugify(\"a b\")\n"),
+      ],
+      [],
+    )
+  // The Go package is imported under the name that is also its directory.
+  should.be_true(string.contains(go, "ffi_util_1 \"hiveapp/ffi_util_1\""))
+  should.be_true(string.contains(
+    go,
+    "func util_0_slugify(s string) string {\n\treturn ffi_util_1.Slugify(s)\n}",
+  ))
+}
+
+pub fn a_vector_is_copied_in_both_directions_test() {
+  let go =
+    foreign_module(
+      [
+        ast.ForeignDecl(
+          "util_0_sorted",
+          [ast.Field("items", ast.TName(option.None, "Str", [], [ast.DimDyn]), False)],
+          ast.TName(option.None, "Str", [], [ast.DimDyn]),
+          "ffi_util_1",
+          "Sorted",
+          1,
+        ),
+      ],
+      [],
+    )
+  // In *and* out: what Go sorted was a copy, and what came back is the caller's.
+  should.be_true(string.contains(
+    go,
+    "hive.CloneVec(ffi_util_1.Sorted(hive.CloneVec(items)))",
+  ))
+}
+
+pub fn a_go_map_comes_back_with_its_keys_in_order_test() {
+  let go =
+    foreign_module(
+      [
+        ast.ForeignDecl(
+          "util_0_tally",
+          [ast.Field("words", ast.TName(option.None, "Str", [], [ast.DimDyn]), False)],
+          ast.TName(option.Some("hive.map"), "Map", [str(), int_ty()], []),
+          "ffi_util_1",
+          "Tally",
+          1,
+        ),
+      ],
+      [],
+    )
+  should.be_true(string.contains(go, "hive.DictFromGo(ffi_util_1.Tally("))
+  should.be_true(string.contains(go, "func(a, b string) bool { return a < b }"))
+}
+
+pub fn a_mirrored_struct_converts_field_by_field_test() {
+  let go =
+    foreign_module(
+      [
+        ast.TypeDecl("util_0_Point", [], [
+          ast.Field("x", int_ty(), False),
+          ast.Field("y", int_ty(), False),
+        ]),
+        ast.ForeignDecl(
+          "util_0_mid",
+          [ast.Field("a", ast.TName(option.None, "util_0_Point", [], []), False)],
+          ast.TName(option.None, "util_0_Point", [], []),
+          "ffi_util_1",
+          "Mid",
+          1,
+        ),
+      ],
+      [#("util_0_Point", "Point")],
+    )
+  should.be_true(string.contains(
+    go,
+    "func toFfi_util_0_Point(v util_0_Point) ffi_util_1.Point",
+  ))
+  should.be_true(string.contains(go, "ffi_util_1.Point{X: v.X, Y: v.Y}"))
+  should.be_true(string.contains(
+    go,
+    "fromFfi_util_0_Point(ffi_util_1.Mid(toFfi_util_0_Point(a)))",
+  ))
+}
+
+pub fn a_go_failure_becomes_a_result_test() {
+  let go =
+    foreign_module(
+      [
+        ast.ForeignDecl(
+          "util_0_parse",
+          [ast.Field("text", str(), False)],
+          ast.TName(option.None, "Result", [int_ty(), str()], []),
+          "ffi_util_1",
+          "Parse",
+          2,
+        ),
+      ],
+      [],
+    )
+  should.be_true(string.contains(go, "value, err := ffi_util_1.Parse(text)"))
+  should.be_true(string.contains(go, "hive.Err[int, string](err.Error())"))
+  should.be_true(string.contains(go, "hive.Ok[int, string](value)"))
+}
+
+pub fn a_go_function_answering_only_an_error_carries_true_test() {
+  let go =
+    foreign_module(
+      [
+        ast.ForeignDecl(
+          "util_0_check",
+          [ast.Field("text", str(), False)],
+          ast.TName(
+            option.None,
+            "Result",
+            [ast.TName(option.None, "Bool", [], []), str()],
+            [],
+          ),
+          "ffi_util_1",
+          "Check",
+          1,
+        ),
+      ],
+      [],
+    )
+  should.be_true(string.contains(go, "if err := ffi_util_1.Check(text); err != nil"))
+  should.be_true(string.contains(go, "hive.Ok[bool, string](true)"))
+}
+
+pub fn a_go_function_is_a_func_and_may_be_called_from_one_test() {
+  // Every value crossing the boundary is copied, so a Go call cannot write to
+  // storage its caller can see — which is the whole of what a `func` promises.
+  let go =
+    foreign_module(
+      list.append(
+        parsed_decls(
+          "func clean(s: Str): Str {\n\treturn util_0_slugify(s)\n}\nproc main(): void {\n\techo clean(\"a b\")\n}\n",
+        ),
+        [
+          ast.ForeignDecl(
+            "util_0_slugify",
+            [ast.Field("s", str(), False)],
+            str(),
+            "ffi_util_1",
+            "Slugify",
+            1,
+          ),
+        ],
+      ),
+      [],
+    )
+  should.be_true(string.contains(go, "func clean(s string) string"))
+}
+
+pub fn a_go_name_is_reached_with_its_first_letter_lowered_test() {
+  should.equal(ffi.lower_initial("Slugify"), "slugify")
+  should.equal(ffi.lower_initial("URL"), "uRL")
+  should.equal(ffi.lower_initial(""), "")
+}
+
+pub fn two_go_files_of_the_same_name_are_two_packages_test() {
+  let one = ffi.package_of("./a/util.go")
+  let other = ffi.package_of("./b/util.go")
+  should.be_true(string.starts_with(one, "ffi_util_"))
+  should.be_true(string.starts_with(other, "ffi_util_"))
+  should.not_equal(one, other)
 }

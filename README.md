@@ -34,9 +34,11 @@ The compiler and the programs it produces need:
 | Gleam           | builds/runs this compiler                  | 1.16              |
 | Erlang/OTP      | Gleam's runtime (default target)           | 27 / 28           |
 | Go              | compiles the generated code to a binary    | 1.26              |
+| git             | only for a [remote import](#importing-from-a-git-repository) | 2.40 |
 
 Go must be on your `PATH` (the compiler shells out to `go build` and
-`go env GOEXE`).
+`go env GOEXE`). `git` is needed only by a program that imports from a
+repository, and only until that repository has been cloned once.
 
 ## Usage
 
@@ -572,8 +574,8 @@ compiles, builds and runs.
 
 ## Value semantics (copy-on-binding)
 
-Vectors, `Table`s and structs that contain them are **value types**, but they
-lower to Go slices, which share their backing storage. To keep the value
+Vectors, `Table`s, [maps](#hivemap) and structs that contain them are **value
+types**, but they lower to Go slices and maps, which share their storage. To keep the value
 semantics honest, a binding whose right-hand side names existing storage
 (`ys := xs`, `ys := xs[i]`, `ys := rec.field`, …) may need to **copy** so the
 two names can't observe each other's mutations. A fresh right-hand side (a
@@ -673,6 +675,8 @@ When a copy *is* made it is **deep and type-directed** — no runtime reflection
 * a flat vector copies its backing array (`hive.CloneVec`);
 * a nested vector or `Table` copies every level (`hive.CloneVecFn` /
   `hive.CloneTable`);
+* a [map](#hivemap) copies its key order and its lookup, and its values too when
+  they own storage of their own (`hive.CloneDict` / `hive.CloneDictFn`);
 * a struct or tagged union copies its storage-owning fields through a generated
   `clone_T` (scalar-only types need nothing — Go's value copy already isolates
   them).
@@ -722,6 +726,7 @@ argument type. A declaration of your own with one of these names
 | ----------------------- | ---------------------------- | -------------------------------------------------------------------- |
 | `len(vector)`           | `len(T[]): Int`              | Number of elements in a vector.                                      |
 | `len(str)`              | `len(Str): Int`              | Number of **characters** (UTF-8 runes) in a string.                  |
+| `len(map)`              | `len(hive.map.Map<K, T>): Int` | Number of pairs in a [map](#hivemap).                              |
 | `bytes(vector)`         | `bytes(T[]): Int`            | Byte footprint of a vector's contiguous storage (count × elem size). |
 | `bytes(str)`            | `bytes(Str): Int`            | Number of **bytes** in a string's UTF-8 encoding.                    |
 | `append(vector, value)` | `append(T[dyn], T): void`    | Grows a **mutable** dynamic vector in place with one more element.   |
@@ -1117,7 +1122,7 @@ See [`code-examples/12 - Files and Spreadsheets`](code-examples/12%20-%20Files%2
 
 Each module owns its types under its own namespace — `hive.net.HttpRequest`,
 `hive.json.JsonError`, `hive.crypto.CryptoError`, `hive.sql.DatabaseDriver`,
-`hive.conv.ConversionError`, `hive.env.EnvironmentError`,
+`hive.map.Map`, `hive.conv.ConversionError`, `hive.env.EnvironmentError`,
 `hive.syslink.Address`, `hive.task.TimeoutError`, `hive.ui.View`, and so on. The only builtin types that live directly on `hive` are the core
 ones the language uses without a module: `Result`, `Table` and the
 `hive.TableError` that `using` yields from a CSV.
@@ -1483,6 +1488,96 @@ would not.
 > a program that uses `hive.sql` runs `go mod tidy` to fetch them (network
 > required once, then cached). Programs that don't use `hive.sql` keep a
 > dependency-free `go.mod` and build fully offline, exactly as before.
+
+### `hive.map`
+
+A **dictionary**: keys paired with values, looked up by key. It is the one
+collection that is not a vector, so it has a module rather than a literal —
+`hive.map.Map<K, T>` is the type and `hive.map.new()` the empty one.
+
+```hive
+import hive.map
+
+proc main(): void {
+	mut hive.map.Map<Str, Int> counts = hive.map.new()
+	for each word in ["bee", "hive", "bee"] {
+		if hive.map.get(counts, word) is Result.Ok(seen) {
+			hive.map.set(counts, word, seen + 1)
+		} else {
+			hive.map.set(counts, word, 1)
+		}
+	}
+	echo counts          // {bee: 2, hive: 1}
+	echo len(counts)     // 2
+}
+```
+
+| call | type | what it does |
+| ---- | ---- | ------------ |
+| `hive.map.new()` | `Map<K, T>` | The empty map. |
+| `hive.map.set(m, key, value)` | `(mut Map<K, T>, K, T): void` | Adds or replaces a pair. |
+| `hive.map.get(m, key)` | `(Map<K, T>, K): Result<T, Bool>` | The value, or `Error(false)`. |
+| `hive.map.has(m, key)` | `(Map<K, T>, K): Bool` | The same question without the value. |
+| `hive.map.delete(m, key)` | `(mut Map<K, T>, K): void` | Removes a pair. |
+| `hive.map.keys(m)` | `(Map<K, T>): K[dyn]` | Its keys, in order. |
+| `hive.map.values(m)` | `(Map<K, T>): T[dyn]` | Its values, in the same order. |
+| `hive.map.fromTable(t)` | `(Table): Map<Str, Str>` | Reads a Table's rows as key/value pairs. |
+| `hive.map.toTable(m)` | `(Map<Str, Str>): Table` | One two-cell row per pair. |
+| `len(m)` | `(Map<K, T>): Int` | How many pairs it holds — the [global builtin](#built-in-functions), same as for a vector. |
+
+* **The order is the order you set the keys in.** `keys`, `values`, `toTable` and
+  `echo` all use it, and replacing a value leaves its key where it was.
+  Go's own map iterates in a deliberately randomised order, so a program built on
+  one would print something different every run; this one prints the same thing
+  twice, which is what makes it testable.
+* **Only a `mut` map can be written to.** `set` and `delete` change which keys
+  the map has, so they follow `append`'s rule exactly — and a `proc` can take a
+  `m: mut hive.map.Map<K, T>` parameter to write into its caller's map.
+* **A map is a value.** Binding one to a second name copies it whenever the two
+  could otherwise observe each other's writes, exactly as for a vector or a
+  `Table` (see [Value semantics](#value-semantics-copy-on-binding)). So is what
+  comes *out*: `keys` and `values` are fresh vectors, and a value that owns
+  storage is copied on the way out, so growing it cannot reach back into the map.
+* **`==` compares the pairs**, and ignores the order they were set in — a map is
+  what it holds. There is no ordering *between* maps, so `sort` on a vector of
+  them is a compile error: the order a map keeps is a way of reading one back,
+  not a rank.
+* **A key is compared and hashed whole**, so it is a `Str`, `Int`, `Float`,
+  `Bool` or `Atom` — or a type of your own whose every field is one of those,
+  which gives you a composite key:
+
+  ```hive
+  type Currency {
+  	code: Str
+  }
+
+  mut hive.map.Map<Currency, Int> tills = hive.map.new()
+  hive.map.set(tills, Currency("BRL"), 1250)   // Currency("BRL") is the same key twice
+  ```
+
+  Storage cannot be a key. Two vectors can hold equal contents and still be
+  different storage, so there would be no answer to whether they are the same
+  key — `Map<Str[dyn], Int>` is a compile error saying so.
+* **A map is reached by key, never by position.** `m[0]` is a compile error
+  pointing at `hive.map.get`, and `for each` over a map is one too: a turn of the
+  loop would have to be handed the key or the value, and the syntax never said
+  which. Walk `hive.map.keys(m)` and look each one up.
+* **`hive.map.new()` has to land somewhere that says what it holds** — a
+  declaration, a `return` whose callable declares a map, or an argument to a
+  parameter or field declared as one. `m := hive.map.new()` is a compile error:
+  the key and value types are part of what a map *is*, and `:=` reads them off
+  the value, which has none to give.
+* **A map does not travel and does not encode.** `hive.json.encode` refuses one
+  and so does a `hive.syslink` mailbox: JSON decoding here is by declared shape —
+  every key named, every type known — while a map's keys are whatever was put in
+  it. Send `hive.map.toTable(m)` and rebuild it with `hive.map.fromTable` on the
+  other side.
+* `import hive.map` names the module `map`, which **coexists with the `map(v, f)`
+  builtin**: a call on the name is the module (`map.get(m, k)`) and a bare call is
+  the builtin (`map([1, 2], double)`). Nothing has to choose, because the two are
+  told apart by shape.
+
+See [`code-examples/18 - Maps`](code-examples/18%20-%20Maps/maps.hive).
 
 ### `hive.conv`
 
@@ -2125,6 +2220,25 @@ proc main(): void {
 }
 ```
 
+There are **three kinds of path**, and the path itself says which:
+
+| written | what it names |
+| ------- | ------------- |
+| `import ./lib/text` | a Hive file on this disk — `.hive` is never written |
+| `import ./lib/util.go` | a [Go file](#importing-a-go-file) on this disk — `.go` always is |
+| `import https://host/owner/repo/src/foo` | a file in a [git repository](#importing-from-a-git-repository) |
+| `import hive.ui` | a [standard library module](#importing-a-standard-library-module), which names no file |
+
+The two extensions are opposites on purpose. A Hive module's is never written,
+because the path names a *module* and the file is only where it lives; a Go
+file's always is, because nothing about `import ./lib/util` should leave you
+wondering which of the two languages you are about to read.
+
+A path may also be **quoted**, which is how one holding a space is written:
+`import "./lib/my file"`, or `import "https://host/o/r/code-examples/11 - x/lib"`.
+Inside the quotes everything up to the closing one is the path, so nothing needs
+escaping or encoding — and `as` after it still reads as `as`.
+
 * The **path is relative to the importing file's own directory** and leaves the
   `.hive` extension off, so `./lib/text` is `lib/text.hive` next door and
   `../../shared/text` climbs out first. It is the file's location that matters,
@@ -2148,6 +2262,128 @@ proc main(): void {
         -> lib/pricing.hive
         -> lib/inventory.hive
   ```
+
+### Importing a Go file
+
+Hive is Go behind the curtain, so a Go file next to a Hive one can be called from
+it directly. The path ends in **`.go`**, which is compulsory — that is what says
+the file is Go and not Hive:
+
+```hive
+import ./lib/measures.go
+
+proc main(): void {
+	echo measures.grams(measures.Weight(899, "Hive tool"))
+	echo measures.tally(["Bee", "hive", "bee"])   // {bee: 2, hive: 1}
+}
+```
+
+```go
+package measures
+
+type Weight struct {
+	Grams int
+	Label string
+}
+
+func Grams(w Weight) string          { ... }
+func Tally(words []string) map[string]int { ... }
+```
+
+* **Every value is deep-copied, in both directions.** That is the whole point of
+  the boundary: a Go function can sort the slice it was handed, keep a reference
+  to it, or write through it, and none of that can reach the Hive value it came
+  from. It is also why an imported Go function is a **`func`** rather than a
+  `proc` — what a `func` promises in Hive is that it cannot write to storage its
+  caller can see, and nothing on the far side of a copy can. (A Hive `func` may
+  already do I/O, so a Go function that reads a file is no problem.)
+* **Only what Go exports is reachable**, which there means a capitalised name.
+  Hive names callables in camelCase, so the name is reached with its first letter
+  lowered — `Grams` is `measures.grams` — while a type keeps its PascalCase
+  (`measures.Weight`). Two Go names differing only in that letter's case cannot
+  both be exported, so nothing collides.
+* The signatures are read by **the Go toolchain**, not guessed at: a small
+  program using Go's own parser reads the file (it is written into
+  `~/.hive/tool/` the first time and compiled once). So `hive check` on a program
+  that imports Go needs `go` on the PATH, as a build already did.
+* **The boundary is narrow, and everything outside it is a compile error** naming
+  the parameter it could not take:
+
+  | Go | Hive |
+  | -- | ---- |
+  | `string` | `Str` |
+  | `int` | `Int` — Hive's `Int` *is* Go's `int`, so `int64` and the rest are rejected rather than silently converted |
+  | `float64` | `Float` |
+  | `bool` | `Bool` |
+  | `[]T` | `T[dyn]` |
+  | `[][]string` | `Table` |
+  | `map[K]V` | [`hive.map.Map<K, T>`](#hivemap), with a `string`/`int`/`float64`/`bool` key |
+  | a struct the file exports | a Hive type of the same name and shape (`measures.Weight`) |
+  | `(T, error)` | `Result<T, Str>` — Go's way of reporting failure is Hive's |
+  | `error` alone | `Result<Bool, Str>`, whose `Ok` carries `true` |
+  | `void` | a function answering with nothing |
+
+  A pointer, a channel, an interface, a function value, a variadic parameter, a
+  fixed-size array, a type from another package, an unexported or embedded struct
+  field: each is refused, and the message says why. A struct crosses only when
+  *every* field of it does.
+* A Go map has **no order of its own** — it iterates differently on purpose — so
+  one arriving in Hive has its keys **sorted**. Going the other way the order is
+  simply dropped, since a Go map has nowhere to keep it.
+* Each imported file is compiled as **its own package** inside the generated
+  project (`hive emit` shows the wrappers calling into it), and it is *copied*
+  there, so what compiled is in the build directory whether the file came from
+  next door or out of a clone.
+* The file may **import whatever it likes**, standard library or not. A build
+  that sees a third-party import runs `go mod tidy` first, so that build needs
+  network access once; everything else stays offline.
+
+### Importing from a git repository
+
+An `import` may name a repository and a file inside it. The path is a host, an
+owner and a repository — then the path within it:
+
+```hive
+import https://github.com/owner/repo/src/text               // a Hive module
+import https://github.com/owner/repo@a1b2c3/src/text        // pinned to a commit
+import https://github.com/owner/repo/go/util.go as helpers  // a Go file, same rules
+import "https://github.com/owner/repo/lib code/text"        // quoted: the path has a space
+```
+
+* **`https://host/owner/repo` is the repository**; everything after it is the
+  path inside it, and it leaves `.hive` off exactly as a local import does. A
+  **revision** goes where the repository ends: `repo@a1b2c3`, `repo@v1.2.0`,
+  `repo@main` — a commit, a tag or a branch.
+* The module is **named after the file inside the repository**, not after the
+  repository or its host (`.../src/text` → `text`), so moving a module out to a
+  repository does not change how the code that uses it reads. `as` renames it as
+  always.
+* **Everything is fetched once.** The repository is cloned into
+  `~/.hive/pkg/<host>_<owner>_<repo>@<commit>`, shared by every program on the
+  machine that wants that commit. Nothing touches the network when the clone is
+  already there.
+* An import that **names no revision is pinned on first use**: the commit it
+  resolved to is written into a lock file beside the entrypoint (`main.hive` →
+  `main.hive-lock`), and every later build reads that. Keep it in version
+  control — it is what makes another machine build the same program. Delete a
+  line from it to take the latest of that repository again.
+
+  ```
+  # Written by the Hive compiler: the commit each remote import was
+  # resolved to. ...
+  https://github.com/R0DR160HM/hive-lang 3b4ae8e176fc35fb3d74076156e444e835522714
+  ```
+* A remote module is an **ordinary module**: it may import its own siblings
+  (resolved inside the clone), import further repositories, and it is loaded once
+  however many modules reach for it. It is also a *different* module from the same
+  file read locally — two copies of one file are two modules, with types of their
+  own.
+* Fetching needs **`git` on the PATH**. A missing one, an unreachable host, a
+  revision that does not exist and a path the repository does not have are four
+  different errors, and each says which it is.
+
+See [`code-examples/11 - Modules`](code-examples/11%20-%20Modules/modules.hive),
+which uses all three kinds of import in one program.
 
 ### Importing a standard library module
 
@@ -2332,6 +2568,8 @@ mappings worth knowing:
 | `using p` / `using conn run q(..)` / `run raw t` | `hive.ReadCSV(..)` / `hive.SqlRows(..)` / `hive.SqlQuery(..)`, each → a `Result` |
 | a `hive.*` library call                 | a call of the same name on the generated `hive` runtime package (`hive.json.parse` → `hive.JsonParse`, `hive.syslink.spawn` → `hive.SyslinkSpawn`, …) |
 | `import hive.ui as ui`, then `ui.row(..)` | nothing — the alias is resolved during import flattening, so codegen only ever sees `hive.ui.row` |
+| `hive.map.Map<Str, Int>`                | `hive.Dict[string, int]` — a key order beside a Go map, since [insertion order](#hivemap) is part of what it is |
+| `import ./util.go`, then `util.slugify(s)` | the file compiled as its own package, plus a wrapper: `func util_0_slugify(s string) string { return ffi_util_1.Slugify(s) }`, with a copy around every value that owns storage |
 | `Msg.Changed(_)` (a constructor hole)   | `func(_h0 string) Msg { return Msg(MsgChanged{Text: _h0}) }` |
 | `ui.row(attrs, kids)` / `ui.Tone.Danger()` | `hive.UiRow(..)` / `hive.Tone("Danger")` — an enum is a named string type carrying its variant's name |
 | `ui.Tone.HEX(s)` / `ui.Tone.RGBA(r, g, b, a)` | `hive.UiToneHex(s)` / `hive.UiToneRGBA(..)` — a call rather than a bare string, because the payload is validated and clamped where it lands |
@@ -2370,6 +2608,11 @@ src/hive/ast.gleam        the abstract syntax tree
 src/hive/parser.gleam     tokens       -> AST (recursive descent)
 src/hive/modules.gleam    resolves the `import` graph (rejecting cycles) and
                           flattens the whole program into one module
+src/hive/imports.gleam    what an import path names, and the fetching the ones
+                          that are not next door need: cloning a repository into
+                          the cache, and the lock file that pins it
+src/hive/ffi.gleam        reads an imported Go file's signatures (through the Go
+                          toolchain) and maps them onto Hive types
 src/hive/generics.gleam   monomorphization: one concrete copy of a generic
                           callable or type per set of type arguments it is
                           used at, so every later pass sees ordinary code
@@ -2384,8 +2627,10 @@ src/hive/testreport.gleam turns `go test` output and its coverage profile into
                           the report `hive test` prints
 ```
 
-Run the tests with `gleam test` (they include compiling every shipped
-example).
+Run the tests with `gleam test` (they include compiling every shipped example —
+so the Go toolchain has to be there, and the example that imports from a
+repository needs `git` and one network fetch the first time, after which its
+lock file and the clone cache make it offline).
 
 ## Scope
 

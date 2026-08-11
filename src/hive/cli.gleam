@@ -14,6 +14,7 @@ import gleam/string
 import filepath
 import shellout
 import simplifile
+import hive/ast
 import hive/compiler
 import hive/runtime
 import hive/spawn
@@ -24,7 +25,8 @@ import hive/testreport
 pub fn build(entry: String) -> Result(String, String) {
   let entry = normalize(entry)
 
-  use main_go <- result.try(compiler.compile_file(entry))
+  use program <- result.try(compiler.compile_program(entry))
+  let main_go = program.main_go
 
   let dir = dir_of(entry)
   let base = filepath.strip_extension(filepath.base_name(entry))
@@ -33,7 +35,8 @@ pub fn build(entry: String) -> Result(String, String) {
   let artifact = "app" <> goexe
 
   use _ <- result.try(prepare_build_dir(build_dir, main_go))
-  use _ <- result.try(resolve_sql_deps(build_dir, main_go))
+  use _ <- result.try(write_foreign(build_dir, program.foreign))
+  use _ <- result.try(resolve_deps(build_dir, main_go, program.foreign))
 
   // Best-effort formatting; ignored if gofmt is unavailable.
   let _ = shellout.command(run: "gofmt", with: ["-w", "."], in: build_dir, opt: [])
@@ -84,14 +87,16 @@ pub fn build(entry: String) -> Result(String, String) {
 pub fn run(entry: String, program_args: List(String)) -> Result(Int, String) {
   let entry = normalize(entry)
 
-  use main_go <- result.try(compiler.compile_file(entry))
+  use program <- result.try(compiler.compile_program(entry))
+  let main_go = program.main_go
 
   let dir = dir_of(entry)
   let base = filepath.strip_extension(filepath.base_name(entry))
   let build_dir = filepath.join(dir, base <> ".hive-build")
 
   use _ <- result.try(prepare_build_dir(build_dir, main_go))
-  use _ <- result.try(resolve_sql_deps(build_dir, main_go))
+  use _ <- result.try(write_foreign(build_dir, program.foreign))
+  use _ <- result.try(resolve_deps(build_dir, main_go, program.foreign))
 
   // Best-effort formatting; ignored if gofmt is unavailable.
   let _ = shellout.command(run: "gofmt", with: ["-w", "."], in: build_dir, opt: [])
@@ -153,7 +158,8 @@ pub fn run_tests(entry: String) -> Result(#(String, Bool), String) {
     filepath.join(build_dir, "main_test.go"),
     build.test_go,
   ))
-  use _ <- result.try(resolve_sql_deps(build_dir, both))
+  use _ <- result.try(write_foreign(build_dir, build.foreign))
+  use _ <- result.try(resolve_deps(build_dir, both, build.foreign))
 
   // Best-effort formatting; ignored if gofmt is unavailable. The coverage report
   // locates each declaration by reading the finished file, so it does not matter
@@ -210,18 +216,90 @@ fn looks_like_a_run(output: String) -> Bool {
   || string.contains(output, "FAIL\t")
 }
 
-// A program that uses `hive.sql` links external Go drivers, so its
-// dependencies must be resolved (fetched on first build, then cached) before
-// the Go toolchain runs. Programs that don't stay dependency-free and offline.
-fn resolve_sql_deps(build_dir: String, main_go: String) -> Result(Nil, String) {
-  case list.contains(runtime.needed_modules(main_go), "sql") {
+// Each imported Go file, copied into the generated project as a package of its
+// own — the directory being the name the generated code imports it under. It is
+// copied rather than referred to so the build stays self-contained: what
+// compiled is in the build directory, whether the file came from next door or
+// out of a clone of somebody's repository.
+fn write_foreign(
+  build_dir: String,
+  foreign: List(ast.Foreign),
+) -> Result(Nil, String) {
+  use _ <- result.try(remove_stale_foreign(build_dir, foreign))
+  list.try_fold(foreign, Nil, fn(_, f) {
+    let dir = filepath.join(build_dir, f.package_name)
+    use _ <- result.try(mkdir(dir))
+    use source <- result.try(
+      simplifile.read(f.file)
+      |> result.map_error(fn(e) {
+        "could not read the imported Go file "
+        <> f.file
+        <> ": "
+        <> simplifile.describe_error(e)
+      }),
+    )
+    write(filepath.join(dir, filepath.base_name(f.file)), source)
+  })
+  |> result.map(fn(_) { Nil })
+}
+
+// A package left behind by an earlier build in this same directory, whose import
+// the program no longer has. Nothing would compile it — `go build .` builds the
+// main package — but `go mod tidy` reads every package it finds, so one whose own
+// dependencies are gone would fail a build that has nothing to do with it.
+fn remove_stale_foreign(
+  build_dir: String,
+  foreign: List(ast.Foreign),
+) -> Result(Nil, String) {
+  let wanted = list.map(foreign, fn(f) { f.package_name })
+  case simplifile.read_directory(build_dir) {
+    // Nothing read means nothing to clean: the directory is about to be created.
+    Error(_) -> Ok(Nil)
+    Ok(entries) ->
+      entries
+      |> list.filter(fn(entry) {
+        string.starts_with(entry, "ffi_") && !list.contains(wanted, entry)
+      })
+      |> list.try_fold(Nil, fn(_, entry) {
+        simplifile.delete_all([filepath.join(build_dir, entry)])
+        |> result.map_error(fn(e) {
+          "could not remove the stale "
+          <> entry
+          <> " in "
+          <> build_dir
+          <> ": "
+          <> simplifile.describe_error(e)
+        })
+      })
+      |> result.map(fn(_) { Nil })
+  }
+}
+
+// A build that links anything from outside the standard library has to resolve
+// it before the toolchain runs: `hive.sql`'s drivers, and whatever an imported
+// Go file imports for itself. Everything else stays dependency-free and offline.
+fn resolve_deps(
+  build_dir: String,
+  main_go: String,
+  foreign: List(ast.Foreign),
+) -> Result(Nil, String) {
+  let sql = list.contains(runtime.needed_modules(main_go), "sql")
+  let go_deps = list.any(foreign, fn(f) { f.third_party })
+  case sql || go_deps {
     True ->
       shellout.command(run: "go", with: ["mod", "tidy"], in: build_dir, opt: [])
       |> result.map_error(fn(failure) {
         let #(_code, message) = failure
-        "could not resolve the SQL driver dependencies (this needs network "
-        <> "access on the first build):\n\n"
-        <> message
+        case go_deps {
+          True ->
+            "could not resolve what the imported Go files depend on (this needs "
+            <> "network access on the first build):\n\n"
+            <> message
+          False ->
+            "could not resolve the SQL driver dependencies (this needs network "
+            <> "access on the first build):\n\n"
+            <> message
+        }
       })
       |> result.map(fn(_) { Nil })
     False -> Ok(Nil)

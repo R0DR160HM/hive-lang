@@ -283,8 +283,15 @@ fn lex_atom(
 
 // Captures an `import`'s path verbatim: leading blanks are skipped, then
 // everything up to the next whitespace is the path (`../lib/strings`,
-// `./helpers`, `sibling`). Ordinary tokenizing resumes afterwards, so an
-// optional `as <name>` and the next declaration lex as usual.
+// `./helpers`, `sibling`, `https://host/owner/repo/src/foo`). Ordinary
+// tokenizing resumes afterwards, so an optional `as <name>` and the next
+// declaration lex as usual.
+//
+// A path may also be **quoted**, which is how one holding a space is written:
+// `import "./lib/my file"`, `import "https://host/o/r/code-examples/11 - x/lib"`.
+// Inside the quotes everything up to the closing one is the path, so nothing in
+// it has to be escaped or encoded — and `as` after it still reads as `as`, which
+// is what an unquoted path with spaces could never promise.
 fn lex_import_path(
   chars: List(String),
   line: Int,
@@ -293,6 +300,7 @@ fn lex_import_path(
   case chars {
     [" ", ..rest] | ["\t", ..rest] | ["\r", ..rest] ->
       lex_import_path(rest, line, acc)
+    ["\"", ..rest] -> lex_quoted_import_path(rest, line, acc, [])
     _ -> {
       let #(taken, rest) = take_while(chars, is_path_char)
       case taken {
@@ -305,6 +313,39 @@ fn lex_import_path(
           ])
       }
     }
+  }
+}
+
+// The quoted form. A newline inside it is a missing closing quote rather than a
+// path that spans lines: an import is one line, and saying so here means the
+// error lands on the line the quote was opened on.
+fn lex_quoted_import_path(
+  chars: List(String),
+  line: Int,
+  acc: List(Token),
+  taken: List(String),
+) -> Result(List(Token), String) {
+  case chars {
+    ["\"", ..rest] ->
+      case taken {
+        [] ->
+          Error(diagnostic.at(
+            line,
+            "`import \"\"` names no module: put the path between the quotes",
+          ))
+        _ ->
+          do_lex(rest, line, Normal, [
+            Token(token.PathLit(string.concat(list.reverse(taken))), line),
+            ..acc
+          ])
+      }
+    [] | ["\n", ..] ->
+      Error(diagnostic.at(
+        line,
+        "this `import` path opens with a quote and never closes it — add the "
+          <> "closing `\"` at the end of the path",
+      ))
+    [c, ..rest] -> lex_quoted_import_path(rest, line, acc, [c, ..taken])
   }
 }
 

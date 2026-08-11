@@ -132,6 +132,7 @@ fn run_rounds(
       module.imports,
       list.append(concrete, instantiated(wanted)),
       module.origins,
+      module.foreign,
     )
   let env = codegen.module_env(staged)
 
@@ -170,6 +171,7 @@ fn run_rounds(
         module.imports,
         list.append(rewritten, inst_rewritten),
         module.origins,
+        module.foreign,
       ))
     // Nothing new, but something still cannot be resolved — so it never will be.
     True, [why, ..] -> Error(why)
@@ -234,6 +236,7 @@ fn decl_name(d: ast.Decl) -> Option(String) {
     ast.ProcDecl(name, _, _, _)
     | ast.FuncDecl(name, _, _, _)
     | ast.QueryDecl(name, _, _, _)
+    | ast.ForeignDecl(name, _, _, _, _, _)
     | ast.TypeDecl(name, _, _) -> Some(name)
     // A test is named in prose and declares no name of its own.
     ast.TestDecl(..) -> None
@@ -261,8 +264,10 @@ fn collect_generics(
         }
       }
       // A test has no signature, so it is never generic itself. Its *body* may
-      // still call something that is, which the body walk instantiates.
-      ast.TypeDecl(..) | ast.TestDecl(..) -> acc
+      // still call something that is, which the body walk instantiates. A Go
+      // function's signature holds no type variables either: every type in it
+      // came from a Go type, and Go said which one.
+      ast.ForeignDecl(..) | ast.TypeDecl(..) | ast.TestDecl(..) -> acc
     }
   })
 }
@@ -410,6 +415,15 @@ fn spell(ty: codegen.Ty) -> Option(ast.TypeExpr) {
         Some(o), Some(e) -> Some(ast.TName(None, "Result", [o, e], []))
         _, _ -> None
       }
+    // The map is spelled through its own module, which is the only spelling of
+    // it there is — so a generic instantiated at one writes it back out exactly
+    // as the program would have.
+    codegen.TyMap(key, value) ->
+      case spell(key), spell(value) {
+        Some(k), Some(v) ->
+          Some(ast.TName(Some("hive.map"), "Map", [k, v], []))
+        _, _ -> None
+      }
     codegen.TyVec(elem) ->
       case spell(elem) {
         Some(ast.TName(pkg, name, args, dims)) ->
@@ -446,6 +460,7 @@ fn mangle(ty: codegen.Ty) -> String {
     codegen.TyBuiltin(name) -> name
     codegen.TyVec(elem) -> "Vec" <> mangle(elem)
     codegen.TyResult(ok, err) -> "Result" <> mangle(ok) <> mangle(err)
+    codegen.TyMap(key, value) -> "Map" <> mangle(key) <> mangle(value)
     codegen.TyFunc(_, params, ret) ->
       "Fn" <> string.concat(list.map(params, mangle)) <> mangle(ret)
     codegen.TyVar(name) -> name
@@ -667,6 +682,9 @@ fn walk_decl(
       let #(commons, st) = rewrite_fields(st, commons)
       Ok(#(ast.TypeDecl(name, list.reverse(variants), commons), st))
     }
+    // A Go function's signature names only concrete types and it has no body, so
+    // there is nothing in one for this pass to rewrite.
+    ast.ForeignDecl(..) -> Ok(#(d, st))
   }
 }
 
@@ -1336,7 +1354,8 @@ fn decl_params(d: ast.Decl) -> List(ast.Field) {
   case d {
     ast.ProcDecl(_, params, _, _)
     | ast.FuncDecl(_, params, _, _)
-    | ast.QueryDecl(_, params, _, _) -> params
+    | ast.QueryDecl(_, params, _, _)
+    | ast.ForeignDecl(_, params, _, _, _, _) -> params
     ast.TypeDecl(..) | ast.TestDecl(..) -> []
   }
 }
@@ -1376,9 +1395,9 @@ fn specialize(
         substitute(subst, ret),
         substitute_sql(subst, sql),
       )
-    // Only a declaration with a signature is ever specialized, and a test has
-    // none — so there is no copy of one to make.
-    ast.TypeDecl(..) | ast.TestDecl(..) -> d
+    // Only a generic declaration is ever specialized: a test has no signature,
+    // and a Go function's holds no variables to substitute.
+    ast.ForeignDecl(..) | ast.TypeDecl(..) | ast.TestDecl(..) -> d
   }
 }
 

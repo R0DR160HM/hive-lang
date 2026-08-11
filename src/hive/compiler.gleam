@@ -33,11 +33,23 @@ import hive/diagnostic
 import hive/generics
 import hive/modules
 
+/// The generated program: the `main.go` it compiles to, and the Go files it
+/// calls into, which the build has to copy in beside it.
+pub type Program {
+  Program(main_go: String, foreign: List(ast.Foreign))
+}
+
 /// Compile the program rooted at `entry` — a path to a `.hive` file — into the
 /// contents of the generated `main.go`, resolving its `import` graph first.
 ///
 /// This is the path something is going to *run*, so the program needs a `main`.
 pub fn compile_file(entry: String) -> Result(String, String) {
+  compile_entry(entry, True) |> result.map(fn(p: Program) { p.main_go })
+}
+
+/// The same compile, with the imported Go files it needs alongside — what a
+/// *build* needs, as opposed to `hive emit`, which only prints the Go.
+pub fn compile_program(entry: String) -> Result(Program, String) {
   compile_entry(entry, True)
 }
 
@@ -50,7 +62,7 @@ pub fn check_file(entry: String) -> Result(Nil, String) {
   compile_entry(entry, False) |> result.map(fn(_) { Nil })
 }
 
-fn compile_entry(entry: String, needs_main: Bool) -> Result(String, String) {
+fn compile_entry(entry: String, needs_main: Bool) -> Result(Program, String) {
   // `load`'s errors already carry the file and line they happened on; the passes
   // `finish` runs work on a flattened module whose nodes carry no positions, so
   // theirs are reported against the entrypoint as a whole.
@@ -70,6 +82,9 @@ pub type TestBuild {
     origins: Dict(String, ast.Origin),
     /// The tests, in declaration order — which is the order they run in.
     test_names: List(String),
+    /// The Go files the program calls into. A test runs the same package, so it
+    /// needs them compiled in exactly as a build does.
+    foreign: List(ast.Foreign),
   )
 }
 
@@ -107,6 +122,7 @@ fn finish_tests(module: ast.Module) -> Result(TestBuild, String) {
             _ -> Error(Nil)
           }
         }),
+        module.foreign,
       ))
     None ->
       Error(
@@ -124,6 +140,7 @@ fn finish_tests(module: ast.Module) -> Result(TestBuild, String) {
 pub fn compile(source: String) -> Result(String, String) {
   use module <- result.try(modules.load_source(source, ".", "the source"))
   finish(module, True)
+  |> result.map(fn(p: Program) { p.main_go })
   |> result.map_error(diagnostic.whole_file("the source", _))
 }
 
@@ -139,7 +156,7 @@ pub fn check_source(source: String) -> Result(Nil, String) {
 
 // Everything past import resolution, which works on one flat module and so does
 // not care how many files it came from.
-fn finish(module: ast.Module, needs_main: Bool) -> Result(String, String) {
+fn finish(module: ast.Module, needs_main: Bool) -> Result(Program, String) {
   // Generic callables are resolved into concrete ones first, so every pass
   // after this one sees ordinary declarations and checks each instantiation on
   // its own terms.
@@ -147,7 +164,7 @@ fn finish(module: ast.Module, needs_main: Bool) -> Result(String, String) {
   use _ <- result.try(check(module, needs_main))
   use _ <- result.try(codegen.check_types(module))
   use _ <- result.try(bounds.check(module))
-  Ok(codegen.generate(module))
+  Ok(Program(codegen.generate(module), module.foreign))
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +209,7 @@ fn check(module: ast.Module, needs_main: Bool) -> Result(Nil, String) {
   })
   use _ <- result.try(check_test_names(module))
   use _ <- result.try(check_decl_types(module.decls))
+  use _ <- result.try(check_map_new(module.decls))
   let procs =
     list.fold(module.decls, dict.new(), fn(acc, d) {
       case d {
@@ -205,7 +223,8 @@ fn check(module: ast.Module, needs_main: Bool) -> Result(Nil, String) {
       case d {
         ast.ProcDecl(name, params, _, _)
         | ast.FuncDecl(name, params, _, _)
-        | ast.QueryDecl(name, params, _, _) ->
+        | ast.QueryDecl(name, params, _, _)
+        | ast.ForeignDecl(name, params, _, _, _, _) ->
           dict.insert(acc, name, list.map(params, fn(p) { p.name }))
         ast.TypeDecl(..) | ast.TestDecl(..) -> acc
       }
@@ -215,7 +234,9 @@ fn check(module: ast.Module, needs_main: Bool) -> Result(Nil, String) {
       case d {
         ast.ProcDecl(name, params, _, _)
         | ast.FuncDecl(name, params, _, _)
-        | ast.QueryDecl(name, params, _, _) -> dict.insert(acc, name, params)
+        | ast.QueryDecl(name, params, _, _)
+        | ast.ForeignDecl(name, params, _, _, _, _) ->
+          dict.insert(acc, name, params)
         ast.TypeDecl(..) | ast.TestDecl(..) -> acc
       }
     })
@@ -287,7 +308,10 @@ fn check(module: ast.Module, needs_main: Bool) -> Result(Nil, String) {
         ))
         check_test_returns(owner, body)
       }
-      ast.TypeDecl(..) -> Ok(Nil)
+      // A Go function has no Hive body, and its signature was checked where it
+      // was read (`hive/ffi`) — including that no parameter of it is a mutex,
+      // which the Go side has no way to spell.
+      ast.ForeignDecl(..) | ast.TypeDecl(..) -> Ok(Nil)
     }
   })
   |> result.map(fn(_) { Nil })
@@ -376,41 +400,517 @@ fn check_pure_params(
 
 // Every type written in a declaration, checked in the position it appears in.
 fn check_decl_types(decls: List(ast.Decl)) -> Result(Nil, String) {
+  let types = collect_type_decls(decls)
   list.try_fold(decls, Nil, fn(_, d) {
     case d {
       ast.ProcDecl(name, params, ret, _)
       | ast.FuncDecl(name, params, ret, _) -> {
         use _ <- result.try(
           list.try_fold(params, Nil, fn(_, p) {
-            check_param_type(p.typ, "parameter `" <> p.name <> "` of `" <> name <> "`")
+            let where =
+              "parameter `" <> p.name <> "` of `" <> name <> "`"
+            use _ <- result.try(check_map_types(types, p.typ, where))
+            check_param_type(p.typ, where)
           }),
         )
-        check_return_type(ret, "the return type of `" <> name <> "`")
+        let where = "the return type of `" <> name <> "`"
+        use _ <- result.try(check_map_types(types, ret, where))
+        check_return_type(ret, where)
       }
       ast.QueryDecl(name, params, ret, sql) -> {
         use _ <- result.try(
           list.try_fold(params, Nil, fn(_, p) {
-            check_param_type(p.typ, "parameter `" <> p.name <> "` of `" <> name <> "`")
+            let where =
+              "parameter `" <> p.name <> "` of `" <> name <> "`"
+            use _ <- result.try(check_map_types(types, p.typ, where))
+            check_param_type(p.typ, where)
           }),
         )
-        use _ <- result.try(check_return_type(
-          ret,
-          "the return type of `" <> name <> "`",
-        ))
+        let where = "the return type of `" <> name <> "`"
+        use _ <- result.try(check_map_types(types, ret, where))
+        use _ <- result.try(check_return_type(ret, where))
         check_select_star(name, ret, sql)
       }
       ast.TypeDecl(name, variants, commons) -> {
         let fields =
           list.append(list.flat_map(variants, fn(v) { v.fields }), commons)
         list.try_fold(fields, Nil, fn(_, f) {
-          check_sized(f.typ, "field `" <> f.name <> "` of type `" <> name <> "`")
+          let where = "field `" <> f.name <> "` of type `" <> name <> "`"
+          use _ <- result.try(check_map_types(types, f.typ, where))
+          check_sized(f.typ, where)
         })
       }
       // A test has no signature, so there is no type written in its declaration.
-      ast.TestDecl(..) -> Ok(Nil)
+      // A Go function's was written in Go and mapped where it was read, so what
+      // is checked here — where `[]` may appear, what a map's key may be — was
+      // settled by the mapping rather than by anyone writing it down.
+      ast.ForeignDecl(..) | ast.TestDecl(..) -> Ok(Nil)
     }
   })
   |> result.map(fn(_) { Nil })
+}
+
+fn collect_type_decls(decls: List(ast.Decl)) -> Dict(String, ast.Decl) {
+  list.fold(decls, dict.new(), fn(acc, d) {
+    case d {
+      ast.TypeDecl(name, _, _) -> dict.insert(acc, name, d)
+      _ -> acc
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// What a map may be
+// ---------------------------------------------------------------------------
+
+// Every `hive.map.Map` a type expression mentions, held to what a map can be.
+//
+// Two things are checked here. The type has to be *spelled* the one way — `Map`
+// alone is not it (an undeclared name in a type position is a type variable,
+// which would make the callable generic in a name that reads like the map and
+// is not), and it names both a key type and a value type.
+//
+// And the key has to be a type a key can be: a scalar, or a type declared in
+// this program whose every field is one of those. Both are what a lookup needs
+// — a value that can be hashed and compared, where two keys are the same key
+// exactly when their parts are equal. A vector or another map has neither
+// property to offer: it is storage, and two of them can hold equal contents
+// while being different storage.
+fn check_map_types(
+  types: Dict(String, ast.Decl),
+  t: ast.TypeExpr,
+  where: String,
+) -> Result(Nil, String) {
+  case t {
+    ast.TVoid -> Ok(Nil)
+    ast.TFunc(_, params, ret) -> {
+      use _ <- result.try(
+        list.try_fold(params, Nil, fn(_, p) { check_map_types(types, p, where) }),
+      )
+      check_map_types(types, ret, where)
+    }
+    ast.TName(pkg, name, args, _) -> {
+      use _ <- result.try(case pkg, name, args {
+        Some("hive.map"), "Map", [key, _] ->
+          check_map_key(types, key, where, t)
+        Some("hive.map"), "Map", _ ->
+          Error(
+            where
+            <> " is declared `"
+            <> ast.show_type(t)
+            <> "`, and a map names both halves of what it holds: "
+            <> "`hive.map.Map<K, T>`, as in `hive.map.Map<Str, Int>`.",
+          )
+        // The type is real but reached through the wrong namespace, which is how
+        // every builtin type behaves — `hive.net.HttpRequest` is not
+        // `hive.HttpRequest` either.
+        Some(other), "Map", _ ->
+          case is_hive_pkg(other) {
+            True ->
+              Error(
+                where
+                <> " is declared `"
+                <> ast.show_type(t)
+                <> "`, and the map lives in its own module: write "
+                <> "`hive.map.Map<K, T>`, or `import hive.map` and reach it as "
+                <> "`map.Map<K, T>`.",
+              )
+            False -> Ok(Nil)
+          }
+        // A bare `Map<...>`: not the module's type, and not a declaration of
+        // this program's either — so it would quietly read as a type variable.
+        None, "Map", [_, ..] ->
+          case dict.has_key(types, "Map") {
+            True -> Ok(Nil)
+            False ->
+              Error(
+                where
+                <> " is declared `"
+                <> ast.show_type(t)
+                <> "`, but `Map` on its own is not a type this program declares "
+                <> "— the dictionary is `hive.map.Map<K, T>`. (An undeclared "
+                <> "name in a type is a type variable, so this would have made "
+                <> "the declaration generic rather than given it a map.)",
+              )
+          }
+        _, _, _ -> Ok(Nil)
+      })
+      list.try_fold(args, Nil, fn(_, a) { check_map_types(types, a, where) })
+      |> result.map(fn(_) { Nil })
+    }
+  }
+}
+
+fn check_map_key(
+  types: Dict(String, ast.Decl),
+  key: ast.TypeExpr,
+  where: String,
+  whole: ast.TypeExpr,
+) -> Result(Nil, String) {
+  case legal_key(types, key, []) {
+    True -> Ok(Nil)
+    False ->
+      Error(
+        where
+        <> " is declared `"
+        <> ast.show_type(whole)
+        <> "`, and `"
+        <> ast.show_type(key)
+        <> "` cannot be a key. A key is compared and hashed whole, so it has to "
+        <> "be a `Str`, `Int`, `Float`, `Bool` or `Atom` — or a type declared "
+        <> "here whose every field is one of those, which makes a composite key "
+        <> "like a `Point`. Storage cannot: two vectors (or maps, or Tables) "
+        <> "hold equal contents while being different storage, so there would "
+        <> "be no answer to whether they are the same key. Key by something "
+        <> "that identifies the value — a `Str` name, an `Int` id — and keep the "
+        <> "rest in the value.",
+      )
+  }
+}
+
+// Whether a type may be a key. `seen` stops a type whose fields reach back to it
+// from being walked forever; such a type is rejected, which is the right answer
+// anyway — a struct cannot contain itself by value, so reaching back means going
+// through storage.
+fn legal_key(
+  types: Dict(String, ast.Decl),
+  t: ast.TypeExpr,
+  seen: List(String),
+) -> Bool {
+  case t {
+    // A key names no dimensions and takes no type arguments: both of those are
+    // storage or a generic yet to be substituted, and neither is a key.
+    ast.TName(None, name, [], []) ->
+      case name {
+        "Str" | "String" | "Int" | "Float" | "Bool" | "Atom" -> True
+        _ ->
+          case list.contains(seen, name), dict.get(types, name) {
+            False, Ok(ast.TypeDecl(_, variants, commons)) ->
+              list.append(list.flat_map(variants, fn(v) { v.fields }), commons)
+              |> list.all(fn(f) { legal_key(types, f.typ, [name, ..seen]) })
+            _, _ -> False
+          }
+      }
+    _ -> False
+  }
+}
+
+// Whether a type qualifier names the standard library (`hive`, `hive.net`, ...).
+fn is_hive_pkg(pkg: String) -> Bool {
+  pkg == "hive" || string.starts_with(pkg, "hive.")
+}
+
+// Whether a written type is a map, and what its values are.
+fn map_value_type(t: ast.TypeExpr) -> Option(ast.TypeExpr) {
+  case t {
+    ast.TName(Some("hive.map"), "Map", [_, value], []) -> Some(value)
+    _ -> None
+  }
+}
+
+fn is_map_type(t: ast.TypeExpr) -> Bool {
+  map_value_type(t) != None
+}
+
+// ---------------------------------------------------------------------------
+// Where the empty map may be written
+// ---------------------------------------------------------------------------
+
+// `hive.map.new()` is an empty map. It says nothing about what it holds, so it
+// may only be written where something else already does: a declaration that
+// names the type, a `return` whose type the callable names, an assignment to a
+// variable declared as a map, an argument landing in a parameter or field
+// declared as one, or the value slot of a `hive.map.set` on a map whose values
+// are themselves maps.
+//
+// Anywhere else there is nothing to read the key and value types off. A map that
+// does not know what it holds is not a map, so this is a compile error naming
+// the one line that fixes it — rather than Go being handed a `Map[any, any]` and
+// complaining about a type Hive never spelled.
+type NewCtx {
+  NewCtx(
+    types: Dict(String, ast.Decl),
+    /// Callable name -> its parameters, for the argument slots.
+    sigs: Dict(String, List(ast.Field)),
+    /// The return type of the declaration being walked.
+    ret: ast.TypeExpr,
+  )
+}
+
+fn check_map_new(decls: List(ast.Decl)) -> Result(Nil, String) {
+  let ctx =
+    NewCtx(collect_type_decls(decls), collect_sig_fields(decls), ast.TVoid)
+  list.try_fold(decls, Nil, fn(_, d) {
+    case d {
+      ast.ProcDecl(_, params, ret, body) | ast.FuncDecl(_, params, ret, body) ->
+        new_in_stmts(NewCtx(..ctx, ret: ret), body, param_types(params))
+        |> result.map(fn(_) { Nil })
+      ast.TestDecl(_, body, _, _) ->
+        new_in_stmts(ctx, body, dict.new()) |> result.map(fn(_) { Nil })
+      // A query body holds expressions but no statements, and no slot in one is
+      // a map: SQL takes values.
+      ast.QueryDecl(_, _, _, sql) ->
+        list.try_fold(ast.sql_exprs(sql), Nil, fn(_, e) {
+          new_in_expr(ctx, e, False, dict.new())
+        })
+        |> result.map(fn(_) { Nil })
+      // Neither has a body, so neither can hold an empty map that went nowhere.
+      ast.ForeignDecl(..) | ast.TypeDecl(..) -> Ok(Nil)
+    }
+  })
+  |> result.map(fn(_) { Nil })
+}
+
+fn collect_sig_fields(decls: List(ast.Decl)) -> Dict(String, List(ast.Field)) {
+  list.fold(decls, dict.new(), fn(acc, d) {
+    case d {
+      ast.ProcDecl(name, params, _, _)
+      | ast.FuncDecl(name, params, _, _)
+      | ast.QueryDecl(name, params, _, _)
+      | ast.ForeignDecl(name, params, _, _, _, _) ->
+        dict.insert(acc, name, params)
+      _ -> acc
+    }
+  })
+}
+
+fn param_types(params: List(ast.Field)) -> Dict(String, ast.TypeExpr) {
+  list.fold(params, dict.new(), fn(acc, p) { dict.insert(acc, p.name, p.typ) })
+}
+
+// Walks a body threading the types locals were *declared* with, which is what a
+// slot's map-ness is read off. A `:=` binding names no type, so it contributes
+// none — a map reached through one can still be set into, just not handed a
+// fresh empty map for a value.
+fn new_in_stmts(
+  ctx: NewCtx,
+  stmts: List(ast.Stmt),
+  locals: Dict(String, ast.TypeExpr),
+) -> Result(Dict(String, ast.TypeExpr), String) {
+  list.try_fold(stmts, locals, fn(locals, s) { new_in_stmt(ctx, s, locals) })
+}
+
+fn new_in_stmt(
+  ctx: NewCtx,
+  s: ast.Stmt,
+  locals: Dict(String, ast.TypeExpr),
+) -> Result(Dict(String, ast.TypeExpr), String) {
+  case s {
+    ast.STypedDecl(typ, name, value, _, _) -> {
+      // A local's type is checked again in `check_stmt`, with the scope it really
+      // has. Asking here too is what lets a misspelt map (`Map<Str, Int>`, with
+      // no module in front) be reported as the misspelling it is, rather than as
+      // an empty map that landed in a slot which — being a type variable — never
+      // said it was a map.
+      use _ <- result.try(check_map_types(ctx.types, typ, "`" <> name <> "`"))
+      use _ <- result.try(new_in_expr(ctx, value, is_map_type(typ), locals))
+      Ok(dict.insert(locals, name, typ))
+    }
+    ast.SVarDecl(_, value, _, _) -> {
+      use _ <- result.try(new_in_expr(ctx, value, False, locals))
+      Ok(locals)
+    }
+    ast.SAssign(target, value) -> {
+      let allowed = case target {
+        ast.EIdent(name) ->
+          case dict.get(locals, name) {
+            Ok(t) -> is_map_type(t)
+            Error(_) -> False
+          }
+        _ -> False
+      }
+      use _ <- result.try(new_in_expr(ctx, target, False, locals))
+      use _ <- result.try(new_in_expr(ctx, value, allowed, locals))
+      Ok(locals)
+    }
+    ast.SReturn(Some(e)) -> {
+      use _ <- result.try(new_in_expr(ctx, e, is_map_type(ctx.ret), locals))
+      Ok(locals)
+    }
+    ast.SReturn(None) | ast.SBreak | ast.SContinue -> Ok(locals)
+    ast.SEcho(e)
+    | ast.SAssert(e, _)
+    | ast.SPanic(e)
+    | ast.SExpr(e)
+    | ast.SAsync(e) -> {
+      use _ <- result.try(new_in_expr(ctx, e, False, locals))
+      Ok(locals)
+    }
+    ast.SIf(branches, else_body) -> {
+      use _ <- result.try(
+        list.try_fold(branches, Nil, fn(_, b) {
+          use _ <- result.try(new_in_expr(ctx, b.cond, False, locals))
+          new_in_stmts(ctx, b.body, locals) |> result.map(fn(_) { Nil })
+        }),
+      )
+      use _ <- result.try(
+        new_in_stmts(ctx, option.unwrap(else_body, []), locals)
+        |> result.map(fn(_) { Nil }),
+      )
+      Ok(locals)
+    }
+    ast.SFor(init, cond, post, body) -> {
+      use inner <- result.try(case init {
+        Some(st) -> new_in_stmt(ctx, st, locals)
+        None -> Ok(locals)
+      })
+      use _ <- result.try(case cond {
+        Some(e) -> new_in_expr(ctx, e, False, inner)
+        None -> Ok(Nil)
+      })
+      use _ <- result.try(case post {
+        Some(st) -> new_in_stmt(ctx, st, inner) |> result.map(fn(_) { Nil })
+        None -> Ok(Nil)
+      })
+      use _ <- result.try(
+        new_in_stmts(ctx, body, inner) |> result.map(fn(_) { Nil }),
+      )
+      Ok(locals)
+    }
+    ast.SForEach(name, elem_type, iterable, body) -> {
+      use _ <- result.try(new_in_expr(ctx, iterable, False, locals))
+      let inner = case elem_type {
+        Some(t) -> dict.insert(locals, name, t)
+        None -> locals
+      }
+      use _ <- result.try(
+        new_in_stmts(ctx, body, inner) |> result.map(fn(_) { Nil }),
+      )
+      Ok(locals)
+    }
+  }
+}
+
+// `allowed` is whether *this* expression may itself be the empty map. Its
+// sub-expressions are asked the question again, since each sits in a slot of its
+// own — an argument, a field, or nothing that names a type at all.
+fn new_in_expr(
+  ctx: NewCtx,
+  e: ast.Expr,
+  allowed: Bool,
+  locals: Dict(String, ast.TypeExpr),
+) -> Result(Nil, String) {
+  case is_new_call(e), allowed {
+    True, True -> Ok(Nil)
+    True, False -> Error(map_new_unplaced())
+    False, _ ->
+      case e {
+        // An argument to something whose parameters are written down: a declared
+        // callable, or a constructor, whose fields are its parameter list.
+        ast.ECall(callee, args) -> {
+          use _ <- result.try(new_in_expr(ctx, callee, False, locals))
+          let slots = arg_slots(ctx, callee, args, locals)
+          list.try_fold(args, Nil, fn(_, a) {
+            new_in_expr(ctx, a.value, slot_takes_map(slots, a, args), locals)
+          })
+          |> result.map(fn(_) { Nil })
+        }
+        _ ->
+          list.try_fold(ast.sub_exprs(e), Nil, fn(_, sub) {
+            new_in_expr(ctx, sub, False, locals)
+          })
+          |> result.map(fn(_) { Nil })
+      }
+  }
+}
+
+// The parameters a call's arguments land in, when they are written down
+// somewhere: a declared callable's, a constructor's fields, or — for
+// `hive.map.set` — the map's own value type, read off the variable it names.
+fn arg_slots(
+  ctx: NewCtx,
+  callee: ast.Expr,
+  args: List(ast.Arg),
+  locals: Dict(String, ast.TypeExpr),
+) -> List(ast.Field) {
+  case callee {
+    ast.EIdent(name) ->
+      case dict.get(ctx.sigs, name), dict.get(ctx.types, name) {
+        Ok(params), _ -> params
+        // `Type(...)` constructs the first variant, or the struct itself.
+        _, Ok(decl) -> constructor_fields(decl, None)
+        _, _ -> []
+      }
+    ast.EMember(ast.EIdent(tname), variant) ->
+      case dict.get(ctx.types, tname) {
+        Ok(decl) -> constructor_fields(decl, Some(variant))
+        Error(_) -> []
+      }
+    // `hive.map.set(m, key, value)`: the value slot is a map exactly when the
+    // map being written to holds maps.
+    ast.EMember(ast.EMember(ast.EIdent("hive"), "map"), "set") ->
+      case args {
+        [ast.Arg(_, ast.EIdent(name)), ..] ->
+          case result.map(dict.get(locals, name), map_value_type) {
+            Ok(Some(value)) -> [
+              ast.Field("map", ast.TVoid, False),
+              ast.Field("key", ast.TVoid, False),
+              ast.Field("value", value, False),
+            ]
+            _ -> []
+          }
+        _ -> []
+      }
+    _ -> []
+  }
+}
+
+// The fields a constructor call fills, which are its parameter list: a named
+// variant's own fields plus the type's common ones, or the first variant's when
+// the call names only the type.
+fn constructor_fields(
+  decl: ast.Decl,
+  variant: Option(String),
+) -> List(ast.Field) {
+  case decl {
+    ast.TypeDecl(_, variants, commons) -> {
+      let own = case variant, variants {
+        Some(name), _ ->
+          case list.find(variants, fn(v) { v.name == name }) {
+            Ok(v) -> v.fields
+            Error(_) -> []
+          }
+        None, [first, ..] -> first.fields
+        None, [] -> []
+      }
+      list.append(own, commons)
+    }
+    _ -> []
+  }
+}
+
+// Whether the slot this argument fills is declared as a map. The argument is
+// matched to its parameter the same way the call itself will be — named
+// arguments claim theirs, the rest fill what is left in order.
+fn slot_takes_map(
+  slots: List(ast.Field),
+  arg: ast.Arg,
+  args: List(ast.Arg),
+) -> Bool {
+  let #(assigned, _) =
+    codegen.assign_args(args, list.map(slots, fn(f) { f.name }))
+  list.zip(assigned, slots)
+  |> list.any(fn(pair) {
+    let #(#(_, expr), field) = pair
+    expr == arg.value && is_map_type(field.typ)
+  })
+}
+
+fn is_new_call(e: ast.Expr) -> Bool {
+  case e {
+    ast.ECall(ast.EMember(ast.EMember(ast.EIdent("hive"), "map"), "new"), []) ->
+      True
+    _ -> False
+  }
+}
+
+fn map_new_unplaced() -> String {
+  "`hive.map.new()` is an empty map, and nothing here says what it holds. Write "
+  <> "it where the type is named: a declaration (`hive.map.Map<Str, Int> counts "
+  <> "= hive.map.new()`, `mut` if you are going to write to it), a `return` from "
+  <> "a callable that declares a map, or an argument to a parameter or field "
+  <> "declared as one. Then hand *that* on — a map's key and value types are "
+  <> "part of what it is, and there is nowhere here to read them from."
 }
 
 // A parameter's own type may be unsized. A function *type* in that position
@@ -832,6 +1332,11 @@ fn declared_grow(t: ast.TypeExpr) -> Grow {
   case t {
     // `Table` is an alias for `Str[dyn][dyn]`, kept unexpanded in the AST.
     ast.TName(None, "Table", _, []) -> Growable
+    // A map has no length to have promised, so nothing about it forbids growing
+    // — `hive.map.set` adds keys to any `mut` map. Saying so here keeps a vector
+    // builtin aimed at a map (`append(m, x)`) out of the "not a dynamic vector"
+    // message, and lets the pass that knows it is a map say so instead.
+    ast.TName(Some("hive.map"), "Map", _, []) -> Growable
     ast.TName(_, _, _, [ast.DimDyn, ..]) -> Growable
     // `T[]` promises nothing about the length, but it is a signature-only
     // spelling: a local declared with it is rejected before this point.
@@ -863,6 +1368,7 @@ fn check_stmt(
   muts: Dict(String, Binding),
 ) -> Result(Dict(String, Binding), String) {
   use _ <- result.try(check_vector_writes(s, muts))
+  use _ <- result.try(check_map_writes(s, muts))
   case s {
     ast.SEcho(e) -> {
       use _ <- result.try(check_expr(ctx, e))
@@ -873,6 +1379,7 @@ fn check_stmt(
       Ok(dict.insert(muts, name, Binding(mutable, Inferred)))
     }
     ast.STypedDecl(typ, name, value, mutable, _) -> {
+      use _ <- result.try(check_map_types(ctx.types, typ, "`" <> name <> "`"))
       use _ <- result.try(check_sized(typ, "`" <> name <> "`"))
       use _ <- result.try(check_expr(ctx, value))
       Ok(dict.insert(muts, name, Binding(mutable, declared_grow(typ))))
@@ -960,7 +1467,11 @@ fn check_stmt(
     }
     ast.SForEach(name, elem_type, iterable, body) -> {
       use _ <- result.try(case elem_type {
-        Some(t) -> check_sized(t, "the element type of `" <> name <> "`")
+        Some(t) -> {
+          let where = "the element type of `" <> name <> "`"
+          use _ <- result.try(check_map_types(ctx.types, t, where))
+          check_sized(t, where)
+        }
         None -> Ok(Nil)
       })
       use _ <- result.try(check_expr(ctx, iterable))
@@ -1251,6 +1762,73 @@ fn check_vector_writes(
   }
 }
 
+// `hive.map.set` and `hive.map.delete` change which keys a map has, which is a
+// write through the map they were given — so the map has to be one this scope
+// may write to, exactly as `append`'s vector does.
+//
+// Unlike a vector there is no second question to ask: a map has no length to
+// have promised, so `mut` is the whole of it. And unlike `prepend`, neither call
+// is restricted to a statement of its own — both hand back nothing, which the
+// arity check above already settles, and `void` in an expression is refused
+// wherever a value was wanted.
+fn check_map_writes(
+  s: ast.Stmt,
+  muts: Dict(String, Binding),
+) -> Result(Nil, String) {
+  list.try_fold(list.flat_map(own_exprs(s), map_writer_calls), Nil, fn(_, call) {
+    let #(what, args) = call
+    case args {
+      [ast.Arg(_, target), ..] -> check_map_writable(what, target, muts)
+      [] -> Ok(Nil)
+    }
+  })
+  |> result.map(fn(_) { Nil })
+}
+
+// Every `hive.map.set` / `hive.map.delete` inside an expression, by name.
+fn map_writer_calls(e: ast.Expr) -> List(#(String, List(ast.Arg))) {
+  let here = case e {
+    ast.ECall(ast.EMember(ast.EMember(ast.EIdent("hive"), "map"), name), args) ->
+      case name {
+        "set" | "delete" -> [#(name, args)]
+        _ -> []
+      }
+    _ -> []
+  }
+  list.append(here, list.flat_map(ast.sub_exprs(e), map_writer_calls))
+}
+
+fn check_map_writable(
+  what: String,
+  target: ast.Expr,
+  muts: Dict(String, Binding),
+) -> Result(Nil, String) {
+  use root <- result.try(
+    assign_root(target)
+    |> result.replace_error(
+      "`hive.map."
+      <> what
+      <> "`'s first argument must be a mutable map: a variable, or a field of "
+      <> "one.",
+    ),
+  )
+  case dict.get(muts, root) {
+    Ok(Binding(True, _)) -> Ok(Nil)
+    // Not `mut`, or not a local at all — a parameter, which is only ever
+    // writable when it was declared `mut`, and then it is in `muts`.
+    _ ->
+      Error(
+        "`hive.map."
+        <> what
+        <> "` changes which keys the map holds, so it needs a mutable map: `"
+        <> root
+        <> "` is immutable — declare it with `mut`, or take it as a `mut "
+        <> "hive.map.Map<...>` parameter. To leave the caller's map alone, "
+        <> "build one of your own.",
+      )
+  }
+}
+
 // Each writer call in these expressions, held to its arity and to the vector it
 // is allowed to write through. `muts` is the bindings in scope; a name absent
 // from it is immutable, which is what a parameter always is.
@@ -1455,6 +2033,10 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
               use _ <- result.try(check_sql_call(fname, args))
               check_args(ctx, args)
             }
+            "map" -> {
+              use _ <- result.try(check_map_call(fname, args))
+              check_args(ctx, args)
+            }
             "conv" -> {
               use _ <- result.try(check_conv_call(fname, args))
               check_args(ctx, args)
@@ -1487,7 +2069,7 @@ fn check_expr(ctx: Ctx, e: ast.Expr) -> Result(Nil, String) {
               Error(
                 "unknown builtin namespace `hive."
                 <> ns
-                <> "` (available: net, file, json, crypto, sql, conv, env, "
+                <> "` (available: net, file, json, crypto, sql, map, conv, env, "
                 <> "term, task, syslink, time, ui)",
               )
           }
@@ -1984,6 +2566,46 @@ fn check_sql_driver(
 }
 
 // ---------------------------------------------------------------------------
+// hive.map builtins
+// ---------------------------------------------------------------------------
+
+fn check_map_call(fname: String, args: List(ast.Arg)) -> Result(Nil, String) {
+  case fname {
+    "new" -> check_arity("`hive.map.new`", args, [])
+    "set" -> check_arity("`hive.map.set`", args, ["map", "key", "value"])
+    "get" -> check_arity("`hive.map.get`", args, ["map", "key"])
+    "has" -> check_arity("`hive.map.has`", args, ["map", "key"])
+    "delete" -> check_arity("`hive.map.delete`", args, ["map", "key"])
+    "keys" -> check_arity("`hive.map.keys`", args, ["map"])
+    "values" -> check_arity("`hive.map.values`", args, ["map"])
+    "fromTable" -> check_arity("`hive.map.fromTable`", args, ["table"])
+    "toTable" -> check_arity("`hive.map.toTable`", args, ["map"])
+    // The two questions this module deliberately does not answer, each with the
+    // one line that answers it.
+    "size" | "length" | "count" ->
+      Error(
+        "`hive.map."
+        <> fname
+        <> "` is not a builtin: `len(m)` counts a map's pairs, the same way it "
+        <> "counts a vector's elements.",
+      )
+    "getOr" ->
+      Error(
+        "`hive.map.getOr` is not a builtin. `hive.map.get(m, key)` answers with "
+        <> "a `Result`, so a fallback is the `else` of matching it: `if "
+        <> "hive.map.get(m, key) is Result.Ok(v) { ... }`.",
+      )
+    _ ->
+      Error(
+        "unknown builtin `hive.map."
+        <> fname
+        <> "` (available: new, set, get, has, delete, keys, values, fromTable, "
+        <> "toTable — and `len(m)` for how many pairs it holds)",
+      )
+  }
+}
+
+// ---------------------------------------------------------------------------
 // hive.conv builtins
 // ---------------------------------------------------------------------------
 
@@ -2136,6 +2758,58 @@ fn check_ui_enum(
             codegen.ui_enum_params(enum_name, variant),
           )
       }
+  }
+}
+
+// A message crosses the wire, which means it is encoded as JSON — and a map has
+// no decoder (see `check_decodable_field`, which says why). A service whose
+// mailbox took one would encode fine on this node and arrive as nothing on the
+// next, so it is refused where the mailbox is declared.
+fn check_message_type(
+  types: Dict(String, ast.Decl),
+  t: ast.TypeExpr,
+  handler: String,
+) -> Result(Nil, String) {
+  case carries_map(types, t, []) {
+    False -> Ok(Nil)
+    True ->
+      Error(
+        "proc `"
+        <> handler
+        <> "` cannot be a service handler: its message type `"
+        <> ast.show_type(t)
+        <> "` carries a map, and a message is encoded to cross the wire. A "
+        <> "map's keys are whatever was put in it, so there is no declared shape "
+        <> "to decode on the other side. Send the pairs as a `Table` "
+        <> "(`hive.map.toTable`) — or as a vector of a declared type — and build "
+        <> "the map from them in the handler.",
+      )
+  }
+}
+
+// Whether a type is, or holds, a map. `seen` stops a type whose fields reach
+// back to it from being walked twice.
+fn carries_map(
+  types: Dict(String, ast.Decl),
+  t: ast.TypeExpr,
+  seen: List(String),
+) -> Bool {
+  case t {
+    ast.TName(Some("hive.map"), "Map", _, _) -> True
+    ast.TName(None, name, args, _) ->
+      list.any(args, fn(a) { carries_map(types, a, seen) })
+      || case list.contains(seen, name), dict.get(types, name) {
+        False, Ok(ast.TypeDecl(_, variants, commons)) ->
+          list.append(list.flat_map(variants, fn(v) { v.fields }), commons)
+          |> list.any(fn(f) { carries_map(types, f.typ, [name, ..seen]) })
+        _, _ -> False
+      }
+    ast.TName(_, _, args, _) ->
+      list.any(args, fn(a) { carries_map(types, a, seen) })
+    ast.TFunc(_, params, ret) ->
+      list.any(params, fn(p) { carries_map(types, p, seen) })
+      || carries_map(types, ret, seen)
+    ast.TVoid -> False
   }
 }
 
@@ -2305,6 +2979,21 @@ fn check_decodable_field(
               )
           }
       }
+    // A JSON object and a map are the same shape, but Hive's decoding is by
+    // declared type — every key named, every type known — and a map's keys are
+    // whatever the document happens to carry.
+    ast.TName(Some("hive.map"), "Map", _, _) ->
+      Error(
+        "cannot derive a JSON decoder for `"
+        <> tname
+        <> "`: field `"
+        <> f.name
+        <> "` is a map, and decoding is by declared shape — every key named and "
+        <> "every type known — while a map's keys are whatever the document "
+        <> "brought. Declare the keys you need as fields, or take that part of "
+        <> "the document as a `Table` (`with Table` flattens it) and read it "
+        <> "with `hive.map.fromTable`.",
+      )
     _ ->
       Error(
         "cannot derive a JSON decoder for `"
@@ -2619,7 +3308,7 @@ fn check_service_handler(ctx: Ctx, handler: ast.Expr) -> Result(Nil, String) {
     ast.ECall(..) -> Ok(Nil)
     ast.EIdent(name) ->
       case dict.get(ctx.procs, name) {
-        Ok(#([state, _message, envelope], ret)) ->
+        Ok(#([state, message, envelope], ret)) ->
           case is_hive_type(envelope.typ, "Envelope"), ret == state.typ {
             False, _ ->
               Error(
@@ -2638,7 +3327,8 @@ fn check_service_handler(ctx: Ctx, handler: ast.Expr) -> Result(Nil, String) {
                 <> "state — "
                 <> shape,
               )
-            True, True -> Ok(Nil)
+            True, True ->
+              check_message_type(ctx.types, message.typ, name)
           }
         Ok(_) -> Error("proc `" <> name <> "` cannot be used: " <> shape)
         Error(_) ->

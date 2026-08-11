@@ -88,6 +88,17 @@ pub fn modules() -> List(Module) {
       requires: [],
     ),
     Module(
+      name: "map",
+      file: "hive/map.go",
+      source: map_go,
+      // The type is `hive.Dict[...]` in the generated Go and every helper on it
+      // is spelled `hive.Dict...`, bar the two named for what they do. Nothing
+      // here matches `hive.Map(`, which is the *walk* builtin — so a program
+      // that maps over a vector does not link a dictionary.
+      markers: ["hive.Dict", "hive.NewDict", "hive.CloneDict"],
+      requires: [],
+    ),
+    Module(
       name: "env",
       file: "hive/env.go",
       source: env_go,
@@ -529,7 +540,16 @@ func AwaitAll[T any](hs []*Async[T]) []T {
 // (a Table) are compared the same way recursively, so an empty vector and a
 // nil one count as equal; other element values are compared deeply. Hive's
 // == / != on vectors lower to this, since Go cannot compare slices directly.
+//
+// A value that knows how to compare itself is asked (EqualsValue) rather than
+// walked. Only hive.map's Map implements it: a map is its pairs, and reflection
+// would compare the key *order* it keeps for iteration as if that were part of
+// the value. The hook is here rather than in map.go so a map nested in a vector
+// or a Table is compared the same way as one on its own.
 func VecEq(a, b any) bool {
+	if self, ok := a.(interface{ EqualsValue(any) bool }); ok {
+		return self.EqualsValue(b)
+	}
 	va := reflect.ValueOf(a)
 	vb := reflect.ValueOf(b)
 	if va.Kind() != reflect.Slice || vb.Kind() != reflect.Slice {
@@ -2590,6 +2610,283 @@ func StrToFloat(s string) Result[float64, ConversionError] {
 		return Err[float64, ConversionError](ConversionError{Input: s, Message: \"not a valid number\"})
 	}
 	return Ok[float64, ConversionError](f)
+}
+"
+}
+
+// ---------------------------------------------------------------------------
+// hive.map
+// ---------------------------------------------------------------------------
+
+/// Source of `hive/map.go`: the dictionary module (`hive.map`) — a `Map<K, T>`
+/// that remembers the order its keys were first set.
+pub fn map_go() -> String {
+  "package hive
+
+import (
+	\"fmt\"
+	\"strings\"
+)
+
+// Dict is Hive's dictionary — `hive.map.Map<K, T>` in a program. It is keys
+// paired with values, in the order the keys were first set.
+//
+// The Go name differs from the Hive one because `Map` here is already the walk
+// builtin (`map(v, f)`), which every program that walks a vector calls. Naming
+// this one Dict keeps the two apart, and keeps a program that only ever walked a
+// vector from linking a dictionary it never asked for.
+//
+// The order is kept on purpose. A Go map iterates in a deliberately randomised
+// order, so `keys(m)` over one would answer differently from run to run — and a
+// program whose output moves when nothing about it changed is a program you
+// cannot test. So the order the pairs went in is the order they come back, and
+// two runs always agree.
+//
+// That costs the key slice beside the lookup: `keys` is the order and `vals`
+// answers the lookups, and every write keeps the two in step. Neither is
+// reachable from Hive, which sees only the pairs.
+type Dict[K comparable, V any] struct {
+	keys []K
+	vals map[K]V
+}
+
+// NewDict is the empty map (`hive.map.new()`). The maps are made here rather
+// than left nil so a map read before it is ever written behaves like the empty
+// map it is.
+func NewDict[K comparable, V any]() Dict[K, V] {
+	return Dict[K, V]{keys: []K{}, vals: map[K]V{}}
+}
+
+// String renders a map for `echo` and interpolation: its pairs in their own
+// order, which is the whole point of keeping one. fmt finds this method on its
+// own, so a map inside a vector or a struct shows the same way.
+func (m Dict[K, V]) String() string {
+	var b strings.Builder
+	b.WriteString(\"{\")
+	for i, k := range m.keys {
+		if i > 0 {
+			b.WriteString(\", \")
+		}
+		b.WriteString(fmt.Sprint(k))
+		b.WriteString(\": \")
+		b.WriteString(fmt.Sprint(m.vals[k]))
+	}
+	b.WriteString(\"}\")
+	return b.String()
+}
+
+// EqualsValue is how `==` compares two maps, and it ignores the order: a map is
+// its pairs, and the order they were written in is a convenience for reading
+// them back, not part of what the value *is*. The core runtime's VecEq looks
+// for this method, so a map nested in a vector is compared the same way.
+func (m Dict[K, V]) EqualsValue(other any) bool {
+	o, ok := other.(Dict[K, V])
+	if !ok {
+		return false
+	}
+	if len(m.vals) != len(o.vals) {
+		return false
+	}
+	for k, mine := range m.vals {
+		theirs, found := o.vals[k]
+		if !found || !VecEq(mine, theirs) {
+			return false
+		}
+	}
+	return true
+}
+
+// DictLen backs `len(m)`: how many pairs the map holds.
+func DictLen[K comparable, V any](m Dict[K, V]) int { return len(m.keys) }
+
+// DictSet adds or replaces a pair. It takes the map's *address* for the same
+// reason `append` reassigns: a new key extends the key order, and growing a
+// slice returns a new header the caller has to end up holding.
+//
+// A key already present keeps the position it had. Its value being replaced is
+// not the key arriving again.
+func DictSet[K comparable, V any](m *Dict[K, V], key K, value V) {
+	if m.vals == nil {
+		m.vals = map[K]V{}
+	}
+	if _, found := m.vals[key]; !found {
+		m.keys = append(m.keys, key)
+	}
+	m.vals[key] = value
+}
+
+// DictGet answers with the value, or an Error carrying false — there is nothing
+// to say about a missing key beyond that it was missing, which is exactly what
+// `indexOf` answers with for the same reason.
+func DictGet[K comparable, V any](m Dict[K, V], key K) Result[V, bool] {
+	if value, found := m.vals[key]; found {
+		return Ok[V, bool](value)
+	}
+	return Err[V, bool](false)
+}
+
+// DictHas is the question without the value.
+func DictHas[K comparable, V any](m Dict[K, V], key K) bool {
+	_, found := m.vals[key]
+	return found
+}
+
+// DictDelete removes a pair, and its key from the order. Deleting a key that was
+// never there is not a failure: the map ends up without it either way.
+func DictDelete[K comparable, V any](m *Dict[K, V], key K) {
+	if _, found := m.vals[key]; !found {
+		return
+	}
+	delete(m.vals, key)
+	for i, k := range m.keys {
+		if k == key {
+			m.keys = append(m.keys[:i], m.keys[i+1:]...)
+			break
+		}
+	}
+}
+
+// DictKeys and DictValues hand back fresh vectors in the map's own order. Fresh
+// because a Hive vector is a value: what the caller does to the one it got back
+// cannot reach the map it came from.
+func DictKeys[K comparable, V any](m Dict[K, V]) []K { return CloneVec(m.keys) }
+
+func DictValues[K comparable, V any](m Dict[K, V]) []V {
+	out := make([]V, 0, len(m.keys))
+	for _, k := range m.keys {
+		out = append(out, m.vals[k])
+	}
+	return out
+}
+
+// DictFromTable reads a Table as pairs: cell 0 of a row is the key, cell 1 its
+// value. Rows are taken in order, so the map's order is the table's.
+//
+// A row of one cell maps that key to \"\", and an empty row is skipped — a
+// table read from a file has whatever rows the file had. A repeated key keeps
+// the position it first took and ends up with the last row's value, which is
+// what setting the same key twice does anywhere else.
+//
+// Row 0 is not treated as a header. `using` hands the header row back like any
+// other and so does `row`; which rows mean what is the program's to decide.
+func DictFromTable(t Table) Dict[string, string] {
+	out := NewDict[string, string]()
+	for _, row := range t {
+		switch len(row) {
+		case 0:
+		case 1:
+			DictSet(&out, row[0], \"\")
+		default:
+			DictSet(&out, row[0], row[1])
+		}
+	}
+	return out
+}
+
+// DictToTable is the other direction: one two-cell row per pair, in the map's
+// own order. That is a Table like any other, so it can be written as a CSV or
+// read with `row`.
+func DictToTable(m Dict[string, string]) Table {
+	out := make(Table, 0, len(m.keys))
+	for _, k := range m.keys {
+		out = append(out, []string{k, m.vals[k]})
+	}
+	return out
+}
+
+// CloneDict copies a map so the copy shares no storage with it: a fresh key
+// order and a fresh lookup. This is the right copy when the value type owns no
+// storage of its own; deeper value types use CloneDictFn.
+func CloneDict[K comparable, V any](m Dict[K, V]) Dict[K, V] {
+	out := Dict[K, V]{keys: CloneVec(m.keys), vals: make(map[K]V, len(m.vals))}
+	for k, v := range m.vals {
+		out.vals[k] = v
+	}
+	return out
+}
+
+// CloneDictFn is CloneDict for value types that themselves own storage (a vector,
+// a struct with vector fields, another map): every value is passed through
+// clone.
+func CloneDictFn[K comparable, V any](m Dict[K, V], clone func(V) V) Dict[K, V] {
+	out := Dict[K, V]{keys: CloneVec(m.keys), vals: make(map[K]V, len(m.vals))}
+	for k, v := range m.vals {
+		out.vals[k] = clone(v)
+	}
+	return out
+}
+
+// DictEq backs `==` between two maps. It is EqualsValue reached the way the
+// generated code reaches every other comparison — as a function of both sides.
+func DictEq[K comparable, V any](a, b Dict[K, V]) bool { return a.EqualsValue(b) }
+
+// ---------------------------------------------------------------------------
+// The boundary with plain Go maps (an `import ./util.go` — see hive/ffi.gleam)
+// ---------------------------------------------------------------------------
+
+// DictToGo is a map on its way into an imported Go function: a fresh Go map, so
+// whatever that function does to it cannot reach the Hive value it came from.
+// The order is not carried over — a Go map has nowhere to keep one.
+func DictToGo[K comparable, V any](d Dict[K, V]) map[K]V {
+	out := make(map[K]V, len(d.vals))
+	for key, value := range d.vals {
+		out[key] = value
+	}
+	return out
+}
+
+// DictToGoFn is DictToGo where the values are converted on the way, which is
+// what a value that is itself a map, a vector or a mirrored struct needs.
+func DictToGoFn[K comparable, V any, W any](d Dict[K, V], conv func(V) W) map[K]W {
+	out := make(map[K]W, len(d.vals))
+	for key, value := range d.vals {
+		out[key] = conv(value)
+	}
+	return out
+}
+
+// DictFromGo is a Go map on its way back: a fresh Hive map, with its keys put in
+// order by `less`.
+//
+// The order is the interesting part. A Hive map's own order is the order its
+// keys were set in, and a Go map has none to give — it iterates differently on
+// purpose, so that a program cannot come to depend on one. Something has to be
+// chosen, and sorted is the only choice that gives the same program the same
+// output twice.
+func DictFromGo[K comparable, V any](m map[K]V, less func(a, b K) bool) Dict[K, V] {
+	out := Dict[K, V]{keys: make([]K, 0, len(m)), vals: make(map[K]V, len(m))}
+	for key, value := range m {
+		out.keys = append(out.keys, key)
+		out.vals[key] = value
+	}
+	sortKeys(out.keys, less)
+	return out
+}
+
+// DictFromGoFn is DictFromGo with the values converted on the way.
+func DictFromGoFn[K comparable, V any, W any](
+	m map[K]W,
+	less func(a, b K) bool,
+	conv func(W) V,
+) Dict[K, V] {
+	out := Dict[K, V]{keys: make([]K, 0, len(m)), vals: make(map[K]V, len(m))}
+	for key, value := range m {
+		out.keys = append(out.keys, key)
+		out.vals[key] = conv(value)
+	}
+	sortKeys(out.keys, less)
+	return out
+}
+
+// An insertion sort, which is the whole of what is needed here: these are a Go
+// map's keys, and the alternative is pulling in `sort` for a comparison the
+// caller already handed over.
+func sortKeys[K any](keys []K, less func(a, b K) bool) {
+	for i := 1; i < len(keys); i++ {
+		for j := i; j > 0 && less(keys[j], keys[j-1]); j-- {
+			keys[j], keys[j-1] = keys[j-1], keys[j]
+		}
+	}
 }
 "
 }

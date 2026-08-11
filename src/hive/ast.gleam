@@ -20,6 +20,34 @@ pub type Module {
     /// Empty until `hive/modules` flattens; the entry module's own declarations
     /// map to themselves.
     origins: Dict(String, Origin),
+    /// The Go files `import ./util.go` brought in, one per file. The build
+    /// copies each into the generated project as a package of its own, and the
+    /// generated code calls into it through the wrappers `ForeignDecl` describes.
+    /// Empty for a program that imports no Go.
+    foreign: List(Foreign),
+  )
+}
+
+/// A Go file an `import` brought in, and what the generated project needs to
+/// know about it. What Hive *calls* in it is a `ForeignDecl` per function; this
+/// is the file itself.
+pub type Foreign {
+  Foreign(
+    /// The `.go` file on disk — a path into the program's own folder, or into a
+    /// clone of a repository a remote import named.
+    file: String,
+    /// The Go package it is compiled as inside the generated project, which is
+    /// also the directory it is written to and the alias the code imports it
+    /// under. Derived from the file's own path, so two `util.go` from different
+    /// folders stay apart.
+    package_name: String,
+    /// Each type mirrored from one of its exported structs: the flat Hive name,
+    /// and the Go name in the file it mirrors. The two are structurally the same
+    /// struct, which is what the generated converters walk.
+    types: List(#(String, String)),
+    /// Whether the file imports anything from outside Go's standard library,
+    /// which is what makes the build resolve dependencies before compiling.
+    third_party: Bool,
   )
 }
 
@@ -76,6 +104,32 @@ pub type Decl {
   /// is a struct and the type is a tagged union; `common_fields` are added to
   /// every variant.
   TypeDecl(name: String, variants: List(Variant), common_fields: List(Field))
+  /// A function in an imported Go file, reached from Hive as an ordinary `func`.
+  ///
+  /// It has no body here, and never will: the body is in the Go file. What the
+  /// compiler needs is its signature, which is read off the file (see
+  /// `hive/ffi`) and mapped to Hive types — so every call to it is checked like
+  /// any other. Codegen emits a wrapper of this name that deep-copies each
+  /// argument on the way in and the answer on the way out, which is what keeps
+  /// a mutation inside the Go code from being a mutation of a Hive value.
+  ///
+  /// It is a `func` rather than a `proc` because of that copying: what a `func`
+  /// promises in Hive is that it cannot write to storage its caller can see, and
+  /// nothing on the other side of a copy can. (A `func` may already do I/O.)
+  ForeignDecl(
+    name: String,
+    params: List(Field),
+    return_type: TypeExpr,
+    /// The Go package the wrapper calls into — `Foreign.package_name`.
+    package_name: String,
+    /// The exported Go name, which the Hive name is the lower-cased form of.
+    symbol: String,
+    /// How many values the Go function answers with: none, one, or a value and
+    /// an `error`. The Hive return type does not say — a `Result<Bool, Str>` is
+    /// both `error` alone and `(bool, error)` — and the wrapper has to take the
+    /// call apart the way the Go side actually wrote it.
+    go_results: Int,
+  )
   /// `test "what should be true" { ... }` — one unit test.
   ///
   /// A test is named in prose because that is what a test name is for, and it

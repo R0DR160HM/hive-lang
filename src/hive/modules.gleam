@@ -26,6 +26,8 @@ import simplifile
 import hive/ast
 import hive/builtins
 import hive/diagnostic
+import hive/ffi
+import hive/imports
 import hive/lexer
 import hive/parser
 
@@ -40,6 +42,11 @@ type Source {
     /// How the module is named in messages — the path as the program spells it.
     display: String,
     module: ast.Module,
+    /// Each of this module's own import paths mapped to the key of the module it
+    /// resolved to. Resolving is where a remote import is fetched and a `.go`
+    /// file is read, so the answer is kept rather than worked out twice — and
+    /// `context` looks names up in here rather than going back to the disk.
+    resolved: Dict(String, String),
   )
 }
 
@@ -55,7 +62,14 @@ pub fn load(entry: String) -> Result(ast.Module, String) {
   )
   use module <- result.try(parse_module(text, entry))
   use key <- result.try(canonical(entry))
-  build(Source(key, directory_of(entry), entry, module), entry)
+  // A program with a file of its own keeps its pins beside it, so what an
+  // un-pinned remote import resolved to is the same on the next build and on
+  // another machine.
+  build(
+    Source(key, directory_of(entry), entry, module, dict.new()),
+    entry,
+    imports.read_lock(entry),
+  )
 }
 
 /// Load a program from source text held in memory, resolving any `import` it
@@ -69,11 +83,25 @@ pub fn load_source(
   use module <- result.try(parse_module(source, display))
   // The key only has to be distinct from every real file's absolute path, which
   // a bare name never is, and nothing can import the in-memory entry anyway.
-  build(Source("<entry>", normalize(dir), display, module), display)
+  build(
+    Source("<entry>", normalize(dir), display, module, dict.new()),
+    display,
+    // Source held in memory has nowhere to keep pins, so an un-pinned remote
+    // import here resolves afresh.
+    imports.no_lock(),
+  )
 }
 
-fn build(entry: Source, display: String) -> Result(ast.Module, String) {
-  use sources <- result.try(resolve(entry, [], []))
+fn build(
+  entry: Source,
+  display: String,
+  lock: imports.Lock,
+) -> Result(ast.Module, String) {
+  use #(sources, lock) <- result.try(resolve(entry, [], [], lock))
+  // Written before the program is checked: what was fetched has been fetched
+  // either way, and a build that fails for an unrelated reason should not have
+  // to fetch it again.
+  use _ <- result.try(imports.write_lock(lock))
   flatten(sources, entry.key, display)
 }
 
@@ -85,33 +113,54 @@ fn build(entry: Source, display: String) -> Result(ast.Module, String) {
 // one's dependencies ahead of it. `chain` is the modules currently being
 // resolved, which is what makes a cycle visible; `done` is everything already
 // loaded, so a diamond (two modules importing the same third) loads it once.
+//
+// The lock travels with the walk because fetching happens inside it: a remote
+// module can import another, so a pin can be added at any depth.
 fn resolve(
   src: Source,
   chain: List(Source),
   done: List(Source),
-) -> Result(List(Source), String) {
+  lock: imports.Lock,
+) -> Result(#(List(Source), imports.Lock), String) {
   case list.any(done, fn(s) { s.key == src.key }) {
-    True -> Ok(done)
+    True -> Ok(#(done, lock))
     False -> {
-      let chain = [src, ..chain]
-      use done <- result.try(
-        list.try_fold(src.module.imports, done, fn(acc, imp) {
-          // A standard library import names no file, so there is no graph to
-          // walk into and nothing that could close a cycle. `context` is where
-          // it is checked and given its meaning.
-          use <- bool.guard(builtins.names_stdlib(imp.path), Ok(acc))
-          use dep <- result.try(load_import(src, imp))
-          case list.any(chain, fn(s) { s.key == dep.key }) {
-            True ->
-              Error(diagnostic.in_file(
-                src.display,
-                diagnostic.at(imp.line, cycle_error(chain, dep)),
-              ))
-            False -> resolve(dep, chain, acc)
-          }
-        }),
+      let inner_chain = [src, ..chain]
+      use #(done, lock, resolved) <- result.try(
+        list.try_fold(
+          src.module.imports,
+          #(done, lock, dict.new()),
+          fn(acc, imp) {
+            let #(done, lock, resolved) = acc
+            // A standard library import names no file, so there is no graph to
+            // walk into and nothing that could close a cycle. `context` is where
+            // it is checked and given its meaning.
+            use <- bool.guard(
+              builtins.names_stdlib(imp.path),
+              Ok(#(done, lock, resolved)),
+            )
+            use #(dep, lock) <- result.try(load_import(src, imp, lock))
+            let resolved = dict.insert(resolved, imp.path, dep.key)
+            case list.any(inner_chain, fn(s) { s.key == dep.key }) {
+              True ->
+                Error(diagnostic.in_file(
+                  src.display,
+                  diagnostic.at(imp.line, cycle_error(inner_chain, dep)),
+                ))
+              False -> {
+                use #(done, lock) <- result.try(resolve(
+                  dep,
+                  inner_chain,
+                  done,
+                  lock,
+                ))
+                Ok(#(done, lock, resolved))
+              }
+            }
+          },
+        ),
       )
-      Ok(list.append(done, [src]))
+      Ok(#(list.append(done, [Source(..src, resolved: resolved)]), lock))
     }
   }
 }
@@ -133,31 +182,140 @@ fn cycle_error(chain: List(Source), dep: Source) -> String {
   <> "module they each import."
 }
 
-// Resolves one `import` against the importing module's own directory and reads
-// the file it names, supplying the `.hive` extension.
-fn load_import(from: Source, imp: ast.Import) -> Result(Source, String) {
-  let path = import_path(from.dir, imp.path)
+// Resolves one `import` and loads what it names. A local Hive module is read from
+// the importing module's own directory; a remote one is read from the clone of
+// its repository, which is fetched first if this machine does not have it.
+fn load_import(
+  from: Source,
+  imp: ast.Import,
+  lock: imports.Lock,
+) -> Result(#(Source, imports.Lock), String) {
+  // Every error below is about this one `import` line, in this one file.
+  let here = fn(message) {
+    diagnostic.in_file(from.display, diagnostic.at(imp.line, message))
+  }
+  use kind <- result.try(imports.classify(imp.path) |> result.map_error(here))
+  case kind {
+    // Reached only through `context`: `resolve` never walks into one.
+    imports.Stdlib(_) -> Error(here("`" <> imp.path <> "` names no file"))
+    imports.LocalHive(path) -> {
+      use src <- result.try(load_hive(imp, import_path(from.dir, path), here))
+      Ok(#(src, lock))
+    }
+    imports.RemoteHive(repo, path) -> {
+      use #(dir, lock) <- result.try(
+        imports.fetch(repo, lock) |> result.map_error(here),
+      )
+      use src <- result.try(load_hive(
+        imp,
+        import_path(dir, path),
+        remote_error(here, repo, imp.path),
+      ))
+      Ok(#(src, lock))
+    }
+    imports.LocalGo(path) -> {
+      let full = filepath.join(from.dir, path)
+      use src <- result.try(load_go(
+        full,
+        here,
+        "`import "
+          <> imp.path
+          <> "` does not name a readable file — looked for "
+          <> shorten(full),
+      ))
+      Ok(#(src, lock))
+    }
+    imports.RemoteGo(repo, path) -> {
+      use #(dir, lock) <- result.try(
+        imports.fetch(repo, lock) |> result.map_error(here),
+      )
+      use src <- result.try(load_go(
+        filepath.join(dir, path),
+        here,
+        remote_error(here, repo, imp.path)(""),
+      ))
+      Ok(#(src, lock))
+    }
+  }
+}
+
+// A file missing from a repository is a different mistake from one missing next
+// door: the clone is on this disk but the path is not the program's own, so the
+// message names the repository rather than a directory nobody chose.
+fn remote_error(
+  here: fn(String) -> String,
+  repo: imports.Repo,
+  path: String,
+) -> fn(String) -> String {
+  fn(_message) {
+    here(
+      "`import "
+      <> path
+      <> "` names a file the repository does not have. "
+      <> repo.url
+      <> " was cloned, so this is the path inside it that is wrong — check it "
+      <> "against the repository, remembering that a Hive module leaves `.hive` "
+      <> "off.",
+    )
+  }
+}
+
+fn load_hive(
+  imp: ast.Import,
+  path: String,
+  fail: fn(String) -> String,
+) -> Result(Source, String) {
   let display = shorten(path)
   use key <- result.try(canonical(path))
   use text <- result.try(
     simplifile.read(path)
     |> result.map_error(fn(e) {
-      diagnostic.in_file(
-        from.display,
-        diagnostic.at(
-          imp.line,
-          "`import "
-            <> imp.path
-            <> "` does not name a readable file — looked for "
-            <> display
-            <> ": "
-            <> simplifile.describe_error(e),
-        ),
+      fail(
+        "`import "
+        <> imp.path
+        <> "` does not name a readable file — looked for "
+        <> display
+        <> ": "
+        <> simplifile.describe_error(e),
       )
     }),
   )
+  // A module's own parse errors belong to *it* rather than to whoever imported
+  // it, and already carry its file and line — `fail` speaks only for the import
+  // line, which is where the file could not be read.
   use module <- result.try(parse_module(text, display))
-  Ok(Source(key, directory_of(path), display, module))
+  Ok(Source(key, directory_of(path), display, module, dict.new()))
+}
+
+// A Go file is not a Hive module: nothing in it is parsed as Hive, and what it
+// contributes is the signatures of the functions it exports (see `hive/ffi`).
+// The module built here holds those, plus a Hive type for each Go struct that
+// crosses the boundary, and no imports of its own — a Go file's own imports are
+// Go's business.
+// `missing` is what to say when the file is not there, which differs between an
+// import naming this disk and one naming a repository.
+fn load_go(
+  path: String,
+  here: fn(String) -> String,
+  missing: String,
+) -> Result(Source, String) {
+  let display = shorten(path)
+  use key <- result.try(canonical(path))
+  // Every message goes through `here`, so it opens with the `import` line that
+  // asked for the file — the position an editor jumps to, and the line the
+  // program can actually change. What the reader says names the Go declaration
+  // and the Go file inside that, since that is where the fix usually is.
+  use read <- result.try(case simplifile.is_file(path) {
+    Ok(True) -> ffi.read(path, display) |> result.map_error(here)
+    _ -> Error(here(missing))
+  })
+  Ok(Source(
+    key,
+    directory_of(path),
+    display,
+    ast.Module([], read.decls, dict.new(), [read.foreign]),
+    dict.new(),
+  ))
 }
 
 // The file an import names: relative to the importing module's directory, with
@@ -210,8 +368,27 @@ fn flatten(
         [],
         list.flat_map(list.append(entry, rest), fn(pair) { pair.1 }),
         origins(sources, prefixes),
+        foreign(sources, prefixes),
       ))
   }
+}
+
+// Every imported Go file, with the types it mirrors renamed the way the
+// declarations were. The Go name stays as it is — that one belongs to the Go
+// file, and the wrapper has to call it what it calls itself.
+fn foreign(
+  sources: List(Source),
+  prefixes: Dict(String, String),
+) -> List(ast.Foreign) {
+  list.flat_map(sources, fn(src) {
+    let prefix = dict.get(prefixes, src.key) |> result.unwrap("")
+    list.map(src.module.foreign, fn(f) {
+      ast.Foreign(
+        ..f,
+        types: list.map(f.types, fn(pair) { #(prefix <> pair.0, pair.1) }),
+      )
+    })
+  })
 }
 
 // Every declaration's flat name mapped back to how the author wrote it. This is
@@ -277,14 +454,20 @@ fn context(src: Source, exports: Dict(String, Dict(String, String))) {
             Some(name) -> Ok(#(modules, dict.insert(stdlib, imp.alias, name)))
             None -> Error(here(unknown_stdlib(imp.path)))
           }
-        False -> {
-          use key <- result.try(canonical(import_path(src.dir, imp.path)))
-          case dict.get(exports, key) {
-            Ok(dep) -> Ok(#(dict.insert(modules, imp.alias, dep), stdlib))
+        // Resolving already happened — and for a remote import it involved a
+        // network — so the answer is read back from where the walk wrote it
+        // rather than worked out again.
+        False ->
+          case dict.get(src.resolved, imp.path) {
+            Ok(key) ->
+              case dict.get(exports, key) {
+                Ok(dep) -> Ok(#(dict.insert(modules, imp.alias, dep), stdlib))
+                Error(_) ->
+                  Error(here("could not resolve `import " <> imp.path <> "`"))
+              }
             Error(_) ->
               Error(here("could not resolve `import " <> imp.path <> "`"))
           }
-        }
       }
     }),
   )
@@ -329,6 +512,7 @@ fn declared_names(decls: List(ast.Decl)) -> List(String) {
       ast.ProcDecl(name, _, _, _)
       | ast.FuncDecl(name, _, _, _)
       | ast.QueryDecl(name, _, _, _)
+      | ast.ForeignDecl(name, _, _, _, _, _)
       | ast.TypeDecl(name, _, _) -> Ok(name)
       ast.TestDecl(..) -> Error(Nil)
     }
@@ -475,6 +659,14 @@ fn rewrite_decl(rw: Rw, decl: ast.Decl) -> Result(ast.Decl, String) {
       )
       use commons <- result.try(rewrite_fields(rw, commons))
       Ok(ast.TypeDecl(flat(rw, name), variants, commons))
+    }
+    // A Go function's signature is rewritten like any other — the types in it may
+    // name this module's own mirrored structs, which are being renamed too. There
+    // is no body: it is in the Go file, and the Go file names nothing of Hive's.
+    ast.ForeignDecl(name, params, ret, pkg, symbol, results) -> {
+      use params <- result.try(rewrite_fields(rw, params))
+      use ret <- result.try(rewrite_type(rw, ret))
+      Ok(ast.ForeignDecl(flat(rw, name), params, ret, pkg, symbol, results))
     }
   }
 }

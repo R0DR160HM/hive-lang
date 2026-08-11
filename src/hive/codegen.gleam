@@ -38,6 +38,10 @@ pub type Ty {
   TyAtom
   TyTable
   TyResult(ok: Ty, err: Ty)
+  /// `hive.map.Map<K, T>` — the dictionary module's type. Like `Result` its
+  /// arguments say what it holds, and unlike a declared generic it needs no
+  /// monomorphizing: it lowers to Go's own generic `hive.Map[K, V]`.
+  TyMap(key: Ty, value: Ty)
   TyVec(Ty)
   TyCustom(String)
   /// A struct provided by the runtime (`hive.HttpRequest`, ...); the name is
@@ -197,6 +201,7 @@ pub fn builtin_qualifier(name: String) -> String {
     "SqlError" | "SqlConnection" | "DatabaseDriver" -> "hive.sql"
     "Address" | "Envelope" | "SyslinkError" -> "hive.syslink"
     "TimeoutError" -> "hive.task"
+    "Map" -> "hive.map"
     "View" | "Attr" -> "hive.ui"
     "Align" | "Justify" | "TextSize" | "Tone" | "Axis" | "InputKind" | "Icon" ->
       "hive.ui"
@@ -304,6 +309,11 @@ pub type Env {
     /// generated *text* names a declaration back to them — which is a failed
     /// `assert`, quoting the condition that did not hold.
     origins: Dict(String, ast.Origin),
+    /// A type mirrored from an imported Go struct -> the package it came from and
+    /// the name it has there. It is the same struct on both sides, but they are
+    /// two Go *types*, so a value crossing the boundary is converted field by
+    /// field — which is also what copies it.
+    foreign_types: Dict(String, #(String, String)),
   )
 }
 
@@ -333,7 +343,19 @@ pub fn module_env(module: ast.Module) -> Env {
     collect_bodies(module.decls),
     None,
     module.origins,
+    collect_foreign_types(module.foreign),
   )
+}
+
+// Every mirrored type in the program, whichever Go file it came from.
+fn collect_foreign_types(
+  foreign: List(ast.Foreign),
+) -> Dict(String, #(String, String)) {
+  list.fold(foreign, dict.new(), fn(acc, f) {
+    list.fold(f.types, acc, fn(acc, pair) {
+      dict.insert(acc, pair.0, #(f.package_name, pair.1))
+    })
+  })
 }
 
 /// Bind a local into an environment, for passes that walk bodies themselves.
@@ -380,6 +402,9 @@ pub fn generate(module: ast.Module) -> String {
           Ok(gen_fn_decl(env, name, params, ret, body))
         ast.QueryDecl(name, params, ret, sql) ->
           Ok(gen_query_decl(env, name, params, ret, sql))
+        // A Go function's wrapper: the copies in, the call, the copy out.
+        ast.ForeignDecl(name, params, ret, pkg, symbol, results) ->
+          Ok(gen_foreign_decl(env, name, params, ret, pkg, symbol, results))
         // A test is not part of the program. It is emitted into its own file by
         // `generate_tests`, which is compiled only by `hive test`.
         ast.TypeDecl(..) | ast.TestDecl(..) -> Error(Nil)
@@ -396,6 +421,7 @@ pub fn generate(module: ast.Module) -> String {
   let clone_code = gen_clone_support(env, module)
   let less_code = gen_less_support(env, module)
   let row_code = gen_sql_row_support(env, module)
+  let ffi_code = gen_foreign_support(env, module)
 
   let body =
     type_code
@@ -405,8 +431,9 @@ pub fn generate(module: ast.Module) -> String {
     <> less_code
     <> row_code
     <> json_code
+    <> ffi_code
     <> fn_code
-  gen_header(body) <> "\n" <> body
+  gen_header(body, module.foreign) <> "\n" <> body
 }
 
 // ---------------------------------------------------------------------------
@@ -708,7 +735,10 @@ pub fn check_types(module: ast.Module) -> Result(Nil, String) {
       ast.TestDecl(_, body, _, _) ->
         walk_stmts(fn_env(env, [], ast.TVoid), body)
         |> result.map(fn(_) { Nil })
-      ast.TypeDecl(..) -> Ok(Nil)
+      // A Go function has no body here to check. Its *signature* was checked
+      // where it was read (`hive/ffi`), which is the only place that knows what
+      // the Go side actually said.
+      ast.ForeignDecl(..) | ast.TypeDecl(..) -> Ok(Nil)
     }
   })
   |> result.map(fn(_) { Nil })
@@ -815,6 +845,20 @@ fn walk_stmt(env: Env, s: ast.Stmt) -> Result(Env, String) {
     }
     ast.SForEach(name, elem_type, iterable, body) -> {
       use _ <- result.try(walk_expr(env, iterable))
+      // A map is not walked directly: what a turn of the loop would be handed —
+      // the key, the value, or both — is a question the syntax does not ask, and
+      // `keys`/`values` each answer one of them without having to.
+      use _ <- result.try(case infer(env, iterable) {
+        TyMap(_, _) ->
+          Error(
+            "`for each` walks a vector, and this is a map: a turn of the loop "
+            <> "would have to be handed the key or the value, and `for each "
+            <> name
+            <> " in ...` does not say which. Walk `hive.map.keys(m)` and look each one "
+            <> "up, or `hive.map.values(m)` when the keys are not what you need.",
+          )
+        _ -> Ok(Nil)
+      })
       let elem_ty = case elem_type {
         Some(t) -> ty_of_type_expr(env.types, t)
         None -> elem_ty_of(infer(env, iterable))
@@ -861,6 +905,10 @@ fn walk_expr(env: Env, e: ast.Expr) -> Result(Nil, String) {
   use _ <- result.try(check_walk_call(env, e))
   use _ <- result.try(check_sort_call(env, e))
   use _ <- result.try(check_mut_args(env, e))
+  use _ <- result.try(check_bytes_arg(env, e))
+  use _ <- result.try(check_map_call_types(env, e))
+  use _ <- result.try(check_vector_builtin_subject(env, e))
+  use _ <- result.try(check_json_encode_arg(env, e))
   case e {
     ast.EInt(_)
     | ast.EFloat(_)
@@ -1290,6 +1338,15 @@ fn walk_elem_ty(env: Env, name: String, subject: ast.Expr) -> Result(Ty, String)
         <> "characters, which `[...]` and `len` treat as a unit. Use "
         <> "`split(s, sep)` to get a vector of its pieces first.",
       )
+    TyMap(_, _) ->
+      Error(
+        "`"
+        <> name
+        <> "` walks a vector, and a map is not one: a turn of the walk would "
+        <> "have to be handed the key or the value, and the call does not say "
+        <> "which. Walk `hive.map.keys(m)` or `hive.map.values(m)` — each is an ordinary vector, "
+        <> "in the order the map's keys were set.",
+      )
     other ->
       Error(
         "`"
@@ -1503,6 +1560,11 @@ fn no_order_reason(env: Env, ty: Ty, seen: List(String)) -> String {
     TyUnknown -> "the element type is not known here"
     TyFunc(_, _, _) -> "a function value has no order"
     TyAddress(_) -> "a service address has no order"
+    // The order a map keeps is the order its own keys were set in. That is a
+    // way of reading one map back, not a rank two of them can be put in.
+    TyMap(_, _) ->
+      "a map has no order — the one it keeps is the order its keys were set in, "
+      <> "which says nothing about how two maps compare"
     TyBuiltin(name) ->
       "`hive."
       <> name
@@ -1776,8 +1838,253 @@ fn check_indexable(env: Env, e: ast.Expr) -> Result(Nil, String) {
             <> "find one, or a string pattern (`s is \"{head}/{tail}\"`) to "
             <> "take it apart.",
           )
+        // A map is not addressed by position: `[...]` is an index, and a map has
+        // keys. Nor is a key an index — a missing one is an ordinary answer, so
+        // the lookup hands back a Result rather than reading somewhere.
+        TyMap(key, _) ->
+          Error(
+            "a map cannot be "
+            <> what
+            <> ": `[...]` takes a position, and a map has keys rather than "
+            <> "positions. Use `hive.map.get(m, key)`, which answers with a "
+            <> "`Result` because the key may not be there — or `hive.map.keys(m)`/"
+            <> "`hive.map.values(m)` for a vector you can index. (A `"
+            <> show_ty(key)
+            <> "` key is not an index even when it is an `Int`.)",
+          )
         _ -> Ok(Nil)
       }
+  }
+}
+
+// Every `hive.map` call, held to the map it was given: the key it is looked up
+// by and the value it is handed have to be the ones the map was declared to
+// hold, and the first argument has to be a map at all.
+//
+// Arities and argument *names* are the validation pass's business
+// (`check_map_call` there); what needs the inferred types is here.
+fn check_map_call_types(env: Env, e: ast.Expr) -> Result(Nil, String) {
+  case e {
+    ast.ECall(ast.EMember(ast.EMember(ast.EIdent("hive"), "map"), fname), args) ->
+      case fname {
+        "new" -> Ok(Nil)
+        // The one call that takes a Table rather than a map.
+        "fromTable" ->
+          case assign_args(args, ["table"]) {
+            #([#(_, table)], _) ->
+              check_map_arg_ty(
+                env,
+                table,
+                TyTable,
+                "the table `hive.map.fromTable` reads",
+              )
+            _ -> Ok(Nil)
+          }
+        _ -> {
+          use #(key_ty, value_ty) <- result.try(check_map_subject(
+            env,
+            fname,
+            args,
+          ))
+          use _ <- result.try(case assign_args(args, ["map", "key"]) {
+            #([_, #(_, key)], _) ->
+              check_map_arg_ty(
+                env,
+                key,
+                key_ty,
+                "the key `hive.map." <> fname <> "` looks up",
+              )
+            _ -> Ok(Nil)
+          })
+          case fname, assign_args(args, ["map", "key", "value"]) {
+            "set", #([_, _, #(_, value)], _) ->
+              check_map_arg_ty(
+                env,
+                value,
+                value_ty,
+                "the value `hive.map.set` stores",
+              )
+            _, _ -> Ok(Nil)
+          }
+        }
+      }
+    _ -> Ok(Nil)
+  }
+}
+
+// The map a call is about, and what it holds. `toTable` is the one call that
+// asks for particular contents rather than working with whatever the map holds:
+// a Table's cells are Strs, so that is what its pairs have to be.
+fn check_map_subject(
+  env: Env,
+  fname: String,
+  args: List(ast.Arg),
+) -> Result(#(Ty, Ty), String) {
+  case assign_args(args, ["map"]) {
+    #([#(_, m)], _) ->
+      case infer(env, m) {
+        TyMap(key, value) ->
+          case fname, key, value {
+            "toTable", TyStr, TyStr -> Ok(#(key, value))
+            "toTable", _, _ ->
+              Error(
+                "`hive.map.toTable` makes a Table, whose cells are `Str`s, and "
+                <> "this is a `"
+                <> show_ty(TyMap(key, value))
+                <> "`. Convert as you build the rows — walk `hive.map.keys(m)` and "
+                <> "render each value (`hive.conv.its`, `hive.conv.fts`) into a "
+                <> "row of your own.",
+              )
+            _, _, _ -> Ok(#(key, value))
+          }
+        TyUnknown -> Ok(#(TyUnknown, TyUnknown))
+        other ->
+          Error(
+            "`hive.map."
+            <> fname
+            <> "` takes a map as its first argument, and this is a `"
+            <> show_ty(other)
+            <> "`. A map is made with `hive.map.new()` and declared "
+            <> "`hive.map.Map<K, T>`.",
+          )
+      }
+    _ -> Ok(#(TyUnknown, TyUnknown))
+  }
+}
+
+fn check_map_arg_ty(
+  env: Env,
+  arg: ast.Expr,
+  expect: Ty,
+  where: String,
+) -> Result(Nil, String) {
+  let actual = infer(env, arg)
+  case ty_accepts(expect, actual) {
+    True -> Ok(Nil)
+    False ->
+      Error(
+        where
+        <> " is a `"
+        <> show_ty(expect)
+        <> "`, and this is a `"
+        <> show_ty(actual)
+        <> "`.",
+      )
+  }
+}
+
+// `hive.json.encode` renders a value as JSON, and a map has no JSON form here:
+// decoding is by declared shape, and a map's keys are whatever was put in it, so
+// what this encoded could never be read back. The pass that rejects a map *field*
+// in a decode target says the same thing (`check_decodable_field` in
+// `hive/compiler`); this is the direct call, where the type is inferred rather
+// than declared.
+fn check_json_encode_arg(env: Env, e: ast.Expr) -> Result(Nil, String) {
+  case e {
+    ast.ECall(
+      ast.EMember(ast.EMember(ast.EIdent("hive"), "json"), "encode"),
+      args,
+    ) ->
+      case assign_args(args, ["value"]) {
+        #([#(_, value)], _) ->
+          case ty_carries_map(env, infer(env, value), []) {
+            False -> Ok(Nil)
+            True ->
+              Error(
+                "`hive.json.encode` cannot encode a `"
+                <> show_ty(infer(env, value))
+                <> "`: a map's keys are whatever was put in it, so nothing could "
+                <> "decode the object this produced back into one. Encode "
+                <> "`hive.map.toTable(m)` — a Table of key/value rows, which "
+                <> "reads back as a map with `hive.map.fromTable` — or a vector "
+                <> "of a declared type whose fields are named.",
+              )
+          }
+        _ -> Ok(Nil)
+      }
+    _ -> Ok(Nil)
+  }
+}
+
+// Whether an inferred type is, or holds, a map.
+fn ty_carries_map(env: Env, ty: Ty, seen: List(String)) -> Bool {
+  case ty {
+    TyMap(_, _) -> True
+    TyVec(elem) -> ty_carries_map(env, elem, seen)
+    TyResult(ok, err) ->
+      ty_carries_map(env, ok, seen) || ty_carries_map(env, err, seen)
+    TyCustom(name) ->
+      case list.contains(seen, name), dict.get(env.types, name) {
+        False, Ok(ast.TypeDecl(_, variants, commons)) ->
+          list.append(list.flat_map(variants, fn(v) { v.fields }), commons)
+          |> list.any(fn(f) {
+            ty_carries_map(env, ty_of_type_expr(env.types, f.typ), [
+              name,
+              ..seen
+            ])
+          })
+        _, _ -> False
+      }
+    _ -> False
+  }
+}
+
+// A map where a vector belongs. Each of these builtins is about elements in an
+// order — putting one at an end, joining them, finding a position — and a map
+// has keys instead of positions. `len` is the exception: it counts pairs, which
+// is the same question it answers about a vector.
+fn check_vector_builtin_subject(env: Env, e: ast.Expr) -> Result(Nil, String) {
+  case e {
+    ast.ECall(ast.EMember(ast.EIdent("hive"), name), [ast.Arg(_, subject), ..]) ->
+      case is_vector_builtin(name), infer(env, subject) {
+        True, TyMap(key, value) ->
+          Error(
+            "`"
+            <> name
+            <> "` works on a vector, and this is a map. Its pairs are reached "
+            <> "through `hive.map` — `get`/`set`/`has`/`delete` by key, and "
+            <> "`hive.map.keys(m)`/`hive.map.values(m)` for a `"
+            <> show_ty(key)
+            <> "[dyn]`/`"
+            <> show_ty(value)
+            <> "[dyn]` you can use `"
+            <> name
+            <> "` on.",
+          )
+        _, _ -> Ok(Nil)
+      }
+    _ -> Ok(Nil)
+  }
+}
+
+// The builtins whose first argument is the vector they work on. `map`, `filter`,
+// `filterMap` and `sort` are left out: each has a check of its own that already
+// says what it wanted and got.
+fn is_vector_builtin(name: String) -> Bool {
+  case name {
+    "append" | "prepend" | "drop" | "join" | "row" | "column" | "indexOf" ->
+      True
+    _ -> False
+  }
+}
+
+// `bytes` reports a footprint: a Str's UTF-8 length, or a vector's contiguous
+// storage. A map has neither — its pairs are spread across a lookup — and
+// answering with the size of the key order would be answering a different
+// question.
+fn check_bytes_arg(env: Env, e: ast.Expr) -> Result(Nil, String) {
+  case e {
+    ast.ECall(ast.EMember(ast.EIdent("hive"), "bytes"), [ast.Arg(_, arg)]) ->
+      case infer(env, arg) {
+        TyMap(_, _) ->
+          Error(
+            "`bytes` counts a `Str`'s UTF-8 bytes or a vector's storage, and a "
+            <> "map is neither: its pairs do not sit in one contiguous run. Use "
+            <> "`len(m)` for how many pairs it holds.",
+          )
+        _ -> Ok(Nil)
+      }
+    _ -> Ok(Nil)
   }
 }
 
@@ -2193,7 +2500,7 @@ fn uses_json_module(module: ast.Module) -> Bool {
       // The generated helpers live in `main.go`, and the test file is the same
       // Go package, so a test reaching for JSON needs them emitted too.
       ast.TestDecl(_, body, _, _) -> uses_json_stmts(body)
-      ast.TypeDecl(..) -> False
+      ast.ForeignDecl(..) | ast.TypeDecl(..) -> False
     }
   })
 }
@@ -2310,6 +2617,10 @@ fn collect_fns(
         dict.insert(acc, name, #(True, params, ret))
       ast.QueryDecl(name, params, ret, _) ->
         dict.insert(acc, name, #(True, params, ret))
+      // A Go function is a `func`: every value crossing the boundary is copied,
+      // so it cannot write to storage its caller can see.
+      ast.ForeignDecl(name, params, ret, _, _, _) ->
+        dict.insert(acc, name, #(True, params, ret))
       // Nothing calls a test, so it is in no table of things that can be called.
       ast.TypeDecl(..) | ast.TestDecl(..) -> acc
     }
@@ -2324,7 +2635,8 @@ fn collect_sigs(
     case d {
       ast.ProcDecl(name, params, ret, _)
       | ast.FuncDecl(name, params, ret, _)
-      | ast.QueryDecl(name, params, ret, _) -> {
+      | ast.QueryDecl(name, params, ret, _)
+      | ast.ForeignDecl(name, params, ret, _, _, _) -> {
         let ptys =
           list.map(params, fn(p) { #(p.name, ty_of_type_expr(types, p.typ)) })
         dict.insert(acc, name, #(ptys, ty_of_type_expr(types, ret)))
@@ -2354,7 +2666,9 @@ fn collect_atoms(module: ast.Module) -> List(String) {
         // There is one atom table for the whole package, and the test file reads
         // it, so an atom only a test names still has to be in it.
         ast.TestDecl(_, body, _, _) -> atoms_in_stmts(body, acc)
-        ast.TypeDecl(..) -> acc
+        // A Go signature names no atoms: an atom has no Go counterpart, so one
+        // never reaches the boundary.
+        ast.ForeignDecl(..) | ast.TypeDecl(..) -> acc
       }
     })
   let customs =
@@ -2504,7 +2818,7 @@ fn gen_atom_setup(table: List(String)) -> String {
 // Header / imports (inferred by scanning the generated body)
 // ---------------------------------------------------------------------------
 
-fn gen_header(body: String) -> String {
+fn gen_header(body: String, foreign: List(ast.Foreign)) -> String {
   let imports =
     list.flatten([
       case string.contains(body, "fmt.") {
@@ -2515,6 +2829,18 @@ fn gen_header(body: String) -> String {
         True -> ["\t\"" <> runtime.go_module <> "/hive\""]
         False -> []
       },
+      // Each imported Go file is a package of its own inside the generated
+      // project, imported under the name that is also its directory — so what
+      // the wrappers call reads as the file it came from.
+      list.map(foreign, fn(f) {
+        "\t"
+        <> f.package_name
+        <> " \""
+        <> runtime.go_module
+        <> "/"
+        <> f.package_name
+        <> "\""
+      }),
     ])
 
   let import_block = case imports {
@@ -2532,6 +2858,15 @@ fn gen_header(body: String) -> String {
 pub fn ty_of_type_expr(types: Dict(String, ast.Decl), t: ast.TypeExpr) -> Ty {
   case t {
     ast.TVoid -> TyUnknown
+    // `hive.map.Map<K, T>` — the other builtin whose arguments say what it
+    // holds. It is matched ahead of the table below because that one reads a
+    // type's *fields*, and a map has none to read: it is reached through
+    // `hive.map`'s calls, never taken apart.
+    ast.TName(Some("hive.map"), "Map", [key, value], dims) ->
+      wrap_dims(
+        TyMap(ty_of_type_expr(types, key), ty_of_type_expr(types, value)),
+        dims,
+      )
     // A builtin type, resolved only through its own namespace
     // (`hive.net.HttpRequest`, `hive.TableError`). A wrong or bare qualifier
     // does not resolve.
@@ -2624,6 +2959,15 @@ fn gen_type(t: ast.TypeExpr) -> String {
       <> ", "
       <> gen_type(err)
       <> "]"
+    // `hive.map.Map<K, T>` lowers to the module's own generic struct, which is
+    // where the key order lives beside the lookup.
+    ast.TName(Some("hive.map"), "Map", [key, value], dims) ->
+      string.repeat("[]", list.length(dims))
+      <> "hive.Dict["
+      <> gen_type(key)
+      <> ", "
+      <> gen_type(value)
+      <> "]"
     // Every other type argument is substituted away by monomorphization, so
     // nothing else reaches codegen still carrying one.
     ast.TName(pkg, name, _, dims) -> {
@@ -2670,6 +3014,8 @@ fn ty_to_go(ty: Ty) -> String {
     TyBuiltin(name) -> "hive." <> name
     TyResult(ok, err) ->
       "hive.Result[" <> ty_to_go(ok) <> ", " <> ty_to_go(err) <> "]"
+    TyMap(key, value) ->
+      "hive.Dict[" <> ty_to_go(key) <> ", " <> ty_to_go(value) <> "]"
     TyFunc(_, params, ret) -> {
       let ps = params |> list.map(ty_to_go) |> string.join(", ")
       let r = case ret {
@@ -2703,6 +3049,8 @@ fn show_ty(ty: Ty) -> String {
     TyBuiltin(name) -> builtin_qualifier(name) <> "." <> name
     TyVec(elem) -> show_ty(elem) <> "[]"
     TyResult(ok, err) -> "Result<" <> show_ty(ok) <> ", " <> show_ty(err) <> ">"
+    TyMap(key, value) ->
+      "hive.map.Map<" <> show_ty(key) <> ", " <> show_ty(value) <> ">"
     TyFunc(pure, params, ret) ->
       case pure {
         True -> "func("
@@ -4649,6 +4997,24 @@ fn infer_other_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> Ty {
                   TyResult(TyBuiltin("SqlConnection"), TyBuiltin("SqlError"))
                 _ -> TyUnknown
               }
+            "map" ->
+              case fname {
+                // Both of these are read off the map itself: what a `get`
+                // answers with and what `keys`/`values` hold is whatever the
+                // map was declared to hold.
+                "get" ->
+                  TyResult(map_arg_tys(env, args).1, TyBool)
+                "keys" -> TyVec(map_arg_tys(env, args).0)
+                "values" -> TyVec(map_arg_tys(env, args).1)
+                "has" -> TyBool
+                "fromTable" -> TyMap(TyStr, TyStr)
+                "toTable" -> TyTable
+                // `new` has no type of its own: the slot it lands in decides,
+                // and validation refuses it where there is no slot to read.
+                "new" -> TyUnknown
+                // `set` and `delete` are void statements.
+                _ -> TyVoid
+              }
             "conv" ->
               case fname {
                 "ceil" | "floor" | "round" -> TyInt
@@ -5292,6 +5658,15 @@ fn coerce(env: Env, e: ast.Expr, expect: Ty) -> String {
       gen_result_ctor(env, variant, args, ok, err)
     TyVec(elem), ast.EVector(items) -> gen_vector(env, items, elem)
     TyTable, ast.EVector(items) -> gen_vector(env, items, TyVec(TyStr))
+    // `hive.map.new()` is the empty map, and the slot it lands in is what says
+    // what it holds — the same way `[]` gets its element type from the slot
+    // rather than from itself.
+    TyMap(key, value),
+      ast.ECall(
+        ast.EMember(ast.EMember(ast.EIdent("hive"), "map"), "new"),
+        [],
+      )
+    -> "hive.NewDict[" <> ty_to_go(key) <> ", " <> ty_to_go(value) <> "]()"
     TyStr, _ ->
       case infer(env, e) {
         TyAtom -> "hive.AtomToStr(" <> gen_expr(env, e) <> ")"
@@ -5375,10 +5750,25 @@ fn gen_equality(env: Env, l: ast.Expr, r: ast.Expr, positive: Bool) -> String {
       _ -> False
     }
   }
-  case is_vec(infer(env, l)) && is_vec(infer(env, r)) {
+  let is_map = fn(t) {
+    case t {
+      TyMap(_, _) -> True
+      _ -> False
+    }
+  }
+  let #(left, right) = #(infer(env, l), infer(env, r))
+  // Two maps compare as the pairs they hold, ignoring the order they were
+  // written in. Go cannot compare a map with `==` any more than it can a slice,
+  // and a map against anything else falls through below to be rejected by the
+  // Go compiler rather than quietly answering `false`.
+  case is_vec(left) && is_vec(right) || is_map(left) && is_map(right) {
     True -> {
+      let helper = case is_map(left) {
+        True -> "hive.DictEq("
+        False -> "hive.VecEq("
+      }
       let call =
-        "hive.VecEq(" <> gen_expr(env, l) <> ", " <> gen_expr(env, r) <> ")"
+        helper <> gen_expr(env, l) <> ", " <> gen_expr(env, r) <> ")"
       case positive {
         True -> call
         False -> "!" <> call
@@ -5671,7 +6061,10 @@ fn needs_deep_copy_ty(env: Env, ty: Ty) -> Bool {
 
 fn is_deep_ty(env: Env, ty: Ty, seen: List(String)) -> Bool {
   case ty {
-    TyVec(_) | TyTable -> True
+    // A map owns its storage whatever it holds: the lookup behind it is a Go
+    // map, which shares like a slice does, so `b := a` on one has to copy for
+    // the same reason a vector does.
+    TyVec(_) | TyTable | TyMap(_, _) -> True
     TyCustom(name) ->
       case list.contains(seen, name) {
         // A recursive field reaches back to a type already being examined; it
@@ -5727,12 +6120,336 @@ fn gen_clone(env: Env, ty: Ty, rendered: String, depth: Int) -> String {
         }
       }
     TyTable -> "hive.CloneTable(" <> rendered <> ")"
+    // A map's keys are scalars (or scalar structs), so only its values can own
+    // storage of their own — the same two cases a vector has, reached through
+    // the map's own helpers.
+    TyMap(_, value) ->
+      case needs_deep_copy_ty(env, value) {
+        False -> "hive.CloneDict(" <> rendered <> ")"
+        True -> {
+          let v = "v" <> int.to_string(depth)
+          let go = ty_to_go(value)
+          "hive.CloneDictFn("
+          <> rendered
+          <> ", func("
+          <> v
+          <> " "
+          <> go
+          <> ") "
+          <> go
+          <> " { return "
+          <> gen_clone(env, value, v, depth + 1)
+          <> " })"
+        }
+      }
     TyCustom(name) ->
       case needs_deep_copy_ty(env, ty) {
         True -> "clone_" <> name <> "(" <> rendered <> ")"
         False -> rendered
       }
     _ -> rendered
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Calling Go
+// ---------------------------------------------------------------------------
+// An imported Go file is compiled as a package of its own inside the generated
+// project, and each function Hive reaches in it gets a wrapper of the flat name
+// the rest of the program calls.
+//
+// The wrapper's whole job is the boundary. Every value handed to Go is copied on
+// the way in and everything Go answers with is copied on the way out, so a Go
+// body holding on to a slice — or writing through one — cannot reach a Hive
+// value. That is what makes a Go function a `func` here: what a `func` promises
+// is that it cannot write to storage its caller can see, and nothing on the far
+// side of a copy can.
+//
+// The types are the same shape on both sides (`hive/ffi` allows nothing else),
+// so a crossing is a copy rather than a translation. Three of them are not the
+// same Go *type*, and those convert:
+//
+//   * a map — `hive.Dict[K, V]` here, `map[K]V` there. Coming back it has to be
+//     given an order, and a Go map has none to give, so its keys arrive sorted.
+//   * a mirrored struct — the same fields, but two named types, so field by field.
+//   * a vector of either of those, element by element.
+
+fn gen_foreign_decl(
+  env: Env,
+  name: String,
+  params: List(ast.Field),
+  ret: ast.TypeExpr,
+  pkg: String,
+  symbol: String,
+  go_results: Int,
+) -> String {
+  let arguments =
+    params
+    |> list.map(fn(p) {
+      let ty = ty_of_type_expr(env.types, p.typ)
+      into_go(env, ty, escape_ident(p.name), 0)
+    })
+    |> string.join(", ")
+  let call = pkg <> "." <> symbol <> "(" <> arguments <> ")"
+  let signature =
+    "func " <> escape_ident(name) <> "(" <> gen_params(params) <> ")"
+  case ret {
+    ast.TVoid -> signature <> " {\n\t" <> call <> "\n}\n"
+    _ -> {
+      let ty = ty_of_type_expr(env.types, ret)
+      let body = case ty, go_results {
+        // `(T, error)` and a lone `error` are both how a Go function reports
+        // failure, and a `Result` is how Hive answers — so the values are taken
+        // apart here and put back together as one. Which of the two shapes it is
+        // cannot be read off the Hive type (`error` alone and `(bool, error)` are
+        // both a `Result<Bool, Str>`), so the Go side's own count decides.
+        TyResult(ok, _), 1 -> gen_foreign_error_only(ok, call)
+        TyResult(ok, _), _ -> gen_foreign_result(env, ok, call)
+        _, _ -> "\treturn " <> out_of_go(env, ty, call, 0) <> "\n"
+      }
+      signature <> " " <> gen_type(ret) <> " {\n" <> body <> "}\n"
+    }
+  }
+}
+
+// The two-value call, as one `Result`. A Go `error` carries a string and nothing
+// else — `err.Error()` — so that string is the error payload.
+fn gen_foreign_result(env: Env, ok: Ty, call: String) -> String {
+  "\tvalue, err := "
+  <> call
+  <> "\n\tif err != nil {\n\t\treturn "
+  <> gen_err(ok)
+  <> "(err.Error())\n\t}\n\treturn "
+  <> gen_ok(ok)
+  <> "("
+  <> out_of_go(env, ok, "value", 0)
+  <> ")\n"
+}
+
+// A Go function whose only answer is an `error` either worked or it did not, so
+// the `Ok` carries `true`: there was nothing else for it to carry.
+fn gen_foreign_error_only(ok: Ty, call: String) -> String {
+  "\tif err := "
+  <> call
+  <> "; err != nil {\n\t\treturn "
+  <> gen_err(ok)
+  <> "(err.Error())\n\t}\n\treturn "
+  <> gen_ok(ok)
+  <> "(true)\n"
+}
+
+fn gen_ok(ok: Ty) -> String {
+  "hive.Ok[" <> ty_to_go(ok) <> ", string]"
+}
+
+fn gen_err(ok: Ty) -> String {
+  "hive.Err[" <> ty_to_go(ok) <> ", string]"
+}
+
+// A Hive value as the Go one the imported function takes. Every branch produces
+// fresh storage: what the Go side receives is never storage a Hive value names.
+fn into_go(env: Env, ty: Ty, rendered: String, depth: Int) -> String {
+  case ty {
+    TyStr | TyInt | TyFloat | TyBool ->
+      // A scalar is copied by being passed. A Go string is immutable, so there
+      // is nothing in one to share.
+      rendered
+    TyTable -> "hive.CloneTable(" <> rendered <> ")"
+    TyVec(elem) ->
+      case foreign_shape_differs(env, elem) {
+        False -> "hive.CloneVec(" <> rendered <> ")"
+        True -> {
+          let e = "e" <> int.to_string(depth)
+          "hive.Map("
+          <> rendered
+          <> ", func("
+          <> e
+          <> " "
+          <> ty_to_go(elem)
+          <> ") "
+          <> foreign_go_type(env, elem)
+          <> " { return "
+          <> into_go(env, elem, e, depth + 1)
+          <> " })"
+        }
+      }
+    TyMap(_, value) ->
+      case foreign_shape_differs(env, value) {
+        False -> "hive.DictToGo(" <> rendered <> ")"
+        True -> {
+          let v = "v" <> int.to_string(depth)
+          "hive.DictToGoFn("
+          <> rendered
+          <> ", func("
+          <> v
+          <> " "
+          <> ty_to_go(value)
+          <> ") "
+          <> foreign_go_type(env, value)
+          <> " { return "
+          <> into_go(env, value, v, depth + 1)
+          <> " })"
+        }
+      }
+    TyCustom(name) -> "toFfi_" <> name <> "(" <> rendered <> ")"
+    // Nothing else reaches a boundary: `hive/ffi` maps a Go signature onto these
+    // types and refuses everything it cannot.
+    _ -> rendered
+  }
+}
+
+// The other direction: what the Go function answered with, as the Hive value.
+fn out_of_go(env: Env, ty: Ty, rendered: String, depth: Int) -> String {
+  case ty {
+    TyStr | TyInt | TyFloat | TyBool -> rendered
+    TyTable -> "hive.CloneTable(" <> rendered <> ")"
+    TyVec(elem) ->
+      case foreign_shape_differs(env, elem) {
+        False -> "hive.CloneVec(" <> rendered <> ")"
+        True -> {
+          let e = "e" <> int.to_string(depth)
+          "hive.Map("
+          <> rendered
+          <> ", func("
+          <> e
+          <> " "
+          <> foreign_go_type(env, elem)
+          <> ") "
+          <> ty_to_go(elem)
+          <> " { return "
+          <> out_of_go(env, elem, e, depth + 1)
+          <> " })"
+        }
+      }
+    // A Go map has no order of its own — it iterates differently every run — so
+    // the pairs are read back in key order. That is a choice the boundary has to
+    // make, and it is the only one that gives the same program the same output
+    // twice.
+    TyMap(key, value) ->
+      case foreign_shape_differs(env, value) {
+        False ->
+          "hive.DictFromGo("
+          <> rendered
+          <> ", "
+          <> gen_key_order(key)
+          <> ")"
+        True -> {
+          let v = "v" <> int.to_string(depth)
+          "hive.DictFromGoFn("
+          <> rendered
+          <> ", "
+          <> gen_key_order(key)
+          <> ", func("
+          <> v
+          <> " "
+          <> foreign_go_type(env, value)
+          <> ") "
+          <> ty_to_go(value)
+          <> " { return "
+          <> out_of_go(env, value, v, depth + 1)
+          <> " })"
+        }
+      }
+    TyCustom(name) -> "fromFfi_" <> name <> "(" <> rendered <> ")"
+    _ -> rendered
+  }
+}
+
+// The comparison that puts a map's keys in order. `hive/ffi` allows only the
+// scalars below as a Go map's key, which is exactly the set that has one.
+fn gen_key_order(key: Ty) -> String {
+  let go = ty_to_go(key)
+  case key {
+    // `false` before `true`, which is the order they compare in everywhere else.
+    TyBool -> "func(a, b bool) bool { return !a && b }"
+    _ -> "func(a, b " <> go <> ") bool { return a < b }"
+  }
+}
+
+// Whether a type is a different Go *type* on the two sides, which is what
+// decides between copying a value and converting it. A map is (Dict against a Go
+// map), a mirrored struct is (two named structs), and a vector is whenever its
+// elements are.
+fn foreign_shape_differs(env: Env, ty: Ty) -> Bool {
+  case ty {
+    TyMap(_, _) -> True
+    TyCustom(name) -> dict.has_key(env.foreign_types, name)
+    TyVec(elem) -> foreign_shape_differs(env, elem)
+    _ -> False
+  }
+}
+
+// The Go spelling of a type on the *imported file's* side of the boundary.
+fn foreign_go_type(env: Env, ty: Ty) -> String {
+  case ty {
+    TyMap(key, value) ->
+      "map[" <> ty_to_go(key) <> "]" <> foreign_go_type(env, value)
+    TyVec(elem) -> "[]" <> foreign_go_type(env, elem)
+    TyCustom(name) ->
+      case dict.get(env.foreign_types, name) {
+        Ok(#(pkg, go_name)) -> pkg <> "." <> go_name
+        Error(_) -> name
+      }
+    other -> ty_to_go(other)
+  }
+}
+
+// A pair of converters for every mirrored struct: the same fields, walked one at
+// a time, which is what copies them as well as re-types them.
+fn gen_foreign_support(env: Env, module: ast.Module) -> String {
+  module.foreign
+  |> list.flat_map(fn(f) {
+    list.map(f.types, fn(pair) {
+      let #(name, go_name) = pair
+      let there = f.package_name <> "." <> go_name
+      let fields = mirrored_fields(env, name)
+      "func toFfi_"
+      <> name
+      <> "(v "
+      <> name
+      <> ") "
+      <> there
+      <> " {\n\treturn "
+      <> there
+      <> "{"
+      <> gen_foreign_fields(env, fields, True)
+      <> "}\n}\n\nfunc fromFfi_"
+      <> name
+      <> "(v "
+      <> there
+      <> ") "
+      <> name
+      <> " {\n\treturn "
+      <> name
+      <> "{"
+      <> gen_foreign_fields(env, fields, False)
+      <> "}\n}\n"
+    })
+  })
+  |> string.join("\n")
+}
+
+fn gen_foreign_fields(env: Env, fields: List(ast.Field), into: Bool) -> String {
+  fields
+  |> list.map(fn(field) {
+    let ty = ty_of_type_expr(env.types, field.typ)
+    let go_name = exported(field.name)
+    let read = "v." <> go_name
+    let value = case into {
+      True -> into_go(env, ty, read, 0)
+      False -> out_of_go(env, ty, read, 0)
+    }
+    go_name <> ": " <> value
+  })
+  |> string.join(", ")
+}
+
+// A mirrored struct is a plain struct — one variant's worth of fields, all of
+// them common — so this is where they are.
+fn mirrored_fields(env: Env, name: String) -> List(ast.Field) {
+  case dict.get(env.types, name) {
+    Ok(ast.TypeDecl(_, _, commons)) -> commons
+    _ -> []
   }
 }
 
@@ -6210,6 +6927,7 @@ fn gen_other_call(env: Env, callee: ast.Expr, args: List(ast.Arg)) -> String {
             "json" -> gen_json_call(env, fname, args)
             "crypto" -> gen_crypto_call(env, fname, args)
             "sql" -> gen_sql_call(env, fname, args)
+            "map" -> gen_map_call(env, fname, args)
             "conv" -> gen_conv_call(env, fname, args)
             "env" -> gen_env_call(env, fname, args)
             "term" -> gen_term_call(env, fname, args)
@@ -7264,6 +7982,116 @@ fn gen_sql_driver(env: Env, variant: String, args: List(ast.Arg)) -> String {
   }
 }
 
+// The `hive.map` namespace: the dictionary.
+//
+// `set` and `delete` take the map's *address*, exactly as `prepend` takes a
+// vector's: both change which keys the map has, which moves the key order — a
+// slice, whose header the caller has to end up holding.
+//
+// Everything a call hands back is the caller's own. `keys` and `toTable` build
+// fresh storage in the runtime, and `values` is copied here when the values are
+// the kind that own storage, so appending to a vector that came out of a map
+// cannot reach back into the map it came from.
+fn gen_map_call(env: Env, fname: String, args: List(ast.Arg)) -> String {
+  case fname {
+    // An empty map's key and value types come from the slot it is landing in,
+    // which `coerce` knows and this does not. Every position that has no such
+    // slot is refused by validation, so this spelling is never what a program
+    // gets — it is here because a Go expression still has to be produced.
+    "new" -> "hive.NewDict[any, any]()"
+    "set" ->
+      case assign_args(args, ["map", "key", "value"]) {
+        #([#(_, m), #(_, key), #(_, value)], []) -> {
+          let #(key_ty, value_ty) = map_tys(env, m)
+          "hive.DictSet("
+          <> gen_mut_arg(env, m)
+          <> ", "
+          <> coerce(env, key, key_ty)
+          <> ", "
+          // The value goes in the way it would go into any parameter: copied
+          // when it is storage the caller can still change, so what the map
+          // holds is the map's.
+          <> gen_arg(env, value, value_ty)
+          <> ")"
+        }
+        _ -> "hive.DictSet(" <> gen_args(env, args) <> ")"
+      }
+    "get" ->
+      case assign_args(args, ["map", "key"]) {
+        #([#(_, m), #(_, key)], []) ->
+          "hive.DictGet("
+          <> gen_expr(env, m)
+          <> ", "
+          <> coerce(env, key, map_tys(env, m).0)
+          <> ")"
+        _ -> "hive.DictGet(" <> gen_args(env, args) <> ")"
+      }
+    "has" ->
+      case assign_args(args, ["map", "key"]) {
+        #([#(_, m), #(_, key)], []) ->
+          "hive.DictHas("
+          <> gen_expr(env, m)
+          <> ", "
+          <> coerce(env, key, map_tys(env, m).0)
+          <> ")"
+        _ -> "hive.DictHas(" <> gen_args(env, args) <> ")"
+      }
+    "delete" ->
+      case assign_args(args, ["map", "key"]) {
+        #([#(_, m), #(_, key)], []) ->
+          "hive.DictDelete("
+          <> gen_mut_arg(env, m)
+          <> ", "
+          <> coerce(env, key, map_tys(env, m).0)
+          <> ")"
+        _ -> "hive.DictDelete(" <> gen_args(env, args) <> ")"
+      }
+    "keys" ->
+      "hive.DictKeys(" <> gen_one_coerced(env, args, "map", TyUnknown) <> ")"
+    "values" ->
+      case assign_args(args, ["map"]) {
+        #([#(_, m)], []) -> {
+          let vector = "hive.DictValues(" <> gen_expr(env, m) <> ")"
+          let value_ty = map_tys(env, m).1
+          case needs_deep_copy_ty(env, value_ty) {
+            False -> vector
+            // Values that own storage are copied out: the map keeps holding
+            // its own, and the vector that came back is independent of it.
+            True -> gen_clone(env, TyVec(value_ty), vector, 0)
+          }
+        }
+        _ -> "hive.DictValues(" <> gen_args(env, args) <> ")"
+      }
+    "fromTable" ->
+      "hive.DictFromTable("
+      <> gen_one_coerced(env, args, "table", TyTable)
+      <> ")"
+    "toTable" ->
+      "hive.DictToTable("
+      <> gen_one_coerced(env, args, "map", TyMap(TyStr, TyStr))
+      <> ")"
+    _ -> "hive." <> exported(fname) <> "(" <> gen_args(env, args) <> ")"
+  }
+}
+
+// The key and value types of a map expression, or unknowns when it is not a map
+// (which validation has already reported).
+fn map_tys(env: Env, m: ast.Expr) -> #(Ty, Ty) {
+  case infer(env, m) {
+    TyMap(key, value) -> #(key, value)
+    _ -> #(TyUnknown, TyUnknown)
+  }
+}
+
+// The same pair read off a `hive.map` call's arguments: every call in the module
+// takes the map first, however the call was written.
+fn map_arg_tys(env: Env, args: List(ast.Arg)) -> #(Ty, Ty) {
+  case assign_args(args, ["map"]) {
+    #([#(_, m)], _) -> map_tys(env, m)
+    _ -> #(TyUnknown, TyUnknown)
+  }
+}
+
 // The `hive.conv` namespace: numeric rounding (ceil/floor/round), widening
 // (itf), rendering (its/fts) and fallible parsing (sti/stf). Each takes a
 // single argument, coerced to the type its Go helper expects.
@@ -7516,12 +8344,14 @@ fn partial_ty(env: Env, name: String, args: List(ast.Arg)) -> Ty {
 // its own declaration of the name.
 fn gen_global_builtin(env: Env, name: String, args: List(ast.Arg)) -> String {
   case name {
-    // `len` counts elements of a vector but characters (runes) of a Str.
+    // `len` counts elements of a vector, characters (runes) of a Str, and pairs
+    // of a map.
     "len" ->
       case args {
         [ast.Arg(_, arg)] ->
           case infer(env, arg) {
             TyStr -> "hive.StrLen(" <> gen_expr(env, arg) <> ")"
+            TyMap(_, _) -> "hive.DictLen(" <> gen_expr(env, arg) <> ")"
             _ -> "len(" <> gen_expr(env, arg) <> ")"
           }
         _ -> "len(" <> gen_args(env, args) <> ")"
