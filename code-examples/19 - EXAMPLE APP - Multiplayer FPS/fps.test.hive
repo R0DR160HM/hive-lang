@@ -24,8 +24,20 @@ import hive.math
 // a player at the origin would be *inside* it — unable to walk, unable to jump
 // without hitting their head, and unable to shoot anything but the block they are
 // standing in. Every test below reads better from somewhere there is room.
+// The seed these tests are played on.
+//
+// The map is a `func` of it, so a fixed seed is a fixed map and every coordinate
+// below means the same thing on every run and every machine — which is the other
+// half of what generating a world out of a number buys you. The yard is the same on
+// every map anyway; the tests that are about the *generator* rather than about this
+// one map loop over seeds instead of using this.
+func seeded(): Int {
+	return 4242
+}
+
 func still(): fps.Model {
 	mut fps.Model model = fps.start("127.0.0.1:9200", "")
+	model.seed = seeded()
 	model.screen = fps.Screen.Arena()
 	model.body = fps.Body(10.0, 0.0, 8.0, 0.0, 0.0, 0.0, 100)
 	return model
@@ -125,7 +137,9 @@ test "opposite keys cancel" {
 }
 
 test "a wall stops you, and does not stop you sliding along it" {
-	// The north wall's inner face is at z = -19.5, and a player is 0.36 wide.
+	// The yard's north wall has its inner face at z = -19.5, and a player is 0.36
+	// wide. This is the wall either side of the gate rather than the edge of the
+	// world, which is thirty-five metres further on.
 	mut fps.Model model = holding(still(), ["w"])
 	model.body.z = 0.0 - 16.0
 	after := walking(model, 2.0)
@@ -267,8 +281,8 @@ test "a dead player is not a target" {
 test "a shot with nobody about still stops at the wall" {
 	shot := fps.aimed(still())
 	assert missed(shot)
-	// The north wall's near face is at z = -19.5, and the bullet gets that far and
-	// no further.
+	// The yard's north wall has its near face at z = -19.5, and the bullet gets
+	// that far and no further.
 	assert shot.bz > 0.0 - 19.6
 	assert shot.bz < 0.0 - 19.4
 }
@@ -303,125 +317,319 @@ test "a tracer fades, and a fresh one lives a moment" {
 }
 
 // ---------------------------------------------------------------------------
-// The dead
+// The pack
 // ---------------------------------------------------------------------------
 
-// One of this node's own, standing where it is put.
-func rising(id: Int, x: Float, z: Float): fps.Zombie {
-	return fps.Zombie("127.0.0.1:9200", id, x, 0.0, z, 0.0, 68, 0)
+// One of this node's own, standing where it is put. Three of them, because the
+// three breeds are what the tests below are mostly about.
+func rising(id: Int, x: Float, z: Float): fps.Fiend {
+	return fps.Fiend("127.0.0.1:9200", id, fps.Breed.Zombie(), x, 0.0, z, 0.0, 68,
+		0, false)
 }
 
-func carrying(model: fps.Model, pack: fps.Zombie[]): fps.Model {
+func finned(id: Int, x: Float, z: Float): fps.Fiend {
+	return fps.Fiend("127.0.0.1:9200", id, fps.Breed.Merman(), x, fps.floating(), z,
+		0.0, 80, 0, false)
+}
+
+func fanged(id: Int, x: Float, y: Float, z: Float, flying: Bool): fps.Fiend {
+	return fps.Fiend("127.0.0.1:9200", id, fps.Breed.Vampire(), x, y, z, 0.0, 78, 0,
+		flying)
+}
+
+func carrying(model: fps.Model, pack: fps.Fiend[]): fps.Model {
 	mut fps.Model next = model
-	mut fps.Zombie[dyn] mine = []
-	for each zombie in pack {
-		append(mine, zombie)
+	mut fps.Fiend[dyn] mine = []
+	for each fiend in pack {
+		append(mine, fiend)
 	}
 	next.pack = mine
 	return next
 }
 
+func isBreed(a: fps.Breed, b: fps.Breed): Bool {
+	return a == b
+}
+
 test "the dead walk at whoever is nearest" {
-	// One two metres behind the player, which is further than it can reach.
+	// One three metres behind the player, which is further than it can reach.
 	mut fps.Model model = carrying(still(), [rising(1, still().body.x, still().body.z + 3.0)])
-	after := fps.shambled(model, 100)
+	after := fps.stirred(model, 100)
 	assert len(after.horde) == 1
 	assert len(after.bitten) == 0
-	for each zombie in after.horde {
+	for each fiend in after.horde {
 		// It closed the distance, and it is facing what it is chasing.
-		assert zombie.z < still().body.z + 3.0
-		assert math.abs(zombie.x - still().body.x) < 0.001
+		assert fiend.z < still().body.z + 3.0
+		assert math.abs(fiend.x - still().body.x) < 0.001
 	}
 }
 
 test "one within reach bites, and does not bite again straight away" {
 	mut fps.Model model = carrying(still(), [rising(1, still().body.x, still().body.z + 1.0)])
-	first := fps.shambled(model, 100)
+	first := fps.stirred(model, 100)
 	assert len(first.bitten) == 1
-	assert indexOf(first.bitten, "127.0.0.1:9200") is Result.Ok(_)
+	// A bite carries its own damage, because the three breeds are not worth the
+	// same and the wound is applied by whoever was bitten.
+	for each bite in first.bitten {
+		assert bite.endpoint == "127.0.0.1:9200"
+		assert bite.damage == fps.teeth(fps.Breed.Zombie())
+	}
 
 	// Its jaw is on a cooldown now, so the next frame is quiet.
 	mut fps.Model again = model
 	again.pack = first.horde
-	assert len(fps.shambled(again, 100).bitten) == 0
+	assert len(fps.stirred(again, 100).bitten) == 0
 
 	// The frame the cooldown runs out in is the frame it bites again.
-	assert len(fps.shambled(again, 900).bitten) == 1
+	assert len(fps.stirred(again, 900).bitten) == 1
 }
 
 test "a player who is down is not worth chasing" {
 	mut fps.Model model = carrying(still(), [rising(1, 0.0, 0.0)])
 	model.body.health = 0
 	// Nobody left to hunt, so it stays where it is and bites nothing.
-	after := fps.shambled(model, 100)
+	after := fps.stirred(model, 100)
 	assert len(after.bitten) == 0
-	for each zombie in after.horde {
-		assert zombie.x == 0.0
-		assert zombie.z == 0.0
+	for each fiend in after.horde {
+		assert fiend.x == 0.0
+		assert fiend.z == 0.0
 	}
 }
 
-test "the pack fills up to the number this node is carrying, one at a time" {
+// ---------------------------------------------------------------------------
+// Three breeds
+// ---------------------------------------------------------------------------
+
+test "a zombie will not walk into the water, and a merman will not walk out of it" {
+	made := fps.plan(seeded())
+	pool := made.lake
+	shore := pool.z - pool.d / 2.0
+
+	// A zombie on the bank with a swimmer three metres out in front of it. It
+	// closes what it can and stops dry.
+	mut fps.Model chase = still()
+	chase.body = fps.Body(pool.x, fps.floating(), shore + 3.0, 0.0, 0.0, 0.0, 100)
+	after := fps.stirred(carrying(chase, [rising(1, pool.x, shore - 1.5)]), 200)
+	for each fiend in after.horde {
+		assert fiend.z < shore
+	}
+
+	// And a merman with a player on the bank: three seconds of trying and it is
+	// still in the lake.
+	mut fps.Model wade = still()
+	wade.body = fps.Body(pool.x, 0.0, shore - 3.0, 0.0, 0.0, 0.0, 100)
+	mut fps.Model finny = carrying(wade, [finned(1, pool.x, shore + 2.0)])
+	for i := 0; i < 30; i++ {
+		step := fps.stirred(finny, 100)
+		finny.pack = step.horde
+	}
+	for each fiend in finny.pack {
+		assert fiend.z >= shore
+		assert fiend.y == fps.floating()
+	}
+}
+
+// The wings, in one test: what stops a vampire walking is what puts it in the air,
+// and nothing in the air is checked against a wall.
+test "a vampire that cannot walk to you flies, and goes over the wall" {
+	// Either side of the yard's north wall, which is four metres of stone.
 	mut fps.Model model = still()
-	model.want = 3
-	model.sprout = 0
-	assert fps.due(model)
-	one := fps.raised(model, fps.Spot(0.0, 0.0, 0.0))
-	assert len(one.pack) == 1
-	// Not again until the timer comes round.
-	assert fps.due(one) == false
-	assert fps.due(fps.waiting(one, 500)) == false
-	assert fps.due(fps.waiting(one, 1400))
-}
+	model.body = fps.Body(10.0, 0.0, 0.0 - 17.0, 0.0, 0.0, 0.0, 100)
+	hunted := carrying(model, [fanged(1, 10.0, 0.0, 0.0 - 21.4, false)])
 
-test "a full pack rolls a new number for next time" {
-	mut fps.Model model = carrying(still(), [rising(1, 0.0, 0.0), rising(2, 1.0, 1.0)])
-	model.want = 2
-	assert fps.full(model)
-	assert fps.due(model) == false
-	assert fps.carrying(model, 5).want == 5
-}
-
-test "the dead this node carries belong to it" {
-	raised := fps.raised(still(), fps.Spot(3.0, 4.0, 0.0))
-	for each zombie in raised.pack {
-		assert zombie.owner == "127.0.0.1:9200"
-		assert zombie.health == 68
-		assert zombie.x == 3.0
-		assert zombie.z == 4.0
+	// It walks up to the stone, is refused, and takes off. Then it comes down again
+	// the far side, so what the test watches for is that it *was* in the air.
+	mut fps.Model chasing = hunted
+	mut Bool flew = false
+	for i := 0; i < 40; i++ {
+		step := fps.stirred(chasing, 50)
+		chasing.pack = step.horde
+		for each fiend in chasing.pack {
+			if fiend.flying {
+				flew = true
+			}
+		}
+	}
+	assert flew
+	// And it is on the player's side of the wall, which is the only way over.
+	for each fiend in chasing.pack {
+		assert fiend.z > 0.0 - 20.5
 	}
 }
 
-// Where one may be raised. The distance is the rule worth testing: a zombie that
+test "a bat cannot bite from the air, and lands to do it" {
+	// Four metres directly above the player: as near as anything gets, and out of
+	// reach all the same.
+	above := carrying(still(), [fanged(1, still().body.x, 4.0, still().body.z, true)])
+	assert len(fps.stirred(above, 100).bitten) == 0
+
+	mut fps.Model coming = above
+	mut Int bites = 0
+	for i := 0; i < 60; i++ {
+		step := fps.stirred(coming, 50)
+		coming.pack = step.horde
+		bites = bites + len(step.bitten)
+	}
+	assert bites > 0
+	for each fiend in coming.pack {
+		assert fiend.flying == false
+		assert fiend.y < 0.5
+	}
+}
+
+test "a vampire drinks what it bites, and nothing else does" {
+	mut fps.Fiend hungry = fanged(1, still().body.x + 1.0, 0.0, still().body.z, false)
+	hungry.health = 20
+	first := fps.stirred(carrying(still(), [hungry]), 100)
+	assert len(first.bitten) == 1
+	for each fiend in first.horde {
+		assert fiend.health == 20 + fps.drink()
+	}
+
+	// It cannot drink past whole.
+	mut fps.Fiend nearly = fanged(2, still().body.x + 1.0, 0.0, still().body.z, false)
+	nearly.health = fps.strength(fps.Breed.Vampire()) - 2
+	for each fiend in fps.stirred(carrying(still(), [nearly]), 100).horde {
+		assert fiend.health == fps.strength(fps.Breed.Vampire())
+	}
+
+	// And a zombie that bites you is exactly as nearly dead as it was.
+	mut fps.Fiend hurt = rising(3, still().body.x + 1.0, still().body.z)
+	hurt.health = 20
+	for each fiend in fps.stirred(carrying(still(), [hurt]), 100).horde {
+		assert fiend.health == 20
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Separate books
+// ---------------------------------------------------------------------------
+// Three breeds, three counts, three clocks. The point of the tests below is that
+// nothing one breed does shows up in another breed's books.
+
+test "each breed is filled to its own number on its own clock" {
+	mut fps.Model model = still()
+	model = fps.carrying(model, fps.Breed.Zombie(), 2)
+
+	// Nothing is owed one yet: every clock is still running.
+	assert len(fps.due(model)) == 0
+
+	// Six hundred milliseconds in, the zombies are owed one and nobody else is.
+	ready := fps.waiting(model, 700)
+	assert len(fps.due(ready)) == 1
+	assert len(filter(fps.due(ready), isBreed(_, fps.Breed.Zombie()))) == 1
+
+	// Raising one restarts that breed's clock and touches neither of the others.
+	one := fps.raised(ready, fps.Breed.Zombie(), fps.Spot(0.0 - 4.0, 0.0 - 16.0, 0.0))
+	assert len(one.pack) == 1
+	assert len(fps.due(one)) == 0
+
+	// And a while later the lake's turn comes round, on its own timer.
+	late := fps.waiting(one, 2500)
+	assert len(filter(fps.due(late), isBreed(_, fps.Breed.Merman()))) == 1
+}
+
+test "a brood that is full rolls a new number, and only its own" {
+	mut fps.Model model = carrying(still(), [rising(1, 0.0, 0.0)])
+	assert len(filter(fps.filled(model), isBreed(_, fps.Breed.Zombie()))) == 1
+	assert len(filter(fps.filled(model), isBreed(_, fps.Breed.Merman()))) == 0
+
+	rolled := fps.carrying(model, fps.Breed.Zombie(), 5)
+	assert fps.wanted(rolled, fps.Breed.Zombie()) == 5
+	assert fps.wanted(rolled, fps.Breed.Merman()) == fps.wanted(model, fps.Breed.Merman())
+	// Five zombies wanted and one standing, so the zombies are short and the lake
+	// is not — which is the whole of what separate books buys.
+	assert len(filter(fps.filled(rolled), isBreed(_, fps.Breed.Zombie()))) == 0
+}
+
+test "what this node raises belongs to it, and starts whole" {
+	raised := fps.raised(still(), fps.Breed.Vampire(), fps.Spot(3.0, 4.0, 0.0))
+	for each fiend in raised.pack {
+		assert fiend.owner == "127.0.0.1:9200"
+		assert fiend.breed == fps.Breed.Vampire()
+		assert fiend.health == fps.strength(fps.Breed.Vampire())
+		assert fiend.x == 3.0
+		assert fiend.flying == false
+	}
+	// A merman starts floating rather than standing on the bottom.
+	for each fiend in fps.raised(still(), fps.Breed.Merman(), fps.Spot(0.0, 30.0, 0.0)).pack {
+		assert fiend.y == fps.floating()
+	}
+}
+
+// Where one may be raised. The distance is the rule worth testing: something that
 // turned up at arm's length would be a free bite rather than a fright.
 test "the dead do not rise on top of anybody" {
 	me := still().body
 	// Fourteen metres away across open ground, then three, then eight.
-	assert fps.decent(still(), me.x, me.z - 14.0)
-	assert fps.decent(still(), me.x + 3.0, me.z) == false
-	assert fps.decent(still(), me.x, me.z - 8.0) == false
+	assert fps.decent(still(), fps.Breed.Zombie(), me.x, me.z - 14.0)
+	assert fps.decent(still(), fps.Breed.Zombie(), me.x + 3.0, me.z) == false
+	assert fps.decent(still(), fps.Breed.Zombie(), me.x, me.z - 8.0) == false
+	// A vampire wants more room than that, because it covers the ground faster.
+	assert fps.decent(still(), fps.Breed.Vampire(), me.x, me.z - 12.0) == false
 
 	// Another player counts too, wherever this node's own player is.
 	crowded := joined(still(), [standing("127.0.0.1:9201", 0.0 - 12.0, 0.0)])
-	assert fps.decent(crowded, 0.0 - 11.0, 0.0) == false
-	assert fps.decent(crowded, 0.0, 0.0 - 14.0)
+	assert fps.decent(crowded, fps.Breed.Zombie(), 0.0 - 11.0, 0.0) == false
+	assert fps.decent(crowded, fps.Breed.Zombie(), 0.0, 0.0 - 14.0)
 }
 
-test "the dead do not rise inside a wall, a crate or the sky" {
+test "the dead do not rise inside a wall, a crate or beyond them" {
 	far := still()
-	// The block in the middle of the arena, and the far side of the north wall.
-	assert fps.decent(far, 0.0, 0.0) == false
-	assert fps.decent(far, 0.0, 0.0 - 25.0) == false
-	assert fps.decent(far, 25.0, 0.0) == false
+	// The block in the middle of the yard, and the yard's own east wall.
+	assert fps.decent(far, fps.Breed.Zombie(), 0.0, 0.0) == false
+	assert fps.decent(far, fps.Breed.Zombie(), 20.0, 10.0) == false
 	// The crate at (-8, -6) is solid; the ground beside it is not.
-	assert fps.decent(far, 0.0 - 8.0, 0.0 - 6.0) == false
-	assert fps.decent(far, 0.0 - 11.0, 0.0 - 6.0)
+	assert fps.decent(far, fps.Breed.Zombie(), 0.0 - 8.0, 0.0 - 6.0) == false
+	assert fps.decent(far, fps.Breed.Zombie(), 0.0 - 11.0, 0.0 - 6.0)
+	// And nothing rises past the walls, however much room there is out there.
+	assert fps.decent(far, fps.Breed.Zombie(), 0.0 - 60.0, 0.0) == false
+	assert fps.decent(far, fps.Breed.Zombie(), 0.0, 54.0) == false
+}
+
+test "a breed only rises where it belongs" {
+	made := fps.plan(seeded())
+	pool := made.lake
+	// On the bank, ten metres north of the water.
+	mut fps.Model model = still()
+	model.body.x = pool.x
+	model.body.z = pool.z - pool.d / 2.0 - 10.0
+	inWater := pool.z - pool.d / 2.0 + 2.5
+	onLand := pool.z - pool.d / 2.0 - 22.0
+
+	assert fps.decent(model, fps.Breed.Merman(), pool.x, inWater)
+	assert fps.decent(model, fps.Breed.Zombie(), pool.x, inWater) == false
+	assert fps.decent(model, fps.Breed.Merman(), pool.x, onLand) == false
+}
+
+// The rule the hundred-metre map needs: they rise where the living are. One raised
+// in an empty market is not a threat, it is a thing shuffling into a wall for the
+// rest of the game.
+test "the dead rise near the living, or not at all" {
+	far := still()
+	// Open ground fifty metres north of the only player here. Clear, empty, and no
+	// use to anybody.
+	assert fps.clear(fps.arena(seeded()), 10.0, 0.0, 0.0 - 45.0)
+	assert fps.decent(far, fps.Breed.Zombie(), 10.0, 0.0 - 45.0) == false
+
+	// Nobody alive at all, and nowhere is fit: a pack with nobody to hunt does not
+	// grow.
+	mut fps.Model empty = still()
+	empty.body.health = 0
+	assert fps.decent(empty, fps.Breed.Zombie(), 0.0, 0.0 - 30.0) == false
+
+	// Somebody else alive brings the neighbourhood back — whoever the pack belongs
+	// to, it hunts anybody.
+	busy := joined(empty, [standing("127.0.0.1:9201", 0.0, 0.0 - 40.0)])
+	assert fps.decent(busy, fps.Breed.Zombie(), 0.0, 0.0 - 30.0)
 }
 
 test "a player who is down does not keep the dead away" {
-	mut fps.Model gone = still()
+	// Two players, one of them down. The dead may rise right beside the one who is
+	// not there any more, because somebody who is down is not prey.
+	mut fps.Model gone = joined(still(), [standing("127.0.0.1:9201", 0.0 - 12.0, 0.0)])
 	gone.body.health = 0
-	assert fps.decent(gone, gone.body.x + 2.0, gone.body.z)
+	assert fps.decent(gone, fps.Breed.Zombie(), gone.body.x + 2.0, gone.body.z)
 }
 
 test "two shots put one down, and the second one is the one that did it" {
@@ -436,8 +644,8 @@ test "two shots put one down, and the second one is the one that did it" {
 }
 
 test "a shot at somebody else's zombie says whose it is" {
-	mut fps.Zombie theirs = fps.Zombie("127.0.0.1:9201", 4, still().body.x,
-		0.0, still().body.z - 5.0, 0.0, 68, 0)
+	mut fps.Fiend theirs = fps.Fiend("127.0.0.1:9201", 4, fps.Breed.Zombie(),
+		still().body.x, 0.0, still().body.z - 5.0, 0.0, 68, 0, false)
 	mut fps.Model model = still()
 	append(model.swarm, theirs)
 	shot := fps.aimed(model)
@@ -449,8 +657,8 @@ test "a shot at somebody else's zombie says whose it is" {
 }
 
 test "whatever is in front is what is hit" {
-	// A zombie two metres away and a player six: the zombie is what stops the
-	// bullet, and shooting it in the back is a perfectly good idea.
+	// One two metres away and a player six: the near one stops the bullet, and
+	// shooting it in the back is a perfectly good idea.
 	blocking := carrying(joined(still(), [ahead(still(), 6.0)]),
 		[rising(1, still().body.x, still().body.z - 2.0)])
 	assert fps.aimed(blocking).at is fps.Struck.Undead
@@ -463,11 +671,15 @@ test "whatever is in front is what is hit" {
 
 test "what another node says about its pack replaces only its own" {
 	mut fps.Model model = still()
-	append(model.swarm, fps.Zombie("127.0.0.1:9201", 1, 0.0, 0.0, 0.0, 0.0, 68, 0))
-	append(model.swarm, fps.Zombie("127.0.0.1:9202", 1, 5.0, 0.0, 5.0, 0.0, 68, 0))
-	mut fps.Zombie[dyn] fresh = [
-		fps.Zombie("127.0.0.1:9201", 1, 9.0, 0.0, 9.0, 0.0, 34, 0),
-		fps.Zombie("127.0.0.1:9201", 2, 8.0, 0.0, 8.0, 0.0, 68, 0)
+	append(model.swarm, fps.Fiend("127.0.0.1:9201", 1, fps.Breed.Zombie(), 0.0, 0.0,
+		0.0, 0.0, 68, 0, false))
+	append(model.swarm, fps.Fiend("127.0.0.1:9202", 1, fps.Breed.Merman(), 5.0, 0.0,
+		5.0, 0.0, 80, 0, false))
+	mut fps.Fiend[dyn] fresh = [
+		fps.Fiend("127.0.0.1:9201", 1, fps.Breed.Vampire(), 9.0, 0.0, 9.0, 0.0, 34,
+			0, true),
+		fps.Fiend("127.0.0.1:9201", 2, fps.Breed.Zombie(), 8.0, 0.0, 8.0, 0.0, 68,
+			0, false)
 	]
 	after := fps.told(model, "127.0.0.1:9201", fresh)
 	assert len(after.swarm) == 3
@@ -475,20 +687,31 @@ test "what another node says about its pack replaces only its own" {
 	assert len(filter(after.swarm, ownedBy(_, "127.0.0.1:9201"))) == 2
 }
 
-func ownedBy(zombie: fps.Zombie, endpoint: Str): Bool {
-	return zombie.owner == endpoint
+func ownedBy(fiend: fps.Fiend, endpoint: Str): Bool {
+	return fiend.owner == endpoint
 }
 
 test "everything standing is drawn, whoever is moving it" {
 	mut fps.Model model = carrying(still(), [rising(1, 0.0, 0.0)])
-	append(model.swarm, fps.Zombie("127.0.0.1:9201", 1, 4.0, 0.0, 4.0, 0.0, 68, 0))
+	append(model.swarm, finned(2, fps.plan(seeded()).lake.x, fps.plan(seeded()).lake.z))
 	assert len(fps.mob(model)) == 2
-	// Four shapes each: a body, a head and two arms reaching.
+	// Four shapes each: a body, a head and two of whatever it holds out in front.
 	assert len(fps.world(model)) == len(fps.world(still())) + 8
+
+	// A bat is three, and so is a vampire on its feet — but they are not the same
+	// three, which is the point of drawing the two differently.
+	mut fps.Model air = carrying(still(), [fanged(3, 0.0, 6.0, 0.0, true)])
+	assert len(fps.world(air)) == len(fps.world(still())) + 3
 }
 
-test "a zombie greys as it is shot" {
+test "each breed is its own colour, and shows what has been shot out of it" {
 	assert fps.rot(68) != fps.rot(20)
+	assert fps.scale(80) != fps.scale(20)
+	assert fps.pallor(78) != fps.pallor(20)
+	// And no two breeds are the same colour at full health, which is what makes
+	// them tellable apart in the dark.
+	assert fps.rot(68) != fps.scale(80)
+	assert fps.scale(80) != fps.pallor(78)
 }
 
 test "hex digits are the number they spell" {
@@ -526,26 +749,428 @@ test "the panel says which kind of game it is" {
 // Coming back
 // ---------------------------------------------------------------------------
 
-test "you come back where there is the most room" {
-	// Three of the four corners taken. The fourth is where a player belongs.
+// Nearest with room, which is two rules: it is not the one somebody is standing on,
+// and no other free spot is closer. The second half is the definition rather than a
+// number, so it holds on whatever map the seed came out as.
+test "you come back at the nearest spot with room in it" {
+	mut fps.Model fallen = still()
+	fallen.body.health = 0
+	fallen.body.x = 16.0
+	fallen.body.z = 0.0 - 16.0
+	crowded := joined(fallen, [standing("127.0.0.1:9201", 16.0, 0.0 - 16.0)])
+	room := fps.vacancy(crowded)
+
+	// Not the corner they are standing on.
+	assert room.x != 16.0 || room.z != 0.0 - 16.0
+	// And nothing free is nearer than what came back.
+	took := math.hypot(room.x - 16.0, room.z + 16.0)
+	for i := 0; i < fps.spots(); i++ {
+		place := fps.spot(i, seeded())
+		if fps.lonely(fps.prey(crowded), place) > 9.0 {
+			assert math.hypot(place.x - 16.0, place.z + 16.0) >= took - 0.001
+		}
+	}
+}
+
+// What `vacancy` falls back to, and where one of the pack is raised when every
+// guess has landed somewhere unfit.
+test "the emptiest spot is the one whose nearest neighbour is furthest" {
 	crowded := joined(still(), [
 		standing("127.0.0.1:9201", 0.0 - 16.0, 0.0 - 16.0),
 		standing("127.0.0.1:9202", 16.0, 0.0 - 16.0),
-		standing("127.0.0.1:9203", 16.0, 16.0)
+		standing("127.0.0.1:9203", 16.0, 16.0),
+		standing("127.0.0.1:9204", 0.0 - 16.0, 16.0)
 	])
-	room := fps.vacancy(crowded)
-	assert room.x == 0.0 - 16.0
-	assert room.z == 16.0
+	room := fps.emptiest(crowded)
+	// All four of the yard's corners have somebody on them, so it is one of the four
+	// outside the yard — and it has room in it.
+	assert math.abs(room.x) > 20.0 || math.abs(room.z) > 20.0
+	assert fps.lonely(fps.prey(crowded), room) > 9.0
 }
 
 test "two nodes on one machine start apart" {
-	assert fps.mySpot("127.0.0.1:9200").x != fps.mySpot("127.0.0.1:9201").x
-		|| fps.mySpot("127.0.0.1:9200").z != fps.mySpot("127.0.0.1:9201").z
+	first := fps.mySpot("127.0.0.1:9200", seeded())
+	second := fps.mySpot("127.0.0.1:9201", seeded())
+	assert first.x != second.x || first.z != second.z
 }
 
 test "an endpoint that makes no sense still gets a corner" {
 	assert fps.portOf("nonsense") == 0
 	assert fps.portOf("127.0.0.1:9203") == 9203
+}
+
+// ---------------------------------------------------------------------------
+// The generator
+// ---------------------------------------------------------------------------
+// Two assertions carry the whole design. The same seed is the same map — which is
+// what lets one number travel between machines instead of a map — and two seeds are
+// not, which is what makes a game worth playing twice. Everything else in this
+// section is an *invariant*: something the generator has to promise about a map
+// nobody has looked at, which is the only way procedural ground can be tested at
+// all.
+
+test "the same seed is the same map, on every machine and every run" {
+	assert fps.arena(9) == fps.arena(9)
+	assert fps.arena(123456) == fps.arena(123456)
+}
+
+test "no two seeds are the same map" {
+	assert fps.arena(1) != fps.arena(2)
+	assert fps.arena(1000) != fps.arena(1001)
+	assert fps.arena(31337) != fps.arena(4242)
+	// And not in one number either: the districts themselves come out differently.
+	mut Int alike = 0
+	for i := 0; i < 12; i++ {
+		if fps.plan(i * 37).deck == fps.plan(i * 37 + 37).deck {
+			alike = alike + 1
+		}
+	}
+	assert alike < 6
+}
+
+test "every spot you come back to is somewhere you can stand, on any map" {
+	for s := 0; s < 8; s++ {
+		seed := 1000 + s * 977
+		blocks := fps.arena(seed)
+		made := fps.plan(seed)
+		for i := 0; i < fps.spots(); i++ {
+			place := fps.spot(i, seed)
+			assert fps.clear(blocks, place.x, 0.0, place.z)
+			assert math.abs(place.x) < fps.edge()
+			assert math.abs(place.z) < fps.edge()
+			// And on dry land: coming back into the lake would be coming back
+			// drowning.
+			assert fps.dry(made, place.x, place.z)
+		}
+	}
+}
+
+// The stair the generator builds is a stair whatever height it decided the loft
+// should be at — which is the sort of promise a generated map lives or dies on, and
+// it is four lines of arithmetic to check.
+test "the warehouse crates are climbable on any map" {
+	for s := 0; s < 6; s++ {
+		made := fps.plan(5 + s * 811)
+		mut Float highest = 0.0 - 99.0
+		mut Float lowest = 99.0
+		mut Int crates = 0
+		for each crate in fps.stair(made) {
+			lid := crate.y + crate.h / 2.0
+			if lid > highest {
+				highest = lid
+			}
+			if lid < lowest {
+				lowest = lid
+			}
+			crates = crates + 1
+		}
+		assert crates == 4
+		// The first one is a jump from the floor, every one after it is a jump from
+		// the one below, and the last step onto the loft is a walk.
+		rise := (highest - lowest) / hive.conv.itf(crates - 1)
+		assert lowest < 1.3
+		assert rise < 1.3
+		assert made.deck - highest <= 0.36
+	}
+}
+
+test "the tower is walked up, not jumped up, on any map" {
+	for s := 0; s < 5; s++ {
+		seed := 77 + s * 1013
+		mut fps.Model climbing = holding(still(), ["w"])
+		climbing.seed = seed
+		// From the spot the game starts people at, which faces the first flight.
+		climbing.body = fps.fresh(fps.spot(5, seed))
+		after := walking(climbing, 2.2)
+		// Off the ground, and space was never pressed.
+		assert after.y > 1.0
+	}
+}
+
+test "every map has a lake to swim in, with a dam across it and an island beyond" {
+	for s := 0; s < 6; s++ {
+		seed := 3 + s * 733
+		made := fps.plan(seed)
+		pool := made.lake
+		// Deep enough that a player cannot stand on the bottom and see out.
+		assert pool.bed < 0.0 - fps.eyes()
+		// Inside the walls, with room to spare.
+		assert math.abs(pool.x) + pool.w / 2.0 < fps.edge()
+		assert math.abs(pool.z) + pool.d / 2.0 < fps.edge()
+		// The dam is in the water, and the island is beyond it — so the island is
+		// either a dive or the long way round, on every map there is.
+		assert fps.wet(made, pool.x, made.dam)
+		assert made.island.z > made.dam
+		assert fps.wet(made, made.island.x, made.island.z)
+	}
+}
+
+test "there are three breeds, and somewhere to put each of them" {
+	assert len(fps.kinds()) == 3
+	// More zombies than anything else, because one vampire is most of a fight.
+	assert fps.plenty(fps.Breed.Zombie()) > fps.plenty(fps.Breed.Vampire())
+	assert fps.patience(fps.Breed.Vampire()) > fps.patience(fps.Breed.Zombie())
+
+	// And when every guess at a place has been refused: a merman goes to the middle
+	// of the lake, which is water on any map, and everything else to a spot on land.
+	made := fps.plan(seeded())
+	afloat := fps.unfit(still(), fps.Breed.Merman())
+	assert fps.wet(made, afloat.x, afloat.z)
+	ashore := fps.unfit(still(), fps.Breed.Zombie())
+	assert fps.dry(made, ashore.x, ashore.z)
+}
+
+// ---------------------------------------------------------------------------
+// Whose world it is
+// ---------------------------------------------------------------------------
+// The one rule that makes a generated map safe in a mesh with no server in it.
+
+test "the lower endpoint's world is the one everybody ends up in" {
+	mut fps.Model mine = carrying(still(), [rising(1, 0.0, 0.0)])
+	mine.seed = 111
+
+	// Somebody whose endpoint sorts after ours tells us about their world. Ours
+	// stands — and theirs will, because they are applying the same rule.
+	assert fps.settled(mine, "127.0.0.1:9300", 222).seed == 111
+
+	// Somebody whose endpoint sorts before ours, and we rebuild into theirs.
+	theirs := fps.settled(mine, "127.0.0.1:9100", 222)
+	assert theirs.seed == 222
+	// A rebuild is a rebuild: back to a spot in the new map, with a full breath and
+	// no pack, because everything we were carrying was raised in a world that has
+	// stopped existing.
+	assert theirs.body.x == fps.mySpot("127.0.0.1:9200", 222).x
+	assert theirs.body.z == fps.mySpot("127.0.0.1:9200", 222).z
+	assert len(theirs.pack) == 0
+	assert theirs.air == fps.breath()
+
+	// Hearing our own seed back changes nothing at all.
+	assert len(fps.settled(mine, "127.0.0.1:9100", 111).pack) == 1
+}
+
+// ---------------------------------------------------------------------------
+// The water
+// ---------------------------------------------------------------------------
+
+// A player floating in the northern half of the lake, which is the half you can
+// walk into from the yard's south gate.
+func afloat(): fps.Model {
+	pool := fps.plan(seeded()).lake
+	mut fps.Model model = still()
+	model.body = fps.Body(pool.x, fps.floating(), pool.z - pool.d / 2.0 + 3.0, 0.0,
+		0.0, 0.0, 100)
+	return model
+}
+
+test "walking into the lake is swimming in it" {
+	pool := fps.plan(seeded()).lake
+	// On the bank three metres north of the water, facing it, holding W.
+	mut fps.Model wading = holding(still(), ["w"])
+	wading.body = fps.Body(pool.x, 0.0, pool.z - pool.d / 2.0 - 3.0, 0.0, 3.14, 0.0, 100)
+	after := walking(wading, 1.5)
+
+	// Past the shore, and floating rather than standing: the bed is three metres
+	// down and the body is nowhere near it.
+	assert after.z > pool.z - pool.d / 2.0
+	assert after.y < 0.0 - 0.3
+	assert after.y > pool.bed
+	// And slower than the same second and a half on land would have been.
+	assert after.z - (pool.z - pool.d / 2.0 - 3.0) < 1.5 * fps.speed()
+}
+
+test "space climbs, control dives, and neither of them leaves the water" {
+	high := walking(holding(afloat(), ["space"]), 1.0)
+	low := walking(holding(afloat(), ["ctrl"]), 1.0)
+	assert high.y > fps.floating()
+	assert high.y < fps.surface()
+	assert low.y < fps.floating()
+	assert low.y > fps.plan(seeded()).lake.bed
+	// Swimming is not standing, so there is nothing to jump off.
+	assert fps.grounded(afloat()) == false
+}
+
+test "a head under the water runs out of air, and then the water takes it" {
+	mut fps.Model diving = holding(afloat(), ["ctrl"])
+	diving.body = walking(diving, 1.0)
+	assert fps.under(diving)
+
+	// Ten seconds is a lungful. A little over, and the water starts on the health.
+	mut fps.Model held = diving
+	for i := 0; i < 101; i++ {
+		held = fps.stepped(held, 100)
+	}
+	assert held.air == 0
+	assert held.body.health < 100
+	assert fps.alive(held)
+
+	// A head out of the water gets it back, and faster than it went.
+	mut fps.Model up = held
+	up.body.y = 0.0 - 0.2
+	assert fps.under(up) == false
+	breathed := fps.stepped(up, 100)
+	assert breathed.air > 100
+}
+
+test "a full breath is not on the screen, and a spent one is" {
+	assert hive.ui.html(fps.lungs(still())) == "<!--none-->"
+	mut fps.Model gasping = still()
+	gasping.air = 0
+	assert indexOf(hive.ui.html(fps.lungs(gasping)), "drowning") is Result.Ok(_)
+}
+
+// The dam is the reason to dive, and this is the whole of why it works: the two
+// comparisons in `inside` that stop a floater are the two that let a diver past.
+// There is no rule about water in either of them.
+test "the dam is a wall to a swimmer and a doorway to a diver" {
+	made := fps.plan(seeded())
+	blocks := fps.arena(seeded())
+	pool := made.lake
+	// Two metres in from the lake's eastern shore, where the island never reaches.
+	at := pool.x + pool.w / 2.0 - 2.0
+	assert fps.clear(blocks, at, fps.floating(), made.dam) == false
+	assert fps.clear(blocks, at, pool.bed + 0.4, made.dam)
+}
+
+test "the island is climbed out of the water, not walked onto" {
+	made := fps.plan(seeded())
+	blocks := fps.arena(seeded())
+	// On the rim of the sandbank rather than the middle of it, which is where a
+	// swimmer arrives.
+	rim := made.island.x + fps.sandbank() / 2.0 - 0.5
+	// Floating up against it, the sandbank is in the way...
+	assert fps.clear(blocks, rim, fps.floating(), made.island.z) == false
+	// ...and with the space bar held, which lifts a swimmer to just under the
+	// surface, it is something to step onto instead.
+	assert fps.clear(blocks, rim, fps.surface() - 0.4, made.island.z)
+	// Its top is out of the water and the beacon on it is the tallest thing for
+	// thirty metres.
+	assert fps.ledge(blocks, made.island.x, made.island.z, 1.0) > fps.surface()
+}
+
+test "you can tell where you are, and where everybody else is" {
+	made := fps.plan(seeded())
+	assert fps.whereabouts(still()) == "the yard"
+	assert fps.district(made, made.lake.x, fps.floating(), made.lake.z - 6.0) == "the lake"
+	assert fps.district(made, made.island.x, 0.5, made.island.z) == "the island"
+	assert fps.district(made, made.towerX, 1.0, made.towerZ) == "the tower"
+	assert fps.district(made, made.shedX, 0.0, made.shedZ) == "the warehouse"
+	// Four metres up over open ground is the walkway, and nowhere else is.
+	assert fps.district(made, 8.0, made.deck, made.towerZ) == "the causeway"
+}
+
+// ---------------------------------------------------------------------------
+// Talking
+// ---------------------------------------------------------------------------
+// The chat is `func`s of the state like everything else, so a conversation can be
+// had here with no keyboard, no window and no second machine in it.
+
+test "a line is typed one key at a time" {
+	open := fps.opening(still())
+	assert open.composing
+	mut fps.Model saying = open
+	for each key in ["h", "i", "space", "b", "o", "b"] {
+		saying = fps.typed(saying, key)
+	}
+	assert saying.saying == "hi bob"
+}
+
+test "starting a line lets go of whatever was held" {
+	running := holding(still(), ["w", "mouse1"])
+	assert len(fps.opening(running).held) == 0
+}
+
+test "backspace takes one back, and what is not text is ignored" {
+	saying := fps.typed(fps.typed(fps.opening(still()), "n"), "o")
+	assert fps.typed(saying, "backspace").saying == "n"
+	// Shift, tab and the arrows are pressed while typing and none of them is a
+	// letter — nor is a mouse button, which arrives as a key like everything else.
+	assert fps.typed(saying, "shift").saying == "no"
+	assert fps.typed(saying, "tab").saying == "no"
+	assert fps.typed(saying, "up").saying == "no"
+	assert fps.typed(saying, "mouse1").saying == "no"
+	// And backspace on nothing is nothing.
+	assert fps.rubbed("") == ""
+	assert fps.rubbed("a") == ""
+}
+
+test "a line sent or forgotten is a line no longer being typed" {
+	saying := fps.typed(fps.opening(still()), "x")
+	closed := fps.sealed(saying)
+	assert closed.composing == false
+	assert closed.saying == ""
+	// Sealing a line is not sending it: nothing was said.
+	assert len(closed.chat) == 0
+}
+
+test "nobody says more than a mouthful" {
+	mut Str shout = ""
+	for i := 0; i < 200; i++ {
+		shout = "{shout}x"
+	}
+	assert len(split(fps.clipped(shout), "")) == fps.mouthful()
+	// And a line that arrives from another node is cut the same way: how much of
+	// this screen a line may take is this screen's business.
+	loud := fps.spoke(still(), "127.0.0.1:9201", "Bob", shout)
+	for each line in loud.chat {
+		assert len(split(line.text, "")) == fps.mouthful()
+	}
+}
+
+test "what somebody said arrives with them" {
+	// A line from a node nobody has met introduces them, exactly as a position
+	// from one does.
+	talking := fps.spoke(still(), "127.0.0.1:9209", "Zoe", "anybody there?")
+	assert len(talking.others) == 1
+	assert len(talking.chat) == 1
+	for each line in talking.chat {
+		assert line.who == "Zoe"
+		assert line.text == "anybody there?"
+	}
+}
+
+test "only the last few lines are kept, and they go quiet on their own" {
+	mut fps.Model talking = still()
+	for i := 0; i < 9; i++ {
+		talking = fps.spoke(talking, "127.0.0.1:9201", "Bob", "line {i}")
+	}
+	assert len(talking.chat) == fps.remembered()
+	assert len(filter(talking.chat, said(_, "line 8"))) == 1
+	assert len(filter(talking.chat, said(_, "line 0"))) == 0
+
+	// Fourteen seconds later there is nothing on the screen, and nothing had to be
+	// cleared away.
+	assert len(fps.hushed(talking.chat, fps.chatting())) == 0
+	assert len(fps.hushed(talking.chat, 100)) == fps.remembered()
+}
+
+func said(line: fps.Line, text: Str): Bool {
+	return line.text == text
+}
+
+test "a frame quietens the chat, the same frame that fades the tracers" {
+	talking := fps.spoke(still(), "127.0.0.1:9201", "Bob", "hello")
+	after := fps.stepped(talking, 100)
+	for each line in after.chat {
+		assert line.life == fps.chatting() - 100
+	}
+}
+
+test "the line being typed is on the screen, and the mouse is not given back for it" {
+	mut fps.Model saying = fps.opening(still())
+	for each key in ["z", "o", "o"] {
+		saying = fps.typed(saying, key)
+	}
+	strip := hive.ui.html(fps.chatter(saying))
+	assert indexOf(strip, "zoo") is Result.Ok(_)
+	// Typing is not a reason to let go of the picture.
+	assert fps.playing(saying)
+}
+
+test "what is said cannot smuggle markup onto the screen" {
+	loud := fps.spoke(still(), "127.0.0.1:9201", "Bob", "<script>alert(1)</script>")
+	strip := hive.ui.html(fps.chatter(loud))
+	assert indexOf(strip, "<script>") is Result.Error(_)
+	assert indexOf(strip, "&lt;script&gt;") is Result.Ok(_)
 }
 
 // ---------------------------------------------------------------------------
@@ -719,6 +1344,12 @@ test "the score lists you and everybody else" {
 	assert indexOf(board, "(you)") is Result.Ok(_)
 	assert indexOf(board, "Bob") is Result.Ok(_)
 	assert indexOf(board, "127.0.0.1:9202") is Result.Ok(_)
+
+	// And where everybody was when they last said something, which on a place this
+	// size is the difference between a score board and a way of finding anybody.
+	away := fps.moved(known,
+		fps.Msg.Moved("127.0.0.1:9202", "Cai", 0.0 - 32.0, 0.0, 30.0, 0.0, 100))
+	assert indexOf(hive.ui.html(fps.scores(away)), "the market") is Result.Ok(_)
 }
 
 // The guess is built out of wherever this node is, so it is right on any address
@@ -797,4 +1428,101 @@ test "somebody who is down does not walk, and comes back when the count runs out
 	back := fps.stepped(waiting, 40)
 	assert fps.alive(back)
 	assert back.body.health == 100
+}
+
+// --- A real node --------------------------------------------------------------
+
+// Everything below runs over syslink for real: this file becomes a node, publishes
+// an `#Arena` mailbox, and is talked to exactly as a window would be. It is the one
+// test here that is not arithmetic — and the one that would matter most if it ever
+// started failing, because "the chat goes over the connection the game is already
+// using" is a claim about the wire and nothing else can check it.
+//
+// `#Arena` is the same atom `fps.hive` registers, so this handler's mailbox type has
+// to be `fps.Msg` — the compiler pairs a registered name with the type behind it,
+// which is why neither `on` nor the `async` below needs an annotation.
+
+// A stand-in for the window. It folds what arrives into a real `fps.Model` the way
+// `update` does, and answers anything else with what it has heard — a service's
+// state being private, asking is the only way to read it.
+proc window(model: fps.Model, msg: fps.Msg, from: hive.syslink.Envelope): fps.Model {
+	if msg is fps.Msg.Said(endpoint, who, text) {
+		return fps.spoke(model, endpoint, who, text)
+	}
+	hive.syslink.answer(from, fps.Msg.Said(model.mine, model.me,
+		"{transcript(model)} · roster {len(model.others)}"))
+	return model
+}
+
+func transcript(model: fps.Model): Str {
+	mut Str[dyn] lines = []
+	for each line in model.chat {
+		append(lines, "{line.who}: {line.text}")
+	}
+	return join(lines, " | ")
+}
+
+proc asked(box: hive.syslink.Address): Str {
+	answer := box(fps.Msg.Left()) with timeout 2000
+	if answer is Result.Ok(reply) {
+		if reply is fps.Msg.Said(_, _, text) {
+			return text
+		}
+	}
+	return ""
+}
+
+test "a line of chat crosses a real connection, and brings whoever said it" {
+	if hive.syslink.listen("127.0.0.1:9288") is Result.Error(problem) {
+		panic problem
+	}
+	mut fps.Model model = fps.start("127.0.0.1:9288", "")
+	model.me = "Bob"
+	box := hive.syslink.spawn(window, model)
+	if hive.syslink.register(#Arena, box) is Result.Error(problem) {
+		panic problem
+	}
+
+	// The same two statements `say` says a line with, and the same address every
+	// position update is sent to.
+	there := hive.syslink.on("127.0.0.1:9288", #Arena)
+	async there(fps.Msg.Said("127.0.0.1:9289", "Ada", "hello over syslink"))
+	async there(fps.Msg.Said("127.0.0.1:9289", "Ada", "and again"))
+	hive.task.sleep(400)
+
+	told := asked(box)
+	assert indexOf(told, "Ada: hello over syslink") is Result.Ok(_)
+	assert indexOf(told, "Ada: and again") is Result.Ok(_)
+
+	// One FIFO pipe per node pair, so what one peer says arrives in the order they
+	// said it — which is the whole reason a chat needs nothing of its own.
+	first := indexOf(told, "hello over syslink")
+	second := indexOf(told, "and again")
+	if first is Result.Ok(a) && second is Result.Ok(b) {
+		assert a < b
+	} else {
+		assert false
+	}
+
+	// And the node that spoke is on the roster, once, because hearing somebody
+	// speak is meeting them.
+	assert indexOf(told, "roster 1") is Result.Ok(_)
+
+	// Now the game's own send, for real. `say` is a `proc` because it puts a line
+	// on the wire, and this is that statement running: the roster it walks is one
+	// player, whose endpoint is this node.
+	mut fps.Model sender = fps.start("127.0.0.1:9288", "")
+	sender.me = "Ada"
+	spoke := fps.say(joined(sender, [standing("127.0.0.1:9288", 0.0, 0.0)]),
+		"over the wire")
+	hive.task.sleep(400)
+	// It is on the sender's own screen without going anywhere...
+	assert len(spoke.chat) == 1
+	// ...and it arrived at the far end, which here is the same node.
+	assert indexOf(asked(box), "over the wire") is Result.Ok(_)
+
+	// A line of nothing is not sent and not shown: the rule that decides a name is
+	// worth joining under decides a line is worth saying.
+	quiet := fps.say(joined(sender, [standing("127.0.0.1:9288", 0.0, 0.0)]), "   ")
+	assert len(quiet.chat) == 0
 }
