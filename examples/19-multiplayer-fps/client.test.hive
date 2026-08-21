@@ -1,0 +1,989 @@
+// Tests for the arena client
+// ==========================
+// A multiplayer game is the last place you would expect to be able to test
+// anything without running it, and that is exactly what the split in `client.hive`
+// buys: walking, falling, swimming, aiming, typing, and everything the screen shows
+// are all `func`s of the state, so every one of them can be called here — with no
+// window, no mouse, no browser and no server anywhere.
+//
+// **What cannot be called is `update`**, and that is deliberate: it is a handler, an
+// envelope is opaque, and one only ever arrives as a handler's own argument. So
+// everything it decides lives in the funcs below it — `told` most of all, which is
+// the whole of what this program does with what the server says — and this file is
+// the proof that this was worth doing.
+//
+// The server's own tests are next door in `server.test.hive`, and they include a
+// real websocket carrying a real game. What is *not* here is any of the world's
+// arithmetic: this program does not move a monster, work out a health or roll a
+// map, so there is nothing about any of those to test in it.
+//
+//   hive test client.test.hive
+
+import ./client
+import ./lib/place
+import ./lib/wire
+import hive.ui
+import hive.math
+import hive.conv
+
+// The seed these tests are played on.
+//
+// The map is a `func` of it, so a fixed seed is a fixed map and every coordinate
+// below means the same thing on every run and every machine. Here the seed arrives
+// in a `Welcome` rather than being rolled; a test sets it directly, which is the
+// same thing one message earlier.
+func seeded(): Int {
+	return 4242
+}
+
+// Somebody in a snapshot, whole and standing where they are put.
+func whole(seat: Int, who: Str, x: Float, z: Float): wire.Player {
+	return wire.Player(seat, who, x, 0.0, z, 0.0, 100, place.breath(), 0, 0, 0, 0)
+}
+
+// A player standing still in open ground, facing down -Z (which is where yaw 0
+// looks), with nobody else about and a roster with just them in it.
+//
+// The spot matters and is worth saying why: the middle of the arena is a block, so
+// a player at the origin would be *inside* it — unable to walk, unable to jump
+// without hitting their head, and unable to shoot anything but the block they are
+// standing in. Every test below reads better from somewhere there is room.
+func still(): client.Model {
+	mut client.Model model = client.start("ws://127.0.0.1:9200/arena")
+	model.me = "Ada"
+	model.seat = 1
+	model.seed = seeded()
+	model.screen = client.Screen.Arena()
+	model.body = client.Body(10.0, 0.0, 8.0, 0.0, 0.0, 0.0)
+	mut wire.Player[dyn] only = [whole(1, "Ada", 10.0, 8.0)]
+	model.roster = only
+	return model
+}
+
+// The same, with other people in the snapshot. This player is always first in it,
+// because a client's own row is one of the rows.
+func joined(model: client.Model, players: wire.Player[]): client.Model {
+	mut client.Model next = model
+	mut wire.Player[dyn] all = [mineOf(model)]
+	for each one in players {
+		append(all, one)
+	}
+	next.roster = all
+	return next
+}
+
+func mineOf(model: client.Model): wire.Player {
+	return client.mine(model)
+}
+
+// Somebody at whatever health, which is how the tests that are about being shot
+// say so: the number comes from the server, so a test sets it in the roster.
+func hurt(model: client.Model, health: Int): client.Model {
+	mut client.Model next = model
+	next.roster = map(model.roster, at(_, model.seat, health))
+	return next
+}
+
+func at(one: wire.Player, seat: Int, health: Int): wire.Player {
+	if one.seat != seat {
+		return one
+	}
+	mut wire.Player wounded = one
+	wounded.health = health
+	return wounded
+}
+
+// A second of walking, one real frame at a time. Nothing steps a player 6 metres
+// at once — `stepped` caps a frame at a twentieth of a second — and a test that
+// did would be testing something the game never does.
+func walking(model: client.Model, seconds: Float): client.Body {
+	mut client.Model moving = model
+	mut client.Body body = model.body
+	frames := conv.round(seconds * 60.0)
+	for i := 0; i < frames; i++ {
+		moving.body = body
+		body = client.walked(moving, 1.0 / 60.0)
+	}
+	return body
+}
+
+func holding(model: client.Model, keys: Str[]): client.Model {
+	mut client.Model next = model
+	mut Str[dyn] held = []
+	for each key in keys {
+		append(held, key)
+	}
+	next.held = held
+	return next
+}
+
+func facing(model: client.Model, yaw: Float, pitch: Float): client.Model {
+	mut client.Model next = model
+	next.body.yaw = yaw
+	next.body.pitch = pitch
+	return next
+}
+
+// ---------------------------------------------------------------------------
+// Walking
+// ---------------------------------------------------------------------------
+// The half of the game this program owns. Sixty frames a second of it, on this
+// machine, because a game that asked a server where its own feet were would feel
+// like one.
+
+// A second of W at yaw 0 goes to -Z and nowhere else. This is the one test that
+// pins the convention the whole file depends on: forward is where the eye points,
+// and at yaw 0 that is -Z.
+test "walking forward goes the way you are looking" {
+	from := still().body
+	after := walking(holding(still(), ["w"]), 1.0)
+	// A second at 6.4 metres a second, all of it towards -Z.
+	assert after.z < from.z - 6.0
+	assert after.z > from.z - 7.0
+	assert math.abs(after.x - from.x) < 0.001
+}
+
+test "a quarter turn to the right sends the same key east" {
+	// Yaw -pi/2 is a quarter turn clockwise seen from above, so forward is +X.
+	turned := facing(holding(still(), ["w"]), 0.0 - math.pi() / 2.0, 0.0)
+	after := walking(turned, 1.0)
+	assert after.x > still().body.x + 6.0
+	assert math.abs(after.z - still().body.z) < 0.001
+}
+
+test "strafing is sideways, not forwards" {
+	after := walking(holding(still(), ["d"]), 1.0)
+	assert after.x > still().body.x + 6.0
+	assert math.abs(after.z - still().body.z) < 0.001
+}
+
+// Two keys are one direction, not two speeds. Without normalising, a diagonal
+// would be 1.41 times as fast as a straight line — which is the oldest bug in
+// first-person movement.
+test "holding two keys does not make you faster" {
+	from := still().body
+	straight := walking(holding(still(), ["w"]), 1.0)
+	diagonal := walking(holding(still(), ["w", "d"]), 1.0)
+	far := math.hypot(straight.x - from.x, straight.z - from.z)
+	slant := math.hypot(diagonal.x - from.x, diagonal.z - from.z)
+	assert math.abs(far - slant) < 0.01
+}
+
+test "opposite keys cancel" {
+	from := still().body
+	after := walking(holding(still(), ["w", "s"]), 1.0)
+	assert math.hypot(after.x - from.x, after.z - from.z) < 0.001
+}
+
+test "a wall stops you, and does not stop you sliding along it" {
+	// The yard's north wall has its inner face at z = -19.5, and a player is 0.36
+	// wide. This is the wall either side of the gate rather than the edge of the
+	// world, which is thirty-five metres further on.
+	mut client.Model model = holding(still(), ["w"])
+	model.body.z = 0.0 - 16.0
+	after := walking(model, 2.0)
+	assert after.z > 0.0 - 19.2
+	assert after.z < 0.0 - 19.0
+
+	// The same wall, pressed into while walking east along it: the step across is
+	// given up on its own, so sliding along a wall works.
+	mut client.Model against = model
+	against.body.z = after.z
+	sliding := walking(holding(against, ["w", "d"]), 1.0)
+	assert sliding.x > model.body.x + 3.0
+	assert sliding.z > 0.0 - 19.2
+}
+
+// The wall the client draws is the wall the server walks a zombie around, because
+// both of them import the same `place.arena` — which is the whole reason there is a
+// `lib` directory. A game where those two differed would be a game where you are
+// shot through a wall only one of you can see.
+test "the stairs the generator built can be walked up, on any map" {
+	for s := 0; s < 5; s++ {
+		seed := 77 + s * 1013
+		mut client.Model climbing = holding(still(), ["w"])
+		climbing.seed = seed
+		// From the spot the server starts people at, which faces the first flight.
+		climbing.body = client.fresh(place.spot(5, seed))
+		after := walking(climbing, 2.2)
+		// Off the ground, and space was never pressed.
+		assert after.y > 1.0
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Falling and jumping
+// ---------------------------------------------------------------------------
+
+test "standing on the ground stays on the ground" {
+	after := client.walked(still(), 0.1)
+	assert after.y == 0.0
+	assert after.fall == 0.0
+}
+
+test "space goes up, and gravity brings it back" {
+	up := client.walked(holding(still(), ["space"]), 1.0 / 60.0)
+	assert up.y > 0.0
+	assert up.fall > 0.0
+
+	// Let go and give it two seconds: what goes up comes down to the floor and
+	// stops there.
+	mut client.Model flying = still()
+	flying.body = up
+	falling := walking(flying, 2.0)
+	assert falling.y == 0.0
+	assert falling.fall == 0.0
+}
+
+test "a crate can be stood on" {
+	// The crate at (-8, -6) is 1.2 tall, so its lid is at 1.2 — and a player
+	// dropped from head height above it lands on the lid rather than through it.
+	mut client.Model model = still()
+	model.body = client.Body(0.0 - 8.0, 3.0, 0.0 - 6.0, 0.0, 0.0, 0.0)
+	assert walking(model, 2.0).y == 1.2
+}
+
+// Falling fast enough to pass a lid inside one frame still lands on it. The step
+// is what is tested against, not the place the step ended.
+test "a fast fall does not go through a crate" {
+	mut client.Model model = still()
+	model.body = client.Body(0.0 - 8.0, 1.4, 0.0 - 6.0, 0.0 - 9.0, 0.0, 0.0)
+	after := client.walked(model, 1.0 / 30.0)
+	assert after.y == 1.2
+	assert after.fall == 0.0
+}
+
+// ---------------------------------------------------------------------------
+// Looking
+// ---------------------------------------------------------------------------
+
+test "the mouse turns you, and pitch stops short of straight up" {
+	turned := client.turned(still(), 100.0, 0.0)
+	assert turned.yaw < 0.0
+
+	// Ten thousand pixels upwards is still not further than the clamp allows.
+	craned := client.turned(still(), 0.0, 0.0 - 10000.0)
+	assert craned.pitch == 1.35
+	planted := client.turned(still(), 0.0, 10000.0)
+	assert planted.pitch == 0.0 - 1.35
+}
+
+// ---------------------------------------------------------------------------
+// Shooting
+// ---------------------------------------------------------------------------
+// The other thing this program is trusted with, and the reason it is: it is the
+// only thing that knows where the mouse was pointing. What comes out of `aimed` is
+// a seat or an id, never a number of hit points — the server owns that.
+
+// Somebody six metres along -Z, which is where a player at yaw 0 is looking.
+func ahead(metres: Float): wire.Player {
+	return whole(2, "Bob", 10.0, 8.0 - metres)
+}
+
+// What a shot found, asked about in the two ways the tests want. A `Struck` is a
+// closed set, so these are the whole of it.
+func shooting(shot: client.Shot, seat: Int): Bool {
+	if shot.at is client.Struck.Player(who) {
+		return who == seat
+	}
+	return false
+}
+
+func missed(shot: client.Shot): Bool {
+	return shot.at is client.Struck.Nobody
+}
+
+test "a shot down the middle finds somebody standing in front of you" {
+	model := joined(still(), [ahead(6.0)])
+	shot := client.aimed(model)
+	assert shooting(shot, 2)
+	// The tracer ends where the bullet stopped, which is at them rather than
+	// somewhere beyond them.
+	assert shot.bz > still().body.z - 6.5
+	assert shot.bz < still().body.z - 5.5
+}
+
+test "a shot into the sky finds nobody" {
+	model := joined(facing(still(), 0.0, 1.3), [ahead(6.0)])
+	assert missed(client.aimed(model))
+}
+
+test "somebody behind you is not in front of you" {
+	model := joined(still(), [ahead(0.0 - 6.0)])
+	assert missed(client.aimed(model))
+}
+
+// The point of the arena having a middle: cover. The block at the origin is 2
+// metres tall and 6 across, and a player on the far side of it cannot be shot
+// through it — which is the same `entry` test the bullet uses on every wall.
+test "cover works" {
+	mut client.Model model = still()
+	model.body = client.Body(0.0, 0.0, 10.0, 0.0, 0.0, 0.0)
+	behind := whole(2, "Bob", 0.0, 0.0 - 10.0)
+	assert missed(client.aimed(joined(model, [behind])))
+
+	// Standing on top of that same block and aiming down at them, the shot goes
+	// over the edge and lands. The pitch is worked out rather than guessed: from
+	// this eye to that chest is the angle it is.
+	mut client.Model high = model
+	high.body = client.Body(0.0, 2.0, 2.9, 0.0, 0.0, 0.0)
+	high.body.pitch = math.atan2(place.chest() - (2.0 + place.eyes()), 12.9)
+	assert shooting(client.aimed(joined(high, [behind])), 2)
+}
+
+test "a dead player is not a target" {
+	mut wire.Player down = ahead(6.0)
+	down.health = 0
+	assert missed(client.aimed(joined(still(), [down])))
+}
+
+test "a shot with nobody about still stops at the wall" {
+	shot := client.aimed(still())
+	assert missed(shot)
+	// The yard's north wall has its near face at z = -19.5, and the bullet gets
+	// that far and no further.
+	assert shot.bz > 0.0 - 19.6
+	assert shot.bz < 0.0 - 19.4
+}
+
+// One of the horde, as a snapshot delivered it: an id and nothing about whose it
+// is, because it is nobody's.
+func rising(id: Int, x: Float, z: Float): wire.Fiend {
+	return wire.Fiend(id, wire.Breed.Zombie(), x, 0.0, z, 0.0,
+		wire.strength(wire.Breed.Zombie()), 0, false)
+}
+
+func prowling(model: client.Model, pack: wire.Fiend[]): client.Model {
+	mut client.Model next = model
+	mut wire.Fiend[dyn] up = []
+	for each fiend in pack {
+		append(up, fiend)
+	}
+	next.horde = up
+	return next
+}
+
+test "a shot at one of the horde says which one" {
+	shot := client.aimed(prowling(still(), [rising(4, 10.0, 3.0)]))
+	assert shot.at is client.Struck.Undead
+	if shot.at is client.Struck.Undead(id) {
+		assert id == 4
+	}
+}
+
+test "whatever is in front is what is hit" {
+	// One two metres away and a player six: the near one stops the bullet, and
+	// shooting it in the back is a perfectly good idea.
+	blocking := prowling(joined(still(), [ahead(6.0)]), [rising(1, 10.0, 6.0)])
+	assert client.aimed(blocking).at is client.Struck.Undead
+
+	// The other way round, the player is nearer.
+	behind := prowling(joined(still(), [ahead(2.0)]), [rising(1, 10.0, 2.0)])
+	assert shooting(client.aimed(behind), 2)
+}
+
+test "a tracer fades, and a fresh one lives a moment" {
+	mut client.Tracer[dyn] shots = [
+		client.Tracer(0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 100),
+		client.Tracer(0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 20)
+	]
+	assert len(client.fading(shots, 30)) == 1
+}
+
+test "a tracer is drawn between where the shot started and where it stopped" {
+	shot := client.aimed(joined(still(), [ahead(6.0)]))
+	drawn := client.tracing(shot)
+	assert drawn.az == shot.az
+	assert drawn.bz == shot.bz
+	assert drawn.life > 0
+}
+
+// ---------------------------------------------------------------------------
+// Reading the snapshot
+// ---------------------------------------------------------------------------
+// Everything this program knows that it did not work out itself arrives in one
+// message, and `told` is the whole of what it does with it. There is no second copy
+// of a health anywhere in the model, which is what these tests are really about.
+
+test "a welcome is a seat, a world and a place to stand in it" {
+	bare := client.start("ws://127.0.0.1:9200/arena")
+	seated := client.told(bare, wire.Down.Welcome(3, 777, place.Spot(4.0, 5.0, 1.0)))
+	assert seated.seat == 3
+	assert seated.seed == 777
+	assert seated.body.x == 4.0
+	assert seated.body.z == 5.0
+	assert seated.body.yaw == 1.0
+	assert seated.screen is client.Screen.Arena
+	// And the map is a `func` of that number, so arriving cost one message.
+	assert len(place.arena(seated.seed)) == len(place.arena(777))
+}
+
+test "a snapshot is everybody, and your own row is where your health is" {
+	full := client.told(still(), wire.Down.Snapshot(hurtRoster(), somePack()))
+	assert len(full.roster) == 2
+	assert len(client.others(full)) == 1
+	// Your own health, air and score are read out of the roster rather than kept.
+	assert client.mine(full).health == 42
+	assert client.alive(full)
+	assert len(full.horde) == 1
+	// And a later snapshot replaces it rather than being merged into it: the
+	// message *is* the state of the world.
+	quiet := client.told(full, wire.Down.Snapshot(wire.noplayers(), wire.nofiends()))
+	assert len(quiet.roster) == 0
+	assert len(quiet.horde) == 0
+	// Nobody at all, and the screen can still be drawn: an absent row is zeroes.
+	assert client.mine(quiet).health == 0
+	assert client.alive(quiet) == false
+}
+
+func hurtRoster(): wire.Player[dyn] {
+	mut wire.Player[dyn] all = [whole(1, "Ada", 10.0, 8.0), whole(2, "Bob", 2.0, 2.0)]
+	return map(all, at(_, 1, 42))
+}
+
+func somePack(): wire.Fiend[dyn] {
+	mut wire.Fiend[dyn] pack = [rising(1, 0.0, 0.0)]
+	return pack
+}
+
+test "going down lets go of every key" {
+	running := holding(still(), ["w", "mouse1"])
+	mut wire.Player[dyn] flattened = [whole(1, "Ada", 10.0, 8.0)]
+	down := client.told(running, wire.Down.Snapshot(map(flattened, at(_, 1, 0)),
+		wire.nofiends()))
+	assert client.alive(down) == false
+	assert len(down.held) == 0
+}
+
+test "coming back is the one thing that moves this player for them" {
+	back := client.told(still(), wire.Down.Reborn(place.Spot(0.0 - 16.0, 16.0, 2.0)))
+	assert back.body.x == 0.0 - 16.0
+	assert back.body.z == 16.0
+	assert back.body.fall == 0.0
+}
+
+test "somebody else's tracer is one more line on the screen" {
+	before := len(client.world(still()))
+	seen := client.told(still(), wire.Down.Tracer(0.0, 1.0, 0.0, 0.0, 1.0, 0.0 - 9.0))
+	assert len(seen.tracers) == 1
+	assert len(client.world(seen)) == before + 1
+}
+
+// The whole of "single player" is this: a fact about the roster, not a mode. Both
+// of these assertions are the same line of code answering differently — nothing
+// switches over, and there is no match to restart.
+test "one name in the roster is playing alone, and two is not" {
+	assert client.alone(still())
+	assert client.alone(joined(still(), [whole(2, "Bob", 1.0, 1.0)])) == false
+	// And back again when they go, which is just a smaller snapshot.
+	assert client.alone(client.told(still(),
+		wire.Down.Snapshot(oneRow(), wire.nofiends())))
+}
+
+func oneRow(): wire.Player[dyn] {
+	mut wire.Player[dyn] all = [whole(1, "Ada", 10.0, 8.0)]
+	return all
+}
+
+test "the panel says which kind of game it is" {
+	solo := ui.html(client.mode(still()))
+	assert indexOf(solo, "alone") is Result.Ok(_)
+	together := ui.html(client.mode(joined(still(), [whole(2, "Bob", 1.0, 1.0)])))
+	assert indexOf(together, "2 playing") is Result.Ok(_)
+	assert indexOf(together, "kills") is Result.Ok(_)
+}
+
+test "a socket that goes takes the game with it" {
+	playing := joined(still(), [whole(2, "Bob", 1.0, 1.0)])
+	out := client.unjoined(playing)
+	assert out.screen is client.Screen.Lobby
+	assert len(out.roster) == 0
+	assert len(out.horde) == 0
+	assert out.seat == 0
+	// The name is worth keeping: it is the one thing on that screen the player
+	// typed themselves.
+	assert out.me == "Ada"
+}
+
+// ---------------------------------------------------------------------------
+// The water
+// ---------------------------------------------------------------------------
+// Where a swimmer goes is this program's; what being under there costs is the
+// server's. Both ask `lib/place.hive` about the same position, which is why the
+// meter in the corner and the way the keys behave cannot disagree.
+
+// A player floating in the northern half of the lake, which is the half you can
+// walk into from the yard's south gate.
+func afloat(): client.Model {
+	pool := place.plan(seeded()).lake
+	mut client.Model model = still()
+	model.body = client.Body(pool.x, place.floating(), pool.z - pool.d / 2.0 + 3.0,
+		0.0, 0.0, 0.0)
+	return model
+}
+
+test "walking into the lake is swimming in it" {
+	pool := place.plan(seeded()).lake
+	// On the bank three metres north of the water, facing it, holding W.
+	mut client.Model wading = holding(still(), ["w"])
+	wading.body = client.Body(pool.x, 0.0, pool.z - pool.d / 2.0 - 3.0, 0.0, 3.14, 0.0)
+	after := walking(wading, 1.5)
+
+	// Past the shore, and floating rather than standing: the bed is three metres
+	// down and the body is nowhere near it.
+	assert after.z > pool.z - pool.d / 2.0
+	assert after.y < 0.0 - 0.3
+	assert after.y > pool.bed
+	// And slower than the same second and a half on land would have been.
+	assert after.z - (pool.z - pool.d / 2.0 - 3.0) < 1.5 * place.speed()
+}
+
+test "space climbs, control dives, and neither of them leaves the water" {
+	high := walking(holding(afloat(), ["space"]), 1.0)
+	low := walking(holding(afloat(), ["ctrl"]), 1.0)
+	assert high.y > place.floating()
+	assert high.y < place.surface()
+	assert low.y < place.floating()
+	assert low.y > place.plan(seeded()).lake.bed
+	// Swimming is not standing, so there is nothing to jump off.
+	assert client.grounded(afloat()) == false
+	assert client.swimming(afloat())
+}
+
+test "a dive puts your head under, which is the fact the server charges for" {
+	mut client.Model diving = holding(afloat(), ["ctrl"])
+	diving.body = walking(diving, 1.0)
+	assert client.under(diving)
+	// And with the head out it is not under, which is the same `func` the server
+	// calls about the position this client is about to send it.
+	mut client.Model up = diving
+	up.body.y = 0.0 - 0.2
+	assert client.under(up) == false
+}
+
+// The dam is the reason to dive, and this is the whole of why it works: the two
+// comparisons in `place.inside` that stop a floater are the two that let a diver
+// past. There is no rule about water in either of them.
+test "the dam is a wall to a swimmer and a doorway to a diver" {
+	plan := place.plan(seeded())
+	solid := place.arena(seeded())
+	pool := plan.lake
+	// Two metres in from the lake's eastern shore, where the island never reaches.
+	edge := pool.x + pool.w / 2.0 - 2.0
+	assert place.clear(solid, edge, place.floating(), plan.dam) == false
+	assert place.clear(solid, edge, pool.bed + 0.4, plan.dam)
+}
+
+test "the island is climbed out of the water, not walked onto" {
+	plan := place.plan(seeded())
+	solid := place.arena(seeded())
+	// On the rim of the sandbank rather than the middle of it, which is where a
+	// swimmer arrives.
+	rim := plan.island.x + place.sandbank() / 2.0 - 0.5
+	// Floating up against it, the sandbank is in the way...
+	assert place.clear(solid, rim, place.floating(), plan.island.z) == false
+	// ...and with the space bar held, which lifts a swimmer to just under the
+	// surface, it is something to step onto instead.
+	assert place.clear(solid, rim, place.surface() - 0.4, plan.island.z)
+	// Its top is out of the water and the beacon on it is the tallest thing for
+	// thirty metres.
+	assert place.ledge(solid, plan.island.x, plan.island.z, 1.0) > place.surface()
+}
+
+test "a full breath is not on the screen, and a spent one is" {
+	assert ui.html(client.lungs(still())) == "<!--none-->"
+	gasping := breathless(still())
+	assert indexOf(ui.html(client.lungs(gasping)), "drowning") is Result.Ok(_)
+}
+
+// The air is the server's number, so a test sets it where it arrives: in the row.
+func breathless(model: client.Model): client.Model {
+	mut client.Model next = model
+	next.roster = map(model.roster, spent(_, model.seat))
+	return next
+}
+
+func spent(one: wire.Player, seat: Int): wire.Player {
+	if one.seat != seat {
+		return one
+	}
+	mut wire.Player empty = one
+	empty.air = 0
+	return empty
+}
+
+test "you can tell where you are, and where everybody else is" {
+	plan := place.plan(seeded())
+	assert client.whereabouts(still()) == "the yard"
+	assert place.district(plan, plan.lake.x, place.floating(), plan.lake.z - 6.0)
+		== "the lake"
+	assert place.district(plan, plan.island.x, 0.5, plan.island.z) == "the island"
+	assert place.district(plan, plan.towerX, 1.0, plan.towerZ) == "the tower"
+	assert place.district(plan, plan.shedX, 0.0, plan.shedZ) == "the warehouse"
+	// Four metres up over open ground is the walkway, and nowhere else is.
+	assert place.district(plan, 8.0, plan.deck, plan.towerZ) == "the causeway"
+}
+
+// ---------------------------------------------------------------------------
+// Talking
+// ---------------------------------------------------------------------------
+// The chat is `func`s of the state like everything else, so a conversation can be
+// had here with no keyboard, no window and no server in it.
+
+test "a line is typed one key at a time" {
+	open := client.opening(still())
+	assert open.composing
+	mut client.Model saying = open
+	for each key in ["h", "i", "space", "b", "o", "b"] {
+		saying = client.typed(saying, key)
+	}
+	assert saying.saying == "hi bob"
+}
+
+test "starting a line lets go of whatever was held" {
+	running := holding(still(), ["w", "mouse1"])
+	assert len(client.opening(running).held) == 0
+}
+
+test "backspace takes one back, and what is not text is ignored" {
+	saying := client.typed(client.typed(client.opening(still()), "n"), "o")
+	assert client.typed(saying, "backspace").saying == "n"
+	// Shift, tab and the arrows are pressed while typing and none of them is a
+	// letter — nor is a mouse button, which arrives as a key like everything else.
+	assert client.typed(saying, "shift").saying == "no"
+	assert client.typed(saying, "tab").saying == "no"
+	assert client.typed(saying, "up").saying == "no"
+	assert client.typed(saying, "mouse1").saying == "no"
+	// And backspace on nothing is nothing.
+	assert client.rubbed("") == ""
+	assert client.rubbed("a") == ""
+}
+
+test "a line sent or forgotten is a line no longer being typed" {
+	saying := client.typed(client.opening(still()), "x")
+	closed := client.sealed(saying)
+	assert closed.composing == false
+	assert closed.saying == ""
+	// Sealing a line is not sending it, and sending it does not put it on this
+	// screen either: it comes back from the server with everybody else's copy.
+	assert len(closed.chat) == 0
+	assert len(client.say(closed, "hello").chat) == 0
+}
+
+test "nobody says more than a mouthful" {
+	mut Str shout = ""
+	for i := 0; i < 200; i++ {
+		shout = "{shout}x"
+	}
+	assert len(split(client.clipped(shout), "")) == client.mouthful()
+	// And a line that arrives from the server is cut the same way: the server
+	// decides how much of the wire a client may take, and this screen decides how
+	// much of itself a line may take.
+	loud := client.spoke(still(), 2, "Bob", shout)
+	for each line in loud.chat {
+		assert len(split(line.text, "")) == client.mouthful()
+	}
+}
+
+test "what somebody said arrives with their name and their colour" {
+	talking := client.told(still(), wire.Down.Said(2, "Zoe", "anybody there?"))
+	assert len(talking.chat) == 1
+	for each line in talking.chat {
+		assert line.who == "Zoe"
+		assert line.seat == 2
+		assert line.text == "anybody there?"
+	}
+	// The badge is the same colour that player's body is in the picture, which is
+	// what makes "the green one" mean one person in both places.
+	strip := ui.html(client.chatter(talking))
+	assert indexOf(strip, "Zoe") is Result.Ok(_)
+	assert indexOf(strip, "anybody there?") is Result.Ok(_)
+}
+
+// The server says things too, about people arriving and leaving, and it says them
+// as seat zero — which is nobody, and reads as the arena itself.
+test "the arena speaks for itself" {
+	joinedUp := client.told(still(), wire.Down.Said(0, "", "Bob joined"))
+	strip := ui.html(client.chatter(joinedUp))
+	assert indexOf(strip, "arena") is Result.Ok(_)
+	assert indexOf(strip, "Bob joined") is Result.Ok(_)
+}
+
+test "only the last few lines are kept, and they go quiet on their own" {
+	mut client.Model talking = still()
+	for i := 0; i < 9; i++ {
+		talking = client.spoke(talking, 2, "Bob", "line {i}")
+	}
+	assert len(talking.chat) == client.remembered()
+	assert len(filter(talking.chat, said(_, "line 8"))) == 1
+	assert len(filter(talking.chat, said(_, "line 0"))) == 0
+
+	// Fourteen seconds later there is nothing on the screen, and nothing had to be
+	// cleared away.
+	assert len(client.hushed(talking.chat, client.chatting())) == 0
+	assert len(client.hushed(talking.chat, 100)) == client.remembered()
+}
+
+func said(line: client.Line, text: Str): Bool {
+	return line.text == text
+}
+
+test "a frame quietens the chat, the same frame that fades the tracers" {
+	talking := client.spoke(still(), 2, "Bob", "hello")
+	after := client.stepped(talking, 100)
+	for each line in after.chat {
+		assert line.life == client.chatting() - 100
+	}
+}
+
+test "the line being typed is on the screen, and the mouse is not given back for it" {
+	mut client.Model saying = client.opening(still())
+	for each key in ["z", "o", "o"] {
+		saying = client.typed(saying, key)
+	}
+	strip := ui.html(client.chatter(saying))
+	assert indexOf(strip, "zoo") is Result.Ok(_)
+	// Typing is not a reason to let go of the picture.
+	assert client.playing(saying)
+}
+
+test "what is said cannot smuggle markup onto the screen" {
+	loud := client.spoke(still(), 2, "Bob", "<script>alert(1)</script>")
+	strip := ui.html(client.chatter(loud))
+	assert indexOf(strip, "<script>") is Result.Error(_)
+	assert indexOf(strip, "&lt;script&gt;") is Result.Ok(_)
+}
+
+// ---------------------------------------------------------------------------
+// The screen
+// ---------------------------------------------------------------------------
+// A view is a value, so a test can read one. `hive.ui.html` is the same renderer a
+// served page uses and needs no browser, no screenshot and no socket.
+
+test "the lobby will not let you join without a name and somewhere to go" {
+	// A fresh model is in the lobby, with a URL filled in and no name.
+	bare := ui.html(client.view(client.start("ws://127.0.0.1:9200/arena")))
+	assert indexOf(bare, "disabled") is Result.Ok(_)
+
+	mut client.Model filled = client.start("ws://127.0.0.1:9200/arena")
+	filled.me = "Ada"
+	assert indexOf(ui.html(client.view(filled)), "disabled") is Result.Error(_)
+
+	// And not twice: while it is waiting for a seat, the button is not a button.
+	mut client.Model knocking = filled
+	knocking.screen = client.Screen.Joining()
+	page := ui.html(client.view(knocking))
+	assert indexOf(page, "disabled") is Result.Ok(_)
+	assert indexOf(page, "waiting for a seat") is Result.Ok(_)
+	assert client.ready(knocking) == false
+	// And there is a way out of waiting, which a server that accepts a connection
+	// and then says nothing is the reason for.
+	assert indexOf(page, "Cancel") is Result.Ok(_)
+}
+
+test "a name is a name, and spaces are not" {
+	assert client.usable("Ada")
+	assert client.usable("   ") == false
+	assert client.usable("") == false
+}
+
+test "the panel says what is in front of the game" {
+	down := hurt(still(), 0)
+	assert indexOf(ui.html(client.panel(down)), "You went down") is Result.Ok(_)
+
+	waiting := still()
+	assert indexOf(ui.html(client.panel(waiting)), "Click to play") is Result.Ok(_)
+
+	mut client.Model playing = still()
+	playing.aiming = true
+	assert ui.html(client.panel(playing)) == "<!--none-->"
+}
+
+// The count is the server's, and the panel reads it off the same row everything
+// else does.
+test "the count until you are back comes from the server" {
+	mut client.Model down = hurt(still(), 0)
+	down.roster = map(down.roster, counting(_, 1200))
+	assert indexOf(ui.html(client.panel(down)), "2s") is Result.Ok(_)
+}
+
+func counting(one: wire.Player, ms: Int): wire.Player {
+	mut wire.Player waiting = one
+	waiting.down = ms
+	return waiting
+}
+
+test "the mouse is only asked for while the game is being played" {
+	assert client.playing(still())
+	mut client.Model reading = still()
+	reading.board = true
+	assert client.playing(reading) == false
+	assert client.playing(client.start("ws://127.0.0.1:9200/arena")) == false
+}
+
+test "the health bar empties as the health goes" {
+	full := ui.html(client.bar(100))
+	// Ten cells, and at full health every one of them is the good colour.
+	assert len(split(full, "h-bg-good")) == 11
+	assert len(split(ui.html(client.bar(50)), "h-bg-warn")) == 6
+	assert len(split(ui.html(client.bar(10)), "h-bg-danger")) == 2
+}
+
+test "a name cannot smuggle markup onto the screen" {
+	mut client.Model model = still()
+	model.me = "<script>alert(1)</script>"
+	page := ui.html(client.view(model))
+	assert indexOf(page, "<script>") is Result.Error(_)
+	assert indexOf(page, "&lt;script&gt;") is Result.Ok(_)
+}
+
+// A scene is a value too, so what is *in* the world is as readable as the panel
+// around it — no picture required.
+test "the world holds the arena, and a player is four shapes of it" {
+	empty := len(client.world(still()))
+	crowded := len(client.world(joined(still(), [whole(2, "Bob", 2.0, 2.0)])))
+	assert crowded == empty + 4
+
+	// Somebody who has gone down is one shape lying on the floor, not four.
+	mut wire.Player fallen = whole(2, "Bob", 2.0, 2.0)
+	fallen.health = 0
+	assert len(client.world(joined(still(), [fallen]))) == empty + 1
+
+	// And this player is never in it: this player is the camera.
+	assert len(client.world(hurt(still(), 0))) == empty
+}
+
+test "everything the server says is standing is drawn" {
+	empty := len(client.world(still()))
+	// Four shapes each: a body, a head and two of whatever it holds out in front.
+	two := prowling(still(), [rising(1, 0.0, 0.0),
+		wire.Fiend(2, wire.Breed.Merman(), place.plan(seeded()).lake.x,
+			place.floating(), place.plan(seeded()).lake.z, 0.0, 80, 0, false)])
+	assert len(client.world(two)) == empty + 8
+
+	// A bat is three, and so is a vampire on its feet — but they are not the same
+	// three, which is the point of drawing the two differently.
+	air := prowling(still(), [wire.Fiend(3, wire.Breed.Vampire(), 0.0, 6.0, 0.0, 0.0,
+		78, 0, true)])
+	assert len(client.world(air)) == empty + 3
+}
+
+test "each breed is its own colour, and shows what has been shot out of it" {
+	assert client.rot(68) != client.rot(20)
+	assert client.scale(80) != client.scale(20)
+	assert client.pallor(78) != client.pallor(20)
+	// And no two breeds are the same colour at full health, which is what makes
+	// them tellable apart in the dark.
+	assert client.rot(68) != client.scale(80)
+	assert client.scale(80) != client.pallor(78)
+}
+
+// Two seats next to each other are two small integers, and small integers look
+// alike — which is why the colour goes through the same mixing the map does.
+test "two players are told apart by colour" {
+	assert client.colour(1) != client.colour(2)
+	assert client.colour(2) != client.colour(3)
+	assert client.colour(1) != client.colour(8)
+}
+
+test "the score lists you and everybody else, off the same roster" {
+	board := ui.html(client.scores(joined(still(), [
+		whole(2, "Bob", 1.0, 1.0),
+		whole(3, "Cai", 0.0 - 32.0, 30.0)
+	])))
+	assert indexOf(board, "(you)") is Result.Ok(_)
+	assert indexOf(board, "Bob") is Result.Ok(_)
+	assert indexOf(board, "Cai") is Result.Ok(_)
+	// And where everybody was in the last snapshot, which on a place this size is
+	// the difference between a score board and a way of finding anybody.
+	assert indexOf(board, "the market") is Result.Ok(_)
+}
+
+// ---------------------------------------------------------------------------
+// The command line, and the fold's edges
+// ---------------------------------------------------------------------------
+
+test "the argument is taken as a URL, or made into one" {
+	assert client.asked("ws://10.0.0.4:9300/arena") == "ws://10.0.0.4:9300/arena"
+	assert client.asked("wss://arena.example/play") == "wss://arena.example/play"
+	// A host and a port is the common case for a second machine, and a bare port
+	// the common case for a second terminal.
+	assert client.asked("10.0.0.4:9300") == "ws://10.0.0.4:9300/arena"
+	assert client.asked("9300") == "ws://127.0.0.1:9300/arena"
+	// And nonsense gets the default rather than an error: where to join is not
+	// worth failing over, and the field is still there to correct it in.
+	assert client.asked("nonsense") == "ws://127.0.0.1:9200/arena"
+}
+
+// Enter on either field means Join, and the text is thrown away: it is already in
+// the model.
+test "pressing enter in a field joins" {
+	assert client.joinedOf("whatever") is client.Msg.Joined
+}
+
+test "letting go of one key keeps the others" {
+	assert client.isNotKey("w", "space")
+	assert client.isNotKey("w", "w") == false
+}
+
+// ---------------------------------------------------------------------------
+// The frame
+// ---------------------------------------------------------------------------
+
+test "a frame reloads, fades and moves, all at once" {
+	mut client.Model firing = holding(still(), ["w"])
+	firing.cooldown = 100
+	append(firing.tracers, client.Tracer(0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 60))
+	after := client.stepped(firing, 40)
+	assert after.cooldown == 60
+	assert len(after.tracers) == 1
+	assert after.body.z < still().body.z
+}
+
+test "a reload cannot go past ready" {
+	mut client.Model waiting = still()
+	waiting.cooldown = 10
+	assert client.stepped(waiting, 40).cooldown == 0
+}
+
+// A frame that took a quarter of a second — a window that was hidden, or a machine
+// that was busy — moves a player by a twentieth of a second's worth. A world
+// stepped by the real gap would teleport them through a wall.
+test "a very late frame does not teleport anybody" {
+	late := client.stepped(holding(still(), ["w"]), 250)
+	assert late.body.z > 0.0 - 0.35
+}
+
+// Somebody who is down does not walk, and does not come back on their own either:
+// when they are back up is the server's call, and it arrives as a `Reborn`.
+test "somebody who is down does not walk, and waits to be told they are back" {
+	gone := hurt(holding(still(), ["w"]), 0)
+	waiting := client.stepped(gone, 100)
+	assert waiting.body.z == still().body.z
+	assert client.alive(waiting) == false
+
+	// A thousand frames later they are still down, because nothing in this program
+	// decides otherwise.
+	mut client.Model patient = waiting
+	for i := 0; i < 100; i++ {
+		patient = client.stepped(patient, 16)
+	}
+	assert client.alive(patient) == false
+
+	back := client.told(patient, wire.Down.Reborn(place.spot(3, seeded())))
+	assert back.body.x == place.spot(3, seeded()).x
+	// And whole again the moment the snapshot that says so arrives.
+	assert client.alive(client.told(back,
+		wire.Down.Snapshot(oneRow(), wire.nofiends())))
+}
+
+// The position that goes up the wire, on its own clock. Fifteen times a second
+// rather than sixty, and the counter is in the model rather than anywhere else.
+test "a player's position goes up four frames out of sixty" {
+	mut client.Model playing = still()
+	playing.beat = 40
+	assert client.stepped(playing, 16).beat == 24
+	// A frame that takes it past zero is the frame `ticked` sends on, and it is set
+	// back to sixty-six.
+	assert client.stepped(playing, 50).beat < 0
+}

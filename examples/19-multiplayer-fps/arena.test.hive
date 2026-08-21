@@ -1,0 +1,282 @@
+// Both halves, over a real socket
+// ==============================
+// The other two suites are arithmetic: `client.test.hive` walks a player into a
+// wall with no server in it, and `server.test.hive` holds a whole game with no
+// socket in it. Neither of them can check the one thing that matters most about a
+// program written in two halves — **that the two halves agree** — because agreeing
+// is a fact about the wire, and nothing but the wire can settle it.
+//
+// So this file imports both programs and runs them against each other: a real
+// `wsServe` on a real port, the real `client.listening` reading it, the real
+// `client.tell` and `client.fire` and `client.ticked` writing to it, and the real
+// `client.told` folding everything that comes back. Every line below an assertion
+// is code that ships.
+//
+// **What it cannot reach** is `client.update` and `server.referee` themselves: they
+// are handlers, an envelope is opaque, and one only ever arrives as a handler's own
+// argument. So the window is stood in for by a fold of the same shape — folding
+// `client.told`, which is the real one — and the server's fold is spawned exactly
+// as `server.main` spawns it and then reached only down a socket, which is how a
+// client reaches it too.
+//
+//   hive test arena.test.hive
+
+import ./server
+import ./client
+import ./lib/place
+import ./lib/wire
+
+// One player, from the test's side: the window its reader posts into, and the
+// socket. The socket is out here rather than inside the service on purpose — a
+// service's state is private, and a connection is not a thing that can come back
+// out of one in a message. Which is the same reason the server keeps its sockets in
+// a service *per socket* rather than in the fold.
+type Player {
+	box: hive.syslink.Address
+	conn: hive.net.WsConnection
+}
+
+// A stand-in for the window. It is the same mailbox type the real one folds, and
+// the two branches that matter fold it with the real functions; anything else is
+// answered with a report of what it is holding, because a service's state is
+// private and asking is the only way to read one.
+proc window(model: client.Model, msg: client.Msg, from: hive.syslink.Envelope): client.Model {
+	if msg is client.Msg.Heard(news) {
+		return client.told(model, news)
+	}
+	if msg is client.Msg.Lost(why) {
+		mut client.Model out = client.unjoined(model)
+		out.trouble = why
+		return out
+	}
+	hive.syslink.answer(from, client.Msg.Heard(wire.Down.Said(model.seat, model.me,
+		report(model))))
+	return model
+}
+
+// What this client believes, as one line. Every number in it came off the wire.
+func report(model: client.Model): Str {
+	me := client.mine(model)
+	return "seat {model.seat} · world {model.seed} · {len(model.roster)} playing"
+		+ " · health {me.health} · air {me.air} · kills {me.kills} · deaths {me.deaths}"
+		+ " · {len(model.horde)} up · {len(model.tracers)} tracers"
+		+ " · [{standing(model)}] · [{said(model)}] · {screen(model)}"
+}
+
+// Where the last snapshot put everybody, to the metre — so an assertion about
+// somebody walking does not depend on the last digit of a float.
+func standing(model: client.Model): Str {
+	mut Str[dyn] all = []
+	for each one in model.roster {
+		append(all, "{one.who}@{metres(one.x)},{metres(one.z)}")
+	}
+	return join(all, " ")
+}
+
+func said(model: client.Model): Str {
+	mut Str[dyn] lines = []
+	for each line in model.chat {
+		append(lines, "{line.who}: {line.text}")
+	}
+	return join(lines, " | ")
+}
+
+func screen(model: client.Model): Str {
+	if model.screen is client.Screen.Arena {
+		return "playing"
+	}
+	if model.screen is client.Screen.Joining {
+		return "joining"
+	}
+	return "lobby"
+}
+
+func metres(n: Float): Int {
+	return hive.conv.round(n)
+}
+
+// Asking a window what it has. The reply is one of the mailbox's own messages,
+// which is why nothing here is annotated.
+proc asking(one: Player): Str {
+	answer := one.box(client.Msg.Left()) with timeout 3000
+	if answer is Result.Ok(reply) && reply is client.Msg.Heard(news) {
+		if news is wire.Down.Said(_, _, text) {
+			return text
+		}
+	}
+	return "no answer"
+}
+
+func holds(told: Str, what: Str): Bool {
+	if indexOf(told, what) is Result.Ok(_) {
+		return true
+	}
+	return false
+}
+
+// A model whose link is that socket. It is what the real fold is holding; a test
+// cannot read one out of a service, so this builds the same thing beside it, and
+// every `tell` below goes down the link in it.
+func speaking(one: Player, who: Str): client.Model {
+	mut client.Model model = client.start("ws://127.0.0.1:9289/arena")
+	model.me = who
+	model.link = client.Link.Live(one.conn)
+	return model
+}
+
+// The same, alive and standing in the yard — which is what `client.ticked` needs to
+// walk anybody: it will not move a player the roster says is down.
+//
+// The seed is this test's own rather than the server's, and that is safe for
+// exactly one reason: **the yard is the same on every map** (see `place.yard`), and
+// three metres north of here is yard on any seed there is.
+func afoot(one: Player, seat: Int, who: Str): client.Model {
+	mut client.Model model = speaking(one, who)
+	model.seat = seat
+	model.seed = 4242
+	model.screen = client.Screen.Arena()
+	model.body = client.Body(10.0, 0.0, 8.0, 0.0, 0.0, 0.0)
+	mut wire.Player[dyn] only = [
+		wire.Player(seat, who, 10.0, 0.0, 8.0, 0.0, 100, place.breath(), 0, 0, 0, 0)
+	]
+	model.roster = only
+	mut Str[dyn] keys = ["w"]
+	model.held = keys
+	return model
+}
+
+// Joining, which is `client.joining` with its two lines that need an envelope
+// written out here instead: the connect, and the `self` that hands the window's
+// address to the reader.
+proc joining(who: Str): Player {
+	opened := hive.net.wsConnect("ws://127.0.0.1:9289/arena")
+	if opened is Result.Ok(conn) {
+		mut client.Model model = client.start("ws://127.0.0.1:9289/arena")
+		model.me = who
+		model.link = client.Link.Live(conn)
+		model.screen = client.Screen.Joining()
+		box := hive.syslink.spawn(window, model)
+		one := Player(box, conn)
+		// The real reader, on a thread of its own, and the real first thing a
+		// client says.
+		async client.listening(conn, box)
+		client.tell(model, wire.Up.Join(who))
+		return one
+	}
+	panic "could not reach the arena on 9289"
+}
+
+// A click, three times — through the client's own `fire`, which is what puts a
+// tracer and a claim on the wire and nothing else.
+proc shooting(one: Player, who: Str, seat: Int): void {
+	model := speaking(one, who)
+	for i := 0; i < 3; i++ {
+		client.fire(model, client.Shot(client.Struck.Player(seat), 0.0, 1.6, 0.0,
+			1.0, 1.6, 1.0))
+	}
+}
+
+proc saying(one: Player, who: Str, text: Str): void {
+	client.say(speaking(one, who), text)
+}
+
+proc leaving(one: Player, who: Str): void {
+	client.tell(speaking(one, who), wire.Up.Left())
+	hive.net.wsClose(one.conn)
+}
+
+test "a whole game crosses a real websocket" {
+	// The server, exactly as `server.main` starts it: one fold holding the world,
+	// one clock, and `wsServe` handing every connection to `seated` on a thread of
+	// its own.
+	desk := hive.syslink.spawn(server.referee, server.mustered())
+	async server.keeping(desk)
+	async hive.net.wsServe(9289, server.seated(desk, _))
+	// Give the listener a moment to bind before dialling it.
+	hive.task.sleep(300)
+
+	ada := joining("Ada")
+	hive.task.sleep(500)
+
+	// Seated, in a world, and on the screen the game is drawn on — all three out of
+	// one `Welcome`, folded by the client's own `told`. The map never crossed: that
+	// number is the whole of it.
+	seated := asking(ada)
+	assert holds(seated, "seat 1")
+	assert holds(seated, "1 playing")
+	assert holds(seated, "health 100")
+	assert holds(seated, "air {place.breath()}")
+	assert holds(seated, "playing")
+
+	// Snapshots arrive on their own, fifteen times a second, without anybody asking
+	// for one — which is what that roster is made of, and what the next assertion
+	// watches change.
+	bob := joining("Bob")
+	hive.task.sleep(500)
+	assert holds(asking(ada), "2 playing")
+	assert holds(asking(bob), "seat 2")
+	assert holds(asking(bob), "2 playing")
+
+	// Ada walks, with the client's own `ticked`: it steps the body sixty times a
+	// second and, when its own clock runs out, puts the position on the wire itself.
+	mut client.Model walking = afoot(ada, 1, "Ada")
+	for i := 0; i < 30; i++ {
+		walking = client.ticked(walking, 16)
+	}
+	assert walking.body.z < 6.0
+	hive.task.sleep(400)
+	// And Bob's screen has her where she walked to, without either client knowing
+	// the other exists: she went north, so she is no longer at the eight she started
+	// at, and her x has not moved.
+	moved := asking(bob)
+	assert holds(moved, "Ada@10,")
+	assert holds(moved, "Ada@10,8") == false
+
+	// Bob shoots Ada, three times, through his own `fire`. The damage is in none of
+	// those messages — the server owns what a bullet is worth — and what comes back
+	// is Ada's health, on Ada's socket.
+	shooting(bob, "Bob", 1)
+	hive.task.sleep(400)
+	shot := asking(ada)
+	assert holds(shot, "health 0")
+	assert holds(shot, "deaths 1")
+	// And Ada saw all three tracers, because they were somebody else's shots.
+	assert holds(shot, "3 tracers")
+	// Bob is credited, on Bob's own screen, by the only thing entitled to say so.
+	assert holds(asking(bob), "kills 1")
+
+	// Which is what the panel on Ada's screen draws from: down, and the server
+	// counting. A little over two seconds later it sends her back up, and
+	// `client.told` moves her body — the one thing the server does that for.
+	hive.task.sleep(place.mourning() + 700)
+	assert holds(asking(ada), "health 100")
+
+	// A line of chat goes to everybody including whoever said it, down the socket
+	// that is already carrying the positions. There is no chat server, no second
+	// port and no second connection anywhere.
+	saying(bob, "Bob", "over here")
+	hive.task.sleep(400)
+	assert holds(asking(ada), "Bob: over here")
+	assert holds(asking(bob), "Bob: over here")
+	// A line of nothing is not sent, and nothing on either screen says otherwise.
+	saying(bob, "Bob", "   ")
+	hive.task.sleep(300)
+	assert holds(asking(ada), "over here | ") == false
+
+	// The horde is the server's, and it grows on its own clock: nobody asked for one
+	// and there are some, on both screens.
+	assert holds(asking(ada), "0 up") == false
+	assert holds(asking(bob), "0 up") == false
+
+	// Bob leaves — his own `Up.Left`, which is what the Leave button sends — and
+	// Ada's next snapshot has one player in it.
+	leaving(bob, "Bob")
+	hive.task.sleep(500)
+	assert holds(asking(ada), "1 playing")
+
+	// And a client whose connection goes is told so by its own reader thread, and
+	// gives the game up rather than drawing one that has stopped.
+	hive.net.wsClose(ada.conn)
+	hive.task.sleep(400)
+	assert holds(asking(ada), "lobby")
+}

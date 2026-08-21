@@ -1,0 +1,972 @@
+// Tests for the arena server
+// ==========================
+// A game server is the last place you would expect to be able to test anything
+// without running it, and this file is what the split in `server.hive` buys: the
+// world, the horde, the health, the scores and the wire are all `func`s and
+// `proc`s of a `World`, so every one of them can be called here — with no socket,
+// no clock and no client anywhere.
+//
+// **What cannot be called is `referee` itself**, and that is deliberate: it is a
+// handler, an envelope is opaque, and one only ever arrives as a handler's own
+// argument. So everything that fold decides lives in `heard`, `ticked` and `waking`
+// below it, and this file is the proof that this was worth doing — those three take
+// no envelope and a test drives them directly.
+//
+// Everything here is arithmetic, and deliberately: there is not a socket in the
+// file. The one thing arithmetic cannot check is that the two programs agree about
+// the wire, and that is `arena.test.hive` next door — a real server, a real client,
+// and a real websocket between them.
+//
+//   hive test server.test.hive
+
+import ./server
+import ./lib/place
+import ./lib/wire
+import ./lib/horde
+import hive.math
+import hive.conv
+
+// The seed these tests are played on.
+//
+// The map is a `func` of it, so a fixed seed is a fixed map and every coordinate
+// below means the same thing on every run and every machine — which is the other
+// half of what generating a world out of a number buys you. The yard is the same on
+// every map anyway; the tests that are about the *generator* rather than about this
+// one map loop over seeds instead of using this.
+func seeded(): Int {
+	return 4242
+}
+
+func made(): place.Plan {
+	return place.plan(seeded())
+}
+
+func blocks(): place.Block[dyn] {
+	return place.arena(seeded())
+}
+
+// An address nothing is listening to. `hive.syslink.at` performs no I/O and cannot
+// fail — it is address construction rather than a lookup — so a test may name a
+// service that was never started, and an `async` at it goes quietly nowhere.
+//
+// Which is exactly what a test of the world wants: the fold below really does send
+// its snapshots, to a real address, and there is nobody on the other end.
+func nowhere(): hive.syslink.Address {
+	return hive.syslink.at(#Nobody)
+}
+
+// One player, whole, standing where they are put.
+func sitting(number: Int, who: Str, x: Float, z: Float): server.Seat {
+	return server.Seat(number, who, nowhere(), x, 0.0, z, 0.0, 100, place.breath(),
+		0, 0, 0, 0, 0, 0)
+}
+
+// A game with these people in it and nothing else.
+func game(seats: server.Seat[]): server.World {
+	mut server.Seat[dyn] taken = []
+	for each seat in seats {
+		append(taken, seat)
+	}
+	return server.World(seeded(), taken, wire.nofiends(), horde.broods(),
+		len(taken), 0, 0)
+}
+
+// One player, in open ground in the yard. The spot matters and is worth saying why:
+// the middle of the arena is a block, so somebody at the origin would be *inside*
+// it — and every test below reads better from somewhere there is room.
+func alone(): server.World {
+	return game([sitting(1, "Ada", 10.0, 8.0)])
+}
+
+// Two, near each other.
+func pair(): server.World {
+	return game([sitting(1, "Ada", 10.0, 8.0), sitting(2, "Bob", 10.0, 2.0)])
+}
+
+func carrying(world: server.World, pack: wire.Fiend[]): server.World {
+	mut server.World next = world
+	mut wire.Fiend[dyn] up = []
+	for each fiend in pack {
+		append(up, fiend)
+	}
+	next.pack = up
+	return next
+}
+
+// The horde, one step, against whoever is playing.
+func stirring(world: server.World, ms: Int): horde.Assault {
+	return horde.stirred(made(), blocks(), world.pack, server.hunted(world), ms)
+}
+
+// One of each breed, standing where it is put.
+func rising(id: Int, x: Float, z: Float): wire.Fiend {
+	return wire.Fiend(id, wire.Breed.Zombie(), x, 0.0, z, 0.0,
+		wire.strength(wire.Breed.Zombie()), 0, false)
+}
+
+func finned(id: Int, x: Float, z: Float): wire.Fiend {
+	return wire.Fiend(id, wire.Breed.Merman(), x, place.floating(), z, 0.0,
+		wire.strength(wire.Breed.Merman()), 0, false)
+}
+
+func fanged(id: Int, x: Float, y: Float, z: Float, flying: Bool): wire.Fiend {
+	return wire.Fiend(id, wire.Breed.Vampire(), x, y, z, 0.0,
+		wire.strength(wire.Breed.Vampire()), 0, flying)
+}
+
+func isBreed(a: wire.Breed, b: wire.Breed): Bool {
+	return a == b
+}
+
+// ---------------------------------------------------------------------------
+// The generator
+// ---------------------------------------------------------------------------
+// Two assertions carry the whole design. The same seed is the same map — which is
+// what lets one number travel to every client instead of a map — and two seeds are
+// not, which is what makes a game worth playing twice. Everything else in this
+// section is an *invariant*: something the generator has to promise about a map
+// nobody has looked at, which is the only way procedural ground can be tested at
+// all.
+
+test "the same seed is the same map, on every machine and every run" {
+	assert place.arena(9) == place.arena(9)
+	assert place.arena(123456) == place.arena(123456)
+}
+
+test "no two seeds are the same map" {
+	assert place.arena(1) != place.arena(2)
+	assert place.arena(1000) != place.arena(1001)
+	assert place.arena(31337) != place.arena(4242)
+	// And not in one number either: the districts themselves come out differently.
+	mut Int alike = 0
+	for i := 0; i < 12; i++ {
+		if place.plan(i * 37).deck == place.plan(i * 37 + 37).deck {
+			alike = alike + 1
+		}
+	}
+	assert alike < 6
+}
+
+test "every spot the server sends anybody to is somewhere they can stand" {
+	for s := 0; s < 8; s++ {
+		seed := 1000 + s * 977
+		solid := place.arena(seed)
+		plan := place.plan(seed)
+		for i := 0; i < place.spots(); i++ {
+			where := place.spot(i, seed)
+			assert place.clear(solid, where.x, 0.0, where.z)
+			assert math.abs(where.x) < place.edge()
+			assert math.abs(where.z) < place.edge()
+			// And on dry land: coming back into the lake would be coming back
+			// drowning.
+			assert place.dry(plan, where.x, where.z)
+		}
+	}
+}
+
+// The stair the generator builds is a stair whatever height it decided the loft
+// should be at — which is the sort of promise a generated map lives or dies on, and
+// it is four lines of arithmetic to check.
+test "the warehouse crates are climbable on any map" {
+	for s := 0; s < 6; s++ {
+		plan := place.plan(5 + s * 811)
+		mut Float highest = 0.0 - 99.0
+		mut Float lowest = 99.0
+		mut Int crates = 0
+		for each crate in place.stair(plan) {
+			lid := crate.y + crate.h / 2.0
+			if lid > highest {
+				highest = lid
+			}
+			if lid < lowest {
+				lowest = lid
+			}
+			crates = crates + 1
+		}
+		assert crates == 4
+		// The first one is a jump from the floor, every one after it is a jump from
+		// the one below, and the last step onto the loft is a walk.
+		rise := (highest - lowest) / conv.itf(crates - 1)
+		assert lowest < 1.3
+		assert rise < 1.3
+		assert plan.deck - highest <= 0.36
+	}
+}
+
+test "every map has a lake to swim in, with a dam across it and an island beyond" {
+	for s := 0; s < 6; s++ {
+		seed := 3 + s * 733
+		plan := place.plan(seed)
+		pool := plan.lake
+		// Deep enough that a player cannot stand on the bottom and see out.
+		assert pool.bed < 0.0 - place.eyes()
+		// Inside the walls, with room to spare.
+		assert math.abs(pool.x) + pool.w / 2.0 < place.edge()
+		assert math.abs(pool.z) + pool.d / 2.0 < place.edge()
+		// The dam is in the water, and the island is beyond it — so the island is
+		// either a dive or the long way round, on every map there is.
+		assert place.wet(plan, pool.x, plan.dam)
+		assert plan.island.z > plan.dam
+		assert place.wet(plan, plan.island.x, plan.island.z)
+	}
+}
+
+test "hex digits are the number they spell" {
+	assert server.hexOf("ff") == 255
+	assert server.hexOf("10") == 16
+	assert server.hexOf("0") == 0
+	// Anything that is not a digit contributes nothing rather than failing.
+	assert server.hexOf("z") == 0
+}
+
+// ---------------------------------------------------------------------------
+// The horde
+// ---------------------------------------------------------------------------
+
+test "the dead walk at whoever is nearest" {
+	// One three metres behind the player, which is further than it can reach.
+	world := carrying(alone(), [rising(1, 10.0, 11.0)])
+	after := stirring(world, 100)
+	assert len(after.horde) == 1
+	assert len(after.bitten) == 0
+	for each fiend in after.horde {
+		// It closed the distance, and it is facing what it is chasing.
+		assert fiend.z < 11.0
+		assert math.abs(fiend.x - 10.0) < 0.001
+	}
+}
+
+test "one within reach bites, and does not bite again straight away" {
+	world := carrying(alone(), [rising(1, 10.0, 9.0)])
+	first := stirring(world, 100)
+	assert len(first.bitten) == 1
+	// A bite carries its own damage, because the three breeds are not worth the
+	// same — and it names the seat, because that is who the fold takes it out of.
+	for each bite in first.bitten {
+		assert bite.seat == 1
+		assert bite.damage == horde.teeth(wire.Breed.Zombie())
+	}
+
+	// Its jaw is on a cooldown now, so the next frame is quiet.
+	again := carrying(world, first.horde)
+	assert len(stirring(again, 100).bitten) == 0
+
+	// The frame the cooldown runs out in is the frame it bites again.
+	assert len(stirring(again, 900).bitten) == 1
+}
+
+test "a player who is down is not worth chasing" {
+	mut server.World world = carrying(alone(), [rising(1, 0.0, 0.0)])
+	world.seats = map(world.seats, felled(_))
+	// Nobody left to hunt, so it stays where it is and bites nothing.
+	after := stirring(world, 100)
+	assert len(after.bitten) == 0
+	for each fiend in after.horde {
+		assert fiend.x == 0.0
+		assert fiend.z == 0.0
+	}
+}
+
+func felled(seat: server.Seat): server.Seat {
+	mut server.Seat down = seat
+	down.health = 0
+	return down
+}
+
+test "a zombie will not walk into the water, and a merman will not walk out of it" {
+	pool := made().lake
+	shore := pool.z - pool.d / 2.0
+
+	// A zombie on the bank with a swimmer three metres out in front of it. It
+	// closes what it can and stops dry.
+	swimming := game([sitting(1, "Ada", pool.x, shore + 3.0)])
+	after := stirring(carrying(swimming, [rising(1, pool.x, shore - 1.5)]), 200)
+	for each fiend in after.horde {
+		assert fiend.z < shore
+	}
+
+	// And a merman with a player on the bank: three seconds of trying and it is
+	// still in the lake.
+	wading := game([sitting(1, "Ada", pool.x, shore - 3.0)])
+	mut server.World finny = carrying(wading, [finned(1, pool.x, shore + 2.0)])
+	for i := 0; i < 30; i++ {
+		finny = carrying(finny, stirring(finny, 100).horde)
+	}
+	for each fiend in finny.pack {
+		assert fiend.z >= shore
+		assert fiend.y == place.floating()
+	}
+}
+
+// The wings, in one test: what stops a vampire walking is what puts it in the air,
+// and nothing in the air is checked against a wall.
+test "a vampire that cannot walk to you flies, and goes over the wall" {
+	// Either side of the yard's north wall, which is four metres of stone.
+	world := game([sitting(1, "Ada", 10.0, 0.0 - 17.0)])
+	mut server.World chasing = carrying(world, [fanged(1, 10.0, 0.0, 0.0 - 21.4, false)])
+	mut Bool flew = false
+	for i := 0; i < 40; i++ {
+		chasing = carrying(chasing, stirring(chasing, 50).horde)
+		for each fiend in chasing.pack {
+			if fiend.flying {
+				flew = true
+			}
+		}
+	}
+	assert flew
+	// And it is on the player's side of the wall, which is the only way over.
+	for each fiend in chasing.pack {
+		assert fiend.z > 0.0 - 20.5
+	}
+}
+
+test "a bat cannot bite from the air, and lands to do it" {
+	// Four metres directly above the player: as near as anything gets, and out of
+	// reach all the same.
+	above := carrying(alone(), [fanged(1, 10.0, 4.0, 8.0, true)])
+	assert len(stirring(above, 100).bitten) == 0
+
+	mut server.World coming = above
+	mut Int bites = 0
+	for i := 0; i < 60; i++ {
+		step := stirring(coming, 50)
+		coming = carrying(coming, step.horde)
+		bites = bites + len(step.bitten)
+	}
+	assert bites > 0
+	for each fiend in coming.pack {
+		assert fiend.flying == false
+		assert fiend.y < 0.5
+	}
+}
+
+test "a vampire drinks what it bites, and nothing else does" {
+	mut wire.Fiend hungry = fanged(1, 11.0, 0.0, 8.0, false)
+	hungry.health = 20
+	first := stirring(carrying(alone(), [hungry]), 100)
+	assert len(first.bitten) == 1
+	for each fiend in first.horde {
+		assert fiend.health == 20 + horde.drink()
+	}
+
+	// It cannot drink past whole.
+	mut wire.Fiend nearly = fanged(2, 11.0, 0.0, 8.0, false)
+	nearly.health = wire.strength(wire.Breed.Vampire()) - 2
+	for each fiend in stirring(carrying(alone(), [nearly]), 100).horde {
+		assert fiend.health == wire.strength(wire.Breed.Vampire())
+	}
+
+	// And a zombie that bites you is exactly as nearly dead as it was.
+	mut wire.Fiend hurt = rising(3, 11.0, 8.0)
+	hurt.health = 20
+	for each fiend in stirring(carrying(alone(), [hurt]), 100).horde {
+		assert fiend.health == 20
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Separate books
+// ---------------------------------------------------------------------------
+// Three breeds, three counts, three clocks. The point of the tests below is that
+// nothing one breed does shows up in another breed's books.
+
+test "each breed is filled to its own number on its own clock" {
+	mut server.World world = alone()
+	world.books = map(world.books, horde.wanting(_, wire.Breed.Zombie(), 2))
+
+	// Nothing is owed one yet: every clock is still running.
+	assert len(horde.due(world.pack, world.books, 1)) == 0
+
+	// Six hundred milliseconds in, the zombies are owed one and nobody else is.
+	mut server.World ready = world
+	ready.books = horde.waiting(world.books, 700)
+	owed := horde.due(ready.pack, ready.books, 1)
+	assert len(owed) == 1
+	assert len(filter(owed, isBreed(_, wire.Breed.Zombie()))) == 1
+
+	// Raising one restarts that breed's clock and touches neither of the others.
+	one := server.raise(ready, made(), blocks(), wire.Breed.Zombie())
+	assert len(one.pack) == 1
+	assert len(horde.due(one.pack, one.books, 1)) == 0
+
+	// And a while later the lake's turn comes round, on its own timer.
+	mut server.World late = one
+	late.books = horde.waiting(one.books, 2500)
+	assert len(filter(horde.due(late.pack, late.books, 1),
+		isBreed(_, wire.Breed.Merman()))) == 1
+}
+
+test "a brood that is full rolls a new number, and only its own" {
+	world := carrying(alone(), [rising(1, 0.0, 0.0)])
+	full := horde.filled(world.pack, world.books, 1)
+	assert len(filter(full, isBreed(_, wire.Breed.Zombie()))) == 1
+	assert len(filter(full, isBreed(_, wire.Breed.Merman()))) == 0
+
+	mut server.World rolled = world
+	rolled.books = map(world.books, horde.wanting(_, wire.Breed.Zombie(), 5))
+	assert horde.wanted(rolled.books, wire.Breed.Zombie()) == 5
+	assert horde.wanted(rolled.books, wire.Breed.Merman())
+		== horde.wanted(world.books, wire.Breed.Merman())
+	// Five zombies wanted and one standing, so the zombies are short and the lake
+	// is not — which is the whole of what separate books buys.
+	assert len(filter(horde.filled(rolled.pack, rolled.books, 1),
+		isBreed(_, wire.Breed.Zombie()))) == 0
+}
+
+// The rule a server needs that a mesh did not: one horde between everybody, so how
+// many of them there are has to be how many people are playing.
+test "the horde grows with the room" {
+	world := carrying(alone(), [rising(1, 0.0, 0.0)])
+	// One zombie wanted per player. With one player that is enough, with four it is
+	// three short.
+	assert len(filter(horde.filled(world.pack, world.books, 1),
+		isBreed(_, wire.Breed.Zombie()))) == 1
+	mut server.World busy = world
+	busy.books = horde.waiting(world.books, 700)
+	assert len(filter(horde.due(busy.pack, busy.books, 4),
+		isBreed(_, wire.Breed.Zombie()))) == 1
+	assert len(filter(horde.due(busy.pack, busy.books, 1),
+		isBreed(_, wire.Breed.Zombie()))) == 0
+}
+
+test "what the server raises starts whole, and belongs to nobody" {
+	raised := server.raise(alone(), made(), blocks(), wire.Breed.Vampire())
+	assert len(raised.pack) == 1
+	for each fiend in raised.pack {
+		assert fiend.breed == wire.Breed.Vampire()
+		assert fiend.health == wire.strength(wire.Breed.Vampire())
+		assert fiend.flying == false
+		// Numbered from one, by the server, and that number is the whole of what a
+		// client needs to shoot at it.
+		assert fiend.id == 1
+	}
+	// A merman starts floating rather than standing on the bottom.
+	assert horde.risen(2, wire.Breed.Merman(), place.Spot(0.0, 30.0, 0.0)).y
+		== place.floating()
+}
+
+// Where one may be raised. The distance is the rule worth testing: something that
+// turned up at arm's length would be a free bite rather than a fright.
+test "the dead do not rise on top of anybody" {
+	who := server.hunted(alone())
+	// Fourteen metres away across open ground, then three, then eight.
+	assert horde.decent(made(), blocks(), who, wire.Breed.Zombie(), 10.0, 8.0 - 14.0)
+	assert horde.decent(made(), blocks(), who, wire.Breed.Zombie(), 13.0, 8.0) == false
+	assert horde.decent(made(), blocks(), who, wire.Breed.Zombie(), 10.0, 0.0) == false
+	// A vampire wants more room than that, because it covers the ground faster.
+	assert horde.decent(made(), blocks(), who, wire.Breed.Vampire(), 10.0, 8.0 - 12.0)
+		== false
+
+	// Another player counts too, wherever the first one is.
+	crowded := server.hunted(game([sitting(1, "Ada", 10.0, 8.0),
+		sitting(2, "Bob", 0.0 - 12.0, 0.0)]))
+	assert horde.decent(made(), blocks(), crowded, wire.Breed.Zombie(),
+		0.0 - 11.0, 0.0) == false
+	assert horde.decent(made(), blocks(), crowded, wire.Breed.Zombie(),
+		10.0, 8.0 - 14.0)
+}
+
+test "the dead do not rise inside a wall, a crate or beyond them" {
+	who := server.hunted(alone())
+	// The block in the middle of the yard, and the yard's own east wall.
+	assert horde.decent(made(), blocks(), who, wire.Breed.Zombie(), 0.0, 0.0) == false
+	assert horde.decent(made(), blocks(), who, wire.Breed.Zombie(), 20.0, 10.0) == false
+	// The crate at (8, 6) is solid; open ground across the yard is not — and it is
+	// far enough off to be worth rising at, which is the rule above this one.
+	assert horde.decent(made(), blocks(), who, wire.Breed.Zombie(), 8.0, 6.0) == false
+	assert horde.decent(made(), blocks(), who, wire.Breed.Zombie(),
+		0.0 - 11.0, 0.0 - 6.0)
+	// And nothing rises past the walls, however much room there is out there.
+	assert horde.decent(made(), blocks(), who, wire.Breed.Zombie(),
+		0.0 - 60.0, 0.0) == false
+	assert horde.decent(made(), blocks(), who, wire.Breed.Zombie(), 0.0, 54.0) == false
+}
+
+test "a breed only rises where it belongs" {
+	pool := made().lake
+	// On the bank, ten metres north of the water.
+	who := server.hunted(game([sitting(1, "Ada", pool.x, pool.z - pool.d / 2.0 - 10.0)]))
+	inWater := pool.z - pool.d / 2.0 + 2.5
+	onLand := pool.z - pool.d / 2.0 - 22.0
+
+	assert horde.decent(made(), blocks(), who, wire.Breed.Merman(), pool.x, inWater)
+	assert horde.decent(made(), blocks(), who, wire.Breed.Zombie(), pool.x, inWater)
+		== false
+	assert horde.decent(made(), blocks(), who, wire.Breed.Merman(), pool.x, onLand)
+		== false
+}
+
+// The rule the hundred-metre map needs: they rise where the living are. One raised
+// in an empty market is not a threat, it is a thing shuffling into a wall for the
+// rest of the game.
+test "the dead rise near the living, or not at all" {
+	who := server.hunted(alone())
+	// Open ground fifty metres north of the only player here. Clear, empty, and no
+	// use to anybody.
+	assert place.clear(blocks(), 10.0, 0.0, 0.0 - 45.0)
+	assert horde.decent(made(), blocks(), who, wire.Breed.Zombie(), 10.0, 0.0 - 45.0)
+		== false
+
+	// Nobody alive at all, and nowhere is fit: a horde with nobody to hunt does not
+	// grow. Which is also what an empty server does — nothing.
+	mut server.World empty = alone()
+	empty.seats = map(empty.seats, felled(_))
+	assert horde.decent(made(), blocks(), server.hunted(empty), wire.Breed.Zombie(),
+		0.0, 0.0 - 30.0) == false
+
+	// Somebody else alive brings the neighbourhood back.
+	busy := server.hunted(game([sitting(1, "Ada", 0.0, 0.0 - 40.0)]))
+	assert horde.decent(made(), blocks(), busy, wire.Breed.Zombie(), 0.0, 0.0 - 30.0)
+}
+
+test "two shots put one down, and the second one is the one that did it" {
+	world := carrying(pair(), [rising(7, 0.0, 0.0)])
+	assert horde.finished(world.pack, 7, place.damage()) == false
+	once := server.clawed(world, 7, 1)
+	assert len(once.pack) == 1
+	assert horde.finished(once.pack, 7, place.damage())
+	twice := server.clawed(once, 7, 1)
+	// The fallen are not left lying: a horde is what is standing.
+	assert len(twice.pack) == 0
+	// And the shot that finished it is the one that was credited — once, to the
+	// seat that fired it.
+	assert server.seatOf(once, 1).felled == 0
+	assert server.seatOf(twice, 1).felled == 1
+	assert server.seatOf(twice, 2).felled == 0
+}
+
+test "there are three breeds, and somewhere to put each of them" {
+	assert len(horde.kinds()) == 3
+	// More zombies than anything else, because one vampire is most of a fight.
+	assert horde.plenty(wire.Breed.Zombie()) > horde.plenty(wire.Breed.Vampire())
+	assert horde.patience(wire.Breed.Vampire()) > horde.patience(wire.Breed.Zombie())
+
+	// And when every guess at a place has been refused: a merman goes to the middle
+	// of the lake, which is water on any map, and everything else to a spot on land.
+	afloat := server.unfit(alone(), made(), wire.Breed.Merman())
+	assert place.wet(made(), afloat.x, afloat.z)
+	ashore := server.unfit(alone(), made(), wire.Breed.Zombie())
+	assert place.dry(made(), ashore.x, ashore.z)
+}
+
+// ---------------------------------------------------------------------------
+// The referee
+// ---------------------------------------------------------------------------
+// This is the part the mesh version of this game could not have: one process
+// holding the shot, the health and the score board, so there is nothing to
+// reconcile and nobody to trust about the answer.
+//
+// Every test below drives `heard` — the fold's body — with the messages a client
+// actually sends.
+
+test "three bullets put somebody down, and the shooter is credited" {
+	one := server.heard(pair(), 2, wire.Up.HitPlayer(1))
+	assert server.seatOf(one, 1).health == 100 - place.damage()
+	two := server.heard(one, 2, wire.Up.HitPlayer(1))
+	assert server.standing(two, 1)
+	three := server.heard(two, 2, wire.Up.HitPlayer(1))
+
+	assert server.seatOf(three, 1).health == 0
+	assert server.standing(three, 1) == false
+	// The credit and the wound are one turn in one process. Nobody had to be asked
+	// and nobody could have disagreed.
+	assert server.seatOf(three, 1).deaths == 1
+	assert server.seatOf(three, 2).kills == 1
+	// And they are down for as long as the game says, not as long as anybody claims.
+	assert server.seatOf(three, 1).down == place.mourning()
+}
+
+test "a shot at somebody already down does nothing at all" {
+	mut server.World world = pair()
+	world.seats = map(world.seats, hurting(_, 1))
+	assert server.standing(world, 1) == false
+	after := server.heard(world, 2, wire.Up.HitPlayer(1))
+	// No second death, and no second kill: going down happens once.
+	assert server.seatOf(after, 1).deaths == server.seatOf(world, 1).deaths
+	assert server.seatOf(after, 2).kills == 0
+}
+
+func hurting(seat: server.Seat, number: Int): server.Seat {
+	return server.wounding(seat, number, 200)
+}
+
+// A client says which seat it hit, so a client could say its own. This is where
+// that is refused rather than hoped about.
+test "nobody shoots themselves" {
+	after := server.heard(pair(), 1, wire.Up.HitPlayer(1))
+	assert server.seatOf(after, 1).health == 100
+	assert server.seatOf(after, 1).kills == 0
+}
+
+// A client that has hung up is a seat that is not there, and every message still
+// in flight from it lands on nobody.
+test "a message from a seat that is gone is harmless" {
+	gone := server.parted(pair(), 2)
+	assert len(gone.seats) == 1
+	after := server.heard(gone, 2, wire.Up.HitPlayer(1))
+	assert server.seatOf(after, 1).health == 100
+	assert server.seatOf(after, 2).number == 0
+}
+
+test "a bite takes health and credits nobody" {
+	world := carrying(alone(), [rising(1, 10.0, 9.0)])
+	after := server.ticked(world, 100)
+	assert server.seatOf(after, 1).health == 100 - horde.teeth(wire.Breed.Zombie())
+	assert server.seatOf(after, 1).kills == 0
+}
+
+test "health does not go below nothing" {
+	after := server.heard(pair(), 2, wire.Up.HitPlayer(1))
+	flattened := server.gnawed(after, horde.Bite(1, 500))
+	assert server.seatOf(flattened, 1).health == 0
+	assert server.seatOf(flattened, 1).deaths == 1
+}
+
+test "where somebody says they are is where they are" {
+	after := server.heard(alone(), 1, wire.Up.Moved(3.0, 1.0, 4.0, 1.5))
+	seat := server.seatOf(after, 1)
+	assert seat.x == 3.0
+	assert seat.z == 4.0
+	assert seat.yaw == 1.5
+	// And it is in the roster a snapshot is made of, which is the whole trip: a
+	// client's own position goes up, and comes back down to everybody.
+	for each one in server.roster(after) {
+		assert one.x == 3.0
+		assert one.who == "Ada"
+	}
+}
+
+// Coming back is the one thing the server moves a client's body for, and for a
+// fraction of a second afterwards the client is still reporting where it died.
+test "a position sent before a teleport landed is ignored" {
+	mut server.World world = alone()
+	world.seats = map(world.seats, settling(_))
+	after := server.heard(world, 1, wire.Up.Moved(40.0, 0.0, 40.0, 0.0))
+	assert server.seatOf(after, 1).x == 10.0
+
+	// A tenth of a second later the count has run out and they are believed again.
+	settled := server.waking(after, 400)
+	moved := server.heard(settled, 1, wire.Up.Moved(40.0, 0.0, 40.0, 0.0))
+	assert server.seatOf(moved, 1).x == 40.0
+}
+
+func settling(seat: server.Seat): server.Seat {
+	mut server.Seat fresh = seat
+	fresh.settling = 300
+	return fresh
+}
+
+test "somebody who is down comes back at a spot with room in it" {
+	// Two players on the same corner, one of them just shot.
+	mut server.World world = game([sitting(1, "Ada", 16.0, 0.0 - 16.0),
+		sitting(2, "Bob", 16.0, 0.0 - 16.0)])
+	shot := server.heard(server.heard(server.heard(world, 2,
+		wire.Up.HitPlayer(1)), 2, wire.Up.HitPlayer(1)), 2, wire.Up.HitPlayer(1))
+	assert server.standing(shot, 1) == false
+
+	// The count runs down on the server's clock, and nothing happens until it does.
+	waiting := server.waking(shot, place.mourning() - 100)
+	assert server.standing(waiting, 1) == false
+
+	back := server.waking(waiting, 200)
+	seat := server.seatOf(back, 1)
+	assert seat.health == 100
+	assert seat.down == 0
+	assert seat.air == place.breath()
+	// Not the corner the other one is standing on, and somewhere they can stand.
+	assert seat.x != 16.0 || seat.z != 0.0 - 16.0
+	assert place.clear(blocks(), seat.x, 0.0, seat.z)
+	// And they are left settling, because the client has not heard yet.
+	assert seat.settling > 0
+}
+
+// Nearest with room, which is two rules: it is not the one somebody is standing on,
+// and no other free spot is closer. The second half is the definition rather than a
+// number, so it holds on whatever map the seed came out as.
+test "coming back is the nearest free spot, not the emptiest" {
+	crowded := game([sitting(1, "Ada", 16.0, 0.0 - 16.0),
+		sitting(2, "Bob", 16.0, 0.0 - 16.0)])
+	who := server.hunted(crowded)
+	room := horde.vacancy(who, seeded(), 16.0, 0.0 - 16.0)
+	assert room.x != 16.0 || room.z != 0.0 - 16.0
+	took := math.hypot(room.x - 16.0, room.z + 16.0)
+	for i := 0; i < place.spots(); i++ {
+		where := place.spot(i, seeded())
+		if horde.lonely(who, where) > 9.0 {
+			assert math.hypot(where.x - 16.0, where.z + 16.0) >= took - 0.001
+		}
+	}
+}
+
+// What `vacancy` falls back to, and where one of the horde is raised when every
+// guess has landed somewhere unfit.
+test "the emptiest spot is the one whose nearest neighbour is furthest" {
+	crowded := server.hunted(game([
+		sitting(1, "Ada", 0.0 - 16.0, 0.0 - 16.0),
+		sitting(2, "Bob", 16.0, 0.0 - 16.0),
+		sitting(3, "Cai", 16.0, 16.0),
+		sitting(4, "Dee", 0.0 - 16.0, 16.0)
+	]))
+	room := horde.emptiest(crowded, seeded())
+	// All four of the yard's corners have somebody on them, so it is one of the four
+	// outside the yard — and it has room in it.
+	assert math.abs(room.x) > 20.0 || math.abs(room.z) > 20.0
+	assert horde.lonely(crowded, room) > 9.0
+}
+
+test "two players are seated apart" {
+	first := place.spot(1, seeded())
+	second := place.spot(2, seeded())
+	assert first.x != second.x || first.z != second.z
+	// A ninth player is back at the first spot, and nothing has to know that eight
+	// is how many there are.
+	assert place.spot(9, seeded()).x == first.x
+}
+
+// ---------------------------------------------------------------------------
+// The water, from the side that pays for it
+// ---------------------------------------------------------------------------
+// The client decides where a swimmer goes; the server decides what being under
+// there costs. Both of them ask `place.submerged` about the same position, which is
+// why they cannot disagree about it.
+
+// Somebody with their head three metres under, in the northern half of the lake.
+func diving(): server.World {
+	pool := made().lake
+	mut server.World world = game([sitting(1, "Ada", pool.x, pool.z - pool.d / 2.0 + 3.0)])
+	world.seats = map(world.seats, sinking(_))
+	return world
+}
+
+func sinking(seat: server.Seat): server.Seat {
+	mut server.Seat down = seat
+	down.y = 0.0 - 3.0
+	return down
+}
+
+test "a head under the water runs out of air, and then the water takes it" {
+	world := diving()
+	assert place.submerged(made(), 0.0 + server.seatOf(world, 1).x,
+		server.seatOf(world, 1).y, server.seatOf(world, 1).z)
+
+	// Ten seconds is a lungful. A little over, and the water starts on the health.
+	mut server.World held = world
+	for i := 0; i < 101; i++ {
+		held = server.breathing(held, made(), 100)
+	}
+	assert server.seatOf(held, 1).air == 0
+	assert server.seatOf(held, 1).health < 100
+	assert server.standing(held, 1)
+
+	// A head out of the water gets it back, and faster than it went.
+	mut server.World up = held
+	up.seats = map(held.seats, surfacing(_))
+	breathed := server.breathing(up, made(), 100)
+	assert server.seatOf(breathed, 1).air > 100
+}
+
+func surfacing(seat: server.Seat): server.Seat {
+	mut server.Seat up = seat
+	up.y = 0.0 - 0.2
+	return up
+}
+
+test "the drowned do not go on drowning" {
+	mut server.World world = diving()
+	world.seats = map(world.seats, felled(_))
+	after := server.breathing(world, made(), 100)
+	// Nothing is taken off nothing, and there is no second death in it.
+	assert server.seatOf(after, 1).health == 0
+	assert server.seatOf(after, 1).deaths == 0
+}
+
+// ---------------------------------------------------------------------------
+// Who is playing
+// ---------------------------------------------------------------------------
+
+test "the roster is everybody, with the server's answers in it" {
+	world := server.heard(pair(), 2, wire.Up.HitPlayer(1))
+	list := server.roster(world)
+	assert len(list) == 2
+	assert wire.seated(list, 1).health == 100 - place.damage()
+	assert wire.seated(list, 1).who == "Ada"
+	assert wire.seated(list, 2).health == 100
+	// Looking up somebody who is not in it is a row of zeroes rather than an
+	// answer a screen has to cope with.
+	assert wire.seated(list, 9).seat == 0
+}
+
+test "somebody who leaves is off the roster, and the horde stops hunting them" {
+	assert len(server.hunted(pair())) == 2
+	gone := server.parted(pair(), 1)
+	assert len(gone.seats) == 1
+	assert len(server.hunted(gone)) == 1
+	for each one in server.hunted(gone) {
+		assert one.seat == 2
+	}
+}
+
+test "the horde does not hunt the dead" {
+	mut server.World world = pair()
+	world.seats = map(world.seats, hurting(_, 1))
+	who := server.hunted(world)
+	assert len(who) == 1
+	for each one in who {
+		assert one.seat == 2
+	}
+}
+
+// ---------------------------------------------------------------------------
+// What a client may say, and how much of it
+// ---------------------------------------------------------------------------
+
+test "a name is a name, spaces are not, and nobody has a very long one" {
+	assert server.named("Ada") == "Ada"
+	assert server.named("   ") == "somebody"
+	assert server.named("") == "somebody"
+	mut Str shout = ""
+	for i := 0; i < 200; i++ {
+		shout = "{shout}x"
+	}
+	assert len(split(server.named(shout), "")) == server.namely()
+	assert len(split(server.clipped(shout), "")) == server.mouthful()
+}
+
+test "a line of nothing is not passed on" {
+	assert server.said("hello")
+	assert server.said("   ") == false
+	assert server.said("") == false
+}
+
+// ---------------------------------------------------------------------------
+// A tick of the whole thing
+// ---------------------------------------------------------------------------
+
+test "one tick moves the horde, keeps the books and takes the water's due" {
+	mut server.World world = carrying(diving(), [rising(1, 40.0, 40.0)])
+	// Two zombies wanted, one standing, and the clock run out: this tick owes one.
+	world.books = map(world.books, horde.wanting(_, wire.Breed.Zombie(), 2))
+	world.books = horde.waiting(world.books, 700)
+	after := server.ticked(world, 100)
+	// The clock ran, so something rose — and it is the zombies that were owed one.
+	assert len(after.pack) == 2
+	// The one that was already there moved.
+	assert len(filter(after.pack, at(_, 40.0, 40.0))) == 0
+	// And a hundred milliseconds of air went.
+	assert server.seatOf(after, 1).air == place.breath() - 100
+	// The snapshot clock ran too.
+	assert after.beat != world.beat
+}
+
+func at(fiend: wire.Fiend, x: Float, z: Float): Bool {
+	return fiend.x == x && fiend.z == z
+}
+
+// ---------------------------------------------------------------------------
+// The wire
+// ---------------------------------------------------------------------------
+// The protocol is a type declaration and the codecs are derived from it, so what
+// there is to test is not the encoder — it cannot be wrong — but that both ends
+// read the same declaration. A round trip through text is what says so.
+
+test "everything a client can say survives the trip" {
+	assert asking(wire.Up.Join("Ada")) is wire.Up.Join
+	moved := asking(wire.Up.Moved(1.5, 2.5, 3.5, 0.25))
+	if moved is wire.Up.Moved(x, y, z, yaw) {
+		assert x == 1.5
+		assert y == 2.5
+		assert z == 3.5
+		assert yaw == 0.25
+	} else {
+		assert false
+	}
+	if asking(wire.Up.HitPlayer(7)) is wire.Up.HitPlayer(seat) {
+		assert seat == 7
+	} else {
+		assert false
+	}
+	if asking(wire.Up.Said("hello")) is wire.Up.Said(text) {
+		assert text == "hello"
+	} else {
+		assert false
+	}
+	assert asking(wire.Up.Left()) is wire.Up.Left
+}
+
+// One trip through the wire and back. A failure to decode is a failure of the test
+// rather than something to assert about, so it answers with a `Left` — which is a
+// variant every assertion above would fail on.
+func asking(up: wire.Up): wire.Up {
+	if wire.asked(wire.said(up)) is Result.Ok(back) {
+		return back
+	}
+	return wire.Up.Left()
+}
+
+test "everything the server can say survives the trip" {
+	welcome := telling(wire.Down.Welcome(3, 99, place.Spot(1.0, 2.0, 0.5)))
+	if welcome is wire.Down.Welcome(seat, seed, at) {
+		assert seat == 3
+		assert seed == 99
+		assert at.x == 1.0
+		assert at.yaw == 0.5
+	} else {
+		assert false
+	}
+
+	// A snapshot is the big one: two vectors of records, and a variant nested
+	// inside one of them.
+	mut wire.Fiend[dyn] pack = [finned(4, 1.0, 2.0), fanged(5, 3.0, 4.0, 5.0, true)]
+	shot := server.heard(pair(), 2, wire.Up.HitPlayer(1))
+	full := telling(wire.Down.Snapshot(server.roster(shot), pack))
+	if full is wire.Down.Snapshot(players, horde) {
+		assert len(players) == 2
+		assert wire.seated(players, 1).health == 100 - place.damage()
+		assert len(horde) == 2
+		assert len(filter(horde, isKind(_, wire.Breed.Merman()))) == 1
+		assert len(filter(horde, flying(_))) == 1
+	} else {
+		assert false
+	}
+
+	if telling(wire.Down.Said(2, "Bob", "over here")) is wire.Down.Said(seat, who, text) {
+		assert seat == 2
+		assert who == "Bob"
+		assert text == "over here"
+	} else {
+		assert false
+	}
+}
+
+func telling(down: wire.Down): wire.Down {
+	if wire.heard(wire.told(down)) is Result.Ok(back) {
+		return back
+	}
+	return wire.Down.Reborn(place.Spot(0.0, 0.0, 0.0))
+}
+
+func isKind(fiend: wire.Fiend, breed: wire.Breed): Bool {
+	return fiend.breed == breed
+}
+
+func flying(fiend: wire.Fiend): Bool {
+	return fiend.flying
+}
+
+// The honest failure, and the reason it is worth having: a client built against a
+// different `lib/wire.hive` finds out at the first message, with the path that
+// disagreed, rather than by drawing somebody in the wrong place.
+test "a message that is not one of ours says exactly what was wrong with it" {
+	assert wire.asked("\{\"Moved\": \{\"x\": 1.0}}") is Result.Error(_)
+	if wire.asked("\{\"Moved\": \{\"x\": 1.0}}") is Result.Error(problem) {
+		assert problem.path != ""
+	}
+	assert wire.asked("not json at all") is Result.Error(_)
+	// A field the declaration does not mention is ignored, which is what makes a
+	// rolling upgrade possible.
+	if wire.asked("\{\"Join\": \{\"who\": \"Ada\", \"hat\": true}}") is Result.Ok(up) {
+		assert up is wire.Up.Join
+	} else {
+		assert false
+	}
+}

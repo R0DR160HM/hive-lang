@@ -1,0 +1,1017 @@
+// The place, and where it came from
+// =================================
+// A hundred metres of it, at night, and **no two games are on the same map**. The
+// districts are always in the same quarters — a warehouse north-west, a stepped
+// tower north-east, a market south-west, a field of ruins south-east, a lake to
+// the south — but how big each one is, what is inside it, where the lake reaches,
+// where the island in it stands and how high the walkway runs are all rolled from
+// a number.
+//
+// So a game is a place you have to learn, and the quarter it is in is the only
+// thing you knew before you arrived. The one exception is the walled yard in the
+// middle: it is the same every game on purpose, because a map wants one thing
+// everybody already knows.
+//
+// **THIS FILE IS WHY THERE ARE TWO PROGRAMS AND NOT TWO COPIES.** The server has
+// to know where the walls are — a zombie walks around them and a spawn point may
+// not be inside one — and the client has to know the same walls, to draw them, to
+// stop a player walking through one and to stop a bullet at one. A map the two
+// disagreed about would be a game where you are shot through a wall only one of
+// you can see. So the map is a **`func` of one number**, imported by both: same
+// seed, same boxes, on the server, in the client, and in every test.
+//
+// The number is rolled once, by the server, and handed to each client as it
+// arrives (see `wire.Down.Welcome`). Nothing about the map travels but that.
+//
+// All of it is boxes, including the ground. The same vector is what gets drawn,
+// what a body bumps into and what a bullet stops at, so a stair you can walk up is
+// a stair a bullet can be stopped by, and the floor being solid is what makes
+// climbing out of the lake something you do rather than something that happens.
+
+import hive.math
+import hive.conv
+
+// One solid thing in the arena. The same vector is what gets drawn, what a player
+// bumps into and what a bullet stops at — one description, three uses, and no way
+// for the picture to disagree with the collisions.
+type Block {
+	x: Float
+	y: Float
+	z: Float
+	w: Float
+	h: Float
+	d: Float
+	shade: Str
+}
+
+// Where somebody comes back after they go down. The server picks them and the
+// client is told which; it crosses the wire, so it is declared here with the map
+// it is a place in.
+type Spot {
+	x: Float
+	z: Float
+	yaw: Float
+}
+
+// A number out of two numbers. Knuth's multiplier, twice, and the sign thrown
+// away: not good randomness, and it does not need to be — what it has to be is the
+// *same* arithmetic everywhere, which is why it is written here rather than asked
+// of the machine.
+//
+// `salt` is which decision is being made. Every call passes its own, so the
+// tower's height and the lake's width are two independent rolls of one seed rather
+// than one roll used twice.
+func hash(seed: Int, salt: Int): Int {
+	mut Int n = (seed % 2147483647 + salt * 7919) % 2147483647
+	n = (n * 1103515245 + 12345) % 2147483647
+	n = (n / 65536 * 1103515245 + salt * 40503 + 12345) % 2147483647
+	if n < 0 {
+		return 0 - n
+	}
+	return n
+}
+
+// A whole number from `low` to `high`, both ends included.
+func between(seed: Int, salt: Int, low: Int, high: Int): Int {
+	span := high - low + 1
+	if span <= 0 {
+		return low
+	}
+	return low + hash(seed, salt) % span
+}
+
+// A distance, to the tenth of a metre. Everything the map measures goes through
+// here, which is what keeps the numbers in the plan below readable.
+func spread(seed: Int, salt: Int, low: Float, high: Float): Float {
+	steps := conv.round((high - low) * 10.0)
+	return low + conv.itf(between(seed, salt, 0, steps)) / 10.0
+}
+
+// Whether something is there at all: `percent` times in a hundred.
+func chance(seed: Int, salt: Int, percent: Int): Bool {
+	return hash(seed, salt) % 100 < percent
+}
+
+// What a seed came to.
+//
+// Every loose decision about the map is made once, here, and the districts are
+// built from the answers — so a district and everything that has to know where
+// that district *is* (a spawn spot, a name in the corner of the screen, a merman
+// wondering how far the water goes) are reading the same numbers instead of each
+// rolling their own.
+type Plan {
+	seed: Int
+	// The lake, the wall across it, and the island beyond that wall.
+	lake: Pool
+	dam: Float
+	island: Spot
+	// How high the walkway runs, which is also how high the loft it lands on is.
+	deck: Float
+	// The warehouse: where it stands, how big it is, and where its doorway is.
+	shedX: Float
+	shedZ: Float
+	shedW: Float
+	shedD: Float
+	door: Float
+	// The tower: where it stands, how wide its bottom tier is, and which side its
+	// flights of steps climb.
+	towerX: Float
+	towerZ: Float
+	tierW: Float
+	side: Float
+	// The market: where its first stall stands, and how far apart they are.
+	stallX: Float
+	stallZ: Float
+	pitch: Float
+	// The ruins: the middle of the field of them.
+	ruinX: Float
+	ruinZ: Float
+}
+
+func plan(seed: Int): Plan {
+	// The lake first, because the floor is drawn around it and half the map wants
+	// to know where its shore is.
+	pond := Pool(
+		spread(seed, 11, -2.0, 4.0),
+		spread(seed, 12, 34.0, 39.0),
+		spread(seed, 13, 28.0, 32.0),
+		spread(seed, 14, 20.0, 25.0),
+		spread(seed, 15, -4.2, -3.2)
+	)
+	mut Float which = 1.0
+	if chance(seed, 44, 50) {
+		which = 0.0 - 1.0
+	}
+	return Plan(
+		seed,
+		pond,
+		// Across its northern third, so there is open water on both sides of it and
+		// room for the island in the half beyond.
+		pond.z + spread(seed, 16, -6.0, -3.0),
+		// And the island beyond the dam, always: getting to it is either a dive or
+		// the long way round the south shore. Where it sits is measured in fractions
+		// of the lake rather than in metres, which is what keeps it off the shore
+		// whatever size the lake came out.
+		Spot(
+			pond.x + pond.w * spread(seed, 17, 0.0 - 0.2, 0.2),
+			pond.z + pond.d * spread(seed, 18, 0.18, 0.26),
+			0.0
+		),
+		spread(seed, 21, 3.6, 4.4),
+		spread(seed, 31, -34.0, -30.0),
+		spread(seed, 32, -35.0, -31.0),
+		spread(seed, 33, 24.0, 30.0),
+		spread(seed, 34, 20.0, 25.0),
+		spread(seed, 35, -5.0, 5.0),
+		spread(seed, 41, 30.0, 34.0),
+		spread(seed, 42, -34.0, -30.0),
+		spread(seed, 43, 14.0, 17.0),
+		which,
+		spread(seed, 51, -49.0, -47.0),
+		spread(seed, 52, 19.0, 21.0),
+		spread(seed, 53, 7.6, 8.4),
+		spread(seed, 61, 34.0, 38.0),
+		spread(seed, 62, 32.0, 36.0)
+	)
+}
+
+// How far out anything the game raises may go. The wall itself stands at
+// fifty-five metres; the three between are its own thickness, a body's width, and
+// enough room that nothing is ever raised with its back against it.
+func edge(): Float {
+	return 52.0
+}
+
+// Everything solid: the floor, and then everything standing on it. A body and a
+// bullet are stopped by both, which is why both are here — the client's `world`
+// draws the two with different shapes, and that is the only place the difference
+// shows.
+func arena(seed: Int): Block[dyn] {
+	made := plan(seed)
+	return lawn(made) + built(made)
+}
+
+// Everything standing on the floor.
+func built(made: Plan): Block[dyn] {
+	walls := perimeter() + yard() + warehouse(made) + tower(made)
+	rest := market(made) + ruins(made) + causeway(made)
+	return walls + rest + shore(made) + scattered(made)
+}
+
+// The floor, as five boxes with a lake-shaped hole in it. Twenty-four metres of
+// earth under each, which is not scenery: a swimmer who could pass through the
+// bank from below would come out under the map, and this is the arithmetic that
+// says they cannot. It is also why getting out of the water is something you do
+// with the space bar — from down there the shore is a wall.
+func lawn(made: Plan): Block[dyn] {
+	pool := made.lake
+	north := pool.z - pool.d / 2.0
+	south := pool.z + pool.d / 2.0
+	west := pool.x - pool.w / 2.0
+	east := pool.x + pool.w / 2.0
+	mut Block[dyn] floor = [
+		Block(0.0, -12.0, (north - 58.0) / 2.0, 116.0, 24.0, north + 58.0, "#1b2a1d"),
+		Block(0.0, -12.0, (south + 58.0) / 2.0, 116.0, 24.0, 58.0 - south, "#1b2a1d"),
+		Block((west - 58.0) / 2.0, -12.0, pool.z, west + 58.0, 24.0, pool.d, "#1b2a1d"),
+		Block((east + 58.0) / 2.0, -12.0, pool.z, 58.0 - east, 24.0, pool.d, "#1b2a1d"),
+		// The bed of the lake, which is the one piece of floor that is not level
+		// with the rest.
+		Block(pool.x, pool.bed - 12.0, pool.z, pool.w, 24.0, pool.d, "#2a2a20")
+	]
+	return floor
+}
+
+// The four walls of the world, six metres of them. Nothing inside is tall enough
+// to jump them from, which is the only reason they are that high.
+func perimeter(): Block[dyn] {
+	mut Block[dyn] walls = [
+		Block(0.0, 3.0, -55.0, 112.0, 6.0, 1.0, "#2b2823"),
+		Block(0.0, 3.0, 55.0, 112.0, 6.0, 1.0, "#2b2823"),
+		Block(-55.0, 3.0, 0.0, 1.0, 6.0, 112.0, "#2b2823"),
+		Block(55.0, 3.0, 0.0, 1.0, 6.0, 112.0, "#2b2823")
+	]
+	return walls
+}
+
+// The yard: the middle of the place, and the one district a seed does not touch.
+//
+// It was the whole arena once, back when the arena was forty metres square, and it
+// is left exactly as it was for the reason a generated map most needs: somewhere
+// that is the same every game. "Behind the bunker" and "the north gate" mean
+// something to somebody who has never seen this map before, and everything else on
+// this list has to be learned.
+func yard(): Block[dyn] {
+	mut Block[dyn] blocks = [
+		Block(-12.0, 2.0, -20.0, 16.0, 4.0, 1.0, "#37301f"),
+		Block(12.0, 2.0, -20.0, 16.0, 4.0, 1.0, "#37301f"),
+		Block(-12.0, 2.0, 20.0, 16.0, 4.0, 1.0, "#37301f"),
+		Block(12.0, 2.0, 20.0, 16.0, 4.0, 1.0, "#37301f"),
+		Block(-20.0, 2.0, -12.0, 1.0, 4.0, 16.0, "#37301f"),
+		Block(-20.0, 2.0, 12.0, 1.0, 4.0, 16.0, "#37301f"),
+		Block(20.0, 2.0, -12.0, 1.0, 4.0, 16.0, "#37301f"),
+		Block(20.0, 2.0, 12.0, 1.0, 4.0, 16.0, "#37301f"),
+
+		// Cover in the middle, and a pair of towers to jump onto.
+		Block(0.0, 1.0, 0.0, 6.0, 2.0, 6.0, "#3a434c"),
+		Block(-8.0, 0.6, -6.0, 2.4, 1.2, 2.4, "#5c4022"),
+		Block(8.0, 0.6, 6.0, 2.4, 1.2, 2.4, "#5c4022"),
+		Block(-8.0, 0.6, 6.0, 2.4, 1.2, 2.4, "#5c4022"),
+		Block(8.0, 0.6, -6.0, 2.4, 1.2, 2.4, "#5c4022"),
+		Block(-13.0, 1.5, 0.0, 3.0, 3.0, 3.0, "#2f3841"),
+		Block(13.0, 1.5, 0.0, 3.0, 3.0, 3.0, "#2f3841"),
+		Block(0.0, 0.5, -12.0, 5.0, 1.0, 1.6, "#5c4022"),
+		Block(0.0, 0.5, 12.0, 5.0, 1.0, 1.6, "#5c4022")
+	]
+	return blocks
+}
+
+// The warehouse, north-west: a shed with a door in its south wall, racks to work
+// along, a gap in its east wall the walkway comes in through, and a loft at the
+// walkway's height. How big it is, where its door is and how many racks it has are
+// this seed's business.
+//
+// The crates are its inside stair, and the generator builds them as one: each is a
+// jump higher than the last and the top one is a step below the loft, whatever
+// height the loft came out at. `stair` is a `func` of the plan, so a test can walk
+// up a stair it has never seen: `../server.test.hive` checks the crates are a
+// stair on any map, and `../client.test.hive` walks up five of them.
+func warehouse(made: Plan): Block[dyn] {
+	west := made.shedX - made.shedW / 2.0
+	east := made.shedX + made.shedW / 2.0
+	north := made.shedZ - made.shedD / 2.0
+	south := made.shedZ + made.shedD / 2.0
+	doorX := made.shedX + made.door
+	// The walkway comes in level with the loft, through the gap in the east wall.
+	gap := made.towerZ
+	mut Block[dyn] blocks = [
+		Block(made.shedX, 2.5, north, made.shedW, 5.0, 1.0, "#33291f"),
+		// The south wall, either side of the doorway.
+		Block((west + doorX - 2.0) / 2.0, 2.5, south, doorX - 2.0 - west, 5.0, 1.0,
+			"#33291f"),
+		Block((doorX + 2.0 + east) / 2.0, 2.5, south, east - doorX - 2.0, 5.0, 1.0,
+			"#33291f"),
+		Block(west, 2.5, made.shedZ, 1.0, 5.0, made.shedD, "#33291f"),
+		// The east wall, either side of the gap — which is a door at ground level
+		// and the way in for the walkway four metres up.
+		Block(east, 2.5, (north + gap - 2.2) / 2.0, 1.0, 5.0, gap - 2.2 - north,
+			"#33291f"),
+		Block(east, 2.5, (gap + 2.2 + south) / 2.0, 1.0, 5.0, south - gap - 2.2,
+			"#33291f"),
+		// The loft the walkway runs onto.
+		Block(east - 7.5, made.deck - 0.2, gap, 15.0, 0.4, 8.0, "#3b2f20")
+	]
+	// Racks, across the end nobody floored over.
+	for i := 0; i < between(made.seed, 36, 2, 4); i++ {
+		z := north + 3.5 + conv.itf(i) * 4.5
+		append(blocks, Block(made.shedX, 0.9, z, made.shedW - 8.0, 1.8, 2.0, "#3b2f20"))
+	}
+	return blocks + stair(made)
+}
+
+// The crates, climbing to the loft's edge. Each lid is a jump above the one below
+// and the last is a step under the loft, so a stair is a stair whatever height the
+// seed put the loft at — which is the sort of thing a generated map has to be able
+// to promise.
+func stair(made: Plan): Block[dyn] {
+	east := made.shedX + made.shedW / 2.0
+	rise := (made.deck - 0.35) / 4.0
+	mut Block[dyn] crates = []
+	// Westward from the loft's edge, each one lower than the last — so read the
+	// other way it is four crates and then a floor.
+	for i := 0; i < 4; i++ {
+		lid := made.deck - 0.35 - rise * conv.itf(i)
+		append(crates, Block(east - 15.5 - conv.itf(i) * 1.9, lid / 2.0, made.towerZ,
+			2.4, lid, 2.4, "#5c4022"))
+	}
+	return crates
+}
+
+// The tower, north-east: three tiers and a mast, with a flight of steps up to each
+// of them. It is the tallest thing in the place and the fog gives it up from
+// further away than anything else, which makes it the one thing worth navigating
+// by at night — and the walkway leaves from the top of it.
+//
+// Which side the steps climb is the seed's, so the way up is not the way up you
+// learned last game.
+func tower(made: Plan): Block[dyn] {
+	first := made.deck / 3.0
+	second := made.deck * 2.0 / 3.0
+	mut Block[dyn] blocks = [
+		Block(made.towerX, first / 2.0, made.towerZ, made.tierW, first, made.tierW,
+			"#3c3a33"),
+		Block(made.towerX, second / 2.0, made.towerZ, made.tierW - 5.0, second,
+			made.tierW - 5.0, "#43413a"),
+		Block(made.towerX, made.deck / 2.0, made.towerZ, made.tierW - 10.0, made.deck,
+			made.tierW - 10.0, "#4a4841"),
+		// The mast. It is the wrong colour for a building on purpose: this is what
+		// you look for over the market's awnings when you are lost in the dark.
+		Block(made.towerX, made.deck + 1.2, made.towerZ, 1.0, 2.4, 1.0, "#8e2c2c")
+	]
+	// Up from the ground on the south face, then along each tier to the next
+	// flight. Going up a tower ought to be a walk rather than a series of hopeful
+	// jumps, and a tread a third of a metre high is what that costs.
+	foot := made.towerZ + made.tierW / 2.0 + 3.6
+	up := steps(made.towerX, foot, 0.0, 0.0 - 1.1, treads(first), 0.0, 3.0, 1.1)
+	mid := steps(made.towerX + (made.tierW / 2.0 - 1.3) * made.side,
+		made.towerZ - 6.0, 0.0, 1.1, treads(second - first), first, 2.2, 1.1)
+	top := steps(made.towerX + (made.tierW / 2.0 - 4.3) * made.side,
+		made.towerZ - 6.0, 0.0, 1.1, treads(made.deck - second), second, 2.2, 1.1)
+	return blocks + up + mid + top
+}
+
+// How many treads it takes to climb that far, and how much higher each one is than
+// the one before it. The rise is under the height a player steps up without
+// jumping — see the lid rule in `inside` — and that one number is the whole
+// difference between a staircase and a wall with lumps in it.
+func riser(): Float {
+	return 0.32
+}
+
+func treads(climb: Float): Int {
+	return conv.round(climb / riser())
+}
+
+// A flight of steps, as boxes. Each tread is a box from the ground up to its own
+// lid rather than a plank on legs, so a flight is a stepped mass: nothing to see
+// underneath and nothing to fall through.
+//
+// `dx` and `dz` are one tread's step along the ground, which is what says which
+// way the flight climbs, and `base` is the lid it starts from — so a flight can
+// begin on top of whatever the last one reached.
+func steps(
+	x: Float,
+	z: Float,
+	dx: Float,
+	dz: Float,
+	count: Int,
+	base: Float,
+	wide: Float,
+	deep: Float
+): Block[dyn] {
+	mut Block[dyn] treads = []
+	mut Float atX = x
+	mut Float atZ = z
+	for i := 0; i < count; i++ {
+		lid := base + riser() * conv.itf(i + 1)
+		append(treads, Block(atX, (base + lid) / 2.0, atZ, wide, lid - base, deep,
+			"#454239"))
+		atX = atX + dx
+		atZ = atZ + dz
+	}
+	return treads
+}
+
+// The market, south-west: a grid of stalls, some of them low enough to shoot over
+// and some of them not, in alleys wide enough for one person. How many of the
+// sixteen places have a stall in them, how tall each one is and how far apart they
+// stand are all the seed's — so the same corner of the map is a thicket one game
+// and half empty the next.
+func market(made: Plan): Block[dyn] {
+	mut Block[dyn] stalls = []
+	for i := 0; i < 4; i++ {
+		for j := 0; j < 4; j++ {
+			salt := 200 + i * 17 + j * 3
+			if chance(made.seed, salt, 78) {
+				x := made.stallX + conv.itf(i) * made.pitch
+				z := made.stallZ + conv.itf(j) * made.pitch
+				tall := spread(made.seed, salt + 1, 1.2, 2.8)
+				append(stalls, Block(x, tall / 2.0, z, made.pitch - 3.4, tall,
+					made.pitch - 3.4, canvas(made.seed, salt)))
+			}
+		}
+	}
+	return stalls
+}
+
+// An awning. Three of them, so an alley is somewhere you can tell you have been
+// before — which is the only navigation a market gives you.
+func canvas(seed: Int, salt: Int): Str {
+	which := hash(seed, salt + 900) % 3
+	if which == 0 {
+		return "#5a2b28"
+	}
+	if which == 1 {
+		return "#26405a"
+	}
+	return "#5e4c22"
+}
+
+// The ruins, south-east: walls that stop halfway along and pillars with nothing
+// left on top of them. Every one of them is this seed's — how many, how long, how
+// tall, and which way round they lie — which makes this the district that looks
+// least like the one you played on last, and the one where you least often know
+// what is behind you.
+func ruins(made: Plan): Block[dyn] {
+	mut Block[dyn] blocks = []
+	for i := 0; i < between(made.seed, 70, 9, 14); i++ {
+		salt := 300 + i * 11
+		x := made.ruinX + spread(made.seed, salt, -13.0, 13.0)
+		z := made.ruinZ + spread(made.seed, salt + 1, -14.0, 14.0)
+		tall := spread(made.seed, salt + 2, 1.8, 4.0)
+		long := spread(made.seed, salt + 3, 3.0, 12.0)
+		if chance(made.seed, salt + 4, 22) {
+			// A pillar: whatever is left of one.
+			append(blocks, Block(x, tall / 2.0, z, 1.2, tall, 1.2, "#2f332e"))
+		}
+		if chance(made.seed, salt + 4, 22) == false {
+			if chance(made.seed, salt + 5, 50) {
+				append(blocks, Block(x, tall / 2.0, z, long, tall, 1.0, "#363b36"))
+			}
+			if chance(made.seed, salt + 5, 50) == false {
+				append(blocks, Block(x, tall / 2.0, z, 1.0, tall, long, "#363b36"))
+			}
+		}
+	}
+	// One slab off one of them, lying where it fell. It is a step up and a place to
+	// stand, which is more than the wall it came off is.
+	append(blocks, Block(made.ruinX - 4.0, 0.4, made.ruinZ + 2.0, 6.0, 0.8, 6.0,
+		"#41443e"))
+	return blocks
+}
+
+// The walkway: from the top tier of the tower to the warehouse loft, straight over
+// the yard's north gate and whatever is between them. Its height is the seed's,
+// and everything that has to meet it — the loft, the tower's tiers, the crates
+// inside the shed — is worked out from the same number.
+//
+// It is the one part of the place somebody has to show you, and the only way onto
+// the loft that is not four crates. Being up there is worth something, which is
+// the reason getting up there is awkward.
+func causeway(made: Plan): Block[dyn] {
+	from := made.shedX + made.shedW / 2.0
+	to := made.towerX - (made.tierW - 10.0) / 2.0
+	mut Block[dyn] blocks = [
+		Block((from + to) / 2.0, made.deck - 0.2, made.towerZ, to - from, 0.4, 2.2,
+			"#3a352f")
+	]
+	// Posts under it, at whatever spacing this one came out needing.
+	mut Float at = from + 8.0
+	for i := 0; i < 4; i++ {
+		if at < to - 4.0 {
+			append(blocks, Block(at, (made.deck - 0.4) / 2.0, made.towerZ, 0.8,
+				made.deck - 0.4, 0.8, "#302d28"))
+		}
+		at = at + 12.0
+	}
+	return blocks
+}
+
+// The lake's furniture: the dam across it, and the island beyond the dam.
+//
+// The dam is the reason to dive. Its underside is level with the water, so a
+// swimmer floating with their head out cannot pass it — the lid rule in `inside`
+// is what says so, and nothing here is a special case for water. Getting under it
+// costs a lungful, which is the whole of what makes the far half of the lake a
+// place you have to earn.
+// How wide the island's lowest tier is. Each tier above it is two metres narrower,
+// which leaves a metre of rim to stand on all the way round — a sandbank you can
+// only just get a foot onto is not one.
+func sandbank(): Float {
+	return 9.0
+}
+
+func shore(made: Plan): Block[dyn] {
+	pool := made.lake
+	mut Block[dyn] blocks = [
+		Block(pool.x, 1.6, made.dam, pool.w + 2.0, 3.2, 4.0, "#2f3239")
+	]
+	// The island: a sandbank a swimmer can kick up onto, and three steps to a beacon
+	// at the top of it. The lowest tier is *under* the water on purpose — anything
+	// standing out of a lake is unclimbable from in it, because the height a body
+	// steps up is measured from where the water holds it.
+	mut Float lid = 0.0 - 0.15
+	mut Float wide = sandbank()
+	for i := 0; i < 4; i++ {
+		append(blocks, Block(made.island.x, (pool.bed + lid) / 2.0, made.island.z,
+			wide, lid - pool.bed, wide - 1.0, "#3a3527"))
+		lid = lid + 0.3
+		wide = wide - 2.2
+	}
+	// The beacon. It is the brightest thing in the map and it is on the far side of
+	// the water: at night you can see where you are going long before you can see
+	// how to get there.
+	append(blocks, Block(made.island.x, lid + 1.6, made.island.z, 0.8, 3.2, 0.8,
+		"#c9a44b"))
+	return blocks
+}
+
+// What is left: cover in the open, scattered. Nothing lands in the yard, in the
+// water, or close enough to a district to be its business — open ground with
+// nothing in it is ground nobody crosses twice, and open ground with something in
+// it every twelve metres is not open ground.
+func scattered(made: Plan): Block[dyn] {
+	mut Block[dyn] blocks = []
+	for i := 0; i < between(made.seed, 80, 8, 14); i++ {
+		salt := 400 + i * 13
+		x := spread(made.seed, salt, -50.0, 50.0)
+		z := spread(made.seed, salt + 1, -50.0, 50.0)
+		if loose(made, x, z) {
+			tall := spread(made.seed, salt + 2, 1.0, 2.6)
+			wide := spread(made.seed, salt + 3, 2.0, 4.0)
+			append(blocks, Block(x, tall / 2.0, z, wide, tall, wide, "#4a3a24"))
+		}
+	}
+	return blocks
+}
+
+// Whether a place is open ground: outside the yard, out of the water, and not
+// standing in a district's way.
+func loose(made: Plan, x: Float, z: Float): Bool {
+	if math.abs(x) < 23.0 && math.abs(z) < 23.0 {
+		return false
+	}
+	if wet(made, x, z) || math.hypot(x - made.lake.x, z - made.lake.z) < 26.0 {
+		return false
+	}
+	if math.hypot(x - made.shedX, z - made.shedZ) < 22.0 {
+		return false
+	}
+	if math.hypot(x - made.towerX, z - made.towerZ) < 20.0 {
+		return false
+	}
+	if math.hypot(x - made.stallX - 12.0, z - made.stallZ - 12.0) < 22.0 {
+		return false
+	}
+	if math.hypot(x - made.ruinX, z - made.ruinZ) < 20.0 {
+		return false
+	}
+	return true
+}
+
+// ---------------------------------------------------------------------------
+// The water
+// ---------------------------------------------------------------------------
+// One lake, level with the ground, deep enough that you cannot touch the bottom
+// and stand. Swimming is slower than walking, the space bar climbs, control dives,
+// and **a head under the water runs out of air** — which is the price of the two
+// things being under it is good for: getting past the dam, and not being seen from
+// the bank.
+//
+// None of it is a special case anywhere else in the game. The floor is boxes and
+// the lake is a hole in them; a swimmer is a body whose floor is three metres
+// further down; the dam is a box whose underside is level with the water. What the
+// water *is*, mechanically, is one rectangle and one depth.
+//
+// The two halves of it are in two programs, and the split is the same one
+// everything else follows: the client decides where a swimmer *goes*, because it
+// is holding the keys, and the server decides what being under there *costs*,
+// because it is holding the health. Both of them ask the questions below.
+
+// A body of water: where it is, how far it reaches, and how far down its bed is.
+type Pool {
+	x: Float
+	z: Float
+	w: Float
+	d: Float
+	bed: Float
+}
+
+// The top of the water is the top of the ground, which is what makes walking into
+// a lake something you can do by accident.
+func surface(): Float {
+	return 0.0
+}
+
+// Where a body floats when it is not doing anything about it: eyes half a metre
+// clear of the water, and the rest under.
+func floating(): Float {
+	return 0.0 - 1.1
+}
+
+// How fast you swim, and how fast you climb or sink while doing it.
+func swim(): Float {
+	return 3.2
+}
+
+func paddle(): Float {
+	return 2.6
+}
+
+// A lungful, in milliseconds; what the water takes when it runs out, and how often
+// it takes it. Ten seconds is long enough to get under the dam and back with
+// something to spare, and short enough that the bottom of the lake is not
+// somewhere to sit and think.
+func breath(): Int {
+	return 10000
+}
+
+func gasp(): Int {
+	return 900
+}
+
+func drowned(): Int {
+	return 14
+}
+
+func wet(made: Plan, x: Float, z: Float): Bool {
+	pool := made.lake
+	if math.abs(x - pool.x) > pool.w / 2.0 {
+		return false
+	}
+	return math.abs(z - pool.z) <= pool.d / 2.0
+}
+
+func dry(made: Plan, x: Float, z: Float): Bool {
+	return wet(made, x, z) == false
+}
+
+// Whether a body is swimming rather than walking: in the water, under the top of
+// it, and with nothing under its feet. The third one is what keeps somebody
+// standing on the island's sandbank out of the swimming rules — shallow water is
+// somewhere you walk.
+//
+// It takes a place rather than a player, which is what lets the client ask it
+// about the body it is holding the keys for and the server ask it about a seat.
+func swimming(made: Plan, blocks: Block[], x: Float, y: Float, z: Float): Bool {
+	if dry(made, x, z) {
+		return false
+	}
+	if y > surface() - 0.35 {
+		return false
+	}
+	return y > ledge(blocks, x, z, y) + 0.02
+}
+
+// Whether the water has closed over somebody's head. It is the eye that decides,
+// because the eye is the thing the water closes over.
+func submerged(made: Plan, x: Float, y: Float, z: Float): Bool {
+	if dry(made, x, z) {
+		return false
+	}
+	return y + eyes() < surface()
+}
+
+// A number moving toward another one, by no more than a step. Which is the whole
+// of what "sinking" and "climbing" are, once gravity is not involved.
+func toward(from: Float, to: Float, step: Float): Float {
+	if to > from {
+		return math.min(to, from + step)
+	}
+	return math.max(to, from - step)
+}
+
+// Which district somebody is standing in, in words, for the corner of the screen
+// and for the score board. A map you have to learn is a map worth being told your
+// way around in, and on a generated one the answer has to come out of the plan
+// rather than out of a list of rectangles somebody typed.
+//
+// It takes three numbers rather than a player because the score board asks it
+// about *other* players, and what a client has of them is what the last snapshot
+// said they were — which is three numbers.
+func district(made: Plan, x: Float, y: Float, z: Float): Str {
+	if math.hypot(x - made.island.x, z - made.island.z) < 8.0 && y > 0.0 - 0.3 {
+		return "the island"
+	}
+	if wet(made, x, z) {
+		return "the lake"
+	}
+	if math.abs(x) <= 21.0 && math.abs(z) <= 21.0 {
+		return "the yard"
+	}
+	if math.hypot(x - made.shedX, z - made.shedZ) < 20.0 {
+		return "the warehouse"
+	}
+	if math.hypot(x - made.towerX, z - made.towerZ) < 18.0 {
+		return "the tower"
+	}
+	if x < 0.0 && z > 15.0 {
+		return "the market"
+	}
+	if x > 14.0 && z > 15.0 {
+		return "the ruins"
+	}
+	if y > 3.0 {
+		return "the causeway"
+	}
+	return "open ground"
+}
+
+// ---------------------------------------------------------------------------
+// Where you start, and where you come back
+// ---------------------------------------------------------------------------
+// Both are the server's to decide — it is the one that knows who else is standing
+// where — but *which places there are* is a fact about the map, so it lives here
+// with the map. The client is told a spot and walks from it.
+
+// How many places there are to start in. Eight rather than the yard's four,
+// because a place this size is worth coming back into somewhere else: the walk
+// back is a different walk every time, and half of them are a district you were
+// not in when you went down.
+func spots(): Int {
+	return 8
+}
+
+// The eight of them: the yard's four corners, which are the same every game, and
+// one outside each of the four districts that are not — read off the plan, facing
+// in. `n` is taken modulo eight, so a seat number or an index may be handed in
+// without either of them having to know how many there are.
+func spot(n: Int, seed: Int): Spot {
+	made := plan(seed)
+	which := n % spots()
+	if which == 0 {
+		return Spot(-16.0, -16.0, 0.8)
+	}
+	if which == 1 {
+		return Spot(16.0, -16.0, 2.4)
+	}
+	if which == 2 {
+		return Spot(16.0, 16.0, 3.9)
+	}
+	if which == 3 {
+		return Spot(-16.0, 16.0, 5.5)
+	}
+	// The warehouse door, and the foot of the tower's first flight — which is
+	// where a player who has never been here starts, facing the way up.
+	if which == 4 {
+		return Spot(made.shedX + made.door, made.shedZ + made.shedD / 2.0 + 4.0, 0.0)
+	}
+	if which == 5 {
+		return Spot(made.towerX, made.towerZ + made.tierW / 2.0 + 5.4, 0.0)
+	}
+	// The top of the market, and the edge of the ruins.
+	if which == 6 {
+		return Spot(made.stallX + 12.0, made.stallZ - 6.0, 3.14)
+	}
+	return Spot(made.ruinX - 16.0, made.ruinZ - 4.0, 4.71)
+}
+
+// ---------------------------------------------------------------------------
+// The arithmetic of being somewhere
+// ---------------------------------------------------------------------------
+// Everything from here down is a `func` of a place and a vector of boxes. That is
+// not tidiness: a `func` cannot act, so none of it can send a message or touch the
+// screen by accident — and it is imported by both programs, so the client's idea
+// of a wall and the server's are the same seventeen lines rather than two guesses.
+
+// How fast a player walks, in metres per second, and how hard the world pulls.
+func speed(): Float {
+	return 6.4
+}
+
+func gravity(): Float {
+	return 20.0
+}
+
+// How high the eye is above the feet, and how wide a player is. The second one is
+// used twice — to stop them walking through walls, and to work out whether a
+// bullet found them — so it is written once.
+func eyes(): Float {
+	return 1.62
+}
+
+func girth(): Float {
+	return 0.36
+}
+
+// Whether a player standing at this spot is inside nothing. A block whose top is
+// at or below the feet is not in the way — that is what makes a crate something
+// you climb onto rather than something you bump into.
+func clear(blocks: Block[], x: Float, y: Float, z: Float): Bool {
+	for each block in blocks {
+		if inside(block, x, y, z) {
+			return false
+		}
+	}
+	return true
+}
+
+func inside(block: Block, x: Float, y: Float, z: Float): Bool {
+	if block.y + block.h / 2.0 <= y + 0.35 {
+		return false
+	}
+	if x + girth() < block.x - block.w / 2.0 || x - girth() > block.x + block.w / 2.0 {
+		return false
+	}
+	if z + girth() < block.z - block.d / 2.0 || z - girth() > block.z + block.d / 2.0 {
+		return false
+	}
+	if y + eyes() < block.y - block.h / 2.0 || y > block.y + block.h / 2.0 {
+		return false
+	}
+	return true
+}
+
+// The highest thing under the feet: the top of a block being stood on, or the
+// ground. Only a top the feet are already at or above counts, so walking into the
+// side of a crate does not lift anybody onto it.
+func ledge(blocks: Block[], x: Float, z: Float, y: Float): Float {
+	// Nothing under it at all. The ground is boxes like everything else (see
+	// `lawn`), so "no floor here" is a real answer rather than an impossible one —
+	// and it is a number rather than a special case because nothing inside the
+	// walls can reach it.
+	mut Float top = 0.0 - 60.0
+	for each block in blocks {
+		if over(block, x, z) {
+			lid := block.y + block.h / 2.0
+			if lid <= y + 0.35 && lid > top {
+				top = lid
+			}
+		}
+	}
+	return top
+}
+
+func over(block: Block, x: Float, z: Float): Bool {
+	if x + girth() < block.x - block.w / 2.0 || x - girth() > block.x + block.w / 2.0 {
+		return false
+	}
+	if z + girth() < block.z - block.d / 2.0 || z - girth() > block.z + block.d / 2.0 {
+		return false
+	}
+	return true
+}
+
+// ---------------------------------------------------------------------------
+// What a bullet meets
+// ---------------------------------------------------------------------------
+// Hit-scan: the shot arrives the instant it is fired, which is what every game of
+// this kind does and what makes the answer a `func` of the state rather than
+// something to simulate. **The client does this arithmetic**, because the client
+// is the only thing that knows where the mouse was pointing — see `aimed` in
+// `../client.hive`, and "what is not guaranteed" in `../server.hive` for what
+// trusting it costs.
+
+// How far the shot travels before something solid stops it — or as far as anybody
+// can see, when nothing does.
+func wall(
+	blocks: Block[],
+	ox: Float,
+	oy: Float,
+	oz: Float,
+	dx: Float,
+	dy: Float,
+	dz: Float
+): Float {
+	mut Float nearest = 90.0
+	for each block in blocks {
+		reach := entry(block, ox, oy, oz, dx, dy, dz)
+		if reach >= 0.0 && reach < nearest {
+			nearest = reach
+		}
+	}
+	return nearest
+}
+
+// Where a ray enters a box, or a negative answer if it never does.
+//
+// The classic slab test: a box is three pairs of parallel planes, the ray is
+// inside the box between entering the last of them and leaving the first. Written
+// with `enters` and `exits` below so the three axes read the same.
+func entry(
+	block: Block,
+	ox: Float,
+	oy: Float,
+	oz: Float,
+	dx: Float,
+	dy: Float,
+	dz: Float
+): Float {
+	near := math.max(
+		math.max(
+			enters(ox, dx, block.x - block.w / 2.0, block.x + block.w / 2.0),
+			enters(oy, dy, block.y - block.h / 2.0, block.y + block.h / 2.0)
+		),
+		enters(oz, dz, block.z - block.d / 2.0, block.z + block.d / 2.0)
+	)
+	far := math.min(
+		math.min(
+			exits(ox, dx, block.x - block.w / 2.0, block.x + block.w / 2.0),
+			exits(oy, dy, block.y - block.h / 2.0, block.y + block.h / 2.0)
+		),
+		exits(oz, dz, block.z - block.d / 2.0, block.z + block.d / 2.0)
+	)
+	if far < near || far < 0.0 {
+		return 0.0 - 1.0
+	}
+	return math.max(near, 0.0)
+}
+
+// Where the ray crosses into one slab, and where it crosses out. A ray going
+// nowhere along an axis is either inside that slab for its whole length or
+// outside it for the whole length, and the two absurd distances say which — which
+// is what keeps a division by zero out of it.
+func enters(o: Float, d: Float, low: Float, high: Float): Float {
+	if math.abs(d) < 0.000001 {
+		if o < low || o > high {
+			return 1000000.0
+		}
+		return 0.0 - 1000000.0
+	}
+	return math.min((low - o) / d, (high - o) / d)
+}
+
+func exits(o: Float, d: Float, low: Float, high: Float): Float {
+	if math.abs(d) < 0.000001 {
+		if o < low || o > high {
+			return 0.0 - 1000000.0
+		}
+		return 1000000.0
+	}
+	return math.max((low - o) / d, (high - o) / d)
+}
+
+// What a player is, to a bullet: one sphere around the chest, this high above
+// their feet and this wide. It covers the body and the head, and it deliberately
+// does not cover the legs — a shot at somebody's shins misses, which is a rule
+// worth having on purpose rather than a rule that fell out of the arithmetic.
+func chest(): Float {
+	return 1.15
+}
+
+func build(): Float {
+	return 0.7
+}
+
+// How far along the ray somebody was hit, or a negative answer for a miss. The
+// nearest point on the ray to their chest, and whether that is within arm's
+// length of it. It takes three numbers rather than a player because the living
+// and the dead are shot at in exactly the same way.
+func struck(
+	atX: Float,
+	atY: Float,
+	atZ: Float,
+	ox: Float,
+	oy: Float,
+	oz: Float,
+	dx: Float,
+	dy: Float,
+	dz: Float
+): Float {
+	cx := atX - ox
+	cy := atY + chest() - oy
+	cz := atZ - oz
+	along := cx * dx + cy * dy + cz * dz
+	if along < 0.0 {
+		return 0.0 - 1.0
+	}
+	offX := cx - dx * along
+	offY := cy - dy * along
+	offZ := cz - dz * along
+	if math.sqrt(offX * offX + offY * offY + offZ * offZ) > build() {
+		return 0.0 - 1.0
+	}
+	return along
+}
+
+// Bullets do 34, so three of them are enough and two are not. **The server owns
+// this number**: a client says what it hit and never how hard, so the damage a
+// bullet does is not something a client is asked about (see `wire.Up.HitPlayer`).
+func damage(): Int {
+	return 34
+}
+
+// How long somebody stays down before they come back.
+func mourning(): Int {
+	return 2400
+}
+
+// Milliseconds and health are `Int`s, and `hive.math` is `Float` throughout — so
+// this is where the two meet, and it needs nothing from a library. Hive never
+// widens a number behind your back (`hive.conv.itf` is how one crosses), which is
+// what makes `math.max(0, health)` a compile error rather than a surprise.
+func floored(n: Int): Int {
+	if n < 0 {
+		return 0
+	}
+	return n
+}

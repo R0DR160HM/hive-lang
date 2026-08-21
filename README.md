@@ -308,13 +308,13 @@ Dockerfile.example   building a Hive program in a container
 ```
 
 [examples/](examples) is the other half of the documentation: twenty-one
-programs, from a two-line `echo` to a multiplayer game with a 3D scene, every one
-of them compiled by `./examples/run` and — where a program finishes on its own —
-run and compared with what it says it prints.
+programs, from a two-line `echo` to a multiplayer game whose server and client
+are two of them, every one compiled by `./examples/run` and — where a program
+finishes on its own — run and compared with what it says it prints.
 
 The compiler is about 23,000 lines of Hive — 8,700 of which are the Go runtime
 and the JavaScript a scene is drawn by, carried as source text — its tests are
-3,000 more, and the examples another 10,000.
+3,000 more, and the examples another 11,000.
 
 ## The pipeline
 

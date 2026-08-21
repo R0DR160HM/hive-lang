@@ -1,0 +1,1794 @@
+// A shooter for as many machines as you like
+// ==========================================
+// Three dimensions, a mouse, and a server. This program is one player's screen: it
+// draws the world, walks its own body around it, decides what its own shot was
+// pointing at, and tells the server about all three. **Everything it does not
+// decide, it is told** — everybody else's position, the whole horde, its own
+// health, and the score — which is what makes this a client rather than half a
+// mesh.
+//
+// RUN IT — one terminal for the server, one for each player:
+//
+//   hive run server.hive                            prints the URL to join
+//   hive run client.hive                            joins ws://127.0.0.1:9200/arena
+//   hive run client.hive ws://10.0.0.4:9200/arena   joins that one
+//
+// A second, third and fourth player is another terminal with the same line in it —
+// on this machine or on any machine that can reach the server. Nothing has to be
+// arranged between the clients, because no client ever talks to another one: the
+// server's URL is the whole of what anybody needs to know, and the argument above
+// only fills the lobby's field in for you.
+//
+// PLAYING: click the picture to take the mouse. W A S D walks, space jumps — and
+// swims up — control dives, the mouse looks, the left button shoots, `t` talks, tab
+// shows the score, escape gives the mouse back. Two bullets for a zombie and three
+// for anything worse.
+//
+// THE PLACE is a hundred metres across, it is always night, and **no two games are
+// on the same map**. The districts are always in the same quarters — a warehouse
+// north-west, a stepped tower north-east, a market south-west, ruins south-east, a
+// lake to the south, a walled yard in the middle — but how big each one is, what is
+// inside it, how far the lake reaches, where the island in it stands and how high
+// the walkway runs are rolled from a number. The server rolls that number and hands
+// it out on the way in; everything downstream of it is `lib/place.hive`, imported
+// by both programs, so the wall this client draws is the wall the server walks a
+// zombie around. See its header for why that matters more than it looks.
+//
+// THE LAKE is deep enough to swim in and there is a dam across it. Its underside is
+// level with the water, so a swimmer with their head out cannot pass it and a
+// swimmer who dives can — and the island on the far side is either that dive or the
+// long way round the shore. **Stay under too long and you drown**: a lungful is ten
+// seconds, it comes back twice as fast as it goes, and the water starts on your
+// health when it runs out. Being under it is also the only place on the map nobody
+// can see you from, because the surface is drawn opaque from above and not at all
+// from below.
+//
+// The air meter in the corner is the server's arithmetic, not this program's — it
+// is holding the health, so it is holding what drowning costs. This client draws
+// what the last snapshot said was left of the breath.
+//
+// WHAT COMES FOR YOU is three things, and the fog gives you about a second's
+// warning of any of them. **Zombies** walk at you and will not get their feet wet.
+// **Mermen** never leave the lake and swim faster than you do. **Vampires** walk
+// like a zombie until walking will not do, and then become bats and go over the top
+// of whatever was in the way — walls, crates, the water — and every bite puts one
+// back on its feet, so one you left at a sliver is whole when you meet it next.
+//
+// All of them are the server's. This program has never moved one and does not know
+// how; it draws them where the last snapshot put them, fifteen times a second, and
+// shoots at them by number.
+//
+// TALKING costs nothing and needs nothing: a line you type is one more message down
+// the socket that is already carrying your position, and the server stamps your
+// name on it and hands it round. There is no chat server, no second port and no
+// second connection anywhere.
+//
+// And it is typed **with the mouse still locked to the picture**, which is why it
+// is not a text field. A field would have to be clicked, and the click belongs to
+// the game; handing the mouse back to say hello and asking for it again afterwards
+// is two clicks and a lost fight. `t` turns the keyboard into text and `enter`
+// turns it back — one flag in the model, and `Pressed` is the only message either
+// state needs.
+//
+// WHAT DOES THE WORK
+// ------------------
+// Four things, and the file is organised as the four of them:
+//
+//   * `hive.ui.scene` draws. A scene is a **value** — a camera and a vector of
+//     shapes — rebuilt by an ordinary `func` from the state, sixty times a
+//     second. Nothing here holds a mesh, a material or a canvas: `world` below
+//     answers "what is there right now", the same way `view` answers "what does
+//     the panel say right now". Night is part of that answer rather than a setting:
+//     a dark sky, dark fog, and a palette to match.
+//
+//   * `hive.math` moves *this* player. Which way "forward" is, whether the step
+//     would end inside a wall, how high the crate under your feet is, whether your
+//     shot met anybody — all of it is arithmetic on the state, in `func`s a test
+//     can call, and `client.test.hive` walks a player into a wall with no window,
+//     no mouse and no server anywhere.
+//
+//   * `hive.net` connects, and that is the whole of the networking in this file:
+//     one `wsConnect`, one thread that does nothing but `wsReceive`, and a `wsSend`
+//     wherever there is something to say.
+//
+//   * `hive.syslink` is how the reading thread gets back in. **A window is a
+//     service** — `update` below is a fold over a mailbox, checked as one — so it
+//     has an address, and `hive.syslink.self` inside the fold is how a background
+//     task is handed it. That is why there is no queue in this program and no
+//     mutex: the socket reader posts what it heard, and it arrives at the same fold
+//     the keyboard arrives at, as one more variant.
+//
+// WHAT THIS PROGRAM IS TRUSTED WITH
+// ---------------------------------
+// Where it is standing, and what it was pointing at. That is all, and the two are
+// the two facts only the machine with the mouse plugged into it can know. It cannot
+// give itself health, cannot credit itself a kill, cannot decide it finished
+// something that was still standing, and cannot see anybody the server has not told
+// it about. See "what is still not guaranteed" in `server.hive` for what is left.
+
+import ./lib/place
+import ./lib/wire
+import hive.ui
+import hive.math
+import hive.conv
+
+// ---------------------------------------------------------------------------
+// The state
+// ---------------------------------------------------------------------------
+
+type Screen {
+	Lobby
+	// Connected, and waiting to be told which seat and which world. It is a screen
+	// rather than a flag because it is a thing the player can see happening.
+	Joining
+	Arena
+}
+
+// The socket, once there is one. A variant rather than a bare connection because
+// there is a whole screen before there is one, and `Link.None` is what that screen
+// holds.
+type Link {
+	None
+	Live { conn: hive.net.WsConnection }
+}
+
+// My own body. **There is no health in it** — that is the server's, and it arrives
+// in every snapshot — so what is left here is exactly the part this program is
+// trusted with: where the keys have put it, and where the mouse is looking.
+//
+// `y` is the ground under the feet, not the eye — the eye is a constant above it,
+// and keeping the two apart is what makes standing on a crate mean anything.
+type Body {
+	x: Float
+	y: Float
+	z: Float
+	fall: Float
+	yaw: Float
+	pitch: Float
+}
+
+// A shot, briefly. `life` is how many milliseconds it still has to be seen for.
+type Tracer {
+	ax: Float
+	ay: Float
+	az: Float
+	bx: Float
+	by: Float
+	bz: Float
+	life: Int
+}
+
+// Something somebody said, and how much longer it stays on the screen. It carries
+// the seat as well as the name because the colour is computed from the seat — the
+// same colour that player's body has in the picture, so "the green one" means one
+// person in the arena and in the chat.
+type Line {
+	seat: Int
+	who: Str
+	text: Str
+	life: Int
+}
+
+// What a shot found. `Nobody` is a miss, and the two others say which of the two
+// kinds of thing it was — because they are two different messages to the server,
+// and it is the server that does anything about either.
+type Struck {
+	Nobody
+	Player { seat: Int }
+	Undead { id: Int }
+}
+
+// What a shot did. A pure `func` works this out and a `proc` sends it, which is the
+// split that lets a test fire a gun without a network.
+type Shot {
+	at: Struck
+	ax: Float
+	ay: Float
+	az: Float
+	bx: Float
+	by: Float
+	bz: Float
+}
+
+// The window's mailbox. A key you pressed and a line the server said arrive at the
+// same fold and are told apart only by which variant they are — which is the claim
+// `hive.syslink` makes, holding as far as the keyboard.
+type Msg {
+	// From the screen.
+	NameTyped { text: Str }
+	ServerTyped { text: Str }
+	Joined
+	Left
+	Pressed { key: Str }
+	Released { key: Str }
+	Looked { dx: Float, dy: Float }
+	Grabbed { on: Bool }
+	Tick { ms: Int }
+
+	// From the socket, posted in by the thread reading it. One variant for
+	// everything the server can say, because `wire.Down` is already that list and a
+	// second copy of it here would be a second thing to keep in step.
+	Heard { news: wire.Down }
+	// And the connection ending, however it ended.
+	Lost { why: Str }
+}
+
+type Model {
+	me: Str
+	// The URL to join. It is a `Str` because that is what it is: deployment data,
+	// typed into a field, and string work is all anybody does to it.
+	server: Str
+	screen: Screen
+	link: Link
+	// Which seat the server gave us, and the world it gave us with it. Seats are
+	// numbered from one, so zero is "not seated yet".
+	seat: Int
+	seed: Int
+	aiming: Bool
+	trouble: Str
+
+	body: Body
+	held: Str[dyn]
+	// Everybody, **including this player**, exactly as the last snapshot said — and
+	// this player's own row is where the health, the air, the count and every score
+	// on the board are read from. One list, one source, and no way for the screen
+	// to hold an opinion about your health that the server does not share.
+	roster: wire.Player[dyn]
+	// And the whole horde, likewise. This program never moves one of these.
+	horde: wire.Fiend[dyn]
+
+	tracers: Tracer[dyn]
+	chat: Line[dyn]
+	cooldown: Int
+	// How long until this player's position goes up the wire again.
+	beat: Int
+	board: Bool
+	// Whether the keyboard is text at the moment, and what it has typed so far.
+	// The two of them are the whole of the chat's state, and the first one is the
+	// only difference between a key that walks and a key that spells.
+	composing: Bool
+	saying: Str
+}
+
+// ---------------------------------------------------------------------------
+// Reading the snapshot
+// ---------------------------------------------------------------------------
+// Four small `func`s, and between them the reason there is no second copy of
+// anything in this program. Health, air, the count until you are back and every
+// score are read out of the roster on the way to the screen, rather than kept
+// somewhere here and mended when a snapshot disagrees.
+
+// This player's own row. A row of zeroes before the first snapshot, which is a
+// thing the HUD can draw — where "no answer yet" would have been a thing eleven
+// places had to cope with.
+func mine(model: Model): wire.Player {
+	return wire.seated(model.roster, model.seat)
+}
+
+// Everybody else. This player is not in it, because this player is the camera.
+func others(model: Model): wire.Player[dyn] {
+	mut wire.Player[dyn] rest = []
+	for each one in model.roster {
+		if one.seat != model.seat {
+			append(rest, one)
+		}
+	}
+	return rest
+}
+
+func alive(model: Model): Bool {
+	return mine(model).health > 0
+}
+
+// Playing alone is not a mode this game has; it is a fact about the roster, read
+// off it every time the screen is drawn. One name in it and there is nobody to
+// shoot but the horde; somebody joining changes the answer and nothing else.
+func alone(model: Model): Bool {
+	return len(model.roster) <= 1
+}
+
+// ---------------------------------------------------------------------------
+// Moving
+// ---------------------------------------------------------------------------
+// Everything from here to "Shooting" is a `func` of the state. That is not
+// tidiness: a `func` cannot act, so none of it can send a message or touch the
+// screen by accident — and `client.test.hive` walks a player into a wall without a
+// window, a mouse or a server anywhere.
+//
+// **This is the half of the game the client owns.** Sixty frames a second of keys,
+// gravity and collision happen here, on this machine, because a game that asked a
+// server where its own feet were would feel like one.
+
+// One frame: the part that happens whether or not anything did. Look and shoot
+// arrive as their own messages; this is the walking, the falling, the reload, and
+// the tracers and chat going quiet.
+//
+// Compare it with the mesh version this replaces and what is *missing* is the
+// point: no pack to step, no clocks to keep, no health to work out, no drowning.
+// All of that is one process away, and what is left is this screen's own business.
+func stepped(model: Model, ms: Int): Model {
+	dt := math.min(conv.itf(ms) / 1000.0, 0.05)
+	mut Model next = model
+	next.cooldown = place.floored(model.cooldown - ms)
+	next.tracers = fading(model.tracers, ms)
+	next.chat = hushed(model.chat, ms)
+	next.beat = model.beat - ms
+
+	// Somebody who is down does not walk. When they are back up is the server's
+	// call, and it arrives as a `Reborn`.
+	if alive(model) == false {
+		return next
+	}
+	next.body = walked(model, dt)
+	return next
+}
+
+// Where a body ends up after `dt` seconds of whatever is held down.
+//
+// The two horizontal steps are taken one at a time, and each is given up
+// separately if it would end inside something. That is what lets a player slide
+// along a wall they are pushing into instead of stopping dead against it.
+func walked(model: Model, dt: Float): Body {
+	// In the water none of the rest of this applies: no gravity, no jumping, and
+	// half the speed. It is the one branch, and it is here rather than in the fold
+	// because whether you are swimming is a fact about where you are.
+	if swimming(model) {
+		return paddled(model, dt)
+	}
+	blocks := place.arena(model.seed)
+	mut Body body = model.body
+
+	step := heading(model, dt, place.speed())
+	if step.dx != 0.0 || step.dz != 0.0 {
+		if place.clear(blocks, body.x + step.dx, body.y, body.z) {
+			body.x = body.x + step.dx
+		}
+		if place.clear(blocks, body.x, body.y, body.z + step.dz) {
+			body.z = body.z + step.dz
+		}
+	}
+
+	// Down, then what stopped it. A jump is a push upwards and nothing else; the
+	// same three lines bring it back.
+	body.fall = body.fall - place.gravity() * dt
+	if held(model, "space") && grounded(model) {
+		body.fall = 7.4
+	}
+	was := body.y
+	body.y = body.y + body.fall * dt
+	// The lid to land on is looked for across the whole step, not at the end of
+	// it. Falling fast, a foot that was above a crate is below it by the time the
+	// step is over — and asking "is there a lid near where I am now" would miss
+	// it and drop the player through the crate.
+	floor := place.ledge(blocks, body.x, body.z, math.max(was, body.y))
+	if body.y <= floor {
+		body.y = floor
+		body.fall = 0.0
+	}
+	// A jump into the underside of something stops there rather than passing
+	// through it.
+	if body.fall > 0.0 && place.clear(blocks, body.x, body.y, body.z) == false {
+		body.y = body.y - body.fall * dt
+		body.fall = 0.0
+	}
+	return body
+}
+
+// The swim. It is `walked` with three differences and no fourth: slower, no
+// gravity, and up and down are keys rather than something the world does to you.
+func paddled(model: Model, dt: Float): Body {
+	made := place.plan(model.seed)
+	blocks := place.arena(model.seed)
+	mut Body body = model.body
+	step := heading(model, dt, place.swim())
+	if step.dx != 0.0 || step.dz != 0.0 {
+		if place.clear(blocks, body.x + step.dx, body.y, body.z) {
+			body.x = body.x + step.dx
+		}
+		if place.clear(blocks, body.x, body.y, body.z + step.dz) {
+			body.z = body.z + step.dz
+		}
+	}
+	body.fall = 0.0
+	// Where it wants to be: at the surface if it is climbing, at the bottom if it
+	// is diving, and floating if it is doing neither.
+	mut Float want = place.floating()
+	if held(model, "space") {
+		want = place.surface() - 0.4
+	}
+	if held(model, "ctrl") {
+		want = made.lake.bed + 0.3
+	}
+	body.y = place.toward(body.y, want, place.paddle() * dt)
+	return body
+}
+
+// Whether this player is swimming, and whether the water has closed over their
+// head. Both are `lib/place.hive`'s arithmetic handed this body — the server asks
+// the same two questions about the same position, which is why the meter in the
+// corner and the way the keys behave can never disagree.
+func swimming(model: Model): Bool {
+	return place.swimming(place.plan(model.seed), place.arena(model.seed),
+		model.body.x, model.body.y, model.body.z)
+}
+
+func under(model: Model): Bool {
+	return place.submerged(place.plan(model.seed), model.body.x, model.body.y,
+		model.body.z)
+}
+
+// A step across the ground: how far this frame goes and in which direction.
+type Step {
+	dx: Float
+	dz: Float
+}
+
+// Which way the keys point, as that step. The yaw flattened, the diagonals
+// normalised so that holding two of them turns you rather than launching you, and
+// the whole thing scaled by whatever the medium allows — which is the only
+// difference between walking and swimming, and the reason this is one `func` and
+// not two.
+func heading(model: Model, dt: Float, rate: Float): Step {
+	ahead := axis(model, "w", "s")
+	side := axis(model, "d", "a")
+	if ahead == 0.0 && side == 0.0 {
+		return Step(0.0, 0.0)
+	}
+	// Forward is where the eye is pointing, flattened: rotating (0, 0, -1) by the
+	// yaw gives (-sin, -cos), and right is the same turn a quarter later.
+	fx := 0.0 - math.sin(model.body.yaw)
+	fz := 0.0 - math.cos(model.body.yaw)
+	mut Float dx = fx * ahead + math.cos(model.body.yaw) * side
+	mut Float dz = fz * ahead + (0.0 - math.sin(model.body.yaw)) * side
+	length := math.hypot(dx, dz)
+	if length > 0.0 {
+		scale := rate * dt / length
+		dx = dx * scale
+		dz = dz * scale
+	}
+	return Step(dx, dz)
+}
+
+// Which way one pair of keys adds up to: forwards, backwards, or nowhere.
+func axis(model: Model, plus: Str, minus: Str): Float {
+	mut Float total = 0.0
+	if held(model, plus) {
+		total = total + 1.0
+	}
+	if held(model, minus) {
+		total = total - 1.0
+	}
+	return total
+}
+
+func held(model: Model, key: Str): Bool {
+	if indexOf(model.held, key) is Result.Ok(_) {
+		return true
+	}
+	return false
+}
+
+func grounded(model: Model): Bool {
+	floor := place.ledge(place.arena(model.seed), model.body.x, model.body.z,
+		model.body.y)
+	return model.body.y <= floor + 0.02
+}
+
+// Turning. The mouse reports how far it moved and the model decides what that is
+// worth; pitch stops short of straight up and straight down, because there is
+// nothing above the top of the sky to look at and rolling over would be worse.
+func turned(model: Model, dx: Float, dy: Float): Body {
+	mut Body body = model.body
+	body.yaw = body.yaw - dx * 0.0024
+	body.pitch = math.clamp(body.pitch - dy * 0.0024, 0.0 - 1.35, 1.35)
+	return body
+}
+
+// A body standing at a spot the server picked, facing where it said. It is the one
+// thing in this program that moves this player without a key being pressed, and it
+// happens exactly twice: on the way in, and on coming back.
+func fresh(at: place.Spot): Body {
+	return Body(at.x, 0.0, at.z, 0.0, at.yaw, 0.0)
+}
+
+func whereabouts(model: Model): Str {
+	return place.district(place.plan(model.seed), model.body.x, model.body.y,
+		model.body.z)
+}
+
+// ---------------------------------------------------------------------------
+// Shooting
+// ---------------------------------------------------------------------------
+
+// Where the bullet went and whom it found. Hit-scan: the shot arrives the instant
+// it is fired, which is what every game of this kind does and what makes the
+// answer a `func` of the state rather than something to simulate.
+//
+// **This is the other thing the client is trusted with**, and it is trusted with it
+// because it is the only thing that knows where the mouse was pointing. What goes
+// up the wire is *which* seat or *which* of the dead — never how much damage —
+// because what a bullet is worth is the server's number and not this program's.
+//
+// The eye is the origin; the direction is the aim in full, pitch included. A
+// player is a sphere around their chest, a wall is a box, and the nearest of the
+// two is what the bullet met.
+func aimed(model: Model): Shot {
+	ox := model.body.x
+	oy := model.body.y + place.eyes()
+	oz := model.body.z
+	flat := math.cos(model.body.pitch)
+	dx := 0.0 - math.sin(model.body.yaw) * flat
+	dy := math.sin(model.body.pitch)
+	dz := 0.0 - math.cos(model.body.yaw) * flat
+
+	// The wall is what the bullet meets if nothing else does, and everything else
+	// has to be nearer than it to count. Players and the horde are checked the same
+	// way and against the same distance, so whichever is in front is what is hit —
+	// a zombie between you and somebody else is cover, and shooting it in the back
+	// is a perfectly good idea. The floor is in that vector too, so a shot into the
+	// ground stops in the ground.
+	mut Float best = place.wall(place.arena(model.seed), ox, oy, oz, dx, dy, dz)
+	mut Struck at = Struck.Nobody()
+	for each one in others(model) {
+		if one.health > 0 {
+			hit := place.struck(one.x, one.y, one.z, ox, oy, oz, dx, dy, dz)
+			if hit >= 0.0 && hit < best {
+				best = hit
+				at = Struck.Player(one.seat)
+			}
+		}
+	}
+	for each fiend in model.horde {
+		hit := place.struck(fiend.x, fiend.y, fiend.z, ox, oy, oz, dx, dy, dz)
+		if hit >= 0.0 && hit < best {
+			best = hit
+			at = Struck.Undead(fiend.id)
+		}
+	}
+	return Shot(at, ox, oy, oz, ox + dx * best, oy + dy * best, oz + dz * best)
+}
+
+func fading(tracers: Tracer[], ms: Int): Tracer[dyn] {
+	mut Tracer[dyn] left = []
+	for each tracer in tracers {
+		if tracer.life > ms {
+			append(left, Tracer(tracer.ax, tracer.ay, tracer.az, tracer.bx,
+				tracer.by, tracer.bz, tracer.life - ms))
+		}
+	}
+	return left
+}
+
+func tracing(shot: Shot): Tracer {
+	return Tracer(shot.ax, shot.ay, shot.az, shot.bx, shot.by, shot.bz, 120)
+}
+
+// ---------------------------------------------------------------------------
+// Talking
+// ---------------------------------------------------------------------------
+// A chat, and **not one made out of `ui.input`** — which is worth saying why,
+// because a text field is the obvious answer and it is the wrong one here. A field
+// has to be clicked to be typed into, and the mouse is not the player's to click
+// with: it is locked to the picture, which is what makes looking around work.
+//
+// So the line is composed out of the keyboard the game is already reading. A key
+// arrives as `Pressed` whether it means "walk forward" or means the letter `w`, and
+// which of the two it means is one flag in the model. That is the whole mechanism,
+// and everything under it is a `func` a test can call — so `client.test.hive` holds
+// a conversation with no keyboard and no server in it.
+//
+// What it costs is capitals: a key is reported by the name of the key, and that
+// name is `a` whether or not shift was held. Everybody shouting in lower case
+// seemed a fair price for never letting go of the mouse.
+
+// How long a line stays on the screen, and how many are kept. Both are small: a
+// chat that scrolled would be a page, and this is a game.
+func chatting(): Int {
+	return 14000
+}
+
+func remembered(): Int {
+	return 5
+}
+
+// The longest thing this screen will draw. The server clips what crosses the wire
+// as well, and both of them being sure is not redundant: how much of the wire a
+// client may take is the server's business, and how much of the screen a line may
+// take is this screen's.
+func mouthful(): Int {
+	return 90
+}
+
+// Starting a line. Whatever was held goes with it: a player who was running when
+// they started typing would otherwise run into a wall for as long as the sentence
+// took, and none of those keys is a key any more — they are letters now.
+func opening(model: Model): Model {
+	mut Model next = model
+	next.composing = true
+	next.saying = ""
+	next.held = nothing()
+	return next
+}
+
+// Done with it, either way. Sending is what `say` does; this is only the part
+// where the keyboard goes back to being a keyboard.
+func sealed(model: Model): Model {
+	mut Model next = model
+	next.composing = false
+	next.saying = ""
+	return next
+}
+
+// One key into the line. A letter, a digit or a punctuation mark is itself — that
+// is what the renderer reports — space is a space, backspace takes one back, and
+// everything else (shift, tab, the arrows, a mouse button) is not text and is
+// ignored. Which is the whole of the difference: one character long means type it.
+func typed(model: Model, key: Str): Model {
+	mut Model next = model
+	if key == "space" {
+		next.saying = clipped("{model.saying} ")
+		return next
+	}
+	if key == "backspace" {
+		next.saying = rubbed(model.saying)
+		return next
+	}
+	if len(split(key, "")) == 1 {
+		next.saying = clipped("{model.saying}{key}")
+	}
+	return next
+}
+
+// Every character but the last. `for each` never indexes, which is why this is
+// four lines and not a bounds proof.
+func rubbed(text: Str): Str {
+	letters := split(text, "")
+	mut Str[dyn] left = []
+	mut Int seen = 0
+	for each letter in letters {
+		seen = seen + 1
+		if seen < len(letters) {
+			append(left, letter)
+		}
+	}
+	return join(left, "")
+}
+
+// At most a mouthful of it.
+func clipped(text: Str): Str {
+	mut Str[dyn] kept = []
+	mut Int seen = 0
+	for each letter in split(text, "") {
+		seen = seen + 1
+		if seen <= mouthful() {
+			append(kept, letter)
+		}
+	}
+	return join(kept, "")
+}
+
+func usable(text: Str): Bool {
+	return join(split(text, " "), "") != ""
+}
+
+// The log with one more line at the end of it, and the oldest dropped when that
+// makes it too long.
+func noted(lines: Line[], seat: Int, who: Str, text: Str): Line[dyn] {
+	over := len(lines) + 1 - remembered()
+	mut Line[dyn] said = []
+	mut Int seen = 0
+	for each line in lines {
+		if seen >= over {
+			append(said, line)
+		}
+		seen = seen + 1
+	}
+	append(said, Line(seat, who, clipped(text), chatting()))
+	return said
+}
+
+// Somebody said something — and that includes this player, because the server
+// hands every line to everybody. A line you typed appears when the server saw it,
+// which is one code path instead of two and one fewer thing to be almost right.
+func spoke(model: Model, seat: Int, who: Str, text: Str): Model {
+	mut Model next = model
+	next.chat = noted(model.chat, seat, who, text)
+	return next
+}
+
+// Lines going quiet, the same way tracers fade — and for the same reason: what is
+// on the screen is what is recent, and nothing has to be cleared away.
+func hushed(lines: Line[], ms: Int): Line[dyn] {
+	mut Line[dyn] left = []
+	for each line in lines {
+		if line.life > ms {
+			append(left, Line(line.seat, line.who, line.text, line.life - ms))
+		}
+	}
+	return left
+}
+
+// ---------------------------------------------------------------------------
+// The picture
+// ---------------------------------------------------------------------------
+
+// A scene is a value, so this is a `func` like any other view — and, like any
+// other view, it cannot act. Sixty of these are built a second and thrown away;
+// if drawing could send a message, every frame would send it again.
+func world(model: Model): ui.Shape[dyn] {
+	made := place.plan(model.seed)
+	mut ui.Shape[dyn] shapes = []
+	// The floor. It is the same boxes the collisions use — one description, two
+	// uses — drawn as `ground` planes rather than as boxes because `ground` is the
+	// shape the renderer puts grass on, and a floor wants grass.
+	for each slab in place.lawn(made) {
+		append(shapes, ui.ground(
+			[
+				ui.at(slab.x, slab.y + slab.h / 2.0, slab.z),
+				ui.paint(ui.Tone.HEX(slab.shade))
+			],
+			slab.w,
+			slab.d
+		))
+	}
+	// The water, which is the one thing drawn that nothing collides with: you swim
+	// through it. A box rather than a plane, and that is worth a word — a box has an
+	// underside, so from the bank the lake is opaque and from below it is not there
+	// at all. Which is exactly what a dive is worth: they cannot see you, and you
+	// can see them.
+	append(shapes, ui.box(
+		[
+			ui.at(made.lake.x, place.surface() - 0.06, made.lake.z),
+			ui.paint(ui.Tone.HEX("#12283d"))
+		],
+		made.lake.w,
+		0.12,
+		made.lake.d
+	))
+	for each block in place.built(made) {
+		append(shapes, ui.box(
+			[
+				ui.at(block.x, block.y, block.z),
+				ui.paint(ui.Tone.HEX(block.shade))
+			],
+			block.w,
+			block.h,
+			block.d
+		))
+	}
+	for each one in others(model) {
+		for each piece in player(one) {
+			append(shapes, piece)
+		}
+	}
+	// The horde, drawn from the last snapshot. Nothing here knows or cares that
+	// something else is moving them: a picture is what the state says, and the
+	// state is what arrived.
+	for each fiend in model.horde {
+		for each piece in beast(fiend) {
+			append(shapes, piece)
+		}
+	}
+	for each tracer in model.tracers {
+		append(shapes, ui.line(
+			[ui.paint(ui.Tone.HEX("#ffe066"))],
+			tracer.ax,
+			tracer.ay,
+			tracer.az,
+			tracer.bx,
+			tracer.by,
+			tracer.bz
+		))
+	}
+	return shapes
+}
+
+// Somebody else: a body, a head, a snout to show which way they are facing, and
+// their name above them. Four shapes and a colour computed from their seat — which
+// is what `Tone.HEX` and `Tone.RGBA` are for, since there is no role called "the
+// other player" and no closed set could have one.
+func player(one: wire.Player): ui.Shape[dyn] {
+	mut ui.Shape[dyn] pieces = []
+	if one.health <= 0 {
+		// Down, and lying where they fell rather than gone: a game that hides its
+		// dead makes the two seconds before they are back read as a disconnection.
+		append(pieces, ui.box(
+			[ui.at(one.x, one.y + 0.15, one.z), ui.paint(ui.Tone.Muted())],
+			1.2,
+			0.3,
+			0.6
+		))
+		return pieces
+	}
+	shade := colour(one.seat)
+	append(pieces, ui.box(
+		[
+			ui.at(one.x, one.y + 0.62, one.z),
+			ui.turn(0.0, one.yaw, 0.0),
+			ui.paint(shade)
+		],
+		0.62,
+		1.24,
+		0.42
+	))
+	append(pieces, ui.sphere(
+		[ui.at(one.x, one.y + 1.48, one.z), ui.paint(ui.Tone.HEX("#f2d3ae"))],
+		0.26
+	))
+	// Where they are looking, so a player about to be shot at can tell.
+	append(pieces, ui.box(
+		[
+			ui.at(
+				one.x - math.sin(one.yaw) * 0.42,
+				one.y + 1.2,
+				one.z - math.cos(one.yaw) * 0.42
+			),
+			ui.turn(0.0, one.yaw, 0.0),
+			ui.paint(ui.Tone.HEX("#2b2f36"))
+		],
+		0.12,
+		0.12,
+		0.7
+	))
+	append(pieces, ui.label(
+		[ui.at(one.x, one.y + 2.1, one.z), ui.paint(ui.Tone.HEX("#ffffff"))],
+		"{one.who}  {one.health}"
+	))
+	return pieces
+}
+
+// One of the horde, whichever it is. The three of them have to be told apart at
+// forty metres in the dark, so the difference is shape before it is colour: a
+// zombie has its arms out, a merman is a head and shoulders above the water and
+// nothing else, and a bat is wings.
+func beast(fiend: wire.Fiend): ui.Shape[dyn] {
+	if fiend.breed == wire.Breed.Merman() {
+		return swimmer(fiend)
+	}
+	if fiend.breed == wire.Breed.Vampire() {
+		return stalker(fiend)
+	}
+	return walker(fiend)
+}
+
+// A merman: a hunched back and a head at the waterline, with a fin to either side.
+// Most of it is under the water and the water is drawn opaque, so what you actually
+// see is a shape moving at you and no legs — which is the whole idea.
+func swimmer(fiend: wire.Fiend): ui.Shape[dyn] {
+	skin := scale(fiend.health)
+	mut ui.Shape[dyn] pieces = [
+		ui.box(
+			[
+				ui.at(fiend.x, fiend.y + 1.0, fiend.z),
+				ui.turn(0.0, fiend.yaw, 0.0),
+				ui.paint(skin)
+			],
+			0.62,
+			0.9,
+			0.5
+		),
+		ui.sphere(
+			[ui.at(fiend.x, fiend.y + 1.6, fiend.z), ui.paint(skin)],
+			0.26
+		)
+	]
+	for each side in [0.0 - 1.0, 1.0] {
+		append(pieces, ui.box(
+			[
+				ui.at(
+					fiend.x + math.cos(fiend.yaw) * 0.42 * side,
+					fiend.y + 1.05,
+					fiend.z - math.sin(fiend.yaw) * 0.42 * side
+				),
+				ui.turn(0.0, fiend.yaw, 0.0),
+				ui.paint(skin)
+			],
+			0.5,
+			0.1,
+			0.28
+		))
+	}
+	return pieces
+}
+
+// A vampire, on its feet or in the air. On the ground it is tall and dark with a
+// pale head and a cape; in the air it is a body a third the size and two wings, and
+// nothing else — because a bat coming at you over a wall has to read as a bat in
+// the half second you have to shoot it in.
+func stalker(fiend: wire.Fiend): ui.Shape[dyn] {
+	skin := pallor(fiend.health)
+	if fiend.flying {
+		mut ui.Shape[dyn] wings = [
+			ui.box(
+				[
+					ui.at(fiend.x, fiend.y + 0.9, fiend.z),
+					ui.turn(0.0, fiend.yaw, 0.0),
+					ui.paint(skin)
+				],
+				0.3,
+				0.42,
+				0.3
+			)
+		]
+		for each side in [0.0 - 1.0, 1.0] {
+			append(wings, ui.box(
+				[
+					ui.at(
+						fiend.x + math.cos(fiend.yaw) * 0.62 * side,
+						fiend.y + 1.05,
+						fiend.z - math.sin(fiend.yaw) * 0.62 * side
+					),
+					ui.turn(0.0, fiend.yaw, 0.35 * side),
+					ui.paint(skin)
+				],
+				1.1,
+				0.08,
+				0.6
+			))
+		}
+		return wings
+	}
+	mut ui.Shape[dyn] pieces = [
+		ui.box(
+			[
+				ui.at(fiend.x, fiend.y + 0.72, fiend.z),
+				ui.turn(0.0, fiend.yaw, 0.0),
+				ui.paint(skin)
+			],
+			0.5,
+			1.44,
+			0.36
+		),
+		ui.sphere(
+			[
+				ui.at(fiend.x, fiend.y + 1.64, fiend.z),
+				ui.paint(ui.Tone.HEX("#c8bfae"))
+			],
+			0.24
+		),
+		// The cape, which is the whole of what makes it read as a vampire rather
+		// than as a thin zombie.
+		ui.box(
+			[
+				ui.at(
+					fiend.x + math.sin(fiend.yaw) * 0.26,
+					fiend.y + 0.86,
+					fiend.z + math.cos(fiend.yaw) * 0.26
+				),
+				ui.turn(0.0, fiend.yaw, 0.0),
+				ui.paint(ui.Tone.HEX("#20161c"))
+			],
+			1.0,
+			1.2,
+			0.12
+		)
+	]
+	return pieces
+}
+
+// A zombie: a hunched body, a head, and two arms held out in front — which is the
+// whole of what makes a box read as a zombie rather than as a crate. They go dull
+// as they are shot, so how much fight is left in one is something you can see
+// rather than something you have to remember.
+func walker(fiend: wire.Fiend): ui.Shape[dyn] {
+	zombie := fiend
+	skin := rot(zombie.health)
+	mut ui.Shape[dyn] pieces = [
+		ui.box(
+			[
+				ui.at(zombie.x, zombie.y + 0.6, zombie.z),
+				ui.turn(0.0, zombie.yaw, 0.0),
+				ui.paint(skin)
+			],
+			0.56,
+			1.2,
+			0.38
+		),
+		ui.sphere(
+			[ui.at(zombie.x, zombie.y + 1.42, zombie.z), ui.paint(skin)],
+			0.25
+		)
+	]
+	// The arms, reaching. Both are the same box moved out to either side of
+	// wherever the thing is facing, which is two lines of trigonometry and the
+	// only reason a zombie needs any.
+	across := 0.26
+	ahead := 0.34
+	for each side in [0.0 - 1.0, 1.0] {
+		append(pieces, ui.box(
+			[
+				ui.at(
+					zombie.x - math.sin(zombie.yaw) * ahead + math.cos(zombie.yaw) * across * side,
+					zombie.y + 0.95,
+					zombie.z - math.cos(zombie.yaw) * ahead - math.sin(zombie.yaw) * across * side
+				),
+				ui.turn(0.0, zombie.yaw, 0.0),
+				ui.paint(skin)
+			],
+			0.16,
+			0.16,
+			0.62
+		))
+	}
+	return pieces
+}
+
+// Green, and staying green: a shot one goes darker and duller rather than grey, so
+// how much fight is left in it is something you can see without ever having to
+// wonder what you are looking at. All three of these are dark for their colour,
+// because the map is at night and a bright green zombie at midnight would be the
+// one thing in the picture that was lit from nowhere.
+//
+// `Tone.RGBA` is what a computed colour is for, and it is worth saying why it is
+// not `Tone.HEX` of a string built here: `HEX` is *checked*, so a colour that is
+// not `#` and then hex digits comes back as `Normal` rather than as whatever was
+// in the string. Which is the right behaviour — and the reason to hand the
+// channels over as the numbers they already are.
+func rot(health: Int): ui.Tone {
+	gone := wire.strength(wire.Breed.Zombie()) - place.floored(health)
+	fade := gone * 100 / wire.strength(wire.Breed.Zombie())
+	return ui.Tone.RGBA(34 + fade / 4, 108 - fade * 2 / 5, 30 + fade / 5, 255)
+}
+
+// A merman, in the two colours a thing in cold water is: slate and a green that
+// goes out of it as it is shot.
+func scale(health: Int): ui.Tone {
+	gone := wire.strength(wire.Breed.Merman()) - place.floored(health)
+	fade := gone * 100 / wire.strength(wire.Breed.Merman())
+	return ui.Tone.RGBA(26 + fade / 3, 92 - fade / 4, 104 - fade / 3, 255)
+}
+
+// A vampire: red-black, and paler as it goes — which runs the other way from the
+// two above on purpose, because a vampire that has been drinking is *darker* again
+// and that is the thing you want to be able to see.
+func pallor(health: Int): ui.Tone {
+	gone := wire.strength(wire.Breed.Vampire()) - place.floored(health)
+	fade := gone * 100 / wire.strength(wire.Breed.Vampire())
+	return ui.Tone.RGBA(76 + fade / 3, 20 + fade / 4, 30 + fade / 3, 255)
+}
+
+// A colour per player, computed from the seat the server gave them.
+//
+// It is the same on every screen, which matters more than it looks: "the green one
+// shot me" has to mean the same thing on two machines. A seat number is a small
+// integer and small integers next to each other look alike, so it goes through
+// `place.hash` — the same mixing the map is made out of — rather than being
+// multiplied by something here and hoped over.
+//
+// The channels stay dark enough for the white name above them to read. A role
+// brings a legible foreground with it; a colour you computed brings nothing, so
+// the contrast is yours to get right.
+func colour(seat: Int): ui.Tone {
+	spun := place.hash(seat, 9001)
+	return ui.Tone.RGBA(50 + spun % 130, 50 + spun / 130 % 140,
+		80 + spun / 18200 % 120, 255)
+}
+
+// The chat, under the picture and over the footer. It is the same height whether
+// anybody is talking or not, and that is deliberate: a strip that grew with the
+// conversation would resize the picture — and move the crosshair in the middle of
+// it — every time somebody said hello.
+func chatter(model: Model): ui.View {
+	mut ui.View[dyn] rows = []
+	for each line in model.chat {
+		append(rows, ui.row([ui.gap(8), ui.align(ui.Align.Center())], [
+			ui.text([
+				ui.background(colour(line.seat)),
+				ui.tone(ui.Tone.HEX("#ffffff")),
+				ui.size(ui.TextSize.Caption()),
+				ui.pad(2)
+			], " {sayer(line)} "),
+			ui.text([ui.size(ui.TextSize.Caption())], line.text)
+		]))
+	}
+	append(rows, prompt(model))
+	return ui.column([
+		ui.height(124),
+		ui.pad(6),
+		ui.gap(2),
+		// Newest at the bottom, which is what `Justify.End` says here, and the
+		// oldest scrolls away rather than pushing the picture about.
+		ui.justify(ui.Justify.End()),
+		ui.scroll(ui.Axis.Vertical()),
+		ui.background(ui.Tone.Muted())
+	], rows)
+}
+
+// Who said it. Seat zero is the server itself — somebody arriving, somebody
+// leaving — and it is worth a word rather than an empty badge.
+func sayer(line: Line): Str {
+	if line.seat == 0 {
+		return "arena"
+	}
+	return line.who
+}
+
+// The line being typed, with a block where the next letter goes. There is nothing
+// to focus and no cursor to blink: it is a `ui.text` of a `Str` in the model, and
+// the keyboard is what writes into that.
+func prompt(model: Model): ui.View {
+	if model.composing == false {
+		if len(model.chat) == 0 {
+			return ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+				"press t to say something")
+		}
+		return ui.none()
+	}
+	return ui.row([ui.gap(8), ui.align(ui.Align.Center())], [
+		ui.icon([ui.tone(ui.Tone.Good())], ui.Icon.Reply()),
+		ui.text([], "{model.saying}▌"),
+		ui.spacer(),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"enter sends it · escape forgets it")
+	])
+}
+
+func view(model: Model): ui.View {
+	if model.screen is Screen.Arena {
+		return ui.column([ui.height(0), ui.grow(1)], [
+			hud(model),
+			ui.scene(
+				[
+					ui.grow(1),
+					// The eye, and where it is looking. Both come straight out of the
+					// state: the camera is not something this program owns, it is
+					// something it describes.
+					ui.eye(model.body.x, model.body.y + place.eyes(), model.body.z),
+					ui.aim(model.body.yaw, model.body.pitch),
+					ui.lens(78),
+					// Night, and this is the whole of it: a sky the colour of a sky at
+					// night, and fog that fades everything into it. There is no light to
+					// turn down — the renderer's is fixed — so what makes it dark is the
+					// palette, which is why every colour in the plan's districts is a
+					// quarter of what it would be by day.
+					//
+					// Far enough to make out the tower's mast from the market, and not
+					// far enough to see who is standing under it: a map worth learning is
+					// a map you cannot see all of, and at night that comes for free.
+					ui.fog(78),
+					ui.background(ui.Tone.HEX("#070c15")),
+					// The mouse is asked for while the game is being played and given
+					// back the moment anything is in front of it.
+					ui.grab(playing(model)),
+					ui.crosshair(model.aiming && alive(model) && model.composing == false),
+					ui.onFrame(Msg.Tick(_)),
+					ui.onKeyDown(Msg.Pressed(_)),
+					ui.onKeyUp(Msg.Released(_)),
+					ui.onLook(Msg.Looked(_, _)),
+					ui.onGrab(Msg.Grabbed(_))
+				],
+				world(model)
+			),
+			chatter(model),
+			footer(model),
+			panel(model)
+		])
+	}
+	return ui.column([ui.grow(1)], [lobby(model)])
+}
+
+// Whether the mouse should be captured: playing, and not reading the score.
+func playing(model: Model): Bool {
+	return model.board == false && model.screen is Screen.Arena
+}
+
+func hud(model: Model): ui.View {
+	me := mine(model)
+	return ui.row([ui.pad(10), ui.gap(14), ui.align(ui.Align.Center())], [
+		ui.text([ui.size(ui.TextSize.Subtitle()), ui.heading(1)], model.me),
+		bar(me.health),
+		ui.text([], "{me.health}"),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			whereabouts(model)),
+		lungs(model),
+		ui.spacer(),
+		ui.text([ui.tone(ui.Tone.Warn())], "{len(model.horde)} up"),
+		ui.text([ui.tone(ui.Tone.Good())], "felled {me.felled}"),
+		mode(model),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"seat {model.seat}"),
+		ui.button([ui.on(Msg.Left()), ui.tone(ui.Tone.Danger())], "Leave")
+	])
+}
+
+// What kind of game this is, which is not a setting anywhere: it is read off the
+// roster every time the screen is drawn. Alone, there is nobody to shoot but the
+// horde; with anybody else, there is.
+func mode(model: Model): ui.View {
+	if alone(model) {
+		return ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"alone · you and whatever is out there")
+	}
+	me := mine(model)
+	return ui.row([ui.gap(10), ui.align(ui.Align.Center())], [
+		ui.text([ui.tone(ui.Tone.Good())], "kills {me.kills}"),
+		ui.text([ui.tone(ui.Tone.Danger())], "deaths {me.deaths}"),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"{len(model.roster)} playing")
+	])
+}
+
+// The breath, and only while it is going: a full one is not news. Eight cells and a
+// word when there are none left — and the word is the part that matters, because by
+// then you have a second or two to decide whether the far shore is nearer than the
+// one behind you.
+func lungs(model: Model): ui.View {
+	air := mine(model).air
+	if air >= place.breath() {
+		return ui.none()
+	}
+	mut ui.View[dyn] cells = []
+	for i := 0; i < 8; i++ {
+		append(cells, ui.text(
+			[ui.width(8), ui.height(12), ui.background(bubble(air, i))],
+			" "
+		))
+	}
+	return ui.row([ui.gap(6), ui.align(ui.Align.Center())], [
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())], "air"),
+		ui.row([ui.gap(2), ui.align(ui.Align.Center())], cells),
+		gasping(air)
+	])
+}
+
+func bubble(air: Int, cell: Int): ui.Tone {
+	if air <= cell * place.breath() / 8 {
+		return ui.Tone.HEX("#1d2630")
+	}
+	if air < place.breath() / 4 {
+		return ui.Tone.Danger()
+	}
+	return ui.Tone.HEX("#4f8fd0")
+}
+
+func gasping(air: Int): ui.View {
+	if air > 0 {
+		return ui.none()
+	}
+	return ui.text([ui.tone(ui.Tone.Danger()), ui.size(ui.TextSize.Caption())],
+		"drowning")
+}
+
+// Ten cells, however many of them are left. A bar is a row of small boxes, which
+// is the sort of thing the widget set is meant to be enough for.
+func bar(health: Int): ui.View {
+	mut ui.View[dyn] cells = []
+	for i := 0; i < 10; i++ {
+		append(cells, ui.text(
+			[ui.width(10), ui.height(12), ui.background(shade(health, i))],
+			" "
+		))
+	}
+	return ui.row([ui.gap(2), ui.align(ui.Align.Center())], cells)
+}
+
+func shade(health: Int, cell: Int): ui.Tone {
+	if health <= cell * 10 {
+		return ui.Tone.HEX("#2f343b")
+	}
+	if health <= 30 {
+		return ui.Tone.Danger()
+	}
+	if health <= 60 {
+		return ui.Tone.Warn()
+	}
+	return ui.Tone.Good()
+}
+
+func footer(model: Model): ui.View {
+	return ui.row([ui.pad(8), ui.gap(12), ui.align(ui.Align.Center())], [
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"W A S D walk · space jumps and swims up · ctrl dives · mouse looks · left button shoots · t talks · tab for the score · escape to let the mouse go"),
+		ui.spacer(),
+		trouble(model.trouble)
+	])
+}
+
+func trouble(why: Str): ui.View {
+	if why == "" {
+		return ui.none()
+	}
+	return ui.text([ui.tone(ui.Tone.Danger()), ui.size(ui.TextSize.Caption())], why)
+}
+
+// Whatever is in front of the game right now: the score, the two seconds after
+// being shot, or nothing. An overlay is the widget for exactly this, and it is
+// what also takes the mouse back — the picture behind it keeps being drawn.
+func panel(model: Model): ui.View {
+	if model.board {
+		return ui.overlay([ui.pad(20), ui.onDismiss(Msg.Grabbed(true))], scores(model))
+	}
+	if alive(model) == false {
+		return ui.overlay([ui.pad(28)], ui.column([ui.gap(8), ui.align(ui.Align.Center())], [
+			ui.text([ui.size(ui.TextSize.Title()), ui.tone(ui.Tone.Danger())], "You went down"),
+			ui.text([ui.tone(ui.Tone.Muted())], "back in {seconds(mine(model).down)}")
+		]))
+	}
+	if model.aiming == false {
+		return ui.overlay([ui.pad(24)], ui.column([ui.gap(6), ui.align(ui.Align.Center())], [
+			ui.icon([ui.tone(ui.Tone.Good())], ui.Icon.Star()),
+			ui.text([ui.size(ui.TextSize.Subtitle())], "Click to play"),
+			ui.text([ui.tone(ui.Tone.Muted()), ui.size(ui.TextSize.Caption())],
+				"escape gives the mouse back")
+		]))
+	}
+	return ui.none()
+}
+
+// Whole seconds only. The panel is redrawn whenever it changes, and a countdown
+// in milliseconds would be a new document sixty times a second.
+func seconds(ms: Int): Str {
+	return "{ms / 1000 + 1}s"
+}
+
+// The score board, straight off the roster — which is to say straight off the
+// server. There is nothing to reconcile and nothing kept here: every number on it
+// arrived in the same message as everybody's position.
+func scores(model: Model): ui.View {
+	made := place.plan(model.seed)
+	me := mine(model)
+	mut ui.View[dyn] rows = [
+		ui.row([ui.gap(12)], [
+			ui.text([ui.size(ui.TextSize.Subtitle())], "{model.me} (you)"),
+			ui.text([ui.size(ui.TextSize.Caption())], whereabouts(model)),
+			ui.spacer(),
+			ui.text([ui.tone(ui.Tone.Good())], "{me.kills}"),
+			ui.text([ui.tone(ui.Tone.Muted())], "{me.deaths}")
+		])
+	]
+	for each one in others(model) {
+		append(rows, ui.row([ui.gap(12)], [
+			ui.text([ui.background(colour(one.seat)),
+				ui.tone(ui.Tone.HEX("#ffffff")), ui.pad(2)], " {one.who} "),
+			// Where they were when the last snapshot came. On a place this size that
+			// is the difference between a score board and a way of finding anybody:
+			// it costs nothing to work out, because their position is already here.
+			ui.text([ui.size(ui.TextSize.Caption())],
+				place.district(made, one.x, one.y, one.z)),
+			ui.spacer(),
+			ui.text([ui.tone(ui.Tone.Good())], "{one.kills}"),
+			ui.text([ui.tone(ui.Tone.Muted())], "{one.deaths}")
+		]))
+	}
+	append(rows, ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+		"tab closes this"))
+	return ui.column([ui.gap(8), ui.width(460)], rows)
+}
+
+func lobby(model: Model): ui.View {
+	return ui.column([ui.pad(32), ui.gap(12), ui.width(500)], [
+		ui.row([ui.gap(8), ui.align(ui.Align.Center())], [
+			ui.icon([ui.tone(ui.Tone.Good())], ui.Icon.Star()),
+			ui.text([ui.size(ui.TextSize.Title()), ui.heading(1)], "Hive Arena")
+		]),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())], "Your name"),
+		ui.input([ui.onInput(Msg.NameTyped(_)), ui.onSubmit(joinedOf),
+			ui.placeholder("Ada")], model.me),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"The arena"),
+		ui.input([ui.onInput(Msg.ServerTyped(_)), ui.onSubmit(joinedOf),
+			ui.placeholder("ws://127.0.0.1:9200/arena")], model.server),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"Whatever `hive run server.hive` printed. Everybody who joins the same one is in the same game — and in the same world, because the server is what rolled it."),
+		ui.row([ui.gap(8), ui.align(ui.Align.Center())], [
+			trouble(model.trouble),
+			ui.spacer(),
+			waiting(model),
+			ui.button([ui.on(Msg.Joined()), ui.tone(ui.Tone.Good()),
+				ui.disabled(ready(model) == false),
+				ui.busy(model.screen is Screen.Joining)], "Join")
+		])
+	])
+}
+
+// The moment between the socket opening and the server saying which seat this is.
+// It is usually too short to see, and worth drawing anyway: a server that accepts
+// the connection and then says nothing is a thing that can happen, and this is how
+// a player is told the difference between that and a refused connection.
+func waiting(model: Model): ui.View {
+	if model.screen is Screen.Joining {
+		return ui.row([ui.gap(8), ui.align(ui.Align.Center())], [
+			ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+				"connected · waiting for a seat"),
+			// The way out of exactly that. `Left` is the same message the Leave
+			// button in the game sends, and it does the same three things: say so,
+			// hang up, and forget the lot.
+			ui.button([ui.on(Msg.Left())], "Cancel")
+		])
+	}
+	return ui.none()
+}
+
+func ready(model: Model): Bool {
+	return usable(model.me) && usable(model.server)
+		&& model.screen is Screen.Lobby
+}
+
+// `onSubmit` hands back what was typed and this does not care: it is already in
+// the model.
+func joinedOf(_typed: Str): Msg {
+	return Msg.Joined()
+}
+
+// ---------------------------------------------------------------------------
+// The fold
+// ---------------------------------------------------------------------------
+
+// The window's mailbox. A key, a mouse, a frame and the server all arrive here,
+// and there is one `is` chain for the lot.
+//
+// There is no mutex in this program. The fold is the mutex.
+proc update(model: Model, msg: Msg, from: hive.syslink.Envelope): Model {
+	mut Model next = model
+
+	if msg is Msg.Tick(ms) {
+		return ticked(model, ms)
+	}
+	if msg is Msg.Looked(dx, dy) {
+		// Not while there is a sentence on the go: the picture holds still, which
+		// is what makes reading back what you wrote possible.
+		if alive(model) && model.composing == false {
+			next.body = turned(model, dx, dy)
+		}
+		return next
+	}
+	if msg is Msg.Pressed(key) {
+		// The one branch that decides whether a key is a letter or a move, and it
+		// is checked first because while it is true nothing else about the key
+		// matters. `enter` is the only key here that acts, so it is the only one
+		// that leaves this `func`-shaped corner of the fold.
+		if model.composing {
+			if key == "enter" {
+				return say(sealed(model), model.saying)
+			}
+			if key == "escape" {
+				return sealed(model)
+			}
+			return typed(model, key)
+		}
+		if key == "t" {
+			return opening(model)
+		}
+		if key == "tab" {
+			next.board = model.board == false
+			return next
+		}
+		if held(model, key) == false {
+			append(next.held, key)
+		}
+		return next
+	}
+	if msg is Msg.Released(key) {
+		// Nothing is held while typing, so there is nothing to let go of — and the
+		// key that comes up is a letter that has already been typed.
+		if model.composing {
+			return model
+		}
+		next.held = filter(model.held, isNotKey(_, key))
+		return next
+	}
+	if msg is Msg.Grabbed(on) {
+		next.aiming = on
+		// Letting the mouse go is how you get out, so it closes the score too —
+		// otherwise escape would leave the panel up with nothing holding it.
+		if on {
+			next.board = false
+		}
+		// The mouse going takes the half-typed line with it. Escape is one key and
+		// it means both things, and this is where the second one happens: the
+		// browser lets the pointer go and tells us about it afterwards.
+		if on == false {
+			return sealed(next)
+		}
+		return next
+	}
+	if msg is Msg.NameTyped(text) {
+		next.me = text
+		return next
+	}
+	if msg is Msg.ServerTyped(text) {
+		next.server = text
+		return next
+	}
+	if msg is Msg.Joined {
+		return joining(model, from)
+	}
+	if msg is Msg.Left {
+		return leaving(model)
+	}
+
+	// --- from the server ---
+
+	if msg is Msg.Heard(news) {
+		return told(model, news)
+	}
+	if msg is Msg.Lost(why) {
+		// Leaving closes the socket itself, and the reader notices a moment later
+		// and says so. That is not news: there is no link, so there is nothing to
+		// have lost, and telling the player their own Leave button failed would be
+		// worse than saying nothing.
+		if model.link is Link.None {
+			return model
+		}
+		// Otherwise the socket has gone on its own, and there is no game left to
+		// draw. Back to the lobby, with the reason on the screen — which is the
+		// honest thing to do about a server that stopped: everything on this screen
+		// came from it, and none of it is true any more.
+		mut Model out = unjoined(model)
+		out.trouble = why
+		return out
+	}
+	return next
+}
+
+// Everything the server can say, in one fold. Five messages, and four of them are
+// one line: this program is mostly a thing that draws what it was told.
+func told(model: Model, news: wire.Down): Model {
+	mut Model next = model
+	if news is wire.Down.Welcome(seat, seed, at) {
+		// Which seat, which world, and where in it. Everything about the map comes
+		// out of that number by arithmetic (see `lib/place.hive`), so this is the
+		// whole of what arriving costs.
+		next.seat = seat
+		next.seed = seed
+		next.body = fresh(at)
+		next.screen = Screen.Arena()
+		next.trouble = ""
+		return next
+	}
+	if news is wire.Down.Snapshot(players, pack) {
+		// Everybody, and everything. It replaces what was there rather than being
+		// merged into it — the message *is* the state of the world, and the last one
+		// to arrive is the truth.
+		next.roster = players
+		next.horde = pack
+		// Going down lets go of every key. Without this, a player who was running
+		// when they were shot comes back running.
+		if alive(model) && wire.seated(players, model.seat).health <= 0 {
+			next.held = nothing()
+			next.composing = false
+			next.saying = ""
+		}
+		return next
+	}
+	if news is wire.Down.Tracer(ax, ay, az, bx, by, bz) {
+		append(next.tracers, Tracer(ax, ay, az, bx, by, bz, 120))
+		return next
+	}
+	if news is wire.Down.Reborn(at) {
+		next.body = fresh(at)
+		return next
+	}
+	if news is wire.Down.Said(seat, who, text) {
+		return spoke(model, seat, who, text)
+	}
+	return next
+}
+
+func isNotKey(had: Str, key: Str): Bool {
+	return had != key
+}
+
+// One frame: step the world, fire if the trigger is down, and fifteen times a
+// second say where this player got to.
+proc ticked(model: Model, ms: Int): Model {
+	mut Model next = stepped(model, ms)
+
+	if held(model, "mouse1") && model.cooldown <= 0 && alive(model) {
+		shot := aimed(model)
+		next.cooldown = 190
+		// The shooter's own tracer is drawn here, at the instant they fired, rather
+		// than waiting for it to come back off the server — which is why the server
+		// relays a tracer to everybody *but* the one who fired it.
+		append(next.tracers, tracing(shot))
+		fire(next, shot)
+	}
+
+	// Fifteen times a second rather than sixty. Everybody else draws this player
+	// from the last snapshot they had, and hearing it every four frames is enough
+	// to look continuous — while sending sixty would be four times the traffic for
+	// a difference nobody can see.
+	if next.beat <= 0 {
+		next.beat = 66
+		tell(next, wire.Up.Moved(next.body.x, next.body.y, next.body.z,
+			next.body.yaw))
+	}
+	return next
+}
+
+// A shot, reported. The tracer goes up so that every other screen draws the same
+// one; what was hit goes up as a seat or an id, and **that is all** — the server
+// owns what a bullet is worth, whether the target was still standing, and who gets
+// the credit. There is nothing to be told back: the next snapshot has it.
+proc fire(model: Model, shot: Shot): void {
+	tell(model, wire.Up.Fired(shot.ax, shot.ay, shot.az, shot.bx, shot.by, shot.bz))
+	if shot.at is Struck.Player(seat) {
+		tell(model, wire.Up.HitPlayer(seat))
+	}
+	if shot.at is Struck.Undead(id) {
+		tell(model, wire.Up.HitFiend(id))
+	}
+}
+
+// A line, said. It does not go onto this screen here — it comes back from the
+// server with everybody else's copy of it, which is one code path instead of two.
+//
+// The same rule that decides a name is worth joining under decides a line is worth
+// sending: something other than spaces.
+proc say(model: Model, text: Str): Model {
+	if usable(text) {
+		tell(model, wire.Up.Said(text))
+	}
+	return model
+}
+
+// ---------------------------------------------------------------------------
+// The socket
+// ---------------------------------------------------------------------------
+// Three procs, and between them the whole of the networking: one that opens it,
+// one that writes to it, and one thread that does nothing but read.
+
+// Joining. `wsConnect` is I/O, and a fold is a `proc`, so the fold can simply do
+// it — there is no command to return and nothing to arrange. What it must not do
+// is *wait* for the answer: a screen that stopped drawing while it dialled is the
+// one thing a game may never do, so the reply arrives as a message like everything
+// else.
+proc joining(model: Model, from: hive.syslink.Envelope): Model {
+	mut Model next = model
+	if ready(model) == false {
+		return next
+	}
+	opened := hive.net.wsConnect(model.server)
+	if opened is Result.Error(problem) {
+		next.trouble = "{problem.reason} — {problem.message}"
+		return next
+	} else if opened is Result.Ok(conn) {
+		next.link = Link.Live(conn)
+		next.screen = Screen.Joining()
+		next.trouble = ""
+		// `hive.syslink.self` is the window's own address, and handing it to a
+		// thread is the whole of how the socket gets back in. From here on, anything
+		// the server says arrives at this fold as `Msg.Heard`.
+		async listening(conn, hive.syslink.self(from))
+		tell(next, wire.Up.Join(model.me))
+		return next
+	}
+	return next
+}
+
+// The reader. One thread, one loop, and every line it decodes posted at the
+// window — which is why there is no queue in this program and nothing is locked:
+// `async` at a service never blocks, and the fold is the only thing that touches
+// the model.
+proc listening(connection: hive.net.WsConnection, window: hive.syslink.Address): void {
+	for ;; {
+		heard := hive.net.wsReceive(connection)
+		if heard is Result.Error(problem) {
+			// A peer that goes away is a `Result.Error` whose reason is "Closed" —
+			// the ordinary end of a conversation, not a failure. Either way this
+			// thread is done, and the window is told so it can say so.
+			async window(Msg.Lost("{problem.reason} — {problem.message}"))
+			return
+		} else if heard is Result.Ok(text) {
+			decoded := wire.heard(text)
+			if decoded is Result.Ok(news) {
+				async window(Msg.Heard(news))
+			} else if decoded is Result.Error(problem) {
+				// A server built against a different `lib/wire.hive`. It is worth
+				// saying out loud rather than ignoring, because every symptom of it
+				// otherwise looks like a bug in the game.
+				echo "a message this client cannot read: expected {problem.expected} at {problem.path}"
+			}
+		}
+	}
+}
+
+// Everything this program says. A send that fails is not reported anywhere: the
+// reader thread is about to notice the same thing and say so once, and a position
+// nobody can be told is not worth waiting to find out about.
+proc tell(model: Model, up: wire.Up): void {
+	if model.link is Link.Live(conn) {
+		if hive.net.wsSend(conn, wire.said(up)) is Result.Error(_) {
+			return
+		}
+	}
+}
+
+// Leaving: say so, hang up, and forget all of it. Saying so first is a courtesy
+// that costs one message — hanging up would do, but then the others watch this
+// player stand still until the server notices.
+proc leaving(model: Model): Model {
+	tell(model, wire.Up.Left())
+	if model.link is Link.Live(conn) {
+		hive.net.wsClose(conn)
+	}
+	return unjoined(model)
+}
+
+// Back to the lobby, holding nothing. Everything that is dropped here came from
+// the server, and none of it is true any more once the socket has gone: not the
+// roster, not the horde, not what anybody said.
+func unjoined(model: Model): Model {
+	mut Model next = start(model.server)
+	next.me = model.me
+	return next
+}
+
+// ---------------------------------------------------------------------------
+
+func nothing(): Str[dyn] {
+	mut Str[dyn] none = []
+	return none
+}
+
+func notracers(): Tracer[dyn] {
+	mut Tracer[dyn] none = []
+	return none
+}
+
+func unsaid(): Line[dyn] {
+	mut Line[dyn] none = []
+	return none
+}
+
+// The lobby's model. There is no world yet and no seat: both of them are things the
+// server says, and until it has there is nothing here but a name and a URL.
+func start(server: Str): Model {
+	return Model(
+		"",
+		server,
+		Screen.Lobby(),
+		Link.None(),
+		0,
+		0,
+		false,
+		"",
+		Body(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+		nothing(),
+		wire.noplayers(),
+		wire.nofiends(),
+		notracers(),
+		unsaid(),
+		0,
+		0,
+		false,
+		false,
+		""
+	)
+}
+
+// What the command line asked for. A URL is taken as it is; anything else is
+// filled out into one, so `hive run client.hive 9300` and
+// `hive run client.hive 10.0.0.4:9300` both mean something sensible. It is a
+// convenience and nothing more: the field is still there, still editable, and
+// joining still goes through it.
+func asked(given: Str): Str {
+	if indexOf(given, "://") is Result.Ok(_) {
+		return given
+	}
+	if indexOf(given, ":") is Result.Ok(_) {
+		return "ws://{given}/arena"
+	}
+	if conv.sti(given) is Result.Ok(port) {
+		return "ws://127.0.0.1:{port}/arena"
+	}
+	return "ws://127.0.0.1:9200/arena"
+}
+
+proc main(): void {
+	args := hive.term.args()
+	mut Str where = "ws://127.0.0.1:9200/arena"
+	if args bounds 0 {
+		where = asked(args[0])
+	}
+
+	// Opens a real application window: an installed Chrome or Edge in app mode,
+	// and an ordinary tab where there is none. three.js was fetched once when this
+	// program was first compiled and is inside the executable, so this runs with
+	// no network and nothing installed.
+	//
+	// The window *is* a service — `update` is checked as a `hive.syslink.spawn`
+	// handler and gets an address like one — which is what makes a background
+	// thread posting into it the ordinary thing it is above.
+	ui.window("Hive Arena", view, update, start(where))
+}

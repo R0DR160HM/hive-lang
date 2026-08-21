@@ -32,7 +32,7 @@ hive test examples/15-testing/cart.test.hive
 | 16 | [password-vault](16-password-vault) | a vault sealed with `hive.crypto`, read with a hidden prompt |
 | 17 | [chat](17-chat) | a window, a mailbox, and two nodes talking |
 | 18 | [maps](18-maps) | `hive.map`: order, values, tables, composite keys |
-| 19 | [multiplayer-fps](19-multiplayer-fps) | a 3D scene, sixty frames a second, and a game over the network |
+| 19 | [multiplayer-fps](19-multiplayer-fps) | a 3D scene, sixty frames a second, and a client and a server over a websocket |
 | 20 | [advent-2025-day-2](20-advent-2025-day-2) | Advent of Code, and `assert` as a program's own check |
 | 21 | [advent-2025-day-3](21-advent-2025-day-3) | day 3, where every index is proved in range |
 
@@ -43,12 +43,13 @@ the program's output is worth pinning down — an `.expected` file holding what 
 prints. `./run` compares the two, so an example that stops being true stops
 passing.
 
-Six of them are **compiled but not run**, and the reason is the same in each
-case: they do not finish. A server blocks forever (03), a window waits for a
-browser (17, 19), a distributed pair waits for the other node (09, 13), and a
-vault waits for somebody to type a password (16). Compiling one is what can be
-checked without a person — and five of those six carry test suites that exercise
-the rest: 155 tests across the cache, the vault, the chat, the game and the cart.
+Seven of them are **compiled but not run**, and the reason is the same in each
+case: they do not finish. A server blocks forever (03, and the game's own server
+in 19), a window waits for a browser (17, and the game's client), a distributed
+pair waits for the other node (09, 13), and a vault waits for somebody to type a
+password (16). Compiling one is what can be checked without a person — and five of
+those seven carry test suites that exercise the rest: 167 tests across the cache,
+the vault, the chat, the game's two halves and the cart.
 
 Two more have no `.expected` file because what they print is a race by design:
 `10-concurrency`, whose two `note` calls run at once, and anything that reports a
@@ -59,7 +60,7 @@ clock.
 These are the same programs the compiler this one replaces was written against,
 ported one for one and accepted very nearly verbatim — which is the useful thing
 about them: two independent compilers of the same language, and the second one
-takes the first one's programs as they were written. Two exceptions are worth
+takes the first one's programs as they were written. Three exceptions are worth
 knowing about:
 
 * **The remote import in [11](11-modules)** is written out in a comment rather
@@ -70,3 +71,12 @@ knowing about:
   `lib/measures.go`, whose signatures the Go toolchain reads
   ([12.4](../spec/12-modules.md#124-importing-a-go-file)) — the one example that
   needs a compiler to talk to another language's.
+* **[19](19-multiplayer-fps) is architecture rather than a port.** It was one
+  program that every player ran, meshed together with `hive.syslink`: each node
+  held its own player and its own pack of the dead, told the others what both were
+  doing, and nothing was in charge. It is now the traditional shape instead — a
+  `server.hive` that owns the world and a `client.hive` that owns a screen, over a
+  websocket, with the protocol a type declaration in `lib/wire.hive` and the map
+  arithmetic in `lib/place.hive` that both of them import. The game plays the same;
+  what changed is who decides. `13-distributed-actors` is still the example that
+  is about `hive.syslink` across machines.

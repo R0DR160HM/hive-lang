@@ -1,0 +1,909 @@
+// The arena server
+// ================
+// One process, one world, and a websocket to every player. It draws nothing, has
+// no window, and never touches a mouse: what it holds is **everything the players
+// are not allowed to disagree about**.
+//
+// RUN IT:
+//
+//   hive run server.hive          on port 9200
+//   hive run server.hive 9300     on another
+//
+// It prints the URL to hand out. The address in that URL is asked of the machine
+// with `hive.net.localAddress` rather than written down here, so what it prints is
+// something another computer can actually dial — which is the whole difference
+// between a game two terminals can play and a game two people can.
+//
+// Then, in another terminal or on another machine:
+//
+//   hive run client.hive                            joins ws://127.0.0.1:9200/arena
+//   hive run client.hive ws://10.0.0.4:9200/arena   joins that one
+//
+// WHAT IT DECIDES, AND WHY IT IS THE ONE TO DECIDE
+// -----------------------------------------------
+// A client is trusted with exactly two things, because they are the two things
+// only it can know: **where its own player is** — it is holding the keys — and
+// **what its shot was pointing at** — it is holding the mouse. Everything else is
+// here:
+//
+//   * the world's seed, rolled once, on the way up
+//   * everybody's health, and therefore who is down and when they are back
+//   * where somebody comes back to
+//   * the whole horde: how many there are, where each one is, and what it bit
+//   * what a bullet is worth (a client says *what* it hit, never how hard)
+//   * the score board
+//
+// This is the difference from the version of this game that had no server. That
+// one was a mesh: every node held its own player and its own pack, told the others
+// what both were doing, and nothing was in charge — so two machines could briefly
+// disagree about a near miss, and a kill had to be credited by the *victim*,
+// because the victim was the only node entitled to say it had gone down. It worked,
+// and the honest note in it said what having no referee cost.
+//
+// This is that referee. A kill is credited here, from the two facts this process is
+// already holding, and there is nothing to reconcile because there was never a
+// second opinion.
+//
+// WHAT IS STILL NOT GUARANTEED
+// ----------------------------
+// A client is trusted with where it says it is, and with what it says it shot. So a
+// modified client could walk through walls or claim a hit it did not have; what it
+// could *not* do is give itself health, credit itself a kill, know where anybody is
+// that the server has not told it, or decide it killed something that was still
+// standing. Closing the last gap means simulating every player's movement here and
+// treating what they send as a *request* — which is what a game with a prize does,
+// and what a game between friends does not need. This file is the honest middle:
+// the server owns everything it can own without taking the game away from the
+// machine the mouse is plugged into.
+//
+// WHAT DOES THE WORK
+// ------------------
+// Three things, and it is worth reading them in this order:
+//
+//   * **`hive.net`** speaks RFC 6455. `wsServe` runs `seated` once per client, on a
+//     virtual thread of its own, and that thread does nothing but read.
+//
+//   * **`hive.json`** is the wire. The protocol is a type declaration in
+//     `lib/wire.hive` and the codecs are derived from it, so there is no
+//     serialisation layer in this program — there are four one-line funcs in that
+//     file, and they are all of it.
+//
+//   * **`hive.syslink`** is the mutex, and there is no mutex. Every one of those
+//     reader threads, plus the clock, funnels into **one service**: `referee`, the
+//     fold below. A fold cannot be entered twice at once, so the world is stepped,
+//     shot at, joined and left one message at a time, and nothing in this file
+//     locks anything. Note that this is `syslink` doing the job it does *inside* a
+//     process — nothing here `listen`s, and no service on this node is reachable
+//     from another machine. The network is websockets from end to end.
+//
+// AND ONE SERVICE PER SOCKET
+// --------------------------
+// The fold never writes to a socket. It cannot: a slow client — one on a bad
+// connection, one that has stopped reading — would stall the world for everybody
+// while its `wsSend` waited. So every connection gets a second, tiny service of
+// its own (`posting`), whose entire state is that socket, and the fold reaches a
+// client by `async`ing a line at it. `async` never blocks and never fails, the
+// write happens on that service's own turn, and the worst a hung client can do is
+// let its own outbox grow.
+//
+// It is also why a `hive.syslink.Address` travels inside `Note.Sit`: an address is
+// an ordinary value, so "here is how to reach my client" is a field.
+
+import ./lib/place
+import ./lib/wire
+import ./lib/horde
+import hive.math
+import hive.conv
+
+// ---------------------------------------------------------------------------
+// One service per socket
+// ---------------------------------------------------------------------------
+
+// A socket, or the space where one was. It is a variant rather than a plain
+// connection because a send that fails is a client that has gone, and the state of
+// this service is exactly "is there still somebody there".
+type Link {
+	None
+	Live { conn: hive.net.WsConnection }
+}
+
+// What a post is asked to do. Two messages, and neither is ever waited for.
+type Post {
+	Send { line: Str }
+	Shut
+}
+
+// The whole of a post service: it owns one socket and knows nothing about the
+// game. A send that fails takes the socket out of its own state, so the writes
+// that were already queued behind it are dropped rather than each waiting to fail
+// in turn.
+proc posting(link: Link, note: Post, from: hive.syslink.Envelope): Link {
+	if note is Post.Send(line) {
+		if link is Link.Live(conn) {
+			if hive.net.wsSend(conn, line) is Result.Error(problem) {
+				return Link.None()
+			}
+		}
+		return link
+	}
+	if link is Link.Live(conn) {
+		hive.net.wsClose(conn)
+	}
+	return Link.None()
+}
+
+// ---------------------------------------------------------------------------
+// The world
+// ---------------------------------------------------------------------------
+
+// One player, as the server holds them. The first four numbers are what they told
+// us; everything after them is ours.
+type Seat {
+	number: Int
+	who: Str
+	// How to reach them. An address is a value, so a way of talking to somebody is
+	// a field like their name is.
+	post: hive.syslink.Address
+	x: Float
+	y: Float
+	z: Float
+	yaw: Float
+	health: Int
+	air: Int
+	gulp: Int
+	down: Int
+	// How long to go on ignoring what they say about where they are. It is set the
+	// moment they are moved from here — coming back after going down — because for
+	// the next fraction of a second they are still telling us where they were
+	// before they heard about it. Without it, one stale `Moved` puts a player
+	// straight back where they died.
+	settling: Int
+	kills: Int
+	deaths: Int
+	felled: Int
+}
+
+// Everything there is. It is one value, held by one service, and changed one
+// message at a time.
+type World {
+	seed: Int
+	seats: Seat[dyn]
+	pack: wire.Fiend[dyn]
+	books: horde.Brood[dyn]
+	// Seats are numbered from one, because zero is what "no seat" is spelt as —
+	// the number a reader thread carries before its client has said who it is.
+	nextSeat: Int
+	nextFiend: Int
+	// How long until the next snapshot goes out.
+	beat: Int
+}
+
+// The fold's mailbox. Four things arrive here: somebody sitting down, something a
+// client said, somebody's socket closing, and the clock.
+type Note {
+	Sit { who: Str, post: hive.syslink.Address }
+	// The answer to a `Sit`, and the only reply this service ever makes.
+	Seated { seat: Int }
+	Heard { seat: Int, up: wire.Up }
+	Gone { seat: Int }
+	Tick { ms: Int }
+}
+
+// ---------------------------------------------------------------------------
+// Reading the world
+// ---------------------------------------------------------------------------
+// Everything in this section is a `func`, which is what lets `server.test.hive`
+// hold a whole game — a horde, four players, a drowning, a kill — with no socket,
+// no clock and no client anywhere.
+
+// What a snapshot says. Everybody, in one list, with their own row carrying the
+// facts only this process knows: health, air, the count until they are back, and
+// the score.
+func roster(world: World): wire.Player[dyn] {
+	mut wire.Player[dyn] all = []
+	for each seat in world.seats {
+		append(all, wire.Player(seat.number, seat.who, seat.x, seat.y, seat.z,
+			seat.yaw, seat.health, seat.air, seat.down, seat.kills, seat.deaths,
+			seat.felled))
+	}
+	return all
+}
+
+// Everybody the horde might go after: everybody playing, minus whoever is down.
+// The horde is nobody's, so it hunts whoever is nearest — which is what makes
+// another player's carelessness your problem two seconds later.
+func hunted(world: World): horde.Prey[dyn] {
+	mut horde.Prey[dyn] living = []
+	for each seat in world.seats {
+		if seat.health > 0 {
+			append(living, horde.Prey(seat.number, seat.x, seat.y, seat.z))
+		}
+	}
+	return living
+}
+
+// How many are playing, which is what the horde's numbers are multiplied by (see
+// `horde.due`). An empty server raises nothing at all, because there is nobody for
+// anything to rise near.
+func playing(world: World): Int {
+	return len(world.seats)
+}
+
+func standing(world: World, seat: Int): Bool {
+	return seatOf(world, seat).health > 0
+}
+
+func seatOf(world: World, seat: Int): Seat {
+	for each one in world.seats {
+		if one.number == seat {
+			return one
+		}
+	}
+	return vacant()
+}
+
+// Nobody. `health` is zero, so every rule that asks whether somebody is alive
+// answers "no" for a seat that is not there — which is what makes a message from a
+// client that has just hung up harmless rather than a special case. The address in
+// it is never called: `number` is zero, and every caller checks that first.
+func vacant(): Seat {
+	return Seat(0, "", hive.syslink.at(#Nobody), 0.0, 0.0, 0.0, 0.0, 0, 0, 0, 0, 0,
+		0, 0, 0)
+}
+
+func joinedAt(world: World, number: Int, who: Str, post: hive.syslink.Address): Seat {
+	where := place.spot(number, world.seed)
+	return Seat(number, who, post, where.x, 0.0, where.z, where.yaw, 100,
+		place.breath(), 0, 0, 0, 0, 0, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Changing it
+// ---------------------------------------------------------------------------
+
+// Where somebody says they are. It is taken as read — a client owns its own
+// position — unless they have just been moved from here and cannot have heard
+// about it yet.
+func placed(world: World, seat: Int, x: Float, y: Float, z: Float, yaw: Float): World {
+	mut World next = world
+	next.seats = map(world.seats, standingAt(_, seat, x, y, z, yaw))
+	return next
+}
+
+func standingAt(
+	one: Seat,
+	seat: Int,
+	x: Float,
+	y: Float,
+	z: Float,
+	yaw: Float
+): Seat {
+	if one.number != seat || one.settling > 0 {
+		return one
+	}
+	mut Seat moved = one
+	moved.x = x
+	moved.y = y
+	moved.z = z
+	moved.yaw = yaw
+	return moved
+}
+
+// A bullet, applied. Both halves of it are here — the wound and the credit — and
+// that is the whole point of there being a server: the shot, the health and the
+// score board are three facts in one process, so there is nothing to agree about.
+//
+// Whoever fired it is credited only if this is the shot that put them down, which
+// is asked by comparing before with after rather than by arithmetic on a number
+// somebody sent.
+func shot(world: World, target: Int, by: Int): World {
+	// Nobody shoots themselves, and this is where that is decided rather than
+	// hoped for: a client says which seat it hit, so a client that said its own
+	// would otherwise be handed a kill for it.
+	if target == by {
+		return world
+	}
+	if standing(world, target) == false || standing(world, by) == false {
+		return world
+	}
+	mut World next = world
+	next.seats = map(world.seats, wounding(_, target, place.damage()))
+	if standing(next, target) == false {
+		next.seats = map(next.seats, credited(_, by))
+	}
+	return next
+}
+
+// A bite, applied. Nobody is credited: the horde does not keep score.
+func gnawed(world: World, bite: horde.Bite): World {
+	mut World next = world
+	next.seats = map(world.seats, wounding(_, bite.seat, bite.damage))
+	return next
+}
+
+func wounding(one: Seat, seat: Int, hurt: Int): Seat {
+	if one.number != seat || one.health <= 0 {
+		return one
+	}
+	mut Seat hit = one
+	hit.health = place.floored(one.health - hurt)
+	if hit.health == 0 {
+		hit.deaths = one.deaths + 1
+		hit.down = place.mourning()
+	}
+	return hit
+}
+
+func credited(one: Seat, seat: Int): Seat {
+	if one.number != seat {
+		return one
+	}
+	mut Seat scoring = one
+	scoring.kills = one.kills + 1
+	return scoring
+}
+
+func tallied(one: Seat, seat: Int): Seat {
+	if one.number != seat {
+		return one
+	}
+	mut Seat scoring = one
+	scoring.felled = one.felled + 1
+	return scoring
+}
+
+// Somebody shot one of the dead. The credit and the damage are one turn, in one
+// process, so "was that the shot that finished it" has an answer.
+func clawed(world: World, id: Int, by: Int): World {
+	if standing(world, by) == false {
+		return world
+	}
+	mut World next = world
+	if horde.finished(world.pack, id, place.damage()) {
+		next.seats = map(world.seats, tallied(_, by))
+	}
+	next.pack = horde.clawed(world.pack, id, place.damage())
+	return next
+}
+
+// Somebody back on their feet, at a spot picked for them.
+func revived(one: Seat, back: place.Spot): Seat {
+	mut Seat up = one
+	up.x = back.x
+	up.y = 0.0
+	up.z = back.z
+	up.yaw = back.yaw
+	up.health = 100
+	up.air = place.breath()
+	up.gulp = 0
+	up.down = 0
+	up.settling = 300
+	return up
+}
+
+// The air, everybody's. It goes while the head is under and comes back twice as
+// fast as it went, which is what makes surfacing for a moment worth the moment.
+// When there is none left the water starts taking health instead.
+//
+// **This is the server's because health is the server's.** A client draws the meter
+// off its own row in the snapshot; it does not decide what is in it. Where the head
+// *is* comes from the position the client sent and the seed this process rolled, so
+// the arithmetic is `place.submerged` at both ends and disagreeing about it is not
+// possible.
+func breathing(world: World, made: place.Plan, ms: Int): World {
+	mut World next = world
+	next.seats = map(world.seats, drowning(_, made, ms))
+	return next
+}
+
+func drowning(one: Seat, made: place.Plan, ms: Int): Seat {
+	if one.health <= 0 {
+		return one
+	}
+	mut Seat next = one
+	if place.submerged(made, one.x, one.y, one.z) == false {
+		gained := one.air + ms * 2
+		next.air = gained
+		if gained > place.breath() {
+			next.air = place.breath()
+		}
+		next.gulp = 0
+		return next
+	}
+	next.air = place.floored(one.air - ms)
+	if next.air > 0 {
+		return next
+	}
+	next.gulp = one.gulp - ms
+	if next.gulp <= 0 {
+		next.gulp = place.gasp()
+		return wounding(next, one.number, place.drowned())
+	}
+	return next
+}
+
+func parted(world: World, seat: Int): World {
+	mut World next = world
+	next.seats = filter(world.seats, isNot(_, seat))
+	return next
+}
+
+func isNot(one: Seat, seat: Int): Bool {
+	return one.number != seat
+}
+
+// ---------------------------------------------------------------------------
+// Talking to the clients
+// ---------------------------------------------------------------------------
+// Three lines each, and every one of them an `async` at a post service. Nothing
+// below waits for anything, which is what keeps a client on a bad connection from
+// being everybody's problem.
+
+proc telling(world: World, line: Str): void {
+	for each seat in world.seats {
+		async seat.post(Post.Send(line))
+	}
+}
+
+// Everybody but one. It is what a tracer wants: whoever fired drew it themselves,
+// at the instant they fired, so sending it back to them would draw it twice.
+proc relaying(world: World, line: Str, but: Int): void {
+	for each seat in world.seats {
+		if seat.number != but {
+			async seat.post(Post.Send(line))
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The fold
+// ---------------------------------------------------------------------------
+
+// **One service, and therefore one mutex, and therefore no mutex.** Every reader
+// thread and the clock arrive here, and the compiler is what enforces that the
+// world going in and the world coming out are the same type.
+proc referee(world: World, note: Note, from: hive.syslink.Envelope): World {
+	if note is Note.Sit(who, post) {
+		mut World next = world
+		next.nextSeat = world.nextSeat + 1
+		taken := joinedAt(world, next.nextSeat, who, post)
+		append(next.seats, taken)
+		// The reader thread is waiting for this: it needs its own number before it
+		// can tag anything else it hears. It is the one request this service
+		// answers, and the answer is one of its own messages, so nothing is
+		// annotated.
+		hive.syslink.answer(from, Note.Seated(next.nextSeat))
+		// And the client is told the three things it cannot work out: which seat it
+		// is, which world it is in, and where in that world it is standing. The map
+		// itself never crosses — it is `place.arena` of that number.
+		async post(Post.Send(wire.told(wire.Down.Welcome(next.nextSeat, world.seed,
+			place.spot(next.nextSeat, world.seed)))))
+		telling(next, wire.told(wire.Down.Said(0, "", "{who} joined")))
+		return next
+	}
+
+	if note is Note.Heard(seat, up) {
+		return heard(world, seat, up)
+	}
+
+	// A socket that closed. Every message still in flight from that client lands
+	// on nobody, which is what `seatOf` answering with `vacant` is for.
+	if note is Note.Gone(seat) {
+		return departed(world, seat)
+	}
+
+	if note is Note.Tick(ms) {
+		return ticked(world, ms)
+	}
+	// `Seated` only ever goes back as the answer to a `Sit`, never into the
+	// mailbox — but it is one of the mailbox's messages, so it has a branch.
+	return world
+}
+
+// What a client said. Six messages, and the shape of every branch is the same: the
+// client is believed about itself and about nothing else.
+proc heard(world: World, seat: Int, up: wire.Up): World {
+	if up is wire.Up.Moved(x, y, z, yaw) {
+		return placed(world, seat, x, y, z, yaw)
+	}
+	if up is wire.Up.Fired(ax, ay, az, bx, by, bz) {
+		relaying(world, wire.told(wire.Down.Tracer(ax, ay, az, bx, by, bz)), seat)
+		return world
+	}
+	if up is wire.Up.HitPlayer(target) {
+		return shot(world, target, seat)
+	}
+	if up is wire.Up.HitFiend(id) {
+		return clawed(world, id, seat)
+	}
+	if up is wire.Up.Said(text) {
+		spoke := seatOf(world, seat)
+		if said(text) {
+			telling(world, wire.told(wire.Down.Said(seat, spoke.who,
+				clipped(text))))
+		}
+		return world
+	}
+	// Pressing Leave and hanging up are the same thing one message apart, so they
+	// are the same three lines.
+	if up is wire.Up.Left {
+		return departed(world, seat)
+	}
+	// `Join` twice is a client repeating itself, and the seat it already has is the
+	// answer to it.
+	return world
+}
+
+// Somebody gone, however they went: their socket shut, their seat dropped, and
+// everybody else told. Dropping the seat is the whole of the cleanup — the next
+// snapshot simply has one fewer row in it, and a horde that was hunting them goes
+// after somebody else on the next tick.
+proc departed(world: World, seat: Int): World {
+	left := seatOf(world, seat)
+	if left.number == 0 {
+		return world
+	}
+	async left.post(Post.Shut())
+	mut World without = parted(world, seat)
+	telling(without, wire.told(wire.Down.Said(0, "", "{left.who} left")))
+	return without
+}
+
+// One tick of the world: the horde moves, what it reached is applied, the books are
+// kept, the water takes its due, and anybody whose count has run out comes back.
+// Then, every other tick, one snapshot to everybody.
+proc ticked(world: World, ms: Int): World {
+	made := place.plan(world.seed)
+	blocks := place.arena(world.seed)
+	mut World next = world
+
+	// The horde, one step — and the bites it managed handed back rather than sent,
+	// because working out what happened is a `func` and changing somebody's health
+	// is this fold's business.
+	assault := horde.stirred(made, blocks, world.pack, hunted(world), ms)
+	next.pack = assault.horde
+	for each bite in assault.bitten {
+		next = gnawed(next, bite)
+	}
+
+	// The books. Each breed on its own clock, so two of them may be owed one in the
+	// same frame and each is asked separately.
+	next.books = horde.waiting(next.books, ms)
+	for each breed in horde.due(next.pack, next.books, playing(next)) {
+		next = raise(next, made, blocks, breed)
+	}
+	for each breed in horde.filled(next.pack, next.books, playing(next)) {
+		many := roll(breed)
+		next.books = map(next.books, horde.wanting(_, breed, many))
+	}
+
+	next = breathing(next, made, ms)
+	next = waking(next, ms)
+
+	// Fifteen times a second rather than thirty. The clients draw everybody from
+	// the last snapshot they had, and hearing it every other tick is enough to look
+	// continuous — while sending every tick would be twice the traffic for a
+	// difference nobody can see.
+	next.beat = next.beat - ms
+	if next.beat <= 0 {
+		next.beat = 66
+		telling(next, wire.told(wire.Down.Snapshot(roster(next), next.pack)))
+	}
+	return next
+}
+
+// Everybody's clocks: the count for anybody who is down, and the moment it runs
+// out. Coming back is the one thing that moves a client's own body without the
+// client's say, so it is a message of its own — and the seat is left `settling`
+// for a fraction of a second afterwards, because until that message lands the
+// client is still reporting where it died.
+proc waking(world: World, ms: Int): World {
+	mut World next = world
+	mut Seat[dyn] roused = []
+	for each seat in world.seats {
+		mut Seat one = seat
+		one.settling = place.floored(seat.settling - ms)
+		if seat.health <= 0 {
+			one.down = seat.down - ms
+			if one.down <= 0 {
+				back := horde.vacancy(hunted(world), world.seed, seat.x, seat.z)
+				one = revived(one, back)
+				async seat.post(Post.Send(wire.told(wire.Down.Reborn(back))))
+			}
+		}
+		append(roused, one)
+	}
+	next.seats = roused
+	return next
+}
+
+// One more of the dead, somewhere a `func` said was fit, and its own breed's clock
+// started again. The other two are not touched, which is the whole of what
+// "separately" means here.
+proc raise(
+	world: World,
+	made: place.Plan,
+	blocks: place.Block[],
+	breed: wire.Breed
+): World {
+	mut World next = world
+	next.nextFiend = world.nextFiend + 1
+	next.books = map(world.books, horde.resting(_, breed))
+	append(next.pack, horde.risen(next.nextFiend, breed,
+		somewhere(world, made, blocks, breed)))
+	return next
+}
+
+// ---------------------------------------------------------------------------
+// The two impure lines in the game
+// ---------------------------------------------------------------------------
+// Everything about the horde is a `func` except these: how many of a breed to
+// carry, and where to put the next one. Both are `proc`s because finding out is
+// *doing* something — a `func` handed the same world twice has to answer the same
+// way twice, and these must not.
+
+// A number between one and however many of that breed there may be per player.
+// `hive.crypto` is where the randomness comes from — the same call a token is made
+// with.
+proc roll(breed: wire.Breed): Int {
+	return 1 + hexOf(hive.crypto.randomHex(2)) % horde.plenty(breed)
+}
+
+// The world's number, rolled once, here, and nowhere else. Three bytes of it is
+// six hex digits, which is sixteen million maps — enough that nobody will see the
+// same one twice — and it is *this* call, and only this one, that the whole map is
+// downstream of. Everything after it is arithmetic (see `place.hash`), which is
+// what lets the number travel instead of the map.
+proc rolled(): Int {
+	return hexOf(hive.crypto.randomHex(3))
+}
+
+// Somewhere to raise one, which is a guess checked against `horde.decent` rather
+// than a place worked out — the same way you would find a free seat in a room.
+// Sixteen guesses, because a guess anywhere in a hundred metres lands near enough
+// to somebody to matter about a third of the time, and sixteen of them miss
+// together a couple of times in a thousand raisings. When they do, the emptiest
+// spot is a better answer than a seventeenth guess.
+proc somewhere(
+	world: World,
+	made: place.Plan,
+	blocks: place.Block[],
+	breed: wire.Breed
+): place.Spot {
+	for i := 0; i < 16; i++ {
+		try := guess(made, breed)
+		if horde.decent(made, blocks, hunted(world), breed, try.x, try.z) {
+			return try
+		}
+	}
+	return unfit(world, made, breed)
+}
+
+// Where to try. A merman is guessed inside the lake rather than inside the map,
+// because the lake is a twentieth of the map and sixteen guesses at the whole thing
+// would put one in the water about as often as it rains.
+proc guess(made: place.Plan, breed: wire.Breed): place.Spot {
+	if breed == wire.Breed.Merman() {
+		pool := made.lake
+		return place.Spot(pool.x + adrift(pool.w), pool.z + adrift(pool.d), 0.0)
+	}
+	return place.Spot(anywhere(), anywhere(), 0.0)
+}
+
+// A coordinate anywhere between the walls, to the centimetre.
+proc anywhere(): Float {
+	return conv.itf(hexOf(hive.crypto.randomHex(4)) % 10400) / 100.0 - 52.0
+}
+
+// And one anywhere across something `span` wide, never quite at the edge of it.
+proc adrift(span: Float): Float {
+	room := conv.round(span * 100.0) - 300
+	if room < 1 {
+		return 0.0
+	}
+	return conv.itf(hexOf(hive.crypto.randomHex(4)) % room) / 100.0 - span / 2.0 + 1.5
+}
+
+// When sixteen guesses have all landed somewhere unfit. A merman goes to the middle
+// of the lake, which is water whatever the seed said; everything else goes to the
+// emptiest spot, which is always ground.
+func unfit(world: World, made: place.Plan, breed: wire.Breed): place.Spot {
+	if breed == wire.Breed.Merman() {
+		pool := made.lake
+		return place.Spot(pool.x, pool.z, 0.0)
+	}
+	return horde.emptiest(hunted(world), world.seed)
+}
+
+// Hex digits into the number they spell. `hive.conv.sti` reads base ten, and this
+// is base sixteen — four lines, and the whole of what a `randomHex` needs to
+// become a number.
+func hexOf(text: Str): Int {
+	mut Int total = 0
+	for each digit in split(text, "") {
+		if indexOf("0123456789abcdef", digit) is Result.Ok(value) {
+			total = total * 16 + value
+		}
+	}
+	return total
+}
+
+// ---------------------------------------------------------------------------
+// What a client may say, and how much of it
+// ---------------------------------------------------------------------------
+// A name and a line of chat are the two things a client sends that end up on
+// somebody else's screen, so they are the two the server has to have an opinion
+// about. Both are trimmed here rather than where they are drawn: how much of the
+// wire a client may take is the server's business, and a screen that had to cope
+// with a nine-thousand-character name would be coping with it in nine places.
+
+func said(text: Str): Bool {
+	return join(split(text, " "), "") != ""
+}
+
+// The longest thing anybody may say, and the longest name anybody may have.
+func mouthful(): Int {
+	return 90
+}
+
+func namely(): Int {
+	return 18
+}
+
+func clipped(text: Str): Str {
+	return shortened(text, mouthful())
+}
+
+func named(who: Str): Str {
+	if said(who) == false {
+		return "somebody"
+	}
+	return shortened(who, namely())
+}
+
+// At most that many characters of it. `for each` never indexes, which is why this
+// is six lines and not a bounds proof.
+func shortened(text: Str, most: Int): Str {
+	mut Str[dyn] kept = []
+	mut Int seen = 0
+	for each letter in split(text, "") {
+		seen = seen + 1
+		if seen <= most {
+			append(kept, letter)
+		}
+	}
+	return join(kept, "")
+}
+
+// ---------------------------------------------------------------------------
+// The threads
+// ---------------------------------------------------------------------------
+
+// The clock. Thirty ticks a second, which is what the horde is stepped at; the
+// snapshots go out on every other one.
+//
+// It sleeps thirty-three milliseconds and then says thirty-three, and the few
+// milliseconds of overhead between those two make the horde a shade slower than
+// real time. Nothing in the game can tell — but it is worth knowing that the
+// number in the message is the number this loop *intends*, not a clock reading.
+proc keeping(desk: hive.syslink.Address): void {
+	for ;; {
+		hive.task.sleep(33)
+		async desk(Note.Tick(33))
+	}
+}
+
+// One client, one thread, and all it does is read. `wsServe` calls this once per
+// connection; when it returns, the connection closes.
+proc seated(desk: hive.syslink.Address, connection: hive.net.WsConnection): void {
+	opening := hive.net.wsRequest(connection)
+	// The request that opened the connection is still there, so a handler can route
+	// on its url or authenticate from its headers before saying anything. This one
+	// only says where they arrived.
+	echo "a client connected to {opening.url}"
+
+	// The socket's own service. From here on this thread never writes to it: it
+	// hands lines to `post` and posts hand them to the socket.
+	post := hive.syslink.spawn(posting, Link.Live(connection))
+	mut Int seat = 0
+
+	for ;; {
+		incoming := hive.net.wsReceive(connection)
+		if incoming is Result.Error(problem) {
+			// A peer that goes away is a `Result.Error` whose reason is "Closed" —
+			// the ordinary end of a conversation, not a failure.
+			if seat != 0 {
+				async desk(Note.Gone(seat))
+			}
+			async post(Post.Shut())
+			return
+		} else if incoming is Result.Ok(text) {
+			decoded := wire.asked(text)
+			if decoded is Result.Error(problem) {
+				// Not one of ours. The path the decoder failed at is the useful half
+				// of the message: a client built against a different version of
+				// `lib/wire.hive` says so here, at the first message, rather than by
+				// disagreeing about where somebody is standing.
+				echo "  a message this server cannot read: expected {problem.expected} at {problem.path}"
+			} else if decoded is Result.Ok(up) {
+				if up is wire.Up.Join(who) && seat == 0 {
+					// The one waited call in the program, and the only thing worth
+					// waiting for: this thread cannot tag anything until it knows
+					// which seat it is reading for.
+					answer := desk(Note.Sit(named(who), post)) with timeout 4000
+					if answer is Result.Ok(reply) && reply is Note.Seated(given) {
+						seat = given
+						echo "  seat {given}: {named(who)}"
+					} else if answer is Result.Error(problem) {
+						echo "  could not seat anybody: {problem.reason} — {problem.message}"
+						async post(Post.Shut())
+						return
+					}
+				} else if seat != 0 {
+					// Everything else, and nothing waits for any of it. A position
+					// four milliseconds old is not worth a round trip.
+					async desk(Note.Heard(seat, up))
+				}
+			}
+		}
+	}
+}
+
+func noseats(): Seat[dyn] {
+	mut Seat[dyn] none = []
+	return none
+}
+
+// A world with nothing in it yet: a number, and how many of each breed this game
+// is carrying tonight.
+proc mustered(): World {
+	mut World fresh = World(rolled(), noseats(), wire.nofiends(), horde.broods(),
+		0, 0, 0)
+	for each breed in horde.kinds() {
+		many := roll(breed)
+		fresh.books = map(fresh.books, horde.wanting(_, breed, many))
+	}
+	return fresh
+}
+
+// Where to tell people to dial — **asked of the machine, not written down**.
+//
+// `hive.net.localAddress` is the source address the operating system would stamp
+// on a packet leaving by the default route, which is the right one on a machine
+// with several interfaces. Loopback is deliberately *not* something it answers
+// with — a machine holding only `127.0.0.1` has no address anybody else could
+// dial, and it says so rather than handing back one that works until the second
+// player turns out to be on another host. That case is the one place below where
+// the loopback address is the right answer rather than a lazy one: two terminals on
+// a machine with its networking down can still play each other.
+proc reachedAt(port: Int): Str {
+	if hive.net.localAddress() is Result.Ok(address) {
+		return "ws://{address}:{port}/arena"
+	}
+	return "ws://127.0.0.1:{port}/arena"
+}
+
+proc main(): void {
+	args := hive.term.args()
+	mut Int port = 9200
+	if args bounds 0 {
+		if conv.sti(args[0]) is Result.Ok(given) {
+			port = given
+		}
+	}
+
+	world := mustered()
+	desk := hive.syslink.spawn(referee, world)
+	async keeping(desk)
+
+	echo "the arena is at {reachedAt(port)}"
+	echo "world {world.seed}"
+	echo ""
+	echo "  hive run client.hive {reachedAt(port)}"
+	echo ""
+
+	// Blocks forever, which is what a server does. Every connection it accepts gets
+	// `seated` on a virtual thread of its own — and the handler is passed by name,
+	// with the desk already applied, so the compiler checks its shape here.
+	hive.net.wsServe(port, seated(desk, _))
+}

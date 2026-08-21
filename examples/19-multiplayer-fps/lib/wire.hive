@@ -1,0 +1,201 @@
+// What crosses, and how
+// =====================
+// One file, two directions, and **both programs import it** — which is the whole
+// reason a protocol is a good thing to have a file of. A client says `Up`; a
+// server says `Down`; nothing else is ever on the socket.
+//
+// THE TYPE DECLARATION *IS* THE PROTOCOL. `hive.json.encode` derives the encoder
+// from the static type, so it cannot fail and there is nothing to keep in step by
+// hand; `hive.json.parse(text) with Up` derives the decoder from the same
+// declaration, and a message that is not one comes back as a `Result.Error`
+// carrying the exact path that failed. A variant travels as `{"Moved": {...}}`,
+// which is what makes the two types below readable in a browser's network tab —
+// worth something in a game, where "what did it actually send" is most of
+// debugging.
+//
+// Fields the far end does not declare are ignored, which is the whole of what
+// makes a rolling upgrade possible: a server that learns a new field can send it
+// to a client that has never heard of it. What is *not* forgiven is a field that
+// is declared and missing, and that is the honest failure — an old client talking
+// to a new server finds out at the first message rather than at the first
+// disagreement about where somebody is standing.
+//
+// WHAT IS NOT HERE is any notion of a map. The world is a `func` of one number
+// (see `./place`), so the number travels — once, in `Welcome` — and the map never
+// does. A hundred boxes of arena would otherwise be on the wire every time
+// somebody joined.
+
+import ./place
+
+// The three breeds. Which one a thing is decides everything about how it moves,
+// which is the server's business, and everything about how it is drawn, which is
+// the client's — so the *kind* crosses and nothing else about it does.
+type Breed {
+	Zombie
+	Merman
+	Vampire
+}
+
+// What each is worth shooting: a zombie goes down in two bullets, a merman and a
+// vampire in three — and a vampire that got a bite in between them does not.
+//
+// It is here rather than with the rest of the horde's behaviour because it is the
+// one number about a breed that *both* programs need: the server takes it off a
+// wound, and the client fades its colours against it. Which is the test for
+// whether something belongs in this file — not "is it about the wire" but "do both
+// ends have to agree about it".
+func strength(breed: Breed): Int {
+	if breed == Breed.Merman() {
+		return 80
+	}
+	if breed == Breed.Vampire() {
+		return 78
+	}
+	return 68
+}
+
+// One of the dead, as the server last stepped it.
+//
+// There is no `owner` field, and its absence is the architecture: every one of
+// these belongs to the server, which is the only thing that moves them. A client
+// draws them and shoots at them by `id`.
+//
+// `flying` is a vampire in the air. It is a fact about this one rather than a
+// breed of its own, because the thing that lands is the thing that took off — and
+// because a bat that had to be a different kind of thing would need its own `id`,
+// and then shooting one halfway through the change would have no answer.
+type Fiend {
+	id: Int
+	breed: Breed
+	x: Float
+	y: Float
+	z: Float
+	yaw: Float
+	health: Int
+	// How long until it can bite again. The server's business; it crosses because
+	// one type for the wire and for the simulation is one type fewer than two.
+	bite: Int
+	flying: Bool
+}
+
+// Somebody playing, as the server last heard from them and last decided about
+// them. The first four numbers are theirs — a client is trusted with where it is —
+// and everything after them is the server's answer.
+//
+// **A client reads its own row out of this list.** Health, air, the count until it
+// comes back, and every score on the board arrive the same way for you as for
+// everybody else, which is what keeps the two programs from ever holding two
+// opinions about your health.
+type Player {
+	seat: Int
+	who: Str
+	x: Float
+	y: Float
+	z: Float
+	yaw: Float
+	health: Int
+	// What is left of a lungful, and the count until they are back up. Both are
+	// the server's arithmetic — it is holding the health, so it is holding what
+	// drowning costs.
+	air: Int
+	down: Int
+	kills: Int
+	deaths: Int
+	felled: Int
+}
+
+// What a client says. Six things, and it is worth noticing what is *not* among
+// them: how much a bullet is worth, how much health anybody has left, where any
+// of the dead are, and what the map is. A client is trusted with where it is
+// standing and what it was pointing at, and with nothing else.
+type Up {
+	// The first thing anybody says, and the only one the server answers.
+	Join { who: Str }
+	// Fifteen times a second. The client walks itself — sixty frames a second of
+	// keys and gravity — and reports where that got it.
+	Moved { x: Float, y: Float, z: Float, yaw: Float }
+	// A shot, so that every screen draws the same tracer. Where it started and
+	// where it stopped; what it hit is the two below.
+	Fired { ax: Float, ay: Float, az: Float, bx: Float, by: Float, bz: Float }
+	// "I shot that player." Not "I did 34 damage to them": the server owns what a
+	// bullet is worth (`place.damage`), so this carries a seat and nothing else.
+	HitPlayer { seat: Int }
+	// "I shot that one of the dead."
+	HitFiend { id: Int }
+	Said { text: Str }
+	// Pressing Leave. Hanging up would do — a closed socket is a player who left
+	// either way — but saying so first means the others see them go at once
+	// instead of at the end of a timeout.
+	Left
+}
+
+// What the server says. Everything a screen needs and nothing it does not.
+type Down {
+	// Your seat, the world you are in, and where you are standing in it. This is
+	// the whole of what a client is told on the way in; the map comes out of the
+	// seed by arithmetic.
+	Welcome { seat: Int, seed: Int, at: place.Spot }
+	// Where everything is, fifteen times a second: everybody playing, and every
+	// one of the dead. One message, one encode, and one copy to each client —
+	// which is what a client/server game buys over everybody telling everybody.
+	Snapshot { players: Player[dyn], horde: Fiend[dyn] }
+	// Somebody else's shot. The one who fired it drew it themselves, at the
+	// instant they fired, so this goes to everybody but them.
+	Tracer { ax: Float, ay: Float, az: Float, bx: Float, by: Float, bz: Float }
+	// You are back up, and here. The one message that moves a client's own body
+	// without the client's say — going down and coming back is the server's call,
+	// and this is it being made.
+	Reborn { at: place.Spot }
+	// A line somebody typed, stamped with who by. It goes to everybody including
+	// whoever said it, so a chat is one code path and not two.
+	Said { seat: Int, who: Str, text: Str }
+}
+
+// The four calls that are the wire. Each direction encodes what it says and
+// decodes what it hears, and there is nothing else to it: the codecs are derived,
+// so these are four one-line funcs rather than a serialisation layer.
+func said(up: Up): Str {
+	return hive.json.encode(up)
+}
+
+func asked(text: Str): Result<Up, hive.json.JsonError> {
+	return hive.json.parse(text) with Up
+}
+
+func told(down: Down): Str {
+	return hive.json.encode(down)
+}
+
+func heard(text: Str): Result<Down, hive.json.JsonError> {
+	return hive.json.parse(text) with Down
+}
+
+// Nobody, and nothing. Both programs start from these and both hand them across,
+// so they are declared with the types they are empty of.
+func noplayers(): Player[dyn] {
+	mut Player[dyn] none = []
+	return none
+}
+
+func nofiends(): Fiend[dyn] {
+	mut Fiend[dyn] none = []
+	return none
+}
+
+// Somebody who is not there: what looking yourself up in a roster you are not in
+// yet comes back with. A game whose HUD had to cope with "no answer" would have to
+// cope with it in eleven places; a zeroed row it can draw is one place.
+func nobody(): Player {
+	return Player(0, "", 0.0, 0.0, 0.0, 0.0, 0, place.breath(), 0, 0, 0, 0)
+}
+
+// Somebody's own row out of a snapshot. Both programs ask this — the client about
+// itself, a test about anybody.
+func seated(players: Player[], seat: Int): Player {
+	for each player in players {
+		if player.seat == seat {
+			return player
+		}
+	}
+	return nobody()
+}

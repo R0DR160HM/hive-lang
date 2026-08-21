@@ -1,0 +1,648 @@
+// The dead, and what they do
+// ==========================
+// **The server keeps the horde**, and this file is how it moves them. That is the
+// one place this game differs most from the mesh it used to be: there, every
+// player brought their own pack and stepped it themselves, and the price of it was
+// that nobody was in charge and no two machines quite agreed. Here there is one
+// horde, one thing stepping it, and one answer to "did that kill it".
+//
+// **The client does not import this file at all**, and that is the clearest single
+// statement of the architecture there is: a client draws the dead and shoots at
+// them by number, and everything about how one of them behaves is in here, on the
+// other side of a socket.
+//
+// THREE BREEDS, ONE TYPE, and separate books for each. Which breed a thing is
+// decides everything about how it moves and nothing about how it is drawn, shot,
+// sent or counted — so there is one type with a kind in it rather than three
+// types. A second type would have meant a second vector in the world, a second
+// entry in every message, and a second copy of every rule below, to say what one
+// field says.
+//
+//   * A **zombie** walks at whoever is nearest and never gets its feet wet, which
+//     makes the lake the one place on the map they cannot follow you into.
+//   * A **merman** never leaves the water, and swims faster than you do — which is
+//     what makes the lake a risk rather than a refuge.
+//   * A **vampire** walks like a zombie until walking will not do, and then becomes
+//     a bat and goes over the top of whatever was in the way. Every bite puts it
+//     back on its feet, so one you left at a sliver is whole when you meet it next.
+//
+// What is *not* shared is how many of each there are. Each breed is filled to its
+// own number on its own clock, so a pack of five zombies and a lake with nothing
+// in it is an ordinary night, and clearing the water does not slow the zombies
+// down.
+//
+// **None of this is a `proc`.** Every rule here is a `func` of the world, which is
+// what lets `../server.test.hive` stand a vampire next to a player and check that
+// biting them healed it, with no socket and no clock anywhere. The two impure
+// parts — rolling how many to carry, and rolling where to put the next one — are
+// in the server, and they are four lines.
+
+import ./place
+import ./wire
+import hive.math
+import hive.conv
+
+// Somebody one of them might go after: everybody playing, minus whoever is
+// currently down. It is a flat little type on purpose — nothing hunting cares
+// which seat it is chasing, and the code that steers it should not have to ask.
+//
+// It carries the height as well as the place, and that is not decoration: a bat
+// works out how high to fly from it, and a swimmer three metres under the surface
+// is out of reach of everything that cannot follow them down.
+type Prey {
+	seat: Int
+	x: Float
+	y: Float
+	z: Float
+}
+
+// Somebody bitten, and what by. The damage says which breed did it rather than
+// naming the breed — a merman's grab and a zombie's bite are not worth the same,
+// and whoever applies it only needs the number.
+type Bite {
+	seat: Int
+	damage: Int
+}
+
+// One step of the horde: where they all are now, and who they reached. The bites
+// are handed back rather than applied, because working out what happened is a
+// `func` and changing somebody's health is the fold's business.
+type Assault {
+	horde: wire.Fiend[dyn]
+	bitten: Bite[dyn]
+}
+
+// How fast each of them moves. Slower than a player on foot, every one — you can
+// always outrun what is chasing you, and the trouble is never one of them. The
+// merman is the exception that proves the rule: faster than a *swimmer*, which is
+// the whole reason the water is dangerous.
+func pace(breed: wire.Breed): Float {
+	if breed == wire.Breed.Merman() {
+		return 4.1
+	}
+	if breed == wire.Breed.Vampire() {
+		return 3.4
+	}
+	return 3.9
+}
+
+// A bat: quicker than the thing it turns into, still slower than a running player,
+// and climbing about as fast as it flies.
+func flap(): Float {
+	return 5.4
+}
+
+func climb(): Float {
+	return 3.4
+}
+
+// How high above its target one flies. High enough to clear the tower's tiers and
+// the walkway, which is what "over the top of whatever was in the way" has to mean
+// on this map.
+func cruise(target: Prey): Float {
+	return target.y + 4.2
+}
+
+func reach(breed: wire.Breed): Float {
+	if breed == wire.Breed.Merman() {
+		return 1.8
+	}
+	return 1.5
+}
+
+func teeth(breed: wire.Breed): Int {
+	if breed == wire.Breed.Merman() {
+		return 22
+	}
+	if breed == wire.Breed.Vampire() {
+		return 19
+	}
+	return 17
+}
+
+// What a bite is worth to a vampire.
+func drink(): Int {
+	return 18
+}
+
+// How high one starts: a merman floating, everything else on the ground it was
+// raised on.
+func perched(breed: wire.Breed): Float {
+	if breed == wire.Breed.Merman() {
+		return place.floating()
+	}
+	return 0.0
+}
+
+// One step of the whole horde: each of them goes after whoever is nearest and
+// bites them if it can reach. It is the same walk for everybody's benefit — the
+// horde is nobody's, so it hunts whoever is closest, and another player's
+// carelessness is your problem two seconds later.
+func stirred(
+	made: place.Plan,
+	blocks: place.Block[],
+	pack: wire.Fiend[],
+	hunted: Prey[],
+	ms: Int
+): Assault {
+	dt := math.min(conv.itf(ms) / 1000.0, 0.05)
+	mut wire.Fiend[dyn] stepped = []
+	mut Bite[dyn] bitten = []
+
+	for each fiend in pack {
+		mut wire.Fiend next = fiend
+		next.bite = place.floored(fiend.bite - ms)
+		target := nearest(hunted, fiend.x, fiend.z)
+		if target.seat != 0 {
+			toX := target.x - fiend.x
+			toZ := target.z - fiend.z
+			away := math.hypot(toX, toZ)
+			// Facing is worked out even when it cannot move: something stuck behind
+			// a crate still looks at what it wants.
+			next.yaw = math.atan2(0.0 - toX, 0.0 - toZ)
+			if bites(next, target, away) {
+				next.bite = 900
+				append(bitten, Bite(target.seat, teeth(fiend.breed)))
+				next = fed(next)
+			}
+			// Something in the air moves whether or not it is over its target: it
+			// has to come down to bite.
+			if away > reach(fiend.breed) || next.flying {
+				next = crept(next, target, made, blocks, dt)
+			}
+		}
+		append(stepped, next)
+	}
+	return Assault(stepped, bitten)
+}
+
+// One of them, one step. This is the only place in the file where the three breeds
+// differ from each other at all.
+func crept(
+	fiend: wire.Fiend,
+	target: Prey,
+	made: place.Plan,
+	blocks: place.Block[],
+	dt: Float
+): wire.Fiend {
+	if fiend.breed == wire.Breed.Vampire() {
+		return winged(fiend, target, made, blocks, dt)
+	}
+	return crawled(fiend, target, made, blocks, dt)
+}
+
+// A zombie or a merman: straight at whoever is nearest, one axis at a time so that
+// it slides along whatever it cannot get through, and never out of the element it
+// belongs in. The two are one walk with a different idea of where they may put
+// their feet, and that difference is `belongs` and `rests` and nothing else.
+func crawled(
+	fiend: wire.Fiend,
+	target: Prey,
+	made: place.Plan,
+	blocks: place.Block[],
+	dt: Float
+): wire.Fiend {
+	mut wire.Fiend next = fiend
+	toX := target.x - fiend.x
+	toZ := target.z - fiend.z
+	away := math.hypot(toX, toZ)
+	if away <= 0.0 {
+		return next
+	}
+	step := pace(fiend.breed) * dt / away
+	onX := fiend.x + toX * step
+	onZ := fiend.z + toZ * step
+	if belongs(made, fiend.breed, onX, fiend.z)
+		&& place.clear(blocks, onX, fiend.y, fiend.z) {
+		next.x = onX
+	}
+	if belongs(made, fiend.breed, next.x, onZ)
+		&& place.clear(blocks, next.x, fiend.y, onZ) {
+		next.z = onZ
+	}
+	next.y = rests(made, blocks, fiend.breed, next.x, next.z, fiend.y)
+	return next
+}
+
+// A vampire. On foot it walks like a zombie; the moment walking will not do — the
+// step refused, the player standing somewhere above it, or too far off to be worth
+// the walk — it becomes a bat, and a bat is checked against nothing at all. Walls,
+// crates, the yard's gate, the lake: none of it is in the way of something in the
+// air, which is the point of it.
+//
+// It lands when it is over its target and there is something under it to land on.
+// It will not land in water: over the lake it hangs at biting height instead, which
+// makes it the one thing that can reach a swimmer who has swum out of everything
+// else's reach.
+func winged(
+	fiend: wire.Fiend,
+	target: Prey,
+	made: place.Plan,
+	blocks: place.Block[],
+	dt: Float
+): wire.Fiend {
+	mut wire.Fiend next = fiend
+	toX := target.x - fiend.x
+	toZ := target.z - fiend.z
+	away := math.hypot(toX, toZ)
+	if fiend.flying {
+		if away > 0.0 {
+			step := flap() * dt / away
+			next.x = fiend.x + toX * step
+			next.z = fiend.z + toZ * step
+		}
+		// What it would land on, asked of the floor from above it — which is the
+		// same question a walking player asks and the same answer.
+		ground := place.ledge(blocks, next.x, next.z, cruise(target))
+		if away < 2.4 && place.dry(made, next.x, next.z)
+			&& math.abs(target.y - ground) < 1.4 {
+			next.flying = false
+			next.y = ground
+			return next
+		}
+		mut Float want = cruise(target)
+		if away < 2.4 && place.wet(made, next.x, next.z) {
+			want = place.floating() + 0.7
+		}
+		next.y = place.toward(fiend.y, want, climb() * dt)
+		return next
+	}
+	afoot := crawled(fiend, target, made, blocks, dt)
+	stuck := afoot.x == fiend.x && afoot.z == fiend.z
+	if stuck || target.y > fiend.y + 1.4 || away > 20.0 {
+		mut wire.Fiend rising = afoot
+		rising.flying = true
+		return rising
+	}
+	return afoot
+}
+
+// Where a breed may put itself: a merman in the water and nothing else, everything
+// else anywhere but.
+func belongs(made: place.Plan, breed: wire.Breed, x: Float, z: Float): Bool {
+	if breed == wire.Breed.Merman() {
+		return place.wet(made, x, z)
+	}
+	return place.dry(made, x, z)
+}
+
+// Where its feet end up: a merman floats, and everything else stands on whatever
+// the floor turned out to be there.
+func rests(
+	made: place.Plan,
+	blocks: place.Block[],
+	breed: wire.Breed,
+	x: Float,
+	z: Float,
+	y: Float
+): Float {
+	if breed == wire.Breed.Merman() {
+		return place.floating()
+	}
+	return place.ledge(blocks, x, z, y)
+}
+
+// Whether it can reach them: near enough across the ground, and near enough up and
+// down. The second half is what a bat and a dive are both about — something
+// hovering over your head cannot bite you, and neither can something floating at
+// the surface when you are three metres under it.
+func bites(fiend: wire.Fiend, target: Prey, away: Float): Bool {
+	if fiend.bite != 0 {
+		return false
+	}
+	if away > reach(fiend.breed) {
+		return false
+	}
+	return math.abs(target.y - fiend.y) < 1.8
+}
+
+// What a vampire gets out of it. This is the only thing in the game that puts
+// health back into anything, and it is the reason a vampire is worth finishing
+// rather than leaving: it drinks its way back to whole on somebody else if you do
+// not.
+func fed(fiend: wire.Fiend): wire.Fiend {
+	if fiend.breed != wire.Breed.Vampire() {
+		return fiend
+	}
+	mut wire.Fiend next = fiend
+	next.health = fiend.health + drink()
+	if next.health > wire.strength(fiend.breed) {
+		next.health = wire.strength(fiend.breed)
+	}
+	return next
+}
+
+// Whoever is nearest, or nobody at all — which is seat zero, because seats are
+// numbered from one. A horde with nothing to hunt stands still.
+func nearest(hunted: Prey[], x: Float, z: Float): Prey {
+	mut Prey closest = Prey(0, 0.0, 0.0, 0.0)
+	mut Float least = 1000.0
+	for each one in hunted {
+		gap := math.hypot(one.x - x, one.z - z)
+		if gap < least {
+			least = gap
+			closest = one
+		}
+	}
+	return closest
+}
+
+// ---------------------------------------------------------------------------
+// Keeping the horde up to strength
+// ---------------------------------------------------------------------------
+// Three sets of books, one per breed. Each is four small questions and none of them
+// needs a random number — which is what lets every one of them be a `func` a test
+// can call. The fold asks them in order and does the two things that *are* impure:
+// rolling how many to carry, and rolling where to raise the next one.
+
+// One breed the server is carrying, and its own clock.
+type Brood {
+	breed: wire.Breed
+	want: Int
+	sprout: Int
+}
+
+// The three a game starts with. The numbers are rolled by the fold the moment the
+// server comes up — a `func` cannot roll anything — and the clocks are staggered
+// so that the first minute is not all of it at once.
+func broods(): Brood[dyn] {
+	mut Brood[dyn] all = [
+		Brood(wire.Breed.Zombie(), 1, 600),
+		Brood(wire.Breed.Merman(), 1, 2400),
+		Brood(wire.Breed.Vampire(), 1, 5200)
+	]
+	return all
+}
+
+func kinds(): wire.Breed[dyn] {
+	mut wire.Breed[dyn] all = [
+		wire.Breed.Zombie(),
+		wire.Breed.Merman(),
+		wire.Breed.Vampire()
+	]
+	return all
+}
+
+// How long between one of a kind rising and the next of that kind, and how many of
+// it there may be at the outside. A vampire is rare and slow to come back because
+// one of them is most of a fight on its own.
+//
+// How many is **per player**, and that is the whole of what makes a busy server
+// harder than an empty one: the horde grows with the room. Six people share one
+// horde, so if it did not, six people would clear it and stand about.
+func patience(breed: wire.Breed): Int {
+	if breed == wire.Breed.Merman() {
+		return 3200
+	}
+	if breed == wire.Breed.Vampire() {
+		return 6400
+	}
+	return 1600
+}
+
+func plenty(breed: wire.Breed): Int {
+	if breed == wire.Breed.Merman() {
+		return 3
+	}
+	if breed == wire.Breed.Vampire() {
+		return 2
+	}
+	return 5
+}
+
+// Every clock, one frame on.
+func waiting(books: Brood[], ms: Int): Brood[dyn] {
+	return map(books, counting(_, ms))
+}
+
+func counting(brood: Brood, ms: Int): Brood {
+	return Brood(brood.breed, brood.want, brood.sprout - ms)
+}
+
+// Which breeds are owed one: the clock has run out and the horde is short of its
+// number, which is its number *times how many people are playing*. Nothing here is
+// a single answer, because two breeds may be owed one in the same frame and each is
+// its own business.
+func due(pack: wire.Fiend[], books: Brood[], playing: Int): wire.Breed[dyn] {
+	mut wire.Breed[dyn] owing = []
+	for each brood in books {
+		if brood.sprout <= 0 && counted(pack, brood.breed) < brood.want * playing {
+			append(owing, brood.breed)
+		}
+	}
+	return owing
+}
+
+// And which are complete, which is when a new number is rolled for next time. So a
+// room that clears its zombies may find itself with one each, or five each, and
+// never knows which — and what the lake is doing meanwhile is its own affair.
+func filled(pack: wire.Fiend[], books: Brood[], playing: Int): wire.Breed[dyn] {
+	mut wire.Breed[dyn] done = []
+	for each brood in books {
+		if counted(pack, brood.breed) >= brood.want * playing {
+			append(done, brood.breed)
+		}
+	}
+	return done
+}
+
+func counted(pack: wire.Fiend[], breed: wire.Breed): Int {
+	mut Int total = 0
+	for each fiend in pack {
+		if fiend.breed == breed {
+			total = total + 1
+		}
+	}
+	return total
+}
+
+func wanted(books: Brood[], breed: wire.Breed): Int {
+	for each brood in books {
+		if brood.breed == breed {
+			return brood.want
+		}
+	}
+	return 0
+}
+
+func wanting(brood: Brood, breed: wire.Breed, rolled: Int): Brood {
+	if brood.breed != breed {
+		return brood
+	}
+	return Brood(brood.breed, rolled, brood.sprout)
+}
+
+func resting(brood: Brood, breed: wire.Breed): Brood {
+	if brood.breed != breed {
+		return brood
+	}
+	return Brood(brood.breed, brood.want, patience(breed))
+}
+
+// One more of them, at a place the fold found. It arrives whole and already
+// looking for somebody.
+func risen(id: Int, breed: wire.Breed, where: place.Spot): wire.Fiend {
+	return wire.Fiend(id, breed, where.x, perched(breed), where.z, where.yaw,
+		wire.strength(breed), 0, false)
+}
+
+// Whether a place is fit to raise a given breed in: inside the walls, in the right
+// element, not inside anything solid, not on top of anybody — and near enough to
+// somebody to matter.
+//
+// The last rule is the one a hundred-metre map needs. Something raised eighty
+// metres away in an empty market is not a threat, it is a thing shuffling into a
+// wall for the rest of the game. So what is wanted is a band: far enough that you
+// hear it coming, close enough that it is coming for you. Which also settles what
+// happens when everybody is down — nothing rises, because there is nobody for it to
+// rise near. The horde follows the living about.
+func decent(
+	made: place.Plan,
+	blocks: place.Block[],
+	hunted: Prey[],
+	breed: wire.Breed,
+	x: Float,
+	z: Float
+): Bool {
+	if math.abs(x) > place.edge() || math.abs(z) > place.edge() {
+		return false
+	}
+	if belongs(made, breed, x, z) == false {
+		return false
+	}
+	if place.clear(blocks, x, perched(breed), z) == false {
+		return false
+	}
+	mut Bool near = false
+	for each one in hunted {
+		gap := math.hypot(one.x - x, one.z - z)
+		if gap < shy(breed) {
+			return false
+		}
+		if gap < earshot() {
+			near = true
+		}
+	}
+	return near
+}
+
+// How much room one wants when it rises. A vampire asks for more, because it covers
+// the ground between faster than anything else here — and because arriving in the
+// air is arriving from any direction at all.
+func shy(breed: wire.Breed): Float {
+	if breed == wire.Breed.Vampire() {
+		return 15.0
+	}
+	return 9.0
+}
+
+func earshot(): Float {
+	return 34.0
+}
+
+// What somebody shot, applied. The fallen are dropped here rather than left lying:
+// a horde is what is standing.
+func clawed(pack: wire.Fiend[], id: Int, hurt: Int): wire.Fiend[dyn] {
+	return standing(map(pack, wounding(_, id, hurt)))
+}
+
+func wounding(fiend: wire.Fiend, id: Int, hurt: Int): wire.Fiend {
+	if fiend.id != id {
+		return fiend
+	}
+	mut wire.Fiend hit = fiend
+	hit.health = place.floored(fiend.health - hurt)
+	return hit
+}
+
+// Whether that shot is the one that finishes it. It is asked *before* the damage is
+// applied, because "it was standing and now it is not" is the only moment worth
+// crediting anybody with.
+func finished(pack: wire.Fiend[], id: Int, hurt: Int): Bool {
+	for each fiend in pack {
+		if fiend.id == id {
+			return fiend.health > 0 && fiend.health - hurt <= 0
+		}
+	}
+	return false
+}
+
+func standing(pack: wire.Fiend[]): wire.Fiend[dyn] {
+	mut wire.Fiend[dyn] left = []
+	for each fiend in pack {
+		if fiend.health > 0 {
+			append(left, fiend)
+		}
+	}
+	return left
+}
+
+// ---------------------------------------------------------------------------
+// Where nobody is
+// ---------------------------------------------------------------------------
+// Two questions with one answer between them: where to put somebody who has just
+// gone down, and where to put one of the dead when a dozen guesses have all landed
+// somewhere unfit. Both are "a spot with room in it", and both are asked of the
+// same list of the living.
+
+// How far the closest living body is from a spot — a very long way, when there is
+// nobody about.
+//
+// It is handed the `Prey` list rather than the roster, and that is the useful part:
+// that list is exactly "everybody alive". So nothing is ever raised at a spot next
+// to somebody who is *about* to come back to it either, because somebody who is
+// down is not prey.
+func lonely(hunted: Prey[], where: place.Spot): Float {
+	mut Float least = 1000.0
+	for each one in hunted {
+		gap := math.hypot(one.x - where.x, one.z - where.z)
+		if gap < least {
+			least = gap
+		}
+	}
+	return least
+}
+
+// Where to come back after going down: the nearest spot with room in it.
+//
+// On a place this size the *emptiest* spot is nearly always the far one, and a
+// game that answered "the far one" would spend the next twenty seconds being a
+// walk. It still has to have room — coming back on top of whoever put you down is
+// not coming back — so what this asks is "the closest one nobody is standing in",
+// which is two rules rather than one and worth the six lines it costs.
+func vacancy(hunted: Prey[], seed: Int, x: Float, z: Float): place.Spot {
+	mut place.Spot best = place.spot(0, seed)
+	mut Float closest = 100000.0
+	mut Bool found = false
+	for i := 0; i < place.spots(); i++ {
+		where := place.spot(i, seed)
+		if lonely(hunted, where) > 9.0 {
+			gap := math.hypot(where.x - x, where.z - z)
+			if gap < closest {
+				closest = gap
+				best = where
+				found = true
+			}
+		}
+	}
+	if found {
+		return best
+	}
+	return emptiest(hunted, seed)
+}
+
+// The spot whose nearest living body is furthest away. It is what `vacancy` falls
+// back to when there is somebody near every one of them.
+func emptiest(hunted: Prey[], seed: Int): place.Spot {
+	mut place.Spot best = place.spot(0, seed)
+	mut Float room = 0.0 - 1.0
+	for i := 0; i < place.spots(); i++ {
+		where := place.spot(i, seed)
+		near := lonely(hunted, where)
+		if near > room {
+			room = near
+			best = where
+		}
+	}
+	return best
+}
