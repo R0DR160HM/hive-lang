@@ -1,0 +1,129 @@
+// Pattern matching
+// ================
+// `is` checks a value against a pattern. Where it matches it narrows the
+// value's type and binds parts of it to fresh names, usable right away — in the
+// rest of the same condition, after `&&`, and in the branch body. There are
+// four kinds of pattern: tagged-union variants, `Result`s, vectors and strings.
+// Every branch below is a plain `if` / `else if`, because `is` is an ordinary
+// expression that answers with a Bool.
+
+type Shape {
+	Circle {
+		radius: Int
+	}
+	Rectangle {
+		width: Int
+		height: Int
+	}
+	Point
+}
+
+// 1. Tagged unions
+// ----------------
+// `value is Type.Variant(a, b)` matches one variant and binds its fields by
+// position; `_` matches a field without binding it. The branches here cover
+// every variant of `Shape`, so no `else` is needed — the compiler proves the
+// chain returns on every path. Drop one branch and it refuses to compile.
+func describe(shape: Shape): Str {
+	if shape is Shape.Circle(r) {
+		return "circle, radius {r}"
+	} else if shape is Shape.Rectangle(w, h) {
+		return "rectangle, {w}x{h}"
+	} else if shape is Shape.Point {
+		return "a single point"
+	}
+}
+
+// 2. Results
+// ----------
+// `Result.Ok(v)` and `Result.Error(e)` unwrap a fallible value and bind what is
+// inside. Matching both is exhaustive. This one comes from `hive.conv.sti`,
+// which parses a Str into an Int.
+func parseAge(written: Str): Str {
+	parsed := hive.conv.sti(written)
+	if parsed is Result.Ok(age) {
+		return "{written} -> age {age}"
+	} else if parsed is Result.Error(problem) {
+		return "{written} -> {problem.message}"
+	}
+}
+
+// 3. Vectors
+// ----------
+// A vector pattern matches positionally: a literal element must be equal, a
+// bare name binds that element, `_` skips one, and a trailing `...rest` binds
+// whatever is left as a vector — which also turns an exact length into a
+// minimum. Without a `...rest`, the pattern matches only a vector of exactly
+// that many.
+func route(command: Str[dyn]): Str {
+	// `direction` binds command[1]; `steps` binds command[2:].
+	if command is ["move", direction, ...steps] {
+		return "move {direction} ({len(steps)} extra)"
+	} else if command is ["stop"] {
+		return "halt"
+	} else if command is [single] {
+		return "one-word command: {single}"
+	}
+	return "unrecognised command"
+}
+
+// 4. Strings
+// ----------
+// A string pattern is a template: literal text that has to match verbatim, plus
+// `{name}` holes that bind what is between the literals — holes in the middle
+// included. Matching is non-greedy, so a hole between two slashes never
+// swallows a slash; a hole with nothing after it runs to the end; and the
+// template has to cover the whole string. A pattern with no holes is a plain
+// exact match.
+func handle(path: Str): Str {
+	if path is "/health" {
+		return "200 health check"
+	} else if path is "/users/{id}/posts/{postId}" {
+		return "user {id}, post {postId}"
+	} else if path is "/users/{id}" {
+		return "user {id}"
+	} else if path is "/files/{rest}" {
+		// A trailing hole takes everything left, slashes and all.
+		return "file at {rest}"
+	}
+	return "404 not found"
+}
+
+proc main(): void {
+	echo "-- tagged unions --"
+	echo describe(Shape.Circle(5))
+	echo describe(Shape.Rectangle(3, 4))
+	echo describe(Shape.Point())
+
+	echo ""
+	echo "-- results --"
+	echo parseAge("42")
+	echo parseAge("twelve")
+
+	echo ""
+	echo "-- vectors --"
+	echo route(["move", "north", "10", "20"])
+	echo route(["stop"])
+	echo route(["jump"])
+	echo route(["a", "b", "c", "d"])
+
+	echo ""
+	echo "-- strings --"
+	echo handle("/health")
+	echo handle("/users/7/posts/99")
+	echo handle("/users/7")
+	echo handle("/files/img/logo.png")
+	echo handle("/nope")
+
+	echo ""
+	echo "-- a binding is usable in the rest of the condition --"
+	shape := Shape.Circle(9)
+	if shape is Shape.Circle(r) && r > 5 {
+		echo "a big circle: {r}"
+	}
+	// Narrowing works on the way in too: a pattern that fails simply answers
+	// false, so this is one condition rather than two nested ifs.
+	if parseAge("7") is "7 -> age {age}" {
+		echo "and a string pattern can read a string another one wrote: {age}"
+	}
+}

@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Compile the compiler with itself, twice, and check the two agree.
+#
+# This is the test that says a self-hosted compiler works. Stage 1 is whatever
+# ./bootstrap built. Stage 2 is stage 1 compiling its own source. Stage 3 is
+# stage 2 doing the same. If stage 2 and stage 3 emit byte-identical Go, the
+# compiler is a fixpoint of itself — which means the language it accepts and the
+# code it writes are the same on both sides, and nothing about whatever compiled
+# it first is left in it.
+#
+# A difference here is a real bug, and a loud one: it says the compiler does not
+# understand something it wrote.
+set -euo pipefail
+
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+work="${TMPDIR:-/tmp}/hive-selfhost.$$"
+trap 'rm -rf "$work"' EXIT
+
+if [ ! -x "$here/src/hivec" ]; then
+	echo "selfhost: stage 1 has not been built. Run ./bootstrap first." >&2
+	exit 1
+fi
+
+# Compile the compiler's source with `compiler`, leaving the executable at
+# $work/stageN/src/hivec — which is where `hive build` puts it, beside the
+# entrypoint it was given.
+stage() {
+	local n="$1" compiler="$2"
+	mkdir -p "$work/stage$n"
+	cp -r "$here/src" "$work/stage$n/"
+	rm -f "$work/stage$n/src/hivec"
+	rm -rf "$work/stage$n"/src/*-build
+	"$compiler" build "$work/stage$n/src/hivec.hive" >/dev/null
+}
+
+echo "stage 2: the compiler, compiled by stage 1..."
+stage 2 "$here/src/hivec"
+
+echo "stage 3: the compiler, compiled by stage 2..."
+stage 3 "$work/stage2/src/hivec"
+
+if diff -q "$work/stage2/src/hivec.hive-build/main.go" \
+           "$work/stage3/src/hivec.hive-build/main.go" >/dev/null; then
+	echo
+	echo "  FIXPOINT — stage 2 and stage 3 emit byte-identical Go."
+else
+	echo
+	echo "  DIFFERENT — stage 2 and stage 3 disagree:" >&2
+	diff "$work/stage2/src/hivec.hive-build/main.go" \
+	     "$work/stage3/src/hivec.hive-build/main.go" | head -40 >&2
+	exit 1
+fi

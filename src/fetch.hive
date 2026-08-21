@@ -1,0 +1,311 @@
+// Fetching
+// ========
+// The import that names a repository rather than a file next door.
+//
+//     import https://github.com/owner/repo/src/text
+//     import https://github.com/owner/repo@a1b2c3/src/text
+//
+// `https://host/owner/repo` is the repository; everything after it is the path
+// inside it, and it leaves `.hive` off exactly as a local import does. A
+// revision goes where the repository ends — a commit, a tag or a branch.
+//
+// **Everything is fetched once.** The clone lands in a cache under the home
+// directory, shared by every program on the machine that wants that commit, and
+// nothing touches the network when it is already there.
+//
+// **An import that names no revision is pinned on first use.** The commit it
+// resolved to is written into a lock file beside the entrypoint, and every later
+// build reads that — which is what makes another machine build the same program.
+import ./diag
+import ./paths
+import ./progress
+import ./text
+import hive.env
+import hive.file
+import hive.term
+
+/// What a remote import names.
+type Repo {
+	/// `https://host/owner/repo` — the repository itself.
+	url: Str
+	/// The revision written on it, or `""`. A commit, a tag or a branch.
+	revision: Str
+	/// The path inside the repository, with no extension for a Hive module.
+	inner: Str
+}
+
+/// A fetched repository: where its files are, and what commit they are.
+type Fetched {
+	directory: Str
+	commit: Str
+}
+
+/// The commit each un-pinned repository resolved to, so it resolves to the same
+/// thing next time.
+type Lock {
+	path: Str
+	urls: Str[dyn]
+	commits: Str[dyn]
+	/// Whether anything was added, so a lock that did not change is not rewritten.
+	added: Bool
+}
+
+// --- Reading a path ----------------------------------------------------------
+
+/// Whether a path is aimed at a repository rather than at this disk.
+func isRemote(path: Str): Bool {
+	return text.startsWith(path, "https://") || text.startsWith(path, "http://")
+}
+
+/// Split a remote import path into its three parts.
+func repoOf(path: Str): Result<Repo, Str> {
+	mut scheme := "https://"
+	if text.startsWith(path, "http://") {
+		scheme = "http://"
+	}
+	rest := text.span(text.chars(path), len(scheme), len(path) - 1)
+	segments := split(rest, "/")
+	if len(segments) < 4 {
+		return Result.Error("`{path}` does not name a file in a repository: the path is a host, an owner and a repository, and then the path inside it — `https://host/owner/repo/src/text`")
+	}
+	host := text.charAt(segments, 0)
+	owner := text.charAt(segments, 1)
+	named := text.charAt(segments, 2)
+
+	// The revision goes where the repository ends: `repo@a1b2c3`.
+	mut repo := named
+	mut revision := ""
+	if indexOf(named, "@") is Result.Ok(at) {
+		cs := text.chars(named)
+		repo = text.span(cs, 0, at - 1)
+		revision = text.span(cs, at + 1, len(cs) - 1)
+	}
+
+	mut Str[dyn] innerParts = []
+	for i := 3; i < len(segments); i++ {
+		if segments bounds i {
+			append(innerParts, segments[i])
+		}
+	}
+	return Result.Ok(Repo(scheme + host + "/" + owner + "/" + repo, revision, join(innerParts, "/")))
+}
+
+/// Where a repository's clone lives: under the home directory, keyed by what it
+/// is and which commit — so two programs wanting the same commit share one, and
+/// two wanting different ones do not collide.
+proc cacheOf(repo: Repo, commit: Str): Str {
+	return paths.joinPath(hiveHome(), paths.joinPath("pkg", slug(repo.url) + "@" + commit))
+}
+
+proc hiveHome(): Str {
+	if hive.env.get("HOME") is Result.Ok(home) {
+		return paths.joinPath(home, ".hive")
+	}
+	// Windows names it differently, and a machine with neither has the working
+	// directory, which is better than nothing.
+	if hive.env.get("USERPROFILE") is Result.Ok(home) {
+		return paths.joinPath(home, ".hive")
+	}
+	return ".hive"
+}
+
+// `https://github.com/owner/repo` -> `github.com_owner_repo`.
+func slug(url: Str): Str {
+	mut out := text.replace(url, "https://", "")
+	out = text.replace(out, "http://", "")
+	return text.replace(out, "/", "_")
+}
+
+// --- The lock file -----------------------------------------------------------
+
+/// The lock beside `entry`: `main.hive` keeps its pins in `main.hive-lock`.
+func lockPathOf(entry: Str): Str {
+	return entry + "-lock"
+}
+
+proc readLock(entry: Str): Lock {
+	path := lockPathOf(entry)
+	mut Str[dyn] urls = []
+	mut Str[dyn] commits = []
+	if hive.file.read(path) is Result.Ok(contents) {
+		for each line in split(contents, "\n") {
+			trimmed := text.trim(line)
+			if trimmed == "" || text.startsWith(trimmed, "#") {
+				continue
+			}
+			pieces := split(trimmed, " ")
+			if len(pieces) >= 2 {
+				append(urls, text.charAt(pieces, 0))
+				append(commits, text.charAt(pieces, 1))
+			}
+		}
+	}
+	return Lock(path, urls, commits, false)
+}
+
+func pinned(lock: Lock, url: Str): Str {
+	if indexOf(lock.urls, url) is Result.Ok(at) {
+		return text.charAt(lock.commits, at)
+	}
+	return ""
+}
+
+proc pin(lock: mut Lock, url: Str, commit: Str): void {
+	if indexOf(lock.urls, url) is Result.Ok(_) {
+		return
+	}
+	append(lock.urls, url)
+	append(lock.commits, commit)
+	lock.added = true
+}
+
+/// Write the lock back, if anything was added to it. Keep it in version
+/// control — it is what makes another machine build the same program.
+proc writeLock(lock: Lock): void {
+	if lock.added == false || lock.path == "" {
+		return
+	}
+	mut Str[dyn] lines = []
+	append(lines, "# Written by the Hive compiler: the commit each remote import was")
+	append(lines, "# resolved to. Keep this in version control — it is what makes another")
+	append(lines, "# machine build the same program. Delete a line to take the latest of")
+	append(lines, "# that repository again.")
+	for i := 0; i < len(lock.urls); i++ {
+		if lock.urls bounds i {
+			if lock.commits bounds i {
+				append(lines, lock.urls[i] + " " + lock.commits[i])
+			}
+		}
+	}
+	if hive.file.write(lock.path, join(lines, "\n") + "\n") is Result.Error(_) {
+		// A lock that could not be written costs a fetch next time and nothing
+		// else, so it is not worth failing a build over.
+		return
+	}
+}
+
+// --- Fetching ----------------------------------------------------------------
+
+/// Make sure `repo` is on this disk at the commit it should be, and say where.
+proc fetch(repo: Repo, lock: mut Lock): Result<Fetched, Str> {
+	resolved := commitOf(repo, lock)
+	if resolved is Result.Error(why) {
+		return Result.Error(why)
+	}
+	if resolved is Result.Ok(commit) {
+		directory := cacheOf(repo, commit)
+		// Nothing touches the network when the clone is already there.
+		if hive.file.exists(directory) {
+			return Result.Ok(Fetched(directory, commit))
+		}
+		cloned := clone(repo, commit, directory)
+		if cloned is Result.Error(why) {
+			return Result.Error(why)
+		}
+		return Result.Ok(Fetched(directory, commit))
+	}
+	return Result.Error("could not resolve `{repo.url}`")
+}
+
+// Which commit this import means. A revision written on the import decides; one
+// that was not written is read from the lock, and pinned there on first use.
+proc commitOf(repo: Repo, lock: mut Lock): Result<Str, Str> {
+	if repo.revision != "" {
+		return resolve(repo.url, repo.revision)
+	}
+	held := pinned(lock, repo.url)
+	if held != "" {
+		return Result.Ok(held)
+	}
+	found := resolve(repo.url, "HEAD")
+	if found is Result.Ok(commit) {
+		pin(lock, repo.url, commit)
+	}
+	return found
+}
+
+// Ask the repository what a revision is, without cloning it. A revision that is
+// already a commit is its own answer, which is what lets a pinned build work
+// against a repository whose branches have moved on.
+proc resolve(url: Str, revision: Str): Result<Str, Str> {
+	// A network is the one thing a compile does that it cannot be quick about,
+	// so both halves of a remote import say so before they wait on it.
+	progress.note("asking {url} what `{revision}` is")
+	said := hive.term.exec("git", ["ls-remote", url, revision], "")
+	if said is Result.Error(why) {
+		return Result.Error(gitFailed(url, why))
+	}
+	if said is Result.Ok(output) {
+		commit := firstField(output)
+		if commit != "" {
+			return Result.Ok(commit)
+		}
+		// `ls-remote` says nothing about a raw commit id, because it is not a ref.
+		if looksLikeCommit(revision) {
+			return Result.Ok(revision)
+		}
+		return Result.Error("`{url}` has no `{revision}`: it is not a branch, a tag or a commit that repository holds")
+	}
+	return Result.Error("could not reach `{url}`")
+}
+
+proc clone(repo: Repo, commit: Str, directory: Str): Result<Bool, Str> {
+	if hive.file.makeDir(paths.dirOf(directory)) is Result.Error(why) {
+		return Result.Error("cannot make the package cache at `" + paths.dirOf(directory) + "`: {why.message}")
+	}
+	progress.note("cloning {repo.url}")
+	cloned := hive.term.exec("git", ["clone", "--quiet", repo.url, directory], "")
+	if cloned is Result.Error(why) {
+		return Result.Error(gitFailed(repo.url, why))
+	}
+	checked := hive.term.exec("git", ["-C", directory, "checkout", "--quiet", commit], "")
+	if checked is Result.Error(why) {
+		return Result.Error("`{repo.url}` was cloned but has no `{commit}`: " + text.trim(why.output))
+	}
+	return Result.Ok(true)
+}
+
+// The three ways git can be unhappy, told apart — because each is a different
+// thing to go and fix.
+func gitFailed(url: Str, why: hive.term.ExecError): Str {
+	if why.code < 0 {
+		return "`git` is not on the PATH, and a remote import needs it to fetch `{url}`. Install git, or vendor the module next to the file that imports it"
+	}
+	return "could not reach `{url}`: " + text.trim(why.output)
+}
+
+// The first word of the first line, which is the commit `ls-remote` answers with.
+func firstField(output: Str): Str {
+	for each line in split(output, "\n") {
+		trimmed := text.trim(line)
+		if trimmed == "" {
+			continue
+		}
+		for each field in split(trimmed, "\t") {
+			return text.trim(field)
+		}
+	}
+	return ""
+}
+
+// A commit id is forty hex digits, or the short form somebody typed.
+func looksLikeCommit(revision: Str): Bool {
+	if len(revision) < 7 {
+		return false
+	}
+	for each c in text.chars(revision) {
+		if text.isDigit(c) == false && isHexLetter(c) == false {
+			return false
+		}
+	}
+	return true
+}
+
+func isHexLetter(c: Str): Bool {
+	return c == "a" || c == "b" || c == "c" || c == "d" || c == "e" || c == "f"
+}
+
+/// A diagnostic about a remote import, against the file that wrote it.
+func problem(file: Str, line: Int, message: Str): diag.Diagnostic {
+	return diag.Diagnostic(file, line, message)
+}

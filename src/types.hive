@@ -1,0 +1,720 @@
+// Types
+// =====
+// What a `TypeExpr` means once it has been resolved — and, more to the point,
+// what an expression's type *is*, which is what the checker asks about and what
+// the emitter needs before it can decide what `+` lowers to.
+//
+// A `TypeExpr` is syntax: `Str[3]` as it was written, including a name whose
+// meaning depends on what the program declared. A `Ty` is the answer: a vector
+// of three strings, or a declared union, or a type variable nothing has pinned
+// down yet. Every pass after the loader works in `Ty`.
+//
+// `Ty` compares with `==`, structurally and all the way down, which is the whole
+// of what type equality means here — there is no subtyping between declared
+// types and no interface to widen through.
+import ./ast
+import ./text
+
+type Ty {
+	TStr
+	TInt
+	TFloat
+	TBool
+	TAtom
+	/// The return type that is no type at all.
+	TVoid
+	/// A vector, with the promise its declaration made about its length.
+	TVec { element: Ty, dim: ast.Dim }
+	/// A type the program declared — a struct or a tagged union, under its
+	/// flattened name.
+	TNamed { name: Str }
+	/// `Result<T, E>`.
+	TResult { ok: Ty, bad: Ty }
+	/// `hive.map.Map<K, T>`.
+	TMap { key: Ty, value: Ty }
+	/// A function value: `func(Int): Int` or `proc(Str): void`.
+	TFn { pure: Bool, params: Ty[dyn], result: Ty }
+	/// An opaque type the standard library owns: `hive.net.HttpRequest`,
+	/// `hive.sql.SqlConnection`. Its fields are the library's business, so it is
+	/// carried by name and compared by name.
+	TLib { module: Str, name: Str }
+	/// A type variable, which is what makes a callable generic in it.
+	TVar { name: Str }
+	/// No answer. Everything that produces one has already reported why, so a
+	/// second complaint about it would be the same mistake counted twice.
+	TUnknown
+}
+
+// --- What the program declares -----------------------------------------------
+
+/// One declared type, in the form the passes ask about it.
+type TypeInfo {
+	name: Str
+	/// Empty for a struct.
+	variants: ast.Variant[dyn]
+	/// The fields every value of the type has, whichever variant it is.
+	shared: ast.Field[dyn]
+	/// The type variables the declaration mentions, in first-appearance order.
+	parameters: Str[dyn]
+}
+
+/// One declared callable, in the same form.
+type CallableInfo {
+	name: Str
+	pure: Bool
+	params: ast.Param[dyn]
+	result: ast.TypeExpr
+	/// The type variables its signature mentions, in first-appearance order. A
+	/// non-empty one makes it generic.
+	parameters: Str[dyn]
+}
+
+/// Everything a pass needs to look up while walking a program.
+type Table {
+	types: TypeInfo[dyn]
+	callables: CallableInfo[dyn]
+}
+
+/// Read a flattened module's declarations into a table.
+func tableOf(m: ast.Module): Table {
+	mut TypeInfo[dyn] types = []
+	mut CallableInfo[dyn] callables = []
+	for each d in m.decls {
+		if d is ast.Decl.TypeDecl(name, fields, variants, _) {
+			types = withType(types, TypeInfo(name, variants, fields, variablesOfType(fields, variants)))
+		} else if d is ast.Decl.CallableDecl(kind, name, params, result, _, _) {
+			pure := kind is ast.CallableKind.FuncKind
+			callables = withCallable(callables, CallableInfo(name, pure, params, result, variablesOfSignature(params, result)))
+		} else if d is ast.Decl.ForeignDecl(name, params, result, _, _, _, _) {
+			// A Go function is a `func`: the boundary copies in both directions,
+			// so nothing on the far side can write where the caller can see.
+			callables = withCallable(callables, CallableInfo(name, true, params, result, variablesOfSignature(params, result)))
+		} else if d is ast.Decl.QueryDecl(name, params, result, _, _) {
+			// A query is a func whose body happens to be SQL.
+			callables = withCallable(callables, CallableInfo(name, true, params, result, variablesOfSignature(params, result)))
+		}
+	}
+	return Table(types, callables)
+}
+
+// `append` on a value the caller handed us would be a write through storage it
+// can still see, so each of these hands back a vector of its own. That is the
+// same rule the language keeps everywhere; here it is what lets `tableOf` be a
+// `func`.
+func withType(types: TypeInfo[], one: TypeInfo): TypeInfo[dyn] {
+	mut TypeInfo[dyn] out = []
+	for each t in types {
+		append(out, t)
+	}
+	append(out, one)
+	return out
+}
+
+func withCallable(callables: CallableInfo[], one: CallableInfo): CallableInfo[dyn] {
+	mut CallableInfo[dyn] out = []
+	for each c in callables {
+		append(out, c)
+	}
+	append(out, one)
+	return out
+}
+
+func findType(t: Table, name: Str): Result<TypeInfo, Bool> {
+	for each info in t.types {
+		if info.name == name {
+			return Result.Ok(info)
+		}
+	}
+	return Result.Error(false)
+}
+
+func findCallable(t: Table, name: Str): Result<CallableInfo, Bool> {
+	for each info in t.callables {
+		if info.name == name {
+			return Result.Ok(info)
+		}
+	}
+	return Result.Error(false)
+}
+
+/// The variant of `typeName` called `variantName`, with the type's shared fields
+/// appended — which is what "a field outside any variant is added to every one
+/// of them" means once anything has to read them.
+func findVariant(t: Table, typeName: Str, variantName: Str): Result<ast.Field[dyn], Bool> {
+	if findType(t, typeName) is Result.Ok(info) {
+		for each v in info.variants {
+			if v.name == variantName {
+				mut ast.Field[dyn] out = []
+				for each f in v.fields {
+					append(out, f)
+				}
+				for each f in info.shared {
+					append(out, f)
+				}
+				return Result.Ok(out)
+			}
+		}
+	}
+	return Result.Error(false)
+}
+
+/// A struct's fields, or `Error` when the name is a union or nothing at all.
+func fieldsOfStruct(t: Table, name: Str): Result<ast.Field[dyn], Bool> {
+	if findType(t, name) is Result.Ok(info) {
+		if len(info.variants) == 0 {
+			return Result.Ok(info.shared)
+		}
+	}
+	return Result.Error(false)
+}
+
+// --- Type variables ----------------------------------------------------------
+
+// A name in a signature that is neither a builtin nor a declared type is a type
+// variable. Which of those it is cannot be settled here — the table is being
+// built — so this collects every name that *could* be one, in first-appearance
+// order, and `resolve` decides when it has the table to decide with.
+func variablesOfSignature(params: ast.Param[], result: ast.TypeExpr): Str[dyn] {
+	mut Str[dyn] out = []
+	for each p in params {
+		out = collectNames(p.declared, out)
+	}
+	return collectNames(result, out)
+}
+
+func variablesOfType(fields: ast.Field[], variants: ast.Variant[]): Str[dyn] {
+	mut Str[dyn] out = []
+	for each f in fields {
+		out = collectNames(f.declared, out)
+	}
+	for each v in variants {
+		for each f in v.fields {
+			out = collectNames(f.declared, out)
+		}
+	}
+	return out
+}
+
+// Each of these hands back a vector of its own rather than growing one it was
+// given. That is what keeps every function in this module a `func`: a `mut`
+// parameter is the one thing a func may not declare, and reaching for one here
+// would have made the whole table a `proc` to build.
+func collectNames(t: ast.TypeExpr, into: Str[]): Str[dyn] {
+	if t is ast.TypeExpr.Named(pkg, name, args, _) {
+		mut Str[dyn] out = copied(into)
+		if pkg == "" && indexOf(out, name) is Result.Error(_) {
+			append(out, name)
+		}
+		for each a in args {
+			out = collectNames(a, out)
+		}
+		return out
+	}
+	if t is ast.TypeExpr.Fn(_, params, result) {
+		mut Str[dyn] out = copied(into)
+		for each p in params {
+			out = collectNames(p, out)
+		}
+		return collectNames(result, out)
+	}
+	return copied(into)
+}
+
+func copied(names: Str[]): Str[dyn] {
+	mut Str[dyn] out = []
+	for each n in names {
+		append(out, n)
+	}
+	return out
+}
+
+/// Whether `name` is a type variable in a program whose declarations are `t`: a
+/// PascalCase name that is neither a builtin nor anything the program declared.
+func isVariable(t: Table, name: Str): Bool {
+	if isBuiltinType(name) {
+		return false
+	}
+	if findType(t, name) is Result.Ok(_) {
+		return false
+	}
+	return true
+}
+
+func isBuiltinType(name: Str): Bool {
+	return name == "Str" || name == "Int" || name == "Float" || name == "Bool"
+		|| name == "Atom" || name == "Table" || name == "Result"
+}
+
+// --- Resolving a written type ------------------------------------------------
+
+/// What a `TypeExpr` means, given what the program declared.
+func resolve(t: Table, written: ast.TypeExpr): Ty {
+	if written is ast.TypeExpr.VoidType {
+		return Ty.TVoid()
+	}
+	if written is ast.TypeExpr.Fn(pure, params, result) {
+		mut Ty[dyn] out = []
+		for each p in params {
+			append(out, resolve(t, p))
+		}
+		return Ty.TFn(pure, out, resolve(t, result))
+	}
+	if written is ast.TypeExpr.Named(pkg, name, args, dims) {
+		return wrap(resolveBase(t, pkg, name, args), dims)
+	}
+	return Ty.TUnknown()
+}
+
+// The element type, with one layer per dimension. The dimensions read left to
+// right as the element type gains outer layers, so `Str[2][3]` is three vectors
+// of two.
+func wrap(element: Ty, dims: ast.Dim[]): Ty {
+	mut Ty out = element
+	for each d in dims {
+		out = Ty.TVec(out, d)
+	}
+	return out
+}
+
+func resolveBase(t: Table, pkg: Str, name: Str, args: ast.TypeExpr[]): Ty {
+	if pkg == "" {
+		return resolveBare(t, name, args)
+	}
+	if pkg == "hive.map" && name == "Map" {
+		return Ty.TMap(argAt(t, args, 0), argAt(t, args, 1))
+	}
+	if text.startsWith(pkg, "hive.") {
+		return Ty.TLib(text.span(text.chars(pkg), 5, len(pkg) - 1), name)
+	}
+	return Ty.TUnknown()
+}
+
+func resolveBare(t: Table, name: Str, args: ast.TypeExpr[]): Ty {
+	if name == "Str" { return Ty.TStr() }
+	else if name == "Int" { return Ty.TInt() }
+	else if name == "Float" { return Ty.TFloat() }
+	else if name == "Bool" { return Ty.TBool() }
+	else if name == "Atom" { return Ty.TAtom() }
+	// `Table` is an alias for `Str[dyn][dyn]` — a vector of rows of cells.
+	else if name == "Table" {
+		return Ty.TVec(Ty.TVec(Ty.TStr(), ast.Dim.Dynamic()), ast.Dim.Dynamic())
+	}
+	else if name == "Result" {
+		return Ty.TResult(argAt(t, args, 0), argAt(t, args, 1))
+	}
+	if findType(t, name) is Result.Ok(_) {
+		return Ty.TNamed(name)
+	}
+	return Ty.TVar(name)
+}
+
+func argAt(t: Table, args: ast.TypeExpr[], index: Int): Ty {
+	if args bounds index {
+		return resolve(t, args[index])
+	}
+	return Ty.TUnknown()
+}
+
+// --- Writing a type back -----------------------------------------------------
+
+/// A `Ty` as the `TypeExpr` an author would have written for it. It is the
+/// inverse of `resolve`, and monomorphization is what wants it: a type argument
+/// is worked out as a `Ty` and then has to be substituted into a signature,
+/// which is written in `TypeExpr`.
+func toWritten(ty: Ty): ast.TypeExpr {
+	if ty is Ty.TStr { return named("Str") }
+	if ty is Ty.TInt { return named("Int") }
+	if ty is Ty.TFloat { return named("Float") }
+	if ty is Ty.TBool { return named("Bool") }
+	if ty is Ty.TAtom { return named("Atom") }
+	if ty is Ty.TVoid { return ast.TypeExpr.VoidType() }
+	if ty is Ty.TNamed(name) { return named(name) }
+	if ty is Ty.TVar(name) { return named(name) }
+	if ty is Ty.TLib(module, name) {
+		return ast.TypeExpr.Named("hive." + module, name, [], [])
+	}
+	if ty is Ty.TVec(element, dim) {
+		return withDim(toWritten(element), dim)
+	}
+	if ty is Ty.TResult(ok, bad) {
+		return ast.TypeExpr.Named("", "Result", [toWritten(ok), toWritten(bad)], [])
+	}
+	if ty is Ty.TMap(key, value) {
+		return ast.TypeExpr.Named("hive.map", "Map", [toWritten(key), toWritten(value)], [])
+	}
+	if ty is Ty.TFn(pure, params, result) {
+		mut ast.TypeExpr[dyn] out = []
+		for each p in params {
+			append(out, toWritten(p))
+		}
+		return ast.TypeExpr.Fn(pure, out, toWritten(result))
+	}
+	// An unknown has no spelling. It only reaches here from an expression that
+	// has already been reported, and `Str` is as good a stand-in as any.
+	return named("Str")
+}
+
+func named(name: Str): ast.TypeExpr {
+	return ast.TypeExpr.Named("", name, [], [])
+}
+
+// One more dimension on the outside of a written type.
+func withDim(inner: ast.TypeExpr, dim: ast.Dim): ast.TypeExpr {
+	if inner is ast.TypeExpr.Named(pkg, name, args, dims) {
+		mut ast.Dim[dyn] out = []
+		for each d in dims {
+			append(out, d)
+		}
+		append(out, dim)
+		return ast.TypeExpr.Named(pkg, name, args, out)
+	}
+	return inner
+}
+
+// --- Reading a type back -----------------------------------------------------
+
+/// How a type reads in a message. It is the spelling the author would have
+/// written, because a message naming a type nobody can write is a message about
+/// the compiler rather than the program.
+func show(ty: Ty): Str {
+	if ty is Ty.TStr { return "Str" }
+	else if ty is Ty.TInt { return "Int" }
+	else if ty is Ty.TFloat { return "Float" }
+	else if ty is Ty.TBool { return "Bool" }
+	else if ty is Ty.TAtom { return "Atom" }
+	else if ty is Ty.TVoid { return "void" }
+	else if ty is Ty.TUnknown { return "?" }
+	else if ty is Ty.TVar(name) { return name }
+	else if ty is Ty.TNamed(name) { return name }
+	else if ty is Ty.TLib(module, name) { return "hive.{module}.{name}" }
+	else if ty is Ty.TVec(element, dim) { return show(element) + showDim(dim) }
+	else if ty is Ty.TResult(ok, bad) { return "Result<" + show(ok) + ", " + show(bad) + ">" }
+	else if ty is Ty.TMap(key, value) { return "hive.map.Map<" + show(key) + ", " + show(value) + ">" }
+	else if ty is Ty.TFn(pure, params, result) {
+		mut word := "proc"
+		if pure {
+			word = "func"
+		}
+		mut Str[dyn] out = []
+		for each p in params {
+			append(out, show(p))
+		}
+		return word + "(" + join(out, ", ") + "): " + show(result)
+	}
+	return "?"
+}
+
+func showDim(d: ast.Dim): Str {
+	if d is ast.Dim.Fixed(size) { return "[{size}]" }
+	else if d is ast.Dim.Dynamic { return "[dyn]" }
+	return "[]"
+}
+
+// --- Questions the passes ask ------------------------------------------------
+
+/// Whether a value of type `from` may be used where `to` is expected.
+///
+/// There is no implicit numeric widening and no subtyping between declared
+/// types, so this is equality with exactly three exceptions — and each of them
+/// is a thing the language says out loud.
+func accepts(to: Ty, from: Ty): Bool {
+	// An unknown has already been reported. Accepting it everywhere is what
+	// keeps one mistake from being counted twice.
+	if to is Ty.TUnknown || from is Ty.TUnknown {
+		return true
+	}
+	if same(to, from) {
+		return true
+	}
+	if to is Ty.TVec(toElement, toDim) {
+		if from is Ty.TVec(fromElement, fromDim) {
+			return acceptsVector(toElement, toDim, fromElement, fromDim)
+		}
+		return false
+	}
+	// A `Result` and a map fit when their halves do. Written out rather than left
+	// to `same`, because `same` wants the dimensions to match exactly and a
+	// `Result<Int, Diagnostic[dyn]>` is perfectly happy with a `Diagnostic[1]`
+	// inside it — the same rule the vector case above keeps, one layer down.
+	if to is Ty.TResult(toOk, toBad) {
+		if from is Ty.TResult(fromOk, fromBad) {
+			return accepts(toOk, fromOk) && accepts(toBad, fromBad)
+		}
+		return false
+	}
+	if to is Ty.TMap(toKey, toValue) {
+		if from is Ty.TMap(fromKey, fromValue) {
+			return accepts(toKey, fromKey) && accepts(toValue, fromValue)
+		}
+		return false
+	}
+	// A `func` value may fill a `proc` slot — pure widens to impure — and never
+	// the reverse.
+	if to is Ty.TFn(toPure, toParams, toResult) {
+		if from is Ty.TFn(fromPure, fromParams, fromResult) {
+			if toPure && fromPure == false {
+				return false
+			}
+			return sameTypes(toParams, fromParams) && accepts(toResult, fromResult)
+		}
+	}
+	return false
+}
+
+/// Whether two types are the same type, structurally and all the way down.
+///
+/// Written out rather than left to `==`, and the reason is worth knowing: a
+/// tagged union lowers to an interface holding one variant's struct, and Go's
+/// `==` on two of those panics when the struct holds a slice. `TFn` holds its
+/// parameters in one, so `a == b` would be a crash waiting for two function
+/// types to meet.
+func same(a: Ty, b: Ty): Bool {
+	// An unknown has already been reported wherever it came from, so it fits
+	// anything — which is what keeps one mistake from being counted twice, at
+	// every level rather than only at the top.
+	if a is Ty.TUnknown || b is Ty.TUnknown {
+		return true
+	}
+	if a is Ty.TStr { return b is Ty.TStr }
+	if a is Ty.TInt { return b is Ty.TInt }
+	if a is Ty.TFloat { return b is Ty.TFloat }
+	if a is Ty.TBool { return b is Ty.TBool }
+	if a is Ty.TAtom { return b is Ty.TAtom }
+	if a is Ty.TVoid { return b is Ty.TVoid }
+	if a is Ty.TVar(aName) {
+		if b is Ty.TVar(bName) { return aName == bName }
+		return false
+	}
+	if a is Ty.TNamed(aName) {
+		if b is Ty.TNamed(bName) { return aName == bName }
+		return false
+	}
+	if a is Ty.TLib(aModule, aName) {
+		if b is Ty.TLib(bModule, bName) { return aModule == bModule && aName == bName }
+		return false
+	}
+	if a is Ty.TVec(aElement, aDim) {
+		if b is Ty.TVec(bElement, bDim) { return same(aElement, bElement) && sameDim(aDim, bDim) }
+		return false
+	}
+	if a is Ty.TResult(aOk, aBad) {
+		if b is Ty.TResult(bOk, bBad) { return same(aOk, bOk) && same(aBad, bBad) }
+		return false
+	}
+	if a is Ty.TMap(aKey, aValue) {
+		if b is Ty.TMap(bKey, bValue) { return same(aKey, bKey) && same(aValue, bValue) }
+		return false
+	}
+	if a is Ty.TFn(aPure, aParams, aResult) {
+		if b is Ty.TFn(bPure, bParams, bResult) {
+			return aPure == bPure && sameList(aParams, bParams) && same(aResult, bResult)
+		}
+		return false
+	}
+	return false
+}
+
+func sameDim(a: ast.Dim, b: ast.Dim): Bool {
+	if a is ast.Dim.Fixed(aSize) {
+		if b is ast.Dim.Fixed(bSize) { return aSize == bSize }
+		return false
+	}
+	if a is ast.Dim.Dynamic { return b is ast.Dim.Dynamic }
+	return b is ast.Dim.Any
+}
+
+func sameList(a: Ty[], b: Ty[]): Bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		if a bounds i {
+			if b bounds i {
+				if same(a[i], b[i]) == false {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+func acceptsVector(toElement: Ty, toDim: ast.Dim, fromElement: Ty, fromDim: ast.Dim): Bool {
+	if accepts(toElement, fromElement) == false {
+		return false
+	}
+	// `Str[]` is the parameter spelling: any length, of this element type.
+	if toDim is ast.Dim.Any {
+		return true
+	}
+	// A declared length is a promise, so it only ever takes a vector of exactly
+	// that many — and a length nothing knows is refused too.
+	if toDim is ast.Dim.Fixed(wanted) {
+		if fromDim is ast.Dim.Fixed(given) {
+			return wanted == given
+		}
+		return false
+	}
+	// `[dyn]` promises nothing, so a known length is welcome to fill it.
+	return fromDim is ast.Dim.Fixed(_) || fromDim is ast.Dim.Dynamic
+		|| fromDim is ast.Dim.Any
+}
+
+func sameTypes(a: Ty[], b: Ty[]): Bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		// Written as two guards rather than one `&&`: two `bounds` in one
+		// condition repeat the `i >= 0` half, which `go vet` reads as a mistake.
+		if a bounds i {
+			if b bounds i {
+				if accepts(a[i], b[i]) == false {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+/// The length a concatenation answers with. Two known lengths add; anything else
+/// is unknown, because there is no "at least this many" in the language.
+func addedDim(a: ast.Dim, b: ast.Dim): ast.Dim {
+	if a is ast.Dim.Fixed(aSize) {
+		if b is ast.Dim.Fixed(bSize) {
+			return ast.Dim.Fixed(aSize + bSize)
+		}
+	}
+	return ast.Dim.Dynamic()
+}
+
+/// Whether the two sides of an operator fit each other. Two vectors fit when
+/// their elements do — a concatenation adds the lengths rather than matching
+/// them — and an atom fits beside a `Str`, which is the one coercion the
+/// language has.
+func operandsFit(a: Ty, b: Ty): Bool {
+	if a is Ty.TVec(aElement, _) {
+		if b is Ty.TVec(bElement, _) {
+			return same(aElement, bElement)
+		}
+		return false
+	}
+	if a is Ty.TStr && b is Ty.TAtom {
+		return true
+	}
+	if a is Ty.TAtom && b is Ty.TStr {
+		return true
+	}
+	return accepts(a, b) || accepts(b, a)
+}
+
+/// Whether a type owns storage that two names could otherwise observe each
+/// other writing to. This is what decides whether a binding needs a copy and
+/// whether a clone has to be generated for a declared type.
+func ownsStorage(t: Table, ty: Ty): Bool {
+	if ty is Ty.TVec(_, _) || ty is Ty.TMap(_, _) {
+		return true
+	}
+	if ty is Ty.TResult(ok, bad) {
+		return ownsStorage(t, ok) || ownsStorage(t, bad)
+	}
+	if ty is Ty.TNamed(name) {
+		return namedOwnsStorage(t, name, [])
+	}
+	return false
+}
+
+// A declared type owns storage when any field of it does. `seen` is what keeps a
+// type that reaches back into itself from asking forever: a recursive field is
+// reached through a variant, which is a pointer, and a pointer is storage in its
+// own right — so the answer is yes the moment the walk comes back round.
+func namedOwnsStorage(t: Table, name: Str, seen: Str[]): Bool {
+	if indexOf(seen, name) is Result.Ok(_) {
+		return true
+	}
+	mut Str[dyn] next = []
+	for each s in seen {
+		append(next, s)
+	}
+	append(next, name)
+
+	if findType(t, name) is Result.Ok(info) {
+		for each f in info.shared {
+			if fieldOwnsStorage(t, f.declared, next) {
+				return true
+			}
+		}
+		for each v in info.variants {
+			for each f in v.fields {
+				if fieldOwnsStorage(t, f.declared, next) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func fieldOwnsStorage(t: Table, written: ast.TypeExpr, seen: Str[]): Bool {
+	ty := resolve(t, written)
+	if ty is Ty.TVec(_, _) || ty is Ty.TMap(_, _) {
+		return true
+	}
+	if ty is Ty.TNamed(inner) {
+		return namedOwnsStorage(t, inner, seen)
+	}
+	if ty is Ty.TResult(ok, bad) {
+		return ownsStorage(t, ok) || ownsStorage(t, bad)
+	}
+	return false
+}
+
+/// The element type of a vector, or `TUnknown` for anything else.
+func elementOf(ty: Ty): Ty {
+	if ty is Ty.TVec(element, _) {
+		return element
+	}
+	return Ty.TUnknown()
+}
+
+/// A vector's length promise, or `Dim.Any` — which promises nothing — for
+/// anything that is not one.
+func dimOf(ty: Ty): ast.Dim {
+	if ty is Ty.TVec(_, dim) {
+		return dim
+	}
+	return ast.Dim.Any()
+}
+
+/// Whether a type can be compared and hashed whole, which is what a map's key
+/// has to be. Storage cannot: two vectors can hold equal contents and still be
+/// different storage, so there would be no answer to whether they are the same
+/// key.
+func isKeyable(t: Table, ty: Ty): Bool {
+	if ty is Ty.TStr || ty is Ty.TInt || ty is Ty.TFloat || ty is Ty.TBool || ty is Ty.TAtom {
+		return true
+	}
+	if ty is Ty.TNamed(name) {
+		return ownsStorage(t, ty) == false && findType(t, name) is Result.Ok(_)
+	}
+	return false
+}
+
+/// Whether a type has an order of its own — which `sort` with one argument
+/// needs, and which a function value and a service address do not have.
+func isOrdered(t: Table, ty: Ty): Bool {
+	if ty is Ty.TFn(_, _, _) || ty is Ty.TMap(_, _) || ty is Ty.TUnknown {
+		return false
+	}
+	if ty is Ty.TLib(_, _) || ty is Ty.TVoid {
+		return false
+	}
+	if ty is Ty.TVec(element, _) {
+		return isOrdered(t, element)
+	}
+	if ty is Ty.TResult(ok, bad) {
+		return isOrdered(t, ok) && isOrdered(t, bad)
+	}
+	return true
+}

@@ -1,0 +1,100 @@
+// Tests for `src/goffi` — reading an imported Go file.
+//
+// The reading itself needs the Go toolchain, and `test/loaderTests.hive` runs it
+// there. What is here is the half that needs nothing: the mapping between Go's
+// types and Hive's, which is where the boundary is decided — and every refusal
+// in it is a message somebody has to be able to act on.
+import ../src/goffi
+import ../src/show
+import ../src/text
+
+// The Hive type a Go type maps to, rendered, or the reason it maps to none.
+proc mapped(goType: Str): Str {
+	got := goffi.hiveType(goType, ["Point", "Weight"])
+	if got is Result.Ok(declared) {
+		return show.showType(declared)
+	}
+	if got is Result.Error(why) {
+		return "refused: " + why
+	}
+	return "?"
+}
+
+test "the scalars are the same value on both sides" {
+	assert mapped("string") == "Str"
+	assert mapped("int") == "Int"
+	assert mapped("float64") == "Float"
+	assert mapped("bool") == "Bool"
+}
+
+test "a slice is a dynamic vector, however deep" {
+	assert mapped("[]string") == "Str[dyn]"
+	assert mapped("[]int") == "Int[dyn]"
+	assert mapped("[][]string") == "Str[dyn][dyn]"
+}
+
+test "a map is a map, and its key has to sort" {
+	assert mapped("map[string]int") == "hive.map.Map<Str,Int>"
+	assert mapped("map[string][]string") == "hive.map.Map<Str,Str[dyn]>"
+	assert text.contains(mapped("map[Point]int"), "only a `string`, `int`, `float64` or `bool` key")
+}
+
+test "a struct the file declares is a type of the same name" {
+	assert mapped("Point") == "Point"
+	assert mapped("[]Weight") == "Weight[dyn]"
+	// One it does not declare is not a type at all.
+	assert text.contains(mapped("Circle"), "not a type Hive has a shape for")
+}
+
+test "a narrower number is refused rather than converted" {
+	assert text.contains(mapped("int64"), "Hive's `Int` is Go's `int`")
+	assert text.contains(mapped("uint8"), "Hive's `Int` is Go's `int`")
+	assert text.contains(mapped("float32"), "no precision is lost")
+}
+
+test "an error is not a value that travels" {
+	assert text.contains(mapped("error"), "the *last* thing the function answers with")
+}
+
+test "what Go has no Hive shape for says which shape it was" {
+	assert text.contains(mapped("unsupported(pointer)"), "a Go pointer")
+	assert text.contains(mapped("unsupported(channel)"), "a Go channel")
+	assert text.contains(mapped("unsupported(variadic)"), "a Go variadic")
+}
+
+// --- What a Go function answers with -----------------------------------------
+
+proc answers(results: Str[]): Str {
+	got := goffi.hiveResult(results, ["Point"], "Fetch", "`util.go`")
+	if got is Result.Ok(declared) {
+		return show.showType(declared)
+	}
+	if got is Result.Error(why) {
+		return "refused: " + why
+	}
+	return "?"
+}
+
+test "Go's two-value form is what a Result already means" {
+	assert answers([]) == "void"
+	assert answers(["string"]) == "Str"
+	assert answers(["string", "error"]) == "Result<Str,Str>"
+	// A lone `error` either worked or it did not, and `Ok(true)` is what "it
+	// worked" looks like when there was nothing to hand back.
+	assert answers(["error"]) == "Result<Bool,Str>"
+}
+
+test "three answers is one too many" {
+	assert text.contains(answers(["string", "int", "error"]), "answers with 3 values")
+	assert text.contains(answers(["string", "int", "error"]), "answer with a struct")
+}
+
+// --- The package a file becomes ----------------------------------------------
+
+test "a Go file becomes a package named after where it is" {
+	assert goffi.packageOf("./lib/measures.go") == "ffi_lib_measures_go"
+	// Two files of the same name in different folders stay apart, which is the
+	// whole reason the path is in the name.
+	assert goffi.packageOf("./a/util.go") != goffi.packageOf("./b/util.go")
+	assert text.startsWith(goffi.packageOf("util.go"), "ffi_")
+}

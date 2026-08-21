@@ -1,0 +1,155 @@
+// The Hive compiler
+// =================
+// The command line, which is the whole of what this file is.
+//
+//   hive check <entrypoint.hive>       report any errors, build nothing
+//   hive emit  <entrypoint.hive>       print the generated Go
+//   hive build <entrypoint.hive>       compile to a native executable
+//   hive run   <entrypoint.hive> [..]  compile and run
+//   hive test  <entrypoint.hive>       run the program's tests, with coverage
+//
+// Everything a compiler is made of happens here — lexing, parsing, resolving
+// imports, expanding generics, checking, proving every index in range, emitting
+// Go — and so does driving the Go toolchain over what came out, through
+// `hive.term.exec`. There is nothing left for a shell script to do.
+import ./diag
+import ./progress
+import ./project
+import ./testreport
+import hive.term
+
+proc main(): void {
+	args := hive.term.args()
+	if len(args) < 2 {
+		usage()
+		return
+	}
+	command := at(args, 0)
+	entry := at(args, 1)
+	// One clock for the whole command, started before anything is read, so every
+	// line of progress says how long *this* has been going.
+	from := progress.started()
+
+	if command == "check" {
+		report(project.check(entry, from), "No problems found in {entry}", from)
+	} else if command == "emit" {
+		emit(entry, from)
+	} else if command == "build" {
+		build(entry, from)
+	} else if command == "run" {
+		run(entry, rest(args, 2), from)
+	} else if command == "test" {
+		suite(entry, from)
+	} else {
+		echo "hive: `{command}` is not a command"
+		usage()
+		hive.term.exit(1)
+	}
+}
+
+// --- The commands ------------------------------------------------------------
+
+// The generated Go goes to standard output, which is what makes
+// `hive emit x.hive > main.go` work — and the reason progress goes to standard
+// error rather than getting in the way of it.
+proc emit(entry: Str, from: Int): void {
+	written := project.emitOnly(entry, from)
+	if written is Result.Ok(source) {
+		echo source
+	} else if written is Result.Error(errors) {
+		complain(errors)
+	}
+}
+
+proc build(entry: Str, from: Int): void {
+	written := project.compile(entry, from)
+	if len(written.errors) > 0 {
+		complain(written.errors)
+		return
+	}
+	// What it cost is part of the answer, so this one is on standard output with
+	// the rest of the answer, and is said whether anybody was watching or not.
+	echo "Compiled {entry} -> " + project.executableOf(entry) + " (" + progress.took(progress.since(from)) + ")"
+}
+
+proc run(entry: Str, args: Str[], from: Int): void {
+	answered := project.run(entry, args, from)
+	if answered is Result.Error(errors) {
+		complain(errors)
+	} else if answered is Result.Ok(code) {
+		// The program's status is this command's status: a script that runs a
+		// Hive program through `hive run` should see what the program said.
+		if code != 0 {
+			hive.term.exit(code)
+		}
+	}
+}
+
+// Named `suite` rather than `test`, because `test` is a keyword.
+proc suite(entry: Str, from: Int): void {
+	answered := project.runTests(entry, from)
+	if answered is Result.Error(errors) {
+		complain(errors)
+		return
+	}
+	if answered is Result.Ok(said) {
+		progress.step(from, "reading the report")
+		directory := project.buildDirOf(entry)
+		titles := project.testTitles(entry)
+		echo testreport.render(directory, titles, said)
+		// A failing suite is a failing command, which is what makes `hive test`
+		// the thing a commit hook or a CI step runs.
+		if testreport.allPassed(titles, said) == false {
+			hive.term.exit(1)
+		}
+	}
+}
+
+// --- Saying so ---------------------------------------------------------------
+
+proc report(errors: diag.Diagnostic[], quiet: Str, from: Int): void {
+	if len(errors) > 0 {
+		complain(errors)
+		return
+	}
+	echo quiet + " (" + progress.took(progress.since(from)) + ")"
+}
+
+// A compile error is printed exactly as the compiler wrote it: it opens with
+// `file:line:`, which is what lets an editor jump to it, and putting anything in
+// front of that would break it.
+proc complain(errors: diag.Diagnostic[]): void {
+	for each e in errors {
+		echo diag.render(e)
+	}
+	hive.term.exit(1)
+}
+
+func at(args: Str[], index: Int): Str {
+	if args bounds index {
+		return args[index]
+	}
+	return ""
+}
+
+// Everything after the entrypoint is the program's own, forwarded to it.
+func rest(args: Str[], from: Int): Str[dyn] {
+	mut Str[dyn] out = []
+	for i := from; i < len(args); i++ {
+		if args bounds i {
+			append(out, args[i])
+		}
+	}
+	return out
+}
+
+proc usage(): void {
+	echo "Hive — a table-based language that compiles to Go"
+	echo ""
+	echo "Usage:"
+	echo "  hive check <entrypoint.hive>       Report any errors, build nothing"
+	echo "  hive emit  <entrypoint.hive>       Print the generated Go source"
+	echo "  hive build <entrypoint.hive>       Compile to a native executable"
+	echo "  hive run   <entrypoint.hive> [..]  Compile and run"
+	echo "  hive test  <entrypoint.hive>       Run the program's tests, with coverage"
+}

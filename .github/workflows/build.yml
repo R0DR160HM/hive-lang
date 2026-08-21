@@ -1,0 +1,180 @@
+name: build
+
+# Hive builds Hive, so what this does is the bootstrap chain, in order: the
+# compiler from a previous release compiles this one, that compiler compiles
+# itself, and the two are checked against each other. Everything after that is
+# the tests. Which release it starts from is seed/pinned.txt; pushing a tag
+# publishes what came out, which is what the *next* build will start from.
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # The compiler is twenty-three thousand lines and the chain compiles it
+    # four times over. On a runner that is most of an hour.
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # A build writes a Go module and runs `go build` over it, so this is the
+      # only tool the compiler needs that it does not carry itself.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+
+      # Go's own caches, and the one the compiler keeps: a fetched three.js and
+      # the reader it writes for describing a Go file. Both are re-fetchable, so
+      # a cache miss costs a download rather than a failure.
+      - name: Restore the caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+            ~/.hive
+          key: hive-${{ runner.os }}-${{ hashFiles('src/**/*.hive', 'seed/pinned.txt') }}
+          restore-keys: |
+            hive-${{ runner.os }}-
+
+      # The compiler that builds this one comes from a release, pinned by tag and
+      # by digest in seed/pinned.txt. A release asset can be replaced under its
+      # own tag, so the digest is the part that matters: it is checked before the
+      # binary is run, and a mismatch fails the build rather than compiling
+      # against bytes nobody vouched for.
+      - name: Download the previous compiler
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pin=seed/pinned.txt
+          tag=$(awk '$1=="tag:"{print $2}' "$pin")
+          asset=$(awk '$1=="asset:"{print $2}' "$pin")
+          want=$(awk '$1=="sha256:"{print $2}' "$pin")
+          if [ -z "$tag" ] || [ -z "$asset" ] || [ -z "$want" ]; then
+            echo "::error file=seed/pinned.txt::$pin has to name a tag, an asset and a sha256. See seed/README.md."
+            exit 1
+          fi
+          echo "seed: $asset from $tag"
+
+          mkdir -p .seed
+          if [ "$tag" = latest ]; then
+            gh release download --pattern "$asset" --dir .seed --clobber
+          else
+            gh release download "$tag" --pattern "$asset" --dir .seed --clobber
+          fi
+
+          got=$(sha256sum ".seed/$asset" | cut -d' ' -f1)
+          if [ "$got" != "$want" ]; then
+            echo "::error file=seed/pinned.txt::$asset in $tag is not the file this repository pins. Expected $want, got $got. Nothing was compiled against it."
+            exit 1
+          fi
+          echo "digest matches the pin"
+          chmod +x ".seed/$asset"
+          echo "HIVEC=$PWD/.seed/$asset" >> "$GITHUB_ENV"
+
+      # Stage 1: the compiler, compiled by the version before it.
+      - name: Build the compiler with the previous one
+        run: ./bootstrap
+
+      # Stage 2: and now by itself, which is the one that counts — the first
+      # stage's output is Go the *downloaded* compiler wrote. Unsetting HIVEC is
+      # what makes `./bootstrap` reach for src/hivec instead.
+      - name: Build it again, with itself
+        run: HIVEC= ./bootstrap
+
+      # Stage 3 against stage 2. A difference here says the compiler does not
+      # understand something it wrote, which is a real bug and a loud one.
+      - name: Fixpoint
+        run: ./selfhost
+
+      - name: The compiler's own tests
+        run: ./test/run
+
+      # Twenty-one programs, five of them with test suites of their own. This is
+      # the step that needs a network: the SQL drivers and a scene's three.js.
+      - name: Every example
+        run: ./examples/run
+
+      # The module the compiler was compiled from is still in the build
+      # directory, so Go's cross-compilation makes the next seed for every
+      # platform — and a release's binaries — without a Hive compiler for any of
+      # them.
+      - name: Binaries for every platform
+        run: |
+          mkdir -p dist
+          cd src/hivec.hive-build
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            name="hivec-$os-$arch"
+            if [ "$os" = windows ]; then name="$name.exe"; fi
+            echo "  $name"
+            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 go build -o "../../dist/$name" .
+          done
+          cd ../..
+          cd dist && sha256sum hivec-* > SHA256SUMS && cd ..
+          cat dist/SHA256SUMS
+
+      - name: Keep them
+        uses: actions/upload-artifact@v4
+        with:
+          name: hivec
+          path: dist/
+          if-no-files-found: error
+
+  # A tag publishes. The binaries are the ones the job above cross-compiled, so
+  # what a release carries is what the tests ran against — and since a release
+  # is where the next build's compiler comes from, that matters more here than
+  # anywhere else.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: hivec
+          path: dist
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          cd dist
+          sha256sum -c SHA256SUMS
+          seed=$(awk '$2=="hivec-linux-amd64"{print $1}' SHA256SUMS)
+
+          # The notes carry the next pin, because the first thing anyone does
+          # with a release is make it the seed. printf rather than a heredoc:
+          # inside a YAML block the terminator would be indented, and bash
+          # strips tabs from those, never spaces.
+          {
+            printf 'Built by [the release before it](../../blob/%s/seed/pinned.txt),\n' "$tag"
+            printf 'then by itself, and the two agree — `./selfhost` reports a fixpoint.\n\n'
+            printf '`chmod +x` the one for your platform and put it on your PATH;\n'
+            printf '[the README](../../blob/%s/README.md#installing-it) has the rest.\n' "$tag"
+            printf 'The checksums are in `SHA256SUMS`.\n\n'
+            printf 'To bootstrap from this release, `seed/pinned.txt` becomes:\n\n'
+            printf '```\ntag:    %s\nasset:  hivec-linux-amd64\nsha256: %s\n```\n' "$tag" "$seed"
+          } > notes.md
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" hivec-* SHA256SUMS --clobber
+            gh release edit "$tag" --notes-file notes.md
+          else
+            gh release create "$tag" hivec-* SHA256SUMS \
+              --title "$tag" --notes-file notes.md
+          fi

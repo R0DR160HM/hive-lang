@@ -1,0 +1,341 @@
+// The syntax tree
+// ===============
+// What the parser produces and every pass after it reads. It is a tree of
+// values: nothing here holds a reference to anything else, so a pass that
+// rewrites part of a program builds a new tree rather than editing one in
+// place — which is what makes monomorphization a rewrite rather than a graph
+// surgery.
+//
+// Two sentinels stand in for what Hive has no `Option` to say. `Expr.Absent` is
+// an expression that was not written — a slice's missing bound, a bare
+// `return`, an `await` with no timeout — and `Stmt.Nothing` is a statement that
+// was not, which is what an omitted `for` clause is. Naming them is better than
+// a parallel `Bool` beside every field: a sentinel travels with the value it
+// stands in for, and a flag can be read without it.
+import ./token
+
+// --- Types -------------------------------------------------------------------
+
+/// One `[...]` of a vector type.
+type Dim {
+	/// `[3]` — a promise of exactly that many.
+	Fixed { size: Int }
+	/// `[dyn]` — promises nothing about the length, and guards its indexes.
+	Dynamic
+	/// `[]` — the parameter spelling: any length, of this element type.
+	Any
+}
+
+type TypeExpr {
+	/// `Str`, `T`, `Result<T, E>`, `hive.map.Map<Str, Int>`, `Str[3][2]`.
+	/// `pkg` is `""` when the name was written unqualified.
+	Named { pkg: Str, name: Str, args: TypeExpr[dyn], dims: Dim[dyn] }
+	/// `func(Int): Int` (pure) or `proc(Int): void`.
+	Fn { pure: Bool, params: TypeExpr[dyn], result: TypeExpr }
+	/// The return type that is no type at all.
+	VoidType
+}
+
+// --- Expressions -------------------------------------------------------------
+
+type BinOp {
+	Add
+	Sub
+	Mul
+	Div
+	Mod
+	Pow
+	Eq
+	Neq
+	Lt
+	Gt
+	Le
+	Ge
+	And
+	Or
+}
+
+/// A piece of an interpolated string, with its `{expression}` parsed.
+type InterpPart {
+	Literal { text: Str }
+	Expression { value: Expr }
+}
+
+/// One argument of a call: `name: value`, or positional, in which case `name`
+/// is `""`.
+type Arg {
+	name: Str
+	value: Expr
+}
+
+/// What a `using` is reading. Each form says so in the source, which is what
+/// lets the compiler pick the reader and leave the others out of the build.
+type UsingForm {
+	/// `using <path>` and `... as csv [separating by <sep>]`. The separator is
+	/// `Expr.Absent` for the default comma.
+	Csv { separator: Expr }
+	Xlsx
+	Ods
+	/// `using <conn> run <query>`
+	RunQuery { call: Expr }
+	/// `using <conn> run raw <text>`
+	Raw { sqlText: Expr }
+}
+
+type Expr {
+	IntLit { intValue: Int }
+	FloatLit { floatValue: Float }
+	StrLit { text: Str }
+	BoolLit { boolValue: Bool }
+	AtomLit { atom: Str }
+	/// A name: a variable, a callable, a module alias, a type being constructed.
+	Ident { name: Str }
+	/// `"a {b} c"`, with each hole parsed.
+	Interp { parts: InterpPart[dyn] }
+	/// `[a, b, c]`
+	VectorLit { items: Expr[dyn] }
+	/// The only prefix operator there is.
+	Negate { operand: Expr }
+	Binary { op: BinOp, left: Expr, right: Expr }
+	Call { callee: Expr, args: Arg[dyn] }
+	Member { subject: Expr, field: Str }
+	Index { subject: Expr, index: Expr }
+	/// `v[low:high]`, both bounds inclusive and either one possibly `Absent`.
+	Slice { subject: Expr, low: Expr, high: Expr }
+	IsMatch { subject: Expr, pattern: Pattern }
+	/// `await [f(a), f(b)] [with timeout ms]`
+	AwaitAll { calls: Expr[dyn], timeout: Expr }
+	/// `f(x) with timeout ms`
+	Timed { call: Expr, ms: Expr }
+	/// `hive.json.parse(t) with User` — a decode target, not a timeout.
+	WithType { value: Expr, target: TypeExpr }
+	UsingExpr { source: Expr, form: UsingForm }
+	/// `_` in a call's argument list, which makes the call a partial
+	/// application.
+	Hole
+	/// An expression that was not written.
+	Absent
+}
+
+// --- Patterns ----------------------------------------------------------------
+
+/// One position of a vector pattern.
+type VecElem {
+	/// A literal the element has to equal.
+	Match { value: Expr }
+	/// A name to bind it to, or `_` to skip it.
+	Bind { name: Str }
+}
+
+type Pattern {
+	/// `Result.Ok(v)`, `Shape.Circle(r)`, `text.Align.Left`. `bindings` is
+	/// empty when the variant carries nothing or was written without an
+	/// argument list.
+	Constructor { path: Str[dyn], bindings: Str[dyn], parenthesised: Bool }
+	/// `["a", x, ...rest]`. `rest` is `""` when no `...` was written, which is
+	/// what makes the length exact rather than a lower bound.
+	VectorPat { elements: VecElem[dyn], rest: Str }
+	/// `"/users/{id}/posts/{postId}"` — literal text and binding holes.
+	StrTemplate { parts: token.StrPart[dyn] }
+}
+
+// --- Statements --------------------------------------------------------------
+
+/// A `{ ... }`. A struct rather than a bare vector so a field holding one reads
+/// as what it is, and so an empty body is an ordinary value.
+type Block {
+	stmts: Stmt[dyn]
+}
+
+/// One `if`/`else if` of a chain.
+type Branch {
+	condition: Expr
+	body: Block
+}
+
+type Stmt {
+	/// `x := v` / `mut x := v`. `deferred` is `x := async f(v)`, whose wait
+	/// happens wherever `x` is read.
+	VarDecl { name: Str, value: Expr, mutable: Bool, deferred: Bool }
+	/// `T x = v` / `mut T x = v`.
+	TypedDecl { declared: TypeExpr, name: Str, value: Expr, mutable: Bool, deferred: Bool }
+	/// `x = v`, `v[i] = v`, `rec.f = v`. Compound assignment and `++`/`--` are
+	/// desugared into this by the parser, so nothing after it has four more
+	/// shapes to know about.
+	Assign { target: Expr, value: Expr }
+	/// An `if`/`else if` chain, with `otherwise` used only when `hasElse`.
+	IfChain { branches: Branch[dyn], otherwise: Block, hasElse: Bool }
+	/// `for init; cond; post { }`. Any clause may be `Stmt.Nothing` /
+	/// `Expr.Absent`, which is how a while loop is written.
+	ForLoop { init: Stmt, cond: Expr, post: Stmt, body: Block }
+	/// `for each name[: T] in subject { }`. `declared` is `TypeExpr.VoidType` when
+	/// no annotation was written.
+	ForEach { name: Str, declared: TypeExpr, subject: Expr, body: Block }
+	/// `return [value]` — `Expr.Absent` for a bare one.
+	ReturnStmt { value: Expr }
+	EchoStmt { value: Expr }
+	AssertStmt { condition: Expr }
+	PanicStmt { value: Expr }
+	BreakStmt
+	ContinueStmt
+	/// `async f(x)` as a statement: fire-and-forget.
+	AsyncStmt { call: Expr }
+	/// A call standing on its own, its result discarded.
+	Expression { value: Expr }
+	/// A statement that was not written.
+	Nothing
+}
+
+// --- Declarations ------------------------------------------------------------
+
+type Param {
+	name: Str
+	declared: TypeExpr
+	/// `v: mut T` — the mutex itself, which only a `proc` may ask for.
+	mutex: Bool
+}
+
+type Field {
+	name: Str
+	declared: TypeExpr
+}
+
+type Variant {
+	name: Str
+	fields: Field[dyn]
+}
+
+type CallableKind {
+	ProcKind
+	FuncKind
+}
+
+type Decl {
+	/// `type T { ... }`. No variants is a struct; `fields` outside any variant
+	/// are added to every one of them.
+	TypeDecl { name: Str, fields: Field[dyn], variants: Variant[dyn], line: Int }
+	/// A `proc` or a `func`.
+	CallableDecl { kind: CallableKind, name: Str, params: Param[dyn], result: TypeExpr, body: Block, line: Int }
+	/// A function in an imported Go file, as the `func` Hive calls. What the
+	/// compiler needs of it is its *signature*, read off the file by the Go
+	/// toolchain and mapped onto Hive types — so every call to it is checked like
+	/// any other. The emitter writes a wrapper of this name that copies each
+	/// argument on the way in and the answer on the way out, which is what keeps
+	/// a mutation on the far side from being a mutation of a Hive value.
+	///
+	/// It is a `func` rather than a `proc` because of that copying: what a `func`
+	/// promises is that it cannot write to storage its caller can see, and
+	/// nothing on the other side of a copy can.
+	ForeignDecl { name: Str, params: Param[dyn], result: TypeExpr, packageName: Str, symbol: Str, goResults: Int, line: Int }
+	/// A `query`, whose body is SQL and whose return type describes its rows.
+	QueryDecl { name: Str, params: Param[dyn], result: TypeExpr, sql: SqlPart[dyn], line: Int }
+	/// `test "..." { }` — named in prose, taking nothing and returning nothing.
+	TestDecl { title: Str, body: Block, line: Int }
+}
+
+// --- Query bodies ------------------------------------------------------------
+//
+// A query body is SQL with two things in it that are not: a value being bound,
+// and a block of predicates that are each present or absent. Neither is ever
+// text — a bound value becomes a placeholder, and a predicate's text is fixed at
+// compile time while only *which* predicates are taken is decided at run time.
+
+type SqlPart {
+	/// Text the database reads exactly as written.
+	Lit { text: Str }
+	/// `{expr}`: a placeholder in the text, and the value bound beside it.
+	Param { value: Expr }
+	/// `WHERE { ... }`, which disappears entirely when nothing in it holds.
+	Where { group: SqlGroup }
+}
+
+/// A group of predicates and how they join: `WHERE` and `and` are a
+/// conjunction, `or` is not.
+type SqlGroup {
+	conjunction: Bool
+	items: SqlItem[dyn]
+}
+
+type SqlItem {
+	/// `if <condition> { <sql> }`
+	Cond { condition: Expr, body: SqlPart[dyn] }
+	/// `or { ... }` / `and { ... }`, whose own connective is its group's.
+	Nested { group: SqlGroup }
+}
+
+type ImportLine {
+	path: Str
+	alias: Str
+	line: Int
+}
+
+type Module {
+	imports: ImportLine[dyn]
+	decls: Decl[dyn]
+	/// The Go files this program imports. Nothing in one is Hive, so none of it
+	/// is a declaration here — this is what the build needs in order to compile
+	/// them beside the program.
+	foreign: Foreign[dyn]
+}
+
+/// One imported Go file: the package it declares, where it is, whether it needs
+/// anything from outside Go's own standard library, and the structs Hive mirrors
+/// from it — each named as Hive spells it, which is how Go spells it too.
+type Foreign {
+	packageName: Str
+	path: Str
+	thirdParty: Bool
+	types: Str[dyn]
+}
+
+// --- Reading a tree back -----------------------------------------------------
+
+/// The name a declaration is known by. A test has none — it is named in prose,
+/// which is documentation rather than something anything calls — so it answers
+/// with its title in quotes, which is what a message about it should say.
+func declName(d: Decl): Str {
+	if d is Decl.TypeDecl(name, _, _, _) { return name }
+	else if d is Decl.CallableDecl(_, name, _, _, _, _) { return name }
+	else if d is Decl.QueryDecl(name, _, _, _, _) { return name }
+	else if d is Decl.ForeignDecl(name, _, _, _, _, _, _) { return name }
+	else if d is Decl.TestDecl(title, _, _) { return "\"{title}\"" }
+	return ""
+}
+
+func declLine(d: Decl): Int {
+	if d is Decl.TypeDecl(_, _, _, line) { return line }
+	else if d is Decl.CallableDecl(_, _, _, _, _, line) { return line }
+	else if d is Decl.QueryDecl(_, _, _, _, line) { return line }
+	else if d is Decl.ForeignDecl(_, _, _, _, _, _, line) { return line }
+	else if d is Decl.TestDecl(_, _, line) { return line }
+	return 0
+}
+
+/// Whether a type declaration is a tagged union rather than a struct. It is the
+/// one question about a type that decides how everything else reads it, and the
+/// declaration answers it by whether it wrote any variants.
+func isUnion(d: Decl): Bool {
+	if d is Decl.TypeDecl(_, _, variants, _) {
+		return len(variants) > 0
+	}
+	return false
+}
+
+/// The operator a `BinOp` was written as.
+func opSpelling(op: BinOp): Str {
+	if op is BinOp.Add { return "+" }
+	else if op is BinOp.Sub { return "-" }
+	else if op is BinOp.Mul { return "*" }
+	else if op is BinOp.Div { return "/" }
+	else if op is BinOp.Mod { return "%" }
+	else if op is BinOp.Pow { return "**" }
+	else if op is BinOp.Eq { return "==" }
+	else if op is BinOp.Neq { return "!=" }
+	else if op is BinOp.Lt { return "<" }
+	else if op is BinOp.Gt { return ">" }
+	else if op is BinOp.Le { return "<=" }
+	else if op is BinOp.Ge { return ">=" }
+	else if op is BinOp.And { return "&&" }
+	else if op is BinOp.Or { return "||" }
+	return ""
+}

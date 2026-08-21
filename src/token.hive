@@ -1,0 +1,234 @@
+// Tokens
+// ======
+// What the lexer produces and the parser consumes. A `Kind` says what a token
+// is and carries whatever it holds; a `Token` pairs one with the line it was
+// written on, which is the only position the front end tracks.
+//
+// `Kind` is a tagged union rather than a tag and a bag of optional fields,
+// which buys two things. A variant that carries nothing carries nothing —
+// there is no `LBrace` with an unused `value` beside it — and `==` compares two
+// kinds structurally, so the parser's `expect(p, token.RBrace())` is an
+// ordinary comparison rather than a match with one interesting arm.
+
+// A piece of an interpolated string: literal text, or the source of a
+// `{expression}` for the parser to finish.
+type StrPart {
+	Literal { text: Str }
+	Code { source: Str }
+}
+
+type Kind {
+	// --- Literals and names -------------------------------------------------
+	Ident { name: Str }
+	IntLit { intValue: Int }
+	FloatLit { floatValue: Float }
+	/// A `"..."` or backtick string holding no interpolation.
+	StrLit { text: Str }
+	/// A `"..."` string holding at least one `{expression}`.
+	StrParts { parts: StrPart[dyn] }
+	/// `#Name`, without the `#`.
+	AtomLit { atom: Str }
+	/// An import path, captured whole: `.`, `..` and `/` would each otherwise
+	/// lex as an operator.
+	PathLit { path: Str }
+	/// A `query` body, captured whole: it is SQL, not Hive statements.
+	SqlBody { sql: Str }
+
+	// --- Keywords -----------------------------------------------------------
+	KwImport
+	KwProc
+	KwFunc
+	KwQuery
+	KwTest
+	KwType
+	KwIf
+	KwElse
+	KwReturn
+	KwIs
+	KwUsing
+	KwWith
+	KwVoid
+	KwTrue
+	KwFalse
+	KwEcho
+	KwAssert
+	KwPanic
+	KwDyn
+	KwMut
+	KwAsync
+	KwAwait
+	KwFor
+	KwIn
+	KwEach
+	KwBounds
+	KwBreak
+	KwContinue
+
+	// --- Operators, longest first -------------------------------------------
+	Ellipsis
+	ColonEq
+	Ge
+	Le
+	EqEq
+	NotEq
+	StarStar
+	AmpAmp
+	PipePipe
+	PlusPlus
+	MinusMinus
+	PlusEq
+	MinusEq
+	StarEq
+	SlashEq
+
+	// --- Punctuation --------------------------------------------------------
+	LBrace
+	RBrace
+	LParen
+	RParen
+	LBracket
+	RBracket
+	Colon
+	Semicolon
+	Comma
+	Dot
+	Gt
+	Lt
+	Assign
+	Plus
+	Minus
+	Star
+	Slash
+	Percent
+
+	Eof
+}
+
+type Token {
+	kind: Kind
+	line: Int
+}
+
+// How a token reads in a message. A parser's "expected `)` but found ..." is
+// only as useful as this is, so a literal names what it holds rather than what
+// it is: `the number 3` beats `an integer literal`.
+func describe(k: Kind): Str {
+	if k is Kind.Ident(name) { return "`{name}`" }
+	else if k is Kind.IntLit(v) { return "the number {v}" }
+	else if k is Kind.FloatLit(v) { return "the number {v}" }
+	else if k is Kind.StrLit(_) { return "a string" }
+	else if k is Kind.StrParts(_) { return "an interpolated string" }
+	else if k is Kind.AtomLit(atom) { return "`#{atom}`" }
+	else if k is Kind.PathLit(path) { return "the path `{path}`" }
+	else if k is Kind.SqlBody(_) { return "a query body" }
+	else if k is Kind.Eof { return "the end of the file" }
+	return "`{spelling(k)}`"
+}
+
+// The source text a keyword or operator was written as. A literal has none —
+// its spelling is whatever the author typed — so this answers `""` for one and
+// `describe` is what a message should reach for instead.
+func spelling(k: Kind): Str {
+	if k is Kind.KwImport { return "import" }
+	else if k is Kind.KwProc { return "proc" }
+	else if k is Kind.KwFunc { return "func" }
+	else if k is Kind.KwQuery { return "query" }
+	else if k is Kind.KwTest { return "test" }
+	else if k is Kind.KwType { return "type" }
+	else if k is Kind.KwIf { return "if" }
+	else if k is Kind.KwElse { return "else" }
+	else if k is Kind.KwReturn { return "return" }
+	else if k is Kind.KwIs { return "is" }
+	else if k is Kind.KwUsing { return "using" }
+	else if k is Kind.KwWith { return "with" }
+	else if k is Kind.KwVoid { return "void" }
+	else if k is Kind.KwTrue { return "true" }
+	else if k is Kind.KwFalse { return "false" }
+	else if k is Kind.KwEcho { return "echo" }
+	else if k is Kind.KwAssert { return "assert" }
+	else if k is Kind.KwPanic { return "panic" }
+	else if k is Kind.KwDyn { return "dyn" }
+	else if k is Kind.KwMut { return "mut" }
+	else if k is Kind.KwAsync { return "async" }
+	else if k is Kind.KwAwait { return "await" }
+	else if k is Kind.KwFor { return "for" }
+	else if k is Kind.KwIn { return "in" }
+	else if k is Kind.KwEach { return "each" }
+	else if k is Kind.KwBounds { return "bounds" }
+	else if k is Kind.KwBreak { return "break" }
+	else if k is Kind.KwContinue { return "continue" }
+	return operatorSpelling(k)
+}
+
+func operatorSpelling(k: Kind): Str {
+	if k is Kind.Ellipsis { return "..." }
+	else if k is Kind.ColonEq { return ":=" }
+	else if k is Kind.Ge { return ">=" }
+	else if k is Kind.Le { return "<=" }
+	else if k is Kind.EqEq { return "==" }
+	else if k is Kind.NotEq { return "!=" }
+	else if k is Kind.StarStar { return "**" }
+	else if k is Kind.AmpAmp { return "&&" }
+	else if k is Kind.PipePipe { return "||" }
+	else if k is Kind.PlusPlus { return "++" }
+	else if k is Kind.MinusMinus { return "--" }
+	else if k is Kind.PlusEq { return "+=" }
+	else if k is Kind.MinusEq { return "-=" }
+	else if k is Kind.StarEq { return "*=" }
+	else if k is Kind.SlashEq { return "/=" }
+	else if k is Kind.LBrace { return "\{" }
+	else if k is Kind.RBrace { return "}" }
+	else if k is Kind.LParen { return "(" }
+	else if k is Kind.RParen { return ")" }
+	else if k is Kind.LBracket { return "[" }
+	else if k is Kind.RBracket { return "]" }
+	else if k is Kind.Colon { return ":" }
+	else if k is Kind.Semicolon { return ";" }
+	else if k is Kind.Comma { return "," }
+	else if k is Kind.Dot { return "." }
+	else if k is Kind.Gt { return ">" }
+	else if k is Kind.Lt { return "<" }
+	else if k is Kind.Assign { return "=" }
+	else if k is Kind.Plus { return "+" }
+	else if k is Kind.Minus { return "-" }
+	else if k is Kind.Star { return "*" }
+	else if k is Kind.Slash { return "/" }
+	else if k is Kind.Percent { return "%" }
+	return ""
+}
+
+// The keyword a word spells, if it spells one. Every keyword in Hive is lower
+// case and only lower case, so this is asked with the word exactly as written
+// and again lower-cased — a word that answers only the second time is a keyword
+// shouted, which is a mistake worth naming rather than a name.
+func keywordOf(word: Str): Result<Kind, Bool> {
+	if word == "import" { return Result.Ok(Kind.KwImport()) }
+	else if word == "proc" { return Result.Ok(Kind.KwProc()) }
+	else if word == "func" { return Result.Ok(Kind.KwFunc()) }
+	else if word == "query" { return Result.Ok(Kind.KwQuery()) }
+	else if word == "test" { return Result.Ok(Kind.KwTest()) }
+	else if word == "type" { return Result.Ok(Kind.KwType()) }
+	else if word == "if" { return Result.Ok(Kind.KwIf()) }
+	else if word == "else" { return Result.Ok(Kind.KwElse()) }
+	else if word == "return" { return Result.Ok(Kind.KwReturn()) }
+	else if word == "is" { return Result.Ok(Kind.KwIs()) }
+	else if word == "using" { return Result.Ok(Kind.KwUsing()) }
+	else if word == "with" { return Result.Ok(Kind.KwWith()) }
+	else if word == "void" { return Result.Ok(Kind.KwVoid()) }
+	else if word == "true" { return Result.Ok(Kind.KwTrue()) }
+	else if word == "false" { return Result.Ok(Kind.KwFalse()) }
+	else if word == "echo" { return Result.Ok(Kind.KwEcho()) }
+	else if word == "assert" { return Result.Ok(Kind.KwAssert()) }
+	else if word == "panic" { return Result.Ok(Kind.KwPanic()) }
+	else if word == "dyn" { return Result.Ok(Kind.KwDyn()) }
+	else if word == "mut" { return Result.Ok(Kind.KwMut()) }
+	else if word == "async" { return Result.Ok(Kind.KwAsync()) }
+	else if word == "await" { return Result.Ok(Kind.KwAwait()) }
+	else if word == "for" { return Result.Ok(Kind.KwFor()) }
+	else if word == "in" { return Result.Ok(Kind.KwIn()) }
+	else if word == "each" { return Result.Ok(Kind.KwEach()) }
+	else if word == "bounds" { return Result.Ok(Kind.KwBounds()) }
+	else if word == "break" { return Result.Ok(Kind.KwBreak()) }
+	else if word == "continue" { return Result.Ok(Kind.KwContinue()) }
+	return Result.Error(false)
+}

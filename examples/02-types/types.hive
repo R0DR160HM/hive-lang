@@ -1,0 +1,275 @@
+// The types
+// =========
+// Every type Hive has, in one program: strings, vectors, atoms, numbers, bools,
+// maps, the types you declare yourself, and the one wrapper that is not a type
+// so much as a permission — `Mutex<T>`.
+import hive.map
+
+proc main(): void {
+	echo strings()
+	echo vectors()
+	echo unsized(["a", "b"])
+	echo atoms()
+	echo numbers()
+	echo conversions()
+	echo bools()
+	echo declared()
+	echo maps()
+	echo mutability()
+	echo concurrency()
+}
+
+func strings(): Str {
+	// A Str is UTF-8, always, and it is characters rather than bytes: `len`
+	// counts characters and `bytes` counts bytes, and for "café" they differ.
+	Str one = "Text 1"
+	two := "Text 2"
+
+	// Interpolation takes any value, not just a Str.
+	three := "{two} came after {one}, and there are {len(two)} characters in it"
+
+	// A backtick string spans lines, and the indentation you wrote it at is
+	// removed at compile time — so a multi-line string in an indented block is
+	// not indented text.
+	four := `
+		This
+		is
+		a
+		multiline
+		string
+	`
+
+	// `+` concatenates. There is no `+=` on an immutable name, because there is
+	// no writing to one at all.
+	five := one + " " + two
+	echo "{len("café")} characters, {bytes("café")} bytes"
+	echo split(five, " ")
+	echo three
+	echo four
+	return "Strings!"
+}
+
+func vectors(): Str[3] {
+	// A vector's length is part of its type, and there are three spellings of
+	// it. A declared one is a promise kept everywhere: every value that lands in
+	// a `Str[2]` slot is two long, which is what lets `[1]` be read with no
+	// check at all.
+	Str[2] fixed = ["Hello", "World"]
+	inferred := ["Hello", "World"]
+
+	// `[dyn]` is the growable one. Its length is not known, so every index into
+	// it is guarded — that is the price of `append`.
+	Str[dyn] growable = ["Hello", "World"]
+
+	// `+` concatenates, and always into a new vector. Two known lengths add up,
+	// so this one is a `Str[5]` and can be indexed freely.
+	greeting := ["Hello", "Darkness"] + ["my", "old", "friend"]
+
+	echo fixed[1]
+	echo inferred[0]
+	if growable bounds 0 {
+		echo growable[0]
+	}
+	echo greeting[4]
+	// `Table` is the name for `Str[dyn][dyn]` — a vector of rows of cells.
+	Table grid = [["a", "b"], ["c", "d"]]
+	echo grid
+	return ["Vectors", "for the", "Win!"]
+}
+
+// `Str[]` is a parameter-only spelling: "a vector of Str, some length". It takes
+// a `Str[2]`, a `Str[dyn]` or anything else of the right element type, so a
+// helper like this need not be written twice. The trade is that it promises
+// nothing, so every access into it is guarded — unlike a `Str[3]` parameter,
+// whose length every call site is held to.
+func unsized(values: Str[]): Str {
+	if values bounds 0 {
+		return "first of {len(values)}: {values[0]}"
+	}
+	return "nothing at all"
+}
+
+func atoms(): Atom {
+	// An atom is a bare label: a `#` and a name, and no whitespace between.
+	Atom one = #Atom1
+	two := #Atom2
+
+	// The compiler keeps a table of them and gives each the smallest value it
+	// can, so comparing two atoms is comparing two numbers. The table travels
+	// with the program so `echo` can still show the name.
+	//
+	// `#Nil` is the only atom the language provides and is always first. Every
+	// other one exists because a program mentioned it.
+	// In a concatenation an atom is its number, and `#Nil`'s is 0.
+	assert "0" + #Nil == "00"
+	Atom[2] both = [#SomeAtom, #SomeOtherAtom]
+	echo both
+
+	// An atom is a label rather than a yes or a no, so it is never a condition
+	// on its own — compare it with the one you mean.
+	if one == #Atom1 && two != #Atom1 {
+		echo "atoms are compared, never tested on their own"
+	}
+	return #Nil
+}
+
+func numbers(): Float {
+	// Two number types, and no widening between them behind your back.
+	Int whole = 1
+	alsoWhole := 2
+	Float fraction = 1.0
+	alsoFraction := 2.0
+
+	// `+ - * / % **` all work on both. An Int `/` is integer division, and
+	// dividing by zero is 0 rather than a crash — there is no exception in the
+	// language for it to be.
+	echo 7 / 2
+	echo 7 / 0
+	echo -7 % 3
+	echo 2 ** 10
+	echo whole + alsoWhole
+	return fraction + alsoFraction
+}
+
+func conversions(): Str {
+	// `hive.conv` is the whole of the conversion story.
+
+	// Rounding a Float to an Int: `ceil` up, `floor` down, `round` to nearest
+	// (halves away from zero).
+	Int up = hive.conv.ceil(2.1)
+	down := hive.conv.floor(2.9)
+	nearest := hive.conv.round(2.5)
+
+	// `itf` widens an Int to a Float; `its` and `fts` render either as a Str —
+	// though interpolation does that for you.
+	Float widened = hive.conv.itf(nearest)
+	rendered := hive.conv.its(up) + " " + hive.conv.fts(widened)
+
+	// Parsing is fallible, so it answers with a Result: `sti` for an Int, `stf`
+	// for a Float.
+	amount := hive.conv.sti("42")
+	half := hive.conv.stf("0.5")
+	if amount is Result.Ok(number) && half is Result.Ok(part) {
+		return "{rendered}, floor {down}, parsed {number} and {part}"
+	} else if amount is Result.Error(error) {
+		// A ConversionError carries the offending input and a message.
+		return "could not parse {error.input}: {error.message}"
+	}
+	return "unreachable: a Result is one or the other"
+}
+
+func bools(): Bool {
+	// `true` and `false` are the only Bools, and `&&`, `||` and every
+	// comparison answer with one. Nothing else is a condition: not an Int, not
+	// an empty vector, not an atom.
+	Bool yes = true
+	no := false
+	return yes || no
+}
+
+// A type with no variants is a struct.
+type Item {
+	name: Str
+	pence: Int
+}
+
+// A type with variants is a tagged union, and a field outside every variant
+// belongs to all of them.
+type Event {
+	Added {
+		item: Item
+	}
+	Removed {
+		name: Str
+	}
+	Cleared
+
+	at: Int
+}
+
+func declared(): Str {
+	// A constructor is reached through the type's name. Arguments can be given
+	// by name, and only the unnamed ones have to be in order.
+	beeswax := Item(name: "Beeswax", pence: 450)
+	added := Event.Added(beeswax, 1)
+
+	// `is` narrows a value to one variant and binds its fields, and the
+	// bindings are usable in the rest of the same condition.
+	if added is Event.Added(item, at) && item.pence > 100 {
+		return "{item.name} at {item.pence}p, event {at}"
+	} else if added is Event.Removed(name, _) {
+		return "removed {name}"
+	} else if added is Event.Cleared(_) {
+		return "cleared"
+	}
+	return "unreachable: those are all three variants"
+}
+
+func maps(): Str {
+	// A map is the one collection that is not a vector, so it has a module
+	// rather than a literal. It keeps the order its keys were first set.
+	mut hive.map.Map<Str, Int> tally = hive.map.new()
+	for each word in ["bee", "hive", "bee"] {
+		if hive.map.get(tally, word) is Result.Ok(seen) {
+			hive.map.set(tally, word, seen + 1)
+		} else {
+			hive.map.set(tally, word, 1)
+		}
+	}
+	return "{len(tally)} keys, in the order they arrived: {tally}"
+}
+
+proc mutability(): Str {
+	// Every binding is immutable unless it says otherwise. `mut` makes it a
+	// `Mutex<T>`, which is not a lock and costs nothing at runtime: it is the
+	// compile-time permission to write. Anything taking a `T` takes a
+	// `Mutex<T>`, and never the other way about.
+	mut fixed := ["Hello", "World"]
+	// Allowed because the compiler knows the vector is two long, so `0` is in it.
+	fixed[0] = "Hive!"
+
+	mut Str[dyn] growable = ["My", "name"]
+	// `append` only compiles on a mutable dynamic vector. `prepend` is its other
+	// end, and `drop` takes a range back out — inclusive both sides, and proved
+	// in range like any slice.
+	append(growable, "is")
+	prepend(growable, "Well,")
+	if growable bounds 0 {
+		echo drop(growable, 0, 0)
+	}
+
+	// `indexOf` answers with a Result whose Ok payload is a position the vector
+	// really has — so it is already a proven index, and needs no guard to read
+	// or write through, however many statements later the answer is matched.
+	found := indexOf(growable, "name")
+	if found is Result.Ok(i) {
+		growable[i] = "surname"
+	} else if found is Result.Error(_) {
+		echo "no such element"
+	}
+
+	mut language := "Gleam? Go?"
+	language = "Hive!"
+	return join(growable + [language], " ")
+}
+
+proc concurrency(): Str {
+	mut text := "Dog"
+
+	// Every call blocks the thread that made it, and the caller decides
+	// otherwise. `async` on its own is fire-and-forget: its own virtual thread,
+	// and nothing comes back.
+	async slow(text)
+	text = "Hello"
+	// Waited for, because that is what a call is.
+	text = slow(text)
+	return text
+}
+
+// Being a `func`, `slow` cannot take a mutex, so the `Mutex<Str>` above is seen
+// here as an ordinary `Str`. Nothing in the declaration says how it runs: the
+// same one serves both call sites.
+func slow(text: Str): Str {
+	hive.task.sleep(50)
+	return text + " World!"
+}

@@ -1,0 +1,224 @@
+// A password manager for one person and one terminal: an encrypted file, a
+// master password that never appears on screen, and six commands.
+//
+//     hive run vault.hive
+//
+// The whole vault is one AES-256-GCM message (`hive.crypto.encrypt`) whose key
+// comes from the master password. Nothing is written in the clear and nothing
+// is kept anywhere else: what is not in `vault.dat` is not stored.
+//
+// The master password and every secret are read with `hive.term.readSecret`,
+// which is `hive.term.read` with the terminal's echo turned off — so what is
+// typed at those prompts is not left on the screen, nor in the scrollback of
+// whoever walks past afterwards.
+
+// The vault as it is JSON-encoded before being encrypted: `hive.json.encode`
+// derives the encoder from these types and `hive.json.parse ... with Vault`
+// derives the decoder, so the file format is these declarations and nothing
+// else.
+type Entry {
+	name: Str
+	secret: Str
+}
+
+type Vault {
+	entries: Entry[dyn]
+}
+
+// Where the vault lives, relative to this program's folder — which is where
+// `hive run` starts it, and where a built executable is launched from.
+func file(): Str {
+	return "vault.dat"
+}
+
+proc main(): void {
+	echo "hive vault — {file()}"
+
+	// An existing vault asks for its master password once and finds out whether
+	// it was right by trying to open it; a new one asks twice, below.
+	if hive.file.exists(file()) {
+		echo "Master password:"
+		master := hive.term.readSecret()
+		opened := open(master)
+		if opened is Result.Error(problem) {
+			echo problem
+			return
+		}
+		if opened is Result.Ok(vault) {
+			echo "{len(vault.entries)} entries unlocked."
+			run(vault, master)
+		}
+		return
+	}
+
+	created := create()
+	if created is Result.Error(problem) {
+		echo problem
+		return
+	}
+	if created is Result.Ok(master) {
+		run(Vault([]), master)
+	}
+}
+
+// The command loop. `read` shows what is typed — a command is not a secret —
+// and the secrets themselves are read with `readSecret` further down.
+proc run(vault: Vault, master: Str): void {
+	echo "Commands: list, get <name>, add <name>, gen <name>, del <name>, quit"
+
+	mut Vault open = vault
+	for ;; {
+		echo ""
+		echo "vault>"
+		line := hive.term.read()
+
+		// End of input (`hive run < commands.txt`, or a Ctrl-D at the prompt)
+		// leaves as `quit` does, rather than spinning on an empty read.
+		if line == "" || line == "quit" {
+			echo "locked."
+			return
+		}
+
+		if line == "list" {
+			if len(open.entries) == 0 {
+				echo "(empty)"
+			}
+			for each entry in open.entries {
+				echo "  {entry.name}"
+			}
+			continue
+		}
+
+		// A string pattern with a hole matches the shape and binds the rest:
+		// `get github` binds name to "github".
+		if line is "get {name}" {
+			found := secretOf(open.entries, name)
+			if found is Result.Ok(secret) {
+				echo "{name}: {secret}"
+			} else {
+				echo "no entry named {name}"
+			}
+			continue
+		}
+
+		if line is "add {name}" {
+			echo "Secret for {name}:"
+			secret := hive.term.readSecret()
+			if secret == "" {
+				echo "nothing typed — {name} left alone"
+				continue
+			}
+			open = save(replace(open, name, secret), master)
+			echo "{name} saved"
+			continue
+		}
+
+		if line is "gen {name}" {
+			// 24 random bytes as hex. `randomHex` is the cryptographically
+			// random one, which is the only kind worth putting in a vault.
+			secret := hive.crypto.randomHex(24)
+			open = save(replace(open, name, secret), master)
+			echo "{name}: {secret}"
+			continue
+		}
+
+		if line is "del {name}" {
+			if secretOf(open.entries, name) is Result.Error(_) {
+				echo "no entry named {name}"
+				continue
+			}
+			open = save(Vault(without(open.entries, name)), master)
+			echo "{name} deleted"
+			continue
+		}
+
+		echo "don't know `{line}` — try list, get, add, gen, del or quit"
+	}
+}
+
+// Asks for a master password twice and writes the empty vault it opens, so that
+// a typo in a password nothing has been stored under yet is caught while it
+// still costs nothing. Answers with the password the vault was created under.
+proc create(): Result<Str, Str> {
+	echo "No vault here yet. Choose a master password:"
+	master := hive.term.readSecret()
+	if len(master) < 8 {
+		return Result.Error("a master password of at least 8 characters, please")
+	}
+
+	echo "Type it again:"
+	if hive.term.readSecret() != master {
+		return Result.Error("those two do not match — nothing was created")
+	}
+
+	save(Vault([]), master)
+	echo "created."
+	return Result.Ok(master)
+}
+
+// Reads the vault and opens it, or says what went wrong in a sentence.
+proc open(master: Str): Result<Vault, Str> {
+	read := hive.file.read(file())
+	if read is Result.Error(problem) {
+		return Result.Error("could not read {file()}: {problem.message}")
+	} else if read is Result.Ok(sealed) {
+		// A wrong password and a file edited since it was written both fail the
+		// authentication tag, and it cannot say which of the two happened — so
+		// neither can this.
+		opened := hive.crypto.decrypt(sealed, master)
+		if opened is Result.Error(_) {
+			return Result.Error("wrong master password, or {file()} has been tampered with")
+		} else if opened is Result.Ok(plain) {
+			parsed := hive.json.parse(plain) with Vault
+			if parsed is Result.Ok(vault) {
+				return Result.Ok(vault)
+			} else if parsed is Result.Error(problem) {
+				return Result.Error("{file()} decrypted but did not hold a vault ({problem.path}: expected {problem.expected})")
+			}
+		}
+	}
+}
+
+// Encrypts the whole vault and writes it out, and hands the vault back so a
+// caller can go on using it. Every save draws a fresh salt and nonce, so two
+// saves of the same entries look nothing alike on disk.
+proc save(vault: Vault, master: Str): Vault {
+	sealed := hive.crypto.encrypt(hive.json.encode(vault), master)
+	if hive.file.write(file(), sealed) is Result.Error(problem) {
+		// Carrying on would leave the entry in memory only, and the next `get`
+		// would answer with something the file does not have.
+		panic problem
+	}
+	return vault
+}
+
+// The vault with `name` set to `secret`, replacing any entry already under that
+// name. Values are copied on binding, so this builds a new vault rather than
+// changing the one it was given.
+func replace(vault: Vault, name: Str, secret: Str): Vault {
+	mut Entry[dyn] entries = without(vault.entries, name)
+	append(entries, Entry(name, secret))
+	return Vault(entries)
+}
+
+// Every entry except the one named.
+func without(entries: Entry[], name: Str): Entry[dyn] {
+	mut Entry[dyn] kept = []
+	for each entry in entries {
+		if entry.name != name {
+			append(kept, entry)
+		}
+	}
+	return kept
+}
+
+// The secret stored under `name`, or `Error(false)` if there is none — the same
+// shape the builtin `indexOf` answers a failed search with.
+func secretOf(entries: Entry[], name: Str): Result<Str, Bool> {
+	for each entry in entries {
+		if entry.name == name {
+			return Result.Ok(entry.secret)
+		}
+	}
+	return Result.Error(false)
+}

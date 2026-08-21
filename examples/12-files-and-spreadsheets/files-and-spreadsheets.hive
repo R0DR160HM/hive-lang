@@ -1,0 +1,122 @@
+// Files and spreadsheets
+// ======================
+// `using` reads a table, and says in the source which kind it is reading:
+//
+//   using <path>                                 a comma-separated CSV
+//   using <path> as csv separating by <sep>      a CSV with another separator
+//   using <path> as xlsx                         every sheet of an Excel workbook
+//   using <path> as ods                          every table of an OpenDocument one
+//   using <connection> run <query>               SQL on an open connection
+//
+// Naming the format is what lets the compiler pick the reader — and leave the
+// spreadsheet machinery out of a build that never asks for a spreadsheet.
+//
+// A CSV is one table, so it comes back as a `Table`. A workbook holds many, so
+// xlsx and ods come back as a `Table[dyn]`: one Table per sheet, in the order the
+// document keeps them.
+
+proc main(): void {
+	readWorkbook()
+	readOpenDocument()
+	writeAndReadFiles()
+}
+
+proc readWorkbook(): void {
+	echo "--- stock.xlsx ---"
+	// Result<Table[dyn], hive.TableError> — a vector of tables.
+	book := using "stock.xlsx" as xlsx
+	if book is Result.Error(error) {
+		echo "could not read it: {error.message}"
+		return
+	} else if book is Result.Ok(sheets) {
+		echo "the workbook holds {len(sheets)} sheets"
+		// The first sheet is a headered table like any other, so `column` and
+		// `row` work on it unchanged.
+		if len(sheets) > 0 {
+			stock := sheets[0]
+			// `column` and `row` look a value up by its heading and yield an
+			// empty vector rather than failing when nothing matches. A column
+			// arrives with the heading cell it matched on still at the front.
+			echo "items:     " + join(column(stock, "item"), ", ")
+			// Excel keeps a date as a day count; Hive reads the cell's number
+			// format and hands back the date it was displaying.
+			echo "restocked: " + join(column(stock, "restocked"), ", ")
+			echo "beeswax:   " + join(row(stock, "Beeswax"), " | ")
+		}
+		// Later sheets are just further entries in the vector.
+		if len(sheets) > 1 {
+			echo "second sheet: " + join(column(sheets[1], "site"), ", ")
+		}
+	}
+}
+
+proc readOpenDocument(): void {
+	echo "--- stock.ods ---"
+	// The same shape, from an OpenDocument spreadsheet.
+	doc := using "stock.ods" as ods
+	if doc is Result.Ok(sheets) && len(sheets) > 0 {
+		for each row in sheets[0] {
+			echo join(row, " | ")
+		}
+	} else if doc is Result.Error(error) {
+		echo "could not read it: {error.message}"
+	}
+}
+
+// `hive.file` is the general filesystem module: whole-file reads and writes,
+// existence and size, directory listings, copies and moves. Everything that can
+// fail returns a `Result<_, hive.file.FileError>`, whose `reason` is a short tag
+// like "NotFound" or "Permission".
+proc writeAndReadFiles(): void {
+	echo "--- hive.file ---"
+	dir := "./scratch"
+	report := dir + "/report.txt"
+
+	// `write` will not create missing parents; `makeDir` makes them.
+	if hive.file.makeDir(dir) is Result.Error(error) {
+		echo "could not make {dir}: {error.reason}"
+		return
+	}
+
+	// A write reports the bytes that went out, an append the same.
+	if hive.file.write(report, "stock report\n") is Result.Ok(written) {
+		echo "wrote {written} bytes"
+	}
+	if hive.file.append(report, "beeswax: 450\n") is Result.Ok(written) {
+		echo "appended {written} bytes"
+	}
+
+	// `lines` splits on newlines and drops the empty piece a trailing one leaves.
+	if hive.file.lines(report) is Result.Ok(lines) {
+		echo "the file holds {len(lines)} lines:"
+		for each line in lines {
+			echo "  " + line
+		}
+	}
+
+	// `read` is the whole thing at once; `size` avoids reading it to measure it.
+	if hive.file.size(report) is Result.Ok(bytes) {
+		echo "size on disk: {bytes} bytes"
+	}
+	echo "exists: {hive.file.exists(report)}"
+
+	// A copy reports the bytes moved; `move` is a rename.
+	copied := dir + "/report.bak"
+	if hive.file.copy(report, copied) is Result.Ok(bytes) {
+		echo "copied {bytes} bytes"
+	}
+	if hive.file.list(dir) is Result.Ok(entries) {
+		echo "the folder holds: " + join(entries, ", ")
+	}
+
+	// A failure carries the reason and the path it was about.
+	missing := dir + "/nothing-here.txt"
+	if hive.file.read(missing) is Result.Error(error) {
+		echo "reading {error.path} failed with {error.reason}"
+	}
+
+	// Tidy up after ourselves, so re-running the example starts clean.
+	hive.file.delete(copied)
+	hive.file.delete(report)
+	hive.file.delete(dir)
+}

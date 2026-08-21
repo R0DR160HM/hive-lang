@@ -1,0 +1,355 @@
+// Testing the online cache
+// ========================
+// `hive test cache.test.hive` — the same runner as `15 - Testing`, pointed at an
+// app instead of a pure function. Nothing in cache.hive was written to be
+// testable: there is no interface to stand in for the database, no injected
+// clock and nothing exported on purpose. A test imports the module and calls it.
+//
+// The app is three programs on three machines, and a unit test is one process,
+// so what is under test here is one node: its service, its database and its HTTP
+// front door. What the suite deliberately does NOT cover is two nodes talking
+// over the wire — that needs two processes, and the `curl` walkthrough at the top
+// of cache.hive is what it is for. The half of the gossip that a single process
+// *can* prove is the receiving half: `Invalidate` really does drop the row.
+//
+// Two habits worth copying:
+//
+//   1. Every test gets its own database. An in-memory SQLite database belongs to
+//      whoever names it, so `file:<name>?mode=memory&cache=shared` gives each
+//      test a private one and no test can be made to pass, or fail, by the test
+//      before it.
+//   2. Every test that registers #Cache stops the service before it ends. A name
+//      is registered once per node, and a test process is one node — a service
+//      left running would take the name with it into the next test.
+
+import ./cache
+
+// A pool onto an empty cache table, named so no other test shares it. `pool`
+// rather than `connect` for the same reason main gives: the front door and the
+// service are separate virtual threads, so their queries overlap.
+proc freshDb(name: Str): hive.sql.SqlConnection {
+	opened := hive.sql.pool(
+		hive.sql.DatabaseDriver.SQLite(),
+		"file:{name}?mode=memory&cache=shared",
+		4,
+		1,
+	)
+	if opened is Result.Ok(db) {
+		if using db run cache.createTable() is Result.Error(err) {
+			panic err
+		}
+		return db
+	} else if opened is Result.Error(err) {
+		panic err
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The service
+// ---------------------------------------------------------------------------
+// A service is reached by calling its address, and `spawn` hands one back, so a
+// test talks to it exactly the way the front door does — one message at a time,
+// waiting for the answer. No registry is involved: these tests hold the address
+// themselves, which is also why they can run a node without a name.
+//
+// A test cannot return early, so a match that should have succeeded is recorded
+// into a variable and asserted after. The failure then shows the value that did
+// arrive rather than just saying `false`.
+
+test "a name stored on this node comes back from it" {
+	db := freshDb("stored-comes-back")
+	Str[dyn] alone = []
+	node := hive.syslink.spawn(cache.cache, cache.Node(db, alone))
+
+	mut Str acked = ""
+	stored := node(cache.Cache.Store("greeting", "from A")) with timeout 2000
+	if stored is Result.Ok(reply) && reply is cache.Cache.Stored(name) {
+		acked = name
+	}
+	assert acked == "greeting"
+
+	mut Str got = ""
+	found := node(cache.Cache.Lookup("greeting")) with timeout 2000
+	if found is Result.Ok(reply) && reply is cache.Cache.Found(_, value) {
+		got = value
+	}
+	assert got == "from A"
+
+	hive.syslink.stop(node)
+}
+
+test "a name this node never stored is missing" {
+	db := freshDb("never-stored")
+	Str[dyn] alone = []
+	node := hive.syslink.spawn(cache.cache, cache.Node(db, alone))
+
+	mut missing := false
+	answer := node(cache.Cache.Lookup("nobody")) with timeout 2000
+	if answer is Result.Ok(reply) && reply is cache.Cache.Missing(name) {
+		missing = name == "nobody"
+	}
+	assert missing
+
+	hive.syslink.stop(node)
+}
+
+// The query is an INSERT OR REPLACE, and this is the test that says so: a second
+// store under the same name is the new value, not a second row and not a
+// conflict.
+test "storing a name again replaces its value" {
+	db := freshDb("stored-twice")
+	Str[dyn] alone = []
+	node := hive.syslink.spawn(cache.cache, cache.Node(db, alone))
+
+	first := node(cache.Cache.Store("greeting", "from A")) with timeout 2000
+	second := node(cache.Cache.Store("greeting", "from A again")) with timeout 2000
+	mut both := false
+	if first is Result.Ok(one) && one is cache.Cache.Stored(_) {
+		if second is Result.Ok(two) && two is cache.Cache.Stored(_) {
+			both = true
+		}
+	}
+	assert both
+
+	mut Str got = ""
+	found := node(cache.Cache.Lookup("greeting")) with timeout 2000
+	if found is Result.Ok(reply) && reply is cache.Cache.Found(_, value) {
+		got = value
+	}
+	assert got == "from A again"
+
+	hive.syslink.stop(node)
+}
+
+// The receiving half of the gossip. `Invalidate` is a cast — nothing answers it
+// — so it goes out with `async`, and the `Lookup` after it does not race: one
+// mailbox handles its messages in the order they arrive, so by the time the
+// lookup is answered the drop has already happened.
+test "an invalidated name is dropped from this node" {
+	db := freshDb("invalidated")
+	Str[dyn] alone = []
+	node := hive.syslink.spawn(cache.cache, cache.Node(db, alone))
+
+	stored := node(cache.Cache.Store("greeting", "from A")) with timeout 2000
+	mut ok := false
+	if stored is Result.Ok(reply) && reply is cache.Cache.Stored(_) {
+		ok = true
+	}
+	assert ok
+
+	async node(cache.Cache.Invalidate("greeting"))
+
+	mut gone := false
+	answer := node(cache.Cache.Lookup("greeting")) with timeout 2000
+	if answer is Result.Ok(reply) && reply is cache.Cache.Missing(_) {
+		gone = true
+	}
+	assert gone
+
+	hive.syslink.stop(node)
+}
+
+// A node is told to drop names it never had — that is what a broadcast means.
+// It has to survive that, and go on working.
+test "invalidating a name this node never had changes nothing" {
+	db := freshDb("invalidate-unknown")
+	Str[dyn] alone = []
+	node := hive.syslink.spawn(cache.cache, cache.Node(db, alone))
+
+	stored := node(cache.Cache.Store("kept", "still here")) with timeout 2000
+	mut ok := false
+	if stored is Result.Ok(reply) && reply is cache.Cache.Stored(_) {
+		ok = true
+	}
+	assert ok
+
+	async node(cache.Cache.Invalidate("never-existed"))
+
+	mut Str got = ""
+	found := node(cache.Cache.Lookup("kept")) with timeout 2000
+	if found is Result.Ok(reply) && reply is cache.Cache.Found(_, value) {
+		got = value
+	}
+	assert got == "still here"
+
+	hive.syslink.stop(node)
+}
+
+// The sending half of the gossip cannot be *observed* in one process — there is
+// no second node to drop anything — but the promise it rests on can be: the
+// broadcast goes out with `async`, which waits for nothing and cannot fail, so a
+// peer that is not there must not slow the store down or fail it. Here the peer
+// is a port with nothing behind it.
+test "a store is not held up by a peer that is not there" {
+	db := freshDb("dead-peer-broadcast")
+	Str[dyn] peers = ["127.0.0.1:59999"]
+	node := hive.syslink.spawn(cache.cache, cache.Node(db, peers))
+
+	mut Str acked = ""
+	stored := node(cache.Cache.Store("greeting", "from A")) with timeout 2000
+	if stored is Result.Ok(reply) && reply is cache.Cache.Stored(name) {
+		acked = name
+	}
+	assert acked == "greeting"
+
+	// And the turn after it is served as normally as any other.
+	mut Str got = ""
+	found := node(cache.Cache.Lookup("greeting")) with timeout 2000
+	if found is Result.Ok(reply) && reply is cache.Cache.Found(_, value) {
+		got = value
+	}
+	assert got == "from A"
+
+	hive.syslink.stop(node)
+}
+
+// Stored / Found / Missing are answers, and the handler's last branch returns
+// without answering them. Because that handler's envelope provably never leaves
+// the turn, the compiler lets syslink fail the caller the moment the turn ends:
+// `NoReply` comes back at once instead of the caller waiting out its two
+// seconds. This test is the one that would notice if that ever became a hang.
+test "an answer sent as a request is refused, not left hanging" {
+	db := freshDb("no-reply")
+	Str[dyn] alone = []
+	node := hive.syslink.spawn(cache.cache, cache.Node(db, alone))
+
+	mut Str reason = ""
+	answer := node(cache.Cache.Stored("greeting")) with timeout 2000
+	if answer is Result.Error(err) {
+		reason = err.reason
+	}
+	assert reason == "NoReply"
+
+	hive.syslink.stop(node)
+}
+
+// A store that the database refuses answers nothing, on purpose: the caller must
+// not be told a name was stored when it was not. The same `NoReply` carries that,
+// so a broken database is reported rather than swallowed.
+test "a store the database refuses is not reported as stored" {
+	db := freshDb("refused")
+	Str[dyn] alone = []
+	node := hive.syslink.spawn(cache.cache, cache.Node(db, alone))
+	hive.sql.close(db)
+
+	mut Str reason = ""
+	stored := node(cache.Cache.Store("greeting", "from A")) with timeout 2000
+	if stored is Result.Error(err) {
+		reason = err.reason
+	}
+	assert reason == "NoReply"
+
+	hive.syslink.stop(node)
+}
+
+// ---------------------------------------------------------------------------
+// The front door
+// ---------------------------------------------------------------------------
+// `handler` is an ordinary proc: `httpServe` calls it once per request, and so
+// can a test. It finds the service through `at(#Cache)`, so these tests register
+// one — and stop it again, since the name outlives the test otherwise.
+
+test "the front door stores and reads back through the service" {
+	db := freshDb("front-door")
+	Str[dyn] alone = []
+	node := hive.syslink.spawn(cache.cache, cache.Node(db, alone))
+	registered := hive.syslink.register(#Cache, node)
+	assert registered is Result.Ok(_)
+
+	set := cache.handler(hive.net.HttpRequest("POST", "/set/greeting", [], "from A"), alone)
+	assert set.status == 200
+	assert set.body == "stored\n"
+
+	got := cache.handler(hive.net.HttpRequest("GET", "/get/greeting", [], ""), alone)
+	assert got.status == 200
+	assert got.body == "from A"
+
+	hive.syslink.stop(node)
+}
+
+test "a name no node has is a 404" {
+	db := freshDb("front-door-missing")
+	Str[dyn] alone = []
+	node := hive.syslink.spawn(cache.cache, cache.Node(db, alone))
+	registered := hive.syslink.register(#Cache, node)
+	assert registered is Result.Ok(_)
+
+	got := cache.handler(hive.net.HttpRequest("GET", "/get/nobody", [], ""), alone)
+	assert got.status == 404
+	assert got.body == "no node has nobody\n"
+
+	hive.syslink.stop(node)
+}
+
+// A peer that is not there comes back as a Result.Error rather than an answer,
+// and the search moves on to the next one. Nothing is listening in a test
+// process, so this peer fails immediately — which is the point: the front door
+// treats "could not ask" and "asked, hasn't got it" the same way, and neither
+// one hangs.
+test "a peer that cannot be reached ends the search instead of hanging" {
+	db := freshDb("front-door-dead-peer")
+	Str[dyn] alone = []
+	Str[dyn] peers = ["127.0.0.1:59999"]
+	node := hive.syslink.spawn(cache.cache, cache.Node(db, alone))
+	registered := hive.syslink.register(#Cache, node)
+	assert registered is Result.Ok(_)
+
+	got := cache.handler(hive.net.HttpRequest("GET", "/get/nobody", [], ""), peers)
+	assert got.status == 404
+
+	hive.syslink.stop(node)
+}
+
+// A client is never told "stored" for something that was not. When the service
+// cannot answer — here because its database has been closed underneath it — the
+// front door turns that into a 500 that names the reason, and it does so at once
+// rather than after the two-second timeout.
+test "a cache that did not answer is a 500, not a 200" {
+	db := freshDb("front-door-broken")
+	Str[dyn] alone = []
+	node := hive.syslink.spawn(cache.cache, cache.Node(db, alone))
+	registered := hive.syslink.register(#Cache, node)
+	assert registered is Result.Ok(_)
+	hive.sql.close(db)
+
+	set := cache.handler(hive.net.HttpRequest("POST", "/set/greeting", [], "from A"), alone)
+	assert set.status == 500
+	assert set.body == "the cache did not answer: NoReply\n"
+
+	hive.syslink.stop(node)
+}
+
+// Only two routes exist, and anything else says so rather than falling through
+// to a stack trace or a blank 200.
+test "an unrecognised route is turned away" {
+	db := freshDb("front-door-routes")
+	Str[dyn] alone = []
+	node := hive.syslink.spawn(cache.cache, cache.Node(db, alone))
+	registered := hive.syslink.register(#Cache, node)
+	assert registered is Result.Ok(_)
+
+	got := cache.handler(hive.net.HttpRequest("GET", "/", [], ""), alone)
+	assert got.status == 404
+	assert got.body == "try POST /set/<name> or GET /get/<name>\n"
+
+	// A `/set` that arrives as a GET is not a store, and a `/get` that arrives as
+	// a POST is not a read: the method is part of the route.
+	wrong := cache.handler(hive.net.HttpRequest("GET", "/set/greeting", [], "from A"), alone)
+	assert wrong.status == 404
+
+	hive.syslink.stop(node)
+}
+
+// The one pure function in the app, tested the way `15 - Testing` tests a cart:
+// no service, no database, nothing to set up.
+test "every response says it is plain text" {
+	res := cache.plain(200, "hi\n")
+	assert res.status == 200
+	assert res.body == "hi\n"
+
+	mut Str kind = ""
+	if res.headers is [row] && row is [name, value] && name == "Content-Type" {
+		kind = value
+	}
+	assert kind == "text/plain"
+}

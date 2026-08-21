@@ -1,0 +1,395 @@
+// The project
+// ===========
+// The compiler's last two steps: a Go module written beside the entrypoint, and
+// the Go toolchain run over it.
+//
+// Both happen here, in Hive. `hive.term.exec` runs a command and hands back
+// everything it wrote, and `hive.term.attach` gives a command this program's own
+// terminal — which is the difference between a build, whose output is only
+// interesting when it fails, and a run, which is the program talking to whoever
+// started it.
+import ./ast
+import ./check as checks
+import ./diag
+import ./emit
+import ./loader
+import ./mono
+import ./paths
+import ./progress
+import ./ranges
+import ./runtime
+import ./text
+import ./vendor
+import hive.file
+import hive.term
+
+/// What a build produced.
+type Written {
+	/// The directory the project was written into.
+	directory: Str
+	/// Every file written, in the order it was written.
+	files: Str[dyn]
+	/// Whether anything in the build links something from outside Go's own
+	/// standard library — an imported Go file's own imports. `hive.sql` is the
+	/// other case, and the build directory says so by holding `hive/sql.go`.
+	thirdParty: Bool
+	errors: diag.Diagnostic[dyn]
+}
+
+/// Where a build's intermediate Go project goes, named after the entrypoint:
+/// `main.hive` builds in `main.hive-build`.
+func buildDirOf(entry: Str): Str {
+	return entry + "-build"
+}
+
+/// What a program compiled from `entry` is called: the entrypoint's own name
+/// without its extension, and `.exe` where the platform wants one.
+proc executableOf(entry: Str): Str {
+	return paths.stem(entry) + goExe()
+}
+
+/// What the Go toolchain calls an executable here — `""` everywhere but Windows.
+/// Asked of the toolchain rather than guessed at.
+proc goExe(): Str {
+	if hive.term.exec("go", ["env", "GOEXE"], "") is Result.Ok(said) {
+		return text.trim(said)
+	}
+	return ""
+}
+
+/// Everything before anything is written: the program loaded, its generics
+/// expanded, checked, every index proved in range, and Go emitted for it. A
+/// build, an `emit` and a `check` differ only in what they do with this, so it
+/// is written once — which also puts every line of progress in one place.
+///
+/// A pass that found something stops the ones after it. There is little point
+/// proving indexes in a program whose names do not resolve, and what such a
+/// pass would report would mostly be about the first mistake anyway.
+type Compiled {
+	/// The flattened, expanded program. Empty if a pass refused it.
+	module: ast.Module
+	emitted: emit.Emitted
+	errors: diag.Diagnostic[dyn]
+}
+
+/// `from` is when the command started, which every line of progress is counted
+/// from. The lines say what is *about* to happen rather than what just did,
+/// because the last line printed is then always the thing being waited on.
+proc passes(entry: Str, from: Int): Compiled {
+	progress.step(from, "reading {entry}")
+	program := loader.load(entry)
+	if len(program.errors) > 0 {
+		return refused(program.errors)
+	}
+	// Monomorphization runs before the checks, so each copy is checked on its own
+	// terms — an instantiation at `Str[3]` held to that length, one at `Str[dyn]`
+	// guarding its indexes.
+	progress.step(from, "expanding generics in " + progress.counted(len(program.sources), "file"))
+	expanded := mono.expand(program.module, from)
+	if len(expanded.errors) > 0 {
+		return refused(expanded.errors)
+	}
+	progress.step(from, "checking " + progress.counted(len(expanded.module.decls), "declaration"))
+	found := checks.checkModule(expanded.module)
+	if len(found) > 0 {
+		return refused(found)
+	}
+	// Every index and slice is proved in range before anything is written, so
+	// the Go that comes out can never fail out of one.
+	progress.step(from, "proving every index in range")
+	inRange := ranges.checkModule(expanded.module)
+	if len(inRange) > 0 {
+		return refused(inRange)
+	}
+	progress.step(from, "emitting Go")
+	emitted := emit.emitModule(expanded.module)
+	if len(emitted.errors) > 0 {
+		return refused(emitted.errors)
+	}
+	return Compiled(expanded.module, emitted, [])
+}
+
+func refused(errors: diag.Diagnostic[dyn]): Compiled {
+	return Compiled(ast.Module([], [], []), emit.Emitted("", [], [], [], [], []), errors)
+}
+
+/// Compile `entry` and write the Go project for it.
+proc build(entry: Str, withTests: Bool, from: Int): Written {
+	made := passes(entry, from)
+	if len(made.errors) > 0 {
+		return Written("", [], false, made.errors)
+	}
+	emitted := made.emitted
+
+	directory := buildDirOf(entry)
+	// A build directory is generated whole, every time. Removing it first is what
+	// keeps a file an earlier build wrote — one this program no longer writes, or
+	// one another compiler left there — from being compiled into this one.
+	removeTree(directory)
+
+	mut Str[dyn] written = []
+	mut diag.Diagnostic[dyn] errors = []
+
+	put(directory + "/hive", "", "", written, errors)
+	put(directory, "go.mod", runtime.goMod() + "\n", written, errors)
+	put(directory, "main.go", emitted.source, written, errors)
+	put(directory + "/hive", "runtime.go", runtime.coreSource() + "\n", written, errors)
+	// A module the program never referenced is never written, so it is never
+	// compiled and never linked.
+	mut drawsAScene := false
+	for each module in emitted.modules {
+		source := runtime.moduleSource(module)
+		if source != "" {
+			put(directory + "/hive", module + ".go", source + "\n", written, errors)
+		}
+		if module == "uiscene" {
+			drawsAScene = true
+		}
+	}
+	// The one thing a build ever downloads: the three.js a scene is drawn with,
+	// fetched once against a pinned digest and embedded into the executable. A
+	// build whose program stopped drawing scenes takes it back out, for the
+	// reason a stale module file is removed — what is in the directory is what
+	// was compiled.
+	if drawsAScene {
+		progress.step(from, "three.js")
+		if vendor.placeThree(directory + "/hive") is Result.Error(why) {
+			append(errors, diag.Diagnostic(entry, 0, why))
+		}
+	} else {
+		vendor.clearThree(directory + "/hive")
+	}
+	// Each imported Go file, copied into the generated project as a package of
+	// its own — the directory being the name the generated code imports it
+	// under. Copied rather than referred to, so what compiled is in the build
+	// directory whether the file came from next door or out of a clone.
+	for each f in made.module.foreign {
+		source := hive.file.read(f.path)
+		if source is Result.Error(why) {
+			append(errors, diag.Diagnostic(f.path, 0, "could not read the imported Go file `" + f.path + "`: {why.message}"))
+		}
+		if source is Result.Ok(contents) {
+			put(paths.joinPath(directory, f.packageName), paths.baseOf(f.path), contents, written, errors)
+		}
+	}
+	if withTests {
+		tests := emit.emitTests(made.module, emitted.atoms, emitted.codecs)
+		if tests != "" {
+			put(directory, "main_test.go", tests, written, errors)
+			// Where each of the program's own declarations landed, so the report
+			// can say what coverage is *of* — and name what no test reached.
+			put(directory, "declarations.tsv", join(emitted.spans, "\n") + "\n", written, errors)
+		}
+	}
+	return Written(directory, written, linksForeign(made.module.foreign), errors)
+}
+
+// Whether any imported Go file imports something the toolchain has to fetch.
+func linksForeign(foreign: ast.Foreign[]): Bool {
+	for each f in foreign {
+		if f.thirdParty {
+			return true
+		}
+	}
+	return false
+}
+
+/// Remove a directory and everything under it. Post-order, because
+/// `hive.file.delete` takes a file or a directory that is already empty — which
+/// is the whole of what it needs to be, given a walk.
+proc removeTree(path: Str): void {
+	if hive.file.exists(path) == false {
+		return
+	}
+	// A path that lists is a directory; one that does not is a file.
+	entries := hive.file.list(path)
+	if entries is Result.Ok(names) {
+		for each name in names {
+			removeTree(paths.joinPath(path, name))
+		}
+	}
+	if hive.file.delete(path) is Result.Error(_) {
+		// Nothing to say: what could not be removed is about to be written over
+		// or was never ours, and a build that then fails will say so itself.
+		return
+	}
+}
+
+// Write one file, making its directory first. A file name of `""` makes the
+// directory and nothing else.
+proc put(directory: Str, name: Str, contents: Str, written: mut Str[dyn], errors: mut diag.Diagnostic[dyn]): void {
+	if hive.file.makeDir(directory) is Result.Error(why) {
+		append(errors, diag.Diagnostic(directory, 0, "cannot make `{directory}`: {why.message}"))
+		return
+	}
+	if name == "" {
+		return
+	}
+	full := paths.joinPath(directory, name)
+	if hive.file.write(full, contents) is Result.Error(why) {
+		append(errors, diag.Diagnostic(full, 0, "cannot write `{full}`: {why.message}"))
+		return
+	}
+	append(written, full)
+}
+
+/// What running the Go toolchain came to.
+type Toolchain {
+	/// The status the command exited with. `0` is the only good one.
+	code: Int
+	/// Everything it wrote, which is the whole of why it failed.
+	output: Str
+}
+
+/// Compile `entry` all the way to a native executable beside it.
+proc compile(entry: Str, from: Int): Written {
+	written := build(entry, false, from)
+	if len(written.errors) > 0 {
+		return written
+	}
+	// Built straight to where it belongs rather than copied there afterwards: a
+	// copy would have to put the executable bit back, and the toolchain already
+	// knows how.
+	if resolveDeps(written, from) is Result.Error(why) {
+		return Written(written.directory, written.files, written.thirdParty, [why])
+	}
+	progress.step(from, "go build")
+	made := toolchain(["build", "-o", paths.joinPath("..", executableOf(entry)), "."], written.directory)
+	if made.code != 0 {
+		return Written(written.directory, written.files, written.thirdParty, [goFailed(entry, made)])
+	}
+	return written
+}
+
+/// Compile `entry` and run it, with `args` handed on to the program and the
+/// working directory set to the entrypoint's own folder — so a relative path in
+/// it resolves the way its author wrote it. Answers with the status the program
+/// exited with.
+proc run(entry: Str, args: Str[], from: Int): Result<Int, diag.Diagnostic[dyn]> {
+	written := build(entry, false, from)
+	if len(written.errors) > 0 {
+		return Result.Error(written.errors)
+	}
+	if resolveDeps(written, from) is Result.Error(why) {
+		return Result.Error([why])
+	}
+	progress.step(from, "go build")
+	made := toolchain(["build", "-o", "app" + goExe(), "."], written.directory)
+	if made.code != 0 {
+		return Result.Error([goFailed(entry, made)])
+	}
+	// The build directory sits beside the entrypoint, so from the entrypoint's
+	// own folder the program is one step down.
+	program := paths.joinPath(".", paths.joinPath(paths.baseOf(written.directory), "app" + goExe()))
+	// The last thing said before the program's own output, so a silence after
+	// this one is the program's rather than the compiler's.
+	progress.step(from, "running " + paths.stem(entry))
+	return Result.Ok(hive.term.attach(program, args, paths.dirOf(entry)))
+}
+
+/// Compile `entry` with its tests alongside and run them. Answers with what the
+/// toolchain said, which the report reads.
+proc runTests(entry: Str, from: Int): Result<Str, diag.Diagnostic[dyn]> {
+	written := build(entry, true, from)
+	if len(written.errors) > 0 {
+		return Result.Error(written.errors)
+	}
+	// Coverage is not a mode: every run reports it, because a run that does not
+	// say what it missed has answered half the question.
+	if resolveDeps(written, from) is Result.Error(why) {
+		return Result.Error([why])
+	}
+	progress.step(from, "go test")
+	made := toolchain(["test", "-v", "-coverprofile=coverage.out", "./..."], written.directory)
+	// A failing suite is an answer rather than a malfunction, so its output is
+	// what comes back either way. Only a toolchain that could not run at all is
+	// an error here, and that is what a negative status says.
+	if made.code < 0 {
+		return Result.Error([goFailed(entry, made)])
+	}
+	return Result.Ok(made.output)
+}
+
+/// A build that links anything from outside Go's own standard library has to
+/// resolve it before the toolchain runs, which is `go mod tidy`. Exactly one
+/// module needs it — `hive.sql`, whose drivers are real dependencies — so
+/// exactly one kind of program pays for it, and every other build stays offline.
+proc resolveDeps(written: Written, from: Int): Result<Bool, diag.Diagnostic> {
+	mut why := "the SQL drivers"
+	if hive.file.exists(paths.joinPath(written.directory, "hive/sql.go")) == false {
+		if written.thirdParty == false {
+			return Result.Ok(true)
+		}
+		why = "what an imported Go file imports"
+	}
+	progress.step(from, "go mod tidy — " + why)
+	made := toolchain(["mod", "tidy"], written.directory)
+	if made.code != 0 {
+		return Result.Error(diag.Diagnostic(written.directory, 0, "what this build links from outside Go's own standard library could not be resolved. `go mod tidy` said:\n\n" + indented(made.output)))
+	}
+	return Result.Ok(true)
+}
+
+proc toolchain(arguments: Str[], directory: Str): Toolchain {
+	said := hive.term.exec("go", arguments, directory)
+	if said is Result.Ok(output) {
+		return Toolchain(0, output)
+	}
+	if said is Result.Error(why) {
+		return Toolchain(why.code, why.output + why.message)
+	}
+	return Toolchain(-1, "")
+}
+
+// The Go toolchain refusing what this compiler wrote is this compiler's fault,
+// not the author's — so the message says so, and shows what it said.
+//
+// A toolchain that could not be *started* is a different thing entirely, and
+// saying "a bug in this compiler" about a machine with no `go` on it would send
+// somebody looking in the wrong place. A negative status is what says which of
+// the two happened.
+func goFailed(entry: Str, made: Toolchain): diag.Diagnostic {
+	if made.code < 0 {
+		return diag.Diagnostic(entry, 0, "this needs the Go toolchain, and `go` is not on the PATH. A Hive build writes a Go module and compiles it, so `go` is what turns one into a program — install it from https://go.dev/dl/. Nothing else is needed: this compiler carries the runtime it compiles against, and `hive check` and `hive emit` ask for no toolchain at all.")
+	}
+	return diag.Diagnostic(entry, 0, "the Go toolchain refused the generated project, which is a bug in this compiler rather than in your program. It said:\n\n" + indented(made.output))
+}
+
+func indented(output: Str): Str {
+	mut Str[dyn] out = []
+	for each line in split(output, "\n") {
+		append(out, "    " + line)
+	}
+	return join(out, "\n")
+}
+
+/// Compile `entry` and hand back the Go it would have written, without writing
+/// anything. This is what `hive emit` prints and what a test reads.
+proc emitOnly(entry: Str, from: Int): Result<Str, diag.Diagnostic[dyn]> {
+	made := passes(entry, from)
+	if len(made.errors) > 0 {
+		return Result.Error(made.errors)
+	}
+	return Result.Ok(made.emitted.source)
+}
+
+/// The prose names of a program's tests, in the order they were declared —
+/// which is the order the runner runs them in, and the only way back from the
+/// name `go test` prints to the one that was written.
+proc testTitles(entry: Str): Str[dyn] {
+	program := loader.load(entry)
+	mut Str[dyn] out = []
+	for each d in program.module.decls {
+		if d is ast.Decl.TestDecl(title, _, _) {
+			append(out, title)
+		}
+	}
+	return out
+}
+
+/// Run every pass and build nothing, which is what an editor wants on every
+/// save — and, unlike a build, it asks for no entrypoint, since a file holding
+/// only tests or only declarations is a perfectly good file.
+proc check(entry: Str, from: Int): diag.Diagnostic[dyn] {
+	return passes(entry, from).errors
+}

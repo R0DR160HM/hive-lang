@@ -1,0 +1,295 @@
+// Tests for `src/lexer`.
+//
+// A lexer's answer is a list, and a list is awkward to assert about one element
+// at a time — so `dump` renders one as a single line and the tests compare
+// strings. A failing test then shows the whole token list on both sides, which
+// is exactly what you want to look at when a lexer is wrong.
+import ../src/lexer
+import ../src/text
+import ../src/token
+
+// Every token of `source`, space-separated. A keyword or operator shows as the
+// text it was written with; anything carrying a value shows as `kind:value`, so
+// `1` and `"1"` cannot be mistaken for each other.
+proc dump(source: Str): Str {
+	out := lexer.lex(source)
+	mut Str[dyn] parts = []
+	for each t in out.tokens {
+		append(parts, showKind(t.kind))
+	}
+	return join(parts, " ")
+}
+
+// The lines of the errors `source` produced, or `""` when it produced none.
+proc errorsOf(source: Str): Str {
+	out := lexer.lex(source)
+	mut Str[dyn] parts = []
+	for each e in out.errors {
+		append(parts, e.message)
+	}
+	return join(parts, " | ")
+}
+
+// The line each token was written on, in order.
+proc lines(source: Str): Str {
+	out := lexer.lex(source)
+	mut Str[dyn] parts = []
+	for each t in out.tokens {
+		append(parts, "{t.line}")
+	}
+	return join(parts, " ")
+}
+
+func showKind(k: token.Kind): Str {
+	if k is token.Kind.Ident(name) { return name }
+	else if k is token.Kind.IntLit(v) { return "int:{v}" }
+	else if k is token.Kind.FloatLit(v) { return "float:{v}" }
+	else if k is token.Kind.StrLit(t) { return "str:{t}" }
+	else if k is token.Kind.StrParts(parts) { return "parts[" + showParts(parts) + "]" }
+	else if k is token.Kind.AtomLit(atom) { return "#{atom}" }
+	else if k is token.Kind.PathLit(path) { return "path:{path}" }
+	else if k is token.Kind.SqlBody(sql) { return "sql:{sql}" }
+	else if k is token.Kind.Eof { return "eof" }
+	return token.spelling(k)
+}
+
+func showParts(parts: token.StrPart[]): Str {
+	mut Str[dyn] out = []
+	for each p in parts {
+		if p is token.StrPart.Literal(t) {
+			append(out, "lit:{t}")
+		} else if p is token.StrPart.Code(source) {
+			append(out, "code:{source}")
+		}
+	}
+	return join(out, "|")
+}
+
+// --- The basics --------------------------------------------------------------
+
+test "an empty source is one Eof" {
+	got := dump("")
+	assert got == "eof"
+}
+
+test "whitespace and newlines separate tokens and are otherwise nothing" {
+	got := dump("  a\n\tb\r\nc  ")
+	assert got == "a b c eof"
+}
+
+test "a comment runs to the end of its line and no further" {
+	got := dump("a // b c\nd")
+	assert got == "a d eof"
+	whole := dump("// nothing at all")
+	assert whole == "eof"
+}
+
+test "the line counter survives comments, and CRLF counts as one newline" {
+	got := lines("a\n// comment\nb\r\nc")
+	assert got == "1 3 4 4"
+}
+
+// --- Operators ---------------------------------------------------------------
+
+test "every two-character operator wins over its one-character prefix" {
+	got := dump(":= >= <= == != ** && || ++ -- += -= *= /=")
+	assert got == ":= >= <= == != ** && || ++ -- += -= *= /= eof"
+}
+
+test "the one-character operators and punctuation" {
+	got := dump("\{ } ( ) [ ] : ; , . > < = + - * / %")
+	assert got == "\{ } ( ) [ ] : ; , . > < = + - * / % eof"
+}
+
+test "`...` is matched before `.`" {
+	got := dump("[a, ...rest]")
+	assert got == "[ a , ... rest ] eof"
+	single := dump("a.b")
+	assert single == "a . b eof"
+}
+
+test "an unexpected character is reported and the scan carries on" {
+	got := errorsOf("a ~ b")
+	assert got == "unexpected character `~`"
+	rest := dump("a ~ b")
+	assert rest == "a b eof"
+}
+
+// --- Names and keywords ------------------------------------------------------
+
+test "keywords are recognised, names are not" {
+	got := dump("proc func query test type if else return is using with void")
+	assert got == "proc func query test type if else return is using with void eof"
+	// `import` is left out: it switches the lexer into reading a path, which
+	// the import tests below are about.
+	more := dump("true false echo assert panic dyn mut async await for in each bounds break continue")
+	assert more == "true false echo assert panic dyn mut async await for in each bounds break continue eof"
+}
+
+test "a name may hold digits and underscores, and may open with one" {
+	got := dump("userName MAX_RETRIES _private x2")
+	assert got == "userName MAX_RETRIES _private x2 eof"
+}
+
+test "a keyword written in the wrong case is neither a keyword nor a name" {
+	got := errorsOf("Proc main")
+	assert got == "`Proc` is a keyword written the wrong way: every keyword in Hive is lower case, and only lower case. Write `proc` — or, if a name was meant, one the language has not already taken. A keyword is reserved however it is spelled, so `Proc` is no more a name than `proc` is."
+	shouted := errorsOf("IF")
+	assert text.startsWith(shouted, "`IF` is a keyword written the wrong way")
+}
+
+// --- Numbers -----------------------------------------------------------------
+
+test "integers and floats" {
+	got := dump("0 42 3.14 1.0")
+	// A whole float renders without its fraction, which is how a `Float` shows
+	// rather than anything the lexer did: the token holds 1.0 either way.
+	assert got == "int:0 int:42 float:3.14 float:1 eof"
+}
+
+test "a dot with no digit after it is an operator, not a decimal point" {
+	got := dump("v[1:2]")
+	assert got == "v [ int:1 : int:2 ] eof"
+	member := dump("1.foo")
+	assert member == "int:1 . foo eof"
+}
+
+// --- Atoms -------------------------------------------------------------------
+
+test "an atom is PascalCase and carries its name without the hash" {
+	got := dump("#Ready #Nil")
+	assert got == "#Ready #Nil eof"
+}
+
+test "an atom written any other way is refused where it is written" {
+	got := errorsOf("#ready")
+	assert got == "`#ready` is not how an atom is written. An atom is written in PascalCase: `#Ready`."
+	empty := errorsOf("# ")
+	assert empty == "expected an atom name after `#`"
+}
+
+// --- Strings -----------------------------------------------------------------
+
+test "a plain string carries its text" {
+	got := dump("\"hello\"")
+	assert got == "str:hello eof"
+	blank := dump("\"\"")
+	assert blank == "str: eof"
+}
+
+test "escapes" {
+	got := dump("\"a\\nb\"")
+	assert got == "str:a\nb eof"
+	tab := dump("\"a\\tb\"")
+	assert tab == "str:a\tb eof"
+	quote := dump("\"a\\\"b\"")
+	assert quote == "str:a\"b eof"
+	slash := dump("\"a\\\\b\"")
+	assert slash == "str:a\\b eof"
+}
+
+test "an escaped brace is a literal brace, not an interpolation" {
+	got := dump("\"a\\\{b\"")
+	assert got == "str:a\{b eof"
+}
+
+test "interpolation splits a string into its pieces" {
+	got := dump("\"a\{x}b\"")
+	assert got == "parts[lit:a|code:x|lit:b] eof"
+}
+
+test "two interpolations side by side contribute no empty literal between them" {
+	got := dump("\"\{a}\{b}\"")
+	assert got == "parts[code:a|code:b] eof"
+}
+
+test "an interpolation holding braces of its own is read whole" {
+	got := dump("\"\{f(\{x})}\"")
+	assert got == "parts[code:f(\{x})] eof"
+}
+
+test "an unterminated string is reported against the line it opened on" {
+	got := errorsOf("\"never closed")
+	assert got == "unterminated string literal"
+	interp := errorsOf("\"a \{b")
+	assert interp == "unterminated `\{` interpolation in a string"
+}
+
+// --- Backtick strings --------------------------------------------------------
+
+test "a backtick string is raw: no escapes and no interpolation" {
+	got := dump("`a\\nb\{c}`")
+	assert got == "str:a\\nb\{c} eof"
+}
+
+test "a backtick string is dedented, and keeps the line it opened on" {
+	source := "`\n\tone\n\t\ttwo\n`"
+	got := dump(source)
+	assert got == "str:one\n\ttwo eof"
+}
+
+test "an unclosed backtick string is reported" {
+	got := errorsOf("`never closed")
+	assert got == "this backtick string never closes"
+}
+
+// --- Import paths ------------------------------------------------------------
+
+test "an import path is captured whole, dots and slashes included" {
+	got := dump("import ./lib/text")
+	assert got == "import path:./lib/text eof"
+	up := dump("import ../../shared/text")
+	assert up == "import path:../../shared/text eof"
+	stdlib := dump("import hive.map")
+	assert stdlib == "import path:hive.map eof"
+}
+
+test "ordinary tokenizing resumes after the path, so `as` still reads as `as`" {
+	got := dump("import ./lib/text as words")
+	assert got == "import path:./lib/text as words eof"
+}
+
+test "a quoted path may hold spaces" {
+	got := dump("import \"./lib/my file\" as helper")
+	assert got == "import path:./lib/my file as helper eof"
+}
+
+test "a quoted path that never closes is a missing quote, not a path over two lines" {
+	got := errorsOf("import \"./lib\nproc main")
+	assert got == "this `import` path opens with a quote and never closes it — add the closing `\"`"
+	empty := errorsOf("import \"\"")
+	assert empty == "`import \"\"` names no module: put the path between the quotes"
+}
+
+// --- Query bodies ------------------------------------------------------------
+
+test "a query body is captured verbatim and dedented" {
+	source := "query all(): User[dyn] \{\n\tSELECT id FROM users\n}"
+	got := dump(source)
+	assert got == "query all ( ) : User [ dyn ] sql:SELECT id FROM users eof"
+}
+
+test "a query body counts its braces, so a bound parameter does not close it" {
+	source := "query one(id: Int): User[dyn] \{ SELECT id FROM users WHERE id = \{id} }"
+	got := dump(source)
+	assert got == "query one ( id : Int ) : User [ dyn ] sql:SELECT id FROM users WHERE id = \{id} eof"
+}
+
+test "ordinary tokenizing resumes after a query body" {
+	source := "query a(): Int[dyn] \{ SELECT 1 }\nproc main(): void \{ }"
+	got := dump(source)
+	assert got == "query a ( ) : Int [ dyn ] sql:SELECT 1 proc main ( ) : void \{ } eof"
+}
+
+test "an unclosed query body is reported" {
+	got := errorsOf("query a(): Int[dyn] \{ SELECT 1")
+	assert got == "this query body never closes"
+}
+
+// --- A whole declaration -----------------------------------------------------
+
+test "a proc lexes to what it looks like" {
+	source := "proc greet(name: Str): void \{\n\techo \"hi \{name}\"\n}"
+	got := dump(source)
+	assert got == "proc greet ( name : Str ) : void \{ echo parts[lit:hi |code:name] } eof"
+}

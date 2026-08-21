@@ -1,0 +1,657 @@
+// Inference
+// =========
+// What an expression's type is. The checker asks so it can say when two do not
+// fit; the emitter asks because `+` on two strings and `+` on two vectors are
+// different Go, and nothing but the type tells them apart.
+//
+// It is deliberately **local**. Every declaration states its own signature, so
+// nothing here has to solve for one: an expression's type is read off its parts
+// and the table of what the program declared. Where an answer genuinely is not
+// available — `hive.map.new()` on its own, a hole, an expression that already
+// failed — the answer is `TUnknown`, which everything downstream accepts, so one
+// mistake is reported once.
+//
+// The environment is a value and is passed immutably, which is what keeps every
+// function here a `func`: a lookup costs nothing, and only a *binding* builds a
+// new one.
+import ./ast
+import ./stdlib
+import ./text
+import ./token
+import ./types
+import hive.map
+
+/// What is in scope: what the program declared, and what the block has bound.
+type Env {
+	table: types.Table
+	names: hive.map.Map<Str, types.Ty>
+}
+
+func newEnv(t: types.Table): Env {
+	mut hive.map.Map<Str, types.Ty> empty = hive.map.new()
+	return Env(t, empty)
+}
+
+/// The same scope with one more name in it. A new value rather than a write,
+/// because a scope that ended has to leave the one around it as it found it.
+func bound(env: Env, name: Str, ty: types.Ty): Env {
+	if name == "" || name == "_" {
+		return env
+	}
+	mut hive.map.Map<Str, types.Ty> next = env.names
+	hive.map.set(next, name, ty)
+	return Env(env.table, next)
+}
+
+func lookup(env: Env, name: Str): types.Ty {
+	if hive.map.get(env.names, name) is Result.Ok(ty) {
+		return ty
+	}
+	return types.Ty.TUnknown()
+}
+
+func isBound(env: Env, name: Str): Bool {
+	return hive.map.has(env.names, name)
+}
+
+// --- Expressions -------------------------------------------------------------
+
+func typeOf(env: Env, e: ast.Expr): types.Ty {
+	if e is ast.Expr.IntLit(_) { return types.Ty.TInt() }
+	else if e is ast.Expr.FloatLit(_) { return types.Ty.TFloat() }
+	else if e is ast.Expr.StrLit(_) { return types.Ty.TStr() }
+	else if e is ast.Expr.BoolLit(_) { return types.Ty.TBool() }
+	else if e is ast.Expr.AtomLit(_) { return types.Ty.TAtom() }
+	else if e is ast.Expr.Interp(_) { return types.Ty.TStr() }
+	else if e is ast.Expr.IsMatch(_, _) { return types.Ty.TBool() }
+	else if e is ast.Expr.Hole { return types.Ty.TUnknown() }
+	else if e is ast.Expr.Absent { return types.Ty.TUnknown() }
+	else if e is ast.Expr.Ident(name) { return identType(env, name) }
+	else if e is ast.Expr.Negate(operand) { return typeOf(env, operand) }
+	else if e is ast.Expr.Binary(op, left, right) { return binaryType(env, op, left, right) }
+	else if e is ast.Expr.VectorLit(items) { return vectorType(env, items) }
+	return typeOfTail(env, e)
+}
+
+func typeOfTail(env: Env, e: ast.Expr): types.Ty {
+	if e is ast.Expr.Call(callee, args) {
+		return callType(env, callee, args)
+	} else if e is ast.Expr.Member(subject, field) {
+		return memberType(env, subject, field)
+	} else if e is ast.Expr.Index(subject, _) {
+		return types.elementOf(typeOf(env, subject))
+	} else if e is ast.Expr.Slice(subject, _, _) {
+		// A slice's length is whatever the two bounds worked out to, which is not
+		// a promise the type can keep — so what comes back is dynamic.
+		return types.Ty.TVec(types.elementOf(typeOf(env, subject)), ast.Dim.Dynamic())
+	} else if e is ast.Expr.AwaitAll(calls, timeout) {
+		// One barrier resolves to one vector, statically sized: three calls are
+		// three results, in order.
+		mut element := firstCallType(env, calls)
+		whole := types.Ty.TVec(element, ast.Dim.Fixed(len(calls)))
+		// A barrier over *sends* is already a vector of Results — each send
+		// reports its own failure — so a deadline over one bounds the waiting
+		// rather than adding an answer of its own.
+		if allSends(env, calls) {
+			return whole
+		}
+		if timeout is ast.Expr.Absent {
+			return whole
+		}
+		return timedResult(whole)
+	} else if e is ast.Expr.Timed(call, _) {
+		// `with timeout` on a send is the patience written down rather than a
+		// second answer: a send already answers with a Result.
+		if isSendExpr(env, call) {
+			return typeOf(env, call)
+		}
+		return timedResult(typeOf(env, call))
+	} else if e is ast.Expr.WithType(value, target) {
+		return withTypeResult(env, value, target)
+	} else if e is ast.Expr.UsingExpr(_, form) {
+		return usingType(env, form)
+	}
+	return types.Ty.TUnknown()
+}
+
+func timedResult(value: types.Ty): types.Ty {
+	return types.Ty.TResult(value, types.Ty.TLib("task", "TimeoutError"))
+}
+
+func allSends(env: Env, calls: ast.Expr[]): Bool {
+	if len(calls) == 0 {
+		return false
+	}
+	for each c in calls {
+		if isSendExpr(env, c) == false {
+			return false
+		}
+	}
+	return true
+}
+
+func firstCallType(env: Env, calls: ast.Expr[]): types.Ty {
+	for each c in calls {
+		return typeOf(env, c)
+	}
+	return types.Ty.TUnknown()
+}
+
+// A local wins over a declaration of the same name, exactly as it does
+// everywhere else. Past that, a bare name is a callable, a type being
+// constructed, or nothing this pass can answer for.
+func identType(env: Env, name: Str): types.Ty {
+	if isBound(env, name) {
+		return lookup(env, name)
+	}
+	if types.findCallable(env.table, name) is Result.Ok(info) {
+		return callableType(env.table, info)
+	}
+	if types.findType(env.table, name) is Result.Ok(_) {
+		return types.Ty.TNamed(name)
+	}
+	return types.Ty.TUnknown()
+}
+
+func callableType(t: types.Table, info: types.CallableInfo): types.Ty {
+	mut types.Ty[dyn] params = []
+	for each p in info.params {
+		append(params, types.resolve(t, p.declared))
+	}
+	return types.Ty.TFn(info.pure, params, types.resolve(t, info.result))
+}
+
+// Arithmetic answers with what it was given; a comparison and a connective
+// answer with a `Bool`. There is no widening anywhere in here, which is what
+// makes the left operand's type the answer.
+func binaryType(env: Env, op: ast.BinOp, left: ast.Expr, right: ast.Expr): types.Ty {
+	if isComparison(op) || op is ast.BinOp.And || op is ast.BinOp.Or {
+		return types.Ty.TBool()
+	}
+	leftType := typeOf(env, left)
+	rightType := typeOf(env, right)
+	if leftType is types.Ty.TUnknown {
+		return rightType
+	}
+	if op is ast.BinOp.Add {
+		return addedType(leftType, rightType)
+	}
+	return leftType
+}
+
+// What `+` answers with. Concatenation adds the two lengths, which is what keeps
+// `Str[2] + Str[8]` fit to fill a `Str[10]` slot; if either side is unknown the
+// result is, because there is no "at least this many". And an atom coerces to
+// `Str` beside one, so `"0" + #Nil` is `"00"`.
+func addedType(leftType: types.Ty, rightType: types.Ty): types.Ty {
+	if leftType is types.Ty.TVec(element, leftDim) {
+		if rightType is types.Ty.TVec(_, rightDim) {
+			return types.Ty.TVec(element, types.addedDim(leftDim, rightDim))
+		}
+		return leftType
+	}
+	if leftType is types.Ty.TStr || rightType is types.Ty.TStr {
+		return types.Ty.TStr()
+	}
+	return leftType
+}
+
+func isComparison(op: ast.BinOp): Bool {
+	return op is ast.BinOp.Eq || op is ast.BinOp.Neq || op is ast.BinOp.Lt
+		|| op is ast.BinOp.Gt || op is ast.BinOp.Le || op is ast.BinOp.Ge
+}
+
+// A literal's length is what it holds, which is a static one — and that is what
+// makes `v := ["a", "b"]` a `Str[2]`.
+func vectorType(env: Env, items: ast.Expr[]): types.Ty {
+	mut types.Ty element = types.Ty.TUnknown()
+	for each item in items {
+		found := typeOf(env, item)
+		if found is types.Ty.TUnknown {
+			continue
+		}
+		element = found
+		break
+	}
+	return types.Ty.TVec(element, ast.Dim.Fixed(len(items)))
+}
+
+func memberType(env: Env, subject: ast.Expr, field: Str): types.Ty {
+	subjectType := typeOf(env, subject)
+	if subjectType is types.Ty.TNamed(name) {
+		return fieldType(env.table, name, field)
+	}
+	// One of the library's own types — an error a call answered with, or a
+	// request a server handed a handler — is read field by field like any other.
+	if subjectType is types.Ty.TLib(module, name) {
+		return stdlib.fieldTypeOf(module, name, field)
+	}
+	// A `hive.<module>` on its own is a module rather than a value, and only a
+	// call ever asks what it holds.
+	return types.Ty.TUnknown()
+}
+
+// Every field the type has, whichever variant it is — which is the shared ones
+// for a union, and all of them for a struct.
+func fieldType(t: types.Table, typeName: Str, field: Str): types.Ty {
+	if types.findType(t, typeName) is Result.Ok(info) {
+		for each f in info.shared {
+			if f.name == field {
+				return types.resolve(t, f.declared)
+			}
+		}
+		// A narrowed value is bound to a name of its own by the pattern that
+		// narrowed it, so a variant's own fields are reached through that name
+		// rather than through this one.
+		for each v in info.variants {
+			for each f in v.fields {
+				if f.name == field {
+					return types.resolve(t, f.declared)
+				}
+			}
+		}
+	}
+	return types.Ty.TUnknown()
+}
+
+// --- Calls -------------------------------------------------------------------
+
+func callType(env: Env, callee: ast.Expr, args: ast.Arg[]): types.Ty {
+	// A call with a hole is a partial application: what comes back is a function
+	// of the holes, in the order they were written.
+	if hasHole(args) {
+		return partialType(env, callee, args)
+	}
+	// Calling an address is a request, and the one place in `hive.syslink` that
+	// reports failure — because it is the only one with somewhere to report to.
+	// A service answers with one of its own messages, so what comes back is
+	// whatever its mailbox holds, which the pattern that reads it says.
+	if isAddressType(typeOf(env, callee)) {
+		return sendResult(env, args)
+	}
+	argTypes := typesOfArgs(env, args)
+
+	if callee is ast.Expr.Ident(name) {
+		if isBound(env, name) == false {
+			builtin := builtinResult(env, name, argTypes, args)
+			if builtin is types.Ty.TUnknown {
+				return identCallType(env, name, argTypes)
+			}
+			return builtin
+		}
+		return resultOfFn(lookup(env, name))
+	}
+	if callee is ast.Expr.Member(subject, field) {
+		return memberCallType(env, subject, field, argTypes, args)
+	}
+	return resultOfFn(typeOf(env, callee))
+}
+
+func identCallType(env: Env, name: Str, argTypes: types.Ty[]): types.Ty {
+	if types.findCallable(env.table, name) is Result.Ok(info) {
+		return types.resolve(env.table, info.result)
+	}
+	// A struct is built by calling its own name.
+	if types.findType(env.table, name) is Result.Ok(_) {
+		return types.Ty.TNamed(name)
+	}
+	return types.Ty.TUnknown()
+}
+
+func memberCallType(env: Env, subject: ast.Expr, field: Str, argTypes: types.Ty[], args: ast.Arg[]): types.Ty {
+	// `Result.Ok(v)` and `Result.Error(e)`.
+	if subject is ast.Expr.Ident(head) {
+		if head == "Result" {
+			return resultConstructor(field, argTypes)
+		}
+		// `Shape.Circle(5)` builds a variant, and what it builds is the union.
+		if types.findType(env.table, head) is Result.Ok(_) {
+			return types.Ty.TNamed(head)
+		}
+		// `hive.len(v)` — a builtin under its long name.
+		if head == "hive" {
+			return builtinResult(env, field, argTypes, args)
+		}
+	}
+	// `hive.<module>.<name>(...)`
+	if subject is ast.Expr.Member(root, module) {
+		if root is ast.Expr.Ident(hiveName) {
+			if hiveName == "hive" {
+				return stdlib.resultOf(module, field, argTypes)
+			}
+		}
+		// `hive.sql.DatabaseDriver.SQLite()` — a variant of one of the library's
+		// own enumerations, which is the enumeration.
+		if root is ast.Expr.Member(head, libModule) {
+			if head is ast.Expr.Ident(hiveName) && hiveName == "hive" {
+				if indexOf(stdlib.variantsOf(libModule, module), field) is Result.Ok(_) {
+					return types.Ty.TLib(libModule, module)
+				}
+			}
+		}
+	}
+	return resultOfFn(memberType(env, subject, field))
+}
+
+// A service answers with one of *its own* messages, so the reply type is the
+// mailbox type — which is the type of the message that was sent. That is what
+// takes the annotation off an await site entirely.
+func sendResult(env: Env, args: ast.Arg[]): types.Ty {
+	mut message := types.Ty.TUnknown()
+	if args bounds 0 {
+		message = typeOf(env, args[0].value)
+	}
+	return types.Ty.TResult(message, types.Ty.TLib("syslink", "SyslinkError"))
+}
+
+/// Whether this expression is a call of an address, which is a send.
+func isSendExpr(env: Env, e: ast.Expr): Bool {
+	if e is ast.Expr.Call(callee, _) {
+		return isAddressType(typeOf(env, callee))
+	}
+	return false
+}
+
+func isAddressType(ty: types.Ty): Bool {
+	if ty is types.Ty.TLib(module, name) {
+		return module == "syslink" && name == "Address"
+	}
+	return false
+}
+
+func resultConstructor(variant: Str, argTypes: types.Ty[]): types.Ty {
+	mut payload := typeAt(argTypes, 0)
+	if variant == "Ok" {
+		return types.Ty.TResult(payload, types.Ty.TUnknown())
+	}
+	return types.Ty.TResult(types.Ty.TUnknown(), payload)
+}
+
+func resultOfFn(ty: types.Ty): types.Ty {
+	if ty is types.Ty.TFn(_, _, result) {
+		return result
+	}
+	return types.Ty.TUnknown()
+}
+
+func hasHole(args: ast.Arg[]): Bool {
+	for each a in args {
+		if a.value is ast.Expr.Hole {
+			return true
+		}
+	}
+	return false
+}
+
+// Each `_` becomes a parameter of the resulting function, in hole order.
+func partialType(env: Env, callee: ast.Expr, args: ast.Arg[]): types.Ty {
+	whole := typeOf(env, callee)
+	mut types.Ty[dyn] holes = []
+	if whole is types.Ty.TFn(pure, params, result) {
+		mut i := 0
+		for each a in args {
+			if a.value is ast.Expr.Hole {
+				append(holes, typeAt(params, i))
+			}
+			i = i + 1
+		}
+		return types.Ty.TFn(pure, holes, result)
+	}
+	// A constructor with a hole is a function too: each `_` still becomes a
+	// parameter in hole order, and what comes back is typed as what it builds.
+	built := callType(env, callee, [])
+	fields := constructorFields(env, callee)
+	mut at := 0
+	for each a in args {
+		if a.value is ast.Expr.Hole {
+			if fields bounds at {
+				append(holes, types.resolve(env.table, fields[at].declared))
+			} else {
+				append(holes, types.Ty.TUnknown())
+			}
+		}
+		at = at + 1
+	}
+	return types.Ty.TFn(true, holes, built)
+}
+
+// The fields a constructor takes, or nothing when the callee is not one.
+func constructorFields(env: Env, callee: ast.Expr): ast.Field[dyn] {
+	if callee is ast.Expr.Ident(name) {
+		if types.fieldsOfStruct(env.table, name) is Result.Ok(fields) {
+			return fields
+		}
+	}
+	if callee is ast.Expr.Member(subject, variant) {
+		if subject is ast.Expr.Ident(typeName) {
+			if types.findVariant(env.table, typeName, variant) is Result.Ok(fields) {
+				return fields
+			}
+		}
+	}
+	mut ast.Field[dyn] none = []
+	return none
+}
+
+func typesOfArgs(env: Env, args: ast.Arg[]): types.Ty[dyn] {
+	mut types.Ty[dyn] out = []
+	for each a in args {
+		append(out, typeOf(env, a.value))
+	}
+	return out
+}
+
+func typeAt(tys: types.Ty[], index: Int): types.Ty {
+	if tys bounds index {
+		return tys[index]
+	}
+	return types.Ty.TUnknown()
+}
+
+// --- The global builtins -----------------------------------------------------
+
+/// What a builtin answers with, or `TUnknown` when the name is not one.
+///
+/// A declaration of your own wins, so this is only ever asked about a name the
+/// program did not declare — which is what makes `len` mean the builtin in one
+/// program and something else entirely in the next.
+func builtinResult(env: Env, name: Str, argTypes: types.Ty[], args: ast.Arg[]): types.Ty {
+	subject := typeAt(argTypes, 0)
+	if name == "len" || name == "bytes" {
+		return types.Ty.TInt()
+	}
+	if name == "append" || name == "prepend" {
+		return types.Ty.TVoid()
+	}
+	if name == "drop" {
+		return types.Ty.TVec(types.elementOf(subject), ast.Dim.Dynamic())
+	}
+	if name == "join" {
+		return types.Ty.TStr()
+	}
+	if name == "split" || name == "row" || name == "column" {
+		return types.Ty.TVec(types.Ty.TStr(), ast.Dim.Dynamic())
+	}
+	if name == "indexOf" {
+		return types.Ty.TResult(types.Ty.TInt(), types.Ty.TBool())
+	}
+	// `map` and `sort` are length-preserving, and the bounds pass knows it: a
+	// transform changes elements and a comparator moves them, and neither
+	// changes how many there are.
+	if name == "map" {
+		return types.Ty.TVec(resultOfFn(typeAt(argTypes, 1)), types.dimOf(subject))
+	}
+	if name == "sort" {
+		return subject
+	}
+	// `filter` and `filterMap` select, so they claim nothing about the length —
+	// a filter that keeps nothing is always a possibility.
+	if name == "filter" {
+		return types.Ty.TVec(types.elementOf(subject), ast.Dim.Dynamic())
+	}
+	if name == "filterMap" {
+		return types.Ty.TVec(okOf(resultOfFn(typeAt(argTypes, 1))), ast.Dim.Dynamic())
+	}
+	return types.Ty.TUnknown()
+}
+
+func okOf(ty: types.Ty): types.Ty {
+	if ty is types.Ty.TResult(ok, _) {
+		return ok
+	}
+	return types.Ty.TUnknown()
+}
+
+/// Whether `name` is one of the global builtins. Asked where a call has to be
+/// told from a declaration of the same name.
+func isBuiltin(name: Str): Bool {
+	return name == "len" || name == "bytes" || name == "append"
+		|| name == "prepend" || name == "drop" || name == "join"
+		|| name == "split" || name == "indexOf" || name == "row"
+		|| name == "column" || name == "map" || name == "filter"
+		|| name == "filterMap" || name == "sort"
+}
+
+// --- `with` and `using` ------------------------------------------------------
+
+func withTypeResult(env: Env, value: ast.Expr, target: ast.TypeExpr): types.Ty {
+	wanted := types.resolve(env.table, target)
+	// `parse(text) with T` and `jwtVerify(t, s) with T` both derive a decoder at
+	// compile time and answer with a `Result` of what was asked for.
+	if value is ast.Expr.Call(callee, _) {
+		if callee is ast.Expr.Member(subject, name) {
+			if subject is ast.Expr.Member(_, module) {
+				if module == "json" && name == "parse" {
+					return types.Ty.TResult(wanted, types.Ty.TLib("json", "JsonError"))
+				}
+				if module == "crypto" {
+					return types.Ty.TResult(wanted, types.Ty.TLib("crypto", "CryptoError"))
+				}
+			}
+		}
+	}
+	return wanted
+}
+
+func usingType(env: Env, form: ast.UsingForm): types.Ty {
+	tableType := types.Ty.TVec(types.Ty.TVec(types.Ty.TStr(), ast.Dim.Dynamic()), ast.Dim.Dynamic())
+	tableError := types.Ty.TLib("", "TableError")
+	if form is ast.UsingForm.Csv(_) {
+		return types.Ty.TResult(tableType, tableError)
+	}
+	// A spreadsheet holds many tables, so it comes back as one per sheet.
+	if form is ast.UsingForm.Xlsx || form is ast.UsingForm.Ods {
+		return types.Ty.TResult(types.Ty.TVec(tableType, ast.Dim.Dynamic()), tableError)
+	}
+	if form is ast.UsingForm.Raw(_) {
+		return types.Ty.TResult(tableType, types.Ty.TLib("sql", "SqlError"))
+	}
+	if form is ast.UsingForm.RunQuery(call) {
+		rows := typeOf(env, call)
+		// A statement has no rows to answer with, so it answers with how many it
+		// touched.
+		if rows is types.Ty.TVoid {
+			return types.Ty.TResult(types.Ty.TInt(), types.Ty.TLib("sql", "SqlError"))
+		}
+		return types.Ty.TResult(rows, types.Ty.TLib("sql", "SqlError"))
+	}
+	return types.Ty.TUnknown()
+}
+
+// --- Patterns ----------------------------------------------------------------
+
+/// The scope a condition leaves behind: `env` with everything its patterns
+/// bound. Only `&&` carries bindings forward — a name bound on one side of `||`
+/// would not exist on the other.
+func narrowed(env: Env, condition: ast.Expr): Env {
+	if condition is ast.Expr.Binary(op, left, right) {
+		if op is ast.BinOp.And {
+			return narrowed(narrowed(env, left), right)
+		}
+		return env
+	}
+	if condition is ast.Expr.IsMatch(subject, pattern) {
+		return afterPattern(env, typeOf(env, subject), pattern)
+	}
+	return env
+}
+
+/// The scope a pattern leaves behind: `env` with everything the pattern binds.
+func afterPattern(env: Env, subject: types.Ty, p: ast.Pattern): Env {
+	if p is ast.Pattern.Constructor(path, bindings, _) {
+		return afterConstructor(env, subject, path, bindings)
+	}
+	if p is ast.Pattern.VectorPat(elements, rest) {
+		mut element := types.elementOf(subject)
+		mut Env out = env
+		for each item in elements {
+			if item is ast.VecElem.Bind(name) {
+				out = bound(out, name, element)
+			}
+		}
+		if rest != "" {
+			out = bound(out, rest, types.Ty.TVec(element, ast.Dim.Dynamic()))
+		}
+		return out
+	}
+	if p is ast.Pattern.StrTemplate(parts) {
+		mut Env out = env
+		for each part in parts {
+			if part is token.StrPart.Code(source) {
+				out = bound(out, text.trim(source), types.Ty.TStr())
+			}
+		}
+		return out
+	}
+	return env
+}
+
+func afterConstructor(env: Env, subject: types.Ty, path: Str[], bindings: Str[]): Env {
+	head := nameAt(path, 0)
+	if head == "Result" {
+		mut payload := types.Ty.TUnknown()
+		if subject is types.Ty.TResult(ok, bad) {
+			if nameAt(path, 1) == "Ok" {
+				payload = ok
+			} else {
+				payload = bad
+			}
+		}
+		return bindOne(env, bindings, payload)
+	}
+	// `T.Variant(a, b)` binds the variant's fields by position — its own, then
+	// the ones the type declared outside any variant.
+	if types.findVariant(env.table, head, nameAt(path, 1)) is Result.Ok(fields) {
+		mut Env out = env
+		mut i := 0
+		for each b in bindings {
+			if fields bounds i {
+				out = bound(out, b, types.resolve(env.table, fields[i].declared))
+			} else {
+				out = bound(out, b, types.Ty.TUnknown())
+			}
+			i = i + 1
+		}
+		return out
+	}
+	mut out2 := env
+	for each b in bindings {
+		out2 = bound(out2, b, types.Ty.TUnknown())
+	}
+	return out2
+}
+
+func bindOne(env: Env, bindings: Str[], ty: types.Ty): Env {
+	mut Env out = env
+	for each b in bindings {
+		out = bound(out, b, ty)
+	}
+	return out
+}
+
+func nameAt(path: Str[], index: Int): Str {
+	if path bounds index {
+		return path[index]
+	}
+	return ""
+}

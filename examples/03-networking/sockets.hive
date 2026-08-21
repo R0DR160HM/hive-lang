@@ -1,0 +1,119 @@
+// Raw TCP sockets
+// ===============
+// Under HTTP and WebSockets, `hive.net` also hands out plain TCP streams:
+// `socketServe` and `socketConnect` for the two ends, then `socketSend`,
+// `socketReceive` and `socketReceiveLine` to move bytes across.
+//
+// A stream is not a queue of messages. `socketReceive` hands back whatever has
+// arrived so far — up to the number of bytes asked for — so it is the protocol's
+// job to say where one message ends. This one ends them with newlines, which is
+// what `socketReceiveLine` is for.
+//
+// Underneath every protocol in the module sit two calls that name none of them:
+// `resolve`, which turns a name into the addresses behind it, and
+// `localAddress`, which is where this machine is. `main` starts with both.
+
+// A handler is a `proc (hive.net.SocketConnection): void`, run once per
+// accepted connection on a virtual thread of its own. The connection closes
+// when it returns.
+proc greetCaller(connection: hive.net.SocketConnection): void {
+	peer := hive.net.socketPeer(connection)
+	echo "server: {peer} connected"
+	// A send whose result you don't need is fine as a bare statement.
+	hive.net.socketSend(connection, "HELLO. Say QUIT to leave.\n")
+
+	for ;; {
+		line := hive.net.socketReceiveLine(connection)
+		if line is Result.Error(error) {
+			// "Closed" is the caller hanging up — the normal end of a session.
+			echo "server: {error.reason} — {error.message}"
+			return
+		} else if line is Result.Ok(text) {
+			echo "server: received {text}"
+			if text == "QUIT" {
+				hive.net.socketSend(connection, "BYE\n")
+				return
+			}
+			hive.net.socketSend(connection, "ECHO {text}\n")
+		}
+	}
+}
+
+// `socketServe` blocks forever, so the caller starts it with `async` and does
+// not wait for it (see `main` below).
+func serveForever(): void {
+	hive.net.socketServe(9002, greetCaller)
+}
+
+proc talk(): void {
+	opened := hive.net.socketConnect("localhost", 9002)
+	if opened is Result.Error(error) {
+		echo "client: could not connect — {error.message}"
+		return
+	} else if opened is Result.Ok(connection) {
+		// `socketReceive` takes whatever has already arrived, up to the number
+		// of bytes asked for. A short read is normal on a stream, so a protocol
+		// that needs an exact count has to keep asking.
+		banner := hive.net.socketReceive(connection, 256)
+		if banner is Result.Ok(text) {
+			// A raw read keeps every byte the server sent, newline included —
+			// `socketReceiveLine` is the one that trims it.
+			echo "client: {text}"
+		}
+
+		for each line in ["ping", "pong", "QUIT"] {
+			sent := hive.net.socketSend(connection, line + "\n")
+			if sent is Result.Error(error) {
+				echo "client: send failed — {error.message}"
+				return
+			} else if sent is Result.Ok(count) {
+				echo "client: sent {count} bytes"
+			}
+			// The replies are newline-terminated, so read them a line at a time
+			// rather than guessing at byte counts.
+			answer := hive.net.socketReceiveLine(connection)
+			if answer is Result.Ok(text) {
+				echo "client: {text}"
+			} else if answer is Result.Error(error) {
+				echo "client: {error.reason} — {error.message}"
+				return
+			}
+		}
+		hive.net.socketClose(connection)
+	}
+}
+
+proc main(): void {
+	// Where this machine is, as another machine would reach it: the source address
+	// the operating system would stamp on an outbound packet. Nothing is sent to
+	// find out. Loopback is deliberately not an answer — a machine holding only
+	// 127.0.0.1 has no address a peer could dial, and "NoAddress" is far more use
+	// than one that works right up until the other end is on another host.
+	here := hive.net.localAddress()
+	if here is Result.Ok(ip) {
+		echo "this machine is at {ip}"
+	} else if here is Result.Error(error) {
+		echo "no address of our own: {error.reason} — {error.message}"
+	}
+
+	// A name stands for however many addresses are behind it, so `resolve` hands
+	// back all of them, in the order the resolver gave them — which is
+	// information, not noise: rotating the answers is how a name balances load.
+	// A name nobody registered is a `"NotFound"`; a resolver that could not be
+	// reached at all is a `"Lookup"`.
+	found := hive.net.resolve("localhost")
+	if found is Result.Ok(addresses) {
+		for each address in addresses {
+			echo "localhost is {address}"
+		}
+	} else if found is Result.Error(error) {
+		echo "cannot resolve localhost: {error.reason} — {error.message}"
+	}
+
+	async serveForever()
+	// Give the listener a moment to bind before dialling it.
+	hive.task.sleep(200)
+	talk()
+	// Let the server's last line land before the program exits.
+	hive.task.sleep(100)
+}

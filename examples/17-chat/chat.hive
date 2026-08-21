@@ -1,0 +1,623 @@
+// A chat between two nodes
+// ========================
+// Two peers, each one a window you talk from and a mailbox the other one posts
+// to. There is no server: both processes run identical code, and nothing
+// distinguishes them but the addresses they are given.
+//
+// RUN IT — two terminals on one machine:
+//
+//   hive run chat.hive                       listens on 127.0.0.1:9100
+//   hive run chat.hive 127.0.0.1:9101        listens on 127.0.0.1:9101
+//
+// The argument is where *this* node listens, and it is the only thing the two
+// terminals need to differ in. Who to talk to is asked for on screen: the lobby
+// has a field for the other node's address, filled in with the obvious guess, so
+// on one machine you type nothing at all.
+//
+// Two machines on the same network work the same way — start each with its own
+// "ip:port" and type the other's into the field (the ports may then match).
+// Every connection is TLS 1.3 either way; the two nodes only have to share a
+// cluster key, generated into ~/.hive/syslink.key on first run — copy that file
+// across, or set HIVE_SYSLINK_KEY the same in both.
+//
+// WHAT DOES THE WORK
+// ------------------
+// A window is a `hive.syslink` service. That is the whole design here: the
+// window publishes *itself* under a name, so the other node reaches the screen
+// by calling an address, exactly as it would reach any other service.
+//
+//   hive.syslink.register(#Chat, hive.syslink.self(from))   // on this node
+//   hive.syslink.on(peer, #Chat)                            // on the other one
+//
+// There is no protocol to write down. A message is a value of one user type and
+// the compiler derives the codec from it, so nothing here formats a line, parses
+// one, or escapes anything — the two ends cannot disagree about a wire format
+// because neither of them has one.
+//
+//   * `async address(message)` is the send that waits for nothing and cannot
+//     fail. Everything said in the room goes out this way.
+//   * `address(message) with timeout 1000` is the same statement *waited for*,
+//     and it is the one place failure gets reported. The greeting below uses it,
+//     because "is anybody there?" is a question with an answer.
+
+import hive.ui
+
+// ---------------------------------------------------------------------------
+// What crosses between the two
+// ---------------------------------------------------------------------------
+
+// One mailbox, one type. A window's mailbox holds what the screen produces *and*
+// what the other node sends, because they arrive at the same fold and there is
+// only one of it.
+//
+// Worth being plain about the cost: publishing the window under a name puts this
+// whole type on the wire, so a peer could post `Left` as easily as `Spoke`. A
+// second service, registered separately and holding only the four remote
+// variants, is what a program with untrusted peers would do — and it would be
+// the same three calls, twice.
+type Msg {
+	// From the screen.
+	NameTyped { text: Str }
+	PeerTyped { text: Str }
+	Joined
+	DraftTyped { text: Str }
+	Sent
+	Left
+
+	// From the other node.
+	Knock { endpoint: Str, who: Str }
+	Wave { endpoint: Str, who: Str }
+	Spoke { who: Str, text: Str, at: Str }
+	Parted { endpoint: Str, who: Str }
+
+	// From the greeter, which runs off the fold's thread.
+	Met { endpoint: Str, who: Str }
+	Unreachable { endpoint: Str }
+}
+
+// Somebody who has introduced themselves, and where to reach them. This is the
+// application's idea of who is here, which is a different thing from
+// `hive.syslink.peers()` — that is the list of nodes with a live connection, and
+// a node can be connected without anybody on it having said their name.
+type Friend {
+	endpoint: Str
+	who: Str
+}
+
+// One line of the transcript. `kind` is what happened rather than how it should
+// look — the view decides that, and the two are worth keeping apart.
+type Line {
+	kind: Kind
+	who: Str
+	text: Str
+	at: Str
+}
+
+type Kind {
+	Talk
+	Arrival
+	Departure
+}
+
+type Screen {
+	Lobby
+	Room
+}
+
+type Model {
+	me: Str
+	mine: Str
+	peer: Str
+	screen: Screen
+	draft: Str
+	transcript: Line[dyn]
+	here: Friend[dyn]
+	nodes: Str[dyn]
+	trouble: Str
+}
+
+// ---------------------------------------------------------------------------
+// Folding what the other node says
+// ---------------------------------------------------------------------------
+
+// Every one of these is an ordinary `func` of a model, which is what lets the
+// test file check the whole protocol without a second node anywhere. `update`
+// below is a handler and cannot be called from a test — an envelope is opaque
+// and only ever arrives as a handler's own argument — so everything it decides
+// lives out here instead.
+
+// Somebody introduced themselves. Their name replaces whatever we had for that
+// endpoint rather than adding to it: a node that rejoins under a new name is the
+// same node, and two entries for it would be a roster that only grows.
+func met(model: Model, endpoint: Str, who: Str, at: Str): Model {
+	mut Model next = model
+	if knows(model.here, endpoint) {
+		next.here = map(model.here, renamed(_, endpoint, who))
+		return next
+	}
+	append(next.here, Friend(endpoint, who))
+	append(next.transcript, Line(Kind.Arrival(), who, "joined", at))
+	return next
+}
+
+func parted(model: Model, endpoint: Str, who: Str, at: Str): Model {
+	mut Model next = model
+	if knows(model.here, endpoint) == false {
+		return next
+	}
+	next.here = filter(model.here, isNot(_, endpoint))
+	append(next.transcript, Line(Kind.Departure(), who, "left", at))
+	return next
+}
+
+func spoke(model: Model, who: Str, text: Str, at: Str): Model {
+	mut Model next = model
+	append(next.transcript, Line(Kind.Talk(), who, text, at))
+	return next
+}
+
+func troubled(model: Model, why: Str): Model {
+	mut Model next = model
+	next.trouble = why
+	return next
+}
+
+func knows(here: Friend[], endpoint: Str): Bool {
+	for each friend in here {
+		if friend.endpoint == endpoint {
+			return true
+		}
+	}
+	return false
+}
+
+func isNot(friend: Friend, endpoint: Str): Bool {
+	return friend.endpoint != endpoint
+}
+
+func renamed(friend: Friend, endpoint: Str, who: Str): Friend {
+	if friend.endpoint != endpoint {
+		return friend
+	}
+	return Friend(endpoint, who)
+}
+
+func nameOf(friend: Friend): Str {
+	return friend.who
+}
+
+// A name that is only spaces is not a name. Nothing else is checked, and nothing
+// is escaped: a name crosses inside a typed message, so there is no line for it
+// to break out of.
+func usable(name: Str): Bool {
+	return join(split(name, " "), "") != ""
+}
+
+// ---------------------------------------------------------------------------
+// The view
+// ---------------------------------------------------------------------------
+
+// A view is a `func`, which is not a formality: a func cannot call a proc and
+// cannot hold a mutex, so drawing cannot act. That matters because a repaint
+// happens every time the state changes — anything a view did would happen again
+// with it, and here that would mean sending it to the other node again.
+func view(model: Model): ui.View {
+	if model.screen is Screen.Lobby {
+		return lobby(model)
+	}
+	return chatting(model)
+}
+
+func lobby(model: Model): ui.View {
+	return ui.column([ui.pad(32), ui.gap(12), ui.width(460)], [
+		ui.row([ui.gap(8), ui.align(ui.Align.Center())], [
+			ui.icon([ui.tone(ui.Tone.Good())], ui.Icon.User()),
+			ui.text([ui.size(ui.TextSize.Title()), ui.heading(1)], "Hive Chat")
+		]),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())], "Your name"),
+		ui.input(
+			[ui.onInput(Msg.NameTyped(_)), ui.onSubmit(joinedOf), ui.placeholder("Ada")],
+			model.me
+		),
+		// Who to talk to, asked for rather than configured. A node is identified
+		// by *where it is* — there is no cluster-wide name registry to look one
+		// up in — so an endpoint is ordinary runtime data, and a text field is a
+		// perfectly good place for it to come from.
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())], "The other node"),
+		ui.input(
+			[
+				ui.onInput(Msg.PeerTyped(_)),
+				ui.onSubmit(joinedOf),
+				ui.placeholder("127.0.0.1:9101")
+			],
+			model.peer
+		),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"This node is listening on {model.mine}"),
+		ui.row([ui.gap(8), ui.align(ui.Align.Center())], [
+			trouble(model.trouble),
+			ui.spacer(),
+			ui.button(
+				[ui.on(Msg.Joined()), ui.tone(ui.Tone.Good()), ui.disabled(ready(model) == false)],
+				"Join"
+			)
+		])
+	])
+}
+
+// Both fields have to say something before there is anywhere to go.
+func ready(model: Model): Bool {
+	return usable(model.me) && usable(model.peer)
+}
+
+func trouble(why: Str): ui.View {
+	if why == "" {
+		return ui.none()
+	}
+	return ui.text([ui.tone(ui.Tone.Danger()), ui.size(ui.TextSize.Caption())], why)
+}
+
+func chatting(model: Model): ui.View {
+	return ui.column([ui.height(0), ui.grow(1)], [
+		ui.row([ui.pad(12), ui.gap(12), ui.align(ui.Align.Center())], [
+			ui.text([ui.size(ui.TextSize.Subtitle()), ui.heading(1)], "Hive Chat"),
+			ui.text([ui.tone(ui.Tone.Muted()), ui.size(ui.TextSize.Caption())], model.mine),
+			ui.spacer(),
+			trouble(model.trouble),
+			ui.button([ui.on(Msg.Left()), ui.tone(ui.Tone.Danger())], "Leave")
+		]),
+		ui.row([ui.grow(1)], [
+			ui.column([ui.grow(1), ui.scroll(ui.Axis.Vertical()), ui.pad(12), ui.gap(6)],
+				transcript(model)),
+			aside(model)
+		]),
+		composer(model)
+	])
+}
+
+func transcript(model: Model): ui.View[dyn] {
+	if len(model.transcript) == 0 {
+		mut ui.View[dyn] quietly = [
+			ui.column([ui.pad(32), ui.align(ui.Align.Center()), ui.gap(6)], [
+				ui.icon([ui.tone(ui.Tone.Muted())], ui.Icon.Info()),
+				ui.text([ui.tone(ui.Tone.Muted())], "Nobody has said anything yet.")
+			])
+		]
+		return quietly
+	}
+	return map(model.transcript, bubble(_, model.me))
+}
+
+// One line. A `Talk` is a bubble with the speaker's own colour behind it;
+// everything else is a quiet aside, because an arrival is not something anybody
+// said.
+func bubble(line: Line, me: Str): ui.View {
+	if line.kind is Kind.Talk {
+		return ui.column([ui.gap(2)], [
+			ui.row([ui.gap(6), ui.align(ui.Align.Center())], [
+				ui.text(
+					[
+						ui.background(voice(line.who, me)),
+						ui.tone(ui.Tone.HEX("#ffffff")),
+						ui.pad(4),
+						ui.size(ui.TextSize.Caption())
+					],
+					" {line.who} "
+				),
+				ui.text([ui.tone(ui.Tone.Muted()), ui.size(ui.TextSize.Caption())], line.at)
+			]),
+			ui.text([], line.text)
+		])
+	}
+	return ui.row([ui.gap(6), ui.align(ui.Align.Center())], [
+		ui.icon([ui.tone(ui.Tone.Muted())], arrow(line.kind)),
+		ui.text([ui.tone(ui.Tone.Muted()), ui.size(ui.TextSize.Caption())],
+			"{line.who} {line.text} · {line.at}")
+	])
+}
+
+func arrow(kind: Kind): ui.Icon {
+	if kind is Kind.Departure {
+		return ui.Icon.Left()
+	}
+	return ui.Icon.Right()
+}
+
+// A colour per speaker, computed from their name. This is what `Tone.RGBA` is
+// for: there is no role called "Ada", and no closed set could have one — the
+// colour has to come from the value. Your own name is the exception and gets the
+// one role that means *you*, so a glance finds your own lines.
+//
+// The channels stay dark enough for the white above to read. A role carries a
+// legible foreground with it from the stylesheet; a colour you computed carries
+// nothing, so the contrast is yours to get right.
+func voice(who: Str, me: Str): ui.Tone {
+	if who == me {
+		return ui.Tone.Good()
+	}
+	seed := bytes(who) * 41 + len(who) * 97
+	return ui.Tone.RGBA(70 + seed % 110, 70 + seed * 7 % 110, 100 + seed * 13 % 100, 255)
+}
+
+// Two lists, and the difference between them is the point. "Here now" is who has
+// said their name. "Connected" is `hive.syslink.peers()` — the nodes with a live
+// pipe to this one, which a connection *is* rather than something bookkeeping
+// tracks. A node can be in the second and not the first.
+func aside(model: Model): ui.View {
+	return ui.column([ui.pad(12), ui.gap(10), ui.width(200)], [
+		ui.text([ui.size(ui.TextSize.Subtitle())], "Here now"),
+		ui.column([ui.gap(4)], map(present(model), standing)),
+		ui.text([ui.size(ui.TextSize.Subtitle())], "Connected"),
+		ui.column([ui.gap(4)], map(model.nodes, wired))
+	])
+}
+
+func present(model: Model): Str[dyn] {
+	mut Str[dyn] names = [model.me]
+	for each name in map(model.here, nameOf) {
+		append(names, name)
+	}
+	return names
+}
+
+func standing(name: Str): ui.View {
+	return ui.row([ui.gap(6), ui.align(ui.Align.Center())], [
+		ui.icon([ui.tone(ui.Tone.Good())], ui.Icon.Check()),
+		ui.text([], name)
+	])
+}
+
+func wired(endpoint: Str): ui.View {
+	return ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())], endpoint)
+}
+
+// `onSubmit` fires on Enter and `on` fires on the button, and both mean the same
+// message — which is the point of a message being a value rather than a
+// callback: two widgets can hand back the identical one.
+func composer(model: Model): ui.View {
+	return ui.row([ui.pad(12), ui.gap(8), ui.align(ui.Align.Center())], [
+		ui.input(
+			[
+				ui.onInput(Msg.DraftTyped(_)),
+				ui.onSubmit(sentOf),
+				ui.placeholder("Say something"),
+				ui.grow(1)
+			],
+			model.draft
+		),
+		ui.button(
+			[ui.on(Msg.Sent()), ui.tone(ui.Tone.Good()), ui.disabled(model.draft == "")],
+			"Send"
+		)
+	])
+}
+
+// `onSubmit` hands back a function of what was typed, but neither of these cares
+// what that was — it is already in the model. They throw the text away and
+// answer with the message that matters.
+func joinedOf(_typed: Str): Msg {
+	return Msg.Joined()
+}
+
+func sentOf(_typed: Str): Msg {
+	return Msg.Sent()
+}
+
+// ---------------------------------------------------------------------------
+// The fold
+// ---------------------------------------------------------------------------
+
+// The window's mailbox, and the node's. A message from the screen and a message
+// from the other machine arrive here the same way and are told apart only by
+// which variant they are — which is the whole claim `hive.syslink` makes, and it
+// holds right down to there being one `is` chain for both.
+//
+// There is no mutex in this program: the fold *is* the mutex.
+proc update(model: Model, msg: Msg, from: hive.syslink.Envelope): Model {
+	mut Model next = model
+
+	if msg is Msg.NameTyped(text) {
+		next.me = text
+		return next
+	}
+	if msg is Msg.PeerTyped(text) {
+		next.peer = text
+		return next
+	}
+	if msg is Msg.Joined {
+		return joined(model, from)
+	}
+	if msg is Msg.DraftTyped(text) {
+		next.draft = text
+		return next
+	}
+	if msg is Msg.Sent {
+		return sent(model)
+	}
+	if msg is Msg.Left {
+		return leaving(model)
+	}
+
+	// A knock is the only message anything waits for an answer to, and this is
+	// the branch that answers it. A service replies with one of its *own*
+	// messages, so the reply type is the mailbox type and nothing is annotated.
+	if msg is Msg.Knock(endpoint, who) {
+		hive.syslink.answer(from, Msg.Wave(model.mine, model.me))
+		mut Model greeted = met(model, endpoint, who, clock())
+		greeted.nodes = hive.syslink.peers()
+		return greeted
+	}
+	if msg is Msg.Met(endpoint, who) {
+		mut Model known = met(model, endpoint, who, clock())
+		known.nodes = hive.syslink.peers()
+		known.trouble = ""
+		return known
+	}
+	if msg is Msg.Spoke(who, text, at) {
+		return spoke(model, who, text, at)
+	}
+	if msg is Msg.Parted(endpoint, who) {
+		mut Model gone = parted(model, endpoint, who, clock())
+		gone.nodes = hive.syslink.peers()
+		return gone
+	}
+	if msg is Msg.Unreachable(endpoint) {
+		return troubled(model, "No answer from {endpoint}. Start it and press Join again.")
+	}
+	// A `Wave` only ever comes back as the answer to a knock, never into the
+	// mailbox — but it is one of the mailbox's messages, so it has a branch.
+	return model
+}
+
+// Joining publishes the window and goes knocking. Both are worth reading twice.
+//
+// The registration is what makes the screen addressable from another machine,
+// and it happens *here* rather than in `main` because a service's address does
+// not exist until the service is running — inside the fold is the first place
+// there is one. `Taken` means this window is already published, which is what
+// rejoining after a Leave looks like.
+proc joined(model: Model, from: hive.syslink.Envelope): Model {
+	mut Model next = model
+	if hive.syslink.register(#Chat, hive.syslink.self(from)) is Result.Error(problem) {
+		if problem.reason != "Taken" {
+			next.trouble = "Could not publish this window — {problem.message}"
+			return next
+		}
+	}
+	// Off the fold's thread. A greeting is a *waited* call and the fold must not
+	// wait: a screen that stops repainting while it dials is the one thing a
+	// window may never do.
+	async greet(model.peer, model.mine, model.me, hive.syslink.self(from))
+	next.screen = Screen.Room()
+	next.trouble = ""
+	next.nodes = hive.syslink.peers()
+	return next
+}
+
+// "Is anybody there?", asked properly. This is the one call in the program that
+// waits for an answer, and therefore the one that can report a failure — an
+// unreachable node, a service not yet registered and a timeout all arrive here
+// as a `Result.Error`.
+//
+// It retries because both nodes are usually started within a second of each
+// other, and whichever one knocks first would otherwise knock at a window that
+// has not been published yet. A handshake that is a *request* rather than a
+// send is what makes that detectable at all.
+//
+// Retrying is safe because a knock is idempotent: `met` renames an endpoint it
+// already knows rather than adding it again. That matters in practice — the
+// first attempt can time out while the pipe to a brand-new node is still being
+// set up, and the second one then arrives at a peer that has already answered
+// the first.
+proc greet(peer: Str, mine: Str, me: Str, window: hive.syslink.Address): void {
+	for i := 0; i < 5; i++ {
+		far := hive.syslink.on(peer, #Chat)
+		answer := far(Msg.Knock(mine, me)) with timeout 2000
+		if answer is Result.Ok(reply) {
+			if reply is Msg.Wave(endpoint, who) {
+				async window(Msg.Met(endpoint, who))
+				return
+			}
+		}
+		hive.task.sleep(500)
+	}
+	async window(Msg.Unreachable(peer))
+}
+
+// Saying something is one line appended here and one `async` send per friend.
+//
+// Note what is *not* guaranteed, because it is the price of there being no
+// server: with a room in the middle, one mailbox decided the order and everyone
+// saw that one. Here each node orders its own transcript by when it heard
+// things. Syslink keeps one FIFO pipe per node pair, so what any *one* peer says
+// arrives in the order they said it — but with three or more people, two nodes
+// can disagree about whether Ada or Bob spoke first. For two, there is nothing
+// to disagree about.
+proc sent(model: Model): Model {
+	if model.draft == "" {
+		return model
+	}
+	at := clock()
+	for each friend in model.here {
+		far := hive.syslink.on(friend.endpoint, #Chat)
+		async far(Msg.Spoke(model.me, model.draft, at))
+	}
+	mut Model next = spoke(model, model.me, model.draft, at)
+	next.draft = ""
+	return next
+}
+
+proc leaving(model: Model): Model {
+	for each friend in model.here {
+		far := hive.syslink.on(friend.endpoint, #Chat)
+		async far(Msg.Parted(model.mine, model.me))
+	}
+	mut Model next = model
+	next.screen = Screen.Lobby()
+	next.here = nobody()
+	next.transcript = quietly()
+	next.trouble = ""
+	return next
+}
+
+proc clock(): Str {
+	return hive.time.format(hive.time.now(), "%H:%M")
+}
+
+func nobody(): Friend[dyn] {
+	mut Friend[dyn] none = []
+	return none
+}
+
+func quietly(): Line[dyn] {
+	mut Line[dyn] none = []
+	return none
+}
+
+func nowhere(): Str[dyn] {
+	mut Str[dyn] none = []
+	return none
+}
+
+// ---------------------------------------------------------------------------
+
+func fresh(mine: Str, peer: Str): Model {
+	return Model("", mine, peer, Screen.Lobby(), "", quietly(), nobody(), nowhere(), "")
+}
+
+// The obvious guess for the other node, so two terminals on one machine need no
+// typing at all: whichever of the pair this node is not. Anything else and the
+// field is left for you to fill in, which is the honest answer — this program
+// cannot know where the other machine is.
+func facing(mine: Str): Str {
+	if mine == "127.0.0.1:9100" {
+		return "127.0.0.1:9101"
+	}
+	if mine == "127.0.0.1:9101" {
+		return "127.0.0.1:9100"
+	}
+	return ""
+}
+
+proc main(): void {
+	args := hive.term.args()
+	mut Str mine = "127.0.0.1:9100"
+	if args bounds 0 {
+		mine = args[0]
+	}
+
+	// The node starts accepting before the window opens. A node has no name — it
+	// is identified by where it is — so this endpoint is ordinary runtime data
+	// and a peer list is something a program can compute, read from a file or
+	// resolve through DNS.
+	if hive.syslink.listen(mine) is Result.Error(problem) {
+		panic problem
+	}
+	echo "listening on {mine}"
+
+	// Opens a real application window on Linux and on Windows: an installed
+	// Chrome or Edge in app mode, and an ordinary tab where there is none.
+	// Nothing is linked in for it, so this still builds offline into one
+	// executable with no dependencies.
+	ui.window("Hive Chat — {mine}", view, update, fresh(mine, facing(mine)))
+}

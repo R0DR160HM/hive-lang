@@ -1,0 +1,69 @@
+# syntax=docker/dockerfile:1
+#
+# Build a Hive program in a container and ship only the binary that comes out.
+#
+#   Stage 1 (builder): the Hive compiler turns your program into a Go module and
+#                      runs the Go toolchain over it.
+#   Stage 2 (runtime):  just the compiled program — no Hive, no Go, nothing else.
+#
+# It assumes this repository is the build context and that your program is at
+# ./app.hive. Build and run it with:
+#
+#   docker build -f Dockerfile.example -t my-hive-app .
+#   docker run --rm my-hive-app
+#
+# What makes the second stage as small as it is: a Hive program is one native
+# executable, and the compiler carries the runtime it compiles against as source
+# text rather than as a library to install.
+
+##############################################################################
+# Stage 1 — builder
+##############################################################################
+# Go is the one thing the compiler needs that it does not carry: `hive build`
+# writes a Go module and compiles it.
+ARG GO_VERSION=1.24
+FROM golang:${GO_VERSION} AS builder
+
+# The compiler itself, from a release — `docker build` cannot fetch it, so pass
+# the path to one you downloaded (the README's "Getting the first compiler" is
+# the two commands that get it), or to one you built.
+ARG HIVEC=dist/hivec-linux-amd64
+COPY ${HIVEC} /usr/local/bin/hivec
+RUN chmod +x /usr/local/bin/hivec
+
+# To build the compiler from *this checkout's source* instead of taking that
+# binary at its word, swap the two lines above for:
+#
+#   COPY . /opt/hive
+#   RUN HIVEC=/opt/hive/${HIVEC} /opt/hive/bootstrap \
+#    && cp /opt/hive/src/hivec /usr/local/bin/hivec
+#
+# It costs about half an hour and answers the question a downloaded compiler asks
+# you to take on trust.
+
+# A static binary, so the runtime image needs no libc. The bundled SQLite driver
+# is pure Go, so nothing is lost by it.
+ENV CGO_ENABLED=0
+
+WORKDIR /app
+COPY app.hive ./app.hive
+
+# `hive build` leaves the executable beside the entrypoint and the Go module it
+# came from in app.hive-build/. The test is there to fail the image build now
+# rather than at `docker run`.
+RUN hivec build /app/app.hive \
+ && test -x /app/app
+
+##############################################################################
+# Stage 2 — runtime
+##############################################################################
+FROM gcr.io/distroless/static-debian12 AS runtime
+WORKDIR /app
+COPY --from=builder /app/app /usr/local/bin/app
+
+# A program that reads relative paths — `using "./stock.csv"`, a `.env`, a
+# SQLite file — wants them beside its working directory:
+#
+#   COPY --from=builder /app/data ./data
+
+ENTRYPOINT ["/usr/local/bin/app"]

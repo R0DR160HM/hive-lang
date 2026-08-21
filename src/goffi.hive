@@ -1,0 +1,695 @@
+// Calling Go
+// ==========
+// `import ./util.go` is not a Hive module: nothing in the file is Hive, and what
+// Hive gets from it is the **signatures** of what it exports. The Go toolchain is
+// what reads them — a small program (`godecl`, written into this compiler's cache
+// the first time it is needed) parses the file with Go's own parser and prints
+// one line per declaration. Guessing at Go's grammar from here would be a
+// second, worse Go parser.
+//
+// Each exported function becomes an `ast.Decl.ForeignDecl`: an ordinary `func`
+// with a Hive signature, so every call to it is checked like any other. Each
+// exported struct it mentions becomes an ordinary `TypeDecl`, so `util.Point` is
+// constructed, annotated and matched like a type the program wrote itself.
+//
+// The boundary is deliberately narrow, and everything outside it is a compile
+// error naming the parameter it could not take:
+//
+//     string                 <-> Str
+//     int                    <-> Int      (int64 is refused: Hive's Int *is* Go's int)
+//     float64                <-> Float
+//     bool                   <-> Bool
+//     []T                    <-> T[dyn]
+//     map[K]V                <-> hive.map.Map<K, T>   (K a scalar)
+//     a struct in the file   <-> a Hive type mirroring it
+//     (T, error)              -> Result<T, Str>
+//     error                   -> Result<Bool, Str>
+//
+// The narrowness is the point: every type here has the same shape on both sides,
+// so the wrapper the emitter writes is copies rather than translations, and
+// nothing crosses that Hive could not have made itself.
+import ./ast
+import ./fetch
+import ./naming
+import ./paths
+import ./text
+import hive.file
+import hive.term
+
+/// What one Go file contributes: the declarations Hive reaches in it, and what
+/// the build needs to compile it.
+type Read {
+	decls: ast.Decl[dyn]
+	foreign: ast.Foreign
+}
+
+/// One declaration, as `godecl` printed it.
+type Line {
+	/// `func<TAB>Name<TAB>a:string|b:int<TAB>string,error`
+	Fn { name: Str, params: Str, results: Str }
+	/// `type<TAB>Name<TAB>X:float64|Y:float64`
+	Struct { name: Str, fields: Str }
+	Imported { path: Str }
+	Package { name: Str }
+	Other
+}
+
+/// Read `path` (a `.go` file) and answer with what Hive can reach in it.
+/// `display` is how the file is named in a message about it.
+proc read(path: Str, display: Str): Result<Read, Str> {
+	if hive.file.exists(path) == false {
+		return Result.Error("`import` names {display}, and there is no such file.")
+	}
+	said := run(path, display)
+	if said is Result.Error(why) {
+		return Result.Error(why)
+	}
+	if said is Result.Ok(printed) {
+		lines := readLines(printed)
+		packageName := packageOf(path)
+		structs := structNames(lines)
+		mut ast.Decl[dyn] decls = []
+		mut Str[dyn] mirrored = []
+		for each line in lines {
+			if line is Line.Struct(name, fields) {
+				made := mirror(name, fields, structs, display)
+				if made is Result.Error(why) {
+					return Result.Error(why)
+				}
+				if made is Result.Ok(decl) {
+					append(decls, decl)
+					append(mirrored, name)
+				}
+			}
+		}
+		mut found := 0
+		for each line in lines {
+			if line is Line.Fn(name, params, results) {
+				made := foreignFn(name, params, results, structs, packageName, display)
+				if made is Result.Error(why) {
+					return Result.Error(why)
+				}
+				if made is Result.Ok(decl) {
+					append(decls, decl)
+					found = found + 1
+				}
+			}
+		}
+		if found == 0 {
+			return Result.Error("{display} exports no functions, so there is nothing in it to call. Go exports a name by capitalising it — `func Slugify(...)` is reachable and `func slugify(...)` is the file's own.")
+		}
+		return Result.Ok(Read(decls, ast.Foreign(packageName, path, thirdParty(lines), mirrored)))
+	}
+	return Result.Error("could not read {display}")
+}
+
+// --- What godecl said --------------------------------------------------------
+
+func readLines(printed: Str): Line[dyn] {
+	mut Line[dyn] out = []
+	for each line in split(printed, "\n") {
+		if line != "" {
+			append(out, readLine(line))
+		}
+	}
+	return out
+}
+
+func readLine(line: Str): Line {
+	fields := split(line, "\t")
+	kind := at(fields, 0)
+	if kind == "package" {
+		return Line.Package(at(fields, 1))
+	}
+	if kind == "import" {
+		return Line.Imported(at(fields, 1))
+	}
+	if kind == "type" {
+		return Line.Struct(at(fields, 1), at(fields, 2))
+	}
+	if kind == "func" {
+		return Line.Fn(at(fields, 1), at(fields, 2), at(fields, 3))
+	}
+	return Line.Other()
+}
+
+func at(fields: Str[], index: Int): Str {
+	if fields bounds index {
+		return fields[index]
+	}
+	return ""
+}
+
+/// The names of the structs the file exports, which is what tells a type in a
+/// signature apart from a name Hive has never heard of.
+func structNames(lines: Line[]): Str[dyn] {
+	mut Str[dyn] out = []
+	for each line in lines {
+		if line is Line.Struct(name, _) {
+			append(out, name)
+		}
+	}
+	return out
+}
+
+/// Whether the file needs anything from outside Go's own standard library. A
+/// standard library path has no dot in its first segment — `strings`,
+/// `encoding/json` — while anything fetched has a host there.
+func thirdParty(lines: Line[]): Bool {
+	for each line in lines {
+		if line is Line.Imported(path) {
+			segments := split(path, "/")
+			if segments bounds 0 {
+				if text.contains(segments[0], ".") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// --- Mapping Go onto Hive ----------------------------------------------------
+
+// A struct in the file, mirrored as a Hive type of the same name and shape. The
+// two are the same struct on both sides — same field names, same field types —
+// which is what lets the converter the emitter writes be a field-by-field copy.
+proc mirror(name: Str, fields: Str, structs: Str[], display: Str): Result<ast.Decl, Str> {
+	if naming.check(naming.Role.TypeName(), name) is Result.Error(_) {
+		return Result.Error("the struct `{name}` in {display} cannot be a Hive type: a type is PascalCase here, and this name is not something Hive can spell.")
+	}
+	mut ast.Field[dyn] out = []
+	for each pair in split(fields, "|") {
+		if pair != "" {
+			fieldName := before(pair, ":")
+			goType := after(pair, ":")
+			mapped := hiveType(goType, structs)
+			if mapped is Result.Error(why) {
+				return Result.Error("the field `{fieldName}` of `{name}` in {display} {why} A struct only crosses the boundary when every one of its fields does.")
+			}
+			// Go exports a field by capitalising it, and a Hive field is
+			// camelCase, so the name is lowered exactly as a function's is.
+			lowered := text.decapitalise(fieldName)
+			if naming.check(naming.Role.Field(), lowered) is Result.Error(_) {
+				return Result.Error("the field `{fieldName}` of `{name}` in {display} cannot be reached from Hive: `{lowered}` is not a name Hive can spell.")
+			}
+			if mapped is Result.Ok(declared) {
+				append(out, ast.Field(lowered, declared))
+			}
+		}
+	}
+	return Result.Ok(ast.Decl.TypeDecl(name, out, [], 0))
+}
+
+// One exported function, as the `func` Hive calls.
+proc foreignFn(symbol: Str, params: Str, results: Str, structs: Str[], packageName: Str, display: Str): Result<ast.Decl, Str> {
+	name := text.decapitalise(symbol)
+	if naming.check(naming.Role.Callable(), name) is Result.Error(_) {
+		return Result.Error("`{symbol}` in {display} cannot be called from Hive: a callable is camelCase here, so the name is reached with its first letter lowered — and `{name}` is not a name Hive can spell.")
+	}
+	mut ast.Param[dyn] out = []
+	for each pair in split(params, "|") {
+		if pair != "" {
+			paramName := before(pair, ":")
+			goType := after(pair, ":")
+			mapped := hiveType(goType, structs)
+			if mapped is Result.Error(why) {
+				return Result.Error("the parameter `{paramName}` of `{symbol}` in {display} {why}")
+			}
+			lowered := text.decapitalise(paramName)
+			if naming.check(naming.Role.Parameter(), lowered) is Result.Error(_) {
+				return Result.Error("the parameter `{paramName}` of `{symbol}` in {display} cannot be named in Hive, where a parameter is camelCase. Rename it in the Go file.")
+			}
+			if mapped is Result.Ok(declared) {
+				append(out, ast.Param(lowered, declared, false))
+			}
+		}
+	}
+	answers := answered(results)
+	mapped := hiveResult(answers, structs, symbol, display)
+	if mapped is Result.Error(why) {
+		return Result.Error(why)
+	}
+	if mapped is Result.Ok(declared) {
+		return Result.Ok(ast.Decl.ForeignDecl(name, out, declared, packageName, symbol, len(answers), 0))
+	}
+	return Result.Error("could not read what `{symbol}` answers with")
+}
+
+func answered(results: Str): Str[dyn] {
+	mut Str[dyn] out = []
+	for each one in split(results, ",") {
+		if one != "" {
+			append(out, one)
+		}
+	}
+	return out
+}
+
+// What a Go function answers with, as a Hive return type.
+//
+// Go's second return value is how it reports a failure and Hive's is a
+// `Result`, so the two are the same idea and the mapping says so. What a Go
+// `error` carries is a string and nothing else — `err.Error()` — so that is the
+// error payload.
+proc hiveResult(results: Str[], structs: Str[], symbol: Str, display: Str): Result<ast.TypeExpr, Str> {
+	if len(results) == 0 {
+		return Result.Ok(ast.TypeExpr.VoidType())
+	}
+	if results is ["error"] {
+		// A lone `error` is a Go function that either worked or did not. `Ok(true)`
+		// is what "it worked" looks like when there was nothing to hand back.
+		return Result.Ok(resultOf(plain("Bool")))
+	}
+	if results is [only] {
+		mapped := hiveType(only, structs)
+		if mapped is Result.Error(why) {
+			return Result.Error("what `{symbol}` in {display} answers with {why}")
+		}
+		if mapped is Result.Ok(declared) {
+			return Result.Ok(declared)
+		}
+	}
+	if results is [value, "error"] {
+		mapped := hiveType(value, structs)
+		if mapped is Result.Error(why) {
+			return Result.Error("what `{symbol}` in {display} answers with {why}")
+		}
+		if mapped is Result.Ok(declared) {
+			return Result.Ok(resultOf(declared))
+		}
+	}
+	return Result.Error("`{symbol}` in {display} answers with {len(results)} values, and a Hive call answers with one. Go's two-value form is the exception, because `(T, error)` is what a `Result<T, Str>` already means. For anything else, answer with a struct — every field of one crosses the boundary, and Hive reads it as a type of its own.")
+}
+
+/// A Go type as the Hive type it is the same shape as, or why it is not one. The
+/// message is a clause, so a caller can put the parameter it belongs to in
+/// front of it.
+proc hiveType(goType: Str, structs: Str[]): Result<ast.TypeExpr, Str> {
+	if goType == "string" { return Result.Ok(plain("Str")) }
+	if goType == "int" { return Result.Ok(plain("Int")) }
+	if goType == "float64" { return Result.Ok(plain("Float")) }
+	if goType == "bool" { return Result.Ok(plain("Bool")) }
+	// Every other numeric type is a different width from Hive's, and converting
+	// one silently is how a value quietly stops being the value it was.
+	if goType == "int8" || goType == "int16" || goType == "int32"
+		|| goType == "int64" || goType == "uint" || goType == "uint8"
+		|| goType == "uint16" || goType == "uint32" || goType == "uint64"
+		|| goType == "byte" || goType == "rune" {
+		return Result.Error("is a Go `{goType}`, and Hive's `Int` is Go's `int` — the same 64-bit signed integer, not a conversion away from one. Declare it `int` in the Go file; converting a narrower or unsigned type here would change values without saying so.")
+	}
+	if goType == "float32" {
+		return Result.Error("is a Go `float32`, and Hive's `Float` is Go's `float64`. Declare it `float64` in the Go file, so no precision is lost at the boundary.")
+	}
+	if goType == "error" {
+		return Result.Error("is a Go `error`, which is how a Go function reports failure rather than a value that travels. It is read as the error half of a `Result` when it is the *last* thing the function answers with, and nowhere else.")
+	}
+	if text.startsWith(goType, "[]") {
+		inner := hiveType(text.span(text.chars(goType), 2, len(goType) - 1), structs)
+		if inner is Result.Error(why) {
+			return Result.Error(why)
+		}
+		if inner is Result.Ok(element) {
+			return vectorOf(element)
+		}
+	}
+	if text.startsWith(goType, "map[") {
+		return mapType(goType, structs)
+	}
+	if text.startsWith(goType, "unsupported(") {
+		return Result.Error("is " + unsupportedReason(goType) + ", which has no Hive shape.")
+	}
+	if indexOf(structs, goType) is Result.Ok(_) {
+		return Result.Ok(plain(goType))
+	}
+	return Result.Error("is a Go `{goType}`, which is not a type Hive has a shape for. What crosses the boundary is `string`, `int`, `float64`, `bool`, a slice or map of those, or a struct the file itself declares.")
+}
+
+// `map[K]V` split into its two halves, minding a key that is itself a map.
+proc mapType(goType: Str, structs: Str[]): Result<ast.TypeExpr, Str> {
+	cs := text.chars(goType)
+	mut depth := 0
+	mut shut := -1
+	for i := 3; i < len(cs); i++ {
+		c := text.charAt(cs, i)
+		if c == "[" {
+			depth = depth + 1
+		} else if c == "]" {
+			depth = depth - 1
+			if depth == 0 {
+				shut = i
+				i = len(cs)
+			}
+		}
+	}
+	if shut < 0 {
+		return Result.Error("is a Go map this compiler could not read.")
+	}
+	key := text.span(cs, 4, shut - 1)
+	value := text.span(cs, shut + 1, len(cs) - 1)
+	// A map's key is compared and hashed whole on both sides, so it is a scalar.
+	// A Go map keyed by a struct is legal Go and would be legal Hive, but the
+	// order its keys come back in is the order they were *set* in — and a Go map
+	// has no such order to hand over, so they arrive sorted, which needs a key
+	// that sorts.
+	if key == "string" || key == "int" || key == "float64" || key == "bool" {
+	} else {
+		return Result.Error("is a Go map keyed by `{key}`, and only a `string`, `int`, `float64` or `bool` key crosses the boundary. A Go map has no order of its own, so its keys arrive sorted — which needs a key that sorts.")
+	}
+	keyType := hiveType(key, structs)
+	valueType := hiveType(value, structs)
+	if keyType is Result.Ok(k) && valueType is Result.Ok(v) {
+		return Result.Ok(ast.TypeExpr.Named("hive.map", "Map", [k, v], []))
+	}
+	if valueType is Result.Error(why) {
+		return Result.Error(why)
+	}
+	return Result.Error("is a Go map this compiler could not read.")
+}
+
+func vectorOf(element: ast.TypeExpr): Result<ast.TypeExpr, Str> {
+	if element is ast.TypeExpr.Named(pkg, name, args, dims) {
+		mut ast.Dim[dyn] out = [ast.Dim.Dynamic()]
+		for each d in dims {
+			append(out, d)
+		}
+		return Result.Ok(ast.TypeExpr.Named(pkg, name, args, out))
+	}
+	return Result.Error("is a slice of something that has no Hive shape, so the slice has none either.")
+}
+
+// `unsupported(pointer)` — the word in the brackets, as a clause.
+func unsupportedReason(rendered: Str): Str {
+	inside := before(after(rendered, "("), ")")
+	return "a Go " + inside
+}
+
+func plain(name: Str): ast.TypeExpr {
+	return ast.TypeExpr.Named("", name, [], [])
+}
+
+func resultOf(ok: ast.TypeExpr): ast.TypeExpr {
+	return ast.TypeExpr.Named("", "Result", [ok, plain("Str")], [])
+}
+
+func before(whole: Str, separator: Str): Str {
+	pieces := split(whole, separator)
+	if pieces bounds 0 {
+		return pieces[0]
+	}
+	return whole
+}
+
+func after(whole: Str, separator: Str): Str {
+	pieces := split(whole, separator)
+	if len(pieces) < 2 {
+		return ""
+	}
+	mut out := ""
+	mut i := 1
+	for ; i < len(pieces); {
+		if pieces bounds i {
+			if i > 1 {
+				out = out + separator
+			}
+			out = out + pieces[i]
+		}
+		i = i + 1
+	}
+	return out
+}
+
+// --- The package a Go file becomes -------------------------------------------
+
+/// The Go package name an imported file is compiled as inside the generated
+/// project. It gets a directory of its own so two files never share one, and the
+/// name is the path with everything that is not a Go identifier replaced — which
+/// is what keeps two files of the same name in different folders apart.
+func packageOf(path: Str): Str {
+	mut out := "ffi_"
+	for each c in text.chars(paths.normalise(path)) {
+		if text.isAlnum(c) {
+			out = out + text.lower(c)
+		} else if text.endsWith(out, "_") == false {
+			out = out + "_"
+		}
+	}
+	if text.endsWith(out, "_") {
+		return text.span(text.chars(out), 0, len(out) - 2)
+	}
+	return out
+}
+
+// --- Asking the Go toolchain -------------------------------------------------
+
+// Runs the reader over `path` and answers with what it printed.
+//
+// The file is copied into the tool's own directory first, under a name that is
+// not a `.go` one — so `go run .` still compiles only the reader, and the
+// reader's argument needs no absolute path to be found.
+proc run(path: Str, display: Str): Result<Str, Str> {
+	where := install()
+	if where is Result.Error(why) {
+		return Result.Error(why)
+	}
+	if where is Result.Ok(directory) {
+		source := hive.file.read(path)
+		if source is Result.Error(why) {
+			return Result.Error("could not read {display}: {why.message}")
+		}
+		if source is Result.Ok(contents) {
+			if hive.file.write(paths.joinPath(directory, "subject.gotext"), contents) is Result.Error(why) {
+				return Result.Error("could not stage {display} for reading: {why.message}")
+			}
+		}
+		said := hive.term.exec("go", ["run", ".", "subject.gotext"], directory)
+		if said is Result.Ok(printed) {
+			return Result.Ok(printed)
+		}
+		if said is Result.Error(why) {
+			if why.code < 0 {
+				return Result.Error("importing a Go file needs the Go toolchain on the PATH, and `go` is not there. It is the same toolchain a build already needs; install it from https://go.dev/dl/.")
+			}
+			return Result.Error("the Go toolchain could not read {display}. A Go file has to be valid Go before Hive can call it:\n\n" + why.output)
+		}
+	}
+	return Result.Error("could not run the Go declaration reader")
+}
+
+// Writes the reader into this compiler's cache if it is not already there, and
+// answers with its directory. It is written rather than shipped because it has
+// to be *compiled* by the toolchain on this machine; after the first run Go's
+// own build cache makes this near-instant.
+proc install(): Result<Str, Str> {
+	directory := paths.joinPath(fetch.hiveHome(), "tool/godecl")
+	if hive.file.makeDir(directory) is Result.Error(why) {
+		return Result.Error("could not make {directory}: {why.message}")
+	}
+	if write(paths.joinPath(directory, "go.mod"), "module hivegodecl\n\ngo 1.24\n") is Result.Error(why) {
+		return Result.Error(why)
+	}
+	if write(paths.joinPath(directory, "main.go"), godeclSource() + "\n") is Result.Error(why) {
+		return Result.Error(why)
+	}
+	return Result.Ok(directory)
+}
+
+// Written only when it differs, so an unchanged tool is left alone and Go's
+// build cache keeps holding it.
+proc write(path: Str, contents: Str): Result<Bool, Str> {
+	if hive.file.read(path) is Result.Ok(already) {
+		if already == contents {
+			return Result.Ok(true)
+		}
+	}
+	if hive.file.write(path, contents) is Result.Error(why) {
+		return Result.Error("could not write {path}: {why.message}")
+	}
+	return Result.Ok(true)
+}
+
+
+/// The reader itself: a Go program that parses one Go file with Go's own parser
+/// and prints one declaration per line, tab-separated. It is written into the
+/// cache rather than shipped because it has to be compiled by the toolchain on
+/// this machine.
+func godeclSource(): Str {
+	return `
+		// godecl prints what Hive can reach in one Go file: the functions it exports,
+		// the structs they mention, and what the file imports.
+		//
+		// It is written here by the Hive compiler (see src/goffi.hive) and run with
+		// go run. The output is one declaration per line, tab-separated, because the
+		// compiler reading it needs no JSON decoder for this and having one would not
+		// make it clearer:
+		//
+		//     package<TAB>util
+		//     import<TAB>strings
+		//     func<TAB>Slugify<TAB>s:string<TAB>string
+		//     func<TAB>Fetch<TAB>url:string|retries:int<TAB>string,error
+		//     type<TAB>Point<TAB>X:float64|Y:float64
+		//
+		// A type Hive has no shape for is printed as unsupported(<what>), which
+		// carries none of the separators above — so the line still reads, and the
+		// compiler can say exactly which parameter it could not take.
+		package main
+
+		import (
+			"fmt"
+			"go/ast"
+			"go/parser"
+			"go/token"
+			"os"
+			"strconv"
+			"strings"
+		)
+
+		func main() {
+			if len(os.Args) != 2 {
+				fmt.Fprintln(os.Stderr, "usage: godecl <file.go>")
+				os.Exit(2)
+			}
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, os.Args[1], nil, parser.SkipObjectResolution)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err.Error())
+				os.Exit(1)
+			}
+			out := &strings.Builder{}
+			fmt.Fprintf(out, "package\t%s\n", file.Name.Name)
+			for _, imported := range file.Imports {
+				path, err := strconv.Unquote(imported.Path.Value)
+				if err != nil {
+					continue
+				}
+				fmt.Fprintf(out, "import\t%s\n", path)
+			}
+			for _, decl := range file.Decls {
+				switch d := decl.(type) {
+				case *ast.FuncDecl:
+					// A method belongs to its type, and an unexported function is the
+					// file's own business.
+					if d.Recv != nil || !d.Name.IsExported() {
+						continue
+					}
+					fmt.Fprintf(out, "func\t%s\t%s\t%s\n", d.Name.Name, params(d.Type), results(d.Type))
+				case *ast.GenDecl:
+					if d.Tok != token.TYPE {
+						continue
+					}
+					for _, spec := range d.Specs {
+						ts, ok := spec.(*ast.TypeSpec)
+						if !ok || !ts.Name.IsExported() {
+							continue
+						}
+						st, ok := ts.Type.(*ast.StructType)
+						if !ok {
+							continue
+						}
+						fmt.Fprintf(out, "type\t%s\t%s\n", ts.Name.Name, fields(st))
+					}
+				}
+			}
+			fmt.Print(out.String())
+		}
+
+		// params renders a parameter list as name:type pairs. A parameter with no name
+		// of its own is given one, since the Hive side names every parameter.
+		func params(t *ast.FuncType) string {
+			if t.Params == nil {
+				return ""
+			}
+			parts := []string{}
+			position := 0
+			for _, field := range t.Params.List {
+				rendered := render(field.Type)
+				if len(field.Names) == 0 {
+					parts = append(parts, fmt.Sprintf("arg%d:%s", position, rendered))
+					position++
+					continue
+				}
+				for _, name := range field.Names {
+					parts = append(parts, name.Name+":"+rendered)
+					position++
+				}
+			}
+			return strings.Join(parts, "|")
+		}
+
+		// results renders what a function answers with, in order. Named results are
+		// counted, not named: what a caller gets is the types.
+		func results(t *ast.FuncType) string {
+			if t.Results == nil {
+				return ""
+			}
+			parts := []string{}
+			for _, field := range t.Results.List {
+				rendered := render(field.Type)
+				count := len(field.Names)
+				if count == 0 {
+					count = 1
+				}
+				for i := 0; i < count; i++ {
+					parts = append(parts, rendered)
+				}
+			}
+			return strings.Join(parts, ",")
+		}
+
+		// fields renders a struct's fields. An unexported or embedded one is reported as
+		// what it is rather than skipped: a struct crosses the boundary whole, so the
+		// compiler has to be able to say why one cannot.
+		func fields(st *ast.StructType) string {
+			parts := []string{}
+			for _, field := range st.Fields.List {
+				rendered := render(field.Type)
+				if len(field.Names) == 0 {
+					parts = append(parts, "embedded:unsupported(embedded field)")
+					continue
+				}
+				for _, name := range field.Names {
+					if !name.IsExported() {
+						parts = append(parts, name.Name+":unsupported(unexported)")
+						continue
+					}
+					parts = append(parts, name.Name+":"+rendered)
+				}
+			}
+			return strings.Join(parts, "|")
+		}
+
+		// render is the type as Hive's side reads it. Everything Hive has no shape for
+		// says so in one token, naming what it was.
+		func render(expr ast.Expr) string {
+			switch t := expr.(type) {
+			case *ast.Ident:
+				if t.Name == "any" {
+					return "unsupported(interface)"
+				}
+				return t.Name
+			case *ast.ArrayType:
+				if t.Len != nil {
+					return "unsupported(fixed-size array)"
+				}
+				return "[]" + render(t.Elt)
+			case *ast.MapType:
+				return "map[" + render(t.Key) + "]" + render(t.Value)
+			case *ast.StarExpr:
+				return "unsupported(pointer)"
+			case *ast.SelectorExpr:
+				return "unsupported(a type from another package)"
+			case *ast.Ellipsis:
+				return "unsupported(variadic)"
+			case *ast.FuncType:
+				return "unsupported(function)"
+			case *ast.ChanType:
+				return "unsupported(channel)"
+			case *ast.InterfaceType:
+				return "unsupported(interface)"
+			case *ast.StructType:
+				return "unsupported(unnamed struct)"
+			}
+			return "unsupported(this type)"
+		}
+	`
+}

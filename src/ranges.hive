@@ -1,0 +1,746 @@
+// Ranges — the bounds pass
+// ========================
+// Every index and every slice, proved in range at compile time — so the
+// generated Go can never fail out of one.
+//
+// The pass is **flow-sensitive**: what it knows depends on where it is. A guard
+// proves something for the branch under it and nothing outside it; a loop's
+// condition proves something for its body; a rebinding of the vector costs
+// whatever had been proved about it. Anything it cannot prove is a compile error
+// rather than a runtime crash, which is the whole trade the language is making.
+//
+// Two things it does not have to work out for itself, because `infer` already
+// did. A vector's **length** is part of its type, so `Str[3]` arrives knowing it
+// holds three — and so does `map(v, f)`, which preserves it, and `a + b`, which
+// adds the two. What this pass adds is the *flow*: which guard is in scope, and
+// what an assignment has cost.
+import ./ast
+import ./diag
+import ./infer
+import ./types
+
+// What the pass knows right here.
+type Proofs {
+	table: types.Table
+	errors: diag.Diagnostic[dyn]
+	/// The declaration being walked, which is what a message names.
+	inside: Str
+	line: Int
+	/// The `vector|index` pairs proved in range right here. A scope pushes and
+	/// pops it, because a guard proves nothing outside its own branch.
+	proved: Str[dyn]
+	/// The names whose length is no longer known: an inferred one that has been
+	/// rebound, or a vector something may have made shorter.
+	lost: Str[dyn]
+	/// The names whose length was *declared*. A declared length is a promise
+	/// rather than an observation — every value that lands in a `Str[3]` slot is
+	/// three, wherever it came from — so nothing an assignment does costs it.
+	promised: Str[dyn]
+	/// What each name bound to an `indexOf` searched, as `name|vector`. The
+	/// search and the match of it are two statements — `found := indexOf(v, x)`
+	/// and `if found is Result.Ok(i)` — so which vector the answer is an index
+	/// into has to survive the gap between them.
+	searches: Str[dyn]
+}
+
+/// Prove every access in a flattened program, or say which one cannot be.
+proc checkModule(m: ast.Module): diag.Diagnostic[dyn] {
+	t := types.tableOf(m)
+	mut Proofs bo = Proofs(t, [], "", 0, [], [], [], [])
+	env := infer.newEnv(t)
+	for each d in m.decls {
+		checkDecl(bo, env, d)
+	}
+	return bo.errors
+}
+
+proc report(bo: mut Proofs, message: Str): void {
+	append(bo.errors, diag.Diagnostic("", bo.line, diag.inDecl(bo.inside, message)))
+}
+
+// --- Declarations ------------------------------------------------------------
+
+proc checkDecl(bo: mut Proofs, env: infer.Env, d: ast.Decl): void {
+	if d is ast.Decl.CallableDecl(_, name, params, _, body, line) {
+		bo.inside = name
+		bo.line = line
+		bo.proved = []
+		bo.lost = []
+		bo.promised = []
+		bo.searches = []
+		mut infer.Env inner = env
+		for each p in params {
+			// A parameter's declared length is a promise too, kept at every call
+			// site — which is what lets the callee index it unguarded.
+			promise(bo, p.name, p.declared)
+			inner = infer.bound(inner, p.name, types.resolve(bo.table, p.declared))
+		}
+		checkBlock(bo, inner, body)
+	} else if d is ast.Decl.QueryDecl(name, params, _, sql, line) {
+		bo.inside = name
+		bo.line = line
+		bo.proved = []
+		bo.lost = []
+		bo.promised = []
+		bo.searches = []
+		mut infer.Env inner = env
+		for each p in params {
+			promise(bo, p.name, p.declared)
+			inner = infer.bound(inner, p.name, types.resolve(bo.table, p.declared))
+		}
+		// A query body holds no index of its own, but the expressions in it are
+		// expressions: a bound value can be `v[0]` like anything else.
+		checkSql(bo, inner, sql)
+	} else if d is ast.Decl.TestDecl(title, body, line) {
+		bo.inside = "\"{title}\""
+		bo.line = line
+		bo.proved = []
+		bo.lost = []
+		bo.promised = []
+		bo.searches = []
+		checkBlock(bo, env, body)
+	}
+}
+
+proc checkSql(bo: mut Proofs, env: infer.Env, parts: ast.SqlPart[]): void {
+	for each part in parts {
+		if part is ast.SqlPart.Param(value) {
+			checkExpr(bo, env, value)
+		} else if part is ast.SqlPart.Where(group) {
+			checkSqlGroup(bo, env, group)
+		}
+	}
+}
+
+proc checkSqlGroup(bo: mut Proofs, env: infer.Env, group: ast.SqlGroup): void {
+	for each item in group.items {
+		if item is ast.SqlItem.Cond(condition, body) {
+			checkExpr(bo, env, condition)
+			// A guard in a WHERE block proves nothing about the predicate it
+			// opens: what it decides is whether the predicate is *there*.
+			mark := len(bo.proved)
+			learn(bo, env, condition)
+			checkSql(bo, env, body)
+			forget(bo, mark)
+		} else if item is ast.SqlItem.Nested(inner) {
+			checkSqlGroup(bo, env, inner)
+		}
+	}
+}
+
+// A declaration whose type says a length is a promise the compiler holds every
+// value that lands there to.
+proc promise(bo: mut Proofs, name: Str, declared: ast.TypeExpr): void {
+	if types.dimOf(types.resolve(bo.table, declared)) is ast.Dim.Fixed(_) {
+		if indexOf(bo.promised, name) is Result.Error(_) {
+			append(bo.promised, name)
+		}
+	}
+}
+
+// --- Statements --------------------------------------------------------------
+
+proc checkBlock(bo: mut Proofs, env: infer.Env, b: ast.Block): infer.Env {
+	mark := len(bo.proved)
+	mut infer.Env inner = env
+	for each s in b.stmts {
+		inner = checkStmt(bo, inner, s)
+	}
+	forget(bo, mark)
+	return inner
+}
+
+// Everything proved after `mark` goes out of scope with the block that proved
+// it.
+proc forget(bo: mut Proofs, mark: Int): void {
+	last := len(bo.proved) - 1
+	if mark <= last && bo.proved bounds mark {
+		if bo.proved bounds last {
+			drop(bo.proved, mark, last)
+		}
+	}
+}
+
+proc checkStmt(bo: mut Proofs, env: infer.Env, s: ast.Stmt): infer.Env {
+	if s is ast.Stmt.VarDecl(name, value, _, _) {
+		checkExpr(bo, env, value)
+		rememberSearch(bo, name, value)
+		return infer.bound(env, name, infer.typeOf(env, value))
+	} else if s is ast.Stmt.TypedDecl(declared, name, value, _, _) {
+		checkExpr(bo, env, value)
+		promise(bo, name, declared)
+		rememberSearch(bo, name, value)
+		return infer.bound(env, name, types.resolve(bo.table, declared))
+	} else if s is ast.Stmt.Assign(target, value) {
+		checkExpr(bo, env, value)
+		checkExpr(bo, env, target)
+		// Rebinding a vector costs every length and index fact about it: the
+		// proof was about the old value, and this is a different one.
+		rebind(bo, target)
+		// And a name pointed at a different search is no longer about the vector
+		// the old one searched.
+		forgetSearch(bo, target)
+		rememberSearch(bo, pathKey(target), value)
+		return env
+	} else if s is ast.Stmt.IfChain(branches, otherwise, hasElse) {
+		for each b in branches {
+			checkExpr(bo, env, b.condition)
+			mark := len(bo.proved)
+			// A guard proves something for the branch under it, and nothing
+			// outside it.
+			learn(bo, env, b.condition)
+			checkBlock(bo, infer.narrowed(env, b.condition), b.body)
+			forget(bo, mark)
+		}
+		if hasElse {
+			checkBlock(bo, env, otherwise)
+		}
+		// An inferred length dies in a branch that may not even run, so what any
+		// branch rebound is lost from here on.
+		loseAssigned(bo, s)
+		return env
+	}
+	return checkStmtTail(bo, env, s)
+}
+
+proc checkStmtTail(bo: mut Proofs, env: infer.Env, s: ast.Stmt): infer.Env {
+	if s is ast.Stmt.ForLoop(init, cond, post, body) {
+		inner := checkStmt(bo, env, init)
+		checkExpr(bo, inner, cond)
+		mark := len(bo.proved)
+		// The condition of a counting loop is a guard like any other, and holds
+		// for every pass of the body.
+		learn(bo, inner, cond)
+		checkStmt(bo, inner, post)
+		checkBlock(bo, inner, body)
+		forget(bo, mark)
+		loseAssigned(bo, s)
+		return env
+	} else if s is ast.Stmt.ForEach(name, declared, subject, body) {
+		checkExpr(bo, env, subject)
+		mut element := types.elementOf(infer.typeOf(env, subject))
+		if declared is ast.TypeExpr.VoidType {
+		} else {
+			element = types.resolve(bo.table, declared)
+		}
+		// A `for each` never indexes, so there is nothing here to prove.
+		checkBlock(bo, infer.bound(env, name, element), body)
+		loseAssigned(bo, s)
+		return env
+	} else if s is ast.Stmt.ReturnStmt(value) {
+		checkExpr(bo, env, value)
+		return env
+	} else if s is ast.Stmt.EchoStmt(value) {
+		checkExpr(bo, env, value)
+		return env
+	} else if s is ast.Stmt.AssertStmt(condition) {
+		checkExpr(bo, env, condition)
+		return env
+	} else if s is ast.Stmt.PanicStmt(value) {
+		checkExpr(bo, env, value)
+		return env
+	} else if s is ast.Stmt.AsyncStmt(call) {
+		checkExpr(bo, env, call)
+		return env
+	} else if s is ast.Stmt.Expression(value) {
+		checkExpr(bo, env, value)
+		// `drop` is the one builtin that makes a vector shorter, so it costs that
+		// vector whatever had been proved about it.
+		loseAssigned(bo, s)
+		return env
+	}
+	return env
+}
+
+// --- What a guard proves -----------------------------------------------------
+
+// The shapes a guard takes, and what each one proves. Everything here is
+// `&&`-separated, because a fact from one side of `||` does not hold on the
+// other.
+proc learn(bo: mut Proofs, env: infer.Env, condition: ast.Expr): void {
+	if condition is ast.Expr.Binary(op, left, right) {
+		if op is ast.BinOp.And {
+			learn(bo, env, left)
+			learn(bo, env, right)
+			return
+		}
+		// `i < len(v)` proves the high half; the low half is `i >= 0`, which the
+		// other conjunct carries — and which `v bounds i` writes for you.
+		if op is ast.BinOp.Lt {
+			if lengthOf(right) is Result.Ok(vector) {
+				prove(bo, vector, left)
+				proveBelow(bo, vector, left)
+			}
+			return
+		}
+		// `1 < len(v)` the other way round, which is how a `drop`'s high bound is
+		// usually guarded.
+		if op is ast.BinOp.Gt {
+			if lengthOf(left) is Result.Ok(vector) {
+				prove(bo, vector, right)
+				proveBelow(bo, vector, right)
+			}
+			return
+		}
+		return
+	}
+	// `indexOf` answers with a position the vector really has, so an `Ok` payload
+	// arrives already proved — for that vector, and for as long as it means the
+	// same thing.
+	if condition is ast.Expr.IsMatch(subject, pattern) {
+		learnFromMatch(bo, env, subject, pattern)
+	}
+}
+
+proc learnFromMatch(bo: mut Proofs, env: infer.Env, subject: ast.Expr, pattern: ast.Pattern): void {
+	if pattern is ast.Pattern.Constructor(path, bindings, _) {
+		if nameAt(path, 0) == "Result" && nameAt(path, 1) == "Ok" {
+			if searchedVector(subject) is Result.Ok(vector) {
+				for each b in bindings {
+					prove(bo, vector, ast.Expr.Ident(b))
+				}
+			}
+			// Or the search was bound to a name first, which is how the
+			// specification writes it: what it searched was remembered there.
+			vector := searchOf(bo, pathKey(subject))
+			if vector != "" {
+				for each b in bindings {
+					proveKey(bo, vector + "|" + b)
+				}
+			}
+		}
+	}
+}
+
+// `found := indexOf(v, x)` is worth remembering, because what the `Ok` of it
+// proves is about `v` and the match of it comes later.
+proc rememberSearch(bo: mut Proofs, name: Str, value: ast.Expr): void {
+	if name == "" {
+		return
+	}
+	if searchedVector(value) is Result.Ok(vector) {
+		key := pathKey(vector)
+		if key != "" {
+			append(bo.searches, name + "|" + key)
+		}
+	}
+}
+
+// The vector `name`'s search searched, or `""` if it never held one. The last
+// entry wins, because a name bound twice means the second one.
+func searchOf(bo: Proofs, name: Str): Str {
+	mut found := ""
+	if name == "" {
+		return ""
+	}
+	for each entry in bo.searches {
+		if entry is "{who}|{vector}" && who == name {
+			found = vector
+		}
+	}
+	return found
+}
+
+// A name pointed somewhere else has no search behind it any more.
+proc forgetSearch(bo: mut Proofs, target: ast.Expr): void {
+	name := pathKey(target)
+	if name == "" {
+		return
+	}
+	mut Str[dyn] kept = []
+	for each entry in bo.searches {
+		if entry is "{who}|{_vector}" && who != name {
+			append(kept, entry)
+		}
+	}
+	bo.searches = kept
+}
+
+// The vector an `indexOf` searched, whether the call was written inline or bound
+// to a name first.
+func searchedVector(subject: ast.Expr): Result<ast.Expr, Bool> {
+	if subject is ast.Expr.Call(callee, args) {
+		if isIndexOf(callee) && len(args) >= 1 {
+			if args bounds 0 {
+				return Result.Ok(args[0].value)
+			}
+		}
+	}
+	return Result.Error(false)
+}
+
+func isIndexOf(callee: ast.Expr): Bool {
+	if callee is ast.Expr.Ident(name) {
+		return name == "indexOf"
+	}
+	if callee is ast.Expr.Member(head, name) {
+		if head is ast.Expr.Ident(hiveName) {
+			return hiveName == "hive" && name == "indexOf"
+		}
+	}
+	return false
+}
+
+// The vector a `len(...)` was taken of.
+func lengthOf(e: ast.Expr): Result<ast.Expr, Bool> {
+	if e is ast.Expr.Call(callee, args) {
+		if args bounds 0 {
+			if callee is ast.Expr.Ident(name) {
+				if name == "len" {
+					return Result.Ok(args[0].value)
+				}
+			}
+			if callee is ast.Expr.Member(head, name) {
+				if head is ast.Expr.Ident(hiveName) {
+					if hiveName == "hive" && name == "len" {
+						return Result.Ok(args[0].value)
+					}
+				}
+			}
+		}
+	}
+	return Result.Error(false)
+}
+
+// A guard on a literal high bound proves every position under it too: a length
+// is never negative, so `1 < len(v)` says the vector has a 0 as surely as it
+// says it has a 1. That is what lets `drop(v, 0, 1)` need one guard rather than
+// two.
+proc proveBelow(bo: mut Proofs, vector: ast.Expr, index: ast.Expr): void {
+	if index is ast.Expr.IntLit(high) {
+		for i := 0; i < high; i++ {
+			prove(bo, vector, ast.Expr.IntLit(i))
+		}
+	}
+}
+
+proc prove(bo: mut Proofs, vector: ast.Expr, index: ast.Expr): void {
+	proveKey(bo, pairKey(vector, index))
+}
+
+proc proveKey(bo: mut Proofs, key: Str): void {
+	if key != "" && indexOf(bo.proved, key) is Result.Error(_) {
+		append(bo.proved, key)
+	}
+}
+
+func isProved(bo: Proofs, vector: ast.Expr, index: ast.Expr): Bool {
+	key := pairKey(vector, index)
+	return key != "" && indexOf(bo.proved, key) is Result.Ok(_)
+}
+
+// --- What an assignment costs ------------------------------------------------
+
+// A vector that has been written over is a different vector, so every fact about
+// it goes.
+proc rebind(bo: mut Proofs, target: ast.Expr): void {
+	name := rootOf(target)
+	if name == "" {
+		return
+	}
+	// Writing *through* a name — `v[i] = x` — swaps an element without changing
+	// the length, so only replacing the name itself costs anything.
+	if target is ast.Expr.Ident(_) {
+		lose(bo, name)
+		return
+	}
+	// Replacing a field costs whatever had been proved about the old value,
+	// exactly as rebinding a variable does.
+	if target is ast.Expr.Member(_, _) {
+		lose(bo, name)
+	}
+}
+
+proc lose(bo: mut Proofs, name: Str): void {
+	// A declared length survives everything: it is a promise rather than an
+	// observation, and the checker held every value that reached it to that
+	// promise. Only what a guard proved about the old value goes.
+	if indexOf(bo.promised, name) is Result.Error(_) {
+		if indexOf(bo.lost, name) is Result.Error(_) {
+			append(bo.lost, name)
+		}
+	}
+	// Every proof about it went with it.
+	mut Str[dyn] kept = []
+	for each entry in bo.proved {
+		if startsWithName(entry, name) == false {
+			append(kept, entry)
+		}
+	}
+	bo.proved = kept
+}
+
+func startsWithName(entry: Str, name: Str): Bool {
+	pieces := split(entry, "|")
+	return nameAt(pieces, 0) == name
+}
+
+// Everything any branch of a statement rebound. An inferred length dies even in
+// a branch that may not run, because what the compiler knows has to hold on
+// every path through.
+proc loseAssigned(bo: mut Proofs, s: ast.Stmt): void {
+	for each name in assignedIn(s) {
+		lose(bo, name)
+	}
+}
+
+func assignedIn(s: ast.Stmt): Str[dyn] {
+	mut Str[dyn] out = []
+	if s is ast.Stmt.Assign(target, _) {
+		name := rootOf(target)
+		if name != "" {
+			append(out, name)
+		}
+		return out
+	}
+	if s is ast.Stmt.IfChain(branches, otherwise, _) {
+		for each b in branches {
+			out = joined(out, assignedInBlock(b.body))
+		}
+		return joined(out, assignedInBlock(otherwise))
+	}
+	if s is ast.Stmt.ForLoop(_, _, post, body) {
+		return joined(assignedIn(post), assignedInBlock(body))
+	}
+	if s is ast.Stmt.ForEach(_, _, _, body) {
+		return assignedInBlock(body)
+	}
+	// `drop` is the one builtin that makes a vector shorter, so it costs that
+	// vector whatever had been proved about it.
+	if s is ast.Stmt.Expression(value) {
+		return shortenedBy(value)
+	}
+	return out
+}
+
+func assignedInBlock(b: ast.Block): Str[dyn] {
+	mut Str[dyn] out = []
+	for each s in b.stmts {
+		out = joined(out, assignedIn(s))
+	}
+	return out
+}
+
+func shortenedBy(value: ast.Expr): Str[dyn] {
+	mut Str[dyn] out = []
+	if value is ast.Expr.Call(callee, args) {
+		if isNamed(callee, "drop") && len(args) >= 1 {
+			if args bounds 0 {
+				name := rootOf(args[0].value)
+				if name != "" {
+					append(out, name)
+				}
+			}
+		}
+	}
+	return out
+}
+
+func isNamed(callee: ast.Expr, wanted: Str): Bool {
+	if callee is ast.Expr.Ident(name) {
+		return name == wanted
+	}
+	if callee is ast.Expr.Member(head, name) {
+		if head is ast.Expr.Ident(hiveName) {
+			return hiveName == "hive" && name == wanted
+		}
+	}
+	return false
+}
+
+func joined(a: Str[], b: Str[]): Str[dyn] {
+	mut Str[dyn] out = []
+	for each name in a {
+		append(out, name)
+	}
+	for each name in b {
+		if indexOf(out, name) is Result.Error(_) {
+			append(out, name)
+		}
+	}
+	return out
+}
+
+// --- Expressions -------------------------------------------------------------
+
+proc checkExpr(bo: mut Proofs, env: infer.Env, e: ast.Expr): void {
+	if e is ast.Expr.Index(subject, index) {
+		checkExpr(bo, env, subject)
+		checkExpr(bo, env, index)
+		checkIndex(bo, env, subject, index)
+	} else if e is ast.Expr.Slice(subject, low, high) {
+		checkExpr(bo, env, subject)
+		checkExpr(bo, env, low)
+		checkExpr(bo, env, high)
+		checkBound(bo, env, subject, low)
+		checkBound(bo, env, subject, high)
+	} else if e is ast.Expr.Call(callee, args) {
+		checkExpr(bo, env, callee)
+		for each a in args {
+			checkExpr(bo, env, a.value)
+		}
+		checkDrop(bo, env, callee, args)
+	} else if e is ast.Expr.Binary(_, left, right) {
+		checkExpr(bo, env, left)
+		checkExpr(bo, env, right)
+	} else if e is ast.Expr.Negate(operand) {
+		checkExpr(bo, env, operand)
+	} else if e is ast.Expr.Member(subject, _) {
+		checkExpr(bo, env, subject)
+	} else if e is ast.Expr.VectorLit(items) {
+		for each item in items {
+			checkExpr(bo, env, item)
+		}
+	} else if e is ast.Expr.Interp(parts) {
+		for each part in parts {
+			if part is ast.InterpPart.Expression(value) {
+				checkExpr(bo, env, value)
+			}
+		}
+	} else if e is ast.Expr.IsMatch(subject, _) {
+		checkExpr(bo, env, subject)
+	}
+}
+
+// `drop`'s bounds are proven in range exactly as a slice's are: they are the
+// same two numbers.
+proc checkDrop(bo: mut Proofs, env: infer.Env, callee: ast.Expr, args: ast.Arg[]): void {
+	if isNamed(callee, "drop") == false || len(args) != 3 {
+		return
+	}
+	if args bounds 0 {
+		subject := args[0].value
+		if args bounds 1 {
+			checkBound(bo, env, subject, args[1].value)
+		}
+		if args bounds 2 {
+			checkBound(bo, env, subject, args[2].value)
+		}
+	}
+}
+
+proc checkIndex(bo: mut Proofs, env: infer.Env, subject: ast.Expr, index: ast.Expr): void {
+	if provable(bo, env, subject, index) {
+		return
+	}
+	report(bo, refusal(bo, env, subject, index))
+}
+
+// A slice's bound, which is proved the same way an index is — except that a
+// bound left out is `0` at one end and the last element at the other, and
+// neither of those can be out of range.
+proc checkBound(bo: mut Proofs, env: infer.Env, subject: ast.Expr, bound: ast.Expr): void {
+	if bound is ast.Expr.Absent {
+		return
+	}
+	if provable(bo, env, subject, bound) {
+		return
+	}
+	report(bo, refusal(bo, env, subject, bound))
+}
+
+func provable(bo: Proofs, env: infer.Env, subject: ast.Expr, index: ast.Expr): Bool {
+	// A guard in scope, or an index that came from `indexOf`.
+	if isProved(bo, subject, index) {
+		return true
+	}
+	// A literal index into a vector whose length is known is decided outright.
+	if index is ast.Expr.IntLit(at) {
+		if knownLength(bo, env, subject) is Result.Ok(n) {
+			return at >= 0 && at < n
+		}
+		return false
+	}
+	return false
+}
+
+// The length of a vector, when the compiler knows it. A declared length is a
+// promise and is never lost; an inferred one dies the moment the name is
+// rebound, which `lost` is what records.
+func knownLength(bo: Proofs, env: infer.Env, subject: ast.Expr): Result<Int, Bool> {
+	name := rootOf(subject)
+	if name != "" && indexOf(bo.lost, name) is Result.Ok(_) {
+		return Result.Error(false)
+	}
+	if types.dimOf(infer.typeOf(env, subject)) is ast.Dim.Fixed(n) {
+		return Result.Ok(n)
+	}
+	return Result.Error(false)
+}
+
+// The message. It says which of the three things went wrong, because each has a
+// different fix.
+func refusal(bo: Proofs, env: infer.Env, subject: ast.Expr, index: ast.Expr): Str {
+	written := describe(subject)
+	if index is ast.Expr.IntLit(at) {
+		if knownLength(bo, env, subject) is Result.Ok(n) {
+			return "`{written}` holds {n}, so `{at}` is not a position it has"
+		}
+		return "cannot prove `{at}` is in range: `{written}` has no length the compiler knows. Guard it — `if {written} bounds {at} \{ ... }` — or declare the vector with a length"
+	}
+	if index is ast.Expr.Ident(name) {
+		return "cannot prove `{name}` is in range for `{written}`. Guard it — `if {written} bounds {name} \{ ... }` — or take it from `indexOf`, whose `Ok` payload is always a position the vector really has"
+	}
+	return "cannot prove this index is in range: it is a computed expression, and there is nothing to hang a guard on. Bind it to a name first, then guard that"
+}
+
+func describe(e: ast.Expr): Str {
+	name := rootOf(e)
+	if name == "" {
+		return "this vector"
+	}
+	return name
+}
+
+// --- Keys --------------------------------------------------------------------
+
+// A stable name for the pair a guard proves, so the guard and the access agree
+// about what was proved. Anything that is not a plain path has no key, and so is
+// never proved — which is the conservative answer.
+func pairKey(vector: ast.Expr, index: ast.Expr): Str {
+	left := pathKey(vector)
+	right := pathKey(index)
+	if left == "" || right == "" {
+		return ""
+	}
+	return left + "|" + right
+}
+
+func pathKey(e: ast.Expr): Str {
+	if e is ast.Expr.Ident(name) { return name }
+	if e is ast.Expr.Member(subject, field) {
+		inner := pathKey(subject)
+		if inner == "" {
+			return ""
+		}
+		return inner + "." + field
+	}
+	// `grid[0]` is a stable name for a row as long as the index is a literal, so
+	// a guard on it proves something the access can use. A computed index names a
+	// different element each time and has no key.
+	if e is ast.Expr.Index(subject, index) {
+		inner := pathKey(subject)
+		if index is ast.Expr.IntLit(at) {
+			if inner != "" {
+				return inner + "[{at}]"
+			}
+		}
+		return ""
+	}
+	if e is ast.Expr.IntLit(v) { return "{v}" }
+	return ""
+}
+
+func rootOf(e: ast.Expr): Str {
+	if e is ast.Expr.Ident(name) { return name }
+	if e is ast.Expr.Member(subject, _) { return rootOf(subject) }
+	if e is ast.Expr.Index(subject, _) { return rootOf(subject) }
+	return ""
+}
+
+func nameAt(path: Str[], index: Int): Str {
+	if path bounds index {
+		return path[index]
+	}
+	return ""
+}

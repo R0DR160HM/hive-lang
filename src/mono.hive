@@ -1,0 +1,748 @@
+// Monomorphization
+// ================
+// A generic callable or type, and one concrete copy of it per set of type
+// arguments it is used at — so every pass after this one sees ordinary code.
+//
+// Nothing about generics is dynamic. The type arguments are read off the
+// argument types at each call site, never written there, and what comes out is
+// `first_Str` beside `first_Int`: no boxing, no dispatch, no reflection.
+//
+// Because each copy is an ordinary declaration, **every later check runs on it
+// separately**. Two of them get sharper for it: an instantiation at `Str[3]` is
+// held to that length while one at `Str[dyn]` guards its indexes, which is the
+// right answer for both.
+//
+// It is a worklist. A copy may itself call something generic — `filterMap`
+// calling `first` — so instantiating one can ask for another, and the loop runs
+// until nothing new is asked for. A generic that instantiates itself at an
+// ever-larger type would never settle, so the expansion is capped and
+// overrunning it is a compile error rather than a hung build.
+import ./ast
+import ./diag
+import ./infer
+import ./progress
+import ./text
+import ./types
+
+/// A program with every generic resolved away.
+type Expanded {
+	module: ast.Module
+	errors: diag.Diagnostic[dyn]
+}
+
+/// How many copies one program may ask for before the expansion is called
+/// runaway. A program that needs more than this has a generic instantiating
+/// itself at a bigger type every time round.
+func expansionLimit(): Int {
+	return 2000
+}
+
+type Mono {
+	table: types.Table
+	/// Every declaration of the original program.
+	source: ast.Decl[dyn]
+	/// The names that are generic, so a reference to one can be told from a
+	/// reference to anything else.
+	generics: Str[dyn]
+	/// The instantiations asked for, as `name` and the written type arguments
+	/// beside it — parallel vectors, because one of them holds types.
+	wantedNames: Str[dyn]
+	wantedArgs: ArgList[dyn]
+	/// The flat name each of them was given, in the same order.
+	wantedFlat: Str[dyn]
+	/// How far down `wanted` the worklist has got.
+	done: Int
+	errors: diag.Diagnostic[dyn]
+}
+
+/// One set of type arguments. A struct rather than a bare vector so the parallel
+/// vectors above hold something that reads as what it is.
+type ArgList {
+	written: ast.TypeExpr[dyn]
+}
+
+/// Expand every generic in a flattened program.
+/// `from` is when the command started, for the progress this pass reports.
+/// This is the slowest thing the compiler does — most of a compile is spent
+/// here — so it is the one pass that says something while it is working rather
+/// than only when it starts.
+proc expand(m: ast.Module, from: Int): Expanded {
+	t := types.tableOf(m)
+	mut Mono mo = Mono(t, m.decls, genericNames(t, m.decls), [], [], [], 0, [])
+
+	// Nothing generic is emitted as it stands: a copy is what runs, and the
+	// original is only a template.
+	mut ast.Decl[dyn] out = []
+	env := infer.newEnv(t)
+	mut walked := 0
+	for each d in m.decls {
+		if isGeneric(mo, ast.declName(d)) == false {
+			append(out, rewriteDecl(mo, env, d))
+		}
+		walked = walked + 1
+		if walked % 100 == 0 {
+			progress.step(from, "  {walked} of {len(m.decls)} declarations")
+		}
+	}
+
+	// Everything the concrete declarations asked for, and everything those copies
+	// ask for in turn.
+	for ; mo.done < len(mo.wantedNames); {
+		at := mo.done
+		mo.done = mo.done + 1
+		if at % 100 == 0 && at > 0 {
+			progress.step(from, "  {at} copies of generics made")
+		}
+		if len(mo.wantedNames) > expansionLimit() {
+			append(mo.errors, diag.at(0, "this program's generics expand without settling: more than {expansionLimit()} copies were asked for. A generic that instantiates itself at a larger type every time round never finishes"))
+			return Expanded(ast.Module([], out, m.foreign), mo.errors)
+		}
+		copy := instantiate(mo, env, at)
+		if copy is Result.Ok(made) {
+			append(out, made)
+		}
+	}
+	return Expanded(ast.Module([], out, m.foreign), mo.errors)
+}
+
+// A declaration is generic when its signature mentions a name that is neither a
+// builtin nor anything the program declared — which is the whole of what makes a
+// type variable a type variable.
+func genericNames(t: types.Table, decls: ast.Decl[]): Str[dyn] {
+	mut Str[dyn] out = []
+	for each info in t.callables {
+		if len(variablesOf(t, info.parameters)) > 0 {
+			append(out, info.name)
+		}
+	}
+	for each info in t.types {
+		if len(variablesOf(t, info.parameters)) > 0 {
+			append(out, info.name)
+		}
+	}
+	return out
+}
+
+func variablesOf(t: types.Table, names: Str[]): Str[dyn] {
+	mut Str[dyn] out = []
+	for each name in names {
+		if types.isVariable(t, name) {
+			append(out, name)
+		}
+	}
+	return out
+}
+
+func isGeneric(mo: Mono, name: Str): Bool {
+	return indexOf(mo.generics, name) is Result.Ok(_)
+}
+
+// --- Asking for a copy -------------------------------------------------------
+
+// The flat name of `name` at these arguments, asking for the copy if it has not
+// been asked for yet.
+proc wanted(mo: mut Mono, name: Str, args: ArgList): Str {
+	key := mangle(name, args)
+	if indexOf(mo.wantedFlat, key) is Result.Ok(_) {
+		return key
+	}
+	append(mo.wantedNames, name)
+	append(mo.wantedArgs, args)
+	append(mo.wantedFlat, key)
+	return key
+}
+
+/// `first` at `Str` is `first_Str`. The mangling only has to be a function of
+/// the arguments, and being readable is the rest of what it is for.
+func mangle(name: Str, args: ArgList): Str {
+	mut out := name
+	for each a in args.written {
+		out = out + "_" + spell(a)
+	}
+	return out
+}
+
+func spell(t: ast.TypeExpr): Str {
+	if t is ast.TypeExpr.VoidType {
+		return "void"
+	}
+	if t is ast.TypeExpr.Fn(_, params, result) {
+		mut out := "fn"
+		for each p in params {
+			out = out + spell(p)
+		}
+		return out + spell(result)
+	}
+	if t is ast.TypeExpr.Named(pkg, name, args, dims) {
+		mut out := text.replace(pkg, ".", "") + name
+		for each a in args {
+			out = out + spell(a)
+		}
+		for each d in dims {
+			out = out + spellDim(d)
+		}
+		return out
+	}
+	return "x"
+}
+
+func spellDim(d: ast.Dim): Str {
+	if d is ast.Dim.Fixed(size) { return "{size}" }
+	if d is ast.Dim.Dynamic { return "Dyn" }
+	return "Any"
+}
+
+// --- Making a copy -----------------------------------------------------------
+
+proc instantiate(mo: mut Mono, env: infer.Env, at: Int): Result<ast.Decl, Bool> {
+	name := nameAt(mo.wantedNames, at)
+	flat := nameAt(mo.wantedFlat, at)
+	args := argsAt(mo.wantedArgs, at)
+
+	for each d in mo.source {
+		if ast.declName(d) == name {
+			variables := variablesOfDecl(mo, d)
+			if len(variables) != len(args.written) {
+				append(mo.errors, diag.at(0, "`{name}` is generic in " + countWord(len(variables)) + ", and this use gives " + countWord(len(args.written))))
+				return Result.Error(false)
+			}
+			return Result.Ok(substituteDecl(mo, env, d, flat, variables, args))
+		}
+	}
+	return Result.Error(false)
+}
+
+func variablesOfDecl(mo: Mono, d: ast.Decl): Str[dyn] {
+	name := ast.declName(d)
+	if types.findCallable(mo.table, name) is Result.Ok(info) {
+		return variablesOf(mo.table, info.parameters)
+	}
+	if types.findType(mo.table, name) is Result.Ok(info) {
+		return variablesOf(mo.table, info.parameters)
+	}
+	mut Str[dyn] none = []
+	return none
+}
+
+func countWord(n: Int): Str {
+	if n == 1 {
+		return "1 type"
+	}
+	return "{n} types"
+}
+
+proc substituteDecl(mo: mut Mono, env: infer.Env, d: ast.Decl, flat: Str, variables: Str[], args: ArgList): ast.Decl {
+	if d is ast.Decl.TypeDecl(_, fields, variants, line) {
+		return ast.Decl.TypeDecl(flat, substituteFields(mo, fields, variables, args), substituteVariants(mo, variants, variables, args), line)
+	}
+	if d is ast.Decl.CallableDecl(kind, _, params, result, body, line) {
+		mut ast.Param[dyn] out = []
+		for each p in params {
+			append(out, ast.Param(p.name, substitute(mo, p.declared, variables, args), p.mutex))
+		}
+		// The body writes the variables down too — `mut K[dyn] out = []`,
+		// `for each v: T in values` — so each copy substitutes through its own.
+		// The parameters go into scope first, with the types this copy gave them.
+		mut infer.Env inner = env
+		for each p in out {
+			inner = infer.bound(inner, p.name, types.resolve(mo.table, p.declared))
+		}
+		return ast.Decl.CallableDecl(kind, flat, out, substitute(mo, result, variables, args), substituteBlock(mo, inner, body, variables, args), line)
+	}
+	return d
+}
+
+proc substituteFields(mo: mut Mono, fields: ast.Field[], variables: Str[], args: ArgList): ast.Field[dyn] {
+	mut ast.Field[dyn] out = []
+	for each f in fields {
+		append(out, ast.Field(f.name, substitute(mo, f.declared, variables, args)))
+	}
+	return out
+}
+
+proc substituteVariants(mo: mut Mono, variants: ast.Variant[], variables: Str[], args: ArgList): ast.Variant[dyn] {
+	mut ast.Variant[dyn] out = []
+	for each v in variants {
+		append(out, ast.Variant(v.name, substituteFields(mo, v.fields, variables, args)))
+	}
+	return out
+}
+
+/// A written type with every variable replaced, and every generic type written
+/// out replaced by the copy it names. The two halves are separate because one
+/// caller wants only the first: a constructor is told which instantiation it is
+/// building by the declaration beside it, and that has to be read before the
+/// name is rewritten.
+proc substitute(mo: mut Mono, t: ast.TypeExpr, variables: Str[], args: ArgList): ast.TypeExpr {
+	return renameGenerics(mo, substituteVars(t, variables, args))
+}
+
+/// A written type with every variable replaced by what it stands for here.
+func substituteVars(t: ast.TypeExpr, variables: Str[], args: ArgList): ast.TypeExpr {
+	if t is ast.TypeExpr.Fn(pure, params, result) {
+		mut ast.TypeExpr[dyn] out = []
+		for each p in params {
+			append(out, substituteVars(p, variables, args))
+		}
+		return ast.TypeExpr.Fn(pure, out, substituteVars(result, variables, args))
+	}
+	if t is ast.TypeExpr.Named(pkg, name, typeArgs, dims) {
+		if pkg == "" {
+			if indexOf(variables, name) is Result.Ok(which) {
+				// `T[dyn]` where `T` is `Str` is `Str[dyn]`: the variable's own
+				// dimensions go on the outside of what it stood for.
+				return layer(argAt(args, which), dims)
+			}
+		}
+		mut ast.TypeExpr[dyn] out = []
+		for each a in typeArgs {
+			append(out, substituteVars(a, variables, args))
+		}
+		return ast.TypeExpr.Named(pkg, name, out, dims)
+	}
+	return t
+}
+
+/// A generic type written out — `Box<Str>` — is a copy of its own, and what it
+/// is called after this is the copy's name.
+proc renameGenerics(mo: mut Mono, t: ast.TypeExpr): ast.TypeExpr {
+	if t is ast.TypeExpr.Fn(pure, params, result) {
+		mut ast.TypeExpr[dyn] out = []
+		for each p in params {
+			append(out, renameGenerics(mo, p))
+		}
+		return ast.TypeExpr.Fn(pure, out, renameGenerics(mo, result))
+	}
+	if t is ast.TypeExpr.Named(pkg, name, typeArgs, dims) {
+		mut ast.TypeExpr[dyn] out = []
+		for each a in typeArgs {
+			append(out, renameGenerics(mo, a))
+		}
+		if pkg == "" && isGeneric(mo, name) && len(out) > 0 {
+			return ast.TypeExpr.Named("", wanted(mo, name, ArgList(out)), [], dims)
+		}
+		return ast.TypeExpr.Named(pkg, name, out, dims)
+	}
+	return t
+}
+
+/// A constructor for a generic type, aimed at the instantiation the declaration
+/// beside it named. `Either<Str, Int> went = Either.Left("x")` builds an
+/// `Either_Str_Int`, and only the declaration could have said so — the argument
+/// pins down `A` and says nothing at all about `B`.
+proc retarget(mo: mut Mono, want: ast.TypeExpr, value: ast.Expr): ast.Expr {
+	if want is ast.TypeExpr.Named(pkg, name, typeArgs, _) {
+		if pkg == "" && isGeneric(mo, name) && len(typeArgs) > 0 {
+			flat := wanted(mo, name, ArgList(renamedAll(mo, typeArgs)))
+			return aimedAt(name, flat, value)
+		}
+	}
+	return value
+}
+
+proc renamedAll(mo: mut Mono, ts: ast.TypeExpr[]): ast.TypeExpr[dyn] {
+	mut ast.TypeExpr[dyn] out = []
+	for each t in ts {
+		append(out, renameGenerics(mo, t))
+	}
+	return out
+}
+
+// `T.Variant(...)` and `T(...)`, with `T` replaced by the copy's name.
+func aimedAt(name: Str, flat: Str, value: ast.Expr): ast.Expr {
+	if value is ast.Expr.Call(callee, args) {
+		if callee is ast.Expr.Member(head, variant) {
+			if head is ast.Expr.Ident(written) {
+				if written == name {
+					return ast.Expr.Call(ast.Expr.Member(ast.Expr.Ident(flat), variant), args)
+				}
+			}
+		}
+		if callee is ast.Expr.Ident(written) {
+			if written == name {
+				return ast.Expr.Call(ast.Expr.Ident(flat), args)
+			}
+		}
+	}
+	return value
+}
+
+// `dims` put on the outside of `inner`.
+func layer(inner: ast.TypeExpr, dims: ast.Dim[]): ast.TypeExpr {
+	if inner is ast.TypeExpr.Named(pkg, name, args, own) {
+		mut ast.Dim[dyn] out = []
+		for each d in own {
+			append(out, d)
+		}
+		for each d in dims {
+			append(out, d)
+		}
+		return ast.TypeExpr.Named(pkg, name, args, out)
+	}
+	return inner
+}
+
+func argAt(args: ArgList, index: Int): ast.TypeExpr {
+	if args.written bounds index {
+		return args.written[index]
+	}
+	return ast.TypeExpr.Named("", "Str", [], [])
+}
+
+func nameAt(names: Str[], index: Int): Str {
+	if names bounds index {
+		return names[index]
+	}
+	return ""
+}
+
+func argsAt(all: ArgList[], index: Int): ArgList {
+	if all bounds index {
+		return all[index]
+	}
+	return ArgList([])
+}
+
+// --- Rewriting a body --------------------------------------------------------
+//
+// Two things happen in a body: a written type has its variables substituted, and
+// a call to something generic becomes a call to the copy for the arguments it
+// was made with.
+
+// A declaration that is not generic still has to be walked: it may name one
+// that is, and every such reference becomes the copy for the arguments it was
+// made with.
+proc rewriteDecl(mo: mut Mono, env: infer.Env, d: ast.Decl): ast.Decl {
+	mut Str[dyn] nothing = []
+	return substituteDecl(mo, env, d, ast.declName(d), nothing, ArgList([]))
+}
+
+// A block, with every statement's bindings in scope for the ones after it. The
+// scope is what a call site is read against: `first(names)` says `T` is `Str`
+// only because `names` is known to be a `Str[2]` here.
+proc substituteBlock(mo: mut Mono, env: infer.Env, b: ast.Block, variables: Str[], args: ArgList): ast.Block {
+	mut ast.Stmt[dyn] out = []
+	mut infer.Env inner = env
+	for each s in b.stmts {
+		next := substituteStmt(mo, inner, s, variables, args)
+		append(out, next)
+		inner = bindFrom(mo, inner, next)
+	}
+	return ast.Block(out)
+}
+
+// The scope a statement leaves behind.
+func bindFrom(mo: Mono, env: infer.Env, s: ast.Stmt): infer.Env {
+	if s is ast.Stmt.VarDecl(name, value, _, _) {
+		return infer.bound(env, name, infer.typeOf(env, value))
+	}
+	if s is ast.Stmt.TypedDecl(declared, name, _, _, _) {
+		return infer.bound(env, name, types.resolve(mo.table, declared))
+	}
+	return env
+}
+
+proc substituteStmt(mo: mut Mono, env: infer.Env, s: ast.Stmt, variables: Str[], args: ArgList): ast.Stmt {
+	if s is ast.Stmt.VarDecl(name, value, mutable, deferred) {
+		return ast.Stmt.VarDecl(name, substituteExpr(mo, env, value, variables, args), mutable, deferred)
+	} else if s is ast.Stmt.TypedDecl(declared, name, value, mutable, deferred) {
+		// The variables are replaced first and the generic name second, because
+		// what the constructor needs is the type arguments as written.
+		asWritten := substituteVars(declared, variables, args)
+		newValue := retarget(mo, asWritten, substituteExpr(mo, env, value, variables, args))
+		return ast.Stmt.TypedDecl(renameGenerics(mo, asWritten), name, newValue, mutable, deferred)
+	} else if s is ast.Stmt.Assign(target, value) {
+		return ast.Stmt.Assign(substituteExpr(mo, env, target, variables, args), substituteExpr(mo, env, value, variables, args))
+	} else if s is ast.Stmt.IfChain(branches, otherwise, hasElse) {
+		mut ast.Branch[dyn] out = []
+		for each b in branches {
+			condition := substituteExpr(mo, env, b.condition, variables, args)
+			// A pattern binds into its own branch, and no further.
+			append(out, ast.Branch(condition, substituteBlock(mo, infer.narrowed(env, condition), b.body, variables, args)))
+		}
+		return ast.Stmt.IfChain(out, substituteBlock(mo, env, otherwise, variables, args), hasElse)
+	} else if s is ast.Stmt.ForLoop(init, cond, post, body) {
+		// The counter is scoped to the loop, and the condition, the post clause
+		// and the body all read it.
+		newInit := substituteStmt(mo, env, init, variables, args)
+		inner := bindFrom(mo, env, newInit)
+		return ast.Stmt.ForLoop(newInit, substituteExpr(mo, inner, cond, variables, args), substituteStmt(mo, inner, post, variables, args), substituteBlock(mo, inner, body, variables, args))
+	} else if s is ast.Stmt.ForEach(name, declared, subject, body) {
+		newSubject := substituteExpr(mo, env, subject, variables, args)
+		newType := substitute(mo, declared, variables, args)
+		mut element := types.elementOf(infer.typeOf(env, newSubject))
+		if newType is ast.TypeExpr.VoidType {
+		} else {
+			element = types.resolve(mo.table, newType)
+		}
+		return ast.Stmt.ForEach(name, newType, newSubject, substituteBlock(mo, infer.bound(env, name, element), body, variables, args))
+	}
+	return substituteStmtTail(mo, env, s, variables, args)
+}
+
+proc substituteStmtTail(mo: mut Mono, env: infer.Env, s: ast.Stmt, variables: Str[], args: ArgList): ast.Stmt {
+	if s is ast.Stmt.ReturnStmt(value) {
+		return ast.Stmt.ReturnStmt(substituteExpr(mo, env, value, variables, args))
+	} else if s is ast.Stmt.EchoStmt(value) {
+		return ast.Stmt.EchoStmt(substituteExpr(mo, env, value, variables, args))
+	} else if s is ast.Stmt.AssertStmt(condition) {
+		return ast.Stmt.AssertStmt(substituteExpr(mo, env, condition, variables, args))
+	} else if s is ast.Stmt.PanicStmt(value) {
+		return ast.Stmt.PanicStmt(substituteExpr(mo, env, value, variables, args))
+	} else if s is ast.Stmt.AsyncStmt(call) {
+		return ast.Stmt.AsyncStmt(substituteExpr(mo, env, call, variables, args))
+	} else if s is ast.Stmt.Expression(value) {
+		return ast.Stmt.Expression(substituteExpr(mo, env, value, variables, args))
+	}
+	return s
+}
+
+proc substituteExpr(mo: mut Mono, env: infer.Env, e: ast.Expr, variables: Str[], args: ArgList): ast.Expr {
+	if e is ast.Expr.Call(callee, callArgs) {
+		return substituteCall(mo, env, callee, callArgs, variables, args)
+	} else if e is ast.Expr.Binary(op, left, right) {
+		return ast.Expr.Binary(op, substituteExpr(mo, env, left, variables, args), substituteExpr(mo, env, right, variables, args))
+	} else if e is ast.Expr.Negate(operand) {
+		return ast.Expr.Negate(substituteExpr(mo, env, operand, variables, args))
+	} else if e is ast.Expr.Member(subject, field) {
+		return ast.Expr.Member(substituteExpr(mo, env, subject, variables, args), field)
+	} else if e is ast.Expr.Index(subject, index) {
+		return ast.Expr.Index(substituteExpr(mo, env, subject, variables, args), substituteExpr(mo, env, index, variables, args))
+	} else if e is ast.Expr.Slice(subject, low, high) {
+		return ast.Expr.Slice(substituteExpr(mo, env, subject, variables, args), substituteExpr(mo, env, low, variables, args), substituteExpr(mo, env, high, variables, args))
+	} else if e is ast.Expr.VectorLit(items) {
+		mut ast.Expr[dyn] out = []
+		for each item in items {
+			append(out, substituteExpr(mo, env, item, variables, args))
+		}
+		return ast.Expr.VectorLit(out)
+	} else if e is ast.Expr.Interp(parts) {
+		mut ast.InterpPart[dyn] out = []
+		for each part in parts {
+			if part is ast.InterpPart.Expression(value) {
+				append(out, ast.InterpPart.Expression(substituteExpr(mo, env, value, variables, args)))
+			} else {
+				append(out, part)
+			}
+		}
+		return ast.Expr.Interp(out)
+	} else if e is ast.Expr.IsMatch(subject, pattern) {
+		newSubject := substituteExpr(mo, env, subject, variables, args)
+		return ast.Expr.IsMatch(newSubject, aimPattern(mo, env, newSubject, pattern))
+	} else if e is ast.Expr.WithType(value, target) {
+		return ast.Expr.WithType(substituteExpr(mo, env, value, variables, args), substitute(mo, target, variables, args))
+	} else if e is ast.Expr.Ident(name) {
+		// A generic callable cannot be used as a value. Which copy a call reaches
+		// is decided by the argument types, and a value carries none — so a bare
+		// reference to one has nothing to resolve to. A call's callee never gets
+		// here: `substituteCall` reads it before this does.
+		// Only a callable: a bare type name is always part of a constructor path
+		// — `Either.Left(...)` — and is never a value on its own.
+		if isGeneric(mo, name) && types.findCallable(mo.table, name) is Result.Ok(_) {
+			append(mo.errors, diag.at(0, "`{name}` is generic, so it cannot be used as a value: which copy a call reaches is decided by the argument types, and a value carries none. Call it, or wrap it in a callable of your own that is not generic"))
+		}
+		return e
+	}
+	return e
+}
+
+// A pattern's path names a type, and the copy is what the subject actually is.
+proc aimPattern(mo: mut Mono, env: infer.Env, subject: ast.Expr, p: ast.Pattern): ast.Pattern {
+	if p is ast.Pattern.Constructor(path, bindings, parenthesised) {
+		if len(path) == 2 && isGeneric(mo, nameAt(path, 0)) {
+			// The copy is not in the table this pass reads — the table is of the
+			// program as it was written — so its name arrives as a type variable
+			// rather than as a declared type. Either way it is the name.
+			flat := nameOfType(infer.typeOf(env, subject))
+			if flat != "" {
+				return ast.Pattern.Constructor([flat, nameAt(path, 1)], bindings, parenthesised)
+			}
+		}
+	}
+	return p
+}
+
+func nameOfType(ty: types.Ty): Str {
+	if ty is types.Ty.TNamed(name) { return name }
+	if ty is types.Ty.TVar(name) { return name }
+	return ""
+}
+
+// A call to something generic becomes a call to the copy for the arguments it
+// was made with. The type arguments are read off the argument types — never
+// written at the call site, which is the whole point.
+proc substituteCall(mo: mut Mono, env: infer.Env, callee: ast.Expr, callArgs: ast.Arg[], variables: Str[], args: ArgList): ast.Expr {
+	mut ast.Arg[dyn] out = []
+	for each a in callArgs {
+		append(out, ast.Arg(a.name, substituteExpr(mo, env, a.value, variables, args)))
+	}
+	if callee is ast.Expr.Ident(name) {
+		if isGeneric(mo, name) {
+			return ast.Expr.Call(ast.Expr.Ident(chosen(mo, env, name, out)), out)
+		}
+	}
+	return ast.Expr.Call(substituteExpr(mo, env, callee, variables, args), out)
+}
+
+// The copy a call reaches, asked for if it has not been asked for yet.
+proc chosen(mo: mut Mono, env: infer.Env, name: Str, callArgs: ast.Arg[]): Str {
+	if types.findCallable(mo.table, name) is Result.Ok(info) {
+		variables := variablesOf(mo.table, info.parameters)
+		mut ast.TypeExpr[dyn] found = []
+		for each v in variables {
+			found = withWritten(found, solve(mo, env, info.params, callArgs, v))
+		}
+		return wanted(mo, name, ArgList(found))
+	}
+	// A generic *type* being constructed: `Box(["a"], "people")` names the copy
+	// its declaration was written out as, which the declaration site already
+	// asked for.
+	if types.findType(mo.table, name) is Result.Ok(info) {
+		variables := variablesOf(mo.table, info.parameters)
+		mut ast.TypeExpr[dyn] found = []
+		for each v in variables {
+			found = withWritten(found, solveFields(mo, env, info.shared, callArgs, v))
+		}
+		return wanted(mo, name, ArgList(found))
+	}
+	return name
+}
+
+func withWritten(into: ast.TypeExpr[], one: ast.TypeExpr): ast.TypeExpr[dyn] {
+	mut ast.TypeExpr[dyn] out = []
+	for each t in into {
+		append(out, t)
+	}
+	append(out, one)
+	return out
+}
+
+// What one variable stands for at this call. A variable is pinned down by
+// wherever it appears in the parameters — including *inside* a parameter's own
+// type, which is what makes a higher-order generic work.
+proc solve(mo: mut Mono, env: infer.Env, params: ast.Param[], callArgs: ast.Arg[], variable: Str): ast.TypeExpr {
+	mut i := 0
+	for each p in params {
+		given := argExpr(callArgs, p.name, i)
+		if given is ast.Expr.Absent {
+			i = i + 1
+			continue
+		}
+		found := match(p.declared, infer.typeOf(env, given), variable)
+		if found is Result.Ok(t) {
+			return t
+		}
+		i = i + 1
+	}
+	// A variable that appears only in the return type has nothing to be inferred
+	// from. It is reported here rather than left to produce a copy nobody meant.
+	append(mo.errors, diag.at(0, "`{variable}` appears nowhere in the parameters, so there is nothing at a call to read it off. A type variable is pinned down by what is passed, never written at the call site"))
+	return ast.TypeExpr.Named("", "Str", [], [])
+}
+
+proc solveFields(mo: mut Mono, env: infer.Env, fields: ast.Field[], callArgs: ast.Arg[], variable: Str): ast.TypeExpr {
+	mut i := 0
+	for each f in fields {
+		given := argExpr(callArgs, f.name, i)
+		if given is ast.Expr.Absent {
+			i = i + 1
+			continue
+		}
+		found := match(f.declared, infer.typeOf(env, given), variable)
+		if found is Result.Ok(t) {
+			return t
+		}
+		i = i + 1
+	}
+	return ast.TypeExpr.Named("", "Str", [], [])
+}
+
+// Match a written parameter type against the type actually passed, looking for
+// what one variable stood for.
+func match(param: ast.TypeExpr, given: types.Ty, variable: Str): Result<ast.TypeExpr, Bool> {
+	if param is ast.TypeExpr.Named(pkg, name, typeArgs, dims) {
+		if pkg == "" && name == variable {
+			// `T[]` matched against `Str[dyn]` says `T` is `Str`: the parameter's
+			// own dimensions are peeled off what was given.
+			return Result.Ok(types.toWritten(peel(given, len(dims))))
+		}
+		mut i := 0
+		for each a in typeArgs {
+			inner := match(a, argumentOf(given, i), variable)
+			if inner is Result.Ok(_) {
+				return inner
+			}
+			i = i + 1
+		}
+		return Result.Error(false)
+	}
+	if param is ast.TypeExpr.Fn(_, params, result) {
+		mut i := 0
+		for each p in params {
+			inner := match(p, parameterOf(given, i), variable)
+			if inner is Result.Ok(_) {
+				return inner
+			}
+			i = i + 1
+		}
+		return match(result, resultOf(given), variable)
+	}
+	return Result.Error(false)
+}
+
+// `n` layers of vector taken off a type.
+func peel(ty: types.Ty, n: Int): types.Ty {
+	mut types.Ty out = ty
+	for i := 0; i < n; i++ {
+		out = types.elementOf(out)
+	}
+	return out
+}
+
+// The `index`-th type argument of a `Result` or a map, since those are the two
+// written types that carry any.
+func argumentOf(ty: types.Ty, index: Int): types.Ty {
+	if ty is types.Ty.TResult(ok, bad) {
+		if index == 0 { return ok }
+		return bad
+	}
+	if ty is types.Ty.TMap(key, value) {
+		if index == 0 { return key }
+		return value
+	}
+	return types.Ty.TUnknown()
+}
+
+func parameterOf(ty: types.Ty, index: Int): types.Ty {
+	if ty is types.Ty.TFn(_, params, _) {
+		if params bounds index {
+			return params[index]
+		}
+	}
+	return types.Ty.TUnknown()
+}
+
+func resultOf(ty: types.Ty): types.Ty {
+	if ty is types.Ty.TFn(_, _, result) {
+		return result
+	}
+	return types.Ty.TUnknown()
+}
+
+func argExpr(args: ast.Arg[], name: Str, index: Int): ast.Expr {
+	for each a in args {
+		if a.name == name {
+			return a.value
+		}
+	}
+	mut seen := 0
+	for each a in args {
+		if a.name == "" {
+			if seen == index {
+				return a.value
+			}
+			seen = seen + 1
+		}
+	}
+	return ast.Expr.Absent()
+}

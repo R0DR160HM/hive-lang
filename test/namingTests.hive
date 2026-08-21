@@ -1,0 +1,138 @@
+// Tests for `src/naming` and `src/diag`.
+import ../src/diag
+import ../src/naming
+
+// --- The shapes --------------------------------------------------------------
+
+test "camelCase is a variable, a parameter, a field, a callable and a module" {
+	assert naming.fits(naming.Role.Variable(), "userName")
+	assert naming.fits(naming.Role.Parameter(), "name")
+	assert naming.fits(naming.Role.Field(), "id2")
+	assert naming.fits(naming.Role.Callable(), "main")
+	assert naming.fits(naming.Role.Module(), "text")
+	assert naming.fits(naming.Role.Callable(), "Main") == false
+	assert naming.fits(naming.Role.Field(), "user_name") == false
+}
+
+test "PascalCase is a type, a variant and an atom" {
+	assert naming.fits(naming.Role.TypeName(), "User")
+	assert naming.fits(naming.Role.TypeName(), "Str")
+	assert naming.fits(naming.Role.Variant(), "Ok")
+	assert naming.fits(naming.Role.Atom(), "Ready")
+	assert naming.fits(naming.Role.TypeName(), "user") == false
+	assert naming.fits(naming.Role.Atom(), "ready") == false
+}
+
+test "UPPER_CASE is a variable nothing reassigns, and never a mut one" {
+	assert naming.fits(naming.Role.Variable(), "MAX_RETRIES")
+	assert naming.fits(naming.Role.Variable(), "PORT2")
+	assert naming.fits(naming.Role.MutVariable(), "MAX_RETRIES") == false
+	assert naming.fits(naming.Role.MutVariable(), "count")
+}
+
+test "a binding is camelCase, or `_` to throw the value away" {
+	assert naming.fits(naming.Role.Binding(), "found")
+	assert naming.fits(naming.Role.Binding(), "_")
+	assert naming.fits(naming.Role.Binding(), "Found") == false
+}
+
+test "a single leading underscore says nothing about a name's shape" {
+	assert naming.fits(naming.Role.Variable(), "_scratch")
+	assert naming.fits(naming.Role.Callable(), "_helperOf")
+	assert naming.fits(naming.Role.Variable(), "_MAX")
+	assert naming.fits(naming.Role.TypeName(), "_Private")
+	// It is a prefix, not a licence: what follows still has to have the shape.
+	assert naming.fits(naming.Role.Callable(), "_Helper") == false
+}
+
+test "an underscore inside a name belongs to UPPER_CASE alone" {
+	assert naming.fits(naming.Role.Variable(), "user_name") == false
+	assert naming.fits(naming.Role.TypeName(), "User_Name") == false
+	assert naming.fits(naming.Role.Variable(), "USER_NAME")
+}
+
+test "the empty name has no shape at all" {
+	assert naming.fits(naming.Role.Variable(), "") == false
+	assert naming.fits(naming.Role.TypeName(), "") == false
+	assert naming.fits(naming.Role.Binding(), "") == false
+}
+
+// --- Messages ----------------------------------------------------------------
+
+test "check answers with the message to report" {
+	assert naming.check(naming.Role.Variable(), "ok") is Result.Ok(_)
+	if naming.check(naming.Role.Callable(), "Main") is Result.Error(why) {
+		assert why == "`Main` is not how a callable is named. A `proc`, a `func` and a `query` are written in camelCase, like the variable a call's result lands in: `main`."
+	}
+}
+
+test "a mut variable written as a constant is told its shape is taken" {
+	if naming.check(naming.Role.MutVariable(), "MAX") is Result.Error(why) {
+		assert why == "`MAX` is written as a constant, and `mut` says it is not one: UPPER_CASE is for a variable nothing reassigns. Write it in camelCase — `max` — or drop the `mut` if it really does hold still."
+	}
+}
+
+test "an atom's message puts the hash back" {
+	if naming.check(naming.Role.Atom(), "ready") is Result.Error(why) {
+		assert why == "`#ready` is not how an atom is written. An atom is written in PascalCase: `#Ready`."
+	}
+}
+
+// --- Respelling --------------------------------------------------------------
+
+test "toCamel" {
+	assert naming.toCamel("user_name") == "userName"
+	assert naming.toCamel("MAX_RETRIES") == "maxRetries"
+	assert naming.toCamel("User") == "user"
+	assert naming.toCamel("already") == "already"
+}
+
+test "toPascal" {
+	assert naming.toPascal("user_name") == "UserName"
+	assert naming.toPascal("ready") == "Ready"
+	assert naming.toPascal("MAX_RETRIES") == "MaxRetries"
+}
+
+test "toScreaming" {
+	assert naming.toScreaming("userName") == "USER_NAME"
+	assert naming.toScreaming("max") == "MAX"
+	assert naming.toScreaming("MAX") == "MAX"
+}
+
+test "a suggestion keeps the underscore a name opened with" {
+	assert naming.toCamel("_user_name") == "_userName"
+	assert naming.toPascal("_ready") == "_Ready"
+	assert naming.toScreaming("_maxRetries") == "_MAX_RETRIES"
+}
+
+test "miscasedKeyword names both readings" {
+	assert naming.miscasedKeyword("PROC") == "`PROC` is a keyword written the wrong way: every keyword in Hive is lower case, and only lower case. Write `proc`"
+}
+
+// --- Diagnostics -------------------------------------------------------------
+
+test "a diagnostic renders as file:line: message" {
+	d := diag.Diagnostic("main.hive", 12, "expected `]`")
+	assert diag.render(d) == "main.hive:12: expected `]`"
+}
+
+test "a diagnostic with no file yet prints its line alone" {
+	assert diag.render(diag.at(3, "unterminated string literal")) == "3: unterminated string literal"
+}
+
+test "a file goes on afterwards, at the one place holding both" {
+	placed := diag.inFile("lib/text.hive", diag.at(7, "oops"))
+	assert diag.render(placed) == "lib/text.hive:7: oops"
+
+	all := diag.allInFile("a.hive", [diag.at(1, "one"), diag.at(2, "two")])
+	assert diag.renderAll(all) == "a.hive:1: one\na.hive:2: two"
+}
+
+test "renderAll of nothing is nothing" {
+	diag.Diagnostic[0] none = []
+	assert diag.renderAll(none) == ""
+}
+
+test "a pass with no position names the declaration instead" {
+	assert diag.inDecl("total", "`v` is not `mut`") == "in `total`: `v` is not `mut`"
+}

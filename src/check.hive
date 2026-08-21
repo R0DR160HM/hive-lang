@@ -1,0 +1,1035 @@
+// Checks
+// ======
+// Everything a program has to be that the grammar cannot say. The parser has
+// already held every name to its shape and the loader has already resolved every
+// import, so what is left is about meaning: whether a call has the arguments its
+// declaration asked for, whether a `func` stayed a `func`, whether a name that
+// is written to was ever allowed to be, and whether every path returns.
+//
+// Every check reports and carries on. A program with six mistakes is a program
+// whose author would rather hear about six than about the first one, and none of
+// these depends on the others having passed.
+//
+// The pass runs on a **flattened** module, whose nodes carry no position — so a
+// message here names the declaration it is about rather than a line. That is the
+// whole of what flattening costs, and it is written down in the spec.
+import ./ast
+import ./diag
+import ./infer
+import ./stdlib
+import ./types
+
+type Check {
+	table: types.Table
+	errors: diag.Diagnostic[dyn]
+	/// The declaration being walked, which is what a message names.
+	inside: Str
+	/// The line it was declared on, which is the best position a flattened tree
+	/// can offer.
+	line: Int
+	/// Whether the body is a `func` — which may not call a `proc`.
+	pure: Bool
+	/// What the body has to return, or `TVoid`.
+	result: types.Ty
+	/// Whether the body is a `test`, where `return value` is refused.
+	inTest: Bool
+	/// How many loops enclose the statement being walked.
+	loops: Int
+	/// The names in scope that are `mut`, as a stack the scopes push and pop.
+	mutable: Str[dyn]
+}
+
+/// Check a whole flattened program.
+proc checkModule(m: ast.Module): diag.Diagnostic[dyn] {
+	t := types.tableOf(m)
+	mut Check c = Check(t, [], "", 0, false, types.Ty.TVoid(), false, 0, [])
+	env := infer.newEnv(t)
+	for each d in m.decls {
+		checkDecl(c, env, d)
+	}
+	return c.errors
+}
+
+proc report(c: mut Check, message: Str): void {
+	append(c.errors, diag.Diagnostic("", c.line, diag.inDecl(c.inside, message)))
+}
+
+// --- Declarations ------------------------------------------------------------
+
+proc checkDecl(c: mut Check, env: infer.Env, d: ast.Decl): void {
+	if d is ast.Decl.TypeDecl(name, fields, variants, line) {
+		c.inside = name
+		c.line = line
+		checkTypeDecl(c, fields, variants)
+	} else if d is ast.Decl.CallableDecl(kind, name, params, result, body, line) {
+		c.inside = name
+		c.line = line
+		c.pure = kind is ast.CallableKind.FuncKind
+		c.result = types.resolve(c.table, result)
+		c.inTest = false
+		c.loops = 0
+		c.mutable = []
+		checkCallable(c, env, name, params, body)
+	} else if d is ast.Decl.QueryDecl(name, params, result, sql, line) {
+		c.inside = name
+		c.line = line
+		// A query is a `func` whose body happens to be SQL: it may not write to
+		// storage its caller can see, and there is nothing in a query body that
+		// could.
+		c.pure = true
+		c.result = types.resolve(c.table, result)
+		c.inTest = false
+		c.loops = 0
+		c.mutable = []
+		checkQuery(c, env, params, result, sql)
+	} else if d is ast.Decl.TestDecl(title, body, line) {
+		c.inside = "\"{title}\""
+		c.line = line
+		c.pure = false
+		c.result = types.Ty.TVoid()
+		c.inTest = true
+		c.loops = 0
+		c.mutable = []
+		checkBlock(c, env, body)
+	}
+}
+
+// A query's parameters go into scope, and then the two things in its body that
+// are not text are checked like the expressions they are: a bound value, and the
+// condition on an optional predicate.
+proc checkQuery(c: mut Check, env: infer.Env, params: ast.Param[], result: ast.TypeExpr, sql: ast.SqlPart[]): void {
+	mut infer.Env inner = env
+	mut Str[dyn] seen = []
+	for each p in params {
+		if indexOf(seen, p.name) is Result.Ok(_) {
+			report(c, "this declares the parameter `{p.name}` twice")
+		}
+		append(seen, p.name)
+		if p.mutex {
+			report(c, "a query cannot declare the mutex parameter `{p.name}: mut ...`: its body is SQL, and there is nothing in one that could write through it")
+		}
+		inner = infer.bound(inner, p.name, types.resolve(c.table, p.declared))
+	}
+	checkRowType(c, types.resolve(c.table, result))
+	checkSql(c, inner, sql)
+}
+
+// What a query declares its rows to be. Three shapes mean something: one row
+// type per row, a single column, and no rows at all.
+proc checkRowType(c: mut Check, declared: types.Ty): void {
+	if declared is types.Ty.TVoid {
+		return
+	}
+	if declared is types.Ty.TVec(element, _) {
+		if element is types.Ty.TNamed(name) {
+			if types.findType(c.table, name) is Result.Ok(info) {
+				if len(info.variants) > 0 {
+					report(c, "a query's rows are a struct, and `{name}` is a tagged union: a row is a fixed set of columns, and there is nothing in a result set to say which variant one of them is")
+				}
+				return
+			}
+			report(c, "a query answers with rows of a declared type, and `{name}` is not one")
+			return
+		}
+		// A single column, or a Table from `run raw`.
+		return
+	}
+	report(c, "a query answers with `T[dyn]` for one row type, `Str[dyn]` (or another scalar) for a single column, or `void` for a statement — and this is " + types.show(declared))
+}
+
+proc checkSql(c: mut Check, env: infer.Env, parts: ast.SqlPart[]): void {
+	for each part in parts {
+		if part is ast.SqlPart.Param(value) {
+			checkExpr(c, env, value)
+			checkBoundValue(c, env, value)
+		} else if part is ast.SqlPart.Where(group) {
+			checkSqlGroup(c, env, group)
+		}
+	}
+}
+
+proc checkSqlGroup(c: mut Check, env: infer.Env, group: ast.SqlGroup): void {
+	for each item in group.items {
+		if item is ast.SqlItem.Cond(condition, body) {
+			checkCondition(c, env, condition)
+			checkSql(c, env, body)
+		} else if item is ast.SqlItem.Nested(inner) {
+			checkSqlGroup(c, env, inner)
+		}
+	}
+}
+
+// A bound value is one cell, so it is one of the four things a cell can be. A
+// vector or a record would have to be spliced into text to travel, and splicing
+// is the one thing a query never does.
+proc checkBoundValue(c: mut Check, env: infer.Env, value: ast.Expr): void {
+	ty := infer.typeOf(env, value)
+	if ty is types.Ty.TStr || ty is types.Ty.TInt || ty is types.Ty.TFloat
+		|| ty is types.Ty.TBool || ty is types.Ty.TAtom || ty is types.Ty.TUnknown {
+		return
+	}
+	report(c, "a bound value is one cell, and this is " + types.show(ty) + ". A cell is a `Str`, an `Int`, a `Float`, a `Bool` or an `Atom`; anything else would have to be spliced into the text, which is the one thing a query never does")
+}
+
+proc checkTypeDecl(c: mut Check, fields: ast.Field[], variants: ast.Variant[]): void {
+	mut Str[dyn] seen = []
+	for each f in fields {
+		if indexOf(seen, f.name) is Result.Ok(_) {
+			report(c, "this type declares `{f.name}` twice")
+		}
+		append(seen, f.name)
+	}
+	mut Str[dyn] variantNames = []
+	for each v in variants {
+		if indexOf(variantNames, v.name) is Result.Ok(_) {
+			report(c, "this type declares the variant `{v.name}` twice")
+		}
+		append(variantNames, v.name)
+		// A field declared outside any variant is added to every one of them, so
+		// a variant naming one of its own the same way would have two.
+		for each f in v.fields {
+			if indexOf(seen, f.name) is Result.Ok(_) {
+				report(c, "the variant `{v.name}` declares `{f.name}`, which the type already declares outside every variant — a shared field is added to each of them, so this one would be there twice")
+			}
+		}
+	}
+}
+
+proc checkCallable(c: mut Check, env: infer.Env, name: Str, params: ast.Param[], body: ast.Block): void {
+	mut infer.Env inner = env
+	mut Str[dyn] seen = []
+	for each p in params {
+		if indexOf(seen, p.name) is Result.Ok(_) {
+			report(c, "this declares the parameter `{p.name}` twice")
+		}
+		append(seen, p.name)
+		// Only a `proc` may ask for the mutex itself. A `mut` value handed to a
+		// `func` is seen as an ordinary immutable copy instead.
+		if p.mutex && c.pure {
+			report(c, "a `func` cannot declare the mutex parameter `{p.name}: mut ...`. What a `func` promises is that it cannot write to storage its caller can see, and a mutex is exactly that storage — make it a `proc`, or take an ordinary `{p.name}: ...` and answer with the new value")
+		}
+		if p.mutex {
+			append(c.mutable, p.name)
+		}
+		inner = infer.bound(inner, p.name, types.resolve(c.table, p.declared))
+	}
+	checkBlock(c, inner, body)
+
+	// Every non-`void` callable must return on every path.
+	if c.result is types.Ty.TVoid {
+		return
+	}
+	if terminates(c, body) == false {
+		report(c, "`{name}` answers with " + types.show(c.result) + ", so every path through it has to return one. A path terminates by ending in `return`, in `assert` or `panic`, in an `if`/`else` whose every branch terminates, or in an else-less `if`/`else if` chain that covers its subject's whole type")
+	}
+}
+
+// --- Statements --------------------------------------------------------------
+
+proc checkBlock(c: mut Check, env: infer.Env, b: ast.Block): infer.Env {
+	mark := len(c.mutable)
+	mut infer.Env inner = env
+	for each s in b.stmts {
+		inner = checkStmt(c, inner, s)
+	}
+	restore(c, mark)
+	return inner
+}
+
+proc restore(c: mut Check, mark: Int): void {
+	last := len(c.mutable) - 1
+	if mark <= last && c.mutable bounds mark {
+		if c.mutable bounds last {
+			drop(c.mutable, mark, last)
+		}
+	}
+}
+
+proc checkStmt(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
+	if s is ast.Stmt.VarDecl(name, value, mutable, _) {
+		checkExpr(c, env, value)
+		ty := infer.typeOf(env, value)
+		// `hive.map.new()` says empty and nothing about what it holds, so it has
+		// to land somewhere that says.
+		if isEmptyMap(value) {
+			report(c, "`hive.map.new()` has to land somewhere that says what it holds: a declaration (`hive.map.Map<Str, Int> m = hive.map.new()`), a `return` whose callable declares a map, or an argument to a parameter declared as one. A `:=` binding reads the type off the value, and this one has none to give")
+		}
+		if mutable {
+			append(c.mutable, name)
+		}
+		return infer.bound(env, name, ty)
+	} else if s is ast.Stmt.TypedDecl(declared, name, value, mutable, deferred) {
+		checkExpr(c, env, value)
+		ty := types.resolve(c.table, declared)
+		if deferred == false {
+			fits(c, ty, infer.typeOf(env, value), "the declaration of `{name}`")
+		}
+		if mutable {
+			append(c.mutable, name)
+		}
+		return infer.bound(env, name, ty)
+	} else if s is ast.Stmt.Assign(target, value) {
+		checkAssign(c, env, target, value)
+		return env
+	} else if s is ast.Stmt.ReturnStmt(value) {
+		checkReturn(c, env, value)
+		return env
+	} else if s is ast.Stmt.IfChain(branches, otherwise, hasElse) {
+		for each b in branches {
+			checkCondition(c, env, b.condition)
+			checkBlock(c, afterCondition(c, env, b.condition), b.body)
+		}
+		if hasElse {
+			checkBlock(c, env, otherwise)
+		}
+		return env
+	}
+	return checkStmtTail(c, env, s)
+}
+
+proc checkStmtTail(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
+	if s is ast.Stmt.ForLoop(init, cond, post, body) {
+		mark := len(c.mutable)
+		inner := checkStmt(c, env, init)
+		if cond is ast.Expr.Absent {
+		} else {
+			checkCondition(c, inner, cond)
+		}
+		checkStmt(c, inner, post)
+		c.loops = c.loops + 1
+		checkBlock(c, inner, body)
+		c.loops = c.loops - 1
+		restore(c, mark)
+		return env
+	} else if s is ast.Stmt.ForEach(name, declared, subject, body) {
+		checkExpr(c, env, subject)
+		subjectType := infer.typeOf(env, subject)
+		// A turn of the loop would have to be handed a map's key or its value,
+		// and the syntax never said which.
+		if subjectType is types.Ty.TMap(_, _) {
+			report(c, "a map is reached by key, never by position, so `for each` over one says nothing about what a turn is handed. Walk `hive.map.keys(m)` and look each one up")
+		} else if subjectType is types.Ty.TStr {
+			report(c, "a `Str` is not a vector, so there is nothing for `for each` to walk. `split(s, \"\")` is its characters")
+		}
+		mut elementType := types.elementOf(subjectType)
+		if declared is ast.TypeExpr.VoidType {
+		} else {
+			elementType = types.resolve(c.table, declared)
+		}
+		c.loops = c.loops + 1
+		checkBlock(c, infer.bound(env, name, elementType), body)
+		c.loops = c.loops - 1
+		return env
+	} else if s is ast.Stmt.BreakStmt || s is ast.Stmt.ContinueStmt {
+		if c.loops == 0 {
+			report(c, "`break` and `continue` act on the innermost enclosing loop, and there is none here")
+		}
+		return env
+	} else if s is ast.Stmt.EchoStmt(value) {
+		checkExpr(c, env, value)
+		return env
+	} else if s is ast.Stmt.AssertStmt(condition) {
+		checkCondition(c, env, condition)
+		return env
+	} else if s is ast.Stmt.PanicStmt(value) {
+		checkExpr(c, env, value)
+		return env
+	} else if s is ast.Stmt.AsyncStmt(call) {
+		checkAsync(c, env, call)
+		return env
+	} else if s is ast.Stmt.Expression(value) {
+		checkStatementExpr(c, env, value)
+		return env
+	}
+	return env
+}
+
+proc checkReturn(c: mut Check, env: infer.Env, value: ast.Expr): void {
+	if value is ast.Expr.Absent {
+		if c.result is types.Ty.TVoid {
+			return
+		}
+		report(c, "this `return` answers with nothing, and the declaration says " + types.show(c.result))
+		return
+	}
+	if c.inTest {
+		report(c, "a test returns nothing: it is run by the suite and never called, so there is nobody to answer. A bare `return` to leave early is fine")
+		return
+	}
+	checkExpr(c, env, value)
+	if c.result is types.Ty.TVoid {
+		report(c, "this `return` answers with a value, and the declaration says `void`")
+		return
+	}
+	fits(c, c.result, infer.typeOf(env, value), "this `return`")
+}
+
+proc checkAssign(c: mut Check, env: infer.Env, target: ast.Expr, value: ast.Expr): void {
+	checkExpr(c, env, value)
+	checkExpr(c, env, target)
+	root := rootName(target)
+	if root == "" {
+		report(c, "this is not something that can be assigned to: a target is a name, or a path into one through its fields and elements")
+		return
+	}
+	if isMutable(c, root) == false {
+		report(c, "cannot assign to `{root}`: it is immutable — declare it with `mut` to allow reassignment")
+		return
+	}
+	fits(c, infer.typeOf(env, target), infer.typeOf(env, value), "the assignment to `{root}`")
+}
+
+// The name a target is a path into. `v`, `v[0]`, `rec.f` and `b.items[2]` all
+// answer with the variable at the bottom of them, which is the one whose
+// mutability decides.
+func rootName(target: ast.Expr): Str {
+	if target is ast.Expr.Ident(name) { return name }
+	if target is ast.Expr.Member(subject, _) { return rootName(subject) }
+	if target is ast.Expr.Index(subject, _) { return rootName(subject) }
+	return ""
+}
+
+func isMutable(c: Check, name: Str): Bool {
+	return indexOf(c.mutable, name) is Result.Ok(_)
+}
+
+// A condition is a `Bool` and nothing else. There is no truthiness in Hive: an
+// atom is a label rather than a yes or a no, and a number is a number.
+proc checkCondition(c: mut Check, env: infer.Env, condition: ast.Expr): void {
+	checkExpr(c, env, condition)
+	ty := infer.typeOf(env, condition)
+	if ty is types.Ty.TBool || ty is types.Ty.TUnknown {
+		return
+	}
+	if ty is types.Ty.TAtom {
+		report(c, "an atom is a label, not a yes or a no, so it cannot be a condition. Compare it with the one you mean — `if flag == #Ready` — or use a `Bool`")
+		return
+	}
+	report(c, "a condition is a `Bool`, and this one is " + types.show(ty) + ". There is no truthiness in Hive: say what you are comparing it to")
+}
+
+// The scope a condition leaves behind, which is whatever its patterns bound.
+func afterCondition(c: Check, env: infer.Env, condition: ast.Expr): infer.Env {
+	return infer.narrowed(env, condition)
+}
+
+// --- Expressions -------------------------------------------------------------
+
+proc checkExpr(c: mut Check, env: infer.Env, e: ast.Expr): void {
+	if e is ast.Expr.Call(callee, args) {
+		checkCall(c, env, callee, args)
+	} else if e is ast.Expr.Binary(op, left, right) {
+		checkExpr(c, env, left)
+		// A binding an `is` made is usable in the rest of the same condition
+		// after `&&` — which is the whole reason the two are told apart here.
+		if op is ast.BinOp.And {
+			narrowed := afterCondition(c, env, left)
+			checkExpr(c, narrowed, right)
+			checkOperands(c, narrowed, op, left, right)
+		} else {
+			checkExpr(c, env, right)
+			checkOperands(c, env, op, left, right)
+		}
+	} else if e is ast.Expr.Negate(operand) {
+		checkExpr(c, env, operand)
+	} else if e is ast.Expr.Index(subject, index) {
+		checkExpr(c, env, subject)
+		checkExpr(c, env, index)
+		checkIndexable(c, env, subject)
+	} else if e is ast.Expr.Slice(subject, low, high) {
+		checkExpr(c, env, subject)
+		checkExpr(c, env, low)
+		checkExpr(c, env, high)
+		checkIndexable(c, env, subject)
+	} else if e is ast.Expr.VectorLit(items) {
+		for each item in items {
+			checkExpr(c, env, item)
+		}
+	} else if e is ast.Expr.Interp(parts) {
+		for each part in parts {
+			if part is ast.InterpPart.Expression(value) {
+				checkExpr(c, env, value)
+			}
+		}
+	} else if e is ast.Expr.IsMatch(subject, pattern) {
+		checkExpr(c, env, subject)
+		checkPattern(c, env, subject, pattern)
+	} else if e is ast.Expr.Ident(name) {
+		checkName(c, env, name)
+	} else if e is ast.Expr.Member(subject, field) {
+		checkMember(c, env, subject, field)
+	}
+}
+
+// A `Str` has no subscript, and neither has a map. Both refuse for the same
+// reason: the syntax would have to mean something the value cannot answer.
+proc checkIndexable(c: mut Check, env: infer.Env, subject: ast.Expr): void {
+	ty := infer.typeOf(env, subject)
+	if ty is types.Ty.TStr {
+		report(c, "a `Str` has no subscript: `[...]` addresses bytes while a `Str` is a sequence of characters, so the two never line up and a byte from the middle of a character is not text. Take it apart with `split(s, sep)`, find in it with `indexOf(s, sub)`, or match it with a string pattern")
+		return
+	}
+	if ty is types.Ty.TMap(_, _) {
+		report(c, "a map is reached by key, never by position: `hive.map.get(m, key)` is what this wants")
+	}
+}
+
+proc checkName(c: mut Check, env: infer.Env, name: Str): void {
+	if name == "_" || name == "hive" {
+		return
+	}
+	if infer.isBound(env, name) {
+		return
+	}
+	if types.findCallable(c.table, name) is Result.Ok(_) {
+		return
+	}
+	if types.findType(c.table, name) is Result.Ok(_) {
+		return
+	}
+	if infer.isBuiltin(name) || name == "Result" {
+		return
+	}
+	report(c, "`{name}` is not a name anything here declared")
+}
+
+proc checkMember(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str): void {
+	// A `hive.<module>.<name>` is a library call and is checked where it is
+	// called, not where the module is named.
+	if subject is ast.Expr.Ident(head) {
+		if head == "hive" || head == "Result" {
+			return
+		}
+		if types.findType(c.table, head) is Result.Ok(_) {
+			return
+		}
+	}
+	if subject is ast.Expr.Member(root, _) {
+		if root is ast.Expr.Ident(hiveName) {
+			if hiveName == "hive" {
+				return
+			}
+		}
+	}
+	checkExpr(c, env, subject)
+	ty := infer.typeOf(env, subject)
+	if ty is types.Ty.TNamed(name) {
+		if hasField(c, name, field) == false {
+			report(c, "`" + name + "` has no field `{field}`")
+		}
+	}
+}
+
+func hasField(c: Check, typeName: Str, field: Str): Bool {
+	if types.findType(c.table, typeName) is Result.Ok(info) {
+		for each f in info.shared {
+			if f.name == field {
+				return true
+			}
+		}
+		for each v in info.variants {
+			for each f in v.fields {
+				if f.name == field {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// There is no implicit numeric widening anywhere, so an operator's two sides
+// have to be the same type — which is the rule that makes
+// `hive.math.max(0, health)` a compile error rather than a surprise.
+proc checkOperands(c: mut Check, env: infer.Env, op: ast.BinOp, left: ast.Expr, right: ast.Expr): void {
+	leftType := infer.typeOf(env, left)
+	rightType := infer.typeOf(env, right)
+	if leftType is types.Ty.TUnknown || rightType is types.Ty.TUnknown {
+		return
+	}
+	if op is ast.BinOp.And || op is ast.BinOp.Or {
+		if leftType is types.Ty.TBool && rightType is types.Ty.TBool {
+			return
+		}
+		report(c, "`" + ast.opSpelling(op) + "` joins two `Bool`s, and these are " + types.show(leftType) + " and " + types.show(rightType))
+		return
+	}
+	if types.operandsFit(leftType, rightType) == false {
+		report(c, "`" + ast.opSpelling(op) + "` wants two of one type, and these are " + types.show(leftType) + " and " + types.show(rightType) + ". Hive never widens a number behind your back — `hive.conv.itf` is how an `Int` becomes a `Float`")
+	}
+}
+
+// --- Calls -------------------------------------------------------------------
+
+proc checkCall(c: mut Check, env: infer.Env, callee: ast.Expr, args: ast.Arg[]): void {
+	for each a in args {
+		if a.value is ast.Expr.Hole {
+			continue
+		}
+		checkExpr(c, env, a.value)
+	}
+	if callee is ast.Expr.Ident(name) {
+		checkNamedCall(c, env, name, args)
+		return
+	}
+	if callee is ast.Expr.Member(subject, field) {
+		checkMemberCall(c, env, subject, field, args)
+		return
+	}
+	checkExpr(c, env, callee)
+}
+
+proc checkNamedCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): void {
+	// A local binding shadows a declaration, which shadows a builtin.
+	if infer.isBound(env, name) {
+		return
+	}
+	if types.findCallable(c.table, name) is Result.Ok(info) {
+		checkArguments(c, env, name, info, args)
+		return
+	}
+	if types.fieldsOfStruct(c.table, name) is Result.Ok(fields) {
+		checkFieldArguments(c, env, name, fields, args)
+		return
+	}
+	if infer.isBuiltin(name) {
+		checkBuiltinCall(c, env, name, args)
+		return
+	}
+	if types.findType(c.table, name) is Result.Ok(_) {
+		report(c, "`{name}` is a tagged union, so a value of it is built by naming the variant: `{name}.SomeVariant(...)`")
+		return
+	}
+	report(c, "`{name}` is not a name anything here declared")
+}
+
+proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str, args: ast.Arg[]): void {
+	if subject is ast.Expr.Ident(head) {
+		if head == "Result" {
+			if field != "Ok" && field != "Error" {
+				report(c, "`Result` has two variants, `Ok` and `Error`, and `{field}` is neither")
+			} else if len(args) != 1 {
+				report(c, "`Result.{field}` carries exactly one payload, and this call passes " + countOf(len(args)))
+			}
+			return
+		}
+		if head == "hive" {
+			checkBuiltinCall(c, env, field, args)
+			return
+		}
+		if types.findType(c.table, head) is Result.Ok(info) {
+			if types.findVariant(c.table, head, field) is Result.Ok(fields) {
+				checkFieldArguments(c, env, head + "." + field, fields, args)
+			} else {
+				report(c, "`" + head + "` has no variant `{field}`")
+			}
+			return
+		}
+	}
+	if subject is ast.Expr.Member(root, module) {
+		if root is ast.Expr.Ident(hiveName) {
+			if hiveName == "hive" {
+				if stdlib.isKnownModule(module) == false {
+					report(c, "this compiler does not carry `hive.{module}`")
+				}
+				return
+			}
+		}
+	}
+	checkMember(c, env, subject, field)
+	// A call through a function value is checked by what the value's type says.
+	ty := infer.typeOf(env, ast.Expr.Member(subject, field))
+	if ty is types.Ty.TFn(pure, params, _) {
+		if len(params) != len(args) {
+			report(c, "`{field}` takes " + countOf(len(params)) + ", and this call passes " + countOf(len(args)))
+		}
+		checkPurity(c, pure, field)
+	}
+}
+
+proc checkArguments(c: mut Check, env: infer.Env, name: Str, info: types.CallableInfo, args: ast.Arg[]): void {
+	checkPurity(c, info.pure, name)
+	if checkArgumentNames(c, name, namesOfParams(info.params), args) == false {
+		return
+	}
+	if len(args) != len(info.params) {
+		report(c, "`{name}` takes " + countOf(len(info.params)) + ", and this call passes " + countOf(len(args)))
+		return
+	}
+	mut i := 0
+	for each p in info.params {
+		found := argFor(args, p.name, i)
+		if found is ast.Expr.Hole {
+			i = i + 1
+			continue
+		}
+		// A `mut T` parameter takes the caller's own storage, so the argument has
+		// to be a `mut` variable or a path into one.
+		if p.mutex {
+			root := rootName(found)
+			if root == "" || isMutable(c, root) == false {
+				report(c, "`{name}` asks for the mutex itself in `{p.name}: mut ...`, so the argument has to be a `mut` variable or a path into one — this one is not")
+			}
+		}
+		fits(c, types.resolve(c.table, p.declared), infer.typeOf(env, found), "the argument `{p.name}` of `{name}`")
+		i = i + 1
+	}
+}
+
+// A `func` cannot call a `proc`. What it promises is not purity in the
+// mathematical sense — it may echo, read a file, reach the network — but that it
+// cannot write to storage its caller can see.
+proc checkPurity(c: mut Check, calleePure: Bool, name: Str): void {
+	if c.pure && calleePure == false {
+		report(c, "a `func` cannot call the `proc` `{name}`: a proc may hold a mutex and write through it, and a func promises it cannot write to storage its caller can see. Make this one a `proc`, or make `{name}` a `func`")
+	}
+}
+
+proc checkFieldArguments(c: mut Check, env: infer.Env, name: Str, fields: ast.Field[], args: ast.Arg[]): void {
+	if checkArgumentNames(c, name, namesOfFields(fields), args) == false {
+		return
+	}
+	if len(args) != len(fields) {
+		report(c, "`{name}` has " + fieldCount(len(fields)) + ", and this call passes " + countOf(len(args)))
+		return
+	}
+	mut i := 0
+	for each f in fields {
+		found := argFor(args, f.name, i)
+		if found is ast.Expr.Hole {
+			i = i + 1
+			continue
+		}
+		fits(c, types.resolve(c.table, f.declared), infer.typeOf(env, found), "the field `{f.name}` of `{name}`")
+		i = i + 1
+	}
+}
+
+// Named arguments may appear anywhere; only the unnamed ones need to be in
+// order. Names must exist, must not repeat, and once named arguments are used
+// the call must cover the full parameter list.
+proc checkArgumentNames(c: mut Check, name: Str, parameters: Str[], args: ast.Arg[]): Bool {
+	mut Str[dyn] seen = []
+	mut named := false
+	for each a in args {
+		if a.name == "" {
+			continue
+		}
+		named = true
+		if indexOf(parameters, a.name) is Result.Error(_) {
+			report(c, "`{name}` has no parameter called `" + a.name + "`")
+			return false
+		}
+		if indexOf(seen, a.name) is Result.Ok(_) {
+			report(c, "this call names `" + a.name + "` twice")
+			return false
+		}
+		append(seen, a.name)
+	}
+	if named && len(args) != len(parameters) {
+		report(c, "once a call uses named arguments it has to cover the full parameter list, and `{name}` has " + countOf(len(parameters)))
+		return false
+	}
+	return true
+}
+
+func namesOfParams(params: ast.Param[]): Str[dyn] {
+	mut Str[dyn] out = []
+	for each p in params {
+		append(out, p.name)
+	}
+	return out
+}
+
+func namesOfFields(fields: ast.Field[]): Str[dyn] {
+	mut Str[dyn] out = []
+	for each f in fields {
+		append(out, f.name)
+	}
+	return out
+}
+
+func argFor(args: ast.Arg[], name: Str, index: Int): ast.Expr {
+	for each a in args {
+		if a.name == name {
+			return a.value
+		}
+	}
+	mut seen := 0
+	for each a in args {
+		if a.name == "" {
+			if seen == index {
+				return a.value
+			}
+			seen = seen + 1
+		}
+	}
+	return ast.Expr.Absent()
+}
+
+func countOf(n: Int): Str {
+	if n == 1 {
+		return "1 argument"
+	}
+	return "{n} arguments"
+}
+
+func fieldCount(n: Int): Str {
+	if n == 1 {
+		return "1 field"
+	}
+	return "{n} fields"
+}
+
+// --- The builtins ------------------------------------------------------------
+
+proc checkBuiltinCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): void {
+	if name == "append" || name == "prepend" {
+		checkGrows(c, env, name, args, 2)
+	} else if name == "drop" {
+		checkGrows(c, env, name, args, 3)
+	} else if name == "sort" {
+		if len(args) != 1 && len(args) != 2 {
+			report(c, "`sort` takes a vector, and optionally the `func` that says which of two elements comes first")
+		}
+	}
+}
+
+// `append`, `prepend` and `drop` all write *through* a vector, and all three ask
+// for the same thing: a mutable dynamic one. Dynamic has to be declared, because
+// a `:=` binding reads its length off the value and a length read off a value is
+// a static one — a promise the vector could not then grow out of.
+proc checkGrows(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[], wanted: Int): void {
+	if len(args) != wanted {
+		report(c, "`{name}` takes " + countOf(wanted) + ", and this call passes " + countOf(len(args)))
+		return
+	}
+	target := argFor(args, "", 0)
+	root := rootName(target)
+	if root == "" || isMutable(c, root) == false {
+		report(c, "`{name}` grows a vector in place, so its target has to be `mut` — this one is not")
+		return
+	}
+	ty := infer.typeOf(env, target)
+	if ty is types.Ty.TVec(_, dim) {
+		if dim is ast.Dim.Fixed(size) {
+			report(c, "`{name}` needs a vector declared `[dyn]`, and `{root}` promises exactly {size}. A `:=` binding reads its length off the value, and a length read off a value is a promise it cannot grow out of — declare it `mut T[dyn]`")
+		}
+		return
+	}
+	if ty is types.Ty.TUnknown {
+		return
+	}
+	report(c, "`{name}` grows a vector, and `{root}` is " + types.show(ty))
+}
+
+// A discarded `sort` on a `mut` vector reorders it where it lies. One that
+// cannot is a compile error rather than a statement that quietly does nothing:
+// both spellings would sort a copy and drop it the instant it was made.
+proc checkStatementExpr(c: mut Check, env: infer.Env, value: ast.Expr): void {
+	checkExpr(c, env, value)
+	if value is ast.Expr.Call(callee, args) {
+		mut name := ""
+		if callee is ast.Expr.Ident(bare) {
+			name = bare
+		} else if callee is ast.Expr.Member(head, member) {
+			if head is ast.Expr.Ident(hiveName) {
+				if hiveName == "hive" {
+					name = member
+				}
+			}
+		}
+		if name == "sort" && infer.isBound(env, name) == false && len(args) >= 1 {
+			target := argFor(args, "", 0)
+			root := rootName(target)
+			if root == "" {
+				report(c, "a `sort` written as a statement throws away the vector it answers with, so it only means something when it can sort in place — and there is nothing here to sort in place. Keep the answer instead")
+			} else if isMutable(c, root) == false {
+				report(c, "a `sort` written as a statement sorts in place, which needs a `mut` vector — `{root}` is not one. Declare it `mut` to sort it where it lies, or keep the answer")
+			}
+		}
+	}
+}
+
+// --- `async` -----------------------------------------------------------------
+
+// `async` works on any call, and what it refuses it refuses by name.
+proc checkAsync(c: mut Check, env: infer.Env, call: ast.Expr): void {
+	checkExpr(c, env, call)
+	if call is ast.Expr.Call(callee, args) {
+		for each a in args {
+			if a.value is ast.Expr.Hole {
+				report(c, "`async` cannot fire off a partial application: `f(1, _)` makes a function value, and nothing runs until something calls it")
+				return
+			}
+		}
+		if callee is ast.Expr.Ident(name) {
+			if infer.isBound(env, name) == false {
+				if infer.isBuiltin(name) {
+					report(c, "`async` cannot fire off the builtin `{name}`: the global builtins exist for the value they hand back, so firing one off would leave nothing of it")
+					return
+				}
+				if types.findType(c.table, name) is Result.Ok(_) {
+					report(c, "`async` cannot fire off a constructor: `{name}(...)` builds a value and runs no body")
+				}
+			}
+		}
+		if callee is ast.Expr.Member(head, variant) {
+			if head is ast.Expr.Ident(typeName) {
+				if typeName == "Result" || types.findType(c.table, typeName) is Result.Ok(_) {
+					report(c, "`async` cannot fire off a constructor: `{typeName}.{variant}(...)` builds a value and runs no body")
+				}
+			}
+		}
+	}
+}
+
+// --- Patterns ----------------------------------------------------------------
+
+proc checkPattern(c: mut Check, env: infer.Env, subject: ast.Expr, p: ast.Pattern): void {
+	subjectType := infer.typeOf(env, subject)
+	if p is ast.Pattern.Constructor(path, bindings, parenthesised) {
+		checkConstructorPattern(c, subjectType, path, bindings, parenthesised)
+	} else if p is ast.Pattern.VectorPat(_, _) {
+		if subjectType is types.Ty.TVec(_, _) || subjectType is types.Ty.TUnknown {
+			return
+		}
+		report(c, "a vector pattern matches a vector, and this subject is " + types.show(subjectType))
+	} else if p is ast.Pattern.StrTemplate(_) {
+		if subjectType is types.Ty.TStr || subjectType is types.Ty.TUnknown {
+			return
+		}
+		report(c, "a string pattern matches a `Str`, and this subject is " + types.show(subjectType))
+	}
+}
+
+proc checkConstructorPattern(c: mut Check, subjectType: types.Ty, path: Str[], bindings: Str[], parenthesised: Bool): void {
+	head := segment(path, 0)
+	variant := segment(path, 1)
+	if head == "Result" {
+		if variant != "Ok" && variant != "Error" {
+			report(c, "`Result` has two variants, `Ok` and `Error`, and `{variant}` is neither")
+		} else if parenthesised && len(bindings) != 1 {
+			report(c, "`Result.{variant}` carries one payload, and this pattern binds " + countOf(len(bindings)))
+		}
+		return
+	}
+	if types.findType(c.table, head) is Result.Error(_) {
+		report(c, "`{head}` is not a type anything here declared")
+		return
+	}
+	if types.findVariant(c.table, head, variant) is Result.Ok(fields) {
+		// A partially-written argument list is not allowed: name every field or
+		// none, so a pattern never quietly skips one.
+		if parenthesised && len(bindings) != len(fields) {
+			report(c, "`{head}.{variant}` has " + fieldCount(len(fields)) + ", and this pattern binds " + countOf(len(bindings)) + ". Name every field or none — `_` is how one is skipped")
+		}
+		return
+	}
+	report(c, "`{head}` has no variant `{variant}`")
+}
+
+func segment(path: Str[], index: Int): Str {
+	if path bounds index {
+		return path[index]
+	}
+	return ""
+}
+
+// --- Terminating paths -------------------------------------------------------
+
+// A path terminates by ending in `return`, in `assert` or `panic` (both handy
+// for a tail you know is unreachable), in an `if`/`else` whose every branch
+// terminates, or in an else-less `if`/`else if` chain that covers its subject's
+// whole type.
+func terminates(c: Check, b: ast.Block): Bool {
+	last := len(b.stmts) - 1
+	if b.stmts bounds last {
+		return terminatesWith(c, b.stmts[last])
+	}
+	return false
+}
+
+func terminatesWith(c: Check, s: ast.Stmt): Bool {
+	if s is ast.Stmt.ReturnStmt(_) { return true }
+	if s is ast.Stmt.PanicStmt(_) { return true }
+	if s is ast.Stmt.AssertStmt(_) { return true }
+	if s is ast.Stmt.IfChain(branches, otherwise, hasElse) {
+		for each branch in branches {
+			if terminates(c, branch.body) == false {
+				return false
+			}
+		}
+		if hasElse {
+			return terminates(c, otherwise)
+		}
+		return covers(c, branches)
+	}
+	return false
+}
+
+// Whether an else-less chain covers its subject's whole type: every variant of a
+// declared union, or a `Result`'s `Ok` and `Error`. Every branch has to test the
+// same subject, since a chain that changed subject halfway covers neither.
+func covers(c: Check, branches: ast.Branch[]): Bool {
+	mut subject := ""
+	mut Str[dyn] variants = []
+	mut typeName := ""
+	for each b in branches {
+		if b.condition is ast.Expr.IsMatch(matched, pattern) {
+			name := rootName(matched)
+			if name == "" || (subject != "" && subject != name) {
+				return false
+			}
+			subject = name
+			if pattern is ast.Pattern.Constructor(path, _, _) {
+				head := segment(path, 0)
+				if typeName != "" && typeName != head {
+					return false
+				}
+				typeName = head
+				append(variants, segment(path, 1))
+			} else {
+				// No finite set of vector or string patterns covers every length
+				// or every string.
+				return false
+			}
+		} else {
+			return false
+		}
+	}
+	if typeName == "Result" {
+		return indexOf(variants, "Ok") is Result.Ok(_) && indexOf(variants, "Error") is Result.Ok(_)
+	}
+	if types.findType(c.table, typeName) is Result.Ok(info) {
+		for each v in info.variants {
+			if indexOf(variants, v.name) is Result.Error(_) {
+				return false
+			}
+		}
+		return len(info.variants) > 0
+	}
+	return false
+}
+
+// --- Small questions ---------------------------------------------------------
+
+func isEmptyMap(value: ast.Expr): Bool {
+	if value is ast.Expr.Call(callee, _) {
+		if callee is ast.Expr.Member(subject, name) {
+			if name == "new" && subject is ast.Expr.Member(root, module) {
+				if module == "map" && root is ast.Expr.Ident(hiveName) {
+					return hiveName == "hive"
+				}
+			}
+		}
+	}
+	return false
+}
+
+proc fits(c: mut Check, wanted: types.Ty, given: types.Ty, where: Str): void {
+	if types.accepts(wanted, given) {
+		return
+	}
+	report(c, where + " wants " + types.show(wanted) + " and this is " + types.show(given))
+}

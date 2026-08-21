@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# Every example, compiled and run.
+#
+#   ./examples/run              all of them
+#   ./examples/run 05 11        only the ones whose directory starts like that
+#
+# An example is a directory holding one or more entrypoints. Where an `.expected`
+# file sits beside one, what the program printed has to match it exactly; where
+# none does, the example only has to compile and exit zero.
+#
+# A `*.test.hive` is run with `hive test` instead, because what that example is
+# about is the test run.
+#
+# Six programs are only *checked*, and the reason is the same in each case: they
+# do not finish on their own. A server blocks forever, a window waits for a
+# browser, a distributed pair waits for the other node, and a vault waits for
+# somebody to type a password. Compiling one is what can be checked without a
+# person; four of the six have test suites that exercise the rest, and each says
+# in its own header how to run it by hand.
+set -uo pipefail
+
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+hive="$here/../hive"
+
+if [ ! -x "$here/../src/hivec" ]; then
+	echo "examples/run: the compiler has not been built yet. Run ./bootstrap" >&2
+	exit 1
+fi
+
+# Compiled but not run: each of these waits for something no script can give it.
+# It is the entrypoint rather than the directory — `03-networking` also holds two
+# programs that are both halves of a conversation and do finish.
+check_only() {
+	case "$1" in
+		03-networking/http) return 0 ;;
+		09-online-cache/cache) return 0 ;;
+		13-distributed-actors/distributed-actors) return 0 ;;
+		16-password-vault/vault) return 0 ;;
+		17-chat/chat) return 0 ;;
+		19-multiplayer-fps/fps) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+passed=0
+failed=0
+
+report() {
+	printf '  %-26s %s\n' "$1" "$2"
+}
+
+for directory in "$here"/*/; do
+	name="$(basename "$directory")"
+
+	if [ "$#" -gt 0 ]; then
+		wanted=no
+		for pattern in "$@"; do
+			case "$name" in $pattern*) wanted=yes ;; esac
+		done
+		[ "$wanted" == yes ] || continue
+	fi
+
+	# Every test suite in the directory, run as one.
+	for suite in "$directory"*.test.hive; do
+		[ -f "$suite" ] || continue
+		label="$name/$(basename "$suite" .test.hive)"
+		if output="$("$hive" test "$suite" </dev/null 2>&1)"; then
+			report "$label" "$(echo "$output" | grep -oE '[0-9]+ tests?: .*' | head -1)"
+			passed=$((passed + 1))
+		else
+			report "$label" "FAILED"
+			echo "$output" | sed 's/^/      /'
+			failed=$((failed + 1))
+		fi
+	done
+
+	# Every program in it.
+	for entry in "$directory"*.hive; do
+		[ -f "$entry" ] || continue
+		case "$entry" in *.test.hive) continue ;; esac
+		grep -q '^proc main(' "$entry" || continue
+		label="$name/$(basename "$entry" .hive)"
+
+		if check_only "$label"; then
+			if output="$("$hive" check "$entry" 2>&1)"; then
+				report "$label" "checked"
+				passed=$((passed + 1))
+			else
+				report "$label" "FAILED"
+				echo "$output" | sed 's/^/      /'
+				failed=$((failed + 1))
+			fi
+			continue
+		fi
+
+		expected="${entry%.hive}.expected"
+		output="$("$hive" run "$entry" </dev/null 2>&1)"
+		status=$?
+
+		if [ "$status" -ne 0 ]; then
+			report "$label" "FAILED (exit $status)"
+			echo "$output" | sed 's/^/      /'
+			failed=$((failed + 1))
+		elif [ ! -f "$expected" ]; then
+			report "$label" "ran"
+			passed=$((passed + 1))
+		elif [ "$output" == "$(cat "$expected")" ]; then
+			report "$label" "ok"
+			passed=$((passed + 1))
+		else
+			report "$label" "DIFFERENT"
+			diff <(echo "$output") "$expected" | sed 's/^/      /'
+			failed=$((failed + 1))
+		fi
+	done
+done
+
+echo
+total=$((passed + failed))
+if [ "$failed" -eq 0 ]; then
+	echo "  $total examples: $passed passed"
+else
+	echo "  $total examples: $passed passed, $failed failed"
+	exit 1
+fi

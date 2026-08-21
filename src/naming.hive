@@ -1,0 +1,255 @@
+// Naming
+// ======
+// What a name is allowed to look like — and, since the shapes do not overlap,
+// what the way it is written already says it is.
+//
+//   * `camelCase` — a variable, a parameter, a field, every callable, and the
+//     name an `import` is reached through.
+//   * `UPPER_CASE` — a variable nothing reassigns, which is the one thing worth
+//     a shape of its own: `MAX_RETRIES` is a constant, and a `mut` variable may
+//     not be written that way.
+//   * `PascalCase` — a type, a variant of one, and an atom. Builtin and
+//     declared types are written alike, because there is nothing about `Str` a
+//     program should read differently from a type it wrote itself.
+//   * lower case — the keywords, and nothing else.
+//
+// Every rule is enforced where a name is **declared**. That is the one place it
+// can be fixed: a use site spells whatever the declaration did, and a name that
+// was never declared is a different mistake with its own message.
+import ./text
+
+// What a name names. This decides both the shape it must have and how a message
+// about it reads, so there is one of these for each kind of thing Hive lets you
+// name rather than one per shape.
+type Role {
+	/// A `proc`, `func` or `query`.
+	Callable
+	/// A parameter of one.
+	Parameter
+	/// A field of a type.
+	Field
+	/// A variable declared `mut`, or a counting loop's counter, which is one.
+	/// It may be reassigned, so it cannot be written as a constant.
+	MutVariable
+	/// A variable that is not `mut`: camelCase, or UPPER_CASE for a value the
+	/// program treats as a constant.
+	Variable
+	/// A name bound by a pattern or a `for each`. `_` throws the value away.
+	Binding
+	/// A type: declared, builtin, or a type variable.
+	TypeName
+	/// One variant of a type.
+	Variant
+	/// An atom, written without its `#`.
+	Atom
+	/// The name an `import` is reached through, and each qualifier segment in
+	/// front of a name (`hive.net.HttpRequest`).
+	Module
+}
+
+// Whether `name` has the shape its role calls for. Asked without a message for
+// a position that accepts more than one role — what stands in front of a name
+// is a module or a type, and either will do.
+func fits(role: Role, name: Str): Bool {
+	// The `_` a name may open with says nothing about its shape, so it is set
+	// aside before the shape is looked at — and `_` on its own is not a name
+	// with a prefix, it is the whole of what a binding says when it wants
+	// nothing.
+	bare := unprefixed(name)
+	if role is Role.Variable {
+		return isCamel(bare) || isScreaming(bare)
+	} else if role is Role.Binding {
+		return isCamel(bare) || name == "_"
+	} else if role is Role.TypeName || role is Role.Variant || role is Role.Atom {
+		return isPascal(bare)
+	}
+	return isCamel(bare)
+}
+
+// The shape check with the message to report when it does not fit. The message
+// carries no position: whoever calls this is holding the token, and only they
+// know the line.
+func check(role: Role, name: Str): Result<Bool, Str> {
+	if fits(role, name) {
+		return Result.Ok(true)
+	}
+	return Result.Error(message(role, name))
+}
+
+func unprefixed(name: Str): Str {
+	if text.startsWith(name, "_") {
+		return text.span(text.chars(name), 1, len(name) - 1)
+	}
+	return name
+}
+
+// --- The shapes --------------------------------------------------------------
+//
+// An identifier is only ever ASCII letters, digits and `_`, so each of these is
+// a first character followed by a rule about the rest. `_` is what separates the
+// two conventions: UPPER_CASE is the only shape that may hold one.
+
+/// `userName` — a lower-case letter followed by letters and digits.
+func isCamel(name: Str): Bool {
+	cs := text.chars(name)
+	if text.isLower(text.charAt(cs, 0)) == false {
+		return false
+	}
+	return restIsAlnum(cs)
+}
+
+/// `UserName` — an upper-case letter followed by letters and digits.
+func isPascal(name: Str): Bool {
+	cs := text.chars(name)
+	if text.isUpper(text.charAt(cs, 0)) == false {
+		return false
+	}
+	return restIsAlnum(cs)
+}
+
+/// `USER_NAME` — upper-case letters, digits and underscores, opening with a
+/// letter. A single `A` is both this and PascalCase; nothing needs to tell those
+/// two apart, since no position accepts both.
+func isScreaming(name: Str): Bool {
+	cs := text.chars(name)
+	first := text.charAt(cs, 0)
+	if text.isUpper(first) == false {
+		return false
+	}
+	for i := 1; i < len(cs); i++ {
+		c := text.charAt(cs, i)
+		if text.isUpper(c) == false && text.isDigit(c) == false && c != "_" {
+			return false
+		}
+	}
+	return true
+}
+
+// Every character after the first is a letter or a digit. The underscore is
+// deliberately absent: it is what tells `MAX_RETRIES` from `maxRetries`, so a
+// shape that allowed one in either would have nothing left to tell them by.
+func restIsAlnum(cs: Str[]): Bool {
+	for i := 1; i < len(cs); i++ {
+		if text.isAlnum(text.charAt(cs, i)) == false {
+			return false
+		}
+	}
+	return true
+}
+
+// --- Respelling --------------------------------------------------------------
+//
+// What a message offers back. A suggestion only has to be recognisable as the
+// name that was written — the point is to show the shape, not to guess at better
+// words — so the pieces are whatever the underscores separate, with a shouted
+// one quietened first so `MAX_RETRIES` can become `maxRetries`.
+
+/// `user_name` -> `userName`.
+func toCamel(name: Str): Str {
+	if text.startsWith(name, "_") {
+		return "_" + toCamel(unprefixed(name))
+	}
+	words := pieces(name)
+	mut Str[dyn] out = []
+	for i := 0; i < len(words); i++ {
+		word := text.charAt(words, i)
+		if i == 0 {
+			append(out, text.decapitalise(word))
+		} else {
+			append(out, text.capitalise(word))
+		}
+	}
+	return join(out, "")
+}
+
+/// `user_name` -> `UserName`.
+func toPascal(name: Str): Str {
+	if text.startsWith(name, "_") {
+		return "_" + toPascal(unprefixed(name))
+	}
+	mut Str[dyn] out = []
+	for each word in pieces(name) {
+		append(out, text.capitalise(word))
+	}
+	return join(out, "")
+}
+
+/// `userName` -> `USER_NAME`.
+func toScreaming(name: Str): Str {
+	if text.startsWith(name, "_") {
+		return "_" + toScreaming(unprefixed(name))
+	}
+	cs := text.chars(name)
+	mut Str[dyn] out = []
+	for i := 0; i < len(cs); i++ {
+		c := text.charAt(cs, i)
+		// A `_` goes where a hump was: an upper-case letter with something
+		// quieter in front of it. Asking what came *before* is what keeps a name
+		// that is already shouted — `MAX` — from being pulled apart into
+		// `M_A_X`, which the same question asked of `c` alone would do.
+		previous := text.charAt(cs, i - 1)
+		if text.isUpper(c) && (text.isLower(previous) || text.isDigit(previous)) {
+			append(out, "_")
+		}
+		append(out, text.upper(c))
+	}
+	return join(out, "")
+}
+
+// A piece that is shouted has nothing left to say about where its words divide,
+// so it is lower-cased whole and re-cased by whoever asked for it.
+func pieces(name: Str): Str[dyn] {
+	mut Str[dyn] out = []
+	for each word in split(name, "_") {
+		if word != "" {
+			if word == text.upper(word) {
+				append(out, text.lower(word))
+			} else {
+				append(out, word)
+			}
+		}
+	}
+	return out
+}
+
+// --- Messages ----------------------------------------------------------------
+
+func message(role: Role, name: Str): Str {
+	if role is Role.Callable {
+		return "`{name}` is not how a callable is named. A `proc`, a `func` and a `query` are written in camelCase, like the variable a call's result lands in: `{toCamel(name)}`."
+	} else if role is Role.Parameter {
+		return "`{name}` is not how a parameter is named. A parameter is written in camelCase: `{toCamel(name)}`."
+	} else if role is Role.Field {
+		return "`{name}` is not how a field is named. A field is written in camelCase: `{toCamel(name)}`."
+	} else if role is Role.MutVariable {
+		// The one name whose shape is *taken*, rather than merely wrong: it says
+		// constant about something the program is about to reassign.
+		if isScreaming(name) {
+			return "`{name}` is written as a constant, and `mut` says it is not one: UPPER_CASE is for a variable nothing reassigns. Write it in camelCase — `{toCamel(name)}` — or drop the `mut` if it really does hold still."
+		}
+		return "`{name}` is not how a variable is named. A variable is written in camelCase: `{toCamel(name)}`."
+	} else if role is Role.Variable {
+		return "`{name}` is not how a variable is named. A variable is written in camelCase — `{toCamel(name)}` — or, when nothing reassigns it, in UPPER_CASE: `{toScreaming(name)}`."
+	} else if role is Role.Binding {
+		return "`{name}` is not how a binding is named. A name a pattern or a `for each` binds is written in camelCase — `{toCamel(name)}` — or `_` to throw the value away."
+	} else if role is Role.TypeName {
+		return "`{name}` is not how a type is named. Every type is written in PascalCase, the ones the language declares (`Str`, `Result`) along with your own: `{toPascal(name)}`."
+	} else if role is Role.Variant {
+		return "`{name}` is not how a variant is named. A variant is written in PascalCase, like the type it belongs to: `{toPascal(name)}`."
+	} else if role is Role.Atom {
+		return "`#{name}` is not how an atom is written. An atom is written in PascalCase: `#{toPascal(name)}`."
+	} else if role is Role.Module {
+		return "`{name}` is not a name a module can be reached through. It is written in camelCase, like the variable it reads as at every use — `{toCamel(name)}` — which an `import ... as {toCamel(name)}` gives it."
+	}
+	return "`{name}` is not a name."
+}
+
+// The opening of the message for a keyword written in any casing but its own,
+// which the caller finishes with what its own position can offer instead.
+//
+// Two passes report this. The lexer has the keywords it lexes; the parser has
+// the words that are keywords only where they are written (`as`, `run`, `csv`),
+// which never reach the lexer's table at all.
+func miscasedKeyword(word: Str): Str {
+	return "`{word}` is a keyword written the wrong way: every keyword in Hive is lower case, and only lower case. Write `{text.lower(word)}`"
+}
