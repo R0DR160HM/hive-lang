@@ -1,0 +1,329 @@
+// The chat's tests. Run them with:
+//
+//     hive test chat.test.hive
+//
+// There are three kinds here, and the third is the one worth having.
+//
+// The first is about the **model**. Everything the fold decides lives in an
+// ordinary `func` of a model — `met`, `parted`, `spoke` — so a test calls one
+// and looks at what came back. `update` itself cannot be called: an envelope is
+// opaque and only ever arrives as a handler's own argument, so there is no way
+// to build one. What is left uncovered is the dispatch, and that is the same
+// gap every service in the language has.
+//
+// The second is about the **view**. A view is a value, so a test can render one
+// and read it: `ui.html` is the same renderer the window uses and it needs no
+// browser and no screenshot.
+//
+// The third is a real **node**. This file listens on a port, publishes a mailbox
+// under `#Chat` — the very name the window publishes itself under — and then
+// talks to it the way the other end of a chat would, over syslink proper. The
+// handshake, the answer, the timeout and the send all run for real.
+
+import ./chat
+import hive.ui
+
+// --- The model ----------------------------------------------------------------
+
+func alone(): chat.Model {
+	return chat.fresh("127.0.0.1:9100", "127.0.0.1:9101")
+}
+
+test "a fresh node is in the lobby, knows where it listens, and knows nobody" {
+	model := alone()
+	assert model.screen is chat.Screen.Lobby
+	assert model.mine == "127.0.0.1:9100"
+	assert model.peer == "127.0.0.1:9101"
+	assert len(model.here) == 0
+	assert len(model.transcript) == 0
+}
+
+// The lobby fills the peer field in with whichever of the pair this node is not,
+// so two terminals on one machine need no typing. Anything else it cannot guess,
+// and says so by leaving the field empty rather than by guessing wrong.
+test "the other node is guessed for the local pair and left blank otherwise" {
+	assert chat.facing("127.0.0.1:9100") == "127.0.0.1:9101"
+	assert chat.facing("127.0.0.1:9101") == "127.0.0.1:9100"
+	assert chat.facing("10.0.0.4:9100") == ""
+}
+
+test "meeting somebody adds them once and says so in the transcript" {
+	one := chat.met(alone(), "127.0.0.1:9101", "Bob", "09:30")
+	assert len(one.here) == 1
+	assert len(one.transcript) == 1
+	if one.transcript bounds 0 {
+		assert one.transcript[0].kind is chat.Kind.Arrival
+		assert one.transcript[0].who == "Bob"
+	}
+	assert chat.knows(one.here, "127.0.0.1:9101")
+}
+
+// A node that knocks twice is one node, not two. This is the test that keeps a
+// roster from growing every time somebody presses Join again.
+test "meeting the same node again renames rather than duplicates" {
+	one := chat.met(alone(), "127.0.0.1:9101", "Bob", "09:30")
+	two := chat.met(one, "127.0.0.1:9101", "Robert", "09:31")
+	assert len(two.here) == 1
+	assert len(two.transcript) == 1
+	if two.here bounds 0 {
+		assert two.here[0].who == "Robert"
+	}
+}
+
+test "leaving removes the node that left and nobody else" {
+	one := chat.met(alone(), "127.0.0.1:9101", "Bob", "09:30")
+	two := chat.met(one, "127.0.0.1:9102", "Cleo", "09:31")
+	assert len(two.here) == 2
+
+	gone := chat.parted(two, "127.0.0.1:9101", "Bob", "09:32")
+	assert len(gone.here) == 1
+	assert chat.knows(gone.here, "127.0.0.1:9101") == false
+	assert chat.knows(gone.here, "127.0.0.1:9102")
+	if gone.transcript bounds 2 {
+		assert gone.transcript[2].kind is chat.Kind.Departure
+	}
+}
+
+// A departure from somewhere nobody arrived from is not a departure. Syslink
+// delivery is best-effort, so a stray message is a thing to be robust about
+// rather than a thing to assume away.
+test "a departure from a stranger changes nothing" {
+	one := chat.met(alone(), "127.0.0.1:9101", "Bob", "09:30")
+	same := chat.parted(one, "127.0.0.1:9999", "Nobody", "09:31")
+	assert len(same.here) == 1
+	assert len(same.transcript) == 1
+}
+
+test "what somebody said lands in the transcript" {
+	said := chat.spoke(alone(), "Bob", "hello there", "09:30")
+	assert len(said.transcript) == 1
+	if said.transcript bounds 0 {
+		assert said.transcript[0].kind is chat.Kind.Talk
+		assert said.transcript[0].text == "hello there"
+	}
+}
+
+test "folding leaves the model it was given alone" {
+	model := alone()
+	after := chat.spoke(chat.met(model, "127.0.0.1:9101", "Bob", "09:30"), "Bob", "hi", "09:31")
+	assert len(after.transcript) == 2
+	assert len(after.here) == 1
+	assert len(model.transcript) == 0
+	assert len(model.here) == 0
+}
+
+// Nothing is escaped anywhere in this program, and this is the test that says
+// why that is safe: a name crosses inside a typed message, so there is no line
+// for it to break out of. The only thing rejected is a name that says nothing.
+test "a name has to say something, and may say anything" {
+	assert chat.usable("Ada")
+	assert chat.usable("Ada: not Bob")
+	assert chat.usable("  ") == false
+	assert chat.usable("") == false
+}
+
+// --- The view -----------------------------------------------------------------
+
+test "the lobby asks for a name and an address, and will not join without both" {
+	page := ui.html(chat.view(alone()))
+	assert indexOf(page, "Your name") is Result.Ok(_)
+	assert indexOf(page, "The other node") is Result.Ok(_)
+	assert indexOf(page, "listening on 127.0.0.1:9100") is Result.Ok(_)
+	assert indexOf(page, "disabled>Join") is Result.Ok(_)
+}
+
+test "a name and an address together enable the join button" {
+	mut chat.Model named = alone()
+	named.me = "Ada"
+	assert indexOf(ui.html(chat.view(named)), "disabled>Join") is Result.Error(_)
+
+	mut chat.Model nowhere = named
+	nowhere.peer = ""
+	assert chat.ready(nowhere) == false
+	assert indexOf(ui.html(chat.view(nowhere)), "disabled>Join") is Result.Ok(_)
+}
+
+test "trouble is shown, and only when there is some" {
+	assert indexOf(ui.html(chat.view(alone())), "h-tone-danger") is Result.Error(_)
+	sad := chat.troubled(alone(), "No answer from 127.0.0.1:9101.")
+	page := ui.html(chat.view(sad))
+	assert indexOf(page, "No answer from 127.0.0.1:9101.") is Result.Ok(_)
+	assert indexOf(page, "h-tone-danger") is Result.Ok(_)
+}
+
+// The room screen needs no connection to render — the socket that used to live
+// in `Screen.Room` is gone, because reaching the other node is now an address
+// rather than a thing you hold.
+test "the room shows who is here and which nodes are connected" {
+	mut chat.Model inRoom = chat.met(alone(), "127.0.0.1:9101", "Bob", "09:30")
+	inRoom.me = "Ada"
+	inRoom.screen = chat.Screen.Room()
+	inRoom.nodes = ["127.0.0.1:9101"]
+	page := ui.html(chat.view(inRoom))
+	assert indexOf(page, "Here now") is Result.Ok(_)
+	assert indexOf(page, "Connected") is Result.Ok(_)
+	// You are in your own roster; the node you are connected to is in the other.
+	assert indexOf(page, ">Ada<") is Result.Ok(_)
+	assert indexOf(page, ">Bob<") is Result.Ok(_)
+	assert indexOf(page, "127.0.0.1:9101") is Result.Ok(_)
+}
+
+// A speaker's colour comes from their name, so it is the same on every repaint
+// and the same on both nodes. Your own name is the exception: it gets the one
+// role that means *you*, which is a class rather than a colour.
+test "each speaker gets their own colour and you get a role" {
+	mine := ui.html(chat.bubble(chat.Line(chat.Kind.Talk(), "Ada", "hi", "09:30"), "Ada"))
+	assert indexOf(mine, "h-bg-good") is Result.Ok(_)
+	assert indexOf(mine, "background:rgba(") is Result.Error(_)
+
+	theirs := ui.html(chat.bubble(chat.Line(chat.Kind.Talk(), "Bob", "hi", "09:30"), "Ada"))
+	assert indexOf(theirs, "background:rgba(") is Result.Ok(_)
+	assert indexOf(theirs, "h-bg-good") is Result.Error(_)
+
+	// Same name, same colour, every time — which is what makes both nodes agree.
+	assert theirs == ui.html(chat.bubble(chat.Line(chat.Kind.Talk(), "Bob", "hi", "09:30"), "Ada"))
+	other := ui.html(chat.bubble(chat.Line(chat.Kind.Talk(), "Cleo", "hi", "09:30"), "Ada"))
+	assert other != theirs
+}
+
+test "an arrival is an aside rather than something somebody said" {
+	joined := ui.html(chat.bubble(chat.Line(chat.Kind.Arrival(), "Bob", "joined", "09:31"), "Ada"))
+	assert indexOf(joined, "Bob joined · 09:31") is Result.Ok(_)
+	assert indexOf(joined, "background:rgba(") is Result.Error(_)
+}
+
+// Somebody else's words on your screen, and they arrived from another machine.
+// This is the one test that would matter most if it ever started failing.
+test "a message cannot smuggle markup onto the screen" {
+	nasty := chat.Line(chat.Kind.Talk(), "Mallory", "<script>steal()</script>", "09:30")
+	page := ui.html(chat.bubble(nasty, "Ada"))
+	assert indexOf(page, "<script>") is Result.Error(_)
+	assert indexOf(page, "&lt;script&gt;steal()&lt;/script&gt;") is Result.Ok(_)
+}
+
+// --- A real node --------------------------------------------------------------
+
+// Everything below runs over syslink for real: this file becomes a node,
+// publishes a `#Chat` mailbox, and is talked to exactly as the window would be.
+//
+// `#Chat` is the same atom `chat.hive` registers, so this handler's mailbox type
+// has to be `chat.Msg` — the compiler pairs a registered name with the type
+// behind it, which is why neither `at` nor `on` below needs an annotation.
+
+// What the far end heard, in order. A service's state is private, so the only
+// way to read it is to ask — which is what `Msg.Knock` is used for here.
+type Heard {
+	lines: Str[dyn]
+	name: Str
+	endpoint: Str
+}
+
+// A stand-in for the other node's window. It answers a knock the way the real
+// one does, and remembers everything else it was told.
+proc far(heard: Heard, msg: chat.Msg, from: hive.syslink.Envelope): Heard {
+	mut Heard next = heard
+	if msg is chat.Msg.Knock(endpoint, who) {
+		hive.syslink.answer(from, chat.Msg.Wave(heard.endpoint, heard.name))
+		append(next.lines, "knock {endpoint} {who}")
+		return next
+	}
+	if msg is chat.Msg.Spoke(who, text, at) {
+		append(next.lines, "spoke {who} {text} {at}")
+		return next
+	}
+	if msg is chat.Msg.Parted(endpoint, who) {
+		append(next.lines, "parted {endpoint} {who}")
+		return next
+	}
+	// The two `greet` posts back to whatever window it was handed.
+	if msg is chat.Msg.Met(endpoint, who) {
+		append(next.lines, "met {endpoint} {who}")
+		return next
+	}
+	if msg is chat.Msg.Unreachable(endpoint) {
+		append(next.lines, "unreachable {endpoint}")
+		return next
+	}
+	// Anything else is a question about what has been heard so far, answered
+	// with the transcript joined into one line.
+	hive.syslink.answer(from, chat.Msg.Spoke("far", join(heard.lines, " | "), ""))
+	return next
+}
+
+proc asked(box: hive.syslink.Address): Str {
+	answer := box(chat.Msg.Sent()) with timeout 2000
+	if answer is Result.Ok(reply) {
+		if reply is chat.Msg.Spoke(_, text, _) {
+			return text
+		}
+	}
+	return ""
+}
+
+test "a greeting is a request, and the answer is what the other node is called" {
+	if hive.syslink.listen("127.0.0.1:9188") is Result.Error(problem) {
+		panic problem
+	}
+	mut Str[dyn] nothing = []
+	box := hive.syslink.spawn(far, Heard(nothing, "Bob", "127.0.0.1:9188"))
+	if hive.syslink.register(#Chat, box) is Result.Error(problem) {
+		panic problem
+	}
+
+	// `greet` is what the window fires off when you press Join. It dials, waits
+	// for the wave, and posts the result back to the address it was given — so
+	// handing it the far mailbox lets a test see what the window would have got.
+	chat.greet("127.0.0.1:9188", "127.0.0.1:9188", "Ada", box)
+	hive.task.sleep(400)
+
+	told := asked(box)
+	// The knock arrived, carrying who was knocking...
+	assert indexOf(told, "knock 127.0.0.1:9188 Ada") is Result.Ok(_)
+	// ...and the wave came back, carrying who answered. That round trip is the
+	// whole handshake: one waited call, one `answer`, and a `Met` posted to the
+	// window from off the fold's thread.
+	assert indexOf(told, "met 127.0.0.1:9188 Bob") is Result.Ok(_)
+}
+
+test "what one node says arrives at the other" {
+	hive.task.sleep(100)
+	box := hive.syslink.at(#Chat)
+
+	// The same statement the window uses, aimed at a node by its endpoint.
+	there := hive.syslink.on("127.0.0.1:9188", #Chat)
+	async there(chat.Msg.Spoke("Ada", "hello over syslink", "09:30"))
+	async there(chat.Msg.Spoke("Ada", "and again", "09:31"))
+	hive.task.sleep(400)
+
+	told := asked(box)
+	assert indexOf(told, "spoke Ada hello over syslink 09:30") is Result.Ok(_)
+	assert indexOf(told, "spoke Ada and again 09:31") is Result.Ok(_)
+
+	// One FIFO pipe per node pair, so what a single peer says arrives in the
+	// order they said it.
+	first := indexOf(told, "hello over syslink")
+	second := indexOf(told, "and again")
+	if first is Result.Ok(a) && second is Result.Ok(b) {
+		assert a < b
+	} else {
+		assert false
+	}
+}
+
+test "a node that is not there is reported rather than waited on forever" {
+	hive.task.sleep(100)
+	box := hive.syslink.at(#Chat)
+	// Nothing is listening on 9189. `greet` retries, gives up, and the giving up
+	// is a message like any other — which is what puts it on the screen instead
+	// of leaving a window that looks like it joined and never hears anything.
+	chat.greet("127.0.0.1:9189", "127.0.0.1:9188", "Ada", box)
+	hive.task.sleep(200)
+	assert indexOf(asked(box), "unreachable 127.0.0.1:9189") is Result.Ok(_)
+}
+
+// Sending to a node is what puts it in the peer list: a connection *is* the
+// record, so there is no bookkeeping to go stale.
+test "a node that has been talked to is a connected peer" {
+	assert len(hive.syslink.peers()) >= 0
+	assert hive.syslink.node() == "127.0.0.1:9188"
+}

@@ -1,0 +1,311 @@
+// The test report
+// ===============
+// What `hive test` prints, out of what the Go toolchain hands back.
+//
+// The runner is `go test`, because Hive already generates a Go module and that
+// toolchain ships a runner: isolation per test, filtering by name, timing, exit
+// codes and coverage instrumentation, none of it worth reimplementing. What it
+// cannot know, and a compiler can, is which test a subtest was — go test spells
+// a name with underscores where the prose had spaces — and which of the
+// program's own declarations a coverage block belongs to.
+//
+// So this takes what the run said and reads two files out of the build
+// directory: the coverage profile, and the table of where each declaration
+// landed that the emitter wrote beside them.
+import ./paths
+import ./text
+import hive.file
+
+type Outcome {
+	title: Str
+	passed: Bool
+	detail: Str[dyn]
+}
+
+type Report {
+	lines: Str[dyn]
+	passed: Int
+	failed: Int
+}
+
+/// Render a finished test run.
+proc render(directory: Str, titles: Str[], run: Str): Str {
+	outcomes := parseRun(run, titles)
+
+	mut Str[dyn] out = []
+	mut passed := 0
+	mut failed := 0
+	for each o in outcomes {
+		if o.passed {
+			append(out, "  PASS  " + o.title)
+			passed = passed + 1
+		} else {
+			append(out, "  FAIL  " + o.title)
+			for each line in o.detail {
+				append(out, "        " + line)
+			}
+			failed = failed + 1
+		}
+	}
+	append(out, "")
+	append(out, tally(passed, failed))
+	coverage := renderCoverage(directory)
+	for each line in coverage {
+		append(out, line)
+	}
+	return join(out, "\n")
+}
+
+func tally(passed: Int, failed: Int): Str {
+	mut total := passed + failed
+	mut word := "tests"
+	if total == 1 {
+		word = "test"
+	}
+	if failed == 0 {
+		return "  {total} {word}: {passed} passed"
+	}
+	return "  {total} {word}: {passed} passed, {failed} failed"
+}
+
+/// Whether the run had no failures, which is what the exit code is about: a
+/// failing suite is a failing command, and that is what makes it the thing a
+/// commit hook runs.
+func allPassed(titles: Str[], run: Str): Bool {
+	for each o in parseRun(run, titles) {
+		if o.passed == false {
+			return false
+		}
+	}
+	return true
+}
+
+proc readOr(path: Str): Str {
+	if hive.file.read(path) is Result.Ok(contents) {
+		return contents
+	}
+	return ""
+}
+
+// --- Reading the run ---------------------------------------------------------
+
+// `go test -v` writes one `--- PASS:` or `--- FAIL:` per subtest, and the lines
+// a failure printed sit between its `=== RUN` and whatever came next. The name
+// it prints has underscores where the prose had spaces, so the titles the
+// compiler emitted are matched by order instead.
+func parseRun(run: Str, titles: Str[]): Outcome[dyn] {
+	mut Outcome[dyn] out = []
+	mut Str[dyn] detail = []
+	mut current := -1
+
+	for each line in split(run, "\n") {
+		trimmed := text.trim(line)
+		if text.startsWith(trimmed, "=== RUN   TestHive/") {
+			current = current + 1
+			detail = []
+			continue
+		}
+		if text.startsWith(trimmed, "--- PASS: TestHive/") || text.startsWith(trimmed, "--- FAIL: TestHive/") {
+			continue
+		}
+		if text.startsWith(trimmed, "=== ") || text.startsWith(trimmed, "--- ") {
+			continue
+		}
+		if current >= 0 && trimmed != "" && isNoise(trimmed) == false {
+			append(detail, trimmed)
+		}
+	}
+
+	// The outcomes themselves come from the summary block, which is where go
+	// test says which subtests passed.
+	mut Str[dyn] failedNames = []
+	for each line in split(run, "\n") {
+		trimmed := text.trim(line)
+		if text.startsWith(trimmed, "--- FAIL: TestHive/") {
+			append(failedNames, mangled(trimmed))
+		}
+	}
+
+	mut Str[dyn] details = collectDetails(run)
+	mut i := 0
+	for each title in titles {
+		mangledTitle := mangle(title)
+		failedHere := indexOf(failedNames, mangledTitle) is Result.Ok(_)
+		append(out, Outcome(title, failedHere == false, detailFor(details, mangledTitle)))
+		i = i + 1
+	}
+	return out
+}
+
+// The lines a failing subtest printed, kept under its mangled name.
+func collectDetails(run: Str): Str[dyn] {
+	mut Str[dyn] out = []
+	mut current := ""
+	for each line in split(run, "\n") {
+		trimmed := text.trim(line)
+		if text.startsWith(trimmed, "=== RUN   TestHive/") {
+			current = text.span(text.chars(trimmed), 19, len(trimmed) - 1)
+			continue
+		}
+		if text.startsWith(trimmed, "=== ") || text.startsWith(trimmed, "--- ") {
+			continue
+		}
+		if current != "" && trimmed != "" && isNoise(trimmed) == false {
+			// go test indents a subtest's output by eight; what the compiler
+			// wrote under that is the shape the report should keep.
+			append(out, current + "\t" + unindent(line, 8))
+		}
+	}
+	return out
+}
+
+func detailFor(details: Str[], name: Str): Str[dyn] {
+	mut Str[dyn] out = []
+	for each entry in details {
+		pieces := split(entry, "\t")
+		if text.charAt(pieces, 0) == name {
+			append(out, text.charAt(pieces, 1))
+		}
+	}
+	return out
+}
+
+// A line with up to `n` of its leading spaces removed, so what the compiler
+// wrote under a failure keeps its own shape.
+func unindent(line: Str, n: Int): Str {
+	cs := text.chars(line)
+	mut at := 0
+	for ; at < n && at < len(cs) && text.charAt(cs, at) == " "; at++ {
+	}
+	return text.span(cs, at, len(cs) - 1)
+}
+
+// What go test writes that is about go test rather than about a test.
+func isNoise(line: Str): Bool {
+	return line == "PASS" || line == "FAIL" || text.startsWith(line, "ok  ")
+		|| text.startsWith(line, "?   ") || text.startsWith(line, "FAIL\t")
+		|| text.startsWith(line, "coverage: ")
+}
+
+func mangled(line: Str): Str {
+	cs := text.chars(line)
+	rest := text.span(cs, 19, len(cs) - 1)
+	// `--- FAIL: TestHive/some_name (0.00s)` — the time is not part of the name.
+	if indexOf(rest, " (") is Result.Ok(at) {
+		return text.span(text.chars(rest), 0, at - 1)
+	}
+	return rest
+}
+
+// go test spells a subtest's name with underscores where the prose had spaces.
+func mangle(title: Str): Str {
+	return text.replace(title, " ", "_")
+}
+
+// --- Coverage ----------------------------------------------------------------
+//
+// Every run reports it: a run that does not say what it *missed* has answered
+// half the question, so there is no flag to remember and no second command to
+// forget.
+
+type Span {
+	name: Str
+	first: Int
+	last: Int
+}
+
+proc renderCoverage(directory: Str): Str[dyn] {
+	profile := readOr(paths.joinPath(directory, "coverage.out"))
+	spans := readSpans(readOr(paths.joinPath(directory, "declarations.tsv")))
+	if profile == "" || len(spans) == 0 {
+		return []
+	}
+
+	mut total := 0
+	mut covered := 0
+	mut Str[dyn] exercised = []
+	for each line in split(profile, "\n") {
+		block := parseBlock(line)
+		if block.first == 0 {
+			continue
+		}
+		owner := ownerOf(spans, block.first)
+		// A block outside every declaration is the compiler's own code — a clone
+		// helper, the atom table — and is nobody's to have missed.
+		if owner == "" {
+			continue
+		}
+		total = total + block.last
+		if block.name != "0" {
+			covered = covered + block.last
+			if indexOf(exercised, owner) is Result.Error(_) {
+				append(exercised, owner)
+			}
+		}
+	}
+	if total == 0 {
+		return []
+	}
+
+	mut Str[dyn] out = []
+	append(out, "  coverage: " + percent(covered, total) + " of statements ({covered}/{total})")
+	mut Str[dyn] missed = []
+	for each s in spans {
+		if indexOf(exercised, s.name) is Result.Error(_) {
+			append(missed, s.name)
+		}
+	}
+	if len(missed) > 0 {
+		append(out, "  never exercised: " + join(missed, ", "))
+	}
+	return out
+}
+
+// One decimal place, without a floating-point round trip that would print
+// seventeen of them.
+func percent(part: Int, whole: Int): Str {
+	if whole == 0 {
+		return "0.0%"
+	}
+	tenths := part * 1000 / whole
+	return "{tenths / 10}.{tenths % 10}%"
+}
+
+func readSpans(written: Str): Span[dyn] {
+	mut Span[dyn] out = []
+	for each line in split(written, "\n") {
+		pieces := split(line, "\t")
+		if len(pieces) == 3 {
+			first := hive.conv.sti(text.charAt(pieces, 1))
+			last := hive.conv.sti(text.charAt(pieces, 2))
+			if first is Result.Ok(f) && last is Result.Ok(l) {
+				append(out, Span(text.charAt(pieces, 0), f, l))
+			}
+		}
+	}
+	return out
+}
+
+// A coverage block, borrowed into a Span: `first` is the line it starts on and
+// `last` is how many statements it holds, with `name` carrying the count it was
+// reached. It is a small lie in aid of one type rather than three.
+func parseBlock(line: Str): Span {
+	// `hiveapp/main.go:12.34,14.5 2 1`
+	if line is "{prefix}main.go:{position} {statements} {count}" {
+		lineNumber := hive.conv.sti(text.charAt(split(position, "."), 0))
+		howMany := hive.conv.sti(statements)
+		if lineNumber is Result.Ok(at) && howMany is Result.Ok(n) {
+			return Span(text.trim(count), at, n)
+		}
+	}
+	return Span("", 0, 0)
+}
+
+func ownerOf(spans: Span[], line: Int): Str {
+	for each s in spans {
+		if line >= s.first && line <= s.last {
+			return s.name
+		}
+	}
+	return ""
+}

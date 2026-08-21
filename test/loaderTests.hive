@@ -1,0 +1,253 @@
+// Tests for `src/loader`.
+//
+// A test runs with the working directory set to the generated project rather
+// than to this file's folder, so the multi-file tests here **write the program
+// they are about** and then load it. That is more work than a fixture on disk
+// and buys two things: the source of the program under test is next to the
+// assertion about it, and the suite does not care how it was invoked.
+import ../src/loader
+import ../src/show
+import ../src/text
+import hive.file
+
+// Write `contents` to `path` under a directory of this test's own, and answer
+// with the path written.
+proc put(path: Str, contents: Str): Str {
+	full := "_program/" + path
+	if hive.file.makeDir(dirOf(full)) is Result.Error(_) {
+		panic "could not make the directory for {full}"
+	}
+	if hive.file.write(full, contents) is Result.Error(why) {
+		panic "could not write {full}: {why.message}"
+	}
+	return full
+}
+
+func dirOf(path: Str): Str {
+	segments := split(path, "/")
+	mut Str[dyn] out = []
+	for i := 0; i < len(segments) - 1; i++ {
+		append(out, text.charAt(segments, i))
+	}
+	if len(out) == 0 {
+		return "."
+	}
+	return join(out, "/")
+}
+
+proc tree(name: Str, source: Str): Str {
+	p := loader.loadText(name, source)
+	if len(p.errors) > 0 {
+		return firstError(p)
+	}
+	return show.showModule(p.module)
+}
+
+proc firstError(p: loader.Program): Str {
+	for each e in p.errors {
+		return e.message
+	}
+	return ""
+}
+
+proc treeOfFile(entry: Str): Str {
+	p := loader.load(entry)
+	if len(p.errors) > 0 {
+		return firstError(p)
+	}
+	return show.showModule(p.module)
+}
+
+proc errorOfFile(entry: Str): Str {
+	p := loader.load(entry)
+	return firstError(p)
+}
+
+// --- One file ----------------------------------------------------------------
+
+test "a program of one file keeps its own names" {
+	got := tree("main.hive", "proc main(): void \{ echo greeting() }\nfunc greeting(): Str \{ return \"hi\" }")
+	assert got == "(proc main () void (block (echo (call greeting)))) (func greeting () Str (block (return \"hi\")))"
+}
+
+test "a lexing or parsing failure is reported against the file it was in" {
+	p := loader.loadText("main.hive", "proc main(): void \{ echo ~ }")
+	assert len(p.errors) > 0
+	for each e in p.errors {
+		assert e.file == "main.hive"
+	}
+}
+
+// --- The standard library ----------------------------------------------------
+
+test "a standard library alias is a spelling, resolved away" {
+	got := tree("main.hive", "import hive.map\nproc main(): void \{ echo map.get(m, k) }")
+	assert got == "(proc main () void (block (echo (call (. (. hive map) get) m k))))"
+}
+
+test "the same call written in full comes out identically" {
+	short := tree("main.hive", "import hive.map as m\nproc main(): void \{ echo m.keys(x) }")
+	long := tree("main.hive", "proc main(): void \{ echo hive.map.keys(x) }")
+	assert short == long
+}
+
+test "an import may not be named hive" {
+	got := tree("main.hive", "import ./lib/text as hive\nproc main(): void \{ }")
+	assert got == "an import cannot be named `hive`: that name belongs to the standard library"
+}
+
+// --- Several files -----------------------------------------------------------
+
+test "an imported declaration is renamed, and every reference with it" {
+	put("lib/text.hive", "func repeat(unit: Str, times: Int): Str \{ return unit }")
+	entry := put("app.hive", "import ./lib/text\nproc main(): void \{ echo text.repeat(\"=\", 3) }")
+
+	got := treeOfFile(entry)
+	assert got == "(func text_0_repeat ((unit Str) (times Int)) Str (block (return unit))) (proc main () void (block (echo (call text_0_repeat \"=\" 3))))"
+}
+
+test "an imported type is renamed too, wherever it is named" {
+	put("lib/shapes.hive", "type Align \{ Left  Right }")
+	entry := put("useShapes.hive", "import ./lib/shapes\nfunc pad(a: shapes.Align): Str \{ if a is shapes.Align.Left \{ return \"l\" } return \"r\" }")
+
+	got := treeOfFile(entry)
+	assert got == "(type shapes_0_Align (| Left) (| Right)) (func pad ((a shapes_0_Align)) Str (block (if (is a shapes_0_Align.Left) (block (return \"l\"))) (return \"r\")))"
+}
+
+test "two modules may each declare the same name and stay distinct" {
+	put("lib/one.hive", "type Align \{ Centre }")
+	put("lib/two.hive", "type Align \{ Centre }")
+	entry := put("bothAligns.hive", "import ./lib/one\nimport ./lib/two\ntype Align \{ Centre }\nproc main(): void \{ }")
+
+	got := treeOfFile(entry)
+	assert text.contains(got, "(type one_0_Align (| Centre))")
+	assert text.contains(got, "(type two_1_Align (| Centre))")
+	assert text.contains(got, "(type Align (| Centre))")
+}
+
+test "a file is loaded once however many modules reach for it" {
+	put("lib/shared.hive", "func twice(n: Int): Int \{ return n * 2 }")
+	put("lib/middle.hive", "import ./shared\nfunc four(): Int \{ return shared.twice(2) }")
+	entry := put("diamond.hive", "import ./lib/shared\nimport ./lib/middle\nproc main(): void \{ echo shared.twice(middle.four()) }")
+
+	got := treeOfFile(entry)
+	// One copy of `twice`, reached by both names.
+	assert text.contains(got, "(func shared_0_twice")
+	assert text.contains(got, "(call shared_0_twice (call middle_1_four))")
+	assert text.contains(got, "(func middle_1_four () Int (block (return (call shared_0_twice 2))))")
+}
+
+test "`as` renames the module, not what it holds" {
+	put("lib/inventory.hive", "func total(): Int \{ return 1 }")
+	entry := put("renamed.hive", "import ./lib/inventory as stock\nproc main(): void \{ echo stock.total() }")
+
+	got := treeOfFile(entry)
+	assert text.contains(got, "(call inventory_0_total)")
+}
+
+// --- Local names shadow ------------------------------------------------------
+
+test "a local binding shadows a module-level declaration of the same name" {
+	got := tree("main.hive", "func len(a: Str, b: Int): Str \{ return a }\nproc main(): void \{ len := 1  echo len }")
+	// The declaration is renamed to itself here — it is the entrypoint — but the
+	// point is that the local `len` is left as a local, not turned into a call.
+	assert text.contains(got, "(block (let len 1) (echo len))")
+}
+
+test "a parameter shadows one too" {
+	put("lib/values.hive", "func value(): Int \{ return 1 }")
+	entry := put("shadowParam.hive", "import ./lib/values\nfunc take(values: Int): Int \{ return values }")
+
+	got := treeOfFile(entry)
+	assert text.contains(got, "(func take ((values Int)) Int (block (return values)))")
+}
+
+test "a shadow lasts only as long as its scope" {
+	got := tree("main.hive", "func helper(): Int \{ return 1 }\nproc main(): void \{ if true \{ helper := 2  echo helper }  echo helper() }")
+	assert text.contains(got, "(let helper 2)")
+	assert text.contains(got, "(echo (call helper))")
+}
+
+test "a pattern's bindings shadow inside their branch and no further" {
+	got := tree("main.hive", "func value(): Int \{ return 1 }\nproc main(): void \{ if r is Result.Ok(value) \{ echo value }  echo value() }")
+	assert text.contains(got, "(block (echo value))")
+	assert text.contains(got, "(echo (call value))")
+}
+
+// --- What is refused ---------------------------------------------------------
+
+test "a file importing itself is a cycle" {
+	entry := put("selfImport.hive", "import ./selfImport\nproc main(): void \{ }")
+	got := errorOfFile(entry)
+	assert text.startsWith(got, "this import forms a cycle:")
+}
+
+test "a cycle round two steps is one too, and the message prints the loop" {
+	put("cycleA.hive", "import ./cycleB\nfunc a(): Int \{ return 1 }")
+	put("cycleB.hive", "import ./cycleA\nfunc b(): Int \{ return 2 }")
+	entry := put("cycleEntry.hive", "import ./cycleA\nproc main(): void \{ }")
+
+	got := errorOfFile(entry)
+	assert text.startsWith(got, "this import forms a cycle:")
+	assert text.contains(got, "_program/cycleA.hive")
+	assert text.contains(got, "_program/cycleB.hive")
+}
+
+test "an import naming no file says so, and says where it looked" {
+	entry := put("missingImport.hive", "import ./lib/nowhere\nproc main(): void \{ }")
+	got := errorOfFile(entry)
+	assert text.startsWith(got, "cannot read `_program/lib/nowhere.hive`")
+}
+
+test "a Go file's exported functions arrive as ordinary funcs" {
+	// Nothing in the file is Hive, and what Hive takes from it is the
+	// signatures — read by the Go toolchain, which is why this test runs one.
+	put("lib/util.go", "package util\n\nfunc Slugify(s string) string \{ return s }\n\nfunc Halve(n int) (int, error) \{ return n / 2, nil }\n\nfunc hidden() string \{ return \"\" }\n")
+	entry := put("goImport.hive", "import ./lib/util.go\nproc main(): void \{ echo util.slugify(\"a b\") }")
+	got := treeOfFile(entry)
+	// The name is lowered, because Go exports by capitalising and a Hive callable
+	// is camelCase; a Go `(T, error)` is a `Result`; and what the file keeps to
+	// itself does not appear at all.
+	assert text.contains(got, "(go util_0_slugify ((s Str)) Str ")
+	assert text.contains(got, "(go util_0_halve ((n Int)) Result<Int,Str> ")
+	assert text.contains(got, "hidden") == false
+	assert errorOfFile(entry) == ""
+}
+
+test "a Go file's exported structs are mirrored as types" {
+	put("lib/shapes.go", "package shapes\n\ntype Point struct \{\n\tX float64\n\tY float64\n}\n\nfunc Length(p Point) float64 \{ return p.X + p.Y }\n")
+	entry := put("goStruct.hive", "import ./lib/shapes.go\nproc main(): void \{ echo shapes.length(shapes.Point(1.0, 2.0)) }")
+	got := treeOfFile(entry)
+	// The struct is a Hive type of the same shape, with its fields lowered.
+	assert text.contains(got, "(type shapes_0_Point (x Float) (y Float))")
+	assert text.contains(got, "(go shapes_0_length ((p shapes_0_Point)) Float ")
+}
+
+test "a Go type Hive has no shape for is refused, and named" {
+	put("lib/wide.go", "package wide\n\nfunc Wide(n int64) int64 \{ return n }\n")
+	entry := put("goWide.hive", "import ./lib/wide.go\nproc main(): void \{ }")
+	got := errorOfFile(entry)
+	assert text.contains(got, "the parameter `n` of `Wide`")
+	assert text.contains(got, "Hive's `Int` is Go's `int`")
+}
+
+test "a Go file with nothing exported says so" {
+	put("lib/quiet.go", "package quiet\n\nfunc hidden() string \{ return \"\" }\n")
+	entry := put("goQuiet.hive", "import ./lib/quiet.go\nproc main(): void \{ }")
+	assert text.contains(errorOfFile(entry), "exports no functions")
+}
+
+test "a repository path that names nothing inside it says what the shape is" {
+	// The fetching itself is `test/fetchTests.hive`'s business. What the loader
+	// owns is turning a bad path into a message against the line that wrote it.
+	entry := put("shortRemote.hive", "import https://github.com/owner/repo\nproc main(): void \{ }")
+	assert text.contains(errorOfFile(entry), "a host, an owner and a repository")
+}
+
+test "a member the imported module does not have is named" {
+	put("lib/small.hive", "func here(): Int \{ return 1 }")
+	entry := put("missingMember.hive", "import ./lib/small\nproc main(): void \{ echo small.notHere() }")
+
+	got := errorOfFile(entry)
+	assert got == "the module imported as `small` has no `notHere`"
+}

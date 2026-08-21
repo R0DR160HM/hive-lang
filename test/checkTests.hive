@@ -1,0 +1,316 @@
+// Tests for `src/check`.
+//
+// Each test names a rule and shows a program that breaks it. The assertion is on
+// the opening of the message rather than every word of it, so a message can be
+// improved without a test having to be rewritten — but a message that stopped
+// naming the right thing would still fail.
+import ../src/check
+import ../src/loader
+import ../src/text
+
+// The first thing wrong with `source`, or `""`.
+proc problem(source: Str): Str {
+	p := loader.loadText("main.hive", source)
+	if len(p.errors) > 0 {
+		for each e in p.errors {
+			return "loader: " + e.message
+		}
+	}
+	for each e in check.checkModule(p.module) {
+		return e.message
+	}
+	return ""
+}
+
+proc problemCount(source: Str): Int {
+	p := loader.loadText("main.hive", source)
+	if len(p.errors) > 0 {
+		return -1
+	}
+	return len(check.checkModule(p.module))
+}
+
+// A whole program wrapped around one statement, which is what most of these are
+// about.
+func inMain(body: Str): Str {
+	return "proc main(): void \{ " + body + " }"
+}
+
+func opens(got: Str, wanted: Str): Bool {
+	return text.startsWith(got, wanted)
+}
+
+// --- Nothing wrong -----------------------------------------------------------
+
+test "a program that is right has nothing said about it" {
+	assert problemCount(inMain("echo 1")) == 0
+	assert problemCount("func two(): Int \{ return 2 }\nproc main(): void \{ echo two() }") == 0
+	assert problemCount("type User \{ id: Int  name: Str }\nproc main(): void \{ echo User(1, \"a\").name }") == 0
+}
+
+// --- Names -------------------------------------------------------------------
+
+test "a name nothing declared is named" {
+	assert problem(inMain("echo nowhere")) == "in `main`: `nowhere` is not a name anything here declared"
+}
+
+test "a field a type does not have is named" {
+	got := problem("type User \{ id: Int }\nproc main(): void \{ echo User(1).nope }")
+	assert got == "in `main`: `User` has no field `nope`"
+}
+
+test "a variant a type does not have is named" {
+	got := problem("type Shape \{ Circle \{ radius: Int } }\nproc main(): void \{ echo Shape.Square(1) }")
+	assert got == "in `main`: `Shape` has no variant `Square`"
+}
+
+test "a type declaring the same field twice is refused" {
+	got := problem("type User \{ id: Int  id: Str }")
+	assert got == "in `User`: this type declares `id` twice"
+}
+
+test "a shared field a variant declares again would be there twice" {
+	got := problem("type Event \{ at: Int  Opened \{ at: Str } }")
+	assert opens(got, "in `Event`: the variant `Opened` declares `at`")
+}
+
+// --- Arity and arguments -----------------------------------------------------
+
+test "a call with the wrong number of arguments is named" {
+	got := problem("func two(): Int \{ return 2 }\nproc main(): void \{ echo two(1) }")
+	assert got == "in `main`: `two` takes 0 arguments, and this call passes 1 argument"
+}
+
+test "a constructor with the wrong number of fields is named" {
+	got := problem("type User \{ id: Int  name: Str }\nproc main(): void \{ echo User(1) }")
+	assert got == "in `main`: `User` has 2 fields, and this call passes 1 argument"
+}
+
+test "a named argument that names no parameter is refused" {
+	got := problem("func f(a: Int): Int \{ return a }\nproc main(): void \{ echo f(b: 1) }")
+	assert got == "in `main`: `f` has no parameter called `b`"
+}
+
+test "a named argument written twice is refused" {
+	got := problem("func f(a: Int, b: Int): Int \{ return a }\nproc main(): void \{ echo f(a: 1, a: 2) }")
+	assert got == "in `main`: this call names `a` twice"
+}
+
+test "once named arguments are used the call covers the whole parameter list" {
+	got := problem("func f(a: Int, b: Int): Int \{ return a }\nproc main(): void \{ echo f(a: 1) }")
+	assert opens(got, "in `main`: once a call uses named arguments")
+}
+
+test "a Result and a map widen through their halves" {
+	// A `[dyn]` promises nothing, so a known length is welcome to fill it — one
+	// layer down as much as at the top.
+	assert problemCount("func f(): Result<Int, Str[dyn]> \{ return Result.Error([\"one\"]) }") == 0
+	assert problemCount("func f(): Str[dyn] \{ return [\"one\"] }") == 0
+	// And a promise is still a promise: three does not fill a slot that said two.
+	assert opens(problem("func f(): Result<Int, Str[2]> \{ return Result.Error([\"a\", \"b\", \"c\"]) }"), "in `f`: this `return` wants Result<Int, Str[2]>")
+}
+
+test "an argument of the wrong type is named, with both types" {
+	got := problem("func f(a: Int): Int \{ return a }\nproc main(): void \{ echo f(\"s\") }")
+	assert got == "in `main`: the argument `a` of `f` wants Int and this is Str"
+}
+
+// --- The proc/func split -----------------------------------------------------
+
+test "a func cannot call a proc" {
+	got := problem("proc side(): Int \{ return 1 }\nfunc pure(): Int \{ return side() }")
+	assert opens(got, "in `pure`: a `func` cannot call the `proc` `side`")
+}
+
+test "a func cannot declare a mutex parameter" {
+	got := problem("func grow(v: mut Str[dyn]): void \{ }")
+	assert opens(got, "in `grow`: a `func` cannot declare the mutex parameter `v: mut ...`")
+}
+
+test "a proc calling a proc is fine, and so is a func calling a func" {
+	assert problemCount("proc a(): Int \{ return 1 }\nproc b(): Int \{ return a() }") == 0
+	assert problemCount("func a(): Int \{ return 1 }\nfunc b(): Int \{ return a() }") == 0
+	// A func value may fill a proc slot: pure widens to impure.
+	assert problemCount("func a(): Int \{ return 1 }\nproc b(): Int \{ return a() }") == 0
+}
+
+// --- Mutability --------------------------------------------------------------
+
+test "assigning to an immutable binding is refused" {
+	got := problem(inMain("x := 1  x = 2"))
+	assert got == "in `main`: cannot assign to `x`: it is immutable — declare it with `mut` to allow reassignment"
+}
+
+test "a mut binding may be reassigned, and through a path into it" {
+	assert problemCount(inMain("mut x := 1  x = 2")) == 0
+	assert problemCount("type Box \{ n: Int }\nproc main(): void \{ mut Box b = Box(1)  b.n = 2 }") == 0
+	assert problemCount(inMain("mut Int[dyn] v = [1]  v[0] = 2")) == 0
+}
+
+test "assigning through an immutable path is refused" {
+	got := problem("type Box \{ n: Int }\nproc main(): void \{ b := Box(1)  b.n = 2 }")
+	assert opens(got, "in `main`: cannot assign to `b`")
+}
+
+test "append needs a mut target" {
+	got := problem(inMain("Str[dyn] v = []  append(v, \"a\")"))
+	assert got == "in `main`: `append` grows a vector in place, so its target has to be `mut` — this one is not"
+}
+
+test "append needs a vector declared dynamic, because an inferred length is a promise" {
+	got := problem(inMain("mut v := [\"a\"]  append(v, \"b\")"))
+	assert opens(got, "in `main`: `append` needs a vector declared `[dyn]`, and `v` promises exactly 1")
+}
+
+test "prepend and drop follow append's rule exactly" {
+	assert opens(problem(inMain("Str[dyn] v = []  prepend(v, \"a\")")), "in `main`: `prepend` grows a vector in place")
+	assert opens(problem(inMain("Str[dyn] v = []  drop(v, 0, 0)")), "in `main`: `drop` grows a vector in place")
+}
+
+test "a mut parameter takes the caller's own storage, so its argument has to be mut" {
+	got := problem("proc grow(v: mut Str[dyn]): void \{ }\nproc main(): void \{ Str[dyn] v = []  grow(v) }")
+	assert opens(got, "in `main`: `grow` asks for the mutex itself")
+	assert problemCount("proc grow(v: mut Str[dyn]): void \{ }\nproc main(): void \{ mut Str[dyn] v = []  grow(v) }") == 0
+}
+
+test "a discarded sort has to be able to sort in place" {
+	assert opens(problem(inMain("Int[dyn] v = [3, 1]  sort(v)")), "in `main`: a `sort` written as a statement sorts in place")
+	assert opens(problem(inMain("sort(split(\"a,b\", \",\"))")), "in `main`: a `sort` written as a statement throws away")
+	assert problemCount(inMain("mut Int[dyn] v = [3, 1]  sort(v)")) == 0
+	// Keeping the answer is always fine.
+	assert problemCount(inMain("Int[dyn] v = [3, 1]  ordered := sort(v)  echo ordered")) == 0
+}
+
+// --- Conditions --------------------------------------------------------------
+
+test "a condition is a Bool and nothing else" {
+	assert opens(problem(inMain("if 1 \{ }")), "in `main`: a condition is a `Bool`, and this one is Int")
+	assert opens(problem(inMain("if \"s\" \{ }")), "in `main`: a condition is a `Bool`, and this one is Str")
+}
+
+test "an atom is a label, not a yes or a no" {
+	got := problem(inMain("flag := #Ready  if flag \{ }"))
+	assert opens(got, "in `main`: an atom is a label, not a yes or a no")
+	assert problemCount(inMain("flag := #Ready  if flag == #Ready \{ }")) == 0
+}
+
+// --- Returning ---------------------------------------------------------------
+
+test "every path of a non-void callable has to return" {
+	got := problem("func f(n: Int): Int \{ if n > 0 \{ return 1 } }")
+	assert opens(got, "in `f`: `f` answers with Int, so every path through it has to return one")
+}
+
+test "an if/else whose every branch returns is a terminating path" {
+	assert problemCount("func f(n: Int): Int \{ if n > 0 \{ return 1 } else \{ return 2 } }") == 0
+}
+
+test "panic and assert close off a path" {
+	assert problemCount("func f(n: Int): Int \{ panic \"no\" }") == 0
+	assert problemCount("func f(n: Int): Int \{ if n > 0 \{ return 1 } panic \"unreachable\" }") == 0
+}
+
+test "an else-less chain covering a union's whole type is a terminating path" {
+	source := "type Shape \{ Circle \{ radius: Int } Point }\nfunc name(s: Shape): Str \{ if s is Shape.Circle(r) \{ return \"c\" } else if s is Shape.Point \{ return \"p\" } }"
+	assert problemCount(source) == 0
+}
+
+test "and dropping one branch of it is not" {
+	source := "type Shape \{ Circle \{ radius: Int } Point }\nfunc name(s: Shape): Str \{ if s is Shape.Circle(r) \{ return \"c\" } }"
+	assert opens(problem(source), "in `name`: `name` answers with Str")
+}
+
+test "a Result's Ok and Error cover it" {
+	source := "func name(r: Result<Int, Bool>): Str \{ if r is Result.Ok(v) \{ return \"ok\" } else if r is Result.Error(e) \{ return \"no\" } }"
+	assert problemCount(source) == 0
+}
+
+test "a return whose value does not fit the declaration is named" {
+	assert opens(problem("func f(): Int \{ return \"s\" }"), "in `f`: this `return` wants Int and this is Str")
+	assert opens(problem("proc f(): void \{ return 1 }"), "in `f`: this `return` answers with a value")
+	assert opens(problem("func f(): Int \{ return }"), "in `f`: this `return` answers with nothing")
+}
+
+// --- Tests -------------------------------------------------------------------
+
+test "a test returns nothing, because there is nobody to answer" {
+	got := problem("test \"t\" \{ return 1 }")
+	assert opens(got, "in `\"t\"`: a test returns nothing")
+	// A bare return to leave early is fine.
+	assert problemCount("test \"t\" \{ return }") == 0
+}
+
+// --- Loops -------------------------------------------------------------------
+
+test "break and continue act on the innermost loop, and there has to be one" {
+	assert opens(problem(inMain("break")), "in `main`: `break` and `continue` act on the innermost enclosing loop")
+	assert problemCount(inMain("for i := 0; i < 3; i++ \{ break }")) == 0
+	assert problemCount(inMain("for each x in [1] \{ continue }")) == 0
+}
+
+test "for each walks a vector, and a map and a Str are not one" {
+	assert opens(problem("import hive.map\nproc main(): void \{ hive.map.Map<Str, Int> m = hive.map.new()  for each k in m \{ } }"), "in `main`: a map is reached by key")
+	assert opens(problem(inMain("for each c in \"abc\" \{ }")), "in `main`: a `Str` is not a vector")
+}
+
+// --- Subscripts --------------------------------------------------------------
+
+test "a Str has no subscript" {
+	assert opens(problem(inMain("s := \"abc\"  echo s[0]")), "in `main`: a `Str` has no subscript")
+	assert opens(problem(inMain("s := \"abc\"  echo s[0:1]")), "in `main`: a `Str` has no subscript")
+}
+
+test "a map is reached by key, never by position" {
+	got := problem("import hive.map\nproc main(): void \{ hive.map.Map<Str, Int> m = hive.map.new()  echo m[0] }")
+	assert opens(got, "in `main`: a map is reached by key")
+}
+
+// --- Maps --------------------------------------------------------------------
+
+test "an empty map has to land somewhere that says what it holds" {
+	got := problem("import hive.map\nproc main(): void \{ m := hive.map.new() }")
+	assert opens(got, "in `main`: `hive.map.new()` has to land somewhere that says what it holds")
+	assert problemCount("import hive.map\nproc main(): void \{ hive.map.Map<Str, Int> m = hive.map.new()  echo len(m) }") == 0
+}
+
+// --- Operators ---------------------------------------------------------------
+
+test "Hive never widens a number behind your back" {
+	got := problem(inMain("echo 1 + 2.0"))
+	assert opens(got, "in `main`: `+` wants two of one type, and these are Int and Float")
+}
+
+test "&& and || join two Bools" {
+	got := problem(inMain("echo 1 && true"))
+	assert opens(got, "in `main`: `&&` joins two `Bool`s")
+}
+
+// --- async -------------------------------------------------------------------
+
+test "async refuses a builtin, a constructor and a partial application by name" {
+	assert opens(problem(inMain("Int[dyn] v = []  async len(v)")), "in `main`: `async` cannot fire off the builtin `len`")
+	assert opens(problem("type User \{ id: Int }\nproc main(): void \{ async User(1) }"), "in `main`: `async` cannot fire off a constructor")
+	assert opens(problem("proc f(a: Int, b: Int): void \{ }\nproc main(): void \{ async f(1, _) }"), "in `main`: `async` cannot fire off a partial application")
+	assert problemCount("proc f(a: Int): void \{ }\nproc main(): void \{ async f(1) }") == 0
+}
+
+// --- Patterns ----------------------------------------------------------------
+
+test "a pattern binds every field or none" {
+	got := problem("type Shape \{ Rectangle \{ width: Int height: Int } }\nproc main(): void \{ s := Shape.Rectangle(1, 2)  if s is Shape.Rectangle(w) \{ } }")
+	assert opens(got, "in `main`: `Shape.Rectangle` has 2 fields, and this pattern binds 1 argument")
+	assert problemCount("type Shape \{ Rectangle \{ width: Int height: Int } }\nproc main(): void \{ s := Shape.Rectangle(1, 2)  if s is Shape.Rectangle(w, _) \{ } }") == 0
+}
+
+test "a pattern's subject has to be the kind of thing the pattern matches" {
+	assert opens(problem(inMain("n := 1  if n is [\"a\"] \{ }")), "in `main`: a vector pattern matches a vector")
+	assert opens(problem(inMain("n := 1  if n is \"/a\" \{ }")), "in `main`: a string pattern matches a `Str`")
+}
+
+// --- Several at once ---------------------------------------------------------
+
+test "every mistake is reported, not just the first" {
+	// Three declarations, one mistake each.
+	source := "func a(): Int \{ return \"s\" }\nfunc b(): Int \{ }\nproc c(): void \{ echo nowhere }"
+	assert problemCount(source) == 3
+}

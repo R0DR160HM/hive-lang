@@ -1,0 +1,830 @@
+// Loader
+// ======
+// The `import` graph, and the one module every later pass reads.
+//
+// A Hive program can span as many files as it likes, and none of the passes
+// after this one knows that. The loader walks the graph from the entrypoint,
+// rejects a cycle, loads each file once however many modules reach for it, and
+// then **flattens**: every imported declaration is renamed to something unique
+// across the whole program, every reference to it is rewritten, and what comes
+// out is one `ast.Module`.
+//
+// The rename is what makes names mean nothing across a module boundary. Two
+// files may each declare their own `Align` and both stay distinct types, because
+// after this they are `text_1_Align` and `Align` — two names, as they always
+// were.
+//
+// Flattening costs one thing, and it is worth stating: the result carries no
+// record of which file each declaration came from, so every pass after this one
+// reports against the entrypoint and names the declaration instead.
+import ./ast
+import ./diag
+import ./fetch
+import ./goffi
+import ./lexer
+import ./parser
+import ./paths
+import ./text
+import ./token
+import hive.file
+import hive.map
+
+/// One file, loaded and parsed.
+type Source {
+	/// The normalised path, which is this module's identity: two spellings of
+	/// one file are one module, and the same file reached twice is loaded once.
+	key: Str
+	/// The directory its own imports resolve against — its own location, not
+	/// wherever the compiler was run from.
+	dir: Str
+	/// What its declarations are renamed with in the flattened program. `""`
+	/// for the entrypoint, which keeps its own names.
+	prefix: Str
+	/// What each of its import paths resolved to. Read back rather than worked
+	/// out again: resolving a remote one involved a network, and the answer is
+	/// not something a second guess would arrive at.
+	resolved: hive.map.Map<Str, Str>
+	module: ast.Module
+}
+
+/// A whole program, as one module.
+type Program {
+	module: ast.Module
+	sources: Source[dyn]
+	errors: diag.Diagnostic[dyn]
+}
+
+/// The walk's state.
+type Load {
+	sources: Source[dyn]
+	/// The keys already loaded, in load order — dependencies before the modules
+	/// that reached for them.
+	keys: Str[dyn]
+	/// The chain currently being loaded. A key already on it is a cycle, and the
+	/// chain itself is what the message prints.
+	stack: Str[dyn]
+	/// The commit each un-pinned repository resolved to. Read once at the start
+	/// and written back at the end, so a build that fetched nothing new leaves it
+	/// alone.
+	lock: fetch.Lock
+	errors: diag.Diagnostic[dyn]
+}
+
+/// Load the program rooted at `entry` and flatten it.
+proc load(entry: Str): Program {
+	mut Load l = Load([], [], [], fetch.readLock(entry), [])
+	key := paths.normalise(entry)
+	loadFile(l, key, entry, 0)
+	fetch.writeLock(l.lock)
+	if len(l.errors) > 0 {
+		return Program(ast.Module([], [], []), l.sources, l.errors)
+	}
+	return flatten(l.sources, key, l.errors)
+}
+
+/// Load a program already in memory, under a name to report against. This is
+/// what a test reaches for: it says what the compiler does to a source without
+/// putting the source on a disk first.
+proc loadText(name: Str, source: Str): Program {
+	// A program held in memory has nowhere to keep a lock, and nothing to pin.
+	mut Load l = Load([], [], [], fetch.Lock("", [], [], false), [])
+	key := paths.normalise(name)
+	appendSource(l, key, name, source)
+	if len(l.errors) > 0 {
+		return Program(ast.Module([], [], []), l.sources, l.errors)
+	}
+	return flatten(l.sources, key, l.errors)
+}
+
+// --- The walk ----------------------------------------------------------------
+
+proc loadFile(l: mut Load, key: Str, display: Str, line: Int): void {
+	if onStack(l, key) {
+		append(l.errors, diag.Diagnostic(display, line, cycleMessage(l, key)))
+		return
+	}
+	// A file is loaded once however many modules reach for it.
+	if indexOf(l.keys, key) is Result.Ok(_) {
+		return
+	}
+	// A Go file is not a Hive module: nothing in it is Hive, and what Hive takes
+	// from it is the signatures of what it exports — which the Go toolchain
+	// reads, not this compiler.
+	if text.endsWith(key, ".go") {
+		appendForeign(l, key, display, line)
+		return
+	}
+	read := hive.file.read(display)
+	if read is Result.Error(why) {
+		append(l.errors, diag.Diagnostic(display, line, "cannot read `{display}`: {why.message}"))
+		return
+	}
+	if read is Result.Ok(source) {
+		append(l.stack, key)
+		appendSource(l, key, display, source)
+		popStack(l)
+	}
+}
+
+// One imported Go file, as the declarations Hive reaches in it. It imports
+// nothing of its own as far as Hive is concerned — whatever the Go file imports
+// is Go's business, and the build resolves it.
+proc appendForeign(l: mut Load, key: Str, display: Str, line: Int): void {
+	got := goffi.read(display, "`{display}`")
+	if got is Result.Error(why) {
+		append(l.errors, diag.Diagnostic(display, line, why))
+		return
+	}
+	if got is Result.Ok(read) {
+		append(l.keys, key)
+		mut hive.map.Map<Str, Str> nothing = hive.map.new()
+		append(l.sources, Source(key, paths.dirOf(display), "", nothing, ast.Module([], read.decls, [read.foreign])))
+	}
+}
+
+// Lex, parse, and walk whatever it imported. The imports are loaded *before*
+// this module is filed, so the sources come out in dependency order — which is
+// what lets the flattener rewrite each one knowing every name it can reach.
+proc appendSource(l: mut Load, key: Str, display: Str, source: Str): void {
+	lexed := lexer.lex(source)
+	for each e in lexed.errors {
+		append(l.errors, diag.inFile(display, e))
+	}
+	if len(lexed.errors) > 0 {
+		return
+	}
+	parsed := parser.parse(lexed.tokens)
+	for each e in parsed.errors {
+		append(l.errors, diag.inFile(display, e))
+	}
+	if len(parsed.errors) > 0 {
+		return
+	}
+
+	dir := paths.dirOf(display)
+	mut hive.map.Map<Str, Str> resolved = hive.map.new()
+	for each line in parsed.module.imports {
+		found := resolveImport(l, dir, line, display)
+		if found != "" {
+			hive.map.set(resolved, line.path, paths.normalise(found))
+			loadFile(l, paths.normalise(found), found, line.line)
+		}
+	}
+	append(l.keys, key)
+	append(l.sources, Source(key, dir, "", resolved, parsed.module))
+}
+
+// What an import path names. Four kinds, and the path itself says which.
+proc resolveImport(l: mut Load, dir: Str, line: ast.ImportLine, display: Str): Str {
+	path := line.path
+	// Checked here rather than at flattening time so it is reported instead of
+	// whatever the import would have failed to load.
+	if line.alias == "hive" {
+		append(l.errors, diag.Diagnostic(display, line.line, "an import cannot be named `hive`: that name belongs to the standard library"))
+		return ""
+	}
+	if namesStdlib(path) {
+		// The standard library names no file. The alias is a spelling, and the
+		// flattener resolves it away.
+		return ""
+	}
+	if fetch.isRemote(path) {
+		return fetchRemote(l, path, line, display)
+	}
+	// A Go file writes its extension and a Hive module never does, so which is
+	// being named is already settled by the path.
+	if text.endsWith(path, ".go") {
+		return paths.normalise(paths.joinPath(dir, path))
+	}
+	// A Hive module leaves its extension off, because the path names a module
+	// and the file is only where it lives. The result is normalised so the path
+	// a message prints is the path somebody would type.
+	return paths.normalise(paths.joinPath(dir, path) + ".hive")
+}
+
+// A repository, cloned once into a cache shared by every program on this
+// machine that wants that commit, and then read exactly as a file next door is.
+proc fetchRemote(l: mut Load, path: Str, line: ast.ImportLine, display: Str): Str {
+	named := fetch.repoOf(path)
+	if named is Result.Error(why) {
+		append(l.errors, diag.Diagnostic(display, line.line, why))
+		return ""
+	}
+	if named is Result.Ok(repo) {
+		got := fetch.fetch(repo, l.lock)
+		if got is Result.Error(why) {
+			append(l.errors, diag.Diagnostic(display, line.line, why))
+			return ""
+		}
+		if got is Result.Ok(here) {
+			inside := paths.joinPath(here.directory, repo.inner)
+			// A Go file writes its extension and a Hive module never does, so
+			// which is being named is already settled by the path.
+			if text.endsWith(repo.inner, ".go") {
+				return inside
+			}
+			written := inside + ".hive"
+			if hive.file.exists(written) == false {
+				append(l.errors, diag.Diagnostic(display, line.line, "`{repo.url}` has no `" + repo.inner + ".hive` at " + here.commit))
+				return ""
+			}
+			return written
+		}
+	}
+	return ""
+}
+
+func namesStdlib(path: Str): Bool {
+	return path == "hive" || text.startsWith(path, "hive.")
+}
+
+func onStack(l: Load, key: Str): Bool {
+	return indexOf(l.stack, key) is Result.Ok(_)
+}
+
+proc popStack(l: mut Load): void {
+	last := len(l.stack) - 1
+	if l.stack bounds last {
+		drop(l.stack, last, last)
+	}
+}
+
+// The loop that was found, printed as the chain that closed it.
+func cycleMessage(l: Load, key: Str): Str {
+	mut Str[dyn] lines = []
+	append(lines, "this import forms a cycle:")
+	append(lines, "")
+	mut seen := false
+	for each entry in l.stack {
+		if entry == key {
+			seen = true
+		}
+		if seen {
+			append(lines, "    " + arrow(entry, len(lines) > 2) )
+		}
+	}
+	append(lines, "    " + arrow(key, true))
+	return join(lines, "\n")
+}
+
+func arrow(entry: Str, indented: Bool): Str {
+	if indented {
+		return "  -> " + entry
+	}
+	return entry
+}
+
+// --- Flattening --------------------------------------------------------------
+
+/// What a module's declarations are renamed with. The entrypoint keeps its own
+/// names, so `hive emit` shows an untouched `main` beside a `text_1_repeat`.
+func prefixFor(key: Str, index: Int, isEntry: Bool): Str {
+	if isEntry {
+		return ""
+	}
+	return paths.stem(key) + "_{index}_"
+}
+
+// Every Go file the program imported, in load order. The build compiles each as
+// a package of its own beside the program.
+func foreignOf(sources: Source[]): ast.Foreign[dyn] {
+	mut ast.Foreign[dyn] out = []
+	for each src in sources {
+		for each f in src.module.foreign {
+			// The mirrored types are named as the flattened program spells them,
+			// which is the name every later pass will see them under.
+			mut Str[dyn] flat = []
+			for each name in f.types {
+				append(flat, src.prefix + name)
+			}
+			append(out, ast.Foreign(f.packageName, f.path, f.thirdParty, flat))
+		}
+	}
+	return out
+}
+
+proc flatten(sources: Source[], entryKey: Str, found: diag.Diagnostic[]): Program {
+	mut diag.Diagnostic[dyn] errors = []
+	for each e in found {
+		append(errors, e)
+	}
+
+	// Every declaration in the program, under `<moduleKey>#<name>`, mapped to
+	// the name it carries once everything is one module.
+	mut hive.map.Map<Str, Str> flatNames = hive.map.new()
+	mut Source[dyn] prefixed = []
+	for i := 0; i < len(sources); i++ {
+		if sources bounds i {
+			src := sources[i]
+			prefix := prefixFor(src.key, i, src.key == entryKey)
+			append(prefixed, Source(src.key, src.dir, prefix, src.resolved, src.module))
+			for each d in src.module.decls {
+				name := ast.declName(d)
+				if name != "" {
+					hive.map.set(flatNames, src.key + "#" + name, prefix + name)
+				}
+			}
+		}
+	}
+
+	mut ast.Decl[dyn] decls = []
+	for each src in prefixed {
+		mut Rw rw = Rw(src.key, hive.map.new(), hive.map.new(), flatNames, [], [])
+		bindImports(rw, src, prefixed)
+		for each d in src.module.decls {
+			append(decls, rewriteDecl(rw, d))
+		}
+		for each e in rw.errors {
+			append(errors, diag.inFile(src.key, e))
+		}
+	}
+	return Program(ast.Module([], decls, foreignOf(prefixed)), prefixed, errors)
+}
+
+/// One module's rewriting context.
+type Rw {
+	/// The module being rewritten, which is what turns a bare name into a key.
+	moduleKey: Str
+	/// Import alias -> the key of the module it names.
+	aliasKeys: hive.map.Map<Str, Str>
+	/// Import alias -> the standard library module it stands for. A name in here
+	/// is rewritten back to its qualified spelling rather than resolved to a
+	/// declaration: the standard library is not flattened into the program, it
+	/// is named in it.
+	stdlibAliases: hive.map.Map<Str, Str>
+	/// Every declaration in the program, under `<moduleKey>#<name>`.
+	flatNames: hive.map.Map<Str, Str>
+	/// The names bound by the scope being walked. A local shadows a module-level
+	/// declaration exactly as it does in a single file, so a name in here is
+	/// left alone.
+	locals: Str[dyn]
+	errors: diag.Diagnostic[dyn]
+}
+
+proc bindImports(rw: mut Rw, src: Source, sources: Source[]): void {
+	for each line in src.module.imports {
+		if line.alias == "" {
+			continue
+		}
+		if namesStdlib(line.path) {
+			hive.map.set(rw.stdlibAliases, line.alias, stdlibModuleOf(line.path))
+			continue
+		}
+		// Whatever the path turned out to name — a Hive file next door, a Go file
+		// beside it, or one inside a clone — the walk already worked it out and
+		// wrote it down.
+		if hive.map.get(src.resolved, line.path) is Result.Ok(key) {
+			if keyKnown(sources, key) {
+				hive.map.set(rw.aliasKeys, line.alias, key)
+				continue
+			}
+		}
+		append(rw.errors, diag.at(line.line, "could not resolve `import {line.path}`"))
+	}
+}
+
+func keyKnown(sources: Source[], key: Str): Bool {
+	for each s in sources {
+		if s.key == key {
+			return true
+		}
+	}
+	return false
+}
+
+// `hive.map` -> `map`, which is both the module's name and the alias an import
+// gives it when it does not say otherwise.
+func stdlibModuleOf(path: Str): Str {
+	segments := split(path, ".")
+	return text.charAt(segments, len(segments) - 1)
+}
+
+// --- Rewriting ---------------------------------------------------------------
+
+// The flat name a bare name has in this module, or `""` when this module
+// declares no such thing.
+func ownFlat(rw: Rw, name: Str): Str {
+	if hive.map.get(rw.flatNames, rw.moduleKey + "#" + name) is Result.Ok(flat) {
+		return flat
+	}
+	return ""
+}
+
+// The flat name `alias.member` has, or `""`.
+func importedFlat(rw: Rw, alias: Str, member: Str): Str {
+	if hive.map.get(rw.aliasKeys, alias) is Result.Ok(key) {
+		if hive.map.get(rw.flatNames, key + "#" + member) is Result.Ok(flat) {
+			return flat
+		}
+	}
+	return ""
+}
+
+func isLocal(rw: Rw, name: Str): Bool {
+	return indexOf(rw.locals, name) is Result.Ok(_)
+}
+
+proc bindLocal(rw: mut Rw, name: Str): void {
+	if name != "" && name != "_" {
+		append(rw.locals, name)
+	}
+}
+
+proc restoreLocals(rw: mut Rw, mark: Int): void {
+	last := len(rw.locals) - 1
+	if mark <= last && rw.locals bounds mark {
+		if rw.locals bounds last {
+			drop(rw.locals, mark, last)
+		}
+	}
+}
+
+proc rewriteDecl(rw: mut Rw, d: ast.Decl): ast.Decl {
+	if d is ast.Decl.TypeDecl(name, fields, variants, line) {
+		return ast.Decl.TypeDecl(rename(rw, name), rewriteFields(rw, fields), rewriteVariants(rw, variants), line)
+	} else if d is ast.Decl.CallableDecl(kind, name, params, result, body, line) {
+		mark := len(rw.locals)
+		newParams := rewriteParams(rw, params)
+		newResult := rewriteType(rw, result)
+		newBody := rewriteBlock(rw, body)
+		restoreLocals(rw, mark)
+		return ast.Decl.CallableDecl(kind, rename(rw, name), newParams, newResult, newBody, line)
+	} else if d is ast.Decl.ForeignDecl(name, params, result, packageName, symbol, goResults, line) {
+		mark := len(rw.locals)
+		newParams := rewriteParams(rw, params)
+		newResult := rewriteType(rw, result)
+		restoreLocals(rw, mark)
+		return ast.Decl.ForeignDecl(rename(rw, name), newParams, newResult, packageName, symbol, goResults, line)
+	} else if d is ast.Decl.QueryDecl(name, params, result, sql, line) {
+		mark := len(rw.locals)
+		newParams := rewriteParams(rw, params)
+		newResult := rewriteType(rw, result)
+		// The body's bound values and conditions are ordinary expressions, and
+		// they are in this module's scope like any others.
+		newSql := rewriteSql(rw, sql)
+		restoreLocals(rw, mark)
+		return ast.Decl.QueryDecl(rename(rw, name), newParams, newResult, newSql, line)
+	} else if d is ast.Decl.TestDecl(title, body, line) {
+		mark := len(rw.locals)
+		newBody := rewriteBlock(rw, body)
+		restoreLocals(rw, mark)
+		return ast.Decl.TestDecl(title, newBody, line)
+	}
+	return d
+}
+
+func rename(rw: Rw, name: Str): Str {
+	flat := ownFlat(rw, name)
+	if flat == "" {
+		return name
+	}
+	return flat
+}
+
+// A query body: its text is nobody's business but the database's, and the
+// expressions in it are this module's.
+proc rewriteSql(rw: mut Rw, parts: ast.SqlPart[]): ast.SqlPart[dyn] {
+	mut ast.SqlPart[dyn] out = []
+	for each part in parts {
+		if part is ast.SqlPart.Param(value) {
+			append(out, ast.SqlPart.Param(rewriteExpr(rw, value)))
+		} else if part is ast.SqlPart.Where(group) {
+			append(out, ast.SqlPart.Where(rewriteSqlGroup(rw, group)))
+		} else {
+			append(out, part)
+		}
+	}
+	return out
+}
+
+proc rewriteSqlGroup(rw: mut Rw, group: ast.SqlGroup): ast.SqlGroup {
+	mut ast.SqlItem[dyn] out = []
+	for each item in group.items {
+		if item is ast.SqlItem.Cond(condition, body) {
+			append(out, ast.SqlItem.Cond(rewriteExpr(rw, condition), rewriteSql(rw, body)))
+		} else if item is ast.SqlItem.Nested(inner) {
+			append(out, ast.SqlItem.Nested(rewriteSqlGroup(rw, inner)))
+		}
+	}
+	return ast.SqlGroup(group.conjunction, out)
+}
+
+proc rewriteFields(rw: mut Rw, fields: ast.Field[]): ast.Field[dyn] {
+	mut ast.Field[dyn] out = []
+	for each f in fields {
+		append(out, ast.Field(f.name, rewriteType(rw, f.declared)))
+	}
+	return out
+}
+
+proc rewriteVariants(rw: mut Rw, variants: ast.Variant[]): ast.Variant[dyn] {
+	mut ast.Variant[dyn] out = []
+	for each v in variants {
+		append(out, ast.Variant(v.name, rewriteFields(rw, v.fields)))
+	}
+	return out
+}
+
+proc rewriteParams(rw: mut Rw, params: ast.Param[]): ast.Param[dyn] {
+	mut ast.Param[dyn] out = []
+	for each param in params {
+		bindLocal(rw, param.name)
+		append(out, ast.Param(param.name, rewriteType(rw, param.declared), param.mutex))
+	}
+	return out
+}
+
+// --- Types -------------------------------------------------------------------
+
+proc rewriteType(rw: mut Rw, t: ast.TypeExpr): ast.TypeExpr {
+	if t is ast.TypeExpr.Fn(pure, params, result) {
+		mut ast.TypeExpr[dyn] out = []
+		for each param in params {
+			append(out, rewriteType(rw, param))
+		}
+		return ast.TypeExpr.Fn(pure, out, rewriteType(rw, result))
+	}
+	if t is ast.TypeExpr.Named(pkg, name, args, dims) {
+		mut ast.TypeExpr[dyn] newArgs = []
+		for each a in args {
+			append(newArgs, rewriteType(rw, a))
+		}
+		return namedType(rw, pkg, name, newArgs, dims)
+	}
+	return t
+}
+
+proc namedType(rw: mut Rw, pkg: Str, name: Str, args: ast.TypeExpr[dyn], dims: ast.Dim[dyn]): ast.TypeExpr {
+	if pkg == "" {
+		flat := ownFlat(rw, name)
+		if flat == "" {
+			return ast.TypeExpr.Named("", name, args, dims)
+		}
+		return ast.TypeExpr.Named("", flat, args, dims)
+	}
+	// `hive.net.HttpRequest` and friends belong to the standard library, which
+	// is named in the program rather than flattened into it.
+	if pkg == "hive" || text.startsWith(pkg, "hive.") {
+		return ast.TypeExpr.Named(pkg, name, args, dims)
+	}
+	imported := importedFlat(rw, pkg, name)
+	if imported != "" {
+		return ast.TypeExpr.Named("", imported, args, dims)
+	}
+	// `ui.View` with `import hive.ui as ui` — the same type, spelled short.
+	if hive.map.get(rw.stdlibAliases, pkg) is Result.Ok(module) {
+		return ast.TypeExpr.Named("hive." + module, name, args, dims)
+	}
+	if hive.map.has(rw.aliasKeys, pkg) {
+		append(rw.errors, diag.at(0, "the module imported as `{pkg}` has no `{name}`"))
+	}
+	return ast.TypeExpr.Named(pkg, name, args, dims)
+}
+
+// --- Statements --------------------------------------------------------------
+
+proc rewriteBlock(rw: mut Rw, b: ast.Block): ast.Block {
+	mark := len(rw.locals)
+	mut ast.Stmt[dyn] out = []
+	for each s in b.stmts {
+		append(out, rewriteStmt(rw, s))
+	}
+	restoreLocals(rw, mark)
+	return ast.Block(out)
+}
+
+proc rewriteStmt(rw: mut Rw, s: ast.Stmt): ast.Stmt {
+	if s is ast.Stmt.VarDecl(name, value, mutable, deferred) {
+		// The value is rewritten *before* the name is bound: `x := x` on the
+		// right names whatever `x` meant before this statement.
+		newValue := rewriteExpr(rw, value)
+		bindLocal(rw, name)
+		return ast.Stmt.VarDecl(name, newValue, mutable, deferred)
+	} else if s is ast.Stmt.TypedDecl(declared, name, value, mutable, deferred) {
+		newType := rewriteType(rw, declared)
+		newValue := rewriteExpr(rw, value)
+		bindLocal(rw, name)
+		return ast.Stmt.TypedDecl(newType, name, newValue, mutable, deferred)
+	} else if s is ast.Stmt.Assign(target, value) {
+		return ast.Stmt.Assign(rewriteExpr(rw, target), rewriteExpr(rw, value))
+	} else if s is ast.Stmt.IfChain(branches, otherwise, hasElse) {
+		mut ast.Branch[dyn] out = []
+		for each b in branches {
+			// A pattern binds into its own branch and no further, so the
+			// condition and the body share one scope and the next branch starts
+			// again from where this one did.
+			mark := len(rw.locals)
+			condition := rewriteExpr(rw, b.condition)
+			body := rewriteBlock(rw, b.body)
+			restoreLocals(rw, mark)
+			append(out, ast.Branch(condition, body))
+		}
+		return ast.Stmt.IfChain(out, rewriteBlock(rw, otherwise), hasElse)
+	}
+	return rewriteStmtTail(rw, s)
+}
+
+proc rewriteStmtTail(rw: mut Rw, s: ast.Stmt): ast.Stmt {
+	if s is ast.Stmt.ForLoop(init, cond, post, body) {
+		// The counter is scoped to the loop, which is why the mark is taken
+		// before the init clause and restored after the body.
+		mark := len(rw.locals)
+		newInit := rewriteStmt(rw, init)
+		newCond := rewriteExpr(rw, cond)
+		newPost := rewriteStmt(rw, post)
+		newBody := rewriteBlock(rw, body)
+		restoreLocals(rw, mark)
+		return ast.Stmt.ForLoop(newInit, newCond, newPost, newBody)
+	} else if s is ast.Stmt.ForEach(name, declared, subject, body) {
+		newType := rewriteType(rw, declared)
+		newSubject := rewriteExpr(rw, subject)
+		mark := len(rw.locals)
+		bindLocal(rw, name)
+		newBody := rewriteBlock(rw, body)
+		restoreLocals(rw, mark)
+		return ast.Stmt.ForEach(name, newType, newSubject, newBody)
+	} else if s is ast.Stmt.ReturnStmt(value) {
+		return ast.Stmt.ReturnStmt(rewriteExpr(rw, value))
+	} else if s is ast.Stmt.EchoStmt(value) {
+		return ast.Stmt.EchoStmt(rewriteExpr(rw, value))
+	} else if s is ast.Stmt.AssertStmt(condition) {
+		return ast.Stmt.AssertStmt(rewriteExpr(rw, condition))
+	} else if s is ast.Stmt.PanicStmt(value) {
+		return ast.Stmt.PanicStmt(rewriteExpr(rw, value))
+	} else if s is ast.Stmt.AsyncStmt(call) {
+		return ast.Stmt.AsyncStmt(rewriteExpr(rw, call))
+	} else if s is ast.Stmt.Expression(value) {
+		return ast.Stmt.Expression(rewriteExpr(rw, value))
+	}
+	return s
+}
+
+// --- Expressions -------------------------------------------------------------
+
+proc rewriteExpr(rw: mut Rw, e: ast.Expr): ast.Expr {
+	if e is ast.Expr.Ident(name) {
+		// A local shadows a module-level name of the same shape, exactly as it
+		// does in a single file — so a name the scope bound is left alone.
+		if isLocal(rw, name) {
+			return e
+		}
+		flat := ownFlat(rw, name)
+		if flat == "" {
+			return e
+		}
+		return ast.Expr.Ident(flat)
+	} else if e is ast.Expr.Member(subject, field) {
+		return member(rw, subject, field)
+	} else if e is ast.Expr.Binary(op, left, right) {
+		return ast.Expr.Binary(op, rewriteExpr(rw, left), rewriteExpr(rw, right))
+	} else if e is ast.Expr.Negate(operand) {
+		return ast.Expr.Negate(rewriteExpr(rw, operand))
+	} else if e is ast.Expr.Call(callee, args) {
+		mut ast.Arg[dyn] out = []
+		for each a in args {
+			append(out, ast.Arg(a.name, rewriteExpr(rw, a.value)))
+		}
+		return ast.Expr.Call(rewriteExpr(rw, callee), out)
+	} else if e is ast.Expr.VectorLit(items) {
+		return ast.Expr.VectorLit(rewriteExprs(rw, items))
+	} else if e is ast.Expr.Interp(parts) {
+		mut ast.InterpPart[dyn] out = []
+		for each part in parts {
+			if part is ast.InterpPart.Expression(value) {
+				append(out, ast.InterpPart.Expression(rewriteExpr(rw, value)))
+			} else {
+				append(out, part)
+			}
+		}
+		return ast.Expr.Interp(out)
+	}
+	return rewriteExprTail(rw, e)
+}
+
+proc rewriteExprTail(rw: mut Rw, e: ast.Expr): ast.Expr {
+	if e is ast.Expr.Index(subject, index) {
+		return ast.Expr.Index(rewriteExpr(rw, subject), rewriteExpr(rw, index))
+	} else if e is ast.Expr.Slice(subject, low, high) {
+		return ast.Expr.Slice(rewriteExpr(rw, subject), rewriteExpr(rw, low), rewriteExpr(rw, high))
+	} else if e is ast.Expr.IsMatch(subject, pattern) {
+		// A pattern's bindings are in scope from here on, which the caller's
+		// scope mark is what bounds.
+		newSubject := rewriteExpr(rw, subject)
+		return ast.Expr.IsMatch(newSubject, rewritePattern(rw, pattern))
+	} else if e is ast.Expr.AwaitAll(calls, timeout) {
+		return ast.Expr.AwaitAll(rewriteExprs(rw, calls), rewriteExpr(rw, timeout))
+	} else if e is ast.Expr.Timed(call, ms) {
+		return ast.Expr.Timed(rewriteExpr(rw, call), rewriteExpr(rw, ms))
+	} else if e is ast.Expr.WithType(value, target) {
+		return ast.Expr.WithType(rewriteExpr(rw, value), rewriteType(rw, target))
+	} else if e is ast.Expr.UsingExpr(source, form) {
+		return ast.Expr.UsingExpr(rewriteExpr(rw, source), rewriteUsing(rw, form))
+	}
+	return e
+}
+
+proc rewriteExprs(rw: mut Rw, es: ast.Expr[]): ast.Expr[dyn] {
+	mut ast.Expr[dyn] out = []
+	for each e in es {
+		append(out, rewriteExpr(rw, e))
+	}
+	return out
+}
+
+proc rewriteUsing(rw: mut Rw, form: ast.UsingForm): ast.UsingForm {
+	if form is ast.UsingForm.Csv(separator) {
+		return ast.UsingForm.Csv(rewriteExpr(rw, separator))
+	} else if form is ast.UsingForm.RunQuery(call) {
+		return ast.UsingForm.RunQuery(rewriteExpr(rw, call))
+	} else if form is ast.UsingForm.Raw(sqlText) {
+		return ast.UsingForm.Raw(rewriteExpr(rw, sqlText))
+	}
+	return form
+}
+
+// `alias.member` is three different things, told apart by what the left side
+// names: another module's declaration, a standard library module, or an
+// ordinary field of a value.
+proc member(rw: mut Rw, subject: ast.Expr, field: Str): ast.Expr {
+	if subject is ast.Expr.Ident(alias) {
+		if isLocal(rw, alias) == false {
+			imported := importedFlat(rw, alias, field)
+			if imported != "" {
+				return ast.Expr.Ident(imported)
+			}
+			if hive.map.get(rw.stdlibAliases, alias) is Result.Ok(module) {
+				// `ui.row` and `hive.ui.row` are the same call. Written back out
+				// in full, so the emitter only ever sees the one spelling.
+				return ast.Expr.Member(ast.Expr.Member(ast.Expr.Ident("hive"), module), field)
+			}
+			if hive.map.has(rw.aliasKeys, alias) {
+				append(rw.errors, diag.at(0, "the module imported as `{alias}` has no `{field}`"))
+				return ast.Expr.Member(subject, field)
+			}
+		}
+	}
+	return ast.Expr.Member(rewriteExpr(rw, subject), field)
+}
+
+// --- Patterns ----------------------------------------------------------------
+
+proc rewritePattern(rw: mut Rw, p: ast.Pattern): ast.Pattern {
+	if p is ast.Pattern.Constructor(path, bindings, parenthesised) {
+		for each b in bindings {
+			bindLocal(rw, b)
+		}
+		return ast.Pattern.Constructor(rewritePatternPath(rw, path), bindings, parenthesised)
+	} else if p is ast.Pattern.VectorPat(elements, rest) {
+		for each element in elements {
+			if element is ast.VecElem.Bind(name) {
+				bindLocal(rw, name)
+			}
+		}
+		bindLocal(rw, rest)
+		return p
+	} else if p is ast.Pattern.StrTemplate(parts) {
+		for each part in parts {
+			if part is token.StrPart.Code(source) {
+				bindLocal(rw, text.trim(source))
+			}
+		}
+		return p
+	}
+	return p
+}
+
+// `Result.Ok(v)` is left alone. Two segments are normally a type and one of its
+// variants, and are a module and one of its types when the first segment names
+// an import instead; three segments can only be the module form.
+proc rewritePatternPath(rw: mut Rw, path: Str[]): Str[dyn] {
+	mut Str[dyn] out = []
+	for each segment in path {
+		append(out, segment)
+	}
+	first := text.charAt(path, 0)
+	if first == "Result" {
+		return out
+	}
+	if len(path) == 2 {
+		flat := ownFlat(rw, first)
+		if flat != "" {
+			return [flat, text.charAt(path, 1)]
+		}
+		imported := importedFlat(rw, first, text.charAt(path, 1))
+		if imported != "" {
+			append(rw.errors, diag.at(0, "`" + join(out, ".") + "` does not name a pattern: it names a type, so a variant of it has to be named too"))
+		}
+		return out
+	}
+	if len(path) == 3 {
+		typeName := text.charAt(path, 1)
+		imported := importedFlat(rw, first, typeName)
+		if imported != "" {
+			return [imported, text.charAt(path, 2)]
+		}
+		if hive.map.get(rw.stdlibAliases, first) is Result.Ok(module) {
+			return ["hive", module, typeName, text.charAt(path, 2)]
+		}
+	}
+	return out
+}

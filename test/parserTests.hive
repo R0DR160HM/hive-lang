@@ -1,0 +1,408 @@
+// Tests for `src/parser`.
+//
+// Every test renders the tree it got with `show`, so what a failure prints is
+// the whole shape on both sides — which is the thing worth reading when a
+// parser has understood something other than what was written.
+import ../src/diag
+import ../src/lexer
+import ../src/parser
+import ../src/show
+import ../src/text
+
+// The module `source` parses to, rendered.
+proc tree(source: Str): Str {
+	lexed := lexer.lex(source)
+	out := parser.parse(lexed.tokens)
+	return show.showModule(out.module)
+}
+
+// The same, for a source that is one statement inside a `proc`. Almost every
+// test is about a statement or an expression, and wrapping them by hand would
+// bury each one in the same eleven characters.
+proc stmt(source: Str): Str {
+	whole := tree("proc p(): void \{ " + source + " }")
+	// Peeled with `startsWith`/`span` rather than a string pattern: a pattern's
+	// hole is non-greedy and takes the *first* `))` it finds, which is somewhere
+	// in the middle of every nested statement here.
+	opening := "(proc p () void (block "
+	cs := text.chars(whole)
+	if text.startsWith(whole, opening) && text.endsWith(whole, "))") {
+		return text.span(cs, len(opening), len(cs) - 3)
+	}
+	return whole
+}
+
+// The first thing `source` was found wrong, or `""`.
+proc problem(source: Str): Str {
+	lexed := lexer.lex(source)
+	out := parser.parse(lexed.tokens)
+	if len(out.errors) == 0 {
+		return ""
+	}
+	return text.charAt(messages(out.errors), 0)
+}
+
+func messages(ds: diag.Diagnostic[]): Str[dyn] {
+	mut Str[dyn] out = []
+	for each d in ds {
+		append(out, d.message)
+	}
+	return out
+}
+
+proc problemCount(source: Str): Int {
+	lexed := lexer.lex(source)
+	out := parser.parse(lexed.tokens)
+	return len(out.errors)
+}
+
+// --- Declarations ------------------------------------------------------------
+
+test "an empty file parses to an empty module" {
+	got := tree("")
+	assert got == ""
+}
+
+test "a proc and a func differ only in the word" {
+	got := tree("proc main(): void \{ }")
+	assert got == "(proc main () void (block))"
+	pure := tree("func two(): Int \{ return 2 }")
+	assert pure == "(func two () Int (block (return 2)))"
+}
+
+test "parameters carry their types, and a mutex parameter says so" {
+	got := tree("proc grow(vec: mut Str[dyn], tag: Str): void \{ }")
+	assert got == "(proc grow ((vec mut Str[dyn]) (tag Str)) void (block))"
+}
+
+test "a type with no variants is a struct" {
+	got := tree("type User \{ id: Int  name: Str }")
+	assert got == "(type User (id Int) (name Str))"
+}
+
+test "a type with variants is a tagged union, and a bare variant carries nothing" {
+	got := tree("type Shape \{ Circle \{ radius: Int } Rectangle \{ width: Int height: Int } Point }")
+	assert got == "(type Shape (| Circle (radius Int)) (| Rectangle (width Int) (height Int)) (| Point))"
+}
+
+test "a field outside any variant is kept beside the variants" {
+	got := tree("type Event \{ at: Int  Opened \{ by: Str } Closed }")
+	assert got == "(type Event (at Int) (| Opened (by Str)) (| Closed))"
+}
+
+test "a field list may be written with commas or without them" {
+	got := tree("type P \{ x: Int, y: Int }")
+	assert got == "(type P (x Int) (y Int))"
+}
+
+test "a query's body is text, and what is not text is spelled out" {
+	got := tree("query allUsers(): User[dyn] \{ SELECT id, name FROM users }")
+	assert got == "(query allUsers () User[dyn] (\"SELECT id, name FROM users\"))"
+	// A bound value is never text: it is an expression, and every later pass
+	// reads it as one.
+	bound := tree("query userNamed(name: Str): User[dyn] \{ SELECT id FROM users WHERE name = \{name} }")
+	assert bound == "(query userNamed ((name Str)) User[dyn] (\"SELECT id FROM users WHERE name = \" (bind name)))"
+}
+
+test "a WHERE block is predicates that are each present or absent" {
+	got := tree("query find(name: Str, small: Bool): User[dyn] \{ SELECT id FROM users WHERE \{ if name != \"\" \{ name = \{name} } or \{ if small \{ size < 4 } } } }")
+	assert text.contains(got, "(where (and")
+	// The `WHERE` itself is not in the text: a block with nothing in it leaves
+	// no clause behind.
+	assert text.contains(got, "(\"SELECT id FROM users \"")
+	// The text on either side of a bound value is kept exactly as it was
+	// written, spaces and all: what the database reads is what the source said.
+	assert text.contains(got, "(if (!= name \"\") (\" name = \" (bind name) \" \"))")
+	assert text.contains(got, "(or (if small (\" size < 4 \")))")
+}
+
+test "a test is named in prose and takes nothing" {
+	got := tree("test \"it holds\" \{ assert true }")
+	assert got == "(test \"it holds\" (block (assert true)))"
+}
+
+test "an import is named after its path, or by `as`" {
+	got := tree("import ./lib/text")
+	assert got == "(import ./lib/text as text)"
+	renamed := tree("import ./lib/inventory as stock")
+	assert renamed == "(import ./lib/inventory as stock)"
+	stdlib := tree("import hive.map")
+	assert stdlib == "(import hive.map as map)"
+	goFile := tree("import ./lib/measures.go")
+	assert goFile == "(import ./lib/measures.go as measures)"
+	remote := tree("import https://host/owner/repo/src/text")
+	assert remote == "(import https://host/owner/repo/src/text as text)"
+}
+
+test "a path whose last segment is not a name has to be given one" {
+	got := problem("import ./lib/text-utils")
+	assert got == "`import ./lib/text-utils` needs a name of its own: `text-utils` cannot be used as one — write `import ./lib/text-utils as <name>`"
+}
+
+// --- Types -------------------------------------------------------------------
+
+test "the three vector spellings" {
+	got := tree("func f(a: Str[], b: Str[dyn], c: Str[3]): void \{ }")
+	assert got == "(func f ((a Str[]) (b Str[dyn]) (c Str[3])) void (block))"
+}
+
+test "a vector of vectors reads left to right" {
+	got := tree("func f(t: Str[2][3]): void \{ }")
+	assert got == "(func f ((t Str[2][3])) void (block))"
+}
+
+test "type arguments and a qualifier" {
+	got := tree("func f(m: hive.map.Map<Str, Int>, r: Result<T, Bool>): void \{ }")
+	assert got == "(func f ((m hive.map.Map<Str,Int>) (r Result<T,Bool>)) void (block))"
+}
+
+test "a function type is a declaration with the name dropped" {
+	got := tree("func f(g: func(Int): Int, h: proc(Str): void): void \{ }")
+	assert got == "(func f ((g (func(Int) Int)) (h (proc(Str) void))) void (block))"
+}
+
+// --- Bindings and assignment -------------------------------------------------
+
+test "the four ways to bind a name" {
+	assert stmt("x := 1") == "(let x 1)"
+	assert stmt("mut x := 1") == "(mut x 1)"
+	assert stmt("Str s = \"a\"") == "(lett Str s \"a\")"
+	assert stmt("mut Str[dyn] v = []") == "(mutt Str[dyn] v [])"
+}
+
+test "an async binding says so, and keeps the call" {
+	assert stmt("rows := async load()") == "(let-async rows (call load))"
+}
+
+test "assignment, through a name, an index and a field" {
+	assert stmt("x = 1") == "(= x 1)"
+	assert stmt("v[0] = 1") == "(= (at v 0) 1)"
+	assert stmt("rec.f = 1") == "(= (. rec f) 1)"
+	assert stmt("b.items[2] = 1") == "(= (at (. b items) 2) 1)"
+}
+
+test "compound assignment and the two steps desugar into one assignment" {
+	assert stmt("x += 2") == "(= x (+ x 2))"
+	assert stmt("x -= 2") == "(= x (- x 2))"
+	assert stmt("x *= 2") == "(= x (* x 2))"
+	assert stmt("x /= 2") == "(= x (/ x 2))"
+	assert stmt("i++") == "(= i (+ i 1))"
+	assert stmt("i--") == "(= i (- i 1))"
+}
+
+// --- Control flow ------------------------------------------------------------
+
+test "an if chain, with and without an else" {
+	assert stmt("if a \{ echo 1 }") == "(if a (block (echo 1)))"
+	assert stmt("if a \{ } else \{ }") == "(if a (block) else (block))"
+	assert stmt("if a \{ } else if b \{ } else \{ }") == "(if a (block) b (block) else (block))"
+}
+
+test "a counting loop, and the while loop that omits two of its clauses" {
+	assert stmt("for i := 0; i < 3; i++ \{ }") == "(for (mut i 0) (< i 3) (= i (+ i 1)) (block))"
+	assert stmt("for ; more; \{ }") == "(for () more () (block))"
+	assert stmt("for ; ; \{ }") == "(for () . () (block))"
+}
+
+test "a for-each binds an element, with an optional annotation" {
+	assert stmt("for each v in xs \{ }") == "(foreach v void xs (block))"
+	assert stmt("for each v: Str in xs \{ }") == "(foreach v Str xs (block))"
+}
+
+test "break, continue, echo, assert, panic and a bare return" {
+	assert stmt("break") == "(break)"
+	assert stmt("continue") == "(continue)"
+	assert stmt("echo x") == "(echo x)"
+	assert stmt("assert x == 1") == "(assert (== x 1))"
+	assert stmt("panic \"no\"") == "(panic \"no\")"
+	assert stmt("return") == "(return .)"
+	assert stmt("return 1") == "(return 1)"
+}
+
+test "async as a statement is fire-and-forget" {
+	assert stmt("async grow(v, \"c\")") == "(async (call grow v \"c\"))"
+}
+
+// --- Expressions -------------------------------------------------------------
+
+test "the literals" {
+	assert stmt("echo 42") == "(echo 42)"
+	assert stmt("echo 3.5") == "(echo 3.5f)"
+	assert stmt("echo \"t\"") == "(echo \"t\")"
+	assert stmt("echo true") == "(echo true)"
+	assert stmt("echo false") == "(echo false)"
+	assert stmt("echo #Ready") == "(echo #Ready)"
+	assert stmt("echo [1, 2]") == "(echo [1 2])"
+	assert stmt("echo []") == "(echo [])"
+}
+
+test "an interpolated string keeps its pieces, each parsed" {
+	assert stmt("echo \"a \{b + 1} c\"") == "(echo (str \"a \" (+ b 1) \" c\"))"
+}
+
+test "precedence: || is loosest, then &&, then comparison, then + -, then * / %" {
+	assert stmt("echo a || b && c") == "(echo (|| a (&& b c)))"
+	assert stmt("echo a == b + c * d") == "(echo (== a (+ b (* c d))))"
+	assert stmt("echo a + b - c") == "(echo (- (+ a b) c))"
+	assert stmt("echo a * b / c % d") == "(echo (% (/ (* a b) c) d))"
+}
+
+test "unary minus binds tighter than * and looser than **" {
+	assert stmt("echo -2 ** 2") == "(echo (- (** 2 2)))"
+	assert stmt("echo 2 ** -3") == "(echo (** 2 (- 3)))"
+	assert stmt("echo -a * b") == "(echo (* (- a) b))"
+}
+
+test "** is right-associative" {
+	assert stmt("echo 2 ** 3 ** 2") == "(echo (** 2 (** 3 2)))"
+}
+
+test "parentheses override precedence and leave no trace" {
+	assert stmt("echo (a + b) * c") == "(echo (* (+ a b) c))"
+}
+
+test "calls, named arguments and holes" {
+	assert stmt("echo f(1, 2)") == "(echo (call f 1 2))"
+	assert stmt("echo f(b: 1, \"s\")") == "(echo (call f b:1 \"s\"))"
+	assert stmt("echo handler(_, db)") == "(echo (call handler _ db))"
+	assert stmt("echo f") == "(echo f)"
+	assert stmt("echo f()()") == "(echo (call (call f)))"
+}
+
+test "member access, indexing and slicing" {
+	assert stmt("echo a.b.c") == "(echo (. (. a b) c))"
+	assert stmt("echo v[0]") == "(echo (at v 0))"
+	assert stmt("echo v[1:3]") == "(echo (slice v 1 3))"
+	assert stmt("echo v[:2]") == "(echo (slice v . 2))"
+	assert stmt("echo v[1:]") == "(echo (slice v 1 .))"
+	assert stmt("echo v[:]") == "(echo (slice v . .))"
+}
+
+test "the await-all, with and without a deadline" {
+	assert stmt("r := await [f(a), g(b)]") == "(let r (await [(call f a) (call g b)] .))"
+	assert stmt("r := await [f(a)] with timeout 500") == "(let r (await [(call f a)] 500))"
+}
+
+test "with timeout on a call, and with a type on anything" {
+	assert stmt("r := f(x) with timeout 500") == "(let r (timed (call f x) 500))"
+	assert stmt("r := hive.json.parse(t) with User") == "(let r (with (call (. (. hive json) parse) t) User))"
+}
+
+test "a timeout clause stops before `is`, so the match is not folded into the count" {
+	assert stmt("if f(x) with timeout 100 is Result.Error(e) \{ }") == "(if (is (timed (call f x) 100) Result.Error(e)) (block))"
+}
+
+test "`v bounds i` desugars into the guard it stands for" {
+	assert stmt("if v bounds i \{ }") == "(if (&& (>= i 0) (< i (call (. hive len) v))) (block))"
+}
+
+test "using, in each of its forms" {
+	assert stmt("r := using \"./d.csv\"") == "(let r (using \"./d.csv\" csv))"
+	assert stmt("r := using \"./d.tsv\" as csv separating by \"\\t\"") == "(let r (using \"./d.tsv\" (csv \"\t\")))"
+	assert stmt("r := using \"./b.xlsx\" as xlsx") == "(let r (using \"./b.xlsx\" xlsx))"
+	assert stmt("r := using \"./b.ods\" as ods") == "(let r (using \"./b.ods\" ods))"
+	assert stmt("r := using db run allUsers()") == "(let r (using db (run (call allUsers))))"
+	assert stmt("r := using db run raw someSql") == "(let r (using db (raw someSql)))"
+}
+
+// --- Patterns ----------------------------------------------------------------
+
+test "a variant pattern binds by position, and `_` skips" {
+	assert stmt("if s is Shape.Circle(r) \{ }") == "(if (is s Shape.Circle(r)) (block))"
+	assert stmt("if s is Shape.Rectangle(w, _) \{ }") == "(if (is s Shape.Rectangle(w _)) (block))"
+	assert stmt("if s is Shape.Point \{ }") == "(if (is s Shape.Point) (block))"
+	assert stmt("if s is text.Align.Left \{ }") == "(if (is s text.Align.Left) (block))"
+}
+
+test "a Result pattern is a variant pattern on the language's own union" {
+	assert stmt("if r is Result.Ok(v) \{ }") == "(if (is r Result.Ok(v)) (block))"
+	assert stmt("if r is Result.Error(e) \{ }") == "(if (is r Result.Error(e)) (block))"
+}
+
+test "a vector pattern matches positionally, with an optional rest" {
+	assert stmt("if v is [\"a\", x] \{ }") == "(if (is v [\"a\" x]) (block))"
+	assert stmt("if v is [\"move\", d, ...steps] \{ }") == "(if (is v [\"move\" d ...steps]) (block))"
+	assert stmt("if v is [_, 3, #Ready, true] \{ }") == "(if (is v [_ 3 #Ready true]) (block))"
+	assert stmt("if v is [] \{ }") == "(if (is v []) (block))"
+}
+
+test "a string pattern is a template of literal text and binding holes" {
+	assert stmt("if p is \"/health\" \{ }") == "(if (is p (template \"/health\")) (block))"
+	assert stmt("if p is \"/users/\{id}\" \{ }") == "(if (is p (template \"/users/\" <id>)) (block))"
+	assert stmt("if p is \"/users/\{id}/posts/\{postId}\" \{ }") == "(if (is p (template \"/users/\" <id> \"/posts/\" <postId>)) (block))"
+}
+
+test "a hole that is not a plain name is refused" {
+	got := problem("proc p(): void \{ if s is \"/x/\{a + b}\" \{ } }")
+	assert text.startsWith(got, "a string pattern's `\{a + b}` has to be a plain name")
+}
+
+test "two holes side by side are refused: there is nothing to split on" {
+	got := problem("proc p(): void \{ if s is \"\{a}\{b}\" \{ } }")
+	assert text.startsWith(got, "two holes may not sit side by side")
+}
+
+// --- What is refused ---------------------------------------------------------
+
+test "async has no value of its own" {
+	got := problem("proc p(): void \{ echo async f(x) }")
+	assert text.startsWith(got, "`async` has no value of its own")
+}
+
+test "async takes a call and nothing else" {
+	got := problem("proc p(): void \{ async x }")
+	assert text.startsWith(got, "`async` takes a call")
+}
+
+test "mut and async cannot be combined" {
+	got := problem("proc p(): void \{ mut x := async f() }")
+	assert text.startsWith(got, "`mut` and `async` cannot be combined")
+}
+
+test "with timeout cannot bound an async binding" {
+	got := problem("proc p(): void \{ x := async f() with timeout 5 }")
+	assert text.startsWith(got, "`with timeout` cannot bound an `async` binding")
+}
+
+test "await needs a list, and every entry has to be a call" {
+	got := problem("proc p(): void \{ r := await f(x) }")
+	assert text.startsWith(got, "`await` takes a list of calls")
+	value := problem("proc p(): void \{ r := await [x] }")
+	assert text.startsWith(value, "`await` runs each of its calls")
+	empty := problem("proc p(): void \{ r := await [] }")
+	assert text.startsWith(empty, "`await []` waits for nothing")
+}
+
+test "with timeout belongs on something that waits" {
+	got := problem("proc p(): void \{ r := x with timeout 5 }")
+	assert text.startsWith(got, "`with timeout <ms>` bounds how long a wait may take")
+}
+
+test "a name is held to its shape where it is declared" {
+	assert problem("proc Main(): void \{ }") == "`Main` is not how a callable is named. A `proc`, a `func` and a `query` are written in camelCase, like the variable a call's result lands in: `main`."
+	assert problem("type user \{ }") == "`user` is not how a type is named. Every type is written in PascalCase, the ones the language declares (`Str`, `Result`) along with your own: `User`."
+	assert problem("proc p(): void \{ mut MAX := 1 }") == "`MAX` is written as a constant, and `mut` says it is not one: UPPER_CASE is for a variable nothing reassigns. Write it in camelCase — `max` — or drop the `mut` if it really does hold still."
+}
+
+test "a loop counter is a mut variable, so it may not be written as a constant" {
+	got := problem("proc p(): void \{ for I := 0; I < 3; I++ \{ } }")
+	assert text.startsWith(got, "`I` is written as a constant, and `mut` says it is not one")
+}
+
+// --- Recovery ----------------------------------------------------------------
+
+test "a broken declaration costs one error, not every declaration after it" {
+	source := "proc a(): void \{ echo }\nproc b(): void \{ }\nproc c(): void \{ }"
+	assert problemCount(source) == 1
+	// The two that follow are still parsed, which is the whole point.
+	assert tree(source) == "(proc b () void (block)) (proc c () void (block))"
+}
+
+test "two broken declarations are two errors" {
+	assert problemCount("proc a(): void \{ echo }\nproc b(): void \{ echo }") == 2
+}
+
+test "a file of nothing but a stray token is one error, not a hang" {
+	assert problemCount("}") == 1
+	assert problemCount(",,,") == 1
+}

@@ -1,0 +1,89 @@
+// WebSockets
+// ==========
+// `hive.net` speaks RFC 6455 at both ends: `wsServe` accepts connections and
+// `wsConnect` opens one. The handshake, frame headers, masking, ping/pong and
+// fragmentation are all the runtime's business — a Hive program only ever sees
+// whole messages, as `Str`.
+//
+// This example is both halves in one process: the server goes on its own
+// virtual thread, the client then talks to it, and the program exits.
+
+// A server handler is a `proc (hive.net.WsConnection): void`, called once per
+// accepted connection on a virtual thread of its own. The connection closes
+// when it returns.
+proc echoBack(connection: hive.net.WsConnection): void {
+	// The HTTP request that opened the connection is still there, so a handler
+	// can route on its url or authenticate from its headers before saying
+	// anything.
+	opening := hive.net.wsRequest(connection)
+	echo "server: a client connected to {opening.url}"
+
+	// `for ;;` loops until something inside stops it. Here that is the peer
+	// hanging up, or saying "bye".
+	for ;; {
+		incoming := hive.net.wsReceive(connection)
+		if incoming is Result.Error(error) {
+			// A peer that goes away is a `Result.Error` whose reason is
+			// "Closed" — the ordinary end of a conversation, not a failure.
+			echo "server: {error.reason} — {error.message}"
+			return
+		} else if incoming is Result.Ok(message) {
+			echo "server: received {message}"
+			if message == "bye" {
+				hive.net.wsClose(connection)
+				return
+			}
+			// A send's Ok payload is how many bytes the message carried.
+			sent := hive.net.wsSend(connection, "you said: {message}")
+			if sent is Result.Error(error) {
+				echo "server: could not reply — {error.message}"
+				return
+			}
+		}
+	}
+}
+
+// `wsServe` blocks forever, so it belongs on a virtual thread of its own. It is
+// an ordinary `func` — nothing about the declaration says how it runs — and the
+// caller writes `async serveForever()` to start it without waiting.
+func serveForever(): void {
+	hive.net.wsServe(9001, echoBack)
+}
+
+proc chat(): void {
+	// `wsConnect` takes a ws:// or wss:// URL — wss:// negotiates TLS.
+	opened := hive.net.wsConnect("ws://localhost:9001/chat")
+	if opened is Result.Error(error) {
+		echo "client: could not connect — {error.message}"
+		return
+	} else if opened is Result.Ok(connection) {
+		for each line in ["hello", "still here", "bye"] {
+			sent := hive.net.wsSend(connection, line)
+			if sent is Result.Error(error) {
+				echo "client: send failed — {error.message}"
+				return
+			}
+			// "bye" makes the server close on us, so there is no reply to wait
+			// for; everything else comes straight back.
+			if line != "bye" {
+				reply := hive.net.wsReceive(connection)
+				if reply is Result.Ok(text) {
+					echo "client: {text}"
+				} else if reply is Result.Error(error) {
+					echo "client: {error.reason} — {error.message}"
+					return
+				}
+			}
+		}
+		hive.net.wsClose(connection)
+	}
+}
+
+proc main(): void {
+	async serveForever()
+	// Give the listener a moment to bind before dialling it.
+	hive.task.sleep(200)
+	chat()
+	// Let the server's last line land before the program exits.
+	hive.task.sleep(100)
+}

@@ -1,0 +1,258 @@
+// Text
+// ====
+// The string handling the compiler needs and the standard library does not
+// have. Hive gives a `Str` no subscript — `[...]` addresses bytes while a `Str`
+// is a sequence of characters, so the two never line up — which leaves `split`,
+// `join`, `indexOf` and `len` as the whole of what a program can do to one.
+//
+// That is enough, and this module is the proof: every function here is built
+// from those four. The one that does the work is `chars`, which splits a string
+// into one-character strings so the rest can walk it.
+//
+// Nothing here is specific to compiling. It is the module a second Hive program
+// would want too.
+
+// Every character of `text`, each as a one-character `Str`. Splitting on the
+// empty separator is what reaches them: it divides after every character, which
+// is the only place a `Str` opens up.
+func chars(text: Str): Str[dyn] {
+	return split(text, "")
+}
+
+// The character at `index`, or `""` past either end. A lexer asks this question
+// once per character and never wants a guard around the answer, so the
+// out-of-range case is a value rather than an error — and `""` is a character no
+// source file holds.
+func charAt(cs: Str[], index: Int): Str {
+	if cs bounds index {
+		return cs[index]
+	}
+	return ""
+}
+
+// `cs[low..high]`, both ends inclusive, clamped to what is really there. A
+// lexer takes a span it has already walked past, so a bound it cannot reach is
+// a shorter answer rather than a failure.
+func span(cs: Str[], low: Int, high: Int): Str {
+	mut Str[dyn] out = []
+	mut i := low
+	if i < 0 {
+		i = 0
+	}
+	for ; i <= high; i++ {
+		if cs bounds i {
+			append(out, cs[i])
+		}
+	}
+	return join(out, "")
+}
+
+// Whether `cs` reads `word` from `index` on. The comparison is character by
+// character rather than over a joined substring, so a long haystack costs the
+// length of the needle and not its own.
+func matchesAt(cs: Str[], index: Int, word: Str): Bool {
+	wanted := chars(word)
+	for i := 0; i < len(wanted); i++ {
+		if charAt(cs, index + i) != charAt(wanted, i) {
+			return false
+		}
+	}
+	return true
+}
+
+func startsWith(text: Str, prefix: Str): Bool {
+	return matchesAt(chars(text), 0, prefix)
+}
+
+func endsWith(text: Str, suffix: Str): Bool {
+	start := len(text) - len(suffix)
+	if start < 0 {
+		return false
+	}
+	return matchesAt(chars(text), start, suffix)
+}
+
+func contains(text: Str, needle: Str): Bool {
+	if needle == "" {
+		return true
+	}
+	return indexOf(text, needle) is Result.Ok(_)
+}
+
+// Every occurrence of `from` becomes `to`. Splitting on a separator and joining
+// on another is the whole of it — which is also why `from` may not be empty:
+// `split(s, "")` means something else entirely.
+func replace(text: Str, from: Str, to: Str): Str {
+	if from == "" {
+		return text
+	}
+	return join(split(text, from), to)
+}
+
+func repeat(unit: Str, times: Int): Str {
+	mut Str[dyn] out = []
+	for i := 0; i < times; i++ {
+		append(out, unit)
+	}
+	return join(out, "")
+}
+
+// --- Character classes -------------------------------------------------------
+//
+// Each takes a one-character string, because that is what `chars` hands back.
+// Anything else — `""` past the end of a file, or a whole word — is not a
+// character and answers `false`, which is what keeps the callers free of length
+// checks of their own.
+
+func isDigit(c: Str): Bool {
+	return isOneOf(c, "0123456789")
+}
+
+func isLower(c: Str): Bool {
+	return isOneOf(c, "abcdefghijklmnopqrstuvwxyz")
+}
+
+func isUpper(c: Str): Bool {
+	return isOneOf(c, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+}
+
+func isAlpha(c: Str): Bool {
+	return isLower(c) || isUpper(c)
+}
+
+func isAlnum(c: Str): Bool {
+	return isAlpha(c) || isDigit(c)
+}
+
+func isSpace(c: Str): Bool {
+	return c == " " || c == "\t" || c == "\n" || c == "\r"
+}
+
+// Whether `c` is one of `set`'s characters. The length check is the point: an
+// empty needle is found in every haystack, so without it every class above
+// would answer `true` at end of file.
+func isOneOf(c: Str, set: Str): Bool {
+	if len(c) != 1 {
+		return false
+	}
+	return indexOf(set, c) is Result.Ok(_)
+}
+
+// --- Case --------------------------------------------------------------------
+//
+// Recased by position: the two alphabets are written out in the same order, so
+// finding a character in one is finding its twin in the other. A character in
+// neither is left exactly as it was, which is what carries digits, punctuation
+// and every non-ASCII letter through untouched.
+
+func lower(text: Str): Str {
+	return recase(text, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+}
+
+func upper(text: Str): Str {
+	return recase(text, "abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+}
+
+func recase(text: Str, from: Str, to: Str): Str {
+	replacements := chars(to)
+	mut Str[dyn] out = []
+	for each c in chars(text) {
+		if indexOf(from, c) is Result.Ok(at) {
+			append(out, charAt(replacements, at))
+		} else {
+			append(out, c)
+		}
+	}
+	return join(out, "")
+}
+
+// The first character upper-cased, and nothing else touched. `grams` becomes
+// `Grams`, which is the name Go exports it under.
+func capitalise(text: Str): Str {
+	cs := chars(text)
+	if len(cs) == 0 {
+		return text
+	}
+	return upper(charAt(cs, 0)) + span(cs, 1, len(cs) - 1)
+}
+
+// The first character lower-cased. `Grams` becomes `grams`, which is the name
+// Hive reaches it by.
+func decapitalise(text: Str): Str {
+	cs := chars(text)
+	if len(cs) == 0 {
+		return text
+	}
+	return lower(charAt(cs, 0)) + span(cs, 1, len(cs) - 1)
+}
+
+// --- Whitespace --------------------------------------------------------------
+
+func trim(text: Str): Str {
+	cs := chars(text)
+	mut low := 0
+	for ; low < len(cs) && isSpace(charAt(cs, low)); low++ {
+	}
+	mut high := len(cs) - 1
+	for ; high >= low && isSpace(charAt(cs, high)); high-- {
+	}
+	return span(cs, low, high)
+}
+
+// The count of spaces and tabs a line opens with. A tab counts as one, the same
+// as a space: what this measures is how much to remove, not how wide it looks.
+func leadingBlanks(line: Str): Int {
+	cs := chars(line)
+	mut count := 0
+	for ; count < len(cs); count++ {
+		c := charAt(cs, count)
+		if c != " " && c != "\t" {
+			return count
+		}
+	}
+	return count
+}
+
+// Remove the indentation every line shares, dropping leading and trailing blank
+// lines. This is what a backtick string and a query body are put through: their
+// indentation says where they sit in the file, not what they hold.
+func dedent(text: Str): Str {
+	lines := dropBlankEnds(split(text, "\n"))
+	mut shared := -1
+	for each line in lines {
+		if trim(line) != "" {
+			blanks := leadingBlanks(line)
+			if shared < 0 || blanks < shared {
+				shared = blanks
+			}
+		}
+	}
+	if shared <= 0 {
+		return join(lines, "\n")
+	}
+	mut Str[dyn] out = []
+	for each line in lines {
+		if trim(line) == "" {
+			append(out, "")
+		} else {
+			append(out, span(chars(line), shared, len(line) - 1))
+		}
+	}
+	return join(out, "\n")
+}
+
+func dropBlankEnds(lines: Str[]): Str[dyn] {
+	mut low := 0
+	for ; low < len(lines) && trim(charAt(lines, low)) == ""; low++ {
+	}
+	mut high := len(lines) - 1
+	for ; high >= low && trim(charAt(lines, high)) == ""; high-- {
+	}
+	mut Str[dyn] out = []
+	for i := low; i <= high; i++ {
+		if lines bounds i {
+			append(out, lines[i])
+		}
+	}
+	return out
+}

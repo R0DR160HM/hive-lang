@@ -1,0 +1,206 @@
+// Tests for `src/ranges` — the bounds pass.
+//
+// The pass is flow-sensitive, so almost every test here is a pair: the same
+// access, once where something proves it and once where nothing does.
+import ../src/loader
+import ../src/mono
+import ../src/ranges
+import ../src/text
+
+// The first thing `source` cannot prove, or `""`.
+proc problem(source: Str): Str {
+	p := loader.loadText("main.hive", source)
+	if len(p.errors) > 0 {
+		for each e in p.errors {
+			return "loader: " + e.message
+		}
+	}
+	expanded := mono.expand(p.module, 0)
+	for each e in ranges.checkModule(expanded.module) {
+		return e.message
+	}
+	return ""
+}
+
+// A whole program wrapped around one body.
+func inMain(body: Str): Str {
+	return "proc main(): void \{ " + body + " }"
+}
+
+proc proves(body: Str): Bool {
+	return problem(inMain(body)) == ""
+}
+
+func opens(got: Str, wanted: Str): Bool {
+	return text.startsWith(got, wanted)
+}
+
+// --- A length the compiler knows ---------------------------------------------
+
+test "a literal index into a declared length is decided outright" {
+	assert proves("Str[3] v = [\"a\", \"b\", \"c\"]  echo v[0]")
+	assert proves("Str[3] v = [\"a\", \"b\", \"c\"]  echo v[2]")
+	assert opens(problem(inMain("Str[3] v = [\"a\", \"b\", \"c\"]  echo v[3]")), "in `main`: `v` holds 3, so `3` is not a position it has")
+	assert opens(problem(inMain("Str[3] v = [\"a\", \"b\", \"c\"]  echo v[-1]")), "in `main`: cannot prove this index is in range")
+}
+
+test "an inferred length is a length too, for as long as it lasts" {
+	assert proves("v := [\"a\", \"b\"]  echo v[1]")
+	assert opens(problem(inMain("v := [\"a\", \"b\"]  echo v[2]")), "in `main`: `v` holds 2")
+}
+
+test "a dynamic vector promises nothing, so even a literal needs a guard" {
+	assert opens(problem(inMain("Str[dyn] v = [\"a\"]  echo v[0]")), "in `main`: cannot prove `0` is in range")
+	assert proves("Str[dyn] v = [\"a\"]  if v bounds 0 \{ echo v[0] }")
+}
+
+// --- A guard in scope --------------------------------------------------------
+
+test "`v bounds i` is what proves an index the length cannot" {
+	assert opens(problem(inMain("Str[dyn] v = []  i := 0  echo v[i]")), "in `main`: cannot prove `i` is in range for `v`")
+	assert proves("Str[dyn] v = []  i := 0  if v bounds i \{ echo v[i] }")
+}
+
+test "the guard written out by hand means the same thing" {
+	assert proves("Str[dyn] v = []  i := 0  if i >= 0 && i < len(v) \{ echo v[i] }")
+	assert proves("Str[dyn] v = []  i := 0  if i >= 0 && i < hive.len(v) \{ echo v[i] }")
+}
+
+test "a guard proves nothing outside its own branch" {
+	assert opens(problem(inMain("Str[dyn] v = []  i := 0  if v bounds i \{ echo 1 }  echo v[i]")), "in `main`: cannot prove `i` is in range")
+}
+
+test "a guard proves nothing about a different vector" {
+	source := inMain("Str[dyn] a = []  Str[dyn] b = []  i := 0  if a bounds i \{ echo b[i] }")
+	assert opens(problem(source), "in `main`: cannot prove `i` is in range for `b`")
+}
+
+test "a guard and something else, joined by &&, still proves" {
+	assert proves("Str[dyn] v = []  i := 0  if v bounds i && i > 0 \{ echo v[i] }")
+	assert proves("Str[dyn] v = []  i := 0  if i > 0 && v bounds i \{ echo v[i] }")
+}
+
+test "a guard on one side of || proves nothing, because the other side is live" {
+	source := inMain("Str[dyn] v = []  i := 0  if v bounds i || i == 0 \{ echo v[i] }")
+	assert opens(problem(source), "in `main`: cannot prove `i` is in range")
+}
+
+// --- The counting loop -------------------------------------------------------
+
+test "a counting loop's condition is a guard for its body" {
+	assert proves("Str[dyn] v = []  for i := 0; i < len(v); i++ \{ echo v[i] }")
+}
+
+test "a loop over something else proves nothing about this one" {
+	source := inMain("Str[dyn] a = []  Str[dyn] b = []  for i := 0; i < len(a); i++ \{ echo b[i] }")
+	assert opens(problem(source), "in `main`: cannot prove `i` is in range for `b`")
+}
+
+test "a for-each never indexes, so there is nothing to prove" {
+	assert proves("Str[dyn] v = []  for each item in v \{ echo item }")
+}
+
+// --- indexOf -----------------------------------------------------------------
+
+test "an Ok payload from indexOf is always a position the vector really has" {
+	assert proves("Str[dyn] v = []  if indexOf(v, \"a\") is Result.Ok(at) \{ echo v[at] }")
+	assert proves("Str[dyn] v = []  if hive.indexOf(v, \"a\") is Result.Ok(at) \{ echo v[at] }")
+}
+
+test "a search bound to a name is still a search when it is matched" {
+	// The specification writes it this way round, so the vector the search
+	// searched has to survive the gap between the two statements.
+	assert proves("Str[dyn] v = []  found := indexOf(v, \"a\")  if found is Result.Ok(at) \{ echo v[at] }")
+	assert proves("mut Str[dyn] v = []  found := indexOf(v, \"a\")  if found is Result.Ok(at) \{ v[at] = \"b\" }")
+	// And it is still tied to the vector it was about.
+	source := inMain("Str[dyn] a = []  Str[dyn] b = []  found := indexOf(a, \"x\")  if found is Result.Ok(at) \{ echo b[at] }")
+	assert opens(problem(source), "in `main`: cannot prove `at` is in range for `b`")
+}
+
+test "a name pointed at something else has no search behind it any more" {
+	source := inMain("Str[dyn] v = []  mut found := indexOf(v, \"a\")  found = Result.Error(false)  if found is Result.Ok(at) \{ echo v[at] }")
+	assert opens(problem(source), "in `main`: cannot prove `at` is in range for `v`")
+}
+
+test "the proof is tied to the vector that was searched" {
+	source := inMain("Str[dyn] a = []  Str[dyn] b = []  if indexOf(a, \"x\") is Result.Ok(at) \{ echo b[at] }")
+	assert opens(problem(source), "in `main`: cannot prove `at` is in range for `b`")
+}
+
+// --- What costs a proof ------------------------------------------------------
+
+test "rebinding a vector costs an inferred length, even in a branch that may not run" {
+	assert proves("mut v := [\"a\", \"b\", \"c\"]  echo v[2]")
+	assert opens(problem(inMain("mut v := [\"a\", \"b\", \"c\"]  if true \{ v = [\"x\"] }  echo v[2]")), "in `main`: cannot prove `2` is in range")
+}
+
+test "a declared length is a promise, so nothing costs it" {
+	// `v` is declared `Str[3]`, and every value that lands in it is three.
+	assert proves("mut Str[3] v = [\"a\", \"b\", \"c\"]  v = [\"x\", \"y\", \"z\"]  echo v[2]")
+}
+
+test "writing through a name swaps an element without changing the length" {
+	assert proves("mut v := [\"a\", \"b\", \"c\"]  v[0] = \"x\"  echo v[2]")
+}
+
+test "drop is the one builtin that makes a vector shorter" {
+	assert proves("mut Str[dyn] v = [\"a\", \"b\"]  if v bounds 1 \{ echo v[1] }")
+	source := inMain("mut Str[dyn] v = [\"a\", \"b\"]  if v bounds 1 \{ drop(v, 0, 0)  echo v[1] }")
+	assert opens(problem(source), "in `main`: cannot prove `1` is in range")
+}
+
+// --- Lengths that survive ----------------------------------------------------
+
+test "concatenation adds the two lengths" {
+	assert proves("Str[2] a = [\"a\", \"b\"]  Str[1] b = [\"c\"]  Str[3] both = a + b  echo both[2]")
+	assert opens(problem(inMain("Str[2] a = [\"a\", \"b\"]  joined := a + a  echo joined[4]")), "in `main`: `joined` holds 4")
+}
+
+test "map and sort carry their input's length through" {
+	source := "func double(n: Int): Int \{ return n * 2 }\nproc main(): void \{ Int[2] v = [1, 2]  doubled := map(v, double)  echo doubled[1] }"
+	assert problem(source) == ""
+	tooFar := "func double(n: Int): Int \{ return n * 2 }\nproc main(): void \{ Int[2] v = [1, 2]  doubled := map(v, double)  echo doubled[2] }"
+	assert opens(problem(tooFar), "in `main`: `doubled` holds 2")
+}
+
+test "filter claims nothing, because a filter that keeps nothing is always possible" {
+	source := "func any(n: Int): Bool \{ return true }\nproc main(): void \{ Int[2] v = [1, 2]  kept := filter(v, any)  echo kept[0] }"
+	assert opens(problem(source), "in `main`: cannot prove `0` is in range")
+}
+
+test "split claims nothing either" {
+	assert opens(problem(inMain("parts := split(\"a,b\", \",\")  echo parts[0]")), "in `main`: cannot prove `0` is in range")
+}
+
+// --- Slices ------------------------------------------------------------------
+
+test "a slice's bounds are proved the way an index is" {
+	assert proves("Str[3] v = [\"a\", \"b\", \"c\"]  echo v[0:2]")
+	assert opens(problem(inMain("Str[3] v = [\"a\", \"b\", \"c\"]  echo v[0:3]")), "in `main`: `v` holds 3, so `3` is not a position it has")
+}
+
+test "a bound left out cannot be out of range" {
+	assert proves("Str[3] v = [\"a\", \"b\", \"c\"]  echo v[:]")
+	assert proves("Str[3] v = [\"a\", \"b\", \"c\"]  echo v[1:]")
+	assert proves("Str[3] v = [\"a\", \"b\", \"c\"]  echo v[:1]")
+}
+
+// --- A computed index --------------------------------------------------------
+
+test "a computed index has nothing to hang a guard on" {
+	source := inMain("Str[dyn] v = [\"a\"]  echo v[len(v) - 1]")
+	assert opens(problem(source), "in `main`: cannot prove this index is in range: it is a computed expression")
+	// Bound to a name first, it can be guarded like anything else.
+	assert proves("Str[dyn] v = [\"a\"]  last := len(v) - 1  if v bounds last \{ echo v[last] }")
+}
+
+// --- Where the access is -----------------------------------------------------
+
+test "a parameter's declared length is a promise inside the callee" {
+	assert problem("proc takes(v: Str[3]): void \{ echo v[2] }\nproc main(): void \{ }") == ""
+	assert opens(problem("proc takes(v: Str[dyn]): void \{ echo v[2] }\nproc main(): void \{ }"), "in `takes`: cannot prove `2` is in range")
+}
+
+test "a test body is held to the same rule" {
+	assert opens(problem("test \"t\" \{ Str[dyn] v = []  echo v[0] }"), "in `\"t\"`: cannot prove `0` is in range")
+}

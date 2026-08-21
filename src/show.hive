@@ -1,0 +1,352 @@
+// Showing a tree
+// ==============
+// An `ast` node rendered as one line of parentheses. Two things want this: a
+// test, which can then say what it expects as a string and be told both sides
+// when it is wrong, and `hive emit --ast`, for when the question is what the
+// parser understood rather than what the emitter wrote.
+//
+// It is not a pretty-printer and does not try to be: nothing here can be fed
+// back to the parser, and a form that could would have to carry every piece of
+// punctuation the tree deliberately dropped.
+//
+// Every function here is a `func`. A tree is a value and rendering it reads
+// nothing else, so there is nothing for a `proc` to do.
+import ./ast
+import ./token
+
+func showModule(m: ast.Module): Str {
+	mut Str[dyn] out = []
+	for each i in m.imports {
+		append(out, "(import {i.path} as {i.alias})")
+	}
+	for each d in m.decls {
+		append(out, showDecl(d))
+	}
+	return join(out, " ")
+}
+
+func showDecl(d: ast.Decl): Str {
+	if d is ast.Decl.TypeDecl(name, fields, variants, _) {
+		return "(type {name}" + showFields(fields) + showVariants(variants) + ")"
+	} else if d is ast.Decl.CallableDecl(kind, name, params, result, body, _) {
+		mut word := "proc"
+		if kind is ast.CallableKind.FuncKind {
+			word = "func"
+		}
+		return "({word} {name} (" + showParams(params) + ") " + showType(result) + " " + showBlock(body) + ")"
+	} else if d is ast.Decl.ForeignDecl(name, params, result, packageName, symbol, _, _) {
+		return "(go {name} (" + showParams(params) + ") " + showType(result) + " {packageName}.{symbol})"
+	} else if d is ast.Decl.QueryDecl(name, params, result, sql, _) {
+		return "(query {name} (" + showParams(params) + ") " + showType(result) + " " + showSql(sql) + ")"
+	} else if d is ast.Decl.TestDecl(title, body, _) {
+		return "(test \"{title}\" " + showBlock(body) + ")"
+	}
+	return "(?)"
+}
+
+// A query body: the text as written, and what is not text spelled out.
+func showSql(parts: ast.SqlPart[]): Str {
+	mut Str[dyn] out = []
+	for each part in parts {
+		if part is ast.SqlPart.Lit(written) {
+			append(out, "\"" + written + "\"")
+		} else if part is ast.SqlPart.Param(value) {
+			append(out, "(bind " + showExpr(value) + ")")
+		} else if part is ast.SqlPart.Where(group) {
+			append(out, "(where " + showSqlGroup(group) + ")")
+		}
+	}
+	return "(" + join(out, " ") + ")"
+}
+
+func showSqlGroup(group: ast.SqlGroup): Str {
+	mut word := "or"
+	if group.conjunction {
+		word = "and"
+	}
+	mut Str[dyn] out = []
+	for each item in group.items {
+		if item is ast.SqlItem.Cond(condition, body) {
+			append(out, "(if " + showExpr(condition) + " " + showSql(body) + ")")
+		} else if item is ast.SqlItem.Nested(inner) {
+			append(out, showSqlGroup(inner))
+		}
+	}
+	return "({word} " + join(out, " ") + ")"
+}
+
+func showFields(fields: ast.Field[]): Str {
+	mut Str[dyn] out = []
+	for each f in fields {
+		append(out, "({f.name} " + showType(f.declared) + ")")
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return " " + join(out, " ")
+}
+
+func showVariants(variants: ast.Variant[]): Str {
+	mut Str[dyn] out = []
+	for each v in variants {
+		append(out, "(| {v.name}" + showFields(v.fields) + ")")
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return " " + join(out, " ")
+}
+
+func showParams(params: ast.Param[]): Str {
+	mut Str[dyn] out = []
+	for each param in params {
+		if param.mutex {
+			append(out, "({param.name} mut " + showType(param.declared) + ")")
+		} else {
+			append(out, "({param.name} " + showType(param.declared) + ")")
+		}
+	}
+	return join(out, " ")
+}
+
+// --- Types -------------------------------------------------------------------
+
+func showType(t: ast.TypeExpr): Str {
+	if t is ast.TypeExpr.VoidType {
+		return "void"
+	} else if t is ast.TypeExpr.Fn(pure, params, result) {
+		mut word := "proc"
+		if pure {
+			word = "func"
+		}
+		return "({word}(" + showTypes(params) + ") " + showType(result) + ")"
+	} else if t is ast.TypeExpr.Named(pkg, name, args, dims) {
+		mut out := name
+		if pkg != "" {
+			out = "{pkg}.{name}"
+		}
+		if len(args) > 0 {
+			out = out + "<" + showTypes(args) + ">"
+		}
+		for each d in dims {
+			out = out + showDim(d)
+		}
+		return out
+	}
+	return "?"
+}
+
+func showTypes(ts: ast.TypeExpr[]): Str {
+	mut Str[dyn] out = []
+	for each t in ts {
+		append(out, showType(t))
+	}
+	return join(out, ",")
+}
+
+func showDim(d: ast.Dim): Str {
+	if d is ast.Dim.Fixed(size) { return "[{size}]" }
+	else if d is ast.Dim.Dynamic { return "[dyn]" }
+	else if d is ast.Dim.Any { return "[]" }
+	return "[?]"
+}
+
+// --- Statements --------------------------------------------------------------
+
+func showBlock(b: ast.Block): Str {
+	mut Str[dyn] out = []
+	for each s in b.stmts {
+		append(out, showStmt(s))
+	}
+	if len(out) == 0 {
+		return "(block)"
+	}
+	return "(block " + join(out, " ") + ")"
+}
+
+func showStmt(s: ast.Stmt): Str {
+	if s is ast.Stmt.VarDecl(name, value, mutable, deferred) {
+		return "({keyword(mutable, deferred)} {name} " + showExpr(value) + ")"
+	} else if s is ast.Stmt.TypedDecl(declared, name, value, mutable, deferred) {
+		return "({keyword(mutable, deferred)}t " + showType(declared) + " {name} " + showExpr(value) + ")"
+	} else if s is ast.Stmt.Assign(target, value) {
+		return "(= " + showExpr(target) + " " + showExpr(value) + ")"
+	} else if s is ast.Stmt.IfChain(branches, otherwise, hasElse) {
+		return showIf(branches, otherwise, hasElse)
+	} else if s is ast.Stmt.ForLoop(init, cond, post, body) {
+		return "(for " + showStmt(init) + " " + showExpr(cond) + " " + showStmt(post) + " " + showBlock(body) + ")"
+	} else if s is ast.Stmt.ForEach(name, declared, subject, body) {
+		return "(foreach {name} " + showType(declared) + " " + showExpr(subject) + " " + showBlock(body) + ")"
+	} else if s is ast.Stmt.ReturnStmt(value) {
+		return "(return " + showExpr(value) + ")"
+	} else if s is ast.Stmt.EchoStmt(value) {
+		return "(echo " + showExpr(value) + ")"
+	} else if s is ast.Stmt.AssertStmt(condition) {
+		return "(assert " + showExpr(condition) + ")"
+	} else if s is ast.Stmt.PanicStmt(value) {
+		return "(panic " + showExpr(value) + ")"
+	} else if s is ast.Stmt.BreakStmt {
+		return "(break)"
+	} else if s is ast.Stmt.ContinueStmt {
+		return "(continue)"
+	} else if s is ast.Stmt.AsyncStmt(call) {
+		return "(async " + showExpr(call) + ")"
+	} else if s is ast.Stmt.Expression(value) {
+		return showExpr(value)
+	} else if s is ast.Stmt.Nothing {
+		return "()"
+	}
+	return "(?)"
+}
+
+func keyword(mutable: Bool, deferred: Bool): Str {
+	mut word := "let"
+	if mutable {
+		word = "mut"
+	}
+	if deferred {
+		return word + "-async"
+	}
+	return word
+}
+
+func showIf(branches: ast.Branch[], otherwise: ast.Block, hasElse: Bool): Str {
+	mut Str[dyn] out = []
+	for each b in branches {
+		append(out, showExpr(b.condition) + " " + showBlock(b.body))
+	}
+	if hasElse {
+		append(out, "else " + showBlock(otherwise))
+	}
+	return "(if " + join(out, " ") + ")"
+}
+
+// --- Expressions -------------------------------------------------------------
+
+func showExpr(e: ast.Expr): Str {
+	if e is ast.Expr.IntLit(v) { return "{v}" }
+	else if e is ast.Expr.FloatLit(v) { return "{v}f" }
+	else if e is ast.Expr.StrLit(t) { return "\"{t}\"" }
+	else if e is ast.Expr.BoolLit(v) { return "{v}" }
+	else if e is ast.Expr.AtomLit(atom) { return "#{atom}" }
+	else if e is ast.Expr.Ident(name) { return name }
+	else if e is ast.Expr.Hole { return "_" }
+	else if e is ast.Expr.Absent { return "." }
+	else if e is ast.Expr.Interp(parts) { return "(str " + showInterp(parts) + ")" }
+	else if e is ast.Expr.VectorLit(items) { return "[" + showExprs(items) + "]" }
+	else if e is ast.Expr.Negate(operand) { return "(- " + showExpr(operand) + ")" }
+	else if e is ast.Expr.Binary(op, left, right) {
+		return "(" + ast.opSpelling(op) + " " + showExpr(left) + " " + showExpr(right) + ")"
+	}
+	return showExprTail(e)
+}
+
+// The second half of `showExpr`. One chain of twenty branches would be a
+// perfectly good function and a miserable thing to read; the split is where the
+// leaves end and the shapes begin.
+func showExprTail(e: ast.Expr): Str {
+	if e is ast.Expr.Call(callee, args) {
+		return "(call " + showExpr(callee) + showArgs(args) + ")"
+	} else if e is ast.Expr.Member(subject, field) {
+		return "(. " + showExpr(subject) + " {field})"
+	} else if e is ast.Expr.Index(subject, index) {
+		return "(at " + showExpr(subject) + " " + showExpr(index) + ")"
+	} else if e is ast.Expr.Slice(subject, low, high) {
+		return "(slice " + showExpr(subject) + " " + showExpr(low) + " " + showExpr(high) + ")"
+	} else if e is ast.Expr.IsMatch(subject, pattern) {
+		return "(is " + showExpr(subject) + " " + showPattern(pattern) + ")"
+	} else if e is ast.Expr.AwaitAll(calls, timeout) {
+		return "(await [" + showExprs(calls) + "] " + showExpr(timeout) + ")"
+	} else if e is ast.Expr.Timed(call, ms) {
+		return "(timed " + showExpr(call) + " " + showExpr(ms) + ")"
+	} else if e is ast.Expr.WithType(value, target) {
+		return "(with " + showExpr(value) + " " + showType(target) + ")"
+	} else if e is ast.Expr.UsingExpr(source, form) {
+		return "(using " + showExpr(source) + " " + showUsing(form) + ")"
+	}
+	return "(?)"
+}
+
+func showExprs(es: ast.Expr[]): Str {
+	mut Str[dyn] out = []
+	for each e in es {
+		append(out, showExpr(e))
+	}
+	return join(out, " ")
+}
+
+func showArgs(args: ast.Arg[]): Str {
+	mut Str[dyn] out = []
+	for each a in args {
+		if a.name == "" {
+			append(out, showExpr(a.value))
+		} else {
+			append(out, "{a.name}:" + showExpr(a.value))
+		}
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return " " + join(out, " ")
+}
+
+func showInterp(parts: ast.InterpPart[]): Str {
+	mut Str[dyn] out = []
+	for each part in parts {
+		if part is ast.InterpPart.Literal(t) {
+			append(out, "\"{t}\"")
+		} else if part is ast.InterpPart.Expression(value) {
+			append(out, showExpr(value))
+		}
+	}
+	return join(out, " ")
+}
+
+func showUsing(form: ast.UsingForm): Str {
+	if form is ast.UsingForm.Csv(separator) {
+		if separator is ast.Expr.Absent {
+			return "csv"
+		}
+		return "(csv " + showExpr(separator) + ")"
+	} else if form is ast.UsingForm.Xlsx { return "xlsx" }
+	else if form is ast.UsingForm.Ods { return "ods" }
+	else if form is ast.UsingForm.RunQuery(call) { return "(run " + showExpr(call) + ")" }
+	else if form is ast.UsingForm.Raw(sqlText) { return "(raw " + showExpr(sqlText) + ")" }
+	return "?"
+}
+
+// --- Patterns ----------------------------------------------------------------
+
+func showPattern(p: ast.Pattern): Str {
+	if p is ast.Pattern.Constructor(path, bindings, parenthesised) {
+		mut out := join(path, ".")
+		if parenthesised {
+			out = out + "(" + join(bindings, " ") + ")"
+		}
+		return out
+	} else if p is ast.Pattern.VectorPat(elements, rest) {
+		mut Str[dyn] out = []
+		for each element in elements {
+			if element is ast.VecElem.Match(value) {
+				append(out, showExpr(value))
+			} else if element is ast.VecElem.Bind(name) {
+				append(out, name)
+			}
+		}
+		if rest != "" {
+			append(out, "...{rest}")
+		}
+		return "[" + join(out, " ") + "]"
+	} else if p is ast.Pattern.StrTemplate(parts) {
+		mut Str[dyn] out = []
+		for each part in parts {
+			if part is token.StrPart.Literal(t) {
+				append(out, "\"{t}\"")
+			} else if part is token.StrPart.Code(source) {
+				append(out, "<{source}>")
+			}
+		}
+		return "(template " + join(out, " ") + ")"
+	}
+	return "(?)"
+}

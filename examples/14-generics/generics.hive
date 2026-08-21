@@ -1,0 +1,175 @@
+// Generics
+// ========
+// A name in a signature that is neither a builtin nor a declared type is a TYPE
+// VARIABLE, and it makes the callable generic in it. This is exactly the
+// notation the builtin table has always used to describe the builtins:
+//
+//     len(T[]): Int
+//     indexOf(T[], T): Result<Int, Bool>
+//     append(T[dyn], T): void
+//
+// There is no runtime to any of it. Every call site is resolved at compile
+// time: the type arguments are read off the argument types, and one concrete
+// copy is emitted per distinct set of them — `first_Str`, `first_Int`. No
+// boxing, no dispatch, no reflection.
+//
+// Because each copy is an ordinary declaration, every check runs on it
+// separately. Two of them get *sharper* for it: an instantiation at `Str[3]` is
+// held to that length while one at `Str[dyn]` guards its indexes, which is the
+// right answer for both.
+
+// --- Generic callables ------------------------------------------------------
+
+// `T[]` is a vector of some length, of some element type. Nothing is promised
+// about the length, so the access is guarded — as it would be for any `[]`.
+func first(v: T[]): Result<T, Bool> {
+	if len(v) > 0 {
+		return Result.Ok(v[0])
+	}
+	return Result.Error(false)
+}
+
+func firstOr(v: T[], fallback: T): T {
+	if first(v) is Result.Ok(found) {
+		return found
+	}
+	return fallback
+}
+
+// A variable is pinned down by wherever it appears in the PARAMETERS —
+// including inside a parameter's own type. That is what makes a higher-order
+// generic work: the vector says what `T` is, and the function says what `K` and
+// `E` are.
+//
+// The return is written `K[dyn]`, and it has to say which kind it is. `[]` is a
+// PARAMETER spelling: there it lets one helper serve a caller holding a `Str[3]`
+// and one holding a `Str[dyn]` alike, which is a real thing to say. A return is
+// the other way round — it is where the caller is told what it is getting, and
+// `[dyn]` (guard every index) and `[3]` (index freely) are different answers,
+// so leaving it open is not the callee's to do.
+//
+// The body writes `K` down too. Each copy substitutes through its own body, so
+// the Int one declares a `[]int`.
+func keepOk(values: T[], transform: func(T): Result<K, E>): K[dyn] {
+	mut K[dyn] out = []
+	for each value in values {
+		if transform(value) is Result.Ok(next) {
+			append(out, next)
+		}
+	}
+	return out
+}
+
+func asPort(s: Str): Result<Int, Bool> {
+	if hive.conv.sti(s) is Result.Ok(n) && n > 0 && n < 65536 {
+		return Result.Ok(n)
+	}
+	return Result.Error(false)
+}
+
+func keepEven(n: Int): Result<Int, Bool> {
+	if n % 2 == 0 {
+		return Result.Ok(n)
+	}
+	return Result.Error(false)
+}
+
+// Two variables, inferred independently at each call.
+func pairUp(a: A, b: B): Str {
+	return "{a} / {b}"
+}
+
+// Procs can be generic too.
+proc showAll(label: Str, v: T[]): void {
+	echo "{label}:"
+	for each item in v {
+		echo "  - {item}"
+	}
+}
+
+// --- Generic types ----------------------------------------------------------
+
+// A type whose fields mention variables is generic in them, in first-appearance
+// order, and is written out where it is used: `Box<Str>`.
+type Box {
+	items: T[dyn]
+	label: Str
+}
+
+// A generic tagged union. Each instantiation gets its own clone, its own JSON
+// codec and its own structural digest, so `Either<Str, Int>` and
+// `Either<Int, Str>` are different types all the way down to the wire.
+type Either {
+	Left { left: A }
+	Right { right: B }
+}
+
+func sizeOf(b: Box<Str>): Str {
+	return "{b.label} holds {len(b.items)}"
+}
+
+proc main(): void {
+	Str[2] names = ["ada", "grace"]
+	Int[dyn] counts = [7, 8, 9]
+	Str[dyn] nothing = []
+
+	// One `first`, three instantiations — chosen by the argument, never written.
+	if first(names) is Result.Ok(n) { echo n }
+	if first(counts) is Result.Ok(c) { echo c }
+	if first(nothing) is Result.Error(_) { echo "nothing there" }
+
+	echo firstOr(nothing, "a fallback")
+	echo pairUp(len(names), firstOr(names, "nobody"))
+
+	// A higher-order generic. `T` comes from the vector, `K` and `E` from the
+	// function — three variables, none of them written at the call site.
+	Str[dyn] raw = ["8080", "nope", "443"]
+	Int[dyn] ports = keepOk(raw, asPort)
+	echo "{len(ports)} of {len(raw)} were ports"
+
+	// The same generic at a second set of arguments gets a second copy. (This is
+	// the hand-written twin of the builtin `filterMap`, spelled out to show what
+	// the notation can say.)
+	Int[dyn] evens = keepOk(ports, keepEven)
+	echo len(evens)
+
+	showAll("names", names)
+	showAll("counts", counts)
+
+	types()
+}
+
+proc types(): void {
+	// The arguments are written on the declaration, which is also what tells a
+	// variant constructor which instantiation it is building.
+	Box<Str> people = Box(["ada", "grace"], "people")
+	Box<Int> tallies = Box([1, 2, 3], "tallies")
+	echo sizeOf(people)
+	echo "{tallies.label} holds {len(tallies.items)}"
+
+	Either<Str, Int> went = Either.Left("went left")
+	if went is Either.Left(v) { echo v }
+
+	Either<Str, Int> answer = Either.Right(42)
+	if answer is Either.Right(n) { echo n }
+
+	// The derived JSON encoder comes free, per instantiation.
+	echo hive.json.encode(people)
+	echo hive.json.encode(tallies)
+}
+
+// --- What is rejected -------------------------------------------------------
+//
+// A generic callable cannot be used as a VALUE. Which copy a call reaches is
+// decided by the argument types, and a value carries none:
+//
+//     f := first            // compile error
+//
+// A variable that appears only in the return type has nothing to be inferred
+// from, so there is no way to say which copy is wanted:
+//
+//     func makeOne(n: Int): T { ... }   // compile error at the call
+//
+// And a generic that instantiates itself at an ever-larger type would never
+// settle, so the expansion is capped and overrunning it is a compile error
+// rather than a hung build.

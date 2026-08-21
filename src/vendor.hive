@@ -1,0 +1,159 @@
+// Vendoring
+// =========
+// The one thing a Hive build ever downloads for itself: the three.js a
+// `hive.ui.scene` is drawn with.
+//
+// It follows `hive.sql`'s rule exactly — a program that never draws a scene
+// neither downloads nor links it, and one that does downloads it **once**, on
+// the first build, and never again. What is fetched is written into the build
+// directory and embedded into the executable, so the program that comes out is
+// still a single file that runs on a machine with no network.
+//
+// Two properties are worth being plain about, because a compiler that fetches
+// code has to answer for both:
+//
+//   * **The version is pinned and so is the file.** Not a range, not "latest":
+//     one version, and the SHA-256 of each file's exact bytes. A file that does
+//     not hash to what is written here is not the file this compiler was tested
+//     against, so the build **fails** — it is not used and not cached. That
+//     holds for a corrupted download, a hijacked one, and a registry that
+//     silently republished a version.
+//   * **The transport is verified too.** The request goes over TLS with the
+//     chain and the hostname checked against the machine's own trust store. The
+//     digest would catch a tampered file anyway; there is no reason to hand it a
+//     plausible one.
+//
+// The compiler does all of this with its own standard library: `hive.net` for
+// the request, `hive.crypto` for the digest, `hive.file` for the cache.
+import ./fetch
+import ./paths
+import ./progress
+import hive.crypto
+import hive.file
+import hive.net
+
+/// The three.js release every scene is drawn with.
+func threeVersion(): Str {
+	return "0.180.0"
+}
+
+/// The files that release is made of, in the order a page loads them: the module
+/// a scene imports, and the core it imports in turn. Modern three.js is two
+/// files rather than one — `three.module.min.js` is the API surface and
+/// `three.core.min.js` the engine behind it — and the first one's `import` is a
+/// relative path, so both have to sit in the same directory.
+func threeFiles(): Str[dyn] {
+	return ["three.module.min.js", "three.core.min.js"]
+}
+
+/// The SHA-256 of a file's bytes in this release.
+func digestOf(file: Str): Str {
+	if file == "three.module.min.js" {
+		return "e2b5ee6bccd38fd6d8a2428546b83c5f2426d84b152ef82be8055556e3b40eb6"
+	}
+	if file == "three.core.min.js" {
+		return "61ba0df005b05991361d040d8ff670e1aadfd0ce7aeebd1fdb0725957a8957de"
+	}
+	return ""
+}
+
+/// Where a file of the pinned release is fetched from: the registry's own
+/// immutable per-version path. A published version's bytes never change, which
+/// is what makes the digest above a pin rather than a hope.
+func urlOf(file: Str): Str {
+	return "https://cdn.jsdelivr.net/npm/three@" + threeVersion() + "/build/" + file
+}
+
+/// Where a fetched file lives between builds: under the same `~/.hive` the
+/// remote-import clones use, so every program on the machine shares one copy,
+/// keyed by the version it belongs to.
+proc cachePathOf(file: Str): Str {
+	return paths.joinPath(paths.joinPath(fetch.hiveHome(), "vendor/three@" + threeVersion()), file)
+}
+
+/// Make sure the pinned three.js is in `directory`, fetching it once if this
+/// machine has never built a scene before. A file already there with the right
+/// digest is left alone, so a rebuild does no work at all.
+proc placeThree(directory: Str): Result<Bool, Str> {
+	for each file in threeFiles() {
+		got := threeFile(file)
+		if got is Result.Error(why) {
+			return Result.Error(why)
+		}
+		if got is Result.Ok(bytes) {
+			if hive.file.write(paths.joinPath(directory, file), bytes) is Result.Error(why) {
+				return Result.Error("could not write {file} into the build: {why.message}")
+			}
+		}
+	}
+	return Result.Ok(true)
+}
+
+/// Remove the pinned three.js from `directory` — what a build whose program no
+/// longer draws a scene needs, for the reason a stale module file is removed:
+/// what is in the directory is what was compiled.
+proc clearThree(directory: Str): void {
+	for each file in threeFiles() {
+		hive.file.delete(paths.joinPath(directory, file))
+	}
+}
+
+// One file of the release: from the shared cache when it is there and intact,
+// and from the registry the first time.
+proc threeFile(file: Str): Result<Str, Str> {
+	cached := cachePathOf(file)
+	if verified(cached, digestOf(file)) is Result.Ok(bytes) {
+		return Result.Ok(bytes)
+	}
+	return download(file)
+}
+
+// A cached file is trusted only as far as its digest goes: anything else — a
+// half-written file from an interrupted build, a version overwritten by hand —
+// counts as not being there, and is fetched again.
+proc verified(path: Str, digest: Str): Result<Str, Bool> {
+	if hive.file.read(path) is Result.Ok(bytes) {
+		if hive.crypto.sha256(bytes) == digest {
+			return Result.Ok(bytes)
+		}
+	}
+	return Result.Error(false)
+}
+
+proc download(file: Str): Result<Str, Str> {
+	url := urlOf(file)
+	// The one thing the compiler says for itself here. A silent 700 KB download
+	// is worse than a noisy one: the first build of a scene takes as long as the
+	// network does, and that is worth saying out loud.
+	progress.note("fetching three.js " + threeVersion() + " ({file})")
+	asked := hive.net.httpRequest(hive.net.HttpRequest("GET", url, [], ""))
+	if asked is Result.Error(why) {
+		return Result.Error(unreachable(url, why.message))
+	}
+	if asked is Result.Ok(response) {
+		if response.status != 200 {
+			return Result.Error(unreachable(url, "the registry answered {response.status}"))
+		}
+		want := digestOf(file)
+		got := hive.crypto.sha256(response.body)
+		if got != want {
+			return Result.Error(mismatch(url, want, got))
+		}
+		// Cached only once verified, so a bad download is never written down as a
+		// good one. Failing to cache is not failing the build: the bytes are in
+		// hand, and the next build fetches them again.
+		if hive.file.makeDir(paths.dirOf(cachePathOf(file))) is Result.Ok(_) {
+			hive.file.write(cachePathOf(file), response.body)
+		}
+		return Result.Ok(response.body)
+	}
+	return Result.Error(unreachable(url, "nothing came back"))
+}
+
+func unreachable(url: Str, why: Str): Str {
+	return "could not fetch the three.js build a `hive.ui.scene` is drawn with. This needs network access on the first build; after that it is cached and every build is offline:\n\n    " + url + "\n    " + why
+}
+
+func mismatch(url: Str, want: Str, got: Str): Str {
+	return "the three.js build downloaded from\n\n    " + url + "\n\nis not the file this compiler pins. Expected SHA-256\n\n    " + want + "\n\nand got\n\n    " + got + "\n\nNothing was cached and nothing was compiled against it. Either the download was corrupted — try again — or those bytes are not the ones three.js " + threeVersion() + " published, which is not something to build a program on."
+}

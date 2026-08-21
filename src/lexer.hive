@@ -1,0 +1,492 @@
+// Lexer
+// =====
+// Source text to a flat list of tokens. It skips `//` comments and whitespace,
+// tracks the line every token sits on, and matches keywords exactly: every
+// keyword is lower case and only lower case, so `IF` is not `if` — and it is not
+// a name either, since reading it as one would hide the mistake somewhere else
+// entirely.
+//
+// Three constructs need light context tracking, and `Mode` is the whole of it:
+//
+//   * a `"..."` string may hold `{expression}` interpolations, whose source is
+//     captured raw for the parser to finish;
+//   * after `query`, the `{ ... }` that follows is SQL rather than Hive
+//     statements, so it is taken verbatim;
+//   * after `import` comes a path, whose `.`, `..` and `/` would each otherwise
+//     lex as an operator.
+//
+// The scan holds a cursor and what it has produced so far, and every helper that
+// moves it takes it as a `mut` parameter — which is the one way storage crosses
+// a call boundary in Hive, and exactly what a cursor is. Everything that only
+// *reads* takes the characters and an index instead, so no reader ever costs a
+// copy of the source.
+import ./diag
+import ./naming
+import ./text
+import ./token
+
+/// A lexed file: what it produced, and what it could not.
+type Lexed {
+	tokens: token.Token[dyn]
+	errors: diag.Diagnostic[dyn]
+}
+
+/// What the lexer expects next.
+type Mode {
+	Normal
+	/// Between the `query` keyword and its opening `{`, which switches brace
+	/// handling to raw SQL capture.
+	AwaitSql
+	/// Right after `import`, where the source is a path rather than tokens.
+	AwaitPath
+}
+
+/// Where the scan is, and what it has produced. Only this moves.
+type Scan {
+	pos: Int
+	line: Int
+	mode: Mode
+	tokens: token.Token[dyn]
+	errors: diag.Diagnostic[dyn]
+}
+
+/// Lex the whole source.
+proc lex(source: Str): Lexed {
+	// Line endings are normalised first: a `\r` left in place would ride along
+	// inside every token's text, and a `\r\n` would be counted as two lines.
+	cs := text.chars(text.replace(text.replace(source, "\r\n", "\n"), "\r", "\n"))
+	mut Scan s = Scan(0, 1, Mode.Normal(), [], [])
+	for ; s.pos < len(cs); {
+		scanOne(cs, s)
+	}
+	emit(s, token.Kind.Eof())
+	return Lexed(s.tokens, s.errors)
+}
+
+// --- Moving the cursor -------------------------------------------------------
+
+proc emit(s: mut Scan, kind: token.Kind): void {
+	append(s.tokens, token.Token(kind, s.line))
+}
+
+// Emit a token and step past the `width` characters it was written with.
+proc take(s: mut Scan, kind: token.Kind, width: Int): void {
+	emit(s, kind)
+	s.pos = s.pos + width
+}
+
+proc fail(s: mut Scan, message: Str): void {
+	append(s.errors, diag.at(s.line, message))
+}
+
+// --- One token ---------------------------------------------------------------
+
+proc scanOne(cs: Str[], s: mut Scan): void {
+	if s.mode is Mode.AwaitPath {
+		scanImportPath(cs, s)
+		return
+	}
+
+	c := text.charAt(cs, s.pos)
+
+	if c == "\n" {
+		s.line = s.line + 1
+		s.pos = s.pos + 1
+		return
+	}
+	if text.isSpace(c) {
+		s.pos = s.pos + 1
+		return
+	}
+	// A comment runs to the end of the line. The newline is left in place so the
+	// line counter keeps advancing.
+	if c == "/" && text.charAt(cs, s.pos + 1) == "/" {
+		for ; s.pos < len(cs) && text.charAt(cs, s.pos) != "\n"; s.pos++ {
+		}
+		return
+	}
+
+	if c == "\"" {
+		scanString(cs, s)
+		return
+	}
+	if c == "`" {
+		scanBacktick(cs, s)
+		return
+	}
+	if c == "#" {
+		scanAtom(cs, s)
+		return
+	}
+	// A `{` right after a query header opens the raw SQL body.
+	if c == "\{" && s.mode is Mode.AwaitSql {
+		scanSqlBody(cs, s)
+		return
+	}
+	if text.isDigit(c) {
+		scanNumber(cs, s)
+		return
+	}
+	if text.isAlpha(c) || c == "_" {
+		scanWord(cs, s)
+		return
+	}
+	scanOperator(cs, s)
+}
+
+// Operators and punctuation, longest first: the scan commits to the first
+// spelling that fits, so `:=` has to be looked for before `:` and `...` before
+// `.`.
+proc scanOperator(cs: Str[], s: mut Scan): void {
+	if text.matchesAt(cs, s.pos, "...") {
+		take(s, token.Kind.Ellipsis(), 3)
+		return
+	}
+
+	two := text.span(cs, s.pos, s.pos + 1)
+	if two == ":=" { take(s, token.Kind.ColonEq(), 2) return }
+	else if two == ">=" { take(s, token.Kind.Ge(), 2) return }
+	else if two == "<=" { take(s, token.Kind.Le(), 2) return }
+	else if two == "==" { take(s, token.Kind.EqEq(), 2) return }
+	else if two == "!=" { take(s, token.Kind.NotEq(), 2) return }
+	else if two == "**" { take(s, token.Kind.StarStar(), 2) return }
+	else if two == "&&" { take(s, token.Kind.AmpAmp(), 2) return }
+	else if two == "||" { take(s, token.Kind.PipePipe(), 2) return }
+	else if two == "++" { take(s, token.Kind.PlusPlus(), 2) return }
+	else if two == "--" { take(s, token.Kind.MinusMinus(), 2) return }
+	else if two == "+=" { take(s, token.Kind.PlusEq(), 2) return }
+	else if two == "-=" { take(s, token.Kind.MinusEq(), 2) return }
+	else if two == "*=" { take(s, token.Kind.StarEq(), 2) return }
+	else if two == "/=" { take(s, token.Kind.SlashEq(), 2) return }
+
+	one := text.charAt(cs, s.pos)
+	if one == "\{" { take(s, token.Kind.LBrace(), 1) return }
+	else if one == "}" { take(s, token.Kind.RBrace(), 1) return }
+	else if one == "(" { take(s, token.Kind.LParen(), 1) return }
+	else if one == ")" { take(s, token.Kind.RParen(), 1) return }
+	else if one == "[" { take(s, token.Kind.LBracket(), 1) return }
+	else if one == "]" { take(s, token.Kind.RBracket(), 1) return }
+	else if one == ":" { take(s, token.Kind.Colon(), 1) return }
+	else if one == ";" { take(s, token.Kind.Semicolon(), 1) return }
+	else if one == "," { take(s, token.Kind.Comma(), 1) return }
+	else if one == "." { take(s, token.Kind.Dot(), 1) return }
+	else if one == ">" { take(s, token.Kind.Gt(), 1) return }
+	else if one == "<" { take(s, token.Kind.Lt(), 1) return }
+	else if one == "=" { take(s, token.Kind.Assign(), 1) return }
+	else if one == "+" { take(s, token.Kind.Plus(), 1) return }
+	else if one == "-" { take(s, token.Kind.Minus(), 1) return }
+	else if one == "*" { take(s, token.Kind.Star(), 1) return }
+	else if one == "/" { take(s, token.Kind.Slash(), 1) return }
+	else if one == "%" { take(s, token.Kind.Percent(), 1) return }
+
+	fail(s, "unexpected character `{one}`")
+	s.pos = s.pos + 1
+}
+
+// --- Words -------------------------------------------------------------------
+
+// A word is a keyword when it is spelled the way the language spells one, and a
+// name when no keyword answers to it in any casing. What is left — `IF`, `Proc`,
+// `VOID` — is neither: it is a keyword written wrong, and saying so is the whole
+// reason this is not simply read as a name. A program that meant it as one has a
+// name to change; a program that meant the keyword has a shout to quieten.
+proc scanWord(cs: Str[], s: mut Scan): void {
+	start := s.pos
+	for ; s.pos < len(cs) && isWordChar(text.charAt(cs, s.pos)); s.pos++ {
+	}
+	word := text.span(cs, start, s.pos - 1)
+
+	if token.keywordOf(word) is Result.Ok(kw) {
+		emit(s, kw)
+		// The body that follows a `query` header is raw SQL, and what follows
+		// `import` is a path. Both are decided here, where the keyword is.
+		if kw is token.Kind.KwQuery {
+			s.mode = Mode.AwaitSql()
+		} else if kw is token.Kind.KwImport {
+			s.mode = Mode.AwaitPath()
+		}
+		return
+	}
+	if token.keywordOf(text.lower(word)) is Result.Ok(_) {
+		fail(s, naming.miscasedKeyword(word) + " — or, if a name was meant, one the language has not already taken. A keyword is reserved however it is spelled, so `" + word + "` is no more a name than `" + text.lower(word) + "` is.")
+		return
+	}
+	emit(s, token.Kind.Ident(word))
+}
+
+func isWordChar(c: Str): Bool {
+	return text.isAlnum(c) || c == "_"
+}
+
+// --- Numbers -----------------------------------------------------------------
+
+// A digit run, then a `.` and another digit run for a float. The digit after the
+// dot is what decides: without one the dot is an operator, so `v[1:2]` and a
+// method call on a number both still lex.
+proc scanNumber(cs: Str[], s: mut Scan): void {
+	start := s.pos
+	for ; s.pos < len(cs) && text.isDigit(text.charAt(cs, s.pos)); s.pos++ {
+	}
+	if text.charAt(cs, s.pos) == "." && text.isDigit(text.charAt(cs, s.pos + 1)) {
+		s.pos = s.pos + 1
+		for ; s.pos < len(cs) && text.isDigit(text.charAt(cs, s.pos)); s.pos++ {
+		}
+		written := text.span(cs, start, s.pos - 1)
+		if hive.conv.stf(written) is Result.Ok(f) {
+			emit(s, token.Kind.FloatLit(f))
+		} else {
+			fail(s, "`{written}` is not a number this machine can hold")
+		}
+		return
+	}
+	written := text.span(cs, start, s.pos - 1)
+	if hive.conv.sti(written) is Result.Ok(n) {
+		emit(s, token.Kind.IntLit(n))
+	} else {
+		fail(s, "`{written}` is not a number this machine can hold")
+	}
+}
+
+// --- Atoms -------------------------------------------------------------------
+
+// An atom is written where it is used and declared nowhere, so this is the only
+// place its spelling is ever looked at.
+proc scanAtom(cs: Str[], s: mut Scan): void {
+	s.pos = s.pos + 1
+	start := s.pos
+	for ; s.pos < len(cs) && isWordChar(text.charAt(cs, s.pos)); s.pos++ {
+	}
+	name := text.span(cs, start, s.pos - 1)
+	if name == "" {
+		fail(s, "expected an atom name after `#`")
+		return
+	}
+	if naming.check(naming.Role.Atom(), name) is Result.Error(why) {
+		fail(s, why)
+		return
+	}
+	emit(s, token.Kind.AtomLit(name))
+}
+
+// --- Strings -----------------------------------------------------------------
+
+// A `"..."` string, with escapes and `{expression}` interpolation. The pieces
+// are collected as they are read: a string that turns out to hold no
+// interpolation at all becomes a plain literal, which is what most of them are.
+proc scanString(cs: Str[], s: mut Scan): void {
+	opened := s.line
+	s.pos = s.pos + 1
+	mut StrPartBuf b = StrPartBuf([], "")
+
+	for ; s.pos < len(cs); {
+		c := text.charAt(cs, s.pos)
+		if c == "\"" {
+			s.pos = s.pos + 1
+			finishString(s, b, opened)
+			return
+		}
+		if c == "\\" {
+			pushChar(b, unescape(text.charAt(cs, s.pos + 1)))
+			s.pos = s.pos + 2
+		} else if c == "\{" {
+			s.pos = s.pos + 1
+			if scanInterpolation(cs, s, b, opened) == false {
+				// The interpolation has already said what went wrong. Reporting
+				// an unterminated string on top of it would name one mistake
+				// twice.
+				return
+			}
+		} else {
+			if c == "\n" {
+				s.line = s.line + 1
+			}
+			pushChar(b, c)
+			s.pos = s.pos + 1
+		}
+	}
+	append(s.errors, diag.at(opened, "unterminated string literal"))
+}
+
+// The `{...}` of an interpolation: everything to the matching `}`, captured raw.
+// Braces are counted rather than stopped at, so an expression holding one of its
+// own is read whole. Answers whether it closed.
+proc scanInterpolation(cs: Str[], s: mut Scan, b: mut StrPartBuf, opened: Int): Bool {
+	start := s.pos
+	mut depth := 1
+	for ; s.pos < len(cs); s.pos++ {
+		c := text.charAt(cs, s.pos)
+		if c == "\{" {
+			depth = depth + 1
+		} else if c == "}" {
+			depth = depth - 1
+			if depth == 0 {
+				pushLiteral(b)
+				append(b.parts, token.StrPart.Code(text.span(cs, start, s.pos - 1)))
+				s.pos = s.pos + 1
+				return true
+			}
+		} else if c == "\n" {
+			s.line = s.line + 1
+		}
+	}
+	append(s.errors, diag.at(opened, "unterminated `\{` interpolation in a string"))
+	return false
+}
+
+// A backtick string is raw: no escapes, no interpolation, and it may span lines.
+// Its indentation is a fact about where it sits in the file rather than part of
+// what it holds, so it is removed.
+proc scanBacktick(cs: Str[], s: mut Scan): void {
+	opened := s.line
+	s.pos = s.pos + 1
+	start := s.pos
+	for ; s.pos < len(cs); s.pos++ {
+		c := text.charAt(cs, s.pos)
+		if c == "`" {
+			raw := text.span(cs, start, s.pos - 1)
+			s.pos = s.pos + 1
+			append(s.tokens, token.Token(token.Kind.StrLit(text.dedent(raw)), opened))
+			return
+		}
+		if c == "\n" {
+			s.line = s.line + 1
+		}
+	}
+	append(s.errors, diag.at(opened, "this backtick string never closes"))
+}
+
+func unescape(c: Str): Str {
+	if c == "n" { return "\n" }
+	else if c == "t" { return "\t" }
+	else if c == "r" { return "\r" }
+	// `\"`, `\\`, `\{` and anything else: the character itself. `\{` is the one
+	// that earns the rule — a literal brace, not the start of an interpolation.
+	return c
+}
+
+// --- Building a string's pieces ----------------------------------------------
+
+// The pieces of a string as it is read: the ones already settled, and the
+// literal text accumulating since the last interpolation.
+type StrPartBuf {
+	parts: token.StrPart[dyn]
+	buf: Str
+}
+
+proc pushChar(b: mut StrPartBuf, c: Str): void {
+	b.buf = b.buf + c
+}
+
+// An empty run contributes nothing: `"{a}{b}"` is two pieces, not five.
+proc pushLiteral(b: mut StrPartBuf): void {
+	if b.buf != "" {
+		append(b.parts, token.StrPart.Literal(b.buf))
+		b.buf = ""
+	}
+}
+
+proc finishString(s: mut Scan, b: mut StrPartBuf, opened: Int): void {
+	if len(b.parts) == 0 {
+		append(s.tokens, token.Token(token.Kind.StrLit(b.buf), opened))
+		return
+	}
+	pushLiteral(b)
+	append(s.tokens, token.Token(token.Kind.StrParts(b.parts), opened))
+}
+
+// --- Query bodies ------------------------------------------------------------
+
+// The `{ ... }` after a query header is SQL, taken verbatim to its matching
+// close brace. Braces are counted because the body holds `{param}`
+// interpolations of its own, and a `WHERE { }` block besides.
+proc scanSqlBody(cs: Str[], s: mut Scan): void {
+	opened := s.line
+	s.pos = s.pos + 1
+	start := s.pos
+	mut depth := 1
+	for ; s.pos < len(cs); s.pos++ {
+		c := text.charAt(cs, s.pos)
+		if c == "\{" {
+			depth = depth + 1
+		} else if c == "}" {
+			depth = depth - 1
+			if depth == 0 {
+				body := text.span(cs, start, s.pos - 1)
+				s.pos = s.pos + 1
+				s.mode = Mode.Normal()
+				// The blanks around a body are where the braces were written,
+				// not something the database is going to read.
+				append(s.tokens, token.Token(token.Kind.SqlBody(text.trim(text.dedent(body))), opened))
+				return
+			}
+		} else if c == "\n" {
+			s.line = s.line + 1
+		}
+	}
+	append(s.errors, diag.at(opened, "this query body never closes"))
+	s.mode = Mode.Normal()
+}
+
+// --- Import paths ------------------------------------------------------------
+
+// An import's path is captured whole: leading blanks are skipped, then
+// everything up to the next whitespace is the path. A path may also be quoted,
+// which is how one holding a space is written — inside the quotes everything up
+// to the closing one is the path, so nothing in it has to be escaped, and an
+// `as` after it still reads as `as`.
+proc scanImportPath(cs: Str[], s: mut Scan): void {
+	for ; s.pos < len(cs) && isBlank(text.charAt(cs, s.pos)); s.pos++ {
+	}
+	if text.charAt(cs, s.pos) == "\"" {
+		scanQuotedImportPath(cs, s)
+		return
+	}
+	start := s.pos
+	for ; s.pos < len(cs) && isPathChar(text.charAt(cs, s.pos)); s.pos++ {
+	}
+	path := text.span(cs, start, s.pos - 1)
+	s.mode = Mode.Normal()
+	if path == "" {
+		fail(s, "expected a module path after `import`")
+		return
+	}
+	emit(s, token.Kind.PathLit(path))
+}
+
+proc scanQuotedImportPath(cs: Str[], s: mut Scan): void {
+	opened := s.line
+	s.pos = s.pos + 1
+	start := s.pos
+	for ; s.pos < len(cs); s.pos++ {
+		c := text.charAt(cs, s.pos)
+		// A newline inside it is a missing closing quote rather than a path that
+		// spans lines: an import is one line, and saying so here means the error
+		// lands on the line the quote was opened on.
+		if c == "\n" {
+			s.mode = Mode.Normal()
+			append(s.errors, diag.at(opened, "this `import` path opens with a quote and never closes it — add the closing `\"`"))
+			return
+		}
+		if c == "\"" {
+			path := text.span(cs, start, s.pos - 1)
+			s.pos = s.pos + 1
+			s.mode = Mode.Normal()
+			if path == "" {
+				append(s.errors, diag.at(opened, "`import \"\"` names no module: put the path between the quotes"))
+				return
+			}
+			append(s.tokens, token.Token(token.Kind.PathLit(path), opened))
+			return
+		}
+	}
+	s.mode = Mode.Normal()
+	append(s.errors, diag.at(opened, "this `import` path opens with a quote and never closes it — add the closing `\"`"))
+}
+
+func isBlank(c: Str): Bool {
+	return c == " " || c == "\t"
+}
+
+func isPathChar(c: Str): Bool {
+	return c != "" && text.isSpace(c) == false
+}

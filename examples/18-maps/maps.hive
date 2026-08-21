@@ -1,0 +1,178 @@
+// Maps
+// ====
+// A map is keys paired with values, looked up by key. It is the one collection
+// that is not a vector, so it has a module of its own rather than a literal:
+// `hive.map.Map<K, T>` is the type and `hive.map.new()` is the empty one.
+//
+// Two things about it are worth knowing before anything else:
+//
+//   * It keeps the order its keys were first set. A Go map iterates in a
+//     randomised order, so `keys` over one would answer differently from run to
+//     run; here the pairs come back the way they went in, and two runs agree.
+//   * It is a value, like everything else. Binding one to a second name copies
+//     it where the two could otherwise observe each other's writes, and only a
+//     `mut` map can be written to at all.
+import hive.map
+
+type Currency {
+	code: Str
+}
+
+proc main(): void {
+	echo "Counting"
+	echo "--------"
+	counting()
+
+	echo ""
+	echo "Looking up"
+	echo "----------"
+	lookingUp()
+
+	echo ""
+	echo "Tables"
+	echo "------"
+	tables()
+
+	echo ""
+	echo "Values"
+	echo "------"
+	values()
+
+	echo ""
+	echo "Composite keys"
+	echo "--------------"
+	compositeKeys()
+}
+
+// `set` adds or replaces a pair and needs a `mut` map: it changes which keys the
+// map has, which is a write like `append`'s.
+proc counting(): void {
+	words := ["bee", "hive", "bee", "comb", "bee"]
+
+	// The type is written on the declaration, because `hive.map.new()` says
+	// "empty" and nothing about what it holds.
+	mut hive.map.Map<Str, Int> counts = hive.map.new()
+	for each word in words {
+		// `get` answers with a Result — a key that is not there is an ordinary
+		// answer rather than a failure — so the miss is the `else` of matching it.
+		if hive.map.get(counts, word) is Result.Ok(seen) {
+			hive.map.set(counts, word, seen + 1)
+		} else {
+			hive.map.set(counts, word, 1)
+		}
+	}
+
+	// `len` counts pairs, the way it counts a vector's elements.
+	echo "{len(counts)} distinct words in {len(words)}"
+	// A map shows its pairs in first-set order: `bee` came first even though
+	// `comb` was set later and `bee` was set three times.
+	echo counts
+}
+
+proc lookingUp(): void {
+	mut hive.map.Map<Str, Str> capitals = hive.map.new()
+	hive.map.set(capitals, "pt", "Lisboa")
+	hive.map.set(capitals, "br", "Brasília")
+	hive.map.set(capitals, "jp", "東京")
+
+	echo "has `br`: {hive.map.has(capitals, "br")}"
+	echo "has `de`: {hive.map.has(capitals, "de")}"
+
+	if hive.map.get(capitals, "jp") is Result.Ok(city) {
+		echo "jp -> {city}"
+	}
+
+	// `delete` is the other write. Removing a key that was never there is not a
+	// failure — the map ends up without it either way.
+	hive.map.delete(capitals, "pt")
+	hive.map.delete(capitals, "never-was")
+	echo "after delete: {hive.map.keys(capitals)}"
+
+	// Replacing a value leaves the key where it was: `br` was set first and is
+	// still first.
+	hive.map.set(capitals, "br", "Rio (not really)")
+	echo "still in order: {capitals}"
+}
+
+// A `Map<Str, Str>` and a `Table` are two shapes of the same thing — pairs — so
+// each reads as the other. That is how a map gets in and out of a CSV, a set of
+// HTTP headers, or anything else that arrives as rows.
+proc tables(): void {
+	Table settings = [
+		["host", "localhost"],
+		["port", "8080"],
+		["tls", "off"],
+	]
+
+	hive.map.Map<Str, Str> config = hive.map.fromTable(settings)
+	if hive.map.get(config, "port") is Result.Ok(port) {
+		echo "port is {port}"
+	}
+
+	// And back: one two-cell row per pair, in the map's own order.
+	echo hive.map.toTable(config)
+
+	// Only a `Map<Str, Str>` becomes a Table, since a Table's cells are Strs.
+	// For anything else, render the values as you build the rows yourself.
+	mut hive.map.Map<Str, Int> ports = hive.map.new()
+	hive.map.set(ports, "http", 80)
+	hive.map.set(ports, "https", 443)
+	mut Table rows = []
+	for each name in hive.map.keys(ports) {
+		if hive.map.get(ports, name) is Result.Ok(number) {
+			append(rows, [name, hive.conv.its(number)])
+		}
+	}
+	echo rows
+}
+
+// What comes out of a map is the caller's own. `keys` and `values` are fresh
+// vectors, and a value that owns storage — a vector, or a struct holding one —
+// is copied on the way out, so growing it cannot reach back into the map.
+proc values(): void {
+	mut hive.map.Map<Str, Str[dyn]> tags = hive.map.new()
+	mut Str[dyn] bees = ["worker"]
+	hive.map.set(tags, "hive", bees)
+
+	// This grows the caller's vector, not the one the map holds.
+	append(bees, "drone")
+	echo "the map kept: {hive.map.values(tags)}"
+	echo "the vector is now: {bees}"
+
+	// A whole map copies the same way. `snapshot` is taken before the write
+	// below and does not see it.
+	mut hive.map.Map<Str, Int> live = hive.map.new()
+	hive.map.set(live, "a", 1)
+	hive.map.Map<Str, Int> snapshot = live
+	hive.map.set(live, "b", 2)
+	echo "snapshot: {snapshot}"
+	echo "live: {live}"
+	// `==` compares the pairs and ignores the order they were set in.
+	echo "equal: {snapshot == live}"
+}
+
+// A key is compared and hashed whole, so it can be a Str, Int, Float, Bool or
+// Atom — or a type of your own whose every field is one of those, which is how
+// a composite key works. Storage cannot be a key: two vectors can hold equal
+// contents and still be different storage, so there would be no answer to
+// whether they are the same key.
+proc compositeKeys(): void {
+	mut hive.map.Map<Currency, Int> tills = hive.map.new()
+	hive.map.set(tills, Currency("BRL"), 1250)
+	hive.map.set(tills, Currency("EUR"), 300)
+
+	// An equal key is the same key: this is a lookup, not a second entry.
+	if hive.map.get(tills, Currency("BRL")) is Result.Ok(cents) {
+		echo "BRL till: {cents} cents"
+	}
+	hive.map.set(tills, Currency("BRL"), 1300)
+	echo "{len(tills)} tills: {tills}"
+
+	// An atom keys just as well, and reads better when the set is closed.
+	mut hive.map.Map<Atom, Str> status = hive.map.new()
+	hive.map.set(status, #Ready, "ready to go")
+	hive.map.set(status, #Draining, "finishing up")
+	if hive.map.get(status, #Ready) is Result.Ok(text) {
+		echo "#Ready -> {text}"
+	}
+}

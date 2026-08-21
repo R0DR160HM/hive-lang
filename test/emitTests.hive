@@ -1,0 +1,434 @@
+// Tests for `src/emit`.
+//
+// These are about the Go that comes out, so they assert on the text of it. That
+// is a blunt instrument and deliberately so: what matters about a lowering is
+// the shape it takes, and a test that spelled out every line would fail every
+// time a comment moved.
+//
+// What the generated Go *does* is tested by `test/e2e`, which compiles and runs
+// it — a thing a Hive test cannot do for itself, since Hive has no way to run
+// another program.
+import ../src/emit
+import ../src/loader
+import ../src/text
+
+// The Go `source` compiles to.
+proc go(source: Str): Str {
+	p := loader.loadText("main.hive", source)
+	if len(p.errors) > 0 {
+		for each e in p.errors {
+			return "loader: " + e.message
+		}
+	}
+	out := emit.emitModule(p.module)
+	if len(out.errors) > 0 {
+		for each e in out.errors {
+			return "emit: " + e.message
+		}
+	}
+	return out.source
+}
+
+// The Go one statement inside a `proc` compiles to.
+proc stmt(body: Str): Str {
+	return go("proc main(): void \{ " + body + " }")
+}
+
+func has(haystack: Str, needle: Str): Bool {
+	return text.contains(haystack, needle)
+}
+
+// --- The shape of a file -----------------------------------------------------
+
+test "a file is one package importing one thing" {
+	got := stmt("echo 1")
+	assert text.startsWith(got, "package main\n\nimport \"hiveapp/hive\"\n")
+}
+
+test "the atom table is installed before anything runs" {
+	got := stmt("echo #Ready")
+	assert has(got, "hive.InitAtoms([]string\{\"Nil\", \"Ready\"})")
+}
+
+test "a program with no main still gets one, so the package is a program" {
+	got := go("func two(): Int \{ return 2 }")
+	assert has(got, "func main() \{")
+}
+
+// --- Declarations ------------------------------------------------------------
+
+test "a struct is a struct, with its fields exported" {
+	got := go("type User \{ id: Int  name: Str }\nproc main(): void \{ }")
+	assert has(got, "type User struct \{")
+	assert has(got, "Id int")
+	assert has(got, "Name string")
+}
+
+test "a tagged union is an interface plus one struct per variant" {
+	got := go("type Shape \{ Circle \{ radius: Int } Point }\nproc main(): void \{ }")
+	assert has(got, "type Shape interface \{")
+	assert has(got, "isShape()")
+	assert has(got, "type ShapeCircle struct \{")
+	assert has(got, "func (ShapeCircle) isShape() \{}")
+	assert has(got, "type ShapePoint struct \{")
+}
+
+test "a field outside any variant is added to every variant" {
+	got := go("type Event \{ at: Int  Opened \{ by: Str } Closed }\nproc main(): void \{ }")
+	assert has(got, "type EventOpened struct \{\n\tBy string\n\tAt int\n}")
+	assert has(got, "type EventClosed struct \{\n\tAt int\n}")
+}
+
+test "a mutex parameter lowers to a pointer" {
+	got := go("proc grow(v: mut Str[dyn], tag: Str): void \{ }\nproc main(): void \{ }")
+	assert has(got, "func grow(v *[]string, tag string)")
+}
+
+test "a callable whose name is a Go keyword is suffixed" {
+	got := go("func map(a: Int): Int \{ return a }\nproc main(): void \{ }")
+	assert has(got, "func map_(a int) int")
+}
+
+// --- The three vector spellings are one Go type ------------------------------
+
+test "static, dynamic and any-length all lower to a slice" {
+	got := go("func f(a: Str[], b: Str[dyn], c: Str[3]): void \{ }\nproc main(): void \{ }")
+	assert has(got, "func f(a []string, b []string, c []string)")
+}
+
+// --- Operators ---------------------------------------------------------------
+
+test "+ is three operators, told apart by one type" {
+	assert has(stmt("echo 1 + 2"), "(1 + 2)")
+	assert has(stmt("echo \"a\" + \"b\""), "(\"a\" + \"b\")")
+	assert has(stmt("Int[dyn] a = []  echo a + a"), "hive.Concat(a, a)")
+}
+
+test "dividing by zero is a value, so it goes through the runtime" {
+	assert has(stmt("echo 1 / 2"), "hive.DivInt(1, 2)")
+	assert has(stmt("echo 1.0 / 2.0"), "hive.DivFloat(1.0, 2.0)")
+	assert has(stmt("echo 1 % 2"), "hive.ModInt(1, 2)")
+	assert has(stmt("echo 2 ** 3"), "hive.PowInt(2, 3)")
+	assert has(stmt("echo 2.0 ** 3.0"), "hive.PowFloat(2.0, 3.0)")
+}
+
+test "a scalar compares with Go's own ==, and storage compares structurally" {
+	assert has(stmt("echo 1 == 2"), "(1 == 2)")
+	assert has(stmt("Int[dyn] a = []  echo a == a"), "hive.Eq(a, a)")
+}
+
+test "a bounds guard is one call rather than two comparisons" {
+	assert has(stmt("Str[dyn] v = []  i := 0  if v bounds i \{ }"), "hive.InRange(i, v)")
+}
+
+test "a slice's high bound is inclusive, and Go's is not" {
+	assert has(stmt("Str[dyn] v = []  echo v[1:3]"), "v[1:(3)+1]")
+	assert has(stmt("Str[dyn] v = []  echo v[1:]"), "v[1:]")
+	assert has(stmt("Str[dyn] v = []  echo v[:2]"), "v[0:(2)+1]")
+}
+
+// --- Statements --------------------------------------------------------------
+
+test "a local carries its Hive type, and the assignment that says Go it was used" {
+	// Written with the type rather than with `:=`, because the two do not always
+	// agree — see the emitter's own note on it.
+	got := stmt("x := 1")
+	assert has(got, "var x int = 1\n\t_ = x")
+}
+
+test "a for-each is a range, and a counting loop is a for" {
+	assert has(stmt("Int[dyn] v = []  for each n in v \{ }"), "for _, n := range v \{")
+	assert has(stmt("for i := 0; i < 3; i++ \{ }"), "for i := 0; (i < 3); i = (i + 1) \{")
+}
+
+test "append writes the new header back, and prepend and drop take an address" {
+	assert has(stmt("mut Int[dyn] v = []  append(v, 1)"), "v = append(v, 1)")
+	assert has(stmt("mut Int[dyn] v = []  prepend(v, 1)"), "hive.Prepend(&v, 1)")
+	assert has(stmt("mut Int[dyn] v = [1, 2]  drop(v, 0, 0)"), "hive.Drop(&v, 0, 0)")
+}
+
+test "a discarded sort on a mut vector sorts in place" {
+	assert has(stmt("mut Int[dyn] v = [2, 1]  sort(v)"), "hive.SortInPlace(v)")
+	assert has(stmt("Int[dyn] v = [2, 1]  ordered := sort(v)"), "hive.Sort(v)")
+}
+
+test "an await-all is one barrier, and a bounded one answers with a Result" {
+	program := "func f(): Str \{ return \"a\" }\nproc main(): void \{ "
+	assert has(go(program + "Str[2] all = await [f(), f()]  echo all }"), "hive.AwaitAll[string](")
+	// With a deadline it is a different call and a different type: the vector is
+	// inside a Result, so the element cannot be read off what the value lands in.
+	bounded := go(program + "if await [f(), f()] with timeout 5 is Result.Ok(all) \{ echo all } }")
+	assert has(bounded, "hive.AwaitAllTimeout[string](")
+	assert has(bounded, ".IsOk()")
+}
+
+test "an atom a declaration below main mentions is still on the table" {
+	// The table is written into main before the declarations that mention the
+	// atoms have been walked, so what it says has to be written again from the
+	// end of the program rather than the end of main.
+	got := go("proc main(): void \{ echo #Ready  echo later() }\nfunc later(): Atom \{ return #Draining }")
+	assert has(got, "hive.InitAtoms([]string\{\"Nil\", \"Ready\", \"Draining\"})")
+}
+
+test "async is go, and echo, assert and panic each go through the runtime" {
+	assert has(go("proc f(): void \{ }\nproc main(): void \{ async f() }"), "go f()")
+	assert has(stmt("echo 1"), "hive.Echo(1)")
+	assert has(stmt("assert true"), "hive.Assert(true)")
+	assert has(stmt("panic \"no\""), "panic(hive.Show(\"no\"))")
+}
+
+// --- Patterns ----------------------------------------------------------------
+
+test "a variant pattern is a type assertion, and its bindings are fields" {
+	got := go("type Shape \{ Circle \{ radius: Int } }\nproc main(): void \{ s := Shape.Circle(1)  if s is Shape.Circle(r) \{ echo r } }")
+	assert has(got, ".(ShapeCircle);")
+	assert has(got, ".Radius")
+}
+
+test "a Result pattern is IsOk and a reader, and the subject is evaluated once" {
+	got := stmt("if hive.conv.sti(\"1\") is Result.Ok(n) \{ echo n }")
+	assert has(got, ".IsOk()")
+	assert has(got, ".Ok()")
+	// One call, in the `if`'s own init slot.
+	assert has(got, ":= hive.ConvSti(\"1\");")
+}
+
+test "a chain with patterns becomes a flag and a run of ifs" {
+	got := go("type Shape \{ Circle \{ radius: Int } Point }\nfunc name(s: Shape): Str \{ if s is Shape.Circle(r) \{ return \"c\" } else if s is Shape.Point \{ return \"p\" } }")
+	assert has(got, ":= false")
+	assert has(got, "if !_m")
+}
+
+test "a chain with no patterns stays a plain if/else" {
+	got := stmt("if 1 > 2 \{ echo 1 } else \{ echo 2 }")
+	assert has(got, "if (1 > 2) \{")
+	assert has(got, "} else \{")
+	assert has(got, "_m") == false
+}
+
+test "a vector pattern tests the length and then the literals" {
+	got := stmt("Str[dyn] v = []  if v is [\"a\", x] \{ echo x }")
+	assert has(got, "len(_t")
+	assert has(got, ") == 2")
+}
+
+test "a string pattern goes through the runtime matcher" {
+	got := stmt("p := \"/a\"  if p is \"/users/\{id}\" \{ echo id }")
+	assert has(got, "hive.MatchTemplate(p, []bool\{true, false}, []string\{\"/users/\", \"\"})")
+}
+
+// --- Values ------------------------------------------------------------------
+
+test "interpolation is concatenation, with the runtime for the pieces that are not Str" {
+	got := stmt("n := 1  echo \"a \{n} b\"")
+	assert has(got, "\"a \" + hive.ToStr(n) + \" b\"")
+	sameType := stmt("s := \"x\"  echo \"a \{s} b\"")
+	assert has(sameType, "\"a \" + s + \" b\"")
+}
+
+test "a Result constructor takes both halves from where it lands" {
+	got := go("func f(): Result<Int, Bool> \{ return Result.Ok(1) }\nproc main(): void \{ }")
+	assert has(got, "hive.Ok[int, bool](1)")
+	bad := go("func f(): Result<Int, Bool> \{ return Result.Error(false) }\nproc main(): void \{ }")
+	assert has(bad, "hive.Err[int, bool](false)")
+}
+
+test "an empty vector takes its element type from where it lands" {
+	assert has(stmt("Str[dyn] v = []"), "var v []string = []string\{}")
+	assert has(stmt("Int[dyn] v = []"), "var v []int = []int\{}")
+}
+
+test "an empty map takes both its types from where it lands" {
+	got := go("import hive.map\nproc main(): void \{ hive.map.Map<Str, Int> m = hive.map.new() }")
+	assert has(got, "hive.NewDict[string, int]()")
+}
+
+test "a map's writes go through its address, since they change which keys it has" {
+	got := go("import hive.map\nproc main(): void \{ mut hive.map.Map<Str, Int> m = hive.map.new()  hive.map.set(m, \"a\", 1) }")
+	assert has(got, "(&m).Set(\"a\", 1)")
+}
+
+test "a constructor names its fields, so reordering the declaration cannot remap them" {
+	got := go("type User \{ id: Int  name: Str }\nproc main(): void \{ echo User(1, \"a\") }")
+	assert has(got, "User\{Id: 1, Name: \"a\"}")
+}
+
+test "a named argument fills the parameter it names, wherever it was written" {
+	got := go("func f(a: Int, b: Str): Str \{ return b }\nproc main(): void \{ echo f(b: \"x\", 1) }")
+	assert has(got, "f(1, \"x\")")
+}
+
+test "a partial application is a closure whose parameters are the holes" {
+	got := go("func add(a: Int, b: Int): Int \{ return a + b }\nproc main(): void \{ f := add(1, _)  echo f(2) }")
+	assert has(got, "func(_h")
+	assert has(got, "int) int \{ return add(1, _h")
+}
+
+test "a bare reference to a callable is the function value" {
+	got := go("func double(n: Int): Int \{ return n * 2 }\nproc main(): void \{ Int[dyn] v = []  echo map(v, double) }")
+	assert has(got, "hive.Map(v, double)")
+}
+
+// --- The standard library ----------------------------------------------------
+
+test "a library call is a call of the same name on the runtime package" {
+	assert has(stmt("echo hive.conv.its(1)"), "hive.ConvIts(1)")
+	assert has(stmt("echo hive.math.sqrt(2.0)"), "hive.MathSqrt(2.0)")
+	assert has(stmt("echo hive.time.now()"), "hive.TimeNow()")
+}
+
+test "only the modules a program referenced are asked for" {
+	p := loader.loadText("main.hive", "proc main(): void \{ echo hive.conv.its(1) }")
+	out := emit.emitModule(p.module)
+	assert join(out.modules, ",") == "conv"
+
+	none := loader.loadText("main.hive", "proc main(): void \{ echo 1 }")
+	quiet := emit.emitModule(none.module)
+	assert len(quiet.modules) == 0
+}
+
+test "len is three builtins, told apart by what it was given" {
+	assert has(stmt("Str[dyn] v = []  echo len(v)"), "len(v)")
+	assert has(stmt("s := \"a\"  echo len(s)"), "hive.LenStr(s)")
+	assert has(go("import hive.map\nproc main(): void \{ hive.map.Map<Str, Int> m = hive.map.new()  echo len(m) }"), "(m).Len()")
+}
+
+// --- Reading a table ---------------------------------------------------------
+
+test "each `using` form lowers to the reader it names" {
+	assert has(stmt("t := using \"./x.csv\""), "hive.ReadCsv(\"./x.csv\", \",\")")
+	assert has(stmt("t := using \"./x.tsv\" as csv separating by \"\\t\""), "hive.ReadCsv(\"./x.tsv\", \"\\t\")")
+	assert has(stmt("t := using \"./b.xlsx\" as xlsx"), "hive.ReadXlsx(\"./b.xlsx\")")
+	assert has(stmt("t := using \"./b.ods\" as ods"), "hive.ReadOds(\"./b.ods\")")
+}
+
+// --- Queries -----------------------------------------------------------------
+
+test "a query builds a fragment, and a bound value never enters the text" {
+	got := go("query userNamed(name: Str): Str[dyn] \{ SELECT name FROM users WHERE name = \{name} }")
+	assert has(got, "func userNamed(name string) hive.SqlFragment \{")
+	assert has(got, "_sql += \"SELECT name FROM users WHERE name = \"")
+	assert has(got, "_sql += \"?\"")
+	assert has(got, "_args = append(_args, name)")
+}
+
+test "a WHERE block is gathered at run time and joined" {
+	got := go("query find(small: Bool): Str[dyn] \{ SELECT id FROM t WHERE \{ if small \{ size < 4 } } }")
+	assert has(got, "hive.SqlJoin(")
+	assert has(got, "\" AND \"")
+	// The clause disappears when nothing in it holds, which is why the WHERE is
+	// added only where the fragment turned out to carry something.
+	assert has(got, ".Text != \"\"")
+	assert has(got, "_sql += \" WHERE \"")
+}
+
+test "what a query declared its rows to be decides how it is run" {
+	rows := "type User \{ id: Int }\nquery all(): User[dyn] \{ SELECT id FROM users }\nquery wipe(): void \{ DELETE FROM users }\n"
+	got := go(rows + "proc main(): void \{ db := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"x.db\")  if db is Result.Ok(open) \{ echo using open run all()  echo using open run wipe()  echo using open run raw \"SELECT 1\" } }")
+	assert has(got, "hive.SqlRows(")
+	assert has(got, "sqlRow_User")
+	assert has(got, "hive.SqlExec(")
+	assert has(got, "hive.SqlQuery(")
+	assert has(got, "hive.SqlDatabaseDriver\{Name: \"sqlite\"}")
+	// One mapper per row type, and it checks the shape it was given.
+	assert has(got, "func sqlRow_User(_r []string) (User, error) \{")
+	assert has(got, "hive.SqlShapeError(1, len(_r))")
+}
+
+// --- JSON --------------------------------------------------------------------
+
+test "a codec is derived from the declaration, and named for the type" {
+	got := go("type User \{ id: Int\n name: Str }\nproc main(): void \{ echo hive.json.encode(User(1, \"ada\")) }")
+	assert has(got, "func jsonEncode_User(x User) string \{")
+	// The field names are the ones that were *written*, not Go's exported ones.
+	assert has(got, "\"\\\"id\\\":\"")
+	assert has(got, "hive.JsonEncodeInt(x.Id)")
+	assert has(got, "jsonEncode_User(")
+}
+
+test "a variant encodes under its own name, and decodes by it" {
+	got := go("type Shape \{ Circle \{ radius: Int }\n Point }\nproc main(): void \{ echo hive.json.encode(Shape.Circle(1))  if hive.json.parse(\"null\") with Shape is Result.Ok(s) \{ echo s } }")
+	assert has(got, "func jsonDecode_Shape(v hive.JsonValue, path string) (Shape, *hive.JsonJsonError) \{")
+	assert has(got, "hive.JsonVariant(v, path)")
+	assert has(got, "hive.JsonParse(")
+	// A JSON null selects the first field-less variant there is.
+	assert has(got, "if v.Kind == 'n' \{")
+}
+
+test "a JWT signs the claims its type derives an encoder for" {
+	got := go("type Claims \{ sub: Str }\nproc main(): void \{ echo hive.crypto.jwtSign(Claims(\"ada\"), \"secret\")  if hive.crypto.jwtVerify(\"t\", \"secret\") with Claims is Result.Ok(c) \{ echo c } }")
+	assert has(got, "hive.CryptoJwtSign(jsonEncode_Claims(")
+	assert has(got, "hive.CryptoJwtVerify(\"t\", \"secret\", jsonDecode_Claims)")
+}
+
+// --- Services ----------------------------------------------------------------
+
+test "a send carries an encoder, a digest and the decoder for the answer" {
+	program := "type Note \{ Say \{ text: Str }\n Counted \{ seen: Int } }\nproc inbox(seen: Int, note: Note, from: hive.syslink.Envelope): Int \{ hive.syslink.answer(from, Note.Counted(seen))  return seen }\n"
+	got := go(program + "proc main(): void \{ box := hive.syslink.spawn(inbox, 0)  async box(Note.Say(\"hi\"))  if box(Note.Say(\"hi\")) is Result.Ok(reply) \{ echo reply } }")
+	// Fire and forget is a cast; the same call kept is a request.
+	assert has(got, "hive.SyslinkSend(")
+	assert has(got, "hive.SyslinkSendAwaitable(")
+	assert has(got, "hive.SyslinkAwait(")
+	assert has(got, "hive.SyslinkEncoder(")
+	assert has(got, "hive.SyslinkReplyDecoder(jsonDecode_Note)")
+	// The digest is taken over the type's signature — every variant and field.
+	assert has(got, "hive.SyslinkDigest(\"Note\{Say,text:Str,Counted,seen:Int}\")")
+	// A message travels as its mailbox type rather than as the variant it is.
+	assert has(got, "Note(NoteSay\{")
+}
+
+test "a handler whose envelope stays in its turn can fail an unanswered request at once" {
+	quick := "proc quick(n: Int, note: Note, from: hive.syslink.Envelope): Int \{ hive.syslink.answer(from, note)  return n }\n"
+	slow := "proc slow(n: Int, note: Note, from: hive.syslink.Envelope): Int \{ async later(from)  return n }\nfunc later(from: hive.syslink.Envelope): void \{ }\n"
+	program := "type Note \{ Say \{ text: Str } }\n" + quick + slow
+	got := go(program + "proc main(): void \{ echo hive.syslink.spawn(quick, 0)  echo hive.syslink.spawn(slow, 0) }")
+	assert has(got, "jsonDecode_Note), hive.SyslinkDigest(\"Note\{Say,text:Str}\"), true)")
+	assert has(got, "jsonDecode_Note), hive.SyslinkDigest(\"Note\{Say,text:Str}\"), false)")
+}
+
+// --- Windows -----------------------------------------------------------------
+
+test "a widget takes its attributes first, and an event takes what the user did" {
+	got := go("type Msg \{ Typed \{ text: Str } }\nfunc view(m: Str): hive.ui.View \{ return hive.ui.column([hive.ui.gap(8)], [hive.ui.text([hive.ui.tone(hive.ui.Tone.Good())], m), hive.ui.input([hive.ui.onInput(Msg.Typed(_))], m)]) }\nproc main(): void \{ echo hive.ui.html(view(\"x\")) }")
+	assert has(got, "hive.UiColumn([]hive.UiAttr\{hive.UiAttrGap(8)}")
+	assert has(got, "hive.UiAttrTone(hive.UiTone(\"Good\"))")
+	// One parameter per thing the event reports, handed to whatever was given.
+	assert has(got, "hive.UiAttrOnInput(func(_ev0 string) any \{ return (")
+	assert has(got, "hive.UiHtml(")
+}
+
+test "a scene is a module of its own, and the shapes go in it" {
+	got := go("proc main(): void \{ echo hive.ui.html(hive.ui.scene([hive.ui.eye(0.0, 2.0, 8.0)], [hive.ui.box([hive.ui.at(0.0, 0.0, 0.0)], 1.0, 1.0, 1.0)])) }")
+	assert has(got, "hive.UiScene(")
+	assert has(got, "hive.UiAttrEye(0.0, 2.0, 8.0)")
+	assert has(got, "hive.UiBox(")
+}
+
+// --- Tests -------------------------------------------------------------------
+
+test "a program with no tests generates no test file" {
+	p := loader.loadText("main.hive", "proc main(): void \{ }")
+	out := emit.emitModule(p.module)
+	assert emit.emitTests(p.module, out.atoms, out.codecs) == ""
+}
+
+test "each test is a subtest, named in the prose it was written with" {
+	p := loader.loadText("main.hive", "test \"it holds\" \{ assert true }")
+	out := emit.emitModule(p.module)
+	generated := emit.emitTests(p.module, out.atoms, out.codecs)
+	assert has(generated, "func TestHive(t *testing.T)")
+	assert has(generated, "t.Run(\"it holds\", func(t *testing.T) \{")
+	assert has(generated, "defer hive.TestRecover(t)")
+}
+
+test "an assertion over a comparison binds each side once and reports both" {
+	p := loader.loadText("main.hive", "func two(): Int \{ return 2 }\ntest \"t\" \{ assert two() == 2 }")
+	out := emit.emitModule(p.module)
+	generated := emit.emitTests(p.module, out.atoms, out.codecs)
+	// The call is written once, into a temporary, and the temporary is what both
+	// the comparison and the report read.
+	assert has(generated, ":= two()")
+	assert has(generated, "hive.TestAssertCmp(t,")
+	assert has(generated, "hive.Show(_l")
+}

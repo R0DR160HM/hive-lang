@@ -1,0 +1,763 @@
+// The standard library
+// ====================
+// What `hive.<module>.<name>` means: what it answers with, and what it is called
+// on the generated runtime package. Both questions are asked in one place
+// because they have one answer — a library call is a call of the same name on a
+// package the build always carries, and the only thing that varies is the
+// spelling.
+//
+// A module a program never references is never written into the build, so this
+// table is also what decides what gets compiled. `modulesUsed` is the whole of
+// that decision.
+import ./ast
+import ./text
+import ./types
+
+/// Whether `module` is one this compiler carries.
+func isKnownModule(module: Str): Bool {
+	return module == "conv" || module == "math" || module == "term"
+		|| module == "file" || module == "map" || module == "env"
+		|| module == "task" || module == "time" || module == "json"
+		|| module == "crypto" || module == "net" || module == "sql"
+		|| module == "syslink" || module == "ui"
+}
+
+/// The name a library call carries on the runtime package: `hive.conv.its`
+/// becomes `hive.ConvIts`. One rule, so a module added tomorrow needs no entry —
+/// and one exception, because the rule cannot tell two of these apart.
+///
+/// `hive.net.httpRequest` is the call and `hive.net.HttpRequest` is the value it
+/// takes, and capitalising the first spells the second. So the call is
+/// `NetHttpSend` on the runtime, which is what it does anyway.
+func goNameOf(module: Str, name: Str): Str {
+	if module == "net" && name == "httpRequest" {
+		return "NetHttpSend"
+	}
+	if module == "ui" {
+		// An attribute and an enumeration can be the same word — `align` sets one
+		// and `Align` is the set it comes from — so an attribute says so in its
+		// runtime name and the enumeration keeps the plain one.
+		if isUiAttr(name) {
+			return "UiAttr" + text.capitalise(name)
+		}
+		// And one widget is the same word as an enumeration, for the same reason
+		// and with the same fix.
+		if name == "icon" {
+			return "UiIconOf"
+		}
+	}
+	return text.capitalise(module) + text.capitalise(name)
+}
+
+/// What `hive.<module>.<name>(args)` answers with.
+///
+/// Most of these are fixed. The ones that are not are the collection calls,
+/// whose answer is read off what they were handed — which is the same rule the
+/// global builtins follow, and for the same reason.
+func resultOf(module: Str, name: Str, args: types.Ty[]): types.Ty {
+	// A name that opens with a capital is one of the library's own types being
+	// built, and what it answers with is itself.
+	if isLibType(module, name) {
+		return types.Ty.TLib(module, name)
+	}
+	if module == "conv" { return convResult(name) }
+	if module == "math" { return mathResult(name) }
+	if module == "term" { return termResult(name) }
+	if module == "file" { return fileResult(name) }
+	if module == "map" { return mapResult(name, args) }
+	if module == "env" { return envResult(name) }
+	if module == "task" { return types.Ty.TVoid() }
+	if module == "time" { return timeResult(name) }
+	if module == "json" { return jsonResult(name, args) }
+	if module == "crypto" { return cryptoResult(name) }
+	if module == "net" { return netResult(name) }
+	if module == "sql" { return sqlResult(name) }
+	if module == "syslink" { return syslinkResult(name) }
+	if module == "ui" { return uiResult(name) }
+	return types.Ty.TUnknown()
+}
+
+func convResult(name: Str): types.Ty {
+	if name == "ceil" || name == "floor" || name == "round" {
+		return types.Ty.TInt()
+	}
+	if name == "itf" { return types.Ty.TFloat() }
+	if name == "its" || name == "fts" { return types.Ty.TStr() }
+	if name == "sti" {
+		return types.Ty.TResult(types.Ty.TInt(), types.Ty.TLib("conv", "ConversionError"))
+	}
+	if name == "stf" {
+		return types.Ty.TResult(types.Ty.TFloat(), types.Ty.TLib("conv", "ConversionError"))
+	}
+	return types.Ty.TUnknown()
+}
+
+// Every one of them takes and answers with a `Float`, and there is no integer
+// twin — which is one rule for thirteen functions.
+func mathResult(name: Str): types.Ty {
+	if name == "pi" || name == "sin" || name == "cos" || name == "tan"
+		|| name == "asin" || name == "acos" || name == "atan2"
+		|| name == "sqrt" || name == "hypot" || name == "abs"
+		|| name == "min" || name == "max" || name == "clamp" {
+		return types.Ty.TFloat()
+	}
+	return types.Ty.TUnknown()
+}
+
+func termResult(name: Str): types.Ty {
+	if name == "print" || name == "status" { return types.Ty.TVoid() }
+	if name == "read" || name == "readSecret" { return types.Ty.TStr() }
+	// Whether anybody is watching, which is the one question a program asks
+	// before deciding to say anything about its own progress.
+	if name == "isTerminal" { return types.Ty.TBool() }
+	if name == "args" {
+		return types.Ty.TVec(types.Ty.TStr(), dynamic())
+	}
+	// `exec` hands back what the command wrote; `attach` hands the terminal over
+	// and answers with the status, since a command talking to whoever started
+	// this program has already said whatever it had to say.
+	if name == "exec" {
+		return types.Ty.TResult(types.Ty.TStr(), types.Ty.TLib("term", "ExecError"))
+	}
+	if name == "attach" { return types.Ty.TInt() }
+	// `exit` never returns, so there is nothing for it to answer with.
+	if name == "exit" { return types.Ty.TVoid() }
+	return types.Ty.TUnknown()
+}
+
+func fileResult(name: Str): types.Ty {
+	fileError := types.Ty.TLib("file", "FileError")
+	if name == "read" { return types.Ty.TResult(types.Ty.TStr(), fileError) }
+	if name == "lines" || name == "list" {
+		return types.Ty.TResult(types.Ty.TVec(types.Ty.TStr(), dynamic()), fileError)
+	}
+	if name == "write" || name == "append" || name == "size" || name == "copy" {
+		return types.Ty.TResult(types.Ty.TInt(), fileError)
+	}
+	if name == "delete" || name == "makeDir" || name == "move" {
+		return types.Ty.TResult(types.Ty.TBool(), fileError)
+	}
+	if name == "exists" { return types.Ty.TBool() }
+	return types.Ty.TUnknown()
+}
+
+// A map's calls answer with what the map holds, so each of these reads its
+// answer off the first argument.
+func mapResult(name: Str, args: types.Ty[]): types.Ty {
+	subject := argAt(args, 0)
+	if name == "new" {
+		// `new()` says empty and nothing about what it holds, so it has no type
+		// of its own: it takes the one from wherever it lands.
+		return types.Ty.TUnknown()
+	}
+	if name == "set" || name == "delete" { return types.Ty.TVoid() }
+	if name == "has" { return types.Ty.TBool() }
+	if name == "get" {
+		if subject is types.Ty.TMap(_, value) {
+			return types.Ty.TResult(value, types.Ty.TBool())
+		}
+		return types.Ty.TUnknown()
+	}
+	if name == "keys" {
+		if subject is types.Ty.TMap(key, _) {
+			return types.Ty.TVec(key, dynamic())
+		}
+		return types.Ty.TUnknown()
+	}
+	if name == "values" {
+		if subject is types.Ty.TMap(_, value) {
+			return types.Ty.TVec(value, dynamic())
+		}
+		return types.Ty.TUnknown()
+	}
+	if name == "fromTable" {
+		return types.Ty.TMap(types.Ty.TStr(), types.Ty.TStr())
+	}
+	if name == "toTable" { return table() }
+	return types.Ty.TUnknown()
+}
+
+func envResult(name: Str): types.Ty {
+	if name == "get" {
+		return types.Ty.TResult(types.Ty.TStr(), types.Ty.TLib("env", "EnvironmentError"))
+	}
+	return types.Ty.TUnknown()
+}
+
+func timeResult(name: Str): types.Ty {
+	if name == "now" || name == "timezoneOffset" { return types.Ty.TInt() }
+	if name == "timezone" || name == "format" { return types.Ty.TStr() }
+	return types.Ty.TUnknown()
+}
+
+func jsonResult(name: Str, args: types.Ty[]): types.Ty {
+	if name == "encode" { return types.Ty.TStr() }
+	if name == "table" {
+		return types.Ty.TResult(table(), types.Ty.TLib("json", "JsonError"))
+	}
+	// A flattened document is looked up by path, and a path that is not in it is
+	// an ordinary answer rather than a failure.
+	if name == "get" {
+		return types.Ty.TResult(types.Ty.TStr(), types.Ty.TLib("json", "JsonError"))
+	}
+	// `parse` answers with whatever the `with T` clause said, which the caller
+	// applies — there is nothing in the arguments to read it off.
+	return types.Ty.TUnknown()
+}
+
+// A service is reached by calling its address, so most of this module is about
+// getting one: `spawn` starts a service, `at` and `on` name one that already
+// exists, and `register` publishes it. None of the three that build an address
+// performs any I/O — they are address construction, not a lookup.
+func syslinkResult(name: Str): types.Ty {
+	address := types.Ty.TLib("syslink", "Address")
+	syslinkError := types.Ty.TLib("syslink", "SyslinkError")
+	if name == "spawn" || name == "at" || name == "on" || name == "self" {
+		return address
+	}
+	if name == "register" { return types.Ty.TResult(address, syslinkError) }
+	if name == "stop" || name == "answer" || name == "monitor" {
+		return types.Ty.TVoid()
+	}
+	if name == "listen" {
+		return types.Ty.TResult(types.Ty.TStr(), syslinkError)
+	}
+	if name == "node" { return types.Ty.TStr() }
+	if name == "peers" {
+		return types.Ty.TVec(types.Ty.TStr(), dynamic())
+	}
+	return types.Ty.TUnknown()
+}
+
+// Opening a connection is the whole of this module's surface: everything else a
+// program does with a database it does through a `query`, and `using` is what
+// runs one.
+func sqlResult(name: Str): types.Ty {
+	if name == "connect" || name == "pool" {
+		return types.Ty.TResult(types.Ty.TLib("sql", "SqlConnection"), types.Ty.TLib("sql", "SqlError"))
+	}
+	if name == "close" { return types.Ty.TVoid() }
+	return types.Ty.TUnknown()
+}
+
+// Every call names its protocol, so nothing here reads as "the" default one —
+// and the three servers answer with nothing at all, because each of them blocks
+// forever.
+func netResult(name: Str): types.Ty {
+	httpError := types.Ty.TLib("net", "HttpError")
+	wsError := types.Ty.TLib("net", "WsError")
+	socketError := types.Ty.TLib("net", "SocketError")
+	netError := types.Ty.TLib("net", "NetError")
+	if name == "httpServe" || name == "wsServe" || name == "socketServe"
+		|| name == "wsClose" || name == "socketClose" {
+		return types.Ty.TVoid()
+	}
+	if name == "httpRequest" {
+		return types.Ty.TResult(types.Ty.TLib("net", "HttpResponse"), httpError)
+	}
+	if name == "wsConnect" {
+		return types.Ty.TResult(types.Ty.TLib("net", "WsConnection"), wsError)
+	}
+	if name == "wsSend" { return types.Ty.TResult(types.Ty.TInt(), wsError) }
+	if name == "wsReceive" { return types.Ty.TResult(types.Ty.TStr(), wsError) }
+	// The request that opened the connection, which is how a WebSocket server
+	// reads the path and the headers it was reached at.
+	if name == "wsRequest" { return types.Ty.TLib("net", "HttpRequest") }
+	if name == "socketConnect" {
+		return types.Ty.TResult(types.Ty.TLib("net", "SocketConnection"), socketError)
+	}
+	if name == "socketSend" { return types.Ty.TResult(types.Ty.TInt(), socketError) }
+	if name == "socketReceive" || name == "socketReceiveLine" {
+		return types.Ty.TResult(types.Ty.TStr(), socketError)
+	}
+	if name == "socketPeer" { return types.Ty.TStr() }
+	// Every address behind a name, in resolver order.
+	if name == "resolve" {
+		return types.Ty.TResult(types.Ty.TVec(types.Ty.TStr(), dynamic()), netError)
+	}
+	if name == "localAddress" { return types.Ty.TResult(types.Ty.TStr(), netError) }
+	return types.Ty.TUnknown()
+}
+
+// Everything here is a `Str` in and a `Str` out, bar the three that can fail
+// and the two that read a token. `jwtVerify` and `jwtDecode` answer with
+// whatever the `with T` clause said, which the caller applies — there is nothing
+// in the arguments to read it off.
+func cryptoResult(name: Str): types.Ty {
+	cryptoError := types.Ty.TLib("crypto", "CryptoError")
+	if name == "sha256" || name == "sha512" || name == "hmacSha256"
+		|| name == "base64Encode" || name == "randomHex"
+		|| name == "encrypt" || name == "jwtSign" {
+		return types.Ty.TStr()
+	}
+	if name == "base64Decode" || name == "decrypt" {
+		return types.Ty.TResult(types.Ty.TStr(), cryptoError)
+	}
+	if name == "jwtHeader" {
+		return types.Ty.TResult(types.Ty.TLib("crypto", "Header"), cryptoError)
+	}
+	return types.Ty.TUnknown()
+}
+
+// --- The types the library owns ----------------------------------------------
+//
+// A module owns its types under its own namespace: `hive.net.HttpRequest`,
+// `hive.crypto.CryptoError`. Most are only ever received — an error a call
+// answers with — but some are built by a program and handed back in
+// (`hive.net.HttpResponse`), and every one of them can be read field by field.
+// So both questions are answered here: what a type's fields are called, in the
+// order a positional constructor takes them, and what each one holds.
+//
+// A name that opens with a capital is a type; one that does not is a call. That
+// is the whole of what tells `hive.net.httpRequest` (which sends one) from
+// `hive.net.HttpRequest` (which is what it sends).
+
+/// Whether `hive.<module>.<name>` names a type this compiler carries.
+func isLibType(module: Str, name: Str): Bool {
+	return len(fieldsOf(module, name)) > 0 || isOpaque(module, name)
+}
+
+/// The types that have no fields to read: a handle a program holds and hands
+/// back, rather than a value it takes apart. Registering them is what lets one
+/// be written down as a parameter's type.
+func isOpaque(module: Str, name: Str): Bool {
+	if module == "net" {
+		return name == "WsConnection" || name == "SocketConnection"
+	}
+	if module == "sql" {
+		return name == "SqlConnection"
+	}
+	// An address is produced by `spawn`, `at` or `self`; an envelope only ever
+	// arrives as a handler's third parameter. Neither is taken apart, but both
+	// are written down — as a field's type, a parameter's, a message's.
+	if module == "syslink" {
+		return name == "Address" || name == "Envelope"
+	}
+	// A view, an attribute, a shape, and the enumerations. Registering them is
+	// what lets a `func` answering with a `hive.ui.View` be written down, which
+	// is how a view is composed at all.
+	if module == "ui" {
+		return name == "View" || name == "Attr" || name == "Shape"
+			|| len(variantsOf("ui", name)) > 0
+	}
+	return false
+}
+
+/// The variants of one of the library's own enumerations, in declaration order —
+/// which is also the order `sort` puts them in. A library type with variants is
+/// reached the way the language's own are: `hive.sql.DatabaseDriver.SQLite()`.
+func variantsOf(module: Str, name: Str): Str[dyn] {
+	if module == "sql" && name == "DatabaseDriver" {
+		return ["SQLite", "PostgreSQL", "Other"]
+	}
+	if module == "ui" {
+		if name == "Align" { return ["Start", "Center", "End", "Stretch"] }
+		if name == "Justify" { return ["Start", "Center", "End", "Between"] }
+		if name == "TextSize" { return ["Title", "Subtitle", "Body", "Caption"] }
+		// The five roles a stylesheet answers for, then the two that carry a
+		// colour themselves. A payload variant sorts after every plain one, which
+		// is what putting them last says.
+		if name == "Tone" {
+			return ["Normal", "Muted", "Good", "Warn", "Danger", "HEX", "RGBA"]
+		}
+		if name == "Axis" { return ["Horizontal", "Vertical", "Both"] }
+		if name == "InputKind" {
+			return ["Text", "Number", "Date", "Password", "Search"]
+		}
+		if name == "Icon" {
+			return ["Search", "Close", "Check", "Plus", "Minus", "Up", "Down",
+				"Left", "Right", "Warning", "Info", "Star", "Heart", "Reply",
+				"Repeat", "Trash", "User", "Menu"]
+		}
+	}
+	return []
+}
+
+/// A library type's fields, in the order a positional constructor takes them.
+func fieldsOf(module: Str, name: Str): ast.Field[dyn] {
+	if module == "net" { return netFields(name) }
+	if module == "syslink" {
+		if name == "SyslinkError" { return [field("reason"), field("message")] }
+		return []
+	}
+	if module == "ui" {
+		// Everything `hive.ui` owns is opaque: a view is built by the widget
+		// calls, an attribute by the attribute calls, and an enumeration is a
+		// closed set of names. None of them is taken apart again.
+		return []
+	}
+	if module == "sql" {
+		if name == "SqlError" { return [field("reason"), field("message")] }
+		if name == "DatabaseDriver" { return [field("name")] }
+		return []
+	}
+	if module == "crypto" {
+		if name == "CryptoError" { return [field("reason"), field("message")] }
+		if name == "Header" {
+			return [field("alg"), field("typ"), field("kid")]
+		}
+		return []
+	}
+	if module == "json" {
+		if name == "JsonError" {
+			return [field("path"), field("expected"), field("found")]
+		}
+		return []
+	}
+	if module == "file" {
+		if name == "FileError" {
+			return [field("reason"), field("path"), field("message")]
+		}
+		return []
+	}
+	if module == "term" {
+		if name == "ExecError" {
+			return [field("command"), intField("code"), field("output"), field("message")]
+		}
+		return []
+	}
+	if module == "conv" {
+		if name == "ConversionError" { return [field("input"), field("message")] }
+		return []
+	}
+	if module == "env" {
+		if name == "EnvironmentError" { return [field("key"), field("message")] }
+		return []
+	}
+	if module == "task" {
+		if name == "TimeoutError" { return [intField("waited"), field("message")] }
+		return []
+	}
+	if module == "" {
+		// The one type the language uses without a module, because `using` names
+		// no module either.
+		if name == "TableError" { return [field("path"), field("message")] }
+		return []
+	}
+	return []
+}
+
+func netFields(name: Str): ast.Field[dyn] {
+	if name == "HttpRequest" {
+		return [field("method"), field("url"), tableField("headers"), field("body")]
+	}
+	if name == "HttpResponse" {
+		return [intField("status"), tableField("headers"), field("body")]
+	}
+	if name == "HttpError" { return [field("url"), field("message")] }
+	if name == "WsError" || name == "SocketError" || name == "NetError" {
+		return [field("reason"), field("message")]
+	}
+	return []
+}
+
+func field(name: Str): ast.Field {
+	return ast.Field(name, types.toWritten(types.Ty.TStr()))
+}
+
+func intField(name: Str): ast.Field {
+	return ast.Field(name, types.toWritten(types.Ty.TInt()))
+}
+
+func tableField(name: Str): ast.Field {
+	return ast.Field(name, types.toWritten(table()))
+}
+
+/// What one of a library type's fields holds, or `TUnknown` where the type is
+/// not one this compiler carries. Every one of them is a `Str`, an `Int` or a
+/// `Table`, so nothing here needs a program's own declarations to be resolved
+/// against.
+func fieldTypeOf(module: Str, typeName: Str, field: Str): types.Ty {
+	for each f in fieldsOf(module, typeName) {
+		if f.name == field {
+			return types.resolve(types.Table([], []), f.declared)
+		}
+	}
+	return types.Ty.TUnknown()
+}
+
+// --- hive.ui ------------------------------------------------------------------
+//
+// Three sets of names, and which set a name is in decides everything about it. A
+// **widget** takes its attributes and then whatever its kind takes, and answers
+// with a `View`. A **shape** is the same call one dimension further out, and
+// answers with a `Shape` — what goes in a scene is a closed set of solids, and a
+// button is not one of them. An **attribute** carries one value and answers with
+// an `Attr`, which is a token the renderer may or may not have a use for.
+
+func isUiWidget(name: Str): Bool {
+	return name == "row" || name == "column" || name == "spacer"
+		|| name == "overlay" || name == "text" || name == "image"
+		|| name == "icon" || name == "link" || name == "button"
+		|| name == "input" || name == "textarea" || name == "checkbox"
+		|| name == "select" || name == "table" || name == "scene"
+		|| name == "spinner" || name == "none"
+}
+
+func isUiShape(name: Str): Bool {
+	return name == "box" || name == "sphere" || name == "cylinder"
+		|| name == "ground" || name == "label" || name == "line"
+}
+
+func isUiAttr(name: Str): Bool {
+	return name == "gap" || name == "pad" || name == "width" || name == "height"
+		|| name == "grow" || name == "heading" || name == "align"
+		|| name == "justify" || name == "scroll" || name == "size"
+		|| name == "tone" || name == "background" || name == "kind"
+		|| name == "placeholder" || name == "hint" || name == "disabled"
+		|| name == "busy" || name == "paint" || name == "lens" || name == "fog"
+		|| name == "grab" || name == "crosshair"
+		|| name == "at" || name == "turn" || name == "eye" || name == "aim"
+		|| isUiEvent(name)
+}
+
+/// The attributes that carry a message, or a function of what the user did to
+/// one. Each is here with what the event reports, because that is what decides
+/// the shape of what a program may hand it.
+func isUiEvent(name: Str): Bool {
+	return len(uiEventArgs(name)) > 0 || name == "on" || name == "onDismiss"
+}
+
+/// What an event reports, in order. `on` and `onDismiss` report nothing — they
+/// take the message itself.
+func uiEventArgs(name: Str): types.Ty[dyn] {
+	if name == "onInput" || name == "onSubmit" || name == "onChoose"
+		|| name == "onKeyDown" || name == "onKeyUp" {
+		return [types.Ty.TStr()]
+	}
+	if name == "onToggle" || name == "onGrab" { return [types.Ty.TBool()] }
+	if name == "onPick" || name == "onSort" || name == "onFrame" {
+		return [types.Ty.TInt()]
+	}
+	// How far the mouse moved, across and down. The one event that reports two
+	// numbers — and a two-hole constructor is already a function of that shape.
+	if name == "onLook" { return [types.Ty.TFloat(), types.Ty.TFloat()] }
+	return []
+}
+
+/// The names that are the *scene* rather than the page: the widget, the shapes
+/// that go in one, and the attributes only a scene gives meaning to. They are a
+/// module of their own because that module carries a download — so what brings
+/// it into a build has to be exactly what needs it.
+func isUiScene(name: Str): Bool {
+	return name == "scene" || isUiShape(name)
+		|| name == "paint" || name == "lens" || name == "fog" || name == "grab"
+		|| name == "crosshair" || name == "at" || name == "turn" || name == "eye"
+		|| name == "aim" || name == "onFrame" || name == "onKeyDown"
+		|| name == "onKeyUp" || name == "onLook" || name == "onGrab"
+}
+
+func uiResult(name: Str): types.Ty {
+	if isUiWidget(name) { return types.Ty.TLib("ui", "View") }
+	if isUiShape(name) { return types.Ty.TLib("ui", "Shape") }
+	if isUiAttr(name) { return types.Ty.TLib("ui", "Attr") }
+	if name == "html" || name == "page" { return types.Ty.TStr() }
+	// A window does not return: it shows the view and folds events until the
+	// program ends.
+	if name == "window" { return types.Ty.TVoid() }
+	return types.Ty.TUnknown()
+}
+
+/// What a `hive.ui` call takes, in order: its attributes first, then whatever
+/// its kind takes.
+func uiParams(name: Str): types.Ty[dyn] {
+	attrs := types.Ty.TVec(types.Ty.TLib("ui", "Attr"), dynamic())
+	view := types.Ty.TLib("ui", "View")
+	views := types.Ty.TVec(view, dynamic())
+	shapes := types.Ty.TVec(types.Ty.TLib("ui", "Shape"), dynamic())
+	str := types.Ty.TStr()
+	number := types.Ty.TFloat()
+	if name == "row" || name == "column" { return [attrs, views] }
+	if name == "overlay" { return [attrs, view] }
+	if name == "text" || name == "button" || name == "input" || name == "textarea" {
+		return [attrs, str]
+	}
+	if name == "image" || name == "link" { return [attrs, str, str] }
+	if name == "icon" { return [attrs, types.Ty.TLib("ui", "Icon")] }
+	if name == "checkbox" { return [attrs, str, types.Ty.TBool()] }
+	if name == "select" {
+		return [attrs, types.Ty.TVec(str, dynamic()), str]
+	}
+	if name == "table" { return [attrs, table()] }
+	if name == "scene" { return [attrs, shapes] }
+	if name == "spacer" || name == "spinner" || name == "none" { return [] }
+	// The solids. Dimensions are the payload rather than attributes because they
+	// are what the shape *is*: a sphere without a radius is not a sphere with a
+	// default one.
+	if name == "box" || name == "ground" || name == "cylinder" {
+		if name == "box" { return [attrs, number, number, number] }
+		return [attrs, number, number]
+	}
+	if name == "sphere" { return [attrs, number] }
+	if name == "label" { return [attrs, str] }
+	if name == "line" {
+		return [attrs, number, number, number, number, number, number]
+	}
+	if name == "html" { return [view] }
+	if name == "page" { return [str, view] }
+	if name == "window" { return [str] }
+	if isUiAttr(name) { return uiAttrParams(name) }
+	return []
+}
+
+/// What one attribute carries. The three that carry a place or a heading carry
+/// three numbers rather than one vector: a program's own idea of a point is its
+/// own, and a library type it had to convert into would be one more thing
+/// between the state and the picture.
+func uiAttrParams(name: Str): types.Ty[dyn] {
+	number := types.Ty.TFloat()
+	if name == "at" || name == "turn" || name == "eye" {
+		return [number, number, number]
+	}
+	if name == "aim" { return [number, number] }
+	if name == "gap" || name == "pad" || name == "width" || name == "height"
+		|| name == "grow" || name == "heading" || name == "lens" || name == "fog" {
+		return [types.Ty.TInt()]
+	}
+	if name == "placeholder" || name == "hint" { return [types.Ty.TStr()] }
+	if name == "disabled" || name == "busy" || name == "grab" || name == "crosshair" {
+		return [types.Ty.TBool()]
+	}
+	if name == "align" { return [types.Ty.TLib("ui", "Align")] }
+	if name == "justify" { return [types.Ty.TLib("ui", "Justify")] }
+	if name == "scroll" { return [types.Ty.TLib("ui", "Axis")] }
+	if name == "size" { return [types.Ty.TLib("ui", "TextSize")] }
+	if name == "tone" || name == "background" || name == "paint" {
+		return [types.Ty.TLib("ui", "Tone")]
+	}
+	if name == "kind" { return [types.Ty.TLib("ui", "InputKind")] }
+	// An event's value is a message, or a function to one, and only the program
+	// knows what a message is — so nothing is said about it here.
+	return []
+}
+
+/// What `hive.<module>.<name>` takes, in order. Empty where this compiler has
+/// nothing to say, and the emitter then lets each argument stand for itself.
+///
+/// It matters for exactly one reason: a value that cannot say what it is has to
+/// be told. An empty vector literal is the usual one — `hive.term.exec("go",
+/// [], "")` has to know that `[]` is a vector of `Str` before it can write the
+/// Go for it.
+func paramsOf(module: Str, name: Str): types.Ty[dyn] {
+	if module == "term" {
+		if name == "print" || name == "status" { return [types.Ty.TStr()] }
+		if name == "exec" || name == "attach" {
+			return [types.Ty.TStr(), strings(), types.Ty.TStr()]
+		}
+		if name == "exit" { return [types.Ty.TInt()] }
+		return []
+	}
+	if module == "file" {
+		if name == "write" || name == "append" || name == "copy" || name == "move" {
+			return [types.Ty.TStr(), types.Ty.TStr()]
+		}
+		return [types.Ty.TStr()]
+	}
+	if module == "conv" {
+		if name == "ceil" || name == "floor" || name == "round" || name == "fts" {
+			return [types.Ty.TFloat()]
+		}
+		if name == "itf" || name == "its" { return [types.Ty.TInt()] }
+		return [types.Ty.TStr()]
+	}
+	if module == "math" {
+		return [types.Ty.TFloat(), types.Ty.TFloat(), types.Ty.TFloat()]
+	}
+	if module == "env" { return [types.Ty.TStr()] }
+	if module == "task" { return [types.Ty.TInt()] }
+	if module == "time" {
+		if name == "format" { return [types.Ty.TInt(), types.Ty.TStr()] }
+		return []
+	}
+	if module == "json" {
+		if name == "table" || name == "parse" { return [types.Ty.TStr()] }
+		if name == "get" { return [table(), types.Ty.TStr()] }
+		return []
+	}
+	if module == "ui" { return uiParams(name) }
+	if module == "syslink" {
+		address := types.Ty.TLib("syslink", "Address")
+		envelope := types.Ty.TLib("syslink", "Envelope")
+		// A service name is an atom, which is what lets the compiler know the
+		// whole registry.
+		if name == "at" { return [types.Ty.TAtom()] }
+		if name == "on" { return [types.Ty.TStr(), types.Ty.TAtom()] }
+		if name == "register" { return [types.Ty.TAtom(), address] }
+		if name == "stop" { return [address] }
+		if name == "self" { return [envelope] }
+		if name == "listen" { return [types.Ty.TStr()] }
+		if name == "monitor" { return [envelope, address] }
+		if name == "answer" { return [envelope] }
+		return []
+	}
+	if module == "sql" {
+		driver := types.Ty.TLib("sql", "DatabaseDriver")
+		if name == "connect" { return [driver, types.Ty.TStr()] }
+		if name == "pool" {
+			return [driver, types.Ty.TStr(), types.Ty.TInt(), types.Ty.TInt()]
+		}
+		return [types.Ty.TLib("sql", "SqlConnection")]
+	}
+	if module == "net" {
+		if name == "httpRequest" { return [types.Ty.TLib("net", "HttpRequest")] }
+		// A server takes a port and a handler, and the handler's shape is what
+		// the compiler holds it to.
+		if name == "httpServe" {
+			return [types.Ty.TInt(), handler(types.Ty.TLib("net", "HttpRequest"), types.Ty.TLib("net", "HttpResponse"))]
+		}
+		if name == "wsServe" {
+			return [types.Ty.TInt(), handler(types.Ty.TLib("net", "WsConnection"), types.Ty.TVoid())]
+		}
+		if name == "socketServe" {
+			return [types.Ty.TInt(), handler(types.Ty.TLib("net", "SocketConnection"), types.Ty.TVoid())]
+		}
+		if name == "wsConnect" || name == "resolve" { return [types.Ty.TStr()] }
+		if name == "socketConnect" { return [types.Ty.TStr(), types.Ty.TInt()] }
+		// The connection every one of these opens with is a handle, so it stands
+		// for itself; what follows it is what needs saying.
+		if name == "wsSend" {
+			return [types.Ty.TLib("net", "WsConnection"), types.Ty.TStr()]
+		}
+		if name == "socketSend" {
+			return [types.Ty.TLib("net", "SocketConnection"), types.Ty.TStr()]
+		}
+		if name == "socketReceive" {
+			return [types.Ty.TLib("net", "SocketConnection"), types.Ty.TInt()]
+		}
+		return []
+	}
+	if module == "crypto" {
+		if name == "randomHex" { return [types.Ty.TInt()] }
+		if name == "hmacSha256" || name == "encrypt" || name == "decrypt"
+			|| name == "jwtSign" || name == "jwtVerify" {
+			return [types.Ty.TStr(), types.Ty.TStr()]
+		}
+		return [types.Ty.TStr()]
+	}
+	return []
+}
+
+// A server's handler: one argument in, one value out, and impure — a `func`
+// value goes where a `proc` is wanted, so writing it this way round takes both.
+func handler(takes: types.Ty, gives: types.Ty): types.Ty {
+	return types.Ty.TFn(false, [takes], gives)
+}
+
+func strings(): types.Ty {
+	return types.Ty.TVec(types.Ty.TStr(), dynamic())
+}
+
+func argAt(args: types.Ty[], index: Int): types.Ty {
+	if args bounds index {
+		return args[index]
+	}
+	return types.Ty.TUnknown()
+}
+
+func dynamic(): ast.Dim {
+	return ast.Dim.Dynamic()
+}
+
+func table(): types.Ty {
+	return types.Ty.TVec(types.Ty.TVec(types.Ty.TStr(), dynamic()), dynamic())
+}
