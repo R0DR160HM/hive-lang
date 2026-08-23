@@ -307,6 +307,54 @@ test "a pattern's subject has to be the kind of thing the pattern matches" {
 	assert opens(problem(inMain("n := 1  if n is \"/a\" \{ }")), "in `main`: a string pattern matches a `Str`")
 }
 
+// --- `SELECT *` --------------------------------------------------------------
+
+// A query whose rows are a declared type may not ask for whatever the table
+// happens to have. The rule is about the *result*, so everything that is not a
+// select list still compiles.
+func withRow(sql: Str): Str {
+	return "type User \{ id: Int name: Str }\nquery q(): User[dyn] \{ " + sql + " }\nproc main(): void \{ }"
+}
+
+test "a star cannot fill in rows of a declared type" {
+	assert opens(problem(withRow("SELECT * FROM users")),
+		"in `q`: `SELECT *` cannot fill in rows of a declared type")
+	assert opens(problem(withRow("SELECT *, id FROM users")),
+		"in `q`: `SELECT *` cannot fill in rows of a declared type")
+	assert opens(problem(withRow("SELECT u.* FROM users u")),
+		"in `q`: `SELECT *` cannot fill in rows of a declared type")
+	assert opens(problem(withRow("SELECT DISTINCT * FROM users")),
+		"in `q`: `SELECT *` cannot fill in rows of a declared type")
+	// Either half of a union is the result.
+	assert opens(problem(withRow("SELECT id, name FROM users UNION SELECT * FROM ghosts")),
+		"in `q`: `SELECT *` cannot fill in rows of a declared type")
+}
+
+test "naming the columns is what it wants" {
+	assert problemCount(withRow("SELECT id, name FROM users")) == 0
+	assert problemCount(withRow("SELECT u.id, u.name AS name FROM users u")) == 0
+}
+
+test "a star that is not a select list is nobody's business" {
+	// Multiplication, a function's argument, a subquery, and a common table
+	// expression — none of which is what the caller is handed.
+	assert problemCount(withRow("SELECT id, name FROM users WHERE id * 2 > 4")) == 0
+	assert problemCount(withRow("SELECT id, name FROM users HAVING count(*) > 1")) == 0
+	assert problemCount(withRow("SELECT id, name FROM (SELECT * FROM users) u")) == 0
+	assert problemCount(withRow("WITH all AS (SELECT * FROM users) SELECT id, name FROM all")) == 0
+	assert problemCount(withRow("SELECT id, name FROM users WHERE note = 'a * b'")) == 0
+	assert problemCount(withRow("SELECT id, name FROM users -- SELECT * would be wrong")) == 0
+	assert problemCount(withRow("SELECT /* SELECT * */ id, name FROM users")) == 0
+}
+
+test "a star is fine where there are no fields to disagree with" {
+	// A `Table` is rows of cells and has no names to line up, a single column is
+	// not a row type, and a statement hands back a count rather than rows.
+	assert problemCount("query q(): Table \{ SELECT * FROM users }\nproc main(): void \{ }") == 0
+	assert problemCount("query q(): Str[dyn] \{ SELECT * FROM users }\nproc main(): void \{ }") == 0
+	assert problemCount("query q(): void \{ INSERT INTO old SELECT * FROM users }\nproc main(): void \{ }") == 0
+}
+
 // --- Several at once ---------------------------------------------------------
 
 test "every mistake is reported, not just the first" {

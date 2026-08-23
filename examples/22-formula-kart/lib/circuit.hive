@@ -1,0 +1,903 @@
+// The circuit, and where it came from
+// ===================================
+// A kilometre and a half of it, and **no two races are on the same track**. A
+// number goes in; a closed loop of tarmac comes out, with its kerbs, its run-off,
+// its three sectors, the line round it that is quickest, and how fast a car can
+// be at every point on that line. All of it from the one seed, all of it a `func`,
+// and all of it computed once before the lights go out.
+//
+// **ONE DESCRIPTION, SIX USES.** The nodes below are what gets drawn, what a car
+// grips or slides on, what the bots steer at, what the lap counter counts, what
+// race control reads to know which sector a yellow flag belongs to, and where the
+// tokens are laid out. There is no second idea of where the track is anywhere in
+// this program, which is the only way the picture and the physics can be made to
+// agree — a corner you can see and a corner you can grip have to be the same
+// corner.
+//
+// HOW A TRACK IS ROLLED
+// ---------------------
+// Not from harmonics. A sum of sines gives a smooth closed curve every time, which
+// sounds like exactly what is wanted until you drive one: it has no corners, only
+// bends, and every lap is the same lap. So instead:
+//
+//   1. **Anchors.** Nine to fourteen radii, one every so many degrees round a
+//      circle, each rolled from the seed. That is where the shape comes from, and
+//      why one track has a long loop out west and the next does not.
+//   2. **Interpolation.** The anchors are joined with a raised cosine, which is
+//      smooth at every anchor rather than kinked — a straight line between two
+//      would put a corner exactly where nobody asked for one.
+//   3. **Relaxation.** A few passes of pulling every point toward the middle of
+//      its neighbours. This is the step that makes the result *drivable*: it takes
+//      the curvature off the tightest corners without touching the straights,
+//      because a straight is already the average of its neighbours and a hairpin
+//      is not.
+//
+// The three together give a track with real corners of real different sizes, and
+// no way to roll one a car cannot get round.
+//
+// THE RACING LINE falls out of one idea, applied a hundred times: *the fast way
+// round is the straightest path that stays on the road*. Take the line so far,
+// move every point to halfway between its neighbours, and push whatever left the
+// tarmac back onto it. Repeat. What comes out is a line that runs wide into a
+// corner, clips the apex and runs wide again — which nobody wrote down, and which
+// is what a racing line is.
+//
+// THE SPEED at each point is that line's curvature turned into a cornering speed,
+// and then a **backward pass**: a point may be no faster than what still lets you
+// slow down for the point after it. That pass, run twice round the lap so it
+// carries past the start line, is the whole of why the bots brake before a corner
+// rather than in it.
+
+import hive.math
+import hive.conv
+
+// ---------------------------------------------------------------------------
+// The roll
+// ---------------------------------------------------------------------------
+
+// A number out of two numbers. Knuth's multiplier, twice, and the sign thrown
+// away: not good randomness, and it does not need to be. What it has to be is the
+// *same* arithmetic everywhere, so that a track drawn on this machine is the track
+// a test walks a car around on another one.
+//
+// `salt` is which decision is being made. Every call passes its own, so how far
+// the third corner reaches and how high the hill is are two independent rolls of
+// one seed rather than one roll used twice.
+func hash(seed: Int, salt: Int): Int {
+	mut Int n = (seed % 2147483647 + salt * 7919) % 2147483647
+	n = (n * 1103515245 + 12345) % 2147483647
+	n = (n / 65536 * 1103515245 + salt * 40503 + 12345) % 2147483647
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+// A whole number from `low` to `high`, both ends included.
+func between(seed: Int, salt: Int, low: Int, high: Int): Int {
+	span := high - low + 1
+	if span <= 0 {
+		return low
+	}
+	return low + hash(seed, salt) % span
+}
+
+// A distance, to the hundredth. Everything the track measures goes through here,
+// which is what keeps the numbers in `build` below readable as the metres they are.
+func spread(seed: Int, salt: Int, low: Float, high: Float): Float {
+	steps := conv.round((high - low) * 100.0)
+	return low + conv.itf(between(seed, salt, 0, steps)) / 100.0
+}
+
+// ---------------------------------------------------------------------------
+// What a track is
+// ---------------------------------------------------------------------------
+
+// One point on the centre of the road, and everything anybody needs to know at it.
+// A track is a vector of these and nothing else — there is no curve object, no
+// spline to evaluate and no geometry to intersect, because a road sampled every
+// five metres answers every question this program asks of it directly.
+type Node {
+	// Where the middle of the road is, and how high the ground is under it.
+	x: Float
+	z: Float
+	y: Float
+	// Which way the road runs here, as a yaw: the same yaw a car facing along it
+	// would have, so a car's heading and the road's are the same kind of number
+	// and subtracting one from the other means what it looks like it means.
+	dir: Float
+	// How far this is from the start line, going forwards.
+	along: Float
+	// Half the road's width. It is per-node rather than one number for the track
+	// because a road that narrows at the wrong moment is worth more than a road of
+	// one width, and it costs a field.
+	half: Float
+	// How sharply the centreline turns here, in radians per metre, signed: positive
+	// is a right-hander. This is the centreline's, not the racing line's — it is
+	// what decides where kerbs and run-off go, which is a fact about the road.
+	bend: Float
+	// Where the fast way round sits, across the road, in metres from the middle and
+	// positive to the right. Relaxed into place by `fastest` below.
+	line: Float
+	// How fast a car may be here, in metres a second, and still make everything
+	// after it. The bots' whole idea of pace, and the reason they brake early.
+	pace: Float
+	// Whether what is beside the road here is gravel rather than grass. A corner
+	// gets a trap and a straight does not, which is both what a circuit looks like
+	// and what makes running wide cost more in the one place it is tempting.
+	trap: Bool
+}
+
+// A whole circuit: what it is called, what it is made of, and how long it is.
+type Circuit {
+	seed: Int
+	name: Str
+	nodes: Node[dyn]
+	// The lap, in metres. Kept rather than recomputed because half this file
+	// divides by it.
+	length: Float
+	laps: Int
+}
+
+// Where something is, said in the road's own terms rather than the world's.
+//
+// **This is the type the rest of the program thinks in.** A lap is `along` passing
+// the length; being off the road is `across` past the half width; who is ahead is
+// two `along`s compared; the bots steer at an `along` some way in front of their
+// own. All of that is arithmetic on two numbers, and none of it would be
+// arithmetic at all in x and z.
+type Where {
+	// Which node it is nearest, which is also where to start looking next time.
+	node: Int
+	along: Float
+	across: Float
+}
+
+// How many points a lap is cut into. Five metres or so between them at the
+// length below, which is close enough that a car never skips one at full speed
+// and coarse enough that relaxing the racing line over the lot is instant.
+func nodes(): Int {
+	return 288
+}
+
+// How many laps a race is. Short, because this is a kart race and not a Sunday
+// afternoon.
+func laps(): Int {
+	return 3
+}
+
+// ---------------------------------------------------------------------------
+// Rolling one
+// ---------------------------------------------------------------------------
+
+// A point on the loop while it is still being made — before it knows which way
+// the road runs at it, how far round it is, or anything else a `Node` knows.
+type Spot {
+	x: Float
+	z: Float
+}
+
+// The two lookups the whole of the build is written in terms of: the point `i`
+// places round a loop that wraps, and the number `i` places round a vector that
+// does.
+//
+// **They are why there is not a bounds guard in this section.** A loop is a loop:
+// the point before the first one is the last one, and code that had to say so at
+// every neighbour it touched would be four times the length and no clearer. Say it
+// once, here, and index nothing anywhere else.
+func spotAt(loop: Spot[], i: Int): Spot {
+	count := len(loop)
+	if count == 0 {
+		return Spot(0.0, 0.0)
+	}
+	mut Int at = i % count
+	if at < 0 {
+		at = at + count
+	}
+	if loop bounds at {
+		return loop[at]
+	}
+	return Spot(0.0, 0.0)
+}
+
+func roundAt(values: Float[], i: Int): Float {
+	count := len(values)
+	if count == 0 {
+		return 0.0
+	}
+	mut Int at = i % count
+	if at < 0 {
+		at = at + count
+	}
+	if values bounds at {
+		return values[at]
+	}
+	return 0.0
+}
+
+func build(seed: Int): Circuit {
+	corners := between(seed, 3, 9, 14)
+	// The anchors: one radius per corner, and the loop is the shape they make. The
+	// band is wide enough that a track has both a distant loop and a tight one, and
+	// narrow enough that it never doubles back on itself — a radius that could
+	// reach past its neighbour's is a track that crosses itself, and this program
+	// has no idea what to do with a bridge.
+	mut Float[dyn] anchors = []
+	for i := 0; i < corners; i++ {
+		append(anchors, spread(seed, 40 + i * 3, 150.0, 285.0))
+	}
+
+	// Every point on the loop, from the anchors either side of it.
+	count := nodes()
+	mut Spot[dyn] rough = []
+	for i := 0; i < count; i++ {
+		round := conv.itf(i) / conv.itf(count)
+		radius := reach(anchors, round * conv.itf(corners))
+		angle := round * math.pi() * 2.0
+		append(rough, Spot(radius * math.sin(angle), radius * math.cos(angle)))
+	}
+
+	// The step that makes it drivable. A straight is already the average of its
+	// neighbours and does not move; a corner is not, and gives ground every pass
+	// until it is one a car can get round.
+	//
+	// Then evened out, which is not cosmetic — see `evened`.
+	loop := evened(relaxed(rough, 14, 0.34), count)
+
+	// The road's width, and the hill it runs over. Both are rolled once for the
+	// whole track rather than per node: a road that changed width every five metres
+	// would read as a mistake rather than as a design.
+	half := spread(seed, 7, 6.4, 7.8)
+	climb := spread(seed, 8, 2.2, 6.5)
+	tilt := spread(seed, 9, 0.0, math.pi() * 2.0)
+
+	return Circuit(
+		seed,
+		named(seed),
+		assemble(loop, half, climb, tilt),
+		lap(loop),
+		laps()
+	)
+}
+
+// The radius `at` anchors round, where `at` is a fraction of the way through the
+// vector and wraps. Raised cosine between the two it falls between, which is
+// smooth where a straight line between them would put a kink — and a kink in the
+// radius is a corner nobody rolled.
+func reach(anchors: Float[], at: Float): Float {
+	count := len(anchors)
+	if count == 0 {
+		return 200.0
+	}
+	step := at - conv.itf(conv.floor(at))
+	// Cosine rather than linear: nought and one both come out flat, so the two
+	// arcs meet without a corner between them.
+	eased := (1.0 - math.cos(step * math.pi())) / 2.0
+	from := roundAt(anchors, conv.floor(at))
+	to := roundAt(anchors, conv.floor(at) + 1)
+	return from + (to - from) * eased
+}
+
+// Pull every point toward halfway between its neighbours, `passes` times over.
+//
+// The read in each pass is off the loop as it was when the pass started — kept in
+// `was` — rather than off what the pass has already written. A pass that read its
+// own writes would drag the whole loop round in the direction it happened to be
+// walking, which shows up as a track that creeps a few metres anticlockwise for
+// every pass you add. `was := made` is a copy and not another name for the same
+// storage, which is the language's rule rather than this function's care.
+//
+// It is a `func` and not a `proc`, and that is worth a line: **everything about a
+// circuit in this file is a `func`**, so every bit of it can be called by a test
+// with nothing set up, and the whole of it could be worked out inside the one that
+// draws the picture if it ever had to be. A `proc` writing through two vectors
+// would have been shorter and would have cost that.
+func relaxed(loop: Spot[], passes: Int, pull: Float): Spot[dyn] {
+	mut Spot[dyn] made = []
+	for each spot in loop {
+		append(made, spot)
+	}
+	if len(made) < 3 {
+		return made
+	}
+	for pass := 0; pass < passes; pass++ {
+		was := made
+		for i := 0; i < len(made); i++ {
+			back := spotAt(was, i - 1)
+			here := spotAt(was, i)
+			on := spotAt(was, i + 1)
+			middleX := (back.x + on.x) / 2.0
+			middleZ := (back.z + on.z) / 2.0
+			made[i] = Spot(
+				here.x + (middleX - here.x) * pull,
+				here.z + (middleZ - here.z) * pull
+			)
+		}
+	}
+	return made
+}
+
+// The loop again, with every point the same distance from the next.
+//
+// **This is not tidying.** The points come out of `reach` evenly spaced in *angle*,
+// and a loop whose radius nearly doubles has nearly twice as much road between two
+// points on the far side as between two on the near side. So "the node a third of
+// the way round" and "the node at five hundred metres" would be two different
+// nodes, and every lookup by distance — which is every lookup this program makes,
+// because the road's terms are how the whole thing thinks — would be out by as much
+// as the radius varies. Which is tens of metres, and shows up as a bot steering at
+// a point that is not where it thinks it is.
+//
+// Evenly spaced, the two questions are the same question, and turning a distance
+// into a node is a division. Everything downstream of here is exact because of this
+// function and would be approximately right without it, which is the worst kind of
+// wrong to debug.
+func evened(loop: Spot[], count: Int): Spot[dyn] {
+	mut Spot[dyn] out = []
+	if len(loop) < 3 || count < 3 {
+		return out
+	}
+	step := lap(loop) / conv.itf(count)
+	// Which segment of the original we are walking, and how far the start of it is
+	// from the beginning. Both only ever go forwards, so the whole resample is one
+	// pass over the loop however many points come out of it.
+	mut Int at = 0
+	mut Float walked = 0.0
+	for i := 0; i < count; i++ {
+		want := conv.itf(i) * step
+		for ; at < len(loop) * 3; {
+			here := spotAt(loop, at)
+			on := spotAt(loop, at + 1)
+			run := math.hypot(on.x - here.x, on.z - here.z)
+			if run <= 0.0 || walked + run >= want {
+				break
+			}
+			walked = walked + run
+			at = at + 1
+		}
+		here := spotAt(loop, at)
+		on := spotAt(loop, at + 1)
+		run := math.max(0.0001, math.hypot(on.x - here.x, on.z - here.z))
+		part := math.clamp((want - walked) / run, 0.0, 1.0)
+		append(out, Spot(
+			here.x + (on.x - here.x) * part,
+			here.z + (on.z - here.z) * part
+		))
+	}
+	return out
+}
+
+// How long a lap of these points is.
+func lap(loop: Spot[]): Float {
+	mut Float total = 0.0
+	for i := 0; i < len(loop); i++ {
+		here := spotAt(loop, i)
+		on := spotAt(loop, i + 1)
+		total = total + math.hypot(on.x - here.x, on.z - here.z)
+	}
+	if total <= 0.0 {
+		return 1.0
+	}
+	return total
+}
+
+// The points, turned into nodes: which way the road runs at each, how far round it
+// is, how sharply it bends, where the fast line goes and how fast you may be on it.
+func assemble(loop: Spot[], half: Float, climb: Float, tilt: Float): Node[dyn] {
+	count := len(loop)
+	mut Node[dyn] made = []
+	if count < 3 {
+		return made
+	}
+
+	// Which way it runs, and how far round. The direction at a node is taken across
+	// it rather than from it: the chord from the node behind to the node ahead,
+	// which is the tangent, where the chord to the next one alone is the tangent
+	// half a step further on.
+	mut Float[dyn] dirs = []
+	mut Float[dyn] alongs = []
+	mut Float travelled = 0.0
+	for i := 0; i < count; i++ {
+		back := spotAt(loop, i - 1)
+		here := spotAt(loop, i)
+		on := spotAt(loop, i + 1)
+		// A yaw, in the one convention this program has: facing along `dir` means
+		// moving by (-sin dir, -cos dir), so that a car's heading and a stretch of
+		// road are the same kind of number and subtracting one from the other means
+		// what it looks like it means.
+		append(dirs, math.atan2(-(on.x - back.x), -(on.z - back.z)))
+		append(alongs, travelled)
+		travelled = travelled + math.hypot(on.x - here.x, on.z - here.z)
+	}
+
+	// How sharply each node turns: the change in direction over the distance it
+	// took, which is curvature and is what a cornering speed is worked out from.
+	mut Float[dyn] bends = []
+	for i := 0; i < count; i++ {
+		here := spotAt(loop, i)
+		on := spotAt(loop, i + 1)
+		turn := wrapped(roundAt(dirs, i + 1) - roundAt(dirs, i))
+		step := math.max(0.5, math.hypot(on.x - here.x, on.z - here.z))
+		append(bends, turn / step)
+	}
+
+	line := fastest(loop, dirs, half)
+	speeds := pacing(loop, dirs, line)
+
+	for i := 0; i < count; i++ {
+		here := spotAt(loop, i)
+		bend := roundAt(bends, i)
+		// The hill. Two harmonics of the way round rather than one, so the climb is
+		// not a single symmetrical mound, and both gentle: a grade over about five
+		// percent stops reading as a hill and starts reading as a ramp.
+		round := conv.itf(i) / conv.itf(count) * math.pi() * 2.0
+		height := math.sin(round * 2.0 + tilt) * climb
+			+ math.sin(round * 3.0 + tilt * 1.7) * climb * 0.45
+		append(made, Node(
+			here.x,
+			here.z,
+			height,
+			roundAt(dirs, i),
+			roundAt(alongs, i),
+			half,
+			bend,
+			roundAt(line, i),
+			roundAt(speeds, i),
+			// Gravel goes where a corner is, which is where running wide is tempting
+			// and where a trap is therefore worth something. Grass everywhere else,
+			// because a straight with a gravel bed beside it is a straight nobody
+			// would ever leave.
+			math.abs(bend) > 0.011
+		))
+	}
+	return made
+}
+
+// An angle brought back into -pi..pi. Every difference of two headings in this
+// program goes through here — without it, a car pointing just west of north and a
+// road running just east of it are most of a full turn apart.
+func wrapped(angle: Float): Float {
+	full := math.pi() * 2.0
+	mut Float a = angle
+	for ; a > math.pi(); {
+		a = a - full
+	}
+	for ; a < -math.pi(); {
+		a = a + full
+	}
+	return a
+}
+
+// ---------------------------------------------------------------------------
+// The line round it
+// ---------------------------------------------------------------------------
+
+// The fast way round, as a lateral offset per node.
+//
+// One idea, applied a hundred and forty times: **the fast way round is the
+// straightest path that stays on the road**. Move every point of the line to
+// halfway between its neighbours — which is what "straighter" means, and is the
+// same relaxation the road itself was made drivable by — then push whatever has
+// left the tarmac back onto it.
+//
+// Nobody writes "run wide, clip the apex, run wide again" anywhere here. It is
+// what the two rules come to, because on the entry to a corner the straightest
+// path is outside the centreline, at the apex it is inside, and on the exit it is
+// outside again, and the edge of the road is the only thing stopping it being
+// straighter still.
+func fastest(loop: Spot[], dirs: Float[], half: Float): Float[dyn] {
+	count := len(loop)
+	mut Float[dyn] line = []
+	if count < 3 {
+		return line
+	}
+	for i := 0; i < count; i++ {
+		append(line, 0.0)
+	}
+	// How far off the middle the line may sit: the road, less the width of a car
+	// and a little more, because a wheel on the white line is on the line and a
+	// wheel past it is not.
+	limit := math.max(0.5, half - 1.9)
+
+	for pass := 0; pass < 140; pass++ {
+		was := line
+		for i := 0; i < len(line); i++ {
+			here := spotAt(loop, i)
+			hereDir := roundAt(dirs, i)
+			// The two neighbours as they actually are: the centreline, plus however
+			// far off it the line has got to.
+			back := across(spotAt(loop, i - 1), roundAt(dirs, i - 1), roundAt(was, i - 1))
+			on := across(spotAt(loop, i + 1), roundAt(dirs, i + 1), roundAt(was, i + 1))
+			// Halfway between them, brought back onto this node's cross-section: how
+			// far along the road's own sideways direction it lies.
+			overX := (back.x + on.x) / 2.0 - here.x
+			overZ := (back.z + on.z) / 2.0 - here.z
+			want := overX * math.cos(hereDir) - overZ * math.sin(hereDir)
+			line[i] = math.clamp(want, -limit, limit)
+		}
+	}
+	return line
+}
+
+// A point `off` metres to the right of one on the centreline, given which way the
+// road runs there. The road's sideways direction, written once.
+func across(here: Spot, dir: Float, off: Float): Spot {
+	return Spot(here.x + math.cos(dir) * off, here.z - math.sin(dir) * off)
+}
+
+// How fast a car may be at each node, in metres a second.
+//
+// Two rules, and the second is the one that matters. **Cornering**: a corner of
+// radius r may be taken at the square root of r times the grip, which is all a
+// friction circle ever said. **Braking**: and then no faster than what still lets
+// you slow down for the node after — carried backwards round the lap, twice, so
+// that a corner just past the start line brakes the straight before it.
+//
+// Without the second pass a bot arrives at every corner flat out and understeers
+// off. With it, it lifts about where a driver would.
+func pacing(loop: Spot[], dirs: Float[], line: Float[]): Float[dyn] {
+	count := len(loop)
+	mut Float[dyn] speeds = []
+	if count < 3 {
+		return speeds
+	}
+	// Where the line actually runs, which is what its curvature has to be measured
+	// on — the centreline's curvature is the road's, and the whole point of a
+	// racing line is that it is straighter than the road.
+	mut Spot[dyn] fast = []
+	for i := 0; i < count; i++ {
+		append(fast, across(spotAt(loop, i), roundAt(dirs, i), roundAt(line, i)))
+	}
+
+	for i := 0; i < count; i++ {
+		back := spotAt(fast, i - 1)
+		here := spotAt(fast, i)
+		on := spotAt(fast, i + 1)
+		radius := circle(back.x, back.z, here.x, here.z, on.x, on.z)
+		// v = sqrt(a r), with the lateral acceleration a car of this sort will hold.
+		// Capped at a top speed, because a straight is not infinitely fast.
+		append(speeds, math.min(top(), math.sqrt(grip() * radius)))
+	}
+
+	// Backwards, twice round: a node may be no faster than what braking from it
+	// reaches the next node's speed at. Twice because a lap is a loop, and one pass
+	// leaves the stretch before the start line believing whatever it started with.
+	for pass := 0; pass < 2; pass++ {
+		for step := 0; step < count; step++ {
+			i := count - 1 - step
+			here := spotAt(fast, i)
+			on := spotAt(fast, i + 1)
+			run := math.max(0.5, math.hypot(on.x - here.x, on.z - here.z))
+			next := roundAt(speeds, i + 1)
+			// v² = u² + 2 a s, solved for the u that arrives at v.
+			reachable := math.sqrt(next * next + 2.0 * braking() * run)
+			if speeds bounds i {
+				speeds[i] = math.min(speeds[i], reachable)
+			}
+		}
+	}
+	return speeds
+}
+
+// The radius of the circle through three points, which is one over the curvature.
+// A straight has no circle through it, and the answer for one is "very large" —
+// which is exactly what a straight's cornering speed should be worked out from.
+func circle(ax: Float, az: Float, bx: Float, bz: Float, cx: Float, cz: Float): Float {
+	// Twice the area of the triangle, by the cross product of two of its sides.
+	area := (bx - ax) * (cz - az) - (bz - az) * (cx - ax)
+	if math.abs(area) < 0.0001 {
+		return 100000.0
+	}
+	a := math.hypot(bx - ax, bz - az)
+	b := math.hypot(cx - bx, cz - bz)
+	c := math.hypot(cx - ax, cz - az)
+	return a * b * c / math.abs(area)
+}
+
+// What the pace is worked out from, and nothing else in this program uses them:
+// they are the reference car, not any particular one. A bot scales what comes out
+// by how good it is, and `drive.hive` has its own numbers for what a car actually
+// does.
+func grip(): Float {
+	return 15.5
+}
+
+func braking(): Float {
+	return 19.0
+}
+
+func top(): Float {
+	return 74.0
+}
+
+// ---------------------------------------------------------------------------
+// Reading one
+// ---------------------------------------------------------------------------
+
+// The node `i` places round, wrapping at the start line.
+//
+// Every index into a track in this program goes through here, and it hands back
+// the node rather than the number on purpose: a number would have to be proved in
+// range again wherever it landed, and the whole point of wrapping it here is that
+// it never has to be.
+func nodeAt(track: Circuit, i: Int): Node {
+	count := len(track.nodes)
+	if count == 0 {
+		return Node(0.0, 0.0, 0.0, 0.0, 0.0, 7.0, 0.0, 0.0, 40.0, false)
+	}
+	mut Int at = i % count
+	if at < 0 {
+		at = at + count
+	}
+	if track.nodes bounds at {
+		return track.nodes[at]
+	}
+	return Node(0.0, 0.0, 0.0, 0.0, 0.0, 7.0, 0.0, 0.0, 40.0, false)
+}
+
+// Where a point in the world is, in the road's terms. `hint` is the node it was
+// last near — a car does not move five metres in a frame, so the answer is within
+// a couple of nodes of where it was, and looking at every node on the track sixty
+// times a second for each of ten cars would be forty thousand distances to no
+// purpose. A hint of anything out of range searches the lot.
+func locate(track: Circuit, x: Float, z: Float, hint: Int): Where {
+	count := len(track.nodes)
+	if count == 0 {
+		return Where(0, 0.0, 0.0)
+	}
+	mut Int from = hint - 14
+	mut Int span = 29
+	if hint < 0 || hint >= count {
+		from = 0
+		span = count
+	}
+	mut Int best = 0
+	mut Float nearest = 100000000.0
+	for step := 0; step < span; step++ {
+		at := from + step
+		node := nodeAt(track, at)
+		far := (node.x - x) * (node.x - x) + (node.z - z) * (node.z - z)
+		if far < nearest {
+			nearest = far
+			best = at
+		}
+	}
+	return exactly(track, x, z, best)
+}
+
+// The same answer, refined off one node: how far past it and how far to the side
+// of it the point actually is. Without this a car's progress would jump five
+// metres at a time and every gap on the timing screen would be a staircase.
+func exactly(track: Circuit, x: Float, z: Float, at: Int): Where {
+	node := nodeAt(track, at)
+	overX := x - node.x
+	overZ := z - node.z
+	// The road's own two directions here: along it, and across it to the right.
+	forward := -math.sin(node.dir) * overX - math.cos(node.dir) * overZ
+	right := math.cos(node.dir) * overX - math.sin(node.dir) * overZ
+	mut Float along = node.along + forward
+	if along < 0.0 {
+		along = along + track.length
+	}
+	if along >= track.length {
+		along = along - track.length
+	}
+	count := len(track.nodes)
+	if count == 0 {
+		return Where(0, along, right)
+	}
+	mut Int index = at % count
+	if index < 0 {
+		index = index + count
+	}
+	return Where(index, along, right)
+}
+
+// How far apart two nodes are. A constant, because `evened` made it one, and the
+// number every lookup by distance divides by.
+func spacing(track: Circuit): Float {
+	count := len(track.nodes)
+	if count == 0 {
+		return 1.0
+	}
+	return track.length / conv.itf(count)
+}
+
+// The node nearest a distance round the lap. The other way round from `locate`:
+// that one starts with a place and finds the distance, this one starts with the
+// distance — which is what "the corner two hundred metres in front of me" needs.
+func nodeAlong(track: Circuit, along: Float): Node {
+	return nodeAt(track, indexAlong(track, along))
+}
+
+func indexAlong(track: Circuit, along: Float): Int {
+	count := len(track.nodes)
+	if count == 0 || track.length <= 0.0 {
+		return 0
+	}
+	round := wrappedAlong(track, along) / track.length
+	return conv.floor(round * conv.itf(count)) % count
+}
+
+// A distance round the lap, brought into nought to a lap.
+func wrappedAlong(track: Circuit, along: Float): Float {
+	if track.length <= 0.0 {
+		return 0.0
+	}
+	mut Float at = along
+	for ; at < 0.0; {
+		at = at + track.length
+	}
+	for ; at >= track.length; {
+		at = at - track.length
+	}
+	return at
+}
+
+// How far in front of `behind` the point `ahead` is, going forwards round the lap.
+// Always nought to a lap, never negative — "he is two metres behind me" is "he is
+// a lap and a bit in front of me", and for deciding who to overtake that is the
+// wrong answer, so the caller compares it with half a lap instead.
+func gap(track: Circuit, ahead: Float, behind: Float): Float {
+	return wrappedAlong(track, ahead - behind)
+}
+
+// The gap the short way round, signed: positive if `ahead` really is in front,
+// negative if it is behind. What "is there someone alongside me" is asked with.
+func nearGap(track: Circuit, ahead: Float, behind: Float): Float {
+	far := gap(track, ahead, behind)
+	if far > track.length / 2.0 {
+		return far - track.length
+	}
+	return far
+}
+
+// Where a point on the road is in the world: how far round, and how far across.
+// The one call that turns the road's terms back into the world's, and so the only
+// place a shape's position or a car's comes from.
+//
+// Between the two nodes either side rather than out along the nearer one's tangent.
+// The difference is a quarter of a metre at the apex of the tightest corner a seed
+// can roll, which is a quarter of a metre of a car sitting beside the road it is
+// supposed to be on. It is also exactly how the road is *drawn* — as straight
+// pieces between the same two nodes — so the picture and the arithmetic agree by
+// construction rather than by being tuned to.
+func placed(track: Circuit, along: Float, across: Float): Spot {
+	at := indexAlong(track, along)
+	here := nodeAt(track, at)
+	on := nodeAt(track, at + 1)
+	part := math.clamp(gap(track, along, here.along) / spacing(track), 0.0, 1.0)
+	x := here.x + (on.x - here.x) * part
+	z := here.z + (on.z - here.z) * part
+	// The direction turns as well, which is what keeps a car's sideways offset
+	// square to the road rather than to whichever node it last passed.
+	dir := here.dir + wrapped(on.dir - here.dir) * part
+	return Spot(x + math.cos(dir) * across, z - math.sin(dir) * across)
+}
+
+func placeX(track: Circuit, along: Float, across: Float): Float {
+	return placed(track, along, across).x
+}
+
+func placeZ(track: Circuit, along: Float, across: Float): Float {
+	return placed(track, along, across).z
+}
+
+// How high the ground is at a place on the road. Between the two nodes either
+// side rather than at the nearer one, because a car climbing a hill in five-metre
+// steps rides it like a staircase.
+func heightAt(track: Circuit, where: Where): Float {
+	here := nodeAt(track, where.node)
+	on := nodeAt(track, where.node + 1)
+	step := gap(track, on.along, here.along)
+	if step <= 0.0 {
+		return here.y
+	}
+	part := math.clamp(gap(track, where.along, here.along) / step, 0.0, 1.0)
+	return here.y + (on.y - here.y) * part
+}
+
+// ---------------------------------------------------------------------------
+// What you are driving on
+// ---------------------------------------------------------------------------
+
+// The four things there are underneath a car, in the order you meet them going
+// off the road. They are a type rather than four booleans because every one of
+// them is a different amount of grip, a different noise and a different colour,
+// and a car is on exactly one of them.
+type Ground {
+	Tarmac
+	Kerb
+	Gravel
+	Grass
+}
+
+func under(track: Circuit, where: Where): Ground {
+	node := nodeAt(track, where.node)
+	off := math.abs(where.across)
+	if off <= node.half {
+		return Ground.Tarmac()
+	}
+	if off <= node.half + kerbWidth() {
+		return Ground.Kerb()
+	}
+	if node.trap {
+		return Ground.Gravel()
+	}
+	return Ground.Grass()
+}
+
+// How much of the grip a car has on each. A kerb is nearly as good as the road
+// and rattles; grass is half; gravel barely holds you at all and is what makes
+// running wide at a corner a mistake rather than a shortcut.
+func hold(ground: Ground): Float {
+	if ground is Ground.Tarmac { return 1.0 }
+	else if ground is Ground.Kerb { return 0.86 }
+	else if ground is Ground.Gravel { return 0.34 }
+	else if ground is Ground.Grass { return 0.52 }
+}
+
+// And how much it drags on you, as a fraction of speed lost each second.
+func drag(ground: Ground): Float {
+	if ground is Ground.Tarmac { return 0.0 }
+	else if ground is Ground.Kerb { return 0.10 }
+	else if ground is Ground.Gravel { return 1.35 }
+	else if ground is Ground.Grass { return 0.62 }
+}
+
+func kerbWidth(): Float {
+	return 1.7
+}
+
+// Whether a car at this place has all four wheels off the road — the track-limits
+// question, and it is asked exactly the way the rule is written rather than by
+// eye. The white line counts as the track, so the margin is the width of a car
+// past the edge before anybody has left anything.
+func exceeded(track: Circuit, where: Where): Bool {
+	node := nodeAt(track, where.node)
+	return math.abs(where.across) > node.half + kerbWidth() + 0.4
+}
+
+// ---------------------------------------------------------------------------
+// Sectors
+// ---------------------------------------------------------------------------
+
+// Which third of the lap a distance falls in: 1, 2 or 3. Three because that is
+// how many a circuit has, and evenly split because there is nothing here that
+// would make one split better than another — a real circuit's are where the
+// timing loops were buried.
+func sector(track: Circuit, along: Float): Int {
+	if track.length <= 0.0 {
+		return 1
+	}
+	third := conv.floor(wrappedAlong(track, along) / track.length * 3.0)
+	if third < 0 { return 1 }
+	if third > 2 { return 3 }
+	return third + 1
+}
+
+// Where a sector starts, in metres. The start line is the start of the first.
+func sectorStart(track: Circuit, which: Int): Float {
+	return track.length * conv.itf(which - 1) / 3.0
+}
+
+// ---------------------------------------------------------------------------
+// The name over the gate
+// ---------------------------------------------------------------------------
+
+// A circuit gets a name because a lap time belongs somewhere. Two halves rolled
+// from the same seed, which is enough for a name you would believe and few enough
+// words to read them all.
+func named(seed: Int): Str {
+	firsts := ["Vale", "Kastel", "Monteverde", "Ostbahn", "Ravensholt", "Cortina",
+		"Sablon", "Nordkap", "Aldergrove", "Pelayo", "Tavistock", "Ironbridge"]
+	seconds := ["Park", "Ring", "Riviera", "Heights", "Motorpark", "Speedway",
+		"Circuit", "Autodrome"]
+	mut Str first = "Vale"
+	mut Str second = "Park"
+	one := between(seed, 91, 0, len(firsts) - 1)
+	two := between(seed, 92, 0, len(seconds) - 1)
+	if firsts bounds one { first = firsts[one] }
+	if seconds bounds two { second = seconds[two] }
+	return "{first} {second}"
+}

@@ -1,0 +1,560 @@
+// How a bot drives
+// ================
+// Nine of the ten cars are driven by this file, and everything it can do you can
+// do. It reads the track and the other cars, and it fills in a `drive.Wants`:
+// steering, throttle, brake, drift, token. That is the whole of its authority.
+// It cannot write a position, cannot help itself to grip, cannot see a corner the
+// picture has not drawn yet, and — the one that matters most — **it is stepped by
+// the same `drive.stepped` you are**, so when it gets a corner wrong it goes onto
+// the gravel and stays there for as long as you would.
+//
+// FIVE QUESTIONS, IN ORDER. Each answers on top of the last, and the order is the
+// order a driver would ask them in:
+//
+//   1. **Where is the road going?** An aim point some way in front, at the
+//      lateral offset `circuit.hive` worked out is quickest.
+//   2. **Who is in the way?** A car ahead moves the aim point to one side of it.
+//   3. **Who is behind me?** A car behind moves the line toward the inside, to
+//      cover the place they would put a nose into — *unless it is a teammate*,
+//      which is what most of the second half of this file is about.
+//   4. **What is lying about?** A shard or a wheel on the aim point moves it.
+//   5. **How fast may I be?** The pace at the slowest node between here and the
+//      aim point, less what this driver is willing to risk, and never more than
+//      race control allows.
+//
+// TEAMMATES
+// ---------
+// Two rules, and they are not the same rule.
+//
+// **A bot never spends a token on its teammate.** Not "rarely" and not "less
+// often" — the check is a straight refusal, and it applies to the debris it drops
+// as well as the wheel it fires, because dropping something in front of your own
+// car is attacking it with extra steps.
+//
+// **A bot defends its teammate less hard than it defends anybody else.** Where a
+// rival gets the door shut on them, a teammate gets the line left open and a lift
+// besides. Not a wave-through: it will still race, it just will not make it
+// expensive. That is what `defending` below does with the two numbers it has, and
+// it is the difference between a teammate being an ally and a teammate being one
+// more car.
+//
+// The two together mean the pair in your garage is worth something. Get past your
+// own second driver and they will let you go; get past somebody else's and they
+// will have a wheel ready for you on the next straight.
+//
+// MISTAKES. A grid where nobody ever gets it wrong is a procession. Each bot
+// carries a wobble worked out from its seat and the second of the race it is in —
+// so it is the same wobble every time for a given race and can be raced against
+// rather than merely suffered — which moves its braking point a little and its
+// line a little. The good drivers wobble less. Nobody wobbles never.
+
+import ./circuit
+import ./drive
+import ./grid
+import hive.math
+import hive.conv
+
+// How far ahead a bot looks, in metres: further the faster it is going, which is
+// exactly what a driver does and is why this is not a constant. Bounded at both
+// ends — too short and it saws at the wheel, too long and it aims past the apex
+// and drives straight over it.
+func lookahead(speed: Float): Float {
+	return math.clamp(6.0 + speed * 0.40, 8.0, 28.0)
+}
+
+// The whole answer for one car, one frame.
+//
+// `cap` is race control's speed limit and `green` is whether racing is allowed at
+// all — under a safety car nobody overtakes and nobody spends anything, which is
+// a rule the bots keep because they are told, not because they cannot break it.
+func driving(
+	track: circuit.Circuit,
+	cars: drive.Car[],
+	shards: drive.Shard[],
+	wheels: drive.Runaway[],
+	seat: Int,
+	cap: Float,
+	green: Bool,
+	clock: Float
+): drive.Wants {
+	me := carAt(cars, seat)
+	if me.sheet.finished {
+		return drive.Wants(0.0, 0.0, 1.0, false, false)
+	}
+	one := grid.driverOf(seat)
+	slip := wobble(seat, clock) * (1.4 - one.skill)
+
+	// 1. Where the road is going.
+	aim := circuit.wrappedAlong(track, me.along + lookahead(me.speed))
+	node := circuit.nodeAlong(track, aim)
+	mut Float want = node.line
+
+	// 2, 3 and 4: who is in the way, who is behind, and what is lying about.
+	want = want + passing(track, cars, me, green)
+	want = want + defending(track, cars, me, green)
+	want = want + dodging(track, shards, wheels, me, aim)
+	// A bot stays on its own road. It may use every inch of it and no more, which
+	// is the same rule the racing line was relaxed under.
+	room := math.max(0.5, node.half - 1.6)
+	want = math.clamp(want + slip * 1.1, -room, room)
+
+	// 5. How fast.
+	target := allowed(track, me, one, cap, slip)
+
+	wheel := steering(track, me, aim, want)
+	return drive.Wants(
+		wheel,
+		throttle(me, target),
+		braking(me, target),
+		drifts(track, me, node, wheel, green),
+		spends(track, cars, me, green, clock)
+	)
+}
+
+// The car in a seat. Every read of the field in this file goes through here, for
+// the same reason `circuit.nodeAt` exists: one place that has to be careful.
+func carAt(cars: drive.Car[], seat: Int): drive.Car {
+	for each car in cars {
+		if car.seat == seat {
+			return car
+		}
+	}
+	if cars bounds 0 {
+		return cars[0]
+	}
+	return drive.Car(seat, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0,
+		0.0, 0.0, 0.0, 1.0, 0.0, drive.Token.Nothing(), 0.0, 0.0, 0.0, false,
+		drive.freshSheet())
+}
+
+// A number between -1 and 1 that changes about once a second and is the same every
+// time for a given seat and second. Deterministic on purpose: a race you can learn
+// is better than a race that is merely unpredictable, and a test that cannot repeat
+// a bot's mistake cannot check it either.
+func wobble(seat: Int, clock: Float): Float {
+	tick := conv.floor(clock)
+	raw := circuit.hash(seat * 7919 + tick, 4271) % 2000
+	return conv.itf(raw - 1000) / 1000.0
+}
+
+// ---------------------------------------------------------------------------
+// Where to point it
+// ---------------------------------------------------------------------------
+
+// Which way to turn to reach the aim point.
+//
+// **Pure pursuit**, which is the oldest trick there is for this and the only one
+// worth using: pick a point some way ahead, work out the arc from where you are to
+// where it is, and turn at the rate that arc needs. The arc through a point at
+// distance L and off your nose by an angle a has a curvature of 2 sin a over L, and
+// travelling it at v needs a rate of turn of v times that.
+//
+// The reason it is that and not "aim at the road's heading and correct for how far
+// off the line you are" — which is the obvious thing, and which this file did
+// first — is that the obvious thing has no damping in it anywhere. It asks for the
+// same correction whether the car is already coming round to it or going away from
+// it, and half a second of lag between asking and getting is enough to make it
+// swing. Pure pursuit damps itself: the angle to the aim point shrinks as the car
+// comes round, and there is nothing left to overshoot with.
+//
+// Two things are then taken off the answer, and both are this program's rather than
+// the classic method's. The arc is measured from the direction the car is **going**
+// rather than the way its nose points, which is the same thing except in a drift and
+// is the whole difference in one. And the rotation a drift is already giving away is
+// subtracted, so a bot does not spend a corner fighting its own back end.
+func steering(track: circuit.Circuit, me: drive.Car, aim: Float, want: Float): Float {
+	// The aim point, in the world.
+	atX := circuit.placeX(track, aim, want)
+	atZ := circuit.placeZ(track, aim, want)
+	overX := atX - me.x
+	overZ := atZ - me.z
+	// How far away it actually is — but never counted as further than it was meant
+	// to be. Pure pursuit works out a gentler and gentler arc the further off the
+	// path you are, which is right while you are near it and useless once you are
+	// not: a car that has ended up in a field would ask for a curve so slack it
+	// would never come back. Capping the distance at the lookahead turns "a long
+	// way off" into "turn as hard as you would for something right there".
+	reach := math.clamp(math.hypot(overX, overZ), 4.0, lookahead(me.speed))
+	// Where the car is actually travelling, which in a drift is not where it points.
+	going := me.yaw + me.slide
+	ahead := -math.sin(going) * overX - math.cos(going) * overZ
+	beside := math.cos(going) * overX - math.sin(going) * overZ
+	// The angle off the nose, positive to the right.
+	off := math.atan2(beside, ahead)
+	// The arc that gets there, and the rate of turn it takes at this speed.
+	mut Float turn = 2.0 * math.max(6.0, me.speed) * math.sin(off) / reach
+	// What a drift is already contributing, in the same "positive is to the right"
+	// terms the rest of this is in.
+	if me.drift != 0.0 {
+		turn = turn - me.drift * drive.driftYaw() * math.min(1.0, me.speed / 20.0)
+	}
+	// And what asking for that is worth on the wheel. `drive.lockFor` is the exact
+	// inverse of what the car does with an input, so a bot asks for what it wants
+	// rather than for a fraction of full lock — which matters now that full lock at
+	// speed is several times more than the tyres will hold, and a bot that treated
+	// the wheel as a rate would spend every straight understeering into the scenery.
+	return drive.lockFor(turn, me.speed, 1.0)
+}
+
+// How fast this driver is prepared to be, right now.
+//
+// **Not the slowest pace between here and the corner** — that was the first thing
+// this file did and it is wrong in a way that is easy to miss: it makes a bot
+// arrive at the braking point already down at corner speed, which is a second a lap
+// thrown away on every straight. What is wanted is the *latest* it can still leave
+// it, and that is one line of the same arithmetic `circuit.pacing` used:
+//
+//     you may be v here, if v² is no more than (the pace there)² plus twice your
+//     braking times the distance to there
+//
+// asked of every node between here and as far as this car could stop from, and the
+// lowest answer taken. On a straight every node answers "as fast as you like" until
+// the corner comes into braking range, and then the answer falls away exactly as
+// fast as the car can shed it. Which is a driver braking late.
+func allowed(
+	track: circuit.Circuit,
+	me: drive.Car,
+	one: grid.Driver,
+	cap: Float,
+	slip: Float
+): Float {
+	team := grid.teamOf(me.seat)
+	// How hard this driver will actually stop. Not the car's limit: a limit nobody
+	// ever misses is not a limit, and the spread here is most of why one bot is
+	// half a second a lap quicker than another.
+	stopping := drive.brakes() * team.machine * (0.70 + one.skill * 0.28)
+	// Far enough to stop from this speed, and a little further so that the answer
+	// has already started falling before the braking point arrives.
+	reach := math.max(40.0, me.speed * me.speed / (2.0 * stopping) + 30.0)
+	step := math.max(3.0, circuit.spacing(track))
+	steps := conv.floor(reach / step) + 1
+	mut Float ceiling = circuit.top() * 2.0
+	for at := 0; at < steps; at++ {
+		off := conv.itf(at) * step
+		node := circuit.nodeAlong(track, me.along + off)
+		ceiling = math.min(ceiling,
+			math.sqrt(node.pace * node.pace + 2.0 * stopping * off))
+	}
+	// What this driver and this car make of it. The wobble is what stops the same
+	// corner being taken at exactly the same speed every lap.
+	// And how much of that this driver will actually use. Under one, always: a car
+	// held at exactly the limit has nothing left to steer with, so the first thing
+	// that is not quite as expected — an inch off the line, a kerb, somebody's
+	// mirror — puts it in the gravel. The margin is what a driver keeps in hand, and
+	// the better ones keep less of it.
+	commit := 0.80 + one.skill * 0.11
+	mut Float target = ceiling * commit * team.machine + slip * 2.2
+	if me.hurt > 0.0 {
+		target = target * 0.72
+	}
+	// Already off. Slow down and come back — a car trying to keep its lap time up
+	// while crossing a gravel trap is a car that stays in it.
+	ground := circuit.under(track, circuit.Where(me.node, me.along, me.across))
+	if ground is circuit.Ground.Gravel || ground is circuit.Ground.Grass {
+		target = math.min(target, 15.0)
+	}
+	if cap > 0.0 {
+		target = math.min(target, cap)
+	}
+	return math.max(6.0, target)
+}
+
+func throttle(me: drive.Car, target: Float): Float {
+	if me.speed >= target {
+		return 0.0
+	}
+	return math.clamp((target - me.speed) / 4.0, 0.0, 1.0)
+}
+
+func braking(me: drive.Car, target: Float): Float {
+	if me.speed <= target + 0.5 {
+		return 0.0
+	}
+	return math.clamp((me.speed - target) / 6.0, 0.0, 1.0)
+}
+
+// Whether to be drifting.
+//
+// A corner worth harvesting through, fast enough for the drift to hold, and — the
+// part that matters — **the wheel already turned well into it**. A drift commits to
+// whichever way the wheel was pointing when the button went down and will not change
+// side while it is held, so a bot that started one on the strength of the corner
+// alone would sometimes commit to the outside of it and then spend the whole corner
+// with three quarters of a radian a second pushing it the wrong way.
+//
+// Asking for the steering to agree first costs nothing and makes that impossible.
+func drifts(
+	track: circuit.Circuit,
+	me: drive.Car,
+	node: circuit.Node,
+	wheel: Float,
+	green: Bool
+): Bool {
+	if green == false || me.speed < 16.0 || me.spun > 0.0 {
+		return false
+	}
+	here := circuit.nodeAt(track, me.node)
+	tight := math.abs(here.bend) > 0.009 || math.abs(node.bend) > 0.011
+	if me.drift != 0.0 {
+		// Already sideways. Hold one that is still doing what it was started for and
+		// **let go of one that is not** — which is the whole of this branch and was
+		// worth an afternoon to find.
+		//
+		// A drift commits to a side when the button goes down and `drive.hive` will
+		// not change its mind while it is held. So a drift begun in a right-hander
+		// and carried into the left-hander after it is three quarters of a radian a
+		// second pushing the car the wrong way, against a bot sitting on full
+		// opposite lock and losing. The button is the only thing that can end it, so
+		// the button is what has to be let go of.
+		return tight && me.drift * wheel > 0.0 && math.abs(wheel) > 0.15
+	}
+	if math.abs(wheel) < 0.34 {
+		return false
+	}
+	// Starting one. Yaw grows to the left and a positive `bend` is the road turning
+	// that way, so a corner and the wheel that takes it have opposite signs — and
+	// both the corner it is in and the one it is arriving at have to agree, or this
+	// is a drift begun on the exit of one corner for the sake of the next.
+	return tight && here.bend * wheel < 0.0 && node.bend * wheel < 0.0
+}
+
+// ---------------------------------------------------------------------------
+// The other cars
+// ---------------------------------------------------------------------------
+
+// How far off the line to go to get past whoever is in front.
+//
+// Only for somebody genuinely in the way: near enough to matter, slower, and on
+// the side the aim point is heading for anyway. The side to go is whichever has
+// more road, which is what makes a bot come up the inside at a hairpin and round
+// the outside where there is room.
+func passing(track: circuit.Circuit, cars: drive.Car[], me: drive.Car, green: Bool): Float {
+	if green == false {
+		return 0.0
+	}
+	one := grid.driverOf(me.seat)
+	mut Float shift = 0.0
+	for each other in cars {
+		if other.seat == me.seat || other.sheet.finished {
+			continue
+		}
+		ahead := circuit.nearGap(track, other.along, me.along)
+		if ahead <= 0.5 || ahead > 16.0 {
+			continue
+		}
+		if other.speed > me.speed + 1.5 {
+			continue
+		}
+		// Whichever side of them has more road left. Nerve decides how much of a gap
+		// counts as one worth going for.
+		node := circuit.nodeAt(track, other.node)
+		leftRoom := node.half + other.across
+		rightRoom := node.half - other.across
+		mut Float side = 1.0
+		if leftRoom > rightRoom {
+			side = -1.0
+		}
+		// Closer means more committed, which is what makes the move happen at the
+		// braking zone rather than a hundred metres out.
+		urgency := (16.0 - ahead) / 16.0
+		shift = shift + side * (2.2 + one.nerve * 1.6) * urgency
+	}
+	return math.clamp(shift, -4.0, 4.0)
+}
+
+// How far off the line to go to keep somebody behind — and the one place in this
+// program where who somebody is changes what happens to them.
+//
+// A rival close behind gets the inside covered: the bot moves to the side they
+// would have gone down, which costs it a little of the corner and costs them the
+// move. A **teammate** gets the opposite of that. Not a wave-through — it still
+// races — but it leaves the line where it was and gives a little room besides, so
+// the move that would not have worked against anybody else works against this one.
+//
+// It is two lines of arithmetic. It is also, in a race, the whole difference
+// between having a teammate and having nine rivals.
+func defending(track: circuit.Circuit, cars: drive.Car[], me: drive.Car, green: Bool): Float {
+	if green == false {
+		return 0.0
+	}
+	one := grid.driverOf(me.seat)
+	mut Float shift = 0.0
+	for each other in cars {
+		if other.seat == me.seat || other.sheet.finished {
+			continue
+		}
+		behind := circuit.nearGap(track, me.along, other.along)
+		if behind <= 0.5 || behind > 13.0 {
+			continue
+		}
+		// They have to actually be coming, or this is a bot weaving at somebody who
+		// is dropping away.
+		if other.speed < me.speed - 1.0 {
+			continue
+		}
+		close := (13.0 - behind) / 13.0
+		if grid.teammates(me.seat, other.seat) {
+			// Leave the door open, and lean the other way to widen it. The whole
+			// courtesy, and it is deliberately small — a teammate who parked would be
+			// worse than a teammate who raced.
+			shift = shift - sideOf(other.across - me.across) * 1.5 * close
+			continue
+		}
+		// Anybody else: cover the side they are coming down. Nerve is how far a
+		// driver will go to do it.
+		shift = shift + sideOf(other.across - me.across) * (1.3 + one.nerve * 1.5) * close
+	}
+	return math.clamp(shift, -4.0, 4.0)
+}
+
+// Which side of you something is, as -1 or 1. Nought counts as the right, because
+// two cars exactly abreast is not a case worth a third branch.
+func sideOf(difference: Float): Float {
+	if difference < 0.0 {
+		return -1.0
+	}
+	return 1.0
+}
+
+// Getting out of the way of what is lying on the road. A shard or a wheel near
+// the aim point pushes the aim point off it, and by more than a car's width so
+// that avoiding it is actually avoiding it.
+func dodging(
+	track: circuit.Circuit,
+	shards: drive.Shard[],
+	wheels: drive.Runaway[],
+	me: drive.Car,
+	aim: Float
+): Float {
+	mut Float shift = 0.0
+	for each shard in shards {
+		near := circuit.nearGap(track, shard.along, me.along)
+		if near > -2.0 && near < 30.0 {
+			shift = shift + swerve(shard.across, me.across, 2.6)
+		}
+	}
+	for each wheel in wheels {
+		near := circuit.nearGap(track, wheel.along, me.along)
+		// A wheel is coming at you as well as sitting there, so it is worth looking
+		// further ahead for one and worth going further round it.
+		if near > -4.0 && near < 46.0 {
+			shift = shift + swerve(wheel.across, me.across, 3.4)
+		}
+	}
+	return math.clamp(shift, -4.5, 4.5)
+}
+
+// How far to move to miss something at `at`, given you are at `me`. Nothing at all
+// once you are already clear of it, which is what stops a bot that has dodged one
+// shard from driving into the grass because of it.
+func swerve(at: Float, me: Float, room: Float): Float {
+	off := me - at
+	if math.abs(off) > room {
+		return 0.0
+	}
+	return sideOf(off) * (room - math.abs(off))
+}
+
+// ---------------------------------------------------------------------------
+// Spending a token
+// ---------------------------------------------------------------------------
+
+// Whether to press the button this frame.
+//
+// The refusals are the interesting part. **A bot will not fire a wheel at its
+// teammate and will not drop debris in front of one** — and it is a refusal
+// rather than a discouragement: there is no roll, no weighting and no "usually",
+// because a teammate who takes you out one time in ten is not a teammate.
+func spends(
+	track: circuit.Circuit,
+	cars: drive.Car[],
+	me: drive.Car,
+	green: Bool,
+	clock: Float
+): Bool {
+	if green == false || me.holding is drive.Token.Nothing || me.spun > 0.0 {
+		return false
+	}
+	if me.holding is drive.Token.Wing {
+		// Where the road is straight and there is speed left to use. Spending it in a
+		// corner does nothing at all, and the bots know the rule because it is the
+		// same `wingStraight` the car is held to.
+		node := circuit.nodeAt(track, me.node)
+		return math.abs(node.bend) <= drive.wingStraight() && me.speed > 34.0
+	}
+	if me.holding is drive.Token.Softs {
+		// Punctured, or about to need the grip. A new set on the run to the flag is
+		// worth more than a new set held all race and never fitted.
+		return me.hurt > 0.0 || tightAhead(track, me)
+	}
+	if me.holding is drive.Token.Debris {
+		return worthDropping(track, cars, me)
+	}
+	if me.holding is drive.Token.Wheel {
+		return worthFiring(track, cars, me)
+	}
+	if me.holding is drive.Token.Safety {
+		// Never while leading, which is the same reason it is in the game: it is what
+		// somebody a long way back has, and it costs whoever is in front.
+		return placeOf(cars, me) > 0 && me.speed > 20.0
+	}
+	return false
+}
+
+// Whether there is a corner coming worth putting new tyres on for.
+func tightAhead(track: circuit.Circuit, me: drive.Car): Bool {
+	for step := 0; step < 14; step++ {
+		node := circuit.nodeAlong(track, me.along + conv.itf(step) * 8.0)
+		if math.abs(node.bend) > 0.014 {
+			return true
+		}
+	}
+	return false
+}
+
+// Debris is worth dropping when somebody who is not in your garage is close enough
+// behind to find it. Anybody further back than this will see it coming.
+func worthDropping(track: circuit.Circuit, cars: drive.Car[], me: drive.Car): Bool {
+	for each other in cars {
+		if other.seat == me.seat || other.sheet.finished {
+			continue
+		}
+		if grid.teammates(me.seat, other.seat) {
+			continue
+		}
+		behind := circuit.nearGap(track, me.along, other.along)
+		if behind > 1.0 && behind < 22.0 && math.abs(other.across - me.across) < 5.0 {
+			return true
+		}
+	}
+	return false
+}
+
+// A wheel is worth firing when somebody who is not in your garage is in front of
+// you and near enough the line for it to reach them.
+func worthFiring(track: circuit.Circuit, cars: drive.Car[], me: drive.Car): Bool {
+	for each other in cars {
+		if other.seat == me.seat || other.sheet.finished {
+			continue
+		}
+		if grid.teammates(me.seat, other.seat) {
+			continue
+		}
+		ahead := circuit.nearGap(track, other.along, me.along)
+		if ahead > 3.0 && ahead < 120.0 {
+			return true
+		}
+	}
+	return false
+}
+
+// How many cars are in front of this one. Nought is the lead.
+func placeOf(cars: drive.Car[], me: drive.Car): Int {
+	mut Int front = 0
+	for each other in cars {
+		if other.seat != me.seat && other.sheet.travelled > me.sheet.travelled {
+			front = front + 1
+		}
+	}
+	return front
+}

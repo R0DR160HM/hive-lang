@@ -44,15 +44,16 @@ compiled it first is left in it. `../bootstrap` builds it with itself and with
 nothing else — the compiler that first compiled it is no longer part of this
 project.
 
-**It runs every example.** [`../examples`](../examples) holds twenty-one
-programs, and they are the same programs the compiler this one replaces was
-written against: three servers, a database, a distributed pair of nodes, a
-password vault, a chat with a user interface, a multiplayer game with a 3D
-scene, and the tours of the language itself. `../examples/run` compiles and runs
-them, and the five with test suites of their own contribute 155 tests more. That
-is the other half of what "implemented" means here: not that the compiler
-accepts the specification's grammar, but that it builds the programs the
-specification was written for.
+**It runs every example.** [`../examples`](../examples) holds twenty-two
+programs, and all but the last are the same programs the compiler this one
+replaces was written against: three servers, a database, a distributed pair of
+nodes, a password vault, a chat with a user interface, a multiplayer shooter with
+a 3D scene, a ten-car race on a circuit rolled from a number, and the tours of the
+language itself. `../examples/run` compiles and runs them, and the six with test
+suites of their own contribute over two hundred tests more. That is the other half
+of what "implemented" means here: not that the compiler accepts the
+specification's grammar, but that it builds the programs the specification was
+written for.
 
 ### What is implemented
 

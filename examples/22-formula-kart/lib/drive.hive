@@ -1,0 +1,927 @@
+// Driving one
+// ===========
+// What a car is, and what one frame does to it. Every car in the race goes
+// through the same `stepped` below — the one you are steering and the nine you
+// are not — and that is the single most important thing in this file.
+//
+// **A BOT CANNOT ASK FOR ANYTHING YOU CANNOT ASK FOR.** The only way into the
+// physics is a `Wants`: how far the wheel is turned, how much throttle, how much
+// brake, whether the drift button is held, whether the token button was pressed.
+// A keyboard fills one in. A pad fills one in. `pace.hive` fills one in. Nothing
+// downstream of that can tell which, and there is no branch anywhere in this file
+// on whether a car is a bot. So a bot that is quicker than you is quicker because
+// it braked later, not because it was allowed to.
+//
+// That is worth the small cost it has. It would be easier to steer a bot by
+// writing its position, and every racing game that does it that way has cars that
+// corner on rails, cannot be leaned on, and never make a mistake. These ones lock
+// up, run wide onto the gravel, and lose it if you put them on the grass.
+//
+// HOW A CAR MOVES. Speed along the nose, and a `slide` angle between where the
+// nose points and where the car is actually going. Straight-line driving keeps
+// slide at nought and the two are the same. A drift is what happens when they
+// come apart on purpose, and the whole of drifting in this program is that one
+// number growing and then coming back.
+//
+// THE ENERGY. Hold the drift through a corner and you **harvest**; let go and you
+// **deploy**. That is a mini-turbo wearing the right overalls, and the fit is
+// better than it has any right to be: a real car harvests under load and spends it
+// on the exit, which is exactly when the charge is worth having. Three levels,
+// and the third one is worth going a long way round a corner for.
+//
+// WHAT IS UNDER THE WHEELS decides almost everything else. `circuit.hive` says
+// what a place is made of and how much grip it holds; grip scales the cornering,
+// the braking and the drive out. There is no separate rule for grass — grass is
+// half the grip, and everything that follows from that follows.
+
+import ./circuit
+import hive.math
+import hive.conv
+
+// ---------------------------------------------------------------------------
+// What a driver asks for
+// ---------------------------------------------------------------------------
+
+// The whole of the interface between somebody driving and a car being driven.
+// A keyboard makes one of these, a pad makes one, and so does a bot.
+type Wants {
+	// -1 is full left, +1 is full right. A pad gives the whole range; a keyboard
+	// gives the ends and `race.hive` eases between them, so that a key is a wheel
+	// being turned rather than a wheel snapping over.
+	steer: Float
+	throttle: Float
+	brake: Float
+	// Held, not pressed: a drift lasts as long as the button does.
+	drifting: Bool
+	// Pressed this frame, not held: a token is spent once.
+	spending: Bool
+}
+
+func idle(): Wants {
+	return Wants(0.0, 0.0, 0.0, false, false)
+}
+
+// ---------------------------------------------------------------------------
+// What you can be carrying
+// ---------------------------------------------------------------------------
+
+// Five things, and every one of them is something that happens in a real race —
+// which is the whole of the reskin. A mushroom is a boost; so is opening the rear
+// wing. A banana is something on the road that punctures whoever finds it; so is
+// a piece of somebody's front wing. The blue shell is the item that hurts the
+// leader most; so is a safety car.
+type Token {
+	Nothing
+	// The rear wing, open. Only on a straight, which is both the real rule and the
+	// thing that makes it a decision rather than a button.
+	Wing
+	// A new set of the softest tyre there is. Grip, for a while, and nothing on the
+	// road can puncture them.
+	Softs
+	// A piece of your own bodywork, left where you were. Whoever finds it is not
+	// going to enjoy it.
+	Debris
+	// A wheel off somebody's car, rolling down the racing line at whoever is next.
+	Wheel
+	// The safety car. Everybody slows to a delta and nobody may pass, which costs
+	// whoever is winning everything they had built up.
+	Safety
+}
+
+func tokenName(token: Token): Str {
+	if token is Token.Nothing { return "—" }
+	else if token is Token.Wing { return "DRS" }
+	else if token is Token.Softs { return "SOFTS" }
+	else if token is Token.Debris { return "DEBRIS" }
+	else if token is Token.Wheel { return "LOOSE WHEEL" }
+	else if token is Token.Safety { return "SAFETY CAR" }
+}
+
+// What the token is worth to whoever is holding it, on a scale of one to five.
+// Read off the same declaration the effects are, so the pit board and the roll
+// below cannot disagree about which of them is the good one.
+func tokenWorth(token: Token): Int {
+	if token is Token.Nothing { return 0 }
+	else if token is Token.Wing { return 2 }
+	else if token is Token.Softs { return 3 }
+	else if token is Token.Debris { return 1 }
+	else if token is Token.Wheel { return 4 }
+	else if token is Token.Safety { return 5 }
+}
+
+// What comes out of a crate, and it depends on where you are.
+//
+// The leader gets debris and a wing; the car at the back gets the safety car. This
+// is the one place the game is deliberately not fair, and it is the mechanism the
+// whole genre is built on — a race where the lead is unassailable stops being a
+// race about ten seconds in. Dressed in F1 it even has a name: the further back
+// you are, the more the pit wall will gamble.
+func rolled(place: Int, field: Int, seed: Int, salt: Int, mayCall: Bool): Token {
+	// Nought at the front of the field, a hundred at the back.
+	mut Int back = 0
+	if field > 1 {
+		back = place * 100 / (field - 1)
+	}
+	roll := circuit.hash(seed, salt) % 100
+	if roll < 22 { return Token.Debris() }
+	if roll < 50 { return Token.Wing() }
+	if roll < 74 { return Token.Softs() }
+	// The last two are not on the table at all at the front — both thresholds start
+	// at seventy-four and open up as `back` grows, so the leader can draw neither
+	// and the car at the back draws one or the other a quarter of the time.
+	wheelTo := 74 + back * 15 / 100
+	mut Int safetyTo = wheelTo
+	// And not at all while one is already out or has only just gone in. A token
+	// that cannot be used is worse than a token you did not draw — it sits in the
+	// car taking the place of one that would have done something — so the check is
+	// here at the draw rather than at the press.
+	if mayCall {
+		safetyTo = wheelTo + back * 11 / 100
+	}
+	if roll < wheelTo { return Token.Wheel() }
+	if roll < safetyTo { return Token.Safety() }
+	return Token.Softs()
+}
+
+// ---------------------------------------------------------------------------
+// The timing sheet
+// ---------------------------------------------------------------------------
+
+// Everything about a car that is a *result* rather than a state of motion: how far
+// round, how long each bit took, and what has been added to it. It sits inside a
+// `Car` rather than in a vector of its own because a car and its sheet are looked
+// up together every single time, and two vectors indexed by the same seat is a
+// way of getting them out of step.
+type Sheet {
+	lap: Int
+	// The total distance since the lights, which is what the order is decided on.
+	// Comparing how far round the lap two cars are puts whoever has just crossed
+	// the line last, which is exactly the wrong answer.
+	travelled: Float
+	// The race clock when this lap and this sector began.
+	lapStart: Float
+	sectorAt: Float
+	sector: Int
+	last: Float
+	best: Float
+	// This lap's three sector times, and the best three ever set. A static three,
+	// because a lap has three sectors and a vector that could be any length would
+	// be a lie about that.
+	sectors: Float[3]
+	bestSectors: Float[3]
+	// Track limits: how many warnings, and how many seconds have been added.
+	warnings: Int
+	penalty: Float
+	finished: Bool
+	finishedAt: Float
+}
+
+func freshSheet(): Sheet {
+	return Sheet(0, 0.0, 0.0, 0.0, 1, 0.0, 0.0,
+		[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 0, 0.0, false, 0.0)
+}
+
+// ---------------------------------------------------------------------------
+// A car
+// ---------------------------------------------------------------------------
+
+type Car {
+	seat: Int
+	// Where it is in the world, and which way the nose points. The road's terms
+	// are worked out from these rather than the other way round, because a car
+	// slides and a road does not.
+	x: Float
+	z: Float
+	yaw: Float
+	// How fast along the nose, and how far off the nose it is actually travelling.
+	speed: Float
+	slide: Float
+	// Where that puts it on the track. Kept on the car rather than recomputed by
+	// whoever wants it: `node` is also the hint the next lookup starts from, and
+	// without it every lookup would search the whole track.
+	node: Int
+	along: Float
+	across: Float
+	// Which way it is committed to drifting — -1, 0 or +1 — and how much has been
+	// harvested doing it.
+	drift: Float
+	harvest: Float
+	// How long the deployment has left and how hard it is pushing.
+	deploy: Float
+	push: Float
+	// Whether the wing is open, which is a deployment that only works on a
+	// straight and closes itself in a corner.
+	wing: Float
+	// What it is carrying, and what has been done to it: a puncture, a spin, and a
+	// set of tyres that has not gone off yet.
+	holding: Token
+	hurt: Float
+	spun: Float
+	fresh: Float
+	// Whether it was over the line last frame, so that one long excursion is one
+	// warning rather than sixty.
+	adrift: Bool
+	sheet: Sheet
+}
+
+// The car a seat starts the race in, on its slot on the grid.
+func parked(track: circuit.Circuit, seat: Int): Car {
+	spot := gridSpot(track, seat)
+	node := circuit.nodeAlong(track, spot.along)
+	return Car(
+		seat,
+		circuit.placeX(track, spot.along, spot.across),
+		circuit.placeZ(track, spot.along, spot.across),
+		node.dir,
+		0.0,
+		0.0,
+		circuit.indexAlong(track, spot.along),
+		spot.along,
+		spot.across,
+		0.0, 0.0, 0.0, 1.0, 0.0,
+		Token.Nothing(),
+		0.0, 0.0, 0.0,
+		false,
+		freshSheet()
+	)
+}
+
+// Where a seat lines up. Two columns, staggered, the way a grid is: the car on the
+// far side of the road is half a box further back, so that nobody is exactly
+// alongside anybody and the first corner is survivable.
+func gridSpot(track: circuit.Circuit, seat: Int): circuit.Where {
+	row := seat / 2
+	side := seat % 2
+	back := 14.0 + conv.itf(row) * 9.5 + conv.itf(side) * 4.5
+	mut Float across = -3.1
+	if side == 1 {
+		across = 3.1
+	}
+	return circuit.Where(0, circuit.wrappedAlong(track, -back), across)
+}
+
+// ---------------------------------------------------------------------------
+// The numbers a car is made of
+// ---------------------------------------------------------------------------
+
+// The reference car, before a team's `machine` is applied to it. Every one of
+// these is a `func` rather than a literal in the middle of the physics, so that
+// the tuning of the game is one screenful you can read top to bottom.
+
+// The top speed, in metres a second. Two hundred and sixty an hour.
+func top(): Float {
+	return 72.0
+}
+
+// How hard it pulls away from nothing. The drive falls off toward the top speed
+// rather than being cut at it, which is what makes the last twenty an hour take
+// as long as the first hundred.
+func power(): Float {
+	return 22.0
+}
+
+func brakes(): Float {
+	return 26.0
+}
+
+// How much sideways it will hold, in metres a second a second. This is what a
+// corner is: everything else about cornering follows from it and from how much
+// grip is under the wheels.
+func lateral(): Float {
+	return 16.0
+}
+
+// The most the wheel can turn the car at all, whatever the grip. It is what stops
+// a car standing still from spinning on the spot.
+func agility(): Float {
+	return 2.8
+}
+
+// What full lock asks the car to do, as a multiple of what the tyres will hold.
+//
+// **This is the whole of why a fast car feels alive.** A wheel commands an
+// *angle*, and the rate of turn an angle produces grows with speed — so at two
+// hundred an hour a small movement asks for far more than the tyres can give and
+// the car washes wide, while the same movement at forty does almost nothing. A
+// model that instead handed you exactly the limit at full lock whatever the speed
+// is easy to write, easy to drive, and completely dead: you can never ask for too
+// much, so there is nothing to get right.
+//
+// One at a crawl, where the car simply does what it is told, rising past three at
+// the top end — where two thirds of the travel is understeer and the quick way
+// round is a small, early input.
+func demand(speed: Float): Float {
+	return 1.0 + speed / 34.0
+}
+
+// And what the tyres will actually hold: the friction circle, or the rack at a
+// crawl, where grip is not what runs out first.
+func holdable(speed: Float, grip: Float): Float {
+	return math.min(agility(), lateral() * grip / math.max(3.0, speed))
+}
+
+// The input that asks for a given rate of turn, positive to the right. The exact
+// inverse of what `steered` does with one — written here rather than in
+// `pace.hive` so that a bot working out what to ask for and a car working out
+// what it was asked cannot come to disagree about what the wheel means.
+//
+// (Not `wheelFor` — that one is how long a loose wheel rolls for.)
+func lockFor(turn: Float, speed: Float, grip: Float): Float {
+	most := holdable(speed, grip) * demand(speed)
+	if most <= 0.0 {
+		return 0.0
+	}
+	return math.clamp(turn / most, -1.0, 1.0)
+}
+
+// How far past what the tyres hold the wheel is asking, as a fraction of the
+// limit. Nought is a car doing what it was told.
+func pushing(car: Car, want: Wants, grip: Float): Float {
+	limit := holdable(car.speed, grip * cornering(car))
+	if limit <= 0.0 {
+		return 0.0
+	}
+	asked := math.abs(want.steer) * limit * demand(car.speed)
+	return math.clamp((asked - limit) / limit, 0.0, 1.5)
+}
+
+// What asking for it costs, as a fraction of speed lost each second at full
+// understeer. Without it, going past the limit is free — and a car you cannot
+// overdrive is the dead car above by another route.
+func pushCost(): Float {
+	return 0.30
+}
+
+// Drifting. The extra rotation while the button is down, how far the car ends up
+// travelling off its nose, and how slowly that comes back once it is let go.
+func driftYaw(): Float {
+	return 0.85
+}
+
+func driftSlide(): Float {
+	return 0.40
+}
+
+func driftGrip(): Float {
+	// A drift is faster than the grip says it should be — which is untrue of a real
+	// car and is the whole reason a kart game has drifting in it.
+	return 1.12
+}
+
+// The three levels of deployment: how long you have to hold the drift for each,
+// how long the boost lasts, and how hard it pushes.
+func harvestFor(level: Int): Float {
+	if level <= 1 { return 0.80 }
+	if level == 2 { return 1.70 }
+	return 2.70
+}
+
+func deployFor(level: Int): Float {
+	if level <= 1 { return 0.85 }
+	if level == 2 { return 1.45 }
+	return 2.20
+}
+
+func pushFor(level: Int): Float {
+	if level <= 1 { return 1.10 }
+	if level == 2 { return 1.19 }
+	return 1.30
+}
+
+// What level a given amount of harvest is worth. Nought is not enough to be worth
+// anything, which is what stops a flick of the button being free speed.
+func levelOf(harvest: Float): Int {
+	if harvest >= harvestFor(3) { return 3 }
+	if harvest >= harvestFor(2) { return 2 }
+	if harvest >= harvestFor(1) { return 1 }
+	return 0
+}
+
+// The most that can be banked. Without a cap, the fast way round any circuit is
+// one enormous drift down the main straight.
+func harvestCap(): Float {
+	return 3.2
+}
+
+// The wing. Open, it is worth this much top speed — and it only opens where the
+// road is straight enough, and shuts the moment it is not.
+func wingPush(): Float {
+	return 1.16
+}
+
+func wingStraight(): Float {
+	return 0.0035
+}
+
+// A new set of tyres: how long they last and what they are worth.
+func softsFor(): Float {
+	return 8.0
+}
+
+func softsGrip(): Float {
+	return 1.20
+}
+
+// A puncture, and a spin.
+func punctureFor(): Float {
+	return 2.6
+}
+
+func punctureGrip(): Float {
+	return 0.5
+}
+
+func spinFor(): Float {
+	return 1.5
+}
+
+// How wide and how long a car is, for the purposes of bumping into another one.
+func girth(): Float {
+	return 1.05
+}
+
+func nose(): Float {
+	return 2.4
+}
+
+// How many warnings before the five seconds, and how many seconds it is.
+func allowed(): Int {
+	return 3
+}
+
+func added(): Float {
+	return 5.0
+}
+
+// ---------------------------------------------------------------------------
+// One car, one frame
+// ---------------------------------------------------------------------------
+
+// Everything that happens to a car in `dt` seconds.
+//
+// `cap` is race control's: a speed nobody may exceed, which is how a yellow flag
+// and a safety car are enforced. `machine` is the team's car. Neither of them is
+// allowed to know whether there is a person at the wheel.
+func stepped(
+	track: circuit.Circuit,
+	car: Car,
+	want: Wants,
+	machine: Float,
+	cap: Float,
+	dt: Float
+): Car {
+	mut Car it = car
+	if it.sheet.finished {
+		// Past the flag: the car rolls to a stop rather than vanishing, because a
+		// car that disappears at the line reads as a crash.
+		it.speed = math.max(0.0, it.speed - 12.0 * dt)
+		return travelled(track, moved(it, dt), dt)
+	}
+
+	where := circuit.Where(it.node, it.along, it.across)
+	ground := circuit.under(track, where)
+	// The grip under this car right now: the road, the tyres, and whatever is wrong
+	// with it. Everything about cornering, braking and getting off the line is
+	// scaled by this one number and nothing else.
+	grip := circuit.hold(ground) * machine * tyres(it)
+
+	it = timers(it, dt)
+	it = spending(track, it, want, dt)
+
+	if it.spun > 0.0 {
+		// No control at all: the car keeps its momentum, turns itself round, and
+		// scrubs off speed a great deal faster than the brakes would.
+		it.yaw = it.yaw + 7.0 * dt
+		it.speed = math.max(0.0, it.speed - 26.0 * dt)
+		it.drift = 0.0
+		it.harvest = 0.0
+		return travelled(track, located(track, moved(it, dt)), dt)
+	}
+
+	it = drifting(it, want, dt)
+	it = steered(it, want, grip, dt)
+	it = driven(track, it, want, ground, grip, machine, cap, dt)
+	it = located(track, moved(it, dt))
+	it = limits(track, it)
+	return travelled(track, it, dt)
+}
+
+// Everything with a clock on it, wound down by one frame.
+func timers(car: Car, dt: Float): Car {
+	mut Car it = car
+	it.deploy = math.max(0.0, it.deploy - dt)
+	it.hurt = math.max(0.0, it.hurt - dt)
+	it.spun = math.max(0.0, it.spun - dt)
+	it.fresh = math.max(0.0, it.fresh - dt)
+	if it.deploy <= 0.0 {
+		it.push = 1.0
+	}
+	return it
+}
+
+// What the tyres are worth: a new set is worth more, a punctured one a great deal
+// less, and the two cannot both be true because new tyres cannot be punctured.
+func tyres(car: Car): Float {
+	if car.hurt > 0.0 {
+		return punctureGrip()
+	}
+	if car.fresh > 0.0 {
+		return softsGrip()
+	}
+	return 1.0
+}
+
+// The drift: whether one is on, which way, and what it has banked.
+//
+// A drift is committed to at the moment the button goes down and does not change
+// side while it is held. That matters: without it, a wobble of the wheel mid-corner
+// swaps the direction and the whole harvest is thrown away for nothing anybody
+// meant.
+func drifting(car: Car, want: Wants, dt: Float): Car {
+	mut Car it = car
+	holding := want.drifting && it.speed > 9.0
+	if holding == false {
+		if it.drift != 0.0 {
+			// Let go: whatever was banked comes out as a deployment, and nothing at all
+			// if it was not held long enough to be worth one.
+			level := levelOf(it.harvest)
+			if level > 0 {
+				it.deploy = math.max(it.deploy, deployFor(level))
+				it.push = math.max(it.push, pushFor(level))
+			}
+		}
+		it.drift = 0.0
+		it.harvest = 0.0
+		return it
+	}
+	if it.drift == 0.0 {
+		if want.steer > 0.2 {
+			it.drift = 1.0
+		} else if want.steer < -0.2 {
+			it.drift = -1.0
+		}
+		return it
+	}
+	// Harvesting, and only while the wheel is still turned the way the drift is
+	// going. Straightening up mid-drift stops the charge without cancelling it,
+	// which is what makes a long corner worth more than a flick.
+	if want.steer * it.drift > 0.15 {
+		it.harvest = math.min(harvestCap(), it.harvest + dt)
+	}
+	return it
+}
+
+// Which way the nose ends up pointing, and how far off it the car is going.
+//
+// **Yaw grows to the left.** Facing along a yaw means travelling by
+// (-sin yaw, -cos yaw), so turning right is the yaw going down — which is why
+// every steering term below is subtracted. It is one convention for the whole
+// program, shared with the road's own direction, and the cost of it being this way
+// round is exactly this paragraph.
+func steered(car: Car, want: Wants, grip: Float, dt: Float): Car {
+	mut Car it = car
+	// What the tyres will hold, and — separately — what the wheel is asking for.
+	// The two are not the same number and the gap between them is understeer: past
+	// the limit the car turns at the limit and scrubs the difference away, which
+	// `driven` charges for.
+	limit := holdable(it.speed, grip * cornering(it))
+	asked := -want.steer * limit * demand(it.speed)
+	mut Float turn = math.clamp(asked, -limit, limit)
+	mut Float slideWant = 0.0
+	if it.drift != 0.0 {
+		// A drift turns the car faster than the grip alone would, and points it
+		// further into the corner than it is actually going.
+		turn = turn - it.drift * driftYaw() * math.min(1.0, it.speed / 20.0)
+		slideWant = it.drift * driftSlide()
+	}
+	// A puncture pulls. Which way is decided by the seat rather than rolled, so
+	// that it is the same pull every time for a given car and can be learned.
+	if it.hurt > 0.0 {
+		mut Float pull = 0.55
+		if it.seat % 2 == 1 {
+			pull = -0.55
+		}
+		turn = turn + pull * math.min(1.0, it.speed / 25.0)
+	}
+	it.yaw = it.yaw + turn * dt
+	// The slide comes on quickly and goes off slowly, which is what a car recovering
+	// from a drift does and is most of why a drift feels like anything.
+	mut Float rate = 3.4
+	if math.abs(slideWant) < math.abs(it.slide) {
+		rate = 2.1
+	}
+	it.slide = it.slide + (slideWant - it.slide) * math.min(1.0, rate * dt)
+	return it
+}
+
+// How fast it ends up going.
+func driven(
+	track: circuit.Circuit,
+	car: Car,
+	want: Wants,
+	ground: circuit.Ground,
+	grip: Float,
+	machine: Float,
+	cap: Float,
+	dt: Float
+): Car {
+	mut Car it = car
+	it = winged(track, it, dt)
+	ceiling := top() * machine * it.push * wingOf(it)
+	// The drive: full at rest, nothing at the ceiling. A wheel with no grip under
+	// it puts nothing down, which is why leaving the road costs speed even with the
+	// throttle buried.
+	pull := power() * machine * math.min(1.0, grip * 1.3)
+		* math.max(0.0, 1.0 - it.speed / math.max(1.0, ceiling))
+	stop := brakes() * grip * want.brake
+	// What the ground takes off you regardless. Gravel is most of a car's speed a
+	// second, which is what makes a trap a trap.
+	mut Float scrub = circuit.drag(ground) * it.speed
+	// And what a drift costs, which is real: a car going sideways is a car pushing
+	// air. It is less than the grip you get back, or nobody would ever drift.
+	if it.drift != 0.0 {
+		scrub = scrub + math.abs(it.slide) * it.speed * 0.16
+	}
+	// And what asking for more cornering than there is costs, which is the front
+	// tyres scrubbing across the road instead of gripping it. This is what makes
+	// turning in too hard at speed slower than turning in gently, rather than
+	// merely no faster.
+	scrub = scrub + pushing(it, want, grip) * pushCost() * it.speed
+	it.speed = it.speed + (pull * want.throttle - stop - scrub) * dt
+	// Reverse, but only barely: enough to get off a wall, not enough to be a way of
+	// getting anywhere.
+	if want.throttle <= 0.0 && want.brake > 0.0 && it.speed < 0.6 {
+		it.speed = math.max(-7.0, it.speed - 9.0 * dt)
+	}
+	it.speed = math.min(it.speed, ceiling)
+	// Race control's ceiling, which is the whole of how a yellow flag and a safety
+	// car are enforced. Nothing else in the program has to know they exist.
+	if cap > 0.0 && it.speed > cap {
+		it.speed = math.max(cap, it.speed - 34.0 * dt)
+	}
+	if it.speed < -7.0 {
+		it.speed = -7.0
+	}
+	return it
+}
+
+// A drift holds more grip than the tyres should, which is the one place this
+// program is deliberately not a simulator.
+func cornering(car: Car): Float {
+	if car.drift != 0.0 {
+		return driftGrip()
+	}
+	return 1.0
+}
+
+// The wing. It only opens where the road is straight — the real rule, and the one
+// that turns it from a button into a decision about where to spend it — and it
+// shuts itself the moment the road bends.
+func winged(track: circuit.Circuit, car: Car, dt: Float): Car {
+	mut Car it = car
+	if it.wing <= 0.0 {
+		return it
+	}
+	node := circuit.nodeAt(track, it.node)
+	if math.abs(node.bend) > wingStraight() {
+		it.wing = 0.0
+		return it
+	}
+	it.wing = math.max(0.0, it.wing - dt)
+	return it
+}
+
+func wingOf(car: Car): Float {
+	if car.wing > 0.0 {
+		return wingPush()
+	}
+	return 1.0
+}
+
+// Where the car ends up. The velocity is off the nose by the slide, which is the
+// one line that makes a drift travel the way a drift travels.
+func moved(car: Car, dt: Float): Car {
+	mut Car it = car
+	going := it.yaw + it.slide
+	it.x = it.x - math.sin(going) * it.speed * dt
+	it.z = it.z - math.cos(going) * it.speed * dt
+	return it
+}
+
+// Where that is, on the road. The node it was near last frame is the hint, which
+// is what keeps this cheap enough to do for ten cars sixty times a second.
+func located(track: circuit.Circuit, car: Car): Car {
+	mut Car it = car
+	where := circuit.locate(track, it.x, it.z, it.node)
+	it.node = where.node
+	it.along = where.along
+	it.across = where.across
+	return it
+}
+
+// How far round it has got, and whether that was a lap. Distance is tracked as a
+// total rather than read off `along`, because the order is decided on it and a car
+// that has just crossed the line has an `along` of nearly nothing.
+func travelled(track: circuit.Circuit, car: Car, dt: Float): Car {
+	mut Car it = car
+	it.sheet.travelled = it.sheet.travelled + math.max(0.0, it.speed) * dt
+	return it
+}
+
+// Track limits, asked exactly the way the rule is written. One excursion is one
+// warning however long it lasts, which is what `adrift` is for; three of them is
+// five seconds, and the count starts again.
+func limits(track: circuit.Circuit, car: Car): Car {
+	mut Car it = car
+	over := circuit.exceeded(track, circuit.Where(it.node, it.along, it.across))
+	if over && it.adrift == false {
+		it.sheet.warnings = it.sheet.warnings + 1
+		if it.sheet.warnings >= allowed() {
+			it.sheet.warnings = 0
+			it.sheet.penalty = it.sheet.penalty + added()
+		}
+	}
+	it.adrift = over
+	return it
+}
+
+// ---------------------------------------------------------------------------
+// Spending a token
+// ---------------------------------------------------------------------------
+
+// The two tokens a car can use on itself. The three that put something on the
+// track or call out the safety car are the race's business rather than the car's,
+// so `control.hive` reads what was spent and does the rest — this only says the
+// car no longer has it.
+func spending(track: circuit.Circuit, car: Car, want: Wants, dt: Float): Car {
+	mut Car it = car
+	if want.spending == false || it.holding is Token.Nothing {
+		return it
+	}
+	if it.holding is Token.Wing {
+		// It can be pressed anywhere; it only *does* anything where the road is
+		// straight, and `winged` shuts it again at the next corner.
+		node := circuit.nodeAt(track, it.node)
+		if math.abs(node.bend) <= wingStraight() {
+			it.wing = 4.0
+		}
+		it.holding = Token.Nothing()
+		return it
+	}
+	if it.holding is Token.Softs {
+		it.fresh = softsFor()
+		it.hurt = 0.0
+		it.holding = Token.Nothing()
+		return it
+	}
+	return it
+}
+
+// What a car ran over. Both are the same shape of thing — something that costs
+// you the moment you touch it — and neither is the car's own doing.
+func punctured(car: Car): Car {
+	mut Car it = car
+	// New tyres are new: nothing on the road gets through them, which is most of
+	// what makes them worth holding on to.
+	if it.fresh > 0.0 {
+		return it
+	}
+	it.hurt = punctureFor()
+	it.speed = it.speed * 0.62
+	it.drift = 0.0
+	it.harvest = 0.0
+	return it
+}
+
+func spinning(car: Car): Car {
+	mut Car it = car
+	// A car already spinning cannot be spun harder. Without this, a car that has
+	// lost it in front of the pack is hit, hit again by the next one and again by
+	// the one after, and never gets its wheels back — which is a car parked in the
+	// middle of the road holding its sector yellow for the rest of the race.
+	if it.spun > 0.0 {
+		return it
+	}
+	it.spun = spinFor()
+	it.speed = it.speed * 0.35
+	it.drift = 0.0
+	it.harvest = 0.0
+	it.wing = 0.0
+	return it
+}
+
+// ---------------------------------------------------------------------------
+// What is lying about on the road
+// ---------------------------------------------------------------------------
+
+// A piece of somebody's bodywork, where they left it. It is in the road's terms
+// rather than the world's for the same reason a car's position is compared that
+// way: "on the racing line at the exit of turn four" is a place, and two numbers
+// that say so are worth more than two that say where that is.
+type Shard {
+	along: Float
+	across: Float
+	// Nothing clears the track under green, so a shard lasts until the flag — but
+	// it has a life anyway, because a lap of a race that has gone on long enough is
+	// a minefield and that is not fun for anybody.
+	life: Float
+	by: Int
+}
+
+// A wheel, rolling down the racing line at whoever is in front. It does not steer
+// and it does not chase: it runs the line, and if somebody is on the line when it
+// gets there, that is their problem. Which is also why it can be dodged.
+type Runaway {
+	along: Float
+	across: Float
+	speed: Float
+	life: Float
+	by: Int
+}
+
+// A crate of parts on the road. Taken, it comes back a few seconds later in the
+// same place — so a crate is a *place on the circuit* rather than something you
+// use up, and the third row on the outside of turn one is worth learning.
+type Crate {
+	along: Float
+	across: Float
+	// The clock reading it comes back at. Nought means it is there now.
+	back: Float
+}
+
+// How long a shard and a wheel last, and how fast a wheel travels.
+func shardFor(): Float {
+	return 15.0
+}
+
+func wheelFor(): Float {
+	return 6.5
+}
+
+func wheelSpeed(): Float {
+	return 46.0
+}
+
+// Where the crates are. Rows of three across the road, evenly round the lap and
+// nudged off the start line so that nobody collects one before the lights.
+//
+// Three across is the shape that makes it a decision: the middle one is on the
+// line and free, and the outer two cost you a metre or two of the corner after.
+func crates(track: circuit.Circuit): Crate[dyn] {
+	rows := 7
+	mut Crate[dyn] out = []
+	for row := 0; row < rows; row++ {
+		along := circuit.wrappedAlong(track,
+			track.length * conv.itf(row) / conv.itf(rows) + track.length * 0.11)
+		for lane := -1; lane <= 1; lane++ {
+			append(out, Crate(along, conv.itf(lane) * 3.4, 0.0))
+		}
+	}
+	return out
+}
+
+// Whether a car is on top of something lying on the road.
+func over(track: circuit.Circuit, car: Car, along: Float, across: Float, room: Float): Bool {
+	return math.abs(circuit.nearGap(track, along, car.along)) < room
+		&& math.abs(across - car.across) < room
+}
+
+// ---------------------------------------------------------------------------
+// Two cars in the same place
+// ---------------------------------------------------------------------------
+
+// Whether these two are touching. Asked in the road's terms rather than the
+// world's, and that is not a shortcut: two cars a metre apart across a straight
+// are racing, and the same two metres apart on opposite sides of a hairpin are
+// nowhere near each other. Comparing how far round the lap they are and how far
+// across the road gets that right; comparing x and z does not.
+func touching(track: circuit.Circuit, one: Car, other: Car): Bool {
+	return math.abs(circuit.nearGap(track, one.along, other.along)) < nose()
+		&& math.abs(one.across - other.across) < girth() * 2.0
+}
+
+// What contact does to the car that was behind. It loses more than the car in
+// front does — a nose into a diffuser costs the nose — and if it arrived fast
+// enough it loses the back end as well.
+func rammed(car: Car, closing: Float, side: Float): Car {
+	mut Car it = car
+	it.speed = it.speed * 0.86
+	it.across = it.across + side * 0.55
+	if closing > 11.0 {
+		return spinning(it)
+	}
+	it.slide = it.slide + side * 0.06
+	return it
+}
+
+// And to the car that was in front, which is knocked along and sideways and keeps
+// most of what it had.
+func shoved(car: Car, closing: Float, side: Float): Car {
+	mut Car it = car
+	it.speed = it.speed * 0.95
+	it.across = it.across + side * 0.55
+	if closing > 15.0 {
+		return spinning(it)
+	}
+	return it
+}

@@ -17,6 +17,7 @@
 import ./ast
 import ./diag
 import ./infer
+import ./text
 import ./types
 
 // What the pass knows right here.
@@ -470,9 +471,23 @@ proc lose(bo: mut Proofs, name: Str): void {
 	bo.proved = kept
 }
 
+// Whether a proof was about `name`, or about something reached through it.
+//
+// A proof is keyed by the whole path it was about — `b.loose|2` — and losing `b`
+// has to lose that one too, because what a guard proved about the field it proved
+// about the value the field was in. Comparing the key's first piece with the name
+// outright only ever matched a bare identifier, so a guard on a field outlived the
+// record that was guarded and
+// [10.4](../spec/10-bounds.md#104-an-inferred-length-is-weaker)'s own example —
+// replace the field inside the guard, then index it — compiled.
 func startsWithName(entry: Str, name: Str): Bool {
-	pieces := split(entry, "|")
-	return nameAt(pieces, 0) == name
+	path := nameAt(split(entry, "|"), 0)
+	if path == name {
+		return true
+	}
+	// `name.` and `name[` rather than `name`, so that losing `b` does not also lose
+	// everything proved about `bat`.
+	return text.startsWith(path, name + ".") || text.startsWith(path, name + "[")
 }
 
 // Everything any branch of a statement rebound. An inferred length dies even in
@@ -655,14 +670,30 @@ func provable(bo: Proofs, env: infer.Env, subject: ast.Expr, index: ast.Expr): B
 }
 
 // The length of a vector, when the compiler knows it. A declared length is a
-// promise and is never lost; an inferred one dies the moment the name is
-// rebound, which `lost` is what records.
+// promise and is never lost; an inferred one dies the moment the name it was read
+// off is rebound, which is what `lost` records.
 func knownLength(bo: Proofs, env: infer.Env, subject: ast.Expr): Result<Int, Bool> {
-	name := rootOf(subject)
-	if name != "" && indexOf(bo.lost, name) is Result.Ok(_) {
-		return Result.Error(false)
-	}
 	if types.dimOf(infer.typeOf(env, subject)) is ast.Dim.Fixed(n) {
+		// **A field's length is a promise even when the record holding it is not.**
+		// It is written down in the type's own declaration, and the checker holds
+		// every value that reaches that field to it — including at construction
+		// ([10.3](../spec/10-bounds.md#103-a-declared-length-is-a-promise)) — so
+		// there is no way to put a `Float[2]` in a `Float[3]` field and nothing
+		// rebinding the record can do about how many it holds.
+		//
+		// Asking `lost` about the *root* name would say otherwise, because the root
+		// of `b.three` is `b`, and `b` is an ordinary record whose own proofs go
+		// when it is assigned to. That is right for what a guard proved about a
+		// `[dyn]` field and wrong for what the declaration says about a fixed one:
+		// 10.4's "that proof died with the old value" is about an inferred length,
+		// and a field never has one — a field's type is written, never observed.
+		if subject is ast.Expr.Member(_, _) {
+			return Result.Ok(n)
+		}
+		name := rootOf(subject)
+		if name != "" && indexOf(bo.lost, name) is Result.Ok(_) {
+			return Result.Error(false)
+		}
 		return Result.Ok(n)
 	}
 	return Result.Error(false)
@@ -684,7 +715,15 @@ func refusal(bo: Proofs, env: infer.Env, subject: ast.Expr, index: ast.Expr): St
 	return "cannot prove this index is in range: it is a computed expression, and there is nothing to hang a guard on. Bind it to a name first, then guard that"
 }
 
+// What to call the vector in a message. The whole path where there is one, so
+// that a refusal about `b.three` says `b.three` rather than `b` — naming the
+// record when the field is what could not be proved sends the reader to the wrong
+// declaration.
 func describe(e: ast.Expr): Str {
+	written := pathKey(e)
+	if written != "" {
+		return written
+	}
 	name := rootOf(e)
 	if name == "" {
 		return "this vector"

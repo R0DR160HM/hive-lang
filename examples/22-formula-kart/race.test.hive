@@ -1,0 +1,862 @@
+// The race, with no window in it
+// ==============================
+// A grand prix is a picture, a keyboard and a browser, and none of those is here.
+// What is here is everything else — the track, the line round it, the physics, the
+// bots, the flags and the clock — because all of it is a `func` of a value and none
+// of it ever knew there was a screen.
+//
+//   hive test race.test.hive
+//
+// The suite is in the order the program is: the circuit first, because everything
+// stands on it; then a car on its own; then a bot; then the two rules about
+// teammates, which are the ones worth being sure of; then a whole race.
+//
+// **Two of these tests exist because of bugs that got as far as the picture.** The
+// one about a token being spent once and the one about the flag actually falling
+// are both cases where a function wrote to a field that the caller then overwrote,
+// and both were silent: the race simply never ended, and a bot laid a carpet of
+// debris down the racing line at sixty pieces a second. They are here so that they
+// stay fixed.
+
+import ./lib/circuit
+import ./lib/control
+import ./lib/drive
+import ./lib/grid
+import ./lib/pace
+import hive.math
+import hive.conv
+
+// ---------------------------------------------------------------------------
+// Standing a car somewhere on purpose
+// ---------------------------------------------------------------------------
+
+// A car put exactly where the test wants it, pointing along the road. Everything
+// below that is about two cars near each other needs this, and doing it by driving
+// one there would be a test of the driving rather than of the thing being tested.
+func put(
+	track: circuit.Circuit,
+	seat: Int,
+	along: Float,
+	across: Float,
+	speed: Float
+): drive.Car {
+	mut drive.Car car = drive.parked(track, seat)
+	car.along = circuit.wrappedAlong(track, along)
+	car.across = across
+	car.x = circuit.placeX(track, car.along, across)
+	car.z = circuit.placeZ(track, car.along, across)
+	car.node = circuit.indexAlong(track, car.along)
+	car.yaw = circuit.nodeAlong(track, car.along).dir
+	car.speed = speed
+	return car
+}
+
+// A car driven by the bot for a while, on an empty track.
+func lapped(track: circuit.Circuit, seat: Int, seconds: Float): drive.Car {
+	mut drive.Car car = drive.parked(track, seat)
+	steps := conv.round(seconds * 60.0)
+	for frame := 0; frame < steps; frame++ {
+		want := pace.driving(track, [car], [], [], seat, 0.0, true,
+			conv.itf(frame) / 60.0)
+		car = drive.stepped(track, car, want, grid.teamOf(seat).machine, 0.0,
+			1.0 / 60.0)
+	}
+	return car
+}
+
+// ---------------------------------------------------------------------------
+// The circuit
+// ---------------------------------------------------------------------------
+
+test "the same seed rolls the same circuit" {
+	one := circuit.build(4821)
+	two := circuit.build(4821)
+	assert one.name == two.name
+	assert one.length == two.length
+	assert one.nodes == two.nodes
+}
+
+test "different seeds roll different circuits" {
+	assert circuit.build(1).length != circuit.build(2).length
+}
+
+test "a lap is a lap of somewhere you could drive" {
+	for each seed in [1, 77, 4821, 90210] {
+		track := circuit.build(seed)
+		assert len(track.nodes) == circuit.nodes()
+		assert track.length > 900.0
+		assert track.length < 2200.0
+	}
+}
+
+// The one property everything downstream leans on: `nodeAlong` finds a node by
+// dividing, which is only true if the nodes really are evenly spaced.
+test "every node is the same distance from the next" {
+	track := circuit.build(4821)
+	want := circuit.spacing(track)
+	for i := 0; i < len(track.nodes); i++ {
+		here := circuit.nodeAt(track, i)
+		on := circuit.nodeAt(track, i + 1)
+		assert math.abs(math.hypot(on.x - here.x, on.z - here.z) - want) < 0.05
+	}
+}
+
+test "the track does not cross itself" {
+	for each seed in [1, 77, 4821, 90210] {
+		track := circuit.build(seed)
+		count := len(track.nodes)
+		for i := 0; i < count; i++ {
+			here := circuit.nodeAt(track, i)
+			// Anything more than a few nodes away has to stay more than a road's width
+			// off, or the two stretches of it are the same piece of ground.
+			for step := 8; step < count / 2; step++ {
+				there := circuit.nodeAt(track, i + step)
+				assert math.hypot(there.x - here.x, there.z - here.z) > here.half * 2.4
+			}
+		}
+	}
+}
+
+test "no corner is tighter than a car can get round" {
+	for each seed in [1, 77, 4821, 90210] {
+		for each node in circuit.build(seed).nodes {
+			if math.abs(node.bend) > 0.0001 {
+				assert 1.0 / math.abs(node.bend) > 10.0
+			}
+		}
+	}
+}
+
+test "the road's terms and the world's are the same place" {
+	track := circuit.build(4821)
+	for step := 0; step < 60; step++ {
+		along := track.length * conv.itf(step) / 60.0
+		for each across in [-5.0, 0.0, 5.0] {
+			x := circuit.placeX(track, along, across)
+			z := circuit.placeZ(track, along, across)
+			back := circuit.locate(track, x, z, -1)
+			// Across has to be right to the centimetre, because it is what track
+			// limits are decided on. Along is allowed a node either way: the nearest
+			// point on the centreline to somewhere on the inside of a hairpin really
+			// is a little further round than the cross-section it was built from.
+			assert math.abs(back.across - across) < 0.4
+			assert math.abs(circuit.nearGap(track, back.along, along))
+				< circuit.spacing(track) * 1.1
+		}
+	}
+}
+
+test "the fast way round stays on the road" {
+	for each seed in [1, 4821] {
+		for each node in circuit.build(seed).nodes {
+			assert math.abs(node.line) <= node.half - 1.8
+		}
+	}
+}
+
+// The racing line is not the middle of the road. If it were, the relaxation in
+// `fastest` would have done nothing and nobody would notice.
+test "the fast way round uses the width of the road" {
+	mut Float widest = 0.0
+	for each node in circuit.build(4821).nodes {
+		widest = math.max(widest, math.abs(node.line))
+	}
+	assert widest > 4.0
+}
+
+// The whole point of the backward pass in `pacing`.
+test "the pace at a node lets you slow down for the one after it" {
+	track := circuit.build(4821)
+	for i := 0; i < len(track.nodes); i++ {
+		here := circuit.nodeAt(track, i)
+		on := circuit.nodeAt(track, i + 1)
+		// The distance along the *racing line*, which is what the profile was worked
+		// out over and is not the spacing of the nodes: the line cuts the inside of a
+		// corner and runs long round the outside of one.
+		hereAt := circuit.across(circuit.Spot(here.x, here.z), here.dir, here.line)
+		onAt := circuit.across(circuit.Spot(on.x, on.z), on.dir, on.line)
+		run := math.hypot(onAt.x - hereAt.x, onAt.z - hereAt.z)
+		reachable := math.sqrt(on.pace * on.pace + 2.0 * circuit.braking() * run)
+		assert here.pace <= reachable + 0.01
+	}
+}
+
+test "a corner is slower than a straight" {
+	track := circuit.build(4821)
+	// The tightest corner against the quickest point anywhere, rather than corners
+	// against straights. Two reasons: the *slowest* straight is a braking zone, so
+	// comparing with that would be asserting that braking does not happen; and
+	// whether a given circuit has a node straight enough to count is a fact about
+	// the seed, so a test written that way passes or fails on which one it was given.
+	mut Float quickest = 0.0
+	mut Float sharpest = 0.0
+	mut Float atTheApex = 0.0
+	for each node in track.nodes {
+		quickest = math.max(quickest, node.pace)
+		if math.abs(node.bend) > sharpest {
+			sharpest = math.abs(node.bend)
+			atTheApex = node.pace
+		}
+	}
+	// Somewhere on the lap is flat out, and the tightest corner is nothing like it.
+	assert quickest > 60.0
+	assert atTheApex < quickest * 0.6
+}
+
+test "what is under the wheels changes as you go off" {
+	track := circuit.build(4821)
+	half := circuit.nodeAt(track, 40).half
+	assert circuit.under(track, circuit.Where(40, 0.0, 0.0)) is circuit.Ground.Tarmac
+	assert circuit.under(track, circuit.Where(40, 0.0, half + 0.5))
+		is circuit.Ground.Kerb
+	assert circuit.hold(circuit.Ground.Tarmac()) > circuit.hold(circuit.Ground.Kerb())
+	assert circuit.hold(circuit.Ground.Grass()) > circuit.hold(circuit.Ground.Gravel())
+	assert circuit.drag(circuit.Ground.Tarmac()) == 0.0
+}
+
+test "the white line is still the track and a car's width past it is not" {
+	track := circuit.build(4821)
+	half := circuit.nodeAt(track, 40).half
+	assert circuit.exceeded(track, circuit.Where(40, 0.0, half)) == false
+	assert circuit.exceeded(track, circuit.Where(40, 0.0, half + 3.0))
+}
+
+test "a lap is three sectors and they are in order" {
+	track := circuit.build(4821)
+	assert circuit.sector(track, 0.0) == 1
+	assert circuit.sector(track, track.length * 0.5) == 2
+	assert circuit.sector(track, track.length * 0.9) == 3
+	assert circuit.sector(track, track.length - 0.001) == 3
+	assert circuit.sectorStart(track, 1) == 0.0
+}
+
+// ---------------------------------------------------------------------------
+// The grid
+// ---------------------------------------------------------------------------
+
+test "the field is counted rather than written down" {
+	assert grid.field() == len(grid.teams()) * 2
+	assert grid.field() == 10
+}
+
+test "a garage holds two cars and they are each other's partner" {
+	for seat := 0; seat < grid.field(); seat++ {
+		mate := grid.partner(seat)
+		assert mate != seat
+		assert grid.partner(mate) == seat
+		assert grid.garage(mate) == grid.garage(seat)
+		assert grid.teammates(seat, mate)
+	}
+}
+
+test "nobody is their own teammate and nobody is in two garages" {
+	assert grid.teammates(0, 0) == false
+	assert grid.teammates(0, 1)
+	assert grid.teammates(0, 2) == false
+	assert grid.teammates(8, 9)
+}
+
+test "every seat has a driver and a livery" {
+	for seat := 0; seat < grid.field(); seat++ {
+		assert len(grid.driverOf(seat).tag) == 3
+		assert grid.driverOf(seat).number > 0
+		assert len(grid.bodyOf(seat)) == 7
+		assert len(grid.helmetOf(seat)) == 7
+	}
+}
+
+test "no two drivers share a number" {
+	for one := 0; one < grid.field(); one++ {
+		for two := 0; two < grid.field(); two++ {
+			if one != two {
+				assert grid.driverOf(one).number != grid.driverOf(two).number
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// One car
+// ---------------------------------------------------------------------------
+
+test "the throttle makes it go and the brake makes it stop" {
+	track := circuit.build(4821)
+	mut drive.Car car = drive.parked(track, 0)
+	// Two seconds and no steering, which is short enough that the road has not gone
+	// anywhere the car has not. Three seconds of it puts the car on the grass, which
+	// is a fair test of the grass and a poor one of the throttle.
+	for frame := 0; frame < 120; frame++ {
+		car = drive.stepped(track, car, drive.Wants(0.0, 1.0, 0.0, false, false),
+			1.0, 0.0, 1.0 / 60.0)
+	}
+	assert car.speed > 25.0
+	rolling := car.speed
+	for frame := 0; frame < 40; frame++ {
+		car = drive.stepped(track, car, drive.Wants(0.0, 0.0, 1.0, false, false),
+			1.0, 0.0, 1.0 / 60.0)
+	}
+	assert car.speed < rolling - 10.0
+}
+
+test "grass is slower than tarmac" {
+	track := circuit.build(4821)
+	mut drive.Car onRoad = put(track, 0, 200.0, 0.0, 30.0)
+	mut drive.Car offRoad = put(track, 0, 200.0,
+		circuit.nodeAt(track, circuit.indexAlong(track, 200.0)).half + 4.0, 30.0)
+	for frame := 0; frame < 60; frame++ {
+		onRoad = drive.stepped(track, onRoad,
+			drive.Wants(0.0, 1.0, 0.0, false, false), 1.0, 0.0, 1.0 / 60.0)
+		offRoad = drive.stepped(track, offRoad,
+			drive.Wants(0.0, 1.0, 0.0, false, false), 1.0, 0.0, 1.0 / 60.0)
+	}
+	assert offRoad.speed < onRoad.speed
+}
+
+test "holding a drift harvests, and letting go deploys it" {
+	track := circuit.build(4821)
+	mut drive.Car car = put(track, 0, 300.0, 0.0, 35.0)
+	held := drive.Wants(1.0, 1.0, 0.0, true, false)
+	for frame := 0; frame < 120; frame++ {
+		car = drive.stepped(track, car, held, 1.0, 0.0, 1.0 / 60.0)
+	}
+	assert car.drift == 1.0
+	assert car.harvest > drive.harvestFor(1)
+	assert math.abs(car.slide) > 0.1
+	// And now let go.
+	after := drive.stepped(track, car, drive.Wants(1.0, 1.0, 0.0, false, false),
+		1.0, 0.0, 1.0 / 60.0)
+	assert after.drift == 0.0
+	assert after.harvest == 0.0
+	assert after.deploy > 0.0
+	assert after.push > 1.0
+}
+
+test "a flick of the drift button is worth nothing" {
+	track := circuit.build(4821)
+	mut drive.Car car = put(track, 0, 300.0, 0.0, 35.0)
+	for frame := 0; frame < 12; frame++ {
+		car = drive.stepped(track, car, drive.Wants(1.0, 1.0, 0.0, true, false),
+			1.0, 0.0, 1.0 / 60.0)
+	}
+	after := drive.stepped(track, car, drive.Wants(1.0, 1.0, 0.0, false, false),
+		1.0, 0.0, 1.0 / 60.0)
+	assert drive.levelOf(car.harvest) == 0
+	assert after.deploy == 0.0
+}
+
+// The claim the steering model is built on, and it is a claim about a *ratio*.
+// At a crawl a tenth of lock buys about a tenth of what the car can corner; at
+// two hundred an hour the same tenth buys a third of it. That is what makes a
+// fast car feel alive, and a model where full lock is always exactly the limit —
+// which this one had first — has none of it.
+test "the wheel is more use the faster you are going" {
+	assert drive.demand(70.0) > drive.demand(10.0) * 1.9
+	// Full lock always asks for more than the tyres hold, at every speed, so there
+	// is always something to get wrong.
+	for each v in [10.0, 25.0, 45.0, 70.0] {
+		limit := drive.holdable(v, 1.0)
+		assert limit * drive.demand(v) > limit
+		// And the same tenth of lock is a larger share of the limit the faster it is.
+		assert 0.1 * drive.demand(v) < 1.0
+	}
+	assert 0.1 * drive.demand(70.0) > 0.1 * drive.demand(10.0) * 1.9
+}
+
+test "asking for more cornering than there is costs speed" {
+	track := circuit.build(4821)
+	// Two identical cars on the same piece of road, one turning in gently and one
+	// on full lock. A third of a second is short enough that neither has had time
+	// to reach different ground, so the only difference between them is the wheel.
+	mut drive.Car gentle = put(track, 0, 200.0, 0.0, 60.0)
+	mut drive.Car heavy = put(track, 0, 200.0, 0.0, 60.0)
+	for frame := 0; frame < 20; frame++ {
+		gentle = drive.stepped(track, gentle,
+			drive.Wants(0.12, 1.0, 0.0, false, false), 1.0, 0.0, 1.0 / 60.0)
+		heavy = drive.stepped(track, heavy,
+			drive.Wants(1.0, 1.0, 0.0, false, false), 1.0, 0.0, 1.0 / 60.0)
+	}
+	assert drive.pushing(gentle, drive.Wants(0.12, 0.0, 0.0, false, false), 1.0) == 0.0
+	assert drive.pushing(heavy, drive.Wants(1.0, 0.0, 0.0, false, false), 1.0) > 0.5
+	assert heavy.speed < gentle.speed - 3.0
+}
+
+test "the wheel a bot asks for is the rate it wanted" {
+	// `lockFor` is the exact inverse of what the car does with an input, and the
+	// two being one function is what stops a bot and a car drifting apart.
+	for each v in [12.0, 30.0, 55.0] {
+		limit := drive.holdable(v, 1.0)
+		wanted := limit * 0.6
+		wheel := drive.lockFor(wanted, v, 1.0)
+		assert math.abs(wheel * limit * drive.demand(v) - wanted) < 0.001
+		// And a bot asking for six tenths of the limit is nowhere near full lock.
+		assert wheel < 0.6
+	}
+	// More than the tyres hold cannot be asked for: the wheel stops at the stop.
+	assert drive.lockFor(1000.0, 40.0, 1.0) == 1.0
+}
+
+test "one excursion is one warning, however long it lasts" {
+	track := circuit.build(4821)
+	half := circuit.nodeAt(track, circuit.indexAlong(track, 400.0)).half
+	mut drive.Car car = put(track, 0, 400.0, half + 5.0, 8.0)
+	for frame := 0; frame < 60; frame++ {
+		car = drive.stepped(track, car, drive.Wants(0.0, 0.2, 0.0, false, false),
+			1.0, 0.0, 1.0 / 60.0)
+	}
+	assert car.sheet.warnings == 1
+	assert car.adrift
+}
+
+test "three warnings is five seconds" {
+	track := circuit.build(4821)
+	half := circuit.nodeAt(track, circuit.indexAlong(track, 400.0)).half
+	// Three separate excursions, which is what three warnings means — a car that
+	// stays off gets one, and that is the test above. The sheet is carried from one
+	// to the next because it is the only thing that is supposed to survive them.
+	mut drive.Sheet sheet = drive.freshSheet()
+	for round := 0; round < 3; round++ {
+		mut drive.Car car = put(track, 0, 400.0, half + 6.0, 4.0)
+		car.sheet = sheet
+		car = drive.stepped(track, car, drive.idle(), 1.0, 0.0, 1.0 / 60.0)
+		sheet = car.sheet
+	}
+	assert sheet.penalty == drive.added()
+	assert sheet.warnings == 0
+}
+
+test "a puncture costs grip, and new tyres are immune to one" {
+	track := circuit.build(4821)
+	car := put(track, 0, 200.0, 0.0, 40.0)
+	hurt := drive.punctured(car)
+	assert hurt.hurt > 0.0
+	assert hurt.speed < car.speed
+	mut drive.Car fresh = car
+	fresh.fresh = drive.softsFor()
+	assert drive.punctured(fresh).hurt == 0.0
+}
+
+test "a car already spinning cannot be spun harder" {
+	track := circuit.build(4821)
+	spun := drive.spinning(put(track, 0, 200.0, 0.0, 40.0))
+	again := drive.spinning(spun)
+	assert again.spun == spun.spun
+	assert again.speed == spun.speed
+}
+
+test "the leader never draws the safety car and the back marker can" {
+	mut Bool leaderGotOne = false
+	mut Bool backGotOne = false
+	for salt := 0; salt < 400; salt++ {
+		if drive.rolled(0, 10, 4821, salt, true) is drive.Token.Safety {
+			leaderGotOne = true
+		}
+		if drive.rolled(9, 10, 4821, salt, true) is drive.Token.Safety {
+			backGotOne = true
+		}
+	}
+	assert leaderGotOne == false
+	assert backGotOne
+}
+
+test "nobody draws a safety car that cannot be called" {
+	for salt := 0; salt < 400; salt++ {
+		assert (drive.rolled(9, 10, 4821, salt, false) is drive.Token.Safety) == false
+	}
+}
+
+test "the crates are laid out across the road and off the start line" {
+	track := circuit.build(4821)
+	crates := drive.crates(track)
+	assert len(crates) == 21
+	for each crate in crates {
+		assert math.abs(crate.across) < circuit.nodeAt(track, 0).half
+		assert circuit.gap(track, crate.along, 0.0) > 20.0
+	}
+}
+
+test "the ground under a car follows the hill rather than stepping up it" {
+	track := circuit.build(4821)
+	mut Float worst = 0.0
+	for step := 0; step < 400; step++ {
+		along := track.length * conv.itf(step) / 400.0
+		here := circuit.heightAt(track, circuit.locate(track,
+			circuit.placeX(track, along, 0.0),
+			circuit.placeZ(track, along, 0.0), -1))
+		on := circuit.heightAt(track, circuit.locate(track,
+			circuit.placeX(track, along + 2.0, 0.0),
+			circuit.placeZ(track, along + 2.0, 0.0), -1))
+		worst = math.max(worst, math.abs(on - here))
+	}
+	// Two metres of road never climbs more than a few centimetres, which is what
+	// makes it a hill rather than a staircase.
+	assert worst < 0.3
+}
+
+test "a token says what it is and what it is worth" {
+	assert drive.tokenName(drive.Token.Nothing()) == "—"
+	assert drive.tokenName(drive.Token.Wing()) == "DRS"
+	assert drive.tokenWorth(drive.Token.Nothing()) == 0
+	assert drive.tokenWorth(drive.Token.Safety()) > drive.tokenWorth(drive.Token.Wing())
+	assert drive.tokenWorth(drive.Token.Wheel()) > drive.tokenWorth(drive.Token.Debris())
+}
+
+test "a timing screen has a number, three letters and two colours" {
+	assert grid.board(0) == "1  HAL"
+	assert grid.trimOf(0) == grid.teamOf(0).trim
+	assert grid.trimOf(0) != grid.bodyOf(0)
+}
+
+// ---------------------------------------------------------------------------
+// A bot
+// ---------------------------------------------------------------------------
+
+// A bot that never put a wheel wrong would be a bot on rails, which is the thing
+// this whole example is written not to be. So what is asserted is not that it
+// never goes off — it does, about one corner in twenty — but that it gets round,
+// spends nearly all of its time on the road, and **comes back from an excursion
+// rather than sitting in the gravel**. The last is the one that would actually
+// break, and it is the one a lap time cannot tell you about.
+test "a bot gets round, and comes back when it goes off" {
+	track := circuit.build(4821)
+	mut drive.Car car = drive.parked(track, 0)
+	mut Int off = 0
+	mut Int longest = 0
+	mut Int run = 0
+	for frame := 0; frame < 2400; frame++ {
+		want := pace.driving(track, [car], [], [], 0, 0.0, true,
+			conv.itf(frame) / 60.0)
+		car = drive.stepped(track, car, want, 1.0, 0.0, 1.0 / 60.0)
+		if circuit.exceeded(track, circuit.Where(car.node, car.along, car.across)) {
+			off = off + 1
+			run = run + 1
+			if run > longest {
+				longest = run
+			}
+		} else {
+			run = 0
+		}
+	}
+	// Forty seconds, which is more than a lap of anywhere this rolls.
+	assert car.sheet.travelled > track.length
+	// On the road nine tenths of the time, and never off it for more than a couple
+	// of seconds at a stretch. A bot stuck in a gravel trap would fail the second
+	// of those long before the first.
+	assert off < 240
+	assert longest < 150
+}
+
+test "a bot obeys a speed limit it is given" {
+	track := circuit.build(4821)
+	mut drive.Car car = put(track, 0, 100.0, 0.0, 60.0)
+	for frame := 0; frame < 240; frame++ {
+		want := pace.driving(track, [car], [], [], 0, 20.0, true,
+			conv.itf(frame) / 60.0)
+		car = drive.stepped(track, car, want, 1.0, 20.0, 1.0 / 60.0)
+	}
+	assert car.speed < 21.0
+}
+
+test "a better driver is a quicker driver" {
+	track := circuit.build(4821)
+	// Seat 0 is the best driver in the best car; seat 8 is neither.
+	assert lapped(track, 0, 40.0).sheet.travelled
+		> lapped(track, 8, 40.0).sheet.travelled
+}
+
+// ---------------------------------------------------------------------------
+// Teammates — the two rules
+// ---------------------------------------------------------------------------
+
+test "a bot will not fire a wheel at its own teammate" {
+	track := circuit.build(4821)
+	me := put(track, 0, 100.0, 0.0, 50.0)
+	mate := put(track, grid.partner(0), 160.0, 0.0, 50.0)
+	rival := put(track, 4, 160.0, 0.0, 50.0)
+	assert pace.worthFiring(track, [me, mate], me) == false
+	assert pace.worthFiring(track, [me, rival], me)
+}
+
+test "a bot will not drop debris in front of its own teammate" {
+	track := circuit.build(4821)
+	me := put(track, 0, 200.0, 0.0, 50.0)
+	mate := put(track, grid.partner(0), 190.0, 0.0, 50.0)
+	rival := put(track, 4, 190.0, 0.0, 50.0)
+	assert pace.worthDropping(track, [me, mate], me) == false
+	assert pace.worthDropping(track, [me, rival], me)
+}
+
+// The second rule, and the one that is a matter of degree rather than a refusal.
+// A rival coming down the inside gets the door shut; a teammate gets it left open.
+test "a bot covers a rival and yields to a teammate" {
+	track := circuit.build(4821)
+	me := put(track, 0, 300.0, 0.0, 50.0)
+	mate := put(track, grid.partner(0), 296.0, 2.5, 52.0)
+	rival := put(track, 4, 296.0, 2.5, 52.0)
+	againstRival := pace.defending(track, [me, rival], me, true)
+	againstMate := pace.defending(track, [me, mate], me, true)
+	// Toward the rival, to cover the side they are coming down.
+	assert againstRival > 0.0
+	// And away from the teammate, which is the same move in reverse.
+	assert againstMate < 0.0
+}
+
+test "a teammate on the other side is still given room on that side" {
+	track := circuit.build(4821)
+	me := put(track, 0, 300.0, 0.0, 50.0)
+	mate := put(track, grid.partner(0), 296.0, -2.5, 52.0)
+	assert pace.defending(track, [me, mate], me, true) > 0.0
+}
+
+test "nobody defends against a car that is dropping away" {
+	track := circuit.build(4821)
+	me := put(track, 0, 300.0, 0.0, 50.0)
+	slower := put(track, 4, 296.0, 2.5, 40.0)
+	assert pace.defending(track, [me, slower], me, true) == 0.0
+}
+
+test "nobody races behind the safety car" {
+	track := circuit.build(4821)
+	me := put(track, 0, 300.0, 0.0, 50.0)
+	rival := put(track, 4, 296.0, 2.5, 52.0)
+	ahead := put(track, 6, 306.0, 0.0, 48.0)
+	assert pace.defending(track, [me, rival], me, false) == 0.0
+	assert pace.passing(track, [me, ahead], me, false) == 0.0
+	assert pace.passing(track, [me, ahead], me, true) != 0.0
+}
+
+// ---------------------------------------------------------------------------
+// Race control
+// ---------------------------------------------------------------------------
+
+test "nobody moves before the lights go out" {
+	mut control.Race race = control.lined(4821, 0)
+	assert race.lights > 0.0
+	before := control.find(race.cars, 3).along
+	for frame := 0; frame < 60; frame++ {
+		race = control.stepped(race, drive.Wants(0.0, 1.0, 0.0, false, false),
+			1.0 / 60.0)
+	}
+	assert control.find(race.cars, 3).along == before
+	assert race.clock == 0.0
+}
+
+test "standing on the throttle before the lights costs five seconds, once" {
+	mut control.Race race = control.lined(4821, 0)
+	for frame := 0; frame < 120; frame++ {
+		race = control.stepped(race, drive.Wants(0.0, 1.0, 0.0, false, false),
+			1.0 / 60.0)
+	}
+	assert control.find(race.cars, 0).sheet.penalty == drive.added()
+	assert control.find(race.cars, 1).sheet.penalty == 0.0
+}
+
+test "the grid is two staggered columns behind the line" {
+	track := circuit.build(4821)
+	for seat := 0; seat < grid.field(); seat++ {
+		spot := drive.gridSpot(track, seat)
+		assert math.abs(spot.across) > 2.0
+		assert math.abs(spot.across) < circuit.nodeAt(track, 0).half
+		// Behind the line, which is most of the way round from it.
+		assert spot.along > track.length * 0.8
+	}
+	// And nobody is exactly alongside anybody.
+	for seat := 0; seat < grid.field() - 1; seat++ {
+		assert drive.gridSpot(track, seat).along
+			!= drive.gridSpot(track, seat + 1).along
+	}
+}
+
+test "a flag is a speed and nothing else" {
+	mut control.Race race = control.lined(4821, 0)
+	car := control.find(race.cars, 0)
+	assert control.capFor(race, car) == 0.0
+	race.yellow = control.withSlot(race.yellow,
+		circuit.sector(race.track, car.along) - 1, 3.0)
+	assert control.capFor(race, car) == control.yellowSpeed()
+	race.safety = 5.0
+	assert control.capFor(race, car) == control.safetySpeed()
+	assert control.green(race) == false
+}
+
+// The bug this is here for: `thrown` used to take the token off a copy of the
+// field that the caller then overwrote, so the press landed again every frame.
+test "a token is spent once" {
+	mut control.Race race = control.lined(4821, -1)
+	// Past the lights, and give somebody something to throw.
+	race.lights = 0.0
+	mut drive.Car[dyn] cars = []
+	for each car in race.cars {
+		mut drive.Car one = car
+		if one.seat == 0 {
+			one.holding = drive.Token.Debris()
+			one.speed = 30.0
+		}
+		append(cars, one)
+	}
+	race.cars = cars
+	race.mine = 0
+	pressing := drive.Wants(0.0, 1.0, 0.0, false, true)
+	for frame := 0; frame < 30; frame++ {
+		race = control.stepped(race, pressing, 1.0 / 60.0)
+	}
+	assert len(race.shards) == 1
+	assert control.find(race.cars, 0).holding is drive.Token.Nothing
+}
+
+// And the other one: the race used to run for ever, because the car marked as
+// finished was thrown away with the copy of the field it was marked on.
+test "the flag falls" {
+	mut control.Race race = control.lined(4821, -1)
+	race.lights = 0.0
+	race.clock = 100.0
+	// Everybody on the last lap, a few metres short of the line.
+	mut drive.Car[dyn] cars = []
+	for each car in race.cars {
+		mut drive.Car one = put(race.track, car.seat,
+			race.track.length - 30.0 - conv.itf(car.seat) * 9.0,
+			conv.itf(car.seat % 2) * 4.0 - 2.0, 40.0)
+		one.sheet.lap = race.track.laps
+		one.sheet.sector = 3
+		one.sheet.travelled = race.track.length * conv.itf(race.track.laps)
+		append(cars, one)
+	}
+	race.cars = cars
+	for frame := 0; frame < 600; frame++ {
+		race = control.stepped(race, drive.idle(), 1.0 / 60.0)
+	}
+	assert race.over
+	for each car in race.cars {
+		assert car.sheet.finished
+		assert car.sheet.finishedAt > 0.0
+		assert car.sheet.lap == race.track.laps
+	}
+}
+
+test "the order is total distance, not how far round the lap" {
+	mut control.Race race = control.lined(4821, -1)
+	mut drive.Car[dyn] cars = []
+	for each car in race.cars {
+		mut drive.Car one = car
+		// Seat 1 has just crossed the line and is barely into the lap; seat 2 is
+		// most of the way round the one before. Sorting on `along` puts seat 1 last,
+		// which is exactly the wrong answer.
+		if one.seat == 1 {
+			one.along = 5.0
+			one.sheet.travelled = 3000.0
+		}
+		if one.seat == 2 {
+			one.along = race.track.length - 5.0
+			one.sheet.travelled = 1400.0
+		}
+		append(cars, one)
+	}
+	race.cars = cars
+	standings := control.order(race)
+	assert control.roundSeat(standings, 0) == 1
+	assert control.placeOf(race.cars, control.find(race.cars, 1))
+		< control.placeOf(race.cars, control.find(race.cars, 2))
+}
+
+test "the gap to the car in front is a time" {
+	mut control.Race race = control.lined(4821, -1)
+	mut drive.Car[dyn] cars = []
+	for each car in race.cars {
+		mut drive.Car one = car
+		one.speed = 50.0
+		one.sheet.travelled = 1000.0 - conv.itf(one.seat) * 25.0
+		append(cars, one)
+	}
+	race.cars = cars
+	// The leader has nobody in front, and everybody else is half a second back.
+	assert control.interval(race, 0) == 0.0
+	assert control.interval(race, 1) > 0.0
+	assert control.interval(race, 1) < 1.0
+	assert control.gapped(control.interval(race, 1)) != "—"
+}
+
+test "a finished car is placed by its time, penalties and all" {
+	mut control.Race race = control.lined(4821, -1)
+	mut drive.Car[dyn] cars = []
+	for each car in race.cars {
+		mut drive.Car one = car
+		if one.seat == 0 {
+			one.sheet.finished = true
+			one.sheet.finishedAt = 100.0
+		}
+		if one.seat == 1 {
+			one.sheet.finished = true
+			one.sheet.finishedAt = 96.0
+		}
+		append(cars, one)
+	}
+	race.cars = cars
+	standings := control.order(race)
+	assert control.roundSeat(standings, 0) == 1
+	assert control.roundSeat(standings, 1) == 0
+}
+
+test "a lap time is written the way a lap time is written" {
+	assert control.clocked(0.0) == "—"
+	assert control.clocked(31.5) == "31.500"
+	assert control.clocked(92.25) == "1:32.250"
+	assert control.clocked(9.0009) == "9.001"
+	// The carry that used to print "47.1000".
+	assert control.clocked(47.9996) == "48.000"
+	assert control.gapped(1.25) == "+1.25"
+	assert control.gapped(59.999) == "+60.00"
+}
+
+// ---------------------------------------------------------------------------
+// The whole thing
+// ---------------------------------------------------------------------------
+
+test "a grand prix runs itself" {
+	mut control.Race race = control.lined(4821, -1)
+	for frame := 0; frame < 4200; frame++ {
+		race = control.stepped(race, drive.idle(), 1.0 / 60.0)
+	}
+	assert race.clock > 60.0
+	// Everybody has been somewhere, and the leader has been round at least once.
+	leader := control.find(race.cars, control.roundSeat(control.order(race), 0))
+	assert leader.sheet.lap >= 1
+	assert leader.sheet.best > 0.0
+	for each car in race.cars {
+		assert car.sheet.travelled > 200.0
+		assert car.holding is drive.Token.Nothing || drive.tokenWorth(car.holding) > 0
+	}
+	// And the timing screen has something on it for everybody.
+	standings := control.order(race)
+	assert len(standings) == grid.field()
+	for seat := 0; seat < grid.field(); seat++ {
+		assert indexOf(standings, seat) is Result.Ok(_)
+	}
+}
+
+test "the safety car cannot be called twice in a row" {
+	mut control.Race race = control.lined(4821, -1)
+	race.lights = 0.0
+	race.clock = 10.0
+	mut drive.Car[dyn] cars = []
+	for each car in race.cars {
+		mut drive.Car one = car
+		one.holding = drive.Token.Safety()
+		one.speed = 30.0
+		append(cars, one)
+	}
+	race.cars = cars
+	race.mine = 0
+	for frame := 0; frame < 20; frame++ {
+		race = control.stepped(race, drive.Wants(0.0, 1.0, 0.0, false, true),
+			1.0 / 60.0)
+	}
+	assert race.safety > 0.0
+	assert race.safetyAgain > race.clock
+	// Nine cars are still holding one, and none of them got to use it.
+	mut Int holding = 0
+	for each car in race.cars {
+		if car.holding is drive.Token.Safety {
+			holding = holding + 1
+		}
+	}
+	assert holding == grid.field() - 1
+}

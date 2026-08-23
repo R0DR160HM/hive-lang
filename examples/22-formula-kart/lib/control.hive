@@ -1,0 +1,809 @@
+// Race control
+// ============
+// The clock, the lights, the flags, the safety car, the timing screen, and the
+// one call that advances the whole race by one frame. Everything in here is the
+// part of a race that is *not* driving: it never touches a steering angle and it
+// never decides where a car goes. It sets a speed limit and it writes down what
+// happened.
+//
+// **A FLAG IS A NUMBER.** There is no rule engine and no state machine with a
+// dozen arms. A yellow sector and a safety car both come out of `capFor` as one
+// figure — the fastest anybody in that place may currently be — and
+// `drive.driven` brings a car down to it. That is the whole enforcement. It means
+// a flag applies to the bots and to you identically, that it cannot be got round,
+// and that adding a red flag later is one more line in one function.
+//
+// **THE ORDER IS TOTAL DISTANCE**, not how far round the lap somebody is. Two
+// cars a metre apart across the start line are a metre apart, and sorting them on
+// how far into the lap they are would put the one in front last. It is the
+// commonest bug in a racing game and the fix is one field.
+//
+// SECTORS advance one at a time and only forwards, 1 to 2 to 3 and round. A car
+// spun backwards over a timing loop does not un-set a sector time, and a lap is
+// exactly the 3-to-1 crossing — which is also where the flag falls.
+//
+// WHAT THE STRIP SAYS is the same set of messages a real one carries, and each is
+// written at the moment the thing happened rather than worked out later by
+// something scanning the state: purple and green sectors, track limits, a car in
+// the gravel, the safety car in and out, and the flag.
+
+import ./circuit
+import ./drive
+import ./grid
+import ./pace
+import hive.math
+import hive.conv
+
+// ---------------------------------------------------------------------------
+// The race
+// ---------------------------------------------------------------------------
+
+// One line on the message strip, and how long it has left to be read.
+type Note {
+	text: Str
+	kind: Kind
+	life: Float
+}
+
+// What colour it is said in, which is the same four a real strip has.
+type Kind {
+	Info
+	Warn
+	Good
+	Fast
+}
+
+// The whole world. A value like everything else: the fold below hands back a new
+// one every frame, and nothing anywhere holds a reference to a car.
+type Race {
+	track: circuit.Circuit
+	cars: drive.Car[dyn]
+	crates: drive.Crate[dyn]
+	shards: drive.Shard[dyn]
+	wheels: drive.Runaway[dyn]
+	// Seconds since the lights went out. Nothing before that.
+	clock: Float
+	// Seconds until they do. Positive is the countdown, and nobody moves.
+	lights: Float
+	// How long each of the three sectors stays yellow, and how long the safety car
+	// is out for. Both in seconds, and both nought when there is nothing on.
+	yellow: Float[3]
+	safety: Float
+	// The clock reading from which the safety car may be called again. Without it
+	// the field draws another the moment the last one goes in, and a race becomes
+	// one long procession behind it — which is exactly what happened the first time
+	// this ran.
+	safetyAgain: Float
+	notes: Note[dyn]
+	// Which seat the person is in, and the seed the whole thing was rolled from.
+	mine: Int
+	seed: Int
+	over: Bool
+}
+
+// How long the lights are on for before the start.
+func countdown(): Float {
+	return 4.0
+}
+
+// The speed limit a yellow sector and the safety car impose, in metres a second.
+// A yellow is a lift you can feel and not much more — set it low enough to be a
+// crawl and a race with an incident in it becomes a race that is mostly the
+// incident — and the safety car is the crawl.
+func yellowSpeed(): Float {
+	return 42.0
+}
+
+func safetySpeed(): Float {
+	return 21.0
+}
+
+// How long a yellow lasts once something has caused one, and how long the safety
+// car stays out.
+func yellowFor(): Float {
+	return 3.0
+}
+
+func safetyFor(): Float {
+	return 11.0
+}
+
+// And how long after one before another may be called. A race gets one, or at the
+// outside two.
+func safetyRest(): Float {
+	return 75.0
+}
+
+// How long a crate takes to come back.
+func crateBack(): Float {
+	return 6.0
+}
+
+// A whole race, on the grid, waiting for the lights.
+func lined(seed: Int, mine: Int): Race {
+	track := circuit.build(seed)
+	mut drive.Car[dyn] cars = []
+	for seat := 0; seat < grid.field(); seat++ {
+		mut drive.Car car = drive.parked(track, seat)
+		// A car on the grid is behind the line, which is the third sector — and
+		// saying so here is what makes the first crossing of the line the start of
+		// lap one rather than the end of a lap nobody drove.
+		car.sheet.sector = circuit.sector(track, car.along)
+		append(cars, car)
+	}
+	return Race(
+		track,
+		cars,
+		drive.crates(track),
+		[],
+		[],
+		0.0,
+		countdown(),
+		[0.0, 0.0, 0.0],
+		0.0,
+		0.0,
+		[Note("{track.name} — {track.laps} laps", Kind.Info(), 6.0)],
+		mine,
+		seed,
+		false
+	)
+}
+
+// ---------------------------------------------------------------------------
+// One frame of it
+// ---------------------------------------------------------------------------
+
+// Everything that happens in `dt` seconds. `mine` is what the person at the
+// keyboard or on the pad asked for; every other car's `Wants` is filled in by
+// `pace.hive` inside this call, and the two go through exactly the same physics.
+func stepped(race: Race, mine: drive.Wants, dt: Float): Race {
+	mut Race it = race
+	if it.lights > 0.0 {
+		it.lights = it.lights - dt
+		// Standing on the throttle before the lights go out costs what it costs.
+		if mine.throttle > 0.4 && it.lights < countdown() - 0.4 {
+			it = jumped(it)
+		}
+		it.notes = fading(it.notes, dt)
+		return it
+	}
+	it.clock = it.clock + dt
+	it.yellow = cooling(it.yellow, dt)
+	it.safety = math.max(0.0, it.safety - dt)
+	if race.safety > 0.0 && it.safety <= 0.0 {
+		it = said(it, "SAFETY CAR IN THIS LAP — GREEN", Kind.Good())
+	}
+
+	it = walked(it, mine, dt)
+	it = bumped(it)
+	it = collected(it)
+	it = littered(it)
+	it = rolling(it, dt)
+	it = flagged(it)
+	it = timed(it, race)
+	it.notes = fading(it.notes, dt)
+	it.over = everybodyIn(it)
+	return it
+}
+
+// Every car, stepped. The person's car takes the `Wants` that came in; the other
+// nine have theirs worked out by `pace.hive` — and then all ten go through one
+// call, which is the claim this whole example is built on.
+func walked(race: Race, mine: drive.Wants, dt: Float): Race {
+	mut Race it = race
+	mut drive.Car[dyn] next = []
+	for each car in race.cars {
+		mut drive.Wants want = mine
+		if car.seat != race.mine {
+			want = pace.driving(race.track, race.cars, race.shards, race.wheels,
+				car.seat, capFor(race, car), green(race), race.clock)
+		}
+		// What the token did, if it was spent and if it was one that puts something
+		// on the road. The car's own two — the wing and the tyres — are the car's
+		// business and `drive.spending` has already dealt with them.
+		//
+		// The token comes off the car **here**, in the field this walk is building,
+		// rather than inside `thrown`. A write to `it.cars` from in there is
+		// overwritten by the assignment at the end of this loop, and the failure is
+		// silent and spectacular: the token is never spent, so the press lands again
+		// on the very next frame, and one bot lays a continuous carpet of debris
+		// down the racing line at sixty pieces a second.
+		mut drive.Car one = car
+		if spends(it, one, want) {
+			one.holding = drive.Token.Nothing()
+		}
+		it = thrown(it, car, want)
+		append(next, drive.stepped(race.track, one, want,
+			grid.teamOf(one.seat).machine, capFor(race, one), dt))
+	}
+	it.cars = next
+	return it
+}
+
+// The fastest anybody at this place may be, or nought for no limit at all.
+//
+// One function, and it is the whole of how a flag is enforced. A yellow only
+// applies in its own sector, which is what makes a yellow a local thing and the
+// safety car a global one.
+func capFor(race: Race, car: drive.Car): Float {
+	if race.safety > 0.0 {
+		return safetySpeed()
+	}
+	which := circuit.sector(race.track, car.along) - 1
+	if slotOf(race.yellow, which) > 0.0 {
+		return yellowSpeed()
+	}
+	return 0.0
+}
+
+// Whether racing is allowed. Under the safety car it is not, and the bots keep
+// that rule because they are told rather than because they cannot break it.
+func green(race: Race): Bool {
+	return race.safety <= 0.0 && race.lights <= 0.0
+}
+
+// Reading and writing one of a static three by a number worked out at runtime.
+//
+// A `Float[3]` is a promise the compiler holds every construction to, so a literal
+// index into one needs no proof — and a computed one still does. Three branches
+// naming the three of them is both shorter than the guard and impossible to get
+// wrong, and it is why nothing else in this file has to think about it.
+func slotOf(three: Float[3], at: Int): Float {
+	if at == 0 { return three[0] }
+	if at == 1 { return three[1] }
+	if at == 2 { return three[2] }
+	return 0.0
+}
+
+func withSlot(three: Float[3], at: Int, value: Float): Float[3] {
+	if at == 0 { return [value, three[1], three[2]] }
+	if at == 1 { return [three[0], value, three[2]] }
+	if at == 2 { return [three[0], three[1], value] }
+	return three
+}
+
+func cooling(yellow: Float[3], dt: Float): Float[3] {
+	return [
+		math.max(0.0, yellow[0] - dt),
+		math.max(0.0, yellow[1] - dt),
+		math.max(0.0, yellow[2] - dt)
+	]
+}
+
+// ---------------------------------------------------------------------------
+// Cars touching cars
+// ---------------------------------------------------------------------------
+
+// Everybody who is in the same place as somebody else, pushed apart.
+//
+// It is written as a full pass over the pairs rather than a spatial anything: ten
+// cars is forty-five pairs, sixty times a second, which is two and a half thousand
+// comparisons of two numbers each. An index would be more code and slower.
+func bumped(race: Race): Race {
+	mut Race it = race
+	mut drive.Car[dyn] next = []
+	for each car in race.cars {
+		mut drive.Car one = car
+		for each other in race.cars {
+			if other.seat == car.seat || other.sheet.finished || car.sheet.finished {
+				continue
+			}
+			if drive.touching(race.track, car, other) == false {
+				continue
+			}
+			// Which side to be pushed, and who was the one arriving. The car behind
+			// pays more, which is both the rule and what makes following closely a
+			// decision.
+			side := pushed(car.across, other.across, car.seat, other.seat)
+			closing := math.abs(car.speed - other.speed)
+			gap := circuit.nearGap(race.track, other.along, car.along)
+			if gap > 0.0 {
+				one = drive.rammed(one, closing, side)
+			} else {
+				one = drive.shoved(one, closing, side)
+			}
+		}
+		append(next, one)
+	}
+	it.cars = next
+	return it
+}
+
+// Which way a car is pushed when it hits another. Away from the other one — and
+// where the two are exactly abreast, the lower seat goes left, so that the pair
+// never both choose the same side and stay welded together.
+func pushed(mine: Float, theirs: Float, seat: Int, otherSeat: Int): Float {
+	if mine < theirs {
+		return -1.0
+	}
+	if mine > theirs {
+		return 1.0
+	}
+	if seat < otherSeat {
+		return -1.0
+	}
+	return 1.0
+}
+
+// ---------------------------------------------------------------------------
+// The crates, and what comes out of them
+// ---------------------------------------------------------------------------
+
+// Anybody who drove through a crate has whatever was in it. Nothing is picked up
+// by a car that is already carrying something, which is what makes spending it a
+// decision rather than something you do to make room.
+func collected(race: Race): Race {
+	mut Race it = race
+	mut drive.Crate[dyn] crates = []
+	mut drive.Car[dyn] cars = race.cars
+	for each crate in race.crates {
+		mut drive.Crate box = crate
+		if box.back > race.clock {
+			append(crates, box)
+			continue
+		}
+		box.back = 0.0
+		mut drive.Car[dyn] after = []
+		for each car in cars {
+			mut drive.Car one = car
+			if box.back == 0.0 && one.holding is drive.Token.Nothing
+				&& one.sheet.finished == false
+				&& drive.over(race.track, one, crate.along, crate.across, 2.3) {
+				one.holding = drive.rolled(placeOf(cars, one), grid.field(), race.seed,
+					conv.floor(race.clock * 31.0) + one.seat * 977,
+					race.safety <= 0.0 && race.clock >= race.safetyAgain)
+				box.back = race.clock + crateBack()
+			}
+			append(after, one)
+		}
+		cars = after
+		append(crates, box)
+	}
+	it.cars = cars
+	it.crates = crates
+	return it
+}
+
+// Whether this press actually spends a token that puts something on the road.
+//
+// It is asked in two places — here, to put the thing there, and in `walked`, to
+// take the token off the car — so it is one function rather than two conditions
+// that have to be kept in step. Two conditions is how you get a token that is
+// spent without being used, or used without being spent.
+func spends(race: Race, car: drive.Car, want: drive.Wants): Bool {
+	if want.spending == false || car.spun > 0.0 || green(race) == false {
+		return false
+	}
+	if car.holding is drive.Token.Debris {
+		return true
+	}
+	if car.holding is drive.Token.Wheel {
+		return true
+	}
+	if car.holding is drive.Token.Safety {
+		// One at a time, and not straight after the last. A held token survives the
+		// rest rather than being thrown away, so a driver who called it a moment too
+		// early still has it.
+		return race.clock >= race.safetyAgain && race.safety <= 0.0
+	}
+	return false
+}
+
+// A token that puts something on the road, spent. The car's own two never get
+// here: `drive.spending` has already dealt with the wing and the tyres, and this
+// only ever sees the three that are somebody else's problem.
+func thrown(race: Race, car: drive.Car, want: drive.Wants): Race {
+	mut Race it = race
+	if spends(race, car, want) == false {
+		return it
+	}
+	if car.holding is drive.Token.Debris {
+		append(it.shards, drive.Shard(
+			circuit.wrappedAlong(race.track, car.along - 4.0),
+			car.across,
+			drive.shardFor(),
+			car.seat
+		))
+		return said(it, "{grid.driverOf(car.seat).tag} — DEBRIS ON TRACK", Kind.Warn())
+	}
+	if car.holding is drive.Token.Wheel {
+		append(it.wheels, drive.Runaway(
+			circuit.wrappedAlong(race.track, car.along + 5.0),
+			car.across,
+			math.max(car.speed, 20.0) + drive.wheelSpeed(),
+			drive.wheelFor(),
+			car.seat
+		))
+		return said(it, "{grid.driverOf(car.seat).tag} — LOOSE WHEEL", Kind.Warn())
+	}
+	if car.holding is drive.Token.Safety {
+		it.safety = safetyFor()
+		it.safetyAgain = race.clock + safetyRest()
+		return said(it, "SAFETY CAR DEPLOYED", Kind.Warn())
+	}
+	return it
+}
+
+// ---------------------------------------------------------------------------
+// What is lying on the road
+// ---------------------------------------------------------------------------
+
+// Anybody who found a shard. Nothing clears the track under green, so a shard
+// that has been hit stays exactly where it was — the next car finds it too, which
+// is what makes a piece of debris on the racing line worth going round.
+func littered(race: Race): Race {
+	mut Race it = race
+	mut drive.Car[dyn] cars = []
+	for each car in race.cars {
+		mut drive.Car one = car
+		if one.sheet.finished == false && one.hurt <= 0.0 {
+			for each shard in race.shards {
+				if drive.over(race.track, one, shard.along, shard.across, 1.6) {
+					one = drive.punctured(one)
+				}
+			}
+		}
+		append(cars, one)
+	}
+	it.cars = cars
+	return it
+}
+
+// The wheels, rolled on and whatever they met. A wheel runs the racing line and
+// does not steer: what it hits, it hits, and what gets out of the way gets out of
+// the way.
+func rolling(race: Race, dt: Float): Race {
+	mut Race it = race
+	mut drive.Runaway[dyn] left = []
+	mut drive.Car[dyn] cars = race.cars
+	for each wheel in race.wheels {
+		mut drive.Runaway one = wheel
+		one.life = one.life - dt
+		one.along = circuit.wrappedAlong(race.track, one.along + one.speed * dt)
+		// It settles onto the line, which is why it finds people: the line is where
+		// everybody is.
+		node := circuit.nodeAlong(race.track, one.along)
+		one.across = one.across + (node.line - one.across) * math.min(1.0, 2.4 * dt)
+		mut Bool struck = false
+		mut drive.Car[dyn] after = []
+		for each car in cars {
+			mut drive.Car hit = car
+			if struck == false && hit.seat != one.by && hit.sheet.finished == false
+				&& drive.over(race.track, hit, one.along, one.across, 2.0) {
+				hit = drive.spinning(hit)
+				struck = true
+			}
+			append(after, hit)
+		}
+		cars = after
+		if struck {
+			it = said(it, "{grid.driverOf(one.by).tag} COLLECTS "
+				+ "{grid.driverOf(hitBy(cars, race.cars)).tag}", Kind.Warn())
+		} else if one.life > 0.0 {
+			append(left, one)
+		}
+	}
+	it.cars = cars
+	it.wheels = left
+	return it
+}
+
+// Who just got spun: the one car whose spin was not running a moment ago. Read
+// off the two states rather than passed along, so that however a spin happened —
+// a wheel, a shunt, the gravel — the strip says the same thing about it.
+func hitBy(after: drive.Car[], before: drive.Car[]): Int {
+	for each car in after {
+		for each was in before {
+			if was.seat == car.seat && car.spun > 0.0 && was.spun <= 0.0 {
+				return car.seat
+			}
+		}
+	}
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// The flags
+// ---------------------------------------------------------------------------
+
+// Anybody spinning or stopped in a gravel trap brings out a yellow where they
+// are. It is refreshed rather than set, so a car that stays there keeps the
+// sector yellow until it is going again.
+func flagged(race: Race): Race {
+	mut Race it = race
+	for each car in race.cars {
+		if car.sheet.finished {
+			continue
+		}
+		// Stopped, not merely sideways. A car that spins and drives on is a moment,
+		// not an incident, and a sector that went yellow for every one of those would
+		// be yellow for most of the race — which it was, the first time this ran.
+		stranded := (car.spun > 0.0 && car.speed < 7.0)
+			|| (circuit.under(race.track, circuit.Where(car.node, car.along, car.across))
+				is circuit.Ground.Gravel && car.speed < 5.0)
+		if stranded == false {
+			continue
+		}
+		which := circuit.sector(race.track, car.along) - 1
+		if slotOf(it.yellow, which) <= 0.0 {
+			it = said(it, "YELLOW — SECTOR {which + 1}", Kind.Warn())
+		}
+		it.yellow = withSlot(it.yellow, which, yellowFor())
+	}
+	return it
+}
+
+// ---------------------------------------------------------------------------
+// The clock
+// ---------------------------------------------------------------------------
+
+// Sector times, lap times, and the flag. `before` is the field as it was at the
+// start of the frame, because a sector is a *crossing* and a crossing takes two
+// readings to see.
+func timed(race: Race, before: Race): Race {
+	mut Race it = race
+	mut drive.Car[dyn] cars = []
+	// Whether the flag has already fallen for somebody, which decides what the
+	// strip says about the next one over the line.
+	mut Bool taken = false
+	for each done in race.cars {
+		if done.sheet.finished {
+			taken = true
+		}
+	}
+	for each car in race.cars {
+		mut drive.Car one = car
+		if one.sheet.finished {
+			append(cars, one)
+			continue
+		}
+		now := circuit.sector(race.track, one.along)
+		wanted := one.sheet.sector % 3 + 1
+		if now == wanted {
+			// A sector done. Which one it was is the one being left, not the one being
+			// entered.
+			done := one.sheet.sector
+			took := race.clock - one.sheet.sectorAt
+			one.sheet.sectorAt = race.clock
+			one.sheet.sector = now
+			at := done - 1
+			if one.sheet.lap > 0 {
+				one.sheet.sectors = withSlot(one.sheet.sectors, at, took)
+				was := slotOf(one.sheet.bestSectors, at)
+				if was <= 0.0 || took < was {
+					one.sheet.bestSectors = withSlot(one.sheet.bestSectors, at, took)
+					it = said(it, "{grid.driverOf(one.seat).tag} S{done} {clocked(took)}",
+						Kind.Fast())
+				}
+			}
+			if now == 1 {
+				one = lapped(one, race.clock)
+				if one.sheet.lap > race.track.laps {
+					// Past the flag. The penalties are added here and only here — a
+					// penalty that had changed the car's speed would be a different
+					// sport, and one applied twice would be a different result.
+					one.sheet.lap = race.track.laps
+					one.sheet.finished = true
+					one.sheet.finishedAt = race.clock + one.sheet.penalty
+					it = chequered(it, one.seat, taken == false)
+					taken = true
+				}
+			}
+		}
+		append(cars, one)
+	}
+	it.cars = cars
+	return it
+}
+
+// A car over the line. Its lap is closed, and if that was the last one it is done.
+func lapped(car: drive.Car, clock: Float): drive.Car {
+	mut drive.Car it = car
+	if it.sheet.lap > 0 {
+		took := clock - it.sheet.lapStart
+		it.sheet.last = took
+		if it.sheet.best <= 0.0 || took < it.sheet.best {
+			it.sheet.best = took
+		}
+	}
+	it.sheet.lap = it.sheet.lap + 1
+	it.sheet.lapStart = clock
+	return it
+}
+
+// What the strip says when somebody takes the flag. It says nothing about the
+// cars, deliberately: `timed` is already rebuilding the field as it walks it, and
+// a second function writing to `it.cars` from the copy it was handed would have
+// its work thrown away by the assignment at the end of the walk. That is a bug
+// worth naming, because it is silent — the race simply never ends.
+func chequered(race: Race, seat: Int, first: Bool): Race {
+	one := grid.driverOf(seat)
+	if first {
+		return said(race, "CHEQUERED FLAG — {one.name}", Kind.Good())
+	}
+	return said(race, "{one.tag} FINISHES", Kind.Info())
+}
+
+// A jump start. It is written down the moment it happens rather than at the end,
+// because the strip saying so while the lights are still on is half the point.
+func jumped(race: Race): Race {
+	mut Race it = race
+	mut drive.Car[dyn] cars = []
+	mut Bool already = false
+	for each car in race.cars {
+		mut drive.Car one = car
+		if one.seat == race.mine {
+			if one.sheet.penalty > 0.0 {
+				already = true
+			}
+			one.sheet.penalty = drive.added()
+		}
+		append(cars, one)
+	}
+	it.cars = cars
+	if already {
+		return it
+	}
+	return said(it, "{grid.driverOf(race.mine).tag} — JUMP START, 5s", Kind.Warn())
+}
+
+func everybodyIn(race: Race): Bool {
+	for each car in race.cars {
+		if car.sheet.finished == false {
+			return false
+		}
+	}
+	return true
+}
+
+// ---------------------------------------------------------------------------
+// The strip
+// ---------------------------------------------------------------------------
+
+// One more line on it. Newest last, and the oldest goes when there are more than
+// fit — a strip that grew would push the picture about.
+func said(race: Race, text: Str, kind: Kind): Race {
+	mut Race it = race
+	append(it.notes, Note(text, kind, 6.5))
+	if len(it.notes) > 5 {
+		drop(it.notes, 0, 0)
+	}
+	return it
+}
+
+func fading(notes: Note[], dt: Float): Note[dyn] {
+	mut Note[dyn] left = []
+	for each note in notes {
+		if note.life > dt {
+			append(left, Note(note.text, note.kind, note.life - dt))
+		}
+	}
+	return left
+}
+
+// ---------------------------------------------------------------------------
+// The order
+// ---------------------------------------------------------------------------
+
+// The seats, leader first.
+//
+// On total distance, not on how far round the lap anybody is — and a car that has
+// finished is placed by when it finished, penalties included, because after the
+// flag distance stops meaning anything.
+func order(race: Race): Int[dyn] {
+	mut Int[dyn] seats = []
+	for each car in race.cars {
+		append(seats, car.seat)
+	}
+	return sort(seats, leads(_, _, race.cars))
+}
+
+func leads(one: Int, other: Int, cars: drive.Car[]): Bool {
+	a := find(cars, one)
+	b := find(cars, other)
+	if a.sheet.finished != b.sheet.finished {
+		return a.sheet.finished
+	}
+	if a.sheet.finished && b.sheet.finished {
+		return a.sheet.finishedAt < b.sheet.finishedAt
+	}
+	return a.sheet.travelled > b.sheet.travelled
+}
+
+func find(cars: drive.Car[], seat: Int): drive.Car {
+	for each car in cars {
+		if car.seat == seat {
+			return car
+		}
+	}
+	if cars bounds 0 {
+		return cars[0]
+	}
+	return drive.Car(seat, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0,
+		0.0, 0.0, 0.0, 1.0, 0.0, drive.Token.Nothing(), 0.0, 0.0, 0.0, false,
+		drive.freshSheet())
+}
+
+// How many cars are in front of this one, counted the same way the order is.
+func placeOf(cars: drive.Car[], me: drive.Car): Int {
+	mut Int front = 0
+	for each other in cars {
+		if other.seat != me.seat && leads(other.seat, me.seat, cars) {
+			front = front + 1
+		}
+	}
+	return front
+}
+
+// How far behind the car in front somebody is, in seconds. Distance over speed,
+// which is what a pit wall does and is near enough at racing speeds.
+func interval(race: Race, seat: Int): Float {
+	standings := order(race)
+	me := find(race.cars, seat)
+	mut Int place = 0
+	for i := 0; i < len(standings); i++ {
+		if standings[i] == seat {
+			place = i
+		}
+	}
+	if place == 0 {
+		return 0.0
+	}
+	ahead := find(race.cars, roundSeat(standings, place - 1))
+	return (ahead.sheet.travelled - me.sheet.travelled) / math.max(12.0, me.speed)
+}
+
+func roundSeat(seats: Int[], at: Int): Int {
+	if seats bounds at {
+		return seats[at]
+	}
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Saying a time out loud
+// ---------------------------------------------------------------------------
+
+// A time as a minute, a second and three figures after it — which is how a lap
+// time is written everywhere it is written.
+func clocked(seconds: Float): Str {
+	if seconds <= 0.0 {
+		return "—"
+	}
+	mut Int whole = conv.floor(seconds)
+	// Rounding the fraction can carry: 47.9996 rounds to a thousand thousandths,
+	// which is not a thousandth of anything and prints as "47.1000".
+	mut Int thousandths = conv.round((seconds - conv.itf(whole)) * 1000.0)
+	if thousandths >= 1000 {
+		thousandths = 0
+		whole = whole + 1
+	}
+	minutes := whole / 60
+	rest := whole % 60
+	if minutes > 0 {
+		return "{minutes}:{padded(rest, 2)}.{padded(thousandths, 3)}"
+	}
+	return "{rest}.{padded(thousandths, 3)}"
+}
+
+// A gap, which is written with a plus and two figures.
+func gapped(seconds: Float): Str {
+	if seconds <= 0.0 {
+		return "—"
+	}
+	mut Int whole = conv.floor(seconds)
+	mut Int hundredths = conv.round((seconds - conv.itf(whole)) * 100.0)
+	if hundredths >= 100 {
+		hundredths = 0
+		whole = whole + 1
+	}
+	return "+{whole}.{padded(hundredths, 2)}"
+}
+
+func padded(value: Int, width: Int): Str {
+	mut Str out = "{value}"
+	for ; len(out) < width; {
+		out = "0" + out
+	}
+	return out
+}

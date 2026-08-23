@@ -1,6 +1,6 @@
 # Examples
 
-Twenty-one programs, and between them every feature the language has. Each one
+Twenty-two programs, and between them every feature the language has. Each one
 compiles and runs on the compiler in [`../src`](../src) — that is what `./run`
 checks, and what makes these examples rather than illustrations.
 
@@ -35,6 +35,7 @@ hive test examples/15-testing/cart.test.hive
 | 19 | [multiplayer-fps](19-multiplayer-fps) | a 3D scene, sixty frames a second, and a client and a server over a websocket |
 | 20 | [advent-2025-day-2](20-advent-2025-day-2) | Advent of Code, and `assert` as a program's own check |
 | 21 | [advent-2025-day-3](21-advent-2025-day-3) | day 3, where every index is proved in range |
+| 22 | [formula-kart](22-formula-kart) | a ten-car race on a circuit rolled from a number, with bots, teammates and a gamepad |
 
 ## What `./run` does with them
 
@@ -43,13 +44,14 @@ the program's output is worth pinning down — an `.expected` file holding what 
 prints. `./run` compares the two, so an example that stops being true stops
 passing.
 
-Seven of them are **compiled but not run**, and the reason is the same in each
+Eight of them are **compiled but not run**, and the reason is the same in each
 case: they do not finish. A server blocks forever (03, and the game's own server
-in 19), a window waits for a browser (17, and the game's client), a distributed
-pair waits for the other node (09, 13), and a vault waits for somebody to type a
-password (16). Compiling one is what can be checked without a person — and five of
-those seven carry test suites that exercise the rest: 167 tests across the cache,
-the vault, the chat, the game's two halves and the cart.
+in 19), a window waits for a browser (17, the shooter's client, and the race in
+22), a distributed pair waits for the other node (09, 13), and a vault waits for
+somebody to type a password (16). Compiling one is what can be checked without a
+person — and six of those eight carry test suites that exercise the rest: 221
+tests across the cache, the vault, the chat, the shooter's two halves, the race
+and the cart.
 
 Two more have no `.expected` file because what they print is a race by design:
 `10-concurrency`, whose two `note` calls run at once, and anything that reports a
@@ -60,7 +62,7 @@ clock.
 These are the same programs the compiler this one replaces was written against,
 ported one for one and accepted very nearly verbatim — which is the useful thing
 about them: two independent compilers of the same language, and the second one
-takes the first one's programs as they were written. Three exceptions are worth
+takes the first one's programs as they were written. Four exceptions are worth
 knowing about:
 
 * **The remote import in [11](11-modules)** is written out in a comment rather
@@ -80,3 +82,10 @@ knowing about:
   arithmetic in `lib/place.hive` that both of them import. The game plays the same;
   what changed is who decides. `13-distributed-actors` is still the example that
   is about `hive.syslink` across machines.
+* **[22](22-formula-kart) was not ported from anywhere.** It is the first example
+  written against this compiler rather than accepted from the last one, and four
+  things in `hive.ui.scene` were added for it: the `cone` shape, the `surface`
+  attribute, translucency in a scene, and `onPad`, which is how a gamepad reaches
+  a Hive program at all. Each is in [14.16](../spec/14-stdlib.md#1416-hiveuiscene),
+  and each earned its place by something in the race being impossible or ugly
+  without it — a road drawn as a `ground` came out as a lawn.

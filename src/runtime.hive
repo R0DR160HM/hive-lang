@@ -6231,6 +6231,10 @@ func uiSource(): Str {
 			// The one event that reports two numbers instead of a value: how far the
 			// mouse moved while the window was holding it.
 			FnLook func(float64, float64) any
+			// A gamepad: which pad, which control on it, and where that control now
+			// is. One shape for the whole device, because a button is a control that
+			// is only ever 0 or 1.
+			FnPad func(int, string, float64) any
 		}
 
 		func uiNode(kind string, attrs []UiAttr, children []UiView) UiView {
@@ -6334,6 +6338,12 @@ func uiSource(): Str {
 		type UiAxis string
 		type UiInputKind string
 		type UiIcon string
+
+		// What a solid in a scene is made of, as against what colour it is. It lives
+		// here with the other enumerations rather than in the scene's own file because
+		// a closed set of names is a name and nothing more; what it costs to draw is
+		// hive/ui_scene.go's business.
+		type UiSurface string
 
 		// A UiTone is the one enumeration that is not only a closed set: past the five
 		// roles a stylesheet answers for, two variants carry a colour outright. The two
@@ -7152,6 +7162,21 @@ func uiSource(): Str {
 			return x, y
 		}
 
+		// One control off a pad: its name, then where it is. A bar between them
+		// rather than a comma because a control's name is a word and a comma is what
+		// the mouse already uses; nothing else about the two is different.
+		func uiControl(text string) (string, float64) {
+			at := strings.IndexByte(text, '|')
+			if at < 0 {
+				return "", 0
+			}
+			position, err := strconv.ParseFloat(strings.TrimSpace(text[at+1:]), 64)
+			if err != nil {
+				return "", 0
+			}
+			return text[:at], position
+		}
+
 		// Closing the window ends the program.
 		//
 		// A window *is* the program here — UiWindow does not return, and there is
@@ -7215,6 +7240,11 @@ func uiSource(): Str {
 					return a.FnLook(dx, dy), true
 				case kind == "grab" && a.Kind == "onGrab" && a.FnBool != nil:
 					return a.FnBool(value != ""), true
+				// A pad names the control that moved and says where it now is; which
+				// pad it was is the index, the same channel a list's row travels in.
+				case kind == "pad" && a.Kind == "onPad" && a.FnPad != nil:
+					control, position := uiControl(value)
+					return a.FnPad(index, control, position), true
 				}
 			}
 			return nil, false
@@ -7616,6 +7646,16 @@ func uiSceneSource(): Str {
 			return UiShape{Kind: "cylinder", Attrs: attrs, Nums: []float64{radius, height}}
 		}
 
+		// A cone, given both of its radii rather than only the base one. A cone in the
+		// world is hardly ever the perfect one: a track marker is snub-nosed, a nose
+		// cone ends in a blade, a stack of tyres narrows without ever coming to a
+		// point. A shape that could only be the perfect cone would be composed around
+		// rather than used, so the top is asked for. Nought for the top is the perfect
+		// one.
+		func UiCone(attrs []UiAttr, top float64, bottom float64, height float64) UiShape {
+			return UiShape{Kind: "cone", Attrs: attrs, Nums: []float64{top, bottom, height}}
+		}
+
 		// A plane that lies flat, because that is what a floor is. It takes no rotation
 		// to be one — the geometry is built lying down — so the common case costs
 		// nothing and turn still means what it means everywhere else.
@@ -7659,6 +7699,11 @@ func uiSceneSource(): Str {
 
 		func UiAttrPaint(v UiTone) UiAttr { return uiEnum("paint", string(v)) }
 
+		// What it is made of. Absent, a shape is made of what its kind used to imply
+		// on its own — a floor is turf, a barrel is staves — so nothing that never
+		// mentions a surface draws differently for this existing.
+		func UiAttrSurface(v UiSurface) UiAttr { return uiEnum("surface", string(v)) }
+
 		func UiAttrEye(x float64, y float64, z float64) UiAttr {
 			return uiNums("eye", []float64{x, y, z})
 		}
@@ -7679,6 +7724,10 @@ func uiSceneSource(): Str {
 
 		func UiAttrOnLook(f func(float64, float64) any) UiAttr {
 			return UiAttr{Kind: "onLook", FnLook: f}
+		}
+
+		func UiAttrOnPad(f func(int, string, float64) any) UiAttr {
+			return UiAttr{Kind: "onPad", FnPad: f}
 		}
 
 		// ---------------------------------------------------------------------------
@@ -7747,6 +7796,11 @@ func uiSceneSource(): Str {
 			if _, ok := uiFind(attrs, "onGrab"); ok {
 				b.WriteString("g")
 			}
+			// Reading the pads costs a poll every frame, because the browser offers no
+			// event for one. A scene that does not fold them does not pay for them.
+			if _, ok := uiFind(attrs, "onPad"); ok {
+				b.WriteString("p")
+			}
 			return b.String()
 		}
 
@@ -7763,6 +7817,9 @@ func uiSceneSource(): Str {
 			}
 			if len(s.Nums) > 0 {
 				b.WriteString(",\"d\":" + uiSceneVec(s.Nums))
+			}
+			if made := uiSceneEnum(s.Attrs, "surface"); made != "" {
+				b.WriteString(",\"s\":\"" + made + "\"")
 			}
 			if s.Text != "" {
 				b.WriteString(",\"x\":" + uiSceneStr(s.Text))
@@ -8062,6 +8119,7 @@ func uiSceneJs(): Str {
 		  var d = s.d || [1, 1, 1];
 		  if (s.k === "sphere") { return new THREE.SphereGeometry(d[0], 18, 12); }
 		  if (s.k === "cylinder") { return new THREE.CylinderGeometry(d[0], d[0], d[1], 20); }
+		  if (s.k === "cone") { return new THREE.CylinderGeometry(d[0], d[1], d[2], 20); }
 		  if (s.k === "ground") {
 		    var flat = new THREE.PlaneGeometry(d[0], d[1]);
 		    flat.rotateX(-Math.PI / 2);
@@ -8075,7 +8133,9 @@ func uiSceneJs(): Str {
 		    var p = o.geometry.attributes.position;
 		    for (var i = 0; i < 6; i++) { p.array[i] = s.d[i]; }
 		    p.needsUpdate = true;
-		    o.material.color.setStyle(s.c);
+		    o.material.color.setStyle(bare(s.c));
+		    o.material.opacity = solidity(s.c);
+		    o.material.transparent = o.material.opacity < 1;
 		    return;
 		  }
 		  o.position.set(s.p[0], s.p[1], s.p[2]);
@@ -8097,15 +8157,69 @@ func uiSceneJs(): Str {
 		// a render, and the grain below is what stops each face reading as a flat card.
 		function paintOf(s) {
 		  var tile = tiling(s);
-		  var key = s.k + "|" + s.c + "|" + tile[0] + "," + tile[1];
+		  var finish = made(s), body = bare(s.c), thick = solidity(s.c);
+		  var key = finish + "|" + body + "|" + tile[0] + "," + tile[1] + "|" + thick;
 		  var m = mats.get(key);
 		  if (!m) {
 		    // The colour is in the texture rather than on the material: a map multiplies
-		    // the material's colour, so setting both would square it.
-		    m = new THREE.MeshToonMaterial({map: grain(s.k, s.c, tile)});
+		    // the material's colour, so setting both would square it. How much of that
+		    // colour there is stays on the material instead, which is what lets a car
+		    // and the ghost of one share a single texture between them.
+		    m = new THREE.MeshToonMaterial({
+		      map: grain(finish, body, tile),
+		      transparent: thick < 1,
+		      opacity: thick,
+		      // A translucent shape that wrote depth would hide whatever is behind it
+		      // from everything drawn after it, which is the whole of what a ghost is
+		      // not allowed to do.
+		      depthWrite: thick >= 1
+		    });
 		    mats.set(key, m);
 		  }
 		  return m;
+		}
+
+		// What a shape is made of: what it said, or — where it said nothing — what its
+		// kind used to imply on its own. That second half is the whole of the story for
+		// a scene written before there were surfaces: it draws exactly as it did.
+		function made(s) {
+		  if (s.s) { return s.s; }
+		  if (s.k === "ground") { return "Turf"; }
+		  if (s.k === "cylinder" || s.k === "cone") { return "Staves"; }
+		  if (s.k === "sphere") { return "Speckle"; }
+		  return "Planks";
+		}
+
+		// A colour arrives as CSS, and CSS keeps the alpha inside the colour — which a
+		// canvas honours by itself and a material has to be told about separately. So
+		// the two are split apart here: the colour without its alpha, and the alpha on
+		// its own.
+		function bare(colour) {
+		  if (colour.indexOf("rgba(") === 0) {
+		    var p = colour.slice(5, -1).split(",");
+		    return "rgb(" + p[0] + "," + p[1] + "," + p[2] + ")";
+		  }
+		  if (colour.charAt(0) === "#") {
+		    if (colour.length === 9) { return colour.slice(0, 7); }
+		    if (colour.length === 5) { return colour.slice(0, 4); }
+		  }
+		  return colour;
+		}
+
+		// How much of it there is, nought to one. Anything that cannot be read as an
+		// alpha is a whole one — a colour that did not say is not a colour that meant
+		// invisible.
+		function solidity(colour) {
+		  var a = 1;
+		  if (colour.indexOf("rgba(") === 0) {
+		    var p = colour.slice(5, -1).split(",");
+		    a = p.length > 3 ? parseFloat(p[3]) : 1;
+		  } else if (colour.charAt(0) === "#") {
+		    if (colour.length === 9) { a = parseInt(colour.slice(7), 16) / 255; }
+		    else if (colour.length === 5) { a = parseInt(colour.charAt(4), 16) / 15; }
+		  }
+		  if (!(a >= 0 && a <= 1)) { return 1; }
+		  return a;
 		}
 
 		// How many times the grain repeats across a shape, so that a wall and a crate
@@ -8116,6 +8230,9 @@ func uiSceneJs(): Str {
 		  if (s.k === "ground") { return [span(d[0], 3), span(d[1], 3)]; }
 		  if (s.k === "sphere") { return [2, 1]; }
 		  if (s.k === "cylinder") { return [span(d[0] * 6, 2), span(d[1], 2)]; }
+		  // A cone carries both its radii, so its girth is the second number and its
+		  // height the third. The wider end is what the grain is sized against.
+		  if (s.k === "cone") { return [span(Math.max(d[0], d[1]) * 6, 2), span(d[2], 2)]; }
 		  return [span(d[0], 2), span(d[1], 2)];
 		}
 
@@ -8131,8 +8248,8 @@ func uiSceneJs(): Str {
 		// Every pattern is painted in translucent black and white *over* the colour, so
 		// one drawing serves every colour it is asked for: a green crate and a brown one
 		// are the same planks.
-		function grain(kind, colour, tile) {
-		  var key = kind + "|" + colour + "|" + tile[0] + "," + tile[1];
+		function grain(finish, colour, tile) {
+		  var key = finish + "|" + colour + "|" + tile[0] + "," + tile[1];
 		  var kept = skins.get(key);
 		  if (kept) { return kept; }
 		  var size = 128;
@@ -8142,9 +8259,15 @@ func uiSceneJs(): Str {
 		  var ctx = canvas.getContext("2d");
 		  ctx.fillStyle = colour;
 		  ctx.fillRect(0, 0, size, size);
-		  if (kind === "ground") { turf(ctx, size); }
-		  else if (kind === "cylinder") { staves(ctx, size); }
-		  else if (kind === "sphere") { speckle(ctx, size, 90, 0.05); }
+		  if (finish === "Turf") { turf(ctx, size); }
+		  else if (finish === "Gravel") { gravel(ctx, size); }
+		  else if (finish === "Tarmac") { tarmac(ctx, size); }
+		  else if (finish === "Kerb") { kerb(ctx, size); }
+		  else if (finish === "Staves") { staves(ctx, size); }
+		  else if (finish === "Speckle") { speckle(ctx, size, 90, 0.05); }
+		  else if (finish === "Metal") { metal(ctx, size); }
+		  else if (finish === "Carbon") { carbon(ctx, size); }
+		  else if (finish === "Gloss") { gloss(ctx, size); }
 		  else { planks(ctx, size); }
 		  var tex = new THREE.CanvasTexture(canvas);
 		  tex.colorSpace = THREE.SRGBColorSpace;
@@ -8209,6 +8332,119 @@ func uiSceneJs(): Str {
 		  }
 		}
 
+		// Asphalt: a dense scatter of fine aggregate and no seams anywhere. Small and
+		// even is the whole of it — a road is the one surface in a scene somebody looks
+		// at for a full lap, so anything with a repeat you can pick out becomes a
+		// pattern moving under the car rather than a road.
+		function tarmac(ctx, size) {
+		  for (var i = 0; i < 900; i++) {
+		    ctx.fillStyle = i % 3 === 0 ? "rgba(255,255,255,0.055)" : "rgba(0,0,0,0.075)";
+		    ctx.beginPath();
+		    ctx.arc(Math.random() * size, Math.random() * size, 0.5 + Math.random() * 1.1, 0, 6.284);
+		    ctx.fill();
+		  }
+		}
+
+		// A kerb: broad diagonal bands painted nearly white over whatever colour the
+		// shape is, so one drawing serves a red kerb and a blue one. The stripe is the
+		// light half and the colour shows through the other, which is the rule every
+		// pattern here keeps.
+		//
+		// The slope is one across for one down and the bands repeat every half tile, so
+		// both edges meet themselves and a kerb can run for a hundred metres without a
+		// seam in it.
+		function kerb(ctx, size) {
+		  ctx.fillStyle = "rgba(255,255,255,0.88)";
+		  ctx.beginPath();
+		  for (var i = -2; i < 4; i++) {
+		    var x = size * i / 2;
+		    ctx.moveTo(x, 0);
+		    ctx.lineTo(x + size / 4, 0);
+		    ctx.lineTo(x + size / 4 + size, size);
+		    ctx.lineTo(x + size, size);
+		    ctx.closePath();
+		  }
+		  ctx.fill();
+		  speckle(ctx, size, 40, 0.03);
+		}
+
+		// Gravel: bigger stones than tarmac and far more contrast between them, so a
+		// run-off reads as somewhere you do not want to be from a long way off.
+		function gravel(ctx, size) {
+		  speckle(ctx, size, 60, 0.05);
+		  for (var i = 0; i < 220; i++) {
+		    ctx.fillStyle = i % 2 ? "rgba(255,255,255,0.13)" : "rgba(0,0,0,0.17)";
+		    ctx.beginPath();
+		    ctx.arc(Math.random() * size, Math.random() * size, 1.5 + Math.random() * 3.5, 0, 6.284);
+		    ctx.fill();
+		  }
+		}
+
+		// Brushed metal: fine lines all one way, under a band of light across them. The
+		// band runs top to bottom and fades out at both ends, so it tiles; a diagonal
+		// one would look better on a single panel and show every seam on a long one.
+		function metal(ctx, size) {
+		  for (var i = 0; i < 130; i++) {
+		    var y = Math.random() * size;
+		    ctx.strokeStyle = i % 2 ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.07)";
+		    ctx.lineWidth = 1;
+		    ctx.beginPath();
+		    ctx.moveTo(0, y);
+		    ctx.lineTo(size, y);
+		    ctx.stroke();
+		  }
+		  var sheen = ctx.createLinearGradient(0, 0, 0, size);
+		  sheen.addColorStop(0, "rgba(255,255,255,0)");
+		  sheen.addColorStop(0.5, "rgba(255,255,255,0.13)");
+		  sheen.addColorStop(1, "rgba(255,255,255,0)");
+		  ctx.fillStyle = sheen;
+		  ctx.fillRect(0, 0, size, size);
+		}
+
+		// Carbon: a twill weave, which is two sets of tows crossing at right angles with
+		// one riding over the other in a checker.
+		//
+		// Sixteen cells across rather than eight, and quiet: a weave you can count the
+		// squares of from three metres away is a chessboard, which is what a coarser
+		// and more contrasty first attempt at this looked like painted on the floor of
+		// a car. Carbon reads as carbon by being *fine* — the strokes inside each cell
+		// are doing more of the work than the checker is.
+		function carbon(ctx, size) {
+		  var cells = 16, cell = size / cells;
+		  for (var y = 0; y < cells; y++) {
+		    for (var x = 0; x < cells; x++) {
+		      var over = (x + y) % 2 === 0;
+		      ctx.fillStyle = over ? "rgba(255,255,255,0.055)" : "rgba(0,0,0,0.11)";
+		      ctx.fillRect(x * cell, y * cell, cell, cell);
+		      ctx.strokeStyle = over ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.07)";
+		      ctx.lineWidth = 1;
+		      for (var i = 1; i < 3; i++) {
+		        ctx.beginPath();
+		        if (over) {
+		          ctx.moveTo(x * cell, y * cell + cell * i / 3);
+		          ctx.lineTo(x * cell + cell, y * cell + cell * i / 3);
+		        } else {
+		          ctx.moveTo(x * cell + cell * i / 3, y * cell);
+		          ctx.lineTo(x * cell + cell * i / 3, y * cell + cell);
+		        }
+		        ctx.stroke();
+		      }
+		    }
+		  }
+		}
+
+		// Paint: no grain at all, and one soft highlight down the face. It is what a
+		// livery wants — a panel that reads as sprayed rather than as built out of
+		// something — and it is the only surface here that adds no texture of its own.
+		function gloss(ctx, size) {
+		  var sheen = ctx.createLinearGradient(0, 0, 0, size);
+		  sheen.addColorStop(0, "rgba(255,255,255,0.15)");
+		  sheen.addColorStop(0.45, "rgba(255,255,255,0.03)");
+		  sheen.addColorStop(1, "rgba(0,0,0,0.10)");
+		  ctx.fillStyle = sheen;
+		  ctx.fillRect(0, 0, size, size);
+		}
+
 		// The mottling every pattern starts from: dots of light and dark, which is what
 		// keeps a large flat face from banding.
 		function speckle(ctx, size, count, strength) {
@@ -8267,6 +8503,9 @@ func uiSceneJs(): Str {
 		    lookX = 0;
 		    lookY = 0;
 		  }
+		  // Before the frame is reported rather than after, so the fold hears the stick
+		  // move and *then* is told to step the world by it.
+		  if (want.indexOf("p") >= 0) { pads(); }
 		  if (dirty) { renderer.render(stage, camera); dirty = false; }
 		  var ms = last ? Math.round(now - last) : 0;
 		  last = now;
@@ -8397,6 +8636,96 @@ func uiSceneJs(): Str {
 		    if (want.indexOf("u") >= 0) { post("keyup", k, 0); }
 		  }
 		  held = {};
+		}
+
+		// --- the pads ----------------------------------------------------------------
+
+		// A gamepad is the one input a browser will not tell you about. There is no
+		// event for a stick moving, only a snapshot you have to ask for, so a pad is
+		// read once a frame and what goes out is what *changed* since the last look —
+		// which is what makes a button on a pad the same kind of thing as a key going
+		// down, rather than a second way of hearing about input.
+		//
+		// The names are the standard mapping's, by position.
+		//
+		// **Not only for pads the browser calls standard.** An earlier version of this
+		// ignored anything whose mapping was not "standard", on the reasoning that a
+		// program told "button 7" about a device nobody can name is worse off than a
+		// program told nothing. That reasoning is wrong in practice and the rule threw
+		// away most of the working controllers on a desktop: a browser leaves the mapping
+		// empty for any pad missing from its own table, which on Linux is most of them,
+		// and for very nearly every wheel — while the ordering underneath is the same
+		// XInput ordering in almost every case. A pad nobody can name is still a pad.
+		//
+		// So every pad is reported, and one the browser could not name says so on the
+		// way in: "here" arrives as 2 rather than 1, which is a program's cue that
+		// the names it is about to hear are a good guess rather than a promise. Past
+		// the end of the two lists a control is reported by its number, so a device
+		// with more of them than anybody has a word for is still fully readable.
+		var PAD_BUTTONS = ["a", "b", "x", "y", "lb", "rb", "lt", "rt", "back", "start",
+		  "lstick", "rstick", "up", "down", "left", "right", "guide"];
+		var PAD_AXES = ["leftX", "leftY", "rightX", "rightY"];
+		var padWas = [];
+
+		function buttonName(at) {
+		  return at < PAD_BUTTONS.length ? PAD_BUTTONS[at] : "b" + at;
+		}
+
+		function axisName(at) {
+		  return at < PAD_AXES.length ? PAD_AXES[at] : "axis" + at;
+		}
+
+		function pads() {
+		  var all = navigator.getGamepads ? navigator.getGamepads() : [];
+		  for (var i = 0; i < all.length; i++) {
+		    var pad = all[i];
+		    if (!pad || !pad.connected) {
+		      if (padWas[i]) { padLeft(i); }
+		      continue;
+		    }
+		    if (!padWas[i]) {
+		      padWas[i] = {};
+		      post("pad", pad.mapping === "standard" ? "here|1" : "here|2", i);
+		    }
+		    var b = 0;
+		    for (; b < pad.buttons.length; b++) {
+		      padMoved(i, buttonName(b), pad.buttons[b].value);
+		    }
+		    var a = 0;
+		    for (; a < pad.axes.length; a++) {
+		      padMoved(i, axisName(a), deadzone(pad.axes[a]));
+		    }
+		  }
+		}
+
+		// A hundredth of travel is not a movement, it is a stick sitting still, and a
+		// pad that reported that would post sixty messages a second saying nothing.
+		function padMoved(pad, control, now) {
+		  var was = padWas[pad];
+		  var before = was[control] || 0;
+		  if (Math.abs(now - before) < 0.02) { return; }
+		  was[control] = now;
+		  post("pad", control + "|" + round(now), pad);
+		}
+
+		// A stick at rest is never quite at rest. The dead zone is applied here rather
+		// than left to the program because every program would apply the same one, and
+		// nothing is thrown away past the first eight percent — a program that wants a
+		// wider one can widen it, and one that wants none has lost very little.
+		function deadzone(v) {
+		  if (v > -0.08 && v < 0.08) { return 0; }
+		  return v;
+		}
+
+		// A pad that is unplugged lets go of everything on the way out. Without this a
+		// car whose controller ran flat mid-corner keeps turning.
+		function padLeft(pad) {
+		  var was = padWas[pad];
+		  for (var control in was) {
+		    if (was[control]) { post("pad", control + "|0", pad); }
+		  }
+		  padWas[pad] = null;
+		  post("pad", "here|0", pad);
 		}
 
 		// One name per key, and the same name on every keyboard layout the browser can

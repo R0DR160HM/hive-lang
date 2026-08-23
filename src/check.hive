@@ -17,6 +17,7 @@ import ./ast
 import ./diag
 import ./infer
 import ./stdlib
+import ./text
 import ./types
 
 type Check {
@@ -110,7 +111,9 @@ proc checkQuery(c: mut Check, env: infer.Env, params: ast.Param[], result: ast.T
 		}
 		inner = infer.bound(inner, p.name, types.resolve(c.table, p.declared))
 	}
-	checkRowType(c, types.resolve(c.table, result))
+	rows := types.resolve(c.table, result)
+	checkRowType(c, rows)
+	checkSelectStar(c, rows, sql)
 	checkSql(c, inner, sql)
 }
 
@@ -135,6 +138,197 @@ proc checkRowType(c: mut Check, declared: types.Ty): void {
 		return
 	}
 	report(c, "a query answers with `T[dyn]` for one row type, `Str[dyn]` (or another scalar) for a single column, or `void` for a statement — and this is " + types.show(declared))
+}
+
+// --- `SELECT *` against a declared row type ----------------------------------
+
+// A query that says what its rows *are* may not then ask for whatever the table
+// happens to have.
+//
+// `SELECT *` says neither how many columns come back nor what they are called, so
+// nothing here and nothing in the emitter can line them up against the fields —
+// and what it stands for changes the day somebody adds a column to the table,
+// which turns a query that compiled and worked into rows that no longer fit,
+// reported at run time, in a program nobody edited.
+//
+// The rule is about the **result** and only the result. `count(*)`, `a * 2`, a
+// star inside a subquery and the select list of a `void` statement all still
+// compile, because none of them is what the caller is handed.
+proc checkSelectStar(c: mut Check, declared: types.Ty, sql: ast.SqlPart[]): void {
+	if rowTyped(c.table, declared) == false {
+		return
+	}
+	if selectsEverything(sqlText(sql)) == false {
+		return
+	}
+	report(c, "`SELECT *` cannot fill in rows of a declared type: it says neither how many columns come back nor what they are called, so nothing can line them up against the fields — and what it stands for changes the day somebody adds a column. Name them, with an alias where a column and a field are spelt differently: `SELECT id, u.name AS author`")
+}
+
+// Whether the declared result is one row type per row, as against a single
+// column, a `Table` (which is `Str[dyn][dyn]` and has no fields to disagree
+// with), or a statement. The same shape `checkRowType` accepts, asked as a
+// question rather than reported on.
+func rowTyped(table: types.Table, declared: types.Ty): Bool {
+	if declared is types.Ty.TVec(element, _) {
+		if element is types.Ty.TNamed(name) {
+			return types.findType(table, name) is Result.Ok(_)
+		}
+	}
+	return false
+}
+
+// The query's text with its holes filled by something inert. A bound value is a
+// placeholder in the text anyway and an optional predicate only ever appears
+// after the select list, so neither can change what the select list is and both
+// become a token that reads as a value.
+func sqlText(parts: ast.SqlPart[]): Str {
+	mut Str out = ""
+	for each part in parts {
+		if part is ast.SqlPart.Lit(written) {
+			out = out + written
+		} else {
+			out = out + " ? "
+		}
+	}
+	return out
+}
+
+// Whether any select list that decides the result asks for a bare star.
+//
+// It is a scan rather than a parse, and the four things it has to get right are
+// the four things that make it one:
+//
+//   * **depth.** A star inside brackets is `count(*)` or a subquery's, and
+//     neither of those is the result.
+//   * **what came before it.** A star that begins an item — after `SELECT`, a
+//     comma, `DISTINCT`, `ALL`, or the dot of `t.*` — is every column. A star
+//     after a name, a number or a closing bracket is multiplication.
+//   * **where the list ends.** At the top-level `FROM`, and it starts again at
+//     the next top-level `SELECT`, so both halves of a `UNION` are looked at.
+//   * **quotes and comments.** A star in `'a * b'` or in `/* ... */` is text.
+func selectsEverything(sql: Str): Bool {
+	cs := text.chars(sql)
+	mut Int depth = 0
+	mut Bool listing = false
+	// The last thing that mattered, which is the whole of how a star that means
+	// every column is told from a star that means times.
+	mut Str before = ""
+	mut Int i = 0
+	for ; i < len(cs); {
+		ch := text.charAt(cs, i)
+		if ch == "'" || ch == "\"" || ch == "`" {
+			i = pastQuoted(cs, i, ch)
+			before = "value"
+		} else if ch == "-" && text.charAt(cs, i + 1) == "-" {
+			i = pastLine(cs, i)
+		} else if ch == "/" && text.charAt(cs, i + 1) == "*" {
+			i = pastBlock(cs, i)
+		} else if ch == "(" {
+			depth = depth + 1
+			before = "("
+			i = i + 1
+		} else if ch == ")" {
+			depth = depth - 1
+			before = ")"
+			i = i + 1
+		} else if ch == "," {
+			before = ","
+			i = i + 1
+		} else if ch == "." {
+			before = "."
+			i = i + 1
+		} else if ch == "*" {
+			if listing && depth == 0 && opensAnItem(before) {
+				return true
+			}
+			before = "*"
+			i = i + 1
+		} else if text.isAlnum(ch) || ch == "_" {
+			word := text.lower(wordAt(cs, i))
+			i = i + len(word)
+			// Only at the top level: a `SELECT` inside brackets is a subquery's or a
+			// common table expression's, and neither of them decides the result.
+			if depth == 0 && word == "select" {
+				listing = true
+				before = "select"
+			} else if depth == 0 && word == "from" {
+				listing = false
+				before = "from"
+			} else if word == "distinct" || word == "all" {
+				before = ","
+			} else {
+				before = "word"
+			}
+		} else {
+			// Whitespace and every operator that is not a star leave what came before
+			// alone, so `SELECT  *` and `SELECT\n*` read as `SELECT *`.
+			if text.isSpace(ch) == false {
+				before = "operator"
+			}
+			i = i + 1
+		}
+	}
+	return false
+}
+
+// Whether a star here begins a select item rather than continuing an expression.
+func opensAnItem(before: Str): Bool {
+	return before == "select" || before == "," || before == "."
+}
+
+// Past a quoted run, from its opening mark.
+//
+// A doubled quote — `'it''s'` — needs no case of its own: the first run is closed
+// by the first of the pair and the second immediately opens another, so the whole
+// thing is skipped either way. What matters is only that nothing inside is read as
+// SQL.
+func pastQuoted(cs: Str[], from: Int, mark: Str): Int {
+	mut Int i = from + 1
+	for ; i < len(cs); {
+		if text.charAt(cs, i) == mark {
+			return i + 1
+		}
+		i = i + 1
+	}
+	return len(cs)
+}
+
+func pastLine(cs: Str[], from: Int): Int {
+	mut Int i = from
+	for ; i < len(cs); {
+		if text.charAt(cs, i) == "\n" {
+			return i
+		}
+		i = i + 1
+	}
+	return len(cs)
+}
+
+func pastBlock(cs: Str[], from: Int): Int {
+	mut Int i = from + 2
+	for ; i < len(cs); {
+		if text.charAt(cs, i) == "*" && text.charAt(cs, i + 1) == "/" {
+			return i + 2
+		}
+		i = i + 1
+	}
+	return len(cs)
+}
+
+// The word starting here: letters, digits and underscores, which is what a SQL
+// keyword and a column name are both made of.
+func wordAt(cs: Str[], from: Int): Str {
+	mut Str out = ""
+	mut Int i = from
+	for ; i < len(cs); {
+		ch := text.charAt(cs, i)
+		if text.isAlnum(ch) == false && ch != "_" {
+			return out
+		}
+		out = out + ch
+		i = i + 1
+	}
+	return out
 }
 
 proc checkSql(c: mut Check, env: infer.Env, parts: ast.SqlPart[]): void {

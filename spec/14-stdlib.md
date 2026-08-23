@@ -431,7 +431,7 @@ elsewhere is an entry in the attribute vector.
 | `checkbox(attrs, label, checked)` | `Str, Bool` |
 | `select(attrs, options, chosen)` | `Str[], Str` |
 | `table(attrs, rows)` | `Table` |
-| `scene(attrs, shapes)` | `Shape[]` |
+| `scene(attrs, shapes)` | `Shape[]` — see [14.16](#1416-hiveuiscene) |
 
 A widget is here only if it cannot be composed from the others *and* needs
 something the renderer has that Hive does not. A card is a `column` with padding,
@@ -453,6 +453,9 @@ all.
 | State | `disabled` `busy` `placeholder` `hint` `kind` |
 | Events | `on(Msg)` `onDismiss(Msg)` `onInput(f)` `onSubmit(f)` `onChoose(f)` `onToggle(f)` `onPick(f)` `onSort(f)` |
 
+A scene takes attributes of its own — a camera, a sky, and the events a game
+needs — and so do the shapes in one. They are [14.16](#1416-hiveuiscene).
+
 `on` and `onDismiss` carry the message itself; the rest carry a **function** of
 what the user did, which is what a constructor with a hole is for:
 `ui.onInput(Msg.Changed(_))`.
@@ -468,3 +471,149 @@ role becomes a class the stylesheet answers for; a colour becomes a declaration.
 A colour is **checked, not trusted** — `HEX` takes `#` and 3, 4, 6 or 8 hex
 digits and anything else is `Normal`, and `RGBA` clamps each channel — and a role
 brings a readable foreground with it while a computed colour brings nothing.
+
+## 14.16 `hive.ui.scene`
+
+Three dimensions inside a window. A scene is a **value** like every other view: a
+camera, a sky, and a vector of shapes, rebuilt by an ordinary `func` from the
+state as often as there are frames. Nothing here is a handle — there is no mesh
+to keep, no material to allocate and no canvas to hold — so a program that draws
+one answers "what is there right now" and never "what has changed".
+
+It is **a module of its own because it is the one that carries a download**
+([14](#14--standard-library)): a pinned three.js, fetched on the first build that
+needs it and cached. A window that draws no scene links none of this.
+
+### The shapes
+
+A shape is here only if it cannot be made out of the others. Dimensions are the
+payload rather than attributes, because they are what the shape *is*: a sphere
+without a radius is not a sphere with a default one.
+
+| shape | payload |
+| --- | --- |
+| `box(attrs, width, height, depth)` | a solid |
+| `sphere(attrs, radius)` | |
+| `cylinder(attrs, radius, height)` | standing on its end |
+| `cone(attrs, top, bottom, height)` | standing on its end, **both** radii |
+| `ground(attrs, width, depth)` | a plane that already lies flat |
+| `label(attrs, words)` | words that always face the viewer |
+| `line(attrs, fromX, fromY, fromZ, toX, toY, toZ)` | |
+
+**`cone` takes both of its radii** rather than only the base. A cone in the world
+is hardly ever the perfect one — a track marker is snub-nosed, a nose cone ends in
+a blade, a stack of tyres narrows without coming to a point — and a shape that
+could only be the perfect one would be composed around rather than used. A top of
+nought is the perfect one, and a top equal to the bottom is a `cylinder`.
+
+**`ground` is already lying down**, so a floor costs no rotation and `turn` still
+means everywhere what it means anywhere. **`label` takes no rotation** for the
+same reason a label exists: one you can read from one side only is not a label.
+**`line` takes no position**, because a line is *between* two places and has no
+third one to call its own.
+
+### Where a shape is, and what it is made of
+
+| attribute | carries |
+| --- | --- |
+| `at(x, y, z)` | where its middle is |
+| `turn(x, y, z)` | its rotation, in radians, applied X then Y then Z |
+| `paint(Tone)` | its colour |
+| `surface(Surface)` | what it is made of |
+
+`Surface` is the finish, as against `paint`'s colour: `Turf`, `Gravel`, `Tarmac`,
+`Kerb`, `Planks`, `Staves`, `Speckle`, `Metal`, `Carbon`, `Gloss`. Every one is
+drawn **over** whatever colour the shape is, so one pattern serves a red kerb and
+a blue one, and `Gloss` adds no pattern at all.
+
+Where a shape says nothing, its **kind** decides: a `ground` is `Turf`, a
+`cylinder` or a `cone` is `Staves`, a `sphere` is `Speckle`, and everything else
+is `Planks`. That is what the renderer did before there was a way to say, so a
+scene that never mentions a surface draws exactly as it did — and it is also why
+saying is worth having, because a road drawn as a `ground` came out as a lawn.
+
+**A colour with an alpha is translucent.** `Tone.RGBA(r, g, b, a)` and an eight-
+or four-digit `Tone.HEX` carry one, and in a scene it is honoured: the shape is
+drawn see-through and writes no depth, so whatever is behind it stays visible.
+This is how a ghost, a tinted screen or the plume behind something is drawn.
+
+### The camera, the sky and the mouse
+
+These go on the `scene` itself rather than on a shape.
+
+| attribute | carries |
+| --- | --- |
+| `eye(x, y, z)` | where the camera is |
+| `aim(yaw, pitch)` | where it is looking, in radians |
+| `lens(Int)` | the field of view, in degrees |
+| `fog(Int)` | how far you can see, in metres |
+| `background(Tone)` | the sky, which the fog fades into |
+| `grab(Bool)` | whether the window should hold the mouse |
+| `crosshair(Bool)` | whether to draw one in the middle |
+
+Lighting is **not** something a scene describes. The rig is fixed — one light
+from the sky and one from a sun — chosen so that a solid painted a colour comes
+out that colour with a shaded side. What makes a scene dark is its palette, which
+is why a night scene is written in dark colours rather than by turning something
+down.
+
+### What the player did
+
+| event | reports |
+| --- | --- |
+| `onFrame(f)` | `Int` — how many milliseconds the last frame took |
+| `onKeyDown(f)` / `onKeyUp(f)` | `Str` — the key's name |
+| `onLook(f)` | `Float, Float` — how far the mouse moved, across and down |
+| `onGrab(f)` | `Bool` — whether the window is holding the mouse now |
+| `onPad(f)` | `Int, Str, Float` — which pad, which control, where it now is |
+
+A key is named the same on every layout the browser can report: a letter or a
+digit is itself, and everything else is the word for it — `space`, `enter`,
+`escape`, `tab`, `shift`, `ctrl`, `up`, `down`, `left`, `right`.
+
+**A gamepad is the one input a browser will not tell you about**: there is no
+event for a stick moving, only a snapshot you have to ask for. So a pad is read
+once a frame and what arrives is what *changed* — which is what makes a button on
+a pad the same kind of thing as a key going down rather than a second way of
+hearing about input.
+
+One shape covers the whole device, because a button is a control that is only ever
+0 or 1:
+
+| control | name | reports |
+| --- | --- | --- |
+| sticks | `leftX` `leftY` `rightX` `rightY` | −1 to 1 |
+| triggers | `lt` `rt` | 0 to 1 |
+| face | `a` `b` `x` `y` | 0 or 1 |
+| shoulders | `lb` `rb` | 0 or 1 |
+| dpad | `up` `down` `left` `right` | 0 or 1 |
+| the rest | `back` `start` `guide` `lstick` `rstick` | 0 or 1 |
+| anything past those | `b17` `b18` … `axis4` … | by number |
+| the pad itself | `here` | 1 when it arrives, **2** when it arrives with a layout the browser could not name, 0 when it goes |
+
+The names are the standard mapping's, **by position, for every pad** — including
+the ones the browser declines to name. It leaves `mapping` empty for any device
+missing from its own table, which on a desktop is most of them and very nearly
+every wheel, while the ordering underneath is the same in almost every case. A
+pad nobody can name is still a pad; ignoring it would throw away most of the
+working controllers there are.
+
+`here` arriving as **2** rather than 1 is how a program is told that the names it
+is about to hear are a good guess rather than a promise — which is worth showing
+somebody, because it is also the answer to "why is the brake on the wrong pedal".
+A pad that is unplugged lets go of every control it was holding first, and then
+says `here` is 0.
+
+**A pad the browser cannot see at all** is not this module's doing and is worth
+knowing about: a browser reports no pads until one has been *used* — a button
+press or a stick moved — and a sandboxed browser reports none ever unless it was
+given access to input devices (for a Flatpak, `flatpak override --user
+--device=all <app-id>`).
+
+A dead zone of eight percent is applied before the event is sent, and nothing is
+sent until a control has moved by a hundredth — a stick at rest is never quite at
+rest, and a pad that reported that would post sixty messages a second saying
+nothing.
+
+The **first number is which pad**, so two of them in one machine are told apart
+without anything else changing.

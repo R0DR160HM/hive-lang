@@ -194,6 +194,65 @@ test "a computed index has nothing to hang a guard on" {
 	assert proves("Str[dyn] v = [\"a\"]  last := len(v) - 1  if v bounds last \{ echo v[last] }")
 }
 
+// --- A field's own length ----------------------------------------------------
+
+func withBox(body: Str): Str {
+	return "type Box \{ three: Str[3] loose: Str[dyn] }\nproc main(): void \{ " + body + " }"
+}
+
+test "a field's declared length is a promise" {
+	assert problem(withBox("b := Box([\"a\", \"b\", \"c\"], [])  echo b.three[2]")) == ""
+	assert opens(problem(withBox("b := Box([\"a\", \"b\", \"c\"], [])  echo b.three[3]")),
+		"in `main`: `b.three` holds 3, so `3` is not a position it has")
+}
+
+// The record is not the field. Rebinding a `Box` costs whatever a guard had
+// proved about its `[dyn]` field and cannot touch what its type says about the
+// fixed one — there is no way to put a `Str[2]` in a `Str[3]` field, so there is
+// nothing an assignment could do to make the index unsafe.
+test "a field's length survives the record being written over" {
+	assert problem(withBox("mut Box b = Box([\"a\", \"b\", \"c\"], [])"
+		+ "  b = Box([\"x\", \"y\", \"z\"], [])  echo b.three[2]")) == ""
+	// Including from a branch that may not run, which is what costs an inferred one.
+	assert problem(withBox("mut Box b = Box([\"a\", \"b\", \"c\"], [])"
+		+ "  if 1 > 0 \{ b = Box([\"x\", \"y\", \"z\"], []) }  echo b.three[0]")) == ""
+	// And a parameter's field is a promise for the same reason.
+	assert problem("type Box \{ three: Str[3] }\nproc takes(b: Box): void \{ echo b.three[2] }"
+		+ "\nproc main(): void \{ }") == ""
+}
+
+test "a dynamic field is guarded like anything else" {
+	assert opens(problem(withBox("b := Box([\"a\", \"b\", \"c\"], [\"x\"])  echo b.loose[0]")),
+		"in `main`: cannot prove `0` is in range: `b.loose` has no length")
+	assert problem(withBox("b := Box([\"a\", \"b\", \"c\"], [\"x\"])"
+		+ "  if b.loose bounds 0 \{ echo b.loose[0] }")) == ""
+}
+
+// 10.4's own example, and the thing the rule above must not have broken: what a
+// *guard* proved about a `[dyn]` field dies with the value it was proved about.
+test "a guard on a dynamic field dies when the field is replaced" {
+	assert opens(problem(withBox("mut Box b = Box([\"a\", \"b\", \"c\"], [\"x\", \"y\", \"z\"])"
+		+ "  if 2 < len(b.loose) \{ b.loose = [\"one\"]  echo b.loose[2] }")),
+		"in `main`: cannot prove `2` is in range")
+}
+
+test "losing a record loses what was proved about its fields, and no more" {
+	// Assigning to the record itself, rather than to the field, costs the guard
+	// just the same: the field is part of the value that was replaced.
+	assert opens(problem(withBox("mut Box b = Box([\"a\", \"b\", \"c\"], [\"x\", \"y\", \"z\"])"
+		+ "  if 2 < len(b.loose) \{ b = Box([\"a\", \"b\", \"c\"], [])  echo b.loose[2] }")),
+		"in `main`: cannot prove `2` is in range")
+	// And a name that merely starts the same way is a different name.
+	assert problem("type Box \{ loose: Str[dyn] }\nproc main(): void \{"
+		+ "  b := Box([\"x\"])  mut Box bat = Box([\"x\"])"
+		+ "  if b.loose bounds 0 \{ bat = Box([])  echo b.loose[0] } }") == ""
+}
+
+test "a refusal names the field rather than the record it is in" {
+	assert opens(problem(withBox("b := Box([\"a\", \"b\", \"c\"], [])  echo b.loose[0]")),
+		"in `main`: cannot prove `0` is in range: `b.loose`")
+}
+
 // --- Where the access is -----------------------------------------------------
 
 test "a parameter's declared length is a promise inside the callee" {

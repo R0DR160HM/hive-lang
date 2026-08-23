@@ -301,7 +301,7 @@ faster.
 
 ```
 spec/                the language specification, in 19 chapters
-examples/            twenty-one programs, and between them every feature there is
+examples/            twenty-two programs, and between them every feature there is
 src/                 the compiler
   text.hive          the string handling the standard library does not have
   paths.hive         enough path handling for an `import` to name a file
@@ -339,10 +339,11 @@ seed/                which release a build bootstraps from, and its digest
 .github/workflows/   the bootstrap chain, run on every push
 ```
 
-[examples/](examples) is the other half of the documentation: twenty-one
-programs, from a two-line `echo` to a multiplayer game whose server and client
-are two of them, every one compiled by `./examples/run` and — where a program
-finishes on its own — run and compared with what it says it prints.
+[examples/](examples) is the other half of the documentation: twenty-two
+programs, from a two-line `echo` to a multiplayer shooter whose server and client
+are two of them and a ten-car grand prix on a circuit rolled from a number, every
+one compiled by `./examples/run` and — where a program finishes on its own — run
+and compared with what it says it prints.
 
 The compiler is about 23,000 lines of Hive — 8,700 of which are the Go runtime
 and the JavaScript a scene is drawn by, carried as source text — its tests are
@@ -438,11 +439,11 @@ The end-to-end suite compiles whole programs and runs them, comparing what they
 printed with the `.expected` file beside each. It is a shell script because
 comparing two files is what a shell is for, not because Hive could not.
 
-`./examples/run` does the same for the twenty-one programs in
+`./examples/run` does the same for the twenty-two programs in
 [examples/](examples), which are the language's own tour rather than a test of
 the compiler — but they are compiled, run and compared all the same, because an
-example that has stopped being true is worse than no example. Five of them carry
-test suites of their own, and those are 155 tests more.
+example that has stopped being true is worse than no example. Six of them carry
+test suites of their own, and those are 221 tests more.
 
 ## Reading it
 
