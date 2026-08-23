@@ -1,11 +1,12 @@
 @echo off
 rem The Hive command line, on Windows.
 rem
-rem   hive check <entrypoint.hive>       Report any errors, build nothing
-rem   hive emit  <entrypoint.hive>       Print the generated Go source
-rem   hive build <entrypoint.hive>       Compile to a native executable
-rem   hive run   <entrypoint.hive> [..]  Compile and run
-rem   hive test  <entrypoint.hive>       Run the program's tests, with coverage
+rem   hive check     <entrypoint.hive>       Report any errors, build nothing
+rem   hive emit      <entrypoint.hive>       Print the generated Go source
+rem   hive build     <entrypoint.hive>       Compile to a native executable
+rem   hive run       <entrypoint.hive> [..]  Compile and run
+rem   hive test      <entrypoint.hive>       Run the program's tests, with coverage
+rem   hive container <entrypoint.hive>       Write a Dockerfile that builds and runs it
 rem
 rem A batch file rather than a PowerShell one, for one reason: this runs from
 rem cmd.exe and from PowerShell alike, and no execution policy has a say in it.

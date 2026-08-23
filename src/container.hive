@@ -1,0 +1,573 @@
+// The container
+// =============
+// `hive container <entrypoint.hive>` writes a Dockerfile that builds the
+// program and runs it, and that is the whole of what this file is.
+//
+// It lands in the folder the command was run in, which is also the build's
+// context: everything beside it is what the image can see. A `Dockerfile`
+// already there is left alone and ours is called `Dockerfile-hive-container`
+// instead — overwriting somebody else's file is not a thing a generator should
+// do, and overwriting its own is exactly what it should do.
+//
+// What comes out asks nothing of the machine building it but Docker itself: the
+// image downloads Go, downloads the compiler's latest release for the platform
+// being built for, and compiles the program with the two of them. Two stages,
+// so what ships is the executable and nothing else — no Go, no compiler, not
+// even a shell.
+//
+// The parts of it that are not a template are read off the program: which ports
+// it serves on, whether an import names a repository — which the build then
+// needs `git` for — and whether it opens a database, whose drivers are resolved
+// before anything compiles. A file that guessed at all that would still build;
+// one that read it is a file somebody can believe.
+import ./ast
+import ./diag
+import ./fetch
+import ./loader
+import ./paths
+import ./progress
+import ./text
+import hive.conv
+import hive.file
+
+// --- What the image has to do ------------------------------------------------
+
+/// One server the program starts: the call that starts it, and the port it was
+/// written with — `0` where the port is worked out while the program runs and
+/// there is nothing in the source to read.
+type Served {
+	call: Str
+	port: Int
+}
+
+/// What the program asks of the image.
+type Needs {
+	/// Every port it serves on, each said once, with the call that says so.
+	ports: Served[dyn]
+	/// Whether it starts a server at all, which is a different question: a
+	/// program that reads its port out of the environment serves without ever
+	/// naming one here.
+	serves: Bool
+	/// Whether an import names a repository. The compiler clones it while the
+	/// image builds, which is the one thing here that needs `git`.
+	repositories: Bool
+	/// Whether it opens a database. The drivers are Go's, resolved by
+	/// `go mod tidy` before anything compiles.
+	database: Bool
+}
+
+// --- The command -------------------------------------------------------------
+
+/// Write the Dockerfile for `entry` into the folder the command was run in, and
+/// answer with what it ended up called.
+proc write(entry: Str, from: Int): Result<Str, diag.Diagnostic[dyn]> {
+	// The path as the Dockerfile will spell it: `./main.hive` and `main.hive`
+	// are one file, and a `COPY` naming the first would be a puzzle.
+	inside := paths.normalise(entry)
+	if reachable(inside) == false {
+		return Result.Error([diag.Diagnostic(entry, 0, outside(entry))])
+	}
+	progress.step(from, "reading {entry}")
+	program := loader.load(entry)
+	if len(program.errors) > 0 {
+		return Result.Error(program.errors)
+	}
+	needs := needsOf(program)
+	path := fileName()
+	progress.step(from, "writing {path}")
+	if hive.file.write(path, render(inside, needs)) is Result.Error(why) {
+		return Result.Error([diag.Diagnostic(path, 0, "cannot write `{path}`: {why.message}")])
+	}
+	return Result.Ok(path)
+}
+
+/// What the file is called: `Dockerfile`, unless the folder already has one.
+proc fileName(): Str {
+	if hive.file.exists("Dockerfile") {
+		return "Dockerfile-hive-container"
+	}
+	return "Dockerfile"
+}
+
+// Whether the entrypoint is inside the folder the Dockerfile goes into. That
+// folder is the build's context, so a program above it is a program the image
+// cannot reach — which is worth saying now rather than leaving to a `COPY` that
+// finds nothing.
+func reachable(inside: Str): Bool {
+	if text.startsWith(inside, "/") || text.startsWith(inside, "../") {
+		return false
+	}
+	// `C:/src/main.hive` is absolute in the other spelling of absolute, and a
+	// drive letter is no more inside this folder than a leading slash is.
+	if text.endsWith(text.charAt(split(inside, "/"), 0), ":") {
+		return false
+	}
+	return inside != ".."
+}
+
+func outside(entry: Str): Str {
+	return "`{entry}` is outside the folder this was run in, and that folder is the whole of what the image can see: everything in it is copied into the build, and nothing above it is. Run `hive container` from the folder the program is in, or from one above it."
+}
+
+// --- Reading the program -----------------------------------------------------
+
+// What the walk collects, filled in as it goes: a walk that has to thread its
+// answer back up through every branch is the same walk with more punctuation.
+type Found {
+	served: Served[dyn]
+	database: Bool
+}
+
+/// What the program asks of the image, read off its own tree.
+proc needsOf(program: loader.Program): Needs {
+	mut Found found = Found([], false)
+	for each d in program.module.decls {
+		// A `test` is not what a container runs and a `query` body is SQL, so a
+		// `proc` or a `func` is the only place a server is started from.
+		if d is ast.Decl.CallableDecl(_, _, _, _, body, _) {
+			walkBlock(found, body)
+		}
+	}
+	// The same port served twice is one port, and a number that is not one at
+	// all is nothing to write down.
+	mut Served[dyn] ports = []
+	for each s in found.served {
+		if s.port > 0 && s.port < 65536 && known(ports, s.port) == false {
+			append(ports, s)
+		}
+	}
+	return Needs(ports, len(found.served) > 0, clones(program), found.database)
+}
+
+func known(ports: Served[], port: Int): Bool {
+	for each p in ports {
+		if p.port == port {
+			return true
+		}
+	}
+	return false
+}
+
+// Whether any import in the program names a repository rather than a file.
+func clones(program: loader.Program): Bool {
+	for each src in program.sources {
+		for each line in src.module.imports {
+			if fetch.isRemote(line.path) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+proc walkBlock(found: mut Found, b: ast.Block): void {
+	for each s in b.stmts {
+		walkStmt(found, s)
+	}
+}
+
+proc walkStmt(found: mut Found, s: ast.Stmt): void {
+	if s is ast.Stmt.VarDecl(_, value, _, _) {
+		walkExpr(found, value)
+	} else if s is ast.Stmt.TypedDecl(_, _, value, _, _) {
+		walkExpr(found, value)
+	} else if s is ast.Stmt.Assign(target, value) {
+		walkExpr(found, target)
+		walkExpr(found, value)
+	} else if s is ast.Stmt.IfChain(branches, otherwise, _) {
+		for each branch in branches {
+			walkExpr(found, branch.condition)
+			walkBlock(found, branch.body)
+		}
+		walkBlock(found, otherwise)
+	} else if s is ast.Stmt.ForLoop(init, cond, post, body) {
+		walkStmt(found, init)
+		walkExpr(found, cond)
+		walkStmt(found, post)
+		walkBlock(found, body)
+	} else if s is ast.Stmt.ForEach(_, _, subject, body) {
+		walkExpr(found, subject)
+		walkBlock(found, body)
+	} else if s is ast.Stmt.ReturnStmt(value) {
+		walkExpr(found, value)
+	} else if s is ast.Stmt.EchoStmt(value) {
+		walkExpr(found, value)
+	} else if s is ast.Stmt.AssertStmt(condition) {
+		walkExpr(found, condition)
+	} else if s is ast.Stmt.PanicStmt(value) {
+		walkExpr(found, value)
+	} else if s is ast.Stmt.AsyncStmt(call) {
+		walkExpr(found, call)
+	} else if s is ast.Stmt.Expression(value) {
+		walkExpr(found, value)
+	}
+}
+
+// Every expression is walked rather than only the ones a server is likely to be
+// started from: `async hive.net.wsServe(9001, echo)` is a server, and so is one
+// inside an `if` inside a loop inside a handler.
+proc walkExpr(found: mut Found, e: ast.Expr): void {
+	if e is ast.Expr.Call(callee, args) {
+		serving(found, callee, args)
+		walkExpr(found, callee)
+		for each a in args {
+			walkExpr(found, a.value)
+		}
+	} else if e is ast.Expr.Interp(parts) {
+		for each part in parts {
+			if part is ast.InterpPart.Expression(value) {
+				walkExpr(found, value)
+			}
+		}
+	} else if e is ast.Expr.VectorLit(items) {
+		for each item in items {
+			walkExpr(found, item)
+		}
+	} else if e is ast.Expr.Negate(operand) {
+		walkExpr(found, operand)
+	} else if e is ast.Expr.Binary(_, left, right) {
+		walkExpr(found, left)
+		walkExpr(found, right)
+	} else {
+		walkExprTail(found, e)
+	}
+}
+
+// The second half of `walkExpr`, split where the leaves end and the shapes
+// begin — which is where `show.hive` splits the same walk, and for the same
+// reason.
+proc walkExprTail(found: mut Found, e: ast.Expr): void {
+	if e is ast.Expr.Member(subject, _) {
+		walkExpr(found, subject)
+	} else if e is ast.Expr.Index(subject, index) {
+		walkExpr(found, subject)
+		walkExpr(found, index)
+	} else if e is ast.Expr.Slice(subject, low, high) {
+		walkExpr(found, subject)
+		walkExpr(found, low)
+		walkExpr(found, high)
+	} else if e is ast.Expr.IsMatch(subject, _) {
+		walkExpr(found, subject)
+	} else if e is ast.Expr.AwaitAll(calls, timeout) {
+		for each call in calls {
+			walkExpr(found, call)
+		}
+		walkExpr(found, timeout)
+	} else if e is ast.Expr.Timed(call, ms) {
+		walkExpr(found, call)
+		walkExpr(found, ms)
+	} else if e is ast.Expr.WithType(value, _) {
+		walkExpr(found, value)
+	} else if e is ast.Expr.UsingExpr(source, form) {
+		walkExpr(found, source)
+		walkUsing(found, form)
+	}
+}
+
+proc walkUsing(found: mut Found, form: ast.UsingForm): void {
+	if form is ast.UsingForm.Csv(separator) {
+		walkExpr(found, separator)
+	} else if form is ast.UsingForm.RunQuery(call) {
+		walkExpr(found, call)
+	} else if form is ast.UsingForm.Raw(sqlText) {
+		walkExpr(found, sqlText)
+	}
+}
+
+// The calls that open a port, and the ones that open a database. Each is spelled
+// `hive.<module>.<name>` here however the source spelled it: an alias an import
+// gave a standard library module is written back out in full by the loader, so
+// this has one spelling to know rather than one per program.
+proc serving(found: mut Found, callee: ast.Expr, args: ast.Arg[]): void {
+	name := libCall(callee)
+	if name == "hive.net.httpServe" || name == "hive.net.wsServe"
+		|| name == "hive.net.socketServe" {
+		append(found.served, Served(name, literalPort(args)))
+	} else if name == "hive.syslink.listen" {
+		append(found.served, Served(name, addressPort(args)))
+	} else if text.startsWith(name, "hive.sql.") {
+		found.database = true
+	}
+}
+
+func libCall(callee: ast.Expr): Str {
+	if callee is ast.Expr.Member(subject, name) {
+		if subject is ast.Expr.Member(root, module) {
+			if root is ast.Expr.Ident(base) && base == "hive" {
+				return "hive.{module}.{name}"
+			}
+		}
+	}
+	return ""
+}
+
+// The port a server was started with, when it was written as a number. Anything
+// else — a variable, an environment lookup, arithmetic — is a port this file
+// cannot know, and `0` is how it says so.
+func literalPort(args: ast.Arg[]): Int {
+	if args bounds 0 {
+		first := args[0]
+		if first.value is ast.Expr.IntLit(port) {
+			return port
+		}
+	}
+	return 0
+}
+
+// A node listens on an address rather than a port, and names the port the way a
+// browser does: `hive.syslink.listen("0.0.0.0:9000")`.
+func addressPort(args: ast.Arg[]): Int {
+	if args bounds 0 {
+		first := args[0]
+		if first.value is ast.Expr.StrLit(address) {
+			pieces := split(address, ":")
+			if len(pieces) > 1 {
+				if hive.conv.sti(text.charAt(pieces, len(pieces) - 1)) is Result.Ok(port) {
+					return port
+				}
+			}
+		}
+	}
+	return 0
+}
+
+// --- The Dockerfile ----------------------------------------------------------
+
+/// The file itself, as text. Pure: everything it needs it was handed, which is
+/// what lets a test ask what a program would get without a disk, a network or a
+/// Docker.
+func render(entry: Str, needs: Needs): Str {
+	mut Str[dyn] out = []
+	append(out, header(entry, needs))
+	append(out, "")
+	append(out, buildStage(entry, needs))
+	append(out, "")
+	append(out, runStage(entry, needs))
+	return backticked(join(out, "\n")) + "\n"
+}
+
+// A backtick is the one character a backtick string cannot hold, and the file
+// below wants them the way this compiler's own comments do. So the text writes
+// `~BT~` wherever it means one and this puts them back — the same trick, for the
+// same reason, as the Go the runtime carries.
+func backticked(source: Str): Str {
+	return join(split(source, "~BT~"), "`")
+}
+
+// The comment the file opens with, which is the part somebody reads before they
+// read any of it.
+func header(entry: Str, needs: Needs): Str {
+	name := imageName(entry)
+	mut Str[dyn] out = []
+	append(out, "# syntax=docker/dockerfile:1")
+	append(out, "#")
+	append(out, "# Builds and runs {entry}, from nothing but this folder.")
+	append(out, "#")
+	append(out, "#   docker build -t {name} .")
+	append(out, "#   docker run --rm " + publish(needs) + name)
+	append(out, "#")
+	append(out, `
+		# Nothing has to be installed to build this but Docker: the image downloads Go
+		# — the one thing ~BT~hivec build~BT~ needs that it does not carry as source text the
+		# way it does its own runtime — downloads the compiler's latest release for the
+		# platform being built for, and compiles the program with the two of them.
+		#
+		# Two stages: the first has Go and the compiler and does the building; the
+		# second is just the binary that came out of it, with nothing else in the image
+		# — not Go, not the compiler, not even a shell.
+		#
+		# Everything beside this file goes into the build, so a .dockerignore is what
+		# keeps out of it what does not belong in it: a .git, a build directory, an
+		# .env holding anything private — which ~BT~docker run -e~BT~ hands over better
+		# anyway, and ~BT~hive.env.get~BT~ reads either the same way.
+		#
+	`)
+	append(out, "# Written by ~BT~hive container {entry}~BT~, and an ordinary Dockerfile from there")
+	append(out, "# on: editing it is expected, and running the command again writes it afresh.")
+	return join(out, "\n")
+}
+
+// What `docker run` publishes, which is every port the file goes on to expose.
+func publish(needs: Needs): Str {
+	if len(needs.ports) == 0 {
+		if needs.serves {
+			// A server whose port could not be read still wants one published, and
+			// the default the file settles on below is the one to offer here.
+			return "-p 8080:8080 "
+		}
+		// A program that listens on nothing has nothing to publish.
+		return ""
+	}
+	mut Str[dyn] out = []
+	for each p in needs.ports {
+		append(out, "-p {p.port}:{p.port}")
+	}
+	return join(out, " ") + " "
+}
+
+func buildStage(entry: Str, needs: Needs): Str {
+	mut Str[dyn] out = []
+	append(out, rule())
+	append(out, "# Stage 1 — download Go and the compiler, then build")
+	append(out, rule())
+	append(out, `
+		FROM debian:bookworm-slim AS builder
+
+		# What Docker is building for: amd64 on an ordinary machine, arm64 on an
+		# Apple-silicon one or a Graviton. Go and the compiler are both downloaded for
+		# it, so this builds natively wherever it runs, and
+		# ~BT~docker buildx build --platform linux/arm64 .~BT~ is the whole of building it
+		# somewhere else.
+		ARG TARGETARCH
+	`)
+	append(out, "")
+	append(out, packages(needs))
+	append(out, "")
+	append(out, `
+		# Go itself, whatever the current release is.
+		RUN set -eux; \
+			version="$(curl -fsSL 'https://go.dev/VERSION?m=text' | head -n1)"; \
+			curl -fsSL "https://go.dev/dl/${version}.linux-${TARGETARCH}.tar.gz" -o /tmp/go.tar.gz; \
+			tar -C /usr/local -xzf /tmp/go.tar.gz; \
+			rm /tmp/go.tar.gz
+		ENV PATH="/usr/local/go/bin:${PATH}"
+
+		# The compiler itself, from hive-lang's latest release — named rather than
+		# versioned, so this build never has to be told what "latest" means and never
+		# goes stale as new releases ship.
+		RUN curl -fsSL \
+		      "https://github.com/R0DR160HM/hive-lang/releases/latest/download/hivec-linux-${TARGETARCH}" \
+		      -o /usr/local/bin/hivec \
+		 && chmod +x /usr/local/bin/hivec
+
+		# A static binary, so the runtime stage below needs no libc.
+		ENV CGO_ENABLED=0
+
+		WORKDIR /app
+
+		# The whole folder, because a program is its entrypoint and whatever that
+		# imported, and because what it reads while it runs is nobody's business but
+		# its own. A .dockerignore is what narrows this.
+		COPY . .
+	`)
+	append(out, "")
+	if needs.database {
+		append(out, `
+			# This program opens a database, so the build resolves the SQL drivers with
+			# ~BT~go mod tidy~BT~ before it compiles — the one step here that fetches anything
+			# of its own. Both drivers are pure Go, so nothing of them is left for the
+			# runtime stage to carry.
+		`)
+		append(out, "")
+	}
+	append(out, "# ~BT~hivec build~BT~ leaves the executable beside the entrypoint, and the Go")
+	append(out, "# module it came from in {entry}-build/. The test is there to fail the image")
+	append(out, "# build now rather than at ~BT~docker run~BT~.")
+	append(out, "RUN hivec build /app/{entry} \\")
+	append(out, " && test -x " + built(entry))
+	return join(out, "\n")
+}
+
+// What the builder installs. `curl` downloads Go and the compiler, the
+// certificates are what it downloads them over, and `git` is there only for a
+// program that imports a repository.
+func packages(needs: Needs): Str {
+	mut Str[dyn] out = []
+	if needs.repositories {
+		append(out, `
+			# ~BT~git~BT~ is in this list because an import in this program names a repository:
+			# the compiler clones it while the image builds.
+			RUN apt-get update \
+			 && apt-get install -y --no-install-recommends ca-certificates curl git \
+			 && rm -rf /var/lib/apt/lists/*
+		`)
+		return join(out, "\n")
+	}
+	append(out, `
+		RUN apt-get update \
+		 && apt-get install -y --no-install-recommends ca-certificates curl \
+		 && rm -rf /var/lib/apt/lists/*
+	`)
+	return join(out, "\n")
+}
+
+func runStage(entry: Str, needs: Needs): Str {
+	name := paths.stem(entry)
+	mut Str[dyn] out = []
+	append(out, rule())
+	append(out, "# Stage 2 — runtime")
+	append(out, rule())
+	append(out, `
+		# What the program ships in: the binary, the certificates an HTTPS call needs,
+		# the time zones — and nothing else at all. There is no shell in here, so
+		# ~BT~docker exec~BT~ has nothing to run; that is the point of it rather than an
+		# oversight.
+		FROM gcr.io/distroless/static-debian12 AS runtime
+		WORKDIR /app
+	`)
+	append(out, "COPY --from=builder " + built(entry) + " /usr/local/bin/{name}")
+	append(out, "")
+	append(out, exposed(needs))
+	append(out, "")
+	append(out, "ENTRYPOINT [\"/usr/local/bin/{name}\"]")
+	return join(out, "\n")
+}
+
+// The ports, and why each of them is there. A number in a generated file that
+// does not say where it came from is a number nobody can safely change.
+func exposed(needs: Needs): Str {
+	mut Str[dyn] out = []
+	if len(needs.ports) > 0 {
+		mut first := true
+		for each p in needs.ports {
+			if first == false {
+				append(out, "")
+			}
+			first = false
+			append(out, reason(p))
+			append(out, "EXPOSE {p.port}")
+		}
+		return join(out, "\n")
+	}
+	if needs.serves {
+		append(out, `
+			# This program starts a server, but nothing in it says on which port: every
+			# one it starts is handed a port worked out while it runs — from a variable,
+			# or out of the environment. So 8080 is the usual default rather than
+			# anything read off the program: change it to whatever this one listens on.
+		`)
+	} else {
+		append(out, `
+			# Nothing in this program opens a port, so this is a default rather than an
+			# observation: 8080 is here because a container usually wants one. Change it
+			# to whatever this program comes to listen on, or drop the line — a program
+			# that listens on nothing has no use for it.
+		`)
+	}
+	append(out, "EXPOSE 8080")
+	return join(out, "\n")
+}
+
+func reason(p: Served): Str {
+	if p.call == "hive.syslink.listen" {
+		return "# {p.port} is the port in the address this program listens on: " + p.call + " says so."
+	}
+	return "# {p.port} is where this program serves: " + p.call + "({p.port}, ...) says so."
+}
+
+// Where the executable is inside the image. `hivec build` leaves it beside the
+// entrypoint, and the entrypoint is wherever it was in the folder that was
+// copied in.
+func built(entry: Str): Str {
+	return paths.joinPath("/app", paths.joinPath(paths.dirOf(entry), paths.stem(entry)))
+}
+
+// A tag is lower case or it is not a tag, so a program in `Main.hive` still
+// builds an image somebody can name.
+func imageName(entry: Str): Str {
+	return text.lower(paths.stem(entry))
+}
+
+func rule(): Str {
+	return text.repeat("#", 78)
+}

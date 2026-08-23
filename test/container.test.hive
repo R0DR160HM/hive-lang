@@ -1,0 +1,257 @@
+// Tests for `src/container`.
+//
+// Two halves, and neither of them needs a Docker: what the compiler reads off a
+// program — which ports it serves on, and whether it opens a database — and
+// what the Dockerfile it then writes says. The programs are written here as
+// text and loaded from memory, so each one is next to what is asserted about
+// it, and `render` is pure, so what a program would get can be asked for
+// without a file being written anywhere.
+import ../src/container
+import ../src/loader
+import ../src/text
+
+// What the command reads off a program before it writes anything.
+proc needsOf(source: Str): container.Needs {
+	program := loader.loadText("main.hive", source)
+	if len(program.errors) > 0 {
+		panic "the program under test did not load: " + firstError(program)
+	}
+	return container.needsOf(program)
+}
+
+func firstError(program: loader.Program): Str {
+	for each e in program.errors {
+		return e.message
+	}
+	return ""
+}
+
+// The Dockerfile for a program, as `hive container main.hive` would write it.
+proc fileFor(source: Str): Str {
+	return container.render("main.hive", needsOf(source))
+}
+
+func says(file: Str, line: Str): Bool {
+	return text.contains(file, line)
+}
+
+// --- Reading the program -----------------------------------------------------
+
+test "a port written as a number is read off the program" {
+	needs := needsOf(`
+		proc handle(request: Str): Str {
+			return "hello"
+		}
+
+		proc main(): void {
+			hive.net.httpServe(8080, handle)
+		}
+	`)
+	assert len(needs.ports) == 1
+	assert needs.serves
+	for each p in needs.ports {
+		assert p.port == 8080
+		assert p.call == "hive.net.httpServe"
+	}
+}
+
+test "an alias an import gave the module is the same call" {
+	// Which is why this reads the flattened program: `n.wsServe` and
+	// `hive.net.wsServe` are one call by the time the loader is done with them,
+	// so there is one spelling to know here rather than one per program.
+	needs := needsOf(`
+		import hive.net as n
+
+		proc seat(connection: Str): void {
+			return
+		}
+
+		proc main(): void {
+			n.wsServe(9001, seat)
+		}
+	`)
+	assert len(needs.ports) == 1
+	for each p in needs.ports {
+		assert p.port == 9001
+		assert p.call == "hive.net.wsServe"
+	}
+}
+
+test "a port worked out while the program runs is a server with no port" {
+	needs := needsOf(`
+		proc seat(connection: Str): void {
+			return
+		}
+
+		proc main(): void {
+			port := 9001
+			async hive.net.wsServe(port, seat)
+		}
+	`)
+	assert len(needs.ports) == 0
+	// It still serves, which is a different question from where.
+	assert needs.serves
+}
+
+test "a node's port is the end of the address it listens on" {
+	needs := needsOf(`
+		proc main(): void {
+			hive.syslink.listen("0.0.0.0:9000")
+		}
+	`)
+	assert len(needs.ports) == 1
+	for each p in needs.ports {
+		assert p.port == 9000
+		assert p.call == "hive.syslink.listen"
+	}
+}
+
+test "the same port served twice is one port, and two are two" {
+	needs := needsOf(`
+		proc handle(request: Str): Str {
+			return "hello"
+		}
+
+		proc again(): void {
+			hive.net.httpServe(8080, handle)
+		}
+
+		proc main(): void {
+			hive.net.httpServe(8080, handle)
+			hive.net.socketServe(9002, handle)
+		}
+	`)
+	assert len(needs.ports) == 2
+}
+
+test "a test is not what a container runs, so its port is not read" {
+	needs := needsOf(`
+		proc handle(request: Str): Str {
+			return "hello"
+		}
+
+		proc main(): void {
+			return
+		}
+
+		test "the server answers" {
+			hive.net.httpServe(9289, handle)
+		}
+	`)
+	assert len(needs.ports) == 0
+	assert needs.serves == false
+}
+
+test "a program that opens a database says so" {
+	needs := needsOf(`
+		proc main(): void {
+			if hive.sql.connect(#Sqlite, "file:cart.db") is Result.Ok(db) {
+				hive.sql.close(db)
+			}
+		}
+	`)
+	assert needs.database
+	assert needs.serves == false
+}
+
+// --- What the file says ------------------------------------------------------
+
+test "the port it found is exposed, and says where it came from" {
+	file := fileFor(`
+		proc handle(request: Str): Str {
+			return "hello"
+		}
+
+		proc main(): void {
+			hive.net.httpServe(8080, handle)
+		}
+	`)
+	assert says(file, "\nEXPOSE 8080\n")
+	assert says(file, "8080 is where this program serves: hive.net.httpServe(8080, ...)")
+	assert says(file, "docker run --rm -p 8080:8080 main")
+}
+
+test "a port it could not read is a default, and says that instead" {
+	file := fileFor(`
+		proc seat(connection: Str): void {
+			return
+		}
+
+		proc main(): void {
+			port := 9001
+			hive.net.wsServe(port, seat)
+		}
+	`)
+	assert says(file, "\nEXPOSE 8080\n")
+	assert says(file, "nothing in it says on which port")
+	// A server whose port is not in the file still wants one published.
+	assert says(file, "docker run --rm -p 8080:8080 main")
+}
+
+test "a program that listens on nothing publishes nothing" {
+	file := fileFor(`
+		proc main(): void {
+			echo "hello"
+		}
+	`)
+	assert says(file, "\nEXPOSE 8080\n")
+	assert says(file, "Nothing in this program opens a port")
+	assert says(file, "docker run --rm main")
+}
+
+test "an import that names a repository puts git in the build" {
+	// Built by hand rather than loaded, because loading a program that imports
+	// a repository clones it, and a test has no business on a network.
+	needs := container.Needs([], false, true, false)
+	assert says(container.render("main.hive", needs), "ca-certificates curl git")
+	plain := container.Needs([], false, false, false)
+	assert says(container.render("main.hive", plain), "ca-certificates curl git") == false
+}
+
+test "an entrypoint outside the folder the file goes into is refused" {
+	// The folder the command was run in is the build's context, so a program
+	// above it is one the image could never be handed.
+	assert container.reachable("main.hive")
+	assert container.reachable("src/app/main.hive")
+	assert container.reachable("../shared/main.hive") == false
+	assert container.reachable("/tmp/main.hive") == false
+	assert container.reachable("C:/src/main.hive") == false
+	assert container.reachable("..") == false
+}
+
+test "a database is why `go mod tidy` runs before anything compiles" {
+	needs := container.Needs([], false, false, true)
+	assert says(container.render("main.hive", needs), "resolves the SQL drivers")
+	plain := container.Needs([], false, false, false)
+	assert says(container.render("main.hive", plain), "resolves the SQL drivers") == false
+}
+
+test "an entrypoint in a folder is copied, built and shipped from that folder" {
+	needs := container.Needs([], false, false, false)
+	file := container.render("src/app/main.hive", needs)
+	assert says(file, "RUN hivec build /app/src/app/main.hive")
+	assert says(file, "test -x /app/src/app/main")
+	assert says(file, "COPY --from=builder /app/src/app/main /usr/local/bin/main")
+	assert says(file, "ENTRYPOINT [\"/usr/local/bin/main\"]")
+}
+
+test "the image is named in lower case, because a tag has to be" {
+	file := container.render("Main.hive", container.Needs([], false, false, false))
+	assert says(file, "docker build -t main .")
+	// The executable keeps the name the compiler gives it, which is the file's.
+	assert says(file, "ENTRYPOINT [\"/usr/local/bin/Main\"]")
+}
+
+test "every backtick the file wanted is a backtick" {
+	// The text carries them as `~BT~`, and one left in the file is a file that
+	// was written before they were put back.
+	file := container.render("main.hive", container.Needs([], false, true, true))
+	assert says(file, "~BT~") == false
+	assert says(file, "`hivec build`")
+}
+
+test "the platform is Docker's own, so the build is native either way" {
+	file := container.render("main.hive", container.Needs([], false, false, false))
+	assert says(file, "ARG TARGETARCH")
+	assert says(file, "hivec-linux-$\{TARGETARCH}")
+}

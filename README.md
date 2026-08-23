@@ -11,16 +11,17 @@ This directory holds two things: the [specification](spec/) of the language, and
 a compiler for it written in the language it compiles.
 
 ```
-./bootstrap                       build the compiler with itself
-./hive run   <entrypoint.hive>    compile and run
-./hive test  <entrypoint.hive>    run the program's tests, with coverage
-./hive check <entrypoint.hive>    report any errors, build nothing
-./hive emit  <entrypoint.hive>    print the generated Go
-./hive build <entrypoint.hive>    compile to a native executable
+./bootstrap                           build the compiler with itself
+./hive run       <entrypoint.hive>    compile and run
+./hive test      <entrypoint.hive>    run the program's tests, with coverage
+./hive check     <entrypoint.hive>    report any errors, build nothing
+./hive emit      <entrypoint.hive>    print the generated Go
+./hive build     <entrypoint.hive>    compile to a native executable
+./hive container <entrypoint.hive>    write a Dockerfile that builds and runs it
 
-./test/run                        every test the compiler has
-./examples/run                    every example, compiled and run
-./selfhost                        compile the compiler with itself, twice
+./test/run                            every test the compiler has
+./examples/run                        every example, compiled and run
+./selfhost                            compile the compiler with itself, twice
 ```
 
 `./hive` is a two-line script that finds the binary and gets out of the way;
@@ -219,6 +220,37 @@ Each one is a complete compiler: the runtime it carries is source text inside it
 so nothing else has to travel. The same trick builds *your* program for another
 platform — every `hive build` leaves its Go module in `<entrypoint>.hive-build`.
 
+### In a container
+
+`hive container <entrypoint.hive>` writes a Dockerfile for a program, into the
+folder the command was run in — which is also the build's context:
+
+```sh
+hive container main.hive
+docker build -t main .
+docker run --rm -p 8080:8080 main
+```
+
+Nothing has to be installed to build that image but Docker itself. The first
+stage downloads Go and the compiler's latest release for the platform being
+built for — `amd64` on an ordinary machine, `arm64` on an Apple-silicon one, so
+the build is native either way — and compiles the program with the two of them.
+The second stage is the executable and nothing else, on `distroless/static`: no
+Go, no compiler, not even a shell.
+
+The parts of the file that are not a template are read off the program rather
+than guessed at. A `hive.net.httpServe(8080, ...)` becomes an `EXPOSE 8080` that
+says in a comment where the number came from; an import that names a repository
+puts `git` in the build stage, since the compiler clones it while the image
+builds; a program that opens a database says why `go mod tidy` runs before
+anything compiles. Everything beside the Dockerfile goes into the build, so a
+`.dockerignore` is what narrows that.
+
+What comes out is an ordinary Dockerfile and editing it is expected. A
+`Dockerfile` already in the folder is never written over — ours is called
+`Dockerfile-hive-container` instead, and the command says which of the two it
+wrote.
+
 ## It compiles itself
 
 `./selfhost` builds stage 2 with stage 1 and stage 3 with stage 2, then compares
@@ -294,17 +326,17 @@ src/                 the compiler
   vendor.hive        the one thing a build downloads: the three.js a scene needs
   progress.hive      what the compiler says while it is working
   project.hive       writing the Go module, and running the Go toolchain over it
+  container.hive     the Dockerfile `hive container` writes
   testreport.hive    what `hive test` prints
   hivec.hive         the command line
 test/                the tests
-  *Tests.hive        one suite per module, written in Hive
+  *.test.hive        one suite per module, written in Hive
   e2e/               whole programs, compiled, run, and compared
 hive, hive.cmd       the command line, for Unix and for Windows
 bootstrap            build the compiler with itself
 selfhost             build it twice and check the two agree
 seed/                which release a build bootstraps from, and its digest
 .github/workflows/   the bootstrap chain, run on every push
-Dockerfile.example   building a Hive program in a container
 ```
 
 [examples/](examples) is the other half of the documentation: twenty-one
@@ -368,18 +400,19 @@ compiler it replaces.
 $ ./test/run
 Running the suites with the compiler itself.
 
-textTests        16 tests: 16 passed
-namingTests      20 tests: 20 passed
-pathsTests       8 tests: 8 passed
-lexerTests       34 tests: 34 passed
-parserTests      55 tests: 55 passed
-loaderTests      23 tests: 23 passed
-fetchTests       15 tests: 15 passed
-goffiTests       10 tests: 10 passed
-monoTests        18 tests: 18 passed
-checkTests       45 tests: 45 passed
-rangesTests      29 tests: 29 passed
-emitTests        53 tests: 53 passed
+text         16 tests: 16 passed
+naming       20 tests: 20 passed
+paths        8 tests: 8 passed
+lexer        34 tests: 34 passed
+parser       55 tests: 55 passed
+loader       23 tests: 23 passed
+fetch        15 tests: 15 passed
+goffi        10 tests: 10 passed
+mono         18 tests: 18 passed
+check        45 tests: 45 passed
+ranges       29 tests: 29 passed
+emit         53 tests: 53 passed
+container    17 tests: 17 passed
 
 End to end:
   PASS  collections
