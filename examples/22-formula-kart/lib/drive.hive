@@ -171,6 +171,17 @@ type Sheet {
 	bestSectors: Float[3]
 	// Track limits: how many warnings, and how many seconds have been added.
 	warnings: Int
+	// And the flags. `speeding` is how long this car has been over the delta on
+	// this offence and `ignored` is how many offences it has run up — two numbers
+	// rather than one because a lift that came a moment late is not an offence and
+	// one that never came is, and only a clock can tell those apart.
+	//
+	// They are kept apart from `warnings` on purpose. Running wide and ignoring a
+	// yellow are two different things to have done, they are shown separately on
+	// the board, and a driver who has done a bit of each has not done three of
+	// anything.
+	speeding: Float
+	ignored: Int
 	penalty: Float
 	finished: Bool
 	finishedAt: Float
@@ -178,7 +189,7 @@ type Sheet {
 
 func freshSheet(): Sheet {
 	return Sheet(0, 0.0, 0.0, 0.0, 1, 0.0, 0.0,
-		[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 0, 0.0, false, 0.0)
+		[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 0, 0.0, 0, 0.0, false, 0.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +269,47 @@ func gridSpot(track: circuit.Circuit, seat: Int): circuit.Where {
 		across = 3.1
 	}
 	return circuit.Where(0, circuit.wrappedAlong(track, -back), across)
+}
+
+// ---------------------------------------------------------------------------
+// The one car that is not racing
+// ---------------------------------------------------------------------------
+
+// The safety car.
+//
+// It is a type here rather than in `control.hive` — which owns everything it
+// *does* — for one reason: the bots have to see it. `pace.hive` cannot import
+// `control.hive`, because `control.hive` imports `pace.hive`, and a thing on the
+// road that half the program cannot name is a thing half the program will drive
+// into. What a car is belongs in this file, and this is a car.
+//
+// It is not a `Car`. It does not race, it cannot be raced, it has no seat, no
+// sheet, no tyres and nothing to spend, and every line of `stepped` would be
+// arithmetic in the way of something whose whole behaviour is "drive the racing
+// line at exactly the delta".
+type Pace {
+	// How long it has left to lead the field. Nought when it is not out, and
+	// nought while it is on its way in.
+	life: Float
+	// Where it is, in the road's terms, and how fast. The same numbers a car
+	// keeps, and for the same reason.
+	along: Float
+	across: Float
+	speed: Float
+	node: Int
+	// On its way in.
+	leaving: Bool
+}
+
+func garaged(): Pace {
+	return Pace(0.0, 0.0, 0.0, 0.0, 0, false)
+}
+
+// Whether there is one on the circuit at all, whether or not it is still leading
+// the field. A safety car peeling into the pit lane is still something you can
+// drive into the back of.
+func onTrack(pace: Pace): Bool {
+	return pace.life > 0.0 || pace.leaving
 }
 
 // ---------------------------------------------------------------------------
@@ -453,21 +505,53 @@ func added(): Float {
 	return 5.0
 }
 
+// How long you may be over the delta in a flagged zone before it counts as
+// having ignored the flag.
+//
+// It is a second and a bit rather than nothing, and that is the whole design of
+// the rule: a flag comes out while you are already braking for the corner it is
+// at, and a rule with no leeway in it would punish the physics rather than the
+// driver. Long enough to lift; not long enough to keep going.
+func leeway(): Float {
+	return 1.3
+}
+
+// And how fast the count comes off again once you are within the delta. Half the
+// rate it went on at, so a driver who overshot the limit for half a second and
+// then sat under it has paid for it by the end of the zone.
+func forgiven(): Float {
+	return 0.5
+}
+
+// How many offences before the five seconds. The same three that track limits
+// costs, because they are the same sort of thing and two different numbers would
+// be two numbers to learn.
+func ignorable(): Int {
+	return 3
+}
+
 // ---------------------------------------------------------------------------
 // One car, one frame
 // ---------------------------------------------------------------------------
 
 // Everything that happens to a car in `dt` seconds.
 //
-// `cap` is race control's: a speed nobody may exceed, which is how a yellow flag
-// and a safety car are enforced. `machine` is the team's car. Neither of them is
-// allowed to know whether there is a person at the wheel.
+// `machine` is the team's car, and it is the only thing here that is not the
+// driver's doing. **Nothing in this file knows what a flag is.**
+//
+// It used to. A yellow sector and the safety car arrived here as a `cap` — a
+// speed nobody could exceed — and this function brought the car down to it,
+// which made a flag something that happened *to* a car rather than something a
+// driver had to do about it. It was one line and it was wrong: a rule you cannot
+// break is not a rule, there was nothing to get right, and the only thing that
+// told you a flag was out was your own car slowing down for reasons you did not
+// ask for. Race control now sets a delta and writes down who was over it
+// (`control.policed`), and this steps a car exactly as the driver drove it.
 func stepped(
 	track: circuit.Circuit,
 	car: Car,
 	want: Wants,
 	machine: Float,
-	cap: Float,
 	dt: Float
 ): Car {
 	mut Car it = car
@@ -500,7 +584,7 @@ func stepped(
 
 	it = drifting(it, want, dt)
 	it = steered(it, want, grip, dt)
-	it = driven(track, it, want, ground, grip, machine, cap, dt)
+	it = driven(track, it, want, ground, grip, machine, dt)
 	it = located(track, moved(it, dt))
 	it = limits(track, it)
 	return travelled(track, it, dt)
@@ -622,7 +706,6 @@ func driven(
 	ground: circuit.Ground,
 	grip: Float,
 	machine: Float,
-	cap: Float,
 	dt: Float
 ): Car {
 	mut Car it = car
@@ -654,11 +737,6 @@ func driven(
 		it.speed = math.max(-7.0, it.speed - 9.0 * dt)
 	}
 	it.speed = math.min(it.speed, ceiling)
-	// Race control's ceiling, which is the whole of how a yellow flag and a safety
-	// car are enforced. Nothing else in the program has to know they exist.
-	if cap > 0.0 && it.speed > cap {
-		it.speed = math.max(cap, it.speed - 34.0 * dt)
-	}
 	if it.speed < -7.0 {
 		it.speed = -7.0
 	}
@@ -726,6 +804,48 @@ func travelled(track: circuit.Circuit, car: Car, dt: Float): Car {
 	mut Car it = car
 	it.sheet.travelled = it.sheet.travelled + math.max(0.0, it.speed) * dt
 	return it
+}
+
+// What being over the delta in a flagged zone costs, given whether this car is
+// over it right now.
+//
+// The clock is the whole rule. Over the limit, it runs up; under it, it runs back
+// down at half the rate. Past `leeway()` seconds it is an offence, the clock is
+// put back to nought, and three offences is five seconds — the same five that
+// three excursions costs, because they are the same sort of thing.
+//
+// It is here rather than in `control.hive` because what it changes is a car's own
+// sheet, and everything that writes to a sheet is in this file. What it does not
+// know is *where* the flags are; that arrives as one boolean.
+func policed(car: Car, over: Bool, dt: Float): Car {
+	mut Car it = car
+	if it.sheet.finished {
+		return it
+	}
+	if over == false {
+		it.sheet.speeding = math.max(0.0, it.sheet.speeding - forgiven() * dt)
+		return it
+	}
+	it.sheet.speeding = it.sheet.speeding + dt
+	if it.sheet.speeding < leeway() {
+		return it
+	}
+	it.sheet.speeding = 0.0
+	it.sheet.ignored = it.sheet.ignored + 1
+	if it.sheet.ignored >= ignorable() {
+		it.sheet.ignored = 0
+		it.sheet.penalty = it.sheet.penalty + added()
+	}
+	return it
+}
+
+// Whether that call was the one that took a car past the leeway. Read off the two
+// states rather than reported out of `policed`, for the same reason `control.hitBy`
+// reads a spin off two states: a `func` answers with one thing, and the strip
+// wants to know about something the sheet already says.
+func caught(after: Car, before: Car): Bool {
+	return after.sheet.ignored != before.sheet.ignored
+		|| after.sheet.penalty > before.sheet.penalty
 }
 
 // Track limits, asked exactly the way the rule is written. One excursion is one

@@ -1,0 +1,332 @@
+// The two things in the corners
+// =============================
+// A map of the circuit and a dial for the speed, both drawn with `ui.canvas` —
+// which is two dimensions in the program's own units, so everything here is
+// written in **metres** for the map and in **kilometres an hour** for the dial,
+// and nothing in the file is written in pixels.
+//
+// WHY A MAP EARNS ITS CORNER. The circuit is rolled from a number and you have
+// never driven it before. Without a map, the first lap of every race is spent
+// finding out where the road goes, and the second is spent finding out what you
+// got wrong on the first. With one, the corner you cannot see yet is a shape in
+// the corner of the screen.
+//
+// And it is where the flags are. `control.hive` knows a yellow as a stretch of
+// road — a place and a span, in metres round the lap — and this is the file that
+// makes that worth having: the stretch is drawn *on the circuit*, in yellow, at
+// exactly the place it is in force, so "lift here, go again there" is something
+// you can see rather than something you have to guess at from a word on a strip.
+// The marshals' posts in `scenery.hive` say the same thing at the side of the
+// road; this says it from above, before you are in it.
+//
+// WHY A DIAL AND NOT A NUMBER. The number is on it too, because it is a number
+// you sometimes want to read exactly. But what you want a hundred times a lap is
+// not the reading, it is *where the needle is going* — and a needle answers that
+// at a glance in a way four digits never do. The delta, when one is out, is a red
+// band on the same dial: the punishment is now yours to avoid, so what you need
+// is to be able to see how far over it you are without looking away from the road.
+
+import ./circuit
+import ./control
+import ./drive
+import ./grid
+import hive.ui
+import hive.math
+import hive.conv
+
+// ---------------------------------------------------------------------------
+// The map
+// ---------------------------------------------------------------------------
+
+// How wide the map is, in pixels, and how thick the road is drawn on it, in
+// metres. The road is drawn a good deal wider than it is — seven metres of tarmac
+// on a circuit six hundred metres across is under two pixels, which is a hair
+// rather than a road.
+func mapSize(): Int {
+	return 208
+}
+
+func roadWide(): Float {
+	return 15.0
+}
+
+// The whole map. Grass, the circuit, the pit lane, wherever a flag is out, the
+// start line, and everybody on it.
+//
+// The order is the order they are drawn in, and it is the only thing keeping the
+// cars on top of the road rather than under it: a canvas is a list, and a list is
+// painted front to back exactly as it is written.
+func map(race: control.Race, seat: Int): ui.View {
+	track := race.track
+	box := circuit.extent(track)
+	mut ui.Mark[dyn] marks = []
+
+	// The circuit itself, as one line through every other node. Every node is more
+	// than a map this size can show and twice what it costs to send.
+	append(marks, ui.path(
+		[ui.paint(ui.Tone.HEX("#4a5057")), ui.thick(roadWide() + 5.0)],
+		lap(track, 2)
+	))
+	append(marks, ui.path(
+		[ui.paint(ui.Tone.HEX("#22262b")), ui.thick(roadWide())],
+		lap(track, 2)
+	))
+	// The pit lane, thinner and paler, and only over the stretch it exists on.
+	append(marks, ui.path(
+		[ui.paint(ui.Tone.HEX("#3c424a")), ui.thick(track.pits.half * 2.0)],
+		lane(track)
+	))
+
+	// Every flag, on the road, exactly where it is in force. This is the whole
+	// reason a zone has a place.
+	for each zone in race.zones {
+		mut ui.Tone shade = ui.Tone.HEX("#2fbf71")
+		if zone.yellow > 0.0 {
+			shade = ui.Tone.HEX("#ffd400")
+		}
+		append(marks, ui.path(
+			[ui.paint(shade), ui.thick(roadWide() + 4.0)],
+			stretch(track, zone)
+		))
+	}
+
+	// The start line, across the road at nought metres.
+	line := circuit.nodeAt(track, 0)
+	append(marks, ui.path(
+		[ui.paint(ui.Tone.HEX("#f2f4f6")), ui.thick(3.0)],
+		[
+			line.x + math.cos(line.dir) * line.half,
+			line.z - math.sin(line.dir) * line.half,
+			line.x - math.cos(line.dir) * line.half,
+			line.z + math.sin(line.dir) * line.half
+		]
+	))
+
+	// The safety car, which is worth seeing on a map more than anything else on
+	// one: it is the slowest thing on the circuit and the only thing you can hit
+	// without anybody having driven into you.
+	if drive.onTrack(race.pace) {
+		where := circuit.placed(track, race.pace.along, race.pace.across)
+		append(marks, ui.dot([ui.paint(ui.Tone.HEX("#0d1013"))],
+			where.x, where.z, 12.0))
+		append(marks, ui.dot([ui.paint(ui.Tone.HEX("#ff8000"))],
+			where.x, where.z, 9.5))
+		append(marks, ui.words([ui.paint(ui.Tone.HEX("#0d1013"))],
+			where.x, where.z, 11.0, "SC"))
+	}
+
+	// Everybody else, then you. Yours last so nothing is ever drawn over it, and
+	// with a white ring round it so it is yours at a glance rather than after a
+	// search — the one thing a map has to answer instantly is "which of those is me".
+	for each car in race.cars {
+		if car.seat == seat {
+			continue
+		}
+		append(marks, ui.dot([ui.paint(ui.Tone.HEX(grid.bodyOf(car.seat)))],
+			car.x, car.z, 7.0))
+	}
+	me := control.find(race.cars, seat)
+	append(marks, ui.dot([ui.paint(ui.Tone.HEX("#ffffff"))], me.x, me.z, 11.0))
+	append(marks, ui.dot([ui.paint(ui.Tone.HEX(grid.bodyOf(seat)))],
+		me.x, me.z, 7.5))
+
+	return ui.canvas([
+		ui.width(mapSize()),
+		ui.height(mapSize()),
+		ui.region(box.x, box.z, box.across, box.down),
+		ui.background(ui.Tone.RGBA(13, 20, 12, 225))
+	], marks)
+}
+
+// The centreline as x, z, x, z, every `step` nodes, closed back onto itself. The
+// shape of everything else on the map.
+func lap(track: circuit.Circuit, step: Int): Float[dyn] {
+	mut Float[dyn] out = []
+	count := len(track.nodes)
+	if count == 0 || step < 1 {
+		return out
+	}
+	for i := 0; i < count; i = i + step {
+		node := circuit.nodeAt(track, i)
+		append(out, node.x)
+		append(out, node.z)
+	}
+	first := circuit.nodeAt(track, 0)
+	append(out, first.x)
+	append(out, first.z)
+	return out
+}
+
+// The pit lane's own line, which stops where the lane does.
+func lane(track: circuit.Circuit): Float[dyn] {
+	mut Float[dyn] out = []
+	run := circuit.pitRun(track)
+	steps := conv.floor(run / 12.0) + 1
+	for i := 0; i <= steps; i++ {
+		along := circuit.wrappedAlong(track,
+			track.pits.entry + run * conv.itf(i) / conv.itf(steps))
+		where := circuit.placed(track, along, circuit.pitAcross(track, along))
+		append(out, where.x)
+		append(out, where.z)
+	}
+	return out
+}
+
+// The stretch of road one zone covers, as a line along it. Drawn over the road
+// rather than beside it, because what it is saying is "this piece of the circuit",
+// and a mark beside the road is a mark about something beside the road.
+func stretch(track: circuit.Circuit, zone: control.Zone): Float[dyn] {
+	mut Float[dyn] out = []
+	steps := conv.floor(zone.span * 2.0 / 10.0) + 2
+	for i := 0; i <= steps; i++ {
+		part := conv.itf(i) / conv.itf(steps)
+		along := circuit.wrappedAlong(track,
+			zone.at - zone.span + zone.span * 2.0 * part)
+		node := circuit.nodeAlong(track, along)
+		where := circuit.placed(track, along, node.line)
+		append(out, where.x)
+		append(out, where.z)
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// The dial
+// ---------------------------------------------------------------------------
+
+func dialSize(): Int {
+	return 176
+}
+
+// The fastest the dial reads, in kilometres an hour, rounded up to something a
+// dial would actually be printed with. Off the car's own top speed, so a change
+// to the physics moves the dial with it.
+func fullScale(): Float {
+	return 300.0
+}
+
+// Where the needle sits for a speed: three quarters of a turn, from bottom-left
+// round to bottom-right, which is where a dial's nought and full are.
+func sweep(kmh: Float): Float {
+	part := math.clamp(kmh / fullScale(), 0.0, 1.0)
+	return math.pi() * 0.75 + part * math.pi() * 1.5
+}
+
+// The speedometer, and what race control is asking of you on the same face.
+func dial(race: control.Race, seat: Int): ui.View {
+	me := control.find(race.cars, seat)
+	kmh := math.max(0.0, me.speed) * 3.6
+	delta := control.deltaAt(race, me.along)
+	mut ui.Mark[dyn] marks = []
+
+	// The face.
+	append(marks, ui.dot([ui.paint(ui.Tone.RGBA(13, 16, 19, 205))], 0.0, 0.0, 96.0))
+	// The track the needle runs round.
+	append(marks, ui.path(
+		[ui.paint(ui.Tone.HEX("#2b3037")), ui.thick(13.0)],
+		arc(0.0, fullScale(), 74.0)
+	))
+	// **What you may not exceed, if anything.** Everything above the delta, in red,
+	// on the same face as the needle — so how far over you are is a distance you can
+	// see rather than two numbers you have to subtract.
+	if delta > 0.0 {
+		append(marks, ui.path(
+			[ui.paint(ui.Tone.HEX("#d7263d")), ui.thick(13.0)],
+			arc(delta * 3.6, fullScale(), 74.0)
+		))
+		append(marks, ui.path(
+			[ui.paint(ui.Tone.HEX("#ffd400")), ui.thick(13.0)],
+			arc(0.0, delta * 3.6, 74.0)
+		))
+	}
+	// Where the needle has got to.
+	append(marks, ui.path(
+		[ui.paint(ui.Tone.HEX("#e7e9ea")), ui.thick(7.0)],
+		arc(0.0, kmh, 74.0)
+	))
+
+	// The ticks: one every fifty.
+	mut Float at = 0.0
+	for ; at <= fullScale(); {
+		turn := sweep(at)
+		append(marks, ui.path(
+			[ui.paint(ui.Tone.HEX("#5b6470")), ui.thick(2.0)],
+			[
+				math.cos(turn) * 58.0, math.sin(turn) * 58.0,
+				math.cos(turn) * 66.0, math.sin(turn) * 66.0
+			]
+		))
+		at = at + 50.0
+	}
+
+	// The needle, and the pin it turns on.
+	point := sweep(kmh)
+	append(marks, ui.path(
+		[ui.paint(ui.Tone.HEX("#ff5a1f")), ui.thick(4.5)],
+		[
+			math.cos(point + math.pi()) * 12.0, math.sin(point + math.pi()) * 12.0,
+			math.cos(point) * 62.0, math.sin(point) * 62.0
+		]
+	))
+	append(marks, ui.dot([ui.paint(ui.Tone.HEX("#e7e9ea"))], 0.0, 0.0, 7.0))
+
+	// The reading, and what it is a reading of.
+	append(marks, ui.words([ui.paint(ui.Tone.HEX("#f2f4f6"))],
+		0.0, 34.0, 34.0, "{conv.round(kmh)}"))
+	append(marks, ui.words([ui.paint(ui.Tone.Muted())], 0.0, 57.0, 12.0, "KM/H"))
+	// And, in the top of the face, whichever of the two things is worth saying: what
+	// you are being asked for, or what the drift banked. It sits well inside the
+	// arc — a dial's face is round and a line of words is not, so anything written
+	// across the middle of one has to be short of the ring by more than it looks.
+	append(marks, ui.words([ui.paint(deltaTone(me, delta))],
+		0.0, -34.0, 12.0, capline(me, delta)))
+	return ui.canvas([
+		ui.width(dialSize()),
+		ui.height(dialSize()),
+		ui.region(-100.0, -100.0, 200.0, 200.0)
+	], marks)
+}
+
+// A line of the dial's face, from one speed to another. Enough points that it is
+// an arc rather than a fan — one every twelfth of a turn, and never fewer than two.
+func arc(from: Float, to: Float, radius: Float): Float[dyn] {
+	mut Float[dyn] out = []
+	start := sweep(from)
+	end := sweep(to)
+	steps := math.max(2.0, math.abs(end - start) / (math.pi() / 24.0))
+	many := conv.floor(steps)
+	for i := 0; i <= many; i++ {
+		turn := start + (end - start) * conv.itf(i) / conv.itf(many)
+		append(out, math.cos(turn) * radius)
+		append(out, math.sin(turn) * radius)
+	}
+	return out
+}
+
+// What the dial says under the pin. The delta when there is one, because that is
+// the only thing on the screen you can be punished for ignoring; what the drift
+// has banked when there is not.
+func capline(me: drive.Car, delta: Float): Str {
+	if delta > 0.0 {
+		return "DELTA {conv.round(delta * 3.6)}"
+	}
+	if me.deploy > 0.0 {
+		return "DEPLOY"
+	}
+	if me.wing > 0.0 {
+		return "DRS"
+	}
+	return ""
+}
+
+// And in what colour. Over the delta it goes red, which is the one thing on this
+// dial that has to be seen without being looked for.
+func deltaTone(me: drive.Car, delta: Float): ui.Tone {
+	if delta > 0.0 && me.speed > delta {
+		return ui.Tone.HEX("#ff4d5a")
+	}
+	if delta > 0.0 {
+		return ui.Tone.HEX("#ffd400")
+	}
+	return ui.Tone.Muted()
+}

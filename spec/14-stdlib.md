@@ -431,11 +431,19 @@ elsewhere is an entry in the attribute vector.
 | `checkbox(attrs, label, checked)` | `Str, Bool` |
 | `select(attrs, options, chosen)` | `Str[], Str` |
 | `table(attrs, rows)` | `Table` |
+| `canvas(attrs, marks)` | `Mark[]` — see [below](#a-canvas) |
 | `scene(attrs, shapes)` | `Shape[]` — see [14.16](#1416-hiveuiscene) |
 
 A widget is here only if it cannot be composed from the others *and* needs
 something the renderer has that Hive does not. A card is a `column` with padding,
 a toast is an `overlay` and a message, a divider is a `row` with a border.
+
+**An `overlay` that says where it goes is not a dialog.** With neither `align`
+nor `justify` it is centred over a dimmed page, which is what a dialog is. With
+either of them it is pinned to that edge instead, nothing is dimmed, and clicks
+pass through everywhere the panel is not — which is what a heads-up display in a
+corner, a toast, or a legend over a picture needs, and what a grey sheet over the
+very thing being annotated is not.
 
 **`link` is the one widget that works without an event.** The window follows the
 **message** and a served page follows the **href**, from the identical tree.
@@ -449,7 +457,8 @@ all.
 | --- | --- |
 | Layout | `gap` `pad` `width` `height` `grow` `align` `justify` `scroll` |
 | Text | `size` `heading` `tone` |
-| Colour | `background(Tone)` |
+| Colour | `background(Tone)` `paint(Tone)` |
+| Canvas | `region(x, y, width, height)` `thick(Float)` |
 | State | `disabled` `busy` `placeholder` `hint` `kind` |
 | Events | `on(Msg)` `onDismiss(Msg)` `onInput(f)` `onSubmit(f)` `onChoose(f)` `onToggle(f)` `onPick(f)` `onSort(f)` |
 
@@ -471,6 +480,36 @@ role becomes a class the stylesheet answers for; a colour becomes a declaration.
 A colour is **checked, not trusted** — `HEX` takes `#` and 3, 4, 6 or 8 hex
 digits and anything else is `Normal`, and `RGBA` clamps each channel — and a role
 brings a readable foreground with it while a computed colour brings nothing.
+
+### A canvas
+
+Two dimensions, in **the program's own units**. `canvas(attrs, marks)` is a
+widget like any other and a `Mark` is a value like any other, so what a canvas
+holds is what is on it right now — there is no drawing context, no frame to
+schedule and nothing to clear.
+
+| mark | payload |
+| --- | --- |
+| `dot(attrs, x, y, radius)` | a filled circle |
+| `bar(attrs, x, y, width, height)` | a rectangle, **from its middle** |
+| `path(attrs, points)` | `Float[]` — x, y, x, y … — a line through them |
+| `patch(attrs, points)` | the same numbers, filled |
+| `words(attrs, x, y, height, text)` | words **centred** on the place |
+
+`region(x, y, width, height)` says which part of the plane the box shows, and
+**everything on a canvas is said in those units** — a map of a circuit is written
+in metres, and a car nine metres long is drawn nine long. The box may be any
+shape; what is drawn keeps its own and is centred in it. `paint(Tone)` is a
+mark's colour and `thick(Float)` is how wide a `path` is drawn, in the region's
+units too — so a map zoomed in has thicker roads, which is what zooming in means.
+
+A dimension is the payload rather than an attribute, the same way it is for a
+shape: a dot without a radius is not a dot with a default one. `bar` is placed by
+its middle because everything else on a canvas is, and one mark placed by its
+corner would be the one that is always half a width out.
+
+The same tree a window swaps in is what `page` writes out, so a chart drawn for a
+program is a chart served by a web server with nothing changed.
 
 ## 14.16 `hive.ui.scene`
 
@@ -521,10 +560,31 @@ third one to call its own.
 | `paint(Tone)` | its colour |
 | `surface(Surface)` | what it is made of |
 
-`Surface` is the finish, as against `paint`'s colour: `Turf`, `Gravel`, `Tarmac`,
-`Kerb`, `Planks`, `Staves`, `Speckle`, `Metal`, `Carbon`, `Gloss`. Every one is
-drawn **over** whatever colour the shape is, so one pattern serves a red kerb and
-a blue one, and `Gloss` adds no pattern at all.
+`Surface` is the finish, as against `paint`'s colour. Eighteen, ordered from the
+ground up — what you drive on, then what things are built of, then what they are
+finished in:
+
+| | |
+| --- | --- |
+| ground | `Turf` `Gravel` `Tarmac` `Kerb` |
+| built | `Concrete` `Brick` `Planks` `Staves` |
+| grown and gathered | `Bark` `Leaves` `Crowd` |
+| open | `Mesh` |
+| finished | `Speckle` `Metal` `Carbon` `Rubber` `Glass` `Gloss` |
+
+Every one is drawn **over** whatever colour the shape is, so one pattern serves a
+red kerb and a blue one, and `Gloss` adds no pattern at all.
+
+**`Mesh` is the one with holes in it.** A chain-link fence is not a faint fence,
+it is wire with nothing between the wire — so its pattern's own transparency
+decides pixel by pixel, and what is left goes on writing depth like any solid.
+Nothing has to be sorted against it and it is visible from both sides.
+
+**A finish is sized in metres, not in faces.** Roughly one tile every two metres
+whatever the shape is, so a crate and a wall are made of the same-sized boards —
+and a `box` is tiled **face by face**, each by its own two dimensions. A barrier
+forty metres long and one metre high is forty tiles by one, not one by one
+stretched forty ways.
 
 Where a shape says nothing, its **kind** decides: a `ground` is `Turf`, a
 `cylinder` or a `cone` is `Staves`, a `sphere` is `Speckle`, and everything else
@@ -591,12 +651,27 @@ One shape covers the whole device, because a button is a control that is only ev
 | anything past those | `b17` `b18` … `axis4` … | by number |
 | the pad itself | `here` | 1 when it arrives, **2** when it arrives with a layout the browser could not name, 0 when it goes |
 
-The names are the standard mapping's, **by position, for every pad** — including
-the ones the browser declines to name. It leaves `mapping` empty for any device
-missing from its own table, which on a desktop is most of them and very nearly
-every wheel, while the ordering underneath is the same in almost every case. A
-pad nobody can name is still a pad; ignoring it would throw away most of the
-working controllers there are.
+The names are **by position, for every pad** — including the ones the browser
+declines to name. It leaves `mapping` empty for any device missing from its own
+table, which on a desktop is most of them and very nearly every wheel. A pad
+nobody can name is still a pad; ignoring it would throw away most of the working
+controllers there are.
+
+**There are two orders, and which one a pad is speaking is worked out rather than
+assumed.** The standard mapping's is one. The other is what a browser reports for
+very nearly every pad it cannot name: eleven buttons and eight axes, with the two
+triggers among the *axes* and the dpad on the last two of them. Read as the
+standard order, such a pad has no `lt` and no `rt` at all — those two names land
+on Back and Start instead — which is a controller that steers and will not drive.
+A device reporting six or more axes and no more than twelve buttons has its
+triggers on axes, because there is nowhere else for them to be, and it is read
+that way. A trigger that arrives as an axis still reports 0 to 1: the −1 it rests
+at is nought, and an axis reading exactly nought is a pedal nobody has touched
+rather than one held halfway.
+
+`here` still says which of the two it was — 1 for a pad the browser named, 2 for
+one it did not — because names worked out are a good guess and names given are a
+promise, and a program that lets somebody rebind wants to know which it has.
 
 `here` arriving as **2** rather than 1 is how a program is told that the names it
 is about to hear are a good guess rather than a promise — which is worth showing

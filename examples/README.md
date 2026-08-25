@@ -35,7 +35,7 @@ hive test examples/15-testing/cart.test.hive
 | 19 | [multiplayer-fps](19-multiplayer-fps) | a 3D scene, sixty frames a second, and a client and a server over a websocket |
 | 20 | [advent-2025-day-2](20-advent-2025-day-2) | Advent of Code, and `assert` as a program's own check |
 | 21 | [advent-2025-day-3](21-advent-2025-day-3) | day 3, where every index is proved in range |
-| 22 | [formula-kart](22-formula-kart) | a ten-car race on a circuit rolled from a number, with bots, teammates and a gamepad |
+| 22 | [formula-kart](22-formula-kart) | a ten-car race on a circuit rolled from a number, with a landscape round it, a server, a map and a dial |
 
 ## What `./run` does with them
 
@@ -44,13 +44,13 @@ the program's output is worth pinning down — an `.expected` file holding what 
 prints. `./run` compares the two, so an example that stops being true stops
 passing.
 
-Eight of them are **compiled but not run**, and the reason is the same in each
-case: they do not finish. A server blocks forever (03, and the game's own server
-in 19), a window waits for a browser (17, the shooter's client, and the race in
-22), a distributed pair waits for the other node (09, 13), and a vault waits for
-somebody to type a password (16). Compiling one is what can be checked without a
-person — and six of those eight carry test suites that exercise the rest: 221
-tests across the cache, the vault, the chat, the shooter's two halves, the race
+Nine of them are **compiled but not run**, and the reason is the same in each
+case: they do not finish. A server blocks forever (03, and the two games' own
+servers in 19 and 22), a window waits for a browser (17, and the two games'
+clients), a distributed pair waits for the other node (09, 13), and a vault waits
+for somebody to type a password (16). Compiling one is what can be checked
+without a person — and six of those nine carry test suites that exercise the
+rest, across the cache, the vault, the chat, the shooter's two halves, the race
 and the cart.
 
 Two more have no `.expected` file because what they print is a race by design:
@@ -73,6 +73,15 @@ knowing about:
   `lib/measures.go`, whose signatures the Go toolchain reads
   ([12.4](../spec/12-modules.md#124-importing-a-go-file)) — the one example that
   needs a compiler to talk to another language's.
+* **[22](22-formula-kart) is architecture rather than a port too**, and it went
+  further than 19 did. It was one window that held the whole race; it is now a
+  `server.hive` that owns the only copy of it and a `client.hive` that owns a
+  screen. A client sends `drive.Wants` — a steering angle, two pedals and two
+  buttons, the identical value a bot produces — and nothing else, so the server
+  puts a person's car and a bot's through the same `drive.stepped`. Run the client
+  with no server and it holds the race itself, which is the same call again: one
+  program, two ways of playing, and no second copy of the game loop.
+
 * **[19](19-multiplayer-fps) is architecture rather than a port.** It was one
   program that every player ran, meshed together with `hive.syslink`: each node
   held its own player and its own pack of the dead, told the others what both were

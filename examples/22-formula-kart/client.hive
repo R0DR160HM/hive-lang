@@ -1,0 +1,1946 @@
+// Ten cars, five teams, one seed
+// ==============================
+// A kart racer with a Formula One face on it. Pick a team, take a seat, and race
+// the other nine — one of whom is your own second driver and will be noticeably
+// easier on you than the other eight, and any number of whom may be other people.
+//
+// RUN IT:
+//
+//   hive run client.hive                          alone, on a circuit off the clock
+//   hive run client.hive 4821                     alone, on that circuit, every time
+//   hive run client.hive ws://10.0.0.4:9300/race  with everybody on that server
+//
+// **Alone and joined are the same program and very nearly the same code.** The
+// difference is one field: `Link.Alone` means this window holds the race and steps
+// it, `Link.Live` means a server does and this window is drawing what it is told.
+// Everything after that — the physics, the bots, the flags, the picture, the map —
+// is identical, because it is the same call on the same libraries.
+//
+// It opens a real window: an installed Chrome or Edge in app mode, an ordinary tab
+// where there is none. three.js was fetched once when this was first compiled and
+// lives inside the executable, so it runs with no network and nothing installed.
+//
+// DRIVING. Arrow keys or W A S D. **Space is the drift**, and it is the whole game:
+// hold it through a corner and the car steps sideways and harvests; let go and it
+// deploys what it harvested. Three levels, and the third is worth going a long way
+// round a corner for. `E` spends whatever you picked up. `C` changes the camera,
+// `Tab` shows the standings.
+//
+// **A CONTROLLER WORKS**, and getting there took a fix in two places.
+//
+// A browser leaves a pad's `mapping` empty for any device missing from its own
+// table — on Linux that is most of them and very nearly every wheel — and
+// `hive.ui`'s reader took the XInput order for those anyway. It is the wrong order:
+// what a browser reports for an unnamed pad is usually eleven buttons and eight
+// axes, with the **triggers among the axes**, so `lt` and `rt` landed on Back and
+// Start instead. That is a controller that steers and will not drive, and pressing
+// Start is full throttle. The runtime now works out which of the two orders a pad
+// is speaking ([14.16](../../spec/14-stdlib.md)), and no longer forgets a stick
+// movement it failed to send.
+//
+// The other half is here, and it is the half that cannot be wrong about anybody's
+// hardware: **every control can be learned**. Press "learn" beside a job in the
+// lobby, move the control you want, and that is the control. A wheel, a pad nobody
+// can name, a device with the pedals the other way round — all of them work, and
+// none of them needs anybody to have guessed right about it.
+//
+// The lobby also shows **what your pad is saying, live, while you look at it**,
+// which is the thing that was missing most: a controller that does nothing and says
+// nothing about why is a controller nobody can fix.
+//
+// WHAT IS IN THE CRATES. Five things, and every one is something that happens in a
+// real race, because that is the joke this whole example is built on: a mushroom is
+// a boost and so is opening your rear wing; a banana is something on the road that
+// punctures whoever finds it and so is a piece of somebody's front wing; the blue
+// shell is the item that hurts the leader most and so is a safety car. Which one you
+// get depends on where you are — the leader gets debris and a wing, the car at the
+// back gets the safety car — and that is the one deliberately unfair thing here.
+//
+// THE FLAGS ARE YOURS TO KEEP. Nothing slows your car down for you. A yellow is a
+// stretch of road drawn in yellow on the map, a delta on the dial, and a marshal
+// waving at the side of it; the safety car is a car. Go through at racing speed and
+// the stewards write it down, and three of those is five seconds on your race time.
+// Go through *into the back of the safety car* and you will not need the stewards.
+//
+// WHO DOES WHAT
+// -------------
+//   lib/circuit.hive   the track: rolled, relaxed, measured, and the fast way round
+//   lib/scenery.hive   everywhere that is not the road
+//   lib/grid.hive      five teams, two cars each, and what makes a teammate one
+//   lib/drive.hive     what a car is and what one frame does to it
+//   lib/pace.hive      how a bot drives — and it can ask for nothing you cannot
+//   lib/control.hive   the clock, the flags, the safety car, the timing screen
+//   lib/board.hive     the map and the dial, drawn with `ui.canvas`
+//   lib/wire.hive      what crosses when there is a server
+//   server.hive        the one copy of the race everybody is in
+//
+// This file is the window: what the fold does with a key, a pad and a frame, and
+// what the picture and the pit board look like. There is no game logic in it. That
+// is not tidiness for its own sake — it is what lets `race.test.hive` race a whole
+// grand prix with no window, no keyboard and no browser anywhere.
+
+import ./lib/board
+import ./lib/circuit
+import ./lib/control
+import ./lib/drive
+import ./lib/grid
+import ./lib/scenery
+import ./lib/wire
+import hive.ui
+import hive.net
+import hive.syslink
+import hive.math
+import hive.conv
+
+// ---------------------------------------------------------------------------
+// The state
+// ---------------------------------------------------------------------------
+
+type Screen {
+	Lobby
+	// Dialled, waiting to be told which seat.
+	Joining
+	Racing
+}
+
+// Where the race is. **The one field that says whether this is a game or half of
+// one**: alone, this window holds the race and steps it; live, a server does and
+// what is held here is the last thing it said.
+type Link {
+	Alone
+	Live { conn: hive.net.WsConnection }
+}
+
+// Where the camera is. Two, and the difference is worth having: the chase camera
+// shows you the car's attitude, which is what you need to catch a drift, and the
+// cockpit shows you the apex, which is what you need to hit one.
+type Seat {
+	Chase
+	Cockpit
+}
+
+// One control on a pad and where it is. A vector of these rather than a fixed set
+// of fields, because **which controls a pad has is not known in advance** — that
+// is the whole lesson of the controller not working — and a device with an extra
+// axis on it is a device whose extra axis can be bound to something.
+type Control {
+	name: Str
+	at: Float
+}
+
+type Pad {
+	// Which pad this is. The first one to say anything claims the seat and the rest
+	// are ignored.
+	which: Int
+	// Whether the browser could name its layout. It reports every pad either way,
+	// but for one it could not name the control names are a worked-out guess rather
+	// than a promise — so it is worth saying out loud, because it is also half the
+	// answer to "why is the brake on the wrong pedal".
+	named: Bool
+	at: Control[dyn]
+}
+
+func nopad(): Pad {
+	mut Control[dyn] nothing = []
+	return Pad(-1, false, nothing)
+}
+
+// Which control does which job.
+//
+// It is a value, and every field of it is a name the pad reported rather than a
+// number this program decided. That is what makes a wheel, a pad the browser
+// cannot name and a pad with the pedals the wrong way round all work: none of
+// them needs anybody to have guessed right, because none of them is guessed at.
+type Bind {
+	steer: Str
+	throttle: Str
+	brake: Str
+	drift: Str
+	spend: Str
+	camera: Str
+	board: Str
+}
+
+// What a pad that the browser *could* name is, which is what most of them are on
+// most machines and is what everything starts as.
+func standard(): Bind {
+	return Bind("leftX", "rt", "lt", "a", "b", "y", "back")
+}
+
+// The seven jobs, in the order the lobby lists them. A vector rather than seven
+// lines of markup, so a job added tomorrow is one entry.
+func jobs(): Str[dyn] {
+	return ["steer", "throttle", "brake", "drift", "spend", "camera", "board"]
+}
+
+func bound(bind: Bind, job: Str): Str {
+	if job == "steer" { return bind.steer }
+	if job == "throttle" { return bind.throttle }
+	if job == "brake" { return bind.brake }
+	if job == "drift" { return bind.drift }
+	if job == "spend" { return bind.spend }
+	if job == "camera" { return bind.camera }
+	if job == "board" { return bind.board }
+	return ""
+}
+
+func binding(bind: Bind, job: Str, control: Str): Bind {
+	mut Bind it = bind
+	if job == "steer" { it.steer = control }
+	else if job == "throttle" { it.throttle = control }
+	else if job == "brake" { it.brake = control }
+	else if job == "drift" { it.drift = control }
+	else if job == "spend" { it.spend = control }
+	else if job == "camera" { it.camera = control }
+	else if job == "board" { it.board = control }
+	return it
+}
+
+type Model {
+	screen: Screen
+	link: Link
+	// The race. Alone, this is stepped here; joined, it is the last snapshot with
+	// everything carried forward by however long ago it arrived.
+	race: control.Race
+	seed: Int
+	seat: Int
+	// Everywhere that is not the road, rolled once when the circuit is.
+	props: scenery.Prop[dyn]
+	// Who to dial, who to say you are, and what went wrong if anything did.
+	server: Str
+	me: Str
+	team: Str
+	trouble: Str
+	// The keys currently held, and the wheel angle they have eased the steering to.
+	// A key is on or off and a wheel is not, so the two are not the same thing and
+	// the easing is what makes a keyboard drivable at all.
+	held: Str[dyn]
+	wheel: Float
+	pad: Pad
+	bind: Bind
+	// Which job is waiting for a control to be moved at it, or "" for none.
+	learning: Str
+	// The token button, pressed rather than held: set by a key or a pad, and taken
+	// away again by the next frame that reads it.
+	spend: Bool
+	view: Seat
+	board: Bool
+	// How long since anything was said to the server. The controls go out thirty
+	// times a second rather than sixty — twice as often as they could usefully be
+	// acted on is already generous.
+	told: Float
+	// What the lobby's camera has turned to.
+	spin: Float
+	// The camera, which follows the car rather than being welded to it. Held here
+	// because smoothing needs to remember where it was.
+	eyeX: Float
+	eyeY: Float
+	eyeZ: Float
+	eyeYaw: Float
+}
+
+// The window's mailbox. A key, a pad, a frame, a click and everything the server
+// says all arrive at the same fold and are told apart by which variant they are.
+type Msg {
+	Tick { ms: Int }
+	Pressed { key: Str }
+	Released { key: Str }
+	// Which pad, which control on it, and where that control now is. One shape for
+	// the whole device: a button is a control that is only ever nought or one.
+	Padded { pad: Int, control: Str, at: Float }
+	Chose { team: Str }
+	Called { who: Str }
+	Dialling { url: Str }
+	// Bind this job to whatever moves next.
+	Learn { job: Str }
+	Alone
+	Join
+	Leave
+	// From the socket, posted in by the thread reading it.
+	Heard { down: wire.Down }
+	Lost { why: Str }
+	Again
+}
+
+func start(seed: Int, server: Str): Model {
+	race := control.lined(seed)
+	return Model(
+		Screen.Lobby(),
+		Link.Alone(),
+		race,
+		seed,
+		0,
+		scenery.props(race.track),
+		server,
+		"",
+		firstTeam(),
+		"",
+		[],
+		0.0,
+		nopad(),
+		standard(),
+		"",
+		false,
+		Seat.Chase(),
+		false,
+		0.0,
+		0.0,
+		0.0, 0.0, 0.0, 0.0
+	)
+}
+
+func firstTeam(): Str {
+	all := grid.teams()
+	if all bounds 0 {
+		return all[0].name
+	}
+	return ""
+}
+
+func seatOf(team: Str): Int {
+	all := grid.teams()
+	for i := 0; i < len(all); i++ {
+		if all[i].name == team {
+			return i * 2
+		}
+	}
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// The fold
+// ---------------------------------------------------------------------------
+
+// There is no mutex in this program. The fold is the mutex.
+proc update(model: Model, msg: Msg, from: hive.syslink.Envelope): Model {
+	mut Model next = model
+
+	if msg is Msg.Tick(ms) {
+		return ticked(model, math.min(0.05, conv.itf(ms) / 1000.0))
+	}
+	if msg is Msg.Pressed(key) {
+		return pressed(model, key)
+	}
+	if msg is Msg.Released(key) {
+		next.held = filter(model.held, notKey(_, key))
+		return next
+	}
+	if msg is Msg.Padded(pad, control, at) {
+		return padded(model, pad, control, at)
+	}
+	if msg is Msg.Chose(team) {
+		next.team = team
+		next.seat = seatOf(team)
+		return next
+	}
+	if msg is Msg.Called(who) {
+		next.me = who
+		return next
+	}
+	if msg is Msg.Dialling(url) {
+		next.server = url
+		return next
+	}
+	if msg is Msg.Learn(job) {
+		next.learning = job
+		return next
+	}
+	if msg is Msg.Alone {
+		next.screen = Screen.Racing()
+		next.link = Link.Alone()
+		next.seat = seatOf(model.team)
+		next.race = control.lined(model.seed)
+		next.props = scenery.props(next.race.track)
+		return next
+	}
+	if msg is Msg.Join {
+		return joining(model, from)
+	}
+	if msg is Msg.Heard(down) {
+		return told(model, down)
+	}
+	if msg is Msg.Lost(why) {
+		next.trouble = why
+		next.screen = Screen.Lobby()
+		next.link = Link.Alone()
+		return next
+	}
+	if msg is Msg.Leave {
+		return leaving(model)
+	}
+	if msg is Msg.Again {
+		return again(model)
+	}
+	return next
+}
+
+// Another circuit. Alone it is rolled here; joined it is the server's to roll, so
+// all this does is stop asking.
+func again(model: Model): Model {
+	if model.link is Link.Alone {
+		mut Model fresh = start(circuit.hash(model.seed, 7717), model.server)
+		fresh.me = model.me
+		fresh.team = model.team
+		fresh.bind = model.bind
+		return fresh
+	}
+	mut Model next = model
+	next.board = false
+	return next
+}
+
+// One frame: the world stepped or carried forward, the controls sent if there is
+// anywhere to send them, and the camera moved to wherever that put the car.
+proc ticked(model: Model, dt: Float): Model {
+	mut Model next = model
+	if model.screen is Screen.Lobby {
+		next.spin = model.spin + dt * 0.35
+		return next
+	}
+	if model.screen is Screen.Joining {
+		next.spin = model.spin + dt * 0.35
+		return next
+	}
+	next.wheel = eased(model, dt)
+	want := asking(next)
+
+	if model.link is Link.Alone {
+		// The whole of single-player, and it is the same call the server makes.
+		next.race = control.stepped(model.race,
+			[control.Asking(model.seat, want)], dt)
+	} else {
+		next.race = coasted(model.race, dt)
+		next.told = model.told + dt
+		// Thirty times a second, and at once for a press — a token spent between two
+		// sends is a token that must not wait for the second of them.
+		if next.told >= 1.0 / 30.0 || want.spending {
+			tell(model, wire.drives(want))
+			next.told = 0.0
+		}
+	}
+	// Pressed, not held: the token button is spent by the frame that reads it, so
+	// one press is one token however long the finger stays down.
+	next.spend = false
+	return watched(next, dt)
+}
+
+// The last snapshot, carried forward.
+//
+// Thirty snapshots a second describe a race that is drawn sixty times a second, so
+// half the frames have nothing new in them — and a car that only moved when a
+// snapshot arrived would judder at exactly the speeds this game is about.
+//
+// **This is the whole of the client's prediction, on purpose.** It moves each car
+// the way it was already going and it does nothing else: it does not steer, does
+// not accelerate, does not collide, does not pick anything up and never touches a
+// lap counter. A client that guessed at any of those would be a client with an
+// opinion, and the opinion would be wrong at exactly the moments that matter. What
+// this gets wrong is a car's position by a few centimetres for a thirtieth of a
+// second, and the next snapshot puts it right.
+func coasted(race: control.Race, dt: Float): control.Race {
+	mut control.Race it = race
+	mut drive.Car[dyn] cars = []
+	for each car in race.cars {
+		append(cars, drive.located(race.track, drive.moved(car, dt)))
+	}
+	it.cars = cars
+	if drive.onTrack(it.pace) {
+		it.pace.along = circuit.wrappedAlong(race.track,
+			it.pace.along + it.pace.speed * dt)
+		it.pace.node = circuit.indexAlong(race.track, it.pace.along)
+	}
+	it.clock = race.clock + dt
+	return it
+}
+
+// The wheel, eased toward wherever the keys are pointing it. A pad writes the
+// angle directly and this leaves it alone — `asking` below takes whichever of the
+// two is actually being used.
+func eased(model: Model, dt: Float): Float {
+	mut Float want = 0.0
+	if down(model, "left") || down(model, "a") {
+		want = -1.0
+	}
+	if down(model, "right") || down(model, "d") {
+		want = 1.0
+	}
+	// Toward the middle faster than away from it, which is what makes a keyboard
+	// car catchable: letting go is immediate and turning in is not.
+	rate := 5.0
+	if want == 0.0 {
+		return model.wheel + (want - model.wheel) * math.min(1.0, rate * 2.0 * dt)
+	}
+	return model.wheel + (want - model.wheel) * math.min(1.0, rate * dt)
+}
+
+// What the person at the controls is asking for.
+//
+// The pad and the keyboard are both read, every frame, and whichever is saying
+// more wins. There is no mode and nothing to switch: pick the pad up mid-race and
+// it works, put it down and the keys do.
+func asking(model: Model): drive.Wants {
+	mut Float steer = model.wheel
+	padded := padAt(model, model.bind.steer)
+	if math.abs(padded) > math.abs(steer) {
+		steer = math.clamp(padded, -1.0, 1.0)
+	}
+	mut Float throttle = math.clamp(padAt(model, model.bind.throttle), 0.0, 1.0)
+	if down(model, "up") || down(model, "w") {
+		throttle = 1.0
+	}
+	mut Float brake = math.clamp(padAt(model, model.bind.brake), 0.0, 1.0)
+	if down(model, "down") || down(model, "s") {
+		brake = 1.0
+	}
+	drifting := padAt(model, model.bind.drift) > 0.5 || down(model, "space")
+	return drive.Wants(steer, throttle, brake, drifting, model.spend)
+}
+
+func down(model: Model, key: Str): Bool {
+	return indexOf(model.held, key) is Result.Ok(_)
+}
+
+func notKey(held: Str, key: Str): Bool {
+	return held != key
+}
+
+// Where one control on the pad is now. Nought for a control the pad has never
+// mentioned, which is also the answer for a job bound to nothing.
+func padAt(model: Model, control: Str): Float {
+	if control == "" {
+		return 0.0
+	}
+	for each one in model.pad.at {
+		if one.name == control {
+			return one.at
+		}
+	}
+	return 0.0
+}
+
+func pressed(model: Model, key: Str): Model {
+	mut Model next = model
+	if key == "c" {
+		next.view = other(model.view)
+		return next
+	}
+	if key == "tab" {
+		next.board = model.board == false
+		return next
+	}
+	if key == "e" {
+		next.spend = true
+		return next
+	}
+	if down(model, key) == false {
+		append(next.held, key)
+	}
+	return next
+}
+
+func other(view: Seat): Seat {
+	if view is Seat.Chase {
+		return Seat.Cockpit()
+	}
+	return Seat.Chase()
+}
+
+// One control on one pad moved.
+//
+// The first pad to say anything takes the seat and the rest are ignored. Which
+// control this *is* is not decided here and never was in this file's gift: what
+// arrives is a name, it is written down under that name, and `Bind` says which
+// name does which job.
+func padded(model: Model, pad: Int, control: Str, at: Float): Model {
+	mut Model next = model
+	if model.pad.which >= 0 && model.pad.which != pad {
+		return next
+	}
+	next.pad.which = pad
+	// A pad that has been unplugged lets go of everything on the way out, so there
+	// is nothing to tidy up here beyond forgetting which one it was.
+	if control == "here" {
+		if at < 0.5 {
+			next.pad = nopad()
+			return next
+		}
+		// One means the browser knows this pad; two means it is reporting one whose
+		// layout it could not name, and the names are then worked out rather than
+		// given. Either way every one of them can be rebound.
+		next.pad.named = at < 1.5
+		return next
+	}
+	was := padAt(model, control)
+	next.pad.at = noted(model.pad.at, control, at)
+
+	// Learning. The first control moved hard enough claims the job — hard enough
+	// being past halfway, so that a stick resting slightly off centre does not
+	// become somebody's throttle.
+	if model.learning != "" && math.abs(at) > 0.55 {
+		next.bind = binding(model.bind, model.learning, control)
+		next.learning = ""
+		return next
+	}
+
+	// The three that are presses rather than positions, and a press is a crossing
+	// rather than a value — otherwise holding the button is sixty presses.
+	if was > 0.5 || at <= 0.5 {
+		return next
+	}
+	if control == model.bind.spend {
+		next.spend = true
+	} else if control == model.bind.camera {
+		next.view = other(model.view)
+	} else if control == model.bind.board {
+		next.board = model.board == false
+	}
+	return next
+}
+
+// One control written down. Replaced where it is already known and appended where
+// it is not, which is what makes the list of them the list of controls this device
+// actually has.
+func noted(at: Control[], control: Str, now: Float): Control[dyn] {
+	mut Control[dyn] out = []
+	mut Bool already = false
+	for each one in at {
+		if one.name == control {
+			append(out, Control(control, now))
+			already = true
+		} else {
+			append(out, one)
+		}
+	}
+	if already == false {
+		append(out, Control(control, now))
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// The socket
+// ---------------------------------------------------------------------------
+// Three procs, and between them the whole of the networking: one that opens it,
+// one that writes to it, and one thread that does nothing but read.
+
+// Joining. `wsConnect` is I/O, and a fold is a `proc`, so the fold can simply do
+// it — there is no command to return and nothing to arrange. What it must not do
+// is *wait* for the answer, so the reply arrives as a message like everything else.
+proc joining(model: Model, from: hive.syslink.Envelope): Model {
+	mut Model next = model
+	opened := hive.net.wsConnect(model.server)
+	if opened is Result.Error(problem) {
+		next.trouble = "{problem.reason} — {problem.message}"
+		return next
+	} else if opened is Result.Ok(conn) {
+		next.link = Link.Live(conn)
+		next.screen = Screen.Joining()
+		next.trouble = ""
+		// `hive.syslink.self` is the window's own address, and handing it to a thread
+		// is the whole of how the socket gets back in. From here on, anything the
+		// server says arrives at this fold as `Msg.Heard`.
+		async listening(conn, hive.syslink.self(from))
+		tell(next, wire.Up.Join(model.me, model.team))
+		return next
+	}
+	return next
+}
+
+// The reader. One thread, one loop, and everything it decodes posted at the window
+// — which is why there is no queue in this program and nothing is locked.
+proc listening(connection: hive.net.WsConnection, window: hive.syslink.Address): void {
+	for ;; {
+		heard := hive.net.wsReceive(connection)
+		if heard is Result.Error(problem) {
+			// A peer that goes away is a `Result.Error` whose reason is "Closed" — the
+			// ordinary end of a conversation rather than a failure. Either way this
+			// thread is done, and the window is told so it can say so.
+			async window(Msg.Lost("{problem.reason} — {problem.message}"))
+			return
+		} else if heard is Result.Ok(text) {
+			decoded := wire.heard(text)
+			if decoded is Result.Ok(news) {
+				async window(Msg.Heard(news))
+			} else if decoded is Result.Error(problem) {
+				// A server built against a different `lib/wire.hive`. Worth saying out
+				// loud rather than ignoring, because every symptom of it otherwise looks
+				// like a bug in the game.
+				echo "a message this client cannot read: expected {problem.expected} at {problem.path}"
+			}
+		}
+	}
+}
+
+// Everything this program says. A send that fails is not reported anywhere: the
+// reader thread is about to notice the same thing and say so once.
+proc tell(model: Model, up: wire.Up): void {
+	if model.link is Link.Live(conn) {
+		if hive.net.wsSend(conn, wire.said(up)) is Result.Error(_) {
+			return
+		}
+	}
+}
+
+// What the server said.
+func told(model: Model, down: wire.Down): Model {
+	mut Model next = model
+	if down is wire.Down.Welcome(seat, seed) {
+		next.screen = Screen.Racing()
+		next.seat = seat
+		next.seed = seed
+		next.race = control.lined(seed)
+		next.props = scenery.props(next.race.track)
+		next.board = false
+		return next
+	}
+	if down is wire.Down.Ran(at) {
+		next.race = wire.given(model.race, at)
+		return next
+	}
+	if down is wire.Down.Full {
+		next.trouble = "every seat is taken on that server"
+		next.screen = Screen.Lobby()
+		next.link = Link.Alone()
+	}
+	return next
+}
+
+// Leaving: say so, hang up, and go back to the lobby. Saying so first is a
+// courtesy that costs one message — hanging up would do, but then the others watch
+// the car drive itself into a wall until the server notices.
+proc leaving(model: Model): Model {
+	tell(model, wire.Up.Left())
+	if model.link is Link.Live(conn) {
+		hive.net.wsClose(conn)
+	}
+	mut Model fresh = start(model.seed, model.server)
+	fresh.me = model.me
+	fresh.team = model.team
+	fresh.bind = model.bind
+	fresh.pad = model.pad
+	return fresh
+}
+
+// ---------------------------------------------------------------------------
+// The camera
+// ---------------------------------------------------------------------------
+
+// Where the eye ends up. It follows the car rather than being bolted to it, and
+// the lag is the point: a camera welded to the car's heading swings through ninety
+// degrees in a drift and is unusable, while one that catches up over about a fifth
+// of a second shows you the car going sideways, which is the whole thing you are
+// trying to see.
+func watched(model: Model, dt: Float): Model {
+	mut Model next = model
+	me := control.find(model.race.cars, model.seat)
+	track := model.race.track
+	ground := circuit.heightAt(track, circuit.Where(me.node, me.along, me.across))
+	// Behind where the car is *pointing*, not where it is going — so a drift shows
+	// as the car turned across the screen rather than as the camera swinging round
+	// to hide it.
+	want := me.yaw
+	next.eyeYaw = model.eyeYaw + circuit.wrapped(want - model.eyeYaw)
+		* math.min(1.0, 7.0 * dt)
+
+	if model.view is Seat.Cockpit {
+		next.eyeX = me.x - math.sin(me.yaw) * 0.25
+		next.eyeY = ground + 1.15
+		next.eyeZ = me.z - math.cos(me.yaw) * 0.25
+		next.eyeYaw = me.yaw
+		return next
+	}
+	// The chase camera pulls back and lifts as the speed comes up, which is the
+	// cheapest way there is of making a car feel fast.
+	back := 7.4 + me.speed * 0.055
+	lift := 2.9 + me.speed * 0.014
+	wantX := me.x + math.sin(next.eyeYaw) * back
+	wantZ := me.z + math.cos(next.eyeYaw) * back
+	catch := math.min(1.0, 9.0 * dt)
+	next.eyeX = model.eyeX + (wantX - model.eyeX) * catch
+	next.eyeY = model.eyeY + (ground + lift - model.eyeY) * catch
+	next.eyeZ = model.eyeZ + (wantZ - model.eyeZ) * catch
+	return next
+}
+
+func pitchOf(model: Model): Float {
+	if model.view is Seat.Cockpit {
+		return -0.03
+	}
+	return -0.135
+}
+
+// ---------------------------------------------------------------------------
+// The picture
+// ---------------------------------------------------------------------------
+
+// A scene is a value, so this is a `func` like any other view — and like any other
+// view it cannot act. Sixty of these are built a second and thrown away.
+func world(model: Model): ui.Shape[dyn] {
+	race := model.race
+	track := race.track
+	me := control.find(race.cars, model.seat)
+	mut ui.Shape[dyn] shapes = []
+
+	// The ground everything else stands on, one plane, moved to wherever the camera
+	// is. Before there was one, the far side of the grass verge was the *sky* — and
+	// a horizon you can see under is the single most expensive-looking thing a scene
+	// can have wrong with it. It follows the camera because the fog hides its edges
+	// and nothing else has to be true of it.
+	append(shapes, ui.ground(
+		[
+			ui.at(model.eyeX, groundAt(track, me.along) - 1.35, model.eyeZ),
+			// The same green the verge is painted, which is what makes the join
+			// between the two invisible: one is a strip of boxes following the road up
+			// and down its hill and the other is a plane under the whole thing, and
+			// two greens would draw a line round the circuit at thirty metres.
+			ui.paint(ui.Tone.HEX("#6f9c55")),
+			ui.surface(ui.Surface.Turf())
+		],
+		1400.0, 1400.0
+	))
+
+	// The road, from the node behind the camera to as far ahead as the fog lets
+	// anybody see. Drawing the whole lap would be nine hundred boxes for the sake of
+	// the eight hundred nobody can see.
+	for step := -8; step < 46; step++ {
+		for each piece in laid(track, me.node + step) {
+			append(shapes, piece)
+		}
+		for each piece in scenery.verge(track, me.node + step) {
+			append(shapes, piece)
+		}
+	}
+	for each piece in gantry(track) {
+		append(shapes, piece)
+	}
+	for each piece in lights(track, race) {
+		append(shapes, piece)
+	}
+	// Everything standing beside the circuit, near enough to be worth drawing. The
+	// flag a marshal is showing is worked out per post, which is what makes a yellow
+	// something you see at the side of the road rather than a word on a strip.
+	for each prop in model.props {
+		if near(track, prop.along, me.along) == false {
+			continue
+		}
+		for each piece in scenery.shaped(prop, flagAt(race, prop.along)) {
+			append(shapes, piece)
+		}
+	}
+
+	for each crate in race.crates {
+		if crate.back <= race.clock && near(track, crate.along, me.along) {
+			append(shapes, ui.box(
+				[
+					ui.at(circuit.placeX(track, crate.along, crate.across),
+						groundAt(track, crate.along) + 1.0,
+						circuit.placeZ(track, crate.along, crate.across)),
+					// Spun by the clock, which is what makes it read as a pickup rather
+					// than as a box somebody left.
+					ui.turn(0.4, race.clock * 1.6, 0.4),
+					ui.paint(ui.Tone.HEX("#f2c14e")),
+					ui.surface(ui.Surface.Metal())
+				],
+				0.9, 0.9, 0.9
+			))
+		}
+	}
+	for each shard in race.shards {
+		if near(track, shard.along, me.along) {
+			append(shapes, ui.box(
+				[
+					ui.at(circuit.placeX(track, shard.along, shard.across),
+						groundAt(track, shard.along) + 0.08,
+						circuit.placeZ(track, shard.along, shard.across)),
+					ui.turn(0.0, conv.itf(shard.by), 0.0),
+					ui.paint(ui.Tone.HEX("#2b3037")),
+					ui.surface(ui.Surface.Carbon())
+				],
+				0.8, 0.14, 0.5
+			))
+		}
+	}
+	for each wheel in race.wheels {
+		if near(track, wheel.along, me.along) {
+			append(shapes, ui.cylinder(
+				[
+					ui.at(circuit.placeX(track, wheel.along, wheel.across),
+						groundAt(track, wheel.along) + 0.34,
+						circuit.placeZ(track, wheel.along, wheel.across)),
+					// Laid on its side, rolling: the axle points across the road.
+					ui.turn(0.0, circuit.nodeAlong(track, wheel.along).dir + math.pi(),
+						math.pi() / 2.0),
+					ui.paint(ui.Tone.HEX("#3a3d42")),
+					ui.surface(ui.Surface.Rubber())
+				],
+				0.34, 0.36
+			))
+		}
+	}
+	if drive.onTrack(race.pace) && near(track, race.pace.along, me.along) {
+		for each piece in safetyCar(track, race) {
+			append(shapes, piece)
+		}
+	}
+
+	for each car in race.cars {
+		if near(track, car.along, me.along) {
+			for each piece in bodywork(track, car, model) {
+				append(shapes, piece)
+			}
+		}
+	}
+	return shapes
+}
+
+// What a marshal standing at a place is showing.
+func flagAt(race: control.Race, along: Float): scenery.Flag {
+	for each zone in race.zones {
+		if control.inZone(race.track, zone, along) == false {
+			continue
+		}
+		if zone.yellow > 0.0 {
+			return scenery.Flag.Yellow()
+		}
+		return scenery.Flag.Green()
+	}
+	if race.pace.life > 0.0 {
+		return scenery.Flag.Yellow()
+	}
+	return scenery.Flag.Clear()
+}
+
+// Whether a thing is close enough to the camera to be worth drawing at all.
+func near(track: circuit.Circuit, along: Float, mine: Float): Bool {
+	off := circuit.nearGap(track, along, mine)
+	return off > -55.0 && off < 250.0
+}
+
+func groundAt(track: circuit.Circuit, along: Float): Float {
+	at := circuit.indexAlong(track, along)
+	return circuit.nodeAt(track, at).y
+}
+
+// One slice of road: the verge under it, the tarmac, and a kerb on each side where
+// the road bends enough to have earned one.
+//
+// It is boxes rather than the `ground` planes an earlier draft used, and for one
+// reason: a plane has no thickness, so two of them at slightly different heights on
+// a hill leave a slot you can see the sky through. A box has a bottom, and
+// consecutive boxes overlap into each other.
+func laid(track: circuit.Circuit, at: Int): ui.Shape[dyn] {
+	mut ui.Shape[dyn] shapes = []
+	node := circuit.nodeAt(track, at)
+	steep := math.abs(node.bend) > 0.006
+	// Every colour in this file is a good deal lighter than the thing it stands for.
+	// The renderer's lighting is fixed and each surface is painted over the colour in
+	// translucent black, so a shade picked to look like tarmac on a swatch comes out
+	// as tarmac at midnight. They are chosen against the picture, not the paint chart.
+	mut ui.Tone verge = ui.Tone.HEX("#6f9c55")
+	mut ui.Surface grain = ui.Surface.Turf()
+	if node.trap {
+		verge = ui.Tone.HEX("#cbb98e")
+		grain = ui.Surface.Gravel()
+	}
+	// **Every height here is written as "the top of it", minus half its thickness.**
+	// A node's `y` is the surface a car drives on, and the tops have to come out in
+	// the right order or the ground eats the road: a verge a few centimetres taller
+	// than the tarmac is a race run entirely on grass, and it looks exactly like a
+	// race run entirely on grass.
+	append(shapes, ui.box(
+		[
+			ui.at(node.x, node.y - 0.15 - 0.70, node.z),
+			ui.turn(0.0, node.dir, 0.0),
+			ui.paint(verge),
+			ui.surface(grain)
+		],
+		scenery.mown() * 2.0, 1.4, along(track, node, scenery.mown())
+	))
+	append(shapes, ui.box(
+		[
+			ui.at(node.x, node.y - 0.275, node.z),
+			ui.turn(0.0, node.dir, 0.0),
+			ui.paint(ui.Tone.HEX("#61686f")),
+			ui.surface(ui.Surface.Tarmac())
+		],
+		node.half * 2.0, 0.55, along(track, node, node.half)
+	))
+	if steep == false {
+		return shapes
+	}
+	for each side in [-1.0, 1.0] {
+		off := (node.half + 0.85) * side
+		append(shapes, ui.box(
+			[
+				ui.at(node.x + math.cos(node.dir) * off,
+					node.y + 0.06 - 0.16,
+					node.z - math.sin(node.dir) * off),
+				ui.turn(0.0, node.dir, 0.0),
+				ui.paint(ui.Tone.HEX("#d3353d")),
+				ui.surface(ui.Surface.Kerb())
+			],
+			1.7, 0.32, along(track, node, node.half + 1.7)
+		))
+	}
+	// A marker cone every so often on the outside of a corner, which is the one
+	// thing that tells you how fast the corner is tightening.
+	if at % 6 != 0 {
+		return shapes
+	}
+	mut Float outside = node.half + 3.4
+	if node.bend > 0.0 {
+		outside = -outside
+	}
+	append(shapes, ui.cone(
+		[
+			ui.at(node.x + math.cos(node.dir) * outside,
+				node.y + 0.28,
+				node.z - math.sin(node.dir) * outside),
+			ui.paint(ui.Tone.HEX("#ff5a1f")),
+			ui.surface(ui.Surface.Gloss())
+		],
+		0.04, 0.24, 0.62
+	))
+	return shapes
+}
+
+// How long to cut a slab of road `wide` metres across, so that it still meets the
+// next one.
+//
+// **A slab is a rectangle and a corner is not.** Two rectangles laid end to end
+// round a bend overlap on the inside of it and leave a wedge between them on the
+// outside, and a wedge in the ground is a wedge of sky — which is what a hairpin
+// looked like until this function existed. The outer edge of a corner of radius r
+// is longer than the middle by (r + w) / r, which is one plus the width times the
+// curvature; that is exactly the factor a slab has to grow by. On a straight it
+// comes to one and costs nothing.
+//
+// Overlapping is free: two boxes in the same place are two boxes in the same place,
+// and nobody can see the join.
+func along(track: circuit.Circuit, node: circuit.Node, wide: Float): Float {
+	fan := 1.0 + math.abs(node.bend) * wide
+	return circuit.spacing(track) * fan * 1.08
+}
+
+// The start line, and the gantry over it.
+func gantry(track: circuit.Circuit): ui.Shape[dyn] {
+	mut ui.Shape[dyn] shapes = []
+	node := circuit.nodeAt(track, 0)
+	append(shapes, ui.box(
+		[
+			ui.at(node.x, node.y + 0.02, node.z),
+			ui.turn(0.0, node.dir, 0.0),
+			ui.paint(ui.Tone.HEX("#e8ecef")),
+			ui.surface(ui.Surface.Gloss())
+		],
+		node.half * 2.0, 0.05, 1.1
+	))
+	for each side in [-1.0, 1.0] {
+		off := (node.half + 1.6) * side
+		append(shapes, ui.cylinder(
+			[
+				ui.at(node.x + math.cos(node.dir) * off,
+					node.y + 3.2,
+					node.z - math.sin(node.dir) * off),
+				ui.paint(ui.Tone.HEX("#b6c2ce")),
+				ui.surface(ui.Surface.Metal())
+			],
+			0.16, 6.6
+		))
+	}
+	append(shapes, ui.box(
+		[
+			ui.at(node.x, node.y + 6.3, node.z),
+			ui.turn(0.0, node.dir, 0.0),
+			ui.paint(ui.Tone.HEX("#b6c2ce")),
+			ui.surface(ui.Surface.Metal())
+		],
+		node.half * 2.0 + 3.2, 0.7, 0.5
+	))
+	return shapes
+}
+
+// Five lights on the gantry, and they go out rather than turning green — which is
+// what a Formula One start is and is the only bit of the ceremony that matters.
+func lights(track: circuit.Circuit, race: control.Race): ui.Shape[dyn] {
+	mut ui.Shape[dyn] shapes = []
+	if race.lights <= 0.0 {
+		return shapes
+	}
+	node := circuit.nodeAt(track, 0)
+	// One more comes on every fifth of the countdown.
+	lit := 5 - conv.floor(race.lights / control.countdown() * 5.0)
+	for i := 0; i < 5; i++ {
+		off := (conv.itf(i) - 2.0) * 1.5
+		mut ui.Tone bulb = ui.Tone.HEX("#2a1416")
+		if i < lit {
+			bulb = ui.Tone.HEX("#ff2d2d")
+		}
+		append(shapes, ui.sphere(
+			[
+				ui.at(node.x + math.cos(node.dir) * off,
+					node.y + 5.9,
+					node.z - math.sin(node.dir) * off),
+				ui.paint(bulb),
+				ui.surface(ui.Surface.Gloss())
+			],
+			0.34
+		))
+	}
+	return shapes
+}
+
+// The safety car: a estate car in orange with a light bar on the roof, and the
+// bar flashes. It is drawn a great deal more simply than a racing car because it
+// is a thing you see from behind at a bad moment, and because the one thing it has
+// to be is *unmistakable at two hundred metres* — which is the orange and the
+// flashing, not the bodywork.
+func safetyCar(track: circuit.Circuit, race: control.Race): ui.Shape[dyn] {
+	one := race.pace
+	base := groundAt(track, one.along) + 0.1
+	x := circuit.placeX(track, one.along, one.across)
+	z := circuit.placeZ(track, one.along, one.across)
+	yaw := circuit.nodeAt(track, one.node).dir
+	// Flashing: half a second on, half off, off the race clock so every window in a
+	// multiplayer race sees it flash together.
+	blue := conv.floor(race.clock * 4.0) % 2 == 0
+	mut ui.Tone left = ui.Tone.HEX("#1d5fd0")
+	mut ui.Tone right = ui.Tone.HEX("#f2c14e")
+	if blue == false {
+		left = ui.Tone.HEX("#0d1013")
+		right = ui.Tone.HEX("#0d1013")
+	}
+	return [
+		ui.box(
+			[
+				ui.at(x, base + 0.55, z),
+				ui.turn(0.0, yaw, 0.0),
+				ui.paint(ui.Tone.HEX("#ff8000")),
+				ui.surface(ui.Surface.Gloss())
+			],
+			1.9, 0.9, 4.6
+		),
+		ui.box(
+			[
+				ui.at(x, base + 1.25, z),
+				ui.turn(0.0, yaw, 0.0),
+				ui.paint(ui.Tone.RGBA(150, 190, 214, 200)),
+				ui.surface(ui.Surface.Glass())
+			],
+			1.7, 0.62, 2.6
+		),
+		ui.box(
+			[
+				ui.at(x - math.cos(yaw) * 0.42, base + 1.68, z + math.sin(yaw) * 0.42),
+				ui.turn(0.0, yaw, 0.0),
+				ui.paint(left),
+				ui.surface(ui.Surface.Gloss())
+			],
+			0.6, 0.2, 0.5
+		),
+		ui.box(
+			[
+				ui.at(x + math.cos(yaw) * 0.42, base + 1.68, z - math.sin(yaw) * 0.42),
+				ui.turn(0.0, yaw, 0.0),
+				ui.paint(right),
+				ui.surface(ui.Surface.Gloss())
+			],
+			0.6, 0.2, 0.5
+		),
+		ui.label(
+			[ui.at(x, base + 2.5, z), ui.paint(ui.Tone.HEX("#ff8000"))],
+			"SAFETY CAR"
+		)
+	]
+}
+
+// One car. Ten shapes and a name, and every one of them is placed off the car's
+// own yaw, so the whole thing turns together.
+//
+// **The nose and the wheels are the two that need the awkward rotation.** A cone
+// and a cylinder both stand on their end, and a nose points forwards while an axle
+// points sideways. `along` and `axle` below are the two Euler triples that do it,
+// worked out once each rather than in ten places.
+func bodywork(track: circuit.Circuit, car: drive.Car, model: Model): ui.Shape[dyn] {
+	mut ui.Shape[dyn] shapes = []
+	team := grid.teamOf(car.seat)
+	one := grid.driverOf(car.seat)
+	base := circuit.heightAt(track, circuit.Where(car.node, car.along, car.across))
+	yaw := car.yaw
+	// The three directions everything on the car is placed along.
+	forwardX := -math.sin(yaw)
+	forwardZ := -math.cos(yaw)
+	rightX := math.cos(yaw)
+	rightZ := -math.sin(yaw)
+
+	// The floor: the widest, flattest, blackest thing on the car, and what makes it
+	// read as a single-seater rather than as a box on wheels.
+	append(shapes, ui.box(
+		[
+			ui.at(car.x, base + 0.14, car.z),
+			ui.turn(0.0, yaw, 0.0),
+			ui.paint(ui.Tone.HEX("#2b3037")),
+			ui.surface(ui.Surface.Carbon())
+		],
+		1.55, 0.10, 4.4
+	))
+	// The body, in the team's colour.
+	append(shapes, ui.box(
+		[
+			ui.at(car.x + forwardX * 0.25, base + 0.40, car.z + forwardZ * 0.25),
+			ui.turn(0.0, yaw, 0.0),
+			ui.paint(ui.Tone.HEX(team.body)),
+			ui.surface(ui.Surface.Gloss())
+		],
+		0.78, 0.44, 2.7
+	))
+	// The sidepods.
+	for each side in [-1.0, 1.0] {
+		append(shapes, ui.box(
+			[
+				ui.at(car.x + rightX * 0.62 * side - forwardX * 0.35,
+					base + 0.34,
+					car.z + rightZ * 0.62 * side - forwardZ * 0.35),
+				ui.turn(0.0, yaw, 0.0),
+				ui.paint(ui.Tone.HEX(team.body)),
+				ui.surface(ui.Surface.Gloss())
+			],
+			0.48, 0.36, 1.7
+		))
+	}
+	// The nose. A cone with a blade rather than a point, which is what one is.
+	append(shapes, ui.cone(
+		[
+			ui.at(car.x + forwardX * 2.1, base + 0.30, car.z + forwardZ * 2.1),
+			ui.turn(0.0, yaw - math.pi() / 2.0, math.pi() / 2.0),
+			ui.paint(ui.Tone.HEX(team.body)),
+			ui.surface(ui.Surface.Gloss())
+		],
+		0.05, 0.30, 1.5
+	))
+	// The front wing, and the rear one.
+	append(shapes, ui.box(
+		[
+			ui.at(car.x + forwardX * 2.75, base + 0.11, car.z + forwardZ * 2.75),
+			ui.turn(0.0, yaw, 0.0),
+			ui.paint(ui.Tone.HEX(team.trim)),
+			ui.surface(ui.Surface.Carbon())
+		],
+		1.85, 0.08, 0.55
+	))
+	append(shapes, ui.box(
+		[
+			ui.at(car.x - forwardX * 2.0, base + 0.78, car.z - forwardZ * 2.0),
+			// A wing that is open is turned flat, which is what a wing that is open
+			// looks like and is the only tell anybody has that somebody has DRS.
+			ui.turn(wingTilt(car), yaw, 0.0),
+			ui.paint(ui.Tone.HEX(team.trim)),
+			ui.surface(ui.Surface.Carbon())
+		],
+		1.25, 0.30, 0.12
+	))
+	// The airbox over the driver's head, and the helmet under it.
+	append(shapes, ui.cone(
+		[
+			ui.at(car.x - forwardX * 0.85, base + 0.86, car.z - forwardZ * 0.85),
+			ui.paint(ui.Tone.HEX(team.body)),
+			ui.surface(ui.Surface.Gloss())
+		],
+		0.13, 0.24, 0.44
+	))
+	append(shapes, ui.sphere(
+		[
+			ui.at(car.x - forwardX * 0.35, base + 0.72, car.z - forwardZ * 0.35),
+			ui.paint(ui.Tone.HEX(one.helmet)),
+			ui.surface(ui.Surface.Gloss())
+		],
+		0.21
+	))
+	// Four wheels, lying on their sides.
+	for each side in [-1.0, 1.0] {
+		for each end in [-1.0, 1.0] {
+			mut Float wide = 0.86
+			if end > 0.0 {
+				wide = 0.80
+			}
+			append(shapes, ui.cylinder(
+				[
+					ui.at(car.x + rightX * wide * side + forwardX * 1.45 * end,
+						base + 0.33,
+						car.z + rightZ * wide * side + forwardZ * 1.45 * end),
+					ui.turn(0.0, yaw + math.pi(), math.pi() / 2.0),
+					ui.paint(tyre(car)),
+					ui.surface(ui.Surface.Rubber())
+				],
+				0.33, 0.34
+			))
+		}
+	}
+	// What it is doing, if it is doing anything. The plume is translucent, which is
+	// the only way a thing behind a car can be seen through and therefore the only
+	// way it can be behind a car at all.
+	if car.deploy > 0.0 || car.wing > 0.0 {
+		append(shapes, ui.box(
+			[
+				ui.at(car.x - forwardX * 3.4, base + 0.5, car.z - forwardZ * 3.4),
+				ui.turn(0.0, yaw, 0.0),
+				ui.paint(ui.Tone.RGBA(120, 200, 255, 96)),
+				ui.surface(ui.Surface.Gloss())
+			],
+			1.0, 0.7, 2.4
+		))
+	}
+	if car.spun > 0.0 {
+		append(shapes, ui.label(
+			[ui.at(car.x, base + 2.3, car.z), ui.paint(ui.Tone.HEX("#ffd166"))],
+			"!"
+		))
+	}
+	// The name, but not your own — you know who you are, and a label in the middle
+	// of the screen is a label in the way.
+	if car.seat != model.seat {
+		append(shapes, ui.label(
+			[ui.at(car.x, base + 1.7, car.z), ui.paint(ui.Tone.HEX(team.body))],
+			"{one.tag}"
+		))
+	}
+	return shapes
+}
+
+// How far the rear wing is tipped. Shut it stands up; open it lies down.
+func wingTilt(car: drive.Car): Float {
+	if car.wing > 0.0 {
+		return math.pi() / 2.4
+	}
+	return 0.0
+}
+
+// What colour the tyres are, which is how you tell at a glance that somebody has
+// just put a new set on or is running on a flat.
+func tyre(car: drive.Car): ui.Tone {
+	if car.hurt > 0.0 {
+		return ui.Tone.HEX("#7a4a4a")
+	}
+	if car.fresh > 0.0 {
+		return ui.Tone.HEX("#e0343f")
+	}
+	return ui.Tone.HEX("#3a3d42")
+}
+
+// ---------------------------------------------------------------------------
+// The window
+// ---------------------------------------------------------------------------
+
+func view(model: Model): ui.View {
+	if model.screen is Screen.Racing {
+		// **The picture is the whole window, and everything else floats over it.**
+		// Nothing here takes a pixel of road away to sit in, which is the point: a
+		// racing game's screen is one big picture with small things at the edges, and
+		// every one of those small things is something read out of the corner of the
+		// eye while looking somewhere else.
+		//
+		// The instruments are along the top — the map on the left, what the car is
+		// doing in the middle, the dial on the right — and race control talks along
+		// the bottom. The pit board is pinned rather than in the flow for the same
+		// reason the other two are: with it in the flow it owned the top strip, and
+		// the two corners the instruments want *are* the top strip.
+		return ui.column([ui.height(0), ui.grow(1)], [
+			picture(model),
+			ui.overlay([ui.align(ui.Align.Start()), ui.justify(ui.Justify.Start())],
+				board.map(model.race, model.seat)),
+			ui.overlay([ui.align(ui.Align.Start()), ui.justify(ui.Justify.Center())],
+				pitboard(model)),
+			ui.overlay([ui.align(ui.Align.Start()), ui.justify(ui.Justify.End())],
+				board.dial(model.race, model.seat)),
+			ui.overlay([ui.align(ui.Align.End()), ui.justify(ui.Justify.Center())],
+				strip(model)),
+			panel(model)
+		])
+	}
+	// The lobby has a scene in it too, and it is not decoration: **a browser will
+	// not report a gamepad to a page that is not reading one**, so a lobby with no
+	// scene is a lobby in which no controller can be set up. It shows the grid,
+	// slowly turning, which is somewhere to look while you decide.
+	return ui.column([ui.height(0), ui.grow(1)], [
+		picture(model),
+		lobby(model)
+	])
+}
+
+// The scene, which is one widget in both screens and carries every event this
+// program hears from the picture.
+func picture(model: Model): ui.View {
+	return ui.scene(
+		[
+			ui.grow(1),
+			ui.eye(eyeOf(model, 0), eyeOf(model, 1), eyeOf(model, 2)),
+			ui.aim(aimOf(model), pitchOf(model)),
+			ui.lens(lensOf(model)),
+			// Far enough to see the corner after next, and not so far that the whole
+			// lap is on the screen at once.
+			ui.fog(260),
+			ui.background(ui.Tone.HEX("#8fb6d6")),
+			// The mouse is left alone: nothing here needs it, and a game that takes the
+			// pointer is a game you cannot click a button in.
+			ui.grab(false),
+			ui.crosshair(false),
+			ui.onFrame(Msg.Tick(_)),
+			ui.onKeyDown(Msg.Pressed(_)),
+			ui.onKeyUp(Msg.Released(_)),
+			ui.onPad(Msg.Padded(_, _, _))
+		],
+		world(model)
+	)
+}
+
+// Where the eye is. Racing it is wherever `watched` put it; in the lobby it circles
+// the grid slot of the garage you are looking at, which is both a view of your own
+// car and a view of the pit lane behind it.
+func eyeOf(model: Model, which: Int): Float {
+	if model.screen is Screen.Racing {
+		if which == 0 { return model.eyeX }
+		if which == 1 { return model.eyeY }
+		return model.eyeZ
+	}
+	spot := drive.gridSpot(model.race.track, seatOf(model.team))
+	middle := circuit.placed(model.race.track, spot.along, spot.across)
+	if which == 0 { return middle.x + math.sin(model.spin) * 11.0 }
+	if which == 1 {
+		return groundAt(model.race.track, spot.along) + 3.4
+	}
+	return middle.z + math.cos(model.spin) * 11.0
+}
+
+func aimOf(model: Model): Float {
+	if model.screen is Screen.Racing {
+		return model.eyeYaw
+	}
+	return model.spin
+}
+
+func lensOf(model: Model): Int {
+	if model.view is Seat.Cockpit {
+		return 82
+	}
+	return 74
+}
+
+// ---------------------------------------------------------------------------
+// The lobby
+// ---------------------------------------------------------------------------
+
+func lobby(model: Model): ui.View {
+	mut Str[dyn] names = []
+	for each team in grid.teams() {
+		append(names, team.name)
+	}
+	seat := seatOf(model.team)
+	team := grid.teamOf(seat)
+	return ui.column([ui.pad(16), ui.gap(10), ui.height(430), ui.scroll(ui.Axis.Vertical())], [
+		ui.row([ui.gap(14), ui.align(ui.Align.Center())], [
+			ui.text([ui.size(ui.TextSize.Title()), ui.heading(1)], "Formula Kart"),
+			ui.text([ui.tone(ui.Tone.Muted())],
+				"{model.race.track.name} · {conv.round(model.race.track.length)} metres · {model.race.track.laps} laps · {grid.field()} cars · seed {model.seed}"),
+			ui.spacer(),
+			trouble(model)
+		]),
+		ui.row([ui.gap(10), ui.align(ui.Align.Center())], [
+			ui.text([ui.width(66), ui.tone(ui.Tone.Muted()),
+				ui.size(ui.TextSize.Caption())], "GARAGE"),
+			ui.select([ui.onChoose(Msg.Chose(_))], names, model.team),
+			lineup(seat, team)
+		]),
+		ui.row([ui.gap(10), ui.align(ui.Align.Center())], [
+			ui.text([ui.width(66), ui.tone(ui.Tone.Muted()),
+				ui.size(ui.TextSize.Caption())], "NAME"),
+			ui.input([ui.onInput(Msg.Called(_)), ui.placeholder("who you are"),
+				ui.width(200)], model.me),
+			ui.text([ui.width(66), ui.tone(ui.Tone.Muted()),
+				ui.size(ui.TextSize.Caption())], "SERVER"),
+			ui.input([ui.onInput(Msg.Dialling(_)),
+				ui.placeholder("ws://host:9300/race"), ui.grow(1)], model.server),
+			ui.button([ui.on(Msg.Join()), ui.tone(ui.Tone.Good()),
+				ui.disabled(model.server == "")], joinLabel(model))
+		]),
+		ui.row([ui.gap(10), ui.align(ui.Align.Center())], [
+			ui.button([ui.on(Msg.Alone()), ui.kind(ui.InputKind.Text())],
+				"Race the bots here"),
+			ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+				"Arrows or W A S D · SPACE holds a drift, and letting go deploys it · E spends what you picked up · C camera · TAB standings")
+		]),
+		ui.text([ui.size(ui.TextSize.Subtitle())], "The controller"),
+		padline(model),
+		ui.row([ui.gap(6)], controls(model)),
+		live(model)
+	])
+}
+
+func trouble(model: Model): ui.View {
+	if model.trouble == "" {
+		return ui.none()
+	}
+	return ui.text([ui.tone(ui.Tone.Danger()), ui.size(ui.TextSize.Caption())],
+		model.trouble)
+}
+
+func joinLabel(model: Model): Str {
+	if model.screen is Screen.Joining {
+		return "joining…"
+	}
+	return "Join that race"
+}
+
+// Who is in the garage you picked, which is the one thing about the choice that
+// changes how the race goes.
+func lineup(seat: Int, team: grid.Team): ui.View {
+	you := grid.driverOf(seat)
+	mate := grid.driverOf(grid.partner(seat))
+	return ui.row([ui.gap(12), ui.align(ui.Align.Center()), ui.pad(6),
+		ui.background(ui.Tone.Muted()), ui.grow(1)], [
+		ui.text([ui.background(ui.Tone.HEX(team.body)),
+			ui.tone(ui.Tone.HEX("#ffffff")), ui.pad(6)], " {team.tag} "),
+		ui.text([], "{you.number} {you.name}"),
+		ui.text([ui.tone(ui.Tone.Muted())], "with {mate.number} {mate.name}"),
+		ui.spacer(),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"car {conv.fts(team.machine)} · your second driver will let you past, and nobody else will")
+	])
+}
+
+// What the pad is, said as a diagnostic rather than as a label. "no pad" and "pad
+// 0, layout worked out" want two different things done about them, and neither is
+// obvious from a car that will not steer.
+func padline(model: Model): ui.View {
+	if model.pad.which < 0 {
+		return ui.text([ui.tone(ui.Tone.Muted()), ui.size(ui.TextSize.Caption())],
+			"No pad yet — press something on it. A browser will not admit one exists until it has been used, and it only looks while this window has the focus.")
+	}
+	if model.pad.named {
+		return ui.text([ui.tone(ui.Tone.Good()), ui.size(ui.TextSize.Caption())],
+			"Pad {model.pad.which}, and the browser knows this one — the names below are its own. Rebind anything that is not where you want it.")
+	}
+	return ui.text([ui.tone(ui.Tone.Warn()), ui.size(ui.TextSize.Caption())],
+		"Pad {model.pad.which}, layout worked out rather than given — the browser has no name for this device. The names below are a good guess. If a pedal is on the wrong control, press learn and squeeze it.")
+}
+
+// One line per job: what it is, what it is bound to, and a button that binds it to
+// whatever moves next.
+func controls(model: Model): ui.View[dyn] {
+	mut ui.View[dyn] out = []
+	for each job in jobs() {
+		append(out, ui.column([ui.gap(3), ui.pad(6), ui.background(ui.Tone.Muted())], [
+			ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+				upper(job)),
+			ui.text([], shownAs(model, job)),
+			ui.button([ui.on(Msg.Learn(job)), ui.kind(ui.InputKind.Text()),
+				ui.tone(learningTone(model, job))], learnLabel(model, job))
+		]))
+	}
+	return out
+}
+
+func shownAs(model: Model, job: Str): Str {
+	control := bound(model.bind, job)
+	if control == "" {
+		return "—"
+	}
+	return control
+}
+
+func learnLabel(model: Model, job: Str): Str {
+	if model.learning == job {
+		return "move it…"
+	}
+	return "learn"
+}
+
+func learningTone(model: Model, job: Str): ui.Tone {
+	if model.learning == job {
+		return ui.Tone.Good()
+	}
+	return ui.Tone.Normal()
+}
+
+func upper(word: Str): Str {
+	mut Str[dyn] out = []
+	for each letter in split(word, "") {
+		append(out, letter)
+	}
+	return join(out, "")
+}
+
+// Everything the pad is saying, right now. It is the thing that was missing: a
+// controller that does nothing and says nothing about why is a controller nobody
+// can fix, and one line showing every control it has and where each of them is
+// answers "is it the pad, the browser, or the binding" in one look.
+func live(model: Model): ui.View {
+	if model.pad.which < 0 {
+		return ui.none()
+	}
+	mut ui.View[dyn] out = []
+	for each one in model.pad.at {
+		if math.abs(one.at) < 0.02 {
+			continue
+		}
+		append(out, ui.text([ui.pad(4), ui.background(ui.Tone.Muted()),
+			ui.size(ui.TextSize.Caption())],
+			" {one.name} {conv.fts(one.at)} "))
+	}
+	if len(out) == 0 {
+		return ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"Everything on it is at rest. Move something and it will appear here.")
+	}
+	return ui.row([ui.gap(6), ui.align(ui.Align.Center())], out)
+}
+
+// ---------------------------------------------------------------------------
+// The pit board
+// ---------------------------------------------------------------------------
+
+func pitboard(model: Model): ui.View {
+	race := model.race
+	me := control.find(race.cars, model.seat)
+	place := control.placeOf(race.cars, me) + 1
+	// It sits between the map and the dial rather than spanning the window, so the
+	// two `spacer`s that used to push this apart have nothing left to push against
+	// and are gone. What is left is sized by its own content, which is what keeps
+	// the two corners clear of it.
+	return ui.row([ui.pad(8), ui.gap(11), ui.align(ui.Align.Center()),
+		ui.background(ui.Tone.RGBA(13, 16, 19, 190))], [
+		ui.text([ui.size(ui.TextSize.Title()), ui.heading(1)], "P{place}"),
+		ui.text([ui.tone(ui.Tone.Muted())], "of {grid.field()}"),
+		ui.text([ui.size(ui.TextSize.Subtitle())],
+			"LAP {math.min(conv.itf(me.sheet.lap + 1), conv.itf(race.track.laps))}/{race.track.laps}"),
+		ui.text([ui.background(ui.Tone.HEX(grid.bodyOf(model.seat))),
+			ui.tone(ui.Tone.HEX("#ffffff")), ui.pad(4)],
+			" {grid.driverOf(model.seat).tag} "),
+		harvest(me),
+		token(me, race),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())], "GAP"),
+		ui.text([], control.gapped(control.interval(race, model.seat))),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())], "LAST"),
+		ui.text([], control.clocked(me.sheet.last)),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())], "BEST"),
+		ui.text([ui.tone(ui.Tone.Good())], control.clocked(me.sheet.best)),
+		penalties(me)
+	])
+}
+
+// The energy, and it is the one gauge on the board worth watching: eight cells,
+// with the three level marks lit as they are reached. Drifting fills it and letting
+// go spends it.
+func harvest(me: drive.Car): ui.View {
+	mut ui.View[dyn] cells = []
+	for i := 0; i < 8; i++ {
+		full := me.harvest / drive.harvestCap() * 8.0
+		mut ui.Tone shade = ui.Tone.HEX("#22272d")
+		if conv.itf(i) < full {
+			shade = ui.Tone.HEX("#2fbf71")
+			if me.harvest >= drive.harvestFor(3) {
+				shade = ui.Tone.HEX("#c86bff")
+			} else if me.harvest >= drive.harvestFor(2) {
+				shade = ui.Tone.HEX("#f0b429")
+			}
+		}
+		append(cells, ui.text([ui.width(9), ui.height(14), ui.background(shade)], " "))
+	}
+	return ui.row([ui.gap(8), ui.align(ui.Align.Center())], [
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			deploying(me)),
+		ui.row([ui.gap(2), ui.align(ui.Align.Center())], cells)
+	])
+}
+
+func deploying(me: drive.Car): Str {
+	if me.deploy > 0.0 {
+		return "DEPLOY"
+	}
+	if me.wing > 0.0 {
+		return "DRS"
+	}
+	return "ERS"
+}
+
+// What is in the car, and whether pressing the button would do anything with it.
+func token(me: drive.Car, race: control.Race): ui.View {
+	if me.holding is drive.Token.Nothing {
+		return ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"no parts")
+	}
+	mut ui.Tone shade = ui.Tone.Good()
+	if usable(me, race) == false {
+		shade = ui.Tone.Muted()
+	}
+	return ui.text(
+		[ui.background(shade), ui.tone(ui.Tone.HEX("#0d1013")), ui.pad(4)],
+		" {drive.tokenName(me.holding)} · E "
+	)
+}
+
+// Whether the token in the car can be spent where it is standing. The wing only
+// opens on a straight and the safety car cannot be called twice in a row, and
+// greying the label is cheaper than letting somebody press it and wonder.
+func usable(me: drive.Car, race: control.Race): Bool {
+	if me.holding is drive.Token.Wing {
+		return math.abs(circuit.nodeAt(race.track, me.node).bend) <= drive.wingStraight()
+	}
+	if me.holding is drive.Token.Safety {
+		return race.clock >= race.safetyAgain && drive.onTrack(race.pace) == false
+	}
+	return true
+}
+
+// The two counts that cost time, and they are shown apart because they are two
+// different things to have done.
+func penalties(me: drive.Car): ui.View {
+	mut ui.View[dyn] out = []
+	if me.sheet.warnings > 0 {
+		append(out, ui.text([ui.tone(ui.Tone.Warn()), ui.size(ui.TextSize.Caption())],
+			"LIMITS {me.sheet.warnings}/{drive.allowed()}"))
+	}
+	if me.sheet.ignored > 0 {
+		append(out, ui.text([ui.tone(ui.Tone.Warn()), ui.size(ui.TextSize.Caption())],
+			"FLAGS {me.sheet.ignored}/{drive.ignorable()}"))
+	}
+	if me.sheet.penalty > 0.0 {
+		append(out, ui.text([ui.tone(ui.Tone.Danger())],
+			"+{conv.round(me.sheet.penalty)}s"))
+	}
+	if len(out) == 0 {
+		return ui.none()
+	}
+	return ui.row([ui.gap(8), ui.align(ui.Align.Center())], out)
+}
+
+// ---------------------------------------------------------------------------
+// The strip along the bottom
+// ---------------------------------------------------------------------------
+
+// What race control has been saying, the flag where you are, and — small, at the
+// bottom — what the keys do. One pinned column between the map and the dial.
+func strip(model: Model): ui.View {
+	mut ui.View[dyn] rows = []
+	for each note in model.race.notes {
+		append(rows, ui.text([ui.tone(colourOf(note.kind)),
+			ui.size(ui.TextSize.Caption())], note.text))
+	}
+	append(rows, ui.row([ui.gap(12), ui.align(ui.Align.Center()), ui.pad(4)], [
+		flag(model.race, model.seat),
+		ui.spacer(),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"SPACE drifts · E spends · C camera · TAB standings"),
+		padBadge(model),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			where(model)),
+		quit(model)
+	]))
+	// Over a picture rather than over a page, so it carries its own dark behind it.
+	// Race control's messages are the one thing on the screen you read a *word* of
+	// rather than a shape, and a word of pale text on a sunlit grass verge is a word
+	// nobody reads.
+	return ui.column([
+		ui.width(760),
+		ui.pad(8),
+		ui.gap(1),
+		ui.justify(ui.Justify.End()),
+		ui.align(ui.Align.Stretch()),
+		ui.background(ui.Tone.RGBA(13, 16, 19, 190))
+	], rows)
+}
+
+func colourOf(kind: control.Kind): ui.Tone {
+	if kind is control.Kind.Info { return ui.Tone.Normal() }
+	else if kind is control.Kind.Warn { return ui.Tone.Warn() }
+	else if kind is control.Kind.Good { return ui.Tone.Good() }
+	else if kind is control.Kind.Fast { return ui.Tone.HEX("#c86bff") }
+}
+
+// Whether there is a pad, said in three characters. It is on the racing screen
+// rather than only in the lobby because a controller that stops being noticed
+// mid-race — the browser loses the focus, somebody unplugs it, the batteries go —
+// is a car that stops steering, and "PAD 0" going out is the only thing that says
+// which of the many possible reasons it was.
+func padBadge(model: Model): ui.View {
+	if model.pad.which < 0 {
+		return ui.none()
+	}
+	mut ui.Tone shade = ui.Tone.Good()
+	if model.pad.named == false {
+		shade = ui.Tone.Warn()
+	}
+	return ui.text([ui.size(ui.TextSize.Caption()), ui.tone(shade)],
+		"PAD {model.pad.which}")
+}
+
+func where(model: Model): Str {
+	if model.link is Link.Live(_) {
+		return "on {model.server}"
+	}
+	return "alone against {grid.field() - 1} bots"
+}
+
+func quit(model: Model): ui.View {
+	if model.link is Link.Live(_) {
+		return ui.button([ui.on(Msg.Leave()), ui.kind(ui.InputKind.Text())], "Leave")
+	}
+	return ui.none()
+}
+
+// What flag is out **where you are**, which is the one thing on the screen that
+// has to be seen without being looked for. It says the same thing the map says and
+// the same thing the marshal beside the road says; three of them, because the one
+// you happen to be looking at is the one that has to tell you.
+func flag(race: control.Race, seat: Int): ui.View {
+	me := control.find(race.cars, seat)
+	delta := control.deltaAt(race, me.along)
+	if race.pace.life > 0.0 {
+		return ui.text([ui.background(ui.Tone.Warn()),
+			ui.tone(ui.Tone.HEX("#0d1013")), ui.pad(4)],
+			" SAFETY CAR — DELTA {conv.round(delta * 3.6)} ")
+	}
+	if delta > 0.0 {
+		mut ui.Tone shade = ui.Tone.HEX("#f0b429")
+		mut Str said = " YELLOW — DELTA {conv.round(delta * 3.6)} "
+		if me.speed > delta {
+			shade = ui.Tone.Danger()
+			said = " YELLOW — SLOW DOWN "
+		}
+		return ui.text([ui.background(shade), ui.tone(ui.Tone.HEX("#0d1013")),
+			ui.pad(4)], said)
+	}
+	// A green is worth its moment on the strip too, because the thing it is saying
+	// is that you may go again — which is not something you want to have to infer
+	// from a yellow having stopped being drawn.
+	for each zone in race.zones {
+		if zone.green > 0.0 && control.inZone(race.track, zone, me.along) {
+			return ui.text([ui.background(ui.Tone.Good()),
+				ui.tone(ui.Tone.HEX("#0d1013")), ui.pad(4)], " GREEN ")
+		}
+	}
+	return ui.none()
+}
+
+// ---------------------------------------------------------------------------
+// Whatever is in front of the race
+// ---------------------------------------------------------------------------
+
+func panel(model: Model): ui.View {
+	if model.race.over {
+		return ui.overlay([ui.pad(24)], classification(model))
+	}
+	if model.race.lights > 0.0 {
+		return ui.overlay([ui.pad(24)], grid5(model))
+	}
+	if model.board {
+		return ui.overlay([ui.pad(24)], standings(model, false))
+	}
+	return ui.none()
+}
+
+func grid5(model: Model): ui.View {
+	lit := 5 - conv.floor(model.race.lights / control.countdown() * 5.0)
+	mut ui.View[dyn] bulbs = []
+	for i := 0; i < 5; i++ {
+		mut ui.Tone shade = ui.Tone.HEX("#2a1416")
+		if i < lit {
+			shade = ui.Tone.HEX("#ff2d2d")
+		}
+		append(bulbs, ui.text([ui.width(34), ui.height(34), ui.background(shade)], " "))
+	}
+	return ui.column([ui.gap(12), ui.align(ui.Align.Center()), ui.pad(18)], [
+		ui.text([ui.size(ui.TextSize.Title())], model.race.track.name),
+		ui.row([ui.gap(8)], bulbs),
+		ui.text([ui.tone(ui.Tone.Muted())],
+			"{grid.field()} cars · {model.race.track.laps} laps · lights out when they all go out")
+	])
+}
+
+func standings(model: Model, final: Bool): ui.View {
+	mut Str[dyn][dyn] rows = []
+	append(rows, ["", "", "DRIVER", "TEAM", "GAP", "BEST"])
+	mut Int place = 1
+	for each seat in control.order(model.race) {
+		car := control.find(model.race.cars, seat)
+		one := grid.driverOf(seat)
+		append(rows, [
+			"{place}",
+			"{one.number}",
+			one.name,
+			grid.teamOf(seat).tag,
+			standingGap(model, car, place, final),
+			control.clocked(car.sheet.best)
+		])
+		place = place + 1
+	}
+	return ui.column([ui.gap(10), ui.pad(16)], [
+		ui.text([ui.size(ui.TextSize.Subtitle()), ui.heading(2)], headline(model, final)),
+		ui.table([], rows)
+	])
+}
+
+func headline(model: Model, final: Bool): Str {
+	if final {
+		return "{model.race.track.name} — classification"
+	}
+	me := control.find(model.race.cars, model.seat)
+	on := math.min(conv.itf(me.sheet.lap + 1), conv.itf(model.race.track.laps))
+	return "{model.race.track.name} — lap {on} of {model.race.track.laps}"
+}
+
+func standingGap(model: Model, car: drive.Car, place: Int, final: Bool): Str {
+	if place == 1 {
+		if car.sheet.finished {
+			return control.clocked(car.sheet.finishedAt)
+		}
+		return "leader"
+	}
+	if car.sheet.finished {
+		leader := control.find(model.race.cars,
+			control.roundSeat(control.order(model.race), 0))
+		return control.gapped(car.sheet.finishedAt - leader.sheet.finishedAt)
+	}
+	return control.gapped(control.interval(model.race, car.seat))
+}
+
+func classification(model: Model): ui.View {
+	me := control.find(model.race.cars, model.seat)
+	place := control.placeOf(model.race.cars, me) + 1
+	return ui.column([ui.gap(12), ui.pad(16)], [
+		ui.text([ui.size(ui.TextSize.Title()), ui.heading(1)],
+			"You finished P{place}"),
+		standings(model, true),
+		ui.row([ui.gap(10)], [
+			ui.button([ui.on(Msg.Again())], nextLabel(model))
+		])
+	])
+}
+
+func nextLabel(model: Model): Str {
+	if model.link is Link.Live(_) {
+		return "Wait for the next one"
+	}
+	return "Another circuit"
+}
+
+// ---------------------------------------------------------------------------
+
+proc main(): void {
+	args := hive.term.args()
+	mut Int seed = hive.time.now() % 100000
+	mut Str server = ""
+	if args bounds 0 {
+		// One argument, and what it is is decided by what it looks like: a number is
+		// a circuit to roll and anything else is somewhere to dial. Two flags would
+		// be two things to remember for no gain — nobody has ever meant a seed by
+		// "ws://".
+		if hive.conv.sti(args[0]) is Result.Ok(asked) {
+			seed = asked
+		} else {
+			server = args[0]
+		}
+	}
+	// Opens a real application window. The window *is* a service — `update` is
+	// checked as a `hive.syslink.spawn` handler and gets an address like one, which
+	// is how the thread reading the socket posts back into it.
+	ui.window("Formula Kart", view, update, start(seed, server))
+}

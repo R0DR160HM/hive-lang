@@ -340,10 +340,10 @@ seed/                which release a build bootstraps from, and its digest
 ```
 
 [examples/](examples) is the other half of the documentation: twenty-two
-programs, from a two-line `echo` to a multiplayer shooter whose server and client
-are two of them and a ten-car grand prix on a circuit rolled from a number, every
-one compiled by `./examples/run` and — where a program finishes on its own — run
-and compared with what it says it prints.
+programs, from a two-line `echo` to a multiplayer shooter and a ten-car grand
+prix — each of those a server and a client, on a world rolled from a number —
+every one compiled by `./examples/run` and — where a program finishes on its own
+— run and compared with what it says it prints.
 
 The compiler is about 23,000 lines of Hive — 8,700 of which are the Go runtime
 and the JavaScript a scene is drawn by, carried as source text — its tests are

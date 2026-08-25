@@ -1,0 +1,170 @@
+// What crosses, and how
+// =====================
+// One file, two directions, and **both programs import it** — which is the whole
+// reason a protocol is worth having a file of. A client says `Up`; a server says
+// `Down`; nothing else is ever on the socket.
+//
+// THE TYPE DECLARATION *IS* THE PROTOCOL. `hive.json.encode` derives the encoder
+// from the static type, so it cannot fail and there is nothing to keep in step by
+// hand; `hive.json.parse(text) with Up` derives the decoder from the same
+// declaration, and a message that is not one comes back as a `Result.Error`
+// carrying the exact path that failed. A variant travels as `{"Drove": {...}}`,
+// which is what makes both types below readable in a browser's network tab.
+//
+// WHAT A CLIENT IS TRUSTED WITH, AND IT IS ONE THING
+// --------------------------------------------------
+// **The controls.** Not where its car is, not how fast it is going, not whether
+// it hit anybody. A client sends a steering angle, two pedals and two buttons —
+// `drive.Wants`, the identical value a bot produces — and the server puts it
+// through `drive.stepped` exactly as it puts a bot's through it.
+//
+// That is a stronger position than the shooter in [19](../19-multiplayer-fps)
+// takes, and it is stronger for a reason that is about this game rather than
+// about ambition: a car is *already* simulated centrally. Ten of them are stepped
+// by one call sixty times a second whether anybody is connected or not, and the
+// cars have to agree about who hit whom, who is in front, and whose lap counted.
+// There was never a version of this where a client owned its own position, so
+// there is nothing here to give up by not letting it.
+//
+// What that buys: a modified client cannot teleport, cannot give itself grip,
+// cannot decide it overtook somebody, and cannot see anything the server has not
+// sent it. What it can still do is send inputs no human could — full lock at two
+// hundred, sixty perfect throttle steps a second. It will be no faster for it,
+// because the car is the same car.
+//
+// WHAT IS NOT HERE is any notion of a circuit. The track is a `func` of one
+// number (`circuit.build`), so the number travels — once, in `Welcome` — and the
+// track never does. Nine hundred nodes, a racing line and a pit lane would
+// otherwise be on the wire every time somebody joined.
+
+import ./control
+import ./drive
+import hive.json
+
+// What a client says. Three things.
+type Up {
+	// The first thing anybody says, and the only one the server answers.
+	Join { who: Str, team: Str }
+	// The controls, as often as the client folds a frame. It is the whole of what
+	// a client is trusted with, and it is the same value a bot hands to the same
+	// physics — which is what makes "everybody drives the same car" true rather
+	// than claimed.
+	Drove {
+		steer: Float,
+		throttle: Float,
+		brake: Float,
+		drifting: Bool,
+		spending: Bool
+	}
+	// Pressing Leave. Hanging up would do — a closed socket is a driver who has
+	// gone either way — but saying so first means their car is handed back to the
+	// bots at once instead of at the end of a timeout.
+	Left
+}
+
+// What the server says.
+type Down {
+	// Your seat and the number the whole circuit comes out of. This is the whole
+	// of what a client is told on the way in.
+	Welcome { seat: Int, seed: Int }
+	// The race, as often as the server steps it.
+	Ran { at: Snapshot }
+	// Ten seats, ten drivers, and every one of them taken.
+	Full
+}
+
+// Everything about a race that its seed does not already say.
+//
+// It is very nearly the whole of `control.Race`, and that is the point rather
+// than an accident: there is one description of a race in this program, the
+// server holds it, and what crosses the wire is that description with the circuit
+// taken out of it. A protocol that had its own idea of what a car was would be a
+// second place for the two ends to disagree.
+type Snapshot {
+	clock: Float
+	lights: Float
+	zones: control.Zone[dyn]
+	pace: drive.Pace
+	safetyAgain: Float
+	cars: drive.Car[dyn]
+	crates: drive.Crate[dyn]
+	shards: drive.Shard[dyn]
+	wheels: drive.Runaway[dyn]
+	notes: control.Note[dyn]
+	over: Bool
+}
+
+// A race, as a snapshot — and a snapshot, put back into a race. The circuit is
+// the one thing neither of them carries: it is `circuit.build(seed)` at both
+// ends, which is the same arithmetic on the same number and therefore the same
+// track down to the last centimetre.
+func taken(race: control.Race): Snapshot {
+	return Snapshot(
+		race.clock,
+		race.lights,
+		race.zones,
+		race.pace,
+		race.safetyAgain,
+		race.cars,
+		race.crates,
+		race.shards,
+		race.wheels,
+		race.notes,
+		race.over
+	)
+}
+
+func given(race: control.Race, at: Snapshot): control.Race {
+	mut control.Race it = race
+	it.clock = at.clock
+	it.lights = at.lights
+	it.zones = at.zones
+	it.pace = at.pace
+	it.safetyAgain = at.safetyAgain
+	it.cars = at.cars
+	it.crates = at.crates
+	it.shards = at.shards
+	it.wheels = at.wheels
+	it.notes = at.notes
+	it.over = at.over
+	return it
+}
+
+// What the controls came to, as the value the physics takes. One line, and it is
+// the only place in either program where a message becomes a `drive.Wants`.
+func drove(up: Up): drive.Wants {
+	if up is Up.Drove(steer, throttle, brake, drifting, spending) {
+		return drive.Wants(steer, throttle, brake, drifting, spending)
+	}
+	return drive.idle()
+}
+
+func drives(want: drive.Wants): Up {
+	return Up.Drove(want.steer, want.throttle, want.brake, want.drifting,
+		want.spending)
+}
+
+// The four one-line codecs, and they are the whole of the serialisation in this
+// program.
+func said(up: Up): Str {
+	return hive.json.encode(up)
+}
+
+func asked(text: Str): Result<Up, hive.json.JsonError> {
+	return hive.json.parse(text) with Up
+}
+
+func told(down: Down): Str {
+	return hive.json.encode(down)
+}
+
+func heard(text: Str): Result<Down, hive.json.JsonError> {
+	return hive.json.parse(text) with Down
+}
+
+// Nobody at any wheel. Declared with the type it is empty of, because an empty
+// vector cannot say what it is empty of on its own.
+func nobody(): control.Asking[dyn] {
+	mut control.Asking[dyn] none = []
+	return none
+}

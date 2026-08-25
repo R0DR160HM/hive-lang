@@ -338,6 +338,7 @@ func isOpaque(module: Str, name: Str): Bool {
 	// is how a view is composed at all.
 	if module == "ui" {
 		return name == "View" || name == "Attr" || name == "Shape"
+			|| name == "Mark"
 			|| len(variantsOf("ui", name)) > 0
 	}
 	return false
@@ -375,8 +376,9 @@ func variantsOf(module: Str, name: Str): Str[dyn] {
 		// then there is nothing it can say. Ordered from the ground up: what you
 		// drive on, then what things are built of, then what they are finished in.
 		if name == "Surface" {
-			return ["Turf", "Gravel", "Tarmac", "Kerb", "Planks", "Staves",
-				"Speckle", "Metal", "Carbon", "Gloss"]
+			return ["Turf", "Gravel", "Tarmac", "Kerb", "Concrete", "Brick",
+				"Planks", "Staves", "Bark", "Leaves", "Crowd", "Mesh",
+				"Speckle", "Metal", "Carbon", "Rubber", "Glass", "Gloss"]
 		}
 	}
 	return []
@@ -487,12 +489,14 @@ func fieldTypeOf(module: Str, typeName: Str, field: Str): types.Ty {
 
 // --- hive.ui ------------------------------------------------------------------
 //
-// Three sets of names, and which set a name is in decides everything about it. A
+// Four sets of names, and which set a name is in decides everything about it. A
 // **widget** takes its attributes and then whatever its kind takes, and answers
 // with a `View`. A **shape** is the same call one dimension further out, and
 // answers with a `Shape` — what goes in a scene is a closed set of solids, and a
-// button is not one of them. An **attribute** carries one value and answers with
-// an `Attr`, which is a token the renderer may or may not have a use for.
+// button is not one of them. A **mark** is the same call one dimension *in* —
+// what goes on a canvas — and answers with a `Mark`. An **attribute** carries one
+// value and answers with an `Attr`, which is a token the renderer may or may not
+// have a use for.
 
 func isUiWidget(name: Str): Bool {
 	return name == "row" || name == "column" || name == "spacer"
@@ -500,13 +504,22 @@ func isUiWidget(name: Str): Bool {
 		|| name == "icon" || name == "link" || name == "button"
 		|| name == "input" || name == "textarea" || name == "checkbox"
 		|| name == "select" || name == "table" || name == "scene"
-		|| name == "spinner" || name == "none"
+		|| name == "canvas" || name == "spinner" || name == "none"
 }
 
 func isUiShape(name: Str): Bool {
 	return name == "box" || name == "sphere" || name == "cylinder"
 		|| name == "cone" || name == "ground" || name == "label"
 		|| name == "line"
+}
+
+/// What goes on a `canvas`. Five, and the test each had to pass to be here is the
+/// one the shapes passed: it cannot be made out of the others. A ring is a `dot`
+/// with no fill, a grid is a vector of `path`s, an arrow is a `path` — and none of
+/// those needed a name of its own.
+func isUiMark(name: Str): Bool {
+	return name == "dot" || name == "bar" || name == "path"
+		|| name == "patch" || name == "words"
 }
 
 func isUiAttr(name: Str): Bool {
@@ -516,6 +529,7 @@ func isUiAttr(name: Str): Bool {
 		|| name == "tone" || name == "background" || name == "kind"
 		|| name == "placeholder" || name == "hint" || name == "disabled"
 		|| name == "busy" || name == "paint" || name == "surface"
+		|| name == "thick" || name == "region"
 		|| name == "lens" || name == "fog"
 		|| name == "grab" || name == "crosshair"
 		|| name == "at" || name == "turn" || name == "eye" || name == "aim"
@@ -559,7 +573,7 @@ func uiEventArgs(name: Str): types.Ty[dyn] {
 /// it into a build has to be exactly what needs it.
 func isUiScene(name: Str): Bool {
 	return name == "scene" || isUiShape(name)
-		|| name == "paint" || name == "surface" || name == "lens"
+		|| name == "surface" || name == "lens"
 		|| name == "fog" || name == "grab"
 		|| name == "crosshair" || name == "at" || name == "turn" || name == "eye"
 		|| name == "aim" || name == "onFrame" || name == "onKeyDown"
@@ -570,6 +584,7 @@ func isUiScene(name: Str): Bool {
 func uiResult(name: Str): types.Ty {
 	if isUiWidget(name) { return types.Ty.TLib("ui", "View") }
 	if isUiShape(name) { return types.Ty.TLib("ui", "Shape") }
+	if isUiMark(name) { return types.Ty.TLib("ui", "Mark") }
 	if isUiAttr(name) { return types.Ty.TLib("ui", "Attr") }
 	if name == "html" || name == "page" { return types.Ty.TStr() }
 	// A window does not return: it shows the view and folds events until the
@@ -585,8 +600,10 @@ func uiParams(name: Str): types.Ty[dyn] {
 	view := types.Ty.TLib("ui", "View")
 	views := types.Ty.TVec(view, dynamic())
 	shapes := types.Ty.TVec(types.Ty.TLib("ui", "Shape"), dynamic())
+	marks := types.Ty.TVec(types.Ty.TLib("ui", "Mark"), dynamic())
 	str := types.Ty.TStr()
 	number := types.Ty.TFloat()
+	numbers := types.Ty.TVec(number, dynamic())
 	if name == "row" || name == "column" { return [attrs, views] }
 	if name == "overlay" { return [attrs, view] }
 	if name == "text" || name == "button" || name == "input" || name == "textarea" {
@@ -600,7 +617,17 @@ func uiParams(name: Str): types.Ty[dyn] {
 	}
 	if name == "table" { return [attrs, table()] }
 	if name == "scene" { return [attrs, shapes] }
+	if name == "canvas" { return [attrs, marks] }
 	if name == "spacer" || name == "spinner" || name == "none" { return [] }
+	// The marks. A place is two numbers rather than a point, for the reason `at`
+	// takes three rather than a position: a program's own idea of a place is its
+	// own. A line through many places is the one that cannot be written that way,
+	// and it takes them as they are — x, y, x, y — rather than as a type nobody
+	// would have had a value of already.
+	if name == "dot" { return [attrs, number, number, number] }
+	if name == "bar" { return [attrs, number, number, number, number] }
+	if name == "path" || name == "patch" { return [attrs, numbers] }
+	if name == "words" { return [attrs, number, number, number, str] }
 	// The solids. Dimensions are the payload rather than attributes because they
 	// are what the shape *is*: a sphere without a radius is not a sphere with a
 	// default one.
@@ -633,6 +660,9 @@ func uiAttrParams(name: Str): types.Ty[dyn] {
 		return [number, number, number]
 	}
 	if name == "aim" { return [number, number] }
+	// Which part of the plane a canvas shows: a corner, then how much of it.
+	if name == "region" { return [number, number, number, number] }
+	if name == "thick" { return [number] }
 	if name == "gap" || name == "pad" || name == "width" || name == "height"
 		|| name == "grow" || name == "heading" || name == "lens" || name == "fog" {
 		return [types.Ty.TInt()]
