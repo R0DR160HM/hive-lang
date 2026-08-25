@@ -81,30 +81,35 @@ proc passes(entry: Str, from: Int): Compiled {
 	if len(program.errors) > 0 {
 		return refused(program.errors)
 	}
+	// Every pass from here down runs on one flattened program, whose nodes carry
+	// no file — so what they report is reported against the entrypoint, which is
+	// what keeps `file:line:` in front of every message and an editor able to jump
+	// to it. `17.3` records that as the limit it is.
+	//
 	// Monomorphization runs before the checks, so each copy is checked on its own
 	// terms — an instantiation at `Str[3]` held to that length, one at `Str[dyn]`
 	// guarding its indexes.
 	progress.step(from, "expanding generics in " + progress.counted(len(program.sources), "file"))
 	expanded := mono.expand(program.module, from)
 	if len(expanded.errors) > 0 {
-		return refused(expanded.errors)
+		return refused(diag.allInFile(entry, expanded.errors))
 	}
 	progress.step(from, "checking " + progress.counted(len(expanded.module.decls), "declaration"))
 	found := checks.checkModule(expanded.module)
 	if len(found) > 0 {
-		return refused(found)
+		return refused(diag.allInFile(entry, found))
 	}
 	// Every index and slice is proved in range before anything is written, so
 	// the Go that comes out can never fail out of one.
 	progress.step(from, "proving every index in range")
 	inRange := ranges.checkModule(expanded.module)
 	if len(inRange) > 0 {
-		return refused(inRange)
+		return refused(diag.allInFile(entry, inRange))
 	}
 	progress.step(from, "emitting Go")
 	emitted := emit.emitModule(expanded.module)
 	if len(emitted.errors) > 0 {
-		return refused(emitted.errors)
+		return refused(diag.allInFile(entry, emitted.errors))
 	}
 	return Compiled(expanded.module, emitted, [])
 }
@@ -154,7 +159,7 @@ proc build(entry: Str, withTests: Bool, from: Int): Written {
 	if drawsAScene {
 		progress.step(from, "three.js")
 		if vendor.placeThree(directory + "/hive") is Result.Error(why) {
-			append(errors, diag.Diagnostic(entry, 0, why))
+			append(errors, diag.about(entry, why))
 		}
 	} else {
 		vendor.clearThree(directory + "/hive")
@@ -166,7 +171,7 @@ proc build(entry: Str, withTests: Bool, from: Int): Written {
 	for each f in made.module.foreign {
 		source := hive.file.read(f.path)
 		if source is Result.Error(why) {
-			append(errors, diag.Diagnostic(f.path, 0, "could not read the imported Go file `" + f.path + "`: {why.message}"))
+			append(errors, diag.about(f.path, "could not read the imported Go file `" + f.path + "`: {why.message}"))
 		}
 		if source is Result.Ok(contents) {
 			put(paths.joinPath(directory, f.packageName), paths.baseOf(f.path), contents, written, errors)
@@ -219,7 +224,7 @@ proc removeTree(path: Str): void {
 // directory and nothing else.
 proc put(directory: Str, name: Str, contents: Str, written: mut Str[dyn], errors: mut diag.Diagnostic[dyn]): void {
 	if hive.file.makeDir(directory) is Result.Error(why) {
-		append(errors, diag.Diagnostic(directory, 0, "cannot make `{directory}`: {why.message}"))
+		append(errors, diag.about(directory, "cannot make `{directory}`: {why.message}"))
 		return
 	}
 	if name == "" {
@@ -227,7 +232,7 @@ proc put(directory: Str, name: Str, contents: Str, written: mut Str[dyn], errors
 	}
 	full := paths.joinPath(directory, name)
 	if hive.file.write(full, contents) is Result.Error(why) {
-		append(errors, diag.Diagnostic(full, 0, "cannot write `{full}`: {why.message}"))
+		append(errors, diag.about(full, "cannot write `{full}`: {why.message}"))
 		return
 	}
 	append(written, full)
@@ -302,9 +307,16 @@ proc runTests(entry: Str, from: Int): Result<Str, diag.Diagnostic[dyn]> {
 	progress.step(from, "go test")
 	made := toolchain(["test", "-v", "-coverprofile=coverage.out", "./..."], written.directory)
 	// A failing suite is an answer rather than a malfunction, so its output is
-	// what comes back either way. Only a toolchain that could not run at all is
-	// an error here, and that is what a negative status says.
+	// what comes back either way. Two things are not answers: a toolchain that
+	// could not run at all, which is what a negative status says, and one that
+	// refused what this compiler wrote — a project it would not build, or one
+	// `go vet` would not pass. Neither of those ran a test, and a run that held no
+	// test at all must never be reported as a suite where everything passed: the
+	// report reads failures off the run, so an empty one would read as silence.
 	if made.code < 0 {
+		return Result.Error([goFailed(entry, made)])
+	}
+	if made.code != 0 && text.contains(made.output, "=== RUN") == false {
 		return Result.Error([goFailed(entry, made)])
 	}
 	return Result.Ok(made.output)
@@ -325,7 +337,7 @@ proc resolveDeps(written: Written, from: Int): Result<Bool, diag.Diagnostic> {
 	progress.step(from, "go mod tidy — " + why)
 	made := toolchain(["mod", "tidy"], written.directory)
 	if made.code != 0 {
-		return Result.Error(diag.Diagnostic(written.directory, 0, "what this build links from outside Go's own standard library could not be resolved. `go mod tidy` said:\n\n" + indented(made.output)))
+		return Result.Error(diag.about(written.directory, "what this build links from outside Go's own standard library could not be resolved. `go mod tidy` said:\n\n" + indented(made.output)))
 	}
 	return Result.Ok(true)
 }
@@ -341,8 +353,10 @@ proc toolchain(arguments: Str[], directory: Str): Toolchain {
 	return Toolchain(-1, "")
 }
 
-// The Go toolchain refusing what this compiler wrote is this compiler's fault,
-// not the author's — so the message says so, and shows what it said.
+// The Go toolchain refusing what this compiler wrote is this compiler's fault
+// rather than the author's, with one exception: a Go file the program imports
+// goes into the build as it was written, so it is the one thing in there nobody
+// here generated. Both readings are named, because this cannot tell them apart.
 //
 // A toolchain that could not be *started* is a different thing entirely, and
 // saying "a bug in this compiler" about a machine with no `go` on it would send
@@ -350,9 +364,9 @@ proc toolchain(arguments: Str[], directory: Str): Toolchain {
 // the two happened.
 func goFailed(entry: Str, made: Toolchain): diag.Diagnostic {
 	if made.code < 0 {
-		return diag.Diagnostic(entry, 0, "this needs the Go toolchain, and `go` is not on the PATH. A Hive build writes a Go module and compiles it, so `go` is what turns one into a program — install it from https://go.dev/dl/. Nothing else is needed: this compiler carries the runtime it compiles against, and `hive check` and `hive emit` ask for no toolchain at all.")
+		return diag.about(entry, "this needs the Go toolchain, and `go` is not on the PATH. A Hive build writes a Go module and compiles it, so `go` is what turns one into a program — install it from https://go.dev/dl/. Nothing else is needed: this compiler carries the runtime it compiles against, and `hive check` and `hive emit` ask for no toolchain at all.")
 	}
-	return diag.Diagnostic(entry, 0, "the Go toolchain refused the generated project, which is a bug in this compiler rather than in your program. It said:\n\n" + indented(made.output))
+	return diag.about(entry, "the Go toolchain refused the generated project. There are two readings and this cannot tell them apart: a Go file this program imports may be the one it would not compile, and everything else here is a bug in this compiler rather than in your program. It said:\n\n" + indented(made.output))
 }
 
 func indented(output: Str): Str {

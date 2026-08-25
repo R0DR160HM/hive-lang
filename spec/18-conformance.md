@@ -44,6 +44,13 @@ compiled it first is left in it. `../bootstrap` builds it with itself and with
 nothing else — the compiler that first compiled it is no longer part of this
 project.
 
+**Every rejection is the front end's.** No program this specification describes
+as a compile error is left for the Go toolchain to refuse: what `hive check`
+accepts, `go build` builds. That is what makes the toolchain's own refusal mean
+what [17](17-diagnostics.md) says it means — a bug in this compiler, or in a Go
+file the program imported — rather than a message about Go standing in for a
+message about Hive.
+
 **It runs every example.** [`../examples`](../examples) holds twenty-two
 programs, and all but the last are the same programs the compiler this one
 replaces was written against: three servers, a database, a distributed pair of
@@ -64,15 +71,15 @@ All of it.
 | lexing | all of [01](01-lexical.md), including interpolation, backtick strings, atoms, query bodies and import paths |
 | parsing | all of [02](02-grammar.md), query bodies and their `WHERE` blocks included |
 | modules | local `.hive` imports, Go file imports, git repository imports with a shared clone cache and a lock file, standard library aliases, cycle rejection, flattening ([12](12-modules.md)) |
-| the toolchain | `build`, `run` and `test` drive `go` themselves, a test run is reported and exits non-zero when it failed ([16](16-testing.md)), and the one build that links anything from outside Go's standard library resolves it first |
+| the toolchain | `build`, `run` and `test` drive `go` themselves, a test run is reported and exits non-zero when it failed ([16](16-testing.md)), and the one build that links anything from outside Go's standard library resolves it first. Two commands are this implementation's own rather than the specification's: `emit`, which prints the generated Go and is what [17.2](17-diagnostics.md#172-editor-support) means by asking for no toolchain, and `container`, which writes a Dockerfile that builds a program and runs it |
 | generics | monomorphization: one copy per set of type arguments, read off the argument types, for callables and types alike ([11](11-generics.md)) |
 | bounds | every index and slice proved in range, flow-sensitively: declared and inferred lengths, guards, counting loops, `indexOf`, and what an assignment or a `drop` costs ([10](10-bounds.md)) |
-| checks | names, arity, named arguments, argument and return types, the proc/func split, mutability, terminating paths, exhaustiveness, conditions, subscripts, `async`'s three refusals, pattern shapes, a query's rows and its bound values ([04](04-declarations.md), [06](06-statements.md), [07](07-patterns.md), [08](08-mutability-and-values.md)) |
+| checks | names, arity, named arguments, argument and return types, what a call can reach through, the standard library's own names and what they take, what a walk's function answers with, the proc/func split, mutability, terminating paths, exhaustiveness, conditions, subscripts, `async`'s three refusals, pattern shapes, a query's rows and its bound values ([04](04-declarations.md), [06](06-statements.md), [07](07-patterns.md), [08](08-mutability-and-values.md), [13](13-builtins.md), [14](14-stdlib.md)) |
 | value semantics | copy-on-binding, type-directed deep copies, two `mut` names sharing one header, mutex parameters as pointers ([08](08-mutability-and-values.md)) |
 | concurrency | `async` as a statement, the `async` binding, the await-all, `with timeout` ([09](09-concurrency.md)) |
 | patterns | all four kinds, with narrowing through `&&` ([07](07-patterns.md)) |
 | builtins | all of [13](13-builtins.md) |
-| standard library | every module of [14](14-stdlib.md): `hive.conv`, `hive.math`, `hive.map`, `hive.file`, `hive.term`, `hive.task`, `hive.time`, `hive.json`, `hive.crypto`, `hive.net`, `hive.syslink`, `hive.sql`, `hive.ui` and `hive.ui.scene` |
+| standard library | every module of [14](14-stdlib.md): `hive.conv`, `hive.math`, `hive.map`, `hive.file`, `hive.env`, `hive.term`, `hive.task`, `hive.time`, `hive.json`, `hive.crypto`, `hive.net`, `hive.syslink`, `hive.sql`, `hive.ui` and `hive.ui.scene` |
 | reading tables | every `using` form: CSV, xlsx, ods, a declared `query`, and `run raw` ([14.6](14-stdlib.md#146-reading-tables-using)) |
 | testing | `test` declarations, `assert` with both sides, per-declaration coverage, the report ([16](16-testing.md)) |
 
@@ -123,6 +130,13 @@ different route, or does not quite do it.
   `if v bounds i && v[i] > 0` is refused where `if v bounds i { if v[i] > 0 }`
   is not. All three refuse a program the specification permits rather than
   accepting one it forbids, which is the safe direction to be wrong in.
+* **A message from a pass after the parser names a declaration rather than a
+  statement.** Those passes run on the flattened program, whose nodes carry a
+  position on a declaration and nowhere else, so a message opens at the
+  declaration's line and says which declaration it is about
+  ([17](17-diagnostics.md#173-two-limits-worth-knowing)). In a program of more
+  than one file that line is counted against the entrypoint, because flattening
+  is what discards which file a declaration came from.
 * **A local that is never read still compiles.** Hive allows it and Go does not,
   so every generated local is followed by `_ = name`. That is noise in the
   generated Go and nothing else.
@@ -141,7 +155,72 @@ different route, or does not quite do it.
   missing is the compile-time refusal of a send whose message is not the
   mailbox's.
 
-## 18.3 Defects found in the compiler this one replaces
+## 18.3 Defects this chapter turned up in this one
+
+Holding this compiler against 18.1 found six things wrong with it. All six are
+fixed; they are recorded because each says something about what the requirement
+in [18.1](#181-what-a-conforming-implementation-must-do) actually costs to keep.
+The first is much the largest, and the shape of it is worth the paragraph: a
+compiler that lowers to another language will pass every test it has while
+leaving whole classes of mistake to that language's compiler, because the
+program *is* still refused. What is lost is which language the message is about.
+
+1. **A rejection reached the Go toolchain instead of naming the thing at
+   fault.** These programs were refused — which is right — but refused by `go
+   build`, in terms of Go's own types and against the generated file:
+
+   * a call through a local binding holding something that is not callable;
+   * a `hive.<module>.<name>` the module does not have;
+   * a library call whose arguments are not what the module takes —
+     `hive.math.max(0, health)`, the example
+     [03](03-types.md#39-assignability) gives by name;
+   * **every builtin's arguments.** Only arity and `append`'s mutability were
+     checked, so `join([1, 2], ",")`, `split(12, ",")`, `row(v, "a")` on
+     something that is not a `Table`, `indexOf` for a value the vector could not
+     hold, `len` of a number, and a `sort` comparator that is not
+     `func(T, T): Bool` all went straight through. Every signature in
+     [13](13-builtins.md) is held to now, the walks included — `filter` wants a
+     `Bool`, `filterMap` a `Result`, and `map` something.
+
+   A builtin used as a value — `map(names, len)` — was the same story, and is
+   refused for the reason a generic is: several builtins are overloaded, and a
+   value carries no argument types to pick with.
+2. **Diagnostics after the parser opened at `file:0:`.** No editor jumps to line
+   zero, so [18.1(5)](#181-what-a-conforming-implementation-must-do) was not
+   met. Those passes carry a declaration's line and now report against it, and
+   the ones holding no declaration at all report against line 1.
+3. **A test run could exit zero having run no test.** When the Go toolchain
+   refused the generated project — which `go test` reports as a build failure
+   rather than as a failing test — the report read the empty run as a suite where
+   nothing failed. A run that never reached a test is now the toolchain error it
+   is, which is what [18.1(6)](#181-what-a-conforming-implementation-must-do)
+   asks for.
+4. **A JSON codec only a test asked for was named and never written.** The test
+   emitter seeded the codecs `main.go` had already written into the wrong field,
+   so `main_test.go` called an encoder nobody generated. With (3) fixed this is
+   loud; before it, silent.
+5. **A clone cache directory could not always be created.** The name is the
+   repository's URL with the separators flattened, and a URL may carry a port —
+   whose colon is not a character every filesystem lets a name have.
+6. **`argFor(args, "", i)` answered with the first argument whatever `i` was.**
+   An empty name matched the first argument with no name of its own. Nothing had
+   ever asked for anything but position 0, so it never showed.
+
+One message was wrong rather than absent: a comparison of two types that fit
+nowhere near each other closed with "Hive never widens a number behind your
+back", which explains something that is not the mistake when neither side is a
+number. [17.4](17-diagnostics.md#174-what-a-message-should-say) asks a message to
+say why *when the why is the point*, and that is now the only time it is said.
+
+Two things beside the compiler were wrong with it as well. `../bootstrap`,
+`../selfhost` and `../hive` looked for `src/hivec` and nothing else, so on
+Windows — where Go writes the `.exe` that makes a file runnable at all — none of
+them could find the compiler they had just built; each takes either spelling now.
+And an `.expected` file was checked out with whatever line endings the platform
+preferred, which made every comparison fail on a program that was right, since
+`echo` writes a newline and never a carriage return; `.gitattributes` pins them.
+
+## 18.4 Defects found in the compiler this one replaces
 
 Writing this one turned up four things wrong with the compiler it was first built
 by. That compiler is gone — Hive builds Hive now, and `../bootstrap` reaches for

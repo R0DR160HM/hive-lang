@@ -45,16 +45,20 @@ else.
 
 ## 17.3 Two limits worth knowing
 
-**Errors from the passes after parsing land on line 1.** Mutability, bounds, the
-proc/func split and the type checks all run on a flattened module whose nodes
-carry no source positions, so the file is as precise as they get. The message
-names the declaration it is about.
+**Errors from the passes after parsing land on a declaration.** Mutability,
+bounds, the proc/func split and the type checks all run on a flattened module
+whose nodes carry a position on a declaration and nowhere else, so the
+declaration the mistake is inside is as precise as they get: its line is what the
+message opens with, and its name is what the message says. A pass holding no
+declaration at all reports against the file's first line, because `file:0:` is
+not somewhere to jump to.
 
 **In a program with imports, those same errors are reported against the
 entrypoint**, even when the declaration at fault came from an imported module —
 [flattening](12-modules.md#flattening) is what discards which file each
-declaration came from. Errors the lexer, parser and import resolver raise do name
-the right file and line, because those run per file.
+declaration came from. The line is still the declaration's own, which is to say a
+line of a file the message does not name. Errors the lexer, parser and import
+resolver raise do name the right file and line, because those run per file.
 
 Both limits are consequences of one decision — that the passes after the loader
 see one flat program — and both would be lifted by carrying a position on every
