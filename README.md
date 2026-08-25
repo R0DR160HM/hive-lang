@@ -392,8 +392,8 @@ this program's own terminal instead.
 
 [18 — Conformance](spec/18-conformance.md) is where an implementation answers for
 itself: what it implements (all of it), where it does what the specification
-describes by a different route, and four defects that writing it turned up in the
-compiler it replaces.
+describes by a different route, the six that holding it against 18.1 turned up in
+it, and four that writing it turned up in the compiler it replaces.
 
 ## Tests
 
@@ -410,8 +410,8 @@ loader       23 tests: 23 passed
 fetch        15 tests: 15 passed
 goffi        10 tests: 10 passed
 mono         18 tests: 18 passed
-check        45 tests: 45 passed
-ranges       29 tests: 29 passed
+check        63 tests: 63 passed
+ranges       35 tests: 35 passed
 emit         53 tests: 53 passed
 container    17 tests: 17 passed
 
@@ -443,7 +443,7 @@ comparing two files is what a shell is for, not because Hive could not.
 [examples/](examples), which are the language's own tour rather than a test of
 the compiler — but they are compiled, run and compared all the same, because an
 example that has stopped being true is worse than no example. Six of them carry
-test suites of their own, and those are 221 tests more.
+test suites of their own, and those are 224 tests more.
 
 ## Reading it
 

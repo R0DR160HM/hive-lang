@@ -52,6 +52,10 @@ type Mono {
 	wantedFlat: Str[dyn]
 	/// How far down `wanted` the worklist has got.
 	done: Int
+	/// The line the declaration being rewritten was declared on. It is the only
+	/// position a flattened program can offer, and a message with none at all is
+	/// one an editor cannot jump to.
+	line: Int
 	errors: diag.Diagnostic[dyn]
 }
 
@@ -68,7 +72,7 @@ type ArgList {
 /// than only when it starts.
 proc expand(m: ast.Module, from: Int): Expanded {
 	t := types.tableOf(m)
-	mut Mono mo = Mono(t, m.decls, genericNames(t, m.decls), [], [], [], 0, [])
+	mut Mono mo = Mono(t, m.decls, genericNames(t, m.decls), [], [], [], 0, 0, [])
 
 	// Nothing generic is emitted as it stands: a copy is what runs, and the
 	// original is only a template.
@@ -77,6 +81,7 @@ proc expand(m: ast.Module, from: Int): Expanded {
 	mut walked := 0
 	for each d in m.decls {
 		if isGeneric(mo, ast.declName(d)) == false {
+			mo.line = ast.declLine(d)
 			append(out, rewriteDecl(mo, env, d))
 		}
 		walked = walked + 1
@@ -201,9 +206,10 @@ proc instantiate(mo: mut Mono, env: infer.Env, at: Int): Result<ast.Decl, Bool> 
 
 	for each d in mo.source {
 		if ast.declName(d) == name {
+			mo.line = ast.declLine(d)
 			variables := variablesOfDecl(mo, d)
 			if len(variables) != len(args.written) {
-				append(mo.errors, diag.at(0, "`{name}` is generic in " + countWord(len(variables)) + ", and this use gives " + countWord(len(args.written))))
+				append(mo.errors, diag.at(mo.line, "`{name}` is generic in " + countWord(len(variables)) + ", and this use gives " + countWord(len(args.written))))
 				return Result.Error(false)
 			}
 			return Result.Ok(substituteDecl(mo, env, d, flat, variables, args))
@@ -539,7 +545,7 @@ proc substituteExpr(mo: mut Mono, env: infer.Env, e: ast.Expr, variables: Str[],
 		// Only a callable: a bare type name is always part of a constructor path
 		// — `Either.Left(...)` — and is never a value on its own.
 		if isGeneric(mo, name) && types.findCallable(mo.table, name) is Result.Ok(_) {
-			append(mo.errors, diag.at(0, "`{name}` is generic, so it cannot be used as a value: which copy a call reaches is decided by the argument types, and a value carries none. Call it, or wrap it in a callable of your own that is not generic"))
+			append(mo.errors, diag.at(mo.line, "`{name}` is generic, so it cannot be used as a value: which copy a call reaches is decided by the argument types, and a value carries none. Call it, or wrap it in a callable of your own that is not generic"))
 		}
 		return e
 	}
@@ -636,7 +642,7 @@ proc solve(mo: mut Mono, env: infer.Env, params: ast.Param[], callArgs: ast.Arg[
 	}
 	// A variable that appears only in the return type has nothing to be inferred
 	// from. It is reported here rather than left to produce a copy nobody meant.
-	append(mo.errors, diag.at(0, "`{variable}` appears nowhere in the parameters, so there is nothing at a call to read it off. A type variable is pinned down by what is passed, never written at the call site"))
+	append(mo.errors, diag.at(mo.line, "`{variable}` appears nowhere in the parameters, so there is nothing at a call to read it off. A type variable is pinned down by what is passed, never written at the call site"))
 	return ast.TypeExpr.Named("", "Str", [], [])
 }
 

@@ -277,7 +277,13 @@ test "an empty map has to land somewhere that says what it holds" {
 
 test "Hive never widens a number behind your back" {
 	got := problem(inMain("echo 1 + 2.0"))
-	assert opens(got, "in `main`: `+` wants two of one type, and these are Int and Float")
+	assert got == "in `main`: `+` wants two of one type, and these are Int and Float. Hive never widens a number behind your back — `hive.conv.itf` is how an `Int` becomes a `Float`"
+
+	// And the why is said only where widening is what was wanted: a message that
+	// explained a conversion to somebody comparing an atom with a boolean would
+	// be explaining something that is not the mistake.
+	assert problem(inMain("flag := #Ready  if flag == true \{ echo 1 }")) == "in `main`: `==` wants two of one type, and these are Atom and Bool"
+	assert problem(inMain("echo [1, 2] == 2")) == "in `main`: `==` wants two of one type, and these are Int[2] and Int"
 }
 
 test "&& and || join two Bools" {
@@ -353,6 +359,145 @@ test "a star is fine where there are no fields to disagree with" {
 	assert problemCount("query q(): Table \{ SELECT * FROM users }\nproc main(): void \{ }") == 0
 	assert problemCount("query q(): Str[dyn] \{ SELECT * FROM users }\nproc main(): void \{ }") == 0
 	assert problemCount("query q(): void \{ INSERT INTO old SELECT * FROM users }\nproc main(): void \{ }") == 0
+}
+
+// --- What a call can reach through ------------------------------------------
+//
+// Every one of these used to reach the Go toolchain instead, which reported it
+// against the generated file in terms of Go's own types. A rejection has to name
+// the thing at fault ([18.1](../spec/18-conformance.md)), and Go naming `len_`
+// or `float64` names nothing anybody wrote.
+
+test "a call through a binding that holds no callable is named" {
+	got := problem("proc greet(name: Str): Str \{ return name }\nproc main(): void \{ greet := 3  echo greet(\"a\") }")
+	assert opens(got, "in `main`: `greet` here is Int, which is not something a call can reach through")
+}
+
+test "a binding that does hold one is called through happily" {
+	assert problemCount("func twice(n: Int): Int \{ return n * 2 }\nproc main(): void \{ f := twice  echo f(2) }") == 0
+	assert problemCount("func twice(n: Int): Int \{ return n * 2 }\nfunc via(f: func(Int): Int, n: Int): Int \{ return f(n) }\nproc main(): void \{ echo via(twice, 2) }") == 0
+}
+
+test "a name the standard library does not have is named" {
+	assert problem(inMain("hive.task.nonsense(1)")) == "in `main`: `hive.task` has no `nonsense`"
+	assert problem(inMain("echo hive.conv.nonsense(\"x\")")) == "in `main`: `hive.conv` has no `nonsense`"
+	assert problem(inMain("echo hive.file.slurp(\"x\")")) == "in `main`: `hive.file` has no `slurp`"
+	// A module it does not carry at all is a different sentence.
+	assert problem(inMain("hive.nowhere.get()")) == "in `main`: this compiler does not carry `hive.nowhere`"
+}
+
+test "the names it does have are left alone" {
+	assert problemCount(inMain("hive.task.sleep(1)")) == 0
+	assert problemCount(inMain("echo hive.conv.its(1)")) == 0
+	assert problemCount(inMain("echo hive.crypto.jwtDecode(\"t\") with Int")) == 0
+	assert problemCount(inMain("hive.map.Map<Str, Int> m = hive.map.new()  hive.map.set(m, \"a\", 1)")) == 0
+}
+
+test "a library call is held to what its module takes" {
+	// Hive never widens a number behind your back, and this is where that is
+	// caught rather than left to Go to say `float64` about.
+	got := problem(inMain("health := 3  echo hive.math.max(0, health)"))
+	assert opens(got, "in `main`: the first argument of `hive.math.max` wants Float and this is Int")
+	// And only where the module really does take one thing. A token's claims are
+	// a value of the program's own type, so that position says nothing.
+	session := "type Session \{ user: Str  exp: Int }\n"
+	assert problemCount(session + inMain("echo hive.crypto.jwtSign(Session(\"ada\", 1), \"secret\")")) == 0
+	assert opens(problem(session + inMain("echo hive.crypto.jwtSign(Session(\"ada\", 1), 1)")),
+		"in `main`: the second argument of `hive.crypto.jwtSign` wants Str and this is Int")
+	assert opens(problem(inMain("health := 3  echo hive.math.max(0.0, health)")),
+		"in `main`: the second argument of `hive.math.max` wants Float and this is Int")
+	assert problemCount(inMain("health := 3.0  echo hive.math.max(0.0, health)")) == 0
+}
+
+test "a builtin cannot be used as a value" {
+	got := problem(inMain("Str[dyn] names = [\"a\"]  echo map(names, len)"))
+	assert opens(got, "in `main`: `len` is a builtin, so it cannot be used as a value")
+}
+
+// --- Walking a vector --------------------------------------------------------
+
+test "filter wants a Bool, filterMap a Result, and map something" {
+	twice := "func twice(n: Int): Int \{ return n * 2 }\n"
+	nothing := "proc shout(n: Int): void \{ echo n }\n"
+	assert opens(problem(twice + inMain("echo filter([1, 2], twice)")),
+		"in `main`: `filter` keeps the elements its function said yes to, so that function has to answer with a `Bool`")
+	assert opens(problem(twice + inMain("echo filterMap([1, 2], twice)")),
+		"in `main`: `filterMap` transforms and selects in one pass, so its function has to answer with a `Result`")
+	assert opens(problem(nothing + inMain("echo map([1, 2], shout)")),
+		"in `main`: `map` walks with a `func`, never a `proc`")
+}
+
+test "a walk takes a func over the elements, one at a time" {
+	pair := "func pair(a: Int, b: Int): Int \{ return a + b }\n"
+	assert opens(problem(pair + inMain("echo map([1, 2], pair)")),
+		"in `main`: `map` hands its function one element at a time, and this one takes 2 arguments")
+	assert opens(problem(inMain("echo map([1, 2], 3)")),
+		"in `main`: `map` walks a vector with a function over its elements, and this second argument is Int")
+	assert opens(problem(inMain("echo map([1, 2])")),
+		"in `main`: `map` takes the vector to walk and the `func` to walk it with, and this call passes 1 argument")
+	// And the element type has to be the one the function takes.
+	assert opens(problem("func shout(s: Str): Str \{ return s }\n" + inMain("echo map([1, 2], shout)")),
+		"in `main`: the element `map` hands its function wants Str and this is Int")
+}
+
+test "a walk that is right is left alone" {
+	assert problemCount("func twice(n: Int): Int \{ return n * 2 }\n" + inMain("echo map([1, 2], twice)")) == 0
+	assert problemCount("func big(n: Int): Bool \{ return n > 1 }\n" + inMain("echo filter([1, 2], big)")) == 0
+	assert problemCount("func ok(n: Int): Result<Int, Bool> \{ return Result.Ok(n) }\n" + inMain("echo filterMap([1, 2], ok)")) == 0
+}
+
+// --- What a builtin takes ----------------------------------------------------
+//
+// Every builtin has a signature ([13](../spec/13-builtins.md)); every one of
+// these used to reach the Go toolchain instead.
+
+test "join, split, row and column are held to their signatures" {
+	assert opens(problem(inMain("echo join([1, 2], \",\")")),
+		"in `main`: what `join` concatenates wants Str[] and this is Int[2]")
+	assert opens(problem(inMain("echo join([\"a\"], 1)")),
+		"in `main`: the separator `join` puts between elements wants Str and this is Int")
+	assert opens(problem(inMain("echo split(12, \",\")")),
+		"in `main`: what `split` takes apart wants Str and this is Int")
+	assert opens(problem(inMain("echo row([1, 2], \"a\")")),
+		"in `main`: what `row` reads wants Str[][] and this is Int[2]")
+	assert opens(problem(inMain("Str[dyn][dyn] t = []  echo column(t, 1)")),
+		"in `main`: the key `column` looks for wants Str and this is Int")
+}
+
+test "len and bytes measure something that has a size" {
+	assert opens(problem(inMain("echo len(1)")),
+		"in `main`: `len` measures a vector or a `Str` or a map, and this is Int")
+	assert opens(problem(inMain("hive.map.Map<Str, Int> m = hive.map.new()  echo bytes(m)")),
+		"in `main`: `bytes` measures a vector's storage or a `Str`'s encoding, and a map is neither")
+	assert opens(problem(inMain("echo len(\"a\", \"b\")")),
+		"in `main`: `len` takes 1 argument, and this call passes 2 arguments")
+	assert problemCount(inMain("hive.map.Map<Str, Int> m = hive.map.new()  echo len(m)  echo len(\"a\")  echo len([1])  echo bytes([1])")) == 0
+}
+
+test "indexOf looks for what could be there" {
+	assert opens(problem(inMain("echo indexOf([1, 2], \"a\")")),
+		"in `main`: what `indexOf` looks for wants Int and this is Str")
+	assert opens(problem(inMain("echo indexOf(\"ab\", 1)")),
+		"in `main`: what `indexOf` looks for in a `Str` wants Str and this is Int")
+	assert problemCount(inMain("echo indexOf([1, 2], 2)  echo indexOf(\"ab\", \"b\")")) == 0
+}
+
+test "sort orders a vector, by its own order or by a func of two" {
+	twice := "func twice(n: Int): Int \{ return n * 2 }\n"
+	assert opens(problem(twice + inMain("echo sort([2, 1], twice)")),
+		"in `main`: the order `sort` was given wants func(Int, Int): Bool and this is func(Int): Int")
+	assert opens(problem(inMain("echo sort(1)")),
+		"in `main`: `sort` orders a vector, and this is Int")
+	assert problemCount("func firstOf(a: Int, b: Int): Bool \{ return a < b }\n" + inMain("echo sort([2, 1], firstOf)")) == 0
+	assert problemCount(inMain("echo sort([2, 1])")) == 0
+}
+
+test "append and drop are held to what the vector holds" {
+	assert opens(problem(inMain("mut Int[dyn] v = [1]  append(v, \"a\")")),
+		"in `main`: what `append` puts in wants Int and this is Str")
+	assert opens(problem(inMain("mut Int[dyn] v = [1, 2]  echo drop(v, \"a\", 1)")),
+		"in `main`: the low bound of `drop` wants Int and this is Str")
+	assert problemCount(inMain("mut Int[dyn] v = [1, 2]  append(v, 3)  echo drop(v, 0, 1)")) == 0
 }
 
 // --- Several at once ---------------------------------------------------------

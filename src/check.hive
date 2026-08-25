@@ -52,7 +52,7 @@ proc checkModule(m: ast.Module): diag.Diagnostic[dyn] {
 }
 
 proc report(c: mut Check, message: Str): void {
-	append(c.errors, diag.Diagnostic("", c.line, diag.inDecl(c.inside, message)))
+	append(c.errors, diag.at(c.line, diag.inDecl(c.inside, message)))
 }
 
 // --- Declarations ------------------------------------------------------------
@@ -681,7 +681,16 @@ proc checkName(c: mut Check, env: infer.Env, name: Str): void {
 	if types.findType(c.table, name) is Result.Ok(_) {
 		return
 	}
-	if infer.isBuiltin(name) || name == "Result" {
+	if name == "Result" {
+		return
+	}
+	// A builtin is a name a *call* reaches, and never a value. Several are
+	// overloaded — `len` takes a vector, a `Str` or a map — so which one a bare
+	// reference meant is decided by the argument types, and a value carries
+	// none. It is the same reason a generic cannot be a value, and it has the
+	// same two ways out.
+	if infer.isBuiltin(name) {
+		report(c, "`{name}` is a builtin, so it cannot be used as a value: several builtins are overloaded, and which one a reference means is decided by the argument types a value does not carry. Call it, or wrap it in a `func` of your own — `func lengthOf(s: Str): Int \{ return hive.len(s) }`")
 		return
 	}
 	report(c, "`{name}` is not a name anything here declared")
@@ -749,7 +758,7 @@ proc checkOperands(c: mut Check, env: infer.Env, op: ast.BinOp, left: ast.Expr, 
 		return
 	}
 	if types.operandsFit(leftType, rightType) == false {
-		report(c, "`" + ast.opSpelling(op) + "` wants two of one type, and these are " + types.show(leftType) + " and " + types.show(rightType) + ". Hive never widens a number behind your back — `hive.conv.itf` is how an `Int` becomes a `Float`")
+		report(c, "`" + ast.opSpelling(op) + "` wants two of one type, and these are " + types.show(leftType) + " and " + types.show(rightType) + whyMixed(leftType, rightType))
 	}
 }
 
@@ -774,8 +783,11 @@ proc checkCall(c: mut Check, env: infer.Env, callee: ast.Expr, args: ast.Arg[]):
 }
 
 proc checkNamedCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): void {
-	// A local binding shadows a declaration, which shadows a builtin.
+	// A local binding shadows a declaration, which shadows a builtin — so a call
+	// through one is a call of whatever the binding holds, and what it holds
+	// decides whether that means anything.
 	if infer.isBound(env, name) {
+		checkCallableValue(c, env, name)
 		return
 	}
 	if types.findCallable(c.table, name) is Result.Ok(info) {
@@ -795,6 +807,31 @@ proc checkNamedCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): v
 		return
 	}
 	report(c, "`{name}` is not a name anything here declared")
+}
+
+// What a name has to hold for a call through it to mean something: a callable
+// value, or an address, which a call sends to and waits for the answer of.
+//
+// `TUnknown` is what a pass that has already complained hands back and a type
+// variable is only pinned down in a copy, so neither is complained about here —
+// counting one mistake twice helps nobody.
+proc checkCallableValue(c: mut Check, env: infer.Env, name: Str): void {
+	ty := infer.typeOf(env, ast.Expr.Ident(name))
+	if ty is types.Ty.TFn(_, _, _) {
+		return
+	}
+	if ty is types.Ty.TUnknown {
+		return
+	}
+	if ty is types.Ty.TVar(_) {
+		return
+	}
+	if ty is types.Ty.TLib(module, libName) {
+		if module == "syslink" && libName == "Address" {
+			return
+		}
+	}
+	report(c, "`{name}` here is " + types.show(ty) + ", which is not something a call can reach through. A local binding shadows a declaration of the same name, so the `{name}` this calls is the one bound above it rather than any callable")
 }
 
 proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str, args: ast.Arg[]): void {
@@ -825,6 +862,10 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
 			if hiveName == "hive" {
 				if stdlib.isKnownModule(module) == false {
 					report(c, "this compiler does not carry `hive.{module}`")
+				} else if stdlib.hasName(module, field) == false {
+					report(c, "`hive.{module}` has no `{field}`")
+				} else {
+					checkLibraryArguments(c, env, module, field, args)
 				}
 				return
 			}
@@ -839,6 +880,53 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
 		}
 		checkPurity(c, pure, field)
 	}
+}
+
+// What a standard library call takes, position by position. The table says what
+// each position holds and not how many there are — `hive.math.max` takes two of
+// its three, and an attribute that carries a message says nothing about it — so
+// this checks the positions the table has an answer for and leaves the rest.
+//
+// Without it the mismatch reaches the Go toolchain, which reports it against the
+// generated file in terms of Go's own types. `hive.math.max(0, health)` is the
+// one worth catching by name: Hive never widens a number behind your back, and
+// a message that only said `float64` would leave the reader hunting for the
+// conversion they were supposed to have known about.
+proc checkLibraryArguments(c: mut Check, env: infer.Env, module: Str, name: Str, args: ast.Arg[]): void {
+	wanted := stdlib.paramsOf(module, name)
+	mut i := 0
+	for each a in args {
+		if a.value is ast.Expr.Hole {
+			i = i + 1
+			continue
+		}
+		if wanted bounds i {
+			fits(c, wanted[i], infer.typeOf(env, a.value), "the " + nth(i) + " argument of `hive.{module}.{name}`")
+		}
+		i = i + 1
+	}
+}
+
+// Why an `Int` beside a `Float` is refused, said only where that is what
+// happened. It is worth saying then — a reader who does not know Hive never
+// widens is left hunting for a conversion nobody told them about — and worth
+// leaving out otherwise, where it would explain something that is not the
+// mistake.
+func whyMixed(left: types.Ty, right: types.Ty): Str {
+	if isNumberPair(left, right) {
+		return ". Hive never widens a number behind your back — `hive.conv.itf` is how an `Int` becomes a `Float`"
+	}
+	return ""
+}
+
+func isNumberPair(left: types.Ty, right: types.Ty): Bool {
+	if left is types.Ty.TInt {
+		return right is types.Ty.TFloat
+	}
+	if left is types.Ty.TFloat {
+		return right is types.Ty.TInt
+	}
+	return false
 }
 
 proc checkArguments(c: mut Check, env: infer.Env, name: Str, info: types.CallableInfo, args: ast.Arg[]): void {
@@ -944,9 +1032,14 @@ func namesOfFields(fields: ast.Field[]): Str[dyn] {
 }
 
 func argFor(args: ast.Arg[], name: Str, index: Int): ast.Expr {
-	for each a in args {
-		if a.name == name {
-			return a.value
+	// A positional argument carries no name, so an empty one is not a name to
+	// look up — it is the question "which position", and only the loop below
+	// answers that.
+	if name != "" {
+		for each a in args {
+			if a.name == name {
+				return a.value
+			}
 		}
 	}
 	mut seen := 0
@@ -959,6 +1052,15 @@ func argFor(args: ast.Arg[], name: Str, index: Int): ast.Expr {
 		}
 	}
 	return ast.Expr.Absent()
+}
+
+// Which argument, counted the way a person counts them.
+func nth(index: Int): Str {
+	if index == 0 { return "first" }
+	if index == 1 { return "second" }
+	if index == 2 { return "third" }
+	if index == 3 { return "fourth" }
+	return "argument {index}"
 }
 
 func countOf(n: Int): Str {
@@ -977,16 +1079,219 @@ func fieldCount(n: Int): Str {
 
 // --- The builtins ------------------------------------------------------------
 
+// Every builtin has a signature ([13](../spec/13-builtins.md)), and a call that
+// does not match one is a program the specification describes as a compile
+// error. Caught here rather than left to the generated Go, where the message
+// would be about Go's own types and about a file nobody wrote.
 proc checkBuiltinCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): void {
 	if name == "append" || name == "prepend" {
 		checkGrows(c, env, name, args, 2)
+		// What goes in has to be what the vector holds.
+		if len(args) == 2 {
+			element := types.elementOf(typeOfArg(c, env, args, 0))
+			fits(c, element, typeOfArg(c, env, args, 1), "what `{name}` puts in")
+		}
 	} else if name == "drop" {
 		checkGrows(c, env, name, args, 3)
+		if len(args) == 3 {
+			fits(c, types.Ty.TInt(), typeOfArg(c, env, args, 1), "the low bound of `drop`")
+			fits(c, types.Ty.TInt(), typeOfArg(c, env, args, 2), "the high bound of `drop`")
+		}
 	} else if name == "sort" {
-		if len(args) != 1 && len(args) != 2 {
-			report(c, "`sort` takes a vector, and optionally the `func` that says which of two elements comes first")
+		checkSort(c, env, args)
+	} else if name == "map" || name == "filter" || name == "filterMap" {
+		checkWalk(c, env, name, args)
+	} else if name == "len" || name == "bytes" {
+		checkMeasured(c, env, name, args)
+	} else if name == "join" {
+		if arity(c, name, args, 2) {
+			fits(c, strings(), typeOfArg(c, env, args, 0), "what `join` concatenates")
+			fits(c, types.Ty.TStr(), typeOfArg(c, env, args, 1), "the separator `join` puts between elements")
+		}
+	} else if name == "split" {
+		if arity(c, name, args, 2) {
+			fits(c, types.Ty.TStr(), typeOfArg(c, env, args, 0), "what `split` takes apart")
+			fits(c, types.Ty.TStr(), typeOfArg(c, env, args, 1), "the separator `split` cuts on")
+		}
+	} else if name == "indexOf" {
+		checkIndexOf(c, env, args)
+	} else if name == "row" || name == "column" {
+		if arity(c, name, args, 2) {
+			fits(c, table(), typeOfArg(c, env, args, 0), "what `{name}` reads")
+			fits(c, types.Ty.TStr(), typeOfArg(c, env, args, 1), "the key `{name}` looks for")
 		}
 	}
+}
+
+// `sort(v)` orders a vector by its element type's own order; `sort(v, first)`
+// orders it by a `func` answering whether its first element comes before its
+// second.
+proc checkSort(c: mut Check, env: infer.Env, args: ast.Arg[]): void {
+	if len(args) != 1 && len(args) != 2 {
+		report(c, "`sort` takes a vector, and optionally the `func` that says which of two elements comes first")
+		return
+	}
+	subject := typeOfArg(c, env, args, 0)
+	if isVector(subject) == false && isUnknown(subject) == false {
+		report(c, "`sort` orders a vector, and this is " + types.show(subject))
+		return
+	}
+	if len(args) == 1 {
+		return
+	}
+	element := types.elementOf(subject)
+	fits(c, types.Ty.TFn(true, [element, element], types.Ty.TBool()), typeOfArg(c, env, args, 1),
+		"the order `sort` was given")
+}
+
+// `len` counts a vector's elements, a `Str`'s characters or a map's pairs;
+// `bytes` measures a vector's storage or a `Str`'s encoding.
+proc checkMeasured(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): void {
+	if arity(c, name, args, 1) == false {
+		return
+	}
+	subject := typeOfArg(c, env, args, 0)
+	if isUnknown(subject) || isVector(subject) {
+		return
+	}
+	if subject is types.Ty.TStr {
+		return
+	}
+	if subject is types.Ty.TMap(_, _) {
+		if name == "len" {
+			return
+		}
+		report(c, "`bytes` measures a vector's storage or a `Str`'s encoding, and a map is neither — a map's storage is not one contiguous thing to measure")
+		return
+	}
+	report(c, "`{name}` measures a vector or a `Str`" + mapToo(name) + ", and this is " + types.show(subject))
+}
+
+func mapToo(name: Str): Str {
+	if name == "len" {
+		return " or a map"
+	}
+	return ""
+}
+
+// `indexOf` finds a value in a vector or a substring in a `Str`, and either way
+// what is looked for has to be what could be there.
+proc checkIndexOf(c: mut Check, env: infer.Env, args: ast.Arg[]): void {
+	if arity(c, "indexOf", args, 2) == false {
+		return
+	}
+	subject := typeOfArg(c, env, args, 0)
+	if subject is types.Ty.TStr {
+		fits(c, types.Ty.TStr(), typeOfArg(c, env, args, 1), "what `indexOf` looks for in a `Str`")
+		return
+	}
+	if isVector(subject) {
+		fits(c, types.elementOf(subject), typeOfArg(c, env, args, 1), "what `indexOf` looks for")
+		return
+	}
+	if isUnknown(subject) {
+		return
+	}
+	report(c, "`indexOf` searches a vector or a `Str`, and this is " + types.show(subject))
+}
+
+// How many a builtin takes. Answers whether the call had that many, so what
+// follows can read the arguments knowing they are there.
+proc arity(c: mut Check, name: Str, args: ast.Arg[], wanted: Int): Bool {
+	if len(args) == wanted {
+		return true
+	}
+	report(c, "`{name}` takes " + countOf(wanted) + ", and this call passes " + countOf(len(args)))
+	return false
+}
+
+// One argument's type, or `TUnknown` where a hole stands instead — a partial
+// application says nothing about what will fill it.
+proc typeOfArg(c: mut Check, env: infer.Env, args: ast.Arg[], index: Int): types.Ty {
+	given := argFor(args, "", index)
+	if given is ast.Expr.Hole {
+		return types.Ty.TUnknown()
+	}
+	return infer.typeOf(env, given)
+}
+
+func isVector(ty: types.Ty): Bool {
+	return ty is types.Ty.TVec(_, _)
+}
+
+func isUnknown(ty: types.Ty): Bool {
+	return ty is types.Ty.TUnknown
+}
+
+func strings(): types.Ty {
+	return types.Ty.TVec(types.Ty.TStr(), ast.Dim.Any())
+}
+
+// `Table` is rows of cells: a vector of vectors of `Str`, any length either way.
+func table(): types.Ty {
+	return types.Ty.TVec(strings(), ast.Dim.Any())
+}
+
+// `map`, `filter` and `filterMap` each walk a vector with a function over its
+// elements, and each is specific about what that function answers with. A
+// mismatch here is caught rather than left to the generated Go, where the
+// message would be about Go's own types and about a file nobody wrote.
+proc checkWalk(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): void {
+	if len(args) != 2 {
+		report(c, "`{name}` takes the vector to walk and the `func` to walk it with, and this call passes " + countOf(len(args)))
+		return
+	}
+	ty := infer.typeOf(env, argFor(args, "", 1))
+	if ty is types.Ty.TUnknown {
+		return
+	}
+	if ty is types.Ty.TFn(pure, params, result) {
+		// A walk says nothing about the order its function runs in or how often,
+		// so there is nowhere to hang a side effect. A `for each` loop does say,
+		// and is what a `proc` is for.
+		if pure == false {
+			report(c, "`{name}` walks with a `func`, never a `proc`: it says nothing about the order it runs in or how often, so there is nowhere to hang a side effect. Write a `for each` loop, which does say")
+			return
+		}
+		if len(params) != 1 {
+			report(c, "`{name}` hands its function one element at a time, and this one takes " + countOf(len(params)))
+			return
+		}
+		element := types.elementOf(infer.typeOf(env, argFor(args, "", 0)))
+		fits(c, typeAt(params, 0), element, "the element `{name}` hands its function")
+		checkWalkResult(c, name, result)
+		return
+	}
+	report(c, "`{name}` walks a vector with a function over its elements, and this second argument is " + types.show(ty))
+}
+
+proc checkWalkResult(c: mut Check, name: Str, result: types.Ty): void {
+	if name == "filter" {
+		if result is types.Ty.TBool {
+			return
+		}
+		report(c, "`filter` keeps the elements its function said yes to, so that function has to answer with a `Bool` — this one answers with " + types.show(result))
+		return
+	}
+	if name == "filterMap" {
+		if result is types.Ty.TResult(_, _) {
+			return
+		}
+		report(c, "`filterMap` transforms and selects in one pass, so its function has to answer with a `Result` — an `Ok` is kept and an `Error` is dropped. This one answers with " + types.show(result))
+		return
+	}
+	// `map` wants *something*: a `void` function collects nothing, and that too
+	// is a `for each` loop.
+	if result is types.Ty.TVoid {
+		report(c, "`map` collects what its function answered with, and this one answers with nothing. A walk that only acts is a `for each` loop")
+	}
+}
+
+func typeAt(list: types.Ty[], index: Int): types.Ty {
+	if list bounds index {
+		return list[index]
+	}
+	return types.Ty.TUnknown()
 }
 
 // `append`, `prepend` and `drop` all write *through* a vector, and all three ask

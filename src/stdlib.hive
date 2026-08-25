@@ -49,6 +49,43 @@ func goNameOf(module: Str, name: Str): Str {
 	return text.capitalise(module) + text.capitalise(name)
 }
 
+/// Whether `hive.<module>.<name>` is a call this compiler carries. A name a
+/// module does not have has to be refused here, because nothing downstream can:
+/// the emitter writes the call out under its runtime spelling and the Go
+/// toolchain is what finds it missing, which is far too late to name the thing
+/// at fault.
+///
+/// Most of it is read off `resultOf`, which answers `TUnknown` for a name its
+/// module does not have. Four modules cannot be read that way — `task` answers
+/// the same for every name, and `map`, `json` and `crypto` each hold calls whose
+/// answer is genuinely not known here — so those are named in full.
+func hasName(module: Str, name: Str): Bool {
+	if isLibType(module, name) {
+		return true
+	}
+	if module == "task" {
+		return name == "sleep"
+	}
+	if module == "map" {
+		return name == "new" || name == "set" || name == "get" || name == "has"
+			|| name == "delete" || name == "keys" || name == "values"
+			|| name == "fromTable" || name == "toTable"
+	}
+	if module == "json" {
+		return name == "parse" || name == "encode" || name == "table"
+			|| name == "get"
+	}
+	if module == "crypto" {
+		if name == "jwtVerify" || name == "jwtDecode" {
+			return true
+		}
+	}
+	if resultOf(module, name, []) is types.Ty.TUnknown {
+		return false
+	}
+	return true
+}
+
 /// What `hive.<module>.<name>(args)` answers with.
 ///
 /// Most of these are fixed. The ones that are not are the collection calls,
@@ -686,12 +723,19 @@ func uiAttrParams(name: Str): types.Ty[dyn] {
 }
 
 /// What `hive.<module>.<name>` takes, in order. Empty where this compiler has
-/// nothing to say, and the emitter then lets each argument stand for itself.
+/// nothing to say, and `TUnknown` in a position where it has nothing to say
+/// about *that* one; either way the argument stands for itself.
 ///
-/// It matters for exactly one reason: a value that cannot say what it is has to
-/// be told. An empty vector literal is the usual one — `hive.term.exec("go",
-/// [], "")` has to know that `[]` is a vector of `Str` before it can write the
-/// Go for it.
+/// It matters for two reasons. A value that cannot say what it is has to be
+/// told, which is what the emitter reads this for — an empty vector literal is
+/// the usual one, and `hive.term.exec("go", [], "")` has to know that `[]` is a
+/// vector of `Str` before it can write the Go for it. And a call given the wrong
+/// thing is refused here rather than by the Go toolchain, which is what the
+/// check pass reads it for.
+///
+/// So a position that is a *program's* own type has to say `TUnknown` and not
+/// guess: guessing would be harmless to the first reader and a wrong refusal to
+/// the second.
 func paramsOf(module: Str, name: Str): types.Ty[dyn] {
 	if module == "term" {
 		if name == "print" || name == "status" { return [types.Ty.TStr()] }
@@ -782,8 +826,14 @@ func paramsOf(module: Str, name: Str): types.Ty[dyn] {
 	}
 	if module == "crypto" {
 		if name == "randomHex" { return [types.Ty.TInt()] }
+		// A token's claims are a value of the program's own type — signing
+		// encodes one as the payload and verifying decodes the payload back into
+		// it — so that position says nothing and the argument stands for itself.
+		if name == "jwtSign" {
+			return [types.Ty.TUnknown(), types.Ty.TStr()]
+		}
 		if name == "hmacSha256" || name == "encrypt" || name == "decrypt"
-			|| name == "jwtSign" || name == "jwtVerify" {
+			|| name == "jwtVerify" {
 			return [types.Ty.TStr(), types.Ty.TStr()]
 		}
 		return [types.Ty.TStr()]

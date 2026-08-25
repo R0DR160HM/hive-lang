@@ -97,13 +97,17 @@ type Emit {
 	/// author wrote, and this is what tells that apart from the clone helpers and
 	/// the atom table the compiler wrote beside it.
 	spans: Str[dyn]
+	/// The line the declaration being emitted was declared on. It is the only
+	/// position a flattened program can offer, and a message with none at all is
+	/// one an editor cannot jump to.
+	line: Int
 	errors: diag.Diagnostic[dyn]
 }
 
 /// Emit a whole program.
 proc emitModule(m: ast.Module): Emitted {
 	t := types.tableOf(m)
-	mut Emit em = Emit(t, [], 0, ["Nil"], [], [], [], [], [], [], 0, [], [], [], [], [], false, -1, [], [])
+	mut Emit em = Emit(t, [], 0, ["Nil"], [], [], [], [], [], [], 0, [], [], [], [], [], false, -1, [], 0, [])
 
 	line(em, "package main")
 	line(em, "")
@@ -133,6 +137,7 @@ proc emitModule(m: ast.Module): Emitted {
 	emitMirrors(em, m)
 	emitClones(em, m.decls)
 	for each d in m.decls {
+		em.line = ast.declLine(d)
 		emitDecl(em, env, d)
 	}
 	// A codec is asked for wherever a program encodes or decodes something,
@@ -190,7 +195,7 @@ proc close(em: mut Emit, written: Str): void {
 }
 
 proc fail(em: mut Emit, message: Str): void {
-	append(em.errors, diag.at(0, message))
+	append(em.errors, diag.at(em.line, message))
 }
 
 proc fresh(em: mut Emit, tag: Str): Str {
@@ -3217,7 +3222,7 @@ proc emitTests(m: ast.Module, atoms: Str[], codecs: Str[]): Str {
 	t := types.tableOf(m)
 	// The codecs `main.go` already wrote are seeded rather than written again:
 	// the two files are one Go package.
-	mut Emit em = Emit(t, [], 0, copiedNames(atoms), [], copiedNames(codecs), [], [], [], [], 0, [], [], [], [], [], true, -1, [], [])
+	mut Emit em = Emit(t, [], 0, copiedNames(atoms), [], [], [], [], [], copiedNames(codecs), 0, [], [], [], [], [], true, -1, [], 0, [])
 	written := len(codecs)
 	mut found := false
 	for each d in m.decls {
@@ -3241,7 +3246,8 @@ proc emitTests(m: ast.Module, atoms: Str[], codecs: Str[]): Str {
 	line(em, "hive.InitAtoms(" + atomTable(em) + ")")
 	env := infer.newEnv(t)
 	for each d in m.decls {
-		if d is ast.Decl.TestDecl(title, body, _) {
+		if d is ast.Decl.TestDecl(title, body, declaredOn) {
+			em.line = declaredOn
 			enterBody(em)
 			open(em, "t.Run(" + quoted(title) + ", func(t *testing.T) \{")
 			line(em, "defer hive.TestRecover(t)")
@@ -3321,5 +3327,29 @@ func sourceOf(e: ast.Expr): Str {
 	if e is ast.Expr.Negate(operand) { return "-" + sourceOf(operand) }
 	if e is ast.Expr.FloatLit(v) { return "{v}" }
 	if e is ast.Expr.AtomLit(atom) { return "#{atom}" }
+	if e is ast.Expr.VectorLit(items) {
+		mut Str[dyn] out = []
+		for each item in items {
+			append(out, sourceOf(item))
+		}
+		return "[" + join(out, ", ") + "]"
+	}
+	// A slice's bounds are each `Absent` when they were not written, which is
+	// what makes `v[:2]` and `v[2:]` read back as they were typed.
+	if e is ast.Expr.Slice(subject, low, high) {
+		return sourceOf(subject) + "[" + sourceOf(low) + ":" + sourceOf(high) + "]"
+	}
+	if e is ast.Expr.Interp(parts) {
+		mut Str[dyn] out = []
+		for each part in parts {
+			if part is ast.InterpPart.Literal(t) {
+				append(out, t)
+			} else if part is ast.InterpPart.Expression(value) {
+				append(out, "\{" + sourceOf(value) + "}")
+			}
+		}
+		return quoted(join(out, ""))
+	}
+	if e is ast.Expr.Absent { return "" }
 	return "..."
 }
