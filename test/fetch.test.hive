@@ -4,6 +4,7 @@
 // The last few make a real repository on this disk and fetch it, which needs
 // `git` but no network — a clone from a path is a clone.
 import ../src/fetch
+import ../src/paths
 import ../src/text
 import hive.file
 import hive.term
@@ -74,6 +75,12 @@ test "a clone is filed under what it is and which commit" {
 	other := fetch.cacheOf(repo, "def456")
 	assert where != other
 	assert fetch.cacheOf(fetch.Repo("https://github.com/owner/other", "", "x"), "abc123") != where
+
+	// It is one directory name, so nothing a directory name cannot hold survives
+	// into it. A port is the case that arises: a colon is not a character every
+	// filesystem lets a name have.
+	ported := fetch.cacheOf(fetch.Repo("https://host:8443/owner/repo", "", "x"), "abc123")
+	assert text.endsWith(ported, "/pkg/host_8443_owner_repo@abc123")
 }
 
 // --- The lock ----------------------------------------------------------------
@@ -140,13 +147,19 @@ proc aRepository(where: Str, contents: Str): Str {
 	run("git", ["config", "user.name", "Hive test"], where)
 	run("git", ["add", "."], where)
 	run("git", ["commit", "--quiet", "-m", "one module"], where)
-	return here() + "/" + where
+	return absolute(where)
 }
 
-// Where this test is running, which is the generated project rather than the
-// folder the source is in.
-proc here(): Str {
-	return text.trim(run("pwd", [], ""))
+// A repository this test made, as an absolute path.
+//
+// `pwd` is the obvious way to find one and the wrong one: the shell that has a
+// `pwd` on Windows answers in a form only that shell understands, and what this
+// path is handed to is `git` and the Go runtime. So git is asked instead — it
+// is already what these tests run — and it answers in the form it takes back.
+proc absolute(where: Str): Str {
+	// `--absolute-git-dir` names `<where>/.git`; the repository is the folder
+	// that one sits in.
+	return paths.dirOf(text.trim(run("git", ["rev-parse", "--absolute-git-dir"], where)))
 }
 
 // `hive.file.delete` takes a file or a directory that is already empty, which is
@@ -229,7 +242,9 @@ test "a revision the repository does not have is named as that, and nothing else
 
 test "a repository that cannot be reached says so" {
 	mut fetch.Lock lock = fetch.readLock("_fetchFour.hive")
-	nowhere := here() + "/_nothing/is/here"
+	// A repository is made only to have somewhere absolute to hang a name on;
+	// the name is a path under it that nothing ever wrote.
+	nowhere := aRepository("_repoFive", "func here(): Int \{ return 1 }") + "/_nothing/is/here"
 	got := fetch.fetch(fetch.Repo(nowhere, "", "text"), lock)
 	assert text.startsWith(whyOf(got), "could not reach `{nowhere}`")
 }
