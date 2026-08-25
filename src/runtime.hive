@@ -6169,6 +6169,7 @@ func uiSource(): Str {
 
 		import (
 			"fmt"
+			"math"
 			"net"
 			"net/http"
 			"os"
@@ -6208,6 +6209,7 @@ func uiSource(): Str {
 			Rows    Table
 			Options []string
 			Flag    bool
+			Marks   []UiMark
 		}
 
 		// UiAttr is one attribute. Layout and styling attributes carry a number, a
@@ -6282,6 +6284,62 @@ func uiSource(): Str {
 		// making easy to write.
 		func UiLink(attrs []UiAttr, href string, label string) UiView {
 			return UiView{Kind: "link", Attrs: attrs, Text: label, Options: []string{href}}
+		}
+
+		// --- The plane ----------------------------------------------------------------
+
+		// UiMark is one thing on a canvas: the same arrangement UiView and UiShape use,
+		// and for the same reason — a mark is a value with nothing behind it. Nums
+		// carries whatever its kind takes, which for a line is every place on it.
+		//
+		// A mark is deliberately not a UiView and not a UiShape. Three closed sets,
+		// three meanings, and keeping them apart is what makes a button on a canvas or
+		// a dot in a scene something the compiler refuses rather than something the
+		// renderer quietly drops.
+		type UiMark struct {
+			Kind  string
+			Attrs []UiAttr
+			Nums  []float64
+			Text  string
+		}
+
+		// A filled circle: a car on a map, a point on a plot, a bulb on a dial.
+		func UiDot(attrs []UiAttr, x float64, y float64, radius float64) UiMark {
+			return UiMark{Kind: "dot", Attrs: attrs, Nums: []float64{x, y, radius}}
+		}
+
+		// A rectangle, from its middle rather than from a corner — because everything
+		// else on a canvas is placed by where it is, and one thing placed by where its
+		// corner is would be the one that is always half a width out.
+		func UiBar(attrs []UiAttr, x float64, y float64, width float64, height float64) UiMark {
+			return UiMark{Kind: "bar", Attrs: attrs, Nums: []float64{x, y, width, height}}
+		}
+
+		// A line through every place given, as x, y, x, y. Thick is how wide it is
+		// drawn, in the canvas's units.
+		func UiPath(attrs []UiAttr, points []float64) UiMark {
+			return UiMark{Kind: "path", Attrs: attrs, Nums: points}
+		}
+
+		// The same places, filled: the area a road encloses, a sector of a dial, a
+		// country on a map.
+		func UiPatch(attrs []UiAttr, points []float64) UiMark {
+			return UiMark{Kind: "patch", Attrs: attrs, Nums: points}
+		}
+
+		// Words centred on a place, as tall as it says — in the canvas's units like
+		// everything else, so words on a map grow with the map rather than staying the
+		// size of the page's type.
+		func UiWords(attrs []UiAttr, x float64, y float64, height float64, text string) UiMark {
+			return UiMark{Kind: "words", Attrs: attrs, Nums: []float64{x, y, height}, Text: text}
+		}
+
+		// UiCanvas is the widget. Unlike a scene it keeps its payload in the document:
+		// what a canvas draws is a few hundred numbers where a world is a few thousand,
+		// and a picture that arrives with the page it belongs to needs no second channel
+		// and cannot be a frame behind it.
+		func UiCanvas(attrs []UiAttr, marks []UiMark) UiView {
+			return UiView{Kind: "canvas", Attrs: attrs, Marks: marks}
 		}
 
 		// --- Input ------------------------------------------------------------------
@@ -6422,6 +6480,37 @@ func uiSource(): Str {
 		func UiAttrBackground(v UiTone) UiAttr { return uiEnum("background", string(v)) }
 		func UiAttrKind(v UiInputKind) UiAttr  { return uiEnum("kind", string(v)) }
 
+		// Several numbers at once. A place, a heading, a corner of the plane: none of
+		// them is one number and none of them is worth a type.
+		func uiNums(kind string, values []float64) UiAttr {
+			return UiAttr{Kind: kind, Nums: values}
+		}
+
+		// What colour a thing is, as against what colour the words on it are. It is
+		// here rather than with the scene because both dimensions past this page use
+		// it — a solid in a world and a mark on a canvas are both painted — and a
+		// canvas must not drag a 3D library into a build to say what colour a line is.
+		func UiAttrPaint(v UiTone) UiAttr { return uiEnum("paint", string(v)) }
+
+		// How thick a line is drawn, in the canvas's own units rather than in pixels:
+		// a map zoomed in has thicker roads, which is what zooming in means.
+		func UiAttrThick(n float64) UiAttr { return uiNums("thick", []float64{n}) }
+
+		// Which part of the plane a canvas shows: a corner, then how much of it. It is
+		// the whole of the coordinate system — everything on a canvas is said in these
+		// units and nothing anywhere is said in pixels.
+		func UiAttrRegion(x float64, y float64, width float64, height float64) UiAttr {
+			return uiNums("region", []float64{x, y, width, height})
+		}
+
+		// The numbers one attribute carries, or what to do without it.
+		func uiNumbers(attrs []UiAttr, kind string, fallback []float64) []float64 {
+			if a, ok := uiFind(attrs, kind); ok && len(a.Nums) == len(fallback) {
+				return a.Nums
+			}
+			return fallback
+		}
+
 		func UiAttrHeading(n int) UiAttr        { return uiNum("heading", n) }
 		func UiAttrPlaceholder(s string) UiAttr { return uiStr("placeholder", s) }
 		func UiAttrHint(s string) UiAttr        { return uiStr("hint", s) }
@@ -6460,7 +6549,12 @@ func uiSource(): Str {
 				// A scene's own events. They are listed here rather than anywhere the
 				// scene module can reach because this is what gives a node its id, and a
 				// scene with nothing but a frame handler still needs one.
-				case "onFrame", "onKeyDown", "onKeyUp", "onLook", "onGrab":
+				//
+				// onPad belongs in this list as much as any of them and was missing from
+				// it, which cost nothing only because every scene that reads a pad also
+				// reads a frame — a scene listening for a controller and nothing else got
+				// no id, so nothing it heard could be delivered anywhere.
+				case "onFrame", "onKeyDown", "onKeyUp", "onLook", "onGrab", "onPad":
 					return true
 				}
 			}
@@ -6645,7 +6739,34 @@ func uiSource(): Str {
 				}
 				r.out.WriteString("</div>")
 			case "overlay":
-				r.out.WriteString("<div class=\"h-backdrop\"" + r.backdrop(v.Attrs) + ">")
+				// Where in the window it sits.
+				//
+				// An overlay that says nothing is a **dialog**: centred, over a dimmed
+				// page, which is what a dialog is and what this widget was only ever
+				// used for. One that says where it goes is not a dialog — it is a panel
+				// pinned to an edge: a heads-up display in a corner, a toast, a legend
+				// over a picture. So it is not dimmed, because a grey sheet over the
+				// very thing the panel is annotating is the one thing it must not do,
+				// and it lets clicks through everywhere it is not, because a HUD that
+				// swallowed the whole window would be a game you cannot press a button
+				// in.
+				pinned := ""
+				if a, ok := uiFind(v.Attrs, "align"); ok {
+					pinned += "align-items:" + uiFlexPos(a.Enum) + ";"
+				}
+				if j, ok := uiFind(v.Attrs, "justify"); ok {
+					pinned += "justify-content:" + uiFlexPos(j.Enum) + ";"
+				}
+				shade := "h-backdrop"
+				if pinned != "" {
+					shade = "h-backdrop h-pinned"
+					pinned += "padding:12px;"
+				}
+				open := "<div class=\"" + shade + "\""
+				if pinned != "" {
+					open += " style=\"" + pinned + "\""
+				}
+				r.out.WriteString(open + r.backdrop(v.Attrs) + ">")
 				r.out.WriteString("<div" + r.common(v.Kind, v.Attrs) + ">")
 				for _, c := range v.Children {
 					r.view(c)
@@ -6731,6 +6852,8 @@ func uiSource(): Str {
 					out += " data-scene=\"" + strconv.Itoa(at) + "\""
 				}
 				r.out.WriteString(out + "></div>")
+			case "canvas":
+				r.canvas(v)
 			case "table":
 				r.table(v)
 			case "spinner":
@@ -6738,6 +6861,149 @@ func uiSource(): Str {
 			default:
 				r.out.WriteString("<!--unknown widget-->")
 			}
+		}
+
+		// ---------------------------------------------------------------------------
+		// A canvas
+		// ---------------------------------------------------------------------------
+
+		// Two dimensions, in the program's own units.
+		//
+		// It renders to SVG, and that is the whole implementation — there is no drawing
+		// context, no frame to schedule and nothing to clear, because a canvas is a
+		// value like every other view and what it holds is what is on it right now. The
+		// same tree that a window swaps in is what ui.page writes to a file, so a map
+		// drawn for a game is a map served by a web server without a line changing.
+		//
+		// **The units are the region's, not the page's.** A canvas showing a kilometre
+		// of racetrack says so once, and everything on it is then written in metres —
+		// a car at (x, z), a road nine metres wide — rather than in pixels somebody
+		// worked out by hand. That is what preserveAspectRatio is for: the box may be
+		// any shape at all and what is drawn keeps its own.
+		func (r *uiRender) canvas(v UiView) {
+			region := uiNumbers(v.Attrs, "region", []float64{0, 0, 100, 100})
+			// A region with no extent would divide by nothing. It is worth answering
+			// rather than refusing: a canvas of a lap before the lap has been rolled is
+			// a real state for one frame, and an empty box is what it should look like.
+			if region[2] <= 0 || region[3] <= 0 {
+				region = []float64{0, 0, 100, 100}
+			}
+			out := "<svg" + r.common(v.Kind, v.Attrs)
+			out += " viewBox=\"" + uiNumber(region[0]) + " " + uiNumber(region[1]) +
+				" " + uiNumber(region[2]) + " " + uiNumber(region[3]) + "\""
+			out += " preserveAspectRatio=\"xMidYMid meet\""
+			out += " xmlns=\"http://www.w3.org/2000/svg\">"
+			r.out.WriteString(out)
+			for _, m := range v.Marks {
+				r.mark(m)
+			}
+			r.out.WriteString("</svg>")
+		}
+
+		func (r *uiRender) mark(m UiMark) {
+			colour := uiMarkColour(m.Attrs)
+			switch m.Kind {
+			case "dot":
+				if len(m.Nums) < 3 {
+					return
+				}
+				r.out.WriteString("<circle cx=\"" + uiNumber(m.Nums[0]) + "\" cy=\"" +
+					uiNumber(m.Nums[1]) + "\" r=\"" + uiNumber(m.Nums[2]) +
+					"\" fill=\"" + colour + "\"/>")
+			case "bar":
+				if len(m.Nums) < 4 {
+					return
+				}
+				r.out.WriteString("<rect x=\"" + uiNumber(m.Nums[0]-m.Nums[2]/2) +
+					"\" y=\"" + uiNumber(m.Nums[1]-m.Nums[3]/2) +
+					"\" width=\"" + uiNumber(m.Nums[2]) +
+					"\" height=\"" + uiNumber(m.Nums[3]) +
+					"\" fill=\"" + colour + "\"/>")
+			case "path":
+				points := uiPoints(m.Nums)
+				if points == "" {
+					return
+				}
+				// Round at both the ends and the joins, which is the difference between
+				// a road and a row of splinters wherever one bends sharply.
+				r.out.WriteString("<polyline points=\"" + points + "\" fill=\"none\" stroke=\"" +
+					colour + "\" stroke-width=\"" + uiNumber(uiThick(m.Attrs)) +
+					"\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>")
+			case "patch":
+				points := uiPoints(m.Nums)
+				if points == "" {
+					return
+				}
+				r.out.WriteString("<polygon points=\"" + points + "\" fill=\"" + colour + "\"/>")
+			case "words":
+				if len(m.Nums) < 3 {
+					return
+				}
+				// Centred on the place both ways. Words placed by their baseline and their
+				// left edge are words the caller has to offset by hand, and every caller
+				// would offset them the same way.
+				r.out.WriteString("<text x=\"" + uiNumber(m.Nums[0]) + "\" y=\"" +
+					uiNumber(m.Nums[1]) + "\" font-size=\"" + uiNumber(m.Nums[2]) +
+					"\" fill=\"" + colour + "\" text-anchor=\"middle\"" +
+					" dominant-baseline=\"central\"" +
+					" font-family=\"system-ui,-apple-system,sans-serif\">" +
+					uiEscape(m.Text) + "</text>")
+			}
+		}
+
+		// What a mark is painted. A tone naming a role becomes the colour that role is
+		// on the page, because SVG has no stylesheet to look one up in — and a canvas
+		// that said "danger" and drew nothing would be worse than one that said nothing.
+		func uiMarkColour(attrs []UiAttr) string {
+			paint, ok := uiFind(attrs, "paint")
+			if !ok {
+				return "currentColor"
+			}
+			if colour, is := uiToneColour(paint.Enum); is {
+				return uiEscape(colour)
+			}
+			switch paint.Enum {
+			case "Muted":
+				return "var(--muted)"
+			case "Good":
+				return "var(--good)"
+			case "Warn":
+				return "var(--warn)"
+			case "Danger":
+				return "var(--danger)"
+			}
+			return "currentColor"
+		}
+
+		func uiThick(attrs []UiAttr) float64 {
+			thick := uiNumbers(attrs, "thick", []float64{1})
+			if thick[0] <= 0 {
+				return 1
+			}
+			return thick[0]
+		}
+
+		// x, y, x, y as SVG wants them. An odd number of them is a place with no second
+		// half, and it is dropped rather than guessed at.
+		func uiPoints(nums []float64) string {
+			var b strings.Builder
+			for i := 0; i+1 < len(nums); i += 2 {
+				if i > 0 {
+					b.WriteString(" ")
+				}
+				b.WriteString(uiNumber(nums[i]) + "," + uiNumber(nums[i+1]))
+			}
+			return b.String()
+		}
+
+		// A number as short as it can be written without losing anything that shows.
+		// A canvas redrawn sixty times a second is sixty documents a second, and a
+		// racetrack written to seventeen figures is most of one.
+		func uiNumber(n float64) string {
+			if math.IsNaN(n) || math.IsInf(n, 0) {
+				return "0"
+			}
+			return strconv.FormatFloat(n, 'f', -1, 32)
 		}
 
 		// Where a link may point. This is the only value in the module that becomes a
@@ -7068,6 +7334,8 @@ func uiSource(): Str {
 		.h-pickable:hover{background:var(--surface)}
 		.h-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;
 		align-items:center;justify-content:center;z-index:10}
+		.h-pinned{background:none;pointer-events:none}
+		.h-pinned>.h-overlay{background:none;box-shadow:none;pointer-events:auto}
 		.h-overlay{background:var(--bg);border-radius:16px;max-height:85vh;overflow:auto;
 		box-shadow:0 12px 40px rgba(0,0,0,.3)}
 		.h-spinner{width:18px;height:18px;border:2px solid var(--line);
@@ -7079,8 +7347,9 @@ func uiSource(): Str {
 		.h-closed::after{content:"disconnected";position:fixed;bottom:12px;left:12px;
 		background:var(--danger);color:#fff;padding:4px 10px;border-radius:6px;font-size:12px}
 		.h-scene{position:relative;overflow:hidden;min-height:0;min-width:0;background:#0b0d10}
-		.h-canvas{position:fixed;z-index:2;overflow:hidden}
-		.h-canvas>canvas{display:block;width:100%;height:100%}
+		.h-world{position:fixed;z-index:2;overflow:hidden}
+		.h-world>canvas{display:block;width:100%;height:100%}
+		.h-canvas{display:block;min-width:0;min-height:0}
 		.h-aiming{cursor:none}
 		.h-aiming::before,.h-aiming::after{content:"";position:absolute;left:50%;top:50%;
 		background:#fff;opacity:.8;pointer-events:none}
@@ -7685,10 +7954,6 @@ func uiSceneSource(): Str {
 		// The attributes a scene and its shapes take
 		// ---------------------------------------------------------------------------
 
-		func uiNums(kind string, values []float64) UiAttr {
-			return UiAttr{Kind: kind, Nums: values}
-		}
-
 		func UiAttrAt(x float64, y float64, z float64) UiAttr {
 			return uiNums("at", []float64{x, y, z})
 		}
@@ -7696,8 +7961,6 @@ func uiSceneSource(): Str {
 		func UiAttrTurn(x float64, y float64, z float64) UiAttr {
 			return uiNums("turn", []float64{x, y, z})
 		}
-
-		func UiAttrPaint(v UiTone) UiAttr { return uiEnum("paint", string(v)) }
 
 		// What it is made of. Absent, a shape is made of what its kind used to imply
 		// on its own — a floor is turf, a barrel is staves — so nothing that never
@@ -7956,7 +8219,7 @@ func uiSceneJs(): Str {
 		// impossible to work around — the pointer lock, which the browser drops the
 		// moment the element holding it leaves the document.
 		var holder = document.createElement("div");
-		holder.className = "h-canvas";
+		holder.className = "h-world";
 		holder.style.display = "none";
 		document.body.appendChild(holder);
 
@@ -8012,7 +8275,7 @@ func uiSceneJs(): Str {
 
 		function follow(force) {
 		  if (!host || !renderer) { return; }
-		  var mark = host.classList.contains("h-aiming") ? "h-canvas h-aiming" : "h-canvas";
+		  var mark = host.classList.contains("h-aiming") ? "h-world h-aiming" : "h-world";
 		  if (holder.className !== mark) { holder.className = mark; }
 		  var r = host.getBoundingClientRect();
 		  var w = Math.max(1, Math.round(r.width)), h = Math.max(1, Math.round(r.height));
@@ -8125,7 +8388,9 @@ func uiSceneJs(): Str {
 		    flat.rotateX(-Math.PI / 2);
 		    return flat;
 		  }
-		  return new THREE.BoxGeometry(d[0], d[1], d[2]);
+		  var box = new THREE.BoxGeometry(d[0], d[1], d[2]);
+		  uvsPerFace(box, d);
+		  return box;
 		}
 
 		function put(o, s) {
@@ -8161,6 +8426,12 @@ func uiSceneJs(): Str {
 		  var key = finish + "|" + body + "|" + tile[0] + "," + tile[1] + "|" + thick;
 		  var m = mats.get(key);
 		  if (!m) {
+		    // A finish with holes in it. There is one, and what it needs is not what a
+		    // translucent colour needs: a fence is not a faint fence, it is wire with
+		    // nothing between the wire. So the pattern's own alpha decides pixel by
+		    // pixel — a cut-out rather than a blend, which also means it can go on
+		    // writing depth and never has to be sorted against anything.
+		    var pierced = finish === "Mesh";
 		    // The colour is in the texture rather than on the material: a map multiplies
 		    // the material's colour, so setting both would square it. How much of that
 		    // colour there is stays on the material instead, which is what lets a car
@@ -8169,6 +8440,8 @@ func uiSceneJs(): Str {
 		      map: grain(finish, body, tile),
 		      transparent: thick < 1,
 		      opacity: thick,
+		      alphaTest: pierced ? 0.5 : 0,
+		      side: pierced ? THREE.DoubleSide : THREE.FrontSide,
 		      // A translucent shape that wrote depth would hide whatever is behind it
 		      // from everything drawn after it, which is the whole of what a ghost is
 		      // not allowed to do.
@@ -8225,6 +8498,13 @@ func uiSceneJs(): Str {
 		// How many times the grain repeats across a shape, so that a wall and a crate
 		// have the same size of grain rather than the same *number* of it. Roughly one
 		// tile every two metres, and never fewer than one.
+		//
+		// A box says one, and that is not because a box wants one: **a box's six faces
+		// are six different sizes**, and one repeat for all of them is the wrong repeat
+		// for four of them — a barrier forty metres long and a metre high, tiled the
+		// same number of times each way, is concrete stretched forty to one. So a box
+		// carries its tiling in its own geometry instead, face by face, and its texture
+		// repeats once. See uvsPerFace.
 		function tiling(s) {
 		  var d = s.d || [1, 1, 1];
 		  if (s.k === "ground") { return [span(d[0], 3), span(d[1], 3)]; }
@@ -8233,7 +8513,39 @@ func uiSceneJs(): Str {
 		  // A cone carries both its radii, so its girth is the second number and its
 		  // height the third. The wider end is what the grain is sized against.
 		  if (s.k === "cone") { return [span(Math.max(d[0], d[1]) * 6, 2), span(d[2], 2)]; }
-		  return [span(d[0], 2), span(d[1], 2)];
+		  return [1, 1];
+		}
+
+		// Each face of a box tiled by its own two dimensions, written into the vertices
+		// rather than into the texture.
+		//
+		// It is the only thing in this renderer that touches a vertex, and it earns it:
+		// very nearly every box in every scene is a wall, a slab, a panel or a barrier,
+		// and all four of those are things whose faces are different sizes. The
+		// alternative is what was here before — the width and the height deciding the
+		// repeat on all six — which is right for a crate and wrong for everything
+		// longer than it is wide.
+		//
+		// A BoxGeometry lays its faces out +X, -X, +Y, -Y, +Z, -Z with four vertices
+		// each, and each face's own UVs run nought to one; multiplying them is the
+		// whole of it. Geometries are cached by their dimensions, so this happens once
+		// per size of box rather than once per box.
+		function uvsPerFace(geo, d) {
+		  var uv = geo.attributes.uv;
+		  if (!uv) { return; }
+		  var sides = [
+		    [d[2], d[1]], [d[2], d[1]],
+		    [d[0], d[2]], [d[0], d[2]],
+		    [d[0], d[1]], [d[0], d[1]]
+		  ];
+		  for (var f = 0; f < 6; f++) {
+		    var across = span(sides[f][0], 2), down = span(sides[f][1], 2);
+		    for (var v = 0; v < 4; v++) {
+		      var at = f * 4 + v;
+		      uv.setXY(at, uv.getX(at) * across, uv.getY(at) * down);
+		    }
+		  }
+		  uv.needsUpdate = true;
 		}
 
 		function span(metres, per) {
@@ -8263,10 +8575,18 @@ func uiSceneJs(): Str {
 		  else if (finish === "Gravel") { gravel(ctx, size); }
 		  else if (finish === "Tarmac") { tarmac(ctx, size); }
 		  else if (finish === "Kerb") { kerb(ctx, size); }
+		  else if (finish === "Concrete") { concrete(ctx, size); }
+		  else if (finish === "Brick") { brick(ctx, size); }
 		  else if (finish === "Staves") { staves(ctx, size); }
+		  else if (finish === "Bark") { bark(ctx, size); }
+		  else if (finish === "Leaves") { leaves(ctx, size); }
+		  else if (finish === "Crowd") { crowd(ctx, size); }
+		  else if (finish === "Mesh") { mesh(ctx, size); }
 		  else if (finish === "Speckle") { speckle(ctx, size, 90, 0.05); }
 		  else if (finish === "Metal") { metal(ctx, size); }
 		  else if (finish === "Carbon") { carbon(ctx, size); }
+		  else if (finish === "Rubber") { rubber(ctx, size); }
+		  else if (finish === "Glass") { glass(ctx, size); }
 		  else if (finish === "Gloss") { gloss(ctx, size); }
 		  else { planks(ctx, size); }
 		  var tex = new THREE.CanvasTexture(canvas);
@@ -8445,6 +8765,198 @@ func uiSceneJs(): Str {
 		  ctx.fillRect(0, 0, size, size);
 		}
 
+		// Poured concrete: almost nothing, and that is the point. A very faint mottle,
+		// one shutter line across and one down, and a scattering of pinholes. It is
+		// what a pit lane, a grandstand's legs and a barrier wall are, and every one of
+		// those is a large flat thing you want the eye to slide off.
+		function concrete(ctx, size) {
+		  speckle(ctx, size, 120, 0.028);
+		  for (var i = 0; i < 300; i++) {
+		    ctx.fillStyle = "rgba(0,0,0,0.06)";
+		    ctx.beginPath();
+		    ctx.arc(Math.random() * size, Math.random() * size, 0.4 + Math.random() * 0.8, 0, 6.284);
+		    ctx.fill();
+		  }
+		  ctx.strokeStyle = "rgba(0,0,0,0.10)";
+		  ctx.lineWidth = 1;
+		  ctx.beginPath();
+		  ctx.moveTo(0, size / 2);
+		  ctx.lineTo(size, size / 2);
+		  ctx.moveTo(size / 2, 0);
+		  ctx.lineTo(size / 2, size);
+		  ctx.stroke();
+		}
+
+		// Brick: a running bond, which is the one thing that makes brick read as brick
+		// rather than as a grid — every other course is offset by half a brick. Four
+		// courses of four, so the offset lands on the tile edge and the wall has no seam.
+		function brick(ctx, size) {
+		  var courses = 4, high = size / courses, wide = size / 4;
+		  speckle(ctx, size, 70, 0.05);
+		  ctx.strokeStyle = "rgba(255,255,255,0.16)";
+		  ctx.lineWidth = 2;
+		  for (var y = 0; y < courses; y++) {
+		    var top = y * high;
+		    ctx.beginPath();
+		    ctx.moveTo(0, top);
+		    ctx.lineTo(size, top);
+		    ctx.stroke();
+		    var shift = (y % 2) * wide / 2;
+		    for (var x = -1; x < 4; x++) {
+		      var at = x * wide + shift;
+		      ctx.beginPath();
+		      ctx.moveTo(at, top);
+		      ctx.lineTo(at, top + high);
+		      ctx.stroke();
+		    }
+		  }
+		}
+
+		// Bark: long vertical fissures of very different widths, and no repeat you can
+		// see. A trunk is a cylinder, so the grain runs the way the staves do — what
+		// makes it bark rather than a barrel is that the lines are ragged and never
+		// evenly spaced.
+		function bark(ctx, size) {
+		  speckle(ctx, size, 90, 0.06);
+		  for (var i = 0; i < 26; i++) {
+		    var x = Math.random() * size;
+		    var wide = 1 + Math.random() * 3;
+		    ctx.fillStyle = i % 3 === 0 ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.19)";
+		    // Drawn in short segments that wander, so a fissure is not a ruled line.
+		    var y = 0;
+		    while (y < size) {
+		      var run = 6 + Math.random() * 18;
+		      ctx.fillRect(x, y, wide, run);
+		      x = x + (Math.random() - 0.5) * 2.5;
+		      y = y + run + Math.random() * 3;
+		    }
+		  }
+		}
+
+		// Foliage: overlapping blobs of light and shade with holes between them. The
+		// holes are what stop a tree's crown reading as a green ball — a canopy is
+		// mostly gaps, and painting the gaps is cheaper than modelling the leaves.
+		function leaves(ctx, size) {
+		  for (var i = 0; i < 150; i++) {
+		    var shade = i % 3;
+		    ctx.fillStyle = shade === 0 ? "rgba(255,255,255,0.13)"
+		      : shade === 1 ? "rgba(0,0,0,0.16)" : "rgba(0,0,0,0.30)";
+		    var x = Math.random() * size, y = Math.random() * size;
+		    var r = 3 + Math.random() * 9;
+		    ctx.beginPath();
+		    // Four arcs round a middle rather than one circle: a clump, not a dot.
+		    for (var a = 0; a < 4; a++) {
+		      var turn = a * 1.571 + Math.random();
+		      ctx.arc(x + Math.cos(turn) * r * 0.5, y + Math.sin(turn) * r * 0.5,
+		        r * 0.6, 0, 6.284);
+		    }
+		    ctx.fill();
+		  }
+		}
+
+		// A crowd, seen from the track. Nobody can make out a person in a grandstand
+		// from a car, and drawing one would be drawing something nobody sees — what you
+		// see is rows of seats with something the colour of clothes in most of them,
+		// which is what this is.
+		//
+		// **The colours are muted and the dots are small, and that is the whole of
+		// getting it right.** A first attempt used saturated primaries at three
+		// quarters opacity on a near-black ground and came out as a wall of LEDs: a
+		// crowd at two hundred metres is a *texture*, and anything in it you can pick
+		// out individually has stopped being one. The seat rows do more work than the
+		// people do.
+		function crowd(ctx, size) {
+		  var rows = 7, high = size / rows;
+		  // Clothes rather than paint: real colours, well off full saturation. The two
+		  // failures either side of this are worth naming, because both were tried.
+		  // Primaries at three quarters opacity is a wall of LEDs; near-greys at two
+		  // fifths is an empty stand, and an empty stand is what a grandstand with no
+		  // crowd texture already was.
+		  var shirts = ["#c94f3d", "#e8c56a", "#5b86b8", "#ece8e0", "#5f9463",
+		    "#a982c4", "#c98da8", "#414850"];
+		  for (var r = 0; r < rows; r++) {
+		    // Darker towards the back, which is the only depth cue a flat texture has
+		    // and is most of why this reads as tiers rather than as a pattern.
+		    ctx.fillStyle = "rgba(0,0,0," + (0.10 + (rows - r) * 0.030) + ")";
+		    ctx.fillRect(0, r * high, size, high);
+		    // The lip of each row of seats.
+		    ctx.fillStyle = "rgba(0,0,0,0.30)";
+		    ctx.fillRect(0, r * high, size, 1.5);
+		    for (var i = 0; i < 13; i++) {
+		      ctx.fillStyle = shirts[(r * 5 + i * 3) % shirts.length];
+		      ctx.globalAlpha = 0.62;
+		      var x = (i + 0.5) * size / 13 + (Math.random() - 0.5) * 2.5;
+		      var y = r * high + high * 0.56;
+		      ctx.beginPath();
+		      ctx.arc(x, y, high * 0.17, 0, 6.284);
+		      ctx.fill();
+		      ctx.globalAlpha = 1;
+		    }
+		  }
+		}
+
+		// Chain-link: two sets of wires crossing at forty-five degrees, thin and bright,
+		// over as little as possible. A fence is a thing you see *through*, so what is
+		// drawn here is nearly all wire and the shape it is painted on wants an alpha —
+		// the pattern gives it the wire and the colour gives it the seeing through.
+		function mesh(ctx, size) {
+		  ctx.clearRect(0, 0, size, size);
+		  ctx.lineWidth = 1.5;
+		  for (var pass = 0; pass < 2; pass++) {
+		    ctx.strokeStyle = pass ? "rgba(0,0,0,0.55)" : "rgba(255,255,255,0.75)";
+		    for (var i = -8; i < 16; i++) {
+		      var at = i * size / 8;
+		      ctx.beginPath();
+		      if (pass) {
+		        ctx.moveTo(at, 0);
+		        ctx.lineTo(at + size, size);
+		      } else {
+		        ctx.moveTo(at, 0);
+		        ctx.lineTo(at - size, size);
+		      }
+		      ctx.stroke();
+		    }
+		  }
+		}
+
+		// Rubber: matt, slightly uneven, with a moulding seam round it. It is what a
+		// tyre wall and a barrier of stacked tyres are made of, and the one thing it
+		// must not do is shine.
+		function rubber(ctx, size) {
+		  speckle(ctx, size, 110, 0.05);
+		  ctx.strokeStyle = "rgba(0,0,0,0.30)";
+		  ctx.lineWidth = 3;
+		  ctx.strokeRect(1.5, 1.5, size - 3, size - 3);
+		  for (var i = 0; i < 40; i++) {
+		    var y = Math.random() * size;
+		    ctx.strokeStyle = "rgba(0,0,0,0.09)";
+		    ctx.lineWidth = 2 + Math.random() * 3;
+		    ctx.beginPath();
+		    ctx.moveTo(0, y);
+		    ctx.lineTo(size, y);
+		    ctx.stroke();
+		  }
+		}
+
+		// Glass: a pane, and two hard diagonal reflections across it. The reflections
+		// are what make it glass — a flat translucent panel with nothing on it reads as
+		// a hole in a wall — and the frame is what makes it a window rather than a sheet.
+		function glass(ctx, size) {
+		  var sheen = ctx.createLinearGradient(0, size, size, 0);
+		  sheen.addColorStop(0, "rgba(255,255,255,0.02)");
+		  sheen.addColorStop(0.32, "rgba(255,255,255,0.02)");
+		  sheen.addColorStop(0.38, "rgba(255,255,255,0.40)");
+		  sheen.addColorStop(0.46, "rgba(255,255,255,0.05)");
+		  sheen.addColorStop(0.60, "rgba(255,255,255,0.22)");
+		  sheen.addColorStop(0.68, "rgba(255,255,255,0.03)");
+		  sheen.addColorStop(1, "rgba(0,0,0,0.10)");
+		  ctx.fillStyle = sheen;
+		  ctx.fillRect(0, 0, size, size);
+		  ctx.strokeStyle = "rgba(0,0,0,0.35)";
+		  ctx.lineWidth = 5;
+		  ctx.strokeRect(2.5, 2.5, size - 5, size - 5);
+		}
+
 		// The mottling every pattern starts from: dots of light and dark, which is what
 		// keeps a large flat face from banding.
 		function speckle(ctx, size, count, strength) {
@@ -8521,9 +9033,13 @@ func uiSceneJs(): Str {
 
 		// Nothing is sent while the socket is behind. A frame the program has not folded
 		// yet is not made any fresher by queueing another one after it.
+		//
+		// It says whether it went, and one caller cares: a pad keeps a record of what it
+		// has *told* the program, and a message that was dropped was never told.
 		function post(kind, value, index) {
-		  if (!handle || sock.readyState !== 1 || sock.bufferedAmount > 65536) { return; }
+		  if (!handle || sock.readyState !== 1 || sock.bufferedAmount > 65536) { return false; }
 		  send(handle, kind, value, index);
+		  return true;
 		}
 
 		// --- what the player did ---------------------------------------------------
@@ -8665,14 +9181,38 @@ func uiSceneJs(): Str {
 		var PAD_BUTTONS = ["a", "b", "x", "y", "lb", "rb", "lt", "rt", "back", "start",
 		  "lstick", "rstick", "up", "down", "left", "right", "guide"];
 		var PAD_AXES = ["leftX", "leftY", "rightX", "rightY"];
+
+		// And the other layout there is. **The XInput order is not the only order**, and
+		// assuming it was is what made a controller on Linux unusable rather than merely
+		// mislabelled: a browser that cannot name a pad usually reports eleven buttons
+		// and eight axes, with the two triggers among the *axes* and the dpad on the
+		// last two of them. Read as XInput, that pad has no throttle and no brake at
+		// all — the two names those pedals would have had, lt and rt, land on Back and
+		// Start instead, so pressing Start is full throttle and squeezing the trigger
+		// does nothing anybody can see.
+		//
+		// It is not a guess between equals. A device reporting six or more axes and no
+		// more than twelve buttons has its triggers on axes, because there is nowhere
+		// else for them to be.
+		var PAD_LOOSE_BUTTONS = ["a", "b", "x", "y", "lb", "rb", "back", "start",
+		  "guide", "lstick", "rstick"];
+		var PAD_LOOSE_AXES = ["leftX", "leftY", "lt", "rightX", "rightY", "rt",
+		  "dpadX", "dpadY"];
 		var padWas = [];
 
-		function buttonName(at) {
-		  return at < PAD_BUTTONS.length ? PAD_BUTTONS[at] : "b" + at;
+		function loose(pad) {
+		  return pad.mapping !== "standard" && pad.axes.length >= 6
+		    && pad.buttons.length <= 12;
 		}
 
-		function axisName(at) {
-		  return at < PAD_AXES.length ? PAD_AXES[at] : "axis" + at;
+		function buttonName(at, wide) {
+		  var names = wide ? PAD_LOOSE_BUTTONS : PAD_BUTTONS;
+		  return at < names.length ? names[at] : "b" + at;
+		}
+
+		function axisName(at, wide) {
+		  var names = wide ? PAD_LOOSE_AXES : PAD_AXES;
+		  return at < names.length ? names[at] : "axis" + at;
 		}
 
 		function pads() {
@@ -8683,19 +9223,53 @@ func uiSceneJs(): Str {
 		      if (padWas[i]) { padLeft(i); }
 		      continue;
 		    }
+		    var wide = loose(pad);
 		    if (!padWas[i]) {
 		      padWas[i] = {};
 		      post("pad", pad.mapping === "standard" ? "here|1" : "here|2", i);
 		    }
 		    var b = 0;
 		    for (; b < pad.buttons.length; b++) {
-		      padMoved(i, buttonName(b), pad.buttons[b].value);
+		      padMoved(i, buttonName(b, wide), pad.buttons[b].value);
 		    }
 		    var a = 0;
 		    for (; a < pad.axes.length; a++) {
-		      padMoved(i, axisName(a), deadzone(pad.axes[a]));
+		      padAxis(i, axisName(a, wide), pad.axes[a]);
 		    }
 		  }
+		}
+
+		// One axis, reported as whatever it actually is. Three of them are not sticks:
+		// a pedal reads -1 to 1 and means 0 to 1, and a dpad on an axis is two buttons
+		// that happen to be sharing a number.
+		function padAxis(pad, control, at) {
+		  if (control === "lt" || control === "rt") {
+		    padMoved(pad, control, pedal(at));
+		    return;
+		  }
+		  if (control === "dpadX") {
+		    padMoved(pad, "left", at < -0.5 ? 1 : 0);
+		    padMoved(pad, "right", at > 0.5 ? 1 : 0);
+		    return;
+		  }
+		  if (control === "dpadY") {
+		    padMoved(pad, "up", at < -0.5 ? 1 : 0);
+		    padMoved(pad, "down", at > 0.5 ? 1 : 0);
+		    return;
+		  }
+		  padMoved(pad, control, deadzone(at));
+		}
+
+		// A pedal that arrived as an axis. It rests at -1 and reads 1 held down, which
+		// is nought to one written the way a stick is written.
+		//
+		// Exactly nought is treated as a pedal nobody has touched rather than as one
+		// held halfway, and that is deliberate: a driver that has not seen the trigger
+		// move yet reports the axis as 0, and taking that at face value is a car that
+		// pulls away on its own the moment the window opens.
+		function pedal(at) {
+		  if (at === 0) { return 0; }
+		  return Math.max(0, Math.min(1, (at + 1) / 2));
 		}
 
 		// A hundredth of travel is not a movement, it is a stick sitting still, and a
@@ -8704,8 +9278,13 @@ func uiSceneJs(): Str {
 		  var was = padWas[pad];
 		  var before = was[control] || 0;
 		  if (Math.abs(now - before) < 0.02) { return; }
-		  was[control] = now;
-		  post("pad", control + "|" + round(now), pad);
+		  // Written down only once it has actually gone. What this record holds is what
+		  // the program has been *told*, and a message dropped because the socket was
+		  // behind was never told — writing it down anyway is a stick that moved once,
+		  // was not heard, and then never moves again, because as far as the browser is
+		  // concerned it is already where it said it was. Which is a controller that
+		  // works until the first busy frame and is dead afterwards.
+		  if (post("pad", control + "|" + round(now), pad)) { was[control] = now; }
 		}
 
 		// A stick at rest is never quite at rest. The dead zone is applied here rather

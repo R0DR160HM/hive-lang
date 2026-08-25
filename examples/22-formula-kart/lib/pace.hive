@@ -64,16 +64,24 @@ func lookahead(speed: Float): Float {
 
 // The whole answer for one car, one frame.
 //
-// `cap` is race control's speed limit and `green` is whether racing is allowed at
-// all — under a safety car nobody overtakes and nobody spends anything, which is
-// a rule the bots keep because they are told, not because they cannot break it.
+// `delta` is the speed race control is asking for at this car's place — nought
+// where it is asking for nothing — and `green` is whether racing is allowed at
+// all. Under a safety car nobody overtakes and nobody spends anything, and the
+// delta is a *target* here exactly as it is on the pit board: nothing holds a bot
+// to it any more than anything holds you to it, and a bot that a flag comes out
+// on top of gets caught by the stewards the same way you do.
+//
+// `lead` is the safety car, if there is one. It is here because it is a thing on
+// the road rather than a rule about the road — a bot that could not see it would
+// drive into the back of it, which is what happened for as long as it was a number.
 func driving(
 	track: circuit.Circuit,
 	cars: drive.Car[],
 	shards: drive.Shard[],
 	wheels: drive.Runaway[],
+	lead: drive.Pace,
 	seat: Int,
-	cap: Float,
+	delta: Float,
 	green: Bool,
 	clock: Float
 ): drive.Wants {
@@ -92,14 +100,14 @@ func driving(
 	// 2, 3 and 4: who is in the way, who is behind, and what is lying about.
 	want = want + passing(track, cars, me, green)
 	want = want + defending(track, cars, me, green)
-	want = want + dodging(track, shards, wheels, me, aim)
+	want = want + dodging(track, shards, wheels, lead, me, aim)
 	// A bot stays on its own road. It may use every inch of it and no more, which
 	// is the same rule the racing line was relaxed under.
 	room := math.max(0.5, node.half - 1.6)
 	want = math.clamp(want + slip * 1.1, -room, room)
 
 	// 5. How fast.
-	target := allowed(track, me, one, cap, slip)
+	target := allowed(track, me, one, lead, delta, slip)
 
 	wheel := steering(track, me, aim, want)
 	return drive.Wants(
@@ -215,7 +223,8 @@ func allowed(
 	track: circuit.Circuit,
 	me: drive.Car,
 	one: grid.Driver,
-	cap: Float,
+	lead: drive.Pace,
+	delta: Float,
 	slip: Float
 ): Float {
 	team := grid.teamOf(me.seat)
@@ -253,8 +262,25 @@ func allowed(
 	if ground is circuit.Ground.Gravel || ground is circuit.Ground.Grass {
 		target = math.min(target, 15.0)
 	}
-	if cap > 0.0 {
-		target = math.min(target, cap)
+	// What race control is asking for, and a whisker under it. The margin is not
+	// caution for its own sake: the delta is policed by a clock rather than by a
+	// clamp, and a bot that sat exactly on it would spend half of every yellow a
+	// tenth over and collect five seconds for it.
+	if delta > 0.0 {
+		target = math.min(target, delta * 0.97)
+	}
+	// And the safety car, which is a thing in front of you rather than a rule about
+	// how fast you may go. No faster than what still stops you behind it — the same
+	// line `circuit.pacing` brakes for every corner with, asked of something that
+	// is moving. It applies under green too, because a safety car on its way into
+	// the pit lane is still on the road.
+	if drive.onTrack(lead) {
+		front := circuit.nearGap(track, lead.along, me.along)
+		if front > 0.0 && front < 160.0 {
+			room := math.max(3.0, front - 14.0)
+			target = math.min(target,
+				math.sqrt(lead.speed * lead.speed + 2.0 * stopping * room))
+		}
 	}
 	return math.max(6.0, target)
 }
@@ -423,6 +449,7 @@ func dodging(
 	track: circuit.Circuit,
 	shards: drive.Shard[],
 	wheels: drive.Runaway[],
+	lead: drive.Pace,
 	me: drive.Car,
 	aim: Float
 ): Float {
@@ -441,7 +468,15 @@ func dodging(
 			shift = shift + swerve(wheel.across, me.across, 3.4)
 		}
 	}
-	return math.clamp(shift, -4.5, 4.5)
+	// The safety car is wider than a wheel and slower than everything, so it is
+	// worth seeing further off and going further round.
+	if drive.onTrack(lead) {
+		near := circuit.nearGap(track, lead.along, me.along)
+		if near > -5.0 && near < 70.0 {
+			shift = shift + swerve(lead.across, me.across, 4.2)
+		}
+	}
+	return math.clamp(shift, -5.5, 5.5)
 }
 
 // How far to move to miss something at `at`, given you are at `me`. Nothing at all

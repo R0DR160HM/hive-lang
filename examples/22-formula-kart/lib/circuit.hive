@@ -137,6 +137,79 @@ type Circuit {
 	// divides by it.
 	length: Float
 	laps: Int
+	// Where the pit lane runs. Worked out once with the rest of the track, because
+	// it is part of the shape of the place rather than something drawn on top of
+	// it — the safety car comes out of it, and everything that draws it draws it
+	// from here rather than from its own idea of where it goes.
+	pits: Pits
+}
+
+// ---------------------------------------------------------------------------
+// The pit lane
+// ---------------------------------------------------------------------------
+
+// Where the pit lane is. It follows the road's own nodes at a fixed offset rather
+// than running straight, and that is not a detail: a straight lane beside a road
+// that bends would cut through the road within fifty metres, and there is no seed
+// that makes the start line straight enough to get away with it.
+type Pits {
+	// Where the lane leaves the road and where it rejoins, in metres round the lap.
+	// The entry is before the start line and the exit after it, which is why a pit
+	// lane is a short cut across the start of a lap everywhere it exists.
+	entry: Float
+	exit: Float
+	// Which side of the road it runs down: -1 for the left, +1 for the right. It is
+	// worked out rather than rolled — the lane goes on the *inside* of the circuit,
+	// which is the side with the room, and on a closed loop that is whichever side
+	// the middle of the loop is on.
+	side: Float
+	// How far off the middle of the road the middle of the lane is, and half how
+	// wide the lane is.
+	off: Float
+	half: Float
+}
+
+// The pit lane for a track that has just been assembled.
+func pitsFor(nodes: Node[], length: Float, half: Float): Pits {
+	mut Node first = Node(0.0, 0.0, 0.0, 0.0, 0.0, half, 0.0, 0.0, 40.0, false)
+	if nodes bounds 0 {
+		first = nodes[0]
+	}
+	// Which way the middle of the circuit is from the start line. The loop is
+	// rolled around the origin, so the origin *is* the middle of it — and how far
+	// to the right of the road that lies is the same dot product `exactly` takes.
+	inside := math.cos(first.dir) * -first.x - math.sin(first.dir) * -first.z
+	mut Float side = 1.0
+	if inside < 0.0 {
+		side = -1.0
+	}
+	// Long enough to hold a garage per team with room at each end, and never more
+	// than a third of the lap — on a short circuit the pit lane is short.
+	run := math.min(length / 3.0, 400.0)
+	return Pits(
+		wrapAt(length, -run * 0.55),
+		wrapAt(length, run * 0.45),
+		side,
+		half + 12.5,
+		4.0
+	)
+}
+
+// A distance brought into nought to a lap, given the lap. The same arithmetic
+// `wrappedAlong` does, and it is spelled out here because a `Pits` is built
+// before there is a `Circuit` to ask.
+func wrapAt(length: Float, along: Float): Float {
+	if length <= 0.0 {
+		return 0.0
+	}
+	mut Float at = along
+	for ; at < 0.0; {
+		at = at + length
+	}
+	for ; at >= length; {
+		at = at - length
+	}
+	return at
 }
 
 // Where something is, said in the road's own terms rather than the world's.
@@ -248,15 +321,17 @@ func build(seed: Int): Circuit {
 	// whole track rather than per node: a road that changed width every five metres
 	// would read as a mistake rather than as a design.
 	half := spread(seed, 7, 6.4, 7.8)
-	climb := spread(seed, 8, 2.2, 6.5)
+	climb := spread(seed, 8, 0.7, 2.2)
 	tilt := spread(seed, 9, 0.0, math.pi() * 2.0)
 
+	nodes := assemble(loop, half, climb, tilt)
 	return Circuit(
 		seed,
 		named(seed),
-		assemble(loop, half, climb, tilt),
+		nodes,
 		lap(loop),
-		laps()
+		laps(),
+		pitsFor(nodes, lap(loop), half)
 	)
 }
 
@@ -428,8 +503,15 @@ func assemble(loop: Spot[], half: Float, climb: Float, tilt: Float): Node[dyn] {
 		here := spotAt(loop, i)
 		bend := roundAt(bends, i)
 		// The hill. Two harmonics of the way round rather than one, so the climb is
-		// not a single symmetrical mound, and both gentle: a grade over about five
-		// percent stops reading as a hill and starts reading as a ramp.
+		// not a single symmetrical mound, and both gentle.
+		//
+		// **A metre or two, not six.** An earlier draft climbed as much as six and a
+		// half and it was too much by a long way: a circuit a kilometre and a half
+		// round with that in it is at a slope somewhere for most of the lap, the
+		// camera pitches over every crest, and the corner you are braking for is
+		// regularly behind a hill rather than in front of you. What a small amount of
+		// elevation buys — a track that is not a drawing on a table — it buys nearly
+		// all of in the first metre.
 		round := conv.itf(i) / conv.itf(count) * math.pi() * 2.0
 		height := math.sin(round * 2.0 + tilt) * climb
 			+ math.sin(round * 3.0 + tilt * 1.7) * climb * 0.45
@@ -856,6 +938,89 @@ func kerbWidth(): Float {
 func exceeded(track: Circuit, where: Where): Bool {
 	node := nodeAt(track, where.node)
 	return math.abs(where.across) > node.half + kerbWidth() + 0.4
+}
+
+// ---------------------------------------------------------------------------
+// Reading the pit lane
+// ---------------------------------------------------------------------------
+
+// How long the pit lane is, forwards round the lap.
+func pitRun(track: Circuit): Float {
+	return gap(track, track.pits.exit, track.pits.entry)
+}
+
+// Whether a distance round the lap is one the pit lane runs beside.
+func alongPits(track: Circuit, along: Float): Bool {
+	return gap(track, along, track.pits.entry) <= pitRun(track)
+}
+
+// How far across the middle of the pit lane is at a distance round the lap, and
+// nought where there is no pit lane beside the road.
+//
+// The taper at each end is what makes it a lane a car could enter rather than a
+// rectangle bolted to the road: it leaves the tarmac over the first thirty metres
+// and comes back to it over the last thirty. It is also what the safety car
+// drives down, which is the one thing in the game that uses this for anything
+// other than drawing.
+func pitAcross(track: Circuit, along: Float): Float {
+	run := pitRun(track)
+	if run <= 0.0 {
+		return 0.0
+	}
+	on := gap(track, along, track.pits.entry)
+	if on > run {
+		return 0.0
+	}
+	taper := math.min(34.0, run / 3.0)
+	mut Float part = 1.0
+	if taper > 0.0 {
+		if on < taper {
+			part = on / taper
+		}
+		if run - on < taper {
+			part = math.min(part, (run - on) / taper)
+		}
+	}
+	return track.pits.side * track.pits.off * part
+}
+
+// ---------------------------------------------------------------------------
+// How big it is
+// ---------------------------------------------------------------------------
+
+// The box a whole lap fits in, which is the one thing about a circuit that is
+// asked from *outside* the road's own terms — a map has to be drawn at some
+// scale, and this is where the scale comes from.
+type Extent {
+	x: Float
+	z: Float
+	across: Float
+	down: Float
+}
+
+func extent(track: Circuit): Extent {
+	if len(track.nodes) == 0 {
+		return Extent(-100.0, -100.0, 200.0, 200.0)
+	}
+	mut Float leftMost = 1000000.0
+	mut Float rightMost = -1000000.0
+	mut Float topMost = 1000000.0
+	mut Float bottomMost = -1000000.0
+	for each node in track.nodes {
+		leftMost = math.min(leftMost, node.x)
+		rightMost = math.max(rightMost, node.x)
+		topMost = math.min(topMost, node.z)
+		bottomMost = math.max(bottomMost, node.z)
+	}
+	// Room for the road's own width, the run-off beside it and the pit lane, so
+	// nothing drawn on the map falls off the edge of it.
+	margin := track.pits.off + 14.0
+	return Extent(
+		leftMost - margin,
+		topMost - margin,
+		rightMost - leftMost + margin * 2.0,
+		bottomMost - topMost + margin * 2.0
+	)
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,889 @@
+// Everywhere that is not the road
+// ===============================
+// A circuit is a road with a place around it, and until this file existed this
+// one had the road. Past the grass verge was the sky: no barrier, no fence,
+// nothing beyond it, and — the thing you actually noticed — **no way of telling
+// how fast you were going**, because the only thing moving past you was a strip of
+// tarmac with nothing beside it to move past.
+//
+// That is what the landscape is for. It is not decoration. Speed in a game is
+// almost entirely the rate at which nearby things go by, a corner is much easier
+// to place when there is a grandstand on the outside of it, and a lap is far
+// easier to learn when the third corner has a stand of pines behind it and the
+// seventh does not.
+//
+// WHAT IS OUT THERE
+// -----------------
+// Two kinds of thing, and they are built two different ways because they are two
+// different sorts of fact:
+//
+//   * **What follows the road** — the barrier, the catch fencing, the pit wall,
+//     the pit lane itself. These are worked out per node, every frame, by `verge`,
+//     for exactly the reason the road is: a barrier is a fact about the stretch of
+//     road it is beside, and one held in a vector would need keeping in step with
+//     a road that is already saying where it goes.
+//
+//   * **What merely stands there** — trees, grandstands, marshals' posts, the
+//     hoardings, the tyre stacks, the garages. These are rolled once by `props`
+//     and drawn from that, because *which* of them there are is a fact about the
+//     seed rather than about the road, and rolling one sixty times a second would
+//     be a wood that changed its mind about itself every frame.
+//
+// ALL OF IT FROM THE SEED. Two people racing the same seed are looking at the
+// same trees in the same places, which matters more than it sounds: "he went off
+// at the stand" is a sentence that has to mean something to both of them.
+//
+// NOTHING HERE IS IN THE WAY. Every prop stands past the barrier line, and the
+// barrier line stands past the run-off, so nothing in this file can be hit and
+// nothing in it is asked about by the physics. It is the one part of the program
+// that is purely a picture, which is also why it lives only in the client — the
+// server has no use for a tree.
+
+import ./circuit
+import ./grid
+import hive.ui
+import hive.math
+import hive.conv
+
+// ---------------------------------------------------------------------------
+// What is out there
+// ---------------------------------------------------------------------------
+
+// One thing standing beside the circuit.
+type Prop {
+	kind: Kind
+	// Where it is: in the world, and how far round the lap — the second so that
+	// what is behind the camera can be dropped by subtracting two numbers rather
+	// than by working out a distance.
+	x: Float
+	z: Float
+	y: Float
+	along: Float
+	yaw: Float
+	// Which side of the road it stands on: -1 for the left, +1 for the right.
+	//
+	// It is a field rather than something worked out again from the yaw, because
+	// half of these things have a *front* — a grandstand has its seating on one
+	// side and its back on the other, a marshal shows a flag to the road — and
+	// which way that front points is a fact settled when the thing was placed.
+	facing: Float
+	// How big it is, and which of its kind's colours it wears. Rolled once each,
+	// which is the whole difference between a wood and one tree printed forty
+	// times.
+	size: Float
+	tint: Int
+}
+
+type Kind {
+	// Two shapes of tree, because one shape of tree is a wallpaper.
+	Pine
+	Broadleaf
+	// A grandstand: legs, tiers, a roof and a crowd in it.
+	Stand
+	// A marshal's post — a hut, and the panel the flag is shown on. This is where
+	// a yellow flag is actually *seen*, which is the thing that makes a flag with a
+	// place worth having.
+	Post
+	// A stack of tyres on the outside of somewhere quick.
+	Tyres
+	// An advertising board along the barrier.
+	Hoarding
+	// One pit garage, and the tower over the middle of them.
+	Garage
+	Tower
+}
+
+// What a marshal is showing. It is worked out by whoever is drawing — the flags
+// live in `control.hive` and this file has never heard of a race — and handed in.
+type Flag {
+	Clear
+	Yellow
+	Green
+}
+
+// ---------------------------------------------------------------------------
+// Where the lines are
+// ---------------------------------------------------------------------------
+
+// How far the mown grass reaches either side of the middle of the road, how far
+// out the barrier is, and where the trees start.
+//
+// The three are in one place because they only mean anything relative to each
+// other: run-off inside the barrier, barrier inside the treeline, and a gap
+// between the barrier and the trees wide enough for a marshal to stand in.
+func mown(): Float {
+	return 30.0
+}
+
+func barrierOff(): Float {
+	return 12.5
+}
+
+func treesFrom(): Float {
+	return 17.0
+}
+
+func treesTo(): Float {
+	return 74.0
+}
+
+// ---------------------------------------------------------------------------
+// What follows the road
+// ---------------------------------------------------------------------------
+
+// Everything beside one node of road: the barrier both sides, the catch fencing
+// where a corner has earned it, and — where the pit lane runs — the lane, its
+// wall and its markings instead of a barrier.
+//
+// Called for the same span of nodes the road itself is drawn over, so it costs
+// what the road costs and never draws a metre of barrier nobody can see.
+func verge(track: circuit.Circuit, at: Int): ui.Shape[dyn] {
+	mut ui.Shape[dyn] shapes = []
+	node := circuit.nodeAt(track, at)
+	long := reaching(track, node, node.half + barrierOff())
+	fast := math.abs(node.bend) > 0.006
+
+	for each side in [-1.0, 1.0] {
+		off := (node.half + barrierOff()) * side
+		// The pit lane takes the place of the barrier on its own side, because the
+		// lane is on the other side of where the barrier would be.
+		if pitSide(track, node.along, side) {
+			continue
+		}
+		// The barrier. Concrete, waist high, and unbroken all the way round — which
+		// is what a circuit looks like and, more to the point, is a continuous
+		// horizontal line at a known height that the eye reads speed off.
+		append(shapes, ui.box(
+			[
+				ui.at(node.x + math.cos(node.dir) * off, node.y + 0.55,
+					node.z - math.sin(node.dir) * off),
+				ui.turn(0.0, node.dir, 0.0),
+				ui.paint(ui.Tone.HEX("#d8dde2")),
+				ui.surface(ui.Surface.Concrete())
+			],
+			0.5, 1.1, long
+		))
+		if fast == false {
+			continue
+		}
+		// Catch fencing, where the road bends enough for somebody to end up in it.
+		// The colour carries an alpha and the `Mesh` finish carries the holes, so it
+		// is wire with air between the wire rather than a grey pane.
+		append(shapes, ui.box(
+			[
+				ui.at(node.x + math.cos(node.dir) * off, node.y + 2.7,
+					node.z - math.sin(node.dir) * off),
+				ui.turn(0.0, node.dir, 0.0),
+				ui.paint(ui.Tone.RGBA(206, 214, 222, 235)),
+				ui.surface(ui.Surface.Mesh())
+			],
+			0.08, 3.2, long
+		))
+		// And a post every so often, because a fence with no posts hangs in the air.
+		if at % 3 == 0 {
+			append(shapes, ui.cylinder(
+				[
+					ui.at(node.x + math.cos(node.dir) * off, node.y + 2.5,
+						node.z - math.sin(node.dir) * off),
+					ui.paint(ui.Tone.HEX("#8f9aa5")),
+					ui.surface(ui.Surface.Metal())
+				],
+				0.09, 4.0
+			))
+		}
+	}
+	for each piece in pitLane(track, at) {
+		append(shapes, piece)
+	}
+	return shapes
+}
+
+// How long a piece of something standing `off` metres from the middle of the road
+// has to be cut, so that it still meets the next piece.
+//
+// **It is the road's own problem, one step further out, and worse.** Two
+// rectangles laid end to end round a bend leave a wedge between them on the
+// outside of it, and the further from the centre of the corner they are the wider
+// the wedge — the outer arc is longer than the centreline by one plus the
+// curvature times the offset. `client.hive`'s `along` does this for slabs of road
+// seven metres wide; a barrier is twelve metres out and a pit lane is twenty, so
+// what is a rounding error on the tarmac is a **hole in the wall** out here, and
+// it looked exactly like one.
+//
+// Overlapping on the inside of a corner is free: two boxes in the same place are
+// two boxes in the same place.
+func reaching(track: circuit.Circuit, node: circuit.Node, off: Float): Float {
+	fan := 1.0 + math.abs(node.bend) * off
+	return circuit.spacing(track) * fan * 1.08
+}
+
+// Whether the pit lane runs down this side of the road at this distance. The one
+// question the barrier has to ask, because the lane and the barrier want the same
+// piece of ground.
+func pitSide(track: circuit.Circuit, along: Float, side: Float): Bool {
+	return circuit.alongPits(track, along) && track.pits.side == side
+}
+
+// The pit lane at one node: the tarmac, the wall between it and the road, and the
+// white line down the middle of it. Nothing where the lane does not run.
+func pitLane(track: circuit.Circuit, at: Int): ui.Shape[dyn] {
+	mut ui.Shape[dyn] shapes = []
+	node := circuit.nodeAt(track, at)
+	if circuit.alongPits(track, node.along) == false {
+		return shapes
+	}
+	lane := circuit.pitAcross(track, node.along)
+	if lane == 0.0 {
+		return shapes
+	}
+	pits := track.pits
+	long := reaching(track, node, math.abs(lane) + pits.half)
+	// The lane itself, a shade lighter than the circuit — which is what a pit lane
+	// is, because it is resurfaced about four times as often as the track is.
+	append(shapes, ui.box(
+		[
+			ui.at(node.x + math.cos(node.dir) * lane, node.y - 0.27,
+				node.z - math.sin(node.dir) * lane),
+			ui.turn(0.0, node.dir, 0.0),
+			ui.paint(ui.Tone.HEX("#6d747c")),
+			ui.surface(ui.Surface.Tarmac())
+		],
+		pits.half * 2.0, 0.54, long
+	))
+	// The wall between the lane and the circuit, which is the one thing in a pit
+	// lane everybody can picture.
+	wall := lane - pits.side * (pits.half + 1.1)
+	append(shapes, ui.box(
+		[
+			ui.at(node.x + math.cos(node.dir) * wall, node.y + 0.62,
+				node.z - math.sin(node.dir) * wall),
+			ui.turn(0.0, node.dir, 0.0),
+			ui.paint(ui.Tone.HEX("#e6eaee")),
+			ui.surface(ui.Surface.Concrete())
+		],
+		0.6, 1.25, long
+	))
+	// A box marked out for each team, on the garage side of the lane, every few
+	// nodes. How many there are is `grid.teams()` counted rather than a number
+	// somebody typed — a sixth team gets a sixth box and nothing else changes.
+	if at % 4 != 0 {
+		return shapes
+	}
+	teams := len(grid.teams())
+	if teams < 1 {
+		return shapes
+	}
+	which := at / 4 % teams
+	boxOff := lane + pits.side * (pits.half - 0.8)
+	append(shapes, ui.box(
+		[
+			ui.at(node.x + math.cos(node.dir) * boxOff, node.y + 0.02,
+				node.z - math.sin(node.dir) * boxOff),
+			ui.turn(0.0, node.dir, 0.0),
+			ui.paint(ui.Tone.HEX(garageColour(which))),
+			ui.surface(ui.Surface.Gloss())
+		],
+		2.6, 0.05, 3.4
+	))
+	return shapes
+}
+
+func garageColour(which: Int): Str {
+	all := grid.teams()
+	if all bounds which {
+		return all[which].body
+	}
+	return "#e8ecef"
+}
+
+// ---------------------------------------------------------------------------
+// What merely stands there
+// ---------------------------------------------------------------------------
+
+// Everything beside this circuit, rolled once.
+//
+// It is called once when a race is built and never again — a few hundred rolls
+// and one search of the track per tree, which is nothing done once and would be
+// far too much done sixty times a second.
+func props(track: circuit.Circuit): Prop[dyn] {
+	mut Prop[dyn] out = []
+	seed := track.seed
+	count := len(track.nodes)
+	if count < 8 {
+		return out
+	}
+	// The pit complex first, because everything after it asks whether it is
+	// standing where the pits are.
+	for each one in pits(track) {
+		append(out, one)
+	}
+	for i := 0; i < count; i++ {
+		node := circuit.nodeAt(track, i)
+		beside := circuit.alongPits(track, node.along)
+		// A marshal's post every twenty-four nodes, which at this spacing is about
+		// one every hundred and twenty metres. It is the same order a real circuit
+		// has them at, and — the thing it has to be — closer together than a yellow
+		// zone is wide, so that **every flag has somebody standing in it to wave it**.
+		// That is why this one is placed before the pit stretch is skipped rather
+		// than after: four hundred metres of circuit with no marshal on it is four
+		// hundred metres where a yellow is a word on a screen and nothing else.
+		if i % 24 == 0 {
+			append(out, posted(track, seed, i, node))
+		}
+		if beside {
+			continue
+		}
+		// A grandstand every so often, on the outside of a corner — which is where
+		// one goes, because that is where there is room and where there is anything
+		// to watch.
+		if i % 32 == 11 && math.abs(node.bend) > 0.008 {
+			append(out, standing(track, seed, i, node))
+			continue
+		}
+		// Tyres on the outside of anywhere quick and tight.
+		if i % 6 == 3 && math.abs(node.bend) > 0.014 {
+			append(out, stacked(track, seed, i, node))
+		}
+		// Hoardings along the barrier, both sides, on the straighter stretches where
+		// there is a run of it to put them on.
+		if i % 5 == 2 && math.abs(node.bend) < 0.010 {
+			for each side in [-1.0, 1.0] {
+				append(out, boarded(track, seed, i, node, side))
+			}
+		}
+		for each tree in wooded(track, seed, i, node) {
+			append(out, tree)
+		}
+	}
+	return out
+}
+
+// The trees beside one node. Nought to two a side, rolled — so a lap has thin
+// stretches and thick ones rather than an avenue.
+func wooded(track: circuit.Circuit, seed: Int, at: Int, node: circuit.Node): Prop[dyn] {
+	mut Prop[dyn] out = []
+	for each side in [-1.0, 1.0] {
+		many := circuit.between(seed, at * 31 + conv.floor(side) * 7 + 3, 0, 2)
+		for n := 0; n < many; n++ {
+			salt := at * 131 + n * 17 + conv.floor(side) * 5003
+			off := (node.half + circuit.spread(seed, salt, treesFrom(), treesTo())) * side
+			along := circuit.wrappedAlong(track,
+				node.along + circuit.spread(seed, salt + 1, -2.0, 2.0))
+			where := circuit.placed(track, along, off)
+			// **Is it actually off the circuit?** A track that loops back on itself
+			// puts the far side of the loop within seventy metres of this one, and a
+			// tree planted by offset alone lands in the middle of it. So the point is
+			// asked where it is — a full search, because the answer is nowhere near the
+			// node it came from — and anything that came out near a road is not planted.
+			//
+			// This is the one expensive thing in the file, and it is expensive once.
+			back := circuit.locate(track, where.x, where.z, -1)
+			nearest := circuit.nodeAt(track, back.node)
+			if math.abs(back.across) < nearest.half + treesFrom() - 1.0 {
+				continue
+			}
+			mut Kind kind = Kind.Broadleaf()
+			if circuit.between(seed, salt + 2, 0, 100) < 46 {
+				kind = Kind.Pine()
+			}
+			append(out, Prop(
+				kind,
+				where.x,
+				where.z,
+				node.y,
+				along,
+				circuit.spread(seed, salt + 3, 0.0, math.pi() * 2.0),
+				side,
+				circuit.spread(seed, salt + 4, 0.72, 1.55),
+				circuit.between(seed, salt + 5, 0, 3)
+			))
+		}
+	}
+	return out
+}
+
+func standing(track: circuit.Circuit, seed: Int, at: Int, node: circuit.Node): Prop {
+	// On the outside of the corner, which is the side the road is bending away from.
+	mut Float side = 1.0
+	if node.bend > 0.0 {
+		side = -1.0
+	}
+	off := (node.half + barrierOff() + 13.0) * side
+	where := circuit.placed(track, node.along, off)
+	return Prop(
+		Kind.Stand(),
+		where.x, where.z, node.y, node.along,
+		node.dir,
+		side,
+		circuit.spread(seed, at * 7 + 11, 0.85, 1.45),
+		circuit.between(seed, at * 7 + 12, 0, 3)
+	)
+}
+
+func posted(track: circuit.Circuit, seed: Int, at: Int, node: circuit.Node): Prop {
+	// The outside of the corner, which is where a marshal stands — unless that is
+	// the side the pit lane is on, in which case they stand across the road from it,
+	// because a marshal's post in the middle of a pit lane is not one.
+	mut Float side = 1.0
+	if node.bend > 0.0 {
+		side = -1.0
+	}
+	if circuit.alongPits(track, node.along) && track.pits.side == side {
+		side = -side
+	}
+	off := (node.half + barrierOff() + 3.4) * side
+	where := circuit.placed(track, node.along, off)
+	return Prop(
+		Kind.Post(),
+		where.x, where.z, node.y, node.along,
+		// Facing the road, so the flag panel is a panel rather than an edge.
+		node.dir + math.pi() / 2.0 * side,
+		side,
+		1.0,
+		circuit.between(seed, at + 91, 0, 3)
+	)
+}
+
+func stacked(track: circuit.Circuit, seed: Int, at: Int, node: circuit.Node): Prop {
+	mut Float side = 1.0
+	if node.bend > 0.0 {
+		side = -1.0
+	}
+	off := (node.half + barrierOff() - 1.6) * side
+	where := circuit.placed(track, node.along, off)
+	return Prop(
+		Kind.Tyres(),
+		where.x, where.z, node.y, node.along,
+		node.dir,
+		side,
+		circuit.spread(seed, at * 3 + 77, 0.9, 1.25),
+		circuit.between(seed, at * 3 + 78, 0, 3)
+	)
+}
+
+func boarded(track: circuit.Circuit, seed: Int, at: Int, node: circuit.Node,
+	side: Float): Prop {
+	off := (node.half + barrierOff() + 0.5) * side
+	where := circuit.placed(track, node.along, off)
+	return Prop(
+		Kind.Hoarding(),
+		where.x, where.z, node.y, node.along,
+		node.dir,
+		side,
+		1.0,
+		circuit.between(seed, at * 5 + conv.floor(side) * 13 + 41, 0, 5)
+	)
+}
+
+// The pit complex: a garage per team behind the lane, and race control over the
+// middle of them.
+func pits(track: circuit.Circuit): Prop[dyn] {
+	mut Prop[dyn] out = []
+	teams := len(grid.teams())
+	if teams == 0 {
+		return out
+	}
+	run := circuit.pitRun(track)
+	for i := 0; i < teams; i++ {
+		// Spread across the middle two thirds of the lane, so the tapers at each end
+		// are clear road.
+		part := (conv.itf(i) + 0.5) / conv.itf(teams)
+		along := circuit.wrappedAlong(track,
+			track.pits.entry + run * (0.18 + part * 0.64))
+		node := circuit.nodeAlong(track, along)
+		lane := circuit.pitAcross(track, along)
+		off := lane + track.pits.side * (track.pits.half + 6.0)
+		where := circuit.placed(track, along, off)
+		append(out, Prop(Kind.Garage(), where.x, where.z, node.y, along,
+			node.dir, track.pits.side, 1.0, i))
+	}
+	middle := circuit.wrappedAlong(track, track.pits.entry + run * 0.5)
+	node := circuit.nodeAlong(track, middle)
+	lane := circuit.pitAcross(track, middle)
+	off := lane + track.pits.side * (track.pits.half + 13.0)
+	where := circuit.placed(track, middle, off)
+	append(out, Prop(Kind.Tower(), where.x, where.z, node.y, middle,
+		node.dir, track.pits.side, 1.0, 0))
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// Drawing one
+// ---------------------------------------------------------------------------
+
+// One prop, as solids. `flag` is what a marshal is showing where this one is
+// standing, and is ignored by everything that is not a marshal's post.
+func shaped(prop: Prop, flag: Flag): ui.Shape[dyn] {
+	if prop.kind is Kind.Pine { return pine(prop) }
+	else if prop.kind is Kind.Broadleaf { return broadleaf(prop) }
+	else if prop.kind is Kind.Stand { return stand(prop) }
+	else if prop.kind is Kind.Post { return post(prop, flag) }
+	else if prop.kind is Kind.Tyres { return tyres(prop) }
+	else if prop.kind is Kind.Hoarding { return hoarding(prop) }
+	else if prop.kind is Kind.Garage { return garage(prop) }
+	else if prop.kind is Kind.Tower { return tower(prop) }
+}
+
+// A pine: a bare trunk and two cones of needles, the upper one narrower. Two
+// rather than one because a single cone is a traffic marker and two is a tree.
+func pine(prop: Prop): ui.Shape[dyn] {
+	tall := 9.0 * prop.size
+	// **Every trunk is buried.** The ground beyond the verge is one plane following
+	// the camera and the road is on a hill, so the two are never at exactly the same
+	// height — and a trunk that stopped where its own node did would hang in the air
+	// somewhere on every lap. Three metres of it under the ground costs nothing and
+	// makes that impossible.
+	return [
+		ui.cylinder(
+			[
+				ui.at(prop.x, prop.y + tall * 0.18 - 1.5, prop.z),
+				ui.paint(ui.Tone.HEX("#6b4f36")),
+				ui.surface(ui.Surface.Bark())
+			],
+			0.24 * prop.size, tall * 0.36 + 3.0
+		),
+		ui.cone(
+			[
+				ui.at(prop.x, prop.y + tall * 0.48, prop.z),
+				ui.turn(0.0, prop.yaw, 0.0),
+				ui.paint(ui.Tone.HEX(needle(prop.tint))),
+				ui.surface(ui.Surface.Leaves())
+			],
+			0.5 * prop.size, 2.5 * prop.size, tall * 0.5
+		),
+		ui.cone(
+			[
+				ui.at(prop.x, prop.y + tall * 0.83, prop.z),
+				ui.turn(0.0, prop.yaw + 0.7, 0.0),
+				ui.paint(ui.Tone.HEX(needle(prop.tint))),
+				ui.surface(ui.Surface.Leaves())
+			],
+			0.05, 1.65 * prop.size, tall * 0.42
+		)
+	]
+}
+
+// A broadleaf: a short thick trunk and a crown of two overlapping spheres, which
+// is enough to be a different silhouette from a distance and is all a tree beside
+// a road at ninety miles an hour ever is.
+func broadleaf(prop: Prop): ui.Shape[dyn] {
+	tall := 7.4 * prop.size
+	crown := 2.5 * prop.size
+	return [
+		ui.cylinder(
+			[
+				ui.at(prop.x, prop.y + tall * 0.25 - 1.5, prop.z),
+				ui.paint(ui.Tone.HEX("#7a5c40")),
+				ui.surface(ui.Surface.Bark())
+			],
+			0.32 * prop.size, tall * 0.5 + 3.0
+		),
+		ui.sphere(
+			[
+				ui.at(prop.x, prop.y + tall * 0.66, prop.z),
+				ui.paint(ui.Tone.HEX(leaf(prop.tint))),
+				ui.surface(ui.Surface.Leaves())
+			],
+			crown
+		),
+		ui.sphere(
+			[
+				ui.at(prop.x + math.cos(prop.yaw) * crown * 0.6,
+					prop.y + tall * 0.82,
+					prop.z + math.sin(prop.yaw) * crown * 0.6),
+				ui.paint(ui.Tone.HEX(leaf(prop.tint))),
+				ui.surface(ui.Surface.Leaves())
+			],
+			crown * 0.72
+		)
+	]
+}
+
+func needle(tint: Int): Str {
+	all := ["#3f6b46", "#37603f", "#476f4a", "#2f5a3c"]
+	if all bounds tint { return all[tint] }
+	return "#3f6b46"
+}
+
+func leaf(tint: Int): Str {
+	all := ["#5b8f4a", "#6fa055", "#4f8244", "#7aa74f"]
+	if all bounds tint { return all[tint] }
+	return "#5b8f4a"
+}
+
+// A grandstand: a concrete shell, a raked bank of seating inside it, and a roof
+// over the back.
+//
+// **The crowd is a lining, not the building.** A first version was four boxes of
+// `Crowd` and nothing else, and it had people painted on its back, its sides and
+// its roof — which is what you actually see of a grandstand from most of a
+// circuit, so most of the time it was a cube of spectators. The shell is here so
+// that the seating is only visible from the one direction seating is visible
+// from, and `facing` is how it knows which direction that is.
+func stand(prop: Prop): ui.Shape[dyn] {
+	long := 26.0 * prop.size
+	tall := 8.4
+	mut ui.Shape[dyn] shapes = []
+	// The bank, in four tiers, each further back and higher than the last. Boxes
+	// rather than one sloped slab, because a slab has no steps in it and a stand
+	// with no steps in it is a ramp.
+	for i := 0; i < 4; i++ {
+		part := conv.itf(i)
+		append(shapes, ui.box(
+			[
+				ui.at(prop.x + math.cos(prop.yaw) * (part * 2.3 - 3.2) * prop.facing,
+					prop.y + 1.3 + part * 1.5,
+					prop.z - math.sin(prop.yaw) * (part * 2.3 - 3.2) * prop.facing),
+				ui.turn(0.0, prop.yaw, 0.0),
+				// Lighter than seats are, because the `Crowd` finish is painted *over*
+				// the colour in translucent black — a row's shading, the lip of the
+				// row and a vertical face's own light, and a stand painted the grey a
+				// stand actually is comes out very nearly black.
+				ui.paint(ui.Tone.HEX("#aab4be")),
+				ui.surface(ui.Surface.Crowd())
+			],
+			2.3, 2.6 + part * 1.4, long
+		))
+	}
+	// The shell behind the seating, which is what the rest of the circuit sees of
+	// this thing.
+	append(shapes, ui.box(
+		[
+			ui.at(prop.x + math.cos(prop.yaw) * 7.2 * prop.facing,
+				prop.y + tall / 2.0 - 0.4,
+				prop.z - math.sin(prop.yaw) * 7.2 * prop.facing),
+			ui.turn(0.0, prop.yaw, 0.0),
+			ui.paint(ui.Tone.HEX("#c2cad1")),
+			ui.surface(ui.Surface.Concrete())
+		],
+		3.0, tall + 1.6, long + 1.6
+	))
+	// The floor it all stands on, buried at the bottom for the reason the trunks are.
+	append(shapes, ui.box(
+		[
+			ui.at(prop.x + math.cos(prop.yaw) * 2.0 * prop.facing, prop.y - 0.7,
+				prop.z - math.sin(prop.yaw) * 2.0 * prop.facing),
+			ui.turn(0.0, prop.yaw, 0.0),
+			ui.paint(ui.Tone.HEX("#b6bec6")),
+			ui.surface(ui.Surface.Concrete())
+		],
+		15.0, 4.0, long + 1.6
+	))
+	// The roof, which is what makes a grandstand read as one from the far side of
+	// the circuit.
+	append(shapes, ui.box(
+		[
+			ui.at(prop.x + math.cos(prop.yaw) * 3.0 * prop.facing,
+				prop.y + tall + 1.0,
+				prop.z - math.sin(prop.yaw) * 3.0 * prop.facing),
+			ui.turn(0.0, prop.yaw, 0.0),
+			ui.paint(ui.Tone.HEX(roofing(prop.tint))),
+			ui.surface(ui.Surface.Metal())
+		],
+		13.0, 0.4, long + 1.6
+	))
+	for each end in [-1.0, 1.0] {
+		append(shapes, ui.cylinder(
+			[
+				ui.at(prop.x - math.sin(prop.yaw) * (long / 2.0 - 1.0) * end
+					- math.cos(prop.yaw) * 3.2 * prop.facing,
+					prop.y + tall / 2.0 + 0.6,
+					prop.z - math.cos(prop.yaw) * (long / 2.0 - 1.0) * end
+					+ math.sin(prop.yaw) * 3.2 * prop.facing),
+				ui.paint(ui.Tone.HEX("#8f9aa5")),
+				ui.surface(ui.Surface.Metal())
+			],
+			0.22, tall + 2.4
+		))
+	}
+	return shapes
+}
+
+func roofing(tint: Int): Str {
+	all := ["#b6c2ce", "#9aa7b3", "#c3cbd3", "#a4b0bb"]
+	if all bounds tint { return all[tint] }
+	return "#b6c2ce"
+}
+
+// A marshal's post: the hut, and the panel a flag is shown on.
+//
+// **This is where a flag becomes something you can see.** `control.hive` knows
+// where a yellow is in metres round the lap; that is exactly the right thing for
+// it to know and exactly the wrong thing to be told by, because nobody is reading
+// metres at seventy a second. Here it is a panel at the side of the road that is
+// yellow, and one two hundred metres later that is green.
+func post(prop: Prop, flag: Flag): ui.Shape[dyn] {
+	mut ui.Shape[dyn] shapes = [
+		ui.box(
+			[
+				ui.at(prop.x, prop.y + 1.1, prop.z),
+				ui.turn(0.0, prop.yaw, 0.0),
+				ui.paint(ui.Tone.HEX("#dfe5ea")),
+				ui.surface(ui.Surface.Concrete())
+			],
+			2.4, 2.6, 2.0
+		),
+		ui.box(
+			[
+				ui.at(prop.x, prop.y + 2.6, prop.z),
+				ui.turn(0.0, prop.yaw, 0.0),
+				ui.paint(ui.Tone.HEX("#c8102e")),
+				ui.surface(ui.Surface.Metal())
+			],
+			2.8, 0.3, 2.4
+		)
+	]
+	if flag is Flag.Clear {
+		return shapes
+	}
+	mut ui.Tone shown = ui.Tone.HEX("#2fbf71")
+	if flag is Flag.Yellow {
+		shown = ui.Tone.HEX("#ffd400")
+	}
+	// The panel itself, held up beside the hut and turned to face the road — which
+	// is `facing` and nothing else, because that is the whole reason a marshal's
+	// post has a front.
+	append(shapes, ui.box(
+		[
+			ui.at(prop.x - math.sin(prop.yaw) * 1.9 * prop.facing, prop.y + 3.1,
+				prop.z - math.cos(prop.yaw) * 1.9 * prop.facing),
+			ui.turn(0.0, prop.yaw, 0.0),
+			ui.paint(shown),
+			ui.surface(ui.Surface.Gloss())
+		],
+		1.9, 1.3, 0.12
+	))
+	return shapes
+}
+
+// A stack of tyres. Four cylinders, each turned a little differently, which is
+// what stops four of them reading as one striped post.
+func tyres(prop: Prop): ui.Shape[dyn] {
+	mut ui.Shape[dyn] shapes = []
+	for i := 0; i < 4; i++ {
+		part := conv.itf(i)
+		append(shapes, ui.cylinder(
+			[
+				ui.at(prop.x, prop.y + 0.34 + part * 0.62, prop.z),
+				ui.turn(0.0, prop.yaw + part * 0.5, 0.0),
+				ui.paint(ui.Tone.HEX("#22262b")),
+				ui.surface(ui.Surface.Rubber())
+			],
+			0.86 * prop.size, 0.6
+		))
+	}
+	// A band of colour round the top of the stack, which is both what they have and
+	// the only thing that makes one visible at dusk.
+	append(shapes, ui.cylinder(
+		[
+			ui.at(prop.x, prop.y + 2.5, prop.z),
+			ui.paint(ui.Tone.HEX(band(prop.tint))),
+			ui.surface(ui.Surface.Gloss())
+		],
+		0.88 * prop.size, 0.22
+	))
+	return shapes
+}
+
+func band(tint: Int): Str {
+	all := ["#f2c14e", "#e8563f", "#f2f4f6", "#3fa9f5"]
+	if all bounds tint { return all[tint] }
+	return "#f2c14e"
+}
+
+// An advertising board on the barrier. It is a flat panel with a colour on it and
+// no words, and the reason is worth a line: words on a board are read, and a
+// board you read is a board you looked at instead of the corner.
+func hoarding(prop: Prop): ui.Shape[dyn] {
+	return [
+		ui.box(
+			[
+				ui.at(prop.x, prop.y + 1.35, prop.z),
+				ui.turn(0.0, prop.yaw, 0.0),
+				ui.paint(ui.Tone.HEX(advert(prop.tint))),
+				ui.surface(ui.Surface.Gloss())
+			],
+			0.16, 1.0, 9.0
+		)
+	]
+}
+
+func advert(tint: Int): Str {
+	all := ["#1d9bf0", "#e8563f", "#f2c14e", "#2fbf71", "#c86bff", "#f2f4f6"]
+	if all bounds tint { return all[tint] }
+	return "#1d9bf0"
+}
+
+// One pit garage: a brick box, a glazed front, and a door in the team's colour.
+func garage(prop: Prop): ui.Shape[dyn] {
+	front := prop.yaw + math.pi() / 2.0
+	return [
+		ui.box(
+			[
+				ui.at(prop.x, prop.y + 2.6, prop.z),
+				ui.turn(0.0, prop.yaw, 0.0),
+				ui.paint(ui.Tone.HEX("#b9a493")),
+				ui.surface(ui.Surface.Brick())
+			],
+			9.0, 6.0, 8.5
+		),
+		// The glass front, standing just clear of the brick so the two do not fight
+		// over the same plane.
+		ui.box(
+			[
+				ui.at(prop.x - math.sin(front) * 4.4, prop.y + 3.6,
+					prop.z - math.cos(front) * 4.4),
+				ui.turn(0.0, prop.yaw, 0.0),
+				ui.paint(ui.Tone.RGBA(150, 190, 214, 210)),
+				ui.surface(ui.Surface.Glass())
+			],
+			0.2, 2.2, 7.0
+		),
+		ui.box(
+			[
+				ui.at(prop.x - math.sin(front) * 4.4, prop.y + 1.2,
+					prop.z - math.cos(front) * 4.4),
+				ui.turn(0.0, prop.yaw, 0.0),
+				ui.paint(ui.Tone.HEX(garageColour(prop.tint))),
+				ui.surface(ui.Surface.Gloss())
+			],
+			0.24, 2.4, 6.6
+		)
+	]
+}
+
+// Race control, over the middle of the garages. It is the tallest thing on the
+// circuit, which is what makes it useful: on a track rolled from a number, the
+// one landmark that says "the start line is over there" is worth more than it
+// costs.
+func tower(prop: Prop): ui.Shape[dyn] {
+	return [
+		ui.box(
+			[
+				ui.at(prop.x, prop.y + 6.0, prop.z),
+				ui.turn(0.0, prop.yaw, 0.0),
+				ui.paint(ui.Tone.HEX("#cfd6de")),
+				ui.surface(ui.Surface.Concrete())
+			],
+			8.0, 13.0, 12.0
+		),
+		ui.box(
+			[
+				ui.at(prop.x, prop.y + 11.0, prop.z),
+				ui.turn(0.0, prop.yaw, 0.0),
+				ui.paint(ui.Tone.RGBA(140, 184, 210, 215)),
+				ui.surface(ui.Surface.Glass())
+			],
+			8.4, 3.0, 12.4
+		),
+		ui.box(
+			[
+				ui.at(prop.x, prop.y + 13.0, prop.z),
+				ui.turn(0.0, prop.yaw, 0.0),
+				ui.paint(ui.Tone.HEX("#8f9aa5")),
+				ui.surface(ui.Surface.Metal())
+			],
+			9.6, 0.5, 14.0
+		)
+	]
+}

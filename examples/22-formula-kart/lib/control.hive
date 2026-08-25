@@ -6,12 +6,32 @@
 // never decides where a car goes. It sets a speed limit and it writes down what
 // happened.
 //
-// **A FLAG IS A NUMBER.** There is no rule engine and no state machine with a
-// dozen arms. A yellow sector and a safety car both come out of `capFor` as one
-// figure — the fastest anybody in that place may currently be — and
-// `drive.driven` brings a car down to it. That is the whole enforcement. It means
-// a flag applies to the bots and to you identically, that it cannot be got round,
-// and that adding a red flag later is one more line in one function.
+// **A FLAG IS A PLACE AND A SPEED, AND NOBODY IS MADE TO KEEP IT.** This is the
+// one thing in the program that was rebuilt rather than added to, so it is worth
+// saying what it was: a yellow was a third of the circuit, a safety car was a
+// number counting down, and both of them came out of one function as a `cap` that
+// `drive.driven` clamped every car to. Two things were wrong with that and they
+// are the same thing twice.
+//
+// A rule you cannot break is not a rule. Nothing was asked of the driver, there
+// was nothing to get right and nothing to get wrong, and the only way you knew a
+// flag was out at all was that your own car had started slowing down for reasons
+// you had not asked for — which is the worst thing a racing game can do to
+// somebody, because the car is the one thing that has to answer to you.
+//
+// And a flag with no place is not a flag. A yellow that covered five hundred
+// metres because a car stopped somewhere in it could not be drawn, could not be
+// pointed at, and could not be driven *through* — you lifted, and then you kept
+// lifting, because nothing said where it ended.
+//
+// So now: `deltaAt` says the fastest anybody *should* be at a place; the zones say
+// exactly where, and go on the map exactly where they are; and `policed` writes
+// down who was over it and for how long. Over it for longer than `drive.leeway()`
+// is an offence and three offences is five seconds — the same shape as the track
+// limits rule, which is deliberate, because they are the same kind of thing. The
+// safety car is a car: it comes out of the pit lane, drives at the delta, and if
+// you arrive at the back of it at two hundred you will find out about it in the
+// way that needs no rule at all.
 //
 // **THE ORDER IS TOTAL DISTANCE**, not how far round the lap somebody is. Two
 // cars a metre apart across the start line are a metre apart, and sorting them on
@@ -20,7 +40,9 @@
 //
 // SECTORS advance one at a time and only forwards, 1 to 2 to 3 and round. A car
 // spun backwards over a timing loop does not un-set a sector time, and a lap is
-// exactly the 3-to-1 crossing — which is also where the flag falls.
+// exactly the 3-to-1 crossing — which is also where the flag falls. Sectors are
+// the *timing* screen's idea of where you are; they are no longer the flags', and
+// keeping those two apart is most of what this file gained.
 //
 // WHAT THE STRIP SAYS is the same set of messages a real one carries, and each is
 // written at the moment the thing happened rather than worked out later by
@@ -55,6 +77,28 @@ type Kind {
 
 // The whole world. A value like everything else: the fold below hands back a new
 // one every frame, and nothing anywhere holds a reference to a car.
+// Where a flag is out, and for how long.
+//
+// **A flag has a place.** That is the whole of what this type is for: the stretch
+// of road an incident has made dangerous, said in the road's own terms, so that it
+// can be drawn on a map at exactly the place it is in force and driven through at
+// exactly the place it stops.
+type Zone {
+	// The middle of the stretch, in metres round the lap, and how far it reaches
+	// either side of that.
+	at: Float
+	span: Float
+	// How long the yellow has left, and how long the green after it has.
+	//
+	// A zone with no yellow left and some green left is one that has just gone
+	// clear, and it is worth a few seconds on the map: the flag a driver most wants
+	// to see is the one saying the road ahead is theirs again, and a yellow that
+	// merely stopped being drawn says that by saying nothing, which is not the same
+	// as saying it.
+	yellow: Float
+	green: Float
+}
+
 type Race {
 	track: circuit.Circuit
 	cars: drive.Car[dyn]
@@ -65,20 +109,60 @@ type Race {
 	clock: Float
 	// Seconds until they do. Positive is the countdown, and nobody moves.
 	lights: Float
-	// How long each of the three sectors stays yellow, and how long the safety car
-	// is out for. Both in seconds, and both nought when there is nothing on.
-	yellow: Float[3]
-	safety: Float
+	// Every flag that is out, and the safety car. A vector rather than three
+	// numbers because a flag belongs to an incident and there is no reason for
+	// there to be at most three of those.
+	zones: Zone[dyn]
+	// The safety car. `drive.Pace`, because the bots have to be able to see it
+	// and `pace.hive` cannot import this file — see the type's own note.
+	pace: drive.Pace
 	// The clock reading from which the safety car may be called again. Without it
 	// the field draws another the moment the last one goes in, and a race becomes
 	// one long procession behind it — which is exactly what happened the first time
 	// this ran.
 	safetyAgain: Float
 	notes: Note[dyn]
-	// Which seat the person is in, and the seed the whole thing was rolled from.
-	mine: Int
+	// The seed the whole thing was rolled from, which is the only description of
+	// the circuit that ever crosses a network.
 	seed: Int
 	over: Bool
+}
+
+// What somebody at a set of controls asked for, and which car they are asking it
+// of.
+//
+// **This is the whole of what a person is, in here.** A race is stepped with a
+// vector of these; every seat named in it is driven by whoever sent it and every
+// seat that is not is driven by `pace.hive`. One of them is a game on one
+// machine, four of them is a game on four, none of them is ten bots racing each
+// other with nobody watching — and all three go through the same call, which is
+// what made splitting this example into a server and a client a matter of
+// deciding who holds the `Race` rather than a matter of rewriting the race.
+type Asking {
+	seat: Int
+	want: drive.Wants
+}
+
+// Whether anybody is at this car's wheel, and what they asked for. Two functions
+// rather than one that answers both, because "nobody is driving it" and "the
+// driver asked for nothing" are different facts and a car standing on the grid is
+// the second one.
+func atWheel(asked: Asking[], seat: Int): Bool {
+	for each one in asked {
+		if one.seat == seat {
+			return true
+		}
+	}
+	return false
+}
+
+func asking(asked: Asking[], seat: Int): drive.Wants {
+	for each one in asked {
+		if one.seat == seat {
+			return one.want
+		}
+	}
+	return drive.idle()
 }
 
 // How long the lights are on for before the start.
@@ -86,26 +170,43 @@ func countdown(): Float {
 	return 4.0
 }
 
-// The speed limit a yellow sector and the safety car impose, in metres a second.
-// A yellow is a lift you can feel and not much more — set it low enough to be a
+// The delta a yellow zone and the safety car ask for, in metres a second. A
+// yellow is a lift you can feel and not much more — set it low enough to be a
 // crawl and a race with an incident in it becomes a race that is mostly the
 // incident — and the safety car is the crawl.
+//
+// They are what a driver is *asked* for now rather than what a car is held to, so
+// they can be a little less severe than they were: what makes a yellow cost you
+// is having to judge it, not having it done to you.
 func yellowSpeed(): Float {
-	return 42.0
+	return 45.0
 }
 
 func safetySpeed(): Float {
-	return 21.0
+	return 23.0
 }
 
-// How long a yellow lasts once something has caused one, and how long the safety
-// car stays out.
+// How far a yellow reaches either side of what caused it. A hundred metres, which
+// at these speeds is between two and three seconds of lifting — long enough to be
+// a real decision and short enough that both ends of it are on the screen at once.
+//
+// It was a third of the circuit, and a third of the circuit is not a place.
+func yellowSpan(): Float {
+	return 100.0
+}
+
+// How long a yellow lasts once whatever caused it has gone, how long the green
+// that follows it stays on the map, and how long the safety car leads the field.
 func yellowFor(): Float {
-	return 3.0
+	return 4.0
+}
+
+func greenFor(): Float {
+	return 4.0
 }
 
 func safetyFor(): Float {
-	return 11.0
+	return 13.0
 }
 
 // And how long after one before another may be called. A race gets one, or at the
@@ -120,7 +221,7 @@ func crateBack(): Float {
 }
 
 // A whole race, on the grid, waiting for the lights.
-func lined(seed: Int, mine: Int): Race {
+func lined(seed: Int): Race {
 	track := circuit.build(seed)
 	mut drive.Car[dyn] cars = []
 	for seat := 0; seat < grid.field(); seat++ {
@@ -131,6 +232,7 @@ func lined(seed: Int, mine: Int): Race {
 		car.sheet.sector = circuit.sector(track, car.along)
 		append(cars, car)
 	}
+	mut Zone[dyn] clear = []
 	return Race(
 		track,
 		cars,
@@ -139,11 +241,10 @@ func lined(seed: Int, mine: Int): Race {
 		[],
 		0.0,
 		countdown(),
-		[0.0, 0.0, 0.0],
-		0.0,
+		clear,
+		drive.garaged(),
 		0.0,
 		[Note("{track.name} — {track.laps} laps", Kind.Info(), 6.0)],
-		mine,
 		seed,
 		false
 	)
@@ -153,50 +254,53 @@ func lined(seed: Int, mine: Int): Race {
 // One frame of it
 // ---------------------------------------------------------------------------
 
-// Everything that happens in `dt` seconds. `mine` is what the person at the
-// keyboard or on the pad asked for; every other car's `Wants` is filled in by
-// `pace.hive` inside this call, and the two go through exactly the same physics.
-func stepped(race: Race, mine: drive.Wants, dt: Float): Race {
+// Everything that happens in `dt` seconds. `asked` is what the people at the
+// controls asked for, by seat; every car nobody is asking anything of has its
+// `Wants` filled in by `pace.hive` inside this call, and the two go through
+// exactly the same physics.
+func stepped(race: Race, asked: Asking[], dt: Float): Race {
 	mut Race it = race
 	if it.lights > 0.0 {
 		it.lights = it.lights - dt
 		// Standing on the throttle before the lights go out costs what it costs.
-		if mine.throttle > 0.4 && it.lights < countdown() - 0.4 {
-			it = jumped(it)
+		// Every seat is asked, so a jump start is a jump start whoever made it.
+		for each one in asked {
+			if one.want.throttle > 0.4 && it.lights < countdown() - 0.4 {
+				it = jumped(it, one.seat)
+			}
 		}
 		it.notes = fading(it.notes, dt)
 		return it
 	}
 	it.clock = it.clock + dt
-	it.yellow = cooling(it.yellow, dt)
-	it.safety = math.max(0.0, it.safety - dt)
-	if race.safety > 0.0 && it.safety <= 0.0 {
-		it = said(it, "SAFETY CAR IN THIS LAP — GREEN", Kind.Good())
-	}
+	it = clearing(it, dt)
+	it = paced(it, dt)
 
-	it = walked(it, mine, dt)
+	it = walked(it, asked, dt)
 	it = bumped(it)
+	it = ranInto(it)
 	it = collected(it)
 	it = littered(it)
 	it = rolling(it, dt)
 	it = flagged(it)
+	it = policing(it, dt)
 	it = timed(it, race)
 	it.notes = fading(it.notes, dt)
 	it.over = everybodyIn(it)
 	return it
 }
 
-// Every car, stepped. The person's car takes the `Wants` that came in; the other
-// nine have theirs worked out by `pace.hive` — and then all ten go through one
-// call, which is the claim this whole example is built on.
-func walked(race: Race, mine: drive.Wants, dt: Float): Race {
+// Every car, stepped. A car somebody is driving takes the `Wants` that came in;
+// every other one has its own worked out by `pace.hive` — and then all ten go
+// through one call, which is the claim this whole example is built on.
+func walked(race: Race, asked: Asking[], dt: Float): Race {
 	mut Race it = race
 	mut drive.Car[dyn] next = []
 	for each car in race.cars {
-		mut drive.Wants want = mine
-		if car.seat != race.mine {
+		mut drive.Wants want = asking(asked, car.seat)
+		if atWheel(asked, car.seat) == false {
 			want = pace.driving(race.track, race.cars, race.shards, race.wheels,
-				car.seat, capFor(race, car), green(race), race.clock)
+				race.pace, car.seat, deltaAt(race, car.along), green(race), race.clock)
 		}
 		// What the token did, if it was spent and if it was one that puts something
 		// on the road. The car's own two — the wing and the tyres — are the car's
@@ -214,32 +318,52 @@ func walked(race: Race, mine: drive.Wants, dt: Float): Race {
 		}
 		it = thrown(it, car, want)
 		append(next, drive.stepped(race.track, one, want,
-			grid.teamOf(one.seat).machine, capFor(race, one), dt))
+			grid.teamOf(one.seat).machine, dt))
 	}
 	it.cars = next
 	return it
 }
 
-// The fastest anybody at this place may be, or nought for no limit at all.
+// The fastest anybody at this place is being asked to be, or nought where nothing
+// is being asked at all.
 //
-// One function, and it is the whole of how a flag is enforced. A yellow only
-// applies in its own sector, which is what makes a yellow a local thing and the
-// safety car a global one.
-func capFor(race: Race, car: drive.Car): Float {
-	if race.safety > 0.0 {
+// One function, and it is what everything about a flag reads: the bots take it as
+// a target, the pit board shows it, the map draws where it applies, and the
+// stewards compare it with how fast somebody actually went. Nothing anywhere is
+// held to it — that is the difference from the `capFor` this replaced, and it is
+// the whole design.
+//
+// The safety car's delta is everywhere. A yellow's is exactly where the yellow is,
+// which is the other half of the same idea: you should be able to see where you
+// have to lift and see where you may go again.
+func deltaAt(race: Race, along: Float): Float {
+	if race.pace.life > 0.0 {
 		return safetySpeed()
 	}
-	which := circuit.sector(race.track, car.along) - 1
-	if slotOf(race.yellow, which) > 0.0 {
-		return yellowSpeed()
+	for each zone in race.zones {
+		if zone.yellow > 0.0 && inZone(race.track, zone, along) {
+			return yellowSpeed()
+		}
 	}
 	return 0.0
 }
 
+// Whether a place on the road is inside a zone. Signed the short way round,
+// because a zone a hundred metres wide over the start line has half of itself at
+// nearly a whole lap.
+func inZone(track: circuit.Circuit, zone: Zone, along: Float): Bool {
+	return math.abs(circuit.nearGap(track, along, zone.at)) <= zone.span
+}
+
 // Whether racing is allowed. Under the safety car it is not, and the bots keep
 // that rule because they are told rather than because they cannot break it.
+//
+// It goes green the moment the safety car's own count runs out, rather than when
+// it has finished getting out of the way — which is what a real one does, and is
+// why a safety car peeling into the pit lane has the whole field flat out behind
+// it.
 func green(race: Race): Bool {
-	return race.safety <= 0.0 && race.lights <= 0.0
+	return race.pace.life <= 0.0 && race.lights <= 0.0
 }
 
 // Reading and writing one of a static three by a number worked out at runtime.
@@ -260,14 +384,6 @@ func withSlot(three: Float[3], at: Int, value: Float): Float[3] {
 	if at == 1 { return [three[0], value, three[2]] }
 	if at == 2 { return [three[0], three[1], value] }
 	return three
-}
-
-func cooling(yellow: Float[3], dt: Float): Float[3] {
-	return [
-		math.max(0.0, yellow[0] - dt),
-		math.max(0.0, yellow[1] - dt),
-		math.max(0.0, yellow[2] - dt)
-	]
 }
 
 // ---------------------------------------------------------------------------
@@ -351,7 +467,7 @@ func collected(race: Race): Race {
 				&& drive.over(race.track, one, crate.along, crate.across, 2.3) {
 				one.holding = drive.rolled(placeOf(cars, one), grid.field(), race.seed,
 					conv.floor(race.clock * 31.0) + one.seat * 977,
-					race.safety <= 0.0 && race.clock >= race.safetyAgain)
+					drive.onTrack(race.pace) == false && race.clock >= race.safetyAgain)
 				box.back = race.clock + crateBack()
 			}
 			append(after, one)
@@ -384,7 +500,7 @@ func spends(race: Race, car: drive.Car, want: drive.Wants): Bool {
 		// One at a time, and not straight after the last. A held token survives the
 		// rest rather than being thrown away, so a driver who called it a moment too
 		// early still has it.
-		return race.clock >= race.safetyAgain && race.safety <= 0.0
+		return race.clock >= race.safetyAgain && drive.onTrack(race.pace) == false
 	}
 	return false
 }
@@ -417,9 +533,9 @@ func thrown(race: Race, car: drive.Car, want: drive.Wants): Race {
 		return said(it, "{grid.driverOf(car.seat).tag} — LOOSE WHEEL", Kind.Warn())
 	}
 	if car.holding is drive.Token.Safety {
-		it.safety = safetyFor()
-		it.safetyAgain = race.clock + safetyRest()
-		return said(it, "SAFETY CAR DEPLOYED", Kind.Warn())
+		it = deployed(it)
+		return said(it, "SAFETY CAR DEPLOYED — DELTA {conv.round(safetySpeed() * 3.6)} KM/H",
+			Kind.Warn())
 	}
 	return it
 }
@@ -506,9 +622,9 @@ func hitBy(after: drive.Car[], before: drive.Car[]): Int {
 // The flags
 // ---------------------------------------------------------------------------
 
-// Anybody spinning or stopped in a gravel trap brings out a yellow where they
-// are. It is refreshed rather than set, so a car that stays there keeps the
-// sector yellow until it is going again.
+// Anybody spinning or stopped in a gravel trap brings out a yellow **where they
+// are**. It is refreshed rather than set, so a car that stays there keeps its own
+// stretch of road yellow until it is going again.
 func flagged(race: Race): Race {
 	mut Race it = race
 	for each car in race.cars {
@@ -516,7 +632,7 @@ func flagged(race: Race): Race {
 			continue
 		}
 		// Stopped, not merely sideways. A car that spins and drives on is a moment,
-		// not an incident, and a sector that went yellow for every one of those would
+		// not an incident, and a circuit that went yellow for every one of those would
 		// be yellow for most of the race — which it was, the first time this ran.
 		stranded := (car.spun > 0.0 && car.speed < 7.0)
 			|| (circuit.under(race.track, circuit.Where(car.node, car.along, car.across))
@@ -524,12 +640,204 @@ func flagged(race: Race): Race {
 		if stranded == false {
 			continue
 		}
-		which := circuit.sector(race.track, car.along) - 1
-		if slotOf(it.yellow, which) <= 0.0 {
-			it = said(it, "YELLOW — SECTOR {which + 1}", Kind.Warn())
-		}
-		it.yellow = withSlot(it.yellow, which, yellowFor())
+		it = waved(it, car.along)
 	}
+	return it
+}
+
+// A yellow at a place. A zone that already covers it is refreshed rather than
+// joined by a second one — without that, a car sitting in a gravel trap is sixty
+// overlapping flags a second, and every one of them would be drawn.
+func waved(race: Race, at: Float): Race {
+	mut Race it = race
+	mut Zone[dyn] zones = []
+	mut Bool already = false
+	for each zone in race.zones {
+		mut Zone one = zone
+		if inZone(race.track, one, at) {
+			one.yellow = yellowFor()
+			one.green = 0.0
+			already = true
+		}
+		append(zones, one)
+	}
+	it.zones = zones
+	if already {
+		return it
+	}
+	append(it.zones, Zone(at, yellowSpan(), yellowFor(), 0.0))
+	return said(it, "YELLOW — SECTOR {circuit.sector(race.track, at)}", Kind.Warn())
+}
+
+// Every zone, wound down by one frame. A yellow that runs out becomes a green for
+// a few seconds and then is gone altogether.
+func clearing(race: Race, dt: Float): Race {
+	mut Race it = race
+	mut Zone[dyn] left = []
+	for each zone in race.zones {
+		mut Zone one = zone
+		if one.yellow > 0.0 {
+			one.yellow = math.max(0.0, one.yellow - dt)
+			if one.yellow <= 0.0 {
+				one.green = greenFor()
+				it = said(it, "GREEN — SECTOR {circuit.sector(race.track, one.at)}",
+					Kind.Good())
+			}
+		} else {
+			one.green = math.max(0.0, one.green - dt)
+		}
+		if one.yellow > 0.0 || one.green > 0.0 {
+			append(left, one)
+		}
+	}
+	it.zones = left
+	return it
+}
+
+// The zone at a number, for anything that wants one by index rather than by
+// walking the lot. Out of range answers with a zone that is not out, which is
+// what "there is no such flag" looks like everywhere else in this file.
+func slotOfZone(zones: Zone[], at: Int): Zone {
+	if zones bounds at {
+		return zones[at]
+	}
+	return Zone(0.0, yellowSpan(), 0.0, 0.0)
+}
+
+// ---------------------------------------------------------------------------
+// The stewards
+// ---------------------------------------------------------------------------
+
+// Who was over the delta, and for how long. This is the whole enforcement, and it
+// is worth noticing what it does *not* do: it does not touch a speed, a throttle
+// or a brake anywhere. A car that ignores a yellow goes exactly as fast as its
+// driver asked it to and finds five seconds on its race time afterwards.
+//
+// The bots are policed by the same call as the person, from the same numbers, and
+// they are caught by it now and then — a flag that comes out fifty metres in front
+// of a car doing seventy is a flag nobody was going to keep, which is exactly what
+// `drive.leeway()` is for and exactly why it is not nothing.
+func policing(race: Race, dt: Float): Race {
+	mut Race it = race
+	mut drive.Car[dyn] cars = []
+	for each car in race.cars {
+		delta := deltaAt(it, car.along)
+		mut drive.Car one = drive.policed(car, delta > 0.0 && car.speed > delta, dt)
+		if drive.caught(one, car) {
+			it = said(it, "{grid.driverOf(one.seat).tag} — SPEEDING UNDER YELLOW"
+				+ costOf(one, car), Kind.Warn())
+		}
+		append(cars, one)
+	}
+	it.cars = cars
+	return it
+}
+
+// What that one cost, said out loud only when it cost something. Two of these are
+// a warning and the third is the five seconds.
+func costOf(after: drive.Car, before: drive.Car): Str {
+	if after.sheet.penalty > before.sheet.penalty {
+		return ", +{conv.round(drive.added())}s"
+	}
+	return " ({after.sheet.ignored}/{drive.ignorable()})"
+}
+
+// ---------------------------------------------------------------------------
+// The safety car
+// ---------------------------------------------------------------------------
+
+// It, stepped. The one thing on the circuit that is not a `drive.Car` and does
+// not go through `drive.stepped` — on purpose: it does not race, it cannot be
+// raced, and every line of a car's physics would be arithmetic in the way of a
+// thing whose entire behaviour is "drive the racing line at exactly the delta".
+func paced(race: Race, dt: Float): Race {
+	mut Race it = race
+	if drive.onTrack(race.pace) == false {
+		return it
+	}
+	mut drive.Pace one = race.pace
+	if one.life > 0.0 {
+		one.life = math.max(0.0, one.life - dt)
+		if one.life <= 0.0 {
+			one.leaving = true
+			it = said(it, "SAFETY CAR IN THIS LAP — GREEN", Kind.Good())
+		}
+	}
+	// Up to the delta and no further, and it takes a moment about it: a safety car
+	// that appeared already at speed would arrive in the middle of the field rather
+	// than in front of it.
+	one.speed = one.speed + (safetySpeed() - one.speed) * math.min(1.0, 1.3 * dt)
+	one.along = circuit.wrappedAlong(race.track, one.along + one.speed * dt)
+	one.node = circuit.indexAlong(race.track, one.along)
+	mut Float want = circuit.nodeAt(race.track, one.node).line
+	if one.leaving {
+		// On its way in. It drives the road until the pit lane appears beside it and
+		// the lane's own taper is what takes it off — which is what a pit entry *is*,
+		// and is the reason `circuit.pitAcross` exists rather than a straight lane
+		// bolted to the side of the road.
+		lane := circuit.pitAcross(race.track, one.along)
+		if lane != 0.0 {
+			want = lane
+		}
+		if circuit.alongPits(race.track, one.along)
+			&& circuit.gap(race.track, race.track.pits.exit, one.along) < 16.0 {
+			it.pace = drive.garaged()
+			return it
+		}
+	}
+	one.across = one.across + (want - one.across) * math.min(1.0, 2.4 * dt)
+	it.pace = one
+	return it
+}
+
+// It, called out. It comes out of the pit lane, which is what the pit lane is for
+// in a game with no pit stops in it.
+//
+// It is put a little way *inside* the lane rather than at the mouth of it, and
+// then left to drive: it is stationary, its target line is the racing line, and
+// the sixty metres of lane in front of it are exactly long enough to get up to
+// the delta and slide across onto the road. Nothing here describes that; it is
+// what "accelerate toward the delta and ease toward the line" comes to when you
+// start it in a pit lane.
+func deployed(race: Race): Race {
+	from := circuit.wrappedAlong(race.track, race.track.pits.exit - 60.0)
+	mut Race it = race
+	it.pace = drive.Pace(
+		safetyFor(),
+		from,
+		circuit.pitAcross(race.track, from),
+		0.0,
+		circuit.indexAlong(race.track, from),
+		false
+	)
+	it.safetyAgain = race.clock + safetyRest()
+	return it
+}
+
+// Anybody who arrived at the back of it.
+//
+// **This is the punishment nobody had to write a rule for.** It is doing the delta,
+// it is not going to move, and a driver who did not lift finds that out at
+// whatever speed they did not lift at. It spins you exactly the way a loose wheel
+// does, because from the inside of the car it is the same event.
+func ranInto(race: Race): Race {
+	mut Race it = race
+	if drive.onTrack(race.pace) == false {
+		return it
+	}
+	mut drive.Car[dyn] cars = []
+	for each car in race.cars {
+		mut drive.Car one = car
+		if one.sheet.finished == false && one.spun <= 0.0
+			&& one.speed > race.pace.speed + 6.0
+			&& drive.over(race.track, one, race.pace.along, race.pace.across, 2.6) {
+			one = drive.spinning(one)
+			it = said(it, "{grid.driverOf(one.seat).tag} INTO THE BACK OF THE SAFETY CAR",
+				Kind.Warn())
+		}
+		append(cars, one)
+	}
+	it.cars = cars
 	return it
 }
 
@@ -626,13 +934,13 @@ func chequered(race: Race, seat: Int, first: Bool): Race {
 
 // A jump start. It is written down the moment it happens rather than at the end,
 // because the strip saying so while the lights are still on is half the point.
-func jumped(race: Race): Race {
+func jumped(race: Race, seat: Int): Race {
 	mut Race it = race
 	mut drive.Car[dyn] cars = []
 	mut Bool already = false
 	for each car in race.cars {
 		mut drive.Car one = car
-		if one.seat == race.mine {
+		if one.seat == seat {
 			if one.sheet.penalty > 0.0 {
 				already = true
 			}
@@ -644,7 +952,7 @@ func jumped(race: Race): Race {
 	if already {
 		return it
 	}
-	return said(it, "{grid.driverOf(race.mine).tag} — JUMP START, 5s", Kind.Warn())
+	return said(it, "{grid.driverOf(seat).tag} — JUMP START, 5s", Kind.Warn())
 }
 
 func everybodyIn(race: Race): Bool {

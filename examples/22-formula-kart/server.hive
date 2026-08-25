@@ -1,0 +1,483 @@
+// The race server
+// ===============
+// One process, one race, and a websocket to every driver. It draws nothing, has
+// no window, and has never heard of a tree: what it holds is **the one copy of
+// the race that everybody is in**.
+//
+// RUN IT:
+//
+//   hive run server.hive              on port 9300, a circuit off the clock
+//   hive run server.hive 9400         on another port
+//   hive run server.hive 9400 4821    that port, that circuit, every time
+//
+// It prints the URL to hand out. The address in it is asked of the machine with
+// `hive.net.localAddress` rather than written down here, so what it prints is
+// something another computer can actually dial — which is the whole difference
+// between a game two terminals can play and a game two people can.
+//
+// Then, in another terminal or on another machine:
+//
+//   hive run client.hive                              joins 127.0.0.1:9300
+//   hive run client.hive ws://10.0.0.4:9300/race      joins that one
+//
+// WHAT IT DECIDES, WHICH IS EVERYTHING
+// ------------------------------------
+// A client sends **the controls** — a steering angle, two pedals and two buttons
+// — and nothing else. Not where its car is, not how fast, not who it hit. The
+// server puts that value through `drive.stepped` exactly as it puts a bot's
+// through it, and the car that comes out is the only car there is.
+//
+// That is a stronger line than [19](../19-multiplayer-fps) draws, where a client
+// owns its own position, and it is stronger because of what this game is rather
+// than because of ambition. Ten cars are stepped by one call sixty times a second
+// whether anybody is connected or not; they have to agree about who is in front,
+// who was hit, and whose lap counted. There was never a version of this where a
+// client held its own car, so nothing is being given up by not letting it.
+//
+// SEATS. There are ten, they are always all full, and the only thing joining does
+// is take one **off a bot**. Leaving hands it back. That is why this server never
+// waits for anybody, never has an empty grid, and needs no notion of a lobby: a
+// race with one person in it is a race with one person and nine bots, which is
+// exactly what the single-player game was.
+//
+// WHAT DOES THE WORK
+// ------------------
+//   * **`hive.net`** speaks RFC 6455. `wsServe` runs `seated` once per client, on
+//     a virtual thread of its own, and that thread does nothing but read.
+//   * **`hive.json`** is the wire, and the protocol is the type declaration in
+//     `lib/wire.hive`. There is no serialisation layer in this program.
+//   * **`hive.syslink` is the mutex, and there is no mutex.** Every reader thread
+//     and the clock funnel into one service — `steward`, the fold below — and a
+//     fold cannot be entered twice at once. The race is stepped, joined, driven
+//     and left one message at a time, and nothing in this file locks anything.
+
+import ./lib/circuit
+import ./lib/control
+import ./lib/drive
+import ./lib/grid
+import ./lib/wire
+import hive.net
+import hive.syslink
+import hive.conv
+import hive.time
+import hive.term
+
+// ---------------------------------------------------------------------------
+// One socket
+// ---------------------------------------------------------------------------
+
+type Link {
+	None
+	Live { conn: hive.net.WsConnection }
+}
+
+type Post {
+	Send { line: Str }
+	Shut
+}
+
+// The whole of a post service: it owns one socket and knows nothing about the
+// race. A send that fails takes the socket out of its own state, so the writes
+// queued behind it are dropped rather than each waiting to fail in turn.
+proc posting(link: Link, note: Post, from: hive.syslink.Envelope): Link {
+	if note is Post.Send(line) {
+		if link is Link.Live(conn) {
+			if hive.net.wsSend(conn, line) is Result.Error(problem) {
+				return Link.None()
+			}
+		}
+		return link
+	}
+	if link is Link.Live(conn) {
+		hive.net.wsClose(conn)
+	}
+	return Link.None()
+}
+
+// ---------------------------------------------------------------------------
+// The world
+// ---------------------------------------------------------------------------
+
+// One person, as the server holds them.
+type Driver {
+	seat: Int
+	who: Str
+	// How to reach them. An address is a value, so a way of talking to somebody is
+	// a field the way their name is.
+	post: hive.syslink.Address
+	// The last thing they asked for. **Held rather than applied on arrival**: the
+	// race is stepped by the clock, and a client that sent its controls twice in
+	// one frame must not get two frames of throttle for it.
+	want: drive.Wants
+	// How long since anything was heard from them. A client that froze mid-corner
+	// would otherwise go on holding the throttle down for as long as the socket
+	// took to notice, and finish the race.
+	quiet: Float
+}
+
+type World {
+	race: control.Race
+	drivers: Driver[dyn]
+	// How long until the next snapshot goes out, and how long since the race
+	// finished — a server that stopped at the flag would need restarting by hand,
+	// which is not what a server is for.
+	beat: Float
+	rest: Float
+	port: Int
+}
+
+// The fold's mailbox.
+type Note {
+	Tick { ms: Int }
+	Sit { who: Str, team: Str, post: hive.syslink.Address }
+	// The answer to `Sit`, which is the one thing anybody waits for.
+	Seated { seat: Int }
+	Nowhere
+	Heard { seat: Int, up: wire.Up }
+	Gone { seat: Int }
+}
+
+// How often a snapshot goes out. Thirty a second: the race is stepped at whatever
+// the clock ticks at, and what crosses is every other step.
+func beatFor(): Float {
+	return 1.0 / 30.0
+}
+
+// How long a driver may say nothing before their car is handed back to the bots
+// for the duration. Not disconnected — a hiccup on a wireless network is a second
+// of nothing and then everything at once, and dropping somebody for it would be
+// worse than the hiccup.
+func patience(): Float {
+	return 1.5
+}
+
+// And how long after the flag before the next race is rolled.
+func between(): Float {
+	return 12.0
+}
+
+// ---------------------------------------------------------------------------
+// The fold
+// ---------------------------------------------------------------------------
+
+// There is no mutex in this program. This is the mutex.
+proc steward(world: World, note: Note, from: hive.syslink.Envelope): World {
+	if note is Note.Tick(ms) {
+		return ticked(world, conv.itf(ms) / 1000.0)
+	}
+	if note is Note.Sit(who, team, post) {
+		return sitting(world, who, team, post, from)
+	}
+	if note is Note.Heard(seat, up) {
+		return heard(world, seat, up)
+	}
+	if note is Note.Gone(seat) {
+		return leaving(world, seat)
+	}
+	return world
+}
+
+// One step of the race, and — every other one — one snapshot to everybody.
+proc ticked(world: World, dt: Float): World {
+	mut World next = world
+	// Everybody who has gone quiet. Their car is not frozen and not removed: it is
+	// simply not being asked for anything, and `control.stepped` gives a car nobody
+	// is asking anything of to `pace.hive`. A driver whose connection stumbles finds
+	// a bot has been holding their seat, which is the kindest of the three things
+	// that could happen.
+	mut Driver[dyn] waiting = []
+	mut control.Asking[dyn] asked = []
+	for each one in world.drivers {
+		mut Driver held = one
+		held.quiet = held.quiet + dt
+		if held.quiet <= patience() {
+			append(asked, control.Asking(held.seat, held.want))
+		}
+		// A press is spent by the frame that reads it, at this end as at the other:
+		// one message asking for a token is one token however many frames it takes
+		// for the next message to arrive.
+		held.want.spending = false
+		append(waiting, held)
+	}
+	next.drivers = waiting
+	next.race = control.stepped(world.race, asked, dt)
+
+	if next.race.over {
+		next.rest = world.rest + dt
+		if next.rest >= between() {
+			return started(next)
+		}
+	}
+
+	next.beat = world.beat + dt
+	if next.beat < beatFor() {
+		return next
+	}
+	next.beat = 0.0
+	line := wire.told(wire.Down.Ran(wire.taken(next.race)))
+	for each one in next.drivers {
+		async one.post(Post.Send(line))
+	}
+	return next
+}
+
+// Somebody sitting down. They asked for a garage; they get the first free seat in
+// it, or the first free seat anywhere, or the answer that there is not one.
+proc sitting(world: World, who: Str, team: Str, post: hive.syslink.Address,
+	from: hive.syslink.Envelope): World {
+	mut World next = world
+	seat := freeSeat(world, team)
+	if seat < 0 {
+		hive.syslink.answer(from, Note.Nowhere())
+		async post(Post.Send(wire.told(wire.Down.Full())))
+		return next
+	}
+	append(next.drivers, Driver(seat, who, post, drive.idle(), 0.0))
+	hive.syslink.answer(from, Note.Seated(seat))
+	async post(Post.Send(wire.told(wire.Down.Welcome(seat, world.race.seed))))
+	one := grid.driverOf(seat)
+	next.race = control.said(next.race,
+		"{who} TAKES {one.number} {one.tag} — {grid.teamOf(seat).name}",
+		control.Kind.Info())
+	echo "  seat {seat}: {who} in the {grid.teamOf(seat).tag}"
+	return next
+}
+
+// The first seat nobody is in, preferring the garage they asked for. A seat with
+// nobody in it has a bot in it, which is why there is always a race and never a
+// wait.
+func freeSeat(world: World, team: Str): Int {
+	wanted := seatOf(team)
+	for each off in [0, 1] {
+		if taken(world, wanted + off) == false {
+			return wanted + off
+		}
+	}
+	for seat := 0; seat < grid.field(); seat++ {
+		if taken(world, seat) == false {
+			return seat
+		}
+	}
+	return -1
+}
+
+func taken(world: World, seat: Int): Bool {
+	for each one in world.drivers {
+		if one.seat == seat {
+			return true
+		}
+	}
+	return false
+}
+
+func seatOf(team: Str): Int {
+	all := grid.teams()
+	for i := 0; i < len(all); i++ {
+		if all[i].name == team {
+			return i * 2
+		}
+	}
+	return 0
+}
+
+// Something a driver said. Everything but `Join` arrives here, and there are two
+// of those: what they are asking of the car, and that they are going.
+func heard(world: World, seat: Int, up: wire.Up): World {
+	mut World next = world
+	if up is wire.Up.Left {
+		return leaving(world, seat)
+	}
+	if up is wire.Up.Drove(_, _, _, _, spending) {
+		mut Driver[dyn] drivers = []
+		for each one in world.drivers {
+			mut Driver held = one
+			if held.seat == seat {
+				held.want = wire.drove(up)
+				// A press is held until a frame reads it. Two messages between two
+				// frames must not lose the press in the first of them, which is what
+				// this `||` is: the frame clears it, and nothing else does.
+				held.want.spending = one.want.spending || spending
+				held.quiet = 0.0
+			}
+			append(drivers, held)
+		}
+		next.drivers = drivers
+	}
+	return next
+}
+
+// Somebody gone: their seat goes back to the bots, mid-race, exactly where their
+// car was. Nothing about the race changes — which is the whole reason the seats
+// are always full.
+func leaving(world: World, seat: Int): World {
+	mut World next = world
+	mut Driver[dyn] left = []
+	mut Bool was = false
+	for each one in world.drivers {
+		if one.seat == seat {
+			was = true
+			continue
+		}
+		append(left, one)
+	}
+	next.drivers = left
+	if was == false {
+		return next
+	}
+	one := grid.driverOf(seat)
+	next.race = control.said(next.race, "{one.tag} — CAR HANDED TO THE RESERVE",
+		control.Kind.Info())
+	echo "  seat {seat} is a bot again"
+	return next
+}
+
+// A new circuit, everybody still in their seat. The clock is what rolls it, so a
+// server left running all afternoon is a season rather than one race.
+proc started(world: World): World {
+	mut World next = world
+	seed := circuit.hash(world.race.seed, hive.time.now() % 99991)
+	next.race = control.lined(seed)
+	next.rest = 0.0
+	next.beat = 0.0
+	echo ""
+	echo "{next.race.track.name} — seed {seed}"
+	for each one in next.drivers {
+		async one.post(Post.Send(wire.told(wire.Down.Welcome(one.seat, seed))))
+	}
+	return next
+}
+
+// ---------------------------------------------------------------------------
+// The threads
+// ---------------------------------------------------------------------------
+
+// The clock. Sixty a second, which is what the cars are stepped at — the same
+// rate the single-player game steps them at, because it is the same call.
+//
+// It sleeps sixteen milliseconds and then says sixteen, and the overhead between
+// those two makes the race a shade slower than real time. Nothing in the game can
+// tell; it is worth knowing that the number in the message is what this loop
+// *intends* rather than a clock reading.
+proc keeping(desk: hive.syslink.Address): void {
+	for ;; {
+		hive.task.sleep(16)
+		async desk(Note.Tick(16))
+	}
+}
+
+// One client, one thread, and all it does is read. `wsServe` calls this once per
+// connection; when it returns, the connection closes.
+proc seated(desk: hive.syslink.Address, connection: hive.net.WsConnection): void {
+	opening := hive.net.wsRequest(connection)
+	echo "a client connected to {opening.url}"
+
+	// The socket's own service. From here on this thread never writes to it: it
+	// hands lines to `post`, and posts hand them to the socket.
+	post := hive.syslink.spawn(posting, Link.Live(connection))
+	mut Int seat = -1
+
+	for ;; {
+		incoming := hive.net.wsReceive(connection)
+		if incoming is Result.Error(problem) {
+			if seat >= 0 {
+				async desk(Note.Gone(seat))
+			}
+			async post(Post.Shut())
+			return
+		} else if incoming is Result.Ok(text) {
+			decoded := wire.asked(text)
+			if decoded is Result.Error(problem) {
+				// Not one of ours. The path the decoder failed at is the useful half of
+				// the message: a client built against a different `lib/wire.hive` says
+				// so here, at the first message, rather than by disagreeing later about
+				// where somebody's car is.
+				echo "  a message this server cannot read: expected {problem.expected} at {problem.path}"
+			} else if decoded is Result.Ok(up) {
+				if up is wire.Up.Join(who, team) && seat < 0 {
+					// The one waited call in the program, and the only thing worth
+					// waiting for: this thread cannot tag anything until it knows which
+					// seat it is reading for.
+					answer := desk(Note.Sit(named(who), team, post)) with timeout 4000
+					if answer is Result.Ok(reply) && reply is Note.Seated(given) {
+						seat = given
+					} else {
+						echo "  no seat for {named(who)}"
+						async post(Post.Shut())
+						return
+					}
+				} else if seat >= 0 {
+					// Everything else, and nothing waits for any of it. A steering angle
+					// four milliseconds old is not worth a round trip.
+					async desk(Note.Heard(seat, up))
+				}
+			}
+		}
+	}
+}
+
+// A name somebody can be called by, whatever they typed. It is the one string
+// from a client that is ever shown to anybody else, so it is trimmed to something
+// a timing screen can hold rather than trusted.
+func named(who: Str): Str {
+	mut Str[dyn] kept = []
+	mut Int seen = 0
+	// `for each` never indexes, which is why this is six lines and not a bounds
+	// proof.
+	for each letter in split(who, "") {
+		seen = seen + 1
+		if seen <= 18 && letter != "" {
+			append(kept, letter)
+		}
+	}
+	trimmed := join(kept, "")
+	if trimmed == "" {
+		return "Somebody"
+	}
+	return trimmed
+}
+
+// Where to tell people to dial — **asked of the machine, not written down**. A
+// server that printed 127.0.0.1 would be a server nobody else can join, and the
+// one thing this file exists to make possible is somebody else joining.
+proc reachedAt(port: Int): Str {
+	host := hive.net.localAddress()
+	if host is Result.Ok(address) {
+		return "ws://{address}:{port}/race"
+	}
+	return "ws://127.0.0.1:{port}/race"
+}
+
+// ---------------------------------------------------------------------------
+
+proc main(): void {
+	args := hive.term.args()
+	mut Int port = 9300
+	mut Int seed = hive.time.now() % 100000
+	if args bounds 0 {
+		if conv.sti(args[0]) is Result.Ok(given) {
+			port = given
+		}
+	}
+	if args bounds 1 {
+		if conv.sti(args[1]) is Result.Ok(given) {
+			seed = given
+		}
+	}
+
+	mut Driver[dyn] nobody = []
+	world := World(control.lined(seed), nobody, 0.0, 0.0, port)
+	desk := hive.syslink.spawn(steward, world)
+	async keeping(desk)
+
+	echo "{world.race.track.name} — {conv.round(world.race.track.length)} metres, {world.race.track.laps} laps, seed {seed}"
+	echo ""
+	echo "  hive run client.hive {reachedAt(port)}"
+	echo ""
+	echo "{grid.field()} seats, all of them full. Joining takes one off a bot."
+	echo ""
+
+	// Blocks forever, which is what a server does. Every connection it accepts gets
+	// `seated` on a virtual thread of its own — and the handler is passed by name,
+	// with the desk already applied, so the compiler checks its shape here.
+	hive.net.wsServe(port, seated(desk, _))
+}
