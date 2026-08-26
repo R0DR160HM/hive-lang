@@ -1,0 +1,71 @@
+// Running another program, with and without an environment overlay.
+//
+// The command is `go env`, for two reasons: a build already needs the Go
+// toolchain, so nothing new has to be installed for this to run; and what it
+// answers is decided entirely by its environment, which is exactly what is under
+// test. `go env GOOS` under an overlay saying `GOOS=android` says `android` on
+// every machine this suite runs on, which is what makes the expected output one
+// file rather than one per platform.
+import hive.map
+import hive.term
+
+proc main(): void {
+	mut hive.map.Map<Str, Str> android = hive.map.new()
+	hive.map.set(android, "GOOS", "android")
+	hive.map.set(android, "GOARCH", "arm64")
+
+	echo "an overlay reaches the command"
+	echo "  GOOS   " + answered(["env", "GOOS"], android)
+	echo "  GOARCH " + answered(["env", "GOARCH"], android)
+	// A Windows program ends in `.exe` and an Android one does not, and the
+	// toolchain is being asked about the *target* rather than about itself.
+	echo "  GOEXE  [" + answered(["env", "GOEXE"], android) + "]"
+
+	// An empty overlay has to be exactly what `exec` does, because that is what
+	// every call in the compiler that does not cross-compile is still doing.
+	mut hive.map.Map<Str, Str> nothing = hive.map.new()
+	echo ""
+	echo "an empty overlay is no overlay"
+	echo answered(["env", "GOOS"], nothing) == plain(["env", "GOOS"])
+
+	// And an overlay *adds* rather than replaces: a GOARCH on its own must leave
+	// GOOS as this machine's. If the environment were being replaced instead of
+	// added to, this would be empty or wrong — and so would PATH, and so would
+	// the module cache.
+	mut hive.map.Map<Str, Str> archOnly = hive.map.new()
+	hive.map.set(archOnly, "GOARCH", "arm64")
+	echo ""
+	echo "an overlay adds rather than replaces"
+	echo answered(["env", "GOOS"], archOnly) == plain(["env", "GOOS"])
+}
+
+// What `go` said to one question under an overlay, as a single line.
+proc answered(arguments: Str[], environment: hive.map.Map<Str, Str>): Str {
+	said := hive.term.execWith("go", arguments, "", environment)
+	if said is Result.Ok(output) {
+		return firstLine(output)
+	}
+	return "<the toolchain refused>"
+}
+
+// The same question through the call that has always been there.
+proc plain(arguments: Str[]): Str {
+	said := hive.term.exec("go", arguments, "")
+	if said is Result.Ok(output) {
+		return firstLine(output)
+	}
+	return "<the toolchain refused>"
+}
+
+// The first line of what a command wrote, without the carriage return Windows
+// puts in front of the newline.
+func firstLine(whole: Str): Str {
+	lines := split(whole, "\n")
+	if lines bounds 0 {
+		parts := split(lines[0], "\r")
+		if parts bounds 0 {
+			return parts[0]
+		}
+	}
+	return ""
+}
