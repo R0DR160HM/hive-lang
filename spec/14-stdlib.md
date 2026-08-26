@@ -538,6 +538,7 @@ without a radius is not a sphere with a default one.
 | `ground(attrs, width, depth)` | a plane that already lies flat |
 | `label(attrs, words)` | words that always face the viewer |
 | `line(attrs, fromX, fromY, fromZ, toX, toY, toZ)` | |
+| `sound(attrs, name)` | a noise at a place — see [below](#a-sound-is-a-shape) |
 
 **`cone` takes both of its radii** rather than only the base. A cone in the world
 is hardly ever the perfect one — a track marker is snub-nosed, a nose cone ends in
@@ -596,6 +597,65 @@ saying is worth having, because a road drawn as a `ground` came out as a lawn.
 or four-digit `Tone.HEX` carry one, and in a scene it is honoured: the shape is
 drawn see-through and writes no depth, so whatever is behind it stays visible.
 This is how a ghost, a tinted screen or the plume behind something is drawn.
+
+### A sound is a shape
+
+`sound(attrs, name)` is something in the scene that is **heard** from where it
+stands instead of drawn where it stands. It takes `at` like any other shape, and
+three of its own:
+
+| attribute | carries |
+| --- | --- |
+| `voice(Voice)` | which noise it is |
+| `pitch(Float)` | how high, as a multiple of the voice at rest |
+| `volume(Float)` | how loud, the same way |
+
+Pitch and volume are multiples rather than hertz and decibels. What an engine
+sounds like at `1.0` is the renderer's business; a program says "twice as fast"
+and "half as loud", which is what it knows, and never has to hold an opinion
+about a filter.
+
+| | |
+| --- | --- |
+| sustained | `Engine` `Tyres` `Brakes` `Wind` `Crowd` `Music` |
+| struck | `Impact` `Chime` |
+
+**The payload is a name, and the name is the shape's identity between frames.**
+This is the one place audio cannot follow the rule the solids follow. A box is
+matched to whatever was in its slot last frame, because a view built by the same
+code lists the same things in the same order — and a box rebuilt anyway is a box
+nobody can tell was rebuilt. An oscillator rebuilt anyway is a *click*, sixty of
+them a second, so a voice has to be the same voice this frame that it was last
+frame; and a slot cannot promise that, because a scene is free to stop drawing the
+car in front and every sound after it would shift up a place and become a
+different engine.
+
+So a name that is in this frame and was in the last one carries on, a name that
+has just arrived starts, and a name that has gone fades out.
+
+**Which of those a voice actually does is the voice's own business, not the
+program's.** A *sustained* voice lasts as long as the scene goes on naming it. A
+*struck* one fires once, when the name arrives, and is deaf to everything after
+it — because a crash is a thing that happened rather than a thing that is
+happening, and a world of values has no other way to say so. Naming `"hit-3"` for
+as long as a car knows it was hit is one impact; letting the name go and bringing
+it back is a second one.
+
+Sounds are **positioned**, and the listener is the scene's own `eye` and `aim` —
+so what is heard on the left is what is drawn on the left, and a car goes past
+your ear as well as your eye. `Music` is the exception: it has nowhere to stand,
+so it is never panned.
+
+Nothing is downloaded. Every voice is oscillators and filtered noise, for the same
+reason a `Surface` is a drawn pattern rather than an image: a built Hive program
+is one file. It buys something as well as costing something — a voice made of a
+frequency can be *bent*, and an engine that is a recording of one speed played
+faster is an engine you can hear looping.
+
+A browser will not let a page make a noise until somebody has touched it. There is
+nothing to ask for and nothing to detect: the context is built when the first
+sound is asked for and nudged on every gesture until one takes, so whatever the
+user was going to click anyway is what turns the sound on.
 
 ### The camera, the sky and the mouse
 

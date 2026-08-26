@@ -6,13 +6,22 @@
 // be at every point on that line. All of it from the one seed, all of it a `func`,
 // and all of it computed once before the lights go out.
 //
-// **ONE DESCRIPTION, SIX USES.** The nodes below are what gets drawn, what a car
+// **ONE DESCRIPTION, SEVEN USES.** The nodes below are what gets drawn, what a car
 // grips or slides on, what the bots steer at, what the lap counter counts, what
-// race control reads to know which sector a yellow flag belongs to, and where the
-// tokens are laid out. There is no second idea of where the track is anywhere in
-// this program, which is the only way the picture and the physics can be made to
-// agree — a corner you can see and a corner you can grip have to be the same
-// corner.
+// race control reads to know which sector a yellow flag belongs to, where the
+// tokens are laid out, and — since there is something to hit — where the ground
+// stops. There is no second idea of where the track is anywhere in this program,
+// which is the only way the picture and the physics can be made to agree: a
+// corner you can see and a corner you can grip have to be the same corner, and a
+// barrier you can see and a barrier you can hit have to be the same barrier.
+//
+// That last one is why `wallOff` lives here rather than in `scenery.hive`, which
+// is the file that draws it. For as long as the drawing owned the number, the
+// wall was a decoration shaped like a wall — nothing asked it anything, so a car
+// went through it into a field. The pit lane is the same story twice over: its
+// wall used to be drawn a fixed distance inside the *lane*, so at the pit entry,
+// where the lane tapers toward the road, the wall stood across the racing line.
+// Nobody could see it, because nothing could hit it.
 //
 // HOW A TRACK IS ROLLED
 // ---------------------
@@ -234,9 +243,10 @@ func nodes(): Int {
 }
 
 // How many laps a race is. Short, because this is a kart race and not a Sunday
-// afternoon.
+// afternoon — but long enough that the compulsory stop is a decision about *when*
+// rather than a thing that happens to you on the only lap there was.
 func laps(): Int {
-	return 3
+	return 5
 }
 
 // ---------------------------------------------------------------------------
@@ -903,6 +913,14 @@ func under(track: Circuit, where: Where): Ground {
 	if off <= node.half + kerbWidth() {
 		return Ground.Kerb()
 	}
+	// The pit lane is a road too — the one piece of tarmac on the circuit that is
+	// not the circuit. Without this a car serving its compulsory stop would be
+	// driving across a lawn at a third of the grip, and the rule would not be a
+	// decision about when to come in: it would be a thing that ruined your race
+	// whenever you did it.
+	if onLane(track, where.along, where.across) {
+		return Ground.Tarmac()
+	}
 	if node.trap {
 		return Ground.Gravel()
 	}
@@ -937,7 +955,50 @@ func kerbWidth(): Float {
 // past the edge before anybody has left anything.
 func exceeded(track: Circuit, where: Where): Bool {
 	node := nodeAt(track, where.node)
+	// Nothing on the pit lane's side of the road is a track limit while the pit
+	// lane is beside it. A car coming in leaves the road on purpose, and a rule
+	// that could not tell that from running wide would hand every driver in the
+	// race three warnings and five seconds for obeying a different one.
+	if alongPits(track, where.along) && where.across * track.pits.side > 0.0 {
+		return false
+	}
 	return math.abs(where.across) > node.half + kerbWidth() + 0.4
+}
+
+// ---------------------------------------------------------------------------
+// Where the ground stops
+// ---------------------------------------------------------------------------
+
+// How far out the barrier stands from the middle of the road.
+//
+// **It is here rather than in `scenery.hive`, which is the file that draws it.**
+// That is the same rule the road itself follows and it is not a stylistic one: a
+// wall you can see and a wall you can hit have to be the same wall, and two files
+// each with their own idea of where it goes would be a barrier drawn a few metres
+// from the barrier a car bounces off. The picture reads this; so does the physics.
+func wallOff(): Float {
+	return 12.5
+}
+
+// How far out the wall is on one side of the road at a distance round the lap,
+// from the middle of the road and always positive. One number, and the whole of
+// what it means to be contained by a circuit is asked of it.
+//
+// It is not simply the barrier. Where the pit lane runs, the wall on that side
+// stands beyond the *lane* — because the lane is on the far side of where the
+// barrier would otherwise have been, and a barrier drawn straight through it
+// would make the pit lane somewhere a car is bounced out of rather than somewhere
+// it can be.
+func wallAt(track: Circuit, along: Float, side: Float): Float {
+	out := nodeAlong(track, along).half + wallOff()
+	if side != track.pits.side {
+		return out
+	}
+	lane := math.abs(pitAcross(track, along))
+	if lane <= 0.0 {
+		return out
+	}
+	return math.max(out, lane + track.pits.half + 0.9)
 }
 
 // ---------------------------------------------------------------------------
@@ -971,7 +1032,7 @@ func pitAcross(track: Circuit, along: Float): Float {
 	if on > run {
 		return 0.0
 	}
-	taper := math.min(34.0, run / 3.0)
+	taper := pitMouth(track)
 	mut Float part = 1.0
 	if taper > 0.0 {
 		if on < taper {
@@ -982,6 +1043,110 @@ func pitAcross(track: Circuit, along: Float): Float {
 		}
 	}
 	return track.pits.side * track.pits.off * part
+}
+
+// How long the way in and the way out are: the length of the taper above, and so
+// also the length of the gap in the pit wall. **They are one number because they
+// are one thing.** The lane is only clear of the road once it has finished moving
+// away from it, so a wall that started any earlier would have nowhere to stand —
+// and a wall that started any later would leave a hole a car could rejoin the
+// circuit through halfway down the pit lane.
+func pitMouth(track: Circuit): Float {
+	return math.min(34.0, pitRun(track) / 3.0)
+}
+
+// Where the pit wall closes behind a car that has committed to coming in. What a
+// bot brakes for, and the only place in the program that asks where the pit
+// *entry* ends rather than where it begins.
+func pitClosesAt(track: Circuit): Float {
+	return wrappedAlong(track, track.pits.entry + pitMouth(track))
+}
+
+// Whether the pit wall stands between the road and the lane at a distance round
+// the lap — that is, whether there is a wall there at all rather than one of the
+// two gaps a car goes through.
+//
+// A pit lane is a wall with a hole at each end. Everything about coming in and
+// going out is this one question: a car may cross where this is false and may not
+// where it is true, and that is the whole of what makes the lane somewhere you
+// commit to rather than somewhere you drift into.
+func pitWalled(track: Circuit, along: Float): Bool {
+	run := pitRun(track)
+	if run <= 0.0 {
+		return false
+	}
+	on := gap(track, along, track.pits.entry)
+	if on > run {
+		return false
+	}
+	mouth := pitMouth(track)
+	return on > mouth && run - on > mouth
+}
+
+// How far out the pit wall stands from the middle of the road.
+//
+// It follows the road at a **fixed** offset rather than following the lane, and
+// that is not a detail — it is the fix for a wall that used to be drawn a fixed
+// distance inside the *lane*. Where the lane tapers in toward the road at the pit
+// entry, so did the wall, so the first few metres of it stood across the racing
+// line: at the node after the entry the lane is three metres over and the wall
+// was two metres past the middle of the road on the *other* side. Nothing could
+// hit it, so nobody could see it. Now something can hit it.
+func pitWallOff(): Float {
+	return 5.4
+}
+
+func pitWallAt(track: Circuit, along: Float): Float {
+	return nodeAlong(track, along).half + pitWallOff()
+}
+
+// Whether a place is on the pit lane's own tarmac — within half a lane's width of
+// wherever the middle of the lane has got to.
+func onLane(track: Circuit, along: Float, across: Float): Bool {
+	lane := pitAcross(track, along)
+	if lane == 0.0 {
+		return false
+	}
+	return math.abs(across - lane) <= track.pits.half
+}
+
+// Whether a place is **down the pit lane** rather than on the circuit: on the
+// lane's own tarmac, and clear of the road's.
+//
+// That second clause is the whole of the difference between this and `onLane`,
+// and it is not a nicety. **The tapers overlap the racing line by design** — that
+// is what makes the lane something a car can drive into — so "is it on the lane's
+// tarmac" reads true for a car merely taking a wide line past the pit entry. A
+// bot that asked it that way turned in for the pits every single lap, at eighty
+// an hour, and on one seed in eight the race could not end.
+func downLane(track: Circuit, along: Float, across: Float): Bool {
+	if onLane(track, along, across) == false {
+		return false
+	}
+	return math.abs(across) > nodeAlong(track, along).half + kerbWidth()
+}
+
+// And whether a car in that place has **committed** to the pit lane: past the pit
+// wall, on the lane's side, somewhere the wall is closed. All three, because a car
+// running wide at the pit entry has not come in and a car on the far side of the
+// road never did.
+//
+// This is what the compulsory stop is counted by, and it is deliberately the
+// strictest of the three questions this file asks about the pit lane: there is no
+// line to clip and no corner of it to cut. You are past the wall or you are not.
+func inPits(track: Circuit, along: Float, across: Float): Bool {
+	if pitWalled(track, along) == false {
+		return false
+	}
+	return across * track.pits.side > pitWallAt(track, along)
+}
+
+// How fast a car may go down the pit lane, in metres a second. Eighty an hour,
+// which is the real number and is the whole of what makes the stop cost anything:
+// the lane is no shorter than the road beside it, so a lane you could take flat
+// would be a rule with no price on it.
+func pitSpeed(): Float {
+	return 22.2
 }
 
 // ---------------------------------------------------------------------------

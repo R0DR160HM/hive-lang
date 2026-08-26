@@ -323,11 +323,19 @@ test "grass is slower than tarmac" {
 
 test "holding a drift harvests, and letting go deploys it" {
 	track := circuit.build(4821)
-	mut drive.Car car = put(track, 0, 300.0, 0.0, 35.0)
+	// Started against the left of the road and drifting right, for a second.
+	//
+	// **A drift now has to fit on the circuit.** This used to hold full lock for two
+	// seconds from the middle of the road, which put the car twenty-five metres
+	// wide of it — and passed, because until the barrier was something a car could
+	// hit there was nothing out there to stop it. A drift crosses fourteen metres
+	// of road in about a second, so a second is what there is.
+	mut drive.Car car = put(track, 0, 300.0, -5.0, 35.0)
 	held := drive.Wants(1.0, 1.0, 0.0, true, false)
-	for frame := 0; frame < 120; frame++ {
+	for frame := 0; frame < 60; frame++ {
 		car = drive.stepped(track, car, held, 1.0, 1.0 / 60.0)
 	}
+	assert car.knock == 0.0
 	assert car.drift == 1.0
 	assert car.harvest > drive.harvestFor(1)
 	assert math.abs(car.slide) > 0.1
@@ -930,6 +938,234 @@ test "the pit lane tapers in at one end and out at the other" {
 }
 
 // ---------------------------------------------------------------------------
+// The compulsory stop
+// ---------------------------------------------------------------------------
+
+test "a race is five laps and the stop fits inside one of them" {
+	track := circuit.build(4821)
+	assert track.laps == 5
+	// Every seat picks a lap to come in on, it is never the last one, and the field
+	// does not all pick the same one — which is the whole reason it is rolled.
+	mut Bool spread = false
+	for seat := 0; seat < grid.field(); seat++ {
+		on := pace.pitsOn(track, seat)
+		assert on >= 1
+		assert on < track.laps
+		if on != pace.pitsOn(track, 0) {
+			spread = true
+		}
+	}
+	assert spread
+	// And the same seat picks the same lap every time, so a race can be learned.
+	assert pace.pitsOn(track, 3) == pace.pitsOn(circuit.build(4821), 3)
+}
+
+test "the pit wall has a way in and a way out and nothing in between" {
+	for each seed in [4821, 17, 90210, 5] {
+		track := circuit.build(seed)
+		run := circuit.pitRun(track)
+		mouth := circuit.pitMouth(track)
+		// Open at each end, closed down the middle. Without the two openings a pit
+		// lane is a corridor nothing can get into.
+		assert circuit.pitWalled(track,
+			circuit.wrappedAlong(track, track.pits.entry + mouth / 2.0)) == false
+		assert circuit.pitWalled(track,
+			circuit.wrappedAlong(track, track.pits.exit - mouth / 2.0)) == false
+		assert circuit.pitWalled(track,
+			circuit.wrappedAlong(track, track.pits.entry + run / 2.0))
+		// And nothing anywhere else on the circuit.
+		assert circuit.pitWalled(track,
+			circuit.wrappedAlong(track, track.pits.exit + run / 4.0)) == false
+		// Where it is closed it stands clear of the road and clear of the lane, which
+		// is what makes it a wall with a car on each side rather than a kerb.
+		middle := circuit.wrappedAlong(track, track.pits.entry + run / 2.0)
+		node := circuit.nodeAlong(track, middle)
+		wall := circuit.pitWallAt(track, middle)
+		assert wall > node.half + circuit.kerbWidth()
+		assert wall < math.abs(circuit.pitAcross(track, middle)) - track.pits.half
+	}
+}
+
+test "a car cannot cross the pit wall where it is closed" {
+	track := circuit.build(4821)
+	middle := circuit.wrappedAlong(track, track.pits.entry + circuit.pitRun(track) / 2.0)
+	wall := circuit.pitWallAt(track, middle)
+	// Driven at it from the circuit, hard.
+	mut drive.Car car = put(track, 0, middle - 40.0, 0.0, 34.0)
+	car.yaw = car.yaw - track.pits.side * 0.5
+	for frame := 0; frame < 150; frame++ {
+		car = drive.stepped(track, car, drive.Wants(0.0, 1.0, 0.0, false, false),
+			1.0, 1.0 / 60.0)
+		if circuit.pitWalled(track, car.along) {
+			assert car.across * track.pits.side < wall
+		}
+	}
+	// So it never got in, and so it never served anything.
+	assert car.sheet.pitted == false
+}
+
+test "the pit lane is a road: tarmac, and not a track-limits offence" {
+	track := circuit.build(4821)
+	middle := circuit.wrappedAlong(track, track.pits.entry + circuit.pitRun(track) / 2.0)
+	lane := circuit.pitAcross(track, middle)
+	where := circuit.Where(circuit.indexAlong(track, middle), middle, lane)
+	// A car in its pit box is on a road, not on a lawn. Without this the compulsory
+	// stop would be a third of the grip and half the speed, and a rule you are
+	// punished for obeying is not a rule.
+	assert circuit.under(track, where) is circuit.Ground.Tarmac
+	assert circuit.exceeded(track, where) == false
+	// And the same place is well past where the track limits would otherwise be.
+	assert math.abs(lane) > circuit.nodeAlong(track, middle).half + circuit.kerbWidth()
+}
+
+test "driving through the pit lane serves the stop" {
+	track := circuit.build(4821)
+	// Put in the middle of the lane, which is where a car that came in ends up.
+	middle := circuit.wrappedAlong(track, track.pits.entry + circuit.pitRun(track) / 2.0)
+	mut drive.Car car = put(track, 0, middle, circuit.pitAcross(track, middle), 20.0)
+	assert car.sheet.pitted == false
+	car = drive.stepped(track, car, drive.Wants(0.0, 0.5, 0.0, false, false),
+		1.0, 1.0 / 60.0)
+	assert car.sheet.pitted
+	// A car on the circuit alongside is not in the pit lane and has served nothing.
+	mut drive.Car past = put(track, 1, middle, 0.0, 40.0)
+	past = drive.stepped(track, past, drive.Wants(0.0, 1.0, 0.0, false, false),
+		1.0, 1.0 / 60.0)
+	assert past.sheet.pitted == false
+}
+
+test "the pit lane has a limit, and it is policed the way a flag is" {
+	mut control.Race race = control.lined(4821)
+	race.lights = 0.0
+	track := race.track
+	middle := circuit.wrappedAlong(track, track.pits.entry + circuit.pitRun(track) / 2.0)
+	lane := circuit.pitAcross(track, middle)
+	// The limit applies in the lane and nowhere else — not to the car a few metres
+	// away on the other side of the wall, which is the whole reason a delta is asked
+	// of a *place* rather than of a distance round the lap.
+	assert control.deltaFor(race, middle, lane) == circuit.pitSpeed()
+	assert control.deltaFor(race, middle, 0.0) == 0.0
+	// And somebody blasting down it is on the stewards' clock for it, by the same
+	// count an ignored yellow is kept on — which is the join being tested here:
+	// that the number `policing` compares a car with is the one for the place the
+	// car is actually in, and not the one for the stretch of road it is beside.
+	//
+	// Two cars, same speed, a few metres apart across the pit wall. One of them is
+	// speeding and the other is racing.
+	inLane := circuit.wrappedAlong(track,
+		track.pits.entry + circuit.pitMouth(track) + 8.0)
+	mut drive.Car[dyn] cars = []
+	for each car in race.cars {
+		mut Float across = 0.0
+		if car.seat == 0 {
+			across = circuit.pitAcross(track, inLane)
+		}
+		append(cars, put(track, car.seat, inLane - conv.itf(car.seat) * 40.0,
+			across, 60.0))
+	}
+	race.cars = cars
+	// Held down by somebody at the wheel: a bot would lift, which is the point of a
+	// bot and no use at all for testing what happens to a driver who does not.
+	flat := [control.Asking(0, drive.Wants(0.0, 1.0, 0.0, false, false))]
+	for frame := 0; frame < 24; frame++ {
+		race = control.stepped(race, flat, 1.0 / 60.0)
+	}
+	speeder := control.find(race.cars, 0)
+	// Still down there, so the test is about the rule rather than about a car that
+	// left the lane on the second frame.
+	assert circuit.inPits(track, speeder.along, speeder.across)
+	assert speeder.sheet.speeding > 0.3
+	// Nobody on the circuit is on any clock at all.
+	assert control.find(race.cars, 2).sheet.speeding == 0.0
+}
+
+test "taking the flag without the stop costs, and serving it costs nothing" {
+	mut control.Race race = control.lined(4821)
+	race.lights = 0.0
+	race.clock = 100.0
+	track := race.track
+	mut drive.Car[dyn] cars = []
+	for each car in race.cars {
+		mut drive.Car one = put(track, car.seat, track.length - 24.0, -2.0, 30.0)
+		one.sheet.lap = track.laps
+		one.sheet.sector = 3
+		one.sheet.travelled = track.length * conv.itf(track.laps)
+		// The even seats came in at some point and the odd ones did not.
+		one.sheet.pitted = car.seat % 2 == 0
+		append(cars, one)
+	}
+	race.cars = cars
+	for frame := 0; frame < 240; frame++ {
+		race = control.stepped(race, nobody(), 1.0 / 60.0)
+	}
+	for each car in race.cars {
+		assert car.sheet.finished
+		if car.seat % 2 == 0 {
+			assert car.sheet.penalty == 0.0
+		} else {
+			// Not counted in threes and not forgiven: it either happened or it did not.
+			assert car.sheet.penalty >= drive.unserved()
+			assert car.sheet.finishedAt >= car.sheet.penalty
+		}
+	}
+}
+
+test "a bot comes in, and comes in once" {
+	// A whole race, nobody driving, on three seeds — and the three are chosen
+	// rather than pretty. **Both of the bugs this test exists for were seed-shaped
+	// and neither showed on 4821.**
+	//
+	// A bot asked whether it was in the pit lane by "is it on the lane's tarmac",
+	// and the lane's two tapers overlap the racing line by design — so a car merely
+	// running wide past the pit entry read as a car already in the pits and turned
+	// in. Every lap. On 17 the field pitted up to five times each and the race
+	// could not end at all; on 777 half of them never got round.
+	//
+	// So what is asserted is what actually went wrong: the race **ends**, and
+	// nobody spends it going round the pit lane.
+	for each seed in [4821, 17, 777] {
+		mut control.Race race = control.lined(seed)
+		mut Int[dyn] visits = []
+		mut Bool[dyn] inside = []
+		for seat := 0; seat < grid.field(); seat++ {
+			append(visits, 0)
+			append(inside, false)
+		}
+		for frame := 0; frame < 60 * 60 * 10; frame++ {
+			race = control.stepped(race, nobody(), 1.0 / 60.0)
+			for each car in race.cars {
+				if visits bounds car.seat && inside bounds car.seat {
+					now := circuit.inPits(race.track, car.along, car.across)
+					if now && inside[car.seat] == false {
+						visits[car.seat] = visits[car.seat] + 1
+					}
+					inside[car.seat] = now
+				}
+			}
+			if race.over {
+				break
+			}
+		}
+		assert race.over
+		mut Int served = 0
+		for each car in race.cars {
+			assert car.sheet.finished
+			if car.sheet.pitted {
+				served = served + 1
+			}
+		}
+		// Most of them get in. A bot that misses the window takes the twenty-five
+		// seconds like anybody else, which is a result rather than a fault — but a
+		// field where hardly anybody manages it would mean the lane cannot be
+		// entered, and that is a fault.
+		assert served > grid.field() / 2
+		for each n in visits {
+			assert n <= 2
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // The shape of the ground
 // ---------------------------------------------------------------------------
 
@@ -1023,24 +1259,122 @@ test "everything beside the circuit can be drawn, and a marshal shows the flag" 
 	assert posts > 6
 }
 
-test "the barrier follows the road, and gives way to the pit lane" {
-	track := circuit.build(4821)
-	// Somewhere with no pit lane beside it: a barrier each side.
-	mut Int clear = 0
-	mut Int beside = 0
-	for i := 0; i < len(track.nodes); i++ {
-		pieces := len(scenery.verge(track, i))
-		if circuit.alongPits(track, circuit.nodeAt(track, i).along) {
-			beside = beside + pieces
-		} else {
-			clear = clear + pieces
+test "the barrier goes round the outside of the pit lane, not through it" {
+	// The barrier used to be *skipped* on the pit lane's side, because the lane
+	// wanted the ground it stood on. That was fine while nothing could touch it and
+	// is a hole in the wall now that something can — so it goes round the outside
+	// of the lane instead, and there is a piece of it on both sides of every node
+	// on the circuit.
+	for each seed in [4821, 17, 90210] {
+		track := circuit.build(seed)
+		mut Int clear = 0
+		mut Int beside = 0
+		for i := 0; i < len(track.nodes); i++ {
+			node := circuit.nodeAt(track, i)
+			pieces := len(scenery.verge(track, i))
 			assert pieces >= 2
+			if circuit.alongPits(track, node.along) {
+				beside = beside + pieces
+				// Where the lane runs, the wall on that side is beyond the far edge of
+				// it: a car in its pit box is inside the circuit, not outside it.
+				lane := math.abs(circuit.pitAcross(track, node.along))
+				if lane > 0.0 {
+					assert circuit.wallAt(track, node.along, track.pits.side)
+						> lane + track.pits.half
+				}
+			} else {
+				clear = clear + pieces
+				// And where it does not, both walls are the plain barrier offset.
+				assert circuit.wallAt(track, node.along, 1.0) == node.half + circuit.wallOff()
+				assert circuit.wallAt(track, node.along, -1.0) == node.half + circuit.wallOff()
+			}
 		}
+		// The pit stretch draws more than the plain verge does — the lane, its wall
+		// and the boxes — rather than less.
+		assert beside > 0
+		assert clear > 0
 	}
-	// And the pit stretch draws something of its own — the lane, its wall and the
-	// boxes — rather than nothing at all.
-	assert beside > 0
-	assert clear > 0
+}
+
+// ---------------------------------------------------------------------------
+// The walls
+// ---------------------------------------------------------------------------
+
+test "a car cannot drive through the barrier" {
+	track := circuit.build(4821)
+	// Pointed thirty degrees off the road and given everything it has. Before the
+	// wall was a wall this ended up in a field; the only question now is which side
+	// of the barrier it ends up on.
+	mut drive.Car car = put(track, 0, 300.0, 0.0, 40.0)
+	car.yaw = car.yaw + 0.52
+	for frame := 0; frame < 240; frame++ {
+		car = drive.stepped(track, car, drive.Wants(0.0, 1.0, 0.0, false, false),
+			1.0, 1.0 / 60.0)
+		// Every frame, not only the last one: a car that went through and came back
+		// would pass a test that only looked at where it stopped.
+		mut Float side = 1.0
+		if car.across < 0.0 {
+			side = -1.0
+		}
+		assert math.abs(car.across) <= circuit.wallAt(track, car.along, side)
+	}
+	// And it hit something on the way.
+	assert car.sheet.warnings > 0
+}
+
+test "hitting a wall square costs more than brushing it" {
+	track := circuit.build(4821)
+	// Two cars, same speed, same wall, different angles at it.
+	mut drive.Car square = put(track, 0, 300.0, 0.0, 40.0)
+	mut drive.Car glance = put(track, 0, 300.0, 0.0, 40.0)
+	square.yaw = square.yaw + 1.2
+	glance.yaw = glance.yaw + 0.14
+	coast := drive.Wants(0.0, 0.0, 0.0, false, false)
+	for frame := 0; frame < 180; frame++ {
+		square = drive.stepped(track, square, coast, 1.0, 1.0 / 60.0)
+		glance = drive.stepped(track, glance, coast, 1.0, 1.0 / 60.0)
+	}
+	// The one that arrived across the wall is stopped; the one that leaned on it
+	// kept most of what it had. A flat fraction of the speed would have made these
+	// two the same, which is exactly backwards.
+	assert glance.speed > square.speed + 8.0
+}
+
+test "driving away from a wall costs nothing" {
+	track := circuit.build(4821)
+	// Sitting against the barrier, pointed away from it, on the throttle. A car in
+	// this position is in contact every single frame — so if a wall took the size
+	// of the sideways speed rather than the part of it going *into* the wall, it
+	// would scrub off the very movement that gets the car out, sixty times a
+	// second, and the car would never leave. One bot spent nine minutes there and
+	// the race could not end.
+	edge := circuit.wallAt(track, 300.0, 1.0) - 1.2
+	mut drive.Car car = put(track, 0, 300.0, edge, 4.0)
+	car.yaw = car.yaw - 0.5
+	for frame := 0; frame < 90; frame++ {
+		car = drive.stepped(track, car, drive.Wants(-0.6, 1.0, 0.0, false, false),
+			1.0, 1.0 / 60.0)
+	}
+	assert car.across < edge - 2.0
+	assert car.speed > 12.0
+}
+
+test "a wall does not weld a spun car to itself" {
+	track := circuit.build(4821)
+	// Parked against the barrier facing back down the circuit, which is where a car
+	// ends up after a spin. It has to be able to get round again: a wall that
+	// straightened every car it touched, every frame, whatever the speed, would
+	// hold this one here for the rest of the race.
+	edge := circuit.wallAt(track, 300.0, 1.0) - 1.2
+	mut drive.Car car = put(track, 0, 300.0, edge, 6.0)
+	car.yaw = car.yaw + math.pi()
+	was := circuit.wrapped(car.yaw - circuit.nodeAlong(track, car.along).dir)
+	for frame := 0; frame < 120; frame++ {
+		want := pace.driving(track, [car], [], [], drive.garaged(), 0, 0.0, true, 0.0)
+		car = drive.stepped(track, car, want, 1.0, 1.0 / 60.0)
+	}
+	now := circuit.wrapped(car.yaw - circuit.nodeAlong(track, car.along).dir)
+	assert math.abs(now) < math.abs(was) - 0.6
 }
 
 test "a lap fits inside the box a map is drawn in" {
@@ -1285,6 +1619,77 @@ test "a finished car is placed by its time, penalties and all" {
 	standings := control.order(race)
 	assert control.roundSeat(standings, 0) == 1
 	assert control.roundSeat(standings, 1) == 0
+}
+
+// ---------------------------------------------------------------------------
+// Watching, once your own race has ended
+// ---------------------------------------------------------------------------
+
+// A race with the given seats already past the flag, in that order, and everybody
+// else still out on the circuit.
+func parked(seed: Int, done: Int[]): control.Race {
+	mut control.Race race = control.lined(seed)
+	mut drive.Car[dyn] cars = []
+	for each car in race.cars {
+		mut drive.Car one = car
+		// Spread along the lap so the running order is something in particular
+		// rather than ten cars on a grid.
+		one.sheet.travelled = 5000.0 - conv.itf(one.seat) * 120.0
+		if indexOf(done, one.seat) is Result.Ok(at) {
+			one.sheet.finished = true
+			one.sheet.finishedAt = 300.0 + conv.itf(at)
+		}
+		append(cars, one)
+	}
+	race.cars = cars
+	return race
+}
+
+test "a driver who has finished is shown whoever is still leading" {
+	// Nobody chosen yet — `wanted` is your own seat, which is what a model that has
+	// never been asked holds. The answer is the leader of those still running, and
+	// it is never you.
+	race := parked(4821, [3])
+	assert control.following(race, 3, 3) == 0
+	// And once that one has finished too, the next one still out there. Nothing had
+	// to notice: the same call gives a different answer because the race did.
+	after := parked(4821, [3, 0])
+	assert control.following(after, 3, 0) == 1
+	// A choice that is still running is kept.
+	assert control.following(after, 3, 4) == 4
+}
+
+test "turning goes along the order and steps past anybody parked" {
+	// Travelled falls with the seat number, so the running order is the seat order —
+	// except that seat 7 has finished, and a finished car sorts ahead of everybody
+	// still out there whatever distance says.
+	race := parked(4821, [7])
+	standings := control.order(race)
+	assert control.roundSeat(standings, 0) == 7
+	assert control.roundSeat(standings, 1) == 0
+	assert control.roundSeat(standings, 9) == 9
+	assert control.turned(race, 0, 1) == 1
+	assert control.turned(race, 2, -1) == 1
+	// Seat 7 has finished, so stepping onto it goes past it in both directions.
+	assert control.turned(race, 6, 1) == 8
+	assert control.turned(race, 8, -1) == 6
+	// And it wraps rather than stopping at the end of the list.
+	assert control.running(race, control.turned(race, 9, 1))
+	assert control.turned(race, 7, 1) != 7
+}
+
+test "watching a race where everybody else has finished answers with you" {
+	mut Int[dyn] all = []
+	for seat := 0; seat < grid.field(); seat++ {
+		append(all, seat)
+	}
+	race := parked(4821, all)
+	// Every car is parked, so there is nothing to watch and nothing to pretend.
+	// The window never asks in this state — the race is over and the
+	// classification is up — but a function that answered with somebody else's
+	// stationary car would be a camera pointed at a car park.
+	assert control.following(race, 4, 4) == 4
+	assert control.turned(race, 4, 1) == 4
 }
 
 test "a lap time is written the way a lap time is written" {

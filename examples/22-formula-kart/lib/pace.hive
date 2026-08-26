@@ -42,6 +42,16 @@
 // own second driver and they will let you go; get past somebody else's and they
 // will have a wheel ready for you on the next straight.
 //
+// THE STOP. Every bot picks a lap to come in on, rolled off its seat so that the
+// field does not all arrive at the pit entry together and so that the same driver
+// comes in on the same lap every time a given race is run. Coming in changes one
+// thing and one thing only: the point it aims at becomes the middle of the pit
+// lane instead of the racing line. It brakes for the entry with the same
+// arithmetic it brakes for a corner with, is held to the limit by the same
+// `delta` that holds it to a yellow, and steers down the lane with the same pure
+// pursuit. **A pit lane is a piece of road**, and nothing in this file writes a
+// position.
+//
 // MISTAKES. A grid where nobody ever gets it wrong is a procession. Each bot
 // carries a wobble worked out from its seat and the second of the race it is in —
 // so it is the same wobble every time for a given race and can be raced against
@@ -96,18 +106,34 @@ func driving(
 	aim := circuit.wrappedAlong(track, me.along + lookahead(me.speed))
 	node := circuit.nodeAlong(track, aim)
 	mut Float want = node.line
+	toPits := pitting(track, me, seat)
 
-	// 2, 3 and 4: who is in the way, who is behind, and what is lying about.
-	want = want + passing(track, cars, me, green)
-	want = want + defending(track, cars, me, green)
-	want = want + dodging(track, shards, wheels, lead, me, aim)
-	// A bot stays on its own road. It may use every inch of it and no more, which
-	// is the same rule the racing line was relaxed under.
-	room := math.max(0.5, node.half - 1.6)
-	want = math.clamp(want + slip * 1.1, -room, room)
+	// The one thing that is not the racing line. A car on its way through the pit
+	// lane aims at the middle of the *lane* instead, from the moment the lane
+	// appears beside the road until it is back on the circuit — and it does
+	// nothing else differently. It steers with the same pure pursuit, brakes with
+	// the same arithmetic, and is held to the pit limit by the same `delta` that
+	// holds everybody to a yellow. A pit lane is a piece of road, and nothing in
+	// this file writes a position.
+	//
+	// Racing is suspended while it is down there, which is not a special case
+	// either: there is nobody to pass in a pit lane and nobody to defend from, and
+	// a bot that went on covering the inside line would put itself in the wall.
+	if toPits {
+		want = laneAt(track, aim)
+	} else {
+		// 2, 3 and 4: who is in the way, who is behind, and what is lying about.
+		want = want + passing(track, cars, me, green)
+		want = want + defending(track, cars, me, green)
+		want = want + dodging(track, shards, wheels, lead, me, aim)
+		// A bot stays on its own road. It may use every inch of it and no more,
+		// which is the same rule the racing line was relaxed under.
+		room := math.max(0.5, node.half - 1.6)
+		want = math.clamp(want + slip * 1.1, -room, room)
+	}
 
 	// 5. How fast.
-	target := allowed(track, me, one, lead, delta, slip)
+	target := allowed(track, me, one, lead, delta, slip, toPits)
 
 	wheel := steering(track, me, aim, want)
 	return drive.Wants(
@@ -117,6 +143,97 @@ func driving(
 		drifts(track, me, node, wheel, green),
 		spends(track, cars, me, green, clock)
 	)
+}
+
+// ---------------------------------------------------------------------------
+// The stop
+// ---------------------------------------------------------------------------
+
+// Which lap this driver means to come in on.
+//
+// Rolled off the seat, so that the field does not all arrive at the pit entry
+// together and so that the same driver comes in on the same lap every time a
+// given race is run — which is what makes it something to race against rather
+// than something that happens. Never the last lap: a car that left it that late
+// and then got held up would take the flag owing a stop, and losing twenty-five
+// seconds to arithmetic nobody could see is not a strategy, it is a bug.
+func pitsOn(track: circuit.Circuit, seat: Int): Int {
+	if track.laps <= 2 {
+		return 1
+	}
+	return 1 + circuit.hash(seat * 977, 5501) % (track.laps - 1)
+}
+
+// Whether this bot is going through the pit lane right now.
+//
+// **It is a `func` of the car and the track and nothing else.** There is no flag
+// anywhere saying "coming in", and there must not be: a bot that lost that state
+// on one frame would turn across the pit wall halfway down the lane. So the
+// question is asked fresh every frame and answers the same way every frame, which
+// is the same reason `circuit.hive` recomputes a racing line rather than storing
+// where a car meant to go.
+//
+// Already in the lane, and it does not matter whether the stop has been served:
+// a car in a pit lane is committed to the end of it, and a bot that let go of
+// this halfway down would turn across the pit wall to rejoin.
+//
+// Otherwise: the stop is still owed, the lap has come round, and — the condition
+// that is easy to leave out and expensive to leave out — **it is still possible
+// to get in**. The lane has a mouth at each end and a wall between them, and a
+// car past the mouth has missed it this time round. Without that last line every
+// bot in the race turns for the pit lane the moment it starts its chosen lap,
+// discovers it is already two hundred metres past the entry, and drives into the
+// wall it is aiming through. Which is what happened, to all nine of them, on the
+// first lap of the first race after the wall became something you could hit.
+func pitting(track: circuit.Circuit, me: drive.Car, seat: Int): Bool {
+	// Already down there, either way of being down there: past the pit wall, or on
+	// the lane's own tarmac clear of the circuit's — which is a car that has not
+	// reached the wall yet, or one on its way back out past the end of it. There is
+	// no leaving the lane from here except by the end of it, served or not.
+	if circuit.inPits(track, me.along, me.across)
+		|| circuit.downLane(track, me.along, me.across) {
+		return true
+	}
+	if me.sheet.pitted || me.sheet.lap < pitsOn(track, seat) {
+		return false
+	}
+	// Coming up on the entry, and near enough to be slowing for it — which is the
+	// same distance `allowed` brakes over, because they are the same approach.
+	to := circuit.gap(track, track.pits.entry, me.along)
+	if to > 0.0 && to < approach() {
+		return true
+	}
+	// Or in the mouth of it, with the wall not yet closed alongside.
+	return circuit.gap(track, me.along, track.pits.entry) <= circuit.pitMouth(track)
+}
+
+// Where a car on its way in should be, across the road, at a place ahead of it.
+//
+// Down the middle of the lane once there is a lane to be down the middle of — and
+// before that, **over on the lane's side of the road**, which is the half of this
+// that is easy to leave out. The taper is thirty-odd metres long and the lane is
+// twenty metres off the road; a car that arrived at the pit entry on the racing
+// line had to cross the whole of that in a second and a half at the pit limit,
+// which is more than the tyres will do. On some tracks it made it and on others it
+// simply washed past the entry, lap after lap, and never came in at all.
+//
+// It is also what a driver does. Nobody arrives at the pit entry on the racing
+// line.
+func laneAt(track: circuit.Circuit, aim: Float): Float {
+	lane := circuit.pitAcross(track, aim)
+	if lane != 0.0 {
+		return lane
+	}
+	node := circuit.nodeAlong(track, aim)
+	return track.pits.side * math.max(0.5, node.half - 1.2)
+}
+
+// How far before the pit entry a bot starts thinking about it. Comfortably more
+// than the ninety metres it takes to come from the top speed down to the limit,
+// because a car that began braking at exactly the last possible point would need
+// the corner before the pit entry to have gone perfectly.
+func approach(): Float {
+	return 170.0
 }
 
 // The car in a seat. Every read of the field in this file goes through here, for
@@ -131,7 +248,7 @@ func carAt(cars: drive.Car[], seat: Int): drive.Car {
 		return cars[0]
 	}
 	return drive.Car(seat, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0,
-		0.0, 0.0, 0.0, 1.0, 0.0, drive.Token.Nothing(), 0.0, 0.0, 0.0, false,
+		0.0, 0.0, 0.0, 1.0, 0.0, drive.Token.Nothing(), 0.0, 0.0, 0.0, false, 0.0,
 		drive.freshSheet())
 }
 
@@ -189,6 +306,24 @@ func steering(track: circuit.Circuit, me: drive.Car, aim: Float, want: Float): F
 	beside := math.cos(going) * overX - math.sin(going) * overZ
 	// The angle off the nose, positive to the right.
 	off := math.atan2(beside, ahead)
+	// **Pure pursuit has one blind spot, and a car that has just been spun round is
+	// sitting in it.** The method works out the arc through a point ahead; there is
+	// no arc to a point directly *behind*, and the sine that stands in for one goes
+	// to nought as the angle goes to a hundred and eighty degrees. So a car facing
+	// back down the circuit is asked to go straight on — and does, at thirty metres
+	// a second, for the rest of the race. It cost a leader a win in a test before
+	// anybody noticed it could happen at all.
+	//
+	// Where the aim point is behind the nose the answer is not an arc: it is turn
+	// as hard as the car will turn, toward whichever side the road is on. Which is
+	// also what a driver does, and takes no account of speed because there is
+	// nothing to be smooth about — the car is pointing the wrong way.
+	if ahead < 0.0 {
+		if beside < 0.0 {
+			return -1.0
+		}
+		return 1.0
+	}
 	// The arc that gets there, and the rate of turn it takes at this speed.
 	mut Float turn = 2.0 * math.max(6.0, me.speed) * math.sin(off) / reach
 	// What a drift is already contributing, in the same "positive is to the right"
@@ -225,7 +360,8 @@ func allowed(
 	one: grid.Driver,
 	lead: drive.Pace,
 	delta: Float,
-	slip: Float
+	slip: Float,
+	toPits: Bool
 ): Float {
 	team := grid.teamOf(me.seat)
 	// How hard this driver will actually stop. Not the car's limit: a limit nobody
@@ -243,6 +379,20 @@ func allowed(
 		node := circuit.nodeAlong(track, me.along + off)
 		ceiling = math.min(ceiling,
 			math.sqrt(node.pace * node.pace + 2.0 * stopping * off))
+	}
+	// The pit entry, which is braked for exactly the way a corner is because as far
+	// as this is concerned it *is* one: a place ahead with a speed on it, and how
+	// fast you may be here is how fast still lets you arrive there doing that.
+	//
+	// Without it a bot would come down the pit straight flat out, meet the limit at
+	// the moment the wall closed behind it, and spend the length of the lane
+	// collecting speeding penalties for a stop it was obeying.
+	if toPits {
+		off := circuit.gap(track, circuit.pitClosesAt(track), me.along)
+		if off < 300.0 {
+			ceiling = math.min(ceiling,
+				math.sqrt(circuit.pitSpeed() * circuit.pitSpeed() + 2.0 * stopping * off))
+		}
 	}
 	// What this driver and this car make of it. The wobble is what stops the same
 	// corner being taken at exactly the same speed every lap.

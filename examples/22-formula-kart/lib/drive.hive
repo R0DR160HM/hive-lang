@@ -33,6 +33,18 @@
 // what a place is made of and how much grip it holds; grip scales the cornering,
 // the braking and the drive out. There is no separate rule for grass — grass is
 // half the grip, and everything that follows from that follows.
+//
+// AND WHERE THE GROUND STOPS. `walled` is the one call in this file that moves a
+// car the driver did not, and the exception is worth stating rather than hiding:
+// a flag may not slow you down, because a flag is something you are asked to do
+// something about and there has to be something to get wrong — but a wall is not
+// asked. It is where the ground ends. What a hit costs is the speed the car was
+// carrying *into* it and nothing else, which is one sine and is why a brush down
+// the barrier costs almost nothing and arriving square at it costs everything.
+//
+// THE COMPULSORY STOP is written down here too, by `served`, for the same reason
+// track limits and the flags are: race control decides what a rule is, and the
+// only thing in this program that writes one onto a car's sheet is this file.
 
 import ./circuit
 import hive.math
@@ -183,13 +195,17 @@ type Sheet {
 	speeding: Float
 	ignored: Int
 	penalty: Float
+	// Whether the compulsory pass through the pit lane has been served. One
+	// boolean, because the rule is one thing that either has happened or has not —
+	// there is no part credit for most of a pit lane.
+	pitted: Bool
 	finished: Bool
 	finishedAt: Float
 }
 
 func freshSheet(): Sheet {
 	return Sheet(0, 0.0, 0.0, 0.0, 1, 0.0, 0.0,
-		[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 0, 0.0, 0, 0.0, false, 0.0)
+		[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 0, 0.0, 0, 0.0, false, false, 0.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +248,11 @@ type Car {
 	// Whether it was over the line last frame, so that one long excursion is one
 	// warning rather than sixty.
 	adrift: Bool
+	// How long ago it last hit something, counting down. It is on the car rather
+	// than reported out of the collision because a hit is over in one frame and
+	// everything that wants to know about one — the picture, the noise it makes —
+	// is looking at the car some other frame.
+	knock: Float
 	sheet: Sheet
 }
 
@@ -253,6 +274,7 @@ func parked(track: circuit.Circuit, seat: Int): Car {
 		Token.Nothing(),
 		0.0, 0.0, 0.0,
 		false,
+		0.0,
 		freshSheet()
 	)
 }
@@ -487,9 +509,28 @@ func spinFor(): Float {
 	return 1.5
 }
 
-// How wide and how long a car is, for the purposes of bumping into another one.
+// How wide and how long a car is, for the purposes of bumping into another one —
+// and of not being inside a wall.
 func girth(): Float {
 	return 1.05
+}
+
+// How long a car goes on knowing it was hit. A quarter of a second, which is long
+// enough that something drawn sixty times a second and something heard once will
+// both catch it, and short enough that two hits in quick succession are two.
+func knockFor(): Float {
+	return 0.25
+}
+
+// What taking the flag without having been down the pit lane costs.
+//
+// **The one penalty in this race that is not counted in threes.** Track limits
+// and ignored flags are three-and-then-five, because they are things a driver
+// does a bit of and can be forgiven a bit of. A compulsory stop is not: it is one
+// thing, it either happened or it did not, and the penalty has to be larger than
+// the stop it replaced or skipping it would be the quick way round.
+func unserved(): Float {
+	return 25.0
 }
 
 func nose(): Float {
@@ -557,9 +598,10 @@ func stepped(
 	mut Car it = car
 	if it.sheet.finished {
 		// Past the flag: the car rolls to a stop rather than vanishing, because a
-		// car that disappears at the line reads as a crash.
+		// car that disappears at the line reads as a crash. It is still located and
+		// still walled — the race is over for it, not the barrier.
 		it.speed = math.max(0.0, it.speed - 12.0 * dt)
-		return travelled(track, moved(it, dt), dt)
+		return travelled(track, walled(track, located(track, moved(it, dt))), dt)
 	}
 
 	where := circuit.Where(it.node, it.along, it.across)
@@ -579,14 +621,21 @@ func stepped(
 		it.speed = math.max(0.0, it.speed - 26.0 * dt)
 		it.drift = 0.0
 		it.harvest = 0.0
-		return travelled(track, located(track, moved(it, dt)), dt)
+		// Still walled, and still credited with the pit lane if that is where it is
+		// spinning: a stop served sideways is a stop served, and a car denied one
+		// because of where it happened to lose it would be the sort of unfairness
+		// nobody would ever find.
+		it = walled(track, located(track, moved(it, dt)))
+		return travelled(track, served(track, it), dt)
 	}
 
 	it = drifting(it, want, dt)
 	it = steered(it, want, grip, dt)
 	it = driven(track, it, want, ground, grip, machine, dt)
 	it = located(track, moved(it, dt))
+	it = walled(track, it)
 	it = limits(track, it)
+	it = served(track, it)
 	return travelled(track, it, dt)
 }
 
@@ -597,6 +646,7 @@ func timers(car: Car, dt: Float): Car {
 	it.hurt = math.max(0.0, it.hurt - dt)
 	it.spun = math.max(0.0, it.spun - dt)
 	it.fresh = math.max(0.0, it.fresh - dt)
+	it.knock = math.max(0.0, it.knock - dt)
 	if it.deploy <= 0.0 {
 		it.push = 1.0
 	}
@@ -848,6 +898,160 @@ func caught(after: Car, before: Car): Bool {
 		|| after.sheet.penalty > before.sheet.penalty
 }
 
+// A car moved across the road, in the world as well as on the map.
+//
+// **Both, and that is the whole reason it exists.** A car's place in the road's
+// terms is worked out from where it is in the world every single frame — see
+// `located` — so writing `across` on its own writes a number the next frame
+// throws away. That is not a hypothetical: `rammed` and `shoved` below did
+// exactly that, so for as long as they have existed contact between two cars has
+// cost the car behind speed and moved it precisely nowhere. Anything that moves a
+// car sideways has to move the car, and this is the one call that does.
+func nudged(track: circuit.Circuit, car: Car, across: Float): Car {
+	mut Car it = car
+	it.across = across
+	spot := circuit.placed(track, it.along, across)
+	it.x = spot.x
+	it.z = spot.z
+	return it
+}
+
+// ---------------------------------------------------------------------------
+// The walls
+// ---------------------------------------------------------------------------
+
+// A car put back on the right side of whatever it has just driven into.
+//
+// **This is the only thing in this file that moves a car the driver did not.**
+// It is worth saying why that is allowed here and nowhere else, because the rule
+// it looks like it breaks is the rule the whole file is built on. A flag is not
+// allowed to slow you down, because a flag is a thing you are asked to do about
+// and there has to be something to get wrong. A wall is not asked. It is where
+// the ground stops, and a barrier a car drives through is not a barrier — it is a
+// decoration that happens to be shaped like one, which is exactly what these were
+// until now. Everything the driver has any say in has already happened by the
+// time this is called.
+//
+// Two walls, and they are not the same kind of thing. The barrier round the
+// outside has road on one side of it only, so there is one way to be pushed off
+// it. The pit wall has road on *both* sides, so which way a car comes off it
+// depends on which side it arrived from — and that is the whole of the difference
+// in the arithmetic below.
+func walled(track: circuit.Circuit, car: Car): Car {
+	mut Car it = car
+	mut Float side = 1.0
+	if it.across < 0.0 {
+		side = -1.0
+	}
+	mut Float want = it.across
+	// Which way the wall is from the car, in the same terms `across` is measured
+	// in: +1 for a wall further to the right, -1 for one further to the left. It is
+	// carried out of here rather than worked out again in `scraped`, because that
+	// is the one thing the two of them have to agree about — see what it is for.
+	mut Float face = side
+	// The barrier. Never open, both sides, and out beyond the pit lane where there
+	// is one — `circuit.wallAt` is what knows that.
+	edge := circuit.wallAt(track, it.along, side) - girth()
+	if math.abs(want) > edge {
+		want = side * edge
+	}
+	// And the pit wall, where it is closed. `mine` is how far over toward the pit
+	// lane this car is, so that the whole question is one comparison whichever side
+	// of the circuit the pit lane happens to be on.
+	if circuit.pitWalled(track, it.along) {
+		at := circuit.pitWallAt(track, it.along)
+		mine := want * track.pits.side
+		if math.abs(mine - at) < girth() {
+			mut Float clear = at + girth()
+			face = -track.pits.side
+			if mine < at {
+				clear = at - girth()
+				face = track.pits.side
+			}
+			want = clear * track.pits.side
+		}
+	}
+	if want == it.across {
+		return it
+	}
+	return scraped(track, it, want, face)
+}
+
+// What hitting one costs.
+//
+// The speed the car was carrying **into** the wall is taken off it and the rest
+// is left alone, which is one sine and is the whole model: a car that brushes the
+// barrier at a shallow angle keeps nearly everything, and a car that arrives
+// square at it keeps nearly nothing. Anything simpler — a flat fraction of the
+// speed — makes a glancing blow catastrophic and a head-on one survivable, which
+// is precisely backwards and is what a wall must never feel like.
+func scraped(track: circuit.Circuit, car: Car, across: Float, face: Float): Car {
+	mut Car it = nudged(track, car, across)
+	node := circuit.nodeAlong(track, it.along)
+	going := it.yaw + it.slide
+	// How fast the car is going **at** the wall, and nothing is taken for going
+	// away from one. It used to be the size of the sideways velocity whichever way
+	// it pointed, and that is a trap rather than a wall: a car resting against a
+	// barrier is in contact every frame, so a driver steering off it had the speed
+	// of steering off it scrubbed sixty times a second and never left. On one seed
+	// a bot spent nine minutes there and the race could not end.
+	sideways := it.speed * math.sin(circuit.wrapped(node.dir - going))
+	into := math.max(0.0, sideways * face)
+	it.speed = math.max(0.0, it.speed - into * 0.9)
+	// Turned to face along the wall, part of the way — because a car left pointing
+	// into a barrier grinds down it for the rest of the lap. Along it in the
+	// direction it was already going: a car that arrives backwards leaves
+	// backwards, and is not spun round to face the way the road goes.
+	mut Float wall = node.dir
+	if math.abs(circuit.wrapped(node.dir - it.yaw)) > math.pi() / 2.0 {
+		wall = node.dir + math.pi()
+	}
+	// **As hard as it was hit, and no harder.** A fixed fraction every frame reads
+	// fine on the one frame a car arrives at the barrier and is a trap on all the
+	// ones after it: a car merely leaning on the wall is in contact sixty times a
+	// second, and thirty-five per cent of the way to the wall's heading sixty times
+	// a second is a car welded to it — one that spun near a barrier could never
+	// turn round again, because the wall straightened it out faster than it could
+	// steer. Scaling by the blow costs nothing on a real one and lets go of a car
+	// that is only resting against it.
+	it.yaw = it.yaw + circuit.wrapped(wall - it.yaw)
+		* 0.35 * math.clamp(into / 12.0, 0.0, 1.0)
+	it.slide = it.slide * 0.4
+	// Whatever was being harvested is not being harvested any more. A drift that
+	// ends in the wall is a drift that did not come off.
+	it.drift = 0.0
+	it.harvest = 0.0
+	// A knock is something that happened. Leaning on the barrier is not one, so it
+	// is not reported as one — otherwise a car parked against a wall would go on
+	// announcing an impact for as long as it stood there.
+	if into > 1.0 {
+		it.knock = knockFor()
+	}
+	// And a big enough one turns the car round, the same way a big enough shunt
+	// from another car does.
+	if into > 17.0 {
+		return spinning(it)
+	}
+	return it
+}
+
+// Whether this car has served its compulsory pass through the pit lane, asked once
+// a frame at wherever it is.
+//
+// It is the same shape as `limits` and `policed` above, and it is here for the
+// same reason they are: race control decides what a rule *is*, and the only thing
+// in this program that writes one down on a car's sheet is this file.
+func served(track: circuit.Circuit, car: Car): Car {
+	mut Car it = car
+	if it.sheet.pitted {
+		return it
+	}
+	if circuit.inPits(track, it.along, it.across) {
+		it.sheet.pitted = true
+	}
+	return it
+}
+
 // Track limits, asked exactly the way the rule is written. One excursion is one
 // warning however long it lasts, which is what `adrift` is for; three of them is
 // five seconds, and the count starts again.
@@ -1023,10 +1227,10 @@ func touching(track: circuit.Circuit, one: Car, other: Car): Bool {
 // What contact does to the car that was behind. It loses more than the car in
 // front does — a nose into a diffuser costs the nose — and if it arrived fast
 // enough it loses the back end as well.
-func rammed(car: Car, closing: Float, side: Float): Car {
-	mut Car it = car
+func rammed(track: circuit.Circuit, car: Car, closing: Float, side: Float): Car {
+	mut Car it = nudged(track, car, car.across + side * 0.55)
 	it.speed = it.speed * 0.86
-	it.across = it.across + side * 0.55
+	it.knock = knockFor()
 	if closing > 11.0 {
 		return spinning(it)
 	}
@@ -1036,10 +1240,10 @@ func rammed(car: Car, closing: Float, side: Float): Car {
 
 // And to the car that was in front, which is knocked along and sideways and keeps
 // most of what it had.
-func shoved(car: Car, closing: Float, side: Float): Car {
-	mut Car it = car
+func shoved(track: circuit.Circuit, car: Car, closing: Float, side: Float): Car {
+	mut Car it = nudged(track, car, car.across + side * 0.55)
 	it.speed = it.speed * 0.95
-	it.across = it.across + side * 0.55
+	it.knock = knockFor()
 	if closing > 15.0 {
 		return spinning(it)
 	}

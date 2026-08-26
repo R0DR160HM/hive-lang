@@ -44,10 +44,23 @@
 // the *timing* screen's idea of where you are; they are no longer the flags', and
 // keeping those two apart is most of what this file gained.
 //
+// **THE COMPULSORY STOP** is the one rule here that is not counted in threes.
+// Track limits and ignored flags are three-and-then-five seconds, because they are
+// things a driver does a bit of and can be forgiven a bit of. A pass through the
+// pit lane is not: it either happened or it did not, and the penalty for taking
+// the flag without it is larger than the stop it replaced — otherwise skipping it
+// would simply be the quick way round.
+//
+// It is policed by `deltaFor` rather than by anything new. The pit limit is a
+// delta like a yellow's, on the same stewards' clock, with the same leeway — the
+// only difference is that it is asked of a **place** rather than of a distance
+// round the lap, because a car in the lane and a car a few metres away on the
+// other side of the pit wall are held to two different numbers.
+//
 // WHAT THE STRIP SAYS is the same set of messages a real one carries, and each is
 // written at the moment the thing happened rather than worked out later by
 // something scanning the state: purple and green sectors, track limits, a car in
-// the gravel, the safety car in and out, and the flag.
+// the gravel, the safety car in and out, the stop nobody served, and the flag.
 
 import ./circuit
 import ./drive
@@ -300,7 +313,8 @@ func walked(race: Race, asked: Asking[], dt: Float): Race {
 		mut drive.Wants want = asking(asked, car.seat)
 		if atWheel(asked, car.seat) == false {
 			want = pace.driving(race.track, race.cars, race.shards, race.wheels,
-				race.pace, car.seat, deltaAt(race, car.along), green(race), race.clock)
+				race.pace, car.seat, deltaFor(race, car.along, car.across),
+				green(race), race.clock)
 		}
 		// What the token did, if it was spent and if it was one that puts something
 		// on the road. The car's own two — the wing and the tyres — are the car's
@@ -346,6 +360,25 @@ func deltaAt(race: Race, along: Float): Float {
 		}
 	}
 	return 0.0
+}
+
+// The fastest a car at this **place** is being asked to be.
+//
+// A place is two numbers everywhere else in this program, and it has to be two
+// here as well: the pit lane's limit applies to whoever is in the lane and to
+// nobody a metre the other side of its wall, and `deltaAt` above — which knows
+// only how far round the lap something is — cannot tell those two apart. So the
+// flags keep the one-number question, because a flag really is a stretch of road
+// and that is what the map draws, and everything that judges a *car* asks this.
+//
+// The lane's limit is not a flag and does not behave like one. A green flag does
+// not lift it, a safety car does not raise it, and it is the lowest number
+// anywhere on the circuit — so it is asked first and answered outright.
+func deltaFor(race: Race, along: Float, across: Float): Float {
+	if circuit.inPits(race.track, along, across) {
+		return circuit.pitSpeed()
+	}
+	return deltaAt(race, along)
 }
 
 // Whether a place on the road is inside a zone. Signed the short way round,
@@ -414,9 +447,9 @@ func bumped(race: Race): Race {
 			closing := math.abs(car.speed - other.speed)
 			gap := circuit.nearGap(race.track, other.along, car.along)
 			if gap > 0.0 {
-				one = drive.rammed(one, closing, side)
+				one = drive.rammed(race.track, one, closing, side)
 			} else {
-				one = drive.shoved(one, closing, side)
+				one = drive.shoved(race.track, one, closing, side)
 			}
 		}
 		append(next, one)
@@ -721,16 +754,25 @@ func policing(race: Race, dt: Float): Race {
 	mut Race it = race
 	mut drive.Car[dyn] cars = []
 	for each car in race.cars {
-		delta := deltaAt(it, car.along)
+		delta := deltaFor(it, car.along, car.across)
 		mut drive.Car one = drive.policed(car, delta > 0.0 && car.speed > delta, dt)
 		if drive.caught(one, car) {
-			it = said(it, "{grid.driverOf(one.seat).tag} — SPEEDING UNDER YELLOW"
+			it = said(it, "{grid.driverOf(one.seat).tag} — {overFor(it, car)}"
 				+ costOf(one, car), Kind.Warn())
 		}
 		append(cars, one)
 	}
 	it.cars = cars
 	return it
+}
+
+// Which limit it was. The strip has always said what somebody was caught doing
+// rather than that they were caught, and there are two things to be caught at now.
+func overFor(race: Race, car: drive.Car): Str {
+	if circuit.inPits(race.track, car.along, car.across) {
+		return "SPEEDING IN THE PIT LANE"
+	}
+	return "SPEEDING UNDER YELLOW"
 }
 
 // What that one cost, said out loud only when it cost something. Two of these are
@@ -892,9 +934,20 @@ func timed(race: Race, before: Race): Race {
 					// sport, and one applied twice would be a different result.
 					one.sheet.lap = race.track.laps
 					one.sheet.finished = true
+					if one.sheet.pitted == false {
+						one.sheet.penalty = one.sheet.penalty + drive.unserved()
+						it = said(it, "{grid.driverOf(one.seat).tag} — PIT STOP NOT"
+							+ " SERVED, +{conv.round(drive.unserved())}s", Kind.Warn())
+					}
 					one.sheet.finishedAt = race.clock + one.sheet.penalty
 					it = chequered(it, one.seat, taken == false)
 					taken = true
+				} else if one.sheet.lap == race.track.laps && one.sheet.pitted == false {
+					// Onto the last lap with the stop still owed. It is said here, at
+					// the only moment saying it is any use — a driver who finds out at
+					// the flag finds out too late to do anything but read it.
+					it = said(it, "{grid.driverOf(one.seat).tag} — LAST LAP, PIT STOP"
+						+ " NOT SERVED", Kind.Warn())
 				}
 			}
 		}
@@ -1028,7 +1081,7 @@ func find(cars: drive.Car[], seat: Int): drive.Car {
 		return cars[0]
 	}
 	return drive.Car(seat, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0,
-		0.0, 0.0, 0.0, 1.0, 0.0, drive.Token.Nothing(), 0.0, 0.0, 0.0, false,
+		0.0, 0.0, 0.0, 1.0, 0.0, drive.Token.Nothing(), 0.0, 0.0, 0.0, false, 0.0,
 		drive.freshSheet())
 }
 
@@ -1066,6 +1119,68 @@ func roundSeat(seats: Int[], at: Int): Int {
 		return seats[at]
 	}
 	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Watching somebody else
+// ---------------------------------------------------------------------------
+
+// Whether a seat is still racing: out there, and not yet past the flag.
+func running(race: Race, seat: Int): Bool {
+	return find(race.cars, seat).sheet.finished == false
+}
+
+// Who a driver whose own race has ended should be looking at.
+//
+// **It is here, with the order, rather than in the window** — because it is a
+// question about the standings and not about a camera. "The next car along" while
+// watching a race means the one ahead on the road, and the road's order is this
+// file's to answer. What the window does with the answer is put an eye behind it,
+// and that is all it knows about any of this.
+//
+// `wanted` is whoever was being watched, which may be nobody yet or may be
+// somebody who has since taken the flag themselves. Either way the answer falls
+// to whoever leads of those still out there — so nothing has to be initialised
+// when a car crosses the line, and nothing has to be cleared when the car being
+// watched crosses it either.
+func following(race: Race, seat: Int, wanted: Int): Int {
+	if wanted != seat && running(race, wanted) {
+		return wanted
+	}
+	for each other in order(race) {
+		if running(race, other) {
+			return other
+		}
+	}
+	return seat
+}
+
+// The next car along from this one: `on` is +1 for the car behind and -1 for the
+// car in front.
+//
+// Stepped through the order rather than through the seat numbers, and anybody
+// already parked is stepped past — a camera pointed at a stationary car is not
+// watching a race. If nobody at all is still running it answers with what it was
+// given, which is the only honest answer there is.
+func turned(race: Race, from: Int, on: Int): Int {
+	standings := order(race)
+	count := len(standings)
+	if count == 0 {
+		return from
+	}
+	mut Int at = 0
+	for i := 0; i < len(standings); i++ {
+		if standings[i] == from {
+			at = i
+		}
+	}
+	for step := 1; step <= count; step++ {
+		to := roundSeat(standings, ((at + on * step) % count + count) % count)
+		if running(race, to) {
+			return to
+		}
+	}
+	return from
 }
 
 // ---------------------------------------------------------------------------

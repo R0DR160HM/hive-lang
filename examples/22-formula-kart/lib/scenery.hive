@@ -33,11 +33,23 @@
 // same trees in the same places, which matters more than it sounds: "he went off
 // at the stand" is a sentence that has to mean something to both of them.
 //
-// NOTHING HERE IS IN THE WAY. Every prop stands past the barrier line, and the
-// barrier line stands past the run-off, so nothing in this file can be hit and
-// nothing in it is asked about by the physics. It is the one part of the program
-// that is purely a picture, which is also why it lives only in the client — the
-// server has no use for a tree.
+// NOTHING HERE IS IN THE WAY — **and the barrier is no longer here**.
+//
+// Every prop stands past the barrier line and the barrier line stands past the
+// run-off, so nothing in this file can be hit and nothing in it is asked about by
+// the physics. That was once true of the barrier as well, and it is what made the
+// barrier a decoration shaped like a wall: a car drove through it into a field
+// and kept going.
+//
+// Now `circuit.wallAt` says where the ground stops, `drive.walled` puts cars back
+// on the right side of it, and this file *draws what that says* — the same
+// number, read rather than chosen. It is the rule the road itself follows and it
+// is the only way a wall you can see and a wall you can hit stay the same wall.
+// The pit wall is the same bargain: `circuit.pitWalled` decides where it stands
+// and where its two openings are, and the boxes below go where it is.
+//
+// Everything else in here is still purely a picture, which is why the file lives
+// only in the client — the server has no use for a tree.
 
 import ./circuit
 import ./grid
@@ -115,8 +127,13 @@ func mown(): Float {
 	return 30.0
 }
 
+// Where the barrier is. **Read from `circuit.hive` rather than decided here**,
+// which is the whole point of it still being a function: this file draws the
+// wall and `drive.hive` bounces cars off it, and a picture of a barrier that was
+// not the barrier would be the one kind of wrong nobody can see. Everything else
+// in this file is measured from it, which is why it stays.
 func barrierOff(): Float {
-	return 12.5
+	return circuit.wallOff()
 }
 
 func treesFrom(): Float {
@@ -140,16 +157,19 @@ func treesTo(): Float {
 func verge(track: circuit.Circuit, at: Int): ui.Shape[dyn] {
 	mut ui.Shape[dyn] shapes = []
 	node := circuit.nodeAt(track, at)
-	long := reaching(track, node, node.half + barrierOff())
 	fast := math.abs(node.bend) > 0.006
 
 	for each side in [-1.0, 1.0] {
-		off := (node.half + barrierOff()) * side
-		// The pit lane takes the place of the barrier on its own side, because the
-		// lane is on the other side of where the barrier would be.
-		if pitSide(track, node.along, side) {
-			continue
-		}
+		// Where the ground stops on this side, asked of the road rather than worked
+		// out here. Along the pit stretch that is a good deal further out on one
+		// side than the other — the barrier goes round the *outside* of the lane,
+		// because the lane is a place a car is meant to be.
+		//
+		// It used to be skipped on the pit side entirely, which was right when
+		// nothing could be hit and is a hole in the wall now that something can.
+		out := circuit.wallAt(track, node.along, side)
+		off := out * side
+		long := reaching(track, node, out)
 		// The barrier. Concrete, waist high, and unbroken all the way round — which
 		// is what a circuit looks like and, more to the point, is a continuous
 		// horizontal line at a known height that the eye reads speed off.
@@ -217,13 +237,6 @@ func reaching(track: circuit.Circuit, node: circuit.Node, off: Float): Float {
 	return circuit.spacing(track) * fan * 1.08
 }
 
-// Whether the pit lane runs down this side of the road at this distance. The one
-// question the barrier has to ask, because the lane and the barrier want the same
-// piece of ground.
-func pitSide(track: circuit.Circuit, along: Float, side: Float): Bool {
-	return circuit.alongPits(track, along) && track.pits.side == side
-}
-
 // The pit lane at one node: the tarmac, the wall between it and the road, and the
 // white line down the middle of it. Nothing where the lane does not run.
 func pitLane(track: circuit.Circuit, at: Int): ui.Shape[dyn] {
@@ -250,19 +263,29 @@ func pitLane(track: circuit.Circuit, at: Int): ui.Shape[dyn] {
 		],
 		pits.half * 2.0, 0.54, long
 	))
-	// The wall between the lane and the circuit, which is the one thing in a pit
-	// lane everybody can picture.
-	wall := lane - pits.side * (pits.half + 1.1)
-	append(shapes, ui.box(
-		[
-			ui.at(node.x + math.cos(node.dir) * wall, node.y + 0.62,
-				node.z - math.sin(node.dir) * wall),
-			ui.turn(0.0, node.dir, 0.0),
-			ui.paint(ui.Tone.HEX("#e6eaee")),
-			ui.surface(ui.Surface.Concrete())
-		],
-		0.6, 1.25, long
-	))
+	// The wall between the lane and the circuit — the one wall on a circuit with a
+	// road on both sides of it, and the only one with a gap in it.
+	//
+	// Where it stands and where it stops are both the road's answer now, not this
+	// file's. It used to be drawn a fixed distance inside the *lane*, and since the
+	// lane tapers toward the road at each end so did the wall: at the node after
+	// the pit entry it stood two metres past the middle of the road, on the far
+	// side of it, straight across the racing line. Nothing could hit it, so nobody
+	// ever saw it. The two gaps are the pit entry and the pit exit, which is what a
+	// pit lane is.
+	if circuit.pitWalled(track, node.along) {
+		wall := pits.side * circuit.pitWallAt(track, node.along)
+		append(shapes, ui.box(
+			[
+				ui.at(node.x + math.cos(node.dir) * wall, node.y + 0.62,
+					node.z - math.sin(node.dir) * wall),
+				ui.turn(0.0, node.dir, 0.0),
+				ui.paint(ui.Tone.HEX("#e6eaee")),
+				ui.surface(ui.Surface.Concrete())
+			],
+			0.6, 1.25, reaching(track, node, math.abs(wall))
+		))
+	}
 	// A box marked out for each team, on the garage side of the lane, every few
 	// nodes. How many there are is `grid.teams()` counted rather than a number
 	// somebody typed — a sixth team gets a sixth box and nothing else changes.
