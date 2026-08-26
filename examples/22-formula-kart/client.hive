@@ -24,7 +24,32 @@
 // hold it through a corner and the car steps sideways and harvests; let go and it
 // deploys what it harvested. Three levels, and the third is worth going a long way
 // round a corner for. `E` spends whatever you picked up. `C` changes the camera,
-// `Tab` shows the standings.
+// `Tab` shows the standings — and alone, the standings carry a button that starts
+// another race on another circuit, because the thing you want when a race has gone
+// wrong is on the screen you are already looking at when you decide that.
+//
+// **ONE STOP, AND THE WALLS ARE REAL.** Five laps, and somewhere in them you have
+// to go down the pit lane once: the pit board says PIT until you have, red on the
+// last lap, and taking the flag still owing it is twenty-five seconds. The lane
+// has a limit and the limit is policed by the same stewards' clock a yellow is.
+// The barrier is no longer scenery either — hit it square and you will stop, brush
+// it and you will hardly notice, which is one line of arithmetic and the whole
+// difference between a wall and a wall-shaped picture.
+//
+// **AFTER YOUR FLAG, THE RACE GOES ON.** Take the chequered flag with cars still
+// out there and the camera stays in the race: left and right turn to the car in
+// front or behind, and every instrument on the screen — the map, the dial, the
+// pit board, the flag — is about whoever you are watching. That is one function,
+// `shown`, and nothing downstream of it knows there is such a thing as watching
+// somebody else.
+//
+// **IT MAKES A NOISE.** Every car has an engine that climbs and drops through six
+// gears, the tyres complain when they are asked to, the barrier is audible when
+// you find it, there is a crowd in each grandstand and a bed under all of it. It
+// is synthesised rather than sampled — nothing is downloaded and a built program
+// is still one file — and it is *declared* rather than played: `heard` below says
+// what can be heard right now, sixty times a second, and the window works out
+// which voices that means starting, bending and stopping. See `ui.sound`.
 //
 // **A CONTROLLER WORKS**, and getting there took a fix in two places.
 //
@@ -225,6 +250,10 @@ type Model {
 	spend: Bool
 	view: Seat
 	board: Bool
+	// Which car is being watched once your own has taken the flag. It is only ever
+	// read through `shown` below, which corrects it — so there is nothing to
+	// initialise and nothing to reset between races.
+	watching: Int
 	// How long since anything was said to the server. The controls go out thirty
 	// times a second rather than sixty — twice as often as they could usefully be
 	// acted on is already generous.
@@ -260,6 +289,9 @@ type Msg {
 	Heard { down: wire.Down }
 	Lost { why: Str }
 	Again
+	Restart
+	// Turn to the car in front or the car behind, while watching.
+	Turn { on: Int }
 }
 
 func start(seed: Int, server: Str): Model {
@@ -283,6 +315,7 @@ func start(seed: Int, server: Str): Model {
 		false,
 		Seat.Chase(),
 		false,
+		0,
 		0.0,
 		0.0,
 		0.0, 0.0, 0.0, 0.0
@@ -371,7 +404,41 @@ proc update(model: Model, msg: Msg, from: hive.syslink.Envelope): Model {
 	if msg is Msg.Again {
 		return again(model)
 	}
+	if msg is Msg.Restart {
+		return restarted(model)
+	}
+	if msg is Msg.Turn(on) {
+		return turning(model, on)
+	}
 	return next
+}
+
+// Straight into another race, on another circuit, without going back through the
+// lobby.
+//
+// It is `again` with the lobby left out, and the difference between them is the
+// whole reason there are two: `again` is what you press when a race has *ended*
+// and you might want a different car, and this is what you press when the one you
+// are in has gone wrong and you would like to start it over. Which is why this
+// one is on the standings — the screen you already open mid-race — and that one
+// is on the classification.
+//
+// **Alone only.** A race on a server belongs to everybody in it, and a button on
+// one person's timing screen that rolled a fresh circuit for all of them would be
+// a button nobody could safely press.
+func restarted(model: Model): Model {
+	if model.link is Link.Live(_) {
+		return model
+	}
+	mut Model fresh = start(circuit.hash(model.seed, 7717), model.server)
+	fresh.me = model.me
+	fresh.team = model.team
+	fresh.bind = model.bind
+	fresh.view = model.view
+	fresh.screen = Screen.Racing()
+	fresh.link = Link.Alone()
+	fresh.seat = seatOf(model.team)
+	return fresh
 }
 
 // Another circuit. Alone it is rolled here; joined it is the server's to roll, so
@@ -531,6 +598,16 @@ func pressed(model: Model, key: Str): Model {
 	if key == "e" {
 		next.spend = true
 		return next
+	}
+	// The two that steer while you are driving turn the camera once you are not.
+	// They are not bound to anything else at that moment — a car past the flag
+	// takes no input at all, see `drive.stepped` — so there is no mode here and
+	// nothing to switch: the same keys mean the nearest thing they can.
+	if spectating(model) && (key == "left" || key == "a") {
+		return turning(model, -1)
+	}
+	if spectating(model) && (key == "right" || key == "d") {
+		return turning(model, 1)
 	}
 	if down(model, key) == false {
 		append(next.held, key)
@@ -722,6 +799,63 @@ proc leaving(model: Model): Model {
 }
 
 // ---------------------------------------------------------------------------
+// Watching, once you have finished
+// ---------------------------------------------------------------------------
+
+// Whether the person at the controls is watching rather than driving: their own
+// car has taken the flag and the race has not finished behind them.
+//
+// It is the one moment in the program when the instruments are about a car nobody
+// here is steering — and it is a moment that used to be four minutes of looking
+// at your own car parked on the grass while nine others raced somewhere you could
+// not see.
+func spectating(model: Model): Bool {
+	if racing(model) == false {
+		return false
+	}
+	me := control.find(model.race.cars, model.seat)
+	return me.sheet.finished && model.race.over == false
+}
+
+func racing(model: Model): Bool {
+	if model.screen is Screen.Racing {
+		return true
+	}
+	return false
+}
+
+// Which car the picture, the camera and every instrument are about.
+//
+// **One function, and everything downstream reads it instead of `model.seat`.**
+// That is the whole of what keeps watching from being a second copy of the HUD:
+// the map, the dial, the pit board and the chase camera have no idea there is
+// such a thing as watching somebody else — they draw the seat they are handed.
+// What still reads `model.seat` is exactly the two things that are about *you*
+// rather than about a car: what gets sent to the server, and what a wheel turns.
+//
+// Who that is, when it is not you, is `control.hive`'s answer rather than this
+// file's — it is a question about the running order, and this file has no
+// opinions about running orders.
+func shown(model: Model): Int {
+	if spectating(model) == false {
+		return model.seat
+	}
+	return control.following(model.race, model.seat, model.watching)
+}
+
+// Turn to the next car along, `on` being +1 for the one behind and -1 for the one
+// in front. Nothing to remember and nothing to bound: `shown` corrects whatever
+// is written here on the way out.
+func turning(model: Model, on: Int): Model {
+	mut Model next = model
+	if spectating(model) == false {
+		return next
+	}
+	next.watching = control.turned(model.race, shown(model), on)
+	return next
+}
+
+// ---------------------------------------------------------------------------
 // The camera
 // ---------------------------------------------------------------------------
 
@@ -732,7 +866,7 @@ proc leaving(model: Model): Model {
 // trying to see.
 func watched(model: Model, dt: Float): Model {
 	mut Model next = model
-	me := control.find(model.race.cars, model.seat)
+	me := control.find(model.race.cars, shown(model))
 	track := model.race.track
 	ground := circuit.heightAt(track, circuit.Where(me.node, me.along, me.across))
 	// Behind where the car is *pointing*, not where it is going — so a drift shows
@@ -778,7 +912,7 @@ func pitchOf(model: Model): Float {
 func world(model: Model): ui.Shape[dyn] {
 	race := model.race
 	track := race.track
-	me := control.find(race.cars, model.seat)
+	me := control.find(race.cars, shown(model))
 	mut ui.Shape[dyn] shapes = []
 
 	// The ground everything else stands on, one plane, moved to wherever the camera
@@ -890,7 +1024,212 @@ func world(model: Model): ui.Shape[dyn] {
 			}
 		}
 	}
+	// And what all of it sounds like, which goes in the same list because it is the
+	// same kind of thing: something in the world, at a place in it.
+	for each voice in heard(model) {
+		append(shapes, voice)
+	}
 	return shapes
+}
+
+// ---------------------------------------------------------------------------
+// What it sounds like
+// ---------------------------------------------------------------------------
+
+// Every noise the world is making, as shapes, in the frame the picture goes in.
+//
+// **A sound is declared, not played.** There is no "start the engine" anywhere in
+// this program, no list of what is currently making a noise, and nothing holding
+// an oscillator: this `func` is asked what can be heard *right now*, sixty times
+// a second, and the window works out for itself which voices that means starting,
+// which it means bending and which it means stopping. It is exactly the bargain
+// the picture makes — say what is true and let the renderer diff it — and it buys
+// exactly the same thing, which is that nothing in here can leak a running voice
+// or forget to stop one, because nothing in here owns one.
+//
+// The only thing a name has to be is **stable**. A car's engine is "car-3" for as
+// long as that car is within earshot, and that is the whole of what makes it one
+// engine changing pitch rather than sixty engines a second.
+//
+// The other half of it is that a name arriving is an event. There is no way in a
+// world of values to say "a crash just happened" — a value describes what *is* —
+// so the two struck voices say it by being there: "hit-3" is in the frame for the
+// quarter of a second a car goes on knowing it was hit, it makes its noise when
+// the name turns up, and it is deaf until the name has gone and come back.
+func heard(model: Model): ui.Shape[dyn] {
+	mut ui.Shape[dyn] out = []
+	race := model.race
+	track := race.track
+	me := control.find(race.cars, shown(model))
+
+	// The bed. It is not in the world — it has no place, it is never panned, and
+	// it is the one voice here you are not meant to notice.
+	append(out, sound("music", ui.Voice.Music(),
+		model.eyeX, model.eyeY, model.eyeZ, 1.0, musicAt(model)))
+
+	if racing(model) == false {
+		// In the lobby the grid is sitting there idling, which is what a pit lane
+		// sounds like before a race and is half of why one is worth looking at.
+		for each car in race.cars {
+			append(out, sound("car-{car.seat}", ui.Voice.Engine(),
+				car.x, earOf(track, car), car.z, 0.72, 0.26))
+		}
+		return out
+	}
+
+	// The lights, one chime each as they come on, and then the moment they go out.
+	if race.lights > 0.0 {
+		lit := 5 - conv.floor(race.lights / control.countdown() * 5.0)
+		if lit > 0 {
+			append(out, sound("light-{lit}", ui.Voice.Chime(),
+				model.eyeX, model.eyeY, model.eyeZ, 0.62, 0.45))
+		}
+	} else if race.clock < 0.8 {
+		append(out, sound("away", ui.Voice.Chime(),
+			model.eyeX, model.eyeY, model.eyeZ, 1.5, 0.5))
+	}
+	// And one for your own flag, which arrives once and stays in the frame — so it
+	// sounds once and never again, which is what taking a chequered flag is.
+	if control.find(race.cars, model.seat).sheet.finished {
+		append(out, sound("chequered", ui.Voice.Chime(),
+			model.eyeX, model.eyeY, model.eyeZ, 1.12, 0.45))
+	}
+
+	// The air. It is the one thing you hear that is nobody's engine, and it is most
+	// of what makes a speed feel like a speed.
+	append(out, sound("wind", ui.Voice.Wind(), me.x, earOf(track, me), me.z,
+		0.5 + me.speed / 40.0, math.min(0.30, me.speed / 200.0)))
+
+	// The brakes, and they are the one voice that comes from the controls rather
+	// than from the world. Nothing in a `drive.Car` records what the pedal was
+	// doing — a car is a state of motion, and the input that produced it is gone by
+	// the time anything draws it — so this is the car you are *in*, using what you
+	// asked of it, and it says nothing about the other nine. What they are doing
+	// under braking you hear through their tyres instead.
+	if spectating(model) == false {
+		want := asking(model)
+		if want.brake > 0.25 && me.speed > 8.0 {
+			append(out, sound("brakes", ui.Voice.Brakes(),
+				me.x, earOf(track, me), me.z, 0.7 + me.speed / 110.0,
+				want.brake * math.min(0.42, me.speed / 70.0)))
+		}
+	}
+
+	// Every car within earshot, which is the same `near` the picture draws by:
+	// something too far away to see is something there is no reason to have in the
+	// frame at all, and a lap's worth of engines nobody can hear is forty voices.
+	for each car in race.cars {
+		if near(track, car.along, me.along) == false {
+			continue
+		}
+		y := earOf(track, car)
+		append(out, sound("car-{car.seat}", ui.Voice.Engine(), car.x, y, car.z,
+			revsOf(car), 0.30 + math.min(0.26, car.speed / 260.0)))
+		scrub := scrubbing(track, car)
+		if scrub > 0.03 {
+			append(out, sound("grip-{car.seat}", ui.Voice.Tyres(), car.x, y, car.z,
+				0.55 + car.speed / 95.0, scrub * 0.45))
+		}
+		if car.knock > 0.0 {
+			append(out, sound("hit-{car.seat}", ui.Voice.Impact(), car.x, y, car.z,
+				0.75 + car.speed / 130.0, 0.8))
+		}
+	}
+
+	// The grandstands. One voice each, standing where the stand stands — so a lap
+	// has places in it that are loud and places that are not, which is what a
+	// circuit sounds like from inside a car and is the one thing no single looping
+	// ambience can do.
+	for i := 0; i < len(model.props); i++ {
+		if model.props bounds i {
+			prop := model.props[i]
+			if standing(prop) && near(track, prop.along, me.along) {
+				append(out, sound("crowd-{i}", ui.Voice.Crowd(),
+					prop.x, prop.y + 4.5, prop.z, 1.0, 0.5))
+			}
+		}
+	}
+	return out
+}
+
+// One sound in the world. A `func` like every other shape-maker in this file, and
+// worth noticing that it is exactly as much of a value as the boxes are: sixty of
+// these are built a second and thrown away, while the voice on the other end of
+// the name goes on running the whole time.
+func sound(name: Str, voice: ui.Voice, x: Float, y: Float, z: Float,
+	pitch: Float, loud: Float): ui.Shape {
+	return ui.sound([
+		ui.at(x, y, z),
+		ui.voice(voice),
+		ui.pitch(pitch),
+		ui.volume(loud)
+	], name)
+}
+
+// Roughly where a car's noise comes from: the ground under it, plus about as high
+// as an airbox.
+func earOf(track: circuit.Circuit, car: drive.Car): Float {
+	return circuit.heightAt(track, circuit.Where(car.node, car.along, car.across)) + 0.6
+}
+
+// What note an engine is making, as a multiple of its note at rest.
+//
+// **Not a straight function of speed.** A pitch that rose smoothly from a
+// standstill to two hundred and sixty an hour is a siren, and the thing that makes
+// an engine sound like an engine is that it climbs, drops, and climbs again. So
+// the speed is cut into six gears and the note is how far up one it has got, plus
+// a little for which one that is: six ramps rather than one long one, and the drop
+// between them is the change you hear.
+func revsOf(car: drive.Car): Float {
+	gears := 6.0
+	step := drive.top() / gears
+	at := math.clamp(conv.itf(conv.floor(car.speed / step)), 0.0, gears - 1.0)
+	part := math.clamp((car.speed - at * step) / step, 0.0, 1.0)
+	// Deploying is a change of note as well as of speed, which is what makes the
+	// overtake audible from the car in front.
+	mut Float extra = 0.0
+	if car.deploy > 0.0 {
+		extra = 0.18
+	}
+	return 0.70 + at * 0.15 + part * 1.35 + extra
+}
+
+// How hard the tyres are working, nought to one: how far off its nose the car is
+// travelling, plus whatever it is travelling *over*. Grass and gravel are as much
+// of a noise as a slide is, and a car that had gone off and made no sound at all
+// doing it would be the one thing on this circuit you could miss.
+func scrubbing(track: circuit.Circuit, car: drive.Car): Float {
+	ground := circuit.under(track, circuit.Where(car.node, car.along, car.across))
+	much := math.abs(car.slide) * 1.7 + math.abs(car.drift) * 0.30 + rumble(ground)
+	return math.clamp(much * math.min(1.0, car.speed / 16.0), 0.0, 1.0)
+}
+
+// What the ground under a car is worth as a noise, read off the same four surfaces
+// `circuit.hold` and `circuit.drag` answer for.
+func rumble(ground: circuit.Ground): Float {
+	if ground is circuit.Ground.Tarmac { return 0.0 }
+	else if ground is circuit.Ground.Kerb { return 0.30 }
+	else if ground is circuit.Ground.Gravel { return 0.85 }
+	else if ground is circuit.Ground.Grass { return 0.55 }
+}
+
+func standing(prop: scenery.Prop): Bool {
+	if prop.kind is scenery.Kind.Stand {
+		return true
+	}
+	return false
+}
+
+// How loud the bed is: under everything while there is a race to listen to, and up
+// a little where there is not.
+func musicAt(model: Model): Float {
+	if racing(model) == false {
+		return 0.30
+	}
+	if model.race.over {
+		return 0.28
+	}
+	return 0.14
 }
 
 // What a marshal standing at a place is showing.
@@ -1296,9 +1635,9 @@ func bodywork(track: circuit.Circuit, car: drive.Car, model: Model): ui.Shape[dy
 			"!"
 		))
 	}
-	// The name, but not your own — you know who you are, and a label in the middle
-	// of the screen is a label in the way.
-	if car.seat != model.seat {
+	// The name, but not over the car the camera is behind — you know which one that
+	// is, and a label in the middle of the screen is a label in the way.
+	if car.seat != shown(model) {
 		append(shapes, ui.label(
 			[ui.at(car.x, base + 1.7, car.z), ui.paint(ui.Tone.HEX(team.body))],
 			"{one.tag}"
@@ -1347,11 +1686,11 @@ func view(model: Model): ui.View {
 		return ui.column([ui.height(0), ui.grow(1)], [
 			picture(model),
 			ui.overlay([ui.align(ui.Align.Start()), ui.justify(ui.Justify.Start())],
-				board.map(model.race, model.seat)),
+				board.map(model.race, shown(model))),
 			ui.overlay([ui.align(ui.Align.Start()), ui.justify(ui.Justify.Center())],
 				pitboard(model)),
 			ui.overlay([ui.align(ui.Align.Start()), ui.justify(ui.Justify.End())],
-				board.dial(model.race, model.seat)),
+				board.dial(model.race, shown(model))),
 			ui.overlay([ui.align(ui.Align.End()), ui.justify(ui.Justify.Center())],
 				strip(model)),
 			panel(model)
@@ -1599,7 +1938,8 @@ func live(model: Model): ui.View {
 
 func pitboard(model: Model): ui.View {
 	race := model.race
-	me := control.find(race.cars, model.seat)
+	seat := shown(model)
+	me := control.find(race.cars, seat)
 	place := control.placeOf(race.cars, me) + 1
 	// It sits between the map and the dial rather than spanning the window, so the
 	// two `spacer`s that used to push this apart have nothing left to push against
@@ -1611,19 +1951,44 @@ func pitboard(model: Model): ui.View {
 		ui.text([ui.tone(ui.Tone.Muted())], "of {grid.field()}"),
 		ui.text([ui.size(ui.TextSize.Subtitle())],
 			"LAP {math.min(conv.itf(me.sheet.lap + 1), conv.itf(race.track.laps))}/{race.track.laps}"),
-		ui.text([ui.background(ui.Tone.HEX(grid.bodyOf(model.seat))),
+		ui.text([ui.background(ui.Tone.HEX(grid.bodyOf(seat))),
 			ui.tone(ui.Tone.HEX("#ffffff")), ui.pad(4)],
-			" {grid.driverOf(model.seat).tag} "),
+			" {grid.driverOf(seat).tag} "),
+		pitcall(me, race),
 		harvest(me),
 		token(me, race),
 		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())], "GAP"),
-		ui.text([], control.gapped(control.interval(race, model.seat))),
+		ui.text([], control.gapped(control.interval(race, seat))),
 		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())], "LAST"),
 		ui.text([], control.clocked(me.sheet.last)),
 		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())], "BEST"),
 		ui.text([ui.tone(ui.Tone.Good())], control.clocked(me.sheet.best)),
 		penalties(me)
 	])
+}
+
+// Whether the compulsory pass through the pit lane is still owed.
+//
+// It is on the board rather than on the strip because it is a **state** and not
+// an event, and the strip is for events. A message that scrolled past two laps
+// ago is no use at the one moment it matters — going past the pit entry for what
+// turns out to have been the last time — and this is a light that is either on or
+// off every time you glance at it.
+func pitcall(me: drive.Car, race: control.Race): ui.View {
+	if me.sheet.pitted {
+		return ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"STOP SERVED")
+	}
+	// Amber until the last lap and red on it. There is nothing subtle about it,
+	// because there is nothing subtle about twenty-five seconds.
+	mut ui.Tone shade = ui.Tone.Warn()
+	if me.sheet.lap >= race.track.laps {
+		shade = ui.Tone.Danger()
+	}
+	return ui.text(
+		[ui.background(shade), ui.tone(ui.Tone.HEX("#0d1013")), ui.pad(4)],
+		" PIT "
+	)
 }
 
 // The energy, and it is the one gauge on the board worth watching: eight cells,
@@ -1724,11 +2089,14 @@ func strip(model: Model): ui.View {
 		append(rows, ui.text([ui.tone(colourOf(note.kind)),
 			ui.size(ui.TextSize.Caption())], note.text))
 	}
+	if spectating(model) {
+		append(rows, watchline(model))
+	}
 	append(rows, ui.row([ui.gap(12), ui.align(ui.Align.Center()), ui.pad(4)], [
-		flag(model.race, model.seat),
+		flag(model.race, shown(model)),
 		ui.spacer(),
 		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
-			"SPACE drifts · E spends · C camera · TAB standings"),
+			hints(model)),
 		padBadge(model),
 		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
 			where(model)),
@@ -1760,6 +2128,42 @@ func colourOf(kind: control.Kind): ui.Tone {
 // mid-race — the browser loses the focus, somebody unplugs it, the batteries go —
 // is a car that stops steering, and "PAD 0" going out is the only thing that says
 // which of the many possible reasons it was.
+// Whose car the screen is about, once it is not yours.
+//
+// **A row of the strip rather than a corner of its own.** It was a panel pinned
+// to the bottom left, which is the one corner of this window nothing had claimed
+// — and the strip is 760 pixels of centred column, so on any window narrower than
+// about seventeen hundred the two sat on top of each other and race control's
+// last word was printed through the middle of it. Nothing said so; it was
+// invisible until somebody looked at the screen.
+//
+// The strip is the right place anyway. It is where race control talks, and "your
+// race is over and this is somebody else's car" is the most useful thing anybody
+// could say to you at that moment.
+func watchline(model: Model): ui.View {
+	seat := shown(model)
+	me := control.find(model.race.cars, model.seat)
+	return ui.row([ui.gap(10), ui.align(ui.Align.Center()), ui.pad(2)], [
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Good())],
+			"YOU FINISHED P{control.placeOf(model.race.cars, me) + 1}"),
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"· WATCHING"),
+		ui.text([ui.background(ui.Tone.HEX(grid.bodyOf(seat))),
+			ui.tone(ui.Tone.HEX("#ffffff")), ui.pad(2)],
+			" {grid.driverOf(seat).tag} "),
+		ui.text([ui.size(ui.TextSize.Caption())], grid.driverOf(seat).name)
+	])
+}
+
+// What the keys do — and it is not the same list once your own race has ended,
+// because the two that steered are the two that turn to another car.
+func hints(model: Model): Str {
+	if spectating(model) {
+		return "← → another car · C camera · TAB standings"
+	}
+	return "SPACE drifts · E spends · C camera · TAB standings"
+}
+
 func padBadge(model: Model): ui.View {
 	if model.pad.which < 0 {
 		return ui.none()
@@ -1792,7 +2196,20 @@ func quit(model: Model): ui.View {
 // you happen to be looking at is the one that has to tell you.
 func flag(race: control.Race, seat: Int): ui.View {
 	me := control.find(race.cars, seat)
-	delta := control.deltaAt(race, me.along)
+	delta := control.deltaFor(race, me.along, me.across)
+	// The pit limit first, because it is asked first: it is not a flag, nothing
+	// lifts it, and a car in the lane under a safety car is held to the lower of
+	// the two rather than to the one that happens to be more dramatic.
+	if circuit.inPits(race.track, me.along, me.across) {
+		mut ui.Tone lane = ui.Tone.HEX("#4aa3ff")
+		mut Str limit = " PIT LANE — LIMIT {conv.round(delta * 3.6)} "
+		if me.speed > delta {
+			lane = ui.Tone.Danger()
+			limit = " PIT LANE — SLOW DOWN "
+		}
+		return ui.text([ui.background(lane), ui.tone(ui.Tone.HEX("#0d1013")),
+			ui.pad(4)], limit)
+	}
 	if race.pace.life > 0.0 {
 		return ui.text([ui.background(ui.Tone.Warn()),
 			ui.tone(ui.Tone.HEX("#0d1013")), ui.pad(4)],
@@ -1872,9 +2289,44 @@ func standings(model: Model, final: Bool): ui.View {
 		])
 		place = place + 1
 	}
+	// **The button is in the header and the table is what scrolls.** Both halves of
+	// that are a fix for the same thing. This panel is centred over the picture and
+	// a field of ten is taller than it looks: with the button as the last row of a
+	// column that could not scroll, anything shorter than about a seven-hundred
+	// pixel window put it underneath the message strip — where it is still drawn,
+	// still reports itself as being at that place, and cannot be clicked because
+	// the strip is over it — and anything shorter than that again pushed it off the
+	// bottom of the screen with no way to reach it. It looked exactly like a button
+	// that does nothing.
+	//
+	// A header that does not move is also simply better: the way out of a race is
+	// the first thing on the panel rather than the last.
 	return ui.column([ui.gap(10), ui.pad(16)], [
-		ui.text([ui.size(ui.TextSize.Subtitle()), ui.heading(2)], headline(model, final)),
-		ui.table([], rows)
+		ui.row([ui.gap(14), ui.align(ui.Align.Center())], [
+			ui.text([ui.size(ui.TextSize.Subtitle()), ui.heading(2)],
+				headline(model, final)),
+			ui.spacer(),
+			startOver(model, final)
+		]),
+		ui.column([ui.height(260), ui.scroll(ui.Axis.Vertical())], [
+			ui.table([], rows)
+		])
+	])
+}
+
+// The way out of a race that is not going well, on the screen you are already
+// looking at when you decide that. Alone only, for the reason `restarted` gives.
+//
+// Not on the classification, which has one of its own: at the end of a race the
+// thing to offer is the lobby, because that is where you change cars.
+func startOver(model: Model, final: Bool): ui.View {
+	if final || model.link is Link.Live(_) {
+		return ui.none()
+	}
+	return ui.row([ui.gap(10), ui.align(ui.Align.Center())], [
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"another circuit, from the lights"),
+		ui.button([ui.on(Msg.Restart())], "New race")
 	])
 }
 
@@ -1882,7 +2334,7 @@ func headline(model: Model, final: Bool): Str {
 	if final {
 		return "{model.race.track.name} — classification"
 	}
-	me := control.find(model.race.cars, model.seat)
+	me := control.find(model.race.cars, shown(model))
 	on := math.min(conv.itf(me.sheet.lap + 1), conv.itf(model.race.track.laps))
 	return "{model.race.track.name} — lap {on} of {model.race.track.laps}"
 }
@@ -1905,13 +2357,16 @@ func standingGap(model: Model, car: drive.Car, place: Int, final: Bool): Str {
 func classification(model: Model): ui.View {
 	me := control.find(model.race.cars, model.seat)
 	place := control.placeOf(model.race.cars, me) + 1
+	// Same shape and for the same reason as the standings above: the way on is in
+	// the header, not at the bottom of a panel that is taller than a short window.
 	return ui.column([ui.gap(12), ui.pad(16)], [
-		ui.text([ui.size(ui.TextSize.Title()), ui.heading(1)],
-			"You finished P{place}"),
-		standings(model, true),
-		ui.row([ui.gap(10)], [
+		ui.row([ui.gap(14), ui.align(ui.Align.Center())], [
+			ui.text([ui.size(ui.TextSize.Title()), ui.heading(1)],
+				"You finished P{place}"),
+			ui.spacer(),
 			ui.button([ui.on(Msg.Again())], nextLabel(model))
-		])
+		]),
+		standings(model, true)
 	])
 }
 
