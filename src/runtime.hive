@@ -1183,10 +1183,24 @@ func termSource(): Str {
 		// command that failed is not a command that answered. The output is on the
 		// error too: it is usually the whole of why it failed.
 		func TermExec(command string, arguments []string, directory string) Result[string, TermExecError] {
+			return TermExecWith(command, arguments, directory, NewDict[string, string]())
+		}
+
+		// TermExecWith is TermExec with an environment overlay. Every pair in
+		// environment is set for the command on top of the environment this program
+		// itself was started with, so an empty Dict is exactly TermExec and a name
+		// already set is replaced rather than joined by a second.
+		//
+		// An overlay is deliberately the only thing on offer. Handing a command a
+		// *replaced* environment is a different thing entirely — a go with no PATH
+		// finds no toolchain and one with no HOME finds no module cache — and
+		// nothing that needs to set GOOS wants either of those as well.
+		func TermExecWith(command string, arguments []string, directory string, environment Dict[string, string]) Result[string, TermExecError] {
 			cmd := exec.Command(command, arguments...)
 			if directory != "" {
 				cmd.Dir = directory
 			}
+			cmd.Env = termEnvironment(environment)
 			written, err := cmd.CombinedOutput()
 			output := string(written)
 			if err == nil {
@@ -1202,6 +1216,30 @@ func termSource(): Str {
 				Output:  output,
 				Message: err.Error(),
 			})
+		}
+
+		// The environment a command runs in: this program's own with the overlay
+		// applied, or nil for no overlay at all.
+		//
+		// Nil is not the empty environment — it is this program's, which is what a
+		// command has always run in and what every caller but one still wants. The
+		// distinction matters: an empty non-nil slice would start the command with
+		// nothing set, and that is never what an empty overlay meant.
+		//
+		// Appending is enough to replace a name. Go takes the last of a repeated one
+		// and does so case-insensitively on Windows, which is the platform where
+		// PATH and Path are the same variable.
+		func termEnvironment(overlay Dict[string, string]) []string {
+			if overlay.Len() == 0 {
+				return nil
+			}
+			out := os.Environ()
+			for _, name := range overlay.Keys() {
+				if value := overlay.Get(name); value.IsOk() {
+					out = append(out, name+"="+value.Ok())
+				}
+			}
+			return out
 		}
 
 		// TermExit ends the program with a status. There is no value to answer with

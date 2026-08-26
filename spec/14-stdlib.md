@@ -137,8 +137,8 @@ Line-oriented terminal I/O.
   and nothing after it runs, which is what makes it a statement rather than a
   call.
 
-**Running another program.** Two calls, and the difference between them is who
-is talking to the terminal.
+**Running another program.** Three calls. The difference between the first two is
+who is talking to the terminal; the third is the first with an environment.
 
 * `exec(command, arguments, directory)` runs it and hands back **everything it
   wrote** — standard output and standard error together, in the order it wrote
@@ -153,6 +153,11 @@ is talking to the terminal.
   terminal** — its input, its output, its errors — and answers with the `Int`
   status it exited with. Nothing is captured, because the point of it is that the
   command is talking to whoever started this program.
+* `execWith(command, arguments, directory, environment)` is `exec` with an
+  **environment overlay**: a `Map<Str, Str>` whose pairs are set for the command
+  on top of the environment this program was started with. It answers exactly
+  what `exec` answers, because an environment is something a command is *given*
+  rather than something it says back.
 
 ```hive
 if hive.term.exec("go", ["build", "."], buildDirectory) is Result.Error(why) {
@@ -164,6 +169,25 @@ if hive.term.exec("go", ["build", "."], buildDirectory) is Result.Error(why) {
 The arguments are a vector rather than a line of text, and that is the whole of
 the safety story: nothing is handed to a shell, so nothing in an argument can be
 read as one. A command that needs a shell asks for one by name.
+
+An overlay is the only thing `execWith` offers, and deliberately: it **adds to**
+the environment rather than replacing it. A replaced environment is a different
+and much sharper tool — a command with no `PATH` finds no programs and one with
+no `HOME` finds no caches — and nothing that wants to set one variable wants
+those as well. An empty map is therefore exactly `exec`, byte for byte, and a
+name the environment already holds is replaced rather than joined by a second.
+
+```hive
+mut hive.map.Map<Str, Str> asked = hive.map.new()
+hive.map.set(asked, "GOOS", "android")
+hive.map.set(asked, "GOARCH", "arm64")
+
+// `go env GOOS` now says `android`, and `go` is still found on the PATH.
+hive.term.execWith("go", ["build", "."], buildDirectory, asked)
+```
+
+This is what `hive build --target` is built on — see [15](15-lowering.md) — and
+it is the only thing in the compiler that needs an environment at all.
 
 ## 14.6 Reading tables (`using`)
 
