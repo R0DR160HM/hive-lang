@@ -7273,7 +7273,50 @@ func uiSource(): Str {
 		    return;
 		  }
 		  var idx = parseInt(el.getAttribute("data-index") || "0", 10);
+		  settled = true;
 		  send(el.getAttribute("data-h"), "click", "", idx);
+		});
+
+		// A click is a press and a release on the same thing — and on a page that
+		// rebuilds itself sixty times a second, "the same thing" cannot be the same
+		// *node*. Every repaint assigns root.innerHTML, so every element on the page is
+		// destroyed and made again. The button that was pressed does not exist by the
+		// time the mouse comes up; the browser sees a press and a release on two
+		// different elements and fires **no click at all**.
+		//
+		// So on any window with a live scene in it, no button on the page could ever be
+		// pressed. It is invisible in a static window — a document that does not change
+		// is never swapped, so the nodes survive and everything works — and total in a
+		// window drawing a world, where it looks exactly like a button that does
+		// nothing. Which is how it was found: a "new race" button that reported itself
+		// present, hit-testable and on top, and swallowed every click.
+		//
+		// The fix is to remember the press by **handle** rather than by node, which is
+		// the same thing the swap above already does for the focused element, and let
+		// the release decide. The browser's own click still wins wherever it happens,
+		// so nothing fires twice: a click is dispatched before a task queued from the
+		// mouseup that produced it, and this only speaks up when none arrived.
+		var pressedOn = "";
+		var settled = false;
+		root.addEventListener("mousedown", function (e) {
+		  var el = holder(e.target);
+		  pressedOn = el && el.tagName !== "A" ? el.getAttribute("data-h") : "";
+		});
+		root.addEventListener("mouseup", function (e) {
+		  var el = holder(e.target);
+		  var was = pressedOn;
+		  pressedOn = "";
+		  if (!el || el.tagName === "A" || el.disabled) { return; }
+		  var id = el.getAttribute("data-h");
+		  if (!id || id !== was) { return; }
+		  if (el.getAttribute("data-backdrop") && e.target !== el) { return; }
+		  if (anchorUnder(e.target, el)) { return; }
+		  var idx = parseInt(el.getAttribute("data-index") || "0", 10);
+		  settled = false;
+		  setTimeout(function () {
+		    if (settled) { return; }
+		    send(id, "click", "", idx);
+		  }, 0);
 		});
 		root.addEventListener("input", function (e) {
 		  var el = holder(e.target);
