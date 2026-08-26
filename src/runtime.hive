@@ -6403,6 +6403,11 @@ func uiSource(): Str {
 		// hive/ui_scene.go's business.
 		type UiSurface string
 
+		// And what a sound in a scene is the sound of, here for the same reason and
+		// with the same division: the name is the module's, the oscillators are the
+		// scene's.
+		type UiVoice string
+
 		// A UiTone is the one enumeration that is not only a closed set: past the five
 		// roles a stylesheet answers for, two variants carry a colour outright. The two
 		// kinds are told apart by shape and nothing else — a role is a name, a colour is
@@ -7939,6 +7944,28 @@ func uiSceneSource(): Str {
 			return UiShape{Kind: "label", Attrs: attrs, Text: words}
 		}
 
+		// A sound at a place in the world: something in the scene that is heard from
+		// where it stands instead of drawn where it stands.
+		//
+		// **Its payload is a name, and the name is its identity across frames.** That
+		// is the one place audio cannot follow the rule the solids follow. A box is
+		// matched to whatever was in its slot last frame, because a view built by the
+		// same code lists the same things in the same order and a box rebuilt anyway
+		// is a box nobody can tell was rebuilt. An oscillator rebuilt anyway is a
+		// click — sixty of them a second — so a voice has to be the *same* oscillator
+		// this frame that it was last frame, and a slot cannot promise that: a scene
+		// is free to stop drawing the car in front of it, and every sound after that
+		// one would shift up a place and become a different engine.
+		//
+		// So sounds are matched by what they are called. A name that is in this
+		// frame and was in the last one is a voice that carries on; a name that has
+		// just arrived is a voice that starts; a name that has gone is a voice that
+		// fades out. Which of those three a given voice actually does is the voice's
+		// own business — see the JS.
+		func UiSound(attrs []UiAttr, name string) UiShape {
+			return UiShape{Kind: "sound", Attrs: attrs, Text: name}
+		}
+
 		// The one shape whose position is its payload rather than an attribute: a line
 		// is *between* two places, and there is no third one to call its own. A tracer
 		// is what this is for.
@@ -7966,6 +7993,14 @@ func uiSceneSource(): Str {
 		// on its own — a floor is turf, a barrel is staves — so nothing that never
 		// mentions a surface draws differently for this existing.
 		func UiAttrSurface(v UiSurface) UiAttr { return uiEnum("surface", string(v)) }
+
+		// Which noise, and the two numbers every noise is bent by. Pitch and volume are
+		// multiples of what the voice is at rest rather than hertz and gain, so that a
+		// program says "twice as fast" and "half as loud" — which is what it knows —
+		// and never has to hold an opinion about a filter.
+		func UiAttrVoice(v UiVoice) UiAttr  { return uiEnum("voice", string(v)) }
+		func UiAttrPitch(v float64) UiAttr  { return uiNums("pitch", []float64{v}) }
+		func UiAttrVolume(v float64) UiAttr { return uiNums("volume", []float64{v}) }
 
 		func UiAttrEye(x float64, y float64, z float64) UiAttr {
 			return uiNums("eye", []float64{x, y, z})
@@ -8068,6 +8103,21 @@ func uiSceneSource(): Str {
 		}
 
 		func uiSceneShape(b *strings.Builder, s UiShape) {
+			// A sound has no colour, no dimensions, no rotation and nothing to shade.
+			// Writing all four of them sixty times a second for something nobody can
+			// see is the whole reason this is a branch of its own rather than four more
+			// conditionals in the one below.
+			if s.Kind == "sound" {
+				b.WriteString("{\"k\":\"sound\",\"x\":" + uiSceneStr(s.Text))
+				b.WriteString(",\"p\":" + uiSceneVec(uiSceneNums(s.Attrs, "at", []float64{0, 0, 0})))
+				if voice := uiSceneEnum(s.Attrs, "voice"); voice != "" {
+					b.WriteString(",\"v\":\"" + voice + "\"")
+				}
+				b.WriteString(",\"h\":" + uiSceneF(uiSceneOne(s.Attrs, "pitch", 1)))
+				b.WriteString(",\"g\":" + uiSceneF(uiSceneOne(s.Attrs, "volume", 1)))
+				b.WriteString("}")
+				return
+			}
 			b.WriteString("{\"k\":\"" + s.Kind + "\"")
 			b.WriteString(",\"c\":\"" + uiSceneTone(uiSceneEnum(s.Attrs, "paint"), "#cfd6de") + "\"")
 			// A line carries both its ends in its payload, so it has no position of its
@@ -8122,6 +8172,16 @@ func uiSceneSource(): Str {
 		func uiSceneNums(attrs []UiAttr, kind string, fallback []float64) []float64 {
 			if a, ok := uiFind(attrs, kind); ok && len(a.Nums) == len(fallback) {
 				return a.Nums
+			}
+			return fallback
+		}
+
+		// One number off an attribute that carries exactly one, or what it means when
+		// the attribute is not there at all. Both of the two are 1: a sound that says
+		// nothing about its pitch or its volume is a sound at rest, not a silent one.
+		func uiSceneOne(attrs []UiAttr, kind string, fallback float64) float64 {
+			if a, ok := uiFind(attrs, kind); ok && len(a.Nums) == 1 {
+				return a.Nums[0]
 			}
 			return fallback
 		}
@@ -8264,6 +8324,7 @@ func uiSceneJs(): Str {
 		    handle = "";
 		    holder.style.display = "none";
 		    release();
+		    silence();
 		    return;
 		  }
 		  host = el;
@@ -8323,7 +8384,22 @@ func uiSceneJs(): Str {
 		  camera.rotation.set(w.aim[1], w.aim[0], 0);
 		  var lens = w.lens || 75;
 		  if (camera.fov !== lens) { camera.fov = lens; camera.updateProjectionMatrix(); }
-		  shapes(w.o || []);
+		  // The sounds are taken out before the solids are drawn, because the solids
+		  // are matched to their slots and a sound sitting in one would push every
+		  // shape after it along a place. Most scenes have none at all, and the scan
+		  // that finds that out is one comparison per shape and no allocation.
+		  var all = w.o || [], drawn = all, sounded = null;
+		  for (var i = 0; i < all.length; i++) {
+		    if (all[i].k !== "sound") { continue; }
+		    drawn = [];
+		    sounded = [];
+		    for (var j = 0; j < all.length; j++) {
+		      if (all[j].k === "sound") { sounded.push(all[j]); } else { drawn.push(all[j]); }
+		    }
+		    break;
+		  }
+		  shapes(drawn);
+		  if (sounded || voices.size) { sounds(sounded || [], w); }
 		  // Letting go is the program's to decide; taking hold needs a click, which is
 		  // the browser's rule and not ours.
 		  if (!w.grab && grabbing) { document.exitPointerLock(); }
@@ -9042,9 +9118,397 @@ func uiSceneJs(): Str {
 		  return true;
 		}
 
+		// --- what a world sounds like ----------------------------------------------
+		//
+		// A sound is a shape you cannot see. It is listed in the scene beside the
+		// solids, it stands at a place in the world exactly as they do, and the whole
+		// difference is what happens to one between two frames: a solid is *redrawn*
+		// and a sound is *carried on*. That is why a sound carries a name — see
+		// UiSound in the Go — and why every map below is keyed by one.
+		//
+		// NOTHING IS LOADED. Every voice here is oscillators and filtered noise, for
+		// the same reason the grain patterns are drawn rather than fetched: a built
+		// Hive program is one file, and a window that had to download a wave before it
+		// could make a noise would make that untrue. It buys something as well as
+		// costing something — a voice made of a frequency can be *bent*, and an engine
+		// that is a recording of one speed played faster is an engine you can hear
+		// looping.
+
+		var ears = null, master = null, hiss = null, voices = new Map();
+
+		// The context, built the first time a scene asks for a noise.
+		//
+		// A browser will not let a page make one until somebody has touched it, and it
+		// says so by handing back a context that is *suspended* rather than by
+		// failing. So there is nothing here to detect and nothing for a program to put
+		// on the screen: build it, nudge it on every gesture until one takes, and
+		// whatever the user was going to click anyway is what turns the sound on.
+		function hearing() {
+		  if (ears) { return ears; }
+		  var Sound = window.AudioContext || window.webkitAudioContext;
+		  if (!Sound) { return null; }
+		  ears = new Sound();
+		  master = ears.createGain();
+		  master.gain.value = 0.8;
+		  master.connect(ears.destination);
+		  // Two seconds of white noise, made once and shared by everything with a hiss
+		  // in it — tyres, brakes, the wind, a crowd, an impact. All five are this one
+		  // buffer through a different filter, which is both what those things are and
+		  // the difference between five buffers and one.
+		  var run = Math.floor(ears.sampleRate * 2);
+		  hiss = ears.createBuffer(1, run, ears.sampleRate);
+		  var grains = hiss.getChannelData(0);
+		  for (var i = 0; i < run; i++) { grains[i] = Math.random() * 2 - 1; }
+		  wake();
+		  return ears;
+		}
+
+		function wake() {
+		  if (ears && ears.state === "suspended") { ears.resume(); }
+		}
+
+		function noise() {
+		  var src = ears.createBufferSource();
+		  src.buffer = hiss;
+		  src.loop = true;
+		  src.start();
+		  return src;
+		}
+
+		// Where a voice stands. A panner rather than a stereo balance, because the
+		// thing being modelled is a car going past: what makes that read is the
+		// distance falling away *and* the sound crossing from one ear to the other,
+		// and only a panner does both.
+		function sited(gain) {
+		  var pan = ears.createPanner();
+		  pan.panningModel = "HRTF";
+		  pan.distanceModel = "inverse";
+		  pan.refDistance = 7;
+		  pan.maxDistance = 400;
+		  pan.rolloffFactor = 1.2;
+		  gain.connect(pan);
+		  pan.connect(master);
+		  return pan;
+		}
+
+		// A panner moved. The named parameters are the current spelling and the two
+		// setters are the old one; a browser has one or the other, and both mean this.
+		function standing(pan, p) {
+		  if (!pan || !p) { return; }
+		  if (pan.positionX) {
+		    pan.positionX.value = p[0];
+		    pan.positionY.value = p[1];
+		    pan.positionZ.value = p[2];
+		  } else if (pan.setPosition) {
+		    pan.setPosition(p[0], p[1], p[2]);
+		  }
+		}
+
+		// One sustained voice, built to its name and silent until it is told how loud.
+		//
+		// Every one is the same three pieces — a source, a filter, and the gain the
+		// whole thing hangs on — and what makes an engine an engine rather than a
+		// crowd is which source through which filter. The bend is what the pitch
+		// attribute drives, and a voice with nothing to bend simply has none.
+		function sustained(kind) {
+		  var gain = ears.createGain();
+		  gain.gain.value = 0;
+		  var voice = {kind: kind, gain: gain, pan: null, parts: [], bend: null};
+		  // Music is the one voice with nowhere to stand. It is not in the world, it
+		  // is over it, so it goes straight to the master and is never panned.
+		  if (kind === "Music") { gain.connect(master); }
+		  else { voice.pan = sited(gain); }
+		  if (kind === "Engine") {
+		    // Two oscillators an octave apart with the top taken off. The saw is the
+		    // firing and the square under it is the part you feel rather than hear —
+		    // one alone is a wasp, and a wasp is what every synthesised engine that
+		    // stopped at a single oscillator sounds like.
+		    var low = ears.createBiquadFilter();
+		    low.type = "lowpass";
+		    low.Q.value = 3.5;
+		    low.connect(gain);
+		    var saw = ears.createOscillator(), body = ears.createOscillator();
+		    saw.type = "sawtooth";
+		    body.type = "square";
+		    body.detune.value = -1200;
+		    saw.connect(low);
+		    body.connect(low);
+		    saw.start();
+		    body.start();
+		    voice.parts = [saw, body];
+		    voice.bend = function (p) {
+		      var revs = Math.max(18, 54 * p);
+		      saw.frequency.setTargetAtTime(revs, ears.currentTime, 0.04);
+		      body.frequency.setTargetAtTime(revs, ears.currentTime, 0.04);
+		      // The filter opens with the revs, which is the whole of why a car on the
+		      // throttle sounds harder than the same car coasting at the same speed.
+		      low.frequency.setTargetAtTime(340 + revs * 11, ears.currentTime, 0.06);
+		    };
+		  } else if (kind === "Tyres") {
+		    var scrub = ears.createBiquadFilter();
+		    scrub.type = "bandpass";
+		    scrub.Q.value = 1.1;
+		    scrub.connect(gain);
+		    var rough = noise();
+		    rough.connect(scrub);
+		    voice.parts = [rough];
+		    voice.bend = function (p) {
+		      scrub.frequency.setTargetAtTime(Math.max(120, 780 * p), ears.currentTime, 0.05);
+		    };
+		  } else if (kind === "Brakes") {
+		    // A squeal is a narrow band with a tone sitting in the middle of it, and
+		    // the tone is what makes it a brake rather than a hiss.
+		    var narrow = ears.createBiquadFilter();
+		    narrow.type = "bandpass";
+		    narrow.Q.value = 9;
+		    narrow.connect(gain);
+		    var grit = noise();
+		    grit.connect(narrow);
+		    var squeal = ears.createOscillator();
+		    squeal.type = "triangle";
+		    var cry = ears.createGain();
+		    cry.gain.value = 0.16;
+		    squeal.connect(cry);
+		    cry.connect(gain);
+		    squeal.start();
+		    voice.parts = [grit, squeal];
+		    voice.bend = function (p) {
+		      narrow.frequency.setTargetAtTime(Math.max(400, 2400 * p), ears.currentTime, 0.03);
+		      squeal.frequency.setTargetAtTime(Math.max(300, 1750 * p), ears.currentTime, 0.03);
+		    };
+		  } else if (kind === "Wind") {
+		    var rush = ears.createBiquadFilter();
+		    rush.type = "bandpass";
+		    rush.Q.value = 0.4;
+		    rush.connect(gain);
+		    var air = noise();
+		    air.connect(rush);
+		    voice.parts = [air];
+		    voice.bend = function (p) {
+		      rush.frequency.setTargetAtTime(Math.max(90, 320 * p), ears.currentTime, 0.1);
+		    };
+		  } else if (kind === "Crowd") {
+		    // Filtered noise is a crowd already; what it is missing is that a crowd
+		    // *breathes*. The slow swell under it is one oscillator on the filter, and
+		    // it is the difference between a grandstand and a waterfall.
+		    var murmur = ears.createBiquadFilter();
+		    murmur.type = "bandpass";
+		    murmur.Q.value = 0.8;
+		    murmur.frequency.value = 620;
+		    murmur.connect(gain);
+		    var many = noise();
+		    many.connect(murmur);
+		    var swell = ears.createOscillator();
+		    swell.type = "sine";
+		    swell.frequency.value = 0.13;
+		    var depth = ears.createGain();
+		    depth.gain.value = 260;
+		    swell.connect(depth);
+		    depth.connect(murmur.frequency);
+		    swell.start();
+		    voice.parts = [many, swell];
+		  } else if (kind === "Music") {
+		    voice.at = ears.currentTime;
+		    voice.step = 0;
+		  }
+		  return voice;
+		}
+
+		// The bed. Four bars, a bass note under each and a figure over the top,
+		// scheduled a little ahead of the clock rather than played when a frame
+		// happens to come round — a sequencer hung off the render loop would be in
+		// time with the frame rate, and a frame rate is not a tempo.
+		//
+		// It is not much of a tune and it is not meant to be. Something you stop
+		// hearing by the second lap is exactly what a bed is for; anything with more
+		// in it would be a thing you listen to instead of the race.
+		var TUNE = [
+		  [-12, 0, 3, 7],
+		  [-10, 2, 5, 9],
+		  [-15, -3, 0, 4],
+		  [-8, 0, 4, 7]
+		];
+
+		function note(step) { return 55 * Math.pow(2, step / 12); }
+
+		function music(voice, now) {
+		  // Half a second of runway. Less, and a busy frame arrives too late to
+		  // schedule the next note; more, and a change of volume takes a bar to tell.
+		  while (voice.at < now + 0.5) {
+		    var beat = voice.step % 8, bar = Math.floor(voice.step / 8) % TUNE.length;
+		    var chord = TUNE[bar];
+		    if (beat === 0 || beat === 5) {
+		      pluck(voice, note(chord[0]), voice.at, 0.5, "triangle", 0.5);
+		    }
+		    pluck(voice, note(chord[1 + (voice.step % 3)] + 12), voice.at, 0.22, "square", 0.1);
+		    voice.at = voice.at + 0.19;
+		    voice.step = voice.step + 1;
+		  }
+		}
+
+		// One note: an oscillator with an envelope on it, started and stopped in the
+		// future and then let go of. Nothing keeps a reference — a note that has
+		// finished sounding is a note nobody can do anything to.
+		function pluck(voice, freq, at, run, shape, loud) {
+		  var osc = ears.createOscillator();
+		  osc.type = shape;
+		  osc.frequency.value = freq;
+		  var env = ears.createGain();
+		  env.gain.setValueAtTime(0.0001, at);
+		  env.gain.exponentialRampToValueAtTime(loud, at + 0.012);
+		  env.gain.exponentialRampToValueAtTime(0.0001, at + run);
+		  osc.connect(env);
+		  env.connect(voice.gain);
+		  osc.start(at);
+		  osc.stop(at + run + 0.02);
+		}
+
+		// The two voices that fire rather than last. Both are built, started and
+		// forgotten in one call: there is nothing to carry forward, because the thing
+		// they stand for has already happened.
+		var STRUCK = {Impact: true, Chime: true};
+
+		function strike(kind, s) {
+		  var gain = ears.createGain();
+		  var pan = sited(gain);
+		  standing(pan, s.p);
+		  var now = ears.currentTime;
+		  var loud = Math.max(0.0001, s.g === undefined ? 1 : s.g);
+		  var pitch = s.h === undefined ? 1 : s.h;
+		  if (kind === "Chime") {
+		    var ring = ears.createOscillator();
+		    ring.type = "sine";
+		    ring.frequency.value = Math.max(80, 660 * pitch);
+		    ring.connect(gain);
+		    gain.gain.setValueAtTime(0.0001, now);
+		    gain.gain.exponentialRampToValueAtTime(loud, now + 0.01);
+		    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.55);
+		    ring.start(now);
+		    ring.stop(now + 0.6);
+		    return;
+		  }
+		  // An impact is two things at once and has to be: the noise of it, which is
+		  // broadband and dead in a third of a second, and the weight of it, which is
+		  // one low tone sliding down. The noise alone is a hiss and the tone alone is
+		  // a drum; together they are something hitting something.
+		  var burst = ears.createBufferSource();
+		  burst.buffer = hiss;
+		  var dull = ears.createBiquadFilter();
+		  dull.type = "lowpass";
+		  dull.frequency.setValueAtTime(Math.max(400, 3200 * pitch), now);
+		  dull.frequency.exponentialRampToValueAtTime(200, now + 0.3);
+		  burst.connect(dull);
+		  dull.connect(gain);
+		  var thud = ears.createOscillator();
+		  thud.type = "sine";
+		  thud.frequency.setValueAtTime(Math.max(50, 150 * pitch), now);
+		  thud.frequency.exponentialRampToValueAtTime(45, now + 0.22);
+		  var weight = ears.createGain();
+		  weight.gain.value = 0.7;
+		  thud.connect(weight);
+		  weight.connect(gain);
+		  gain.gain.setValueAtTime(loud, now);
+		  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.38);
+		  burst.start(now);
+		  burst.stop(now + 0.4);
+		  thud.start(now);
+		  thud.stop(now + 0.4);
+		}
+
+		// A voice whose name has left the scene. It is faded rather than cut, because
+		// a gain taken to nought in one sample is a click — the same click that
+		// restarting an oscillator every frame would make, arriving at the other end.
+		function hush(name) {
+		  var voice = voices.get(name);
+		  voices.delete(name);
+		  if (!voice || voice.struck) { return; }
+		  var now = ears.currentTime;
+		  voice.gain.gain.setTargetAtTime(0, now, 0.05);
+		  for (var i = 0; i < voice.parts.length; i++) {
+		    try { voice.parts[i].stop(now + 0.3); } catch (e) {}
+		  }
+		}
+
+		function silence() {
+		  if (!ears) { return; }
+		  var going = [];
+		  voices.forEach(function (voice, name) { going.push(name); });
+		  for (var i = 0; i < going.length; i++) { hush(going[i]); }
+		}
+
+		// Every sound in the frame, against every voice that is already going. Three
+		// cases, and they are the whole of it: a name that is new starts a voice, a
+		// name that is still here bends the one it has, and a voice whose name has
+		// gone fades out.
+		function sounds(list, w) {
+		  if (!hearing()) { return; }
+		  attend(w);
+		  var now = ears.currentTime, here = {};
+		  for (var i = 0; i < list.length; i++) {
+		    var s = list[i], name = s.x || "", kind = s.v || "Engine";
+		    here[name] = true;
+		    var voice = voices.get(name);
+		    // A name that has come back as a different voice is a different sound
+		    // wearing the same label, and the old one goes before the new one starts.
+		    if (voice && voice.kind !== kind) {
+		      hush(name);
+		      voice = null;
+		    }
+		    if (!voice) {
+		      if (STRUCK[kind]) {
+		        strike(kind, s);
+		        voices.set(name, {kind: kind, struck: true, parts: []});
+		        continue;
+		      }
+		      voice = sustained(kind);
+		      voices.set(name, voice);
+		    }
+		    if (voice.struck) { continue; }
+		    standing(voice.pan, s.p);
+		    voice.gain.gain.setTargetAtTime(Math.max(0, s.g === undefined ? 1 : s.g), now, 0.06);
+		    if (voice.bend) { voice.bend(s.h === undefined ? 1 : s.h); }
+		    if (voice.kind === "Music") { music(voice, now); }
+		  }
+		  var going = [];
+		  voices.forEach(function (voice, name) { if (!here[name]) { going.push(name); } });
+		  for (var g = 0; g < going.length; g++) { hush(going[g]); }
+		}
+
+		// The ears, put where the camera is and pointed where it is pointing. The
+		// forward vector is the camera's own -Z taken through the same yaw-then-pitch
+		// the renderer applies, so that what is heard on the left is what is drawn on
+		// the left — which is the entire claim a positioned sound makes.
+		function attend(w) {
+		  var ear = ears.listener, p = w.eye, yaw = w.aim[0], tip = w.aim[1];
+		  var fx = -Math.sin(yaw) * Math.cos(tip);
+		  var fy = Math.sin(tip);
+		  var fz = -Math.cos(yaw) * Math.cos(tip);
+		  if (ear.positionX) {
+		    ear.positionX.value = p[0];
+		    ear.positionY.value = p[1];
+		    ear.positionZ.value = p[2];
+		    ear.forwardX.value = fx;
+		    ear.forwardY.value = fy;
+		    ear.forwardZ.value = fz;
+		    ear.upX.value = 0;
+		    ear.upY.value = 1;
+		    ear.upZ.value = 0;
+		  } else if (ear.setPosition) {
+		    ear.setPosition(p[0], p[1], p[2]);
+		    ear.setOrientation(fx, fy, fz, 0, 1, 0);
+		  }
+		}
+
 		// --- what the player did ---------------------------------------------------
 
 		function listen() {
+		  // A browser will not let a page make a noise until somebody has touched it,
+		  // so every gesture nudges the audio context and the first one that lands
+		  // turns the sound on. It is watched for here, with the rest of the input,
+		  // because that is what it is: the one event a program never hears about.
+		  document.addEventListener("mousedown", wake, true);
+		  document.addEventListener("keydown", wake, true);
+		  document.addEventListener("touchstart", wake, true);
 		  // Taking the mouse is watched for on the whole document rather than on the
 		  // canvas, and that is not laziness. A browser only grants the pointer on a
 		  // click, and a panel drawn over the picture — "click to play", the thing a
