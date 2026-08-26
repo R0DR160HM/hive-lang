@@ -5,8 +5,8 @@ Precedence and the full expression grammar are in
 
 ## 5.1 Literals
 
-`42`, `3.14`, `"text"`, `` `raw text` ``, `true`, `false`, `#Atom`, and
-`[a, b, c]` for a vector.
+`42`, `3.14`, `"text"`, `` `text over lines` ``, `` raw`verbatim text` ``,
+`true`, `false`, `#Atom`, and `[a, b, c]` for a vector.
 
 A vector literal's element type is the type its elements share; an empty one
 takes its type from where it lands. A literal's length is **static**, which is
@@ -20,6 +20,19 @@ what makes `v := ["a", "b"]` a `Str[2]`.
 ```hive
 echo "loaded {len(rows)} of {total}"
 ```
+
+`"..."` and `` `...` `` both interpolate, so a multiline string splices the same
+way ([01.3.2](01-lexical.md#132-backtick-strings)):
+
+```hive
+echo `
+	loaded {len(rows)} of {total}
+	from {source}
+`
+```
+
+`` raw`...` `` is the one string form that does not. A `{` in one is a brace,
+which is what makes it the form for carrying somebody else's syntax.
 
 Interpolation is the only implicit conversion in the language, and it goes one
 way: a value becomes text, never the reverse.

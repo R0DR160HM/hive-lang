@@ -68,7 +68,7 @@ All of it.
 
 | | |
 | --- | --- |
-| lexing | all of [01](01-lexical.md), including interpolation, backtick strings, atoms, query bodies and import paths |
+| lexing | all of [01](01-lexical.md), including interpolation, both backtick forms, atoms, query bodies and import paths |
 | parsing | all of [02](02-grammar.md), query bodies and their `WHERE` blocks included |
 | modules | local `.hive` imports, Go file imports, git repository imports with a shared clone cache and a lock file, standard library aliases, cycle rejection, flattening ([12](12-modules.md)) |
 | the toolchain | `build`, `run` and `test` drive `go` themselves, a test run is reported and exits non-zero when it failed ([16](16-testing.md)), and the one build that links anything from outside Go's standard library resolves it first. Two commands are this implementation's own rather than the specification's: `emit`, which prints the generated Go and is what [17.2](17-diagnostics.md#172-editor-support) means by asking for no toolchain, and `container`, which writes a Dockerfile that builds a program and runs it |

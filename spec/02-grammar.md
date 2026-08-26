@@ -7,8 +7,9 @@ Terminals from the lexer are `UPPER_CASE`.
 ```
 IDENT        camelCase, PascalCase or UPPER_CASE identifier (1.4)
 INT FLOAT    integer and float literals
-STRING       a "..." or `...` string with no interpolation
-INTERP       a "..." string holding at least one {expression}
+STRING       a "...", `...` or raw`...` string with no interpolation
+INTERP       a "..." or `...` string holding at least one {expression}
+             (a raw`...` string never interpolates, so it is always STRING)
 ATOM         #Name
 PATH         an import path, captured whole (1.3.3)
 SQL          a query body, captured whole (1.3.3)

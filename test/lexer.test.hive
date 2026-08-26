@@ -217,9 +217,25 @@ test "an unterminated string is reported against the line it opened on" {
 
 // --- Backtick strings --------------------------------------------------------
 
-test "a backtick string is raw: no escapes and no interpolation" {
-	got := dump("`a\\nb\{c}`")
-	assert got == "str:a\\nb\{c} eof"
+// The escapes are a quoted string's escapes, because it is a quoted string: the
+// two spellings differ in spanning lines and in being dedented, and nowhere else.
+test "a backtick string reads the same escapes a quoted one does" {
+	got := dump("`a\\nb\\tc`")
+	assert got == "str:a\nb\tc eof"
+	quote := dump("`a\\\"b`")
+	assert quote == "str:a\"b eof"
+	slash := dump("`a\\\\b`")
+	assert slash == "str:a\\b eof"
+}
+
+test "a backtick string interpolates, the same as a quoted one" {
+	got := dump("`a\{x}b`")
+	assert got == "parts[lit:a|code:x|lit:b] eof"
+}
+
+test "an escaped brace in a backtick string is a literal brace" {
+	got := dump("`x\\\{a\\}y`")
+	assert got == "str:x\{a}y eof"
 }
 
 test "a backtick string is dedented, and keeps the line it opened on" {
@@ -228,8 +244,59 @@ test "a backtick string is dedented, and keeps the line it opened on" {
 	assert got == "str:one\n\ttwo eof"
 }
 
+test "a backtick string is dedented before its pieces are split apart" {
+	got := dump("`\n\thello \{name}\n`")
+	assert got == "parts[lit:hello |code:name] eof"
+}
+
+// The body is walked twice — once for the closing backtick and once for the
+// pieces — and only the first walk may count the lines, or every token after
+// the string would sit a line too far down.
+test "the token after an interpolated backtick string is on the line it was written on" {
+	got := lines("`\n\ta \{b}\n`\nc")
+	assert got == "1 4 4"
+}
+
 test "an unclosed backtick string is reported" {
 	got := errorsOf("`never closed")
+	assert got == "this backtick string never closes"
+}
+
+test "an unterminated interpolation inside a backtick string is reported" {
+	got := errorsOf("`a \{b`")
+	assert got == "unterminated `\{` interpolation in a string"
+}
+
+// --- raw`...` ----------------------------------------------------------------
+
+// The contrast with the test above is the whole point of the form: the same
+// source text, and nothing at all read out of it.
+test "a raw backtick string reads nothing out of itself" {
+	got := dump("raw`a\\nb\{c}`")
+	assert got == "str:a\\nb\{c} eof"
+}
+
+test "a raw backtick string is dedented like the other one" {
+	got := dump("raw`\n\tone\n\t\ttwo\n`")
+	assert got == "str:one\n\ttwo eof"
+}
+
+// The space is the whole of the rule: `run raw someSql` has to keep reading as
+// the query keyword and an expression after it.
+test "`raw` is only a prefix when the backtick is touching it" {
+	got := dump("raw `x`")
+	assert got == "raw str:x eof"
+	sql := dump("using db run raw someSql")
+	assert sql == "using db run raw someSql eof"
+}
+
+test "a name ending in `raw` is still a name" {
+	got := dump("myraw`x`")
+	assert got == "myraw str:x eof"
+}
+
+test "an unclosed raw backtick string is reported" {
+	got := errorsOf("raw`never closed")
 	assert got == "this backtick string never closes"
 }
 

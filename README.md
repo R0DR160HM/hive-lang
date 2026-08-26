@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/hive-logo.svg" alt="Hive" width="160">
+</p>
+
 # Hive, in Hive
 
 [![build](https://github.com/R0DR160HM/hive-lang/actions/workflows/build.yml/badge.svg)](https://github.com/R0DR160HM/hive-lang/actions/workflows/build.yml)

@@ -8,8 +8,10 @@
 //
 // Three constructs need light context tracking, and `Mode` is the whole of it:
 //
-//   * a `"..."` string may hold `{expression}` interpolations, whose source is
-//     captured raw for the parser to finish;
+//   * a `"..."` or `` `...` `` string may hold `{expression}` interpolations,
+//     whose source is captured raw for the parser to finish — the two are one
+//     kind of string written two ways, and `` raw`...` `` is the third form, the
+//     one nothing is read out of at all;
 //   * after `query`, the `{ ... }` that follows is SQL rather than Hive
 //     statements, so it is taken verbatim;
 //   * after `import` comes a path, whose `.`, `..` and `/` would each otherwise
@@ -112,6 +114,15 @@ proc scanOne(cs: Str[], s: mut Scan): void {
 	}
 	if c == "`" {
 		scanBacktick(cs, s)
+		return
+	}
+	// `raw` with a backtick right behind it is a prefix rather than a name, and
+	// what it opens is verbatim. The backtick has to be *touching* it: `run raw`
+	// is followed by an expression, and a space between the two is what keeps
+	// that reading available.
+	if text.matchesAt(cs, s.pos, "raw`") {
+		s.pos = s.pos + 3
+		scanRawBacktick(cs, s)
 		return
 	}
 	if c == "#" {
@@ -333,34 +344,99 @@ proc scanInterpolation(cs: Str[], s: mut Scan, b: mut StrPartBuf, opened: Int): 
 	return false
 }
 
-// A backtick string is raw: no escapes, no interpolation, and it may span lines.
-// Its indentation is a fact about where it sits in the file rather than part of
-// what it holds, so it is removed.
-proc scanBacktick(cs: Str[], s: mut Scan): void {
-	opened := s.line
-	s.pos = s.pos + 1
+// Everything to the closing backtick, dedented. Both backtick forms are read
+// exactly the same way and differ only in what is then made of what came out, so
+// the reading is here once. Answers `Error` when the string never closed, having
+// already said so.
+//
+// The indentation is a fact about where the string sits in the file rather than
+// part of what it holds, so it is removed here — before either form looks at the
+// text, because the common indentation belongs to the body as a whole and no one
+// piece of it could answer for the rest.
+proc takeBacktickBody(cs: Str[], s: mut Scan, opened: Int): Result<Str, Bool> {
 	start := s.pos
 	for ; s.pos < len(cs); s.pos++ {
 		c := text.charAt(cs, s.pos)
 		if c == "`" {
 			raw := text.span(cs, start, s.pos - 1)
 			s.pos = s.pos + 1
-			append(s.tokens, token.Token(token.Kind.StrLit(text.dedent(raw)), opened))
-			return
+			return Result.Ok(text.dedent(raw))
 		}
 		if c == "\n" {
 			s.line = s.line + 1
 		}
 	}
 	append(s.errors, diag.at(opened, "this backtick string never closes"))
+	return Result.Error(false)
+}
+
+// A backtick string is a `"..."` string that may span lines: the same escapes
+// and the same `{expression}` interpolation, with a newline in the source
+// standing for a newline in the value and the indentation taken off. There is
+// one form of string in this language, and two ways to write it down.
+proc scanBacktick(cs: Str[], s: mut Scan): void {
+	opened := s.line
+	s.pos = s.pos + 1
+	if takeBacktickBody(cs, s, opened) is Result.Ok(body) {
+		splitBacktick(text.chars(body), s, opened)
+	}
+}
+
+// A `` raw`...` `` string is verbatim: no escapes and no interpolation, so every
+// brace in it is a brace. This is the form the Go, SQL and shell text this
+// compiler carries is written in — text that is already somebody else's syntax
+// and has to arrive unread.
+proc scanRawBacktick(cs: Str[], s: mut Scan): void {
+	opened := s.line
+	s.pos = s.pos + 1
+	if takeBacktickBody(cs, s, opened) is Result.Ok(body) {
+		append(s.tokens, token.Token(token.Kind.StrLit(body), opened))
+	}
+}
+
+// The pieces of a dedented backtick body: literal runs, escapes, and
+// `{expression}` interpolations. It is the same walk `scanString` makes, over the
+// same `unescape`, because the two forms of string differ in how they are written
+// and not in what they mean.
+//
+// The body is walked on a cursor of its own. The outer one is already past the
+// closing backtick, and it has already counted every newline in here — counting
+// them twice would move every token after the string down a line. The index it
+// holds points into the file besides, and this points into the dedented body,
+// which is shorter by however much indentation was removed.
+proc splitBacktick(bs: Str[], s: mut Scan, opened: Int): void {
+	mut Scan body = Scan(0, opened, Mode.Normal(), [], [])
+	mut StrPartBuf b = StrPartBuf([], "")
+	for ; body.pos < len(bs); {
+		c := text.charAt(bs, body.pos)
+		if c == "\\" {
+			pushChar(b, unescape(text.charAt(bs, body.pos + 1)))
+			body.pos = body.pos + 2
+		} else if c == "\{" {
+			body.pos = body.pos + 1
+			if scanInterpolation(bs, body, b, opened) == false {
+				// The interpolation has already said what went wrong. It said it
+				// against the body's own scan, which exists only in here.
+				for each e in body.errors {
+					append(s.errors, e)
+				}
+				return
+			}
+		} else {
+			pushChar(b, c)
+			body.pos = body.pos + 1
+		}
+	}
+	finishString(s, b, opened)
 }
 
 func unescape(c: Str): Str {
 	if c == "n" { return "\n" }
 	else if c == "t" { return "\t" }
 	else if c == "r" { return "\r" }
-	// `\"`, `\\`, `\{` and anything else: the character itself. `\{` is the one
-	// that earns the rule — a literal brace, not the start of an interpolation.
+	// `\"`, `` \` ``, `\\`, `\{` and anything else: the character itself. `\{` is
+	// the one that earns the rule — a literal brace, not the start of an
+	// interpolation. Both quoted and backtick strings come through here.
 	return c
 }
 

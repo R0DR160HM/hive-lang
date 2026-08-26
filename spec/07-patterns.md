@@ -94,6 +94,11 @@ path is "/files/{rest}"                  // a trailing hole runs to the end
   avoid.
 * Holes must be plain **binding names**, and two holes may not sit side by side —
   the split point would be ambiguous. Both are compile errors.
+* **`"..."` and `` `...` `` may both be templates**, since both interpolate
+  ([01.3.2](01-lexical.md#132-backtick-strings)). A backtick one spans lines, so
+  a multiline shape — a header block, a fixed-format record — is matched by a
+  pattern written to look like it. A `` raw`...` `` pattern has no holes by
+  construction, which makes it an exact match over as many lines as it covers.
 
 ## 7.5 Exhaustiveness
 

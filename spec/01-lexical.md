@@ -79,6 +79,11 @@ a `using` connection), `csv`, `xlsx`, `ods` and `separating`/`by` (in a `using`
 clause), and `timeout` (in `with timeout`). Because they are not reserved, a
 variable may be called `timeout`.
 
+`raw` is also a keyword when a backtick is **touching** it, where it opens a
+verbatim string ([1.3.2](#132-backtick-strings)). The space is what tells the two
+apart: `run raw x` reads `raw` as the query keyword, and `` raw`x` `` as the
+string prefix.
+
 ### Operators and punctuation
 
 | | |
@@ -105,7 +110,7 @@ leading dot is not a float.
 part of the name. An atom is declared nowhere, so the lexer is the only pass that
 ever looks at its spelling, and it is where the PascalCase rule is enforced.
 
-**Strings** come in two forms.
+**Strings** come in three forms: `"..."`, `` `...` `` and `` raw`...` ``.
 
 ### 1.3.1 Double-quoted strings
 
@@ -134,17 +139,32 @@ and otherwise a sequence of literal and code parts. Lowering is in
 
 ### 1.3.2 Backtick strings
 
-A `` `...` `` string is **raw**: no escapes, no interpolation, and it may span
-lines. It cannot contain a backtick.
+A `` `...` `` string is a double-quoted string that **may span lines**. The
+escapes are the same, the `{expression}` interpolation is the same
+([1.3.1](#131-double-quoted-strings)), and two things are added: a newline in the
+source is a newline in the value, and the indentation is removed at compile time.
+Neither backtick form can contain a backtick.
 
-Its indentation is removed at compile time: leading and trailing blank lines are
-dropped, then the longest common leading whitespace of every non-blank line is
-removed from all of them. So the string says what it looks like, and where it
-sits in the file is a layout matter rather than part of the value.
+```hive
+echo `
+	loaded {len(rows)} of {total}
+	a literal brace: \{
+`
+```
+
+**`` raw`...` `` is the same string with nothing read out of it**: no escapes and
+no interpolation, so every brace is a brace and every backslash a backslash. It
+is how text that is already somebody else's syntax — Go, SQL, a shell command, a
+Dockerfile — is written, where a `{` or a `\n` is the language being carried
+talking and not this one.
+
+The backtick has to be **touching** the `raw`. `run raw` ([04](04-declarations.md#45-query))
+is followed by an expression, and the space between them is what keeps that
+reading available: `run raw x` is the query keyword, `` raw`x` `` is the prefix.
 
 ```hive
 func goSource(): Str {
-	return `
+	return raw`
 		package hive
 
 		func Assert(ok bool) {
@@ -154,9 +174,19 @@ func goSource(): Str {
 }
 ```
 
-The value above opens with `package hive` at column 1. A tab and a space each
-count as one character of indentation, so a file that mixes them within one
-block dedents by character count, not by visual width.
+Both forms have their **indentation removed** at compile time: leading and
+trailing blank lines are dropped, then the longest common leading whitespace of
+every non-blank line is removed from all of them. So the string says what it
+looks like, and where it sits in the file is a layout matter rather than part of
+the value. The value above opens with `package hive` at column 1. A tab and a
+space each count as one character of indentation, so a file that mixes them
+within one block dedents by character count, not by visual width.
+
+Dedenting happens **before** the escapes are read and the pieces split apart,
+because the common indentation belongs to the body as a whole: a literal run
+between two interpolations could not answer for the lines around it. So a `\t`
+written in the source is never part of the margin — the margin is the whitespace
+that is really there.
 
 ### 1.3.3 Two lexer modes
 
