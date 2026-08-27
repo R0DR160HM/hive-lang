@@ -33,8 +33,10 @@ generate very different Go and both be right.
 `hivec`, in `../src`, is written in Hive and compiles to Go. It compiles itself,
 and it drives the Go toolchain itself: `hive build` writes a Go module and then
 runs `go build` over it, through
-[`hive.term.exec`](14-stdlib.md#145-hiveterm). There is no wrapper script doing
-part of the job.
+[`hive.term.exec`](14-stdlib.md#145-hiveterm) — and through `execWith`, its
+environment overlay, when `--target` says to build for another platform
+([15.6](15-lowering.md#156-building-for-another-platform)). There is no wrapper
+script doing part of the job.
 
 **It is a fixpoint of itself.** `../selfhost` builds stage 2 with stage 1 and
 stage 3 with stage 2, and checks that the two emit byte-identical Go. They do.

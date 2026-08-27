@@ -21,6 +21,7 @@ import ./runtime
 import ./text
 import ./vendor
 import hive.file
+import hive.map
 import hive.term
 
 /// What a build produced.
@@ -44,17 +45,50 @@ func buildDirOf(entry: Str): Str {
 
 /// What a program compiled from `entry` is called: the entrypoint's own name
 /// without its extension, and `.exe` where the platform wants one.
-proc executableOf(entry: Str): Str {
-	return paths.stem(entry) + goExe()
+///
+/// A build for another platform says which one in the name — `main-linux-arm64`
+/// beside the `main` this machine builds — because two files that cannot run in
+/// the same places must not answer to one name, and a cross build that silently
+/// replaced the local one would be found out by running it.
+proc executableOf(entry: Str, target: Str): Str {
+	if target == "" {
+		return paths.stem(entry) + goExe("")
+	}
+	return paths.stem(entry) + "-" + text.replace(target, "/", "-") + goExe(target)
 }
 
-/// What the Go toolchain calls an executable here — `""` everywhere but Windows.
-/// Asked of the toolchain rather than guessed at.
-proc goExe(): Str {
-	if hive.term.exec("go", ["env", "GOEXE"], "") is Result.Ok(said) {
+/// What the Go toolchain calls an executable for `target` — `""` everywhere but
+/// Windows. Asked of the toolchain rather than guessed at, and asked *for the
+/// target*, since whose convention it is is the whole of the question: a Windows
+/// program built on Linux still wants its `.exe`.
+proc goExe(target: Str): Str {
+	if hive.term.execWith("go", ["env", "GOEXE"], "", crossing(target)) is Result.Ok(said) {
 		return text.trim(said)
 	}
 	return ""
+}
+
+/// The environment the toolchain is given for `target`. An empty target is an
+/// empty overlay, which `hive.term.execWith` says is `exec` byte for byte — so a
+/// build for this machine runs exactly as it always did, and there is no second
+/// path through here to keep working.
+///
+/// `CGO_ENABLED=0` goes with a cross build and only with one. Everything the
+/// runtime is made of is Go, so nothing in a Hive program needs a C compiler,
+/// and a C *cross*-compiler is the one thing a machine with the Go toolchain on
+/// it cannot be assumed to have.
+func crossing(target: Str): hive.map.Map<Str, Str> {
+	mut hive.map.Map<Str, Str> asked = hive.map.new()
+	if target == "" {
+		return asked
+	}
+	parts := split(target, "/")
+	if parts bounds 0 && parts bounds 1 {
+		hive.map.set(asked, "GOOS", parts[0])
+		hive.map.set(asked, "GOARCH", parts[1])
+		hive.map.set(asked, "CGO_ENABLED", "0")
+	}
+	return asked
 }
 
 /// Everything before anything is written: the program loaded, its generics
@@ -246,8 +280,14 @@ type Toolchain {
 	output: Str
 }
 
-/// Compile `entry` all the way to a native executable beside it.
-proc compile(entry: Str, from: Int): Written {
+/// Compile `entry` all the way to a native executable beside it. An empty
+/// `target` is this machine, and anything else is a `goos/goarch` pair —
+/// `buildsFor` is what says whether the toolchain knows one, and the command
+/// line asks it before calling this, because a platform nobody can build for is
+/// a mistake in what was typed rather than in the program. Reaching here with
+/// one anyway is still an error and not a wrong executable: `go build` refuses
+/// an unsupported pair outright.
+proc compile(entry: Str, target: Str, from: Int): Written {
 	written := build(entry, false, from)
 	if len(written.errors) > 0 {
 		return written
@@ -258,12 +298,50 @@ proc compile(entry: Str, from: Int): Written {
 	if resolveDeps(written, from) is Result.Error(why) {
 		return Written(written.directory, written.files, written.thirdParty, [why])
 	}
-	progress.step(from, "go build")
-	made := toolchain(["build", "-o", paths.joinPath("..", executableOf(entry)), "."], written.directory)
+	progress.step(from, "go build" + saying(target))
+	made := toolchain(["build", "-o", paths.joinPath("..", executableOf(entry, target)), "."], written.directory, target)
 	if made.code != 0 {
 		return Written(written.directory, written.files, written.thirdParty, [goFailed(entry, made)])
 	}
 	return written
+}
+
+/// Whether the Go toolchain builds for `target`. Asked of the toolchain rather
+/// than kept in a list here: `go tool dist list` names every pair it knows, and
+/// a list written down in this file would go stale the first time Go learned
+/// another one.
+///
+/// Asked before a line of Hive is read, so a platform that does not exist is
+/// said straight away rather than after a whole compile. An `Error` is a
+/// toolchain that could not be asked at all, which is a different thing from an
+/// answer of no and is reported against `entry` as every other toolchain
+/// failure is.
+proc buildsFor(entry: Str, target: Str): Result<Bool, diag.Diagnostic> {
+	listed := toolchain(["tool", "dist", "list"], "", "")
+	if listed.code != 0 {
+		return Result.Error(goFailed(entry, listed))
+	}
+	return Result.Ok(names(listed.output, target))
+}
+
+/// Whether what `go tool dist list` wrote holds `target`, which is one line per
+/// pair and nothing else.
+func names(listed: Str, target: Str): Bool {
+	for each line in split(listed, "\n") {
+		if text.trim(line) == target {
+			return true
+		}
+	}
+	return false
+}
+
+/// How a step of progress says which platform it is for. A build for this
+/// machine says nothing, because that is the only thing it has ever done.
+func saying(target: Str): Str {
+	if target == "" {
+		return ""
+	}
+	return " — " + target
 }
 
 /// Compile `entry` and run it, with `args` handed on to the program and the
@@ -279,13 +357,13 @@ proc run(entry: Str, args: Str[], from: Int): Result<Int, diag.Diagnostic[dyn]> 
 		return Result.Error([why])
 	}
 	progress.step(from, "go build")
-	made := toolchain(["build", "-o", "app" + goExe(), "."], written.directory)
+	made := toolchain(["build", "-o", "app" + goExe(""), "."], written.directory, "")
 	if made.code != 0 {
 		return Result.Error([goFailed(entry, made)])
 	}
 	// The build directory sits beside the entrypoint, so from the entrypoint's
 	// own folder the program is one step down.
-	program := paths.joinPath(".", paths.joinPath(paths.baseOf(written.directory), "app" + goExe()))
+	program := paths.joinPath(".", paths.joinPath(paths.baseOf(written.directory), "app" + goExe("")))
 	// The last thing said before the program's own output, so a silence after
 	// this one is the program's rather than the compiler's.
 	progress.step(from, "running " + paths.stem(entry))
@@ -305,7 +383,7 @@ proc runTests(entry: Str, from: Int): Result<Str, diag.Diagnostic[dyn]> {
 		return Result.Error([why])
 	}
 	progress.step(from, "go test")
-	made := toolchain(["test", "-v", "-coverprofile=coverage.out", "./..."], written.directory)
+	made := toolchain(["test", "-v", "-coverprofile=coverage.out", "./..."], written.directory, "")
 	// A failing suite is an answer rather than a malfunction, so its output is
 	// what comes back either way. Two things are not answers: a toolchain that
 	// could not run at all, which is what a negative status says, and one that
@@ -335,15 +413,18 @@ proc resolveDeps(written: Written, from: Int): Result<Bool, diag.Diagnostic> {
 		why = "what an imported Go file imports"
 	}
 	progress.step(from, "go mod tidy — " + why)
-	made := toolchain(["mod", "tidy"], written.directory)
+	// No target here, and deliberately: `go mod tidy` considers every platform at
+	// once rather than the one being built for, so handing it a `GOOS` would say
+	// something it does not read and hide that it does not.
+	made := toolchain(["mod", "tidy"], written.directory, "")
 	if made.code != 0 {
 		return Result.Error(diag.about(written.directory, "what this build links from outside Go's own standard library could not be resolved. `go mod tidy` said:\n\n" + indented(made.output)))
 	}
 	return Result.Ok(true)
 }
 
-proc toolchain(arguments: Str[], directory: Str): Toolchain {
-	said := hive.term.exec("go", arguments, directory)
+proc toolchain(arguments: Str[], directory: Str, target: Str): Toolchain {
+	said := hive.term.execWith("go", arguments, directory, crossing(target))
 	if said is Result.Ok(output) {
 		return Toolchain(0, output)
 	}

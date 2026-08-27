@@ -1,0 +1,66 @@
+// Tests for `src/project`.
+//
+// The parts of the last two steps that can be asked without a build running:
+// what the toolchain is given for a target, what its answer is read as, and what
+// the executable ends up called. Everything else in that file writes a Go module
+// or runs `go` over one, and the end-to-end suite is where those are exercised.
+import ../src/project
+import hive.map
+
+test "no target hands the toolchain no environment at all" {
+	// The whole of why a build for this machine is unchanged: an empty overlay
+	// is exactly `exec`, so there is no second path through the toolchain to
+	// keep working.
+	assert len(hive.map.keys(project.crossing(""))) == 0
+}
+
+test "a target becomes GOOS, GOARCH and no cgo" {
+	asked := project.crossing("linux/arm64")
+	assert valueOf(asked, "GOOS") == "linux"
+	assert valueOf(asked, "GOARCH") == "arm64"
+	// Nothing in the runtime needs a C compiler, and a C cross-compiler is the
+	// one thing a machine with Go on it may not have.
+	assert valueOf(asked, "CGO_ENABLED") == "0"
+}
+
+test "a target that is not a pair sets nothing rather than half of it" {
+	assert len(hive.map.keys(project.crossing("linux"))) == 0
+}
+
+test "names finds a platform in what the toolchain listed" {
+	listed := "darwin/arm64\nlinux/amd64\nlinux/arm64\nwindows/amd64\n"
+	assert project.names(listed, "linux/arm64")
+	assert project.names(listed, "windows/amd64")
+	assert project.names(listed, "sparc/vax") == false
+}
+
+test "names matches a whole line rather than part of one" {
+	// `linux/arm` is a real platform and `linux/arm64` is another, so a match on
+	// the front of a line would build the wrong one.
+	assert project.names("linux/arm64\n", "linux/arm") == false
+	assert project.names("linux/arm64\n", "arm64") == false
+}
+
+test "a cross build is named for the platform it is for" {
+	// Two files that cannot run in the same places must not answer to one name.
+	assert project.executableOf("main.hive", "linux/arm64") == "main-linux-arm64"
+	assert project.executableOf("src/hivec.hive", "darwin/arm64") == "hivec-darwin-arm64"
+}
+
+test "the .exe follows the target rather than this machine" {
+	assert project.executableOf("main.hive", "windows/amd64") == "main-windows-amd64.exe"
+}
+
+test "progress says which platform a build is for, and only then" {
+	assert project.saying("") == ""
+	assert project.saying("linux/arm64") == " — linux/arm64"
+}
+
+// The value under a key, or `""` where there is none — so a missing pair fails
+// an assertion rather than quietly skipping it.
+func valueOf(asked: hive.map.Map<Str, Str>, key: Str): Str {
+	if hive.map.get(asked, key) is Result.Ok(value) {
+		return value
+	}
+	return ""
+}

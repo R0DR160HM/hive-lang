@@ -5,6 +5,7 @@
 //   hive check     <entrypoint.hive>       report any errors, build nothing
 //   hive emit      <entrypoint.hive>       print the generated Go
 //   hive build     <entrypoint.hive>       compile to a native executable
+//   hive build     <entrypoint.hive> --target <goos>/<goarch>
 //   hive run       <entrypoint.hive> [..]  compile and run
 //   hive test      <entrypoint.hive>       run the program's tests, with coverage
 //   hive container <entrypoint.hive>       write a Dockerfile that builds and runs it
@@ -12,12 +13,14 @@
 // Everything a compiler is made of happens here — lexing, parsing, resolving
 // imports, expanding generics, checking, proving every index in range, emitting
 // Go — and so does driving the Go toolchain over what came out, through
-// `hive.term.exec`. There is nothing left for a shell script to do.
+// `hive.term.exec` and, where `--target` names another platform, `execWith`.
+// There is nothing left for a shell script to do.
 import ./container
 import ./diag
 import ./progress
 import ./project
 import ./testreport
+import ./text
 import hive.term
 
 proc main(): void {
@@ -32,12 +35,23 @@ proc main(): void {
 	// line of progress says how long *this* has been going.
 	from := progress.started()
 
+	// `--target` belongs to `build` and to nothing else. Two commands compile
+	// nothing at all, two more are about this machine by definition, and `run`
+	// hands everything past the entrypoint to the program it runs — so the only
+	// wrong thing left to do is take the flag and quietly drop it.
+	if command != "build" && command != "run" {
+		if mentions(rest(args, 2), "--target") {
+			echo "hive: `--target` is a flag of `hive build`. `{command}` builds nothing for another platform."
+			hive.term.exit(1)
+		}
+	}
+
 	if command == "check" {
 		report(project.check(entry, from), "No problems found in {entry}", from)
 	} else if command == "emit" {
 		emit(entry, from)
 	} else if command == "build" {
-		build(entry, from)
+		build(entry, rest(args, 2), from)
 	} else if command == "run" {
 		run(entry, rest(args, 2), from)
 	} else if command == "test" {
@@ -65,15 +79,38 @@ proc emit(entry: Str, from: Int): void {
 	}
 }
 
-proc build(entry: Str, from: Int): void {
-	written := project.compile(entry, from)
+proc build(entry: Str, flags: Str[], from: Int): void {
+	asked := askedFor(flags)
+	if asked.error != "" {
+		echo "hive: " + asked.error
+		hive.term.exit(1)
+	}
+	// A platform the toolchain cannot build for is a mistake in what was typed
+	// rather than in the program, so it is said the way the other ones here are
+	// — and said now, rather than after a whole compile has been spent on it.
+	// A toolchain that could not be asked at all is the other answer, and that
+	// one really is about the build.
+	if asked.target != "" {
+		known := project.buildsFor(entry, asked.target)
+		if known is Result.Error(why) {
+			complain([why])
+			return
+		}
+		if known is Result.Ok(builds) {
+			if builds == false {
+				echo "hive: `--target " + asked.target + "` is not a platform the Go toolchain builds for. A target is a `goos/goarch` pair — `linux/arm64`, `darwin/arm64`, `windows/amd64` — and `go tool dist list` names every one it knows."
+				hive.term.exit(1)
+			}
+		}
+	}
+	written := project.compile(entry, asked.target, from)
 	if len(written.errors) > 0 {
 		complain(written.errors)
 		return
 	}
 	// What it cost is part of the answer, so this one is on standard output with
 	// the rest of the answer, and is said whether anybody was watching or not.
-	echo "Compiled {entry} -> " + project.executableOf(entry) + " (" + progress.took(progress.since(from)) + ")"
+	echo "Compiled {entry} -> " + project.executableOf(entry, asked.target) + " (" + progress.took(progress.since(from)) + ")"
 }
 
 proc run(entry: Str, args: Str[], from: Int): void {
@@ -161,6 +198,55 @@ func rest(args: Str[], from: Int): Str[dyn] {
 	return out
 }
 
+// --- What a build was asked for ------------------------------------------------
+
+/// What followed the entrypoint on a `build`, read. There is exactly one flag
+/// there, so `error` is either empty or the whole of what went wrong — a build
+/// has nothing to get half right.
+type Asked {
+	/// The platform to build for, `goos/goarch`, or `""` for this machine.
+	target: Str
+	error: Str
+}
+
+/// `--target linux/arm64` and `--target=linux/arm64` are one flag spelled two
+/// ways, because both spellings are what everybody's fingers already know.
+/// Anything else is refused rather than skipped: a flag a build ignored is a
+/// build that did something other than what it was told to, and said nothing.
+func askedFor(flags: Str[]): Asked {
+	mut target := ""
+	mut wants := false
+	for each flag in flags {
+		if wants {
+			target = flag
+			wants = false
+		} else if flag == "--target" {
+			wants = true
+		} else if text.startsWith(flag, "--target=") {
+			target = text.span(text.chars(flag), len("--target="), len(flag) - 1)
+		} else {
+			return Asked("", "`" + flag + "` is not something `hive build` takes. The one flag here is `--target <goos>/<goarch>`.")
+		}
+	}
+	// `--target` with the platform left off, and `--target=` with it left empty,
+	// are the same mistake and get the same answer.
+	if wants || (len(flags) > 0 && target == "") {
+		return Asked("", "`--target` was given no platform to build for. It takes a `goos/goarch` pair — `hive build <entrypoint.hive> --target linux/arm64`.")
+	}
+	return Asked(target, "")
+}
+
+/// Whether `flags` holds `name`, either spelling. Asked of the commands that
+/// have no use for a flag, so that they can say so.
+func mentions(flags: Str[], name: Str): Bool {
+	for each flag in flags {
+		if flag == name || text.startsWith(flag, name + "=") {
+			return true
+		}
+	}
+	return false
+}
+
 proc usage(): void {
 	echo "Hive — a table-based language that compiles to Go"
 	echo ""
@@ -171,4 +257,8 @@ proc usage(): void {
 	echo "  hive run       <entrypoint.hive> [..]  Compile and run"
 	echo "  hive test      <entrypoint.hive>       Run the program's tests, with coverage"
 	echo "  hive container <entrypoint.hive>       Write a Dockerfile that builds and runs it"
+	echo ""
+	echo "Flags:"
+	echo "  --target <goos>/<goarch>               Build for another platform, on `build` alone."
+	echo "                                         `go tool dist list` names every one."
 }

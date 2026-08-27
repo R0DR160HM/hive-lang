@@ -17,6 +17,7 @@ a compiler for it written in the language it compiles.
 ./hive check     <entrypoint.hive>    report any errors, build nothing
 ./hive emit      <entrypoint.hive>    print the generated Go
 ./hive build     <entrypoint.hive>    compile to a native executable
+./hive build     <entrypoint.hive> --target <goos>/<goarch>
 ./hive container <entrypoint.hive>    write a Dockerfile that builds and runs it
 
 ./test/run                            every test the compiler has
@@ -204,9 +205,26 @@ one. A digest that does not match is never run.
 
 ### Building it for another platform
 
-The compiler *is* a Go program, and after any build the module it was compiled
-from is still sitting there — so Go's own cross-compilation makes a binary for
-anywhere it targets, in about twenty seconds:
+**Your own program** is built for another platform by saying which one, and the
+compiler does the rest:
+
+```sh
+./hive build main.hive --target linux/arm64      # writes main-linux-arm64
+./hive build main.hive --target=windows/amd64    # writes main-windows-amd64.exe
+```
+
+A target is a `goos/goarch` pair, and the pair is checked against
+`go tool dist list` before a line of Hive is read — an unknown one is an error
+straight away rather than ten seconds into a build. A cross build says which
+platform it is for in its name, so it never displaces the executable this machine
+made, and it takes its `.exe` from the target rather than from here.
+`CGO_ENABLED=0` goes with a cross build and only with one: nothing in the runtime
+needs a C compiler, and a C *cross*-compiler is the one thing a machine with Go
+on it may not have.
+
+**The compiler itself** is a Go program, and after any build the module it was
+compiled from is still sitting there — so Go's own cross-compilation makes a
+binary for anywhere it targets, in about twenty seconds:
 
 ```sh
 ./bootstrap                                   # writes src/hivec.hive-build
@@ -217,8 +235,7 @@ GOOS=linux   GOARCH=arm64 go build -o hivec-linux-arm64 .
 ```
 
 Each one is a complete compiler: the runtime it carries is source text inside it,
-so nothing else has to travel. The same trick builds *your* program for another
-platform — every `hive build` leaves its Go module in `<entrypoint>.hive-build`.
+so nothing else has to travel.
 
 ### In a container
 
@@ -387,8 +404,10 @@ its three.js fetched over HTTPS and checked against a pinned SHA-256 — with
 
 All of that is Hive, through
 [`hive.term.exec`](spec/14-stdlib.md#145-hiveterm) — a call that runs a command
-and hands back everything it wrote, and `hive.term.attach`, which gives a command
-this program's own terminal instead.
+and hands back everything it wrote; `hive.term.attach`, which gives a command
+this program's own terminal instead; and `hive.term.execWith`, which is `exec`
+with an environment overlay, and is the whole of how `--target` builds for
+another platform.
 
 [18 — Conformance](spec/18-conformance.md) is where an implementation answers for
 itself: what it implements (all of it), where it does what the specification

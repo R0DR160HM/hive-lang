@@ -102,3 +102,42 @@ is why the generated code is laid out the way it is.
 `go.mod` names no dependency unless the program reached for one of the two
 modules that have any ([14](14-stdlib.md)). A build that sees a third-party
 import in an FFI file runs `go mod tidy` first.
+
+## 15.6 Building for another platform
+
+Because the last step is the Go toolchain, a Hive program is built for another
+platform the way any Go program is — by telling the toolchain which one.
+`hive build` takes a **target**, and nothing else does:
+
+```
+hive build main.hive --target linux/arm64
+hive build main.hive --target=windows/amd64
+```
+
+A target is a `goos/goarch` pair, and **the pair is checked before anything is
+compiled** — `go tool dist list` names every one the toolchain knows, and one it
+does not name is refused there and then rather than ten seconds later, by a
+build failing in a language you did not write. The list is asked for rather than
+kept anywhere, so a platform Go learns tomorrow needs no change here. A platform
+that does not exist is a mistake in what was typed, so it is reported as one:
+`hive: ...`, where the other command-line mistakes are, rather than against a
+line of a program that has nothing wrong with it.
+
+**What comes out says what it is for.** A host build of `main.hive` is `main`,
+and a cross build is `main-linux-arm64` — two files that cannot run in the same
+places must not answer to one name, and a cross build that quietly replaced the
+local one would only be found out by running it. The `.exe` follows the
+*target*: `--target windows/amd64` writes `main-windows-amd64.exe` from any
+machine.
+
+**`CGO_ENABLED=0` goes with a cross build and only with one.** Everything the
+runtime is made of is Go, so no Hive program needs a C compiler — and a C
+*cross*-compiler is the one thing a machine with the Go toolchain on it cannot
+be assumed to have. A build for the machine it is running on is given no
+environment at all, and is therefore byte for byte the build it always was.
+
+`--target` is a flag of `build`. `check` and `emit` compile nothing, `test` and
+`container` are about this machine, and each of them **refuses** the flag rather
+than accepting and ignoring it. `run` is the exception that proves it: everything
+after the entrypoint there belongs to the program being run, so `--target` is
+passed straight through to it, unread.

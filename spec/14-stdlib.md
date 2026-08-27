@@ -179,15 +179,16 @@ name the environment already holds is replaced rather than joined by a second.
 
 ```hive
 mut hive.map.Map<Str, Str> asked = hive.map.new()
-hive.map.set(asked, "GOOS", "android")
+hive.map.set(asked, "GOOS", "linux")
 hive.map.set(asked, "GOARCH", "arm64")
 
-// `go env GOOS` now says `android`, and `go` is still found on the PATH.
+// `go env GOOS` now says `linux`, and `go` is still found on the PATH.
 hive.term.execWith("go", ["build", "."], buildDirectory, asked)
 ```
 
-This is what `hive build --target` is built on — see [15](15-lowering.md) — and
-it is the only thing in the compiler that needs an environment at all.
+This is what `hive build --target` is built on
+([15.6](15-lowering.md#156-building-for-another-platform)) — and it is the only
+thing in the compiler that needs an environment at all.
 
 ## 14.6 Reading tables (`using`)
 
