@@ -80,7 +80,7 @@ proc expand(m: ast.Module, from: Int): Expanded {
 	env := infer.newEnv(t)
 	mut walked := 0
 	for each d in m.decls {
-		if isGeneric(mo, ast.declName(d)) == false {
+		if isGeneric(mo.generics, ast.declName(d)) == false {
 			mo.line = ast.declLine(d)
 			append(out, rewriteDecl(mo, env, d))
 		}
@@ -138,8 +138,8 @@ func variablesOf(t: types.Table, names: Str[]): Str[dyn] {
 	return out
 }
 
-func isGeneric(mo: Mono, name: Str): Bool {
-	return indexOf(mo.generics, name) is Result.Ok(_)
+func isGeneric(generics: Str[], name: Str): Bool {
+	return indexOf(generics, name) is Result.Ok(_)
 }
 
 // --- Asking for a copy -------------------------------------------------------
@@ -249,10 +249,7 @@ proc substituteDecl(mo: mut Mono, env: infer.Env, d: ast.Decl, flat: Str, variab
 		// The body writes the variables down too — `mut K[dyn] out = []`,
 		// `for each v: T in values` — so each copy substitutes through its own.
 		// The parameters go into scope first, with the types this copy gave them.
-		mut infer.Env inner = env
-		for each p in out {
-			inner = infer.bound(inner, p.name, types.resolve(mo.table, p.declared))
-		}
+		inner := infer.boundParams(env, out, 0)
 		return ast.Decl.CallableDecl(kind, flat, out, substitute(mo, result, variables, args), substituteBlock(mo, inner, body, variables, args), line)
 	}
 	return d
@@ -324,7 +321,7 @@ proc renameGenerics(mo: mut Mono, t: ast.TypeExpr): ast.TypeExpr {
 		for each a in typeArgs {
 			append(out, renameGenerics(mo, a))
 		}
-		if pkg == "" && isGeneric(mo, name) && len(out) > 0 {
+		if pkg == "" && isGeneric(mo.generics, name) && len(out) > 0 {
 			return ast.TypeExpr.Named("", wanted(mo, name, ArgList(out)), [], dims)
 		}
 		return ast.TypeExpr.Named(pkg, name, out, dims)
@@ -338,7 +335,7 @@ proc renameGenerics(mo: mut Mono, t: ast.TypeExpr): ast.TypeExpr {
 /// pins down `A` and says nothing at all about `B`.
 proc retarget(mo: mut Mono, want: ast.TypeExpr, value: ast.Expr): ast.Expr {
 	if want is ast.TypeExpr.Named(pkg, name, typeArgs, _) {
-		if pkg == "" && isGeneric(mo, name) && len(typeArgs) > 0 {
+		if pkg == "" && isGeneric(mo.generics, name) && len(typeArgs) > 0 {
 			flat := wanted(mo, name, ArgList(renamedAll(mo, typeArgs)))
 			return aimedAt(name, flat, value)
 		}
@@ -428,22 +425,31 @@ proc rewriteDecl(mo: mut Mono, env: infer.Env, d: ast.Decl): ast.Decl {
 // only because `names` is known to be a `Str[2]` here.
 proc substituteBlock(mo: mut Mono, env: infer.Env, b: ast.Block, variables: Str[], args: ArgList): ast.Block {
 	mut ast.Stmt[dyn] out = []
-	mut infer.Env inner = env
-	for each s in b.stmts {
-		next := substituteStmt(mo, inner, s, variables, args)
-		append(out, next)
-		inner = bindFrom(mo, inner, next)
-	}
+	substituteStmts(mo, env, b.stmts, 0, out, variables, args)
 	return ast.Block(out)
 }
 
+// Each statement rewritten with the bindings of everything before it in scope.
+// It recurses rather than threading a `mut infer.Env` through a loop, and that
+// is a performance decision: an `Env` carries the whole table, a `mut` binding
+// off an immutable one has to be copied to keep `8.3`'s invariant, and a copy
+// of the table per statement was most of what this pass cost. `env` here is an
+// immutable parameter — storage nothing can write — so nothing is copied.
+proc substituteStmts(mo: mut Mono, env: infer.Env, stmts: ast.Stmt[], at: Int, into: mut ast.Stmt[dyn], variables: Str[], args: ArgList): void {
+	if stmts bounds at {
+		next := substituteStmt(mo, env, stmts[at], variables, args)
+		append(into, next)
+		substituteStmts(mo, bindFrom(env.table, env, next), stmts, at + 1, into, variables, args)
+	}
+}
+
 // The scope a statement leaves behind.
-func bindFrom(mo: Mono, env: infer.Env, s: ast.Stmt): infer.Env {
+func bindFrom(t: types.Table, env: infer.Env, s: ast.Stmt): infer.Env {
 	if s is ast.Stmt.VarDecl(name, value, _, _) {
 		return infer.bound(env, name, infer.typeOf(env, value))
 	}
 	if s is ast.Stmt.TypedDecl(declared, name, _, _, _) {
-		return infer.bound(env, name, types.resolve(mo.table, declared))
+		return infer.bound(env, name, types.resolve(t, declared))
 	}
 	return env
 }
@@ -471,7 +477,7 @@ proc substituteStmt(mo: mut Mono, env: infer.Env, s: ast.Stmt, variables: Str[],
 		// The counter is scoped to the loop, and the condition, the post clause
 		// and the body all read it.
 		newInit := substituteStmt(mo, env, init, variables, args)
-		inner := bindFrom(mo, env, newInit)
+		inner := bindFrom(env.table, env, newInit)
 		return ast.Stmt.ForLoop(newInit, substituteExpr(mo, inner, cond, variables, args), substituteStmt(mo, inner, post, variables, args), substituteBlock(mo, inner, body, variables, args))
 	} else if s is ast.Stmt.ForEach(name, declared, subject, body) {
 		newSubject := substituteExpr(mo, env, subject, variables, args)
@@ -479,7 +485,7 @@ proc substituteStmt(mo: mut Mono, env: infer.Env, s: ast.Stmt, variables: Str[],
 		mut element := types.elementOf(infer.typeOf(env, newSubject))
 		if newType is ast.TypeExpr.VoidType {
 		} else {
-			element = types.resolve(mo.table, newType)
+			element = types.resolve(env.table, newType)
 		}
 		return ast.Stmt.ForEach(name, newType, newSubject, substituteBlock(mo, infer.bound(env, name, element), body, variables, args))
 	}
@@ -544,7 +550,7 @@ proc substituteExpr(mo: mut Mono, env: infer.Env, e: ast.Expr, variables: Str[],
 		// here: `substituteCall` reads it before this does.
 		// Only a callable: a bare type name is always part of a constructor path
 		// — `Either.Left(...)` — and is never a value on its own.
-		if isGeneric(mo, name) && types.findCallable(mo.table, name) is Result.Ok(_) {
+		if isGeneric(mo.generics, name) && types.findCallable(env.table, name) is Result.Ok(_) {
 			append(mo.errors, diag.at(mo.line, "`{name}` is generic, so it cannot be used as a value: which copy a call reaches is decided by the argument types, and a value carries none. Call it, or wrap it in a callable of your own that is not generic"))
 		}
 		return e
@@ -555,7 +561,7 @@ proc substituteExpr(mo: mut Mono, env: infer.Env, e: ast.Expr, variables: Str[],
 // A pattern's path names a type, and the copy is what the subject actually is.
 proc aimPattern(mo: mut Mono, env: infer.Env, subject: ast.Expr, p: ast.Pattern): ast.Pattern {
 	if p is ast.Pattern.Constructor(path, bindings, parenthesised) {
-		if len(path) == 2 && isGeneric(mo, nameAt(path, 0)) {
+		if len(path) == 2 && isGeneric(mo.generics, nameAt(path, 0)) {
 			// The copy is not in the table this pass reads — the table is of the
 			// program as it was written — so its name arrives as a type variable
 			// rather than as a declared type. Either way it is the name.
@@ -583,7 +589,7 @@ proc substituteCall(mo: mut Mono, env: infer.Env, callee: ast.Expr, callArgs: as
 		append(out, ast.Arg(a.name, substituteExpr(mo, env, a.value, variables, args)))
 	}
 	if callee is ast.Expr.Ident(name) {
-		if isGeneric(mo, name) {
+		if isGeneric(mo.generics, name) {
 			return ast.Expr.Call(ast.Expr.Ident(chosen(mo, env, name, out)), out)
 		}
 	}
@@ -592,8 +598,8 @@ proc substituteCall(mo: mut Mono, env: infer.Env, callee: ast.Expr, callArgs: as
 
 // The copy a call reaches, asked for if it has not been asked for yet.
 proc chosen(mo: mut Mono, env: infer.Env, name: Str, callArgs: ast.Arg[]): Str {
-	if types.findCallable(mo.table, name) is Result.Ok(info) {
-		variables := variablesOf(mo.table, info.parameters)
+	if types.findCallable(env.table, name) is Result.Ok(info) {
+		variables := variablesOf(env.table, info.parameters)
 		mut ast.TypeExpr[dyn] found = []
 		for each v in variables {
 			found = withWritten(found, solve(mo, env, info.params, callArgs, v))
@@ -603,8 +609,8 @@ proc chosen(mo: mut Mono, env: infer.Env, name: Str, callArgs: ast.Arg[]): Str {
 	// A generic *type* being constructed: `Box(["a"], "people")` names the copy
 	// its declaration was written out as, which the declaration site already
 	// asked for.
-	if types.findType(mo.table, name) is Result.Ok(info) {
-		variables := variablesOf(mo.table, info.parameters)
+	if types.findType(env.table, name) is Result.Ok(info) {
+		variables := variablesOf(env.table, info.parameters)
 		mut ast.TypeExpr[dyn] found = []
 		for each v in variables {
 			found = withWritten(found, solveFields(mo, env, info.shared, callArgs, v))
