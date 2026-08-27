@@ -66,7 +66,7 @@ proc checkDecl(c: mut Check, env: infer.Env, d: ast.Decl): void {
 		c.inside = name
 		c.line = line
 		c.pure = kind is ast.CallableKind.FuncKind
-		c.result = types.resolve(c.table, result)
+		c.result = types.resolve(env.table, result)
 		c.inTest = false
 		c.loops = 0
 		c.mutable = []
@@ -78,7 +78,7 @@ proc checkDecl(c: mut Check, env: infer.Env, d: ast.Decl): void {
 		// storage its caller can see, and there is nothing in a query body that
 		// could.
 		c.pure = true
-		c.result = types.resolve(c.table, result)
+		c.result = types.resolve(env.table, result)
 		c.inTest = false
 		c.loops = 0
 		c.mutable = []
@@ -99,7 +99,6 @@ proc checkDecl(c: mut Check, env: infer.Env, d: ast.Decl): void {
 // are not text are checked like the expressions they are: a bound value, and the
 // condition on an optional predicate.
 proc checkQuery(c: mut Check, env: infer.Env, params: ast.Param[], result: ast.TypeExpr, sql: ast.SqlPart[]): void {
-	mut infer.Env inner = env
 	mut Str[dyn] seen = []
 	for each p in params {
 		if indexOf(seen, p.name) is Result.Ok(_) {
@@ -109,9 +108,9 @@ proc checkQuery(c: mut Check, env: infer.Env, params: ast.Param[], result: ast.T
 		if p.mutex {
 			report(c, "a query cannot declare the mutex parameter `{p.name}: mut ...`: its body is SQL, and there is nothing in one that could write through it")
 		}
-		inner = infer.bound(inner, p.name, types.resolve(c.table, p.declared))
 	}
-	rows := types.resolve(c.table, result)
+	inner := infer.boundParams(env, params, 0)
+	rows := types.resolve(env.table, result)
 	checkRowType(c, rows)
 	checkSelectStar(c, rows, sql)
 	checkSql(c, inner, sql)
@@ -390,7 +389,6 @@ proc checkTypeDecl(c: mut Check, fields: ast.Field[], variants: ast.Variant[]): 
 }
 
 proc checkCallable(c: mut Check, env: infer.Env, name: Str, params: ast.Param[], body: ast.Block): void {
-	mut infer.Env inner = env
 	mut Str[dyn] seen = []
 	for each p in params {
 		if indexOf(seen, p.name) is Result.Ok(_) {
@@ -405,15 +403,14 @@ proc checkCallable(c: mut Check, env: infer.Env, name: Str, params: ast.Param[],
 		if p.mutex {
 			append(c.mutable, p.name)
 		}
-		inner = infer.bound(inner, p.name, types.resolve(c.table, p.declared))
 	}
-	checkBlock(c, inner, body)
+	checkBlock(c, infer.boundParams(env, params, 0), body)
 
 	// Every non-`void` callable must return on every path.
 	if c.result is types.Ty.TVoid {
 		return
 	}
-	if terminates(c, body) == false {
+	if terminates(env.table, body) == false {
 		report(c, "`{name}` answers with " + types.show(c.result) + ", so every path through it has to return one. A path terminates by ending in `return`, in `assert` or `panic`, in an `if`/`else` whose every branch terminates, or in an else-less `if`/`else if` chain that covers its subject's whole type")
 	}
 }
@@ -422,12 +419,20 @@ proc checkCallable(c: mut Check, env: infer.Env, name: Str, params: ast.Param[],
 
 proc checkBlock(c: mut Check, env: infer.Env, b: ast.Block): infer.Env {
 	mark := len(c.mutable)
-	mut infer.Env inner = env
-	for each s in b.stmts {
-		inner = checkStmt(c, inner, s)
-	}
+	after := checkStmts(c, env, b.stmts, 0)
 	restore(c, mark)
-	return inner
+	return after
+}
+
+// Each statement checked with the bindings of everything before it in scope.
+// Recursion rather than a `mut infer.Env` threaded through a loop: an `Env`
+// carries the whole table, and a `mut` one is copied at every use to keep
+// `8.3`'s invariant.
+proc checkStmts(c: mut Check, env: infer.Env, stmts: ast.Stmt[], at: Int): infer.Env {
+	if stmts bounds at {
+		return checkStmts(c, checkStmt(c, env, stmts[at]), stmts, at + 1)
+	}
+	return env
 }
 
 proc restore(c: mut Check, mark: Int): void {
@@ -454,7 +459,7 @@ proc checkStmt(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
 		return infer.bound(env, name, ty)
 	} else if s is ast.Stmt.TypedDecl(declared, name, value, mutable, deferred) {
 		checkExpr(c, env, value)
-		ty := types.resolve(c.table, declared)
+		ty := types.resolve(env.table, declared)
 		if deferred == false {
 			fits(c, ty, infer.typeOf(env, value), "the declaration of `{name}`")
 		}
@@ -471,7 +476,7 @@ proc checkStmt(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
 	} else if s is ast.Stmt.IfChain(branches, otherwise, hasElse) {
 		for each b in branches {
 			checkCondition(c, env, b.condition)
-			checkBlock(c, afterCondition(c, env, b.condition), b.body)
+			checkBlock(c, afterCondition(env, b.condition), b.body)
 		}
 		if hasElse {
 			checkBlock(c, env, otherwise)
@@ -508,7 +513,7 @@ proc checkStmtTail(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
 		mut elementType := types.elementOf(subjectType)
 		if declared is ast.TypeExpr.VoidType {
 		} else {
-			elementType = types.resolve(c.table, declared)
+			elementType = types.resolve(env.table, declared)
 		}
 		c.loops = c.loops + 1
 		checkBlock(c, infer.bound(env, name, elementType), body)
@@ -566,7 +571,7 @@ proc checkAssign(c: mut Check, env: infer.Env, target: ast.Expr, value: ast.Expr
 		report(c, "this is not something that can be assigned to: a target is a name, or a path into one through its fields and elements")
 		return
 	}
-	if isMutable(c, root) == false {
+	if isMutable(c.mutable, root) == false {
 		report(c, "cannot assign to `{root}`: it is immutable — declare it with `mut` to allow reassignment")
 		return
 	}
@@ -583,8 +588,8 @@ func rootName(target: ast.Expr): Str {
 	return ""
 }
 
-func isMutable(c: Check, name: Str): Bool {
-	return indexOf(c.mutable, name) is Result.Ok(_)
+func isMutable(mutable: Str[], name: Str): Bool {
+	return indexOf(mutable, name) is Result.Ok(_)
 }
 
 // A condition is a `Bool` and nothing else. There is no truthiness in Hive: an
@@ -603,7 +608,7 @@ proc checkCondition(c: mut Check, env: infer.Env, condition: ast.Expr): void {
 }
 
 // The scope a condition leaves behind, which is whatever its patterns bound.
-func afterCondition(c: Check, env: infer.Env, condition: ast.Expr): infer.Env {
+func afterCondition(env: infer.Env, condition: ast.Expr): infer.Env {
 	return infer.narrowed(env, condition)
 }
 
@@ -617,7 +622,7 @@ proc checkExpr(c: mut Check, env: infer.Env, e: ast.Expr): void {
 		// A binding an `is` made is usable in the rest of the same condition
 		// after `&&` — which is the whole reason the two are told apart here.
 		if op is ast.BinOp.And {
-			narrowed := afterCondition(c, env, left)
+			narrowed := afterCondition(env, left)
 			checkExpr(c, narrowed, right)
 			checkOperands(c, narrowed, op, left, right)
 		} else {
@@ -675,10 +680,10 @@ proc checkName(c: mut Check, env: infer.Env, name: Str): void {
 	if infer.isBound(env, name) {
 		return
 	}
-	if types.findCallable(c.table, name) is Result.Ok(_) {
+	if types.findCallable(env.table, name) is Result.Ok(_) {
 		return
 	}
-	if types.findType(c.table, name) is Result.Ok(_) {
+	if types.findType(env.table, name) is Result.Ok(_) {
 		return
 	}
 	if name == "Result" {
@@ -703,7 +708,7 @@ proc checkMember(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str): v
 		if head == "hive" || head == "Result" {
 			return
 		}
-		if types.findType(c.table, head) is Result.Ok(_) {
+		if types.findType(env.table, head) is Result.Ok(_) {
 			return
 		}
 	}
@@ -717,14 +722,14 @@ proc checkMember(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str): v
 	checkExpr(c, env, subject)
 	ty := infer.typeOf(env, subject)
 	if ty is types.Ty.TNamed(name) {
-		if hasField(c, name, field) == false {
+		if hasField(env.table, name, field) == false {
 			report(c, "`" + name + "` has no field `{field}`")
 		}
 	}
 }
 
-func hasField(c: Check, typeName: Str, field: Str): Bool {
-	if types.findType(c.table, typeName) is Result.Ok(info) {
+func hasField(t: types.Table, typeName: Str, field: Str): Bool {
+	if types.findType(t, typeName) is Result.Ok(info) {
 		for each f in info.shared {
 			if f.name == field {
 				return true
@@ -790,11 +795,11 @@ proc checkNamedCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): v
 		checkCallableValue(c, env, name)
 		return
 	}
-	if types.findCallable(c.table, name) is Result.Ok(info) {
+	if types.findCallable(env.table, name) is Result.Ok(info) {
 		checkArguments(c, env, name, info, args)
 		return
 	}
-	if types.fieldsOfStruct(c.table, name) is Result.Ok(fields) {
+	if types.fieldsOfStruct(env.table, name) is Result.Ok(fields) {
 		checkFieldArguments(c, env, name, fields, args)
 		return
 	}
@@ -802,7 +807,7 @@ proc checkNamedCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): v
 		checkBuiltinCall(c, env, name, args)
 		return
 	}
-	if types.findType(c.table, name) is Result.Ok(_) {
+	if types.findType(env.table, name) is Result.Ok(_) {
 		report(c, "`{name}` is a tagged union, so a value of it is built by naming the variant: `{name}.SomeVariant(...)`")
 		return
 	}
@@ -848,8 +853,8 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
 			checkBuiltinCall(c, env, field, args)
 			return
 		}
-		if types.findType(c.table, head) is Result.Ok(info) {
-			if types.findVariant(c.table, head, field) is Result.Ok(fields) {
+		if types.findType(env.table, head) is Result.Ok(info) {
+			if types.findVariant(env.table, head, field) is Result.Ok(fields) {
 				checkFieldArguments(c, env, head + "." + field, fields, args)
 			} else {
 				report(c, "`" + head + "` has no variant `{field}`")
@@ -949,11 +954,11 @@ proc checkArguments(c: mut Check, env: infer.Env, name: Str, info: types.Callabl
 		// to be a `mut` variable or a path into one.
 		if p.mutex {
 			root := rootName(found)
-			if root == "" || isMutable(c, root) == false {
+			if root == "" || isMutable(c.mutable, root) == false {
 				report(c, "`{name}` asks for the mutex itself in `{p.name}: mut ...`, so the argument has to be a `mut` variable or a path into one — this one is not")
 			}
 		}
-		fits(c, types.resolve(c.table, p.declared), infer.typeOf(env, found), "the argument `{p.name}` of `{name}`")
+		fits(c, types.resolve(env.table, p.declared), infer.typeOf(env, found), "the argument `{p.name}` of `{name}`")
 		i = i + 1
 	}
 }
@@ -982,7 +987,7 @@ proc checkFieldArguments(c: mut Check, env: infer.Env, name: Str, fields: ast.Fi
 			i = i + 1
 			continue
 		}
-		fits(c, types.resolve(c.table, f.declared), infer.typeOf(env, found), "the field `{f.name}` of `{name}`")
+		fits(c, types.resolve(env.table, f.declared), infer.typeOf(env, found), "the field `{f.name}` of `{name}`")
 		i = i + 1
 	}
 }
@@ -1305,7 +1310,7 @@ proc checkGrows(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[], wanted
 	}
 	target := argFor(args, "", 0)
 	root := rootName(target)
-	if root == "" || isMutable(c, root) == false {
+	if root == "" || isMutable(c.mutable, root) == false {
 		report(c, "`{name}` grows a vector in place, so its target has to be `mut` — this one is not")
 		return
 	}
@@ -1343,7 +1348,7 @@ proc checkStatementExpr(c: mut Check, env: infer.Env, value: ast.Expr): void {
 			root := rootName(target)
 			if root == "" {
 				report(c, "a `sort` written as a statement throws away the vector it answers with, so it only means something when it can sort in place — and there is nothing here to sort in place. Keep the answer instead")
-			} else if isMutable(c, root) == false {
+			} else if isMutable(c.mutable, root) == false {
 				report(c, "a `sort` written as a statement sorts in place, which needs a `mut` vector — `{root}` is not one. Declare it `mut` to sort it where it lies, or keep the answer")
 			}
 		}
@@ -1368,14 +1373,14 @@ proc checkAsync(c: mut Check, env: infer.Env, call: ast.Expr): void {
 					report(c, "`async` cannot fire off the builtin `{name}`: the global builtins exist for the value they hand back, so firing one off would leave nothing of it")
 					return
 				}
-				if types.findType(c.table, name) is Result.Ok(_) {
+				if types.findType(env.table, name) is Result.Ok(_) {
 					report(c, "`async` cannot fire off a constructor: `{name}(...)` builds a value and runs no body")
 				}
 			}
 		}
 		if callee is ast.Expr.Member(head, variant) {
 			if head is ast.Expr.Ident(typeName) {
-				if typeName == "Result" || types.findType(c.table, typeName) is Result.Ok(_) {
+				if typeName == "Result" || types.findType(env.table, typeName) is Result.Ok(_) {
 					report(c, "`async` cannot fire off a constructor: `{typeName}.{variant}(...)` builds a value and runs no body")
 				}
 			}
@@ -1441,28 +1446,28 @@ func segment(path: Str[], index: Int): Str {
 // for a tail you know is unreachable), in an `if`/`else` whose every branch
 // terminates, or in an else-less `if`/`else if` chain that covers its subject's
 // whole type.
-func terminates(c: Check, b: ast.Block): Bool {
+func terminates(t: types.Table, b: ast.Block): Bool {
 	last := len(b.stmts) - 1
 	if b.stmts bounds last {
-		return terminatesWith(c, b.stmts[last])
+		return terminatesWith(t, b.stmts[last])
 	}
 	return false
 }
 
-func terminatesWith(c: Check, s: ast.Stmt): Bool {
+func terminatesWith(t: types.Table, s: ast.Stmt): Bool {
 	if s is ast.Stmt.ReturnStmt(_) { return true }
 	if s is ast.Stmt.PanicStmt(_) { return true }
 	if s is ast.Stmt.AssertStmt(_) { return true }
 	if s is ast.Stmt.IfChain(branches, otherwise, hasElse) {
 		for each branch in branches {
-			if terminates(c, branch.body) == false {
+			if terminates(t, branch.body) == false {
 				return false
 			}
 		}
 		if hasElse {
-			return terminates(c, otherwise)
+			return terminates(t, otherwise)
 		}
-		return covers(c, branches)
+		return covers(t, branches)
 	}
 	return false
 }
@@ -1470,7 +1475,7 @@ func terminatesWith(c: Check, s: ast.Stmt): Bool {
 // Whether an else-less chain covers its subject's whole type: every variant of a
 // declared union, or a `Result`'s `Ok` and `Error`. Every branch has to test the
 // same subject, since a chain that changed subject halfway covers neither.
-func covers(c: Check, branches: ast.Branch[]): Bool {
+func covers(t: types.Table, branches: ast.Branch[]): Bool {
 	mut subject := ""
 	mut Str[dyn] variants = []
 	mut typeName := ""
@@ -1500,7 +1505,7 @@ func covers(c: Check, branches: ast.Branch[]): Bool {
 	if typeName == "Result" {
 		return indexOf(variants, "Ok") is Result.Ok(_) && indexOf(variants, "Error") is Result.Ok(_)
 	}
-	if types.findType(c.table, typeName) is Result.Ok(info) {
+	if types.findType(t, typeName) is Result.Ok(info) {
 		for each v in info.variants {
 			if indexOf(variants, v.name) is Result.Error(_) {
 				return false

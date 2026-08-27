@@ -61,6 +61,9 @@ type Emit {
 	/// The handlers whose envelope escapes its turn, so a request they leave
 	/// unanswered is one a reply may still be coming for.
 	escapers: Str[dyn]
+	/// The `func`s a caller may hand its own storage to rather than a copy of
+	/// it — see `lentFuncs` for what earns a name a place on it.
+	lent: Str[dyn]
 	/// The row types a mapper has been asked for: one per declared type a typed
 	/// query reads its rows into.
 	rows: Str[dyn]
@@ -89,6 +92,11 @@ type Emit {
 	/// rest of the suite still runs — and that holds however deep inside an `if`
 	/// or a loop it was written.
 	inTest: Bool
+	/// Whether what is being written is a call about to run on a thread of its
+	/// own. Its arguments are copied on this side of the fence (`8.6`), which is
+	/// a different job from guarding against a later write — so no argument is
+	/// lent while this holds.
+	spawning: Bool
 	/// Which output line holds the atom table, so it can be written again once
 	/// the whole program has been walked. `-1` until `main` is emitted.
 	atomLine: Int
@@ -107,7 +115,7 @@ type Emit {
 /// Emit a whole program.
 proc emitModule(m: ast.Module): Emitted {
 	t := types.tableOf(m)
-	mut Emit em = Emit(t, [], 0, ["Nil"], [], [], [], [], [], [], 0, [], [], [], [], [], false, -1, [], 0, [])
+	mut Emit em = Emit(t, [], 0, ["Nil"], [], [], [], [], [], [], [], 0, [], [], [], [], [], false, false, -1, [], 0, [])
 
 	line(em, "package main")
 	line(em, "")
@@ -128,6 +136,7 @@ proc emitModule(m: ast.Module): Emitted {
 
 	env := infer.newEnv(t)
 	em.escapers = escapingHandlers(t, m.decls)
+	em.lent = lentFuncs(t, m.decls)
 	for each f in m.foreign {
 		for each name in f.types {
 			append(em.mirrors, name)
@@ -383,12 +392,11 @@ proc emitCallable(em: mut Emit, env: infer.Env, name: Str, params: ast.Param[], 
 	enterBody(em)
 	// Lines are 1-based, and the header has not been written yet.
 	firstLine := len(em.out) + 1
-	mut resultType := types.resolve(em.table, result)
-	mut infer.Env inner = env
+	mut resultType := types.resolve(env.table, result)
+	inner := infer.boundParams(env, params, 0)
 	mut Str[dyn] written = []
 	for each p in params {
-		ty := types.resolve(em.table, p.declared)
-		inner = infer.bound(inner, p.name, ty)
+		ty := types.resolve(env.table, p.declared)
 		// A mutex parameter lowers to a pointer, because a shared backing array
 		// would not survive `append` — that produces a new header, and the caller
 		// has to end up holding it.
@@ -560,11 +568,18 @@ proc cloneField(em: mut Emit, f: ast.Field): void {
 // --- Statements --------------------------------------------------------------
 
 proc emitStmts(em: mut Emit, env: infer.Env, body: ast.Block, result: types.Ty): infer.Env {
-	mut infer.Env inner = env
-	for each s in body.stmts {
-		inner = emitStmt(em, inner, s, result)
+	return emitEach(em, env, body.stmts, 0, result)
+}
+
+// Each statement written with the bindings of everything before it in scope.
+// Recursion rather than a `mut infer.Env` threaded through a loop: an `Env`
+// carries the whole table, and a `mut` binding off an immutable one is copied
+// at every use to keep `8.3`'s invariant.
+proc emitEach(em: mut Emit, env: infer.Env, stmts: ast.Stmt[], at: Int, result: types.Ty): infer.Env {
+	if stmts bounds at {
+		return emitEach(em, emitStmt(em, env, stmts[at], result), stmts, at + 1, result)
 	}
-	return inner
+	return env
 }
 
 proc emitStmt(em: mut Emit, env: infer.Env, s: ast.Stmt, result: types.Ty): infer.Env {
@@ -587,7 +602,8 @@ proc emitStmt(em: mut Emit, env: infer.Env, s: ast.Stmt, result: types.Ty): infe
 				append(em.deferred, name)
 				return infer.bound(env, name, ty)
 			}
-			line(em, taskName(name) + " := hive.Spawn(func() any \{ return " + expr(em, env, value, ty) + " })")
+			work := onThread(em, env, value, ty)
+			line(em, taskName(name) + " := hive.Spawn(func() any \{ return " + work + " })")
 			append(em.deferred, name)
 			return infer.bound(env, name, ty)
 		}
@@ -614,7 +630,7 @@ proc emitStmt(em: mut Emit, env: infer.Env, s: ast.Stmt, result: types.Ty): infe
 		line(em, "_ = " + goIdent(name))
 		return infer.bound(env, name, ty)
 	} else if s is ast.Stmt.TypedDecl(declared, name, value, mutable, _) {
-		ty := types.resolve(em.table, declared)
+		ty := types.resolve(env.table, declared)
 		written := bindingValue(em, env, value, ty, mutable)
 		if mutable {
 			append(em.mutables, name)
@@ -764,25 +780,30 @@ proc emitAssign(em: mut Emit, env: infer.Env, target: ast.Expr, value: ast.Expr)
 proc emitFor(em: mut Emit, env: infer.Env, init: ast.Stmt, cond: ast.Expr, post: ast.Stmt, body: ast.Block, result: types.Ty): void {
 	// The counter is scoped to the loop, so its binding goes into a scope of its
 	// own — and Go's own `for` clause is where it is written.
-	mut infer.Env inner = env
-	mut header := "for "
 	if init is ast.Stmt.Nothing {
-		header = header + "; "
-	} else {
-		inner = bindOnly(em, inner, init)
-		header = header + clause(em, inner, init) + "; "
+		emitForRest(em, env, "for ; ", cond, post, body, result)
+		return
 	}
+	inner := bindOnly(em, env, init)
+	emitForRest(em, inner, "for " + clause(em, inner, init) + "; ", cond, post, body, result)
+}
+
+// The rest of a `for`, with the counter already in scope. Split out so the
+// counter's scope is an immutable binding rather than a `mut infer.Env`, which
+// would be copied — table and all — at every use.
+proc emitForRest(em: mut Emit, env: infer.Env, opening: Str, cond: ast.Expr, post: ast.Stmt, body: ast.Block, result: types.Ty): void {
+	mut header := opening
 	if cond is ast.Expr.Absent {
 		header = header + "; "
 	} else {
-		header = header + expr(em, inner, cond, types.Ty.TBool()) + "; "
+		header = header + expr(em, env, cond, types.Ty.TBool()) + "; "
 	}
 	if post is ast.Stmt.Nothing {
 		open(em, header + "\{")
 	} else {
-		open(em, header + clause(em, inner, post) + " \{")
+		open(em, header + clause(em, env, post) + " \{")
 	}
-	emitStmts(em, inner, body, result)
+	emitStmts(em, env, body, result)
 	close(em, "}")
 }
 
@@ -792,7 +813,7 @@ proc clause(em: mut Emit, env: infer.Env, s: ast.Stmt): Str {
 		return goIdent(name) + " := " + expr(em, env, value, infer.typeOf(env, value))
 	}
 	if s is ast.Stmt.TypedDecl(declared, name, value, _, _) {
-		ty := types.resolve(em.table, declared)
+		ty := types.resolve(env.table, declared)
 		return "var " + goIdent(name) + " " + goType(ty) + " = " + expr(em, env, value, ty)
 	}
 	if s is ast.Stmt.Assign(target, value) {
@@ -809,7 +830,7 @@ func bindOnly(em: Emit, env: infer.Env, s: ast.Stmt): infer.Env {
 		return infer.bound(env, name, infer.typeOf(env, value))
 	}
 	if s is ast.Stmt.TypedDecl(declared, name, _, _, _) {
-		return infer.bound(env, name, types.resolve(em.table, declared))
+		return infer.bound(env, name, types.resolve(env.table, declared))
 	}
 	return env
 }
@@ -818,7 +839,7 @@ proc emitForEach(em: mut Emit, env: infer.Env, name: Str, declared: ast.TypeExpr
 	mut elementType := types.elementOf(infer.typeOf(env, subject))
 	if declared is ast.TypeExpr.VoidType {
 	} else {
-		elementType = types.resolve(em.table, declared)
+		elementType = types.resolve(env.table, declared)
 	}
 	mut inner := infer.bound(env, name, elementType)
 	open(em, "for _, " + goIdent(name) + " := range " + expr(em, env, subject, types.Ty.TUnknown()) + " \{")
@@ -978,18 +999,31 @@ proc constructorGuard(em: mut Emit, env: infer.Env, written: Str, holder: Str, s
 	// A variant that carries nothing binds nothing, and Go insists on a local
 	// being read.
 	line(em, "_ = " + holder)
-	mut infer.Env inner = env
-	if types.findVariant(em.table, head, variant) is Result.Ok(fields) {
+	if types.findVariant(env.table, head, variant) is Result.Ok(fields) {
 		mut i := 0
 		for each b in bindings {
 			if fields bounds i {
 				bind(em, b, holder + "." + goField(fields[i].name))
-				inner = infer.bound(inner, b, types.resolve(em.table, fields[i].declared))
 			}
 			i = i + 1
 		}
+		return boundVariant(env, bindings, fields, 0)
 	}
-	return inner
+	return env
+}
+
+// The variant's bindings in scope, each taking the declared type of the field
+// in the same position. A position the variant does not have binds nothing at
+// all, which is what the guard above emits too. Recursion rather than a `mut
+// infer.Env` threaded through a loop — see `infer`'s own folds for why.
+func boundVariant(env: infer.Env, bindings: Str[], fields: ast.Field[], at: Int): infer.Env {
+	if bindings bounds at {
+		if fields bounds at {
+			return boundVariant(infer.bound(env, bindings[at], types.resolve(env.table, fields[at].declared)), bindings, fields, at + 1)
+		}
+		return boundVariant(env, bindings, fields, at + 1)
+	}
+	return env
 }
 
 func resultTest(variant: Str): Str {
@@ -1035,18 +1069,17 @@ proc vectorGuard(em: mut Emit, env: infer.Env, written: Str, holder: Str, subjec
 	}
 	open(em, "if " + holder + " := " + written + "; " + join(tests, " && ") + " \{")
 
-	mut infer.Env inner = env
 	mut j := 0
 	for each item in elements {
 		if item is ast.VecElem.Bind(name) {
 			bind(em, name, holder + "[{j}]")
-			inner = infer.bound(inner, name, element)
 		}
 		j = j + 1
 	}
+	inner := infer.boundElements(env, elements, element, 0)
 	if rest != "" {
 		bind(em, rest, holder + "[{len(elements)}:]")
-		inner = infer.bound(inner, rest, types.Ty.TVec(element, ast.Dim.Dynamic()))
+		return infer.bound(inner, rest, types.Ty.TVec(element, ast.Dim.Dynamic()))
 	}
 	return inner
 }
@@ -1071,14 +1104,12 @@ proc templateGuard(em: mut Emit, env: infer.Env, written: Str, holder: Str, part
 	mut ok := fresh(em, "ok")
 	open(em, "if " + holder + ", " + ok + " := hive.MatchTemplate(" + written + ", []bool\{" + join(kinds, ", ") + "}, []string\{" + join(texts, ", ") + "}); " + ok + " \{")
 	line(em, "_ = " + holder)
-	mut infer.Env inner = env
 	mut i := 0
 	for each hole in holes {
 		bind(em, hole, holder + "[{i}]")
-		inner = infer.bound(inner, hole, types.Ty.TStr())
 		i = i + 1
 	}
-	return inner
+	return infer.bindOne(env, holes, types.Ty.TStr())
 }
 
 // A binding Hive made and the body may not read. Go insists a local is used, so
@@ -1206,7 +1237,7 @@ proc identExpr(em: mut Emit, env: infer.Env, name: Str): Str {
 	return goIdent(resolved)
 }
 
-func resolveAlias(em: Emit, name: Str): Str {
+proc resolveAlias(em: mut Emit, name: Str): Str {
 	if indexOf(em.aliasFrom, name) is Result.Ok(at) {
 		if em.aliasTo bounds at {
 			return em.aliasTo[at]
@@ -1217,8 +1248,9 @@ func resolveAlias(em: Emit, name: Str): Str {
 
 proc rememberAlias(em: mut Emit, name: Str, value: ast.Expr): void {
 	if value is ast.Expr.Ident(source) {
+		to := resolveAlias(em, source)
 		append(em.aliasFrom, name)
-		append(em.aliasTo, resolveAlias(em, source))
+		append(em.aliasTo, to)
 	}
 }
 
@@ -1233,7 +1265,7 @@ proc rememberAlias(em: mut Emit, name: Str, value: ast.Expr): void {
 proc bindingValue(em: mut Emit, env: infer.Env, value: ast.Expr, ty: types.Ty, mutable: Bool): Str {
 	written := expr(em, env, value, ty)
 	// A fresh right-hand side is already independent and is never copied.
-	if namesStorage(value) == false || types.ownsStorage(em.table, ty) == false {
+	if namesStorage(value) == false || types.ownsStorage(env.table, ty) == false {
 		return written
 	}
 	sourceMut := isMutableSource(em, value)
@@ -1249,10 +1281,10 @@ proc bindingValue(em: mut Emit, env: infer.Env, value: ast.Expr, ty: types.Ty, m
 	if mutable == false && sourceMut == false {
 		return written
 	}
-	return cloned(em.table, ty, written)
+	return cloned(env.table, ty, written)
 }
 
-func isMutableSource(em: Emit, value: ast.Expr): Bool {
+proc isMutableSource(em: mut Emit, value: ast.Expr): Bool {
 	root := rootOf(value)
 	if root == "" {
 		return false
@@ -1333,7 +1365,7 @@ proc withType(em: mut Emit, env: infer.Env, value: ast.Expr, target: ast.TypeExp
 		if callee is ast.Expr.Member(subject, name) {
 			if subject is ast.Expr.Member(root, module) {
 				if root is ast.Expr.Ident(head) && head == "hive" {
-					wanted := types.resolve(em.table, target)
+					wanted := types.resolve(env.table, target)
 					if module == "json" && name == "parse" {
 						useModule(em, "json")
 						return "hive.JsonParse(" + expr(em, env, argExpr(args, 0), types.Ty.TStr()) + ", " + decoderRef(em, wanted) + ")"
@@ -1436,11 +1468,21 @@ proc withSpawn(em: mut Emit, env: infer.Env, into: Str[], c: ast.Expr): Str[dyn]
 // The thread a call is put on. A call that answers with nothing has nothing to
 // hand back, so it is run for its effect and the thread answers with `nil`.
 proc spawned(em: mut Emit, env: infer.Env, c: ast.Expr): Str {
-	written := expr(em, env, c, types.Ty.TUnknown())
+	written := onThread(em, env, c, types.Ty.TUnknown())
 	if infer.typeOf(env, c) is types.Ty.TVoid {
 		return "hive.Spawn(func() any \{ " + written + "; return nil })"
 	}
 	return "hive.Spawn(func() any \{ return " + written + " })"
+}
+
+// A call written for a thread of its own. Nothing in it is lent: every argument
+// is copied on this side of the fence, because the caller runs on regardless.
+proc onThread(em: mut Emit, env: infer.Env, c: ast.Expr, ty: types.Ty): Str {
+	was := em.spawning
+	em.spawning = true
+	written := expr(em, env, c, ty)
+	em.spawning = was
+	return written
 }
 
 // An `is` outside an `if` condition has nowhere to put what it binds, so it
@@ -1622,7 +1664,7 @@ proc arithmetic(em: mut Emit, env: infer.Env, op: ast.BinOp, l: Str, r: Str, ty:
 // structurally, which is what the language says `==` means on a vector, a map
 // and a declared type.
 proc equality(em: mut Emit, env: infer.Env, l: Str, r: Str, ty: types.Ty): Str {
-	if types.ownsStorage(em.table, ty) || isUnion(em, ty) {
+	if types.ownsStorage(env.table, ty) || isUnion(env.table, ty) {
 		return "hive.Eq(" + l + ", " + r + ")"
 	}
 	if ty is types.Ty.TResult(_, _) {
@@ -1634,9 +1676,9 @@ proc equality(em: mut Emit, env: infer.Env, l: Str, r: Str, ty: types.Ty): Str {
 	return "(" + l + " == " + r + ")"
 }
 
-func isUnion(em: Emit, ty: types.Ty): Bool {
+func isUnion(t: types.Table, ty: types.Ty): Bool {
 	if ty is types.Ty.TNamed(name) {
-		if types.findType(em.table, name) is Result.Ok(info) {
+		if types.findType(t, name) is Result.Ok(info) {
 			return len(info.variants) > 0
 		}
 	}
@@ -1672,10 +1714,10 @@ proc call(em: mut Emit, env: infer.Env, callee: ast.Expr, args: ast.Arg[], want:
 proc namedCall(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[], want: types.Ty): Str {
 	// A declaration of your own wins, and a local binding shadows it in turn.
 	if infer.isBound(env, name) == false {
-		if types.findCallable(em.table, name) is Result.Ok(info) {
+		if types.findCallable(env.table, name) is Result.Ok(info) {
 			return goIdent(name) + "(" + orderedArgs(em, env, info, args) + ")"
 		}
-		if types.fieldsOfStruct(em.table, name) is Result.Ok(fields) {
+		if types.fieldsOfStruct(env.table, name) is Result.Ok(fields) {
 			return structLiteral(em, env, name, fields, args)
 		}
 		if infer.isBuiltin(name) {
@@ -1694,7 +1736,7 @@ proc memberCall(em: mut Emit, env: infer.Env, subject: ast.Expr, field: Str, arg
 			return builtin(em, env, field, args, want)
 		}
 		// `Shape.Circle(5)` builds a variant.
-		if types.findVariant(em.table, head, field) is Result.Ok(fields) {
+		if types.findVariant(env.table, head, field) is Result.Ok(fields) {
 			return variantLiteral(em, env, head, field, fields, args)
 		}
 	}
@@ -1816,7 +1858,7 @@ proc fieldArgs(em: mut Emit, env: infer.Env, fields: ast.Field[], args: ast.Arg[
 	mut i := 0
 	for each f in fields {
 		mut found := argFor(args, f.name, i)
-		ty := types.resolve(em.table, f.declared)
+		ty := types.resolve(env.table, f.declared)
 		if found is ast.Expr.Absent {
 			append(out, goField(f.name) + ": " + goZero(ty))
 		} else {
@@ -1832,15 +1874,15 @@ proc orderedArgs(em: mut Emit, env: infer.Env, info: types.CallableInfo, args: a
 	mut i := 0
 	for each p in info.params {
 		mut found := argFor(args, p.name, i)
-		ty := types.resolve(em.table, p.declared)
+		ty := types.resolve(env.table, p.declared)
 		mut written := expr(em, env, found, ty)
 		if p.mutex {
 			// A mutex parameter takes the caller's own storage, which is its
 			// address — and if the caller's name is itself a pointer, the address
 			// it already holds.
 			written = addressOf(em, found, written)
-		} else if isMutableSource(em, found) && types.ownsStorage(em.table, ty) {
-			written = cloned(em.table, ty, written)
+		} else if isMutableSource(em, found) && types.ownsStorage(env.table, ty) && lends(em, info.name) == false {
+			written = cloned(env.table, ty, written)
 		}
 		append(out, written)
 		i = i + 1
@@ -1848,9 +1890,19 @@ proc orderedArgs(em: mut Emit, env: infer.Env, info: types.CallableInfo, args: a
 	return join(out, ", ")
 }
 
+// Whether this callee may be handed the caller's own storage rather than a copy
+// of it. Never while a thread is being started: that copy is the fence between
+// two threads rather than a defence against a later write.
+proc lends(em: mut Emit, name: Str): Bool {
+	if em.spawning {
+		return false
+	}
+	return indexOf(em.lent, name) is Result.Ok(_)
+}
+
 // The address of storage a mutex parameter is being handed. A name that is
 // already a pointer is passed on as it stands.
-func addressOf(em: Emit, found: ast.Expr, written: Str): Str {
+proc addressOf(em: mut Emit, found: ast.Expr, written: Str): Str {
 	if found is ast.Expr.Ident(name) {
 		if indexOf(em.pointers, resolveAlias(em, name)) is Result.Ok(_) {
 			return goIdent(resolveAlias(em, name))
@@ -2327,11 +2379,11 @@ proc sendOnly(em: mut Emit, env: infer.Env, call: ast.Expr): Str {
 // machine — so it is copied on the way, for the same reason an `async` call's
 // mutex argument is: nothing the sender does afterwards may be visible inside.
 proc carried(em: mut Emit, env: infer.Env, value: ast.Expr, ty: types.Ty): Str {
-	written := cloned(em.table, ty, expr(em, env, value, ty))
+	written := cloned(env.table, ty, expr(em, env, value, ty))
 	// A message travels as its *mailbox* type rather than as the variant it
 	// happens to be: what the far side decodes into is the whole protocol, and
 	// what encodes it is the codec for that.
-	if isUnion(em, ty) {
+	if isUnion(env.table, ty) {
 		return goType(ty) + "(" + written + ")"
 	}
 	return written
@@ -2602,6 +2654,282 @@ func escapesInExpr(name: Str, e: ast.Expr): Bool {
 	return false
 }
 
+// --- What a caller may lend rather than copy ---------------------------------
+//
+// A `mut` value handed to an ordinary parameter is copied on the way in, so the
+// callee's immutable view really is one (`8.1`). Most of those copies cannot be
+// observed, and on a program of any size they are most of a compile: a predicate
+// reading one field of a pass's state was handed a copy of the whole program to
+// do it with.
+//
+// `8.4` takes an alias wherever one is indistinguishable from a copy, and for a
+// `func` the language itself supplies the proof. A `func` differs from a `proc`
+// in exactly two ways (`4.2`): it cannot declare a mutex parameter, and it
+// cannot call a `proc`. So a `func` **cannot write to storage its caller can
+// see** — that is the whole of what `func` promises — and the only storage that
+// leaves one is its result. When the result carries no storage at all, an
+// argument can be neither written by the callee nor outlive the call, and no
+// program can tell the copy from the alias.
+//
+// Four things are left out, each because the proof does not reach them:
+//
+//   * a `proc`, which may write through a mutex parameter of its own;
+//   * a `query` and an imported Go `func` — both `func`s in the table, neither a
+//     `CallableDecl`: a query keeps its arguments in the fragment it answers
+//     with, and the Go boundary copies for reasons of its own;
+//   * a result that carries storage, or that holds a function value, since one
+//     can be a partial application holding the argument it was made from;
+//   * anything that can start a thread, directly or through what it calls. A
+//     thread outlives the call that started it, so an argument that reaches one
+//     is storage the caller may still be writing — which is the one thing this
+//     copy is genuinely for (`8.6`).
+
+/// The `func`s a caller may hand its own storage to rather than a copy of it.
+proc lentFuncs(t: types.Table, decls: ast.Decl[]): Str[dyn] {
+	threading := threadStarters(decls)
+	mut Str[dyn] out = []
+	for each d in decls {
+		if d is ast.Decl.CallableDecl(kind, name, _, result, _, _) {
+			if kind is ast.CallableKind.FuncKind && carriesStorage(t, types.resolve(t, result)) == false {
+				if indexOf(threading, name) is Result.Error(_) {
+					append(out, name)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// Whether a value of this type can carry storage out of a call: it owns some, or
+// it holds a function value, which can be a partial application holding one of
+// the arguments it was built from.
+func carriesStorage(t: types.Table, ty: types.Ty): Bool {
+	return types.ownsStorage(t, ty) || holdsFn(ty)
+}
+
+func holdsFn(ty: types.Ty): Bool {
+	if ty is types.Ty.TFn(_, _, _) { return true }
+	if ty is types.Ty.TVec(element, _) { return holdsFn(element) }
+	if ty is types.Ty.TResult(ok, bad) { return holdsFn(ok) || holdsFn(bad) }
+	if ty is types.Ty.TMap(_, value) { return holdsFn(value) }
+	return false
+}
+
+// Every callable that can start a thread, directly or through something it
+// calls. The closure runs over the whole program rather than over `func`s alone,
+// which is a superset and costs nothing — a `func` may only call `func`s.
+//
+// A program that starts no thread anywhere needs none of it, which is the usual
+// case and is why the graph is only built when something does.
+proc threadStarters(decls: ast.Decl[]): Str[dyn] {
+	mut Str[dyn] found = []
+	for each d in decls {
+		if d is ast.Decl.CallableDecl(_, name, _, _, body, _) {
+			mut Scan sc = Scan(false, [])
+			scanBlock(body, sc)
+			if sc.spawns {
+				append(found, name)
+			}
+		} else if d is ast.Decl.QueryDecl(name, _, _, sql, _) {
+			mut Scan sc2 = Scan(false, [])
+			scanSql(sql, sc2)
+			if sc2.spawns {
+				append(found, name)
+			}
+		}
+	}
+	if len(found) == 0 {
+		return found
+	}
+	g := callGraph(decls)
+	mut growing := true
+	for ; growing; {
+		growing = false
+		mut i := 0
+		for each caller in g.from {
+			if g.to bounds i {
+				if indexOf(found, g.to[i]) is Result.Ok(_) && indexOf(found, caller) is Result.Error(_) {
+					append(found, caller)
+					growing = true
+				}
+			}
+			i = i + 1
+		}
+	}
+	return found
+}
+
+/// The call graph as two parallel vectors: `from[i]` names something that calls
+/// `to[i]`. A name that is nobody's declaration is harmless — it matches none.
+type Graph {
+	from: Str[dyn]
+	to: Str[dyn]
+}
+
+proc callGraph(decls: ast.Decl[]): Graph {
+	mut Str[dyn] from = []
+	mut Str[dyn] to = []
+	for each d in decls {
+		if d is ast.Decl.CallableDecl(_, name, _, _, body, _) {
+			mut Scan sc = Scan(false, [])
+			scanBlock(body, sc)
+			for each called in sc.calls {
+				append(from, name)
+				append(to, called)
+			}
+		} else if d is ast.Decl.QueryDecl(name, _, _, sql, _) {
+			mut Scan sc2 = Scan(false, [])
+			scanSql(sql, sc2)
+			for each called in sc2.calls {
+				append(from, name)
+				append(to, called)
+			}
+		}
+	}
+	return Graph(from, to)
+}
+
+/// What one body does that the lending question turns on: whether it starts a
+/// thread, and what it calls. Both come out of one walk.
+type Scan {
+	spawns: Bool
+	calls: Str[dyn]
+}
+
+proc scanBlock(b: ast.Block, sc: mut Scan): void {
+	for each s in b.stmts {
+		scanStmt(s, sc)
+	}
+}
+
+proc scanStmt(s: ast.Stmt, sc: mut Scan): void {
+	if s is ast.Stmt.VarDecl(_, value, _, deferred) {
+		// `x := async f(a)` starts the call now and waits wherever `x` is read.
+		if deferred { sc.spawns = true }
+		scanExpr(value, sc)
+	} else if s is ast.Stmt.TypedDecl(_, _, value, _, deferred) {
+		if deferred { sc.spawns = true }
+		scanExpr(value, sc)
+	} else if s is ast.Stmt.Assign(target, value) {
+		scanExpr(target, sc)
+		scanExpr(value, sc)
+	} else if s is ast.Stmt.IfChain(branches, otherwise, _) {
+		for each b in branches {
+			scanExpr(b.condition, sc)
+			scanBlock(b.body, sc)
+		}
+		scanBlock(otherwise, sc)
+	} else if s is ast.Stmt.ForLoop(init, cond, post, body) {
+		scanStmt(init, sc)
+		scanExpr(cond, sc)
+		scanStmt(post, sc)
+		scanBlock(body, sc)
+	} else if s is ast.Stmt.ForEach(_, _, subject, body) {
+		scanExpr(subject, sc)
+		scanBlock(body, sc)
+	} else if s is ast.Stmt.ReturnStmt(value) {
+		scanExpr(value, sc)
+	} else if s is ast.Stmt.EchoStmt(value) {
+		scanExpr(value, sc)
+	} else if s is ast.Stmt.AssertStmt(condition) {
+		scanExpr(condition, sc)
+	} else if s is ast.Stmt.PanicStmt(value) {
+		scanExpr(value, sc)
+	} else if s is ast.Stmt.AsyncStmt(call) {
+		sc.spawns = true
+		scanExpr(call, sc)
+	} else if s is ast.Stmt.Expression(value) {
+		scanExpr(value, sc)
+	}
+}
+
+proc scanExpr(e: ast.Expr, sc: mut Scan): void {
+	if e is ast.Expr.Call(callee, args) {
+		if callee is ast.Expr.Ident(name) {
+			append(sc.calls, name)
+		} else {
+			scanExpr(callee, sc)
+		}
+		for each a in args {
+			scanExpr(a.value, sc)
+		}
+	} else if e is ast.Expr.Interp(parts) {
+		for each part in parts {
+			if part is ast.InterpPart.Expression(inner) {
+				scanExpr(inner, sc)
+			}
+		}
+	} else if e is ast.Expr.VectorLit(items) {
+		for each item in items {
+			scanExpr(item, sc)
+		}
+	} else if e is ast.Expr.Negate(operand) {
+		scanExpr(operand, sc)
+	} else if e is ast.Expr.Binary(_, left, right) {
+		scanExpr(left, sc)
+		scanExpr(right, sc)
+	} else if e is ast.Expr.Member(subject, _) {
+		scanExpr(subject, sc)
+	} else if e is ast.Expr.Index(subject, index) {
+		scanExpr(subject, sc)
+		scanExpr(index, sc)
+	} else if e is ast.Expr.Slice(subject, low, high) {
+		scanExpr(subject, sc)
+		scanExpr(low, sc)
+		scanExpr(high, sc)
+	} else if e is ast.Expr.IsMatch(subject, _) {
+		scanExpr(subject, sc)
+	} else if e is ast.Expr.AwaitAll(calls, timeout) {
+		// A barrier runs every call in it on a thread of its own.
+		sc.spawns = true
+		for each c in calls {
+			scanExpr(c, sc)
+		}
+		scanExpr(timeout, sc)
+	} else if e is ast.Expr.Timed(call, ms) {
+		// `f(x) with timeout ms` waits on a thread, so it starts one.
+		sc.spawns = true
+		scanExpr(call, sc)
+		scanExpr(ms, sc)
+	} else if e is ast.Expr.WithType(value, _) {
+		scanExpr(value, sc)
+	} else if e is ast.Expr.UsingExpr(source, form) {
+		scanExpr(source, sc)
+		scanUsing(form, sc)
+	}
+}
+
+proc scanUsing(form: ast.UsingForm, sc: mut Scan): void {
+	if form is ast.UsingForm.Csv(separator) {
+		scanExpr(separator, sc)
+	} else if form is ast.UsingForm.RunQuery(call) {
+		scanExpr(call, sc)
+	} else if form is ast.UsingForm.Raw(sqlText) {
+		scanExpr(sqlText, sc)
+	}
+}
+
+proc scanSql(parts: ast.SqlPart[], sc: mut Scan): void {
+	for each part in parts {
+		if part is ast.SqlPart.Param(value) {
+			scanExpr(value, sc)
+		} else if part is ast.SqlPart.Where(group) {
+			scanSqlGroup(group, sc)
+		}
+	}
+}
+
+proc scanSqlGroup(group: ast.SqlGroup, sc: mut Scan): void {
+	for each item in group.items {
+		if item is ast.SqlItem.Cond(condition, body) {
+			scanExpr(condition, sc)
+			scanSql(body, sc)
+		} else if item is ast.SqlItem.Nested(inner) {
+			scanSqlGroup(inner, sc)
+		}
+	}
+}
+
 // `hive.syslink.answer`, `.self` and `.monitor` — the three that take an
 // envelope and cannot let it out.
 func turnCall(callee: ast.Expr): Bool {
@@ -2631,13 +2959,11 @@ proc emitQuery(em: mut Emit, env: infer.Env, name: Str, params: ast.Param[], res
 	useModule(em, "sql")
 	firstLine := len(em.out)
 	blank(em)
-	mut infer.Env inner = env
 	mut Str[dyn] written = []
 	for each p in params {
-		ty := types.resolve(em.table, p.declared)
-		append(written, goIdent(p.name) + " " + goType(ty))
-		inner = infer.bound(inner, p.name, ty)
+		append(written, goIdent(p.name) + " " + goType(types.resolve(env.table, p.declared)))
 	}
+	inner := infer.boundParams(env, params, 0)
 	open(em, "func " + goIdent(name) + "(" + join(written, ", ") + ") hive.SqlFragment \{")
 	line(em, "_sql := \"\"")
 	line(em, "_args := []any\{}")
@@ -3222,7 +3548,7 @@ proc emitTests(m: ast.Module, atoms: Str[], codecs: Str[]): Str {
 	t := types.tableOf(m)
 	// The codecs `main.go` already wrote are seeded rather than written again:
 	// the two files are one Go package.
-	mut Emit em = Emit(t, [], 0, copiedNames(atoms), [], [], [], [], [], copiedNames(codecs), 0, [], [], [], [], [], true, -1, [], 0, [])
+	mut Emit em = Emit(t, [], 0, copiedNames(atoms), [], [], [], [], lentFuncs(t, m.decls), [], copiedNames(codecs), 0, [], [], [], [], [], true, false, -1, [], 0, [])
 	written := len(codecs)
 	mut found := false
 	for each d in m.decls {

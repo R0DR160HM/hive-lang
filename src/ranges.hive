@@ -69,14 +69,12 @@ proc checkDecl(bo: mut Proofs, env: infer.Env, d: ast.Decl): void {
 		bo.lost = []
 		bo.promised = []
 		bo.searches = []
-		mut infer.Env inner = env
 		for each p in params {
 			// A parameter's declared length is a promise too, kept at every call
 			// site — which is what lets the callee index it unguarded.
 			promise(bo, p.name, p.declared)
-			inner = infer.bound(inner, p.name, types.resolve(bo.table, p.declared))
 		}
-		checkBlock(bo, inner, body)
+		checkBlock(bo, infer.boundParams(env, params, 0), body)
 	} else if d is ast.Decl.QueryDecl(name, params, _, sql, line) {
 		bo.inside = name
 		bo.line = line
@@ -84,14 +82,12 @@ proc checkDecl(bo: mut Proofs, env: infer.Env, d: ast.Decl): void {
 		bo.lost = []
 		bo.promised = []
 		bo.searches = []
-		mut infer.Env inner = env
 		for each p in params {
 			promise(bo, p.name, p.declared)
-			inner = infer.bound(inner, p.name, types.resolve(bo.table, p.declared))
 		}
 		// A query body holds no index of its own, but the expressions in it are
 		// expressions: a bound value can be `v[0]` like anything else.
-		checkSql(bo, inner, sql)
+		checkSql(bo, infer.boundParams(env, params, 0), sql)
 	} else if d is ast.Decl.TestDecl(title, body, line) {
 		bo.inside = "\"{title}\""
 		bo.line = line
@@ -143,12 +139,19 @@ proc promise(bo: mut Proofs, name: Str, declared: ast.TypeExpr): void {
 
 proc checkBlock(bo: mut Proofs, env: infer.Env, b: ast.Block): infer.Env {
 	mark := len(bo.proved)
-	mut infer.Env inner = env
-	for each s in b.stmts {
-		inner = checkStmt(bo, inner, s)
-	}
+	after := checkStmts(bo, env, b.stmts, 0)
 	forget(bo, mark)
-	return inner
+	return after
+}
+
+// Each statement proved with everything before it in scope. Recursion rather
+// than a `mut infer.Env` threaded through a loop, for the reason `infer`'s own
+// folds give: an `Env` carries the whole table.
+proc checkStmts(bo: mut Proofs, env: infer.Env, stmts: ast.Stmt[], at: Int): infer.Env {
+	if stmts bounds at {
+		return checkStmts(bo, checkStmt(bo, env, stmts[at]), stmts, at + 1)
+	}
+	return env
 }
 
 // Everything proved after `mark` goes out of scope with the block that proved
@@ -171,7 +174,7 @@ proc checkStmt(bo: mut Proofs, env: infer.Env, s: ast.Stmt): infer.Env {
 		checkExpr(bo, env, value)
 		promise(bo, name, declared)
 		rememberSearch(bo, name, value)
-		return infer.bound(env, name, types.resolve(bo.table, declared))
+		return infer.bound(env, name, types.resolve(env.table, declared))
 	} else if s is ast.Stmt.Assign(target, value) {
 		checkExpr(bo, env, value)
 		checkExpr(bo, env, target)
@@ -222,7 +225,7 @@ proc checkStmtTail(bo: mut Proofs, env: infer.Env, s: ast.Stmt): infer.Env {
 		mut element := types.elementOf(infer.typeOf(env, subject))
 		if declared is ast.TypeExpr.VoidType {
 		} else {
-			element = types.resolve(bo.table, declared)
+			element = types.resolve(env.table, declared)
 		}
 		// A `for each` never indexes, so there is nothing here to prove.
 		checkBlock(bo, infer.bound(env, name, element), body)

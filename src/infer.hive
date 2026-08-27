@@ -582,26 +582,57 @@ func afterPattern(env: Env, subject: types.Ty, p: ast.Pattern): Env {
 		return afterConstructor(env, subject, path, bindings)
 	}
 	if p is ast.Pattern.VectorPat(elements, rest) {
-		mut element := types.elementOf(subject)
-		mut Env out = env
-		for each item in elements {
-			if item is ast.VecElem.Bind(name) {
-				out = bound(out, name, element)
-			}
-		}
+		element := types.elementOf(subject)
+		out := boundElements(env, elements, element, 0)
 		if rest != "" {
-			out = bound(out, rest, types.Ty.TVec(element, ast.Dim.Dynamic()))
+			return bound(out, rest, types.Ty.TVec(element, ast.Dim.Dynamic()))
 		}
 		return out
 	}
 	if p is ast.Pattern.StrTemplate(parts) {
-		mut Env out = env
-		for each part in parts {
-			if part is token.StrPart.Code(source) {
-				out = bound(out, text.trim(source), types.Ty.TStr())
-			}
+		return boundHoles(env, parts, 0)
+	}
+	return env
+}
+
+// --- Growing a scope ---------------------------------------------------------
+//
+// Each of these walks a list and hands back the scope it leaves behind. They
+// recurse rather than threading a `mut Env` through a loop, and that is a
+// performance decision rather than a stylistic one: an `Env` holds the whole
+// table, a `mut` binding off an immutable one has to be copied to keep `8.3`'s
+// invariant, and a copy per statement of a program this size is most of a
+// compile. Every `env` here is an immutable parameter, which is storage nothing
+// can write, so nothing is ever copied.
+
+func boundElements(env: Env, elements: ast.VecElem[], element: types.Ty, at: Int): Env {
+	if elements bounds at {
+		item := elements[at]
+		if item is ast.VecElem.Bind(name) {
+			return boundElements(bound(env, name, element), elements, element, at + 1)
 		}
-		return out
+		return boundElements(env, elements, element, at + 1)
+	}
+	return env
+}
+
+func boundHoles(env: Env, parts: token.StrPart[], at: Int): Env {
+	if parts bounds at {
+		part := parts[at]
+		if part is token.StrPart.Code(source) {
+			return boundHoles(bound(env, text.trim(source), types.Ty.TStr()), parts, at + 1)
+		}
+		return boundHoles(env, parts, at + 1)
+	}
+	return env
+}
+
+/// Every parameter in scope, with the type its signature gave it. Six passes
+/// open a body this way.
+func boundParams(env: Env, params: ast.Param[], at: Int): Env {
+	if params bounds at {
+		p := params[at]
+		return boundParams(bound(env, p.name, types.resolve(env.table, p.declared)), params, at + 1)
 	}
 	return env
 }
@@ -622,31 +653,33 @@ func afterConstructor(env: Env, subject: types.Ty, path: Str[], bindings: Str[])
 	// `T.Variant(a, b)` binds the variant's fields by position — its own, then
 	// the ones the type declared outside any variant.
 	if types.findVariant(env.table, head, nameAt(path, 1)) is Result.Ok(fields) {
-		mut Env out = env
-		mut i := 0
-		for each b in bindings {
-			if fields bounds i {
-				out = bound(out, b, types.resolve(env.table, fields[i].declared))
-			} else {
-				out = bound(out, b, types.Ty.TUnknown())
-			}
-			i = i + 1
+		return boundFields(env, bindings, fields, 0)
+	}
+	return bindOne(env, bindings, types.Ty.TUnknown())
+}
+
+// Each binding taking the declared type of the field in the same position, and
+// `TUnknown` for a position the variant does not have.
+func boundFields(env: Env, bindings: Str[], fields: ast.Field[], at: Int): Env {
+	if bindings bounds at {
+		mut types.Ty ty = types.Ty.TUnknown()
+		if fields bounds at {
+			ty = types.resolve(env.table, fields[at].declared)
 		}
-		return out
+		return boundFields(bound(env, bindings[at], ty), bindings, fields, at + 1)
 	}
-	mut out2 := env
-	for each b in bindings {
-		out2 = bound(out2, b, types.Ty.TUnknown())
-	}
-	return out2
+	return env
 }
 
 func bindOne(env: Env, bindings: Str[], ty: types.Ty): Env {
-	mut Env out = env
-	for each b in bindings {
-		out = bound(out, b, ty)
+	return boundAll(env, bindings, ty, 0)
+}
+
+func boundAll(env: Env, bindings: Str[], ty: types.Ty, at: Int): Env {
+	if bindings bounds at {
+		return boundAll(bound(env, bindings[at], ty), bindings, ty, at + 1)
 	}
-	return out
+	return env
 }
 
 func nameAt(path: Str[], index: Int): Str {
