@@ -82,10 +82,28 @@
 // back gets the safety car — and that is the one deliberately unfair thing here.
 //
 // THE FLAGS ARE YOURS TO KEEP. Nothing slows your car down for you. A yellow is a
-// stretch of road drawn in yellow on the map, a delta on the dial, and a marshal
-// waving at the side of it; the safety car is a car. Go through at racing speed and
-// the stewards write it down, and three of those is five seconds on your race time.
-// Go through *into the back of the safety car* and you will not need the stewards.
+// stretch of road drawn in yellow on the map, a delta on the dial, a marshal waving
+// at the side of it and **the whole border of the screen going amber**; the safety
+// car is a car, and the pit lane has a limit of its own. Go through any of the three
+// at racing speed and the border turns red and starts beating, which is the second
+// and a half you have to lift in. Past that the stewards write it down, and **every
+// one of those costs**: five seconds, then ten, then fifteen. Nobody wins a race by
+// ignoring a flag. Go through *into the back of the safety car* and you will not
+// need the stewards. **Two seconds are yours** from the moment a flag goes out, and
+// so is every second you spend on the brakes: a car being braked as hard as it can
+// be braked is obeying, and nothing counts against it on the way down.
+//
+// BLUE FLAGS ARE YOURS TO KEEP TOO. When somebody a lap quicker comes up behind
+// you the border goes blue: move to the edge of the road and let them by. Five
+// seconds of not doing it costs five seconds, and the next five cost ten — the
+// bots are held to the same rule by the same call and will move over for you.
+//
+// THE BORDER OF THE SCREEN IS THE INSTRUMENT. Amber while a limit applies and you
+// are answering it, red the moment you are not — which is inside the two seconds,
+// while there is still something to be done about it — blue while somebody is
+// waiting to lap you, green for your own fastest lap and purple for the fastest
+// anybody has set. Nothing else in the window has to be looked at to be
+// read, which is why the four things worth knowing at two hundred are all there.
 //
 // WHO DOES WHAT
 // -------------
@@ -266,6 +284,20 @@ type Model {
 	eyeY: Float
 	eyeZ: Float
 	eyeYaw: Float
+	// The lap-time flash: how long the border has left to be lit, and the lap count
+	// that lit it.
+	//
+	// **Both are here rather than on the car, and that is the one decision worth
+	// defending.** A lap time is already on the sheet and a second copy of it would
+	// be a second thing to keep true; what is *not* on the sheet is whether this
+	// window has already reacted to it. That is not a fact about the race — a
+	// server holding ten cars has no business knowing which of them somebody is
+	// looking at — it is a fact about this window, and this is where a window's
+	// facts live. It also means the flash works identically alone and joined, where
+	// the lap is closed by a snapshot that arrives between two frames rather than
+	// by a call this program made.
+	lit: Float
+	seen: Int
 }
 
 // The window's mailbox. A key, a pad, a frame, a click and everything the server
@@ -318,7 +350,9 @@ func start(seed: Int, server: Str): Model {
 		0,
 		0.0,
 		0.0,
-		0.0, 0.0, 0.0, 0.0
+		0.0, 0.0, 0.0, 0.0,
+		0.0,
+		0
 	)
 }
 
@@ -488,7 +522,34 @@ proc ticked(model: Model, dt: Float): Model {
 	// Pressed, not held: the token button is spent by the frame that reads it, so
 	// one press is one token however long the finger stays down.
 	next.spend = false
-	return watched(next, dt)
+	return watched(flashed(next, dt), dt)
+}
+
+// The lap-time flash, wound down and lit.
+//
+// It is a comparison against what this window last saw rather than against the
+// previous frame's race, and that is what makes it work in both modes: joined, a
+// lap is closed by a snapshot that arrived between two frames, and a fold that
+// looked for the moment of the change would never be holding the two races it
+// changed between.
+//
+// **The first lap a driver completes is not worth a colour.** It is their fastest
+// because it is their only one, which is arithmetic rather than driving, and a
+// window that flashed at it would be a window that flashed at everybody once for
+// nothing. `seen` is the lap count before the crossing, so the first *timed* lap
+// is the one where it is 1, and this wants 2 and up.
+func flashed(model: Model, dt: Float): Model {
+	mut Model it = model
+	it.lit = math.max(0.0, it.lit - dt)
+	me := control.find(it.race.cars, model.seat)
+	if me.sheet.lap == it.seen {
+		return it
+	}
+	if it.seen >= 2 && me.sheet.last > 0.0 && me.sheet.last <= me.sheet.best {
+		it.lit = litFor()
+	}
+	it.seen = me.sheet.lap
+	return it
 }
 
 // The last snapshot, carried forward.
@@ -1683,18 +1744,24 @@ func view(model: Model): ui.View {
 		// the bottom. The pit board is pinned rather than in the flow for the same
 		// reason the other two are: with it in the flow it owned the top strip, and
 		// the two corners the instruments want *are* the top strip.
-		return ui.column([ui.height(0), ui.grow(1)], [
-			picture(model),
-			ui.overlay([ui.align(ui.Align.Start()), ui.justify(ui.Justify.Start())],
-				board.map(model.race, shown(model))),
-			ui.overlay([ui.align(ui.Align.Start()), ui.justify(ui.Justify.Center())],
-				pitboard(model)),
-			ui.overlay([ui.align(ui.Align.Start()), ui.justify(ui.Justify.End())],
-				board.dial(model.race, shown(model))),
-			ui.overlay([ui.align(ui.Align.End()), ui.justify(ui.Justify.Center())],
-				strip(model)),
-			panel(model)
-		])
+		//
+		// The glow goes on first and everything else over it: it is the one thing
+		// here that is not read, and a stripe of colour that covered the number it
+		// was warning you about would be a poor trade.
+		mut ui.View[dyn] over = [picture(model)]
+		for each edge in glow(model) {
+			append(over, edge)
+		}
+		append(over, ui.overlay([ui.align(ui.Align.Start()),
+			ui.justify(ui.Justify.Start())], board.map(model.race, shown(model))))
+		append(over, ui.overlay([ui.align(ui.Align.Start()),
+			ui.justify(ui.Justify.Center())], pitboard(model)))
+		append(over, ui.overlay([ui.align(ui.Align.Start()),
+			ui.justify(ui.Justify.End())], board.dial(model.race, shown(model))))
+		append(over, ui.overlay([ui.align(ui.Align.End()),
+			ui.justify(ui.Justify.Center())], strip(model)))
+		append(over, panel(model))
+		return ui.column([ui.height(0), ui.grow(1)], over)
 	}
 	// The lobby has a scene in it too, and it is not decoration: **a browser will
 	// not report a gamepad to a page that is not reading one**, so a lobby with no
@@ -1762,6 +1829,242 @@ func lensOf(model: Model): Int {
 		return 82
 	}
 	return 74
+}
+
+// ---------------------------------------------------------------------------
+// The glow
+// ---------------------------------------------------------------------------
+
+// What the border of the window is doing. Four things, and the reason it is a type
+// rather than two booleans is that they are four things and never two of them.
+type Border {
+	// Nothing. Most of most laps.
+	Dark
+	// A limit applies where you are and nothing is being counted against you.
+	Watched
+	// The stewards' clock is running.
+	Late
+	// Somebody a lap quicker is about to come past, and has not yet.
+	Blue
+	// A lap just closed that was this driver's own fastest…
+	Quick
+	// …and nobody in the race has gone faster.
+	Fastest
+}
+
+// The edges of the window, lit whenever there is something worth knowing without
+// looking for it.
+//
+// **It is here because the rules got expensive.** `drive.disregard()` made a delta
+// worth obeying by making it ruinous to ignore, and a rule that ruinous has to be
+// impossible to miss. The strip says it in words and the map says it in a colour,
+// and both of those are somewhere you are not looking at the moment you need
+// them — which is while you are looking at a corner. This is not somewhere you
+// look. It is the whole border of the picture, and it is there whichever way the
+// camera happens to be pointing.
+//
+// Four colours, and every one of them is the colour that thing already is at a
+// circuit, which is the whole reason none of them needs a legend:
+//
+//   * **amber** — a limit applies where you are and you are answering it: under the
+//     delta, or on the brakes on the way down to it. Both are amber, because what a
+//     driver has to do about them is *what they are already doing*.
+//   * **red** — over the limit with no brake on. **It goes red inside the two
+//     seconds of `control.grace()`, before anything is being counted**, and that is
+//     the point of it rather than a detail: a border that waited until the penalty
+//     had started would be telling a driver at the one moment it was too late to be
+//     told. Red is "brake", not "you have been charged".
+//   * **blue** — somebody a lap quicker is behind you and about to come past. Move
+//     to the edge of the road and let them. It beats once it is costing you, which
+//     is the same thing the red does and for the same reason.
+//   * **green** — the lap you have just finished is your own fastest.
+//   * **purple** — and nobody in the race has gone faster.
+//
+// Amber covers the pit lane, a yellow sector and the safety car alike, and they
+// are one colour on purpose: what a driver has to *do* about all three is the same
+// thing, the strip is already there to say which of them it was, and somebody
+// telling three border colours apart is somebody reading the border.
+//
+// The whole thing is three questions and not one of them is answered here:
+// `control.deltaFor` for whether a limit applies at all, `control.ignoring` — the
+// warning the stewards' own `judged` is built out of — for whether the driver is
+// doing anything about it, and `control.fastest` for whose lap it was. Nothing in
+// this file works out where a flag is, how old it is or what the pedals are doing,
+// and that is what keeps the border from ever telling a driver they are fine while
+// race control is about to write them down.
+func glow(model: Model): ui.View[dyn] {
+	mut ui.View[dyn] edges = []
+	if model.race.over {
+		return edges
+	}
+	shade := border(model)
+	if shade is Border.Dark {
+		return edges
+	}
+	for at := 0; at < 4; at++ {
+		append(edges, glowEdge(model, shade, at))
+	}
+	return edges
+}
+
+// Which of the four it is.
+//
+// **A limit beats a lap time, and it is not close.** They can happen together — a
+// yellow that comes out in the half second between the line and the flash — and
+// when they do the border says the one that is costing five seconds and then ten
+// rather than the one that is worth a smile. A celebration nobody sees is nothing
+// lost; a red border nobody sees is the whole point of the border.
+func border(model: Model): Border {
+	race := model.race
+	me := control.find(race.cars, shown(model))
+	if control.deltaFor(race, me.along, me.across) > 0.0 {
+		if control.ignoring(race, me) {
+			return Border.Late()
+		}
+		return Border.Watched()
+	}
+	// A limit beats a blue flag, and there is barely a case where both are out: a
+	// blue is only ever shown under green, so what this is really ordering is a
+	// yellow that came out while somebody was lapping you. The delta costs more and
+	// costs it faster.
+	if control.blue(race, me) {
+		return Border.Blue()
+	}
+	if model.lit <= 0.0 {
+		return Border.Dark()
+	}
+	// Purple is asked now rather than remembered from when the flash was lit, so a
+	// lap that is beaten by somebody else while it is still on the screen goes green
+	// under it. That is not a glitch and it is not worth preventing: it is what the
+	// timing screen at a circuit does, and it is true.
+	mine := control.find(race.cars, model.seat)
+	if control.fastest(race) >= mine.sheet.best {
+		return Border.Fastest()
+	}
+	return Border.Quick()
+}
+
+// One edge, pinned to it. 0 is the top, 1 the bottom, 2 the left and 3 the right.
+//
+// Four overlays rather than one frame because an overlay is pinned to *an* edge —
+// that is the whole of what a pinned overlay is — and four of them cost four divs
+// against a scene that is drawing nine hundred road slabs a frame.
+func glowEdge(model: Model, shade: Border, at: Int): ui.View {
+	bands := glowBands(model, shade, at)
+	if at == 0 {
+		return ui.overlay([ui.align(ui.Align.Start()),
+			ui.justify(ui.Justify.Center()), ui.grow(1)],
+			ui.column([ui.grow(1)], bands))
+	}
+	if at == 1 {
+		return ui.overlay([ui.align(ui.Align.End()),
+			ui.justify(ui.Justify.Center()), ui.grow(1)],
+			ui.column([ui.grow(1)], bands))
+	}
+	if at == 2 {
+		return ui.overlay([ui.align(ui.Align.Stretch()),
+			ui.justify(ui.Justify.Start())], ui.row([], bands))
+	}
+	return ui.overlay([ui.align(ui.Align.Stretch()),
+		ui.justify(ui.Justify.End())], ui.row([], bands))
+}
+
+// The bands one edge is made of, in the order they are drawn.
+//
+// The top and the left are drawn away from their edge and the bottom and the right
+// are drawn towards theirs, so the step is counted backwards for those two. Get it
+// wrong and two of the four edges have their bright end in the middle of the
+// screen, which is exactly what the first version did.
+func glowBands(model: Model, shade: Border, at: Int): ui.View[dyn] {
+	mut ui.View[dyn] bands = []
+	for i := 0; i < glowDepth(); i++ {
+		mut Int step = i
+		if at == 1 || at == 3 {
+			step = glowDepth() - 1 - i
+		}
+		append(bands, glowBand(model, shade, step, at < 2))
+	}
+	return bands
+}
+
+// One band. Flat ones lie along the top and bottom and are as wide as the window;
+// the others stand up the sides and are as tall as it. Only the thickness is said
+// either way, because the other dimension is "all of it" and that is what a band
+// with nothing said about it does inside a `row` or a `column`.
+//
+// **The text is empty rather than a space**, and that is not tidiness. A space is a
+// line box, a line box is nineteen pixels, and nineteen pixels of it hung out of the
+// bottom of a twelve-pixel band — enough to put a scrollbar down the right-hand end
+// of the top and bottom edges of the window. Nothing is being said here, so nothing
+// is what it says.
+func glowBand(model: Model, shade: Border, step: Int, flat: Bool): ui.View {
+	tone := glowTone(model, shade, step)
+	if flat {
+		return ui.text([ui.height(glowThick()), ui.background(tone)], "")
+	}
+	return ui.text([ui.width(glowThick()), ui.background(tone)], "")
+}
+
+// What one band is, at a depth. The alpha falls with the *square* of how far in the
+// band is, and that is the only interesting line here: falling straight gives six
+// stripes and a visible seam at each one, and falling as a square gives light
+// spilling in from the edge.
+//
+// The two kinds of border fade differently, because they are saying different
+// kinds of thing. A limit is a **state** and stays at one brightness for as long as
+// it lasts — the red beating on top of that, because a colour that sits still is
+// decoration and a colour that pulses is an alarm, and the moment this is for is
+// the second and a half of `drive.leeway()` there is to lift in. A lap time is an
+// **event**: it arrives at full brightness and is gone, so it fades out over
+// `litFor()` and never has to be dismissed.
+func glowTone(model: Model, shade: Border, step: Int): ui.Tone {
+	fade := conv.itf(glowDepth() - step) / conv.itf(glowDepth())
+	deep := fade * fade
+	if shade is Border.Late {
+		beat := 0.72 + 0.28 * math.sin(model.race.clock * 9.0)
+		return ui.Tone.RGBA(255, 62, 48, conv.round(235.0 * deep * beat))
+	}
+	if shade is Border.Watched {
+		return ui.Tone.RGBA(240, 176, 41, conv.round(150.0 * deep))
+	}
+	if shade is Border.Blue {
+		// Steady while there is still time to pick a place to move over, and beating
+		// once the five seconds are gone and it is costing. One colour saying two
+		// things is right here: what to *do* about it does not change when it starts
+		// costing, so the colour should not either — only the urgency.
+		mut Float urge = 1.0
+		if control.find(model.race.cars, shown(model)).sheet.blocking
+			>= drive.blueLeeway() * 0.6 {
+			urge = 0.7 + 0.3 * math.sin(model.race.clock * 9.0)
+		}
+		return ui.Tone.RGBA(74, 163, 255, conv.round(185.0 * deep * urge))
+	}
+	going := deep * math.min(1.0, model.lit / litFor())
+	if shade is Border.Fastest {
+		return ui.Tone.RGBA(200, 107, 255, conv.round(225.0 * going))
+	}
+	return ui.Tone.RGBA(47, 191, 113, conv.round(210.0 * going))
+}
+
+// How many bands an edge is, and how thick one of them is. Six twelves is
+// seventy-two pixels: wide enough to catch the corner of an eye on a small window,
+// and — because of the square above — thin enough where it is bright that the
+// road is still visible under all of it.
+func glowDepth(): Int {
+	return 6
+}
+
+func glowThick(): Int {
+	return 12
+}
+
+// How long a lap-time flash lasts. **Quick, and that is the requirement rather
+// than a taste.** It arrives on the pit straight at the moment the lap ticks over,
+// which is a moment a driver is already busy; long enough to be certain of having
+// seen it and short enough to be gone before the first corner is anything to do
+// with it.
+func litFor(): Float {
+	return 1.2
 }
 
 // ---------------------------------------------------------------------------
@@ -1945,25 +2248,70 @@ func pitboard(model: Model): ui.View {
 	// two `spacer`s that used to push this apart have nothing left to push against
 	// and are gone. What is left is sized by its own content, which is what keeps
 	// the two corners clear of it.
-	return ui.row([ui.pad(8), ui.gap(11), ui.align(ui.Align.Center()),
+	//
+	// **Two lines rather than one, and the width is the whole reason.** On one line
+	// it was already most of a 1400-pixel window, and the sector times took it under
+	// the map — the same failure a status panel had here once before, and the same
+	// one it will have again the moment somebody adds a fourteenth thing to a row
+	// that is centred between two fixed corners. Two lines is the fix that does not
+	// depend on how many things there are: where you are on the top, how you are
+	// going underneath, and neither of them anywhere near a corner.
+	return ui.column([ui.pad(8), ui.gap(4), ui.align(ui.Align.Center()),
 		ui.background(ui.Tone.RGBA(13, 16, 19, 190))], [
-		ui.text([ui.size(ui.TextSize.Title()), ui.heading(1)], "P{place}"),
-		ui.text([ui.tone(ui.Tone.Muted())], "of {grid.field()}"),
-		ui.text([ui.size(ui.TextSize.Subtitle())],
-			"LAP {math.min(conv.itf(me.sheet.lap + 1), conv.itf(race.track.laps))}/{race.track.laps}"),
-		ui.text([ui.background(ui.Tone.HEX(grid.bodyOf(seat))),
-			ui.tone(ui.Tone.HEX("#ffffff")), ui.pad(4)],
-			" {grid.driverOf(seat).tag} "),
-		pitcall(me, race),
-		harvest(me),
-		token(me, race),
-		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())], "GAP"),
-		ui.text([], control.gapped(control.interval(race, seat))),
-		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())], "LAST"),
-		ui.text([], control.clocked(me.sheet.last)),
+		ui.row([ui.gap(11), ui.align(ui.Align.Center())], [
+			ui.text([ui.size(ui.TextSize.Title()), ui.heading(1)], "P{place}"),
+			ui.text([ui.tone(ui.Tone.Muted())], "of {grid.field()}"),
+			ui.text([ui.size(ui.TextSize.Subtitle())],
+				"LAP {math.min(conv.itf(me.sheet.lap + 1), conv.itf(race.track.laps))}/{race.track.laps}"),
+			ui.text([ui.background(ui.Tone.HEX(grid.bodyOf(seat))),
+				ui.tone(ui.Tone.HEX("#ffffff")), ui.pad(4)],
+				" {grid.driverOf(seat).tag} "),
+			pitcall(me, race),
+			harvest(me),
+			token(me, race)
+		]),
+		ui.row([ui.gap(11), ui.align(ui.Align.Center())], [
+			ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())], "GAP"),
+			ui.text([], control.gapped(control.interval(race, seat))),
+			ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())], "LAST"),
+			ui.text([], control.clocked(me.sheet.last)),
+			ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())], "BEST"),
+			ui.text([ui.tone(ui.Tone.Good())], control.clocked(me.sheet.best)),
+			sector(me),
+			penalties(me)
+		])
+	])
+}
+
+// The sector being driven right now, and what it has been worth.
+//
+// **The lap you are on is the wrong unit for most of a lap.** LAST and BEST beside
+// it are whole laps, and for the two and a half minutes between one line and the
+// next they say nothing about how the corner just taken went. This does: the same
+// two numbers for the third of a circuit currently under the wheels, which is the
+// one stretch of road a driver can still do anything about.
+//
+// Both are read straight off the sheet — `sectors` is the last time set for each
+// third and `bestSectors` the best — so there is nothing here to keep in step and
+// nothing that could disagree with the purple sectors the strip announces. The
+// slot is `sector - 1` because a sector is numbered the way a driver numbers it
+// and a `Float[3]` is indexed the way everything else is.
+func sector(me: drive.Car): ui.View {
+	at := me.sheet.sector - 1
+	last := control.slotOf(me.sheet.sectors, at)
+	best := control.slotOf(me.sheet.bestSectors, at)
+	// Green when the last run through this sector was the best one, which is the
+	// same green the timing screen at a circuit uses and means the same thing.
+	mut ui.Tone shade = ui.Tone.Normal()
+	if last > 0.0 && last <= best {
+		shade = ui.Tone.Good()
+	}
+	return ui.row([ui.gap(8), ui.align(ui.Align.Center())], [
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())],
+			"S{me.sheet.sector}"),
+		ui.text([ui.tone(shade)], control.clocked(last)),
 		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())], "BEST"),
-		ui.text([ui.tone(ui.Tone.Good())], control.clocked(me.sheet.best)),
-		penalties(me)
+		ui.text([], control.clocked(best))
 	])
 }
 
@@ -2063,9 +2411,16 @@ func penalties(me: drive.Car): ui.View {
 		append(out, ui.text([ui.tone(ui.Tone.Warn()), ui.size(ui.TextSize.Caption())],
 			"LIMITS {me.sheet.warnings}/{drive.allowed()}"))
 	}
+	// A tally rather than a count towards anything: every one of these was paid
+	// for at the moment it happened, and what it is worth showing for is that the
+	// **next** one costs one more of them.
 	if me.sheet.ignored > 0 {
-		append(out, ui.text([ui.tone(ui.Tone.Warn()), ui.size(ui.TextSize.Caption())],
-			"FLAGS {me.sheet.ignored}/{drive.ignorable()}"))
+		append(out, ui.text([ui.tone(ui.Tone.Danger()), ui.size(ui.TextSize.Caption())],
+			"FLAGS {me.sheet.ignored} · NEXT +{conv.round(drive.disregard() * conv.itf(me.sheet.ignored + 1))}s"))
+	}
+	if me.sheet.blocked > 0 {
+		append(out, ui.text([ui.tone(ui.Tone.Danger()), ui.size(ui.TextSize.Caption())],
+			"BLUE {me.sheet.blocked} · NEXT +{conv.round(drive.blueCost() * conv.itf(me.sheet.blocked + 1))}s"))
 	}
 	if me.sheet.penalty > 0.0 {
 		append(out, ui.text([ui.tone(ui.Tone.Danger())],
@@ -2197,13 +2552,21 @@ func quit(model: Model): ui.View {
 func flag(race: control.Race, seat: Int): ui.View {
 	me := control.find(race.cars, seat)
 	delta := control.deltaFor(race, me.along, me.across)
+	// SLOW DOWN is `control.ignoring` rather than a speed against a number: the same
+	// call the border of the window runs on, and the one the stewards' `judged` is
+	// built out of. A car braking hard from two hundred is over the delta and is
+	// answering it, and a panel that shouted at that would be telling a driver doing
+	// exactly what the flag asked that they were getting it wrong. A car that is
+	// over it with no brake on is told at once, inside `control.grace()` and before
+	// it costs anything, because that is when telling it is any use.
+	late := control.ignoring(race, me)
 	// The pit limit first, because it is asked first: it is not a flag, nothing
 	// lifts it, and a car in the lane under a safety car is held to the lower of
 	// the two rather than to the one that happens to be more dramatic.
 	if circuit.inPits(race.track, me.along, me.across) {
 		mut ui.Tone lane = ui.Tone.HEX("#4aa3ff")
 		mut Str limit = " PIT LANE — LIMIT {conv.round(delta * 3.6)} "
-		if me.speed > delta {
+		if late {
 			lane = ui.Tone.Danger()
 			limit = " PIT LANE — SLOW DOWN "
 		}
@@ -2211,19 +2574,40 @@ func flag(race: control.Race, seat: Int): ui.View {
 			ui.pad(4)], limit)
 	}
 	if race.pace.life > 0.0 {
-		return ui.text([ui.background(ui.Tone.Warn()),
-			ui.tone(ui.Tone.HEX("#0d1013")), ui.pad(4)],
-			" SAFETY CAR — DELTA {conv.round(delta * 3.6)} ")
+		mut ui.Tone car = ui.Tone.Warn()
+		mut Str out = " SAFETY CAR — DELTA {conv.round(delta * 3.6)} "
+		if late {
+			car = ui.Tone.Danger()
+			out = " SAFETY CAR — SLOW DOWN "
+		}
+		return ui.text([ui.background(car), ui.tone(ui.Tone.HEX("#0d1013")),
+			ui.pad(4)], out)
 	}
 	if delta > 0.0 {
 		mut ui.Tone shade = ui.Tone.HEX("#f0b429")
 		mut Str said = " YELLOW — DELTA {conv.round(delta * 3.6)} "
-		if me.speed > delta {
+		if late {
 			shade = ui.Tone.Danger()
 			said = " YELLOW — SLOW DOWN "
 		}
 		return ui.text([ui.background(shade), ui.tone(ui.Tone.HEX("#0d1013")),
 			ui.pad(4)], said)
+	}
+	// The blue flag, which is the one panel here that names somebody: "move over" is
+	// advice and "move over, Okonjo is on your gearbox" is a mirror. It is asked
+	// after the deltas because a limit is the more expensive thing to be told, and
+	// before the green because a car being lapped on a clear track is not having a
+	// quiet moment.
+	who := control.blueFor(race, me)
+	if who >= 0 {
+		mut ui.Tone flag = ui.Tone.HEX("#4aa3ff")
+		mut Str move = " BLUE — {grid.driverOf(who).tag} · LET THEM BY "
+		if me.sheet.blocking >= drive.blueLeeway() * 0.6 {
+			flag = ui.Tone.Danger()
+			move = " BLUE — MOVE OVER "
+		}
+		return ui.text([ui.background(flag), ui.tone(ui.Tone.HEX("#0d1013")),
+			ui.pad(4)], move)
 	}
 	// A green is worth its moment on the strip too, because the thing it is saying
 	// is that you may go again — which is not something you want to have to infer
@@ -2289,18 +2673,22 @@ func standings(model: Model, final: Bool): ui.View {
 		])
 		place = place + 1
 	}
-	// **The button is in the header and the table is what scrolls.** Both halves of
-	// that are a fix for the same thing. This panel is centred over the picture and
-	// a field of ten is taller than it looks: with the button as the last row of a
-	// column that could not scroll, anything shorter than about a seven-hundred
-	// pixel window put it underneath the message strip — where it is still drawn,
-	// still reports itself as being at that place, and cannot be clicked because
-	// the strip is over it — and anything shorter than that again pushed it off the
-	// bottom of the screen with no way to reach it. It looked exactly like a button
-	// that does nothing.
+	// **The button is in the header, and the table shows the whole field.** The
+	// header is a fix for something that really happened: with the button as the
+	// last row of a column that could not scroll, anything shorter than about a
+	// seven-hundred pixel window put it underneath the message strip — where it is
+	// still drawn, still reports itself as being at that place, and cannot be
+	// clicked because the strip is over it. A header that does not move is also
+	// simply better: the way out of a race is the first thing on the panel rather
+	// than the last.
 	//
-	// A header that does not move is also simply better: the way out of a race is
-	// the first thing on the panel rather than the last.
+	// **The table's own scroll box is gone, and the height it was capped at with
+	// it.** Two hundred and sixty pixels was six of ten drivers and a scrollbar, and
+	// a standings panel that hides the four cars you are racing is not a standings
+	// panel — the one thing anybody opens it for is the whole order. There is no
+	// height here now at all: ten rows are what ten rows are, and if the window is
+	// too short for them the overlay this sits in scrolls, which is the one place
+	// a scrollbar was ever any use.
 	return ui.column([ui.gap(10), ui.pad(16)], [
 		ui.row([ui.gap(14), ui.align(ui.Align.Center())], [
 			ui.text([ui.size(ui.TextSize.Subtitle()), ui.heading(2)],
@@ -2308,9 +2696,7 @@ func standings(model: Model, final: Bool): ui.View {
 			ui.spacer(),
 			startOver(model, final)
 		]),
-		ui.column([ui.height(260), ui.scroll(ui.Axis.Vertical())], [
-			ui.table([], rows)
-		])
+		ui.table([], rows)
 	])
 }
 
@@ -2359,6 +2745,8 @@ func classification(model: Model): ui.View {
 	place := control.placeOf(model.race.cars, me) + 1
 	// Same shape and for the same reason as the standings above: the way on is in
 	// the header, not at the bottom of a panel that is taller than a short window.
+	// The classification is the one panel where the whole field is the entire point,
+	// which is the other half of why `standings` no longer hides six of it.
 	return ui.column([ui.gap(12), ui.pad(16)], [
 		ui.row([ui.gap(14), ui.align(ui.Align.Center())], [
 			ui.text([ui.size(ui.TextSize.Title()), ui.heading(1)],

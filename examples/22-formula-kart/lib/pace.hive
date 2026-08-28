@@ -92,6 +92,7 @@ func driving(
 	lead: drive.Pace,
 	seat: Int,
 	delta: Float,
+	blue: Bool,
 	green: Bool,
 	clock: Float
 ): drive.Wants {
@@ -121,6 +122,17 @@ func driving(
 	// a bot that went on covering the inside line would put itself in the wall.
 	if toPits {
 		want = laneAt(track, aim)
+	} else if blue {
+		// A blue flag, and it is the same kind of exception the pit lane is: the
+		// racing line stops being the thing to aim at, and everything else about
+		// driving the car is unchanged.
+		//
+		// **A bot under a blue flag is not racing the car behind it, and every one of
+		// the three questions below is about racing the car behind it.** Covering the
+		// inside from somebody a lap quicker is how a lapped car ends up defending a
+		// position it does not hold, for half a lap, into the wall. So it goes to the
+		// side and stays there until the flag is gone.
+		want = aside(track, me, seat, node)
 	} else {
 		// 2, 3 and 4: who is in the way, who is behind, and what is lying about.
 		want = want + passing(track, cars, me, green)
@@ -143,6 +155,38 @@ func driving(
 		drifts(track, me, node, wheel, green),
 		spends(track, cars, me, green, clock)
 	)
+}
+
+// Where a car under a blue flag puts itself: hard over to one edge of the road, so
+// that the car coming through can have the line.
+//
+// It is the same `half - 1.6` every other lateral target in this file is bounded
+// by, which is what makes it a place a bot can actually hold rather than a wall it
+// leans on — and it clears `drive.blueEdge()` on the narrowest node a seed rolls,
+// so a bot that gets here is a bot the stewards have nothing to say to.
+//
+// **Which edge is not always the same edge, and getting that wrong cost a whole
+// field its pit stops.** Away from the racing line is the right answer nearly
+// always: it is the half of the road the car coming through does not want. But a
+// bot with its stop still owed has somewhere it must be — see `laneAt`, which
+// exists because a car that reaches the pit entry on the *racing line* has already
+// left it too late to cross, let alone one sent to the far side of the road by a
+// flag. So on the lap it is due in, the lane's side is the edge it moves to. That
+// is out of the way by exactly the same measure and it is also where it was going.
+func aside(
+	track: circuit.Circuit,
+	me: drive.Car,
+	seat: Int,
+	node: circuit.Node
+): Float {
+	room := math.max(0.5, node.half - 1.6)
+	if dueIn(track, me, seat) {
+		return room * track.pits.side
+	}
+	if node.line > 0.0 {
+		return -room
+	}
+	return room
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +238,7 @@ func pitting(track: circuit.Circuit, me: drive.Car, seat: Int): Bool {
 		|| circuit.downLane(track, me.along, me.across) {
 		return true
 	}
-	if me.sheet.pitted || me.sheet.lap < pitsOn(track, seat) {
+	if dueIn(track, me, seat) == false {
 		return false
 	}
 	// Coming up on the entry, and near enough to be slowing for it — which is the
@@ -205,6 +249,14 @@ func pitting(track: circuit.Circuit, me: drive.Car, seat: Int): Bool {
 	}
 	// Or in the mouth of it, with the wall not yet closed alongside.
 	return circuit.gap(track, me.along, track.pits.entry) <= circuit.pitMouth(track)
+}
+
+// Whether this car still owes its stop and has reached the lap it means to take it
+// on. Not "is it turning in now" — that is `pitting` above, which is this and the
+// pit entry being in sight — but "is the pit lane this lap's business", which is
+// what anything else that might move the car across the road has to know about.
+func dueIn(track: circuit.Circuit, me: drive.Car, seat: Int): Bool {
+	return me.sheet.pitted == false && me.sheet.lap >= pitsOn(track, seat)
 }
 
 // Where a car on its way in should be, across the road, at a place ahead of it.
@@ -248,8 +300,8 @@ func carAt(cars: drive.Car[], seat: Int): drive.Car {
 		return cars[0]
 	}
 	return drive.Car(seat, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0,
-		0.0, 0.0, 0.0, 1.0, 0.0, drive.Token.Nothing(), 0.0, 0.0, 0.0, false, 0.0,
-		drive.freshSheet())
+		0.0, 0.0, 0.0, 1.0, 0.0, drive.Token.Nothing(), 0.0, 0.0, 0.0, false, false,
+		0.0, drive.freshSheet())
 }
 
 // A number between -1 and 1 that changes about once a second and is the same every

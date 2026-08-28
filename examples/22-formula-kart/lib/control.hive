@@ -27,10 +27,10 @@
 // So now: `deltaAt` says the fastest anybody *should* be at a place; the zones say
 // exactly where, and go on the map exactly where they are; and `policed` writes
 // down who was over it and for how long. Over it for longer than `drive.leeway()`
-// is an offence and three offences is five seconds — the same shape as the track
-// limits rule, which is deliberate, because they are the same kind of thing. The
-// safety car is a car: it comes out of the pit lane, drives at the delta, and if
-// you arrive at the back of it at two hundred you will find out about it in the
+// is an offence, and **every offence is a penalty, each one dearer than the last**
+// — see `drive.disregard()`, which is where the arithmetic of why is written out.
+// The safety car is a car: it comes out of the pit lane, drives at the delta, and
+// if you arrive at the back of it at two hundred you will find out about it in the
 // way that needs no rule at all.
 //
 // **THE ORDER IS TOTAL DISTANCE**, not how far round the lap somebody is. Two
@@ -44,12 +44,12 @@
 // the *timing* screen's idea of where you are; they are no longer the flags', and
 // keeping those two apart is most of what this file gained.
 //
-// **THE COMPULSORY STOP** is the one rule here that is not counted in threes.
-// Track limits and ignored flags are three-and-then-five seconds, because they are
-// things a driver does a bit of and can be forgiven a bit of. A pass through the
-// pit lane is not: it either happened or it did not, and the penalty for taking
-// the flag without it is larger than the stop it replaced — otherwise skipping it
-// would simply be the quick way round.
+// **THE COMPULSORY STOP** is the one rule here with nothing gradual about it.
+// Track limits are counted in threes and a delta in escalating fives, because they
+// are things a driver does a bit of. A pass through the pit lane is not: it either
+// happened or it did not, and the penalty for taking the flag without it is larger
+// than the stop it replaced — otherwise skipping it would simply be the quick way
+// round.
 //
 // It is policed by `deltaFor` rather than by anything new. The pit limit is a
 // delta like a yellow's, on the same stewards' clock, with the same leeway — the
@@ -110,6 +110,13 @@ type Zone {
 	// as saying it.
 	yellow: Float
 	green: Float
+	// The clock reading the flag first went out at, which is a different question
+	// from how long it has left and cannot be got from it. `yellow` is *refreshed*
+	// for as long as whatever caused the flag is still there, so a car sitting in a
+	// gravel trap holds it at `yellowFor()` and an age read off it would be nought
+	// for the whole incident. This is written once and never again — see `grace()`,
+	// which is the only thing that reads it.
+	since: Float
 }
 
 type Race {
@@ -222,6 +229,45 @@ func safetyFor(): Float {
 	return 13.0
 }
 
+// How long a limit is out before anybody is judged on it.
+//
+// **A delta arrives instantly and a car does not.** The safety car takes the whole
+// circuit from two hundred and sixty to eighty-three in the frame it is called, and
+// a car doing two hundred needs the better part of two seconds on the brakes to get
+// there. Without this, obeying a safety car *as fast as the brakes physically
+// allow* was an offence and then another one — the driver was punished for the
+// stopping distance rather than for anything they did — and after `drive.disregard()`
+// made an offence cost five seconds and then ten, that was the difference between a
+// hard rule and an unfair one.
+//
+// Two seconds is the reaction and no more. It runs from the moment the flag goes
+// out rather than from the moment a car reaches one, which is the distinction that
+// keeps it honest: a yellow that appears around you is a surprise and gets this, and
+// a yellow you drove into — it was on the map, on the border of your screen and in a
+// marshal's hands the whole way there — is not and does not.
+//
+// **It is silent to the stewards and loud to the driver.** Nothing is written down
+// inside it, and the border of the window goes red the instant a car is over the
+// delta with no brake on — see `ignoring`, which is the half of the rule the driver
+// is shown. Two seconds of being told to brake before it means anything is the
+// whole of what makes this a reaction time rather than two free seconds.
+func grace(): Float {
+	return 2.0
+}
+
+// How close behind a car somebody has to be, in metres, before a blue flag is
+// shown to it.
+//
+// It is a distance rather than a time because it is a *place on the road* — the
+// same thing a yellow zone is, and asked with the same arithmetic. A hundred and
+// ten metres is roughly the two seconds a real one is waved at, taken at the speed
+// this game is mostly driven at, and it is deliberately more warning than the
+// moment of the pass: the whole rule is about picking somewhere to move over
+// before somebody is already alongside.
+func blueWithin(): Float {
+	return 110.0
+}
+
 // And how long after one before another may be called. A race gets one, or at the
 // outside two.
 func safetyRest(): Float {
@@ -297,6 +343,7 @@ func stepped(race: Race, asked: Asking[], dt: Float): Race {
 	it = rolling(it, dt)
 	it = flagged(it)
 	it = policing(it, dt)
+	it = lapping(it, dt)
 	it = timed(it, race)
 	it.notes = fading(it.notes, dt)
 	it.over = everybodyIn(it)
@@ -314,7 +361,7 @@ func walked(race: Race, asked: Asking[], dt: Float): Race {
 		if atWheel(asked, car.seat) == false {
 			want = pace.driving(race.track, race.cars, race.shards, race.wheels,
 				race.pace, car.seat, deltaFor(race, car.along, car.across),
-				green(race), race.clock)
+				blue(race, car), green(race), race.clock)
 		}
 		// What the token did, if it was spent and if it was one that puts something
 		// on the road. The car's own two — the wing and the tyres — are the car's
@@ -379,6 +426,168 @@ func deltaFor(race: Race, along: Float, across: Float): Float {
 		return circuit.pitSpeed()
 	}
 	return deltaAt(race, along)
+}
+
+// Whether the limit at this place went out inside the last `grace()` seconds — that
+// is, whether it is still too new for anybody to be judged on.
+//
+// It asks the three limits in the order `deltaFor` answers them, because it has to
+// be about the *same* limit that function named or it would forgive a car for one
+// rule while the stewards were holding it to another:
+//
+//   * The pit lane's limit is never new. It does not come out; you drive into it,
+//     past a wall, at a place you chose, having braked for the entry.
+//   * The safety car's is new for two seconds from the moment it was called, which
+//     is `safetyFor() - life` because nothing ever puts `life` back up.
+//   * A yellow's is new for two seconds from the moment the flag first went out,
+//     which is what `Zone.since` is for and is not what `Zone.yellow` says.
+func justOut(race: Race, along: Float, across: Float): Bool {
+	if circuit.inPits(race.track, along, across) {
+		return false
+	}
+	if race.pace.life > 0.0 {
+		return safetyFor() - race.pace.life < grace()
+	}
+	for each zone in race.zones {
+		if zone.yellow > 0.0 && inZone(race.track, zone, along) {
+			return race.clock - zone.since < grace()
+		}
+	}
+	return false
+}
+
+// Whether this car is over the limit where it is and doing nothing about it.
+//
+// **This is the warning, and it is not the same question as the penalty.** The two
+// were one function for exactly as long as it took to drive a safety car with it:
+// a border that stayed amber for the two seconds of `grace()` was a border that
+// went red at the one moment it was already too late to be told, and the whole
+// value of putting it around the outside of the picture is that it is early.
+//
+// So this is asked of the *driver* — are you over it, and is your foot on the
+// brake — and nothing else. It is what the border of the window is red for and
+// what the strip says SLOW DOWN for. Whether it costs anything is `judged` below,
+// which is this and the clock.
+//
+// Braking is the one thing that answers it. A car being braked as hard as it can
+// be braked is doing the only thing the flag asks of it, and the speed on the way
+// down is the brakes rather than the driver — so it counts as being at the limit,
+// and the border goes amber the instant the brake goes on. That is also the whole
+// of what stops this being a way through a yellow: you cannot brake and keep your
+// speed, and `drive.stepped` will not call it braking while there is a throttle
+// under it.
+func ignoring(race: Race, car: drive.Car): Bool {
+	delta := deltaFor(race, car.along, car.across)
+	if delta <= 0.0 || car.speed <= delta {
+		return false
+	}
+	return car.braking == false
+}
+
+// Whether the stewards' clock is running on this car right now.
+//
+// **One function, and everything that writes anything down asks this one.** A
+// second reading of the rule would be a second chance to charge somebody for
+// something the border never told them about.
+//
+// It is `ignoring` and one thing more: a limit newer than `grace()` judges nobody,
+// because nobody has had time yet. That gap between the two — over the delta, not
+// braking, not yet being counted — is deliberate and it is what the driver is
+// *shown*: the border is already red, and there are two seconds to do something
+// about it before it means anything.
+func judged(race: Race, car: drive.Car): Bool {
+	if ignoring(race, car) == false {
+		return false
+	}
+	return justOut(race, car.along, car.across) == false
+}
+
+// Who is about to put a lap on this car and is close enough behind for it to
+// matter — the seat, or -1 for nobody. This is the blue flag.
+//
+// **Being lapped is decided on total distance, because everything about the order
+// in this program is.** Two cars a hundred metres apart on the road are either on
+// the same lap, in which case the difference in what they have travelled is that
+// hundred metres, or one of them is a lap up, in which case it is a lap either
+// side of it. There is nothing in between, so the test is a whole lap with half a
+// lap of margin on each side of it and cannot be confused by a car that has just
+// crossed the line — which is the bug every other way of asking this has.
+//
+// A pit lane is nobody's blue flag: a car in the lane is not in anybody's way and
+// a car on the circuit is not in the lane's. Nor is anything under a safety car or
+// before the lights, where there is no racing to be held up.
+func blueFor(race: Race, car: drive.Car): Int {
+	if green(race) == false || car.sheet.finished {
+		return -1
+	}
+	if circuit.inPits(race.track, car.along, car.across) {
+		return -1
+	}
+	mut Int who = -1
+	mut Float nearest = blueWithin()
+	for each them in race.cars {
+		if them.seat == car.seat || them.sheet.finished {
+			continue
+		}
+		if circuit.inPits(race.track, them.along, them.across) {
+			continue
+		}
+		// How far back down the road they are. Anybody in front is a whole lap of
+		// this and falls out on the next line rather than needing a case of its own.
+		behind := circuit.gap(race.track, car.along, them.along)
+		if behind <= 0.0 || behind > nearest {
+			continue
+		}
+		if them.sheet.travelled - car.sheet.travelled + behind
+			< race.track.length * 0.5 {
+			continue
+		}
+		who = them.seat
+		nearest = behind
+	}
+	return who
+}
+
+// Whether a blue flag is out for this car at all. The question everything that
+// draws one asks; `blueFor` is for whoever wants to name the car coming through.
+func blue(race: Race, car: drive.Car): Bool {
+	return blueFor(race, car) >= 0
+}
+
+// Whether this car has got out of the way: far enough off the middle of the road,
+// either side, that the racing line beside it is somebody else's.
+//
+// **Either side, and that is not laziness.** The car coming through wants the
+// line, and where the line is depends on the corner; a rule that named a side
+// would be a rule that sometimes asked a driver to cross in front of the very car
+// it was letting past. Off the middle is the thing that is always safe to do and
+// always enough.
+func yielding(track: circuit.Circuit, car: drive.Car): Bool {
+	node := circuit.nodeAlong(track, car.along)
+	return math.abs(car.across) >= node.half * drive.blueEdge()
+}
+
+// Who is holding up somebody about to lap them, and for how long.
+//
+// The same shape as `policing` and the same division of labour: this knows where
+// everybody is and `drive.impeded` knows what it costs. The strip says it when it
+// lands, because a penalty a driver only finds out about in the classification is
+// a penalty they were never given a chance to avoid.
+func lapping(race: Race, dt: Float): Race {
+	mut Race it = race
+	mut drive.Car[dyn] cars = []
+	for each car in race.cars {
+		who := blueFor(it, car)
+		mut drive.Car one = drive.impeded(car,
+			who >= 0 && yielding(race.track, car) == false, dt)
+		if one.sheet.blocked > car.sheet.blocked {
+			it = said(it, "{grid.driverOf(one.seat).tag} — IGNORING BLUE FLAGS, "
+				+ "+{conv.round(one.sheet.penalty - car.sheet.penalty)}s", Kind.Warn())
+		}
+		append(cars, one)
+	}
+	it.cars = cars
+	return it
 }
 
 // Whether a place on the road is inside a zone. Signed the short way round,
@@ -698,7 +907,7 @@ func waved(race: Race, at: Float): Race {
 	if already {
 		return it
 	}
-	append(it.zones, Zone(at, yellowSpan(), yellowFor(), 0.0))
+	append(it.zones, Zone(at, yellowSpan(), yellowFor(), 0.0, race.clock))
 	return said(it, "YELLOW — SECTOR {circuit.sector(race.track, at)}", Kind.Warn())
 }
 
@@ -734,7 +943,7 @@ func slotOfZone(zones: Zone[], at: Int): Zone {
 	if zones bounds at {
 		return zones[at]
 	}
-	return Zone(0.0, yellowSpan(), 0.0, 0.0)
+	return Zone(0.0, yellowSpan(), 0.0, 0.0, 0.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -744,18 +953,24 @@ func slotOfZone(zones: Zone[], at: Int): Zone {
 // Who was over the delta, and for how long. This is the whole enforcement, and it
 // is worth noticing what it does *not* do: it does not touch a speed, a throttle
 // or a brake anywhere. A car that ignores a yellow goes exactly as fast as its
-// driver asked it to and finds five seconds on its race time afterwards.
+// driver asked it to and finds the seconds on its race time afterwards — five for
+// the first offence, ten for the second, and so on up, which is `drive.disregard()`
+// and is the number that decides whether any of this is worth obeying.
 //
 // The bots are policed by the same call as the person, from the same numbers, and
 // they are caught by it now and then — a flag that comes out fifty metres in front
 // of a car doing seventy is a flag nobody was going to keep, which is exactly what
 // `drive.leeway()` is for and exactly why it is not nothing.
+//
+// **What is over the delta and what is being judged are two different questions**,
+// and only `judged` answers the second. A car braking from two hundred, and every
+// car on the circuit for the first two seconds of a safety car, are over the delta
+// and are not being judged — see `grace()`.
 func policing(race: Race, dt: Float): Race {
 	mut Race it = race
 	mut drive.Car[dyn] cars = []
 	for each car in race.cars {
-		delta := deltaFor(it, car.along, car.across)
-		mut drive.Car one = drive.policed(car, delta > 0.0 && car.speed > delta, dt)
+		mut drive.Car one = drive.policed(car, judged(it, car), dt)
 		if drive.caught(one, car) {
 			it = said(it, "{grid.driverOf(one.seat).tag} — {overFor(it, car)}"
 				+ costOf(one, car), Kind.Warn())
@@ -767,21 +982,26 @@ func policing(race: Race, dt: Float): Race {
 }
 
 // Which limit it was. The strip has always said what somebody was caught doing
-// rather than that they were caught, and there are two things to be caught at now.
+// rather than that they were caught, and there are three things to be caught at:
+// the lane's limit, the safety car's delta and a yellow's. They are asked in that
+// order because `deltaFor` answers them in that order, and a strip that named the
+// wrong one would be worse than a strip that named none.
 func overFor(race: Race, car: drive.Car): Str {
 	if circuit.inPits(race.track, car.along, car.across) {
 		return "SPEEDING IN THE PIT LANE"
 	}
+	if race.pace.life > 0.0 {
+		return "SPEEDING BEHIND THE SAFETY CAR"
+	}
 	return "SPEEDING UNDER YELLOW"
 }
 
-// What that one cost, said out loud only when it cost something. Two of these are
-// a warning and the third is the five seconds.
+// What that one cost. Every offence costs something now, so there is no longer a
+// case where this says nothing — and the amount is read off the two sheets rather
+// than named, because the nth offence is worth n times `drive.disregard()` and the
+// only thing that knows which one this was is the sheet.
 func costOf(after: drive.Car, before: drive.Car): Str {
-	if after.sheet.penalty > before.sheet.penalty {
-		return ", +{conv.round(drive.added())}s"
-	}
-	return " ({after.sheet.ignored}/{drive.ignorable()})"
+	return ", +{conv.round(after.sheet.penalty - before.sheet.penalty)}s"
 }
 
 // ---------------------------------------------------------------------------
@@ -957,6 +1177,25 @@ func timed(race: Race, before: Race): Race {
 	return it
 }
 
+// The fastest lap anybody in this race has set, or nought before anybody has set
+// one.
+//
+// **Worked out from the sheets rather than kept anywhere.** A `fastest` field on
+// the race would be a second place for one fact to live, and the two would
+// eventually disagree — about a car that never started, about a race a client was
+// handed halfway through, about whichever of those the first bug turned out to be.
+// Ten `if`s once a frame is not worth a field to get wrong.
+func fastest(race: Race): Float {
+	mut Float quickest = 0.0
+	for each car in race.cars {
+		lap := car.sheet.best
+		if lap > 0.0 && (quickest <= 0.0 || lap < quickest) {
+			quickest = lap
+		}
+	}
+	return quickest
+}
+
 // A car over the line. Its lap is closed, and if that was the last one it is done.
 func lapped(car: drive.Car, clock: Float): drive.Car {
 	mut drive.Car it = car
@@ -1081,8 +1320,8 @@ func find(cars: drive.Car[], seat: Int): drive.Car {
 		return cars[0]
 	}
 	return drive.Car(seat, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0,
-		0.0, 0.0, 0.0, 1.0, 0.0, drive.Token.Nothing(), 0.0, 0.0, 0.0, false, 0.0,
-		drive.freshSheet())
+		0.0, 0.0, 0.0, 1.0, 0.0, drive.Token.Nothing(), 0.0, 0.0, 0.0, false, false,
+		0.0, drive.freshSheet())
 }
 
 // How many cars are in front of this one, counted the same way the order is.

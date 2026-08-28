@@ -188,12 +188,24 @@ type Sheet {
 	// rather than one because a lift that came a moment late is not an offence and
 	// one that never came is, and only a clock can tell those apart.
 	//
+	// `ignored` only ever goes up. It is not a count towards a penalty the way
+	// `warnings` is — every offence is already paid for — it is how much the *next*
+	// one will cost, which is why nothing puts it back.
+	//
 	// They are kept apart from `warnings` on purpose. Running wide and ignoring a
 	// yellow are two different things to have done, they are shown separately on
 	// the board, and a driver who has done a bit of each has not done three of
 	// anything.
 	speeding: Float
 	ignored: Int
+	// The blue flag, and the same two numbers for the same reason: how long this
+	// car has been holding up somebody about to lap it, and how many times that has
+	// cost it. A third pair rather than a third use of the first, because being
+	// lapped and being quick are not the same offence and a driver who has done a
+	// bit of each has not done three of anything — the same argument `warnings`
+	// makes next door, made again.
+	blocking: Float
+	blocked: Int
 	penalty: Float
 	// Whether the compulsory pass through the pit lane has been served. One
 	// boolean, because the rule is one thing that either has happened or has not —
@@ -205,7 +217,7 @@ type Sheet {
 
 func freshSheet(): Sheet {
 	return Sheet(0, 0.0, 0.0, 0.0, 1, 0.0, 0.0,
-		[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 0, 0.0, 0, 0.0, false, false, 0.0)
+		[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 0, 0.0, 0, 0.0, 0, 0.0, false, false, 0.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +260,16 @@ type Car {
 	// Whether it was over the line last frame, so that one long excursion is one
 	// warning rather than sixty.
 	adrift: Bool
+	// Whether the driver was on the brakes rather than on the throttle when this
+	// frame was stepped.
+	//
+	// It is kept on the car for the same reason `adrift` is: what asked for it is a
+	// `Wants`, `Wants` live for exactly one call, and the pass that wants to know —
+	// `control.policing`, a stage later — has cars and no pedals. **It is the one
+	// thing race control knows about how a car is being driven**, and it is here
+	// rather than in the sheet because it is what the driver is doing now and not
+	// something the stewards have written down.
+	braking: Bool
 	// How long ago it last hit something, counting down. It is on the car rather
 	// than reported out of the collision because a hit is over in one frame and
 	// everything that wants to know about one — the picture, the noise it makes —
@@ -273,6 +295,7 @@ func parked(track: circuit.Circuit, seat: Int): Car {
 		0.0, 0.0, 0.0, 1.0, 0.0,
 		Token.Nothing(),
 		0.0, 0.0, 0.0,
+		false,
 		false,
 		0.0,
 		freshSheet()
@@ -524,11 +547,16 @@ func knockFor(): Float {
 
 // What taking the flag without having been down the pit lane costs.
 //
-// **The one penalty in this race that is not counted in threes.** Track limits
-// and ignored flags are three-and-then-five, because they are things a driver
-// does a bit of and can be forgiven a bit of. A compulsory stop is not: it is one
-// thing, it either happened or it did not, and the penalty has to be larger than
-// the stop it replaced or skipping it would be the quick way round.
+// **The one penalty in this race with nothing gradual about it.** Track limits are
+// counted in threes and a delta is counted in escalating fives, because both are
+// things a driver does a bit of. A compulsory stop is not: it is one thing, it
+// either happened or it did not, and the penalty has to be larger than the stop it
+// replaced or skipping it would be the quick way round.
+//
+// The three numbers are meant to be read together, and in this order: going down
+// the lane at the limit costs about eleven seconds, skipping the lane costs
+// twenty-five, and going down it flat costs fifty. **Obeying is the cheapest thing
+// on that list**, which is the only arrangement of them worth having.
 func unserved(): Float {
 	return 25.0
 }
@@ -546,15 +574,18 @@ func added(): Float {
 	return 5.0
 }
 
-// How long you may be over the delta in a flagged zone before it counts as
-// having ignored the flag.
+// How long you may be over the delta — a flag's, the safety car's or the pit
+// lane's — before it counts as having ignored it.
 //
-// It is a second and a bit rather than nothing, and that is the whole design of
+// It is a second and a half rather than nothing, and that is the whole design of
 // the rule: a flag comes out while you are already braking for the corner it is
 // at, and a rule with no leeway in it would punish the physics rather than the
-// driver. Long enough to lift; not long enough to keep going.
+// driver. Long enough to lift; not long enough to keep going. It grew by two
+// tenths when `disregard()` below did away with the two free offences, because
+// the two numbers are one bargain: **more room to get it right, and nothing at
+// all once you are past it.**
 func leeway(): Float {
-	return 1.3
+	return 1.5
 }
 
 // And how fast the count comes off again once you are within the delta. Half the
@@ -564,11 +595,56 @@ func forgiven(): Float {
 	return 0.5
 }
 
-// How many offences before the five seconds. The same three that track limits
-// costs, because they are the same sort of thing and two different numbers would
-// be two numbers to learn.
-func ignorable(): Int {
-	return 3
+// What one offence against a delta costs — and what every one after it costs more
+// than the last, the nth being worth n of these.
+//
+// **Running wide is counted in threes and this is not, because they are not the
+// same sort of thing.** A car that puts two wheels on the kerb has taken a
+// liberty. A car that goes through a yellow, past the safety car or down the pit
+// lane at racing speed has taken *time*, and a penalty for that is only a penalty
+// if it costs more than the time it took. It did not: a flag was five seconds
+// every third offence, so one blast through a two-hundred-metre yellow — a single
+// offence, and no penalty at all — was free, and a run down the pit lane at racing
+// speed saved eleven seconds and cost five. Both were simply the quick way round,
+// which is the one thing a rule may never be.
+//
+// So every offence is a penalty now, and they escalate: five seconds, then ten,
+// then fifteen. One late lift is a bad afternoon; holding it flat down the pit
+// lane is four offences and fifty seconds, which is the end of the race. That is
+// the right order for those two, and it is the escalation rather than the size of
+// any one of them that puts them in it.
+func disregard(): Float {
+	return 5.0
+}
+
+// How long a car may hold up somebody who is about to put a lap on it.
+//
+// **Five seconds is long because moving over is not instant and is not free.** A
+// car being lapped is still racing everybody on its own lap: it has to find a
+// place where letting somebody past does not also hand a position to the car it
+// is actually fighting. Long enough to pick that place, and nowhere near long
+// enough to spend a straight in front of somebody a lap quicker.
+func blueLeeway(): Float {
+	return 5.0
+}
+
+// And what each five seconds of not doing it costs — escalating, like a delta and
+// for the identical reason. **One penalty would be a price rather than a rule.**
+// A car with a five-second penalty already on it has nothing left to lose by
+// staying in the way for the rest of the lap, which is exactly the thing the flag
+// exists to stop; the second time costs ten, the third fifteen, and there is never
+// a moment when holding on is the cheaper option.
+func blueCost(): Float {
+	return 5.0
+}
+
+// How far to the side of the road counts as having got out of the way, as a share
+// of the half-width there. Six tenths is off the racing line and off the middle
+// with a car's width to spare, on the narrowest node a seed can roll — and it is a
+// share rather than a distance because a wide corner and a narrow one ask for the
+// same thing, which is "the edge", and that is a different number at each.
+func blueEdge(): Float {
+	return 0.6
 }
 
 // ---------------------------------------------------------------------------
@@ -613,6 +689,14 @@ func stepped(
 
 	it = timers(it, dt)
 	it = spending(track, it, want, dt)
+	// What the pedals said, written down before anything is done with them, so that
+	// it is true of a car that then spun as well as of one that did not.
+	//
+	// **On the brakes rather than merely touching them.** A driver holding both
+	// pedals is not braking — the car would still be gaining speed on the way
+	// through a yellow, and a rule that took the brake alone as proof of obeying
+	// would be a rule with a button that turns it off.
+	it.braking = want.brake > want.throttle
 
 	if it.spun > 0.0 {
 		// No control at all: the car keeps its momentum, turns itself round, and
@@ -626,6 +710,11 @@ func stepped(
 		// because of where it happened to lose it would be the sort of unfairness
 		// nobody would ever find.
 		it = walled(track, located(track, moved(it, dt)))
+		// And still asked about track limits, which counts nothing while `passenger`
+		// is true and is here for the one thing it does do: keep `adrift` true for a
+		// car that is spinning across the grass, so that the frame the spin ends is
+		// not read as a driver putting it there.
+		it = limits(track, it)
 		return travelled(track, served(track, it), dt)
 	}
 
@@ -856,17 +945,25 @@ func travelled(track: circuit.Circuit, car: Car, dt: Float): Car {
 	return it
 }
 
-// What being over the delta in a flagged zone costs, given whether this car is
-// over it right now.
+// What being over the delta costs, given whether the stewards are counting against
+// this car right now.
 //
 // The clock is the whole rule. Over the limit, it runs up; under it, it runs back
 // down at half the rate. Past `leeway()` seconds it is an offence, the clock is
-// put back to nought, and three offences is five seconds — the same five that
-// three excursions costs, because they are the same sort of thing.
+// put back to nought, and **the offence is the penalty**: `disregard()` seconds
+// for the first, twice that for the second, three times for the third. Nothing is
+// reset and nothing is forgiven, because a driver who has been caught three times
+// is not a driver who has been caught once.
+//
+// `ignored` is therefore a tally rather than a count towards something, which is
+// the one thing to know when reading it: `warnings` next door still winds back to
+// nought every third excursion and this never does.
 //
 // It is here rather than in `control.hive` because what it changes is a car's own
 // sheet, and everything that writes to a sheet is in this file. What it does not
-// know is *where* the flags are; that arrives as one boolean.
+// know is *where* the flags are, how new they are, or whether this driver is on the
+// brakes; the whole of that arrives as one boolean, and `control.judged` is the one
+// place it is worked out.
 func policed(car: Car, over: Bool, dt: Float): Car {
 	mut Car it = car
 	if it.sheet.finished {
@@ -882,10 +979,38 @@ func policed(car: Car, over: Bool, dt: Float): Car {
 	}
 	it.sheet.speeding = 0.0
 	it.sheet.ignored = it.sheet.ignored + 1
-	if it.sheet.ignored >= ignorable() {
-		it.sheet.ignored = 0
-		it.sheet.penalty = it.sheet.penalty + added()
+	it.sheet.penalty = it.sheet.penalty + disregard() * conv.itf(it.sheet.ignored)
+	return it
+}
+
+// What holding up a car that is about to lap you costs, given whether this car is
+// doing it right now.
+//
+// The same shape as `policed` above and deliberately so — a clock, a leeway, and a
+// tally that only goes up — with one difference: this clock is **put back to
+// nought** the moment the car gets out of the way, rather than winding down at half
+// rate. A delta is a speed you can be a little over by accident; a blue flag is a
+// place on the road, and a car at the edge of it is not partly complying. Move
+// over and the five seconds start again if you come back.
+//
+// Like `policed`, it knows nothing about who is lapping whom. That arrives as one
+// boolean, and `control.lapping` is where it is worked out.
+func impeded(car: Car, holding: Bool, dt: Float): Car {
+	mut Car it = car
+	if it.sheet.finished {
+		return it
 	}
+	if holding == false {
+		it.sheet.blocking = 0.0
+		return it
+	}
+	it.sheet.blocking = it.sheet.blocking + dt
+	if it.sheet.blocking < blueLeeway() {
+		return it
+	}
+	it.sheet.blocking = 0.0
+	it.sheet.blocked = it.sheet.blocked + 1
+	it.sheet.penalty = it.sheet.penalty + blueCost() * conv.itf(it.sheet.blocked)
 	return it
 }
 
@@ -1055,10 +1180,23 @@ func served(track: circuit.Circuit, car: Car): Car {
 // Track limits, asked exactly the way the rule is written. One excursion is one
 // warning however long it lasts, which is what `adrift` is for; three of them is
 // five seconds, and the count starts again.
+//
+// **Except that the rule is about a driver going off, and not every car that goes
+// off is a driver going off.** A car spinning is not steering, and a car on a
+// punctured tyre has half the grip it asked the corner with — neither of them
+// chose the piece of grass they ended up on, and somebody else's debris on the
+// racing line is not an excursion however far it puts you across the white line.
+// `passenger` is what says so.
+//
+// `adrift` is written either way, and that is the half of this that is easy to get
+// wrong. Without it a car that was spun off the road would take a warning on the
+// first frame *after* the spin — the excursion would look brand new, because
+// nothing had been watching while the car had no say in it — and a driver would be
+// punished for the place a loose wheel left them in.
 func limits(track: circuit.Circuit, car: Car): Car {
 	mut Car it = car
 	over := circuit.exceeded(track, circuit.Where(it.node, it.along, it.across))
-	if over && it.adrift == false {
+	if over && it.adrift == false && passenger(it) == false {
 		it.sheet.warnings = it.sheet.warnings + 1
 		if it.sheet.warnings >= allowed() {
 			it.sheet.warnings = 0
@@ -1067,6 +1205,21 @@ func limits(track: circuit.Circuit, car: Car): Car {
 	}
 	it.adrift = over
 	return it
+}
+
+// Whether the driver is, for the moment, a passenger.
+//
+// The racing phrase, and it is the right one: the wheel and the pedals are still
+// connected and they are no longer deciding where the car goes. Two things do
+// that here, and both of them are somebody else's doing — a spin, and a tyre
+// somebody else's debris let the air out of.
+//
+// It is deliberately not "was hit". A shunt from the car behind costs you speed
+// and a place and leaves you steering, and a driver who ran wide after one ran
+// wide. This is about the car being out of the driver's hands, not about who is
+// to blame for the afternoon.
+func passenger(car: Car): Bool {
+	return car.spun > 0.0 || car.hurt > 0.0
 }
 
 // ---------------------------------------------------------------------------

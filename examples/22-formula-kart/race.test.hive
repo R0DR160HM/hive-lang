@@ -65,7 +65,7 @@ func lapped(track: circuit.Circuit, seat: Int, seconds: Float): drive.Car {
 	mut drive.Car car = drive.parked(track, seat)
 	steps := conv.round(seconds * 60.0)
 	for frame := 0; frame < steps; frame++ {
-		want := pace.driving(track, [car], [], [], drive.garaged(), seat, 0.0, true,
+		want := pace.driving(track, [car], [], [], drive.garaged(), seat, 0.0, false, true,
 			conv.itf(frame) / 60.0)
 		car = drive.stepped(track, car, want, grid.teamOf(seat).machine,
 			1.0 / 60.0)
@@ -424,6 +424,50 @@ test "one excursion is one warning, however long it lasts" {
 	assert car.adrift
 }
 
+test "a car nobody is steering is not running wide" {
+	// The same excursion three times over: once driven into, once on a tyre
+	// somebody else's debris let the air out of, and once mid-spin. Only the first
+	// is the driver's, and only the first is written down.
+	track := circuit.build(4821)
+	half := circuit.nodeAt(track, circuit.indexAlong(track, 400.0)).half
+	flat := drive.Wants(0.0, 0.2, 0.0, false, false)
+
+	mut drive.Car own = put(track, 0, 400.0, half + 5.0, 8.0)
+	own = drive.stepped(track, own, flat, 1.0, 1.0 / 60.0)
+	assert own.sheet.warnings == 1
+
+	mut drive.Car flat2 = drive.punctured(put(track, 0, 400.0, half + 5.0, 8.0))
+	assert drive.passenger(flat2)
+	flat2 = drive.stepped(track, flat2, flat, 1.0, 1.0 / 60.0)
+	assert flat2.sheet.warnings == 0
+
+	mut drive.Car spun = drive.spinning(put(track, 0, 400.0, half + 5.0, 8.0))
+	spun = drive.stepped(track, spun, flat, 1.0, 1.0 / 60.0)
+	assert spun.sheet.warnings == 0
+	// And it is still off the road when the spin ends, which is the frame the bug
+	// was in: `adrift` is kept true throughout, so nothing reads the car coming back
+	// under control as a driver putting it on the grass. Two seconds of spinning,
+	// then the throttle, and nothing on the sheet.
+	for frame := 0; frame < 120; frame++ {
+		assert spun.adrift
+		spun = drive.stepped(track, spun, flat, 1.0, 1.0 / 60.0)
+	}
+	assert spun.spun <= 0.0
+	assert spun.sheet.warnings == 0
+	// The forgiveness ends with the puncture, though — it is two and a half seconds
+	// of tyre, not an afternoon off. Back on the road, then off it again, and that
+	// one is the driver's.
+	mut drive.Car after = put(track, 0, 400.0, 0.0, 8.0)
+	after = drive.punctured(after)
+	for frame := 0; frame < 60 * 4; frame++ {
+		after = drive.stepped(track, after, flat, 1.0, 1.0 / 60.0)
+	}
+	assert drive.passenger(after) == false
+	after = drive.nudged(track, after, half + 5.0)
+	after = drive.stepped(track, after, flat, 1.0, 1.0 / 60.0)
+	assert after.sheet.warnings == 1
+}
+
 test "three warnings is five seconds" {
 	track := circuit.build(4821)
 	half := circuit.nodeAt(track, circuit.indexAlong(track, 400.0)).half
@@ -540,7 +584,7 @@ test "a bot gets round, and comes back when it goes off" {
 	mut Int longest = 0
 	mut Int run = 0
 	for frame := 0; frame < 2400; frame++ {
-		want := pace.driving(track, [car], [], [], drive.garaged(), 0, 0.0, true,
+		want := pace.driving(track, [car], [], [], drive.garaged(), 0, 0.0, false, true,
 			conv.itf(frame) / 60.0)
 		car = drive.stepped(track, car, want, 1.0, 1.0 / 60.0)
 		if circuit.exceeded(track, circuit.Where(car.node, car.along, car.across)) {
@@ -566,7 +610,7 @@ test "a bot obeys a speed limit it is given" {
 	track := circuit.build(4821)
 	mut drive.Car car = put(track, 0, 100.0, 0.0, 60.0)
 	for frame := 0; frame < 240; frame++ {
-		want := pace.driving(track, [car], [], [], drive.garaged(), 0, 20.0, true,
+		want := pace.driving(track, [car], [], [], drive.garaged(), 0, 20.0, false, true,
 			conv.itf(frame) / 60.0)
 		car = drive.stepped(track, car, want, 1.0, 1.0 / 60.0)
 	}
@@ -799,14 +843,52 @@ test "a moment over the delta is forgiven and a lap of it is not" {
 	assert caught.sheet.speeding < drive.leeway()
 }
 
-test "three of them is five seconds" {
+test "every offence costs, and each one costs more than the last" {
+	// Twelve seconds flat out over the delta. At a leeway apiece that is eight
+	// offences, and the eight are worth 1+2+…+8 of `disregard()` rather than eight
+	// of it — which is the whole of the rule and the whole of what makes ignoring
+	// a delta a worse idea than obeying one.
 	mut drive.Car car = drive.parked(circuit.build(4821), 0)
-	for frame := 0; frame < 60 * 12; frame++ {
+	for frame := 0; frame < 60 * 13; frame++ {
 		car = drive.policed(car, true, 1.0 / 60.0)
 	}
-	assert car.sheet.penalty >= drive.added()
-	// And the count starts again rather than running on.
-	assert car.sheet.ignored < drive.ignorable()
+	assert car.sheet.ignored == 8
+	assert car.sheet.penalty == drive.disregard() * 36.0
+	// The tally runs on rather than starting again, because it is what the next one
+	// will cost rather than a count towards anything.
+	mut drive.Car one = drive.parked(circuit.build(4821), 0)
+	for frame := 0; frame < 120; frame++ {
+		one = drive.policed(one, true, 1.0 / 60.0)
+	}
+	assert one.sheet.ignored == 1
+	assert one.sheet.penalty == drive.disregard()
+	// And the second is worth twice the first, which the third-of-a-penalty a
+	// warning used to be worth never was.
+	for frame := 0; frame < 120; frame++ {
+		one = drive.policed(one, true, 1.0 / 60.0)
+	}
+	assert one.sheet.ignored == 2
+	assert one.sheet.penalty == drive.disregard() * 3.0
+}
+
+test "one blast down the pit lane costs more than the lane it skipped" {
+	// The arithmetic the rule exists for, asserted rather than argued. A car held
+	// flat through the walled length of the pit lane is over the limit for the
+	// whole of it, and what that costs has to beat both of the honest ways round:
+	// the eleven-odd seconds the lane costs at the limit, and the `unserved()` it
+	// costs to skip the lane altogether.
+	track := circuit.build(4821)
+	walled := circuit.pitRun(track) - circuit.pitMouth(track) * 2.0
+	racing := 55.0
+	mut drive.Car car = drive.parked(track, 0)
+	blast := walled / racing
+	mut Int frames = conv.round(blast * 60.0)
+	for frame := 0; frame < frames; frame++ {
+		car = drive.policed(car, true, 1.0 / 60.0)
+	}
+	lane := walled / circuit.pitSpeed() - blast
+	assert car.sheet.penalty > lane
+	assert car.sheet.penalty > drive.unserved()
 }
 
 test "the count comes off again once you are under it" {
@@ -823,7 +905,7 @@ test "the count comes off again once you are under it" {
 	assert car.sheet.ignored == 0
 }
 
-test "driving through a yellow at racing speed costs five seconds" {
+test "driving through a yellow at racing speed costs, and goes on costing" {
 	mut control.Race race = control.lined(4821)
 	race.lights = 0.0
 	// A car well over the delta, standing inside a yellow stretch, held there.
@@ -836,16 +918,263 @@ test "driving through a yellow at racing speed costs five seconds" {
 		append(cars, one)
 	}
 	race.cars = cars
+	// The clock is wound by hand because `policing` is called by hand: `grace()` is
+	// read off how long ago the flag went out, and a race whose clock never moved
+	// would be a race in which the flag is forever two frames old.
 	for frame := 0; frame < 60 * 12; frame++ {
+		race.clock = race.clock + 1.0 / 60.0
 		race = control.waved(race, 400.0)
 		race = control.policing(race, 1.0 / 60.0)
 	}
-	assert control.find(race.cars, 0).sheet.penalty >= drive.added()
+	// Not one penalty and then silence: the clock starts again after every offence,
+	// and every offence is dearer than the one before it.
+	caught := control.find(race.cars, 0)
+	assert caught.sheet.ignored > 2
+	assert caught.sheet.penalty > drive.disregard() * conv.itf(caught.sheet.ignored)
+}
+
+test "a flag two seconds old has caught nobody yet" {
+	// The same car in the same yellow, but only for as long as `grace()` lasts. It
+	// is over the delta from the first frame to the last and the stewards have
+	// written down nothing, which is the whole of what the grace is for: a flag
+	// arrives instantly and a car does not.
+	mut control.Race race = control.lined(4821)
+	race.lights = 0.0
+	mut drive.Car[dyn] cars = []
+	for each car in race.cars {
+		mut drive.Car one = car
+		if one.seat == 0 {
+			one = put(race.track, 0, 400.0, 0.0, control.yellowSpeed() + 25.0)
+		}
+		append(cars, one)
+	}
+	race.cars = cars
+	race = control.waved(race, 400.0)
+	assert control.justOut(race, 400.0, 0.0)
+	// A hundred and ten frames is comfortably inside the two seconds, and the point
+	// of stopping short of them is that a test which stepped exactly to the boundary
+	// would be a test of how sixty sixtieths of a second add up.
+	for frame := 0; frame < 110; frame++ {
+		race.clock = race.clock + 1.0 / 60.0
+		race = control.waved(race, 400.0)
+		race = control.policing(race, 1.0 / 60.0)
+	}
+	assert control.justOut(race, 400.0, 0.0)
+	assert control.find(race.cars, 0).sheet.speeding == 0.0
+	assert control.find(race.cars, 0).sheet.ignored == 0
+	// **Silent to the stewards and loud to the driver.** The grace is not two free
+	// seconds, it is two seconds of being told: nothing is being written down and
+	// the border of the window is already red, which is the difference between the
+	// two calls and the reason there are two of them.
+	assert control.judged(race, control.find(race.cars, 0)) == false
+	assert control.ignoring(race, control.find(race.cars, 0))
+	// And the moment it stops being new it starts counting, on the same flag and at
+	// the same speed. The zone is *refreshed* every frame above, so this also pins
+	// down that the grace is read off when the flag went out and not off what it
+	// has left.
+	for frame := 0; frame < 140; frame++ {
+		race.clock = race.clock + 1.0 / 60.0
+		race = control.waved(race, 400.0)
+		race = control.policing(race, 1.0 / 60.0)
+	}
+	assert control.justOut(race, 400.0, 0.0) == false
+	assert control.find(race.cars, 0).sheet.ignored == 1
+}
+
+test "a driver on the brakes is counted as being at the limit" {
+	// Two identical cars, both a long way over a yellow's delta, both held there
+	// for eight seconds. One is braking and one is not. The braking one is doing
+	// the only thing the flag asks and is not judged for how long the car takes to
+	// answer; the other one is simply ignoring it.
+	mut control.Race race = control.lined(4821)
+	race.lights = 0.0
+	race.clock = 30.0
+	mut drive.Car[dyn] cars = []
+	for each car in race.cars {
+		mut drive.Car one = put(race.track, car.seat, 400.0, 0.0,
+			control.yellowSpeed() + 25.0)
+		one.braking = car.seat == 0
+		append(cars, one)
+	}
+	race.cars = cars
+	race = control.waved(race, 400.0)
+	for frame := 0; frame < 60 * 8; frame++ {
+		race.clock = race.clock + 1.0 / 60.0
+		race = control.waved(race, 400.0)
+		race = control.policing(race, 1.0 / 60.0)
+	}
+	onBrakes := control.find(race.cars, 0)
+	flatOut := control.find(race.cars, 1)
+	// Braking answers both of them: the stewards are not counting and the border is
+	// not red either, because a driver hard on the brakes is doing the one thing the
+	// flag asks and has nothing to be told.
+	assert control.judged(race, onBrakes) == false
+	assert control.ignoring(race, onBrakes) == false
+	assert control.judged(race, flatOut)
+	assert control.ignoring(race, flatOut)
+	assert onBrakes.sheet.penalty == 0.0
+	assert onBrakes.sheet.speeding == 0.0
+	assert flatOut.sheet.penalty > 0.0
+}
+
+// ---------------------------------------------------------------------------
+// Blue flags
+// ---------------------------------------------------------------------------
+
+// Two cars a hundred metres apart on the road, and a lap of total distance between
+// them. `travelled` is the only thing that says who is lapping whom, so it is the
+// only thing these set.
+func lapDown(race: control.Race, ahead: Float, behind: Float, across: Float,
+	apart: Float): control.Race {
+	mut control.Race it = race
+	it.lights = 0.0
+	it.clock = 60.0
+	mut drive.Car[dyn] cars = []
+	for each car in race.cars {
+		mut drive.Car one = car
+		if car.seat == 0 {
+			// The one being lapped, out on the racing line.
+			one = put(race.track, 0, ahead, across, 40.0)
+			one.sheet.travelled = race.track.length * 2.0
+		} else if car.seat == 1 {
+			// The one doing the lapping, `apart` metres back and a whole lap up.
+			one = put(race.track, 1, behind, 0.0, 46.0)
+			one.sheet.travelled = race.track.length * 3.0 - apart
+		} else {
+			// Everybody else parked a long way round, so they are nobody's flag.
+			one = put(race.track, car.seat, ahead + race.track.length / 2.0, 0.0, 0.0)
+			one.sheet.travelled = race.track.length * 2.0
+		}
+		append(cars, one)
+	}
+	it.cars = cars
+	return it
+}
+
+test "a car about to be lapped is shown a blue flag, and one on the same lap is not" {
+	mut control.Race race = control.lined(4821)
+	track := race.track
+	race = lapDown(race, 400.0, 400.0 - 60.0, 0.0, 60.0)
+	me := control.find(race.cars, 0)
+	assert control.blueFor(race, me) == 1
+	assert control.blue(race, me)
+	// The car doing the lapping is not itself under one.
+	assert control.blue(race, control.find(race.cars, 1)) == false
+
+	// The same two cars on the same lap: nobody is being lapped and there is no
+	// flag, however close behind the quicker one is. This is the whole reason the
+	// test is on total distance rather than on a lap counter.
+	mut control.Race level = control.lined(4821)
+	level = lapDown(level, 400.0, 400.0 - 60.0, 0.0, 60.0)
+	mut drive.Car[dyn] same = []
+	for each car in level.cars {
+		mut drive.Car one = car
+		if one.seat == 1 {
+			one.sheet.travelled = track.length * 2.0 - 60.0
+		}
+		append(same, one)
+	}
+	level.cars = same
+	assert control.blue(level, control.find(level.cars, 0)) == false
+
+	// And a lap down but half a circuit back is nobody in your mirrors.
+	mut control.Race far = control.lined(4821)
+	far = lapDown(far, 400.0, 400.0 - 600.0, 0.0, 600.0)
+	assert control.blue(far, control.find(far.cars, 0)) == false
+}
+
+test "getting out of the way costs nothing, and staying in it costs more each time" {
+	// The same blue flag held for twenty seconds, once by a car on the racing line
+	// and once by a car at the edge of the road. Nothing moves: `lapping` is asked
+	// directly, so what is being tested is the rule rather than whether a car can
+	// be driven to the side of a circuit.
+	mut control.Race blocking = control.lined(4821)
+	blocking = lapDown(blocking, 400.0, 400.0 - 60.0, 0.0, 60.0)
+	half := circuit.nodeAlong(blocking.track, 400.0).half
+	mut control.Race aside = control.lined(4821)
+	aside = lapDown(aside, 400.0, 400.0 - 60.0, half * 0.8, 60.0)
+	assert control.yielding(aside.track, control.find(aside.cars, 0))
+	assert control.yielding(blocking.track, control.find(blocking.cars, 0)) == false
+
+	for frame := 0; frame < 60 * 21; frame++ {
+		blocking = control.lapping(blocking, 1.0 / 60.0)
+		aside = control.lapping(aside, 1.0 / 60.0)
+	}
+	// Four five-second stretches of holding somebody up, and they are worth
+	// 1+2+3+4 of `blueCost()` rather than four of it.
+	held := control.find(blocking.cars, 0)
+	assert held.sheet.blocked == 4
+	assert held.sheet.penalty == drive.blueCost() * 10.0
+	// And the car that moved over has nothing at all — not a smaller penalty, none.
+	moved := control.find(aside.cars, 0)
+	assert moved.sheet.blocked == 0
+	assert moved.sheet.penalty == 0.0
+	assert moved.sheet.blocking == 0.0
+}
+
+test "a bot under a blue flag goes to the side of the road" {
+	// A whole lap of it, driven. The bot is given the flag and nothing else, and
+	// what is asserted is where the car ends up — not what `aside` returns, which
+	// would be a test of arithmetic rather than of a car getting out of the way.
+	track := circuit.build(4821)
+	mut drive.Car car = put(track, 0, 400.0, 0.0, 40.0)
+	mut Float took = -1.0
+	for frame := 0; frame < 60 * 6; frame++ {
+		want := pace.driving(track, [car], [], [], drive.garaged(), 0, 0.0, true,
+			true, conv.itf(frame) / 60.0)
+		car = drive.stepped(track, car, want, 1.0, 1.0 / 60.0)
+		if took < 0.0 && control.yielding(track, car) {
+			took = conv.itf(frame) / 60.0
+		}
+	}
+	// **The assertion is the time**, because that is the rule: a car that gets to
+	// the edge inside `blueLeeway()` is never penalised for the flag, and one that
+	// takes longer is. Where it gets to is `control.yielding`, the stewards' own
+	// question, rather than arithmetic this test does for itself.
+	assert took >= 0.0
+	assert took < drive.blueLeeway()
+	assert control.yielding(track, car)
+	assert circuit.exceeded(track, circuit.Where(car.node, car.along, car.across))
+		== false
 }
 
 // ---------------------------------------------------------------------------
 // The safety car, which is a car
 // ---------------------------------------------------------------------------
+
+test "obeying a safety car as fast as the brakes allow costs nothing" {
+	// **The bug this exists for.** A safety car takes the whole circuit to eighty-
+	// three kilometres an hour in the frame it is called; a car at two hundred and
+	// forty needs the better part of two seconds on the brakes to get there. That
+	// used to be an offence, and then — once every offence cost — five seconds and
+	// then ten, for braking as hard as the car could be braked.
+	//
+	// Nothing here helps the car. It is `control.stepped` with the brake down, and
+	// how long it takes is `drive.brakes()` rather than anything this test decides.
+	mut control.Race race = control.lined(4821)
+	race.lights = 0.0
+	race.clock = 40.0
+	mut drive.Car[dyn] cars = []
+	for each car in race.cars {
+		append(cars, put(race.track, car.seat,
+			300.0 + conv.itf(car.seat) * 60.0, 0.0, 66.0))
+	}
+	race.cars = cars
+	race = control.deployed(race)
+	assert control.judged(race, control.find(race.cars, 0)) == false
+	for frame := 0; frame < 60 * 4; frame++ {
+		race = control.stepped(race,
+			[control.Asking(0, drive.Wants(0.0, 0.0, 1.0, false, false))],
+			1.0 / 60.0)
+	}
+	me := control.find(race.cars, 0)
+	assert me.speed <= control.safetySpeed()
+	// `ignored` and `speeding` rather than `penalty`, because a car braking in a
+	// straight line down a bending road may well run wide, and running wide is a
+	// different rule with a different count. This is about the delta.
+	assert me.sheet.ignored == 0
+	assert me.sheet.speeding == 0.0
+}
 
 test "the safety car comes out of the pit lane and goes back into it" {
 	mut control.Race race = control.lined(4821)
@@ -1370,7 +1699,7 @@ test "a wall does not weld a spun car to itself" {
 	car.yaw = car.yaw + math.pi()
 	was := circuit.wrapped(car.yaw - circuit.nodeAlong(track, car.along).dir)
 	for frame := 0; frame < 120; frame++ {
-		want := pace.driving(track, [car], [], [], drive.garaged(), 0, 0.0, true, 0.0)
+		want := pace.driving(track, [car], [], [], drive.garaged(), 0, 0.0, false, true, 0.0)
 		car = drive.stepped(track, car, want, 1.0, 1.0 / 60.0)
 	}
 	now := circuit.wrapped(car.yaw - circuit.nodeAlong(track, car.along).dir)

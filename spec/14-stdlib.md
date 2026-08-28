@@ -468,7 +468,9 @@ nor `justify` it is centred over a dimmed page, which is what a dialog is. With
 either of them it is pinned to that edge instead, nothing is dimmed, and clicks
 pass through everywhere the panel is not — which is what a heads-up display in a
 corner, a toast, or a legend over a picture needs, and what a grey sheet over the
-very thing being annotated is not.
+very thing being annotated is not. A pinned panel keeps none of the dialog's own
+shape either: no rounded corner, no shadow, and no cap on its height, so `grow`
+and `align(Stretch)` will run one the full width or height of the window.
 
 **`link` is the one widget that works without an event.** The window follows the
 **message** and a served page follows the **href**, from the identical tree.
