@@ -27,6 +27,28 @@ func goMod(): Str {
 	`
 }
 
+/// The one generated file in `hive/` — written only when the program has an
+/// `assets/` directory beside its entrypoint, and what puts the contents of one
+/// into the executable.
+///
+/// It is four lines and it has to be generated rather than carried, because
+/// `//go:embed` names a directory that must exist: a program with no assets
+/// cannot hold this declaration at all, and a program with assets cannot embed
+/// them without it. `hive/uiscene.go` is the other half, and knows nothing about
+/// this file beyond the one call it leaves open for it.
+func assetsSource(): Str {
+	return `
+		package hive
+
+		import "embed"
+
+		//go:embed assets
+		var uiSceneAssetDir embed.FS
+
+		func init() { uiSceneAssetsAre(uiSceneAssetDir) }
+	`
+}
+
 /// The Go for a module of the runtime, or `""` when this compiler does not
 /// carry it. Most are named by a `hive.<module>` a program referenced; `csv` and
 /// `sheets` are named by a `using` form instead, which is the same idea — the
@@ -7989,6 +8011,91 @@ func uiSceneSource(): Str {
 			uiExtraRoutes["/_hive/scene.js"] = uiSceneText("text/javascript", uiSceneJS)
 			uiExtraRoutes["/_hive/three.module.min.js"] = uiSceneAsset("three.module.min.js")
 			uiExtraRoutes["/_hive/three.core.min.js"] = uiSceneAsset("three.core.min.js")
+			// A subtree rather than a route each, because what is under assets/ is the
+			// program's business and not this file's: it is registered before anything is
+			// known about what was embedded, and answers for whatever turns out to be
+			// there.
+			uiExtraRoutes["/_hive/asset/"] = uiSceneStored
+		}
+
+		// ---------------------------------------------------------------------------
+		// What the program brought with it
+		// ---------------------------------------------------------------------------
+
+		// Everything under the program's own assets/ directory, embedded at compile
+		// time. It is nil in a program that has no such directory, and hive/assets.go —
+		// written into the build only when there is one — is what fills it in.
+		//
+		// This is the one thing in a scene that is not made out of arithmetic, and it
+		// is still not *loaded*: the bytes are in the executable exactly as three.js is,
+		// and the window hands them to its own page over its own socket. A built Hive
+		// program is one file, and this does not change that — it only changes how big
+		// the one file is, which is the program's own decision and not the runtime's.
+		var uiSceneAssets *embed.FS
+
+		func uiSceneAssetsAre(files embed.FS) { uiSceneAssets = &files }
+
+		// One embedded file, named by its path under assets/. A miss is a 404 rather
+		// than an error the program hears about: a sound whose recording is not there
+		// falls back to the synthesised voice, and a picture that cannot say why is
+		// worse than one that quietly makes the noise it always could.
+		func uiSceneStored(rw http.ResponseWriter, req *http.Request) {
+			if uiSceneAssets == nil {
+				http.Error(rw, "not found", http.StatusNotFound)
+				return
+			}
+			name := strings.TrimPrefix(req.URL.Path, "/_hive/asset/")
+			// .. cannot climb out of an embed.FS — it is not a filesystem — but a path
+			// that tries is a path this never meant to answer, and saying so is cheaper
+			// than reasoning about what ReadFile would do with it.
+			if name == "" || strings.Contains(name, "..") {
+				http.Error(rw, "not found", http.StatusNotFound)
+				return
+			}
+			body, err := uiSceneAssets.ReadFile("assets/" + name)
+			if err != nil {
+				http.Error(rw, "not found", http.StatusNotFound)
+				return
+			}
+			rw.Header().Set("Content-Type", uiSceneMime(name))
+			// The bytes are in the executable, so they cannot change under a page that
+			// kept them.
+			rw.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			rw.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			_, _ = rw.Write(body)
+		}
+
+		// What an embedded file is, by the end of its name. Short deliberately: this is
+		// what a browser needs to decode a sound or draw a picture, and a full table of
+		// media types would be a table nobody in this program reads.
+		func uiSceneMime(name string) string {
+			cut := strings.LastIndex(name, ".")
+			if cut < 0 {
+				return "application/octet-stream"
+			}
+			switch strings.ToLower(name[cut:]) {
+			case ".ogg", ".opus":
+				return "audio/ogg"
+			case ".mp3":
+				return "audio/mpeg"
+			case ".wav":
+				return "audio/wav"
+			case ".m4a", ".aac":
+				return "audio/mp4"
+			case ".flac":
+				return "audio/flac"
+			case ".png":
+				return "image/png"
+			case ".jpg", ".jpeg":
+				return "image/jpeg"
+			case ".webp":
+				return "image/webp"
+			case ".gif":
+				return "image/gif"
+			case ".svg":
+				return "image/svg+xml"
+			}
+			return "application/octet-stream"
 		}
 
 		func uiSceneText(mime string, body string) func(http.ResponseWriter, *http.Request) {
@@ -8131,6 +8238,11 @@ func uiSceneSource(): Str {
 		func UiAttrPitch(v float64) UiAttr  { return uiNums("pitch", []float64{v}) }
 		func UiAttrVolume(v float64) UiAttr { return uiNums("volume", []float64{v}) }
 
+		// Which recording the voice is of, named by its path under assets/. The voice
+		// still says what the noise *is*; this says which one of it the program has to
+		// hand, and where there is none the oscillators answer as they always did.
+		func UiAttrTrack(v string) UiAttr { return uiStr("track", v) }
+
 		func UiAttrEye(x float64, y float64, z float64) UiAttr {
 			return uiNums("eye", []float64{x, y, z})
 		}
@@ -8241,6 +8353,11 @@ func uiSceneSource(): Str {
 				b.WriteString(",\"p\":" + uiSceneVec(uiSceneNums(s.Attrs, "at", []float64{0, 0, 0})))
 				if voice := uiSceneEnum(s.Attrs, "voice"); voice != "" {
 					b.WriteString(",\"v\":\"" + voice + "\"")
+				}
+				// Only where there is one. A sound that names no recording writes nothing,
+				// and is the sound this renderer has always made.
+				if track, ok := uiFind(s.Attrs, "track"); ok && track.Str != "" {
+					b.WriteString(",\"t\":" + uiSceneStr(track.Str))
 				}
 				b.WriteString(",\"h\":" + uiSceneF(uiSceneOne(s.Attrs, "pitch", 1)))
 				b.WriteString(",\"g\":" + uiSceneF(uiSceneOne(s.Attrs, "volume", 1)))
@@ -9255,15 +9372,47 @@ func uiSceneJs(): Str {
 		// and a sound is *carried on*. That is why a sound carries a name — see
 		// UiSound in the Go — and why every map below is keyed by one.
 		//
-		// NOTHING IS LOADED. Every voice here is oscillators and filtered noise, for
-		// the same reason the grain patterns are drawn rather than fetched: a built
-		// Hive program is one file, and a window that had to download a wave before it
+		// NOTHING IS DOWNLOADED. Every voice here is oscillators and filtered noise,
+		// for the same reason the grain patterns are drawn rather than fetched: a built
+		// Hive program is one file, and a window that had to reach a CDN before it
 		// could make a noise would make that untrue. It buys something as well as
 		// costing something — a voice made of a frequency can be *bent*, and an engine
 		// that is a recording of one speed played faster is an engine you can hear
 		// looping.
+		//
+		// A sound that names a track is the one exception, and it is not an exception
+		// to that rule: the recording was embedded into the executable at compile time
+		// and comes off this window's own server. Nothing crosses a network, the
+		// program is still one file, and what changed is only how big one file is —
+		// which is a decision the program made by putting the thing in assets/.
+		// Where the recording is missing, the oscillators answer instead, so a track is
+		// always something a scene gains and never something it depends on.
 
 		var ears = null, master = null, hiss = null, voices = new Map();
+
+		// The recordings, by the path a scene named them with. One entry per track and
+		// never more: a name asked for while it is still decoding gets the promise the
+		// first ask made, so ten cars naming one crowd would still fetch it once.
+		//
+		// A track that fails — missing, or in something this browser cannot decode —
+		// resolves to null rather than rejecting, and null is a voice that falls back
+		// to its oscillators. There is nothing here for a program to handle, because
+		// there is nothing it could usefully do.
+		var recordings = new Map();
+
+		function recorded(name) {
+		  var held = recordings.get(name);
+		  if (held) { return held; }
+		  var asked = fetch("/_hive/asset/" + name.split("/").map(encodeURIComponent).join("/"))
+		    .then(function (r) { return r.ok ? r.arrayBuffer() : null; })
+		    .then(function (bytes) {
+		      if (!bytes) { return null; }
+		      return ears.decodeAudioData(bytes);
+		    })
+		    .catch(function () { return null; });
+		  recordings.set(name, asked);
+		  return asked;
+		}
 
 		// The context, built the first time a scene asks for a noise.
 		//
@@ -9339,14 +9488,23 @@ func uiSceneJs(): Str {
 		// whole thing hangs on — and what makes an engine an engine rather than a
 		// crowd is which source through which filter. The bend is what the pitch
 		// attribute drives, and a voice with nothing to bend simply has none.
-		function sustained(kind) {
+		function sustained(kind, track) {
 		  var gain = ears.createGain();
 		  gain.gain.value = 0;
-		  var voice = {kind: kind, gain: gain, pan: null, parts: [], bend: null};
+		  var voice = {kind: kind, gain: gain, pan: null, parts: [], bend: null,
+		    track: track || "", pitch: 1, gone: false};
 		  // Music is the one voice with nowhere to stand. It is not in the world, it
 		  // is over it, so it goes straight to the master and is never panned.
 		  if (kind === "Music") { gain.connect(master); }
 		  else { voice.pan = sited(gain); }
+		  // A recording answers for the voice instead of the oscillators. Everything
+		  // downstream is the same graph — the same gain, the same panner, the same
+		  // fade when the name goes — so a track is a different *source* and not a
+		  // different kind of sound.
+		  if (voice.track) {
+		    played(voice);
+		    return voice;
+		  }
 		  if (kind === "Engine") {
 		    // Two oscillators an octave apart with the top taken off. The saw is the
 		    // firing and the square under it is the part you feel rather than hear —
@@ -9436,11 +9594,51 @@ func uiSceneJs(): Str {
 		    depth.connect(murmur.frequency);
 		    swell.start();
 		    voice.parts = [many, swell];
+		    // A crowd that is *reacting* to something is a brighter noise than one
+		    // talking among itself, which is the difference between a hiss and a roar
+		    // and is entirely in where the band sits. This voice took no pitch at all
+		    // before, so a scene that asked one of it was asking for nothing — and the
+		    // one attribute a sound has for saying how excited it is was the one it
+		    // ignored. The swell goes on adding to the same parameter, so a crowd that
+		    // asks for 1.0 is the crowd it always was.
+		    voice.bend = function (p) {
+		      murmur.frequency.setTargetAtTime(
+		        Math.max(180, 620 * p), ears.currentTime, 0.25);
+		    };
 		  } else if (kind === "Music") {
 		    voice.at = ears.currentTime;
 		    voice.step = 0;
 		  }
 		  return voice;
+		}
+
+		// A voice's recording, started as soon as there is one to start.
+		//
+		// It is asynchronous and the rest of this file is not, which is the whole of
+		// what the guard below is for: a fetch that began sixty frames ago comes back
+		// to a voice whose name may have left the scene, or come back naming something
+		// else. Either way what it must not do is start.
+		//
+		// The loop is the whole buffer. A bed is meant to be under a race for as long
+		// as the race lasts, and where it should stop is a question the scene answers
+		// by not naming it any more.
+		function played(voice) {
+		  var want = voice.track;
+		  recorded(want).then(function (buffer) {
+		    if (!buffer || voice.gone || voice.track !== want) { return; }
+		    var src = ears.createBufferSource();
+		    src.buffer = buffer;
+		    src.loop = true;
+		    src.connect(voice.gain);
+		    src.start();
+		    voice.parts = [src];
+		    // Pitch on a recording is the speed it is played at, which is the only
+		    // thing it can be — and is why a bed asks for 1.0 and means it.
+		    voice.bend = function (p) {
+		      src.playbackRate.setTargetAtTime(Math.max(0.06, p), ears.currentTime, 0.08);
+		    };
+		    voice.bend(voice.pitch);
+		  });
 		}
 
 		// The bed. Four bars, a bass note under each and a figure over the top,
@@ -9504,6 +9702,23 @@ func uiSceneJs(): Str {
 		  var now = ears.currentTime;
 		  var loud = Math.max(0.0001, s.g === undefined ? 1 : s.g);
 		  var pitch = s.h === undefined ? 1 : s.h;
+		  // A struck recording is the same bargain the struck oscillators make: it
+		  // fires once and there is nothing left to hold. The one difference is that
+		  // the bytes may not be here yet, and a bang that arrives late is a bang
+		  // nobody wanted — so a recording that is still decoding when it was struck
+		  // is simply not heard, which is what a sound that has already happened is.
+		  if (s.t) {
+		    recorded(s.t).then(function (buffer) {
+		      if (!buffer) { return; }
+		      var one = ears.createBufferSource();
+		      one.buffer = buffer;
+		      one.playbackRate.value = Math.max(0.06, pitch);
+		      one.connect(gain);
+		      gain.gain.value = loud;
+		      one.start();
+		    });
+		    return;
+		  }
 		  if (kind === "Chime") {
 		    var ring = ears.createOscillator();
 		    ring.type = "sine";
@@ -9551,6 +9766,11 @@ func uiSceneJs(): Str {
 		  var voice = voices.get(name);
 		  voices.delete(name);
 		  if (!voice || voice.struck) { return; }
+		  // Said before the fade rather than after it, and it is not a formality: a
+		  // recording still being decoded comes back to this voice, and this is the
+		  // only thing standing between it and a source started into a gain that is
+		  // already on its way to nought.
+		  voice.gone = true;
 		  var now = ears.currentTime;
 		  voice.gain.gain.setTargetAtTime(0, now, 0.05);
 		  for (var i = 0; i < voice.parts.length; i++) {
@@ -9574,29 +9794,36 @@ func uiSceneJs(): Str {
 		  attend(w);
 		  var now = ears.currentTime, here = {};
 		  for (var i = 0; i < list.length; i++) {
-		    var s = list[i], name = s.x || "", kind = s.v || "Engine";
+		    var s = list[i], name = s.x || "", kind = s.v || "Engine", track = s.t || "";
 		    here[name] = true;
 		    var voice = voices.get(name);
 		    // A name that has come back as a different voice is a different sound
 		    // wearing the same label, and the old one goes before the new one starts.
-		    if (voice && voice.kind !== kind) {
+		    // A different *recording* under the same name is the same thing said
+		    // another way, and is how a scene changes the bed between races.
+		    if (voice && (voice.kind !== kind || voice.track !== track)) {
 		      hush(name);
 		      voice = null;
 		    }
 		    if (!voice) {
 		      if (STRUCK[kind]) {
 		        strike(kind, s);
-		        voices.set(name, {kind: kind, struck: true, parts: []});
+		        voices.set(name, {kind: kind, struck: true, parts: [], track: track});
 		        continue;
 		      }
-		      voice = sustained(kind);
+		      voice = sustained(kind, track);
 		      voices.set(name, voice);
 		    }
 		    if (voice.struck) { continue; }
 		    standing(voice.pan, s.p);
 		    voice.gain.gain.setTargetAtTime(Math.max(0, s.g === undefined ? 1 : s.g), now, 0.06);
-		    if (voice.bend) { voice.bend(s.h === undefined ? 1 : s.h); }
-		    if (voice.kind === "Music") { music(voice, now); }
+		    // Kept as well as applied, because a recording still decoding has nothing
+		    // to bend yet and will want to know what it missed.
+		    voice.pitch = s.h === undefined ? 1 : s.h;
+		    if (voice.bend) { voice.bend(voice.pitch); }
+		    // A bed that is a recording plays itself. The sequencer is what a scene
+		    // gets when it asks for music and has none of its own.
+		    if (voice.kind === "Music" && !voice.track) { music(voice, now); }
 		  }
 		  var going = [];
 		  voices.forEach(function (voice, name) { if (!here[name]) { going.push(name); } });

@@ -636,6 +636,7 @@ three of its own:
 | `voice(Voice)` | which noise it is |
 | `pitch(Float)` | how high, as a multiple of the voice at rest |
 | `volume(Float)` | how loud, the same way |
+| `track(Str)` | which recording, named under `assets/` — see [below](#a-sound-may-be-a-recording) |
 
 Pitch and volume are multiples rather than hertz and decibels. What an engine
 sounds like at `1.0` is the renderer's business; a program says "twice as fast"
@@ -683,6 +684,35 @@ A browser will not let a page make a noise until somebody has touched it. There 
 nothing to ask for and nothing to detect: the context is built when the first
 sound is asked for and nudged on every gesture until one takes, so whatever the
 user was going to click anyway is what turns the sound on.
+
+### A sound may be a recording
+
+`track(Str)` names a recording for a sound to be made of instead of oscillators.
+The voice still says what the noise *is* — the name decides whether it lasts or
+fires once, exactly as before — and the recording is what it is made of:
+
+```
+ui.sound([ui.voice(ui.Voice.Music()), ui.volume(0.2),
+          ui.track("audio/theme.ogg")], "music")
+```
+
+**The program's `assets/` directory is embedded into the executable**, and a
+`track` names a path within it. There is no such directory beside the entrypoint,
+nothing is embedded and the program is exactly the size it was; where there is
+one, the whole tree goes in and the window serves it to its own page over its own
+socket. Nothing crosses a network at run time and a built program is still one
+file — a bigger one, by however much was put in the directory, which is the
+program's decision rather than the runtime's.
+
+**A track that is not there is not an error.** A missing file, or one in something
+the browser cannot decode, falls back to the synthesised voice — so a recording is
+something a scene gains and never something it depends on, and a program that
+loses its assets makes the noise it always could.
+
+A *sustained* voice loops its recording for as long as the scene names it, and
+`pitch` is the speed it is played at. A *struck* one plays it once. A recording
+still decoding when a struck sound arrives is not heard, because a bang that
+arrives late is a bang nobody wanted.
 
 ### The camera, the sky and the mouse
 
