@@ -5,21 +5,19 @@
 //
 // It lands in the folder the command was run in, which is also the build's
 // context: everything beside it is what the image can see. A `Dockerfile`
-// already there is left alone and ours is called `Dockerfile-hive-container`
-// instead — overwriting somebody else's file is not a thing a generator should
-// do, and overwriting its own is exactly what it should do.
+// already there is left alone and ours becomes `Dockerfile-hive-container` —
+// overwriting somebody else's file is not a generator's business, overwriting
+// its own is.
 //
-// What comes out asks nothing of the machine building it but Docker itself: the
-// image downloads Go, downloads the compiler's latest release for the platform
-// being built for, and compiles the program with the two of them. Two stages,
-// so what ships is the executable and nothing else — no Go, no compiler, not
-// even a shell.
+// What comes out asks nothing of the machine but Docker itself: the image
+// downloads Go and the compiler's latest release for the target platform, and
+// compiles with the two of them. Two stages, so what ships is the executable
+// and nothing else — no Go, no compiler, not even a shell.
 //
-// The parts of it that are not a template are read off the program: which ports
-// it serves on, whether an import names a repository — which the build then
-// needs `git` for — and whether it opens a database, whose drivers are resolved
-// before anything compiles. A file that guessed at all that would still build;
-// one that read it is a file somebody can believe.
+// The parts that are not a template are read off the program: which ports it
+// serves on, whether an import names a repository (which needs `git`), and
+// whether it opens a database (whose drivers are resolved before anything
+// compiles).
 import ./ast
 import ./diag
 import ./fetch
@@ -44,9 +42,8 @@ type Served {
 type Needs {
 	/// Every port it serves on, each said once, with the call that says so.
 	ports: Served[dyn]
-	/// Whether it starts a server at all, which is a different question: a
-	/// program that reads its port out of the environment serves without ever
-	/// naming one here.
+	/// Whether it starts a server at all — a different question, since a program
+	/// reading its port from the environment names none here.
 	serves: Bool
 	/// Whether an import names a repository. The compiler clones it while the
 	/// image builds, which is the one thing here that needs `git`.
@@ -90,9 +87,8 @@ proc fileName(): Str {
 }
 
 // Whether the entrypoint is inside the folder the Dockerfile goes into. That
-// folder is the build's context, so a program above it is a program the image
-// cannot reach — which is worth saying now rather than leaving to a `COPY` that
-// finds nothing.
+// folder is the build's context, so a program above it is one the image cannot
+// reach — worth saying now rather than leaving to a `COPY` that finds nothing.
 func reachable(inside: Str): Bool {
 	if text.startsWith(inside, "/") || text.startsWith(inside, "../") {
 		return false
@@ -111,8 +107,7 @@ func outside(entry: Str): Str {
 
 // --- Reading the program -----------------------------------------------------
 
-// What the walk collects, filled in as it goes: a walk that has to thread its
-// answer back up through every branch is the same walk with more punctuation.
+// What the walk collects, filled in as it goes.
 type Found {
 	served: Served[dyn]
 	database: Bool
@@ -234,8 +229,7 @@ proc walkExpr(found: mut Found, e: ast.Expr): void {
 }
 
 // The second half of `walkExpr`, split where the leaves end and the shapes
-// begin — which is where `show.hive` splits the same walk, and for the same
-// reason.
+// begin — the same split `show.hive` makes.
 proc walkExprTail(found: mut Found, e: ast.Expr): void {
 	if e is ast.Expr.Member(subject, _) {
 		walkExpr(found, subject)
@@ -274,10 +268,9 @@ proc walkUsing(found: mut Found, form: ast.UsingForm): void {
 	}
 }
 
-// The calls that open a port, and the ones that open a database. Each is spelled
-// `hive.<module>.<name>` here however the source spelled it: an alias an import
-// gave a standard library module is written back out in full by the loader, so
-// this has one spelling to know rather than one per program.
+// The calls that open a port, and the ones that open a database. Spelled
+// `hive.<module>.<name>` however the source spelled it: the loader writes an
+// import's alias back out in full, so this has one spelling to know.
 proc serving(found: mut Found, callee: ast.Expr, args: ast.Arg[]): void {
 	name := libCall(callee)
 	if name == "hive.net.httpServe" || name == "hive.net.wsServe"
@@ -301,9 +294,9 @@ func libCall(callee: ast.Expr): Str {
 	return ""
 }
 
-// The port a server was started with, when it was written as a number. Anything
-// else — a variable, an environment lookup, arithmetic — is a port this file
-// cannot know, and `0` is how it says so.
+// The port a server was started with, when written as a number. Anything else —
+// a variable, an environment lookup, arithmetic — is a port this file cannot
+// know, and `0` says so.
 func literalPort(args: ast.Arg[]): Int {
 	if args bounds 0 {
 		first := args[0]
@@ -333,9 +326,8 @@ func addressPort(args: ast.Arg[]): Int {
 
 // --- The Dockerfile ----------------------------------------------------------
 
-/// The file itself, as text. Pure: everything it needs it was handed, which is
-/// what lets a test ask what a program would get without a disk, a network or a
-/// Docker.
+/// The file itself, as text. Pure — everything it needs it was handed — so a
+/// test can ask what a program would get with no disk, network or Docker.
 func render(entry: Str, needs: Needs): Str {
 	mut Str[dyn] out = []
 	append(out, header(entry, needs))
@@ -346,16 +338,14 @@ func render(entry: Str, needs: Needs): Str {
 	return backticked(join(out, "\n")) + "\n"
 }
 
-// A backtick is the one character a backtick string cannot hold, and the file
-// below wants them the way this compiler's own comments do. So the text writes
-// `~BT~` wherever it means one and this puts them back — the same trick, for the
-// same reason, as the Go the runtime carries.
+// A backtick is the one character a backtick string cannot hold, so the text
+// below writes `~BT~` wherever it means one and this puts them back — the same
+// trick the runtime's embedded Go uses.
 func backticked(source: Str): Str {
 	return join(split(source, "~BT~"), "`")
 }
 
-// The comment the file opens with, which is the part somebody reads before they
-// read any of it.
+// The comment the file opens with.
 func header(entry: Str, needs: Needs): Str {
 	name := imageName(entry)
 	mut Str[dyn] out = []
@@ -395,7 +385,7 @@ func publish(needs: Needs): Str {
 			// the default the file settles on below is the one to offer here.
 			return "-p 8080:8080 "
 		}
-		// A program that listens on nothing has nothing to publish.
+		// Listens on nothing, publishes nothing.
 		return ""
 	}
 	mut Str[dyn] out = []
@@ -513,8 +503,8 @@ func runStage(entry: Str, needs: Needs): Str {
 	return join(out, "\n")
 }
 
-// The ports, and why each of them is there. A number in a generated file that
-// does not say where it came from is a number nobody can safely change.
+// The ports, and why each is there: a number in a generated file that does not
+// say where it came from is one nobody can safely change.
 func exposed(needs: Needs): Str {
 	mut Str[dyn] out = []
 	if len(needs.ports) > 0 {

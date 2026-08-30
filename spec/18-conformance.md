@@ -109,8 +109,18 @@ different route, or does not quite do it.
   [08](08-mutability-and-values.md#84-copy-on-binding) is implemented as: two
   immutable ends alias, two `mut` ends alias, a mixed pair copies. The
   specification allows an alias in a mixed pair when it is *provably*
-  indistinguishable; this compiler does not attempt the proof, so it copies where
-  a cleverer one would not. That is slower and never wrong.
+  indistinguishable; this compiler does not attempt that proof for a **binding**,
+  so it copies where a cleverer one would not. That is slower and never wrong.
+
+  It does attempt it one level down, for the fields of a copy
+  ([8.5](08-mutability-and-values.md#85-what-a-copy-copies)) and for what a
+  caller hands a `func`. A whole-program pass asks what the program writes to
+  storage of each *shape* — through a path, through a call, or through a `mut`
+  name — and a field nothing can write is shared rather than copied; separately,
+  a `func` whose result carries no storage and which cannot start a thread may be
+  handed the caller's own storage, since 4.2 already proves it cannot write
+  where the caller can see. Both give up entirely on anything they cannot
+  follow, so both refuse to share where a cleverer one would.
 * **Coverage names a declaration as the flattened program spells it.** With more
   than one file in the program, `never exercised` reads `cart_0_describe` rather
   than `describe` ([16](16-testing.md#coverage-is-not-a-separate-command)), because the report is written

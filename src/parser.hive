@@ -7,16 +7,14 @@
 // one position and a field in the next — and the last one holding the line to
 // report it against.
 //
-// **Errors do not stop it.** A parser that gave up on the first mistake would
-// make fixing six a six-run job, so a failure sets a flag, every loop checks
-// that flag and stops, and the declaration loop at the top clears it and skips
-// to the next `proc`, `func`, `type`, `query` or `test`. One error per
-// declaration is reported, which is as many as are worth trusting: everything
-// after a mistake inside one declaration is guesswork.
+// **Errors do not stop it.** A failure sets a flag, every loop checks it and
+// stops, and the declaration loop at the top clears it and skips to the next
+// `proc`, `func`, `type`, `query` or `test`. One error per declaration is
+// reported, which is as many as are worth trusting — everything after a mistake
+// inside one is guesswork.
 //
 // The cursor is a `mut Parse` and the tokens are an immutable parameter beside
-// it, exactly as in the lexer — reading a token costs nothing, and only the
-// cursor moves.
+// it, as in the lexer: reading a token costs nothing, and only the cursor moves.
 import ./ast
 import ./diag
 import ./lexer
@@ -35,12 +33,12 @@ type Parsed {
 type Parse {
 	pos: Int
 	/// Set by the first failure inside a declaration and cleared when the
-	/// declaration loop moves on. Every loop in the parser checks it, which is
-	/// what keeps a broken declaration from being read as ten more.
+	/// declaration loop moves on. Every loop checks it, which keeps a broken
+	/// declaration from being read as ten more.
 	failed: Bool
 	/// While a speculative parse is running. The parser looks ahead in exactly
 	/// one place — telling `Type name = value` from an expression — and a guess
-	/// that did not work out is not a mistake anybody made.
+	/// that did not work out is nobody's mistake.
 	quiet: Bool
 	errors: diag.Diagnostic[dyn]
 }
@@ -61,9 +59,8 @@ proc parse(ts: token.Token[]): Parsed {
 		if p.failed {
 			synchronise(ts, p)
 		}
-		// A pass that consumed nothing would loop forever. Nothing below should
-		// leave the cursor where it found it, and this is the belt to that
-		// braces.
+		// Nothing below should leave the cursor where it found it; a pass that
+		// consumed nothing would loop forever.
 		if p.pos == before {
 			p.pos = p.pos + 1
 		}
@@ -155,8 +152,8 @@ proc expectIdent(ts: token.Token[], p: mut Parse, role: naming.Role): Str {
 	}
 	advance(p)
 	if naming.check(role, name) is Result.Error(why) {
-		// The cursor has moved past the name, so the message would land on
-		// whatever follows it. Report it against the name itself.
+		// The cursor has moved past the name, so report against the name itself
+		// rather than whatever follows it.
 		if p.quiet == false && p.failed == false {
 			append(p.errors, diag.at(lineAt(ts, p.pos - 1), why))
 		}
@@ -166,8 +163,7 @@ proc expectIdent(ts: token.Token[], p: mut Parse, role: naming.Role): Str {
 }
 
 // Skip to the next thing that can start a declaration. A mistake inside one
-// declaration says nothing about the next, and this is what lets the parser
-// report on every one of them in a single run.
+// says nothing about the next, which is what lets one run report on all of them.
 proc synchronise(ts: token.Token[], p: mut Parse): void {
 	p.failed = false
 	for ; atEnd(ts, p) == false; advance(p) {
@@ -220,8 +216,8 @@ proc wordOfPath(ts: token.Token[], p: mut Parse): Str {
 	return ""
 }
 
-// The name a module is reached through when the import did not say: the file's
-// own name, which is the last segment of the path with any extension dropped.
+// The name a module is reached through when the import did not say: the last
+// segment of the path, with any extension dropped.
 proc defaultAlias(ts: token.Token[], p: mut Parse, path: Str, line: Int): Str {
 	segments := split(path, "/")
 	mut last := text.charAt(segments, len(segments) - 1)
@@ -246,9 +242,8 @@ proc defaultAlias(ts: token.Token[], p: mut Parse, path: Str, line: Int): Str {
 	return last
 }
 
-// Whether `word` is `wanted` written in some other casing — which is a keyword
-// shouted rather than a name, even for the words that are keywords only where
-// they are written.
+// Whether `word` is `wanted` written in some other casing — a keyword shouted
+// rather than a name, even for the positional keywords.
 func miscased(word: Str, wanted: Str): Bool {
 	return word != "" && word != wanted && text.lower(word) == wanted
 }
@@ -272,25 +267,19 @@ proc parseDecl(ts: token.Token[], p: mut Parse): ast.Decl {
 	return ast.Decl.TestDecl("", ast.Block([]), lineAt(ts, p.pos))
 }
 
-// `type T { field: T  Variant { field: T }  Variant }`. Fields and variants may
-// be interleaved: a field written outside any variant is added to every one of
-// them, and where it was written says nothing about which.
 // --- Query bodies ------------------------------------------------------------
 //
-// The lexer captured a query's body whole, because most of it is text for a
-// database rather than tokens for a compiler. Its own small grammar is read
-// here, and here rather than in the lexer because two of the three things in it
-// are ordinary Hive expressions — a `\{param}` and an `if`'s condition — and
-// this is the pass that knows how to read one.
+// The lexer captured a query's body whole, most of it being text for a database
+// rather than tokens for a compiler. Its own small grammar is read here rather
+// than in the lexer because two of the three things in it are ordinary Hive
+// expressions — a `\{param}` and an `if`'s condition.
 //
-// Everything below works over the body's characters and hands each expression
-// it finds to the lexer and to `parseExpr`, so an expression inside a query is
-// the same expression it would be anywhere else, and every later pass sees it
-// as one.
+// Everything below works over the body's characters and hands each expression it
+// finds to the lexer and to `parseExpr`, so an expression inside a query is the
+// same expression it would be anywhere else.
 
 // A query body's own failures. It has no tokens to report against — the body
-// arrived as one — so it reports against the declaration, which is where a
-// reader would look for it anyway.
+// arrived as one — so it reports against the declaration.
 proc sqlFail(p: mut Parse, message: Str): void {
 	if p.quiet == false && p.failed == false {
 		append(p.errors, diag.at(0, message))
@@ -317,9 +306,9 @@ proc parseSqlParts(body: Str, p: mut Parse): ast.SqlPart[dyn] {
 				return parts
 			}
 			inside := text.span(cs, at + 1, shut - 1)
-			// A `\{` right after WHERE opens a block of optional predicates.
-			// Anywhere else it is a value being bound, and the WHERE keyword is
-			// left out of the text until the block has something to put after it.
+			// A `\{` right after WHERE opens a block of optional predicates;
+			// anywhere else it is a value being bound. The WHERE is held back
+			// until the block has something to put after it.
 			if endsWithWhere(lit) {
 				append(parts, ast.SqlPart.Lit(withoutWhere(lit)))
 				append(parts, ast.SqlPart.Where(parseSqlGroup(inside, true, p)))
@@ -391,8 +380,8 @@ proc parseSqlGroup(inside: Str, conjunction: Bool, p: mut Parse): ast.SqlGroup {
 	return ast.SqlGroup(conjunction, items)
 }
 
-/// One expression out of a query body: lexed and parsed exactly as it would be
-/// anywhere else, so every later pass reads it as what it is.
+/// One expression out of a query body, lexed and parsed exactly as it would be
+/// anywhere else.
 proc parseSqlExpr(source: Str, p: mut Parse): ast.Expr {
 	lexed := lexer.lex(text.trim(source))
 	for each e in lexed.errors {
@@ -477,6 +466,9 @@ func withoutWhere(lit: Str): Str {
 	return text.span(cs, 0, cut - 6)
 }
 
+// `type T { field: T  Variant { field: T }  Variant }`. Fields and variants may
+// be interleaved: a field written outside any variant is added to every one of
+// them, and where it was written says nothing about which.
 proc parseTypeDecl(ts: token.Token[], p: mut Parse): ast.Decl {
 	line := lineAt(ts, p.pos)
 	advance(p)
@@ -536,7 +528,6 @@ proc parseVariant(ts: token.Token[], p: mut Parse): ast.Variant {
 }
 
 // A field list may be written with commas between its entries or without them.
-// Neither says anything the other does not, so both are read the same way.
 proc skipCommas(ts: token.Token[], p: mut Parse): void {
 	for ; kindAt(ts, p.pos) == token.Kind.Comma(); advance(p) {
 	}
@@ -570,8 +561,8 @@ proc parseQueryDecl(ts: token.Token[], p: mut Parse): ast.Decl {
 }
 
 // `test "what should be true" { ... }`. The name is prose because a test name is
-// documentation rather than something anything calls — which is also why it
-// takes no parameters and returns nothing.
+// documentation rather than something anything calls — which is also why it takes
+// no parameters and returns nothing.
 proc parseTestDecl(ts: token.Token[], p: mut Parse): ast.Decl {
 	line := lineAt(ts, p.pos)
 	advance(p)
@@ -605,7 +596,7 @@ proc parseParams(ts: token.Token[], p: mut Parse): ast.Param[dyn] {
 			return params
 		}
 		// `v: mut T` asks for the mutex itself rather than a view of it. Only a
-		// `proc` may, which is a later pass's business: here it is only a shape.
+		// `proc` may — a later pass's business; here it is only a shape.
 		mutex := kindAt(ts, p.pos) == token.Kind.KwMut()
 		if mutex {
 			advance(p)
@@ -879,8 +870,7 @@ proc parseMut(ts: token.Token[], p: mut Parse): ast.Stmt {
 
 // `mut` asks for storage that can be written to; an `async` binding is a value
 // still being computed somewhere else. Nothing sensible comes of the two
-// together, so the combination is refused where it is written rather than
-// half-honoured later.
+// together, so the combination is refused where it is written.
 proc refuseMutAsync(ts: token.Token[], p: mut Parse): Bool {
 	if kindAt(ts, p.pos) != token.Kind.KwAsync() {
 		return false
@@ -898,10 +888,9 @@ proc refuseDeferredTimeout(ts: token.Token[], p: mut Parse): void {
 	}
 }
 
-// The call an `async` fires off, in either of the two positions the word is
-// allowed. The operand is parsed at the postfix level, which is exactly a call
-// and nothing more: `async` is not an operator over expressions, so there is no
-// larger one for it to sit inside.
+// The call an `async` fires off, in either position the word is allowed. The
+// operand is parsed at the postfix level — exactly a call and nothing more —
+// since `async` is not an operator over expressions.
 proc parseAsyncCall(ts: token.Token[], p: mut Parse): ast.Expr {
 	advance(p)
 	operand := parsePostfix(ts, p)
@@ -916,9 +905,9 @@ proc parseAsyncCall(ts: token.Token[], p: mut Parse): ast.Expr {
 }
 
 // An identifier-led statement is either a typed declaration (`Type name =
-// value`) or a plain expression statement. The declaration form is tried first
-// and only commits when a type expression is followed by `identifier =`, which
-// is the one place this parser looks ahead.
+// value`) or an expression statement. The declaration form is tried first and
+// commits only when a type expression is followed by `identifier =` — the one
+// place this parser looks ahead.
 proc parseTypedOrExpr(ts: token.Token[], p: mut Parse): ast.Stmt {
 	start := p.pos
 	p.quiet = true
@@ -958,8 +947,8 @@ proc parseExprStmt(ts: token.Token[], p: mut Parse): ast.Stmt {
 		return ast.Stmt.Assign(subject, parseExpr(ts, p))
 	}
 	// Compound assignment and the two steps desugar into a plain one, so nothing
-	// after the parser has four more shapes to know about. The mutability check
-	// and zero-safe division then apply to them unchanged.
+	// downstream has four more shapes to know about — and the mutability check
+	// and zero-safe division apply to them unchanged.
 	if k == token.Kind.PlusEq() {
 		return compound(ts, p, subject, ast.BinOp.Add())
 	} else if k == token.Kind.MinusEq() {
@@ -990,7 +979,7 @@ func step(target: ast.Expr, op: ast.BinOp): ast.Stmt {
 proc parseReturn(ts: token.Token[], p: mut Parse): ast.Stmt {
 	advance(p)
 	k := kindAt(ts, p.pos)
-	// A bare `return` leaves a `void` callable, or a test, early. What says it is
+	// A bare `return` leaves a `void` callable, or a test, early. What makes it
 	// bare is that nothing follows it on this statement.
 	if k == token.Kind.RBrace() || k == token.Kind.Semicolon() || k == token.Kind.Eof() {
 		return ast.Stmt.ReturnStmt(ast.Expr.Absent())
@@ -1046,9 +1035,8 @@ proc parseFor(ts: token.Token[], p: mut Parse): ast.Stmt {
 }
 
 // A variable an init clause declares is forced mutable: the post clause advances
-// it, which the mutability check would otherwise reject. Its name is checked
-// again for the same reason — a counter is not a constant, whatever it looked
-// like when `parseStmt` read it as an ordinary declaration.
+// it, which the mutability check would otherwise reject. Its name is rechecked
+// for the same reason — a counter is not a constant.
 proc asCounter(ts: token.Token[], p: mut Parse, s: ast.Stmt): ast.Stmt {
 	if s is ast.Stmt.VarDecl(name, value, _, deferred) {
 		refuseCounterAsync(ts, p, deferred)
@@ -1128,10 +1116,9 @@ proc parseIs(ts: token.Token[], p: mut Parse): ast.Expr {
 		return ast.Expr.IsMatch(left, parsePattern(ts, p))
 	}
 	// `vector bounds index` is sugar for `index >= 0 && index < hive.len(vector)`.
-	// Desugaring here means the emitter and the bounds pass both understand it
-	// for free — the bounds pass already mines exactly this shape. The `len` is
-	// written qualified so the guard means the same thing in a program that
-	// declared a `len` of its own.
+	// Desugaring here means the emitter and the bounds pass understand it for
+	// free — the bounds pass already mines this shape. The `len` is qualified so
+	// the guard means the same thing in a program with a `len` of its own.
 	if k == token.Kind.KwBounds() {
 		advance(p)
 		index := parseAdditive(ts, p)
@@ -1223,10 +1210,9 @@ proc parsePower(ts: token.Token[], p: mut Parse): ast.Expr {
 	return base
 }
 
-// Two unrelated clauses share the `with` keyword. `with timeout <ms>` bounds a
-// wait; anything else names a decode target. They are told apart here so
-// `timeout` never gets read as a type name — and so `timeout` stays a perfectly
-// ordinary identifier everywhere else.
+// Two unrelated clauses share the `with` keyword: `with timeout <ms>` bounds a
+// wait, anything else names a decode target. Told apart here so `timeout` is
+// never read as a type name, and stays an ordinary identifier elsewhere.
 proc parseWith(ts: token.Token[], p: mut Parse): ast.Expr {
 	value := parsePostfix(ts, p)
 	if p.failed || kindAt(ts, p.pos) != token.Kind.KwWith() {
@@ -1235,10 +1221,10 @@ proc parseWith(ts: token.Token[], p: mut Parse): ast.Expr {
 	if wordAt(ts, p.pos + 1) == "timeout" {
 		advance(p)
 		advance(p)
-		// Parsed at the arithmetic level, not as a full expression: the clause
-		// has to stop before `is` and `&&`, so `f(x) with timeout 500 is
-		// Result.Ok(v)` reads as `(f(x) with timeout 500) is Result.Ok(v)`
-		// rather than folding the comparison into the millisecond count.
+		// At the arithmetic level, not as a full expression: the clause stops
+		// before `is` and `&&`, so `f(x) with timeout 500 is Result.Ok(v)` reads
+		// as `(f(x) with timeout 500) is ...` rather than folding the comparison
+		// into the millisecond count.
 		ms := parseAdditive(ts, p)
 		return timed(ts, p, value, ms)
 	}
@@ -1367,9 +1353,9 @@ proc parsePrimary(ts: token.Token[], p: mut Parse): ast.Expr {
 	else if k is token.Kind.StrParts(parts) { return parseInterp(ts, p, parts) }
 	else if k is token.Kind.Ident(name) {
 		advance(p)
-		// `_` is a hole where a call's argument was expected, and a binding that
-		// throws its value away everywhere else. Which it is, is decided by
-		// where it landed — so it is carried as itself and read later.
+		// `_` is a hole where a call's argument was expected and a discarding
+		// binding everywhere else. Where it landed decides, so it is carried as
+		// itself and read later.
 		if name == "_" {
 			return ast.Expr.Hole()
 		}
@@ -1387,10 +1373,9 @@ proc parsePrimary(ts: token.Token[], p: mut Parse): ast.Expr {
 		expect(ts, p, token.Kind.RParen())
 		return inner
 	}
-	// `async` is not an expression: it says how a call is *run*, and the only
-	// places that question can be asked are a statement of its own and the value
-	// side of a declaration. Anywhere else the value is wanted right there,
-	// which is what an ordinary call already does.
+	// `async` is not an expression: it says how a call is *run*, which can only
+	// be asked as a statement of its own or on the value side of a declaration.
+	// Anywhere else the value is wanted right there.
 	else if k == token.Kind.KwAsync() {
 		fail(ts, p, "`async` has no value of its own: it says how a call runs, not what it evaluates to, so it cannot sit inside a larger expression. Give it a name and read the name here — `x := async f(a)` starts the call now and waits at the first place `x` is read — or drop the `async` to wait for the result on the spot.")
 		return ast.Expr.Absent()
@@ -1422,8 +1407,7 @@ proc parseVectorLit(ts: token.Token[], p: mut Parse): ast.Expr {
 }
 
 // `await [f(a), g(b)]` — the await-all, and the only `await` there is. A single
-// call needs no keyword (calling it blocks already), so the `[` is required and
-// its absence is worth saying out loud.
+// call needs no keyword, calling it blocks already, so the `[` is required.
 proc parseAwaitAll(ts: token.Token[], p: mut Parse): ast.Expr {
 	advance(p)
 	mut ast.Expr[dyn] calls = []
@@ -1460,10 +1444,9 @@ proc parseAwaitAll(ts: token.Token[], p: mut Parse): ast.Expr {
 	return ast.Expr.AwaitAll(calls, ast.Expr.Absent())
 }
 
-// `using` reads a table, and each form says in the source what it is reading.
-// The operand is parsed at the postfix level so a call is consumed whole; none
-// of the words below is a postfix operator, so the source expression stops
-// cleanly before them.
+// `using` reads a table, each form saying in the source what it is reading. The
+// operand is parsed at the postfix level so a call is consumed whole; none of
+// the words below is a postfix operator, so the source stops cleanly before them.
 proc parseUsing(ts: token.Token[], p: mut Parse): ast.Expr {
 	advance(p)
 	source := parsePostfix(ts, p)
@@ -1549,8 +1532,7 @@ proc parseInterp(ts: token.Token[], p: mut Parse, parts: token.StrPart[]): ast.E
 }
 
 // An expression captured as text — a string's interpolation — parsed by running
-// the lexer and the parser over it again. It is the same grammar, so it is the
-// same two passes.
+// the lexer and the parser over it again: same grammar, same two passes.
 proc parseSubExpr(ts: token.Token[], p: mut Parse, source: Str, line: Int): ast.Expr {
 	lexed := lexer.lex(source)
 	if len(lexed.errors) > 0 {
@@ -1580,9 +1562,8 @@ proc parsePattern(ts: token.Token[], p: mut Parse): ast.Pattern {
 	if k is token.Kind.StrLit(t) {
 		advance(p)
 		// A hole that arrived as literal text was written where nothing reads it
-		// as one — in a backtick string, which has no interpolation, or behind a
-		// `\{` that escaped the brace on purpose. Either way it would match the
-		// characters rather than the shape, and silently never match at all.
+		// as one — a backtick string, or behind an escaped `\{`. Either way it
+		// would match the characters rather than the shape, and never match.
 		if looksLikeHole(t) {
 			fail(ts, p, "this pattern holds `\{name is (...)}` as literal text rather than as a hole, so it would match those characters and never match at all. A hole only opens in an ordinary `\"...\"` pattern — a backtick string has no holes, and a `\\\{` asked for the brace itself")
 			return ast.Pattern.StrTemplate([token.StrPart.Literal(t)])
@@ -1603,8 +1584,7 @@ proc parsePattern(ts: token.Token[], p: mut Parse): ast.Pattern {
 }
 
 // A string pattern's holes bind; they do not compute. Two rules keep that
-// honest, and both are compile errors rather than a match that would be
-// impossible to read.
+// honest, both compile errors rather than a match impossible to read.
 proc stringPattern(ts: token.Token[], p: mut Parse, parts: token.StrPart[]): ast.Pattern {
 	mut wasHole := false
 	mut token.StrPart[dyn] out = []
@@ -1636,11 +1616,11 @@ proc stringPattern(ts: token.Token[], p: mut Parse, parts: token.StrPart[]): ast
 			if duplicateHole(named, name, ts, p) {
 				return ast.Pattern.StrTemplate(parts)
 			}
-			// The regex is read here, once, so that a malformed one is a compile
-			// error naming what is wrong with it rather than something the Go
-			// toolchain says about a file nobody wrote. What comes back is the
-			// same pattern with its capturing groups made plain: the holes of a
-			// template are its capture groups, one each.
+			// Read here, once, so a malformed regex is a compile error naming
+			// what is wrong with it rather than something the Go toolchain says
+			// about a file nobody wrote. What comes back is the same pattern with
+			// its capturing groups made plain — a template's holes are its
+			// capture groups, one each.
 			if regex.check(pattern) is Result.Ok(compiled) {
 				append(named, name)
 				append(out, token.StrPart.Hole(name, compiled))
@@ -1667,12 +1647,10 @@ proc duplicateHole(named: Str[], name: Str, ts: token.Token[], p: mut Parse): Bo
 	return false
 }
 
-// Whether literal text holds what somebody meant as a regex hole — a hole
-// written where nothing reads it as one, which is a backtick pattern or a `\{`
-// that escaped the brace on purpose. Either way it would match those characters
-// and so never match at all.
+// Whether literal text holds what somebody meant as a regex hole — one written
+// where nothing reads it as such: a backtick pattern, or an escaped `\{`.
 //
-// The shape is looked for exactly, name and all, so that an escaped brace with
+// The shape is looked for exactly, name and all, so an escaped brace with
 // unrelated text after it — `"\\{a} is (b)}"` — is left alone.
 func looksLikeHole(t: Str): Bool {
 	mut first := true

@@ -4,10 +4,9 @@
 // the Go toolchain run over it.
 //
 // Both happen here, in Hive. `hive.term.exec` runs a command and hands back
-// everything it wrote, and `hive.term.attach` gives a command this program's own
-// terminal — which is the difference between a build, whose output is only
-// interesting when it fails, and a run, which is the program talking to whoever
-// started it.
+// everything it wrote; `hive.term.attach` gives it this program's own terminal.
+// That is the difference between a build, whose output is only interesting when
+// it fails, and a run, which is the program talking to whoever started it.
 import ./ast
 import ./check as checks
 import ./diag
@@ -26,13 +25,12 @@ import hive.term
 
 /// What a build produced.
 type Written {
-	/// The directory the project was written into.
 	directory: Str
-	/// Every file written, in the order it was written.
+	/// Every file written, in order.
 	files: Str[dyn]
 	/// Whether anything in the build links something from outside Go's own
 	/// standard library — an imported Go file's own imports. `hive.sql` is the
-	/// other case, and the build directory says so by holding `hive/sql.go`.
+	/// other case, and says so by putting `hive/sql.go` in the build directory.
 	thirdParty: Bool
 	errors: diag.Diagnostic[dyn]
 }
@@ -44,12 +42,9 @@ func buildDirOf(entry: Str): Str {
 }
 
 /// What a program compiled from `entry` is called: the entrypoint's own name
-/// without its extension, and `.exe` where the platform wants one.
-///
-/// A build for another platform says which one in the name — `main-linux-arm64`
-/// beside the `main` this machine builds — because two files that cannot run in
-/// the same places must not answer to one name, and a cross build that silently
-/// replaced the local one would be found out by running it.
+/// without its extension, and `.exe` where the platform wants one. A cross
+/// build says which platform in the name — `main-linux-arm64` beside the `main`
+/// this machine builds — so it never silently replaces the local one.
 proc executableOf(entry: Str, target: Str): Str {
 	if target == "" {
 		return paths.stem(entry) + goExe("")
@@ -58,9 +53,8 @@ proc executableOf(entry: Str, target: Str): Str {
 }
 
 /// What the Go toolchain calls an executable for `target` — `""` everywhere but
-/// Windows. Asked of the toolchain rather than guessed at, and asked *for the
-/// target*, since whose convention it is is the whole of the question: a Windows
-/// program built on Linux still wants its `.exe`.
+/// Windows. Asked *for the target*, since a Windows program built on Linux
+/// still wants its `.exe`.
 proc goExe(target: Str): Str {
 	if hive.term.execWith("go", ["env", "GOEXE"], "", crossing(target)) is Result.Ok(said) {
 		return text.trim(said)
@@ -69,14 +63,12 @@ proc goExe(target: Str): Str {
 }
 
 /// The environment the toolchain is given for `target`. An empty target is an
-/// empty overlay, which `hive.term.execWith` says is `exec` byte for byte — so a
-/// build for this machine runs exactly as it always did, and there is no second
-/// path through here to keep working.
+/// empty overlay, which `hive.term.execWith` says is `exec` byte for byte — so
+/// a build for this machine takes no second path through here.
 ///
-/// `CGO_ENABLED=0` goes with a cross build and only with one. Everything the
-/// runtime is made of is Go, so nothing in a Hive program needs a C compiler,
-/// and a C *cross*-compiler is the one thing a machine with the Go toolchain on
-/// it cannot be assumed to have.
+/// `CGO_ENABLED=0` goes with a cross build and only with one: nothing in a Hive
+/// program needs a C compiler, and a C *cross*-compiler is the one thing a
+/// machine with the Go toolchain cannot be assumed to have.
 func crossing(target: Str): hive.map.Map<Str, Str> {
 	mut hive.map.Map<Str, Str> asked = hive.map.new()
 	if target == "" {
@@ -93,12 +85,10 @@ func crossing(target: Str): hive.map.Map<Str, Str> {
 
 /// Everything before anything is written: the program loaded, its generics
 /// expanded, checked, every index proved in range, and Go emitted for it. A
-/// build, an `emit` and a `check` differ only in what they do with this, so it
-/// is written once — which also puts every line of progress in one place.
+/// build, an `emit` and a `check` differ only in what they do with this.
 ///
-/// A pass that found something stops the ones after it. There is little point
-/// proving indexes in a program whose names do not resolve, and what such a
-/// pass would report would mostly be about the first mistake anyway.
+/// A pass that found something stops the ones after it: there is little point
+/// proving indexes in a program whose names do not resolve.
 type Compiled {
 	/// The flattened, expanded program. Empty if a pass refused it.
 	module: ast.Module
@@ -106,23 +96,20 @@ type Compiled {
 	errors: diag.Diagnostic[dyn]
 }
 
-/// `from` is when the command started, which every line of progress is counted
-/// from. The lines say what is *about* to happen rather than what just did,
-/// because the last line printed is then always the thing being waited on.
+/// `from` is when the command started; every line of progress counts from it.
 proc passes(entry: Str, from: Int): Compiled {
 	progress.step(from, "reading {entry}")
 	program := loader.load(entry)
 	if len(program.errors) > 0 {
 		return refused(program.errors)
 	}
-	// Every pass from here down runs on one flattened program, whose nodes carry
-	// no file — so what they report is reported against the entrypoint, which is
-	// what keeps `file:line:` in front of every message and an editor able to jump
-	// to it. `17.3` records that as the limit it is.
+	// Every pass from here down runs on one flattened program whose nodes carry
+	// no file, so it reports against the entrypoint — which keeps `file:line:`
+	// in front of every message. Spec 17.3 records that as the limit it is.
 	//
-	// Monomorphization runs before the checks, so each copy is checked on its own
-	// terms — an instantiation at `Str[3]` held to that length, one at `Str[dyn]`
-	// guarding its indexes.
+	// Monomorphization runs before the checks, so each copy is checked on its
+	// own terms: an instantiation at `Str[3]` held to that length, one at
+	// `Str[dyn]` guarding its indexes.
 	progress.step(from, "expanding generics in " + progress.counted(len(program.sources), "file"))
 	expanded := mono.expand(program.module, from)
 	if len(expanded.errors) > 0 {
@@ -161,9 +148,8 @@ proc build(entry: Str, withTests: Bool, from: Int): Written {
 	emitted := made.emitted
 
 	directory := buildDirOf(entry)
-	// A build directory is generated whole, every time. Removing it first is what
-	// keeps a file an earlier build wrote — one this program no longer writes, or
-	// one another compiler left there — from being compiled into this one.
+	// A build directory is generated whole, every time. Removing it first keeps
+	// a file an earlier build wrote from being compiled into this one.
 	removeTree(directory)
 
 	mut Str[dyn] written = []
@@ -187,9 +173,8 @@ proc build(entry: Str, withTests: Bool, from: Int): Written {
 	}
 	// The one thing a build ever downloads: the three.js a scene is drawn with,
 	// fetched once against a pinned digest and embedded into the executable. A
-	// build whose program stopped drawing scenes takes it back out, for the
-	// reason a stale module file is removed — what is in the directory is what
-	// was compiled.
+	// program that stopped drawing scenes takes it back out — what is in the
+	// directory is what was compiled.
 	if drawsAScene {
 		progress.step(from, "three.js")
 		if vendor.placeThree(directory + "/hive") is Result.Error(why) {
@@ -200,9 +185,9 @@ proc build(entry: Str, withTests: Bool, from: Int): Written {
 		vendor.clearThree(directory + "/hive")
 	}
 	// Each imported Go file, copied into the generated project as a package of
-	// its own — the directory being the name the generated code imports it
-	// under. Copied rather than referred to, so what compiled is in the build
-	// directory whether the file came from next door or out of a clone.
+	// its own, the directory being the name the generated code imports it under.
+	// Copied rather than referred to, so what compiled is in the build directory
+	// whether the file came from next door or out of a clone.
 	for each f in made.module.foreign {
 		source := hive.file.read(f.path)
 		if source is Result.Error(why) {
@@ -235,8 +220,7 @@ func linksForeign(foreign: ast.Foreign[]): Bool {
 }
 
 /// Remove a directory and everything under it. Post-order, because
-/// `hive.file.delete` takes a file or a directory that is already empty — which
-/// is the whole of what it needs to be, given a walk.
+/// `hive.file.delete` takes a file or an already-empty directory.
 proc removeTree(path: Str): void {
 	if hive.file.exists(path) == false {
 		return
@@ -249,8 +233,8 @@ proc removeTree(path: Str): void {
 		}
 	}
 	if hive.file.delete(path) is Result.Error(_) {
-		// Nothing to say: what could not be removed is about to be written over
-		// or was never ours, and a build that then fails will say so itself.
+		// What could not be removed is about to be written over or was never
+		// ours, and a build that then fails will say so itself.
 		return
 	}
 }
@@ -278,15 +262,13 @@ proc put(directory: Str, name: Str, contents: Str, written: mut Str[dyn], errors
 ///
 /// It goes in beside three.js and for the same reason: a scene that names a
 /// recording has to *have* it, and a built Hive program is one file. What is
-/// under `assets/` is the program's own business — nothing here reads it, and
-/// nothing here has an opinion about what it is for — so the tree is copied
-/// whole and `hive.ui.scene` answers at run time for whatever a scene turns out
-/// to name.
+/// under `assets/` is the program's own business, so the tree is copied whole
+/// and `hive.ui.scene` answers at run time for whatever a scene names.
 ///
-/// A program with no such directory writes no `hive/assets.go`, embeds nothing,
-/// and is exactly the size it was. That is why the file is generated rather than
-/// carried in the runtime: `//go:embed` cannot be told to embed nothing, so what
-/// decides is whether the declaration is written at all.
+/// A program with no such directory writes no `hive/assets.go` and embeds
+/// nothing. That is why the file is generated rather than carried in the
+/// runtime: `//go:embed` cannot be told to embed nothing, so what decides is
+/// whether the declaration is written at all.
 proc placeAssets(entry: Str, into: Str, from: Int, written: mut Str[dyn], errors: mut diag.Diagnostic[dyn]): void {
 	source := paths.joinPath(paths.dirOf(entry), "assets")
 	if hive.file.exists(source) == false {
@@ -299,10 +281,10 @@ proc placeAssets(entry: Str, into: Str, from: Int, written: mut Str[dyn], errors
 	put(into, "assets.go", runtime.assetsSource() + "\n", written, errors)
 }
 
-/// One directory copied into another, everything under it with it. The answer is
-/// how many files landed, and nought means there was nothing to embed — which is
-/// not the same as nothing being there, because an empty directory is not
-/// something `//go:embed` will take.
+/// One directory copied into another, everything under it with it. The answer
+/// is how many files landed; nought means there was nothing to embed, which is
+/// not the same as nothing being there — `//go:embed` will not take an empty
+/// directory.
 proc copied(from: Str, to: Str, errors: mut diag.Diagnostic[dyn]): Int {
 	names := hive.file.list(from)
 	if names is Result.Error(why) {
@@ -316,16 +298,15 @@ proc copied(from: Str, to: Str, errors: mut diag.Diagnostic[dyn]): Int {
 	mut Int many = 0
 	if names is Result.Ok(here) {
 		for each name in here {
-			// `//go:embed` on a directory skips anything whose name begins with a dot
-			// or an underscore, so copying one in would be copying something nothing
-			// could ever read back out.
+			// `//go:embed` on a directory skips anything whose name begins with
+			// a dot or an underscore, so copying one in is copying something
+			// nothing could read back out.
 			if text.startsWith(name, ".") || text.startsWith(name, "_") {
 				continue
 			}
 			source := paths.joinPath(from, name)
 			target := paths.joinPath(to, name)
-			// A directory is a thing that can be listed. There is no other question
-			// being asked here, and no other answer that would change what happens.
+			// A directory is a thing that can be listed.
 			if hive.file.list(source) is Result.Ok(_) {
 				many = many + copied(source, target, errors)
 				continue
@@ -342,27 +323,24 @@ proc copied(from: Str, to: Str, errors: mut diag.Diagnostic[dyn]): Int {
 
 /// What running the Go toolchain came to.
 type Toolchain {
-	/// The status the command exited with. `0` is the only good one.
+	/// `0` is the only good one.
 	code: Int
 	/// Everything it wrote, which is the whole of why it failed.
 	output: Str
 }
 
 /// Compile `entry` all the way to a native executable beside it. An empty
-/// `target` is this machine, and anything else is a `goos/goarch` pair —
-/// `buildsFor` is what says whether the toolchain knows one, and the command
-/// line asks it before calling this, because a platform nobody can build for is
-/// a mistake in what was typed rather than in the program. Reaching here with
-/// one anyway is still an error and not a wrong executable: `go build` refuses
-/// an unsupported pair outright.
+/// `target` is this machine, anything else a `goos/goarch` pair. The command
+/// line asks `buildsFor` first, so an unknown platform is a mistake in what was
+/// typed rather than in the program; reaching here with one anyway is still an
+/// error and not a wrong executable, since `go build` refuses it outright.
 proc compile(entry: Str, target: Str, from: Int): Written {
 	written := build(entry, false, from)
 	if len(written.errors) > 0 {
 		return written
 	}
-	// Built straight to where it belongs rather than copied there afterwards: a
-	// copy would have to put the executable bit back, and the toolchain already
-	// knows how.
+	// Built straight to where it belongs: a copy would have to put the
+	// executable bit back, and the toolchain already knows how.
 	if resolveDeps(written, from) is Result.Error(why) {
 		return Written(written.directory, written.files, written.thirdParty, [why])
 	}
@@ -374,16 +352,14 @@ proc compile(entry: Str, target: Str, from: Int): Written {
 	return written
 }
 
-/// Whether the Go toolchain builds for `target`. Asked of the toolchain rather
-/// than kept in a list here: `go tool dist list` names every pair it knows, and
-/// a list written down in this file would go stale the first time Go learned
-/// another one.
+/// Whether the Go toolchain builds for `target`. Asked of `go tool dist list`
+/// rather than kept in a list here, which would go stale the first time Go
+/// learned another pair.
 ///
 /// Asked before a line of Hive is read, so a platform that does not exist is
 /// said straight away rather than after a whole compile. An `Error` is a
 /// toolchain that could not be asked at all, which is a different thing from an
-/// answer of no and is reported against `entry` as every other toolchain
-/// failure is.
+/// answer of no.
 proc buildsFor(entry: Str, target: Str): Result<Bool, diag.Diagnostic> {
 	listed := toolchain(["tool", "dist", "list"], "", "")
 	if listed.code != 0 {
@@ -452,13 +428,12 @@ proc runTests(entry: Str, from: Int): Result<Str, diag.Diagnostic[dyn]> {
 	}
 	progress.step(from, "go test")
 	made := toolchain(["test", "-v", "-coverprofile=coverage.out", "./..."], written.directory, "")
-	// A failing suite is an answer rather than a malfunction, so its output is
-	// what comes back either way. Two things are not answers: a toolchain that
-	// could not run at all, which is what a negative status says, and one that
-	// refused what this compiler wrote — a project it would not build, or one
-	// `go vet` would not pass. Neither of those ran a test, and a run that held no
-	// test at all must never be reported as a suite where everything passed: the
-	// report reads failures off the run, so an empty one would read as silence.
+	// A failing suite is an answer rather than a malfunction, so its output
+	// comes back either way. Two things are not answers: a toolchain that could
+	// not run at all (a negative status), and one that refused what this
+	// compiler wrote. Neither ran a test, and a run that held no test must never
+	// be reported as a suite where everything passed — the report reads failures
+	// off the run, so an empty one would read as silence.
 	if made.code < 0 {
 		return Result.Error([goFailed(entry, made)])
 	}
@@ -481,9 +456,8 @@ proc resolveDeps(written: Written, from: Int): Result<Bool, diag.Diagnostic> {
 		why = "what an imported Go file imports"
 	}
 	progress.step(from, "go mod tidy — " + why)
-	// No target here, and deliberately: `go mod tidy` considers every platform at
-	// once rather than the one being built for, so handing it a `GOOS` would say
-	// something it does not read and hide that it does not.
+	// No target here, deliberately: `go mod tidy` considers every platform at
+	// once, so a `GOOS` would say something it does not read.
 	made := toolchain(["mod", "tidy"], written.directory, "")
 	if made.code != 0 {
 		return Result.Error(diag.about(written.directory, "what this build links from outside Go's own standard library could not be resolved. `go mod tidy` said:\n\n" + indented(made.output)))
@@ -502,15 +476,14 @@ proc toolchain(arguments: Str[], directory: Str, target: Str): Toolchain {
 	return Toolchain(-1, "")
 }
 
-// The Go toolchain refusing what this compiler wrote is this compiler's fault
-// rather than the author's, with one exception: a Go file the program imports
-// goes into the build as it was written, so it is the one thing in there nobody
-// here generated. Both readings are named, because this cannot tell them apart.
+// The Go toolchain refusing what this compiler wrote is this compiler's fault,
+// with one exception: an imported Go file goes into the build as it was
+// written, so it is the one thing in there nobody here generated. Both readings
+// are named, because this cannot tell them apart.
 //
-// A toolchain that could not be *started* is a different thing entirely, and
-// saying "a bug in this compiler" about a machine with no `go` on it would send
-// somebody looking in the wrong place. A negative status is what says which of
-// the two happened.
+// A toolchain that could not be *started* is a different thing — saying "a bug
+// in this compiler" about a machine with no `go` on it sends somebody looking
+// in the wrong place. A negative status says which of the two happened.
 func goFailed(entry: Str, made: Toolchain): diag.Diagnostic {
 	if made.code < 0 {
 		return diag.about(entry, "this needs the Go toolchain, and `go` is not on the PATH. A Hive build writes a Go module and compiles it, so `go` is what turns one into a program — install it from https://go.dev/dl/. Nothing else is needed: this compiler carries the runtime it compiles against, and `hive check` and `hive emit` ask for no toolchain at all.")
@@ -536,9 +509,9 @@ proc emitOnly(entry: Str, from: Int): Result<Str, diag.Diagnostic[dyn]> {
 	return Result.Ok(made.emitted.source)
 }
 
-/// The prose names of a program's tests, in the order they were declared —
-/// which is the order the runner runs them in, and the only way back from the
-/// name `go test` prints to the one that was written.
+/// The prose names of a program's tests, in declaration order — which is the
+/// order the runner runs them in, and the only way back from the name `go test`
+/// prints to the one that was written.
 proc testTitles(entry: Str): Str[dyn] {
 	program := loader.load(entry)
 	mut Str[dyn] out = []
@@ -551,8 +524,8 @@ proc testTitles(entry: Str): Str[dyn] {
 }
 
 /// Run every pass and build nothing, which is what an editor wants on every
-/// save — and, unlike a build, it asks for no entrypoint, since a file holding
-/// only tests or only declarations is a perfectly good file.
+/// save. Unlike a build it asks for no entrypoint: a file holding only tests or
+/// only declarations is a perfectly good file.
 proc check(entry: Str, from: Int): diag.Diagnostic[dyn] {
 	return passes(entry, from).errors
 }

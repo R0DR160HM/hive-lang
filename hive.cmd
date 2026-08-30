@@ -10,7 +10,7 @@ rem   hive container <entrypoint.hive>       Write a Dockerfile that builds and 
 rem
 rem A batch file rather than a PowerShell one, for one reason: this runs from
 rem cmd.exe and from PowerShell alike, and no execution policy has a say in it.
-rem Like its Unix twin it is two lines of work, because the compiler does
+rem Like its Unix twin it does almost nothing, because the compiler does
 rem everything itself — it writes the Go module and runs the Go toolchain over
 rem it. All that is left here is finding the binary.
 rem

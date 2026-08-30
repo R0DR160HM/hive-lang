@@ -12,22 +12,21 @@
 // original's are two names for storage nobody rewrites, and sharing it is
 // indistinguishable from copying it.
 //
-// That is worth a great deal in practice. A racing game holds its circuit — four
-// hundred and eighty nodes, built once and read for the rest of the race — in the
-// same record as the cars, so every frame deep-copied the track to move a car
-// three metres.
+// It is worth a great deal in practice: a racing game holds its circuit — four
+// hundred and eighty nodes, built once and read for the rest of the race — in
+// the same record as the cars, so every frame deep-copied the track to move a
+// car three metres.
 //
-// The question is asked about **types, not fields**, and that is the whole of
-// what makes it sound. Storage does not only travel down a path somebody wrote:
-// a `func` that returns `b.items` hands its caller the very slice the field
-// names, and a `mut` binding of it can write there without ever mentioning the
-// field. So the analysis asks what the program does to *storage of each shape*,
-// and a field is shared only when nothing reachable from its type is ever
-// written — through a path, through a call, or through a `mut` name.
+// The question is asked about **types, not fields**, which is what makes it
+// sound. Storage does not only travel down a path somebody wrote: a `func` that
+// returns `b.items` hands its caller the very slice the field names, and a `mut`
+// binding of it can write there without mentioning the field. So the analysis
+// asks what the program does to *storage of each shape*, and shares a field only
+// when nothing reachable from its type is ever written.
 //
 // **It is whole-program and conservative.** It runs after flattening and
-// monomorphization, so it sees every declaration the build contains, and anything
-// it cannot follow makes it give up entirely rather than guess.
+// monomorphization, so it sees every declaration the build contains, and gives
+// up entirely on anything it cannot follow rather than guess.
 import ./ast
 import ./infer
 import ./types
@@ -35,32 +34,29 @@ import ./types
 /// The fields a copy has to copy, as `Type.field`. Anything not named here owns
 /// storage that the program never writes through, so a copy may share it.
 type Written {
-	/// `Type.field` for every field a write path goes **through**. This is the
-	/// precise half: the program said which field it was writing, so only that
-	/// field is denied the sharing.
+	/// `Type.field` for every field a write path goes **through** — the precise
+	/// half, since the program said which field it was writing.
 	fields: Str[dyn]
-	/// The storage shapes that can **leave a call inside its answer**. A copy
-	/// that shares gives a callee the caller's own storage, so a callable whose
-	/// result could be part of what it was handed can put that storage somewhere
-	/// this walk will never see it come from. Once a shape can do that, no field
-	/// holding one is shared.
+	/// The storage shapes that can **leave a call inside its answer**. A shared
+	/// copy hands a callee the caller's own storage, so a callable whose result
+	/// could be part of what it was handed can put that storage where this walk
+	/// never sees it come from. Once a shape can do that, no field holding one
+	/// is shared.
 	///
-	/// It is read off signatures rather than followed through bodies, which is
-	/// both cheaper and safer: `build(seed: Int): Circuit` cannot hand back
-	/// anything it was given, because it was given nothing that owns storage.
+	/// Read off signatures rather than followed through bodies, which is cheaper
+	/// and safer: `build(seed: Int): Circuit` cannot hand back anything it was
+	/// given, having been given nothing that owns storage.
 	escaped: Str[dyn]
 	table: types.Table
 	/// Set when the walk met a write it could not attribute at all. Nothing is
-	/// shared after that: this module shares a field only when the program has
-	/// been *shown* never to write it, and a walk that lost track has shown
-	/// nothing.
+	/// shared after that — a field is shared only when the program has been
+	/// *shown* never to write it, and a walk that lost track has shown nothing.
 	blind: Bool
 }
 
 /// What a deep copy still has to copy, as `Type.field` entries and escaped
-/// shapes. `m` is the flattened, monomorphized module — the whole of what the
-/// build contains — so a field missing from the answer is missing because nothing
-/// in the program writes it.
+/// shapes. `m` is the flattened, monomorphized module, so a field missing from
+/// the answer is missing because nothing in the program writes it.
 proc writtenShapes(m: ast.Module): Str[dyn] {
 	t := types.tableOf(m)
 	mut Written w = Written([], [], t, false)
@@ -98,15 +94,12 @@ func mustCopy(t: types.Table, written: Str[], owner: Str, field: Str, ty: types.
 	return reaches(t, written, ty, [])
 }
 
-// Whether anything reachable from `ty` has escaped. A field is only shared when
-// this says no about the whole of what it holds: sharing a record shares every
-// piece of storage inside it, so one escaped piece anywhere below is enough to
-// need the copy.
+// Whether anything reachable from `ty` has escaped. Sharing a record shares
+// every piece of storage inside it, so one escaped piece below needs the copy.
 func reaches(t: types.Table, written: Str[], ty: types.Ty, seen: Str[]): Bool {
 	if types.ownsStorage(t, ty) == false {
 		// A scalar is a value and never storage, so it can neither escape nor be
-		// aliased. Marking one would deny the sharing to every record holding a
-		// number, which is every record there is.
+		// aliased. Marking one would deny the sharing to every record there is.
 		return false
 	}
 	if indexOf(written, "s" + shapeOf(ty)) is Result.Ok(_) {
@@ -122,9 +115,8 @@ func reaches(t: types.Table, written: Str[], ty: types.Ty, seen: Str[]): Bool {
 		return reaches(t, written, ok, seen) || reaches(t, written, bad, seen)
 	}
 	if ty is types.Ty.TNamed(name) {
-		// A type that reaches back into itself is reached through a variant, which
-		// is a pointer — and a pointer is storage of its own. Coming back round is
-		// answered yes, which is the conservative end.
+		// A type reaching back into itself does so through a variant, which is a
+		// pointer, which is storage of its own. Answered yes: the safe end.
 		if indexOf(seen, name) is Result.Ok(_) {
 			return true
 		}
@@ -196,17 +188,14 @@ proc markShape(w: mut Written, ty: types.Ty): void {
 
 // Every shape a callable could hand back out of what it was given.
 //
-// **A copy that shares is what makes this a question at all.** An argument used
-// to reach a callee as a copy of its own, so a `func` could only ever answer with
+// **A copy that shares is what makes this a question.** An argument used to
+// reach a callee as a copy of its own, so a `func` could only answer with
 // storage it made; now the copy may share, and `func itemsOf(b: Box): Str[dyn]`
-// answers with the very slice the caller's field names. Anything that can travel
-// that way is storage this module cannot vouch for, so no field holding one is
-// shared.
+// answers with the very slice the caller's field names.
 //
 // Read off the signature: a shape leaks when it is reachable from the result
 // *and* from a parameter. That is why a builder is not caught by it — nothing
-// that owns storage went in, so nothing that owns storage can come back out of
-// what went in.
+// that owns storage went in, so none can come back out of what went in.
 proc markLeaks(w: mut Written, decls: ast.Decl[]): void {
 	for each d in decls {
 		if d is ast.Decl.CallableDecl(_, _, params, result, _, _) {
@@ -242,11 +231,11 @@ proc leaksFrom(w: mut Written, params: ast.Param[], result: types.Ty): void {
 // nothing above it for a write to be traced through.
 //
 // It stops at a declared type, and that is the point. A callable answering with
-// a `Race` hands back storage still inside a `Race`, so a write to it is written
-// `r.track.nodes[0].x = ...` and the walk sees every field on the way. A callable
+// a `Race` hands back storage still inside one, so a write is written
+// `r.track.nodes[0].x = ...` and the walk sees every field on the way. One
 // answering with a `Node[dyn]` hands back a bare vector: the caller writes
-// `ns[0].x = ...`, which names no field at all, and nothing could tie that back
-// to the circuit it came out of. Only the second kind has to deny the sharing.
+// `ns[0].x = ...`, naming no field, and nothing ties that back to where it came
+// from. Only the second kind has to deny the sharing.
 proc leakShapes(t: types.Table, ty: types.Ty, out: mut Str[dyn]): void {
 	if types.ownsStorage(t, ty) == false {
 		return
@@ -341,9 +330,6 @@ proc walkStmt(w: mut Written, env: infer.Env, s: ast.Stmt): infer.Env {
 	}
 	if s is ast.Stmt.VarDecl(name, value, mutable, _) {
 		walkExpr(w, env, value)
-		// **A `mut` binding may be written through**, and 8.4 lets one alias what
-		// it was bound from — so unless the source is fresh, the shape it names is
-		// a shape this program can write.
 		// **A `mut` binding may be written through**, and 8.4 lets one alias what
 		// it was bound from — so a source that names storage already in a field
 		// is a name that can write there.
@@ -483,7 +469,7 @@ proc markThrough(w: mut Written, env: infer.Env, e: ast.Expr): void {
 		} else {
 			// A field of something that is not a declared type — a library value.
 			// It has no generated clone to share anything, but this cannot prove
-			// that, so it takes the safe end.
+			// it, so it takes the safe end.
 			markShape(w, infer.typeOf(env, e))
 		}
 		markThrough(w, env, subject)
@@ -508,8 +494,7 @@ proc markCall(w: mut Written, env: infer.Env, callee: ast.Expr, args: ast.Arg[])
 		return
 	}
 	// The two standard library calls that take a mutex. Everything else in the
-	// library is handed a value and answers with one, so nothing it was given is
-	// written where the caller can see it.
+	// library is handed a value and answers with one.
 	if callee is ast.Expr.Member(head, called) {
 		if head is ast.Expr.Member(root, module) {
 			if root is ast.Expr.Ident(hiveName) {
@@ -527,10 +512,9 @@ proc markCall(w: mut Written, env: infer.Env, callee: ast.Expr, args: ast.Arg[])
 	// A mutex parameter takes the caller's own storage rather than a copy, so
 	// whatever was handed to one is storage the program writes.
 	//
-	// A call with **named** arguments does not line its arguments up with its
-	// parameters by position, so which one landed on the mutex cannot be read off
-	// the order. There is no reason to work it out: marking all of them is right
-	// and costs a copy nobody was going to save.
+	// With **named** arguments the order says nothing about which one landed on
+	// the mutex, so all of them are marked — right, and costing a copy nobody
+	// was going to save.
 	if callee is ast.Expr.Ident(plain) {
 		if types.findCallable(env.table, plain) is Result.Ok(found) {
 			if anyNamed(args) {

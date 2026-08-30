@@ -1,11 +1,10 @@
 // Calling Go
 // ==========
 // `import ./util.go` is not a Hive module: nothing in the file is Hive, and what
-// Hive gets from it is the **signatures** of what it exports. The Go toolchain is
-// what reads them — a small program (`godecl`, written into this compiler's cache
-// the first time it is needed) parses the file with Go's own parser and prints
-// one line per declaration. Guessing at Go's grammar from here would be a
-// second, worse Go parser.
+// Hive gets from it is the **signatures** of what it exports. The Go toolchain
+// reads them — `godecl`, written into this compiler's cache the first time it is
+// needed, parses the file with Go's own parser and prints one line per
+// declaration. Guessing at Go's grammar here would be a second, worse Go parser.
 //
 // Each exported function becomes an `ast.Decl.ForeignDecl`: an ordinary `func`
 // with a Hive signature, so every call to it is checked like any other. Each
@@ -26,8 +25,7 @@
 //     error                   -> Result<Bool, Str>
 //
 // The narrowness is the point: every type here has the same shape on both sides,
-// so the wrapper the emitter writes is copies rather than translations, and
-// nothing crosses that Hive could not have made itself.
+// so the emitter's wrapper is copies rather than translations.
 import ./ast
 import ./fetch
 import ./naming
@@ -140,8 +138,8 @@ func at(fields: Str[], index: Int): Str {
 	return ""
 }
 
-/// The names of the structs the file exports, which is what tells a type in a
-/// signature apart from a name Hive has never heard of.
+/// The names of the structs the file exports — what tells a type in a signature
+/// from a name Hive has never heard of.
 func structNames(lines: Line[]): Str[dyn] {
 	mut Str[dyn] out = []
 	for each line in lines {
@@ -171,9 +169,9 @@ func thirdParty(lines: Line[]): Bool {
 
 // --- Mapping Go onto Hive ----------------------------------------------------
 
-// A struct in the file, mirrored as a Hive type of the same name and shape. The
-// two are the same struct on both sides — same field names, same field types —
-// which is what lets the converter the emitter writes be a field-by-field copy.
+// A struct in the file, mirrored as a Hive type of the same name and shape —
+// same field names, same field types — which is what lets the emitter's
+// converter be a field-by-field copy.
 proc mirror(name: Str, fields: Str, structs: Str[], display: Str): Result<ast.Decl, Str> {
 	if naming.check(naming.Role.TypeName(), name) is Result.Error(_) {
 		return Result.Error("the struct `{name}` in {display} cannot be a Hive type: a type is PascalCase here, and this name is not something Hive can spell.")
@@ -187,8 +185,8 @@ proc mirror(name: Str, fields: Str, structs: Str[], display: Str): Result<ast.De
 			if mapped is Result.Error(why) {
 				return Result.Error("the field `{fieldName}` of `{name}` in {display} {why} A struct only crosses the boundary when every one of its fields does.")
 			}
-			// Go exports a field by capitalising it, and a Hive field is
-			// camelCase, so the name is lowered exactly as a function's is.
+			// Go exports a field by capitalising it and a Hive field is
+			// camelCase, so the name is lowered as a function's is.
 			lowered := text.decapitalise(fieldName)
 			if naming.check(naming.Role.Field(), lowered) is Result.Error(_) {
 				return Result.Error("the field `{fieldName}` of `{name}` in {display} cannot be reached from Hive: `{lowered}` is not a name Hive can spell.")
@@ -248,10 +246,9 @@ func answered(results: Str): Str[dyn] {
 
 // What a Go function answers with, as a Hive return type.
 //
-// Go's second return value is how it reports a failure and Hive's is a
-// `Result`, so the two are the same idea and the mapping says so. What a Go
-// `error` carries is a string and nothing else — `err.Error()` — so that is the
-// error payload.
+// Go's second return value is how it reports a failure and Hive's is a `Result`,
+// so the mapping says so. A Go `error` carries a string and nothing else —
+// `err.Error()` — so that is the payload.
 proc hiveResult(results: Str[], structs: Str[], symbol: Str, display: Str): Result<ast.TypeExpr, Str> {
 	if len(results) == 0 {
 		return Result.Ok(ast.TypeExpr.VoidType())
@@ -290,8 +287,8 @@ proc hiveType(goType: Str, structs: Str[]): Result<ast.TypeExpr, Str> {
 	if goType == "int" { return Result.Ok(plain("Int")) }
 	if goType == "float64" { return Result.Ok(plain("Float")) }
 	if goType == "bool" { return Result.Ok(plain("Bool")) }
-	// Every other numeric type is a different width from Hive's, and converting
-	// one silently is how a value quietly stops being the value it was.
+	// Every other numeric type is a different width from Hive's, and a silent
+	// conversion is how a value quietly stops being what it was.
 	if goType == "int8" || goType == "int16" || goType == "int32"
 		|| goType == "int64" || goType == "uint" || goType == "uint8"
 		|| goType == "uint16" || goType == "uint32" || goType == "uint64"
@@ -348,10 +345,9 @@ proc mapType(goType: Str, structs: Str[]): Result<ast.TypeExpr, Str> {
 	key := text.span(cs, 4, shut - 1)
 	value := text.span(cs, shut + 1, len(cs) - 1)
 	// A map's key is compared and hashed whole on both sides, so it is a scalar.
-	// A Go map keyed by a struct is legal Go and would be legal Hive, but the
-	// order its keys come back in is the order they were *set* in — and a Go map
-	// has no such order to hand over, so they arrive sorted, which needs a key
-	// that sorts.
+	// A Go map keyed by a struct would be legal on both sides, but Hive's keys
+	// come back in the order they were *set* and a Go map has no such order — so
+	// they arrive sorted, which needs a key that sorts.
 	if key == "string" || key == "int" || key == "float64" || key == "bool" {
 	} else {
 		return Result.Error("is a Go map keyed by `{key}`, and only a `string`, `int`, `float64` or `bool` key crosses the boundary. A Go map has no order of its own, so its keys arrive sorted — which needs a key that sorts.")
@@ -422,9 +418,9 @@ func after(whole: Str, separator: Str): Str {
 // --- The package a Go file becomes -------------------------------------------
 
 /// The Go package name an imported file is compiled as inside the generated
-/// project. It gets a directory of its own so two files never share one, and the
-/// name is the path with everything that is not a Go identifier replaced — which
-/// is what keeps two files of the same name in different folders apart.
+/// project. Each gets a directory of its own, named after the path with
+/// everything that is not a Go identifier replaced — which keeps two files of
+/// the same name in different folders apart.
 func packageOf(path: Str): Str {
 	mut out := "ffi_"
 	for each c in text.chars(paths.normalise(path)) {
@@ -444,9 +440,8 @@ func packageOf(path: Str): Str {
 
 // Runs the reader over `path` and answers with what it printed.
 //
-// The file is copied into the tool's own directory first, under a name that is
-// not a `.go` one — so `go run .` still compiles only the reader, and the
-// reader's argument needs no absolute path to be found.
+// The file is copied into the tool's own directory first under a non-`.go`
+// name, so `go run .` still compiles only the reader.
 proc run(path: Str, display: Str): Result<Str, Str> {
 	where := install()
 	if where is Result.Error(why) {
@@ -476,10 +471,9 @@ proc run(path: Str, display: Str): Result<Str, Str> {
 	return Result.Error("could not run the Go declaration reader")
 }
 
-// Writes the reader into this compiler's cache if it is not already there, and
-// answers with its directory. It is written rather than shipped because it has
-// to be *compiled* by the toolchain on this machine; after the first run Go's
-// own build cache makes this near-instant.
+// Writes the reader into this compiler's cache if it is not there, and answers
+// with its directory. Written rather than shipped because it has to be
+// *compiled* here; after the first run Go's build cache makes it near-instant.
 proc install(): Result<Str, Str> {
 	directory := paths.joinPath(fetch.hiveHome(), "tool/godecl")
 	if hive.file.makeDir(directory) is Result.Error(why) {
@@ -510,18 +504,14 @@ proc write(path: Str, contents: Str): Result<Bool, Str> {
 
 
 /// The reader itself: a Go program that parses one Go file with Go's own parser
-/// and prints one declaration per line, tab-separated. It is written into the
-/// cache rather than shipped because it has to be compiled by the toolchain on
-/// this machine.
+/// and prints one declaration per line, tab-separated.
 func godeclSource(): Str {
 	return `
 		// godecl prints what Hive can reach in one Go file: the functions it exports,
 		// the structs they mention, and what the file imports.
 		//
-		// It is written here by the Hive compiler (see src/goffi.hive) and run with
-		// go run. The output is one declaration per line, tab-separated, because the
-		// compiler reading it needs no JSON decoder for this and having one would not
-		// make it clearer:
+		// Written here by the Hive compiler (see src/goffi.hive) and run with go run.
+		// The output is one declaration per line, tab-separated:
 		//
 		//     package<TAB>util
 		//     import<TAB>strings
@@ -636,9 +626,9 @@ func godeclSource(): Str {
 			return strings.Join(parts, ",")
 		}
 
-		// fields renders a struct's fields. An unexported or embedded one is reported as
-		// what it is rather than skipped: a struct crosses the boundary whole, so the
-		// compiler has to be able to say why one cannot.
+		// fields renders a struct's fields. An unexported or embedded one is reported
+		// rather than skipped: a struct crosses the boundary whole, so the compiler
+		// has to be able to say why one cannot.
 		func fields(st *ast.StructType) string {
 			parts := []string{}
 			for _, field := range st.Fields.List {

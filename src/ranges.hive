@@ -9,11 +9,10 @@
 // whatever had been proved about it. Anything it cannot prove is a compile error
 // rather than a runtime crash, which is the whole trade the language is making.
 //
-// Two things it does not have to work out for itself, because `infer` already
-// did. A vector's **length** is part of its type, so `Str[3]` arrives knowing it
-// holds three — and so does `map(v, f)`, which preserves it, and `a + b`, which
-// adds the two. What this pass adds is the *flow*: which guard is in scope, and
-// what an assignment has cost.
+// A vector's **length** is part of its type, so `Str[3]` arrives knowing it
+// holds three — as do `map(v, f)`, which preserves it, and `a + b`, which adds
+// the two. What this pass adds is the *flow*: which guard is in scope, and what
+// an assignment has cost.
 import ./ast
 import ./diag
 import ./infer
@@ -34,13 +33,12 @@ type Proofs {
 	/// rebound, or a vector something may have made shorter.
 	lost: Str[dyn]
 	/// The names whose length was *declared*. A declared length is a promise
-	/// rather than an observation — every value that lands in a `Str[3]` slot is
-	/// three, wherever it came from — so nothing an assignment does costs it.
+	/// rather than an observation — every value landing in a `Str[3]` slot is
+	/// three — so nothing an assignment does costs it.
 	promised: Str[dyn]
 	/// What each name bound to an `indexOf` searched, as `name|vector`. The
-	/// search and the match of it are two statements — `found := indexOf(v, x)`
-	/// and `if found is Result.Ok(i)` — so which vector the answer is an index
-	/// into has to survive the gap between them.
+	/// search and its match are two statements, so which vector the answer
+	/// indexes has to survive the gap between them.
 	searches: Str[dyn]
 }
 
@@ -85,8 +83,8 @@ proc checkDecl(bo: mut Proofs, env: infer.Env, d: ast.Decl): void {
 		for each p in params {
 			promise(bo, p.name, p.declared)
 		}
-		// A query body holds no index of its own, but the expressions in it are
-		// expressions: a bound value can be `v[0]` like anything else.
+		// A query body holds no index of its own, but a bound value in it can be
+		// `v[0]` like any other expression.
 		checkSql(bo, infer.boundParams(env, params, 0), sql)
 	} else if d is ast.Decl.TestDecl(title, body, line) {
 		bo.inside = "\"{title}\""
@@ -145,8 +143,8 @@ proc checkBlock(bo: mut Proofs, env: infer.Env, b: ast.Block): infer.Env {
 }
 
 // Each statement proved with everything before it in scope. Recursion rather
-// than a `mut infer.Env` threaded through a loop, for the reason `infer`'s own
-// folds give: an `Env` carries the whole table.
+// than a `mut infer.Env` threaded through a loop: an `Env` carries the whole
+// table.
 proc checkStmts(bo: mut Proofs, env: infer.Env, stmts: ast.Stmt[], at: Int): infer.Env {
 	if stmts bounds at {
 		return checkStmts(bo, checkStmt(bo, env, stmts[at]), stmts, at + 1)
@@ -406,10 +404,9 @@ func lengthOf(e: ast.Expr): Result<ast.Expr, Bool> {
 	return Result.Error(false)
 }
 
-// A guard on a literal high bound proves every position under it too: a length
-// is never negative, so `1 < len(v)` says the vector has a 0 as surely as it
-// says it has a 1. That is what lets `drop(v, 0, 1)` need one guard rather than
-// two.
+// A guard on a literal high bound proves every position under it: `1 < len(v)`
+// says the vector has a 0 as surely as a 1, which is what lets `drop(v, 0, 1)`
+// need one guard rather than two.
 proc proveBelow(bo: mut Proofs, vector: ast.Expr, index: ast.Expr): void {
 	if index is ast.Expr.IntLit(high) {
 		for i := 0; i < high; i++ {
@@ -456,9 +453,9 @@ proc rebind(bo: mut Proofs, target: ast.Expr): void {
 }
 
 proc lose(bo: mut Proofs, name: Str): void {
-	// A declared length survives everything: it is a promise rather than an
-	// observation, and the checker held every value that reached it to that
-	// promise. Only what a guard proved about the old value goes.
+	// A declared length survives everything — it is a promise the checker held
+	// every value reaching it to. Only what a guard proved about the old value
+	// goes.
 	if indexOf(bo.promised, name) is Result.Error(_) {
 		if indexOf(bo.lost, name) is Result.Error(_) {
 			append(bo.lost, name)
@@ -477,25 +474,23 @@ proc lose(bo: mut Proofs, name: Str): void {
 // Whether a proof was about `name`, or about something reached through it.
 //
 // A proof is keyed by the whole path it was about — `b.loose|2` — and losing `b`
-// has to lose that one too, because what a guard proved about the field it proved
-// about the value the field was in. Comparing the key's first piece with the name
-// outright only ever matched a bare identifier, so a guard on a field outlived the
-// record that was guarded and
-// [10.4](../spec/10-bounds.md#104-an-inferred-length-is-weaker)'s own example —
-// replace the field inside the guard, then index it — compiled.
+// has to lose that one too: what a guard proved about the field, it proved about
+// the value the field was in. Matching the key's first piece against the name
+// outright would only catch a bare identifier, letting a guard on a field
+// outlive the record and compiling
+// [10.4](../spec/10-bounds.md#104-an-inferred-length-is-weaker)'s own example.
 func startsWithName(entry: Str, name: Str): Bool {
 	path := nameAt(split(entry, "|"), 0)
 	if path == name {
 		return true
 	}
-	// `name.` and `name[` rather than `name`, so that losing `b` does not also lose
+	// `name.` and `name[` rather than `name`, so losing `b` does not also lose
 	// everything proved about `bat`.
 	return text.startsWith(path, name + ".") || text.startsWith(path, name + "[")
 }
 
 // Everything any branch of a statement rebound. An inferred length dies even in
-// a branch that may not run, because what the compiler knows has to hold on
-// every path through.
+// a branch that may not run: what the compiler knows has to hold on every path.
 proc loseAssigned(bo: mut Proofs, s: ast.Stmt): void {
 	for each name in assignedIn(s) {
 		lose(bo, name)
@@ -523,8 +518,7 @@ func assignedIn(s: ast.Stmt): Str[dyn] {
 	if s is ast.Stmt.ForEach(_, _, _, body) {
 		return assignedInBlock(body)
 	}
-	// `drop` is the one builtin that makes a vector shorter, so it costs that
-	// vector whatever had been proved about it.
+	// `drop` is the one builtin that makes a vector shorter.
 	if s is ast.Stmt.Expression(value) {
 		return shortenedBy(value)
 	}
@@ -644,9 +638,8 @@ proc checkIndex(bo: mut Proofs, env: infer.Env, subject: ast.Expr, index: ast.Ex
 	report(bo, refusal(bo, env, subject, index))
 }
 
-// A slice's bound, which is proved the same way an index is — except that a
-// bound left out is `0` at one end and the last element at the other, and
-// neither of those can be out of range.
+// A slice's bound, proved the way an index is — except that a bound left out is
+// `0` at one end and the last element at the other, neither out of range.
 proc checkBound(bo: mut Proofs, env: infer.Env, subject: ast.Expr, bound: ast.Expr): void {
 	if bound is ast.Expr.Absent {
 		return
@@ -673,23 +666,21 @@ func provable(bo: Proofs, env: infer.Env, subject: ast.Expr, index: ast.Expr): B
 }
 
 // The length of a vector, when the compiler knows it. A declared length is a
-// promise and is never lost; an inferred one dies the moment the name it was read
-// off is rebound, which is what `lost` records.
+// promise and is never lost; an inferred one dies the moment the name it was
+// read off is rebound, which is what `lost` records.
 func knownLength(bo: Proofs, env: infer.Env, subject: ast.Expr): Result<Int, Bool> {
 	if types.dimOf(infer.typeOf(env, subject)) is ast.Dim.Fixed(n) {
-		// **A field's length is a promise even when the record holding it is not.**
-		// It is written down in the type's own declaration, and the checker holds
-		// every value that reaches that field to it — including at construction
-		// ([10.3](../spec/10-bounds.md#103-a-declared-length-is-a-promise)) — so
-		// there is no way to put a `Float[2]` in a `Float[3]` field and nothing
-		// rebinding the record can do about how many it holds.
+		// **A field's length is a promise even when the record holding it is
+		// not.** It is written in the type's declaration and the checker holds
+		// every value reaching that field to it, construction included
+		// ([10.3](../spec/10-bounds.md#103-a-declared-length-is-a-promise)), so
+		// nothing rebinding the record can change how many it holds.
 		//
-		// Asking `lost` about the *root* name would say otherwise, because the root
-		// of `b.three` is `b`, and `b` is an ordinary record whose own proofs go
-		// when it is assigned to. That is right for what a guard proved about a
-		// `[dyn]` field and wrong for what the declaration says about a fixed one:
-		// 10.4's "that proof died with the old value" is about an inferred length,
-		// and a field never has one — a field's type is written, never observed.
+		// Asking `lost` about the *root* name would say otherwise — the root of
+		// `b.three` is `b`, an ordinary record whose proofs go when it is
+		// assigned to. That is right for what a guard proved about a `[dyn]`
+		// field and wrong for a fixed one: 10.4 is about an *inferred* length,
+		// and a field's type is written, never observed.
 		if subject is ast.Expr.Member(_, _) {
 			return Result.Ok(n)
 		}
@@ -702,12 +693,12 @@ func knownLength(bo: Proofs, env: infer.Env, subject: ast.Expr): Result<Int, Boo
 	return Result.Error(false)
 }
 
-// The message. It says which of the three things went wrong, because each has a
-// different fix.
+// The message. It says which of the three things went wrong: each has its own
+// fix.
 func refusal(bo: Proofs, env: infer.Env, subject: ast.Expr, index: ast.Expr): Str {
 	written := describe(bo, env, subject)
 	// A `Str` is indexed by character and never carries a declared length, so the
-	// two answers that mention one would send the reader nowhere.
+	// two answers mentioning one would send the reader nowhere.
 	str := infer.typeOf(env, subject) is types.Ty.TStr
 	if index is ast.Expr.IntLit(at) {
 		if knownLength(bo, env, subject) is Result.Ok(n) {
@@ -727,10 +718,9 @@ func refusal(bo: Proofs, env: infer.Env, subject: ast.Expr, index: ast.Expr): St
 	return "cannot prove this index is in range: it is a computed expression, and there is nothing to hang a guard on. Bind it to a name first, then guard that"
 }
 
-// What to call the vector in a message. The whole path where there is one, so
-// that a refusal about `b.three` says `b.three` rather than `b` — naming the
-// record when the field is what could not be proved sends the reader to the wrong
-// declaration.
+// What to call the vector in a message: the whole path where there is one, so a
+// refusal about `b.three` says `b.three` rather than `b` — naming the record
+// would send the reader to the wrong declaration.
 func describe(bo: Proofs, env: infer.Env, e: ast.Expr): Str {
 	written := pathKey(e)
 	if written != "" {
@@ -748,9 +738,8 @@ func describe(bo: Proofs, env: infer.Env, e: ast.Expr): Str {
 
 // --- Keys --------------------------------------------------------------------
 
-// A stable name for the pair a guard proves, so the guard and the access agree
-// about what was proved. Anything that is not a plain path has no key, and so is
-// never proved — which is the conservative answer.
+// A stable name for the pair a guard proves, so the guard and the access agree.
+// Anything that is not a plain path has no key, and so is never proved.
 func pairKey(vector: ast.Expr, index: ast.Expr): Str {
 	left := pathKey(vector)
 	right := pathKey(index)
@@ -769,9 +758,8 @@ func pathKey(e: ast.Expr): Str {
 		}
 		return inner + "." + field
 	}
-	// `grid[0]` is a stable name for a row as long as the index is a literal, so
-	// a guard on it proves something the access can use. A computed index names a
-	// different element each time and has no key.
+	// `grid[0]` is a stable name for a row as long as the index is a literal. A
+	// computed index names a different element each time and has no key.
 	if e is ast.Expr.Index(subject, index) {
 		inner := pathKey(subject)
 		if index is ast.Expr.IntLit(at) {

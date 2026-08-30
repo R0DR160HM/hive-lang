@@ -1,10 +1,9 @@
 // Lexer
 // =====
 // Source text to a flat list of tokens. It skips `//` comments and whitespace,
-// tracks the line every token sits on, and matches keywords exactly: every
-// keyword is lower case and only lower case, so `IF` is not `if` — and it is not
-// a name either, since reading it as one would hide the mistake somewhere else
-// entirely.
+// tracks the line every token sits on, and matches keywords exactly: `IF` is
+// not `if`, and not a name either — reading it as one would hide the mistake
+// somewhere else entirely.
 //
 // Three constructs need light context tracking, and `Mode` is the whole of it:
 //
@@ -15,11 +14,9 @@
 //   * after `import` comes a path, whose `.`, `..` and `/` would each otherwise
 //     lex as an operator.
 //
-// The scan holds a cursor and what it has produced so far, and every helper that
-// moves it takes it as a `mut` parameter — which is the one way storage crosses
-// a call boundary in Hive, and exactly what a cursor is. Everything that only
-// *reads* takes the characters and an index instead, so no reader ever costs a
-// copy of the source.
+// The scan holds a cursor and what it has produced, and every helper that moves
+// it takes it as a `mut` parameter. Everything that only *reads* takes the
+// characters and an index instead, so no reader costs a copy of the source.
 import ./diag
 import ./naming
 import ./text
@@ -52,8 +49,8 @@ type Scan {
 
 /// Lex the whole source.
 proc lex(source: Str): Lexed {
-	// Line endings are normalised first: a `\r` left in place would ride along
-	// inside every token's text, and a `\r\n` would be counted as two lines.
+	// Line endings are normalised first: a stray `\r` rides along inside every
+	// token's text, and a `\r\n` would count as two lines.
 	cs := text.chars(text.replace(text.replace(source, "\r\n", "\n"), "\r", "\n"))
 	mut Scan s = Scan(0, 1, Mode.Normal(), [], [])
 	for ; s.pos < len(cs); {
@@ -185,11 +182,10 @@ proc scanOperator(cs: Str[], s: mut Scan): void {
 
 // --- Words -------------------------------------------------------------------
 
-// A word is a keyword when it is spelled the way the language spells one, and a
-// name when no keyword answers to it in any casing. What is left — `IF`, `Proc`,
-// `VOID` — is neither: it is a keyword written wrong, and saying so is the whole
-// reason this is not simply read as a name. A program that meant it as one has a
-// name to change; a program that meant the keyword has a shout to quieten.
+// A word is a keyword when spelled the way the language spells one, and a name
+// when no keyword answers to it in any casing. What is left — `IF`, `Proc`,
+// `VOID` — is a keyword written wrong, which is worth saying rather than reading
+// as a name.
 proc scanWord(cs: Str[], s: mut Scan): void {
 	start := s.pos
 	for ; s.pos < len(cs) && isWordChar(text.charAt(cs, s.pos)); s.pos++ {
@@ -220,9 +216,8 @@ func isWordChar(c: Str): Bool {
 
 // --- Numbers -----------------------------------------------------------------
 
-// A digit run, then a `.` and another digit run for a float. The digit after the
-// dot is what decides: without one the dot is an operator, so `v[1:2]` and a
-// method call on a number both still lex.
+// A digit run, then a `.` and another for a float. The digit after the dot
+// decides: without one the dot is an operator, so `v[1:2]` still lexes.
 proc scanNumber(cs: Str[], s: mut Scan): void {
 	start := s.pos
 	for ; s.pos < len(cs) && text.isDigit(text.charAt(cs, s.pos)); s.pos++ {
@@ -270,9 +265,9 @@ proc scanAtom(cs: Str[], s: mut Scan): void {
 
 // --- Strings -----------------------------------------------------------------
 
-// A `"..."` string, with escapes and `{expression}` interpolation. The pieces
-// are collected as they are read: a string that turns out to hold no
-// interpolation at all becomes a plain literal, which is what most of them are.
+// A `"..."` string, with escapes and `{expression}` interpolation. The pieces are
+// collected as they are read, and one that turns out to hold no interpolation
+// becomes a plain literal.
 proc scanString(cs: Str[], s: mut Scan): void {
 	opened := s.line
 	s.pos = s.pos + 1
@@ -291,15 +286,13 @@ proc scanString(cs: Str[], s: mut Scan): void {
 		} else if c == "\{" {
 			s.pos = s.pos + 1
 			// `\{name is (regex)}` is a pattern's hole rather than an
-			// interpolation, and its regex is captured with no escape
-			// processing at all. It is recognised by that exact shape and
-			// nothing looser, which is what lets the regex hold the `\` and
-			// the `\{` that would otherwise have been the string's.
+			// interpolation, captured with no escape processing. Recognised by
+			// that exact shape and nothing looser, which lets the regex hold the
+			// `\` and `\{` that would otherwise be the string's.
 			if scanRegexHole(cs, s, b) == false {
 				if scanInterpolation(cs, s, b, opened) == false {
-					// The interpolation has already said what went wrong.
-					// Reporting an unterminated string on top of it would name
-					// one mistake twice.
+					// The interpolation already said what went wrong; an
+					// unterminated string on top would name it twice.
 					return
 				}
 			}
@@ -337,9 +330,7 @@ proc scanRegexHole(cs: Str[], s: mut Scan, b: mut StrPartBuf): Bool {
 	}
 	// Past this point the shape is a hole and nothing else — `\{name is (` is not
 	// an expression anybody writes — so what follows is reported as a hole gone
-	// wrong rather than handed back to be read as an interpolation. Falling back
-	// there would name the mistake as a lexing failure inside a `\{...}`, which
-	// is about as far from the truth as a message gets.
+	// wrong. Falling back would name it a lexing failure inside a `\{...}`.
 	open := i
 	i = i + 1
 	mut depth := 1
@@ -378,18 +369,16 @@ proc scanRegexHole(cs: Str[], s: mut Scan, b: mut StrPartBuf): Bool {
 	return failedHole(s, "this hole's regex is never closed: `\{{name} is (` opens one and nothing closes it")
 }
 
-// A hole that went wrong. It answers `true` — the characters are consumed and
-// the string reads on — because the mistake has been reported and reading them
-// again as an interpolation would only report a second, wronger one.
+// A hole that went wrong. Answers `true` — the characters are consumed and the
+// string reads on — because the mistake is already reported.
 proc failedHole(s: mut Scan, message: Str): Bool {
 	append(s.errors, diag.at(s.line, message))
 	return true
 }
 
-// The binding name a hole opens with, or `""` where what follows the `\{` is not
-// one. A name is what the language's `Binding` role allows, which is a lower
-// case letter and then letters and digits — deliberately narrower than an
-// expression, so `\{a.b is (x)}` is an interpolation and not a malformed hole.
+// The binding name a hole opens with, or `""`. A name is what the `Binding` role
+// allows — deliberately narrower than an expression, so `\{a.b is (x)}` is an
+// interpolation and not a malformed hole.
 func holeName(cs: Str[], start: Int): Str {
 	mut Str[dyn] out = []
 	mut i := start
@@ -433,9 +422,9 @@ proc scanInterpolation(cs: Str[], s: mut Scan, b: mut StrPartBuf, opened: Int): 
 	return false
 }
 
-// A backtick string is raw: no escapes, no interpolation, and it may span lines.
-// Its indentation is a fact about where it sits in the file rather than part of
-// what it holds, so it is removed.
+// A backtick string is raw: no escapes, no interpolation, may span lines. Its
+// indentation says where it sits in the file rather than what it holds, so it
+// is removed.
 proc scanBacktick(cs: Str[], s: mut Scan): void {
 	opened := s.line
 	s.pos = s.pos + 1
@@ -529,11 +518,9 @@ proc scanSqlBody(cs: Str[], s: mut Scan): void {
 
 // --- Import paths ------------------------------------------------------------
 
-// An import's path is captured whole: leading blanks are skipped, then
-// everything up to the next whitespace is the path. A path may also be quoted,
-// which is how one holding a space is written — inside the quotes everything up
-// to the closing one is the path, so nothing in it has to be escaped, and an
-// `as` after it still reads as `as`.
+// An import's path is captured whole: skip leading blanks, then everything to
+// the next whitespace. A quoted path is how one holding a space is written —
+// nothing inside has to be escaped, and an `as` after it still reads as `as`.
 proc scanImportPath(cs: Str[], s: mut Scan): void {
 	for ; s.pos < len(cs) && isBlank(text.charAt(cs, s.pos)); s.pos++ {
 	}
@@ -559,9 +546,8 @@ proc scanQuotedImportPath(cs: Str[], s: mut Scan): void {
 	start := s.pos
 	for ; s.pos < len(cs); s.pos++ {
 		c := text.charAt(cs, s.pos)
-		// A newline inside it is a missing closing quote rather than a path that
-		// spans lines: an import is one line, and saying so here means the error
-		// lands on the line the quote was opened on.
+		// A newline inside is a missing closing quote rather than a path spanning
+		// lines, so the error lands on the line the quote was opened on.
 		if c == "\n" {
 			s.mode = Mode.Normal()
 			append(s.errors, diag.at(opened, "this `import` path opens with a quote and never closes it — add the closing `\"`"))

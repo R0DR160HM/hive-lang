@@ -31,7 +31,7 @@ a compiler for it written in the language it compiles.
 ./selfhost                            compile the compiler with itself, twice
 ```
 
-`./hive` is a two-line script that finds the binary and gets out of the way;
+`./hive` is a small wrapper that finds the binary and gets out of the way;
 `hive.cmd` is the same thing for Windows. Installed rather than run from here,
 the compiler *is* `hivec` and takes exactly those arguments — see
 [Installing it](#installing-it).
@@ -292,22 +292,20 @@ it — the language it accepts and the code it writes are the same on both sides
 
 ## It says what it is doing
 
-A compile is not instant — the compiler's own twenty-three thousand lines take
-minutes — so every pass says what it is about to do, with the time so far in
-front of it:
+Every pass says what it is about to do, with the time so far in front of it:
 
 ```
 $ ./hive build src/hivec.hive
  0:00  reading src/hivec.hive
- 0:08  expanding generics in 25 files
- 0:44    100 of 872 declarations
+ 0:00  expanding generics in 28 files
+ 0:00    100 of 1028 declarations
  ...
- 5:02    800 of 872 declarations
- 5:18  checking 872 declarations
- 5:58  proving every index in range
- 6:17  emitting Go
- 6:44  go build
-Compiled src/hivec.hive -> src/hivec (7m15s)
+ 0:00    1000 of 1028 declarations
+ 0:00  checking 1028 declarations
+ 0:02  proving every index in range
+ 0:03  emitting Go
+ 0:07  go build
+Compiled src/hivec.hive -> hivec (9s)
 ```
 
 Every line names something about to be waited on rather than something just
@@ -316,14 +314,14 @@ It goes to **standard error** and only when standard error is a **terminal**, so
 `hive emit x.hive > main.go` is still Go and a script comparing what a program
 printed is unaffected; `HIVE_PROGRESS=1` says it anyway, and `HIVE_PROGRESS=0`
 never does. The one pass that reports while it works rather than only when it
-starts is the expansion of generics, because it is where most of a compile goes —
-five of those seven minutes, and the number worth attacking if anybody wants this
-faster.
+starts is the expansion of generics, which used to be where most of a compile
+went: taking the defensive copies out of it turned a seven-minute build of the
+compiler into a nine-second one.
 
 ## What is here
 
 ```
-spec/                the language specification, in 19 chapters
+spec/                the language specification, in 18 chapters
 examples/            twenty-two programs, and between them every feature there is
 src/                 the compiler
   text.hive          the string handling the standard library does not have
@@ -334,6 +332,7 @@ src/                 the compiler
   lexer.hive         source text -> tokens
   ast.hive           the syntax tree
   parser.hive        tokens -> one module's tree
+  regex.hive         the regex a string pattern's hole carries, read at compile time
   show.hive          a tree rendered as one line of parentheses
   loader.hive        the import graph, and the one module every later pass reads
   fetch.hive         the import that names a repository rather than a file
@@ -343,6 +342,7 @@ src/                 the compiler
   stdlib.hive        what `hive.<module>.<name>` means
   infer.hive         what an expression's type is
   check.hive         everything a program has to be that the grammar cannot say
+  writes.hive        which fields a deep copy still has to copy
   emit.hive          one flattened module -> one Go file
   runtime.hive       the Go the generated program is compiled against
   goffi.hive         reading an imported Go file's signatures, through Go itself
@@ -368,9 +368,9 @@ prix — each of those a server and a client, on a world rolled from a number �
 every one compiled by `./examples/run` and — where a program finishes on its own
 — run and compared with what it says it prints.
 
-The compiler is about 23,000 lines of Hive — 8,700 of which are the Go runtime
+The compiler is about 28,000 lines of Hive — 10,400 of which are the Go runtime
 and the JavaScript a scene is drawn by, carried as source text — its tests are
-3,000 more, and the examples another 11,000.
+4,400 more, and the examples another 23,000.
 
 ## The pipeline
 
@@ -388,6 +388,7 @@ one program's tree
    ↓  check            names, types, purity, mutability, terminating paths
    ↓  ranges           every index and slice proved in range
    ↓  emit             Go, with the copies value semantics need — and the
+   ↓    writes         which of those copies anybody could tell apart
    ↓                   codecs, row mappers and wrappers a declaration derives
 a Go module
    ↓  the Go toolchain
@@ -429,28 +430,33 @@ Running the suites with the compiler itself.
 text         16 tests: 16 passed
 naming       20 tests: 20 passed
 paths        8 tests: 8 passed
-lexer        34 tests: 34 passed
-parser       55 tests: 55 passed
+lexer        40 tests: 40 passed
+regex        21 tests: 21 passed
+parser       56 tests: 56 passed
 loader       23 tests: 23 passed
 fetch        15 tests: 15 passed
 goffi        10 tests: 10 passed
 mono         18 tests: 18 passed
-check        63 tests: 63 passed
-ranges       35 tests: 35 passed
-emit         53 tests: 53 passed
+check        65 tests: 65 passed
+ranges       39 tests: 39 passed
+emit         58 tests: 58 passed
 container    17 tests: 17 passed
+project      8 tests: 8 passed
+hivec        11 tests: 11 passed
 
 End to end:
   PASS  collections
   PASS  concurrency
+  PASS  exec
   PASS  functions
   PASS  generics
   PASS  modules
   PASS  patterns
+  PASS  strings
   PASS  valueSemantics
   PASS  values
 
-  8 programs: 8 passed
+  10 programs: 10 passed
 
 Everything passed.
 ```
@@ -468,7 +474,7 @@ comparing two files is what a shell is for, not because Hive could not.
 [examples/](examples), which are the language's own tour rather than a test of
 the compiler — but they are compiled, run and compared all the same, because an
 example that has stopped being true is worse than no example. Six of them carry
-test suites of their own, and those are 224 tests more.
+test suites of their own, and those are 273 tests more.
 
 ## Reading it
 
@@ -476,7 +482,7 @@ The compiler is meant to be read. Every module opens with what it is for and
 what it decided not to do; the interesting choices are argued for where they were
 made rather than in a design document nobody opens.
 
-Six places are worth reading first, because each is a decision the language
+Eight places are worth reading first, because each is a decision the language
 forced:
 
 * **`lexer.hive`** — the lexer works over `split(source, "")` rather than
@@ -496,7 +502,7 @@ forced:
   difference between a command whose output only matters when it fails and one
   that is talking to whoever started you.
 * **`ranges.hive`** — the bounds pass, and the language's headline guarantee: it
-  proves the compiler's own eleven thousand lines in range without a single
+  proves the compiler's own twenty-eight thousand lines in range without a single
   refusal. The module is called `ranges` because `bounds` is a keyword.
 * **`types.hive`** — `same` is written out rather than left to `==`, and the
   comment says why: `==` on a union whose variant holds a vector crashes. That is
@@ -506,7 +512,7 @@ forced:
   signatures are read by Go's own parser, in a program this compiler writes into
   its cache and runs; everything after that is the mapping between the two type
   systems, and every refusal in it names the parameter it could not take.
-* **`runtime.hive`** — eight thousand lines of Go carried as source text, which
+* **`runtime.hive`** — ten thousand lines of Go carried as source text, which
   is where the standard library actually lives: HTTP and WebSockets on a hijacked
   connection, a service's mailbox and the TLS wire under it, a window and the
   three.js a scene is drawn by. A module a program never named is never written

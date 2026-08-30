@@ -12,11 +12,10 @@
 // held to that length while one at `Str[dyn]` guards its indexes, which is the
 // right answer for both.
 //
-// It is a worklist. A copy may itself call something generic — `filterMap`
-// calling `first` — so instantiating one can ask for another, and the loop runs
-// until nothing new is asked for. A generic that instantiates itself at an
-// ever-larger type would never settle, so the expansion is capped and
-// overrunning it is a compile error rather than a hung build.
+// It is a worklist: a copy may itself call something generic, so instantiating
+// one can ask for another, and the loop runs until nothing new is asked for. A
+// generic instantiating itself at an ever-larger type would never settle, so the
+// expansion is capped and overrunning it is a compile error, not a hung build.
 import ./ast
 import ./diag
 import ./infer
@@ -52,9 +51,8 @@ type Mono {
 	wantedFlat: Str[dyn]
 	/// How far down `wanted` the worklist has got.
 	done: Int
-	/// The line the declaration being rewritten was declared on. It is the only
-	/// position a flattened program can offer, and a message with none at all is
-	/// one an editor cannot jump to.
+	/// The line the declaration being rewritten was declared on — the only
+	/// position a flattened program can offer.
 	line: Int
 	errors: diag.Diagnostic[dyn]
 }
@@ -65,11 +63,9 @@ type ArgList {
 	written: ast.TypeExpr[dyn]
 }
 
-/// Expand every generic in a flattened program.
-/// `from` is when the command started, for the progress this pass reports.
-/// This is the slowest thing the compiler does — most of a compile is spent
-/// here — so it is the one pass that says something while it is working rather
-/// than only when it starts.
+/// Expand every generic in a flattened program. `from` is when the command
+/// started, for the progress this pass reports — it is the slowest thing the
+/// compiler does, so it is the one pass that speaks while it works.
 proc expand(m: ast.Module, from: Int): Expanded {
 	t := types.tableOf(m)
 	mut Mono mo = Mono(t, m.decls, genericNames(t, m.decls), [], [], [], 0, 0, [])
@@ -111,8 +107,7 @@ proc expand(m: ast.Module, from: Int): Expanded {
 }
 
 // A declaration is generic when its signature mentions a name that is neither a
-// builtin nor anything the program declared — which is the whole of what makes a
-// type variable a type variable.
+// builtin nor anything the program declared.
 func genericNames(t: types.Table, decls: ast.Decl[]): Str[dyn] {
 	mut Str[dyn] out = []
 	for each info in t.callables {
@@ -272,10 +267,9 @@ proc substituteVariants(mo: mut Mono, variants: ast.Variant[], variables: Str[],
 }
 
 /// A written type with every variable replaced, and every generic type written
-/// out replaced by the copy it names. The two halves are separate because one
-/// caller wants only the first: a constructor is told which instantiation it is
-/// building by the declaration beside it, and that has to be read before the
-/// name is rewritten.
+/// out replaced by the copy it names. The two halves are separate because a
+/// constructor is told which instantiation it builds by the declaration beside
+/// it, which has to be read before the name is rewritten.
 proc substitute(mo: mut Mono, t: ast.TypeExpr, variables: Str[], args: ArgList): ast.TypeExpr {
 	return renameGenerics(mo, substituteVars(t, variables, args))
 }
@@ -331,8 +325,7 @@ proc renameGenerics(mo: mut Mono, t: ast.TypeExpr): ast.TypeExpr {
 
 /// A constructor for a generic type, aimed at the instantiation the declaration
 /// beside it named. `Either<Str, Int> went = Either.Left("x")` builds an
-/// `Either_Str_Int`, and only the declaration could have said so — the argument
-/// pins down `A` and says nothing at all about `B`.
+/// `Either_Str_Int`: the argument pins down `A` and says nothing about `B`.
 proc retarget(mo: mut Mono, want: ast.TypeExpr, value: ast.Expr): ast.Expr {
 	if want is ast.TypeExpr.Named(pkg, name, typeArgs, _) {
 		if pkg == "" && isGeneric(mo.generics, name) && len(typeArgs) > 0 {
@@ -412,9 +405,8 @@ func argsAt(all: ArgList[], index: Int): ArgList {
 // a call to something generic becomes a call to the copy for the arguments it
 // was made with.
 
-// A declaration that is not generic still has to be walked: it may name one
-// that is, and every such reference becomes the copy for the arguments it was
-// made with.
+// A declaration that is not generic still has to be walked: it may name one that
+// is.
 proc rewriteDecl(mo: mut Mono, env: infer.Env, d: ast.Decl): ast.Decl {
 	mut Str[dyn] nothing = []
 	return substituteDecl(mo, env, d, ast.declName(d), nothing, ArgList([]))
@@ -430,11 +422,10 @@ proc substituteBlock(mo: mut Mono, env: infer.Env, b: ast.Block, variables: Str[
 }
 
 // Each statement rewritten with the bindings of everything before it in scope.
-// It recurses rather than threading a `mut infer.Env` through a loop, and that
-// is a performance decision: an `Env` carries the whole table, a `mut` binding
-// off an immutable one has to be copied to keep `8.3`'s invariant, and a copy
-// of the table per statement was most of what this pass cost. `env` here is an
-// immutable parameter — storage nothing can write — so nothing is copied.
+// Recursion rather than a `mut infer.Env` threaded through a loop, and that is a
+// performance decision: an `Env` carries the whole table, a `mut` binding off an
+// immutable one is copied to keep 8.3's invariant, and a copy of the table per
+// statement was most of what this pass cost.
 proc substituteStmts(mo: mut Mono, env: infer.Env, stmts: ast.Stmt[], at: Int, into: mut ast.Stmt[dyn], variables: Str[], args: ArgList): void {
 	if stmts bounds at {
 		next := substituteStmt(mo, env, stmts[at], variables, args)
@@ -544,12 +535,12 @@ proc substituteExpr(mo: mut Mono, env: infer.Env, e: ast.Expr, variables: Str[],
 	} else if e is ast.Expr.WithType(value, target) {
 		return ast.Expr.WithType(substituteExpr(mo, env, value, variables, args), substitute(mo, target, variables, args))
 	} else if e is ast.Expr.Ident(name) {
-		// A generic callable cannot be used as a value. Which copy a call reaches
-		// is decided by the argument types, and a value carries none — so a bare
-		// reference to one has nothing to resolve to. A call's callee never gets
-		// here: `substituteCall` reads it before this does.
+		// A generic callable cannot be used as a value: which copy a call reaches
+		// is decided by the argument types, and a value carries none. A call's
+		// callee never gets here — `substituteCall` reads it first.
+		//
 		// Only a callable: a bare type name is always part of a constructor path
-		// — `Either.Left(...)` — and is never a value on its own.
+		// (`Either.Left(...)`) and never a value on its own.
 		if isGeneric(mo.generics, name) && types.findCallable(env.table, name) is Result.Ok(_) {
 			append(mo.errors, diag.at(mo.line, "`{name}` is generic, so it cannot be used as a value: which copy a call reaches is decided by the argument types, and a value carries none. Call it, or wrap it in a callable of your own that is not generic"))
 		}
@@ -562,9 +553,9 @@ proc substituteExpr(mo: mut Mono, env: infer.Env, e: ast.Expr, variables: Str[],
 proc aimPattern(mo: mut Mono, env: infer.Env, subject: ast.Expr, p: ast.Pattern): ast.Pattern {
 	if p is ast.Pattern.Constructor(path, bindings, parenthesised) {
 		if len(path) == 2 && isGeneric(mo.generics, nameAt(path, 0)) {
-			// The copy is not in the table this pass reads — the table is of the
-			// program as it was written — so its name arrives as a type variable
-			// rather than as a declared type. Either way it is the name.
+			// The copy is not in the table this pass reads — that is of the
+			// program as written — so its name arrives as a type variable rather
+			// than a declared type. Either way it is the name.
 			flat := nameOfType(infer.typeOf(env, subject))
 			if flat != "" {
 				return ast.Pattern.Constructor([flat, nameAt(path, 1)], bindings, parenthesised)
@@ -607,8 +598,7 @@ proc chosen(mo: mut Mono, env: infer.Env, name: Str, callArgs: ast.Arg[]): Str {
 		return wanted(mo, name, ArgList(found))
 	}
 	// A generic *type* being constructed: `Box(["a"], "people")` names the copy
-	// its declaration was written out as, which the declaration site already
-	// asked for.
+	// its declaration was written out as, already asked for at that site.
 	if types.findType(env.table, name) is Result.Ok(info) {
 		variables := variablesOf(env.table, info.parameters)
 		mut ast.TypeExpr[dyn] found = []
@@ -629,9 +619,9 @@ func withWritten(into: ast.TypeExpr[], one: ast.TypeExpr): ast.TypeExpr[dyn] {
 	return out
 }
 
-// What one variable stands for at this call. A variable is pinned down by
-// wherever it appears in the parameters — including *inside* a parameter's own
-// type, which is what makes a higher-order generic work.
+// What one variable stands for at this call. A variable is pinned down wherever
+// it appears in the parameters, *inside* a parameter's own type included — which
+// is what makes a higher-order generic work.
 proc solve(mo: mut Mono, env: infer.Env, params: ast.Param[], callArgs: ast.Arg[], variable: Str): ast.TypeExpr {
 	mut i := 0
 	for each p in params {
@@ -646,8 +636,8 @@ proc solve(mo: mut Mono, env: infer.Env, params: ast.Param[], callArgs: ast.Arg[
 		}
 		i = i + 1
 	}
-	// A variable that appears only in the return type has nothing to be inferred
-	// from. It is reported here rather than left to produce a copy nobody meant.
+	// A variable appearing only in the return type has nothing to be inferred
+	// from, and would otherwise produce a copy nobody meant.
 	append(mo.errors, diag.at(mo.line, "`{variable}` appears nowhere in the parameters, so there is nothing at a call to read it off. A type variable is pinned down by what is passed, never written at the call site"))
 	return ast.TypeExpr.Named("", "Str", [], [])
 }
