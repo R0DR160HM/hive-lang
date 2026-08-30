@@ -222,11 +222,13 @@ vector-pattern
 element     = INT | FLOAT | STRING | ATOM | "true" | "false"
             | IDENT | "_" ;
 
-string-pattern = STRING | INTERP ;   (* holes are {name} *)
+string-pattern = STRING | INTERP ;   (* holes are {name} or {name is (re)} *)
 ```
 
-A string pattern's holes must be plain binding names, and two holes may not sit
-side by side. See [07](07-patterns.md).
+A string pattern's holes must be plain binding names, and two **open** holes may
+not sit side by side. A hole is lexed rather than parsed ([01](01-lexical.md#a-regex-hole)):
+`{name is (re)}` captures its regex raw, so the grammar above never sees inside
+those parentheses. See [07](07-patterns.md).
 
 ## 2.8 `using`
 

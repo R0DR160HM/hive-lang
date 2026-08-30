@@ -195,6 +195,7 @@ proc build(entry: Str, withTests: Bool, from: Int): Written {
 		if vendor.placeThree(directory + "/hive") is Result.Error(why) {
 			append(errors, diag.about(entry, why))
 		}
+		placeAssets(entry, directory + "/hive", from, written, errors)
 	} else {
 		vendor.clearThree(directory + "/hive")
 	}
@@ -270,6 +271,73 @@ proc put(directory: Str, name: Str, contents: Str, written: mut Str[dyn], errors
 		return
 	}
 	append(written, full)
+}
+
+/// The program's own `assets/` directory, copied into the build so the Go
+/// toolchain can take it into the executable.
+///
+/// It goes in beside three.js and for the same reason: a scene that names a
+/// recording has to *have* it, and a built Hive program is one file. What is
+/// under `assets/` is the program's own business — nothing here reads it, and
+/// nothing here has an opinion about what it is for — so the tree is copied
+/// whole and `hive.ui.scene` answers at run time for whatever a scene turns out
+/// to name.
+///
+/// A program with no such directory writes no `hive/assets.go`, embeds nothing,
+/// and is exactly the size it was. That is why the file is generated rather than
+/// carried in the runtime: `//go:embed` cannot be told to embed nothing, so what
+/// decides is whether the declaration is written at all.
+proc placeAssets(entry: Str, into: Str, from: Int, written: mut Str[dyn], errors: mut diag.Diagnostic[dyn]): void {
+	source := paths.joinPath(paths.dirOf(entry), "assets")
+	if hive.file.exists(source) == false {
+		return
+	}
+	progress.step(from, "assets")
+	if copied(source, paths.joinPath(into, "assets"), errors) == 0 {
+		return
+	}
+	put(into, "assets.go", runtime.assetsSource() + "\n", written, errors)
+}
+
+/// One directory copied into another, everything under it with it. The answer is
+/// how many files landed, and nought means there was nothing to embed — which is
+/// not the same as nothing being there, because an empty directory is not
+/// something `//go:embed` will take.
+proc copied(from: Str, to: Str, errors: mut diag.Diagnostic[dyn]): Int {
+	names := hive.file.list(from)
+	if names is Result.Error(why) {
+		append(errors, diag.about(from, "cannot read `{from}`: {why.message}"))
+		return 0
+	}
+	if hive.file.makeDir(to) is Result.Error(why) {
+		append(errors, diag.about(to, "cannot make `{to}`: {why.message}"))
+		return 0
+	}
+	mut Int many = 0
+	if names is Result.Ok(here) {
+		for each name in here {
+			// `//go:embed` on a directory skips anything whose name begins with a dot
+			// or an underscore, so copying one in would be copying something nothing
+			// could ever read back out.
+			if text.startsWith(name, ".") || text.startsWith(name, "_") {
+				continue
+			}
+			source := paths.joinPath(from, name)
+			target := paths.joinPath(to, name)
+			// A directory is a thing that can be listed. There is no other question
+			// being asked here, and no other answer that would change what happens.
+			if hive.file.list(source) is Result.Ok(_) {
+				many = many + copied(source, target, errors)
+				continue
+			}
+			if hive.file.copy(source, target) is Result.Error(why) {
+				append(errors, diag.about(source, "cannot copy `{source}`: {why.message}"))
+				continue
+			}
+			many = many + 1
+		}
+	}
+	return many
 }
 
 /// What running the Go toolchain came to.

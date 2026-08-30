@@ -79,8 +79,17 @@ func typeOfTail(env: Env, e: ast.Expr): types.Ty {
 	} else if e is ast.Expr.Member(subject, field) {
 		return memberType(env, subject, field)
 	} else if e is ast.Expr.Index(subject, _) {
+		// A `Str` is a sequence of characters, so one position of it is a `Str`
+		// of one character. There is no character type to answer with, and a
+		// one-character `Str` is what `split(s, "")` already hands out.
+		if typeOf(env, subject) is types.Ty.TStr {
+			return types.Ty.TStr()
+		}
 		return types.elementOf(typeOf(env, subject))
 	} else if e is ast.Expr.Slice(subject, _, _) {
+		if typeOf(env, subject) is types.Ty.TStr {
+			return types.Ty.TStr()
+		}
 		// A slice's length is whatever the two bounds worked out to, which is not
 		// a promise the type can keep — so what comes back is dynamic.
 		return types.Ty.TVec(types.elementOf(typeOf(env, subject)), ast.Dim.Dynamic())
@@ -466,7 +475,7 @@ func builtinResult(env: Env, name: Str, argTypes: types.Ty[], args: ast.Arg[]): 
 	if name == "drop" {
 		return types.Ty.TVec(types.elementOf(subject), ast.Dim.Dynamic())
 	}
-	if name == "join" {
+	if name == "join" || name == "replaceFirst" || name == "replaceAll" {
 		return types.Ty.TStr()
 	}
 	if name == "split" || name == "row" || name == "column" {
@@ -510,6 +519,7 @@ func isBuiltin(name: Str): Bool {
 		|| name == "split" || name == "indexOf" || name == "row"
 		|| name == "column" || name == "map" || name == "filter"
 		|| name == "filterMap" || name == "sort"
+		|| name == "replaceFirst" || name == "replaceAll"
 }
 
 // --- `with` and `using` ------------------------------------------------------
@@ -621,6 +631,11 @@ func boundHoles(env: Env, parts: token.StrPart[], at: Int): Env {
 		part := parts[at]
 		if part is token.StrPart.Code(source) {
 			return boundHoles(bound(env, text.trim(source), types.Ty.TStr()), parts, at + 1)
+		}
+		// A hole binds the text it spans whether or not it said what that text
+		// has to look like.
+		if part is token.StrPart.Hole(name, _) {
+			return boundHoles(bound(env, name, types.Ty.TStr()), parts, at + 1)
 		}
 		return boundHoles(env, parts, at + 1)
 	}

@@ -566,6 +566,14 @@ proc checkReturn(c: mut Check, env: infer.Env, value: ast.Expr): void {
 proc checkAssign(c: mut Check, env: infer.Env, target: ast.Expr, value: ast.Expr): void {
 	checkExpr(c, env, value)
 	checkExpr(c, env, target)
+	// A `Str` is read by position but never written by one. It is a value rather
+	// than storage — the same as an `Int` — so there is nothing behind `s[0]` to
+	// assign into, and a character written over another of a different width
+	// would move every character after it.
+	if writesIntoStr(env, target) {
+		report(c, "a `Str` cannot be assigned into by position: it is a value rather than storage, and characters are not all the same width, so writing one would move every character after it. Build the new string instead — `s = s[:i - 1] + c + s[i + 1:]`")
+		return
+	}
 	root := rootName(target)
 	if root == "" {
 		report(c, "this is not something that can be assigned to: a target is a name, or a path into one through its fields and elements")
@@ -576,6 +584,15 @@ proc checkAssign(c: mut Check, env: infer.Env, target: ast.Expr, value: ast.Expr
 		return
 	}
 	fits(c, infer.typeOf(env, target), infer.typeOf(env, value), "the assignment to `{root}`")
+}
+
+// Whether a target writes through a `Str`'s subscript, at any depth: `s[0]` and
+// `rows[2][1]` where the row is a `Str` are the same mistake.
+func writesIntoStr(env: infer.Env, target: ast.Expr): Bool {
+	if target is ast.Expr.Index(subject, _) {
+		return infer.typeOf(env, subject) is types.Ty.TStr
+	}
+	return false
 }
 
 // The name a target is a path into. `v`, `v[0]`, `rec.f` and `b.items[2]` all
@@ -660,14 +677,11 @@ proc checkExpr(c: mut Check, env: infer.Env, e: ast.Expr): void {
 	}
 }
 
-// A `Str` has no subscript, and neither has a map. Both refuse for the same
-// reason: the syntax would have to mean something the value cannot answer.
+// A vector and a `Str` both have a subscript; a map does not. A map refuses
+// because the syntax would have to mean something the value cannot answer:
+// there is no first pair to ask for.
 proc checkIndexable(c: mut Check, env: infer.Env, subject: ast.Expr): void {
 	ty := infer.typeOf(env, subject)
-	if ty is types.Ty.TStr {
-		report(c, "a `Str` has no subscript: `[...]` addresses bytes while a `Str` is a sequence of characters, so the two never line up and a byte from the middle of a character is not text. Take it apart with `split(s, sep)`, find in it with `indexOf(s, sub)`, or match it with a string pattern")
-		return
-	}
 	if ty is types.Ty.TMap(_, _) {
 		report(c, "a map is reached by key, never by position: `hive.map.get(m, key)` is what this wants")
 	}
@@ -1117,6 +1131,12 @@ proc checkBuiltinCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]):
 		if arity(c, name, args, 2) {
 			fits(c, types.Ty.TStr(), typeOfArg(c, env, args, 0), "what `split` takes apart")
 			fits(c, types.Ty.TStr(), typeOfArg(c, env, args, 1), "the separator `split` cuts on")
+		}
+	} else if name == "replaceFirst" || name == "replaceAll" {
+		if arity(c, name, args, 3) {
+			fits(c, types.Ty.TStr(), typeOfArg(c, env, args, 0), "what `{name}` rewrites")
+			fits(c, types.Ty.TStr(), typeOfArg(c, env, args, 1), "what `{name}` looks for")
+			fits(c, types.Ty.TStr(), typeOfArg(c, env, args, 2), "what `{name}` puts in its place")
 		}
 	} else if name == "indexOf" {
 		checkIndexOf(c, env, args)

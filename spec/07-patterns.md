@@ -74,7 +74,7 @@ if command is ["move", direction, ...steps] {
 ## 7.4 String patterns
 
 A string pattern is a **template**: literal text that must match verbatim, plus
-`{name}` holes that bind the text spanning each hole.
+holes that bind the text spanning each one.
 
 ```hive
 path is "/health"                        // a hole-less pattern: an exact match
@@ -85,15 +85,66 @@ path is "/files/{rest}"                  // a trailing hole runs to the end
 * The template must cover the **whole** string.
 * Matching is **non-greedy**, so a hole between two `/` never swallows a `/`.
 * A hole with no literal after it runs to the end of the string.
-* Non-greedy means **first match, no backtracking**. A hole stops at the first
-  occurrence of the literal that follows it, and if the rest of the template
-  cannot then cover the rest of the string, the match simply fails — it does not
-  reconsider where the hole ended. So `s is "({inner}))"` binds `inner` up to the
-  *first* `))`, which is the wrong one whenever the text holds a nested pair.
-  A template with a hole followed by punctuation that repeats is a template to
-  avoid.
-* Holes must be plain **binding names**, and two holes may not sit side by side —
-  the split point would be ambiguous. Both are compile errors.
+* Holes must be plain **binding names**, and two **open** holes may not sit side
+  by side — the split point would be ambiguous. Both are compile errors.
+
+### A hole may say what it takes
+
+`{name}` takes any text. `{name is (regex)}` takes only text matching the regex,
+and binds it the same way:
+
+```hive
+if line is "{user is (\w+)}@{host is ([\w.]+)}" {
+	echo "{user} at {host}"
+}
+
+if path is "/api/v{version is (\d+)}/{rest}" {
+	echo "version {version}, then {rest}"
+}
+```
+
+The two are **one construct**, and everything above holds for both: the template
+covers the whole string, a hole binds a `Str`, and the bindings are in scope for
+the rest of the condition and the branch body. The only difference is what the
+hole accepts — so a `{name}` and a `{name is (...)}` may sit side by side, because
+the second says for itself where it ends.
+
+**Nothing inside the parentheses is escaped by the string.** A hole is recognised
+by that exact shape, so the `\` and the `{` between them belong to the regex:
+`{year is (\d{4})}` is four digits, not an interpolation of `4`. That is also why
+a hole is written in an ordinary `"..."` pattern and never a backtick one — a
+backtick string has no holes at all, and one written there would match those
+characters literally, which the compiler refuses rather than allows.
+
+**The regex is read at compile time**, so a malformed one is a compile error
+naming what is wrong with it:
+
+```hive
+if s is "{a is (a{2,1})}" { }   // error: `{2,1}` counts down
+if s is "{a is ((?=x))}" { }    // error: lookaround is not part of this syntax
+```
+
+The syntax is Go's, which is RE2: there is **no backreference and no lookaround**,
+because an expression that cannot backtrack is one whose running time is a fact
+about the text's length rather than about the pattern. Both are refused by name.
+
+A group inside a hole **groups and does not capture** — the hole is already the
+binding, so `(a)(b)` there means "an `a` then a `b`". A named group is a compile
+error for the same reason: the hole's own name is what the text binds to.
+
+### One matcher
+
+A template is compiled to a single anchored expression, once, when the program
+starts — whichever kind of hole it holds. An open `{name}` is the shortest run of
+any text that lets the **whole** template match, so a hole is reconsidered when
+what follows it does not fit:
+
+```hive
+"(a(b))" is "({inner}))"     // matches; `inner` is "a(b"
+```
+
+Two templates that come to the same expression share the one compiled pattern,
+and a program that writes no string pattern links no matcher at all.
 
 ## 7.5 Exhaustiveness
 

@@ -1,0 +1,172 @@
+// Tests for `src/regex`.
+//
+// The module answers two things about a hole's regex — whether it is well
+// formed, and what Go should compile for it — so every test here asks one of
+// those. A rejection is asserted on the opening of its message rather than every
+// word, so the wording can improve without a test being rewritten.
+import ../src/regex
+import ../src/text
+
+// What `pattern` compiles to, or `""` if it was refused.
+proc go(pattern: Str): Str {
+	if regex.check(pattern) is Result.Ok(compiled) {
+		return compiled
+	}
+	return ""
+}
+
+// Why `pattern` was refused, or `""` if it was not.
+proc why(pattern: Str): Str {
+	if regex.check(pattern) is Result.Error(problem) {
+		return problem
+	}
+	return ""
+}
+
+func opens(got: Str, wanted: Str): Bool {
+	return text.startsWith(got, wanted)
+}
+
+// --- What goes through unchanged ---------------------------------------------
+
+test "an ordinary pattern comes back as it went in" {
+	assert go("\\w+") == "\\w+"
+	assert go("[\\w.]+") == "[\\w.]+"
+	assert go("a|b|c") == "a|b|c"
+	assert go(".*") == ".*"
+	assert go("[^]]*") == "[^]]*"
+	assert go("[a-z0-9_-]") == "[a-z0-9_-]"
+}
+
+test "every counted repeat spelling is read" {
+	assert go("a\{2}") == "a\{2}"
+	assert go("a\{2,}") == "a\{2,}"
+	assert go("a\{2,4}") == "a\{2,4}"
+	assert go("a\{2,4}?") == "a\{2,4}?"
+	// A `{` that is not a count is the character itself, which is what the Go
+	// regexp package makes of it too.
+	assert go("x\{nope}") == "x\{nope}"
+}
+
+test "the lazy and greedy forms of every quantifier" {
+	assert go("a*?") == "a*?"
+	assert go("a+?") == "a+?"
+	assert go("a??") == "a??"
+}
+
+test "flags are kept, set globally or over a group" {
+	assert go("(?i)hello") == "(?i)hello"
+	assert go("(?is)hello") == "(?is)hello"
+	assert go("(?i:hello)") == "(?i:hello)"
+	assert go("(?i)a|b") == "(?i)a|b"
+}
+
+// --- The one rewrite ----------------------------------------------------------
+
+test "a capturing group becomes a grouping one" {
+	// The template's holes are its capture groups, one each. An inner group that
+	// captured as well would shift every one of them along.
+	assert go("(a)") == "(?:a)"
+	assert go("(a)(b)") == "(?:a)(?:b)"
+	assert go("(a(b))") == "(?:a(?:b))"
+	assert go("(ab|cd)+") == "(?:ab|cd)+"
+}
+
+test "a group that already declines to capture is left alone" {
+	assert go("(?:ab)") == "(?:ab)"
+	assert go("(?:a(b))") == "(?:a(?:b))"
+}
+
+test "a parenthesis inside a character class is text, not a group" {
+	assert go("[()]+") == "[()]+"
+	assert go("[(]") == "[(]"
+	// And an escaped one is text too.
+	assert go("\\(a\\)") == "\\(a\\)"
+}
+
+// --- What is refused ----------------------------------------------------------
+
+test "an unclosed group is named" {
+	assert opens(why("(unclosed"), "this `(` is never closed")
+	assert opens(why("a(b|c"), "this `(` is never closed")
+}
+
+test "a closing parenthesis with nothing open is named" {
+	assert opens(why("closed)"), "this `)` closes a group that was never opened")
+}
+
+test "an unclosed character class is named" {
+	assert opens(why("[abc"), "this `[` is never closed")
+}
+
+test "a repeat with nothing before it is named" {
+	assert opens(why("*a"), "this `*` has nothing before it to repeat")
+	assert opens(why("+a"), "this `+` has nothing before it to repeat")
+	assert opens(why("(*a)"), "this `*` has nothing before it to repeat")
+	assert opens(why("a|*b"), "this `*` has nothing before it to repeat")
+	// Go reads a leading `\{2}` as a repeat with no argument and refuses it, so
+	// this refuses it too: a pattern that got past here has to be one Go compiles.
+	assert opens(why("\{2}"), "this `\{...}` has nothing before it to repeat")
+	// A `\{` that opens no count is text, which is also what Go makes of it.
+	assert why("x\{nope}") == ""
+	assert why("a\{}") == ""
+}
+
+test "a repeat of a repeat says nothing the first one did not" {
+	assert opens(why("a**"), "this `*` repeats a repeat")
+	assert opens(why("a+*"), "this `*` repeats a repeat")
+}
+
+test "a count that runs backwards is named, with both bounds" {
+	assert opens(why("a\{2,1}"), "`\{2,1}` counts down")
+	assert why("a\{1,2}") == ""
+	assert why("a\{2,2}") == ""
+}
+
+test "a backreference is refused by name, because a match here never backtracks" {
+	assert opens(why("(a)\\1"), "`\\1` is a backreference")
+	// `\0` is not one, so it is left to mean what it means.
+	assert why("a\\0") == ""
+}
+
+test "lookaround is refused by name, and so is lookbehind" {
+	assert opens(why("(?=a)"), "lookaround (`(?=`) is not part of this regex syntax")
+	assert opens(why("(?!a)"), "lookaround (`(?!`) is not part of this regex syntax")
+	assert opens(why("(?<=a)"), "lookbehind (`(?<=`) is not part of this regex syntax")
+	assert opens(why("(?<!a)"), "lookbehind (`(?<!`) is not part of this regex syntax")
+}
+
+test "a named group inside a hole is refused: the hole is already the name" {
+	assert opens(why("(?<year>\\d)"), "a named group is not written inside a hole")
+	assert opens(why("(?P<year>\\d)"), "a named group is not written inside a hole")
+}
+
+test "a trailing backslash has nothing to escape" {
+	assert opens(why("trailing\\"), "this `\\` is the last character")
+}
+
+test "a flag letter no regex has is named" {
+	assert opens(why("(?q)x"), "`q` is not one of the flags a regex takes")
+	assert opens(why("(?)x"), "`(?)` says nothing")
+}
+
+test "an empty regex matches nothing, so it is refused" {
+	assert opens(why(""), "this hole's regex is empty")
+}
+
+// --- Literal text as a regex --------------------------------------------------
+
+test "quoteMeta escapes what a regex reads as syntax, and nothing else" {
+	assert regex.quoteMeta("/users/") == "/users/"
+	assert regex.quoteMeta("a.b") == "a\\.b"
+	assert regex.quoteMeta("(a)") == "\\(a\\)"
+	assert regex.quoteMeta("a+b*c?") == "a\\+b\\*c\\?"
+	assert regex.quoteMeta("2026-08-29") == "2026\\-08\\-29"
+}
+
+test "quoteMeta leaves a character outside ASCII alone" {
+	// A backslash in front of one is not a valid escape, so escaping it would
+	// make a pattern that will not compile out of one that would.
+	assert regex.quoteMeta("café") == "café"
+	assert regex.quoteMeta("naïve.") == "naïve\\."
+}

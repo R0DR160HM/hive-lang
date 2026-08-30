@@ -56,7 +56,9 @@ func showKind(k: token.Kind): Str {
 func showParts(parts: token.StrPart[]): Str {
 	mut Str[dyn] out = []
 	for each p in parts {
-		if p is token.StrPart.Literal(t) {
+		if p is token.StrPart.Hole(name, pattern) {
+			append(out, "hole:{name}={pattern}")
+		} else if p is token.StrPart.Literal(t) {
 			append(out, "lit:{t}")
 		} else if p is token.StrPart.Code(source) {
 			append(out, "code:{source}")
@@ -206,6 +208,51 @@ test "two interpolations side by side contribute no empty literal between them" 
 test "an interpolation holding braces of its own is read whole" {
 	got := dump("\"\{f(\{x})}\"")
 	assert got == "parts[code:f(\{x})] eof"
+}
+
+// --- Regex holes -------------------------------------------------------------
+
+test "a regex hole is captured raw, so its backslashes are the regex's" {
+	got := dump("\"\{user is (\\w+)}\"")
+	assert got == "parts[hole:user=\\w+] eof"
+}
+
+test "braces inside a hole's regex need no escaping" {
+	// The hole is recognised by its exact shape, so a `\{` inside the
+	// parentheses is a repeat count and never the start of an interpolation.
+	got := dump("\"\{year is (\\d\{4})}\"")
+	assert got == "parts[hole:year=\\d\{4}] eof"
+}
+
+test "a hole sits among literal text and ordinary interpolations" {
+	got := dump("\"a\{h is (x)}b\"")
+	assert got == "parts[lit:a|hole:h=x|lit:b] eof"
+	both := dump("\"\{a}-\{b is (y)}\"")
+	assert both == "parts[code:a|lit:-|hole:b=y] eof"
+}
+
+test "parentheses inside the regex are counted, through classes and escapes" {
+	assert dump("\"\{a is ((x)(y))}\"") == "parts[hole:a=(x)(y)] eof"
+	assert dump("\"\{a is ([)}]+)}\"") == "parts[hole:a=[)}]+] eof"
+	assert dump("\"\{a is (\\))}\"") == "parts[hole:a=\\)] eof"
+}
+
+test "anything that is not exactly the hole shape is still an interpolation" {
+	// The `is` has to be there, with a `(` after it, and the name has to be a
+	// plain binding name — so an ordinary expression reads on as it always did.
+	assert dump("\"\{a is b}\"") == "parts[code:a is b] eof"
+	assert dump("\"\{a.b is (x)}\"") == "parts[code:a.b is (x)] eof"
+	assert dump("\"\{isolated}\"") == "parts[code:isolated] eof"
+}
+
+test "a hole whose regex never closes says so, rather than failing to lex" {
+	assert errorsOf("\"\{a is ((x)}\"") == "this hole's regex is never closed: `\{a is (` opens one and nothing closes it"
+	// A hole never spans lines, so a newline inside one is the same mistake said
+	// where the reader is looking.
+	// The string really is unterminated as well, so both are said — the hole
+	// first, because that is the mistake the reader made.
+	assert errorsOf("\"\{a is ((x)}\"\n") == "this hole's regex is never closed — it runs to the end of the line | unterminated string literal"
+	assert errorsOf("\"\{a is (x)y}\"") == "this hole closes its regex and then goes on: a `\{a is (...)}` ends at the `}` right after the `)`"
 }
 
 test "an unterminated string is reported against the line it opened on" {

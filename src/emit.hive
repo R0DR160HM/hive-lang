@@ -22,6 +22,7 @@ import ./ast
 import ./diag
 import ./infer
 import ./paths
+import ./regex
 import ./runtime
 import ./show
 import ./stdlib
@@ -105,6 +106,11 @@ type Emit {
 	/// author wrote, and this is what tells that apart from the clone helpers and
 	/// the atom table the compiler wrote beside it.
 	spans: Str[dyn]
+	/// The regexes a string pattern's holes asked for, as the Go to compile.
+	/// Each becomes one package-level variable, so a pattern is compiled once
+	/// when the program starts and never again — and two patterns that read the
+	/// same share the one.
+	patterns: Str[dyn]
 	/// The line the declaration being emitted was declared on. It is the only
 	/// position a flattened program can offer, and a message with none at all is
 	/// one an editor cannot jump to.
@@ -115,7 +121,7 @@ type Emit {
 /// Emit a whole program.
 proc emitModule(m: ast.Module): Emitted {
 	t := types.tableOf(m)
-	mut Emit em = Emit(t, [], 0, ["Nil"], [], [], [], [], [], [], [], 0, [], [], [], [], [], false, false, -1, [], 0, [])
+	mut Emit em = Emit(t, [], 0, ["Nil"], [], [], [], [], [], [], [], 0, [], [], [], [], [], false, false, -1, [], [], 0, [])
 
 	line(em, "package main")
 	line(em, "")
@@ -154,6 +160,7 @@ proc emitModule(m: ast.Module): Emitted {
 	// ask has been walked. A row mapper is the same story.
 	emitRows(em)
 	emitCodecs(em)
+	emitPatterns(em)
 	// The table is only complete now. An atom is numbered when the walk reaches
 	// it, and a `proc` below `main` is reached long after main's own body was
 	// written — so the line written there is written again from here, rather than
@@ -1088,28 +1095,96 @@ proc vectorGuard(em: mut Emit, env: infer.Env, written: Str, holder: Str, subjec
 // non-greedily by the runtime. The parts travel as two vectors — which piece is
 // a literal, and what it says — because that is the whole of what a template is.
 proc templateGuard(em: mut Emit, env: infer.Env, written: Str, holder: Str, parts: token.StrPart[]): infer.Env {
-	mut Str[dyn] kinds = []
-	mut Str[dyn] texts = []
-	mut Str[dyn] holes = []
-	for each part in parts {
-		if part is token.StrPart.Literal(t) {
-			append(kinds, "true")
-			append(texts, quoted(t))
-		} else if part is token.StrPart.Code(source) {
-			append(kinds, "false")
-			append(texts, "\"\"")
-			append(holes, text.trim(source))
-		}
-	}
 	mut ok := fresh(em, "ok")
-	open(em, "if " + holder + ", " + ok + " := hive.MatchTemplate(" + written + ", []bool\{" + join(kinds, ", ") + "}, []string\{" + join(texts, ", ") + "}); " + ok + " \{")
+	open(em, "if " + holder + ", " + ok + " := " + templateMatch(em, written, parts) + "; " + ok + " \{")
 	line(em, "_ = " + holder)
 	mut i := 0
+	holes := holeNames(parts)
 	for each hole in holes {
 		bind(em, hole, holder + "[{i}]")
 		i = i + 1
 	}
 	return infer.bindOne(env, holes, types.Ty.TStr())
+}
+
+/// The call that matches `written` against the template, and hands back what its
+/// holes bound.
+///
+/// **Every** template is one compiled expression, whichever kind of hole it
+/// holds. A hole that says what it takes and a hole that takes anything are the
+/// same construct with the same rules — one matcher, so that what a template
+/// means never depends on which sort of hole is in it.
+proc templateMatch(em: mut Emit, written: Str, parts: token.StrPart[]): Str {
+	useModule(em, "regex")
+	return "hive.MatchPattern(" + written + ", " + patternVar(em, wholePattern(parts)) + ")"
+}
+
+/// Every hole's name, in the order the template writes them — which is the order
+/// the matcher answers in.
+func holeNames(parts: token.StrPart[]): Str[dyn] {
+	mut Str[dyn] out = []
+	for each part in parts {
+		if part is token.StrPart.Code(source) {
+			append(out, text.trim(source))
+		} else if part is token.StrPart.Hole(name, _) {
+			append(out, name)
+		}
+	}
+	return out
+}
+
+/// The whole template as one regex: literal text quoted so it means itself, an
+/// open hole as the shortest run of anything, and a hole that says what it takes
+/// as what it said. Anchored at both ends, because a template covers the whole
+/// string.
+///
+/// `\{name}` and `\{name is (...)}` differ here by exactly one thing — what goes
+/// between the parentheses — which is the whole of the difference between them.
+///
+/// `(?s)` leads it so that `.` covers a newline too — an open hole spans whatever
+/// text is there, and text with a line break in it is still text.
+func wholePattern(parts: token.StrPart[]): Str {
+	mut Str[dyn] out = ["(?s)\\A"]
+	for each part in parts {
+		if part is token.StrPart.Literal(t) {
+			append(out, regex.quoteMeta(t))
+		} else if part is token.StrPart.Code(_) {
+			append(out, "(.*?)")
+		} else if part is token.StrPart.Hole(_, pattern) {
+			append(out, "(" + pattern + ")")
+		}
+	}
+	append(out, "\\z")
+	return join(out, "")
+}
+
+/// The package-level variable holding one compiled pattern, named after where it
+/// sits. Two templates that come to the same regex share one variable: a pattern
+/// is a value, and compiling it twice would only cost the program its startup.
+proc patternVar(em: mut Emit, pattern: Str): Str {
+	mut prefix := "hivePattern"
+	if em.inTest {
+		// The tests are a second file in the same package, so they cannot name
+		// their variables the way the program named its own.
+		prefix = "hiveTestPattern"
+	}
+	if indexOf(em.patterns, pattern) is Result.Ok(at) {
+		return prefix + "{at}"
+	}
+	append(em.patterns, pattern)
+	return prefix + "{len(em.patterns) - 1}"
+}
+
+/// The compiled patterns, written out once the whole program has been walked —
+/// which is the first moment they are all known.
+proc emitPatterns(em: mut Emit): void {
+	if len(em.patterns) == 0 {
+		return
+	}
+	blank(em)
+	for each pattern in em.patterns {
+		line(em, "var " + patternVar(em, pattern) + " = hive.CompilePattern(" + quoted(pattern) + ")")
+	}
 }
 
 // A binding Hive made and the body may not read. Go insists a local is used, so
@@ -1159,6 +1234,11 @@ proc exprTail(em: mut Emit, env: infer.Env, e: ast.Expr, want: types.Ty): Str {
 	} else if e is ast.Expr.Member(subject, field) {
 		return member(em, env, subject, field)
 	} else if e is ast.Expr.Index(subject, index) {
+		// A `Str` is addressed by character and Go addresses it by byte, so one
+		// position of it is a walk rather than a subscript.
+		if infer.typeOf(env, subject) is types.Ty.TStr {
+			return "hive.IndexStr(" + expr(em, env, subject, types.Ty.TStr()) + ", " + expr(em, env, index, types.Ty.TInt()) + ")"
+		}
 		return expr(em, env, subject, types.Ty.TUnknown()) + "[" + expr(em, env, index, types.Ty.TInt()) + "]"
 	} else if e is ast.Expr.Slice(subject, low, high) {
 		return slice(em, env, subject, low, high)
@@ -1349,6 +1429,15 @@ proc slice(em: mut Emit, env: infer.Env, subject: ast.Expr, low: ast.Expr, high:
 	} else {
 		lowText = expr(em, env, low, types.Ty.TInt())
 	}
+	// A `Str`'s bounds count characters, so both ends have to be found by walking
+	// it. The open-ended form is its own call rather than a length written out
+	// here, because writing one would evaluate the subject twice.
+	if infer.typeOf(env, subject) is types.Ty.TStr {
+		if high is ast.Expr.Absent {
+			return "hive.SliceStrFrom(" + written + ", " + lowText + ")"
+		}
+		return "hive.SliceStr(" + written + ", " + lowText + ", " + expr(em, env, high, types.Ty.TInt()) + ")"
+	}
 	if high is ast.Expr.Absent {
 		return written + "[" + lowText + ":]"
 	}
@@ -1499,18 +1588,7 @@ proc standaloneMatch(em: mut Emit, env: infer.Env, subject: ast.Expr, pattern: a
 		return "func() bool \{ _, ok := (" + written + ").(" + goVariant(head, variant) + "); return ok }()"
 	}
 	if pattern is ast.Pattern.StrTemplate(parts) {
-		mut Str[dyn] kinds = []
-		mut Str[dyn] texts = []
-		for each part in parts {
-			if part is token.StrPart.Literal(t) {
-				append(kinds, "true")
-				append(texts, quoted(t))
-			} else {
-				append(kinds, "false")
-				append(texts, "\"\"")
-			}
-		}
-		return "func() bool \{ _, ok := hive.MatchTemplate(" + written + ", []bool\{" + join(kinds, ", ") + "}, []string\{" + join(texts, ", ") + "}); return ok }()"
+		return "func() bool \{ _, ok := " + templateMatch(em, written, parts) + "; return ok }()"
 	}
 	fail(em, "a vector pattern outside an `if` condition binds nothing, so it has no value to give")
 	return "false"
@@ -1562,6 +1640,11 @@ proc boundsGuard(em: mut Emit, env: infer.Env, left: ast.Expr, right: ast.Expr):
 				if zero is ast.Expr.IntLit(zeroValue) {
 					if zeroValue == 0 && sameExpr(index, again) {
 						if lengthOf(length) is Result.Ok(vector) {
+							// A `Str` is guarded by character, the way it is
+							// indexed, so it has its own of these.
+							if infer.typeOf(env, vector) is types.Ty.TStr {
+								return "hive.InRangeStr(" + expr(em, env, index, types.Ty.TInt()) + ", " + expr(em, env, vector, types.Ty.TStr()) + ")"
+							}
 							return "hive.InRange(" + expr(em, env, index, types.Ty.TInt()) + ", " + expr(em, env, vector, types.Ty.TUnknown()) + ")"
 						}
 					}
@@ -2013,6 +2096,11 @@ proc builtin(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[], want: typ
 	}
 	if name == "split" {
 		return "hive.Split(" + a + ", " + expr(em, env, argExpr(args, 1), types.Ty.TStr()) + ")"
+	}
+	if name == "replaceFirst" || name == "replaceAll" {
+		from := expr(em, env, argExpr(args, 1), types.Ty.TStr())
+		to := expr(em, env, argExpr(args, 2), types.Ty.TStr())
+		return "hive." + text.capitalise(name) + "(" + a + ", " + from + ", " + to + ")"
 	}
 	if name == "indexOf" {
 		if firstType is types.Ty.TStr {
@@ -3548,7 +3636,7 @@ proc emitTests(m: ast.Module, atoms: Str[], codecs: Str[]): Str {
 	t := types.tableOf(m)
 	// The codecs `main.go` already wrote are seeded rather than written again:
 	// the two files are one Go package.
-	mut Emit em = Emit(t, [], 0, copiedNames(atoms), [], [], [], [], lentFuncs(t, m.decls), [], copiedNames(codecs), 0, [], [], [], [], [], true, false, -1, [], 0, [])
+	mut Emit em = Emit(t, [], 0, copiedNames(atoms), [], [], [], [], lentFuncs(t, m.decls), [], copiedNames(codecs), 0, [], [], [], [], [], true, false, -1, [], [], 0, [])
 	written := len(codecs)
 	mut found := false
 	for each d in m.decls {
@@ -3583,8 +3671,9 @@ proc emitTests(m: ast.Module, atoms: Str[], codecs: Str[]): Str {
 	}
 	close(em, "}")
 	// A codec only a test asked for is written here, beside the tests that
-	// wanted it.
+	// wanted it. A pattern only a test used is the same story.
 	emitCodecsFrom(em, written)
+	emitPatterns(em)
 	return join(em.out, "\n") + "\n"
 }
 
