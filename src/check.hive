@@ -10,9 +10,9 @@
 // whose author would rather hear about six than about the first one, and none of
 // these depends on the others having passed.
 //
-// The pass runs on a **flattened** module, whose nodes carry no position — so a
-// message here names the declaration it is about rather than a line. That is the
-// whole of what flattening costs, and it is written down in the spec.
+// The pass runs on a **flattened** module, whose nodes carry no position, so a
+// message here names the declaration it is about rather than a line. Spec 17.3
+// records that as the limit it is.
 import ./ast
 import ./diag
 import ./infer
@@ -25,8 +25,7 @@ type Check {
 	errors: diag.Diagnostic[dyn]
 	/// The declaration being walked, which is what a message names.
 	inside: Str
-	/// The line it was declared on, which is the best position a flattened tree
-	/// can offer.
+	/// The line it was declared on — the best position a flattened tree offers.
 	line: Int
 	/// Whether the body is a `func` — which may not call a `proc`.
 	pure: Bool
@@ -74,9 +73,8 @@ proc checkDecl(c: mut Check, env: infer.Env, d: ast.Decl): void {
 	} else if d is ast.Decl.QueryDecl(name, params, result, sql, line) {
 		c.inside = name
 		c.line = line
-		// A query is a `func` whose body happens to be SQL: it may not write to
-		// storage its caller can see, and there is nothing in a query body that
-		// could.
+		// A query is a `func` whose body happens to be SQL: nothing in one could
+		// write to storage its caller can see.
 		c.pure = true
 		c.result = types.resolve(env.table, result)
 		c.inTest = false
@@ -95,8 +93,8 @@ proc checkDecl(c: mut Check, env: infer.Env, d: ast.Decl): void {
 	}
 }
 
-// A query's parameters go into scope, and then the two things in its body that
-// are not text are checked like the expressions they are: a bound value, and the
+// A query's parameters go into scope, then the two things in its body that are
+// not text are checked as the expressions they are: a bound value, and the
 // condition on an optional predicate.
 proc checkQuery(c: mut Check, env: infer.Env, params: ast.Param[], result: ast.TypeExpr, sql: ast.SqlPart[]): void {
 	mut Str[dyn] seen = []
@@ -144,15 +142,13 @@ proc checkRowType(c: mut Check, declared: types.Ty): void {
 // A query that says what its rows *are* may not then ask for whatever the table
 // happens to have.
 //
-// `SELECT *` says neither how many columns come back nor what they are called, so
-// nothing here and nothing in the emitter can line them up against the fields —
-// and what it stands for changes the day somebody adds a column to the table,
-// which turns a query that compiled and worked into rows that no longer fit,
-// reported at run time, in a program nobody edited.
+// `SELECT *` says neither how many columns come back nor what they are called,
+// so nothing can line them up against the fields — and what it stands for
+// changes the day somebody adds a column, turning a query that worked into rows
+// that no longer fit, reported at run time, in a program nobody edited.
 //
-// The rule is about the **result** and only the result. `count(*)`, `a * 2`, a
-// star inside a subquery and the select list of a `void` statement all still
-// compile, because none of them is what the caller is handed.
+// The rule is about the **result** and only the result: `count(*)`, `a * 2`, a
+// star inside a subquery and a `void` statement's select list all still compile.
 proc checkSelectStar(c: mut Check, declared: types.Ty, sql: ast.SqlPart[]): void {
 	if rowTyped(c.table, declared) == false {
 		return
@@ -164,9 +160,7 @@ proc checkSelectStar(c: mut Check, declared: types.Ty, sql: ast.SqlPart[]): void
 }
 
 // Whether the declared result is one row type per row, as against a single
-// column, a `Table` (which is `Str[dyn][dyn]` and has no fields to disagree
-// with), or a statement. The same shape `checkRowType` accepts, asked as a
-// question rather than reported on.
+// column, a `Table` (which has no fields to disagree with), or a statement.
 func rowTyped(table: types.Table, declared: types.Ty): Bool {
 	if declared is types.Ty.TVec(element, _) {
 		if element is types.Ty.TNamed(name) {
@@ -177,9 +171,8 @@ func rowTyped(table: types.Table, declared: types.Ty): Bool {
 }
 
 // The query's text with its holes filled by something inert. A bound value is a
-// placeholder in the text anyway and an optional predicate only ever appears
-// after the select list, so neither can change what the select list is and both
-// become a token that reads as a value.
+// placeholder anyway, and an optional predicate only appears after the select
+// list, so neither can change what the select list is.
 func sqlText(parts: ast.SqlPart[]): Str {
 	mut Str out = ""
 	for each part in parts {
@@ -209,8 +202,8 @@ func selectsEverything(sql: Str): Bool {
 	cs := text.chars(sql)
 	mut Int depth = 0
 	mut Bool listing = false
-	// The last thing that mattered, which is the whole of how a star that means
-	// every column is told from a star that means times.
+	// The last thing that mattered — how a star meaning every column is told
+	// from a star meaning times.
 	mut Str before = ""
 	mut Int i = 0
 	for ; i < len(cs); {
@@ -245,8 +238,8 @@ func selectsEverything(sql: Str): Bool {
 		} else if text.isAlnum(ch) || ch == "_" {
 			word := text.lower(wordAt(cs, i))
 			i = i + len(word)
-			// Only at the top level: a `SELECT` inside brackets is a subquery's or a
-			// common table expression's, and neither of them decides the result.
+			// Only at the top level: a `SELECT` inside brackets belongs to a
+			// subquery or a CTE, and neither decides the result.
 			if depth == 0 && word == "select" {
 				listing = true
 				before = "select"
@@ -277,10 +270,9 @@ func opensAnItem(before: Str): Bool {
 
 // Past a quoted run, from its opening mark.
 //
-// A doubled quote — `'it''s'` — needs no case of its own: the first run is closed
-// by the first of the pair and the second immediately opens another, so the whole
-// thing is skipped either way. What matters is only that nothing inside is read as
-// SQL.
+// A doubled quote — `'it''s'` — needs no case of its own: the first run closes
+// on the first of the pair and the second immediately opens another, so the whole
+// thing is skipped either way.
 func pastQuoted(cs: Str[], from: Int, mark: Str): Int {
 	mut Int i = from + 1
 	for ; i < len(cs); {
@@ -314,8 +306,8 @@ func pastBlock(cs: Str[], from: Int): Int {
 	return len(cs)
 }
 
-// The word starting here: letters, digits and underscores, which is what a SQL
-// keyword and a column name are both made of.
+// The word starting here: letters, digits and underscores, which a SQL keyword
+// and a column name are both made of.
 func wordAt(cs: Str[], from: Int): Str {
 	mut Str out = ""
 	mut Int i = from
@@ -353,8 +345,8 @@ proc checkSqlGroup(c: mut Check, env: infer.Env, group: ast.SqlGroup): void {
 }
 
 // A bound value is one cell, so it is one of the four things a cell can be. A
-// vector or a record would have to be spliced into text to travel, and splicing
-// is the one thing a query never does.
+// vector or a record would have to be spliced into the text, which a query never
+// does.
 proc checkBoundValue(c: mut Check, env: infer.Env, value: ast.Expr): void {
 	ty := infer.typeOf(env, value)
 	if ty is types.Ty.TStr || ty is types.Ty.TInt || ty is types.Ty.TFloat
@@ -566,10 +558,10 @@ proc checkReturn(c: mut Check, env: infer.Env, value: ast.Expr): void {
 proc checkAssign(c: mut Check, env: infer.Env, target: ast.Expr, value: ast.Expr): void {
 	checkExpr(c, env, value)
 	checkExpr(c, env, target)
-	// A `Str` is read by position but never written by one. It is a value rather
-	// than storage — the same as an `Int` — so there is nothing behind `s[0]` to
-	// assign into, and a character written over another of a different width
-	// would move every character after it.
+	// A `Str` is read by position but never written by one: it is a value rather
+	// than storage, so there is nothing behind `s[0]` to assign into — and a
+	// character written over one of a different width would move every character
+	// after it.
 	if writesIntoStr(env, target) {
 		report(c, "a `Str` cannot be assigned into by position: it is a value rather than storage, and characters are not all the same width, so writing one would move every character after it. Build the new string instead — `s = s[:i - 1] + c + s[i + 1:]`")
 		return
@@ -595,9 +587,8 @@ func writesIntoStr(env: infer.Env, target: ast.Expr): Bool {
 	return false
 }
 
-// The name a target is a path into. `v`, `v[0]`, `rec.f` and `b.items[2]` all
-// answer with the variable at the bottom of them, which is the one whose
-// mutability decides.
+// The name a target is a path into: `v`, `v[0]`, `rec.f` and `b.items[2]` all
+// answer with the variable at the bottom, whose mutability decides.
 func rootName(target: ast.Expr): Str {
 	if target is ast.Expr.Ident(name) { return name }
 	if target is ast.Expr.Member(subject, _) { return rootName(subject) }
@@ -636,8 +627,8 @@ proc checkExpr(c: mut Check, env: infer.Env, e: ast.Expr): void {
 		checkCall(c, env, callee, args)
 	} else if e is ast.Expr.Binary(op, left, right) {
 		checkExpr(c, env, left)
-		// A binding an `is` made is usable in the rest of the same condition
-		// after `&&` — which is the whole reason the two are told apart here.
+		// A binding an `is` made is usable in the rest of the same condition after
+		// `&&`, which is why the two are told apart here.
 		if op is ast.BinOp.And {
 			narrowed := afterCondition(env, left)
 			checkExpr(c, narrowed, right)
@@ -677,9 +668,8 @@ proc checkExpr(c: mut Check, env: infer.Env, e: ast.Expr): void {
 	}
 }
 
-// A vector and a `Str` both have a subscript; a map does not. A map refuses
-// because the syntax would have to mean something the value cannot answer:
-// there is no first pair to ask for.
+// A vector and a `Str` both have a subscript; a map does not — there is no
+// first pair to ask for.
 proc checkIndexable(c: mut Check, env: infer.Env, subject: ast.Expr): void {
 	ty := infer.typeOf(env, subject)
 	if ty is types.Ty.TMap(_, _) {
@@ -703,11 +693,10 @@ proc checkName(c: mut Check, env: infer.Env, name: Str): void {
 	if name == "Result" {
 		return
 	}
-	// A builtin is a name a *call* reaches, and never a value. Several are
-	// overloaded — `len` takes a vector, a `Str` or a map — so which one a bare
-	// reference meant is decided by the argument types, and a value carries
-	// none. It is the same reason a generic cannot be a value, and it has the
-	// same two ways out.
+	// A builtin is a name a *call* reaches, never a value. Several are overloaded
+	// — `len` takes a vector, a `Str` or a map — so which one a bare reference
+	// meant is decided by the argument types, and a value carries none. The same
+	// reason a generic cannot be a value, with the same two ways out.
 	if infer.isBuiltin(name) {
 		report(c, "`{name}` is a builtin, so it cannot be used as a value: several builtins are overloaded, and which one a reference means is decided by the argument types a value does not carry. Call it, or wrap it in a `func` of your own — `func lengthOf(s: Str): Int \{ return hive.len(s) }`")
 		return
@@ -761,8 +750,8 @@ func hasField(t: types.Table, typeName: Str, field: Str): Bool {
 }
 
 // There is no implicit numeric widening anywhere, so an operator's two sides
-// have to be the same type — which is the rule that makes
-// `hive.math.max(0, health)` a compile error rather than a surprise.
+// have to be the same type — the rule that makes `hive.math.max(0, health)` a
+// compile error rather than a surprise.
 proc checkOperands(c: mut Check, env: infer.Env, op: ast.BinOp, left: ast.Expr, right: ast.Expr): void {
 	leftType := infer.typeOf(env, left)
 	rightType := infer.typeOf(env, right)
@@ -802,9 +791,8 @@ proc checkCall(c: mut Check, env: infer.Env, callee: ast.Expr, args: ast.Arg[]):
 }
 
 proc checkNamedCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): void {
-	// A local binding shadows a declaration, which shadows a builtin — so a call
-	// through one is a call of whatever the binding holds, and what it holds
-	// decides whether that means anything.
+	// A local binding shadows a declaration, which shadows a builtin, so a call
+	// through one calls whatever the binding holds.
 	if infer.isBound(env, name) {
 		checkCallableValue(c, env, name)
 		return
@@ -831,9 +819,8 @@ proc checkNamedCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): v
 // What a name has to hold for a call through it to mean something: a callable
 // value, or an address, which a call sends to and waits for the answer of.
 //
-// `TUnknown` is what a pass that has already complained hands back and a type
-// variable is only pinned down in a copy, so neither is complained about here —
-// counting one mistake twice helps nobody.
+// `TUnknown` is what a pass that already complained hands back, and a type
+// variable is only pinned down in a copy, so neither is complained about twice.
 proc checkCallableValue(c: mut Check, env: infer.Env, name: Str): void {
 	ty := infer.typeOf(env, ast.Expr.Ident(name))
 	if ty is types.Ty.TFn(_, _, _) {
@@ -902,15 +889,12 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
 }
 
 // What a standard library call takes, position by position. The table says what
-// each position holds and not how many there are — `hive.math.max` takes two of
-// its three, and an attribute that carries a message says nothing about it — so
-// this checks the positions the table has an answer for and leaves the rest.
+// each position holds and not how many there are, so this checks the positions
+// it has an answer for and leaves the rest.
 //
 // Without it the mismatch reaches the Go toolchain, which reports it against the
-// generated file in terms of Go's own types. `hive.math.max(0, health)` is the
-// one worth catching by name: Hive never widens a number behind your back, and
-// a message that only said `float64` would leave the reader hunting for the
-// conversion they were supposed to have known about.
+// generated file in terms of Go's own types — and a message that only said
+// `float64` would leave the reader hunting for a conversion nobody mentioned.
 proc checkLibraryArguments(c: mut Check, env: infer.Env, module: Str, name: Str, args: ast.Arg[]): void {
 	wanted := stdlib.paramsOf(module, name)
 	mut i := 0
@@ -927,10 +911,7 @@ proc checkLibraryArguments(c: mut Check, env: infer.Env, module: Str, name: Str,
 }
 
 // Why an `Int` beside a `Float` is refused, said only where that is what
-// happened. It is worth saying then — a reader who does not know Hive never
-// widens is left hunting for a conversion nobody told them about — and worth
-// leaving out otherwise, where it would explain something that is not the
-// mistake.
+// happened — anywhere else it would explain something that is not the mistake.
 func whyMixed(left: types.Ty, right: types.Ty): Str {
 	if isNumberPair(left, right) {
 		return ". Hive never widens a number behind your back — `hive.conv.itf` is how an `Int` becomes a `Float`"
@@ -977,9 +958,9 @@ proc checkArguments(c: mut Check, env: infer.Env, name: Str, info: types.Callabl
 	}
 }
 
-// A `func` cannot call a `proc`. What it promises is not purity in the
-// mathematical sense — it may echo, read a file, reach the network — but that it
-// cannot write to storage its caller can see.
+// A `func` cannot call a `proc`. What it promises is not mathematical purity —
+// it may echo, read a file, reach the network — but that it cannot write to
+// storage its caller can see.
 proc checkPurity(c: mut Check, calleePure: Bool, name: Str): void {
 	if c.pure && calleePure == false {
 		report(c, "a `func` cannot call the `proc` `{name}`: a proc may hold a mutex and write through it, and a func promises it cannot write to storage its caller can see. Make this one a `proc`, or make `{name}` a `func`")
@@ -1052,8 +1033,7 @@ func namesOfFields(fields: ast.Field[]): Str[dyn] {
 
 func argFor(args: ast.Arg[], name: Str, index: Int): ast.Expr {
 	// A positional argument carries no name, so an empty one is not a name to
-	// look up — it is the question "which position", and only the loop below
-	// answers that.
+	// look up but the question "which position", which only the loop answers.
 	if name != "" {
 		for each a in args {
 			if a.name == name {
@@ -1099,9 +1079,8 @@ func fieldCount(n: Int): Str {
 // --- The builtins ------------------------------------------------------------
 
 // Every builtin has a signature ([13](../spec/13-builtins.md)), and a call that
-// does not match one is a program the specification describes as a compile
-// error. Caught here rather than left to the generated Go, where the message
-// would be about Go's own types and about a file nobody wrote.
+// does not match one is a compile error. Caught here rather than left to the
+// generated Go, whose message would be about Go's types and a file nobody wrote.
 proc checkBuiltinCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): void {
 	if name == "append" || name == "prepend" {
 		checkGrows(c, env, name, args, 2)
@@ -1258,9 +1237,7 @@ func table(): types.Ty {
 }
 
 // `map`, `filter` and `filterMap` each walk a vector with a function over its
-// elements, and each is specific about what that function answers with. A
-// mismatch here is caught rather than left to the generated Go, where the
-// message would be about Go's own types and about a file nobody wrote.
+// elements, and each is specific about what that function answers with.
 proc checkWalk(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): void {
 	if len(args) != 2 {
 		report(c, "`{name}` takes the vector to walk and the `func` to walk it with, and this call passes " + countOf(len(args)))
@@ -1272,8 +1249,7 @@ proc checkWalk(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): void {
 	}
 	if ty is types.Ty.TFn(pure, params, result) {
 		// A walk says nothing about the order its function runs in or how often,
-		// so there is nowhere to hang a side effect. A `for each` loop does say,
-		// and is what a `proc` is for.
+		// so there is nowhere to hang a side effect. A `for each` loop does say.
 		if pure == false {
 			report(c, "`{name}` walks with a `func`, never a `proc`: it says nothing about the order it runs in or how often, so there is nowhere to hang a side effect. Write a `for each` loop, which does say")
 			return
@@ -1319,10 +1295,9 @@ func typeAt(list: types.Ty[], index: Int): types.Ty {
 	return types.Ty.TUnknown()
 }
 
-// `append`, `prepend` and `drop` all write *through* a vector, and all three ask
-// for the same thing: a mutable dynamic one. Dynamic has to be declared, because
-// a `:=` binding reads its length off the value and a length read off a value is
-// a static one — a promise the vector could not then grow out of.
+// `append`, `prepend` and `drop` all write *through* a vector and all ask for a
+// mutable dynamic one. Dynamic has to be declared: a `:=` binding reads its
+// length off the value, and that is a static promise it could not grow out of.
 proc checkGrows(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[], wanted: Int): void {
 	if len(args) != wanted {
 		report(c, "`{name}` takes " + countOf(wanted) + ", and this call passes " + countOf(len(args)))
@@ -1348,8 +1323,7 @@ proc checkGrows(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[], wanted
 }
 
 // A discarded `sort` on a `mut` vector reorders it where it lies. One that
-// cannot is a compile error rather than a statement that quietly does nothing:
-// both spellings would sort a copy and drop it the instant it was made.
+// cannot is a compile error rather than a statement that quietly does nothing.
 proc checkStatementExpr(c: mut Check, env: infer.Env, value: ast.Expr): void {
 	checkExpr(c, env, value)
 	if value is ast.Expr.Call(callee, args) {
@@ -1443,8 +1417,7 @@ proc checkConstructorPattern(c: mut Check, subjectType: types.Ty, path: Str[], b
 		return
 	}
 	if types.findVariant(c.table, head, variant) is Result.Ok(fields) {
-		// A partially-written argument list is not allowed: name every field or
-		// none, so a pattern never quietly skips one.
+		// Name every field or none, so a pattern never quietly skips one.
 		if parenthesised && len(bindings) != len(fields) {
 			report(c, "`{head}.{variant}` has " + fieldCount(len(fields)) + ", and this pattern binds " + countOf(len(bindings)) + ". Name every field or none — `_` is how one is skipped")
 		}
@@ -1494,7 +1467,7 @@ func terminatesWith(t: types.Table, s: ast.Stmt): Bool {
 
 // Whether an else-less chain covers its subject's whole type: every variant of a
 // declared union, or a `Result`'s `Ok` and `Error`. Every branch has to test the
-// same subject, since a chain that changed subject halfway covers neither.
+// same subject — a chain that changed subject halfway covers neither.
 func covers(t: types.Table, branches: ast.Branch[]): Bool {
 	mut subject := ""
 	mut Str[dyn] variants = []

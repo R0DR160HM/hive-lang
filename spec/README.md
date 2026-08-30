@@ -73,9 +73,9 @@ tokens
 one module's AST
    ↓  loader           (12)   import graph, cycle rejection, flattening
 one program's AST
+   ↓  monomorphizer    (11)   one copy per set of type arguments
    ↓  checker          (03, 04, 06, 07, 08)   names, types, purity, mutability,
    ↓                                          exhaustiveness, terminating paths
-   ↓  monomorphizer    (11)   one copy per set of type arguments
    ↓  bounds           (10)   flow-sensitive index and slice proofs
    ↓  emitter          (15)   Go source
 Go project

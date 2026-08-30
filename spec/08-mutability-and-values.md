@@ -132,6 +132,12 @@ reflection:
 * a declared type copies its storage-owning fields through a generated clone.
   Scalar-only types need nothing — a value copy already isolates them.
 
+A copy may **share** a field for the reason [8.4](#84-copy-on-binding) lets a
+binding alias: if nothing the program can reach through that field is ever
+written, the copy's field and the original's are two names for storage nobody
+rewrites, and sharing it is indistinguishable from copying it. As in 8.4 the
+analysis must be conservative — anything it cannot follow is treated as written.
+
 ## 8.6 Where a copy is not enough
 
 A **`mut T` parameter** is the one place storage crosses a call boundary on

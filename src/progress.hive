@@ -1,60 +1,45 @@
 // Progress
 // ========
-// What the compiler says while it is working.
-//
-// A compile is not instant. The compiler's own twelve thousand lines take
-// minutes, and a program that says nothing for two of them is
-// indistinguishable from one that has hung. So every pass says what it is
-// about to do, with the time so far in front of it, and that is the whole of
-// it: one line per pass, and none of them ever rewritten — nothing here moves a
-// cursor, so a log of it reads the same as the terminal did.
+// What the compiler says while it is working: one line per pass, with the time
+// so far in front of it, and none of them ever rewritten — nothing here moves a
+// cursor, so a log reads the same as the terminal did.
 //
 // Three decisions keep it out of the way:
 //
-//   * It goes to **standard error**, so `hive emit > main.go` is still Go, and
-//     a script reading what a compiled program printed still reads only that.
-//   * It is written **only when standard error is a terminal**. A build inside
-//     a pipeline, or a test comparing what a program printed, is exactly as
-//     quiet as it was before any of this existed.
+//   * It goes to **standard error**, so `hive emit > main.go` is still Go.
+//   * It is written **only when standard error is a terminal**, so a build in a
+//     pipeline is as quiet as it was before any of this existed.
 //   * `HIVE_PROGRESS` overrides both ways: `0` never says anything, anything
 //     else says it even when nobody is watching, which is what a CI log wants.
 //
-// The last line printed is always the thing being waited on. That is the whole
-// design goal, and it is why every line names a pass rather than reporting one:
-// a line that arrives when a pass *finishes* tells you what you are no longer
-// waiting for.
+// Every line names the pass that is *starting*, so the last line printed is
+// always the thing being waited on.
 import hive.env
 import hive.term
 import hive.time
 
-/// When a command started. Every line is counted from this, so the clock down
-/// the left is how long the command has been going rather than how long some
-/// pass inside it has.
+/// When a command started. The clock down the left counts from this, so it is
+/// how long the whole command has been going, not how long a pass has.
 proc started(): Int {
 	return hive.time.now()
 }
 
-/// How long it has been since `from`, in seconds — which is what the line a
-/// command ends with reports, and the only arithmetic anybody does on a clock
-/// that counts in seconds.
+/// How long it has been since `from`, in seconds.
 proc since(from: Int): Int {
 	return hive.time.now() - from
 }
 
 /// One line: how long the command has been going, then what is starting now.
-///
-/// A `from` of `0` is a clock that was never started — which is what a test
-/// calling a pass directly passes, and it says nothing at all rather than
-/// counting from 1970.
+/// A `from` of `0` is a clock that was never started — what a test calling a
+/// pass directly passes — and says nothing rather than counting from 1970.
 proc step(from: Int, text: Str): void {
 	if from > 0 && reporting() {
 		hive.term.status(clock(since(from)) + "  " + text)
 	}
 }
 
-/// A line with no clock in front of it, for something that happens *inside* a
-/// pass rather than being one — a repository being cloned, which is the one
-/// thing a compile does that can take longer than the compile.
+/// A line with no clock, for something that happens *inside* a pass rather than
+/// being one — a repository being cloned, say.
 proc note(text: Str): void {
 	if reporting() {
 		// Seven spaces, which is what a clock and its two spaces take.
@@ -64,22 +49,20 @@ proc note(text: Str): void {
 
 /// Whether anything is said at all.
 proc reporting(): Bool {
-	// Set and not empty is an answer either way; unset — or set to nothing at
-	// all, which is how a shell says unset — leaves the terminal to decide.
+	// Set and non-empty answers either way; unset — or empty, which is how a
+	// shell says unset — leaves the terminal to decide.
 	if hive.env.get("HIVE_PROGRESS") is Result.Ok(asked) && asked != "" {
 		return asked != "0"
 	}
 	return hive.term.isTerminal()
 }
 
-/// `m:ss`, right-aligned in the width two digits of minutes need — which is
-/// every compile anybody will sit through, and honest about the rest: a
-/// seventy-minute one reads `70:04`.
+/// `m:ss`, right-aligned in the width two digits of minutes need. Honest about
+/// anything longer: a seventy-minute compile reads `70:04`.
 func clock(seconds: Int): Str {
 	mut s := seconds
 	if s < 0 {
-		// A clock adjusted under us, which is not worth a special case beyond
-		// refusing to print a negative time.
+		// A clock adjusted under us. Nothing to do but refuse to print it.
 		s = 0
 	}
 	minutes := s / 60
@@ -89,7 +72,7 @@ func clock(seconds: Int): Str {
 	return "{minutes}:" + twoDigits(s % 60)
 }
 
-/// How long something took, for the line a command ends with. That line is on
+/// How long something took, for the line a command ends with — which is on
 /// standard output, because what a build cost is part of its answer.
 func took(seconds: Int): Str {
 	if seconds < 60 {
@@ -98,9 +81,8 @@ func took(seconds: Int): Str {
 	return "{seconds / 60}m" + twoDigits(seconds % 60) + "s"
 }
 
-/// `1 file` and `2 files`, because a compiler that says `1 files` reads like one
-/// that is guessing. Only for words an `s` is the whole of the plural of, which
-/// is every word the compiler counts.
+/// `1 file` and `2 files`. Only for words an `s` is the whole of the plural of,
+/// which is every word the compiler counts.
 func counted(count: Int, thing: Str): Str {
 	if count == 1 {
 		return "1 {thing}"

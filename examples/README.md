@@ -50,8 +50,8 @@ servers in 19 and 22), a window waits for a browser (17, and the two games'
 clients), a distributed pair waits for the other node (09, 13), and a vault waits
 for somebody to type a password (16). Compiling one is what can be checked
 without a person — and six of those nine carry test suites that exercise the
-rest, across the cache, the vault, the chat, the shooter's two halves, the race
-and the cart.
+rest, across the cache, the vault, the chat, the shooter's two halves and the
+race.
 
 Two more have no `.expected` file because what they print is a race by design:
 `10-concurrency`, whose two `note` calls run at once, and anything that reports a
@@ -68,20 +68,11 @@ knowing about:
 * **The remote import in [11](11-modules)** is written out in a comment rather
   than performed. It needs a repository of `.hive` files to point at, and an
   example should not need one to run; the machinery is `../src/fetch.hive` and
-  `../test/fetchTests.hive` holds it to its word.
+  `../test/fetch.test.hive` holds it to its word.
 * **A Go file import is a real import again.** [11](11-modules) calls into
   `lib/measures.go`, whose signatures the Go toolchain reads
   ([12.4](../spec/12-modules.md#124-importing-a-go-file)) — the one example that
   needs a compiler to talk to another language's.
-* **[22](22-formula-kart) is architecture rather than a port too**, and it went
-  further than 19 did. It was one window that held the whole race; it is now a
-  `server.hive` that owns the only copy of it and a `client.hive` that owns a
-  screen. A client sends `drive.Wants` — a steering angle, two pedals and two
-  buttons, the identical value a bot produces — and nothing else, so the server
-  puts a person's car and a bot's through the same `drive.stepped`. Run the client
-  with no server and it holds the race itself, which is the same call again: one
-  program, two ways of playing, and no second copy of the game loop.
-
 * **[19](19-multiplayer-fps) is architecture rather than a port.** It was one
   program that every player ran, meshed together with `hive.syslink`: each node
   held its own player and its own pack of the dead, told the others what both were
@@ -98,3 +89,11 @@ knowing about:
   a Hive program at all. Each is in [14.16](../spec/14-stdlib.md#1416-hiveuiscene),
   and each earned its place by something in the race being impossible or ugly
   without it — a road drawn as a `ground` came out as a lawn.
+
+  It takes 19's split further. A `server.hive` owns the only copy of the race and
+  a `client.hive` owns a screen; a client sends `drive.Wants` — a steering angle,
+  two pedals and two buttons, the identical value a bot produces — and nothing
+  else, so the server puts a person's car and a bot's through the same
+  `drive.stepped`. Run the client with no server and it holds the race itself,
+  which is the same call again: one program, two ways of playing, and no second
+  copy of the game loop.
