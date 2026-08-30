@@ -1,0 +1,428 @@
+// Regular expressions
+// ===================
+// The regex a string pattern's hole carries — `{name is (\w+)}` — read here
+// once, at compile time, for the two things the rest of the compiler needs to
+// know: whether it is well formed, and what to hand the runtime.
+//
+// **A pattern that gets past this cannot fail later.** That is the whole reason
+// this module exists rather than the generated Go compiling the text and hoping:
+// a malformed regex is a compile error naming the character at fault, in the
+// file the programmer wrote, and the emitted `MustCompile` can never panic.
+//
+// What comes out is not quite what went in. Every **capturing** group is
+// rewritten to a non-capturing one, because a hole is already the binding: the
+// template's holes are its capture groups, one each, in order, and an inner
+// group that captured as well would shift every one of them. So `(a)(b)` inside
+// a hole means "an `a` then a `b`", grouped and not captured.
+//
+// The syntax accepted is Go's, which is RE2: no backreferences and no
+// lookaround, because a regex that cannot backtrack is one whose running time is
+// a fact about the input's length rather than about the pattern. Both are
+// refused by name here rather than by the Go toolchain later.
+import ./text
+
+/// A regex read left to right. `out` is the rewritten pattern, a piece at a
+/// time; `problem` is the first thing wrong, and stops the walk.
+type Scan {
+	cs: Str[]
+	pos: Int
+	depth: Int
+	out: Str[dyn]
+	problem: Str
+	/// Whether the last thing read can carry a quantifier. `*` at the start of a
+	/// pattern, or straight after a `|` or a `(`, has nothing to repeat.
+	repeatable: Bool
+}
+
+/// Reads `pattern`, and answers with the Go to compile it as — or with what is
+/// wrong with it.
+///
+/// The answer is a `Result` rather than a diagnostic because the caller knows
+/// where in the file this sat and this does not.
+proc check(pattern: Str): Result<Str, Str> {
+	if pattern == "" {
+		return Result.Error("this hole's regex is empty, so it matches nothing and binds nothing. A hole that takes any text is written `\{name}`, with no `is`")
+	}
+	mut Scan s = Scan(text.chars(pattern), 0, 0, [], "", false)
+	alternation(s)
+	if s.problem == "" && s.pos < len(s.cs) {
+		// Only an unmatched `)` leaves the walk early with nothing said.
+		fault(s, "this `)` closes a group that was never opened")
+	}
+	if s.problem != "" {
+		return Result.Error(s.problem)
+	}
+	return Result.Ok(join(s.out, ""))
+}
+
+/// A template's literal text, as a regex matching exactly it. The characters a
+/// regex reads as syntax are the only ones escaped: a backslash in front of a
+/// letter would be an escape sequence rather than that letter, and in front of a
+/// character outside ASCII it is not valid at all.
+func quoteMeta(literal: Str): Str {
+	mut Str[dyn] out = []
+	for each c in text.chars(literal) {
+		if text.isOneOf(c, "\\.+*?()|[]\{}^$-") {
+			append(out, "\\" + c)
+		} else {
+			append(out, c)
+		}
+	}
+	return join(out, "")
+}
+
+// --- The grammar -------------------------------------------------------------
+
+// `a|b|c`. Alternation binds loosest, so it is the whole of a pattern and the
+// whole of a group's body.
+proc alternation(s: mut Scan): void {
+	concat(s)
+	for ; s.problem == "" && here(s) == "|"; {
+		emit(s, "|")
+		s.pos = s.pos + 1
+		s.repeatable = false
+		concat(s)
+	}
+}
+
+// A run of repeated atoms, stopping at a `|` or at the `)` that closes the group
+// this is the body of.
+proc concat(s: mut Scan): void {
+	for ; s.problem == "" && s.pos < len(s.cs); {
+		c := here(s)
+		if c == "|" {
+			return
+		}
+		if c == ")" {
+			if s.depth == 0 {
+				return
+			}
+			return
+		}
+		atom(s)
+		if s.problem == "" {
+			quantifier(s)
+		}
+	}
+}
+
+// One thing a quantifier can be written after.
+proc atom(s: mut Scan): void {
+	c := here(s)
+	if c == "(" {
+		group(s)
+		return
+	}
+	if c == "[" {
+		characterClass(s)
+		return
+	}
+	if c == "\\" {
+		escape(s)
+		return
+	}
+	if c == "*" || c == "+" || c == "?" {
+		fault(s, "this `{c}` has nothing before it to repeat")
+		return
+	}
+	// A `\{` that opens a real count here has nothing in front of it to apply to.
+	// One that does not is the character itself, which is what RE2 makes of it —
+	// so `x\{nope}` is text and `\{2}` is a mistake, and the two are told apart
+	// by whether what follows is a count.
+	if c == "\{" {
+		if countEndsAt(s, s.pos) >= 0 {
+			fault(s, "this `\{...}` has nothing before it to repeat")
+			return
+		}
+	}
+	// `^`, `$` and `.` are themselves, and so is any ordinary character. An
+	// anchor is not repeatable — `^*` is not a pattern anyone means.
+	emit(s, c)
+	s.pos = s.pos + 1
+	s.repeatable = c != "^" && c != "$"
+}
+
+// `( ... )`, in every form RE2 has — and a refusal, by name, for the two forms
+// it does not.
+proc group(s: mut Scan): void {
+	opened := s.pos
+	s.pos = s.pos + 1
+	if here(s) == "?" {
+		if groupFlags(s) == false {
+			return
+		}
+	} else {
+		// A capturing group becomes a grouping one: the hole is the binding.
+		emit(s, "(?:")
+	}
+	s.depth = s.depth + 1
+	s.repeatable = false
+	alternation(s)
+	if s.problem != "" {
+		return
+	}
+	if here(s) != ")" {
+		s.pos = opened
+		fault(s, "this `(` is never closed")
+		return
+	}
+	emit(s, ")")
+	s.pos = s.pos + 1
+	s.depth = s.depth - 1
+	s.repeatable = true
+}
+
+// What follows a `(?`. Answers whether the group may go on being read.
+proc groupFlags(s: mut Scan): Bool {
+	next := at(s, s.pos + 1)
+	if next == ":" {
+		emit(s, "(?:")
+		s.pos = s.pos + 2
+		return true
+	}
+	if next == "=" || next == "!" {
+		fault(s, "lookaround (`(?{next}`) is not part of this regex syntax: a match here never backtracks, so how long it takes is a fact about the text's length and not about the pattern. Say it with the literal text around the hole instead")
+		return false
+	}
+	if next == "<" {
+		after := at(s, s.pos + 2)
+		if after == "=" || after == "!" {
+			fault(s, "lookbehind (`(?<{after}`) is not part of this regex syntax: a match here never backtracks. Say it with the literal text before the hole instead")
+			return false
+		}
+		fault(s, "a named group is not written inside a hole — the hole's own name is what the text binds to. Write `(...)` for grouping alone")
+		return false
+	}
+	if next == "P" {
+		fault(s, "a named group is not written inside a hole — the hole's own name is what the text binds to. Write `(...)` for grouping alone")
+		return false
+	}
+	// `(?i)`, `(?is)`, `(?i:...)` — a flag setting. The letters are RE2's own.
+	mut i := s.pos + 1
+	mut seen := ""
+	for ; i < len(s.cs); i++ {
+		c := at(s, i)
+		if c == "i" || c == "m" || c == "s" || c == "U" || c == "-" {
+			seen = seen + c
+		} else if c == ")" || c == ":" {
+			if seen == "" {
+				fault(s, "`(?{c}` says nothing: a `(?` opens a flag setting, a `(?:` a group that does not capture")
+				return false
+			}
+			emit(s, "(?" + seen + c)
+			s.pos = i + 1
+			if c == ")" {
+				// A bare flag setting is not a group: nothing was opened, so
+				// nothing has to close.
+				s.repeatable = false
+				return false
+			}
+			return true
+		} else {
+			fault(s, "`{c}` is not one of the flags a regex takes — those are `i` (ignore case), `m` (multi-line), `s` (`.` matches a newline) and `U` (ungreedy)")
+			return false
+		}
+	}
+	fault(s, "this `(` is never closed")
+	return false
+}
+
+// `[abc]`, `[^a-z]`, `[[:alpha:]]`. The contents go through unchanged: nothing
+// inside a class captures, so there is nothing here to rewrite.
+proc characterClass(s: mut Scan): void {
+	opened := s.pos
+	emit(s, "[")
+	s.pos = s.pos + 1
+	if here(s) == "^" {
+		emit(s, "^")
+		s.pos = s.pos + 1
+	}
+	// A `]` in the first position is the character itself rather than the close,
+	// which is the one place a class needs no escape.
+	if here(s) == "]" {
+		emit(s, "]")
+		s.pos = s.pos + 1
+	}
+	for ; s.pos < len(s.cs); {
+		c := here(s)
+		if c == "]" {
+			emit(s, "]")
+			s.pos = s.pos + 1
+			s.repeatable = true
+			return
+		}
+		if c == "\\" {
+			escape(s)
+			if s.problem != "" {
+				return
+			}
+		} else {
+			emit(s, c)
+			s.pos = s.pos + 1
+		}
+	}
+	s.pos = opened
+	fault(s, "this `[` is never closed")
+}
+
+// `\d`, `\w`, `\.`, `\n` — one backslash and what it applies to.
+proc escape(s: mut Scan): void {
+	c := at(s, s.pos + 1)
+	if c == "" {
+		fault(s, "this `\\` is the last character, so there is nothing for it to escape")
+		return
+	}
+	// A digit after a backslash is a backreference everywhere that backtracks,
+	// and nowhere here. Saying so by name beats letting it read as an octal
+	// escape, which is what it would otherwise be.
+	if text.isDigit(c) && c != "0" {
+		fault(s, "`\\{c}` is a backreference, and this regex syntax has none: a match here never backtracks. Repeat the pattern instead of pointing back at it")
+		return
+	}
+	emit(s, "\\" + c)
+	s.pos = s.pos + 2
+	s.repeatable = true
+}
+
+// `*`, `+`, `?`, `\{n}`, `\{n,}`, `\{n,m}`, each optionally followed by a `?`
+// that makes it lazy. A quantifier is optional, so nothing here is an error
+// unless one was written where none could apply.
+proc quantifier(s: mut Scan): void {
+	c := here(s)
+	if c == "*" || c == "+" || c == "?" {
+		if s.repeatable == false {
+			fault(s, "this `{c}` has nothing before it to repeat")
+			return
+		}
+		emit(s, c)
+		s.pos = s.pos + 1
+		lazy(s)
+		return
+	}
+	if c == "\{" {
+		counted(s)
+	}
+}
+
+// `\{n}`, `\{n,}` or `\{n,m}`. A `\{` that is not one of those is the character
+// itself, which is what RE2 makes of it — so this says nothing and leaves it to
+// be read as text.
+proc counted(s: mut Scan): void {
+	opened := s.pos
+	closing := countEndsAt(s, opened)
+	if closing < 0 {
+		return
+	}
+	low := number(s, opened + 1)
+	mut high := low
+	after := opened + 1 + len(text.chars(low))
+	if at(s, after) == "," {
+		high = number(s, after + 1)
+	}
+	// A bound left out is "and up", which cannot run backwards.
+	if high != "" {
+		if asInt(high) < asInt(low) {
+			fault(s, "`\{{low},{high}}` counts down: a repeat's high bound cannot be below its low one")
+			return
+		}
+	}
+	emit(s, text.span(s.cs, opened, closing))
+	s.pos = closing + 1
+	lazy(s)
+}
+
+// Where the `}` of a count starting at `open` is, or `-1` where what sits there
+// is not a count at all. It is the one question both `atom` and `counted` ask:
+// a `\{` is a repeat or it is text, and everything else follows from which.
+func countEndsAt(s: Scan, open: Int): Int {
+	mut i := open + 1
+	low := number(s, i)
+	if low == "" {
+		return -1
+	}
+	i = i + len(text.chars(low))
+	if at(s, i) == "," {
+		i = i + 1
+		i = i + len(text.chars(number(s, i)))
+	}
+	if at(s, i) != "}" {
+		return -1
+	}
+	return i
+}
+
+// The `?` that makes a quantifier lazy, and the refusal of a second quantifier
+// on top of one — `a**` says nothing `a*` does not.
+proc lazy(s: mut Scan): void {
+	c := here(s)
+	if c == "?" {
+		emit(s, "?")
+		s.pos = s.pos + 1
+		s.repeatable = false
+		return
+	}
+	if c == "*" || c == "+" {
+		fault(s, "this `{c}` repeats a repeat, which says nothing the first one did not")
+		return
+	}
+	s.repeatable = false
+}
+
+// --- Reading ------------------------------------------------------------------
+
+func here(s: Scan): Str {
+	return text.charAt(s.cs, s.pos)
+}
+
+func at(s: Scan, index: Int): Str {
+	return text.charAt(s.cs, index)
+}
+
+// The digits from `index` on, as they were written.
+func number(s: Scan, index: Int): Str {
+	mut Str[dyn] out = []
+	mut i := index
+	for ; i < len(s.cs); i++ {
+		c := text.charAt(s.cs, i)
+		if text.isDigit(c) == false {
+			return join(out, "")
+		}
+		append(out, c)
+	}
+	return join(out, "")
+}
+
+// A count a regex wrote down. It has already been read as digits, so there is
+// nothing here that can fail.
+func asInt(digits: Str): Int {
+	mut n := 0
+	for each c in text.chars(digits) {
+		n = n * 10 + digitValue(c)
+	}
+	return n
+}
+
+func digitValue(c: Str): Int {
+	mut i := 0
+	for each d in text.chars("0123456789") {
+		if d == c {
+			return i
+		}
+		i = i + 1
+	}
+	return 0
+}
+
+proc emit(s: mut Scan, piece: Str): void {
+	append(s.out, piece)
+}
+
+// The first thing wrong is the one reported: after it the walk is reading a
+// pattern that was never going to work, and everything it noticed next would be
+// about that rather than about what the programmer wrote.
+proc fault(s: mut Scan, message: Str): void {
+	if s.problem == "" {
+		s.problem = message
+	}
+	s.pos = len(s.cs)
+}

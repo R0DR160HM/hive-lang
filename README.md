@@ -1,6 +1,12 @@
-# Hive, in Hive
+<p align="center">
+  <img src="assets/hive-logo.svg" alt="The Hive logo: a bee over a honeycomb" width="160">
+</p>
 
-[![build](https://github.com/R0DR160HM/hive-lang/actions/workflows/build.yml/badge.svg)](https://github.com/R0DR160HM/hive-lang/actions/workflows/build.yml)
+<h1 align="center">Hive, in Hive</h1>
+
+<p align="center">
+  <a href="https://github.com/R0DR160HM/hive-lang/actions/workflows/build.yml"><img src="https://github.com/R0DR160HM/hive-lang/actions/workflows/build.yml/badge.svg" alt="build"></a>
+</p>
 
 The Hive compiler, written in Hive.
 
@@ -473,10 +479,12 @@ made rather than in a design document nobody opens.
 Six places are worth reading first, because each is a decision the language
 forced:
 
-* **`lexer.hive`** — a `Str` has no subscript in Hive, so the lexer works over
-  `split(source, "")`. The cursor is a `mut` parameter, which is the one way
-  storage crosses a call boundary; everything that only reads takes the
-  characters and an index instead, so no reader ever costs a copy.
+* **`lexer.hive`** — the lexer works over `split(source, "")` rather than
+  indexing the source, because every index is proved in range one at a time and a
+  scanner asks about the same string a million times. The cursor is a `mut`
+  parameter, which is the one way storage crosses a call boundary; everything
+  that only reads takes the characters and an index instead, so no reader ever
+  costs a copy.
 * **`parser.hive`** — errors do not stop it. A failure sets a flag, every loop
   checks it, and the declaration loop clears it and skips to the next `proc`.
 * **`emit.hive`** — every lowering decision is a type. `+` is three operators,

@@ -21,6 +21,7 @@ import ./ast
 import ./diag
 import ./lexer
 import ./naming
+import ./regex
 import ./text
 import ./token
 
@@ -1538,6 +1539,10 @@ proc parseInterp(ts: token.Token[], p: mut Parse, parts: token.StrPart[]): ast.E
 			append(out, ast.InterpPart.Literal(t))
 		} else if part is token.StrPart.Code(source) {
 			append(out, ast.InterpPart.Expression(parseSubExpr(ts, p, source, line)))
+		} else if part is token.StrPart.Hole(name, _) {
+			// `\{name is (regex)}` asks a question, and a string being built has
+			// nobody to answer it.
+			fail(ts, p, "`\{{name} is (...)}` is a pattern's hole, not something a string can hold: it says what the text there has to look like, which only means anything on the right of an `is`. To put a `\{` in a string, write `\\\{`")
 		}
 	}
 	return ast.Expr.Interp(out)
@@ -1574,6 +1579,14 @@ proc parsePattern(ts: token.Token[], p: mut Parse): ast.Pattern {
 	k := kindAt(ts, p.pos)
 	if k is token.Kind.StrLit(t) {
 		advance(p)
+		// A hole that arrived as literal text was written where nothing reads it
+		// as one — in a backtick string, which has no interpolation, or behind a
+		// `\{` that escaped the brace on purpose. Either way it would match the
+		// characters rather than the shape, and silently never match at all.
+		if looksLikeHole(t) {
+			fail(ts, p, "this pattern holds `\{name is (...)}` as literal text rather than as a hole, so it would match those characters and never match at all. A hole only opens in an ordinary `\"...\"` pattern — a backtick string has no holes, and a `\\\{` asked for the brace itself")
+			return ast.Pattern.StrTemplate([token.StrPart.Literal(t)])
+		}
 		// A hole-less template is an exact match, which is the whole of what a
 		// plain string pattern says.
 		return ast.Pattern.StrTemplate([token.StrPart.Literal(t)])
@@ -1594,6 +1607,8 @@ proc parsePattern(ts: token.Token[], p: mut Parse): ast.Pattern {
 // impossible to read.
 proc stringPattern(ts: token.Token[], p: mut Parse, parts: token.StrPart[]): ast.Pattern {
 	mut wasHole := false
+	mut token.StrPart[dyn] out = []
+	mut Str[dyn] named = []
 	for each part in parts {
 		if part is token.StrPart.Code(source) {
 			name := text.trim(source)
@@ -1601,16 +1616,92 @@ proc stringPattern(ts: token.Token[], p: mut Parse, parts: token.StrPart[]): ast
 				fail(ts, p, "a string pattern's `\{{source}}` has to be a plain name to bind the text to — it is a hole, not an expression")
 				return ast.Pattern.StrTemplate(parts)
 			}
+			// Two plain holes side by side have no split point. A hole that says
+			// what it matches does, so the rule is about the open ones only.
 			if wasHole {
-				fail(ts, p, "two holes may not sit side by side in a string pattern: with no literal text between them there is nothing to say where one ends and the next begins")
+				fail(ts, p, "two holes that take any text may not sit side by side in a string pattern: with no literal text between them there is nothing to say where one ends and the next begins. Give one of them a regex — `\{{name} is (...)}` — and it says where it ends itself")
 				return ast.Pattern.StrTemplate(parts)
 			}
+			if duplicateHole(named, name, ts, p) {
+				return ast.Pattern.StrTemplate(parts)
+			}
+			append(named, name)
+			append(out, part)
 			wasHole = true
+		} else if part is token.StrPart.Hole(name, pattern) {
+			if naming.fits(naming.Role.Binding(), name) == false || name == "_" {
+				fail(ts, p, "`\{{name} is (...)}` binds the text it matches to `{name}`, so `{name}` has to be a plain binding name — `camelCase`")
+				return ast.Pattern.StrTemplate(parts)
+			}
+			if duplicateHole(named, name, ts, p) {
+				return ast.Pattern.StrTemplate(parts)
+			}
+			// The regex is read here, once, so that a malformed one is a compile
+			// error naming what is wrong with it rather than something the Go
+			// toolchain says about a file nobody wrote. What comes back is the
+			// same pattern with its capturing groups made plain: the holes of a
+			// template are its capture groups, one each.
+			if regex.check(pattern) is Result.Ok(compiled) {
+				append(named, name)
+				append(out, token.StrPart.Hole(name, compiled))
+			} else if regex.check(pattern) is Result.Error(why) {
+				fail(ts, p, "in the hole `\{{name} is (...)}`: " + why)
+				return ast.Pattern.StrTemplate(parts)
+			}
+			wasHole = false
 		} else {
+			append(out, part)
 			wasHole = false
 		}
 	}
-	return ast.Pattern.StrTemplate(parts)
+	return ast.Pattern.StrTemplate(out)
+}
+
+// Two holes of one name would bind the same word to two different pieces of the
+// text, and the second would quietly win.
+proc duplicateHole(named: Str[], name: Str, ts: token.Token[], p: mut Parse): Bool {
+	if indexOf(named, name) is Result.Ok(_) {
+		fail(ts, p, "this pattern binds `{name}` twice, and the two holes would take different text. Give them different names")
+		return true
+	}
+	return false
+}
+
+// Whether literal text holds what somebody meant as a regex hole — a hole
+// written where nothing reads it as one, which is a backtick pattern or a `\{`
+// that escaped the brace on purpose. Either way it would match those characters
+// and so never match at all.
+//
+// The shape is looked for exactly, name and all, so that an escaped brace with
+// unrelated text after it — `"\\{a} is (b)}"` — is left alone.
+func looksLikeHole(t: Str): Bool {
+	mut first := true
+	for each piece in split(t, "\{") {
+		// `split` gives the text before the first `\{` as well, and nothing
+		// opened that one.
+		if first {
+			first = false
+		} else if opensHole(piece) {
+			return true
+		}
+	}
+	return false
+}
+
+// Whether `piece` — the text just past a `\{` — reads as `name is (...)}`.
+func opensHole(piece: Str): Bool {
+	cs := text.chars(piece)
+	mut i := 0
+	for ; i < len(cs); i++ {
+		c := text.charAt(cs, i)
+		if text.isAlnum(c) == false {
+			if i == 0 {
+				return false
+			}
+			return text.matchesAt(cs, i, " is (") && text.contains(piece, ")}")
+		}
+	}
+	return false
 }
 
 proc parseVectorPattern(ts: token.Token[], p: mut Parse): ast.Pattern {

@@ -6,6 +6,9 @@
 // four kinds of pattern: tagged-union variants, `Result`s, vectors and strings.
 // Every branch below is a plain `if` / `else if`, because `is` is an ordinary
 // expression that answers with a Bool.
+//
+// A string pattern's holes come in two kinds — one that takes any text and one
+// that says what it takes — and the last two sections are about them.
 
 type Shape {
 	Circle {
@@ -89,6 +92,48 @@ func handle(path: Str): Str {
 	return "404 not found"
 }
 
+// 5. Holes that say what they take
+// --------------------------------
+// `{name}` takes any text. `{name is (regex)}` takes only text the regex
+// matches, and binds it the same way — the two are one construct, and everything
+// above holds for both.
+//
+// **Nothing between those parentheses is escaped by the string.** A hole is
+// recognised by that exact shape, so the `\` and the `{` in there belong to the
+// regex: `{year is (\d{4})}` is four digits rather than an interpolation of `4`.
+//
+// **The regex is read at compile time.** A malformed one is an error naming what
+// is wrong with it, in this file, rather than a surprise in a running program —
+// and because the hole is already the name, a group inside it groups without
+// capturing.
+func typed(path: Str): Str {
+	if path is "/users/{id is (\d+)}/posts/{postId is (\d+)}" {
+		// `id` is digits and nothing else, which `handle` above could not
+		// promise: `/users/nobody` matched its `/users/{id}` branch quite
+		// happily. Here the branch is simply skipped instead.
+		return "user #{id}, post #{postId}"
+	} else if path is "/api/v{version is (\d+)}/{rest}" {
+		// The two kinds of hole mix freely, and a hole that says what it takes
+		// may sit right beside another — it says where it ends itself.
+		return "v{version}, then {rest}"
+	} else if path is "{file is ([\w-]+)}.{ext is (png|jpe?g|gif)}" {
+		// `(png|jpe?g|gif)` groups three alternatives without capturing any of
+		// them, so `ext` is the whole extension and there is no fourth binding
+		// to account for.
+		return "image {file}, {ext}"
+	}
+	return "no shape matched"
+}
+
+// Each of these is refused before the program is built. They are left as
+// comments because a file that does not compile is a poor example:
+//
+//   if s is "{a is (a{2,1})}" { }    // `{2,1}` counts down
+//   if s is "{a is ((?=b)c)}" { }    // no lookaround — a match never backtracks
+//   if s is "{a is ((b)\1)}" { }     // and no backreference, for the same reason
+//   if s is "{a is ((?<n>b))}" { }   // the hole is already the name
+//   if s is `{a is (\w+)}` { }       // a backtick string has no holes at all
+
 proc main(): void {
 	echo "-- tagged unions --"
 	echo describe(Shape.Circle(5))
@@ -114,6 +159,16 @@ proc main(): void {
 	echo handle("/users/7")
 	echo handle("/files/img/logo.png")
 	echo handle("/nope")
+
+	echo ""
+	echo "-- holes that say what they take --"
+	echo typed("/users/7/posts/99")
+	// The same path with a word where a number belongs simply does not match,
+	// which is the whole point of saying what the hole takes.
+	echo typed("/users/nobody/posts/99")
+	echo typed("/api/v2/things/42")
+	echo typed("holiday-01.jpeg")
+	echo typed("holiday-01.bmp")
 
 	echo ""
 	echo "-- a binding is usable in the rest of the condition --"

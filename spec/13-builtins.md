@@ -15,6 +15,8 @@ type.
 | `drop(vector, low, high)` | `drop(T[dyn], Int, Int): T[dyn]` | removes `low`–`high` **inclusive** and hands them back |
 | `join(vector, sep)` | `join(Str[], Str): Str` | concatenates, `sep` between elements |
 | `split(str, sep)` | `split(Str, Str): Str[dyn]` | splits on `sep` (the inverse of `join`) |
+| `replaceFirst(str, from, to)` | `replaceFirst(Str, Str, Str): Str` | the first occurrence of `from`, rewritten |
+| `replaceAll(str, from, to)` | `replaceAll(Str, Str, Str): Str` | every occurrence of `from`, rewritten |
 | `indexOf(vector, value)` | `indexOf(T[], T): Result<Int, Bool>` | position of the first equal element |
 | `indexOf(str, sub)` | `indexOf(Str, Str): Result<Int, Bool>` | position, in characters, of the first occurrence |
 | `row(table, key)` | `row(Table, Str): Str[dyn]` | the row whose first cell equals `key`, else `[]` |
@@ -28,8 +30,15 @@ type.
 `len` and `bytes` differ only for strings: for `"café"`, `len` is `4` (runes)
 while `bytes` is `5`.
 
-`split(s, "")` splits a string into its characters, which is how a program
-reaches them at all ([03](03-types.md#str)).
+`split(s, "")` splits a string into its characters, and a `Str` is also indexed
+and sliced by character directly ([03](03-types.md#str)).
+
+`replaceFirst` and `replaceAll` **answer with a new string** and never write
+through the one they were given: a `Str` is a value. `from` is plain text rather
+than a pattern — to rewrite by shape, match with a
+[string pattern](07-patterns.md#74-string-patterns) and build the answer from
+what its holes bound. Neither is an error when `from` is not there; the string
+comes back as it was.
 
 ## A declaration of your own wins
 

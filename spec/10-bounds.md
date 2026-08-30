@@ -124,7 +124,7 @@ construction — and so can be indexed unguarded.
 
 `indexOf` is fallible, so it answers with a `Result`. The point of returning a
 position rather than a `-1` is that **an `Ok` payload is always a position the
-vector really has**, and the bounds pass knows it:
+vector — or the string — really has**, and the bounds pass knows it:
 
 ```hive
 found := indexOf(names, "bob")
@@ -156,3 +156,43 @@ bound and, with it, a low bound of `0`, since a length is never negative.
 
 Crossed bounds (`drop(v, 2, 1)`) take nothing and hand back an empty vector — the
 same as the slice they describe.
+
+## 10.8 A `Str`'s own bounds
+
+A `Str` is indexed and sliced like a vector ([03](03-types.md#str)) and proved
+like one, with a single difference: **a `Str` never has a length the compiler
+knows.** There is no `Str[3]` for text — a declared length is a promise about a
+vector's elements, and a string's length is a count of characters that only the
+value itself carries. So 10.1's first proof never applies to one:
+
+```hive
+s := "abc"
+echo s[1]                    // compile error, even though `s` is right there
+if s bounds 1 { echo s[1] }  // fine
+```
+
+That leaves the same two proofs the rest of this chapter describes, and both work
+unchanged:
+
+* a **guard** — `if s bounds i`, which counts characters here because `hive.len`
+  does;
+* an index from **`indexOf`**, whose `Ok` payload is a character position the
+  string really has.
+
+```hive
+if indexOf(line, "=") is Result.Ok(at) {
+	echo line[at:]           // no guard: the search proved it
+}
+```
+
+A slice's two bounds are proved separately, so a guard that settles one says
+nothing about the other, and a **computed** bound is bound to a name and guarded
+like any other ([10.1](#101-what-counts-as-a-proof)):
+
+```hive
+last := at - 1
+if line bounds last { echo line[:last] }
+```
+
+Because a `Str` has no length to lose, nothing in [10.6](#106-what-costs-a-proof)
+costs one anything but the guard's own scope.

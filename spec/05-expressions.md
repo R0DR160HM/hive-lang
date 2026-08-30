@@ -89,8 +89,9 @@ are told apart by what the left side names.
 elements. Either bound may be omitted (`v[:2]`, `v[1:]`, `v[:]`). Every index and
 slice is proved in range at compile time ([10](10-bounds.md)).
 
-A `Str` has no subscript ([03](03-types.md#str)). A map has no subscript
-([03](03-types.md#36-maps)).
+A `Str` is subscripted the same way and **by character**, yielding a one-character
+`Str` ([03](03-types.md#str)). It may not be assigned into by position. A map has
+no subscript at all ([03](03-types.md#36-maps)).
 
 ## 5.6 Operators
 

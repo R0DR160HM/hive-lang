@@ -27,14 +27,30 @@ else: there is no `void` variable, no `void` field, and no `void` element.
 A `Str` is a sequence of **characters**, and `len` counts those. It holds bytes,
 so a binary file survives a read/write round trip, but it is addressed as text.
 
-A `Str` has **no subscript**. `s[0]` and `s[1:3]` are compile errors, because
-`[...]` addresses bytes while a `Str` is a sequence of characters, so the two
-never line up and a byte from the middle of a character is not text. Take a
-string apart with `split`, find in it with `indexOf`, or match it with a
-[string pattern](07-patterns.md#74-string-patterns).
+A `Str` is **subscripted by character**, never by byte: `s[0]` is its first
+character and `s[1:3]` is characters one through three, both bounds inclusive.
+Every one of those is proved in range at compile time, exactly as a vector's is
+([10](10-bounds.md#108-a-strs-own-bounds)) — a `Str` carries no declared length,
+so an index into one is always guarded or comes from `indexOf`.
 
-`split(s, "")` is the way to reach individual characters: it answers with a
-`Str[dyn]` of one-character strings.
+Indexing yields a **`Str` of one character**. There is no character type to
+answer with, and a one-character `Str` is what `split(s, "")` already hands out.
+
+A `Str` is **never assigned into by position**. `s[0] = "x"` is a compile error:
+a `Str` is a value rather than storage — the same as an `Int` — and characters
+are not all the same width, so writing one would move every character after it.
+Build the new string instead.
+
+```hive
+s := "café au lait"
+if s bounds 3 { echo s[3] }        // é — the fourth character, not the fourth byte
+if indexOf(s, "au") is Result.Ok(at) {
+	echo s[at:]                    // "au lait", and no guard needed
+}
+```
+
+`split(s, "")` still reaches every character at once, and remains the way to walk
+a string without indexing it.
 
 ### Atom
 

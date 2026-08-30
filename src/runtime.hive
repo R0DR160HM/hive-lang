@@ -84,6 +84,7 @@ func moduleText(module: Str): Str {
 	if module == "syslinknet" { return syslinkNetSource() }
 	if module == "ui" { return uiSource() }
 	if module == "uiscene" { return uiSceneSource() + "\n" + uiSceneJs() }
+	if module == "regex" { return regexSource() }
 	if module == "csv" { return csvSource() }
 	if module == "sheets" { return sheetsSource() }
 	// `hive.map` and `hive.task` are the core: a `Dict` and a `Task` are values
@@ -148,7 +149,6 @@ func coreSource(): Str {
 		coreWalks(),
 		coreStrings(),
 		coreArithmetic(),
-		coreTemplate(),
 		coreDict(),
 		coreTasks(),
 		coreTesting(),
@@ -394,6 +394,12 @@ func coreVectors(): Str {
 		// two comparisons that repeat half of themselves.
 		func InRange[T any](i int, v []T) bool { return i >= 0 && i < len(v) }
 
+		// And the same guard on a Str, which counts characters rather than the
+		// bytes that hold them.
+		func InRangeStr(i int, s string) bool {
+			return i >= 0 && i < utf8.RuneCountInString(s)
+		}
+
 		// Bytes is a vector's byte footprint: its length times the size of one
 		// element.
 		func Bytes[T any](v []T) int {
@@ -595,6 +601,71 @@ func coreStrings(): Str {
 		// a program reaches a string's characters at all.
 		func Split(s, sep string) []string { return strings.Split(s, sep) }
 
+		// ReplaceFirst rewrites the first occurrence of from, and ReplaceAll every
+		// one of them. Both answer with a new string: a Str is a value, so nothing
+		// is written through.
+		func ReplaceFirst(s, from, to string) string {
+			return strings.Replace(s, from, to, 1)
+		}
+
+		func ReplaceAll(s, from, to string) string {
+			return strings.ReplaceAll(s, from, to)
+		}
+
+		// IndexStr is the character at position i, as a one-character string. The
+		// bounds pass proves i in range before this is ever called, so the empty
+		// answer is a defence rather than a case a program can reach.
+		func IndexStr(s string, i int) string {
+			n := 0
+			for _, r := range s {
+				if n == i {
+					return string(r)
+				}
+				n++
+			}
+			return ""
+		}
+
+		// SliceStr is characters low through high, both inclusive — the same two
+		// numbers a vector slice takes. Crossed bounds take nothing, exactly as
+		// the slice they describe does.
+		func SliceStr(s string, low, high int) string {
+			if high < low {
+				return ""
+			}
+			start := -1
+			end := len(s)
+			n := 0
+			for at := range s {
+				if n == low {
+					start = at
+				}
+				if n == high+1 {
+					end = at
+					break
+				}
+				n++
+			}
+			if start < 0 {
+				return ""
+			}
+			return s[start:end]
+		}
+
+		// SliceStrFrom is s[low:] counted in characters. It is its own function
+		// rather than SliceStr with a length written at the call, because writing
+		// one there would evaluate the subject twice.
+		func SliceStrFrom(s string, low int) string {
+			n := 0
+			for at := range s {
+				if n == low {
+					return s[at:]
+				}
+				n++
+			}
+			return ""
+		}
+
 		// IndexOfStr is the position, in characters, of the first occurrence of
 		// sub. Searching an empty string never succeeds, not even for an empty
 		// needle: an Ok index always points at something really there.
@@ -704,48 +775,6 @@ func coreArithmetic(): Str {
 		}
 
 		func PowFloat(a, b float64) float64 { return math.Pow(a, b) }
-	`
-}
-
-func coreTemplate(): Str {
-	return `
-		// MatchTemplate matches s against a string pattern, given as its pieces:
-		// isLit says which pieces are literal text and texts holds that text. The
-		// bound holes come back in order.
-		//
-		// Matching is non-greedy and does not backtrack: a hole stops at the first
-		// occurrence of the literal that follows it, and the template has to cover
-		// the whole string.
-		func MatchTemplate(s string, isLit []bool, texts []string) ([]string, bool) {
-			holes := []string{}
-			rest := s
-			for i := 0; i < len(isLit); i++ {
-				if isLit[i] {
-					if !strings.HasPrefix(rest, texts[i]) {
-						return nil, false
-					}
-					rest = rest[len(texts[i]):]
-					continue
-				}
-				// A hole with no literal after it runs to the end.
-				if i+1 >= len(isLit) {
-					holes = append(holes, rest)
-					rest = ""
-					continue
-				}
-				next := texts[i+1]
-				at := strings.Index(rest, next)
-				if at < 0 {
-					return nil, false
-				}
-				holes = append(holes, rest[:at])
-				rest = rest[at:]
-			}
-			if rest != "" {
-				return nil, false
-			}
-			return holes, true
-		}
 	`
 }
 
@@ -2089,6 +2118,37 @@ func jsonSource(): Str {
 /// Separate from the spreadsheet readers because the two have nothing in
 /// common but the answer they give: this is one standard library call, and
 /// that one is a zip archive full of XML.
+// The matcher behind every string pattern. It is a module of its own rather
+// than part of the core because `regexp` is a package worth carrying only where
+// a pattern is written at all: a program that matches no strings links none of
+// this.
+func regexSource(): Str {
+	return `
+		package hive
+
+		import "regexp"
+
+		// CompilePattern is one string pattern, compiled once when the program
+		// starts. Nothing here can fail: the compiler reads every pattern before
+		// writing it out, so one that would not compile is a compile error and
+		// never reaches this file.
+		func CompilePattern(pattern string) *regexp.Regexp {
+			return regexp.MustCompile(pattern)
+		}
+
+		// MatchPattern answers with what the template's holes bound, in the order
+		// the template writes them. The whole expression is anchored, so a match
+		// covers the whole string or there is no match at all.
+		func MatchPattern(s string, re *regexp.Regexp) ([]string, bool) {
+			found := re.FindStringSubmatch(s)
+			if found == nil {
+				return nil, false
+			}
+			return found[1:], true
+		}
+	`
+}
+
 func csvSource(): Str {
 	return `
 		package hive

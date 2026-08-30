@@ -290,11 +290,18 @@ proc scanString(cs: Str[], s: mut Scan): void {
 			s.pos = s.pos + 2
 		} else if c == "\{" {
 			s.pos = s.pos + 1
-			if scanInterpolation(cs, s, b, opened) == false {
-				// The interpolation has already said what went wrong. Reporting
-				// an unterminated string on top of it would name one mistake
-				// twice.
-				return
+			// `\{name is (regex)}` is a pattern's hole rather than an
+			// interpolation, and its regex is captured with no escape
+			// processing at all. It is recognised by that exact shape and
+			// nothing looser, which is what lets the regex hold the `\` and
+			// the `\{` that would otherwise have been the string's.
+			if scanRegexHole(cs, s, b) == false {
+				if scanInterpolation(cs, s, b, opened) == false {
+					// The interpolation has already said what went wrong.
+					// Reporting an unterminated string on top of it would name
+					// one mistake twice.
+					return
+				}
 			}
 		} else {
 			if c == "\n" {
@@ -305,6 +312,99 @@ proc scanString(cs: Str[], s: mut Scan): void {
 		}
 	}
 	append(s.errors, diag.at(opened, "unterminated string literal"))
+}
+
+// `\{name is (regex)}`, captured raw. Answers whether it was there: anything
+// that is not exactly that shape leaves the position where it found it, so an
+// ordinary `\{expression}` reads on as it always did.
+//
+// The regex runs to the `)` matching its own `(`, and the parentheses are
+// counted through escapes and character classes — `\)` and `[)]` are the
+// pattern's text and not its end.
+proc scanRegexHole(cs: Str[], s: mut Scan, b: mut StrPartBuf): Bool {
+	start := s.pos
+	name := holeName(cs, s.pos)
+	if name == "" {
+		return false
+	}
+	mut i := s.pos + len(text.chars(name))
+	if text.matchesAt(cs, i, " is ") == false {
+		return false
+	}
+	i = i + 4
+	if text.charAt(cs, i) != "(" {
+		return false
+	}
+	// Past this point the shape is a hole and nothing else — `\{name is (` is not
+	// an expression anybody writes — so what follows is reported as a hole gone
+	// wrong rather than handed back to be read as an interpolation. Falling back
+	// there would name the mistake as a lexing failure inside a `\{...}`, which
+	// is about as far from the truth as a message gets.
+	open := i
+	i = i + 1
+	mut depth := 1
+	mut inClass := false
+	for ; i < len(cs); i++ {
+		c := text.charAt(cs, i)
+		if c == "\n" {
+			s.pos = i
+			return failedHole(s, "this hole's regex is never closed — it runs to the end of the line")
+		}
+		if c == "\\" {
+			i = i + 1
+		} else if inClass {
+			if c == "]" {
+				inClass = false
+			}
+		} else if c == "[" {
+			inClass = true
+		} else if c == "(" {
+			depth = depth + 1
+		} else if c == ")" {
+			depth = depth - 1
+			if depth == 0 {
+				if text.charAt(cs, i + 1) != "}" {
+					s.pos = i + 1
+					return failedHole(s, "this hole closes its regex and then goes on: a `\{{name} is (...)}` ends at the `}` right after the `)`")
+				}
+				pushLiteral(b)
+				append(b.parts, token.StrPart.Hole(name, text.span(cs, open + 1, i - 1)))
+				s.pos = i + 2
+				return true
+			}
+		}
+	}
+	s.pos = start
+	return failedHole(s, "this hole's regex is never closed: `\{{name} is (` opens one and nothing closes it")
+}
+
+// A hole that went wrong. It answers `true` — the characters are consumed and
+// the string reads on — because the mistake has been reported and reading them
+// again as an interpolation would only report a second, wronger one.
+proc failedHole(s: mut Scan, message: Str): Bool {
+	append(s.errors, diag.at(s.line, message))
+	return true
+}
+
+// The binding name a hole opens with, or `""` where what follows the `\{` is not
+// one. A name is what the language's `Binding` role allows, which is a lower
+// case letter and then letters and digits — deliberately narrower than an
+// expression, so `\{a.b is (x)}` is an interpolation and not a malformed hole.
+func holeName(cs: Str[], start: Int): Str {
+	mut Str[dyn] out = []
+	mut i := start
+	first := text.charAt(cs, i)
+	if text.isLower(first) == false {
+		return ""
+	}
+	for ; i < len(cs); i++ {
+		c := text.charAt(cs, i)
+		if text.isAlnum(c) == false {
+			return join(out, "")
+		}
+		append(out, c)
+	}
+	return ""
 }
 
 // The `{...}` of an interpolation: everything to the matching `}`, captured raw.

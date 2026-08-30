@@ -132,6 +132,31 @@ The resulting token is a plain string literal when there were no interpolations,
 and otherwise a sequence of literal and code parts. Lowering is in
 [15](15-lowering.md).
 
+#### A regex hole
+
+One shape is read before an interpolation is: `{name is (regex)}`, where `name`
+is a binding name, produces a **hole part** rather than a code part. It is a
+[string pattern's](07-patterns.md#a-hole-may-say-what-it-takes) hole, and what
+sits between the parentheses is captured **raw** — no escape processing, no
+interpolation, and no brace counting:
+
+```hive
+if s is "{year is (\d{4})}" { echo year }
+```
+
+So the `\d` is the regex's escape and the `{4}` is its repeat count, neither of
+which the string touches. The scan runs to the `)` matching the opening one,
+counting parentheses through `\`-escapes and `[...]` classes, and the `}` has to
+follow it immediately.
+
+Anything that is not **exactly** that shape is an ordinary interpolation, so
+`"{a is b}"` and `"{a.b is (x)}"` read as they always did. Once `{name is (` has
+been seen, though, the lexer is committed: an unclosed regex is reported as one
+rather than handed back to be read as an expression.
+
+A hole part only means something in a pattern. In a string being *built* it is a
+compile error, because there is nobody to answer the question it asks.
+
 ### 1.3.2 Backtick strings
 
 A `` `...` `` string is **raw**: no escapes, no interpolation, and it may span

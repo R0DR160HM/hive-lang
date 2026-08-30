@@ -705,14 +705,23 @@ func knownLength(bo: Proofs, env: infer.Env, subject: ast.Expr): Result<Int, Boo
 // The message. It says which of the three things went wrong, because each has a
 // different fix.
 func refusal(bo: Proofs, env: infer.Env, subject: ast.Expr, index: ast.Expr): Str {
-	written := describe(subject)
+	written := describe(bo, env, subject)
+	// A `Str` is indexed by character and never carries a declared length, so the
+	// two answers that mention one would send the reader nowhere.
+	str := infer.typeOf(env, subject) is types.Ty.TStr
 	if index is ast.Expr.IntLit(at) {
 		if knownLength(bo, env, subject) is Result.Ok(n) {
 			return "`{written}` holds {n}, so `{at}` is not a position it has"
 		}
+		if str {
+			return "cannot prove `{at}` is in range: `{written}` is a `Str`, whose length is only ever known at runtime. Guard it — `if {written} bounds {at} \{ ... }`"
+		}
 		return "cannot prove `{at}` is in range: `{written}` has no length the compiler knows. Guard it — `if {written} bounds {at} \{ ... }` — or declare the vector with a length"
 	}
 	if index is ast.Expr.Ident(name) {
+		if str {
+			return "cannot prove `{name}` is in range for `{written}`. Guard it — `if {written} bounds {name} \{ ... }` — or take it from `indexOf`, whose `Ok` payload is always a position the string really has"
+		}
 		return "cannot prove `{name}` is in range for `{written}`. Guard it — `if {written} bounds {name} \{ ... }` — or take it from `indexOf`, whose `Ok` payload is always a position the vector really has"
 	}
 	return "cannot prove this index is in range: it is a computed expression, and there is nothing to hang a guard on. Bind it to a name first, then guard that"
@@ -722,13 +731,16 @@ func refusal(bo: Proofs, env: infer.Env, subject: ast.Expr, index: ast.Expr): St
 // that a refusal about `b.three` says `b.three` rather than `b` — naming the
 // record when the field is what could not be proved sends the reader to the wrong
 // declaration.
-func describe(e: ast.Expr): Str {
+func describe(bo: Proofs, env: infer.Env, e: ast.Expr): Str {
 	written := pathKey(e)
 	if written != "" {
 		return written
 	}
 	name := rootOf(e)
 	if name == "" {
+		if infer.typeOf(env, e) is types.Ty.TStr {
+			return "this string"
+		}
 		return "this vector"
 	}
 	return name
