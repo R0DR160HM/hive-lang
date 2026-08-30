@@ -1,0 +1,590 @@
+// What the program writes to
+// ==========================
+// A deep copy is what keeps a value a value ([08](../spec/08-mutability-and-values.md)),
+// and it is not free: `clone_T` copies every field that owns storage, however
+// large, every time a `T` is bound. This module works out which of those copies
+// anybody could ever tell apart.
+//
+// **The rule is the one 8.4 already keeps for bindings, one level down.** A
+// binding aliases rather than copies when the alias is provably indistinguishable
+// from a copy; a copy may *share* a field for the same reason. If nothing the
+// program can reach through that field is ever written, the copy's field and the
+// original's are two names for storage nobody rewrites, and sharing it is
+// indistinguishable from copying it.
+//
+// That is worth a great deal in practice. A racing game holds its circuit — four
+// hundred and eighty nodes, built once and read for the rest of the race — in the
+// same record as the cars, so every frame deep-copied the track to move a car
+// three metres.
+//
+// The question is asked about **types, not fields**, and that is the whole of
+// what makes it sound. Storage does not only travel down a path somebody wrote:
+// a `func` that returns `b.items` hands its caller the very slice the field
+// names, and a `mut` binding of it can write there without ever mentioning the
+// field. So the analysis asks what the program does to *storage of each shape*,
+// and a field is shared only when nothing reachable from its type is ever
+// written — through a path, through a call, or through a `mut` name.
+//
+// **It is whole-program and conservative.** It runs after flattening and
+// monomorphization, so it sees every declaration the build contains, and anything
+// it cannot follow makes it give up entirely rather than guess.
+import ./ast
+import ./infer
+import ./types
+
+/// The fields a copy has to copy, as `Type.field`. Anything not named here owns
+/// storage that the program never writes through, so a copy may share it.
+type Written {
+	/// `Type.field` for every field a write path goes **through**. This is the
+	/// precise half: the program said which field it was writing, so only that
+	/// field is denied the sharing.
+	fields: Str[dyn]
+	/// The storage shapes that can **leave a call inside its answer**. A copy
+	/// that shares gives a callee the caller's own storage, so a callable whose
+	/// result could be part of what it was handed can put that storage somewhere
+	/// this walk will never see it come from. Once a shape can do that, no field
+	/// holding one is shared.
+	///
+	/// It is read off signatures rather than followed through bodies, which is
+	/// both cheaper and safer: `build(seed: Int): Circuit` cannot hand back
+	/// anything it was given, because it was given nothing that owns storage.
+	escaped: Str[dyn]
+	table: types.Table
+	/// Set when the walk met a write it could not attribute at all. Nothing is
+	/// shared after that: this module shares a field only when the program has
+	/// been *shown* never to write it, and a walk that lost track has shown
+	/// nothing.
+	blind: Bool
+}
+
+/// What a deep copy still has to copy, as `Type.field` entries and escaped
+/// shapes. `m` is the flattened, monomorphized module — the whole of what the
+/// build contains — so a field missing from the answer is missing because nothing
+/// in the program writes it.
+proc writtenShapes(m: ast.Module): Str[dyn] {
+	t := types.tableOf(m)
+	mut Written w = Written([], [], t, false)
+	env := infer.newEnv(t)
+	markLeaks(w, m.decls)
+	for each d in m.decls {
+		walkDecl(w, env, d)
+	}
+	if w.blind {
+		// One `*` is everything: `mustCopy` finds it whatever it is asked.
+		return ["*"]
+	}
+	mut Str[dyn] out = []
+	for each f in w.fields {
+		append(out, "f" + f)
+	}
+	for each e in w.escaped {
+		append(out, "s" + e)
+	}
+	return out
+}
+
+/// Whether a copy of `owner` has to copy `field`, or may share it.
+///
+/// Two questions, and a yes to either is a copy. Did a write path go through
+/// this very field? And could storage of this field's shape have escaped to
+/// somewhere a write cannot be traced back from?
+func mustCopy(t: types.Table, written: Str[], owner: Str, field: Str, ty: types.Ty): Bool {
+	if indexOf(written, "*") is Result.Ok(_) {
+		return true
+	}
+	if indexOf(written, "f" + owner + "." + field) is Result.Ok(_) {
+		return true
+	}
+	return reaches(t, written, ty, [])
+}
+
+// Whether anything reachable from `ty` has escaped. A field is only shared when
+// this says no about the whole of what it holds: sharing a record shares every
+// piece of storage inside it, so one escaped piece anywhere below is enough to
+// need the copy.
+func reaches(t: types.Table, written: Str[], ty: types.Ty, seen: Str[]): Bool {
+	if types.ownsStorage(t, ty) == false {
+		// A scalar is a value and never storage, so it can neither escape nor be
+		// aliased. Marking one would deny the sharing to every record holding a
+		// number, which is every record there is.
+		return false
+	}
+	if indexOf(written, "s" + shapeOf(ty)) is Result.Ok(_) {
+		return true
+	}
+	if ty is types.Ty.TVec(element, _) {
+		return reaches(t, written, element, seen)
+	}
+	if ty is types.Ty.TMap(_, value) {
+		return reaches(t, written, value, seen)
+	}
+	if ty is types.Ty.TResult(ok, bad) {
+		return reaches(t, written, ok, seen) || reaches(t, written, bad, seen)
+	}
+	if ty is types.Ty.TNamed(name) {
+		// A type that reaches back into itself is reached through a variant, which
+		// is a pointer — and a pointer is storage of its own. Coming back round is
+		// answered yes, which is the conservative end.
+		if indexOf(seen, name) is Result.Ok(_) {
+			return true
+		}
+		mut Str[dyn] deeper = []
+		for each s in seen {
+			append(deeper, s)
+		}
+		append(deeper, name)
+		if types.findType(t, name) is Result.Ok(found) {
+			for each f in found.shared {
+				if reaches(t, written, types.resolve(t, f.declared), deeper) {
+					return true
+				}
+			}
+			for each v in found.variants {
+				for each f in v.fields {
+					if reaches(t, written, types.resolve(t, f.declared), deeper) {
+						return true
+					}
+				}
+			}
+			return false
+		}
+		// A type this cannot look up is one it cannot vouch for.
+		return true
+	}
+	return false
+}
+
+/// What a type looks like as *storage*, which is what deciding an alias needs to
+/// know. A declared length is left out on purpose: a `Str[3]` fills a `Str[dyn]`
+/// slot ([10.3](../spec/10-bounds.md#103-a-declared-length-is-a-promise)), so the
+/// two are one shape and a write to either is a write to both.
+func shapeOf(ty: types.Ty): Str {
+	if ty is types.Ty.TVec(element, _) {
+		return shapeOf(element) + "[]"
+	}
+	if ty is types.Ty.TMap(key, value) {
+		return "Map<" + shapeOf(key) + "," + shapeOf(value) + ">"
+	}
+	if ty is types.Ty.TResult(ok, bad) {
+		return "Result<" + shapeOf(ok) + "," + shapeOf(bad) + ">"
+	}
+	return types.show(ty)
+}
+
+// A field a write path went through.
+proc markField(w: mut Written, owner: Str, field: Str): void {
+	key := owner + "." + field
+	if indexOf(w.fields, key) is Result.Error(_) {
+		append(w.fields, key)
+	}
+}
+
+// A shape that escaped to somewhere writes cannot be traced from.
+proc markShape(w: mut Written, ty: types.Ty): void {
+	if types.ownsStorage(w.table, ty) == false {
+		// A scalar is a value; there is nothing to alias and nothing to deny.
+		return
+	}
+	shape := shapeOf(ty)
+	if indexOf(w.escaped, shape) is Result.Error(_) {
+		append(w.escaped, shape)
+	}
+}
+
+
+// --- What can leave a call ----------------------------------------------------
+
+// Every shape a callable could hand back out of what it was given.
+//
+// **A copy that shares is what makes this a question at all.** An argument used
+// to reach a callee as a copy of its own, so a `func` could only ever answer with
+// storage it made; now the copy may share, and `func itemsOf(b: Box): Str[dyn]`
+// answers with the very slice the caller's field names. Anything that can travel
+// that way is storage this module cannot vouch for, so no field holding one is
+// shared.
+//
+// Read off the signature: a shape leaks when it is reachable from the result
+// *and* from a parameter. That is why a builder is not caught by it — nothing
+// that owns storage went in, so nothing that owns storage can come back out of
+// what went in.
+proc markLeaks(w: mut Written, decls: ast.Decl[]): void {
+	for each d in decls {
+		if d is ast.Decl.CallableDecl(_, _, params, result, _, _) {
+			leaksFrom(w, params, types.resolve(w.table, result))
+		} else if d is ast.Decl.QueryDecl(_, params, result, _, _) {
+			leaksFrom(w, params, types.resolve(w.table, result))
+		}
+	}
+}
+
+proc leaksFrom(w: mut Written, params: ast.Param[], result: types.Ty): void {
+	if types.ownsStorage(w.table, result) == false {
+		// Nothing that owns storage comes back, so nothing can come back out of
+		// what went in. This is the case `lentFuncs` already relies on.
+		return
+	}
+	mut Str[dyn] answered = []
+	leakShapes(w.table, result, answered)
+	for each p in params {
+		mut Str[dyn] given = []
+		shapesOf(w.table, types.resolve(w.table, p.declared), given, [])
+		for each shape in answered {
+			if indexOf(given, shape) is Result.Ok(_) {
+				if indexOf(w.escaped, shape) is Result.Error(_) {
+					append(w.escaped, shape)
+				}
+			}
+		}
+	}
+}
+
+// The shapes a result can hand back **detached** — as a name of its own, with
+// nothing above it for a write to be traced through.
+//
+// It stops at a declared type, and that is the point. A callable answering with
+// a `Race` hands back storage still inside a `Race`, so a write to it is written
+// `r.track.nodes[0].x = ...` and the walk sees every field on the way. A callable
+// answering with a `Node[dyn]` hands back a bare vector: the caller writes
+// `ns[0].x = ...`, which names no field at all, and nothing could tie that back
+// to the circuit it came out of. Only the second kind has to deny the sharing.
+proc leakShapes(t: types.Table, ty: types.Ty, out: mut Str[dyn]): void {
+	if types.ownsStorage(t, ty) == false {
+		return
+	}
+	shape := shapeOf(ty)
+	if indexOf(out, shape) is Result.Error(_) {
+		append(out, shape)
+	}
+	// Unwrapping a vector, a map or a `Result` is how a caller gets at what is
+	// inside one without naming a field, so those are followed.
+	if ty is types.Ty.TVec(element, _) { leakShapes(t, element, out) return }
+	if ty is types.Ty.TMap(_, value) { leakShapes(t, value, out) return }
+	if ty is types.Ty.TResult(ok, bad) {
+		leakShapes(t, ok, out)
+		leakShapes(t, bad, out)
+	}
+}
+
+// Every storage shape reachable from `ty`, itself included.
+proc shapesOf(t: types.Table, ty: types.Ty, out: mut Str[dyn], seen: Str[]): void {
+	if types.ownsStorage(t, ty) == false {
+		return
+	}
+	shape := shapeOf(ty)
+	if indexOf(out, shape) is Result.Error(_) {
+		append(out, shape)
+	}
+	if ty is types.Ty.TVec(element, _) { shapesOf(t, element, out, seen) return }
+	if ty is types.Ty.TMap(_, value) { shapesOf(t, value, out, seen) return }
+	if ty is types.Ty.TResult(ok, bad) {
+		shapesOf(t, ok, out, seen)
+		shapesOf(t, bad, out, seen)
+		return
+	}
+	if ty is types.Ty.TNamed(name) {
+		if indexOf(seen, name) is Result.Ok(_) {
+			return
+		}
+		mut Str[dyn] deeper = []
+		for each one in seen {
+			append(deeper, one)
+		}
+		append(deeper, name)
+		if types.findType(t, name) is Result.Ok(found) {
+			for each f in found.shared {
+				shapesOf(t, types.resolve(t, f.declared), out, deeper)
+			}
+			for each v in found.variants {
+				for each f in v.fields {
+					shapesOf(t, types.resolve(t, f.declared), out, deeper)
+				}
+			}
+		}
+	}
+}
+
+// --- Declarations -------------------------------------------------------------
+
+proc walkDecl(w: mut Written, env: infer.Env, d: ast.Decl): void {
+	if d is ast.Decl.CallableDecl(_, _, params, _, body, _) {
+		walkBlock(w, infer.boundParams(env, params, 0), body)
+	} else if d is ast.Decl.QueryDecl(_, _, _, _, _) {
+		// A query body holds no assignment: its bound values are expressions, and
+		// an expression writes nothing.
+	} else if d is ast.Decl.TestDecl(_, body, _) {
+		walkBlock(w, env, body)
+	}
+}
+
+proc walkBlock(w: mut Written, env: infer.Env, body: ast.Block): void {
+	walkEach(w, env, body.stmts, 0)
+}
+
+// Statements in order, each walked with everything before it in scope — a write
+// through a local says nothing until the local's type is known.
+proc walkEach(w: mut Written, env: infer.Env, stmts: ast.Stmt[], at: Int): void {
+	if stmts bounds at {
+		walkEach(w, walkStmt(w, env, stmts[at]), stmts, at + 1)
+	}
+}
+
+proc walkStmt(w: mut Written, env: infer.Env, s: ast.Stmt): infer.Env {
+	if s is ast.Stmt.Assign(target, value) {
+		walkExpr(w, env, value)
+		walkExpr(w, env, target)
+		markPath(w, env, target)
+		// An assignment stores the value as it stands — unlike a binding, which
+		// copies — so a value that names storage in a field puts a second name on
+		// it, and the target can be written through.
+		markThrough(w, env, value)
+		return env
+	}
+	if s is ast.Stmt.VarDecl(name, value, mutable, _) {
+		walkExpr(w, env, value)
+		// **A `mut` binding may be written through**, and 8.4 lets one alias what
+		// it was bound from — so unless the source is fresh, the shape it names is
+		// a shape this program can write.
+		// **A `mut` binding may be written through**, and 8.4 lets one alias what
+		// it was bound from — so a source that names storage already in a field
+		// is a name that can write there.
+		if mutable {
+			markThrough(w, env, value)
+		}
+		return infer.bound(env, name, infer.typeOf(env, value))
+	}
+	if s is ast.Stmt.TypedDecl(declared, name, value, mutable, _) {
+		walkExpr(w, env, value)
+		if mutable {
+			markThrough(w, env, value)
+		}
+		return infer.bound(env, name, types.resolve(w.table, declared))
+	}
+	if s is ast.Stmt.IfChain(branches, otherwise, _) {
+		for each b in branches {
+			walkExpr(w, env, b.condition)
+			walkBlock(w, infer.narrowed(env, b.condition), b.body)
+		}
+		walkBlock(w, env, otherwise)
+		return env
+	}
+	if s is ast.Stmt.ForLoop(init, cond, post, body) {
+		inner := walkStmt(w, env, init)
+		walkExpr(w, inner, cond)
+		walkStmt(w, inner, post)
+		walkBlock(w, inner, body)
+		return env
+	}
+	if s is ast.Stmt.ForEach(name, declared, subject, body) {
+		walkExpr(w, env, subject)
+		mut element := types.elementOf(infer.typeOf(env, subject))
+		if declared is ast.TypeExpr.VoidType {
+		} else {
+			element = types.resolve(w.table, declared)
+		}
+		walkBlock(w, infer.bound(env, name, element), body)
+		return env
+	}
+	if s is ast.Stmt.ReturnStmt(value) { walkExpr(w, env, value) return env }
+	if s is ast.Stmt.EchoStmt(value) { walkExpr(w, env, value) return env }
+	if s is ast.Stmt.AssertStmt(condition) { walkExpr(w, env, condition) return env }
+	if s is ast.Stmt.PanicStmt(value) { walkExpr(w, env, value) return env }
+	if s is ast.Stmt.AsyncStmt(call) { walkExpr(w, env, call) return env }
+	if s is ast.Stmt.Expression(value) { walkExpr(w, env, value) return env }
+	return env
+}
+
+// --- Expressions ---------------------------------------------------------------
+
+// An expression writes nothing by itself. What it can do is hand storage to
+// something that writes: a builtin that grows a vector, or a `mut` parameter.
+proc walkExpr(w: mut Written, env: infer.Env, e: ast.Expr): void {
+	if e is ast.Expr.Call(callee, args) {
+		markCall(w, env, callee, args)
+		walkExpr(w, env, callee)
+		for each a in args {
+			walkExpr(w, env, a.value)
+		}
+		return
+	}
+	if e is ast.Expr.Member(subject, _) { walkExpr(w, env, subject) return }
+	if e is ast.Expr.Index(subject, index) {
+		walkExpr(w, env, subject)
+		walkExpr(w, env, index)
+		return
+	}
+	if e is ast.Expr.Slice(subject, low, high) {
+		walkExpr(w, env, subject)
+		walkExpr(w, env, low)
+		walkExpr(w, env, high)
+		return
+	}
+	if e is ast.Expr.Binary(_, left, right) {
+		walkExpr(w, env, left)
+		walkExpr(w, env, right)
+		return
+	}
+	if e is ast.Expr.Negate(operand) { walkExpr(w, env, operand) return }
+	if e is ast.Expr.VectorLit(items) {
+		for each item in items {
+			walkExpr(w, env, item)
+		}
+		return
+	}
+	if e is ast.Expr.Interp(parts) {
+		for each part in parts {
+			if part is ast.InterpPart.Expression(value) {
+				walkExpr(w, env, value)
+			}
+		}
+		return
+	}
+	if e is ast.Expr.IsMatch(subject, _) { walkExpr(w, env, subject) return }
+	if e is ast.Expr.Timed(call, ms) {
+		walkExpr(w, env, call)
+		walkExpr(w, env, ms)
+		return
+	}
+	if e is ast.Expr.AwaitAll(calls, timeout) {
+		for each c in calls {
+			walkExpr(w, env, c)
+		}
+		walkExpr(w, env, timeout)
+		return
+	}
+	if e is ast.Expr.WithType(value, _) { walkExpr(w, env, value) return }
+	if e is ast.Expr.UsingExpr(source, _) { walkExpr(w, env, source) return }
+}
+
+// --- What counts as a write ----------------------------------------------------
+
+// What an assignment target writes into. `v[0] = x` rewrites the storage `v`
+// names, and `rec.f = x` rewrites the record's own memory — so the write reaches
+// out through whatever held the thing written, and every field on the way out is
+// marked.
+//
+// `b.items = other` marks `Box.items`'s *holder* and not `items` itself: it
+// rebinds the field and leaves whatever it held alone.
+proc markPath(w: mut Written, env: infer.Env, target: ast.Expr): void {
+	if target is ast.Expr.Index(subject, _) { markThrough(w, env, subject) return }
+	if target is ast.Expr.Slice(subject, _, _) { markThrough(w, env, subject) return }
+	if target is ast.Expr.Member(subject, _) { markThrough(w, env, subject) return }
+}
+
+// `e` names storage being written into. Every field the path came out through
+// holds storage the write reaches, so each is denied the sharing.
+proc markThrough(w: mut Written, env: infer.Env, e: ast.Expr): void {
+	if e is ast.Expr.Member(subject, field) {
+		ty := infer.typeOf(env, subject)
+		if ty is types.Ty.TNamed(owner) {
+			markField(w, owner, field)
+		} else if ty is types.Ty.TUnknown {
+			w.blind = true
+			return
+		} else {
+			// A field of something that is not a declared type — a library value.
+			// It has no generated clone to share anything, but this cannot prove
+			// that, so it takes the safe end.
+			markShape(w, infer.typeOf(env, e))
+		}
+		markThrough(w, env, subject)
+		return
+	}
+	if e is ast.Expr.Index(subject, _) { markThrough(w, env, subject) return }
+	if e is ast.Expr.Slice(subject, _, _) { markThrough(w, env, subject) return }
+	// A bare name is its own storage: a local, or a parameter the callee was
+	// handed. Nothing above it holds it, so there is no field to deny.
+}
+
+
+// A call that can write through what it was given: the builtins that grow or
+// reorder a vector, and any `mut` parameter.
+proc markCall(w: mut Written, env: infer.Env, callee: ast.Expr, args: ast.Arg[]): void {
+	name := calleeName(callee)
+	// The four builtins that write through the vector they are given.
+	if name == "append" || name == "prepend" || name == "drop" || name == "sort" {
+		if args bounds 0 {
+			markThrough(w, env, args[0].value)
+		}
+		return
+	}
+	// The two standard library calls that take a mutex. Everything else in the
+	// library is handed a value and answers with one, so nothing it was given is
+	// written where the caller can see it.
+	if callee is ast.Expr.Member(head, called) {
+		if head is ast.Expr.Member(root, module) {
+			if root is ast.Expr.Ident(hiveName) {
+				if hiveName == "hive" && module == "map" {
+					if called == "set" || called == "delete" {
+						if args bounds 0 {
+							markThrough(w, env, args[0].value)
+						}
+					}
+					return
+				}
+			}
+		}
+	}
+	// A mutex parameter takes the caller's own storage rather than a copy, so
+	// whatever was handed to one is storage the program writes.
+	//
+	// A call with **named** arguments does not line its arguments up with its
+	// parameters by position, so which one landed on the mutex cannot be read off
+	// the order. There is no reason to work it out: marking all of them is right
+	// and costs a copy nobody was going to save.
+	if callee is ast.Expr.Ident(plain) {
+		if types.findCallable(env.table, plain) is Result.Ok(found) {
+			if anyNamed(args) {
+				if takesMutex(found.params) {
+					for each a in args {
+						markThrough(w, env, a.value)
+					}
+				}
+				return
+			}
+			mut i := 0
+			for each p in found.params {
+				if p.mutex {
+					if args bounds i {
+						markThrough(w, env, args[i].value)
+					}
+				}
+				i = i + 1
+			}
+		}
+	}
+}
+
+func anyNamed(args: ast.Arg[]): Bool {
+	for each a in args {
+		if a.name != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func takesMutex(params: ast.Param[]): Bool {
+	for each p in params {
+		if p.mutex {
+			return true
+		}
+	}
+	return false
+}
+
+func calleeName(callee: ast.Expr): Str {
+	if callee is ast.Expr.Ident(name) { return name }
+	if callee is ast.Expr.Member(head, name) {
+		if head is ast.Expr.Ident(root) {
+			if root == "hive" { return name }
+		}
+	}
+	return ""
+}
+
+// The declared type a field belongs to, or `""` where it is not one this module
+// can name.
+func ownerName(ty: types.Ty): Str {
+	if ty is types.Ty.TNamed(name) { return name }
+	return ""
+}

@@ -29,6 +29,7 @@ import ./stdlib
 import ./text
 import ./token
 import ./types
+import ./writes
 
 /// A generated Go file, and what could not be generated.
 type Emitted {
@@ -106,6 +107,11 @@ type Emit {
 	/// author wrote, and this is what tells that apart from the clone helpers and
 	/// the atom table the compiler wrote beside it.
 	spans: Str[dyn]
+	/// What a deep copy still has to copy: `Type.field` for every field a write
+	/// path goes through, and the storage shapes that can leave a call inside its
+	/// answer. A field in neither owns storage the program never rewrites, so a
+	/// copy shares it — see `writes.hive`.
+	written: Str[dyn]
 	/// The regexes a string pattern's holes asked for, as the Go to compile.
 	/// Each becomes one package-level variable, so a pattern is compiled once
 	/// when the program starts and never again — and two patterns that read the
@@ -121,7 +127,7 @@ type Emit {
 /// Emit a whole program.
 proc emitModule(m: ast.Module): Emitted {
 	t := types.tableOf(m)
-	mut Emit em = Emit(t, [], 0, ["Nil"], [], [], [], [], [], [], [], 0, [], [], [], [], [], false, false, -1, [], [], 0, [])
+	mut Emit em = Emit(t, [], 0, ["Nil"], [], [], [], [], [], [], [], 0, [], [], [], [], [], false, false, -1, [], writes.writtenShapes(m), [], 0, [])
 
 	line(em, "package main")
 	line(em, "")
@@ -540,10 +546,7 @@ proc emitClone(em: mut Emit, name: Str, fields: ast.Field[], variants: ast.Varia
 	if len(variants) == 0 {
 		line(em, "out := v")
 		for each f in fields {
-			ty := types.resolve(em.table, f.declared)
-			if types.ownsStorage(em.table, ty) {
-				line(em, "out." + goField(f.name) + " = " + cloned(em.table, ty, "v." + goField(f.name)))
-			}
+			cloneField(em, name, f, "v.")
 		}
 		line(em, "return out")
 		close(em, "}")
@@ -553,10 +556,10 @@ proc emitClone(em: mut Emit, name: Str, fields: ast.Field[], variants: ast.Varia
 		open(em, "if inner, ok := v.(" + goVariant(name, variant.name) + "); ok \{")
 		line(em, "out := inner")
 		for each f in variant.fields {
-			cloneField(em, f)
+			cloneField(em, name, f, "inner.")
 		}
 		for each f in fields {
-			cloneField(em, f)
+			cloneField(em, name, f, "inner.")
 		}
 		line(em, "return out")
 		close(em, "}")
@@ -565,11 +568,24 @@ proc emitClone(em: mut Emit, name: Str, fields: ast.Field[], variants: ast.Varia
 	close(em, "}")
 }
 
-proc cloneField(em: mut Emit, f: ast.Field): void {
+// One field of a copy. A field that owns storage is copied — unless nothing in
+// the program can write through it, in which case `out` already holds the same
+// header `v` does and sharing it is indistinguishable from copying it.
+//
+// The saving is not small. It is the difference between a copy that costs what
+// the value *is* and one that costs what the program can *do* to it: a racing
+// game's circuit is four hundred and eighty nodes, built once and read for the
+// rest of the race, sitting in the same record as the cars that move every
+// frame.
+proc cloneField(em: mut Emit, owner: Str, f: ast.Field, from: Str): void {
 	ty := types.resolve(em.table, f.declared)
-	if types.ownsStorage(em.table, ty) {
-		line(em, "out." + goField(f.name) + " = " + cloned(em.table, ty, "inner." + goField(f.name)))
+	if types.ownsStorage(em.table, ty) == false {
+		return
 	}
+	if writes.mustCopy(em.table, em.written, owner, f.name, ty) == false {
+		return
+	}
+	line(em, "out." + goField(f.name) + " = " + cloned(em.table, ty, from + goField(f.name)))
 }
 
 // --- Statements --------------------------------------------------------------
@@ -3636,7 +3652,7 @@ proc emitTests(m: ast.Module, atoms: Str[], codecs: Str[]): Str {
 	t := types.tableOf(m)
 	// The codecs `main.go` already wrote are seeded rather than written again:
 	// the two files are one Go package.
-	mut Emit em = Emit(t, [], 0, copiedNames(atoms), [], [], [], [], lentFuncs(t, m.decls), [], copiedNames(codecs), 0, [], [], [], [], [], true, false, -1, [], [], 0, [])
+	mut Emit em = Emit(t, [], 0, copiedNames(atoms), [], [], [], [], lentFuncs(t, m.decls), [], copiedNames(codecs), 0, [], [], [], [], [], true, false, -1, [], writes.writtenShapes(m), [], 0, [])
 	written := len(codecs)
 	mut found := false
 	for each d in m.decls {
