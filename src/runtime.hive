@@ -7311,6 +7311,11 @@ func uiSource(): Str {
 		var paintScene = null;
 		var attachScene = null;
 		var pendingScene = null;
+		var sceneQueued = false;
+		// Whether the program still owes an answer for the last frame this window
+		// reported. See the note on the "A" frame below, and tick in the scene
+		// module, which is the one thing that reads it.
+		var hiveOwed = false;
 		// Where a module that draws inside the window registers itself: the first is
 		// handed each scene frame, and the second is called whenever the document was
 		// swapped, so whatever it draws on can find its box again. The shell knows only
@@ -7319,14 +7324,48 @@ func uiSource(): Str {
 		  paintScene = paint;
 		  attachScene = attach;
 		  attach();
-		  if (pendingScene !== null) { paint(pendingScene); pendingScene = null; }
+		  flushScene();
 		};
+		// **The newest description of the world, drawn once, on the next frame.**
+		//
+		// This used to parse and apply every scene frame the moment it arrived, inside
+		// onmessage, and that is the wrong shape for anything a program can produce
+		// faster than this window can swallow. A scene is not a delta and it is not an
+		// event: it is the whole world, and **the only one worth drawing is the last
+		// one**. Handling them all in order means a window that has fallen a little
+		// behind gets further behind with every frame, because it is paying to build
+		// pictures that were already out of date when it started them — and none of
+		// that work reaches the screen, since the next one overwrites it.
+		//
+		// So an arriving frame is *stored* rather than drawn, and one draw is asked for
+		// on the next animation frame. Frames that arrive in between overwrite the
+		// stored one and cost a string assignment. What was a queue that could only
+		// grow is now a slot with the freshest thing in it.
+		function flushScene() {
+		  sceneQueued = false;
+		  if (!paintScene || pendingScene === null) { return; }
+		  var body = pendingScene;
+		  pendingScene = null;
+		  paintScene(body);
+		}
 		sock.onmessage = function (e) {
+		  var head = e.data.charAt(0);
+		  // **The answer.** One of these goes out for every turn of the fold, whether or
+		  // not anything on the page changed — see uiWindow.publish — and it is the
+		  // whole of what lets this window keep exactly one frame in flight instead of
+		  // shouting sixty a second at a program that may be managing twenty.
+		  if (head === "A") { hiveOwed = false; return; }
 		  var body = e.data.slice(1);
-		  if (e.data.charAt(0) === "S") {
+		  if (head === "S") {
 		    // A frame that arrives before the drawing module has loaded is kept, not
-		    // dropped: it is the only description of the world there is.
-		    if (paintScene) { paintScene(body); } else { pendingScene = body; }
+		    // dropped: it is the only description of the world there is. It is kept the
+		    // same way one arriving after it is, which is why there is one slot and not
+		    // two.
+		    pendingScene = body;
+		    if (paintScene && !sceneQueued) {
+		      sceneQueued = true;
+		      requestAnimationFrame(flushScene);
+		    }
 		    return;
 		  }
 		  var focused = document.activeElement;
@@ -7574,6 +7613,25 @@ func uiSource(): Str {
 				if world {
 					NetWsSend(c, "S"+scene)
 				}
+				// **The answer, and it goes whether or not anything changed.**
+				//
+				// A window reports one frame per animation frame, and nothing between it
+				// and the fold ever dropped one: uiPump puts every message in the mailbox
+				// and the fold takes them in order. So a fold that cannot finish inside a
+				// frame does not skip a frame — it falls behind, the mailbox grows for as
+				// long as the mismatch lasts, and every keypress after that waits behind
+				// a queue of stale frames nobody can do anything about any more. The
+				// world runs slow at the same time, because it is stepped by the gaps
+				// those messages carry and they are arriving slower than they happened.
+				//
+				// This is the byte that stops it. The window holds its next frame until
+				// this arrives, so there is at most one in flight, the queue cannot build
+				// and the gap the next frame carries is the time that really passed.
+				//
+				// Unconditional on purpose: tying it to H or S would deadlock the moment
+				// a fold left the page exactly as it was, which is a still screen and not
+				// an error.
+				NetWsSend(c, "A")
 			}
 		}
 
@@ -8280,6 +8338,11 @@ func uiSceneSource(): Str {
 		func UiAttrGrab(on bool) UiAttr        { return UiAttr{Kind: "grab", Flag: on} }
 		func UiAttrCrosshair(on bool) UiAttr   { return UiAttr{Kind: "crosshair", Flag: on} }
 
+		// Whether the sun casts. **Absent means yes**, so a scene written before this
+		// existed draws exactly as it did — and a program that wants the frames back
+		// has one thing to say rather than a lighting rig to describe.
+		func UiAttrShadows(on bool) UiAttr    { return UiAttr{Kind: "shadows", Flag: on} }
+
 		func UiAttrOnFrame(f func(int) any) UiAttr    { return UiAttr{Kind: "onFrame", FnInt: f} }
 		func UiAttrOnKeyDown(f func(string) any) UiAttr { return UiAttr{Kind: "onKeyDown", FnStr: f} }
 		func UiAttrOnKeyUp(f func(string) any) UiAttr   { return UiAttr{Kind: "onKeyUp", FnStr: f} }
@@ -8336,6 +8399,12 @@ func uiSceneSource(): Str {
 			}
 			if grab, ok := uiFind(attrs, "grab"); ok && grab.Flag {
 				b.WriteString(",\"grab\":1")
+			}
+			// **Written only when it is false**, which is what makes "absent means yes"
+			// true on the page as well as here: every scene ever written says nothing
+			// and gets shadows, and the one that has turned them off says so.
+			if lit, ok := uiFind(attrs, "shadows"); ok && !lit.Flag {
+				b.WriteString(",\"flat\":1")
 			}
 			// Which events the program is actually listening for. A page that would only
 			// be telling the fold about frames nobody folds says nothing instead.
@@ -8556,14 +8625,66 @@ func uiSceneJs(): Str {
 		var renderer = null, stage = null, camera = null;
 		var host = null, handle = "", world = null;
 		var seen = {left: -1, top: -1, width: -1, height: -1};
-		var live = [], geoms = new Map(), mats = new Map(), inks = new Map(), signs = new Map();
-		var skins = new Map();
+		var live = [], geoms = new Map(), mats = new Map(), signs = new Map();
+		var skins = new Map(), bumps = new Map(), reliefs = new Map(), skies = new Map();
+		// The sun is held rather than let go of, because it now has to be moved: a
+		// shadow map covers a box, and the box has to be wherever the eye is.
+		var sun = null;
+		// Every photograph this program shipped, and every canvas that is waiting to be
+		// redrawn when one arrives. See photoOf.
+		var photos = new Map(), waiting = [];
+		// Which frame this is, counted only so the shadow map can be drawn on half of
+		// them. See apply.
+		var beat = 0;
 		var want = "", grabbing = false, lookX = 0, lookY = 0, last = 0, dirty = false;
 		var held = {};
 
 		function boot() {
 		  renderer = new THREE.WebGLRenderer({antialias: true});
 		  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+		  // **Shadows, and the one thing that makes them affordable.** A shadow map is a
+		  // second pass over the scene from where the sun is, and a scene here can be a
+		  // circuit two miles round — mapped whole, at any texture size a card will
+		  // give you, a shadow would be a smear a metre wide. So the map does not cover
+		  // the world. It covers a box round the eye (see reach below), which is
+		  // where shadows are read anyway: the thing a shadow is *for* is telling you
+		  // that a car is beside you and that the kerb is where you think it is, and
+		  // neither of those is a question about something four hundred metres away.
+		  // Everything outside the box is culled out of the pass, which is the whole of
+		  // why this costs what it costs.
+		  renderer.shadowMap.enabled = true;
+		  // **A shadow map costs twice, and the second time is the expensive one.** Once
+		  // to draw, which is what its size and its rate decide; and once to *read*,
+		  // which happens for every lit fragment on the screen rather than for every
+		  // texel in the map. At three thousand eight hundred by eighteen hundred that
+		  // read is seven million times a frame, and how many samples it takes is by
+		  // some distance the largest number in this renderer.
+		  //
+		  // Measured on an Iris Xe at that size, bracketed either side to rule out the
+		  // machine warming up: PCFSoft thirty-four frames, PCF thirty-three, Basic
+		  // forty. **Basic is the cheap one and it is not usable here**, which is worth
+		  // writing down so nobody else spends the afternoon finding out. Unfiltered,
+		  // every wall lit edge-on comes back corrugated — see the note on normalBias —
+		  // and the only bias big enough to clear it is big enough to lift a car's
+		  // shadow clean off the car. Six frames for shadows that are not under
+		  // anything is not a trade.
+		  //
+		  // So: PCF, which is three.js's own default, is a frame cheaper than PCFSoft
+		  // and looks the same at this scale.
+		  renderer.shadowMap.type = THREE.PCFShadowMap;
+		  // **And it is not redrawn every frame.** The map is a second pass over
+		  // everything the sun can see, and what it is a picture of barely moves: the
+		  // light's *direction* is fixed — see apply — so between one frame and the next
+		  // all that changes is where its box is centred, by however far the eye
+		  // travelled. A metre, at racing speed. Redrawing that sixty times a second is
+		  // paying full price for a picture that was already right.
+		  //
+		  // So it is drawn every other frame and the sun is moved on the same beat.
+		  // That pairing is the whole of the trick and it is not optional: move the
+		  // light without redrawing the map and the map is a depth field taken from
+		  // somewhere the light no longer is, which is every shadow in the scene
+		  // sliding about under the thing casting it.
+		  renderer.shadowMap.autoUpdate = false;
 		  stage = new THREE.Scene();
 		  camera = new THREE.PerspectiveCamera(75, 1, 0.08, 800);
 		  // Yaw, then pitch. With the default order a camera that is looking up rolls as
@@ -8576,11 +8697,82 @@ func uiSceneJs(): Str {
 		  // three.js takes these in physical units, where 1 is already a full-strength
 		  // white surface facing the light.
 		  stage.add(new THREE.HemisphereLight(0xffffff, 0x4a5568, 0.65));
-		  var sun = new THREE.DirectionalLight(0xffffff, 1.35);
+		  sun = new THREE.DirectionalLight(0xffffff, 1.35);
 		  sun.position.set(6, 14, 8);
+		  sun.castShadow = true;
+		  // **Two thousand and forty-eight, and it is very nearly free.** Drawing the
+		  // map is the cheap half: measured both ways and under both filters, halving
+		  // it to 1024 moved the frame rate by less than the noise between two runs of
+		  // the same build. What a shadow map costs to *draw* is the geometry that
+		  // survives the cull, and inside fifty-five metres there is not much of it.
+		  //
+		  // So the size is spent where it does something. Over a box that size it is a
+		  // shadow texel of five and a half centimetres, and that is what lets the
+		  // unfiltered edge below pass for a drawn one instead of a staircase.
+		  sun.shadow.mapSize.set(2048, 2048);
+		  var box = sun.shadow.camera;
+		  box.left = -reach();
+		  box.right = reach();
+		  box.top = reach();
+		  box.bottom = -reach();
+		  box.near = 1;
+		  box.far = reach() * 3;
+		  box.updateProjectionMatrix();
+		  // **How far a surface stands out of its own way, and it is a quarter of a
+		  // metre because a tenth was not enough.**
+		  //
+		  // A shadow map is one depth per texel, and a surface lit edge-on has a depth
+		  // that changes across a texel by far more than the map can express — so half
+		  // its texels come out just behind their own recorded depth and shade
+		  // themselves, and half do not. On a wall a kilometre long, seen down its
+		  // length, the two halves alternate and the wall comes out **corrugated**. It
+		  // is the most convincing wrong thing a renderer produces, because it looks
+		  // exactly like a texture: it was blamed here on a normal map, then on a
+		  // photograph, then on a canvas size, and it was none of them. The test that
+		  // settles it is one build with renderer.shadowMap.enabled turned off.
+		  //
+		  // normalBias moves the point being tested out along the surface it is on,
+		  // which is the honest lever: what the map cannot resolve is depth *across* the
+		  // surface, and stepping off the surface is what stops asking. It is paid for
+		  // in contact — a shadow may sit a quarter of a metre from the foot of what
+		  // casts it — and against a circuit's scale that is nothing, where corrugated
+		  // barriers are the first thing anybody sees. The far plane is pulled in to
+		  // three times the reach for the same reason: every metre of depth range not
+		  // used is precision the near end gets back.
+		  //
+		  // Nothing here is a substitute for the shadow map recording the far faces of a
+		  // solid rather than the near ones, which is what keeps a closed object from
+		  // shading its own front — three.js already does that for a front-sided
+		  // material, so there is nothing to ask for and nothing to write down but this.
+		  sun.shadow.bias = -0.0006;
+		  sun.shadow.normalBias = 0.25;
 		  stage.add(sun);
+		  stage.add(sun.target);
 		  holder.appendChild(renderer.domElement);
 		  listen();
+		}
+
+		// How far from the eye a shadow is drawn, in metres.
+		//
+		// Fifty-five is about a second at speed, and a second is as far ahead as a
+		// shadow is read: what one is *for* here is telling you a car is beside you and
+		// that the kerb is where you think it is. It was eighty, and the twenty-five
+		// metres came off because what a shadow map costs is its area — texels to clear
+		// and geometry that survives the cull — and the outer quarter of that box was
+		// buying a shadow you would have had to go looking for.
+		function reach() { return 55; }
+
+		// The most anisotropy the card will give, within reason. It is what stops a road
+		// seen at a glancing angle — which is every road, all the time — from turning to
+		// mush a dozen metres in front of the car.
+		//
+		// **Four and not eight.** Eight is twice the samples on every glancing surface,
+		// and a road at a glancing angle is most of what a racing game draws — so this
+		// is not a cheap knob, it is a multiplier on the largest thing in the picture.
+		// What it buys past four is sharpness somewhere the fog has already taken.
+		function most() {
+		  if (!renderer) { return 4; }
+		  return Math.min(4, renderer.capabilities.getMaxAnisotropy());
 		}
 
 		// --- the box the picture goes in -------------------------------------------
@@ -8637,11 +8829,16 @@ func uiSceneJs(): Str {
 
 		function apply(w) {
 		  want = w.on || "";
-		  var sky = w.sky ? ink(w.sky) : null;
+		  var sky = w.sky ? heavens(w.sky) : null;
 		  if (sky) { stage.background = sky; }
 		  if (w.fog) {
 		    if (!stage.fog) { stage.fog = new THREE.Fog(0x8ecbff, 1, 100); }
-		    if (sky) { stage.fog.color = sky; }
+		    // **The haze is the horizon's colour and not the sky's**, which are now two
+		    // different colours. A road fades into the band it is actually disappearing
+		    // behind; faded into the colour overhead it would end in a stripe of the
+		    // wrong blue, which is the one thing a gradient sky can do worse than a flat
+		    // one if nothing is told about it.
+		    if (sky) { stage.fog.color.copy(sky.userData.haze); }
 		    // The attribute is the distance at which the sky swallows things whole, and
 		    // the haze starts at half of it — near enough to give depth, far enough that
 		    // an arena that size is not looked at through a mist.
@@ -8652,6 +8849,41 @@ func uiSceneJs(): Str {
 		  }
 		  camera.position.set(w.eye[0], w.eye[1], w.eye[2]);
 		  camera.rotation.set(w.aim[1], w.aim[0], 0);
+		  // The sun keeps its bearing and changes its address. A directional light has
+		  // no place — only a direction — but the *box its shadow covers* has one, and
+		  // it hangs off where the light says it is, so the light is carried along under
+		  // the eye. The offsets are the same 6, 14, 8 the rig was built with, scaled
+		  // up: the shadows fall the way they always did and the box they fall inside
+		  // is now wherever anybody is looking.
+		  // Whether the sun casts at all. **Turning this changes every shader in the
+		  // scene**, because whether a material samples a shadow map is compiled into
+		  // it — so it is done on the frame it changes and never on any other, and
+		  // every material already built is told to rebuild itself. A program that
+		  // never mentions it never reaches this line twice.
+		  var wantLit = !w.flat;
+		  if (wantLit !== renderer.shadowMap.enabled) {
+		    renderer.shadowMap.enabled = wantLit;
+		    mats.forEach(function (m) { m.needsUpdate = true; });
+		    renderer.shadowMap.needsUpdate = true;
+		  }
+		  // **Every other frame, and the map is redrawn on the same one.** The two have
+		  // to move together — see boot — because the shadow map is only correct for
+		  // the place the light was standing when it was taken. Skipping both leaves a
+		  // box centred up to a metre behind the eye, on a box fifty-five metres
+		  // across, which is nothing; skipping one of them is every shadow in the scene
+		  // adrift.
+		  //
+		  // The light's *direction* never changes — the offsets below are fixed and the
+		  // target is directly under the eye — so nothing about the shading depends on
+		  // this at all. It is only ever the box that moves.
+		  beat = beat + 1;
+		  if (wantLit && beat % 2 === 0) {
+		    sun.target.position.set(w.eye[0], 0, w.eye[2]);
+		    sun.position.set(w.eye[0] + reach() * 0.36, reach() * 0.85,
+		      w.eye[2] + reach() * 0.48);
+		    sun.target.updateMatrixWorld();
+		    renderer.shadowMap.needsUpdate = true;
+		  }
 		  var lens = w.lens || 75;
 		  if (camera.fov !== lens) { camera.fov = lens; camera.updateProjectionMatrix(); }
 		  // The sounds are taken out before the solids are drawn, because the solids
@@ -8719,6 +8951,14 @@ func uiSceneJs(): Str {
 		    var geo = geoms.get(sig);
 		    if (!geo) { geo = solid(s); geoms.set(sig, geo); }
 		    made = new THREE.Mesh(geo, paintOf(s));
+		    // **A floor receives and does not cast**, and that is not a saving. A plane
+		    // lying on the ground casts onto itself: every pixel of it is both the
+		    // caster and the catcher, they are the same distance from the sun to within
+		    // the map's precision, and what comes out is the stripes that every shadow
+		    // bias in every renderer exists to argue with. It has nothing under it to
+		    // shade in any case.
+		    made.castShadow = s.k !== "ground";
+		    made.receiveShadow = true;
 		  }
 		  made.userData.sig = sig;
 		  return made;
@@ -8757,10 +8997,50 @@ func uiSceneJs(): Str {
 		  if (o.material !== m) { o.material = m; }
 		}
 
-		function ink(hex) {
-		  var c = inks.get(hex);
-		  if (!c) { c = new THREE.Color(); c.setStyle(hex); inks.set(hex, c); }
-		  return c;
+		// The sky, as a band of colour rather than a colour.
+		//
+		// **A flat background is the one thing in a scene that cannot be looked at.** It
+		// has no up and no far, so a horizon drawn against it is a line where the world
+		// stops rather than a place where it carries on — and a circuit is nearly all
+		// horizon. What a sky actually does for a picture is give the eye somewhere to
+		// put "far away", and it does that by being two colours: deeper overhead,
+		// paler and hazier where the ground meets it.
+		//
+		// It is an equirectangular texture four pixels wide, which is a strip of colour
+		// wrapped round the inside of the world. Four rather than one because a texture
+		// wants a width; nothing varies across it, because nothing about a sky should
+		// depend on which way you are facing — there is no sun in it, and a bright patch
+		// that did not agree with where the shadows fall would be worse than none.
+		function heavens(hex) {
+		  var kept = skies.get(hex);
+		  if (kept) { return kept; }
+		  var mid = new THREE.Color();
+		  mid.setStyle(hex);
+		  var high = mid.clone().multiplyScalar(0.66);
+		  var haze = mid.clone().lerp(new THREE.Color(1, 1, 1), 0.42);
+		  var canvas = document.createElement("canvas");
+		  canvas.width = 4;
+		  canvas.height = 256;
+		  var ctx = canvas.getContext("2d");
+		  var band = ctx.createLinearGradient(0, 0, 0, 256);
+		  band.addColorStop(0, "#" + high.getHexString());
+		  band.addColorStop(0.42, "#" + mid.getHexString());
+		  band.addColorStop(0.52, "#" + haze.getHexString());
+		  // And below the horizon, the same haze going quietly darker — which is never
+		  // seen from a car on the ground and is exactly what a camera tipped down over
+		  // a rostrum sees.
+		  band.addColorStop(1, "#" + haze.clone().multiplyScalar(0.82).getHexString());
+		  ctx.fillStyle = band;
+		  ctx.fillRect(0, 0, 4, 256);
+		  var tex = new THREE.CanvasTexture(canvas);
+		  tex.colorSpace = THREE.SRGBColorSpace;
+		  tex.mapping = THREE.EquirectangularReflectionMapping;
+		  tex.wrapS = THREE.RepeatWrapping;
+		  // Carried on the texture because the fog has to match the band the road is
+		  // vanishing into, and this is the one place that knows what that band is.
+		  tex.userData.haze = haze;
+		  skies.set(hex, tex);
+		  return tex;
 		}
 
 		// One material per colour *and* grain, shared by every shape wearing it. Toon
@@ -8784,6 +9064,21 @@ func uiSceneJs(): Str {
 		    // and the ghost of one share a single texture between them.
 		    m = new THREE.MeshToonMaterial({
 		      map: grain(finish, body, tile),
+		      // What the surface *faces*, pixel by pixel, as against what colour it is.
+		      // Toon shading quantises how lit a face is, so without this every face is
+		      // one of three flat cards however finely it is painted — the grain shows
+		      // and nothing about it catches the light. With it, a kerb has edges, a
+		      // gravel trap has stones in it and a wall has a wall's texture, all from
+		      // the drawing that was already there. See relief.
+		      normalMap: bumped(finish) ? relief(finish, tile) : null,
+		      // **Under a half, and that is measured rather than tasteful.** A normal
+		      // map is not a picture, it is lighting, and lighting amplifies whatever
+		      // is in it: at full strength a photographed wall's own form-panel
+		      // structure — which repeats every two metres, because that is what the
+		      // tiling is — came out as corrugated iron down every barrier on the
+		      // circuit. What is wanted from relief here is that an edge catches the
+		      // sun, not that a flat thing stops being flat.
+		      normalScale: new THREE.Vector2(0.45, 0.45),
 		      transparent: thick < 1,
 		      opacity: thick,
 		      alphaTest: pierced ? 0.5 : 0,
@@ -8898,25 +9193,334 @@ func uiSceneJs(): Str {
 		  return Math.max(1, Math.round(metres / per));
 		}
 
-		// The grain itself, drawn here rather than loaded from anywhere. A scene is a
-		// value and a Hive program is one file, so a texture that had to ship as an image
-		// would make both of those untrue — and a pattern a canvas can draw in twenty
-		// lines is all "not a flat card" takes.
+		// The grain itself.
 		//
-		// Every pattern is painted in translucent black and white *over* the colour, so
-		// one drawing serves every colour it is asked for: a green crate and a brown one
-		// are the same planks.
+		// **It is drawn here, and a program that has a photograph of it is drawn from
+		// that instead.** The drawings came first and they are still the floor: a scene
+		// is a value and a Hive program is one file, so a texture that *had* to ship as
+		// an image would make both of those untrue, and a pattern a canvas can draw in
+		// twenty lines is all "not a flat card" ever took. But a road is the one
+		// surface somebody looks at for a full lap, and nine hundred dots on a
+		// hundred-and-twenty-eight-pixel tile is not a road once you are close enough
+		// to read it. So assets/textures/<surface>.jpg — see photoOf — is taken
+		// where it exists, and where it does not this draws what it always drew.
+		//
+		// Every pattern, drawn or photographed, goes *over* the colour rather than
+		// instead of it, so one tile serves every colour it is asked for: a green crate
+		// and a brown one are the same planks, and a road and a pit lane are the same
+		// asphalt at two different shades.
 		function grain(finish, colour, tile) {
 		  var key = finish + "|" + colour + "|" + tile[0] + "," + tile[1];
 		  var kept = skins.get(key);
 		  if (kept) { return kept; }
-		  var size = 128;
 		  var canvas = document.createElement("canvas");
-		  canvas.width = size;
-		  canvas.height = size;
-		  var ctx = canvas.getContext("2d");
-		  ctx.fillStyle = colour;
-		  ctx.fillRect(0, 0, size, size);
+		  var ctx = null;
+		  // Held as a closure rather than run once, because the photograph may not have
+		  // arrived yet — see refresh, which calls this again when it does.
+		  var draw = function () {
+		    var shot = photoOf(finish, "");
+		    var size = shot ? photoWeave() : weave();
+		    if (canvas.width !== size) {
+		      canvas.width = size;
+		      canvas.height = size;
+		      ctx = canvas.getContext("2d");
+		    }
+		    ctx.globalCompositeOperation = "source-over";
+		    ctx.fillStyle = colour;
+		    ctx.fillRect(0, 0, size, size);
+		    if (shot) {
+		      // **Laid over the colour, not in place of it.** The file is flattened to a
+		      // mean of mid grey before it ships, and overlay returns mid grey exactly
+		      // as it found it — so the average of the tile is the colour the scene
+		      // asked for and what the photograph contributes is its structure. That is
+		      // the whole reason a photographed surface does not cost the game its
+		      // palette: the road is still the shade client.hive chose, it merely has
+		      // real aggregate in it now.
+		      ctx.globalCompositeOperation = "overlay";
+		      ctx.drawImage(shot, 0, 0, size, size);
+		      ctx.globalCompositeOperation = "source-over";
+		      return;
+		    }
+		    painted(ctx, finish, size);
+		  };
+		  draw();
+		  var tex = new THREE.CanvasTexture(canvas);
+		  tex.colorSpace = THREE.SRGBColorSpace;
+		  tex.wrapS = THREE.RepeatWrapping;
+		  tex.wrapT = THREE.RepeatWrapping;
+		  tex.repeat.set(tile[0], tile[1]);
+		  tex.anisotropy = most();
+		  skins.set(key, tex);
+		  waiting.push({finish: finish, draw: draw, tex: tex});
+		  return tex;
+		}
+
+		// How big a tile is: the canvas it is rendered on, the grid it is composed on,
+		// and the canvas a photographed one gets.
+		//
+		// **The first two are different numbers, and finding that out cost a day.**
+		// Every drawing below places its work in *pixels*: a pinhole is half a pixel
+		// across, a plank seam is three, a stone is one to four. That was exactly right
+		// while there was one canvas size and quietly wrong the moment there were two,
+		// because enlarging the canvas without enlarging the drawing does not sharpen a
+		// pattern — it shrinks it. A hundred and twenty pinholes over four times the
+		// area, each still half a pixel wide, is detail below one texel, and detail
+		// below one texel is not detail. It is shimmer.
+		//
+		// Concrete is where it showed. Every barrier on every circuit came out
+		// corrugated: a moiré, marching, unmistakable from a hundred metres, and
+		// nothing to do with the relief it was first blamed on — turning the relief off
+		// entirely left it exactly where it was. What fixed it was drawing the picture
+		// the patterns were written for and rendering it larger.
+		//
+		// So: grid is the composition every pattern here means, weave is how finely
+		// it is resolved, and the context is scaled between the two. Doubling weave
+		// now buys what doubling it was supposed to buy — the same drawing, twice the
+		// sample rate — instead of a different, finer, worse drawing.
+		function grid() { return 128; }
+
+		function weave() { return 256; }
+
+		function photoWeave() { return 512; }
+
+		// The drawing for a finish, laid over whatever is on the canvas, at whatever
+		// size the canvas happens to be.
+		function painted(ctx, finish, size) {
+		  ctx.save();
+		  ctx.scale(size / grid(), size / grid());
+		  drawn(ctx, finish, grid());
+		  ctx.restore();
+		}
+
+		// A photograph of a surface, if this program shipped one.
+		//
+		// **There is no call for this and no attribute that asks for it**, and that is
+		// the design rather than an omission. A Surface is a closed set of names — a
+		// name and nothing more, so that any renderer can answer for one — and what a
+		// name is worth is exactly that the window may answer it better tomorrow than
+		// it did today. A program that puts assets/textures/tarmac.jpg beside itself
+		// has photographed tarmac; one that does not has drawn tarmac; neither of them
+		// says anything, and the same scene value is correct in both.
+		//
+		// part is "" for the colour and "-normal" for the relief, so the two files a
+		// surface may ship are one lookup apart.
+		//
+		// The load is not waited for. grain and relief draw what they can *now* and
+		// register themselves to be drawn again when the bytes land — see refresh —
+		// so the first frame is never held up by a network round trip and the picture
+		// improves under you a moment later. A file that is not there 404s, onload
+		// never fires, and the drawing stands. That is the fallback, and it costs one
+		// request per surface per session.
+		function photoOf(finish, part) {
+		  var name = finish.toLowerCase() + part;
+		  var kept = photos.get(name);
+		  if (kept) { return kept.img; }
+		  var slot = {img: null};
+		  photos.set(name, slot);
+		  var img = new Image();
+		  img.onload = function () {
+		    slot.img = img;
+		    refresh(finish);
+		  };
+		  img.src = "/_hive/asset/textures/" + name + ".jpg";
+		  return null;
+		}
+
+		// Every canvas already drawn for a surface, drawn again now that there is a
+		// photograph of it.
+		//
+		// **Nothing is rebuilt and nothing is re-keyed.** The material, the geometry and
+		// the mesh are all untouched; the pixels under a texture that is already on the
+		// card are simply better than they were, which is why a photograph can arrive in
+		// the middle of a lap without a flicker or a stall. Marking the frame dirty is
+		// the only other thing needed, because a window that is not being asked for
+		// frames would otherwise go on showing the drawing until something else moved.
+		function refresh(finish) {
+		  for (var i = 0; i < waiting.length; i++) {
+		    if (waiting[i].finish !== finish) { continue; }
+		    waiting[i].draw();
+		    waiting[i].tex.needsUpdate = true;
+		  }
+		  dirty = true;
+		}
+
+		// The relief: which way a surface faces, pixel by pixel.
+		//
+		// **Two ways in, and which is used is which there is.** A photographed surface
+		// ships its own — a real height field, measured off the real thing — and it is
+		// drawn straight in. A drawn one has none, so one is *derived from the drawing*:
+		// every pattern in this file is painted in translucent black and white over a
+		// flat colour, which makes its brightness a height field by construction, and a
+		// Sobel across a height field is a normal. That is not a measurement and does
+		// not have to be. What it has to do is put the light where the drawing already
+		// said the edge was, and a plank drawn as two dark seams gets its seams lit as
+		// seams for free.
+		//
+		// The canvas is shared by every tiling of a surface and the textures over it are
+		// clones, because relief does not depend on how often a wall repeats — only on
+		// what it is made of. What the clones carry is their own repeat.
+		function relief(finish, tile) {
+		  var key = finish + "|" + tile[0] + "," + tile[1];
+		  var kept = bumps.get(key);
+		  if (kept) { return kept; }
+		  var base = reliefs.get(finish);
+		  if (!base) {
+		    var canvas = document.createElement("canvas");
+		    var ctx = null;
+		    var draw = function () {
+		      var shot = photoOf(finish, "-normal");
+		      var size = shot ? photoWeave() : weave();
+		      if (canvas.width !== size) {
+		        canvas.width = size;
+		        canvas.height = size;
+		        ctx = canvas.getContext("2d");
+		      }
+		      ctx.globalCompositeOperation = "source-over";
+		      if (shot) {
+		        ctx.drawImage(shot, 0, 0, size, size);
+		        return;
+		      }
+		      // Mid grey, so that the drawing's own light and dark is the height and
+		      // nothing else is. The colour a shape is painted must not reach this: a
+		      // dark car and a light one are the same shape of carbon.
+		      ctx.fillStyle = "#808080";
+		      ctx.fillRect(0, 0, size, size);
+		      painted(ctx, finish, size);
+		      slope(ctx, size);
+		    };
+		    draw();
+		    base = new THREE.CanvasTexture(canvas);
+		    base.wrapS = THREE.RepeatWrapping;
+		    base.wrapT = THREE.RepeatWrapping;
+		    base.anisotropy = most();
+		    reliefs.set(finish, base);
+		    waiting.push({finish: finish, draw: draw, tex: base});
+		  }
+		  var tex = base.clone();
+		  tex.wrapS = THREE.RepeatWrapping;
+		  tex.wrapT = THREE.RepeatWrapping;
+		  tex.repeat.set(tile[0], tile[1]);
+		  tex.needsUpdate = true;
+		  bumps.set(key, tex);
+		  // A clone shares the canvas and not the upload, so it has to be told when the
+		  // canvas changes under it as well.
+		  waiting.push({finish: finish, draw: function () {}, tex: tex});
+		  return tex;
+		}
+
+		// Which surfaces have relief at all.
+		//
+		// **The question is not "is this thing bumpy in life", it is "is what was drawn
+		// a texture or a diagram".** A photographed surface always has relief, because
+		// what ships with it is a measurement. A drawn one has whatever its pattern's
+		// brightness implies, and for most of them that is right — aggregate really is
+		// aggregate, a kerb's stripe really does stand a centimetre proud, leaves
+		// really are a canopy of holes. For five it is not:
+		//
+		//   **Gloss** is paint. Its whole definition is that it adds no texture, and
+		//   the one soft highlight down its face read as height is a dent across every
+		//   panel of every car. **Glass** is the same argument.
+		//
+		//   **Mesh** is a cut-out: the holes in a fence are alpha, not geometry, and
+		//   lighting the wire as though it stood proud of nothing turns wire into a
+		//   panel.
+		//
+		// Concrete was on this list for a while and should not have been. Every barrier
+		// on the circuit was corrugated, relief was the obvious suspect, and turning it
+		// off changed nothing at all — see the note on grid, which is where the fault
+		// actually was. It is worth leaving written down: a normal map is the loudest
+		// thing in a renderer and therefore the first thing blamed, and the test that
+		// settles it costs one build.
+		function bumped(finish) {
+		  return finish !== "Gloss" && finish !== "Glass" && finish !== "Mesh";
+		}
+
+		// One separable pass of a 1-2-1 blur over a square field that wraps. Separable
+		// because a 1-2-1 across and a 1-2-1 down is the same as the nine-tap and a
+		// third of the reads, and wrapping because a tile whose edges were blurred
+		// against nothing would have a seam in its lighting that it does not have in
+		// its colour.
+		function softened(field, size) {
+		  var mid = new Float32Array(size * size), out = new Float32Array(size * size);
+		  for (var y = 0; y < size; y++) {
+		    var row = y * size;
+		    for (var x = 0; x < size; x++) {
+		      mid[row + x] = (field[row + (x + size - 1) % size]
+		        + 2 * field[row + x] + field[row + (x + 1) % size]) / 4;
+		    }
+		  }
+		  for (var j = 0; j < size; j++) {
+		    var up = ((j + size - 1) % size) * size, at = j * size, down = ((j + 1) % size) * size;
+		    for (var i = 0; i < size; i++) {
+		      out[at + i] = (mid[up + i] + 2 * mid[at + i] + mid[down + i]) / 4;
+		    }
+		  }
+		  return out;
+		}
+
+		// A height field on a canvas, turned into the directions its surface faces.
+		//
+		// Sobel across and down for the two slopes, and the third component is whatever
+		// is left of a unit vector — which is all a normal map is: a picture whose
+		// colours are arrows. The signs are the ones the texture ends up with rather
+		// than the ones the canvas has: a canvas counts rows downward and a texture
+		// counts them up, so the vertical slope changes sign on its way to the card and
+		// is written already changed.
+		function slope(ctx, size) {
+		  var src = ctx.getImageData(0, 0, size, size).data;
+		  // The brightness, once, as its own array. Read nine times per pixel out of the
+		  // image data it would be nine multiplies and a bounds wrap each; here it is an
+		  // index.
+		  var high = new Float32Array(size * size);
+		  for (var i = 0; i < high.length; i++) {
+		    var at = i * 4;
+		    high[i] = (src[at] * 0.299 + src[at + 1] * 0.587 + src[at + 2] * 0.114) / 255;
+		  }
+		  // **And then softened, which is the difference between relief and noise.**
+		  // A drawing's brightness is only *approximately* a height field, and where it
+		  // is least like one is at the pixel: a scatter of half-pixel pinholes is
+		  // colour, not depth, and differentiating it produces a normal that swings
+		  // from one extreme to the other between neighbouring texels. Lit, minified
+		  // and seen at the angle a barrier is always seen at, that came out as
+		  // corrugation marching down every wall on the circuit — a moiré, and one that
+		  // no amount of anisotropy fixes, because the detail was never real. Two
+		  // passes of a three-tap blur take the sub-pixel out and leave every seam,
+		  // stripe and stone that a pattern actually drew.
+		  high = softened(softened(high, size), size);
+		  var out = ctx.createImageData(size, size), b = out.data;
+		  // How much of a hill the light is told about. Enough that an edge catches it,
+		  // little enough that a drawn seam is a seam and not a trench — the drawings
+		  // were made to be looked at flat, so their contrast is a *picture's* contrast
+		  // and reading it as height at face value makes a chessboard out of a weave.
+		  var deep = 1.2;
+		  for (var y = 0; y < size; y++) {
+		    var up = ((y + size - 1) % size) * size;
+		    var mid = y * size;
+		    var down = ((y + 1) % size) * size;
+		    for (var x = 0; x < size; x++) {
+		      var l = (x + size - 1) % size, r = (x + 1) % size;
+		      var across = (high[up + r] + 2 * high[mid + r] + high[down + r])
+		        - (high[up + l] + 2 * high[mid + l] + high[down + l]);
+		      var along = (high[down + l] + 2 * high[down + x] + high[down + r])
+		        - (high[up + l] + 2 * high[up + x] + high[up + r]);
+		      var nx = -across * deep, ny = along * deep;
+		      var len = Math.sqrt(nx * nx + ny * ny + 1);
+		      var to = (mid + x) * 4;
+		      b[to] = (nx / len * 0.5 + 0.5) * 255;
+		      b[to + 1] = (ny / len * 0.5 + 0.5) * 255;
+		      b[to + 2] = (1 / len * 0.5 + 0.5) * 255;
+		      b[to + 3] = 255;
+		    }
+		  }
+		  ctx.putImageData(out, 0, 0);
+		}
+
+		// One drawn pattern, over whatever is already on the canvas.
+		//
+		// Pulled out of grain so that the *relief* can ask for the same drawing — a
+		// normal map derived from a different pattern than the one it is lighting would
+		// be relief belonging to some other surface. One list, read twice.
+		function drawn(ctx, finish, size) {
 		  if (finish === "Turf") { turf(ctx, size); }
 		  else if (finish === "Gravel") { gravel(ctx, size); }
 		  else if (finish === "Tarmac") { tarmac(ctx, size); }
@@ -8935,14 +9539,6 @@ func uiSceneJs(): Str {
 		  else if (finish === "Glass") { glass(ctx, size); }
 		  else if (finish === "Gloss") { gloss(ctx, size); }
 		  else { planks(ctx, size); }
-		  var tex = new THREE.CanvasTexture(canvas);
-		  tex.colorSpace = THREE.SRGBColorSpace;
-		  tex.wrapS = THREE.RepeatWrapping;
-		  tex.wrapT = THREE.RepeatWrapping;
-		  tex.repeat.set(tile[0], tile[1]);
-		  tex.anisotropy = 4;
-		  skins.set(key, tex);
-		  return tex;
 		}
 
 		// Grass: short strokes leaning two ways, over a light mottling. The mottling is
@@ -9099,16 +9695,34 @@ func uiSceneJs(): Str {
 		  }
 		}
 
-		// Paint: no grain at all, and one soft highlight down the face. It is what a
-		// livery wants — a panel that reads as sprayed rather than as built out of
-		// something — and it is the only surface here that adds no texture of its own.
+		// Paint: a panel that reads as sprayed rather than as built out of something.
+		//
+		// **A tighter highlight than a gradient, and a flake under it.** The first
+		// version of this was one soft ramp from top to bottom, which is what a matte
+		// panel looks like — the whole of what makes paint read as *paint* is that the
+		// light comes back off it from a narrow band rather than evenly, so the band is
+		// narrow here and it is brighter than the ramp it replaces. Under it is a
+		// scatter of single pixels at a twentieth of an alpha, which is metallic
+		// flake: individually invisible, and together the difference between a car
+		// that looks sprayed and a car that looks printed.
+		//
+		// It still adds no *grain* — no seams, no weave, nothing with a size to it —
+		// because a livery is the one surface here that must not look made of
+		// anything. See bumped, which is why it is also the one with no relief: a
+		// highlight read as height is a dent down the middle of every panel.
 		function gloss(ctx, size) {
 		  var sheen = ctx.createLinearGradient(0, 0, 0, size);
-		  sheen.addColorStop(0, "rgba(255,255,255,0.15)");
-		  sheen.addColorStop(0.45, "rgba(255,255,255,0.03)");
-		  sheen.addColorStop(1, "rgba(0,0,0,0.10)");
+		  sheen.addColorStop(0, "rgba(255,255,255,0.06)");
+		  sheen.addColorStop(0.26, "rgba(255,255,255,0.22)");
+		  sheen.addColorStop(0.40, "rgba(255,255,255,0.05)");
+		  sheen.addColorStop(0.72, "rgba(0,0,0,0.05)");
+		  sheen.addColorStop(1, "rgba(0,0,0,0.16)");
 		  ctx.fillStyle = sheen;
 		  ctx.fillRect(0, 0, size, size);
+		  for (var i = 0; i < 900; i++) {
+		    ctx.fillStyle = i % 2 ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.04)";
+		    ctx.fillRect(Math.random() * size, Math.random() * size, 1, 1);
+		  }
 		}
 
 		// Poured concrete: almost nothing, and that is the point. A very faint mottle,
@@ -9366,12 +9980,40 @@ func uiSceneJs(): Str {
 		  if (want.indexOf("p") >= 0) { pads(); }
 		  if (dirty) { renderer.render(stage, camera); dirty = false; }
 		  var ms = last ? Math.round(now - last) : 0;
-		  last = now;
+		  if (want.indexOf("f") < 0) { last = now; return; }
+		  // **One frame in flight, and the clock is what makes that honest.**
+		  //
 		  // Told after the picture is on screen rather than before, so the program is
 		  // working out the next frame while this one is being looked at. A gap longer
 		  // than a tenth of a second is reported as that: it means the window was busy
 		  // or hidden, and a world stepped by the real gap would teleport.
-		  if (ms > 0 && want.indexOf("f") >= 0) { post("frame", "", Math.min(100, ms)); }
+		  //
+		  // But it is told *when the program is ready to hear it* and not sixty times a
+		  // second regardless. While an answer is outstanding this returns having done
+		  // nothing at all — and crucially **without moving last**, so the gap goes on
+		  // growing and the frame that eventually goes carries the whole of the time
+		  // that passed rather than one refresh of it. That is the difference between a
+		  // window that reports sixty frames of seventeen milliseconds to a program
+		  // managing twenty of them — a world running at a third speed, three seconds
+		  // behind and getting worse — and one that reports twenty frames of fifty,
+		  // which is what actually happened.
+		  //
+		  // Sixty a second is what this does when the program can take sixty a second,
+		  // because then the answer is always already back.
+		  // **The first frame starts the clock and reports nothing**, because there is
+		  // nothing yet to report: no frame has gone before it, so no time has passed
+		  // between two of them. This line is the whole of a bug that made the window
+		  // stop dead — the assignment that seeds last used to happen unconditionally
+		  // a few lines up, and moving it below the guard so that a skipped frame kept
+		  // its time left nothing at all to seed it. Then last stayed at nought, every
+		  // gap measured from it was nought, every frame was skipped for being nought
+		  // long, and a window that had drawn one picture sat there forever waiting to
+		  // be told about a second one it was never going to ask for.
+		  if (!last) { last = now; return; }
+		  if (ms <= 0 || hiveOwed) { return; }
+		  last = now;
+		  hiveOwed = true;
+		  if (!post("frame", "", Math.min(100, ms))) { hiveOwed = false; }
 		}
 		requestAnimationFrame(tick);
 
