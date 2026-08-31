@@ -620,6 +620,45 @@ is `Planks`. That is what the renderer did before there was a way to say, so a
 scene that never mentions a surface draws exactly as it did — and it is also why
 saying is worth having, because a road drawn as a `ground` came out as a lawn.
 
+**Every finish has relief.** A surface is not only a pattern, it is a set of
+directions the surface faces, so a kerb's stripes have edges that catch the sun,
+gravel has stones in it and a plank's seams are seams rather than lines. Three
+have none, and none of the three is an oversight: `Gloss` is paint and adds no
+texture by definition, `Glass` is the same argument, and `Mesh`'s holes are
+transparency rather than geometry — lighting the wire as though it stood proud of
+nothing would turn wire into a panel.
+
+### A surface may be a photograph
+
+A `Surface` names what a thing is made of. What that name *looks like* is the
+window's business, and where the program has a better answer to hand the window
+takes it: **a file at `assets/textures/<surface>.jpg`, named for the finish in
+lower case, is used instead of the drawing.** A second file,
+`assets/textures/<surface>-normal.jpg`, is its relief.
+
+```
+assets/textures/tarmac.jpg          the road, photographed
+assets/textures/tarmac-normal.jpg   and how it lies
+```
+
+There is no call for this and no attribute that asks for it. That is the point: a
+scene is a value, and the same value has to be right whether or not the window
+found a picture. A program that ships the files gets them; one that does not gets
+the drawing; neither says anything.
+
+**A photograph is laid over the colour, not in place of it.** The file must be
+flattened to a mean of mid grey — the window composites it in `overlay`, which
+returns mid grey exactly as it finds it — so the average of a tile is the colour
+the shape asked to be painted and what the photograph contributes is its
+structure. That is what keeps one file serving every colour a finish is ever
+asked for, exactly as the drawings do, and what keeps a program's palette its own.
+
+**Nothing waits for it.** The first frame is drawn from the pattern the renderer
+has, the file is fetched alongside, and the tiles are redrawn under their own
+textures when it arrives — no rebuild, no flicker, and no frame held up by a round
+trip. A file that is not there 404s and the drawing stands, which is the same
+bargain `track` makes for a sound.
+
 **A colour with an alpha is translucent.** `Tone.RGBA(r, g, b, a)` and an eight-
 or four-digit `Tone.HEX` carry one, and in a scene it is honoured: the shape is
 drawn see-through and writes no depth, so whatever is behind it stays visible.
@@ -725,6 +764,7 @@ These go on the `scene` itself rather than on a shape.
 | `lens(Int)` | the field of view, in degrees |
 | `fog(Int)` | how far you can see, in metres |
 | `background(Tone)` | the sky, which the fog fades into |
+| `shadows(Bool)` | whether the sun casts. Absent is yes |
 | `grab(Bool)` | whether the window should hold the mouse |
 | `crosshair(Bool)` | whether to draw one in the middle |
 
@@ -733,6 +773,43 @@ from the sky and one from a sun — chosen so that a solid painted a colour come
 out that colour with a shaded side. What makes a scene dark is its palette, which
 is why a night scene is written in dark colours rather than by turning something
 down.
+
+**The sun casts shadows, and it casts them near the eye.** A scene may be miles
+across and a shadow map is one texture; mapped over the whole of a circuit it would
+be a smear. So the map covers a box about fifty metres around wherever the camera
+is, which is where a shadow is read anyway — what a shadow is *for* is telling you
+that a car is beside you and that the kerb is where you think it is, and neither is
+a question about something four hundred metres away. Everything outside the box is
+culled out of the pass, and the map is redrawn on every other frame rather than
+every one. A `ground` receives shadows and does not cast one; every other solid
+does both.
+
+**`shadows(false)` turns them off**, and it is the one thing about the lighting a
+scene may say. It is here because a shadow is by a distance the most expensive
+thing in a picture and among the least of what a program needs from one: a window
+that cannot hold its frame rate should be able to sell the shadows before it starts
+selling the view, which is the trade every other answer gets backwards. Absent
+means yes, so nothing written before this existed draws differently.
+
+Turning it rebuilds every shader in the scene, so a program that means to turn it
+off should turn it off and leave it — a value that changes every frame is a
+recompile every frame. Something driving it off a frame-rate reading wants two
+thresholds with a gap between them rather than one, for the same reason a
+thermostat does.
+
+**The edge is hard rather than soft**, and that is a decision about cost as much as
+about the look. A shadow map is paid for twice — once to draw, which is what its
+size decides, and once to *read*, which happens for every lit fragment on the
+screen. Filtering the read is by a distance the most expensive thing a scene does;
+the size of the map is very nearly free. So the map is large and the read is a
+single sample, which suits a renderer whose every other surface is drawn rather
+than rendered.
+
+**`background` is a band rather than a colour.** The tone given is the sky at
+middle height; the window deepens it overhead and pales it toward the horizon, and
+it is the *horizon's* shade the fog fades into. A flat background has no up and no
+far, so a horizon drawn against one is a line where the world stops rather than a
+place where it carries on — and a scene of any size is nearly all horizon.
 
 ### What the player did
 
@@ -743,6 +820,30 @@ down.
 | `onLook(f)` | `Float, Float` — how far the mouse moved, across and down |
 | `onGrab(f)` | `Bool` — whether the window is holding the mouse now |
 | `onPad(f)` | `Int, Str, Float` — which pad, which control, where it now is |
+
+**`onFrame` reports the time since the last frame the program was told about, and
+not the time since the last frame the window drew.** The two are the same whenever
+a program can keep up and they are deliberately not the same when it cannot. A
+window holds at most one frame in flight: having reported one it says nothing more
+until the program has folded it, and while it waits the gap goes on growing, so the
+frame that does go carries the whole of the time that passed. A program that can
+fold sixty frames a second is therefore told about sixty of them; one that can
+manage twenty is told about twenty, of fifty milliseconds each, rather than sixty
+of seventeen.
+
+This is what makes `onFrame` a clock. Were it otherwise — one message per refresh
+regardless — a program too slow for the window would be handed more frames than it
+could take, and since nothing between the window and the fold ever drops a message,
+the excess would queue rather than vanish: input would sit behind a growing backlog
+of stale frames, and a world stepped by the gaps in them would run slower than real
+time for as long as the backlog lasted. A gap longer than a tenth of a second is
+still reported as a tenth of a second, because a world stepped by a full stall
+would teleport.
+
+**A scene is only ever drawn once, from the newest description of it.** Frames
+arriving faster than the window can draw them replace one another rather than
+queueing, so what is drawn is always the latest world and never a backlog of worlds
+that have already been superseded.
 
 A key is named the same on every layout the browser can report: a letter or a
 digit is itself, and everything else is the word for it — `space`, `enter`,
