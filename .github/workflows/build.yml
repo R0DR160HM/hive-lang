@@ -131,6 +131,64 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # The same compiler on the platform that spells a path differently. It runs the
+  # `hivec-windows-amd64.exe` the job above cross-compiled — the file a release
+  # hands a Windows user — rather than bootstrapping a fifth time for it.
+  #
+  # A pull request only. Master and a tag are Linux, and what this catches is a
+  # change to how paths are read, which is a thing a review wants to know before
+  # it lands rather than after.
+  windows:
+    if: github.event_name == 'pull_request'
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # A build writes a Go module and runs `go build` over it here too.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: hivec
+          path: dist
+
+      # Two copies, because Windows locks a running executable and the build
+      # below writes src/hivec.exe. `.seed` is what compiles, `src` is what the
+      # scripts and hive.cmd look for.
+      - name: Put the compiler where the scripts look
+        shell: bash
+        run: |
+          mkdir -p .seed
+          cp dist/hivec-windows-amd64.exe .seed/hivec.exe
+          cp dist/hivec-windows-amd64.exe src/hivec.exe
+
+      # The one thing no Linux runner can fail: cmd.exe completes a filename with
+      # `\`, and an entrypoint spelled that way is what every import resolves
+      # against. Run from cmd.exe rather than bash so the path arrives as a
+      # Windows user types it.
+      - name: An entrypoint spelled the way Windows spells it
+        shell: cmd
+        run: |
+          call hive.cmd check src\hivec.hive
+          if errorlevel 1 exit /b 1
+
+      # And the compiler compiles itself here, which is what a Windows checkout is
+      # for. The seed copy does the compiling so the output is not the file
+      # running.
+      - name: Build the compiler with itself
+        shell: bash
+        run: HIVEC="$PWD/.seed/hivec.exe" ./bootstrap
+
+      - name: The compiler's own tests
+        shell: bash
+        run: ./test/run
+
   # A tag publishes. The binaries are the ones the job above cross-compiled, so
   # what a release carries is what the tests ran against — and since a release
   # is where the next build's compiler comes from, that matters more here than
