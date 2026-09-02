@@ -6689,6 +6689,11 @@ func uiSource(): Str {
 			// re-send the document around it — and the canvas showing it is never
 			// replaced, which is the other half of the same point.
 			scenes []string
+			// And where each inset is looking, kept apart for exactly the same reason:
+			// a second camera that moves is a document that would be re-sent every
+			// frame, and an inset is at its most useful while it is following
+			// something.
+			insets []string
 		}
 
 		func uiEscape(s string) string {
@@ -6710,7 +6715,7 @@ func uiSource(): Str {
 			switch kind {
 			case "row":
 				b.WriteString("display:flex;flex-direction:row;")
-			case "column":
+			case "column", "inset":
 				b.WriteString("display:flex;flex-direction:column;")
 			case "spacer":
 				b.WriteString("flex:1 1 auto;")
@@ -6963,6 +6968,22 @@ func uiSource(): Str {
 					out += " data-scene=\"" + strconv.Itoa(at) + "\""
 				}
 				r.out.WriteString(out + "></div>")
+			case "inset":
+				// The box a second look at the world goes in. Like a scene it keeps its
+				// camera out of the document — see uiRender.insets — and unlike a scene
+				// it has children, which are laid over the picture rather than drawn
+				// into it.
+				at := len(r.insets)
+				r.insets = append(r.insets, v.Text)
+				out := "<div" + r.common(v.Kind, v.Attrs)
+				if r.handlers != nil {
+					out += " data-inset=\"" + strconv.Itoa(at) + "\""
+				}
+				r.out.WriteString(out + ">")
+				for _, c := range v.Children {
+					r.view(c)
+				}
+				r.out.WriteString("</div>")
 			case "canvas":
 				r.canvas(v)
 			case "table":
@@ -7568,6 +7589,8 @@ func uiSource(): Str {
 		.h-closed::after{content:"disconnected";position:fixed;bottom:12px;left:12px;
 		background:var(--danger);color:#fff;padding:4px 10px;border-radius:6px;font-size:12px}
 		.h-scene{position:relative;overflow:hidden;min-height:0;min-width:0;background:#0b0d10}
+		.h-inset{position:relative;overflow:hidden;min-height:0;min-width:0;
+		background:none;pointer-events:none}
 		.h-world{position:fixed;z-index:2;overflow:hidden}
 		.h-world>canvas{display:block;width:100%;height:100%}
 		.h-canvas{display:block;min-width:0;min-height:0}
@@ -7593,7 +7616,7 @@ func uiSource(): Str {
 			r.view(v)
 			w.mu.Lock()
 			html := r.out.String()
-			scene := uiScenes(r.scenes)
+			scene := uiScenes(r.scenes, r.insets)
 			// What actually changed. A window with no scene in it is exactly what it was
 			// before: one frame per turn, and nothing here costs it anything.
 			document := html != w.html
@@ -7635,23 +7658,30 @@ func uiSource(): Str {
 			}
 		}
 
-		// The scene frame: every scene in the tree, by the index its element carries.
-		// A tree with no scene in it has no frame at all, which is what keeps the whole
-		// mechanism invisible to a window that never draws one.
-		func uiScenes(scenes []string) string {
+		// The scene frame: what the window draws, and where every inset in the tree
+		// is looking at it from. A tree with no scene in it has no frame at all, which
+		// is what keeps the whole mechanism invisible to a window that never draws one
+		// — and an inset without a scene has no world to be a second view of, so it
+		// goes the same way.
+		func uiScenes(scenes []string, insets []string) string {
 			if len(scenes) == 0 {
 				return ""
 			}
 			// A window draws one scene. A view holding several is a mistake worth saying
 			// out loud once — the alternative is a second picture that is silently blank,
 			// which is the kind of thing somebody debugs for an hour.
+			//
+			// **An inset is not one of those**, and that is the distinction the whole
+			// widget rests on: it is a second *camera*, not a second world, so any
+			// number of them cost a second pass over shapes that are already there.
 			if len(scenes) > 1 {
 				uiSceneCrowd.Do(func() {
 					fmt.Println("hive: a window draws one scene, and this view has " +
 						strconv.Itoa(len(scenes)) + " — the first one is the one on screen")
 				})
 			}
-			return "[" + strings.Join(scenes, ",") + "]"
+			return "{\"w\":[" + strings.Join(scenes, ",") +
+				"],\"i\":[" + strings.Join(insets, ",") + "]}"
 		}
 
 		var uiSceneCrowd sync.Once
@@ -8378,6 +8408,24 @@ func uiSceneSource(): Str {
 			return UiView{Kind: "scene", Attrs: attrs, Text: b.String()}
 		}
 
+		// UiInset is the *second* look at that world, and it holds no world of its
+		// own — only a camera. What it draws is whatever the scene is drawing, which
+		// is the whole of why it is affordable: a picture-in-picture that carried its
+		// own set of shapes would be a second scene, and a second scene is a second
+		// description of where everything is.
+		//
+		// Its children are ordinary views and are laid out as a column would lay them
+		// out. They are *over* the picture rather than in it — a caption, a border, a
+		// name — because the box is a page element and the world behind it is drawn by
+		// the canvas the scene already has.
+		func UiInset(attrs []UiAttr, views []UiView) UiView {
+			var b strings.Builder
+			b.WriteString("{")
+			uiSceneCamera(&b, attrs)
+			b.WriteString("}")
+			return UiView{Kind: "inset", Attrs: attrs, Children: views, Text: b.String()}
+		}
+
 		// Where the eye is, where it is looking, and what the world around it looks
 		// like. Every one of these has an answer whether or not the program gave one:
 		// a scene with no camera attributes at all is a metre and a half above the
@@ -8624,6 +8672,10 @@ func uiSceneJs(): Str {
 
 		var renderer = null, stage = null, camera = null;
 		var host = null, handle = "", world = null;
+		// The insets: where each one is looking, and the box on the page it is looking
+		// out of. A camera of their own is not needed one apiece — they are drawn one
+		// after another and never at the same instant — so there is one, moved.
+		var looks = [], boxes = [], spare = null;
 		var seen = {left: -1, top: -1, width: -1, height: -1};
 		var live = [], geoms = new Map(), mats = new Map(), signs = new Map();
 		var skins = new Map(), bumps = new Map(), reliefs = new Map(), skies = new Map();
@@ -8780,6 +8832,7 @@ func uiSceneJs(): Str {
 		// Called after every document swap: the element is a new one each time, so what
 		// is found again here is where the canvas has to be laid over.
 		function attach() {
+		  boxed();
 		  var el = document.querySelector(".h-scene[data-scene]");
 		  if (!el) {
 		    host = null;
@@ -8816,10 +8869,74 @@ func uiSceneJs(): Str {
 		  dirty = true;
 		}
 
+		// Every inset in the document, filed under the index its element carries. Found
+		// again after each swap for the reason the scene box is: the elements are new
+		// ones every time, and an inset holding a reference to the old one would be an
+		// inset drawn where it used to be.
+		function boxed() {
+		  boxes = [];
+		  var found = document.querySelectorAll(".h-inset[data-inset]");
+		  for (var i = 0; i < found.length; i++) {
+		    boxes[+found[i].getAttribute("data-inset")] = found[i];
+		  }
+		}
+
+		// **The second look, and it is a second pass over the same stage.** An inset is
+		// a box on the page and a camera; what it shows is whatever the scene is
+		// already showing, from wherever that camera is standing. So it costs one more
+		// draw of shapes that are already built and nothing whatever in what the
+		// program has to say — which is the whole argument for it being a camera
+		// rather than a second scene.
+		//
+		// It is drawn into the scene's own canvas, scissored to where its box landed.
+		// That is what decides the one rule an inset has: **it has to be over the
+		// picture.** A box laid out somewhere the canvas does not reach has nowhere to
+		// be drawn, so it is clipped to what there is and skipped when there is none of
+		// it left.
+		function insets() {
+		  var drew = false;
+		  for (var i = 0; i < looks.length; i++) {
+		    var box = boxes[i], look = looks[i];
+		    if (!box || !look) { continue; }
+		    var r = box.getBoundingClientRect();
+		    var left = Math.max(0, Math.round(r.left - seen.left));
+		    var top = Math.max(0, Math.round(r.top - seen.top));
+		    var right = Math.min(seen.width, Math.round(r.right - seen.left));
+		    var low = Math.min(seen.height, Math.round(r.bottom - seen.top));
+		    var w = right - left, h = low - top;
+		    if (w < 8 || h < 8) { continue; }
+		    if (!spare) {
+		      spare = new THREE.PerspectiveCamera(75, 1, 0.08, 800);
+		      spare.rotation.order = "YXZ";
+		    }
+		    var lens = look.lens || 75;
+		    if (spare.fov !== lens || spare.aspect !== w / h) {
+		      spare.fov = lens;
+		      spare.aspect = w / h;
+		      spare.updateProjectionMatrix();
+		    }
+		    spare.position.set(look.eye[0], look.eye[1], look.eye[2]);
+		    spare.rotation.set(look.aim[1], look.aim[0], 0);
+		    if (!drew) { renderer.setScissorTest(true); drew = true; }
+		    // A page counts down from the top of the canvas and WebGL counts up from
+		    // the bottom of it, which is the whole of this line.
+		    renderer.setViewport(left, seen.height - low, w, h);
+		    renderer.setScissor(left, seen.height - low, w, h);
+		    renderer.render(stage, spare);
+		  }
+		  if (drew) {
+		    renderer.setScissorTest(false);
+		    renderer.setViewport(0, 0, seen.width, seen.height);
+		    renderer.setScissor(0, 0, seen.width, seen.height);
+		  }
+		}
+
 		// --- one frame -------------------------------------------------------------
 
 		function paint(text) {
-		  var frames = JSON.parse(text);
+		  var frame = JSON.parse(text);
+		  var frames = frame.w || [];
+		  looks = frame.i || [];
 		  if (!frames.length) { return; }
 		  if (!renderer) { boot(); }
 		  world = frames[0];
@@ -9017,7 +9134,26 @@ func uiSceneJs(): Str {
 		  var mid = new THREE.Color();
 		  mid.setStyle(hex);
 		  var high = mid.clone().multiplyScalar(0.66);
-		  var haze = mid.clone().lerp(new THREE.Color(1, 1, 1), 0.42);
+		  // **Haze is scattered light, so a sky with no light in it does not have any.**
+		  // The horizon used to be the sky lifted 42 per cent of the way to white
+		  // whatever the sky was, which is right for every sky there is *outdoors* and
+		  // is exactly wrong for the two places that are not: paint the background black
+		  // for a cave or for space and the far distance came back mid grey, so a lap
+		  // underground looked like an overcast afternoon and the void looked like fog.
+		  // There was no colour a program could pass to get out of it either — 42 per
+		  // cent of white is 107 whatever it starts from, so mid grey was the darkest
+		  // horizon this renderer could draw.
+		  //
+		  // So the lift is in proportion to how much light the sky has to scatter, and
+		  // the threshold is set where it changes nothing that already worked: a third
+		  // of full luminance is darker than any daylight or weather a scene has ever
+		  // asked for — an overcast grey-blue is a third exactly — so everything at or
+		  // above it still lifts the full 42 per cent and comes out pixel for pixel as
+		  // it did. Below it the horizon goes dark with the sky, which is the whole of
+		  // what a scene with a roof over it needed.
+		  var lit = 0.2126 * mid.r + 0.7152 * mid.g + 0.0722 * mid.b;
+		  var haze = mid.clone().lerp(new THREE.Color(1, 1, 1),
+		    0.42 * Math.min(1, lit / 0.35));
 		  var canvas = document.createElement("canvas");
 		  canvas.width = 4;
 		  canvas.height = 256;
@@ -9978,7 +10114,13 @@ func uiSceneJs(): Str {
 		  // Before the frame is reported rather than after, so the fold hears the stick
 		  // move and *then* is told to step the world by it.
 		  if (want.indexOf("p") >= 0) { pads(); }
-		  if (dirty) { renderer.render(stage, camera); dirty = false; }
+		  if (dirty) {
+		    renderer.render(stage, camera);
+		    // After the picture and never instead of it: an inset is set *into* what
+		    // the scene drew, so whatever it covers has already been drawn under it.
+		    if (looks.length) { insets(); }
+		    dirty = false;
+		  }
 		  var ms = last ? Math.round(now - last) : 0;
 		  if (want.indexOf("f") < 0) { last = now; return; }
 		  // **One frame in flight, and the clock is what makes that honest.**
