@@ -47,6 +47,13 @@ There is no hurry to do it often. A seed only has to be new enough to accept the
 source it is asked to compile, and the language changes far less often than the
 compiler does.
 
+Nothing has to be bumped by hand for the version itself. Every Dockerfile
+`hive container` writes downloads the compiler that wrote it, by the release
+named in `src/version.hive`, and the workflow writes the tag in there before it
+compiles anything — so the compiler a release publishes names that release. What
+is committed in that file is what a build from a checkout says, and a checkout is
+not a release.
+
 ## Why not the generated Go
 
 It would work: `hive build` leaves a complete Go module in

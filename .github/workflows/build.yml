@@ -46,6 +46,34 @@ jobs:
           restore-keys: |
             hive-${{ runner.os }}-
 
+      # Every Dockerfile `hive container` writes downloads the compiler that wrote
+      # it, by the release named in src/version.hive — so on a tag, the tag is
+      # what that has to say, and this is where it comes to say it. Written in
+      # before a line is compiled, so the compiler published under a tag is one
+      # that names that tag, without anyone having had to remember. What is
+      # committed is only ever what an unreleased build says.
+      #
+      # It is a rewrite rather than a check because there is one right answer and
+      # the workflow already knows it. The read-back is not ceremony: a sed that
+      # matched nothing would ship the wrong version quietly, which is the whole
+      # failure this step exists to prevent.
+      - name: Stamp the release into the compiler
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          said() { sed -n 's/^\treturn "\(v[^"]*\)"$/\1/p' src/version.hive | head -n1; }
+          was=$(said)
+          sed -i "s|^\treturn \"v[^\"]*\"$|\treturn \"$GITHUB_REF_NAME\"|" src/version.hive
+          now=$(said)
+          if [ "$now" != "$GITHUB_REF_NAME" ]; then
+            echo "::error file=src/version.hive::could not write $GITHUB_REF_NAME into src/version.hive — it says '$now'. The line this rewrites is a tab, 'return', and the version in double quotes; if that shape changed, this step has to change with it."
+            exit 1
+          fi
+          if [ "$was" = "$now" ]; then
+            echo "src/version.hive already said $now"
+          else
+            echo "::notice file=src/version.hive::src/version.hive said $was; this release is $now, and that is what its compiler will write into a Dockerfile."
+          fi
+
       # The compiler that builds this one comes from a release, pinned by tag and
       # by digest in seed/pinned.txt. A release asset can be replaced under its
       # own tag, so the digest is the part that matters: it is checked before the

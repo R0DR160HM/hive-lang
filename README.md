@@ -255,11 +255,18 @@ docker run --rm -p 8080:8080 main
 ```
 
 Nothing has to be installed to build that image but Docker itself. The first
-stage downloads Go and the compiler's latest release for the platform being
-built for — `amd64` on an ordinary machine, `arm64` on an Apple-silicon one, so
-the build is native either way — and compiles the program with the two of them.
-The second stage is the executable and nothing else, on `distroless/static`: no
-Go, no compiler, not even a shell.
+stage downloads Go and the compiler for the platform being built for — `amd64`
+on an ordinary machine, `arm64` on an Apple-silicon one, so the build is native
+either way — and compiles the program with the two of them. The second stage is
+the executable and nothing else, on `distroless/static`: no Go, no compiler, not
+even a shell.
+
+The compiler it downloads is the one that wrote the file, named in an
+`ARG HIVEC_VERSION` at the top of the build stage, rather than whatever release
+is newest on the day the image is built. The program was read and checked by
+this compiler, so this compiler is the one that should build it; an image that
+followed the newest release could stop building a program that never changed.
+`docker build --build-arg HIVEC_VERSION=v9.9.9 .` asks for a different one.
 
 The parts of the file that are not a template are read off the program rather
 than guessed at. A `hive.net.httpServe(8080, ...)` becomes an `EXPOSE 8080` that
@@ -350,6 +357,7 @@ src/                 the compiler
   progress.hive      what the compiler says while it is working
   project.hive       writing the Go module, and running the Go toolchain over it
   container.hive     the Dockerfile `hive container` writes
+  version.hive       which release this compiler is
   testreport.hive    what `hive test` prints
   hivec.hive         the command line
 test/                the tests
@@ -440,7 +448,7 @@ mono         18 tests: 18 passed
 check        65 tests: 65 passed
 ranges       39 tests: 39 passed
 emit         58 tests: 58 passed
-container    17 tests: 17 passed
+container    18 tests: 18 passed
 project      8 tests: 8 passed
 hivec        11 tests: 11 passed
 
