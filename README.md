@@ -25,6 +25,7 @@ a compiler for it written in the language it compiles.
 ./hive build     <entrypoint.hive>    compile to a native executable
 ./hive build     <entrypoint.hive> --target <goos>/<goarch>
 ./hive container <entrypoint.hive>    write a Dockerfile that builds and runs it
+./hive version                        which release this compiler is
 
 ./test/run                            every test the compiler has
 ./examples/run                        every example, compiled and run
@@ -125,6 +126,8 @@ of this README talks about.
 ### Checking that it worked
 
 ```sh
+$ hivec version
+v0.1.9
 $ printf 'proc main(): void {\n\techo "it works"\n}\n' > hello.hive
 $ hivec check hello.hive
 No problems found in hello.hive (0s)
@@ -132,8 +135,10 @@ $ hivec run hello.hive
 it works
 ```
 
-`check` asks nothing of the machine but the compiler itself, which is what makes
-it the useful thing to try first. If `run` then says
+`version` reads no source and builds nothing, so it answers as soon as the
+binary is on the PATH at all — it is the cheapest way to tell an install apart
+from a shell that cannot find it. `check` is the next one up: it asks nothing of
+the machine but the compiler itself. If `run` then says
 
 ```
 hello.hive:0: this needs the Go toolchain, and `go` is not on the PATH.
@@ -357,7 +362,7 @@ src/                 the compiler
   progress.hive      what the compiler says while it is working
   project.hive       writing the Go module, and running the Go toolchain over it
   container.hive     the Dockerfile `hive container` writes
-  version.hive       which release this compiler is
+  version.hive       which release this compiler is, and what `hive version` says
   testreport.hive    what `hive test` prints
   hivec.hive         the command line
 test/                the tests
