@@ -10,7 +10,7 @@
 // its own is.
 //
 // What comes out asks nothing of the machine but Docker itself: the image
-// downloads Go and the compiler's latest release for the target platform, and
+// downloads Go and this compiler's own release for the target platform, and
 // compiles with the two of them. Two stages, so what ships is the executable
 // and nothing else — no Go, no compiler, not even a shell.
 //
@@ -25,6 +25,7 @@ import ./loader
 import ./paths
 import ./progress
 import ./text
+import ./version
 import hive.conv
 import hive.file
 
@@ -359,8 +360,9 @@ func header(entry: Str, needs: Needs): Str {
 	append(out, `
 		# Nothing has to be installed to build this but Docker: the image downloads Go
 		# — the one thing ~BT~hivec build~BT~ needs that it does not carry as source text the
-		# way it does its own runtime — downloads the compiler's latest release for the
-		# platform being built for, and compiles the program with the two of them.
+		# way it does its own runtime — downloads the compiler that wrote this file,
+		# for the platform being built for, and compiles the program with the two of
+		# them.
 		#
 		# Two stages: the first has Go and the compiler and does the building; the
 		# second is just the binary that came out of it, with nothing else in the image
@@ -421,15 +423,11 @@ func buildStage(entry: Str, needs: Needs): Str {
 			tar -C /usr/local -xzf /tmp/go.tar.gz; \
 			rm /tmp/go.tar.gz
 		ENV PATH="/usr/local/go/bin:${PATH}"
-
-		# The compiler itself, from hive-lang's latest release — named rather than
-		# versioned, so this build never has to be told what "latest" means and never
-		# goes stale as new releases ship.
-		RUN curl -fsSL \
-		      "https://github.com/R0DR160HM/hive-lang/releases/latest/download/hivec-linux-${TARGETARCH}" \
-		      -o /usr/local/bin/hivec \
-		 && chmod +x /usr/local/bin/hivec
-
+	`)
+	append(out, "")
+	append(out, compiler())
+	append(out, "")
+	append(out, `
 		# A static binary, so the runtime stage below needs no libc.
 		ENV CGO_ENABLED=0
 
@@ -455,6 +453,31 @@ func buildStage(entry: Str, needs: Needs): Str {
 	append(out, "# build now rather than at ~BT~docker run~BT~.")
 	append(out, "RUN hivec build /app/{entry} \\")
 	append(out, " && test -x " + built(entry))
+	return join(out, "\n")
+}
+
+// The compiler the image builds the program with, which is the one that wrote
+// the file: `version.current()` is the only place the release is named, here and
+// in the Dockerfile both.
+func compiler(): Str {
+	mut Str[dyn] out = []
+	append(out, `
+		# The compiler itself — this one, rather than whatever release is newest on
+		# the day the image is built. The program beside this file was read by the
+		# compiler that wrote it, and that is the compiler that should build it: a
+		# later release is a different compiler, and an image following the newest is
+		# one that can stop building a program that never changed.
+		#
+		# ~BT~docker build --build-arg HIVEC_VERSION=v9.9.9 .~BT~ builds with another one,
+		# and running ~BT~hive container~BT~ from that compiler writes it in here.
+	`)
+	append(out, "ARG HIVEC_VERSION=" + version.current())
+	append(out, `
+		RUN curl -fsSL \
+		      "https://github.com/R0DR160HM/hive-lang/releases/download/${HIVEC_VERSION}/hivec-linux-${TARGETARCH}" \
+		      -o /usr/local/bin/hivec \
+		 && chmod +x /usr/local/bin/hivec
+	`)
 	return join(out, "\n")
 }
 

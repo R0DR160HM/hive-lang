@@ -458,6 +458,7 @@ elsewhere is an entry in the attribute vector.
 | `table(attrs, rows)` | `Table` |
 | `canvas(attrs, marks)` | `Mark[]` — see [below](#a-canvas) |
 | `scene(attrs, shapes)` | `Shape[]` — see [14.16](#1416-hiveuiscene) |
+| `inset(attrs, views)` | `View[]` — a second look at that scene, see [14.16](#1416-hiveuiscene) |
 
 A widget is here only if it cannot be composed from the others *and* needs
 something the renderer has that Hive does not. A card is a `column` with padding,
@@ -810,6 +811,49 @@ middle height; the window deepens it overhead and pales it toward the horizon, a
 it is the *horizon's* shade the fog fades into. A flat background has no up and no
 far, so a horizon drawn against one is a line where the world stops rather than a
 place where it carries on — and a scene of any size is nearly all horizon.
+
+**How far it pales is in proportion to how light the sky is**, because haze is
+scattered light and a sky with none has none to scatter. Any daylight or weather
+pales the full amount; a sky darker than about a third of full luminance pales less,
+and a black one does not pale at all. That is what lets a scene under a roof — a
+cave, a tunnel, somewhere off the planet — fade into the dark rather than into grey,
+which no colour would otherwise buy: paling a fixed amount toward white has a floor,
+and the floor was mid grey.
+
+### A second look: `inset`
+
+`inset(attrs, views)` is a **widget**, and the one widget that draws in three
+dimensions without being a scene. It is a box on the page showing the world the
+scene is already showing, from wherever its own `eye`, `aim` and `lens` are
+standing — a picture-in-picture, a rear-view mirror, a security camera, a replay
+box in the corner of a race.
+
+**It holds a camera and no world**, and that is the whole of what makes it
+affordable. A second scene would be a second description of where everything is,
+built and sent every frame; an inset is a second *pass* over the shapes the scene
+already handed over, so what it costs is one more draw and nothing at all in what
+the program has to say. A window still draws one scene, and any number of insets.
+
+Its own views are laid out exactly as a `column` lays them out, and they sit
+**over** the picture rather than in it — a caption, a border, a name. The box
+itself is transparent, because what is behind it is the second view.
+
+```
+ui.inset([ui.width(320), ui.height(180), ui.eye(x, y, z), ui.aim(yaw, 0.0)], [
+	ui.text([ui.size(ui.TextSize.Caption())], "TURN 7")
+])
+```
+
+**An inset has to be over the picture.** It is drawn into the canvas the scene
+already has, clipped to where its box landed on it, so a box laid out where that
+canvas does not reach has nowhere to be drawn and is not drawn. Over the scene —
+pinned into a corner of it with `overlay`, or anywhere else the layout puts it —
+is where one belongs anyway, and is what the word means.
+
+The sky, the haze, whether the sun casts and how far the world reaches are the
+*scene's* and are shared: an inset is another look at one world, not another world.
+Shadows are drawn near the scene's own eye, so a subject far from it is lit and
+unshadowed.
 
 ### What the player did
 
