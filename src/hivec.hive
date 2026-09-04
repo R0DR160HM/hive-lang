@@ -9,12 +9,14 @@
 //   hive run       <entrypoint.hive> [..]  compile and run
 //   hive test      <entrypoint.hive>       run the program's tests, with coverage
 //   hive container <entrypoint.hive>       write a Dockerfile that builds and runs it
+//   hive agents                            write .hivedocs/ for a coding agent to read
 //   hive version                           which release this compiler is
 //
 // Everything a compiler is made of happens here — lexing, parsing, resolving
 // imports, expanding generics, checking, proving every index in range, emitting
 // Go — as does driving the Go toolchain over what came out. There is nothing
 // left for a shell script to do.
+import ./agents
 import ./container
 import ./diag
 import ./paths
@@ -27,12 +29,16 @@ import hive.term
 
 proc main(): void {
 	args := hive.term.args()
-	// Answered up here, ahead of everything below, because it is the one command
-	// with no source to read: the dispatch further down has resolved an
-	// entrypoint and started a clock before it gets to choose, and `hive version`
-	// was typed with neither.
+	// Answered up here, ahead of everything below, because these are the two
+	// commands with no source to read: the dispatch further down has resolved an
+	// entrypoint and started a clock before it gets to choose, and neither of
+	// these was typed with one.
 	if at(args, 0) == "version" {
 		release(rest(args, 1))
+		return
+	}
+	if at(args, 0) == "agents" {
+		document(rest(args, 1))
 		return
 	}
 	if len(args) < 2 {
@@ -171,6 +177,32 @@ proc dockerfile(entry: Str, from: Int): void {
 	}
 }
 
+// The one command that writes documentation rather than a program: `.hivedocs/`,
+// a short page per feature of the language for a coding agent to read, out of
+// this compiler rather than off a network — see `agents.hive` for what else it
+// makes sure of, and why.
+//
+// Every line it prints is something it did, so a second run says what changed
+// and what was already so. No timing: what it writes it writes in the time a
+// few dozen small files take, and a duration stuck to that would be noise.
+proc document(args: Str[]): void {
+	wrong := agents.refusal(args)
+	if wrong != "" {
+		echo "hive: " + wrong
+		hive.term.exit(1)
+	}
+	written := agents.write()
+	if written is Result.Error(errors) {
+		complain(errors)
+		return
+	}
+	if written is Result.Ok(said) {
+		for each line in agents.report(said) {
+			echo line
+		}
+	}
+}
+
 // The one command that reads nothing and builds nothing: which compiler this
 // is. What it prints is bare — `v0.1.9`, and that alone — so that a script can
 // use the line as it stands, `hivec_version="$(hive version)"`. A word in front
@@ -297,6 +329,7 @@ proc usage(): void {
 	echo "  hive run       <entrypoint.hive> [..]  Compile and run"
 	echo "  hive test      <entrypoint.hive>       Run the program's tests, with coverage"
 	echo "  hive container <entrypoint.hive>       Write a Dockerfile that builds and runs it"
+	echo "  hive agents                            Write .hivedocs/ for a coding agent to read"
 	echo "  hive version                           Print which release this compiler is"
 	echo ""
 	echo "Flags:"

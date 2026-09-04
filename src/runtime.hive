@@ -1807,6 +1807,17 @@ func jsonSource(): Str {
 			return JsonValue{}, &JsonJsonError{Path: path + "." + key, Expected: "a value", Found: "nothing"}
 		}
 
+		// JsonLook is JsonField for a field with somewhere to fall back to: a key
+		// that is not there is an answer rather than an error.
+		func JsonLook(obj []JsonMember, key string) (JsonValue, bool) {
+			for _, m := range obj {
+				if m.Key == key {
+					return m.Value, true
+				}
+			}
+			return JsonValue{}, false
+		}
+
 		// JsonVariant unwraps the {"VariantName": {...}} encoding of tagged
 		// unions.
 		func JsonVariant(v JsonValue, path string) (string, JsonValue, *JsonJsonError) {
@@ -8395,14 +8406,22 @@ func uiSceneSource(): Str {
 		// written out here, once, into the payload the window sends on its own frame.
 		func UiScene(attrs []UiAttr, shapes []UiShape) UiView {
 			var b strings.Builder
+			// **Room for the whole frame, asked for once.** A builder that is not told how
+			// big the answer will be doubles its buffer as it fills, and doubling copies
+			// everything written so far — so a hundred-kilobyte frame was about seventeen
+			// allocations each larger than the last, and half a megabyte of copying, before
+			// a single shape had been described. A box with a position, a rotation and three
+			// dimensions comes to a little over a hundred bytes; the estimate does not have
+			// to be right, only close enough that the doubling does not happen.
+			b.Grow(len(shapes)*112 + 256)
 			b.WriteString("{")
 			uiSceneCamera(&b, attrs)
 			b.WriteString(",\"o\":[")
 			for i, s := range shapes {
 				if i > 0 {
-					b.WriteString(",")
+					b.WriteByte(',')
 				}
-				uiSceneShape(&b, s)
+				uiSceneShape(&b, &s)
 			}
 			b.WriteString("]}")
 			return UiView{Kind: "scene", Attrs: attrs, Text: b.String()}
@@ -8431,8 +8450,10 @@ func uiSceneSource(): Str {
 		// a scene with no camera attributes at all is a metre and a half above the
 		// origin looking down -Z, which is a view of *something* rather than a blank.
 		func uiSceneCamera(b *strings.Builder, attrs []UiAttr) {
-			b.WriteString("\"eye\":" + uiSceneVec(uiSceneNums(attrs, "eye", []float64{0, 1.7, 0})))
-			b.WriteString(",\"aim\":" + uiSceneVec(uiSceneNums(attrs, "aim", []float64{0, 0})))
+			b.WriteString("\"eye\":")
+			uiSceneVecTo(b, uiSceneNums(attrs, "eye", uiSceneEyeAt))
+			b.WriteString(",\"aim\":")
+			uiSceneVecTo(b, uiSceneNums(attrs, "aim", uiSceneAimAt))
 			if lens, ok := uiFind(attrs, "lens"); ok {
 				b.WriteString(",\"lens\":" + strconv.Itoa(lens.Num))
 			}
@@ -8484,47 +8505,158 @@ func uiSceneSource(): Str {
 			return b.String()
 		}
 
-		func uiSceneShape(b *strings.Builder, s UiShape) {
+		// The three defaults a scene falls back on, written down once. They used to be
+		// slice literals in the argument list — which meant one allocation per shape,
+		// per frame, to describe a position that was about to be overwritten anyway.
+		var (
+			uiSceneEyeAt  = []float64{0, 1.7, 0}
+			uiSceneAimAt  = []float64{0, 0}
+			uiSceneOrigin = []float64{0, 0, 0}
+		)
+
+		// The attributes this writer looks for, found in one pass instead of one pass
+		// each.
+		//
+		// uiFind walks the whole slice and hands back a UiAttr **by value** — and a
+		// UiAttr is a hundred and fifty bytes of strings, closures and a slice header,
+		// because it is one shape for every attribute in the module. A shape asked for
+		// up to five of them, so describing one meant five walks and five copies of a
+		// struct whose fields were, in every case, about to be ignored.
+		//
+		// This is the same question asked once, and the answers are pointers into the
+		// caller's own slice. First match wins, which is what uiFind does.
+		type uiSceneParts struct {
+			at, turn, paint, surface, voice, track, pitch, volume *UiAttr
+		}
+
+		func uiScenePartsOf(attrs []UiAttr) uiSceneParts {
+			var p uiSceneParts
+			for i := range attrs {
+				one := &attrs[i]
+				switch one.Kind {
+				case "at":
+					if p.at == nil {
+						p.at = one
+					}
+				case "turn":
+					if p.turn == nil {
+						p.turn = one
+					}
+				case "paint":
+					if p.paint == nil {
+						p.paint = one
+					}
+				case "surface":
+					if p.surface == nil {
+						p.surface = one
+					}
+				case "voice":
+					if p.voice == nil {
+						p.voice = one
+					}
+				case "track":
+					if p.track == nil {
+						p.track = one
+					}
+				case "pitch":
+					if p.pitch == nil {
+						p.pitch = one
+					}
+				case "volume":
+					if p.volume == nil {
+						p.volume = one
+					}
+				}
+			}
+			return p
+		}
+
+		// The numbers an attribute carries, or the default where it carries the wrong
+		// count. The same rule uiSceneNums applies, against a part already found.
+		func uiScenePartNums(one *UiAttr, fallback []float64) []float64 {
+			if one != nil && len(one.Nums) == len(fallback) {
+				return one.Nums
+			}
+			return fallback
+		}
+
+		func uiScenePartOne(one *UiAttr, fallback float64) float64 {
+			if one != nil && len(one.Nums) == 1 {
+				return one.Nums[0]
+			}
+			return fallback
+		}
+
+		func uiScenePartEnum(one *UiAttr) string {
+			if one != nil {
+				return one.Enum
+			}
+			return ""
+		}
+
+		func uiSceneShape(b *strings.Builder, s *UiShape) {
+			// **Written into the frame rather than assembled beside it.** Every line below
+			// used to join its pieces with a plus, hand the result to the builder, and drop
+			// it — so a shape allocated once for each of its parts and once more for each
+			// join. The builder is the destination either way, so these write to it
+			// directly: the same bytes, and none of the rubbish.
+			p := uiScenePartsOf(s.Attrs)
 			// A sound has no colour, no dimensions, no rotation and nothing to shade.
 			// Writing all four of them sixty times a second for something nobody can
 			// see is the whole reason this is a branch of its own rather than four more
 			// conditionals in the one below.
 			if s.Kind == "sound" {
-				b.WriteString("{\"k\":\"sound\",\"x\":" + uiSceneStr(s.Text))
-				b.WriteString(",\"p\":" + uiSceneVec(uiSceneNums(s.Attrs, "at", []float64{0, 0, 0})))
-				if voice := uiSceneEnum(s.Attrs, "voice"); voice != "" {
-					b.WriteString(",\"v\":\"" + voice + "\"")
+				b.WriteString("{\"k\":\"sound\",\"x\":")
+				uiSceneStrTo(b, s.Text)
+				b.WriteString(",\"p\":")
+				uiSceneVecTo(b, uiScenePartNums(p.at, uiSceneOrigin))
+				if voice := uiScenePartEnum(p.voice); voice != "" {
+					b.WriteString(",\"v\":\"")
+					b.WriteString(voice)
+					b.WriteByte('"')
 				}
 				// Only where there is one. A sound that names no recording writes nothing,
 				// and is the sound this renderer has always made.
-				if track, ok := uiFind(s.Attrs, "track"); ok && track.Str != "" {
-					b.WriteString(",\"t\":" + uiSceneStr(track.Str))
+				if p.track != nil && p.track.Str != "" {
+					b.WriteString(",\"t\":")
+					uiSceneStrTo(b, p.track.Str)
 				}
-				b.WriteString(",\"h\":" + uiSceneF(uiSceneOne(s.Attrs, "pitch", 1)))
-				b.WriteString(",\"g\":" + uiSceneF(uiSceneOne(s.Attrs, "volume", 1)))
-				b.WriteString("}")
+				b.WriteString(",\"h\":")
+				uiSceneFTo(b, uiScenePartOne(p.pitch, 1))
+				b.WriteString(",\"g\":")
+				uiSceneFTo(b, uiScenePartOne(p.volume, 1))
+				b.WriteByte('}')
 				return
 			}
-			b.WriteString("{\"k\":\"" + s.Kind + "\"")
-			b.WriteString(",\"c\":\"" + uiSceneTone(uiSceneEnum(s.Attrs, "paint"), "#cfd6de") + "\"")
+			b.WriteString("{\"k\":\"")
+			b.WriteString(s.Kind)
+			b.WriteString("\",\"c\":\"")
+			b.WriteString(uiSceneTone(uiScenePartEnum(p.paint), "#cfd6de"))
+			b.WriteByte('"')
 			// A line carries both its ends in its payload, so it has no position of its
 			// own and no rotation to apply to it.
 			if s.Kind != "line" {
-				b.WriteString(",\"p\":" + uiSceneVec(uiSceneNums(s.Attrs, "at", []float64{0, 0, 0})))
-				if turn, ok := uiFind(s.Attrs, "turn"); ok && uiSceneAny(turn.Nums) {
-					b.WriteString(",\"r\":" + uiSceneVec(turn.Nums))
+				b.WriteString(",\"p\":")
+				uiSceneVecTo(b, uiScenePartNums(p.at, uiSceneOrigin))
+				if p.turn != nil && uiSceneAny(p.turn.Nums) {
+					b.WriteString(",\"r\":")
+					uiSceneVecTo(b, p.turn.Nums)
 				}
 			}
 			if len(s.Nums) > 0 {
-				b.WriteString(",\"d\":" + uiSceneVec(s.Nums))
+				b.WriteString(",\"d\":")
+				uiSceneVecTo(b, s.Nums)
 			}
-			if made := uiSceneEnum(s.Attrs, "surface"); made != "" {
-				b.WriteString(",\"s\":\"" + made + "\"")
+			if made := uiScenePartEnum(p.surface); made != "" {
+				b.WriteString(",\"s\":\"")
+				b.WriteString(made)
+				b.WriteByte('"')
 			}
 			if s.Text != "" {
-				b.WriteString(",\"x\":" + uiSceneStr(s.Text))
+				b.WriteString(",\"x\":")
+				uiSceneStrTo(b, s.Text)
 			}
-			b.WriteString("}")
+			b.WriteByte('}')
 		}
 
 		// The colour a UiTone comes to in a world. A role has to be answered with a
@@ -8582,17 +8714,15 @@ func uiSceneSource(): Str {
 			return false
 		}
 
-		func uiSceneVec(nums []float64) string {
-			var b strings.Builder
-			b.WriteString("[")
+		func uiSceneVecTo(b *strings.Builder, nums []float64) {
+			b.WriteByte('[')
 			for i, n := range nums {
 				if i > 0 {
-					b.WriteString(",")
+					b.WriteByte(',')
 				}
-				b.WriteString(uiSceneF(n))
+				uiSceneFTo(b, n)
 			}
-			b.WriteString("]")
-			return b.String()
+			b.WriteByte(']')
 		}
 
 		// A number in a frame: three decimals, which is a millimetre in a world measured
@@ -8603,27 +8733,63 @@ func uiSceneSource(): Str {
 		// spelling for NaN, so a single one would make the whole frame unreadable and
 		// stop the picture dead — a shape at the origin is a far better answer than a
 		// window that freezes because some velocity divided by zero.
-		func uiSceneF(v float64) string {
+		// **Formatted into the frame, not into a string.** This is the hottest function
+		// in the renderer — a shape carries nine or ten numbers and a frame carries a
+		// thousand shapes — and every one of them used to cost several allocations: one
+		// for FormatFloat, and more for the trims and the join that followed it.
+		//
+		// AppendFloat writes the digits into a buffer on the stack, the trims become
+		// two indices, and the result goes straight into the builder. The spelling is
+		// unchanged, down to the last byte: three decimals, trailing zeros dropped, the
+		// point dropped with them, and negative nothing written as nought.
+		func uiSceneFTo(b *strings.Builder, v float64) {
 			if math.IsNaN(v) || math.IsInf(v, 0) {
-				return "0"
+				b.WriteByte('0')
+				return
 			}
-			text := strconv.FormatFloat(v, 'f', 3, 64)
-			if strings.Contains(text, ".") {
-				text = strings.TrimRight(text, "0")
-				text = strings.TrimSuffix(text, ".")
+			// Big enough for every number a world is measured in. Anything longer — and
+			// 'f' on 1e300 is three hundred digits — grows on the heap exactly as
+			// FormatFloat always did.
+			var buf [32]byte
+			text := strconv.AppendFloat(buf[:0], v, 'f', 3, 64)
+			// The trailing zeros, and then the point they were hiding behind. 'f' with
+			// three places always writes a point, but it is looked for rather than assumed:
+			// this has to answer exactly what TrimRight and then TrimSuffix answered.
+			if uiSceneDotted(text) {
+				end := len(text)
+				for end > 0 && text[end-1] == '0' {
+					end--
+				}
+				if end > 0 && text[end-1] == '.' {
+					end--
+				}
+				text = text[:end]
 			}
-			if text == "" || text == "-" || text == "-0" {
-				return "0"
+			// What is left of "-0.000" is "-0", and a frame should not carry a negative
+			// nothing. The other two cannot arise and are answered anyway.
+			if len(text) == 0 || string(text) == "-" || string(text) == "-0" {
+				b.WriteByte('0')
+				return
 			}
-			return text
+			b.Write(text)
+		}
+
+		// Whether there is a point in it, looked for from the right because that is
+		// where three decimal places put one.
+		func uiSceneDotted(text []byte) bool {
+			for i := len(text) - 1; i >= 0; i-- {
+				if text[i] == '.' {
+					return true
+				}
+			}
+			return false
 		}
 
 		// A label's words as a JSON string. The words are whatever the program had, so
 		// they are escaped rather than trusted — and they never reach the document at
 		// all: a label is drawn into the picture, not written into the page.
-		func uiSceneStr(text string) string {
-			var b strings.Builder
-			b.WriteString("\"")
+		func uiSceneStrTo(b *strings.Builder, text string) {
+			b.WriteByte('"')
 			for _, r := range text {
 				switch r {
 				case '"':
@@ -8644,8 +8810,7 @@ func uiSceneSource(): Str {
 					b.WriteRune(r)
 				}
 			}
-			b.WriteString("\"")
-			return b.String()
+			b.WriteByte('"')
 		}
 	`
 }

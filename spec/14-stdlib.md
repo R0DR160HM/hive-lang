@@ -236,6 +236,23 @@ Built on the idea that Hive's type declarations *are* the JSON schema.
   variant.
 * `encode(value)` derives the encoder from the static type and therefore cannot
   fail.
+
+**A field's annotations are what steer both of them**
+([04](04-declarations.md#annotations)). `-- JSON as <name>;` is the key the
+field is read from and written as, in both directions, so a round trip agrees
+with itself. `-- Default as <literal>;` is what to read where the key is absent
+or `null`, which is what turns a required field into an optional one:
+
+```hive
+type User {
+	name: Str -- JSON as username;
+	age:  Int
+	firstName: Str -- Default as "";
+}
+```
+
+Neither reaches `parse(text) with Table`, which flattens a document rather than
+decoding a declared shape.
 * `table(text)` reads a JSON array of flat objects as a headered `Table`.
 * `parse(text) with Table` flattens a whole document into `[path, value]` rows,
   looked up with `get(table, "keys.layout")` and re-nested by the encoder.
@@ -359,10 +376,14 @@ keeps waiting. That is what makes a deferred reply possible.
 
 **On the wire.** One persistent, multiplexed connection per node *pair*, carrying
 length-prefixed frames, dialed lazily. Messages cross as JSON using the same
-derived codecs `hive.json` builds, and every frame carries a 32-bit structural
-digest of the message type, so a peer built from a different declaration fails
-loudly instead of decoding another type's bytes. Every connection is TLS 1.3,
-mutually authenticated, with no plaintext path. **Delivery is best-effort:**
+derived codecs `hive.json` builds — so a message type's
+[`JSON as` annotations](04-declarations.md#annotations) decide what goes on the
+wire here too — and every frame carries a 32-bit structural digest of the
+message type, so a peer built from a different declaration fails loudly instead
+of decoding another type's bytes. **A field goes into that digest under its JSON
+key**, because that is what decides the bytes; a `Default` stays out of it, since
+it changes what a decoder will accept rather than what an encoder writes. Every
+connection is TLS 1.3, mutually authenticated, with no plaintext path. **Delivery is best-effort:**
 messages queued when a node is declared down are dropped.
 
 ## 14.11 `hive.task`

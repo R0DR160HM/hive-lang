@@ -1,0 +1,300 @@
+// Tests for `src/agents` and the pages under `src/docs`.
+//
+// Two halves, and they are different jobs.
+//
+// The **pages** are text, so what can be checked about them is what a mistake
+// in one would look like from outside: a marker left unreplaced, a body that
+// came out empty, two pages claiming one path, a link into the index that names
+// a page nobody writes. Every one of those has happened to generated
+// documentation before, and none of them shows up in a compile.
+//
+// The **three files a project already has** are where the real decisions are —
+// what counts as an AGENTS.md that already points at the pages, what counts as
+// a .gitignore that already has them, where `@AGENTS.md` goes on a CLAUDE.md
+// that opens with something else. Each of those is a pure function, so each is
+// asked here directly, with the awkward inputs rather than the tidy one.
+import ../src/agents
+import ../src/docs/language
+import ../src/docs/library
+import ../src/docs/page
+import ../src/docs/ui
+import ../src/text
+
+// --- The pages ---------------------------------------------------------------
+
+test "there is a page for every part of the language and the library" {
+	// Not a count anybody has to keep: it says the three halves are all in
+	// there, which is what a dropped `append` in `everyPage` would break.
+	assert len(language.pages()) > 15
+	assert len(library.pages()) > 20
+	assert len(ui.pages()) > 10
+	halves := len(language.pages()) + len(library.pages()) + len(ui.pages())
+	assert len(agents.everyPage()) == halves
+}
+
+test "no page comes out holding a marker it should have spent" {
+	// The one mistake the language cannot catch. A backtick cannot appear in a
+	// backtick string, so every page writes `~BT~` and `~CODE~` instead — and a
+	// marker misspelled, or one written where no substitution runs, is a page
+	// that ships those five characters to a reader.
+	for each one in agents.everyPage() {
+		assert text.contains(one.body, "~BT~") == false
+		assert text.contains(one.body, "~CODE~") == false
+	}
+}
+
+test "every page has a body, a heading and a closing newline" {
+	for each one in agents.everyPage() {
+		assert len(one.body) > 300
+		assert text.startsWith(one.body, "# ")
+		assert text.endsWith(one.body, "\n")
+	}
+}
+
+test "every page is a markdown file, named once" {
+	mut Str[dyn] seen = []
+	for each one in agents.everyPage() {
+		assert text.endsWith(one.path, ".md")
+		assert text.startsWith(one.path, "/") == false
+		assert text.contains(one.path, "..") == false
+		assert indexOf(seen, one.path) is Result.Error(_)
+		append(seen, one.path)
+	}
+}
+
+test "the index links to a page that is really written" {
+	// A link in the index naming a page nobody writes is a dead end, and the
+	// index is the one page every reader opens. Checked by asking the other way
+	// round: every page that goes in the root has to be named in it.
+	index := bodyOf("README.md")
+	assert len(index) > 0
+	for each one in language.pages() {
+		if one.path != "README.md" {
+			assert text.contains(index, "(" + one.path + ")")
+		}
+	}
+}
+
+test "the library index links to every library page" {
+	index := bodyOf("stdlib/README.md")
+	assert len(index) > 0
+	// The links there are written relative to `stdlib/`, so the directory comes
+	// off before the page is looked for.
+	for each one in library.pages() {
+		if one.path != "stdlib/README.md" {
+			assert text.contains(index, "(" + text.replace(one.path, "stdlib/", "") + ")")
+		}
+	}
+}
+
+test "the pages that catch people out are named where they will be seen" {
+	// `pitfalls.md` is the page worth reading first, so the index and both
+	// files this command writes have to send somebody to it.
+	assert len(bodyOf("pitfalls.md")) > 0
+	assert text.contains(agents.agentsFile(), "pitfalls.md")
+	assert text.contains(agents.pointer(), "pitfalls.md")
+}
+
+test "the folders the pages need are worked out from their paths" {
+	folders := agents.foldersOf(agents.everyPage())
+	assert indexOf(folders, ".hivedocs") is Result.Ok(_)
+	assert indexOf(folders, ".hivedocs/stdlib") is Result.Ok(_)
+	// Each said once, since making one twice is a second call for nothing.
+	assert len(folders) == 2
+}
+
+test "a page turns its markers back into what they stand for" {
+	// `~CODE~` first, because what it leaves behind is three of the character
+	// the other marker stands for — done the other way round, a fence would come
+	// out as three markers nothing replaces.
+	assert page.backticked("~BT~mut~BT~") == "`mut`\n"
+	assert page.backticked("~CODE~hive") == "```hive\n"
+	assert page.backticked("nothing to do") == "nothing to do\n"
+}
+
+test "no page is written that nothing links to" {
+	// The pages are only useful if they can be found from the one an agent is
+	// told to open, and the `hive.ui` ones are two levels down — `ui.md` names
+	// the seven beside it and `ui-scene.md` names the five under that. Rather
+	// than write that shape down twice, every page bar the two indexes has to be
+	// named somewhere.
+	for each one in agents.everyPage() {
+		if one.path != "README.md" && one.path != "stdlib/README.md" {
+			assert linked(text.replace(one.path, "stdlib/", ""))
+		}
+	}
+}
+
+// The body of one page, or `""`. The pages are a vector rather than a map, and
+// a test asking for one by name is the only thing that ever wants it the other
+// way round.
+func bodyOf(wanted: Str): Str {
+	for each one in agents.everyPage() {
+		if one.path == wanted {
+			return one.body
+		}
+	}
+	return ""
+}
+
+// Whether any page holds a markdown link to `name`. The links between pages are
+// relative, so one page's `(ui-scene.md)` reaches another in the same folder
+// however deep the folder is.
+func linked(name: Str): Bool {
+	for each one in agents.everyPage() {
+		if text.contains(one.body, "(" + name + ")") {
+			return true
+		}
+	}
+	return false
+}
+
+// --- AGENTS.md ---------------------------------------------------------------
+
+test "an AGENTS.md that names the directory is left alone" {
+	assert agents.mentionsDocs("Read .hivedocs/README.md first.")
+	// Worded its own way, but it has still done the job.
+	assert agents.mentionsDocs("# Us\n\nThe language reference is in `.hivedocs`.")
+}
+
+test "an AGENTS.md about something else has not pointed anywhere" {
+	assert agents.mentionsDocs("# Our project\n\nRun the tests.\n") == false
+	assert agents.mentionsDocs("") == false
+}
+
+test "the pointer is appended, and what was there is kept whole" {
+	was := "# Our project\n\nRun the tests before pushing.\n"
+	now := agents.withPointer(was)
+	assert text.startsWith(now, was)
+	assert text.contains(now, ".hivedocs/README.md")
+	// And having added it, the file now says so.
+	assert agents.mentionsDocs(now)
+}
+
+test "the pointer lands one blank line down, however the file ended" {
+	// Three ways of ending, one answer: a file that ended mid-line gets its
+	// newline, and one that ended in a run of blank lines keeps a single one.
+	assert text.contains(agents.withPointer("Something."), "Something.\n\n## Hive")
+	assert text.contains(agents.withPointer("Something.\n"), "Something.\n\n## Hive")
+	assert text.contains(agents.withPointer("Something.\n\n\n"), "Something.\n\n## Hive")
+}
+
+test "a file written on Windows keeps no carriage return on the line above" {
+	// Both files are read back line by line elsewhere, so a `\r` left stranded
+	// where the section was joined on would be the one line that did not match
+	// what the rest of the file does.
+	assert text.contains(agents.withPointer("Something.\r\n"), "Something.\n\n## Hive")
+	assert text.contains(agents.withIgnore("*.exe\r\n"), "*.exe\n\n# What")
+}
+
+test "a gitignore and a CLAUDE.md written on Windows are read the same way" {
+	// `text.trim` takes a carriage return off with the spaces, which is the
+	// whole of what these two need to work on a file git checked out with CRLF.
+	assert agents.ignoresDocs("*.exe\r\n.hivedocs/\r\n")
+	assert agents.opensWithAgents("@AGENTS.md\r\n\r\n# Us\r\n")
+}
+
+test "an empty AGENTS.md gets the pointer and nothing in front of it" {
+	assert text.startsWith(agents.withPointer(""), "## Hive")
+	assert text.startsWith(agents.withPointer("\n\n"), "## Hive")
+}
+
+test "an AGENTS.md written from nothing says what to read and how to check it" {
+	written := agents.agentsFile()
+	assert text.startsWith(written, "# AGENTS.md")
+	assert text.contains(written, ".hivedocs/README.md")
+	assert text.contains(written, "hive check")
+	assert text.contains(written, "hive test")
+	// And it says how to get the pages back, which is the whole reason a
+	// directory nobody commits is safe to depend on.
+	assert text.contains(written, "hive agents")
+}
+
+// --- .gitignore --------------------------------------------------------------
+
+test "a gitignore holding the directory is found, under any of its spellings" {
+	assert agents.ignoresDocs(".hivedocs/")
+	assert agents.ignoresDocs(".hivedocs")
+	assert agents.ignoresDocs("/.hivedocs/")
+	assert agents.ignoresDocs("/.hivedocs")
+	// Wherever in the file it is, and whatever is around it.
+	assert agents.ignoresDocs("*.exe\n\n# the pages\n.hivedocs/\n\n/dist/\n")
+	assert agents.ignoresDocs("  .hivedocs/  ")
+}
+
+test "a line that is not that directory is not mistaken for it" {
+	assert agents.ignoresDocs("") == false
+	assert agents.ignoresDocs("*.exe\n/dist/\n") == false
+	// A comment mentioning it is not a rule ignoring it.
+	assert agents.ignoresDocs("# .hivedocs/ is generated\n") == false
+	// Neither is something else that starts the same way.
+	assert agents.ignoresDocs(".hivedocsold/\n") == false
+	assert agents.ignoresDocs("docs/\n") == false
+}
+
+test "the rule is appended with the reason it is there" {
+	was := "*.exe\n"
+	now := agents.withIgnore(was)
+	assert text.startsWith(now, was)
+	assert agents.ignoresDocs(now)
+	assert text.contains(now, "hive agents")
+	assert text.endsWith(now, ".hivedocs/\n")
+}
+
+// --- CLAUDE.md ---------------------------------------------------------------
+
+test "a CLAUDE.md opening with the import is left alone" {
+	assert agents.opensWithAgents("@AGENTS.md\n\n# Us\n")
+	assert agents.opensWithAgents("@AGENTS.md")
+	// Blank lines above it change nothing about what is read first.
+	assert agents.opensWithAgents("\n\n@AGENTS.md\n")
+}
+
+test "a CLAUDE.md opening with anything else has not imported it" {
+	assert agents.opensWithAgents("# Us\n\n@AGENTS.md\n") == false
+	assert agents.opensWithAgents("") == false
+	// Named in a sentence rather than imported on a line of its own.
+	assert agents.opensWithAgents("See @AGENTS.md for the rest.") == false
+}
+
+test "the import goes on the front, not the end" {
+	was := "# Our project\n\nRun the tests.\n"
+	now := agents.withAgents(was)
+	assert text.startsWith(now, "@AGENTS.md\n\n")
+	assert text.endsWith(now, was)
+	assert agents.opensWithAgents(now)
+}
+
+// --- The command line --------------------------------------------------------
+
+test "hive agents on its own is the whole command" {
+	assert agents.refusal([]) == ""
+}
+
+test "anything after hive agents is refused rather than dropped" {
+	// It reads no source and takes no flag, so a word after it is a word
+	// somebody expected to mean something. Quietly ignoring it would be the
+	// command doing something other than what it was told.
+	assert agents.refusal(["main.hive"]) != ""
+	assert agents.refusal(["--force"]) != ""
+}
+
+test "what was refused is named in the complaint" {
+	assert text.contains(agents.refusal(["--force"]), "--force")
+}
+
+test "the report opens with what was written and where" {
+	Str[dyn] nothingElse = []
+	said := agents.report(agents.Written(54, nothingElse))
+	assert len(said) == 1
+	assert text.contains(text.charAt(said, 0), "54")
+	assert text.contains(text.charAt(said, 0), ".hivedocs/")
+}
+
+test "the report says every other thing the run did, in order" {
+	Str[dyn] notes = ["Created AGENTS.md", "Added it to .gitignore"]
+	said := agents.report(agents.Written(54, notes))
+	assert len(said) == 3
+	assert text.charAt(said, 1) == "Created AGENTS.md"
+	assert text.charAt(said, 2) == "Added it to .gitignore"
+}

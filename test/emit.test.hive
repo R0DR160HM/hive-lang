@@ -38,6 +38,13 @@ func has(haystack: Str, needle: Str): Bool {
 	return text.contains(haystack, needle)
 }
 
+// The newline between two declarations of a program written on one line. Named
+// rather than written inline, because one more escape inside these
+// already-quoted programs is one more than they can carry.
+func newline(): Str {
+	return "\n"
+}
+
 // --- The shape of a file -----------------------------------------------------
 
 test "a file is one package importing one thing" {
@@ -102,6 +109,39 @@ test "+ is three operators, told apart by one type" {
 	assert has(stmt("echo 1 + 2"), "(1 + 2)")
 	assert has(stmt("echo \"a\" + \"b\""), "(\"a\" + \"b\")")
 	assert has(stmt("Int[dyn] a = []  echo a + a"), "hive.Concat(a, a)")
+}
+
+test "`!` is Go's own, parenthesised" {
+	// Go has a `!` that means exactly this, so there is nothing for the runtime
+	// to do. The parentheses are there for the reason unary minus has them:
+	// what Hive bound tightly, Go has to be told to bind tightly too.
+	assert has(stmt("found := false  echo !found"), "!(found)")
+	assert has(stmt("echo !!true"), "!(!(true))")
+	assert has(stmt("echo !(1 == 2)"), "!((1 == 2))")
+}
+
+test "an annotation decides the key the codecs read and write" {
+	got := go("type User \{ name: Str -- JSON as username; }" + newline() + "proc main(): void \{ echo hive.json.encode(User(\"a\")) }")
+	// One name in the encoder, the same one in the decoder, and the Hive field
+	// keeps its own spelling in the struct.
+	assert has(got, "\\\"username\\\":")
+	assert has(got, "Name string")
+}
+
+test "a Default is written into the decoder, and asks rather than insists" {
+	got := go("type User \{ name: Str -- Default as \"nobody\"; }" + newline() + "proc main(): void \{ if hive.json.parse(\"\") with User is Result.Ok(u) \{ echo u.name } }")
+	// The literal is the field's starting value and the lookup may leave it
+	// alone, so a key that is not there costs no error.
+	assert has(got, "hive.JsonLook(obj,")
+	assert has(got, "nobody")
+	// A `null` is the same nothing an absent key is.
+	assert has(got, ".Kind != 'n'")
+}
+
+test "a field with no Default still goes through the lookup that errors" {
+	got := go("type User \{ name: Str }" + newline() + "proc main(): void \{ if hive.json.parse(\"\") with User is Result.Ok(u) \{ echo u.name } }")
+	assert has(got, "hive.JsonField(obj,")
+	assert has(got, "hive.JsonLook(obj,") == false
 }
 
 test "dividing by zero is a value, so it goes through the runtime" {

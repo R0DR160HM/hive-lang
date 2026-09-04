@@ -40,7 +40,10 @@ declaration = type-decl | func-decl | proc-decl | query-decl | test-decl ;
 type-decl   = "type" IDENT "{" type-body "}" ;
 type-body   = { field } { variant } { field } ;
 variant     = IDENT [ "{" { field } "}" ] ;
-field       = IDENT ":" type ;
+field       = IDENT ":" type [ annotations ] ;
+
+annotations = "--" { annotation } ;
+annotation  = ( "JSON" | "Default" ) "as" ( IDENT | STRING | literal ) ";" ;
 
 func-decl   = "func" IDENT "(" [ params ] ")" ":" type block ;
 proc-decl   = "proc" IDENT "(" [ params ] ")" ":" type block ;
@@ -50,6 +53,15 @@ test-decl   = "test" STRING block ;
 params      = param { "," param } ;
 param       = IDENT ":" [ "mut" ] type ;
 ```
+
+A field's **annotations** are read in any order and each ends at its `;`, so a
+field may carry one, both, or neither. `JSON` takes a name and `Default` takes a
+literal; [04](04-declarations.md#annotations) says what each means.
+
+`--` is the same two characters the decrement step is written with, and there is
+nothing to tell apart: a step is a statement and a type body holds no
+statements. `JSON`, `Default` and `as` are not reserved words either — like `as`
+after an import path, each means something only where it is written.
 
 A field list and a variant list may be interleaved: a field written outside any
 variant is added to **every** variant. A type with no variants is a struct; a
@@ -144,7 +156,7 @@ Loosest to tightest:
 | 4 | `>` `<` `>=` `<=` `==` `!=` | non-associative |
 | 5 | `+` `-` | left |
 | 6 | `*` `/` `%` | left |
-| 7 | unary `-` | prefix |
+| 7 | unary `-`, `!` | prefix |
 | 8 | `**` | right |
 | 9 | `with` clause | postfix |
 | 10 | call, index, slice, member | postfix, left |
@@ -152,6 +164,13 @@ Loosest to tightest:
 
 Unary `-` binds **tighter** than `* / %` and **looser** than `**`, so `-2 ** 2`
 is `-(2 ** 2)` and `2 ** -3` reads the sign as part of the exponent.
+
+`!` binds at that same level, which puts it tighter than every comparison and
+every conjunction: `!a && b` is `(!a) && b` and `!a == b` is `(!a) == b`. What
+it takes is therefore a value rather than a condition somebody wrote out, and
+negating a comparison, a `bounds` or anything else at a looser level is written
+with parentheses — `!(a == b)`, `!(v bounds i)`. A **match** may not be negated
+at all; [05](05-expressions.md#no-negated-match) says why.
 
 ```
 expression  = or-expr ;
@@ -164,7 +183,7 @@ is-expr     = cmp-expr [ "is" pattern ]
 cmp-expr    = add-expr [ ( ">" | "<" | ">=" | "<=" | "==" | "!=" ) add-expr ] ;
 add-expr    = mul-expr { ( "+" | "-" ) mul-expr } ;
 mul-expr    = unary-expr { ( "*" | "/" | "%" ) unary-expr } ;
-unary-expr  = "-" unary-expr | pow-expr ;
+unary-expr  = "-" unary-expr | "!" unary-expr | pow-expr ;
 pow-expr    = with-expr [ "**" unary-expr ] ;
 
 with-expr   = postfix-expr [ "with" "timeout" add-expr

@@ -28,31 +28,59 @@ proc handle(request: hive.net.HttpRequest): hive.net.HttpResponse {
 	return hive.net.HttpResponse(200, body: "Hello, {request.url}!\n", headers: headers)
 }
 
+// A field's `--` annotations are compile-time, and both of them are about the
+// codecs derived from this declaration. Neither touches the Hive side: this is
+// still `greeting.name`, and still `greeting.mood`.
+//
+//   `JSON as <name>;`       the key the field is read from and written as
+//   `Default as <literal>;` what to read where JSON has null or nothing
+//
+// They may be written in either order, and a field may carry one, both or —
+// like `visits` below — neither.
 type Greeting {
-	name: Str
+	// The wire calls it `user_name`, which is not a name Hive would let you
+	// declare. That is the point: a JSON key is somebody else's.
+	name: Str -- JSON as user_name;
+	// Optional, so its absence is an answer rather than an error. Without the
+	// default, a body that left `mood` out would come back as a Result.Error.
+	mood: Str -- Default as "unreadable";
+	visits: Int -- Default as 0;
 }
 
 type Reply {
 	message: Str
-	timestamp: Int
+	// `timestamp` here and `at` on the wire, which is a rename in the other
+	// direction: the encoder writes whatever the annotation says.
+	timestamp: Int -- JSON as at;
 }
 
 // POST /greet expects a body like:
-//   {"name": "Charlie", "details": {"mood": "curious", "visits": 3}}
+//   {"user_name": "Charlie", "mood": "curious", "details": {"visits": 3}}
+// and works just as well on:
+//   {"user_name": "Charlie"}
 proc greet(request: hive.net.HttpRequest): hive.net.HttpResponse {
 	// `hive.json.parse(text) with T` derives a decoder for T at compile time
 	// and returns Result<T, hive.json.JsonError>. Missing fields, wrong types and
 	// wrong static vector lengths become a Result.Error; fields the type
 	// doesn't declare (like `details` here) are simply ignored.
+	//
+	// A `Default` is the one thing that softens that: a key that is absent, or
+	// present and null, reads as the literal instead of failing. It softens
+	// nothing else — a `mood` of `7` is still an error, because a default
+	// stands in for a value that was never said, not for one said wrongly.
 	parsed := hive.json.parse(request.body) with Greeting
 	if parsed is Result.Ok(greeting) {
 		// A whole document can also be flattened into a Table of
-		// [path, value] rows, and `hive.json.get` looks paths up in it.
+		// [path, value] rows, and `hive.json.get` looks paths up in it. That is
+		// the way in for a shape the type does not declare — a nested object
+		// here, which no annotation on a scalar field could reach.
 		details := hive.json.parse(request.body) with Table
-		if details is Result.Ok(table) && hive.json.get(table, "details.mood") is Result.Ok(mood) {
-			return reply(200, "Hello {greeting.name}, glad you are {mood}!")
+		if details is Result.Ok(table) && hive.json.get(table, "details.note") is Result.Ok(note) {
+			return reply(200, "Hello {greeting.name}, glad you are {greeting.mood} — {note}\n")
 		}
-		return reply(200, "Hello, {greeting.name}!")
+		// `mood` and `visits` are whatever the body said, or what their
+		// defaults said, and nothing here has to tell those two apart.
+		return reply(200, "Hello {greeting.name}, glad you are {greeting.mood}. Visit {greeting.visits + 1}.\n")
 	} else if parsed is Result.Error(error) {
 		// Decode errors point at the exact path that failed.
 		return reply(422, "{error.path}: expected {error.expected}, found {error.found}")

@@ -25,6 +25,7 @@ a compiler for it written in the language it compiles.
 ./hive build     <entrypoint.hive>    compile to a native executable
 ./hive build     <entrypoint.hive> --target <goos>/<goarch>
 ./hive container <entrypoint.hive>    write a Dockerfile that builds and runs it
+./hive agents                         write .hivedocs/ for a coding agent to read
 ./hive version                        which release this compiler is
 
 ./test/run                            every test the compiler has
@@ -362,6 +363,12 @@ src/                 the compiler
   progress.hive      what the compiler says while it is working
   project.hive       writing the Go module, and running the Go toolchain over it
   container.hive     the Dockerfile `hive container` writes
+  agents.hive        the .hivedocs/ `hive agents` writes, and what else it makes sure of
+  docs/              the pages themselves, carried as source text
+    page.hive        one page, and the marker that stands in for a backtick
+    language.hive    a page per feature of the language
+    library.hive     a page per `hive.*` module
+    ui.hive          `hive.ui`, which is thirteen of them
   version.hive       which release this compiler is, and what `hive version` says
   testreport.hive    what `hive test` prints
   hivec.hive         the command line
