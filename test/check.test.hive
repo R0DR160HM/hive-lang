@@ -181,11 +181,68 @@ test "a discarded sort has to be able to sort in place" {
 	assert problemCount(inMain("Int[dyn] v = [3, 1]  ordered := sort(v)  echo ordered")) == 0
 }
 
+// --- A field's annotations ---------------------------------------------------
+
+test "a Default has to be a value the field can hold" {
+	assert opens(problem("type User \{ age: Int -- Default as \"none\"; }"),
+		"in `User`: `age` is declared Int and falls back to Str")
+	// No widening here either: an `Int` literal does not fill a `Float`.
+	assert opens(problem("type P \{ ratio: Float -- Default as 1; }"),
+		"in `P`: `ratio` is declared Float and falls back to Int")
+	assert problemCount("type User \{ age: Int -- Default as 0; }") == 0
+	assert problemCount("type User \{ name: Str -- Default as \"\"; }") == 0
+	assert problemCount("type P \{ r: Float -- Default as 0.0;  b: Bool -- Default as false; }") == 0
+}
+
+test "two fields cannot answer to one JSON key" {
+	// One key read into two fields is a decoder reading the same member twice,
+	// and an encoder writing it twice.
+	assert opens(problem("type User \{ name: Str  nickname: Str -- JSON as name; }"),
+		"in `User`: two fields here are `name` in JSON")
+	assert opens(problem("type User \{ a: Str -- JSON as who;  b: Str -- JSON as who; }"),
+		"in `User`: two fields here are `who` in JSON")
+	// A rename that clears a clash rather than making one is fine.
+	assert problemCount("type User \{ name: Str  nickname: Str -- JSON as nick; }") == 0
+}
+
+test "a variant is the object, so a clash is looked for across its own fields and the shared ones" {
+	assert opens(problem("type Event \{ at: Int  Opened \{ when: Int -- JSON as at; } }"),
+		"in `Event`: two fields here are `at` in JSON")
+	// Two variants may each use a key, since neither is ever the other's object.
+	assert problemCount("type Event \{ Opened \{ who: Str -- JSON as by; } Closed \{ shut: Str -- JSON as by; } }") == 0
+}
+
 // --- Conditions --------------------------------------------------------------
 
 test "a condition is a Bool and nothing else" {
 	assert opens(problem(inMain("if 1 \{ }")), "in `main`: a condition is a `Bool`, and this one is Int")
 	assert opens(problem(inMain("if \"s\" \{ }")), "in `main`: a condition is a `Bool`, and this one is Str")
+}
+
+test "`!` inverts a Bool and nothing else" {
+	// The same rule a condition is held to, because it is the same reason:
+	// there is no truthiness, so there is nothing else to be the opposite of.
+	assert opens(problem(inMain("n := 3  echo !n")), "in `main`: `!` inverts a `Bool`, and this is Int")
+	assert opens(problem(inMain("echo !\"s\"")), "in `main`: `!` inverts a `Bool`, and this is Str")
+	assert opens(problem(inMain("Str[dyn] v = []  echo !v")), "in `main`: `!` inverts a `Bool`, and this is Str[dyn]")
+	assert opens(problem(inMain("flag := #Ready  echo !flag")), "in `main`: an atom is a label, not a yes or a no")
+}
+
+test "a Bool is a Bool wherever the ! was written" {
+	// Not only in a condition: a `!` may be stored, returned or passed, and each
+	// of those has to hold its operand to the same rule.
+	assert problemCount(inMain("found := false  if !found \{ }")) == 0
+	assert problemCount(inMain("mut seen := false  seen = !seen")) == 0
+	assert problemCount(inMain("mut Bool[dyn] flags = [true]  append(flags, !true)")) == 0
+	assert problemCount(inMain("found := false  ready := true  if !found && ready \{ }")) == 0
+	assert problemCount(inMain("Str[dyn] v = []  if !(v bounds 0) \{ }")) == 0
+	assert problemCount(inMain("echo !!true")) == 0
+}
+
+test "a negated Bool is still a Bool, so it answers where one is wanted" {
+	assert problemCount("func no(b: Bool): Bool \{ return !b }") == 0
+	// And a `func` value of that shape is what a walk takes.
+	assert problemCount("func no(b: Bool): Bool \{ return !b }\nproc main(): void \{ Bool[dyn] v = [true]  echo filter(v, no) }") == 0
 }
 
 test "an atom is a label, not a yes or a no" {

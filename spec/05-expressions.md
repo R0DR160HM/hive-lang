@@ -102,6 +102,7 @@ no subscript at all ([03](03-types.md#36-maps)).
 | `+` | vectors | a **new** vector, lengths added |
 | `-` `*` `/` `%` `**` | `Int`, `Float` | arithmetic |
 | unary `-` | `Int`, `Float` | negation |
+| unary `!` | `Bool` | the opposite |
 | `==` `!=` | any two values of one type | structural equality |
 | `<` `>` `<=` `>=` | `Int`, `Float`, `Str` | ordering |
 | `&&` `\|\|` | `Bool` | short-circuiting conjunction, disjunction |
@@ -110,17 +111,58 @@ no subscript at all ([03](03-types.md#36-maps)).
 
 `%` is the remainder operator and has the same precedence as `*` and `/`.
 
-**There is no unary `!`.** The only prefix operator is `-`, and `!` exists solely
-as the first character of `!=`. A negated condition is written by comparing:
+### Unary `!`
+
+`!` takes a **`Bool`** and answers with the opposite one. Anything else is a
+compile error, for the reason a condition may not be one: there is no
+truthiness, so there is nothing about an `Int`, a `Str` or an `Atom` to be the
+opposite of.
+
+It is a prefix operator at the same level as unary `-`, which puts it **tighter
+than every comparison and every conjunction**:
 
 ```hive
-if found == false { ... }
-if indexOf(v, x) is Result.Error(_) { ... }
+if !found { ... }              // the whole of what it is for
+echo !isEven(3)                // the call is the operand, not `isEven`
+if !found && ready { ... }     // (!found) && ready
+if !(a == b) { ... }           // parentheses, because `==` is looser
+if !(v bounds i) { ... }       // the same, and this proves nothing about `i`
 ```
 
-That is a deliberate consequence of `is` being an expression: most conditions
-worth negating are matches, and `is` has no negated form either — the `else` is
-where the other case goes.
+`!` is not the only way to say it and does not make the others wrong:
+`found == false` is an ordinary comparison and `indexOf(v, x) is Result.Error(_)`
+is an ordinary match.
+
+#### No negated match
+
+**`!` may not be applied to an expression holding an `is`.** It is a compile
+error, and it is the one `Bool` the operator refuses:
+
+```hive
+if !(x is Shape.Circle(r)) { ... }   // compile error: a match cannot be negated
+if !(ready && (x is Shape.Point)) { ... }  // the same, through the `&&`
+```
+
+The reason is what `is` does beyond answering: it **narrows** the value it
+matched and **binds** parts of it, and neither survives being negated — the
+branch under a negated match is the branch where the pattern did *not* hold, so
+`r` above could never be set. Writing it would be a reader looking at a name
+that means nothing.
+
+The other case goes in the `else`, which is where it always went:
+
+```hive
+if x is Shape.Circle(r) {
+	echo r
+} else {
+	echo "not a circle"
+}
+```
+
+The refusal reaches through `&&`, `||` and a second `!`, and no further: `is`
+binds looser than every comparison, so those three are the only operators a
+match can sit beneath. A `!` **beside** a match is untouched — `!a && (x is P)`
+negates `a` and nothing else.
 
 `==` on a vector compares structurally, element by element, short-circuiting on
 the first difference; on a map it compares the pairs and ignores the order they

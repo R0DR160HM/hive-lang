@@ -1,0 +1,409 @@
+// The agents command
+// ==================
+// `hive agents` writes `.hivedocs/` — one short markdown page per feature of
+// the language, for a coding agent to read before it writes any Hive — and then
+// makes sure the three files that decide whether anybody *finds* them say so.
+//
+// It exists because the failure it prevents is expensive and silent. An agent
+// that cannot read a rule guesses at it, and Hive refuses a great deal that
+// every other language accepts: an index without a proof, an `append` to a
+// vector whose length was inferred, `if flag` on an atom, a `!`. A guess costs
+// a compile error at best and a plausible-looking rewrite of working code at
+// worst, so the pages are exact; and context is not free, so they are short and
+// there are many of them, one per thing somebody reaches for.
+//
+// **The pages come out of the compiler that ran the command**, not off a
+// network and not out of the repository — a released `hivec` is one file, and
+// documentation that did not travel inside it would be documentation a user of
+// that file does not have. `docs/` is where the text lives: `docs/language.hive`
+// for the language, `docs/library.hive` for `hive.*`, `docs/ui.hive` for
+// `hive.ui`, and `docs/page.hive` for the one type the three of them share.
+//
+// Four things happen, and only the first of them overwrites anything:
+//
+//   .hivedocs/     every page this compiler carries, rewritten. Anything else
+//                  in there is left alone — ours are ours to replace, and a
+//                  file we never wrote is somebody else's.
+//   AGENTS.md      created if absent; otherwise the pointer is appended if it
+//                  is not already in there. Never rewritten.
+//   .gitignore     `.hivedocs/` added, if there is a .gitignore and it does not
+//                  have it. Generated documentation is build output.
+//   CLAUDE.md      `@AGENTS.md` put on the front, if there is one and it does
+//                  not open with it.
+//
+// Everything about *what the files should say* is a pure function below, so a
+// test can ask what an existing AGENTS.md, .gitignore or CLAUDE.md would become
+// without a disk.
+import ./diag
+import ./docs/language
+import ./docs/library
+import ./docs/page
+import ./docs/ui
+import ./paths
+import ./text
+import ./version
+import hive.file
+
+/// What one run did, worded for whoever ran it.
+type Written {
+	/// How many pages went into `.hivedocs/`.
+	pages: Int
+	/// What became of AGENTS.md, .gitignore and CLAUDE.md — one line each, and
+	/// nothing at all for a file that is not there and was not ours to make.
+	notes: Str[dyn]
+}
+
+// --- The command -------------------------------------------------------------
+
+/// Write the documentation into the folder the command was run in, and answer
+/// with what happened.
+proc write(): Result<Written, diag.Diagnostic[dyn]> {
+	all := everyPage()
+	if made(all) is Result.Error(why) {
+		return Result.Error([why])
+	}
+	mut diag.Diagnostic[dyn] failed = []
+	for each one in all {
+		path := paths.joinPath(directory(), one.path)
+		if hive.file.write(path, one.body) is Result.Error(why) {
+			append(failed, diag.about(path, "cannot write `{path}`: {why.message}"))
+		}
+	}
+	if len(failed) > 0 {
+		return Result.Error(failed)
+	}
+	mut Str[dyn] notes = []
+	if pointed(notes) is Result.Error(why) {
+		return Result.Error([why])
+	}
+	if ignored(notes) is Result.Error(why) {
+		return Result.Error([why])
+	}
+	if imported(notes) is Result.Error(why) {
+		return Result.Error([why])
+	}
+	return Result.Ok(Written(len(all), notes))
+}
+
+/// Every page, in the order they are written: the language, then the library,
+/// then `hive.ui`.
+func everyPage(): page.Page[dyn] {
+	mut page.Page[dyn] all = []
+	for each one in language.pages() {
+		append(all, one)
+	}
+	for each one in library.pages() {
+		append(all, one)
+	}
+	for each one in ui.pages() {
+		append(all, one)
+	}
+	return all
+}
+
+/// Where the pages go, relative to wherever the command was run.
+func directory(): Str {
+	return ".hivedocs"
+}
+
+// The directories the pages need, made before any of them is written:
+// `hive.file.write` creates a file and never a folder to put it in.
+proc made(all: page.Page[]): Result<Bool, diag.Diagnostic> {
+	for each folder in foldersOf(all) {
+		if hive.file.makeDir(folder) is Result.Error(why) {
+			return Result.Error(diag.about(folder, "cannot make `{folder}`: {why.message}"))
+		}
+	}
+	return Result.Ok(true)
+}
+
+/// Every folder the pages sit in, `.hivedocs` first and each said once. Read
+/// off the paths rather than listed, so a page added to a new subdirectory
+/// needs nothing here.
+func foldersOf(all: page.Page[]): Str[dyn] {
+	mut Str[dyn] folders = [directory()]
+	for each one in all {
+		within := paths.dirOf(one.path)
+		if within != "." {
+			folder := paths.joinPath(directory(), within)
+			if indexOf(folders, folder) is Result.Error(_) {
+				append(folders, folder)
+			}
+		}
+	}
+	return folders
+}
+
+// --- AGENTS.md ---------------------------------------------------------------
+
+// The one file here that is made rather than only amended: an AGENTS.md is
+// where an agent looks first, so a project that has none gets one saying what
+// this language is and where the pages are. One that already exists is its
+// author's, and all this may do is add the pointer — at the end, where an
+// appended section goes, rather than in the middle of somebody's prose.
+proc pointed(notes: mut Str[dyn]): Result<Bool, diag.Diagnostic> {
+	if hive.file.exists("AGENTS.md") == false {
+		if hive.file.write("AGENTS.md", agentsFile()) is Result.Error(why) {
+			return Result.Error(diag.about("AGENTS.md", "cannot write `AGENTS.md`: {why.message}"))
+		}
+		append(notes, "Created AGENTS.md, which points at them")
+		return Result.Ok(true)
+	}
+	read := hive.file.read("AGENTS.md")
+	if read is Result.Error(why) {
+		return Result.Error(diag.about("AGENTS.md", "cannot read `AGENTS.md`: {why.message}"))
+	}
+	if read is Result.Ok(existing) {
+		if mentionsDocs(existing) {
+			append(notes, "AGENTS.md already points at {directory()}/")
+			return Result.Ok(true)
+		}
+		if hive.file.write("AGENTS.md", withPointer(existing)) is Result.Error(why) {
+			return Result.Error(diag.about("AGENTS.md", "cannot write `AGENTS.md`: {why.message}"))
+		}
+		append(notes, "Added the {directory()}/ pointer to AGENTS.md")
+	}
+	return Result.Ok(true)
+}
+
+/// Whether an AGENTS.md already sends its reader to the pages. Naming the
+/// directory is the test, because that is the whole of what the pointer has to
+/// do — a project that worded it its own way has already done the job, and a
+/// second paragraph saying the same thing would be this command talking over
+/// its author.
+func mentionsDocs(existing: Str): Bool {
+	return text.contains(existing, directory())
+}
+
+/// An AGENTS.md written from nothing. Short on purpose: it is read into every
+/// context in the project, so what earns a line here is what somebody needs
+/// before they can read anything else — what the language is, where the pages
+/// are, and how to check and test what they wrote.
+func agentsFile(): Str {
+	return page.backticked(`
+		# AGENTS.md
+
+		This project is written in **Hive**, a table-based language that compiles to Go.
+		Source files end in ~BT~.hive~BT~ and the standard library is reached as ~BT~hive.*~BT~.
+
+		## Before writing any Hive
+
+		Read [~BT~.hivedocs/README.md~BT~](.hivedocs/README.md) first. It indexes one short
+		reference page per feature of the language — syntax, types, patterns, bounds,
+		concurrency, and every ~BT~hive.*~BT~ module — and it opens with the eight rules that
+		catch everybody.
+
+		**Read the page for what you are about to touch rather than guessing the
+		syntax.** Hive refuses a great deal that other languages accept, and every one
+		of those refusals is a compile error rather than something noticed later:
+		an index nothing proved in range, an ~BT~append~BT~ to a vector whose length was
+		inferred, a condition that is not a ~BT~Bool~BT~, a ~BT~!~BT~.
+
+		If you read only one page, read
+		[~BT~.hivedocs/pitfalls.md~BT~](.hivedocs/pitfalls.md).
+
+		## Commands
+
+		~CODE~
+		hive check <entrypoint.hive>   report any errors, build nothing
+		hive test  <entrypoint.hive>   run the tests, with coverage
+		hive build <entrypoint.hive>   compile to a native executable
+		hive run   <entrypoint.hive>   compile and run
+		~CODE~
+
+		The entrypoint is the file holding ~BT~proc main(): void~BT~, and a program is that
+		file plus everything it imports.
+
+		**~BT~hive check~BT~ is the one to run after an edit**: it runs every compiler pass,
+		stops before the Go toolchain, and writes nothing beside the file.
+		**~BT~hive test~BT~ exits non-zero when any test fails**, and reports coverage
+		without being asked.
+
+		## Keeping the pages current
+
+		~BT~.hivedocs/~BT~ is written by ~BT~hive agents~BT~, out of the compiler that ran it. If
+		the directory is missing, or ~BT~hive~BT~ has been upgraded since, run it again:
+
+		~CODE~
+		hive agents
+		~CODE~
+	`)
+}
+
+/// An existing AGENTS.md with the pointer added. Appended, because everything
+/// above it is somebody's own and its order is theirs to decide.
+func withPointer(existing: Str): Str {
+	return endingInBlankLine(existing) + pointer()
+}
+
+func pointer(): Str {
+	return page.backticked(`
+		## Hive
+
+		This project is written in Hive. **Read
+		[~BT~.hivedocs/README.md~BT~](.hivedocs/README.md) before writing any**: it indexes
+		one short reference page per feature of the language, and
+		[~BT~.hivedocs/pitfalls.md~BT~](.hivedocs/pitfalls.md) lists the mistakes that do
+		not compile. ~BT~hive check <entrypoint.hive>~BT~ is what says whether they were
+		avoided.
+
+		The directory is written by ~BT~hive agents~BT~, out of the compiler that ran it —
+		run that again if it is missing or ~BT~hive~BT~ has been upgraded.
+	`)
+}
+
+// --- .gitignore --------------------------------------------------------------
+
+// Only ever amended, and only if there is one: a project with no .gitignore has
+// not asked to be told what to keep out of its history, and starting one on its
+// behalf is a bigger decision than this command is making.
+proc ignored(notes: mut Str[dyn]): Result<Bool, diag.Diagnostic> {
+	if hive.file.exists(".gitignore") == false {
+		return Result.Ok(true)
+	}
+	read := hive.file.read(".gitignore")
+	if read is Result.Error(why) {
+		return Result.Error(diag.about(".gitignore", "cannot read `.gitignore`: {why.message}"))
+	}
+	if read is Result.Ok(existing) {
+		if ignoresDocs(existing) {
+			append(notes, "`{directory()}/` is already in .gitignore")
+			return Result.Ok(true)
+		}
+		if hive.file.write(".gitignore", withIgnore(existing)) is Result.Error(why) {
+			return Result.Error(diag.about(".gitignore", "cannot write `.gitignore`: {why.message}"))
+		}
+		append(notes, "Added `{directory()}/` to .gitignore")
+	}
+	return Result.Ok(true)
+}
+
+/// Whether a .gitignore already keeps the pages out. Four spellings name the
+/// same directory — with and without the trailing slash, with and without the
+/// leading one — and a line that is any of them has settled the question.
+///
+/// A pattern that would *also* match it by some other route (`*docs*`, a
+/// negation further down) is not looked for: reimplementing git's matching
+/// would be a lot of code to get subtly wrong, and the cost of missing one is a
+/// duplicate line rather than a broken repository.
+func ignoresDocs(existing: Str): Bool {
+	for each line in split(existing, "\n") {
+		if names(text.trim(line)) {
+			return true
+		}
+	}
+	return false
+}
+
+func names(line: Str): Bool {
+	bare := directory()
+	return line == bare || line == bare + "/"
+		|| line == "/" + bare || line == "/" + bare + "/"
+}
+
+func withIgnore(existing: Str): Str {
+	return endingInBlankLine(existing) + page.backticked(`
+		# What ~BT~hive agents~BT~ writes for a coding agent to read: one short page per
+		# feature of the language, out of the compiler that ran it. Regenerated rather
+		# than committed, so that it can never describe a compiler nobody here has.
+		.hivedocs/
+	`)
+}
+
+// --- CLAUDE.md ---------------------------------------------------------------
+
+// `@AGENTS.md` on the first line is how a CLAUDE.md says "everything in there
+// applies here too", which is the whole of what this is for: the project's
+// instructions live in one file and the other points at it. Put on the front
+// rather than the end, because a file it is not read from the top of is a file
+// whose first instruction is something else.
+proc imported(notes: mut Str[dyn]): Result<Bool, diag.Diagnostic> {
+	if hive.file.exists("CLAUDE.md") == false {
+		return Result.Ok(true)
+	}
+	read := hive.file.read("CLAUDE.md")
+	if read is Result.Error(why) {
+		return Result.Error(diag.about("CLAUDE.md", "cannot read `CLAUDE.md`: {why.message}"))
+	}
+	if read is Result.Ok(existing) {
+		if opensWithAgents(existing) {
+			append(notes, "CLAUDE.md already opens with `@AGENTS.md`")
+			return Result.Ok(true)
+		}
+		if hive.file.write("CLAUDE.md", withAgents(existing)) is Result.Error(why) {
+			return Result.Error(diag.about("CLAUDE.md", "cannot write `CLAUDE.md`: {why.message}"))
+		}
+		append(notes, "CLAUDE.md now opens with `@AGENTS.md`")
+	}
+	return Result.Ok(true)
+}
+
+/// Whether a CLAUDE.md already opens with the import. The **first line with
+/// anything on it** is what counts: blank lines above it change nothing about
+/// what is read first, and a file that opens with one is not a file that
+/// forgot.
+func opensWithAgents(existing: Str): Bool {
+	return firstWord(existing) == "@AGENTS.md"
+}
+
+func firstWord(existing: Str): Str {
+	for each line in split(existing, "\n") {
+		trimmed := text.trim(line)
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func withAgents(existing: Str): Str {
+	return "@AGENTS.md\n\n" + existing
+}
+
+// --- Saying so ---------------------------------------------------------------
+
+/// What the command prints, as lines. The count and the release go on the first
+/// one because that is what a second run is compared against: the pages came
+/// out of *this* compiler, and knowing which is what tells somebody whether to
+/// run it again.
+func report(written: Written): Str[dyn] {
+	mut Str[dyn] out = ["Wrote {written.pages} pages to {directory()}/ (" + version.current() + ")"]
+	for each note in written.notes {
+		append(out, note)
+	}
+	return out
+}
+
+/// Why whatever followed `hive agents` cannot be used, or `""`. It takes no
+/// entrypoint and no flags — it reads no source and builds nothing — so
+/// anything at all after it is refused rather than dropped, for the reason
+/// `hive version` refuses one: something typed and then ignored is a command
+/// that did not do what it was told, quietly.
+func refusal(args: Str[]): Str {
+	if len(args) > 0 {
+		return "`hive agents` takes nothing — it writes " + directory()
+			+ "/ into the folder it was run in and reads no source. `"
+			+ text.charAt(args, 0) + "` was given to it."
+	}
+	return ""
+}
+
+// --- Text ---------------------------------------------------------------------
+
+// Something to append a section to: exactly one blank line between what was
+// there and what is going on the end, however the old text ended. A file that
+// ended mid-line gets its newline, one that ended in three blank lines keeps
+// one, and an empty file gets nothing in front of the section at all.
+//
+// Carriage returns come off with the newlines, so a file git checked out with
+// CRLF does not end up with one stranded on the line above what was added.
+func endingInBlankLine(existing: Str): Str {
+	if text.trim(existing) == "" {
+		return ""
+	}
+	mut trimmed := existing
+	for ; text.endsWith(trimmed, "\n") || text.endsWith(trimmed, "\r"); {
+		trimmed = text.span(text.chars(trimmed), 0, len(trimmed) - 2)
+	}
+	return trimmed + "\n\n"
+}

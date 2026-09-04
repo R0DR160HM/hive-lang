@@ -363,6 +363,7 @@ proc checkTypeDecl(c: mut Check, fields: ast.Field[], variants: ast.Variant[]): 
 			report(c, "this type declares `{f.name}` twice")
 		}
 		append(seen, f.name)
+		checkMarks(c, f)
 	}
 	mut Str[dyn] variantNames = []
 	for each v in variants {
@@ -376,8 +377,71 @@ proc checkTypeDecl(c: mut Check, fields: ast.Field[], variants: ast.Variant[]): 
 			if indexOf(seen, f.name) is Result.Ok(_) {
 				report(c, "the variant `{v.name}` declares `{f.name}`, which the type already declares outside every variant — a shared field is added to each of them, so this one would be there twice")
 			}
+			checkMarks(c, f)
 		}
 	}
+	checkJsonNames(c, fields, variants)
+}
+
+// What a field's `--` annotations have to be true of. The parser has already
+// settled their shape; what is left is the one thing it could not know, which is
+// what the field's type is.
+proc checkMarks(c: mut Check, f: ast.Field): void {
+	if f.marks.fallback is ast.Expr.Absent {
+		return
+	}
+	declared := types.resolve(c.table, f.declared)
+	given := literalType(f.marks.fallback)
+	if types.same(declared, given) {
+		return
+	}
+	// A literal of the wrong type would be a field decoding into something its
+	// own declaration says it cannot hold, so this is the one place the
+	// annotation is held to the type beside it.
+	report(c, "`{f.name}` is declared " + types.show(declared) + " and falls back to " + types.show(given) + ". A `Default` is the value the field takes where JSON has nothing, so it has to be a value the field can hold")
+}
+
+// Two fields of one object cannot answer to one key: the decoder would read the
+// same member twice and the encoder would write it twice, and neither is a
+// thing the program asked for. Checked over each variant's own fields together
+// with the shared ones, since that is the object a variant encodes to.
+proc checkJsonNames(c: mut Check, fields: ast.Field[], variants: ast.Variant[]): void {
+	if len(variants) == 0 {
+		reportClashes(c, fields)
+		return
+	}
+	for each v in variants {
+		mut ast.Field[dyn] both = []
+		for each f in v.fields {
+			append(both, f)
+		}
+		for each f in fields {
+			append(both, f)
+		}
+		reportClashes(c, both)
+	}
+}
+
+proc reportClashes(c: mut Check, fields: ast.Field[]): void {
+	mut Str[dyn] keys = []
+	for each f in fields {
+		key := ast.jsonKey(f)
+		if indexOf(keys, key) is Result.Ok(_) {
+			report(c, "two fields here are `{key}` in JSON, and one key cannot be read into two fields. Give one of them a `-- JSON as ...;` of its own")
+		}
+		append(keys, key)
+	}
+}
+
+// What a literal is, which is the whole of what a `Default` may be — the parser
+// accepts nothing else there, so this needs no scope to answer.
+func literalType(e: ast.Expr): types.Ty {
+	if e is ast.Expr.IntLit(_) { return types.Ty.TInt() }
+	if e is ast.Expr.FloatLit(_) { return types.Ty.TFloat() }
+	if e is ast.Expr.StrLit(_) { return types.Ty.TStr() }
+	if e is ast.Expr.BoolLit(_) { return types.Ty.TBool() }
+	if e is ast.Expr.AtomLit(_) { return types.Ty.TAtom() }
+	return types.Ty.TUnknown()
 }
 
 proc checkCallable(c: mut Check, env: infer.Env, name: Str, params: ast.Param[], body: ast.Block): void {
@@ -615,6 +679,23 @@ proc checkCondition(c: mut Check, env: infer.Env, condition: ast.Expr): void {
 	report(c, "a condition is a `Bool`, and this one is " + types.show(ty) + ". There is no truthiness in Hive: say what you are comparing it to")
 }
 
+// What `!` takes. The same rule a condition is held to, and for the same
+// reason — there is no truthiness, so there is nothing here to invert but a
+// `Bool` — said separately because a `!` is not always a condition: it may be
+// stored, returned, or passed as an argument, and each of those has to refuse
+// the same operand.
+proc checkNegated(c: mut Check, env: infer.Env, operand: ast.Expr): void {
+	ty := infer.typeOf(env, operand)
+	if ty is types.Ty.TBool || ty is types.Ty.TUnknown {
+		return
+	}
+	if ty is types.Ty.TAtom {
+		report(c, "an atom is a label, not a yes or a no, so there is nothing about it for `!` to invert. Compare it with the one you mean — `flag != #Ready` — or use a `Bool`")
+		return
+	}
+	report(c, "`!` inverts a `Bool`, and this is " + types.show(ty) + ". There is no truthiness in Hive, so there is nothing here to be the opposite of: say what you are comparing it to")
+}
+
 // The scope a condition leaves behind, which is whatever its patterns bound.
 func afterCondition(env: infer.Env, condition: ast.Expr): infer.Env {
 	return infer.narrowed(env, condition)
@@ -639,6 +720,9 @@ proc checkExpr(c: mut Check, env: infer.Env, e: ast.Expr): void {
 		}
 	} else if e is ast.Expr.Negate(operand) {
 		checkExpr(c, env, operand)
+	} else if e is ast.Expr.Not(operand) {
+		checkExpr(c, env, operand)
+		checkNegated(c, env, operand)
 	} else if e is ast.Expr.Index(subject, index) {
 		checkExpr(c, env, subject)
 		checkExpr(c, env, index)

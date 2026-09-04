@@ -1,0 +1,96 @@
+// The JSON codecs, and the field annotations that decide what they do.
+//
+// A type declaration *is* the schema, so a codec is derived from it rather than
+// read off a value while the program runs. What the annotations add is the two
+// things a declaration could not say on its own: what a field is called on the
+// wire, and what to read where the wire has nothing.
+
+type User {
+	name: Str -- JSON as username;
+	age:  Int
+	firstName: Str -- Default as "";
+}
+
+// Both clauses on one field, in either order, and a default of every literal
+// kind there is.
+type Settings {
+	theme: Str -- JSON as colour_scheme; Default as "light";
+	fontSize: Int -- Default as 14; JSON as font_size;
+	ratio: Float -- Default as 1.5;
+	compact: Bool -- Default as false;
+	state: Atom -- Default as #Nil;
+}
+
+// A union: the field outside every variant is annotated once and reaches all of
+// them, and a variant's own fields may be annotated too.
+type Event {
+	at: Int -- JSON as timestamp; Default as 0;
+	Opened { by: Str -- JSON as opened_by; }
+	Closed
+}
+
+proc main(): void {
+	// --- The name on the wire ------------------------------------------------
+	echo hive.json.encode(User("ada", 36, "Ada"))
+
+	if hive.json.parse("\{\"username\":\"grace\",\"age\":45,\"firstName\":\"Grace\"}") with User is Result.Ok(u) {
+		echo "{u.name} {u.age} {u.firstName}"
+	}
+
+	// A round trip: what the encoder writes is what the decoder reads.
+	if hive.json.parse(hive.json.encode(User("ada", 36, "Ada"))) with User is Result.Ok(u) {
+		echo u.name
+	}
+
+	// --- What a default stands in for ----------------------------------------
+	// A key that is not there, and a key that is there and null, are the same
+	// nothing.
+	if hive.json.parse("\{\"username\":\"ada\",\"age\":36}") with User is Result.Ok(u) {
+		echo "absent: [{u.firstName}]"
+	}
+	if hive.json.parse("\{\"username\":\"ada\",\"age\":36,\"firstName\":null}") with User is Result.Ok(u) {
+		echo "null: [{u.firstName}]"
+	}
+
+	// A field with nowhere to fall back to still insists on being there.
+	if hive.json.parse("\{\"username\":\"ada\"}") with User is Result.Error(why) {
+		echo "{why.path}: expected {why.expected}, found {why.found}"
+	}
+
+	// And a default excuses nothing that *was* said: it stands in for a value
+	// that is missing, never for one of the wrong type.
+	if hive.json.parse("\{\"username\":\"ada\",\"age\":36,\"firstName\":7}") with User is Result.Error(why) {
+		echo "{why.path}: expected {why.expected}, found {why.found}"
+	}
+
+	// --- Every literal a default may be --------------------------------------
+	if hive.json.parse("\{}") with Settings is Result.Ok(s) {
+		echo "{s.theme} {s.fontSize} {s.ratio} {s.compact}"
+		// On its own, because interpolating an atom renders its number and
+		// `echo` renders its name — which the annotations do not change.
+		echo s.state
+	}
+	echo hive.json.encode(Settings("dark", 18, 2.0, true, #Ready))
+
+	// One key given, the rest fallen back to.
+	if hive.json.parse("\{\"font_size\":20}") with Settings is Result.Ok(s) {
+		echo "{s.theme} {s.fontSize}"
+	}
+
+	// --- A union -------------------------------------------------------------
+	echo hive.json.encode(Event.Opened("ada", 1700000000))
+	echo hive.json.encode(Event.Closed(1700000001))
+
+	if hive.json.parse("\{\"Opened\":\{\"opened_by\":\"grace\"}}") with Event is Result.Ok(e) {
+		if e is Event.Opened(by, at) {
+			echo "{by} at {at}"
+		}
+	}
+
+	// --- What the annotations do not touch -----------------------------------
+	// A field JSON does not declare is still ignored, and the Hive field keeps
+	// its own name however the wire spells it.
+	if hive.json.parse("\{\"username\":\"ada\",\"age\":36,\"firstName\":\"Ada\",\"extra\":true}") with User is Result.Ok(u) {
+		echo u.name + " " + u.firstName
+	}
+}

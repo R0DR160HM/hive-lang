@@ -1,0 +1,994 @@
+// The `hive.ui` pages
+// ===================
+// A file of its own because the module is: a window, a page, a canvas and a
+// three-dimensional scene, each with a vocabulary somebody reaches for on its
+// own. Thirteen pages, so that laying out a form costs nobody the shape table
+// and the sound rules.
+//
+// `page.hive` holds the `Page` these are and the `backticked` that puts the
+// backticks back; `library.hive` is the rest of the library.
+import ./page
+
+/// Every page about `hive.ui`.
+func pages(): page.Page[dyn] {
+	return [
+		page.Page("stdlib/ui.md", ui()),
+		page.Page("stdlib/ui-widgets.md", widgets()),
+		page.Page("stdlib/ui-attributes.md", attributes()),
+		page.Page("stdlib/ui-events.md", events()),
+		page.Page("stdlib/ui-enums.md", enums()),
+		page.Page("stdlib/ui-colour.md", colour()),
+		page.Page("stdlib/ui-canvas.md", canvas()),
+		page.Page("stdlib/ui-scene.md", scene()),
+		page.Page("stdlib/ui-scene-shapes.md", sceneShapes()),
+		page.Page("stdlib/ui-scene-surfaces.md", sceneSurfaces()),
+		page.Page("stdlib/ui-scene-sound.md", sceneSound()),
+		page.Page("stdlib/ui-scene-camera.md", sceneCamera()),
+		page.Page("stdlib/ui-scene-input.md", sceneInput())
+	]
+}
+
+// --- The module --------------------------------------------------------------
+
+func ui(): Str {
+	return page.backticked(`
+		# ~BT~hive.ui~BT~
+
+		**A view is a value** — a tree of widgets — and what paints it is decided
+		somewhere else.
+
+		| call | what it does |
+		| --- | --- |
+		| ~BT~window(title, view, update, state)~BT~ | opens a window and **does not return** |
+		| ~BT~html(view)~BT~ | renders the tree as an HTML **fragment** → ~BT~Str~BT~ |
+		| ~BT~page(title, view)~BT~ | renders it as a whole **document** → ~BT~Str~BT~ |
+
+		~BT~view~BT~ is a ~BT~func(State): hive.ui.View~BT~ and ~BT~update~BT~ is a
+		~BT~proc(State, Msg, hive.syslink.Envelope): State~BT~.
+
+		| page | what is on it |
+		| --- | --- |
+		| [ui-widgets](ui-widgets.md) | every widget and its payload |
+		| [ui-attributes](ui-attributes.md) | layout, text, state — what an attribute carries |
+		| [ui-events](ui-events.md) | ~BT~on~BT~, ~BT~onInput~BT~, ~BT~onChoose~BT~ and the rest |
+		| [ui-enums](ui-enums.md) | ~BT~Align~BT~ ~BT~Justify~BT~ ~BT~TextSize~BT~ ~BT~Axis~BT~ ~BT~InputKind~BT~ ~BT~Icon~BT~ |
+		| [ui-colour](ui-colour.md) | ~BT~Tone~BT~ |
+		| [ui-canvas](ui-canvas.md) | two dimensions, in the program's own units |
+		| [ui-scene](ui-scene.md) | three dimensions — **five pages**, start there |
+
+		## The window is a service
+
+		~BT~update~BT~ is **the same fold a [~BT~hive.syslink.spawn~BT~](syslink.md) handler is**,
+		and is checked as one. So a window **has an address**, needs no mutex, and can
+		be posted to by a background task or by another machine. That is why the module
+		needs no notion of a *command*.
+
+		## The view is a ~BT~func~BT~, and that is not a formality
+
+		**A ~BT~func~BT~ cannot call a ~BT~proc~BT~ and cannot hold a mutex, so drawing cannot
+		act** — which matters because a repaint happens on every change.
+
+		~CODE~hive
+		type Msg {
+			Typed { text: Str }
+			Send
+		}
+
+		type State {
+			draft: Str
+			lines: Str[dyn]
+		}
+
+		func view(state: State): hive.ui.View {
+			return ui.column([ui.gap(8), ui.pad(16)], [
+				ui.text([ui.size(ui.TextSize.Title())], "Notes"),
+				ui.input([ui.onInput(Msg.Typed(_)), ui.placeholder("a line")], state.draft),
+				ui.button([ui.on(Msg.Send())], "Add")
+			])
+		}
+
+		proc update(state: State, message: Msg, from: hive.syslink.Envelope): State {
+			if message is Msg.Typed(text) {
+				return State(text, state.lines)
+			}
+			mut Str[dyn] next = state.lines
+			append(next, state.draft)
+			return State("", next)
+		}
+
+		proc main(): void {
+			Str[dyn] empty = []
+			ui.window("Notes", view, update, State("", empty))
+		}
+		~CODE~
+
+		## One tree, two destinations
+
+		**The same tree a window swaps in is what ~BT~page~BT~ writes out**, so a view built
+		for a window is a view an ~BT~httpServe~BT~ handler can answer with, unchanged:
+
+		~CODE~hive
+		proc handle(req: hive.net.HttpRequest): hive.net.HttpResponse {
+			return hive.net.HttpResponse(200, [], ui.page("Notes", view(state)))
+		}
+		~CODE~
+
+		~BT~link~BT~ is the one widget that works without an event: a window follows the
+		**message** and a served page follows the **href**, from the identical tree.
+
+		## Why the widget list is short
+
+		**A widget is here only if it cannot be composed from the others *and* needs
+		something the renderer has that Hive does not.** A card is a ~BT~column~BT~ with
+		padding, a toast is an ~BT~overlay~BT~ and a message, a divider is a ~BT~row~BT~ with a
+		border. Do not go looking for those.
+	`)
+}
+
+func widgets(): Str {
+	return page.backticked(`
+		# ~BT~hive.ui~BT~ — the widgets
+
+		**Every widget takes the same two things: its attributes, then its payload.**
+		There are no optional parameters in Hive, so what would be an optional argument
+		elsewhere is an entry in the attribute vector.
+
+		| widget | payload |
+		| --- | --- |
+		| ~BT~row(attrs, children)~BT~ / ~BT~column(attrs, children)~BT~ | ~BT~View[]~BT~ |
+		| ~BT~spacer()~BT~ | — takes **nothing at all**, not even attributes |
+		| ~BT~none()~BT~ | — the same; draws nothing |
+		| ~BT~spinner(attrs)~BT~ | — attributes only |
+		| ~BT~overlay(attrs, child)~BT~ | ~BT~View~BT~ |
+		| ~BT~text(attrs, content)~BT~ | ~BT~Str~BT~ |
+		| ~BT~image(attrs, src, alt)~BT~ | ~BT~Str, Str~BT~ |
+		| ~BT~link(attrs, href, label)~BT~ | ~BT~Str, Str~BT~ |
+		| ~BT~icon(attrs, name)~BT~ | ~BT~Icon~BT~ |
+		| ~BT~button(attrs, label)~BT~ | ~BT~Str~BT~ |
+		| ~BT~input(attrs, value)~BT~ / ~BT~textarea(attrs, value)~BT~ | ~BT~Str~BT~ |
+		| ~BT~checkbox(attrs, label, checked)~BT~ | ~BT~Str, Bool~BT~ |
+		| ~BT~select(attrs, options, chosen)~BT~ | ~BT~Str[], Str~BT~ |
+		| ~BT~table(attrs, rows)~BT~ | ~BT~Table~BT~ |
+		| ~BT~canvas(attrs, marks)~BT~ | ~BT~Mark[]~BT~ — [ui-canvas](ui-canvas.md) |
+		| ~BT~scene(attrs, shapes)~BT~ | ~BT~Shape[]~BT~ — [ui-scene](ui-scene.md) |
+		| ~BT~inset(attrs, views)~BT~ | ~BT~View[]~BT~ — a second look at that scene |
+
+		~CODE~hive
+		ui.row([ui.gap(12), ui.align(ui.Align.Center())], [
+			ui.icon([], ui.Icon.Star()),
+			ui.text([ui.tone(ui.Tone.Muted())], "starred"),
+			ui.spacer(),
+			ui.button([ui.on(Msg.Clear()), ui.disabled(len(items) == 0)], "Clear")
+		])
+		~CODE~
+
+		A widget's value is a ~BT~hive.ui.View~BT~, which is **opaque**: build it with these
+		calls, write it down as a type, and hand it on.
+
+		## ~BT~spacer~BT~ against ~BT~grow~BT~ against ~BT~none~BT~
+
+		~BT~spacer()~BT~ eats the leftover room in a ~BT~row~BT~ or a ~BT~column~BT~, which is what
+		pushes what follows it to the far end. ~BT~ui.grow(n)~BT~ is an
+		[attribute](ui-attributes.md) that gives a **child** a share of it. ~BT~none()~BT~
+		draws nothing and is what a branch returns when there is nothing to show —
+		Hive has no optional view.
+
+		## An ~BT~overlay~BT~ that says where it goes is not a dialog
+
+		* With **neither ~BT~align~BT~ nor ~BT~justify~BT~** it is centred over a dimmed page,
+		  which is what a dialog is.
+		* With **either of them** it is pinned to that edge instead: nothing is dimmed,
+		  and **clicks pass through everywhere the panel is not** — which is what a
+		  heads-up display in a corner, a toast, or a legend over a picture needs.
+
+		A pinned panel keeps none of the dialog's own shape either: no rounded corner,
+		no shadow, and no cap on its height, so ~BT~grow~BT~ and ~BT~align(Stretch)~BT~ will run
+		one the full width or height of the window.
+
+		## ~BT~link~BT~ works without an event
+
+		The window follows the **message** and a served page follows the **href**, from
+		the identical tree. **Where a link may point is a closed set** — a path within
+		the page, a relative path, or ~BT~http~BT~, ~BT~https~BT~, ~BT~mailto~BT~ — and anything else
+		renders as no destination at all.
+
+		## ~BT~select~BT~ and ~BT~checkbox~BT~ hold their own value
+
+		Both take **what is currently chosen** as their payload, because a view is a
+		function of the state: ~BT~select(attrs, options, chosen)~BT~ redraws with whatever
+		~BT~chosen~BT~ now is, and the [event](ui-events.md) is what changed the state.
+		Nothing is remembered inside a widget.
+	`)
+}
+
+func attributes(): Str {
+	return page.backticked(`
+		# ~BT~hive.ui~BT~ — the attributes
+
+		**Attributes are semantic tokens rather than CSS values**, and each is a call
+		answering with a ~BT~hive.ui.Attr~BT~. They go in the vector every widget takes
+		first. Events have a page of their own: [ui-events](ui-events.md).
+
+		| attribute | carries |
+		| --- | --- |
+		| ~BT~gap(n)~BT~ ~BT~pad(n)~BT~ ~BT~width(n)~BT~ ~BT~height(n)~BT~ ~BT~grow(n)~BT~ | ~BT~Int~BT~ |
+		| ~BT~align(Align)~BT~ ~BT~justify(Justify)~BT~ | an [enumeration](ui-enums.md) |
+		| ~BT~scroll(Axis)~BT~ | ~BT~Axis~BT~ |
+		| ~BT~size(TextSize)~BT~ | ~BT~TextSize~BT~ |
+		| ~BT~heading(n)~BT~ | ~BT~Int~BT~ — the heading level |
+		| ~BT~tone(Tone)~BT~ ~BT~background(Tone)~BT~ ~BT~paint(Tone)~BT~ | [~BT~Tone~BT~](ui-colour.md) |
+		| ~BT~kind(InputKind)~BT~ | ~BT~InputKind~BT~ |
+		| ~BT~placeholder(text)~BT~ ~BT~hint(text)~BT~ | ~BT~Str~BT~ |
+		| ~BT~disabled(b)~BT~ ~BT~busy(b)~BT~ | ~BT~Bool~BT~ |
+		| ~BT~region(x, y, width, height)~BT~ ~BT~thick(w)~BT~ | ~BT~Float~BT~ — a [canvas](ui-canvas.md) |
+		| ~BT~at(x, y, z)~BT~ ~BT~turn(x, y, z)~BT~ | ~BT~Float~BT~ — a [shape](ui-scene-shapes.md) |
+		| ~BT~surface(Surface)~BT~ | a [finish](ui-scene-surfaces.md) |
+		| ~BT~voice(Voice)~BT~ ~BT~pitch(f)~BT~ ~BT~volume(f)~BT~ ~BT~track(path)~BT~ | a [sound](ui-scene-sound.md) |
+		| ~BT~eye(x, y, z)~BT~ ~BT~aim(yaw, pitch)~BT~ ~BT~lens(deg)~BT~ ~BT~fog(m)~BT~ | a [camera](ui-scene-camera.md) |
+		| ~BT~shadows(b)~BT~ ~BT~grab(b)~BT~ ~BT~crosshair(b)~BT~ | ~BT~Bool~BT~ — a scene |
+
+		**Watch the number type.** ~BT~gap~BT~, ~BT~pad~BT~, ~BT~width~BT~, ~BT~height~BT~, ~BT~grow~BT~, ~BT~heading~BT~,
+		~BT~lens~BT~ and ~BT~fog~BT~ take an ~BT~Int~BT~; everything geometric — ~BT~at~BT~, ~BT~turn~BT~, ~BT~eye~BT~,
+		~BT~aim~BT~, ~BT~region~BT~, ~BT~thick~BT~, ~BT~pitch~BT~, ~BT~volume~BT~ — takes a ~BT~Float~BT~. Hive never
+		widens a number, so ~BT~ui.at(0, 1, 0)~BT~ is a compile error and
+		~BT~ui.at(0.0, 1.0, 0.0)~BT~ is not.
+
+		~CODE~hive
+		ui.column([ui.gap(8), ui.pad(16), ui.scroll(ui.Axis.Vertical())], [
+			ui.text([ui.size(ui.TextSize.Title()), ui.heading(1)], "Colonies"),
+			ui.text([ui.tone(ui.Tone.Muted())], "{len(rows)} of {total}"),
+			ui.table([ui.grow(1)], rows)
+		])
+		~CODE~
+
+		## Layout
+
+		~BT~gap~BT~ is the space **between** a ~BT~row~BT~'s or ~BT~column~BT~'s children; ~BT~pad~BT~ is the
+		space **inside** its own edge. ~BT~align~BT~ places children across the axis and
+		~BT~justify~BT~ along it. ~BT~grow(n)~BT~ gives a child a **share** of the leftover room —
+		two children at ~BT~grow(1)~BT~ take half each — and ~BT~scroll~BT~ says which way a box
+		may be scrolled when its contents do not fit.
+
+		~BT~width~BT~ and ~BT~height~BT~ are a fixed size; ~BT~align(ui.Align.Stretch())~BT~ is how a
+		child fills the cross axis instead.
+
+		## State
+
+		~BT~disabled~BT~ takes a ~BT~Bool~BT~ rather than being present or absent, so it is
+		written straight off the state — ~BT~ui.disabled(len(items) == 0)~BT~ — and there is
+		no branch to build a different attribute vector.
+
+		~BT~busy~BT~ says a widget is waiting; ~BT~placeholder~BT~ is the ghost text in an empty
+		~BT~input~BT~; ~BT~hint~BT~ is the note beside one. ~BT~kind~BT~ says what an ~BT~input~BT~ is for,
+		which is what gets a date picker or a hidden password.
+
+		## Colour
+
+		~BT~tone~BT~ is the **foreground** of text, ~BT~background~BT~ is a box's fill, and ~BT~paint~BT~
+		is what a canvas mark or a scene shape is coloured. All three take a
+		[~BT~Tone~BT~](ui-colour.md).
+	`)
+}
+
+func events(): Str {
+	return page.backticked(`
+		# ~BT~hive.ui~BT~ — the events
+
+		An event is an attribute like any other. **Two carry the message itself; the
+		rest carry a function of what the user did.**
+
+		| attribute | hands your function |
+		| --- | --- |
+		| ~BT~on(Msg)~BT~ | — the message itself |
+		| ~BT~onDismiss(Msg)~BT~ | — the message itself |
+		| ~BT~onInput(f)~BT~ ~BT~onSubmit(f)~BT~ ~BT~onChoose(f)~BT~ | ~BT~Str~BT~ |
+		| ~BT~onToggle(f)~BT~ | ~BT~Bool~BT~ |
+		| ~BT~onPick(f)~BT~ ~BT~onSort(f)~BT~ | ~BT~Int~BT~ |
+		| ~BT~onKeyDown(f)~BT~ ~BT~onKeyUp(f)~BT~ | ~BT~Str~BT~ — a [scene](ui-scene-input.md) |
+		| ~BT~onFrame(f)~BT~ | ~BT~Int~BT~ — a scene |
+		| ~BT~onLook(f)~BT~ | ~BT~Float, Float~BT~ — a scene |
+		| ~BT~onGrab(f)~BT~ | ~BT~Bool~BT~ — a scene |
+		| ~BT~onPad(f)~BT~ | ~BT~Int, Str, Float~BT~ — a scene |
+
+		## A constructor with a hole is the function
+
+		This is what [partial application](../expressions.md) is for. ~BT~Msg.Changed(_)~BT~
+		is already a ~BT~func(Str): Msg~BT~, so nothing has to be written to adapt it:
+
+		~CODE~hive
+		type Msg {
+			Typed   { text: Str }
+			Toggled { done: Bool }
+			Chose   { option: Str }
+			Send
+		}
+
+		ui.input([ui.onInput(Msg.Typed(_))], state.draft)
+		ui.checkbox([ui.onToggle(Msg.Toggled(_))], "done", state.done)
+		ui.select([ui.onChoose(Msg.Chose(_))], options, state.chosen)
+		ui.button([ui.on(Msg.Send())], "Send")
+		~CODE~
+
+		**The shape must match**: ~BT~onToggle~BT~ is handed a ~BT~Bool~BT~, so its function has to
+		take one, and the compiler says so where it does not. An event reporting two
+		values wants a **two-hole** constructor —
+		~BT~ui.onLook(Msg.Looked(_, _))~BT~ — and one reporting three wants three.
+
+		Where a message needs something the event does not report, fill the rest in at
+		the call site: ~BT~ui.onToggle(Msg.Set(item.id, _))~BT~ captures the id where it was
+		written.
+
+		## What each one is on
+
+		~BT~on~BT~ is a ~BT~button~BT~ being pressed or a ~BT~link~BT~ being followed. ~BT~onDismiss~BT~ is
+		an ~BT~overlay~BT~ being closed. ~BT~onInput~BT~ fires as an ~BT~input~BT~ or ~BT~textarea~BT~
+		changes and ~BT~onSubmit~BT~ when one is entered. ~BT~onChoose~BT~ is a ~BT~select~BT~.
+		~BT~onToggle~BT~ is a ~BT~checkbox~BT~. ~BT~onPick~BT~ and ~BT~onSort~BT~ are a ~BT~table~BT~ — a row
+		chosen, and a column asked to order by, each **by index**.
+
+		The five scene events are [ui-scene-input](ui-scene-input.md).
+
+		## There is no command, and nothing to return
+
+		The message goes to ~BT~update~BT~, which is [a fold](syslink.md): it answers with the
+		next state and nothing else. **Work that has to happen goes to a service** — a
+		window has an address, so anything with something to say posts a message back to
+		it when it has one.
+	`)
+}
+
+func enums(): Str {
+	return page.backticked(`
+		# ~BT~hive.ui~BT~ — the enumerations
+
+		Ordinary closed types, reached the way every other type is, and **called with
+		~BT~()~BT~ like any other variant**: ~BT~ui.Align.Center()~BT~, not ~BT~ui.Align.Center~BT~.
+
+		**None is an atom, deliberately**: the atom table belongs to your program, and a
+		library that added to it would renumber the atoms you wrote.
+
+		| type | variants |
+		| --- | --- |
+		| ~BT~Align~BT~ | ~BT~Start~BT~ ~BT~Center~BT~ ~BT~End~BT~ ~BT~Stretch~BT~ |
+		| ~BT~Justify~BT~ | ~BT~Start~BT~ ~BT~Center~BT~ ~BT~End~BT~ ~BT~Between~BT~ |
+		| ~BT~TextSize~BT~ | ~BT~Title~BT~ ~BT~Subtitle~BT~ ~BT~Body~BT~ ~BT~Caption~BT~ |
+		| ~BT~Axis~BT~ | ~BT~Horizontal~BT~ ~BT~Vertical~BT~ ~BT~Both~BT~ |
+		| ~BT~InputKind~BT~ | ~BT~Text~BT~ ~BT~Number~BT~ ~BT~Date~BT~ ~BT~Password~BT~ ~BT~Search~BT~ |
+		| ~BT~Icon~BT~ | ~BT~Search~BT~ ~BT~Close~BT~ ~BT~Check~BT~ ~BT~Plus~BT~ ~BT~Minus~BT~ ~BT~Up~BT~ ~BT~Down~BT~ ~BT~Left~BT~ ~BT~Right~BT~ ~BT~Warning~BT~ ~BT~Info~BT~ ~BT~Star~BT~ ~BT~Heart~BT~ ~BT~Reply~BT~ ~BT~Repeat~BT~ ~BT~Trash~BT~ ~BT~User~BT~ ~BT~Menu~BT~ |
+		| [~BT~Tone~BT~](ui-colour.md) | ~BT~Normal~BT~ ~BT~Muted~BT~ ~BT~Good~BT~ ~BT~Warn~BT~ ~BT~Danger~BT~ ~BT~HEX(Str)~BT~ ~BT~RGBA(Int, Int, Int, Int)~BT~ |
+		| [~BT~Surface~BT~](ui-scene-surfaces.md) | eighteen finishes |
+		| [~BT~Voice~BT~](ui-scene-sound.md) | ~BT~Engine~BT~ ~BT~Tyres~BT~ ~BT~Brakes~BT~ ~BT~Wind~BT~ ~BT~Crowd~BT~ ~BT~Music~BT~ ~BT~Impact~BT~ ~BT~Chime~BT~ |
+
+		~CODE~hive
+		ui.text([ui.size(ui.TextSize.Caption()), ui.tone(ui.Tone.Muted())], "TURN 7")
+		ui.input([ui.kind(ui.InputKind.Password())], state.secret)
+		ui.icon([], ui.Icon.Trash())
+		ui.column([ui.scroll(ui.Axis.Both())], rows)
+		~CODE~
+
+		The order above is **declaration order**, which is also the order ~BT~sort~BT~ puts
+		them in and the order a ~BT~==~BT~ comparison rests on.
+
+		**The icon list is closed and that is the whole of it.** There is no name to
+		pass and no file to point at: an icon that is not on the list is a ~BT~text~BT~ or an
+		~BT~image~BT~.
+
+		Being ordinary types, they are matched like any other — ~BT~if chosen is ui.Align.End~BT~
+		— and a program that stores one stores a ~BT~hive.ui.Align~BT~.
+	`)
+}
+
+func colour(): Str {
+	return page.backticked(`
+		# ~BT~hive.ui~BT~ — colour
+
+		~BT~Tone~BT~ is carried by ~BT~ui.tone~BT~ (a foreground), ~BT~ui.background~BT~ (a fill) and
+		~BT~ui.paint~BT~ (a canvas mark or a scene shape).
+
+		| variant | is |
+		| --- | --- |
+		| ~BT~Normal()~BT~ | the ordinary role |
+		| ~BT~Muted()~BT~ | secondary text |
+		| ~BT~Good()~BT~ | success |
+		| ~BT~Warn()~BT~ | caution |
+		| ~BT~Danger()~BT~ | failure, destruction |
+		| ~BT~HEX(Str)~BT~ | a colour outright |
+		| ~BT~RGBA(Int, Int, Int, Int)~BT~ | a colour outright, with alpha |
+
+		~BT~Tone~BT~ is the one enumeration that is not only a closed set: past the five
+		**roles**, ~BT~HEX~BT~ and ~BT~RGBA~BT~ carry a colour themselves.
+
+		~CODE~hive
+		ui.text([ui.tone(ui.Tone.Danger())], "could not save")
+		ui.dot([ui.paint(ui.Tone.HEX("#f2a"))], x, y, 3.0)
+		ui.sphere([ui.paint(ui.Tone.RGBA(255, 255, 255, 96))], 1.0)   // translucent
+		~CODE~
+
+		## A role and a colour are not the same kind of thing
+
+		**A role becomes a class the stylesheet answers for; a colour becomes a
+		declaration.** So a role follows the theme and **brings a readable foreground
+		with it**, while a computed colour brings nothing — text painted a colour of
+		your own is legible because you chose it, not because the window did.
+
+		Prefer a role wherever one fits. Reach for ~BT~HEX~BT~ or ~BT~RGBA~BT~ where the colour
+		*is* the information: a series on a chart, a team's livery, a shape in a scene.
+
+		## A colour is checked, not trusted
+
+		* ~BT~HEX~BT~ takes a ~BT~#~BT~ and **3, 4, 6 or 8** hex digits. **Anything else is
+		  ~BT~Normal~BT~** — it does not fail, it falls back, so a colour computed from data
+		  can never break a page.
+		* ~BT~RGBA~BT~ **clamps each channel** to 0–255.
+
+		## Alpha means something in a scene
+
+		~BT~RGBA(r, g, b, a)~BT~ and an eight- or four-digit ~BT~HEX~BT~ carry an alpha, and in a
+		[scene](ui-scene.md) it is honoured: **the shape is drawn see-through and writes
+		no depth**, so whatever is behind it stays visible. That is how a ghost, a
+		tinted screen or the plume behind something is drawn.
+
+		A [surface](ui-scene-surfaces.md) is drawn **over** whatever colour a shape is,
+		so one finish serves a red kerb and a blue one.
+	`)
+}
+
+func canvas(): Str {
+	return page.backticked(`
+		# ~BT~hive.ui~BT~ — the canvas
+
+		Two dimensions, **in the program's own units**. ~BT~canvas(attrs, marks)~BT~ is a
+		widget like any other and a ~BT~Mark~BT~ is a value like any other, so **what a canvas
+		holds is what is on it right now** — there is no drawing context, no frame to
+		schedule and nothing to clear.
+
+		| mark | payload |
+		| --- | --- |
+		| ~BT~dot(attrs, x, y, radius)~BT~ | a filled circle |
+		| ~BT~bar(attrs, x, y, width, height)~BT~ | a rectangle, **from its middle** |
+		| ~BT~path(attrs, points)~BT~ | ~BT~Float[]~BT~ — x, y, x, y … — a line through them |
+		| ~BT~patch(attrs, points)~BT~ | the same numbers, **filled** |
+		| ~BT~words(attrs, x, y, height, text)~BT~ | words **centred** on the place |
+
+		Every number here is a ~BT~Float~BT~.
+
+		~CODE~hive
+		ui.canvas([ui.region(0.0, 0.0, 100.0, 50.0), ui.height(240)], [
+			ui.path([ui.paint(ui.Tone.Muted()), ui.thick(0.5)], [0.0, 0.0, 100.0, 0.0]),
+			ui.bar([ui.paint(ui.Tone.Good())], 20.0, 10.0, 6.0, 20.0),
+			ui.dot([ui.paint(ui.Tone.Danger())], 60.0, 30.0, 1.5),
+			ui.words([], 60.0, 34.0, 3.0, "peak")
+		])
+		~CODE~
+
+		## ~BT~region~BT~ is the whole of the coordinate system
+
+		~BT~region(x, y, width, height)~BT~ says **which part of the plane the box shows**,
+		and **everything on a canvas is said in those units** — a map of a circuit is
+		written in metres, and a car nine metres long is drawn nine long.
+
+		The box may be any shape; **what is drawn keeps its own and is centred in it**.
+		~BT~thick(Float)~BT~ is how wide a ~BT~path~BT~ is drawn, **in the region's units too** —
+		so a map zoomed in has thicker roads, which is what zooming in means.
+
+		## Why the payloads look like that
+
+		**A dimension is the payload rather than an attribute**, the same way it is for
+		a [shape](ui-scene-shapes.md): a dot without a radius is not a dot with a default
+		one.
+
+		**~BT~bar~BT~ is placed by its middle** because everything else on a canvas is, and
+		one mark placed by its corner would be the one that is always half a width out.
+
+		## The list is short on purpose
+
+		Five marks, each passing the test the widgets passed — it cannot be made out of
+		the others. **A ring is a ~BT~dot~BT~ with no fill, a grid is a vector of ~BT~path~BT~s,
+		an arrow is a ~BT~path~BT~.**
+
+		The same tree a window swaps in is what ~BT~page~BT~ writes out, **so a chart drawn
+		for a program is a chart served by a web server with nothing changed**.
+	`)
+}
+
+// --- hive.ui.scene -----------------------------------------------------------
+
+func scene(): Str {
+	return page.backticked(`
+		# ~BT~hive.ui.scene~BT~
+
+		Three dimensions inside a window. **A scene is a value like every other view**:
+		a camera, a sky, and a vector of shapes, rebuilt by an ordinary ~BT~func~BT~ from the
+		state as often as there are frames.
+
+		**Nothing here is a handle** — there is no mesh to keep, no material to allocate
+		and no canvas to hold — so a program that draws one answers "what is there right
+		now" and never "what has changed".
+
+		| page | what is on it |
+		| --- | --- |
+		| [ui-scene-shapes](ui-scene-shapes.md) | the eight shapes, and where one is |
+		| [ui-scene-surfaces](ui-scene-surfaces.md) | what a thing is made of |
+		| [ui-scene-sound](ui-scene-sound.md) | a noise is a shape |
+		| [ui-scene-camera](ui-scene-camera.md) | the eye, the sky, the fog, the shadows |
+		| [ui-scene-input](ui-scene-input.md) | frames, keys, the mouse, a gamepad |
+
+		~CODE~hive
+		func view(world: World): hive.ui.View {
+			return ui.scene([
+				ui.eye(world.x, world.y + 1.6, world.z),
+				ui.aim(world.yaw, world.pitch),
+				ui.lens(75), ui.fog(400),
+				ui.background(ui.Tone.HEX("#8ec5ff")),
+				ui.grab(true), ui.crosshair(true),
+				ui.onFrame(Msg.Frame(_)),
+				ui.onKeyDown(Msg.Down(_)),
+				ui.onLook(Msg.Look(_, _))
+			], shapesOf(world))
+		}
+		~CODE~
+
+		~BT~scene~BT~ is a widget, so it is laid out like one: give it ~BT~grow(1)~BT~ in a
+		~BT~column~BT~, or a ~BT~width~BT~ and ~BT~height~BT~ of its own.
+
+		## It is the module that carries a download
+
+		**~BT~hive.ui.scene~BT~ is a module of its own because it is the one that carries a
+		dependency**: a pinned three.js, fetched on the first build that needs it and
+		cached. A window that draws no scene links none of it.
+
+		## Units and angles
+
+		**Metres and radians**, and every geometric number is a ~BT~Float~BT~ — ~BT~ui.at~BT~,
+		~BT~ui.turn~BT~, ~BT~ui.eye~BT~, ~BT~ui.aim~BT~ and every shape's dimensions. ~BT~ui.lens~BT~ (degrees)
+		and ~BT~ui.fog~BT~ (metres) are the two ~BT~Int~BT~s. Hive never widens a number, so a
+		literal in one of these is written ~BT~1.0~BT~ rather than ~BT~1~BT~.
+
+		[~BT~hive.math~BT~](math.md) is where the trigonometry is, and every one of those
+		takes and answers with a ~BT~Float~BT~ too.
+
+		## One world, and it is drawn once
+
+		**A scene is only ever drawn once, from the newest description of it.** Frames
+		arriving faster than the window can draw them **replace one another rather than
+		queueing**, so what is drawn is always the latest world.
+
+		A window draws **one** scene and any number of [insets](ui-scene-camera.md) — a
+		second camera on the same world.
+	`)
+}
+
+func sceneShapes(): Str {
+	return page.backticked(`
+		# ~BT~hive.ui.scene~BT~ — the shapes
+
+		**A shape is here only if it cannot be made out of the others.** Dimensions are
+		the payload rather than attributes, because they are what the shape *is*: a
+		sphere without a radius is not a sphere with a default one.
+
+		| shape | payload |
+		| --- | --- |
+		| ~BT~box(attrs, width, height, depth)~BT~ | a solid |
+		| ~BT~sphere(attrs, radius)~BT~ | |
+		| ~BT~cylinder(attrs, radius, height)~BT~ | standing on its end |
+		| ~BT~cone(attrs, top, bottom, height)~BT~ | standing on its end, **both** radii |
+		| ~BT~ground(attrs, width, depth)~BT~ | a plane that **already lies flat** |
+		| ~BT~label(attrs, words)~BT~ | ~BT~Str~BT~ — words that always face the viewer |
+		| ~BT~line(attrs, fromX, fromY, fromZ, toX, toY, toZ)~BT~ | |
+		| ~BT~sound(attrs, name)~BT~ | ~BT~Str~BT~ — [a noise at a place](ui-scene-sound.md) |
+
+		Every dimension is a ~BT~Float~BT~.
+
+		## Where a shape is, and what it is made of
+
+		| attribute | carries |
+		| --- | --- |
+		| ~BT~at(x, y, z)~BT~ | **where its middle is** |
+		| ~BT~turn(x, y, z)~BT~ | its rotation, in **radians**, applied X then Y then Z |
+		| ~BT~paint(Tone)~BT~ | its [colour](ui-colour.md) |
+		| ~BT~surface(Surface)~BT~ | [what it is made of](ui-scene-surfaces.md) |
+
+		~CODE~hive
+		ui.box([ui.at(0.0, 0.5, -4.0), ui.paint(ui.Tone.HEX("#c33")),
+		        ui.surface(ui.Surface.Planks())], 2.0, 1.0, 1.0)
+
+		ui.ground([ui.surface(ui.Surface.Tarmac())], 200.0, 200.0)
+
+		ui.cone([ui.at(3.0, 0.0, -6.0), ui.paint(ui.Tone.Warn())], 0.05, 0.3, 0.7)
+
+		ui.label([ui.at(0.0, 2.0, -4.0)], "start")
+		~CODE~
+
+		## Three shapes take less than you expect, and why
+
+		**~BT~cone~BT~ takes both of its radii** rather than only the base. A cone in the
+		world is hardly ever the perfect one — a track marker is snub-nosed, a nose cone
+		ends in a blade, a stack of tyres narrows without coming to a point. **A top of
+		nought is the perfect one, and a top equal to the bottom is a ~BT~cylinder~BT~.**
+
+		**~BT~ground~BT~ is already lying down**, so a floor costs no rotation and ~BT~turn~BT~
+		still means everywhere what it means anywhere.
+
+		**~BT~label~BT~ takes no rotation**, for the same reason a label exists: one you can
+		read from one side only is not a label.
+
+		**~BT~line~BT~ takes no ~BT~at~BT~**, because a line is *between* two places and has no
+		third one to call its own.
+
+		## Building the vector
+
+		A scene's shapes are an ordinary vector built by an ordinary ~BT~func~BT~, so the
+		usual tools apply — ~BT~map~BT~ over the state, ~BT~+~BT~ to concatenate, a
+		~BT~mut Shape[dyn]~BT~ to append into:
+
+		~CODE~hive
+		func shapesOf(world: World): hive.ui.Shape[dyn] {
+			mut hive.ui.Shape[dyn] out = [ui.ground([], 200.0, 200.0)]
+			for each car in world.cars {
+				append(out, ui.box([ui.at(car.x, 0.4, car.z), ui.turn(0.0, car.yaw, 0.0),
+				                    ui.paint(car.livery)], 1.8, 0.8, 4.0))
+			}
+			return out
+		}
+		~CODE~
+	`)
+}
+
+func sceneSurfaces(): Str {
+	return page.backticked(`
+		# ~BT~hive.ui.scene~BT~ — surfaces
+
+		~BT~surface(Surface)~BT~ is **the finish**, as against ~BT~paint~BT~'s colour. Eighteen,
+		ordered from the ground up — what you drive on, then what things are built of,
+		then what they are finished in:
+
+		| | |
+		| --- | --- |
+		| ground | ~BT~Turf~BT~ ~BT~Gravel~BT~ ~BT~Tarmac~BT~ ~BT~Kerb~BT~ |
+		| built | ~BT~Concrete~BT~ ~BT~Brick~BT~ ~BT~Planks~BT~ ~BT~Staves~BT~ |
+		| grown and gathered | ~BT~Bark~BT~ ~BT~Leaves~BT~ ~BT~Crowd~BT~ |
+		| open | ~BT~Mesh~BT~ |
+		| finished | ~BT~Speckle~BT~ ~BT~Metal~BT~ ~BT~Carbon~BT~ ~BT~Rubber~BT~ ~BT~Glass~BT~ ~BT~Gloss~BT~ |
+
+		**Every one is drawn *over* whatever colour the shape is**, so one pattern serves
+		a red kerb and a blue one, and ~BT~Gloss~BT~ adds no pattern at all.
+
+		## What a shape is made of when it does not say
+
+		Its **kind** decides: a ~BT~ground~BT~ is ~BT~Turf~BT~, a ~BT~cylinder~BT~ or a ~BT~cone~BT~ is
+		~BT~Staves~BT~, a ~BT~sphere~BT~ is ~BT~Speckle~BT~, and everything else is ~BT~Planks~BT~.
+
+		That is also why saying is worth having: **a road drawn as a ~BT~ground~BT~ came out
+		as a lawn.**
+
+		## A finish is sized in metres, not in faces
+
+		Roughly **one tile every two metres** whatever the shape is, so a crate and a
+		wall are made of the same-sized boards — and **a ~BT~box~BT~ is tiled face by face**,
+		each by its own two dimensions. A barrier forty metres long and one metre high is
+		forty tiles by one, not one by one stretched forty ways.
+
+		## ~BT~Mesh~BT~ is the one with holes in it
+
+		A chain-link fence is not a faint fence, it is wire with nothing between the
+		wire — so **its pattern's own transparency decides pixel by pixel**, and what is
+		left goes on writing depth like any solid. Nothing has to be sorted against it,
+		and it is **visible from both sides**.
+
+		## Every finish has relief, bar three
+
+		A surface is not only a pattern, it is a set of directions the surface faces —
+		so a kerb's stripes have edges that catch the sun, gravel has stones in it, and
+		a plank's seams are seams rather than lines.
+
+		Three have none, and none of the three is an oversight: **~BT~Gloss~BT~** is paint and
+		adds no texture by definition, **~BT~Glass~BT~** is the same argument, and **~BT~Mesh~BT~**'s
+		holes are transparency rather than geometry.
+
+		## A surface may be a photograph
+
+		A ~BT~Surface~BT~ names what a thing is made of; what that name *looks like* is the
+		window's business. **A file at ~BT~assets/textures/<surface>.jpg~BT~, named for the
+		finish in lower case, is used instead of the drawing.** A second file,
+		~BT~assets/textures/<surface>-normal.jpg~BT~, is its relief.
+
+		~CODE~
+		assets/textures/tarmac.jpg          the road, photographed
+		assets/textures/tarmac-normal.jpg   and how it lies
+		~CODE~
+
+		**There is no call for this and no attribute that asks for it**, and that is the
+		point: a scene is a value, and the same value has to be right whether or not the
+		window found a picture. A program that ships the files gets them; one that does
+		not gets the drawing; neither says anything.
+
+		**A photograph is laid over the colour, not in place of it.** The file must be
+		flattened to a mean of **mid grey** — the window composites it in ~BT~overlay~BT~,
+		which returns mid grey exactly as it finds it — so the average of a tile is the
+		colour the shape asked to be painted and what the photograph contributes is its
+		**structure**. That is what keeps one file serving every colour a finish is asked
+		for.
+
+		**Nothing waits for it.** The first frame is drawn from the pattern the renderer
+		has, the file is fetched alongside, and the tiles are redrawn under their own
+		textures when it arrives — no rebuild, no flicker, and no frame held up by a
+		round trip. A file that is not there 404s and the drawing stands.
+	`)
+}
+
+func sceneSound(): Str {
+	return page.backticked(`
+		# ~BT~hive.ui.scene~BT~ — sound
+
+		~BT~sound(attrs, name)~BT~ is something in the scene that is **heard** from where it
+		stands instead of drawn where it stands. It takes ~BT~at~BT~ like any other shape, and
+		four of its own:
+
+		| attribute | carries |
+		| --- | --- |
+		| ~BT~voice(Voice)~BT~ | which noise it is |
+		| ~BT~pitch(Float)~BT~ | how high, as a **multiple** of the voice at rest |
+		| ~BT~volume(Float)~BT~ | how loud, the same way |
+		| ~BT~track(Str)~BT~ | which recording, named under ~BT~assets/~BT~ |
+
+		**Pitch and volume are multiples rather than hertz and decibels.** What an engine
+		sounds like at ~BT~1.0~BT~ is the renderer's business; a program says "twice as fast"
+		and "half as loud", which is what it knows.
+
+		| | ~BT~Voice~BT~ |
+		| --- | --- |
+		| **sustained** | ~BT~Engine~BT~ ~BT~Tyres~BT~ ~BT~Brakes~BT~ ~BT~Wind~BT~ ~BT~Crowd~BT~ ~BT~Music~BT~ |
+		| **struck** | ~BT~Impact~BT~ ~BT~Chime~BT~ |
+
+		~CODE~hive
+		ui.sound([ui.at(car.x, 0.4, car.z), ui.voice(ui.Voice.Engine()),
+		          ui.pitch(0.8 + revs), ui.volume(0.6)], "engine-{car.id}")
+
+		ui.sound([ui.voice(ui.Voice.Music()), ui.volume(0.2),
+		          ui.track("audio/theme.ogg")], "music")
+		~CODE~
+
+		## The payload is a name, and the name is the sound's identity between frames
+
+		**This is the one place audio cannot follow the rule the solids follow.** A box
+		is matched to whatever was in its slot last frame, and a box rebuilt anyway is a
+		box nobody can tell was rebuilt. **An oscillator rebuilt anyway is a *click*,
+		sixty of them a second** — and a slot cannot promise a voice is the same voice,
+		because a scene is free to stop drawing the car in front and every sound after
+		it would shift up a place.
+
+		So: **a name that is in this frame and was in the last one carries on, a name
+		that has just arrived starts, and a name that has gone fades out.**
+
+		## What a voice does with that is the voice's own business
+
+		* A **sustained** voice lasts **as long as the scene goes on naming it**.
+		* A **struck** one fires **once, when the name arrives**, and is deaf to
+		  everything after it — because a crash is a thing that happened rather than a
+		  thing that is happening.
+
+		**Naming ~BT~"hit-3"~BT~ for as long as a car knows it was hit is one impact; letting
+		the name go and bringing it back is a second one.**
+
+		## Sounds are positioned
+
+		The listener is the scene's own ~BT~eye~BT~ and ~BT~aim~BT~, so what is heard on the left
+		is what is drawn on the left, and a car goes past your ear as well as your eye.
+		**~BT~Music~BT~ is the exception**: it has nowhere to stand, so it is never panned.
+
+		## Nothing is downloaded
+
+		**Every voice is oscillators and filtered noise**, for the same reason a
+		[~BT~Surface~BT~](ui-scene-surfaces.md) is a drawn pattern: a built Hive program is
+		one file. It buys something as well as costing something — a voice made of a
+		frequency can be *bent*, and an engine that is a recording of one speed played
+		faster is an engine you can hear looping.
+
+		## A sound may be a recording
+
+		~BT~track(Str)~BT~ names a recording for a sound to be made of instead. The voice
+		still says what the noise *is* — the name decides whether it lasts or fires
+		once — and the recording is what it is made of.
+
+		**The program's ~BT~assets/~BT~ directory is embedded into the executable**, and a
+		~BT~track~BT~ names a path within it. No such directory beside the entrypoint means
+		nothing is embedded and the program is exactly the size it was; where there is
+		one, the whole tree goes in and the window serves it to its own page over its own
+		socket. **Nothing crosses a network at run time.**
+
+		**A track that is not there is not an error.** A missing file, or one the browser
+		cannot decode, falls back to the synthesised voice — so a recording is something
+		a scene *gains* and never something it depends on.
+
+		A sustained voice **loops** its recording for as long as the scene names it, and
+		~BT~pitch~BT~ is the **speed** it is played at. A struck one plays it once, and one
+		still decoding when a struck sound arrives is not heard — a bang that arrives
+		late is a bang nobody wanted.
+
+		**A browser will not let a page make a noise until somebody has touched it.**
+		There is nothing to ask for and nothing to detect: the context is built when the
+		first sound is asked for and nudged on every gesture until one takes.
+	`)
+}
+
+func sceneCamera(): Str {
+	return page.backticked(`
+		# ~BT~hive.ui.scene~BT~ — the camera, the sky and the mouse
+
+		These go on the ~BT~scene~BT~ itself rather than on a shape.
+
+		| attribute | carries |
+		| --- | --- |
+		| ~BT~eye(x, y, z)~BT~ | where the camera is — ~BT~Float~BT~ |
+		| ~BT~aim(yaw, pitch)~BT~ | where it is looking, in **radians** — ~BT~Float~BT~ |
+		| ~BT~lens(Int)~BT~ | the field of view, in **degrees** |
+		| ~BT~fog(Int)~BT~ | how far you can see, in **metres** |
+		| ~BT~background(Tone)~BT~ | the sky, which the fog fades into |
+		| ~BT~shadows(Bool)~BT~ | whether the sun casts. **Absent is yes** |
+		| ~BT~grab(Bool)~BT~ | whether the window should hold the mouse |
+		| ~BT~crosshair(Bool)~BT~ | whether to draw one in the middle |
+
+		## Lighting is not something a scene describes
+
+		**The rig is fixed** — one light from the sky and one from a sun — chosen so
+		that a solid painted a colour comes out that colour with a shaded side.
+
+		**What makes a scene dark is its palette**, which is why a night scene is written
+		in dark colours rather than by turning something down.
+
+		## The sun casts shadows, and it casts them near the eye
+
+		A shadow map is one texture, so it covers a box about **fifty metres around
+		wherever the camera is** — which is where a shadow is read anyway. Everything
+		outside is culled out of the pass, and the map is redrawn on **every other
+		frame**. **A ~BT~ground~BT~ receives shadows and does not cast one**; every other
+		solid does both.
+
+		**~BT~shadows(false)~BT~ turns them off**, and it is the one thing about the lighting
+		a scene may say: a shadow is by a distance the most expensive thing in a picture
+		and among the least of what a program needs from one, so a window that cannot
+		hold its frame rate should be able to sell the shadows before the view.
+
+		**Turning it rebuilds every shader in the scene**, so a program that means to
+		turn it off should turn it off and leave it — a value that changes every frame is
+		a recompile every frame. Something driving it off a frame-rate reading wants
+		**two thresholds with a gap between them**, for the same reason a thermostat
+		does.
+
+		The edge is **hard rather than soft**: the map is large and the read is a single
+		sample, because filtering the read is by a distance the most expensive thing a
+		scene does while the size of the map is very nearly free.
+
+		## ~BT~background~BT~ is a band rather than a colour
+
+		The tone given is **the sky at middle height**; the window deepens it overhead
+		and pales it toward the horizon, and it is the **horizon's** shade the fog fades
+		into. A flat background has no up and no far, and a scene of any size is nearly
+		all horizon.
+
+		**How far it pales is in proportion to how light the sky is**, because haze is
+		scattered light and a sky with none has none to scatter. Any daylight pales the
+		full amount; a sky darker than about a third of full luminance pales less, and a
+		black one does not pale at all — which is what lets a scene under a roof fade
+		into the dark rather than into grey.
+
+		## A second look: ~BT~inset~BT~
+
+		~BT~inset(attrs, views)~BT~ is a **widget**, and the one widget that draws in three
+		dimensions without being a scene: a box on the page showing the world the scene
+		is already showing, from wherever its own ~BT~eye~BT~, ~BT~aim~BT~ and ~BT~lens~BT~ are
+		standing — a rear-view mirror, a security camera, a replay box.
+
+		~CODE~hive
+		ui.inset([ui.width(320), ui.height(180), ui.eye(x, y, z), ui.aim(yaw, 0.0)], [
+			ui.text([ui.size(ui.TextSize.Caption())], "TURN 7")
+		])
+		~CODE~
+
+		**It holds a camera and no world**, and that is the whole of what makes it
+		affordable: an inset is a second *pass* over the shapes the scene already handed
+		over, so it costs one more draw and nothing at all in what the program has to
+		say. **A window still draws one scene, and any number of insets.**
+
+		Its own views are laid out exactly as a ~BT~column~BT~ lays them out, and they sit
+		**over** the picture rather than in it. The box itself is transparent, because
+		what is behind it is the second view.
+
+		**An inset has to be over the picture.** It is drawn into the canvas the scene
+		already has, clipped to where its box landed on it, so a box laid out where that
+		canvas does not reach is not drawn. Pin it into a corner with ~BT~overlay~BT~.
+
+		The sky, the haze, whether the sun casts and how far the world reaches are the
+		**scene's** and are shared: an inset is another look at one world, not another
+		world. Shadows are drawn near the scene's own eye, so a subject far from it is
+		lit and unshadowed.
+	`)
+}
+
+func sceneInput(): Str {
+	return page.backticked(`
+		# ~BT~hive.ui.scene~BT~ — what the player did
+
+		| event | reports |
+		| --- | --- |
+		| ~BT~onFrame(f)~BT~ | ~BT~Int~BT~ — how many **milliseconds** the last frame took |
+		| ~BT~onKeyDown(f)~BT~ / ~BT~onKeyUp(f)~BT~ | ~BT~Str~BT~ — the key's name |
+		| ~BT~onLook(f)~BT~ | ~BT~Float, Float~BT~ — how far the mouse moved, across and down |
+		| ~BT~onGrab(f)~BT~ | ~BT~Bool~BT~ — whether the window is holding the mouse now |
+		| ~BT~onPad(f)~BT~ | ~BT~Int, Str, Float~BT~ — which pad, which control, where it now is |
+
+		Each takes a function of what it reports, which is what a
+		[constructor with holes](ui-events.md) already is:
+
+		~CODE~hive
+		ui.onFrame(Msg.Frame(_))
+		ui.onKeyDown(Msg.Down(_))
+		ui.onLook(Msg.Look(_, _))
+		ui.onPad(Msg.Pad(_, _, _))
+		~CODE~
+
+		## ~BT~onFrame~BT~ is a clock
+
+		**It reports the time since the last frame the program was told about, and not
+		the time since the last frame the window drew.** The two are the same whenever a
+		program can keep up and are deliberately not the same when it cannot.
+
+		A window holds **at most one frame in flight**: having reported one it says
+		nothing more until the program has folded it, and while it waits the gap goes on
+		growing — so the frame that does go carries the whole of the time that passed. A
+		program that can fold sixty frames a second is told about sixty; one that can
+		manage twenty is told about twenty, of fifty milliseconds each.
+
+		That is what makes it a clock. Were it one message per refresh regardless, a slow
+		program would be handed more frames than it could take, and since nothing between
+		the window and the fold ever drops a message the excess would **queue**: input
+		would sit behind a backlog of stale frames, and a world stepped by the gaps in
+		them would run slower than real time.
+
+		**A gap longer than a tenth of a second is still reported as a tenth of a
+		second**, because a world stepped by a full stall would teleport. So step the
+		world by what ~BT~onFrame~BT~ hands you and nothing else.
+
+		## Keys
+
+		**A key is named the same on every layout the browser can report**: a letter or
+		a digit is itself, and everything else is the word for it — ~BT~space~BT~, ~BT~enter~BT~,
+		~BT~escape~BT~, ~BT~tab~BT~, ~BT~shift~BT~, ~BT~ctrl~BT~, ~BT~up~BT~, ~BT~down~BT~, ~BT~left~BT~, ~BT~right~BT~.
+
+		Hold state is the program's: ~BT~onKeyDown~BT~ and ~BT~onKeyUp~BT~ are what a fold uses to
+		keep its own set of what is held.
+
+		## The mouse
+
+		~BT~grab(true)~BT~ asks the window to hold the pointer, which is what makes ~BT~onLook~BT~
+		report **movement** rather than a position. ~BT~onGrab~BT~ says whether it currently
+		holds it — a browser gives it up on ~BT~escape~BT~, and a program that dims the world
+		when it loses the mouse reads this.
+
+		## A gamepad
+
+		**A gamepad is the one input a browser will not tell you about**: there is no
+		event for a stick moving, only a snapshot you have to ask for. So a pad is read
+		**once a frame** and what arrives is **what changed** — which makes a button on a
+		pad the same kind of thing as a key going down.
+
+		One shape covers the whole device, because a button is a control that is only
+		ever 0 or 1:
+
+		| control | name | reports |
+		| --- | --- | --- |
+		| sticks | ~BT~leftX~BT~ ~BT~leftY~BT~ ~BT~rightX~BT~ ~BT~rightY~BT~ | −1 to 1 |
+		| triggers | ~BT~lt~BT~ ~BT~rt~BT~ | 0 to 1 |
+		| face | ~BT~a~BT~ ~BT~b~BT~ ~BT~x~BT~ ~BT~y~BT~ | 0 or 1 |
+		| shoulders | ~BT~lb~BT~ ~BT~rb~BT~ | 0 or 1 |
+		| dpad | ~BT~up~BT~ ~BT~down~BT~ ~BT~left~BT~ ~BT~right~BT~ | 0 or 1 |
+		| the rest | ~BT~back~BT~ ~BT~start~BT~ ~BT~guide~BT~ ~BT~lstick~BT~ ~BT~rstick~BT~ | 0 or 1 |
+		| anything past those | ~BT~b17~BT~ ~BT~b18~BT~ … ~BT~axis4~BT~ … | by number |
+		| the pad itself | ~BT~here~BT~ | 1 when it arrives, **2** when it arrives with a layout the browser could not name, 0 when it goes |
+
+		**The names are by position, for every pad** — including the ones the browser
+		declines to name. It leaves ~BT~mapping~BT~ empty for any device missing from its own
+		table, which on a desktop is most of them and very nearly every wheel. A pad
+		nobody can name is still a pad.
+	`)
+}

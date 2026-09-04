@@ -122,8 +122,15 @@ proc advance(p: mut Parse): void {
 }
 
 proc fail(ts: token.Token[], p: mut Parse, message: Str): void {
+	failAt(ts, p, p.pos, message)
+}
+
+// `fail`, but about a token the parse has already moved past. There is one of
+// those: the `!` whose operand turns out to be a match, which is not known
+// until the operand has been read.
+proc failAt(ts: token.Token[], p: mut Parse, at: Int, message: Str): void {
 	if p.quiet == false && p.failed == false {
-		append(p.errors, diag.at(lineAt(ts, p.pos), message))
+		append(p.errors, diag.at(lineAt(ts, at), message))
 	}
 	p.failed = true
 }
@@ -131,6 +138,17 @@ proc fail(ts: token.Token[], p: mut Parse, message: Str): void {
 // `expected X but found Y` — the message nine failures in ten want.
 proc expected(ts: token.Token[], p: mut Parse, what: Str): void {
 	fail(ts, p, "expected {what} but found " + token.describe(kindAt(ts, p.pos)))
+}
+
+// One of the words that are keywords only where they are written. Taken when it
+// is there, named when it is not.
+proc expectWord(ts: token.Token[], p: mut Parse, word: Str): Bool {
+	if wordAt(ts, p.pos) == word {
+		advance(p)
+		return true
+	}
+	expected(ts, p, "`" + word + "`")
+	return false
 }
 
 proc expect(ts: token.Token[], p: mut Parse, k: token.Kind): Bool {
@@ -501,9 +519,140 @@ proc parseTypeDecl(ts: token.Token[], p: mut Parse): ast.Decl {
 proc parseField(ts: token.Token[], p: mut Parse): ast.Field {
 	name := expectIdent(ts, p, naming.Role.Field())
 	if expect(ts, p, token.Kind.Colon()) == false {
-		return ast.Field(name, ast.TypeExpr.VoidType())
+		return ast.Field(name, ast.TypeExpr.VoidType(), ast.unmarked())
 	}
-	return ast.Field(name, parseTypeExpr(ts, p))
+	declared := parseTypeExpr(ts, p)
+	return ast.Field(name, declared, parseMarks(ts, p))
+}
+
+// --- A field's annotations ---------------------------------------------------
+//
+// `name: Str -- JSON as username; Default as "";`
+//
+// A `--` opens them and each clause ends at its `;`, so they may be written in
+// any order and a field may carry one, both, or — as every field written before
+// there were any does — neither.
+//
+// `--` is the same two characters the decrement step is written with, and there
+// is nothing to tell apart: a step is a statement and this is a type body, which
+// holds fields and variants and no statements at all. So the marker costs the
+// lexer nothing — it already produced this token — and needs no space behind it.
+//
+// They are **compile-time** and about the JSON codecs alone: what a field is
+// called on the wire, and what to read where the wire has nothing. Nothing here
+// reaches the value at run time, and nothing about the Hive side of the field
+// changes — `user.name` is still `name`, whatever JSON calls it.
+
+proc parseMarks(ts: token.Token[], p: mut Parse): ast.Marks {
+	if kindAt(ts, p.pos) != token.Kind.MinusMinus() {
+		return ast.unmarked()
+	}
+	advance(p)
+	mut json := ""
+	mut ast.Expr fallback = ast.Expr.Absent()
+	for ; p.failed == false && atEnd(ts, p) == false; {
+		at := p.pos
+		kind := wordAt(ts, p.pos)
+		if kind == "JSON" {
+			advance(p)
+			if json != "" {
+				failAt(ts, p, at, "this field says `JSON as` twice, and a field has one name on the wire")
+				return ast.Marks(json, fallback)
+			}
+			json = parseMarkName(ts, p)
+		} else if kind == "Default" {
+			advance(p)
+			if fallback is ast.Expr.Absent {
+			} else {
+				failAt(ts, p, at, "this field says `Default as` twice, and a field has one value to fall back to")
+				return ast.Marks(json, fallback)
+			}
+			fallback = parseMarkLiteral(ts, p)
+		} else {
+			fail(ts, p, unknownMark(ts, p))
+			return ast.Marks(json, fallback)
+		}
+		if expect(ts, p, token.Kind.Semicolon()) == false {
+			return ast.Marks(json, fallback)
+		}
+		// Another clause only where another one was written: what follows a `;`
+		// is the next field as often as it is more of this one.
+		if opensMark(ts, p) == false {
+			return ast.Marks(json, fallback)
+		}
+	}
+	return ast.Marks(json, fallback)
+}
+
+// Whether what sits here is another clause rather than the field after it. Both
+// spell a word, so the `as` behind it is what tells them apart — a field is
+// `name: Type` and never `name as`.
+func opensMark(ts: token.Token[], p: Parse): Bool {
+	word := wordAt(ts, p.pos)
+	return (word == "JSON" || word == "Default") && wordAt(ts, p.pos + 1) == "as"
+}
+
+// The name a clause gives, after the `as` that has to be there. A JSON key is
+// somebody else's name rather than one this program declares, so it is taken as
+// written and held to none of Hive's shapes: `user_name` and `userName` are
+// equally a key.
+proc parseMarkName(ts: token.Token[], p: mut Parse): Str {
+	if expectWord(ts, p, "as") == false {
+		return ""
+	}
+	if kindAt(ts, p.pos) is token.Kind.StrLit(written) {
+		advance(p)
+		if written == "" {
+			fail(ts, p, "`JSON as \"\"` names no field: a JSON key is at least one character")
+			return ""
+		}
+		return written
+	}
+	name := wordAt(ts, p.pos)
+	if name == "" {
+		expected(ts, p, "the JSON name this field is written as, as a word or a quoted string")
+		return ""
+	}
+	advance(p)
+	return name
+}
+
+// What a `Default` falls back to. A **literal**, so it needs nothing in scope
+// and nothing runs to work it out: it is written into the decoder itself.
+proc parseMarkLiteral(ts: token.Token[], p: mut Parse): ast.Expr {
+	if expectWord(ts, p, "as") == false {
+		return ast.Expr.Absent()
+	}
+	// A negative number is unary minus over a literal everywhere else in the
+	// language, and it is the same two tokens here.
+	if kindAt(ts, p.pos) == token.Kind.Minus() {
+		advance(p)
+		negative := kindAt(ts, p.pos)
+		if negative is token.Kind.IntLit(v) {
+			advance(p)
+			return ast.Expr.IntLit(0 - v)
+		}
+		if negative is token.Kind.FloatLit(v) {
+			advance(p)
+			return ast.Expr.FloatLit(0.0 - v)
+		}
+		expected(ts, p, "a number after the `-`")
+		return ast.Expr.Absent()
+	}
+	k := kindAt(ts, p.pos)
+	if k is token.Kind.IntLit(v) { advance(p) return ast.Expr.IntLit(v) }
+	if k is token.Kind.FloatLit(v) { advance(p) return ast.Expr.FloatLit(v) }
+	if k is token.Kind.StrLit(t) { advance(p) return ast.Expr.StrLit(t) }
+	if k is token.Kind.AtomLit(a) { advance(p) return ast.Expr.AtomLit(a) }
+	if k == token.Kind.KwTrue() { advance(p) return ast.Expr.BoolLit(true) }
+	if k == token.Kind.KwFalse() { advance(p) return ast.Expr.BoolLit(false) }
+	expected(ts, p, "a literal for this field to fall back to")
+	return ast.Expr.Absent()
+}
+
+// What was written where a clause was expected.
+func unknownMark(ts: token.Token[], p: Parse): Str {
+	return "a field's annotations are `JSON as <name>;` and `Default as <literal>;`, in any order, and " + token.describe(kindAt(ts, p.pos)) + " is neither"
 }
 
 proc parseVariant(ts: token.Token[], p: mut Parse): ast.Variant {
@@ -1191,12 +1340,52 @@ proc parseMultiplicative(ts: token.Token[], p: mut Parse): ast.Expr {
 	return left
 }
 
+// The two prefix operators. Both bind tighter than every comparison and looser
+// than `**`, so `-2 ** 2` is `-(2 ** 2)` and `!a && b` is `(!a) && b`.
 proc parseUnary(ts: token.Token[], p: mut Parse): ast.Expr {
 	if kindAt(ts, p.pos) == token.Kind.Minus() {
 		advance(p)
 		return ast.Expr.Negate(parseUnary(ts, p))
 	}
+	if kindAt(ts, p.pos) == token.Kind.Bang() {
+		bang := p.pos
+		advance(p)
+		operand := parseUnary(ts, p)
+		// A match is the one `Bool` a `!` may not have. Refused here rather than
+		// left to mean something: `is` narrows the value it matched and binds
+		// parts of it, and neither survives being negated, so a reader of
+		// `!(x is Shape.Circle(r))` would be looking at an `r` that can never be
+		// set. The `else` is where the other case goes.
+		if holdsMatch(operand) {
+			failAt(ts, p, bang, negatedMatch())
+		}
+		return ast.Expr.Not(operand)
+	}
 	return parsePower(ts, p)
+}
+
+/// Whether `e` holds an `is` that a `!` in front of it would be negating.
+///
+/// Recursive through `&&`, `||` and a second `!`, and no further: `is` binds
+/// looser than every comparison, so a match can sit under those three operators
+/// and nowhere else.
+func holdsMatch(e: ast.Expr): Bool {
+	if e is ast.Expr.IsMatch(_, _) {
+		return true
+	}
+	if e is ast.Expr.Not(operand) {
+		return holdsMatch(operand)
+	}
+	if e is ast.Expr.Binary(op, left, right) {
+		if op is ast.BinOp.And || op is ast.BinOp.Or {
+			return holdsMatch(left) || holdsMatch(right)
+		}
+	}
+	return false
+}
+
+func negatedMatch(): Str {
+	return "a match cannot be negated: `is` narrows the value it matched and binds parts of it, and a `!` in front of that would leave those bindings with nothing to mean. Put the other case in the `else`, or match the variant you actually want"
 }
 
 // `**` is right-associative: `2 ** 3 ** 2` is `2 ** (3 ** 2)`. Its exponent is

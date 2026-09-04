@@ -1214,6 +1214,11 @@ proc expr(em: mut Emit, env: infer.Env, e: ast.Expr, want: types.Ty): Str {
 	else if e is ast.Expr.Negate(operand) {
 		return "-(" + expr(em, env, operand, infer.typeOf(env, operand)) + ")"
 	}
+	// Parenthesised for the reason `-` is: what Hive bound tightly, Go has to be
+	// told to bind tightly too.
+	else if e is ast.Expr.Not(operand) {
+		return "!(" + expr(em, env, operand, types.Ty.TBool()) + ")"
+	}
 	else if e is ast.Expr.Interp(parts) { return interpolation(em, env, parts) }
 	else if e is ast.Expr.VectorLit(items) { return vectorLiteral(em, env, items, want) }
 	else if e is ast.Expr.Binary(op, left, right) { return binary(em, env, op, left, right) }
@@ -2465,6 +2470,13 @@ proc syslinkDigest(em: mut Emit, ty: types.Ty): Str {
 /// The signature a digest is taken over: a type's own spelling, and every
 /// variant and field it declares, recursively. A recursive type stops at its own
 /// name — the cycle adds nothing a decoder could differ on.
+///
+/// A field goes in under its **JSON key** rather than its Hive name, because
+/// that is what decides the bytes: two peers whose fields are spelled alike but
+/// annotated differently write different objects, and the digest is the thing
+/// that has to notice. A `Default` is left out for the same reason it is in —
+/// it changes what a decoder will *accept*, never what an encoder writes, so a
+/// peer that has one still reads what a peer without one sends.
 proc signatureOf(em: mut Emit, ty: types.Ty, seen: Str[]): Str {
 	if ty is types.Ty.TStr { return "Str" }
 	if ty is types.Ty.TInt { return "Int" }
@@ -2493,11 +2505,11 @@ proc signatureOf(em: mut Emit, ty: types.Ty, seen: Str[]): Str {
 			for each v in info.variants {
 				append(pieces, v.name)
 				for each f in v.fields {
-					append(pieces, f.name + ":" + signatureOf(em, types.resolve(em.table, f.declared), inner))
+					append(pieces, ast.jsonKey(f) + ":" + signatureOf(em, types.resolve(em.table, f.declared), inner))
 				}
 			}
 			for each f in info.shared {
-				append(pieces, f.name + ":" + signatureOf(em, types.resolve(em.table, f.declared), inner))
+				append(pieces, ast.jsonKey(f) + ":" + signatureOf(em, types.resolve(em.table, f.declared), inner))
 			}
 			return name + "\{" + join(pieces, ",") + "}"
 		}
@@ -2687,6 +2699,7 @@ func escapesInExpr(name: Str, e: ast.Expr): Bool {
 		return false
 	}
 	if e is ast.Expr.Negate(operand) { return escapesInExpr(name, operand) }
+	if e is ast.Expr.Not(operand) { return escapesInExpr(name, operand) }
 	if e is ast.Expr.Binary(_, left, right) {
 		return escapesInExpr(name, left) || escapesInExpr(name, right)
 	}
@@ -2917,6 +2930,8 @@ proc scanExpr(e: ast.Expr, sc: mut Scan): void {
 			scanExpr(item, sc)
 		}
 	} else if e is ast.Expr.Negate(operand) {
+		scanExpr(operand, sc)
+	} else if e is ast.Expr.Not(operand) {
 		scanExpr(operand, sc)
 	} else if e is ast.Expr.Binary(_, left, right) {
 		scanExpr(left, sc)
@@ -3310,12 +3325,40 @@ proc decodeFields(em: mut Emit, fields: ast.Field[], path: Str, zero: Str): void
 	}
 	for each f in fields {
 		ty := types.resolve(em.table, f.declared)
+		key := ast.jsonKey(f)
 		raw := "raw_" + goIdent(f.name)
-		line(em, raw + ", jerr := hive.JsonField(obj, " + quoted(f.name) + ", " + path + ")")
-		bailOut(em, zero)
-		line(em, "f_" + goIdent(f.name) + ", jerr := " + decoderRef(em, ty) + "(" + raw + ", " + path + "+" + quoted("." + f.name) + ")")
-		bailOut(em, zero)
+		held := "f_" + goIdent(f.name)
+		where := path + "+" + quoted("." + key)
+		if f.marks.fallback is ast.Expr.Absent {
+			line(em, raw + ", jerr := hive.JsonField(obj, " + quoted(key) + ", " + path + ")")
+			bailOut(em, zero)
+			line(em, held + ", jerr := " + decoderRef(em, ty) + "(" + raw + ", " + where + ")")
+			bailOut(em, zero)
+		} else {
+			// A field with somewhere to fall back to asks whether the key is
+			// there rather than insisting that it is, and reads a `null` as the
+			// same nothing an absent key is. What it does *not* excuse is a
+			// value of the wrong type: a default stands in for something that was
+			// not said, never for something that was said wrongly.
+			line(em, "{held} := " + literal(em, f.marks.fallback))
+			open(em, "if " + raw + ", found := hive.JsonLook(obj, " + quoted(key) + "); found && " + raw + ".Kind != 'n' \{")
+			line(em, "got, jerr := " + decoderRef(em, ty) + "(" + raw + ", " + where + ")")
+			bailOut(em, zero)
+			line(em, held + " = got")
+			close(em, "}")
+		}
 	}
+}
+
+// A `Default`'s literal, as the Go value it stands for. The parser accepts
+// nothing but a literal there, so this needs no scope and can never fail.
+proc literal(em: mut Emit, e: ast.Expr): Str {
+	if e is ast.Expr.IntLit(v) { return "{v}" }
+	if e is ast.Expr.FloatLit(v) { return floatLiteral(v) }
+	if e is ast.Expr.StrLit(t) { return quoted(t) }
+	if e is ast.Expr.BoolLit(b) { return "{b}" }
+	if e is ast.Expr.AtomLit(name) { return "hive.Atom({atomValue(em, name)})" }
+	return "nil"
 }
 
 func fieldInits(fields: ast.Field[]): Str {
@@ -3401,7 +3444,7 @@ proc objectEncode(em: mut Emit, fields: ast.Field[], subject: Str): Str {
 	mut Str[dyn] out = []
 	for each f in fields {
 		ty := types.resolve(em.table, f.declared)
-		out = appendPiece(out, quoted("\"" + f.name + "\":") + " + " + encodeOf(em, ty, subject + "." + goField(f.name), 0))
+		out = appendPiece(out, quoted("\"" + ast.jsonKey(f) + "\":") + " + " + encodeOf(em, ty, subject + "." + goField(f.name), 0))
 	}
 	return quoted("\{") + " + " + join(out, " + " + quoted(",") + " + ") + " + " + quoted("}")
 }
@@ -3697,6 +3740,7 @@ func sourceOf(e: ast.Expr): Str {
 		return sourceOf(subject) + " is " + show.showPattern(pattern)
 	}
 	if e is ast.Expr.Negate(operand) { return "-" + sourceOf(operand) }
+	if e is ast.Expr.Not(operand) { return "!" + sourceOf(operand) }
 	if e is ast.Expr.FloatLit(v) { return "{v}" }
 	if e is ast.Expr.AtomLit(atom) { return "#{atom}" }
 	if e is ast.Expr.VectorLit(items) {

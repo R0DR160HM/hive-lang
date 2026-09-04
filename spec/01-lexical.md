@@ -85,10 +85,11 @@ variable may be called `timeout`.
 | --- | --- |
 | two-character | `:=` `>=` `<=` `==` `!=` `**` `&&` `\|\|` `++` `--` `+=` `-=` `*=` `/=` |
 | three-character | `...` (the vector-pattern rest marker) |
-| one-character | `{` `}` `(` `)` `[` `]` `:` `;` `,` `.` `>` `<` `=` `+` `-` `*` `/` `%` |
+| one-character | `{` `}` `(` `)` `[` `]` `:` `;` `,` `.` `>` `<` `=` `+` `-` `*` `/` `%` `!` |
 
 `...` must be matched before `.`, and each two-character operator before its
-prefix.
+prefix. `!=` is therefore looked for before `!`, and a `!` reaching the
+one-character row is one standing on its own: the negation.
 
 ### Literals
 
@@ -208,12 +209,35 @@ enforced **where the name is declared** — that is the one place it can be fixe
 | shape | what it names |
 | --- | --- |
 | `camelCase` | variables, parameters, fields, every `proc`/`func`/`query`, and the name an `import` is reached through |
-| `UPPER_CASE` | a variable nothing reassigns, which is how a constant is written |
+| `UPPER_CASE` | **also** allowed for a variable nothing reassigns, which is how a constant is written |
 | `PascalCase` | types, their variants, and atoms |
 | lower case | the keywords, and nothing else |
 
-So `Str` is a type and `str` is not; `MAX` holds still and `max` may not. The
-types the language declares are spelled no differently from yours.
+So `Str` is a type and `str` is not. The types the language declares are spelled
+no differently from yours.
+
+### `UPPER_CASE` is allowed, never required
+
+**`camelCase` is the default spelling of every variable, whether or not anything
+reassigns it.** `UPPER_CASE` is a second shape an *immutable* variable may take,
+for a value the program treats as a constant — and taking it is the author's
+choice, not something the compiler asks for:
+
+```hive
+retries := 3            // fine
+MAX_RETRIES := 3        // also fine, and says the same thing louder
+```
+
+Neither of those is preferred by the language, and nothing is inferred from the
+choice: the two names hold their values in exactly the same way, since **what
+makes a binding immutable is the absence of `mut`, never its spelling**. A
+`camelCase` name is what most immutable variables are written as, because most
+of them are ordinary values that happen not to be reassigned rather than
+constants anybody would call one.
+
+The option belongs to **variables alone**. A parameter, a field, a callable, an
+import's name and a name bound by a pattern or a `for each` are `camelCase` and
+nothing else, however fixed the value behind them is.
 
 Precisely:
 
@@ -225,7 +249,8 @@ Precisely:
 
 A **`mut` variable may not be written `UPPER_CASE`**: that shape says constant
 about something the program is about to reassign. A counting loop's counter is
-implicitly mutable and is held to the same rule.
+implicitly mutable and is held to the same rule. This is the one direction the
+rule runs in — `mut` rules the shape *out*, and nothing ever rules it in.
 
 Any name may open with a **single `_`** — `_scratch`, `_helperOf`, `_MAX`. What
 follows the underscore is spelled exactly as it would be without it. The

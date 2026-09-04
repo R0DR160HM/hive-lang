@@ -90,6 +90,59 @@ test "a field outside any variant is kept beside the variants" {
 	assert got == "(type Event (at Int) (| Opened (by Str)) (| Closed))"
 }
 
+test "a field's annotations are read in any order" {
+	one := tree("type User \{ name: Str -- JSON as username; }")
+	assert one == "(type User (name Str (json username)))"
+	both := tree("type User \{ name: Str -- JSON as username; Default as \"\"; }")
+	assert both == "(type User (name Str (json username) (default \"\")))"
+	// The other order says the same thing.
+	other := tree("type User \{ name: Str -- Default as \"\"; JSON as username; }")
+	assert other == "(type User (name Str (json username) (default \"\")))"
+	// And a field that carries neither renders exactly as it always did.
+	none := tree("type User \{ name: Str }")
+	assert none == "(type User (name Str))"
+}
+
+test "the marker needs no space, and is not the step it is spelled like" {
+	assert tree("type User \{ name: Str --JSON as username; }") == "(type User (name Str (json username)))"
+	// `--` in a body is still the step: what tells them apart is where they are
+	// written, since a type body holds no statements.
+	assert stmt("i--") == "(= i (- i 1))"
+}
+
+test "a Default takes any literal, and a negative number is two tokens" {
+	assert tree("type P \{ n: Int -- Default as 3; }") == "(type P (n Int (default 3)))"
+	assert tree("type P \{ n: Int -- Default as -1; }") == "(type P (n Int (default -1)))"
+	assert tree("type P \{ r: Float -- Default as 1.5; }") == "(type P (r Float (default 1.5f)))"
+	assert tree("type P \{ b: Bool -- Default as false; }") == "(type P (b Bool (default false)))"
+	assert tree("type P \{ a: Atom -- Default as #Nil; }") == "(type P (a Atom (default #Nil)))"
+}
+
+test "a JSON name is somebody else's name, so it keeps whatever shape it has" {
+	// Held to none of Hive's own shapes: the key is what the wire calls it.
+	assert tree("type User \{ name: Str -- JSON as user_name; }") == "(type User (name Str (json user_name)))"
+	// And a key that is not a word at all is written as a string.
+	assert tree("type User \{ name: Str -- JSON as \"user-name\"; }") == "(type User (name Str (json user-name)))"
+}
+
+test "a variant's own fields may be annotated, and so may the shared ones" {
+	got := tree("type Event \{ at: Int -- JSON as timestamp; Opened \{ by: Str -- JSON as opened_by; } }")
+	assert got == "(type Event (at Int (json timestamp)) (| Opened (by Str (json opened_by))))"
+}
+
+test "an annotation nobody knows is refused, and each clause needs its `;`" {
+	assert text.contains(problem("type User \{ name: Str -- XML as u; }"), "`JSON as <name>;`")
+	assert text.contains(problem("type User \{ name: Str -- JSON as u  age: Int }"), "expected `;`")
+	assert text.contains(problem("type User \{ name: Str -- JSON u; }"), "expected `as`")
+	assert text.contains(problem("type User \{ name: Str -- Default as someName; }"), "a literal")
+	assert text.contains(problem("type User \{ name: Str -- JSON as \"\"; }"), "names no field")
+}
+
+test "a clause said twice is refused rather than taking the last one" {
+	assert text.contains(problem("type User \{ name: Str -- JSON as a; JSON as b; }"), "`JSON as` twice")
+	assert text.contains(problem("type User \{ name: Str -- Default as \"a\"; Default as \"b\"; }"), "`Default as` twice")
+}
+
 test "a field list may be written with commas or without them" {
 	got := tree("type P \{ x: Int, y: Int }")
 	assert got == "(type P (x Int) (y Int))"
@@ -255,6 +308,48 @@ test "unary minus binds tighter than * and looser than **" {
 
 test "** is right-associative" {
 	assert stmt("echo 2 ** 3 ** 2") == "(echo (** 2 (** 3 2)))"
+}
+
+test "`!` binds where unary minus binds" {
+	// Tighter than every comparison and every conjunction, so what it takes is
+	// a value rather than a condition somebody wrote out.
+	assert stmt("echo !a") == "(echo (! a))"
+	assert stmt("echo !a && b") == "(echo (&& (! a) b))"
+	assert stmt("echo !a == b") == "(echo (== (! a) b))"
+	assert stmt("echo !a || !b") == "(echo (|| (! a) (! b)))"
+	// And looser than a call, an index or a member, so the whole chain is the
+	// operand rather than only its head.
+	assert stmt("echo !f(x)") == "(echo (! (call f x)))"
+	assert stmt("echo !v[0]") == "(echo (! (at v 0)))"
+	assert stmt("echo !a.b") == "(echo (! (. a b)))"
+}
+
+test "`!` is right-associative, like the prefix operator it is" {
+	assert stmt("echo !!a") == "(echo (! (! a)))"
+}
+
+test "parentheses are what negate a comparison or a bounds check" {
+	assert stmt("echo !(a == b)") == "(echo (! (== a b)))"
+	assert stmt("echo !(v bounds i)") == "(echo (! (&& (>= i 0) (< i (call (. hive len) v)))))"
+}
+
+test "a match cannot be negated" {
+	// `is` narrows the value it matched and binds parts of it, and neither
+	// survives being negated — so this is refused where it is written rather
+	// than compiled into something whose bindings mean nothing.
+	assert text.contains(problem("proc p(): void \{ if !(x is T.A(v)) \{ } }"), "cannot be negated")
+	// Under a conjunction it is still a negated match: `&&`, `||` and a second
+	// `!` are the only three operators a match can sit beneath.
+	assert text.contains(problem("proc p(): void \{ if !(a && (x is T.A)) \{ } }"), "cannot be negated")
+	assert text.contains(problem("proc p(): void \{ if !(a || (x is T.A)) \{ } }"), "cannot be negated")
+	assert text.contains(problem("proc p(): void \{ if !!(x is T.A) \{ } }"), "cannot be negated")
+}
+
+test "an ordinary `!` beside a match is not a negated one" {
+	// The refusal is about what the `!` took, not about the condition holding a
+	// match somewhere: both of these negate a `Bool` that is nobody's pattern.
+	assert problem("proc p(): void \{ if !a && (x is T.A(v)) \{ } }") == ""
+	assert problem("proc p(): void \{ if (x is T.A(v)) && !a \{ } }") == ""
 }
 
 test "parentheses override precedence and leave no trace" {

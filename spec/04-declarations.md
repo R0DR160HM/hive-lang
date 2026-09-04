@@ -30,6 +30,60 @@ Every declared type gets, derived from its declaration and emitted only where
 used: a deep copy, a total order, a JSON codec, and a structural digest. None of
 it is written by hand and none of it uses reflection.
 
+### Annotations
+
+A field may be annotated, and both annotations are about the **JSON codec**
+derived above — what the field is called on the wire, and what to read where the
+wire has nothing:
+
+```hive
+type User {
+	name: Str -- JSON as username;
+	age:  Int
+	firstName: Str -- Default as "";
+}
+```
+
+| written | means |
+| --- | --- |
+| `JSON as <name>;` | the key this field is read from and written as |
+| `Default as <literal>;` | what to use where JSON has `null` or nothing at all |
+
+A `--` opens them and each clause ends at its `;`, so **they may be written in
+any order** and a field may carry one, both or neither:
+
+```hive
+theme: Str -- JSON as colour_scheme; Default as "light";
+theme: Str -- Default as "light"; JSON as colour_scheme;   // the same field
+```
+
+These are **compile-time**, and nothing about the Hive side of the field
+changes: it is still `user.name` whatever JSON calls it, still ordered and
+copied and compared as it was, and still `name` in every message the compiler
+writes about it.
+
+**`JSON as` takes a name rather than a Hive one.** A key is somebody else's, so
+it is held to none of Hive's shapes — `user_name` is a key and so is
+`"user-name"`, written as a string where it is not a word at all. **Two fields
+of one object may not answer to one key**, which is a compile error naming it:
+the decoder would read the same member twice and the encoder would write it
+twice.
+
+**`Default as` takes a literal** — an `Int`, `Float`, `Str`, `Bool` or `Atom`,
+with a leading `-` where a number is negative — and it must be a value the field
+can hold, checked against the declared type. What it stands in for is a key that
+is **absent** and a key that is present and **null**, which are one nothing:
+without it, either is an error. It stands in for nothing else, so a value of the
+wrong type is still an error — a default is for what was never said, not for
+what was said wrongly.
+
+An annotation reaches a variant's own fields and the shared ones alike, and a
+shared field is annotated once for every variant it joins.
+
+Neither annotation changes what `hive.json.parse(text) with Table` does: that
+flattens a document rather than decoding a declared shape, so there is nothing
+there for a field to be named.
+
 ## 4.2 `func`
 
 ```hive

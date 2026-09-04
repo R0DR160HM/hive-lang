@@ -7,6 +7,7 @@ rem   hive build     <entrypoint.hive>       Compile to a native executable
 rem   hive run       <entrypoint.hive> [..]  Compile and run
 rem   hive test      <entrypoint.hive>       Run the program's tests, with coverage
 rem   hive container <entrypoint.hive>       Write a Dockerfile that builds and runs it
+rem   hive agents                            Write .hivedocs/ for a coding agent to read
 rem   hive version                           Which release this compiler is
 rem
 rem A batch file rather than a PowerShell one, for one reason: this runs from
