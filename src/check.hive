@@ -131,7 +131,7 @@ proc checkRowType(c: mut Check, declared: types.Ty): void {
 			report(c, "a query answers with rows of a declared type, and `{name}` is not one")
 			return
 		}
-		// A single column, or a Table from `run raw`.
+		// A single column, or a Table from `hive.sql.raw`.
 		return
 	}
 	report(c, "a query answers with `T[dyn]` for one row type, `Str[dyn]` (or another scalar) for a single column, or `void` for a statement — and this is " + types.show(declared))
@@ -980,6 +980,9 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
 // generated file in terms of Go's own types — and a message that only said
 // `float64` would leave the reader hunting for a conversion nobody mentioned.
 proc checkLibraryArguments(c: mut Check, env: infer.Env, module: Str, name: Str, args: ast.Arg[]): void {
+	if module == "sql" && name == "run" {
+		checkRunsQuery(c, env, args)
+	}
 	wanted := stdlib.paramsOf(module, name)
 	mut i := 0
 	for each a in args {
@@ -991,6 +994,31 @@ proc checkLibraryArguments(c: mut Check, env: infer.Env, module: Str, name: Str,
 			fits(c, wanted[i], infer.typeOf(env, a.value), "the " + nth(i) + " argument of `hive.{module}.{name}`")
 		}
 		i = i + 1
+	}
+}
+
+// `hive.sql.run` is the one library call whose second argument has a shape
+// rather than a type: a fragment of some row type, which is what tells it how to
+// read what comes back. Nothing downstream can refuse a wrong one — the emitter
+// needs the row type before it can write the mapper — so it is refused here.
+proc checkRunsQuery(c: mut Check, env: infer.Env, args: ast.Arg[]): void {
+	if len(args) < 2 {
+		report(c, "`hive.sql.run` takes a connection and the query to run, and this names only one of the two")
+		return
+	}
+	if args bounds 1 {
+		asked := args[1].value
+		if asked is ast.Expr.Hole {
+			return
+		}
+		held := infer.typeOf(env, asked)
+		if held is types.Ty.TFragment(_) {
+			return
+		}
+		if held is types.Ty.TUnknown {
+			return
+		}
+		report(c, "the second argument of `hive.sql.run` is a `hive.sql.Fragment` — what calling a `query` declaration answers with — and this is " + types.show(held))
 	}
 }
 

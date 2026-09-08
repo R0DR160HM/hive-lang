@@ -3,8 +3,7 @@
 Each module owns its types under its own namespace — `hive.net.HttpRequest`,
 `hive.json.JsonError`, `hive.map.Map`, `hive.syslink.Address`. The only builtin
 types that live directly on `hive` are the core ones the language uses without a
-module: `Result`, `Table` and the `hive.TableError` that `using` yields from a
-CSV.
+module: `Result` and `Table`.
 
 A module reached often can be given a short name with `import`
 ([12](12-modules.md#126-importing-a-standard-library-module)). It is a spelling
@@ -90,12 +89,18 @@ A dictionary: keys paired with values, looked up by key. Type-level rules are in
 
 ## 14.4 `hive.file`
 
-General filesystem access, for the files `using` does not cover. Contents move as
+General filesystem access. Contents move as
 `Str`, which holds bytes rather than validated text, so a binary file survives a
 read/write round trip. Everything fallible returns
 `Result<_, hive.file.FileError>`, whose `reason` is `"NotFound"`,
 `"Permission"`, `"Exists"` or `"Io"`, alongside the `path` and the underlying
 `message`.
+
+Reading a **table** out of a file is [14.6](#146-reading-tables): `csv`, `xlsx`
+and `ods` live here too, and each answers with a
+`Result<_, hive.file.TableError>` — a file that opened and then turned out not to
+hold what it said it did is not a filesystem failure, so it keeps an error of its
+own, carrying the `path` and a `message`.
 
 * `read(path)` → `Result<Str, _>`; `lines(path)` → `Result<Str[dyn], _>` splits
   on newlines, dropping the empty piece a trailing newline leaves and any Windows
@@ -190,27 +195,30 @@ This is what `hive build --target` is built on
 ([15.6](15-lowering.md#156-building-for-another-platform)) — and it is the only
 thing in the compiler that needs an environment at all.
 
-## 14.6 Reading tables (`using`)
+## 14.6 Reading tables
 
-`using` reads a table. Each form says in the source what it is reading, which is
-what lets the compiler pick the reader and leave the machinery for the others out
-of the build.
+A table is read by naming its reader. Which one a program calls is what lets the
+compiler leave the machinery for the others out of the build.
 
 ```hive
-using "./data.csv"                            // a comma-separated CSV
-using "./data.tsv" as csv separating by "\t"  // another separator
-using "./book.xlsx" as xlsx                   // every sheet of a workbook
-using "./book.ods" as ods                     // every table of an ODS
-using db run allUsers()                       // a declared query, typed rows
-using db run raw someSqlText                  // SQL built at runtime, a Table
+hive.file.csv("./data.csv", ",")     // a separated table
+hive.file.csv("./data.tsv", "\t")    // the separator is always named
+hive.file.xlsx("./book.xlsx")        // every sheet of a workbook
+hive.file.ods("./book.ods")          // every table of an ODS
+hive.sql.run(db, allUsers())         // a declared query, typed rows
+hive.sql.raw(db, someSqlText)        // SQL built at run time, a Table
 ```
 
-| form | yields |
+| call | yields |
 | --- | --- |
-| `using <path>` / `… as csv [separating by <sep>]` | `Result<Table, hive.TableError>` |
-| `using <path> as xlsx` / `as ods` | `Result<Table[dyn], hive.TableError>` |
-| `using <connection> run <query>` | whatever the query declared its rows to be |
-| `using <connection> run raw <text>` | `Result<Table, hive.sql.SqlError>` |
+| `hive.file.csv(path, separator)` | `Result<Table, hive.file.TableError>` |
+| `hive.file.xlsx(path)` / `hive.file.ods(path)` | `Result<Table[dyn], hive.file.TableError>` |
+| `hive.sql.run(connection, query)` | whatever the query declared its rows to be |
+| `hive.sql.raw(connection, text)` | `Result<Table, hive.sql.SqlError>` |
+
+**The separator is always written.** There are no optional parameters in Hive,
+and a comma is a choice like any other rather than the one the language makes on
+your behalf.
 
 A CSV is a single table, so it comes back as one `Table`. A **spreadsheet holds
 many**, so xlsx and ods come back as a `Table[dyn]` — one per sheet, in document
@@ -423,7 +431,8 @@ Times are plain `Int`s — Unix seconds.
 Talks to **SQLite** (the pure-Go `modernc.org/sqlite` driver, compiled straight
 into your executable) and **PostgreSQL** (`github.com/lib/pq`).
 
-* Querying uses `using <connection> run <query>`
+* Calling a `query` answers with a `hive.sql.Fragment<rows>`, and
+  `hive.sql.run(<connection>, <fragment>)` is what runs it
   ([04](04-declarations.md#45-query)).
 * `connect(driver, connString)` → `Result<SqlConnection, SqlError>`;
   `pool(driver, connString, maxOpen, maxIdle)`; `close(conn)`.

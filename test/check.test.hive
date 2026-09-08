@@ -435,6 +435,41 @@ test "a star is fine where there are no fields to disagree with" {
 	assert problemCount("query q(): void \{ INSERT INTO old SELECT * FROM users }\nproc main(): void \{ }") == 0
 }
 
+// --- Running a query ---------------------------------------------------------
+//
+// Calling a `query` answers with a `hive.sql.Fragment`, not with rows, and
+// `hive.sql.run` is what turns one into rows. Handing it anything else has to be
+// refused here: the emitter needs the row type before it can write the mapper,
+// so nothing downstream could report it.
+
+func withConn(body: Str): Str {
+	return "type User \{ id: Int name: Str }\nquery all(): User[dyn] \{ SELECT id, name FROM users }\nproc go(db: hive.sql.SqlConnection): void \{ " + body + " }\nproc main(): void \{ }"
+}
+
+test "a fragment is what `hive.sql.run` runs" {
+	assert problemCount(withConn("echo hive.sql.run(db, all())")) == 0
+	// It is a value, so it can be bound first and run later.
+	assert problemCount(withConn("q := all()  echo hive.sql.run(db, q)")) == 0
+	// And written down, which is the spelling `Query` could never have had:
+	// `Query` is `query` shouted, and a keyword is reserved however it is spelled.
+	assert problemCount(withConn("hive.sql.Fragment<User[dyn]> q = all()  echo hive.sql.run(db, q)")) == 0
+}
+
+test "`hive.sql.run` refuses what is not a fragment" {
+	assert opens(problem(withConn("echo hive.sql.run(db, 1)")),
+		"in `go`: the second argument of `hive.sql.run` is a `hive.sql.Fragment`")
+	assert opens(problem(withConn("echo hive.sql.run(db, \"SELECT 1\")")),
+		"in `go`: the second argument of `hive.sql.run` is a `hive.sql.Fragment`")
+	// Rows are not a fragment either — that is the whole point of the distinction.
+	assert opens(problem(withConn("q := all()  if hive.sql.run(db, q) is Result.Ok(rows) \{ echo hive.sql.run(db, rows) }")),
+		"in `go`: the second argument of `hive.sql.run` is a `hive.sql.Fragment`")
+}
+
+test "`hive.sql.run` wants both halves" {
+	assert opens(problem(withConn("echo hive.sql.run(db)")),
+		"in `go`: `hive.sql.run` takes a connection and the query to run")
+}
+
 // --- What a call can reach through ------------------------------------------
 //
 // Every one of these used to reach the Go toolchain instead, which reported it

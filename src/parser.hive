@@ -1555,7 +1555,6 @@ proc parsePrimary(ts: token.Token[], p: mut Parse): ast.Expr {
 	else if k == token.Kind.KwFalse() { advance(p) return ast.Expr.BoolLit(false) }
 	else if k == token.Kind.LBracket() { advance(p) return parseVectorLit(ts, p) }
 	else if k == token.Kind.KwAwait() { return parseAwaitAll(ts, p) }
-	else if k == token.Kind.KwUsing() { return parseUsing(ts, p) }
 	else if k == token.Kind.LParen() {
 		advance(p)
 		inner := parseExpr(ts, p)
@@ -1631,73 +1630,6 @@ proc parseAwaitAll(ts: token.Token[], p: mut Parse): ast.Expr {
 		}
 	}
 	return ast.Expr.AwaitAll(calls, ast.Expr.Absent())
-}
-
-// `using` reads a table, each form saying in the source what it is reading. The
-// operand is parsed at the postfix level so a call is consumed whole; none of
-// the words below is a postfix operator, so the source stops cleanly before them.
-proc parseUsing(ts: token.Token[], p: mut Parse): ast.Expr {
-	advance(p)
-	source := parsePostfix(ts, p)
-	if p.failed {
-		return ast.Expr.Absent()
-	}
-	word := wordAt(ts, p.pos)
-	if word == "as" {
-		advance(p)
-		return ast.Expr.UsingExpr(source, parseUsingFormat(ts, p))
-	}
-	if word == "run" {
-		advance(p)
-		// A query is camelCase, so `RAW` is this word shouted rather than
-		// something to call.
-		if miscased(wordAt(ts, p.pos), "raw") {
-			fail(ts, p, naming.miscasedKeyword(wordAt(ts, p.pos)) + ".")
-			return ast.Expr.Absent()
-		}
-		if wordAt(ts, p.pos) == "raw" {
-			advance(p)
-			return ast.Expr.UsingExpr(source, ast.UsingForm.Raw(parsePostfix(ts, p)))
-		}
-		return ast.Expr.UsingExpr(source, ast.UsingForm.RunQuery(parsePostfix(ts, p)))
-	}
-	if miscased(word, "as") || miscased(word, "run") {
-		fail(ts, p, naming.miscasedKeyword(word) + ".")
-		return ast.Expr.Absent()
-	}
-	// A bare `using <path>` is a comma-separated CSV.
-	return ast.Expr.UsingExpr(source, ast.UsingForm.Csv(ast.Expr.Absent()))
-}
-
-proc parseUsingFormat(ts: token.Token[], p: mut Parse): ast.UsingForm {
-	word := wordAt(ts, p.pos)
-	if word == "xlsx" {
-		advance(p)
-		return ast.UsingForm.Xlsx()
-	}
-	if word == "ods" {
-		advance(p)
-		return ast.UsingForm.Ods()
-	}
-	if word == "csv" {
-		advance(p)
-		if wordAt(ts, p.pos) != "separating" {
-			return ast.UsingForm.Csv(ast.Expr.Absent())
-		}
-		advance(p)
-		if wordAt(ts, p.pos) != "by" {
-			expected(ts, p, "`by` after `separating`")
-			return ast.UsingForm.Csv(ast.Expr.Absent())
-		}
-		advance(p)
-		return ast.UsingForm.Csv(parsePostfix(ts, p))
-	}
-	if miscased(word, "csv") || miscased(word, "xlsx") || miscased(word, "ods") {
-		fail(ts, p, naming.miscasedKeyword(word) + ".")
-		return ast.UsingForm.Csv(ast.Expr.Absent())
-	}
-	fail(ts, p, "`using ... as` names the format being read: `csv` (with an optional `separating by <separator>`), `xlsx` or `ods`")
-	return ast.UsingForm.Csv(ast.Expr.Absent())
 }
 
 // An interpolated string, with each captured `{...}` parsed as a full

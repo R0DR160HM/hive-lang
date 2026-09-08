@@ -95,7 +95,7 @@ func greet(name: Str, style: Greeting): Str {
 }
 ```
 
-A `func` **may perform I/O** — `echo`, `using`, `hive.net` are all allowed. It
+A `func` **may perform I/O** — `echo`, `hive.file`, `hive.net` are all allowed. It
 differs from a `proc` in exactly two ways:
 
 1. it cannot declare a mutex parameter (`v: mut T`); a `mut` value passed to a
@@ -144,7 +144,11 @@ func describe(shape: Shape): Str {
 ## 4.5 `query`
 
 A `query` is a `func` whose body is inline SQL and whose **return type describes
-its rows**.
+its rows**. Calling one does not touch a database: it answers with a
+`hive.sql.Fragment<rows>` — the text, and the values bound beside it — and
+`hive.sql.run` is what runs it. It is spelled `Fragment` rather than `Query`
+because `Query` is `query` shouted, and a keyword is reserved however it is
+spelled ([01](01-lexical.md#keywords)).
 
 ```hive
 type User {
@@ -165,11 +169,21 @@ query deleteUser(id: Int): void {  // a statement reports what it touched
 }
 ```
 
-| declared | `using conn run q(...)` yields |
-| --- | --- |
-| `Row[dyn]` (a declared type) | `Result<Row[dyn], hive.sql.SqlError>` |
-| `Str[dyn]`, `Int[dyn]`, … | that column, as a vector |
-| `void` | `Result<Int, hive.sql.SqlError>` — the rows it affected |
+| declared | `q(...)` is | `hive.sql.run(conn, q(...))` yields |
+| --- | --- | --- |
+| `Row[dyn]` (a declared type) | `Fragment<Row[dyn]>` | `Result<Row[dyn], hive.sql.SqlError>` |
+| `Str[dyn]`, `Int[dyn]`, … | `Fragment<Str[dyn]>` | that column, as a vector |
+| `void` | `Fragment<void>` | `Result<Int, hive.sql.SqlError>` — the rows it affected |
+
+Because a fragment is a value, it can be bound, passed and held like any other:
+
+```hive
+recent := findUser("Ada")            // a Fragment<User[dyn]>, nothing has run yet
+answer := hive.sql.run(db, recent)
+```
+
+A `hive.sql.run` handed anything that is not a fragment is a compile error
+naming what it got instead.
 
 Rules the compiler enforces:
 
@@ -186,6 +200,10 @@ Rules the compiler enforces:
   can change what a statement means. Queries are written with `?` and rewritten
   to `$1, $2, …` for PostgreSQL by the connection, which is what lets one
   declaration serve both drivers.
+* **A row type is not what a query answers with.** The declared type says what
+  the rows are; `hive.sql.Fragment<...>` is what the call answers with. Nothing can
+  mistake one for the other, and a query that is never run is a value that was
+  never used rather than a database call that silently did not happen.
 
 ### Optional filters: `WHERE { }`
 
@@ -217,7 +235,7 @@ Two things a `WHERE` block deliberately cannot do. A **column name or sort
 direction** can never be a parameter — `ORDER BY {col}` would sort by a constant
 string — so make the choices a variant type and dispatch to one query per
 ordering. And **SQL you genuinely assemble yourself** goes through
-`run raw`, which is untyped by construction and greppable by design.
+`hive.sql.raw`, which is untyped by construction and greppable by design.
 
 ## 4.6 `test`
 

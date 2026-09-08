@@ -82,7 +82,7 @@ All of it.
 | patterns | all four kinds, with narrowing through `&&`; a string template's holes both ways, with its regexes read at compile time and the whole template compiled once ([07](07-patterns.md)) |
 | builtins | all of [13](13-builtins.md) |
 | standard library | every module of [14](14-stdlib.md): `hive.conv`, `hive.math`, `hive.map`, `hive.file`, `hive.env`, `hive.term`, `hive.task`, `hive.time`, `hive.json`, `hive.crypto`, `hive.net`, `hive.syslink`, `hive.sql`, `hive.ui` and `hive.ui.scene` |
-| reading tables | every `using` form: CSV, xlsx, ods, a declared `query`, and `run raw` ([14.6](14-stdlib.md#146-reading-tables-using)) |
+| reading tables | every reader: `hive.file.csv`, `hive.file.xlsx`, `hive.file.ods`, `hive.sql.run` on a declared `query`, and `hive.sql.raw` ([14.6](14-stdlib.md#146-reading-tables)) |
 | testing | `test` declarations, `assert` with both sides, per-declaration coverage, the report ([16](16-testing.md)) |
 
 A module nothing reaches for is still not in the build: what a program links is

@@ -304,6 +304,9 @@ func goType(ty: types.Ty): Str {
 	else if ty is types.Ty.TMap(key, value) {
 		return "hive.Dict[" + goType(key) + ", " + goType(value) + "]"
 	}
+	// A query is the text and the values bound beside it. Its row type is a type
+	// and never a value, so nothing of it survives into the Go.
+	else if ty is types.Ty.TFragment(_) { return "hive.SqlFragment" }
 	else if ty is types.Ty.TLib(module, name) {
 		return "hive." + text.capitalise(module) + name
 	}
@@ -1260,8 +1263,6 @@ proc exprTail(em: mut Emit, env: infer.Env, e: ast.Expr, want: types.Ty): Str {
 		return awaitAll(em, env, calls, timeout, infer.typeOf(env, e))
 	} else if e is ast.Expr.WithType(value, target) {
 		return withType(em, env, value, target, want)
-	} else if e is ast.Expr.UsingExpr(source, form) {
-		return reading(em, env, source, form)
 	}
 	fail(em, "this expression has no lowering yet")
 	return "nil"
@@ -1473,47 +1474,21 @@ proc withType(em: mut Emit, env: infer.Env, value: ast.Expr, target: ast.TypeExp
 	return expr(em, env, value, want)
 }
 
-// Each `using` form lowers to the reader it names. The format is written in the
-// source rather than sniffed at runtime, which is why a program that only reads
-// CSV carries neither archive/zip nor encoding/xml.
-proc reading(em: mut Emit, env: infer.Env, source: ast.Expr, form: ast.UsingForm): Str {
-	if form is ast.UsingForm.Csv(separator) {
-		useModule(em, "csv")
-		mut sep := "\",\""
-		if separator is ast.Expr.Absent {
-		} else {
-			sep = expr(em, env, separator, types.Ty.TStr())
-		}
-		return "hive.ReadCsv(" + expr(em, env, source, types.Ty.TStr()) + ", " + sep + ")"
-	}
-	if form is ast.UsingForm.Xlsx {
-		useModule(em, "sheets")
-		return "hive.ReadXlsx(" + expr(em, env, source, types.Ty.TStr()) + ")"
-	}
-	if form is ast.UsingForm.Ods {
-		useModule(em, "sheets")
-		return "hive.ReadOds(" + expr(em, env, source, types.Ty.TStr()) + ")"
-	}
-	// SQL assembled at runtime has a shape nothing can know, so it comes back as
-	// a Table, header row and all.
-	if form is ast.UsingForm.Raw(sqlText) {
-		useModule(em, "sql")
-		return "hive.SqlQuery(" + expr(em, env, source, types.Ty.TUnknown()) + ", " + expr(em, env, sqlText, types.Ty.TStr()) + ")"
-	}
-	if form is ast.UsingForm.RunQuery(call) {
-		useModule(em, "sql")
-		connection := expr(em, env, source, types.Ty.TUnknown())
-		fragment := expr(em, env, call, types.Ty.TUnknown())
-		rows := infer.typeOf(env, call)
-		// What the query declared its rows to be decides how it runs: no rows is
-		// a statement reporting how many it touched, anything else is read row by
-		// row through the mapper its type derives.
+// What a query declared its rows to be decides how it runs: no rows is a
+// statement reporting how many it touched, anything else is read row by row
+// through the mapper its type derives.
+proc running(em: mut Emit, env: infer.Env, args: ast.Arg[]): Str {
+	connection := expr(em, env, argExpr(args, 0), types.Ty.TUnknown())
+	asked := argExpr(args, 1)
+	fragment := expr(em, env, asked, types.Ty.TUnknown())
+	held := infer.typeOf(env, asked)
+	if held is types.Ty.TFragment(rows) {
 		if rows is types.Ty.TVoid {
 			return "hive.SqlExec(" + connection + ", " + fragment + ")"
 		}
 		return "hive.SqlRows(" + connection + ", " + fragment + ", " + rowMapper(em, rows) + ")"
 	}
-	fail(em, "this `using` has no lowering")
+	fail(em, "`hive.sql.run` runs a `hive.sql.Fragment`, and this is " + types.show(held))
 	return "nil"
 }
 
@@ -2723,7 +2698,6 @@ func escapesInExpr(name: Str, e: ast.Expr): Bool {
 		return escapesInExpr(name, call) || escapesInExpr(name, ms)
 	}
 	if e is ast.Expr.WithType(value, _) { return escapesInExpr(name, value) }
-	if e is ast.Expr.UsingExpr(source, _) { return escapesInExpr(name, source) }
 	return false
 }
 
@@ -2961,19 +2935,6 @@ proc scanExpr(e: ast.Expr, sc: mut Scan): void {
 		scanExpr(ms, sc)
 	} else if e is ast.Expr.WithType(value, _) {
 		scanExpr(value, sc)
-	} else if e is ast.Expr.UsingExpr(source, form) {
-		scanExpr(source, sc)
-		scanUsing(form, sc)
-	}
-}
-
-proc scanUsing(form: ast.UsingForm, sc: mut Scan): void {
-	if form is ast.UsingForm.Csv(separator) {
-		scanExpr(separator, sc)
-	} else if form is ast.UsingForm.RunQuery(call) {
-		scanExpr(call, sc)
-	} else if form is ast.UsingForm.Raw(sqlText) {
-		scanExpr(sqlText, sc)
 	}
 }
 
@@ -3509,6 +3470,29 @@ proc libraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, args: ast
 	}
 	if module == "map" {
 		return mapCall(em, env, name, args)
+	}
+	// A table reader is named in the source rather than sniffed at run time,
+	// which is why a program that only reads CSV carries neither archive/zip nor
+	// encoding/xml.
+	if module == "file" && name == "csv" {
+		useModule(em, "csv")
+		return "hive.ReadCsv(" + expr(em, env, argExpr(args, 0), types.Ty.TStr()) + ", " + expr(em, env, argExpr(args, 1), types.Ty.TStr()) + ")"
+	}
+	if module == "file" && name == "xlsx" {
+		useModule(em, "sheets")
+		return "hive.ReadXlsx(" + expr(em, env, argExpr(args, 0), types.Ty.TStr()) + ")"
+	}
+	if module == "file" && name == "ods" {
+		useModule(em, "sheets")
+		return "hive.ReadOds(" + expr(em, env, argExpr(args, 0), types.Ty.TStr()) + ")"
+	}
+	// SQL assembled at run time has a shape nothing can know, so it comes back
+	// as a Table, header row and all.
+	if module == "sql" && name == "raw" {
+		return "hive.SqlQuery(" + expr(em, env, argExpr(args, 0), types.Ty.TUnknown()) + ", " + expr(em, env, argExpr(args, 1), types.Ty.TStr()) + ")"
+	}
+	if module == "sql" && name == "run" {
+		return running(em, env, args)
 	}
 	// A token's claims are a type of the program's own, so they are encoded by
 	// the codec that type derives and *then* signed.

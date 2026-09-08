@@ -217,13 +217,7 @@ type you choose: `hive.json.parse(text) with User`,
 clause, so it stays usable as an ordinary variable name. Correspondingly,
 `with Timeout` names a decode target, and a type may well be called that.
 
-## 5.9 `using`
-
-`using` reads a table, and each form says in the source what it is reading —
-which is what lets the compiler pick the reader and leave the machinery for the
-others out of the build. See [14](14-stdlib.md#146-reading-tables-using).
-
-## 5.10 Evaluation order
+## 5.9 Evaluation order
 
 Operands are evaluated left to right. `&&` and `||` short-circuit: the right
 operand is evaluated only if the left did not decide the answer. This is what
