@@ -363,6 +363,7 @@ proc checkTypeDecl(c: mut Check, fields: ast.Field[], variants: ast.Variant[]): 
 			report(c, "this type declares `{f.name}` twice")
 		}
 		append(seen, f.name)
+		checkReservedField(c, f.name)
 		checkMarks(c, f)
 	}
 	mut Str[dyn] variantNames = []
@@ -377,10 +378,33 @@ proc checkTypeDecl(c: mut Check, fields: ast.Field[], variants: ast.Variant[]): 
 			if indexOf(seen, f.name) is Result.Ok(_) {
 				report(c, "the variant `{v.name}` declares `{f.name}`, which the type already declares outside every variant — a shared field is added to each of them, so this one would be there twice")
 			}
+			checkReservedField(c, f.name)
 			checkMarks(c, f)
 		}
 	}
 	checkJsonNames(c, fields, variants)
+}
+
+// Every `fromJson` reads one `Str` of JSON, and answers with a `Result` the
+// caller has to open. Checked here because the emitter needs the type before it
+// can name a decoder, so nothing downstream could report a wrong one.
+proc checkDecodes(c: mut Check, env: infer.Env, what: Str, args: ast.Arg[]): void {
+	if len(args) != 1 {
+		report(c, what + " reads one `Str` of JSON, and this call passes " + countOf(len(args)))
+		return
+	}
+	if args bounds 0 {
+		fits(c, types.Ty.TStr(), infer.typeOf(env, args[0].value), "the argument of " + what)
+	}
+}
+
+// A field-less variant is a value, so `T.Variant.fromJson` would read as that
+// field of it as readily as the codec — and the two mean entirely different
+// things. One name is the whole cost of naming the codec at all.
+proc checkReservedField(c: mut Check, name: Str): void {
+	if name == "fromJson" {
+		report(c, "`fromJson` is the name of the codec every type derives, so a field cannot also be called that — `T.fromJson(text)` would name both this field and the decoder. Any other name is free")
+	}
 }
 
 // What a field's `--` annotations have to be true of. The parser has already
@@ -939,6 +963,11 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
 			return
 		}
 		if types.findType(env.table, head) is Result.Ok(info) {
+			// `T.fromJson(text)` is the codec, not a variant.
+			if field == "fromJson" {
+				checkDecodes(c, env, "`" + head + ".fromJson`", args)
+				return
+			}
 			if types.findVariant(env.table, head, field) is Result.Ok(fields) {
 				checkFieldArguments(c, env, head + "." + field, fields, args)
 			} else {
@@ -948,6 +977,19 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
 		}
 	}
 	if subject is ast.Expr.Member(root, module) {
+		// `T.Variant.fromJson(text)` — the one variant's own codec.
+		if field == "fromJson" {
+			if root is ast.Expr.Ident(head) {
+				if types.findType(env.table, head) is Result.Ok(_) {
+					if types.findVariant(env.table, head, module) is Result.Ok(_) {
+						checkDecodes(c, env, "`" + head + "." + module + ".fromJson`", args)
+					} else {
+						report(c, "`" + head + "` has no variant `{module}`, so there is no `{module}.fromJson` to call. Its variants are " + join(types.variantNames(env.table, head), ", "))
+					}
+					return
+				}
+			}
+		}
 		if root is ast.Expr.Ident(hiveName) {
 			if hiveName == "hive" {
 				if stdlib.isKnownModule(module) == false {

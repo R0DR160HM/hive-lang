@@ -186,8 +186,7 @@ mul-expr    = unary-expr { ( "*" | "/" | "%" ) unary-expr } ;
 unary-expr  = "-" unary-expr | "!" unary-expr | pow-expr ;
 pow-expr    = with-expr [ "**" unary-expr ] ;
 
-with-expr   = postfix-expr [ "with" "timeout" add-expr
-                           | "with" type ] ;
+with-expr   = postfix-expr [ "with" "timeout" add-expr ] ;
 
 postfix-expr= primary { call-suffix | index-suffix | member-suffix } ;
 call-suffix = "(" [ args ] ")" ;

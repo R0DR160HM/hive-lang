@@ -1,9 +1,9 @@
 # The Hive Language Specification
 
-Hive is a memory-managed, table-based language that compiles to Go. Tables are a
-built-in idea rather than a library, values behave like values, and a good deal
-of what other languages leave to runtime — every vector index, every branch of a
-match, the columns a SQL query comes back with — is settled at compile time.
+Hive is a memory-managed language that compiles to Go. Values behave like
+values, and a good deal of what other languages leave to runtime — every vector
+index, every branch of a match, the columns a SQL query comes back with — is
+settled at compile time.
 
 This directory is the language's normative reference. It describes Hive as the
 language is, not as any one compiler happens to implement it; where the two

@@ -1732,8 +1732,8 @@ func jsonSource(): Str {
 			return "an object"
 		}
 
-		// JsonParse backs hive.json.parse(text) with T; the decoder argument is
-		// derived from T at compile time.
+		// JsonParse backs every fromJson and hive.json.flatten; the decoder
+		// argument is what the call named, derived at compile time.
 		func JsonParse[T any](text string, dec func(JsonValue, string) (T, *JsonJsonError)) Result[T, JsonJsonError] {
 			d := json.NewDecoder(strings.NewReader(text))
 			d.UseNumber()
@@ -2970,18 +2970,6 @@ func cryptoSource(): Str {
 			return input + "." + sig
 		}
 
-		// jwtParsePayload runs a derived decoder over a raw JSON payload.
-		func jwtParsePayload[T any](payload []byte, dec func(JsonValue, string) (T, *JsonJsonError)) (T, *JsonJsonError) {
-			var zero T
-			d := json.NewDecoder(strings.NewReader(string(payload)))
-			d.UseNumber()
-			v, err := parseJsonValue(d)
-			if err != nil {
-				return zero, &JsonJsonError{Path: "$", Expected: "valid JSON", Found: err.Error()}
-			}
-			return dec(v, "$")
-		}
-
 		// jwtCheckTime enforces the exp/nbf registered claims against the current
 		// time. Absent claims are skipped.
 		func jwtCheckTime(payload []byte) *CryptoCryptoError {
@@ -3006,11 +2994,14 @@ func cryptoSource(): Str {
 			return nil
 		}
 
-		// CryptoJwtVerify checks an HS256 token's signature and its exp/nbf claims against
-		// the current time, then decodes the payload into T with the derived decoder.
-		func CryptoJwtVerify[T any](token string, secret string, dec func(JsonValue, string) (T, *JsonJsonError)) Result[T, CryptoCryptoError] {
-			fail := func(reason, msg string) Result[T, CryptoCryptoError] {
-				return Err[T, CryptoCryptoError](CryptoCryptoError{Reason: reason, Message: msg})
+		// CryptoJwtVerify checks an HS256 token's signature and its exp/nbf claims
+		// against the current time, and stops there.
+		// The claims come back as the text they arrived as. What shape they are is
+		// the caller's business, decoded with the codec their type derives — which
+		// is why nothing in this file knows about JSON codecs any more.
+		func CryptoJwtVerify(token string, secret string) Result[string, CryptoCryptoError] {
+			fail := func(reason, msg string) Result[string, CryptoCryptoError] {
+				return Err[string, CryptoCryptoError](CryptoCryptoError{Reason: reason, Message: msg})
 			}
 			parts := strings.Split(token, ".")
 			if len(parts) != 3 {
@@ -3044,31 +3035,23 @@ func cryptoSource(): Str {
 				return fail("Malformed", "payload is not valid base64url")
 			}
 			if jerr := jwtCheckTime(payload); jerr != nil {
-				return Err[T, CryptoCryptoError](*jerr)
+				return Err[string, CryptoCryptoError](*jerr)
 			}
-			out, jerr := jwtParsePayload(payload, dec)
-			if jerr != nil {
-				return fail("ClaimType", jerr.Error())
-			}
-			return Ok[T, CryptoCryptoError](out)
+			return Ok[string, CryptoCryptoError](string(payload))
 		}
 
-		// CryptoJwtDecode decodes a token's payload into T WITHOUT verifying its signature
-		// or time claims. Never trust the result for authorization.
-		func CryptoJwtDecode[T any](token string, dec func(JsonValue, string) (T, *JsonJsonError)) Result[T, CryptoCryptoError] {
+		// CryptoJwtDecode reads a token's payload WITHOUT verifying its signature or
+		// its time claims. Never trust the result for authorization.
+		func CryptoJwtDecode(token string) Result[string, CryptoCryptoError] {
 			parts := strings.Split(token, ".")
 			if len(parts) < 2 {
-				return Err[T, CryptoCryptoError](CryptoCryptoError{Reason: "Malformed", Message: "expected at least two dot-separated segments"})
+				return Err[string, CryptoCryptoError](CryptoCryptoError{Reason: "Malformed", Message: "expected at least two dot-separated segments"})
 			}
 			payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 			if err != nil {
-				return Err[T, CryptoCryptoError](CryptoCryptoError{Reason: "Malformed", Message: "payload is not valid base64url"})
+				return Err[string, CryptoCryptoError](CryptoCryptoError{Reason: "Malformed", Message: "payload is not valid base64url"})
 			}
-			out, jerr := jwtParsePayload(payload, dec)
-			if jerr != nil {
-				return Err[T, CryptoCryptoError](CryptoCryptoError{Reason: "ClaimType", Message: jerr.Error()})
-			}
-			return Ok[T, CryptoCryptoError](out)
+			return Ok[string, CryptoCryptoError](string(payload))
 		}
 
 		// CryptoJwtHeader decodes a token's header (alg/typ/kid) without verifying it —

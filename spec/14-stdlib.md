@@ -236,12 +236,18 @@ widest row in their sheet.
 
 Built on the idea that Hive's type declarations *are* the JSON schema.
 
-* `parse(text) with T` derives a decoder for `T` at compile time →
+* `T.fromJson(text)` is the decoder `T`'s declaration derives, named →
   `Result<T, hive.json.JsonError>`. Missing fields, wrong types and wrong static
   vector lengths become errors carrying the exact `path` that failed; JSON fields
   the type doesn't declare are ignored. Variants decode as
   `{"VariantName": {...}}`, and JSON `null` selects a type's first field-less
   variant.
+* `T.Variant.fromJson(text)` reads **one** variant's payload, without the key the
+  whole union is wrapped in — for a document whose variant the caller already
+  knows. It answers with the union all the same, since a variant is not a type of
+  its own.
+* `fromJson` is therefore a **reserved field name**: a type declaring one would
+  make `T.Variant.fromJson` mean two things at once.
 * `encode(value)` derives the encoder from the static type and therefore cannot
   fail.
 
@@ -259,11 +265,11 @@ type User {
 }
 ```
 
-Neither reaches `parse(text) with Table`, which flattens a document rather than
-decoding a declared shape.
+Neither reaches `flatten(text)`, which flattens a document rather than decoding
+a declared shape.
 * `table(text)` reads a JSON array of flat objects as a headered `Table`.
-* `parse(text) with Table` flattens a whole document into `[path, value]` rows,
-  looked up with `get(table, "keys.layout")` and re-nested by the encoder.
+* `flatten(text)` flattens a whole document into `[path, value]` rows, looked up
+  with `get(table, "keys.layout")` and re-nested by the encoder.
 
 ## 14.8 `hive.crypto`
 
@@ -283,11 +289,13 @@ Pure, so it works in a `func` too. Fallible operations return
 * **Encoding** — `base64Encode`, `base64Decode`.
 * **Random** — `randomHex(bytes)`.
 * **JWT** — `jwtSign(claims, secret)` (HS256, compact, cannot fail);
-  `jwtVerify(token, secret) with T` checks the signature and the `exp`/`nbf`
-  claims, then decodes into `T` — only HS256 is accepted, so `alg: none` and
-  algorithm confusion are rejected outright; `jwtDecode(token) with T` decodes
+  `jwtVerify(token, secret)` checks the signature and the `exp`/`nbf` claims and
+  answers with the claims as a `Str` — only HS256 is accepted, so `alg: none` and
+  algorithm confusion are rejected outright; `jwtDecode(token)` reads them
   **without verifying**, for inspection only; `jwtHeader(token)` reads
-  `alg`/`typ`/`kid`.
+  `alg`/`typ`/`kid`. Reading a token stops at the claims: what shape they are is
+  the caller's business, so `T.fromJson(claims)` is what says so, and a bad
+  signature stays a `CryptoError` while wrong-shaped claims are a `JsonError`.
 
 ## 14.9 `hive.net`
 

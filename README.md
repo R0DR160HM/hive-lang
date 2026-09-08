@@ -10,9 +10,10 @@
 
 The Hive compiler, written in Hive.
 
-Hive is a memory-managed, table-based language that compiles to Go. Tables are a
-built-in idea rather than a library, values behave like values, and a good deal
-of what other languages leave to runtime is settled at compile time instead.
+Hive is a memory-managed language. Values behave like values, and a good deal of
+what other languages leave to runtime — every vector index, every branch of a
+match, the columns a SQL query comes back with — is settled at compile time
+instead.
 This directory holds two things: the [specification](spec/) of the language, and
 a compiler for it written in the language it compiles.
 
