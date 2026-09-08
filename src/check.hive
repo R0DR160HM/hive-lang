@@ -131,7 +131,7 @@ proc checkRowType(c: mut Check, declared: types.Ty): void {
 			report(c, "a query answers with rows of a declared type, and `{name}` is not one")
 			return
 		}
-		// A single column, or a Table from `run raw`.
+		// A single column, or a Table from `hive.sql.raw`.
 		return
 	}
 	report(c, "a query answers with `T[dyn]` for one row type, `Str[dyn]` (or another scalar) for a single column, or `void` for a statement — and this is " + types.show(declared))
@@ -363,6 +363,7 @@ proc checkTypeDecl(c: mut Check, fields: ast.Field[], variants: ast.Variant[]): 
 			report(c, "this type declares `{f.name}` twice")
 		}
 		append(seen, f.name)
+		checkReservedField(c, f.name)
 		checkMarks(c, f)
 	}
 	mut Str[dyn] variantNames = []
@@ -377,10 +378,33 @@ proc checkTypeDecl(c: mut Check, fields: ast.Field[], variants: ast.Variant[]): 
 			if indexOf(seen, f.name) is Result.Ok(_) {
 				report(c, "the variant `{v.name}` declares `{f.name}`, which the type already declares outside every variant — a shared field is added to each of them, so this one would be there twice")
 			}
+			checkReservedField(c, f.name)
 			checkMarks(c, f)
 		}
 	}
 	checkJsonNames(c, fields, variants)
+}
+
+// Every `fromJson` reads one `Str` of JSON, and answers with a `Result` the
+// caller has to open. Checked here because the emitter needs the type before it
+// can name a decoder, so nothing downstream could report a wrong one.
+proc checkDecodes(c: mut Check, env: infer.Env, what: Str, args: ast.Arg[]): void {
+	if len(args) != 1 {
+		report(c, what + " reads one `Str` of JSON, and this call passes " + countOf(len(args)))
+		return
+	}
+	if args bounds 0 {
+		fits(c, types.Ty.TStr(), infer.typeOf(env, args[0].value), "the argument of " + what)
+	}
+}
+
+// A field-less variant is a value, so `T.Variant.fromJson` would read as that
+// field of it as readily as the codec — and the two mean entirely different
+// things. One name is the whole cost of naming the codec at all.
+proc checkReservedField(c: mut Check, name: Str): void {
+	if name == "fromJson" {
+		report(c, "`fromJson` is the name of the codec every type derives, so a field cannot also be called that — `T.fromJson(text)` would name both this field and the decoder. Any other name is free")
+	}
 }
 
 // What a field's `--` annotations have to be true of. The parser has already
@@ -939,6 +963,11 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
 			return
 		}
 		if types.findType(env.table, head) is Result.Ok(info) {
+			// `T.fromJson(text)` is the codec, not a variant.
+			if field == "fromJson" {
+				checkDecodes(c, env, "`" + head + ".fromJson`", args)
+				return
+			}
 			if types.findVariant(env.table, head, field) is Result.Ok(fields) {
 				checkFieldArguments(c, env, head + "." + field, fields, args)
 			} else {
@@ -948,6 +977,19 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
 		}
 	}
 	if subject is ast.Expr.Member(root, module) {
+		// `T.Variant.fromJson(text)` — the one variant's own codec.
+		if field == "fromJson" {
+			if root is ast.Expr.Ident(head) {
+				if types.findType(env.table, head) is Result.Ok(_) {
+					if types.findVariant(env.table, head, module) is Result.Ok(_) {
+						checkDecodes(c, env, "`" + head + "." + module + ".fromJson`", args)
+					} else {
+						report(c, "`" + head + "` has no variant `{module}`, so there is no `{module}.fromJson` to call. Its variants are " + join(types.variantNames(env.table, head), ", "))
+					}
+					return
+				}
+			}
+		}
 		if root is ast.Expr.Ident(hiveName) {
 			if hiveName == "hive" {
 				if stdlib.isKnownModule(module) == false {
@@ -980,6 +1022,9 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
 // generated file in terms of Go's own types — and a message that only said
 // `float64` would leave the reader hunting for a conversion nobody mentioned.
 proc checkLibraryArguments(c: mut Check, env: infer.Env, module: Str, name: Str, args: ast.Arg[]): void {
+	if module == "sql" && name == "run" {
+		checkRunsQuery(c, env, args)
+	}
 	wanted := stdlib.paramsOf(module, name)
 	mut i := 0
 	for each a in args {
@@ -991,6 +1036,31 @@ proc checkLibraryArguments(c: mut Check, env: infer.Env, module: Str, name: Str,
 			fits(c, wanted[i], infer.typeOf(env, a.value), "the " + nth(i) + " argument of `hive.{module}.{name}`")
 		}
 		i = i + 1
+	}
+}
+
+// `hive.sql.run` is the one library call whose second argument has a shape
+// rather than a type: a fragment of some row type, which is what tells it how to
+// read what comes back. Nothing downstream can refuse a wrong one — the emitter
+// needs the row type before it can write the mapper — so it is refused here.
+proc checkRunsQuery(c: mut Check, env: infer.Env, args: ast.Arg[]): void {
+	if len(args) < 2 {
+		report(c, "`hive.sql.run` takes a connection and the query to run, and this names only one of the two")
+		return
+	}
+	if args bounds 1 {
+		asked := args[1].value
+		if asked is ast.Expr.Hole {
+			return
+		}
+		held := infer.typeOf(env, asked)
+		if held is types.Ty.TFragment(_) {
+			return
+		}
+		if held is types.Ty.TUnknown {
+			return
+		}
+		report(c, "the second argument of `hive.sql.run` is a `hive.sql.Fragment` — what calling a `query` declaration answers with — and this is " + types.show(held))
 	}
 }
 

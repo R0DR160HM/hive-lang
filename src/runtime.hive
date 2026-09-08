@@ -51,9 +51,10 @@ func assetsSource(): Str {
 
 /// The Go for a module of the runtime, or `""` when this compiler does not
 /// carry it. Most are named by a `hive.<module>` a program referenced; `csv` and
-/// `sheets` are named by a `using` form instead, which is the same idea — the
-/// source says which reader it wants, so a program that reads a CSV does not
-/// carry a spreadsheet's zip and XML.
+/// `sheets` are named by the reader a program called — `hive.file.csv`,
+/// `hive.file.xlsx`, `hive.file.ods` — which is the same idea: the source says
+/// which reader it wants, so a program that reads a CSV does not carry a
+/// spreadsheet's zip and XML.
 func moduleSource(module: Str): Str {
 	return backticked(moduleText(module))
 }
@@ -179,16 +180,16 @@ func coreHeader(): Str {
 		// all arrive as.
 		type Table = [][]string
 
-		// TableError is what a using that could not read its table answers
-		// with: the path it was about, and what went wrong with it. It is spelled
-		// hive.TableError rather than under a module because a using names no
-		// module — the form in the source is what picks the reader.
-		type TableError struct {
+		// FileTableError is what a table that could not be read answers with: the
+		// path it was about, and what went wrong with it. A file that opened and
+		// then turned out not to hold what it said it did is not a filesystem
+		// failure, which is why hive.file keeps an error apart from FileError.
+		type FileTableError struct {
 			Path    string
 			Message string
 		}
 
-		func (e TableError) Error() string {
+		func (e FileTableError) Error() string {
 			return "hive: table error for " + e.Path + ": " + e.Message
 		}
 	`
@@ -1731,8 +1732,8 @@ func jsonSource(): Str {
 			return "an object"
 		}
 
-		// JsonParse backs hive.json.parse(text) with T; the decoder argument is
-		// derived from T at compile time.
+		// JsonParse backs every fromJson and hive.json.flatten; the decoder
+		// argument is what the call named, derived at compile time.
 		func JsonParse[T any](text string, dec func(JsonValue, string) (T, *JsonJsonError)) Result[T, JsonJsonError] {
 			d := json.NewDecoder(strings.NewReader(text))
 			d.UseNumber()
@@ -1900,7 +1901,7 @@ func jsonSource(): Str {
 		}
 
 		// JsonTable reads a JSON array of flat objects as a headered Table (the same
-		// shape using produces from a CSV). Every object must carry the same keys
+		// shape a CSV read produces). Every object must carry the same keys
 		// as the first one, and every value must be a leaf.
 		func JsonTable(text string) Result[Table, JsonJsonError] {
 			d := json.NewDecoder(strings.NewReader(text))
@@ -2119,7 +2120,7 @@ func jsonSource(): Str {
 
 // --- Reading a table ---------------------------------------------------------
 
-/// The Go for `using <path>` and `using <path> as csv separating by <sep>`.
+/// The Go for `hive.file.csv(<path>, <separator>)`.
 /// Separate from the spreadsheet readers because the two have nothing in
 /// common but the answer they give: this is one standard library call, and
 /// that one is a zip archive full of XML.
@@ -2163,16 +2164,16 @@ func csvSource(): Str {
 		)
 
 		// ReadCsv reads a UTF-8 separated-value file and hands its rows back as a
-		// Table. The separator is whatever separating by said, or a comma when it
-		// said nothing.
+		// Table. The separator is whatever the call named; an empty one leaves the
+		// comma encoding/csv starts with.
 		//
 		// Rows are read at the length they have. A file whose rows are ragged is a
 		// table with ragged rows rather than an error about a file the program can
 		// perfectly well read, which is the same answer hive.file gives.
-		func ReadCsv(path string, separator string) Result[Table, TableError] {
+		func ReadCsv(path string, separator string) Result[Table, FileTableError] {
 			raw, err := os.ReadFile(path)
 			if err != nil {
-				return Err[Table, TableError](TableError{Path: path, Message: err.Error()})
+				return Err[Table, FileTableError](FileTableError{Path: path, Message: err.Error()})
 			}
 			reader := csv.NewReader(strings.NewReader(string(raw)))
 			reader.FieldsPerRecord = -1
@@ -2181,17 +2182,17 @@ func csvSource(): Str {
 			}
 			rows, err := reader.ReadAll()
 			if err != nil {
-				return Err[Table, TableError](TableError{Path: path, Message: err.Error()})
+				return Err[Table, FileTableError](FileTableError{Path: path, Message: err.Error()})
 			}
-			return Ok[Table, TableError](rows)
+			return Ok[Table, FileTableError](rows)
 		}
 	`
 }
 
-/// The Go for `using <path> as xlsx` and `as ods`: a workbook is a zip archive
-/// of XML, and both formats are read out of one without a dependency. A
-/// spreadsheet holds many tables, so both answer with one Table per sheet, in
-/// document order.
+/// The Go for `hive.file.xlsx(<path>)` and `hive.file.ods(<path>)`: a workbook is
+/// a zip archive of XML, and both formats are read out of one without a
+/// dependency. A spreadsheet holds many tables, so both answer with one Table per
+/// sheet, in document order.
 func sheetsSource(): Str {
 	return `
 		package hive
@@ -2210,10 +2211,10 @@ func sheetsSource(): Str {
 		// The zip container both formats share
 		// ---------------------------------------------------------------------------
 
-		func openSheets(path string) (*zip.ReadCloser, *TableError) {
+		func openSheets(path string) (*zip.ReadCloser, *FileTableError) {
 			archive, err := zip.OpenReader(path)
 			if err != nil {
-				return nil, &TableError{Path: path, Message: err.Error()}
+				return nil, &FileTableError{Path: path, Message: err.Error()}
 			}
 			return archive, nil
 		}
@@ -2335,14 +2336,14 @@ func sheetsSource(): Str {
 		}
 
 		// ReadXlsx reads every sheet of an .xlsx workbook, in workbook order, and hands
-		// back one Table per sheet. Backs using <path> as xlsx.
-		func ReadXlsx(path string) Result[[]Table, TableError] {
-			fail := func(message string) Result[[]Table, TableError] {
-				return Err[[]Table, TableError](TableError{Path: path, Message: message})
+		// back one Table per sheet. Backs hive.file.xlsx.
+		func ReadXlsx(path string) Result[[]Table, FileTableError] {
+			fail := func(message string) Result[[]Table, FileTableError] {
+				return Err[[]Table, FileTableError](FileTableError{Path: path, Message: message})
 			}
 			archive, openErr := openSheets(path)
 			if openErr != nil {
-				return Err[[]Table, TableError](*openErr)
+				return Err[[]Table, FileTableError](*openErr)
 			}
 			defer archive.Close()
 
@@ -2411,7 +2412,7 @@ func sheetsSource(): Str {
 				}
 				tables = append(tables, padTable(rows))
 			}
-			return Ok[[]Table, TableError](tables)
+			return Ok[[]Table, FileTableError](tables)
 		}
 
 		// A relationship target is relative to xl/ unless it is rooted at the archive.
@@ -2624,14 +2625,14 @@ func sheetsSource(): Str {
 		const odsMaxRepeat = 4096
 
 		// ReadOds reads every table of an OpenDocument spreadsheet, in document order,
-		// and hands back one Table per table. Backs using <path> as ods.
-		func ReadOds(path string) Result[[]Table, TableError] {
-			fail := func(message string) Result[[]Table, TableError] {
-				return Err[[]Table, TableError](TableError{Path: path, Message: message})
+		// and hands back one Table per table. Backs hive.file.ods.
+		func ReadOds(path string) Result[[]Table, FileTableError] {
+			fail := func(message string) Result[[]Table, FileTableError] {
+				return Err[[]Table, FileTableError](FileTableError{Path: path, Message: message})
 			}
 			archive, openErr := openSheets(path)
 			if openErr != nil {
-				return Err[[]Table, TableError](*openErr)
+				return Err[[]Table, FileTableError](*openErr)
 			}
 			defer archive.Close()
 
@@ -2650,7 +2651,7 @@ func sheetsSource(): Str {
 			for _, table := range content.Tables {
 				tables = append(tables, padTable(odsRows(table)))
 			}
-			return Ok[[]Table, TableError](tables)
+			return Ok[[]Table, FileTableError](tables)
 		}
 
 		// odsRows expands a table's repeat counts. Runs of empty rows are held back and
@@ -2969,18 +2970,6 @@ func cryptoSource(): Str {
 			return input + "." + sig
 		}
 
-		// jwtParsePayload runs a derived decoder over a raw JSON payload.
-		func jwtParsePayload[T any](payload []byte, dec func(JsonValue, string) (T, *JsonJsonError)) (T, *JsonJsonError) {
-			var zero T
-			d := json.NewDecoder(strings.NewReader(string(payload)))
-			d.UseNumber()
-			v, err := parseJsonValue(d)
-			if err != nil {
-				return zero, &JsonJsonError{Path: "$", Expected: "valid JSON", Found: err.Error()}
-			}
-			return dec(v, "$")
-		}
-
 		// jwtCheckTime enforces the exp/nbf registered claims against the current
 		// time. Absent claims are skipped.
 		func jwtCheckTime(payload []byte) *CryptoCryptoError {
@@ -3005,11 +2994,14 @@ func cryptoSource(): Str {
 			return nil
 		}
 
-		// CryptoJwtVerify checks an HS256 token's signature and its exp/nbf claims against
-		// the current time, then decodes the payload into T with the derived decoder.
-		func CryptoJwtVerify[T any](token string, secret string, dec func(JsonValue, string) (T, *JsonJsonError)) Result[T, CryptoCryptoError] {
-			fail := func(reason, msg string) Result[T, CryptoCryptoError] {
-				return Err[T, CryptoCryptoError](CryptoCryptoError{Reason: reason, Message: msg})
+		// CryptoJwtVerify checks an HS256 token's signature and its exp/nbf claims
+		// against the current time, and stops there.
+		// The claims come back as the text they arrived as. What shape they are is
+		// the caller's business, decoded with the codec their type derives — which
+		// is why nothing in this file knows about JSON codecs any more.
+		func CryptoJwtVerify(token string, secret string) Result[string, CryptoCryptoError] {
+			fail := func(reason, msg string) Result[string, CryptoCryptoError] {
+				return Err[string, CryptoCryptoError](CryptoCryptoError{Reason: reason, Message: msg})
 			}
 			parts := strings.Split(token, ".")
 			if len(parts) != 3 {
@@ -3043,31 +3035,23 @@ func cryptoSource(): Str {
 				return fail("Malformed", "payload is not valid base64url")
 			}
 			if jerr := jwtCheckTime(payload); jerr != nil {
-				return Err[T, CryptoCryptoError](*jerr)
+				return Err[string, CryptoCryptoError](*jerr)
 			}
-			out, jerr := jwtParsePayload(payload, dec)
-			if jerr != nil {
-				return fail("ClaimType", jerr.Error())
-			}
-			return Ok[T, CryptoCryptoError](out)
+			return Ok[string, CryptoCryptoError](string(payload))
 		}
 
-		// CryptoJwtDecode decodes a token's payload into T WITHOUT verifying its signature
-		// or time claims. Never trust the result for authorization.
-		func CryptoJwtDecode[T any](token string, dec func(JsonValue, string) (T, *JsonJsonError)) Result[T, CryptoCryptoError] {
+		// CryptoJwtDecode reads a token's payload WITHOUT verifying its signature or
+		// its time claims. Never trust the result for authorization.
+		func CryptoJwtDecode(token string) Result[string, CryptoCryptoError] {
 			parts := strings.Split(token, ".")
 			if len(parts) < 2 {
-				return Err[T, CryptoCryptoError](CryptoCryptoError{Reason: "Malformed", Message: "expected at least two dot-separated segments"})
+				return Err[string, CryptoCryptoError](CryptoCryptoError{Reason: "Malformed", Message: "expected at least two dot-separated segments"})
 			}
 			payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 			if err != nil {
-				return Err[T, CryptoCryptoError](CryptoCryptoError{Reason: "Malformed", Message: "payload is not valid base64url"})
+				return Err[string, CryptoCryptoError](CryptoCryptoError{Reason: "Malformed", Message: "payload is not valid base64url"})
 			}
-			out, jerr := jwtParsePayload(payload, dec)
-			if jerr != nil {
-				return Err[T, CryptoCryptoError](CryptoCryptoError{Reason: "ClaimType", Message: jerr.Error()})
-			}
-			return Ok[T, CryptoCryptoError](out)
+			return Ok[string, CryptoCryptoError](string(payload))
 		}
 
 		// CryptoJwtHeader decodes a token's header (alg/typ/kid) without verifying it —
@@ -6483,7 +6467,7 @@ func uiSource(): Str {
 		// --- Data -------------------------------------------------------------------
 
 		// The table takes the headered Table every other part of the language hands
-		// back — a CSV read with using, a SQL result, a JSON document — so putting one
+		// back — a CSV read, a SQL result, a JSON document — so putting one
 		// on screen costs one call.
 		func UiTable(attrs []UiAttr, rows Table) UiView {
 			return UiView{Kind: "table", Attrs: attrs, Rows: rows}

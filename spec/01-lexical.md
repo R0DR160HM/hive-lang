@@ -39,7 +39,7 @@ Every keyword is lower case **and only lower case**:
 
 ```
 import   proc     func     query    test     type
-if       else     return   is       using    with
+if       else     return   is       with
 void     true     false    echo     assert   panic
 dyn      mut      async    await    for      in
 each     bounds   break    continue
@@ -73,11 +73,10 @@ another in Pascal case would make `Is` and `is`, or `Type` and `type`, two
 different things that read alike — and the mistake would surface as a parse
 error somewhere else entirely.
 
-Three words are keywords **only where they are written**, and are ordinary
-identifiers everywhere else: `as` (after an import path), `run` and `raw` (after
-a `using` connection), `csv`, `xlsx`, `ods` and `separating`/`by` (in a `using`
-clause), and `timeout` (in `with timeout`). Because they are not reserved, a
-variable may be called `timeout`.
+Two words are keywords **only where they are written**, and are ordinary
+identifiers everywhere else: `as` (after an import path) and `timeout` (in
+`with timeout`). Because they are not reserved, a variable may be called
+`timeout`.
 
 ### Operators and punctuation
 

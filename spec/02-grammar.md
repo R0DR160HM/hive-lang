@@ -186,8 +186,7 @@ mul-expr    = unary-expr { ( "*" | "/" | "%" ) unary-expr } ;
 unary-expr  = "-" unary-expr | "!" unary-expr | pow-expr ;
 pow-expr    = with-expr [ "**" unary-expr ] ;
 
-with-expr   = postfix-expr [ "with" "timeout" add-expr
-                           | "with" type ] ;
+with-expr   = postfix-expr [ "with" "timeout" add-expr ] ;
 
 postfix-expr= primary { call-suffix | index-suffix | member-suffix } ;
 call-suffix = "(" [ args ] ")" ;
@@ -203,7 +202,6 @@ primary     = INT | FLOAT | STRING | INTERP | ATOM | "true" | "false"
             | "_"
             | vector-lit
             | await-all
-            | using-expr
             | "(" expression ")" ;
 
 vector-lit  = "[" [ expression { "," expression } ] "]" ;
@@ -249,23 +247,7 @@ not sit side by side. A hole is lexed rather than parsed ([01](01-lexical.md#a-r
 `{name is (re)}` captures its regex raw, so the grammar above never sees inside
 those parentheses. See [07](07-patterns.md).
 
-## 2.8 `using`
-
-```
-using-expr  = "using" postfix-expr [ using-tail ] ;
-
-using-tail  = "as" "csv" [ "separating" "by" postfix-expr ]
-            | "as" "xlsx"
-            | "as" "ods"
-            | "run" postfix-expr
-            | "run" "raw" postfix-expr ;
-```
-
-The operand is parsed at the postfix level, so a call is consumed whole and none
-of the words above can be mistaken for an operator. A bare `using <path>` is a
-comma-separated CSV. See [14](14-stdlib.md#146-reading-tables-using).
-
-## 2.9 Query bodies
+## 2.8 Query bodies
 
 A `query` body is SQL, captured whole by the lexer and parsed by its own small
 grammar:

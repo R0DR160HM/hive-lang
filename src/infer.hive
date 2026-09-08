@@ -118,16 +118,18 @@ func typeOfTail(env: Env, e: ast.Expr): types.Ty {
 			return typeOf(env, call)
 		}
 		return timedResult(typeOf(env, call))
-	} else if e is ast.Expr.WithType(value, target) {
-		return withTypeResult(env, value, target)
-	} else if e is ast.Expr.UsingExpr(_, form) {
-		return usingType(env, form)
 	}
 	return types.Ty.TUnknown()
 }
 
 func timedResult(value: types.Ty): types.Ty {
 	return types.Ty.TResult(value, types.Ty.TLib("task", "TimeoutError"))
+}
+
+/// What `<Type>.fromJson` and `<Type>.<Variant>.fromJson` answer with. A variant
+/// is not a type of its own, so both are a `Result` of the union.
+func decoded(typeName: Str): types.Ty {
+	return types.Ty.TResult(types.Ty.TNamed(typeName), types.Ty.TLib("json", "JsonError"))
 }
 
 func allSends(env: Env, calls: ast.Expr[]): Bool {
@@ -314,6 +316,13 @@ func memberCallType(env: Env, subject: ast.Expr, field: Str, argTypes: types.Ty[
 		if head == "Result" {
 			return resultConstructor(field, argTypes)
 		}
+		// `User.fromJson(text)` names the codec the declaration derives. Ahead of
+		// the variant case below, which would otherwise read it as a constructor.
+		if field == "fromJson" {
+			if types.findType(env.table, head) is Result.Ok(_) {
+				return decoded(head)
+			}
+		}
 		// `Shape.Circle(5)` builds a variant, and what it builds is the union.
 		if types.findType(env.table, head) is Result.Ok(_) {
 			return types.Ty.TNamed(head)
@@ -325,6 +334,15 @@ func memberCallType(env: Env, subject: ast.Expr, field: Str, argTypes: types.Ty[
 	}
 	// `hive.<module>.<name>(...)`
 	if subject is ast.Expr.Member(root, module) {
+		// `Sig.Move.fromJson(text)` — one variant's own codec, which reads the
+		// payload without the wrapper and still answers with the union.
+		if field == "fromJson" {
+			if root is ast.Expr.Ident(head) {
+				if types.findVariant(env.table, head, module) is Result.Ok(_) {
+					return decoded(head)
+				}
+			}
+		}
 		if root is ast.Expr.Ident(hiveName) {
 			if hiveName == "hive" {
 				return stdlib.resultOf(module, field, argTypes)
@@ -521,52 +539,6 @@ func isBuiltin(name: Str): Bool {
 		|| name == "column" || name == "map" || name == "filter"
 		|| name == "filterMap" || name == "sort"
 		|| name == "replaceFirst" || name == "replaceAll"
-}
-
-// --- `with` and `using` ------------------------------------------------------
-
-func withTypeResult(env: Env, value: ast.Expr, target: ast.TypeExpr): types.Ty {
-	wanted := types.resolve(env.table, target)
-	// `parse(text) with T` and `jwtVerify(t, s) with T` both derive a decoder at
-	// compile time and answer with a `Result` of what was asked for.
-	if value is ast.Expr.Call(callee, _) {
-		if callee is ast.Expr.Member(subject, name) {
-			if subject is ast.Expr.Member(_, module) {
-				if module == "json" && name == "parse" {
-					return types.Ty.TResult(wanted, types.Ty.TLib("json", "JsonError"))
-				}
-				if module == "crypto" {
-					return types.Ty.TResult(wanted, types.Ty.TLib("crypto", "CryptoError"))
-				}
-			}
-		}
-	}
-	return wanted
-}
-
-func usingType(env: Env, form: ast.UsingForm): types.Ty {
-	tableType := types.Ty.TVec(types.Ty.TVec(types.Ty.TStr(), ast.Dim.Dynamic()), ast.Dim.Dynamic())
-	tableError := types.Ty.TLib("", "TableError")
-	if form is ast.UsingForm.Csv(_) {
-		return types.Ty.TResult(tableType, tableError)
-	}
-	// A spreadsheet holds many tables, so it comes back as one per sheet.
-	if form is ast.UsingForm.Xlsx || form is ast.UsingForm.Ods {
-		return types.Ty.TResult(types.Ty.TVec(tableType, ast.Dim.Dynamic()), tableError)
-	}
-	if form is ast.UsingForm.Raw(_) {
-		return types.Ty.TResult(tableType, types.Ty.TLib("sql", "SqlError"))
-	}
-	if form is ast.UsingForm.RunQuery(call) {
-		rows := typeOf(env, call)
-		// A statement has no rows to answer with, so it answers with how many it
-		// touched.
-		if rows is types.Ty.TVoid {
-			return types.Ty.TResult(types.Ty.TInt(), types.Ty.TLib("sql", "SqlError"))
-		}
-		return types.Ty.TResult(rows, types.Ty.TLib("sql", "SqlError"))
-	}
-	return types.Ty.TUnknown()
 }
 
 // --- Patterns ----------------------------------------------------------------

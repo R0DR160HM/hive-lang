@@ -304,6 +304,9 @@ func goType(ty: types.Ty): Str {
 	else if ty is types.Ty.TMap(key, value) {
 		return "hive.Dict[" + goType(key) + ", " + goType(value) + "]"
 	}
+	// A query is the text and the values bound beside it. Its row type is a type
+	// and never a value, so nothing of it survives into the Go.
+	else if ty is types.Ty.TFragment(_) { return "hive.SqlFragment" }
 	else if ty is types.Ty.TLib(module, name) {
 		return "hive." + text.capitalise(module) + name
 	}
@@ -1258,10 +1261,6 @@ proc exprTail(em: mut Emit, env: infer.Env, e: ast.Expr, want: types.Ty): Str {
 		// Asked of the inferrer rather than read off `want`: with a deadline the
 		// answer is a `Result` around the vector, two wrappers deep.
 		return awaitAll(em, env, calls, timeout, infer.typeOf(env, e))
-	} else if e is ast.Expr.WithType(value, target) {
-		return withType(em, env, value, target, want)
-	} else if e is ast.Expr.UsingExpr(source, form) {
-		return reading(em, env, source, form)
 	}
 	fail(em, "this expression has no lowering yet")
 	return "nil"
@@ -1441,79 +1440,21 @@ proc slice(em: mut Emit, env: infer.Env, subject: ast.Expr, low: ast.Expr, high:
 	return written + "[" + lowText + ":(" + expr(em, env, high, types.Ty.TInt()) + ")+1]"
 }
 
-// `<call> with T` is three calls, all meaning the same thing: decode what came
-// back with the codec T's declaration derives. The type is written at the call
-// because a token and a Str of JSON carry no shape of their own.
-proc withType(em: mut Emit, env: infer.Env, value: ast.Expr, target: ast.TypeExpr, want: types.Ty): Str {
-	if value is ast.Expr.Call(callee, args) {
-		if callee is ast.Expr.Member(subject, name) {
-			if subject is ast.Expr.Member(root, module) {
-				if root is ast.Expr.Ident(head) && head == "hive" {
-					wanted := types.resolve(env.table, target)
-					if module == "json" && name == "parse" {
-						useModule(em, "json")
-						return "hive.JsonParse(" + expr(em, env, argExpr(args, 0), types.Ty.TStr()) + ", " + decoderRef(em, wanted) + ")"
-					}
-					if module == "crypto" && name == "jwtVerify" {
-						useModule(em, "crypto")
-						token := expr(em, env, argExpr(args, 0), types.Ty.TStr())
-						secret := expr(em, env, argExpr(args, 1), types.Ty.TStr())
-						return "hive.CryptoJwtVerify(" + token + ", " + secret + ", " + decoderRef(em, wanted) + ")"
-					}
-					if module == "crypto" && name == "jwtDecode" {
-						useModule(em, "crypto")
-						return "hive.CryptoJwtDecode(" + expr(em, env, argExpr(args, 0), types.Ty.TStr()) + ", " + decoderRef(em, wanted) + ")"
-					}
-				}
-			}
-		}
-	}
-	// Anything else `with` is written on is the value itself: the type was there
-	// to say what an empty thing holds, and the walk has it already.
-	return expr(em, env, value, want)
-}
-
-// Each `using` form lowers to the reader it names. The format is written in the
-// source rather than sniffed at runtime, which is why a program that only reads
-// CSV carries neither archive/zip nor encoding/xml.
-proc reading(em: mut Emit, env: infer.Env, source: ast.Expr, form: ast.UsingForm): Str {
-	if form is ast.UsingForm.Csv(separator) {
-		useModule(em, "csv")
-		mut sep := "\",\""
-		if separator is ast.Expr.Absent {
-		} else {
-			sep = expr(em, env, separator, types.Ty.TStr())
-		}
-		return "hive.ReadCsv(" + expr(em, env, source, types.Ty.TStr()) + ", " + sep + ")"
-	}
-	if form is ast.UsingForm.Xlsx {
-		useModule(em, "sheets")
-		return "hive.ReadXlsx(" + expr(em, env, source, types.Ty.TStr()) + ")"
-	}
-	if form is ast.UsingForm.Ods {
-		useModule(em, "sheets")
-		return "hive.ReadOds(" + expr(em, env, source, types.Ty.TStr()) + ")"
-	}
-	// SQL assembled at runtime has a shape nothing can know, so it comes back as
-	// a Table, header row and all.
-	if form is ast.UsingForm.Raw(sqlText) {
-		useModule(em, "sql")
-		return "hive.SqlQuery(" + expr(em, env, source, types.Ty.TUnknown()) + ", " + expr(em, env, sqlText, types.Ty.TStr()) + ")"
-	}
-	if form is ast.UsingForm.RunQuery(call) {
-		useModule(em, "sql")
-		connection := expr(em, env, source, types.Ty.TUnknown())
-		fragment := expr(em, env, call, types.Ty.TUnknown())
-		rows := infer.typeOf(env, call)
-		// What the query declared its rows to be decides how it runs: no rows is
-		// a statement reporting how many it touched, anything else is read row by
-		// row through the mapper its type derives.
+// What a query declared its rows to be decides how it runs: no rows is a
+// statement reporting how many it touched, anything else is read row by row
+// through the mapper its type derives.
+proc running(em: mut Emit, env: infer.Env, args: ast.Arg[]): Str {
+	connection := expr(em, env, argExpr(args, 0), types.Ty.TUnknown())
+	asked := argExpr(args, 1)
+	fragment := expr(em, env, asked, types.Ty.TUnknown())
+	held := infer.typeOf(env, asked)
+	if held is types.Ty.TFragment(rows) {
 		if rows is types.Ty.TVoid {
 			return "hive.SqlExec(" + connection + ", " + fragment + ")"
 		}
 		return "hive.SqlRows(" + connection + ", " + fragment + ", " + rowMapper(em, rows) + ")"
 	}
-	fail(em, "this `using` has no lowering")
+	fail(em, "`hive.sql.run` runs a `hive.sql.Fragment`, and this is " + types.show(held))
 	return "nil"
 }
 
@@ -1798,6 +1739,13 @@ proc namedCall(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[], want: t
 	return goIdent(name) + "(" + plainArgs(em, env, args) + ")"
 }
 
+// Every `fromJson` is the same call with a different decoder: the text, and what
+// to read it with.
+proc reading(em: mut Emit, env: infer.Env, args: ast.Arg[], decoder: Str): Str {
+	useModule(em, "json")
+	return "hive.JsonParse(" + expr(em, env, argExpr(args, 0), types.Ty.TStr()) + ", " + decoder + ")"
+}
+
 proc memberCall(em: mut Emit, env: infer.Env, subject: ast.Expr, field: Str, args: ast.Arg[], want: types.Ty): Str {
 	if subject is ast.Expr.Ident(head) {
 		if head == "Result" {
@@ -1806,12 +1754,29 @@ proc memberCall(em: mut Emit, env: infer.Env, subject: ast.Expr, field: Str, arg
 		if head == "hive" {
 			return builtin(em, env, field, args, want)
 		}
+		// `User.fromJson(text)` is the codec the declaration derives, named. Ahead
+		// of the variant case, which would otherwise read it as a constructor.
+		if field == "fromJson" {
+			if types.findType(em.table, head) is Result.Ok(_) {
+				return reading(em, env, args, decoderRef(em, types.Ty.TNamed(head)))
+			}
+		}
 		// `Shape.Circle(5)` builds a variant.
 		if types.findVariant(env.table, head, field) is Result.Ok(fields) {
 			return variantLiteral(em, env, head, field, fields, args)
 		}
 	}
 	if subject is ast.Expr.Member(root, module) {
+		// `Sig.Move.fromJson(text)` reads the payload alone, so it needs a decoder
+		// of its own beside the union's — written only where one is asked for.
+		if field == "fromJson" {
+			if root is ast.Expr.Ident(head) {
+				if types.findVariant(em.table, head, module) is Result.Ok(_) {
+					needCodec(em, head + "." + module)
+					return reading(em, env, args, variantDecoderName(head, module))
+				}
+			}
+		}
 		if root is ast.Expr.Ident(hiveName) {
 			if hiveName == "hive" {
 				return libraryCall(em, env, module, field, args, want)
@@ -2722,8 +2687,6 @@ func escapesInExpr(name: Str, e: ast.Expr): Bool {
 	if e is ast.Expr.Timed(call, ms) {
 		return escapesInExpr(name, call) || escapesInExpr(name, ms)
 	}
-	if e is ast.Expr.WithType(value, _) { return escapesInExpr(name, value) }
-	if e is ast.Expr.UsingExpr(source, _) { return escapesInExpr(name, source) }
 	return false
 }
 
@@ -2959,21 +2922,6 @@ proc scanExpr(e: ast.Expr, sc: mut Scan): void {
 		sc.spawns = true
 		scanExpr(call, sc)
 		scanExpr(ms, sc)
-	} else if e is ast.Expr.WithType(value, _) {
-		scanExpr(value, sc)
-	} else if e is ast.Expr.UsingExpr(source, form) {
-		scanExpr(source, sc)
-		scanUsing(form, sc)
-	}
-}
-
-proc scanUsing(form: ast.UsingForm, sc: mut Scan): void {
-	if form is ast.UsingForm.Csv(separator) {
-		scanExpr(separator, sc)
-	} else if form is ast.UsingForm.RunQuery(call) {
-		scanExpr(call, sc)
-	} else if form is ast.UsingForm.Raw(sqlText) {
-		scanExpr(sqlText, sc)
 	}
 }
 
@@ -3228,15 +3176,46 @@ proc emitCodecsFrom(em: mut Emit, from: Int): void {
 	}
 }
 
+// A request is either a type's name, or a type and one of its variants joined by
+// a dot — the second being what `T.Variant.fromJson` asks for. A variant needs a
+// decoder alone: it is read into the union its type already encodes.
 proc emitCodec(em: mut Emit, name: Str): void {
+	at := dotAt(name)
+	if at >= 0 {
+		cs := text.chars(name)
+		typeName := text.span(cs, 0, at - 1)
+		variant := text.span(cs, at + 1, len(cs) - 1)
+		if types.findType(em.table, typeName) is Result.Ok(_) {
+			emitVariantDecoder(em, typeName, variant)
+		}
+		return
+	}
 	if types.findType(em.table, name) is Result.Ok(info) {
 		emitDecoder(em, name, info)
 		emitEncoder(em, name, info)
 	}
 }
 
+/// Where the dot is in `Type.Variant`, or `-1` in a plain type name. A declared
+/// name never holds one, so finding one is what tells the two apart.
+func dotAt(name: Str): Int {
+	cs := text.chars(name)
+	mut i := 0
+	for each c in cs {
+		if c == "." {
+			return i
+		}
+		i = i + 1
+	}
+	return -1
+}
+
 func decoderName(name: Str): Str {
 	return "jsonDecode_" + goIdent(name)
+}
+
+func variantDecoderName(name: Str, variant: Str): Str {
+	return "jsonDecode_" + goIdent(name) + "_" + goIdent(variant)
 }
 
 func encoderName(name: Str): Str {
@@ -3244,6 +3223,23 @@ func encoderName(name: Str): Str {
 }
 
 // --- Decoding ----------------------------------------------------------------
+
+/// The decoder `T.Variant.fromJson` names: this variant's payload, without the
+/// key the whole union is wrapped in. Its fields are its own and then the ones
+/// the type declared outside any variant, which is the order a constructor takes
+/// them in.
+proc emitVariantDecoder(em: mut Emit, name: Str, variant: Str): void {
+	whole := types.Ty.TNamed(name)
+	blank(em)
+	open(em, "func " + variantDecoderName(name, variant) + "(v hive.JsonValue, path string) (" + goType(whole) + ", *hive.JsonJsonError) \{")
+	line(em, "obj, jerr := hive.JsonObject(v, path)")
+	bailOut(em, "nil")
+	if types.findVariant(em.table, name, variant) is Result.Ok(fields) {
+		decodeFields(em, fields, "path", "nil")
+		line(em, "return " + goVariant(name, variant) + "\{" + fieldInits(fields) + "}, nil")
+	}
+	close(em, "}")
+}
 
 proc emitDecoder(em: mut Emit, name: Str, info: types.TypeInfo): void {
 	whole := types.Ty.TNamed(name)
@@ -3509,6 +3505,34 @@ proc libraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, args: ast
 	}
 	if module == "map" {
 		return mapCall(em, env, name, args)
+	}
+	// A whole document as `[path, value]` rows — the one reading that needs no
+	// type, and so the only one still spelled as a library call.
+	if module == "json" && name == "flatten" {
+		return reading(em, env, args, "hive.JsonFlatten")
+	}
+	// A table reader is named in the source rather than sniffed at run time,
+	// which is why a program that only reads CSV carries neither archive/zip nor
+	// encoding/xml.
+	if module == "file" && name == "csv" {
+		useModule(em, "csv")
+		return "hive.ReadCsv(" + expr(em, env, argExpr(args, 0), types.Ty.TStr()) + ", " + expr(em, env, argExpr(args, 1), types.Ty.TStr()) + ")"
+	}
+	if module == "file" && name == "xlsx" {
+		useModule(em, "sheets")
+		return "hive.ReadXlsx(" + expr(em, env, argExpr(args, 0), types.Ty.TStr()) + ")"
+	}
+	if module == "file" && name == "ods" {
+		useModule(em, "sheets")
+		return "hive.ReadOds(" + expr(em, env, argExpr(args, 0), types.Ty.TStr()) + ")"
+	}
+	// SQL assembled at run time has a shape nothing can know, so it comes back
+	// as a Table, header row and all.
+	if module == "sql" && name == "raw" {
+		return "hive.SqlQuery(" + expr(em, env, argExpr(args, 0), types.Ty.TUnknown()) + ", " + expr(em, env, argExpr(args, 1), types.Ty.TStr()) + ")"
+	}
+	if module == "sql" && name == "run" {
+		return running(em, env, args)
 	}
 	// A token's claims are a type of the program's own, so they are encoded by
 	// the codec that type derives and *then* signed.

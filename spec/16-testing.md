@@ -92,7 +92,7 @@ thing a commit hook or a CI step runs.
 
 A test runs with the working directory set to the **generated project**, not to
 the entrypoint's folder. That is a difference from `hive run`, which chdirs to
-the entrypoint's folder so `using "./test.csv"` resolves the way its author
+the entrypoint's folder so `hive.file.csv("./test.csv", ",")` resolves the way its author
 wrote it.
 
 The consequence is worth stating because it is easy to trip over: a test that

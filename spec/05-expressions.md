@@ -202,28 +202,21 @@ matters.
 
 ## 5.8 `with` clauses
 
-Two unrelated clauses share the `with` keyword, told apart by the word after it.
+`with` introduces one clause and only one.
 
 **`with timeout <ms>`** bounds a wait, and may follow anything that waits — a
 call or an await-all. It turns the result into
 `Result<T, hive.task.TimeoutError>`. See
 [09](09-concurrency.md#94-with-timeout).
 
-**`with <Type>`** names a decode target, for the calls whose result shape is a
-type you choose: `hive.json.parse(text) with User`,
-`hive.crypto.jwtVerify(token, secret) with Claims`.
-
 `timeout` is **not** a reserved word: it means something only in this two-token
-clause, so it stays usable as an ordinary variable name. Correspondingly,
-`with Timeout` names a decode target, and a type may well be called that.
+clause, so it stays usable as an ordinary variable name.
 
-## 5.9 `using`
+A decode target is not written here. Reading JSON into a declared type is
+`T.fromJson(text)`, the codec that type derives named directly
+([14](14-stdlib.md#147-hivejson)).
 
-`using` reads a table, and each form says in the source what it is reading —
-which is what lets the compiler pick the reader and leave the machinery for the
-others out of the build. See [14](14-stdlib.md#146-reading-tables-using).
-
-## 5.10 Evaluation order
+## 5.9 Evaluation order
 
 Operands are evaluated left to right. `&&` and `||` short-circuit: the right
 operand is evaluated only if the left did not decide the answer. This is what

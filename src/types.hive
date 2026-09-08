@@ -32,6 +32,11 @@ type Ty {
 	TResult { ok: Ty, bad: Ty }
 	/// `hive.map.Map<K, T>`.
 	TMap { key: Ty, value: Ty }
+	/// `hive.sql.Fragment<T>` — what a `query` declaration answers with. `rows` is
+	/// what the declaration said its rows are, and it travels along in the type
+	/// rather than in the value: the value is text and the arguments bound
+	/// beside it, and `hive.sql.run` is what turns one into rows of `T`.
+	TFragment { rows: Ty }
 	/// A function value: `func(Int): Int` or `proc(Str): void`.
 	TFn { pure: Bool, params: Ty[dyn], result: Ty }
 	/// An opaque type the standard library owns: `hive.net.HttpRequest`,
@@ -88,8 +93,13 @@ func tableOf(m: ast.Module): Table {
 			// so nothing on the far side writes where the caller can see.
 			callables = withCallable(callables, CallableInfo(name, true, params, result, variablesOfSignature(params, result)))
 		} else if d is ast.Decl.QueryDecl(name, params, result, _, _) {
-			// A query is a func whose body happens to be SQL.
-			callables = withCallable(callables, CallableInfo(name, true, params, result, variablesOfSignature(params, result)))
+			// A query is a func whose body happens to be SQL, and what calling
+			// one answers with is the query — text, and the values bound beside
+			// it — rather than the rows. `hive.sql.run` is what turns one into
+			// rows, and the type it needs to do that is the declared row type
+			// travelling along inside `Fragment<...>`.
+			held := queryResult(result)
+			callables = withCallable(callables, CallableInfo(name, true, params, held, variablesOfSignature(params, held)))
 		}
 	}
 	return Table(types, callables)
@@ -137,6 +147,18 @@ func findCallable(t: Table, name: Str): Result<CallableInfo, Bool> {
 /// The variant of `typeName` called `variantName`, with the type's shared fields
 /// appended — which is what "a field outside any variant is added to every one of
 /// them" comes to once anything reads them.
+/// Every variant a declared type has, in declaration order — what an error about
+/// one that is not there lists instead.
+func variantNames(t: Table, typeName: Str): Str[dyn] {
+	mut Str[dyn] out = []
+	if findType(t, typeName) is Result.Ok(info) {
+		for each v in info.variants {
+			append(out, v.name)
+		}
+	}
+	return out
+}
+
 func findVariant(t: Table, typeName: Str, variantName: Str): Result<ast.Field[dyn], Bool> {
 	if findType(t, typeName) is Result.Ok(info) {
 		for each v in info.variants {
@@ -278,6 +300,9 @@ func resolveBase(t: Table, pkg: Str, name: Str, args: ast.TypeExpr[]): Ty {
 	if pkg == "hive.map" && name == "Map" {
 		return Ty.TMap(argAt(t, args, 0), argAt(t, args, 1))
 	}
+	if pkg == "hive.sql" && name == "Fragment" {
+		return Ty.TFragment(argAt(t, args, 0))
+	}
 	if text.startsWith(pkg, "hive.") {
 		return Ty.TLib(text.span(text.chars(pkg), 5, len(pkg) - 1), name)
 	}
@@ -337,6 +362,9 @@ func toWritten(ty: Ty): ast.TypeExpr {
 	if ty is Ty.TMap(key, value) {
 		return ast.TypeExpr.Named("hive.map", "Map", [toWritten(key), toWritten(value)], [])
 	}
+	if ty is Ty.TFragment(rows) {
+		return queryResult(toWritten(rows))
+	}
 	if ty is Ty.TFn(pure, params, result) {
 		mut ast.TypeExpr[dyn] out = []
 		for each p in params {
@@ -351,6 +379,12 @@ func toWritten(ty: Ty): ast.TypeExpr {
 
 func named(name: Str): ast.TypeExpr {
 	return ast.TypeExpr.Named("", name, [], [])
+}
+
+/// `hive.sql.Fragment<rows>`, written out. One place, because a `query`
+/// declaration's answer and a `TFragment` read back have to agree on the spelling.
+func queryResult(rows: ast.TypeExpr): ast.TypeExpr {
+	return ast.TypeExpr.Named("hive.sql", "Fragment", [rows], [])
 }
 
 // One more dimension on the outside of a written type.
@@ -385,6 +419,7 @@ func show(ty: Ty): Str {
 	else if ty is Ty.TVec(element, dim) { return show(element) + showDim(dim) }
 	else if ty is Ty.TResult(ok, bad) { return "Result<" + show(ok) + ", " + show(bad) + ">" }
 	else if ty is Ty.TMap(key, value) { return "hive.map.Map<" + show(key) + ", " + show(value) + ">" }
+	else if ty is Ty.TFragment(rows) { return "hive.sql.Fragment<" + show(rows) + ">" }
 	else if ty is Ty.TFn(pure, params, result) {
 		mut word := "proc"
 		if pure {
@@ -443,6 +478,15 @@ func accepts(to: Ty, from: Ty): Bool {
 		}
 		return false
 	}
+	// A query's rows are a type and never a value, so the halves fit the way a
+	// `Result`'s do and there is no storage underneath for a length to be a
+	// promise about.
+	if to is Ty.TFragment(toRows) {
+		if from is Ty.TFragment(fromRows) {
+			return accepts(toRows, fromRows)
+		}
+		return false
+	}
 	// A `func` value may fill a `proc` slot — pure widens to impure — and never
 	// the reverse.
 	if to is Ty.TFn(toPure, toParams, toResult) {
@@ -498,6 +542,10 @@ func same(a: Ty, b: Ty): Bool {
 	}
 	if a is Ty.TMap(aKey, aValue) {
 		if b is Ty.TMap(bKey, bValue) { return same(aKey, bKey) && same(aValue, bValue) }
+		return false
+	}
+	if a is Ty.TFragment(aRows) {
+		if b is Ty.TFragment(bRows) { return same(aRows, bRows) }
 		return false
 	}
 	if a is Ty.TFn(aPure, aParams, aResult) {
@@ -702,7 +750,7 @@ func isOrdered(t: Table, ty: Ty): Bool {
 	if ty is Ty.TFn(_, _, _) || ty is Ty.TMap(_, _) || ty is Ty.TUnknown {
 		return false
 	}
-	if ty is Ty.TLib(_, _) || ty is Ty.TVoid {
+	if ty is Ty.TLib(_, _) || ty is Ty.TFragment(_) || ty is Ty.TVoid {
 		return false
 	}
 	if ty is Ty.TVec(element, _) {

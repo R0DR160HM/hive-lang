@@ -14,18 +14,18 @@ hive test examples/15-testing/cart.test.hive
 
 | | | |
 | --- | --- | --- |
-| 01 | [basic-io](01-basic-io) | `echo`, a type with variants, and a CSV read with `using` |
+| 01 | [basic-io](01-basic-io) | `echo`, a type with variants, and a CSV read with `hive.file.csv` |
 | 02 | [types](02-types) | every type there is: strings, vectors, atoms, numbers, bools, `mut`, and a `query` |
 | 03 | [networking](03-networking) | an HTTP server and client, raw TCP, and WebSockets |
 | 04 | [crypto](04-crypto) | hashing, HMAC, base64, password encryption, and JWTs |
-| 05 | [sql](05-sql) | `query` declarations, typed rows, optional filters, and `run raw` |
+| 05 | [sql](05-sql) | `query` declarations, typed rows, optional filters, and `hive.sql.raw` |
 | 06 | [value-semantics](06-value-semantics) | why two names never observe each other's writes, and the one case where they do |
 | 07 | [pattern-matching](07-pattern-matching) | the four kinds of pattern, and binding through `&&` |
 | 08 | [first-class-functions](08-first-class-functions) | bare references, partial application, the vector walks, shadowing a builtin |
 | 09 | [online-cache](09-online-cache) | an HTTP cache over a cluster: `hive.net`, `hive.sql` and `hive.syslink` at once |
 | 10 | [concurrency](10-concurrency) | all five spellings of a call, and what a thread does to `mut` |
 | 11 | [modules](11-modules) | a program in four files, one of them Go |
-| 12 | [files-and-spreadsheets](12-files-and-spreadsheets) | `using` over xlsx and ods, and the whole of `hive.file` |
+| 12 | [files-and-spreadsheets](12-files-and-spreadsheets) | `hive.file.xlsx` and `hive.file.ods`, and the whole of `hive.file` |
 | 13 | [distributed-actors](13-distributed-actors) | two nodes, one statement to reach either, and a crash that stays local |
 | 14 | [generics](14-generics) | type variables, monomorphization, and generic types |
 | 15 | [testing](15-testing) | `test` declarations, `assert` with both sides, and coverage |

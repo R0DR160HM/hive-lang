@@ -378,9 +378,16 @@ test "the await-all, with and without a deadline" {
 	assert stmt("r := await [f(a)] with timeout 500") == "(let r (await [(call f a)] 500))"
 }
 
-test "with timeout on a call, and with a type on anything" {
+test "`with` introduces a timeout and nothing else" {
 	assert stmt("r := f(x) with timeout 500") == "(let r (timed (call f x) 500))"
-	assert stmt("r := hive.json.parse(t) with User") == "(let r (with (call (. (. hive json) parse) t) User))"
+	// `with <Type>` was the other clause and is not one any more: naming a decode
+	// target is an ordinary member call, which the parser needs no rule for.
+	assert stmt("r := User.fromJson(t)") == "(let r (call (. User fromJson) t))"
+	assert stmt("r := Sig.Move.fromJson(t)") == "(let r (call (. (. Sig Move) fromJson) t))"
+}
+
+test "a `with` that names no timeout is refused" {
+	assert text.contains(problem("proc main(): void \{ r := f(x) with User }"), "`timeout` after `with`")
 }
 
 test "a timeout clause stops before `is`, so the match is not folded into the count" {
@@ -391,13 +398,11 @@ test "`v bounds i` desugars into the guard it stands for" {
 	assert stmt("if v bounds i \{ }") == "(if (&& (>= i 0) (< i (call (. hive len) v))) (block))"
 }
 
-test "using, in each of its forms" {
-	assert stmt("r := using \"./d.csv\"") == "(let r (using \"./d.csv\" csv))"
-	assert stmt("r := using \"./d.tsv\" as csv separating by \"\\t\"") == "(let r (using \"./d.tsv\" (csv \"\t\")))"
-	assert stmt("r := using \"./b.xlsx\" as xlsx") == "(let r (using \"./b.xlsx\" xlsx))"
-	assert stmt("r := using \"./b.ods\" as ods") == "(let r (using \"./b.ods\" ods))"
-	assert stmt("r := using db run allUsers()") == "(let r (using db (run (call allUsers))))"
-	assert stmt("r := using db run raw someSql") == "(let r (using db (raw someSql)))"
+test "a table reader is an ordinary call" {
+	assert stmt("r := hive.file.csv(\"./d.csv\", \",\")") == "(let r (call (. (. hive file) csv) \"./d.csv\" \",\"))"
+	assert stmt("r := hive.file.xlsx(\"./b.xlsx\")") == "(let r (call (. (. hive file) xlsx) \"./b.xlsx\"))"
+	assert stmt("r := hive.sql.run(db, allUsers())") == "(let r (call (. (. hive sql) run) db (call allUsers)))"
+	assert stmt("r := hive.sql.raw(db, someSql)") == "(let r (call (. (. hive sql) raw) db someSql))"
 }
 
 // --- Patterns ----------------------------------------------------------------

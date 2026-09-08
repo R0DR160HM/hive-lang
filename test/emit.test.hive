@@ -129,7 +129,7 @@ test "an annotation decides the key the codecs read and write" {
 }
 
 test "a Default is written into the decoder, and asks rather than insists" {
-	got := go("type User \{ name: Str -- Default as \"nobody\"; }" + newline() + "proc main(): void \{ if hive.json.parse(\"\") with User is Result.Ok(u) \{ echo u.name } }")
+	got := go("type User \{ name: Str -- Default as \"nobody\"; }" + newline() + "proc main(): void \{ if User.fromJson(\"\") is Result.Ok(u) \{ echo u.name } }")
 	// The literal is the field's starting value and the lookup may leave it
 	// alone, so a key that is not there costs no error.
 	assert has(got, "hive.JsonLook(obj,")
@@ -139,7 +139,7 @@ test "a Default is written into the decoder, and asks rather than insists" {
 }
 
 test "a field with no Default still goes through the lookup that errors" {
-	got := go("type User \{ name: Str }" + newline() + "proc main(): void \{ if hive.json.parse(\"\") with User is Result.Ok(u) \{ echo u.name } }")
+	got := go("type User \{ name: Str }" + newline() + "proc main(): void \{ if User.fromJson(\"\") is Result.Ok(u) \{ echo u.name } }")
 	assert has(got, "hive.JsonField(obj,")
 	assert has(got, "hive.JsonLook(obj,") == false
 }
@@ -356,11 +356,11 @@ test "len is three builtins, told apart by what it was given" {
 
 // --- Reading a table ---------------------------------------------------------
 
-test "each `using` form lowers to the reader it names" {
-	assert has(stmt("t := using \"./x.csv\""), "hive.ReadCsv(\"./x.csv\", \",\")")
-	assert has(stmt("t := using \"./x.tsv\" as csv separating by \"\\t\""), "hive.ReadCsv(\"./x.tsv\", \"\\t\")")
-	assert has(stmt("t := using \"./b.xlsx\" as xlsx"), "hive.ReadXlsx(\"./b.xlsx\")")
-	assert has(stmt("t := using \"./b.ods\" as ods"), "hive.ReadOds(\"./b.ods\")")
+test "each table reader lowers to the one it names" {
+	assert has(stmt("t := hive.file.csv(\"./x.csv\", \",\")"), "hive.ReadCsv(\"./x.csv\", \",\")")
+	assert has(stmt("t := hive.file.csv(\"./x.tsv\", \"\\t\")"), "hive.ReadCsv(\"./x.tsv\", \"\\t\")")
+	assert has(stmt("t := hive.file.xlsx(\"./b.xlsx\")"), "hive.ReadXlsx(\"./b.xlsx\")")
+	assert has(stmt("t := hive.file.ods(\"./b.ods\")"), "hive.ReadOds(\"./b.ods\")")
 }
 
 // --- Queries -----------------------------------------------------------------
@@ -385,7 +385,7 @@ test "a WHERE block is gathered at run time and joined" {
 
 test "what a query declared its rows to be decides how it is run" {
 	rows := "type User \{ id: Int }\nquery all(): User[dyn] \{ SELECT id FROM users }\nquery wipe(): void \{ DELETE FROM users }\n"
-	got := go(rows + "proc main(): void \{ db := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"x.db\")  if db is Result.Ok(open) \{ echo using open run all()  echo using open run wipe()  echo using open run raw \"SELECT 1\" } }")
+	got := go(rows + "proc main(): void \{ db := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"x.db\")  if db is Result.Ok(open) \{ echo hive.sql.run(open, all())  echo hive.sql.run(open, wipe())  echo hive.sql.raw(open, \"SELECT 1\") } }")
 	assert has(got, "hive.SqlRows(")
 	assert has(got, "sqlRow_User")
 	assert has(got, "hive.SqlExec(")
@@ -408,7 +408,7 @@ test "a codec is derived from the declaration, and named for the type" {
 }
 
 test "a variant encodes under its own name, and decodes by it" {
-	got := go("type Shape \{ Circle \{ radius: Int }\n Point }\nproc main(): void \{ echo hive.json.encode(Shape.Circle(1))  if hive.json.parse(\"null\") with Shape is Result.Ok(s) \{ echo s } }")
+	got := go("type Shape \{ Circle \{ radius: Int }\n Point }\nproc main(): void \{ echo hive.json.encode(Shape.Circle(1))  if Shape.fromJson(\"null\") is Result.Ok(s) \{ echo s } }")
 	assert has(got, "func jsonDecode_Shape(v hive.JsonValue, path string) (Shape, *hive.JsonJsonError) \{")
 	assert has(got, "hive.JsonVariant(v, path)")
 	assert has(got, "hive.JsonParse(")
@@ -416,10 +416,39 @@ test "a variant encodes under its own name, and decodes by it" {
 	assert has(got, "if v.Kind == 'n' \{")
 }
 
+test "a variant names a decoder of its own, beside the union's" {
+	src := "type Sig \{ Ping\n Move \{ x: Int, y: Int } }\nproc main(): void \{ if Sig.Move.fromJson(\"x\") is Result.Ok(s) \{ echo s } }"
+	got := go(src)
+	// The payload alone, so no variant key is read on the way in.
+	assert has(got, "func jsonDecode_Sig_Move(v hive.JsonValue, path string) (Sig, *hive.JsonJsonError) \{")
+	assert has(got, "hive.JsonParse(\"x\", jsonDecode_Sig_Move)")
+	assert has(got, "return SigMove\{")
+}
+
+test "a variant decoder is written only where one is asked for" {
+	// The union alone: nothing names a variant, so no per-variant decoder exists.
+	got := go("type Sig \{ Ping\n Move \{ x: Int, y: Int } }\nproc main(): void \{ if Sig.fromJson(\"x\") is Result.Ok(s) \{ echo s } }")
+	assert has(got, "func jsonDecode_Sig(") == true
+	assert has(got, "jsonDecode_Sig_Move") == false
+}
+
+test "a shared field reaches a variant's own decoder too" {
+	got := go("type Sig \{ Move \{ x: Int }\n at: Int }\nproc main(): void \{ if Sig.Move.fromJson(\"x\") is Result.Ok(s) \{ echo s } }")
+	assert has(got, "func jsonDecode_Sig_Move(")
+	assert has(got, "\"x\"")
+	assert has(got, "\"at\"")
+}
+
+test "flatten reads a whole document without a type to read it into" {
+	got := go("proc main(): void \{ if hive.json.flatten(\"x\") is Result.Ok(t) \{ echo t } }")
+	assert has(got, "hive.JsonParse(\"x\", hive.JsonFlatten)")
+}
+
 test "a JWT signs the claims its type derives an encoder for" {
-	got := go("type Claims \{ sub: Str }\nproc main(): void \{ echo hive.crypto.jwtSign(Claims(\"ada\"), \"secret\")  if hive.crypto.jwtVerify(\"t\", \"secret\") with Claims is Result.Ok(c) \{ echo c } }")
+	got := go("type Claims \{ sub: Str }\nproc main(): void \{ echo hive.crypto.jwtSign(Claims(\"ada\"), \"secret\")  if hive.crypto.jwtVerify(\"t\", \"secret\") is Result.Ok(c) \{ echo c } }")
 	assert has(got, "hive.CryptoJwtSign(jsonEncode_Claims(")
-	assert has(got, "hive.CryptoJwtVerify(\"t\", \"secret\", jsonDecode_Claims)")
+	// Reading a token stops at the claims: no decoder crosses into `hive.crypto`.
+	assert has(got, "hive.CryptoJwtVerify(\"t\", \"secret\")")
 }
 
 // --- Services ----------------------------------------------------------------

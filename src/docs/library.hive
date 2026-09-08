@@ -55,7 +55,7 @@ func index(): Str {
 		Each module owns its types under its own namespace: ~BT~hive.net.HttpRequest~BT~,
 		~BT~hive.json.JsonError~BT~, ~BT~hive.map.Map~BT~, ~BT~hive.syslink.Address~BT~. The only
 		builtin types that live directly on ~BT~hive~BT~ are the three the language uses
-		without a module: ~BT~Result~BT~, ~BT~Table~BT~ and ~BT~hive.TableError~BT~.
+		without a module: ~BT~Result~BT~ and ~BT~Table~BT~.
 
 		**A module you don't use is not in your build.** Every module but two is
 		written against the target's standard library alone, so HTTP, WebSockets, TCP,
@@ -84,14 +84,15 @@ func index(): Str {
 		| [net-websockets](net-websockets.md) | ~BT~hive.net~BT~ | WebSockets |
 		| [net-sockets](net-sockets.md) | ~BT~hive.net~BT~ | raw TCP |
 		| [net-names](net-names.md) | ~BT~hive.net~BT~ | ~BT~resolve~BT~ and ~BT~localAddress~BT~ |
-		| [sql](sql.md) | ~BT~hive.sql~BT~ | connections and drivers |
+		| [sql](sql.md) | ~BT~hive.sql~BT~ | connections, drivers, and running a query |
 		| [syslink](syslink.md) | ~BT~hive.syslink~BT~ | what a service is |
 		| [syslink-calls](syslink-calls.md) | ~BT~hive.syslink~BT~ | every call, and calling an address |
 		| [syslink-nodes](syslink-nodes.md) | ~BT~hive.syslink~BT~ | across machines |
 		| [ui](ui.md) | ~BT~hive.ui~BT~ | a view is a value — **thirteen pages**, start here |
 
-		Reading a table from a CSV or a spreadsheet is ~BT~using~BT~ rather than a module:
-		see [tables](../tables.md). Running a ~BT~query~BT~ is [queries](../queries.md).
+		Reading a table from a CSV or a spreadsheet is [~BT~hive.file~BT~](file.md), and
+		the ~BT~Table~BT~ it answers with is [tables](../tables.md). Running a ~BT~query~BT~ is
+		[queries](../queries.md).
 
 		*From ~BT~spec/14-stdlib.md~BT~.*
 	`)
@@ -241,9 +242,10 @@ func files(): Str {
 	return page.backticked(`
 		# ~BT~hive.file~BT~
 
-		General filesystem access, for the files [~BT~using~BT~](../tables.md) does not
-		cover. Contents move as ~BT~Str~BT~, which holds bytes rather than validated text, so
-		**a binary file survives a read/write round trip**.
+		General filesystem access. Contents move as ~BT~Str~BT~, which holds bytes rather
+		than validated text, so **a binary file survives a read/write round trip**.
+		Reading a whole [~BT~Table~BT~](../tables.md) out of one — ~BT~csv~BT~, ~BT~xlsx~BT~, ~BT~ods~BT~ —
+		lives here too.
 
 		| call | answers with |
 		| --- | --- |
@@ -258,9 +260,21 @@ func files(): Str {
 		| ~BT~move(from, to)~BT~ | ~BT~Result<Bool, FileError>~BT~ |
 		| ~BT~list(path)~BT~ | ~BT~Result<Str[dyn], FileError>~BT~ |
 		| ~BT~exists(path)~BT~ | ~BT~Bool~BT~ — **not** a ~BT~Result~BT~; a directory counts |
+		| ~BT~csv(path, separator)~BT~ | ~BT~Result<Table, TableError>~BT~ |
+		| ~BT~xlsx(path)~BT~ | ~BT~Result<Table[dyn], TableError>~BT~ — one per sheet |
+		| ~BT~ods(path)~BT~ | ~BT~Result<Table[dyn], TableError>~BT~ — one per table |
 
 		A ~BT~FileError~BT~ carries ~BT~reason~BT~ — ~BT~"NotFound"~BT~, ~BT~"Permission"~BT~, ~BT~"Exists"~BT~ or
-		~BT~"Io"~BT~ — alongside the ~BT~path~BT~ and the underlying ~BT~message~BT~.
+		~BT~"Io"~BT~ — alongside the ~BT~path~BT~ and the underlying ~BT~message~BT~. A file that
+		opened and then turned out not to hold what it said it did is not a filesystem
+		failure, so the readers answer with a ~BT~TableError~BT~ of their own, carrying the
+		~BT~path~BT~ and a ~BT~message~BT~.
+
+		**The separator is always written.** There are no optional parameters in Hive,
+		and a comma is a choice like any other rather than the one the language makes
+		on your behalf. Which reader a program names is also what lets the compiler
+		leave the others out of the build: one that reads a CSV carries neither
+		~BT~archive/zip~BT~ nor ~BT~encoding/xml~BT~.
 
 		~CODE~hive
 		if hive.file.read("./notes.txt") is Result.Ok(text) {
@@ -539,8 +553,9 @@ func json(): Str {
 
 		| call | answers with |
 		| --- | --- |
-		| ~BT~parse(text) with T~BT~ | ~BT~Result<T, JsonError>~BT~ |
-		| ~BT~parse(text) with Table~BT~ | ~BT~Result<Table, JsonError>~BT~ — the document flattened |
+		| ~BT~T.fromJson(text)~BT~ | ~BT~Result<T, JsonError>~BT~ |
+		| ~BT~T.Variant.fromJson(text)~BT~ | ~BT~Result<T, JsonError>~BT~ — one variant's payload |
+		| ~BT~flatten(text)~BT~ | ~BT~Result<Table, JsonError>~BT~ — the document flattened |
 		| ~BT~encode(value)~BT~ | ~BT~Str~BT~ — **cannot fail** |
 		| ~BT~table(text)~BT~ | ~BT~Result<Table, JsonError>~BT~ |
 		| ~BT~get(table, path)~BT~ | ~BT~Result<Str, JsonError>~BT~ |
@@ -554,7 +569,7 @@ func json(): Str {
 			name: Str
 		}
 
-		if hive.json.parse(body) with User is Result.Ok(user) {
+		if User.fromJson(body) is Result.Ok(user) {
 			echo user.name
 		}
 		echo hive.json.encode(user)
@@ -575,14 +590,14 @@ func json(): Str {
 		hive.json.encode(User("ada", 36, "Ada"))
 		// {"username":"ada","age":36,"firstName":"Ada"}
 
-		hive.json.parse("\{\"username\":\"ada\",\"age\":36}") with User
+		User.fromJson("\{\"username\":\"ada\",\"age\":36}")
 		// Result.Ok — ~BT~firstName~BT~ fell back to ""
 		~CODE~
 
 		~BT~JSON as~BT~ renames in **both** directions, so a round trip agrees with itself.
 		~BT~Default as~BT~ is what turns a required field into an optional one: an absent
 		key and a ~BT~null~BT~ one are the same nothing, and both read as the literal.
-		Neither reaches ~BT~parse(text) with Table~BT~, which flattens a document rather
+		Neither reaches ~BT~flatten(text)~BT~, which flattens a document rather
 		than decoding a declared shape.
 
 		## Decoding
@@ -603,11 +618,11 @@ func json(): Str {
 		~BT~table(text)~BT~ reads a **JSON array of flat objects** as a headered ~BT~Table~BT~ —
 		the first row is the column names.
 
-		~BT~parse(text) with Table~BT~ flattens a **whole document** into ~BT~[path, value]~BT~
+		~BT~flatten(text)~BT~ flattens a **whole document** into ~BT~[path, value]~BT~
 		rows, looked up with ~BT~get~BT~ and re-nested by the encoder:
 
 		~CODE~hive
-		if hive.json.parse(config) with Table is Result.Ok(flat) {
+		if hive.json.flatten(config) is Result.Ok(flat) {
 			if hive.json.get(flat, "keys.layout") is Result.Ok(layout) {
 				echo layout
 			}
@@ -709,8 +724,8 @@ func cryptoJwt(): Str {
 		| call | answers with |
 		| --- | --- |
 		| ~BT~jwtSign(claims, secret)~BT~ | ~BT~Str~BT~ — HS256, compact; **cannot fail** |
-		| ~BT~jwtVerify(token, secret) with T~BT~ | ~BT~Result<T, CryptoError>~BT~ |
-		| ~BT~jwtDecode(token) with T~BT~ | ~BT~Result<T, CryptoError>~BT~ — **without verifying** |
+		| ~BT~jwtVerify(token, secret)~BT~ | ~BT~Result<Str, CryptoError>~BT~ — the claims |
+		| ~BT~jwtDecode(token)~BT~ | ~BT~Result<Str, CryptoError>~BT~ — **without verifying** |
 		| ~BT~jwtHeader(token)~BT~ | ~BT~Result<hive.crypto.Header, CryptoError>~BT~ |
 
 		The claims are **one of your own types**, encoded and decoded by the same
@@ -725,8 +740,10 @@ func cryptoJwt(): Str {
 
 		token := hive.crypto.jwtSign(Claims("ada", hive.time.now() + 3600), secret)
 
-		if hive.crypto.jwtVerify(token, secret) with Claims is Result.Ok(claims) {
-			echo claims.sub
+		if hive.crypto.jwtVerify(token, secret) is Result.Ok(payload) {
+			if Claims.fromJson(payload) is Result.Ok(claims) {
+				echo claims.sub
+			}
 		}
 		~CODE~
 
@@ -1066,14 +1083,22 @@ func sql(): Str {
 		| ~BT~connect(driver, connString)~BT~ | ~BT~Result<SqlConnection, SqlError>~BT~ |
 		| ~BT~pool(driver, connString, maxOpen, maxIdle)~BT~ | ~BT~Result<SqlConnection, SqlError>~BT~ |
 		| ~BT~close(conn)~BT~ | ~BT~void~BT~ |
+		| ~BT~run(conn, fragment)~BT~ | whatever the query declared its rows to be |
+		| ~BT~raw(conn, text)~BT~ | ~BT~Result<Table, SqlError>~BT~ |
 
 		The driver is a ~BT~hive.sql.DatabaseDriver~BT~, built with ~BT~.SQLite()~BT~,
 		~BT~.PostgreSQL()~BT~ or ~BT~.Other(name)~BT~. A ~BT~SqlConnection~BT~ is **opaque**.
 
-		**Opening a connection is the whole of this module's surface.** Everything else
-		a program does with a database it does through a
-		[~BT~query~BT~ declaration](../queries.md), and ~BT~using <conn> run <query>~BT~ is what
-		runs one.
+		**Opening a connection and running what a query built is the whole of this
+		module's surface.** Everything else a program does with a database it does
+		through a [~BT~query~BT~ declaration](../queries.md): calling one answers with a
+		~BT~hive.sql.Fragment<rows>~BT~ — the text, and the values bound beside it,
+		nothing having run yet — and ~BT~run~BT~ is what runs one. It is spelled
+		~BT~Fragment~BT~ rather than ~BT~Query~BT~ because ~BT~Query~BT~ is ~BT~query~BT~
+		shouted, and a keyword is reserved however it is spelled.
+
+		SQL you genuinely assemble yourself goes through ~BT~raw~BT~, which is untyped by
+		construction — a ~BT~Table~BT~, header row and all — and greppable by design.
 
 		~CODE~hive
 		proc main(): void {
@@ -1083,7 +1108,7 @@ func sql(): Str {
 				hive.term.exit(1)
 			}
 			if opened is Result.Ok(db) {
-				if using db run findUser("ada") is Result.Ok(rows) {
+				if hive.sql.run(db, findUser("ada")) is Result.Ok(rows) {
 					for each user in rows {
 						echo user.name
 					}

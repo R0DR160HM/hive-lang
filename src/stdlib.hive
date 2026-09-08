@@ -68,11 +68,13 @@ func hasName(module: Str, name: Str): Bool {
 			|| name == "fromTable" || name == "toTable"
 	}
 	if module == "json" {
-		return name == "parse" || name == "encode" || name == "table"
+		return name == "flatten" || name == "encode" || name == "table"
 			|| name == "get"
 	}
-	if module == "crypto" {
-		if name == "jwtVerify" || name == "jwtDecode" {
+	// `run` answers with what the query it was handed declared, so with no
+	// arguments to read there is nothing for `resultOf` to say.
+	if module == "sql" {
+		if name == "run" {
 			return true
 		}
 	}
@@ -102,7 +104,7 @@ func resultOf(module: Str, name: Str, args: types.Ty[]): types.Ty {
 	if module == "json" { return jsonResult(name, args) }
 	if module == "crypto" { return cryptoResult(name) }
 	if module == "net" { return netResult(name) }
-	if module == "sql" { return sqlResult(name) }
+	if module == "sql" { return sqlResult(name, args) }
 	if module == "syslink" { return syslinkResult(name) }
 	if module == "ui" { return uiResult(name) }
 	return types.Ty.TUnknown()
@@ -158,6 +160,15 @@ func termResult(name: Str): types.Ty {
 
 func fileResult(name: Str): types.Ty {
 	fileError := types.Ty.TLib("file", "FileError")
+	// Reading a table is its own kind of failure — a file that opened and then
+	// turned out not to hold what it said it did — so it answers with an error
+	// of its own rather than a `FileError`.
+	tableError := types.Ty.TLib("file", "TableError")
+	if name == "csv" { return types.Ty.TResult(table(), tableError) }
+	// A spreadsheet holds many tables, so it comes back as one per sheet.
+	if name == "xlsx" || name == "ods" {
+		return types.Ty.TResult(types.Ty.TVec(table(), dynamic()), tableError)
+	}
 	if name == "read" { return types.Ty.TResult(types.Ty.TStr(), fileError) }
 	if name == "lines" || name == "list" {
 		return types.Ty.TResult(types.Ty.TVec(types.Ty.TStr(), dynamic()), fileError)
@@ -231,8 +242,11 @@ func jsonResult(name: Str, args: types.Ty[]): types.Ty {
 	if name == "get" {
 		return types.Ty.TResult(types.Ty.TStr(), types.Ty.TLib("json", "JsonError"))
 	}
-	// `parse` answers with whatever the `with T` clause said, which the caller
-	// applies — there is nothing in the arguments to read it off.
+	// A whole document flattened into `[path, value]` rows, which is the one
+	// reading that needs no type to say what it wants.
+	if name == "flatten" {
+		return types.Ty.TResult(table(), types.Ty.TLib("json", "JsonError"))
+	}
 	return types.Ty.TUnknown()
 }
 
@@ -259,14 +273,31 @@ func syslinkResult(name: Str): types.Ty {
 	return types.Ty.TUnknown()
 }
 
-// Opening a connection is the whole of this module's surface: everything else a
-// program does with a database it does through a `query`, and `using` is what
-// runs one.
-func sqlResult(name: Str): types.Ty {
+// Opening a connection and running what a query built are the whole of this
+// module's surface: everything else a program does with a database it does
+// through a `query`, and `run` is what runs one.
+func sqlResult(name: Str, args: types.Ty[]): types.Ty {
+	sqlError := types.Ty.TLib("sql", "SqlError")
 	if name == "connect" || name == "pool" {
-		return types.Ty.TResult(types.Ty.TLib("sql", "SqlConnection"), types.Ty.TLib("sql", "SqlError"))
+		return types.Ty.TResult(types.Ty.TLib("sql", "SqlConnection"), sqlError)
 	}
 	if name == "close" { return types.Ty.TVoid() }
+	// SQL assembled at run time has a shape nothing can know before it runs, so
+	// it comes back as a Table, header row and all.
+	if name == "raw" { return types.Ty.TResult(table(), sqlError) }
+	// Running a query answers with whatever it declared its rows to be — and a
+	// statement, which declared none, with how many rows it touched.
+	if name == "run" {
+		if args bounds 1 {
+			if args[1] is types.Ty.TFragment(rows) {
+				if rows is types.Ty.TVoid {
+					return types.Ty.TResult(types.Ty.TInt(), sqlError)
+				}
+				return types.Ty.TResult(rows, sqlError)
+			}
+		}
+		return types.Ty.TUnknown()
+	}
 	return types.Ty.TUnknown()
 }
 
@@ -310,8 +341,8 @@ func netResult(name: Str): types.Ty {
 }
 
 // Everything here is a `Str` in and a `Str` out, bar the three that can fail
-// and the two that read a token. `jwtVerify` and `jwtDecode` answer with
-// whatever the `with T` clause said, which the caller applies.
+// and the two that read a token — and those stop at the claims, which the
+// caller decodes with the codec their type derives.
 func cryptoResult(name: Str): types.Ty {
 	cryptoError := types.Ty.TLib("crypto", "CryptoError")
 	if name == "sha256" || name == "sha512" || name == "hmacSha256"
@@ -324,6 +355,12 @@ func cryptoResult(name: Str): types.Ty {
 	}
 	if name == "jwtHeader" {
 		return types.Ty.TResult(types.Ty.TLib("crypto", "Header"), cryptoError)
+	}
+	// Reading a token stops at the claims. What shape they are is the caller's
+	// business, and `<Type>.fromJson` is what says so — which is why this module
+	// no longer knows anything about JSON codecs.
+	if name == "jwtVerify" || name == "jwtDecode" {
+		return types.Ty.TResult(types.Ty.TStr(), cryptoError)
 	}
 	return types.Ty.TUnknown()
 }
@@ -452,6 +489,7 @@ func fieldsOf(module: Str, name: Str): ast.Field[dyn] {
 		if name == "FileError" {
 			return [field("reason"), field("path"), field("message")]
 		}
+		if name == "TableError" { return [field("path"), field("message")] }
 		return []
 	}
 	if module == "term" {
@@ -470,12 +508,6 @@ func fieldsOf(module: Str, name: Str): ast.Field[dyn] {
 	}
 	if module == "task" {
 		if name == "TimeoutError" { return [intField("waited"), field("message")] }
-		return []
-	}
-	if module == "" {
-		// The one type the language uses without a module, because `using` names
-		// no module either.
-		if name == "TableError" { return [field("path"), field("message")] }
 		return []
 	}
 	return []
@@ -767,7 +799,8 @@ func paramsOf(module: Str, name: Str): types.Ty[dyn] {
 		return []
 	}
 	if module == "file" {
-		if name == "write" || name == "append" || name == "copy" || name == "move" {
+		if name == "write" || name == "append" || name == "copy" || name == "move"
+			|| name == "csv" {
 			return [types.Ty.TStr(), types.Ty.TStr()]
 		}
 		return [types.Ty.TStr()]
@@ -789,7 +822,7 @@ func paramsOf(module: Str, name: Str): types.Ty[dyn] {
 		return []
 	}
 	if module == "json" {
-		if name == "table" || name == "parse" { return [types.Ty.TStr()] }
+		if name == "table" || name == "flatten" { return [types.Ty.TStr()] }
 		if name == "get" { return [table(), types.Ty.TStr()] }
 		return []
 	}
@@ -814,6 +847,11 @@ func paramsOf(module: Str, name: Str): types.Ty[dyn] {
 		if name == "pool" {
 			return [driver, types.Ty.TStr(), types.Ty.TInt(), types.Ty.TInt()]
 		}
+		if name == "raw" {
+			return [types.Ty.TLib("sql", "SqlConnection"), types.Ty.TStr()]
+		}
+		// `run`'s second argument is a query of some row type, which is a shape
+		// no single answer here fits. The checker holds it to being one.
 		return [types.Ty.TLib("sql", "SqlConnection")]
 	}
 	if module == "net" {
