@@ -2,22 +2,18 @@
 // =======
 // One flattened module to one Go file.
 //
-// Everything the emitter needs to decide, it decides from a **type**: `+` is
-// concatenation on strings and a fresh vector on vectors; `==` is a comparison
-// on scalars and a structural one on anything that owns storage; `/` is Go's
-// operator on a `Float` and a zero-safe call on an `Int`. So the walk carries an
-// `infer.Env` beside the output, and every statement hands back the scope it
-// leaves behind.
+// Everything the emitter decides, it decides from a type: `+` is concatenation on
+// strings and a fresh vector on vectors, `==` is a comparison on scalars and a
+// structural one on anything that owns storage. So the walk carries an `infer.Env`
+// beside the output, and every statement hands back the scope it leaves behind.
 //
-// It also carries the **wanted** type down. A `Result.Ok(v)` cannot say what its
-// error half is, an empty vector literal cannot say what it holds, and
-// `hive.map.new()` says only that it is empty — each takes its type from where it
-// lands, and this is the only pass that knows where that is.
+// It also carries the wanted type down. A `Result.Ok(v)` cannot say what its error
+// half is and an empty vector literal cannot say what it holds — each takes its type
+// from where it lands, and this is the only pass that knows where that is.
 //
 // Two things about the Go it writes: every local is followed by a `_ = name`,
-// because Hive allows a binding nothing reads and Go does not; and every value
-// goes through the generated `hive` runtime package, so the file imports exactly
-// one thing however much it does.
+// because Hive allows a binding nothing reads and Go does not; and every value goes
+// through the generated `hive` package, so the file imports exactly one thing.
 import ./ast
 import ./diag
 import ./infer
@@ -91,23 +87,20 @@ type Emit {
 	/// proved the *test* wrong rather than the program, so it is recorded and the
 	/// rest of the suite still runs, however deep inside an `if` it was written.
 	inTest: Bool
-	/// Whether what is being written is a call about to run on a thread of its
-	/// own. Its arguments are copied on this side of the fence (`8.6`), which is
-	/// a different job from guarding against a later write — so no argument is
+	/// Whether what is being written is a call about to run on a thread of its own.
+	/// Its arguments are copied on this side of the fence (`8.6`), so no argument is
 	/// lent while this holds.
 	spawning: Bool
 	/// Which output line holds the atom table, so it can be written again once
 	/// the whole program has been walked. `-1` until `main` is emitted.
 	atomLine: Int
 	/// Where each of the program's own declarations landed, as
-	/// `name<tab>firstLine<tab>lastLine`. Coverage is about the program the
-	/// author wrote, and this tells it from the clone helpers and atom table
-	/// beside it.
+	/// `name<tab>firstLine<tab>lastLine`. Coverage is about the program the author
+	/// wrote, and this tells it from the clone helpers beside it.
 	spans: Str[dyn]
 	/// What a deep copy still has to copy: `Type.field` for every field a write
 	/// path goes through, and the storage shapes that can leave a call inside its
-	/// answer. A field in neither owns storage the program never rewrites, so a
-	/// copy shares it — see `writes.hive`.
+	/// answer. A field in neither is shared — see `writes.hive`.
 	written: Str[dyn]
 	/// The regexes a string pattern's holes asked for, as the Go to compile. Each
 	/// becomes one package-level variable, so a pattern is compiled once at
@@ -118,7 +111,6 @@ type Emit {
 	line: Int
 	errors: diag.Diagnostic[dyn]
 }
-
 /// Emit a whole program.
 proc emitModule(m: ast.Module): Emitted {
 	t := types.tableOf(m)
@@ -442,9 +434,9 @@ proc emitCallable(em: mut Emit, env: infer.Env, name: Str, params: ast.Param[], 
 // The atom table is written into `main` before the declarations that mention the
 // atoms have been walked, so the placeholder is written again once they have.
 //
-// By line number, not by searching the output for what it said: a program whose
-// own text holds the words searched for would have that text rewritten — which
-// is what happened the first time this compiler compiled itself.
+// By line number, not by searching the output: a program whose own text holds the
+// words searched for would have that text rewritten — which is what happened the
+// first time this compiler compiled itself.
 proc patchAtoms(em: mut Emit): void {
 	at := em.atomLine
 	if em.out bounds at {
@@ -454,14 +446,12 @@ proc patchAtoms(em: mut Emit): void {
 
 // --- Copying -----------------------------------------------------------------
 //
-// Vectors, maps and the declared types holding them are values, but they lower
-// to Go slices and maps, which share storage. So a binding whose right-hand side
-// *names existing storage* has to copy, unless neither end could ever observe
-// the other's writes.
+// Vectors, maps and the declared types holding them are values, but they lower to Go
+// slices and maps, which share storage. So a binding whose right-hand side names
+// existing storage has to copy, unless neither end could observe the other's writes.
 //
-// The copy is deep and **type-directed** — chosen by the static type, with no
-// runtime reflection. A scalar needs nothing, a flat vector copies its backing
-// array, a nested one every level, a declared type its own generated clone.
+// The copy is deep and type-directed — chosen by the static type, with no runtime
+// reflection.
 
 /// The function that copies a value of `ty`, as a Go expression of one argument.
 func cloneFn(t: types.Table, ty: types.Ty): Str {
@@ -558,13 +548,13 @@ proc emitClone(em: mut Emit, name: Str, fields: ast.Field[], variants: ast.Varia
 	close(em, "}")
 }
 
-// One field of a copy. A field that owns storage is copied — unless nothing in
-// the program can write through it, in which case `out` already holds the same
-// header `v` does and sharing is indistinguishable from copying.
+// One field of a copy. A field that owns storage is copied — unless nothing in the
+// program can write through it, in which case sharing is indistinguishable from
+// copying.
 //
-// The saving is the difference between a copy that costs what the value *is* and
-// one that costs what the program can *do* to it: a racing game's four-hundred-
-// node circuit sits in the same record as the cars that move every frame.
+// The saving is the difference between a copy that costs what the value is and one
+// that costs what the program can do to it: a racing game's four-hundred-node
+// circuit sits in the same record as the cars that move every frame.
 proc cloneField(em: mut Emit, owner: Str, f: ast.Field, from: Str): void {
 	ty := types.resolve(em.table, f.declared)
 	if types.ownsStorage(em.table, ty) == false {
@@ -583,9 +573,8 @@ proc emitStmts(em: mut Emit, env: infer.Env, body: ast.Block, result: types.Ty):
 }
 
 // Each statement written with the bindings of everything before it in scope.
-// Recursion rather than a `mut infer.Env` threaded through a loop: an `Env`
-// carries the whole table, and a `mut` binding off an immutable one is copied at
-// every use to keep 8.3's invariant.
+// Recursion rather than a `mut infer.Env` through a loop: an `Env` carries the whole
+// table, and a `mut` binding off an immutable one is copied at every use.
 proc emitEach(em: mut Emit, env: infer.Env, stmts: ast.Stmt[], at: Int, result: types.Ty): infer.Env {
 	if stmts bounds at {
 		return emitEach(em, emitStmt(em, env, stmts[at], result), stmts, at + 1, result)
@@ -1106,11 +1095,8 @@ proc templateGuard(em: mut Emit, env: infer.Env, written: Str, holder: Str, part
 }
 
 /// The call that matches `written` against the template, and hands back what its
-/// holes bound.
-///
-/// **Every** template is one compiled expression, whichever kind of hole it
-/// holds — one matcher, so what a template means never depends on which sort of
-/// hole is in it.
+/// holes bound. Every template is one compiled expression, whichever kind of hole it
+/// holds, so what a template means never depends on which sort of hole is in it.
 proc templateMatch(em: mut Emit, written: Str, parts: token.StrPart[]): Str {
 	useModule(em, "regex")
 	return "hive.MatchPattern(" + written + ", " + patternVar(em, wholePattern(parts)) + ")"
@@ -1130,16 +1116,12 @@ func holeNames(parts: token.StrPart[]): Str[dyn] {
 	return out
 }
 
-/// The whole template as one regex: literal text quoted so it means itself, an
-/// open hole as the shortest run of anything, and a hole that says what it takes
-/// as what it said. Anchored at both ends, because a template covers the whole
-/// string.
+/// The whole template as one regex: literal text quoted so it means itself, an open
+/// hole as the shortest run of anything, and a hole that says what it takes as what
+/// it said. Anchored at both ends, because a template covers the whole string.
 ///
-/// `\{name}` and `\{name is (...)}` differ by exactly one thing: what goes
-/// between the parentheses.
-///
-/// `(?s)` leads it so `.` covers a newline too — text with a line break in it is
-/// still text.
+/// `(?s)` leads it so `.` covers a newline too — text with a line break is still
+/// text.
 func wholePattern(parts: token.StrPart[]): Str {
 	mut Str[dyn] out = ["(?s)\\A"]
 	for each part in parts {
@@ -1331,12 +1313,10 @@ proc rememberAlias(em: mut Emit, name: Str, value: ast.Expr): void {
 }
 
 /// The right-hand side of a binding, copied if it has to be — or `""` when the
-/// binding gets no variable at all because it is a second name for storage a
-/// first one already has.
+/// binding gets no variable at all, being a second name for storage a first one has.
 ///
-/// Classified by the mutability of its two ends: two immutable ends alias, since
-/// neither can mutate; two `mut` ends alias, since sharing is the intent; a
-/// mixed pair copies, since one end could write where the other can see.
+/// Classified by the mutability of its two ends: two immutable ends alias, two `mut`
+/// ends alias since sharing is the intent, and a mixed pair copies.
 proc bindingValue(em: mut Emit, env: infer.Env, value: ast.Expr, ty: types.Ty, mutable: Bool): Str {
 	written := expr(em, env, value, ty)
 	// A fresh right-hand side is already independent and is never copied.
@@ -2101,9 +2081,9 @@ proc walkBuiltin(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[], a: St
 
 // --- Calling Go --------------------------------------------------------------
 //
-// A Go function's wrapper: the copies in, the call, the copy out. Copying in
-// both directions keeps a mutation on the far side from being one of a Hive
-// value, and is what lets an imported Go function be a `func` here at all.
+// A Go function's wrapper: the copies in, the call, the copy out. Copying both ways
+// keeps a mutation on the far side from being one of a Hive value, and is what lets
+// an imported Go function be a `func` here at all.
 
 proc emitForeign(em: mut Emit, name: Str, params: ast.Param[], result: ast.TypeExpr, packageName: Str, symbol: Str, goResults: Int): void {
 	firstLine := len(em.out)
@@ -2126,9 +2106,8 @@ proc emitForeign(em: mut Emit, name: Str, params: ast.Param[], result: ast.TypeE
 	}
 	open(em, "func " + goIdent(name) + "(" + join(written, ", ") + ") " + goType(answered) + " \{")
 	// `(T, error)` and a lone `error` are both how a Go function reports failure
-	// and a `Result` is how Hive answers, so the values are put back together
-	// here. Which shape it is cannot be read off the Hive type, so the Go side's
-	// own count decides.
+	// and a `Result` is how Hive answers. Which shape it is cannot be read off the
+	// Hive type, so the Go side's own count decides.
 	if answered is types.Ty.TResult(ok, _) {
 		if goResults == 1 {
 			// Nothing but an `error` is a Go function that either worked or did
@@ -2151,10 +2130,9 @@ proc emitForeign(em: mut Emit, name: Str, params: ast.Param[], result: ast.TypeE
 	append(em.spans, name + "\t{firstLine}\t{len(em.out)}")
 }
 
-// Whether a type is a different Go *type* on the two sides, which decides
-// between copying a value and converting it. A map is (`Dict` here, Go map
-// there), a mirrored struct is (two named structs), and a vector or a map's
-// values are whenever what they hold is.
+// Whether a type is a different Go type on the two sides, which decides between
+// copying a value and converting it. A map is, a mirrored struct is, and a vector
+// or a map's values are whenever what they hold is.
 func shapeDiffers(em: Emit, ty: types.Ty): Bool {
 	if ty is types.Ty.TNamed(name) {
 		return indexOf(em.mirrors, name) is Result.Ok(_)
@@ -2319,14 +2297,13 @@ func lastOf(pieces: Str[]): Str {
 
 // --- Services ----------------------------------------------------------------
 //
-// An address is *called*, and what the call site does with it decides what it
-// means, exactly as for a func. Each carries three things the Hive source never
-// mentions: an encoder for the message, a decoder for the answer, and a
-// structural digest of the message type — so a peer built from a different
-// declaration fails loudly instead of decoding another type's bytes into this.
+// An address is called, and what the call site does with it decides what it means,
+// exactly as for a func. Each carries three things the Hive source never mentions:
+// an encoder for the message, a decoder for the answer, and a structural digest of
+// the message type.
 //
-// The answer needs no annotation: a service replies with one of its own
-// messages, so the decoder for a reply is the one its mailbox already uses.
+// The answer needs no annotation: a service replies with one of its own messages,
+// so the decoder for a reply is the one its mailbox already uses.
 
 func isAddress(env: infer.Env, e: ast.Expr): Bool {
 	ty := infer.typeOf(env, e)
@@ -2432,16 +2409,12 @@ proc syslinkDigest(em: mut Emit, ty: types.Ty): Str {
 	return "hive.SyslinkDigest(" + quoted(signatureOf(em, ty, seen)) + ")"
 }
 
-/// The signature a digest is taken over: a type's own spelling, and every
-/// variant and field it declares, recursively. A recursive type stops at its own
-/// name — the cycle adds nothing a decoder could differ on.
+/// The signature a digest is taken over: a type's own spelling, and every variant
+/// and field it declares, recursively. A recursive type stops at its own name.
 ///
-/// A field goes in under its **JSON key** rather than its Hive name, because
-/// that is what decides the bytes: two peers whose fields are spelled alike but
-/// annotated differently write different objects, and the digest is the thing
-/// that has to notice. A `Default` is left out for the same reason it is in —
-/// it changes what a decoder will *accept*, never what an encoder writes, so a
-/// peer that has one still reads what a peer without one sends.
+/// A field goes in under its JSON key rather than its Hive name, because that is
+/// what decides the bytes. A `Default` is left out: it changes what a decoder will
+/// accept, never what an encoder writes.
 proc signatureOf(em: mut Emit, ty: types.Ty, seen: Str[]): Str {
 	if ty is types.Ty.TStr { return "Str" }
 	if ty is types.Ty.TInt { return "Int" }
@@ -2525,11 +2498,9 @@ func handlerParams(em: Emit, handler: ast.Expr): ast.Param[dyn] {
 
 /// Whether an unanswered request may be failed the instant the turn ends.
 ///
-/// If a handler's envelope only ever reaches `answer`, `self` or `monitor`, it
-/// cannot outlive its turn — so once the turn ends no answer can still be coming
-/// and whoever is waiting is told at once. If it goes anywhere else a reply may
-/// genuinely be on its way, and the runtime keeps waiting. Nobody writes
-/// anything either way.
+/// If a handler's envelope only ever reaches `answer`, `self` or `monitor` it cannot
+/// outlive its turn, so once the turn ends whoever is waiting is told at once. If it
+/// goes anywhere else a reply may genuinely be on its way.
 func repliesInTurn(em: Emit, handler: ast.Expr): Bool {
 	mut name := ""
 	if handler is ast.Expr.Ident(named) {
@@ -2692,28 +2663,24 @@ func escapesInExpr(name: Str, e: ast.Expr): Bool {
 
 // --- What a caller may lend rather than copy ---------------------------------
 //
-// A `mut` value handed to an ordinary parameter is copied on the way in, so the
-// callee's immutable view really is one (8.1). Most of those copies cannot be
-// observed, and on a program of any size they are most of a compile.
+// A `mut` value handed to an ordinary parameter is copied on the way in (8.1). Most
+// of those copies cannot be observed, and on a program of any size they are most of
+// a compile.
 //
-// 8.4 takes an alias wherever one is indistinguishable from a copy, and for a
-// `func` the language supplies the proof. A `func` differs from a `proc` in
-// exactly two ways (4.2): no mutex parameter, and it cannot call a `proc`. So a
-// `func` **cannot write to storage its caller can see**, and the only storage
-// that leaves one is its result. When the result carries no storage, an argument
-// can be neither written by the callee nor outlive the call.
+// 8.4 takes an alias wherever one is indistinguishable from a copy, and for a `func`
+// the language supplies the proof: a `func` cannot write to storage its caller can
+// see, and the only storage that leaves one is its result. When the result carries
+// no storage, an argument can be neither written by the callee nor outlive the call.
 //
 // Four things are left out, each because the proof does not reach them:
 //
 //   * a `proc`, which may write through a mutex parameter of its own;
-//   * a `query` and an imported Go `func` — both `func`s in the table, neither a
-//     `CallableDecl`: a query keeps its arguments in the fragment it answers
-//     with, and the Go boundary copies for reasons of its own;
-//   * a result that carries storage, or holding a function value, since one can
-//     be a partial application holding the argument it was made from;
-//   * anything that can start a thread, directly or through what it calls. A
-//     thread outlives the call that started it, so an argument reaching one is
-//     storage the caller may still be writing (8.6).
+//   * a `query` and an imported Go `func` — a query keeps its arguments in the
+//     fragment it answers with, and the Go boundary copies for reasons of its own;
+//   * a result that carries storage, or holds a function value, since one can be a
+//     partial application holding the argument it was made from;
+//   * anything that can start a thread. A thread outlives the call that started it,
+//     so an argument reaching one is storage the caller may still be writing (8.6).
 
 /// The `func`s a caller may hand its own storage to rather than a copy of it.
 proc lentFuncs(t: types.Table, decls: ast.Decl[]): Str[dyn] {
@@ -2746,10 +2713,9 @@ func holdsFn(ty: types.Ty): Bool {
 	return false
 }
 
-// Every callable that can start a thread, directly or through something it
-// calls. The closure runs over the whole program rather than `func`s alone: a
-// superset costing nothing, since a `func` may only call `func`s. The graph is
-// built only when a program starts a thread at all.
+// Every callable that can start a thread, directly or through something it calls.
+// The closure runs over the whole program rather than `func`s alone: a superset
+// costing nothing, since a `func` may only call `func`s.
 proc threadStarters(decls: ast.Decl[]): Str[dyn] {
 	mut Str[dyn] found = []
 	for each d in decls {
@@ -2963,13 +2929,12 @@ func turnCall(callee: ast.Expr): Bool {
 
 // --- Queries -----------------------------------------------------------------
 //
-// A query is a function that builds a *fragment*: the text a database will read,
-// and the values bound beside it. Nothing a caller supplies reaches the text —
-// an interpolation is a placeholder, the value travels next to it — so a query
+// A query is a function that builds a fragment: the text a database will read, and
+// the values bound beside it. Nothing a caller supplies reaches the text, so a query
 // can only ever mean what it says.
 //
-// A `WHERE { }` block is the one part decided at run time, and only in which of
-// its predicates are there: every branch's text is fixed at compile time.
+// A `WHERE { }` block is the one part decided at run time, and only in which of its
+// predicates are there: every branch's text is fixed at compile time.
 
 proc emitQuery(em: mut Emit, env: infer.Env, name: Str, params: ast.Param[], result: ast.TypeExpr, sql: ast.SqlPart[]): void {
 	useModule(em, "sql")
@@ -3012,10 +2977,9 @@ proc emitSqlParts(em: mut Emit, env: infer.Env, parts: ast.SqlPart[]): void {
 	}
 }
 
-// One group, collected into `into`. A group contributing nothing is empty text,
-// so it disappears rather than leaving a dangling connective; one contributing
-// more than one predicate is parenthesised, so nesting cannot change how the
-// surrounding connective binds.
+// One group, collected into `into`. A group contributing nothing is empty text, so
+// it disappears rather than leaving a dangling connective; one contributing more
+// than one predicate is parenthesised.
 proc emitSqlGroup(em: mut Emit, env: infer.Env, group: ast.SqlGroup, into: Str): Str {
 	gathered := "_parts{em.temp}"
 	em.temp = em.temp + 1
@@ -3142,10 +3106,9 @@ proc emitRow(em: mut Emit, name: Str): void {
 
 // --- JSON codecs -------------------------------------------------------------
 //
-// A type declaration is the schema. A codec is generated from the declaration
-// rather than read off a value at runtime, which is what makes the field names
-// the ones that were *written*, a variant `\{"Name": \{...}}`, and a missing or
-// misshapen field an error carrying the path it failed at.
+// A type declaration is the schema. A codec is generated from the declaration rather
+// than read off a value at runtime, which is what makes the field names the ones
+// that were written and a missing field an error carrying the path it failed at.
 //
 // One codec per type, and only for a type the program really encodes or decodes.
 // Writing one asks for the codecs of the types its fields mention, so this is a
@@ -3224,10 +3187,9 @@ func encoderName(name: Str): Str {
 
 // --- Decoding ----------------------------------------------------------------
 
-/// The decoder `T.Variant.fromJson` names: this variant's payload, without the
-/// key the whole union is wrapped in. Its fields are its own and then the ones
-/// the type declared outside any variant, which is the order a constructor takes
-/// them in.
+/// The decoder `T.Variant.fromJson` names: this variant's payload, without the key
+/// the whole union is wrapped in. Its fields are its own and then the ones declared
+/// outside any variant, which is the order a constructor takes them in.
 proc emitVariantDecoder(em: mut Emit, name: Str, variant: Str): void {
 	whole := types.Ty.TNamed(name)
 	blank(em)
@@ -3331,11 +3293,10 @@ proc decodeFields(em: mut Emit, fields: ast.Field[], path: Str, zero: Str): void
 			line(em, held + ", jerr := " + decoderRef(em, ty) + "(" + raw + ", " + where + ")")
 			bailOut(em, zero)
 		} else {
-			// A field with somewhere to fall back to asks whether the key is
-			// there rather than insisting that it is, and reads a `null` as the
-			// same nothing an absent key is. What it does *not* excuse is a
-			// value of the wrong type: a default stands in for something that was
-			// not said, never for something that was said wrongly.
+			// A field with somewhere to fall back to asks whether the key is there
+			// rather than insisting, and reads a `null` as the same nothing an absent
+			// key is. What it does not excuse is a value of the wrong type: a default
+			// stands in for something not said, never for something said wrongly.
 			line(em, "{held} := " + literal(em, f.marks.fallback))
 			open(em, "if " + raw + ", found := hive.JsonLook(obj, " + quoted(key) + "); found && " + raw + ".Kind != 'n' \{")
 			line(em, "got, jerr := " + decoderRef(em, ty) + "(" + raw + ", " + where + ")")
@@ -3540,10 +3501,9 @@ proc libraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, args: ast
 		claims := argExpr(args, 0)
 		return "hive.CryptoJwtSign(" + encodeOf(em, infer.typeOf(env, claims), expr(em, env, claims, types.Ty.TUnknown()), 0) + ", " + expr(em, env, argExpr(args, 1), types.Ty.TStr()) + ")"
 	}
-	// An event attribute takes a message, or a function of what the user did to
-	// one. The runtime holds a message as an `any` — it never looks inside, only
-	// hands it back to the fold — so a handler taking what the user did is
-	// wrapped for its own return type to survive that.
+	// An event attribute takes a message, or a function of what the user did to one.
+	// The runtime holds a message as an `any` and only hands it back to the fold, so
+	// a handler taking what the user did is wrapped for its return type to survive.
 	if module == "ui" {
 		// A scene is a module of its own, because it is the one that carries a
 		// download: what brings it into a build is exactly what needs it.

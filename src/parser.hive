@@ -1,20 +1,15 @@
 // Parser
 // ======
-// A recursive-descent parser turning a token list into an `ast.Module`.
+// A recursive-descent parser turning a token list into an `ast.Module`. It is also
+// where a name's spelling is held to the rules in `naming`: this is the pass that
+// knows what a name is, and the last one holding the line to report it against.
 //
-// It is also where a name's spelling is held to the rules in `naming`. This is
-// the pass that knows what a name *is* — the same identifier token is a type in
-// one position and a field in the next — and the last one holding the line to
-// report it against.
+// Errors do not stop it. A failure sets a flag, every loop checks it and stops, and
+// the declaration loop clears it and skips to the next declaration. One error per
+// declaration is reported — everything after a mistake inside one is guesswork.
 //
-// **Errors do not stop it.** A failure sets a flag, every loop checks it and
-// stops, and the declaration loop at the top clears it and skips to the next
-// `proc`, `func`, `type`, `query` or `test`. One error per declaration is
-// reported, which is as many as are worth trusting — everything after a mistake
-// inside one is guesswork.
-//
-// The cursor is a `mut Parse` and the tokens are an immutable parameter beside
-// it, as in the lexer: reading a token costs nothing, and only the cursor moves.
+// The cursor is a `mut Parse` and the tokens are an immutable parameter beside it,
+// as in the lexer: reading a token costs nothing, and only the cursor moves.
 import ./ast
 import ./diag
 import ./lexer
@@ -288,13 +283,10 @@ proc parseDecl(ts: token.Token[], p: mut Parse): ast.Decl {
 // --- Query bodies ------------------------------------------------------------
 //
 // The lexer captured a query's body whole, most of it being text for a database
-// rather than tokens for a compiler. Its own small grammar is read here rather
-// than in the lexer because two of the three things in it are ordinary Hive
-// expressions — a `\{param}` and an `if`'s condition.
-//
-// Everything below works over the body's characters and hands each expression it
-// finds to the lexer and to `parseExpr`, so an expression inside a query is the
-// same expression it would be anywhere else.
+// rather than tokens for a compiler. Its own small grammar is read here because two
+// of the three things in it are ordinary Hive expressions — a `\{param}` and an
+// `if`'s condition — so an expression inside a query is the same expression it would
+// be anywhere else.
 
 // A query body's own failures. It has no tokens to report against — the body
 // arrived as one — so it reports against the declaration.
@@ -529,19 +521,13 @@ proc parseField(ts: token.Token[], p: mut Parse): ast.Field {
 //
 // `name: Str -- JSON as username; Default as "";`
 //
-// A `--` opens them and each clause ends at its `;`, so they may be written in
-// any order and a field may carry one, both, or — as every field written before
-// there were any does — neither.
+// A `--` opens them and each clause ends at its `;`, so they may be written in any
+// order and a field may carry one, both, or neither. `--` is the same two characters
+// the decrement step is written with, and there is nothing to tell apart: a step is
+// a statement and this is a type body.
 //
-// `--` is the same two characters the decrement step is written with, and there
-// is nothing to tell apart: a step is a statement and this is a type body, which
-// holds fields and variants and no statements at all. So the marker costs the
-// lexer nothing — it already produced this token — and needs no space behind it.
-//
-// They are **compile-time** and about the JSON codecs alone: what a field is
-// called on the wire, and what to read where the wire has nothing. Nothing here
-// reaches the value at run time, and nothing about the Hive side of the field
-// changes — `user.name` is still `name`, whatever JSON calls it.
+// They are compile-time and about the JSON codecs alone. Nothing here reaches the
+// value at run time — `user.name` is still `name`, whatever JSON calls it.
 
 proc parseMarks(ts: token.Token[], p: mut Parse): ast.Marks {
 	if kindAt(ts, p.pos) != token.Kind.MinusMinus() {
@@ -1351,11 +1337,10 @@ proc parseUnary(ts: token.Token[], p: mut Parse): ast.Expr {
 		bang := p.pos
 		advance(p)
 		operand := parseUnary(ts, p)
-		// A match is the one `Bool` a `!` may not have. Refused here rather than
-		// left to mean something: `is` narrows the value it matched and binds
-		// parts of it, and neither survives being negated, so a reader of
-		// `!(x is Shape.Circle(r))` would be looking at an `r` that can never be
-		// set. The `else` is where the other case goes.
+		// A match is the one `Bool` a `!` may not have. `is` narrows the value it
+		// matched and binds parts of it, and neither survives being negated, so a
+		// reader of `!(x is Shape.Circle(r))` would be looking at an `r` that can
+		// never be set. The `else` is where the other case goes.
 		if holdsMatch(operand) {
 			failAt(ts, p, bang, negatedMatch())
 		}
@@ -1364,11 +1349,9 @@ proc parseUnary(ts: token.Token[], p: mut Parse): ast.Expr {
 	return parsePower(ts, p)
 }
 
-/// Whether `e` holds an `is` that a `!` in front of it would be negating.
-///
-/// Recursive through `&&`, `||` and a second `!`, and no further: `is` binds
-/// looser than every comparison, so a match can sit under those three operators
-/// and nowhere else.
+/// Whether `e` holds an `is` that a `!` in front of it would be negating. Recursive
+/// through `&&`, `||` and a second `!`, and no further: `is` binds looser than every
+/// comparison, so a match can sit under those three operators and nowhere else.
 func holdsMatch(e: ast.Expr): Bool {
 	if e is ast.Expr.IsMatch(_, _) {
 		return true
@@ -1737,11 +1720,10 @@ proc stringPattern(ts: token.Token[], p: mut Parse, parts: token.StrPart[]): ast
 			if duplicateHole(named, name, ts, p) {
 				return ast.Pattern.StrTemplate(parts)
 			}
-			// Read here, once, so a malformed regex is a compile error naming
-			// what is wrong with it rather than something the Go toolchain says
-			// about a file nobody wrote. What comes back is the same pattern with
-			// its capturing groups made plain — a template's holes are its
-			// capture groups, one each.
+			// Read here, once, so a malformed regex is a compile error naming what
+			// is wrong rather than something the Go toolchain says about a file
+			// nobody wrote. What comes back is the same pattern with its capturing
+			// groups made plain.
 			if regex.check(pattern) is Result.Ok(compiled) {
 				append(named, name)
 				append(out, token.StrPart.Hole(name, compiled))
@@ -1768,11 +1750,10 @@ proc duplicateHole(named: Str[], name: Str, ts: token.Token[], p: mut Parse): Bo
 	return false
 }
 
-// Whether literal text holds what somebody meant as a regex hole — one written
-// where nothing reads it as such: a backtick pattern, or an escaped `\{`.
-//
-// The shape is looked for exactly, name and all, so an escaped brace with
-// unrelated text after it — `"\\{a} is (b)}"` — is left alone.
+// Whether literal text holds what somebody meant as a regex hole — one written where
+// nothing reads it as such: a backtick pattern, or an escaped `\{`. The shape is
+// looked for exactly, name and all, so an escaped brace with unrelated text after it
+// is left alone.
 func looksLikeHole(t: Str): Bool {
 	mut first := true
 	for each piece in split(t, "\{") {
