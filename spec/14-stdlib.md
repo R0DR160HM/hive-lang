@@ -913,6 +913,16 @@ fold sixty frames a second is therefore told about sixty of them; one that can
 manage twenty is told about twenty, of fifty milliseconds each, rather than sixty
 of seventeen.
 
+**A frame is reported before the window draws it, not after.** The picture a
+window is about to paint was described by the fold before this one, so nothing is
+gained by holding the report back until it is painted, and something is lost: the
+program would sit idle for the length of a render and its answer would then reach a
+window already busy with the next one. Reported first, the fold and the drawing of
+the previous world happen at the same time, in the two processes that each already
+own one of them. This is not observable in what a program is told — the gap is
+measured between the frames it was told about either way — but it is the difference
+between a fold that overlaps the picture and one that queues behind it.
+
 This is what makes `onFrame` a clock. Were it otherwise — one message per refresh
 regardless — a program too slow for the window would be handed more frames than it
 could take, and since nothing between the window and the fold ever drops a message,
