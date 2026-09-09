@@ -6217,6 +6217,9 @@ func uiSource(): Str {
 			Options []string
 			Flag    bool
 			Marks   []UiMark
+			// A scene only: one more entry than there are shapes, so shape i's record
+			// is Text[Cuts[i]:Cuts[i+1]]. It is what lets a frame carry a few slots.
+			Cuts []int32
 		}
 
 		// UiAttr is one attribute. Layout and styling attributes carry a number, a
@@ -6553,7 +6556,7 @@ func uiSource(): Str {
 				// every scene that reads a pad also reads a frame — a scene listening
 				// for a controller and nothing else got no id, so nothing it heard could
 				// be delivered anywhere.
-				case "onFrame", "onKeyDown", "onKeyUp", "onLook", "onGrab", "onPad":
+				case "onFrame", "onRate", "onKeyDown", "onKeyUp", "onLook", "onGrab", "onPad":
 					return true
 				}
 			}
@@ -6576,6 +6579,8 @@ func uiSource(): Str {
 			// of their own, so a world that moves sixty times a second does not re-send
 			// the document around it, and the canvas is never replaced.
 			scenes []string
+			// UiView.Cuts for each of those scenes, in the same order.
+			sceneCuts [][]int32
 			// And where each inset is looking, kept apart for the same reason: a second
 			// camera that moves is a document that would be re-sent every frame.
 			insets []string
@@ -6845,6 +6850,7 @@ func uiSource(): Str {
 				// render has no socket to send frames down, so it leaves an empty box.
 				at := len(r.scenes)
 				r.scenes = append(r.scenes, v.Text)
+				r.sceneCuts = append(r.sceneCuts, v.Cuts)
 				out := "<div" + r.common(v.Kind, v.Attrs)
 				if r.handlers != nil {
 					out += " data-scene=\"" + strconv.Itoa(at) + "\""
@@ -7194,9 +7200,9 @@ func uiSource(): Str {
 		// The live document. The shell keeps a socket open, swaps in whatever HTML
 		// arrives, and posts back the id of whatever was interacted with.
 		//
-		// Two kinds of frame arrive, told apart by their first character: H is the
-		// document, S is what the scenes want drawn. The split is what lets a scene be
-		// redrawn every frame while the document is only re-sent when it changed.
+		// Text frames are the document ("H") and the answer to a reported frame ("A");
+		// a binary frame is the world. The split is what lets a scene be redrawn every
+		// frame while the document is only re-sent when it changed.
 		const uiShell = ~BT~<!doctype html>
 		<html><head><meta charset="utf-8">
 		<meta name="viewport" content="width=device-width,initial-scale=1">
@@ -7204,14 +7210,15 @@ func uiSource(): Str {
 		<body><div class="h-root" id="root"></div>
 		<script>
 		var sock = new WebSocket("ws://" + location.host + "/_hive/socket?token=__TOKEN__");
+		// A Blob would only be readable through a promise; a world has to be read now.
+		sock.binaryType = "arraybuffer";
 		var root = document.getElementById("root");
 		var paintScene = null;
 		var attachScene = null;
-		var pendingScene = null;
+		var pendingScenes = [];
 		var sceneQueued = false;
 		// Whether the program still owes an answer for the last frame this window
-		// reported. See the note on the "A" frame below, and tick in the scene
-		// module, which is the one thing that reads it.
+		// reported. Read by tick in the scene module, and by nothing else.
 		var hiveOwed = false;
 		// Where a module that draws inside the window registers itself: the first is
 		// handed each scene frame, the second is called whenever the document was
@@ -7222,79 +7229,50 @@ func uiSource(): Str {
 		  attach();
 		  flushScene();
 		};
-		// The newest description of the world, drawn once, on the next frame.
-		//
-		// Parsing and applying every scene frame the moment it arrived is the wrong
-		// shape for anything a program can produce faster than this window swallows it.
-		// A scene is not a delta and not an event: it is the whole world, and the only
-		// one worth drawing is the last one. Handling them all in order means a window
-		// a little behind gets further behind with every frame, paying to build
-		// pictures the next one overwrites.
-		//
-		// So an arriving frame is stored rather than drawn, and one draw is asked for
-		// on the next animation frame. What was a queue that could only grow is now a
-		// slot with the freshest thing in it.
+		// Everything waiting, drawn once, on the next animation frame — rather than
+		// each frame the moment it lands, which is how a window a little behind gets
+		// further behind, building pictures the next frame overwrites.
 		function flushScene() {
 		  sceneQueued = false;
-		  if (!paintScene || pendingScene === null) { return; }
-		  var body = pendingScene;
-		  pendingScene = null;
-		  paintScene(body);
+		  if (!paintScene || !pendingScenes.length) { return; }
+		  var waiting = pendingScenes;
+		  pendingScenes = [];
+		  for (var i = 0; i < waiting.length; i++) { paintScene(waiting[i]); }
+		}
+
+		// A frame carrying only what changed has to be drawn after the one it was
+		// taken from, so it queues; one carrying the whole world empties the queue.
+		// Bytes five to eight are the frame followed, nought meaning none.
+		function keepScene(frame) {
+		  if (frame.byteLength >= 9 && new DataView(frame).getUint32(5, true) === 0) {
+		    pendingScenes.length = 0;
+		  }
+		  pendingScenes.push(frame);
+		  if (paintScene && !sceneQueued) {
+		    sceneQueued = true;
+		    requestAnimationFrame(flushScene);
+		  }
 		}
 		sock.onmessage = function (e) {
+		  // A binary frame is the world, and nothing else is binary.
+		  if (typeof e.data !== "string") { keepScene(e.data); return; }
 		  var head = e.data.charAt(0);
-		  // The answer. One goes out for every turn of the fold, whether or not
-		  // anything changed (see uiWindow.publish), and it is what lets this window
-		  // keep exactly one frame in flight instead of shouting sixty a second at a
-		  // program that may be managing twenty.
+		  // The answer, sent every turn of the fold whether or not anything changed
+		  // (see uiWindow.publish). It is what keeps one frame in flight instead of
+		  // sixty a second at a program that may be managing twenty.
 		  if (head === "A") { hiveOwed = false; return; }
-		  var body = e.data.slice(1);
-		  if (head === "S") {
-		    // A frame arriving before the drawing module has loaded is kept, not
-		    // dropped: it is the only description of the world there is, and it is kept
-		    // the same way one arriving after it is — hence one slot and not two.
-		    pendingScene = body;
-		    if (paintScene && !sceneQueued) {
-		      sceneQueued = true;
-		      requestAnimationFrame(flushScene);
-		    }
-		    return;
-		  }
-		  var focused = document.activeElement;
-		  var mark = focused && focused.getAttribute ? focused.getAttribute("data-h") : null;
-		  var start = focused && focused.selectionStart;
-		  var scrolled = uiScrolled(root, "", []);
-		  root.innerHTML = body;
-		  for (var s = 0; s < scrolled.length; s++) {
-		    var box = uiPath(scrolled[s][0]);
-		    if (box) { box.scrollTop = scrolled[s][1]; box.scrollLeft = scrolled[s][2]; }
-		  }
-		  if (mark) {
-		    var again = root.querySelector('[data-h="' + mark + '"]');
-		    if (again && again.focus) {
-		      again.focus();
-		      if (start != null && again.setSelectionRange) {
-		        try { again.setSelectionRange(start, start); } catch (err) {}
-		      }
-		    }
-		  }
-		  if (attachScene) { attachScene(); }
+		  // The canvas is found again only when the page actually changed shape:
+		  // finding it means reading where its box landed, which forces a layout.
+		  if (uiPatch(e.data.slice(1)) && attachScene) { attachScene(); }
 		};
 		sock.onclose = function () { document.body.classList.add("h-closed"); };
 		function send(id, kind, value, index) {
 		  if (sock.readyState !== 1) { return; }
 		  sock.send(JSON.stringify({ id: id, kind: kind, value: String(value), index: index | 0 }));
 		}
-		// How far anything on the page has been scrolled, and where to put it back.
-		//
-		// The same bug the focus restore above is for: a repaint assigns
-		// root.innerHTML, so a box the reader had scrolled comes back at the top —
-		// sixty times a second, a box that cannot be scrolled at all.
-		//
-		// The key is the path of child indices from the root, since data-h belongs to
-		// elements carrying a message. A path is exactly as stable as it should be: the
-		// same tree redrawn keeps every position, and a panel that has genuinely become
-		// a different one starts at the top.
+		// How far anything under a node has been scrolled, and where to put it back
+		// when that node is replaced. Keyed by the path of child indices, since data-h
+		// belongs to elements carrying a message and a scrolled box may carry none.
 		function uiScrolled(node, at, into) {
 		  if (node.scrollTop || node.scrollLeft) {
 		    into.push([at, node.scrollTop, node.scrollLeft]);
@@ -7304,13 +7282,149 @@ func uiSource(): Str {
 		  }
 		  return into;
 		}
-		function uiPath(at) {
-		  var node = root;
+		function uiPathFrom(from, at) {
+		  var node = from;
 		  var parts = at.split(".");
 		  for (var i = 1; i < parts.length && node; i++) {
 		    node = node.children[parts[i] | 0];
 		  }
 		  return node || null;
+		}
+
+		// --- the page, made to match the document -----------------------------------
+		//
+		// A program hands back a whole document every fold, and this walks it against
+		// the page rather than assigning it to root.innerHTML: same tag, patch and
+		// descend; different tag, swap; text that differs, write the text. What the
+		// browser lays out again is then what actually moved, which on a racing HUD is
+		// four numbers rather than eight hundred elements.
+		//
+		// Positional and not keyed, because a view rendered by the same code from a
+		// model that changed a little is the same tree with different numbers in it.
+		// Where that is wrong the tags disagree and the node is swapped.
+		//
+		// uiPatch answers with how many nodes were added, removed or swapped — nought
+		// on nearly every frame, and what tells a scene its box may have moved.
+		var draft = document.createElement("div");
+		var moved = 0;
+
+		function uiPatch(html) {
+		  draft.innerHTML = html;
+		  moved = 0;
+		  uiPatchKids(root, draft);
+		  return moved;
+		}
+
+		function uiPatchKids(live, next) {
+		  var a = live.firstChild, b = next.firstChild;
+		  while (a && b) {
+		    // Both read first: patching takes b out of next, and may take a out of live.
+		    var an = a.nextSibling, bn = b.nextSibling;
+		    uiPatchNode(live, a, b);
+		    a = an;
+		    b = bn;
+		  }
+		  while (a) {
+		    var gone = a.nextSibling;
+		    live.removeChild(a);
+		    moved++;
+		    a = gone;
+		  }
+		  while (b) {
+		    var after = b.nextSibling;
+		    live.appendChild(b);
+		    moved++;
+		    b = after;
+		  }
+		}
+
+		function uiPatchNode(parent, a, b) {
+		  if (a.nodeType !== b.nodeType || a.nodeName !== b.nodeName) {
+		    uiSwapNode(parent, a, b);
+		    return;
+		  }
+		  if (a.nodeType === 3) {
+		    if (a.nodeValue !== b.nodeValue) { a.nodeValue = b.nodeValue; }
+		    return;
+		  }
+		  if (a.nodeType !== 1) { return; }
+		  var name = a.nodeName;
+		  // Read before the children are patched, because patching a select's options
+		  // takes them out of the document being read from.
+		  var pick = name === "SELECT" ? uiChosenIn(b) : null;
+		  uiPatchAttrs(a, b);
+		  uiPatchKids(a, b);
+		  uiDress(a, b, name, pick);
+		}
+
+		function uiPatchAttrs(a, b) {
+		  var want = b.attributes, have = a.attributes, i;
+		  for (i = 0; i < want.length; i++) {
+		    var one = want[i];
+		    if (a.getAttribute(one.name) !== one.value) { a.setAttribute(one.name, one.value); }
+		  }
+		  // Backwards, because removing one shortens the list under the loop.
+		  for (i = have.length - 1; i >= 0; i--) {
+		    var was = have[i].name;
+		    if (!b.hasAttribute(was)) { a.removeAttribute(was); }
+		  }
+		}
+
+		// What an element shows that is not written in its attributes. Once a reader
+		// has typed in a field its value is a property, so setting the attribute alone
+		// would leave the page showing something the program never said.
+		function uiDress(a, b, name, pick) {
+		  if (name === "INPUT") {
+		    if (a.type === "checkbox" || a.type === "radio") {
+		      var on = b.hasAttribute("checked");
+		      if (a.checked !== on) { a.checked = on; }
+		      return;
+		    }
+		    var want = b.getAttribute("value");
+		    if (want !== null && a.value !== want) { a.value = want; }
+		    return;
+		  }
+		  if (name === "TEXTAREA") {
+		    if (a.value !== b.textContent) { a.value = b.textContent; }
+		    return;
+		  }
+		  if (name === "SELECT" && pick !== null && a.value !== pick) { a.value = pick; }
+		}
+
+		function uiChosenIn(el) {
+		  var opts = el.getElementsByTagName("option");
+		  for (var i = 0; i < opts.length; i++) {
+		    if (opts[i].hasAttribute("selected")) { return opts[i].getAttribute("value"); }
+		  }
+		  return null;
+		}
+
+		// A node that has genuinely become a different node. What the reader had done
+		// to the old one and the document does not say — where it was scrolled to, and
+		// the cursor in it — is carried across.
+		function uiSwapNode(parent, a, b) {
+		  var scrolled = a.nodeType === 1 ? uiScrolled(a, "", []) : [];
+		  var mark = null, start = null;
+		  var here = document.activeElement;
+		  if (here && a.nodeType === 1 && a.contains(here)) {
+		    mark = here.getAttribute ? here.getAttribute("data-h") : null;
+		    start = here.selectionStart;
+		  }
+		  parent.replaceChild(b, a);
+		  moved++;
+		  for (var s = 0; s < scrolled.length; s++) {
+		    var box = uiPathFrom(b, scrolled[s][0]);
+		    if (box) { box.scrollTop = scrolled[s][1]; box.scrollLeft = scrolled[s][2]; }
+		  }
+		  if (mark && b.nodeType === 1) {
+		    var again = b.querySelector('[data-h="' + mark + '"]');
+		    if (again && again.focus) {
+		      again.focus();
+		      if (start != null && again.setSelectionRange) {
+		        try { again.setSelectionRange(start, start); } catch (err) {}
+		      }
+		    }
+		  }
 		}
 		function holder(el) {
 		  while (el && el !== root) {
@@ -7346,11 +7460,9 @@ func uiSource(): Str {
 		  send(el.getAttribute("data-h"), "click", "", idx);
 		});
 
-		// A click is a press and a release on the same thing — and on a page that
-		// rebuilds itself sixty times a second, that cannot be the same node. Every
-		// repaint assigns root.innerHTML, so the browser sees two different elements
-		// and fires no click at all. Invisible in a static window, total in one drawing
-		// a world.
+		// A click is a press and a release on the same node, and a repaint between the
+		// two that swaps that node leaves the browser with two different elements and
+		// no click at all. Invisible in a static window, total in one drawing a world.
 		//
 		// So the press is remembered by handle rather than by node, and the release
 		// decides. The browser's own click still wins wherever it happens, being
@@ -7470,62 +7582,94 @@ func uiSource(): Str {
 		// One running window: the page it last rendered, the sockets watching it, and
 		// the handlers the current page's ids stand for.
 		type uiWindow struct {
-			mu       sync.Mutex
-			html     string
+			mu   sync.Mutex
+			html string
+			// The world as it was last published: the payload, where each shape's record
+			// lies inside it, where the insets were looking, and which turn of the fold
+			// it came from. The last three are what a difference is made of.
 			scene    string
+			cuts     []int32
+			insets   string
+			worldGen uint32
 			handlers map[string][]UiAttr
-			watchers map[NetWsConnection]bool
+			// Every watcher, and the world it is known to be holding. A page holding the
+			// frame before this one can be sent the difference; anything else gets the
+			// lot.
+			watchers map[NetWsConnection]uint32
 			token    string
+		}
+
+		// One watcher as publish found it, so the sending can happen off the lock.
+		type uiWatcher struct {
+			conn NetWsConnection
+			near bool
 		}
 
 		func (w *uiWindow) publish(v UiView) {
 			r := &uiRender{handlers: map[string][]UiAttr{}}
 			r.view(v)
+			scene, cuts := uiSceneWorld(r.scenes, r.sceneCuts)
+			insets := uiSceneLooks(r.insets)
 			w.mu.Lock()
 			html := r.out.String()
-			scene := uiScenes(r.scenes, r.insets)
 			// What actually changed. A window with no scene in it is exactly what it was
 			// before: one frame per turn, and nothing here costs it anything.
 			document := html != w.html
-			world := scene != w.scene
+			world := scene != "" && (scene != w.scene || insets != w.insets)
+			was, wasCuts := w.scene, w.cuts
 			w.html = html
 			w.scene = scene
+			w.cuts = cuts
+			w.insets = insets
 			w.handlers = r.handlers
-			watchers := make([]NetWsConnection, 0, len(w.watchers))
-			for c := range w.watchers {
-				watchers = append(watchers, c)
+			// Counts worlds that were sent, not folds that happened, so a page holding
+			// the last world anybody sent is not behind because time passed.
+			if world {
+				w.worldGen++
+			}
+			seq := w.worldGen
+			watchers := make([]uiWatcher, 0, len(w.watchers))
+			for c, held := range w.watchers {
+				watchers = append(watchers, uiWatcher{conn: c, near: held == seq-1})
+				if world {
+					w.watchers[c] = seq
+				}
 			}
 			w.mu.Unlock()
+			var edit, whole []byte
+			if world {
+				edit = uiSceneFrame(scene, cuts, insets, was, wasCuts, seq, seq-1)
+			}
 			for _, c := range watchers {
+				// The answer first, not last: the fold is over now, not after a document
+				// has gone down the socket and been laid out. Unconditional — tying it to
+				// H or S would deadlock the moment a fold left the page exactly as it was.
+				NetWsSend(c.conn, "A")
 				if document {
-					NetWsSend(c, "H"+html)
+					NetWsSend(c.conn, "H"+html)
 				}
-				if world {
-					NetWsSend(c, "S"+scene)
+				if !world {
+					continue
 				}
-				// The answer, and it goes whether or not anything changed.
-				//
-				// A window reports one frame per animation frame and nothing ever drops
-				// one, so a fold that cannot finish inside a frame does not skip one —
-				// it falls behind, the mailbox grows, and every keypress waits behind a
-				// queue of stale frames. The world runs slow at the same time, being
-				// stepped by gaps arriving slower than they happened.
-				//
-				// This is the byte that stops it: the window holds its next frame until
-				// this arrives, so at most one is in flight.
-				//
-				// Unconditional on purpose — tying it to H or S would deadlock the
-				// moment a fold left the page exactly as it was.
-				NetWsSend(c, "A")
+				// A page one frame behind is sent the difference; anything else — just
+				// arrived, or asked to start again — the whole world, built once however
+				// many are asking for it.
+				if c.near {
+					uiWsSend(c.conn, edit)
+					continue
+				}
+				if whole == nil {
+					whole = uiSceneFrame(scene, cuts, insets, "", nil, seq, 0)
+				}
+				uiWsSend(c.conn, whole)
 			}
 		}
 
-		// The scene frame: what the window draws, and where every inset is looking at
-		// it from. A tree with no scene has no frame at all, which keeps the whole
-		// mechanism invisible to a window that never draws one.
-		func uiScenes(scenes []string, insets []string) string {
+		// What the window draws, out of a tree that may hold no scene at all — which
+		// is what keeps the whole mechanism invisible to a window that never draws one.
+		func uiSceneWorld(scenes []string, cuts [][]int32) (string, []int32) {
 			if len(scenes) == 0 {
-				return ""
+				return "", nil
 			}
 			// A window draws one scene. A view holding several is a mistake worth saying
 			// out loud once — the alternative is a second picture that is silently
@@ -7540,8 +7684,137 @@ func uiSource(): Str {
 						strconv.Itoa(len(scenes)) + " — the first one is the one on screen")
 				})
 			}
-			return "{\"w\":[" + strings.Join(scenes, ",") +
-				"],\"i\":[" + strings.Join(insets, ",") + "]}"
+			return scenes[0], cuts[0]
+		}
+
+		// Where every inset is looking: one camera after another behind a count. An
+		// inset holds no world of its own, so this is a few dozen bytes however big
+		// the scene in front of it is.
+		func uiSceneLooks(insets []string) string {
+			many := len(insets)
+			if many > 255 {
+				many = 255
+			}
+			var b strings.Builder
+			uiPackU8(&b, many)
+			for i := 0; i < many; i++ {
+				b.WriteString(insets[i])
+			}
+			return b.String()
+		}
+
+		// One frame of the world, carrying only the shapes whose record is not what the
+		// page already holds. A circuit is eighteen hundred shapes of which the
+		// scenery — three quarters of them — never moves.
+		//
+		// seq names this frame and prev the one it was taken from, because a difference
+		// means nothing against any other. A page that finds prev is not what it holds
+		// asks for the world again; prev nought means this frame is the whole of it.
+		func uiSceneFrame(scene string, cuts []int32, insets string,
+			was string, wasCuts []int32, seq, prev uint32) []byte {
+			head := len(scene)
+			if len(cuts) > 0 {
+				head = int(cuts[0])
+			}
+			shapes := len(cuts) - 1
+			if shapes < 0 {
+				shapes = 0
+			}
+			// How much of what the page holds is worth comparing against. Nothing, when
+			// this frame is the whole world.
+			held := 0
+			if prev != 0 && len(wasCuts) > 0 {
+				held = len(wasCuts) - 1
+			}
+			changed := make([]int32, 0, shapes)
+			for i := 0; i < shapes; i++ {
+				if i < held && scene[cuts[i]:cuts[i+1]] == was[wasCuts[i]:wasCuts[i+1]] {
+					continue
+				}
+				changed = append(changed, int32(i))
+			}
+			var b strings.Builder
+			b.Grow(head + len(insets) + len(changed)*48 + 32)
+			b.WriteByte('S')
+			uiPackU32(&b, int(seq))
+			uiPackU32(&b, int(prev))
+			// The camera and the shape count, already written at the front of the
+			// scene's own payload.
+			b.WriteString(scene[:head])
+			b.WriteString(insets)
+			uiPackU32(&b, len(changed))
+			for _, at := range changed {
+				uiPackU32(&b, int(at))
+				b.WriteString(scene[cuts[at]:cuts[at+1]])
+			}
+			return []byte(b.String())
+		}
+
+		// What NetWsSend does, as a binary frame: a text frame has to carry valid
+		// UTF-8 and a float is not any.
+		func uiWsSend(c NetWsConnection, payload []byte) {
+			if c.ws == nil {
+				return
+			}
+			_ = c.ws.writeFrame(wsBinary, payload)
+		}
+
+		// --- numbers, as bytes -----------------------------------------------------
+		//
+		// Little-endian, which is what every machine a browser runs on is, and what the
+		// DataView on the other side is asked for.
+
+		func uiPackU8(b *strings.Builder, v int) { b.WriteByte(byte(v)) }
+
+		func uiPackU16(b *strings.Builder, v int) {
+			b.WriteByte(byte(v))
+			b.WriteByte(byte(v >> 8))
+		}
+
+		func uiPackU32(b *strings.Builder, v int) {
+			b.WriteByte(byte(v))
+			b.WriteByte(byte(v >> 8))
+			b.WriteByte(byte(v >> 16))
+			b.WriteByte(byte(v >> 24))
+		}
+
+		// A non-finite number goes as 0. One reaching the page puts a mesh nowhere and
+		// keeps it there, since every matrix built from it is non-finite too.
+		func uiPackF32(b *strings.Builder, v float64) {
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				v = 0
+			}
+			uiPackU32(b, int(math.Float32bits(float32(v))))
+		}
+
+		// A short string behind one byte of length: colours, surface names and voices,
+		// which are identifiers and never long.
+		func uiPackWord(b *strings.Builder, s string) {
+			if len(s) > 255 {
+				s = uiPackCut(s, 255)
+			}
+			b.WriteByte(byte(len(s)))
+			b.WriteString(s)
+		}
+
+		// A long one behind two: the words on a label and the name of a sound, which
+		// are the only prose a scene carries.
+		func uiPackLong(b *strings.Builder, s string) {
+			if len(s) > 65535 {
+				s = uiPackCut(s, 65535)
+			}
+			uiPackU16(b, len(s))
+			b.WriteString(s)
+		}
+
+		// Cut to a length in bytes without splitting a rune, because the page decodes
+		// UTF-8 and half a rune is not any. Back up while the byte the cut lands on is
+		// a continuation byte; callers only ask when the string is longer than that.
+		func uiPackCut(s string, most int) string {
+			for most > 0 && s[most]&0xC0 == 0x80 {
+				most--
+			}
+			return s[:most]
 		}
 
 		var uiSceneCrowd sync.Once
@@ -7626,6 +7899,10 @@ func uiSource(): Str {
 				// carries whether the window is holding the mouse now.
 				case kind == "frame" && a.Kind == "onFrame" && a.FnInt != nil:
 					return a.FnInt(index), true
+				// How often the window is handed a frame to draw: the screen's own rate,
+				// not what this program is managing to do with it.
+				case kind == "rate" && a.Kind == "onRate" && a.FnInt != nil:
+					return a.FnInt(index), true
 				case kind == "keydown" && a.Kind == "onKeyDown" && a.FnStr != nil:
 					return a.FnStr(value), true
 				case kind == "keyup" && a.Kind == "onKeyUp" && a.FnStr != nil:
@@ -7661,7 +7938,7 @@ func uiSource(): Str {
 			repliesInTurn bool,
 		) {
 			w := &uiWindow{
-				watchers: map[NetWsConnection]bool{},
+				watchers: map[NetWsConnection]uint32{},
 				token:    CryptoRandomHex(16),
 			}
 			// Rendering is the only thing wrapped around the program's own handler, and
@@ -7732,16 +8009,13 @@ func uiSource(): Str {
 				conn := NetWsConnection{ws: socket}
 				defer socket.close()
 				w.mu.Lock()
-				w.watchers[conn] = true
+				w.watchers[conn] = w.worldGen
 				current := w.html
-				world := w.scene
 				w.mu.Unlock()
 				// A page that has just connected is behind on both frames, whether or not
 				// either has changed lately.
 				NetWsSend(conn, "H"+current)
-				if world != "" {
-					NetWsSend(conn, "S"+world)
-				}
+				w.reseed(conn)
 				uiPump(w, addr, conn)
 				w.mu.Lock()
 				delete(w.watchers, conn)
@@ -7763,6 +8037,22 @@ func uiSource(): Str {
 			_ = http.Serve(listener, mux)
 		}
 
+		// The whole world, to one page that cannot draw what it was sent: it has only
+		// just connected, or the difference it received was taken from a frame it does
+		// not hold.
+		func (w *uiWindow) reseed(conn NetWsConnection) {
+			w.mu.Lock()
+			scene, cuts, insets, seq := w.scene, w.cuts, w.insets, w.worldGen
+			if _, watching := w.watchers[conn]; watching {
+				w.watchers[conn] = seq
+			}
+			w.mu.Unlock()
+			if scene == "" {
+				return
+			}
+			uiWsSend(conn, uiSceneFrame(scene, cuts, insets, "", nil, seq, 0))
+		}
+
 		// Everything a socket says, turned into messages and posted to the fold.
 		func uiPump(w *uiWindow, addr SyslinkAddress, conn NetWsConnection) {
 			for {
@@ -7772,6 +8062,12 @@ func uiSource(): Str {
 				}
 				id, kind, value, index := uiEvent(got.Ok())
 				if id == "" {
+					continue
+				}
+				// Not an event and never folded: a page saying it has lost the thread of
+				// the world. See uiSceneFrame.
+				if kind == "resync" {
+					w.reseed(conn)
 					continue
 				}
 				if msg, ok := w.message(id, kind, value, index); ok {
@@ -7936,7 +8232,6 @@ func uiSceneSource(): Str {
 
 		import (
 			"embed"
-			"math"
 			"net/http"
 			"strconv"
 			"strings"
@@ -8209,6 +8504,7 @@ func uiSceneSource(): Str {
 		func UiAttrShadows(on bool) UiAttr    { return UiAttr{Kind: "shadows", Flag: on} }
 
 		func UiAttrOnFrame(f func(int) any) UiAttr    { return UiAttr{Kind: "onFrame", FnInt: f} }
+		func UiAttrOnRate(f func(int) any) UiAttr     { return UiAttr{Kind: "onRate", FnInt: f} }
 		func UiAttrOnKeyDown(f func(string) any) UiAttr { return UiAttr{Kind: "onKeyDown", FnStr: f} }
 		func UiAttrOnKeyUp(f func(string) any) UiAttr   { return UiAttr{Kind: "onKeyUp", FnStr: f} }
 		func UiAttrOnGrab(f func(bool) any) UiAttr      { return UiAttr{Kind: "onGrab", FnBool: f} }
@@ -8235,18 +8531,19 @@ func uiSceneSource(): Str {
 			// everything so far — a hundred-kilobyte frame was seventeen allocations and
 			// half a megabyte of copying before a single shape was described. The
 			// estimate need not be right, only close enough that the doubling stops.
-			b.Grow(len(shapes)*112 + 256)
-			b.WriteString("{")
+			b.Grow(len(shapes)*40 + 256)
 			uiSceneCamera(&b, attrs)
-			b.WriteString(",\"o\":[")
-			for i, s := range shapes {
-				if i > 0 {
-					b.WriteByte(',')
-				}
-				uiSceneShape(&b, &s)
+			uiPackU32(&b, len(shapes))
+			// Where each record starts, and after the last of them where it ends. One
+			// integer a shape, and all the window needs to send one without its
+			// neighbours — see uiSceneFrame.
+			cuts := make([]int32, len(shapes)+1)
+			for i := range shapes {
+				cuts[i] = int32(b.Len())
+				uiSceneShape(&b, &shapes[i])
 			}
-			b.WriteString("]}")
-			return UiView{Kind: "scene", Attrs: attrs, Text: b.String()}
+			cuts[len(shapes)] = int32(b.Len())
+			return UiView{Kind: "scene", Attrs: attrs, Text: b.String(), Cuts: cuts}
 		}
 
 		// UiInset is the second look at that world, and it holds no world of its own —
@@ -8258,9 +8555,7 @@ func uiSceneSource(): Str {
 		// over the picture rather than in it.
 		func UiInset(attrs []UiAttr, views []UiView) UiView {
 			var b strings.Builder
-			b.WriteString("{")
 			uiSceneCamera(&b, attrs)
-			b.WriteString("}")
 			return UiView{Kind: "inset", Attrs: attrs, Children: views, Text: b.String()}
 		}
 
@@ -8269,40 +8564,63 @@ func uiSceneSource(): Str {
 		// with no camera attributes is a metre and a half above the origin looking
 		// down -Z, which is a view of something rather than a blank.
 		func uiSceneCamera(b *strings.Builder, attrs []UiAttr) {
-			b.WriteString("\"eye\":")
-			uiSceneVecTo(b, uiSceneNums(attrs, "eye", uiSceneEyeAt))
-			b.WriteString(",\"aim\":")
-			uiSceneVecTo(b, uiSceneNums(attrs, "aim", uiSceneAimAt))
-			if lens, ok := uiFind(attrs, "lens"); ok {
-				b.WriteString(",\"lens\":" + strconv.Itoa(lens.Num))
-			}
-			if fog, ok := uiFind(attrs, "fog"); ok {
-				b.WriteString(",\"fog\":" + strconv.Itoa(fog.Num))
-			}
+			eye := uiSceneNums(attrs, "eye", uiSceneEyeAt)
+			aim := uiSceneNums(attrs, "aim", uiSceneAimAt)
+			uiPackF32(b, eye[0])
+			uiPackF32(b, eye[1])
+			uiPackF32(b, eye[2])
+			uiPackF32(b, aim[0])
+			uiPackF32(b, aim[1])
+			// Which of the rest of it there is, in one byte, so that a camera saying
+			// nothing about its lens costs nothing for the lens it did not name.
+			lens, hasLens := uiFind(attrs, "lens")
+			fog, hasFog := uiFind(attrs, "fog")
 			// The sky is the widget's own background, which is the same attribute a
 			// column paints itself with: what is behind the content, in the one place
 			// where what is behind the content is the sky.
-			if sky, ok := uiFind(attrs, "background"); ok {
-				b.WriteString(",\"sky\":\"" + uiSceneTone(sky.Enum, "#8ecbff") + "\"")
+			sky, hasSky := uiFind(attrs, "background")
+			bits := 0
+			if hasLens {
+				bits |= uiSceneEyeLens
+			}
+			if hasFog {
+				bits |= uiSceneEyeFog
+			}
+			if hasSky {
+				bits |= uiSceneEyeSky
 			}
 			if grab, ok := uiFind(attrs, "grab"); ok && grab.Flag {
-				b.WriteString(",\"grab\":1")
+				bits |= uiSceneEyeGrab
 			}
-			// **Written only when it is false**, which is what makes "absent means yes"
-			// true on the page as well as here: every scene ever written says nothing
-			// and gets shadows, and the one that has turned them off says so.
+			// Set only when it is false, which is what makes "absent means yes" true on
+			// the page as well as here: a scene that says nothing gets shadows.
 			if lit, ok := uiFind(attrs, "shadows"); ok && !lit.Flag {
-				b.WriteString(",\"flat\":1")
+				bits |= uiSceneEyeFlat
+			}
+			uiPackU8(b, bits)
+			if hasLens {
+				uiPackU16(b, lens.Num)
+			}
+			if hasFog {
+				uiPackU16(b, fog.Num)
+			}
+			if hasSky {
+				uiPackWord(b, uiSceneTone(sky.Enum, "#8ecbff"))
 			}
 			// Which events the program is actually listening for. A page that would only
 			// be telling the fold about frames nobody folds says nothing instead.
-			b.WriteString(",\"on\":\"" + uiSceneWants(attrs) + "\"")
+			uiPackWord(b, uiSceneWants(attrs))
 		}
 
 		func uiSceneWants(attrs []UiAttr) string {
 			var b strings.Builder
 			if _, ok := uiFind(attrs, "onFrame"); ok {
 				b.WriteString("f")
+			}
+			// Working out what the screen can do costs a sort of two seconds of gaps
+			// once a second. A scene that does not ask does not pay for it.
+			if _, ok := uiFind(attrs, "onRate"); ok {
+				b.WriteString("r")
 			}
 			if _, ok := uiFind(attrs, "onKeyDown"); ok {
 				b.WriteString("k")
@@ -8422,57 +8740,125 @@ func uiSceneSource(): Str {
 			// Writing all four sixty times a second for something nobody can see is why
 			// this is a branch of its own rather than four more conditionals below.
 			if s.Kind == "sound" {
-				b.WriteString("{\"k\":\"sound\",\"x\":")
-				uiSceneStrTo(b, s.Text)
-				b.WriteString(",\"p\":")
+				voice := uiScenePartEnum(p.voice)
+				// A sound that names no recording says nothing, and is the sound this
+				// renderer has always made.
+				track := ""
+				if p.track != nil {
+					track = p.track.Str
+				}
+				mask := 0
+				if voice != "" {
+					mask |= uiSceneHasVoice
+				}
+				if track != "" {
+					mask |= uiSceneHasTrack
+				}
+				uiPackU8(b, uiSceneSound)
+				uiPackU8(b, mask)
 				uiSceneVecTo(b, uiScenePartNums(p.at, uiSceneOrigin))
-				if voice := uiScenePartEnum(p.voice); voice != "" {
-					b.WriteString(",\"v\":\"")
-					b.WriteString(voice)
-					b.WriteByte('"')
+				uiPackLong(b, s.Text)
+				if voice != "" {
+					uiPackWord(b, voice)
 				}
-				// Only where there is one. A sound that names no recording writes nothing,
-				// and is the sound this renderer has always made.
-				if p.track != nil && p.track.Str != "" {
-					b.WriteString(",\"t\":")
-					uiSceneStrTo(b, p.track.Str)
+				if track != "" {
+					uiPackWord(b, track)
 				}
-				b.WriteString(",\"h\":")
-				uiSceneFTo(b, uiScenePartOne(p.pitch, 1))
-				b.WriteString(",\"g\":")
-				uiSceneFTo(b, uiScenePartOne(p.volume, 1))
-				b.WriteByte('}')
+				uiPackF32(b, uiScenePartOne(p.pitch, 1))
+				uiPackF32(b, uiScenePartOne(p.volume, 1))
 				return
 			}
-			b.WriteString("{\"k\":\"")
-			b.WriteString(s.Kind)
-			b.WriteString("\",\"c\":\"")
-			b.WriteString(uiSceneTone(uiScenePartEnum(p.paint), "#cfd6de"))
-			b.WriteByte('"')
+			made := uiScenePartEnum(p.surface)
+			mask := 0
 			// A line carries both its ends in its payload, so it has no position of its
 			// own and no rotation to apply to it.
 			if s.Kind != "line" {
-				b.WriteString(",\"p\":")
-				uiSceneVecTo(b, uiScenePartNums(p.at, uiSceneOrigin))
+				mask |= uiSceneHasAt
 				if p.turn != nil && uiSceneAny(p.turn.Nums) {
-					b.WriteString(",\"r\":")
-					uiSceneVecTo(b, p.turn.Nums)
+					mask |= uiSceneHasTurn
 				}
 			}
 			if len(s.Nums) > 0 {
-				b.WriteString(",\"d\":")
-				uiSceneVecTo(b, s.Nums)
+				mask |= uiSceneHasSize
 			}
-			if made := uiScenePartEnum(p.surface); made != "" {
-				b.WriteString(",\"s\":\"")
-				b.WriteString(made)
-				b.WriteByte('"')
+			if made != "" {
+				mask |= uiSceneHasSurface
 			}
 			if s.Text != "" {
-				b.WriteString(",\"x\":")
-				uiSceneStrTo(b, s.Text)
+				mask |= uiSceneHasWords
 			}
-			b.WriteByte('}')
+			uiPackU8(b, uiSceneKindCode(s.Kind))
+			uiPackU8(b, mask)
+			uiPackWord(b, uiSceneTone(uiScenePartEnum(p.paint), "#cfd6de"))
+			if mask&uiSceneHasAt != 0 {
+				uiSceneVecTo(b, uiScenePartNums(p.at, uiSceneOrigin))
+			}
+			if mask&uiSceneHasTurn != 0 {
+				uiSceneVecTo(b, uiScenePartNums(p.turn, uiSceneOrigin))
+			}
+			if mask&uiSceneHasSize != 0 {
+				uiPackU8(b, len(s.Nums))
+				for _, n := range s.Nums {
+					uiPackF32(b, n)
+				}
+			}
+			if mask&uiSceneHasSurface != 0 {
+				uiPackWord(b, made)
+			}
+			if mask&uiSceneHasWords != 0 {
+				uiPackLong(b, s.Text)
+			}
+		}
+
+		// The kinds as numbers, which of a shape's parts its record carries, and which
+		// of a camera's. Together they make a record self-describing, so the page can
+		// tell where one ends without a length in front of it. KINDS and the masks
+		// read in uiSceneJs are the other half of this and move with it.
+		const (
+			uiSceneBox      = 0
+			uiSceneSphere   = 1
+			uiSceneCylinder = 2
+			uiSceneCone     = 3
+			uiSceneGround   = 4
+			uiSceneLabel    = 5
+			uiSceneLine     = 6
+			uiSceneSound    = 7
+
+			uiSceneHasAt      = 1
+			uiSceneHasTurn    = 2
+			uiSceneHasSize    = 4
+			uiSceneHasSurface = 8
+			uiSceneHasWords   = 16
+			uiSceneHasVoice   = 32
+			uiSceneHasTrack   = 64
+
+			uiSceneEyeLens = 1
+			uiSceneEyeFog  = 2
+			uiSceneEyeSky  = 4
+			uiSceneEyeGrab = 8
+			uiSceneEyeFlat = 16
+		)
+
+		// A kind the page does not know is drawn as a box, which is what an unknown
+		// kind has always come out as.
+		func uiSceneKindCode(kind string) int {
+			switch kind {
+			case "sphere":
+				return uiSceneSphere
+			case "cylinder":
+				return uiSceneCylinder
+			case "cone":
+				return uiSceneCone
+			case "ground":
+				return uiSceneGround
+			case "label":
+				return uiSceneLabel
+			case "line":
+				return uiSceneLine
+			case "sound":
+				return uiSceneSound
+			}
+			return uiSceneBox
 		}
 
 		// The colour a UiTone comes to in a world. A role has to be answered with a
@@ -8531,97 +8917,9 @@ func uiSceneSource(): Str {
 		}
 
 		func uiSceneVecTo(b *strings.Builder, nums []float64) {
-			b.WriteByte('[')
-			for i, n := range nums {
-				if i > 0 {
-					b.WriteByte(',')
-				}
-				uiSceneFTo(b, n)
+			for _, n := range nums {
+				uiPackF32(b, n)
 			}
-			b.WriteByte(']')
-		}
-
-		// A number in a frame: three decimals, a millimetre in a world measured in
-		// metres, and nothing after that. A frame is sent sixty times a second, so the
-		// digits nobody can see are worth leaving out.
-		//
-		// Non-finite values are written as 0. JSON has no spelling for NaN, so one
-		// would make the whole frame unreadable and stop the picture dead.
-		//
-		// Formatted into the frame rather than into a string. This is the hottest
-		// function in the renderer — a thousand shapes of nine or ten numbers a frame —
-		// and each used to cost several allocations. AppendFloat writes into a stack
-		// buffer, the trims become two indices, and the spelling is unchanged down to
-		// the last byte.
-		func uiSceneFTo(b *strings.Builder, v float64) {
-			if math.IsNaN(v) || math.IsInf(v, 0) {
-				b.WriteByte('0')
-				return
-			}
-			// Big enough for every number a world is measured in. Anything longer — and
-			// 'f' on 1e300 is three hundred digits — grows on the heap exactly as
-			// FormatFloat always did.
-			var buf [32]byte
-			text := strconv.AppendFloat(buf[:0], v, 'f', 3, 64)
-			// The trailing zeros, and then the point they were hiding behind. 'f' with
-			// three places always writes a point, but it is looked for rather than assumed:
-			// this has to answer exactly what TrimRight and then TrimSuffix answered.
-			if uiSceneDotted(text) {
-				end := len(text)
-				for end > 0 && text[end-1] == '0' {
-					end--
-				}
-				if end > 0 && text[end-1] == '.' {
-					end--
-				}
-				text = text[:end]
-			}
-			// What is left of "-0.000" is "-0", and a frame should not carry a negative
-			// nothing. The other two cannot arise and are answered anyway.
-			if len(text) == 0 || string(text) == "-" || string(text) == "-0" {
-				b.WriteByte('0')
-				return
-			}
-			b.Write(text)
-		}
-
-		// Whether there is a point in it, looked for from the right because that is
-		// where three decimal places put one.
-		func uiSceneDotted(text []byte) bool {
-			for i := len(text) - 1; i >= 0; i-- {
-				if text[i] == '.' {
-					return true
-				}
-			}
-			return false
-		}
-
-		// A label's words as a JSON string. The words are whatever the program had, so
-		// they are escaped rather than trusted — and they never reach the document at
-		// all: a label is drawn into the picture, not written into the page.
-		func uiSceneStrTo(b *strings.Builder, text string) {
-			b.WriteByte('"')
-			for _, r := range text {
-				switch r {
-				case '"':
-					b.WriteString("\\\"")
-				case '\\':
-					b.WriteString("\\\\")
-				case '\n':
-					b.WriteString("\\n")
-				case '\r':
-					b.WriteString("\\r")
-				case '\t':
-					b.WriteString("\\t")
-				default:
-					if r < 0x20 {
-						b.WriteString("\\u00" + string("0123456789abcdef"[r>>4]) + string("0123456789abcdef"[r&0xf]))
-						continue
-					}
-					b.WriteRune(r)
-				}
-			}
-			b.WriteByte('"')
 		}
 	`
 }
@@ -8646,13 +8944,26 @@ func uiSceneJs(): Str {
 		document.body.appendChild(holder);
 
 		var renderer = null, stage = null, camera = null;
-		var host = null, handle = "", world = null;
+		var host = null, handle = "", world = eyeless();
 		// The insets: where each one is looking, and the box on the page it is looking
 		// out of. A camera of their own is not needed one apiece — they are drawn one
 		// after another and never at the same instant — so there is one, moved.
 		var looks = [], boxes = [], spare = null;
 		var seen = {left: -1, top: -1, width: -1, height: -1};
+		// Whether that rectangle might be out of date, the observer that says so, and
+		// how many frames since it was last read regardless. See watchBox.
+		var boxMoved = true, boxWatch = null, boxWatched = false, boxBeat = 0;
 		var live = [], geoms = new Map(), mats = new Map(), signs = new Map();
+		// Everything on the stage that is not a light, under one node, so a shape can
+		// go on and come off in constant time. See sow and shed.
+		var flock = null;
+		// Which frame of the world arrived last, and the sounds among its slots. Only
+		// the sounds are kept slot by slot: a solid that changed arrives whole, and its
+		// own mesh already holds everything about it worth knowing.
+		var seq = 0, voiceOf = [], soundSlots = [], sounded = [], soundsMoved = false;
+		// Set by a frame this page cannot make sense of, cleared once the ask for the
+		// whole world has gone out. See paint.
+		var needFull = false;
 		var skins = new Map(), bumps = new Map(), reliefs = new Map(), skies = new Map();
 		// The sun is held rather than let go of, because it now has to be moved: a
 		// shadow map covers a box, and the box has to be wherever the eye is.
@@ -8750,6 +9061,8 @@ func uiSceneJs(): Str {
 		  sun.shadow.normalBias = 0.25;
 		  stage.add(sun);
 		  stage.add(sun.target);
+		  flock = new THREE.Group();
+		  stage.add(flock);
 		  holder.appendChild(renderer.domElement);
 		  listen();
 		}
@@ -8789,15 +9102,49 @@ func uiSceneJs(): Str {
 		  }
 		  host = el;
 		  handle = el.getAttribute("data-h") || "";
+		  // A new element every time the page changes shape, so the observer moves
+		  // onto this one.
+		  watchBox(el);
 		  if (!renderer) { boot(); }
 		  holder.style.display = "block";
 		  follow(true);
+		}
+
+		// Notice the box moving, rather than asking after it sixty times a second.
+		// Reading a rectangle forces a layout, and from an animation frame it forces
+		// the whole document's — on a racing HUD, three per cent of the window spent
+		// discovering the box had moved four times in eleven hundred frames.
+		//
+		// So it is read when a resize, a window resize or a scroll anywhere says it
+		// might have changed, and once in every thirty frames regardless: none of
+		// those catches a sibling growing taller above a box of fixed height, and
+		// half a second of drift is cheaper than a layout in every frame.
+		function watchBox(el) {
+		  if (!boxWatched) {
+		    boxWatched = true;
+		    var moved = function () { boxMoved = true; };
+		    if (window.ResizeObserver) { boxWatch = new ResizeObserver(moved); }
+		    window.addEventListener("resize", moved);
+		    // Captured, because a box can sit inside a panel that scrolls, and a
+		    // scroll there never reaches the window.
+		    window.addEventListener("scroll", moved, true);
+		  }
+		  if (boxWatch) {
+		    boxWatch.disconnect();
+		    boxWatch.observe(el);
+		  }
+		  boxMoved = true;
 		}
 
 		function follow(force) {
 		  if (!host || !renderer) { return; }
 		  var mark = host.classList.contains("h-aiming") ? "h-world h-aiming" : "h-world";
 		  if (holder.className !== mark) { holder.className = mark; }
+		  // That class is free to read. The rectangle below costs a layout — see
+		  // watchBox for when it is worth one.
+		  boxBeat++;
+		  if (!force && !boxMoved && boxBeat % 30 !== 0) { return; }
+		  boxMoved = false;
 		  var r = host.getBoundingClientRect();
 		  var w = Math.max(1, Math.round(r.width)), h = Math.max(1, Math.round(r.height));
 		  if (!force && r.left === seen.left && r.top === seen.top && w === seen.width && h === seen.height) {
@@ -8875,15 +9222,248 @@ func uiSceneJs(): Str {
 
 		// --- one frame -------------------------------------------------------------
 
-		function paint(text) {
-		  var frame = JSON.parse(text);
-		  var frames = frame.w || [];
-		  looks = frame.i || [];
-		  if (!frames.length) { return; }
+		// A frame of the world, taken apart. It is the numbers in the order this reader
+		// takes them out — nothing parsed, nothing looked up by name — and a slot
+		// missing from it is a mesh already standing in the right place. A circuit was
+		// a hundred and eighty kilobytes a frame as JSON, and is nearer fifteen here.
+		//
+		// The layout, which uiSceneFrame writes:
+		//
+		//   S  seq  prev  camera  count  insets  edits  [slot, record]...
+		//
+		// seq names this frame and prev the one it was taken from, so a page can tell
+		// it has missed one; prev nought means the frame carries the whole world.
+
+		var reading = null, byte = null, cur = 0;
+		var utf8 = new TextDecoder();
+
+		function readU8() { var n = byte[cur]; cur += 1; return n; }
+
+		function readU16() { var n = reading.getUint16(cur, true); cur += 2; return n; }
+
+		function readU32() { var n = reading.getUint32(cur, true); cur += 4; return n; }
+
+		function readF32() { var n = reading.getFloat32(cur, true); cur += 4; return n; }
+
+		function readWord() { return readText(readU8()); }
+
+		function readLong() { return readText(readU16()); }
+
+		// Nearly every string in a frame is a colour or a surface name — seven ASCII
+		// characters, hundreds of times a second — so the decoder is only woken for
+		// one with something in it worth decoding.
+		function readText(n) {
+		  var s = "", i = 0;
+		  for (; i < n; i++) {
+		    var c = byte[cur + i];
+		    if (c > 127) { break; }
+		    s += String.fromCharCode(c);
+		  }
+		  if (i < n) { s = utf8.decode(byte.subarray(cur, cur + n)); }
+		  cur += n;
+		  return s;
+		}
+
+		// The kinds and the bits, exactly as uiSceneShape and uiSceneCamera write them.
+		var KINDS = ["box", "sphere", "cylinder", "cone", "ground", "label", "line",
+		  "sound"];
+		var SOUND = 7;
+		var HAS_AT = 1, HAS_TURN = 2, HAS_SIZE = 4, HAS_SURFACE = 8, HAS_WORDS = 16,
+		  HAS_VOICE = 32, HAS_TRACK = 64;
+		var EYE_LENS = 1, EYE_FOG = 2, EYE_SKY = 4, EYE_GRAB = 8, EYE_FLAT = 16;
+
+		// Where an eye is and what it can see. The same block for the world's own
+		// camera and for every inset looking at that world, which is why an inset
+		// costs a second pass and not a second scene.
+		function readCamera(into) {
+		  var e = into.eye, a = into.aim;
+		  e[0] = readF32();
+		  e[1] = readF32();
+		  e[2] = readF32();
+		  a[0] = readF32();
+		  a[1] = readF32();
+		  var bits = readU8();
+		  into.lens = (bits & EYE_LENS) ? readU16() : 0;
+		  into.fog = (bits & EYE_FOG) ? readU16() : 0;
+		  into.sky = (bits & EYE_SKY) ? readWord() : "";
+		  into.grab = (bits & EYE_GRAB) !== 0;
+		  into.flat = (bits & EYE_FLAT) !== 0;
+		  into.on = readWord();
+		  return into;
+		}
+
+		function eyeless() {
+		  return {eye: [0, 0, 0], aim: [0, 0], lens: 0, fog: 0, sky: "", grab: false,
+		    flat: false, on: ""};
+		}
+
+		// One shape, read into the same object every time: a record is written straight
+		// into the mesh standing in its slot and is of no further interest, so there is
+		// one of these rather than one per shape per frame.
+		var scratch = {k: "box", c: "", p: [0, 0, 0], r: [0, 0, 0], d: [1, 1, 1],
+		  s: "", x: "", turned: false};
+
+		function paint(frame) {
+		  reading = new DataView(frame);
+		  byte = new Uint8Array(frame);
+		  cur = 1;
+		  var stamp = readU32(), after = readU32();
+		  // A difference taken from a frame this page never held would put the world
+		  // somewhere it has never been. Ask for the whole of it and draw nothing.
+		  if (after !== 0 && after !== seq) {
+		    needFull = true;
+		    return;
+		  }
 		  if (!renderer) { boot(); }
-		  world = frames[0];
+		  readCamera(world);
+		  var count = readU32();
+		  var many = readU8();
+		  for (var i = 0; i < many; i++) {
+		    if (!looks[i]) { looks[i] = eyeless(); }
+		    readCamera(looks[i]);
+		  }
+		  looks.length = many;
+		  if (after === 0) { forget(); }
+		  var edits = readU32();
+		  for (var e = 0; e < edits; e++) { slotted(readU32()); }
+		  trim(count);
+		  seq = stamp;
 		  apply(world);
 		  dirty = true;
+		}
+
+		// Everything this page holds, dropped, because what follows is the whole world.
+		function forget() {
+		  var kids = flock.children;
+		  for (var i = 0; i < kids.length; i++) { kids[i].parent = null; }
+		  kids.length = 0;
+		  live.length = 0;
+		  voiceOf.length = 0;
+		  soundSlots.length = 0;
+		  soundsMoved = true;
+		}
+
+		// The slots past the end of the world this frame describes, hidden rather than
+		// taken down: a horizon coming and going is the same shapes leaving and coming
+		// back, and a mesh nobody can see costs a pointer. Anything past the last
+		// frame's count is always sent whole, so a returning slot is never a stale one.
+		function trim(count) {
+		  for (var i = count; i < live.length; i++) {
+		    if (live[i]) { live[i].visible = false; }
+		    if (voiceOf[i]) {
+		      voiceOf[i] = null;
+		      soundsMoved = true;
+		    }
+		  }
+		}
+
+		// One slot, as this frame has it.
+		function slotted(at) {
+		  var kind = byte[cur], mask = byte[cur + 1];
+		  cur += 2;
+		  if (kind === SOUND) {
+		    var was = voiceOf[at];
+		    var heard = was || {k: "sound", p: [0, 0, 0], x: "", v: "", t: "", h: 1, g: 1};
+		    heard.p[0] = readF32();
+		    heard.p[1] = readF32();
+		    heard.p[2] = readF32();
+		    heard.x = readLong();
+		    heard.v = (mask & HAS_VOICE) ? readWord() : "";
+		    heard.t = (mask & HAS_TRACK) ? readWord() : "";
+		    heard.h = readF32();
+		    heard.g = readF32();
+		    if (!was) {
+		      voiceOf[at] = heard;
+		      soundSlots.push(at);
+		    }
+		    soundsMoved = true;
+		    // A sound standing where a solid stood takes the solid off the stage with it.
+		    if (live[at]) {
+		      shed(live[at]);
+		      live[at] = null;
+		    }
+		    return;
+		  }
+		  if (voiceOf[at]) {
+		    voiceOf[at] = null;
+		    soundsMoved = true;
+		  }
+		  var s = scratch;
+		  s.k = KINDS[kind] || "box";
+		  s.c = readWord();
+		  if (mask & HAS_AT) {
+		    var p = s.p;
+		    p[0] = readF32();
+		    p[1] = readF32();
+		    p[2] = readF32();
+		  }
+		  s.turned = (mask & HAS_TURN) !== 0;
+		  if (s.turned) {
+		    var r = s.r;
+		    r[0] = readF32();
+		    r[1] = readF32();
+		    r[2] = readF32();
+		  }
+		  var d = s.d;
+		  if (mask & HAS_SIZE) {
+		    var n = readU8();
+		    d.length = n;
+		    for (var i = 0; i < n; i++) { d[i] = readF32(); }
+		  } else {
+		    d.length = 3;
+		    d[0] = 1;
+		    d[1] = 1;
+		    d[2] = 1;
+		  }
+		  s.s = (mask & HAS_SURFACE) ? readWord() : "";
+		  s.x = (mask & HAS_WORDS) ? readLong() : "";
+		  var o = live[at];
+		  if (!fits(o, s)) {
+		    if (o) { shed(o); }
+		    o = build(s);
+		    live[at] = o;
+		    sow(o);
+		  }
+		  o.visible = true;
+		  put(o, s);
+		}
+
+		// On the stage and off it, in constant time. Object3D.remove scans the child
+		// list to find what is leaving; order means nothing to a list of solids, so
+		// each remembers where it stands and is replaced by the one at the end. Taking
+		// down two thousand shapes was a fifth of a second of scanning.
+		function sow(o) {
+		  o.parent = flock;
+		  o.userData.spot = flock.children.length;
+		  flock.children.push(o);
+		}
+
+		function shed(o) {
+		  var kids = flock.children, at = o.userData.spot;
+		  if (kids[at] !== o) { at = kids.indexOf(o); }
+		  if (at < 0) { return; }
+		  var end = kids[kids.length - 1];
+		  kids[at] = end;
+		  end.userData.spot = at;
+		  kids.length = kids.length - 1;
+		  o.parent = null;
+		  o.userData.spot = -1;
+		}
+
+		// The sounds, gathered again after the slots holding them changed — rare enough
+		// to be worth a flag: a race is sixteen sounds against eighteen hundred solids.
+		function regather() {
+		  soundsMoved = false;
+		  sounded.length = 0;
+		  var keep = [];
+		  soundSlots.sort(function (a, b) { return a - b; });
+		  for (var i = 0; i < soundSlots.length; i++) {
+		    var at = soundSlots[i], heard = voiceOf[at];
+		    if (!heard) { continue; }
+		    keep.push(at);
+		    sounded.push(heard);
+		  }
+		  soundSlots = keep;
 		}
 
 		function apply(w) {
@@ -8940,56 +9520,34 @@ func uiSceneJs(): Str {
 		  }
 		  var lens = w.lens || 75;
 		  if (camera.fov !== lens) { camera.fov = lens; camera.updateProjectionMatrix(); }
-		  // The sounds are taken out before the solids are drawn, because the solids
-		  // are matched to their slots and a sound sitting in one would push every
-		  // shape after it along a place.
-		  var all = w.o || [], drawn = all, sounded = null;
-		  for (var i = 0; i < all.length; i++) {
-		    if (all[i].k !== "sound") { continue; }
-		    drawn = [];
-		    sounded = [];
-		    for (var j = 0; j < all.length; j++) {
-		      if (all[j].k === "sound") { sounded.push(all[j]); } else { drawn.push(all[j]); }
-		    }
-		    break;
-		  }
-		  shapes(drawn);
-		  if (sounded || voices.size) { sounds(sounded || [], w); }
+		  // A slot holds a sound or a solid, and which slots hold sounds is remembered
+		  // between frames rather than worked out again in each of them.
+		  if (soundsMoved) { regather(); }
+		  if (sounded.length || voices.size) { sounds(sounded, w); }
 		  // Letting go is the program's to decide; taking hold needs a click, which is
 		  // the browser's rule and not ours.
 		  if (!w.grab && grabbing) { document.exitPointerLock(); }
 		}
 
-		// The shapes, matched against what is already on the card slot by slot. A view
-		// built by the same code every frame lists the same things in the same order,
-		// so nearly every frame is a position and a rotation written into a mesh that
-		// was already there.
-		function shapes(list) {
-		  for (var i = 0; i < list.length; i++) {
-		    var s = list[i], sig = signature(s), o = live[i];
-		    if (!o || o.userData.sig !== sig) {
-		      if (o) { stage.remove(o); }
-		      o = build(s, sig);
-		      live[i] = o;
-		      stage.add(o);
-		    }
-		    put(o, s);
-		  }
-		  for (var j = list.length; j < live.length; j++) { stage.remove(live[j]); }
-		  live.length = list.length;
-		}
-
-		// What makes a shape the same shape as the one in this slot last frame.
+		// Whether what stands in this slot is still the right thing to stand in it.
 		// Position, rotation and colour are left out on purpose — those are written
 		// into whatever is there. A line leaves its ends out too: they are its payload,
 		// and a tracer rebuilt every frame would be a new buffer sixty times a second.
-		function signature(s) {
-		  if (s.k === "line") { return "line"; }
-		  if (s.k === "label") { return "label|" + (s.x || "") + "|" + s.c; }
-		  return s.k + "|" + (s.d ? s.d.join(",") : "");
+		function fits(o, s) {
+		  if (!o) { return false; }
+		  var u = o.userData;
+		  if (u.kind !== s.k) { return false; }
+		  if (s.k === "line") { return true; }
+		  if (s.k === "label") { return u.words === s.x && u.tint === s.c; }
+		  var d = s.d, e = u.dims;
+		  if (e.length !== d.length) { return false; }
+		  for (var i = 0; i < d.length; i++) {
+		    if (e[i] !== d[i]) { return false; }
+		  }
+		  return true;
 		}
 
-		function build(s, sig) {
+		function build(s) {
 		  var made;
 		  if (s.k === "line") {
 		    var g = new THREE.BufferGeometry();
@@ -9001,6 +9559,9 @@ func uiSceneJs(): Str {
 		    made = new THREE.Sprite(new THREE.SpriteMaterial({map: tex, transparent: true, depthWrite: false}));
 		    made.scale.set(0.42 * tex.userData.aspect, 0.42, 1);
 		  } else {
+		    // Once per distinct size in the whole run, rather than once per shape per
+		    // frame, which is what fits is for.
+		    var sig = s.k + "|" + s.d.join(",");
 		    var geo = geoms.get(sig);
 		    if (!geo) { geo = solid(s); geoms.set(sig, geo); }
 		    made = new THREE.Mesh(geo, paintOf(s));
@@ -9011,7 +9572,20 @@ func uiSceneJs(): Str {
 		    made.castShadow = s.k !== "ground";
 		    made.receiveShadow = true;
 		  }
-		  made.userData.sig = sig;
+		  // Composed when it moves and not otherwise: left alone, three.js recomposes a
+		  // matrix for every object on the stage every frame, and a circuit is thousands
+		  // of objects of which a handful ever move. put is the only other place a
+		  // matrix is built, and the only place a shape is moved.
+		  made.matrixAutoUpdate = false;
+		  made.updateMatrix();
+		  var u = made.userData;
+		  u.kind = s.k;
+		  u.dims = s.d.slice();
+		  u.words = s.x;
+		  // Left empty so the first put dresses it, whatever it was built wearing.
+		  u.tint = "";
+		  u.finish = "";
+		  u.spot = -1;
 		  return made;
 		}
 
@@ -9031,21 +9605,35 @@ func uiSceneJs(): Str {
 		}
 
 		function put(o, s) {
+		  var u = o.userData;
 		  if (s.k === "line") {
 		    var p = o.geometry.attributes.position;
 		    for (var i = 0; i < 6; i++) { p.array[i] = s.d[i]; }
 		    p.needsUpdate = true;
-		    o.material.color.setStyle(bare(s.c));
-		    o.material.opacity = solidity(s.c);
-		    o.material.transparent = o.material.opacity < 1;
+		    if (u.tint !== s.c) {
+		      o.material.color.setStyle(bare(s.c));
+		      o.material.opacity = solidity(s.c);
+		      o.material.transparent = o.material.opacity < 1;
+		      u.tint = s.c;
+		    }
 		    return;
 		  }
 		  o.position.set(s.p[0], s.p[1], s.p[2]);
-		  if (s.k === "label") { return; }
-		  if (s.r) { o.rotation.set(s.r[0], s.r[1], s.r[2]); }
+		  // The matrix build stopped composing for free. A frame only carries the slots
+		  // that changed, so this happens for the shapes that moved and for no others.
+		  if (s.k === "label") { o.updateMatrix(); return; }
+		  if (s.turned) { o.rotation.set(s.r[0], s.r[1], s.r[2]); }
 		  else if (o.rotation.x || o.rotation.y || o.rotation.z) { o.rotation.set(0, 0, 0); }
-		  var m = paintOf(s);
-		  if (o.material !== m) { o.material = m; }
+		  o.updateMatrix();
+		  // A material is its colour, its surface and its size, and the size cannot
+		  // change without the mesh being rebuilt — so a shape still wearing what it
+		  // wore is left alone rather than asked for a key and a map lookup again.
+		  if (u.tint !== s.c || u.finish !== s.s) {
+		    var m = paintOf(s);
+		    if (o.material !== m) { o.material = m; }
+		    u.tint = s.c;
+		    u.finish = s.s;
+		  }
 		}
 
 		// The sky, as a band of colour rather than a colour.
@@ -9959,8 +10547,12 @@ func uiSceneJs(): Str {
 		// twice for one paint.
 		function tick(now) {
 		  requestAnimationFrame(tick);
+		  paced(now);
 		  if (!renderer || !host) { last = now; return; }
 		  follow(false);
+		  // A page that has lost the thread of the world asks for the whole of it, and
+		  // goes on asking until the ask gets out.
+		  if (needFull && post("resync", "", 0)) { needFull = false; }
 		  if (lookX || lookY) {
 		    if (want.indexOf("l") >= 0) { post("look", round(lookX) + "," + round(lookY), 0); }
 		    lookX = 0;
@@ -9969,6 +10561,8 @@ func uiSceneJs(): Str {
 		  // Before the frame is reported rather than after, so the fold hears the stick
 		  // move and *then* is told to step the world by it.
 		  if (want.indexOf("p") >= 0) { pads(); }
+		  // And the frame before the picture rather than after it. See reported.
+		  reported(now);
 		  if (dirty) {
 		    renderer.render(stage, camera);
 		    // After the picture and never instead of it: an inset is set *into* what
@@ -9976,35 +10570,76 @@ func uiSceneJs(): Str {
 		    if (looks.length) { insets(); }
 		    dirty = false;
 		  }
+		}
+		requestAnimationFrame(tick);
+
+		// Tell the program a frame went by, so that it folds the next world.
+		//
+		// Said before this frame is drawn rather than after it: the fold is the
+		// program's work and the picture is this window's, and there is no reason they
+		// should take turns. Reported after the render they are strictly serial, and
+		// the answer arrives at a thread already busy with the next picture — seven
+		// milliseconds round trip for a fold that takes one and a half. What is drawn
+		// is unaffected; a frame always draws the world the last fold sent.
+		//
+		// A gap longer than a tenth of a second is reported as that: the window was
+		// busy or hidden, and a world stepped by the real gap would teleport.
+		//
+		// It is told when the program is ready to hear it, not sixty times a second
+		// regardless. While an answer is outstanding this does nothing — and crucially
+		// leaves last alone, so the gap goes on growing and the frame that eventually
+		// goes carries the whole of the time that passed. That is the difference
+		// between reporting sixty frames of seventeen milliseconds to a program
+		// managing twenty, and reporting the twenty frames of fifty that happened.
+		//
+		// The first frame starts the clock and reports nothing, no time having passed
+		// between two frames yet. Seeding last above the guard instead, so a skipped
+		// frame did not keep its time, left every gap measuring nought and every frame
+		// skipped for being nought long.
+		function reported(now) {
 		  var ms = last ? Math.round(now - last) : 0;
 		  if (want.indexOf("f") < 0) { last = now; return; }
-		  // One frame in flight, and the clock is what makes that honest.
-		  //
-		  // Told after the picture is on screen, so the program works out the next
-		  // frame while this one is looked at. A gap longer than a tenth of a second is
-		  // reported as that: the window was busy or hidden, and a world stepped by the
-		  // real gap would teleport.
-		  //
-		  // It is told when the program is ready to hear it, not sixty times a second
-		  // regardless. While an answer is outstanding this returns having done nothing
-		  // — and crucially without moving last, so the gap goes on growing and the
-		  // frame that eventually goes carries the whole of the time that passed. That
-		  // is the difference between reporting sixty frames of seventeen milliseconds
-		  // to a program managing twenty, and reporting the twenty frames of fifty that
-		  // actually happened.
-		  //
-		  // The first frame starts the clock and reports nothing, no time having passed
-		  // between two frames yet. Seeding last unconditionally instead — above the
-		  // guard, so a skipped frame did not keep its time — left nothing to seed it:
-		  // every gap measured nought, every frame was skipped for being nought long,
-		  // and the window sat forever after one picture.
 		  if (!last) { last = now; return; }
 		  if (ms <= 0 || hiveOwed) { return; }
 		  last = now;
 		  hiveOwed = true;
 		  if (!post("frame", "", Math.min(100, ms))) { hiveOwed = false; }
 		}
-		requestAnimationFrame(tick);
+
+		// --- what the screen can do -------------------------------------------------
+		//
+		// The display's refresh rate, not what this program is achieving: a program
+		// that measured what it was managing and aimed at that would settle at whatever
+		// it was already doing and call it a success.
+		//
+		// So, the tenth percentile of the last few seconds of gaps between animation
+		// frames. A window painting forty a second on a screen refreshing a hundred and
+		// twenty still sees plenty of eight-millisecond gaps, and it is those that say
+		// what the screen can do; the slow ones say only that this program was busy.
+		// Told once a second and only when the answer changed.
+		var gaps = new Float64Array(240), gapAt = 0, gapsIn = 0;
+		var beatLast = 0, rateSaid = 0, rateAsked = 0;
+
+		function paced(now) {
+		  if (beatLast) {
+		    var ms = now - beatLast;
+		    // A gap outside these is the window having been hidden or throttled, and
+		    // says nothing about the screen.
+		    if (ms > 0.5 && ms < 200) {
+		      gaps[gapAt] = ms;
+		      gapAt = (gapAt + 1) % gaps.length;
+		      if (gapsIn < gaps.length) { gapsIn++; }
+		    }
+		  }
+		  beatLast = now;
+		  if (want.indexOf("r") < 0 || gapsIn < 30 || now - rateAsked < 1000) { return; }
+		  rateAsked = now;
+		  var sorted = Array.prototype.slice.call(gaps.subarray(0, gapsIn));
+		  sorted.sort(function (a, b) { return a - b; });
+		  var hz = Math.round(1000 / sorted[Math.floor(gapsIn / 10)]);
+		  hz = Math.max(20, Math.min(480, hz));
+		  if (hz !== rateSaid && post("rate", "", hz)) { rateSaid = hz; }
+		}
 
 		function round(n) { return Math.round(n * 100) / 100; }
 
