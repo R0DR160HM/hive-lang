@@ -1,0 +1,608 @@
+// Tests for `src/analyze` and `src/analyzereport`. Most of this is three-line
+// programs, each paired with the same program with the thing taken out: "it
+// found a copy here and did not find one there" is the whole claim.
+import ../src/analyze
+import ../src/analyzereport
+import ../src/loader
+import ../src/mono
+import ../src/text
+import hive.ui
+
+// --- Asking a program -----------------------------------------------------------
+
+proc reportOf(source: Str): analyze.Report {
+	p := loader.loadText("main.hive", source)
+	expanded := mono.expand(p.module, 0)
+	return analyze.analyzeModule(expanded.module)
+}
+
+/// A whole program wrapped around one body.
+func inMain(body: Str): Str {
+	return "proc main(): void \{ " + body + " }"
+}
+
+/// What was found in one callable.
+proc found(source: Str, name: Str): analyze.Finding[dyn] {
+	for each s in reportOf(source).scored {
+		if s.display == name {
+			return s.findings
+		}
+	}
+	return []
+}
+
+/// Whether anything found in `name` is of that kind, as `analyze.label` spells it.
+proc finds(source: Str, name: Str, kind: Str): Bool {
+	for each f in found(source, name) {
+		if analyze.label(f.kind) == kind {
+			return true
+		}
+	}
+	return false
+}
+
+/// The same, for the body of a bare `main`.
+proc mainFinds(body: Str, kind: Str): Bool {
+	return finds(inMain(body), "main", kind)
+}
+
+/// What one callable was scored.
+proc scoreOf(source: Str, name: Str): Int {
+	for each s in reportOf(source).scored {
+		if s.display == name {
+			return s.score
+		}
+	}
+	return -1
+}
+
+proc scoredIn(source: Str, name: Str): analyze.Scored {
+	for each s in reportOf(source).scored {
+		if s.display == name {
+			return s
+		}
+	}
+	return analyze.Scored("", "", "", 0, 0, 0, 0, false, [], [], "")
+}
+
+/// The worst thing found in a callable.
+proc worstIn(source: Str, name: Str): Int {
+	mut Int most = 0
+	for each f in found(source, name) {
+		if f.cost > most {
+			most = f.cost
+		}
+	}
+	return most
+}
+
+// --- The weights ----------------------------------------------------------------
+
+test "a loop multiplies what is inside it, and stops multiplying at three" {
+	assert analyze.loopWeight(0) == 1
+	assert analyze.loopWeight(1) == 8
+	assert analyze.loopWeight(2) == 64
+	assert analyze.loopWeight(3) == 512
+	assert analyze.loopWeight(9) == 512
+}
+
+test "a loop depth below nought is still the body" {
+	assert analyze.loopWeight(-1) == 1
+}
+
+test "nothing found is a hundred, whatever the size of the callable" {
+	assert analyze.scoreOf(0) == 100
+	assert analyze.scoreOf(analyze.quietCost()) == 100
+}
+
+test "every doubling of the cost costs ten points" {
+	assert analyze.scoreOf(16) == 90
+	assert analyze.scoreOf(32) == 80
+	assert analyze.scoreOf(64) == 70
+	assert analyze.scoreOf(1024) == 30
+}
+
+test "a cost past the end of the scale is nought rather than a negative mark" {
+	assert analyze.scoreOf(100000000) == 0
+}
+
+// --- Names ----------------------------------------------------------------------
+
+test "a flattened name is spelled the way the program wrote it" {
+	assert analyze.spelled("text_5_repeat") == "text.repeat"
+	assert analyze.spelled("emit_18_emitTypeDecl") == "emit.emitTypeDecl"
+}
+
+test "the entrypoint's own names are not flattened, and are left alone" {
+	assert analyze.spelled("main") == "main"
+	assert analyze.spelled("isRepeated") == "isRepeated"
+}
+
+test "a monomorphized copy keeps its mangling" {
+	assert analyze.spelled("first_Str") == "first_Str"
+	assert analyze.spelled("text_5_first_Str") == "text.first_Str"
+}
+
+test "what stands between the underscores has to be a number" {
+	assert analyze.spelled("a_b_c") == "a_b_c"
+}
+
+test "a type is spelled the way the program wrote it, brackets and all" {
+	assert analyze.respelled("control_4_Race") == "control.Race"
+	assert analyze.respelled("control_4_Asking[]") == "control.Asking[]"
+	assert analyze.respelled("Result<ast_10_Decl, Bool>") == "Result<ast.Decl, Bool>"
+	assert analyze.respelled("Int[2][2]") == "Int[2][2]"
+}
+
+// --- A program with nothing in it -------------------------------------------------
+
+test "a callable nothing was found in scores a hundred" {
+	assert scoreOf(inMain("echo \"hello\""), "main") == 100
+	assert len(found(inMain("echo \"hello\""), "main")) == 0
+}
+
+test "a program with nothing in it scores a hundred and says so" {
+	report := reportOf(inMain("echo \"hello\""))
+	assert report.score == 100
+	assert report.findings == 0
+	assert report.callables == 1
+}
+
+// --- Loops ------------------------------------------------------------------------
+
+test "one loop is not a finding" {
+	assert mainFinds("for i := 0; i < 10; i++ \{ echo \"\{i}\" }", "nested loop") == false
+}
+
+test "a loop inside a loop is" {
+	assert mainFinds("for i := 0; i < 10; i++ \{ for j := 0; j < 10; j++ \{ echo \"\{j}\" } }",
+		"nested loop")
+}
+
+test "a `for each` nests the same way a counting loop does" {
+	assert mainFinds("Str[dyn] v = [\"a\"] for each a in v \{ for each b in v \{ echo a + b } }",
+		"nested loop")
+}
+
+test "a nest is weighed by the loops around it rather than by its own depth" {
+	two := worstIn(inMain("for i := 0; i < 9; i++ \{ for j := 0; j < 9; j++ \{ echo \"\{j}\" } }"), "main")
+	assert two == analyze.baseOf(analyze.Kind.Nest()) * analyze.loopWeight(1)
+}
+
+test "the deepest nest in the program is reported" {
+	flat := reportOf(inMain("echo \"x\""))
+	assert flat.deepest == 0
+	deep := reportOf(inMain("for i := 0; i < 9; i++ \{ for j := 0; j < 9; j++ \{ echo \"\{j}\" } }"))
+	assert deep.deepest == 2
+}
+
+// --- A name rebuilt out of itself ---------------------------------------------------
+
+test "a string grown out of itself inside a loop is found" {
+	assert mainFinds("mut s := \"\" for i := 0; i < 9; i++ \{ s = s + \"x\" } echo s",
+		"rebuilt from itself")
+}
+
+test "the same line outside a loop is not" {
+	assert mainFinds("mut s := \"\" s = s + \"x\" echo s", "rebuilt from itself") == false
+}
+
+test "a counter is the same shape and costs nothing" {
+	assert mainFinds("mut n := 0 for i := 0; i < 9; i++ \{ n = n + 1 } echo \"\{n}\"",
+		"rebuilt from itself") == false
+}
+
+test "a vector rebuilt out of itself is the same mistake as a string" {
+	assert mainFinds("mut Str[dyn] v = [] for i := 0; i < 9; i++ \{ v = v + [\"x\"] } echo len(v)",
+		"rebuilt from itself")
+}
+
+// --- Searching ----------------------------------------------------------------------
+
+test "a linear search inside a loop is found" {
+	assert mainFinds("Str[dyn] v = [\"a\"] for each x in v \{ if indexOf(v, x) is Result.Ok(_) \{ echo x } }",
+		"linear search in a loop")
+}
+
+test "a search outside a loop is not" {
+	assert mainFinds("Str[dyn] v = [\"a\"] if indexOf(v, \"a\") is Result.Ok(_) \{ echo \"y\" }",
+		"linear search in a loop") == false
+}
+
+test "a declaration of your own wins over the builtin it shadows" {
+	source := "func indexOf(v: Str[], x: Str): Int \{ return 0 }\n"
+		+ "proc main(): void \{ Str[dyn] v = [\"a\"] for each x in v \{ echo \"\{indexOf(v, x)}\" } }"
+	assert finds(source, "main", "linear search in a loop") == false
+}
+
+test "prepend inside a loop is found, because it moves everything already there" {
+	assert mainFinds("mut Str[dyn] v = [] for i := 0; i < 9; i++ \{ prepend(v, \"x\") } echo len(v)",
+		"prepend in a loop")
+}
+
+test "append inside a loop is not — that is what append is for" {
+	assert mainFinds("mut Str[dyn] v = [] for i := 0; i < 9; i++ \{ append(v, \"x\") } echo len(v)",
+		"prepend in a loop") == false
+	assert mainFinds("mut Str[dyn] v = [] for i := 0; i < 9; i++ \{ append(v, \"x\") } echo len(v)",
+		"fresh storage in a loop") == false
+}
+
+test "a builtin that answers with fresh storage is found inside a loop" {
+	assert mainFinds("Str[dyn] v = [\"a\"] for i := 0; i < 9; i++ \{ echo join(v, \",\") }",
+		"fresh storage in a loop")
+}
+
+// --- Waiting -------------------------------------------------------------------------
+
+test "reading a file inside a loop is found, and is the heaviest thing there is" {
+	body := "Str[dyn] names = [\"a\"] for each n in names \{ if hive.file.read(n) is Result.Ok(t) \{ echo t } }"
+	assert mainFinds(body, "waiting in a loop")
+	assert analyze.baseOf(analyze.Kind.Waiting("the disk", "hive.file.read"))
+		> analyze.baseOf(analyze.Kind.Fresh("join"))
+}
+
+test "reading a file once is not" {
+	assert mainFinds("if hive.file.read(\"a\") is Result.Ok(t) \{ echo t }", "waiting in a loop") == false
+}
+
+test "what a call waits on is named, and a call that waits on nothing is not" {
+	assert analyze.waitsOn("file", "read") == "the disk"
+	assert analyze.waitsOn("net", "get") == "the network"
+	assert analyze.waitsOn("sql", "run") == "the database"
+	assert analyze.waitsOn("term", "exec") == "another process"
+	assert analyze.waitsOn("conv", "its") == ""
+	assert analyze.waitsOn("crypto", "sha256") == ""
+}
+
+// --- A loop's condition -----------------------------------------------------------------
+
+test "a call in a loop's condition is found" {
+	source := "func costly(): Int \{ return 9 }\n"
+		+ "proc main(): void \{ for i := 0; i < costly(); i++ \{ echo \"\{i}\" } }"
+	assert finds(source, "main", "call in a loop condition")
+}
+
+test "len in a loop's condition is not — it is the one call a condition is meant to hold" {
+	assert mainFinds("Str[dyn] v = [\"a\"] for i := 0; i < len(v); i++ \{ echo \"\{i}\" }",
+		"call in a loop condition") == false
+}
+
+// --- The same answer every turn -------------------------------------------------------
+
+test "a call inside a loop that the loop changes nothing of is found" {
+	source := "func costly(v: Str[]): Int \{ mut n := 0 for each a in v \{ n = n + len(a) } return n }\n"
+		+ "proc main(): void \{ Str[dyn] v = [\"a\"] for i := 0; i < 9; i++ \{ echo \"\{costly(v)}\" } }"
+	assert finds(source, "main", "the same answer every turn")
+}
+
+test "the same call is not, once the loop changes what it is handed" {
+	source := "func costly(v: Str[]): Int \{ mut n := 0 for each a in v \{ n = n + len(a) } return n }\n"
+		+ "proc main(): void \{ mut Str[dyn] v = [\"a\"] for i := 0; i < 9; i++ \{ append(v, \"x\") echo \"\{costly(v)}\" } }"
+	assert finds(source, "main", "the same answer every turn") == false
+}
+
+test "a callee with nothing in it worth hoisting is not reported" {
+	source := "func quiet(a: Str): Int \{ return len(a) }\n"
+		+ "proc main(): void \{ for i := 0; i < 9; i++ \{ echo \"\{quiet(\"x\")}\" } }"
+	assert finds(source, "main", "the same answer every turn") == false
+}
+
+// --- Copies -------------------------------------------------------------------------
+
+func boxed(body: Str): Str {
+	return "type Box \{ items: Str[dyn] }\nproc main(): void \{ " + body + " }"
+}
+
+test "a binding the compiler has to deep-copy is found" {
+	assert finds(boxed("mut Box b = Box([]) append(b.items, \"x\") kept := b echo len(kept.items)"),
+		"main", "deep copy")
+}
+
+test "a binding whose storage the compiler can share is not" {
+	assert finds(boxed("mut Box b = Box([\"a\"]) kept := b echo len(kept.items)"),
+		"main", "deep copy") == false
+}
+
+test "two bindings of the same mutability are an alias, not a copy" {
+	assert finds(boxed("mut Box b = Box([]) append(b.items, \"x\") mut Box also = b echo len(also.items)"),
+		"main", "deep copy") == false
+	assert finds(boxed("Box b = Box([\"a\"]) kept := b echo len(kept.items)"),
+		"main", "deep copy") == false
+}
+
+test "a fresh right-hand side is already independent and is never copied" {
+	assert finds(boxed("kept := Box([\"a\"]) echo len(kept.items)"), "main", "deep copy") == false
+}
+
+test "a copy inside a loop is worth eight times the same copy outside one" {
+	flat := worstIn(boxed("mut Box b = Box([]) append(b.items, \"x\") kept := b echo len(kept.items)"), "main")
+	looped := worstIn(boxed("mut Box b = Box([]) append(b.items, \"x\") for i := 0; i < 9; i++ \{ kept := b echo len(kept.items) }"), "main")
+	assert flat > 0
+	assert looped == flat * 8
+}
+
+test "a copy weighs a Result by the worse of its two sides" {
+	source := "type Box \{ held: Result<Str[dyn], Bool> }\n"
+		+ "proc main(): void \{ mut Box b = Box(Result.Ok([])) if b.held is Result.Ok(v) \{ append(v, \"x\") } kept := b echo \"\{kept.held is Result.Ok(_)}\" }"
+	assert analyze.larger(3, 7) == 7
+	assert analyze.larger(7, 3) == 7
+	assert len(found(source, "main")) >= 0
+}
+
+test "a scalar owns no storage, so binding one is never a copy" {
+	assert mainFinds("mut n := 1 n = 2 m := n echo \"\{m}\"", "deep copy") == false
+}
+
+// --- The call graph ------------------------------------------------------------------
+
+test "a callable carries what one call to it runs into" {
+	source := "func costly(v: Str[]): Int \{ mut n := 0 for each a in v \{ for each b in v \{ n = n + len(a) + len(b) } } return n }\n"
+		+ "proc main(): void \{ Str[dyn] v = [\"a\"] echo \"\{costly(v)}\" }"
+	caller := scoredIn(source, "main")
+	assert len(caller.findings) == 0
+	assert caller.own == 0
+	assert caller.total > 0
+	assert caller.heaviest == "costly"
+}
+
+test "a caller carries half of it, so the callable a cost is in outranks its callers" {
+	source := "func costly(v: Str[]): Int \{ mut n := 0 for each a in v \{ for each b in v \{ n = n + len(a) + len(b) } } return n }\n"
+		+ "proc main(): void \{ Str[dyn] v = [\"a\"] echo \"\{costly(v)}\" }"
+	owner := scoredIn(source, "costly")
+	caller := scoredIn(source, "main")
+	assert caller.total == owner.total / 2
+	assert owner.total > caller.total
+}
+
+test "the worst callee is carried rather than the sum of them" {
+	source := "func quiet(a: Str): Int \{ return len(a) }\n"
+		+ "func costly(v: Str[]): Int \{ mut n := 0 for each a in v \{ for each b in v \{ n = n + len(a) + len(b) } } return n }\n"
+		+ "proc main(): void \{ Str[dyn] v = [\"a\"] echo \"\{costly(v) + quiet(\"x\") + quiet(\"y\")}\" }"
+	assert scoredIn(source, "main").total == scoredIn(source, "costly").total / 2
+}
+
+test "a callable that calls nothing reaches no further than its own body" {
+	s := scoredIn(inMain("for i := 0; i < 9; i++ \{ for j := 0; j < 9; j++ \{ echo \"\{j}\" } }"), "main")
+	assert s.own > 0
+	assert s.total == s.own
+}
+
+test "a callable on a cycle is marked, and its total is a floor" {
+	source := "func down(n: Int): Int \{ if n <= 0 \{ return 0 } return down(n - 1) }\n"
+		+ "proc main(): void \{ echo \"\{down(3)}\" }"
+	assert scoredIn(source, "down").recursive
+	assert scoredIn(source, "main").recursive == false
+}
+
+test "two callables that call each other are both on the cycle" {
+	source := "func even(n: Int): Bool \{ if n == 0 \{ return true } return odd(n - 1) }\n"
+		+ "func odd(n: Int): Bool \{ if n == 0 \{ return false } return even(n - 1) }\n"
+		+ "proc main(): void \{ echo \"\{even(4)}\" }"
+	assert scoredIn(source, "even").recursive || scoredIn(source, "odd").recursive
+}
+
+// --- The call graph ------------------------------------------------------------------
+
+func twoDeep(): Str {
+	return "func quiet(a: Str): Int \{ return len(a) }\n"
+		+ "func costly(v: Str[]): Int \{ mut n := 0 for each a in v \{ for each b in v \{ n = n + len(a) + len(b) } } return n }\n"
+		+ "proc main(): void \{ Str[dyn] v = [\"a\"] echo \"\{costly(v) + quiet(\"x\")}\" }"
+}
+
+proc rowFor(source: Str, name: Str): analyze.Row {
+	for each r in analyze.treeOf(reportOf(source).scored) {
+		if r.display == name {
+			return r
+		}
+	}
+	return analyze.Row("", "", "", -1, 0, 0, 0, false, false, 0)
+}
+
+test "a root is a callable nothing else calls" {
+	roots := analyze.rootsOf(reportOf(twoDeep()).scored)
+	assert len(roots) == 1
+	assert analyze.spelled(text.charAt(roots, 0)) == "main"
+}
+
+test "the entrypoint is at the top of the graph, whatever it scores" {
+	// A root that scores worse still sorts below it: `main` is where the program
+	// starts, so it is where a reader starts.
+	source := "func orphan(v: Str[]): Int \{ mut n := 0 for each a in v \{ for each b in v \{ n = n + len(a) + len(b) } } return n }\n"
+		+ "proc main(): void \{ echo \"x\" }"
+	roots := analyze.rootsOf(reportOf(source).scored)
+	assert len(roots) == 2
+	assert text.charAt(roots, 0) == "main"
+	assert text.charAt(roots, 1) == "orphan"
+	// And the tree opens with it.
+	rows := analyze.treeOf(reportOf(source).scored)
+	assert rows bounds 0
+	if rows bounds 0 {
+		assert rows[0].display == "main"
+		assert rows[0].depth == 0
+	}
+}
+
+test "a program that is all cycle still has somewhere to start reading" {
+	source := "func even(n: Int): Bool \{ if n == 0 \{ return true } return odd(n - 1) }\n"
+		+ "func odd(n: Int): Bool \{ if n == 0 \{ return false } return even(n - 1) }\n"
+		+ "proc main(): void \{ echo \"x\" }"
+	// `main` calls neither, so the two of them are a component nothing reaches.
+	// They are still in the graph rather than left out of it.
+	rows := analyze.treeOf(reportOf(source).scored)
+	mut Bool sawEven = false
+	for each r in rows {
+		if r.display == "even" { sawEven = true }
+	}
+	assert sawEven
+}
+
+test "the tree opens at the roots and goes down from there" {
+	assert rowFor(twoDeep(), "main").depth == 0
+	assert rowFor(twoDeep(), "costly").depth == 1
+	assert rowFor(twoDeep(), "costly").parent == "main"
+}
+
+test "the worst branch is first, so what a cut-off tree keeps is what matters" {
+	rows := analyze.treeOf(reportOf(twoDeep()).scored)
+	mut Int costlyAt = -1
+	mut Int quietAt = -1
+	mut Int at = 0
+	for each r in rows {
+		if r.display == "costly" && costlyAt < 0 { costlyAt = at }
+		if r.display == "quiet" && quietAt < 0 { quietAt = at }
+		at = at + 1
+	}
+	assert costlyAt >= 0
+	assert quietAt >= 0
+	assert costlyAt < quietAt
+}
+
+test "a callable called twice is opened once and named the second time" {
+	source := "func quiet(a: Str): Int \{ return len(a) }\n"
+		+ "func left(a: Str): Int \{ return quiet(a) }\n"
+		+ "func right(a: Str): Int \{ return quiet(a) }\n"
+		+ "proc main(): void \{ echo \"\{left(\"x\") + right(\"y\")}\" }"
+	mut Int opened = 0
+	mut Int named = 0
+	for each r in analyze.treeOf(reportOf(source).scored) {
+		if r.display == "quiet" {
+			if r.again { named = named + 1 } else { opened = opened + 1 }
+		}
+	}
+	assert opened == 1
+	assert named == 1
+}
+
+test "a cycle in the graph does not walk forever" {
+	source := "func down(n: Int): Int \{ if n <= 0 \{ return 0 } return down(n - 1) }\n"
+		+ "proc main(): void \{ echo \"\{down(3)}\" }"
+	rows := analyze.treeOf(reportOf(source).scored)
+	assert len(rows) > 0
+	assert len(rows) < 100
+}
+
+test "every row carries the score of what it names" {
+	source := twoDeep()
+	assert rowFor(source, "costly").score == scoredIn(source, "costly").score
+	assert rowFor(source, "costly").total == scoredIn(source, "costly").total
+}
+
+test "the page draws the graph and lists it" {
+	page := hive.ui.html(analyzereport.view("main.hive", reportOf(twoDeep())))
+	assert text.contains(page, "The call graph")
+	// Small enough to draw, so the picture is there as well as the list.
+	assert text.contains(page, "<svg")
+	assert text.contains(page, "costly")
+}
+
+// --- What is scored and what is not ------------------------------------------------
+
+test "a test block is not scored" {
+	source := "proc main(): void \{ echo \"x\" }\n"
+		+ "test \"a nest in a test\" \{ for i := 0; i < 9; i++ \{ for j := 0; j < 9; j++ \{ assert j >= 0 } } }"
+	report := reportOf(source)
+	assert report.callables == 1
+	assert report.findings == 0
+}
+
+test "the whole program's score is the average of its callables'" {
+	source := "func quiet(a: Str): Int \{ return len(a) }\n"
+		+ "proc main(): void \{ echo \"\{quiet(\"x\")}\" }"
+	report := reportOf(source)
+	assert report.callables == 2
+	assert report.score == 100
+}
+
+// --- The report ---------------------------------------------------------------------
+
+test "the page is written beside the entrypoint, named after it" {
+	assert analyzereport.pathOf("examples/x/main.hive") == "examples/x/main-analysis.html"
+	assert analyzereport.pathOf("main.hive") == "main-analysis.html"
+}
+
+test "the page says the score, and says what was found" {
+	source := boxed("mut Box b = Box([]) append(b.items, \"x\") kept := b echo len(kept.items)")
+	page := hive.ui.html(analyzereport.view("main.hive", reportOf(source)))
+	assert text.contains(page, "What main.hive will cost")
+	assert text.contains(page, "deep-copied")
+	assert text.contains(page, "main")
+}
+
+test "the page names every callable, not only the ones with something wrong" {
+	source := "func quiet(a: Str): Int \{ return len(a) }\n"
+		+ "proc main(): void \{ echo \"\{quiet(\"x\")}\" }"
+	page := hive.ui.html(analyzereport.view("main.hive", reportOf(source)))
+	assert text.contains(page, "quiet")
+	assert text.contains(page, "Every callable")
+	assert text.contains(page, "Nothing to report")
+}
+
+test "a whole document brings its stylesheet with it" {
+	written := analyzereport.page("main.hive", reportOf(inMain("echo \"x\"")))
+	assert text.startsWith(written, "<!doctype html>")
+	assert text.contains(written, "<style>")
+	assert text.contains(written, "</html>")
+}
+
+test "the terminal says the score, the tally and where the page went" {
+	source := boxed("mut Box b = Box([]) append(b.items, \"x\") for i := 0; i < 9; i++ \{ kept := b echo len(kept.items) }")
+	said := join(analyzereport.lines("main.hive", reportOf(source), "main-analysis.html", 0), "\n")
+	assert text.contains(said, "main.hive scores")
+	assert text.contains(said, "Wrote main-analysis.html")
+	assert text.contains(said, "deep-copied")
+	assert text.contains(said, "×8")
+}
+
+test "the worst finding in a callable is printed first" {
+	source := boxed("mut Box b = Box([]) append(b.items, \"x\") for i := 0; i < 9; i++ \{ for j := 0; j < 9; j++ \{ kept := b echo join(kept.items, \",\") } }")
+	said := analyzereport.lines("main.hive", reportOf(source), "main-analysis.html", 0)
+	mut Int copyAt = -1
+	mut Int nestAt = -1
+	mut Int at = 0
+	for each line in said {
+		if text.contains(line, "deep-copied") && copyAt < 0 { copyAt = at }
+		if text.contains(line, "a loop inside a loop") && nestAt < 0 { nestAt = at }
+		at = at + 1
+	}
+	assert copyAt >= 0
+	assert nestAt >= 0
+	assert copyAt < nestAt
+}
+
+test "a copy is spelled copies" {
+	assert text.contains(analyzereport.copies(1), "1 copy")
+	assert text.contains(analyzereport.copies(3), "3 copies")
+}
+
+test "a clean program's report says so rather than showing an empty list" {
+	said := join(analyzereport.lines("main.hive", reportOf(inMain("echo \"x\"")), "main-analysis.html", 0), "\n")
+	assert text.contains(said, "Nothing here looks expensive.")
+}
+
+// --- Every finding says something ------------------------------------------------------
+
+test "every kind of finding has a label and a line of prose" {
+	mut analyze.Kind[dyn] kinds = [
+		analyze.Kind.Copy("Box", "a binding", 4),
+		analyze.Kind.Message("Box", 4),
+		analyze.Kind.Nest(),
+		analyze.Kind.Scan("indexOf"),
+		analyze.Kind.Growing("s"),
+		analyze.Kind.Shifting(),
+		analyze.Kind.Fresh("join"),
+		analyze.Kind.Waiting("the disk", "hive.file.read"),
+		analyze.Kind.Condition(),
+		analyze.Kind.Invariant("costly")
+	]
+	for each k in kinds {
+		assert analyze.label(k) != ""
+		assert analyze.label(k) != "something"
+		assert analyze.says(k) != ""
+		assert analyze.baseOf(k) > 0
+	}
+}
+
+test "a copy weighed at the cap is said as a floor rather than as a count" {
+	assert text.contains(analyze.weighed(4), "about 4")
+	assert text.contains(analyze.weighed(analyze.heaviestCopy()), "or more")
+}

@@ -8,6 +8,7 @@
 //   hive build     <entrypoint.hive> --target <goos>/<goarch>
 //   hive run       <entrypoint.hive> [..]  compile and run
 //   hive test      <entrypoint.hive>       run the program's tests, with coverage
+//   hive analyze   <entrypoint.hive>       score what it will cost, and write a page
 //   hive container <entrypoint.hive>       write a Dockerfile that builds and runs it
 //   hive agents                            write .hivedocs/ for a coding agent to read
 //   hive version                           which release this compiler is
@@ -15,6 +16,7 @@
 // Everything a compiler is made of happens here, as does driving the Go
 // toolchain over what came out. There is nothing left for a shell script to do.
 import ./agents
+import ./analyzereport
 import ./container
 import ./diag
 import ./paths
@@ -71,6 +73,8 @@ proc main(): void {
 		run(entry, rest(args, 2), from)
 	} else if command == "test" {
 		suite(entry, from)
+	} else if command == "analyze" {
+		score(entry, rest(args, 2), from)
 	} else if command == "container" {
 		dockerfile(entry, from)
 	} else {
@@ -157,6 +161,36 @@ proc suite(entry: Str, from: Int): void {
 			hive.term.exit(1)
 		}
 	}
+}
+
+// A score per `proc` and `func`, the copies and loops behind it, and an HTML page
+// beside the entrypoint. Everything found goes on the page; what it prints is the
+// part worth reading without opening one.
+proc score(entry: Str, flags: Str[], from: Int): void {
+	wrong := analyzeRefusal(flags)
+	if wrong != "" {
+		echo "hive: " + wrong
+		hive.term.exit(1)
+	}
+	answered := project.analyse(entry, from)
+	if answered is Result.Error(errors) {
+		complain(errors)
+		return
+	}
+	if answered is Result.Ok(done) {
+		for each line in analyzereport.lines(entry, done.report, done.path, from) {
+			echo line
+		}
+	}
+}
+
+/// Why whatever followed the entrypoint cannot be used, or `""`. It takes no
+/// flags, and something typed and then ignored is a command that quietly disobeyed.
+func analyzeRefusal(flags: Str[]): Str {
+	if len(flags) > 0 {
+		return "`hive analyze` takes an entrypoint and nothing else. `" + at(flags, 0) + "` was given to it."
+	}
+	return ""
 }
 
 // Writes a Dockerfile that builds this program and runs it, into the folder the
@@ -310,6 +344,7 @@ proc usage(): void {
 	echo "  hive build     <entrypoint.hive>       Compile to a native executable"
 	echo "  hive run       <entrypoint.hive> [..]  Compile and run"
 	echo "  hive test      <entrypoint.hive>       Run the program's tests, with coverage"
+	echo "  hive analyze   <entrypoint.hive>       Score what it will cost, and write a page"
 	echo "  hive container <entrypoint.hive>       Write a Dockerfile that builds and runs it"
 	echo "  hive agents                            Write .hivedocs/ for a coding agent to read"
 	echo "  hive version                           Print which release this compiler is"

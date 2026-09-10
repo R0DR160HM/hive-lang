@@ -1,0 +1,1596 @@
+// What `hive analyze` scores: every `proc` and `func` in the flattened,
+// monomorphized program, out of a hundred. Everything here is a weight rather
+// than a measurement — it says where to look first, not how long anything takes.
+// The one exception is a deep copy, which is read off `writes`, the pass that
+// decides them, so a copy named here is a copy that will be emitted.
+import ./ast
+import ./emit
+import ./infer
+import ./text
+import ./types
+import ./writes
+import hive.conv
+import hive.map
+
+// --- The numbers ---------------------------------------------------------------
+
+/// What a loop multiplies what is inside it by, capped at three levels.
+func loopWeight(depth: Int): Int {
+	if depth <= 0 { return 1 }
+	if depth == 1 { return 8 }
+	if depth == 2 { return 64 }
+	return 512
+}
+
+/// How long a `[dyn]` is taken to be when weighing a copy of one.
+func assumedLength(): Int {
+	return 8
+}
+
+/// The most any one type may be said to cost to copy.
+func heaviestCopy(): Int {
+	return 512
+}
+
+/// The most any one callable may be said to cost.
+func heaviestTotal(): Int {
+	return 200000
+}
+
+/// What each kind is worth before its loops are counted.
+func baseOf(kind: Kind): Int {
+	if kind is Kind.Copy(_, _, weight) { return weight }
+	if kind is Kind.Message(_, weight) { return weight + 4 }
+	if kind is Kind.Nest { return 4 }
+	if kind is Kind.Scan(_) { return 12 }
+	if kind is Kind.Growing(_) { return 14 }
+	if kind is Kind.Shifting { return 12 }
+	if kind is Kind.Fresh(name) {
+		if name == "sort" { return 10 }
+		return 4
+	}
+	if kind is Kind.Waiting(_, _) { return 30 }
+	if kind is Kind.Condition { return 6 }
+	if kind is Kind.Invariant(_) { return 4 }
+	return 0
+}
+
+/// A cost too small to be worth a mark against anybody.
+func quietCost(): Int {
+	return 8
+}
+
+/// Cost turned into a mark out of a hundred: every doubling costs ten points.
+/// Logarithmic because a cost here runs from four to thirty thousand, and a
+/// linear curve would bottom out at everything past the first loop.
+func scoreOf(cost: Int): Int {
+	if cost <= quietCost() {
+		return 100
+	}
+	mut Int score = 100
+	for left := cost; left > quietCost(); left = left / 2 {
+		score = score - 10
+	}
+	if score < 0 {
+		return 0
+	}
+	return score
+}
+
+// --- What was found ------------------------------------------------------------
+
+/// One kind of thing worth looking at.
+type Kind {
+	/// `weight` is what the copy will really walk, after everything `writes` shares.
+	Copy { typeName: Str, where: Str, weight: Int }
+	/// Copied across a thread or a machine boundary. Never shareable: it is the fence.
+	Message { typeName: Str, weight: Int }
+	Nest
+	Scan { name: Str }
+	/// A name assigned from an expression that reads it: `s = s + x`.
+	Growing { name: Str }
+	Shifting
+	Fresh { name: Str }
+	/// A disk, a network, a database or another process, inside a loop.
+	Waiting { on: Str, call: Str }
+	Condition
+	/// A call inside a loop that nothing the loop changes is handed to.
+	Invariant { name: Str }
+}
+
+type Finding {
+	kind: Kind
+	/// How many loops enclose it.
+	depth: Int
+	/// `baseOf(kind)` with the loops counted in.
+	cost: Int
+	/// The expression it is about. There are no line numbers this far down.
+	sketch: Str
+}
+
+type Scored {
+	/// The flattened name, which the call graph is written in.
+	name: Str
+	/// `text.repeat` for `text_5_repeat`.
+	display: Str
+	word: Str
+	line: Int
+	own: Int
+	/// That, plus half of the worst thing one call to it runs into.
+	total: Int
+	score: Int
+	/// On a cycle, so `total` is a floor.
+	recursive: Bool
+	findings: Finding[dyn]
+	calls: Str[dyn]
+	heaviest: Str
+}
+
+type Report {
+	/// Worst first.
+	scored: Scored[dyn]
+	/// The average of every score.
+	score: Int
+	callables: Int
+	findings: Int
+	copies: Int
+	nests: Int
+	waits: Int
+	deepest: Int
+}
+
+// --- The pass ------------------------------------------------------------------
+
+/// Tests, queries and imported Go functions are left out: a test is not shipped,
+/// a query's cost is the `hive.sql.run` that runs it, and what is past the Go
+/// boundary is not this compiler's to read.
+proc analyzeModule(m: ast.Module): Report {
+	t := types.tableOf(m)
+	written := writes.writtenShapes(m)
+	lent := emit.lentFuncs(t, m.decls)
+	loud := loopy(m.decls)
+
+	mut Scored[dyn] scored = []
+	mut deepest := 0
+	for each d in m.decls {
+		if d is ast.Decl.CallableDecl(kind, name, params, _, body, line) {
+			mut Walk w = Walk(t, written, lent, loud, [], [], 0)
+			at := At(infer.boundParams(infer.newEnv(t), params, 0), mutexes(params), 0, [], false)
+			walkBlock(w, at, body)
+			if w.deepest > deepest {
+				deepest = w.deepest
+			}
+			mut word := "proc"
+			if kind is ast.CallableKind.FuncKind {
+				word = "func"
+			}
+			own := added(w.found)
+			append(scored, Scored(name, spelled(name), word, line, own, own,
+				scoreOf(own), false, w.found, w.calls, ""))
+		}
+	}
+	return summarised(propagated(scored), deepest)
+}
+
+/// The names a body may write through from the start.
+func mutexes(params: ast.Param[]): Str[dyn] {
+	mut Str[dyn] out = []
+	for each p in params {
+		if p.mutex {
+			append(out, p.name)
+		}
+	}
+	return out
+}
+
+func added(found: Finding[]): Int {
+	mut Int sum = 0
+	for each f in found {
+		sum = sum + f.cost
+	}
+	return sum
+}
+
+/// The callables with a loop in them. Without this gate the loop-invariant
+/// finding fills the report with `text.charAt` and nobody reads the rest.
+proc loopy(decls: ast.Decl[]): Str[dyn] {
+	mut Str[dyn] out = []
+	for each d in decls {
+		if d is ast.Decl.CallableDecl(_, name, _, _, body, _) {
+			if loopsIn(body) {
+				append(out, name)
+			}
+		}
+	}
+	return out
+}
+
+func loopsIn(b: ast.Block): Bool {
+	for each s in b.stmts {
+		if s is ast.Stmt.ForLoop(_, _, _, _) { return true }
+		if s is ast.Stmt.ForEach(_, _, _, _) { return true }
+		if s is ast.Stmt.IfChain(branches, otherwise, _) {
+			for each br in branches {
+				if loopsIn(br.body) { return true }
+			}
+			if loopsIn(otherwise) { return true }
+		}
+	}
+	return false
+}
+
+// --- Walking a body ------------------------------------------------------------
+
+type Walk {
+	table: types.Table
+	written: Str[dyn]
+	lent: Str[dyn]
+	loud: Str[dyn]
+	found: Finding[dyn]
+	calls: Str[dyn]
+	deepest: Int
+}
+
+/// Where in a body the walk is. A value, so a block that ends restores it.
+type At {
+	env: infer.Env
+	/// `mut` bindings and mutex parameters.
+	mutables: Str[dyn]
+	depth: Int
+	/// Every name an enclosing loop changes.
+	varies: Str[dyn]
+	/// A thread gets storage of its own, so every argument owning any is copied.
+	spawning: Bool
+}
+
+proc note(w: mut Walk, at: At, kind: Kind, sketch: Str): void {
+	noteAt(w, kind, at.depth, at.depth, sketch)
+}
+
+/// For a finding whose weight is not its own depth's. Only a nest: the two loops
+/// *are* the finding, so weighing it by the depth it reaches counts them twice.
+proc noteAt(w: mut Walk, kind: Kind, depth: Int, weighing: Int, sketch: Str): void {
+	append(w.found, Finding(kind, depth, baseOf(kind) * loopWeight(weighing), sketch))
+}
+
+proc walkBlock(w: mut Walk, at: At, body: ast.Block): void {
+	walkEach(w, at, body.stmts, 0)
+}
+
+proc walkEach(w: mut Walk, at: At, stmts: ast.Stmt[], index: Int): void {
+	if stmts bounds index {
+		walkEach(w, walkStmt(w, at, stmts[index]), stmts, index + 1)
+	}
+}
+
+proc walkStmt(w: mut Walk, at: At, s: ast.Stmt): At {
+	if s is ast.Stmt.VarDecl(name, value, mutable, deferred) {
+		inner := starting(at, deferred)
+		walkExpr(w, inner, value)
+		ty := infer.typeOf(at.env, value)
+		binding(w, inner, value, ty, mutable)
+		return declared(at, name, ty, mutable)
+	}
+	if s is ast.Stmt.TypedDecl(written, name, value, mutable, deferred) {
+		inner := starting(at, deferred)
+		walkExpr(w, inner, value)
+		ty := types.resolve(w.table, written)
+		binding(w, inner, value, ty, mutable)
+		return declared(at, name, ty, mutable)
+	}
+	if s is ast.Stmt.Assign(target, value) {
+		walkExpr(w, at, value)
+		walkExpr(w, at, target)
+		growing(w, at, target, value)
+		return at
+	}
+	if s is ast.Stmt.IfChain(branches, otherwise, _) {
+		for each b in branches {
+			walkExpr(w, at, b.condition)
+			walkBlock(w, narrowed(at, b.condition), b.body)
+		}
+		walkBlock(w, at, otherwise)
+		return at
+	}
+	if s is ast.Stmt.ForLoop(init, cond, post, body) {
+		opened := walkStmt(w, at, init)
+		inner := entered(w, opened, changed(w.table, body, declaredBy(init)))
+		walkExpr(w, inner, cond)
+		condition(w, inner, cond)
+		walkStmt(w, inner, post)
+		walkBlock(w, inner, body)
+		return at
+	}
+	if s is ast.Stmt.ForEach(name, written, subject, body) {
+		walkExpr(w, at, subject)
+		mut element := types.elementOf(infer.typeOf(at.env, subject))
+		if written is ast.TypeExpr.VoidType {
+		} else {
+			element = types.resolve(w.table, written)
+		}
+		opened := At(infer.bound(at.env, name, element), at.mutables, at.depth, at.varies, at.spawning)
+		inner := entered(w, opened, changed(w.table, body, [name]))
+		walkBlock(w, inner, body)
+		return at
+	}
+	if s is ast.Stmt.AsyncStmt(call) {
+		inner := starting(at, true)
+		walkExpr(w, inner, call)
+		return at
+	}
+	if s is ast.Stmt.ReturnStmt(value) { walkExpr(w, at, value) return at }
+	if s is ast.Stmt.EchoStmt(value) { walkExpr(w, at, value) return at }
+	if s is ast.Stmt.AssertStmt(condition) { walkExpr(w, at, condition) return at }
+	if s is ast.Stmt.PanicStmt(value) { walkExpr(w, at, value) return at }
+	if s is ast.Stmt.Expression(value) { walkExpr(w, at, value) return at }
+	return at
+}
+
+/// One loop deeper, recording the nest as it goes.
+proc entered(w: mut Walk, at: At, varies: Str[]): At {
+	depth := at.depth + 1
+	if depth > w.deepest {
+		w.deepest = depth
+	}
+	inner := At(at.env, at.mutables, depth, joined(at.varies, varies), at.spawning)
+	if at.depth >= 1 {
+		noteAt(w, Kind.Nest(), depth, at.depth, "a loop {depth} deep")
+	}
+	return inner
+}
+
+/// One more name in scope, and in `mutables` if it may be written through.
+func declared(at: At, name: Str, ty: types.Ty, mutable: Bool): At {
+	mut Str[dyn] writable = at.mutables
+	if mutable {
+		writable = withName(at.mutables, name)
+	}
+	return At(infer.bound(at.env, name, ty), writable, at.depth, at.varies, at.spawning)
+}
+
+func narrowed(at: At, condition: ast.Expr): At {
+	return At(infer.narrowed(at.env, condition), at.mutables, at.depth, at.varies, at.spawning)
+}
+
+/// With a thread being started if `deferred`.
+func starting(at: At, deferred: Bool): At {
+	if deferred == false {
+		return at
+	}
+	return At(at.env, at.mutables, at.depth, at.varies, true)
+}
+
+// --- Expressions ---------------------------------------------------------------
+
+proc walkExpr(w: mut Walk, at: At, e: ast.Expr): void {
+	if e is ast.Expr.Call(callee, args) {
+		call(w, at, callee, args)
+		for each a in args {
+			walkExpr(w, at, a.value)
+		}
+		return
+	}
+	if e is ast.Expr.Member(subject, _) { walkExpr(w, at, subject) return }
+	if e is ast.Expr.Index(subject, index) {
+		walkExpr(w, at, subject)
+		walkExpr(w, at, index)
+		return
+	}
+	if e is ast.Expr.Slice(subject, low, high) {
+		walkExpr(w, at, subject)
+		walkExpr(w, at, low)
+		walkExpr(w, at, high)
+		return
+	}
+	if e is ast.Expr.Binary(_, left, right) {
+		walkExpr(w, at, left)
+		walkExpr(w, at, right)
+		return
+	}
+	if e is ast.Expr.Negate(operand) { walkExpr(w, at, operand) return }
+	if e is ast.Expr.Not(operand) { walkExpr(w, at, operand) return }
+	if e is ast.Expr.VectorLit(items) {
+		for each item in items {
+			walkExpr(w, at, item)
+		}
+		return
+	}
+	if e is ast.Expr.Interp(parts) {
+		for each part in parts {
+			if part is ast.InterpPart.Expression(value) {
+				walkExpr(w, at, value)
+			}
+		}
+		return
+	}
+	if e is ast.Expr.IsMatch(subject, _) { walkExpr(w, at, subject) return }
+	if e is ast.Expr.Timed(inner, ms) {
+		walkExpr(w, at, inner)
+		walkExpr(w, at, ms)
+		return
+	}
+	if e is ast.Expr.AwaitAll(calls, timeout) {
+		inner := starting(at, true)
+		for each c in calls {
+			walkExpr(w, inner, c)
+		}
+		walkExpr(w, at, timeout)
+		return
+	}
+}
+
+// --- A call --------------------------------------------------------------------
+
+proc call(w: mut Walk, at: At, callee: ast.Expr, args: ast.Arg[]): void {
+	name := calledName(w.table, at, callee)
+	if name != "" {
+		if indexOf(w.calls, name) is Result.Error(_) {
+			append(w.calls, name)
+		}
+		if types.findCallable(w.table, name) is Result.Ok(info) {
+			arguments(w, at, info, args)
+			hoistable(w, at, info, name, args)
+		}
+		return
+	}
+	builtinCall(w, at, callee, args)
+	libraryCall(w, at, callee, args)
+}
+
+/// The declared callable being called, or `""`.
+func calledName(t: types.Table, at: At, callee: ast.Expr): Str {
+	if callee is ast.Expr.Ident(name) {
+		if infer.isBound(at.env, name) {
+			return ""
+		}
+		if types.findCallable(t, name) is Result.Ok(_) {
+			return name
+		}
+	}
+	return ""
+}
+
+/// Every argument copied on the way in (8.1) — unless the callee is one of the
+/// `func`s the emitter lends storage to, and unless a thread is starting.
+proc arguments(w: mut Walk, at: At, info: types.CallableInfo, args: ast.Arg[]): void {
+	mut Int index = 0
+	for each p in info.params {
+		found := argFor(args, p.name, index)
+		index = index + 1
+		if p.mutex {
+			continue
+		}
+		if mutableSource(at, found) == false {
+			continue
+		}
+		ty := types.resolve(w.table, p.declared)
+		if types.ownsStorage(w.table, ty) == false {
+			continue
+		}
+		if at.spawning == false && indexOf(w.lent, info.name) is Result.Ok(_) {
+			continue
+		}
+		weight := copyWeight(w.table, w.written, ty, [])
+		if weight == 0 {
+			continue
+		}
+		if at.spawning {
+			note(w, at, Kind.Message(shownType(ty), weight), sketch(found))
+		} else {
+			note(w, at, Kind.Copy(shownType(ty), "an argument to `" + spelled(info.name) + "`", weight), sketch(found))
+		}
+	}
+}
+
+func argFor(args: ast.Arg[], name: Str, index: Int): ast.Expr {
+	for each a in args {
+		if a.name == name {
+			return a.value
+		}
+	}
+	mut Int seen = 0
+	for each a in args {
+		if a.name == "" {
+			if seen == index {
+				return a.value
+			}
+			seen = seen + 1
+		}
+	}
+	return ast.Expr.Absent()
+}
+
+/// A call inside a loop that the loop changes nothing of.
+proc hoistable(w: mut Walk, at: At, info: types.CallableInfo, name: Str, args: ast.Arg[]): void {
+	if at.depth == 0 || info.pure == false {
+		return
+	}
+	if indexOf(w.loud, name) is Result.Error(_) {
+		return
+	}
+	for each a in args {
+		if settled(at, a.value) == false {
+			return
+		}
+	}
+	note(w, at, Kind.Invariant(spelled(name)), sketch(ast.Expr.Call(ast.Expr.Ident(name), copiedArgs(args))))
+}
+
+/// Whether an expression is the same on every turn.
+func settled(at: At, e: ast.Expr): Bool {
+	if e is ast.Expr.IntLit(_) { return true }
+	if e is ast.Expr.FloatLit(_) { return true }
+	if e is ast.Expr.StrLit(_) { return true }
+	if e is ast.Expr.BoolLit(_) { return true }
+	if e is ast.Expr.AtomLit(_) { return true }
+	if e is ast.Expr.Ident(name) {
+		return indexOf(at.varies, name) is Result.Error(_)
+	}
+	if e is ast.Expr.Member(subject, _) { return settled(at, subject) }
+	if e is ast.Expr.Index(subject, index) {
+		return settled(at, subject) && settled(at, index)
+	}
+	if e is ast.Expr.Binary(_, left, right) {
+		return settled(at, left) && settled(at, right)
+	}
+	if e is ast.Expr.Negate(operand) { return settled(at, operand) }
+	if e is ast.Expr.Not(operand) { return settled(at, operand) }
+	return false
+}
+
+// --- Builtins ------------------------------------------------------------------
+
+/// The builtin a call is of, or `""`. A declaration of your own wins (13).
+func builtinName(t: types.Table, at: At, callee: ast.Expr): Str {
+	if callee is ast.Expr.Ident(name) {
+		if types.findCallable(t, name) is Result.Ok(_) { return "" }
+		if infer.isBound(at.env, name) { return "" }
+		if infer.isBuiltin(name) { return name }
+		return ""
+	}
+	if callee is ast.Expr.Member(root, name) {
+		if root is ast.Expr.Ident(head) {
+			if head == "hive" && infer.isBuiltin(name) {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+proc builtinCall(w: mut Walk, at: At, callee: ast.Expr, args: ast.Arg[]): void {
+	if at.depth == 0 {
+		return
+	}
+	name := builtinName(w.table, at, callee)
+	if name == "" {
+		return
+	}
+	quoted := sketch(ast.Expr.Call(ast.Expr.Ident(name), copiedArgs(args)))
+	if name == "indexOf" || name == "row" || name == "column" {
+		note(w, at, Kind.Scan(name), quoted)
+		return
+	}
+	if name == "prepend" {
+		note(w, at, Kind.Shifting(), quoted)
+		return
+	}
+	if name == "sort" || name == "split" || name == "join" || name == "map"
+		|| name == "filter" || name == "filterMap" || name == "drop"
+		|| name == "replaceAll" || name == "replaceFirst" {
+		note(w, at, Kind.Fresh(name), quoted)
+	}
+}
+
+// --- The standard library ------------------------------------------------------
+
+/// The `hive.<module>.<name>` a call is of, or two empty strings.
+func libraryOf(callee: ast.Expr): Str[dyn] {
+	if callee is ast.Expr.Member(root, name) {
+		if root is ast.Expr.Member(head, module) {
+			if head is ast.Expr.Ident(rootName) {
+				if rootName == "hive" {
+					return [module, name]
+				}
+			}
+		}
+	}
+	return ["", ""]
+}
+
+proc libraryCall(w: mut Walk, at: At, callee: ast.Expr, args: ast.Arg[]): void {
+	if at.depth == 0 {
+		return
+	}
+	found := libraryOf(callee)
+	module := text.charAt(found, 0)
+	name := text.charAt(found, 1)
+	if module == "" {
+		return
+	}
+	on := waitsOn(module, name)
+	if on == "" {
+		return
+	}
+	spelling := "hive." + module + "." + name
+	note(w, at, Kind.Waiting(on, spelling),
+		sketch(ast.Expr.Call(ast.Expr.Ident(spelling), copiedArgs(args))))
+}
+
+/// What a standard library call waits on, or `""`. `hive.crypto` is deliberately
+/// absent: hashing in a loop is what a program that hashes things does.
+func waitsOn(module: Str, name: Str): Str {
+	if module == "file" {
+		return "the disk"
+	}
+	if module == "net" {
+		return "the network"
+	}
+	if module == "sql" {
+		if name == "run" || name == "exec" || name == "connect" || name == "close" {
+			return "the database"
+		}
+		return ""
+	}
+	if module == "term" {
+		if name == "exec" || name == "execWith" || name == "attach" {
+			return "another process"
+		}
+		return ""
+	}
+	if module == "task" {
+		if name == "sleep" {
+			return "the clock"
+		}
+		return ""
+	}
+	if module == "syslink" {
+		if name == "ask" || name == "listen" {
+			return "another service"
+		}
+		return ""
+	}
+	return ""
+}
+
+// --- Copies --------------------------------------------------------------------
+
+/// A binding that has to copy, by 8.4's rule. The two halves of it that take a
+/// judgement are asked of `emit` rather than restated, so the two cannot drift.
+proc binding(w: mut Walk, at: At, value: ast.Expr, ty: types.Ty, mutable: Bool): void {
+	if emit.namesStorage(value) == false {
+		return
+	}
+	if types.ownsStorage(w.table, ty) == false {
+		return
+	}
+	if at.spawning {
+		weight := copyWeight(w.table, w.written, ty, [])
+		if weight > 0 {
+			note(w, at, Kind.Message(shownType(ty), weight), sketch(value))
+		}
+		return
+	}
+	if mutable == mutableSource(at, value) {
+		return
+	}
+	weight := copyWeight(w.table, w.written, ty, [])
+	if weight == 0 {
+		return
+	}
+	note(w, at, Kind.Copy(shownType(ty), "a binding", weight), sketch(value))
+}
+
+/// Whether an expression is a path into a name that may be written through.
+func mutableSource(at: At, value: ast.Expr): Bool {
+	root := emit.rootOf(value)
+	if root == "" {
+		return false
+	}
+	return indexOf(at.mutables, root) is Result.Ok(_)
+}
+
+/// What a deep copy of `ty` will really walk. Nought means `writes` proved every
+/// piece of storage in it is shared, so `clone_T` copies no field.
+func copyWeight(t: types.Table, written: Str[], ty: types.Ty, seen: Str[]): Int {
+	if types.ownsStorage(t, ty) == false {
+		return 0
+	}
+	if ty is types.Ty.TVec(element, dim) {
+		return capped(howMany(dim) * (1 + copyWeight(t, written, element, seen)))
+	}
+	if ty is types.Ty.TMap(_, value) {
+		return capped(assumedLength() * (1 + copyWeight(t, written, value, seen)))
+	}
+	if ty is types.Ty.TResult(ok, bad) {
+		return larger(copyWeight(t, written, ok, seen), copyWeight(t, written, bad, seen))
+	}
+	if ty is types.Ty.TNamed(name) {
+		if indexOf(seen, name) is Result.Ok(_) {
+			return assumedLength()
+		}
+		deeper := withName(seen, name)
+		if types.findType(t, name) is Result.Ok(info) {
+			mut Int sum = 0
+			for each f in info.shared {
+				sum = sum + fieldWeight(t, written, name, f, deeper)
+			}
+			mut Int worst = 0
+			for each v in info.variants {
+				mut Int here = 0
+				for each f in v.fields {
+					here = here + fieldWeight(t, written, name, f, deeper)
+				}
+				if here > worst {
+					worst = here
+				}
+			}
+			return capped(sum + worst)
+		}
+		return assumedLength()
+	}
+	return 0
+}
+
+func fieldWeight(t: types.Table, written: Str[], owner: Str, f: ast.Field, seen: Str[]): Int {
+	ty := types.resolve(t, f.declared)
+	if writes.mustCopy(t, written, owner, f.name, ty) == false {
+		return 0
+	}
+	return 1 + copyWeight(t, written, ty, seen)
+}
+
+/// How many elements a copy of a vector walks.
+func howMany(dim: ast.Dim): Int {
+	if dim is ast.Dim.Fixed(size) {
+		if size > heaviestCopy() {
+			return heaviestCopy()
+		}
+		if size < 1 {
+			return 1
+		}
+		return size
+	}
+	return assumedLength()
+}
+
+func capped(weight: Int): Int {
+	if weight > heaviestCopy() {
+		return heaviestCopy()
+	}
+	return weight
+}
+
+// --- A name rebuilt from itself ------------------------------------------------
+
+/// `s = s + line` inside a loop. `i = i + 1` is the same shape on an `Int` and
+/// costs nothing, so what tells them apart is the type.
+proc growing(w: mut Walk, at: At, target: ast.Expr, value: ast.Expr): void {
+	if at.depth == 0 {
+		return
+	}
+	if target is ast.Expr.Ident(name) {
+		ty := infer.typeOf(at.env, target)
+		grows := ty is types.Ty.TStr || types.ownsStorage(w.table, ty)
+		if grows && mentions(value, name) {
+			note(w, at, Kind.Growing(name), name + " = " + sketch(value))
+		}
+	}
+}
+
+/// Whether `name` is read anywhere in an expression.
+func mentions(e: ast.Expr, name: Str): Bool {
+	if e is ast.Expr.Ident(found) { return found == name }
+	if e is ast.Expr.Member(subject, _) { return mentions(subject, name) }
+	if e is ast.Expr.Index(subject, index) {
+		return mentions(subject, name) || mentions(index, name)
+	}
+	if e is ast.Expr.Slice(subject, low, high) {
+		return mentions(subject, name) || mentions(low, name) || mentions(high, name)
+	}
+	if e is ast.Expr.Binary(_, left, right) {
+		return mentions(left, name) || mentions(right, name)
+	}
+	if e is ast.Expr.Negate(operand) { return mentions(operand, name) }
+	if e is ast.Expr.Not(operand) { return mentions(operand, name) }
+	if e is ast.Expr.Call(callee, args) {
+		if mentions(callee, name) { return true }
+		for each a in args {
+			if mentions(a.value, name) { return true }
+		}
+		return false
+	}
+	if e is ast.Expr.VectorLit(items) {
+		for each item in items {
+			if mentions(item, name) { return true }
+		}
+		return false
+	}
+	if e is ast.Expr.Interp(parts) {
+		for each part in parts {
+			if part is ast.InterpPart.Expression(value) {
+				if mentions(value, name) { return true }
+			}
+		}
+		return false
+	}
+	if e is ast.Expr.IsMatch(subject, _) { return mentions(subject, name) }
+	return false
+}
+
+// --- A loop's condition --------------------------------------------------------
+
+/// A call in a loop's condition runs again every turn. `len` does not count.
+proc condition(w: mut Walk, at: At, cond: ast.Expr): void {
+	if calling(w, at, cond) {
+		note(w, at, Kind.Condition(), sketch(cond))
+	}
+}
+
+func calling(w: Walk, at: At, e: ast.Expr): Bool {
+	if e is ast.Expr.Call(callee, args) {
+		name := builtinName(w.table, at, callee)
+		if name == "len" || name == "bytes" {
+			for each a in args {
+				if calling(w, at, a.value) { return true }
+			}
+			return false
+		}
+		return true
+	}
+	if e is ast.Expr.Binary(_, left, right) {
+		return calling(w, at, left) || calling(w, at, right)
+	}
+	if e is ast.Expr.Not(operand) { return calling(w, at, operand) }
+	if e is ast.Expr.Negate(operand) { return calling(w, at, operand) }
+	if e is ast.Expr.Member(subject, _) { return calling(w, at, subject) }
+	if e is ast.Expr.Index(subject, index) {
+		return calling(w, at, subject) || calling(w, at, index)
+	}
+	if e is ast.Expr.IsMatch(subject, _) { return calling(w, at, subject) }
+	return false
+}
+
+// --- What a loop changes -------------------------------------------------------
+
+/// Every name a loop body changes. Conservative in the direction that costs nothing.
+proc changed(t: types.Table, body: ast.Block, already: Str[]): Str[dyn] {
+	mut Str[dyn] out = []
+	for each name in already {
+		append(out, name)
+	}
+	changing(t, body, out)
+	return out
+}
+
+proc changing(t: types.Table, b: ast.Block, out: mut Str[dyn]): void {
+	for each s in b.stmts {
+		changingStmt(t, s, out)
+	}
+}
+
+proc changingStmt(t: types.Table, s: ast.Stmt, out: mut Str[dyn]): void {
+	if s is ast.Stmt.Assign(target, value) {
+		put(out, emit.rootOf(target))
+		changingExpr(t, value, out)
+		return
+	}
+	if s is ast.Stmt.VarDecl(name, value, _, _) {
+		put(out, name)
+		changingExpr(t, value, out)
+		return
+	}
+	if s is ast.Stmt.TypedDecl(_, name, value, _, _) {
+		put(out, name)
+		changingExpr(t, value, out)
+		return
+	}
+	if s is ast.Stmt.IfChain(branches, otherwise, _) {
+		for each br in branches {
+			changingExpr(t, br.condition, out)
+			changing(t, br.body, out)
+		}
+		changing(t, otherwise, out)
+		return
+	}
+	if s is ast.Stmt.ForLoop(init, cond, post, body) {
+		changingStmt(t, init, out)
+		changingExpr(t, cond, out)
+		changingStmt(t, post, out)
+		changing(t, body, out)
+		return
+	}
+	if s is ast.Stmt.ForEach(name, _, subject, body) {
+		put(out, name)
+		changingExpr(t, subject, out)
+		changing(t, body, out)
+		return
+	}
+	if s is ast.Stmt.ReturnStmt(value) { changingExpr(t, value, out) return }
+	if s is ast.Stmt.EchoStmt(value) { changingExpr(t, value, out) return }
+	if s is ast.Stmt.AssertStmt(value) { changingExpr(t, value, out) return }
+	if s is ast.Stmt.PanicStmt(value) { changingExpr(t, value, out) return }
+	if s is ast.Stmt.AsyncStmt(value) { changingExpr(t, value, out) return }
+	if s is ast.Stmt.Expression(value) { changingExpr(t, value, out) return }
+}
+
+proc changingExpr(t: types.Table, e: ast.Expr, out: mut Str[dyn]): void {
+	if e is ast.Expr.Call(callee, args) {
+		if callee is ast.Expr.Ident(name) {
+			if types.findCallable(t, name) is Result.Ok(info) {
+				mut Int index = 0
+				for each p in info.params {
+					if p.mutex {
+						put(out, emit.rootOf(argFor(args, p.name, index)))
+					}
+					index = index + 1
+				}
+			} else if growsIt(name) {
+				put(out, emit.rootOf(argExpr(args, 0)))
+			}
+		}
+		found := libraryOf(callee)
+		if text.charAt(found, 0) == "map" {
+			if text.charAt(found, 1) == "set" || text.charAt(found, 1) == "delete" {
+				put(out, emit.rootOf(argExpr(args, 0)))
+			}
+		}
+		for each a in args {
+			changingExpr(t, a.value, out)
+		}
+		return
+	}
+	if e is ast.Expr.Member(subject, _) { changingExpr(t, subject, out) return }
+	if e is ast.Expr.Index(subject, index) {
+		changingExpr(t, subject, out)
+		changingExpr(t, index, out)
+		return
+	}
+	if e is ast.Expr.Slice(subject, low, high) {
+		changingExpr(t, subject, out)
+		changingExpr(t, low, out)
+		changingExpr(t, high, out)
+		return
+	}
+	if e is ast.Expr.Binary(_, left, right) {
+		changingExpr(t, left, out)
+		changingExpr(t, right, out)
+		return
+	}
+	if e is ast.Expr.Negate(operand) { changingExpr(t, operand, out) return }
+	if e is ast.Expr.Not(operand) { changingExpr(t, operand, out) return }
+	if e is ast.Expr.VectorLit(items) {
+		for each item in items {
+			changingExpr(t, item, out)
+		}
+		return
+	}
+	if e is ast.Expr.Interp(parts) {
+		for each part in parts {
+			if part is ast.InterpPart.Expression(value) {
+				changingExpr(t, value, out)
+			}
+		}
+		return
+	}
+	if e is ast.Expr.IsMatch(subject, _) { changingExpr(t, subject, out) return }
+	if e is ast.Expr.Timed(inner, ms) {
+		changingExpr(t, inner, out)
+		changingExpr(t, ms, out)
+		return
+	}
+	if e is ast.Expr.AwaitAll(calls, timeout) {
+		for each c in calls {
+			changingExpr(t, c, out)
+		}
+		changingExpr(t, timeout, out)
+		return
+	}
+}
+
+/// The builtins that write through the vector they are given.
+func growsIt(name: Str): Bool {
+	return name == "append" || name == "prepend" || name == "drop"
+		|| name == "sort" || name == "delete"
+}
+
+/// The name a `for` loop's own clause declares.
+func declaredBy(init: ast.Stmt): Str[dyn] {
+	if init is ast.Stmt.VarDecl(name, _, _, _) { return [name] }
+	if init is ast.Stmt.TypedDecl(_, name, _, _, _) { return [name] }
+	if init is ast.Stmt.Assign(target, _) { return [emit.rootOf(target)] }
+	return []
+}
+
+// --- The call graph ------------------------------------------------------------
+
+/// `total` is a body's own cost plus half of the worst thing one call to it runs
+/// into. The worst rather than the sum, so a `main` calling five hundred clean
+/// helpers is clean; half of it, so the callable a cost is *in* outranks everyone
+/// who merely reaches it. A cycle has no path length and is cut where it closes.
+proc propagated(scored: Scored[]): Scored[dyn] {
+	mut hive.map.Map<Str, Int> index = hive.map.new()
+	mut Int next = 0
+	for each s in scored {
+		hive.map.set(index, s.name, next)
+		next = next + 1
+	}
+	mut Int[dyn][dyn] edges = []
+	mut Int[dyn] own = []
+	for each s in scored {
+		mut Int[dyn] out = []
+		for each name in s.calls {
+			if hive.map.get(index, name) is Result.Ok(to) {
+				append(out, to)
+			}
+		}
+		append(edges, out)
+		append(own, s.own)
+	}
+
+	mut Int[dyn] total = []
+	mut Int[dyn] state = []
+	mut Bool[dyn] cyclic = []
+	for each s in scored {
+		append(total, s.own)
+		append(state, 0)
+		append(cyclic, false)
+	}
+	for i := 0; i < len(scored); i++ {
+		settle(edges, own, total, state, cyclic, i)
+	}
+
+	mut Scored[dyn] out = []
+	mut Int at = 0
+	for each s in scored {
+		mut Int reached = s.own
+		mut Bool recursive = false
+		if total bounds at { reached = total[at] }
+		if cyclic bounds at { recursive = cyclic[at] }
+		append(out, Scored(s.name, s.display, s.word, s.line, s.own, reached,
+			scoreOf(reached), recursive, s.findings, s.calls,
+			worst(scored, total, s.calls, index)))
+		at = at + 1
+	}
+	return out
+}
+
+proc settle(edges: Int[][], own: Int[], total: mut Int[dyn], state: mut Int[dyn],
+	cyclic: mut Bool[dyn], node: Int): Int {
+	if state bounds node {
+		if state[node] == 2 {
+			if total bounds node {
+				return total[node]
+			}
+			return 0
+		}
+		if state[node] == 1 {
+			if cyclic bounds node {
+				cyclic[node] = true
+			}
+			return 0
+		}
+		state[node] = 1
+	} else {
+		return 0
+	}
+	mut Int sum = 0
+	if own bounds node {
+		sum = own[node]
+	}
+	mut Int worstCallee = 0
+	if edges bounds node {
+		calls := edges[node]
+		for each to in calls {
+			if to == node {
+				if cyclic bounds node {
+					cyclic[node] = true
+				}
+				continue
+			}
+			reached := settle(edges, own, total, state, cyclic, to)
+			if reached > worstCallee {
+				worstCallee = reached
+			}
+		}
+	}
+	sum = sum + worstCallee / 2
+	if sum > heaviestTotal() {
+		sum = heaviestTotal()
+	}
+	if state bounds node {
+		state[node] = 2
+	}
+	if total bounds node {
+		total[node] = sum
+	}
+	return sum
+}
+
+func worst(scored: Scored[], total: Int[], calls: Str[], index: hive.map.Map<Str, Int>): Str {
+	mut Str found = ""
+	mut Int most = 0
+	for each name in calls {
+		if hive.map.get(index, name) is Result.Ok(at) {
+			if total bounds at {
+				if total[at] > most {
+					most = total[at]
+					found = name
+				}
+			}
+		}
+	}
+	if found == "" {
+		return ""
+	}
+	return spelled(found)
+}
+
+// --- The whole program ---------------------------------------------------------
+
+proc summarised(scored: Scored[], deepest: Int): Report {
+	mut Int findings = 0
+	mut Int copies = 0
+	mut Int nests = 0
+	mut Int waits = 0
+	mut Int sum = 0
+	for each s in scored {
+		sum = sum + s.score
+		for each f in s.findings {
+			findings = findings + 1
+			if f.kind is Kind.Copy(_, _, _) || f.kind is Kind.Message(_, _) {
+				copies = copies + 1
+			}
+			if f.kind is Kind.Nest {
+				nests = nests + 1
+			}
+			if f.kind is Kind.Waiting(_, _) {
+				waits = waits + 1
+			}
+		}
+	}
+	mut Int score = 100
+	if len(scored) > 0 {
+		score = sum / len(scored)
+	}
+	return Report(ranked(scored), score, len(scored), findings, copies, nests, waits, deepest)
+}
+
+/// Worst first, alphabetically within a tie, so two runs print the same report.
+func ranked(scored: Scored[]): Scored[dyn] {
+	return sort(scored, before)
+}
+
+func before(a: Scored, b: Scored): Bool {
+	if a.total != b.total {
+		return a.total > b.total
+	}
+	if a.own != b.own {
+		return a.own > b.own
+	}
+	return a.display < b.display
+}
+
+// --- Saying what a finding is --------------------------------------------------
+
+/// What a copy will walk, said. At the cap it is a floor rather than a count.
+func weighed(weight: Int): Str {
+	if weight >= heaviestCopy() {
+		return "{weight} or more"
+	}
+	return "about {weight}"
+}
+
+func label(kind: Kind): Str {
+	if kind is Kind.Copy(_, _, _) { return "deep copy" }
+	if kind is Kind.Message(_, _) { return "copied message" }
+	if kind is Kind.Nest { return "nested loop" }
+	if kind is Kind.Scan(_) { return "linear search in a loop" }
+	if kind is Kind.Growing(_) { return "rebuilt from itself" }
+	if kind is Kind.Shifting { return "prepend in a loop" }
+	if kind is Kind.Fresh(_) { return "fresh storage in a loop" }
+	if kind is Kind.Waiting(_, _) { return "waiting in a loop" }
+	if kind is Kind.Condition { return "call in a loop condition" }
+	if kind is Kind.Invariant(_) { return "the same answer every turn" }
+	return "something"
+}
+
+/// What the finding is, said once, so a terminal and a page say the same thing.
+func says(kind: Kind): Str {
+	if kind is Kind.Copy(typeName, where, weight) {
+		return "{where} of type `{typeName}` is deep-copied — " + weighed(weight)
+			+ " fields' worth of storage, after everything the compiler could share"
+	}
+	if kind is Kind.Message(typeName, weight) {
+		return "a `{typeName}` is copied on its way to a thread of its own — " + weighed(weight)
+			+ " fields' worth. A thread gets storage of its own, so this copy is the fence between them and cannot be shared away"
+	}
+	if kind is Kind.Nest {
+		return "a loop inside a loop, so everything in it is paid for the product of the two lengths"
+	}
+	if kind is Kind.Scan(name) {
+		return "`{name}` walks the whole thing, inside a loop that walks another"
+	}
+	if kind is Kind.Growing(name) {
+		return "`{name}` is built out of itself one turn at a time, which copies everything already in it every time round"
+	}
+	if kind is Kind.Shifting {
+		return "`prepend` moves every element already there to make room at the front"
+	}
+	if kind is Kind.Fresh(name) {
+		return "`{name}` answers with fresh storage, and does it again on every turn"
+	}
+	if kind is Kind.Waiting(on, call) {
+		return "`{call}` waits on {on}, once per turn of the loop"
+	}
+	if kind is Kind.Condition {
+		return "a call in the loop's condition is run again before every turn"
+	}
+	if kind is Kind.Invariant(name) {
+		return "`{name}` is handed nothing the loop changes, so every turn computes the same answer"
+	}
+	return ""
+}
+
+/// What to do about it.
+func advises(kind: Kind): Str {
+	if kind is Kind.Copy(_, _, _) {
+		return "Hand it to a `mut` parameter if the callee should write through it, or take the one field it needs instead of the whole record."
+	}
+	if kind is Kind.Message(_, _) {
+		return "Send the least that will do: a key rather than the record it is in."
+	}
+	if kind is Kind.Nest {
+		return "Index the inner one — a `hive.map.Map` built once outside turns the pair into a single pass."
+	}
+	if kind is Kind.Scan(_) {
+		return "Build a `hive.map.Map` before the loop and look up in it."
+	}
+	if kind is Kind.Growing(name) {
+		return "Collect into a `Str[dyn]` with `append` and `join` it once, after the loop."
+	}
+	if kind is Kind.Shifting {
+		return "`append` and read the vector backwards, or reverse it once at the end."
+	}
+	if kind is Kind.Fresh(_) {
+		return "Hoist it out of the loop if what it is given does not change."
+	}
+	if kind is Kind.Waiting(on, _) {
+		return "Ask {on} once, before the loop, for everything the loop will need."
+	}
+	if kind is Kind.Condition {
+		return "Bind it before the loop; the condition is read again every turn."
+	}
+	if kind is Kind.Invariant(_) {
+		return "Bind it before the loop."
+	}
+	return ""
+}
+
+// --- Names ---------------------------------------------------------------------
+
+/// A flattened name as the program spells it: `text_5_repeat` is `text.repeat`.
+/// A monomorphized copy keeps its mangling — which instantiation it is matters.
+func spelled(name: Str): Str {
+	pieces := split(name, "_")
+	if len(pieces) < 3 {
+		return name
+	}
+	if digits(text.charAt(pieces, 1)) == false {
+		return name
+	}
+	mut Str[dyn] rest = []
+	for i := 2; i < len(pieces); i++ {
+		if pieces bounds i {
+			append(rest, pieces[i])
+		}
+	}
+	return text.charAt(pieces, 0) + "." + join(rest, "_")
+}
+
+/// A type as the program spells it.
+func shownType(ty: types.Ty): Str {
+	return respelled(types.show(ty))
+}
+
+func respelled(shown: Str): Str {
+	mut Str[dyn] out = []
+	mut Str word = ""
+	for each c in text.chars(shown) {
+		if text.isAlnum(c) || c == "_" {
+			word = word + c
+		} else {
+			if word != "" {
+				append(out, spelled(word))
+				word = ""
+			}
+			append(out, c)
+		}
+	}
+	if word != "" {
+		append(out, spelled(word))
+	}
+	return join(out, "")
+}
+
+func digits(piece: Str): Bool {
+	if piece == "" {
+		return false
+	}
+	for each c in text.chars(piece) {
+		if text.isDigit(c) == false {
+			return false
+		}
+	}
+	return true
+}
+
+// --- Sketching an expression ---------------------------------------------------
+
+func longest(): Int {
+	return 72
+}
+
+func sketch(e: ast.Expr): Str {
+	return clipped(drawn(e), longest())
+}
+
+func drawn(e: ast.Expr): Str {
+	if e is ast.Expr.Ident(name) { return name }
+	if e is ast.Expr.IntLit(value) { return "{value}" }
+	if e is ast.Expr.FloatLit(value) { return hive.conv.fts(value) }
+	if e is ast.Expr.StrLit(value) { return "\"" + clipped(value, 20) + "\"" }
+	if e is ast.Expr.BoolLit(value) {
+		if value { return "true" }
+		return "false"
+	}
+	if e is ast.Expr.AtomLit(atom) { return "#" + atom }
+	if e is ast.Expr.Interp(_) { return "\"…\"" }
+	if e is ast.Expr.Member(subject, field) { return drawn(subject) + "." + field }
+	if e is ast.Expr.Index(subject, index) {
+		return drawn(subject) + "[" + drawn(index) + "]"
+	}
+	if e is ast.Expr.Slice(subject, low, high) {
+		return drawn(subject) + "[" + drawn(low) + ":" + drawn(high) + "]"
+	}
+	if e is ast.Expr.Call(callee, args) {
+		mut Str[dyn] out = []
+		for each a in args {
+			append(out, drawn(a.value))
+		}
+		return drawn(callee) + "(" + join(out, ", ") + ")"
+	}
+	if e is ast.Expr.Binary(op, left, right) {
+		return drawn(left) + " " + ast.opSpelling(op) + " " + drawn(right)
+	}
+	if e is ast.Expr.Negate(operand) { return "-" + drawn(operand) }
+	if e is ast.Expr.Not(operand) { return "!" + drawn(operand) }
+	if e is ast.Expr.VectorLit(items) {
+		mut Str[dyn] out = []
+		for each item in items {
+			append(out, drawn(item))
+		}
+		return "[" + join(out, ", ") + "]"
+	}
+	if e is ast.Expr.IsMatch(subject, _) { return drawn(subject) + " is …" }
+	if e is ast.Expr.AwaitAll(_, _) { return "await […]" }
+	if e is ast.Expr.Timed(inner, _) { return drawn(inner) + " with timeout …" }
+	if e is ast.Expr.Hole { return "_" }
+	if e is ast.Expr.Absent { return "" }
+	return "…"
+}
+
+func clipped(s: Str, most: Int): Str {
+	cs := text.chars(s)
+	if len(cs) <= most {
+		return s
+	}
+	return text.span(cs, 0, most - 1) + "…"
+}
+
+// --- Odds and ends ------------------------------------------------------------
+
+func withName(names: Str[], name: Str): Str[dyn] {
+	mut Str[dyn] out = []
+	for each n in names {
+		append(out, n)
+	}
+	if name != "" && indexOf(names, name) is Result.Error(_) {
+		append(out, name)
+	}
+	return out
+}
+
+proc put(out: mut Str[dyn], name: Str): void {
+	if name != "" && indexOf(out, name) is Result.Error(_) {
+		append(out, name)
+	}
+}
+
+func joined(a: Str[], b: Str[]): Str[dyn] {
+	mut Str[dyn] out = []
+	for each n in a {
+		append(out, n)
+	}
+	for each n in b {
+		if indexOf(out, n) is Result.Error(_) {
+			append(out, n)
+		}
+	}
+	return out
+}
+
+func copiedArgs(args: ast.Arg[]): ast.Arg[dyn] {
+	mut ast.Arg[dyn] out = []
+	for each a in args {
+		append(out, a)
+	}
+	return out
+}
+
+func argExpr(args: ast.Arg[], index: Int): ast.Expr {
+	mut Int seen = 0
+	for each a in args {
+		if seen == index {
+			return a.value
+		}
+		seen = seen + 1
+	}
+	return ast.Expr.Absent()
+}
+
+func larger(a: Int, b: Int): Int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// --- The call graph ------------------------------------------------------------
+
+/// One line of the call tree.
+type Row {
+	name: Str
+	display: Str
+	parent: Str
+	depth: Int
+	score: Int
+	own: Int
+	total: Int
+	/// Already expanded further up, so it is named here rather than repeated.
+	again: Bool
+	recursive: Bool
+	calls: Int
+}
+
+type Ranked {
+	name: Str
+	total: Int
+}
+
+func heavier(a: Ranked, b: Ranked): Bool {
+	if a.total != b.total {
+		return a.total > b.total
+	}
+	return a.name < b.name
+}
+
+type Tree {
+	rows: Row[dyn]
+	seen: hive.map.Map<Str, Bool>
+}
+
+/// Every callable nothing else in the program calls, worst first.
+proc rootsOf(scored: Scored[]): Str[dyn] {
+	mut hive.map.Map<Str, Bool> called = hive.map.new()
+	for each s in scored {
+		for each c in s.calls {
+			if c != s.name {
+				hive.map.set(called, c, true)
+			}
+		}
+	}
+	mut Str[dyn] out = []
+	for each s in scored {
+		if hive.map.has(called, s.name) == false {
+			append(out, s.name)
+		}
+	}
+	// A program that is all cycle has no root. The worst callable is where to
+	// start reading instead.
+	if len(out) == 0 && scored bounds 0 {
+		append(out, scored[0].name)
+	}
+	return entryFirst(out)
+}
+
+/// The entrypoint at the top, whatever it scores, and the rest worst first. It is
+/// where the program starts, so it is where a reader of the graph starts. The
+/// entry module keeps its own names through flattening, so it is spelled `main`
+/// and nothing else can be.
+func entryFirst(roots: Str[]): Str[dyn] {
+	mut Str[dyn] out = []
+	for each r in roots {
+		if r == "main" {
+			append(out, r)
+		}
+	}
+	for each r in roots {
+		if r != "main" {
+			append(out, r)
+		}
+	}
+	return out
+}
+
+/// The call graph as a forest, one tree per root, worst branch first. Each
+/// callable is expanded once; a later mention is named without being repeated,
+/// which is what keeps a graph a tree without losing an edge — and what bounds
+/// the walk at one row per call rather than one per path.
+proc treeOf(scored: Scored[]): Row[dyn] {
+	mut hive.map.Map<Str, Int> building = hive.map.new()
+	mut Int at = 0
+	for each s in scored {
+		hive.map.set(building, s.name, at)
+		at = at + 1
+	}
+	index := building
+	mut hive.map.Map<Str, Bool> seen = hive.map.new()
+	mut Tree t = Tree([], seen)
+	for each root in rootsOf(scored) {
+		grow(t, scored, index, root, "", 0)
+	}
+	// A cycle nothing outside it calls has no root, so nothing above reached it.
+	// It gets a tree of its own rather than being left out of the graph.
+	for each s in scored {
+		if hive.map.has(t.seen, s.name) == false {
+			grow(t, scored, index, s.name, "", 0)
+		}
+	}
+	return t.rows
+}
+
+proc grow(t: mut Tree, scored: Scored[], index: hive.map.Map<Str, Int>, name: Str,
+	parent: Str, depth: Int): void {
+	place := indexAt(index, name)
+	if place < 0 {
+		return
+	}
+	if scored bounds place {
+		s := scored[place]
+		already := hive.map.has(t.seen, name)
+		append(t.rows, Row(name, s.display, parent, depth, s.score, s.own, s.total,
+			already, s.recursive, len(s.calls)))
+		hive.map.set(t.seen, name, true)
+		if already {
+			return
+		}
+		for each c in byWorst(scored, index, s.calls) {
+			if c != name {
+				grow(t, scored, index, c, name, depth + 1)
+			}
+		}
+	}
+}
+
+func indexAt(index: hive.map.Map<Str, Int>, name: Str): Int {
+	if hive.map.get(index, name) is Result.Ok(at) {
+		return at
+	}
+	return -1
+}
+
+func byWorst(scored: Scored[], index: hive.map.Map<Str, Int>, calls: Str[]): Str[dyn] {
+	mut Ranked[dyn] ranked = []
+	for each c in calls {
+		place := indexAt(index, c)
+		if place >= 0 && scored bounds place {
+			append(ranked, Ranked(c, scored[place].total))
+		}
+	}
+	mut Str[dyn] out = []
+	for each r in sort(ranked, heavier) {
+		append(out, r.name)
+	}
+	return out
+}

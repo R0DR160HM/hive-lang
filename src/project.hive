@@ -6,6 +6,8 @@
 // Both happen here, in Hive. `hive.term.exec` runs a command and hands back what it
 // wrote; `hive.term.attach` gives it this program's own terminal. That is the
 // difference between a build and a run.
+import ./analyze
+import ./analyzereport
 import ./ast
 import ./check as checks
 import ./diag
@@ -94,6 +96,21 @@ type Compiled {
 
 /// `from` is when the command started; every line of progress counts from it.
 proc passes(entry: Str, from: Int): Compiled {
+	made := checked(entry, from)
+	if len(made.errors) > 0 {
+		return made
+	}
+	progress.step(from, "emitting Go")
+	emitted := emit.emitModule(made.module)
+	if len(emitted.errors) > 0 {
+		return refused(diag.allInFile(entry, emitted.errors))
+	}
+	return Compiled(made.module, emitted, [])
+}
+
+/// Everything up to the emitter and no further. Split out because `hive analyze`
+/// wants exactly this, and one pipeline written twice will disagree with itself.
+proc checked(entry: Str, from: Int): Compiled {
 	progress.step(from, "reading {entry}")
 	program := loader.load(entry)
 	if len(program.errors) > 0 {
@@ -121,12 +138,7 @@ proc passes(entry: Str, from: Int): Compiled {
 	if len(inRange) > 0 {
 		return refused(diag.allInFile(entry, inRange))
 	}
-	progress.step(from, "emitting Go")
-	emitted := emit.emitModule(expanded.module)
-	if len(emitted.errors) > 0 {
-		return refused(diag.allInFile(entry, emitted.errors))
-	}
-	return Compiled(expanded.module, emitted, [])
+	return Compiled(expanded.module, emit.Emitted("", [], [], [], [], []), [])
 }
 
 func refused(errors: diag.Diagnostic[dyn]): Compiled {
@@ -513,4 +525,30 @@ proc testTitles(entry: Str): Str[dyn] {
 /// only declarations is a perfectly good file.
 proc check(entry: Str, from: Int): diag.Diagnostic[dyn] {
 	return passes(entry, from).errors
+}
+
+// --- Analysing rather than building -------------------------------------------
+
+/// The page that was written, and the report it was written from.
+type Analysed {
+	path: Str
+	report: analyze.Report
+}
+
+/// Score `entry` and write the page beside it. The front end and no further, so
+/// this needs no more on the machine than `hive check`. A program that does not
+/// compile is not analysed.
+proc analyse(entry: Str, from: Int): Result<Analysed, diag.Diagnostic[dyn]> {
+	made := checked(entry, from)
+	if len(made.errors) > 0 {
+		return Result.Error(made.errors)
+	}
+	progress.step(from, "scoring " + progress.counted(len(made.module.decls), "declaration"))
+	report := analyze.analyzeModule(made.module)
+	path := analyzereport.pathOf(entry)
+	progress.step(from, "writing " + paths.baseOf(path))
+	if hive.file.write(path, analyzereport.page(entry, report)) is Result.Error(why) {
+		return Result.Error([diag.about(path, "cannot write `{path}`: {why.message}")])
+	}
+	return Result.Ok(Analysed(path, report))
 }
