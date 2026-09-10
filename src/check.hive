@@ -16,6 +16,7 @@ import ./infer
 import ./stdlib
 import ./text
 import ./types
+import hive.map
 
 type Check {
 	table: types.Table
@@ -348,25 +349,25 @@ proc checkBoundValue(c: mut Check, env: infer.Env, value: ast.Expr): void {
 }
 
 proc checkTypeDecl(c: mut Check, fields: ast.Field[], variants: ast.Variant[]): void {
-	mut Str[dyn] seen = []
+	mut hive.map.Map<Str, Bool> seen = hive.map.new()
 	for each f in fields {
-		if indexOf(seen, f.name) is Result.Ok(_) {
+		if hive.map.has(seen, f.name) {
 			report(c, "this type declares `{f.name}` twice")
 		}
-		append(seen, f.name)
+		hive.map.set(seen, f.name, true)
 		checkReservedField(c, f.name)
 		checkMarks(c, f)
 	}
-	mut Str[dyn] variantNames = []
+	mut hive.map.Map<Str, Bool> variantNames = hive.map.new()
 	for each v in variants {
-		if indexOf(variantNames, v.name) is Result.Ok(_) {
+		if hive.map.has(variantNames, v.name) {
 			report(c, "this type declares the variant `{v.name}` twice")
 		}
-		append(variantNames, v.name)
+		hive.map.set(variantNames, v.name, true)
 		// A field declared outside any variant is added to every one of them, so
 		// a variant naming one of its own the same way would have two.
 		for each f in v.fields {
-			if indexOf(seen, f.name) is Result.Ok(_) {
+			if hive.map.has(seen, f.name) {
 				report(c, "the variant `{v.name}` declares `{f.name}`, which the type already declares outside every variant — a shared field is added to each of them, so this one would be there twice")
 			}
 			checkReservedField(c, f.name)
@@ -421,30 +422,30 @@ proc checkMarks(c: mut Check, f: ast.Field): void {
 // fields together with the shared ones, since that is the object a variant encodes to.
 proc checkJsonNames(c: mut Check, fields: ast.Field[], variants: ast.Variant[]): void {
 	if len(variants) == 0 {
-		reportClashes(c, fields)
+		reportClashes(c, fields, [])
 		return
 	}
 	for each v in variants {
-		mut ast.Field[dyn] both = []
-		for each f in v.fields {
-			append(both, f)
-		}
-		for each f in fields {
-			append(both, f)
-		}
-		reportClashes(c, both)
+		reportClashes(c, v.fields, fields)
 	}
 }
 
-proc reportClashes(c: mut Check, fields: ast.Field[]): void {
-	mut Str[dyn] keys = []
+proc reportClashes(c: mut Check, fields: ast.Field[], andShared: ast.Field[]): void {
+	mut hive.map.Map<Str, Bool> keys = hive.map.new()
 	for each f in fields {
-		key := ast.jsonKey(f)
-		if indexOf(keys, key) is Result.Ok(_) {
-			report(c, "two fields here are `{key}` in JSON, and one key cannot be read into two fields. Give one of them a `-- JSON as ...;` of its own")
-		}
-		append(keys, key)
+		clashingKey(c, keys, f)
 	}
+	for each f in andShared {
+		clashingKey(c, keys, f)
+	}
+}
+
+proc clashingKey(c: mut Check, keys: mut hive.map.Map<Str, Bool>, f: ast.Field): void {
+	key := ast.jsonKey(f)
+	if hive.map.has(keys, key) {
+		report(c, "two fields here are `{key}` in JSON, and one key cannot be read into two fields. Give one of them a `-- JSON as ...;` of its own")
+	}
+	hive.map.set(keys, key, true)
 }
 
 // What a literal is, which is the whole of what a `Default` may be — the parser

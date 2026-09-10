@@ -7,6 +7,7 @@ import ./ast
 import ./emit
 import ./infer
 import ./text
+import ./token
 import ./types
 import ./writes
 import hive.conv
@@ -39,7 +40,7 @@ func heaviestTotal(): Int {
 
 /// What each kind is worth before its loops are counted.
 func baseOf(kind: Kind): Int {
-	if kind is Kind.Copy(_, _, weight) { return weight }
+	if kind is Kind.Copy(_, _, weight, _) { return weight }
 	if kind is Kind.Message(_, weight) { return weight + 4 }
 	if kind is Kind.Nest { return 4 }
 	if kind is Kind.Scan(_) { return 12 }
@@ -82,7 +83,8 @@ func scoreOf(cost: Int): Int {
 /// One kind of thing worth looking at.
 type Kind {
 	/// `weight` is what the copy will really walk, after everything `writes` shares.
-	Copy { typeName: Str, where: Str, weight: Int }
+	/// `why` is what stops it being shared, or `""` when there is nothing to say.
+	Copy { typeName: Str, where: Str, weight: Int, why: Str }
 	/// Copied across a thread or a machine boundary. Never shareable: it is the fence.
 	Message { typeName: Str, weight: Int }
 	Nest
@@ -147,14 +149,18 @@ type Report {
 proc analyzeModule(m: ast.Module): Report {
 	t := types.tableOf(m)
 	written := writes.writtenShapes(m)
-	lent := emit.lentFuncs(t, m.decls)
+	leaked := writes.leakedBy(t, m.decls)
+	mut hive.map.Map<Str, Bool> lent = hive.map.new()
+	for each name in emit.lentFuncs(t, m.decls) {
+		hive.map.set(lent, name, true)
+	}
 	loud := loopy(m.decls)
 
 	mut Scored[dyn] scored = []
 	mut deepest := 0
 	for each d in m.decls {
 		if d is ast.Decl.CallableDecl(kind, name, params, _, body, line) {
-			mut Walk w = Walk(t, written, lent, loud, [], [], 0)
+			mut Walk w = Walk(t, written, leaked, lent, loud, [], [], 0)
 			at := At(infer.boundParams(infer.newEnv(t), params, 0), mutexes(params), 0, [], false)
 			walkBlock(w, at, body)
 			if w.deepest > deepest {
@@ -224,7 +230,9 @@ func loopsIn(b: ast.Block): Bool {
 type Walk {
 	table: types.Table
 	written: Str[dyn]
-	lent: Str[dyn]
+	/// Shape -> the callable whose signature let it escape, from `writes`.
+	leaked: hive.map.Map<Str, Str>
+	lent: hive.map.Map<Str, Bool>
 	loud: Str[dyn]
 	found: Finding[dyn]
 	calls: Str[dyn]
@@ -294,7 +302,7 @@ proc walkStmt(w: mut Walk, at: At, s: ast.Stmt): At {
 	}
 	if s is ast.Stmt.ForLoop(init, cond, post, body) {
 		opened := walkStmt(w, at, init)
-		inner := entered(w, opened, changed(w.table, body, declaredBy(init)))
+		inner := entered(w, opened, changed(w.table, body, clauses(w.table, init, post)))
 		walkExpr(w, inner, cond)
 		condition(w, inner, cond)
 		walkStmt(w, inner, post)
@@ -467,7 +475,7 @@ proc arguments(w: mut Walk, at: At, info: types.CallableInfo, args: ast.Arg[]): 
 		if types.ownsStorage(w.table, ty) == false {
 			continue
 		}
-		if at.spawning == false && indexOf(w.lent, info.name) is Result.Ok(_) {
+		if at.spawning == false && hive.map.has(w.lent, info.name) {
 			continue
 		}
 		weight := copyWeight(w.table, w.written, ty, [])
@@ -477,7 +485,8 @@ proc arguments(w: mut Walk, at: At, info: types.CallableInfo, args: ast.Arg[]): 
 		if at.spawning {
 			note(w, at, Kind.Message(shownType(ty), weight), sketch(found))
 		} else {
-			note(w, at, Kind.Copy(shownType(ty), "an argument to `" + spelled(info.name) + "`", weight), sketch(found))
+			note(w, at, Kind.Copy(shownType(ty), "an argument to `" + spelled(info.name) + "`",
+				weight, whyCopied(w, ty)), sketch(found))
 		}
 	}
 }
@@ -678,7 +687,7 @@ proc binding(w: mut Walk, at: At, value: ast.Expr, ty: types.Ty, mutable: Bool):
 	if weight == 0 {
 		return
 	}
-	note(w, at, Kind.Copy(shownType(ty), "a binding", weight), sketch(value))
+	note(w, at, Kind.Copy(shownType(ty), "a binding", weight, whyCopied(w, ty)), sketch(value))
 }
 
 /// Whether an expression is a path into a name that may be written through.
@@ -738,6 +747,90 @@ func fieldWeight(t: types.Table, written: Str[], owner: Str, f: ast.Field, seen:
 		return 0
 	}
 	return 1 + copyWeight(t, written, ty, seen)
+}
+
+/// Why a copy of `ty` cannot be shared, or `""` when there is nothing to say
+/// beyond the general advice. A weight says how much a copy costs; this says
+/// which field costs it and what holds that field down.
+proc whyCopied(w: Walk, ty: types.Ty): Str {
+	if indexOf(w.written, "*") is Result.Ok(_) {
+		return "Nothing in this program is shared: a write went somewhere the pass could not follow, and after that it will not vouch for anything. Find that write and this copy goes with every other one."
+	}
+	// A bare `Str[]` has no field to blame: it is itself the shape that escaped.
+	shape := writes.shapeOf(ty)
+	if writes.forcedShape(w.table, w.written, ty, []) == shape {
+		return escapedBecause(w, "", shape)
+	}
+	// A wrapper: what cannot be shared is inside it.
+	if ty is types.Ty.TVec(element, _) { return whyCopied(w, element) }
+	if ty is types.Ty.TMap(_, value) { return whyCopied(w, value) }
+	if ty is types.Ty.TResult(ok, bad) {
+		// `copyWeight` charges the heavier side, so the reason comes from it.
+		if copyWeight(w.table, w.written, ok, []) >= copyWeight(w.table, w.written, bad, []) {
+			return whyCopied(w, ok)
+		}
+		return whyCopied(w, bad)
+	}
+	if ty is types.Ty.TNamed(owner) {
+		if types.findType(w.table, owner) is Result.Ok(info) {
+			mut Str field = ""
+			mut types.Ty held = types.Ty.TUnknown()
+			mut Int most = 0
+			for each f in info.shared {
+				here := fieldWeight(w.table, w.written, owner, f, [owner])
+				if here > most {
+					most = here
+					field = f.name
+					held = types.resolve(w.table, f.declared)
+				}
+			}
+			for each v in info.variants {
+				for each f in v.fields {
+					here := fieldWeight(w.table, w.written, owner, f, [owner])
+					if here > most {
+						most = here
+						field = f.name
+						held = types.resolve(w.table, f.declared)
+					}
+				}
+			}
+			if field == "" {
+				return ""
+			}
+			return heldDown(w, owner, field, held)
+		}
+	}
+	return ""
+}
+
+/// What stops one field being shared: `mustCopy`'s own answers, in the order it
+/// asks them.
+func heldDown(w: Walk, owner: Str, field: Str, held: types.Ty): Str {
+	named := "`" + spelled(owner) + "." + field + "` is most of it, and "
+	if indexOf(w.written, "f" + owner + "." + field) is Result.Ok(_) {
+		return named + "the program writes through it, so a copy that shared it would be one the writer could see. Stop writing through that field and the copy goes."
+	}
+	forced := writes.forcedShape(w.table, w.written, held, [])
+	if forced == "" {
+		return ""
+	}
+	return escapedBecause(w, named, forced)
+}
+
+/// A shape that escaped, and the signature that let it. `named` is the field
+/// clause, or `""` when the copied thing is itself the escaped shape.
+func escapedBecause(w: Walk, named: Str, shape: Str): Str {
+	spelt := "`" + respelled(shape) + "`"
+	mut Str head = named + "cannot be shared because "
+	if named == "" {
+		head = "This cannot be shared because "
+	}
+	if hive.map.get(w.leaked, shape) is Result.Ok(by) {
+		return head + spelt + " escapes: `" + spelled(by)
+			+ "` can answer with storage of that shape reachable from what it was handed, so it may give back the very storage its caller still holds. Nothing holding "
+			+ spelt + " is shared anywhere while that signature stands."
+	}
+	return head + spelt + " escaped through a write the pass could not follow back to any field."
 }
 
 /// How many elements a copy of a vector walks.
@@ -888,6 +981,7 @@ proc changingStmt(t: types.Table, s: ast.Stmt, out: mut Str[dyn]): void {
 	if s is ast.Stmt.IfChain(branches, otherwise, _) {
 		for each br in branches {
 			changingExpr(t, br.condition, out)
+			bindsOf(br.condition, out)
 			changing(t, br.body, out)
 		}
 		changing(t, otherwise, out)
@@ -988,10 +1082,70 @@ proc changingExpr(t: types.Table, e: ast.Expr, out: mut Str[dyn]): void {
 	}
 }
 
+/// Every name a pattern in a condition binds. A binding is not an assignment, but
+/// it is a new value each turn all the same, so it belongs here: left out,
+/// `hoistable` advises lifting a call out of a loop it answers differently in.
+proc bindsOf(cond: ast.Expr, out: mut Str[dyn]): void {
+	if cond is ast.Expr.Binary(op, left, right) {
+		// `&&` is the one operator that carries bindings on, per `infer.narrowed`.
+		if op is ast.BinOp.And {
+			bindsOf(left, out)
+			bindsOf(right, out)
+		}
+		return
+	}
+	if cond is ast.Expr.IsMatch(_, pattern) {
+		boundByPattern(pattern, out)
+	}
+}
+
+/// The names one pattern binds — the same three shapes `infer.afterPattern` does,
+/// so what a body can see and what counts as varying agree.
+proc boundByPattern(p: ast.Pattern, out: mut Str[dyn]): void {
+	if p is ast.Pattern.Constructor(_, bindings, _) {
+		for each name in bindings {
+			put(out, name)
+		}
+		return
+	}
+	if p is ast.Pattern.VectorPat(elements, rest) {
+		for each e in elements {
+			if e is ast.VecElem.Bind(name) {
+				put(out, name)
+			}
+		}
+		if rest != "" {
+			put(out, rest)
+		}
+		return
+	}
+	if p is ast.Pattern.StrTemplate(parts) {
+		for each part in parts {
+			if part is token.StrPart.Code(source) {
+				put(out, text.trim(source))
+			} else if part is token.StrPart.Hole(name, _) {
+				put(out, name)
+			}
+		}
+	}
+}
+
 /// The builtins that write through the vector they are given.
 func growsIt(name: Str): Bool {
 	return name == "append" || name == "prepend" || name == "drop"
 		|| name == "sort" || name == "delete"
+}
+
+/// Every name a `for` loop's own clauses give a new value each turn. `post` is
+/// where `i++` lives, and a counter declared outside the loop is changed nowhere
+/// else, so read off the body alone it looks fixed.
+proc clauses(t: types.Table, init: ast.Stmt, post: ast.Stmt): Str[dyn] {
+	mut Str[dyn] out = []
+	for each name in declaredBy(init) {
+		put(out, name)
+	}
+	changingStmt(t, post, out)
+	return out
 }
 
 /// The name a `for` loop's own clause declares.
@@ -1138,7 +1292,7 @@ proc summarised(scored: Scored[], deepest: Int): Report {
 		sum = sum + s.score
 		for each f in s.findings {
 			findings = findings + 1
-			if f.kind is Kind.Copy(_, _, _) || f.kind is Kind.Message(_, _) {
+			if f.kind is Kind.Copy(_, _, _, _) || f.kind is Kind.Message(_, _) {
 				copies = copies + 1
 			}
 			if f.kind is Kind.Nest {
@@ -1182,7 +1336,7 @@ func weighed(weight: Int): Str {
 }
 
 func label(kind: Kind): Str {
-	if kind is Kind.Copy(_, _, _) { return "deep copy" }
+	if kind is Kind.Copy(_, _, _, _) { return "deep copy" }
 	if kind is Kind.Message(_, _) { return "copied message" }
 	if kind is Kind.Nest { return "nested loop" }
 	if kind is Kind.Scan(_) { return "linear search in a loop" }
@@ -1197,7 +1351,7 @@ func label(kind: Kind): Str {
 
 /// What the finding is, said once, so a terminal and a page say the same thing.
 func says(kind: Kind): Str {
-	if kind is Kind.Copy(typeName, where, weight) {
+	if kind is Kind.Copy(typeName, where, weight, _) {
 		return "{where} of type `{typeName}` is deep-copied — " + weighed(weight)
 			+ " fields' worth of storage, after everything the compiler could share"
 	}
@@ -1234,7 +1388,13 @@ func says(kind: Kind): Str {
 
 /// What to do about it.
 func advises(kind: Kind): Str {
-	if kind is Kind.Copy(_, _, _) {
+	if kind is Kind.Copy(_, _, _, why) {
+		// The general advice is worth little against a copy forced from elsewhere:
+		// `mut` is not open to a `func`, and taking one field does nothing when
+		// that field is the one that cannot be shared.
+		if why != "" {
+			return why
+		}
 		return "Hand it to a `mut` parameter if the callee should write through it, or take the one field it needs instead of the whole record."
 	}
 	if kind is Kind.Message(_, _) {

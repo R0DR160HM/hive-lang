@@ -195,12 +195,18 @@ func spellDim(d: ast.Dim): Str {
 proc instantiate(mo: mut Mono, env: infer.Env, at: Int): Result<ast.Decl, Bool> {
 	name := nameAt(mo.wantedNames, at)
 	flat := nameAt(mo.wantedFlat, at)
-	args := argsAt(mo.wantedArgs, at)
+	// Bound immutably at the end: the loop below hands it on, and what a `mut`
+	// binding is handed to is copied every time.
+	mut ArgList picked = ArgList([])
+	if mo.wantedArgs bounds at {
+		picked = mo.wantedArgs[at]
+	}
+	args := picked
 
 	for each d in mo.source {
 		if ast.declName(d) == name {
 			mo.line = ast.declLine(d)
-			variables := variablesOfDecl(mo, d)
+			variables := variablesOfDecl(mo.table, d)
 			if len(variables) != len(args.written) {
 				append(mo.errors, diag.at(mo.line, "`{name}` is generic in " + countWord(len(variables)) + ", and this use gives " + countWord(len(args.written))))
 				return Result.Error(false)
@@ -211,13 +217,13 @@ proc instantiate(mo: mut Mono, env: infer.Env, at: Int): Result<ast.Decl, Bool> 
 	return Result.Error(false)
 }
 
-func variablesOfDecl(mo: Mono, d: ast.Decl): Str[dyn] {
+func variablesOfDecl(t: types.Table, d: ast.Decl): Str[dyn] {
 	name := ast.declName(d)
-	if types.findCallable(mo.table, name) is Result.Ok(info) {
-		return variablesOf(mo.table, info.parameters)
+	if types.findCallable(t, name) is Result.Ok(info) {
+		return variablesOf(t, info.parameters)
 	}
-	if types.findType(mo.table, name) is Result.Ok(info) {
-		return variablesOf(mo.table, info.parameters)
+	if types.findType(t, name) is Result.Ok(info) {
+		return variablesOf(t, info.parameters)
 	}
 	mut Str[dyn] none = []
 	return none
@@ -388,13 +394,6 @@ func nameAt(names: Str[], index: Int): Str {
 		return names[index]
 	}
 	return ""
-}
-
-func argsAt(all: ArgList[], index: Int): ArgList {
-	if all bounds index {
-		return all[index]
-	}
-	return ArgList([])
 }
 
 // --- Rewriting a body --------------------------------------------------------
@@ -587,7 +586,7 @@ proc chosen(mo: mut Mono, env: infer.Env, name: Str, callArgs: ast.Arg[]): Str {
 		variables := variablesOf(env.table, info.parameters)
 		mut ast.TypeExpr[dyn] found = []
 		for each v in variables {
-			found = withWritten(found, solve(mo, env, info.params, callArgs, v))
+			append(found, solve(mo, env, info.params, callArgs, v))
 		}
 		return wanted(mo, name, ArgList(found))
 	}
@@ -597,20 +596,11 @@ proc chosen(mo: mut Mono, env: infer.Env, name: Str, callArgs: ast.Arg[]): Str {
 		variables := variablesOf(env.table, info.parameters)
 		mut ast.TypeExpr[dyn] found = []
 		for each v in variables {
-			found = withWritten(found, solveFields(mo, env, info.shared, callArgs, v))
+			append(found, solveFields(mo, env, info.shared, callArgs, v))
 		}
 		return wanted(mo, name, ArgList(found))
 	}
 	return name
-}
-
-func withWritten(into: ast.TypeExpr[], one: ast.TypeExpr): ast.TypeExpr[dyn] {
-	mut ast.TypeExpr[dyn] out = []
-	for each t in into {
-		append(out, t)
-	}
-	append(out, one)
-	return out
 }
 
 // What one variable stands for at this call. A variable is pinned down wherever

@@ -300,12 +300,14 @@ proc flatten(sources: Source[], entryKey: Str, found: diag.Diagnostic[]): Progra
 	// Every declaration in the program, under `<moduleKey>#<name>`, mapped to
 	// the name it carries once everything is one module.
 	mut hive.map.Map<Str, Str> flatNames = hive.map.new()
+	mut hive.map.Map<Str, Bool> known = hive.map.new()
 	mut Source[dyn] prefixed = []
 	for i := 0; i < len(sources); i++ {
 		if sources bounds i {
 			src := sources[i]
 			prefix := prefixFor(src.key, i, src.key == entryKey)
 			append(prefixed, Source(src.key, src.dir, prefix, src.resolved, src.module))
+			hive.map.set(known, src.key, true)
 			for each d in src.module.decls {
 				name := ast.declName(d)
 				if name != "" {
@@ -318,7 +320,7 @@ proc flatten(sources: Source[], entryKey: Str, found: diag.Diagnostic[]): Progra
 	mut ast.Decl[dyn] decls = []
 	for each src in prefixed {
 		mut Rw rw = Rw(src.key, hive.map.new(), hive.map.new(), flatNames, [], [])
-		bindImports(rw, src, prefixed)
+		bindImports(rw, src, known)
 		for each d in src.module.decls {
 			append(decls, rewriteDecl(rw, d))
 		}
@@ -347,7 +349,7 @@ type Rw {
 	errors: diag.Diagnostic[dyn]
 }
 
-proc bindImports(rw: mut Rw, src: Source, sources: Source[]): void {
+proc bindImports(rw: mut Rw, src: Source, known: hive.map.Map<Str, Bool>): void {
 	for each line in src.module.imports {
 		if line.alias == "" {
 			continue
@@ -359,22 +361,13 @@ proc bindImports(rw: mut Rw, src: Source, sources: Source[]): void {
 		// Whatever the path named — a file next door, a Go file, one inside a
 		// clone — the walk already worked it out and wrote it down.
 		if hive.map.get(src.resolved, line.path) is Result.Ok(key) {
-			if keyKnown(sources, key) {
+			if hive.map.has(known, key) {
 				hive.map.set(rw.aliasKeys, line.alias, key)
 				continue
 			}
 		}
 		append(rw.errors, diag.at(line.line, "could not resolve `import {line.path}`"))
 	}
-}
-
-func keyKnown(sources: Source[], key: Str): Bool {
-	for each s in sources {
-		if s.key == key {
-			return true
-		}
-	}
-	return false
 }
 
 // `hive.map` -> `map`, which is both the module's name and the alias an import
