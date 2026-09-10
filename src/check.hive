@@ -808,6 +808,7 @@ proc checkMember(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str): v
 			return
 		}
 		if types.findType(env.table, head) is Result.Ok(_) {
+			checkVariantValue(c, env, head, field)
 			return
 		}
 	}
@@ -824,6 +825,19 @@ proc checkMember(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str): v
 		if hasField(env.table, name, field) == false {
 			report(c, "`" + name + "` has no field `{field}`")
 		}
+	}
+}
+
+// A variant named where a value is wanted. Building one is a call — the same
+// call a variant carrying fields is built by — so the name on its own is the
+// variant rather than a value of it, and Go has nothing to make of it.
+proc checkVariantValue(c: mut Check, env: infer.Env, head: Str, field: Str): void {
+	if types.findVariant(env.table, head, field) is Result.Ok(fields) {
+		if len(fields) == 0 {
+			report(c, "`{head}.{field}` is a variant of `{head}`, and a variant is a value only once it is built: write `{head}.{field}()`. One that carries nothing is still built by calling it")
+			return
+		}
+		report(c, "`{head}.{field}` is a variant of `{head}`, and a variant is a value only once it is built: `{head}.{field}(...)` builds one. Nor is a constructor a bare reference — `{head}.{field}(_)` is the spelling that is a function value")
 	}
 }
 
@@ -1078,11 +1092,13 @@ proc checkArguments(c: mut Check, env: infer.Env, name: Str, info: types.Callabl
 		report(c, "`{name}` takes " + countOf(len(info.params)) + ", and this call passes " + countOf(len(args)))
 		return
 	}
-	mut i := 0
+	mut open := 0
 	for each p in info.params {
-		found := argFor(args, p.name, i)
+		found := ast.argFor(args, p.name, open)
+		if ast.claimedByName(args, p.name) == false {
+			open = open + 1
+		}
 		if found is ast.Expr.Hole {
-			i = i + 1
 			continue
 		}
 		// A `mut T` parameter takes the caller's own storage, so the argument has
@@ -1094,7 +1110,6 @@ proc checkArguments(c: mut Check, env: infer.Env, name: Str, info: types.Callabl
 			}
 		}
 		fits(c, types.resolve(env.table, p.declared), infer.typeOf(env, found), "the argument `{p.name}` of `{name}`")
-		i = i + 1
 	}
 }
 
@@ -1115,15 +1130,16 @@ proc checkFieldArguments(c: mut Check, env: infer.Env, name: Str, fields: ast.Fi
 		report(c, "`{name}` has " + fieldCount(len(fields)) + ", and this call passes " + countOf(len(args)))
 		return
 	}
-	mut i := 0
+	mut open := 0
 	for each f in fields {
-		found := argFor(args, f.name, i)
+		found := ast.argFor(args, f.name, open)
+		if ast.claimedByName(args, f.name) == false {
+			open = open + 1
+		}
 		if found is ast.Expr.Hole {
-			i = i + 1
 			continue
 		}
 		fits(c, types.resolve(env.table, f.declared), infer.typeOf(env, found), "the field `{f.name}` of `{name}`")
-		i = i + 1
 	}
 }
 
@@ -1169,28 +1185,6 @@ func namesOfFields(fields: ast.Field[]): Str[dyn] {
 		append(out, f.name)
 	}
 	return out
-}
-
-func argFor(args: ast.Arg[], name: Str, index: Int): ast.Expr {
-	// A positional argument carries no name, so an empty one is not a name to
-	// look up but the question "which position", which only the loop answers.
-	if name != "" {
-		for each a in args {
-			if a.name == name {
-				return a.value
-			}
-		}
-	}
-	mut seen := 0
-	for each a in args {
-		if a.name == "" {
-			if seen == index {
-				return a.value
-			}
-			seen = seen + 1
-		}
-	}
-	return ast.Expr.Absent()
 }
 
 // Which argument, counted the way a person counts them.
@@ -1362,7 +1356,7 @@ proc arity(c: mut Check, name: Str, args: ast.Arg[], wanted: Int): Bool {
 // One argument's type, or `TUnknown` where a hole stands instead — a partial
 // application says nothing about what will fill it.
 proc typeOfArg(c: mut Check, env: infer.Env, args: ast.Arg[], index: Int): types.Ty {
-	given := argFor(args, "", index)
+	given := ast.argFor(args, "", index)
 	if given is ast.Expr.Hole {
 		return types.Ty.TUnknown()
 	}
@@ -1393,7 +1387,7 @@ proc checkWalk(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): void {
 		report(c, "`{name}` takes the vector to walk and the `func` to walk it with, and this call passes " + countOf(len(args)))
 		return
 	}
-	ty := infer.typeOf(env, argFor(args, "", 1))
+	ty := infer.typeOf(env, ast.argFor(args, "", 1))
 	if ty is types.Ty.TUnknown {
 		return
 	}
@@ -1408,7 +1402,7 @@ proc checkWalk(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): void {
 			report(c, "`{name}` hands its function one element at a time, and this one takes " + countOf(len(params)))
 			return
 		}
-		element := types.elementOf(infer.typeOf(env, argFor(args, "", 0)))
+		element := types.elementOf(infer.typeOf(env, ast.argFor(args, "", 0)))
 		fits(c, typeAt(params, 0), element, "the element `{name}` hands its function")
 		checkWalkResult(c, name, result)
 		return
@@ -1453,7 +1447,7 @@ proc checkGrows(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[], wanted
 		report(c, "`{name}` takes " + countOf(wanted) + ", and this call passes " + countOf(len(args)))
 		return
 	}
-	target := argFor(args, "", 0)
+	target := ast.argFor(args, "", 0)
 	root := rootName(target)
 	if root == "" || isMutable(c.mutable, root) == false {
 		report(c, "`{name}` grows a vector in place, so its target has to be `mut` — this one is not")
@@ -1488,7 +1482,7 @@ proc checkStatementExpr(c: mut Check, env: infer.Env, value: ast.Expr): void {
 			}
 		}
 		if name == "sort" && infer.isBound(env, name) == false && len(args) >= 1 {
-			target := argFor(args, "", 0)
+			target := ast.argFor(args, "", 0)
 			root := rootName(target)
 			if root == "" {
 				report(c, "a `sort` written as a statement throws away the vector it answers with, so it only means something when it can sort in place — and there is nothing here to sort in place. Keep the answer instead")

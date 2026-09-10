@@ -1215,8 +1215,8 @@ proc parseForEach(ts: token.Token[], p: mut Parse): ast.Stmt {
 // --- Expressions -------------------------------------------------------------
 //
 // Precedence climbing, loosest to tightest: `||`, `&&`, `is`/`bounds`,
-// comparison, `+`/`-`, `*`/`/`/`%`, unary `-`, `**`, a `with` clause, postfix,
-// primary.
+// comparison, `+`/`-`, `*`/`/`/`%`, `|`, unary `-`, `**`, a `with` clause,
+// postfix, primary.
 
 proc parseExpr(ts: token.Token[], p: mut Parse): ast.Expr {
 	return parseOr(ts, p)
@@ -1307,23 +1307,57 @@ proc parseAdditive(ts: token.Token[], p: mut Parse): ast.Expr {
 }
 
 proc parseMultiplicative(ts: token.Token[], p: mut Parse): ast.Expr {
-	mut ast.Expr left = parseUnary(ts, p)
+	mut ast.Expr left = parsePipe(ts, p)
 	for ; p.failed == false; {
 		k := kindAt(ts, p.pos)
 		if k == token.Kind.Star() {
 			advance(p)
-			left = ast.Expr.Binary(ast.BinOp.Mul(), left, parseUnary(ts, p))
+			left = ast.Expr.Binary(ast.BinOp.Mul(), left, parsePipe(ts, p))
 		} else if k == token.Kind.Slash() {
 			advance(p)
-			left = ast.Expr.Binary(ast.BinOp.Div(), left, parseUnary(ts, p))
+			left = ast.Expr.Binary(ast.BinOp.Div(), left, parsePipe(ts, p))
 		} else if k == token.Kind.Percent() {
 			advance(p)
-			left = ast.Expr.Binary(ast.BinOp.Mod(), left, parseUnary(ts, p))
+			left = ast.Expr.Binary(ast.BinOp.Mod(), left, parsePipe(ts, p))
 		} else {
 			return left
 		}
 	}
 	return left
+}
+
+// `x | f(a)` is `f(x, a)` and `x | f` is `f(x)`, left-associative. Tighter than
+// every binary operator and looser than the prefix ones, so a pipeline may sit
+// on either side of one — `nums | len > 2` — and `1 + 2 | f` is `1 + f(2)`.
+proc parsePipe(ts: token.Token[], p: mut Parse): ast.Expr {
+	mut ast.Expr left = parseUnary(ts, p)
+	for ; p.failed == false && kindAt(ts, p.pos) == token.Kind.Pipe(); {
+		advance(p)
+		at := p.pos
+		left = pipedInto(ts, p, left, parseUnary(ts, p), at)
+	}
+	return left
+}
+
+// Desugared here rather than carried, so nothing after the parser has a pipe to
+// know about: what comes out is the call somebody could have written by hand.
+proc pipedInto(ts: token.Token[], p: mut Parse, value: ast.Expr, stage: ast.Expr, at: Int): ast.Expr {
+	if stage is ast.Expr.Call(callee, args) {
+		return ast.Expr.Call(callee, [ast.Arg("", value)] + args)
+	}
+	// A bounded stage — `body | send() with timeout 500` — takes the value into
+	// the call the clause wraps.
+	if stage is ast.Expr.Timed(call, ms) {
+		return ast.Expr.Timed(pipedInto(ts, p, value, call, at), ms)
+	}
+	// A name, a module member or a constructor: the call with nothing else in it.
+	if stage is ast.Expr.Ident(_) || stage is ast.Expr.Member(_, _) {
+		return ast.Expr.Call(stage, [ast.Arg("", value)])
+	}
+	if p.failed == false {
+		failAt(ts, p, at, "`|` pipes the value on its left in as the first argument of a call, so what stands on the right has to be one: a callable's name (`x | f`), a call with the rest of its arguments written out (`x | f(a)`), or a constructor (`x | Shout.Loud`). Anything computed goes in parentheses on the left instead — `(a + b) | f`")
+	}
+	return stage
 }
 
 // The two prefix operators. Both bind tighter than every comparison and looser

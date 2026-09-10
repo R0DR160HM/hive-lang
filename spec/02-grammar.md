@@ -156,11 +156,12 @@ Loosest to tightest:
 | 4 | `>` `<` `>=` `<=` `==` `!=` | non-associative |
 | 5 | `+` `-` | left |
 | 6 | `*` `/` `%` | left |
-| 7 | unary `-`, `!` | prefix |
-| 8 | `**` | right |
-| 9 | `with` clause | postfix |
-| 10 | call, index, slice, member | postfix, left |
-| 11 | primary | — |
+| 7 | `\|` | left |
+| 8 | unary `-`, `!` | prefix |
+| 9 | `**` | right |
+| 10 | `with` clause | postfix |
+| 11 | call, index, slice, member | postfix, left |
+| 12 | primary | — |
 
 Unary `-` binds **tighter** than `* / %` and **looser** than `**`, so `-2 ** 2`
 is `-(2 ** 2)` and `2 ** -3` reads the sign as part of the exponent.
@@ -172,6 +173,12 @@ negating a comparison, a `bounds` or anything else at a looser level is written
 with parentheses — `!(a == b)`, `!(v bounds i)`. A **match** may not be negated
 at all; [05](05-expressions.md#no-negated-match) says why.
 
+`|` binds tighter than every binary operator and looser than the prefix ones,
+which is what lets a pipeline stand on either side of one without parentheses —
+`v | len > 2` compares the length, `-x | f` pipes the negated value. It takes
+the value written **beside** it, so `1 + 2 | f` is `1 + f(2)` and a computed
+value is parenthesised: `(1 + 2) | f`.
+
 ```
 expression  = or-expr ;
 or-expr     = and-expr { "||" and-expr } ;
@@ -182,7 +189,8 @@ is-expr     = cmp-expr [ "is" pattern ]
 
 cmp-expr    = add-expr [ ( ">" | "<" | ">=" | "<=" | "==" | "!=" ) add-expr ] ;
 add-expr    = mul-expr { ( "+" | "-" ) mul-expr } ;
-mul-expr    = unary-expr { ( "*" | "/" | "%" ) unary-expr } ;
+mul-expr    = pipe-expr { ( "*" | "/" | "%" ) pipe-expr } ;
+pipe-expr   = unary-expr { "|" unary-expr } ;
 unary-expr  = "-" unary-expr | "!" unary-expr | pow-expr ;
 pow-expr    = with-expr [ "**" unary-expr ] ;
 
@@ -211,6 +219,10 @@ await-all   = "await" "[" call { "," call } "]" ;
 `v bounds i` is **sugar** for `i >= 0 && i < hive.len(v)`. The `len` is written
 qualified so the guard means the same thing in a program that declared a `len`
 of its own ([13](13-builtins.md#a-declaration-of-your-own-wins)).
+
+`x | f(a)` is **sugar** for `f(x, a)` ([05](05-expressions.md#piping-a-value-in)).
+The right side of a `|` has to be a call, a callable's name or a constructor —
+`x | f` is `f(x)` — and everything after the parser sees the call it stands for.
 
 `_` is a **hole**, legal only as a call argument, where it makes the call a
 partial application ([05](05-expressions.md#54-function-values)), and as a

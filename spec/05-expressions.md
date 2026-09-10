@@ -43,6 +43,28 @@ filling whichever parameters the named ones did not claim. Names must exist,
 must not repeat, and **once named arguments are used the call must cover the
 full parameter list**.
 
+### Piping a value in
+
+`x | f(a)` is **sugar** for `f(x, a)`: the value on the left becomes the call's
+first argument. `|` is left-associative, so a chain of them reads in the order
+it runs:
+
+```hive
+echo nums | filter(isEven) | map(label) | join(" ")
+```
+
+The right side has to be something that can be called — a call, a callable's
+name, or a constructor — and a stage with nothing else in it needs no
+parentheses: `x | f` is `f(x)`, as `x | f()` is. A `proc`, a builtin and a
+constructor all pipe, and a `_` in a stage still makes that call a partial
+application, since what a pipe leaves behind is the call somebody could have
+written by hand.
+
+`|` binds tighter than every binary operator and looser than the prefix ones,
+which lets a pipeline sit on either side of one — `v | len > 2` compares the
+length. It takes the value written **beside** it, so `1 + 2 | f` is `1 + f(2)`
+and a computed value goes in parentheses: `(1 + 2) | f`.
+
 ## 5.4 Function values
 
 A callable is a value you can pass, store and call later. Two spellings produce
@@ -69,6 +91,10 @@ A **constructor** may be partially applied too, and it means the same thing:
 callable — there is no body to run and no declared return type to read — but each
 `_` still becomes a parameter in hole order, and what comes back is typed as the
 union, since that is what a variant is once built.
+
+A constructor has **no bare reference**: a variant is a value once it is built,
+so `Msg.Changed` on its own is a compile error and the hole is what makes one a
+function value ([03](03-types.md#34-declared-types)).
 
 Three things cannot become values:
 
@@ -108,6 +134,7 @@ no subscript at all ([03](03-types.md#36-maps)).
 | `&&` `\|\|` | `Bool` | short-circuiting conjunction, disjunction |
 | `is` | see [07](07-patterns.md) | a `Bool`, binding as it matches |
 | `bounds` | a vector and an `Int` | sugar for `i >= 0 && i < hive.len(v)` |
+| `\|` | a value and a callable | sugar for the call with the value first |
 
 `%` is the remainder operator and has the same precedence as `*` and `/`.
 

@@ -364,6 +364,43 @@ test "calls, named arguments and holes" {
 	assert stmt("echo f()()") == "(echo (call (call f)))"
 }
 
+test "`|` pipes the value on its left in as the first argument" {
+	assert stmt("echo x | f") == "(echo (call f x))"
+	assert stmt("echo x | f()") == "(echo (call f x))"
+	assert stmt("echo x | f(a)") == "(echo (call f x a))"
+	assert stmt("echo x | f(b: 1)") == "(echo (call f x b:1))"
+	// Left-associative, so a chain reads in the order it was written.
+	assert stmt("echo x | f | g(a)") == "(echo (call g (call f x) a))"
+	// A module member, a constructor, and a hole that makes the piped call a
+	// partial application like any other.
+	assert stmt("echo x | hive.conv.sti") == "(echo (call (. (. hive conv) sti) x))"
+	assert stmt("echo x | Shout.Loud") == "(echo (call (. Shout Loud) x))"
+	assert stmt("echo _ | f(1)") == "(echo (call f _ 1))"
+}
+
+test "`|` binds tighter than every binary operator and looser than the prefix ones" {
+	// So a pipeline stands on either side of one without parentheses.
+	assert stmt("echo v | len > 2") == "(echo (> (call len v) 2))"
+	assert stmt("echo x | label + \"!\"") == "(echo (+ (call label x) \"!\"))"
+	assert stmt("echo -x | f") == "(echo (call f (- x)))"
+	// And the pipe takes the value written beside it: a computed one is
+	// parenthesised.
+	assert stmt("echo 1 + 2 | f") == "(echo (+ 1 (call f 2)))"
+	assert stmt("echo (1 + 2) | f") == "(echo (call f (+ 1 2)))"
+}
+
+test "a piped stage may be bounded, and the value lands in the call the clause wraps" {
+	assert stmt("r := body | send() with timeout 500") == "(let r (timed (call send body) 500))"
+}
+
+test "the right side of `|` has to be something that can be called" {
+	assert text.contains(problem("proc main(): void \{ echo 1 | 3 }"), "has to be one")
+	assert text.contains(problem("proc main(): void \{ echo 1 | (2 + 3) }"), "has to be one")
+	assert text.contains(problem("proc main(): void \{ echo 1 | f ** 2 }"), "has to be one")
+	// One error, not one per stage after the mistake.
+	assert problemCount("proc main(): void \{ echo 1 | 3 | f }") == 1
+}
+
 test "member access, indexing and slicing" {
 	assert stmt("echo a.b.c") == "(echo (. (. a b) c))"
 	assert stmt("echo v[0]") == "(echo (at v 0))"
