@@ -956,11 +956,36 @@ func chainBinds(branches: ast.Branch[]): Bool {
 	return false
 }
 
+// The subject of a match, written. A variant built right here is Go-typed as
+// the variant's own struct, and a type assertion needs the union's interface —
+// so the value is converted to it, which also keeps a composite literal out of
+// the head of an `if`, where Go will not read one.
+proc matchSubject(em: mut Emit, env: infer.Env, subject: ast.Expr): Str {
+	written := expr(em, env, subject, types.Ty.TUnknown())
+	if buildsVariant(env.table, subject) {
+		return goType(infer.typeOf(env, subject)) + "(" + written + ")"
+	}
+	return written
+}
+
+// Whether this expression builds a variant of a declared union on the spot.
+// `Result` is not one of them: its test is a method rather than an assertion.
+func buildsVariant(t: types.Table, e: ast.Expr): Bool {
+	if e is ast.Expr.Call(callee, _) {
+		if callee is ast.Expr.Member(subject, field) {
+			if subject is ast.Expr.Ident(head) {
+				return types.findVariant(t, head, field) is Result.Ok(_)
+			}
+		}
+	}
+	return false
+}
+
 // Open an `if` that tests `pattern` against `subject` and binds what it
 // matched. The caller closes it.
 proc emitPatternGuard(em: mut Emit, env: infer.Env, subject: ast.Expr, pattern: ast.Pattern): infer.Env {
 	subjectType := infer.typeOf(env, subject)
-	mut written := expr(em, env, subject, types.Ty.TUnknown())
+	mut written := matchSubject(em, env, subject)
 	holder := fresh(em, "t")
 
 	if pattern is ast.Pattern.Constructor(path, bindings, _) {
@@ -1492,7 +1517,7 @@ proc onThread(em: mut Emit, env: infer.Env, c: ast.Expr, ty: types.Ty): Str {
 // An `is` outside an `if` condition has nowhere to put what it binds, so it
 // lowers to the test alone.
 proc standaloneMatch(em: mut Emit, env: infer.Env, subject: ast.Expr, pattern: ast.Pattern): Str {
-	mut written := expr(em, env, subject, types.Ty.TUnknown())
+	mut written := matchSubject(em, env, subject)
 	if pattern is ast.Pattern.Constructor(path, _, _) {
 		head := segment(path, 0)
 		variant := segment(path, 1)
@@ -1869,25 +1894,30 @@ proc variantLiteral(em: mut Emit, env: infer.Env, typeName: Str, variant: Str, f
 // order, filling whichever parameters the named ones did not claim.
 proc fieldArgs(em: mut Emit, env: infer.Env, fields: ast.Field[], args: ast.Arg[]): Str {
 	mut Str[dyn] out = []
-	mut i := 0
+	mut open := 0
 	for each f in fields {
-		mut found := argFor(args, f.name, i)
+		mut found := ast.argFor(args, f.name, open)
+		if ast.claimedByName(args, f.name) == false {
+			open = open + 1
+		}
 		ty := types.resolve(env.table, f.declared)
 		if found is ast.Expr.Absent {
 			append(out, goField(f.name) + ": " + goZero(ty))
 		} else {
 			append(out, goField(f.name) + ": " + expr(em, env, found, ty))
 		}
-		i = i + 1
 	}
 	return join(out, ", ")
 }
 
 proc orderedArgs(em: mut Emit, env: infer.Env, info: types.CallableInfo, args: ast.Arg[]): Str {
 	mut Str[dyn] out = []
-	mut i := 0
+	mut open := 0
 	for each p in info.params {
-		mut found := argFor(args, p.name, i)
+		mut found := ast.argFor(args, p.name, open)
+		if ast.claimedByName(args, p.name) == false {
+			open = open + 1
+		}
 		ty := types.resolve(env.table, p.declared)
 		mut written := expr(em, env, found, ty)
 		if p.mutex {
@@ -1899,7 +1929,6 @@ proc orderedArgs(em: mut Emit, env: infer.Env, info: types.CallableInfo, args: a
 			written = cloned(env.table, ty, written)
 		}
 		append(out, written)
-		i = i + 1
 	}
 	return join(out, ", ")
 }
@@ -1923,26 +1952,6 @@ proc addressOf(em: mut Emit, found: ast.Expr, written: Str): Str {
 		}
 	}
 	return "&" + written
-}
-
-// The argument filling `name`, which is the one written with that name if there
-// is one, and otherwise the `index`-th of the unnamed ones.
-func argFor(args: ast.Arg[], name: Str, index: Int): ast.Expr {
-	for each a in args {
-		if a.name == name {
-			return a.value
-		}
-	}
-	mut seen := 0
-	for each a in args {
-		if a.name == "" {
-			if seen == index {
-				return a.value
-			}
-			seen = seen + 1
-		}
-	}
-	return ast.Expr.Absent()
 }
 
 proc plainArgs(em: mut Emit, env: infer.Env, args: ast.Arg[]): Str {
@@ -2483,12 +2492,14 @@ func handlerParams(t: types.Table, handler: ast.Expr): ast.Param[dyn] {
 		if callee is ast.Expr.Ident(name) {
 			if types.findCallable(t, name) is Result.Ok(info) {
 				mut ast.Param[dyn] out = []
-				mut i := 0
+				mut open := 0
 				for each p in info.params {
-					if argFor(args, p.name, i) is ast.Expr.Hole {
+					if ast.argFor(args, p.name, open) is ast.Expr.Hole {
 						append(out, p)
 					}
-					i = i + 1
+					if ast.claimedByName(args, p.name) == false {
+						open = open + 1
+					}
 				}
 				return out
 			}

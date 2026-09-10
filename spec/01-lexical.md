@@ -84,11 +84,12 @@ identifiers everywhere else: `as` (after an import path) and `timeout` (in
 | --- | --- |
 | two-character | `:=` `>=` `<=` `==` `!=` `**` `&&` `\|\|` `++` `--` `+=` `-=` `*=` `/=` |
 | three-character | `...` (the vector-pattern rest marker) |
-| one-character | `{` `}` `(` `)` `[` `]` `:` `;` `,` `.` `>` `<` `=` `+` `-` `*` `/` `%` `!` |
+| one-character | `{` `}` `(` `)` `[` `]` `:` `;` `,` `.` `>` `<` `=` `+` `-` `*` `/` `%` `\|` `!` |
 
 `...` must be matched before `.`, and each two-character operator before its
 prefix. `!=` is therefore looked for before `!`, and a `!` reaching the
-one-character row is one standing on its own: the negation.
+one-character row is one standing on its own: the negation. `||` is looked for
+before `|` the same way, and a `|` reaching that row is the pipe.
 
 ### Literals
 

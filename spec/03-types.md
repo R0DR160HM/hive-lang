@@ -172,6 +172,11 @@ A value is built by calling the type (a struct) or the variant (a union):
 `User(1, "ada")`, `Shape.Circle(5)`, `Shape.Point()`. Constructors accept
 [named arguments](05-expressions.md#named-arguments).
 
+The **call** is what builds one, including for a variant that carries nothing,
+so `Shape.Point` on its own is a compile error: it names the variant rather than
+a value of it. `Shape.Circle(_)` is the spelling that is a function value
+([05](05-expressions.md#54-function-values)).
+
 A union value is narrowed with `is` ([07](07-patterns.md)). There is no other
 way to reach a variant's fields: a value typed as the union has only the fields
 every variant shares.
