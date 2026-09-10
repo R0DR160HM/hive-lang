@@ -11,6 +11,7 @@ import ./analyzereport
 import ./ast
 import ./check as checks
 import ./diag
+import ./icon
 import ./emit
 import ./loader
 import ./mono
@@ -33,6 +34,8 @@ type Written {
 	// standard library — an imported Go file's own imports. `hive.sql` is the
 	// other case, and says so by putting `hive/sql.go` in the build directory.
 	thirdParty: Bool
+	// Whether the program opens a window, which decides how it is linked.
+	windowed: Bool
 	errors: diag.Diagnostic[dyn]
 }
 
@@ -57,6 +60,16 @@ proc executableOf(entry: Str, target: Str): Str {
 // still wants its `.exe`.
 proc goExe(target: Str): Str {
 	if hive.term.execWith("go", ["env", "GOEXE"], "", crossing(target)) is Result.Ok(said) {
+		return text.trim(said)
+	}
+	return ""
+}
+
+// Which architecture a build is for, asked for the *target*: the resource object
+// carrying a window's icon is machine specific, and an empty target is this
+// machine, which only `go env` knows.
+proc goArch(target: Str): Str {
+	if hive.term.execWith("go", ["env", "GOARCH"], "", crossing(target)) is Result.Ok(said) {
 		return text.trim(said)
 	}
 	return ""
@@ -138,18 +151,18 @@ proc checked(entry: Str, from: Int): Compiled {
 	if len(inRange) > 0 {
 		return refused(diag.allInFile(entry, inRange))
 	}
-	return Compiled(expanded.module, emit.Emitted("", [], [], [], [], []), [])
+	return Compiled(expanded.module, emit.Emitted("", [], [], [], [], false, []), [])
 }
 
 func refused(errors: diag.Diagnostic[dyn]): Compiled {
-	return Compiled(ast.Module([], [], []), emit.Emitted("", [], [], [], [], []), errors)
+	return Compiled(ast.Module([], [], []), emit.Emitted("", [], [], [], [], false, []), errors)
 }
 
 // Compile `entry` and write the Go project for it.
 proc build(entry: Str, withTests: Bool, from: Int): Written {
 	made := passes(entry, from)
 	if len(made.errors) > 0 {
-		return Written("", [], false, made.errors)
+		return Written("", [], false, false, made.errors)
 	}
 	emitted := made.emitted
 
@@ -176,6 +189,12 @@ proc build(entry: Str, withTests: Bool, from: Int): Written {
 		if module == "uiscene" {
 			drawsAScene = true
 		}
+	}
+	// A windowed program's own icon, embedded so the window can link it. Written
+	// whatever the platform: what an executable carries on Windows is a second
+	// place for the same file, not the only one.
+	if emitted.window {
+		placeIcon(entry, directory + "/hive", written, errors)
 	}
 	// The one thing a build ever downloads: the three.js a scene is drawn with,
 	// fetched once against a pinned digest and embedded into the executable. A
@@ -210,7 +229,7 @@ proc build(entry: Str, withTests: Bool, from: Int): Written {
 			put(directory, "declarations.tsv", join(emitted.spans, "\n") + "\n", written, errors)
 		}
 	}
-	return Written(directory, written, linksForeign(made.module.foreign), errors)
+	return Written(directory, written, linksForeign(made.module.foreign), emitted.window, errors)
 }
 
 // Whether any imported Go file imports something the toolchain has to fetch.
@@ -280,6 +299,57 @@ proc placeAssets(entry: Str, into: Str, from: Int, written: mut Str[dyn], errors
 	put(into, "assets.go", runtime.assetsSource() + "\n", written, errors)
 }
 
+// The program's own icon, copied in beside the runtime with the Go that embeds
+// it. A program that ships none keeps the mark the window shell carries.
+proc placeIcon(entry: Str, into: Str, written: mut Str[dyn], errors: mut diag.Diagnostic[dyn]): void {
+	source := icon.iconOf(entry)
+	if source == "" {
+		return
+	}
+	if hive.file.makeDir(into) is Result.Error(why) {
+		append(errors, diag.about(into, "cannot make `{into}`: {why.message}"))
+		return
+	}
+	target := paths.joinPath(into, icon.embeddedName())
+	if hive.file.copy(source, target) is Result.Error(why) {
+		append(errors, diag.about(source, "cannot copy `{source}` into the build: {why.message}"))
+		return
+	}
+	append(written, target)
+	put(into, "windowicon.go", icon.embedSource() + "\n", written, errors)
+}
+
+// The same icon as a Windows resource object, so the executable itself carries
+// it. The generator is written into the build, run once for the target's
+// architecture and removed: what it writes is linked, what wrote it is not.
+//
+// Run for this machine rather than the target — a cross build's generator would
+// be a program this one cannot run — and its answer named for the target, which
+// is what keeps it out of every other platform's build.
+proc placeResource(entry: Str, written: Written, target: Str, from: Int): Result<Bool, diag.Diagnostic> {
+	if icon.iconOf(entry) == "" {
+		return Result.Ok(false)
+	}
+	arch := goArch(target)
+	if icon.carriesResource(arch) == false {
+		return Result.Ok(false)
+	}
+	progress.step(from, "icon")
+	mut Str[dyn] wrote = []
+	mut diag.Diagnostic[dyn] failed = []
+	generator := paths.joinPath(written.directory, "icon")
+	put(generator, "main.go", icon.generatorSource() + "\n", wrote, failed)
+	for each why in failed {
+		return Result.Error(why)
+	}
+	made := toolchain(["run", "./icon", "hive/" + icon.embeddedName(), icon.sysoName(arch), arch], written.directory, "")
+	removeTree(generator)
+	if made.code != 0 {
+		return Result.Error(diag.about(entry, "the icon in `assets/icon.png` could not be written into the executable. It said:\n\n" + indented(made.output)))
+	}
+	return Result.Ok(true)
+}
+
 // One directory copied into another, everything under it with it. The answer is how
 // many files landed; nought means there was nothing to embed, which is not the same
 // as nothing being there — `//go:embed` will not take an empty directory.
@@ -332,8 +402,22 @@ type Toolchain {
 // ever the mangled names this compiler wrote. Tracebacks are read off the line
 // tables and survive. `-trimpath` drops the building machine's paths, so the
 // same source built anywhere comes out byte for byte the same.
-func compact(): Str[3] {
+// `-H=windowsgui` is what makes a windowed program one visible thing: without it
+// Windows gives every executable a console, so the window arrives beside a
+// terminal nobody asked for. Only for a Windows target, and only for a program
+// that opens a window — a served page prints, and a print with no console goes
+// nowhere.
+func compact(gui: Bool): Str[dyn] {
+	if gui {
+		return ["-trimpath", "-ldflags", "-s -w -H=windowsgui"]
+	}
 	return ["-trimpath", "-ldflags", "-s -w"]
+}
+
+// Whether `target` is a Windows one, asked of the toolchain rather than parsed:
+// the empty target is this machine, and only `go env` knows what that is.
+proc windowsTarget(target: Str): Bool {
+	return goExe(target) == ".exe"
 }
 
 // Compile `entry` all the way to a native executable beside it. An empty `target`
@@ -347,12 +431,20 @@ proc compile(entry: Str, target: Str, from: Int): Written {
 	// Built straight to where it belongs: a copy would have to put the
 	// executable bit back, and the toolchain already knows how.
 	if resolveDeps(written, from) is Result.Error(why) {
-		return Written(written.directory, written.files, written.thirdParty, [why])
+		return Written(written.directory, written.files, written.thirdParty, written.windowed, [why])
+	}
+	// Asked once: it is a question with a `go env` behind it, and both answers
+	// below are the same one.
+	windows := windowsTarget(target)
+	if written.windowed && windows {
+		if placeResource(entry, written, target, from) is Result.Error(why) {
+			return Written(written.directory, written.files, written.thirdParty, written.windowed, [why])
+		}
 	}
 	progress.step(from, "go build" + saying(target))
-	made := toolchain(["build"] + compact() + ["-o", paths.joinPath("..", executableOf(entry, target)), "."], written.directory, target)
+	made := toolchain(["build"] + compact(written.windowed && windows) + ["-o", paths.joinPath("..", executableOf(entry, target)), "."], written.directory, target)
 	if made.code != 0 {
-		return Written(written.directory, written.files, written.thirdParty, [goFailed(entry, made)])
+		return Written(written.directory, written.files, written.thirdParty, written.windowed, [goFailed(entry, made)])
 	}
 	return written
 }
@@ -401,7 +493,7 @@ proc run(entry: Str, args: Str[], from: Int): Result<Int, diag.Diagnostic[dyn]> 
 		return Result.Error([why])
 	}
 	progress.step(from, "go build")
-	made := toolchain(["build"] + compact() + ["-o", "app" + goExe(""), "."], written.directory, "")
+	made := toolchain(["build"] + compact(false) + ["-o", "app" + goExe(""), "."], written.directory, "")
 	if made.code != 0 {
 		return Result.Error([goFailed(entry, made)])
 	}

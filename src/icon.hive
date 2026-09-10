@@ -1,0 +1,288 @@
+// The program's own icon
+// ======================
+// A windowed program may ship `assets/icon.png` beside its entrypoint, and the
+// build puts it in two places: embedded in the executable for the window to
+// link, and — on Windows — in a resource object the linker takes, so the file
+// itself carries it in Explorer and on a pinned shortcut.
+//
+// A resource object is the only way into a PE, and writing one is byte work, so
+// the Go below is written into the build, run once, and deleted. That keeps the
+// bytes where bytes are natural and leaves nothing behind in the module.
+import ./paths
+import hive.file
+
+// The icon a program ships, or `""` where it ships none. One name and one
+// format: what a window links and what an executable carries have to be the
+// same file, and a PNG is the one both take.
+proc iconOf(entry: Str): Str {
+	path := paths.joinPath(paths.joinPath(paths.dirOf(entry), "assets"), "icon.png")
+	if hive.file.exists(path) {
+		return path
+	}
+	return ""
+}
+
+// What the copy inside the build is called, in the runtime's own package so the
+// embed beside it can name it.
+func embeddedName(): Str {
+	return "windowicon.png"
+}
+
+// The Go that embeds it. `//go:embed` names a file in its own package, which is
+// why the icon is copied in rather than read from where it was written.
+func embedSource(): Str {
+	return `
+		package hive
+
+		import "embed"
+
+		//go:embed windowicon.png
+		var uiWindowIconFile embed.FS
+
+		func init() {
+			if body, err := uiWindowIconFile.ReadFile("windowicon.png"); err == nil {
+				uiWindowIconIs(body)
+			}
+		}
+	`
+}
+
+// Which resource object a target wants. The name carries the platform, so a
+// build for anywhere else ignores the file rather than linking a Windows
+// resource into an ELF.
+func sysoName(arch: Str): Str {
+	return "rsrc_windows_" + arch + ".syso"
+}
+
+// Whether a resource object is written for this architecture. One is machine
+// specific — the object says what it is for, and the relocation naming an
+// address is spelled per machine — so an architecture the generator does not
+// know keeps its window icon and gives the file none.
+func carriesResource(arch: Str): Bool {
+	return arch == "amd64" || arch == "386" || arch == "arm64"
+}
+
+// The generator, as its own `package main` under the build. Given the image, the
+// object to write and the architecture to write it for.
+func generatorSource(): Str {
+	return `
+		// Writes the Windows resource object holding one icon: an RT_ICON with the
+		// image, and the RT_GROUP_ICON that names it. Run by the build and deleted
+		// after — see src/icon.hive.
+		package main
+
+		import (
+			"bytes"
+			"encoding/binary"
+			"fmt"
+			"os"
+		)
+
+		func main() {
+			if len(os.Args) != 4 {
+				fail("usage: icon <image.png> <out.syso> <arch>")
+			}
+			image, err := os.ReadFile(os.Args[1])
+			if err != nil {
+				fail(err.Error())
+			}
+			width, height, err := pngSize(image)
+			if err != nil {
+				fail(err.Error())
+			}
+			object, err := resourceObject(image, width, height, os.Args[3])
+			if err != nil {
+				fail(err.Error())
+			}
+			if err := os.WriteFile(os.Args[2], object, 0o644); err != nil {
+				fail(err.Error())
+			}
+		}
+
+		func fail(why string) {
+			fmt.Fprintln(os.Stderr, why)
+			os.Exit(1)
+		}
+
+		// The size, out of the IHDR every PNG opens with. Also what says the file is
+		// one: an icon that is not a PNG is worth refusing here, where it can be said
+		// plainly, rather than in an executable whose icon is a blank sheet.
+		func pngSize(b []byte) (int, int, error) {
+			if len(b) < 24 || string(b[:8]) != "\x89PNG\r\n\x1a\n" {
+				return 0, 0, fmt.Errorf("assets/icon.png is not a PNG")
+			}
+			width := int(binary.BigEndian.Uint32(b[16:20]))
+			height := int(binary.BigEndian.Uint32(b[20:24]))
+			if width < 1 || height < 1 || width > 256 || height > 256 {
+				return 0, 0, fmt.Errorf("an icon is at most 256x256, and assets/icon.png is %dx%d", width, height)
+			}
+			return width, height, nil
+		}
+
+		// A COFF object of one .rsrc section: the resource tree, the two blobs it
+		// points at, and a relocation for each pointer — the offsets in the tree are
+		// addresses in the image, which only the linker knows.
+		func resourceObject(image []byte, width int, height int, arch string) ([]byte, error) {
+			machine, relocation, err := machineOf(arch)
+			if err != nil {
+				return nil, err
+			}
+			section, fixups := resourceSection(image, width, height)
+
+			out := &bytes.Buffer{}
+			// Where the section's bytes and everything after them land.
+			const headers = 20 + 40
+			relocations := headers + len(section)
+			symbols := relocations + len(fixups)*10
+
+			// The COFF header: one section, one symbol, no optional header.
+			binary.Write(out, binary.LittleEndian, uint16(machine))
+			binary.Write(out, binary.LittleEndian, uint16(1))
+			binary.Write(out, binary.LittleEndian, uint32(0))
+			binary.Write(out, binary.LittleEndian, uint32(symbols))
+			binary.Write(out, binary.LittleEndian, uint32(1))
+			binary.Write(out, binary.LittleEndian, uint16(0))
+			binary.Write(out, binary.LittleEndian, uint16(0))
+
+			// The section header.
+			out.Write([]byte(".rsrc\x00\x00\x00"))
+			binary.Write(out, binary.LittleEndian, uint32(0))
+			binary.Write(out, binary.LittleEndian, uint32(0))
+			binary.Write(out, binary.LittleEndian, uint32(len(section)))
+			binary.Write(out, binary.LittleEndian, uint32(headers))
+			binary.Write(out, binary.LittleEndian, uint32(relocations))
+			binary.Write(out, binary.LittleEndian, uint32(0))
+			binary.Write(out, binary.LittleEndian, uint16(len(fixups)))
+			binary.Write(out, binary.LittleEndian, uint16(0))
+			// Initialised data, readable.
+			binary.Write(out, binary.LittleEndian, uint32(0x40000040))
+
+			out.Write(section)
+
+			// One relocation per pointer into the section, each against the section
+			// itself: the value already written there is the offset to add to it.
+			for _, at := range fixups {
+				binary.Write(out, binary.LittleEndian, uint32(at))
+				binary.Write(out, binary.LittleEndian, uint32(0))
+				binary.Write(out, binary.LittleEndian, uint16(relocation))
+			}
+
+			// The section symbol the relocations name.
+			out.Write([]byte(".rsrc\x00\x00\x00"))
+			binary.Write(out, binary.LittleEndian, uint32(0))
+			binary.Write(out, binary.LittleEndian, uint16(1))
+			binary.Write(out, binary.LittleEndian, uint16(0))
+			out.Write([]byte{3, 0})
+			// The string table, holding no strings: every name here fits in eight
+			// bytes, and the length is still written.
+			binary.Write(out, binary.LittleEndian, uint32(4))
+			return out.Bytes(), nil
+		}
+
+		func machineOf(arch string) (int, int, error) {
+			switch arch {
+			// IMAGE_REL_AMD64_ADDR32NB, IMAGE_REL_I386_DIR32NB, IMAGE_REL_ARM64_ADDR32NB:
+			// one image-relative 32-bit address, spelled differently per machine.
+			case "amd64":
+				return 0x8664, 3, nil
+			case "386":
+				return 0x014c, 7, nil
+			case "arm64":
+				return 0xaa64, 2, nil
+			}
+			return 0, 0, fmt.Errorf("no resource object is written for windows/%s", arch)
+		}
+
+		// The .rsrc section, and the offsets within it that hold an address. Three
+		// levels of directory — type, then name, then language — and a leaf entry for
+		// each of the two resources.
+		func resourceSection(image []byte, width int, height int) ([]byte, []int) {
+			group := groupIcon(image, width, height)
+
+			// Every directory is 16 bytes plus 8 per entry, so where each one lands is
+			// arithmetic rather than a second pass.
+			const typeDir = 0
+			const iconNames = typeDir + 16 + 2*8
+			const iconLangs = iconNames + 16 + 8
+			const groupNames = iconLangs + 16 + 8
+			const groupLangs = groupNames + 16 + 8
+			const iconEntry = groupLangs + 16 + 8
+			const groupEntry = iconEntry + 16
+			iconData := aligned(groupEntry + 16)
+			groupData := aligned(iconData + len(image))
+
+			out := &bytes.Buffer{}
+			// RT_ICON is 3 and RT_GROUP_ICON is 14. Windows reads the group first and
+			// finds the image by the id in it.
+			directory(out, []entry{{3, iconNames | 0x80000000}, {14, groupNames | 0x80000000}})
+			directory(out, []entry{{1, iconLangs | 0x80000000}})
+			directory(out, []entry{{1033, iconEntry}})
+			directory(out, []entry{{1, groupLangs | 0x80000000}})
+			directory(out, []entry{{1033, groupEntry}})
+			dataEntry(out, iconData, len(image))
+			dataEntry(out, groupData, len(group))
+			pad(out, iconData)
+			out.Write(image)
+			pad(out, groupData)
+			out.Write(group)
+			// The first field of each leaf entry is the address the linker fixes up.
+			return out.Bytes(), []int{iconEntry, groupEntry}
+		}
+
+		type entry struct {
+			id     int
+			offset int
+		}
+
+		func directory(out *bytes.Buffer, entries []entry) {
+			binary.Write(out, binary.LittleEndian, uint32(0))
+			binary.Write(out, binary.LittleEndian, uint32(0))
+			binary.Write(out, binary.LittleEndian, uint16(0))
+			binary.Write(out, binary.LittleEndian, uint16(0))
+			// Nothing here is named: a resource this writes is always numbered.
+			binary.Write(out, binary.LittleEndian, uint16(0))
+			binary.Write(out, binary.LittleEndian, uint16(len(entries)))
+			for _, e := range entries {
+				binary.Write(out, binary.LittleEndian, uint32(e.id))
+				binary.Write(out, binary.LittleEndian, uint32(e.offset))
+			}
+		}
+
+		func dataEntry(out *bytes.Buffer, offset int, size int) {
+			binary.Write(out, binary.LittleEndian, uint32(offset))
+			binary.Write(out, binary.LittleEndian, uint32(size))
+			binary.Write(out, binary.LittleEndian, uint32(0))
+			binary.Write(out, binary.LittleEndian, uint32(0))
+		}
+
+		// The directory Windows reads to find the image: one entry, naming the icon
+		// resource by the id it was written under.
+		func groupIcon(image []byte, width int, height int) []byte {
+			out := &bytes.Buffer{}
+			binary.Write(out, binary.LittleEndian, uint16(0))
+			binary.Write(out, binary.LittleEndian, uint16(1))
+			binary.Write(out, binary.LittleEndian, uint16(1))
+			// A 256-wide icon writes its width as nought: the field is one byte, and
+			// 256 is the size that does not fit in one.
+			out.Write([]byte{byte(width % 256), byte(height % 256), 0, 0})
+			binary.Write(out, binary.LittleEndian, uint16(1))
+			binary.Write(out, binary.LittleEndian, uint16(32))
+			binary.Write(out, binary.LittleEndian, uint32(len(image)))
+			binary.Write(out, binary.LittleEndian, uint16(1))
+			return out.Bytes()
+		}
+
+		func aligned(at int) int {
+			if at%8 == 0 {
+				return at
+			}
+			return at + 8 - at%8
+		}
+
+		func pad(out *bytes.Buffer, upto int) {
+			for out.Len() < upto {
+				out.WriteByte(0)
+			}
+		}
+	`
+}
