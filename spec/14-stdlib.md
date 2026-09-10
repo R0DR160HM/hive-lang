@@ -469,6 +469,24 @@ somewhere else:
 * `html(view)` renders the same tree as an HTML fragment, and `page(title, view)`
   as a whole document — which is what an `httpServe` handler answers with.
 
+**What a window is.** An application-mode browser window — no address bar and no
+tabs — running against a **profile of its own**, so it is its own process rather
+than a window inside somebody's browser: none of your own session, extensions or
+history is in it, and quitting a browser does not close it. Closing the window
+ends the program. A machine with no Chromium-family browser falls back to an
+ordinary tab, which is the one case where the window belongs to a browser.
+
+**Its icon is `assets/icon.png`**, beside the entrypoint: a PNG of at most
+256×256, embedded into the executable by the build. A program that ships none
+shows Hive's own mark rather than a browser's blank sheet. Nothing in the source
+names it — what a window shows and what the file carries have to be one image,
+so there is one place to put it.
+
+On Windows a **built** windowed program carries no console and carries its icon
+as a resource, so what opens is the window, and the file itself shows the icon in
+a file manager and on a pinned shortcut
+([15.6](15-lowering.md#156-building-for-another-platform)).
+
 **The window is a service.** `update` is the same fold a `hive.syslink.spawn`
 handler is, and is checked as one, so a window has an address, needs no mutex,
 and can be posted to by a background task or by another machine. That is why the

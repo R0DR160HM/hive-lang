@@ -6178,11 +6178,13 @@ func uiSource(): Str {
 
 		import (
 			"fmt"
+			"hash/fnv"
 			"math"
 			"net"
 			"net/http"
 			"os"
 			"os/exec"
+			"path/filepath"
 			"runtime"
 			"strconv"
 			"strings"
@@ -7206,7 +7208,9 @@ func uiSource(): Str {
 		const uiShell = ~BT~<!doctype html>
 		<html><head><meta charset="utf-8">
 		<meta name="viewport" content="width=device-width,initial-scale=1">
-		<title>__TITLE__</title><style>__CSS__</style></head>
+		<title>__TITLE__</title>
+		<link rel="icon" href="__ICON__">
+		<style>__CSS__</style></head>
 		<body><div class="h-root" id="root"></div>
 		<script>
 		var sock = new WebSocket("ws://" + location.host + "/_hive/socket?token=__TOKEN__");
@@ -7957,6 +7961,7 @@ func uiSource(): Str {
 				"__CSS__", uiCSS,
 				"__TOKEN__", w.token,
 				"__EXTRA__", uiExtraScript,
+				"__ICON__", uiIconHref(),
 			).Replace(uiShell)
 
 			ready := make(chan int, 1)
@@ -7988,6 +7993,9 @@ func uiSource(): Str {
 			mux := http.NewServeMux()
 			for path, handler := range uiExtraRoutes {
 				mux.HandleFunc(path, handler)
+			}
+			if len(uiWindowIcon) > 0 {
+				mux.HandleFunc("/_hive/icon", uiIconRoute)
 			}
 			mux.HandleFunc("/", func(rw http.ResponseWriter, req *http.Request) {
 				if req.URL.Query().Get("token") != w.token {
@@ -8135,6 +8143,31 @@ func uiSource(): Str {
 			return b.String()
 		}
 
+		// The program's own icon, embedded by the build from ~BT~assets/icon.png~BT~. Nil in a
+		// program that ships none; hive/windowicon.go fills it in.
+		var uiWindowIcon []byte
+
+		func uiWindowIconIs(body []byte) { uiWindowIcon = body }
+
+		// What the shell links. A program's own icon is served from the window's own
+		// server; without one, the mark below is the whole of what ships — one path, so
+		// a window is never left with a browser's blank sheet.
+		func uiIconHref() string {
+			if len(uiWindowIcon) > 0 {
+				return "/_hive/icon"
+			}
+			return "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'" +
+				"%3E%3Cpath fill='%23f0b429' d='M12 1.5 21 6.75v10.5L12 22.5 3 17.25V6.75z'/%3E%3C/svg%3E"
+		}
+
+		// Serving it. Cached hard: the bytes are in the executable, so they cannot go
+		// stale while the program runs.
+		func uiIconRoute(rw http.ResponseWriter, req *http.Request) {
+			rw.Header().Set("Content-Type", "image/png")
+			rw.Header().Set("Cache-Control", "max-age=31536000, immutable")
+			rw.Write(uiWindowIcon)
+		}
+
 		// Binding the port. Always a free one chosen by the operating system, and
 		// always on loopback: nothing outside this machine is meant to reach a window,
 		// so the number is an implementation detail rather than something a call
@@ -8148,17 +8181,81 @@ func uiSource(): Str {
 			return listener, listener.Addr().(*net.TCPAddr).Port
 		}
 
+		// What the window is opened with. A profile of its own is what makes it a program
+		// rather than a browser window: without one the launch is handed to a browser
+		// already running, and the window shares that session and dies with it.
+		func uiAppArguments(url string) []string {
+			arguments := []string{"--app=" + url, "--window-size=1100,780"}
+			profile := uiProfileDir()
+			if profile == "" {
+				return arguments
+			}
+			arguments = append(arguments,
+				"--user-data-dir="+profile,
+				"--no-first-run",
+				"--no-default-browser-check")
+			// What a window manager groups a window under. Windows and macOS have no
+			// such notion and are handed none.
+			if runtime.GOOS != "windows" && runtime.GOOS != "darwin" {
+				arguments = append(arguments, "--class="+uiAppName())
+			}
+			return arguments
+		}
+
+		// Where that profile lives: one directory per program, under the platform's own
+		// cache — losing it costs a window its size and position, nothing more. Answers
+		// ~BT~""~BT~ where none can be made, which opens the window without one.
+		func uiProfileDir() string {
+			root, err := os.UserCacheDir()
+			if err != nil {
+				root = os.TempDir()
+			}
+			// Named for the program and for where it is: two programs called ~BT~client~BT~
+			// are two programs, and each wants its own window back.
+			sum := fnv.New32a()
+			if path, err := os.Executable(); err == nil {
+				sum.Write([]byte(path))
+			} else {
+				sum.Write([]byte(os.Args[0]))
+			}
+			dir := filepath.Join(root, "hive", "windows", uiAppName()+"-"+strconv.FormatUint(uint64(sum.Sum32()), 16))
+			if os.MkdirAll(dir, 0o700) != nil {
+				return ""
+			}
+			return dir
+		}
+
+		// The program's own name, as a window manager may be shown it.
+		func uiAppName() string {
+			name := filepath.Base(os.Args[0])
+			name = strings.TrimSuffix(name, ".exe")
+			kept := strings.Map(func(r rune) rune {
+				switch {
+				case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_':
+					return r
+				case r >= 'A' && r <= 'Z':
+					return r + 32
+				}
+				return -1
+			}, name)
+			if kept == "" {
+				return "hive"
+			}
+			return kept
+		}
+
 		// Opening the window. A browser already installed in application mode is a real
 		// window with no address bar and no tabs; without one, an ordinary tab is a
 		// perfectly good fallback. Nothing here is linked into the binary, so the build
 		// stays free of dependencies on every platform.
 		func uiOpen(url string) error {
+			arguments := uiAppArguments(url)
 			for _, candidate := range uiBrowsers() {
 				path, err := exec.LookPath(candidate)
 				if err != nil {
 					continue
 				}
-				cmd := exec.Command(path, "--app="+url, "--window-size=1100,780")
+				cmd := exec.Command(path, arguments...)
 				if err := cmd.Start(); err == nil {
 					return nil
 				}
@@ -8172,7 +8269,7 @@ func uiSource(): Str {
 					if exec.Command(flatpak, "info", id).Run() != nil {
 						continue
 					}
-					cmd := exec.Command(flatpak, "run", id, "--app="+url, "--window-size=1100,780")
+					cmd := exec.Command(flatpak, append([]string{"run", id}, arguments...)...)
 					if cmd.Start() == nil {
 						return nil
 					}
