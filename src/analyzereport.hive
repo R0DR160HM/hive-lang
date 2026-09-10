@@ -1,0 +1,668 @@
+// What `hive analyze` prints, and the page it writes. The page is a `hive.ui`
+// view, so `ui.page` renders it as a whole document and `ui.html` renders it for
+// a test to read. The prose in a finding comes from `analyze`, not from here.
+import ./analyze
+import ./paths
+import ./progress
+import ./text
+import hive.conv
+import hive.ui
+
+// --- The terminal --------------------------------------------------------------
+
+/// How many callables the terminal names before leaving the rest to the page.
+func shown(): Int {
+	return 8
+}
+
+/// How many findings are printed under one callable, worst first.
+func perCallable(): Int {
+	return 4
+}
+
+/// What the command prints. The page has everything; this is the readable part.
+proc lines(entry: Str, report: analyze.Report, wrote: Str, from: Int): Str[dyn] {
+	mut Str[dyn] out = []
+	append(out, "")
+	append(out, "  " + entry + " scores " + mark(report.score)
+		+ " over " + progress.counted(report.callables, "callable"))
+	append(out, "  " + tally(report))
+	if report.findings == 0 {
+		append(out, "")
+		append(out, "  Nothing here looks expensive.")
+	}
+
+	mut Int said = 0
+	for each s in report.scored {
+		if said >= shown() || len(s.findings) == 0 {
+			continue
+		}
+		append(out, "")
+		append(out, "  " + padded("{s.score}", 4) + padded(s.display, 34)
+			+ "  " + s.word + ", line {s.line}")
+		mut Int printed = 0
+		for each f in worstFirst(s.findings) {
+			if printed >= perCallable() {
+				continue
+			}
+			append(out, "        " + weighting(f) + "  " + f.sketch)
+			append(out, "             " + analyze.says(f.kind))
+			printed = printed + 1
+		}
+		if len(s.findings) > printed {
+			append(out, "        " + progress.counted(len(s.findings) - printed, "more finding")
+				+ " in this one")
+		}
+		if s.heaviest != "" && s.total > s.own {
+			append(out, "        most of what it reaches is under `" + s.heaviest + "`")
+		}
+		said = said + 1
+	}
+
+	quiet := report.callables - withFindings(report)
+	if quiet > 0 {
+		append(out, "")
+		append(out, "  " + progress.counted(quiet, "callable") + " had nothing found in "
+			+ them(quiet) + ".")
+	}
+	append(out, "")
+	append(out, "  Wrote " + wrote + " (" + progress.took(progress.since(from)) + ")")
+	return out
+}
+
+func them(many: Int): Str {
+	if many == 1 {
+		return "it"
+	}
+	return "them"
+}
+
+func tally(report: analyze.Report): Str {
+	if report.findings == 0 {
+		return progress.counted(report.findings, "finding")
+	}
+	mut Str[dyn] parts = []
+	if report.copies > 0 {
+		append(parts, copies(report.copies) + " to pay for")
+	}
+	if report.nests > 0 {
+		append(parts, progress.counted(report.nests, "nested loop"))
+	}
+	if report.waits > 0 {
+		append(parts, progress.counted(report.waits, "wait") + " inside a loop")
+	}
+	if len(parts) == 0 {
+		return progress.counted(report.findings, "finding")
+	}
+	return progress.counted(report.findings, "finding") + " — " + join(parts, ", ")
+}
+
+func mark(score: Int): Str {
+	return "{score}/100"
+}
+
+/// The one plural in the report that an `s` is not the whole of.
+func copies(many: Int): Str {
+	if many == 1 {
+		return "1 copy"
+	}
+	return "{many} copies"
+}
+
+func weighting(f: analyze.Finding): Str {
+	if f.depth == 0 {
+		return padded("·", 5)
+	}
+	return padded("×" + "{multiplier(f)}", 5)
+}
+
+/// What the loops around a finding multiplied it by.
+func multiplier(f: analyze.Finding): Int {
+	base := analyze.baseOf(f.kind)
+	if base <= 0 {
+		return 1
+	}
+	return f.cost / base
+}
+
+func padded(s: Str, width: Int): Str {
+	cs := text.chars(s)
+	if len(cs) >= width {
+		return s
+	}
+	return s + text.repeat(" ", width - len(cs))
+}
+
+func withFindings(report: analyze.Report): Int {
+	mut Int many = 0
+	for each s in report.scored {
+		if len(s.findings) > 0 {
+			many = many + 1
+		}
+	}
+	return many
+}
+
+func worstFirst(findings: analyze.Finding[]): analyze.Finding[dyn] {
+	return sort(findings, costlier)
+}
+
+func costlier(a: analyze.Finding, b: analyze.Finding): Bool {
+	if a.cost != b.cost {
+		return a.cost > b.cost
+	}
+	return a.sketch < b.sketch
+}
+
+// --- The page ------------------------------------------------------------------
+
+/// Beside the entrypoint, named after it, the way an executable is.
+func pathOf(entry: Str): Str {
+	return paths.joinPath(paths.dirOf(entry), paths.stem(entry) + "-analysis.html")
+}
+
+/// The whole document, stylesheet included.
+proc page(entry: Str, report: analyze.Report): Str {
+	return hive.ui.page("Hive — " + paths.baseOf(entry) + " analysed", view(entry, report))
+}
+
+/// The report as a view. Separate from `page` so a test can render it alone.
+proc view(entry: Str, report: analyze.Report): hive.ui.View {
+	return hive.ui.column([hive.ui.pad(28), hive.ui.gap(24), hive.ui.width(1000)], [
+		heading(entry, report),
+		tiles(report),
+		spread(report),
+		hot(report),
+		callGraph(report),
+		everything(report),
+		footing()
+	])
+}
+
+proc heading(entry: Str, report: analyze.Report): hive.ui.View {
+	return hive.ui.row([hive.ui.gap(20), hive.ui.align(hive.ui.Align.Center())], [
+		hive.ui.column([hive.ui.gap(4), hive.ui.grow(1)], [
+			hive.ui.text([hive.ui.size(hive.ui.TextSize.Title()), hive.ui.heading(1)],
+				"What " + paths.baseOf(entry) + " will cost"),
+			hive.ui.text([hive.ui.size(hive.ui.TextSize.Caption()), hive.ui.tone(hive.ui.Tone.Muted())],
+				entry + " — " + tally(report))
+		]),
+		chip(report.score)
+	])
+}
+
+proc chip(score: Int): hive.ui.View {
+	return hive.ui.column([
+		hive.ui.pad(16),
+		hive.ui.gap(2),
+		hive.ui.width(120),
+		hive.ui.align(hive.ui.Align.Center()),
+		hive.ui.background(toneOf(score))
+	], [
+		hive.ui.text([hive.ui.size(hive.ui.TextSize.Title()), hive.ui.heading(2)], "{score}"),
+		hive.ui.text([hive.ui.size(hive.ui.TextSize.Caption())], "out of 100")
+	])
+}
+
+func toneOf(score: Int): hive.ui.Tone {
+	if score >= 75 {
+		return hive.ui.Tone.Good()
+	}
+	if score >= 40 {
+		return hive.ui.Tone.Warn()
+	}
+	return hive.ui.Tone.Danger()
+}
+
+proc tiles(report: analyze.Report): hive.ui.View {
+	return hive.ui.row([hive.ui.gap(12)], [
+		tile("callables", "{report.callables}"),
+		tile("findings", "{report.findings}"),
+		tile("deep copies", "{report.copies}"),
+		tile("nested loops", "{report.nests}"),
+		tile("waits in a loop", "{report.waits}"),
+		tile("deepest nest", "{report.deepest}")
+	])
+}
+
+proc tile(name: Str, value: Str): hive.ui.View {
+	return hive.ui.column([
+		hive.ui.pad(12),
+		hive.ui.gap(2),
+		hive.ui.grow(1),
+		hive.ui.background(hive.ui.Tone.Muted())
+	], [
+		hive.ui.text([hive.ui.size(hive.ui.TextSize.Subtitle())], value),
+		hive.ui.text([hive.ui.size(hive.ui.TextSize.Caption()), hive.ui.tone(hive.ui.Tone.Muted())], name)
+	])
+}
+
+// --- How the callables fall ----------------------------------------------------
+
+/// Five bars, one per band of twenty. One red bar in a field of green is a
+/// morning's work; five amber ones are a different conversation.
+proc spread(report: analyze.Report): hive.ui.View {
+	counts := banded(report)
+	mut Int most = 1
+	for each n in counts {
+		if n > most {
+			most = n
+		}
+	}
+	mut hive.ui.Mark[dyn] marks = []
+	mut Int at = 0
+	for each band in bands() {
+		count := countAt(counts, at)
+		// Placed by its middle, like everything on a canvas, so a bar standing on
+		// the baseline is half its own height above it.
+		high := 22.0 * hive.conv.itf(count) / hive.conv.itf(most)
+		middle := 10.0 + hive.conv.itf(at) * 20.0
+		if count > 0 {
+			append(marks, hive.ui.bar([hive.ui.paint(toneOf(at * 20 + 10))],
+				middle, 26.0 - high / 2.0, 12.0, high))
+			append(marks, hive.ui.words([hive.ui.paint(hive.ui.Tone.Muted())],
+				middle, 24.0 - high, 3.5, "{count}"))
+		}
+		append(marks, hive.ui.words([hive.ui.paint(hive.ui.Tone.Muted())],
+			middle, 31.0, 3.5, band))
+		at = at + 1
+	}
+	return hive.ui.column([hive.ui.gap(8)], [
+		hive.ui.text([hive.ui.size(hive.ui.TextSize.Subtitle())], "How the scores fall"),
+		// The box is given the region's own proportions, near enough. A canvas keeps
+		// what is drawn on it to shape and centres it, so a box of any other shape
+		// would leave the chart adrift in a band of nothing.
+		hive.ui.canvas([
+			hive.ui.region(0.0, 0.0, 100.0, 36.0),
+			hive.ui.width(440),
+			hive.ui.height(158)
+		], marks)
+	])
+}
+
+func bands(): Str[5] {
+	return ["0–19", "20–39", "40–59", "60–79", "80–100"]
+}
+
+/// How many callables fall in each band of twenty, lowest first.
+proc banded(report: analyze.Report): Int[dyn] {
+	mut Int[dyn] counts = [0, 0, 0, 0, 0]
+	for each s in report.scored {
+		mut Int at = s.score / 20
+		if at > 4 {
+			at = 4
+		}
+		if counts bounds at {
+			counts[at] = counts[at] + 1
+		}
+	}
+	return counts
+}
+
+func countAt(counts: Int[], index: Int): Int {
+	if counts bounds index {
+		return counts[index]
+	}
+	return 0
+}
+
+// --- The ones worth reading ----------------------------------------------------
+
+/// Every callable something was found in, worst first. What somebody acts on.
+proc hot(report: analyze.Report): hive.ui.View {
+	mut hive.ui.View[dyn] cards = []
+	for each s in report.scored {
+		if len(s.findings) > 0 {
+			append(cards, card(s))
+		}
+	}
+	if len(cards) == 0 {
+		return hive.ui.column([hive.ui.gap(8)], [
+			hive.ui.text([hive.ui.size(hive.ui.TextSize.Subtitle())], "Nothing to report"),
+			hive.ui.text([hive.ui.tone(hive.ui.Tone.Muted())],
+				"No loop, copy or wait in this program scored anything. Every callable is below.")
+		])
+	}
+	return hive.ui.column([hive.ui.gap(12)], [
+		hive.ui.text([hive.ui.size(hive.ui.TextSize.Subtitle())],
+			"What to look at, worst first")
+	] + cards)
+}
+
+proc card(s: analyze.Scored): hive.ui.View {
+	mut hive.ui.View[dyn] rows = []
+	for each f in worstFirst(s.findings) {
+		append(rows, finding(f))
+	}
+	return hive.ui.column([
+		hive.ui.pad(16),
+		hive.ui.gap(10),
+		hive.ui.background(hive.ui.Tone.Muted())
+	], [
+		hive.ui.row([hive.ui.gap(10), hive.ui.align(hive.ui.Align.Center())], [
+			hive.ui.text([hive.ui.size(hive.ui.TextSize.Subtitle())], s.display),
+			hive.ui.text([hive.ui.size(hive.ui.TextSize.Caption()), hive.ui.tone(hive.ui.Tone.Muted())],
+				s.word + ", line {s.line}"),
+			hive.ui.spacer(),
+			hive.ui.text([hive.ui.tone(toneOf(s.score))], "{s.score}")
+		]),
+		hive.ui.text([hive.ui.size(hive.ui.TextSize.Caption()), hive.ui.tone(hive.ui.Tone.Muted())],
+			reach(s))
+	] + rows)
+}
+
+/// What its own body costs against what it reaches, and where the rest went.
+func reach(s: analyze.Scored): Str {
+	mut Str said = "its own body costs {s.own}"
+	if s.total > s.own {
+		said = said + ", and one call to it reaches {s.total}"
+		if s.heaviest != "" {
+			said = said + " — mostly `" + s.heaviest + "`"
+		}
+	}
+	if s.recursive {
+		said = said + ". On a cycle, so that total is a floor rather than a sum"
+	}
+	return said
+}
+
+proc finding(f: analyze.Finding): hive.ui.View {
+	mut hive.ui.View[dyn] said = [
+		hive.ui.text([], f.sketch),
+		hive.ui.text([hive.ui.size(hive.ui.TextSize.Caption()), hive.ui.tone(hive.ui.Tone.Muted())],
+			analyze.says(f.kind))
+	]
+	advice := analyze.advises(f.kind)
+	if advice != "" {
+		append(said, hive.ui.text([hive.ui.size(hive.ui.TextSize.Caption())], "→ " + advice))
+	}
+	return hive.ui.row([hive.ui.gap(12), hive.ui.align(hive.ui.Align.Start())], [
+		hive.ui.column([hive.ui.width(76), hive.ui.gap(2), hive.ui.align(hive.ui.Align.End())], [
+			hive.ui.text([hive.ui.tone(costTone(f.cost))], "{f.cost}"),
+			hive.ui.text([hive.ui.size(hive.ui.TextSize.Caption()), hive.ui.tone(hive.ui.Tone.Muted())],
+				depthWord(f))
+		]),
+		hive.ui.column([hive.ui.gap(3), hive.ui.grow(1)], said)
+	])
+}
+
+func costTone(cost: Int): hive.ui.Tone {
+	if cost >= 120 {
+		return hive.ui.Tone.Danger()
+	}
+	if cost >= 30 {
+		return hive.ui.Tone.Warn()
+	}
+	return hive.ui.Tone.Normal()
+}
+
+func depthWord(f: analyze.Finding): Str {
+	if f.depth == 0 {
+		return analyze.label(f.kind)
+	}
+	return analyze.label(f.kind) + ", ×{multiplier(f)}"
+}
+
+// --- Every callable ------------------------------------------------------------
+
+/// The whole list, so the page is a record of the program and not only its worst corner.
+proc everything(report: analyze.Report): hive.ui.View {
+	mut Str[dyn][dyn] rows = [["score", "callable", "kind", "line", "own", "reaches", "findings"]]
+	for each s in report.scored {
+		append(rows, [
+			"{s.score}",
+			s.display,
+			s.word,
+			"{s.line}",
+			"{s.own}",
+			reaches(s),
+			"{len(s.findings)}"
+		])
+	}
+	return hive.ui.column([hive.ui.gap(8)], [
+		hive.ui.text([hive.ui.size(hive.ui.TextSize.Subtitle())], "Every callable"),
+		hive.ui.text([hive.ui.size(hive.ui.TextSize.Caption()), hive.ui.tone(hive.ui.Tone.Muted())],
+			"`own` is what the body costs. `reaches` adds what one call to it runs into, through the call graph."),
+		hive.ui.table([], rows)
+	])
+}
+
+func reaches(s: analyze.Scored): Str {
+	if s.recursive {
+		return "{s.total}+"
+	}
+	return "{s.total}"
+}
+
+// --- What the numbers are ------------------------------------------------------
+
+/// The most important thing on the page: nothing here is a measurement.
+proc footing(): hive.ui.View {
+	return hive.ui.column([
+		hive.ui.pad(16),
+		hive.ui.gap(6),
+		hive.ui.background(hive.ui.Tone.Muted())
+	], [
+		hive.ui.text([hive.ui.size(hive.ui.TextSize.Subtitle())], "What these numbers are"),
+		hive.ui.text([hive.ui.tone(hive.ui.Tone.Muted())],
+			"Weights, not measurements. No compiler knows how many times a loop goes round or how long a disk takes, so nothing here is a duration and nothing here replaces a profiler. What it is for is ordering: a finding is worth its own weight times eight for every loop around it, capped at three levels, so the same copy inside two loops outranks it inside one."),
+		hive.ui.text([hive.ui.tone(hive.ui.Tone.Muted())],
+			"A deep copy is the exception, and is not a guess about the program: it is read off the same whole-program answer the emitter builds its `clone_T` from, so a copy named here is a copy that will be emitted, weighed by the fields it will really walk — a vector of unknown length counted as eight. A binding whose storage the compiler could share is free, and is never mentioned."),
+		hive.ui.text([hive.ui.tone(hive.ui.Tone.Muted())],
+			"A score is 100 for a callable nothing was found in, whatever its size, and falls ten points for every doubling of its cost. Logarithmic, because a cost here runs from four to thirty thousand: a scale linear in it would spend its whole range inside the first loop and bottom out for everything past that."),
+		hive.ui.text([hive.ui.tone(hive.ui.Tone.Muted())],
+			"`reaches` is the body's own cost plus half of the worst thing one call to it runs into — the worst rather than the sum, so a `main` that calls five hundred clean helpers is still clean, and half of it so that the callable a cost is actually *in* outranks everyone who merely reaches it. A `+` on the number means the callable is on a cycle, where there is no path to be worst: that total is a floor."),
+		hive.ui.text([hive.ui.tone(hive.ui.Tone.Muted())],
+			"Tests, queries and imported Go functions are not scored — a test is not shipped, a query's cost is the `hive.sql.run` that executes it, and what is past the Go boundary is not this compiler's to read.")
+	])
+}
+
+// --- The call graph ------------------------------------------------------------
+
+/// The most nodes worth drawing. Past this the picture is a hairball and the
+/// list below it is the only readable form of the same thing.
+func mostDrawn(): Int {
+	return 40
+}
+
+proc callGraph(report: analyze.Report): hive.ui.View {
+	rows := analyze.treeOf(report.scored)
+	placed := laidOut(rows)
+	mut hive.ui.View[dyn] out = [
+		hive.ui.text([hive.ui.size(hive.ui.TextSize.Subtitle())], "The call graph"),
+		hive.ui.text([hive.ui.size(hive.ui.TextSize.Caption()), hive.ui.tone(hive.ui.Tone.Muted())],
+			"From every callable nothing else calls, worst branch first. Each one is opened once; where it is called again it is named rather than repeated, so no edge is lost. Colour is the score.")
+	]
+	if len(placed) > 1 && len(placed) <= mostDrawn() {
+		append(out, drawn(rows, placed))
+	}
+	for each r in rows {
+		append(out, branch(r))
+	}
+	return hive.ui.column([hive.ui.gap(6)], out)
+}
+
+proc branch(r: analyze.Row): hive.ui.View {
+	mut hive.ui.View[dyn] said = [
+		hive.ui.row([hive.ui.width(analyze.larger(atMost(r.depth, deepestIndent()) * 14, 1))], []),
+		hive.ui.text([hive.ui.tone(toneOf(r.score))], "●"),
+		hive.ui.text([hive.ui.tone(nameTone(r))], r.display)
+	]
+	note := aside(r)
+	if note != "" {
+		append(said, hive.ui.text([hive.ui.size(hive.ui.TextSize.Caption()), hive.ui.tone(hive.ui.Tone.Muted())], note))
+	}
+	append(said, hive.ui.spacer())
+	append(said, hive.ui.text([hive.ui.size(hive.ui.TextSize.Caption()), hive.ui.tone(hive.ui.Tone.Muted())],
+		"own {r.own} · reaches " + reaching(r)))
+	append(said, hive.ui.text([hive.ui.tone(toneOf(r.score))], "{r.score}"))
+	return hive.ui.row([hive.ui.gap(8), hive.ui.align(hive.ui.Align.Center())], said)
+}
+
+/// How many levels the indent keeps growing for. A call graph can be forty deep,
+/// and an indent that followed it would leave no room to write a name in.
+func deepestIndent(): Int {
+	return 28
+}
+
+func atMost(n: Int, most: Int): Int {
+	if n > most {
+		return most
+	}
+	return n
+}
+
+func nameTone(r: analyze.Row): hive.ui.Tone {
+	if r.again {
+		return hive.ui.Tone.Muted()
+	}
+	return hive.ui.Tone.Normal()
+}
+
+func aside(r: analyze.Row): Str {
+	if r.again {
+		if r.recursive {
+			return "on a cycle"
+		}
+		return "opened above"
+	}
+	if r.calls == 0 {
+		return "calls nothing"
+	}
+	return progress.counted(r.calls, "call")
+}
+
+func reaching(r: analyze.Row): Str {
+	if r.recursive {
+		return "{r.total}+"
+	}
+	return "{r.total}"
+}
+
+// --- Drawing it ----------------------------------------------------------------
+
+/// A node's place on the canvas, in the region's own units.
+type Placed {
+	name: Str
+	x: Int
+	y: Int
+}
+
+func nodeWide(): Int {
+	return 150
+}
+
+func nodeTall(): Int {
+	return 24
+}
+
+/// Depth is the column and order of appearance is the row, so an edge runs left
+/// to right the way a call does.
+proc laidOut(rows: analyze.Row[]): Placed[dyn] {
+	mut Int[dyn] slots = []
+	mut Placed[dyn] out = []
+	for each r in rows {
+		if r.again {
+			continue
+		}
+		for ; len(slots) <= r.depth; {
+			append(slots, 0)
+		}
+		if slots bounds r.depth {
+			// A box is placed by its middle, like everything on a canvas, so the
+			// first column starts half a box in from the edge.
+			append(out, Placed(r.name, 12 + nodeWide() / 2 + r.depth * 190,
+				18 + slots[r.depth] * 34))
+			slots[r.depth] = slots[r.depth] + 1
+		}
+	}
+	return out
+}
+
+proc drawn(rows: analyze.Row[], placed: Placed[]): hive.ui.View {
+	mut Int wide = 1
+	mut Int tall = 1
+	for each p in placed {
+		wide = analyze.larger(wide, p.x + nodeWide() / 2 + 12)
+		tall = analyze.larger(tall, p.y + nodeTall() / 2 + 12)
+	}
+	// A fixed scale rather than a box to fit, so a node is the same size whatever
+	// the graph does, and a graph wider than the page scrolls instead of shrinking
+	// until nothing on it can be read.
+	return hive.ui.row([hive.ui.scroll(hive.ui.Axis.Horizontal())], [
+		hive.ui.canvas([
+			hive.ui.region(0.0, 0.0, hive.conv.itf(wide), hive.conv.itf(tall)),
+			hive.ui.width(wide * 17 / 10),
+			hive.ui.height(tall * 17 / 10)
+		], marksOf(rows, placed))
+	])
+}
+
+proc marksOf(rows: analyze.Row[], placed: Placed[]): hive.ui.Mark[dyn] {
+	mut hive.ui.Mark[dyn] marks = []
+	// Edges first, so the boxes sit on top of them.
+	for each r in rows {
+		if r.parent == "" {
+			continue
+		}
+		from := placeOf(placed, r.parent)
+		to := placeOf(placed, r.name)
+		if from.name == "" || to.name == "" {
+			continue
+		}
+		x1 := hive.conv.itf(from.x + nodeWide() / 2)
+		y1 := hive.conv.itf(from.y)
+		x2 := hive.conv.itf(to.x - nodeWide() / 2)
+		y2 := hive.conv.itf(to.y)
+		mid := (x1 + x2) / 2.0
+		append(marks, hive.ui.path([hive.ui.paint(hive.ui.Tone.Muted()), hive.ui.thick(0.7)],
+			[x1, y1, mid, y1, mid, y2, x2, y2]))
+	}
+	for each p in placed {
+		r := rowOf(rows, p.name)
+		x := hive.conv.itf(p.x)
+		y := hive.conv.itf(p.y)
+		append(marks, hive.ui.bar([hive.ui.paint(toneOf(r.score))],
+			x, y, hive.conv.itf(nodeWide()), hive.conv.itf(nodeTall())))
+		append(marks, hive.ui.words([hive.ui.paint(inkOn(r.score))], x, y - 3.5, 8.0,
+			clipped(r.display, 24)))
+		append(marks, hive.ui.words([hive.ui.paint(inkOn(r.score))], x, y + 7.0, 6.0,
+			"{r.score} · reaches " + reaching(r)))
+	}
+	return marks
+}
+
+/// What to write on a coloured box. Amber takes dark ink, the way the stylesheet
+/// writes on its own warn background.
+func inkOn(score: Int): hive.ui.Tone {
+	if score >= 40 && score < 75 {
+		return hive.ui.Tone.HEX("#15181c")
+	}
+	return hive.ui.Tone.HEX("#ffffff")
+}
+
+func placeOf(placed: Placed[], name: Str): Placed {
+	for each p in placed {
+		if p.name == name {
+			return p
+		}
+	}
+	return Placed("", 0, 0)
+}
+
+func rowOf(rows: analyze.Row[], name: Str): analyze.Row {
+	for each r in rows {
+		if r.name == name && r.again == false {
+			return r
+		}
+	}
+	return analyze.Row(name, name, "", 0, 100, 0, 0, false, false, 0)
+}
+
+func clipped(s: Str, most: Int): Str {
+	cs := text.chars(s)
+	if len(cs) <= most {
+		return s
+	}
+	return text.span(cs, 0, most - 1) + "…"
+}

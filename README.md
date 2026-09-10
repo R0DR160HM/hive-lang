@@ -22,6 +22,7 @@ a compiler for it written in the language it compiles.
 ./hive run       <entrypoint.hive>    compile and run
 ./hive test      <entrypoint.hive>    run the program's tests, with coverage
 ./hive check     <entrypoint.hive>    report any errors, build nothing
+./hive analyze   <entrypoint.hive>    score what it will cost, and write a page
 ./hive emit      <entrypoint.hive>    print the generated Go
 ./hive build     <entrypoint.hive>    compile to a native executable
 ./hive build     <entrypoint.hive> --target <goos>/<goarch>
@@ -250,6 +251,38 @@ GOOS=linux   GOARCH=arm64 go build -o hivec-linux-arm64 .
 Each one is a complete compiler: the runtime it carries is source text inside it,
 so nothing else has to travel.
 
+### What it will cost
+
+`hive analyze <entrypoint.hive>` reads the program the emitter is about to write
+and says what looks expensive. It scores every `proc` and `func` out of a hundred,
+prints the worst of them, and writes the whole thing as an HTML page beside the
+entrypoint:
+
+```sh
+hive analyze main.hive
+```
+
+Nothing is built and nothing is run — the numbers come out of the tree, so this
+asks no more of the machine than `hive check` does. The page is a
+[`hive.ui`](spec/14-stdlib.md#1415-hiveui) view rendered with `ui.page`, so it
+carries its own stylesheet and opens in a browser with nothing beside it.
+
+It looks for loops inside loops, a name rebuilt out of itself one turn at a time,
+a linear search inside a loop, something that waits on a disk or a database once
+per turn, and — the one a language of values has that others do not — **implicit
+deep copies**. A finding is worth its own weight times eight for every loop
+around it, and a callable carries half of the worst thing one call to it runs
+into, so a tidy `proc` whose one line calls something quadratic is not scored as
+tidy.
+
+The copies are not guessed at: `writes` already works out which fields a
+`clone_T` still has to copy, since a field nothing writes is shared
+([8.4](spec/08-mutability-and-values.md#84-copy-on-binding)), and the analysis
+reads its answer. A copy it names is one that will be emitted; a binding whose
+storage the compiler shares costs nothing and is never mentioned. Everything else
+is a **weight rather than a measurement** — no compiler knows how many times a
+loop goes round, so this says where to look first, not how long anything takes.
+
 ### In a container
 
 `hive container <entrypoint.hive>` writes a Dockerfile for a program, into the
@@ -363,6 +396,8 @@ src/                 the compiler
   vendor.hive        the one thing a build downloads: the three.js a scene needs
   progress.hive      what the compiler says while it is working
   project.hive       writing the Go module, and running the Go toolchain over it
+  analyze.hive       what `hive analyze` scores, and why
+  analyzereport.hive the page it writes, built as a `hive.ui` view
   container.hive     the Dockerfile `hive container` writes
   agents.hive        the .hivedocs/ `hive agents` writes, and what else it makes sure of
   docs/              the pages themselves, carried as source text

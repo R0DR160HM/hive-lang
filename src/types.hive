@@ -75,19 +75,19 @@ type Table {
 	callables: CallableInfo[dyn]
 }
 /// Read a flattened module's declarations into a table.
-func tableOf(m: ast.Module): Table {
+proc tableOf(m: ast.Module): Table {
 	mut TypeInfo[dyn] types = []
 	mut CallableInfo[dyn] callables = []
 	for each d in m.decls {
 		if d is ast.Decl.TypeDecl(name, fields, variants, _) {
-			types = withType(types, TypeInfo(name, variants, fields, variablesOfType(fields, variants)))
+			append(types, TypeInfo(name, variants, fields, variablesOfType(fields, variants)))
 		} else if d is ast.Decl.CallableDecl(kind, name, params, result, _, _) {
 			pure := kind is ast.CallableKind.FuncKind
-			callables = withCallable(callables, CallableInfo(name, pure, params, result, variablesOfSignature(params, result)))
+			append(callables, CallableInfo(name, pure, params, result, variablesOfSignature(params, result)))
 		} else if d is ast.Decl.ForeignDecl(name, params, result, _, _, _, _) {
 			// A Go function is a `func`: the boundary copies in both directions,
 			// so nothing on the far side writes where the caller can see.
-			callables = withCallable(callables, CallableInfo(name, true, params, result, variablesOfSignature(params, result)))
+			append(callables, CallableInfo(name, true, params, result, variablesOfSignature(params, result)))
 		} else if d is ast.Decl.QueryDecl(name, params, result, _, _) {
 			// A query is a func whose body happens to be SQL, and what calling
 			// one answers with is the query — text, and the values bound beside
@@ -95,31 +95,10 @@ func tableOf(m: ast.Module): Table {
 			// rows, and the type it needs to do that is the declared row type
 			// travelling along inside `Fragment<...>`.
 			held := queryResult(result)
-			callables = withCallable(callables, CallableInfo(name, true, params, held, variablesOfSignature(params, held)))
+			append(callables, CallableInfo(name, true, params, held, variablesOfSignature(params, held)))
 		}
 	}
 	return Table(types, callables)
-}
-
-// `append` on a value the caller handed us would be a write through storage it
-// can still see, so each of these hands back a vector of its own — which is what
-// lets `tableOf` be a `func`.
-func withType(types: TypeInfo[], one: TypeInfo): TypeInfo[dyn] {
-	mut TypeInfo[dyn] out = []
-	for each t in types {
-		append(out, t)
-	}
-	append(out, one)
-	return out
-}
-
-func withCallable(callables: CallableInfo[], one: CallableInfo): CallableInfo[dyn] {
-	mut CallableInfo[dyn] out = []
-	for each c in callables {
-		append(out, c)
-	}
-	append(out, one)
-	return out
 }
 
 func findType(t: Table, name: Str): Result<TypeInfo, Bool> {
@@ -189,57 +168,44 @@ func fieldsOfStruct(t: Table, name: Str): Result<ast.Field[dyn], Bool> {
 // variable. That cannot be settled while the table is still being built, so this
 // collects every name that *could* be one, in first-appearance order, and
 // `resolve` decides once it has the table to decide with.
-func variablesOfSignature(params: ast.Param[], result: ast.TypeExpr): Str[dyn] {
+proc variablesOfSignature(params: ast.Param[], result: ast.TypeExpr): Str[dyn] {
 	mut Str[dyn] out = []
 	for each p in params {
-		out = collectNames(p.declared, out)
+		collectNames(p.declared, out)
 	}
-	return collectNames(result, out)
+	collectNames(result, out)
+	return out
 }
 
-func variablesOfType(fields: ast.Field[], variants: ast.Variant[]): Str[dyn] {
+proc variablesOfType(fields: ast.Field[], variants: ast.Variant[]): Str[dyn] {
 	mut Str[dyn] out = []
 	for each f in fields {
-		out = collectNames(f.declared, out)
+		collectNames(f.declared, out)
 	}
 	for each v in variants {
 		for each f in v.fields {
-			out = collectNames(f.declared, out)
+			collectNames(f.declared, out)
 		}
 	}
 	return out
 }
 
-// Each of these hands back a vector of its own rather than growing one it was
-// given, which keeps every function here a `func`: a `mut` parameter is the one
-// thing a func may not declare.
-func collectNames(t: ast.TypeExpr, into: Str[]): Str[dyn] {
+proc collectNames(t: ast.TypeExpr, into: mut Str[dyn]): void {
 	if t is ast.TypeExpr.Named(pkg, name, args, _) {
-		mut Str[dyn] out = copied(into)
-		if pkg == "" && indexOf(out, name) is Result.Error(_) {
-			append(out, name)
+		if pkg == "" && indexOf(into, name) is Result.Error(_) {
+			append(into, name)
 		}
 		for each a in args {
-			out = collectNames(a, out)
+			collectNames(a, into)
 		}
-		return out
+		return
 	}
 	if t is ast.TypeExpr.Fn(_, params, result) {
-		mut Str[dyn] out = copied(into)
 		for each p in params {
-			out = collectNames(p, out)
+			collectNames(p, into)
 		}
-		return collectNames(result, out)
+		collectNames(result, into)
 	}
-	return copied(into)
-}
-
-func copied(names: Str[]): Str[dyn] {
-	mut Str[dyn] out = []
-	for each n in names {
-		append(out, n)
-	}
-	return out
 }
 
 /// Whether `name` is a type variable in a program whose declarations are `t`: a

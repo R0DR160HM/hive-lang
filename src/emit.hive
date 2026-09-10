@@ -26,6 +26,7 @@ import ./text
 import ./token
 import ./types
 import ./writes
+import hive.map
 
 /// A generated Go file, and what could not be generated.
 type Emitted {
@@ -2460,10 +2461,10 @@ proc signatureOf(em: mut Emit, ty: types.Ty, seen: Str[]): Str {
 
 /// The message type a handler folds over: its second parameter, which is what
 /// makes a mailbox type the whole protocol.
-func handlerMessage(em: Emit, handler: ast.Expr): types.Ty {
-	params := handlerParams(em, handler)
+func handlerMessage(t: types.Table, handler: ast.Expr): types.Ty {
+	params := handlerParams(t, handler)
 	if params bounds 1 {
-		return types.resolve(em.table, params[1].declared)
+		return types.resolve(t, params[1].declared)
 	}
 	return types.Ty.TUnknown()
 }
@@ -2471,16 +2472,16 @@ func handlerMessage(em: Emit, handler: ast.Expr): types.Ty {
 /// The parameters a handler expression leaves for the runtime to fill: all of
 /// them for a bare name, only the `_` holes for a partial application — which
 /// lets `inbox(_, _, _, db)` be read the same way.
-func handlerParams(em: Emit, handler: ast.Expr): ast.Param[dyn] {
+func handlerParams(t: types.Table, handler: ast.Expr): ast.Param[dyn] {
 	if handler is ast.Expr.Ident(name) {
-		if types.findCallable(em.table, name) is Result.Ok(info) {
+		if types.findCallable(t, name) is Result.Ok(info) {
 			return info.params
 		}
 		return []
 	}
 	if handler is ast.Expr.Call(callee, args) {
 		if callee is ast.Expr.Ident(name) {
-			if types.findCallable(em.table, name) is Result.Ok(info) {
+			if types.findCallable(t, name) is Result.Ok(info) {
 				mut ast.Param[dyn] out = []
 				mut i := 0
 				for each p in info.params {
@@ -2718,18 +2719,23 @@ func holdsFn(ty: types.Ty): Bool {
 // costing nothing, since a `func` may only call `func`s.
 proc threadStarters(decls: ast.Decl[]): Str[dyn] {
 	mut Str[dyn] found = []
+	// The same names as `found`, kept in step with it, as a set for the fixpoint
+	// below to ask.
+	mut hive.map.Map<Str, Bool> isStarter = hive.map.new()
 	for each d in decls {
 		if d is ast.Decl.CallableDecl(_, name, _, _, body, _) {
 			mut Scan sc = Scan(false, [])
 			scanBlock(body, sc)
 			if sc.spawns {
 				append(found, name)
+				hive.map.set(isStarter, name, true)
 			}
 		} else if d is ast.Decl.QueryDecl(name, _, _, sql, _) {
 			mut Scan sc2 = Scan(false, [])
 			scanSql(sql, sc2)
 			if sc2.spawns {
 				append(found, name)
+				hive.map.set(isStarter, name, true)
 			}
 		}
 	}
@@ -2743,8 +2749,9 @@ proc threadStarters(decls: ast.Decl[]): Str[dyn] {
 		mut i := 0
 		for each caller in g.from {
 			if g.to bounds i {
-				if indexOf(found, g.to[i]) is Result.Ok(_) && indexOf(found, caller) is Result.Error(_) {
+				if hive.map.has(isStarter, g.to[i]) && hive.map.has(isStarter, caller) == false {
 					append(found, caller)
+					hive.map.set(isStarter, caller, true)
 					growing = true
 				}
 			}
@@ -3401,18 +3408,9 @@ proc objectEncode(em: mut Emit, fields: ast.Field[], subject: Str): Str {
 	mut Str[dyn] out = []
 	for each f in fields {
 		ty := types.resolve(em.table, f.declared)
-		out = appendPiece(out, quoted("\"" + ast.jsonKey(f) + "\":") + " + " + encodeOf(em, ty, subject + "." + goField(f.name), 0))
+		append(out, quoted("\"" + ast.jsonKey(f) + "\":") + " + " + encodeOf(em, ty, subject + "." + goField(f.name), 0))
 	}
 	return quoted("\{") + " + " + join(out, " + " + quoted(",") + " + ") + " + " + quoted("}")
-}
-
-func appendPiece(out: Str[], piece: Str): Str[dyn] {
-	mut Str[dyn] next = []
-	for each o in out {
-		append(next, o)
-	}
-	append(next, piece)
-	return next
 }
 
 /// `value`, encoded as JSON, as a Go expression. `depth` names the closure
@@ -3519,7 +3517,7 @@ proc libraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, args: ast
 		if name == "window" {
 			update := argExpr(args, 2)
 			state := argExpr(args, 3)
-			message := handlerMessage(em, update)
+			message := handlerMessage(em.table, update)
 			return "hive.UiWindow(" + expr(em, env, argExpr(args, 0), types.Ty.TStr()) + ", "
 				+ expr(em, env, argExpr(args, 1), types.Ty.TUnknown()) + ", "
 				+ expr(em, env, update, types.Ty.TUnknown()) + ", "
@@ -3534,7 +3532,7 @@ proc libraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, args: ast
 		if name == "spawn" {
 			handler := argExpr(args, 0)
 			state := argExpr(args, 1)
-			message := handlerMessage(em, handler)
+			message := handlerMessage(em.table, handler)
 			stateType := infer.typeOf(env, state)
 			return "hive.SyslinkSpawn(" + expr(em, env, handler, types.Ty.TUnknown()) + ", "
 				+ carried(em, env, state, stateType) + ", hive.SyslinkDecoder(" + decoderRef(em, message) + "), "

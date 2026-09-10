@@ -22,6 +22,7 @@
 import ./ast
 import ./infer
 import ./types
+import hive.map
 
 /// The fields a copy has to copy, as `Type.field`. Anything not named here owns
 /// storage that the program never writes through, so a copy may share it.
@@ -37,6 +38,11 @@ type Written {
 	/// Read off signatures rather than followed through bodies, which is cheaper and
 	/// safer: `build(seed: Int): Circuit` was given nothing that owns storage.
 	escaped: Str[dyn]
+	/// The same shapes as a set, for `leaksFrom` to ask.
+	escapedSet: hive.map.Map<Str, Bool>
+	/// Shape -> the callable whose signature let it out. Nothing here decides a
+	/// copy; it is only what a report needs to say why one is forced.
+	leakedBy: hive.map.Map<Str, Str>
 	table: types.Table
 	/// Set when the walk met a write it could not attribute at all. Nothing is
 	/// shared after that — a field is shared only when the program has been
@@ -49,7 +55,7 @@ type Written {
 /// the answer is missing because nothing in the program writes it.
 proc writtenShapes(m: ast.Module): Str[dyn] {
 	t := types.tableOf(m)
-	mut Written w = Written([], [], t, false)
+	mut Written w = Written([], [], hive.map.new(), hive.map.new(), t, false)
 	env := infer.newEnv(t)
 	markLeaks(w, m.decls)
 	for each d in m.decls {
@@ -67,6 +73,71 @@ proc writtenShapes(m: ast.Module): Str[dyn] {
 		append(out, "s" + e)
 	}
 	return out
+}
+
+/// Which callable let each escaped shape out, as shape -> flattened name. Only
+/// the signature half of the walk is run: a shape marked by `markShape` escaped a
+/// write, and a write has no signature to point at.
+proc leakedBy(t: types.Table, decls: ast.Decl[]): hive.map.Map<Str, Str> {
+	mut Written w = Written([], [], hive.map.new(), hive.map.new(), t, false)
+	markLeaks(w, decls)
+	return w.leakedBy
+}
+
+/// The shape that forces a copy of `ty`, or `""` if nothing does. It walks as
+/// `reaches` does and stops where it stops, so a change to either is a change to
+/// both.
+func forcedShape(t: types.Table, written: Str[], ty: types.Ty, seen: Str[]): Str {
+	if types.ownsStorage(t, ty) == false {
+		return ""
+	}
+	shape := shapeOf(ty)
+	if indexOf(written, "s" + shape) is Result.Ok(_) {
+		return shape
+	}
+	if ty is types.Ty.TVec(element, _) {
+		return forcedShape(t, written, element, seen)
+	}
+	if ty is types.Ty.TMap(_, value) {
+		return forcedShape(t, written, value, seen)
+	}
+	if ty is types.Ty.TResult(ok, bad) {
+		found := forcedShape(t, written, ok, seen)
+		if found != "" {
+			return found
+		}
+		return forcedShape(t, written, bad, seen)
+	}
+	if ty is types.Ty.TNamed(name) {
+		if indexOf(seen, name) is Result.Ok(_) {
+			return shape
+		}
+		mut Str[dyn] deeper = []
+		for each one in seen {
+			append(deeper, one)
+		}
+		append(deeper, name)
+		if types.findType(t, name) is Result.Ok(found) {
+			for each f in found.shared {
+				below := forcedShape(t, written, types.resolve(t, f.declared), deeper)
+				if below != "" {
+					return below
+				}
+			}
+			for each v in found.variants {
+				for each f in v.fields {
+					below := forcedShape(t, written, types.resolve(t, f.declared), deeper)
+					if below != "" {
+						return below
+					}
+				}
+			}
+			return ""
+		}
+		// A type this cannot look up is one `reaches` will not vouch for either.
+		return shape
+	}
+	return ""
 }
 
 /// Whether a copy of `owner` has to copy `field`, or may share it. Two questions,
@@ -165,9 +236,18 @@ proc markShape(w: mut Written, ty: types.Ty): void {
 		// A scalar is a value; there is nothing to alias and nothing to deny.
 		return
 	}
-	shape := shapeOf(ty)
-	if indexOf(w.escaped, shape) is Result.Error(_) {
+	markEscaped(w, shapeOf(ty), "")
+}
+
+// `by` names the callable whose signature let the shape out, and is `""` for one
+// that escaped a write this walk could not follow.
+proc markEscaped(w: mut Written, shape: Str, by: Str): void {
+	if hive.map.has(w.escapedSet, shape) == false {
 		append(w.escaped, shape)
+		hive.map.set(w.escapedSet, shape, true)
+	}
+	if by != "" && hive.map.has(w.leakedBy, shape) == false {
+		hive.map.set(w.leakedBy, shape, by)
 	}
 }
 
@@ -185,15 +265,15 @@ proc markShape(w: mut Written, ty: types.Ty): void {
 // from a parameter. That is why a builder is not caught by it.
 proc markLeaks(w: mut Written, decls: ast.Decl[]): void {
 	for each d in decls {
-		if d is ast.Decl.CallableDecl(_, _, params, result, _, _) {
-			leaksFrom(w, params, types.resolve(w.table, result))
-		} else if d is ast.Decl.QueryDecl(_, params, result, _, _) {
-			leaksFrom(w, params, types.resolve(w.table, result))
+		if d is ast.Decl.CallableDecl(_, name, params, result, _, _) {
+			leaksFrom(w, name, params, types.resolve(w.table, result))
+		} else if d is ast.Decl.QueryDecl(name, params, result, _, _) {
+			leaksFrom(w, name, params, types.resolve(w.table, result))
 		}
 	}
 }
 
-proc leaksFrom(w: mut Written, params: ast.Param[], result: types.Ty): void {
+proc leaksFrom(w: mut Written, by: Str, params: ast.Param[], result: types.Ty): void {
 	if types.ownsStorage(w.table, result) == false {
 		// Nothing that owns storage comes back, so nothing can come back out of
 		// what went in. This is the case `lentFuncs` already relies on.
@@ -204,11 +284,13 @@ proc leaksFrom(w: mut Written, params: ast.Param[], result: types.Ty): void {
 	for each p in params {
 		mut Str[dyn] given = []
 		shapesOf(w.table, types.resolve(w.table, p.declared), given, [])
+		mut hive.map.Map<Str, Bool> wasGiven = hive.map.new()
+		for each shape in given {
+			hive.map.set(wasGiven, shape, true)
+		}
 		for each shape in answered {
-			if indexOf(given, shape) is Result.Ok(_) {
-				if indexOf(w.escaped, shape) is Result.Error(_) {
-					append(w.escaped, shape)
-				}
+			if hive.map.has(wasGiven, shape) {
+				markEscaped(w, shape, by)
 			}
 		}
 	}
