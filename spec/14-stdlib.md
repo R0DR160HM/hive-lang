@@ -619,6 +619,7 @@ without a radius is not a sphere with a default one.
 | `sphere(attrs, radius)` | |
 | `cylinder(attrs, radius, height)` | standing on its end |
 | `cone(attrs, top, bottom, height)` | standing on its end, **both** radii |
+| `roof(attrs, wide, tall, long)` | a pitched roof: a ridge down its length, a slope each side, a gable closing each end |
 | `ground(attrs, width, depth)` | a plane that already lies flat |
 | `label(attrs, words)` | words that always face the viewer |
 | `line(attrs, fromX, fromY, fromZ, toX, toY, toZ)` | |
@@ -641,9 +642,13 @@ third one to call its own.
 | attribute | carries |
 | --- | --- |
 | `at(x, y, z)` | where its middle is |
-| `turn(x, y, z)` | its rotation, in radians, applied X then Y then Z |
+| `turn(x, y, z)` | its rotation, in radians: yaw, then pitch, then roll |
 | `paint(Tone)` | its colour |
 | `surface(Surface)` | what it is made of |
+
+`turn` is a heading and not three world axes: `y` first, then `x` about the shape's
+*own* lateral axis and `z` about its own length, so a thing yawed to face somewhere
+and then pitched tips nose-up the way it is facing.
 
 `Surface` is the finish, as against `paint`'s colour. Eighteen, ordered from the
 ground up — what you drive on, then what things are built of, then what they are
@@ -652,10 +657,14 @@ finished in:
 | | |
 | --- | --- |
 | ground | `Turf` `Gravel` `Tarmac` `Kerb` |
-| built | `Concrete` `Brick` `Planks` `Staves` |
+| built | `Concrete` `Brick` `Panes` `Planks` `Staves` |
 | grown and gathered | `Bark` `Leaves` `Crowd` |
 | open | `Mesh` |
 | finished | `Speckle` `Metal` `Carbon` `Rubber` `Glass` `Gloss` |
+
+`Panes` is the exception to the sentence below: it paints its glass a colour of its
+own rather than a shade of the shape's, because a window is a different material
+from the wall. One window lands in every couple of metres of surface.
 
 Every one is drawn **over** whatever colour the shape is, so one pattern serves a
 red kerb and a blue one, and `Gloss` adds no pattern at all.
