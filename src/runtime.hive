@@ -8511,6 +8511,12 @@ func uiSceneSource(): Str {
 			return UiShape{Kind: "cone", Attrs: attrs, Nums: []float64{top, bottom, height}}
 		}
 
+		// A pitched roof. The alternative — two boxes leaned together — leaves the
+		// gable ends open and costs a second solid on every building in the scene.
+		func UiRoof(attrs []UiAttr, wide float64, tall float64, long float64) UiShape {
+			return UiShape{Kind: "roof", Attrs: attrs, Nums: []float64{wide, tall, long}}
+		}
+
 		// A plane that lies flat, because that is what a floor is. It takes no rotation
 		// to be one — the geometry is built lying down — so the common case costs
 		// nothing and turn still means what it means everywhere else.
@@ -9657,8 +9663,9 @@ func uiSceneJs(): Str {
 		    made.scale.set(0.42 * tex.userData.aspect, 0.42, 1);
 		  } else {
 		    // Once per distinct size in the whole run, rather than once per shape per
-		    // frame, which is what fits is for.
-		    var sig = s.k + "|" + s.d.join(",");
+		    // frame, which is what fits is for. Keyed by surface too, because a box
+		    // carries its tiling in its vertices — see uvsPerFace.
+		    var sig = s.k + "|" + s.d.join(",") + "|" + perTile(s);
 		    var geo = geoms.get(sig);
 		    if (!geo) { geo = solid(s); geoms.set(sig, geo); }
 		    made = new THREE.Mesh(geo, paintOf(s));
@@ -9669,6 +9676,10 @@ func uiSceneJs(): Str {
 		    made.castShadow = s.k !== "ground";
 		    made.receiveShadow = true;
 		  }
+		  // A heading, as the camera is read. three.js defaults to XYZ, which pitches
+		  // about the *world* axis: a slab yawed east-west and then pitched for a hill
+		  // comes out rolled instead of tilted.
+		  made.rotation.order = "YXZ";
 		  // Composed when it moves and not otherwise: left alone, three.js recomposes a
 		  // matrix for every object on the stage every frame, and a circuit is thousands
 		  // of objects of which a handful ever move. put is the only other place a
@@ -9691,13 +9702,14 @@ func uiSceneJs(): Str {
 		  if (s.k === "sphere") { return new THREE.SphereGeometry(d[0], 18, 12); }
 		  if (s.k === "cylinder") { return new THREE.CylinderGeometry(d[0], d[0], d[1], 20); }
 		  if (s.k === "cone") { return new THREE.CylinderGeometry(d[0], d[1], d[2], 20); }
+		  if (s.k === "roof") { return gable(d[0], d[1], d[2]); }
 		  if (s.k === "ground") {
 		    var flat = new THREE.PlaneGeometry(d[0], d[1]);
 		    flat.rotateX(-Math.PI / 2);
 		    return flat;
 		  }
 		  var box = new THREE.BoxGeometry(d[0], d[1], d[2]);
-		  uvsPerFace(box, d);
+		  uvsPerFace(box, d, perTile(s));
 		  return box;
 		}
 
@@ -9841,6 +9853,7 @@ func uiSceneJs(): Str {
 		  if (s.s) { return s.s; }
 		  if (s.k === "ground") { return "Turf"; }
 		  if (s.k === "cylinder" || s.k === "cone") { return "Staves"; }
+		  if (s.k === "roof") { return "Planks"; }
 		  if (s.k === "sphere") { return "Speckle"; }
 		  return "Planks";
 		}
@@ -9886,13 +9899,25 @@ func uiSceneJs(): Str {
 		// carries its tiling in its own geometry instead. See uvsPerFace.
 		function tiling(s) {
 		  var d = s.d || [1, 1, 1];
+		  var per = perTile(s);
 		  if (s.k === "ground") { return [span(d[0], 3), span(d[1], 3)]; }
 		  if (s.k === "sphere") { return [2, 1]; }
-		  if (s.k === "cylinder") { return [span(d[0] * 6, 2), span(d[1], 2)]; }
+		  // Across the slope and down its length, the way a tile is laid.
+		  if (s.k === "roof") { return [span(d[0], per), span(d[2], per)]; }
+		  if (s.k === "cylinder") { return [span(d[0] * 6, per), span(d[1], per)]; }
 		  // A cone carries both its radii, so its girth is the second number and its
 		  // height the third. The wider end is what the grain is sized against.
-		  if (s.k === "cone") { return [span(Math.max(d[0], d[1]) * 6, 2), span(d[2], 2)]; }
+		  if (s.k === "cone") {
+		    return [span(Math.max(d[0], d[1]) * 6, per), span(d[2], per)];
+		  }
 		  return [1, 1];
+		}
+
+		// How many metres of a surface one tile stands for. Two is the size of the
+		// thing a material tile is a picture of; a window is not a material, and its
+		// spacing is a fact about the building — a bay, or a storey.
+		function perTile(s) {
+		  return s.s === "Panes" ? 2.9 : 2;
 		}
 
 		// Each face of a box tiled by its own two dimensions, written into the vertices
@@ -9906,7 +9931,7 @@ func uiSceneJs(): Str {
 		// A BoxGeometry lays its faces out +X, -X, +Y, -Y, +Z, -Z with four vertices
 		// each and UVs nought to one; multiplying them is the whole of it. Geometries
 		// are cached by their dimensions, so this happens once per size of box.
-		function uvsPerFace(geo, d) {
+		function uvsPerFace(geo, d, per) {
 		  var uv = geo.attributes.uv;
 		  if (!uv) { return; }
 		  var sides = [
@@ -9915,7 +9940,7 @@ func uiSceneJs(): Str {
 		    [d[0], d[1]], [d[0], d[1]]
 		  ];
 		  for (var f = 0; f < 6; f++) {
-		    var across = span(sides[f][0], 2), down = span(sides[f][1], 2);
+		    var across = span(sides[f][0], per), down = span(sides[f][1], per);
 		    for (var v = 0; v < 4; v++) {
 		      var at = f * 4 + v;
 		      uv.setXY(at, uv.getX(at) * across, uv.getY(at) * down);
@@ -9926,6 +9951,21 @@ func uiSceneJs(): Str {
 
 		function span(metres, per) {
 		  return Math.max(1, Math.round(metres / per));
+		}
+
+		// A three-sided cylinder, rather than a hand-written buffer of six vertices
+		// whose normals and windings all have to agree. Three segments puts one corner
+		// at +Z and an edge across the back; turned a quarter about X that corner is
+		// the ridge and the edge is the eaves.
+		function gable(wide, tall, long) {
+		  var g = new THREE.CylinderGeometry(1, 1, long, 3);
+		  g.rotateX(-Math.PI / 2);
+		  // Equilateral to the pitch asked for: the triangle is 2 x cos(30) across the
+		  // eaves and 1.5 from eaves to ridge, in units of the radius it was built at.
+		  // The shift then centres it, which is where at() promises the middle is.
+		  g.scale(wide / 1.7320508, tall / 1.5, 1);
+		  g.translate(0, 0 - tall / 6, 0);
+		  return g;
 		}
 
 		// The grain itself.
@@ -10221,6 +10261,7 @@ func uiSceneJs(): Str {
 		  else if (finish === "Kerb") { kerb(ctx, size); }
 		  else if (finish === "Concrete") { concrete(ctx, size); }
 		  else if (finish === "Brick") { brick(ctx, size); }
+		  else if (finish === "Panes") { panes(ctx, size); }
 		  else if (finish === "Staves") { staves(ctx, size); }
 		  else if (finish === "Bark") { bark(ctx, size); }
 		  else if (finish === "Leaves") { leaves(ctx, size); }
@@ -10453,6 +10494,35 @@ func uiSceneJs(): Str {
 		      ctx.stroke();
 		    }
 		  }
+		}
+
+		// Panes: one window in the middle of every couple of metres of wall.
+		//
+		// Its glass is a colour and not a shade, which is the one place this breaks the
+		// rule the other patterns keep — a pale window on a pale wall is no window at
+		// all. Crowd spends its colours the same way. The cost is that every building
+		// in a program wears the same glass.
+		function panes(ctx, size) {
+		  speckle(ctx, size, 60, 0.04);
+		  var wide = size * 0.46, high = size * 0.44;
+		  var left = (size - wide) / 2, top = size * 0.22;
+		  // The reveal, so the window sits in the wall. Rectangles rather than a shadow,
+		  // which does not survive being scaled to nine pixels.
+		  ctx.fillStyle = "rgba(0,0,0,0.34)";
+		  ctx.fillRect(left - 3, top - 3, wide + 6, high + 6);
+		  ctx.fillStyle = "#8fd6e8";
+		  ctx.fillRect(left, top, wide, high);
+		  // Sky in the top, room in the bottom.
+		  ctx.fillStyle = "rgba(255,255,255,0.34)";
+		  ctx.fillRect(left, top, wide, high * 0.44);
+		  ctx.fillStyle = "rgba(0,0,0,0.20)";
+		  ctx.fillRect(left, top + high * 0.72, wide, high * 0.28);
+		  // The glazing bar, which is what makes it a window rather than a tile, and the
+		  // sill under it.
+		  ctx.fillStyle = "rgba(0,0,0,0.38)";
+		  ctx.fillRect(left, top + high * 0.46, wide, Math.max(1, size * 0.012));
+		  ctx.fillStyle = "rgba(255,255,255,0.30)";
+		  ctx.fillRect(left - 4, top + high + 3, wide + 8, Math.max(1, size * 0.016));
 		}
 
 		// Bark: long vertical fissures of very different widths, and no repeat you can
