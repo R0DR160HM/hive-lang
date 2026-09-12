@@ -1,7 +1,7 @@
 # 14 — Standard library
 
 Each module owns its types under its own namespace — `hive.net.HttpRequest`,
-`hive.json.JsonError`, `hive.map.Map`, `hive.syslink.Address`. The only builtin
+`hive.codec.DecodingError`, `hive.map.Map`, `hive.syslink.Address`. The only builtin
 types that live directly on `hive` are the core ones the language uses without a
 module: `Result` and `Table`.
 
@@ -79,7 +79,7 @@ A dictionary: keys paired with values, looked up by key. Type-level rules are in
   fresh vectors.
 * **`==` compares the pairs** and ignores the order they were set in. There is no
   ordering *between* maps, so `sort` on a vector of them is a compile error.
-* **A map does not travel and does not encode.** `hive.json.encode` refuses one
+* **A map does not travel and does not encode.** `encode` refuses one
   and so does a `hive.syslink` mailbox: decoding here is by declared shape, while
   a map's keys are whatever was put in it. Send `toTable(m)` and rebuild it with
   `fromTable` on the other side.
@@ -136,11 +136,29 @@ Line-oriented terminal I/O.
   is put back before the call returns, and also if the program is interrupted at
   the prompt. Where there is no terminal at all, the line is read exactly as
   `read()` reads it and only the hiding of it is lost.
+* `writeSecret(path, contents)` → `Result<Int, hive.file.FileError>` is
+  `hive.file.write` ([14.4](#144-hivefile)) leaving the file readable by the user
+  running the program and nobody else: mode `0600` on Linux and macOS, and on
+  Windows an access list naming that one account, protected so the containing
+  folder hands nothing down. Who may read it is settled before any of the secret
+  is in it, and a file that was already there is narrowed rather than trusted. A
+  file owned by somebody else is an `Error` rather than a secret written in the
+  clear. This is what a password read with `readSecret` is stored behind, and it
+  answers with `hive.file`'s error because what failed is a file.
 * `args()` → `Str[dyn]`, the command-line arguments in order, excluding the
   program name.
 * `exit(code)` ends the program with a status. There is no value to answer with
   and nothing after it runs, which is what makes it a statement rather than a
   call.
+
+```hive
+if hive.term.writeSecret("./vault.dat", sealed) is Result.Error(why) {
+	echo "the vault was not saved: {why.message}"
+}
+```
+
+Permissions are all it is, so it is not encryption and never claims to be: an
+administrator, and `root`, can read any file on the machine.
 
 **Running another program.** Three calls. The difference between the first two is
 who is talking to the terminal; the third is the first with an environment.
@@ -236,20 +254,32 @@ widest row in their sheet.
 
 Built on the idea that Hive's type declarations *are* the JSON schema.
 
-* `T.fromJson(text)` is the decoder `T`'s declaration derives, named →
-  `Result<T, hive.json.JsonError>`. Missing fields, wrong types and wrong static
-  vector lengths become errors carrying the exact `path` that failed; JSON fields
-  the type doesn't declare are ignored. Variants decode as
-  `{"VariantName": {...}}`, and JSON `null` selects a type's first field-less
+* `codec()` → `hive.codec.Codec` is the value that says **read and write it as
+  JSON**, and it is the whole of what this module contributes to the two calls
+  below. A second format would add a `codec()` of its own and nothing else.
+* `T.decode(text, codec)` is the decoder `T`'s declaration derives, named →
+  `Result<T, hive.codec.DecodingError>`. Missing fields, wrong types and wrong
+  static vector lengths become errors carrying the exact `path` that failed;
+  fields the type doesn't declare are ignored. Variants decode as
+  `{"VariantName": {...}}`, and a `null` selects a type's first field-less
   variant.
-* `T.Variant.fromJson(text)` reads **one** variant's payload, without the key the
-  whole union is wrapped in — for a document whose variant the caller already
+* `T.Variant.decode(text, codec)` reads **one** variant's payload, without the key
+  the whole union is wrapped in — for a document whose variant the caller already
   knows. It answers with the union all the same, since a variant is not a type of
   its own.
-* `fromJson` is therefore a **reserved field name**: a type declaring one would
-  make `T.Variant.fromJson` mean two things at once.
-* `encode(value)` derives the encoder from the static type and therefore cannot
-  fail.
+* `decode` is therefore a **reserved field name**: a type declaring one would
+  make `T.Variant.decode` mean two things at once.
+
+Encoding is **not here** either: it derives from a declaration rather than being
+carried by any module, so it is the builtin `encode(value, codec)`
+([13](13-builtins.md)) and cannot fail. What the two halves share is the
+annotations below; what separates them is that a value already says what it is,
+while a `Str` arriving from outside does not — which is why one is a global name
+and the other is named on a type.
+
+**Neither says JSON.** `encode` and `decode` say *a* format, and the codec handed
+to them says which — so `hive.json` is a module like any other rather than
+something the language is built on.
 
 **A field's annotations are what steer both of them**
 ([04](04-declarations.md#annotations)). `-- JSON as <name>;` is the key the
@@ -265,11 +295,23 @@ type User {
 }
 ```
 
-Neither reaches `flatten(text)`, which flattens a document rather than decoding
-a declared shape.
-* `table(text)` reads a JSON array of flat objects as a headered `Table`.
-* `flatten(text)` flattens a whole document into `[path, value]` rows, looked up
-  with `get(table, "keys.layout")` and re-nested by the encoder.
+Neither reaches the two readers below, which read a document rather than decoding
+a declared shape — and which are what this module is left holding, being the
+calls that need no type at all.
+
+* `flatten(text)` takes **any** document and answers with a two-column `Table` of
+  `[path, value]`, one row per leaf, paths dotted and array elements indexed:
+  `{"keys":{"layout":"us"}}` becomes the row `["keys.layout", "us"]`. It is a
+  lookup structure for a document whose shape you do not want to declare.
+* `get(table, "keys.layout")` reads one path out of a flattened table.
+* `table(text)` is narrower and answers with a **headered** `Table` of the kind
+  `hive.file.csv` produces: the document must be an array of flat objects, row 0
+  is the keys of the first, and each later row is one object's values. An element
+  that is not a flat object, or one whose keys do not match the header, is an
+  error.
+
+So `flatten` reshapes anything into rows you look up by path, while `table` reads
+one particular shape — a list of records — as a spreadsheet.
 
 ## 14.8 `hive.crypto`
 
@@ -294,8 +336,9 @@ Pure, so it works in a `func` too. Fallible operations return
   algorithm confusion are rejected outright; `jwtDecode(token)` reads them
   **without verifying**, for inspection only; `jwtHeader(token)` reads
   `alg`/`typ`/`kid`. Reading a token stops at the claims: what shape they are is
-  the caller's business, so `T.fromJson(claims)` is what says so, and a bad
-  signature stays a `CryptoError` while wrong-shaped claims are a `JsonError`.
+  the caller's business, so `T.decode(claims, codec)` is what says so, and a bad
+  signature stays a `CryptoError` while wrong-shaped claims are a
+  `hive.codec.DecodingError`.
 
 ## 14.9 `hive.net`
 

@@ -69,6 +69,10 @@ func moduleText(module: Str): Str {
 	if module == "termsecret" { return termSecretSource() }
 	if module == "termsecretunix" { return termSecretUnixSource() }
 	if module == "termsecretwindows" { return termSecretWindowsSource() }
+	if module == "termwrite" { return termWriteSecretSource() }
+	if module == "termwriteunix" { return termWriteSecretUnixSource() }
+	if module == "termwritewindows" { return termWriteSecretWindowsSource() }
+	if module == "codec" { return codecSource() }
 	if module == "file" { return fileSource() }
 	if module == "env" { return envSource() }
 	if module == "time" { return timeSource() }
@@ -96,10 +100,21 @@ func requires(module: Str): Str[dyn] {
 	if module == "crypto" {
 		return ["json", "time"]
 	}
+	// A format is written against the vocabulary `encode` and `decode` share,
+	// which is its own file so that a second format would add one rather than
+	// reach into the first.
+	if module == "json" {
+		return ["codec"]
+	}
 	// Turning a terminal's echo off is two files, one per platform, and the tag
 	// at the top of each leaves the other out of the build.
 	if module == "termsecret" {
 		return ["term", "termsecretunix", "termsecretwindows"]
+	}
+	// Writing one is the same shape: a file per platform, and `hive.file` for the
+	// error it answers with.
+	if module == "termwrite" {
+		return ["term", "file", "termwriteunix", "termwritewindows"]
 	}
 	// A message crosses a machine boundary through the same derived codecs
 	// `hive.json` builds from a declaration, and the wire that carries it is its
@@ -1302,6 +1317,34 @@ func termSource(): Str {
 	`
 }
 
+// The Go for `hive.codec`: what `encode` and `T.decode` traffic in, and nothing
+// about any one format. A `Codec` holds nothing because it decides nothing at run
+// time — which format it is was settled where it was named.
+func codecSource(): Str {
+	return `
+		package hive
+
+		// CodecCodec says which format to read and write. It is empty on purpose:
+		// the call it is handed to reads the format off the name in the source, so
+		// there is nothing left for the value to carry.
+		type CodecCodec struct{}
+
+		// CodecDecodingError describes why a document didn't hold what was asked
+		// of it: the exact path that failed, what was expected there, and what was
+		// actually found. No format is named, because all three questions are the
+		// same whatever wrote it.
+		type CodecDecodingError struct {
+			Path     string
+			Expected string
+			Found    string
+		}
+
+		func (e CodecDecodingError) Error() string {
+			return "hive: cannot decode at " + e.Path + ": expected " + e.Expected + ", found " + e.Found
+		}
+	`
+}
+
 func fileSource(): Str {
 	return `
 		package hive
@@ -1614,18 +1657,10 @@ func jsonSource(): Str {
 			"strings"
 		)
 
-		// JsonJsonError describes why a JSON document didn't match the expected type:
-		// the exact path that failed, what the type expected there, and what the
-		// document actually held.
-		type JsonJsonError struct {
-			Path     string
-			Expected string
-			Found    string
-		}
-
-		func (e JsonJsonError) Error() string {
-			return "hive: json error at " + e.Path + ": expected " + e.Expected + ", found " + e.Found
-		}
+		// JsonCodec is the value that says read and write it as JSON. Encoding and
+		// decoding read the format off the name in the source rather than off this,
+		// so what comes back is only ever passed around or ignored.
+		func JsonCodec() CodecCodec { return CodecCodec{} }
 
 		// JsonValue is an order-preserving parsed JSON document.
 		type JsonValue struct {
@@ -1710,56 +1745,56 @@ func jsonSource(): Str {
 			return "an object"
 		}
 
-		// JsonParse backs every fromJson and hive.json.flatten; the decoder
+		// JsonParse backs every decode and hive.json.flatten; the decoder
 		// argument is what the call named, derived at compile time.
-		func JsonParse[T any](text string, dec func(JsonValue, string) (T, *JsonJsonError)) Result[T, JsonJsonError] {
+		func JsonParse[T any](text string, dec func(JsonValue, string) (T, *CodecDecodingError)) Result[T, CodecDecodingError] {
 			d := json.NewDecoder(strings.NewReader(text))
 			d.UseNumber()
 			v, err := parseJsonValue(d)
 			if err != nil {
-				return Err[T, JsonJsonError](JsonJsonError{Path: "$", Expected: "valid JSON", Found: err.Error()})
+				return Err[T, CodecDecodingError](CodecDecodingError{Path: "$", Expected: "valid JSON", Found: err.Error()})
 			}
 			out, jerr := dec(v, "$")
 			if jerr != nil {
-				return Err[T, JsonJsonError](*jerr)
+				return Err[T, CodecDecodingError](*jerr)
 			}
-			return Ok[T, JsonJsonError](out)
+			return Ok[T, CodecDecodingError](out)
 		}
 
-		func JsonStr(v JsonValue, path string) (string, *JsonJsonError) {
+		func JsonStr(v JsonValue, path string) (string, *CodecDecodingError) {
 			if v.Kind == 's' {
 				return v.Str, nil
 			}
-			return "", &JsonJsonError{Path: path, Expected: "Str", Found: jsonKindName(v)}
+			return "", &CodecDecodingError{Path: path, Expected: "Str", Found: jsonKindName(v)}
 		}
 
-		func JsonInt(v JsonValue, path string) (int, *JsonJsonError) {
+		func JsonInt(v JsonValue, path string) (int, *CodecDecodingError) {
 			if v.Kind == '#' {
 				if i, err := strconv.Atoi(v.Num); err == nil {
 					return i, nil
 				}
 			}
-			return 0, &JsonJsonError{Path: path, Expected: "Int", Found: jsonKindName(v)}
+			return 0, &CodecDecodingError{Path: path, Expected: "Int", Found: jsonKindName(v)}
 		}
 
-		func JsonFloat(v JsonValue, path string) (float64, *JsonJsonError) {
+		func JsonFloat(v JsonValue, path string) (float64, *CodecDecodingError) {
 			if v.Kind == '#' {
 				if f, err := strconv.ParseFloat(v.Num, 64); err == nil {
 					return f, nil
 				}
 			}
-			return 0, &JsonJsonError{Path: path, Expected: "Float", Found: jsonKindName(v)}
+			return 0, &CodecDecodingError{Path: path, Expected: "Float", Found: jsonKindName(v)}
 		}
 
-		func JsonBool(v JsonValue, path string) (bool, *JsonJsonError) {
+		func JsonBool(v JsonValue, path string) (bool, *CodecDecodingError) {
 			if v.Kind == 'b' {
 				return v.Bool, nil
 			}
-			return false, &JsonJsonError{Path: path, Expected: "Bool", Found: jsonKindName(v)}
+			return false, &CodecDecodingError{Path: path, Expected: "Bool", Found: jsonKindName(v)}
 		}
 
 		// JsonAtom decodes a JSON string holding an atom's visual form.
-		func JsonAtom(v JsonValue, path string) (Atom, *JsonJsonError) {
+		func JsonAtom(v JsonValue, path string) (Atom, *CodecDecodingError) {
 			if v.Kind == 's' {
 				for i, name := range atomNames {
 					if name == v.Str {
@@ -1767,23 +1802,23 @@ func jsonSource(): Str {
 					}
 				}
 			}
-			return 0, &JsonJsonError{Path: path, Expected: "a known atom", Found: jsonKindName(v)}
+			return 0, &CodecDecodingError{Path: path, Expected: "a known atom", Found: jsonKindName(v)}
 		}
 
-		func JsonObject(v JsonValue, path string) ([]JsonMember, *JsonJsonError) {
+		func JsonObject(v JsonValue, path string) ([]JsonMember, *CodecDecodingError) {
 			if v.Kind == 'o' {
 				return v.Obj, nil
 			}
-			return nil, &JsonJsonError{Path: path, Expected: "an object", Found: jsonKindName(v)}
+			return nil, &CodecDecodingError{Path: path, Expected: "an object", Found: jsonKindName(v)}
 		}
 
-		func JsonField(obj []JsonMember, key string, path string) (JsonValue, *JsonJsonError) {
+		func JsonField(obj []JsonMember, key string, path string) (JsonValue, *CodecDecodingError) {
 			for _, m := range obj {
 				if m.Key == key {
 					return m.Value, nil
 				}
 			}
-			return JsonValue{}, &JsonJsonError{Path: path + "." + key, Expected: "a value", Found: "nothing"}
+			return JsonValue{}, &CodecDecodingError{Path: path + "." + key, Expected: "a value", Found: "nothing"}
 		}
 
 		// JsonLook is JsonField for a field with somewhere to fall back to: a key
@@ -1799,16 +1834,16 @@ func jsonSource(): Str {
 
 		// JsonVariant unwraps the {"VariantName": {...}} encoding of tagged
 		// unions.
-		func JsonVariant(v JsonValue, path string) (string, JsonValue, *JsonJsonError) {
+		func JsonVariant(v JsonValue, path string) (string, JsonValue, *CodecDecodingError) {
 			if v.Kind == 'o' && len(v.Obj) == 1 {
 				return v.Obj[0].Key, v.Obj[0].Value, nil
 			}
-			return "", JsonValue{}, &JsonJsonError{Path: path, Expected: "an object with a single variant key", Found: jsonKindName(v)}
+			return "", JsonValue{}, &CodecDecodingError{Path: path, Expected: "an object with a single variant key", Found: jsonKindName(v)}
 		}
 
-		func JsonVec[T any](v JsonValue, path string, elem func(JsonValue, string) (T, *JsonJsonError)) ([]T, *JsonJsonError) {
+		func JsonVec[T any](v JsonValue, path string, elem func(JsonValue, string) (T, *CodecDecodingError)) ([]T, *CodecDecodingError) {
 			if v.Kind != 'a' {
-				return nil, &JsonJsonError{Path: path, Expected: "a vector", Found: jsonKindName(v)}
+				return nil, &CodecDecodingError{Path: path, Expected: "a vector", Found: jsonKindName(v)}
 			}
 			out := make([]T, 0, len(v.Arr))
 			for i, item := range v.Arr {
@@ -1822,16 +1857,16 @@ func jsonSource(): Str {
 		}
 
 		// JsonVecN also enforces the static length of e.g. Str[3].
-		func JsonVecN[T any](v JsonValue, path string, n int, elem func(JsonValue, string) (T, *JsonJsonError)) ([]T, *JsonJsonError) {
+		func JsonVecN[T any](v JsonValue, path string, n int, elem func(JsonValue, string) (T, *CodecDecodingError)) ([]T, *CodecDecodingError) {
 			if v.Kind != 'a' || len(v.Arr) != n {
-				return nil, &JsonJsonError{Path: path, Expected: "a vector of length " + strconv.Itoa(n), Found: jsonKindName(v)}
+				return nil, &CodecDecodingError{Path: path, Expected: "a vector of length " + strconv.Itoa(n), Found: jsonKindName(v)}
 			}
 			return JsonVec(v, path, elem)
 		}
 
 		// JsonFlatten turns any JSON subtree into a Table of [path, value] rows —
 		// the type-safe holder for JSON that isn't modelled statically.
-		func JsonFlatten(v JsonValue, path string) (Table, *JsonJsonError) {
+		func JsonFlatten(v JsonValue, path string) (Table, *CodecDecodingError) {
 			table := Table{}
 			flattenJson(v, "", &table)
 			return table, nil
@@ -1869,33 +1904,33 @@ func jsonSource(): Str {
 		}
 
 		// JsonGet looks a path up in a flattened Table.
-		func JsonGet(t Table, path string) Result[string, JsonJsonError] {
+		func JsonGet(t Table, path string) Result[string, CodecDecodingError] {
 			for _, row := range t {
 				if len(row) >= 2 && row[0] == path {
-					return Ok[string, JsonJsonError](row[1])
+					return Ok[string, CodecDecodingError](row[1])
 				}
 			}
-			return Err[string, JsonJsonError](JsonJsonError{Path: path, Expected: "a value", Found: "nothing"})
+			return Err[string, CodecDecodingError](CodecDecodingError{Path: path, Expected: "a value", Found: "nothing"})
 		}
 
 		// JsonTable reads a JSON array of flat objects as a headered Table (the same
 		// shape a CSV read produces). Every object must carry the same keys
 		// as the first one, and every value must be a leaf.
-		func JsonTable(text string) Result[Table, JsonJsonError] {
+		func JsonTable(text string) Result[Table, CodecDecodingError] {
 			d := json.NewDecoder(strings.NewReader(text))
 			d.UseNumber()
 			v, err := parseJsonValue(d)
 			if err != nil {
-				return Err[Table, JsonJsonError](JsonJsonError{Path: "$", Expected: "valid JSON", Found: err.Error()})
+				return Err[Table, CodecDecodingError](CodecDecodingError{Path: "$", Expected: "valid JSON", Found: err.Error()})
 			}
 			if v.Kind != 'a' {
-				return Err[Table, JsonJsonError](JsonJsonError{Path: "$", Expected: "an array of objects", Found: jsonKindName(v)})
+				return Err[Table, CodecDecodingError](CodecDecodingError{Path: "$", Expected: "an array of objects", Found: jsonKindName(v)})
 			}
 			table := Table{}
 			for i, item := range v.Arr {
 				path := "$[" + strconv.Itoa(i) + "]"
 				if item.Kind != 'o' {
-					return Err[Table, JsonJsonError](JsonJsonError{Path: path, Expected: "a flat object", Found: jsonKindName(item)})
+					return Err[Table, CodecDecodingError](CodecDecodingError{Path: path, Expected: "a flat object", Found: jsonKindName(item)})
 				}
 				if i == 0 {
 					header := []string{}
@@ -1906,22 +1941,22 @@ func jsonSource(): Str {
 				}
 				header := table[0]
 				if len(item.Obj) != len(header) {
-					return Err[Table, JsonJsonError](JsonJsonError{Path: path, Expected: "an object with keys " + strings.Join(header, ", "), Found: "an object with " + strconv.Itoa(len(item.Obj)) + " keys"})
+					return Err[Table, CodecDecodingError](CodecDecodingError{Path: path, Expected: "an object with keys " + strings.Join(header, ", "), Found: "an object with " + strconv.Itoa(len(item.Obj)) + " keys"})
 				}
 				row := []string{}
 				for _, key := range header {
 					cell, jerr := JsonField(item.Obj, key, path)
 					if jerr != nil {
-						return Err[Table, JsonJsonError](*jerr)
+						return Err[Table, CodecDecodingError](*jerr)
 					}
 					if cell.Kind == 'a' || cell.Kind == 'o' {
-						return Err[Table, JsonJsonError](JsonJsonError{Path: path + "." + key, Expected: "a leaf value", Found: jsonKindName(cell)})
+						return Err[Table, CodecDecodingError](CodecDecodingError{Path: path + "." + key, Expected: "a leaf value", Found: jsonKindName(cell)})
 					}
 					row = append(row, jsonLeafStr(cell))
 				}
 				table = append(table, row)
 			}
-			return Ok[Table, JsonJsonError](table)
+			return Ok[Table, CodecDecodingError](table)
 		}
 
 		func JsonEncodeStr(s string) string {
@@ -4243,7 +4278,7 @@ func syslinkSource(): Str {
 		// SyslinkDecoder adapts a derived decoder into the erased form a mailbox holds.
 		// A mailbox is typed by its handler rather than by its decoder, so the decoder
 		// only has to produce the right dynamic type for that handler to accept.
-		func SyslinkDecoder[T any](dec func(JsonValue, string) (T, *JsonJsonError)) func([]byte) (any, error) {
+		func SyslinkDecoder[T any](dec func(JsonValue, string) (T, *CodecDecodingError)) func([]byte) (any, error) {
 			return func(b []byte) (any, error) {
 				r := JsonParse(string(b), dec)
 				if r.IsError() {
@@ -4255,7 +4290,7 @@ func syslinkSource(): Str {
 
 		// SyslinkReplyDecoder is the same adapter for the answer to a call, which stays
 		// typed because the call site said what it expected back.
-		func SyslinkReplyDecoder[T any](dec func(JsonValue, string) (T, *JsonJsonError)) func([]byte) (T, error) {
+		func SyslinkReplyDecoder[T any](dec func(JsonValue, string) (T, *CodecDecodingError)) func([]byte) (T, error) {
 			return func(b []byte) (T, error) {
 				r := JsonParse(string(b), dec)
 				if r.IsError() {
@@ -4285,14 +4320,14 @@ func syslinkSource(): Str {
 			return JsonEncodeStr(where + "|" + name + "|" + strconv.FormatUint(a.Id, 10))
 		}
 
-		func JsonAddress(v JsonValue, path string) (SyslinkAddress, *JsonJsonError) {
+		func JsonAddress(v JsonValue, path string) (SyslinkAddress, *CodecDecodingError) {
 			text, jerr := JsonStr(v, path)
 			if jerr != nil {
 				return SyslinkAddress{}, jerr
 			}
 			parts := strings.Split(text, "|")
 			if len(parts) != 3 {
-				return SyslinkAddress{}, &JsonJsonError{Path: path, Expected: "a syslink address", Found: JsonEncodeStr(text)}
+				return SyslinkAddress{}, &CodecDecodingError{Path: path, Expected: "a syslink address", Found: JsonEncodeStr(text)}
 			}
 			addr := SyslinkAddress{Endpoint: parts[0], Name: atomNone}
 			if parts[1] != "" {
@@ -4309,7 +4344,7 @@ func syslinkSource(): Str {
 			return addr, nil
 		}
 
-		func jsonWhy(e JsonJsonError) string {
+		func jsonWhy(e CodecDecodingError) string {
 			where := e.Path
 			if where == "" {
 				where = "the message"
@@ -11779,6 +11814,240 @@ func termSecretWindowsSource(): Str {
 		func setConsoleMode(console syscall.Handle, mode uint32) bool {
 			done, _, _ := procSetConsoleMode.Call(uintptr(console), uintptr(mode))
 			return done != 0
+		}
+	`
+}
+
+
+// The Go for `hive.term.writeSecret`: `hive.file.write` with the file left
+// readable by this user alone. What only-this-user means is the one thing that
+// differs between platforms, so the opening of the file is a file per platform
+// and everything after it is shared.
+func termWriteSecretSource(): Str {
+	return `
+		package hive
+
+		import "os"
+
+		// TermWriteSecret replaces a file with contents, creating it when absent, and
+		// leaves it readable by this user alone. Backs hive.term.writeSecret.
+		//
+		// Who may read it is settled before any of the secret is in it, and a file that
+		// was already there is narrowed rather than trusted: the permissions it happened
+		// to carry are no claim about who should see what is going into it now.
+		func TermWriteSecret(path, contents string) Result[int, FileFileError] {
+			f, err := openPrivate(path)
+			if err != nil {
+				return Err[int, FileFileError](fileError(path, err))
+			}
+			written, err := replaceContents(f, contents)
+			if closed := f.Close(); err == nil {
+				err = closed
+			}
+			if err != nil {
+				return Err[int, FileFileError](fileError(path, err))
+			}
+			return Ok[int, FileFileError](written)
+		}
+
+		// Emptying first is what makes this a replacement: without it a shorter secret
+		// would leave the tail of the longer one it replaced.
+		func replaceContents(f *os.File, contents string) (int, error) {
+			if err := f.Truncate(0); err != nil {
+				return 0, err
+			}
+			return f.WriteString(contents)
+		}
+	`
+}
+
+
+// Permissions on a unix: the mode, which is the whole of it.
+func termWriteSecretUnixSource(): Str {
+	return `
+		//go:build !windows
+
+		package hive
+
+		import "os"
+
+		// What a secret is written with: this user reads and writes it, everybody else
+		// has no access at all.
+		const secretMode = 0o600
+
+		// openPrivate opens path for writing, creating it when absent, with nobody but
+		// this user allowed near it.
+		//
+		// The chmod is for a file that was already there — a mode handed to OpenFile
+		// applies only to one it creates. A umask cannot widen either: it only ever
+		// clears further bits.
+		func openPrivate(path string) (*os.File, error) {
+			f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, secretMode)
+			if err != nil {
+				return nil, err
+			}
+			if err := f.Chmod(secretMode); err != nil {
+				f.Close()
+				return nil, err
+			}
+			return f, nil
+		}
+	`
+}
+
+
+// The same on Windows, where it is an access list rather than a mode: the one
+// file right granted to the one SID this process is running as.
+func termWriteSecretWindowsSource(): Str {
+	return `
+		//go:build windows
+
+		package hive
+
+		import (
+			"os"
+			"syscall"
+			"unsafe"
+		)
+
+		// The access list a secret is written under, as SDDL, waiting for the user's own
+		// SID. FA is every right a file has; P protects the list from inheritance,
+		// without which whatever the containing folder hands down is added to it.
+		const secretDacl = "D:P(A;;FA;;;"
+
+		const (
+			// The right to set that list on a file that already existed.
+			writeDac = 0x00040000
+			// Which part of a descriptor is being set, and that it stops inheriting.
+			daclSecurity  = 0x00000004
+			protectedDacl = 0x80000000
+			// A file, and the one revision SDDL has.
+			seFileObject  = 1
+			sddlRevision1 = 1
+		)
+
+		var (
+			advapi32               = syscall.NewLazyDLL("advapi32.dll")
+			procDescriptorFromSddl = advapi32.NewProc("ConvertStringSecurityDescriptorToSecurityDescriptorW")
+			procDescriptorDacl     = advapi32.NewProc("GetSecurityDescriptorDacl")
+			procSetSecurityInfo    = advapi32.NewProc("SetSecurityInfo")
+		)
+
+		// openPrivate opens path for writing, creating it when absent, with nobody but
+		// this user allowed near it. Windows has no mode bits worth the name — a chmod
+		// moves the read-only flag and nothing else — so the access list is written out
+		// in full.
+		func openPrivate(path string) (*os.File, error) {
+			descriptor, err := privateDescriptor()
+			if err != nil {
+				return nil, err
+			}
+			defer syscall.LocalFree(syscall.Handle(descriptor))
+			f, err := createPrivate(path, descriptor)
+			if err != nil {
+				return nil, err
+			}
+			// A descriptor handed to CreateFile is used only for a file it creates, so a
+			// file that was already there is narrowed here instead.
+			if err := narrowToOwner(f, descriptor); err != nil {
+				f.Close()
+				return nil, err
+			}
+			return f, nil
+		}
+
+		// privateDescriptor is a security descriptor granting this user everything and
+		// everybody else nothing. The caller frees it with LocalFree.
+		func privateDescriptor() (uintptr, error) {
+			sid, err := currentUserSid()
+			if err != nil {
+				return 0, err
+			}
+			sddl, err := syscall.UTF16PtrFromString(secretDacl + sid + ")")
+			if err != nil {
+				return 0, err
+			}
+			var descriptor uintptr
+			done, _, err := procDescriptorFromSddl.Call(
+				uintptr(unsafe.Pointer(sddl)),
+				sddlRevision1,
+				uintptr(unsafe.Pointer(&descriptor)),
+				0,
+			)
+			if done == 0 {
+				return 0, err
+			}
+			return descriptor, nil
+		}
+
+		// currentUserSid is who this process is running as, spelled as an access list
+		// names a user.
+		func currentUserSid() (string, error) {
+			token, err := syscall.OpenCurrentProcessToken()
+			if err != nil {
+				return "", err
+			}
+			defer token.Close()
+			user, err := token.GetTokenUser()
+			if err != nil {
+				return "", err
+			}
+			return user.User.Sid.String()
+		}
+
+		// createPrivate opens the file, creating it with the list already on it and
+		// asking for the right to set that list on one that was already there. A file
+		// owned by somebody else fails here rather than being written in the clear.
+		func createPrivate(path string, descriptor uintptr) (*os.File, error) {
+			name, err := syscall.UTF16PtrFromString(path)
+			if err != nil {
+				return nil, err
+			}
+			security := syscall.SecurityAttributes{SecurityDescriptor: descriptor}
+			security.Length = uint32(unsafe.Sizeof(security))
+			handle, err := syscall.CreateFile(
+				name,
+				syscall.GENERIC_WRITE|writeDac,
+				0,
+				&security,
+				syscall.OPEN_ALWAYS,
+				syscall.FILE_ATTRIBUTE_NORMAL,
+				0,
+			)
+			if err != nil {
+				return nil, err
+			}
+			return os.NewFile(uintptr(handle), path), nil
+		}
+
+		// narrowToOwner puts the descriptor's access list on an open file.
+		func narrowToOwner(f *os.File, descriptor uintptr) error {
+			var present, defaulted int32
+			var dacl uintptr
+			done, _, err := procDescriptorDacl.Call(
+				descriptor,
+				uintptr(unsafe.Pointer(&present)),
+				uintptr(unsafe.Pointer(&dacl)),
+				uintptr(unsafe.Pointer(&defaulted)),
+			)
+			if done == 0 {
+				return err
+			}
+			// SetSecurityInfo answers with an error code rather than a flag, and zero is
+			// the one that means it worked.
+			code, _, _ := procSetSecurityInfo.Call(
+				f.Fd(),
+				seFileObject,
+				daclSecurity|protectedDacl,
+				0,
+				0,
+				dacl,
+				0,
+			)
+			if code != 0 {
+				return syscall.Errno(code)
+			}
+			return nil
 		}
 	`
 }

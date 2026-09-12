@@ -26,6 +26,7 @@ type.
 | `filterMap(values, transform)` | `filterMap(T[], func(T): Result<K, E>): K[dyn]` | transform and select in one pass |
 | `sort(values)` | `sort(T[]): T[dyn]` | in the element type's own order |
 | `sort(values, first)` | `sort(T[], func(T, T): Bool): T[dyn]` | in the order `first` gives |
+| `encode(value, codec)` | `encode(T, hive.codec.Codec): Str` | `value` written in the format `codec` names |
 
 `len` and `bytes` differ only for strings: for `"café"`, `len` is `4` (runes)
 while `bytes` is `5`.
@@ -39,6 +40,25 @@ than a pattern — to rewrite by shape, match with a
 [string pattern](07-patterns.md#74-string-patterns) and build the answer from
 what its holes bound. Neither is an error when `from` is not there; the string
 comes back as it was.
+
+`encode` is here for the reason the rest are: a builtin is what operates on the
+types the language hands out without an import, and a document is a `Str`. It is
+also the **only builtin with no runtime function behind it** — the encoder is
+written out of the argument's static type at the call site, which is what makes
+it total and what keeps it free of reflection.
+
+**The codec has to be named at the call**: `encode(user, hive.json.codec())` is
+the encoder for `User` in JSON, written there. A codec reached through a variable
+is a compile error, because by then there is nothing left to write the encoder
+from. This is the bargain `hive.file.csv` and `hive.sql.run` already strike — the
+reader is named in the source rather than sniffed at run time — and it is what
+lets a second format be a second module rather than a change to the language.
+
+Its other half is `T.decode(text, codec)`, named on the type because a `Str`
+arriving from outside cannot say what it should become
+([14.7](14-stdlib.md#147-hivejson)). What a format cannot carry — a
+`hive.map.Map`, whose keys are whatever was put in it — is refused where the
+encoder is derived.
 
 ## A declaration of your own wins
 

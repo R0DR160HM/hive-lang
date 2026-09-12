@@ -46,8 +46,9 @@ file, plus a generated `hive` runtime package.
 | `f` (bare reference) / `f(a, _, c)` | the function value / a closure whose parameter is the hole |
 | `func f(v: T[]): T` at `T = Str` | `func f_Str(v []string) string` — one copy per instantiation |
 | `hive.file.csv(p, s)` / `hive.sql.run(conn, q(..))` / `hive.sql.raw(conn, t)` | `hive.ReadCsv(..)` / `hive.SqlRows(..)` / `hive.SqlQuery(..)`, each → a `Result` |
-| a `hive.*` library call | a call of the same name on the generated `hive` runtime package (`hive.json.encode` → `hive.JsonEncode`) |
-| `T.fromJson(t)` / `T.Variant.fromJson(t)` | `hive.JsonParse(t, jsonDecode_T)` / `hive.JsonParse(t, jsonDecode_T_Variant)` |
+| a `hive.*` library call | a call of the same name on the generated `hive` runtime package (`hive.json.flatten` → `hive.JsonFlatten`) |
+| `T.decode(t, c)` / `T.Variant.decode(t, c)` | `hive.JsonParse(t, jsonDecode_T)` / `hive.JsonParse(t, jsonDecode_T_Variant)` — `c` names the format and is not itself evaluated |
+| `encode(v, c)` | `jsonEncode_T(v)` for a declared `T`, else the encoder for the scalar, vector or `Table` it is — written at the call site from the format `c` names, never a runtime call |
 | `import hive.ui as ui`, then `ui.row(..)` | nothing — the alias is resolved during flattening, so the emitter only ever sees `hive.ui.row` |
 | `hive.map.Map<Str, Int>` | `hive.Dict[string, int]` — a key order beside a Go map |
 | `import ./util.go`, then `util.slugify(s)` | the file compiled as its own package, plus a wrapper `func util_0_slugify(s string) string { return ffi_util_1.Slugify(s) }`, with a copy around every value that owns storage |

@@ -128,7 +128,7 @@ test "`!` is Go's own, parenthesised" {
 }
 
 test "an annotation decides the key the codecs read and write" {
-	got := go("type User \{ name: Str -- JSON as username; }" + newline() + "proc main(): void \{ echo hive.json.encode(User(\"a\")) }")
+	got := go("type User \{ name: Str -- JSON as username; }" + newline() + "proc main(): void \{ echo encode(User(\"a\"), hive.json.codec()) }")
 	// One name in the encoder, the same one in the decoder, and the Hive field
 	// keeps its own spelling in the struct.
 	assert has(got, "\\\"username\\\":")
@@ -136,7 +136,7 @@ test "an annotation decides the key the codecs read and write" {
 }
 
 test "a Default is written into the decoder, and asks rather than insists" {
-	got := go("type User \{ name: Str -- Default as \"nobody\"; }" + newline() + "proc main(): void \{ if User.fromJson(\"\") is Result.Ok(u) \{ echo u.name } }")
+	got := go("type User \{ name: Str -- Default as \"nobody\"; }" + newline() + "proc main(): void \{ if User.decode(\"\", hive.json.codec()) is Result.Ok(u) \{ echo u.name } }")
 	// The literal is the field's starting value and the lookup may leave it
 	// alone, so a key that is not there costs no error.
 	assert has(got, "hive.JsonLook(obj,")
@@ -146,7 +146,7 @@ test "a Default is written into the decoder, and asks rather than insists" {
 }
 
 test "a field with no Default still goes through the lookup that errors" {
-	got := go("type User \{ name: Str }" + newline() + "proc main(): void \{ if User.fromJson(\"\") is Result.Ok(u) \{ echo u.name } }")
+	got := go("type User \{ name: Str }" + newline() + "proc main(): void \{ if User.decode(\"\", hive.json.codec()) is Result.Ok(u) \{ echo u.name } }")
 	assert has(got, "hive.JsonField(obj,")
 	assert has(got, "hive.JsonLook(obj,") == false
 }
@@ -394,6 +394,17 @@ test "only the modules a program referenced are asked for" {
 	assert len(quiet.modules) == 0
 }
 
+test "writing a secret asks for a file per platform, and for the error it answers with" {
+	p := loader.loadText("main.hive", "proc main(): void \{ echo hive.term.writeSecret(\"k\", \"s\") }")
+	out := emit.emitModule(p.module)
+	assert join(out.modules, ",") == "term,termwrite,file,termwriteunix,termwritewindows"
+	assert has(out.source, "hive.TermWriteSecret(\"k\", \"s\")")
+
+	// A program that only reads one carries none of those.
+	reads := loader.loadText("main.hive", "proc main(): void \{ echo hive.term.readSecret() }")
+	assert join(emit.emitModule(reads.module).modules, ",") == "term,termsecret,termsecretunix,termsecretwindows"
+}
+
 test "len is three builtins, told apart by what it was given" {
 	assert has(stmt("Str[dyn] v = []  echo len(v)"), "len(v)")
 	assert has(stmt("s := \"a\"  echo len(s)"), "hive.LenStr(s)")
@@ -445,7 +456,7 @@ test "what a query declared its rows to be decides how it is run" {
 // --- JSON --------------------------------------------------------------------
 
 test "a codec is derived from the declaration, and named for the type" {
-	got := go("type User \{ id: Int\n name: Str }\nproc main(): void \{ echo hive.json.encode(User(1, \"ada\")) }")
+	got := go("type User \{ id: Int\n name: Str }\nproc main(): void \{ echo encode(User(1, \"ada\"), hive.json.codec()) }")
 	assert has(got, "func jsonEncode_User(x User) string \{")
 	// The field names are the ones that were *written*, not Go's exported ones.
 	assert has(got, "\"\\\"id\\\":\"")
@@ -454,8 +465,8 @@ test "a codec is derived from the declaration, and named for the type" {
 }
 
 test "a variant encodes under its own name, and decodes by it" {
-	got := go("type Shape \{ Circle \{ radius: Int }\n Point }\nproc main(): void \{ echo hive.json.encode(Shape.Circle(1))  if Shape.fromJson(\"null\") is Result.Ok(s) \{ echo s } }")
-	assert has(got, "func jsonDecode_Shape(v hive.JsonValue, path string) (Shape, *hive.JsonJsonError) \{")
+	got := go("type Shape \{ Circle \{ radius: Int }\n Point }\nproc main(): void \{ echo encode(Shape.Circle(1), hive.json.codec())  if Shape.decode(\"null\", hive.json.codec()) is Result.Ok(s) \{ echo s } }")
+	assert has(got, "func jsonDecode_Shape(v hive.JsonValue, path string) (Shape, *hive.CodecDecodingError) \{")
 	assert has(got, "hive.JsonVariant(v, path)")
 	assert has(got, "hive.JsonParse(")
 	// A JSON null selects the first field-less variant there is.
@@ -463,23 +474,23 @@ test "a variant encodes under its own name, and decodes by it" {
 }
 
 test "a variant names a decoder of its own, beside the union's" {
-	src := "type Sig \{ Ping\n Move \{ x: Int, y: Int } }\nproc main(): void \{ if Sig.Move.fromJson(\"x\") is Result.Ok(s) \{ echo s } }"
+	src := "type Sig \{ Ping\n Move \{ x: Int, y: Int } }\nproc main(): void \{ if Sig.Move.decode(\"x\", hive.json.codec()) is Result.Ok(s) \{ echo s } }"
 	got := go(src)
 	// The payload alone, so no variant key is read on the way in.
-	assert has(got, "func jsonDecode_Sig_Move(v hive.JsonValue, path string) (Sig, *hive.JsonJsonError) \{")
+	assert has(got, "func jsonDecode_Sig_Move(v hive.JsonValue, path string) (Sig, *hive.CodecDecodingError) \{")
 	assert has(got, "hive.JsonParse(\"x\", jsonDecode_Sig_Move)")
 	assert has(got, "return SigMove\{")
 }
 
 test "a variant decoder is written only where one is asked for" {
 	// The union alone: nothing names a variant, so no per-variant decoder exists.
-	got := go("type Sig \{ Ping\n Move \{ x: Int, y: Int } }\nproc main(): void \{ if Sig.fromJson(\"x\") is Result.Ok(s) \{ echo s } }")
+	got := go("type Sig \{ Ping\n Move \{ x: Int, y: Int } }\nproc main(): void \{ if Sig.decode(\"x\", hive.json.codec()) is Result.Ok(s) \{ echo s } }")
 	assert has(got, "func jsonDecode_Sig(") == true
 	assert has(got, "jsonDecode_Sig_Move") == false
 }
 
 test "a shared field reaches a variant's own decoder too" {
-	got := go("type Sig \{ Move \{ x: Int }\n at: Int }\nproc main(): void \{ if Sig.Move.fromJson(\"x\") is Result.Ok(s) \{ echo s } }")
+	got := go("type Sig \{ Move \{ x: Int }\n at: Int }\nproc main(): void \{ if Sig.Move.decode(\"x\", hive.json.codec()) is Result.Ok(s) \{ echo s } }")
 	assert has(got, "func jsonDecode_Sig_Move(")
 	assert has(got, "\"x\"")
 	assert has(got, "\"at\"")

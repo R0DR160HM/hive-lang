@@ -239,8 +239,8 @@ call or an await-all. It turns the result into
 `timeout` is **not** a reserved word: it means something only in this two-token
 clause, so it stays usable as an ordinary variable name.
 
-A decode target is not written here. Reading JSON into a declared type is
-`T.fromJson(text)`, the codec that type derives named directly
+A decode target is not written here. Reading a document into a declared type is
+`T.decode(text, codec)`, the decoder that type derives named directly
 ([14](14-stdlib.md#147-hivejson)).
 
 ## 5.9 Evaluation order

@@ -377,25 +377,62 @@ proc checkTypeDecl(c: mut Check, fields: ast.Field[], variants: ast.Variant[]): 
 	checkJsonNames(c, fields, variants)
 }
 
-// Every `fromJson` reads one `Str` of JSON, and answers with a `Result` the
-// caller has to open. Checked here because the emitter needs the type before it
-// can name a decoder, so nothing downstream could report a wrong one.
+// Every `decode` reads a `Str` in the format its second argument names, and
+// answers with a `Result` the caller has to open. Checked here because the
+// emitter needs both before it can name a decoder, so nothing downstream could
+// report a wrong one.
 proc checkDecodes(c: mut Check, env: infer.Env, what: Str, args: ast.Arg[]): void {
-	if len(args) != 1 {
-		report(c, what + " reads one `Str` of JSON, and this call passes " + countOf(len(args)))
+	if len(args) != 2 {
+		report(c, what + " reads a `Str` and the codec to read it with, and this call passes " + countOf(len(args)))
 		return
 	}
 	if args bounds 0 {
-		fits(c, types.Ty.TStr(), infer.typeOf(env, args[0].value), "the argument of " + what)
+		fits(c, types.Ty.TStr(), infer.typeOf(env, args[0].value), "what " + what + " reads")
+	}
+	if args bounds 1 {
+		checkNamesCodec(c, env, what, args[1].value)
 	}
 }
 
-// A field-less variant is a value, so `T.Variant.fromJson` would read as that
-// field of it as readily as the codec — and the two mean entirely different
-// things. One name is the whole cost of naming the codec at all.
+// The codec has to be named where it is used. The encoder and the decoder are
+// written out of a declaration at the call site, so a codec that arrived in a
+// variable leaves nothing to write them from — and refusing it here is the whole
+// of what keeps this free of reflection.
+proc checkNamesCodec(c: mut Check, env: infer.Env, what: Str, given: ast.Expr): void {
+	if given is ast.Expr.Hole {
+		return
+	}
+	if stdlib.codecFormat(given) != "" {
+		return
+	}
+	held := infer.typeOf(env, given)
+	if held is types.Ty.TUnknown {
+		return
+	}
+	if held is types.Ty.TLib(module, name) {
+		if module == "codec" && name == "Codec" {
+			report(c, "the codec " + what + " uses has to be named here — " + spellings() + " — rather than reached through a variable. The encoder is written from the declaration at this call, so which format it is has to be settled by now")
+			return
+		}
+	}
+	fits(c, types.Ty.TLib("codec", "Codec"), held, "the codec " + what + " uses")
+}
+
+// `hive.json.codec()`, and whatever joins it.
+func spellings(): Str {
+	mut Str[dyn] out = []
+	for each format in stdlib.codecFormats() {
+		append(out, "`hive." + format + ".codec()`")
+	}
+	return join(out, " or ")
+}
+
+// A field-less variant is a value, so `T.Variant.decode` would read as that field
+// of it as readily as the decoder — and the two mean entirely different things.
+// One name is the whole cost of naming the decoder at all.
 proc checkReservedField(c: mut Check, name: Str): void {
-	if name == "fromJson" {
-		report(c, "`fromJson` is the name of the codec every type derives, so a field cannot also be called that — `T.fromJson(text)` would name both this field and the decoder. Any other name is free")
+	if name == "decode" {
+		report(c, "`decode` is the name of the decoder every type derives, so a field cannot also be called that — `T.Variant.decode(text, codec)` would name both this field and the decoder. Any other name is free")
 	}
 }
 
@@ -963,9 +1000,9 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
 			return
 		}
 		if types.findType(env.table, head) is Result.Ok(info) {
-			// `T.fromJson(text)` is the codec, not a variant.
-			if field == "fromJson" {
-				checkDecodes(c, env, "`" + head + ".fromJson`", args)
+			// `T.decode(text, codec)` is the decoder, not a variant.
+			if field == "decode" {
+				checkDecodes(c, env, "`" + head + ".decode`", args)
 				return
 			}
 			if types.findVariant(env.table, head, field) is Result.Ok(fields) {
@@ -977,14 +1014,14 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
 		}
 	}
 	if subject is ast.Expr.Member(root, module) {
-		// `T.Variant.fromJson(text)` — the one variant's own codec.
-		if field == "fromJson" {
+		// `T.Variant.decode(text, codec)` — the one variant's own decoder.
+		if field == "decode" {
 			if root is ast.Expr.Ident(head) {
 				if types.findType(env.table, head) is Result.Ok(_) {
 					if types.findVariant(env.table, head, module) is Result.Ok(_) {
-						checkDecodes(c, env, "`" + head + "." + module + ".fromJson`", args)
+						checkDecodes(c, env, "`" + head + "." + module + ".decode`", args)
 					} else {
-						report(c, "`" + head + "` has no variant `{module}`, so there is no `{module}.fromJson` to call. Its variants are " + join(types.variantNames(env.table, head), ", "))
+						report(c, "`" + head + "` has no variant `{module}`, so there is no `{module}.decode` to call. Its variants are " + join(types.variantNames(env.table, head), ", "))
 					}
 					return
 				}
@@ -1257,6 +1294,16 @@ proc checkBuiltinCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]):
 		if arity(c, name, args, 2) {
 			fits(c, table(), typeOfArg(c, env, args, 0), "what `{name}` reads")
 			fits(c, types.Ty.TStr(), typeOfArg(c, env, args, 1), "the key `{name}` looks for")
+		}
+	} else if name == "encode" {
+		// Anything with a static type encodes, so beyond the count the only thing
+		// to refuse is a codec that is not named here. What a format cannot carry
+		// is refused where the encoder is derived, which is where the reason can
+		// be given.
+		if arity(c, name, args, 2) {
+			if args bounds 1 {
+				checkNamesCodec(c, env, "`encode`", args[1].value)
+			}
 		}
 	}
 }

@@ -10,12 +10,13 @@
 // The master password and every secret are read with `hive.term.readSecret`,
 // which is `hive.term.read` with the terminal's echo turned off — so what is
 // typed at those prompts is not left on the screen, nor in the scrollback of
-// whoever walks past afterwards.
+// whoever walks past afterwards. `hive.term.writeSecret` is the other half of
+// that: the file it writes is readable by this account and no other.
 
-// The vault as it is JSON-encoded before being encrypted: `hive.json.encode`
-// derives the encoder from these types and `Vault.fromJson(...)`
-// derives the decoder, so the file format is these declarations and nothing
-// else.
+// The vault as it is JSON-encoded before being encrypted: `encode` derives the
+// encoder from these types and `Vault.decode` the decoder, so the file format is
+// these declarations and nothing else. Both are handed `hive.json.codec()`, which
+// is the only thing in either that says JSON.
 type Entry {
 	name: Str
 	secret: Str
@@ -169,7 +170,7 @@ proc open(master: Str): Result<Vault, Str> {
 		if opened is Result.Error(_) {
 			return Result.Error("wrong master password, or {file()} has been tampered with")
 		} else if opened is Result.Ok(plain) {
-			parsed := Vault.fromJson(plain)
+			parsed := Vault.decode(plain, hive.json.codec())
 			if parsed is Result.Ok(vault) {
 				return Result.Ok(vault)
 			} else if parsed is Result.Error(problem) {
@@ -182,9 +183,12 @@ proc open(master: Str): Result<Vault, Str> {
 // Encrypts the whole vault and writes it out, and hands the vault back so a
 // caller can go on using it. Every save draws a fresh salt and nonce, so two
 // saves of the same entries look nothing alike on disk.
+//
+// `writeSecret` rather than `write`: the file is already encrypted, and leaving
+// it readable by this account alone is the second lock rather than the first.
 proc save(vault: Vault, master: Str): Vault {
-	sealed := hive.crypto.encrypt(hive.json.encode(vault), master)
-	if hive.file.write(file(), sealed) is Result.Error(problem) {
+	sealed := hive.crypto.encrypt(encode(vault, hive.json.codec()), master)
+	if hive.term.writeSecret(file(), sealed) is Result.Error(problem) {
 		// Carrying on would leave the entry in memory only, and the next `get`
 		// would answer with something the file does not have.
 		panic problem

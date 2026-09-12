@@ -1751,8 +1751,9 @@ proc namedCall(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[], want: t
 	return goIdent(name) + "(" + plainArgs(em, env, args) + ")"
 }
 
-// Every `fromJson` is the same call with a different decoder: the text, and what
-// to read it with.
+// Every `decode` is the same call with a different decoder: the text, and what
+// to read it with. The format is read off the codec the call names rather than
+// off a value, which is what lets the decoder be written at all.
 proc reading(em: mut Emit, env: infer.Env, args: ast.Arg[], decoder: Str): Str {
 	useModule(em, "json")
 	return "hive.JsonParse(" + expr(em, env, argExpr(args, 0), types.Ty.TStr()) + ", " + decoder + ")"
@@ -1766,9 +1767,10 @@ proc memberCall(em: mut Emit, env: infer.Env, subject: ast.Expr, field: Str, arg
 		if head == "hive" {
 			return builtin(em, env, field, args, want)
 		}
-		// `User.fromJson(text)` is the codec the declaration derives, named. Ahead
-		// of the variant case, which would otherwise read it as a constructor.
-		if field == "fromJson" {
+		// `User.decode(text, codec)` is the decoder the declaration derives, named.
+		// Ahead of the variant case, which would otherwise read it as a
+		// constructor.
+		if field == "decode" {
 			if types.findType(em.table, head) is Result.Ok(_) {
 				return reading(em, env, args, decoderRef(em, types.Ty.TNamed(head)))
 			}
@@ -1779,9 +1781,10 @@ proc memberCall(em: mut Emit, env: infer.Env, subject: ast.Expr, field: Str, arg
 		}
 	}
 	if subject is ast.Expr.Member(root, module) {
-		// `Sig.Move.fromJson(text)` reads the payload alone, so it needs a decoder
-		// of its own beside the union's — written only where one is asked for.
-		if field == "fromJson" {
+		// `Sig.Move.decode(text, codec)` reads the payload alone, so it needs a
+		// decoder of its own beside the union's — written only where one is asked
+		// for.
+		if field == "decode" {
 			if root is ast.Expr.Ident(head) {
 				if types.findVariant(em.table, head, module) is Result.Ok(_) {
 					needCodec(em, head + "." + module)
@@ -2059,6 +2062,18 @@ proc builtin(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[], want: typ
 	}
 	if name == "column" {
 		return "hive.Column(" + a + ", " + expr(em, env, argExpr(args, 1), types.Ty.TStr()) + ")"
+	}
+	// The one builtin that is not a call on the runtime package: the encoder is
+	// written out of the argument's static type and the format its second
+	// argument names, which is what makes it total.
+	if name == "encode" {
+		format := stdlib.codecFormat(argExpr(args, 1))
+		if format == "" {
+			fail(em, "`encode` needs the codec named here, so the encoder can be written from the declaration")
+			return "\"\""
+		}
+		useModule(em, format)
+		return encodeOf(em, firstType, a, 0)
 	}
 	return walkBuiltin(em, env, name, args, a, firstType)
 }
@@ -3164,7 +3179,7 @@ proc emitCodecsFrom(em: mut Emit, from: Int): void {
 }
 
 // A request is either a type's name, or a type and one of its variants joined by
-// a dot — the second being what `T.Variant.fromJson` asks for. A variant needs a
+// a dot — the second being what `T.Variant.decode` asks for. A variant needs a
 // decoder alone: it is read into the union its type already encodes.
 proc emitCodec(em: mut Emit, name: Str): void {
 	at := dotAt(name)
@@ -3211,13 +3226,13 @@ func encoderName(name: Str): Str {
 
 // --- Decoding ----------------------------------------------------------------
 
-// The decoder `T.Variant.fromJson` names: this variant's payload, without the key
+// The decoder `T.Variant.decode` names: this variant's payload, without the key
 // the whole union is wrapped in. Its fields are its own and then the ones declared
 // outside any variant, which is the order a constructor takes them in.
 proc emitVariantDecoder(em: mut Emit, name: Str, variant: Str): void {
 	whole := types.Ty.TNamed(name)
 	blank(em)
-	open(em, "func " + variantDecoderName(name, variant) + "(v hive.JsonValue, path string) (" + goType(whole) + ", *hive.JsonJsonError) \{")
+	open(em, "func " + variantDecoderName(name, variant) + "(v hive.JsonValue, path string) (" + goType(whole) + ", *hive.CodecDecodingError) \{")
 	line(em, "obj, jerr := hive.JsonObject(v, path)")
 	bailOut(em, "nil")
 	if types.findVariant(em.table, name, variant) is Result.Ok(fields) {
@@ -3230,7 +3245,7 @@ proc emitVariantDecoder(em: mut Emit, name: Str, variant: Str): void {
 proc emitDecoder(em: mut Emit, name: Str, info: types.TypeInfo): void {
 	whole := types.Ty.TNamed(name)
 	blank(em)
-	open(em, "func " + decoderName(name) + "(v hive.JsonValue, path string) (" + goType(whole) + ", *hive.JsonJsonError) \{")
+	open(em, "func " + decoderName(name) + "(v hive.JsonValue, path string) (" + goType(whole) + ", *hive.CodecDecodingError) \{")
 	if len(info.variants) == 0 {
 		zero := goZero(whole)
 		line(em, "obj, jerr := hive.JsonObject(v, path)")
@@ -3263,7 +3278,7 @@ proc emitDecoder(em: mut Emit, name: Str, info: types.TypeInfo): void {
 		line(em, "return " + goVariant(name, variant.name) + "\{" + fieldInits(fields) + "}, nil")
 		close(em, "}")
 	}
-	line(em, "return nil, &hive.JsonJsonError\{Path: path, Expected: " + quoted("one of " + join(names, ", ")) + ", Found: hive.JsonEncodeStr(key)}")
+	line(em, "return nil, &hive.CodecDecodingError\{Path: path, Expected: " + quoted("one of " + join(names, ", ")) + ", Found: hive.JsonEncodeStr(key)}")
 	close(em, "}")
 }
 
@@ -3376,9 +3391,9 @@ proc decoderRef(em: mut Emit, ty: types.Ty): Str {
 			// is an error rather than a shorter vector.
 			call = "hive.JsonVecN(v, p, {n}, " + inner + ")"
 		}
-		return "func(v hive.JsonValue, p string) (" + goType(ty) + ", *hive.JsonJsonError) \{ return " + call + " }"
+		return "func(v hive.JsonValue, p string) (" + goType(ty) + ", *hive.CodecDecodingError) \{ return " + call + " }"
 	}
-	return "func(v hive.JsonValue, p string) (" + goType(ty) + ", *hive.JsonJsonError) \{ var zero " + goType(ty) + "; return zero, &hive.JsonJsonError\{Path: p, Expected: " + quoted("a type JSON can carry") + ", Found: " + quoted(types.show(ty)) + "} }"
+	return "func(v hive.JsonValue, p string) (" + goType(ty) + ", *hive.CodecDecodingError) \{ var zero " + goType(ty) + "; return zero, &hive.CodecDecodingError\{Path: p, Expected: " + quoted("a type JSON can carry") + ", Found: " + quoted(types.show(ty)) + "} }"
 }
 
 func isTable(ty: types.Ty): Bool {
@@ -3469,6 +3484,11 @@ proc libraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, args: ast
 	// so a program that never asks for a secret carries none of them.
 	if module == "term" && name == "readSecret" {
 		useModule(em, "termsecret")
+	}
+	// And writing one is a file per platform too, plus `hive.file` for the error
+	// it answers with.
+	if module == "term" && name == "writeSecret" {
+		useModule(em, "termwrite")
 	}
 	// `hive.map.new()` says empty and nothing about what it holds, so what it
 	// builds is read off where it is landing.
@@ -3575,12 +3595,6 @@ proc libraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, args: ast
 	// value, and the fields it lands in say what its arguments are.
 	if len(stdlib.fieldsOf(module, name)) > 0 {
 		return "hive." + text.capitalise(module) + name + "\{" + fieldArgs(em, env, stdlib.fieldsOf(module, name), args) + "}"
-	}
-	// Encoding is derived from the static type, so it cannot fail and needs no
-	// reflection.
-	if module == "json" && name == "encode" {
-		value := argExpr(args, 0)
-		return encodeOf(em, infer.typeOf(env, value), expr(em, env, value, types.Ty.TUnknown()), 0)
 	}
 	return "hive." + stdlib.goNameOf(module, name) + "(" + typedArgs(em, env, args, stdlib.paramsOf(module, name)) + ")"
 }
