@@ -14,6 +14,13 @@
 * **`hive.crypto.jwtCodec(secret)`** — a token is a codec: `encode` signs the
   claims, `T.decode` checks the signature and the times before reading them.
 
+### Fixes
+
+* **`hive.ui.scene`** — a scene that shrinks no longer strands its sound slots.
+  They sit past the end of the solids, so the frame's trim loop never reached
+  them and a stale voice fought the live one for its name: silence, wherever a
+  program renamed a `track` mid-run.
+
 ### Breaking
 
 | was | is |

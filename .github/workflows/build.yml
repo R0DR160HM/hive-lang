@@ -235,6 +235,10 @@ jobs:
       contents: write
 
     steps:
+      # For CHANGELOG.md, which is what the release says about itself. Ahead of
+      # the artifact: a checkout cleans the workspace it lands in.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: hivec
@@ -243,25 +247,45 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-          # Nothing is checked out here — the job wants the artifact, not the
-          # source — so gh has no remote to read the repository off of.
+          # Named rather than read off the checkout's remote, since which
+          # repository is being released to is not a thing to leave to inference.
           GH_REPO: ${{ github.repository }}
         run: |
           tag="$GITHUB_REF_NAME"
+
+          # What the release says is this version's own entry in the changelog,
+          # so the notes and the file agree by construction rather than by
+          # somebody remembering. Leading and trailing blank lines are dropped
+          # and the ones between kept.
+          notes=$(awk -v want="## $tag" '
+            $0 == want { inside = 1; next }
+            inside && /^## / { exit }
+            inside {
+              if ($0 == "") { blank = blank "\n"; next }
+              if (started) printf "%s", blank
+              blank = ""
+              started = 1
+              print
+            }
+          ' CHANGELOG.md)
+
+          # A tag with no entry is a mistake worth stopping for: the release
+          # would go out saying nothing about what is in it.
+          if [ -z "$notes" ]; then
+            echo "::error file=CHANGELOG.md::CHANGELOG.md has no '## $tag' section, so this release would have no notes. Add one, move the tag, and push it again."
+            exit 1
+          fi
+
           cd dist
           sha256sum -c SHA256SUMS
           seed=$(awk '$2=="hivec-linux-amd64"{print $1}' SHA256SUMS)
 
-          # The notes carry the next pin, because the first thing anyone does
-          # with a release is make it the seed. printf rather than a heredoc:
-          # inside a YAML block the terminator would be indented, and bash
-          # strips tabs from those, never spaces.
+          # Then the next pin, because the first thing anyone does with a release
+          # is make it the seed. printf rather than a heredoc: inside a YAML block
+          # the terminator would be indented, and bash strips tabs from those,
+          # never spaces.
           {
-            printf 'Built by [the release before it](../../blob/%s/seed/pinned.txt),\n' "$tag"
-            printf 'then by itself, and the two agree — `./selfhost` reports a fixpoint.\n\n'
-            printf '`chmod +x` the one for your platform and put it on your PATH;\n'
-            printf '[the README](../../blob/%s/README.md#installing-it) has the rest.\n' "$tag"
-            printf 'The checksums are in `SHA256SUMS`.\n\n'
+            printf '%s\n\n' "$notes"
             printf 'To bootstrap from this release, `seed/pinned.txt` becomes:\n\n'
             printf '```\ntag:    %s\nasset:  hivec-linux-amd64\nsha256: %s\n```\n' "$tag" "$seed"
           } > notes.md
