@@ -2,8 +2,9 @@
 // HMAC, base64, secure random) plus JSON Web Tokens. Everything here is pure
 // computation, so it works inside both `func`s and `proc`s.
 
-// A JWT's claims are just a Hive type: signing encodes a value of this type as
-// the payload, and verifying decodes the payload straight back into it.
+// A JWT's claims are just a Hive type: `hive.crypto.jwtCodec` is a codec like
+// `hive.json.codec`, so `encode` signs a value of this type and `Session.decode`
+// checks a token and reads it straight back.
 type Session {
 	user: Str
 	role: Str
@@ -59,37 +60,35 @@ proc main(): void {
 	// A secure random 32-byte secret (64 hex chars). Non-deterministic.
 	secret := hive.crypto.randomHex(32)
 
-	// Sign: the claims are a typed value; `exp` is a Unix timestamp.
-	token := hive.crypto.jwtSign(Session("ada", "admin", hive.time.now() + 3600), secret)
+	// Sign: `encode` with a JWT codec. The claims are a typed value, and `exp`
+	// is a Unix timestamp.
+	token := encode(Session("ada", "admin", hive.time.now() + 3600), hive.crypto.jwtCodec(secret))
 
-	// Verify: the signature and `exp` are checked, and the claims come back as
-	// the text they arrived as. What shape they are is this program's business,
-	// which `Session.decode` is what says — and it keeps the two failures
-	// apart: a bad signature is a CryptoError, wrong-shaped claims a DecodingError.
-	verified := hive.crypto.jwtVerify(token, secret)
-	if verified is Result.Ok(claims) {
-		if Session.decode(claims, hive.json.codec()) is Result.Ok(session) {
-			echo "welcome {session.user} (role: {session.role})"
-		}
+	// Read it back: the signature and `exp` are checked, then the claims are
+	// decoded into the type that declared them. A token that does not check out
+	// and claims of the wrong shape are both one DecodingError.
+	verified := Session.decode(token, hive.crypto.jwtCodec(secret))
+	if verified is Result.Ok(session) {
+		echo "welcome {session.user} (role: {session.role})"
 	} else if verified is Result.Error(error) {
-		echo "unexpected: {error.message}"
+		echo "unexpected: {error.found}"
 	}
 
 	// The wrong secret fails the signature check.
-	forged := hive.crypto.jwtVerify(token, "not-the-secret")
+	forged := Session.decode(token, hive.crypto.jwtCodec("not-the-secret"))
 	if forged is Result.Error(error) {
-		echo "rejected ({error.reason}): {error.message}"
+		echo "rejected: {error.found}"
 	}
 
 	// A token whose `exp` is in the past is rejected as expired.
-	old := hive.crypto.jwtSign(Session("bob", "guest", hive.time.now() - 60), secret)
-	stale := hive.crypto.jwtVerify(old, secret)
+	old := encode(Session("bob", "guest", hive.time.now() - 60), hive.crypto.jwtCodec(secret))
+	stale := Session.decode(old, hive.crypto.jwtCodec(secret))
 	if stale is Result.Error(error) {
-		echo "rejected ({error.reason}): {error.message}"
+		echo "rejected: {error.found}"
 	}
 
 	// `jwtHeader` peeks at the algorithm without verifying — e.g. to choose a
-	// key by `kid` before calling jwtVerify.
+	// key by `kid` before naming the codec that checks it.
 	head := hive.crypto.jwtHeader(token)
 	if head is Result.Ok(h) {
 		echo "token algorithm: {h.alg}"

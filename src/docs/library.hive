@@ -73,7 +73,7 @@ func index(): Str {
 		| [json](json.md) | ~BT~hive.json~BT~ | your types *are* the schema |
 		| [crypto](crypto.md) | ~BT~hive.crypto~BT~ | hashing, encoding, random |
 		| [crypto-encrypt](crypto-encrypt.md) | ~BT~hive.crypto~BT~ | ~BT~encrypt~BT~ / ~BT~decrypt~BT~ |
-		| [crypto-jwt](crypto-jwt.md) | ~BT~hive.crypto~BT~ | signing and verifying tokens |
+		| [crypto-jwt](crypto-jwt.md) | ~BT~hive.crypto~BT~ | tokens, as a codec |
 		| [net](net.md) | ~BT~hive.net~BT~ | what every server here has in common |
 		| [net-http](net-http.md) | ~BT~hive.net~BT~ | HTTP, client and server |
 		| [net-websockets](net-websockets.md) | ~BT~hive.net~BT~ | WebSockets |
@@ -567,7 +567,8 @@ func json(): Str {
 		A ~BT~DecodingError~BT~ carries the exact ~BT~path~BT~ that failed, what was ~BT~expected~BT~
 		and what was ~BT~found~BT~. It names no format, and neither do ~BT~encode~BT~ and
 		~BT~decode~BT~: **the codec is the only thing that says JSON**, which is what lets
-		another format be another module rather than a change to the language.
+		another format be another codec — [~BT~jwtCodec~BT~](crypto-jwt.md) is one already —
+		rather than a change to the language.
 
 		The codec has to be **named at the call**. One held in a variable is a compile
 		error, because the encoder is written from the declaration right there and by
@@ -733,14 +734,15 @@ func cryptoJwt(): Str {
 
 		| call | answers with |
 		| --- | --- |
-		| ~BT~jwtSign(claims, secret)~BT~ | ~BT~Str~BT~ — HS256, compact; **cannot fail** |
-		| ~BT~jwtVerify(token, secret)~BT~ | ~BT~Result<Str, CryptoError>~BT~ — the claims |
+		| ~BT~jwtCodec(secret)~BT~ | ~BT~hive.codec.Codec~BT~ — HS256 under this secret |
 		| ~BT~jwtDecode(token)~BT~ | ~BT~Result<Str, CryptoError>~BT~ — **without verifying** |
 		| ~BT~jwtHeader(token)~BT~ | ~BT~Result<hive.crypto.Header, CryptoError>~BT~ |
 
-		The claims are **one of your own types**, encoded and decoded by the same
-		derived codecs [~BT~hive.json~BT~](json.md) uses — so a token's payload is a type
-		declaration rather than a bag of strings.
+		A token is **a format like any other**, so there is nothing here to sign or
+		verify with: ~BT~jwtCodec~BT~ is a codec beside [~BT~hive.json.codec~BT~](json.md), and
+		[~BT~encode~BT~](../builtins.md) and ~BT~T.decode~BT~ are what a program
+		writes and reads one with. The claims are **one of your own types**, so a
+		token's payload is a type declaration rather than a bag of strings.
 
 		~CODE~hive
 		type Claims {
@@ -748,21 +750,24 @@ func cryptoJwt(): Str {
 			exp: Int
 		}
 
-		token := hive.crypto.jwtSign(Claims("ada", hive.time.now() + 3600), secret)
+		token := encode(Claims("ada", hive.time.now() + 3600), hive.crypto.jwtCodec(secret))
 
-		if hive.crypto.jwtVerify(token, secret) is Result.Ok(payload) {
-			if Claims.decode(payload, hive.json.codec()) is Result.Ok(claims) {
-				echo claims.sub
-			}
+		if Claims.decode(token, hive.crypto.jwtCodec(secret)) is Result.Ok(claims) {
+			echo claims.sub
 		}
 		~CODE~
 
-		## Verify against decode
+		## What the codec checks
 
-		~BT~jwtVerify~BT~ checks the signature **and the ~BT~exp~BT~/~BT~nbf~BT~ claims**, then decodes.
-		**Only HS256 is accepted**, so ~BT~alg: none~BT~ and algorithm confusion are rejected
-		outright rather than negotiated. An expired token is ~BT~"Expired"~BT~; a bad
-		signature is ~BT~"BadSignature"~BT~; a token that is not a token is ~BT~"Malformed"~BT~.
+		Decoding checks the signature **and the ~BT~exp~BT~/~BT~nbf~BT~ claims** before it reads
+		anything. **Only HS256 is accepted**, so ~BT~alg: none~BT~ and algorithm confusion
+		are rejected outright rather than negotiated.
+
+		A token that does not check out is a ~BT~hive.codec.DecodingError~BT~ like any other
+		unreadable document, and its ~BT~found~BT~ opens with the reason — ~BT~"Expired"~BT~,
+		~BT~"BadSignature"~BT~, ~BT~"AlgorithmMismatch"~BT~ or ~BT~"Malformed"~BT~. A forged token and
+		claims of the wrong shape are then one failure to handle rather than two,
+		which is what a caller was going to do with them anyway.
 
 		~BT~jwtDecode~BT~ decodes **without verifying anything at all**, and is for
 		inspection only — logging what a token claims, reading a ~BT~sub~BT~ before deciding

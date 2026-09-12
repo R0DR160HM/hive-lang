@@ -519,8 +519,9 @@ test "a decoder reads a Str and the codec to read it with" {
 test "the codec has to be named where it is used, not reached through a variable" {
 	assert opens(problem(withSig("c := hive.json.codec()  echo Sig.decode(\"x\", c)")),
 		"in `main`: the codec `Sig.decode` uses has to be named here")
+	// The message names every format there is to name.
 	assert text.contains(problem(withSig("c := hive.json.codec()  echo Sig.decode(\"x\", c)")),
-		"`hive.json.codec()`")
+		"`hive.json.codec()` or `hive.crypto.jwtCodec(secret)`")
 	assert opens(problem(withSig("c := hive.json.codec()  echo encode(1, c)")),
 		"in `main`: the codec `encode` uses has to be named here")
 	// And something that is not a codec at all is refused as the wrong type.
@@ -536,8 +537,16 @@ test "the json module carries flatten, and no longer carries parse" {
 	assert opens(problem(inMain("echo hive.json.parse(\"x\")")), "in `main`: `hive.json` has no `parse`")
 }
 
-test "reading a token stops at the claims" {
-	assert problemCount(inMain("if hive.crypto.jwtVerify(\"t\", \"s\") is Result.Ok(claims) \{ echo claims }")) == 0
+test "a token is written and read by the codec it names" {
+	claims := "type Claims \{ sub: Str }\n"
+	assert problemCount(claims + inMain("echo encode(Claims(\"ada\"), hive.crypto.jwtCodec(\"s\"))")) == 0
+	assert problemCount(claims + inMain("if Claims.decode(\"t\", hive.crypto.jwtCodec(\"s\")) is Result.Ok(c) \{ echo c.sub }")) == 0
+	// Signing and verifying are gone: the codec is the whole of both.
+	assert opens(problem(claims + inMain("echo hive.crypto.jwtSign(Claims(\"ada\"), \"s\")")),
+		"in `main`: `hive.crypto` has no `jwtSign`")
+	assert opens(problem(inMain("echo hive.crypto.jwtVerify(\"t\", \"s\")")),
+		"in `main`: `hive.crypto` has no `jwtVerify`")
+	// Reading one without checking it still stops at the claims, as text.
 	assert problemCount(inMain("if hive.crypto.jwtDecode(\"t\") is Result.Ok(claims) \{ echo claims }")) == 0
 }
 
@@ -588,12 +597,8 @@ test "a library call is held to what its module takes" {
 	// caught rather than left to Go to say `float64` about.
 	got := problem(inMain("health := 3  echo hive.math.max(0, health)"))
 	assert opens(got, "in `main`: the first argument of `hive.math.max` wants Float and this is Int")
-	// And only where the module really does take one thing. A token's claims are
-	// a value of the program's own type, so that position says nothing.
-	session := "type Session \{ user: Str  exp: Int }\n"
-	assert problemCount(session + inMain("echo hive.crypto.jwtSign(Session(\"ada\", 1), \"secret\")")) == 0
-	assert opens(problem(session + inMain("echo hive.crypto.jwtSign(Session(\"ada\", 1), 1)")),
-		"in `main`: the second argument of `hive.crypto.jwtSign` wants Str and this is Int")
+	assert opens(problem(inMain("echo hive.crypto.jwtCodec(1)")),
+		"in `main`: the first argument of `hive.crypto.jwtCodec` wants Str and this is Int")
 	assert opens(problem(inMain("health := 3  echo hive.math.max(0.0, health)")),
 		"in `main`: the second argument of `hive.math.max` wants Float and this is Int")
 	assert problemCount(inMain("health := 3.0  echo hive.math.max(0.0, health)")) == 0

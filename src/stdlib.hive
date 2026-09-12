@@ -267,11 +267,16 @@ func decodingError(): types.Ty {
 func codecFormat(e: ast.Expr): Str {
 	if e is ast.Expr.Call(callee, _) {
 		if callee is ast.Expr.Member(subject, name) {
-			if name == "codec" {
-				if subject is ast.Expr.Member(root, module) {
-					if root is ast.Expr.Ident(head) {
-						if head == "hive" && isKnownModule(module) {
+			if subject is ast.Expr.Member(root, module) {
+				if root is ast.Expr.Ident(head) {
+					if head == "hive" && isKnownModule(module) {
+						// A module's own format is `codec()`; a module carrying a
+						// second one names it, which is what `jwtCodec` is.
+						if name == "codec" {
 							return module
+						}
+						if module == "crypto" && name == "jwtCodec" {
+							return "jwt"
 						}
 					}
 				}
@@ -281,9 +286,28 @@ func codecFormat(e: ast.Expr): Str {
 	return ""
 }
 
+// The secret a codec was handed, or `Absent` where it takes none.
+func codecSecret(e: ast.Expr): ast.Expr {
+	if e is ast.Expr.Call(_, args) {
+		if args bounds 0 {
+			return args[0].value
+		}
+	}
+	return ast.Expr.Absent()
+}
+
 // Every format that can be written down, for a message that has to list them.
 func codecFormats(): Str[dyn] {
-	return ["json"]
+	return ["json", "jwt"]
+}
+
+// How a format is written down, which is not `hive.<format>.codec()` for a module
+// that carries more than one.
+func codecSpelling(format: Str): Str {
+	if format == "jwt" {
+		return "hive.crypto.jwtCodec(secret)"
+	}
+	return "hive." + format + ".codec()"
 }
 
 // A service is reached by calling its address, so most of this module is about
@@ -376,26 +400,27 @@ func netResult(name: Str): types.Ty {
 	return types.Ty.TUnknown()
 }
 
-// Everything here is a `Str` in and a `Str` out, bar the three that can fail
-// and the two that read a token — and those stop at the claims, which the
-// caller decodes with the codec their type derives.
+// Everything here is a `Str` in and a `Str` out, bar the three that can fail,
+// the one that reads a token unverified, and the codec — a token is written and
+// read by `encode` and `T.decode`, which the codec is handed to.
 func cryptoResult(name: Str): types.Ty {
 	cryptoError := types.Ty.TLib("crypto", "CryptoError")
 	if name == "sha256" || name == "sha512" || name == "hmacSha256"
 		|| name == "base64Encode" || name == "randomHex"
-		|| name == "encrypt" || name == "jwtSign" {
+		|| name == "encrypt" {
 		return types.Ty.TStr()
 	}
+	// The value that says sign it, and check it, as a JWT under this secret.
+	if name == "jwtCodec" { return types.Ty.TLib("codec", "Codec") }
 	if name == "base64Decode" || name == "decrypt" {
 		return types.Ty.TResult(types.Ty.TStr(), cryptoError)
 	}
 	if name == "jwtHeader" {
 		return types.Ty.TResult(types.Ty.TLib("crypto", "Header"), cryptoError)
 	}
-	// Reading a token stops at the claims. What shape they are is the caller's
-	// business, and `<Type>.decode` is what says so — which is why this module
-	// no longer knows anything about JSON codecs.
-	if name == "jwtVerify" || name == "jwtDecode" {
+	// Reading a token without checking it stops at the claims, as text: what
+	// shape they are is the caller's business.
+	if name == "jwtDecode" {
 		return types.Ty.TResult(types.Ty.TStr(), cryptoError)
 	}
 	return types.Ty.TUnknown()
@@ -922,13 +947,7 @@ func paramsOf(module: Str, name: Str): types.Ty[dyn] {
 	}
 	if module == "crypto" {
 		if name == "randomHex" { return [types.Ty.TInt()] }
-		// A token's claims are a value of the program's own type, so that
-		// position says nothing and the argument stands for itself.
-		if name == "jwtSign" {
-			return [types.Ty.TUnknown(), types.Ty.TStr()]
-		}
-		if name == "hmacSha256" || name == "encrypt" || name == "decrypt"
-			|| name == "jwtVerify" {
+		if name == "hmacSha256" || name == "encrypt" || name == "decrypt" {
 			return [types.Ty.TStr(), types.Ty.TStr()]
 		}
 		return [types.Ty.TStr()]

@@ -65,10 +65,11 @@ func carriesResource(arch: Str): Bool {
 // The generator, as its own `package main` under the build. Given the image, the
 // object to write and the architecture to write it for.
 func generatorSource(): Str {
-	return `
+	return join([
 		// Writes the Windows resource object holding one icon: an RT_ICON with the
 		// image, and the RT_GROUP_ICON that names it. Run by the build and deleted
 		// after — see src/icon.hive.
+		`
 		package main
 
 		import (
@@ -103,10 +104,11 @@ func generatorSource(): Str {
 			fmt.Fprintln(os.Stderr, why)
 			os.Exit(1)
 		}
-
+		`,
 		// The size, out of the IHDR every PNG opens with. Also what says the file is
 		// one: an icon that is not a PNG is worth refusing here, where it can be said
 		// plainly, rather than in an executable whose icon is a blank sheet.
+		`
 		func pngSize(b []byte) (int, int, error) {
 			if len(b) < 24 || string(b[:8]) != "\x89PNG\r\n\x1a\n" {
 				return 0, 0, fmt.Errorf("assets/icon.png is not a PNG")
@@ -118,10 +120,24 @@ func generatorSource(): Str {
 			}
 			return width, height, nil
 		}
-
+		`,
 		// A COFF object of one .rsrc section: the resource tree, the two blobs it
 		// points at, and a relocation for each pointer — the offsets in the tree are
 		// addresses in the image, which only the linker knows.
+		//
+		// Where the section's bytes and everything after them land.
+		//
+		// The COFF header: one section, one symbol, no optional header.
+		//
+		// The section header.
+		//
+		// Initialised data, readable.
+		//
+		// One relocation per pointer into the section, each against the section
+		// itself: the value already written there is the offset to add to it.
+		//
+		// The section symbol the relocations name.
+		`
 		func resourceObject(image []byte, width int, height int, arch string) ([]byte, error) {
 			machine, relocation, err := machineOf(arch)
 			if err != nil {
@@ -130,12 +146,10 @@ func generatorSource(): Str {
 			section, fixups := resourceSection(image, width, height)
 
 			out := &bytes.Buffer{}
-			// Where the section's bytes and everything after them land.
 			const headers = 20 + 40
 			relocations := headers + len(section)
 			symbols := relocations + len(fixups)*10
 
-			// The COFF header: one section, one symbol, no optional header.
 			binary.Write(out, binary.LittleEndian, uint16(machine))
 			binary.Write(out, binary.LittleEndian, uint16(1))
 			binary.Write(out, binary.LittleEndian, uint32(0))
@@ -144,7 +158,6 @@ func generatorSource(): Str {
 			binary.Write(out, binary.LittleEndian, uint16(0))
 			binary.Write(out, binary.LittleEndian, uint16(0))
 
-			// The section header.
 			out.Write([]byte(".rsrc\x00\x00\x00"))
 			binary.Write(out, binary.LittleEndian, uint32(0))
 			binary.Write(out, binary.LittleEndian, uint32(0))
@@ -154,35 +167,35 @@ func generatorSource(): Str {
 			binary.Write(out, binary.LittleEndian, uint32(0))
 			binary.Write(out, binary.LittleEndian, uint16(len(fixups)))
 			binary.Write(out, binary.LittleEndian, uint16(0))
-			// Initialised data, readable.
 			binary.Write(out, binary.LittleEndian, uint32(0x40000040))
 
 			out.Write(section)
 
-			// One relocation per pointer into the section, each against the section
-			// itself: the value already written there is the offset to add to it.
 			for _, at := range fixups {
 				binary.Write(out, binary.LittleEndian, uint32(at))
 				binary.Write(out, binary.LittleEndian, uint32(0))
 				binary.Write(out, binary.LittleEndian, uint16(relocation))
 			}
 
-			// The section symbol the relocations name.
 			out.Write([]byte(".rsrc\x00\x00\x00"))
 			binary.Write(out, binary.LittleEndian, uint32(0))
 			binary.Write(out, binary.LittleEndian, uint16(1))
 			binary.Write(out, binary.LittleEndian, uint16(0))
 			out.Write([]byte{3, 0})
-			// The string table, holding no strings: every name here fits in eight
-			// bytes, and the length is still written.
+		`,
+		// The string table, holding no strings: every name here fits in eight
+		// bytes, and the length is still written.
+		`
 			binary.Write(out, binary.LittleEndian, uint32(4))
 			return out.Bytes(), nil
 		}
 
 		func machineOf(arch string) (int, int, error) {
 			switch arch {
-			// IMAGE_REL_AMD64_ADDR32NB, IMAGE_REL_I386_DIR32NB, IMAGE_REL_ARM64_ADDR32NB:
-			// one image-relative 32-bit address, spelled differently per machine.
+		`,
+		// IMAGE_REL_AMD64_ADDR32NB, IMAGE_REL_I386_DIR32NB, IMAGE_REL_ARM64_ADDR32NB:
+		// one image-relative 32-bit address, spelled differently per machine.
+		`
 			case "amd64":
 				return 0x8664, 3, nil
 			case "386":
@@ -192,15 +205,20 @@ func generatorSource(): Str {
 			}
 			return 0, 0, fmt.Errorf("no resource object is written for windows/%s", arch)
 		}
-
+		`,
 		// The .rsrc section, and the offsets within it that hold an address. Three
 		// levels of directory — type, then name, then language — and a leaf entry for
 		// each of the two resources.
+		//
+		// Every directory is 16 bytes plus 8 per entry, so where each one lands is
+		// arithmetic rather than a second pass.
+		//
+		// RT_ICON is 3 and RT_GROUP_ICON is 14. Windows reads the group first and
+		// finds the image by the id in it.
+		`
 		func resourceSection(image []byte, width int, height int) ([]byte, []int) {
 			group := groupIcon(image, width, height)
 
-			// Every directory is 16 bytes plus 8 per entry, so where each one lands is
-			// arithmetic rather than a second pass.
 			const typeDir = 0
 			const iconNames = typeDir + 16 + 2*8
 			const iconLangs = iconNames + 16 + 8
@@ -212,8 +230,6 @@ func generatorSource(): Str {
 			groupData := aligned(iconData + len(image))
 
 			out := &bytes.Buffer{}
-			// RT_ICON is 3 and RT_GROUP_ICON is 14. Windows reads the group first and
-			// finds the image by the id in it.
 			directory(out, []entry{{3, iconNames | 0x80000000}, {14, groupNames | 0x80000000}})
 			directory(out, []entry{{1, iconLangs | 0x80000000}})
 			directory(out, []entry{{1033, iconEntry}})
@@ -225,7 +241,9 @@ func generatorSource(): Str {
 			out.Write(image)
 			pad(out, groupData)
 			out.Write(group)
-			// The first field of each leaf entry is the address the linker fixes up.
+		`,
+		// The first field of each leaf entry is the address the linker fixes up.
+		`
 			return out.Bytes(), []int{iconEntry, groupEntry}
 		}
 
@@ -239,7 +257,9 @@ func generatorSource(): Str {
 			binary.Write(out, binary.LittleEndian, uint32(0))
 			binary.Write(out, binary.LittleEndian, uint16(0))
 			binary.Write(out, binary.LittleEndian, uint16(0))
-			// Nothing here is named: a resource this writes is always numbered.
+		`,
+		// Nothing here is named: a resource this writes is always numbered.
+		`
 			binary.Write(out, binary.LittleEndian, uint16(0))
 			binary.Write(out, binary.LittleEndian, uint16(len(entries)))
 			for _, e := range entries {
@@ -254,16 +274,19 @@ func generatorSource(): Str {
 			binary.Write(out, binary.LittleEndian, uint32(0))
 			binary.Write(out, binary.LittleEndian, uint32(0))
 		}
-
+		`,
 		// The directory Windows reads to find the image: one entry, naming the icon
 		// resource by the id it was written under.
+		`
 		func groupIcon(image []byte, width int, height int) []byte {
 			out := &bytes.Buffer{}
 			binary.Write(out, binary.LittleEndian, uint16(0))
 			binary.Write(out, binary.LittleEndian, uint16(1))
 			binary.Write(out, binary.LittleEndian, uint16(1))
-			// A 256-wide icon writes its width as nought: the field is one byte, and
-			// 256 is the size that does not fit in one.
+		`,
+		// A 256-wide icon writes its width as nought: the field is one byte, and
+		// 256 is the size that does not fit in one.
+		`
 			out.Write([]byte{byte(width % 256), byte(height % 256), 0, 0})
 			binary.Write(out, binary.LittleEndian, uint16(1))
 			binary.Write(out, binary.LittleEndian, uint16(32))
@@ -284,5 +307,6 @@ func generatorSource(): Str {
 				out.WriteByte(0)
 			}
 		}
-	`
+		`
+	], "\n\n")
 }

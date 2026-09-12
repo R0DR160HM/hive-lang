@@ -247,7 +247,8 @@ Built on the idea that Hive's type declarations *are* the JSON schema.
 
 * `codec()` → `hive.codec.Codec` is the value that says **read and write it as
   JSON**, and it is the whole of what this module contributes to the two calls
-  below. A second format would add a `codec()` of its own and nothing else.
+  below. A second format adds a codec of its own and nothing else, which is all
+  `hive.crypto.jwtCodec(secret)` ([14.8](#148-hivecrypto)) is.
 * `T.decode(text, codec)` is the decoder `T`'s declaration derives, named →
   `Result<T, hive.codec.DecodingError>`. Missing fields, wrong types and wrong
   static vector lengths become errors carrying the exact `path` that failed;
@@ -321,15 +322,18 @@ Pure, so it works in a `func` too. Fallible operations return
   something else — `"BadSignature"`, which is also what a wrong password gives.
 * **Encoding** — `base64Encode`, `base64Decode`.
 * **Random** — `randomHex(bytes)`.
-* **JWT** — `jwtSign(claims, secret)` (HS256, compact, cannot fail);
-  `jwtVerify(token, secret)` checks the signature and the `exp`/`nbf` claims and
-  answers with the claims as a `Str` — only HS256 is accepted, so `alg: none` and
-  algorithm confusion are rejected outright; `jwtDecode(token)` reads them
-  **without verifying**, for inspection only; `jwtHeader(token)` reads
-  `alg`/`typ`/`kid`. Reading a token stops at the claims: what shape they are is
-  the caller's business, so `T.decode(claims, codec)` is what says so, and a bad
-  signature stays a `CryptoError` while wrong-shaped claims are a
-  `hive.codec.DecodingError`.
+* **JWT** — `jwtCodec(secret)` → `hive.codec.Codec` says **read and write it as
+  an HS256 token under this secret**, and is the whole of what this module
+  contributes to tokens: `encode(claims, hive.crypto.jwtCodec(secret))` signs one
+  and `T.decode(token, hive.crypto.jwtCodec(secret))` checks the signature and
+  the `exp`/`nbf` claims before reading them ([14.7](#147-hivejson)). Only HS256
+  is accepted, so `alg: none` and algorithm confusion are rejected outright. A
+  token that does not check out is a `hive.codec.DecodingError` like any other
+  unreadable document, its `found` opening with the reason — so a forged token
+  and wrong-shaped claims are one failure rather than two.
+* `jwtDecode(token)` reads the claims as a `Str` **without verifying**, for
+  inspection only; `jwtHeader(token)` reads `alg`/`typ`/`kid`, which is what a
+  program rotating keys needs before it can name the secret.
 
 ## 14.9 `hive.net`
 
