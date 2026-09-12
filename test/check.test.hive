@@ -484,35 +484,49 @@ test "`hive.sql.run` wants both halves" {
 
 // --- Naming a derived codec --------------------------------------------------
 //
-// `T.fromJson` is the codec a declaration derives, named. Everything that can be
-// wrong with one is refused here: the emitter needs the type before it can name
-// a decoder, so nothing downstream is in a position to report it.
+// `T.decode` is the decoder a declaration derives, named. Everything that can be
+// wrong with one is refused here: the emitter needs the type and the format
+// before it can name a decoder, so nothing downstream is in a position to report
+// it.
 
 func withSig(body: Str): Str {
 	return "type Sig \{ Ping\n Move \{ x: Int, y: Int } }\nproc main(): void \{ " + body + " }"
 }
 
 test "a type and its variants each name a codec" {
-	assert problemCount(withSig("if Sig.fromJson(\"x\") is Result.Ok(s) \{ echo s }")) == 0
-	assert problemCount(withSig("if Sig.Move.fromJson(\"x\") is Result.Ok(s) \{ echo s }")) == 0
-	assert problemCount(withSig("if Sig.Ping.fromJson(\"x\") is Result.Ok(s) \{ echo s }")) == 0
+	assert problemCount(withSig("if Sig.decode(\"x\", hive.json.codec()) is Result.Ok(s) \{ echo s }")) == 0
+	assert problemCount(withSig("if Sig.Move.decode(\"x\", hive.json.codec()) is Result.Ok(s) \{ echo s }")) == 0
+	assert problemCount(withSig("if Sig.Ping.decode(\"x\", hive.json.codec()) is Result.Ok(s) \{ echo s }")) == 0
 }
 
 test "a variant that is not there is named, and so are the ones that are" {
-	assert opens(problem(withSig("if Sig.Nope.fromJson(\"x\") is Result.Ok(s) \{ echo s }")),
+	assert opens(problem(withSig("if Sig.Nope.decode(\"x\", hive.json.codec()) is Result.Ok(s) \{ echo s }")),
 		"in `main`: `Sig` has no variant `Nope`")
-	assert text.contains(problem(withSig("if Sig.Nope.fromJson(\"x\") is Result.Ok(s) \{ echo s }")), "Ping, Move")
+	assert text.contains(problem(withSig("if Sig.Nope.decode(\"x\", hive.json.codec()) is Result.Ok(s) \{ echo s }")), "Ping, Move")
 }
 
-test "a codec reads one Str of JSON" {
-	assert opens(problem(withSig("echo Sig.fromJson()")),
-		"in `main`: `Sig.fromJson` reads one `Str` of JSON")
-	assert opens(problem(withSig("echo Sig.fromJson(\"a\", \"b\")")),
-		"in `main`: `Sig.fromJson` reads one `Str` of JSON")
-	assert opens(problem(withSig("echo Sig.fromJson(1)")),
-		"in `main`: the argument of `Sig.fromJson` wants Str")
-	assert opens(problem(withSig("echo Sig.Move.fromJson(1)")),
-		"in `main`: the argument of `Sig.Move.fromJson` wants Str")
+test "a decoder reads a Str and the codec to read it with" {
+	assert opens(problem(withSig("echo Sig.decode(\"a\")")),
+		"in `main`: `Sig.decode` reads a `Str` and the codec to read it with")
+	assert opens(problem(withSig("echo Sig.decode(\"a\", hive.json.codec(), \"b\")")),
+		"in `main`: `Sig.decode` reads a `Str` and the codec to read it with")
+	assert opens(problem(withSig("echo Sig.decode(1, hive.json.codec())")),
+		"in `main`: what `Sig.decode` reads wants Str")
+	assert opens(problem(withSig("echo Sig.Move.decode(1, hive.json.codec())")),
+		"in `main`: what `Sig.Move.decode` reads wants Str")
+}
+
+test "the codec has to be named where it is used, not reached through a variable" {
+	assert opens(problem(withSig("c := hive.json.codec()  echo Sig.decode(\"x\", c)")),
+		"in `main`: the codec `Sig.decode` uses has to be named here")
+	assert text.contains(problem(withSig("c := hive.json.codec()  echo Sig.decode(\"x\", c)")),
+		"`hive.json.codec()`")
+	assert opens(problem(withSig("c := hive.json.codec()  echo encode(1, c)")),
+		"in `main`: the codec `encode` uses has to be named here")
+	// And something that is not a codec at all is refused as the wrong type.
+	assert opens(problem(withSig("echo Sig.decode(\"x\", 7)")),
+		"in `main`: the codec `Sig.decode` uses wants hive.codec.Codec")
+	assert problemCount(withSig("echo encode(1, hive.json.codec())")) == 0
 }
 
 test "the json module carries flatten, and no longer carries parse" {
@@ -527,14 +541,14 @@ test "reading a token stops at the claims" {
 	assert problemCount(inMain("if hive.crypto.jwtDecode(\"t\") is Result.Ok(claims) \{ echo claims }")) == 0
 }
 
-test "`fromJson` is not a field name" {
-	assert opens(problem("type Bad \{ fromJson: Str }\nproc main(): void \{ }"),
-		"in `Bad`: `fromJson` is the name of the codec every type derives")
+test "`decode` is not a field name" {
+	assert opens(problem("type Bad \{ decode: Str }\nproc main(): void \{ }"),
+		"in `Bad`: `decode` is the name of the decoder every type derives")
 	// A variant's own field is held to it too.
-	assert opens(problem("type Bad \{ One \{ fromJson: Str } }\nproc main(): void \{ }"),
-		"in `Bad`: `fromJson` is the name of the codec every type derives")
+	assert opens(problem("type Bad \{ One \{ decode: Str } }\nproc main(): void \{ }"),
+		"in `Bad`: `decode` is the name of the decoder every type derives")
 	// Any other name is free, including one that merely looks close.
-	assert problemCount("type Fine \{ fromJSON: Str\n toJson: Str }\nproc main(): void \{ }") == 0
+	assert problemCount("type Fine \{ decoded: Str\n encode: Str }\nproc main(): void \{ }") == 0
 }
 
 // --- What a call can reach through ------------------------------------------

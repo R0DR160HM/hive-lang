@@ -16,7 +16,7 @@ func isKnownModule(module: Str): Bool {
 		|| module == "file" || module == "map" || module == "env"
 		|| module == "task" || module == "time" || module == "json"
 		|| module == "crypto" || module == "net" || module == "sql"
-		|| module == "syslink" || module == "ui"
+		|| module == "syslink" || module == "ui" || module == "codec"
 }
 
 // The name a library call carries on the runtime package: `hive.conv.its` becomes
@@ -62,9 +62,13 @@ func hasName(module: Str, name: Str): Bool {
 			|| name == "delete" || name == "keys" || name == "values"
 			|| name == "fromTable" || name == "toTable"
 	}
+	// Encoding and decoding are not here: they derive from a declaration rather
+	// than being carried, so they are `encode` ([13](13-builtins.md)) and
+	// `T.decode`. What this module contributes to them is `codec()`, the value
+	// that says read and write it as JSON.
 	if module == "json" {
-		return name == "flatten" || name == "encode" || name == "table"
-			|| name == "get"
+		return name == "flatten" || name == "table" || name == "get"
+			|| name == "codec"
 	}
 	// `run` answers with what the query it was handed declared, so with no
 	// arguments to read there is nothing for `resultOf` to say.
@@ -148,6 +152,11 @@ func termResult(name: Str): types.Ty {
 		return types.Ty.TResult(types.Ty.TStr(), types.Ty.TLib("term", "ExecError"))
 	}
 	if name == "attach" { return types.Ty.TInt() }
+	// `writeSecret` is `hive.file.write` narrowed to this user, and answers with
+	// what that answers with — a file that failed is a `hive.file.FileError`.
+	if name == "writeSecret" {
+		return types.Ty.TResult(types.Ty.TInt(), types.Ty.TLib("file", "FileError"))
+	}
 	// `exit` never returns, so there is nothing for it to answer with.
 	if name == "exit" { return types.Ty.TVoid() }
 	return types.Ty.TUnknown()
@@ -228,21 +237,57 @@ func timeResult(name: Str): types.Ty {
 }
 
 func jsonResult(name: Str, args: types.Ty[]): types.Ty {
-	if name == "encode" { return types.Ty.TStr() }
+	// The value that says JSON, for the call that is going to read or write one.
+	if name == "codec" { return types.Ty.TLib("codec", "Codec") }
 	if name == "table" {
-		return types.Ty.TResult(table(), types.Ty.TLib("json", "JsonError"))
+		return types.Ty.TResult(table(), decodingError())
 	}
 	// A flattened document is looked up by path, and a path that is not in it is
 	// an ordinary answer rather than a failure.
 	if name == "get" {
-		return types.Ty.TResult(types.Ty.TStr(), types.Ty.TLib("json", "JsonError"))
+		return types.Ty.TResult(types.Ty.TStr(), decodingError())
 	}
 	// A whole document flattened into `[path, value]` rows, which is the one
 	// reading that needs no type to say what it wants.
 	if name == "flatten" {
-		return types.Ty.TResult(table(), types.Ty.TLib("json", "JsonError"))
+		return types.Ty.TResult(table(), decodingError())
 	}
 	return types.Ty.TUnknown()
+}
+
+// What every failure to read a document is, whatever format wrote it.
+func decodingError(): types.Ty {
+	return types.Ty.TLib("codec", "DecodingError")
+}
+
+// The format a codec expression names, or `""` where it names none. `encode` and
+// `decode` read this rather than the value, because the encoder is written out of
+// a declaration at the call site: which format has to be settled by then, and a
+// codec that arrived in a variable settles nothing.
+//
+// It is the same bargain `hive.file.csv` and `hive.sql.run` already strike — the
+// reader is named in the source rather than sniffed at run time — and it is what
+// keeps a codec free of reflection.
+func codecFormat(e: ast.Expr): Str {
+	if e is ast.Expr.Call(callee, _) {
+		if callee is ast.Expr.Member(subject, name) {
+			if name == "codec" {
+				if subject is ast.Expr.Member(root, module) {
+					if root is ast.Expr.Ident(head) {
+						if head == "hive" && isKnownModule(module) {
+							return module
+						}
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// Every format that can be written down, for a message that has to list them.
+func codecFormats(): Str[dyn] {
+	return ["json"]
 }
 
 // A service is reached by calling its address, so most of this module is about
@@ -352,7 +397,7 @@ func cryptoResult(name: Str): types.Ty {
 		return types.Ty.TResult(types.Ty.TLib("crypto", "Header"), cryptoError)
 	}
 	// Reading a token stops at the claims. What shape they are is the caller's
-	// business, and `<Type>.fromJson` is what says so — which is why this module
+	// business, and `<Type>.decode` is what says so — which is why this module
 	// no longer knows anything about JSON codecs.
 	if name == "jwtVerify" || name == "jwtDecode" {
 		return types.Ty.TResult(types.Ty.TStr(), cryptoError)
@@ -376,6 +421,11 @@ func isLibType(module: Str, name: Str): Bool {
 // The types that have no fields to read: a handle a program holds and hands
 // back. Registering them is what lets one be written down as a parameter type.
 func isOpaque(module: Str, name: Str): Bool {
+	// A codec has nothing to read: it is which format, and the call it is handed
+	// to reads that off the name rather than off the value.
+	if module == "codec" {
+		return name == "Codec"
+	}
 	if module == "net" {
 		return name == "WsConnection" || name == "SocketConnection"
 	}
@@ -471,8 +521,12 @@ func fieldsOf(module: Str, name: Str): ast.Field[dyn] {
 		}
 		return []
 	}
-	if module == "json" {
-		if name == "JsonError" {
+	// What `encode` and `decode` traffic in. Neither says JSON, because neither
+	// is about JSON: a `Codec` is the format's rules, named at the call that
+	// wants them, and a failure to read a document is the same three questions
+	// whatever wrote it.
+	if module == "codec" {
+		if name == "DecodingError" {
 			return [field("path"), field("expected"), field("found")]
 		}
 		return []
@@ -783,6 +837,7 @@ func paramsOf(module: Str, name: Str): types.Ty[dyn] {
 		if name == "execWith" {
 			return [types.Ty.TStr(), strings(), types.Ty.TStr(), environment()]
 		}
+		if name == "writeSecret" { return [types.Ty.TStr(), types.Ty.TStr()] }
 		if name == "exit" { return [types.Ty.TInt()] }
 		return []
 	}
