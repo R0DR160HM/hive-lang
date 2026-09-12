@@ -12,7 +12,7 @@
 
 ### Standard library
 
-* **`hive.term.writeSecret(path, contents)`** — `write` leaving the file readable
+* **`hive.file.writeSecret(path, contents)`** — `write` leaving the file readable
   by its author alone: `0600` on Linux and macOS, a protected access list on
   Windows. Settled before any of the secret is in the file.
 * **`hive.codec`** — new. `Codec` and `DecodingError`, so a second format is a

@@ -108,6 +108,15 @@ own, carrying the `path` and a `message`.
 * `write(path, contents)` replaces a file, creating it when absent;
   `append(path, contents)` adds to the end. Both → `Result<Int, _>`, the bytes
   written. Neither creates missing parent directories.
+* `writeSecret(path, contents)` → `Result<Int, _>` is `write` leaving the file
+  readable by the user running the program and nobody else: mode `0600` on Linux
+  and macOS, and on Windows an access list naming that one account, protected so
+  the containing folder hands nothing down. Who may read it is settled before any
+  of the secret is in it, and a file that was already there is narrowed rather
+  than trusted. A file owned by somebody else is an `Error` rather than a secret
+  written in the clear. Permissions are all it is, so it is not encryption and
+  never claims to be: an administrator, and `root`, can read any file on the
+  machine.
 * `exists(path)` → `Bool` (a directory counts); `size(path)` → `Result<Int, _>`.
 * `delete(path)` removes a file, or an already-empty directory.
 * `list(path)` → `Result<Str[dyn], _>`, sorted and without any leading path;
@@ -136,29 +145,11 @@ Line-oriented terminal I/O.
   is put back before the call returns, and also if the program is interrupted at
   the prompt. Where there is no terminal at all, the line is read exactly as
   `read()` reads it and only the hiding of it is lost.
-* `writeSecret(path, contents)` → `Result<Int, hive.file.FileError>` is
-  `hive.file.write` ([14.4](#144-hivefile)) leaving the file readable by the user
-  running the program and nobody else: mode `0600` on Linux and macOS, and on
-  Windows an access list naming that one account, protected so the containing
-  folder hands nothing down. Who may read it is settled before any of the secret
-  is in it, and a file that was already there is narrowed rather than trusted. A
-  file owned by somebody else is an `Error` rather than a secret written in the
-  clear. This is what a password read with `readSecret` is stored behind, and it
-  answers with `hive.file`'s error because what failed is a file.
 * `args()` → `Str[dyn]`, the command-line arguments in order, excluding the
   program name.
 * `exit(code)` ends the program with a status. There is no value to answer with
   and nothing after it runs, which is what makes it a statement rather than a
   call.
-
-```hive
-if hive.term.writeSecret("./vault.dat", sealed) is Result.Error(why) {
-	echo "the vault was not saved: {why.message}"
-}
-```
-
-Permissions are all it is, so it is not encryption and never claims to be: an
-administrator, and `root`, can read any file on the machine.
 
 **Running another program.** Three calls. The difference between the first two is
 who is talking to the terminal; the third is the first with an environment.
