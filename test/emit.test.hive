@@ -98,6 +98,51 @@ test "a mutex parameter lowers to a pointer" {
 	assert has(got, "func grow(v *[]string, tag string)")
 }
 
+// --- Storage two names share -------------------------------------------------
+
+test "two `mut` names for one storage are one cell both of them hold" {
+	got := stmt("mut Str[dyn] a = [\"x\"]  mut Str[dyn] b = a  append(b, \"y\")  echo len(a)")
+	// The first name holds the cell, the second takes the same pointer, and both
+	// read and write through it — so the new header `append` makes is shared.
+	assert has(got, "var a *[]string = hive.Cell[[]string]([]string\{\"x\"})")
+	assert has(got, "b := a")
+	assert has(got, "(*b) = append((*b), \"y\")")
+	assert has(got, "len((*a))")
+}
+
+test "rebinding one of them is not a write through it" {
+	got := stmt("mut Str[dyn] a = [\"x\"]  mut Str[dyn] b = a  b = [\"replaced\"]  a[0] = \"changed\"")
+	// The name is given a cell of its own, so the other keeps what they shared.
+	assert has(got, "b = hive.Cell[[]string]([]string\{\"replaced\"})")
+	// Writing *through* a name still reaches both.
+	assert has(got, "(*a)[0] = \"changed\"")
+}
+
+test "a name nothing shares with is no cell at all" {
+	got := stmt("mut Str[dyn] a = [\"x\"]  append(a, \"y\")  echo len(a)")
+	assert has(got, "hive.Cell") == false
+	assert has(got, "a = append(a, \"y\")")
+}
+
+test "a cell handed to a mutex parameter is the pointer it already holds" {
+	got := go("proc grow(v: mut Str[dyn]): void \{ append(v, \"y\") }\nproc main(): void \{ mut Str[dyn] a = [\"x\"]  mut Str[dyn] b = a  grow(a) }")
+	assert has(got, "grow(a)")
+	assert has(got, "grow(&a)") == false
+}
+
+test "a scalar has no storage to share, so it is never a cell" {
+	got := stmt("mut n := 1  mut m := n  m = m + 1  echo n")
+	assert has(got, "hive.Cell") == false
+}
+
+test "a name standing for two bindings copies rather than sharing by capacity" {
+	// One of the two could be a cell and the other not, and nothing but the name
+	// tells them apart — so neither is, and the binding is an ordinary copy.
+	got := stmt("mut Str[dyn] s = [\"one\"]  if len(s) > 0 \{ mut Str[dyn] s = [\"two\"]  mut Str[dyn] t = s  append(t, \"three\") }")
+	assert has(got, "hive.Cell") == false
+	assert has(got, "hive.CloneVec(s)")
+}
+
 test "a callable whose name is a Go keyword is suffixed" {
 	got := go("func map(a: Int): Int \{ return a }\nproc main(): void \{ }")
 	assert has(got, "func map_(a int) int")
@@ -222,6 +267,41 @@ test "async is go, and echo, assert and panic each go through the runtime" {
 	assert has(stmt("echo 1"), "hive.Echo(1)")
 	assert has(stmt("assert true"), "hive.Assert(true)")
 	assert has(stmt("panic \"no\""), "panic(hive.Show(\"no\"))")
+}
+
+// --- What crosses onto a thread ----------------------------------------------
+
+test "every argument to a spawned call is copied on the caller's side" {
+	program := "proc grow(v: mut Str[dyn], tag: Str): void \{ append(v, tag) }\n"
+	got := go(program + "proc main(): void \{ mut Str[dyn] a = [\"x\"]  async grow(a, \"y\") }")
+	// The copy is a line of the caller's, above the `go`, and the thread is
+	// handed the address of *that* rather than of `a`.
+	assert has(got, "var _spawn1 []string = hive.CloneVec(a)")
+	assert has(got, "go grow(&_spawn1, \"y\")")
+	assert has(got, "go grow(&a") == false
+}
+
+test "the same holds of a named thread and of a barrier" {
+	program := "proc grow(v: mut Str[dyn]): Int \{ append(v, \"y\")  return len(v) }\n"
+	named := go(program + "proc main(): void \{ mut Str[dyn] a = [\"x\"]  n := async grow(a)  echo n }")
+	assert has(named, "var _spawn1 []string = hive.CloneVec(a)")
+	assert has(named, "hive.Spawn(func() any \{ return grow(&_spawn1) })")
+	barrier := go(program + "proc main(): void \{ mut Str[dyn] a = [\"x\"]  ns := await [grow(a), grow(a)]  echo ns }")
+	// One copy each: two threads never share the storage they were handed.
+	assert has(barrier, "var _spawn1 []string = hive.CloneVec(a)")
+	assert has(barrier, "var _spawn2 []string = hive.CloneVec(a)")
+}
+
+test "a call waited for where it is written still takes the caller's storage" {
+	program := "proc grow(v: mut Str[dyn]): void \{ append(v, \"y\") }\n"
+	got := go(program + "proc main(): void \{ mut Str[dyn] a = [\"x\"]  grow(a) }")
+	assert has(got, "grow(&a)")
+	assert has(got, "_spawn") == false
+}
+
+test "a literal has nothing to copy and is written where it stands" {
+	got := go("proc f(n: Int, tag: Str): void \{ }\nproc main(): void \{ async f(1, \"x\") }")
+	assert has(got, "go f(1, \"x\")")
 }
 
 // --- Patterns ----------------------------------------------------------------
@@ -501,11 +581,10 @@ test "flatten reads a whole document without a type to read it into" {
 	assert has(got, "hive.JsonParse(\"x\", hive.JsonFlatten)")
 }
 
-test "a JWT signs the claims its type derives an encoder for" {
-	got := go("type Claims \{ sub: Str }\nproc main(): void \{ echo hive.crypto.jwtSign(Claims(\"ada\"), \"secret\")  if hive.crypto.jwtVerify(\"t\", \"secret\") is Result.Ok(c) \{ echo c } }")
+test "a JWT codec signs and reads the claims its type derives a codec for" {
+	got := go("type Claims \{ sub: Str }\nproc main(): void \{ echo encode(Claims(\"ada\"), hive.crypto.jwtCodec(\"secret\"))  if Claims.decode(\"t\", hive.crypto.jwtCodec(\"secret\")) is Result.Ok(c) \{ echo c.sub } }")
 	assert has(got, "hive.CryptoJwtSign(jsonEncode_Claims(")
-	// Reading a token stops at the claims: no decoder crosses into `hive.crypto`.
-	assert has(got, "hive.CryptoJwtVerify(\"t\", \"secret\")")
+	assert has(got, "hive.CryptoJwtParse(\"t\", \"secret\", jsonDecode_Claims)")
 }
 
 // --- Services ----------------------------------------------------------------

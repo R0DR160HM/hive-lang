@@ -1,0 +1,69 @@
+// The JWT codec: the same derived codecs `json.hive` exercises, inside a signed
+// envelope. `hive.crypto.jwtCodec(secret)` goes where `hive.json.codec()` goes,
+// so signing is `encode` and checking a token is `T.decode` — and everything a
+// token can be wrong about arrives as the one `DecodingError` a caller already
+// has to handle.
+
+type Claims {
+	sub: Str
+	role: Str -- Default as "guest";
+	exp: Int
+}
+
+// Something else signed with the same secret: the signature checks out and the
+// claims still are not what was asked for.
+type Note {
+	body: Str
+}
+
+func secret(): Str { return "s3cret" }
+
+// Far enough ahead that the token is the same string every run.
+func distantFuture(): Int { return 4102444800 }
+
+proc main(): void {
+	// --- A round trip --------------------------------------------------------
+	token := encode(Claims("ada", "admin", distantFuture()), hive.crypto.jwtCodec(secret()))
+	echo token
+
+	if Claims.decode(token, hive.crypto.jwtCodec(secret())) is Result.Ok(c) {
+		echo "{c.sub} {c.role} {c.exp}"
+	}
+
+	// --- What a token can be wrong about -------------------------------------
+	// The wrong secret.
+	if Claims.decode(token, hive.crypto.jwtCodec("not-the-secret")) is Result.Error(why) {
+		echo "{why.path}: expected {why.expected}, found {why.found}"
+	}
+
+	// A token edited after it was signed.
+	if Claims.decode(token + "x", hive.crypto.jwtCodec(secret())) is Result.Error(why) {
+		echo "{why.found}"
+	}
+
+	// A token that is not a token.
+	if Claims.decode("nonsense", hive.crypto.jwtCodec(secret())) is Result.Error(why) {
+		echo "{why.found}"
+	}
+
+	// `exp` in the past, checked before anything is read.
+	expired := encode(Claims("bob", "guest", 1000000000), hive.crypto.jwtCodec(secret()))
+	if Claims.decode(expired, hive.crypto.jwtCodec(secret())) is Result.Error(why) {
+		echo "{why.found}"
+	}
+
+	// A signature that checks out over claims of the wrong shape: past the
+	// envelope, this is an ordinary decoding failure with the path that failed.
+	other := encode(Note("hello"), hive.crypto.jwtCodec(secret()))
+	if Claims.decode(other, hive.crypto.jwtCodec(secret())) is Result.Error(why) {
+		echo "{why.path}: expected {why.expected}, found {why.found}"
+	}
+
+	// --- Reading one without checking it -------------------------------------
+	if hive.crypto.jwtHeader(token) is Result.Ok(h) {
+		echo "{h.alg} {h.typ}"
+	}
+	if hive.crypto.jwtDecode(token) is Result.Ok(claims) {
+		echo claims
+	}
+}

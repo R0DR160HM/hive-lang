@@ -1043,8 +1043,9 @@ func mutability(): Str {
 
 		Vectors, ~BT~Table~BT~s, maps and declared types that contain them are **value
 		types**. Two names for one value never observe each other's mutations — unless
-		both are ~BT~mut~BT~, which is how shared mutable state is opted into. The invariant
-		the whole of it rests on:
+		both are ~BT~mut~BT~, which is how shared mutable state is opted into — and even then
+		it is the *storage* they share and never the names. The invariant the whole of
+		it rests on:
 
 		> Storage that an immutable binding observes is never mutated in place
 		> afterwards.
@@ -1059,7 +1060,7 @@ func mutability(): Str {
 		| target ⟵ source | decision |
 		| --- | --- |
 		| immutable ⟵ immutable | **alias** — neither side can ever mutate it |
-		| ~BT~mut~BT~ ⟵ ~BT~mut~BT~ | **alias** — shared mutable state is the intent |
+		| ~BT~mut~BT~ ⟵ ~BT~mut~BT~ | **share** — shared mutable state is the intent |
 		| ~BT~mut~BT~ ⟵ immutable | **alias** if the target is never written through, else **copy** |
 		| immutable ⟵ ~BT~mut~BT~ | **alias** if the source is never mutated again, else **copy** |
 
@@ -1072,20 +1073,27 @@ func mutability(): Str {
 		sort(a)         // ...this rewrites ~BT~a~BT~, and ~BT~b~BT~ must not follow
 		~CODE~
 
-		### Two ~BT~mut~BT~ bindings share completely
+		### Two ~BT~mut~BT~ bindings share their storage, not their names
 
 		~CODE~hive
 		mut Str[dyn] a = ["x", "y", "z"]
 		mut Str[dyn] b = a
 		append(b, "w")            // len(a) is now 4
 		a[0] = "changed"          // b[0] is "changed" too
-		b = ["replaced"]          // rebinding one rebinds both; len(a) is 1
+		b = ["replaced"]          // len(a) is still 4: ~BT~b~BT~ alone was rebound
 		~CODE~
 
-		The second name is not given a variable at all — it compiles to the first, so
-		there is one slice header for both. The one case this does not cover is a source
-		that does not name the same storage every time it is read: ~BT~mut b = a[i]~BT~ keeps
-		a header of its own.
+		The two names hold **one cell** — the storage, and a pointer to it each of them
+		has. Writing *through* a name reaches the storage, so both see it, ~BT~append~BT~
+		included: the new slice header lives in the cell rather than in either name.
+
+		**Rebinding a name is not a write through it.** ~BT~b = [...]~BT~ says what ~BT~b~BT~ is from
+		here on and says nothing about ~BT~a~BT~: ~BT~b~BT~ takes a cell of its own and the two stop
+		sharing.
+
+		Two cases are not covered and keep storage of their own: a source that does not
+		name the same storage every read (~BT~mut b = a[i]~BT~), and a name standing for more
+		than one binding in a body, since nothing but the name tells the two apart.
 
 		## What a copy copies
 
@@ -1188,8 +1196,13 @@ func concurrency(): Str {
 		## Threads and mutex arguments
 
 		A call handed a mutex argument shares the caller's storage **only when the
-		caller waits for it there**. An ~BT~async~BT~ or ~BT~await~BT~ed call gets a copy, made on
-		the caller's side of the fence. See [mutability](mutability.md).
+		caller waits for it there**. A call on a thread of its own gets a copy of
+		**every** argument, each bound to a name on the caller's side of the fence
+		before the thread starts — so what the caller does next cannot change what the
+		thread was given, and a call nested in an argument runs in the caller. A
+		literal is exempt, having nothing to work out. All three spellings alike:
+		~BT~async f(v)~BT~, ~BT~n := async f(v)~BT~, and each call in ~BT~await [...]~BT~. See
+		[mutability](mutability.md).
 
 		## What is deliberately absent
 

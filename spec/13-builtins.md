@@ -52,7 +52,9 @@ the encoder for `User` in JSON, written there. A codec reached through a variabl
 is a compile error, because by then there is nothing left to write the encoder
 from. This is the bargain `hive.file.csv` and `hive.sql.run` already strike — the
 reader is named in the source rather than sniffed at run time — and it is what
-lets a second format be a second module rather than a change to the language.
+lets a second format be a second codec rather than a change to the language:
+`hive.crypto.jwtCodec(secret)` ([14.8](14-stdlib.md#148-hivecrypto)) signs the
+same derived encoding into a token.
 
 Its other half is `T.decode(text, codec)`, named on the type because a `Str`
 arriving from outside cannot say what it should become

@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.2.3
+
+### Language
+
+* **A call on a thread of its own is handed a copy of every argument**, made on
+  the caller's side before the thread starts.
+* **Two `mut` names share their storage, not their names.** Writing through
+  either still reaches both, but rebinding one no longer rebinds the other.
+
+### Standard library
+
+* **`hive.crypto.jwtCodec(secret)`** — a token is a codec: `encode` signs the
+  claims, `T.decode` checks the signature and the times before reading them.
+
+### Breaking
+
+| was | is |
+| --- | --- |
+| `hive.crypto.jwtSign(claims, secret)` | `encode(claims, hive.crypto.jwtCodec(secret))` |
+| `hive.crypto.jwtVerify(token, secret)` then `T.decode` | `T.decode(token, hive.crypto.jwtCodec(secret))` |
+| a bad token as a `CryptoError` | a `hive.codec.DecodingError` |
+| `b = [...]` rebinding `a` too, after `mut b = a` | it rebinds `b` alone |
+| `async f(v)` writing through the caller's `v` | it writes through a copy |
+
 ## v0.2.2
 
 ### Language

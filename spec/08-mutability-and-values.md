@@ -49,7 +49,8 @@ A call you wait for *there* hands over the caller's storage; an `async` or
 `await`ed one hands over a copy. A thread of its own gets storage of its own,
 which is what keeps a call running alongside the caller from racing it. Whether
 the call's result is kept makes no difference: `n := async count(v)` gets storage
-of its own too. What decides is the thread, not the name.
+of its own too, and so does each call in an `await [...]` — one copy each, never
+one between them. What decides is the thread, not the name.
 
 A callable with a mutex parameter can be neither referenced (`f`) nor partially
 applied (`f(1, _)`): a function value has no call site to take a mutex from.
@@ -63,7 +64,8 @@ costs it every length and index fact already proved about it.
 Vectors, `Table`s, [maps](14-stdlib.md#143-hivemap) and declared types that
 contain them are **value types**. Two names for one value never observe each
 other's mutations — unless both of them are `mut`, which is how shared mutable
-state is opted into.
+state is opted into. Even then it is the *storage* they share and never the
+names: rebinding one of them leaves the other holding what the two had.
 
 Only in-place writes can break that, and the compiler already enforces that only
 `mut` bindings can be written through. So the invariant to preserve is:
@@ -83,7 +85,7 @@ Each binding is classified by the mutability of its two ends:
 | target ⟵ source | decision |
 | --- | --- |
 | immutable ⟵ immutable | **alias** — neither side can ever mutate the shared storage |
-| `mut` ⟵ `mut` | **alias** — shared mutable state is the intent |
+| `mut` ⟵ `mut` | **share** — shared mutable state is the intent |
 | `mut` ⟵ immutable | **alias** if the target is never written through, else **copy** |
 | immutable ⟵ `mut` | **alias** if the source is never mutated again, else **copy** |
 
@@ -101,24 +103,34 @@ b := a          // copies, because...
 sort(a)         // ...this rewrites `a`, and `b` must not follow
 ```
 
-### Two `mut` bindings share completely
+### Two `mut` bindings share their storage, not their names
 
 ```hive
 mut Str[dyn] a = ["x", "y", "z"]
 mut Str[dyn] b = a
 append(b, "w")            // len(a) is now 4
 a[0] = "changed"          // b[0] is "changed" too
-b = ["replaced"]          // rebinding one rebinds both; len(a) is 1
+b = ["replaced"]          // len(a) is still 4: `b` alone was rebound
 ```
 
-Two independent variables could not deliver that: `append` produces a new slice
-header, so growing one name would quietly stop the two from sharing depending on
-spare capacity. So the second name is **not given a variable at all** — it
-compiles to the first, and there is one header for both.
+The two names hold **one cell** — the storage, and a pointer to it that each of
+them has. Writing *through* a name reaches the storage, so every such write is
+seen by both, `append` included: it produces a new slice header, and the header
+lives in the cell rather than in either name.
 
-The one case this does not cover is a source that does not name the same storage
-every time it is read: `mut b = a[i]` can be a different element each time `i`
-moves, so that binding keeps a header of its own.
+**Rebinding a name is not a write through it.** `b = [...]` says what `b` is
+from now on, and says nothing about `a`: `b` is given a cell of its own and the
+two stop sharing, while `a` keeps what they shared. The same goes the other way,
+and a name that has been rebound shares with nobody until something is bound
+from it again.
+
+Two cases are not covered, and each keeps storage of its own instead:
+
+* a source that does not name the same storage every time it is read —
+  `mut b = a[i]` is a different element each time `i` moves;
+* a name that stands for **more than one binding** in the same body, since one
+  of them may share and another may not, and nothing but the name tells them
+  apart. Such a binding is an ordinary [copy](#85-what-a-copy-copies).
 
 ## 8.5 What a copy copies
 
@@ -144,9 +156,14 @@ A **`mut T` parameter** is the one place storage crosses a call boundary on
 purpose, and it lowers to a pointer, because a shared backing array would not
 survive `append` — that produces a new header and the caller has to see it.
 
-For an `async` call the copy has to be made on the **caller's** side of the
-fence, so the argument is bound to a temporary first and the callee is handed
-that. The same applies to a call inside `await [...]`, and to a mutex call
-nested in a spawned call's arguments — that one is hoisted out and run in the
-caller, since running it on the new thread would be the very race the copy exists
-to prevent.
+For a call that runs on a thread of its own the copy has to be made on the
+**caller's** side of the fence, so **every argument is bound to a temporary
+first** and the thread is handed those names. A literal is exempt, having nothing
+to work out and nothing anybody could write to; everything else is settled before
+the thread starts, including a call nested in an argument, which therefore runs
+in the caller. Working an argument out on the new thread would be the very race
+the copy exists to prevent — the caller runs on, and what it does next must not
+change what the thread was given.
+
+This is the whole of it, and it holds of all three spellings alike: `async f(v)`
+as a statement, `n := async f(v)`, and each call inside `await [...]`.

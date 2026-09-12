@@ -331,6 +331,11 @@ func coreVectors(): Str {
 			return append(out, b...)
 		}
 
+		// Cell is storage two ~BT~mut~BT~ names share: both hold this pointer, so a write
+		// through either reaches the other, while rebinding one hands that name a
+		// cell of its own and leaves the other where it was.
+		func Cell[T any](v T) *T { return &v }
+
 		// CloneVec is a fresh backing array holding the same elements. Hive
 		// vectors are values but lower to Go slices, so a binding that must stay
 		// independent of its source is copied rather than aliased.
@@ -2965,6 +2970,10 @@ func cryptoSource(): Str {
 			return Ok[string, CryptoCryptoError](string(plaintext))
 		}
 
+		// CryptoJwtCodec says read and write it as a JWT. Empty like every codec: both
+		// the format and the secret are read off the call in the source.
+		func CryptoJwtCodec(secret string) CodecCodec { return CodecCodec{} }
+
 		// CryptoJwtSign builds an HS256 token from an already-JSON-encoded payload and a
 		// shared secret. HMAC signing cannot fail, so it returns a plain string.
 		func CryptoJwtSign(payloadJSON string, secret string) string {
@@ -2999,10 +3008,25 @@ func cryptoSource(): Str {
 			return nil
 		}
 
-		// CryptoJwtVerify checks an HS256 token's signature and its exp/nbf claims
-		// against the current time, and stops there. The claims come back as the text
-		// they arrived as, decoded with the codec the caller's type derives.
-		func CryptoJwtVerify(token string, secret string) Result[string, CryptoCryptoError] {
+		// CryptoJwtParse is the decoding half of a JWT codec: open the token, then read
+		// the claims with the decoder the caller's type derives. A token that does not
+		// check out fails the way any other unreadable document does.
+		func CryptoJwtParse[T any](token string, secret string, dec func(JsonValue, string) (T, *CodecDecodingError)) Result[T, CodecDecodingError] {
+			claims := jwtVerify(token, secret)
+			if claims.IsError() {
+				why := claims.Err()
+				return Err[T, CodecDecodingError](CodecDecodingError{
+					Path:     "$",
+					Expected: "a JWT signed with this secret",
+					Found:    why.Reason + ": " + why.Message,
+				})
+			}
+			return JsonParse(claims.Ok(), dec)
+		}
+
+		// jwtVerify checks an HS256 token's signature and its exp/nbf claims against the
+		// current time, and stops there.
+		func jwtVerify(token string, secret string) Result[string, CryptoCryptoError] {
 			fail := func(reason, msg string) Result[string, CryptoCryptoError] {
 				return Err[string, CryptoCryptoError](CryptoCryptoError{Reason: reason, Message: msg})
 			}
@@ -3058,7 +3082,7 @@ func cryptoSource(): Str {
 		}
 
 		// CryptoJwtHeader decodes a token's header (alg/typ/kid) without verifying it —
-		// handy for choosing a key by "kid" before calling CryptoJwtVerify.
+		// handy for choosing a key by "kid" before naming a codec to read it with.
 		func CryptoJwtHeader(token string) Result[CryptoHeader, CryptoCryptoError] {
 			parts := strings.Split(token, ".")
 			if len(parts) < 1 || parts[0] == "" {
