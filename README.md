@@ -10,12 +10,19 @@
 
 The Hive compiler, written in Hive.
 
-Hive is a memory-managed language. Values behave like values, and a good deal of
-what other languages leave to runtime — every vector index, every branch of a
-match, the columns a SQL query comes back with — is settled at compile time
-instead.
-This directory holds two things: the [specification](spec/) of the language, and
-a compiler for it written in the language it compiles.
+Hive is a compiled, memory-managed language with **no runtime exceptions**:
+there is no null, nothing is thrown, and every vector index is proved in bounds
+before the program runs. What other languages leave to run time — an index, the
+branch of a match, the columns a SQL query comes back with — is settled at
+compile time instead.
+
+It is built for distributed systems from the start, secure by default — TLS
+between nodes, SQL values always bound as parameters, AES-256-GCM and HS256
+tokens in the standard library — and small enough to learn in a day:
+[a tour of the whole language](https://hive-tour.fly.dev) is fifty-four pages.
+
+This directory holds the [specification](spec/) and a compiler for it written in
+the language it compiles.
 
 ```
 ./bootstrap                           build the compiler with itself
@@ -35,102 +42,68 @@ a compiler for it written in the language it compiles.
 ./selfhost                            compile the compiler with itself, twice
 ```
 
-`./hive` is a small wrapper that finds the binary and gets out of the way;
-`hive.cmd` is the same thing for Windows. Installed rather than run from here,
-the compiler *is* `hivec` and takes exactly those arguments — see
-[Installing it](#installing-it).
+`./hive` finds the binary and gets out of the way; `hive.cmd` is the same for
+Windows. Installed rather than run from here, the compiler *is* `hivec` and takes
+exactly those arguments.
 
 ## Installing it
 
-The compiler is **one executable**, and there is nothing to install beside it:
-it carries the Go it compiles against as source text, so there is no runtime
-library, no standard library directory and no configuration file. Put the binary
-somewhere on your `PATH` and you are done.
+The compiler is **one executable**. It carries the Go it compiles against as
+source text, so there is no runtime library, no standard library directory and no
+configuration file: put the binary on your `PATH` and you are done.
 
-What has to be on the machine as well:
-
-| | |
+| also needed | for |
 | --- | --- |
-| **Go 1.24 or newer**, on the `PATH` | for `build`, `run` and `test`, which write a Go module and compile it. `check` and `emit` need nothing at all |
-| `git` | only for an import that names a repository |
-| a network | only the *first* build of a program that opens a database (the SQL drivers) or draws a scene (a pinned three.js). Both are cached under `~/.hive`, and every build after that is offline |
+| **Go 1.24+**, on the `PATH` | `build`, `run` and `test`, which write a Go module and compile it. `check` and `emit` need nothing |
+| `git` | only an import that names a repository |
+| a network | only the *first* build of a program that opens a database or draws a scene. Both cache under `~/.hive`; every build after is offline |
 
 ### Linux and macOS
 
-A file that arrived through a browser, or out of an archive that did not keep
-the bit, is not executable — which is the one step that is easy to forget:
+A file out of a browser or an archive may not have kept its executable bit:
 
 ```sh
 chmod +x hivec
-mkdir -p ~/.local/bin
-mv hivec ~/.local/bin/
+mkdir -p ~/.local/bin && mv hivec ~/.local/bin/
 ```
 
-`~/.local/bin` is already on the `PATH` on most distributions. Where it is not,
-add it to whichever file your shell reads at startup — `~/.bashrc`, `~/.zshrc`,
-`~/.config/fish/config.fish`:
+`~/.local/bin` is on the `PATH` on most distributions; where it is not, add
+`export PATH="$HOME/.local/bin:$PATH"` to your shell's startup file.
+`/usr/local/bin` is the usual place for everybody on the machine.
 
-```sh
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-For everybody on the machine rather than just you, `/usr/local/bin` is the usual
-place and needs `sudo mv`.
-
-**On macOS**, a binary that arrived through a browser is quarantined, and
-Gatekeeper will refuse it with *"cannot be opened because the developer cannot be
-verified"*. Clear the flag:
-
-```sh
-xattr -d com.apple.quarantine ~/.local/bin/hivec
-```
-
-Also mind the architecture: an Apple-silicon Mac wants an `arm64` build and an
-Intel one an `amd64` build. `file hivec` says which you have, and
-[cross-compiling](#building-it-for-another-platform) says how to make the other.
+**On macOS** a downloaded binary is quarantined, and Gatekeeper refuses it with
+*"the developer cannot be verified"* — clear it with
+`xattr -d com.apple.quarantine ~/.local/bin/hivec`. Mind the architecture too:
+Apple silicon wants `arm64`, Intel `amd64`, and `file hivec` says which you have.
 
 ### Windows
 
-There is no `chmod` to do — the `.exe` extension is what makes a file runnable —
-but the folder has to be on the `PATH`, and a downloaded file has to be
-unblocked. In PowerShell:
+No `chmod` — the `.exe` is what makes it runnable — but the folder has to be on
+the `PATH` and a downloaded file has to be unblocked. In PowerShell:
 
 ```powershell
 $dir = "$env:LOCALAPPDATA\Hive"
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 Move-Item .\hivec.exe $dir
-Unblock-File "$dir\hivec.exe"          # clears the "downloaded from the internet" mark
+Unblock-File "$dir\hivec.exe"
 
-# Add it to your own PATH, without touching the machine's:
+# The *user* PATH, read first so no system entry is copied into your account:
 $user = [Environment]::GetEnvironmentVariable("Path", "User")
 [Environment]::SetEnvironmentVariable("Path", "$user;$dir", "User")
 ```
 
-The last line writes the *user* `PATH`, which is why it reads the user `PATH`
-first rather than `$env:Path` — that one is the user's and the machine's joined
-together, and writing it back would copy every system entry into your account.
-**Open a new terminal afterwards**: a running one keeps the environment it
-started with.
+**Open a new terminal afterwards** — a running one keeps the environment it
+started with. SmartScreen may still ask the first time; *More info → Run anyway*.
 
-SmartScreen may still ask about an unsigned executable the first time; *More
-info → Run anyway* is the answer, and `Unblock-File` above usually forestalls it.
-
-Inside this repository, `hive.cmd` is the wrapper that finds `src\hivec.exe` —
-a batch file rather than a PowerShell script, so it runs from `cmd.exe` and from
-PowerShell alike with no execution policy involved:
-
-```
-hive run examples\02-types\types.hive
-```
-
-The cache lives in `%USERPROFILE%\.hive`, which is the same `~/.hive` the rest
-of this README talks about.
+Inside this repository `hive.cmd` finds `src\hivec.exe`; it is a batch file, so
+it runs from `cmd.exe` and PowerShell alike with no execution policy involved.
+The cache is `%USERPROFILE%\.hive`, the same `~/.hive` as everywhere else.
 
 ### Checking that it worked
 
 ```sh
 $ hivec version
-v0.1.9
+v0.2.2
 $ printf 'proc main(): void {\n\techo "it works"\n}\n' > hello.hive
 $ hivec check hello.hive
 No problems found in hello.hive (0s)
@@ -138,31 +111,21 @@ $ hivec run hello.hive
 it works
 ```
 
-`version` reads no source and builds nothing, so it answers as soon as the
-binary is on the PATH at all — it is the cheapest way to tell an install apart
-from a shell that cannot find it. `check` is the next one up: it asks nothing of
-the machine but the compiler itself. If `run` then says
-
-```
-hello.hive:0: this needs the Go toolchain, and `go` is not on the PATH.
-```
-
-then the compiler is installed and Go is not: `go version` should print 1.24 or
-newer, and [go.dev/dl](https://go.dev/dl/) has it for every platform this one
-runs on.
+`version` builds nothing, so it answers as soon as the binary is on the `PATH`;
+`check` asks nothing of the machine but the compiler. If `run` then says
+`this needs the Go toolchain, and 'go' is not on the PATH`, the compiler is
+installed and Go is not — [go.dev/dl](https://go.dev/dl/) has it.
 
 ### The environment it reads, and what it writes
 
-Nothing has to be set for the compiler to work. These four change what it does:
+Nothing has to be set. These four change what it does:
 
 | | |
 | --- | --- |
 | `PATH` | where `go` and `git` are found |
-| `HOME`, or `USERPROFILE` on Windows | decides where the cache goes: `~/.hive` |
-| `HIVE_PROGRESS` | `1` reports progress even when the output is being captured; `0` never reports it. Unset means "when standard error is a terminal" |
+| `HOME`, or `USERPROFILE` on Windows | where the cache goes: `~/.hive` |
+| `HIVE_PROGRESS` | `1` reports progress even when captured, `0` never. Unset means "when standard error is a terminal" |
 | `GOTOOLCHAIN`, `GOFLAGS`, `GOPROXY`, … | Go's own, since a build runs Go |
-
-And `~/.hive` is everything it keeps between builds, all of it re-fetchable:
 
 ```
 ~/.hive/pkg/<repo>@<commit>/   a remote import's clone, shared by every program
@@ -171,27 +134,18 @@ And `~/.hive` is everything it keeps between builds, all of it re-fetchable:
 ~/.hive/syslink.key            a *program's* cluster key, written on first use
 ```
 
-The first three cost one fetch to lose and nothing else, so deleting them is
-always safe. The fourth is not the compiler's at all: it is the key two
-`hive.syslink` nodes authenticate each other with, so replacing it means the
-cluster no longer agrees — copy that file between machines, or set
-`HIVE_SYSLINK_KEY` to the same value on each.
+The first three cost one fetch to lose, so deleting them is always safe. The
+fourth is not the compiler's: it is the key two `hive.syslink` nodes
+authenticate with, so copy it between machines, or set `HIVE_SYSLINK_KEY` to the
+same value on each.
 
 ### Getting the first compiler
 
-Hive builds Hive, so `./bootstrap` needs a compiler to start from — the one at
-`src/hivec`, or another one named outright:
+Hive builds Hive, so `./bootstrap` needs a compiler to start from — `src/hivec`,
+or another named outright with `HIVEC=/path/to/hivec ./bootstrap`. Any `hivec`
+that accepts this source will do.
 
-```sh
-HIVEC=/path/to/some/hivec ./bootstrap
-```
-
-A checkout with no binary in it and nothing to point at cannot build itself,
-which is the ordinary condition of a self-hosted compiler. Any `hivec` that
-accepts this source will do: a colleague's, a release's, or one you
-cross-compiled from another machine.
-
-No binary is committed here. The compiler a build starts from comes from
+No binary is committed here. The one a build starts from comes from
 [a release](../../releases), and [`seed/pinned.txt`](seed/pinned.txt) says which
 release, which asset, and what it hashes to:
 
@@ -207,86 +161,60 @@ HIVEC=/tmp/hivec-linux-amd64 ./bootstrap    # the release builds src/hivec
 ```
 
 That is what [the build workflow](.github/workflows/build.yml) does on every
-push, followed by `./selfhost`, the tests and the examples — the whole of what
-"it still builds" means here. Pushing a tag publishes what came out, for every
-platform Go targets, and [`seed/README.md`](seed/README.md) says how a release
-becomes the one the next build starts from.
-
-It is pinned by digest rather than taken from the latest release for the same
-reason [`src/vendor.hive`](src/vendor.hive) pins three.js: a release asset can be
-replaced under its own tag, and a bootstrap that can be moved under you is not
-one. A digest that does not match is never run.
+push, followed by `./selfhost`, the tests and the examples. Pushing a tag
+publishes what came out, for every platform Go targets;
+[`seed/README.md`](seed/README.md) says how a release becomes the next build's
+starting point. It is pinned **by digest** because a release asset can be
+replaced under its own tag, and a digest that does not match is never run.
 
 ### Building it for another platform
 
-**Your own program** is built for another platform by saying which one, and the
-compiler does the rest:
+**Your own program** takes a `goos/goarch` pair, checked against
+`go tool dist list` before a line of Hive is read:
 
 ```sh
 ./hive build main.hive --target linux/arm64      # writes main-linux-arm64
 ./hive build main.hive --target=windows/amd64    # writes main-windows-amd64.exe
 ```
 
-A target is a `goos/goarch` pair, and the pair is checked against
-`go tool dist list` before a line of Hive is read — an unknown one is an error
-straight away rather than ten seconds into a build. A cross build says which
-platform it is for in its name, so it never displaces the executable this machine
-made, and it takes its `.exe` from the target rather than from here.
-`CGO_ENABLED=0` goes with a cross build and only with one: nothing in the runtime
-needs a C compiler, and a C *cross*-compiler is the one thing a machine with Go
-on it may not have.
+A cross build says which platform it is for in its name, so it never displaces
+the local one, and takes its `.exe` from the target. `CGO_ENABLED=0` goes with a
+cross build and only with one: nothing in the runtime needs a C compiler, and a C
+*cross*-compiler is the one thing a machine with Go may not have.
 
-**The compiler itself** is a Go program, and after any build the module it was
-compiled from is still sitting there — so Go's own cross-compilation makes a
-binary for anywhere it targets, in about twenty seconds:
+**The compiler itself** is a Go program, and the module it was compiled from is
+still there afterwards — so Go's own cross-compilation makes a binary for
+anywhere it targets, in about twenty seconds:
 
 ```sh
 ./bootstrap                                   # writes src/hivec.hive-build
 cd src/hivec.hive-build
 GOOS=windows GOARCH=amd64 go build -o hivec.exe .
 GOOS=darwin  GOARCH=arm64 go build -o hivec-macos-arm64 .
-GOOS=linux   GOARCH=arm64 go build -o hivec-linux-arm64 .
 ```
 
-Each one is a complete compiler: the runtime it carries is source text inside it,
-so nothing else has to travel.
+Each is a complete compiler: the runtime it carries is source text inside it.
 
 ### What it will cost
 
-`hive analyze <entrypoint.hive>` reads the program the emitter is about to write
-and says what looks expensive. It scores every `proc` and `func` out of a hundred,
-prints the worst of them, and writes the whole thing as an HTML page beside the
-entrypoint:
-
-```sh
-hive analyze main.hive
-```
-
-Nothing is built and nothing is run — the numbers come out of the tree, so this
-asks no more of the machine than `hive check` does. The page is a
-[`hive.ui`](spec/14-stdlib.md#1415-hiveui) view rendered with `ui.page`, so it
-carries its own stylesheet and opens in a browser with nothing beside it.
+`hive analyze main.hive` reads the program the emitter is about to write, scores
+every `proc` and `func` out of a hundred, prints the worst and writes the whole
+thing as an HTML page beside the entrypoint — a [`hive.ui`](spec/14-stdlib.md#1415-hiveui)
+view, so it carries its own stylesheet. Nothing is built and nothing is run.
 
 It looks for loops inside loops, a name rebuilt out of itself one turn at a time,
 a linear search inside a loop, something that waits on a disk or a database once
 per turn, and — the one a language of values has that others do not — **implicit
-deep copies**. A finding is worth its own weight times eight for every loop
-around it, and a callable carries half of the worst thing one call to it runs
-into, so a tidy `proc` whose one line calls something quadratic is not scored as
-tidy.
-
-The copies are not guessed at: `writes` already works out which fields a
-`clone_T` still has to copy, since a field nothing writes is shared
-([8.4](spec/08-mutability-and-values.md#84-copy-on-binding)), and the analysis
-reads its answer. A copy it names is one that will be emitted; a binding whose
-storage the compiler shares costs nothing and is never mentioned. Everything else
-is a **weight rather than a measurement** — no compiler knows how many times a
-loop goes round, so this says where to look first, not how long anything takes.
+deep copies**. Those are not guessed at: `writes` already works out which fields
+a `clone_T` has to copy ([8.4](spec/08-mutability-and-values.md#84-copy-on-binding)),
+and the analysis reads its answer, so a copy it names is one that will be
+emitted. Everything else is a **weight rather than a measurement** — no compiler
+knows how many times a loop goes round.
 
 ### In a container
 
-`hive container <entrypoint.hive>` writes a Dockerfile for a program, into the
-folder the command was run in — which is also the build's context:
+`hive container main.hive` writes a Dockerfile into the folder the command ran
+in, which is also the build's context:
 
 ```sh
 hive container main.hive
@@ -294,32 +222,21 @@ docker build -t main .
 docker run --rm -p 8080:8080 main
 ```
 
-Nothing has to be installed to build that image but Docker itself. The first
-stage downloads Go and the compiler for the platform being built for — `amd64`
-on an ordinary machine, `arm64` on an Apple-silicon one, so the build is native
-either way — and compiles the program with the two of them. The second stage is
-the executable and nothing else, on `distroless/static`: no Go, no compiler, not
-even a shell.
+Nothing but Docker has to be installed. The first stage downloads Go and the
+compiler for the platform being built for, so the build is native either way; the
+second is the executable and nothing else on `distroless/static` — no Go, no
+compiler, not even a shell.
 
-The compiler it downloads is the one that wrote the file, named in an
-`ARG HIVEC_VERSION` at the top of the build stage, rather than whatever release
-is newest on the day the image is built. The program was read and checked by
-this compiler, so this compiler is the one that should build it; an image that
-followed the newest release could stop building a program that never changed.
-`docker build --build-arg HIVEC_VERSION=v9.9.9 .` asks for a different one.
+The compiler it downloads is **the one that wrote the file**, named in an
+`ARG HIVEC_VERSION`, rather than whatever is newest on the day — an image
+following the newest release could stop building a program that never changed.
 
-The parts of the file that are not a template are read off the program rather
-than guessed at. A `hive.net.httpServe(8080, ...)` becomes an `EXPOSE 8080` that
-says in a comment where the number came from; an import that names a repository
-puts `git` in the build stage, since the compiler clones it while the image
-builds; a program that opens a database says why `go mod tidy` runs before
-anything compiles. Everything beside the Dockerfile goes into the build, so a
-`.dockerignore` is what narrows that.
-
-What comes out is an ordinary Dockerfile and editing it is expected. A
+The parts that are not a template are read off the program: a
+`hive.net.httpServe(8080, ...)` becomes an `EXPOSE 8080` saying in a comment
+where the number came from, an import naming a repository puts `git` in the build
+stage, a program opening a database says why `go mod tidy` runs first. A
 `Dockerfile` already in the folder is never written over — ours is called
-`Dockerfile-hive-container` instead, and the command says which of the two it
-wrote.
+`Dockerfile-hive-container`, and the command says which it wrote.
 
 ## It compiles itself
 
@@ -333,9 +250,8 @@ stage 3: the compiler, compiled by stage 2...
   FIXPOINT — stage 2 and stage 3 emit byte-identical Go.
 ```
 
-That is the test that says a self-hosted compiler works. Once stage 2 and stage
-3 agree, nothing about whatever compiled the compiler the first time is left in
-it — the language it accepts and the code it writes are the same on both sides.
+That is the test that says a self-hosted compiler works: once the two agree,
+nothing of whatever compiled it the first time is left in it.
 
 ## It says what it is doing
 
@@ -346,8 +262,6 @@ $ ./hive build src/hivec.hive
  0:00  reading src/hivec.hive
  0:00  expanding generics in 28 files
  0:00    100 of 1028 declarations
- ...
- 0:00    1000 of 1028 declarations
  0:00  checking 1028 declarations
  0:02  proving every index in range
  0:03  emitting Go
@@ -356,77 +270,46 @@ Compiled src/hivec.hive -> hivec (9s)
 ```
 
 Every line names something about to be waited on rather than something just
-finished, so the last one printed is always the answer to "what is it doing?".
-It goes to **standard error** and only when standard error is a **terminal**, so
-`hive emit x.hive > main.go` is still Go and a script comparing what a program
-printed is unaffected; `HIVE_PROGRESS=1` says it anyway, and `HIVE_PROGRESS=0`
-never does. The one pass that reports while it works rather than only when it
-starts is the expansion of generics, which used to be where most of a compile
-went: taking the defensive copies out of it turned a seven-minute build of the
-compiler into a nine-second one.
+finished, so the last one printed always answers "what is it doing?". It goes to
+**standard error** and only when that is a **terminal**, so
+`hive emit x.hive > main.go` is still Go; `HIVE_PROGRESS` overrides either way.
 
 ## What is here
 
 ```
 spec/                the language specification, in 18 chapters
-examples/            twenty-two programs, and between them every feature there is
-src/                 the compiler
-  text.hive          the string handling the standard library does not have
-  paths.hive         enough path handling for an `import` to name a file
-  naming.hive        what a name is allowed to look like
-  diag.hive          one error, and where it happened
-  token.hive         what the lexer produces and the parser consumes
-  lexer.hive         source text -> tokens
-  ast.hive           the syntax tree
-  parser.hive        tokens -> one module's tree
-  regex.hive         the regex a string pattern's hole carries, read at compile time
-  show.hive          a tree rendered as one line of parentheses
-  loader.hive        the import graph, and the one module every later pass reads
-  fetch.hive         the import that names a repository rather than a file
-  mono.hive          one copy of a generic per set of type arguments
-  ranges.hive        the bounds pass: every index proved in range
-  types.hive         what a written type means, and what a value's type is
-  stdlib.hive        what `hive.<module>.<name>` means
-  infer.hive         what an expression's type is
-  check.hive         everything a program has to be that the grammar cannot say
-  writes.hive        which fields a deep copy still has to copy
-  emit.hive          one flattened module -> one Go file
-  runtime.hive       the Go the generated program is compiled against
-  goffi.hive         reading an imported Go file's signatures, through Go itself
-  vendor.hive        the one thing a build downloads: the three.js a scene needs
-  progress.hive      what the compiler says while it is working
-  project.hive       writing the Go module, and running the Go toolchain over it
-  analyze.hive       what `hive analyze` scores, and why
-  analyzereport.hive the page it writes, built as a `hive.ui` view
-  container.hive     the Dockerfile `hive container` writes
-  agents.hive        the .hivedocs/ `hive agents` writes, and what else it makes sure of
-  docs/              the pages themselves, carried as source text
-    page.hive        one page, and the marker that stands in for a backtick
-    language.hive    a page per feature of the language
-    library.hive     a page per `hive.*` module
-    ui.hive          `hive.ui`, which is thirteen of them
-  version.hive       which release this compiler is, and what `hive version` says
-  testreport.hive    what `hive test` prints
-  hivec.hive         the command line
-test/                the tests
+examples/            twenty-two of them, thirty-three programs, every feature there is
+src/                 the compiler, in the order the pipeline runs
+  lexer token ast parser         source text -> tokens -> one module's tree
+  regex show                     a string pattern's regex, read at compile time; a tree as one line
+  loader fetch goffi             the import graph: files, repositories, and Go files
+  mono                           one copy of a generic per set of type arguments
+  types infer stdlib             what a written type means, what an expression is, what `hive.*` is
+  check ranges writes            everything the grammar cannot say; every index proved; what a copy copies
+  emit runtime                   one module -> one Go file, and the Go it compiles against
+  project vendor progress        the Go module and toolchain, the one download, what it says meanwhile
+  analyze analyzereport          what `hive analyze` scores, and the page it writes
+  container agents icon docs/    a Dockerfile, .hivedocs/, a window's icon, the pages themselves
+  text paths naming diag         strings, paths, what a name may look like, one error
+  version testreport hivec       the release, what `hive test` prints, the command line
+test/
   *.test.hive        one suite per module, written in Hive
   e2e/               whole programs, compiled, run, and compared
 hive, hive.cmd       the command line, for Unix and for Windows
-bootstrap            build the compiler with itself
-selfhost             build it twice and check the two agree
+bootstrap selfhost   build with itself; build twice and check the two agree
 seed/                which release a build bootstraps from, and its digest
+CHANGELOG.md         what changed, release by release
 .github/workflows/   the bootstrap chain, run on every push
 ```
 
-[examples/](examples) is the other half of the documentation: twenty-two
-programs, from a two-line `echo` to a multiplayer shooter and a ten-car grand
-prix — each of those a server and a client, on a world rolled from a number —
-every one compiled by `./examples/run` and — where a program finishes on its own
-— run and compared with what it says it prints.
+[examples/](examples) is the other half of the documentation: twenty-two of them
+and thirty-three programs between them, from a two-line `echo` to a multiplayer
+shooter and a ten-car grand prix — every one compiled by `./examples/run`, and
+run and compared where the program finishes on its own.
 
-The compiler is about 28,000 lines of Hive — 10,400 of which are the Go runtime
+The compiler is about 38,000 lines of Hive — 12,000 of which are the Go runtime
 and the JavaScript a scene is drawn by, carried as source text — its tests are
-4,400 more, and the examples another 23,000.
+6,400 more, and the examples another 23,000.
 
 ## The pipeline
 
@@ -457,25 +340,21 @@ about six.
 
 ## It drives the toolchain itself
 
-`hive build` writes a Go module and then runs `go build` over it; `hive test`
-runs `go test` and turns what it said into a report; a remote import runs `git`
-to clone the repository it names; an imported Go file's signatures are read by a
-Go program this compiler writes into its own cache and runs; a build that links
-the SQL drivers runs `go mod tidy` first; and a program that draws a scene has
-its three.js fetched over HTTPS and checked against a pinned SHA-256 — with
+`hive build` runs `go build` over the module it wrote; `hive test` runs `go test`
+and turns what it said into a report; a remote import runs `git`; an imported Go
+file's signatures are read by a Go program this compiler writes into its cache
+and runs; a build linking the SQL drivers runs `go mod tidy` first; and a scene's
+three.js is fetched over HTTPS and checked against a pinned SHA-256 — with
 `hive.net` and `hive.crypto`, which is to say with its own standard library.
 
-All of that is Hive, through
-[`hive.term.exec`](spec/14-stdlib.md#145-hiveterm) — a call that runs a command
-and hands back everything it wrote; `hive.term.attach`, which gives a command
-this program's own terminal instead; and `hive.term.execWith`, which is `exec`
-with an environment overlay, and is the whole of how `--target` builds for
-another platform.
+All of it is Hive, through
+[`hive.term.exec`](spec/14-stdlib.md#145-hiveterm), `attach` and `execWith` —
+the last being the whole of how `--target` builds for another platform.
 
 [18 — Conformance](spec/18-conformance.md) is where an implementation answers for
-itself: what it implements (all of it), where it does what the specification
-describes by a different route, the six that holding it against 18.1 turned up in
-it, and four that writing it turned up in the compiler it replaces.
+itself: what it implements, where it takes a different route to what the
+specification describes, and the divergences that holding it against 18.1 turned
+up.
 
 ## Tests
 
@@ -484,92 +363,56 @@ $ ./test/run
 Running the suites with the compiler itself.
 
 text         16 tests: 16 passed
-naming       20 tests: 20 passed
-paths        8 tests: 8 passed
-lexer        40 tests: 40 passed
-regex        21 tests: 21 passed
-parser       56 tests: 56 passed
-loader       23 tests: 23 passed
-fetch        15 tests: 15 passed
-goffi        10 tests: 10 passed
-mono         18 tests: 18 passed
-check        65 tests: 65 passed
-ranges       39 tests: 39 passed
-emit         58 tests: 58 passed
-container    18 tests: 18 passed
-project      8 tests: 8 passed
-hivec        11 tests: 11 passed
+...
+hivec        15 tests: 15 passed
 
 End to end:
   PASS  collections
-  PASS  concurrency
-  PASS  exec
-  PASS  functions
-  PASS  generics
-  PASS  modules
-  PASS  patterns
-  PASS  strings
-  PASS  valueSemantics
+  ...
   PASS  values
 
-  10 programs: 10 passed
+  13 programs: 13 passed
 
 Everything passed.
 ```
 
-The unit suites are Hive files declaring `test` blocks: they call the compiler's
-own passes and assert about what came back. They are run **by the compiler
-itself**, which is its own kind of test — a compiler that could not compile its
-own test suite would not be much of one.
+602 unit tests over nineteen suites, and thirteen whole programs. The unit suites
+are Hive files declaring `test` blocks that call the compiler's own passes, run
+**by the compiler itself** — one that could not compile its own test suite would
+not be much of one. The end-to-end suite compiles whole programs, runs them, and
+compares what they printed with the `.expected` beside each; it is a shell script
+because comparing two files is what a shell is for.
 
-The end-to-end suite compiles whole programs and runs them, comparing what they
-printed with the `.expected` file beside each. It is a shell script because
-comparing two files is what a shell is for, not because Hive could not.
-
-`./examples/run` does the same for the twenty-two programs in
-[examples/](examples), which are the language's own tour rather than a test of
-the compiler — but they are compiled, run and compared all the same, because an
-example that has stopped being true is worse than no example. Six of them carry
-test suites of their own, and those are 273 tests more.
+`./examples/run` does the same for the thirty-three programs in
+[examples/](examples), which are the language's tour rather than a test of the
+compiler — but compiled, run and compared all the same, because an example that
+has stopped being true is worse than none. Six carry test suites of their own,
+and those are 273 tests more.
 
 ## Reading it
 
-The compiler is meant to be read. Every module opens with what it is for and
-what it decided not to do; the interesting choices are argued for where they were
-made rather than in a design document nobody opens.
-
-Eight places are worth reading first, because each is a decision the language
+The compiler is meant to be read. Every module opens with what it is for and what
+it decided not to do, and the interesting choices are argued for where they were
+made. Eight are worth reading first, because each is a decision the language
 forced:
 
-* **`lexer.hive`** — the lexer works over `split(source, "")` rather than
-  indexing the source, because every index is proved in range one at a time and a
-  scanner asks about the same string a million times. The cursor is a `mut`
-  parameter, which is the one way storage crosses a call boundary; everything
-  that only reads takes the characters and an index instead, so no reader ever
-  costs a copy.
-* **`parser.hive`** — errors do not stop it. A failure sets a flag, every loop
+* **`lexer.hive`** — works over `split(source, "")` rather than indexing, because
+  every index is proved in range one at a time and a scanner asks a million times.
+* **`parser.hive`** — errors do not stop it: a failure sets a flag, every loop
   checks it, and the declaration loop clears it and skips to the next `proc`.
-* **`emit.hive`** — every lowering decision is a type. `+` is three operators,
-  `==` is two, and `/` is one of two; the walk carries the scope beside the
-  output, and the *wanted* type down, which is the only thing that can settle a
-  `Result.Ok` or an empty vector.
-* **`project.hive`** — where the compiler stops being a compiler and starts
-  being a build: a Go module written to disk, `go build` run over it, and the
-  difference between a command whose output only matters when it fails and one
-  that is talking to whoever started you.
-* **`ranges.hive`** — the bounds pass, and the language's headline guarantee: it
-  proves the compiler's own twenty-eight thousand lines in range without a single
-  refusal. The module is called `ranges` because `bounds` is a keyword.
-* **`types.hive`** — `same` is written out rather than left to `==`, and the
-  comment says why: `==` on a union whose variant holds a vector crashes. That is
-  a bug in the compiler that bootstraps this one, and finding it is what made
-  this compiler write its own.
-* **`goffi.hive`** — what happens when a program imports a Go file. The
-  signatures are read by Go's own parser, in a program this compiler writes into
-  its cache and runs; everything after that is the mapping between the two type
-  systems, and every refusal in it names the parameter it could not take.
-* **`runtime.hive`** — ten thousand lines of Go carried as source text, which
-  is where the standard library actually lives: HTTP and WebSockets on a hijacked
-  connection, a service's mailbox and the TLS wire under it, a window and the
-  three.js a scene is drawn by. A module a program never named is never written
-  into the build, and that decision is one table.
+* **`emit.hive`** — every lowering decision is a type. `+` is three operators and
+  `==` is two; the walk carries the *wanted* type down, which is the only thing
+  that can settle a `Result.Ok` or an empty vector.
+* **`project.hive`** — where the compiler stops being a compiler and starts being
+  a build: a Go module on disk, and `go build` run over it.
+* **`ranges.hive`** — the bounds pass, and the headline guarantee: it proves the
+  compiler's own thirty-eight thousand lines in range without a single refusal.
+  Called `ranges` because `bounds` is a keyword.
+* **`types.hive`** — `same` is written out rather than left to `==`, because `==`
+  on a union whose variant holds a vector crashes. That is a bug in the compiler
+  that bootstraps this one, and finding it is what made this one write its own.
+* **`goffi.hive`** — what happens when a program imports a Go file: the signatures
+  are read by Go's own parser, in a program this compiler writes and runs.
+* **`runtime.hive`** — twelve thousand lines of Go carried as source text, which is
+  where the standard library actually lives. A module a program never named is
+  never written into the build, and that decision is one table.
