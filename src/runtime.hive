@@ -8109,8 +8109,17 @@ func uiSource(): Str {
 		__EXTRA__
 		</body></html>~BT~
 
+		`,
+		// A program's own typeface, by the same convention its icon arrives on: ship
+		// `assets/font.woff2` and the window is set in it. Nothing declares it and
+		// nothing detects it — the rule is always written, and a program with no such
+		// file serves a 404, the face is unavailable, and the stack falls through to
+		// the system's own. A miss costs one request and changes nothing.
+		`
 		const uiCSS = ~BT~*,*::before,*::after{box-sizing:border-box}
-		body{margin:0;font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
+		@font-face{font-family:hive-own;font-weight:100 900;font-display:swap;
+		src:url("/_hive/asset/font.woff2") format("woff2")}
+		body{margin:0;font:14px/1.5 hive-own,system-ui,-apple-system,"Segoe UI",sans-serif;
 		background:var(--bg);color:var(--fg)}
 		:root{--bg:#fff;--fg:#16181c;--muted:#5b6470;--line:#e3e6ea;--accent:#1d9bf0;
 		--good:#00a870;--warn:#c47d00;--danger:#d7263d;--surface:#f7f9fa}
@@ -9200,6 +9209,11 @@ func uiSceneSource(): Str {
 		// looking. A name over somebody's head is the case this is for, and it is why it
 		// takes no rotation: a label you can read from one side only is not a label.
 		`
+		func UiSprite(attrs []UiAttr, image string, wide float64, tall float64) UiShape {
+			return UiShape{Kind: "sprite", Attrs: attrs, Text: image,
+				Nums: []float64{wide, tall}}
+		}
+
 		func UiLabel(attrs []UiAttr, words string) UiShape {
 			return UiShape{Kind: "label", Attrs: attrs, Text: words}
 		}
@@ -9275,6 +9289,8 @@ func uiSceneSource(): Str {
 		}
 
 		func UiAttrLens(fov int) UiAttr        { return uiNum("lens", fov) }
+		func UiAttrGrain(px int) UiAttr        { return uiNum("grain", px) }
+		func UiAttrBits(each int) UiAttr       { return uiNum("bits", each) }
 		func UiAttrFog(far int) UiAttr         { return uiNum("fog", far) }
 		func UiAttrGrab(on bool) UiAttr        { return UiAttr{Kind: "grab", Flag: on} }
 		func UiAttrCrosshair(on bool) UiAttr   { return UiAttr{Kind: "crosshair", Flag: on} }
@@ -9388,12 +9404,26 @@ func uiSceneSource(): Str {
 			if lit, ok := uiFind(attrs, "shadows"); ok && !lit.Flag {
 				bits |= uiSceneEyeFlat
 			}
+			grain, hasGrain := uiFind(attrs, "grain")
+			depth, hasBits := uiFind(attrs, "bits")
+			if hasGrain {
+				bits |= uiSceneEyeGrain
+			}
+			if hasBits {
+				bits |= uiSceneEyeBits
+			}
 			uiPackU8(b, bits)
 			if hasLens {
 				uiPackU16(b, lens.Num)
 			}
 			if hasFog {
 				uiPackU16(b, fog.Num)
+			}
+			if hasGrain {
+				uiPackU16(b, grain.Num)
+			}
+			if hasBits {
+				uiPackU16(b, depth.Num)
 			}
 			if hasSky {
 				uiPackWord(b, uiSceneTone(sky.Enum, "#8ecbff"))
@@ -9593,7 +9623,17 @@ func uiSceneSource(): Str {
 			}
 			uiPackU8(b, uiSceneKindCode(s.Kind))
 			uiPackU8(b, mask)
-			uiPackWord(b, uiSceneTone(uiScenePartEnum(p.paint), "#cfd6de"))
+		`,
+		// A sprite unpainted is white, where every solid unpainted is grey. A picture
+		// already has its own colours and the tint multiplies them, so the default has
+		// to be the one that changes nothing; grey would quietly darken every sprite
+		// nobody had an opinion about.
+		`
+			bare := "#cfd6de"
+			if s.Kind == "sprite" {
+				bare = "#ffffff"
+			}
+			uiPackWord(b, uiSceneTone(uiScenePartEnum(p.paint), bare))
 			if mask&uiSceneHasAt != 0 {
 				uiSceneVecTo(b, uiScenePartNums(p.at, uiSceneOrigin))
 			}
@@ -9628,6 +9668,7 @@ func uiSceneSource(): Str {
 			uiSceneLabel    = 5
 			uiSceneLine     = 6
 			uiSceneSound    = 7
+			uiSceneSprite   = 8
 
 			uiSceneHasAt      = 1
 			uiSceneHasTurn    = 2
@@ -9642,6 +9683,8 @@ func uiSceneSource(): Str {
 			uiSceneEyeSky  = 4
 			uiSceneEyeGrab = 8
 			uiSceneEyeFlat = 16
+			uiSceneEyeGrain = 32
+			uiSceneEyeBits  = 64
 		)
 		`,
 		// A kind the page does not know is drawn as a box, which is what an unknown
@@ -9659,6 +9702,8 @@ func uiSceneSource(): Str {
 				return uiSceneGround
 			case "label":
 				return uiSceneLabel
+			case "sprite":
+				return uiSceneSprite
 			case "line":
 				return uiSceneLine
 			case "sound":
@@ -9849,6 +9894,8 @@ func uiSceneJs(): Str {
 		var beat = 0;
 		var want = "", grabbing = false, lookX = 0, lookY = 0, last = 0, dirty = false;
 		var held = {};
+		var frame = null, sheet = null, screen = null, coarse = 0, deep = 0, shrink = 1;
+		var pics = new Map();
 
 		function boot() {
 		  renderer = new THREE.WebGLRenderer({antialias: true});
@@ -9859,8 +9906,22 @@ func uiSceneJs(): Str {
 		  stage = new THREE.Scene();
 		  camera = new THREE.PerspectiveCamera(75, 1, 0.08, 800);
 		  camera.rotation.order = "YXZ";
-		  stage.add(new THREE.HemisphereLight(0xffffff, 0x4a5568, 0.65));
-		  sun = new THREE.DirectionalLight(0xffffff, 1.35);
+		`,
+		// **Most of the light is ambient, and that is what a handheld's world looked
+		// like.** A machine with no per-pixel lighting baked what light it had into
+		// the texture and lit the rest flat, so a face pointing away from the sun was
+		// not a darker version of itself — it was the same colour. Two thirds of the
+		// old sun moved into the sky here: what is left is enough for a kerb to catch
+		// an edge and for the normal maps to have something to be normal to, and not
+		// enough to put a tonal ramp across a wall.
+		//
+		// The sky term is also no longer blue-grey underneath. A hemisphere light with
+		// a cold ground colour is a lighting model — it says the world is lit from
+		// above by sky and from below by dirt — and that is one more gradient than a
+		// flat picture wants.
+		`
+		  stage.add(new THREE.HemisphereLight(0xffffff, 0xdfe3e8, 1.15));
+		  sun = new THREE.DirectionalLight(0xffffff, 0.55);
 		  sun.position.set(6, 14, 8);
 		  sun.castShadow = true;
 		  sun.shadow.mapSize.set(2048, 2048);
@@ -10000,6 +10061,7 @@ func uiSceneJs(): Str {
 		  holder.style.width = w + "px";
 		  holder.style.height = h + "px";
 		  renderer.setSize(w, h, false);
+		  sized(w, h);
 		  camera.aspect = w / h;
 		  camera.updateProjectionMatrix();
 		  dirty = true;
@@ -10027,6 +10089,151 @@ func uiSceneJs(): Str {
 		// Drawn into the scene's own canvas, scissored to where its box landed, which
 		// decides the one rule an inset has: it has to be over the picture. A box the
 		// canvas does not reach is clipped, and skipped when there is none of it left.
+		`
+		function handheld() { return coarse > 0 || deep > 0; }
+		`,
+		// THE PICTURE A HANDHELD WOULD HAVE DRAWN. Two numbers, and between them the
+		// whole of the look: grain is how few pixels the world is drawn into before it
+		// is blown up again, and bits is how few values each of its three channels may
+		// take. Neither is a filter over a modern picture — the world is *rendered* at
+		// the coarse size, so a wall a pixel wide is a pixel wide rather than a grey
+		// smear of one, which is the difference between pixel art and a blur.
+		//
+		// The quantisation is dithered rather than rounded, and that is the half that
+		// matters. Rounded, a sky gradient becomes eight flat bands with hard steps
+		// across the screen; dithered, the step is broken up into a fixed pattern that
+		// reads as a gradient and gives the picture the woven look a machine with
+		// fifteen bits of colour had. It is the same decision this program already
+		// made about its music, which is bit-reduced to ten bits for the same reason
+		// and with the same catch: what you hear is not the crunch, it is the noise
+		// staying put instead of following the signal down.
+		//
+		// A four-by-four ordered matrix, held as a texture rather than a constant
+		// array: dynamic indexing into one is not something every GL ES 1.0 driver
+		// will do, and a four-texel-square lookup is free.
+		`
+		function bayer() {
+		  var m = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+		  var px = new Uint8Array(16);
+		  for (var i = 0; i < 16; i++) { px[i] = Math.round(m[i] * 255 / 16); }
+		  var t = new THREE.DataTexture(px, 4, 4, THREE.RedFormat);
+		  t.minFilter = THREE.NearestFilter;
+		  t.magFilter = THREE.NearestFilter;
+		  t.wrapS = THREE.RepeatWrapping;
+		  t.wrapT = THREE.RepeatWrapping;
+		  t.needsUpdate = true;
+		  return t;
+		}
+		`,
+		// The quad the coarse picture is blown up onto. Nearest all the way: the whole
+		// point is that one drawn pixel becomes a square of them with an edge on it.
+		`
+		function sheeting() {
+		  var vert = [
+		    "varying vec2 vUv;",
+		    "void main() {",
+		    "  vUv = uv;",
+		    "  gl_Position = vec4(position.xy, 0.0, 1.0);",
+		    "}"
+		  ].join("\n");
+		`,
+		// **The buffer is linear and the screen is not.** Rendering to the canvas,
+		// three.js encodes the frame on its way out; rendering to a target it does not,
+		// and a raw shader reading that target gets light in linear units. Write those
+		// to the page and every midtone is about half as bright as it should be — which
+		// is not subtle: measured against the same circuit before the pass existed, the
+		// world came out at a quarter of its brightness and read as a different time of
+		// day. So the encode is done here, by hand, because nothing else is going to.
+		//
+		// And the quantisation happens *after* it, which is the other half of being
+		// right: fifteen-bit colour was fifteen bits of what the screen displayed, not
+		// of what the maths was carried in. Dithering in linear space puts all of the
+		// steps in the highlights and none in the shadows, where the eye is looking.
+		`
+		  var frag = [
+		    "uniform sampler2D tex;",
+		    "uniform sampler2D mix4;",
+		    "uniform vec2 size;",
+		    "uniform float steps;",
+		    "varying vec2 vUv;",
+		    "vec3 shown(vec3 c) {",
+		    "  vec3 lo = c * 12.92;",
+		    "  vec3 hi = 1.055 * pow(max(c, vec3(0.0)), vec3(0.4166667)) - 0.055;",
+		    "  return mix(lo, hi, step(vec3(0.0031308), c));",
+		    "}",
+		    "void main() {",
+		    "  vec3 c = shown(texture2D(tex, vUv).rgb);",
+		    "  if (steps > 0.0) {",
+		    "    vec2 cell = floor(vUv * size);",
+		    "    float d = texture2D(mix4, (cell + 0.5) / 4.0).r - 0.5;",
+		    "    c = floor(c * steps + d + 0.5) / steps;",
+		    "  }",
+		    "  gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);",
+		    "}"
+		  ].join("\n");
+		  var mat = new THREE.ShaderMaterial({
+		    uniforms: {
+		      tex: {value: null},
+		      mix4: {value: bayer()},
+		      size: {value: new THREE.Vector2(1, 1)},
+		      steps: {value: 0}
+		    },
+		    vertexShader: vert,
+		    fragmentShader: frag,
+		    depthTest: false,
+		    depthWrite: false
+		  });
+		  var quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat);
+		  quad.frustumCulled = false;
+		  var over = new THREE.Scene();
+		  over.add(quad);
+		  screen = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+		  return {scene: over, mat: mat};
+		}
+		`,
+		// The coarse buffer, remade only when the shape of it changes. Depth is asked
+		// for because the world is drawn into this and a world without a depth buffer
+		// is a world drawn in the order it was declared.
+		`
+		function sized(w, h) {
+		  if (!handheld()) {
+		    if (frame) { frame.dispose(); frame = null; }
+		    shrink = 1;
+		    return;
+		  }
+		  shrink = 1;
+		  if (coarse > 0) {
+		    shrink = Math.min(1, coarse / Math.max(1, Math.min(w, h)));
+		  }
+		  var tw = Math.max(1, Math.round(w * shrink));
+		  var th = Math.max(1, Math.round(h * shrink));
+		  if (!frame) {
+		    frame = new THREE.WebGLRenderTarget(tw, th, {depthBuffer: true});
+		  } else if (frame.width !== tw || frame.height !== th) {
+		    frame.setSize(tw, th);
+		  }
+		  frame.texture.minFilter = THREE.NearestFilter;
+		  frame.texture.magFilter = THREE.NearestFilter;
+		  frame.texture.generateMipmaps = false;
+		}
+		`,
+		// One frame through the pass: the world into the coarse buffer, the insets
+		// into it after — they are set *into* the picture, so they are set into the
+		// same pixels — and then the whole of it blown up onto the page.
+		`
+		function blown() {
+		  if (!sheet) { sheet = sheeting(); }
+		  renderer.setRenderTarget(frame);
+		  renderer.clear();
+		  renderer.render(stage, camera);
+		  if (looks.length) { insets(); }
+		  renderer.setRenderTarget(null);
+		  sheet.mat.uniforms.tex.value = frame.texture;
+		  sheet.mat.uniforms.size.value.set(frame.width, frame.height);
+		  sheet.mat.uniforms.steps.value = deep > 0 ? Math.pow(2, deep) - 1 : 0;
+		  renderer.render(sheet.scene, screen);
+		}
+		`,
 		`
 		function insets() {
 		  var drew = false;
@@ -10059,14 +10266,16 @@ func uiSceneJs(): Str {
 		//
 		// --- one frame -------------------------------------------------------------
 		`
-		    renderer.setViewport(left, seen.height - low, w, h);
-		    renderer.setScissor(left, seen.height - low, w, h);
+		    renderer.setViewport(left * shrink, (seen.height - low) * shrink,
+		      w * shrink, h * shrink);
+		    renderer.setScissor(left * shrink, (seen.height - low) * shrink,
+		      w * shrink, h * shrink);
 		    renderer.render(stage, spare);
 		  }
 		  if (drew) {
 		    renderer.setScissorTest(false);
-		    renderer.setViewport(0, 0, seen.width, seen.height);
-		    renderer.setScissor(0, 0, seen.width, seen.height);
+		    renderer.setViewport(0, 0, seen.width * shrink, seen.height * shrink);
+		    renderer.setScissor(0, 0, seen.width * shrink, seen.height * shrink);
 		  }
 		}
 		`,
@@ -10116,11 +10325,12 @@ func uiSceneJs(): Str {
 		// The kinds and the bits, exactly as uiSceneShape and uiSceneCamera write them.
 		`
 		var KINDS = ["box", "sphere", "cylinder", "cone", "ground", "label", "line",
-		  "sound"];
+		  "sound", "sprite"];
 		var SOUND = 7;
 		var HAS_AT = 1, HAS_TURN = 2, HAS_SIZE = 4, HAS_SURFACE = 8, HAS_WORDS = 16,
 		  HAS_VOICE = 32, HAS_TRACK = 64;
-		var EYE_LENS = 1, EYE_FOG = 2, EYE_SKY = 4, EYE_GRAB = 8, EYE_FLAT = 16;
+		var EYE_LENS = 1, EYE_FOG = 2, EYE_SKY = 4, EYE_GRAB = 8, EYE_FLAT = 16,
+		  EYE_GRAIN = 32, EYE_BITS = 64;
 		`,
 		// Where an eye is and what it can see. The same block for the world's own
 		// camera and for every inset looking at that world, which is why an inset
@@ -10136,6 +10346,8 @@ func uiSceneJs(): Str {
 		  var bits = readU8();
 		  into.lens = (bits & EYE_LENS) ? readU16() : 0;
 		  into.fog = (bits & EYE_FOG) ? readU16() : 0;
+		  into.grain = (bits & EYE_GRAIN) ? readU16() : 0;
+		  into.bits = (bits & EYE_BITS) ? readU16() : 0;
 		  into.sky = (bits & EYE_SKY) ? readWord() : "";
 		  into.grab = (bits & EYE_GRAB) !== 0;
 		  into.flat = (bits & EYE_FLAT) !== 0;
@@ -10144,8 +10356,8 @@ func uiSceneJs(): Str {
 		}
 
 		function eyeless() {
-		  return {eye: [0, 0, 0], aim: [0, 0], lens: 0, fog: 0, sky: "", grab: false,
-		    flat: false, on: ""};
+		  return {eye: [0, 0, 0], aim: [0, 0], lens: 0, fog: 0, grain: 0, bits: 0,
+		    sky: "", grab: false, flat: false, on: ""};
 		}
 		`,
 		// One shape, read into the same object every time: a record is written straight
@@ -10368,6 +10580,11 @@ func uiSceneJs(): Str {
 
 		function apply(w) {
 		  want = w.on || "";
+		  if (w.grain !== coarse || w.bits !== deep) {
+		    coarse = w.grain;
+		    deep = w.bits;
+		    sized(seen.width, seen.height);
+		  }
 		  var sky = w.sky ? heavens(w.sky) : null;
 		  if (sky) { stage.background = sky; }
 		  if (w.fog) {
@@ -10434,12 +10651,27 @@ func uiSceneJs(): Str {
 		  if (u.kind !== s.k) { return false; }
 		  if (s.k === "line") { return true; }
 		  if (s.k === "label") { return u.words === s.x && u.tint === s.c; }
+		  if (s.k === "sprite" && u.words !== s.x) { return false; }
 		  var d = s.d, e = u.dims;
 		  if (e.length !== d.length) { return false; }
 		  for (var i = 0; i < d.length; i++) {
 		    if (e[i] !== d[i]) { return false; }
 		  }
 		  return true;
+		}
+
+		function pixels(path) {
+		  var t = pics.get(path);
+		  if (!t) {
+		    t = new THREE.TextureLoader().load("/_hive/asset/" +
+		      path.split("/").map(encodeURIComponent).join("/"));
+		    t.minFilter = THREE.NearestFilter;
+		    t.magFilter = THREE.NearestFilter;
+		    t.generateMipmaps = false;
+		    t.colorSpace = THREE.SRGBColorSpace;
+		    pics.set(path, t);
+		  }
+		  return t;
 		}
 
 		function build(s) {
@@ -10453,6 +10685,22 @@ func uiSceneJs(): Str {
 		    var tex = sign(s.x || "", s.c);
 		    made = new THREE.Sprite(new THREE.SpriteMaterial({map: tex, transparent: true, depthWrite: false}));
 		    made.scale.set(0.42 * tex.userData.aspect, 0.42, 1);
+		`,
+		// A picture that always faces you, standing on its place.
+		//
+		// **Its centre is its foot and not its middle**, which is the one thing about
+		// it that is not obvious and is the only thing that makes it usable: what a
+		// sprite is for is a tree, a marshal, somebody in a grandstand — things that
+		// stand on the ground — and a picture centred on its position is a picture
+		// buried to the waist in it.
+		`
+		  } else if (s.k === "sprite") {
+		    var pic = pixels(s.x || "");
+		    made = new THREE.Sprite(new THREE.SpriteMaterial({map: pic,
+		      transparent: true, depthWrite: false, alphaTest: 0.4,
+		      color: new THREE.Color(s.c || "#ffffff")}));
+		    made.center.set(0.5, 0);
+		    made.scale.set(s.d[0] || 1, s.d[1] || 1, 1);
 		  } else {
 		    var sig = s.k + "|" + s.d.join(",") + "|" + perTile(s);
 		    var geo = geoms.get(sig);
@@ -10512,6 +10760,23 @@ func uiSceneJs(): Str {
 		  }
 		  o.position.set(s.p[0], s.p[1], s.p[2]);
 		  if (s.k === "label") { o.updateMatrix(); return; }
+		`,
+		// **A sprite dresses itself and leaves before the wardrobe below.** What is at
+		// the bottom of this function is `paintOf`, which answers with a *mesh*
+		// material — a map, a normal map and a toon ramp — and a billboard wearing one
+		// samples a surface texture it has no normals for and comes out solid black.
+		// A label got out of the way of that on the line above; this is the same exit
+		// for the same reason, with the tint kept up to date on the way through
+		// because a sprite's colour is the one thing about it a frame can change.
+		`
+		  if (s.k === "sprite") {
+		    if (u.tint !== s.c) {
+		      o.material.color.setStyle(bare(s.c));
+		      u.tint = s.c;
+		    }
+		    o.updateMatrix();
+		    return;
+		  }
 		  if (s.turned) { o.rotation.set(s.r[0], s.r[1], s.r[2]); }
 		  else if (o.rotation.x || o.rotation.y || o.rotation.z) { o.rotation.set(0, 0, 0); }
 		  o.updateMatrix();
@@ -10830,6 +11095,16 @@ func uiSceneJs(): Str {
 		  tex.wrapS = THREE.RepeatWrapping;
 		  tex.wrapT = THREE.RepeatWrapping;
 		  tex.repeat.set(tile[0], tile[1]);
+		`,
+		// **Nearest close up and filtered away from you**, which is not a compromise
+		// between the two — it is what each end of the picture actually needs. Under
+		// the wheels a tile is magnified and a smoothed texel is a blurred one, so the
+		// grid the surface was drawn on should be visible. A dozen metres ahead the
+		// same tile is minified past one texel per pixel, and nearest there is the
+		// shimmer anisotropy exists to put down. So magnification is hard, and
+		// minification keeps its mipmaps and its anisotropy.
+		`
+		  tex.magFilter = THREE.NearestFilter;
 		  tex.anisotropy = most();
 		  skins.set(key, tex);
 		  waiting.push({finish: finish, draw: draw, tex: tex});
@@ -10961,6 +11236,7 @@ func uiSceneJs(): Str {
 		    base = new THREE.CanvasTexture(canvas);
 		    base.wrapS = THREE.RepeatWrapping;
 		    base.wrapT = THREE.RepeatWrapping;
+		    base.magFilter = THREE.NearestFilter;
 		    base.anisotropy = most();
 		    reliefs.set(finish, base);
 		    waiting.push({finish: finish, draw: draw, tex: base});
@@ -11596,6 +11872,7 @@ func uiSceneJs(): Str {
 		  if (want.indexOf("p") >= 0) { pads(); }
 		  reported(now);
 		  if (dirty) {
+		    if (handheld()) { blown(); dirty = false; return; }
 		    renderer.render(stage, camera);
 		`,
 		// After the picture and never instead of it: an inset is set *into* what
@@ -12031,12 +12308,22 @@ func uiSceneJs(): Str {
 		// bytes may not be here yet, so one still decoding when it was struck is
 		// simply not heard — which is what a sound that has already happened is.
 		`
-		var STRUCK = {Impact: true, Chime: true};
+		var STRUCK = {Impact: true, Chime: true, Talk: true};
 
+		`,
+		// **A struck voice is positioned once and never again**, because a struck
+		// voice is a thing that happened rather than a thing that is happening: there
+		// is nothing left to move. That is right for an impact, which happened at a
+		// place, and wrong for `Talk`, which did not happen anywhere. Panned, a line
+		// of commentary is pinned to whatever spot the camera stood on when it began
+		// and the car then drives away from it — quieter every metre, and off to one
+		// side. So this one connects straight to the master, exactly as `Music` does
+		// in `sustained` and for the same reason.
+		`
 		function strike(kind, s) {
 		  var gain = ears.createGain();
-		  var pan = sited(gain);
-		  standing(pan, s.p);
+		  if (kind === "Talk") { gain.connect(master); }
+		  else { standing(sited(gain), s.p); }
 		  var now = ears.currentTime;
 		  var loud = Math.max(0.0001, s.g === undefined ? 1 : s.g);
 		  var pitch = s.h === undefined ? 1 : s.h;

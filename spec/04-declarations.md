@@ -95,17 +95,22 @@ func greet(name: Str, style: Greeting): Str {
 }
 ```
 
-A `func` **may perform I/O** — `echo`, `hive.file`, `hive.net` are all allowed. It
-differs from a `proc` in exactly two ways:
-
-1. it cannot declare a mutex parameter (`v: mut T`); a `mut` value passed to a
-   `func` is seen as an ordinary immutable copy instead, and
-2. it cannot call a `proc`.
+A `func` **may perform I/O** — `echo`, `hive.file`, `hive.net` are all allowed —
+and it **may call a `proc`**. It differs from a `proc` in exactly one way: it
+cannot declare a mutex parameter (`v: mut T`), and a `mut` value passed to a
+`func` is seen as an ordinary immutable copy instead.
 
 What a `func` promises, then, is not purity in the mathematical sense but that
-**it cannot write to storage its caller can see**. That is exactly what makes an
-imported Go function a `func` ([12](12-modules.md#124-importing-a-go-file)): the
-boundary copies in both directions, so nothing on the far side can reach back.
+**it cannot write to storage its caller can see**. That one rule is the whole of
+what keeps the promise, together with the rule on a mutex *argument*
+([8.2](08-mutability-and-values.md#82-mutex-parameters)): a mutex has to be
+handed a `mut` variable or a path into one, and the only `mut` variables in a
+`func` are its own. So whatever a `proc` it calls writes through, the caller
+cannot see it.
+
+That is also what makes an imported Go function a `func`
+([12](12-modules.md#124-importing-a-go-file)): the boundary copies in both
+directions, so nothing on the far side can reach back.
 
 ## 4.3 `proc`
 
@@ -115,9 +120,8 @@ proc grow(vec: mut Str[dyn], tag: Str): void {
 }
 ```
 
-A `proc` may do everything a `func` may, plus declare mutex parameters and call
-other procs. Programs start at `proc main(): void`, in the file handed to
-`hive build` / `hive run`.
+A `proc` may do everything a `func` may, plus declare mutex parameters. Programs
+start at `proc main(): void`, in the file handed to `hive build` / `hive run`.
 
 ## 4.4 Returning on every path
 

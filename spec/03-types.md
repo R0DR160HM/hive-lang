@@ -201,15 +201,15 @@ A `proc` or `func` is a value. Its type is written like a declaration with the
 name dropped:
 
 ```hive
-func(Int): Int                                  // pure
-proc(hive.net.HttpRequest): hive.net.HttpResponse  // impure
+func(Int): Int
+proc(hive.net.HttpRequest): hive.net.HttpResponse
 ```
 
 It is usable as a parameter, a return and a variable type.
 
 The `proc`/`func` split is preserved through values: a `func` value **may** be
-used where a `proc` is expected (pure widens to impure), a `proc` value may
-**not** fill a `func` slot, and a `func` still cannot *call* a proc value.
+used where a `proc` is expected, and a `proc` value may **not** fill a `func`
+slot.
 
 `mut` may not appear in a function type. A function value has no call site to
 take a mutex from, so a callable with a mutex parameter can be neither

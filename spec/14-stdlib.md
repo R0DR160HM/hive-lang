@@ -530,9 +530,9 @@ handler is, and is checked as one, so a window has an address, needs no mutex,
 and can be posted to by a background task or by another machine. That is why the
 module needs no notion of a *command*.
 
-**The view is a `func`, and that is not a formality.** A func cannot call a proc
-and cannot hold a mutex, so drawing cannot act — which matters because a repaint
-happens on every change.
+**The view is a `func`, and that is not a formality.** A func cannot hold a
+mutex, so drawing cannot write the model or anything else the caller can see —
+which matters because a repaint happens on every change.
 
 **Every widget takes the same two things: its attributes, then its payload.**
 There are no optional parameters in Hive, so what would be an optional argument
@@ -660,6 +660,7 @@ without a radius is not a sphere with a default one.
 | `roof(attrs, wide, tall, long)` | a pitched roof: a ridge down its length, a slope each side, a gable closing each end |
 | `ground(attrs, width, depth)` | a plane that already lies flat |
 | `label(attrs, words)` | words that always face the viewer |
+| `sprite(attrs, image, wide, tall)` | a picture that always faces the viewer |
 | `line(attrs, fromX, fromY, fromZ, toX, toY, toZ)` | |
 | `sound(attrs, name)` | a noise at a place — see [below](#a-sound-is-a-shape) |
 
@@ -674,6 +675,21 @@ means everywhere what it means anywhere. **`label` takes no rotation** for the
 same reason a label exists: one you can read from one side only is not a label.
 **`line` takes no position**, because a line is *between* two places and has no
 third one to call its own.
+
+**`sprite` names a picture in the program's own `assets/`**, the way a `track`
+names a recording, and stands it in the world at a size given in metres. Like a
+label it always faces the viewer and takes no rotation. **Its place is its foot
+and not its middle** — what a sprite is for is something standing on the ground,
+and one centred on its position is buried to the waist in it.
+
+The image is drawn with no filtering, so what a program put in the file is what
+appears, pixel for pixel, however near the camera gets. `paint` *tints* it: the
+colour multiplies the image, so a picture drawn white takes whatever colour the
+scene asks for and one drawn in its own colours should be left unpainted. Absent,
+a sprite is untinted — which is the one place `paint` does not default to grey.
+
+A file that is not there is not an error, for the reason a missing `track` is not:
+nothing is drawn, and the scene carries on.
 
 ### Where a shape is, and what it is made of
 
@@ -789,7 +805,7 @@ about a filter.
 | | |
 | --- | --- |
 | sustained | `Engine` `Tyres` `Brakes` `Wind` `Crowd` `Music` |
-| struck | `Impact` `Chime` |
+| struck | `Impact` `Chime` `Talk` |
 
 **The payload is a name, and the name is the shape's identity between frames.**
 This is the one place audio cannot follow the rule the solids follow. A box is
@@ -814,8 +830,16 @@ it back is a second one.
 
 Sounds are **positioned**, and the listener is the scene's own `eye` and `aim` —
 so what is heard on the left is what is drawn on the left, and a car goes past
-your ear as well as your eye. `Music` is the exception: it has nowhere to stand,
-so it is never panned.
+your ear as well as your eye. `Music` and `Talk` are the exceptions: neither has
+anywhere to stand, so neither is ever panned.
+
+**`Talk` is struck and unpanned, and it needs to be both.** A struck voice is
+positioned once and never moved, because a thing that has happened has nowhere
+left to go — which is right for an `Impact`, and wrong for anything being said
+about the scene rather than in it. Pinned to a place, a spoken line is one the
+listener then walks away from: quieter every metre, and sliding to one side. So
+`Talk` goes straight to the output, and a commentator, a narrator or a line of
+dialogue stays where the listener is.
 
 Nothing is downloaded. Every voice is oscillators and filtered noise, for the same
 reason a `Surface` is a drawn pattern rather than an image: a built Hive program
@@ -869,8 +893,33 @@ These go on the `scene` itself rather than on a shape.
 | `fog(Int)` | how far you can see, in metres |
 | `background(Tone)` | the sky, which the fog fades into |
 | `shadows(Bool)` | whether the sun casts. Absent is yes |
+| `grain(Int)` | the short edge the world is drawn into, in pixels |
+| `bits(Int)` | how many bits of colour each channel keeps |
 | `grab(Bool)` | whether the window should hold the mouse |
 | `crosshair(Bool)` | whether to draw one in the middle |
+
+### A picture may be drawn coarsely
+
+`grain(Int)` and `bits(Int)` are one decision in two halves: how few pixels the
+world is drawn into, and how few values each of its colour channels may take.
+Absent, a scene is drawn at the size of its box in the colour the screen has.
+
+`grain` is the **short edge in pixels**. The world is rendered into a buffer that
+size and blown up to the box with no filtering, so what a program gets is a
+picture actually drawn small — a wall a pixel wide is a pixel wide, with an edge
+on it — rather than a full-size picture blurred. The long edge follows the box's
+own shape, so nothing is stretched.
+
+`bits` is **per channel**, and the quantisation is *dithered* rather than rounded:
+the value lands on one of its steps or the next according to a fixed four-by-four
+pattern, so a gradient comes out woven instead of banded. Five bits is the fifteen
+-bit colour most handhelds had. It is applied after the frame is encoded for the
+screen, because a display's bit depth is a fact about what it displays and not
+about the arithmetic behind it — dithering in linear light puts every step in the
+highlights and none where the eye is looking.
+
+Insets are drawn into the same buffer, so a second look at the world is grained
+and quantised with the first.
 
 Lighting is **not** something a scene describes. The rig is fixed — one light
 from the sky and one from a sun — chosen so that a solid painted a colour comes

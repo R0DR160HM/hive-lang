@@ -658,13 +658,13 @@ test "a canvas draws without linking a scene" {
 test "a program with no tests generates no test file" {
 	p := loader.loadText("main.hive", "proc main(): void \{ }")
 	out := emit.emitModule(p.module)
-	assert emit.emitTests(p.module, out.atoms, out.codecs) == ""
+	assert emit.emitTests(p.module, out.atoms, out.codecs, out.modules).source == ""
 }
 
 test "each test is a subtest, named in the prose it was written with" {
 	p := loader.loadText("main.hive", "test \"it holds\" \{ assert true }")
 	out := emit.emitModule(p.module)
-	generated := emit.emitTests(p.module, out.atoms, out.codecs)
+	generated := emit.emitTests(p.module, out.atoms, out.codecs, out.modules).source
 	assert has(generated, "func TestHive(t *testing.T)")
 	assert has(generated, "t.Run(\"it holds\", func(t *testing.T) \{")
 	assert has(generated, "defer hive.TestRecover(t)")
@@ -673,10 +673,24 @@ test "each test is a subtest, named in the prose it was written with" {
 test "an assertion over a comparison binds each side once and reports both" {
 	p := loader.loadText("main.hive", "func two(): Int \{ return 2 }\ntest \"t\" \{ assert two() == 2 }")
 	out := emit.emitModule(p.module)
-	generated := emit.emitTests(p.module, out.atoms, out.codecs)
+	generated := emit.emitTests(p.module, out.atoms, out.codecs, out.modules).source
 	// The call is written once, into a temporary, and the temporary is what both
 	// the comparison and the report read.
 	assert has(generated, ":= two()")
 	assert has(generated, "hive.TestAssertCmp(t,")
 	assert has(generated, "hive.Show(_l")
+}
+
+test "a module only a test calls is carried" {
+	p := loader.loadText("main.hive", "test \"t\" \{ assert hive.conv.sti(\"1\") is Result.Ok(_) }")
+	out := emit.emitModule(p.module)
+	tests := emit.emitTests(p.module, out.atoms, out.codecs, out.modules)
+	assert indexOf(out.modules, "conv") is Result.Error(_)
+	assert indexOf(tests.modules, "conv") is Result.Ok(_)
+}
+
+test "a name an `is` binds outside an `if` reaches the rest of the condition" {
+	got := stmt("r := hive.conv.sti(\"1\")\nb := r is Result.Ok(n) && n == 1\necho b")
+	assert has(got, "func() bool \{")
+	assert has(got, "n := _t")
 }

@@ -1781,7 +1781,70 @@ proc standaloneMatch(em: mut Emit, env: infer.Env, subject: ast.Expr, pattern: a
 
 // --- Operators ---------------------------------------------------------------
 
+// Whether an `is` among these conjuncts binds a name a later one could read.
+func conjunctsBind(parts: ast.Expr[]): Bool {
+	for each part in parts {
+		if part is ast.Expr.IsMatch(_, pattern) {
+			if patternBinds(pattern) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func patternBinds(p: ast.Pattern): Bool {
+	if p is ast.Pattern.Constructor(_, bindings, _) {
+		for each b in bindings {
+			if b != "_" {
+				return true
+			}
+		}
+	} else if p is ast.Pattern.VectorPat(elements, rest) {
+		if rest != "" && rest != "_" {
+			return true
+		}
+		for each item in elements {
+			if item is ast.VecElem.Bind(name) {
+				if name != "_" {
+					return true
+				}
+			}
+		}
+	} else if p is ast.Pattern.StrTemplate(parts) {
+		return len(holeNames(parts)) > 0
+	}
+	return false
+}
+
+// A condition outside an `if` whose `is` binds for the rest of it. The guards an
+// `if` would write go into a closure answering whether they all held.
+proc boundConjunction(em: mut Emit, env: infer.Env, parts: ast.Expr[]): Str {
+	outer := em.out
+	indent := em.indent
+	em.out = []
+	em.indent = 0
+	flag := fresh(em, "m")
+	line(em, flag + " := false")
+	emitGuards(em, env, parts, 0, ast.Block([]), flag, types.Ty.TVoid())
+	line(em, "return " + flag)
+	// One line, so the spans coverage reads off `em.out` still count Go lines.
+	body := join(em.out, "; ")
+	em.out = outer
+	em.indent = indent
+	return "func() bool \{ " + body + " }()"
+}
+
 proc binary(em: mut Emit, env: infer.Env, op: ast.BinOp, left: ast.Expr, right: ast.Expr): Str {
+	if op is ast.BinOp.And {
+		mut parts := conjuncts(left)
+		for each part in conjuncts(right) {
+			append(parts, part)
+		}
+		if conjunctsBind(parts) {
+			return boundConjunction(em, env, parts)
+		}
+	}
 	leftType := infer.typeOf(env, left)
 	rightType := infer.typeOf(env, right)
 	// An atom coerces to `Str` beside one, as its decimal value rather than its
@@ -3919,12 +3982,13 @@ proc restArgs(em: mut Emit, env: infer.Env, args: ast.Arg[]): Str {
 
 // --- Tests -------------------------------------------------------------------
 
-// The `main_test.go` for a program's tests, or `""` when it has none.
-proc emitTests(m: ast.Module, atoms: Str[], codecs: Str[]): Str {
+// The `main_test.go` for a program's tests (`""` when it has none), and the
+// modules the build carries once a test's own calls are counted.
+proc emitTests(m: ast.Module, atoms: Str[], codecs: Str[], modules: Str[]): Emitted {
 	t := types.tableOf(m)
-	// The codecs `main.go` already wrote are seeded rather than written again:
+	// What `main.go` already wrote or asked for is seeded rather than repeated:
 	// the two files are one Go package.
-	mut Emit em = Emit(t, [], 0, copiedNames(atoms), [], [], [], [], lentFuncs(t, m.decls), [], copiedNames(codecs), 0, [], [], [], [], true, false, false, -1, [], writes.writtenShapes(m), [], 0, false, [])
+	mut Emit em = Emit(t, [], 0, copiedNames(atoms), copiedNames(modules), [], [], [], lentFuncs(t, m.decls), [], copiedNames(codecs), 0, [], [], [], [], true, false, false, -1, [], writes.writtenShapes(m), [], 0, false, [])
 	written := len(codecs)
 	mut found := false
 	for each d in m.decls {
@@ -3933,7 +3997,7 @@ proc emitTests(m: ast.Module, atoms: Str[], codecs: Str[]): Str {
 		}
 	}
 	if found == false {
-		return ""
+		return Emitted("", [], em.atoms, em.modules, em.codecs, false, [])
 	}
 
 	line(em, "package main")
@@ -3963,7 +4027,7 @@ proc emitTests(m: ast.Module, atoms: Str[], codecs: Str[]): Str {
 	// wanted it. A pattern only a test used is the same story.
 	emitCodecsFrom(em, written)
 	emitPatterns(em)
-	return join(em.out, "\n") + "\n"
+	return Emitted(join(em.out, "\n") + "\n", [], em.atoms, em.modules, em.codecs, false, em.errors)
 }
 
 func copiedNames(names: Str[]): Str[dyn] {
