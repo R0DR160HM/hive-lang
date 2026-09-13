@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.4
+
+### Language
+
+* A backtick string interpolates `{expression}` the way a `"..."` string does, and `\{` is its literal `{`.
+
 ## v0.2.4-pre1
 
 ### Language

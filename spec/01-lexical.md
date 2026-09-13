@@ -160,25 +160,28 @@ compile error, because there is nobody to answer the question it asks.
 
 ### 1.3.2 Backtick strings
 
-A `` `...` `` string is **raw**: no interpolation, and it may span lines. It
-cannot contain a backtick.
+A `` `...` `` string may span lines and cannot contain a backtick. It
+interpolates `{expression}`, and reads a `{name is (regex)}` hole, exactly as a
+`"..."` string does ([1.3.1](#131-double-quoted-strings)).
 
-Its one escape is `\{`, a literal `{`; a `\` before anything else is itself. A
-bare `{` is still literal too, but `\{` is the spelling that keeps working once
-backtick strings interpolate `{expression}` the way `"..."` strings do.
+Its one escape is `\{`, a literal `{`; a `\` before anything else is itself, so
+`\n` is a backslash and an `n`. That keeps a backtick string the place for text
+full of backslashes — a regex, a Windows path, source code in another language.
 
 Its indentation is removed at compile time: leading and trailing blank lines are
 dropped, then the longest common leading whitespace of every non-blank line is
 removed from all of them. So the string says what it looks like, and where it
-sits in the file is a layout matter rather than part of the value.
+sits in the file is a layout matter rather than part of the value. Dedenting
+happens before interpolations are read, so it is the source that is dedented,
+never a value spliced into it.
 
 ```hive
-func goSource(): Str {
+func goSource(name: Str): Str {
 	return `
-		package hive
+		package {name}
 
-		func Assert(ok bool) {
-			if !ok { panic("hive: assertion failed") }
+		func Assert(ok bool) \{
+			if !ok \{ panic("hive: assertion failed") }
 		}
 	`
 }
