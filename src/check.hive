@@ -25,7 +25,7 @@ type Check {
 	inside: Str
 	// The line it was declared on — the best position a flattened tree offers.
 	line: Int
-	// Whether the body is a `func` — which may not call a `proc`.
+	// Whether the body is a `func` — which may not declare a mutex parameter.
 	pure: Bool
 	// What the body has to return, or `TVoid`.
 	result: types.Ty
@@ -817,7 +817,8 @@ proc checkName(c: mut Check, env: infer.Env, name: Str): void {
 	if infer.isBound(env, name) {
 		return
 	}
-	if types.findCallable(env.table, name) is Result.Ok(_) {
+	if types.findCallable(env.table, name) is Result.Ok(info) {
+		checkTakesNoMutex(c, name, info.params, "used as a value")
 		return
 	}
 	if types.findType(env.table, name) is Result.Ok(_) {
@@ -1043,11 +1044,10 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
 	checkMember(c, env, subject, field)
 	// A call through a function value is checked by what the value's type says.
 	ty := infer.typeOf(env, ast.Expr.Member(subject, field))
-	if ty is types.Ty.TFn(pure, params, _) {
+	if ty is types.Ty.TFn(_, params, _) {
 		if len(params) != len(args) {
 			report(c, "`{field}` takes " + countOf(len(params)) + ", and this call passes " + countOf(len(args)))
 		}
-		checkPurity(c, pure, field)
 	}
 }
 
@@ -1121,13 +1121,17 @@ func isNumberPair(left: types.Ty, right: types.Ty): Bool {
 }
 
 proc checkArguments(c: mut Check, env: infer.Env, name: Str, info: types.CallableInfo, args: ast.Arg[]): void {
-	checkPurity(c, info.pure, name)
 	if checkArgumentNames(c, name, namesOfParams(info.params), args) == false {
 		return
 	}
 	if len(args) != len(info.params) {
 		report(c, "`{name}` takes " + countOf(len(info.params)) + ", and this call passes " + countOf(len(args)))
 		return
+	}
+	// A partial application is a value too, and a value has no call site to take
+	// a mutex from.
+	if hasHole(args) {
+		checkTakesNoMutex(c, name, info.params, "partially applied")
 	}
 	mut open := 0
 	for each p in info.params {
@@ -1150,13 +1154,25 @@ proc checkArguments(c: mut Check, env: infer.Env, name: Str, info: types.Callabl
 	}
 }
 
-// A `func` cannot call a `proc`. What it promises is not mathematical purity —
-// it may echo, read a file, reach the network — but that it cannot write to
-// storage its caller can see.
-proc checkPurity(c: mut Check, calleePure: Bool, name: Str): void {
-	if c.pure && calleePure == false {
-		report(c, "a `func` cannot call the `proc` `{name}`: a proc may hold a mutex and write through it, and a func promises it cannot write to storage its caller can see. Make this one a `proc`, or make `{name}` a `func`")
+// A callable that asks for a mutex can be neither referenced nor partially
+// applied ([8.2](../spec/08-mutability-and-values.md)): a function value has no
+// call site to take one from, and Go would be the one to say so otherwise.
+proc checkTakesNoMutex(c: mut Check, name: Str, params: ast.Param[], how: Str): void {
+	for each p in params {
+		if p.mutex {
+			report(c, "`{name}` asks for the mutex itself in `{p.name}: mut ...`, so it cannot be " + how + ": a function value has no call site to take a mutex from. Call it where it is written, or take an ordinary `{p.name}: ...` and answer with the new value")
+			return
+		}
 	}
+}
+
+func hasHole(args: ast.Arg[]): Bool {
+	for each a in args {
+		if a.value is ast.Expr.Hole {
+			return true
+		}
+	}
+	return false
 }
 
 proc checkFieldArguments(c: mut Check, env: infer.Env, name: Str, fields: ast.Field[], args: ast.Arg[]): void {

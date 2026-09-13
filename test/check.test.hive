@@ -129,9 +129,25 @@ test "an argument of the wrong type is named, with both types" {
 
 // --- The proc/func split -----------------------------------------------------
 
-test "a func cannot call a proc" {
-	got := problem("proc side(): Int \{ return 1 }\nfunc pure(): Int \{ return side() }")
-	assert opens(got, "in `pure`: a `func` cannot call the `proc` `side`")
+test "a func may call a proc" {
+	assert problemCount("proc side(): Int \{ return 1 }\nfunc asks(): Int \{ return side() }") == 0
+	assert problemCount("proc fill(out: mut Int[dyn], n: Int): void \{ append(out, n) }\n"
+		+ "func build(): Int[dyn] \{ mut Int[dyn] out = []  fill(out, 1)  return out }") == 0
+}
+
+test "what a func hands a mutex parameter is its own storage and nothing else" {
+	got := problem("proc fill(out: mut Int[dyn], n: Int): void \{ append(out, n) }\n"
+		+ "func sneak(theirs: Int[dyn]): Int \{ fill(theirs, 1)  return len(theirs) }")
+	assert opens(got, "in `sneak`: `fill` asks for the mutex itself in `out: mut ...`")
+}
+
+test "a callable that asks for a mutex is neither referenced nor partially applied" {
+	grow := "proc grow(v: mut Str[dyn], tag: Str): void \{ append(v, tag) }\n"
+	assert opens(problem(grow + inMain("f := grow")),
+		"in `main`: `grow` asks for the mutex itself in `v: mut ...`, so it cannot be used as a value")
+	assert opens(problem(grow + inMain("f := grow(_, \"x\")")),
+		"in `main`: `grow` asks for the mutex itself in `v: mut ...`, so it cannot be partially applied")
+	assert problemCount(grow + inMain("mut Str[dyn] v = []  grow(v, \"x\")")) == 0
 }
 
 test "a func cannot declare a mutex parameter" {
@@ -139,10 +155,9 @@ test "a func cannot declare a mutex parameter" {
 	assert opens(got, "in `grow`: a `func` cannot declare the mutex parameter `v: mut ...`")
 }
 
-test "a proc calling a proc is fine, and so is a func calling a func" {
+test "either may call either" {
 	assert problemCount("proc a(): Int \{ return 1 }\nproc b(): Int \{ return a() }") == 0
 	assert problemCount("func a(): Int \{ return 1 }\nfunc b(): Int \{ return a() }") == 0
-	// A func value may fill a proc slot: pure widens to impure.
 	assert problemCount("func a(): Int \{ return 1 }\nproc b(): Int \{ return a() }") == 0
 }
 

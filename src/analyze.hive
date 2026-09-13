@@ -155,12 +155,13 @@ proc analyzeModule(m: ast.Module): Report {
 		hive.map.set(lent, name, true)
 	}
 	loud := loopy(m.decls)
+	settled := steady(m.decls)
 
 	mut Scored[dyn] scored = []
 	mut deepest := 0
 	for each d in m.decls {
 		if d is ast.Decl.CallableDecl(kind, name, params, _, body, line) {
-			mut Walk w = Walk(t, written, leaked, lent, loud, [], [], 0)
+			mut Walk w = Walk(t, written, leaked, lent, loud, settled, [], [], 0)
 			at := At(infer.boundParams(infer.newEnv(t), params, 0), mutexes(params), 0, [], false)
 			walkBlock(w, at, body)
 			if w.deepest > deepest {
@@ -225,6 +226,251 @@ func loopsIn(b: ast.Block): Bool {
 	return false
 }
 
+// --- What answers off its arguments -------------------------------------------
+//
+// The loop-invariant finding needs a callee that really does answer the same
+// every turn. `func` is no help: one may print, read a file, draw random bytes
+// and — since a func may call a proc — reach anything at all.
+//
+// So it is asked here, of the body: a callable is **steady** when it makes no
+// library call, starts no thread, prints nothing, holds no mutex, and everything
+// it calls is steady too. Deliberately blunt — every `hive.` call counts, even
+// `hive.math.max` — because the cost of being wrong is advice that changes what
+// a program does.
+
+// One callable, as the fixpoint below needs it.
+type Reach {
+	name: Str
+	// Something it does that a turn of the loop would stop doing.
+	acts: Bool
+	// The declared callables it reaches.
+	calls: Str[dyn]
+}
+
+// The walk's state. Everything shared lives here rather than in a parameter:
+// this is handed over as a mutex, and a `types.Table` passed by value at every
+// node would be deep-copied at every node.
+type Reaching {
+	// Every callable this module declares, so a called name can be told from a
+	// builtin — and from an imported Go function, which could do anything.
+	declared: hive.map.Map<Str, Bool>
+	acts: Bool
+	calls: Str[dyn]
+}
+
+// What the spread below works over, behind a mutex for the same reason.
+type Settling {
+	// The names still believed steady.
+	on: hive.map.Map<Str, Bool>
+	// Callee -> the names that call it, which is the way unsteadiness travels.
+	callers: hive.map.Map<Str, Str[dyn]>
+}
+
+proc steady(decls: ast.Decl[]): Str[dyn] {
+	reaches := reachesOf(decls)
+	mut Settling s = Settling(hive.map.new(), hive.map.new())
+	// Everything starts steady but what acts on its own account.
+	mut Str[dyn] spreading = []
+	for each r in reaches {
+		if r.acts {
+			append(spreading, r.name)
+		} else {
+			hive.map.set(s.on, r.name, true)
+		}
+		for each callee in r.calls {
+			calledBy(s, callee, r.name)
+		}
+	}
+	// Unsteadiness travels to callers and never the other way, so one pass over
+	// a worklist settles it — every name goes on at most once.
+	mut at := 0
+	for ; at < len(spreading); at++ {
+		if spreading bounds at {
+			for each caller in callersOf(s, spreading[at]) {
+				if hive.map.has(s.on, caller) {
+					hive.map.delete(s.on, caller)
+					append(spreading, caller)
+				}
+			}
+		}
+	}
+	mut Str[dyn] out = []
+	for each r in reaches {
+		if hive.map.has(s.on, r.name) {
+			append(out, r.name)
+		}
+	}
+	return out
+}
+
+proc calledBy(s: mut Settling, callee: Str, caller: Str): void {
+	if hive.map.get(s.callers, callee) is Result.Ok(had) {
+		mut Str[dyn] more = had
+		append(more, caller)
+		hive.map.set(s.callers, callee, more)
+		return
+	}
+	hive.map.set(s.callers, callee, [caller])
+}
+
+proc callersOf(s: mut Settling, callee: Str): Str[dyn] {
+	if hive.map.get(s.callers, callee) is Result.Ok(names) {
+		return names
+	}
+	return []
+}
+
+proc reachesOf(decls: ast.Decl[]): Reach[dyn] {
+	mut Reaching r = Reaching(hive.map.new(), false, [])
+	for each d in decls {
+		if d is ast.Decl.CallableDecl(_, name, _, _, _, _) {
+			hive.map.set(r.declared, name, true)
+		}
+	}
+	mut Reach[dyn] out = []
+	for each d in decls {
+		if d is ast.Decl.CallableDecl(_, name, params, _, body, _) {
+			// A mutex parameter is storage of somebody else's, written through.
+			r.acts = len(mutexes(params)) > 0
+			r.calls = []
+			reachBlock(r, body)
+			append(out, Reach(name, r.acts, r.calls))
+		}
+	}
+	return out
+}
+
+proc reachBlock(r: mut Reaching, b: ast.Block): void {
+	for each s in b.stmts {
+		reachStmt(r, s)
+	}
+}
+
+proc reachStmt(r: mut Reaching, s: ast.Stmt): void {
+	if s is ast.Stmt.VarDecl(_, value, _, deferred) {
+		if deferred { r.acts = true }
+		reachExpr(r, value)
+	} else if s is ast.Stmt.TypedDecl(_, _, value, _, deferred) {
+		if deferred { r.acts = true }
+		reachExpr(r, value)
+	} else if s is ast.Stmt.Assign(target, value) {
+		reachExpr(r, target)
+		reachExpr(r, value)
+	} else if s is ast.Stmt.IfChain(branches, otherwise, _) {
+		for each br in branches {
+			reachExpr(r, br.condition)
+			reachBlock(r, br.body)
+		}
+		reachBlock(r, otherwise)
+	} else if s is ast.Stmt.ForLoop(init, cond, post, body) {
+		reachStmt(r, init)
+		reachExpr(r, cond)
+		reachStmt(r, post)
+		reachBlock(r, body)
+	} else if s is ast.Stmt.ForEach(_, _, subject, body) {
+		reachExpr(r, subject)
+		reachBlock(r, body)
+	} else if s is ast.Stmt.ReturnStmt(value) {
+		reachExpr(r, value)
+	} else if s is ast.Stmt.EchoStmt(value) {
+		// Printing is the plainest thing a hoist would do fewer of.
+		r.acts = true
+		reachExpr(r, value)
+	} else if s is ast.Stmt.AssertStmt(condition) {
+		r.acts = true
+		reachExpr(r, condition)
+	} else if s is ast.Stmt.PanicStmt(value) {
+		r.acts = true
+		reachExpr(r, value)
+	} else if s is ast.Stmt.AsyncStmt(c) {
+		r.acts = true
+		reachExpr(r, c)
+	} else if s is ast.Stmt.Expression(value) {
+		reachExpr(r, value)
+	}
+}
+
+proc reachExpr(r: mut Reaching, e: ast.Expr): void {
+	if e is ast.Expr.Call(callee, args) {
+		reachCallee(r, callee)
+		for each a in args {
+			reachExpr(r, a.value)
+		}
+	} else if e is ast.Expr.Member(subject, _) {
+		reachExpr(r, subject)
+	} else if e is ast.Expr.Index(subject, index) {
+		reachExpr(r, subject)
+		reachExpr(r, index)
+	} else if e is ast.Expr.Slice(subject, low, high) {
+		reachExpr(r, subject)
+		reachExpr(r, low)
+		reachExpr(r, high)
+	} else if e is ast.Expr.Binary(_, left, right) {
+		reachExpr(r, left)
+		reachExpr(r, right)
+	} else if e is ast.Expr.Negate(operand) {
+		reachExpr(r, operand)
+	} else if e is ast.Expr.Not(operand) {
+		reachExpr(r, operand)
+	} else if e is ast.Expr.IsMatch(subject, _) {
+		reachExpr(r, subject)
+	} else if e is ast.Expr.VectorLit(items) {
+		for each i in items {
+			reachExpr(r, i)
+		}
+	} else if e is ast.Expr.Interp(parts) {
+		for each p in parts {
+			if p is ast.InterpPart.Expression(value) {
+				reachExpr(r, value)
+			}
+		}
+	} else if e is ast.Expr.AwaitAll(calls, timeout) {
+		r.acts = true
+		for each c in calls {
+			reachExpr(r, c)
+		}
+		reachExpr(r, timeout)
+	} else if e is ast.Expr.Timed(c, ms) {
+		r.acts = true
+		reachExpr(r, c)
+		reachExpr(r, ms)
+	}
+}
+
+// What is being called: a declared callable is recorded, a builtin is ignored —
+// none of them acts — a library call acts, and anything this cannot name acts,
+// since a function value could be holding anything.
+proc reachCallee(r: mut Reaching, callee: ast.Expr): void {
+	if callee is ast.Expr.Ident(name) {
+		if hive.map.has(r.declared, name) {
+			if indexOf(r.calls, name) is Result.Error(_) {
+				append(r.calls, name)
+			}
+			return
+		}
+		if infer.isBuiltin(name) {
+			return
+		}
+		r.acts = true
+		return
+	}
+	if callee is ast.Expr.Member(subject, _) {
+		// `hive.file.read(...)` acts; `User(...)`, `Shape.Circle(...)` and
+		// `T.decode(...)` are computation like any other.
+		if rootName(subject) == "hive" {
+			r.acts = true
+		}
+		return
+	}
+	r.acts = true
+}
+
+func rootName(e: ast.Expr): Str {
+	if e is ast.Expr.Ident(name) { return name }
+	if e is ast.Expr.Member(subject, _) { return rootName(subject) }
+	return ""
+}
+
 // --- Walking a body ------------------------------------------------------------
 
 type Walk {
@@ -234,6 +480,7 @@ type Walk {
 	leaked: hive.map.Map<Str, Str>
 	lent: hive.map.Map<Str, Bool>
 	loud: Str[dyn]
+	steady: Str[dyn]
 	found: Finding[dyn]
 	calls: Str[dyn]
 	deepest: Int
@@ -437,7 +684,7 @@ proc call(w: mut Walk, at: At, callee: ast.Expr, args: ast.Arg[]): void {
 		}
 		if types.findCallable(w.table, name) is Result.Ok(info) {
 			arguments(w, at, info, args)
-			hoistable(w, at, info, name, args)
+			hoistable(w, at, name, args)
 		}
 		return
 	}
@@ -494,8 +741,14 @@ proc arguments(w: mut Walk, at: At, info: types.CallableInfo, args: ast.Arg[]): 
 }
 
 // A call inside a loop that the loop changes nothing of.
-proc hoistable(w: mut Walk, at: At, info: types.CallableInfo, name: Str, args: ast.Arg[]): void {
-	if at.depth == 0 || info.pure == false {
+proc hoistable(w: mut Walk, at: At, name: Str, args: ast.Arg[]): void {
+	if at.depth == 0 {
+		return
+	}
+	// `func` is no answer to this: a func may read a file, print, and call a
+	// proc. What the finding needs is that the callee answers off its arguments
+	// and does nothing a turn of the loop would stop doing.
+	if indexOf(w.steady, name) is Result.Error(_) {
 		return
 	}
 	if indexOf(w.loud, name) is Result.Error(_) {
