@@ -1,11 +1,12 @@
 # Changelog
 
-## v0.2.4
+## v0.2.4-pre1
 
 ### Language
 
 * **A `func` may call a `proc`.** It still cannot declare a mutex parameter,
   which is what keeps it from writing to storage its caller can see.
+* A backtick string reads `\{` as a literal `{`, ahead of backtick strings gaining interpolation.
 
 ### Standard library
 

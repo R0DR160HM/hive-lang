@@ -160,8 +160,12 @@ compile error, because there is nobody to answer the question it asks.
 
 ### 1.3.2 Backtick strings
 
-A `` `...` `` string is **raw**: no escapes, no interpolation, and it may span
-lines. It cannot contain a backtick.
+A `` `...` `` string is **raw**: no interpolation, and it may span lines. It
+cannot contain a backtick.
+
+Its one escape is `\{`, a literal `{`; a `\` before anything else is itself. A
+bare `{` is still literal too, but `\{` is the spelling that keeps working once
+backtick strings interpolate `{expression}` the way `"..."` strings do.
 
 Its indentation is removed at compile time: leading and trailing blank lines are
 dropped, then the longest common leading whitespace of every non-blank line is
