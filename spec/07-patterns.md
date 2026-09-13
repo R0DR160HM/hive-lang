@@ -111,10 +111,10 @@ the second says for itself where it ends.
 
 **Nothing inside the parentheses is escaped by the string.** A hole is recognised
 by that exact shape, so the `\` and the `{` between them belong to the regex:
-`{year is (\d{4})}` is four digits, not an interpolation of `4`. That is also why
-a hole is written in an ordinary `"..."` pattern and never a backtick one — a
-backtick string has no holes at all, and one written there would match those
-characters literally, which the compiler refuses rather than allows.
+`{year is (\d{4})}` is four digits, not an interpolation of `4`. A backtick
+pattern reads holes the same way. Written as `\{name is (...)}`, though, a hole
+is literal text that would match those characters and never the shape, which
+the compiler refuses rather than allows.
 
 **The regex is read at compile time**, so a malformed one is a compile error
 naming what is wrong with it:

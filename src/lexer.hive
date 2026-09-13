@@ -5,7 +5,7 @@
 // `if`, and not a name either.
 //
 // Three constructs need light context tracking, and `Mode` is the whole of it: a
-// `"..."` string may hold `{expression}` interpolations, captured raw for the
+// quoted or backtick string may hold `{expression}` interpolations, captured raw for the
 // parser; the `{ ... }` after `query` is SQL, taken verbatim; and after `import`
 // comes a path, whose `.`, `..` and `/` would each otherwise lex as an operator.
 //
@@ -418,9 +418,9 @@ proc scanInterpolation(cs: Str[], s: mut Scan, b: mut StrPartBuf, opened: Int): 
 	return false
 }
 
-// A backtick string is raw: no interpolation, may span lines, and one escape —
-// `\{`, reserved for when `{` interpolates here too. Its indentation says where
-// it sits in the file rather than what it holds, so it is removed.
+// A backtick string may span lines and reads `{...}` as a `"..."` string does, but
+// its one escape is `\{`. Its indentation says where it sits in the file rather
+// than what it holds, so it is removed — before the interpolations are read.
 proc scanBacktick(cs: Str[], s: mut Scan): void {
 	opened := s.line
 	s.pos = s.pos + 1
@@ -430,8 +430,7 @@ proc scanBacktick(cs: Str[], s: mut Scan): void {
 		if c == "`" {
 			raw := text.span(cs, start, s.pos - 1)
 			s.pos = s.pos + 1
-			value := text.replace(text.dedent(raw), "\\\{", "\{")
-			append(s.tokens, token.Token(token.Kind.StrLit(value), opened))
+			scanBacktickText(text.chars(text.dedent(raw)), s, opened)
 			return
 		}
 		if c == "\n" {
@@ -439,6 +438,44 @@ proc scanBacktick(cs: Str[], s: mut Scan): void {
 		}
 	}
 	append(s.errors, diag.at(opened, "this backtick string never closes"))
+}
+
+// A backtick string's dedented text, in pieces. Literal text is taken a run at a
+// time, since a runtime source is one long string.
+proc scanBacktickText(cs: Str[], s: mut Scan, opened: Int): void {
+	mut Scan inner = Scan(0, opened, Mode.Normal(), [], [])
+	mut StrPartBuf b = StrPartBuf([], "")
+	mut run := 0
+	for ; inner.pos < len(cs); {
+		c := text.charAt(cs, inner.pos)
+		if c == "\\" && text.charAt(cs, inner.pos + 1) == "\{" {
+			b.buf = b.buf + text.span(cs, run, inner.pos - 1) + "\{"
+			inner.pos = inner.pos + 2
+			run = inner.pos
+		} else if c == "\{" {
+			b.buf = b.buf + text.span(cs, run, inner.pos - 1)
+			inner.pos = inner.pos + 1
+			if scanRegexHole(cs, inner, b) == false {
+				if scanInterpolation(cs, inner, b, opened) == false {
+					for each e in inner.errors {
+						append(s.errors, e)
+					}
+					return
+				}
+			}
+			run = inner.pos
+		} else {
+			if c == "\n" {
+				inner.line = inner.line + 1
+			}
+			inner.pos = inner.pos + 1
+		}
+	}
+	b.buf = b.buf + text.span(cs, run, len(cs) - 1)
+	for each e in inner.errors {
+		append(s.errors, e)
+	}
+	finishString(s, b, opened)
 }
 
 func unescape(c: Str): Str {
