@@ -29,6 +29,7 @@ func pages(): page.Page[dyn] {
 		page.Page("stdlib/net-websockets.md", netWebsockets()),
 		page.Page("stdlib/net-sockets.md", netSockets()),
 		page.Page("stdlib/net-names.md", netNames()),
+		page.Page("stdlib/net-urls.md", netUrls()),
 		page.Page("stdlib/sql.md", sql()),
 		page.Page("stdlib/syslink.md", syslink()),
 		page.Page("stdlib/syslink-calls.md", syslinkCalls()),
@@ -48,7 +49,7 @@ func index(): Str {
 		changes what is linked.
 
 		Each module owns its types under its own namespace: ~BT~hive.net.HttpRequest~BT~,
-		~BT~hive.codec.DecodingError~BT~, ~BT~hive.map.Map~BT~, ~BT~hive.syslink.Address~BT~. The only
+		~BT~hive.json.JsonError~BT~, ~BT~hive.map.Map~BT~, ~BT~hive.syslink.Address~BT~. The only
 		builtin types that live directly on ~BT~hive~BT~ are the three the language uses
 		without a module: ~BT~Result~BT~ and ~BT~Table~BT~.
 
@@ -79,6 +80,7 @@ func index(): Str {
 		| [net-websockets](net-websockets.md) | ~BT~hive.net~BT~ | WebSockets |
 		| [net-sockets](net-sockets.md) | ~BT~hive.net~BT~ | raw TCP |
 		| [net-names](net-names.md) | ~BT~hive.net~BT~ | ~BT~resolve~BT~ and ~BT~localAddress~BT~ |
+		| [net-urls](net-urls.md) | ~BT~hive.net~BT~ | ~BT~urlEncode~BT~ and the query string codec |
 		| [sql](sql.md) | ~BT~hive.sql~BT~ | connections, drivers, and running a query |
 		| [syslink](syslink.md) | ~BT~hive.syslink~BT~ | what a service is |
 		| [syslink-calls](syslink-calls.md) | ~BT~hive.syslink~BT~ | every call, and calling an address |
@@ -322,6 +324,7 @@ func term(): Str {
 		| ~BT~read()~BT~ | ~BT~Str~BT~ |
 		| ~BT~readSecret()~BT~ | ~BT~Str~BT~ |
 		| ~BT~args()~BT~ | ~BT~Str[dyn]~BT~ |
+		| ~BT~codec()~BT~ | ~BT~hive.codec.Codec<FlagError>~BT~ — the value that says command-line flags |
 		| ~BT~exit(code)~BT~ | ~BT~void~BT~ — nothing after it runs |
 
 		## Which stream, and why it matters
@@ -367,6 +370,44 @@ func term(): Str {
 			}
 		}
 		~CODE~
+
+		## Flags into a type
+
+		~BT~codec()~BT~ reads **command-line flags** into one of your own types through
+		~BT~T.decode~BT~, and [~BT~encode~BT~](../builtins.md) writes one back. It reads one line
+		of text, split the way a shell would, so a quoted argument stays together:
+
+		~CODE~hive
+		type Options \{
+			name: Str
+			dryRun: Bool -- Flag as dry-run; Default as false;
+			count: Int -- Default as 10;
+		}
+
+		options := Options.decode(join(hive.term.args(), " "), hive.term.codec())
+		if options is Result.Error(why) \{
+			hive.term.status("\{why.path}: expected \{why.expected}, found \{why.found}")
+			hive.term.exit(2)
+		}
+
+		Options.decode("--name Ada --dry-run --count=3", hive.term.codec())
+		encode(Options("Ada Lovelace", true, 3), hive.term.codec())
+		// --name "Ada Lovelace" --dry-run true --count 3
+		~CODE~
+
+		* **A flag always opens with ~BT~--~BT~**: ~BT~--name value~BT~ or ~BT~--name=value~BT~. Its name
+		  is the field's own, or what ~BT~Flag as~BT~ says without the dashes — so
+		  ~BT~--something-else~BT~ is ~BT~somethingElse: Str -- Flag as something-else;~BT~.
+		* A ~BT~Bool~BT~ standing alone is ~BT~true~BT~; followed by ~BT~true~BT~ or ~BT~false~BT~, it is that.
+		* A vector is its flag repeated, once per element.
+		* **A missing flag is an error** unless the field has a ~BT~Default~BT~ — a ~BT~Bool~BT~
+		  included — and so is one given twice for a field that is not a vector.
+		* Words that are no flag's value are ignored, and so is everything after a lone
+		  ~BT~--~BT~. Quotes and a backslash keep a word together, and a quoted word is never
+		  a flag.
+		* Only a type without variants travels as flags, each field a ~BT~Str~BT~, ~BT~Int~BT~,
+		  ~BT~Float~BT~, ~BT~Bool~BT~ or ~BT~Atom~BT~, or a vector of one. A failure is a
+		  ~BT~hive.term.FlagError~BT~ whose ~BT~path~BT~ is the flag as written, ~BT~--count~BT~.
 	`)
 }
 
@@ -604,23 +645,25 @@ func json(): Str {
 
 		| call | answers with |
 		| --- | --- |
-		| ~BT~hive.json.codec()~BT~ | ~BT~hive.codec.Codec~BT~ — the value that says JSON |
-		| ~BT~T.decode(text, codec)~BT~ | ~BT~Result<T, hive.codec.DecodingError>~BT~ |
+		| ~BT~hive.json.codec()~BT~ | ~BT~hive.codec.Codec<JsonError>~BT~ — the value that says JSON |
+		| ~BT~T.decode(text, codec)~BT~ | ~BT~Result<T, E>~BT~ — ~BT~E~BT~ is the codec's error, ~BT~JsonError~BT~ here |
 		| ~BT~T.Variant.decode(text, codec)~BT~ | the same — one variant's payload |
 		| ~BT~encode(value, codec)~BT~ | ~BT~Str~BT~ — **cannot fail** |
 		| ~BT~flatten(text)~BT~ | ~BT~Result<Table, _>~BT~ — the document flattened |
 		| ~BT~table(text)~BT~ | ~BT~Result<Table, _>~BT~ |
 		| ~BT~get(table, path)~BT~ | ~BT~Result<Str, _>~BT~ |
 
-		A ~BT~DecodingError~BT~ carries the exact ~BT~path~BT~ that failed, what was ~BT~expected~BT~
-		and what was ~BT~found~BT~. It names no format, and neither do ~BT~encode~BT~ and
-		~BT~decode~BT~: **the codec is the only thing that says JSON**, which is what lets
-		another format be another codec — [~BT~jwtCodec~BT~](crypto-jwt.md) is one already —
-		rather than a change to the language.
+		A ~BT~JsonError~BT~ carries the exact ~BT~path~BT~ that failed, what was ~BT~expected~BT~
+		and what was ~BT~found~BT~. ~BT~encode~BT~ and ~BT~decode~BT~ name no format: **the codec is
+		the only thing that says JSON**, which is what lets another format be another
+		codec — [~BT~jwtCodec~BT~](crypto-jwt.md), [~BT~queryParamsCodec~BT~](net-urls.md) and
+		[~BT~hive.term.codec~BT~](term.md) are —
+		rather than a change to the language. A codec's type names the error its
+		decoding fails with, ~BT~hive.codec.Codec<E>~BT~, and each module owns its own.
 
-		The codec has to be **named at the call**. One held in a variable is a compile
-		error, because the encoder is written from the declaration right there and by
-		then there is nothing left to write it from.
+		A codec is an **ordinary value**: its type already says the format, so one held
+		in a variable, passed to a function or kept in a field encodes and decodes
+		exactly as one written at the call.
 
 		~CODE~hive
 		type User \{
@@ -782,7 +825,7 @@ func cryptoJwt(): Str {
 
 		| call | answers with |
 		| --- | --- |
-		| ~BT~jwtCodec(secret)~BT~ | ~BT~hive.codec.Codec~BT~ — HS256 under this secret |
+		| ~BT~jwtCodec(secret)~BT~ | ~BT~hive.codec.Codec<JwtError>~BT~ — HS256 under this secret |
 		| ~BT~jwtDecode(token)~BT~ | ~BT~Result<Str, CryptoError>~BT~ — **without verifying** |
 		| ~BT~jwtHeader(token)~BT~ | ~BT~Result<hive.crypto.Header, CryptoError>~BT~ |
 
@@ -811,8 +854,8 @@ func cryptoJwt(): Str {
 		anything. **Only HS256 is accepted**, so ~BT~alg: none~BT~ and algorithm confusion
 		are rejected outright rather than negotiated.
 
-		A token that does not check out is a ~BT~hive.codec.DecodingError~BT~ like any other
-		unreadable document, and its ~BT~found~BT~ opens with the reason — ~BT~"Expired"~BT~,
+		A token that does not check out is a ~BT~hive.crypto.JwtError~BT~, like claims of the
+		wrong shape, and its ~BT~found~BT~ opens with the reason — ~BT~"Expired"~BT~,
 		~BT~"BadSignature"~BT~, ~BT~"AlgorithmMismatch"~BT~ or ~BT~"Malformed"~BT~. A forged token and
 		claims of the wrong shape are then one failure to handle rather than two,
 		which is what a caller was going to do with them anyway.
@@ -844,6 +887,7 @@ func net(): Str {
 		| [net-websockets](net-websockets.md) | ~BT~wsConnect~BT~, ~BT~wsServe~BT~, ~BT~wsSend~BT~, ~BT~wsReceive~BT~ |
 		| [net-sockets](net-sockets.md) | ~BT~socketConnect~BT~, ~BT~socketServe~BT~, and the stream |
 		| [net-names](net-names.md) | ~BT~resolve~BT~, ~BT~localAddress~BT~ |
+		| [net-urls](net-urls.md) | ~BT~urlEncode~BT~, ~BT~queryParamsCodec~BT~ |
 
 		## What every server here has in common
 
@@ -1128,6 +1172,68 @@ func netNames(): Str {
 		that answers ~BT~"NoAddress"~BT~ rather than something misleading.
 
 		This is what a [node](syslink-nodes.md) prints so another can dial it.
+	`)
+}
+
+func netUrls(): Str {
+	return page.backticked(`
+		# ~BT~hive.net~BT~ — URLs and query strings
+
+		| call | answers with |
+		| --- | --- |
+		| ~BT~urlEncode(text)~BT~ | ~BT~Str~BT~ — safe in a path segment and a query alike |
+		| ~BT~queryParamsCodec()~BT~ | ~BT~hive.codec.Codec<QueryParamsError>~BT~ — the value that says query string |
+
+		Neither performs I/O.
+
+		## ~BT~urlEncode~BT~
+
+		Every byte but letters, digits, ~BT~-~BT~, ~BT~.~BT~, ~BT~_~BT~ and the tilde is
+		percent-encoded, so a space is ~BT~%20~BT~ rather than ~BT~+~BT~:
+
+		~CODE~hive
+		hive.net.urlEncode("rust & go")   // rust%20%26%20go
+		~CODE~
+
+		## A query string is a codec
+
+		~BT~queryParamsCodec~BT~ goes where [~BT~hive.json.codec()~BT~](json.md) goes, so a type's
+		fields are written with [~BT~encode~BT~](../builtins.md) and read with ~BT~T.decode~BT~ —
+		**without** the leading ~BT~?~BT~:
+
+		~CODE~hive
+		type Search \{
+			term: Str -- URL as q;
+			page: Int -- Default as 1;
+			tags: Str[dyn] -- URL as tag;
+		}
+
+		encode(Search("rust & go", 2, ["web", "cli"]), hive.net.queryParamsCodec())
+		// q=rust%20%26%20go&page=2&tag=web&tag=cli
+
+		if Search.decode("q=hive+lang&tag=web", hive.net.queryParamsCodec()) is Result.Ok(search) \{
+			echo search.term   // hive lang, on page 1
+		}
+		~CODE~
+
+		* **~BT~URL as~BT~ names the parameter**, the way ~BT~JSON as~BT~ names a key; without it
+		  the field's own name is the key. Two fields may not answer to one.
+		* **A vector is its key repeated**, once per element and in order. An absent key
+		  reads as an empty vector, and a ~BT~T[n]~BT~ needs it exactly ~BT~n~BT~ times.
+		* **A missing field is an error** unless it has a ~BT~Default~BT~, and so is a key
+		  given twice for a field that is not a vector.
+		* ~BT~+~BT~ and ~BT~%20~BT~ both read as a space, a leading ~BT~?~BT~ is tolerated, and a
+		  parameter the type does not declare is ignored. A ~BT~Bool~BT~ is ~BT~true~BT~ or
+		  ~BT~false~BT~.
+
+		## What travels as one
+
+		A query string is **flat**, so only a type without variants does, and each of its
+		fields is a ~BT~Str~BT~, ~BT~Int~BT~, ~BT~Float~BT~, ~BT~Bool~BT~ or ~BT~Atom~BT~, or a vector of one.
+		Anything else is a compile error at the ~BT~encode~BT~ or ~BT~decode~BT~ that asked.
+
+		A failure is a ~BT~hive.net.QueryParamsError~BT~: the ~BT~path~BT~ that failed, such as
+		~BT~$.page~BT~, what was ~BT~expected~BT~ there, and what was ~BT~found~BT~.
 	`)
 }
 

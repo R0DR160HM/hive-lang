@@ -8,8 +8,16 @@
   wide, the last row holding what was left. A width written as a literal below
   one is a compile error; a computed one that turns out below one hands back an
   empty `Table`.
+* **`URL as <name>;`** — a field annotation naming the query parameter the field is read from and written as.
+* **`Flag as <name>;`** — a field annotation naming the command-line flag, without its dashes, the field is read from and written as.
+* **Codecs are ordinary values** — held in a variable, passed, stored or returned, since a `hive.codec.Codec<E>`'s type says its format.
 
 ### Standard library
+
+* **`hive.net.urlEncode(text)`** percent-encodes every byte but RFC 3986's unreserved characters.
+* **`hive.net.queryParamsCodec()`** reads and writes a flat type as a query string, without the leading `?`.
+* **`hive.term.codec()`** reads a line of `--name value` flags, quoted words kept together, into a flat type and writes them back.
+* **`hive.codec.Codec<E>`** names the error its decoding fails with, and each module with a codec owns its own: `hive.json.JsonError`, `hive.crypto.JwtError`, `hive.net.QueryParamsError` and `hive.term.FlagError`.
 
 * **`hive.time.dateFrom(year, month, day)`** and
   **`dateTimeFrom(year, month, day, hour, minute, second)`** — a stamp for a date
@@ -34,6 +42,13 @@
   nothing, and each now says what it takes.
 * One of the library's own types — `hive.net.HttpResponse(200, body: ..., ...)` —
   is checked against its fields, so a named argument may come in any order.
+
+### Breaking
+
+| was | is |
+| --- | --- |
+| `hive.codec.Codec` | `hive.codec.Codec<E>` |
+| `hive.codec.DecodingError` | `hive.json.JsonError`, `hive.crypto.JwtError` or `hive.net.QueryParamsError` |
 
 ## v0.2.4
 

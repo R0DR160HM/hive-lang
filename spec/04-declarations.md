@@ -32,9 +32,8 @@ it is written by hand and none of it uses reflection.
 
 ### Annotations
 
-A field may be annotated, and both annotations are about the **JSON codec**
-derived above — what the field is called on the wire, and what to read where the
-wire has nothing:
+A field may be annotated, and every annotation is about the **codecs** — what
+the field is called on the wire, and what to read where the wire has nothing:
 
 ```hive
 type User {
@@ -47,10 +46,12 @@ type User {
 | written | means |
 | --- | --- |
 | `JSON as <name>;` | the key this field is read from and written as |
-| `Default as <literal>;` | what to use where JSON has `null` or nothing at all |
+| `URL as <name>;` | the same, in a query string ([14.9](14-stdlib.md#149-hivenet)) |
+| `Flag as <name>;` | the same, as a command-line flag without its dashes ([14.5](14-stdlib.md#145-hiveterm)) |
+| `Default as <literal>;` | what to use where the document has `null` or nothing at all |
 
 A `--` opens them and each clause ends at its `;`, so **they may be written in
-any order** and a field may carry one, both or neither:
+any order** and a field may carry any of them, or none:
 
 ```hive
 theme: Str -- JSON as colour_scheme; Default as "light";
@@ -62,12 +63,15 @@ changes: it is still `user.name` whatever JSON calls it, still ordered and
 copied and compared as it was, and still `name` in every message the compiler
 writes about it.
 
-**`JSON as` takes a name rather than a Hive one.** A key is somebody else's, so
-it is held to none of Hive's shapes — `user_name` is a key and so is
-`"user-name"`, written as a string where it is not a word at all. **Two fields
-of one object may not answer to one key**, which is a compile error naming it:
-the decoder would read the same member twice and the encoder would write it
-twice.
+**`JSON as`, `URL as` and `Flag as` take a name rather than a Hive one.** A key
+is somebody else's, so it is held to none of Hive's shapes — `user_name` is a key
+and so is `user-name`, words joined by `-`; anything else is written as a string,
+`"user name"`. **Two fields of one object may not answer to one key** in any
+format, which is a compile error naming it: the decoder would read the same
+member twice and the encoder would write it twice. The names are independent, so
+none of them changes another format's key. A flag is named **without its
+dashes** — `Flag as dry-run;` is `--dry-run` — and a name opening with `-` is
+refused.
 
 **`Default as` takes a literal** — an `Int`, `Float`, `Str`, `Bool` or `Atom`,
 with a leading `-` where a number is negative — and it must be a value the field

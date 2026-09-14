@@ -27,7 +27,7 @@ type.
 | `filterMap(values, transform)` | `filterMap(T[], func(T): Result<K, E>): K[dyn]` | transform and select in one pass |
 | `sort(values)` | `sort(T[]): T[dyn]` | in the element type's own order |
 | `sort(values, first)` | `sort(T[], func(T, T): Bool): T[dyn]` | in the order `first` gives |
-| `encode(value, codec)` | `encode(T, hive.codec.Codec): Str` | `value` written in the format `codec` names |
+| `encode(value, codec)` | `encode(T, hive.codec.Codec<E>): Str` | `value` written in the format `codec` names |
 
 `len` and `bytes` differ only for strings: for `"café"`, `len` is `4` (runes)
 while `bytes` is `5`.
@@ -57,14 +57,14 @@ also the **only builtin with no runtime function behind it** — the encoder is
 written out of the argument's static type at the call site, which is what makes
 it total and what keeps it free of reflection.
 
-**The codec has to be named at the call**: `encode(user, hive.json.codec())` is
-the encoder for `User` in JSON, written there. A codec reached through a variable
-is a compile error, because by then there is nothing left to write the encoder
-from. This is the bargain `hive.file.csv` and `hive.sql.run` already strike — the
-reader is named in the source rather than sniffed at run time — and it is what
-lets a second format be a second codec rather than a change to the language:
-`hive.crypto.jwtCodec(secret)` ([14.8](14-stdlib.md#148-hivecrypto)) signs the
-same derived encoding into a token.
+**The codec's type says the format.** `hive.codec.Codec<E>` names the error
+decoding fails with, and that error is one format's own, so `encode(user, codec)`
+is the encoder for `User` in that format wherever `codec` came from — written at
+the call, held in a variable, passed as a parameter or kept in a field. A codec
+is therefore an ordinary value. This is what lets a second format be a second
+codec rather than a change to the language: `hive.crypto.jwtCodec(secret)`
+([14.8](14-stdlib.md#148-hivecrypto)) signs the same derived encoding into a
+token, and the secret travels in the codec value.
 
 Its other half is `T.decode(text, codec)`, named on the type because a `Str`
 arriving from outside cannot say what it should become

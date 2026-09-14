@@ -487,7 +487,7 @@ test "writing a secret asks for a file per platform" {
 
 	// A program that only reads one carries none of those.
 	reads := loader.loadText("main.hive", "proc main(): void \{ echo hive.term.readSecret() }")
-	assert join(emit.emitModule(reads.module).modules, ",") == "term,termsecret,termsecretunix,termsecretwindows"
+	assert join(emit.emitModule(reads.module).modules, ",") == "term,codec,termsecret,termsecretunix,termsecretwindows"
 }
 
 test "len is three builtins, told apart by what it was given" {
@@ -558,7 +558,7 @@ test "a codec is derived from the declaration, and named for the type" {
 
 test "a variant encodes under its own name, and decodes by it" {
 	got := go("type Shape \{ Circle \{ radius: Int }\n Point }\nproc main(): void \{ echo encode(Shape.Circle(1), hive.json.codec())  if Shape.decode(\"null\", hive.json.codec()) is Result.Ok(s) \{ echo s } }")
-	assert has(got, "func jsonDecode_Shape(v hive.JsonValue, path string) (Shape, *hive.CodecDecodingError) \{")
+	assert has(got, "func jsonDecode_Shape(v hive.JsonValue, path string) (Shape, *hive.JsonJsonError) \{")
 	assert has(got, "hive.JsonVariant(v, path)")
 	assert has(got, "hive.JsonParse(")
 	// A JSON null selects the first field-less variant there is.
@@ -569,7 +569,7 @@ test "a variant names a decoder of its own, beside the union's" {
 	src := "type Sig \{ Ping\n Move \{ x: Int, y: Int } }\nproc main(): void \{ if Sig.Move.decode(\"x\", hive.json.codec()) is Result.Ok(s) \{ echo s } }"
 	got := go(src)
 	// The payload alone, so no variant key is read on the way in.
-	assert has(got, "func jsonDecode_Sig_Move(v hive.JsonValue, path string) (Sig, *hive.CodecDecodingError) \{")
+	assert has(got, "func jsonDecode_Sig_Move(v hive.JsonValue, path string) (Sig, *hive.JsonJsonError) \{")
 	assert has(got, "hive.JsonParse(\"x\", jsonDecode_Sig_Move)")
 	assert has(got, "return SigMove\{")
 }
@@ -591,6 +591,40 @@ test "a shared field reaches a variant's own decoder too" {
 test "flatten reads a whole document without a type to read it into" {
 	got := go("proc main(): void \{ if hive.json.flatten(\"x\") is Result.Ok(t) \{ echo t } }")
 	assert has(got, "hive.JsonParse(\"x\", hive.JsonFlatten)")
+}
+
+test "a query codec writes and reads a record's fields as parameters" {
+	got := go("type Search \{ term: Str -- URL as q;\n page: Int -- Default as 1;\n tags: Str[dyn] -- URL as tag; }\nproc main(): void \{ echo encode(Search(\"a\", 1, []), hive.net.queryParamsCodec())  if Search.decode(\"q=a\", hive.net.queryParamsCodec()) is Result.Ok(s) \{ echo s.term } }")
+	assert has(got, "func queryEncode_Search(x Search) string \{")
+	assert has(got, "hive.NetQueryOf(\"q\", hive.NetQueryEncodeStr(x.Term))")
+	assert has(got, "hive.NetQueryEach(\"tag\", x.Tags, hive.NetQueryEncodeStr)")
+	assert has(got, "func queryDecode_Search(q []hive.NetQueryPair) (Search, *hive.NetQueryParamsError) \{")
+	assert has(got, "hive.NetQueryParse(\"q=a\", queryDecode_Search)")
+	assert has(got, "if hive.NetQueryHas(q, \"page\") \{")
+	assert has(got, "f_tags, qerr := hive.NetQueryVec(q, \"tag\", -1, hive.NetQueryStr)")
+	// Nothing JSON is written for a type only a query string carries.
+	assert has(got, "jsonDecode_Search") == false
+}
+
+test "a flags codec writes and reads a command line" {
+	got := go("type Something \{ foo: Str\n bazzBazz: Bool -- Flag as bazz-bazz; }\nproc main(): void \{ echo encode(Something(\"a\", true), hive.term.codec())  if Something.decode(\"--foo a\", hive.term.codec()) is Result.Ok(s) \{ echo s.foo } }")
+	assert has(got, "func termEncode_Something(x Something) string \{")
+	assert has(got, "hive.TermFlagOf(\"bazz-bazz\", hive.TermFlagEncodeBool(x.BazzBazz))")
+	assert has(got, "func termDecode_Something(q []hive.TermFlagPair) (Something, *hive.TermFlagError) \{")
+	assert has(got, "f_foo, qerr := hive.TermFlagOne(q, \"foo\", hive.TermFlagStr)")
+	assert has(got, "hive.TermFlagParse(\"--foo a\", termDecode_Something)")
+}
+
+test "a held codec is evaluated where it is used, and a JWT one carries its secret" {
+	got := go("type Claims \{ sub: Str }\nproc main(): void \{ c := hive.crypto.jwtCodec(\"secret\")  echo encode(Claims(\"ada\"), c)  j := hive.json.codec()  echo encode(Claims(\"ada\"), j) }")
+	assert has(got, "hive.CryptoJwtSign(jsonEncode_Claims(")
+	assert has(got, "c.Secret)")
+	assert has(got, "hive.CodecWith(jsonEncode_Claims(")
+}
+
+test "a codec's Go type carries the error its format fails with" {
+	got := go("proc main(): void \{ hive.codec.Codec<hive.json.JsonError> c = hive.json.codec()  echo 1 }")
+	assert has(got, "hive.CodecCodec[hive.JsonJsonError]")
 }
 
 test "a JWT codec signs and reads the claims its type derives a codec for" {

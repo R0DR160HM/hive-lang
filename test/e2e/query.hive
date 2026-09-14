@@ -1,0 +1,66 @@
+// The query string codec, and `hive.net.urlEncode` for one value on its own.
+
+type Search {
+	term: Str -- URL as q;
+	page: Int -- Default as 1;
+	tags: Str[dyn] -- URL as tag;
+	exact: Bool -- Default as false;
+	mood: Atom -- Default as #Calm;
+}
+
+// A declared length is a promise, the way it is in JSON.
+type Point {
+	at: Int[2]
+}
+
+func asQuery(text: Str): Result<Search, hive.net.QueryParamsError> {
+	return Search.decode(text, hive.net.queryParamsCodec())
+}
+
+// The same type through JSON fails with JSON's own error, under its own names.
+func asJson(text: Str): Result<Search, hive.json.JsonError> {
+	return Search.decode(text, hive.json.codec())
+}
+
+proc report(s: Search): void {
+	echo "{s.term} | {s.page} | " + join(s.tags, ",") + " | {s.exact}"
+	echo s.mood
+}
+
+proc main(): void {
+	echo hive.net.urlEncode("a b&c=d/é~_.-")
+
+	// A round trip: fields in declaration order, a vector as its key repeated.
+	written := encode(Search("rust & go", 2, ["x y", "z"], true, #Eager), hive.net.queryParamsCodec())
+	echo written
+	if asQuery(written) is Result.Ok(s) {
+		report(s)
+	}
+
+	// `+` is a space, a leading `?` is tolerated, and an unknown key is ignored.
+	if asQuery("?q=hive+lang&tag=a&tag=b%2Fc&page=3&extra=1") is Result.Ok(s) {
+		report(s)
+	}
+
+	// No `tag` is an empty vector, and every default stands in.
+	if asQuery("q=alone") is Result.Ok(s) {
+		report(s)
+	}
+
+	for each bad in ["page=2", "q=a&page=two", "q=a&q=b", "q=a&exact=yes", "q=%zz"] {
+		if asQuery(bad) is Result.Error(why) {
+			echo "{why.path}: expected {why.expected}, found {why.found}"
+		}
+	}
+
+	if Point.decode("at=1&at=2", hive.net.queryParamsCodec()) is Result.Ok(p) {
+		echo "{p.at[0]} {p.at[1]}"
+	}
+	if Point.decode("at=1", hive.net.queryParamsCodec()) is Result.Error(why) {
+		echo "{why.path}: expected {why.expected}, found {why.found}"
+	}
+
+	if asJson("\{\"q\": \"a\"}") is Result.Error(why) {
+		echo "{why.path}: expected {why.expected}, found {why.found}"
+	}
+}

@@ -309,6 +309,7 @@ func goType(ty: types.Ty): Str {
 	// A query is the text and the values bound beside it. Its row type is a type
 	// and never a value, so nothing of it survives into the Go.
 	else if ty is types.Ty.TFragment(_) { return "hive.SqlFragment" }
+	else if ty is types.Ty.TCodec(error) { return "hive.CodecCodec[" + goType(error) + "]" }
 	else if ty is types.Ty.TLib(module, name) {
 		return "hive." + text.capitalise(module) + name
 	}
@@ -2062,13 +2063,52 @@ proc reading(em: mut Emit, env: infer.Env, args: ast.Arg[], decoder: Str): Str {
 	source := expr(em, env, argExpr(args, 0), types.Ty.TStr())
 	// A token is opened before it is read: the signature and the times first,
 	// then the claims, which are the same JSON as anything else.
-	if stdlib.codecFormat(codec) == "jwt" {
+	if formatOf(env, codec) == "jwt" {
 		useModule(em, "crypto")
-		return "hive.CryptoJwtParse(" + source + ", "
-			+ expr(em, env, stdlib.codecSecret(codec), types.Ty.TStr()) + ", " + decoder + ")"
+		return "hive.CryptoJwtParse(" + source + ", " + jwtSecret(em, env, codec) + ", " + decoder + ")"
 	}
 	useModule(em, "json")
-	return "hive.JsonParse(" + source + ", " + decoder + ")"
+	return withCodec(em, env, "hive.JsonParse(" + source + ", " + decoder + ")", codec)
+}
+
+// `T.decode` and `T.Variant.decode`, with the decoder the codec's format asks for.
+proc decoding(em: mut Emit, env: infer.Env, args: ast.Arg[], typeName: Str, variant: Str): Str {
+	codec := argExpr(args, 1)
+	format := formatOf(env, codec)
+	if stdlib.isFlatFormat(format) {
+		useModule(em, flatModule(format))
+		needCodec(em, format + ":" + typeName)
+		parsed := flatPrefix(format) + "Parse(" + expr(em, env, argExpr(args, 0), types.Ty.TStr()) + ", " + flatDecoderName(format, typeName) + ")"
+		return withCodec(em, env, parsed, codec)
+	}
+	if variant != "" {
+		needCodec(em, typeName + "." + variant)
+		return reading(em, env, args, variantDecoderName(typeName, variant))
+	}
+	return reading(em, env, args, decoderRef(em, types.Ty.TNamed(typeName)))
+}
+
+// The format a codec argument is, read off its type.
+func formatOf(env: infer.Env, codec: ast.Expr): Str {
+	return stdlib.formatOfCodec(infer.typeOf(env, codec))
+}
+
+// A codec the program holds is still evaluated where it is used, after the value
+// it travels with; one written as the library call itself has nothing to evaluate.
+proc withCodec(em: mut Emit, env: infer.Env, value: Str, codec: ast.Expr): Str {
+	if codec is ast.Expr.Absent || codec is ast.Expr.Hole || stdlib.codecFormat(codec) != "" {
+		return value
+	}
+	return "hive.CodecWith(" + value + ", " + expr(em, env, codec, infer.typeOf(env, codec)) + ")"
+}
+
+// What a JWT codec signs with: the secret written at the call, or the one a held
+// codec carries.
+proc jwtSecret(em: mut Emit, env: infer.Env, codec: ast.Expr): Str {
+	if stdlib.codecFormat(codec) == "jwt" {
+		return expr(em, env, stdlib.codecSecret(codec), types.Ty.TStr())
+	}
+	return expr(em, env, codec, infer.typeOf(env, codec)) + ".Secret"
 }
 
 proc memberCall(em: mut Emit, env: infer.Env, subject: ast.Expr, field: Str, args: ast.Arg[], want: types.Ty): Str {
@@ -2084,7 +2124,7 @@ proc memberCall(em: mut Emit, env: infer.Env, subject: ast.Expr, field: Str, arg
 		// constructor.
 		if field == "decode" {
 			if types.findType(em.table, head) is Result.Ok(_) {
-				return reading(em, env, args, decoderRef(em, types.Ty.TNamed(head)))
+				return decoding(em, env, args, head, "")
 			}
 		}
 		// `Shape.Circle(5)` builds a variant.
@@ -2099,8 +2139,7 @@ proc memberCall(em: mut Emit, env: infer.Env, subject: ast.Expr, field: Str, arg
 		if field == "decode" {
 			if root is ast.Expr.Ident(head) {
 				if types.findVariant(em.table, head, module) is Result.Ok(_) {
-					needCodec(em, head + "." + module)
-					return reading(em, env, args, variantDecoderName(head, module))
+					return decoding(em, env, args, head, module)
 				}
 			}
 		}
@@ -2400,19 +2439,27 @@ proc builtin(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[], want: typ
 	// argument names, which is what makes it total.
 	if name == "encode" {
 		codec := argExpr(args, 1)
-		format := stdlib.codecFormat(codec)
+		format := formatOf(env, codec)
 		if format == "" {
-			fail(em, "`encode` needs the codec named here, so the encoder can be written from the declaration")
+			fail(em, "`encode` needs a codec whose type says its format, so the encoder can be written from the declaration")
+			return "\"\""
+		}
+		if stdlib.isFlatFormat(format) {
+			useModule(em, flatModule(format))
+			if firstType is types.Ty.TNamed(typeName) {
+				needCodec(em, format + ":" + typeName)
+				return withCodec(em, env, flatEncoderName(format, typeName) + "(" + a + ")", codec)
+			}
+			fail(em, stdlib.flatCarrier(format) + " is a declared type's fields, so `encode` cannot write " + types.show(firstType) + " as one")
 			return "\"\""
 		}
 		// A token is the same derived encoder with a signature around it.
 		if format == "jwt" {
 			useModule(em, "crypto")
-			return "hive.CryptoJwtSign(" + encodeOf(em, firstType, a, 0) + ", "
-				+ expr(em, env, stdlib.codecSecret(codec), types.Ty.TStr()) + ")"
+			return "hive.CryptoJwtSign(" + encodeOf(em, firstType, a, 0) + ", " + jwtSecret(em, env, codec) + ")"
 		}
 		useModule(em, format)
-		return encodeOf(em, firstType, a, 0)
+		return withCodec(em, env, encodeOf(em, firstType, a, 0), codec)
 	}
 	return walkBuiltin(em, env, name, args, a, firstType)
 }
@@ -3521,6 +3568,15 @@ proc emitCodecsFrom(em: mut Emit, from: Int): void {
 // a dot — the second being what `T.Variant.decode` asks for. A variant needs a
 // decoder alone: it is read into the union its type already encodes.
 proc emitCodec(em: mut Emit, name: Str): void {
+	for each format in ["query", "term"] {
+		if text.startsWith(name, format + ":") {
+			typeName := text.span(text.chars(name), len(format) + 1, len(name) - 1)
+			if types.findType(em.table, typeName) is Result.Ok(info) {
+				emitFlatCodec(em, format, typeName, info)
+			}
+			return
+		}
+	}
 	at := dotAt(name)
 	if at >= 0 {
 		cs := text.chars(name)
@@ -3571,7 +3627,7 @@ func encoderName(name: Str): Str {
 proc emitVariantDecoder(em: mut Emit, name: Str, variant: Str): void {
 	whole := types.Ty.TNamed(name)
 	blank(em)
-	open(em, "func " + variantDecoderName(name, variant) + "(v hive.JsonValue, path string) (" + goType(whole) + ", *hive.CodecDecodingError) \{")
+	open(em, "func " + variantDecoderName(name, variant) + "(v hive.JsonValue, path string) (" + goType(whole) + ", *hive.JsonJsonError) \{")
 	line(em, "obj, jerr := hive.JsonObject(v, path)")
 	bailOut(em, "nil")
 	if types.findVariant(em.table, name, variant) is Result.Ok(fields) {
@@ -3584,7 +3640,7 @@ proc emitVariantDecoder(em: mut Emit, name: Str, variant: Str): void {
 proc emitDecoder(em: mut Emit, name: Str, info: types.TypeInfo): void {
 	whole := types.Ty.TNamed(name)
 	blank(em)
-	open(em, "func " + decoderName(name) + "(v hive.JsonValue, path string) (" + goType(whole) + ", *hive.CodecDecodingError) \{")
+	open(em, "func " + decoderName(name) + "(v hive.JsonValue, path string) (" + goType(whole) + ", *hive.JsonJsonError) \{")
 	if len(info.variants) == 0 {
 		zero := goZero(whole)
 		line(em, "obj, jerr := hive.JsonObject(v, path)")
@@ -3617,7 +3673,7 @@ proc emitDecoder(em: mut Emit, name: Str, info: types.TypeInfo): void {
 		line(em, "return " + goVariant(name, variant.name) + "\{" + fieldInits(fields) + "}, nil")
 		close(em, "}")
 	}
-	line(em, "return nil, &hive.CodecDecodingError\{Path: path, Expected: " + quoted("one of " + join(names, ", ")) + ", Found: hive.JsonEncodeStr(key)}")
+	line(em, "return nil, &hive.JsonJsonError\{Path: path, Expected: " + quoted("one of " + join(names, ", ")) + ", Found: hive.JsonEncodeStr(key)}")
 	close(em, "}")
 }
 
@@ -3730,9 +3786,9 @@ proc decoderRef(em: mut Emit, ty: types.Ty): Str {
 			// is an error rather than a shorter vector.
 			call = "hive.JsonVecN(v, p, {n}, " + inner + ")"
 		}
-		return "func(v hive.JsonValue, p string) (" + goType(ty) + ", *hive.CodecDecodingError) \{ return " + call + " }"
+		return "func(v hive.JsonValue, p string) (" + goType(ty) + ", *hive.JsonJsonError) \{ return " + call + " }"
 	}
-	return "func(v hive.JsonValue, p string) (" + goType(ty) + ", *hive.CodecDecodingError) \{ var zero " + goType(ty) + "; return zero, &hive.CodecDecodingError\{Path: p, Expected: " + quoted("a type JSON can carry") + ", Found: " + quoted(types.show(ty)) + "} }"
+	return "func(v hive.JsonValue, p string) (" + goType(ty) + ", *hive.JsonJsonError) \{ var zero " + goType(ty) + "; return zero, &hive.JsonJsonError\{Path: p, Expected: " + quoted("a type JSON can carry") + ", Found: " + quoted(types.show(ty)) + "} }"
 }
 
 func isTable(ty: types.Ty): Bool {
@@ -3809,6 +3865,120 @@ proc encodeOf(em: mut Emit, ty: types.Ty, value: Str, depth: Int): Str {
 	}
 	// Anything with no static shape is encoded from what it turns out to be.
 	return "hive.JsonEncodeDynamic(" + value + ")"
+}
+
+// --- Flat codecs -------------------------------------------------------------
+//
+// A query string and a command line, asked for as `query:<Type>` and
+// `term:<Type>` on the same worklist. A field is one key, and a vector is that
+// key repeated.
+
+func flatModule(format: Str): Str {
+	if format == "term" { return "term" }
+	return "net"
+}
+
+// What the runtime's helpers for a format are called.
+func flatPrefix(format: Str): Str {
+	if format == "term" { return "hive.TermFlag" }
+	return "hive.NetQuery"
+}
+
+func flatDecoderName(format: Str, name: Str): Str {
+	return format + "Decode_" + goIdent(name)
+}
+
+func flatEncoderName(format: Str, name: Str): Str {
+	return format + "Encode_" + goIdent(name)
+}
+
+func flatKey(format: Str, f: ast.Field): Str {
+	if format == "term" { return ast.flagKey(f) }
+	return ast.urlKey(f)
+}
+
+proc emitFlatCodec(em: mut Emit, format: Str, name: Str, info: types.TypeInfo): void {
+	if len(info.variants) > 0 {
+		fail(em, stdlib.flatCarrier(format) + " is one flat set of parameters, so `{name}`, which has variants, cannot travel as one")
+		return
+	}
+	for each f in info.shared {
+		ty := types.resolve(em.table, f.declared)
+		if stdlib.isFlatValue(types.elementOf(ty)) == false && stdlib.isFlatValue(ty) == false {
+			fail(em, "`{name}.{f.name}` is " + types.show(ty) + ", which a " + stdlib.flatUnit(format) + " cannot hold")
+			return
+		}
+	}
+	emitFlatDecoder(em, format, name, info.shared)
+	emitFlatEncoder(em, format, name, info.shared)
+}
+
+proc emitFlatDecoder(em: mut Emit, format: Str, name: Str, fields: ast.Field[]): void {
+	whole := types.Ty.TNamed(name)
+	zero := goZero(whole)
+	prefix := flatPrefix(format)
+	blank(em)
+	open(em, "func " + flatDecoderName(format, name) + "(q []" + prefix + "Pair) (" + goType(whole) + ", *" + goType(stdlib.codecErrorOf(format)) + ") \{")
+	line(em, "_ = q")
+	for each f in fields {
+		ty := types.resolve(em.table, f.declared)
+		key := quoted(flatKey(format, f))
+		held := "f_" + goIdent(f.name)
+		if ty is types.Ty.TVec(element, dim) {
+			// A length below zero is a vector of any length.
+			mut count := "-1"
+			if dim is ast.Dim.Fixed(n) {
+				count = "{n}"
+			}
+			line(em, held + ", qerr := " + prefix + "Vec(q, " + key + ", " + count + ", " + prefix + flatValueName(element) + ")")
+			flatBailOut(em, zero)
+		} else if f.marks.fallback is ast.Expr.Absent {
+			line(em, held + ", qerr := " + prefix + "One(q, " + key + ", " + prefix + flatValueName(ty) + ")")
+			flatBailOut(em, zero)
+		} else {
+			line(em, "{held} := " + literal(em, f.marks.fallback))
+			open(em, "if " + prefix + "Has(q, " + key + ") \{")
+			line(em, "got, qerr := " + prefix + "One(q, " + key + ", " + prefix + flatValueName(ty) + ")")
+			flatBailOut(em, zero)
+			line(em, held + " = got")
+			close(em, "}")
+		}
+	}
+	line(em, "return " + goIdent(name) + "\{" + fieldInits(fields) + "}, nil")
+	close(em, "}")
+}
+
+proc emitFlatEncoder(em: mut Emit, format: Str, name: Str, fields: ast.Field[]): void {
+	prefix := flatPrefix(format)
+	blank(em)
+	open(em, "func " + flatEncoderName(format, name) + "(x " + goType(types.Ty.TNamed(name)) + ") string \{")
+	mut Str[dyn] groups = []
+	for each f in fields {
+		ty := types.resolve(em.table, f.declared)
+		key := quoted(flatKey(format, f))
+		subject := "x." + goField(f.name)
+		if ty is types.Ty.TVec(element, _) {
+			append(groups, prefix + "Each(" + key + ", " + subject + ", " + prefix + "Encode" + flatValueName(element) + ")")
+		} else {
+			append(groups, prefix + "Of(" + key + ", " + prefix + "Encode" + flatValueName(ty) + "(" + subject + "))")
+		}
+	}
+	line(em, "return " + prefix + "Join(" + join(groups, ", ") + ")")
+	close(em, "}")
+}
+
+proc flatBailOut(em: mut Emit, zero: Str): void {
+	open(em, "if qerr != nil \{")
+	line(em, "return " + zero + ", qerr")
+	close(em, "}")
+}
+
+func flatValueName(ty: types.Ty): Str {
+	if ty is types.Ty.TInt { return "Int" }
+	if ty is types.Ty.TFloat { return "Float" }
+	if ty is types.Ty.TBool { return "Bool" }
+	if ty is types.Ty.TAtom { return "Atom" }
+	return "Str"
 }
 
 // --- The standard library ----------------------------------------------------

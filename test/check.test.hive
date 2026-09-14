@@ -531,18 +531,91 @@ test "a decoder reads a Str and the codec to read it with" {
 		"in `main`: what `Sig.Move.decode` reads wants Str")
 }
 
-test "the codec has to be named where it is used, not reached through a variable" {
-	assert opens(problem(withSig("c := hive.json.codec()  echo Sig.decode(\"x\", c)")),
-		"in `main`: the codec `Sig.decode` uses has to be named here")
-	// The message names every format there is to name.
-	assert text.contains(problem(withSig("c := hive.json.codec()  echo Sig.decode(\"x\", c)")),
-		"`hive.json.codec()` or `hive.crypto.jwtCodec(secret)`")
-	assert opens(problem(withSig("c := hive.json.codec()  echo encode(1, c)")),
-		"in `main`: the codec `encode` uses has to be named here")
-	// And something that is not a codec at all is refused as the wrong type.
+test "a codec is a value, held and handed on like any other" {
+	assert problemCount(withSig("c := hive.json.codec()  if Sig.decode(\"x\", c) is Result.Ok(s) \{ echo s }")) == 0
+	assert problemCount(withSig("c := hive.crypto.jwtCodec(\"s\")  echo encode(Sig.Ping(), c)")) == 0
+	passed := "type S \{ a: Str }\nfunc send(s: S, c: hive.codec.Codec<hive.net.QueryParamsError>): Str \{ return encode(s, c) }\n"
+	assert problemCount(passed + "proc main(): void \{ echo send(S(\"x\"), hive.net.queryParamsCodec()) }") == 0
+	// Its type still says the format, so a held codec is held to that format's shape.
+	assert opens(problem(withSig("c := hive.net.queryParamsCodec()  if Sig.decode(\"x\", c) is Result.Ok(s) \{ echo s }")),
+		"in `main`: a query string is one flat set of parameters")
+	// Something that is not a codec is refused as the wrong type, and a codec
+	// whose error type names no format is refused for that.
 	assert opens(problem(withSig("echo Sig.decode(\"x\", 7)")),
-		"in `main`: the codec `Sig.decode` uses wants hive.codec.Codec")
+		"in `main`: the codec `Sig.decode` uses wants hive.codec.Codec<E>")
+	assert opens(problem("type S \{ a: Str }\nfunc send(s: S, c: hive.codec.Codec<Str>): Str \{ return encode(s, c) }\nproc main(): void \{ }"),
+		"in `send`: `hive.codec.Codec<Str>` names no format")
 	assert problemCount(withSig("echo encode(1, hive.json.codec())")) == 0
+}
+
+test "each codec's decode fails with its own module's error" {
+	assert problemCount(withSig("Result<Sig, hive.json.JsonError> r = Sig.decode(\"x\", hive.json.codec())  if r is Result.Ok(s) \{ echo s }")) == 0
+	assert opens(problem(withSig("Result<Sig, hive.crypto.JwtError> r = Sig.decode(\"x\", hive.json.codec())  if r is Result.Ok(s) \{ echo s }")),
+		"in `main`: the declaration of `r` wants Result<Sig, hive.crypto.JwtError> and this is Result<Sig, hive.json.JsonError>")
+	assert opens(problem(inMain("hive.codec.Codec<hive.net.QueryParamsError> c = hive.json.codec()")),
+		"in `main`: the declaration of `c` wants hive.codec.Codec<hive.net.QueryParamsError> and this is hive.codec.Codec<hive.json.JsonError>")
+	assert problemCount(inMain("if hive.json.flatten(\"x\") is Result.Error(why) \{ echo why.path }")) == 0
+}
+
+// --- A query string ----------------------------------------------------------
+
+func withSearch(body: Str): Str {
+	return "type Search \{ term: Str -- URL as q;\n page: Int -- Default as 1;\n tags: Str[dyn] }\nproc main(): void \{ " + body + " }"
+}
+
+test "a query string reads and writes a type's fields as parameters" {
+	assert problemCount(withSearch("echo encode(Search(\"a\", 1, [\"b\"]), hive.net.queryParamsCodec())")) == 0
+	assert problemCount(withSearch("if Search.decode(\"q=a\", hive.net.queryParamsCodec()) is Result.Error(why) \{ echo why.found }")) == 0
+	assert problemCount(inMain("echo hive.net.urlEncode(\"a b\")")) == 0
+	assert opens(problem(inMain("echo hive.net.urlEncode(1)")),
+		"in `main`: the first argument of `hive.net.urlEncode` wants Str and this is Int")
+}
+
+test "a query string is flat, so a union or a nested field is refused" {
+	assert opens(problem(withSig("if Sig.decode(\"x\", hive.net.queryParamsCodec()) is Result.Ok(s) \{ echo s }")),
+		"in `main`: a query string is one flat set of parameters, so `Sig.decode` cannot carry `Sig`, which has variants")
+	nested := "type Inner \{ n: Int }\ntype Outer \{ inner: Inner }\n"
+	assert opens(problem(nested + inMain("echo encode(Outer(Inner(1)), hive.net.queryParamsCodec())")),
+		"in `main`: `Outer.inner` is Inner, and a query parameter is a `Str`")
+	assert opens(problem(inMain("echo encode(1, hive.net.queryParamsCodec())")),
+		"in `main`: a query string is a declared type's fields, so `encode` cannot carry Int")
+	// JSON carries every one of these.
+	assert problemCount(nested + inMain("echo encode(Outer(Inner(1)), hive.json.codec())")) == 0
+}
+
+test "two fields cannot answer to one query parameter" {
+	assert opens(problem("type S \{ a: Str -- URL as x;\n b: Str -- URL as x; }\nproc main(): void \{ }"),
+		"in `S`: two fields here are `x` in a query string")
+	// A JSON name is its own, so it never clashes with a URL one.
+	assert problemCount("type S \{ a: Str -- URL as x;\n b: Str -- JSON as x; }\nproc main(): void \{ }") == 0
+}
+
+// --- Command-line flags ------------------------------------------------------
+
+func withSomething(body: Str): Str {
+	return "type Something \{ foo: Str\n bazzBazz: Bool }\nproc main(): void \{ " + body + " }"
+}
+
+test "command-line flags read into a type from a line of text" {
+	assert problemCount(withSomething("if Something.decode(\"--foo ABC --bazzBazz true\", hive.term.codec()) is Result.Ok(s) \{ echo s.foo }")) == 0
+	assert problemCount(withSomething("if Something.decode(join(hive.term.args(), \" \"), hive.term.codec()) is Result.Ok(s) \{ echo s.foo }")) == 0
+	assert problemCount(withSomething("echo encode(Something(\"ABC\", true), hive.term.codec())")) == 0
+	assert problemCount(withSomething("if Something.decode(\"x\", hive.term.codec()) is Result.Error(why) \{ echo why.path }")) == 0
+	// A decoder reads a `Str`, so the arguments are joined first.
+	assert opens(problem(withSomething("if Something.decode(hive.term.args(), hive.term.codec()) is Result.Ok(s) \{ echo s.foo }")),
+		"in `main`: what `Something.decode` reads wants Str")
+	assert opens(problem(withSomething("if Something.decode(1, hive.term.codec()) is Result.Ok(s) \{ echo s.foo }")),
+		"in `main`: what `Something.decode` reads wants Str")
+}
+
+test "command-line flags are flat, and two fields cannot answer to one" {
+	assert opens(problem(withSig("if Sig.decode(\"x\", hive.term.codec()) is Result.Ok(s) \{ echo s }")),
+		"in `main`: a command line is one flat set of parameters, so `Sig.decode` cannot carry `Sig`, which has variants")
+	assert opens(problem("type Inner \{ n: Int }\ntype Outer \{ inner: Inner }\n" + inMain("echo encode(Outer(Inner(1)), hive.term.codec())")),
+		"in `main`: `Outer.inner` is Inner, and a flag is a `Str`")
+	assert opens(problem("type S \{ a: Str -- Flag as x;\n b: Str -- Flag as x; }\nproc main(): void \{ }"),
+		"in `S`: two fields here are `--x` on a command line")
+	assert problemCount("type S \{ somethingElse: Str -- Flag as something-else;\n something: Str }\nproc main(): void \{ }") == 0
 }
 
 test "the json module carries flatten, and no longer carries parse" {

@@ -137,6 +137,8 @@ func mathResult(name: Str): types.Ty {
 }
 
 func termResult(name: Str): types.Ty {
+	// The value that says read and write it as command-line flags.
+	if name == "codec" { return types.Ty.TCodec(codecErrorOf("term")) }
 	if name == "print" || name == "status" { return types.Ty.TVoid() }
 	if name == "read" || name == "readSecret" { return types.Ty.TStr() }
 	// Whether anybody is watching.
@@ -244,37 +246,48 @@ func isClockReading(name: Str): Bool {
 }
 
 func jsonResult(name: Str, args: types.Ty[]): types.Ty {
+	jsonError := codecErrorOf("json")
 	// The value that says JSON, for the call that is going to read or write one.
-	if name == "codec" { return types.Ty.TLib("codec", "Codec") }
+	if name == "codec" { return types.Ty.TCodec(jsonError) }
 	if name == "table" {
-		return types.Ty.TResult(table(), decodingError())
+		return types.Ty.TResult(table(), jsonError)
 	}
 	// A flattened document is looked up by path, and a path that is not in it is
 	// an ordinary answer rather than a failure.
 	if name == "get" {
-		return types.Ty.TResult(types.Ty.TStr(), decodingError())
+		return types.Ty.TResult(types.Ty.TStr(), jsonError)
 	}
 	// A whole document flattened into `[path, value]` rows, which is the one
 	// reading that needs no type to say what it wants.
 	if name == "flatten" {
-		return types.Ty.TResult(table(), decodingError())
+		return types.Ty.TResult(table(), jsonError)
 	}
 	return types.Ty.TUnknown()
 }
 
-// What every failure to read a document is, whatever format wrote it.
-func decodingError(): types.Ty {
-	return types.Ty.TLib("codec", "DecodingError")
+// What decoding in a format fails with: each module that carries a codec owns it.
+func codecErrorOf(format: Str): types.Ty {
+	if format == "jwt" { return types.Ty.TLib("crypto", "JwtError") }
+	if format == "query" { return types.Ty.TLib("net", "QueryParamsError") }
+	if format == "term" { return types.Ty.TLib("term", "FlagError") }
+	return types.Ty.TLib("json", "JsonError")
 }
 
-// The format a codec expression names, or `""` where it names none. `encode` and
-// `decode` read this rather than the value, because the encoder is written out of
-// a declaration at the call site: which format has to be settled by then, and a
-// codec that arrived in a variable settles nothing.
-//
-// It is the same bargain `hive.file.csv` and `hive.sql.run` already strike — the
-// reader is named in the source rather than sniffed at run time — and it is what
-// keeps a codec free of reflection.
+// The format a codec's type names, read off the error its decoding fails with,
+// or `""` where it names none.
+func formatOfCodec(ty: types.Ty): Str {
+	if ty is types.Ty.TCodec(error) {
+		for each format in codecFormats() {
+			if types.same(codecErrorOf(format), error) {
+				return format
+			}
+		}
+	}
+	return ""
+}
+
+// The format a codec expression names when it is the library call itself, or
+// `""`. Such a codec needs no value evaluated at the call it is written in.
 func codecFormat(e: ast.Expr): Str {
 	if e is ast.Expr.Call(callee, _) {
 		if callee is ast.Expr.Member(subject, name) {
@@ -288,6 +301,9 @@ func codecFormat(e: ast.Expr): Str {
 						}
 						if module == "crypto" && name == "jwtCodec" {
 							return "jwt"
+						}
+						if module == "net" && name == "queryParamsCodec" {
+							return "query"
 						}
 					}
 				}
@@ -309,16 +325,7 @@ func codecSecret(e: ast.Expr): ast.Expr {
 
 // Every format that can be written down, for a message that has to list them.
 func codecFormats(): Str[dyn] {
-	return ["json", "jwt"]
-}
-
-// How a format is written down, which is not `hive.<format>.codec()` for a module
-// that carries more than one.
-func codecSpelling(format: Str): Str {
-	if format == "jwt" {
-		return "hive.crypto.jwtCodec(secret)"
-	}
-	return "hive." + format + ".codec()"
+	return ["json", "jwt", "query", "term"]
 }
 
 // A service is reached by calling its address, so most of this module is about
@@ -408,6 +415,9 @@ func netResult(name: Str): types.Ty {
 		return types.Ty.TResult(types.Ty.TVec(types.Ty.TStr(), dynamic()), netError)
 	}
 	if name == "localAddress" { return types.Ty.TResult(types.Ty.TStr(), netError) }
+	if name == "urlEncode" { return types.Ty.TStr() }
+	// The value that says read and write it as a query string, without its `?`.
+	if name == "queryParamsCodec" { return types.Ty.TCodec(codecErrorOf("query")) }
 	return types.Ty.TUnknown()
 }
 
@@ -422,7 +432,7 @@ func cryptoResult(name: Str): types.Ty {
 		return types.Ty.TStr()
 	}
 	// The value that says sign it, and check it, as a JWT under this secret.
-	if name == "jwtCodec" { return types.Ty.TLib("codec", "Codec") }
+	if name == "jwtCodec" { return types.Ty.TCodec(codecErrorOf("jwt")) }
 	if name == "base64Decode" || name == "decrypt" {
 		return types.Ty.TResult(types.Ty.TStr(), cryptoError)
 	}
@@ -557,16 +567,11 @@ func fieldsOf(module: Str, name: Str): ast.Field[dyn] {
 		if name == "Header" {
 			return [field("alg"), field("typ"), field("kid")]
 		}
+		if name == "JwtError" { return decodingFields() }
 		return []
 	}
-	// What `encode` and `decode` traffic in. Neither says JSON, because neither
-	// is about JSON: a `Codec` is the format's rules, named at the call that
-	// wants them, and a failure to read a document is the same three questions
-	// whatever wrote it.
-	if module == "codec" {
-		if name == "DecodingError" {
-			return [field("path"), field("expected"), field("found")]
-		}
+	if module == "json" {
+		if name == "JsonError" { return decodingFields() }
 		return []
 	}
 	if module == "file" {
@@ -580,6 +585,7 @@ func fieldsOf(module: Str, name: Str): ast.Field[dyn] {
 		if name == "ExecError" {
 			return [field("command"), intField("code"), field("output"), field("message")]
 		}
+		if name == "FlagError" { return decodingFields() }
 		return []
 	}
 	if module == "conv" {
@@ -608,7 +614,36 @@ func netFields(name: Str): ast.Field[dyn] {
 	if name == "WsError" || name == "SocketError" || name == "NetError" {
 		return [field("reason"), field("message")]
 	}
+	if name == "QueryParamsError" { return decodingFields() }
 	return []
+}
+
+// The formats that carry one flat record: a query string and a command line.
+func isFlatFormat(format: Str): Bool {
+	return format == "query" || format == "term"
+}
+
+// What a flat format is called in a message, and what one of its keys is.
+func flatCarrier(format: Str): Str {
+	if format == "term" { return "a command line" }
+	return "a query string"
+}
+
+func flatUnit(format: Str): Str {
+	if format == "term" { return "flag" }
+	return "query parameter"
+}
+
+// What one key of a flat format can hold. A vector of one is that key repeated.
+func isFlatValue(ty: types.Ty): Bool {
+	return ty is types.Ty.TStr || ty is types.Ty.TInt || ty is types.Ty.TFloat
+		|| ty is types.Ty.TBool || ty is types.Ty.TAtom
+}
+
+// What a codec's error says, whichever module owns it: where it failed, what
+// was wanted there, and what was there instead.
+func decodingFields(): ast.Field[dyn] {
+	return [field("path"), field("expected"), field("found")]
 }
 
 func field(name: Str): ast.Field {
@@ -912,7 +947,7 @@ func paramsOf(module: Str, name: Str): types.Ty[dyn] {
 			return [types.Ty.TStr(), strings(), types.Ty.TStr(), environment()]
 		}
 		if name == "exit" { return [types.Ty.TInt()] }
-		// `read`, `readSecret`, `isTerminal` and `args` ask for nothing.
+		// `read`, `readSecret`, `isTerminal`, `args` and `codec` ask for nothing.
 		return []
 	}
 	if module == "file" {
@@ -1035,7 +1070,7 @@ func netParams(name: Str): types.Ty[dyn] {
 	}
 	if name == "wsServe" { return [port, handler(ws, types.Ty.TVoid())] }
 	if name == "socketServe" { return [port, handler(socket, types.Ty.TVoid())] }
-	if name == "wsConnect" || name == "resolve" { return [text] }
+	if name == "wsConnect" || name == "resolve" || name == "urlEncode" { return [text] }
 	if name == "socketConnect" { return [text, port] }
 	// The connection every one of these opens with is a handle, so it stands for
 	// itself; what follows it is what needs saying.

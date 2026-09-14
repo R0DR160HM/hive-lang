@@ -1,7 +1,7 @@
 # 14 — Standard library
 
 Each module owns its types under its own namespace — `hive.net.HttpRequest`,
-`hive.codec.DecodingError`, `hive.map.Map`, `hive.syslink.Address`. The only builtin
+`hive.json.JsonError`, `hive.map.Map`, `hive.syslink.Address`. The only builtin
 types that live directly on `hive` are the core ones the language uses without a
 module: `Result` and `Table`.
 
@@ -155,6 +155,20 @@ Line-oriented terminal I/O.
   `read()` reads it and only the hiding of it is lost.
 * `args()` → `Str[dyn]`, the command-line arguments in order, excluding the
   program name.
+* `codec()` → `hive.codec.Codec<hive.term.FlagError>` says **read and write it
+  as command-line flags** ([14.7](#147-hivejson)). `T.decode` reads a `Str` —
+  the arguments, joined — and splits it into words the way a shell does, so a
+  quoted argument stays one word, backslashes included. A flag **always
+  opens with `--`**: a field is `--name value` or `--name=value`, its name the
+  field's own or what `-- Flag as <name>;` says, so `--something-else` is
+  `somethingElse: Str -- Flag as something-else;`. A quoted word is never a flag.
+  A `Bool` standing alone is `true`, and a vector is its flag repeated. A flag
+  that is missing is an error unless the field has a `Default`, as is one given
+  twice for a field that is not a vector; words that are no flag's value are
+  ignored, and so is everything after a lone `--`. Only a type without variants
+  whose fields are values, or vectors of values, travels as flags, and a
+  failure's `path` is the flag as written. `encode` writes every field as
+  `--name value` in declaration order, quoting a value where it has to.
 * `exit(code)` ends the program with a status. There is no value to answer with
   and nothing after it runs, which is what makes it a statement rather than a
   call.
@@ -253,12 +267,15 @@ widest row in their sheet.
 
 Built on the idea that Hive's type declarations *are* the JSON schema.
 
-* `codec()` → `hive.codec.Codec` is the value that says **read and write it as
-  JSON**, and it is the whole of what this module contributes to the two calls
-  below. A second format adds a codec of its own and nothing else, which is all
-  `hive.crypto.jwtCodec(secret)` ([14.8](#148-hivecrypto)) is.
+* `codec()` → `hive.codec.Codec<hive.json.JsonError>` is the value that says
+  **read and write it as JSON**, and it is the whole of what this module
+  contributes to the two calls below. A second format adds a codec of its own and
+  nothing else, which is all `hive.crypto.jwtCodec(secret)`
+  ([14.8](#148-hivecrypto)), `hive.net.queryParamsCodec()` ([14.9](#149-hivenet))
+  and `hive.term.codec()` ([14.5](#145-hiveterm)) are.
 * `T.decode(text, codec)` is the decoder `T`'s declaration derives, named →
-  `Result<T, hive.codec.DecodingError>`. Missing fields, wrong types and wrong
+  `Result<T, E>`, where `E` is the error the codec's type names —
+  `hive.json.JsonError` for this one. Missing fields, wrong types and wrong
   static vector lengths become errors carrying the exact `path` that failed;
   fields the type doesn't declare are ignored. Variants decode as
   `{"VariantName": {...}}`, and a `null` selects a type's first field-less
@@ -281,11 +298,22 @@ and the other is named on a type.
 to them says which — so `hive.json` is a module like any other rather than
 something the language is built on.
 
+**A codec names the error its decoding fails with**, as `hive.codec.Codec<E>`,
+and each module carrying a codec owns that type — `hive.json.JsonError`,
+`hive.crypto.JwtError`, `hive.net.QueryParamsError`, `hive.term.FlagError` — so a `Result` says which
+format failed. Each carries the `path` that failed, what was `expected` there and
+what was `found`. That type is also what says the format, so **a codec is an
+ordinary value** — held in a variable, passed, stored in a field or returned —
+and the encoder and decoder are still written from the declaration wherever it
+is used.
+
 **A field's annotations are what steer both of them**
 ([04](04-declarations.md#annotations)). `-- JSON as <name>;` is the key the
 field is read from and written as, in both directions, so a round trip agrees
-with itself. `-- Default as <literal>;` is what to read where the key is absent
-or `null`, which is what turns a required field into an optional one:
+with itself; `-- URL as <name>;` is the same for a query string
+([14.9](#149-hivenet)) and `-- Flag as <name>;` for command-line flags
+([14.5](#145-hiveterm)). `-- Default as <literal>;` is what to read where the key
+is absent or `null`, which is what turns a required field into an optional one:
 
 ```hive
 type User {
@@ -330,15 +358,15 @@ Pure, so it works in a `func` too. Fallible operations return
   something else — `"BadSignature"`, which is also what a wrong password gives.
 * **Encoding** — `base64Encode`, `base64Decode`.
 * **Random** — `randomHex(bytes)`.
-* **JWT** — `jwtCodec(secret)` → `hive.codec.Codec` says **read and write it as
+* **JWT** — `jwtCodec(secret)` → `hive.codec.Codec<hive.crypto.JwtError>` says **read and write it as
   an HS256 token under this secret**, and is the whole of what this module
   contributes to tokens: `encode(claims, hive.crypto.jwtCodec(secret))` signs one
   and `T.decode(token, hive.crypto.jwtCodec(secret))` checks the signature and
   the `exp`/`nbf` claims before reading them ([14.7](#147-hivejson)). Only HS256
   is accepted, so `alg: none` and algorithm confusion are rejected outright. A
-  token that does not check out is a `hive.codec.DecodingError` like any other
-  unreadable document, its `found` opening with the reason — so a forged token
-  and wrong-shaped claims are one failure rather than two.
+  token that does not check out is a `hive.crypto.JwtError` like claims of the
+  wrong shape, its `found` opening with the reason — so a forged token and
+  wrong-shaped claims are one failure rather than two.
 * `jwtDecode(token)` reads the claims as a `Str` **without verifying**, for
   inspection only; `jwtHeader(token)` reads `alg`/`typ`/`kid`, which is what a
   program rotating keys needs before it can name the secret.
@@ -387,6 +415,30 @@ A `WsError`'s `reason` is `"Handshake"`, `"Protocol"`, `"Closed"`, `"Send"` or
 * `localAddress()` → the address other machines reach this one on: the source
   address the OS would stamp on a packet leaving by the default route. Nothing is
   sent to find out, and loopback is deliberately not an answer.
+
+**URLs and query strings.** Neither performs I/O.
+
+* `urlEncode(text)` → `Str` percent-encodes every byte but RFC 3986's unreserved
+  characters — letters, digits, `-`, `.`, `_` and `~` — so a space is `%20` and
+  the answer is safe in a path segment and a query alike.
+* `queryParamsCodec()` → `hive.codec.Codec<hive.net.QueryParamsError>` says **read
+  and write it as a query string**, without the leading `?`
+  ([14.7](#147-hivejson)). `encode` writes each field as `key=value` in
+  declaration order, joined by `&` and each half `urlEncode`d; a vector field is
+  its key repeated once per element, so an empty one writes nothing.
+* `T.decode(text, hive.net.queryParamsCodec())` reads one back. `+` and `%20` are
+  both a space, a leading `?` is tolerated, and a parameter the type does not
+  declare is ignored. A field that is absent is an error unless it has a
+  `Default`, as is a key given twice for a field that is not a vector; a vector's
+  absent key is an empty vector, and a `T[n]` needs its key exactly `n` times. A
+  `Bool` is `true` or `false`.
+* A query string is **flat**, so only a type without variants travels as one,
+  and each of its fields is a `Str`, `Int`, `Float`, `Bool` or `Atom`, or a
+  vector of one. Anything else is a compile error at the `encode` or `decode`
+  that asked.
+* A field's key is its own name, or what `-- URL as <name>;` says
+  ([04](04-declarations.md#annotations)), and two fields of one type may not
+  answer to one key.
 
 ## 14.10 `hive.syslink`
 
