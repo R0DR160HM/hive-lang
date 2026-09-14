@@ -1051,9 +1051,9 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
 	}
 }
 
-// What a standard library call takes, position by position. The table says what each
-// position holds and not how many there are, so this checks the positions it has an
-// answer for and leaves the rest.
+// What a standard library call takes: how many, where the table can say, and what
+// each position holds. The type table is positional rather than a count, so the
+// positions it has an answer for are checked and the rest left.
 //
 // Without it the mismatch reaches the Go toolchain, which reports it in terms of
 // Go's own types — and a message that only said `float64` would leave the reader
@@ -1062,17 +1062,29 @@ proc checkLibraryArguments(c: mut Check, env: infer.Env, module: Str, name: Str,
 	if module == "sql" && name == "run" {
 		checkRunsQuery(c, env, args)
 	}
-	wanted := stdlib.paramsOf(module, name)
-	mut i := 0
-	for each a in args {
-		if a.value is ast.Expr.Hole {
+	// One of the library's own types being built takes its fields, matched by
+	// name the way a declared type's are.
+	fields := stdlib.fieldsOf(module, name)
+	if len(fields) > 0 {
+		checkFieldArguments(c, env, "hive.{module}.{name}", fields, args)
+		return
+	}
+	if stdlib.signatureOf(module, name) is Result.Ok(wanted) {
+		if len(args) != len(wanted) {
+			report(c, "`hive.{module}.{name}` takes " + countOf(len(wanted)) + ", and this call passes " + countOf(len(args)))
+			return
+		}
+		mut i := 0
+		for each a in args {
+			if a.value is ast.Expr.Hole {
+				i = i + 1
+				continue
+			}
+			if wanted bounds i {
+				fits(c, wanted[i], infer.typeOf(env, a.value), "the " + nth(i) + " argument of `hive.{module}.{name}`")
+			}
 			i = i + 1
-			continue
 		}
-		if wanted bounds i {
-			fits(c, wanted[i], infer.typeOf(env, a.value), "the " + nth(i) + " argument of `hive.{module}.{name}`")
-		}
-		i = i + 1
 	}
 }
 
@@ -1250,6 +1262,9 @@ func nth(index: Int): Str {
 }
 
 func countOf(n: Int): Str {
+	if n == 0 {
+		return "no arguments"
+	}
 	if n == 1 {
 		return "1 argument"
 	}
@@ -1310,6 +1325,12 @@ proc checkBuiltinCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]):
 		if arity(c, name, args, 2) {
 			fits(c, table(), typeOfArg(c, env, args, 0), "what `{name}` reads")
 			fits(c, types.Ty.TStr(), typeOfArg(c, env, args, 1), "the key `{name}` looks for")
+		}
+	} else if name == "toTable" {
+		if arity(c, name, args, 2) {
+			fits(c, strings(), typeOfArg(c, env, args, 0), "what `toTable` cuts into rows")
+			fits(c, types.Ty.TInt(), typeOfArg(c, env, args, 1), "the row width `toTable` cuts at")
+			checkRowWidth(c, args)
 		}
 	} else if name == "encode" {
 		// Anything with a static type encodes, so beyond the count the only thing
@@ -1404,6 +1425,28 @@ proc checkIndexOf(c: mut Check, env: infer.Env, args: ast.Arg[]): void {
 		return
 	}
 	report(c, "`indexOf` searches a vector or a `Str`, and this is " + types.show(subject))
+}
+
+// A literal width below one could only hand back an empty `Table` — dead code
+// wearing the shape of the form that works. A computed width is total instead.
+proc checkRowWidth(c: mut Check, args: ast.Arg[]): void {
+	if literalInt(ast.argFor(args, "", 1)) is Result.Ok(n) {
+		if n < 1 {
+			report(c, "`toTable` cuts a vector into rows of {n} cells, and a row holds at least one — this could only hand back an empty `Table`")
+		}
+	}
+}
+
+func literalInt(e: ast.Expr): Result<Int, Bool> {
+	if e is ast.Expr.IntLit(n) {
+		return Result.Ok(n)
+	}
+	if e is ast.Expr.Negate(operand) {
+		if operand is ast.Expr.IntLit(n) {
+			return Result.Ok(0 - n)
+		}
+	}
+	return Result.Error(false)
 }
 
 // How many a builtin takes. Answers whether the call had that many, so what

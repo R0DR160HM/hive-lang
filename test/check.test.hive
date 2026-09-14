@@ -90,7 +90,7 @@ test "a shared field a variant declares again would be there twice" {
 
 test "a call with the wrong number of arguments is named" {
 	got := problem("func two(): Int \{ return 2 }\nproc main(): void \{ echo two(1) }")
-	assert got == "in `main`: `two` takes 0 arguments, and this call passes 1 argument"
+	assert got == "in `main`: `two` takes no arguments, and this call passes 1 argument"
 }
 
 test "a constructor with the wrong number of fields is named" {
@@ -607,6 +607,63 @@ test "the names it does have are left alone" {
 	assert problemCount(inMain("hive.map.Map<Str, Int> m = hive.map.new()  hive.map.set(m, \"a\", 1)")) == 0
 }
 
+test "hive.time builds a stamp and reads the current instant" {
+	assert problemCount(inMain("echo hive.time.dateFrom(2026, 9, 14)")) == 0
+	assert problemCount(inMain("echo hive.time.dateTimeFrom(2026, 9, 14, 13, 30, 0)")) == 0
+	assert problemCount(inMain("echo hive.time.year() + hive.time.month() + hive.time.day()")) == 0
+	assert problemCount(inMain("echo hive.time.weekday() + hive.time.lastDayOfMonth()")) == 0
+	assert problemCount(inMain("echo hive.time.hour() + hive.time.minute() + hive.time.second() + hive.time.millisecond()")) == 0
+	// Every one answers an `Int`, so a `Str` slot refuses it.
+	assert opens(problem(inMain("Str s = hive.time.lastDayOfMonth()")),
+		"in `main`: the declaration of `s` wants Str and this is Int")
+	assert problem(inMain("echo hive.time.firstDayOfMonth()")) == "in `main`: `hive.time` has no `firstDayOfMonth`"
+	assert opens(problem(inMain("echo hive.time.dateFrom(2026, \"9\", 1)")),
+		"in `main`: the second argument of `hive.time.dateFrom` wants Int and this is Str")
+}
+
+// A library call's signature is now a whole signature rather than a list of the
+// positions a module had something to say about, so its length is the arity and
+// a miscount is named here. Every one of these used to reach the Go toolchain.
+test "a library call is held to how many arguments it takes" {
+	assert opens(problem(inMain("echo hive.time.dateFrom(2026, 9)")),
+		"in `main`: `hive.time.dateFrom` takes 3 arguments, and this call passes 2 arguments")
+	assert opens(problem(inMain("echo hive.time.day(5)")),
+		"in `main`: `hive.time.day` takes no arguments, and this call passes 1 argument")
+	// `math` claimed three `Float`s for every name in it, `pi` and `sqrt` alike.
+	assert opens(problem(inMain("echo hive.math.pi(1.0)")),
+		"in `main`: `hive.math.pi` takes no arguments, and this call passes 1 argument")
+	assert opens(problem(inMain("echo hive.math.sqrt(2.0, 3.0)")),
+		"in `main`: `hive.math.sqrt` takes 1 argument, and this call passes 2 arguments")
+	assert opens(problem(inMain("echo hive.math.max(1.0)")),
+		"in `main`: `hive.math.max` takes 2 arguments, and this call passes 1 argument")
+	assert opens(problem(inMain("echo hive.conv.its(1, 2)")),
+		"in `main`: `hive.conv.its` takes 1 argument, and this call passes 2 arguments")
+	assert opens(problem(inMain("echo hive.file.read(\"a\", \"b\")")),
+		"in `main`: `hive.file.read` takes 1 argument, and this call passes 2 arguments")
+	assert opens(problem(inMain("echo hive.crypto.sha256()")),
+		"in `main`: `hive.crypto.sha256` takes 1 argument, and this call passes no arguments")
+	assert opens(problem(inMain("echo hive.json.codec(1)")),
+		"in `main`: `hive.json.codec` takes no arguments, and this call passes 1 argument")
+	assert opens(problem(inMain("echo hive.ui.spacer(1)")),
+		"in `main`: `hive.ui.spacer` takes no arguments, and this call passes 1 argument")
+	assert opens(problem("import hive.map\n" + inMain("mut hive.map.Map<Str, Int> m = hive.map.new()  hive.map.set(m, \"a\")")),
+		"in `main`: `hive.map.set` takes 3 arguments, and this call passes 2 arguments")
+	// A hole is an argument: a partial application still covers the whole list.
+	assert problemCount(inMain("f := hive.conv.its(_)  echo f(1)")) == 0
+	assert problemCount(inMain("echo hive.time.format(hive.time.now(), \"%Y\")")) == 0
+}
+
+// One of the library's own types is built by naming its fields, so it is held to
+// those rather than to a position — a named argument may come in any order.
+test "a library type is built from its fields, named or in order" {
+	assert problemCount(inMain("echo hive.net.HttpResponse(200, [[\"a\", \"b\"]], \"ok\")")) == 0
+	assert problemCount(inMain("echo hive.net.HttpResponse(200, body: \"ok\", headers: [[\"a\", \"b\"]])")) == 0
+	assert opens(problem(inMain("echo hive.net.HttpResponse(200, \"ok\")")),
+		"in `main`: `hive.net.HttpResponse` has 3 fields, and this call passes 2 arguments")
+	assert opens(problem(inMain("echo hive.net.HttpResponse(200, [[\"a\"]], 5)")),
+		"in `main`: the field `body` of `hive.net.HttpResponse` wants Str and this is Int")
+}
+
 test "a library call is held to what its module takes" {
 	// Hive never widens a number behind your back, and this is where that is
 	// caught rather than left to Go to say `float64` about.
@@ -672,6 +729,25 @@ test "join, split, row and column are held to their signatures" {
 		"in `main`: what `row` reads wants Str[][] and this is Int[2]")
 	assert opens(problem(inMain("Str[dyn][dyn] t = []  echo column(t, 1)")),
 		"in `main`: the key `column` looks for wants Str and this is Int")
+}
+
+test "toTable cuts a vector of cells into rows that wide" {
+	assert problemCount(inMain("echo toTable([\"1\", \"2\", \"3\"], 2)")) == 0
+	assert problemCount(inMain("Table t = toTable([\"a\"], 1)  echo t")) == 0
+	assert opens(problem(inMain("echo toTable([1, 2], 2)")),
+		"in `main`: what `toTable` cuts into rows wants Str[] and this is Int[2]")
+	assert opens(problem(inMain("echo toTable([\"a\"], \"2\")")),
+		"in `main`: the row width `toTable` cuts at wants Int and this is Str")
+	assert opens(problem(inMain("echo toTable([\"a\"])")),
+		"in `main`: `toTable` takes 2 arguments, and this call passes 1 argument")
+	// A row holds at least one cell, and a literal saying otherwise could only
+	// ever hand back an empty `Table`.
+	assert opens(problem(inMain("echo toTable([\"a\"], 0)")),
+		"in `main`: `toTable` cuts a vector into rows of 0 cells, and a row holds at least one")
+	assert opens(problem(inMain("echo toTable([\"a\"], -2)")),
+		"in `main`: `toTable` cuts a vector into rows of -2 cells, and a row holds at least one")
+	// A computed width is total instead, so nothing is refused here.
+	assert problemCount(inMain("wide := len([\"a\"]) - 1  echo toTable([\"a\"], wide)")) == 0
 }
 
 test "len and bytes measure something that has a size" {

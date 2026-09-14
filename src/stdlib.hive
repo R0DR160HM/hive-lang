@@ -229,7 +229,18 @@ func envResult(name: Str): types.Ty {
 func timeResult(name: Str): types.Ty {
 	if name == "now" || name == "timezoneOffset" { return types.Ty.TInt() }
 	if name == "timezone" || name == "format" { return types.Ty.TStr() }
+	if name == "dateFrom" || name == "dateTimeFrom" { return types.Ty.TInt() }
+	if isClockReading(name) { return types.Ty.TInt() }
 	return types.Ty.TUnknown()
+}
+
+// The fields of the current instant, each read in local time the way `format`
+// renders one.
+func isClockReading(name: Str): Bool {
+	return name == "year" || name == "month" || name == "day"
+		|| name == "weekday" || name == "lastDayOfMonth"
+		|| name == "hour" || name == "minute" || name == "second"
+		|| name == "millisecond"
 }
 
 func jsonResult(name: Str, args: types.Ty[]): types.Ty {
@@ -802,7 +813,15 @@ func uiParams(name: Str): types.Ty[dyn] {
 	}
 	if name == "html" { return [view] }
 	if name == "page" { return [str, view] }
-	if name == "window" { return [str] }
+	// A window is a service with a page in front of it: what it is called, what
+	// draws it, what folds a message into its state, and that state to begin with.
+	// The last two are the program's own, so only their positions are said here.
+	if name == "window" {
+		return [str, types.Ty.TUnknown(), types.Ty.TUnknown(), types.Ty.TUnknown()]
+	}
+	// An event takes the message itself, or a function to one. What its handler
+	// is *handed* when it fires is `uiEventArgs`, which is a different question.
+	if isUiEvent(name) { return [types.Ty.TUnknown()] }
 	if isUiAttr(name) { return uiAttrParams(name) }
 	return []
 }
@@ -863,6 +882,26 @@ func uiAttrParams(name: Str): types.Ty[dyn] {
 //
 // So a position that is a program's own type says `TUnknown` and does not guess: a
 // guess is harmless to the first reader and a wrong refusal to the second.
+// What a library call takes, position by position — the whole list, so its length
+// is the call's arity and a library call is held to its signature exactly the way
+// a declared `func` is. A position whose type is the program's own business — a
+// map's key, a service's message, a query's rows — is `TUnknown`, which `accepts`
+// waves through; the count still stands.
+//
+// `Error` is for a name that has no signature to be held to: a library type that
+// is an opaque handle, which nothing constructs.
+func signatureOf(module: Str, name: Str): Result<types.Ty[dyn], Bool> {
+	// A capitalised name is one of the library's own types rather than a call: an
+	// opaque handle, which nothing constructs, or a record, whose arguments are
+	// its fields and are matched by name the way a declared type's are.
+	if isLibType(module, name) {
+		return Result.Error(false)
+	}
+	return Result.Ok(paramsOf(module, name))
+}
+
+// The positions themselves. Kept apart from `signatureOf` so the emitter can ask
+// for them without unwrapping, and so a module reads as one block.
 func paramsOf(module: Str, name: Str): types.Ty[dyn] {
 	if module == "term" {
 		if name == "print" || name == "status" { return [types.Ty.TStr()] }
@@ -873,6 +912,7 @@ func paramsOf(module: Str, name: Str): types.Ty[dyn] {
 			return [types.Ty.TStr(), strings(), types.Ty.TStr(), environment()]
 		}
 		if name == "exit" { return [types.Ty.TInt()] }
+		// `read`, `readSecret`, `isTerminal` and `args` ask for nothing.
 		return []
 	}
 	if module == "file" {
@@ -889,76 +929,21 @@ func paramsOf(module: Str, name: Str): types.Ty[dyn] {
 		if name == "itf" || name == "its" { return [types.Ty.TInt()] }
 		return [types.Ty.TStr()]
 	}
-	if module == "math" {
-		return [types.Ty.TFloat(), types.Ty.TFloat(), types.Ty.TFloat()]
-	}
+	if module == "math" { return mathParams(name) }
 	if module == "env" { return [types.Ty.TStr()] }
 	if module == "task" { return [types.Ty.TInt()] }
-	if module == "time" {
-		if name == "format" { return [types.Ty.TInt(), types.Ty.TStr()] }
-		return []
-	}
+	if module == "time" { return timeParams(name) }
 	if module == "json" {
 		if name == "table" || name == "flatten" { return [types.Ty.TStr()] }
 		if name == "get" { return [table(), types.Ty.TStr()] }
+		// `codec()` takes nothing: it is the value that says JSON.
 		return []
 	}
+	if module == "map" { return mapParams(name) }
 	if module == "ui" { return uiParams(name) }
-	if module == "syslink" {
-		address := types.Ty.TLib("syslink", "Address")
-		envelope := types.Ty.TLib("syslink", "Envelope")
-		// A service name is an atom, which lets the compiler know the registry.
-		if name == "at" { return [types.Ty.TAtom()] }
-		if name == "on" { return [types.Ty.TStr(), types.Ty.TAtom()] }
-		if name == "register" { return [types.Ty.TAtom(), address] }
-		if name == "stop" { return [address] }
-		if name == "self" { return [envelope] }
-		if name == "listen" { return [types.Ty.TStr()] }
-		if name == "monitor" { return [envelope, address] }
-		if name == "answer" { return [envelope] }
-		return []
-	}
-	if module == "sql" {
-		driver := types.Ty.TLib("sql", "DatabaseDriver")
-		if name == "connect" { return [driver, types.Ty.TStr()] }
-		if name == "pool" {
-			return [driver, types.Ty.TStr(), types.Ty.TInt(), types.Ty.TInt()]
-		}
-		if name == "raw" {
-			return [types.Ty.TLib("sql", "SqlConnection"), types.Ty.TStr()]
-		}
-		// `run`'s second argument is a query of some row type, which is a shape
-		// no single answer here fits. The checker holds it to being one.
-		return [types.Ty.TLib("sql", "SqlConnection")]
-	}
-	if module == "net" {
-		if name == "httpRequest" { return [types.Ty.TLib("net", "HttpRequest")] }
-		// A server takes a port and a handler, and the handler's shape is what
-		// the compiler holds it to.
-		if name == "httpServe" {
-			return [types.Ty.TInt(), handler(types.Ty.TLib("net", "HttpRequest"), types.Ty.TLib("net", "HttpResponse"))]
-		}
-		if name == "wsServe" {
-			return [types.Ty.TInt(), handler(types.Ty.TLib("net", "WsConnection"), types.Ty.TVoid())]
-		}
-		if name == "socketServe" {
-			return [types.Ty.TInt(), handler(types.Ty.TLib("net", "SocketConnection"), types.Ty.TVoid())]
-		}
-		if name == "wsConnect" || name == "resolve" { return [types.Ty.TStr()] }
-		if name == "socketConnect" { return [types.Ty.TStr(), types.Ty.TInt()] }
-		// The connection every one of these opens with is a handle, so it stands
-		// for itself; what follows it is what needs saying.
-		if name == "wsSend" {
-			return [types.Ty.TLib("net", "WsConnection"), types.Ty.TStr()]
-		}
-		if name == "socketSend" {
-			return [types.Ty.TLib("net", "SocketConnection"), types.Ty.TStr()]
-		}
-		if name == "socketReceive" {
-			return [types.Ty.TLib("net", "SocketConnection"), types.Ty.TInt()]
-		}
-		return []
-	}
+	if module == "syslink" { return syslinkParams(name) }
+	if module == "sql" { return sqlParams(name) }
+	if module == "net" { return netParams(name) }
 	if module == "crypto" {
 		if name == "randomHex" { return [types.Ty.TInt()] }
 		if name == "hmacSha256" || name == "encrypt" || name == "decrypt" {
@@ -966,6 +951,104 @@ func paramsOf(module: Str, name: Str): types.Ty[dyn] {
 		}
 		return [types.Ty.TStr()]
 	}
+	return []
+}
+
+// Every one takes and answers with a `Float`; what differs is how many.
+func mathParams(name: Str): types.Ty[dyn] {
+	number := types.Ty.TFloat()
+	if name == "pi" { return [] }
+	if name == "clamp" { return [number, number, number] }
+	if name == "atan2" || name == "hypot" || name == "min" || name == "max" {
+		return [number, number]
+	}
+	return [number]
+}
+
+func timeParams(name: Str): types.Ty[dyn] {
+	count := types.Ty.TInt()
+	if name == "format" { return [count, types.Ty.TStr()] }
+	if name == "dateFrom" { return [count, count, count] }
+	if name == "dateTimeFrom" {
+		return [count, count, count, count, count, count]
+	}
+	// `now`, the zone pair, and every reading of the current instant.
+	return []
+}
+
+// A map's key and value are whatever was put in it, so only the shape is said
+// here and `check` reads the rest off the map it was handed.
+func mapParams(name: Str): types.Ty[dyn] {
+	any := types.Ty.TUnknown()
+	if name == "new" { return [] }
+	if name == "set" { return [any, any, any] }
+	if name == "get" || name == "has" || name == "delete" { return [any, any] }
+	if name == "fromTable" { return [table()] }
+	// `keys`, `values` and `toTable` each read one map.
+	return [any]
+}
+
+func syslinkParams(name: Str): types.Ty[dyn] {
+	address := types.Ty.TLib("syslink", "Address")
+	envelope := types.Ty.TLib("syslink", "Envelope")
+	// A handler, its state, and the messages they pass are the program's own, so
+	// what is said about those positions is that they are there.
+	any := types.Ty.TUnknown()
+	// A service name is an atom, which lets the compiler know the registry.
+	if name == "at" { return [types.Ty.TAtom()] }
+	if name == "on" { return [types.Ty.TStr(), types.Ty.TAtom()] }
+	if name == "register" { return [types.Ty.TAtom(), address] }
+	if name == "stop" { return [address] }
+	if name == "self" { return [envelope] }
+	if name == "listen" { return [types.Ty.TStr()] }
+	if name == "spawn" { return [any, any] }
+	if name == "answer" { return [envelope, any] }
+	if name == "monitor" { return [envelope, address, any] }
+	// `node` and `peers` ask for nothing.
+	return []
+}
+
+func sqlParams(name: Str): types.Ty[dyn] {
+	connection := types.Ty.TLib("sql", "SqlConnection")
+	driver := types.Ty.TLib("sql", "DatabaseDriver")
+	if name == "connect" { return [driver, types.Ty.TStr()] }
+	if name == "pool" {
+		return [driver, types.Ty.TStr(), types.Ty.TInt(), types.Ty.TInt()]
+	}
+	if name == "raw" { return [connection, types.Ty.TStr()] }
+	// `run`'s second argument is a query of some row type, which is a shape no
+	// type here fits. `checkRunsQuery` holds it to being one.
+	if name == "run" { return [connection, types.Ty.TUnknown()] }
+	return [connection]
+}
+
+func netParams(name: Str): types.Ty[dyn] {
+	port := types.Ty.TInt()
+	text := types.Ty.TStr()
+	ws := types.Ty.TLib("net", "WsConnection")
+	socket := types.Ty.TLib("net", "SocketConnection")
+	if name == "httpRequest" { return [types.Ty.TLib("net", "HttpRequest")] }
+	// A server takes a port and a handler, and the handler's shape is what the
+	// compiler holds it to.
+	if name == "httpServe" {
+		return [port, handler(types.Ty.TLib("net", "HttpRequest"), types.Ty.TLib("net", "HttpResponse"))]
+	}
+	if name == "wsServe" { return [port, handler(ws, types.Ty.TVoid())] }
+	if name == "socketServe" { return [port, handler(socket, types.Ty.TVoid())] }
+	if name == "wsConnect" || name == "resolve" { return [text] }
+	if name == "socketConnect" { return [text, port] }
+	// The connection every one of these opens with is a handle, so it stands for
+	// itself; what follows it is what needs saying.
+	if name == "wsSend" { return [ws, text] }
+	if name == "wsReceive" || name == "wsClose" || name == "wsRequest" {
+		return [ws]
+	}
+	if name == "socketSend" { return [socket, text] }
+	if name == "socketReceive" { return [socket, port] }
+	if name == "socketReceiveLine" || name == "socketClose" || name == "socketPeer" {
+		return [socket]
+	}
+	// `localAddress` asks for nothing.
 	return []
 }
 

@@ -21,6 +21,7 @@ type.
 | `indexOf(str, sub)` | `indexOf(Str, Str): Result<Int, Bool>` | position, in characters, of the first occurrence |
 | `row(table, key)` | `row(Table, Str): Str[dyn]` | the row whose first cell equals `key`, else `[]` |
 | `column(table, key)` | `column(Table, Str): Str[dyn]` | the column whose top cell equals `key`, else `[]` |
+| `toTable(cells, wide)` | `toTable(Str[], Int): Table` | the cells cut into rows of `wide`, the last row short |
 | `map(values, transform)` | `map(T[], func(T): K): K[dyn]` | every element, transformed |
 | `filter(values, keep)` | `filter(T[], func(T): Bool): T[dyn]` | the elements `keep` says yes to |
 | `filterMap(values, transform)` | `filterMap(T[], func(T): Result<K, E>): K[dyn]` | transform and select in one pass |
@@ -40,6 +41,15 @@ than a pattern — to rewrite by shape, match with a
 [string pattern](07-patterns.md#74-string-patterns) and build the answer from
 what its holes bound. Neither is an error when `from` is not there; the string
 comes back as it was.
+
+`toTable` fills its rows left to right and takes what is left for the last one,
+so `toTable(["1", "2", "3", "4", "5", "6", "7"], 3)` is
+`[["1", "2", "3"], ["4", "5", "6"], ["7"]]`. A row holds at least one cell, so a
+**width written as a literal** below one is a compile error — it could only hand
+back an empty `Table`, which is dead code wearing the shape of the form that
+works. A width **computed** at run time is total instead: below one it hands back
+an empty `Table`, the way dividing by zero is a value rather than a crash
+([05.7](05-expressions.md#57-arithmetic-at-the-edges)).
 
 `encode` is here for the reason the rest are: a builtin is what operates on the
 types the language hands out without an import, and a document is a `Str`. It is

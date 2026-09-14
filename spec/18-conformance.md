@@ -197,6 +197,13 @@ program *is* still refused. What is lost is which language the message is about.
    A builtin used as a value — `map(names, len)` — was the same story, and is
    refused for the reason a generic is: several builtins are overloaded, and a
    value carries no argument types to pick with.
+
+   **A library call's argument count** went the same way, later than the rest.
+   The table behind `hive.<module>.<name>` recorded a type for the positions a
+   module had something to say about and stopped, so its length was a lower bound
+   rather than an arity and `hive.math.pi(1.0)` or `hive.map.set(m, "a")` went
+   straight through. It is a whole signature now ([14](14-stdlib.md)), so a
+   miscount is named here.
 2. **Diagnostics after the parser opened at `file:0:`.** No editor jumps to line
    zero, so [18.1(5)](#181-what-a-conforming-implementation-must-do) was not
    met. Those passes carry a declaration's line and now report against it, and

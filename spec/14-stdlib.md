@@ -9,6 +9,14 @@ A module reached often can be given a short name with `import`
 ([12](12-modules.md#126-importing-a-standard-library-module)). It is a spelling
 and nothing more.
 
+**A library call has a signature and is held to it** — how many arguments it
+takes and what each one is — exactly as a declared `func` is. A call that does
+not match is a compile error here, not one the Go toolchain reports later against
+a file nobody wrote. Where a position's type is the program's own business — a
+map's key, a service's message, a query's rows — nothing is claimed about *that*
+type, but the count still stands. One of a module's own types is built by naming
+its fields, so it is held to those and a named argument may come in any order.
+
 **A module you don't use is not in your build**
 ([12](12-modules.md#127-what-is-linked)). Every module but two is written against
 the target's standard library alone, so HTTP, WebSockets, TCP, JSON,
@@ -462,6 +470,21 @@ Times are plain `Int`s — Unix seconds.
   | `%H` hour 00–23 | `%I` hour 01–12 | `%M` minute | `%S` second |
   | `%p` AM/PM | `%j` day-of-year | `%Z` zone name | `%z` zone offset |
   | `%A`/`%a` weekday | `%B`/`%b` month name | `%%` literal `%` | |
+
+* `dateFrom(year, month, day)` and
+  `dateTimeFrom(year, month, day, hour, minute, second)` answer with the same
+  kind of `Int` `now()` does, for a date named rather than this one. Both build
+  in **local** time, so a stamp round-trips with `format`. A field out of range
+  **carries into the next**, the way a clock does: `dateFrom(2026, 13, 1)` is
+  2027-01-01 and `dateFrom(2026, 3, 0)` is February's last day.
+* `year()`, `month()` (1–12), `day()` (1–31), `weekday()` (**1 Monday – 7
+  Sunday**, the ISO numbering), `lastDayOfMonth()` (28–31, how long this month
+  is), `hour()` (0–23), `minute()`, `second()` (0–59) and `millisecond()`
+  (0–999) each answer one field of **now**, read in local time. They take no
+  arguments; a field of some other stamp is read by rendering it with `format`.
+
+  `millisecond()` is a sub-second **field**, the way `second()` is 0–59 — a
+  reading is still seconds, and there is no millisecond clock here.
 
 ## 14.13 `hive.env`
 
