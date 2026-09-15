@@ -4,16 +4,12 @@
 
 ### Standard library
 
-* **`ui.InputKind.Range()`** — a slider. It runs 0–100, and both the value it is
-  given and the text `onInput` hands back are that number. While it has focus it
-  keeps only the keys that move it (the arrows, `Home`, `End` and the page keys),
-  so a scene still hears `Escape` and everything else.
+* **`ui.InputKind.Range()`** — a slider running 0–100, whose value and `onInput` text are that number, and which keeps only the keys that move it while it has focus, so a scene still hears `Escape`.
 
 ### Fixes
 
-* **A key released while a field has focus is let go.** A scene ignored keyup as
-  well as keydown while typing, so a key held down as focus moved into a field
-  stayed held after it came up.
+* **A key released while a field has focus is let go**, where a scene ignored keyup as well as keydown while typing and a key held as focus moved into a field stayed held after it came up.
+* **An inset no longer shrinks the picture behind it**, where under `ui.grain` it set the renderer's viewport rather than the render target's and left the canvas at the buffer's size, drawing the whole blown-up world into its bottom-left corner.
 
 ## v0.2.5
 
