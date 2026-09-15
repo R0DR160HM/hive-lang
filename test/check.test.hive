@@ -90,7 +90,7 @@ test "a shared field a variant declares again would be there twice" {
 
 test "a call with the wrong number of arguments is named" {
 	got := problem("func two(): Int \{ return 2 }\nproc main(): void \{ echo two(1) }")
-	assert got == "in `main`: `two` takes 0 arguments, and this call passes 1 argument"
+	assert got == "in `main`: `two` takes no arguments, and this call passes 1 argument"
 }
 
 test "a constructor with the wrong number of fields is named" {
@@ -531,18 +531,91 @@ test "a decoder reads a Str and the codec to read it with" {
 		"in `main`: what `Sig.Move.decode` reads wants Str")
 }
 
-test "the codec has to be named where it is used, not reached through a variable" {
-	assert opens(problem(withSig("c := hive.json.codec()  echo Sig.decode(\"x\", c)")),
-		"in `main`: the codec `Sig.decode` uses has to be named here")
-	// The message names every format there is to name.
-	assert text.contains(problem(withSig("c := hive.json.codec()  echo Sig.decode(\"x\", c)")),
-		"`hive.json.codec()` or `hive.crypto.jwtCodec(secret)`")
-	assert opens(problem(withSig("c := hive.json.codec()  echo encode(1, c)")),
-		"in `main`: the codec `encode` uses has to be named here")
-	// And something that is not a codec at all is refused as the wrong type.
+test "a codec is a value, held and handed on like any other" {
+	assert problemCount(withSig("c := hive.json.codec()  if Sig.decode(\"x\", c) is Result.Ok(s) \{ echo s }")) == 0
+	assert problemCount(withSig("c := hive.crypto.jwtCodec(\"s\")  echo encode(Sig.Ping(), c)")) == 0
+	passed := "type S \{ a: Str }\nfunc send(s: S, c: hive.codec.Codec<hive.net.QueryParamsError>): Str \{ return encode(s, c) }\n"
+	assert problemCount(passed + "proc main(): void \{ echo send(S(\"x\"), hive.net.queryParamsCodec()) }") == 0
+	// Its type still says the format, so a held codec is held to that format's shape.
+	assert opens(problem(withSig("c := hive.net.queryParamsCodec()  if Sig.decode(\"x\", c) is Result.Ok(s) \{ echo s }")),
+		"in `main`: a query string is one flat set of parameters")
+	// Something that is not a codec is refused as the wrong type, and a codec
+	// whose error type names no format is refused for that.
 	assert opens(problem(withSig("echo Sig.decode(\"x\", 7)")),
-		"in `main`: the codec `Sig.decode` uses wants hive.codec.Codec")
+		"in `main`: the codec `Sig.decode` uses wants hive.codec.Codec<E>")
+	assert opens(problem("type S \{ a: Str }\nfunc send(s: S, c: hive.codec.Codec<Str>): Str \{ return encode(s, c) }\nproc main(): void \{ }"),
+		"in `send`: `hive.codec.Codec<Str>` names no format")
 	assert problemCount(withSig("echo encode(1, hive.json.codec())")) == 0
+}
+
+test "each codec's decode fails with its own module's error" {
+	assert problemCount(withSig("Result<Sig, hive.json.JsonError> r = Sig.decode(\"x\", hive.json.codec())  if r is Result.Ok(s) \{ echo s }")) == 0
+	assert opens(problem(withSig("Result<Sig, hive.crypto.JwtError> r = Sig.decode(\"x\", hive.json.codec())  if r is Result.Ok(s) \{ echo s }")),
+		"in `main`: the declaration of `r` wants Result<Sig, hive.crypto.JwtError> and this is Result<Sig, hive.json.JsonError>")
+	assert opens(problem(inMain("hive.codec.Codec<hive.net.QueryParamsError> c = hive.json.codec()")),
+		"in `main`: the declaration of `c` wants hive.codec.Codec<hive.net.QueryParamsError> and this is hive.codec.Codec<hive.json.JsonError>")
+	assert problemCount(inMain("if hive.json.flatten(\"x\") is Result.Error(why) \{ echo why.path }")) == 0
+}
+
+// --- A query string ----------------------------------------------------------
+
+func withSearch(body: Str): Str {
+	return "type Search \{ term: Str -- URL as q;\n page: Int -- Default as 1;\n tags: Str[dyn] }\nproc main(): void \{ " + body + " }"
+}
+
+test "a query string reads and writes a type's fields as parameters" {
+	assert problemCount(withSearch("echo encode(Search(\"a\", 1, [\"b\"]), hive.net.queryParamsCodec())")) == 0
+	assert problemCount(withSearch("if Search.decode(\"q=a\", hive.net.queryParamsCodec()) is Result.Error(why) \{ echo why.found }")) == 0
+	assert problemCount(inMain("echo hive.net.urlEncode(\"a b\")")) == 0
+	assert opens(problem(inMain("echo hive.net.urlEncode(1)")),
+		"in `main`: the first argument of `hive.net.urlEncode` wants Str and this is Int")
+}
+
+test "a query string is flat, so a union or a nested field is refused" {
+	assert opens(problem(withSig("if Sig.decode(\"x\", hive.net.queryParamsCodec()) is Result.Ok(s) \{ echo s }")),
+		"in `main`: a query string is one flat set of parameters, so `Sig.decode` cannot carry `Sig`, which has variants")
+	nested := "type Inner \{ n: Int }\ntype Outer \{ inner: Inner }\n"
+	assert opens(problem(nested + inMain("echo encode(Outer(Inner(1)), hive.net.queryParamsCodec())")),
+		"in `main`: `Outer.inner` is Inner, and a query parameter is a `Str`")
+	assert opens(problem(inMain("echo encode(1, hive.net.queryParamsCodec())")),
+		"in `main`: a query string is a declared type's fields, so `encode` cannot carry Int")
+	// JSON carries every one of these.
+	assert problemCount(nested + inMain("echo encode(Outer(Inner(1)), hive.json.codec())")) == 0
+}
+
+test "two fields cannot answer to one query parameter" {
+	assert opens(problem("type S \{ a: Str -- URL as x;\n b: Str -- URL as x; }\nproc main(): void \{ }"),
+		"in `S`: two fields here are `x` in a query string")
+	// A JSON name is its own, so it never clashes with a URL one.
+	assert problemCount("type S \{ a: Str -- URL as x;\n b: Str -- JSON as x; }\nproc main(): void \{ }") == 0
+}
+
+// --- Command-line flags ------------------------------------------------------
+
+func withSomething(body: Str): Str {
+	return "type Something \{ foo: Str\n bazzBazz: Bool }\nproc main(): void \{ " + body + " }"
+}
+
+test "command-line flags read into a type from a line of text" {
+	assert problemCount(withSomething("if Something.decode(\"--foo ABC --bazzBazz true\", hive.term.codec()) is Result.Ok(s) \{ echo s.foo }")) == 0
+	assert problemCount(withSomething("if Something.decode(join(hive.term.args(), \" \"), hive.term.codec()) is Result.Ok(s) \{ echo s.foo }")) == 0
+	assert problemCount(withSomething("echo encode(Something(\"ABC\", true), hive.term.codec())")) == 0
+	assert problemCount(withSomething("if Something.decode(\"x\", hive.term.codec()) is Result.Error(why) \{ echo why.path }")) == 0
+	// A decoder reads a `Str`, so the arguments are joined first.
+	assert opens(problem(withSomething("if Something.decode(hive.term.args(), hive.term.codec()) is Result.Ok(s) \{ echo s.foo }")),
+		"in `main`: what `Something.decode` reads wants Str")
+	assert opens(problem(withSomething("if Something.decode(1, hive.term.codec()) is Result.Ok(s) \{ echo s.foo }")),
+		"in `main`: what `Something.decode` reads wants Str")
+}
+
+test "command-line flags are flat, and two fields cannot answer to one" {
+	assert opens(problem(withSig("if Sig.decode(\"x\", hive.term.codec()) is Result.Ok(s) \{ echo s }")),
+		"in `main`: a command line is one flat set of parameters, so `Sig.decode` cannot carry `Sig`, which has variants")
+	assert opens(problem("type Inner \{ n: Int }\ntype Outer \{ inner: Inner }\n" + inMain("echo encode(Outer(Inner(1)), hive.term.codec())")),
+		"in `main`: `Outer.inner` is Inner, and a flag is a `Str`")
+	assert opens(problem("type S \{ a: Str -- Flag as x;\n b: Str -- Flag as x; }\nproc main(): void \{ }"),
+		"in `S`: two fields here are `--x` on a command line")
+	assert problemCount("type S \{ somethingElse: Str -- Flag as something-else;\n something: Str }\nproc main(): void \{ }") == 0
 }
 
 test "the json module carries flatten, and no longer carries parse" {
@@ -605,6 +678,65 @@ test "the names it does have are left alone" {
 	assert problemCount(inMain("echo hive.conv.its(1)")) == 0
 	assert problemCount(inMain("echo hive.crypto.jwtDecode(\"t\")")) == 0
 	assert problemCount(inMain("hive.map.Map<Str, Int> m = hive.map.new()  hive.map.set(m, \"a\", 1)")) == 0
+}
+
+test "hive.time builds a stamp and reads the current instant" {
+	assert problemCount(inMain("echo hive.time.dateFrom(2026, 9, 14)")) == 0
+	assert problemCount(inMain("echo hive.time.dateTimeFrom(2026, 9, 14, 13, 30, 0)")) == 0
+	assert problemCount(inMain("echo hive.time.year() + hive.time.month() + hive.time.day()")) == 0
+	assert problemCount(inMain("echo hive.time.weekday() + hive.time.lastDayOfMonth()")) == 0
+	assert problemCount(inMain("echo hive.time.hour() + hive.time.minute() + hive.time.second() + hive.time.millisecond()")) == 0
+	// Every one answers an `Int`, so a `Str` slot refuses it.
+	assert opens(problem(inMain("Str s = hive.time.lastDayOfMonth()")),
+		"in `main`: the declaration of `s` wants Str and this is Int")
+	assert problem(inMain("echo hive.time.firstDayOfMonth()")) == "in `main`: `hive.time` has no `firstDayOfMonth`"
+	assert opens(problem(inMain("echo hive.time.dateFrom(2026, \"9\", 1)")),
+		"in `main`: the second argument of `hive.time.dateFrom` wants Int and this is Str")
+}
+
+// A library call's signature is now a whole signature rather than a list of the
+// positions a module had something to say about, so its length is the arity and
+// a miscount is named here. Every one of these used to reach the Go toolchain.
+test "a library call is held to how many arguments it takes" {
+	assert opens(problem(inMain("echo hive.time.dateFrom(2026, 9)")),
+		"in `main`: `hive.time.dateFrom` takes 3 arguments, and this call passes 2 arguments")
+	assert opens(problem(inMain("echo hive.time.day(5)")),
+		"in `main`: `hive.time.day` takes no arguments, and this call passes 1 argument")
+	// `math` claimed three `Float`s for every name in it, `pi` and `sqrt` alike.
+	assert opens(problem(inMain("echo hive.math.pi(1.0)")),
+		"in `main`: `hive.math.pi` takes no arguments, and this call passes 1 argument")
+	assert opens(problem(inMain("echo hive.math.sqrt(2.0, 3.0)")),
+		"in `main`: `hive.math.sqrt` takes 1 argument, and this call passes 2 arguments")
+	assert opens(problem(inMain("echo hive.math.max(1.0)")),
+		"in `main`: `hive.math.max` takes 2 arguments, and this call passes 1 argument")
+	assert opens(problem(inMain("echo hive.conv.its(1, 2)")),
+		"in `main`: `hive.conv.its` takes 1 argument, and this call passes 2 arguments")
+	assert opens(problem(inMain("echo hive.file.read(\"a\", \"b\")")),
+		"in `main`: `hive.file.read` takes 1 argument, and this call passes 2 arguments")
+	assert opens(problem(inMain("echo hive.crypto.sha256()")),
+		"in `main`: `hive.crypto.sha256` takes 1 argument, and this call passes no arguments")
+	assert opens(problem(inMain("echo hive.json.codec(1)")),
+		"in `main`: `hive.json.codec` takes no arguments, and this call passes 1 argument")
+	assert opens(problem(inMain("echo hive.ui.spacer(1)")),
+		"in `main`: `hive.ui.spacer` takes no arguments, and this call passes 1 argument")
+	// A spinner is a widget with nothing to show, so it still takes its attributes.
+	assert problemCount(inMain("echo hive.ui.spinner([])")) == 0
+	assert opens(problem("import hive.map\n" + inMain("mut hive.map.Map<Str, Int> m = hive.map.new()  hive.map.set(m, \"a\")")),
+		"in `main`: `hive.map.set` takes 3 arguments, and this call passes 2 arguments")
+	// A hole is an argument: a partial application still covers the whole list.
+	assert problemCount(inMain("f := hive.conv.its(_)  echo f(1)")) == 0
+	assert problemCount(inMain("echo hive.time.format(hive.time.now(), \"%Y\")")) == 0
+}
+
+// One of the library's own types is built by naming its fields, so it is held to
+// those rather than to a position — a named argument may come in any order.
+test "a library type is built from its fields, named or in order" {
+	assert problemCount(inMain("echo hive.net.HttpResponse(200, [[\"a\", \"b\"]], \"ok\")")) == 0
+	assert problemCount(inMain("echo hive.net.HttpResponse(200, body: \"ok\", headers: [[\"a\", \"b\"]])")) == 0
+	assert opens(problem(inMain("echo hive.net.HttpResponse(200, \"ok\")")),
+		"in `main`: `hive.net.HttpResponse` has 3 fields, and this call passes 2 arguments")
+	assert opens(problem(inMain("echo hive.net.HttpResponse(200, [[\"a\"]], 5)")),
+		"in `main`: the field `body` of `hive.net.HttpResponse` wants Str and this is Int")
 }
 
 test "a library call is held to what its module takes" {
@@ -672,6 +804,25 @@ test "join, split, row and column are held to their signatures" {
 		"in `main`: what `row` reads wants Str[][] and this is Int[2]")
 	assert opens(problem(inMain("Str[dyn][dyn] t = []  echo column(t, 1)")),
 		"in `main`: the key `column` looks for wants Str and this is Int")
+}
+
+test "toTable cuts a vector of cells into rows that wide" {
+	assert problemCount(inMain("echo toTable([\"1\", \"2\", \"3\"], 2)")) == 0
+	assert problemCount(inMain("Table t = toTable([\"a\"], 1)  echo t")) == 0
+	assert opens(problem(inMain("echo toTable([1, 2], 2)")),
+		"in `main`: what `toTable` cuts into rows wants Str[] and this is Int[2]")
+	assert opens(problem(inMain("echo toTable([\"a\"], \"2\")")),
+		"in `main`: the row width `toTable` cuts at wants Int and this is Str")
+	assert opens(problem(inMain("echo toTable([\"a\"])")),
+		"in `main`: `toTable` takes 2 arguments, and this call passes 1 argument")
+	// A row holds at least one cell, and a literal saying otherwise could only
+	// ever hand back an empty `Table`.
+	assert opens(problem(inMain("echo toTable([\"a\"], 0)")),
+		"in `main`: `toTable` cuts a vector into rows of 0 cells, and a row holds at least one")
+	assert opens(problem(inMain("echo toTable([\"a\"], -2)")),
+		"in `main`: `toTable` cuts a vector into rows of -2 cells, and a row holds at least one")
+	// A computed width is total instead, so nothing is refused here.
+	assert problemCount(inMain("wide := len([\"a\"]) - 1  echo toTable([\"a\"], wide)")) == 0
 }
 
 test "len and bytes measure something that has a size" {

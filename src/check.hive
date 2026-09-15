@@ -381,7 +381,7 @@ proc checkTypeDecl(c: mut Check, fields: ast.Field[], variants: ast.Variant[]): 
 // answers with a `Result` the caller has to open. Checked here because the
 // emitter needs both before it can name a decoder, so nothing downstream could
 // report a wrong one.
-proc checkDecodes(c: mut Check, env: infer.Env, what: Str, args: ast.Arg[]): void {
+proc checkDecodes(c: mut Check, env: infer.Env, what: Str, typeName: Str, args: ast.Arg[]): void {
 	if len(args) != 2 {
 		report(c, what + " reads a `Str` and the codec to read it with, and this call passes " + countOf(len(args)))
 		return
@@ -391,40 +391,74 @@ proc checkDecodes(c: mut Check, env: infer.Env, what: Str, args: ast.Arg[]): voi
 	}
 	if args bounds 1 {
 		checkNamesCodec(c, env, what, args[1].value)
+		checkFlatShape(c, what, types.Ty.TNamed(typeName), stdlib.formatOfCodec(infer.typeOf(env, args[1].value)))
 	}
 }
 
-// The codec has to be named where it is used. The encoder and the decoder are
-// written out of a declaration at the call site, so a codec that arrived in a
-// variable leaves nothing to write them from — and refusing it here is the whole
-// of what keeps this free of reflection.
-proc checkNamesCodec(c: mut Check, env: infer.Env, what: Str, given: ast.Expr): void {
-	if given is ast.Expr.Hole {
+// A query string and a command line are one flat set of parameters, so only a
+// type without variants whose fields are values, or vectors of values, travels as one.
+proc checkFlatShape(c: mut Check, what: Str, ty: types.Ty, format: Str): void {
+	if stdlib.isFlatFormat(format) == false || ty is types.Ty.TUnknown {
 		return
 	}
-	if stdlib.codecFormat(given) != "" {
+	carrier := stdlib.flatCarrier(format)
+	if ty is types.Ty.TNamed(name) {
+		if types.findType(c.table, name) is Result.Ok(info) {
+			if len(info.variants) > 0 {
+				report(c, carrier + " is one flat set of parameters, so " + what + " cannot carry `{name}`, which has variants")
+				return
+			}
+			for each f in info.shared {
+				checkFlatField(c, name, f, stdlib.flatUnit(format))
+			}
+			return
+		}
+	}
+	report(c, carrier + " is a declared type's fields, so " + what + " cannot carry " + types.show(ty))
+}
+
+proc checkFlatField(c: mut Check, typeName: Str, f: ast.Field, unit: Str): void {
+	ty := types.resolve(c.table, f.declared)
+	if stdlib.isFlatValue(ty) {
+		return
+	}
+	if ty is types.Ty.TVec(element, _) {
+		if stdlib.isFlatValue(element) {
+			return
+		}
+	}
+	report(c, "`{typeName}.{f.name}` is " + types.show(ty) + ", and a {unit} is a `Str`, `Int`, `Float`, `Bool` or `Atom`, or a vector of one repeated under its name")
+}
+
+// A codec is a value like any other, and its type says which format it is: the
+// encoder and decoder are still written from the declaration at the call, off
+// that type, which is what keeps this free of reflection.
+proc checkNamesCodec(c: mut Check, env: infer.Env, what: Str, given: ast.Expr): void {
+	if given is ast.Expr.Hole {
 		return
 	}
 	held := infer.typeOf(env, given)
 	if held is types.Ty.TUnknown {
 		return
 	}
-	if held is types.Ty.TLib(module, name) {
-		if module == "codec" && name == "Codec" {
-			report(c, "the codec " + what + " uses has to be named here — " + spellings() + " — rather than reached through a variable. The encoder is written from the declaration at this call, so which format it is has to be settled by now")
+	if held is types.Ty.TCodec(error) {
+		// A generic one is settled per copy, where the variable is known.
+		if error is types.Ty.TVar(_) || stdlib.formatOfCodec(held) != "" {
 			return
 		}
+		report(c, "`" + types.show(held) + "` names no format: a codec's error type is what says which, and it is one of " + errorTypes())
+		return
 	}
-	fits(c, types.Ty.TLib("codec", "Codec"), held, "the codec " + what + " uses")
+	report(c, "the codec " + what + " uses wants hive.codec.Codec<E> and this is " + types.show(held))
 }
 
-// `hive.json.codec()`, and whatever joins it.
-func spellings(): Str {
+// Every error type that names a format, for a message that has to list them.
+func errorTypes(): Str {
 	mut Str[dyn] out = []
 	for each format in stdlib.codecFormats() {
-		append(out, "`" + stdlib.codecSpelling(format) + "`")
+		append(out, types.show(stdlib.codecErrorOf(format)))
 	}
-	return join(out, " or ")
+	return join(out, ", ")
 }
 
 // A field-less variant is a value, so `T.Variant.decode` would read as that field
@@ -460,6 +494,8 @@ proc checkMarks(c: mut Check, f: ast.Field): void {
 proc checkJsonNames(c: mut Check, fields: ast.Field[], variants: ast.Variant[]): void {
 	if len(variants) == 0 {
 		reportClashes(c, fields, [])
+		reportUrlClashes(c, fields)
+		reportFlagClashes(c, fields)
 		return
 	}
 	for each v in variants {
@@ -483,6 +519,30 @@ proc clashingKey(c: mut Check, keys: mut hive.map.Map<Str, Bool>, f: ast.Field):
 		report(c, "two fields here are `{key}` in JSON, and one key cannot be read into two fields. Give one of them a `-- JSON as ...;` of its own")
 	}
 	hive.map.set(keys, key, true)
+}
+
+// Only a type without variants travels as a query string, so only its
+// parameters can clash.
+proc reportUrlClashes(c: mut Check, fields: ast.Field[]): void {
+	mut hive.map.Map<Str, Bool> keys = hive.map.new()
+	for each f in fields {
+		key := ast.urlKey(f)
+		if hive.map.has(keys, key) {
+			report(c, "two fields here are `{key}` in a query string, and one parameter cannot be read into two fields. Give one of them a `-- URL as ...;` of its own")
+		}
+		hive.map.set(keys, key, true)
+	}
+}
+
+proc reportFlagClashes(c: mut Check, fields: ast.Field[]): void {
+	mut hive.map.Map<Str, Bool> keys = hive.map.new()
+	for each f in fields {
+		key := ast.flagKey(f)
+		if hive.map.has(keys, key) {
+			report(c, "two fields here are `--{key}` on a command line, and one flag cannot be read into two fields. Give one of them a `-- Flag as ...;` of its own")
+		}
+		hive.map.set(keys, key, true)
+	}
 }
 
 // What a literal is, which is the whole of what a `Default` may be — the parser
@@ -1003,7 +1063,7 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
 		if types.findType(env.table, head) is Result.Ok(info) {
 			// `T.decode(text, codec)` is the decoder, not a variant.
 			if field == "decode" {
-				checkDecodes(c, env, "`" + head + ".decode`", args)
+				checkDecodes(c, env, "`" + head + ".decode`", head, args)
 				return
 			}
 			if types.findVariant(env.table, head, field) is Result.Ok(fields) {
@@ -1020,7 +1080,7 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
 			if root is ast.Expr.Ident(head) {
 				if types.findType(env.table, head) is Result.Ok(_) {
 					if types.findVariant(env.table, head, module) is Result.Ok(_) {
-						checkDecodes(c, env, "`" + head + "." + module + ".decode`", args)
+						checkDecodes(c, env, "`" + head + "." + module + ".decode`", head, args)
 					} else {
 						report(c, "`" + head + "` has no variant `{module}`, so there is no `{module}.decode` to call. Its variants are " + join(types.variantNames(env.table, head), ", "))
 					}
@@ -1051,9 +1111,9 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
 	}
 }
 
-// What a standard library call takes, position by position. The table says what each
-// position holds and not how many there are, so this checks the positions it has an
-// answer for and leaves the rest.
+// What a standard library call takes: how many, where the table can say, and what
+// each position holds. The type table is positional rather than a count, so the
+// positions it has an answer for are checked and the rest left.
 //
 // Without it the mismatch reaches the Go toolchain, which reports it in terms of
 // Go's own types — and a message that only said `float64` would leave the reader
@@ -1062,17 +1122,29 @@ proc checkLibraryArguments(c: mut Check, env: infer.Env, module: Str, name: Str,
 	if module == "sql" && name == "run" {
 		checkRunsQuery(c, env, args)
 	}
-	wanted := stdlib.paramsOf(module, name)
-	mut i := 0
-	for each a in args {
-		if a.value is ast.Expr.Hole {
+	// One of the library's own types being built takes its fields, matched by
+	// name the way a declared type's are.
+	fields := stdlib.fieldsOf(module, name)
+	if len(fields) > 0 {
+		checkFieldArguments(c, env, "hive.{module}.{name}", fields, args)
+		return
+	}
+	if stdlib.signatureOf(module, name) is Result.Ok(wanted) {
+		if len(args) != len(wanted) {
+			report(c, "`hive.{module}.{name}` takes " + countOf(len(wanted)) + ", and this call passes " + countOf(len(args)))
+			return
+		}
+		mut i := 0
+		for each a in args {
+			if a.value is ast.Expr.Hole {
+				i = i + 1
+				continue
+			}
+			if wanted bounds i {
+				fits(c, wanted[i], infer.typeOf(env, a.value), "the " + nth(i) + " argument of `hive.{module}.{name}`")
+			}
 			i = i + 1
-			continue
 		}
-		if wanted bounds i {
-			fits(c, wanted[i], infer.typeOf(env, a.value), "the " + nth(i) + " argument of `hive.{module}.{name}`")
-		}
-		i = i + 1
 	}
 }
 
@@ -1250,6 +1322,9 @@ func nth(index: Int): Str {
 }
 
 func countOf(n: Int): Str {
+	if n == 0 {
+		return "no arguments"
+	}
 	if n == 1 {
 		return "1 argument"
 	}
@@ -1311,14 +1386,20 @@ proc checkBuiltinCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]):
 			fits(c, table(), typeOfArg(c, env, args, 0), "what `{name}` reads")
 			fits(c, types.Ty.TStr(), typeOfArg(c, env, args, 1), "the key `{name}` looks for")
 		}
+	} else if name == "toTable" {
+		if arity(c, name, args, 2) {
+			fits(c, strings(), typeOfArg(c, env, args, 0), "what `toTable` cuts into rows")
+			fits(c, types.Ty.TInt(), typeOfArg(c, env, args, 1), "the row width `toTable` cuts at")
+			checkRowWidth(c, args)
+		}
 	} else if name == "encode" {
-		// Anything with a static type encodes, so beyond the count the only thing
-		// to refuse is a codec that is not named here. What a format cannot carry
-		// is refused where the encoder is derived, which is where the reason can
-		// be given.
+		// Anything with a static type encodes as JSON, so beyond the count the
+		// only thing to refuse is a codec whose type names no format — and a
+		// value a flat format's parameters cannot hold.
 		if arity(c, name, args, 2) {
 			if args bounds 1 {
 				checkNamesCodec(c, env, "`encode`", args[1].value)
+				checkFlatShape(c, "`encode`", typeOfArg(c, env, args, 0), stdlib.formatOfCodec(infer.typeOf(env, args[1].value)))
 			}
 		}
 	}
@@ -1404,6 +1485,28 @@ proc checkIndexOf(c: mut Check, env: infer.Env, args: ast.Arg[]): void {
 		return
 	}
 	report(c, "`indexOf` searches a vector or a `Str`, and this is " + types.show(subject))
+}
+
+// A literal width below one could only hand back an empty `Table` — dead code
+// wearing the shape of the form that works. A computed width is total instead.
+proc checkRowWidth(c: mut Check, args: ast.Arg[]): void {
+	if literalInt(ast.argFor(args, "", 1)) is Result.Ok(n) {
+		if n < 1 {
+			report(c, "`toTable` cuts a vector into rows of {n} cells, and a row holds at least one — this could only hand back an empty `Table`")
+		}
+	}
+}
+
+func literalInt(e: ast.Expr): Result<Int, Bool> {
+	if e is ast.Expr.IntLit(n) {
+		return Result.Ok(n)
+	}
+	if e is ast.Expr.Negate(operand) {
+		if operand is ast.Expr.IntLit(n) {
+			return Result.Ok(0 - n)
+		}
+	}
+	return Result.Error(false)
 }
 
 // How many a builtin takes. Answers whether the call had that many, so what

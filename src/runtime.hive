@@ -115,7 +115,7 @@ func requires(module: Str): Str[dyn] {
 	// A format is written against the vocabulary `encode` and `decode` share,
 	// which is its own file so that a second format would add one rather than
 	// reach into the first.
-	if module == "json" {
+	if module == "json" || module == "net" || module == "term" {
 		return ["codec"]
 	}
 	// Turning a terminal's echo off is two files, one per platform, and the tag
@@ -799,6 +799,24 @@ func coreStrings(): Str {
 			}
 			return out
 		}
+		`,
+		// ToTable cuts a flat vector into rows of at most wide cells. A width
+		// below one is refused as a literal, so reaching here it was computed.
+		`
+		func ToTable(v []string, wide int) Table \{
+			out := Table\{}
+			if wide < 1 \{
+				return out
+			}
+			for at := 0; at < len(v); at += wide \{
+				end := at + wide
+				if end > len(v) \{
+					end = len(v)
+				}
+				out = append(out, CloneVec(v[at:end]))
+			}
+			return out
+		}
 		`
 	], "\n\n")
 }
@@ -1283,6 +1301,7 @@ func termSource(): Str {
 			"fmt"
 			"os"
 			"os/exec"
+			"strconv"
 			"strings"
 		)
 
@@ -1295,6 +1314,290 @@ func termSource(): Str {
 		// Redirecting the answer never takes the progress with it.
 		`
 		func TermStatus(text string) \{ fmt.Fprintln(os.Stderr, text) }
+		`,
+		// ---------------------------------------------------------------------------
+		// Command-line flags as a codec
+		// ---------------------------------------------------------------------------
+		`
+		type TermFlagError struct \{
+			Path     string
+			Expected string
+			Found    string
+		}
+
+		func (e TermFlagError) Error() string \{
+			return "hive: cannot read the flag " + e.Path + ": expected " + e.Expected + ", found " + e.Found
+		}
+
+		func TermCodec() CodecCodec[TermFlagError] \{ return CodecCodec[TermFlagError]\{} }
+
+		// TermFlagPair is one flag as written: its name without the dashes, and its
+		// value unless it stood alone.
+		type TermFlagPair struct \{
+			Key   string
+			Value string
+			Bare  bool
+		}
+
+		type termWord struct \{
+			text   string
+			quoted bool
+		}
+		`,
+		// termWords splits a line the way a shell would: whitespace between words,
+		// quotes and a backslash to keep one together. A word that opens quoted is
+		// never read as a flag.
+		`
+		func termWords(line string) ([]termWord, *TermFlagError) \{
+			words := []termWord\{}
+			var b strings.Builder
+			inWord, quoted, escaped := false, false, false
+			var quote rune
+			for _, r := range line \{
+				switch \{
+				case escaped:
+					b.WriteRune(r)
+					escaped = false
+				case quote == '\'':
+					if r == '\'' \{
+						quote = 0
+					} else \{
+						b.WriteRune(r)
+					}
+				case quote == '"':
+					if r == '\\' \{
+						escaped = true
+					} else if r == '"' \{
+						quote = 0
+					} else \{
+						b.WriteRune(r)
+					}
+				case r == ' ' || r == '\t' || r == '\n' || r == '\r':
+					if inWord \{
+						words = append(words, termWord\{b.String(), quoted})
+						b.Reset()
+						inWord = false
+					}
+				default:
+					if !inWord \{
+						quoted = r == '\\' || r == '"' || r == '\''
+						inWord = true
+					}
+					if r == '\\' \{
+						escaped = true
+					} else if r == '"' || r == '\'' \{
+						quote = r
+					} else \{
+						b.WriteRune(r)
+					}
+				}
+			}
+			if quote != 0 \{
+				return nil, &TermFlagError\{Path: "$", Expected: "a closing quote", Found: "the end of the text"}
+			}
+			if escaped \{
+				return nil, &TermFlagError\{Path: "$", Expected: "a character after the backslash", Found: "the end of the text"}
+			}
+			if inWord \{
+				words = append(words, termWord\{b.String(), quoted})
+			}
+			return words, nil
+		}
+		`,
+		// termFlags reads --name value and --name=value. A flag followed by another
+		// flag, or by nothing, stands alone; a word that is no flag's value is
+		// ignored, and so is everything after a lone --.
+		`
+		func termFlags(words []termWord) []TermFlagPair \{
+			flags := []TermFlagPair\{}
+			for i := 0; i < len(words); i++ \{
+				w := words[i]
+				if !w.quoted && w.text == "--" \{
+					break
+				}
+				if w.quoted || !strings.HasPrefix(w.text, "--") \{
+					continue
+				}
+				name := w.text[2:]
+				if key, value, found := strings.Cut(name, "="); found \{
+					flags = append(flags, TermFlagPair\{Key: key, Value: value})
+					continue
+				}
+				if i+1 < len(words) && (words[i+1].quoted || !strings.HasPrefix(words[i+1].text, "--")) \{
+					flags = append(flags, TermFlagPair\{Key: name, Value: words[i+1].text})
+					i++
+					continue
+				}
+				flags = append(flags, TermFlagPair\{Key: name, Bare: true})
+			}
+			return flags
+		}
+
+		func TermFlagParse[T any](line string, dec func([]TermFlagPair) (T, *TermFlagError)) Result[T, TermFlagError] \{
+			words, werr := termWords(line)
+			if werr != nil \{
+				return Err[T, TermFlagError](*werr)
+			}
+			out, ferr := dec(termFlags(words))
+			if ferr != nil \{
+				return Err[T, TermFlagError](*ferr)
+			}
+			return Ok[T, TermFlagError](out)
+		}
+
+		func termFlagsNamed(q []TermFlagPair, key string) []TermFlagPair \{
+			out := []TermFlagPair\{}
+			for _, f := range q \{
+				if f.Key == key \{
+					out = append(out, f)
+				}
+			}
+			return out
+		}
+
+		func termFlagCount(n int) string \{
+			if n == 1 \{
+				return "1 value"
+			}
+			return strconv.Itoa(n) + " values"
+		}
+
+		func TermFlagHas(q []TermFlagPair, key string) bool \{
+			return len(termFlagsNamed(q, key)) > 0
+		}
+
+		func TermFlagOne[T any](q []TermFlagPair, key string, read func(TermFlagPair, string) (T, *TermFlagError)) (T, *TermFlagError) \{
+			var zero T
+			path := "--" + key
+			found := termFlagsNamed(q, key)
+			if len(found) == 0 \{
+				return zero, &TermFlagError\{Path: path, Expected: "a value", Found: "nothing"}
+			}
+			if len(found) > 1 \{
+				return zero, &TermFlagError\{Path: path, Expected: "one value", Found: termFlagCount(len(found))}
+			}
+			return read(found[0], path)
+		}
+
+		// TermFlagVec reads a flag repeated. n below zero is a vector of any length.
+		func TermFlagVec[T any](q []TermFlagPair, key string, n int, read func(TermFlagPair, string) (T, *TermFlagError)) ([]T, *TermFlagError) \{
+			path := "--" + key
+			found := termFlagsNamed(q, key)
+			if n >= 0 && len(found) != n \{
+				return nil, &TermFlagError\{Path: path, Expected: termFlagCount(n), Found: termFlagCount(len(found))}
+			}
+			out := make([]T, 0, len(found))
+			for i, f := range found \{
+				e, ferr := read(f, path+"["+strconv.Itoa(i)+"]")
+				if ferr != nil \{
+					return nil, ferr
+				}
+				out = append(out, e)
+			}
+			return out, nil
+		}
+		`,
+		// Every reader but Bool's needs a value; a Bool standing alone is true.
+		`
+		func termFlagValue(f TermFlagPair, path string) (string, *TermFlagError) \{
+			if f.Bare \{
+				return "", &TermFlagError\{Path: path, Expected: "a value", Found: "the flag alone"}
+			}
+			return f.Value, nil
+		}
+
+		func TermFlagStr(f TermFlagPair, path string) (string, *TermFlagError) \{
+			return termFlagValue(f, path)
+		}
+
+		func TermFlagInt(f TermFlagPair, path string) (int, *TermFlagError) \{
+			s, ferr := termFlagValue(f, path)
+			if ferr != nil \{
+				return 0, ferr
+			}
+			n, err := strconv.Atoi(s)
+			if err != nil \{
+				return 0, &TermFlagError\{Path: path, Expected: "Int", Found: strconv.Quote(s)}
+			}
+			return n, nil
+		}
+
+		func TermFlagFloat(f TermFlagPair, path string) (float64, *TermFlagError) \{
+			s, ferr := termFlagValue(f, path)
+			if ferr != nil \{
+				return 0, ferr
+			}
+			n, err := strconv.ParseFloat(s, 64)
+			if err != nil \{
+				return 0, &TermFlagError\{Path: path, Expected: "Float", Found: strconv.Quote(s)}
+			}
+			return n, nil
+		}
+
+		func TermFlagBool(f TermFlagPair, path string) (bool, *TermFlagError) \{
+			if f.Bare \{
+				return true, nil
+			}
+			if f.Value == "true" || f.Value == "false" \{
+				return f.Value == "true", nil
+			}
+			return false, &TermFlagError\{Path: path, Expected: "Bool", Found: strconv.Quote(f.Value)}
+		}
+
+		func TermFlagAtom(f TermFlagPair, path string) (Atom, *TermFlagError) \{
+			s, ferr := termFlagValue(f, path)
+			if ferr != nil \{
+				return 0, ferr
+			}
+			for i, name := range atomNames \{
+				if name == s \{
+					return Atom(i), nil
+				}
+			}
+			return 0, &TermFlagError\{Path: path, Expected: "a known atom", Found: strconv.Quote(s)}
+		}
+		`,
+		// Encoding writes every field as --name value, quoting a value that would
+		// otherwise split, vanish or read as a flag.
+		`
+		func TermFlagEncodeStr(s string) string \{ return s }
+
+		func TermFlagEncodeInt(i int) string \{ return strconv.Itoa(i) }
+
+		func TermFlagEncodeFloat(f float64) string \{ return strconv.FormatFloat(f, 'g', -1, 64) }
+
+		func TermFlagEncodeBool(b bool) string \{ return strconv.FormatBool(b) }
+
+		func TermFlagEncodeAtom(a Atom) string \{ return a.String() }
+
+		func TermFlagOf(key string, value string) []TermFlagPair \{
+			return []TermFlagPair\{\{Key: key, Value: value}}
+		}
+
+		func TermFlagEach[T any](key string, items []T, write func(T) string) []TermFlagPair \{
+			out := make([]TermFlagPair, 0, len(items))
+			for _, item := range items \{
+				out = append(out, TermFlagPair\{Key: key, Value: write(item)})
+			}
+			return out
+		}
+
+		func TermFlagJoin(groups ...[]TermFlagPair) string \{
+			parts := []string\{}
+			for _, group := range groups \{
+				for _, f := range group \{
+					parts = append(parts, "--"+f.Key, termQuote(f.Value))
+				}
+			}
+			return strings.Join(parts, " ")
+		}
+
+		func termQuote(s string) string \{
+			if s != "" && !strings.HasPrefix(s, "--") && !strings.ContainsAny(s, " \t\n\r\"'\\") \{
+				return s
+			}
+			return "\"" + strings.ReplaceAll(strings.ReplaceAll(s, "\\", "\\\\"), "\"", "\\\"") + "\""
+		}
 		`,
 		// TermIsTerminal answers whether standard error is a terminal rather than
 		// a file or a pipe: the difference between somebody sitting there waiting
@@ -1435,33 +1738,26 @@ func termSource(): Str {
 }
 
 // The Go for `hive.codec`: what `encode` and `T.decode` traffic in, and nothing
-// about any one format. A `Codec` holds nothing because it decides nothing at run
-// time — which format it is was settled where it was named.
+// about any one format. A `Codec` decides nothing at run time — which format it
+// is was settled by its type.
 func codecSource(): Str {
 	return join([
 		`
 		package hive
 		`,
-		// CodecCodec says which format to read and write. It is empty on purpose:
-		// the call it is handed to reads the format off the name in the source, so
-		// there is nothing left for the value to carry.
+		// CodecCodec is a format, and E is what decoding in it fails with. E settles
+		// which format at compile time, so a value carries only what one needs at run
+		// time: the secret a JWT is signed with.
 		`
-		type CodecCodec struct\{}
-		`,
-		// CodecDecodingError describes why a document didn't hold what was asked
-		// of it: the exact path that failed, what was expected there, and what was
-		// actually found. No format is named, because all three questions are the
-		// same whatever wrote it.
-		`
-		type CodecDecodingError struct \{
-			Path     string
-			Expected string
-			Found    string
+		type CodecCodec[E any] struct \{
+			Secret string
 		}
 
-		func (e CodecDecodingError) Error() string \{
-			return "hive: cannot decode at " + e.Path + ": expected " + e.Expected + ", found " + e.Found
-		}
+		// String keeps a secret out of anything that prints a codec.
+		func (c CodecCodec[E]) String() string \{ return "codec" }
+
+		// CodecWith evaluates a held codec where it is used, and answers with value.
+		func CodecWith[T any, E any](value T, _ CodecCodec[E]) T \{ return value }
 		`
 	], "\n\n")
 }
@@ -1691,6 +1987,53 @@ func timeSource(): Str {
 			return offset / 60
 		}
 		`,
+		// Built in local time, so a stamp round-trips with TimeFormat. A field
+		// out of range carries into the next one the way time.Date does: month
+		// 13 is January of the year after.
+		`
+		func TimeDateFrom(year, month, day int) int \{
+			return TimeDateTimeFrom(year, month, day, 0, 0, 0)
+		}
+
+		func TimeDateTimeFrom(year, month, day, hour, minute, second int) int \{
+			t := time.Date(year, time.Month(month), day, hour, minute, second, 0, time.Local)
+			return int(t.Unix())
+		}
+		`,
+		// The fields of the current instant, in local time.
+		`
+		func TimeYear() int \{ return time.Now().Year() }
+
+		func TimeMonth() int \{ return int(time.Now().Month()) }
+
+		func TimeDay() int \{ return time.Now().Day() }
+
+		func TimeHour() int \{ return time.Now().Hour() }
+
+		func TimeMinute() int \{ return time.Now().Minute() }
+
+		func TimeSecond() int \{ return time.Now().Second() }
+
+		func TimeMillisecond() int \{ return time.Now().Nanosecond() / 1000000 }
+		`,
+		// Monday is 1 and Sunday 7, the ISO numbering, where Go counts Sunday 0.
+		`
+		func TimeWeekday() int \{
+			d := int(time.Now().Weekday())
+			if d == 0 \{
+				return 7
+			}
+			return d
+		}
+		`,
+		// Day 0 of next month is the day before its 1st, so the normalising
+		// time.Date already does gives the length of this one, leap years and all.
+		`
+		func TimeLastDayOfMonth() int \{
+			now := time.Now()
+			return time.Date(now.Year(), now.Month()+1, 0, 0, 0, 0, 0, time.Local).Day()
+		}
+		`,
 		// A strftime-style template, which is familiar rather than Go's reference
 		// date. An unrecognised %x passes through verbatim.
 		`
@@ -1796,7 +2139,20 @@ func jsonSource(): Str {
 		// decoding read the format off the name in the source rather than off this,
 		// so what comes back is only ever passed around or ignored.
 		`
-		func JsonCodec() CodecCodec \{ return CodecCodec\{} }
+		func JsonCodec() CodecCodec[JsonJsonError] \{ return CodecCodec[JsonJsonError]\{} }
+		`,
+		// JsonJsonError says why a document didn't hold what was asked of it: the
+		// path that failed, what was expected there, and what was found.
+		`
+		type JsonJsonError struct \{
+			Path     string
+			Expected string
+			Found    string
+		}
+
+		func (e JsonJsonError) Error() string \{
+			return "hive: cannot decode JSON at " + e.Path + ": expected " + e.Expected + ", found " + e.Found
+		}
 		`,
 		// JsonValue is an order-preserving parsed JSON document. `Kind` is one
 		// letter: `n` null, `b` bool, `#` number, `s` string, `a` array, `o` object.
@@ -1886,55 +2242,55 @@ func jsonSource(): Str {
 		// JsonParse backs every decode and hive.json.flatten; the decoder
 		// argument is what the call named, derived at compile time.
 		`
-		func JsonParse[T any](text string, dec func(JsonValue, string) (T, *CodecDecodingError)) Result[T, CodecDecodingError] \{
+		func JsonParse[T any](text string, dec func(JsonValue, string) (T, *JsonJsonError)) Result[T, JsonJsonError] \{
 			d := json.NewDecoder(strings.NewReader(text))
 			d.UseNumber()
 			v, err := parseJsonValue(d)
 			if err != nil \{
-				return Err[T, CodecDecodingError](CodecDecodingError\{Path: "$", Expected: "valid JSON", Found: err.Error()})
+				return Err[T, JsonJsonError](JsonJsonError\{Path: "$", Expected: "valid JSON", Found: err.Error()})
 			}
 			out, jerr := dec(v, "$")
 			if jerr != nil \{
-				return Err[T, CodecDecodingError](*jerr)
+				return Err[T, JsonJsonError](*jerr)
 			}
-			return Ok[T, CodecDecodingError](out)
+			return Ok[T, JsonJsonError](out)
 		}
 
-		func JsonStr(v JsonValue, path string) (string, *CodecDecodingError) \{
+		func JsonStr(v JsonValue, path string) (string, *JsonJsonError) \{
 			if v.Kind == 's' \{
 				return v.Str, nil
 			}
-			return "", &CodecDecodingError\{Path: path, Expected: "Str", Found: jsonKindName(v)}
+			return "", &JsonJsonError\{Path: path, Expected: "Str", Found: jsonKindName(v)}
 		}
 
-		func JsonInt(v JsonValue, path string) (int, *CodecDecodingError) \{
+		func JsonInt(v JsonValue, path string) (int, *JsonJsonError) \{
 			if v.Kind == '#' \{
 				if i, err := strconv.Atoi(v.Num); err == nil \{
 					return i, nil
 				}
 			}
-			return 0, &CodecDecodingError\{Path: path, Expected: "Int", Found: jsonKindName(v)}
+			return 0, &JsonJsonError\{Path: path, Expected: "Int", Found: jsonKindName(v)}
 		}
 
-		func JsonFloat(v JsonValue, path string) (float64, *CodecDecodingError) \{
+		func JsonFloat(v JsonValue, path string) (float64, *JsonJsonError) \{
 			if v.Kind == '#' \{
 				if f, err := strconv.ParseFloat(v.Num, 64); err == nil \{
 					return f, nil
 				}
 			}
-			return 0, &CodecDecodingError\{Path: path, Expected: "Float", Found: jsonKindName(v)}
+			return 0, &JsonJsonError\{Path: path, Expected: "Float", Found: jsonKindName(v)}
 		}
 
-		func JsonBool(v JsonValue, path string) (bool, *CodecDecodingError) \{
+		func JsonBool(v JsonValue, path string) (bool, *JsonJsonError) \{
 			if v.Kind == 'b' \{
 				return v.Bool, nil
 			}
-			return false, &CodecDecodingError\{Path: path, Expected: "Bool", Found: jsonKindName(v)}
+			return false, &JsonJsonError\{Path: path, Expected: "Bool", Found: jsonKindName(v)}
 		}
 		`,
 		// JsonAtom decodes a JSON string holding an atom's visual form.
 		`
-		func JsonAtom(v JsonValue, path string) (Atom, *CodecDecodingError) \{
+		func JsonAtom(v JsonValue, path string) (Atom, *JsonJsonError) \{
 			if v.Kind == 's' \{
 				for i, name := range atomNames \{
 					if name == v.Str \{
@@ -1942,23 +2298,23 @@ func jsonSource(): Str {
 					}
 				}
 			}
-			return 0, &CodecDecodingError\{Path: path, Expected: "a known atom", Found: jsonKindName(v)}
+			return 0, &JsonJsonError\{Path: path, Expected: "a known atom", Found: jsonKindName(v)}
 		}
 
-		func JsonObject(v JsonValue, path string) ([]JsonMember, *CodecDecodingError) \{
+		func JsonObject(v JsonValue, path string) ([]JsonMember, *JsonJsonError) \{
 			if v.Kind == 'o' \{
 				return v.Obj, nil
 			}
-			return nil, &CodecDecodingError\{Path: path, Expected: "an object", Found: jsonKindName(v)}
+			return nil, &JsonJsonError\{Path: path, Expected: "an object", Found: jsonKindName(v)}
 		}
 
-		func JsonField(obj []JsonMember, key string, path string) (JsonValue, *CodecDecodingError) \{
+		func JsonField(obj []JsonMember, key string, path string) (JsonValue, *JsonJsonError) \{
 			for _, m := range obj \{
 				if m.Key == key \{
 					return m.Value, nil
 				}
 			}
-			return JsonValue\{}, &CodecDecodingError\{Path: path + "." + key, Expected: "a value", Found: "nothing"}
+			return JsonValue\{}, &JsonJsonError\{Path: path + "." + key, Expected: "a value", Found: "nothing"}
 		}
 		`,
 		// JsonLook is JsonField for a field with somewhere to fall back to: a key
@@ -1976,16 +2332,16 @@ func jsonSource(): Str {
 		// JsonVariant unwraps the {"VariantName": {...}} encoding of tagged
 		// unions.
 		`
-		func JsonVariant(v JsonValue, path string) (string, JsonValue, *CodecDecodingError) \{
+		func JsonVariant(v JsonValue, path string) (string, JsonValue, *JsonJsonError) \{
 			if v.Kind == 'o' && len(v.Obj) == 1 \{
 				return v.Obj[0].Key, v.Obj[0].Value, nil
 			}
-			return "", JsonValue\{}, &CodecDecodingError\{Path: path, Expected: "an object with a single variant key", Found: jsonKindName(v)}
+			return "", JsonValue\{}, &JsonJsonError\{Path: path, Expected: "an object with a single variant key", Found: jsonKindName(v)}
 		}
 
-		func JsonVec[T any](v JsonValue, path string, elem func(JsonValue, string) (T, *CodecDecodingError)) ([]T, *CodecDecodingError) \{
+		func JsonVec[T any](v JsonValue, path string, elem func(JsonValue, string) (T, *JsonJsonError)) ([]T, *JsonJsonError) \{
 			if v.Kind != 'a' \{
-				return nil, &CodecDecodingError\{Path: path, Expected: "a vector", Found: jsonKindName(v)}
+				return nil, &JsonJsonError\{Path: path, Expected: "a vector", Found: jsonKindName(v)}
 			}
 			out := make([]T, 0, len(v.Arr))
 			for i, item := range v.Arr \{
@@ -2000,9 +2356,9 @@ func jsonSource(): Str {
 		`,
 		// JsonVecN also enforces the static length of e.g. Str[3].
 		`
-		func JsonVecN[T any](v JsonValue, path string, n int, elem func(JsonValue, string) (T, *CodecDecodingError)) ([]T, *CodecDecodingError) \{
+		func JsonVecN[T any](v JsonValue, path string, n int, elem func(JsonValue, string) (T, *JsonJsonError)) ([]T, *JsonJsonError) \{
 			if v.Kind != 'a' || len(v.Arr) != n \{
-				return nil, &CodecDecodingError\{Path: path, Expected: "a vector of length " + strconv.Itoa(n), Found: jsonKindName(v)}
+				return nil, &JsonJsonError\{Path: path, Expected: "a vector of length " + strconv.Itoa(n), Found: jsonKindName(v)}
 			}
 			return JsonVec(v, path, elem)
 		}
@@ -2010,7 +2366,7 @@ func jsonSource(): Str {
 		// JsonFlatten turns any JSON subtree into a Table of [path, value] rows —
 		// the type-safe holder for JSON that isn't modelled statically.
 		`
-		func JsonFlatten(v JsonValue, path string) (Table, *CodecDecodingError) \{
+		func JsonFlatten(v JsonValue, path string) (Table, *JsonJsonError) \{
 			table := Table\{}
 			flattenJson(v, "", &table)
 			return table, nil
@@ -2049,34 +2405,34 @@ func jsonSource(): Str {
 		`,
 		// JsonGet looks a path up in a flattened Table.
 		`
-		func JsonGet(t Table, path string) Result[string, CodecDecodingError] \{
+		func JsonGet(t Table, path string) Result[string, JsonJsonError] \{
 			for _, row := range t \{
 				if len(row) >= 2 && row[0] == path \{
-					return Ok[string, CodecDecodingError](row[1])
+					return Ok[string, JsonJsonError](row[1])
 				}
 			}
-			return Err[string, CodecDecodingError](CodecDecodingError\{Path: path, Expected: "a value", Found: "nothing"})
+			return Err[string, JsonJsonError](JsonJsonError\{Path: path, Expected: "a value", Found: "nothing"})
 		}
 		`,
 		// JsonTable reads a JSON array of flat objects as a headered Table (the same
 		// shape a CSV read produces). Every object must carry the same keys
 		// as the first one, and every value must be a leaf.
 		`
-		func JsonTable(text string) Result[Table, CodecDecodingError] \{
+		func JsonTable(text string) Result[Table, JsonJsonError] \{
 			d := json.NewDecoder(strings.NewReader(text))
 			d.UseNumber()
 			v, err := parseJsonValue(d)
 			if err != nil \{
-				return Err[Table, CodecDecodingError](CodecDecodingError\{Path: "$", Expected: "valid JSON", Found: err.Error()})
+				return Err[Table, JsonJsonError](JsonJsonError\{Path: "$", Expected: "valid JSON", Found: err.Error()})
 			}
 			if v.Kind != 'a' \{
-				return Err[Table, CodecDecodingError](CodecDecodingError\{Path: "$", Expected: "an array of objects", Found: jsonKindName(v)})
+				return Err[Table, JsonJsonError](JsonJsonError\{Path: "$", Expected: "an array of objects", Found: jsonKindName(v)})
 			}
 			table := Table\{}
 			for i, item := range v.Arr \{
 				path := "$[" + strconv.Itoa(i) + "]"
 				if item.Kind != 'o' \{
-					return Err[Table, CodecDecodingError](CodecDecodingError\{Path: path, Expected: "a flat object", Found: jsonKindName(item)})
+					return Err[Table, JsonJsonError](JsonJsonError\{Path: path, Expected: "a flat object", Found: jsonKindName(item)})
 				}
 				if i == 0 \{
 					header := []string\{}
@@ -2087,22 +2443,22 @@ func jsonSource(): Str {
 				}
 				header := table[0]
 				if len(item.Obj) != len(header) \{
-					return Err[Table, CodecDecodingError](CodecDecodingError\{Path: path, Expected: "an object with keys " + strings.Join(header, ", "), Found: "an object with " + strconv.Itoa(len(item.Obj)) + " keys"})
+					return Err[Table, JsonJsonError](JsonJsonError\{Path: path, Expected: "an object with keys " + strings.Join(header, ", "), Found: "an object with " + strconv.Itoa(len(item.Obj)) + " keys"})
 				}
 				row := []string\{}
 				for _, key := range header \{
 					cell, jerr := JsonField(item.Obj, key, path)
 					if jerr != nil \{
-						return Err[Table, CodecDecodingError](*jerr)
+						return Err[Table, JsonJsonError](*jerr)
 					}
 					if cell.Kind == 'a' || cell.Kind == 'o' \{
-						return Err[Table, CodecDecodingError](CodecDecodingError\{Path: path + "." + key, Expected: "a leaf value", Found: jsonKindName(cell)})
+						return Err[Table, JsonJsonError](JsonJsonError\{Path: path + "." + key, Expected: "a leaf value", Found: jsonKindName(cell)})
 					}
 					row = append(row, jsonLeafStr(cell))
 				}
 				table = append(table, row)
 			}
-			return Ok[Table, CodecDecodingError](table)
+			return Ok[Table, JsonJsonError](table)
 		}
 
 		func JsonEncodeStr(s string) string \{
@@ -3175,10 +3531,20 @@ func cryptoSource(): Str {
 			return Ok[string, CryptoCryptoError](string(plaintext))
 		}
 		`,
-		// CryptoJwtCodec says read and write it as a JWT. Empty like every codec: both
-		// the format and the secret are read off the call in the source.
+		// CryptoJwtCodec says read and write it as a JWT under this secret, which the
+		// value carries wherever it is kept.
 		`
-		func CryptoJwtCodec(secret string) CodecCodec \{ return CodecCodec\{} }
+		func CryptoJwtCodec(secret string) CodecCodec[CryptoJwtError] \{ return CodecCodec[CryptoJwtError]\{Secret: secret} }
+
+		type CryptoJwtError struct \{
+			Path     string
+			Expected string
+			Found    string
+		}
+
+		func (e CryptoJwtError) Error() string \{
+			return "hive: cannot decode JWT at " + e.Path + ": expected " + e.Expected + ", found " + e.Found
+		}
 		`,
 		// CryptoJwtSign builds an HS256 token from an already-JSON-encoded payload and a
 		// shared secret. HMAC signing cannot fail, so it returns a plain string.
@@ -3218,19 +3584,24 @@ func cryptoSource(): Str {
 		`,
 		// CryptoJwtParse is the decoding half of a JWT codec: open the token, then read
 		// the claims with the decoder the caller's type derives. A token that does not
-		// check out fails the way any other unreadable document does.
+		// check out fails the way claims of the wrong shape do.
 		`
-		func CryptoJwtParse[T any](token string, secret string, dec func(JsonValue, string) (T, *CodecDecodingError)) Result[T, CodecDecodingError] \{
+		func CryptoJwtParse[T any](token string, secret string, dec func(JsonValue, string) (T, *JsonJsonError)) Result[T, CryptoJwtError] \{
 			claims := jwtVerify(token, secret)
 			if claims.IsError() \{
 				why := claims.Err()
-				return Err[T, CodecDecodingError](CodecDecodingError\{
+				return Err[T, CryptoJwtError](CryptoJwtError\{
 					Path:     "$",
 					Expected: "a JWT signed with this secret",
 					Found:    why.Reason + ": " + why.Message,
 				})
 			}
-			return JsonParse(claims.Ok(), dec)
+			read := JsonParse(claims.Ok(), dec)
+			if read.IsError() \{
+				why := read.Err()
+				return Err[T, CryptoJwtError](CryptoJwtError\{Path: why.Path, Expected: why.Expected, Found: why.Found})
+			}
+			return Ok[T, CryptoJwtError](read.Ok())
 		}
 		`,
 		// jwtVerify checks an HS256 token's signature and its exp/nbf claims against the
@@ -4204,6 +4575,197 @@ func netSource(): Str {
 			}
 			return "", false
 		}
+		`,
+		// ---------------------------------------------------------------------------
+		// URLs and query strings
+		// ---------------------------------------------------------------------------
+		//
+		// NetUrlEncode keeps RFC 3986's unreserved characters and percent-encodes
+		// every other byte, so its answer is safe in a path segment and a query alike.
+		`
+		func NetUrlEncode(s string) string \{
+			const hex = "0123456789ABCDEF"
+			var b strings.Builder
+			for i := 0; i < len(s); i++ \{
+				c := s[i]
+				if ('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z') || ('0' <= c && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~' \{
+					b.WriteByte(c)
+					continue
+				}
+				b.WriteByte('%')
+				b.WriteByte(hex[c>>4])
+				b.WriteByte(hex[c&15])
+			}
+			return b.String()
+		}
+		`,
+		`
+		type NetQueryParamsError struct \{
+			Path     string
+			Expected string
+			Found    string
+		}
+
+		func (e NetQueryParamsError) Error() string \{
+			return "hive: cannot decode query string at " + e.Path + ": expected " + e.Expected + ", found " + e.Found
+		}
+
+		func NetQueryParamsCodec() CodecCodec[NetQueryParamsError] \{
+			return CodecCodec[NetQueryParamsError]\{}
+		}
+
+		type NetQueryPair struct \{
+			Key   string
+			Value string
+		}
+		`,
+		// NetQueryParse backs every decode with the query codec. A leading "?" is
+		// tolerated, and "+" reads as a space the way a form sends one.
+		`
+		func NetQueryParse[T any](text string, dec func([]NetQueryPair) (T, *NetQueryParamsError)) Result[T, NetQueryParamsError] \{
+			pairs := []NetQueryPair\{}
+			for _, part := range strings.Split(strings.TrimPrefix(text, "?"), "&") \{
+				if part == "" \{
+					continue
+				}
+				rawKey, rawValue, _ := strings.Cut(part, "=")
+				key, kerr := url.QueryUnescape(rawKey)
+				value, verr := url.QueryUnescape(rawValue)
+				if kerr != nil || verr != nil \{
+					return Err[T, NetQueryParamsError](NetQueryParamsError\{Path: "$", Expected: "a query string", Found: strconv.Quote(part)})
+				}
+				pairs = append(pairs, NetQueryPair\{Key: key, Value: value})
+			}
+			out, qerr := dec(pairs)
+			if qerr != nil \{
+				return Err[T, NetQueryParamsError](*qerr)
+			}
+			return Ok[T, NetQueryParamsError](out)
+		}
+
+		func netQueryValues(q []NetQueryPair, key string) []string \{
+			out := []string\{}
+			for _, p := range q \{
+				if p.Key == key \{
+					out = append(out, p.Value)
+				}
+			}
+			return out
+		}
+
+		func NetQueryHas(q []NetQueryPair, key string) bool \{
+			return len(netQueryValues(q, key)) > 0
+		}
+
+		func netQueryCount(n int) string \{
+			if n == 1 \{
+				return "1 value"
+			}
+			return strconv.Itoa(n) + " values"
+		}
+
+		func NetQueryOne[T any](q []NetQueryPair, key string, read func(string, string) (T, *NetQueryParamsError)) (T, *NetQueryParamsError) \{
+			var zero T
+			path := "$." + key
+			values := netQueryValues(q, key)
+			if len(values) == 0 \{
+				return zero, &NetQueryParamsError\{Path: path, Expected: "a value", Found: "nothing"}
+			}
+			if len(values) > 1 \{
+				return zero, &NetQueryParamsError\{Path: path, Expected: "one value", Found: netQueryCount(len(values))}
+			}
+			return read(values[0], path)
+		}
+		`,
+		// NetQueryVec reads a key repeated. n below zero is a vector of any length.
+		`
+		func NetQueryVec[T any](q []NetQueryPair, key string, n int, read func(string, string) (T, *NetQueryParamsError)) ([]T, *NetQueryParamsError) \{
+			path := "$." + key
+			values := netQueryValues(q, key)
+			if n >= 0 && len(values) != n \{
+				return nil, &NetQueryParamsError\{Path: path, Expected: netQueryCount(n), Found: netQueryCount(len(values))}
+			}
+			out := make([]T, 0, len(values))
+			for i, v := range values \{
+				e, qerr := read(v, path+"["+strconv.Itoa(i)+"]")
+				if qerr != nil \{
+					return nil, qerr
+				}
+				out = append(out, e)
+			}
+			return out, nil
+		}
+
+		func NetQueryStr(s string, path string) (string, *NetQueryParamsError) \{
+			return s, nil
+		}
+
+		func NetQueryInt(s string, path string) (int, *NetQueryParamsError) \{
+			n, err := strconv.Atoi(s)
+			if err != nil \{
+				return 0, &NetQueryParamsError\{Path: path, Expected: "Int", Found: strconv.Quote(s)}
+			}
+			return n, nil
+		}
+
+		func NetQueryFloat(s string, path string) (float64, *NetQueryParamsError) \{
+			f, err := strconv.ParseFloat(s, 64)
+			if err != nil \{
+				return 0, &NetQueryParamsError\{Path: path, Expected: "Float", Found: strconv.Quote(s)}
+			}
+			return f, nil
+		}
+
+		func NetQueryBool(s string, path string) (bool, *NetQueryParamsError) \{
+			if s == "true" || s == "false" \{
+				return s == "true", nil
+			}
+			return false, &NetQueryParamsError\{Path: path, Expected: "Bool", Found: strconv.Quote(s)}
+		}
+
+		func NetQueryAtom(s string, path string) (Atom, *NetQueryParamsError) \{
+			for i, name := range atomNames \{
+				if name == s \{
+					return Atom(i), nil
+				}
+			}
+			return 0, &NetQueryParamsError\{Path: path, Expected: "a known atom", Found: strconv.Quote(s)}
+		}
+		`,
+		// Encoding: each field is a group of pairs, and a vector's group is its key
+		// once per element, in order.
+		`
+		func NetQueryEncodeStr(s string) string \{ return s }
+
+		func NetQueryEncodeInt(i int) string \{ return strconv.Itoa(i) }
+
+		func NetQueryEncodeFloat(f float64) string \{ return strconv.FormatFloat(f, 'g', -1, 64) }
+
+		func NetQueryEncodeBool(b bool) string \{ return strconv.FormatBool(b) }
+
+		func NetQueryEncodeAtom(a Atom) string \{ return a.String() }
+
+		func NetQueryOf(key string, value string) []NetQueryPair \{
+			return []NetQueryPair\{\{Key: key, Value: value}}
+		}
+
+		func NetQueryEach[T any](key string, items []T, write func(T) string) []NetQueryPair \{
+			out := make([]NetQueryPair, 0, len(items))
+			for _, item := range items \{
+				out = append(out, NetQueryPair\{Key: key, Value: write(item)})
+			}
+			return out
+		}
+
+		func NetQueryJoin(groups ...[]NetQueryPair) string \{
+			parts := []string\{}
+			for _, group := range groups \{
+				for _, p := range group \{
+					parts = append(parts, NetUrlEncode(p.Key)+"="+NetUrlEncode(p.Value))
+				}
+			}
+			return strings.Join(parts, "&")
+		}
 		`
 	], "\n\n")
 }
@@ -4604,7 +5166,7 @@ func syslinkSource(): Str {
 		// A mailbox is typed by its handler rather than by its decoder, so the decoder
 		// only has to produce the right dynamic type for that handler to accept.
 		`
-		func SyslinkDecoder[T any](dec func(JsonValue, string) (T, *CodecDecodingError)) func([]byte) (any, error) \{
+		func SyslinkDecoder[T any](dec func(JsonValue, string) (T, *JsonJsonError)) func([]byte) (any, error) \{
 			return func(b []byte) (any, error) \{
 				r := JsonParse(string(b), dec)
 				if r.IsError() \{
@@ -4617,7 +5179,7 @@ func syslinkSource(): Str {
 		// SyslinkReplyDecoder is the same adapter for the answer to a call, which stays
 		// typed because the call site said what it expected back.
 		`
-		func SyslinkReplyDecoder[T any](dec func(JsonValue, string) (T, *CodecDecodingError)) func([]byte) (T, error) \{
+		func SyslinkReplyDecoder[T any](dec func(JsonValue, string) (T, *JsonJsonError)) func([]byte) (T, error) \{
 			return func(b []byte) (T, error) \{
 				r := JsonParse(string(b), dec)
 				if r.IsError() \{
@@ -4650,14 +5212,14 @@ func syslinkSource(): Str {
 			return JsonEncodeStr(where + "|" + name + "|" + strconv.FormatUint(a.Id, 10))
 		}
 
-		func JsonAddress(v JsonValue, path string) (SyslinkAddress, *CodecDecodingError) \{
+		func JsonAddress(v JsonValue, path string) (SyslinkAddress, *JsonJsonError) \{
 			text, jerr := JsonStr(v, path)
 			if jerr != nil \{
 				return SyslinkAddress\{}, jerr
 			}
 			parts := strings.Split(text, "|")
 			if len(parts) != 3 \{
-				return SyslinkAddress\{}, &CodecDecodingError\{Path: path, Expected: "a syslink address", Found: JsonEncodeStr(text)}
+				return SyslinkAddress\{}, &JsonJsonError\{Path: path, Expected: "a syslink address", Found: JsonEncodeStr(text)}
 			}
 			addr := SyslinkAddress\{Endpoint: parts[0], Name: atomNone}
 			if parts[1] != "" \{
@@ -4680,7 +5242,7 @@ func syslinkSource(): Str {
 			return addr, nil
 		}
 
-		func jsonWhy(e CodecDecodingError) string \{
+		func jsonWhy(e JsonJsonError) string \{
 			where := e.Path
 			if where == "" \{
 				where = "the message"

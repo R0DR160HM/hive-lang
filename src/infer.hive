@@ -125,11 +125,22 @@ func timedResult(value: types.Ty): types.Ty {
 }
 
 // What `<Type>.decode` and `<Type>.<Variant>.decode` answer with. A variant is
-// not a type of its own, so both are a `Result` of the union. The error names no
-// format, because a document that did not hold what was asked for fails the same
-// way whatever wrote it.
-func decoded(typeName: Str): types.Ty {
-	return types.Ty.TResult(types.Ty.TNamed(typeName), types.Ty.TLib("codec", "DecodingError"))
+// not a type of its own, so both are a `Result` of the union, failing with the
+// error type the codec carries.
+func decoded(typeName: Str, argTypes: types.Ty[], args: ast.Arg[]): types.Ty {
+	return types.Ty.TResult(types.Ty.TNamed(typeName), decodeError(argTypes, args))
+}
+
+func decodeError(argTypes: types.Ty[], args: ast.Arg[]): types.Ty {
+	if argTypes bounds 1 {
+		if argTypes[1] is types.Ty.TCodec(error) {
+			return error
+		}
+	}
+	if args bounds 1 {
+		return stdlib.codecErrorOf(stdlib.codecFormat(args[1].value))
+	}
+	return stdlib.codecErrorOf("")
 }
 
 func allSends(env: Env, calls: ast.Expr[]): Bool {
@@ -321,7 +332,7 @@ func memberCallType(env: Env, subject: ast.Expr, field: Str, argTypes: types.Ty[
 		// constructor.
 		if field == "decode" {
 			if types.findType(env.table, head) is Result.Ok(_) {
-				return decoded(head)
+				return decoded(head, argTypes, args)
 			}
 		}
 		// `Shape.Circle(5)` builds a variant, and what it builds is the union.
@@ -340,7 +351,7 @@ func memberCallType(env: Env, subject: ast.Expr, field: Str, argTypes: types.Ty[
 		if field == "decode" {
 			if root is ast.Expr.Ident(head) {
 				if types.findVariant(env.table, head, module) is Result.Ok(_) {
-					return decoded(head)
+					return decoded(head, argTypes, args)
 				}
 			}
 		}
@@ -504,6 +515,9 @@ func builtinResult(env: Env, name: Str, argTypes: types.Ty[], args: ast.Arg[]): 
 	if name == "split" || name == "row" || name == "column" {
 		return types.Ty.TVec(types.Ty.TStr(), ast.Dim.Dynamic())
 	}
+	if name == "toTable" {
+		return types.Ty.TVec(types.Ty.TVec(types.Ty.TStr(), ast.Dim.Dynamic()), ast.Dim.Dynamic())
+	}
 	if name == "indexOf" {
 		return types.Ty.TResult(types.Ty.TInt(), types.Ty.TBool())
 	}
@@ -540,7 +554,8 @@ func isBuiltin(name: Str): Bool {
 	return name == "len" || name == "bytes" || name == "append"
 		|| name == "prepend" || name == "drop" || name == "join"
 		|| name == "split" || name == "indexOf" || name == "row"
-		|| name == "column" || name == "map" || name == "filter"
+		|| name == "column" || name == "toTable"
+		|| name == "map" || name == "filter"
 		|| name == "filterMap" || name == "sort"
 		|| name == "replaceFirst" || name == "replaceAll"
 		|| name == "encode"

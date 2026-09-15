@@ -34,6 +34,8 @@ type Ty {
 	// rather than in the value: the value is text and the arguments bound
 	// beside it, and `hive.sql.run` is what turns one into rows of `T`.
 	TFragment { rows: Ty }
+	// `hive.codec.Codec<E>` — a format, and the error decoding in it answers with.
+	TCodec { error: Ty }
 	// A function value: `func(Int): Int` or `proc(Str): void`.
 	TFn { pure: Bool, params: Ty[dyn], result: Ty }
 	// An opaque type the standard library owns: `hive.net.HttpRequest`,
@@ -265,6 +267,9 @@ func resolveBase(t: Table, pkg: Str, name: Str, args: ast.TypeExpr[]): Ty {
 	if pkg == "hive.sql" && name == "Fragment" {
 		return Ty.TFragment(argAt(t, args, 0))
 	}
+	if pkg == "hive.codec" && name == "Codec" {
+		return Ty.TCodec(argAt(t, args, 0))
+	}
 	if text.startsWith(pkg, "hive.") {
 		return Ty.TLib(text.span(text.chars(pkg), 5, len(pkg) - 1), name)
 	}
@@ -327,6 +332,9 @@ func toWritten(ty: Ty): ast.TypeExpr {
 	if ty is Ty.TFragment(rows) {
 		return queryResult(toWritten(rows))
 	}
+	if ty is Ty.TCodec(error) {
+		return ast.TypeExpr.Named("hive.codec", "Codec", [toWritten(error)], [])
+	}
 	if ty is Ty.TFn(pure, params, result) {
 		mut ast.TypeExpr[dyn] out = []
 		for each p in params {
@@ -381,6 +389,7 @@ func show(ty: Ty): Str {
 	else if ty is Ty.TResult(ok, bad) { return "Result<" + show(ok) + ", " + show(bad) + ">" }
 	else if ty is Ty.TMap(key, value) { return "hive.map.Map<" + show(key) + ", " + show(value) + ">" }
 	else if ty is Ty.TFragment(rows) { return "hive.sql.Fragment<" + show(rows) + ">" }
+	else if ty is Ty.TCodec(error) { return "hive.codec.Codec<" + show(error) + ">" }
 	else if ty is Ty.TFn(pure, params, result) {
 		mut word := "proc"
 		if pure {
@@ -448,6 +457,12 @@ func accepts(to: Ty, from: Ty): Bool {
 		}
 		return false
 	}
+	if to is Ty.TCodec(toError) {
+		if from is Ty.TCodec(fromError) {
+			return accepts(toError, fromError)
+		}
+		return false
+	}
 	// A `func` value may fill a `proc` slot — pure widens to impure — and never
 	// the reverse.
 	if to is Ty.TFn(toPure, toParams, toResult) {
@@ -507,6 +522,10 @@ func same(a: Ty, b: Ty): Bool {
 	}
 	if a is Ty.TFragment(aRows) {
 		if b is Ty.TFragment(bRows) { return same(aRows, bRows) }
+		return false
+	}
+	if a is Ty.TCodec(aError) {
+		if b is Ty.TCodec(bError) { return same(aError, bError) }
 		return false
 	}
 	if a is Ty.TFn(aPure, aParams, aResult) {
@@ -711,7 +730,7 @@ func isOrdered(t: Table, ty: Ty): Bool {
 	if ty is Ty.TFn(_, _, _) || ty is Ty.TMap(_, _) || ty is Ty.TUnknown {
 		return false
 	}
-	if ty is Ty.TLib(_, _) || ty is Ty.TFragment(_) || ty is Ty.TVoid {
+	if ty is Ty.TLib(_, _) || ty is Ty.TFragment(_) || ty is Ty.TCodec(_) || ty is Ty.TVoid {
 		return false
 	}
 	if ty is Ty.TVec(element, _) {

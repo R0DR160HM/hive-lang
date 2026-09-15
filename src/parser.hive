@@ -519,14 +519,14 @@ proc parseField(ts: token.Token[], p: mut Parse): ast.Field {
 
 // --- A field's annotations ---------------------------------------------------
 //
-// `name: Str -- JSON as username; Default as "";`
+// `name: Str -- JSON as username; URL as user; Default as "";`
 //
 // A `--` opens them and each clause ends at its `;`, so they may be written in any
-// order and a field may carry one, both, or neither. `--` is the same two characters
+// order and a field may carry any of them, or none. `--` is the same two characters
 // the decrement step is written with, and there is nothing to tell apart: a step is
 // a statement and this is a type body.
 //
-// They are compile-time and about the JSON codecs alone. Nothing here reaches the
+// They are compile-time and about the codecs alone. Nothing here reaches the
 // value at run time — `user.name` is still `name`, whatever JSON calls it.
 
 proc parseMarks(ts: token.Token[], p: mut Parse): ast.Marks {
@@ -535,6 +535,8 @@ proc parseMarks(ts: token.Token[], p: mut Parse): ast.Marks {
 	}
 	advance(p)
 	mut json := ""
+	mut url := ""
+	mut flag := ""
 	mut ast.Expr fallback = ast.Expr.Absent()
 	for ; p.failed == false && atEnd(ts, p) == false; {
 		at := p.pos
@@ -543,31 +545,49 @@ proc parseMarks(ts: token.Token[], p: mut Parse): ast.Marks {
 			advance(p)
 			if json != "" {
 				failAt(ts, p, at, "this field says `JSON as` twice, and a field has one name on the wire")
-				return ast.Marks(json, fallback)
+				return ast.Marks(json, url, flag, fallback)
 			}
-			json = parseMarkName(ts, p)
+			json = parseMarkName(ts, p, "JSON", "JSON key")
+		} else if kind == "URL" {
+			advance(p)
+			if url != "" {
+				failAt(ts, p, at, "this field says `URL as` twice, and a field has one name in a query string")
+				return ast.Marks(json, url, flag, fallback)
+			}
+			url = parseMarkName(ts, p, "URL", "query parameter")
+		} else if kind == "Flag" {
+			advance(p)
+			if flag != "" {
+				failAt(ts, p, at, "this field says `Flag as` twice, and a field has one name on a command line")
+				return ast.Marks(json, url, flag, fallback)
+			}
+			flag = parseMarkName(ts, p, "Flag", "flag")
+			if text.startsWith(flag, "-") {
+				failAt(ts, p, at, "`Flag as` names a flag without its dashes, since `--` is added wherever it is written")
+				return ast.Marks(json, url, flag, fallback)
+			}
 		} else if kind == "Default" {
 			advance(p)
 			if fallback is ast.Expr.Absent {
 			} else {
 				failAt(ts, p, at, "this field says `Default as` twice, and a field has one value to fall back to")
-				return ast.Marks(json, fallback)
+				return ast.Marks(json, url, flag, fallback)
 			}
 			fallback = parseMarkLiteral(ts, p)
 		} else {
 			fail(ts, p, unknownMark(ts, p))
-			return ast.Marks(json, fallback)
+			return ast.Marks(json, url, flag, fallback)
 		}
 		if expect(ts, p, token.Kind.Semicolon()) == false {
-			return ast.Marks(json, fallback)
+			return ast.Marks(json, url, flag, fallback)
 		}
 		// Another clause only where another one was written: what follows a `;`
 		// is the next field as often as it is more of this one.
 		if opensMark(ts, p) == false {
-			return ast.Marks(json, fallback)
+			return ast.Marks(json, url, flag, fallback)
 		}
 	}
-	return ast.Marks(json, fallback)
+	return ast.Marks(json, url, flag, fallback)
 }
 
 // Whether what sits here is another clause rather than the field after it. Both
@@ -575,32 +595,54 @@ proc parseMarks(ts: token.Token[], p: mut Parse): ast.Marks {
 // `name: Type` and never `name as`.
 func opensMark(ts: token.Token[], p: Parse): Bool {
 	word := wordAt(ts, p.pos)
-	return (word == "JSON" || word == "Default") && wordAt(ts, p.pos + 1) == "as"
+	return (word == "JSON" || word == "URL" || word == "Flag" || word == "Default") && wordAt(ts, p.pos + 1) == "as"
 }
 
-// The name a clause gives, after the `as` that has to be there. A JSON key is
+// The name a clause gives, after the `as` that has to be there. A key is
 // somebody else's name rather than one this program declares, so it is taken as
 // written and held to none of Hive's shapes: `user_name` and `userName` are
 // equally a key.
-proc parseMarkName(ts: token.Token[], p: mut Parse): Str {
+proc parseMarkName(ts: token.Token[], p: mut Parse, clause: Str, what: Str): Str {
 	if expectWord(ts, p, "as") == false {
 		return ""
 	}
 	if kindAt(ts, p.pos) is token.Kind.StrLit(written) {
 		advance(p)
 		if written == "" {
-			fail(ts, p, "`JSON as \"\"` names no field: a JSON key is at least one character")
+			fail(ts, p, "`{clause} as \"\"` names no field: a {what} is at least one character")
 			return ""
 		}
 		return written
 	}
-	name := wordAt(ts, p.pos)
+	name := markWord(ts, p.pos)
 	if name == "" {
-		expected(ts, p, "the JSON name this field is written as, as a word or a quoted string")
+		expected(ts, p, "the {what} this field is written as, as a word or a quoted string")
 		return ""
 	}
 	advance(p)
-	return name
+	// `something-else` is three tokens, read back as the one name it was written as.
+	mut spelled := name
+	for ; kindAt(ts, p.pos) == token.Kind.Minus() && markWord(ts, p.pos + 1) != ""; {
+		spelled = spelled + "-" + markWord(ts, p.pos + 1)
+		advance(p)
+		advance(p)
+	}
+	return spelled
+}
+
+// One word of a clause's name: a name, a keyword, or a number.
+func markWord(ts: token.Token[], i: Int): Str {
+	k := kindAt(ts, i)
+	if k is token.Kind.IntLit(v) {
+		return "{v}"
+	}
+	if k is token.Kind.Ident(word) {
+		return word
+	}
+	if token.operatorSpelling(k) != "" {
+		return ""
+	}
+	return token.spelling(k)
 }
 
 // What a `Default` falls back to. A **literal**, so it needs nothing in scope
@@ -638,7 +680,7 @@ proc parseMarkLiteral(ts: token.Token[], p: mut Parse): ast.Expr {
 
 // What was written where a clause was expected.
 func unknownMark(ts: token.Token[], p: Parse): Str {
-	return "a field's annotations are `JSON as <name>;` and `Default as <literal>;`, in any order, and " + token.describe(kindAt(ts, p.pos)) + " is neither"
+	return "a field's annotations are `JSON as <name>;`, `URL as <name>;`, `Flag as <name>;` and `Default as <literal>;`, in any order, and " + token.describe(kindAt(ts, p.pos)) + " is none of them"
 }
 
 proc parseVariant(ts: token.Token[], p: mut Parse): ast.Variant {

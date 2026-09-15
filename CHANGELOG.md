@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.2.5
+
+### Language
+
+* **`toTable(cells, wide)`** — a flat `Str[]` cut into a `Table` of rows that
+  wide, the last row holding what was left. A width written as a literal below
+  one is a compile error; a computed one that turns out below one hands back an
+  empty `Table`.
+* **`URL as <name>;`** — a field annotation naming the query parameter the field is read from and written as.
+* **`Flag as <name>;`** — a field annotation naming the command-line flag, without its dashes, the field is read from and written as.
+* **Codecs are ordinary values** — held in a variable, passed, stored or returned, since a `hive.codec.Codec<E>`'s type says its format.
+
+### Standard library
+
+* **`hive.net.urlEncode(text)`** percent-encodes every byte but RFC 3986's unreserved characters.
+* **`hive.net.queryParamsCodec()`** reads and writes a flat type as a query string, without the leading `?`.
+* **`hive.term.codec()`** reads a line of `--name value` flags, quoted words kept together, into a flat type and writes them back.
+* **`hive.codec.Codec<E>`** names the error its decoding fails with, and each module with a codec owns its own: `hive.json.JsonError`, `hive.crypto.JwtError`, `hive.net.QueryParamsError` and `hive.term.FlagError`.
+
+* **`hive.time.dateFrom(year, month, day)`** and
+  **`dateTimeFrom(year, month, day, hour, minute, second)`** — a stamp for a date
+  you name, the same kind of `Int` `now()` answers. Both build in local time, and
+  a field out of range carries into the next: `dateFrom(2026, 3, 0)` is
+  February's last day.
+* **`hive.time`** reads the current instant field by field: `year`, `month`,
+  `day`, `weekday` (1 Monday – 7 Sunday), `lastDayOfMonth`, `hour`, `minute`,
+  `second` and `millisecond`. `millisecond` is a sub-second field, not a
+  millisecond clock — a reading is still seconds.
+
+### Fixes
+
+* **A standard library call is held to how many arguments it takes**, the way a
+  declared `func` is. The table behind `hive.<module>.<name>` recorded a type for
+  the positions a module had something to say about and stopped, so a miscount —
+  `hive.math.pi(1.0)`, `hive.file.read("a", "b")`, `hive.map.set(m, "a")` —
+  reached the Go toolchain and was reported there, against a file nobody wrote.
+  It is a whole signature now, so its length is the arity.
+* Argument **types** are held more closely for the same reason: every
+  `hive.math` call claimed three `Float`s, `hive.map` and `hive.syslink` claimed
+  nothing, and each now says what it takes.
+* One of the library's own types — `hive.net.HttpResponse(200, body: ..., ...)` —
+  is checked against its fields, so a named argument may come in any order.
+
+### Breaking
+
+| was | is |
+| --- | --- |
+| `hive.codec.Codec` | `hive.codec.Codec<E>` |
+| `hive.codec.DecodingError` | `hive.json.JsonError`, `hive.crypto.JwtError` or `hive.net.QueryParamsError` |
+
 ## v0.2.4
 
 ### Language

@@ -21,12 +21,13 @@ type.
 | `indexOf(str, sub)` | `indexOf(Str, Str): Result<Int, Bool>` | position, in characters, of the first occurrence |
 | `row(table, key)` | `row(Table, Str): Str[dyn]` | the row whose first cell equals `key`, else `[]` |
 | `column(table, key)` | `column(Table, Str): Str[dyn]` | the column whose top cell equals `key`, else `[]` |
+| `toTable(cells, wide)` | `toTable(Str[], Int): Table` | the cells cut into rows of `wide`, the last row short |
 | `map(values, transform)` | `map(T[], func(T): K): K[dyn]` | every element, transformed |
 | `filter(values, keep)` | `filter(T[], func(T): Bool): T[dyn]` | the elements `keep` says yes to |
 | `filterMap(values, transform)` | `filterMap(T[], func(T): Result<K, E>): K[dyn]` | transform and select in one pass |
 | `sort(values)` | `sort(T[]): T[dyn]` | in the element type's own order |
 | `sort(values, first)` | `sort(T[], func(T, T): Bool): T[dyn]` | in the order `first` gives |
-| `encode(value, codec)` | `encode(T, hive.codec.Codec): Str` | `value` written in the format `codec` names |
+| `encode(value, codec)` | `encode(T, hive.codec.Codec<E>): Str` | `value` written in the format `codec` names |
 
 `len` and `bytes` differ only for strings: for `"café"`, `len` is `4` (runes)
 while `bytes` is `5`.
@@ -41,20 +42,29 @@ than a pattern — to rewrite by shape, match with a
 what its holes bound. Neither is an error when `from` is not there; the string
 comes back as it was.
 
+`toTable` fills its rows left to right and takes what is left for the last one,
+so `toTable(["1", "2", "3", "4", "5", "6", "7"], 3)` is
+`[["1", "2", "3"], ["4", "5", "6"], ["7"]]`. A row holds at least one cell, so a
+**width written as a literal** below one is a compile error — it could only hand
+back an empty `Table`, which is dead code wearing the shape of the form that
+works. A width **computed** at run time is total instead: below one it hands back
+an empty `Table`, the way dividing by zero is a value rather than a crash
+([05.7](05-expressions.md#57-arithmetic-at-the-edges)).
+
 `encode` is here for the reason the rest are: a builtin is what operates on the
 types the language hands out without an import, and a document is a `Str`. It is
 also the **only builtin with no runtime function behind it** — the encoder is
 written out of the argument's static type at the call site, which is what makes
 it total and what keeps it free of reflection.
 
-**The codec has to be named at the call**: `encode(user, hive.json.codec())` is
-the encoder for `User` in JSON, written there. A codec reached through a variable
-is a compile error, because by then there is nothing left to write the encoder
-from. This is the bargain `hive.file.csv` and `hive.sql.run` already strike — the
-reader is named in the source rather than sniffed at run time — and it is what
-lets a second format be a second codec rather than a change to the language:
-`hive.crypto.jwtCodec(secret)` ([14.8](14-stdlib.md#148-hivecrypto)) signs the
-same derived encoding into a token.
+**The codec's type says the format.** `hive.codec.Codec<E>` names the error
+decoding fails with, and that error is one format's own, so `encode(user, codec)`
+is the encoder for `User` in that format wherever `codec` came from — written at
+the call, held in a variable, passed as a parameter or kept in a field. A codec
+is therefore an ordinary value. This is what lets a second format be a second
+codec rather than a change to the language: `hive.crypto.jwtCodec(secret)`
+([14.8](14-stdlib.md#148-hivecrypto)) signs the same derived encoding into a
+token, and the secret travels in the codec value.
 
 Its other half is `T.decode(text, codec)`, named on the type because a `Str`
 arriving from outside cannot say what it should become
