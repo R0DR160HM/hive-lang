@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.2.6
+
+### Standard library
+
+* **`ui.InputKind.Range()`** — a slider. It runs 0–100, and both the value it is
+  given and the text `onInput` hands back are that number. While it has focus it
+  keeps only the keys that move it (the arrows, `Home`, `End` and the page keys),
+  so a scene still hears `Escape` and everything else.
+
+### Fixes
+
+* **A key released while a field has focus is let go.** A scene ignored keyup as
+  well as keydown while typing, so a key held down as focus moved into a field
+  stayed held after it came up.
+
 ## v0.2.5
 
 ### Language
