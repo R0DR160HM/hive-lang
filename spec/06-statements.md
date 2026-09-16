@@ -103,6 +103,10 @@ leave a test early. Every non-`void` callable must return on every path
 does: an atom prints its **name**, a vector prints its elements, a map prints its
 pairs in its own order, a declared value prints its fields.
 
+A `Str` echoed on its own **is** the line, so it is not quoted. Inside any of
+those it **is** quoted, which is what tells `["1", "2"]` from `[1, 2]` and from
+`["1 2"]`.
+
 `echo` is legal in both a `func` and a `proc`.
 
 ## 6.7 `assert`

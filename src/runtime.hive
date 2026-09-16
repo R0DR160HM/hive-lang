@@ -260,9 +260,9 @@ func coreResult(): Str {
 		`
 		func (r Result[T, E]) String() string \{
 			if r.ok \{
-				return "Ok(" + Show(r.value) + ")"
+				return "Ok(" + ShowIn(r.value) + ")"
 			}
-			return "Error(" + Show(r.bad) + ")"
+			return "Error(" + ShowIn(r.bad) + ")"
 		}
 		`
 	], "\n\n")
@@ -317,12 +317,23 @@ func coreShow(): Str {
 		}
 		`,
 		// Show renders a value exactly as echo displays it, so an Atom shows its
-		// NAME rather than the decimal form ToStr produces.
+		// NAME rather than the decimal form ToStr produces. A top-level Str is the
+		// line itself, which is the one place a Str is not quoted.
 		`
 		func Show(v any) string \{
+			if s, ok := v.(string); ok \{
+				return s
+			}
+			return ShowIn(v)
+		}
+		`,
+		// ShowIn is a value as it reads inside another one, where a Str is quoted:
+		// ["1", "2"] is then a different line from [1, 2] and from ["1 2"].
+		`
+		func ShowIn(v any) string \{
 			switch x := v.(type) \{
 			case string:
-				return x
+				return strconv.Quote(x)
 			case bool:
 				if x \{
 					return "true"
@@ -330,8 +341,44 @@ func coreShow(): Str {
 				return "false"
 			case float64:
 				return strconv.FormatFloat(x, 'g', -1, 64)
+			case error:
+				return x.Error()
+			case fmt.Stringer:
+				return x.String()
 			}
-			return fmt.Sprint(v)
+			return showParts(reflect.ValueOf(v))
+		}
+		`,
+		// A vector's elements or a declared type's fields, one at a time, which is
+		// what carries the quoting all the way down. Anything with no parts to walk
+		// is left to Go's own form.
+		`
+		func showParts(rv reflect.Value) string \{
+			switch rv.Kind() \{
+			case reflect.Slice, reflect.Array:
+				parts := make([]string, 0, rv.Len())
+				for i := 0; i < rv.Len(); i++ \{
+					parts = append(parts, ShowIn(rv.Index(i).Interface()))
+				}
+				return "[" + strings.Join(parts, ", ") + "]"
+			case reflect.Struct:
+				parts := make([]string, 0, rv.NumField())
+				for i := 0; i < rv.NumField(); i++ \{
+					if !rv.Type().Field(i).IsExported() \{
+						return fmt.Sprint(rv.Interface())
+					}
+					parts = append(parts, ShowIn(rv.Field(i).Interface()))
+				}
+				return "\{" + strings.Join(parts, ", ") + "}"
+			case reflect.Pointer, reflect.Interface:
+				if !rv.IsNil() \{
+					return showParts(rv.Elem())
+				}
+			}
+			if !rv.IsValid() \{
+				return "<nil>"
+			}
+			return fmt.Sprint(rv.Interface())
 		}
 		`,
 		// Echo writes one line to stdout. Every print in a generated program goes
@@ -973,7 +1020,7 @@ func coreDict(): Str {
 		func (d Dict[K, V]) String() string \{
 			parts := make([]string, 0, len(d.order))
 			for _, k := range d.order \{
-				parts = append(parts, Show(k)+": "+Show(d.byKey[k]))
+				parts = append(parts, ShowIn(k)+": "+ShowIn(d.byKey[k]))
 			}
 			return "\{" + strings.Join(parts, ", ") + "}"
 		}
