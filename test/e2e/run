@@ -7,6 +7,11 @@
 # cannot run the Go toolchain over what came out, because Hive has no way to run
 # another program. So this part is a shell script, and it is the only part that
 # is.
+#
+# A `.test.hive` here is run by `hive test` instead, and passes when every test
+# in it does. `hive test` emits a second file into the same package and walks
+# the passes over a `test` body rather than a `proc` one, so it is a code path
+# of its own — and one nothing else in this suite ever compiled.
 set -uo pipefail
 
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
@@ -17,6 +22,8 @@ failed=0
 
 for source in "$here"/*.hive; do
 	name="$(basename "$source" .hive)"
+	# A test program is not run: it has no `main` to run. The loop below it.
+	case "$name" in *.test) continue ;; esac
 	expected="$here/$name.expected"
 
 	if [ ! -f "$expected" ]; then
@@ -31,6 +38,24 @@ for source in "$here"/*.hive; do
 	else
 		echo "  FAIL  $name"
 		diff <(echo "$actual") "$expected" | sed 's/^/        /'
+		failed=$((failed + 1))
+	fi
+done
+
+# The same programs through `hive test`. What is asserted is that every test
+# passed rather than the exact report, which carries a coverage figure that
+# moves whenever the program does.
+for source in "$here"/*.test.hive; do
+	[ -e "$source" ] || continue
+	name="$(basename "$source" .hive)"
+
+	out="$("$hive" test "$source" 2>&1)"
+	if echo "$out" | grep -qE '^  [0-9]+ tests?: [0-9]+ passed$'; then
+		echo "  PASS  $name"
+		passed=$((passed + 1))
+	else
+		echo "  FAIL  $name"
+		echo "$out" | sed 's/^/        /'
 		failed=$((failed + 1))
 	fi
 done

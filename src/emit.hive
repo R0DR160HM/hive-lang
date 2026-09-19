@@ -725,12 +725,18 @@ proc emitExprStmt(em: mut Emit, env: infer.Env, value: ast.Expr): void {
 	}
 	if value is ast.Expr.Call(callee, args) {
 		if callee is ast.Expr.Ident(name) {
-			if builtinStatement(em, env, name, args) {
-				return
+			// A declaration or a binding of your own is an ordinary call, so
+			// only a bare name that still reaches the builtin is lowered as one.
+			if infer.callTarget(env, name) is infer.CallTarget.Builtin {
+				if builtinStatement(em, env, name, args) {
+					return
+				}
 			}
 		}
 		if callee is ast.Expr.Member(head, name) {
 			if head is ast.Expr.Ident(hiveName) {
+				// The long name is the builtin whatever the program declared,
+				// which is what it is for.
 				if hiveName == "hive" && builtinStatement(em, env, name, args) {
 					return
 				}
@@ -741,7 +747,7 @@ proc emitExprStmt(em: mut Emit, env: infer.Env, value: ast.Expr): void {
 }
 
 proc builtinStatement(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[]): Bool {
-	if infer.isBuiltin(name) == false || infer.isBound(env, name) {
+	if infer.isBuiltin(name) == false {
 		return false
 	}
 	if name == "append" && len(args) == 2 {
@@ -2040,17 +2046,18 @@ proc call(em: mut Emit, env: infer.Env, callee: ast.Expr, args: ast.Arg[], want:
 }
 
 proc namedCall(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[], want: types.Ty): Str {
-	// A declaration of your own wins, and a local binding shadows it in turn.
-	if infer.isBound(env, name) == false {
-		if types.findCallable(env.table, name) is Result.Ok(info) {
-			return goIdent(name) + "(" + orderedArgs(em, env, info, args) + ")"
-		}
-		if types.fieldsOfStruct(env.table, name) is Result.Ok(fields) {
-			return structLiteral(em, env, name, fields, args)
-		}
-		if infer.isBuiltin(name) {
-			return builtin(em, env, name, args, want)
-		}
+	// A declaration of your own wins, and a local binding shadows it in turn —
+	// the order `infer.callTarget` holds, which is the one the checker read this
+	// same call through.
+	target := infer.callTarget(env, name)
+	if target is infer.CallTarget.Declared(info) {
+		return goIdent(name) + "(" + orderedArgs(em, env, info, args) + ")"
+	}
+	if target is infer.CallTarget.Struct(fields) {
+		return structLiteral(em, env, name, fields, args)
+	}
+	if target is infer.CallTarget.Builtin {
+		return builtin(em, env, name, args, want)
 	}
 	return goIdent(name) + "(" + plainArgs(em, env, args) + ")"
 }
