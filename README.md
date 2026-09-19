@@ -289,7 +289,7 @@ src/                 the compiler, in the order the pipeline runs
   emit runtime                   one module -> one Go file, and the Go it compiles against
   project vendor progress        the Go module and toolchain, the one download, what it says meanwhile
   analyze analyzereport          what `hive analyze` scores, and the page it writes
-  container agents icon docs/    a Dockerfile, .hivedocs/, a window's icon, the pages themselves
+  container agents icon docs/    a Dockerfile, .hivedocs/, the program's icon, the pages themselves
   text paths naming diag         strings, paths, what a name may look like, one error
   version testreport hivec       the release, what `hive test` prints, the command line
 test/

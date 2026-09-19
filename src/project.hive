@@ -66,7 +66,7 @@ proc goExe(target: Str): Str {
 }
 
 // Which architecture a build is for, asked for the *target*: the resource object
-// carrying a window's icon is machine specific, and an empty target is this
+// carrying the program's icon is machine specific, and an empty target is this
 // machine, which only `go env` knows.
 proc goArch(target: Str): Str {
 	if hive.term.execWith("go", ["env", "GOARCH"], "", crossing(target)) is Result.Ok(said) {
@@ -324,15 +324,17 @@ proc placeIcon(entry: Str, into: Str, written: mut Str[dyn], errors: mut diag.Di
 	put(into, "windowicon.go", icon.embedSource() + "\n", written, errors)
 }
 
-// The same icon as a Windows resource object, so the executable itself carries
-// it. The generator is written into the build, run once for the target's
-// architecture and removed: what it writes is linked, what wrote it is not.
+// The icon as a Windows resource object, so the executable itself carries it,
+// windowed or not. The generator is written into the build, run once for the
+// target's architecture and removed: what it writes is linked, what wrote it is
+// not.
 //
 // Run for this machine rather than the target — a cross build's generator would
 // be a program this one cannot run — and its answer named for the target, which
 // is what keeps it out of every other platform's build.
 proc placeResource(entry: Str, written: Written, target: Str, from: Int): Result<Bool, diag.Diagnostic> {
-	if icon.iconOf(entry) == "" {
+	source := icon.iconOf(entry)
+	if source == "" {
 		return Result.Ok(false)
 	}
 	arch := goArch(target)
@@ -347,7 +349,14 @@ proc placeResource(entry: Str, written: Written, target: Str, from: Int): Result
 	for each why in failed {
 		return Result.Error(why)
 	}
-	made := toolchain(["run", "./icon", "hive/" + icon.embeddedName(), icon.sysoName(arch), arch], written.directory, "")
+	// The generator runs with the build directory as its own, so the image goes
+	// in beside it rather than being named from outside.
+	image := paths.joinPath("icon", icon.resourceImage())
+	if hive.file.copy(source, paths.joinPath(written.directory, image)) is Result.Error(why) {
+		removeTree(generator)
+		return Result.Error(diag.about(source, "cannot copy `{source}` into the build: {why.message}"))
+	}
+	made := toolchain(["run", "./icon", image, icon.sysoName(arch), arch], written.directory, "")
 	removeTree(generator)
 	if made.code != 0 {
 		return Result.Error(diag.about(entry, "the icon in `assets/icon.png` could not be written into the executable. It said:\n\n" + indented(made.output)))
@@ -441,7 +450,7 @@ proc compile(entry: Str, target: Str, from: Int): Written {
 	// Asked once: it is a question with a `go env` behind it, and both answers
 	// below are the same one.
 	windows := windowsTarget(target)
-	if written.windowed && windows {
+	if windows {
 		if placeResource(entry, written, target, from) is Result.Error(why) {
 			return Written(written.directory, written.files, written.thirdParty, written.windowed, [why])
 		}

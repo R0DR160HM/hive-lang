@@ -2,6 +2,10 @@
 
 ## v0.2.6
 
+### Building
+
+* **Every executable carries `assets/icon.png`** as a Windows resource, where before only a windowed program did.
+
 ### Standard library
 
 * **`ui.InputKind.Range()`** — a slider running 0–100, whose value and `onInput` text are that number, and which keeps only the keys that move it while it has focus, so a scene still hears `Escape`.
