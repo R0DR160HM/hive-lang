@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.2.7
+
+### Fixes
+
+* **A declaration of your own is what a bare call answers with**, where inference handed back the shadowed builtin's result type and every typed position was held to that instead.
+* A declared `append`, `prepend`, `drop` or `sort` called as a statement is an ordinary call, where it lowered to the builtin's own statement and the Go toolchain refused what came out.
+* `hive.append(v, x)` stands as a statement of its own while a binding of your own shadows `append`, where the long name was turned down for the short one's reason.
+* `async` fires off a declaration named after a builtin, where it was turned down as the builtin.
+* A generic reached only from a `test` is specialised for it, where no copy was made and the call was reported as a name nothing declared.
+
+### Documentation
+
+* **`hive analyze` is in the pages `hive agents` writes**, which until now documented every command but that one.
+
 ## v0.2.6
 
 ### Building

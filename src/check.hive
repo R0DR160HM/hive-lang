@@ -1000,28 +1000,22 @@ proc checkCall(c: mut Check, env: infer.Env, callee: ast.Expr, args: ast.Arg[]):
 
 proc checkNamedCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): void {
 	// A local binding shadows a declaration, which shadows a builtin, so a call
-	// through one calls whatever the binding holds.
-	if infer.isBound(env, name) {
+	// through one calls whatever the binding holds. That order is `callTarget`,
+	// which inference and the emitter read the same call through.
+	target := infer.callTarget(env, name)
+	if target is infer.CallTarget.Bound {
 		checkCallableValue(c, env, name)
-		return
-	}
-	if types.findCallable(env.table, name) is Result.Ok(info) {
+	} else if target is infer.CallTarget.Declared(info) {
 		checkArguments(c, env, name, info, args)
-		return
-	}
-	if types.fieldsOfStruct(env.table, name) is Result.Ok(fields) {
+	} else if target is infer.CallTarget.Struct(fields) {
 		checkFieldArguments(c, env, name, fields, args)
-		return
-	}
-	if infer.isBuiltin(name) {
+	} else if target is infer.CallTarget.Builtin {
 		checkBuiltinCall(c, env, name, args)
-		return
-	}
-	if types.findType(env.table, name) is Result.Ok(_) {
+	} else if target is infer.CallTarget.Union {
 		report(c, "`{name}` is a tagged union, so a value of it is built by naming the variant: `{name}.SomeVariant(...)`")
-		return
+	} else {
+		report(c, "`{name}` is not a name anything here declared")
 	}
-	report(c, "`{name}` is not a name anything here declared")
 }
 
 // What a name has to hold for a call through it to mean something: a callable value,
@@ -1672,14 +1666,17 @@ proc checkAsync(c: mut Check, env: infer.Env, call: ast.Expr): void {
 			}
 		}
 		if callee is ast.Expr.Ident(name) {
-			if infer.isBound(env, name) == false {
-				if infer.isBuiltin(name) {
-					report(c, "`async` cannot fire off the builtin `{name}`: the global builtins exist for the value they hand back, so firing one off would leave nothing of it")
-					return
-				}
-				if types.findType(env.table, name) is Result.Ok(_) {
-					report(c, "`async` cannot fire off a constructor: `{name}(...)` builds a value and runs no body")
-				}
+			// A declaration of your own named after a builtin is an ordinary
+			// callable, so it is fired off like any other.
+			target := infer.callTarget(env, name)
+			if target is infer.CallTarget.Builtin {
+				report(c, "`async` cannot fire off the builtin `{name}`: the global builtins exist for the value they hand back, so firing one off would leave nothing of it")
+				return
+			}
+			if target is infer.CallTarget.Struct(_) {
+				report(c, "`async` cannot fire off a constructor: `{name}(...)` builds a value and runs no body")
+			} else if target is infer.CallTarget.Union {
+				report(c, "`async` cannot fire off a constructor: `{name}(...)` builds a value and runs no body")
 			}
 		}
 		if callee is ast.Expr.Member(head, variant) {
