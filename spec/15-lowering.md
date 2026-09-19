@@ -147,15 +147,18 @@ program that serves a page prints, and a print with no console goes nowhere.
 `hive run` never passes it either — the shell it was typed in is where a
 program's own output belongs.
 
-**A windowed program's icon is linked as a resource.** A PE carries its icon in
-a resource section and nowhere else, so a build that found `assets/icon.png`
+**A program's icon is linked as a resource.** Any program may ship
+`assets/icon.png` beside its entrypoint, windowed or not. A PE carries its icon
+in a resource section and nowhere else, so a build for Windows that found one
 writes a small Go program into the build directory, runs it once to produce
 `rsrc_windows_<arch>.syso`, and removes it — the Go linker takes any `.syso`
 beside the package it links, and the name keeps it out of a build for anywhere
 else. The generator runs for **this** machine while the object it writes is for
 the target, since a cross build's generator would be a program this machine
-cannot run. An architecture it has no machine type for keeps the window's icon
-and gives the file none.
+cannot run. An architecture it has no machine type for gives the file none.
+Windows is the only platform whose executables carry an icon at all; a build for
+anywhere else writes no object, and a windowed program's window links the same
+image whatever the platform ([14.15](14-stdlib.md#1415-hiveui)).
 
 `--target` is a flag of `build`. `check` and `emit` compile nothing, `test` and
 `container` are about this machine, and each of them **refuses** the flag rather

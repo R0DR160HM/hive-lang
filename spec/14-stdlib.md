@@ -590,15 +590,16 @@ ends the program. A machine with no Chromium-family browser falls back to an
 ordinary tab, which is the one case where the window belongs to a browser.
 
 **Its icon is `assets/icon.png`**, beside the entrypoint: a PNG of at most
-256×256, embedded into the executable by the build. A program that ships none
-shows Hive's own mark rather than a browser's blank sheet. Nothing in the source
-names it — what a window shows and what the file carries have to be one image,
-so there is one place to put it.
+256×256, embedded into the executable by the build. It is **the program's** icon
+rather than the window's — any program may ship one, and on Windows the
+executable carries it as a resource whether it opens a window or not
+([15.6](15-lowering.md#156-building-for-another-platform)). A window that ships
+none shows Hive's own mark rather than a browser's blank sheet. Nothing in the
+source names it — what a window shows and what the file carries have to be one
+image, so there is one place to put it.
 
-On Windows a **built** windowed program carries no console and carries its icon
-as a resource, so what opens is the window, and the file itself shows the icon in
-a file manager and on a pinned shortcut
-([15.6](15-lowering.md#156-building-for-another-platform)).
+On Windows a **built** windowed program also carries no console, so what opens is
+the window and nothing else.
 
 **The window is a service.** `update` is the same fold a `hive.syslink.spawn`
 handler is, and is checked as one, so a window has an address, needs no mutex,
