@@ -260,9 +260,9 @@ func coreResult(): Str {
 		`
 		func (r Result[T, E]) String() string \{
 			if r.ok \{
-				return "Ok(" + Show(r.value) + ")"
+				return "Ok(" + ShowIn(r.value) + ")"
 			}
-			return "Error(" + Show(r.bad) + ")"
+			return "Error(" + ShowIn(r.bad) + ")"
 		}
 		`
 	], "\n\n")
@@ -317,12 +317,23 @@ func coreShow(): Str {
 		}
 		`,
 		// Show renders a value exactly as echo displays it, so an Atom shows its
-		// NAME rather than the decimal form ToStr produces.
+		// NAME rather than the decimal form ToStr produces. A top-level Str is the
+		// line itself, which is the one place a Str is not quoted.
 		`
 		func Show(v any) string \{
+			if s, ok := v.(string); ok \{
+				return s
+			}
+			return ShowIn(v)
+		}
+		`,
+		// ShowIn is a value as it reads inside another one, where a Str is quoted:
+		// ["1", "2"] is then a different line from [1, 2] and from ["1 2"].
+		`
+		func ShowIn(v any) string \{
 			switch x := v.(type) \{
 			case string:
-				return x
+				return strconv.Quote(x)
 			case bool:
 				if x \{
 					return "true"
@@ -330,8 +341,44 @@ func coreShow(): Str {
 				return "false"
 			case float64:
 				return strconv.FormatFloat(x, 'g', -1, 64)
+			case error:
+				return x.Error()
+			case fmt.Stringer:
+				return x.String()
 			}
-			return fmt.Sprint(v)
+			return showParts(reflect.ValueOf(v))
+		}
+		`,
+		// A vector's elements or a declared type's fields, one at a time, which is
+		// what carries the quoting all the way down. Anything with no parts to walk
+		// is left to Go's own form.
+		`
+		func showParts(rv reflect.Value) string \{
+			switch rv.Kind() \{
+			case reflect.Slice, reflect.Array:
+				parts := make([]string, 0, rv.Len())
+				for i := 0; i < rv.Len(); i++ \{
+					parts = append(parts, ShowIn(rv.Index(i).Interface()))
+				}
+				return "[" + strings.Join(parts, ", ") + "]"
+			case reflect.Struct:
+				parts := make([]string, 0, rv.NumField())
+				for i := 0; i < rv.NumField(); i++ \{
+					if !rv.Type().Field(i).IsExported() \{
+						return fmt.Sprint(rv.Interface())
+					}
+					parts = append(parts, ShowIn(rv.Field(i).Interface()))
+				}
+				return "\{" + strings.Join(parts, ", ") + "}"
+			case reflect.Pointer, reflect.Interface:
+				if !rv.IsNil() \{
+					return showParts(rv.Elem())
+				}
+			}
+			if !rv.IsValid() \{
+				return "<nil>"
+			}
+			return fmt.Sprint(rv.Interface())
 		}
 		`,
 		// Echo writes one line to stdout. Every print in a generated program goes
@@ -973,7 +1020,7 @@ func coreDict(): Str {
 		func (d Dict[K, V]) String() string \{
 			parts := make([]string, 0, len(d.order))
 			for _, k := range d.order \{
-				parts = append(parts, Show(k)+": "+Show(d.byKey[k]))
+				parts = append(parts, ShowIn(k)+": "+ShowIn(d.byKey[k]))
 			}
 			return "\{" + strings.Join(parts, ", ") + "}"
 		}
@@ -8252,6 +8299,8 @@ func uiSource(): Str {
 				return "password"
 			case "Search":
 				return "search"
+			case "Range":
+				return "range"
 			}
 			return "text"
 		}
@@ -8499,13 +8548,16 @@ func uiSource(): Str {
 		  if (a.nodeType !== 1) \{ return; }
 		  var name = a.nodeName;
 		`,
-		// Read before the children are patched, because patching a select's options
-		// takes them out of the document being read from.
+		// Read before the children are patched, because patching takes them out of
+		// the document being read from: a select's options, and the text a textarea
+		// holds its value in. Reading either afterwards finds it empty, and a
+		// textarea a reader had just started typing into would be emptied with it.
 		`
 		  var pick = name === "SELECT" ? uiChosenIn(b) : null;
+		  var written = name === "TEXTAREA" ? b.textContent : null;
 		  uiPatchAttrs(a, b);
 		  uiPatchKids(a, b);
-		  uiDress(a, b, name, pick);
+		  uiDress(a, b, name, pick, written);
 		}
 
 		function uiPatchAttrs(a, b) \{
@@ -8527,7 +8579,7 @@ func uiSource(): Str {
 		// has typed in a field its value is a property, so setting the attribute alone
 		// would leave the page showing something the program never said.
 		`
-		function uiDress(a, b, name, pick) \{
+		function uiDress(a, b, name, pick, written) \{
 		  if (name === "INPUT") \{
 		    if (a.type === "checkbox" || a.type === "radio") \{
 		      var on = b.hasAttribute("checked");
@@ -8539,7 +8591,7 @@ func uiSource(): Str {
 		    return;
 		  }
 		  if (name === "TEXTAREA") \{
-		    if (a.value !== b.textContent) \{ a.value = b.textContent; }
+		    if (a.value !== written) \{ a.value = written; }
 		    return;
 		  }
 		  if (name === "SELECT" && pick !== null && a.value !== pick) \{ a.value = pick; }
@@ -8713,6 +8765,7 @@ func uiSource(): Str {
 		.h-input,.h-textarea,.h-select\{font:inherit;color:inherit;background:var(--bg);
 		border:1px solid var(--line);border-radius:8px;padding:8px 10px;min-width:0}
 		.h-input:focus,.h-textarea:focus\{outline:2px solid var(--accent);border-color:transparent}
+		.h-input[type=range]\{padding:0;border:0;background:none;accent-color:var(--accent);cursor:pointer}
 		.h-textarea\{resize:vertical;min-height:64px;width:100%}
 		.h-checkbox\{display:inline-flex;align-items:center;gap:6px;cursor:pointer}
 		.h-table\{border-collapse:collapse;width:100%}
@@ -10821,24 +10874,55 @@ func uiSceneJs(): Str {
 		    }
 		    spare.position.set(look.eye[0], look.eye[1], look.eye[2]);
 		    spare.rotation.set(look.aim[1], look.aim[0], 0);
-		    if (!drew) \{ renderer.setScissorTest(true); drew = true; }
+		    drew = true;
 		`,
 		// A page counts down from the top of the canvas and WebGL counts up from
 		// the bottom of it, which is the whole of this line.
 		//
 		// --- one frame -------------------------------------------------------------
 		`
-		    renderer.setViewport(left * shrink, (seen.height - low) * shrink,
-		      w * shrink, h * shrink);
-		    renderer.setScissor(left * shrink, (seen.height - low) * shrink,
-		      w * shrink, h * shrink);
+		    framed(Math.round(left * shrink), Math.round((seen.height - low) * shrink),
+		      Math.round(w * shrink), Math.round(h * shrink), true);
 		    renderer.render(stage, spare);
 		  }
-		  if (drew) \{
-		    renderer.setScissorTest(false);
-		    renderer.setViewport(0, 0, seen.width * shrink, seen.height * shrink);
-		    renderer.setScissor(0, 0, seen.width * shrink, seen.height * shrink);
+		  if (drew) \{ framed(0, 0, 0, 0, false); }
+		}
+		`,
+		// Where an inset is drawn, and the whole picture put back afterwards.
+		//
+		// **Into a buffer, the rectangle is the buffer's own and not the renderer's.**
+		// renderer.setViewport and setScissor always write the canvas's rectangle, times
+		// the pixel ratio, even while a render target is bound, and setRenderTarget(null)
+		// puts that rectangle back on the canvas on the way out. So an inset set that way
+		// under ui.grain drew in the wrong place and then left the canvas at the size of
+		// the buffer, and the blown-up picture came out shrunk into the bottom-left corner
+		// for as long as any inset was up. A target carries its own viewport, scissor and
+		// scissorTest, which setRenderTarget reads when it binds, so into a target those
+		// are set and it is bound again, and the canvas is never touched.
+		`
+		function framed(x, y, w, h, cut) \{
+		  var into = renderer.getRenderTarget();
+		  if (into) \{
+		    if (cut) \{
+		      into.viewport.set(x, y, w, h);
+		      into.scissor.set(x, y, w, h);
+		    } else \{
+		      into.viewport.set(0, 0, into.width, into.height);
+		      into.scissor.set(0, 0, into.width, into.height);
+		    }
+		    into.scissorTest = cut;
+		    renderer.setRenderTarget(into);
+		    return;
 		  }
+		  if (!cut) \{
+		    x = 0;
+		    y = 0;
+		    w = seen.width;
+		    h = seen.height;
+		  }
+		  renderer.setScissorTest(cut);
+		  renderer.setViewport(x, y, w, h);
+		  renderer.setScissor(x, y, w, h);
 		}
 		`,
 		// A frame of the world, taken apart. It is the numbers in the order this reader
@@ -13093,7 +13177,7 @@ func uiSceneJs(): Str {
 		    lookY += e.movementY || 0;
 		  });
 		  window.addEventListener("keydown", function (e) \{
-		    if (typing()) \{ return; }
+		    if (typing(e)) \{ return; }
 		    var k = named(e);
 		    if (!k) \{ return; }
 		    if (grabbing && swallow(k)) \{ e.preventDefault(); }
@@ -13101,7 +13185,6 @@ func uiSceneJs(): Str {
 		    down(k);
 		  });
 		  window.addEventListener("keyup", function (e) \{
-		    if (typing()) \{ return; }
 		    var k = named(e);
 		    if (k) \{ up(k); }
 		  });
@@ -13132,12 +13215,18 @@ func uiSceneJs(): Str {
 		}
 		`,
 		// Typing is typing. A window with a text field in it must not read the field as
-		// movement, and this is the whole rule that keeps the two apart.
+		// movement, and this is the whole rule that keeps the two apart. A slider only
+		// types with the keys that move it; everything else, Escape above all, is still
+		// the program's. A release is never typing: a key held into a field has to let go.
 		`
-		function typing() \{
+		function typing(e) \{
 		  var el = document.activeElement;
 		  if (!el || el === document.body) \{ return false; }
 		  var tag = el.tagName;
+		  if (tag === "INPUT" && el.type === "range") \{
+		    var k = e.key || "";
+		    return k.indexOf("Arrow") === 0 || k.indexOf("Page") === 0 || k === "Home" || k === "End";
+		  }
 		  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
 		}
 		`,

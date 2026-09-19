@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.2.6
+
+### Standard library
+
+* **`ui.InputKind.Range()`** — a slider running 0–100, whose value and `onInput` text are that number, and which keeps only the keys that move it while it has focus, so a scene still hears `Escape`.
+
+### Fixes
+
+* **A `Str` inside an echoed value is quoted**, where `[1 2]` was the line for `[1, 2]`, `["1", "2"]` and `["1 2"]` alike. Elements and fields are separated by `, ` too, and a `Str` echoed on its own is still the line itself rather than a quoted one.
+* **A key released while a field has focus is let go**, where a scene ignored keyup as well as keydown while typing and a key held as focus moved into a field stayed held after it came up.
+* **An inset no longer shrinks the picture behind it**, where under `ui.grain` it set the renderer's viewport rather than the render target's and left the canvas at the buffer's size, drawing the whole blown-up world into its bottom-left corner.
+
 ## v0.2.5
 
 ### Language
