@@ -53,12 +53,12 @@ proc main(): void {
 	// line of progress says how long *this* has been going.
 	from := progress.started()
 
-	// `--target` belongs to `build` and nothing else: two commands compile
-	// nothing, two more are about this machine by definition, and `run` hands
-	// everything past the entrypoint to the program.
-	if command != "build" && command != "run" {
+	// `--target` belongs to the two commands that write something for a platform:
+	// two others compile nothing, two more are about this machine by definition,
+	// and `run` hands everything past the entrypoint to the program.
+	if command != "build" && command != "export" && command != "run" {
 		if mentions(rest(args, 2), "--target") {
-			echo "hive: `--target` is a flag of `hive build`. `{command}` builds nothing for another platform."
+			echo "hive: `--target` is a flag of `hive build` and `hive export`. `{command}` builds nothing for another platform."
 			hive.term.exit(1)
 		}
 	}
@@ -69,6 +69,8 @@ proc main(): void {
 		emit(entry, from)
 	} else if command == "build" {
 		build(entry, rest(args, 2), from)
+	} else if command == "export" {
+		export(entry, rest(args, 2), from)
 	} else if command == "run" {
 		run(entry, rest(args, 2), from)
 	} else if command == "test" {
@@ -128,6 +130,41 @@ proc build(entry: Str, flags: Str[], from: Int): void {
 	// What it cost is part of the answer, so this goes to standard output and is
 	// said whether anybody was watching or not.
 	echo "Compiled {entry} -> " + project.executableOf(entry, asked.target) + " (" + progress.took(progress.since(from)) + ")"
+}
+
+// The program wrapped in an app that can be installed. The one format it knows
+// is Android's, and the target is asked for rather than assumed: another format
+// would make a default mean something else.
+proc export(entry: Str, flags: Str[], from: Int): void {
+	asked := askedFor(flags)
+	if asked.error != "" {
+		echo "hive: " + asked.error
+		hive.term.exit(1)
+	}
+	if asked.target == "" {
+		echo "hive: `hive export` needs a target, and the one it knows is `--target android/arm64`."
+		hive.term.exit(1)
+	}
+	if asked.target != "android/arm64" {
+		echo refusalOf(asked.target)
+		hive.term.exit(1)
+	}
+	written := project.export(entry, asked.target, from)
+	if len(written.errors) > 0 {
+		complain(written.errors)
+		return
+	}
+	echo "Packaged {entry} -> " + project.apkOf(entry, asked.target) + " (" + progress.took(progress.since(from)) + ")"
+}
+
+// Why a target is not one an app can be written for. Android's other
+// architectures are answered apart, because they are the ones somebody would
+// reasonably expect to work.
+func refusalOf(target: Str): Str {
+	if target == "android/386" || target == "android/amd64" || target == "android/arm" {
+		return "hive: `--target {target}` needs a C cross-compiler, which is the one thing a machine with the Go toolchain on it cannot be assumed to have. `android/arm64` is the only Android target Go links on its own, and it is what a handset is."
+	}
+	return "hive: `hive export` knows one format, and it is Android's. It takes `--target android/arm64`; `{target}` has no app to be packaged into."
 }
 
 proc run(entry: Str, args: Str[], from: Int): void {
@@ -342,6 +379,7 @@ proc usage(): void {
 	echo "  hive check     <entrypoint.hive>       Report any errors, build nothing"
 	echo "  hive emit      <entrypoint.hive>       Print the generated Go source"
 	echo "  hive build     <entrypoint.hive>       Compile to a native executable"
+	echo "  hive export    <entrypoint.hive>       Package as an app, with --target android/arm64"
 	echo "  hive run       <entrypoint.hive> [..]  Compile and run"
 	echo "  hive test      <entrypoint.hive>       Run the program's tests, with coverage"
 	echo "  hive analyze   <entrypoint.hive>       Score what it will cost, and write a page"
@@ -350,6 +388,7 @@ proc usage(): void {
 	echo "  hive version                           Print which release this compiler is"
 	echo ""
 	echo "Flags:"
-	echo "  --target <goos>/<goarch>               Build for another platform, on `build` alone."
-	echo "                                         `go tool dist list` names every one."
+	echo "  --target <goos>/<goarch>               Build for another platform, on `build` and"
+	echo "                                         `export` alone. `go tool dist list` names"
+	echo "                                         every one; `export` takes android/arm64."
 }

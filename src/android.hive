@@ -1,0 +1,874 @@
+// Packaging a program as an Android app
+// =====================================
+// A Hive window already serves its own page over loopback, so an app is that
+// program beside a WebView that opens it. An APK is byte work — a binary
+// manifest, a resource table, an aligned archive and a signature over it — so
+// the Go below is written into the build, run once, and deleted, the way the
+// Windows resource generator is.
+
+// What the generator reads the shim out of, under its own directory and removed
+// with it.
+func dexFile(): Str {
+	return "classes.dex.hex"
+}
+
+// The copy of the program's icon the generator reads.
+func iconFile(): Str {
+	return "icon.png"
+}
+
+// The generator, as its own `package main` under the build. It keeps its own
+// comments, being a program in its own right rather than a fragment.
+func generatorSource(): Str {
+	return `
+		package main
+
+		// Writes a signed APK. Run by the build under its own directory and deleted
+		// with it, the way the Windows resource generator is: an APK is byte work, and
+		// this keeps the bytes where bytes are natural.
+		//
+		// apk <out> <stem> <label> <versionCode> <versionName> <payload> <dexhex> <icon>
+		//
+		// <icon> may be empty, and then the app carries no launcher icon and no
+		// resource table at all.
+
+		import (
+			"bytes"
+			"compress/flate"
+			"crypto"
+			"crypto/rand"
+			"crypto/rsa"
+			"crypto/sha256"
+			"crypto/x509"
+			"crypto/x509/pkix"
+			"encoding/binary"
+			"encoding/hex"
+			"fmt"
+			"hash/crc32"
+			"math/big"
+			"os"
+			"path/filepath"
+			"sort"
+			"strconv"
+			"time"
+		)
+
+		var le = binary.LittleEndian
+
+		func main() \{
+			if len(os.Args) != 9 \{
+				fmt.Fprintln(os.Stderr, "apk: wrong number of arguments")
+				os.Exit(2)
+			}
+			out, stem, label := os.Args[1], os.Args[2], os.Args[3]
+			appID := applicationID(stem)
+			versionCode, err := strconv.Atoi(os.Args[4])
+			if err != nil \{
+				fmt.Fprintln(os.Stderr, "apk: version code:", err)
+				os.Exit(2)
+			}
+			versionName, payload, dexPath, icon := os.Args[5], os.Args[6], os.Args[7], os.Args[8]
+			keyPath, err := keyFile()
+			if err != nil \{
+				fmt.Fprintln(os.Stderr, "apk:", err)
+				os.Exit(1)
+			}
+
+			dexHex, err := os.ReadFile(dexPath)
+			if err != nil \{
+				fmt.Fprintln(os.Stderr, "apk:", err)
+				os.Exit(1)
+			}
+			dex, err := unhex(dexHex)
+			if err != nil \{
+				fmt.Fprintln(os.Stderr, "apk: the shim is not readable as hex:", err)
+				os.Exit(1)
+			}
+
+			manifest, err := androidManifest(appID, label, uint32(versionCode), versionName, icon != "")
+			if err != nil \{
+				fmt.Fprintln(os.Stderr, "apk:", err)
+				os.Exit(1)
+			}
+
+			files := []file\{
+				\{name: "AndroidManifest.xml", body: manifest},
+				\{name: "classes.dex", body: dex},
+			}
+			if icon != "" \{
+				body, err := os.ReadFile(icon)
+				if err != nil \{
+					fmt.Fprintln(os.Stderr, "apk:", err)
+					os.Exit(1)
+				}
+				files = append(files,
+					file\{name: "resources.arsc", body: resourceTable(appID, iconPath), stored: true},
+					file\{name: iconPath, body: body})
+			}
+			program, err := os.ReadFile(payload)
+			if err != nil \{
+				fmt.Fprintln(os.Stderr, "apk:", err)
+				os.Exit(1)
+			}
+			files = append(files, file\{name: "lib/arm64-v8a/" + payloadName, body: program})
+
+			apk, err := archive(files, keyPath)
+			if err != nil \{
+				fmt.Fprintln(os.Stderr, "apk:", err)
+				os.Exit(1)
+			}
+			if err := os.WriteFile(out, apk, 0o644); err != nil \{
+				fmt.Fprintln(os.Stderr, "apk:", err)
+				os.Exit(1)
+			}
+		}
+
+		// The payload is named lib*.so so the installer extracts it into
+		// nativeLibraryDir, the one directory in an app that is executable.
+		const payloadName = "libhiveapp.so"
+
+		const iconPath = "res/mipmap/icon.png"
+
+		// Where the signing key is kept: beside the syslink cluster secret, for the
+		// same reason and made the same way.
+		func keyFile() (string, error) \{
+			home, err := os.UserHomeDir()
+			if err != nil \{
+				return "", fmt.Errorf("this machine has no home directory to keep a signing key in")
+			}
+			dir := filepath.Join(home, ".hive")
+			if err := os.MkdirAll(dir, 0o700); err != nil \{
+				return "", err
+			}
+			return filepath.Join(dir, "android.key"), nil
+		}
+
+		// An application id derived from the entrypoint: shop.hive becomes hive.shop.
+		// A segment must start with a letter and carry only letters, digits and
+		// underscores, so anything else in the name is dropped.
+		func applicationID(stem string) string \{
+			clean := make([]byte, 0, len(stem))
+			for i := 0; i < len(stem); i++ \{
+				c := stem[i]
+				switch \{
+				case c >= 'A' && c <= 'Z':
+					clean = append(clean, c+('a'-'A'))
+				case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '_':
+					clean = append(clean, c)
+				}
+			}
+			if len(clean) == 0 || clean[0] < 'a' || clean[0] > 'z' \{
+				clean = append([]byte\{'a'}, clean...)
+			}
+			return "hive." + string(clean)
+		}
+
+		func unhex(text []byte) ([]byte, error) \{
+			clean := make([]byte, 0, len(text))
+			for _, c := range text \{
+				if c > ' ' \{
+					clean = append(clean, c)
+				}
+			}
+			return hex.DecodeString(string(clean))
+		}
+
+		// ---------------------------------------------------------------------------
+		// AndroidManifest.xml, in the binary form Android reads
+		// ---------------------------------------------------------------------------
+
+		const (
+			chunkStringPool  = 0x0001
+			chunkXML         = 0x0003
+			chunkResourceMap = 0x0180
+			chunkStartNS     = 0x0100
+			chunkEndNS       = 0x0101
+			chunkStartElem   = 0x0102
+			chunkEndElem     = 0x0103
+
+			valReference = 0x01
+			valString    = 0x03
+			valIntDec    = 0x10
+			valIntHex    = 0x11
+			valBool      = 0x12
+
+			androidNS = "http://schemas.android.com/apk/res/android"
+		)
+
+		// The framework attribute ids this manifest uses, read out of aapt2's own
+		// resource map. A framework id is stable across releases, which is what lets
+		// them be written here rather than looked up in an SDK nobody has.
+		var attrID = map[string]uint32\{
+			"theme":                0x01010000,
+			"label":                0x01010001,
+			"icon":                 0x01010002,
+			"name":                 0x01010003,
+			"hasCode":              0x0101000c,
+			"exported":             0x01010010,
+			"configChanges":        0x0101001f,
+			"minSdkVersion":        0x0101020c,
+			"versionCode":          0x0101021b,
+			"versionName":          0x0101021c,
+			"windowSoftInputMode":  0x0101022b,
+			"targetSdkVersion":     0x01010270,
+			"extractNativeLibs":    0x010104ea,
+			"usesCleartextTraffic": 0x010104ec,
+		}
+
+		const (
+			// @android:style/Theme.DeviceDefault.NoActionBar: the window is the page and
+			// nothing else.
+			themeNoActionBar = 0x01030129
+			// Everything the shim redraws itself rather than being recreated for.
+			configChangesMask = 0x40001ffc
+			// adjustResize, so the keyboard shortens the page instead of covering it.
+			adjustResize = 0x10
+			// package 0x7f, first type, first entry — what resourceTable writes.
+			iconResource = 0x7f010000
+
+			minSdk    = 24
+			targetSdk = 35
+		)
+
+		type attr struct \{
+			name       string
+			namespaced bool
+			typ        uint8
+			data       uint32
+			raw        string
+		}
+
+		type elem struct \{
+			name  string
+			attrs []attr
+			kids  []elem
+		}
+
+		func str(name, value string) attr \{
+			return attr\{name: name, namespaced: true, typ: valString, raw: value}
+		}
+
+		func num(name string, v uint32) attr \{
+			return attr\{name: name, namespaced: true, typ: valIntDec, data: v}
+		}
+
+		func hexAttr(name string, v uint32) attr \{
+			return attr\{name: name, namespaced: true, typ: valIntHex, data: v}
+		}
+
+		func ref(name string, v uint32) attr \{
+			return attr\{name: name, namespaced: true, typ: valReference, data: v}
+		}
+
+		func yes(name string) attr \{
+			return attr\{name: name, namespaced: true, typ: valBool, data: 0xffffffff}
+		}
+
+		func androidManifest(appID, label string, versionCode uint32, versionName string, hasIcon bool) ([]byte, error) \{
+			application := elem\{name: "application", attrs: []attr\{
+				str("label", label),
+				yes("hasCode"),
+				yes("extractNativeLibs"),
+				yes("usesCleartextTraffic"),
+			}}
+			if hasIcon \{
+				application.attrs = append(application.attrs, ref("icon", iconResource))
+			}
+
+			application.kids = []elem\{\{name: "activity", attrs: []attr\{
+				ref("theme", themeNoActionBar),
+				str("name", "dev.hive.app.MainActivity"),
+				yes("exported"),
+				hexAttr("configChanges", configChangesMask),
+				hexAttr("windowSoftInputMode", adjustResize),
+			}, kids: []elem\{\{
+				name: "intent-filter",
+				kids: []elem\{
+					\{name: "action", attrs: []attr\{str("name", "android.intent.action.MAIN")}},
+					\{name: "category", attrs: []attr\{str("name", "android.intent.category.LAUNCHER")}},
+				},
+			}}}}
+
+			root := elem\{name: "manifest", attrs: []attr\{
+				\{name: "package", typ: valString, raw: appID},
+				num("versionCode", versionCode),
+				str("versionName", versionName),
+			}, kids: []elem\{
+				\{name: "uses-sdk", attrs: []attr\{
+					num("minSdkVersion", minSdk),
+					num("targetSdkVersion", targetSdk),
+				}},
+				// Creating any socket needs this, loopback included, and a window is a
+				// server.
+				\{name: "uses-permission", attrs: []attr\{str("name", "android.permission.INTERNET")}},
+				application,
+			}}
+
+			return encodeXML(root)
+		}
+
+		type strings struct \{
+			index map[string]int
+			order []string
+		}
+
+		func encodeXML(root elem) ([]byte, error) \{
+			// Every attribute name carrying a framework id takes the pool's first slots,
+			// in id order, because the resource map is a parallel array over them.
+			named := map[string]uint32\{}
+			var others []string
+			seen := map[string]bool\{}
+			add := func(s string) \{
+				if !seen[s] \{
+					seen[s] = true
+					others = append(others, s)
+				}
+			}
+
+			var walk func(e elem) error
+			walk = func(e elem) error \{
+				add(e.name)
+				for _, a := range e.attrs \{
+					if a.namespaced \{
+						id, ok := attrID[a.name]
+						if !ok \{
+							return fmt.Errorf("no framework id for %q", a.name)
+						}
+						named[a.name] = id
+					} else \{
+						add(a.name)
+					}
+					if a.typ == valString \{
+						add(a.raw)
+					}
+				}
+				for _, k := range e.kids \{
+					if err := walk(k); err != nil \{
+						return err
+					}
+				}
+				return nil
+			}
+			if err := walk(root); err != nil \{
+				return nil, err
+			}
+			add("android")
+			add(androidNS)
+
+			ids := make([]string, 0, len(named))
+			for n := range named \{
+				ids = append(ids, n)
+			}
+			sort.Slice(ids, func(i, j int) bool \{ return named[ids[i]] < named[ids[j]] })
+
+			rest := make([]string, 0, len(others))
+			for _, s := range others \{
+				if _, taken := named[s]; !taken \{
+					rest = append(rest, s)
+				}
+			}
+			sort.Strings(rest)
+
+			p := &strings\{index: map[string]int\{}}
+			for _, s := range append(append([]string\{}, ids...), rest...) \{
+				p.index[s] = len(p.order)
+				p.order = append(p.order, s)
+			}
+
+			var out []byte
+			out = append(out, stringPool(p.order, false)...)
+
+			rm := make([]byte, 8+4*len(ids))
+			le.PutUint16(rm[0:], chunkResourceMap)
+			le.PutUint16(rm[2:], 8)
+			le.PutUint32(rm[4:], uint32(len(rm)))
+			for i, n := range ids \{
+				le.PutUint32(rm[8+i*4:], named[n])
+			}
+			out = append(out, rm...)
+
+			out = append(out, namespaceChunk(chunkStartNS, p)...)
+			nodes, err := elementChunks(root, p)
+			if err != nil \{
+				return nil, err
+			}
+			out = append(out, nodes...)
+			out = append(out, namespaceChunk(chunkEndNS, p)...)
+
+			head := make([]byte, 8)
+			le.PutUint16(head[0:], chunkXML)
+			le.PutUint16(head[2:], 8)
+			le.PutUint32(head[4:], uint32(8+len(out)))
+			return append(head, out...), nil
+		}
+
+		func nodeHeader(kind uint16, size int) []byte \{
+			b := make([]byte, 16)
+			le.PutUint16(b[0:], kind)
+			le.PutUint16(b[2:], 16)
+			le.PutUint32(b[4:], uint32(size))
+			le.PutUint32(b[8:], 1)
+			le.PutUint32(b[12:], 0xFFFFFFFF)
+			return b
+		}
+
+		func namespaceChunk(kind uint16, p *strings) []byte \{
+			b := nodeHeader(kind, 24)
+			tail := make([]byte, 8)
+			le.PutUint32(tail[0:], uint32(p.index["android"]))
+			le.PutUint32(tail[4:], uint32(p.index[androidNS]))
+			return append(b, tail...)
+		}
+
+		func elementChunks(e elem, p *strings) ([]byte, error) \{
+			sorted := append([]attr\{}, e.attrs...)
+			sort.SliceStable(sorted, func(i, j int) bool \{
+				a, b := sorted[i], sorted[j]
+				if a.namespaced != b.namespaced \{
+					return a.namespaced
+				}
+				if !a.namespaced \{
+					return false
+				}
+				return attrID[a.name] < attrID[b.name]
+			})
+
+			out := nodeHeader(chunkStartElem, 16+20+20*len(sorted))
+			payload := make([]byte, 20)
+			le.PutUint32(payload[0:], 0xFFFFFFFF)
+			le.PutUint32(payload[4:], uint32(p.index[e.name]))
+			le.PutUint16(payload[8:], 20)
+			le.PutUint16(payload[10:], 20)
+			le.PutUint16(payload[12:], uint16(len(sorted)))
+			out = append(out, payload...)
+
+			for _, a := range sorted \{
+				b := make([]byte, 20)
+				ns := uint32(0xFFFFFFFF)
+				if a.namespaced \{
+					ns = uint32(p.index[androidNS])
+				}
+				raw := uint32(0xFFFFFFFF)
+				data := a.data
+				if a.typ == valString \{
+					raw = uint32(p.index[a.raw])
+					data = raw
+				}
+				le.PutUint32(b[0:], ns)
+				le.PutUint32(b[4:], uint32(p.index[a.name]))
+				le.PutUint32(b[8:], raw)
+				le.PutUint16(b[12:], 8)
+				b[15] = a.typ
+				le.PutUint32(b[16:], data)
+				out = append(out, b...)
+			}
+
+			for _, k := range e.kids \{
+				kid, err := elementChunks(k, p)
+				if err != nil \{
+					return nil, err
+				}
+				out = append(out, kid...)
+			}
+
+			end := nodeHeader(chunkEndElem, 24)
+			tail := make([]byte, 8)
+			le.PutUint32(tail[0:], 0xFFFFFFFF)
+			le.PutUint32(tail[4:], uint32(p.index[e.name]))
+			return append(out, append(end, tail...)...), nil
+		}
+
+		// A ResStringPool. UTF-8 carries two lengths, in characters then in bytes;
+		// UTF-16 carries one, in code units. Both end with a terminator.
+		func stringPool(items []string, utf8 bool) []byte \{
+			var data []byte
+			offsets := make([]uint32, len(items))
+			for i, s := range items \{
+				offsets[i] = uint32(len(data))
+				if utf8 \{
+					b := []byte(s)
+					data = append(data, poolLength(len([]rune(s)))...)
+					data = append(data, poolLength(len(b))...)
+					data = append(data, b...)
+					data = append(data, 0)
+					continue
+				}
+				u := utf16of(s)
+				head := make([]byte, 2)
+				le.PutUint16(head, uint16(len(u)))
+				data = append(data, head...)
+				for _, c := range u \{
+					pair := make([]byte, 2)
+					le.PutUint16(pair, c)
+					data = append(data, pair...)
+				}
+				data = append(data, 0, 0)
+			}
+			for len(data)%4 != 0 \{
+				data = append(data, 0)
+			}
+
+			start := 28 + 4*len(items)
+			head := make([]byte, start)
+			le.PutUint16(head[0:], chunkStringPool)
+			le.PutUint16(head[2:], 28)
+			le.PutUint32(head[4:], uint32(start+len(data)))
+			le.PutUint32(head[8:], uint32(len(items)))
+			le.PutUint32(head[12:], 0)
+			if utf8 \{
+				le.PutUint32(head[16:], 1<<8)
+			}
+			le.PutUint32(head[20:], uint32(start))
+			le.PutUint32(head[24:], 0)
+			for i, o := range offsets \{
+				le.PutUint32(head[28+i*4:], o)
+			}
+			return append(head, data...)
+		}
+
+		func poolLength(n int) []byte \{
+			if n > 0x7F \{
+				return []byte\{byte(n>>8) | 0x80, byte(n)}
+			}
+			return []byte\{byte(n)}
+		}
+
+		func utf16of(s string) []uint16 \{
+			var u []uint16
+			for _, r := range s \{
+				if r > 0xFFFF \{
+					r -= 0x10000
+					u = append(u, 0xD800+uint16(r>>10), 0xDC00+uint16(r&0x3FF))
+					continue
+				}
+				u = append(u, uint16(r))
+			}
+			return u
+		}
+
+		// ---------------------------------------------------------------------------
+		// resources.arsc — one package, one mipmap, one entry
+		// ---------------------------------------------------------------------------
+
+		// The whole resource table an app needs, because android:label takes a literal
+		// string and only android:icon must be a reference.
+		func resourceTable(appID, icon string) []byte \{
+			const (
+				chunkTable    = 0x0002
+				chunkPackage  = 0x0200
+				chunkType     = 0x0201
+				chunkTypeSpec = 0x0202
+				packageID     = 0x7f
+				mipmapID      = 0x01
+			)
+
+			values := stringPool([]string\{icon}, true)
+			typeNames := stringPool([]string\{"mipmap"}, false)
+			keyNames := stringPool([]string\{"icon"}, true)
+
+			spec := make([]byte, 20)
+			le.PutUint16(spec[0:], chunkTypeSpec)
+			le.PutUint16(spec[2:], 16)
+			le.PutUint32(spec[4:], uint32(len(spec)))
+			spec[8] = mipmapID
+			// res1 was reserved and is now how many ResTable_type chunks follow for this
+			// spec. There is one, the default configuration.
+			le.PutUint16(spec[10:], 1)
+			le.PutUint32(spec[12:], 1)
+
+			const typeHeader = 84 // 20 fixed, then a 64-byte configuration
+			entry := make([]byte, 16)
+			le.PutUint16(entry[0:], 8)
+			le.PutUint32(entry[4:], 0)
+			le.PutUint16(entry[8:], 8)
+			entry[11] = valString
+			le.PutUint32(entry[12:], 0)
+
+			body := make([]byte, typeHeader+4)
+			le.PutUint16(body[0:], chunkType)
+			le.PutUint16(body[2:], typeHeader)
+			le.PutUint32(body[4:], uint32(len(body)+len(entry)))
+			body[8] = mipmapID
+			le.PutUint32(body[12:], 1)
+			le.PutUint32(body[16:], uint32(typeHeader+4))
+			le.PutUint32(body[20:], 64) // every other config byte zero is "any"
+			le.PutUint32(body[typeHeader:], 0)
+			body = append(body, entry...)
+
+			children := append(append(append(append([]byte\{}, typeNames...), keyNames...), spec...), body...)
+
+			const packageHeader = 288 // 8 chunk, 4 id, 256 name, five 4-byte fields
+			head := make([]byte, packageHeader)
+			le.PutUint16(head[0:], chunkPackage)
+			le.PutUint16(head[2:], packageHeader)
+			le.PutUint32(head[4:], uint32(packageHeader+len(children)))
+			le.PutUint32(head[8:], packageID)
+			for i, c := range utf16of(appID) \{
+				if 12+(i+1)*2 >= 12+256 \{
+					break
+				}
+				le.PutUint16(head[12+i*2:], c)
+			}
+			le.PutUint32(head[268:], packageHeader)
+			le.PutUint32(head[276:], uint32(packageHeader+len(typeNames)))
+			pack := append(head, children...)
+
+			table := make([]byte, 12)
+			le.PutUint16(table[0:], chunkTable)
+			le.PutUint16(table[2:], 12)
+			le.PutUint32(table[4:], uint32(12+len(values)+len(pack)))
+			le.PutUint32(table[8:], 1)
+			return append(append(table, values...), pack...)
+		}
+
+		// ---------------------------------------------------------------------------
+		// The archive, and the signature over it
+		// ---------------------------------------------------------------------------
+
+		type file struct \{
+			name   string
+			body   []byte
+			stored bool
+		}
+
+		// The zip is written by hand because every offset has to be known: a stored
+		// entry starts on a 4-byte boundary, and the signing block goes between the
+		// last entry and the central directory.
+		func archive(files []file, keyPath string) ([]byte, error) \{
+			type placed struct \{
+				file
+				packed []byte
+				crc    uint32
+				at     uint32
+			}
+			entries := make([]placed, 0, len(files))
+			for _, f := range files \{
+				e := placed\{file: f, crc: crc32.ChecksumIEEE(f.body)}
+				if f.stored \{
+					e.packed = f.body
+				} else \{
+					var to bytes.Buffer
+					w, _ := flate.NewWriter(&to, flate.BestCompression)
+					w.Write(f.body)
+					w.Close()
+					e.packed = to.Bytes()
+				}
+				entries = append(entries, e)
+			}
+
+			var body bytes.Buffer
+			for i := range entries \{
+				e := &entries[i]
+				extra := 0
+				if e.stored \{
+					at := body.Len() + 30 + len(e.name)
+					extra = (4 - at%4) % 4
+				}
+				e.at = uint32(body.Len())
+				body.Write(localHeader(e.name, e.crc, len(e.packed), len(e.body), e.stored, extra))
+				body.Write(make([]byte, extra))
+				body.Write(e.packed)
+			}
+
+			var central bytes.Buffer
+			for i := range entries \{
+				e := &entries[i]
+				central.Write(centralRecord(e.name, e.crc, len(e.packed), len(e.body), e.stored, e.at))
+			}
+
+			// The recorded offset is where the signing block will start, which is what
+			// the digest is required to see.
+			end := endRecord(len(entries), central.Len(), body.Len())
+			block, err := signingBlock(body.Bytes(), central.Bytes(), end, keyPath)
+			if err != nil \{
+				return nil, err
+			}
+
+			var apk bytes.Buffer
+			apk.Write(body.Bytes())
+			apk.Write(block)
+			apk.Write(central.Bytes())
+			apk.Write(endRecord(len(entries), central.Len(), body.Len()+len(block)))
+			return apk.Bytes(), nil
+		}
+
+		func method(stored bool) uint16 \{
+			if stored \{
+				return 0
+			}
+			return 8
+		}
+
+		func localHeader(name string, crc uint32, packed, plain int, stored bool, extra int) []byte \{
+			b := make([]byte, 30+len(name))
+			le.PutUint32(b[0:], 0x04034b50)
+			le.PutUint16(b[4:], 20)
+			le.PutUint16(b[8:], method(stored))
+			le.PutUint32(b[14:], crc)
+			le.PutUint32(b[18:], uint32(packed))
+			le.PutUint32(b[22:], uint32(plain))
+			le.PutUint16(b[26:], uint16(len(name)))
+			le.PutUint16(b[28:], uint16(extra))
+			copy(b[30:], name)
+			return b
+		}
+
+		func centralRecord(name string, crc uint32, packed, plain int, stored bool, at uint32) []byte \{
+			b := make([]byte, 46+len(name))
+			le.PutUint32(b[0:], 0x02014b50)
+			le.PutUint16(b[4:], 20)
+			le.PutUint16(b[6:], 20)
+			le.PutUint16(b[10:], method(stored))
+			le.PutUint32(b[16:], crc)
+			le.PutUint32(b[20:], uint32(packed))
+			le.PutUint32(b[24:], uint32(plain))
+			le.PutUint16(b[28:], uint16(len(name)))
+			le.PutUint32(b[42:], at)
+			copy(b[46:], name)
+			return b
+		}
+
+		func endRecord(count, centralSize, centralAt int) []byte \{
+			b := make([]byte, 22)
+			le.PutUint32(b[0:], 0x06054b50)
+			le.PutUint16(b[8:], uint16(count))
+			le.PutUint16(b[10:], uint16(count))
+			le.PutUint32(b[12:], uint32(centralSize))
+			le.PutUint32(b[16:], uint32(centralAt))
+			return b
+		}
+
+		const (
+			digestChunk = 1024 * 1024
+			v2BlockID   = 0x7109871a
+			sigRSAPKCS1 = 0x0103 // RSASSA-PKCS1-v1_5 over SHA2-256
+			blockMagic  = "APK Sig Block 42"
+		)
+
+		// Each 1MB chunk is digested salted with 0xa5 and its length, then all the
+		// chunk digests salted with 0x5a and their count. Splitting it this way is what
+		// lets a verifier work in parallel.
+		func contentDigest(sections ...[]byte) []byte \{
+			var digests [][]byte
+			for _, s := range sections \{
+				for at := 0; at < len(s); at += digestChunk \{
+					end := at + digestChunk
+					if end > len(s) \{
+						end = len(s)
+					}
+					h := sha256.New()
+					head := []byte\{0xa5, 0, 0, 0, 0}
+					le.PutUint32(head[1:], uint32(end-at))
+					h.Write(head)
+					h.Write(s[at:end])
+					digests = append(digests, h.Sum(nil))
+				}
+			}
+			top := sha256.New()
+			head := []byte\{0x5a, 0, 0, 0, 0}
+			le.PutUint32(head[1:], uint32(len(digests)))
+			top.Write(head)
+			for _, d := range digests \{
+				top.Write(d)
+			}
+			return top.Sum(nil)
+		}
+
+		func prefixed(body []byte) []byte \{
+			b := make([]byte, 4+len(body))
+			le.PutUint32(b, uint32(len(body)))
+			copy(b[4:], body)
+			return b
+		}
+
+		func signingBlock(body, central, end []byte, keyPath string) ([]byte, error) \{
+			key, cert, err := identity(keyPath)
+			if err != nil \{
+				return nil, err
+			}
+
+			algo := make([]byte, 4)
+			le.PutUint32(algo, sigRSAPKCS1)
+
+			// Each of these is a length-prefixed sequence of length-prefixed records, so
+			// a lone record still carries both prefixes.
+			digests := prefixed(prefixed(append(algo, prefixed(contentDigest(body, central, end))...)))
+			certs := prefixed(prefixed(cert))
+			signedData := append(append(digests, certs...), prefixed(nil)...)
+
+			sum := sha256.Sum256(signedData)
+			signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, sum[:])
+			if err != nil \{
+				return nil, err
+			}
+			signatures := prefixed(prefixed(append(algo, prefixed(signature)...)))
+
+			publicKey, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+			if err != nil \{
+				return nil, err
+			}
+			signer := append(append(prefixed(signedData), signatures...), prefixed(publicKey)...)
+			signers := prefixed(prefixed(signer))
+
+			pair := make([]byte, 12+len(signers))
+			binary.LittleEndian.PutUint64(pair[0:], uint64(4+len(signers)))
+			le.PutUint32(pair[8:], v2BlockID)
+			copy(pair[12:], signers)
+
+			size := uint64(len(pair) + 8 + 16)
+			head := make([]byte, 8)
+			binary.LittleEndian.PutUint64(head, size)
+			block := append([]byte\{}, head...)
+			block = append(block, pair...)
+			block = append(block, head...)
+			return append(block, blockMagic...), nil
+		}
+
+		// The key is kept where the syslink cluster secret is kept and made the same
+		// way on first use: one stable key a machine over, so successive builds install
+		// over each other instead of being refused as a different app.
+		func identity(path string) (*rsa.PrivateKey, []byte, error) \{
+			if body, err := os.ReadFile(path); err == nil && len(body) > 4 \{
+				n := le.Uint32(body)
+				if int(4+n) <= len(body) \{
+					key, err := x509.ParsePKCS8PrivateKey(body[4 : 4+n])
+					if err != nil \{
+						return nil, nil, err
+					}
+					rsaKey, ok := key.(*rsa.PrivateKey)
+					if !ok \{
+						return nil, nil, fmt.Errorf("%s does not hold an RSA key", path)
+					}
+					return rsaKey, body[4+n:], nil
+				}
+			}
+
+			key, err := rsa.GenerateKey(rand.Reader, 2048)
+			if err != nil \{
+				return nil, nil, err
+			}
+			template := x509.Certificate\{
+				SerialNumber: big.NewInt(1),
+				Subject:      pkix.Name\{CommonName: "Hive"},
+				NotBefore:    time.Unix(0, 0),
+				NotAfter:     time.Now().AddDate(30, 0, 0),
+			}
+			cert, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+			if err != nil \{
+				return nil, nil, err
+			}
+			pkcs8, err := x509.MarshalPKCS8PrivateKey(key)
+			if err != nil \{
+				return nil, nil, err
+			}
+			body := make([]byte, 4)
+			le.PutUint32(body, uint32(len(pkcs8)))
+			body = append(append(body, pkcs8...), cert...)
+			if err := os.WriteFile(path, body, 0o600); err != nil \{
+				return nil, nil, err
+			}
+			return key, cert, nil
+		}
+
+`
+}

@@ -90,6 +90,7 @@ func moduleText(module: Str): Str {
 	if module == "time" { return timeSource() }
 	if module == "json" { return jsonSource() }
 	if module == "crypto" { return cryptoSource() }
+	if module == "resolver" { return resolverSource() }
 	if module == "net" { return netSource() }
 	if module == "sql" { return sqlSource() }
 	if module == "syslink" { return syslinkSource() }
@@ -115,8 +116,17 @@ func requires(module: Str): Str[dyn] {
 	// A format is written against the vocabulary `encode` and `decode` share,
 	// which is its own file so that a second format would add one rather than
 	// reach into the first.
-	if module == "json" || module == "net" || module == "term" {
+	if module == "json" || module == "term" {
 		return ["codec"]
+	}
+	// Looking a name up is the platform's business, and on one of them it is not
+	// a file the Go resolver can read. The three modules that resolve one ask for
+	// the same answer.
+	if module == "net" {
+		return ["codec", "resolver"]
+	}
+	if module == "sql" {
+		return ["resolver"]
 	}
 	// Turning a terminal's echo off is two files, one per platform, and the tag
 	// at the top of each leaves the other out of the build.
@@ -132,7 +142,7 @@ func requires(module: Str): Str[dyn] {
 	// `hive.json` builds from a declaration, and the wire that carries it is its
 	// own file — one nothing in Hive source ever names.
 	if module == "syslink" {
-		return ["json", "syslinknet"]
+		return ["json", "syslinknet", "resolver"]
 	}
 	// A window is a syslink service with a socket in front of it: the fold and
 	// the address come from `syslink`, the socket from `net`, and the token that
@@ -3744,6 +3754,128 @@ func cryptoSource(): Str {
 // raw TCP, and the network under all three. The WebSocket half implements RFC 6455
 // on a hijacked connection rather than reaching for a library, so a program that
 // speaks WebSocket still builds offline against a dependency-free go.mod.
+// --- Names, where the platform keeps them somewhere else ---------------------
+
+// Android has no `/etc/resolv.conf`: its resolvers live in a service, and Go's
+// own note on the matter is that a name needs the cgo resolver there. With no
+// cgo there is none, so the pure resolver falls back to `127.0.0.1:53` and
+// every lookup fails against a server nothing is running. The host writes the
+// addresses it is using into a file, and this dials those instead.
+//
+// Required by `net`, `syslink` and `sql` — the three that resolve a name — so a
+// program that touches no network carries none of it.
+func resolverSource(): Str {
+	return join([
+		`
+		package hive
+
+		import (
+			"context"
+			"errors"
+			"net"
+			"os"
+			"path/filepath"
+			"runtime"
+			"strings"
+			"sync"
+			"time"
+		)
+		`,
+		// Installed before any lookup can happen: this package's init runs after
+		// `net` is itself initialised and before any Hive code.
+		`
+		func init() \{
+			if runtime.GOOS != "android" \{
+				return
+			}
+			net.DefaultResolver = &net.Resolver\{PreferGo: true, Dial: resolverDial}
+		}
+		`,
+		// The address handed in is the one read out of a resolv.conf that is not
+		// there, so it is dropped and a real server dialled in its place. Each in
+		// turn, because the first may be on an interface that has just gone.
+		`
+		func resolverDial(ctx context.Context, network string, _ string) (net.Conn, error) \{
+			servers := resolvers()
+			if len(servers) == 0 \{
+				return nil, errors.New("no resolver: nothing has written " +
+					resolverFile() + ", so a name cannot be looked up here")
+			}
+			var dialer net.Dialer
+			var last error
+			for _, server := range servers \{
+				conn, err := dialer.DialContext(ctx, network, server)
+				if err == nil \{
+					return conn, nil
+				}
+				last = err
+			}
+			return nil, last
+		}
+		`,
+		// Read again whenever the file has been written, which is what makes a
+		// handset moving between networks keep working: the host rewrites it and
+		// the next lookup sees the new servers.
+		`
+		var resolverMu sync.Mutex
+		var resolverStamp time.Time
+		var resolverCache []string
+
+		func resolvers() []string \{
+			path := resolverFile()
+			if path == "" \{
+				return nil
+			}
+			resolverMu.Lock()
+			defer resolverMu.Unlock()
+			at, err := os.Stat(path)
+			if err != nil \{
+				resolverCache = nil
+				resolverStamp = time.Time\{}
+				return nil
+			}
+			if at.ModTime().Equal(resolverStamp) \{
+				return resolverCache
+			}
+			body, err := os.ReadFile(path)
+			if err != nil \{
+				return resolverCache
+			}
+			resolverStamp = at.ModTime()
+			resolverCache = resolverAddresses(string(body))
+			return resolverCache
+		}
+
+		func resolverFile() string \{
+			home, err := os.UserHomeDir()
+			if err != nil \{
+				return ""
+			}
+			return filepath.Join(home, ".hive", "resolvers")
+		}
+		`,
+		// One address a line, a blank line or a `#` ignored. A port is added where
+		// none was written — SplitHostPort refuses both a bare v4 address and a
+		// bare v6 one, and JoinHostPort brackets the second.
+		`
+		func resolverAddresses(text string) []string \{
+			var out []string
+			for _, line := range strings.Split(text, "\n") \{
+				line = strings.TrimSpace(line)
+				if line == "" || strings.HasPrefix(line, "#") \{
+					continue
+				}
+				if _, _, err := net.SplitHostPort(line); err != nil \{
+					line = net.JoinHostPort(line, "53")
+				}
+				out = append(out, line)
+			}
+			return out
+		}
+		`
+	], "\n\n")
+}
+
 func netSource(): Str {
 	return join([
 		// ---------------------------------------------------------------------------
@@ -6421,6 +6553,15 @@ func syslinkNetSource(): Str {
 			if err != nil \{
 				return syslinkErr[string]("NoListener", "could not listen on port "+port+": "+err.Error())
 			}
+		`,
+		// A node is identified by where it can be dialed, so a port the kernel chose
+		// replaces the 0 that asked for it. The host is left as written — what this
+		// machine advertises is the program's to answer, with hive.net.localAddress.
+		`
+			if shown := ln.Addr().String(); strings.LastIndex(shown, ":") >= 0 \{
+				bound := shown[strings.LastIndex(shown, ":")+1:]
+				endpoint = endpoint[:len(endpoint)-len(port)] + bound
+			}
 			nodeMu.Lock()
 			selfEndpoint = endpoint
 			nodeMu.Unlock()
@@ -7770,6 +7911,9 @@ func uiSource(): Str {
 					b.WriteString("padding:" + strconv.Itoa(a.Num) + "px;")
 				case "width":
 					b.WriteString("width:" + strconv.Itoa(a.Num) + "px;")
+					if kind == "row" || kind == "column" \{
+						b.WriteString("max-width:100%;")
+					}
 				case "height":
 					b.WriteString("height:" + strconv.Itoa(a.Num) + "px;")
 				case "align":
@@ -8729,18 +8873,22 @@ func uiSource(): Str {
 		// nothing detects it — the rule is always written, and a program with no such
 		// file serves a 404, the face is unavailable, and the stack falls through to
 		// the system's own. A miss costs one request and changes nothing.
+		//
+		// A coarse pointer is a finger: controls grow to a thumb's width and a field's
+		// text reaches 16px, below which a phone zooms on focus and never zooms back.
+		// Nothing here moves a box.
 		`
 		const uiCSS = ~BT~*,*::before,*::after\{box-sizing:border-box}
 		@font-face\{font-family:hive-own;font-weight:100 900;font-display:swap;
 		src:url("/_hive/asset/font.woff2") format("woff2")}
 		body\{margin:0;font:14px/1.5 hive-own,system-ui,-apple-system,"Segoe UI",sans-serif;
-		background:var(--bg);color:var(--fg)}
+		background:var(--bg);color:var(--fg);-webkit-text-size-adjust:100%}
 		:root\{--bg:#fff;--fg:#16181c;--muted:#5b6470;--line:#e3e6ea;--accent:#1d9bf0;
 		--good:#00a870;--warn:#c47d00;--danger:#d7263d;--surface:#f7f9fa}
 		@media (prefers-color-scheme:dark)\{:root\{--bg:#15181c;--fg:#e7e9ea;--muted:#8b98a5;
 		--line:#2f3336;--accent:#1d9bf0;--good:#00ba7c;--warn:#ffd400;--danger:#f4212e;
 		--surface:#1c2026}}
-		.h-root\{display:flex;flex-direction:column;min-height:100vh}
+		.h-root\{display:flex;flex-direction:column;min-height:100vh;min-height:100dvh}
 		.h-text\{white-space:pre-wrap;overflow-wrap:anywhere}
 		.h-size-title\{font-size:20px;font-weight:700}
 		.h-size-subtitle\{font-size:16px;font-weight:600}
@@ -8757,7 +8905,8 @@ func uiSource(): Str {
 		.h-link\{color:var(--accent);text-decoration:none}
 		.h-link:hover\{text-decoration:underline}
 		.h-button\{font:inherit;border:1px solid var(--line);background:var(--surface);
-		color:inherit;border-radius:999px;padding:6px 14px;cursor:pointer}
+		color:inherit;border-radius:999px;padding:6px 14px;cursor:pointer;
+		touch-action:manipulation}
 		.h-button:hover:not(:disabled)\{border-color:var(--accent);color:var(--accent)}
 		.h-button:disabled\{opacity:.5;cursor:default}
 		.h-button.h-tone-good\{background:var(--accent);border-color:var(--accent);color:#fff}
@@ -8769,7 +8918,8 @@ func uiSource(): Str {
 		.h-textarea\{resize:vertical;min-height:64px;width:100%}
 		.h-checkbox\{display:inline-flex;align-items:center;gap:6px;cursor:pointer}
 		.h-table\{border-collapse:collapse;width:100%}
-		.h-table th,.h-table td\{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
+		.h-table th,.h-table td\{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);
+		overflow-wrap:anywhere}
 		.h-table thead th\{position:sticky;top:0;background:var(--bg);font-weight:600}
 		.h-sortable,.h-pickable\{cursor:pointer}
 		.h-pickable:hover\{background:var(--surface)}
@@ -8779,7 +8929,7 @@ func uiSource(): Str {
 		.h-pinned>.h-overlay\{background:none;box-shadow:none;pointer-events:auto;
 		display:flex;max-height:none;border-radius:0}
 		.h-overlay\{background:var(--bg);border-radius:16px;max-height:85vh;overflow:auto;
-		box-shadow:0 12px 40px rgba(0,0,0,.3)}
+		max-width:calc(100vw - 24px);box-shadow:0 12px 40px rgba(0,0,0,.3)}
 		.h-spinner\{width:18px;height:18px;border:2px solid var(--line);
 		border-top-color:var(--accent);border-radius:50%;animation:h-spin .7s linear infinite}
 		@keyframes h-spin\{to\{transform:rotate(360deg)}}
@@ -8798,7 +8948,10 @@ func uiSource(): Str {
 		.h-aiming::before,.h-aiming::after\{content:"";position:absolute;left:50%;top:50%;
 		background:#fff;opacity:.8;pointer-events:none}
 		.h-aiming::before\{width:2px;height:15px;margin:-7px 0 0 -1px}
-		.h-aiming::after\{width:15px;height:2px;margin:-1px 0 0 -7px}~BT~
+		.h-aiming::after\{width:15px;height:2px;margin:-1px 0 0 -7px}
+		@media (pointer:coarse)\{.h-button,.h-select,.h-input:not([type=range])\{min-height:44px}
+		.h-checkbox\{min-height:44px}
+		.h-input,.h-textarea,.h-select\{font-size:16px}}~BT~
 		`,
 		// One running window: the page it last rendered, the sockets watching it, and
 		// the handlers the current page's ids stand for.
@@ -9105,6 +9258,12 @@ func uiSource(): Str {
 		// window never opened is untouched: nothing ever connected, so nothing left.
 		`
 		func (w *uiWindow) linger() \{
+			// Where a host owns the window, it is the one that ends the program, and
+			// a sleeping device can hold a socket quiet for minutes. Exiting on a
+			// quiet socket there would read as a crash.
+			if runtime.GOOS == "android" \{
+				return
+			}
 			time.Sleep(1500 * time.Millisecond)
 			w.mu.Lock()
 			gone := len(w.watchers) == 0
@@ -9527,6 +9686,13 @@ func uiSource(): Str {
 		// Silverblue and Bluefin desktop. Asked by id instead, they are there.
 		`
 		func uiOpen(url string) error \{
+			// A handset has no browser to launch and a host in front of it that
+			// opens the window itself. Said in a shape meant to be read rather than
+			// left to be picked out of prose.
+			if runtime.GOOS == "android" \{
+				fmt.Println("hive-window " + url)
+				return nil
+			}
 			arguments := uiAppArguments(url)
 			for _, candidate := range uiBrowsers() \{
 				path, err := exec.LookPath(candidate)

@@ -8,6 +8,7 @@
 // difference between a build and a run.
 import ./analyze
 import ./analyzereport
+import ./android
 import ./ast
 import ./check as checks
 import ./diag
@@ -19,6 +20,7 @@ import ./paths
 import ./progress
 import ./ranges
 import ./runtime
+import ./shim
 import ./text
 import ./vendor
 import hive.file
@@ -53,6 +55,12 @@ proc executableOf(entry: Str, target: Str): Str {
 		return paths.stem(entry) + goExe("")
 	}
 	return paths.stem(entry) + "-" + text.replace(target, "/", "-") + goExe(target)
+}
+
+// What the app a program is packaged into is called. An app is always for a
+// platform, so the name always says which one.
+func apkOf(entry: Str, target: Str): Str {
+	return paths.stem(entry) + "-" + text.replace(target, "/", "-") + ".apk"
 }
 
 // What the Go toolchain calls an executable for `target` — `""` everywhere but
@@ -362,6 +370,76 @@ proc placeResource(entry: Str, written: Written, target: Str, from: Int): Result
 		return Result.Error(diag.about(entry, "the icon in `assets/icon.png` could not be written into the executable. It said:\n\n" + indented(made.output)))
 	}
 	return Result.Ok(true)
+}
+
+// The app, as one signed file. The generator is written into the build, run once
+// and removed, the same way the icon's resource object is — and for this machine,
+// while what it writes is for the target.
+proc placeApk(entry: Str, written: Written, out: Str, from: Int): Result<Bool, diag.Diagnostic> {
+	progress.step(from, "apk")
+	mut Str[dyn] wrote = []
+	mut diag.Diagnostic[dyn] failed = []
+	generator := paths.joinPath(written.directory, "apk")
+	put(generator, "main.go", android.generatorSource() + "\n", wrote, failed)
+	put(generator, android.dexFile(), shim.dexHex() + "\n", wrote, failed)
+	for each why in failed {
+		removeTree(generator)
+		return Result.Error(why)
+	}
+
+	// The generator runs with the build directory as its own, so what it reads is
+	// named from inside it. An app shipping no icon says so with an empty name.
+	mut Str carried = ""
+	source := icon.iconOf(entry)
+	if source != "" {
+		carried = paths.joinPath("apk", android.iconFile())
+		if hive.file.copy(source, paths.joinPath(written.directory, carried)) is Result.Error(why) {
+			removeTree(generator)
+			return Result.Error(diag.about(source, "cannot copy `{source}` into the build: {why.message}"))
+		}
+	}
+
+	name := paths.stem(entry)
+	made := toolchain(["run", "./apk", paths.joinPath("..", out), name, name, "1", "1",
+		payloadName(), paths.joinPath("apk", android.dexFile()), carried], written.directory, "")
+	removeTree(generator)
+	if made.code != 0 {
+		return Result.Error(diag.about(entry, "`{paths.baseOf(entry)}` could not be packaged. It said:\n\n" + indented(made.output)))
+	}
+	return Result.Ok(true)
+}
+
+// The program inside the app. It stays in the build directory, because what
+// belongs beside the entrypoint is the app rather than a binary nothing on this
+// machine can run.
+func payloadName(): Str {
+	return "payload"
+}
+
+// `export`: the program compiled for the target, wrapped in the app that starts
+// it. A program with no window is refused rather than packaged — an app with no
+// activity has no way to be started and nothing to show.
+proc export(entry: Str, target: Str, from: Int): Written {
+	written := build(entry, false, from)
+	if len(written.errors) > 0 {
+		return written
+	}
+	if written.windowed == false {
+		return Written(written.directory, written.files, written.thirdParty, written.windowed,
+			[diag.about(entry, "`{paths.baseOf(entry)}` opens no window, so there is nothing for an app to show and no way to start it. `hive build` is what compiles a program that serves or prints.")])
+	}
+	if resolveDeps(written, from) is Result.Error(why) {
+		return Written(written.directory, written.files, written.thirdParty, written.windowed, [why])
+	}
+	progress.step(from, "go build" + saying(target))
+	made := toolchain(["build"] + compact(false) + ["-o", payloadName(), "."], written.directory, target)
+	if made.code != 0 {
+		return Written(written.directory, written.files, written.thirdParty, written.windowed, [goFailed(entry, made)])
+	}
+	if placeApk(entry, written, apkOf(entry, target), from) is Result.Error(why) {
+		return Written(written.directory, written.files, written.thirdParty, written.windowed, [why])
+	}
+	return written
 }
 
 // One directory copied into another, everything under it with it. The answer is how

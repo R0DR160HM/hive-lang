@@ -2,8 +2,20 @@
 
 ## v0.2.7
 
+### Building
+
+* **`hive export <entrypoint.hive> --target android/arm64`** writes an installable app. The program is the same one `hive build` writes; what the handset needs to start it — a WebView host, a binary manifest, a resource table, an aligned archive and an APK Signature Scheme v2 signature over it — the build writes itself. **No Android SDK and no network**, the way the Windows resource object is written. The application id comes from the entrypoint, so `chat.hive` is `hive.chat`, and the signing key is made on first use at `~/.hive/android.key` so a later build installs over an earlier one.
+* `android/arm64` is the only Android target, being the only one Go links without a C cross-compiler; the other three are refused by name. A program that opens no window is refused too — an app with no window has nothing to show and no way to start.
+
+### Standard library
+
+* **A window is usable with a finger.** Where the pointer is coarse, a button, a field and a checkbox stand at least 44px tall and a field's text is 16px — below which a phone zooms the page on focus and never zooms back. A dialog no longer runs wider than the screen it is on. **No layout moves:** a `row` is a row at every width, on every device.
+* **`width` on a `row` or a `column` is held to the space there is**, where a `width(460)` box on a 360px screen made the whole page 460 wide and every window on a handset opened zoomed out. A `canvas`, a `scene` and an `image` keep the width they asked for, since one wider than the box showing it is what `scroll(Horizontal)` is for.
+
 ### Fixes
 
+* **An import of a library module this compiler does not carry is refused at the import**, where it loaded nothing and said nothing: the standard library names no file, so `import hive.jsno` compiled and the error arrived later against every use of the alias instead of against the line that got it wrong. An import naming something *inside* a module is answered as that rather than as a mistake about names — no alias makes `import hive.ui.View` right.
+* **`hive.syslink.listen` answers with the port it bound**, where a `0` asking the kernel to choose was handed straight back and `node()` went on telling peers to dial `:0`. The host is untouched — which address a machine advertises stays the program's to answer, with `hive.net.localAddress`.
 * **A declaration of your own is what a bare call answers with**, where inference handed back the shadowed builtin's result type and every typed position was held to that instead.
 * A declared `append`, `prepend`, `drop` or `sort` called as a statement is an ordinary call, where it lowered to the builtin's own statement and the Go toolchain refused what came out.
 * `hive.append(v, x)` stands as a statement of its own while a binding of your own shadows `append`, where the long name was turned down for the short one's reason.

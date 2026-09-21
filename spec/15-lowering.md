@@ -160,8 +160,49 @@ Windows is the only platform whose executables carry an icon at all; a build for
 anywhere else writes no object, and a windowed program's window links the same
 image whatever the platform ([14.15](14-stdlib.md#1415-hiveui)).
 
-`--target` is a flag of `build`. `check` and `emit` compile nothing, `test` and
+`--target` is a flag of `build` and of `export`, the two commands that write
+something for a platform. `check` and `emit` compile nothing, `test` and
 `container` are about this machine, and each of them **refuses** the flag rather
 than accepting and ignoring it. `run` is the exception that proves it: everything
 after the entrypoint there belongs to the program being run, so `--target` is
 passed straight through to it, unread.
+
+## 15.7 Packaging an app
+
+`hive build` writes a program. **`hive export` writes an app** — the same program
+with the one thing a handset needs to start it:
+
+```
+hive export chat.hive --target android/arm64
+```
+
+writes `chat-android-arm64.apk`, installable as it stands.
+
+**The window needs nothing new.** A `hive.ui.window` already serves its own page
+over loopback with every asset embedded ([14.15](14-stdlib.md#1415-hiveui)), so
+what shows it on a handset is the WebView the platform already has. The program
+is not told it is on a phone; it serves the tree it would serve a browser.
+
+**`android/arm64` and no other Android target.** It is the only one Go links
+without a C cross-compiler — the one thing a machine with the Go toolchain on it
+cannot be assumed to have — so `android/386`, `android/amd64` and `android/arm`
+are **refused by name** rather than failing ten seconds later in a language
+nobody here wrote. It is also what a handset is.
+
+**A program with no window is refused.** An app whose activity shows nothing has
+no way to be started and nothing to see, so `export` says so and stops; `hive
+build` is what compiles a program that serves or prints.
+
+**What the file holds.** The program as `lib/arm64-v8a/libhiveapp.so` — named
+that because only a `lib*.so` is extracted into the one directory an app may
+execute from — beside a fixed WebView host, a binary `AndroidManifest.xml`, and
+`assets/icon.png` as the launcher icon where the program ships one. The
+application id is derived from the entrypoint, so `chat.hive` is `hive.chat`.
+
+**Nothing but Go is needed.** The manifest, the resource table, the archive and
+its signature are written by the build itself, the way the Windows resource
+object is ([15.6](#156-building-for-another-platform)): no Android SDK, and no
+network. The signature is APK Signature Scheme v2 under a key kept beside the
+syslink cluster secret at `~/.hive/android.key`, generated on first use — one
+stable key a machine over, so a later build installs over an earlier one instead
+of being refused as a different app.
