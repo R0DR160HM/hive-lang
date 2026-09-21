@@ -33,6 +33,7 @@ the language it compiles.
 ./hive emit      <entrypoint.hive>    print the generated Go
 ./hive build     <entrypoint.hive>    compile to a native executable
 ./hive build     <entrypoint.hive> --target <goos>/<goarch>
+./hive export    <entrypoint.hive> --target android/arm64   package as an app
 ./hive container <entrypoint.hive>    write a Dockerfile that builds and runs it
 ./hive agents                         write .hivedocs/ for a coding agent to read
 ./hive version                        which release this compiler is

@@ -12,6 +12,7 @@ import android.view.WindowInsets;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.FrameLayout;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -39,9 +40,6 @@ public class MainActivity extends Activity {
 		super.onCreate(state);
 
 		view = new WebView(this);
-		view.setLayoutParams(new ViewGroup.LayoutParams(
-			ViewGroup.LayoutParams.MATCH_PARENT,
-			ViewGroup.LayoutParams.MATCH_PARENT));
 		WebSettings settings = view.getSettings();
 		settings.setJavaScriptEnabled(true);
 		settings.setDomStorageEnabled(true);
@@ -50,10 +48,14 @@ public class MainActivity extends Activity {
 		settings.setMediaPlaybackRequiresUserGesture(false);
 		view.setWebViewClient(new WebViewClient());
 
-		// An app targeting API 35 is laid out edge to edge whether it asked to be, so
-		// the bars' own space is handed to the page as padding. Without this a
-		// column's first row sits under the clock.
-		view.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
+		// API 35 lays an app out edge to edge whether it asked to be. The padding goes
+		// on the frame, not the WebView: padding a WebView insets what it draws without
+		// changing the size it reports, so 100dvh would still cover the navigation bar.
+		FrameLayout frame = new FrameLayout(this);
+		frame.addView(view, new FrameLayout.LayoutParams(
+			ViewGroup.LayoutParams.MATCH_PARENT,
+			ViewGroup.LayoutParams.MATCH_PARENT));
+		frame.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
 			public WindowInsets onApplyWindowInsets(View v, WindowInsets insets) {
 				v.setPadding(
 					insets.getSystemWindowInsetLeft(),
@@ -64,7 +66,7 @@ public class MainActivity extends Activity {
 			}
 		});
 
-		setContentView(view);
+		setContentView(frame);
 
 		Thread runner = new Thread(new Runnable() {
 			public void run() {

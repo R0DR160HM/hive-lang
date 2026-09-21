@@ -678,6 +678,14 @@ text is 16px — below which a phone zooms the page on focus and never zooms bac
 view says is what it says, and a window that wants to answer its own size has
 the attributes to say so.
 
+**`width` on a `row` or a `column` is a width, not a floor.** A layout box is
+never wider than the space it is given, so `width(460)` is 460 where there is
+room and the screen's width where there is not — a box wider than the window is
+the one thing that makes a whole page need zooming out, and it is always a
+mistake. **Everything else keeps the width it asked for**: a `canvas`, a `scene`
+or an `image` inside a `scroll(Horizontal)` is meant to be wider than what shows
+it, and that is what scrolling one sideways means.
+
 `on` and `onDismiss` carry the message itself; the rest carry a **function** of
 what the user did, which is what a constructor with a hole is for:
 `ui.onInput(Msg.Changed(_))`.
