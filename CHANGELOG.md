@@ -2,8 +2,13 @@
 
 ## v0.2.7
 
+### Standard library
+
+* **A window is usable with a finger.** Where the pointer is coarse, a button, a field and a checkbox stand at least 44px tall and a field's text is 16px — below which a phone zooms the page on focus and never zooms back. A dialog no longer runs wider than the screen it is on. **No layout moves:** a `row` is a row at every width, on every device.
+
 ### Fixes
 
+* **`hive.syslink.listen` answers with the port it bound**, where a `0` asking the kernel to choose was handed straight back and `node()` went on telling peers to dial `:0`. The host is untouched — which address a machine advertises stays the program's to answer, with `hive.net.localAddress`.
 * **A declaration of your own is what a bare call answers with**, where inference handed back the shadowed builtin's result type and every typed position was held to that instead.
 * A declared `append`, `prepend`, `drop` or `sort` called as a statement is an ordinary call, where it lowered to the builtin's own statement and the Go toolchain refused what came out.
 * `hive.append(v, x)` stands as a statement of its own while a binding of your own shadows `append`, where the long name was turned down for the short one's reason.

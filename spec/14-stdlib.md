@@ -474,6 +474,14 @@ with one of its own messages, which makes a mailbox type the whole protocol.
   `monitor(from, target, message)`.
 * `listen(endpoint)`, `node()`, `peers()`.
 
+**`listen` answers with the endpoint a peer should dial**, which is not always the
+one it was given: a port of `0` asks the kernel to choose, and what comes back —
+and what `node()` reports from then on — carries the number it chose. A node is
+identified by where it can be reached, so `":0"` is not something a peer could be
+told. The host is left exactly as written: which address this machine advertises
+is the program's to answer, with [`hive.net.localAddress`](#149-hivenet), and not
+something a listener should guess.
+
 **A service name is an atom**, which is what lets the compiler know the whole
 registry, and a named address is the only kind that **survives its service being
 restarted**. A **node has no name**: it is identified by the endpoint it can be
@@ -662,6 +670,13 @@ all.
 
 A scene takes attributes of its own — a camera, a sky, and the events a game
 needs — and so do the shapes in one. They are [14.16](#1416-hiveuiscene).
+
+**A finger is not a mouse, and the stylesheet knows.** Where the pointer is
+coarse, a button, a field and a checkbox are at least 44px tall and a field's
+text is 16px — below which a phone zooms the page on focus and never zooms back.
+**No layout moves:** a `row` is a row at every width, on every device. What a
+view says is what it says, and a window that wants to answer its own size has
+the attributes to say so.
 
 `on` and `onDismiss` carry the message itself; the rest carry a **function** of
 what the user did, which is what a constructor with a hole is for:

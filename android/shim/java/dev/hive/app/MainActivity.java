@@ -6,7 +6,9 @@ import android.net.LinkProperties;
 import android.net.Network;
 import android.os.Bundle;
 import android.util.Log;
+import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -47,6 +49,21 @@ public class MainActivity extends Activity {
 		// for a gesture at a time.
 		settings.setMediaPlaybackRequiresUserGesture(false);
 		view.setWebViewClient(new WebViewClient());
+
+		// An app targeting API 35 is laid out edge to edge whether it asked to be, so
+		// the bars' own space is handed to the page as padding. Without this a
+		// column's first row sits under the clock.
+		view.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
+			public WindowInsets onApplyWindowInsets(View v, WindowInsets insets) {
+				v.setPadding(
+					insets.getSystemWindowInsetLeft(),
+					insets.getSystemWindowInsetTop(),
+					insets.getSystemWindowInsetRight(),
+					insets.getSystemWindowInsetBottom());
+				return insets;
+			}
+		});
+
 		setContentView(view);
 
 		Thread runner = new Thread(new Runnable() {

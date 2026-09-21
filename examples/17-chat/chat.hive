@@ -4,18 +4,21 @@
 // to. There is no server: both processes run identical code, and nothing
 // distinguishes them but the addresses they are given.
 //
-// RUN IT — two terminals on one machine:
+// RUN IT — asked nothing, on any two machines sharing a network:
 //
-//   hive run chat.hive                       listens on 127.0.0.1:9100
-//   hive run chat.hive 127.0.0.1:9101        listens on 127.0.0.1:9101
+//   hive run chat.hive          listens on this machine's own address, on a
+//                               port the kernel picks
 //
-// The argument is where *this* node listens, and it is the only thing the two
-// terminals need to differ in. Who to talk to is asked for on screen: the lobby
-// has a field for the other node's address, filled in with the obvious guess, so
-// on one machine you type nothing at all.
+// Both windows show the endpoint they ended up on; type the other's into the
+// field. Nothing is configured and no number has to be agreed on beforehand,
+// which is what makes a handset and a desktop as easy as two terminals.
 //
-// Two machines on the same network work the same way — start each with its own
-// "ip:port" and type the other's into the field (the ports may then match).
+// Where it listens can still be said outright, which is what two nodes on *one*
+// machine want — a fixed port is then guessable, and the field fills itself in:
+//
+//   hive run chat.hive 127.0.0.1:9100
+//   hive run chat.hive 127.0.0.1:9101
+//
 // Every connection is TLS 1.3 either way; the two nodes only have to share a
 // cluster key, generated into ~/.hive/syslink.key on first run — copy that file
 // across, or set HIVE_SYSLINK_KEY the same in both.
@@ -228,7 +231,7 @@ func lobby(model: Model): ui.View {
 			[
 				ui.onInput(Msg.PeerTyped(_)),
 				ui.onSubmit(joinedOf),
-				ui.placeholder("127.0.0.1:9101")
+				ui.placeholder("192.168.0.10:54321")
 			],
 			model.peer
 		),
@@ -601,16 +604,33 @@ func facing(mine: Str): Str {
 
 proc main(): void {
 	args := hive.term.args()
-	mut Str mine = "127.0.0.1:9100"
+
+	// Nothing said: the address other machines reach this one on, and a port
+	// asked for as 0 so the kernel names it. Loopback is deliberately not an
+	// answer to `localAddress`, so a machine holding only 127.0.0.1 says so here
+	// instead and talks to itself.
+	mut Str mine = ""
 	if args bounds 0 {
 		mine = args[0]
+	} else {
+		mut Str host = "127.0.0.1"
+		if hive.net.localAddress() is Result.Ok(reachable) {
+			host = reachable
+		}
+		mine = "{host}:0"
 	}
 
 	// The node starts accepting before the window opens. A node has no name — it
 	// is identified by where it is — so this endpoint is ordinary runtime data
 	// and a peer list is something a program can compute, read from a file or
 	// resolve through DNS.
-	if hive.syslink.listen(mine) is Result.Error(problem) {
+	//
+	// `listen` answers with the endpoint a peer should dial, which is where a 0
+	// becomes the port it actually got.
+	listening := hive.syslink.listen(mine)
+	if listening is Result.Ok(reachable) {
+		mine = reachable
+	} else if listening is Result.Error(problem) {
 		panic problem
 	}
 	echo "listening on {mine}"

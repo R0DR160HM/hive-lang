@@ -1,0 +1,43 @@
+#!/bin/sh
+# Builds classes.dex, the WebView host every Hive app carries.
+#
+# It is the same dex in every app — an activity's Java package and an
+# application's id are allowed to disagree — so this runs in CI when the shim
+# changes and never on the machine of somebody compiling a Hive program.
+#
+# Needs a JDK and an Android SDK; neither is a dependency of Hive itself.
+set -eu
+
+here=$(dirname "$0")
+sdk=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$LOCALAPPDATA/Android/Sdk}}
+api=${HIVE_ANDROID_API:-35}
+tools=${HIVE_ANDROID_BUILD_TOOLS:-35.0.0}
+
+jar="$sdk/platforms/android-$api/android.jar"
+[ -f "$jar" ] || { echo "shim: no android.jar at $jar" >&2; exit 1; }
+
+# The SDK's own launchers are .bat on Windows and extensionless everywhere else.
+d8="$sdk/build-tools/$tools/d8"
+[ -x "$d8" ] || d8="$d8.bat"
+[ -f "$d8" ] || { echo "shim: no d8 at $d8" >&2; exit 1; }
+
+classes="$here/classes"
+rm -rf "$classes"
+mkdir -p "$classes"
+
+# -source/-target 8 keeps d8 from having to desugar more than it must.
+find "$here/java" -name '*.class' -delete
+javac -nowarn -source 8 -target 8 -bootclasspath "$jar" -classpath "$jar" \
+	-d "$classes" $(find "$here/java" -name '*.java')
+
+# EVERY class file, not just the named ones: javac emits an anonymous class as a
+# file of its own, and a dex missing one fails at runtime rather than at build
+# time, with NoClassDefFoundError on the line that needed it.
+found=$(find "$classes" -name '*.class' | sort)
+echo "shim: dexing"
+echo "$found" | sed 's/^/  /'
+
+# shellcheck disable=SC2086
+"$d8" --min-api 24 --lib "$jar" --output "$here" $found
+
+ls -l "$here/classes.dex"
