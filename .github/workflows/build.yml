@@ -171,51 +171,24 @@ jobs:
   # compiled on the machine of somebody building a Hive program — so this is
   # where it is held against the Java it is supposed to have come from.
   #
-  # A job of its own: it shares no step with the chain, and a runner that cannot
-  # produce a dex should say so plainly rather than failing a compile.
+  # A job of its own, and a short one: `--check` rebuilds nothing, so it wants
+  # neither a JDK nor an Android SDK.
+  #
+  # It does not compare the dex against a freshly built one, because that is not
+  # a comparison a repository can hold: javac and d8 emit different bytes for
+  # the same Java on different machines, and which version of each a runner has
+  # is not something to pin and hope. What it holds instead are two things that
+  # are exact everywhere — that `src/shim.hive` carries the committed dex byte
+  # for byte, and that the dex records the Java it was built from.
   shim:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      # Pinned, because what is committed is `d8`'s output byte for byte. A
-      # different release of the build tools may dex identical Java differently,
-      # and then this job fails on a difference nobody made.
-      HIVE_ANDROID_API: '35'
-      HIVE_ANDROID_BUILD_TOOLS: '35.0.0'
+    timeout-minutes: 5
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: The build tools the shim is dexed with
-        run: |
-          sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
-          if [ -z "$sdk" ]; then
-            echo "::error::this runner has no Android SDK, so the shim cannot be dexed here."
-            exit 1
-          fi
-          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
-          if [ -f "$sdk/build-tools/$HIVE_ANDROID_BUILD_TOOLS/d8" ]; then
-            echo "build-tools $HIVE_ANDROID_BUILD_TOOLS is already on this runner"
-            exit 0
-          fi
-          yes | "$sdk/cmdline-tools/latest/bin/sdkmanager" \
-            "platforms;android-$HIVE_ANDROID_API" \
-            "build-tools;$HIVE_ANDROID_BUILD_TOOLS" >/dev/null
-
-      # `android/shim/build` writes both files from `android/shim/java`. If
-      # either comes out unlike what is committed, the shim inside the compiler
-      # is not the one this Java builds — and every app it packages would carry
-      # a host nobody reviewed.
-      - name: The dex the compiler carries is the one this source builds
-        run: |
-          sh android/shim/build
-          if git diff --quiet -- android/shim/classes.dex src/shim.hive; then
-            echo "src/shim.hive is the dex android/shim/java builds"
-            exit 0
-          fi
-          git diff --stat -- android/shim/classes.dex src/shim.hive
-          echo "::error file=src/shim.hive::the shim the compiler carries is not what android/shim/java builds. Run 'sh android/shim/build' and commit android/shim/classes.dex and src/shim.hive together. If the Java did not change, the build tools did: this job pins $HIVE_ANDROID_BUILD_TOOLS, and d8 is not promised to dex identical source identically across releases."
-          exit 1
+      - name: The shim the compiler carries matches its source
+        run: sh android/shim/build --check
 
   # The same compiler on the platform that spells a path differently. It runs the
   # `hivec-windows-amd64.exe` the job above cross-compiled — the file a release
