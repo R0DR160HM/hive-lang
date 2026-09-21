@@ -16,6 +16,7 @@ import android.widget.FrameLayout;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStreamReader;
 import java.net.InetAddress;
 import java.util.List;
@@ -31,6 +32,9 @@ public class MainActivity extends Activity {
 	// The payload is named lib*.so so the installer extracts it into
 	// nativeLibraryDir, which is the one directory in an app that is executable.
 	private static final String PAYLOAD = "libhiveapp.so";
+
+	// What the runtime prints where it has no browser to launch.
+	private static final String WINDOW = "hive-window ";
 
 	private WebView view;
 	private Process child;
@@ -68,6 +72,10 @@ public class MainActivity extends Activity {
 
 		setContentView(frame);
 
+		// Before the program starts, so its first lookup has somewhere to go.
+		writeResolvers();
+		watchNetwork();
+
 		Thread runner = new Thread(new Runnable() {
 			public void run() {
 				serve();
@@ -90,15 +98,10 @@ public class MainActivity extends Activity {
 			built.redirectErrorStream(true);
 
 			Map<String, String> environment = built.environment();
-			// hive.env reads .env against the working directory and syslink keeps
-			// its cluster key under $HOME, so both are pointed at the app's own
-			// storage rather than at "/".
+			// hive.env reads .env against the working directory; syslink's cluster
+			// key and the resolvers written below both live under $HOME.
 			environment.put("HOME", home.getAbsolutePath());
 			environment.put("TMPDIR", getCacheDir().getAbsolutePath());
-			String resolvers = resolvers();
-			if (!resolvers.isEmpty()) {
-				environment.put("HIVE_DNS", resolvers);
-			}
 
 			child = built.start();
 
@@ -108,12 +111,9 @@ public class MainActivity extends Activity {
 			boolean opened = false;
 			while ((line = out.readLine()) != null) {
 				Log.i(TAG, line);
-				if (!opened) {
-					String url = addressIn(line);
-					if (url != null) {
-						opened = true;
-						show(url);
-					}
+				if (!opened && line.startsWith(WINDOW)) {
+					opened = true;
+					show(line.substring(WINDOW.length()).trim());
 				}
 			}
 			Log.i(TAG, "hive: the program ended");
@@ -130,51 +130,72 @@ public class MainActivity extends Activity {
 		});
 	}
 
-	// The line the runtime prints when it could not launch a browser of its own,
-	// which on a handset is every time. Stage 3 replaces this with a line meant
-	// to be read rather than one meant to be helpful.
-	private static String addressIn(String line) {
-		int at = line.indexOf("http://127.0.0.1:");
-		if (at < 0) {
-			return null;
-		}
-		String rest = line.substring(at);
-		int space = rest.indexOf(' ');
-		if (space >= 0) {
-			rest = rest.substring(0, space);
-		}
-		return rest;
-	}
-
-	// Go's pure resolver has no /etc/resolv.conf to read here, so the servers
-	// the platform is using are handed over for it to dial directly.
-	private String resolvers() {
-		StringBuilder said = new StringBuilder();
+	// Go's resolver has no /etc/resolv.conf to read here, so the addresses this
+	// network is using are written where it does look: $HOME/.hive/resolvers,
+	// one a line. The runtime reads it again whenever it has been written.
+	private void writeResolvers() {
 		try {
 			ConnectivityManager manager =
 				(ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
 			if (manager == null) {
-				return "";
+				return;
 			}
 			Network active = manager.getActiveNetwork();
-			if (active == null) {
-				return "";
-			}
-			LinkProperties properties = manager.getLinkProperties(active);
-			if (properties == null) {
-				return "";
-			}
-			List<InetAddress> servers = properties.getDnsServers();
-			for (InetAddress server : servers) {
-				if (said.length() > 0) {
-					said.append(",");
+			LinkProperties properties =
+				active == null ? null : manager.getLinkProperties(active);
+
+			StringBuilder said = new StringBuilder();
+			if (properties != null) {
+				List<InetAddress> servers = properties.getDnsServers();
+				for (InetAddress server : servers) {
+					said.append(server.getHostAddress()).append("\n");
 				}
-				said.append(server.getHostAddress());
+			}
+
+			File file = new File(new File(getFilesDir(), ".hive"), "resolvers");
+			File parent = file.getParentFile();
+			if (parent != null) {
+				parent.mkdirs();
+			}
+			FileOutputStream to = new FileOutputStream(file);
+			try {
+				to.write(said.toString().getBytes("UTF-8"));
+			} finally {
+				to.close();
 			}
 		} catch (Exception why) {
-			Log.w(TAG, "hive: no resolvers — " + why);
+			Log.w(TAG, "hive: could not write the resolvers — " + why);
 		}
-		return said.toString();
+	}
+
+	// A handset moves between networks and the servers move with it. Rewriting
+	// the file is the whole of the update: the program reads it again itself.
+	private void watchNetwork() {
+		try {
+			ConnectivityManager manager =
+				(ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+			if (manager == null) {
+				return;
+			}
+			manager.registerDefaultNetworkCallback(new ConnectivityManager.NetworkCallback() {
+				@Override
+				public void onAvailable(Network network) {
+					writeResolvers();
+				}
+
+				@Override
+				public void onLost(Network network) {
+					writeResolvers();
+				}
+
+				@Override
+				public void onLinkPropertiesChanged(Network network, LinkProperties properties) {
+					writeResolvers();
+				}
+			});
+		} catch (Exception why) {
+			Log.w(TAG, "hive: cannot watch the network — " + why);
+		}
 	}
 
 	@Override
@@ -186,7 +207,9 @@ public class MainActivity extends Activity {
 		super.onBackPressed();
 	}
 
-	// Closing the window ends the program, the same as it does on a desktop.
+	// Closing the window ends the program, the same as it does on a desktop. The
+	// runtime no longer ends itself when its socket goes quiet — a sleeping
+	// device can hold one quiet for minutes — so this is what stops it.
 	@Override
 	protected void onDestroy() {
 		if (child != null) {

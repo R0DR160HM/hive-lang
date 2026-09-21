@@ -14,6 +14,7 @@
 
 ### Fixes
 
+* **An import of a library module this compiler does not carry is refused at the import**, where it loaded nothing and said nothing: the standard library names no file, so `import hive.jsno` compiled and the error arrived later against every use of the alias instead of against the line that got it wrong. An import naming something *inside* a module is answered as that rather than as a mistake about names — no alias makes `import hive.ui.View` right.
 * **`hive.syslink.listen` answers with the port it bound**, where a `0` asking the kernel to choose was handed straight back and `node()` went on telling peers to dial `:0`. The host is untouched — which address a machine advertises stays the program's to answer, with `hive.net.localAddress`.
 * **A declaration of your own is what a bare call answers with**, where inference handed back the shadowed builtin's result type and every typed position was held to that instead.
 * A declared `append`, `prepend`, `drop` or `sort` called as a statement is an ordinary call, where it lowered to the builtin's own statement and the Go toolchain refused what came out.
