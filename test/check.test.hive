@@ -788,6 +788,56 @@ test "a walk that is right is left alone" {
 	assert problemCount("func ok(n: Int): Result<Int, Bool> \{ return Result.Ok(n) }\n" + inMain("echo filterMap([1, 2], ok)")) == 0
 }
 
+// --- A declaration of your own wins ------------------------------------------
+//
+// [13](../spec/13-builtins.md): a `func`, `proc` or type named after a builtin
+// is what a bare call means, with its own arity and its own result. Inference,
+// the checker and the emitter each used to decide that for themselves, and
+// inference decided it the other way round — so the declaration was called and
+// the *builtin's* result type was the one every typed position was held to.
+
+// A whole program wrapped around one test body, which is where this was
+// reported: `assert` compares two types, so a test says out loud what ordinary
+// code can leave unsaid.
+func inTest(body: Str): Str {
+	return "test \"it holds\" \{ " + body + " }"
+}
+
+func shadowingLen(body: Str): Str {
+	return "func len(label: Str, extra: Int): Str \{ return \"\{label}\{extra}\" }\n" + body
+}
+
+test "a shadowing declaration's result type is its own, not the builtin's" {
+	assert problemCount(shadowingLen(inMain("Str s = len(\"x\", 2)  echo s"))) == 0
+	// The proof it is the declaration's `Str` and not the builtin's `Int`.
+	assert opens(problem(shadowingLen(inMain("Int n = len(\"x\", 2)  echo n"))),
+		"in `main`: the declaration of `n` wants Int and this is Str")
+}
+
+test "and it is its own inside a test, where the builtin's used to win" {
+	assert problemCount(shadowingLen(inTest("assert len(\"x\", 2) == \"x2\""))) == 0
+	assert problemCount(shadowingLen(inTest("Str s = len(\"x\", 2)  assert s == \"x2\""))) == 0
+}
+
+test "the long name still reaches the builtin whatever was declared" {
+	assert problemCount(shadowingLen(inMain("Str[dyn] v = [\"a\"]  Int n = hive.len(v)  echo n"))) == 0
+	assert problemCount(shadowingLen(inTest("Str[dyn] v = [\"a\"]  assert hive.len(v) == 1"))) == 0
+}
+
+test "a shadowing declaration is held to its own arity" {
+	assert opens(problem(shadowingLen(inMain("echo len(\"x\")"))),
+		"in `main`: `len` takes 2 arguments, and this call passes 1 argument")
+}
+
+test "async fires off a declaration named after a builtin like any other" {
+	assert problemCount("proc append(a: Str, b: Str): void \{ echo a + b }
+"
+		+ inMain("async append(\"x\", \"y\")")) == 0
+	// And still refuses the builtin itself.
+	assert opens(problem(inMain("Int[dyn] v = []  async len(v)")),
+		"in `main`: `async` cannot fire off the builtin `len`")
+}
+
 // --- What a builtin takes ----------------------------------------------------
 //
 // Every builtin has a signature ([13](../spec/13-builtins.md)); every one of

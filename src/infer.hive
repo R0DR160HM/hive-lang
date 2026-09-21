@@ -295,14 +295,7 @@ func callType(env: Env, callee: ast.Expr, args: ast.Arg[]): types.Ty {
 	argTypes := typesOfArgs(env, args)
 
 	if callee is ast.Expr.Ident(name) {
-		if isBound(env, name) == false {
-			builtin := builtinResult(env, name, argTypes, args)
-			if builtin is types.Ty.TUnknown {
-				return identCallType(env, name, argTypes)
-			}
-			return builtin
-		}
-		return resultOfFn(lookup(env, name))
+		return identCallType(env, name, argTypes, args)
 	}
 	if callee is ast.Expr.Member(subject, field) {
 		return memberCallType(env, subject, field, argTypes, args)
@@ -310,13 +303,24 @@ func callType(env: Env, callee: ast.Expr, args: ast.Arg[]): types.Ty {
 	return resultOfFn(typeOf(env, callee))
 }
 
-func identCallType(env: Env, name: Str, argTypes: types.Ty[]): types.Ty {
-	if types.findCallable(env.table, name) is Result.Ok(info) {
+func identCallType(env: Env, name: Str, argTypes: types.Ty[], args: ast.Arg[]): types.Ty {
+	target := callTarget(env, name)
+	if target is CallTarget.Bound {
+		return resultOfFn(lookup(env, name))
+	}
+	if target is CallTarget.Declared(info) {
 		return types.resolve(env.table, info.result)
 	}
-	// A struct is built by calling its own name.
-	if types.findType(env.table, name) is Result.Ok(_) {
+	// A struct is built by calling its own name, and so — wrongly, and reported
+	// as such — is a union.
+	if target is CallTarget.Struct(_) {
 		return types.Ty.TNamed(name)
+	}
+	if target is CallTarget.Union {
+		return types.Ty.TNamed(name)
+	}
+	if target is CallTarget.Builtin {
+		return builtinResult(env, name, argTypes, args)
 	}
 	return types.Ty.TUnknown()
 }
@@ -486,6 +490,46 @@ func typeAt(tys: types.Ty[], index: Int): types.Ty {
 		return tys[index]
 	}
 	return types.Ty.TUnknown()
+}
+
+// --- What a bare name in call position means ---------------------------------
+
+// A local binding wins, then a declaration of your own, then a struct's own
+// name, then the builtin (13). Inference, the checker, the emitter and the
+// analyser all have to agree on that order, so it is written down once here
+// rather than spelled out — and got wrong — in each of them.
+type CallTarget {
+	// A parameter or a local binding holds what is being called.
+	Bound
+	// A `func`, `proc`, `query` or foreign function of your own.
+	Declared { info: types.CallableInfo }
+	// A struct, which is built by calling its own name.
+	Struct { fields: ast.Field[dyn] }
+	// One of the global builtins, shadowed by none of the above.
+	Builtin
+	// A tagged union: the name itself is not callable, a variant is.
+	Union
+	// Nothing in scope declared it.
+	Unknown
+}
+
+func callTarget(env: Env, name: Str): CallTarget {
+	if isBound(env, name) {
+		return CallTarget.Bound()
+	}
+	if types.findCallable(env.table, name) is Result.Ok(info) {
+		return CallTarget.Declared(info)
+	}
+	if types.fieldsOfStruct(env.table, name) is Result.Ok(fields) {
+		return CallTarget.Struct(fields)
+	}
+	if isBuiltin(name) {
+		return CallTarget.Builtin()
+	}
+	if types.findType(env.table, name) is Result.Ok(_) {
+		return CallTarget.Union()
+	}
+	return CallTarget.Unknown()
 }
 
 // --- The global builtins -----------------------------------------------------
