@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.8
+
+### Fixes
+
+* **An Android app asks for `ACCESS_NETWORK_STATE`**, where the manifest named only `INTERNET` and every `ConnectivityManager` call threw for want of it: no DNS servers were written to `$HOME/.hive/resolvers` and every lookup failed. Installing over an earlier app picks it up.
+
 ## v0.2.7
 
 ### Building

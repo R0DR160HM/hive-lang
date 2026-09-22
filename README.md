@@ -19,7 +19,7 @@ compile time instead.
 It is built for distributed systems from the start, secure by default — TLS
 between nodes, SQL values always bound as parameters, AES-256-GCM and HS256
 tokens in the standard library — and small enough to learn in a day:
-[a tour of the whole language](https://hive-tour.fly.dev) is fifty-four pages.
+[a tour of the whole language](https://hive-tour.fly.dev) is fifty-five pages.
 
 This directory holds the [specification](spec/) and a compiler for it written in
 the language it compiles.
