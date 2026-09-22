@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# A window driven over its own socket, and again from a headless Chrome when one
+# is installed. Skipped on Windows, whose window launches Edge from a fixed path.
+set -uo pipefail
+
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+hive="$here/../../hive"
+
+case "$(uname -s)" in
+MINGW* | MSYS* | CYGWIN*)
+	echo "  SKIP  windows are not driven on Windows"
+	exit 0
+	;;
+esac
+
+limit() {
+	if command -v timeout >/dev/null; then timeout "$@"; else shift; "$@"; fi
+}
+
+for program in page drive browser; do
+	if ! out="$("$hive" build "$here/$program.hive" 2>&1)"; then
+		echo "  FAIL  $program did not build"
+		echo "$out" | sed 's/^/        /'
+		exit 1
+	fi
+done
+
+window=""
+open_window() {
+	rm -f "$here/page.log"
+	PATH=/var/empty "$here/page" >"$here/page.log" 2>&1 &
+	window=$!
+	for _ in $(seq 1 100); do
+		url="$(grep -o 'http://[^ ]*' "$here/page.log" 2>/dev/null | head -1)"
+		[ -n "$url" ] && return 0
+		sleep 0.1
+	done
+	return 1
+}
+
+close_window() {
+	for _ in $(seq 1 50); do
+		kill -0 "$window" 2>/dev/null || return 0
+		sleep 0.1
+	done
+	kill "$window" 2>/dev/null
+}
+
+failed=0
+compare() {
+	if [ "$2" == "$(cat "$here/$1.expected")" ]; then
+		echo "  PASS  $1"
+	else
+		echo "  FAIL  $1"
+		diff <(echo "$2") "$here/$1.expected" | sed 's/^/        /'
+		sed 's/^/        window: /' "$here/page.log"
+		failed=$((failed + 1))
+	fi
+}
+
+open_window || { echo "  FAIL  the window never said where it was"; exit 1; }
+compare drive "$(limit 60 "$here/drive" "$url" 2>&1)"
+close_window
+
+chrome=()
+for candidate in google-chrome google-chrome-stable chromium chromium-browser; do
+	if command -v "$candidate" >/dev/null; then
+		chrome=("$candidate")
+		break
+	fi
+done
+profile="$(mktemp -d)"
+if [ ${#chrome[@]} -eq 0 ] && command -v flatpak >/dev/null && flatpak info org.chromium.Chromium >/dev/null 2>&1; then
+	chrome=(flatpak run --filesystem="$profile" --command=chromium org.chromium.Chromium)
+fi
+
+if [ ${#chrome[@]} -eq 0 ]; then
+	echo "  SKIP  browser (no Chrome or Chromium here)"
+else
+	open_window || { echo "  FAIL  the window never said where it was"; exit 1; }
+	"${chrome[@]}" --headless=new --no-sandbox --disable-gpu --no-first-run \
+		--user-data-dir="$profile" --remote-debugging-port=0 "$url" >/dev/null 2>&1 &
+	for _ in $(seq 1 300); do
+		[ -s "$profile/DevToolsActivePort" ] && break
+		sleep 0.1
+	done
+	port="$(head -1 "$profile/DevToolsActivePort" 2>/dev/null)"
+	compare browser "$(limit 90 "$here/browser" "$port" "$url" "$here/check.js" 2>&1)"
+	pkill -f -- "--user-data-dir=$profile"
+	close_window
+fi
+rm -rf "$profile"
+
+[ "$failed" -eq 0 ]

@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.2.8
+
+### Standard library
+
+* **`ui.onSize(f)`** — a scene reports how wide and how tall its box landed, as two `Int`s. It says so when it starts listening and whenever the box changes, which is the one number a view cannot work out for itself.
+
+### Performance
+
+* **A window sends what changed in the document, not the document**, which took formula-hive's 96-element HUD from 20.5KB a fold to 2.6KB and from every element parsed to 24.
+* **Drawing one costs a fraction of what it did**, byte for byte the same: one render of formula-hive's HUD and standings went from 3,819 allocations, 1.67MB and 513us to 1,407, 104KB and 133us.
+* **A `ui.Attr` is 80 bytes rather than 144**, which took building a formula-hive frame of 1,495 shapes from 1.97MB allocated to 1.56MB.
+
+### Fixes
+
+* **A variant no library enumeration has is refused here**, where `hive.ui.TextSize.Small()` compiled and the Go toolchain reported `undefined: hive.Ui` against a file nobody wrote. A name that is not a type of that module — `hive.ui.Nonesuch.Caption()` — is refused the same way.
+* **An Android app asks for `ACCESS_NETWORK_STATE`**, where the manifest named only `INTERNET` and every `ConnectivityManager` call threw for want of it: nothing was written to `$HOME/.hive/resolvers` and every lookup failed. Installing over an earlier app picks it up.
+
 ## v0.2.7
 
 ### Building

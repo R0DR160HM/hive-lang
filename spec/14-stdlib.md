@@ -1115,6 +1115,7 @@ unshadowed.
 | `onLook(f)` | `Float, Float` — how far the mouse moved, across and down |
 | `onGrab(f)` | `Bool` — whether the window is holding the mouse now |
 | `onPad(f)` | `Int, Str, Float` — which pad, which control, where it now is |
+| `onSize(f)` | `Int, Int` — how wide and how tall the scene's box is, in pixels |
 
 **`onFrame` reports the time since the last frame the program was told about, and
 not the time since the last frame the window drew.** The two are the same whenever

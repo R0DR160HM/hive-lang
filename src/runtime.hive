@@ -7476,28 +7476,38 @@ func uiSource(): Str {
 		// Several numbers at once: a position, a rotation, a heading. The scene's
 		// attributes, and the only ones carrying more than one — nothing in this
 		// file knows what they mean. hive/ui_scene.go builds and reads them back.
-		//
-		// The one event that reports two numbers instead of a value: how far the
-		// mouse moved while the window was holding it.
 		`
 		type UiAttr struct \{
-			Kind   string
-			Num    int
-			Str    string
-			Enum   string
-			Flag   bool
+			Kind string
+			Num  int
+		`,
+		// A placeholder, a hint, a track's path — or an enumeration's tag. Which it
+		// is, is which attribute this is: `uiStr` and `uiEnum` build it and no
+		// attribute is built by both, so two fields only ever held one string.
+		`
+			Word string
+			Flag bool
+			Nums []float64
+		`,
+		// What an attribute carrying a message or a handler carries, held to one
+		// side. Seven fields that only an event ever sets were seven fields every
+		// attribute paid for: a scene's every `at`, `turn` and `paint` is one of
+		// these, and none of them is an event. One pointer instead took the
+		// attribute from a hundred and fifty-two bytes to ninety-six, and a world
+		// of eight hundred shapes from four hundred and eighty-nine kilobytes a
+		// frame to three hundred and thirty-five.
+		`
+			heard *uiHeard
+		}
+
+		type uiHeard struct \{
 			Msg    any
 			FnStr  func(string) any
 			FnInt  func(int) any
 			FnBool func(bool) any
-			Nums []float64
 			FnLook func(float64, float64) any
-		`,
-		// A gamepad: which pad, which control on it, and where that control now
-		// is. One shape for the whole device, because a button is a control that
-		// is only ever 0 or 1.
-		`
-			FnPad func(int, string, float64) any
+			FnPad  func(int, string, float64) any
+			FnSize func(int, int) any
 		}
 
 		func uiNode(kind string, attrs []UiAttr, children []UiView) UiView \{
@@ -7737,8 +7747,8 @@ func uiSource(): Str {
 		}
 
 		func uiNum(kind string, n int) UiAttr     \{ return UiAttr\{Kind: kind, Num: n} }
-		func uiStr(kind string, s string) UiAttr  \{ return UiAttr\{Kind: kind, Str: s} }
-		func uiEnum(kind string, e string) UiAttr \{ return UiAttr\{Kind: kind, Enum: e} }
+		func uiStr(kind string, s string) UiAttr  \{ return UiAttr\{Kind: kind, Word: s} }
+		func uiEnum(kind string, e string) UiAttr \{ return UiAttr\{Kind: kind, Word: e} }
 
 		func UiAttrGap(n int) UiAttr    \{ return uiNum("gap", n) }
 		func UiAttrPad(n int) UiAttr    \{ return uiNum("pad", n) }
@@ -7799,15 +7809,15 @@ func uiSource(): Str {
 		// The event attributes. A plain one carries the message itself; the rest carry
 		// a function of what the user did, because the message depends on it.
 		`
-		func UiAttrOn(msg any) UiAttr        \{ return UiAttr\{Kind: "on", Msg: msg} }
-		func UiAttrOnDismiss(msg any) UiAttr \{ return UiAttr\{Kind: "onDismiss", Msg: msg} }
+		func UiAttrOn(msg any) UiAttr        \{ return UiAttr\{Kind: "on", heard: &uiHeard\{Msg: msg}} }
+		func UiAttrOnDismiss(msg any) UiAttr \{ return UiAttr\{Kind: "onDismiss", heard: &uiHeard\{Msg: msg}} }
 
-		func UiAttrOnInput(f func(string) any) UiAttr  \{ return UiAttr\{Kind: "onInput", FnStr: f} }
-		func UiAttrOnSubmit(f func(string) any) UiAttr \{ return UiAttr\{Kind: "onSubmit", FnStr: f} }
-		func UiAttrOnChoose(f func(string) any) UiAttr \{ return UiAttr\{Kind: "onChoose", FnStr: f} }
-		func UiAttrOnToggle(f func(bool) any) UiAttr   \{ return UiAttr\{Kind: "onToggle", FnBool: f} }
-		func UiAttrOnPick(f func(int) any) UiAttr      \{ return UiAttr\{Kind: "onPick", FnInt: f} }
-		func UiAttrOnSort(f func(int) any) UiAttr      \{ return UiAttr\{Kind: "onSort", FnInt: f} }
+		func UiAttrOnInput(f func(string) any) UiAttr  \{ return UiAttr\{Kind: "onInput", heard: &uiHeard\{FnStr: f}} }
+		func UiAttrOnSubmit(f func(string) any) UiAttr \{ return UiAttr\{Kind: "onSubmit", heard: &uiHeard\{FnStr: f}} }
+		func UiAttrOnChoose(f func(string) any) UiAttr \{ return UiAttr\{Kind: "onChoose", heard: &uiHeard\{FnStr: f}} }
+		func UiAttrOnToggle(f func(bool) any) UiAttr   \{ return UiAttr\{Kind: "onToggle", heard: &uiHeard\{FnBool: f}} }
+		func UiAttrOnPick(f func(int) any) UiAttr      \{ return UiAttr\{Kind: "onPick", heard: &uiHeard\{FnInt: f}} }
+		func UiAttrOnSort(f func(int) any) UiAttr      \{ return UiAttr\{Kind: "onSort", heard: &uiHeard\{FnInt: f}} }
 		`,
 		// Finding one attribute among a node's. Attributes are few and a view is
 		// rebuilt every turn, so a scan beats anything with a map's allocation.
@@ -7839,7 +7849,7 @@ func uiSource(): Str {
 		// Rendering
 		// ---------------------------------------------------------------------------
 		`
-				case "onFrame", "onRate", "onKeyDown", "onKeyUp", "onLook", "onGrab", "onPad":
+				case "onFrame", "onRate", "onKeyDown", "onKeyUp", "onLook", "onGrab", "onPad", "onSize":
 					return true
 				}
 			}
@@ -7861,6 +7871,12 @@ func uiSource(): Str {
 			out      strings.Builder
 			handlers map[string][]UiAttr
 			next     int
+		`,
+		// One buffer every element's opening tag is built in, kept between them:
+		// the tag is handed back as a string, but what it took to arrive at one
+		// need not be a fresh allocation per node.
+		`
+			scratch  []byte
 			scenes []string
 			sceneCuts [][]int32
 		`,
@@ -7870,15 +7886,70 @@ func uiSource(): Str {
 			insets []string
 		}
 
+		var uiEscaper = strings.NewReplacer(
+			"&", "&amp;",
+			"<", "&lt;",
+			">", "&gt;",
+			"\"", "&quot;",
+			"'", "&#39;",
+		)
+
 		func uiEscape(s string) string \{
-			r := strings.NewReplacer(
-				"&", "&amp;",
-				"<", "&lt;",
-				">", "&gt;",
-				"\"", "&quot;",
-				"'", "&#39;",
-			)
-			return r.Replace(s)
+			return uiEscaper.Replace(s)
+		}
+		`,
+		// The same, appended rather than returned. Text with nothing to escape —
+		// which is nearly all of it — is appended in one run rather than a byte at
+		// a time.
+		`
+		func uiEscapeTo(b *strings.Builder, s string) \{
+			at := 0
+			for i := 0; i < len(s); i++ \{
+				var swap string
+				switch s[i] \{
+				case '&':
+					swap = "&amp;"
+				case '<':
+					swap = "&lt;"
+				case '>':
+					swap = "&gt;"
+				case '"':
+					swap = "&quot;"
+				case '\'':
+					swap = "&#39;"
+				default:
+					continue
+				}
+				b.WriteString(s[at:i])
+				b.WriteString(swap)
+				at = i + 1
+			}
+			b.WriteString(s[at:])
+		}
+
+		func uiEscapeInto(b []byte, s string) []byte \{
+			at := 0
+			for i := 0; i < len(s); i++ \{
+				var swap string
+				switch s[i] \{
+				case '&':
+					swap = "&amp;"
+				case '<':
+					swap = "&lt;"
+				case '>':
+					swap = "&gt;"
+				case '"':
+					swap = "&quot;"
+				case '\'':
+					swap = "&#39;"
+				default:
+					continue
+				}
+				b = append(b, s[at:i]...)
+				b = append(b, swap...)
+				at = i + 1
+			}
+			return append(b, s[at:]...)
 		}
 		`,
 		// The style a node's attributes come to. Every one maps to a fixed declaration:
@@ -7893,50 +7964,65 @@ func uiSource(): Str {
 		// been through UiToneHex or UiToneRGBA, so it is a colour and not
 		// whatever the program had in the string.
 		`
-		func uiStyle(kind string, attrs []UiAttr) string \{
-			var b strings.Builder
+		func uiStyle(b []byte, kind string, attrs []UiAttr) []byte \{
 			switch kind \{
 			case "row":
-				b.WriteString("display:flex;flex-direction:row;")
+				b = append(b, "display:flex;flex-direction:row;"...)
 			case "column", "inset":
-				b.WriteString("display:flex;flex-direction:column;")
+				b = append(b, "display:flex;flex-direction:column;"...)
 			case "spacer":
-				b.WriteString("flex:1 1 auto;")
+				b = append(b, "flex:1 1 auto;"...)
 			}
 			for _, a := range attrs \{
 				switch a.Kind \{
 				case "gap":
-					b.WriteString("gap:" + strconv.Itoa(a.Num) + "px;")
+					b = append(b, "gap:"...)
+					b = uiInt(b, a.Num)
+					b = append(b, "px;"...)
 				case "pad":
-					b.WriteString("padding:" + strconv.Itoa(a.Num) + "px;")
+					b = append(b, "padding:"...)
+					b = uiInt(b, a.Num)
+					b = append(b, "px;"...)
 				case "width":
-					b.WriteString("width:" + strconv.Itoa(a.Num) + "px;")
+					b = append(b, "width:"...)
+					b = uiInt(b, a.Num)
+					b = append(b, "px;"...)
 					if kind == "row" || kind == "column" \{
-						b.WriteString("max-width:100%;")
+						b = append(b, "max-width:100%;"...)
 					}
 				case "height":
-					b.WriteString("height:" + strconv.Itoa(a.Num) + "px;")
+					b = append(b, "height:"...)
+					b = uiInt(b, a.Num)
+					b = append(b, "px;"...)
 				case "align":
-					b.WriteString("align-items:" + uiFlexPos(a.Enum) + ";")
+					b = append(b, "align-items:"...)
+					b = append(b, uiFlexPos(a.Word)...)
+					b = append(b, ";"...)
 				case "justify":
-					b.WriteString("justify-content:" + uiFlexPos(a.Enum) + ";")
+					b = append(b, "justify-content:"...)
+					b = append(b, uiFlexPos(a.Word)...)
+					b = append(b, ";"...)
 				case "scroll":
-					switch a.Enum \{
+					switch a.Word \{
 					case "Horizontal":
-						b.WriteString("overflow-x:auto;")
+						b = append(b, "overflow-x:auto;"...)
 					case "Vertical":
-						b.WriteString("overflow-y:auto;")
+						b = append(b, "overflow-y:auto;"...)
 					default:
-						b.WriteString("overflow:auto;")
+						b = append(b, "overflow:auto;"...)
 					}
-					b.WriteString("min-height:0;min-width:0;")
+					b = append(b, "min-height:0;min-width:0;"...)
 				case "tone":
-					if c, colour := uiToneColour(a.Enum); colour \{
-						b.WriteString("color:" + c + ";")
+					if c, colour := uiToneColour(a.Word); colour \{
+						b = append(b, "color:"...)
+						b = append(b, c...)
+						b = append(b, ";"...)
 					}
 				case "background":
-					if c, colour := uiToneColour(a.Enum); colour \{
-						b.WriteString("background:" + c + ";")
+					if c, colour := uiToneColour(a.Word); colour \{
+						b = append(b, "background:"...)
+						b = append(b, c...)
+						b = append(b, ";"...)
 					}
 				}
 			}
@@ -7946,11 +8032,13 @@ func uiSource(): Str {
 		// later one quietly win.
 		`
 			if grow, ok := uiFind(attrs, "grow"); ok \{
-				b.WriteString("flex:" + strconv.Itoa(grow.Num) + " 1 0;")
+				b = append(b, "flex:"...)
+				b = uiInt(b, grow.Num)
+				b = append(b, " 1 0;"...)
 			} else if _, ok := uiFind(attrs, "width"); ok \{
-				b.WriteString("flex:0 0 auto;")
+				b = append(b, "flex:0 0 auto;"...)
 			}
-			return b.String()
+			return b
 		}
 
 		func uiFlexPos(v string) string \{
@@ -7977,23 +8065,27 @@ func uiSource(): Str {
 		// carrying a colour has nothing to look up and becomes a declaration in
 		// uiStyle instead, so it gets no class here.
 		`
-		func uiClasses(kind string, attrs []UiAttr) string \{
-			classes := []string\{"h-" + kind}
+		func uiClasses(b []byte, kind string, attrs []UiAttr) []byte \{
+			b = append(b, "h-"...)
+			b = append(b, kind...)
 			for _, a := range attrs \{
 				switch a.Kind \{
 				case "tone":
-					if _, colour := uiToneColour(a.Enum); !colour \{
-						classes = append(classes, "h-tone-"+strings.ToLower(a.Enum))
+					if _, colour := uiToneColour(a.Word); !colour \{
+						b = append(b, " h-tone-"...)
+						b = uiLower(b, a.Word)
 					}
 				case "background":
-					if _, colour := uiToneColour(a.Enum); !colour \{
-						classes = append(classes, "h-bg-"+strings.ToLower(a.Enum))
+					if _, colour := uiToneColour(a.Word); !colour \{
+						b = append(b, " h-bg-"...)
+						b = uiLower(b, a.Word)
 					}
 				case "size":
-					classes = append(classes, "h-size-"+strings.ToLower(a.Enum))
+					b = append(b, " h-size-"...)
+					b = uiLower(b, a.Word)
 				case "busy":
 					if a.Flag \{
-						classes = append(classes, "h-busy")
+						b = append(b, " h-busy"...)
 					}
 		`,
 		// A scene's aiming mark. It is a class rather than something drawn in the
@@ -8002,11 +8094,30 @@ func uiSource(): Str {
 		`
 				case "crosshair":
 					if a.Flag \{
-						classes = append(classes, "h-aiming")
+						b = append(b, " h-aiming"...)
 					}
 				}
 			}
-			return strings.Join(classes, " ")
+			return b
+		}
+		`,
+		// An enumeration's name, lowered straight into the output. The names are
+		// ASCII words this compiler wrote, so this is the whole of what ToLower
+		// would do — without the string it allocates to do it.
+		`
+		func uiLower(b []byte, s string) []byte \{
+			for i := 0; i < len(s); i++ \{
+				c := s[i]
+				if c >= 'A' && c <= 'Z' \{
+					c += 'a' - 'A'
+				}
+				b = append(b, c)
+			}
+			return b
+		}
+
+		func uiInt(b []byte, n int) []byte \{
+			return strconv.AppendInt(b, int64(n), 10)
 		}
 		`,
 		// The common attribute string every element opens with.
@@ -8029,21 +8140,40 @@ func uiSource(): Str {
 		// v.Text and goes into r.scenes rather than into the document. A static
 		// render has no socket to send frames down, so it leaves an empty box.
 		`
-		func (r *uiRender) common(kind string, attrs []UiAttr) string \{
-			out := " class=\"" + uiClasses(kind, attrs) + "\""
-			if style := uiStyle(kind, attrs); style != "" \{
-				out += " style=\"" + style + "\""
+		func (r *uiRender) common(kind string, attrs []UiAttr) \{
+			b := r.scratch[:0]
+			b = append(b, " class=\""...)
+			b = uiClasses(b, kind, attrs)
+			b = append(b, '"')
+		`,
+		// The opening is written before there is anything to put in it and taken
+		// back where nothing was: whether a node has any style at all is not a
+		// question that can be answered without asking every attribute.
+		`
+			was := len(b)
+			b = append(b, " style=\""...)
+			held := len(b)
+			b = uiStyle(b, kind, attrs)
+			if len(b) == held \{
+				b = b[:was]
+			} else \{
+				b = append(b, '"')
 			}
 			if hint, ok := uiFind(attrs, "hint"); ok \{
-				out += " title=\"" + uiEscape(hint.Str) + "\""
+				b = append(b, " title=\""...)
+				b = uiEscapeInto(b, hint.Word)
+				b = append(b, '"')
 			}
 			if r.handlers != nil && uiHasEvent(attrs) \{
 				r.next++
 				id := "h" + strconv.Itoa(r.next)
 				r.handlers[id] = attrs
-				out += " data-h=\"" + id + "\""
+				b = append(b, " data-h=\""...)
+				b = append(b, id...)
+				b = append(b, '"')
 			}
-			return out
+			r.scratch = b
+			r.out.Write(b)
 		}
 
 		func (r *uiRender) view(v UiView) \{
@@ -8051,9 +8181,13 @@ func uiSource(): Str {
 			case "none":
 				r.out.WriteString("<!--none-->")
 			case "spacer":
-				r.out.WriteString("<div" + r.common(v.Kind, v.Attrs) + "></div>")
+				r.out.WriteString("<div")
+				r.common(v.Kind, v.Attrs)
+				r.out.WriteString("></div>")
 			case "row", "column":
-				r.out.WriteString("<div" + r.common(v.Kind, v.Attrs) + ">")
+				r.out.WriteString("<div")
+				r.common(v.Kind, v.Attrs)
+				r.out.WriteString(">")
 				for _, c := range v.Children \{
 					r.view(c)
 				}
@@ -8061,10 +8195,10 @@ func uiSource(): Str {
 			case "overlay":
 				pinned := ""
 				if a, ok := uiFind(v.Attrs, "align"); ok \{
-					pinned += "align-items:" + uiFlexPos(a.Enum) + ";"
+					pinned += "align-items:" + uiFlexPos(a.Word) + ";"
 				}
 				if j, ok := uiFind(v.Attrs, "justify"); ok \{
-					pinned += "justify-content:" + uiFlexPos(j.Enum) + ";"
+					pinned += "justify-content:" + uiFlexPos(j.Word) + ";"
 				}
 				shade := "h-backdrop"
 				if pinned != "" \{
@@ -8076,7 +8210,9 @@ func uiSource(): Str {
 					open += " style=\"" + pinned + "\""
 				}
 				r.out.WriteString(open + r.backdrop(v.Attrs) + ">")
-				r.out.WriteString("<div" + r.common(v.Kind, v.Attrs) + ">")
+				r.out.WriteString("<div")
+				r.common(v.Kind, v.Attrs)
+				r.out.WriteString(">")
 				for _, c := range v.Children \{
 					r.view(c)
 				}
@@ -8086,18 +8222,30 @@ func uiSource(): Str {
 				if h, ok := uiFind(v.Attrs, "heading"); ok && h.Num >= 1 && h.Num <= 6 \{
 					tag = "h" + strconv.Itoa(h.Num)
 				}
-				r.out.WriteString("<" + tag + r.common(v.Kind, v.Attrs) + ">")
-				r.out.WriteString(uiEscape(v.Text))
-				r.out.WriteString("</" + tag + ">")
+				r.out.WriteString("<")
+				r.out.WriteString(tag)
+				r.common(v.Kind, v.Attrs)
+				r.out.WriteString(">")
+				uiEscapeTo(&r.out, v.Text)
+				r.out.WriteString("</")
+				r.out.WriteString(tag)
+				r.out.WriteString(">")
 			case "image":
 				alt := ""
 				if len(v.Options) > 0 \{
 					alt = v.Options[0]
 				}
-				r.out.WriteString("<img" + r.common(v.Kind, v.Attrs) +
-					" src=\"" + uiEscape(v.Text) + "\" alt=\"" + uiEscape(alt) + "\">")
+				r.out.WriteString("<img")
+				r.common(v.Kind, v.Attrs)
+				r.out.WriteString(" src=\"")
+				uiEscapeTo(&r.out, v.Text)
+				r.out.WriteString("\" alt=\"")
+				uiEscapeTo(&r.out, alt)
+				r.out.WriteString("\">")
 			case "icon":
-				r.out.WriteString("<span" + r.common(v.Kind, v.Attrs) + " aria-hidden=\"true\">")
+				r.out.WriteString("<span")
+				r.common(v.Kind, v.Attrs)
+				r.out.WriteString(" aria-hidden=\"true\">")
 				r.out.WriteString(uiIconGlyph(v.Text))
 				r.out.WriteString("</span>")
 			case "link":
@@ -8105,57 +8253,93 @@ func uiSource(): Str {
 				if len(v.Options) > 0 \{
 					href = v.Options[0]
 				}
-				r.out.WriteString("<a" + r.common(v.Kind, v.Attrs) +
-					" href=\"" + uiEscape(uiHref(href)) + "\">")
-				r.out.WriteString(uiEscape(v.Text))
+				r.out.WriteString("<a")
+				r.common(v.Kind, v.Attrs)
+				r.out.WriteString(" href=\"")
+				uiEscapeTo(&r.out, uiHref(href))
+				r.out.WriteString("\">")
+				uiEscapeTo(&r.out, v.Text)
 				r.out.WriteString("</a>")
 			case "button":
-				r.out.WriteString("<button type=\"button\"" + r.common(v.Kind, v.Attrs) + r.disabled(v.Attrs) + ">")
-				r.out.WriteString(uiEscape(v.Text))
+				r.out.WriteString("<button type=\"button\"")
+				r.common(v.Kind, v.Attrs)
+				r.out.WriteString(r.disabled(v.Attrs))
+				r.out.WriteString(">")
+				uiEscapeTo(&r.out, v.Text)
 				r.out.WriteString("</button>")
 			case "input":
 				kind := "text"
 				if k, ok := uiFind(v.Attrs, "kind"); ok \{
-					kind = uiInputType(k.Enum)
+					kind = uiInputType(k.Word)
 				}
-				out := "<input type=\"" + kind + "\"" + r.common(v.Kind, v.Attrs) + r.disabled(v.Attrs)
-				out += " value=\"" + uiEscape(v.Text) + "\""
+				r.out.WriteString("<input type=\"")
+				r.out.WriteString(kind)
+				r.out.WriteString("\"")
+				r.common(v.Kind, v.Attrs)
+				r.out.WriteString(r.disabled(v.Attrs))
+				r.out.WriteString(" value=\"")
+				uiEscapeTo(&r.out, v.Text)
+				r.out.WriteString("\"")
 				if p, ok := uiFind(v.Attrs, "placeholder"); ok \{
-					out += " placeholder=\"" + uiEscape(p.Str) + "\""
+					r.out.WriteString(" placeholder=\"")
+					uiEscapeTo(&r.out, p.Word)
+					r.out.WriteString("\"")
 				}
-				r.out.WriteString(out + ">")
+				r.out.WriteString(">")
 			case "textarea":
-				out := "<textarea" + r.common(v.Kind, v.Attrs) + r.disabled(v.Attrs)
+				r.out.WriteString("<textarea")
+				r.common(v.Kind, v.Attrs)
+				r.out.WriteString(r.disabled(v.Attrs))
 				if p, ok := uiFind(v.Attrs, "placeholder"); ok \{
-					out += " placeholder=\"" + uiEscape(p.Str) + "\""
+					r.out.WriteString(" placeholder=\"")
+					uiEscapeTo(&r.out, p.Word)
+					r.out.WriteString("\"")
 				}
-				r.out.WriteString(out + ">" + uiEscape(v.Text) + "</textarea>")
+				r.out.WriteString(">")
+				uiEscapeTo(&r.out, v.Text)
+				r.out.WriteString("</textarea>")
 			case "checkbox":
-				r.out.WriteString("<label" + r.common(v.Kind, v.Attrs) + "><input type=\"checkbox\"")
+				r.out.WriteString("<label")
+				r.common(v.Kind, v.Attrs)
+				r.out.WriteString("><input type=\"checkbox\"")
 				if v.Flag \{
 					r.out.WriteString(" checked")
 				}
-				r.out.WriteString(r.disabled(v.Attrs) + "><span>" + uiEscape(v.Text) + "</span></label>")
+				r.out.WriteString(r.disabled(v.Attrs))
+				r.out.WriteString("><span>")
+				uiEscapeTo(&r.out, v.Text)
+				r.out.WriteString("</span></label>")
 			case "select":
-				r.out.WriteString("<select" + r.common(v.Kind, v.Attrs) + r.disabled(v.Attrs) + ">")
+				r.out.WriteString("<select")
+				r.common(v.Kind, v.Attrs)
+				r.out.WriteString(r.disabled(v.Attrs))
+				r.out.WriteString(">")
 				for _, opt := range v.Options \{
 					sel := ""
 					if opt == v.Text \{
 						sel = " selected"
 					}
-					r.out.WriteString("<option value=\"" + uiEscape(opt) + "\"" + sel + ">" +
-						uiEscape(opt) + "</option>")
+					r.out.WriteString("<option value=\"")
+					uiEscapeTo(&r.out, opt)
+					r.out.WriteString("\"")
+					r.out.WriteString(sel)
+					r.out.WriteString(">")
+					uiEscapeTo(&r.out, opt)
+					r.out.WriteString("</option>")
 				}
 				r.out.WriteString("</select>")
 			case "scene":
 				at := len(r.scenes)
 				r.scenes = append(r.scenes, v.Text)
 				r.sceneCuts = append(r.sceneCuts, v.Cuts)
-				out := "<div" + r.common(v.Kind, v.Attrs)
+				r.out.WriteString("<div")
+				r.common(v.Kind, v.Attrs)
 				if r.handlers != nil \{
-					out += " data-scene=\"" + strconv.Itoa(at) + "\""
+					r.out.WriteString(" data-scene=\"")
+					r.out.WriteString(strconv.Itoa(at))
+					r.out.WriteString("\"")
 				}
-				r.out.WriteString(out + "></div>")
+				r.out.WriteString("></div>")
 			case "inset":
 		`,
 		// The box a second look at the world goes in. Like a scene it keeps its
@@ -8168,11 +8352,14 @@ func uiSource(): Str {
 		`
 				at := len(r.insets)
 				r.insets = append(r.insets, v.Text)
-				out := "<div" + r.common(v.Kind, v.Attrs)
+				r.out.WriteString("<div")
+				r.common(v.Kind, v.Attrs)
 				if r.handlers != nil \{
-					out += " data-inset=\"" + strconv.Itoa(at) + "\""
+					r.out.WriteString(" data-inset=\"")
+					r.out.WriteString(strconv.Itoa(at))
+					r.out.WriteString("\"")
 				}
-				r.out.WriteString(out + ">")
+				r.out.WriteString(">")
 				for _, c := range v.Children \{
 					r.view(c)
 				}
@@ -8182,7 +8369,9 @@ func uiSource(): Str {
 			case "table":
 				r.table(v)
 			case "spinner":
-				r.out.WriteString("<div" + r.common(v.Kind, v.Attrs) + " role=\"status\"></div>")
+				r.out.WriteString("<div")
+				r.common(v.Kind, v.Attrs)
+				r.out.WriteString(" role=\"status\"></div>")
 			default:
 				r.out.WriteString("<!--unknown widget-->")
 			}
@@ -8213,12 +8402,18 @@ func uiSource(): Str {
 			if region[2] <= 0 || region[3] <= 0 \{
 				region = []float64\{0, 0, 100, 100}
 			}
-			out := "<svg" + r.common(v.Kind, v.Attrs)
-			out += " viewBox=\"" + uiNumber(region[0]) + " " + uiNumber(region[1]) +
-				" " + uiNumber(region[2]) + " " + uiNumber(region[3]) + "\""
-			out += " preserveAspectRatio=\"xMidYMid meet\""
-			out += " xmlns=\"http://www.w3.org/2000/svg\">"
-			r.out.WriteString(out)
+			r.out.WriteString("<svg")
+			r.common(v.Kind, v.Attrs)
+			r.out.WriteString(" viewBox=\"")
+			r.out.WriteString(uiNumber(region[0]))
+			r.out.WriteString(" ")
+			r.out.WriteString(uiNumber(region[1]))
+			r.out.WriteString(" ")
+			r.out.WriteString(uiNumber(region[2]))
+			r.out.WriteString(" ")
+			r.out.WriteString(uiNumber(region[3]))
+			r.out.WriteString("\" preserveAspectRatio=\"xMidYMid meet\"")
+			r.out.WriteString(" xmlns=\"http://www.w3.org/2000/svg\">")
 			for _, m := range v.Marks \{
 				r.mark(m)
 			}
@@ -8285,10 +8480,10 @@ func uiSource(): Str {
 			if !ok \{
 				return "currentColor"
 			}
-			if colour, is := uiToneColour(paint.Enum); is \{
+			if colour, is := uiToneColour(paint.Word); is \{
 				return uiEscape(colour)
 			}
-			switch paint.Enum \{
+			switch paint.Word \{
 			case "Muted":
 				return "var(--muted)"
 			case "Good":
@@ -8376,7 +8571,7 @@ func uiSource(): Str {
 			if d, ok := uiFind(attrs, "onDismiss"); ok \{
 				r.next++
 				id := "h" + strconv.Itoa(r.next)
-				r.handlers[id] = []UiAttr\{\{Kind: "on", Msg: d.Msg}}
+				r.handlers[id] = []UiAttr\{\{Kind: "on", heard: d.heard}}
 				return " data-h=\"" + id + "\" data-backdrop=\"1\""
 			}
 			return ""
@@ -8397,7 +8592,9 @@ func uiSource(): Str {
 		// carries its own index, so a click says which row rather than which pixel.
 		`
 		func (r *uiRender) table(v UiView) \{
-			r.out.WriteString("<table" + r.common(v.Kind, v.Attrs) + ">")
+			r.out.WriteString("<table")
+			r.common(v.Kind, v.Attrs)
+			r.out.WriteString(">")
 			if len(v.Rows) == 0 \{
 				r.out.WriteString("</table>")
 				return
@@ -8409,7 +8606,7 @@ func uiSource(): Str {
 				if r.handlers != nil && sortable \{
 					r.next++
 					id := "h" + strconv.Itoa(r.next)
-					r.handlers[id] = []UiAttr\{\{Kind: "onSort", FnInt: sortAttr.FnInt, Num: i}}
+					r.handlers[id] = []UiAttr\{\{Kind: "onSort", heard: sortAttr.heard, Num: i}}
 					cell += " data-h=\"" + id + "\" data-index=\"" + strconv.Itoa(i) + "\" class=\"h-sortable\""
 				}
 				r.out.WriteString(cell + ">" + uiEscape(head) + "</th>")
@@ -8421,7 +8618,7 @@ func uiSource(): Str {
 				if r.handlers != nil && pickable \{
 					r.next++
 					id := "h" + strconv.Itoa(r.next)
-					r.handlers[id] = []UiAttr\{\{Kind: "onPick", FnInt: pickAttr.FnInt, Num: i}}
+					r.handlers[id] = []UiAttr\{\{Kind: "onPick", heard: pickAttr.heard, Num: i}}
 					line += " data-h=\"" + id + "\" data-index=\"" + strconv.Itoa(i) + "\" class=\"h-pickable\""
 				}
 				r.out.WriteString(line + ">")
@@ -8600,6 +8797,10 @@ func uiSource(): Str {
 		// The canvas is found again only when the page actually changed shape:
 		// finding it means reading where its box landed, which forces a layout.
 		`
+		  if (head === "P") \{
+		    if (uiApply(e.data.slice(1)) && attachScene) \{ attachScene(); }
+		    return;
+		  }
 		  if (uiPatch(e.data.slice(1)) && attachScene) \{ attachScene(); }
 		};
 		sock.onclose = function () \{ document.body.classList.add("h-closed"); };
@@ -8653,6 +8854,51 @@ func uiSource(): Str {
 		  moved = 0;
 		  uiPatchKids(root, draft);
 		  return moved;
+		}
+		`,
+		// The same patcher, handed only the nodes that changed. Each edit names one by
+		// the child indices that reach it and carries that node's HTML, so what the
+		// browser parses is the four numbers that moved rather than the page holding
+		// them. An edit naming nothing is the whole document, which is what a page
+		// that has just arrived is sent.
+		//
+		// Edits never nest — the difference either descends into a node or hands it
+		// over — so a path is still true by the time this walks it.
+		`
+		function uiApply(text) \{
+		  var edits = JSON.parse(text);
+		  moved = 0;
+		  for (var i = 0; i < edits.length; i++) \{
+		    var at = edits[i][0];
+		    if (at === "") \{
+		      draft.innerHTML = edits[i][1];
+		      uiPatchKids(root, draft);
+		      continue;
+		    }
+		    var node = uiNodeAt(at);
+		    if (!node) \{ continue; }
+		    var fresh = uiParseIn(node.parentNode, edits[i][1]);
+		    if (fresh) \{ uiPatchNode(node.parentNode, node, fresh); }
+		  }
+		  return moved;
+		}
+		`,
+		// Parsed inside its own parent: a div drops a lone tr or td down to its text,
+		// and makes an svg mark an HTML element that draws nothing.
+		`
+		var cut = document.createRange();
+
+		function uiParseIn(parent, html) \{
+		  cut.selectNodeContents(parent);
+		  return cut.createContextualFragment(html).firstChild;
+		}
+
+		function uiNodeAt(at) \{
+		  var node = root, parts = at.split(".");
+		  for (var i = 0; i < parts.length && node; i++) \{
+		    node = node.childNodes[parts[i] | 0];
+		  }
+		  return node || null;
 		}
 
 		function uiPatchKids(live, next) \{
@@ -8959,21 +9205,263 @@ func uiSource(): Str {
 		// The world as it was last published: the payload, where each shape's record
 		// lies inside it, where the insets were looking, and which turn of the fold
 		// it came from. The last three are what a difference is made of.
+		//
+		// --- What actually changed in the document ----------------------------------
+		//
+		// A window drew the page and sent the whole of it whenever a byte moved:
+		// fourteen kilobytes down the socket, and a parse of every element in it, to
+		// change four numbers. The scene has never worked that way — it sends the
+		// difference — and this is the same for the document.
+		//
+		// The page's own patcher applies it, unchanged. An edit names a node and
+		// carries that node's HTML, so everything that patcher knows about a select's
+		// options, a textarea's value and where the reader is typing still holds: the
+		// only thing that changed is how much of the page it is handed.
+		//
+		// A node of the document as the page will hold it. Positions rather than text,
+		// because every comparison here is between two slices of two documents that are
+		// already in memory.
+		`
+		type uiDom struct \{
+			kind byte
+			name string
+			from int
+			open int
+			to   int
+			kids int32
+			head int32
+			tail int32
+			next int32
+		}
+		`,
+		// The document, read back into the shape the page's parser will give it. It is
+		// this renderer's own output, so what it has to understand is only what that
+		// renderer writes: elements, text, comments, and the few tags that close
+		// themselves. Nothing here is a general HTML parser and nothing should make it
+		// one.
+		`
+		func uiScan(html string, into []uiDom) []uiDom \{
+			nodes := into[:0]
+			if cap(nodes) < 16 \{
+				nodes = make([]uiDom, 0, len(html)/40+16)
+			}
+			nodes = append(nodes, uiDom\{kind: 'r', from: 0, open: 0, to: len(html)})
+			stack := make([]int32, 1, 32)
+			i := 0
+			for i < len(html) \{
+				top := stack[len(stack)-1]
+				if html[i] != '<' \{
+					at := i
+					for i < len(html) && html[i] != '<' \{
+						i++
+					}
+					nodes = append(nodes, uiDom\{kind: 't', from: at, open: i, to: i})
+					uiAdopt(nodes, top, int32(len(nodes)-1))
+					continue
+				}
+				if strings.HasPrefix(html[i:], "<!--") \{
+					shut := strings.Index(html[i:], "-->")
+					if shut < 0 \{
+						break
+					}
+					end := i + shut + 3
+					nodes = append(nodes, uiDom\{kind: 'c', from: i, open: end, to: end})
+					uiAdopt(nodes, top, int32(len(nodes)-1))
+					i = end
+					continue
+				}
+				shut := strings.IndexByte(html[i:], '>')
+				if shut < 0 \{
+					break
+				}
+				end := i + shut + 1
+				if html[i+1] == '/' \{
+					if len(stack) > 1 \{
+						nodes[top].to = end
+						stack = stack[:len(stack)-1]
+					}
+					i = end
+					continue
+				}
+				name := uiTagName(html[i+1 : end-1])
+				nodes = append(nodes, uiDom\{kind: 'e', name: name, from: i, open: end, to: end})
+				me := int32(len(nodes) - 1)
+				uiAdopt(nodes, top, me)
+				if html[end-2] != '/' && uiVoidTag(name) == false \{
+					stack = append(stack, me)
+				}
+				i = end
+			}
+			return nodes
+		}
+		`,
+		// Children are a chain through the nodes rather than a slice apiece: a page of
+		// a few hundred elements was a few hundred little allocations, every fold, to
+		// hold what one more field on each node holds for nothing. Nought is "none",
+		// which costs nothing to say because nought is the root and the root is no
+		// one's child.
+		`
+		func uiAdopt(nodes []uiDom, parent int32, child int32) \{
+			if nodes[parent].tail == 0 \{
+				nodes[parent].head = child
+			} else \{
+				nodes[nodes[parent].tail].next = child
+			}
+			nodes[parent].tail = child
+			nodes[parent].kids++
+		}
+
+		func uiTagName(open string) string \{
+			for i := 0; i < len(open); i++ \{
+				c := open[i]
+				if c == ' ' || c == '/' \{
+					return open[:i]
+				}
+			}
+			return open
+		}
+		`,
+		// The two this renderer writes that carry no closing tag. Every other tag it
+		// emits either closes itself with a slash — the canvas marks — or is closed.
+		`
+		func uiVoidTag(name string) bool \{
+			return name == "img" || name == "input"
+		}
+
+		type uiEdit struct \{
+			path string
+			html string
+		}
+		`,
+		// The difference between two documents, as edits the page can apply.
+		//
+		// Positional, exactly as the page's patcher is: a view rendered by the same
+		// code from a model that moved a little is the same tree with different
+		// numbers in it. Where that is wrong the tags disagree and the node is handed
+		// over whole.
+		//
+		// An edit is never emitted inside another: a node that differs is either
+		// descended into or handed over, never both. That is what keeps every path
+		// still true by the time the page walks it.
+		`
+		func uiDocEdits(was string, old []uiDom, now string, fresh []uiDom) []uiEdit \{
+			var edits []uiEdit
+			uiDiffKids(was, old, 0, now, fresh, 0, "", &edits)
+			return edits
+		}
+
+		func uiDiffKids(was string, old []uiDom, a int32, now string, fresh []uiDom,
+			b int32, path string, edits *[]uiEdit) \{
+			if old[a].kids != fresh[b].kids \{
+				*edits = append(*edits, uiEdit\{path: path, html: now[fresh[b].from:fresh[b].to]})
+				return
+			}
+			x := old[a].head
+			y := fresh[b].head
+			for i := 0; x != 0 && y != 0; i, x, y = i+1, old[x].next, fresh[y].next \{
+				if was[old[x].from:old[x].to] == now[fresh[y].from:fresh[y].to] \{
+					continue
+				}
+		`,
+		// Anything that is not an element on both sides — a text node, a comment, a
+		// different tag — is answered by handing over the node holding it, because a
+		// path names a node and the page patches nodes.
+		`
+				if old[x].kind != 'e' || fresh[y].kind != 'e' || old[x].name != fresh[y].name \{
+					*edits = append(*edits, uiEdit\{path: path, html: now[fresh[b].from:fresh[b].to]})
+					return
+				}
+				here := strconv.Itoa(i)
+				if path != "" \{
+					here = path + "." + here
+				}
+				if was[old[x].from:old[x].open] != now[fresh[y].from:fresh[y].open] \{
+					*edits = append(*edits, uiEdit\{path: here, html: now[fresh[y].from:fresh[y].to]})
+					continue
+				}
+				uiDiffKids(was, old, x, now, fresh, y, here, edits)
+			}
+		}
+		`,
+		// The edits as one frame. JSON because an edit carries a program's own text and
+		// there is no byte this renderer cannot emit; a length-prefixed format would
+		// have to agree with the page about what a length counts, and JSON does not.
+		`
+		func uiEditsFrame(edits []uiEdit) string \{
+			var b strings.Builder
+			b.WriteString("P[")
+			for i, e := range edits \{
+				if i > 0 \{
+					b.WriteByte(',')
+				}
+				b.WriteByte('[')
+				uiQuoteInto(&b, e.path)
+				b.WriteByte(',')
+				uiQuoteInto(&b, e.html)
+				b.WriteByte(']')
+			}
+			b.WriteByte(']')
+			return b.String()
+		}
+
+		func uiQuoteInto(b *strings.Builder, s string) \{
+			b.WriteByte(uiQuoteMark)
+			at := 0
+			for i := 0; i < len(s); i++ \{
+				c := s[i]
+				if c != uiQuoteMark && c != uiBackslash && c >= 0x20 \{
+					continue
+				}
+				b.WriteString(s[at:i])
+				at = i + 1
+				b.WriteByte(uiBackslash)
+				if c == uiQuoteMark || c == uiBackslash \{
+					b.WriteByte(c)
+					continue
+				}
+				b.WriteByte('u')
+				b.WriteByte('0')
+				b.WriteByte('0')
+				b.WriteByte(uiHexDigit(c >> 4))
+				b.WriteByte(uiHexDigit(c & 15))
+			}
+			b.WriteString(s[at:])
+			b.WriteByte(uiQuoteMark)
+		}
+		`,
+		// Spelled as their codes rather than as characters: this Go is written from
+		// inside a backtick string, and a lone backslash there is an escape rather
+		// than itself.
+		`
+		const uiQuoteMark = byte(34)
+		const uiBackslash = byte(92)
+
+		func uiHexDigit(n byte) byte \{
+			if n < 10 \{
+				return '0' + n
+			}
+			return 'a' + n - 10
+		}
+		`,
 		`
 		type uiWindow struct \{
 			mu   sync.Mutex
 			html string
+			dom   []uiDom
+			spare []uiDom
 			scene    string
 			cuts     []int32
 			insets   string
 			worldGen uint32
+			docGen   uint32
 			handlers map[string][]UiAttr
 		`,
 		// Every watcher, and the world it is known to be holding. A page holding the
 		// frame before this one can be sent the difference; anything else gets the
-		// lot.
+		// lot. `holding` says the same of the document.
 		`
 			watchers map[NetWsConnection]uint32
+			holding  map[NetWsConnection]uint32
 			token    string
 		}
 		`,
@@ -8992,10 +9480,25 @@ func uiSource(): Str {
 		type uiWatcher struct \{
 			conn NetWsConnection
 			near bool
+			read bool
 		}
 
 		func (w *uiWindow) publish(v UiView) \{
 			r := &uiRender\{handlers: map[string][]UiAttr\{}}
+		`,
+		// Room for a document about the size of the last one. A builder not told how
+		// big the answer will be doubles as it fills, and doubling copies everything
+		// so far: a fold that changed four numbers was rebuilding the page four times
+		// over on its way to writing it once.
+		`
+			w.mu.Lock()
+			room := len(w.html)
+			spare := w.spare
+			w.spare = nil
+			w.mu.Unlock()
+			if room > 0 \{
+				r.out.Grow(room + room/8)
+			}
 			r.view(v)
 			scene, cuts := uiSceneWorld(r.scenes, r.sceneCuts)
 			insets := uiSceneLooks(r.insets)
@@ -9004,6 +9507,7 @@ func uiSource(): Str {
 			document := html != w.html
 			world := scene != "" && (scene != w.scene || insets != w.insets)
 			was, wasCuts := w.scene, w.cuts
+			wasHtml, wasDom := w.html, w.dom
 			w.html = html
 			w.scene = scene
 			w.cuts = cuts
@@ -9012,12 +9516,34 @@ func uiSource(): Str {
 			if world \{
 				w.worldGen++
 			}
+		`,
+		// The document is read back into nodes only when one is about to be sent, and
+		// only while somebody is watching: a window nobody has open folds on without
+		// paying for a difference nobody will read.
+		`
+			if document \{
+				w.docGen++
+				if len(w.watchers) > 0 \{
+					w.dom = uiScan(html, spare)
+				} else \{
+					w.dom = nil
+				}
+			}
 			seq := w.worldGen
+			papers := w.docGen
+			dom := w.dom
 			watchers := make([]uiWatcher, 0, len(w.watchers))
 			for c, held := range w.watchers \{
-				watchers = append(watchers, uiWatcher\{conn: c, near: held == seq-1})
+				watchers = append(watchers, uiWatcher\{
+					conn: c,
+					near: held == seq-1,
+					read: w.holding[c] == papers-1,
+				})
 				if world \{
 					w.watchers[c] = seq
+				}
+				if document \{
+					w.holding[c] = papers
 				}
 			}
 			w.mu.Unlock()
@@ -9025,10 +9551,26 @@ func uiSource(): Str {
 			if world \{
 				edit = uiSceneFrame(scene, cuts, insets, was, wasCuts, seq, seq-1)
 			}
+		`,
+		// The difference, worked out once however many pages are holding the document
+		// it is against. A page holding anything else is sent the whole of it, which is
+		// what a page that has just arrived or lost the thread always was.
+		`
+			paper := ""
+			if document && wasDom != nil && dom != nil \{
+				edits := uiDocEdits(wasHtml, wasDom, html, dom)
+				if len(edits) > 0 \{
+					paper = uiEditsFrame(edits)
+				}
+			}
 			for _, c := range watchers \{
 				NetWsSend(c.conn, "A")
 				if document \{
-					NetWsSend(c.conn, "H"+html)
+					if c.read && paper != "" \{
+						NetWsSend(c.conn, paper)
+					} else \{
+						NetWsSend(c.conn, "H"+html)
+					}
 				}
 				if !world \{
 					continue
@@ -9047,6 +9589,20 @@ func uiSource(): Str {
 				}
 				uiWsSend(c.conn, whole)
 			}
+		`,
+		// The document before this one, handed back now the difference against it has
+		// been written. The next fold reads the page into it rather than into a fresh
+		// one: two buffers, each holding still while the other is filled, so a window
+		// at sixty folds a second stops leaving a page of nodes behind every time.
+		// An unchanged document is still w.dom, so it must not become the spare.
+		`
+			w.mu.Lock()
+			if document \{
+				w.spare = wasDom
+			} else \{
+				w.spare = spare
+			}
+			w.mu.Unlock()
 		}
 		`,
 		// What the window draws, out of a tree that may hold no scene at all — which
@@ -9293,41 +9849,48 @@ func uiSource(): Str {
 				return nil, false
 			}
 			for _, a := range attrs \{
+				h := a.heard
+				if h == nil \{
+					continue
+				}
 				switch \{
 				case kind == "click" && a.Kind == "on":
-					return a.Msg, true
-				case kind == "click" && a.Kind == "onPick" && a.FnInt != nil:
-					return a.FnInt(index), true
-				case kind == "click" && a.Kind == "onSort" && a.FnInt != nil:
-					return a.FnInt(index), true
-				case kind == "input" && a.Kind == "onInput" && a.FnStr != nil:
-					return a.FnStr(value), true
-				case kind == "submit" && a.Kind == "onSubmit" && a.FnStr != nil:
-					return a.FnStr(value), true
-				case kind == "choose" && a.Kind == "onChoose" && a.FnStr != nil:
-					return a.FnStr(value), true
-				case kind == "toggle" && a.Kind == "onToggle" && a.FnBool != nil:
-					return a.FnBool(value != ""), true
-				case kind == "frame" && a.Kind == "onFrame" && a.FnInt != nil:
-					return a.FnInt(index), true
-				case kind == "rate" && a.Kind == "onRate" && a.FnInt != nil:
-					return a.FnInt(index), true
-				case kind == "keydown" && a.Kind == "onKeyDown" && a.FnStr != nil:
-					return a.FnStr(value), true
-				case kind == "keyup" && a.Kind == "onKeyUp" && a.FnStr != nil:
-					return a.FnStr(value), true
-				case kind == "look" && a.Kind == "onLook" && a.FnLook != nil:
+					return h.Msg, true
+				case kind == "click" && a.Kind == "onPick" && h.FnInt != nil:
+					return h.FnInt(index), true
+				case kind == "click" && a.Kind == "onSort" && h.FnInt != nil:
+					return h.FnInt(index), true
+				case kind == "input" && a.Kind == "onInput" && h.FnStr != nil:
+					return h.FnStr(value), true
+				case kind == "submit" && a.Kind == "onSubmit" && h.FnStr != nil:
+					return h.FnStr(value), true
+				case kind == "choose" && a.Kind == "onChoose" && h.FnStr != nil:
+					return h.FnStr(value), true
+				case kind == "toggle" && a.Kind == "onToggle" && h.FnBool != nil:
+					return h.FnBool(value != ""), true
+				case kind == "frame" && a.Kind == "onFrame" && h.FnInt != nil:
+					return h.FnInt(index), true
+				case kind == "rate" && a.Kind == "onRate" && h.FnInt != nil:
+					return h.FnInt(index), true
+				case kind == "keydown" && a.Kind == "onKeyDown" && h.FnStr != nil:
+					return h.FnStr(value), true
+				case kind == "keyup" && a.Kind == "onKeyUp" && h.FnStr != nil:
+					return h.FnStr(value), true
+				case kind == "look" && a.Kind == "onLook" && h.FnLook != nil:
 					dx, dy := uiPair(value)
-					return a.FnLook(dx, dy), true
-				case kind == "grab" && a.Kind == "onGrab" && a.FnBool != nil:
-					return a.FnBool(value != ""), true
+					return h.FnLook(dx, dy), true
+				case kind == "grab" && a.Kind == "onGrab" && h.FnBool != nil:
+					return h.FnBool(value != ""), true
 		`,
 		// A pad names the control that moved and says where it now is; which
 		// pad it was is the index, the same channel a list's row travels in.
 		`
-				case kind == "pad" && a.Kind == "onPad" && a.FnPad != nil:
+				case kind == "pad" && a.Kind == "onPad" && h.FnPad != nil:
 					control, position := uiControl(value)
-					return a.FnPad(index, control, position), true
+					return h.FnPad(index, control, position), true
+				case kind == "size" && a.Kind == "onSize" && h.FnSize != nil:
+					wide, tall := uiPair(value)
+					return h.FnSize(int(wide), int(tall)), true
 				}
 			}
 			return nil, false
@@ -9355,6 +9918,7 @@ func uiSource(): Str {
 		) \{
 			w := &uiWindow\{
 				watchers: map[NetWsConnection]uint32\{},
+				holding:  map[NetWsConnection]uint32\{},
 				token:    CryptoRandomHex(16),
 			}
 			folded := func(state S, msg M, env SyslinkEnvelope) S \{
@@ -9434,6 +9998,7 @@ func uiSource(): Str {
 				defer socket.close()
 				w.mu.Lock()
 				w.watchers[conn] = w.worldGen
+				w.holding[conn] = w.docGen
 				current := w.html
 				w.mu.Unlock()
 				NetWsSend(conn, "H"+current)
@@ -9441,6 +10006,7 @@ func uiSource(): Str {
 				uiPump(w, addr, conn)
 				w.mu.Lock()
 				delete(w.watchers, conn)
+				delete(w.holding, conn)
 				empty := len(w.watchers) == 0
 				w.mu.Unlock()
 		`,
@@ -10086,18 +10652,22 @@ func uiSceneSource(): Str {
 		`
 		func UiAttrShadows(on bool) UiAttr    \{ return UiAttr\{Kind: "shadows", Flag: on} }
 
-		func UiAttrOnFrame(f func(int) any) UiAttr    \{ return UiAttr\{Kind: "onFrame", FnInt: f} }
-		func UiAttrOnRate(f func(int) any) UiAttr     \{ return UiAttr\{Kind: "onRate", FnInt: f} }
-		func UiAttrOnKeyDown(f func(string) any) UiAttr \{ return UiAttr\{Kind: "onKeyDown", FnStr: f} }
-		func UiAttrOnKeyUp(f func(string) any) UiAttr   \{ return UiAttr\{Kind: "onKeyUp", FnStr: f} }
-		func UiAttrOnGrab(f func(bool) any) UiAttr      \{ return UiAttr\{Kind: "onGrab", FnBool: f} }
+		func UiAttrOnFrame(f func(int) any) UiAttr    \{ return UiAttr\{Kind: "onFrame", heard: &uiHeard\{FnInt: f}} }
+		func UiAttrOnRate(f func(int) any) UiAttr     \{ return UiAttr\{Kind: "onRate", heard: &uiHeard\{FnInt: f}} }
+		func UiAttrOnKeyDown(f func(string) any) UiAttr \{ return UiAttr\{Kind: "onKeyDown", heard: &uiHeard\{FnStr: f}} }
+		func UiAttrOnKeyUp(f func(string) any) UiAttr   \{ return UiAttr\{Kind: "onKeyUp", heard: &uiHeard\{FnStr: f}} }
+		func UiAttrOnGrab(f func(bool) any) UiAttr      \{ return UiAttr\{Kind: "onGrab", heard: &uiHeard\{FnBool: f}} }
 
 		func UiAttrOnLook(f func(float64, float64) any) UiAttr \{
-			return UiAttr\{Kind: "onLook", FnLook: f}
+			return UiAttr\{Kind: "onLook", heard: &uiHeard\{FnLook: f}}
 		}
 
 		func UiAttrOnPad(f func(int, string, float64) any) UiAttr \{
-			return UiAttr\{Kind: "onPad", FnPad: f}
+			return UiAttr\{Kind: "onPad", heard: &uiHeard\{FnPad: f}}
+		}
+
+		func UiAttrOnSize(f func(int, int) any) UiAttr \{
+			return UiAttr\{Kind: "onSize", heard: &uiHeard\{FnSize: f}}
 		}
 		`,
 		// UiScene is the widget. The tree keeps the attributes — the layout ones are
@@ -10207,7 +10777,7 @@ func uiSceneSource(): Str {
 				uiPackU16(b, depth.Num)
 			}
 			if hasSky \{
-				uiPackWord(b, uiSceneTone(sky.Enum, "#8ecbff"))
+				uiPackWord(b, uiSceneTone(sky.Word, "#8ecbff"))
 			}
 		`,
 		// Which events the program is actually listening for. A page that would only
@@ -10245,6 +10815,9 @@ func uiSceneSource(): Str {
 		`
 			if _, ok := uiFind(attrs, "onPad"); ok \{
 				b.WriteString("p")
+			}
+			if _, ok := uiFind(attrs, "onSize"); ok \{
+				b.WriteString("s")
 			}
 			return b.String()
 		}
@@ -10347,7 +10920,7 @@ func uiSceneSource(): Str {
 
 		func uiScenePartEnum(one *UiAttr) string \{
 			if one != nil \{
-				return one.Enum
+				return one.Word
 			}
 			return ""
 		}
@@ -10358,7 +10931,7 @@ func uiSceneSource(): Str {
 				voice := uiScenePartEnum(p.voice)
 				track := ""
 				if p.track != nil \{
-					track = p.track.Str
+					track = p.track.Word
 				}
 				mask := 0
 				if voice != "" \{
@@ -10518,7 +11091,7 @@ func uiSceneSource(): Str {
 
 		func uiSceneEnum(attrs []UiAttr, kind string) string \{
 			if a, ok := uiFind(attrs, kind); ok \{
-				return a.Enum
+				return a.Word
 			}
 			return ""
 		}
@@ -10593,6 +11166,7 @@ func uiSceneJs(): Str {
 		// how many frames since it was last read regardless. See watchBox.
 		`
 		var boxMoved = true, boxWatch = null, boxWatched = false, boxBeat = 0;
+		var sizeSaid = [-1, -1];
 		var live = [], geoms = new Map(), mats = new Map(), signs = new Map();
 		`,
 		// Everything on the stage that is not a light, under one node, so a shape can
@@ -10833,6 +11407,14 @@ func uiSceneJs(): Str {
 		  boxMoved = false;
 		  var r = host.getBoundingClientRect();
 		  var w = Math.max(1, Math.round(r.width)), h = Math.max(1, Math.round(r.height));
+		`,
+		// Said before the rectangle is held against the last one, because a scene
+		// whose payload arrived after the box had settled would otherwise never be
+		// told a size it is listening for.
+		`
+		  if (want.indexOf("s") >= 0 && (w !== sizeSaid[0] || h !== sizeSaid[1])) \{
+		    if (post("size", w + "," + h, 0)) \{ sizeSaid = [w, h]; }
+		  }
 		  if (!force && r.left === seen.left && r.top === seen.top && w === seen.width && h === seen.height) \{
 		    return;
 		  }
