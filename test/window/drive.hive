@@ -1,0 +1,238 @@
+type Tok {
+	kind: Str
+	raw: Str
+	path: Str
+}
+
+type Event {
+	id: Str
+	kind: Str
+	value: Str
+	index: Int
+}
+
+type Edits {
+	edits: Str[2][dyn]
+}
+
+type Settled {
+	page: Str
+	sent: Str
+}
+
+func tagKind(tag: Str): Str {
+	if tag is "{bare}/" {
+		return "leaf"
+	}
+	mut Str name = tag
+	if tag is "{first} {attrs}" {
+		name = first
+	}
+	if name == "img" || name == "input" {
+		return "leaf"
+	}
+	return "open"
+}
+
+func tokens(html: Str): Tok[dyn] {
+	mut Tok[dyn] out = []
+	mut Str rest = html
+	for ; rest != ""; {
+		if rest is "<!--{inside}-->{after}" {
+			append(out, Tok("leaf", "<!--{inside}-->", ""))
+			rest = after
+		} else if rest is "</{name}>{after}" {
+			append(out, Tok("close", "</{name}>", ""))
+			rest = after
+		} else if rest is "<{tag}>{after}" {
+			append(out, Tok(tagKind(tag), "<{tag}>", ""))
+			rest = after
+		} else if rest is "{text}<{after}" {
+			append(out, Tok("leaf", text, ""))
+			rest = "<{after}"
+		} else {
+			append(out, Tok("leaf", rest, ""))
+			rest = ""
+		}
+	}
+	return out
+}
+
+func placed(toks: Tok[dyn]): Tok[dyn] {
+	mut Tok[dyn] out = []
+	mut Int[dyn] counts = []
+	mut Str[dyn] parents = []
+	mut Int count = 0
+	mut Str parent = ""
+	for each t in toks {
+		if t.kind == "close" {
+			append(out, t)
+			last := len(counts) - 1
+			if counts bounds last {
+				for each c in drop(counts, last, last) {
+					count = c
+				}
+			}
+			if parents bounds last {
+				for each p in drop(parents, last, last) {
+					parent = p
+				}
+			}
+			continue
+		}
+		mut Str here = "{count}"
+		if parent != "" {
+			here = "{parent}.{count}"
+		}
+		append(out, Tok(t.kind, t.raw, here))
+		count = count + 1
+		if t.kind == "open" {
+			append(counts, count)
+			append(parents, parent)
+			count = 0
+			parent = here
+		}
+	}
+	return out
+}
+
+func patched(toks: Tok[dyn], path: Str, fragment: Str): Tok[dyn] {
+	if path == "" {
+		return tokens(fragment)
+	}
+	mut Tok[dyn] out = []
+	mut Int depth = 0
+	for each t in placed(toks) {
+		if depth > 0 {
+			if t.kind == "open" {
+				depth = depth + 1
+			} else if t.kind == "close" {
+				depth = depth - 1
+			}
+			continue
+		}
+		if t.kind != "close" && t.path == path {
+			for each f in tokens(fragment) {
+				append(out, f)
+			}
+			if t.kind == "open" {
+				depth = 1
+			}
+			continue
+		}
+		append(out, t)
+	}
+	return out
+}
+
+func rawOf(t: Tok): Str {
+	return t.raw
+}
+
+func applied(page: Str, body: Str): Str {
+	decoded := Edits.decode("\{\"edits\":{body}}", hive.json.codec())
+	if decoded is Result.Error(problem) {
+		return "(unreadable edits: {problem.found})"
+	} else if decoded is Result.Ok(frame) {
+		mut Tok[dyn] toks = tokens(page)
+		for each edit in frame.edits {
+			toks = patched(toks, edit[0], edit[1])
+		}
+		return join(map(toks, rawOf), "")
+	}
+	return page
+}
+
+func buttonId(page: Str, label: Str): Str {
+	mut Str id = ""
+	parts := split(page, "\">{label}</button>")
+	if len(parts) > 1 {
+		for each p in parts {
+			for each piece in split(p, "data-h=\"") {
+				id = piece
+			}
+			break
+		}
+	}
+	return id
+}
+
+proc click(conn: hive.net.WsConnection, page: Str, label: Str): void {
+	hive.net.wsSend(conn, encode(Event(buttonId(page, label), "click", "", 0), hive.json.codec()))
+}
+
+proc settle(conn: hive.net.WsConnection, page: Str): Settled {
+	mut Str held = page
+	mut Str sent = ""
+	mut Int acks = 0
+	for ; acks < 2; {
+		heard := hive.net.wsReceive(conn)
+		if heard is Result.Error(problem) {
+			return Settled(held, "{sent} (socket {problem.reason})")
+		} else if heard is Result.Ok(frame) {
+			if frame == "A" {
+				acks = acks + 1
+			} else if frame is "H{whole}" {
+				held = whole
+				sent = sent + "H"
+			} else if frame is "P{body}" {
+				held = applied(held, body)
+				sent = sent + "P"
+			}
+		}
+	}
+	if sent == "" {
+		sent = "-"
+	}
+	return Settled(held, sent)
+}
+
+proc freshPage(socket: Str): Str {
+	opened := hive.net.wsConnect(socket)
+	if opened is Result.Ok(conn) {
+		heard := hive.net.wsReceive(conn)
+		hive.net.wsClose(conn)
+		if heard is Result.Ok(frame) {
+			if frame is "H{whole}" {
+				return whole
+			}
+		}
+	}
+	return "(no page)"
+}
+
+proc main(): void {
+	args := hive.term.args()
+	mut Str socket = ""
+	if args bounds 0 {
+		if args[0] is "http://{host}/?token={token}" {
+			socket = "ws://{host}/_hive/socket?token={token}"
+		}
+	}
+	opened := hive.net.wsConnect(socket)
+	if opened is Result.Error(problem) {
+		echo "could not reach the window: {problem.reason}"
+		return
+	} else if opened is Result.Ok(conn) {
+		mut Str page = ""
+		first := hive.net.wsReceive(conn)
+		if first is Result.Ok(frame) {
+			if frame is "H{whole}" {
+				page = whole
+			}
+		}
+		steps := ["longer", "same", "longer", "mark", "cell", "row", "shorter", "longer", "row", "cell"]
+		for each step in steps {
+			click(conn, page, step)
+			click(conn, page, "same")
+			settled := settle(conn, page)
+			page = settled.page
+			mut Str verdict = "same page"
+			if page != freshPage(socket) {
+				verdict = "differs from a fresh page"
+			}
+			echo "{step}: {settled.sent}, {verdict}"
+		}
+		hive.net.wsClose(conn)
+	}
+}

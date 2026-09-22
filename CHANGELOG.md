@@ -8,9 +8,9 @@
 
 ### Performance
 
-* **A window sends what changed in the document, not the document.** It works the difference out itself now, as it always has for a scene, and sends edits naming the nodes that moved; the page's own patcher applies them unchanged. A 272-element HUD went from 14.5KB a fold to about 160 bytes, and from every element parsed to three. A page that just arrived still gets the whole document.
-* **Drawing one costs a fraction of what it did.** Every element is written straight into the document now, escapes included, rather than built as a string and concatenated in. One render of that HUD went from 472 allocations and 85KB to 6 and 17KB. What it produces is unchanged byte for byte.
-* **A `ui.Attr` is 80 bytes rather than 152.** The seven fields only an event ever set are behind one pointer, and the two strings that were never both set are one. Every `at`, `turn` and `paint` in a scene is one of these: a world of 800 shapes went from 575KB a frame to 383KB, and 220us to 131us.
+* **A window sends what changed in the document, not the document**, which took formula-hive's 96-element HUD from 20.5KB a fold to 2.6KB and from every element parsed to 24.
+* **Drawing one costs a fraction of what it did**, byte for byte the same: one render of formula-hive's HUD and standings went from 3,819 allocations, 1.67MB and 513us to 1,407, 104KB and 133us.
+* **A `ui.Attr` is 80 bytes rather than 144**, which took building a formula-hive frame of 1,495 shapes from 1.97MB allocated to 1.56MB.
 
 ### Fixes
 

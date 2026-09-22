@@ -1,0 +1,103 @@
+type Params {
+	expression: Str
+	awaitPromise: Bool
+	returnByValue: Bool
+}
+
+type Command {
+	id: Int
+	method: Str
+	params: Params
+}
+
+type Remote {
+	value: Str -- Default as "(the check gave no answer)";
+}
+
+type Evaluated {
+	result: Remote
+}
+
+type Reply {
+	id: Int
+	result: Evaluated
+}
+
+type Answer {
+	id: Int
+}
+
+proc tab(port: Str, page: Str): Str {
+	for tries := 0; tries < 100; tries++ {
+		got := hive.net.httpRequest(hive.net.HttpRequest("GET", "http://127.0.0.1:{port}/json/list", [], ""))
+		if got is Result.Ok(response) {
+			listed := hive.json.flatten(response.body)
+			if listed is Result.Ok(rows) {
+				for each row in rows {
+					if row bounds 1 {
+						if row[1] == page && row[0] is "{at}.url" {
+							if hive.json.get(rows, "{at}.webSocketDebuggerUrl") is Result.Ok(socket) {
+								return socket
+							}
+						}
+					}
+				}
+			}
+		}
+		hive.task.sleep(100)
+	}
+	return ""
+}
+
+proc evaluate(conn: hive.net.WsConnection, id: Int, expression: Str): Str {
+	hive.net.wsSend(conn, encode(Command(id, "Runtime.evaluate", Params(expression, true, true)), hive.json.codec()))
+	for ; true; {
+		heard := hive.net.wsReceive(conn)
+		if heard is Result.Error(problem) {
+			return "(devtools {problem.reason})"
+		} else if heard is Result.Ok(text) {
+			if Answer.decode(text, hive.json.codec()) is Result.Ok(answer) {
+				if answer.id == id {
+					if Reply.decode(text, hive.json.codec()) is Result.Ok(reply) {
+						return reply.result.result.value
+					}
+					return "(devtools refused: {text})"
+				}
+			}
+		}
+	}
+	return ""
+}
+
+proc main(): void {
+	args := hive.term.args()
+	if args bounds 2 {
+		read := hive.file.read(args[2])
+		if read is Result.Error(problem) {
+			echo "could not read the check: {problem.message}"
+			return
+		} else if read is Result.Ok(check) {
+			socket := tab(args[0], args[1])
+			opened := hive.net.wsConnect(socket)
+			if opened is Result.Error(problem) {
+				echo "could not reach the browser: {problem.reason}"
+				return
+			} else if opened is Result.Ok(conn) {
+				steps := ["longer", "same", "longer", "mark", "cell", "row", "shorter", "longer", "row", "cell"]
+				mut Int id = 0
+				for tries := 0; tries < 100; tries++ {
+					id = id + 1
+					if evaluate(conn, id, "typeof sock !== \"undefined\" && sock.readyState === 1 && root.firstChild ? \"ready\" : \"\"") == "ready" {
+						break
+					}
+					hive.task.sleep(100)
+				}
+				for each step in steps {
+					id = id + 1
+					echo "{step}: " + evaluate(conn, id, "({check})(\"{step}\")")
+				}
+				hive.net.wsClose(conn)
+			}
+		}
+	}
+}
