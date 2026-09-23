@@ -5471,6 +5471,7 @@ func syslinkSource(): Str {
 			self   *mailbox
 			ref    uint64
 			origin string
+			drawn  bool
 		`,
 		// Set by SyslinkAnswer, read by the service loop once the turn returns. It is
 		// how the runtime can tell "this request was answered" from "this request was
@@ -5508,6 +5509,7 @@ func syslinkSource(): Str {
 		// the way it came. Empty for a request raised on this node.
 		`
 			origin string
+			drawn  bool
 		}
 		`,
 		// watcher is one monitor registration: the death message and where to deliver
@@ -5754,7 +5756,7 @@ func syslinkSource(): Str {
 					continue
 				}
 				turn := &turnState\{}
-				next, crashed := serviceTurn(handler, state, msg, SyslinkEnvelope\{self: b, ref: d.ref, origin: d.origin, turn: turn})
+				next, crashed := serviceTurn(handler, state, msg, SyslinkEnvelope\{self: b, ref: d.ref, origin: d.origin, drawn: d.drawn, turn: turn})
 				if crashed != nil \{
 					reason = Show(crashed)
 					fmt.Println("hive: " + serviceLabel(b) + " crashed: " + reason)
@@ -5935,6 +5937,12 @@ func syslinkSource(): Str {
 		func SyslinkPost(addr SyslinkAddress, msg any) \{
 			if b, ok := resolveLocal(addr); ok \{
 				b.post(delivery\{value: msg, origin: ""})
+			}
+		}
+
+		func syslinkPostDrawn(addr SyslinkAddress, msg any) \{
+			if b, ok := resolveLocal(addr); ok \{
+				b.post(delivery\{value: msg, origin: "", drawn: true})
 			}
 		}
 		`,
@@ -7435,6 +7443,7 @@ func uiSource(): Str {
 		import (
 			"fmt"
 			"hash/fnv"
+			"hash/maphash"
 			"math"
 			"net"
 			"net/http"
@@ -7884,6 +7893,7 @@ func uiSource(): Str {
 		// camera that moves is a document that would be re-sent every frame.
 		`
 			insets []string
+			paced bool
 		}
 
 		var uiEscaper = strings.NewReplacer(
@@ -8168,6 +8178,9 @@ func uiSource(): Str {
 				r.next++
 				id := "h" + strconv.Itoa(r.next)
 				r.handlers[id] = attrs
+				if _, ok := uiFind(attrs, "onFrame"); ok \{
+					r.paced = true
+				}
 				b = append(b, " data-h=\""...)
 				b = append(b, id...)
 				b = append(b, '"')
@@ -9455,6 +9468,7 @@ func uiSource(): Str {
 			worldGen uint32
 			docGen   uint32
 			handlers map[string][]UiAttr
+			paced    bool
 		`,
 		// Every watcher, and the world it is known to be holding. A page holding the
 		// frame before this one can be sent the difference; anything else gets the
@@ -9513,6 +9527,7 @@ func uiSource(): Str {
 			w.cuts = cuts
 			w.insets = insets
 			w.handlers = r.handlers
+			w.paced = r.paced
 			if world \{
 				w.worldGen++
 			}
@@ -9672,15 +9687,9 @@ func uiSource(): Str {
 			if prev != 0 && len(wasCuts) > 0 \{
 				held = len(wasCuts) - 1
 			}
-			changed := make([]int32, 0, shapes)
-			for i := 0; i < shapes; i++ \{
-				if i < held && scene[cuts[i]:cuts[i+1]] == was[wasCuts[i]:wasCuts[i+1]] \{
-					continue
-				}
-				changed = append(changed, int32(i))
-			}
+			moves, changed := uiSceneDiff(scene, cuts, was, wasCuts, shapes, held)
 			var b strings.Builder
-			b.Grow(head + len(insets) + len(changed)*48 + 32)
+			b.Grow(head + len(insets) + len(changed)*48 + len(moves)*4 + 32)
 			b.WriteByte('S')
 			uiPackU32(&b, int(seq))
 			uiPackU32(&b, int(prev))
@@ -9690,6 +9699,10 @@ func uiSource(): Str {
 		`
 			b.WriteString(scene[:head])
 			b.WriteString(insets)
+			uiPackU32(&b, len(moves)/3)
+			for _, n := range moves \{
+				uiPackU32(&b, int(n))
+			}
 			uiPackU32(&b, len(changed))
 			for _, at := range changed \{
 				uiPackU32(&b, int(at))
@@ -9701,6 +9714,47 @@ func uiSource(): Str {
 		// What NetWsSend does, as a binary frame: a text frame has to carry valid
 		// UTF-8 and a float is not any.
 		`
+		var uiSceneSeed = maphash.MakeSeed()
+
+		func uiSceneDiff(scene string, cuts []int32, was string, wasCuts []int32, shapes, held int) ([]int32, []int32) \{
+			rec := func(i int) string \{ return scene[cuts[i]:cuts[i+1]] }
+			old := func(i int) string \{ return was[wasCuts[i]:wasCuts[i+1]] }
+			same := func(i int) bool \{ return i < held && i < shapes && rec(i) == old(i) }
+			changed := make([]int32, 0, shapes)
+			var moves []int32
+			var index map[uint64]int32
+			var taken []bool
+			for i := 0; i < shapes; i++ \{
+				if same(i) \{
+					continue
+				}
+				if held > 0 \{
+					if index == nil \{
+						index = make(map[uint64]int32, held)
+						for j := held - 1; j >= 0; j-- \{
+							index[maphash.String(uiSceneSeed, old(j))] = int32(j)
+						}
+						taken = make([]bool, held)
+					}
+					if at, ok := index[maphash.String(uiSceneSeed, rec(i))]; ok \{
+						src := int(at)
+						n := 0
+						for i+n < shapes && src+n < held && !taken[src+n] && !same(i+n) && !same(src+n) && rec(i+n) == old(src+n) \{
+							taken[src+n] = true
+							n++
+						}
+						if n > 0 \{
+							moves = append(moves, int32(i), int32(src), int32(n))
+							i += n - 1
+							continue
+						}
+					}
+				}
+				changed = append(changed, int32(i))
+			}
+			return moves, changed
+		}
+
 		func uiWsSend(c NetWsConnection, payload []byte) \{
 			if c.ws == nil \{
 				return
@@ -9921,9 +9975,22 @@ func uiSource(): Str {
 				holding:  map[NetWsConnection]uint32\{},
 				token:    CryptoRandomHex(16),
 			}
+			tally := uiFoldTally()
 			folded := func(state S, msg M, env SyslinkEnvelope) S \{
+				began := time.Now()
 				next := update(state, msg, env)
-				w.publish(view(next))
+				w.mu.Lock()
+				paced := w.paced
+				w.mu.Unlock()
+				if paced && !env.drawn \{
+					tally.fold(began, time.Time\{}, time.Time\{})
+					return next
+				}
+				viewed := time.Now()
+				v := view(next)
+				drawn := time.Now()
+				w.publish(v)
+				tally.fold(began, viewed, drawn)
 				return next
 			}
 			addr := SyslinkSpawn(folded, initial, decode, digest, repliesInTurn)
@@ -9953,6 +10020,66 @@ func uiSource(): Str {
 				fmt.Println("hive: open " + url)
 			}
 			select \{}
+		}
+		`,
+		// HIVE_FOLDS prints fold timings once a second.
+		`
+		type uiTally struct \{
+			on      bool
+			mark    time.Time
+			folds   int
+			drawn   int
+			gcs     uint32
+			paused  uint64
+			update  []float64
+			view    []float64
+			publish []float64
+		}
+
+		func uiFoldTally() *uiTally \{
+			return &uiTally\{on: os.Getenv("HIVE_FOLDS") != "", mark: time.Now()}
+		}
+
+		func (t *uiTally) fold(began, viewed, drawn time.Time) \{
+			if !t.on \{
+				return
+			}
+			now := time.Now()
+			t.folds++
+			if viewed.IsZero() \{
+				t.update = append(t.update, uiMs(now.Sub(began)))
+			} else \{
+				t.drawn++
+				t.update = append(t.update, uiMs(viewed.Sub(began)))
+				t.view = append(t.view, uiMs(drawn.Sub(viewed)))
+				t.publish = append(t.publish, uiMs(now.Sub(drawn)))
+			}
+			if now.Sub(t.mark) < time.Second \{
+				return
+			}
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			fmt.Printf("hive: folds %d/s drawn %d/s | update %s | view %s | publish %s | gc %d, %.1fms\n",
+				t.folds, t.drawn, uiSpread(t.update), uiSpread(t.view), uiSpread(t.publish),
+				m.NumGC-t.gcs, float64(m.PauseTotalNs-t.paused)/1e6)
+			t.gcs, t.paused = m.NumGC, m.PauseTotalNs
+			t.mark, t.folds, t.drawn = now, 0, 0
+			t.update, t.view, t.publish = t.update[:0], t.view[:0], t.publish[:0]
+		}
+
+		func uiMs(d time.Duration) float64 \{ return float64(d) / float64(time.Millisecond) }
+
+		func uiSpread(xs []float64) string \{
+			if len(xs) == 0 \{
+				return "-"
+			}
+			s := append([]float64(nil), xs...)
+			for i := 1; i < len(s); i++ \{
+				for j := i; j > 0 && s[j] < s[j-1]; j-- \{
+					s[j], s[j-1] = s[j-1], s[j]
+				}
+			}
+			return fmt.Sprintf("%.1f/%.1f/%.1fms", s[len(s)/2], s[len(s)*9/10], s[len(s)-1])
 		}
 		`,
 		// What a module that draws inside a window adds to it: a script the shell puts
@@ -10064,10 +10191,24 @@ func uiSource(): Str {
 					w.reseed(conn)
 					continue
 				}
-				if msg, ok := w.message(id, kind, value, index); ok \{
+				msg, ok := w.message(id, kind, value, index)
+				switch \{
+				case ok && uiDrawnAfter(kind):
+					syslinkPostDrawn(addr, msg)
+				case ok:
 					SyslinkPost(addr, msg)
+				case kind == "frame":
+					NetWsSend(conn, "A")
 				}
 			}
+		}
+
+		func uiDrawnAfter(kind string) bool \{
+			switch kind \{
+			case "frame", "click", "input", "submit", "choose", "toggle":
+				return true
+			}
+			return false
 		}
 		`,
 		// Reads the four fields the shell sends. The payload is this program's own
@@ -10255,7 +10396,7 @@ func uiSource(): Str {
 			// A handset has no browser to launch and a host in front of it that
 			// opens the window itself. Said in a shape meant to be read rather than
 			// left to be picked out of prose.
-			if runtime.GOOS == "android" \{
+			if runtime.GOOS == "android" || os.Getenv("HIVE_WINDOW") == "print" \{
 				fmt.Println("hive-window " + url)
 				return nil
 			}
@@ -11680,7 +11821,7 @@ func uiSceneJs(): Str {
 		//
 		// The layout, which uiSceneFrame writes:
 		//
-		//   S  seq  prev  camera  count  insets  edits  [slot, record]...
+		//   S  seq  prev  camera  count  insets  moves  [dst, src, len]...  edits  [slot, record]...
 		//
 		// seq names this frame and prev the one it was taken from, so a page can tell
 		// it has missed one; prev nought means the frame carries the whole world.
@@ -11784,6 +11925,8 @@ func uiSceneJs(): Str {
 		  }
 		  looks.length = many;
 		  if (after === 0) \{ forget(); }
+		  var moves = readU32();
+		  if (moves) \{ carried(moves); }
 		  var edits = readU32();
 		  for (var e = 0; e < edits; e++) \{ slotted(readU32()); }
 		  trim(count);
@@ -11815,6 +11958,39 @@ func uiSceneJs(): Str {
 		// one whose track has changed, so the stranded slot and the live one then tear
 		// each other down every frame. It sounds like silence.
 		`
+		var runs = [], carry = 0;
+
+		function carried(n) \{
+		  var was = live.slice(), heard = voiceOf.slice(), m, j, k;
+		  runs.length = 0;
+		  carry++;
+		  for (m = 0; m < n * 3; m++) \{ runs.push(readU32()); }
+		  for (m = 0; m < runs.length; m += 3) \{
+		    for (j = 0; j < runs[m + 2]; j++) \{
+		      k = runs[m + 1] + j;
+		      if (was[k]) \{ was[k].userData.carry = carry; }
+		      if (heard[k]) \{ heard[k].carry = carry; }
+		    }
+		  }
+		  for (m = 0; m < runs.length; m += 3) \{
+		    for (j = 0; j < runs[m + 2]; j++) \{
+		      var dst = runs[m] + j, src = runs[m + 1] + j;
+		      if (was[dst] && was[dst].userData.carry !== carry) \{ shed(was[dst]); }
+		      live[dst] = was[src] || null;
+		      voiceOf[dst] = heard[src] || null;
+		      if (voiceOf[dst]) \{ soundSlots.push(dst); }
+		    }
+		  }
+		  for (m = 0; m < runs.length; m += 3) \{
+		    for (j = 0; j < runs[m + 2]; j++) \{
+		      k = runs[m + 1] + j;
+		      if (was[k] && live[k] === was[k]) \{ live[k] = null; }
+		      if (heard[k] && voiceOf[k] === heard[k]) \{ voiceOf[k] = null; }
+		    }
+		  }
+		  soundsMoved = true;
+		}
+
 		function trim(count) \{
 		  var far = live.length;
 		  if (voiceOf.length > far) \{ far = voiceOf.length; }
@@ -11966,6 +12142,7 @@ func uiSceneJs(): Str {
 		  for (var i = 0; i < soundSlots.length; i++) \{
 		    var at = soundSlots[i], heard = voiceOf[at];
 		    if (!heard) \{ continue; }
+		    if (i > 0 && at === soundSlots[i - 1]) \{ continue; }
 		    keep.push(at);
 		    sounded.push(heard);
 		  }
@@ -13265,6 +13442,7 @@ func uiSceneJs(): Str {
 		  }
 		  if (want.indexOf("p") >= 0) \{ pads(); }
 		  reported(now);
+		  if (pendingScenes.length) \{ flushScene(); }
 		  if (dirty) \{
 		    if (handheld()) \{ blown(); dirty = false; return; }
 		    renderer.render(stage, camera);
@@ -13452,7 +13630,7 @@ func uiSceneJs(): Str {
 		`
 		function sited(gain) \{
 		  var pan = ears.createPanner();
-		  pan.panningModel = "HRTF";
+		  pan.panningModel = "equalpower";
 		  pan.distanceModel = "inverse";
 		  pan.refDistance = 7;
 		  pan.maxDistance = 400;

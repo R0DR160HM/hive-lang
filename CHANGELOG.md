@@ -11,6 +11,12 @@
 * **A window sends what changed in the document, not the document**, which took formula-hive's 96-element HUD from 20.5KB a fold to 2.6KB and from every element parsed to 24.
 * **Drawing one costs a fraction of what it did**, byte for byte the same: one render of formula-hive's HUD and standings went from 3,819 allocations, 1.67MB and 513us to 1,407, 104KB and 133us.
 * **A `ui.Attr` is 80 bytes rather than 144**, which took building a formula-hive frame of 1,495 shapes from 1.97MB allocated to 1.56MB.
+* **A window that folds frames draws once a frame.** A pad, a key or a message from the network is still folded the moment it arrives, but `view` runs only for a frame or for something clicked. A moving gamepad was a whole `view` and `publish` for every stick that moved: formula-hive went from 120 draws a second to 57 with one in hand, and from 160 collections a second to 80.
+* **A scene frame carries the shapes that moved as moves.** A shape that is now in a different slot is sent as `[dst, src, len]` and the page moves the mesh it already built, where a list shifted by one was every later shape sent again and rebuilt. Driving formula-hive went from 35–48KB a frame to 6–16KB.
+* **A world is drawn on the frame it arrives in**, where it waited one more refresh.
+* **Positioned sounds pan with equal power**, not HRTF: HRTF convolves every voice, and a racing grid is sixty of them.
+* **An Android app collects garbage about once a second rather than once a frame**, with `GOGC=off` and `GOMEMLIMIT=256MiB`. `HIVE_FOLDS`, `GOGC` and `GOMEMLIMIT` can be given as intent extras, and `HIVE_INSPECT` lets `chrome://inspect` attach.
+* `HIVE_FOLDS=1` prints fold timings once a second, and `HIVE_WINDOW=print` prints a window's address instead of opening a browser.
 
 ### Fixes
 
