@@ -39,9 +39,17 @@ public class MainActivity extends Activity {
 	private WebView view;
 	private Process child;
 
+	// Intent extras passed to the program's environment. Only these: any app can
+	// send an intent.
+	private static final String[] TUNABLE = {"HIVE_FOLDS", "GOGC", "GOMEMLIMIT"};
+
 	@Override
 	protected void onCreate(Bundle state) {
 		super.onCreate(state);
+
+		if (getIntent().getStringExtra("HIVE_INSPECT") != null) {
+			WebView.setWebContentsDebuggingEnabled(true);
+		}
 
 		view = new WebView(this);
 		WebSettings settings = view.getSettings();
@@ -102,6 +110,16 @@ public class MainActivity extends Activity {
 			// key and the resolvers written below both live under $HOME.
 			environment.put("HOME", home.getAbsolutePath());
 			environment.put("TMPDIR", getCacheDir().getAbsolutePath());
+			// A window allocates its whole world every frame over a live heap of a
+			// megabyte or two, so Go's default collects nearly every frame.
+			environment.put("GOGC", "off");
+			environment.put("GOMEMLIMIT", "256MiB");
+			for (String key : TUNABLE) {
+				String value = getIntent().getStringExtra(key);
+				if (value != null) {
+					environment.put(key, value);
+				}
+			}
 
 			child = built.start();
 
