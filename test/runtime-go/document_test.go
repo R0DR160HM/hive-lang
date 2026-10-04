@@ -253,3 +253,85 @@ func read(t *testing.T, c NetWsConnection) string {
 	}
 	return got.Ok()
 }
+
+func TestAPageCarriesTheTitleItAsksFor(t *testing.T) {
+	out := drawn(UiColumn([]UiAttr{UiAttrTitle("a & b")}, nil))
+	if !strings.Contains(out, ` data-title="a &amp; b"`) {
+		t.Fatalf("the page does not carry its title: %s", out)
+	}
+}
+
+func TestAWidgetSaysWhichKeysItTakes(t *testing.T) {
+	r := &uiRender{handlers: map[string][]UiAttr{}}
+	r.view(UiColumn([]UiAttr{UiAttrKeys([]string{"Ctrl+S", "Escape"}), UiAttrOnKey(func(k string) any { return k })}, nil))
+	out := r.out.String()
+	if !strings.Contains(out, ` data-keys="Ctrl+S Escape"`) || !strings.Contains(out, ` data-h=`) {
+		t.Fatalf("the page does not say which keys the widget takes: %s", out)
+	}
+	for _, attrs := range r.handlers {
+		if msg, ok := uiMeaning(attrs, "key", "Ctrl+S", 0); ok && msg == "Ctrl+S" {
+			return
+		}
+	}
+	t.Fatal("a key the page reports means nothing")
+}
+
+func TestACodeEditorIsItsTextOverItsRuns(t *testing.T) {
+	out := drawn(UiCode([]UiAttr{UiAttrNumbers(true), UiAttrCaret(1, 3, 0)}, "ab<c\nd", []UiRun{
+		UiInk(0, 2, UiToneHex("#ff0000")), UiShade(1, 3, UiTone("Warn")), UiMarker(1, UiTone("Good")),
+	}))
+	for _, want := range []string{
+		` data-caret="1,3,0"`,
+		`<span style="color:#ff0000;">a</span><span style="color:#ff0000;background:var(--warn);">b</span><span style="background:var(--warn);">&lt;</span>c`,
+		`1` + "\n" + `<span class="h-mk" style="box-shadow:inset 3px 0 0 var(--good)">2</span>`,
+		`<textarea class="h-mono"`,
+		">\nab&lt;c\nd</textarea>",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("the editor does not draw %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestAnElementSaysWhichOfThePointersEventsItHears(t *testing.T) {
+	r := &uiRender{handlers: map[string][]UiAttr{}}
+	r.view(UiColumn(nil, []UiView{
+		UiRow([]UiAttr{UiAttrOnMenu("m"), UiAttrOnDrag(func(int, int, bool) any { return nil })}, nil),
+		UiOverlay([]UiAttr{UiAttrAnchor(UiAnchor("Caret")), UiAttrOnDismiss("d")}, UiText(nil, "x")),
+	}))
+	out := r.out.String()
+	for _, want := range []string{` data-ev="menu drag"`, `class="h-backdrop h-pinned h-anchored" data-anchor="Caret" data-h=`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("the page does not say %q:\n%s", want, out)
+		}
+	}
+	for _, attrs := range r.handlers {
+		if msg, ok := uiMeaning(attrs, "drag", "3,-4,1", 0); ok && msg == nil {
+			return
+		}
+	}
+	t.Fatal("a drag means nothing")
+}
+
+func TestAButtonInItsOwnColourHasNoEdgeUnlessItAsks(t *testing.T) {
+	plain := drawn(UiButton([]UiAttr{UiAttrBackground(UiToneHex("#2a2e36")), UiAttrRadius(4), UiAttrRing(false)}, "Run"))
+	for _, want := range []string{"border-color:transparent;", "border-radius:4px;", " h-noring"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("the button does not say %q: %s", want, plain)
+		}
+	}
+	edged := drawn(UiInput([]UiAttr{UiAttrBackground(UiToneHex("#22252c")), UiAttrBorder(1), UiAttrBorderTone(UiToneHex("#333333"))}, ""))
+	if strings.Contains(edged, "transparent") || !strings.Contains(edged, "border-width:1px;border-style:solid;") || !strings.Contains(edged, "border-color:#333333;") {
+		t.Fatalf("the field lost the edge it asked for: %s", edged)
+	}
+}
+
+func TestAnEditorsNotesFollowTheirLineAndAreNotItsText(t *testing.T) {
+	out := drawn(UiCode(nil, "ab\ncd\nef", []UiRun{UiBand(1, UiToneHex("#ff000024")), UiNote(1, "erro <aqui>", UiTone("Danger"))}))
+	if !strings.Contains(out, `<span class="h-band" style="top:calc(8px + 1 * 1.5em);background:#ff000024"></span>`) {
+		t.Fatalf("no band behind line 1: %s", out)
+	}
+	if !strings.Contains(out, "ab\ncd<span class=\"h-note\" data-note=\"erro &lt;aqui&gt;\" style=\"color:var(--danger)\"></span>\nef") {
+		t.Fatalf("the note is not at the end of line 1: %s", out)
+	}
+}

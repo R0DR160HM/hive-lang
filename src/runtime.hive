@@ -7791,6 +7791,8 @@ func uiSource(): Str {
 			"os/exec"
 			"path/filepath"
 			"runtime"
+			"runtime/debug"
+			"sort"
 			"strconv"
 			"strings"
 			"sync"
@@ -7857,6 +7859,8 @@ func uiSource(): Str {
 			FnLook func(float64, float64) any
 			FnPad  func(int, string, float64) any
 			FnSize func(int, int) any
+			FnEdit func(int, int, string) any
+			FnDrag func(int, int, bool) any
 		}
 
 		func uiNode(kind string, attrs []UiAttr, children []UiView) UiView \{
@@ -7968,6 +7972,40 @@ func uiSource(): Str {
 			return UiView\{Kind: "canvas", Attrs: attrs, Marks: marks}
 		}
 		`,
+		// A code editor's runs are marks of its own: the same record, carried where a
+		// canvas carries its marks, so nothing that copies or compares a view needs to
+		// know there are two. Nums holds the offsets and Text the tone.
+		`
+		type UiRun = UiMark
+
+		func UiCode(attrs []UiAttr, text string, runs []UiRun) UiView \{
+			return UiView\{Kind: "code", Attrs: attrs, Text: text, Marks: runs}
+		}
+
+		func uiRunOf(kind string, from int, to int, tone UiTone) UiRun \{
+			return UiMark\{Kind: kind, Nums: []float64\{float64(from), float64(to)}, Text: string(tone)}
+		}
+
+		func UiInk(from int, to int, tone UiTone) UiRun      \{ return uiRunOf("ink", from, to, tone) }
+		func UiShade(from int, to int, tone UiTone) UiRun    \{ return uiRunOf("shade", from, to, tone) }
+		func UiSquiggle(from int, to int, tone UiTone) UiRun \{ return uiRunOf("squiggle", from, to, tone) }
+		func UiMarker(line int, tone UiTone) UiRun           \{ return uiRunOf("marker", line, line, tone) }
+		func UiUnderline(from int, to int, tone UiTone) UiRun \{ return uiRunOf("underline", from, to, tone) }
+		func UiBand(line int, tone UiTone) UiRun             \{ return uiRunOf("band", line, line, tone) }
+		func UiNote(line int, text string, tone UiTone) UiRun \{
+			r := uiRunOf("note", line, line, tone)
+			r.Attrs = []UiAttr\{uiStr("note", text)}
+			return r
+		}
+
+		// What a note says: its text, kept beside the tone.
+		func uiNoteText(r UiRun) string \{
+			if a, ok := uiFind(r.Attrs, "note"); ok \{
+				return a.Word
+			}
+			return ""
+		}
+		`,
 		// --- Input ------------------------------------------------------------------
 		//
 		// --- Data -------------------------------------------------------------------
@@ -8022,6 +8060,7 @@ func uiSource(): Str {
 		type UiTextSize string
 		type UiTone string
 		type UiAxis string
+		type UiAnchor string
 		type UiInputKind string
 		type UiIcon string
 		`,
@@ -8108,6 +8147,7 @@ func uiSource(): Str {
 		func UiAttrAlign(v UiAlign) UiAttr     \{ return uiEnum("align", string(v)) }
 		func UiAttrJustify(v UiJustify) UiAttr \{ return uiEnum("justify", string(v)) }
 		func UiAttrScroll(v UiAxis) UiAttr     \{ return uiEnum("scroll", string(v)) }
+		func UiAttrAnchor(v UiAnchor) UiAttr   \{ return uiEnum("anchor", string(v)) }
 		func UiAttrSize(v UiTextSize) UiAttr   \{ return uiEnum("size", string(v)) }
 		func UiAttrTone(v UiTone) UiAttr       \{ return uiEnum("tone", string(v)) }
 		func UiAttrBackground(v UiTone) UiAttr \{ return uiEnum("background", string(v)) }
@@ -8152,6 +8192,34 @@ func uiSource(): Str {
 		func UiAttrPlaceholder(s string) UiAttr \{ return uiStr("placeholder", s) }
 		func UiAttrHint(s string) UiAttr        \{ return uiStr("hint", s) }
 		func UiAttrTouch(s string) UiAttr       \{ return uiStr("touch", s) }
+		func UiAttrTitle(s string) UiAttr       \{ return uiStr("title", s) }
+		func UiAttrKeys(keys []string) UiAttr   \{ return uiStr("keys", strings.Join(keys, " ")) }
+		func UiAttrCaret(anchor int, head int, serial int) UiAttr \{
+			return UiAttr\{Kind: "caret", Nums: []float64\{float64(anchor), float64(head), float64(serial)}}
+		}
+		func UiAttrFocus(serial int) UiAttr \{ return uiNum("focus", serial) }
+		func UiAttrClip(text string, serial int) UiAttr \{ return UiAttr\{Kind: "clip", Word: text, Num: serial} }
+		func UiAttrPerform(command string, serial int) UiAttr \{
+			return UiAttr\{Kind: "perform", Word: command, Num: serial}
+		}
+		func UiAttrNumbers(b bool) UiAttr  \{ return UiAttr\{Kind: "numbers", Flag: b} }
+		func UiAttrReadOnly(b bool) UiAttr \{ return UiAttr\{Kind: "readOnly", Flag: b} }
+		func UiAttrTabSize(n int) UiAttr   \{ return UiAttr\{Kind: "tabSize", Num: n} }
+		func UiAttrFontSize(n int) UiAttr  \{ return UiAttr\{Kind: "fontSize", Num: n} }
+		func UiAttrBorder(n int) UiAttr    \{ return UiAttr\{Kind: "border", Num: n} }
+		func UiAttrRadius(n int) UiAttr    \{ return UiAttr\{Kind: "radius", Num: n} }
+		func UiAttrRing(on bool) UiAttr    \{ return UiAttr\{Kind: "ring", Flag: on} }
+		func UiAttrBorderTone(v UiTone) UiAttr \{ return uiEnum("borderTone", string(v)) }
+		func UiAttrHover(v UiTone) UiAttr      \{ return uiEnum("hover", string(v)) }
+
+		// The widgets drawn in a frame of their own: a button, a field, a list, an editor.
+		func uiFramed(kind string) bool \{
+			switch kind \{
+			case "button", "input", "textarea", "select", "code":
+				return true
+			}
+			return false
+		}
 
 		func UiAttrDisabled(b bool) UiAttr \{ return UiAttr\{Kind: "disabled", Flag: b} }
 		func UiAttrBusy(b bool) UiAttr     \{ return UiAttr\{Kind: "busy", Flag: b} }
@@ -8160,10 +8228,27 @@ func uiSource(): Str {
 		// a function of what the user did, because the message depends on it.
 		`
 		func UiAttrOn(msg any) UiAttr        \{ return UiAttr\{Kind: "on", heard: &uiHeard\{Msg: msg}} }
+		func UiAttrOnMenu(msg any) UiAttr    \{ return UiAttr\{Kind: "onMenu", heard: &uiHeard\{Msg: msg}} }
+		func UiAttrOnMiddle(msg any) UiAttr  \{ return UiAttr\{Kind: "onMiddle", heard: &uiHeard\{Msg: msg}} }
+		func UiAttrOnDouble(msg any) UiAttr  \{ return UiAttr\{Kind: "onDouble", heard: &uiHeard\{Msg: msg}} }
+		func UiAttrOnHover(f func(int) any) UiAttr \{ return UiAttr\{Kind: "onHover", heard: &uiHeard\{FnInt: f}} }
+		func UiAttrOnJump(f func(int) any) UiAttr  \{ return UiAttr\{Kind: "onJump", heard: &uiHeard\{FnInt: f}} }
+		func UiAttrOnProbe(f func(int) any) UiAttr \{ return UiAttr\{Kind: "onProbe", heard: &uiHeard\{FnInt: f}} }
+		func UiAttrOnDrag(f func(int, int, bool) any) UiAttr \{
+			return UiAttr\{Kind: "onDrag", heard: &uiHeard\{FnDrag: f}}
+		}
 		func UiAttrOnDismiss(msg any) UiAttr \{ return UiAttr\{Kind: "onDismiss", heard: &uiHeard\{Msg: msg}} }
 
 		func UiAttrOnInput(f func(string) any) UiAttr  \{ return UiAttr\{Kind: "onInput", heard: &uiHeard\{FnStr: f}} }
 		func UiAttrOnSubmit(f func(string) any) UiAttr \{ return UiAttr\{Kind: "onSubmit", heard: &uiHeard\{FnStr: f}} }
+		func UiAttrOnKey(f func(string) any) UiAttr    \{ return UiAttr\{Kind: "onKey", heard: &uiHeard\{FnStr: f}} }
+		func UiAttrOnCaret(f func(int, int) any) UiAttr \{ return UiAttr\{Kind: "onCaret", heard: &uiHeard\{FnSize: f}} }
+		func UiAttrOnView(f func(int, int) any) UiAttr  \{ return UiAttr\{Kind: "onView", heard: &uiHeard\{FnSize: f}} }
+		func UiAttrOnFit(f func(int, int) any) UiAttr   \{ return UiAttr\{Kind: "onFit", heard: &uiHeard\{FnSize: f}} }
+		func UiAttrOnPaste(f func(string) any) UiAttr   \{ return UiAttr\{Kind: "onPaste", heard: &uiHeard\{FnStr: f}} }
+		func UiAttrOnEdit(f func(int, int, string) any) UiAttr \{
+			return UiAttr\{Kind: "onEdit", heard: &uiHeard\{FnEdit: f}}
+		}
 		func UiAttrOnChoose(f func(string) any) UiAttr \{ return UiAttr\{Kind: "onChoose", heard: &uiHeard\{FnStr: f}} }
 		func UiAttrOnToggle(f func(bool) any) UiAttr   \{ return UiAttr\{Kind: "onToggle", heard: &uiHeard\{FnBool: f}} }
 		func UiAttrOnPick(f func(int) any) UiAttr      \{ return UiAttr\{Kind: "onPick", heard: &uiHeard\{FnInt: f}} }
@@ -8184,7 +8269,8 @@ func uiSource(): Str {
 		func uiHasEvent(attrs []UiAttr) bool \{
 			for _, a := range attrs \{
 				switch a.Kind \{
-				case "on", "onDismiss", "onInput", "onSubmit", "onChoose", "onToggle", "onPick", "onSort":
+				case "on", "onDismiss", "onInput", "onSubmit", "onChoose", "onToggle", "onPick", "onSort", "onKey",
+					"onCaret", "onView", "onFit", "onEdit", "onPaste", "onProbe", "onMenu", "onMiddle", "onDouble", "onDrag", "onHover", "onJump":
 					return true
 		`,
 		// A scene's own events, listed here rather than anywhere the scene
@@ -8375,6 +8461,40 @@ func uiSource(): Str {
 						b = append(b, c...)
 						b = append(b, ";"...)
 					}
+				case "border":
+					if a.Num <= 0 \{
+						b = append(b, "border:0;"...)
+					} else \{
+						b = append(b, "border-width:"...)
+						b = uiInt(b, a.Num)
+						b = append(b, "px;border-style:solid;"...)
+					}
+				case "borderTone":
+					if css := uiRunColour(a.Word); css != "" \{
+						b = append(b, "border-color:"...)
+						b = append(b, css...)
+						b = append(b, ";"...)
+					}
+				case "radius":
+					b = append(b, "border-radius:"...)
+					b = uiInt(b, max(a.Num, 0))
+					b = append(b, "px;"...)
+				case "hover":
+					if css := uiRunColour(a.Word); css != "" \{
+						b = append(b, "--hv:"...)
+						b = append(b, css...)
+						b = append(b, ";"...)
+					}
+				}
+			}
+			// A framed widget in a colour of its own has no stylesheet edge round it
+			// unless it asks for one: the edge was there to set it off from the page.
+			if uiFramed(kind) \{
+				_, coloured := uiFind(attrs, "background")
+				_, edged := uiFind(attrs, "border")
+				_, toned := uiFind(attrs, "borderTone")
+				if coloured && !edged && !toned \{
+					b = append(b, "border-color:transparent;"...)
 				}
 			}
 		`,
@@ -8447,6 +8567,16 @@ func uiSource(): Str {
 					if a.Flag \{
 						b = append(b, " h-aiming"...)
 					}
+				case "ring":
+					if !a.Flag \{
+						b = append(b, " h-noring"...)
+					}
+				case "hover":
+					b = append(b, " h-hover"...)
+				case "scroll":
+					if a.Word == "Horizontal" \{
+						b = append(b, " h-scroll-x"...)
+					}
 				}
 			}
 			return b
@@ -8491,6 +8621,237 @@ func uiSource(): Str {
 		// v.Text and goes into r.scenes rather than into the document. A static
 		// render has no socket to send frames down, so it leaves an empty box.
 		`
+		// A code editor: the line numbers, then a textarea whose own text is clear over
+		// a copy of it in the runs' colours, the two scrolled as one by the shell. Each
+		// pre and the textarea open on a newline the parser drops, so a text that
+		// starts on an empty line keeps it.
+		func (r *uiRender) code(v UiView) \{
+			r.out.WriteString("<div")
+			r.common(v.Kind, v.Attrs)
+			if size, ok := uiFind(v.Attrs, "fontSize"); ok && size.Num >= 6 && size.Num <= 72 \{
+				r.out.WriteString(" data-font=\"")
+				r.out.WriteString(strconv.Itoa(size.Num))
+				r.out.WriteString("\"")
+			}
+			if c, ok := uiFind(v.Attrs, "caret"); ok && len(c.Nums) == 3 \{
+				r.out.WriteString(" data-caret=\"")
+				r.out.WriteString(strconv.Itoa(int(c.Nums[0])))
+				r.out.WriteString(",")
+				r.out.WriteString(strconv.Itoa(int(c.Nums[1])))
+				r.out.WriteString(",")
+				r.out.WriteString(strconv.Itoa(int(c.Nums[2])))
+				r.out.WriteString("\"")
+			}
+			if _, ok := uiFind(v.Attrs, "onInput"); ok \{
+				r.out.WriteString(" data-whole")
+			}
+			tab := 4
+			if t, ok := uiFind(v.Attrs, "tabSize"); ok && t.Num > 0 \{
+				tab = t.Num
+			}
+			r.out.WriteString(">")
+			if n, ok := uiFind(v.Attrs, "numbers"); ok && n.Flag \{
+				r.out.WriteString("<pre class=\"h-gutter\" aria-hidden=\"true\">\n")
+				r.gutter(v)
+				r.out.WriteString("</pre>")
+			}
+			sized := " style=\"tab-size:" + strconv.Itoa(tab) + "\""
+			r.out.WriteString("<div class=\"h-code-body\"><div class=\"h-curline\"></div><pre class=\"h-runs\" aria-hidden=\"true\"")
+			r.out.WriteString(sized)
+			r.out.WriteString(">\n")
+			for _, m := range v.Marks \{
+				if m.Kind == "band" && len(m.Nums) == 2 \{
+					if css := uiRunColour(m.Text); css != "" \{
+						r.out.WriteString("<span class=\"h-band\" style=\"top:calc(8px + ")
+						r.out.WriteString(strconv.Itoa(int(m.Nums[0])))
+						r.out.WriteString(" * 1.5em);background:")
+						r.out.WriteString(css)
+						r.out.WriteString("\"></span>")
+					}
+				}
+			}
+			uiRunsTo(&r.out, v.Text, v.Marks)
+			r.out.WriteString("\n</pre><textarea class=\"h-mono\" spellcheck=\"false\" wrap=\"off\" autocomplete=\"off\" autocapitalize=\"off\"")
+			r.out.WriteString(sized)
+			r.out.WriteString(r.disabled(v.Attrs))
+			if ro, ok := uiFind(v.Attrs, "readOnly"); ok && ro.Flag \{
+				r.out.WriteString(" readonly")
+			}
+			r.out.WriteString(">\n")
+			uiEscapeTo(&r.out, v.Text)
+			r.out.WriteString("</textarea></div></div>")
+		}
+
+		// One number a line, and a line a marker names carries its tone at the edge.
+		func (r *uiRender) gutter(v UiView) \{
+			lines := strings.Count(v.Text, "\n") + 1
+			marked := map[int]string\{}
+			for _, m := range v.Marks \{
+				if m.Kind == "marker" && len(m.Nums) == 2 \{
+					if css := uiRunColour(m.Text); css != "" \{
+						marked[int(m.Nums[0])] = css
+					}
+				}
+			}
+			for i := 0; i < lines; i++ \{
+				if css, ok := marked[i]; ok \{
+					r.out.WriteString("<span class=\"h-mk\" style=\"box-shadow:inset 3px 0 0 ")
+					r.out.WriteString(css)
+					r.out.WriteString("\">")
+					r.out.WriteString(strconv.Itoa(i + 1))
+					r.out.WriteString("</span>\n")
+					continue
+				}
+				r.out.WriteString(strconv.Itoa(i + 1))
+				r.out.WriteString("\n")
+			}
+		}
+
+		// What a run's tone is to a stylesheet: a colour as written, a role as the
+		// role's own variable, and nothing for Normal.
+		func uiRunColour(tone string) string \{
+			if css, ok := uiToneColour(tone); ok \{
+				return css
+			}
+			switch tone \{
+			case "Muted":
+				return "var(--muted)"
+			case "Good":
+				return "var(--good)"
+			case "Warn":
+				return "var(--warn)"
+			case "Danger":
+				return "var(--danger)"
+			}
+			return ""
+		}
+
+		// The text cut where any run starts or ends, each piece in what covers it: the
+		// run given last wins where two of a kind overlap, as a later style rule does.
+		func uiRunsTo(out *strings.Builder, text string, runs []UiRun) \{
+			type cut struct \{
+				at    int
+				run   int
+				start bool
+				note  bool
+			}
+			var cuts []cut
+			for i, m := range runs \{
+				if m.Kind == "note" || m.Kind == "marker" || m.Kind == "band" || len(m.Nums) != 2 || m.Nums[1] <= m.Nums[0] \{
+					continue
+				}
+				cuts = append(cuts, cut\{int(m.Nums[0]), i, true, false})
+				cuts = append(cuts, cut\{int(m.Nums[1]), i, false, false})
+			}
+			// A note goes where its line ends, in characters.
+			var notes []int
+			for i, m := range runs \{
+				if m.Kind == "note" && len(m.Nums) == 2 \{
+					notes = append(notes, i)
+				}
+			}
+			if len(notes) > 0 \{
+				ends := []int\{}
+				line, at := 0, 0
+				for _, r := range text \{
+					if r == '\n' \{
+						ends = append(ends, at)
+						line++
+					}
+					at++
+				}
+				ends = append(ends, at)
+				for _, i := range notes \{
+					if line := int(runs[i].Nums[0]); line >= 0 && line < len(ends) \{
+						cuts = append(cuts, cut\{ends[line], i, false, true})
+					}
+				}
+			}
+			if len(cuts) == 0 \{
+				uiEscapeTo(out, text)
+				return
+			}
+			sort.SliceStable(cuts, func(i, j int) bool \{ return cuts[i].at < cuts[j].at })
+			live := map[int]bool\{}
+			chars := []rune(text)
+			at := 0
+			piece := func(to int) \{
+				to = max(0, min(to, len(chars)))
+				if to <= at \{
+					return
+				}
+				ink, shade, wave, line := -1, -1, -1, -1
+				for i := range live \{
+					switch runs[i].Kind \{
+					case "ink":
+						ink = max(ink, i)
+					case "shade":
+						shade = max(shade, i)
+					case "squiggle":
+						wave = max(wave, i)
+					case "underline":
+						line = max(line, i)
+					}
+				}
+				style := ""
+				if ink >= 0 \{
+					if css := uiRunColour(runs[ink].Text); css != "" \{
+						style += "color:" + css + ";"
+					}
+				}
+				if shade >= 0 \{
+					if css := uiRunColour(runs[shade].Text); css != "" \{
+						style += "background:" + css + ";"
+					}
+				}
+				if wave >= 0 \{
+					css := uiRunColour(runs[wave].Text)
+					if css == "" \{
+						css = "currentColor"
+					}
+					style += "text-decoration:underline wavy " + css + ";text-decoration-skip-ink:none;"
+				} else if line >= 0 \{
+					css := uiRunColour(runs[line].Text)
+					if css == "" \{
+						css = "currentColor"
+					}
+					style += "text-decoration:underline " + css + ";"
+				}
+				if style != "" \{
+					out.WriteString("<span style=\"")
+					out.WriteString(style)
+					out.WriteString("\">")
+				}
+				uiEscapeTo(out, string(chars[at:to]))
+				if style != "" \{
+					out.WriteString("</span>")
+				}
+				at = to
+			}
+			for _, c := range cuts \{
+				piece(c.at)
+				if c.note \{
+					css := uiRunColour(runs[c.run].Text)
+					out.WriteString("<span class=\"h-note\" data-note=\"")
+					uiEscapeTo(out, uiNoteText(runs[c.run]))
+					out.WriteString("\"")
+					if css != "" \{
+						out.WriteString(" style=\"color:")
+						out.WriteString(css)
+						out.WriteString("\"")
+					}
+					out.WriteString("></span>")
+					continue
+				}
+				if c.start \{
+					live[c.run] = true
+				} else \{
+					delete(live, c.run)
+				}
+			}
+			piece(len(chars))
+		}
+
 		func (r *uiRender) common(kind string, attrs []UiAttr) \{
 			b := r.scratch[:0]
 			b = append(b, " class=\""...)
@@ -8518,6 +8879,50 @@ func uiSource(): Str {
 			if touch, ok := uiFind(attrs, "touch"); ok \{
 				b = append(b, " data-touch=\""...)
 				b = uiEscapeInto(b, touch.Word)
+				b = append(b, '"')
+			}
+			if title, ok := uiFind(attrs, "title"); ok \{
+				b = append(b, " data-title=\""...)
+				b = uiEscapeInto(b, title.Word)
+				b = append(b, '"')
+			}
+			if keys, ok := uiFind(attrs, "keys"); ok \{
+				b = append(b, " data-keys=\""...)
+				b = uiEscapeInto(b, keys.Word)
+				b = append(b, '"')
+			}
+			if f, ok := uiFind(attrs, "focus"); ok \{
+				b = append(b, " data-focus=\""...)
+				b = strconv.AppendInt(b, int64(f.Num), 10)
+				b = append(b, '"')
+			}
+			if c, ok := uiFind(attrs, "clip"); ok \{
+				b = append(b, " data-clip=\""...)
+				b = strconv.AppendInt(b, int64(c.Num), 10)
+				b = append(b, "\" data-clip-text=\""...)
+				b = uiEscapeInto(b, c.Word)
+				b = append(b, '"')
+			}
+			if p, ok := uiFind(attrs, "perform"); ok \{
+				b = append(b, " data-perform=\""...)
+				b = uiEscapeInto(b, p.Word)
+				b = append(b, ',')
+				b = strconv.AppendInt(b, int64(p.Num), 10)
+				b = append(b, '"')
+			}
+			heard := len(b)
+			for _, a := range attrs \{
+				switch a.Kind \{
+				case "onMenu", "onMiddle", "onDouble", "onDrag", "onHover", "onJump", "onPaste", "onProbe":
+					if len(b) == heard \{
+						b = append(b, " data-ev=\""...)
+					} else \{
+						b = append(b, ' ')
+					}
+					b = append(b, strings.ToLower(a.Kind[2:])...)
+				}
+			}
+			if len(b) > heard \{
 				b = append(b, '"')
 			}
 			if r.handlers != nil && uiHasEvent(attrs) \{
@@ -8567,6 +8972,9 @@ func uiSource(): Str {
 				open := "<div class=\"" + shade + "\""
 				if pinned != "" \{
 					open += " style=\"" + pinned + "\""
+				}
+				if a, ok := uiFind(v.Attrs, "anchor"); ok \{
+					open = "<div class=\"h-backdrop h-pinned h-anchored\" data-anchor=\"" + a.Word + "\""
 				}
 				r.out.WriteString(open + r.backdrop(v.Attrs) + ">")
 				r.out.WriteString("<div")
@@ -8645,6 +9053,8 @@ func uiSource(): Str {
 					r.out.WriteString("\"")
 				}
 				r.out.WriteString(">")
+			case "code":
+				r.code(v)
 			case "textarea":
 				r.out.WriteString("<textarea")
 				r.common(v.Kind, v.Attrs)
@@ -9158,10 +9568,25 @@ func uiSource(): Str {
 		`
 		  if (head === "P") \{
 		    if (uiApply(e.data.slice(1)) && attachScene) \{ attachScene(); }
+		    uiTitle();
+		    uiCodeSync();
+		    uiAnchorSync();
 		    return;
 		  }
 		  if (uiPatch(e.data.slice(1)) && attachScene) \{ attachScene(); }
+		  uiTitle();
+		  uiCodeSync();
+		  uiAnchorSync();
 		};
+		`,
+		// The window's title is the outermost widget's `title`, where it gives one:
+		// the document's own is what a browser puts on the window and the taskbar.
+		`
+		function uiTitle() \{
+		  var top = root.firstElementChild;
+		  var title = top && top.getAttribute("data-title");
+		  if (title && document.title !== title) \{ document.title = title; }
+		}
 		sock.onclose = function () \{ document.body.classList.add("h-closed"); };
 		function send(id, kind, value, index) \{
 		  if (sock.readyState !== 1) \{ return; }
@@ -9340,6 +9765,7 @@ func uiSource(): Str {
 		    return;
 		  }
 		  if (name === "TEXTAREA") \{
+		    if (a.classList.contains("h-mono")) \{ uiCodeDress(a, written); return; }
 		    if (a.value !== written) \{ a.value = written; }
 		    return;
 		  }
@@ -9462,6 +9888,436 @@ func uiSource(): Str {
 		  if (!el || e.target.tagName !== "SELECT") \{ return; }
 		  send(el.getAttribute("data-h"), "choose", e.target.value, 0);
 		});
+		`,
+		// A key a widget took with `keys`: the innermost one around the focus that
+		// names it, or names Any, hears it, and the page does nothing else with it.
+		// The name is what the key types when nothing but Shift is held, and the key
+		// itself — modifiers first, Ctrl then Shift then Alt — when anything else is.
+		`
+		var uiPunct = \{Backquote: "\x60", Minus: "-", Equal: "=", BracketLeft: "[", BracketRight: "]",
+		  Backslash: "\\", Semicolon: ";", Quote: "'", Comma: ",", Period: ".", Slash: "/", IntlBackslash: "\\"};
+		function uiKeyName(e) \{
+		  var key = e.key;
+		  if (key === "Control" || key === "Shift" || key === "Alt" || key === "Meta" || key === "AltGraph") \{ return ""; }
+		  var held = e.ctrlKey || e.metaKey || e.altKey;
+		  if (key === " ") \{ key = "Space"; }
+		  else if (key === "Esc") \{ key = "Escape"; }
+		  else if (key === "Dead" || key === "Unidentified" || (key.length === 1 && held)) \{
+		    var code = e.code || "";
+		    if (code.indexOf("Key") === 0) \{ key = code.slice(3); }
+		    else if (code.indexOf("Digit") === 0) \{ key = code.slice(5); }
+		    else if (uiPunct[code]) \{ key = uiPunct[code]; }
+		    else if (key.length === 1) \{ key = key.toUpperCase(); }
+		    else \{ return ""; }
+		  } else if (key.length === 1) \{ return key; }
+		  return (e.ctrlKey || e.metaKey ? "Ctrl+" : "") + (e.shiftKey ? "Shift+" : "") + (e.altKey ? "Alt+" : "") + key;
+		}
+		document.addEventListener("keydown", function (e) \{
+		  if (e.isComposing) \{ return; }
+		  var name = uiKeyName(e);
+		  if (!name) \{ return; }
+		  if (uiClaim(e, name)) \{ return; }
+		  var ta = e.target;
+		  if (ta && ta.classList && ta.classList.contains("h-mono") && !ta.disabled) \{
+		    if (name === "Tab") \{ e.preventDefault(); uiCodeType(ta, "\t"); }
+		    else if (name === "Enter") \{
+		      e.preventDefault();
+		      var start = ta.value.lastIndexOf("\n", ta.selectionStart - 1) + 1;
+		      var indent = /^[\t ]*/.exec(ta.value.slice(start, ta.selectionStart))[0];
+		      uiCodeType(ta, "\n" + indent);
+		    }
+		  }
+		}, true);
+		document.addEventListener("paste", function (e) \{
+		  var el = uiHearer(e.target, "paste");
+		  if (!el) \{ return; }
+		  e.preventDefault();
+		  send(el.getAttribute("data-h"), "paste", (e.clipboardData || window.clipboardData).getData("text"), 0);
+		}, true);
+		function uiClaim(e, name) \{
+		  if ((name === "Ctrl+V" || name === "Shift+Insert") && uiHearer(e.target, "paste")) \{ return false; }
+		  var el = e.target && root.contains(e.target) ? e.target : root.firstElementChild;
+		  for (; el && el !== root; el = el.parentNode) \{
+		    var keys = el.getAttribute && el.getAttribute("data-keys");
+		    if (!keys || !el.getAttribute("data-h")) \{ continue; }
+		    var list = keys.split(" ");
+		    if (list.indexOf(name) < 0 && list.indexOf("Any") < 0) \{ continue; }
+		    e.preventDefault();
+		    e.stopPropagation();
+		    send(el.getAttribute("data-h"), "key", name, 0);
+		    return true;
+		  }
+		  return false;
+		}
+		`,
+		// A code editor. The textarea is what is typed into and the pre under it is
+		// what is seen; an edit is told to the program as what it replaced, counted in
+		// characters, and painted into the pre's own text at once so nothing waits on
+		// the program to be seen. The program's next document repaints it properly.
+		//
+		// What has been typed is kept until the program has seen it, as a native field
+		// keeps it: a document that answers an older edit does not take back a newer one.
+		`
+		var uiSurrogate = /[\uD800-\uDFFF]/;
+		function uiRunes(s, units) \{
+		  if (!uiSurrogate.test(s)) \{ return units; }
+		  var n = 0;
+		  for (var i = 0; i < units; i++) \{ var c = s.charCodeAt(i); if (c < 0xDC00 || c > 0xDFFF) \{ n++; } }
+		  return n;
+		}
+		function uiUnits(s, runes) \{
+		  if (!uiSurrogate.test(s)) \{ return Math.max(0, Math.min(runes, s.length)); }
+		  var i = 0, n = 0;
+		  while (i < s.length && n < runes) \{ var c = s.charCodeAt(i); i += c >= 0xD800 && c < 0xDC00 ? 2 : 1; n++; }
+		  return i;
+		}
+		function uiCodeState(ta) \{
+		  if (!ta.__code) \{ ta.__code = \{ value: ta.value, sent: [], caret: null, told: null, view: null }; }
+		  return ta.__code;
+		}
+		function uiCodeType(ta, text) \{
+		  if (!document.execCommand("insertText", false, text)) \{
+		    ta.setRangeText(text, ta.selectionStart, ta.selectionEnd, "end");
+		    ta.dispatchEvent(new Event("input", \{ bubbles: true }));
+		  }
+		}
+		document.addEventListener("input", function (e) \{
+		  var ta = e.target;
+		  if (!ta || !ta.classList || !ta.classList.contains("h-mono")) \{ return; }
+		  e.stopPropagation();
+		  var box = ta.closest(".h-code"), s = uiCodeState(ta);
+		  var was = s.value, now = ta.value, a = 0, top = Math.min(was.length, now.length);
+		  while (a < top && was.charCodeAt(a) === now.charCodeAt(a)) \{ a++; }
+		  var zw = was.length, zn = now.length;
+		  while (zw > a && zn > a && was.charCodeAt(zw - 1) === now.charCodeAt(zn - 1)) \{ zw--; zn--; }
+		  if (a > 0 && (was.charCodeAt(a - 1) & 0xFC00) === 0xD800) \{ a--; }
+		  if (zw < was.length && (was.charCodeAt(zw) & 0xFC00) === 0xDC00) \{ zw++; zn++; }
+		  s.value = now;
+		  s.sent.push(now);
+		  if (s.sent.length > 64) \{ s.sent.shift(); }
+		  uiCodePaint(box, a, zw, now.slice(a, zn));
+		  var id = box && box.getAttribute("data-h");
+		  if (!id) \{ return; }
+		  send(id, "edit", uiRunes(was, a) + "," + uiRunes(was, zw) + "," + now.slice(a, zn), 0);
+		  if (box.hasAttribute("data-whole")) \{ send(id, "input", now, 0); }
+		}, true);
+		function uiCodePaint(box, a, z, text) \{
+		  var pre = box && box.querySelector(".h-runs");
+		  if (!pre) \{ return; }
+		  var walk = document.createTreeWalker(pre, NodeFilter.SHOW_TEXT), node, at = 0, first = null;
+		  while ((node = walk.nextNode())) \{
+		    var len = node.nodeValue.length, end = at + len;
+		    if (first === null && a <= end) \{
+		      var v = node.nodeValue;
+		      node.nodeValue = v.slice(0, a - at) + text + v.slice(Math.min(z, end) - at);
+		      first = node;
+		      if (z <= end) \{ break; }
+		    } else if (first !== null) \{
+		      node.nodeValue = node.nodeValue.slice(Math.min(z, end) - at);
+		      if (z <= end) \{ break; }
+		    }
+		    at = end;
+		  }
+		}
+		function uiCodeDress(ta, written) \{
+		  var s = uiCodeState(ta);
+		  if (ta.value === written) \{ s.sent = []; s.value = written; return; }
+		  if (document.activeElement === ta) \{
+		    var seen = s.sent.lastIndexOf(written);
+		    if (seen >= 0) \{ s.sent = s.sent.slice(seen + 1); return; }
+		  }
+		  var from = ta.selectionStart, to = ta.selectionEnd, top = ta.scrollTop, left = ta.scrollLeft;
+		  ta.value = written;
+		  s.value = written;
+		  s.sent = [];
+		  ta.setSelectionRange(Math.min(from, written.length), Math.min(to, written.length));
+		  ta.scrollTop = top;
+		  ta.scrollLeft = left;
+		}
+		`,
+		// After every document: a selection the program set is put where it said, the
+		// copy and the numbers follow the textarea's scroll, and the lines in view are
+		// told where they changed.
+		`
+		function uiCodeSync() \{
+		  var boxes = root.querySelectorAll(".h-code");
+		  for (var i = 0; i < boxes.length; i++) \{
+		    var box = boxes[i], ta = box.querySelector(".h-mono");
+		    if (!ta) \{ continue; }
+		    var font = box.getAttribute("data-font");
+		    box.style.fontSize = font ? font + "px" : "";
+		    var s = uiCodeState(ta), want = box.getAttribute("data-caret");
+		    if (want !== null && want !== s.caret) \{
+		      s.caret = want;
+		      var p = want.split(","), v = ta.value;
+		      s.told = p[0] + "," + p[1];
+		      var anchor = uiUnits(v, p[0] | 0), head = uiUnits(v, p[1] | 0);
+		      ta.setSelectionRange(Math.min(anchor, head), Math.max(anchor, head), head < anchor ? "backward" : "forward");
+		      uiCodeReveal(ta, head);
+		    }
+		    uiCodeScrolled(box, ta);
+		  }
+		  var clips = root.querySelectorAll("[data-clip]");
+		  for (var c = 0; c < clips.length; c++) \{
+		    var holder = clips[c], serial = holder.getAttribute("data-clip");
+		    if (holder.__clip !== undefined && holder.__clip !== serial && navigator.clipboard) \{
+		      navigator.clipboard.writeText(holder.getAttribute("data-clip-text")).catch(function () \{});
+		    }
+		    holder.__clip = serial;
+		  }
+		  var asks = root.querySelectorAll("[data-perform]");
+		  for (var p = 0; p < asks.length; p++) \{
+		    var field = asks[p], said = field.getAttribute("data-perform");
+		    var seen = field.__perform;
+		    field.__perform = said;
+		    if (seen === undefined || seen === said) \{ continue; }
+		    var command = said.slice(0, said.lastIndexOf(","));
+		    var area = field.matches("input,textarea") ? field : field.querySelector("textarea,input");
+		    if (!area) \{ continue; }
+		    area.focus();
+		    if (command === "selectAll") \{ area.select(); }
+		    else if (command === "paste") \{
+		      if (navigator.clipboard && navigator.clipboard.readText) \{
+		        navigator.clipboard.readText().then(function (text) \{ document.execCommand("insertText", false, text); }).catch(function () \{});
+		      }
+		    } else \{ document.execCommand(command); }
+		  }
+		  var asked = root.querySelectorAll("[data-focus]");
+		  for (var k = 0; k < asked.length; k++) \{
+		    var el = asked[k], want = el.getAttribute("data-focus");
+		    if (el.__focus === want) \{ continue; }
+		    el.__focus = want;
+		    var target = el.matches("input,textarea,select,button,a") ? el : el.querySelector("textarea,input,select,button,a");
+		    if (target && target.focus) \{ target.focus(); }
+		  }
+		}
+		function uiCodeLine(ta) \{
+		  var lh = parseFloat(getComputedStyle(ta).lineHeight);
+		  return lh > 0 ? lh : 19.5;
+		}
+		var uiMeasure = null;
+		function uiCodeReveal(ta, head) \{
+		  var v = ta.value, lh = uiCodeLine(ta), pad = 8;
+		  var start = v.lastIndexOf("\n", head - 1) + 1, line = 0;
+		  for (var i = 0; i < start; i++) \{ if (v.charCodeAt(i) === 10) \{ line++; } }
+		  var y = pad + line * lh;
+		  if (y < ta.scrollTop + pad) \{ ta.scrollTop = Math.max(0, y - pad); }
+		  else if (y + lh > ta.scrollTop + ta.clientHeight - pad) \{ ta.scrollTop = y + lh - ta.clientHeight + pad; }
+		  if (!uiMeasure) \{ uiMeasure = document.createElement("canvas").getContext("2d"); }
+		  uiMeasure.font = getComputedStyle(ta).font;
+		  var tab = parseInt(ta.style.tabSize, 10) || 4, cols = 0;
+		  for (var j = start; j < head; j++) \{ cols = v.charCodeAt(j) === 9 ? (Math.floor(cols / tab) + 1) * tab : cols + 1; }
+		  var x = 12 + cols * uiMeasure.measureText("M").width;
+		  if (x < ta.scrollLeft + 12) \{ ta.scrollLeft = Math.max(0, x - 40); }
+		  else if (x > ta.scrollLeft + ta.clientWidth - 12) \{ ta.scrollLeft = x - ta.clientWidth + 40; }
+		}
+		function uiCodeScrolled(box, ta) \{
+		  var pre = box.querySelector(".h-runs"), gutter = box.querySelector(".h-gutter");
+		  var top = ta.scrollTop, left = ta.scrollLeft, lh = uiCodeLine(ta);
+		  if (pre) \{ pre.style.transform = "translate(" + -left + "px," + -top + "px)"; }
+		  if (gutter) \{ gutter.style.transform = "translateY(" + -top + "px)"; }
+		  var cur = box.querySelector(".h-curline");
+		  if (cur) \{
+		    var v = ta.value, at = ta.selectionStart, line = 0;
+		    if (document.activeElement === ta && ta.selectionStart === ta.selectionEnd) \{
+		      for (var i = 0; i < at; i++) \{ if (v.charCodeAt(i) === 10) \{ line++; } }
+		      cur.style.display = "block";
+		      cur.style.height = lh + "px";
+		      cur.style.transform = "translateY(" + (8 + line * lh - top) + "px)";
+		    } else \{
+		      cur.style.display = "none";
+		    }
+		  }
+		  var id = box.getAttribute("data-h");
+		  if (!id) \{ return; }
+		  var lines = 1;
+		  for (var k = 0; k < ta.value.length; k++) \{ if (ta.value.charCodeAt(k) === 10) \{ lines++; } }
+		  var first = Math.max(0, Math.floor((top) / lh));
+		  var last = Math.min(lines - 1, Math.floor((top + ta.clientHeight - 16) / lh));
+		  var view = first + "," + Math.max(first, last), s = uiCodeState(ta);
+		  if (view !== s.view) \{ s.view = view; send(id, "view", view, 0); }
+		  var fit = Math.max(1, Math.floor((ta.clientWidth - 24) / uiCodeCell(ta))) + "," + Math.max(1, Math.floor((ta.clientHeight - 16) / lh));
+		  if (fit !== s.fit) \{ s.fit = fit; send(id, "fit", fit, 0); }
+		}
+		document.addEventListener("scroll", function (e) \{
+		  var ta = e.target;
+		  if (ta && ta.classList && ta.classList.contains("h-mono")) \{ uiCodeScrolled(ta.closest(".h-code"), ta); }
+		}, true);
+		window.addEventListener("resize", function () \{ uiCodeSync(); uiAnchorSync(); });
+		`,
+		// The pointer's own events: a right click, a middle click, a double click, a
+		// drag. Each goes to the innermost element around the pointer that hears it.
+		`
+		function uiHearer(el, ev) \{
+		  for (; el && el !== root && el.getAttribute; el = el.parentNode) \{
+		    var heard = el.getAttribute("data-ev");
+		    if (heard && el.getAttribute("data-h") && (" " + heard + " ").indexOf(" " + ev + " ") >= 0) \{ return el; }
+		  }
+		  return null;
+		}
+		var uiSpot = \{ x: 0, y: 0 }, uiDragging = null, uiDragOwed = false;
+		document.addEventListener("mousedown", function (e) \{
+		  uiSpot = \{ x: e.clientX, y: e.clientY };
+		  var open = root.querySelectorAll(".h-anchored[data-h]");
+		  for (var i = 0; i < open.length; i++) \{
+		    var panel = open[i].firstElementChild;
+		    if (panel && !panel.contains(e.target)) \{ send(open[i].getAttribute("data-h"), "click", "", 0); }
+		  }
+		  if (e.button === 1 && uiHearer(e.target, "middle")) \{ e.preventDefault(); }
+		  if (e.button !== 0) \{ return; }
+		  var ta = e.target;
+		  if ((e.ctrlKey || e.metaKey) && ta.classList && ta.classList.contains("h-mono")) \{
+		    var box = uiHearer(ta, "jump"), at = box ? uiCodeAt(ta, e.clientX, e.clientY) : -1;
+		    if (at >= 0) \{ send(box.getAttribute("data-h"), "jump", at, 0); }
+		  }
+		  var drag = uiHearer(e.target, "drag");
+		  if (!drag || (e.target !== drag && e.target.closest("input,textarea,select,button,a"))) \{ return; }
+		  e.preventDefault();
+		  uiDragging = \{ id: drag.getAttribute("data-h"), x: e.clientX, y: e.clientY, dx: 0, dy: 0 };
+		}, true);
+		document.addEventListener("mousemove", function (e) \{
+		  if (uiDragging) \{
+		    uiDragging.dx = Math.round(e.clientX - uiDragging.x);
+		    uiDragging.dy = Math.round(e.clientY - uiDragging.y);
+		    if (!uiDragOwed) \{
+		      uiDragOwed = true;
+		      requestAnimationFrame(function () \{
+		        uiDragOwed = false;
+		        if (uiDragging) \{ send(uiDragging.id, "drag", uiDragging.dx + "," + uiDragging.dy + ",0", 0); }
+		      });
+		    }
+		    return;
+		  }
+		  var ta = e.target;
+		  if (!ta.classList || !ta.classList.contains("h-mono")) \{ return; }
+		  var box = uiHearer(ta, "hover");
+		  if (!box) \{ return; }
+		  var at = uiCodeAt(ta, e.clientX, e.clientY), s = uiCodeState(ta);
+		  if (at !== s.hover) \{ s.hover = at; send(box.getAttribute("data-h"), "hover", at, 0); }
+		}, true);
+		var uiProbeAt = null;
+		function uiProbe(ta, x, y, ctrl) \{
+		  var box = uiHearer(ta, "probe");
+		  if (!box) \{ return; }
+		  var at = ctrl ? uiCodeAt(ta, x, y) : -1, s = uiCodeState(ta);
+		  ta.closest(".h-code").classList.toggle("h-ctrl", ctrl && at >= 0);
+		  if (at !== s.probe && (s.probe !== undefined || at >= 0)) \{ s.probe = at; send(box.getAttribute("data-h"), "probe", at, 0); }
+		}
+		document.addEventListener("mousemove", function (e) \{
+		  var ta = e.target;
+		  if (!ta.classList || !ta.classList.contains("h-mono")) \{ uiProbeAt = null; return; }
+		  uiProbeAt = \{ ta: ta, x: e.clientX, y: e.clientY };
+		  uiProbe(ta, e.clientX, e.clientY, e.ctrlKey || e.metaKey);
+		}, true);
+		["keydown", "keyup"].forEach(function (name) \{
+		  document.addEventListener(name, function (e) \{
+		    if ((e.key === "Control" || e.key === "Meta") && uiProbeAt) \{
+		      uiProbe(uiProbeAt.ta, uiProbeAt.x, uiProbeAt.y, name === "keydown");
+		    }
+		  }, true);
+		});
+		document.addEventListener("mouseout", function (e) \{
+		  var ta = e.target;
+		  if (ta && ta.classList && ta.classList.contains("h-mono")) \{
+		    var s = uiCodeState(ta), owner = uiHearer(ta, "probe");
+		    if (owner && s.probe !== undefined && s.probe !== -1) \{ s.probe = -1; send(owner.getAttribute("data-h"), "probe", -1, 0); }
+		  }
+		  if (!ta.classList || !ta.classList.contains("h-mono")) \{ return; }
+		  var box = uiHearer(ta, "hover"), s = uiCodeState(ta);
+		  if (box && s.hover !== -1 && s.hover !== undefined) \{ s.hover = -1; send(box.getAttribute("data-h"), "hover", -1, 0); }
+		}, true);
+		document.addEventListener("mouseup", function () \{
+		  if (!uiDragging) \{ return; }
+		  var d = uiDragging;
+		  uiDragging = null;
+		  send(d.id, "drag", d.dx + "," + d.dy + ",1", 0);
+		}, true);
+		document.addEventListener("contextmenu", function (e) \{
+		  uiSpot = \{ x: e.clientX, y: e.clientY };
+		  var el = uiHearer(e.target, "menu");
+		  if (!el) \{ return; }
+		  e.preventDefault();
+		  send(el.getAttribute("data-h"), "menu", "", 0);
+		}, true);
+		document.addEventListener("auxclick", function (e) \{
+		  var el = e.button === 1 && uiHearer(e.target, "middle");
+		  if (!el) \{ return; }
+		  e.preventDefault();
+		  send(el.getAttribute("data-h"), "middle", "", 0);
+		}, true);
+		document.addEventListener("dblclick", function (e) \{
+		  var el = uiHearer(e.target, "double");
+		  if (el) \{ send(el.getAttribute("data-h"), "double", "", 0); }
+		}, true);
+		`,
+		// The character of a code editor under a point, -1 where there is none: past
+		// the end of its line, or below its last.
+		`
+		function uiCodeCell(ta) \{
+		  if (!uiMeasure) \{ uiMeasure = document.createElement("canvas").getContext("2d"); }
+		  uiMeasure.font = getComputedStyle(ta).font;
+		  return uiMeasure.measureText("M").width || 8;
+		}
+		function uiCodeAt(ta, x, y) \{
+		  var r = ta.getBoundingClientRect(), lh = uiCodeLine(ta), cw = uiCodeCell(ta), v = ta.value;
+		  var line = Math.floor((y - r.top - 8 + ta.scrollTop) / lh), col = (x - r.left - 12 + ta.scrollLeft) / cw;
+		  if (line < 0 || col < 0) \{ return -1; }
+		  var at = 0;
+		  for (var l = 0; l < line; l++) \{ at = v.indexOf("\n", at); if (at < 0) \{ return -1; } at++; }
+		  var tab = parseInt(ta.style.tabSize, 10) || 4, c = 0;
+		  for (var i = at; i < v.length && v.charCodeAt(i) !== 10; i++) \{
+		    var next = v.charCodeAt(i) === 9 ? (Math.floor(c / tab) + 1) * tab : c + 1;
+		    if (col < next) \{ return uiRunes(v, i); }
+		    c = next;
+		  }
+		  return -1;
+		}
+		`,
+		// An anchored overlay opens where the pointer was last pressed, or under the
+		// caret of the code editor being typed in, and never past the window's edge:
+		// what does not fit below goes above.
+		`
+		function uiAnchorSync() \{
+		  var open = root.querySelectorAll(".h-anchored");
+		  for (var i = 0; i < open.length; i++) \{
+		    var panel = open[i].firstElementChild;
+		    if (!panel) \{ continue; }
+		    var x = uiSpot.x, y = uiSpot.y, above = y;
+		    var ta = document.activeElement;
+		    if (open[i].getAttribute("data-anchor") === "Caret" && ta && ta.classList && ta.classList.contains("h-mono")) \{
+		      var r = ta.getBoundingClientRect(), lh = uiCodeLine(ta), cw = uiCodeCell(ta), v = ta.value, at = ta.selectionEnd;
+		      var start = v.lastIndexOf("\n", at - 1) + 1, line = 0, tab = parseInt(ta.style.tabSize, 10) || 4, c = 0;
+		      for (var k = 0; k < start; k++) \{ if (v.charCodeAt(k) === 10) \{ line++; } }
+		      for (var j = start; j < at; j++) \{ c = v.charCodeAt(j) === 9 ? (Math.floor(c / tab) + 1) * tab : c + 1; }
+		      x = r.left + 12 + c * cw - ta.scrollLeft;
+		      above = r.top + 8 + line * lh - ta.scrollTop;
+		      y = above + lh;
+		    }
+		    var w = panel.offsetWidth, h = panel.offsetHeight;
+		    x = Math.max(4, Math.min(x, window.innerWidth - w - 4));
+		    if (y + h > window.innerHeight - 4) \{ y = Math.max(4, Math.min(above - h, window.innerHeight - h - 4)); }
+		    panel.style.left = x + "px";
+		    panel.style.top = Math.max(4, y) + "px";
+		  }
+		}
+		var uiCaretOwed = false;
+		document.addEventListener("selectionchange", function () \{
+		  var ta = document.activeElement;
+		  if (!ta || !ta.classList || !ta.classList.contains("h-mono") || uiCaretOwed) \{ return; }
+		  uiCaretOwed = true;
+		  requestAnimationFrame(function () \{
+		    uiCaretOwed = false;
+		    var box = ta.closest(".h-code");
+		    if (!box) \{ return; }
+		    uiCodeScrolled(box, ta);
+		    var v = ta.value, s = uiCodeState(ta), back = ta.selectionDirection === "backward";
+		    var anchor = uiRunes(v, back ? ta.selectionEnd : ta.selectionStart);
+		    var head = uiRunes(v, back ? ta.selectionStart : ta.selectionEnd);
+		    var said = anchor + "," + head, id = box.getAttribute("data-h");
+		    if (said !== s.told && id) \{ s.told = said; send(id, "caret", said, 0); }
+		    uiAnchorSync();
+		  });
+		});
 		root.addEventListener("keydown", function (e) \{
 		  if (e.key !== "Enter" || e.shiftKey) \{ return; }
 		  var el = holder(e.target);
@@ -9522,6 +10378,32 @@ func uiSource(): Str {
 		.h-input[type=range]\{padding:0;border:0;background:none;accent-color:var(--accent);cursor:pointer}
 		.h-textarea\{resize:vertical;min-height:64px;width:100%}
 		.h-checkbox\{display:inline-flex;align-items:center;gap:6px;cursor:pointer}
+		.h-noring:focus,.h-noring:focus-visible,.h-noring:focus-within\{outline:none}
+		.h-code.h-noring:focus-within\{border-color:var(--line)}
+		.h-button[style*="background"]:hover:not(:disabled)\{border-color:transparent;filter:brightness(1.15)}
+		.h-hover:hover:not(:disabled)\{background:var(--hv)!important;filter:none;text-decoration:none}
+		.h-link.h-hover:hover,.h-hover .h-link:hover\{text-decoration:none}
+		.h-code.h-ctrl .h-mono\{cursor:pointer}
+		.h-scroll-x>*\{flex-shrink:0}
+		.h-code\{display:flex;position:relative;min-height:64px;min-width:0;overflow:hidden;
+		border:1px solid var(--line);border-radius:8px;background:var(--bg);
+		font:13px/1.5 ui-monospace,"Cascadia Mono","Cascadia Code",Consolas,"Liberation Mono","DejaVu Sans Mono",monospace}
+		.h-code:focus-within\{border-color:var(--accent)}
+		.h-gutter\{margin:0;padding:8px 10px 8px 12px;font:inherit;text-align:right;color:var(--muted);
+		opacity:.75;user-select:none;white-space:pre;flex:none;will-change:transform}
+		.h-mk\{display:inline-block;width:100%;margin-left:-12px;padding-left:12px}
+		.h-code-body\{position:relative;flex:1;min-width:0;overflow:hidden}
+		.h-runs,.h-mono\{margin:0;padding:8px 12px;font:inherit;white-space:pre;letter-spacing:0}
+		.h-runs\{position:absolute;left:0;top:0;min-width:100%;pointer-events:none;color:inherit;will-change:transform}
+		.h-mono\{position:absolute;inset:0;width:100%;height:100%;resize:none;border:0;outline:0;
+		background:transparent;color:inherit;-webkit-text-fill-color:transparent;overflow:auto;box-sizing:border-box}
+		.h-mono::selection\{background:color-mix(in srgb,var(--accent) 35%,transparent);-webkit-text-fill-color:transparent}
+		.h-mono:disabled\{cursor:default}
+		.h-band\{position:absolute;left:0;right:0;height:1.5em;pointer-events:none;z-index:-1}
+		.h-runs\{z-index:0;isolation:isolate}
+		.h-note::after\{content:attr(data-note);padding-left:3ch;font-style:italic;opacity:.9}
+		.h-curline\{position:absolute;left:0;right:0;top:0;display:none;pointer-events:none;
+		background:color-mix(in srgb,var(--fg) 6%,transparent)}
 		.h-table\{border-collapse:collapse;width:100%}
 		.h-table th,.h-table td\{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);
 		overflow-wrap:anywhere}
@@ -9534,6 +10416,8 @@ func uiSource(): Str {
 		.h-pinned>.h-overlay\{background:none;box-shadow:none;pointer-events:auto;
 		display:flex;max-height:none;border-radius:0}
 		[data-touch]\{touch-action:none;user-select:none;-webkit-user-select:none}
+		.h-anchored>.h-overlay\{position:fixed;left:0;top:0;display:block;max-height:70vh;overflow:auto;
+		background:var(--bg);border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.25)}
 		.h-overlay\{background:var(--bg);border-radius:16px;max-height:85vh;overflow:auto;
 		max-width:calc(100vw - 24px);box-shadow:0 12px 40px rgba(0,0,0,.3)}
 		.h-spinner\{width:18px;height:18px;border:2px solid var(--line);
@@ -10279,6 +11163,16 @@ func uiSource(): Str {
 			return uiMeaning(attrs, kind, value, index)
 		}
 
+		// "12,30,rest" as 12, 30 and whatever follows the second comma, commas and all:
+		// an edit's text, a selection's or a view's nothing.
+		func uiCut(value string) (int, int, string) \{
+			a, rest, _ := strings.Cut(value, ",")
+			b, text, _ := strings.Cut(rest, ",")
+			x, _ := strconv.Atoi(a)
+			y, _ := strconv.Atoi(b)
+			return x, y, text
+		}
+
 		func uiMeaning(attrs []UiAttr, kind string, value string, index int) (any, bool) \{
 			for _, a := range attrs \{
 				h := a.heard
@@ -10296,6 +11190,33 @@ func uiSource(): Str {
 					return h.FnStr(value), true
 				case kind == "submit" && a.Kind == "onSubmit" && h.FnStr != nil:
 					return h.FnStr(value), true
+				case kind == "key" && a.Kind == "onKey" && h.FnStr != nil:
+					return h.FnStr(value), true
+				case kind == "paste" && a.Kind == "onPaste" && h.FnStr != nil:
+					return h.FnStr(value), true
+				case kind == "caret" && a.Kind == "onCaret" && h.FnSize != nil:
+					anchor, head, _ := uiCut(value)
+					return h.FnSize(anchor, head), true
+				case kind == "view" && a.Kind == "onView" && h.FnSize != nil:
+					first, last, _ := uiCut(value)
+					return h.FnSize(first, last), true
+				case kind == "fit" && a.Kind == "onFit" && h.FnSize != nil:
+					cols, rows, _ := uiCut(value)
+					return h.FnSize(cols, rows), true
+				case kind == "edit" && a.Kind == "onEdit" && h.FnEdit != nil:
+					from, to, text := uiCut(value)
+					return h.FnEdit(from, to, text), true
+				case kind == "menu" && a.Kind == "onMenu", kind == "middle" && a.Kind == "onMiddle",
+					kind == "double" && a.Kind == "onDouble":
+					return h.Msg, true
+				case kind == "drag" && a.Kind == "onDrag" && h.FnDrag != nil:
+					x, y, done := uiCut(value)
+					return h.FnDrag(x, y, done == "1"), true
+				case kind == "hover" && a.Kind == "onHover" && h.FnInt != nil,
+					kind == "jump" && a.Kind == "onJump" && h.FnInt != nil,
+					kind == "probe" && a.Kind == "onProbe" && h.FnInt != nil:
+					at, _ := strconv.Atoi(value)
+					return h.FnInt(at), true
 				case kind == "choose" && a.Kind == "onChoose" && h.FnStr != nil:
 					return h.FnStr(value), true
 				case kind == "toggle" && a.Kind == "onToggle" && h.FnBool != nil:
@@ -10368,6 +11289,7 @@ func uiSource(): Str {
 				}
 				if uiNativePainter != nil && !page && os.Getenv("HIVE_WINDOW") != "print" \{
 					w.painter = uiNativePainter()
+					uiCrashLog()
 				}
 				tally := uiFoldTally()
 				folded := func(state *S, msg M, t syslinkTurn) M \{
@@ -10707,9 +11629,27 @@ func uiSource(): Str {
 			}
 		}
 
+		// A window drawn by the program itself usually has no console, so what a
+		// crash prints would go nowhere: it is also kept, appended, in
+		// <temp>/<program>-crash.log.
+		var uiCrashOnce sync.Once
+
+		func uiCrashLog() \{
+			uiCrashOnce.Do(func() \{
+				name := strings.TrimSuffix(filepath.Base(os.Args[0]), filepath.Ext(os.Args[0]))
+				path := filepath.Join(os.TempDir(), name+"-crash.log")
+				f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+				if err != nil \{
+					return
+				}
+				debug.SetCrashOutput(f, debug.CrashOptions\{})
+				f.Close()
+			})
+		}
+
 		func uiDrawnAfter(kind string) bool \{
 			switch kind \{
-			case "frame", "click", "input", "submit", "choose", "toggle":
+			case "frame", "click", "input", "submit", "choose", "toggle", "key", "edit", "menu", "middle", "double", "jump":
 				return true
 			}
 			return false

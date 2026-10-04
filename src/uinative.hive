@@ -160,6 +160,7 @@ func coreSource(): Str {
 			px     float64
 			weight int
 			icon   bool
+			mono   bool
 		}
 
 		type uiClip struct\{ x0, y0, x1, y1 int }
@@ -251,19 +252,57 @@ func coreSource(): Str {
 			cv.flush()
 			cx, cy := (x0+x1)/2, (y0+y1)/2
 			hx, hy := (x1-x0)/2-radius, (y1-y0)/2-radius
+			// The columns between the corners: every pixel of a row there is the
+			// same distance from the edge, so the row's cover there is one number.
+			// Only the corners are worked out a pixel at a time.
+			band0, band1 := uiBand(cx, hx, r.x0, r.x1)
+			solid := uiPack(c)
 			for y := r.y0; y < r.y1; y++ \{
 				row := cv.pix[y*cv.w : (y+1)*cv.w]
 				qy := math.Abs(float64(y)+0.5-cy) - hy
-				for x := r.x0; x < r.x1; x++ \{
+				at := func(x int) float64 \{
 					qx := math.Abs(float64(x)+0.5-cx) - hx
 					outside := math.Hypot(math.Max(qx, 0), math.Max(qy, 0))
 					inside := math.Min(math.Max(qx, qy), 0)
-					cover := uiClamp(0.5-(outside+inside-radius), 0, 1)
-					if cover > 0 \{
+					return uiClamp(0.5-(outside+inside-radius), 0, 1)
+				}
+				for x := r.x0; x < band0; x++ \{
+					if cover := at(x); cover > 0 \{
+						row[x] = uiBlendPixel(row[x], c, cover)
+					}
+				}
+				if band0 < band1 \{
+					cover := uiClamp(0.5-(qy-radius), 0, 1)
+					switch \{
+					case cover >= 1 && c.a == 255:
+						for x := band0; x < band1; x++ \{
+							row[x] = solid
+						}
+					case cover > 0:
+						for x := band0; x < band1; x++ \{
+							row[x] = uiBlendPixel(row[x], c, cover)
+						}
+					}
+				}
+				for x := max(band1, r.x0); x < r.x1; x++ \{
+					if cover := at(x); cover > 0 \{
 						row[x] = uiBlendPixel(row[x], c, cover)
 					}
 				}
 			}
+		}
+
+		// The columns of a rounded box, within [from, to), that are well clear of
+		// both corners: there qx is at most -1, so a row's cover does not change
+		// along them.
+		func uiBand(cx, hx float64, from, to int) (int, int) \{
+			lo := int(math.Ceil(cx - hx + 0.5))
+			hi := int(math.Floor(cx + hx - 0.5))
+			lo, hi = max(lo, from), min(hi, to)
+			if hi < lo \{
+				return from, from
+			}
+			return lo, hi
 		}
 
 		// A rounded outline of the given width, inside the rectangle.
@@ -279,14 +318,35 @@ func coreSource(): Str {
 			cv.flush()
 			cx, cy := (x0+x1)/2, (y0+y1)/2
 			hx, hy := (x1-x0)/2-radius, (y1-y0)/2-radius
+			band0, band1 := uiBand(cx, hx, r.x0, r.x1)
+			// Inside the band a row's distance is its own only while the ring is no
+			// wider than its corners are round; past that, every pixel counts.
+			if width > radius+0.5 \{
+				band0, band1 = r.x1, r.x1
+			}
 			for y := r.y0; y < r.y1; y++ \{
 				row := cv.pix[y*cv.w : (y+1)*cv.w]
 				qy := math.Abs(float64(y)+0.5-cy) - hy
-				for x := r.x0; x < r.x1; x++ \{
+				at := func(x int) float64 \{
 					qx := math.Abs(float64(x)+0.5-cx) - hx
 					d := math.Hypot(math.Max(qx, 0), math.Max(qy, 0)) + math.Min(math.Max(qx, qy), 0) - radius
-					cover := uiClamp(0.5-d, 0, 1) - uiClamp(0.5-(d+width), 0, 1)
-					if cover > 0 \{
+					return uiClamp(0.5-d, 0, 1) - uiClamp(0.5-(d+width), 0, 1)
+				}
+				for x := r.x0; x < band0; x++ \{
+					if cover := at(x); cover > 0 \{
+						row[x] = uiBlendPixel(row[x], c, cover)
+					}
+				}
+				if band0 < band1 \{
+					d := qy - radius
+					if cover := uiClamp(0.5-d, 0, 1) - uiClamp(0.5-(d+width), 0, 1); cover > 0 \{
+						for x := band0; x < band1; x++ \{
+							row[x] = uiBlendPixel(row[x], c, cover)
+						}
+					}
+				}
+				for x := max(band1, r.x0); x < r.x1; x++ \{
+					if cover := at(x); cover > 0 \{
 						row[x] = uiBlendPixel(row[x], c, cover)
 					}
 				}
@@ -528,6 +588,15 @@ func coreSource(): Str {
 			lines      []string
 			grid       *uiGrid
 			pic        *uiPicture
+			code       bool
+			// A field's or a button's own outline: its width (-1: the default),
+			// colour, corner (-1: the default), and whether the focus ring shows.
+			edge       float64
+			edgeTone   string
+			radius     float64
+			noRing     bool
+			// The colour behind it while the pointer is over it.
+			hoverTone  string
 		}
 
 		type uiGrid struct \{
@@ -547,6 +616,8 @@ func coreSource(): Str {
 			panel    *uiBox
 			backdrop *uiBox
 			pinned   bool
+			anchor   string
+			dismiss  []UiAttr
 			align    string
 			justify  string
 		}
@@ -591,6 +662,30 @@ func coreSource(): Str {
 			past, future []uiEntryState
 			lastTyped    bool
 			lastAt       time.Time
+
+			// A code editor's: the selection its program last set, the selection and
+			// the lines last told to it.
+			caretSet, told, view, fit string
+
+			// The text as a string and as lines, worked out once per change of it:
+			// a long file is compared with what the program sent, and cut into
+			// lines, many times a frame.
+			str     string
+			strOK   bool
+			lines   []uiSpan
+			linesOK bool
+		}
+
+		// The text changed: what was worked out from it no longer holds.
+		func (f *uiEntry) changed() \{
+			f.strOK, f.linesOK = false, false
+		}
+
+		func (f *uiEntry) value() string \{
+			if !f.strOK \{
+				f.str, f.strOK = string(f.text), true
+			}
+			return f.str
 		}
 
 		type uiMeasured struct \{
@@ -655,6 +750,20 @@ func coreSource(): Str {
 			clicks    int
 			lastPress time.Time
 			pressAt   [2]float64
+			// Where the pointer was last pressed, and the drag a press began.
+			spot      [2]float64
+			drag      *uiDrag
+			ctrl      bool
+			hovered   string
+			// The innermost box under the pointer that lights up there, and the
+			// character a Ctrl+hover is over.
+			lit       string
+			probed    string
+			// The focus each box last asked for, so a request is answered once;
+			// likewise its text for the clipboard and the command it asked to run.
+			asked     map[string]int
+			clips     map[string]int
+			performed map[string]int
 			menuItems []uiMenuItem
 			grab      *uiGrab
 			grown     map[string]float64
@@ -683,6 +792,9 @@ func coreSource(): Str {
 				pending: map[string]string\{},
 				pics:    map[string]*uiPicture\{},
 				grown:   map[string]float64\{},
+				asked:   map[string]int\{},
+				clips:   map[string]int\{},
+				performed: map[string]int\{},
 				blink:   true,
 				epoch:   time.Now(),
 			}
@@ -697,6 +809,14 @@ func coreSource(): Str {
 			wake := !n.queued
 			n.queued = true
 			return wake
+		}
+
+		// What the outermost widget asks the title bar to say, "" when it asks nothing.
+		func uiTitleOf(v UiView) string \{
+			if a, ok := uiFind(v.Attrs, "title"); ok \{
+				return a.Word
+			}
+			return ""
 		}
 
 		func (n *uiNative) latest() UiView \{
@@ -770,8 +890,16 @@ func coreSource(): Str {
 			if v.Kind == "none" \{
 				return nil
 			}
+			// A code editor is a textarea that does not wrap, set in a fixed width:
+			// everything a textarea does with the keys and the mouse, it does too.
+			code := v.Kind == "code"
+			if code \{
+				c := *v
+				c.Kind = "textarea"
+				v = &c
+			}
 			n.seq++
-			b := &uiBox\{kind: v.Kind, v: v, path: path, seq: n.seq, width: -1, height: -1, opacity: 1}
+			b := &uiBox\{kind: v.Kind, v: v, path: path, seq: n.seq, width: -1, height: -1, opacity: 1, edge: -1, radius: -1}
 			if parent == nil \{
 				b.font = uiFont\{px: 14, weight: 400}
 				b.colour = n.pal.fg
@@ -814,6 +942,16 @@ func coreSource(): Str {
 					}
 				case "kind":
 					b.input = a.Word
+				case "border":
+					b.edge = float64(max(a.Num, 0))
+				case "borderTone":
+					b.edgeTone = a.Word
+				case "radius":
+					b.radius = float64(max(a.Num, 0))
+				case "ring":
+					b.noRing = !a.Flag
+				case "hover":
+					b.hoverTone = a.Word
 				}
 			}
 			// A form control sets its font to inherit after the size classes, so a size on
@@ -855,6 +993,16 @@ func coreSource(): Str {
 				b.colour = c
 			} else if c, ok := n.pal.role(tone); ok \{
 				b.colour = c
+			}
+			if code \{
+				b.code = true
+				b.font.mono = true
+				if _, sized := uiFind(v.Attrs, "size"); !sized \{
+					b.font.px = 13
+				}
+				if size, ok := uiFind(v.Attrs, "fontSize"); ok && size.Num >= 6 && size.Num <= 72 \{
+					b.font.px = float64(size.Num)
+				}
 			}
 			b.lineH = b.font.px * 1.5
 			switch v.Kind \{
@@ -900,7 +1048,12 @@ func coreSource(): Str {
 			case "icon":
 				b.font.icon = true
 			case "link":
-				b.colour = n.pal.accent
+				// A link is the accent colour, as the page's stylesheet makes it, unless
+				// it carries a colour of its own: an inline colour beats the class there,
+				// and a role (Muted, Danger…) does not.
+				if _, own := uiParseColour(tone); !own \{
+					b.colour = n.pal.accent
+				}
 			}
 			if parent == nil \{
 				b.container = true
@@ -924,7 +1077,14 @@ func coreSource(): Str {
 		func (n *uiNative) layer(p *uiBox) *uiLayer \{
 			a, aligned := p.attr("align")
 			j, justified := p.attr("justify")
-			l := &uiLayer\{panel: p, pinned: aligned || justified, align: "Center", justify: "Center"}
+			an, anchored := p.attr("anchor")
+			l := &uiLayer\{panel: p, pinned: aligned || justified || anchored, align: "Center", justify: "Center"}
+			if anchored \{
+				l.anchor = an.Word
+				if d, ok := p.attr("onDismiss"); ok \{
+					l.dismiss = []UiAttr\{\{Kind: "on", heard: d.heard}}
+				}
+			}
 			shade := &UiView\{Kind: "backdrop"}
 			if d, ok := p.attr("onDismiss"); ok && !l.pinned \{
 				shade.Attrs = []UiAttr\{\{Kind: "on", heard: d.heard}}
@@ -938,6 +1098,15 @@ func coreSource(): Str {
 				}
 			}
 			p.scroll = "Both"
+			if anchored \{
+				p.row = false
+				if p.fill == (uiRGBA\{}) \{
+					p.fill = n.pal.bg
+				}
+				p.border = math.Max(p.border, 1)
+				p.corner = 8
+				return l
+			}
 			if l.pinned \{
 				p.row = true
 				if aligned \{
@@ -1277,6 +1446,12 @@ func coreSource(): Str {
 						it.basis = k.maxW
 					}
 					it.min = n.leastW(k, inner)
+					// A row that scrolls across keeps every child as wide as it wants
+					// to be: what does not fit is scrolled to, not squeezed.
+					if b.scroll == "Horizontal" && it.grow == 0 \{
+						it.shrink = 0
+						it.min = math.Max(it.min, it.basis)
+					}
 					if k.width >= 0 && (k.container || k.kind == "image") \{
 						it.max = math.Max(inner, it.min)
 					}
@@ -1705,6 +1880,24 @@ func coreSource(): Str {
 			}
 			n.sizeH(p, h)
 			x, y := (n.vw-w)/2, (n.vh-h)/2
+			if l.anchor != "" \{
+				x, y = n.spot[0], n.spot[1]
+				above := y
+				if l.anchor == "Caret" \{
+					if cx, cy, ok := n.caretSpot(); ok \{
+						b := n.boxes[n.focus]
+						x, above = float64(cx)/n.scale, float64(cy)/n.scale
+						y = above + b.lineH
+					}
+				}
+				x = math.Max(4, math.Min(x, n.vw-w-4))
+				if y+h > n.vh-4 \{
+					y = math.Min(above-h, n.vh-h-4)
+				}
+				n.place(p, x, math.Max(4, y))
+				l.backdrop.w, l.backdrop.h = n.vw, n.vh
+				return
+			}
 			if l.pinned \{
 				switch l.justify \{
 				case "Start", "Between":
@@ -1745,8 +1938,8 @@ func coreSource(): Str {
 				value := b.v.Text
 				switch \{
 				case path != n.focus:
-					f.set(value)
-				case string(f.text) == value || n.numeric(b, f) == value:
+					n.settle(b, f, value)
+				case f.value() == value || n.numeric(b, f) == value:
 					f.sent = nil
 				default:
 					caught := -1
@@ -1758,7 +1951,7 @@ func coreSource(): Str {
 					if caught >= 0 \{
 						f.sent = f.sent[caught+1:]
 					} else \{
-						f.set(value)
+						n.settle(b, f, value)
 					}
 				}
 			}
@@ -1770,6 +1963,68 @@ func coreSource(): Str {
 					f := &uiEntry\{goal: -1, seen: -1}
 					f.set(b.v.Text)
 					n.fields[path] = f
+				}
+			}
+			for path, b := range n.boxes \{
+				f := n.fields[path]
+				c, ok := b.attr("caret")
+				if !b.code || f == nil || !ok || len(c.Nums) != 3 \{
+					continue
+				}
+				want := strconv.Itoa(int(c.Nums[0])) + "," + strconv.Itoa(int(c.Nums[1])) + "," + strconv.Itoa(int(c.Nums[2]))
+				if want == f.caretSet \{
+					continue
+				}
+				f.caretSet = want
+				f.anchor = max(0, min(int(c.Nums[0]), len(f.text)))
+				f.caret = max(0, min(int(c.Nums[1]), len(f.text)))
+				f.told = strconv.Itoa(f.anchor) + "," + strconv.Itoa(f.caret)
+				f.goal, f.seen = -1, -1
+			}
+			for path, b := range n.boxes \{
+				if c, ok := b.attr("clip"); ok \{
+					if seen, ok := n.clips[path]; ok && seen != c.Num \{
+						n.dev.setClipboard(c.Word)
+					}
+					n.clips[path] = c.Num
+				}
+				p, ok := b.attr("perform")
+				if !ok \{
+					continue
+				}
+				seen, known := n.performed[path]
+				n.performed[path] = p.Num
+				f := n.fields[path]
+				if !known || seen == p.Num || f == nil \{
+					continue
+				}
+				n.focus, n.keyboard, n.blink = path, false, true
+				switch p.Word \{
+				case "selectAll":
+					f.anchor, f.caret = 0, len(f.text)
+				case "undo":
+					n.undo(b, f, true)
+				case "redo":
+					n.undo(b, f, false)
+				case "cut":
+					n.fieldKey(b, uiKeyCut, false, false)
+				case "copy":
+					n.fieldKey(b, uiKeyCopy, false, false)
+				case "paste":
+					n.fieldKey(b, uiKeyPaste, false, false)
+				}
+			}
+			for path, b := range n.boxes \{
+				a, ok := b.attr("focus")
+				if !ok \{
+					continue
+				}
+				if seen, ok := n.asked[path]; ok && seen == a.Num \{
+					continue
+				}
+				n.asked[path] = a.Num
+				if t := uiFocusable(b); t != nil \{
+					n.focus, n.keyboard, n.blink = t.path, false, true
 				}
 			}
 			for path, d := range n.dates \{
@@ -1804,6 +2059,7 @@ func coreSource(): Str {
 
 		func (f *uiEntry) set(value string) \{
 			f.text = []rune(value)
+			f.str, f.strOK, f.linesOK = value, true, false
 			f.caret = len(f.text)
 			f.anchor = f.caret
 			f.sent = nil
@@ -1870,7 +2126,20 @@ func paintSource(): Str {
 				saved := cv.grab(area)
 				defer cv.fade(saved, area, b.opacity)
 			}
-			if b.fill.a > 0 && !visible.empty() \{
+			framed := b.kind == "button" || b.kind == "input" || b.kind == "textarea" || b.kind == "select"
+			if b.hoverTone != "" && b.path == n.lit && !b.disabled && !framed && !visible.empty() \{
+				lit := n.runColour(b.hoverTone, n.pal.surface)
+				corner := b.corner
+				if b.radius >= 0 \{
+					corner = b.radius
+				}
+				if corner > 0 \{
+					cv.round(x0, y0, x1, y1, corner*n.scale, lit, clip)
+				} else \{
+					cv.fill(box.x0, box.y0, box.x1, box.y1, lit, clip)
+				}
+				under = uiMix(under, lit, 1)
+			} else if b.fill.a > 0 && !visible.empty() && !framed \{
 				if b.corner > 0 \{
 					cv.round(x0, y0, x1, y1, b.corner*n.scale, b.fill, clip)
 				} else \{
@@ -1933,7 +2202,10 @@ func paintSource(): Str {
 			top := y0 + (b.padY+b.border)*n.scale
 			left := x0 + (b.padX+b.border)*n.scale
 			lift := n.lift(b)
-			underline := b.kind == "link" && b.path == n.hover
+			underline := b.kind == "link" && b.path == n.hover && b.hoverTone == "" && n.lit == ""
+			if n.lit == b.path \{
+				underline = false
+			}
 			for i, line := range b.lines \{
 				n.paintChosen(cv, b, -1, i, line, left, top+float64(i)*b.lineH*n.scale, b.font, b.lineH, clip)
 				y := top + float64(i)*b.lineH*n.scale + lift
@@ -1953,17 +2225,35 @@ func paintSource(): Str {
 		func (n *uiNative) paintButton(cv *uiCanvas, b *uiBox, clip uiClip, under uiRGBA) \{
 			x0, y0, x1, y1 := n.rectOf(b)
 			fill, edge, ink := n.pal.surface, n.pal.line, b.colour
+			coloured := b.fill.a > 0
+			if coloured \{
+				fill = uiMix(under, b.fill, 1)
+			}
 			tone, _ := b.attr("tone")
 			switch tone.Word \{
 			case "Good":
-				fill, edge, ink = n.pal.accent, n.pal.accent, uiWhite
+				if !coloured \{
+					fill = n.pal.accent
+				}
+				edge, ink = n.pal.accent, uiWhite
 			case "Danger":
 				edge, ink = n.pal.danger, n.pal.danger
 			}
 			if c, ok := uiParseColour(tone.Word); ok \{
 				ink = c
 			}
-			if b.path == n.hover && !b.disabled && tone.Word != "Good" \{
+			width, own := n.edgeOf(b, coloured)
+			if b.edgeTone != "" \{
+				edge = own
+			}
+			hovered := b.path == n.hover && !b.disabled
+			switch \{
+			case hovered && b.hoverTone != "":
+				fill = n.runColour(b.hoverTone, fill)
+			case hovered && coloured:
+				// A button in a colour of its own lights up rather than changing colour.
+				fill = uiMix(fill, n.pal.fg, 0.12)
+			case hovered && tone.Word != "Good":
 				edge, ink = n.pal.accent, n.pal.accent
 			}
 			if b.disabled \{
@@ -1971,11 +2261,18 @@ func paintSource(): Str {
 			}
 			line := n.hairline()
 			radius := (y1 - y0) / 2
-			if b.path == n.focus && n.keyboard \{
+			if b.radius >= 0 \{
+				radius = math.Min(b.radius*n.scale, radius)
+			}
+			if b.path == n.focus && n.keyboard && !b.noRing \{
 				cv.ring(x0-2*line, y0-2*line, x1+2*line, y1+2*line, radius+2*line, 2*line, n.pal.accent, clip)
 			}
-			cv.round(x0, y0, x1, y1, radius, edge, clip)
-			cv.round(x0+line, y0+line, x1-line, y1-line, radius-line, fill, clip)
+			if width > 0 \{
+				cv.round(x0, y0, x1, y1, radius, edge, clip)
+				cv.round(x0+width, y0+width, x1-width, y1-width, math.Max(radius-width, 0), fill, clip)
+			} else \{
+				cv.round(x0, y0, x1, y1, radius, fill, clip)
+			}
 			block := float64(len(b.lines)) * b.lineH * n.scale
 			top := (y0+y1)/2 - block/2
 			lift := n.lift(b)
@@ -1993,14 +2290,42 @@ func paintSource(): Str {
 			x0, y0, x1, y1 := n.rectOf(b)
 			line := n.hairline()
 			radius := 8 * n.scale
-			if ringed \{
+			if b.radius >= 0 \{
+				radius = b.radius * n.scale
+			}
+			inside := n.pal.bg
+			if b.fill.a > 0 \{
+				inside = uiMix(n.pal.bg, b.fill, 1)
+			}
+			edge, colour := n.edgeOf(b, b.fill.a > 0)
+			switch \{
+			case ringed && !b.noRing:
 				cv.round(x0-2*line, y0-2*line, x1+2*line, y1+2*line, radius+2*line, n.pal.accent, clip)
-				cv.round(x0, y0, x1, y1, radius, n.pal.bg, clip)
-			} else \{
-				cv.round(x0, y0, x1, y1, radius, n.pal.line, clip)
-				cv.round(x0+line, y0+line, x1-line, y1-line, radius-line, n.pal.bg, clip)
+				cv.round(x0, y0, x1, y1, radius, inside, clip)
+			case edge > 0:
+				cv.round(x0, y0, x1, y1, radius, colour, clip)
+				cv.round(x0+edge, y0+edge, x1-edge, y1-edge, math.Max(radius-edge, 0), inside, clip)
+			default:
+				cv.round(x0, y0, x1, y1, radius, inside, clip)
 			}
 			return x0, y0, x1, y1
+		}
+
+		// How thick a framed widget's edge is, in pixels, and in what: a hairline in
+		// the palette's line unless it says otherwise — and none at all on one in a
+		// colour of its own that asked for none.
+		func (n *uiNative) edgeOf(b *uiBox, coloured bool) (float64, uiRGBA) \{
+			colour := n.pal.line
+			if b.edgeTone != "" \{
+				colour = n.runColour(b.edgeTone, colour)
+			}
+			switch \{
+			case b.edge >= 0:
+				return math.Round(b.edge * n.scale), colour
+			case coloured && b.edgeTone == "":
+				return 0, colour
+			}
+			return n.hairline(), colour
 		}
 
 		func (n *uiNative) ink(b *uiBox) uiRGBA \{
@@ -2189,6 +2514,10 @@ func paintSource(): Str {
 		}
 
 		func (n *uiNative) paintTextarea(cv *uiCanvas, b *uiBox, clip uiClip, under uiRGBA) \{
+			if b.code \{
+				n.paintCode(cv, b, clip, under)
+				return
+			}
 			focused := b.path == n.focus
 			x0, y0, x1, y1 := n.paintFrame(cv, b, clip, focused)
 			f := n.fields[b.path]
@@ -2402,6 +2731,11 @@ func paintSource(): Str {
 			if !l.pinned \{
 				cv.fill(0, 0, cv.w, cv.h, uiShade, all)
 				n.shadow(cv, p, all)
+			}
+			if l.anchor != "" \{
+				x0, y0, x1, y1 := n.rectOf(p)
+				line := n.hairline()
+				cv.round(x0-line, y0-line, x1+line, y1+line, p.corner*n.scale+line, n.pal.line, all)
 			}
 			n.paintBox(cv, p, all, under)
 		}
@@ -2654,6 +2988,7 @@ func inputSource(): Str {
 
 		import (
 			"math"
+			"sort"
 			"strconv"
 			"strings"
 			"time"
@@ -2991,6 +3326,19 @@ func inputSource(): Str {
 			if shape := n.grabCursor(x, y); shape != "" \{
 				return shape
 			}
+			if d := n.heard(x, y, "onDrag"); d != nil \{
+				if t := n.target(x, y); t == nil || t == d || !t.focusable() \{
+					if d.w >= d.h \{
+						return "resize"
+					}
+					return "cols"
+				}
+			}
+			if n.ctrl \{
+				if b := n.heard(x, y, "onJump"); b != nil && b.code && n.codeAt(b, x, y) >= 0 \{
+					return "hand"
+				}
+			}
 			b := n.target(x, y)
 			if b == nil \{
 				if _, ok := n.textAt(x, y); ok \{
@@ -3032,11 +3380,39 @@ func inputSource(): Str {
 			n.layout()
 			x, y = x/n.scale, y/n.scale
 			n.pointer = [2]float64\{x, y}
+			if d := n.drag; d != nil \{
+				dx, dy := int(math.Round(x-d.x)), int(math.Round(y-d.y))
+				if dx != d.dx || dy != d.dy \{
+					d.dx, d.dy = dx, dy
+					n.post(d.attrs, "drag", strconv.Itoa(dx)+","+strconv.Itoa(dy)+",0", 0)
+				}
+				return false
+			}
+			changed := false
+			lit := ""
+			if b := n.litUnder(x, y); b != nil \{
+				lit = b.path
+			}
+			if lit != n.lit \{
+				n.lit = lit
+				changed = true
+			}
+			n.probe(x, y)
+			if b := n.heard(x, y, "onHover"); b != nil && b.code \{
+				said := b.path + "#" + strconv.Itoa(n.codeAt(b, x, y))
+				if said != n.hovered \{
+					n.unhover(b.path)
+					n.hovered = said
+					n.post(b.v.Attrs, "hover", strconv.Itoa(n.codeAt(b, x, y)), 0)
+				}
+			} else \{
+				n.unhover("")
+			}
 			if n.grab != nil \{
-				return n.dragGrab(x, y)
+				return n.dragGrab(x, y) || changed
 			}
 			if n.selecting \{
-				return n.extendSelection(x, y)
+				return n.extendSelection(x, y) || changed
 			}
 			if n.dragging \{
 				if b, ok := n.boxes[n.focus]; ok && b.editable() \{
@@ -3049,9 +3425,8 @@ func inputSource(): Str {
 			if b, ok := n.boxes[n.sliding]; ok \{
 				return n.slide(b, x)
 			}
-			changed := false
 			if tip := n.hinted(x, y); tip != n.tip && tip != n.quiet \{
-				changed = n.tipDrawn
+				changed = changed || n.tipDrawn
 				n.tip, n.tipSince, n.tipAt, n.tipDrawn = tip, time.Now(), [2]float64\{x, y}, false
 			}
 			if n.quiet != "" && n.hinted(x, y) != n.quiet \{
@@ -3074,8 +3449,144 @@ func inputSource(): Str {
 			return changed
 		}
 
+		type uiDrag struct \{
+			attrs  []UiAttr
+			x, y   float64
+			dx, dy int
+		}
+
+		// A box asked to be focused, or the first thing in it that can be.
+		func uiFocusable(b *uiBox) *uiBox \{
+			if b.focusable() \{
+				return b
+			}
+			for _, k := range b.kids \{
+				if t := uiFocusable(k); t != nil \{
+					return t
+				}
+			}
+			return nil
+		}
+
+		// The innermost box under the pointer that hears an event.
+		func (n *uiNative) heard(x, y float64, kind string) *uiBox \{
+			chain := n.under(x, y)
+			for i := len(chain) - 1; i >= 0; i-- \{
+				if _, ok := chain[i].attr(kind); ok && !chain[i].disabled \{
+					return chain[i]
+				}
+			}
+			return nil
+		}
+
+		// The character of a code editor under a point, -1 past its line's end or its last line.
+		func (n *uiNative) codeAt(b *uiBox, x, y float64) int \{
+			f := n.fields[b.path]
+			if f == nil || !b.code \{
+				return -1
+			}
+			spans := n.flow(b, f)
+			line := int(math.Floor((y - (b.y + b.padY + b.border) + f.top) / b.lineH))
+			if line < 0 || line >= len(spans) \{
+				return -1
+			}
+			col := (x - (b.x + b.border + b.padX + n.gutterOf(b, len(spans))) + f.shift) / n.cellW(b)
+			if col < 0 \{
+				return -1
+			}
+			tab, c := n.tabOf(b), 0
+			for i := spans[line].from; i < spans[line].to; i++ \{
+				next := c + 1
+				if f.text[i] == '\t' \{
+					next = (c/tab + 1) * tab
+				}
+				if col < float64(next) \{
+					return i
+				}
+				c = next
+			}
+			return -1
+		}
+
+		// A middle click, on what hears one.
+		func (n *uiNative) middle(x, y float64) bool \{
+			n.touched()
+			n.layout()
+			x, y = x/n.scale, y/n.scale
+			if b := n.heard(x, y, "onMiddle"); b != nil \{
+				n.post(b.v.Attrs, "middle", "", 0)
+				return true
+			}
+			return false
+		}
+
+		// The innermost box under a point that lights up there.
+		func (n *uiNative) litUnder(x, y float64) *uiBox \{
+			chain := n.under(x, y)
+			for i := len(chain) - 1; i >= 0; i-- \{
+				if chain[i].hoverTone != "" && !chain[i].disabled \{
+					return chain[i]
+				}
+			}
+			return nil
+		}
+
+		// What a code editor's onProbe is told: the character under the pointer
+		// while Ctrl is held, -1 once it is not — or the pointer is elsewhere.
+		func (n *uiNative) probe(x, y float64) \{
+			at, path := -1, ""
+			var box *uiBox
+			if b := n.heard(x, y, "onProbe"); b != nil && b.code \{
+				box, path = b, b.path
+				if n.ctrl \{
+					at = n.codeAt(b, x, y)
+				}
+			}
+			said := path + "#" + strconv.Itoa(at)
+			if said == n.probed \{
+				return
+			}
+			was, _, _ := strings.Cut(n.probed, "#")
+			if was != "" && was != path \{
+				if b, ok := n.boxes[was]; ok \{
+					n.post(b.v.Attrs, "probe", "-1", 0)
+				}
+			}
+			if box != nil && (at >= 0 || strings.HasPrefix(n.probed, path+"#") && !strings.HasSuffix(n.probed, "#-1")) \{
+				n.post(box.v.Attrs, "probe", strconv.Itoa(at), 0)
+			}
+			n.probed = said
+		}
+
+		// Ctrl went down or up with the pointer still: what it is over is told again.
+		func (n *uiNative) setCtrl(held bool) bool \{
+			if n.ctrl == held \{
+				return false
+			}
+			n.touched()
+			n.layout()
+			n.ctrl = held
+			n.probe(n.pointer[0], n.pointer[1])
+			return true
+		}
+
+		// The editor the pointer was over is told it has left, where it is another one.
+		func (n *uiNative) unhover(keep string) \{
+			path, _, _ := strings.Cut(n.hovered, "#")
+			if n.hovered == "" || path == keep \{
+				return
+			}
+			n.hovered = ""
+			if b, ok := n.boxes[path]; ok \{
+				n.post(b.v.Attrs, "hover", "-1", 0)
+			}
+		}
+
 		func (n *uiNative) leave() bool \{
 			n.touched()
+			n.unhover("")
+			n.lit = ""
+			n.probe(-1, -1)
 			changed := n.hover != "" || n.tip != ""
 			n.hover, n.hoverPart = "", 0
 			n.tip = ""
@@ -3095,10 +3606,35 @@ func inputSource(): Str {
 				n.popup = nil
 				return true
 			}
+			n.spot = [2]float64\{x, y}
+			for _, l := range n.layers \{
+				p := l.panel
+				if l.dismiss != nil && !(x >= p.x && x < p.x+p.w && y >= p.y && y < p.y+p.h) \{
+					n.post(l.dismiss, "click", "", 0)
+				}
+			}
 			if n.startGrab(x, y) \{
 				return true
 			}
 			clicks := n.countClick(x, y)
+			if clicks == 2 \{
+				if b := n.heard(x, y, "onDouble"); b != nil \{
+					n.post(b.v.Attrs, "double", "", 0)
+				}
+			}
+			if d := n.heard(x, y, "onDrag"); d != nil \{
+				if t := n.target(x, y); t == nil || t == d || !t.focusable() \{
+					n.drag = &uiDrag\{attrs: d.v.Attrs, x: x, y: y}
+					return true
+				}
+			}
+			if n.ctrl \{
+				if b := n.heard(x, y, "onJump"); b != nil && b.code \{
+					if at := n.codeAt(b, x, y); at >= 0 \{
+						n.post(b.v.Attrs, "jump", strconv.Itoa(at), 0)
+					}
+				}
+			}
 			n.sel = nil
 			b := n.target(x, y)
 			n.press, n.pressPart = "", 0
@@ -3150,6 +3686,11 @@ func inputSource(): Str {
 			n.layout()
 			x, y = x/n.scale, y/n.scale
 			n.dragging = false
+			if d := n.drag; d != nil \{
+				n.drag = nil
+				n.post(d.attrs, "drag", strconv.Itoa(d.dx)+","+strconv.Itoa(d.dy)+",1", 0)
+				return true
+			}
 			if n.grab != nil \{
 				n.grab = nil
 				return true
@@ -3524,7 +4065,11 @@ func inputSource(): Str {
 			spans := n.flow(b, f)
 			line := int(math.Floor((y - (b.y + b.padY + b.border) + f.top) / b.lineH))
 			line = max(0, min(line, len(spans)-1))
-			return n.column(b, f, spans, line, x-(b.x+b.padX+b.border))
+			left := b.x + b.padX + b.border
+			if b.code \{
+				left += n.gutterOf(b, len(spans)) - f.shift
+			}
+			return n.column(b, f, spans, line, x-left)
 		}
 
 		// The place on a line nearest x; a line that wrapped ends before the break.
@@ -3536,7 +4081,7 @@ func inputSource(): Str {
 			}
 			best, bestGap := sp.from, math.Inf(1)
 			for i := sp.from; i <= end; i++ \{
-				gap := math.Abs(n.measure(b.font, string(f.text[sp.from:i])) - x)
+				gap := math.Abs(n.runeX(b, f, sp.from, i) - x)
 				if gap < bestGap \{
 					best, bestGap = i, gap
 				}
@@ -3551,6 +4096,12 @@ func inputSource(): Str {
 		// pre-wrap with break-word, which is how a textarea wraps: at spaces, and anywhere in a
 		// word that could not fit on a line of its own.
 		func (n *uiNative) flow(b *uiBox, f *uiEntry) []uiSpan \{
+			if b.code \{
+				if !f.linesOK \{
+					f.lines, f.linesOK = uiLinesOf(f.text), true
+				}
+				return f.lines
+			}
 			width := n.flowWidth(b)
 			text := f.text
 			var spans []uiSpan
@@ -3596,10 +4147,10 @@ func inputSource(): Str {
 				if f.caret == sp.to && i+1 < len(spans) && spans[i+1].from == sp.to \{
 					continue
 				}
-				return i, n.measure(b.font, string(f.text[sp.from:f.caret]))
+				return i, n.runeX(b, f, sp.from, f.caret)
 			}
 			last := len(spans) - 1
-			return last, n.measure(b.font, string(f.text[spans[last].from:spans[last].to]))
+			return last, n.runeX(b, f, spans[last].from, spans[last].to)
 		}
 
 		// Keeps the caret in view after it moved, and never scrolls past the end.
@@ -3615,6 +4166,359 @@ func inputSource(): Str {
 				f.top = top + b.lineH - room
 			}
 			f.top = uiClamp(f.top, 0, math.Max(0, float64(len(spans))*b.lineH-room))
+			if b.code \{
+				_, x := n.caretLine(b, f, spans)
+				wide := b.w - 2*b.padX - 2*b.border - n.gutterOf(b, len(spans))
+				cell := n.cellW(b)
+				if x < f.shift \{
+					f.shift = math.Max(0, x-4*cell)
+				} else if x > f.shift+wide-cell \{
+					f.shift = x - wide + 4*cell
+				}
+			}
+		}
+
+		// The lines of a code editor's text, each without its newline: one more than
+		// there are newlines, so a text that ends in one ends on an empty line.
+		func uiLinesOf(text []rune) []uiSpan \{
+			spans := make([]uiSpan, 0, 64)
+			start := 0
+			for i, r := range text \{
+				if r == '\n' \{
+					spans = append(spans, uiSpan\{start, i})
+					start = i + 1
+				}
+			}
+			return append(spans, uiSpan\{start, len(text)})
+		}
+
+		// How far into a line its text from..to reaches. A code editor counts columns,
+		// a tab reaching the next stop, so every line agrees on where each column is.
+		func (n *uiNative) runeX(b *uiBox, f *uiEntry, from, to int) float64 \{
+			if !b.code \{
+				return n.measure(b.font, string(f.text[from:to]))
+			}
+			return float64(uiColumns(f.text[from:to], 0, n.tabOf(b))) * n.cellW(b)
+		}
+
+		func uiColumns(text []rune, col, tab int) int \{
+			for _, r := range text \{
+				if r == '\t' \{
+					col = (col/tab + 1) * tab
+				} else \{
+					col++
+				}
+			}
+			return col
+		}
+
+		func (n *uiNative) tabOf(b *uiBox) int \{
+			if t, ok := b.attr("tabSize"); ok && t.Num > 0 \{
+				return t.Num
+			}
+			return 4
+		}
+
+		func (n *uiNative) cellW(b *uiBox) float64 \{ return n.measure(b.font, "M") }
+
+		// The line numbers' column, before the editor's own padding: wide enough for the
+		// last line's number and a column either side.
+		func (n *uiNative) gutterOf(b *uiBox, lines int) float64 \{
+			if a, ok := b.attr("numbers"); !b.code || !ok || !a.Flag \{
+				return 0
+			}
+			return float64(max(len(strconv.Itoa(max(lines, 1))), 2)+2) * n.cellW(b)
+		}
+
+		// A field taking a value its program chose. A code editor keeps its selection and
+		// where it was scrolled, as far as the new text reaches: a program that reformats
+		// or completes a word has not asked for the caret to jump to the end.
+		func (n *uiNative) settle(b *uiBox, f *uiEntry, value string) \{
+			if !b.code \{
+				f.set(value)
+				return
+			}
+			if f.value() == value \{
+				f.sent = nil
+				return
+			}
+			caret, anchor := f.caret, f.anchor
+			f.set(value)
+			f.caret, f.anchor = min(caret, len(f.text)), min(anchor, len(f.text))
+			f.seen = f.caret
+		}
+
+		// What an edit changed, as the first character that differs and where the
+		// unchanged end starts in each text.
+		func uiDiff(was, now []rune) (int, int, int) \{
+			a, top := 0, min(len(was), len(now))
+			for a < top && was[a] == now[a] \{
+				a++
+			}
+			zw, zn := len(was), len(now)
+			for zw > a && zn > a && was[zw-1] == now[zn-1] \{
+				zw--
+				zn--
+			}
+			return a, zw, zn
+		}
+
+		func (n *uiNative) runColour(tone string, fallback uiRGBA) uiRGBA \{
+			if c, ok := uiParseColour(tone); ok \{
+				return c
+			}
+			if c, ok := n.pal.role(tone); ok \{
+				return c
+			}
+			return fallback
+		}
+
+		// A code editor's runs, each cut to the visible lines it touches: what colours
+		// the text, what sits behind it, and what is underlined.
+		type uiPiece struct\{ from, to, run int }
+
+		func (n *uiNative) piecesOf(b *uiBox, spans []uiSpan, first, last int) (inks, shades, waves [][]uiPiece) \{
+			count := last - first + 1
+			inks, shades, waves = make([][]uiPiece, count), make([][]uiPiece, count), make([][]uiPiece, count)
+			for i, m := range b.v.Marks \{
+				if len(m.Nums) != 2 || m.Kind == "marker" \{
+					continue
+				}
+				from, to := int(m.Nums[0]), int(m.Nums[1])
+				if to <= from \{
+					continue
+				}
+				k := sort.Search(len(spans), func(j int) bool \{ return spans[j].to >= from })
+				for k = max(k, first); k <= last && k < len(spans) && spans[k].from <= to; k++ \{
+					p := uiPiece\{max(from, spans[k].from), min(to, spans[k].to), i}
+					if p.to <= p.from && m.Kind != "squiggle" \{
+						continue
+					}
+					switch m.Kind \{
+					case "ink":
+						inks[k-first] = append(inks[k-first], p)
+					case "shade":
+						shades[k-first] = append(shades[k-first], p)
+					case "squiggle", "underline":
+						waves[k-first] = append(waves[k-first], p)
+					}
+				}
+			}
+			return
+		}
+
+		func (n *uiNative) paintCode(cv *uiCanvas, b *uiBox, clip uiClip, under uiRGBA) \{
+			focused := b.path == n.focus
+			x0, y0, x1, y1 := n.paintFrame(cv, b, clip, focused)
+			inside := n.pal.bg
+			if b.fill.a > 0 \{
+				inside = uiMix(n.pal.bg, b.fill, 1)
+			}
+			f := n.fields[b.path]
+			if f == nil \{
+				return
+			}
+			if f.caret != f.seen \{
+				n.reveal(b, f)
+				f.seen = f.caret
+			}
+			s := n.scale
+			line := n.hairline()
+			box := clip.and(uiClip\{int(x0 + line), int(y0 + line), int(x1 - line), int(y1 - line)})
+			spans := n.flow(b, f)
+			gutter := n.gutterOf(b, len(spans)) * s
+			cell := n.cellW(b)
+			lh := b.lineH * s
+			edge := x0 + b.border*s
+			text := box.and(uiClip\{int(math.Round(edge + gutter)), box.y0, box.x1, box.y1})
+			numbers := box.and(uiClip\{box.x0, box.y0, int(math.Round(edge + gutter)), box.y1})
+			left := edge + gutter + (b.padX-f.shift)*s
+			top := y0 + (b.padY+b.border)*s - f.top*s
+			lift := n.lift(b)
+			first := max(0, int(f.top/b.lineH)-1)
+			last := min(len(spans)-1, int((f.top+b.h)/b.lineH)+1)
+			inks, shades, waves := n.piecesOf(b, spans, first, last)
+			marked := map[int]uiRGBA\{}
+			banded := map[int]uiRGBA\{}
+			type uiNoted struct \{
+				text   string
+				colour uiRGBA
+			}
+			noted := map[int]uiNoted\{}
+			for _, m := range b.v.Marks \{
+				if len(m.Nums) != 2 \{
+					continue
+				}
+				switch m.Kind \{
+				case "marker":
+					marked[int(m.Nums[0])] = n.runColour(m.Text, n.pal.accent)
+				case "band":
+					banded[int(m.Nums[0])] = n.runColour(m.Text, n.selection())
+				case "note":
+					noted[int(m.Nums[0])] = uiNoted\{uiNoteText(m), n.runColour(m.Text, n.pal.muted)}
+				}
+			}
+			if gutter > 0 \{
+				cv.fill(numbers.x0, numbers.y0, numbers.x1, numbers.y1, uiMix(inside, n.ink(b), 0.04), numbers)
+			}
+			at, _ := n.caretLine(b, f, spans)
+			from, to := min(f.caret, f.anchor), max(f.caret, f.anchor)
+			xOf := func(sp uiSpan, i int) float64 \{ return left + n.runeX(b, f, sp.from, i)*s }
+			for i := first; i <= last; i++ \{
+				sp := spans[i]
+				y := top + float64(i)*lh
+				if y > float64(box.y1) || y+lh < float64(box.y0) \{
+					continue
+				}
+				yi, yz := int(math.Round(y)), int(math.Round(y+lh))
+				if c, ok := banded[i]; ok \{
+					cv.fill(text.x0, yi, text.x1, yz, c, text)
+				}
+				if focused && from == to && i == at \{
+					cv.fill(text.x0, yi, text.x1, yz, uiRGBA\{n.pal.fg.r, n.pal.fg.g, n.pal.fg.b, 14}, text)
+				}
+				for _, p := range shades[i-first] \{
+					c := n.runColour(b.v.Marks[p.run].Text, n.selection())
+					cv.fill(int(math.Round(xOf(sp, p.from))), yi, int(math.Round(xOf(sp, p.to))), yz, c, text)
+				}
+				if focused && from != to && from <= sp.to && to >= sp.from \{
+					sx, ex := xOf(sp, max(from, sp.from)), xOf(sp, min(to, sp.to))
+					if to > sp.to \{
+						ex += cell / 2 * s
+					}
+					cv.fill(int(math.Round(sx)), yi, int(math.Round(ex)), yz, n.selection(), text)
+				}
+				n.paintCodeLine(b, f, sp, inks[i-first], left, y+lift, text)
+				if note, ok := noted[i]; ok && note.text != "" \{
+					cols := uiColumns(f.text[sp.from:sp.to], 0, n.tabOf(b))
+					n.say(b.font, left+float64(cols+3)*cell*s, y+lift, note.text, uiMix(inside, note.colour, 1), text)
+				}
+				for _, p := range waves[i-first] \{
+					c := n.runColour(b.v.Marks[p.run].Text, n.pal.danger)
+					sx, ex := xOf(sp, p.from), xOf(sp, p.to)
+					if ex <= sx \{
+						ex = sx + cell*s
+					}
+					base := y + lh - 3*s
+					if b.v.Marks[p.run].Kind == "underline" \{
+						c = n.runColour(b.v.Marks[p.run].Text, n.ink(b))
+						cv.fill(int(math.Round(sx)), int(math.Round(base)), int(math.Round(ex)), int(math.Round(base+line)), c, text)
+						continue
+					}
+					for x, k := sx, 0; x < ex; x, k = x+2*s, k+1 \{
+						yy := base
+						if k%2 == 0 \{
+							yy -= s
+						}
+						cv.fill(int(math.Round(x)), int(math.Round(yy)), int(math.Round(math.Min(x+2*s, ex))), int(math.Round(yy+line)), c, text)
+					}
+				}
+				if gutter > 0 \{
+					number := strconv.Itoa(i + 1)
+					ink := uiMix(n.pal.bg, n.pal.muted, 0.8)
+					if i == at \{
+						ink = n.ink(b)
+					}
+					n.say(b.font, edge+gutter-(cell+n.measure(b.font, number))*s, y+lift, number, ink, numbers)
+					if c, ok := marked[i]; ok \{
+						cv.fill(int(math.Round(edge)), yi, int(math.Round(edge+3*s)), yz, c, numbers)
+					}
+				}
+			}
+			if focused && n.blink \{
+				i, x := n.caretLine(b, f, spans)
+				n.caret(cv, b, left+x*s, top+float64(i)*lh+lift, text)
+			}
+			inner := b.h - 2*b.border
+			extent := float64(len(spans))*b.lineH + 2*b.padY
+			if extent > inner+0.5 \{
+				track := y1 - y0 - 2*line
+				size := math.Max(track*inner/extent, 24*s)
+				thumb := y0 + line + (track-size)*f.top/(extent-inner)
+				width := 6 * s
+				cv.round(x1-width-3*s, thumb, x1-3*s, thumb+size, width/2, uiMix(n.pal.bg, n.pal.muted, 0.6), clip)
+			}
+			n.codeTell(b, f, spans)
+		}
+
+		// One line, cut where its colour changes: the run given last wins where two
+		// overlap. A tab is drawn as the spaces that reach its stop.
+		func (n *uiNative) paintCodeLine(b *uiBox, f *uiEntry, sp uiSpan, inks []uiPiece, left, y float64, clip uiClip) \{
+			if sp.to <= sp.from \{
+				return
+			}
+			owner := make([]int, sp.to-sp.from)
+			for i := range owner \{
+				owner[i] = -1
+			}
+			for _, p := range inks \{
+				for j := p.from; j < p.to; j++ \{
+					owner[j-sp.from] = p.run
+				}
+			}
+			tab, cell, s := n.tabOf(b), n.cellW(b), n.scale
+			base := n.ink(b)
+			col := 0
+			var piece []rune
+			for a := sp.from; a < sp.to; \{
+				z := a
+				for z < sp.to && owner[z-sp.from] == owner[a-sp.from] \{
+					z++
+				}
+				start := col
+				piece = piece[:0]
+				for _, r := range f.text[a:z] \{
+					if r == '\t' \{
+						next := (col/tab + 1) * tab
+						for ; col < next; col++ \{
+							piece = append(piece, ' ')
+						}
+						continue
+					}
+					piece = append(piece, r)
+					col++
+				}
+				x := left + float64(start)*cell*s
+				if x < float64(clip.x1) && left+float64(col)*cell*s > float64(clip.x0) \{
+					ink := base
+					if run := owner[a-sp.from]; run >= 0 \{
+						ink = uiMix(n.pal.bg, n.runColour(b.v.Marks[run].Text, base), 1)
+					}
+					n.say(b.font, x, y, string(piece), ink, clip)
+				}
+				a = z
+			}
+		}
+
+		// What a code editor tells its program when it moved: the selection, and the
+		// lines in view. A selection the program set is not told back to it.
+		func (n *uiNative) codeTell(b *uiBox, f *uiEntry, spans []uiSpan) \{
+			if _, ok := b.attr("onCaret"); ok \{
+				said := strconv.Itoa(f.anchor) + "," + strconv.Itoa(f.caret)
+				if said != f.told \{
+					f.told = said
+					n.post(b.v.Attrs, "caret", said, 0)
+				}
+			}
+			if _, ok := b.attr("onView"); ok \{
+				room := b.h - 2*b.padY - 2*b.border
+				first := min(len(spans)-1, max(0, int(f.top/b.lineH)))
+				last := min(len(spans)-1, max(first, int((f.top+room)/b.lineH)-1))
+				view := strconv.Itoa(first) + "," + strconv.Itoa(last)
+				if view != f.view \{
+					f.view = view
+					n.post(b.v.Attrs, "view", view, 0)
+				}
+			}
+			if _, ok := b.attr("onFit"); ok \{
+				wide := b.w - 2*b.padX - 2*b.border - n.gutterOf(b, len(spans))
+				room := b.h - 2*b.padY - 2*b.border
+				fit := strconv.Itoa(max(1, int(wide/n.cellW(b)))) + "," + strconv.Itoa(max(1, int(room/b.lineH)))
+				if fit != f.fit \{
+					f.fit = fit
+					n.post(b.v.Attrs, "fit", fit, 0)
+				}
+			}
 		}
 
 		// The innermost box under the pointer that can still move that way takes the turn.
@@ -3639,6 +4543,24 @@ func inputSource(): Str {
 			step := lines * 100
 			for i := len(chain) - 1; i >= 0; i-- \{
 				b := chain[i]
+				if b.kind == "textarea" && b.code && sideways \{
+					f := n.fields[b.path]
+					if f == nil \{
+						continue
+					}
+					widest := 0
+					for _, sp := range n.flow(b, f) \{
+						widest = max(widest, uiColumns(f.text[sp.from:sp.to], 0, n.tabOf(b)))
+					}
+					room := b.w - 2*b.padX - 2*b.border - n.gutterOf(b, 1)
+					most := math.Max(0, float64(widest+2)*n.cellW(b)-room)
+					moved := uiClamp(f.shift-step, 0, most)
+					if moved != f.shift \{
+						f.shift = moved
+						return true
+					}
+					continue
+				}
 				if b.kind == "textarea" && !sideways \{
 					f := n.fields[b.path]
 					if f == nil \{
@@ -3703,6 +4625,78 @@ func inputSource(): Str {
 			uiKeyMenu
 		)
 
+		// A key a widget took with keys(...), named as the page names it: the innermost
+		// box around the focus that names it, or names Any, is told and nothing else
+		// happens to it. With no focus, the outermost widget is what is around it.
+		func (n *uiNative) claim(name string) bool \{
+			if name == "" \{
+				return false
+			}
+			n.touched()
+			n.layout()
+			at := n.focus
+			if _, ok := n.boxes[at]; !ok \{
+				at = "r/0"
+			}
+			if name == "Ctrl+V" || name == "Shift+Insert" \{
+				for p := at; ; \{
+					if b, ok := n.boxes[p]; ok && b.v != nil \{
+						if _, heard := uiFind(b.v.Attrs, "onPaste"); heard \{
+							pasted := strings.NewReplacer("\r\n", "\n", "\r", "\n").Replace(n.dev.clipboard())
+							n.post(b.v.Attrs, "paste", pasted, 0)
+							return true
+						}
+					}
+					cut := strings.LastIndexByte(p, '/')
+					if cut < 0 \{
+						break
+					}
+					p = p[:cut]
+				}
+			}
+			for \{
+				if b, ok := n.boxes[at]; ok && b.v != nil \{
+					if keys, ok := uiFind(b.v.Attrs, "keys"); ok && uiClaims(keys.Word, name) \{
+						if _, heard := uiFind(b.v.Attrs, "onKey"); heard \{
+							n.post(b.v.Attrs, "key", name, 0)
+							return true
+						}
+					}
+				}
+				cut := strings.LastIndexByte(at, '/')
+				if cut < 0 \{
+					return false
+				}
+				at = at[:cut]
+			}
+		}
+
+		func uiClaims(keys, name string) bool \{
+			for _, k := range strings.Fields(keys) \{
+				if k == name || k == "Any" \{
+					return true
+				}
+			}
+			return false
+		}
+
+		// What a key is called with what is held: Ctrl, then Shift, then Alt.
+		func uiCombo(key string, ctrl, shift, alt bool) string \{
+			if key == "" \{
+				return ""
+			}
+			if alt \{
+				key = "Alt+" + key
+			}
+			if shift \{
+				key = "Shift+" + key
+			}
+			if ctrl \{
+				key = "Ctrl+" + key
+			}
+			return key
+		}
+
 		func (n *uiNative) key(k uiKey, shift, word bool) bool \{
 			n.touched()
 			n.layout()
@@ -3727,6 +4721,12 @@ func inputSource(): Str {
 				}
 			}
 			if k == uiKeyTab \{
+				if ok && b.code && !b.disabled && !shift \{
+					f := n.fields[b.path]
+					n.edit(b, f, min(f.caret, f.anchor), max(f.caret, f.anchor), "\t")
+					n.blink = true
+					return true
+				}
 				if ok && b.kind == "input" && b.input == "Date" \{
 					if d := n.dates[b.path]; d != nil && (shift && d.at > 0 || !shift && d.at < 2) \{
 						if shift \{
@@ -3787,7 +4787,20 @@ func inputSource(): Str {
 			switch k \{
 			case uiKeyEnter:
 				if b.kind == "textarea" \{
-					n.edit(b, f, from, to, "\n")
+					// A code editor's new line starts where the one it left did.
+					broke := "\n"
+					if b.code \{
+						start := from
+						for start > 0 && f.text[start-1] != '\n' \{
+							start--
+						}
+						end := start
+						for end < from && (f.text[end] == ' ' || f.text[end] == '\t') \{
+							end++
+						}
+						broke += string(f.text[start:end])
+					}
+					n.edit(b, f, from, to, broke)
 					break
 				}
 				n.post(b.v.Attrs, "submit", n.numeric(b, f), 0)
@@ -4154,7 +5167,7 @@ func inputSource(): Str {
 
 		// What a number field reports: its text where that is a number HTML accepts, else nothing.
 		func (n *uiNative) numeric(b *uiBox, f *uiEntry) string \{
-			text := string(f.text)
+			text := f.value()
 			if b.input != "Number" || uiValidNumber(text) \{
 				return text
 			}
@@ -4214,6 +5227,9 @@ func inputSource(): Str {
 		}
 
 		func (n *uiNative) edit(b *uiBox, f *uiEntry, from, to int, insert string) \{
+			if ro, ok := b.attr("readOnly"); ok && ro.Flag \{
+				return
+			}
 			f.remember(from, to, insert)
 			added := []rune(insert)
 			text := make([]rune, 0, len(f.text)-(to-from)+len(added))
@@ -4221,11 +5237,13 @@ func inputSource(): Str {
 			text = append(text, added...)
 			text = append(text, f.text[to:]...)
 			f.text = text
+			f.changed()
 			f.caret = from + len(added)
 			f.anchor = f.caret
 			f.goal = -1
 			value := n.numeric(b, f)
 			f.sent = append(f.sent, value)
+			n.post(b.v.Attrs, "edit", strconv.Itoa(from)+","+strconv.Itoa(to)+","+insert, 0)
 			n.post(b.v.Attrs, "input", value, 0)
 		}
 
@@ -4299,7 +5317,11 @@ func inputSource(): Str {
 			}
 			f := n.fields[b.path]
 			if b.kind == "textarea" \{
-				line, x := n.caretLine(b, f, n.flow(b, f))
+				spans := n.flow(b, f)
+				line, x := n.caretLine(b, f, spans)
+				if b.code \{
+					x += n.gutterOf(b, len(spans)) - f.shift
+				}
 				return n.dp(b.x + b.padX + b.border + x), n.dp(b.y + b.padY + b.border + float64(line)*b.lineH - f.top), true
 			}
 			x := b.x + b.padX + b.border - f.shift + n.measure(b.font, string(n.shown(b, f)[:f.caret]))
@@ -4775,6 +5797,9 @@ func selectSource(): Str {
 		}
 
 		func (n *uiNative) undo(b *uiBox, f *uiEntry, back bool) bool \{
+			if ro, ok := b.attr("readOnly"); ok && ro.Flag \{
+				return false
+			}
 			from, to := &f.past, &f.future
 			if !back \{
 				from, to = to, from
@@ -4785,8 +5810,13 @@ func selectSource(): Str {
 			*to = append(*to, f.snapshot())
 			s := (*from)[len(*from)-1]
 			*from = (*from)[:len(*from)-1]
+			was := f.text
 			f.text, f.caret, f.anchor = s.text, s.caret, s.anchor
+			f.changed()
 			f.lastTyped = false
+			if a, zw, zn := uiDiff(was, f.text); a < zw || a < zn \{
+				n.post(b.v.Attrs, "edit", strconv.Itoa(a)+","+strconv.Itoa(zw)+","+string(f.text[a:zn]), 0)
+			}
 			value := n.numeric(b, f)
 			f.sent = append(f.sent, value)
 			n.post(b.v.Attrs, "input", value, 0)
@@ -4811,6 +5841,11 @@ func selectSource(): Str {
 			n.layout()
 			x, y = x/n.scale, y/n.scale
 			n.popup, n.tip = nil, ""
+			n.spot = [2]float64\{x, y}
+			if hb := n.heard(x, y, "onMenu"); hb != nil \{
+				n.post(hb.v.Attrs, "menu", "", 0)
+				return true
+			}
 			b := n.target(x, y)
 			var items []uiMenuItem
 			switch \{
@@ -10074,7 +11109,7 @@ func accessSource(): Str {
 			case "textarea":
 				node.role, node.name, node.editable, node.multiline = "edit", placeholder.Word, !b.disabled, true
 				if f := n.fields[b.path]; f != nil \{
-					node.value = string(f.text)
+					node.value = f.value()
 				}
 			case "table":
 				node.role = "table"
@@ -10285,6 +11320,8 @@ func windowsSource(): Str {
 			"os"
 			"os/exec"
 			"runtime"
+			"strconv"
+			"strings"
 			"sync"
 			"sync/atomic"
 			"syscall"
@@ -10303,6 +11340,8 @@ func windowsSource(): Str {
 
 			uiwRegisterClassEx     = uiwUser32.NewProc("RegisterClassExW")
 			uiwCreateWindowEx      = uiwUser32.NewProc("CreateWindowExW")
+			uiwSetWindowText       = uiwUser32.NewProc("SetWindowTextW")
+			uiwMapVirtualKey       = uiwUser32.NewProc("MapVirtualKeyW")
 			uiwDefWindowProc       = uiwUser32.NewProc("DefWindowProcW")
 			uiwShowWindow          = uiwUser32.NewProc("ShowWindow")
 			uiwUpdateWindow        = uiwUser32.NewProc("UpdateWindow")
@@ -10381,12 +11420,15 @@ func windowsSource(): Str {
 			uiwWmNcCreate      = 0x0081
 			uiwWmKeyDown       = 0x0100
 			uiwWmChar          = 0x0102
+			uiwWmKeyUp         = 0x0101
+			uiwWmSysKeyDown    = 0x0104
 			uiwWmImeStart      = 0x010D
 			uiwWmTimer         = 0x0113
 			uiwWmMouseMove     = 0x0200
 			uiwWmLButtonDown   = 0x0201
 			uiwWmLButtonUp     = 0x0202
 			uiwWmRButtonUp     = 0x0205
+			uiwWmMButtonUp     = 0x0208
 			uiwWmMouseWheel    = 0x020A
 			uiwWmMouseHWheel   = 0x020E
 			uiwWmMouseLeave    = 0x02A3
@@ -10526,6 +11568,9 @@ func windowsSource(): Str {
 			high     uint16
 			icons    []uintptr
 			dark     bool
+			title    string
+			swallow  bool
+			msg      uiwMsg
 		}
 
 		func (w *uiwWindow) show(v UiView) \{
@@ -10567,6 +11612,7 @@ func windowsSource(): Str {
 				dpi = float64(uiwCall(uiwGetDpiForSystem))
 			}
 			id := w.register()
+			w.title = title
 			name := uiwText(title)
 			hwnd := uiwCall(uiwCreateWindowEx, 0,
 				uintptr(unsafe.Pointer(&uiwClassNm[0])), uintptr(unsafe.Pointer(&name[0])),
@@ -10585,14 +11631,17 @@ func windowsSource(): Str {
 			uiwCall(uiwUpdateWindow, hwnd)
 			uiwCall(uiwSetTimer, hwnd, uiwBlinkTimer, 530, 0)
 			opened <- true
-			var msg uiwMsg
+			// The message lives on the heap, in the window: DispatchMessage holds a
+			// pointer to it while the window procedure runs, and that is Go code whose
+			// stack may grow — and move — under a message kept on it.
+			msg := &w.msg
 			for \{
-				got := int32(uiwCall(uiwGetMessage, uintptr(unsafe.Pointer(&msg)), 0, 0, 0))
+				got := int32(uiwCall(uiwGetMessage, uintptr(unsafe.Pointer(msg)), 0, 0, 0))
 				if got <= 0 \{
 					return
 				}
-				uiwCall(uiwTranslateMessage, uintptr(unsafe.Pointer(&msg)))
-				uiwCall(uiwDispatchMessage, uintptr(unsafe.Pointer(&msg)))
+				uiwCall(uiwTranslateMessage, uintptr(unsafe.Pointer(msg)))
+				uiwCall(uiwDispatchMessage, uintptr(unsafe.Pointer(msg)))
 			}
 		}
 
@@ -10660,6 +11709,7 @@ func windowsSource(): Str {
 				w.metrics = map[uiFont]uiwMetrics\{}
 				n.dev = w
 				n.adopt()
+				w.retitle()
 				return 0, true
 			case uiwWmPaint:
 				var ps uiwPaint
@@ -10682,6 +11732,7 @@ func windowsSource(): Str {
 				return 0, true
 			case uiwWmAppView:
 				n.adopt()
+				w.retitle()
 				w.invalidate()
 				return 0, true
 			case uiwWmDpiChanged:
@@ -10707,6 +11758,8 @@ func windowsSource(): Str {
 					shape = 32649
 				case "resize":
 					shape = 32645
+				case "cols":
+					shape = 32644
 				}
 				uiwCall(uiwSetCursor, uiwCall(uiwLoadCursor, 0, shape))
 				return 1, true
@@ -10717,18 +11770,30 @@ func windowsSource(): Str {
 					uiwCall(uiwTrackMouseEvent, uintptr(unsafe.Pointer(&track)))
 					w.tracking = true
 				}
+				n.ctrl = wp&0x0008 != 0
 				if n.move(float64(uiwLow(lp)), float64(uiwHigh(lp))) \{
 					w.invalidate()
 				}
 				return 0, true
+			case uiwWmKeyUp:
+				if wp == 0x11 && n.setCtrl(false) \{
+					w.invalidate()
+				}
+				return 0, false
 			case uiwWmMouseLeave:
 				w.tracking = false
 				if n.leave() \{
 					w.invalidate()
 				}
 				return 0, true
+			case uiwWmMButtonUp:
+				if n.middle(float64(uiwLow(lp)), float64(uiwHigh(lp))) \{
+					w.invalidate()
+				}
+				return 0, true
 			case uiwWmLButtonDown:
 				uiwCall(uiwSetCapture, w.hwnd)
+				n.ctrl = wp&0x0008 != 0
 				if n.down(float64(uiwLow(lp)), float64(uiwHigh(lp))) \{
 					w.invalidate()
 				}
@@ -10756,13 +11821,36 @@ func windowsSource(): Str {
 					w.invalidate()
 				}
 				return 0, true
-			case uiwWmKeyDown:
+			case uiwWmKeyDown, uiwWmSysKeyDown:
+				w.swallow = false
+				if wp == 0x11 \{
+					if n.setCtrl(true) \{
+						w.invalidate()
+					}
+					return 0, false
+				}
+				if n.claim(w.named(wp)) \{
+					w.swallow = true
+					w.invalidate()
+					return 0, true
+				}
+				if msg == uiwWmSysKeyDown \{
+					return 0, false
+				}
 				if w.key(wp) \{
 					w.invalidate()
 					return 0, true
 				}
 				return 0, false
 			case uiwWmChar:
+				if w.swallow \{
+					w.swallow = false
+					return 0, true
+				}
+				if unit := rune(wp); unit > 0x20 && unit < 0xD800 && unit != 0x7F && n.claim(string(unit)) \{
+					w.invalidate()
+					return 0, true
+				}
 				unit := uint16(wp)
 				var r rune
 				switch \{
@@ -10821,6 +11909,32 @@ func windowsSource(): Str {
 				return 0, true
 			}
 			return 0, false
+		}
+
+		var uiwNamed = map[uintptr]string\{
+			0x08: "Backspace", 0x09: "Tab", 0x0D: "Enter", 0x1B: "Escape", 0x20: "Space",
+			0x21: "PageUp", 0x22: "PageDown", 0x23: "End", 0x24: "Home",
+			0x25: "ArrowLeft", 0x26: "ArrowUp", 0x27: "ArrowRight", 0x28: "ArrowDown",
+			0x2D: "Insert", 0x2E: "Delete",
+		}
+
+		// The name of the key a KEYDOWN is for, or "" for one WM_CHAR will name.
+		func (w *uiwWindow) named(vk uintptr) string \{
+			ctrl, shift, alt := uiwHeld(0x11), uiwHeld(0x10), uiwHeld(0x12)
+			if name, ok := uiwNamed[vk]; ok \{
+				return uiCombo(name, ctrl, shift, alt)
+			}
+			if vk >= 0x70 && vk <= 0x7B \{
+				return uiCombo("F"+strconv.Itoa(int(vk-0x6F)), ctrl, shift, alt)
+			}
+			if !ctrl && !alt \{
+				return ""
+			}
+			r := rune(uiwCall(uiwMapVirtualKey, vk, 2) & 0x7FFFFFFF)
+			if r <= 0x20 \{
+				return ""
+			}
+			return uiCombo(strings.ToUpper(string(r)), ctrl, shift, alt)
 		}
 
 		func (w *uiwWindow) key(vk uintptr) bool \{
@@ -10894,6 +12008,17 @@ func windowsSource(): Str {
 
 		func (w *uiwWindow) invalidate() \{ uiwCall(uiwInvalidateRect, w.hwnd, 0, 0) }
 
+		// The title bar follows the outermost widget's title, when it gives one.
+		func (w *uiwWindow) retitle() \{
+			title := uiTitleOf(w.n.latest())
+			if title == "" || title == w.title \{
+				return
+			}
+			w.title = title
+			name := uiwText(title)
+			uiwCall(uiwSetWindowText, w.hwnd, uintptr(unsafe.Pointer(&name[0])))
+		}
+
 		func (w *uiwWindow) scale() float64 \{
 			if uiwGetDpiForWindow.Find() != nil \{
 				return 1
@@ -10966,6 +12091,9 @@ func windowsSource(): Str {
 			}
 			if f.icon \{
 				face = "Segoe UI Symbol"
+			}
+			if f.mono \{
+				face = "Consolas"
 			}
 			name := uiwText(face)
 			px := int32(-math.Round(f.px * w.n.scale))
@@ -12826,7 +13954,7 @@ func linuxSource(): Str {
 			w.cursors = map[string]uint32\{}
 			font := c.id()
 			c.send(uixRequest(45, 0).u32(font).u16(6).u16(0).raw([]byte("cursor")))
-			for shape, glyph := range map[string]int\{"arrow": 68, "text": 152, "hand": 60, "resize": 116} \{
+			for shape, glyph := range map[string]int\{"arrow": 68, "text": 152, "hand": 60, "resize": 116, "cols": 108} \{
 				id := c.id()
 				c.send(uixRequest(94, 0).u32(id).u32(font).u32(font).u16(glyph).u16(glyph + 1).
 					u16(0).u16(0).u16(0).u16(0xffff).u16(0xffff).u16(0xffff))
@@ -12846,6 +13974,9 @@ func linuxSource(): Str {
 			c.property(w.win, w.atoms["_NET_WM_ICON"], uixAtomCardinal, 32, uixIcon())
 			w.n.wake = w.poke
 			w.n.adopt()
+			if first := uiTitleOf(w.n.latest()); first != "" && first != w.title \{
+				w.retitle(first)
+			}
 			c.send(uixRequest(8, 0).u32(w.win))
 			c.flush()
 			if at := c.atom("AT_SPI_BUS"); at != 0 \{
@@ -13100,6 +14231,10 @@ func linuxSource(): Str {
 					}
 				case <-w.woke:
 					w.n.adopt()
+					if title := uiTitleOf(w.n.latest()); title != "" && title != w.title \{
+						w.retitle(title)
+						w.c.flush()
+					}
 					w.dirty = true
 				case f := <-w.inbox:
 					f()
@@ -13152,7 +14287,10 @@ func linuxSource(): Str {
 				state := uixLE.Uint16(ev[28:])
 				switch button := ev[1]; \{
 				case button == 1 && ev[0]&0x7f == 4:
+					n.ctrl = state&4 != 0
 					w.dirty = n.down(x, y) || w.dirty
+				case button == 2 && ev[0]&0x7f == 4:
+					w.dirty = n.middle(x, y) || w.dirty
 				case button == 1:
 					w.dirty = n.up(x, y) || w.dirty
 				case button == 3 && ev[0]&0x7f == 4:
@@ -13166,6 +14304,7 @@ func linuxSource(): Str {
 				}
 			case 6, 7:
 				x, y := float64(int16(uixLE.Uint16(ev[24:]))), float64(int16(uixLE.Uint16(ev[26:])))
+				n.ctrl = uixLE.Uint16(ev[28:])&4 != 0
 				w.dirty = n.move(x, y) || w.dirty
 				w.setCursor(n.cursor(x, y))
 			case 8:
@@ -13496,6 +14635,10 @@ func linuxSource(): Str {
 		// A field's keys go to the input method first, and on only where it did not want them.
 		func (w *uixWindow) keyEvent(code byte, state uint16, release bool) \{
 			sym := w.keysym(code, state)
+			if sym == 0xffe3 || sym == 0xffe4 \{
+				w.dirty = w.n.setCtrl(!release) || w.dirty
+				return
+			}
 			if ime := w.ime; ime != nil && ime.focused && w.n.typing() \{
 				if ime.key(sym, code, state, release, w.stamp) \{
 					return
@@ -13510,9 +14653,39 @@ func linuxSource(): Str {
 			}
 		}
 
+		var uixNamed = map[uint32]string\{
+			0xff08: "Backspace", 0xff09: "Tab", 0xfe20: "Tab", 0xff0d: "Enter", 0xff8d: "Enter",
+			0xff1b: "Escape", 0xffff: "Delete", 0xff9f: "Delete", 0xff63: "Insert", 0x20: "Space",
+			0xff50: "Home", 0xff95: "Home", 0xff57: "End", 0xff9c: "End",
+			0xff51: "ArrowLeft", 0xff96: "ArrowLeft", 0xff53: "ArrowRight", 0xff98: "ArrowRight",
+			0xff52: "ArrowUp", 0xff97: "ArrowUp", 0xff54: "ArrowDown", 0xff99: "ArrowDown",
+			0xff55: "PageUp", 0xff9a: "PageUp", 0xff56: "PageDown", 0xff9b: "PageDown",
+		}
+
+		func (w *uixWindow) named(sym uint32, shift, ctrl, alt bool) string \{
+			if name, ok := uixNamed[sym]; ok \{
+				return uiCombo(name, ctrl, shift, alt)
+			}
+			if sym >= 0xffbe && sym <= 0xffc9 \{
+				return uiCombo("F"+strconv.Itoa(int(sym-0xffbd)), ctrl, shift, alt)
+			}
+			r := uixRune(sym)
+			if r == 0 \{
+				return ""
+			}
+			if !ctrl && !alt \{
+				return string(r)
+			}
+			return uiCombo(strings.ToUpper(string(r)), ctrl, shift, alt)
+		}
+
 		func (w *uixWindow) pressed(sym uint32, state uint16, composed bool) \{
 			n := w.n
 			shift, ctrl, alt := state&1 != 0, state&4 != 0, state&8 != 0
+			if _, dead := uixDeadKeys[sym]; !dead && w.dead == 0 && n.claim(w.named(sym, shift, ctrl, alt)) \{
+				w.dirty = true
+				return
+			}
 			k, special := uixKeys[sym]
 			if ctrl && !alt \{
 				switch l, _ := uixCase(sym); l \{
@@ -16479,6 +17652,8 @@ func fontSource(): Str {
 
 		type uixFonts struct \{
 			mu       sync.Mutex
+			mono     *uixFace
+			monoAsked bool
 			regular  *uixFace
 			semibold *uixFace
 			bold     *uixFace
@@ -16822,7 +17997,40 @@ func fontSource(): Str {
 			return face, weight >= 600 && face.weight < 600
 		}
 
+		func (fs *uixFonts) monoFace() *uixFace \{
+			if fs.monoAsked \{
+				return fs.mono
+			}
+			fs.monoAsked = true
+			if fs.fc \{
+				for _, m := range uixFcMatch("monospace", false) \{
+					index, _ := strconv.Atoi(m[1])
+					if face := fs.load(m[0], index&0xffff); face != nil \{
+						fs.mono = face
+						return face
+					}
+				}
+			}
+			for _, path := range []string\{
+				"/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+				"/usr/share/fonts/dejavu/DejaVuSansMono.ttf", "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf",
+				"/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf", "/usr/share/fonts/liberation-mono/LiberationMono-Regular.ttf",
+				"/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf", "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+			} \{
+				if face := fs.load(path, 0); face != nil \{
+					fs.mono = face
+					return face
+				}
+			}
+			return nil
+		}
+
 		func (fs *uixFonts) face(f uiFont) (*uixFace, bool) \{
+			if f.mono \{
+				if face := fs.monoFace(); face != nil \{
+					return uixStyled(face, f.weight, f.px)
+				}
+			}
 			face := fs.regular
 			switch \{
 			case f.weight >= 600 && f.weight < 700 && fs.semibold != nil:

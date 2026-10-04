@@ -510,7 +510,7 @@ func isOpaque(module: Str, name: Str): Bool {
 	// what lets a `func` answering with a `hive.ui.View` be written down.
 	if module == "ui" {
 		return name == "View" || name == "Attr" || name == "Shape"
-			|| name == "Mark"
+			|| name == "Mark" || name == "Run"
 			|| len(variantsOf("ui", name)) > 0
 	}
 	return false
@@ -534,6 +534,9 @@ func variantsOf(module: Str, name: Str): Str[dyn] {
 			return ["Normal", "Muted", "Good", "Warn", "Danger", "HEX", "RGBA"]
 		}
 		if name == "Axis" { return ["Horizontal", "Vertical", "Both"] }
+		// Where an overlay that is neither a dialog nor pinned to an edge opens: where
+		// the pointer was last pressed, or under a code editor's caret.
+		if name == "Anchor" { return ["Pointer", "Caret"] }
 		if name == "InputKind" {
 			return ["Text", "Number", "Date", "Password", "Search", "Range"]
 		}
@@ -716,7 +719,16 @@ func isUiWidget(name: Str): Bool {
 		|| name == "input" || name == "textarea" || name == "checkbox"
 		|| name == "select" || name == "table" || name == "scene"
 		|| name == "inset" || name == "canvas" || name == "spinner"
-		|| name == "none"
+		|| name == "none" || name == "code"
+}
+
+// What goes in a `code` editor beside its text: a run of it in a colour, behind a
+// colour, or underlined, and a mark against one of its lines. Each is where it is by
+// offsets into the text, counted in characters, so what colours a word is the same
+// two numbers whatever the window does with its pixels.
+func isUiRun(name: Str): Bool {
+	return name == "ink" || name == "shade" || name == "squiggle" || name == "marker"
+		|| name == "underline" || name == "band" || name == "note"
 }
 
 // What goes in a `scene`. Eight are solids and the ninth is a `sound`, which is a
@@ -743,7 +755,11 @@ func isUiAttr(name: Str): Bool {
 		|| name == "grow" || name == "heading" || name == "align"
 		|| name == "justify" || name == "scroll" || name == "size"
 		|| name == "tone" || name == "background" || name == "kind"
-		|| name == "placeholder" || name == "hint" || name == "disabled"
+		|| name == "placeholder" || name == "hint" || name == "title" || name == "disabled"
+		|| name == "keys" || name == "caret" || name == "numbers" || name == "tabSize"
+		|| name == "anchor" || name == "focus" || name == "readOnly" || name == "clip" || name == "perform"
+		|| name == "fontSize" || name == "border" || name == "borderTone" || name == "radius" || name == "ring"
+		|| name == "hover"
 		|| name == "busy" || name == "paint" || name == "surface"
 		|| name == "thick" || name == "region"
 		|| name == "lens" || name == "fog" || name == "track"
@@ -760,16 +776,26 @@ func isUiAttr(name: Str): Bool {
 // what a program may hand it.
 func isUiEvent(name: Str): Bool {
 	return len(uiEventArgs(name)) > 0 || name == "on" || name == "onDismiss"
+		|| name == "onMenu" || name == "onMiddle" || name == "onDouble"
 }
 
 // What an event reports, in order. `on` and `onDismiss` report nothing — they
 // take the message itself.
 func uiEventArgs(name: Str): types.Ty[dyn] {
 	if name == "onInput" || name == "onSubmit" || name == "onChoose"
-		|| name == "onKeyDown" || name == "onKeyUp" {
+		|| name == "onKeyDown" || name == "onKeyUp" || name == "onKey" || name == "onPaste" {
 		return [types.Ty.TStr()]
 	}
 	if name == "onToggle" || name == "onGrab" { return [types.Ty.TBool()] }
+	// A code editor's selection, anchor then caret; the lines it shows, first then
+	// last; and what an edit replaced — from, to, and what went there instead.
+	if name == "onCaret" || name == "onView" || name == "onFit" { return [types.Ty.TInt(), types.Ty.TInt()] }
+	if name == "onEdit" { return [types.Ty.TInt(), types.Ty.TInt(), types.Ty.TStr()] }
+	// How far the pointer has moved since the press, across and down, and whether
+	// this is where it was let go.
+	if name == "onDrag" { return [types.Ty.TInt(), types.Ty.TInt(), types.Ty.TBool()] }
+	// The character of a code editor under the pointer, or under a Ctrl+click.
+	if name == "onHover" || name == "onJump" || name == "onProbe" { return [types.Ty.TInt()] }
 	if name == "onPick" || name == "onSort" || name == "onFrame"
 		|| name == "onRate" {
 		return [types.Ty.TInt()]
@@ -812,6 +838,7 @@ func uiResult(name: Str, args: types.Ty[]): types.Ty {
 	if isUiWidget(name) { return types.Ty.TLib("ui", "View") }
 	if isUiShape(name) { return types.Ty.TLib("ui", "Shape") }
 	if isUiMark(name) { return types.Ty.TLib("ui", "Mark") }
+	if isUiRun(name) { return types.Ty.TLib("ui", "Run") }
 	if isUiAttr(name) { return types.Ty.TLib("ui", "Attr") }
 	if name == "html" || name == "page" { return types.Ty.TStr() }
 	// A window is a `spawn` handler of the same shape as its `update`.
@@ -850,6 +877,12 @@ func uiParams(name: Str): types.Ty[dyn] {
 	// already drawing, from wherever this one's `eye` and `aim` are standing.
 	if name == "inset" { return [attrs, views] }
 	if name == "canvas" { return [attrs, marks] }
+	if name == "code" { return [attrs, str, types.Ty.TVec(types.Ty.TLib("ui", "Run"), dynamic())] }
+	if name == "ink" || name == "shade" || name == "squiggle" || name == "underline" {
+		return [types.Ty.TInt(), types.Ty.TInt(), types.Ty.TLib("ui", "Tone")]
+	}
+	if name == "marker" || name == "band" { return [types.Ty.TInt(), types.Ty.TLib("ui", "Tone")] }
+	if name == "note" { return [types.Ty.TInt(), types.Ty.TStr(), types.Ty.TLib("ui", "Tone")] }
 	if name == "spinner" { return [attrs] }
 	if name == "spacer" || name == "none" { return [] }
 	// The marks. A place is two numbers rather than a point, for the reason `at`
@@ -921,7 +954,27 @@ func uiAttrParams(name: Str): types.Ty[dyn] {
 		|| name == "grain" || name == "bits" {
 		return [types.Ty.TInt()]
 	}
-	if name == "placeholder" || name == "hint" || name == "touch" { return [types.Ty.TStr()] }
+	// Where a code editor's selection is, anchor then caret, in characters.
+	if name == "caret" { return [types.Ty.TInt(), types.Ty.TInt(), types.Ty.TInt()] }
+	// A request to be focused, answered whenever the number changes.
+	if name == "focus" { return [types.Ty.TInt()] }
+	if name == "numbers" || name == "readOnly" { return [types.Ty.TBool()] }
+	if name == "tabSize" || name == "fontSize" { return [types.Ty.TInt()] }
+	// How a field or a button is outlined: how thick, in what, how round, and
+	// whether the accent ring shows while it has the focus.
+	if name == "border" || name == "radius" { return [types.Ty.TInt()] }
+	if name == "borderTone" { return [types.Ty.TLib("ui", "Tone")] }
+	// The colour behind a widget while the pointer is over it.
+	if name == "hover" { return [types.Ty.TLib("ui", "Tone")] }
+	if name == "ring" { return [types.Ty.TBool()] }
+	if name == "anchor" { return [types.Ty.TLib("ui", "Anchor")] }
+	// Text for the clipboard, and a command for a field — each carried out once,
+	// when its serial changes.
+	if name == "clip" || name == "perform" { return [types.Ty.TStr(), types.Ty.TInt()] }
+	// The keys a widget takes for itself, each named as `onKey` reports it.
+	if name == "keys" { return [types.Ty.TVec(types.Ty.TStr(), dynamic())] }
+	// What the window's own title bar says, from the outermost widget.
+	if name == "placeholder" || name == "hint" || name == "title" || name == "touch" { return [types.Ty.TStr()] }
 	if name == "disabled" || name == "busy" || name == "grab" || name == "crosshair"
 		|| name == "shadows" {
 		return [types.Ty.TBool()]
@@ -1123,6 +1176,10 @@ func uiParamNames(name: Str): Str[dyn] {
 	if name == "table" { return ["attrs", "rows"] }
 	if name == "scene" { return ["attrs", "shapes"] }
 	if name == "canvas" { return ["attrs", "marks"] }
+	if name == "code" { return ["attrs", "text", "runs"] }
+	if name == "ink" || name == "shade" || name == "squiggle" || name == "underline" { return ["from", "to", "tone"] }
+	if name == "marker" || name == "band" { return ["line", "tone"] }
+	if name == "note" { return ["line", "text", "tone"] }
 	if name == "spinner" { return ["attrs"] }
 	if name == "spacer" || name == "none" { return [] }
 	if name == "dot" { return ["attrs", "x", "y", "radius"] }
@@ -1149,6 +1206,9 @@ func uiParamNames(name: Str): Str[dyn] {
 	if name == "at" || name == "turn" || name == "eye" { return ["x", "y", "z"] }
 	if name == "aim" { return ["yaw", "pitch"] }
 	if name == "region" { return ["x", "y", "width", "height"] }
+	if name == "caret" { return ["anchor", "head", "serial"] }
+	if name == "clip" { return ["text", "serial"] }
+	if name == "perform" { return ["command", "serial"] }
 	if isUiAttr(name) { return ["value"] }
 	return []
 }

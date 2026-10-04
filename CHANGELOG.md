@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.2.13
+
+### Standard library
+
+* **`hive.ui.code(attrs, text, runs)` is a code editor**: fixed-width, no wrapping, coloured by runs — `ink`, `shade`, `squiggle`, `underline`, `marker` (a line's mark in the gutter), `band` (a line's background) and `note` (text after a line's end that is not part of the text), each placed by character offsets. It types, selects, scrolls, undoes and pastes as a textarea does; Tab types a tab and Enter keeps the line's indentation.
+* **A code editor tells and is told**: `onEdit` is handed what an edit replaced (from, to, text) rather than the whole text, `onCaret` the selection, `onView` the lines in view, `onFit` the columns and rows that fit, `onHover` and `onJump` the character under the pointer and under a Ctrl+click, `onProbe` the one under the pointer while Ctrl is held, and `onPaste` the clipboard's text. `caret(anchor, head, serial)` puts the selection somewhere, once per change; `numbers`, `tabSize`, `fontSize`, `readOnly` and `perform(command, serial)` (undo, redo, cut, copy, paste, select all) round it out.
+* **`hive.ui.keys(names)` and `onKey(f)`**: a widget takes the keys it names — `"Ctrl+S"`, `"Escape"`, `":"`, or `"Any"` — and the innermost one around the focus that names a key gets it; nothing else happens to that key.
+* **The pointer's own events on any widget**: `onMenu` (a right click), `onMiddle`, `onDouble` and `onDrag(f)`, handed how far the pointer moved since the press and whether it was let go.
+* **`anchor(Anchor.Pointer)` and `anchor(Anchor.Caret)`** open an overlay where the pointer was last pressed or under a code editor's caret, never past the window's edge; a press anywhere else is its `onDismiss`.
+* **`hive.ui.title(text)`** on the outermost widget is what the window's title bar says.
+* **Requests carried out once per serial**: `focus(serial)` focuses a widget (or the first field in it) and `clip(text, serial)` puts text on the clipboard.
+* **A button's or a field's look**: `border(n)`, `borderTone(tone)`, `radius(n)`, `ring(false)` (no accent ring while focused) and `hover(tone)` (the colour behind any widget under the pointer; a link with one is not underlined). A button or field in a colour of its own draws no edge unless it asks for one.
+* **A row that scrolls across keeps its children's widths**, so what does not fit is scrolled to rather than squeezed.
+
+### Fixes
+
+* **The native window no longer crashes at random on Windows**: the message `DispatchMessage` worked on lived on a goroutine stack that could move while the window procedure ran.
+* **The native window paints faster**: a rounded box fills its middle a row at a time, and a field works out its text and its lines once per change.
+* **A link drawn natively keeps a colour of its own** rather than taking the accent.
+* **A crash in a native window is kept**: what it prints is also appended to `<temp>/<program>-crash.log`, since such a window has no console.
+
 ## v0.2.12
 
 ### Language

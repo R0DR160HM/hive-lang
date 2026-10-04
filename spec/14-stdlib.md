@@ -829,7 +829,13 @@ all.
 | Canvas | `region(x, y, width, height)` `thick(Float)` |
 | State | `disabled` `busy` `placeholder` `hint` `kind` |
 | Touch | `touch(Str)` |
-| Events | `on(Msg)` `onDismiss(Msg)` `onInput(f)` `onSubmit(f)` `onChoose(f)` `onToggle(f)` `onPick(f)` `onSort(f)` |
+| Window | `title` — on the outermost widget, the title bar |
+| Events | `on(Msg)` `onDismiss(Msg)` `onInput(f)` `onSubmit(f)` `onChoose(f)` `onToggle(f)` `onPick(f)` `onSort(f)` `onKey(f)` |
+| Code | `code(attrs, text, runs)` with `ink` `shade` `squiggle` `underline` `marker` `band` `note`; `caret(anchor, head, serial)` `numbers` `tabSize` `readOnly` `perform(command, serial)` `onEdit(f)` `onCaret(f)` `onView(f)` `onFit(f)` `onHover(f)` `onJump(f)` `onProbe(f)` `onPaste(f)` |
+| Look | `border(n)` `radius(n)` `borderTone(Tone)` `ring(b)` — a button's or a field's edge and focus ring; `hover(Tone)` — any widget's colour under the pointer |
+| Requests | `focus(serial)` focuses a widget, `clip(text, serial)` fills the clipboard — once per serial |
+| Pointer | `onMenu(Msg)` `onMiddle(Msg)` `onDouble(Msg)` `onDrag(f)`; `anchor(Anchor)` opens an overlay at the pointer or the caret |
+| Keys | `keys(Str[dyn])` — which keys a widget takes for its `onKey`; the innermost around the focus wins |
 
 A scene takes attributes of its own — a camera, a sky, and the events a game
 needs — and so do the shapes in one. They are [14.16](#1416-hiveuiscene).
