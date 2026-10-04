@@ -36,6 +36,7 @@
 * **`hive.crypto.encrypt` and `decrypt` keep the plaintext a `Secret`**, under a `Secret` password, and `hmacSha256` and `jwtCodec` take a `Secret` key.
 * **`hive.term.readSecret()` answers a `Result<Secret, SecretError>`**, read straight into locked memory, and `hive.file.writeSecret` and `hive.syslink.setKey` take a `Secret`.
 * **`hive.env.getSecret(name)`** is `get` answering a `Secret`, and **`hive.crypto.randomSecret(bytes)`** is `randomHex` drawn into locked memory, answering a `Result`.
+* **`hive.ui.scene` now has native antialiasing**.
 * **`hive.ui.touch(name)` makes any widget a thumb control.** While a finger is on it, a scene's `onPad` hears pad -1: `name` is 1 while the finger is down and 0 once it lifts, and `nameX` and `nameY` are where on the widget it is, -1 to 1 from the middle and held inside a circle. Every finger is followed on its own, so a stick and a button can be held together, and the widget's box is taken when the finger goes down, so a repaint under it moves nothing. The page neither scrolls nor zooms under one.
 
 ### Tooling
