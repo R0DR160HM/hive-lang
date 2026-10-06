@@ -1,5 +1,11 @@
 # Changelog
 
+## v.0.2.14
+
+### Fixes
+
+* **A test may call something `t`**: the `*testing.T` a test is compiled to run under was itself named `t`, so a test declaring a `t` of its own did not build — Go read every assertion after it as being handed the test's value. It is now `__t`, which no Hive name can be spelled as.
+
 ## v0.2.13
 
 ### Standard library
