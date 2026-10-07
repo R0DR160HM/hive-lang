@@ -1,6 +1,6 @@
 # Changelog
 
-## v.0.2.14
+## v0.2.14
 
 ### Fixes
 
