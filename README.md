@@ -40,10 +40,9 @@ hivec version                        which release this compiler is
 
 ## Learn
 
-* [The tour](https://hive-lang.run): the whole language in fifty-five pages.
-* [examples/](examples): thirty-three programs, from `echo` to a multiplayer
+* [The tour](https://hive-lang.run): the whole language. All of it.
+* [examples/](examples): Complete programs, from `echo` to a multiplayer
   shooter, every one compiled and run by `./examples/run`.
-* [spec/](spec/): the specification. [18 — Conformance](spec/18-conformance.md)
-  says where this compiler departs from it.
+* [spec/](spec/): the specification.
 * [CHANGELOG.md](CHANGELOG.md): what changed, release by release.
 
