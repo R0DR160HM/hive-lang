@@ -104,6 +104,7 @@ func moduleText(module: Str): Str {
 	if module == "regex" { return regexSource() }
 	if module == "csv" { return csvSource() }
 	if module == "sheets" { return sheetsSource() }
+	if module == "audio" { return audioSource() }
 	// `hive.map` and `hive.task` are the core: a `Dict` and a `Task` are values
 	// the language itself hands out, so they are never a separate file.
 	return ""
@@ -228,6 +229,15 @@ func coreHeader(): Str {
 		func (e FileTableError) Error() string \{
 			return "hive: table error for " + e.Path + ": " + e.Message
 		}
+		`,
+		// What a module other than hive.ui puts on a program's window, should the
+		// program open one: markup for the page, and the routes that markup asks for.
+		// A route is a func(http.ResponseWriter, *http.Request) held as an any, so that
+		// a program that never opens a window carries no HTTP for it. hive.ui serves
+		// both; nothing else reads them.
+		`
+		var hivePageScripts []string
+		var hivePageRoutes = map[string]any\{}
 		`
 	], "\n\n")
 }
@@ -4460,7 +4470,14 @@ func netSource(): Str {
 					frame = append(frame, payload[i]^mask[i%4])
 				}
 			} else \{
-				frame = append(frame, payload...)
+		`,
+		// Unmasked, the payload goes out as it is, after its header and in the same
+		// write, rather than copied in behind the header first: a window's scene is a
+		// frame of this sixty times a second.
+		`
+				both := net.Buffers\{frame, payload}
+				_, err := both.WriteTo(s.conn)
+				return err
 			}
 			_, err := s.conn.Write(frame)
 			return err
@@ -10941,27 +10958,39 @@ func uiSource(): Str {
 				held = len(wasCuts) - 1
 			}
 			moves, changed := uiSceneDiff(scene, cuts, was, wasCuts, shapes, held)
-			var b strings.Builder
-			b.Grow(head + len(insets) + len(changed)*48 + len(moves)*4 + 32)
-			b.WriteByte('S')
-			uiPackU32(&b, int(seq))
-			uiPackU32(&b, int(prev))
+		`,
+		// Sized exactly and built as the bytes that are sent: a frame is the largest
+		// thing a window makes sixty times a second, and a builder guessing short
+		// and then copied out into bytes was three of them.
+		`
+			size := 9 + head + len(insets) + 4 + len(moves)*4 + 4
+			for _, at := range changed \{
+				size += 4 + int(cuts[at+1]-cuts[at])
+			}
+			out := make([]byte, 0, size)
+			out = append(out, 'S')
+			out = uiAppendU32(out, int(seq))
+			out = uiAppendU32(out, int(prev))
 		`,
 		// The camera and the shape count, already written at the front of the
 		// scene's own payload.
 		`
-			b.WriteString(scene[:head])
-			b.WriteString(insets)
-			uiPackU32(&b, len(moves)/3)
+			out = append(out, scene[:head]...)
+			out = append(out, insets...)
+			out = uiAppendU32(out, len(moves)/3)
 			for _, n := range moves \{
-				uiPackU32(&b, int(n))
+				out = uiAppendU32(out, int(n))
 			}
-			uiPackU32(&b, len(changed))
+			out = uiAppendU32(out, len(changed))
 			for _, at := range changed \{
-				uiPackU32(&b, int(at))
-				b.WriteString(scene[cuts[at]:cuts[at+1]])
+				out = uiAppendU32(out, int(at))
+				out = append(out, scene[cuts[at]:cuts[at+1]]...)
 			}
-			return []byte(b.String())
+			return out
+		}
+
+		func uiAppendU32(out []byte, v int) []byte \{
+			return append(out, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
 		}
 		`,
 		// What NetWsSend does, as a binary frame: a text frame has to carry valid
@@ -11339,7 +11368,7 @@ func uiSource(): Str {
 				"__TITLE__", uiEscape(title),
 				"__CSS__", uiCSS,
 				"__TOKEN__", w.token,
-				"__EXTRA__", uiExtraScript,
+				"__EXTRA__", uiExtraScript+strings.Join(hivePageScripts, ""),
 				"__ICON__", uiIconHref(),
 			).Replace(uiShell)
 
@@ -11523,6 +11552,11 @@ func uiSource(): Str {
 			mux := http.NewServeMux()
 			for path, handler := range uiExtraRoutes \{
 				mux.HandleFunc(path, handler)
+			}
+			for path, handler := range hivePageRoutes \{
+				if route, ok := handler.(func(http.ResponseWriter, *http.Request)); ok \{
+					mux.HandleFunc(path, route)
+				}
 			}
 			if len(uiWindowIcon) > 0 \{
 				mux.HandleFunc("/_hive/icon", uiIconRoute)
@@ -12181,7 +12215,7 @@ func uiSceneSource(): Str {
 		`
 		func UiScene(attrs []UiAttr, shapes []UiShape) UiView \{
 			var b strings.Builder
-			b.Grow(len(shapes)*40 + 256)
+			b.Grow(len(shapes)*64 + 256)
 			uiSceneCamera(&b, attrs)
 			uiPackU32(&b, len(shapes))
 		`,
@@ -12522,6 +12556,7 @@ func uiSceneSource(): Str {
 			uiSceneLine     = 6
 			uiSceneSound    = 7
 			uiSceneSprite   = 8
+			uiSceneRoof     = 9
 
 			uiSceneHasAt      = 1
 			uiSceneHasTurn    = 2
@@ -12561,6 +12596,8 @@ func uiSceneSource(): Str {
 				return uiSceneLine
 			case "sound":
 				return uiSceneSound
+			case "roof":
+				return uiSceneRoof
 			}
 			return uiSceneBox
 		}
@@ -12668,10 +12705,14 @@ func uiSceneJs(): Str {
 		var sizeSaid = [-1, -1];
 		var live = [], geoms = new Map(), mats = new Map(), signs = new Map();
 		`,
-		// Everything on the stage that is not a light, under one node, so a shape can
-		// go on and come off in constant time. See sow and shed.
+		// Everything on the stage that is not a light and not in a batch, under one
+		// node, so a shape can go on and come off in constant time. See sow and shed.
+		//
+		// A batch is every opaque solid of one kind in one finish, drawn as one
+		// instanced mesh: a city is thousands of boxes in a dozen finishes, and a draw
+		// call apiece was the whole of a frame's time on the page's thread. See seat.
 		`
-		var flock = null;
+		var flock = null, batches = new Map();
 		`,
 		// Which frame of the world arrived last, and the sounds among its slots. Only
 		// the sounds are kept slot by slot: a solid that changed arrives whole, and its
@@ -12683,29 +12724,33 @@ func uiSceneJs(): Str {
 		// whole world has gone out. See paint.
 		`
 		var needFull = false;
-		var skins = new Map(), bumps = new Map(), reliefs = new Map(), skies = new Map();
+		`,
+		// One texture of grain and one of relief per surface, whatever colour it is
+		// painted: a texture apiece for every colour a scene ever asked for was nine
+		// hundred canvases a few minutes into a city, and never one of them let go.
+		//
+		// The sky is one canvas, redrawn when its colour changes, and the light it
+		// throws is a second one, blurred for the surfaces to reflect. See heavens.
+		`
+		var skins = new Map();
+		var skyTex = null, skyHex = "", glow = null, glowTex = null, glowHex = "", glowAt = 0, pmrem = null;
 		`,
 		// The sun is held rather than let go of, because it now has to be moved: a
 		// shadow map covers a box, and the box has to be wherever the eye is.
 		`
 		var sun = null;
 		`,
-		// Every photograph this program shipped, and every canvas that is waiting to be
-		// redrawn when one arrives. See photoOf.
+		// Every photograph this program shipped. See photoOf.
 		`
-		var photos = new Map(), waiting = [];
+		var photos = new Map();
 		`,
-		// Which frame this is, counted only so the shadow map can be drawn on half of
-		// them. See apply.
-		//
 		// Shadows, and the one thing that makes them affordable. A shadow map is a
 		// second pass from where the sun is, and a scene here can be a circuit two
 		// miles round — mapped whole, a shadow would be a smear a metre wide.
 		//
 		// So the map covers a box round the eye (see reach) rather than the world,
 		// which is where shadows are read anyway: what a shadow is for is telling you
-		// a car is beside you and the kerb is where you think it is. Everything
-		// outside the box is culled out of the pass.
+		// a car is beside you and the kerb is where you think it is.
 		//
 		// A shadow map costs twice, and the second time is the expensive one: once to
 		// draw, and once to read for every lit fragment on the screen. At 3800x1800
@@ -12720,22 +12765,33 @@ func uiSceneJs(): Str {
 		// So: PCF, three.js's own default, a frame cheaper than PCFSoft and the same
 		// at this scale.
 		//
-		// And it is not redrawn every frame. The map is a second pass over everything
-		// the sun can see, and what it pictures barely moves: the light's direction
-		// is fixed (see apply), so between frames all that changes is where its box
-		// is centred — a metre, at racing speed.
+		// **It is redrawn every frame.** It was every other frame, which was half the
+		// pass saved and was invisible while the sun was a third of the light; once
+		// the sun was most of it, everything moving was shadowed on alternate frames
+		// by where it had been a frame before — a running man or a car at speed
+		// flickering from lit to dark thirty times a second. The pass is a few dozen
+		// instanced draws now (see seat), which is what made every frame affordable.
 		//
-		// So it is drawn every other frame and the sun is moved on the same beat.
-		// That pairing is not optional: move the light without redrawing the map and
-		// every shadow slides about under the thing casting it.
+		// And the sun is moved on the same beat. That pairing is not optional: move
+		// the light without redrawing the map and every shadow slides about under the
+		// thing casting it.
 		//
 		// Yaw, then pitch. With the default order a camera that is looking up rolls as
 		// it turns, which is the one thing an eye never does.
 		//
-		// A fixed rig, because lighting is not something a scene describes: two
-		// lights, one from the sky and one from a sun, chosen so a solid painted a
-		// colour comes out that colour with a shaded side. Brighter and every surface
-		// saturates to white. three.js takes these in physical units.
+		// A fixed rig, because lighting is not something a scene describes: the sky
+		// and a sun, chosen so a solid painted a colour comes out that colour on its
+		// lit side and a cooler, darker shade of it on its shaded one. three.js takes
+		// these in physical units, and the tone mapping is the shoulder of Khronos's
+		// neutral curve without its toe: a colour below the highlights is left where
+		// it was found, and a sunlit white rolls off gently instead of clipping. The
+		// toe was the curve's own darkening of the darks, which made every deep red
+		// and green a deeper and more saturated one than the scene had asked for.
+		//
+		// One pixel per pixel of the box, however dense the screen. A doubled
+		// density is four times the fragments and four times a multisampled
+		// framebuffer, and on a laptop's panel the second of those alone was a
+		// hundred megabytes; the edges are what multisampling is for.
 		//
 		// Two thousand and forty-eight, and it is very nearly free. Halving it to
 		// 1024 moved the frame rate by less than the noise between two runs: what a
@@ -12745,7 +12801,16 @@ func uiSceneJs(): Str {
 		// Over a box that size it is a shadow texel of five and a half centimetres,
 		// which is what lets the unfiltered edge pass for a drawn one.
 		`
-		var beat = 0;
+		var SHOULDER = [
+		  "vec3 shoulder(vec3 c) \{",
+		  "  float peak = max(c.r, max(c.g, c.b));",
+		  "  if (peak < 0.8) \{ return c; }",
+		  "  float fresh = 1.0 - 0.04 / (peak - 0.6);",
+		  "  c *= fresh / peak;",
+		  "  return mix(c, vec3(fresh), 1.0 - 1.0 / (0.15 * (peak - fresh) + 1.0));",
+		  "}"
+		].join("\n");
+
 		var want = "", grabbing = false, lookX = 0, lookY = 0, last = 0, dirty = false;
 		var held = \{};
 		var frame = null, sheet = null, screen = null, coarse = 0, deep = 0, shrink = 1;
@@ -12753,29 +12818,30 @@ func uiSceneJs(): Str {
 
 		function boot() \{
 		  renderer = new THREE.WebGLRenderer(\{antialias: true});
-		  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+		  renderer.setPixelRatio(1);
+		  THREE.ShaderChunk.tonemapping_pars_fragment = THREE.ShaderChunk.tonemapping_pars_fragment
+		    .replace("vec3 CustomToneMapping( vec3 color ) \{ return color; }",
+		      SHOULDER + "\nvec3 CustomToneMapping( vec3 color ) \{ return shoulder( toneMappingExposure * color ); }");
+		  renderer.toneMapping = THREE.CustomToneMapping;
 		  renderer.shadowMap.enabled = true;
 		  renderer.shadowMap.type = THREE.PCFShadowMap;
 		  renderer.shadowMap.autoUpdate = false;
 		  stage = new THREE.Scene();
 		  camera = new THREE.PerspectiveCamera(75, 1, 0.08, 800);
 		  camera.rotation.order = "YXZ";
+		  pmrem = new THREE.PMREMGenerator(renderer);
 		`,
-		// **Most of the light is ambient, and that is what a handheld's world looked
-		// like.** A machine with no per-pixel lighting baked what light it had into
-		// the texture and lit the rest flat, so a face pointing away from the sun was
-		// not a darker version of itself — it was the same colour. Two thirds of the
-		// old sun moved into the sky here: what is left is enough for a kerb to catch
-		// an edge and for the normal maps to have something to be normal to, and not
-		// enough to put a tonal ramp across a wall.
+		// **The sky lights the world, and the sun is warm.** The light from above is
+		// the sky itself, blurred (see heavens), so a wall facing away from the sun
+		// is lit by blue from above and by the ground's own brown from below — which
+		// is what makes it read as a wall in daylight rather than a darker card — and
+		// a car or a window reflects the sky it stands under.
 		//
-		// The sky term is also no longer blue-grey underneath. A hemisphere light with
-		// a cold ground colour is a lighting model — it says the world is lit from
-		// above by sky and from below by dirt — and that is one more gradient than a
-		// flat picture wants.
+		// The sun carries most of the light, so a face toward it and a face away
+		// from it are told apart at a glance; a shadow is then the sky's light alone,
+		// a little blue, as it is outdoors.
 		`
-		  stage.add(new THREE.HemisphereLight(0xffffff, 0xdfe3e8, 1.15));
-		  sun = new THREE.DirectionalLight(0xffffff, 0.55);
+		  sun = new THREE.DirectionalLight(0xfff0dc, 2.6);
 		  sun.position.set(6, 14, 8);
 		  sun.castShadow = true;
 		  sun.shadow.mapSize.set(2048, 2048);
@@ -12823,6 +12889,15 @@ func uiSceneJs(): Str {
 		// outer quarter of that box was buying a shadow you would have gone looking for.
 		`
 		function reach() \{ return 55; }
+		`,
+		// Which way the sun is — the same 6, 14, 8 the rig was built with — and the
+		// two directions across its view, as three.js's lookAt builds them, which are
+		// what the shadow box is moved along a texel at a time.
+		`
+		var SUNWARD = new THREE.Vector3(0.36, 0.85, 0.48).normalize();
+		var SUN_ACROSS = new THREE.Vector3(0, 1, 0).cross(SUNWARD).normalize();
+		var SUN_UP = SUNWARD.clone().cross(SUN_ACROSS);
+		var under = new THREE.Vector3();
 		`,
 		// The most anisotropy the card will give, within reason. It is what stops a
 		// road seen at a glancing angle from turning to mush a dozen metres ahead.
@@ -13011,6 +13086,10 @@ func uiSceneJs(): Str {
 		// right: fifteen-bit colour was fifteen bits of what the screen displayed, not
 		// of what the maths was carried in. Dithering in linear space puts all of the
 		// steps in the highlights and none in the shadows, where the eye is looking.
+		//
+		// The tone mapping is skipped for a target too, for the same reason, so it is
+		// done here as well and first — the same curve the screen gets (see boot), or
+		// a handheld's sunlit wall would clip where the screen's does not.
 		`
 		  var frag = [
 		    "uniform sampler2D tex;",
@@ -13018,7 +13097,9 @@ func uiSceneJs(): Str {
 		    "uniform vec2 size;",
 		    "uniform float steps;",
 		    "varying vec2 vUv;",
+		    SHOULDER,
 		    "vec3 shown(vec3 c) \{",
+		    "  c = shoulder(c);",
 		    "  vec3 lo = c * 12.92;",
 		    "  vec3 hi = 1.055 * pow(max(c, vec3(0.0)), vec3(0.4166667)) - 0.055;",
 		    "  return mix(lo, hi, step(vec3(0.0031308), c));",
@@ -13218,7 +13299,7 @@ func uiSceneJs(): Str {
 		// The kinds and the bits, exactly as uiSceneShape and uiSceneCamera write them.
 		`
 		var KINDS = ["box", "sphere", "cylinder", "cone", "ground", "label", "line",
-		  "sound", "sprite"];
+		  "sound", "sprite", "roof"];
 		var SOUND = 7;
 		var HAS_AT = 1, HAS_TURN = 2, HAS_SIZE = 4, HAS_SURFACE = 8, HAS_WORDS = 16,
 		  HAS_VOICE = 32, HAS_TRACK = 64;
@@ -13299,6 +13380,11 @@ func uiSceneJs(): Str {
 		  var kids = flock.children;
 		  for (var i = 0; i < kids.length; i++) \{ kids[i].parent = null; }
 		  kids.length = 0;
+		  batches.forEach(function (b) \{
+		    for (var j = 0; j < b.seats.length; j++) \{ b.seats[j].index = -1; }
+		    b.seats.length = 0;
+		    b.mesh.count = 0;
+		  });
 		  live.length = 0;
 		  voiceOf.length = 0;
 		  soundSlots.length = 0;
@@ -13353,7 +13439,7 @@ func uiSceneJs(): Str {
 		  var far = live.length;
 		  if (voiceOf.length > far) \{ far = voiceOf.length; }
 		  for (var i = count; i < far; i++) \{
-		    if (live[i]) \{ live[i].visible = false; }
+		    if (live[i]) \{ hide(live[i]); }
 		    if (voiceOf[i]) \{
 		      voiceOf[i] = null;
 		      soundsMoved = true;
@@ -13441,12 +13527,19 @@ func uiSceneJs(): Str {
 		// down two thousand shapes was a fifth of a second of scanning.
 		`
 		function sow(o) \{
+		  if (o.batch) \{ seat(o); return; }
 		  o.parent = flock;
 		  o.userData.spot = flock.children.length;
 		  flock.children.push(o);
 		}
 
+		function hide(o) \{
+		  if (o.batch) \{ unseat(o); return; }
+		  o.visible = false;
+		}
+
 		function shed(o) \{
+		  if (o.batch) \{ unseat(o); return; }
 		  var kids = flock.children, at = o.userData.spot;
 		  if (kids[at] !== o) \{ at = kids.indexOf(o); }
 		  if (at < 0) \{ return; }
@@ -13456,6 +13549,90 @@ func uiSceneJs(): Str {
 		  kids.length = kids.length - 1;
 		  o.parent = null;
 		  o.userData.spot = -1;
+		}
+		`,
+		// A seat: an opaque solid's place in its batch. It stands in a slot exactly as
+		// a mesh does — carried, trimmed and shed by the same code — and what it holds
+		// is an index into the batch's instance buffers rather than a mesh of its own.
+		//
+		// Taking one out moves the last one into its place, the same constant-time
+		// trade sow and shed make, and the moved one's matrix and colour go with it.
+		// Only what changed is sent to the card: a city's batch is thousands of
+		// instances of which a frame moves a handful.
+		//
+		// A batch that is full is made again at twice the size. The old buffers go
+		// with its mesh, because a buffer three.js has uploaded cannot be resized.
+		`
+		function seat(o) \{
+		  if (o.index >= 0) \{ return; }
+		  var b = o.batch;
+		  if (b.seats.length === b.room) \{ grow(b, b.room * 2); }
+		  o.index = b.seats.length;
+		  b.seats.push(o);
+		  b.mesh.count = b.seats.length;
+		  o.userData.tint = "";
+		}
+
+		function unseat(o) \{
+		  var b = o.batch, at = o.index;
+		  if (at < 0) \{ return; }
+		  var last = b.seats.length - 1, end = b.seats[last];
+		  if (at !== last) \{
+		    var m = b.mesh.instanceMatrix, c = b.mesh.instanceColor;
+		    m.array.copyWithin(at * 16, last * 16, last * 16 + 16);
+		    c.array.copyWithin(at * 3, last * 3, last * 3 + 3);
+		    touched(m, at, 16);
+		    touched(c, at, 3);
+		    b.seats[at] = end;
+		    end.index = at;
+		  }
+		  b.seats.length = last;
+		  b.mesh.count = last;
+		  o.index = -1;
+		}
+
+		function touched(attr, at, width) \{
+		  attr.addUpdateRange(at * width, width);
+		  attr.needsUpdate = true;
+		}
+
+		function grow(b, room) \{
+		  var mesh = new THREE.InstancedMesh(b.geo, b.mat, room);
+		  mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+		  mesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(room * 3), 3);
+		  mesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
+		  mesh.castShadow = b.cast;
+		  if (b.round) \{ mesh.customDepthMaterial = rounder(); }
+		  mesh.receiveShadow = true;
+		  mesh.matrixAutoUpdate = false;
+		`,
+		// Never culled as a whole: a batch is spread over everything near enough to
+		// draw, so its bounds always reach the eye, and working them out again after
+		// every change would be a walk over every instance a frame.
+		`
+		  mesh.frustumCulled = false;
+		  mesh.count = b.seats.length;
+		  if (b.mesh) \{
+		    mesh.instanceMatrix.array.set(b.mesh.instanceMatrix.array.subarray(0, b.seats.length * 16));
+		    mesh.instanceColor.array.set(b.mesh.instanceColor.array.subarray(0, b.seats.length * 3));
+		    stage.remove(b.mesh);
+		    b.mesh.dispose();
+		  }
+		  stage.add(mesh);
+		  b.mesh = mesh;
+		  b.room = room;
+		}
+
+		function batchOf(form, finish) \{
+		  var key = form + "|" + finish;
+		  var b = batches.get(key);
+		  if (!b) \{
+		    b = \{geo: unit(form), mat: paintOf(finish, ""), mesh: null, seats: [], room: 0,
+		      cast: form !== "ground", round: (form === "box" || form === "cylinder") && finish !== "Mesh"};
+		    grow(b, 64);
+		    batches.set(key, b);
+		  }
+		  return b;
 		}
 		`,
 		// The sounds, gathered again after the slots holding them changed — rare enough
@@ -13480,14 +13657,16 @@ func uiSceneJs(): Str {
 		// — so it is done on the frame it changes and never on any other, and every
 		// material already built is told to rebuild itself.
 		//
-		// Every other frame, and the map is redrawn on the same one. The two have to
-		// move together (see boot), because the shadow map is only correct for where
-		// the light was standing when it was taken. Skipping both leaves the box a
-		// metre behind the eye, on a box fifty-five metres across; skipping one is
-		// every shadow in the scene adrift.
+		// Every frame, and the map is redrawn on the same one. The two have to move
+		// together (see boot), because the shadow map is only correct for where the
+		// light was standing when it was taken.
 		//
 		// The light's direction never changes, so nothing about the shading depends
-		// on this. It is only ever the box that moves.
+		// on this. It is only ever the box that moves — and it moves a whole texel of
+		// the map at a time, across the light's view: carried along by less, every
+		// edge in the map is sampled a fraction of a texel differently each frame,
+		// and every shadow's outline crawls while the eye moves. Along the light the
+		// box may go anywhere, since that changes no texel.
 		//
 		// A slot holds a sound or a solid, and which slots hold sounds is remembered
 		// between frames rather than worked out again in each of them.
@@ -13516,6 +13695,7 @@ func uiSceneJs(): Str {
 		  }
 		  var sky = w.sky ? heavens(w.sky) : null;
 		  if (sky) \{ stage.background = sky; }
+		  lit(w.sky || "#8ecbff");
 		  if (w.fog) \{
 		    if (!stage.fog) \{ stage.fog = new THREE.Fog(0x8ecbff, 1, 100); }
 		    if (sky) \{ stage.fog.color.copy(sky.userData.haze); }
@@ -13532,11 +13712,14 @@ func uiSceneJs(): Str {
 		    mats.forEach(function (m) \{ m.needsUpdate = true; });
 		    renderer.shadowMap.needsUpdate = true;
 		  }
-		  beat = beat + 1;
-		  if (wantLit && beat % 2 === 0) \{
-		    sun.target.position.set(w.eye[0], 0, w.eye[2]);
-		    sun.position.set(w.eye[0] + reach() * 0.36, reach() * 0.85,
-		      w.eye[2] + reach() * 0.48);
+		  if (wantLit) \{
+		    var texel = reach() * 2 / 2048;
+		    under.set(w.eye[0], 0, w.eye[2]);
+		    var across = Math.round(under.dot(SUN_ACROSS) / texel) * texel;
+		    var up = Math.round(under.dot(SUN_UP) / texel) * texel;
+		    sun.target.position.copy(SUNWARD).multiplyScalar(under.dot(SUNWARD))
+		      .addScaledVector(SUN_ACROSS, across).addScaledVector(SUN_UP, up);
+		    sun.position.copy(sun.target.position).addScaledVector(SUNWARD, reach() * 1.0405);
 		    sun.target.updateMatrixWorld();
 		    renderer.shadowMap.needsUpdate = true;
 		  }
@@ -13556,9 +13739,11 @@ func uiSceneJs(): Str {
 		// into whatever is there. A line leaves its ends out too: they are its payload,
 		// and a tracer rebuilt every frame would be a new buffer sixty times a second.
 		//
-		// Once per distinct size in the whole run, rather than once per shape per
-		// frame, which is what fits is for. Keyed by surface too, because a box
-		// carries its tiling in its vertices — see uvsPerFace.
+		// A solid's size is not asked about either: every solid of a kind is one
+		// geometry a unit across, stretched by its matrix (see unit), so a shape
+		// that grows is a shape that moved. What decides is which batch it sits in
+		// — its kind and its finish — and whether it is see-through, which keeps it
+		// out of every batch.
 		//
 		// A floor receives and does not cast, and that is not a saving. A plane
 		// lying on the ground casts onto itself: every pixel is both caster and
@@ -13580,13 +13765,22 @@ func uiSceneJs(): Str {
 		  if (u.kind !== s.k) \{ return false; }
 		  if (s.k === "line") \{ return true; }
 		  if (s.k === "label") \{ return u.words === s.x && u.tint === s.c; }
-		  if (s.k === "sprite" && u.words !== s.x) \{ return false; }
-		  var d = s.d, e = u.dims;
-		  if (e.length !== d.length) \{ return false; }
-		  for (var i = 0; i < d.length; i++) \{
-		    if (e[i] !== d[i]) \{ return false; }
-		  }
-		  return true;
+		  if (s.k === "sprite") \{ return u.words === s.x && u.dims[0] === s.d[0] && u.dims[1] === s.d[1]; }
+		  return u.key === keyOf(s);
+		}
+
+		function keyOf(s) \{
+		  return formOf(s) + "|" + finishOf(s) + (solidity(s.c) < 1 ? "|see" : "");
+		}
+		`,
+		// Which unit geometry a solid is stretched from. A cone's two radii are the
+		// one shape a stretch cannot change — it only scales them together — so a
+		// cone is a geometry per ratio of its ends, to a thirty-second.
+		`
+		function formOf(s) \{
+		  if (s.k !== "cone") \{ return s.k; }
+		  var m = Math.max(s.d[0], s.d[1]) || 1;
+		  return "cone|" + Math.round(s.d[0] / m * 32) + "|" + Math.round(s.d[1] / m * 32);
 		}
 
 		function pixels(path) \{
@@ -13630,12 +13824,14 @@ func uiSceneJs(): Str {
 		      color: new THREE.Color(s.c || "#ffffff")}));
 		    made.center.set(0.5, 0);
 		    made.scale.set(s.d[0] || 1, s.d[1] || 1, 1);
+		  } else if (solidity(s.c) >= 1) \{
+		    var chair = \{batch: batchOf(formOf(s), finishOf(s)), index: -1, visible: true,
+		      userData: \{kind: s.k, key: keyOf(s), tint: ""}};
+		    return chair;
 		  } else \{
-		    var sig = s.k + "|" + s.d.join(",") + "|" + perTile(s);
-		    var geo = geoms.get(sig);
-		    if (!geo) \{ geo = solid(s); geoms.set(sig, geo); }
-		    made = new THREE.Mesh(geo, paintOf(s));
+		    made = new THREE.Mesh(unit(formOf(s)), paintOf(finishOf(s), s.c));
 		    made.castShadow = s.k !== "ground";
+		    if ((s.k === "box" || s.k === "cylinder") && finishOf(s) !== "Mesh") \{ made.customDepthMaterial = rounder(); }
 		    made.receiveShadow = true;
 		  }
 		  made.rotation.order = "YXZ";
@@ -13643,6 +13839,7 @@ func uiSceneJs(): Str {
 		  made.updateMatrix();
 		  var u = made.userData;
 		  u.kind = s.k;
+		  u.key = keyOf(s);
 		  u.dims = s.d.slice();
 		  u.words = s.x;
 		`,
@@ -13657,23 +13854,241 @@ func uiSceneJs(): Str {
 		  return made;
 		}
 
-		function solid(s) \{
-		  var d = s.d || [1, 1, 1];
-		  if (s.k === "sphere") \{ return new THREE.SphereGeometry(d[0], 18, 12); }
-		  if (s.k === "cylinder") \{ return new THREE.CylinderGeometry(d[0], d[0], d[1], 20); }
-		  if (s.k === "cone") \{ return new THREE.CylinderGeometry(d[0], d[1], d[2], 20); }
-		  if (s.k === "roof") \{ return gable(d[0], d[1], d[2]); }
-		  if (s.k === "ground") \{
-		    var flat = new THREE.PlaneGeometry(d[0], d[1]);
-		    flat.rotateX(-Math.PI / 2);
-		    return flat;
+		`,
+		// Every solid of a kind is one geometry a unit across, and its size is in its
+		// matrix. A geometry per size was one per tree a few minutes into a forest —
+		// three thousand of them, kept for good — and an instanced batch needs one
+		// geometry anyway.
+		//
+		// Twenty faces round a cylinder and a cone, because a program may stand
+		// things on the faces of a cone as drawn; a sphere is sixteen by eleven,
+		// which is round at any size a sphere is drawn at and a third fewer vertices
+		// than it was, in the shape that is most of a forest.
+		`
+		function unit(form) \{
+		  var g = geoms.get(form);
+		  if (g) \{ return g; }
+		  if (form === "sphere") \{
+		    g = new THREE.SphereGeometry(1, 16, 11);
+		    spans(g, globe);
+		  } else if (form === "cylinder") \{
+		    g = roundedDrum();
+		  } else if (form.indexOf("cone|") === 0) \{
+		    var ends = form.split("|");
+		    g = new THREE.CylinderGeometry(+ends[1] / 32, +ends[2] / 32, 1, 20);
+		    spans(g, sloped((+ends[2] - +ends[1]) / 32));
+		  } else if (form === "roof") \{
+		    g = gable(1, 1, 1);
+		    spans(g, ridge);
+		  } else if (form === "ground") \{
+		    g = new THREE.PlaneGeometry(1, 1);
+		    g.rotateX(-Math.PI / 2);
+		    spans(g, floor);
+		  } else \{
+		    g = roundedBox();
 		  }
-		  var box = new THREE.BoxGeometry(d[0], d[1], d[2]);
-		  uvsPerFace(box, d, perTile(s));
-		  return box;
+		  geoms.set(form, g);
+		  return g;
+		}
+		`,
+		// **Edges are round.** Nothing made is as sharp as a box is: a wall's arris,
+		// a bench's edge, a car's wings all catch the light along a curve. So a box
+		// and a cylinder are drawn with their edges rounded — and since a unit
+		// geometry is stretched to every size, a bevel built into it would be
+		// stretched too, a wall's ten times as long as it is deep. The geometry only
+		// says, for each vertex, which corner it belongs to and which way the bevel
+		// faces it there (its normal); the shader puts the corner in at the size it
+		// is drawn (see ROUND_AT). Its position is the sharp shape, near enough,
+		// which is what anything that does not know that reads.
+		//
+		// A box is three.js's own split three ways along each side: the middle third
+		// of each face is flat, and its edge vertices are pushed round the corner.
+		`
+		function roundedBox() \{
+		  var g = new THREE.BoxGeometry(1, 1, 1, 3, 3, 3);
+		  spans(g, faces);
+		  var p = g.attributes.position, n = g.attributes.normal, v = new THREE.Vector3();
+		  for (var i = 0; i < p.count; i++) \{
+		    var x = Math.sign(p.getX(i)), y = Math.sign(p.getY(i)), z = Math.sign(p.getZ(i));
+		    v.set(p.getX(i) - x / 6, p.getY(i) - y / 6, p.getZ(i) - z / 6).normalize();
+		    n.setXYZ(i, v.x, v.y, v.z);
+		    p.setXYZ(i, x * 0.499 + v.x * 0.001, y * 0.499 + v.y * 0.001, z * 0.499 + v.z * 0.001);
+		  }
+		  rounds(g, 1);
+		  return g;
+		}
+		`,
+		// A cylinder is twenty faces round, as it always was: a band from the top
+		// rim, round the side, to the bottom rim — rounding 2 — and a disc at either
+		// end — rounding 3. The band's rows, top to bottom, face up, half out, out,
+		// out, half out and down.
+		`
+		function roundedDrum() \{
+		  var rows = [[0, 1, 1], [0.7071068, 0.7071068, 1], [1, 0, 1], [1, 0, -1], [0.7071068, -0.7071068, -1], [0, -1, -1]];
+		  var at = [], normals = [], uvs = [], su = [], sv = [], kind = [], index = [];
+		  function put(out, up, side, turn, round, u) \{
+		    var sn = Math.sin(turn), cs = Math.cos(turn);
+		    var reach = round === 3 && side === 0 ? 0 : 0.999 + out * 0.001;
+		    var y = side === 0 ? up * 0.5 : side * 0.499 + up * 0.001;
+		    at.push(reach * sn, y, reach * cs);
+		    normals.push(out * sn, up, out * cs);
+		    uvs.push(u, 0);
+		    kind.push(round);
+		    if (round === 2) \{ su.push(2 * Math.PI, 0, 0); sv.push(0, 1, 0); }
+		    else \{ su.push(2, 0, 0); sv.push(0, 0, 2); }
+		  }
+		  for (var r = 0; r < rows.length; r++) \{
+		    for (var k = 0; k <= 20; k++) \{
+		      put(rows[r][0], rows[r][1], rows[r][2], k / 20 * 2 * Math.PI, 2, k / 20);
+		    }
+		  }
+		  for (r = 0; r < rows.length - 1; r++) \{
+		    for (k = 0; k < 20; k++) \{
+		      var a = r * 21 + k, b = a + 21;
+		      index.push(a, b, a + 1, b, b + 1, a + 1);
+		    }
+		  }
+		  for (var end = 1; end >= -1; end -= 2) \{
+		    var middle = at.length / 3;
+		    put(0, end, 0, 0, 3, 0);
+		    for (k = 0; k <= 20; k++) \{ put(0, end, end, k / 20 * 2 * Math.PI, 3, 0); }
+		    for (k = 0; k < 20; k++) \{
+		      if (end > 0) \{ index.push(middle + 1 + k, middle + 2 + k, middle); }
+		      else \{ index.push(middle + 2 + k, middle + 1 + k, middle); }
+		    }
+		  }
+		  var g = new THREE.BufferGeometry();
+		  g.setIndex(index);
+		  g.setAttribute("position", new THREE.Float32BufferAttribute(at, 3));
+		  g.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
+		  g.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+		  g.setAttribute("spanU", new THREE.Float32BufferAttribute(su, 3));
+		  g.setAttribute("spanV", new THREE.Float32BufferAttribute(sv, 3));
+		  g.setAttribute("rounding", new THREE.Float32BufferAttribute(kind, 1));
+		  return g;
+		}
+
+		function rounds(g, kind) \{
+		  g.setAttribute("rounding", new THREE.BufferAttribute(new Float32Array(g.attributes.position.count).fill(kind), 1));
+		}
+		`,
+		// How a face's texture is tiled, written into its vertices: which of the
+		// shape's three stretches each way across the face is measured by. The
+		// shader multiplies them by the stretch it is drawn at and counts tiles of
+		// that many metres (see dress), so a wall forty metres long and one high is
+		// forty tiles by one, as it was when every size had a geometry of its own.
+		//
+		// A box lays its faces out +X, -X, +Y, -Y, +Z, -Z; its normal says which.
+		// Round things go round: a cylinder's side is its girth by its height, its
+		// ends a disc two radii across. A floor is tiled every three metres rather
+		// than two, as it always was.
+		`
+		function spans(g, along) \{
+		  var n = g.attributes.normal, count = n.count;
+		  var u = new Float32Array(count * 3), v = new Float32Array(count * 3);
+		  for (var i = 0; i < count; i++) \{
+		    along(n.getX(i), n.getY(i), n.getZ(i), u, v, i * 3);
+		  }
+		  g.setAttribute("spanU", new THREE.BufferAttribute(u, 3));
+		  g.setAttribute("spanV", new THREE.BufferAttribute(v, 3));
+		  rounds(g, 0);
+		}
+		`,
+		// A box's spans carry the way its texture runs across each face as well, which
+		// is how a rounded face is mapped where the corner is put in: three.js lays
+		// +X out by -Z and Y, -X by Z and Y, +Y by X and -Z, -Y by X and Z, +Z by X
+		// and Y, and -Z by -X and Y.
+		`
+		function faces(x, y, z, u, v, at) \{
+		  if (Math.abs(x) > 0.5) \{ u[at + 2] = -Math.sign(x); v[at + 1] = 1; }
+		  else if (Math.abs(y) > 0.5) \{ u[at] = 1; v[at + 2] = -Math.sign(y); }
+		  else \{ u[at] = Math.sign(z); v[at + 1] = 1; }
+		}
+
+		function globe(x, y, z, u, v, at) \{
+		  u[at] = 2 * Math.PI;
+		  v[at + 1] = Math.PI;
+		}
+
+		function drum(x, y, z, u, v, at) \{
+		  if (Math.abs(y) > 0.99) \{ u[at] = 2; v[at + 2] = 2; }
+		  else \{ u[at] = 2 * Math.PI; v[at + 1] = 1; }
+		}
+		`,
+		// A cone's side is measured down its slope rather than by its height: the
+		// ends' difference in radius rides along in the first of its second span, so
+		// the shader's length of the stretched span is the slant. A hill of three
+		// hundred metres' slope and sixty of height was tiled sixty metres' worth down
+		// it, a tile smeared five times its length — which, filtered smoothly, came
+		// out as no texture at all.
+		//
+		// The ends carry it too, so that a cone gentler than it is tall — a hill, a
+		// mound — is told apart by every one of its vertices, and is laid from above
+		// in metres of the world (see dress): wrapped round like a cylinder, every
+		// tile its foot has is squeezed into its summit.
+		`
+		function sloped(widening) \{
+		  return function (x, y, z, u, v, at) \{
+		    drum(x, y, z, u, v, at);
+		    v[at] = widening;
+		  };
+		}
+
+		function ridge(x, y, z, u, v, at) \{
+		  u[at] = 1;
+		  if (Math.abs(z) > 0.99) \{ v[at + 1] = 1; }
+		  else \{ v[at + 2] = 1; }
+		}
+
+		function floor(x, y, z, u, v, at) \{
+		  u[at] = 2 / 3;
+		  v[at + 2] = 2 / 3;
+		}
+		`,
+		// The stretch a unit geometry is drawn at to be the shape asked for. Never
+		// quite nought: a matrix with a flat axis has no inverse, and the normals are
+		// worked out through one.
+		`
+		function stretch(s, v) \{
+		  var d = s.d, k = s.k;
+		  if (k === "sphere") \{ v.set(d[0], d[0], d[0]); }
+		  else if (k === "cylinder") \{ v.set(d[0], d[1], d[0]); }
+		  else if (k === "cone") \{
+		    var m = Math.max(d[0], d[1]);
+		    v.set(m, d[2], m);
+		  } else if (k === "ground") \{ v.set(d[0], 1, d[1]); }
+		  else \{ v.set(d[0], d[1], d[2]); }
+		  v.set(Math.max(v.x, 0.0001), Math.max(v.y, 0.0001), Math.max(v.z, 0.0001));
+		}
+		`,
+		// Where a seat is, and what colour, written into its batch's buffers. A matrix
+		// is only built here and in put, and only for a shape a frame says changed.
+		`
+		var spot = new THREE.Vector3(), spin = new THREE.Euler(0, 0, 0, "YXZ");
+		var turn = new THREE.Quaternion(), size = new THREE.Vector3();
+		var pose = new THREE.Matrix4(), hue = new THREE.Color();
+
+		function place(o, s) \{
+		  if (o.index < 0) \{ seat(o); }
+		  var mesh = o.batch.mesh, at = o.index;
+		  spot.set(s.p[0], s.p[1], s.p[2]);
+		  if (s.turned) \{ spin.set(s.r[0], s.r[1], s.r[2]); }
+		  else \{ spin.set(0, 0, 0); }
+		  turn.setFromEuler(spin);
+		  stretch(s, size);
+		  pose.compose(spot, turn, size);
+		  pose.toArray(mesh.instanceMatrix.array, at * 16);
+		  touched(mesh.instanceMatrix, at, 16);
+		  if (o.userData.tint !== s.c) \{
+		    hue.setStyle(bare(s.c));
+		    hue.toArray(mesh.instanceColor.array, at * 3);
+		    touched(mesh.instanceColor, at, 3);
+		    o.userData.tint = s.c;
+		  }
 		}
 
 		function put(o, s) \{
+		  if (o.batch) \{ place(o, s); return; }
 		  var u = o.userData;
 		  if (s.k === "line") \{
 		    var p = o.geometry.attributes.position;
@@ -13708,17 +14123,17 @@ func uiSceneJs(): Str {
 		  }
 		  if (s.turned) \{ o.rotation.set(s.r[0], s.r[1], s.r[2]); }
 		  else if (o.rotation.x || o.rotation.y || o.rotation.z) \{ o.rotation.set(0, 0, 0); }
+		  stretch(s, o.scale);
 		  o.updateMatrix();
 		`,
-		// A material is its colour, its surface and its size, and the size cannot
-		// change without the mesh being rebuilt — so a shape still wearing what it
-		// wore is left alone rather than asked for a key and a map lookup again.
+		// A see-through solid wears a material of its own colour, because it is drawn
+		// alone and sorted, rather than in a batch. Its surface cannot change under
+		// it — fits would have built another — so only the colour is looked at.
 		`
-		  if (u.tint !== s.c || u.finish !== s.s) \{
-		    var m = paintOf(s);
+		  if (u.tint !== s.c) \{
+		    var m = paintOf(finishOf(s), s.c);
 		    if (o.material !== m) \{ o.material = m; }
 		    u.tint = s.c;
-		    u.finish = s.s;
 		  }
 		}
 		`,
@@ -13749,20 +14164,27 @@ func uiSceneJs(): Str {
 		// And below the horizon, the same haze going quietly darker — which is never
 		// seen from a car on the ground and is exactly what a camera tipped down over
 		// a rostrum sees.
+		//
+		// One canvas, drawn again when the colour changes. A sky that goes over from
+		// one light to another is a new colour every few frames, and a texture kept
+		// for each of them was a texture kept for good.
 		`
 		function heavens(hex) \{
-		  var kept = skies.get(hex);
-		  if (kept) \{ return kept; }
+		  if (skyTex && skyHex === hex) \{ return skyTex; }
 		  var mid = new THREE.Color();
 		  mid.setStyle(hex);
 		  var high = mid.clone().multiplyScalar(0.66);
-		  var lit = 0.2126 * mid.r + 0.7152 * mid.g + 0.0722 * mid.b;
-		  var haze = mid.clone().lerp(new THREE.Color(1, 1, 1),
-		    0.42 * Math.min(1, lit / 0.35));
-		  var canvas = document.createElement("canvas");
-		  canvas.width = 4;
-		  canvas.height = 256;
-		  var ctx = canvas.getContext("2d");
+		  var haze = hazeOf(mid);
+		  if (!skyTex) \{
+		    var canvas = document.createElement("canvas");
+		    canvas.width = 4;
+		    canvas.height = 256;
+		    skyTex = new THREE.CanvasTexture(canvas);
+		    skyTex.colorSpace = THREE.SRGBColorSpace;
+		    skyTex.mapping = THREE.EquirectangularReflectionMapping;
+		    skyTex.wrapS = THREE.RepeatWrapping;
+		  }
+		  var ctx = skyTex.image.getContext("2d");
 		  var band = ctx.createLinearGradient(0, 0, 0, 256);
 		  band.addColorStop(0, "#" + high.getHexString());
 		  band.addColorStop(0.42, "#" + mid.getHexString());
@@ -13770,76 +14192,303 @@ func uiSceneJs(): Str {
 		  band.addColorStop(1, "#" + haze.clone().multiplyScalar(0.82).getHexString());
 		  ctx.fillStyle = band;
 		  ctx.fillRect(0, 0, 4, 256);
-		  var tex = new THREE.CanvasTexture(canvas);
-		  tex.colorSpace = THREE.SRGBColorSpace;
-		  tex.mapping = THREE.EquirectangularReflectionMapping;
-		  tex.wrapS = THREE.RepeatWrapping;
+		  skyTex.needsUpdate = true;
+		  skyHex = hex;
 		`,
 		// Carried on the texture because the fog has to match the band the road is
 		// vanishing into, and this is the one place that knows what that band is.
 		`
-		  tex.userData.haze = haze;
-		  skies.set(hex, tex);
-		  return tex;
+		  skyTex.userData.haze = haze;
+		  return skyTex;
+		}
+
+		function hazeOf(mid) \{
+		  var lit = 0.2126 * mid.r + 0.7152 * mid.g + 0.0722 * mid.b;
+		  return mid.clone().lerp(new THREE.Color(1, 1, 1), 0.42 * Math.min(1, lit / 0.35));
 		}
 		`,
-		// One material per colour *and* grain, shared by every shape wearing it. Toon
-		// shading is what makes a scene of plain solids read as a drawing rather than as
-		// a render, and the grain below is what stops each face reading as a flat card.
+		// The light the sky throws, which is the sky made into something to light by:
+		// overhead and the horizon as the band has them, and below the horizon the
+		// ground's own colour, warm and dark, which is what lights the underside of a
+		// balcony. Blurred by three.js into the reflections a rough surface and a
+		// polished one each see, and the light the sky casts on a face, in one.
 		//
+		// **Its brightness barely follows the sky's.** What makes a scene dark is its
+		// palette (see apply), so a night sky lighting a night palette would be dark
+		// twice — a shaded wall at midnight came out black. Its colour is the sky's,
+		// half as saturated, at a level that falls only a little from day to night.
+		//
+		// Worked out again when the sky's colour changes, at most twice a second: a
+		// sky going over from one light to another changes every few frames, and the
+		// blur is a dozen passes on the card.
+		`
+		function lit(hex) \{
+		  var now = performance.now();
+		  if (hex === glowHex || (glowTex && now - glowAt < 500)) \{ return; }
+		  glowHex = hex;
+		  glowAt = now;
+		  var mid = new THREE.Color();
+		  mid.setStyle(hex);
+		  var haze = hazeOf(mid);
+		  var high = mid.clone().multiplyScalar(0.66);
+		  var dirt = haze.clone().lerp(new THREE.Color(0.3, 0.25, 0.18), 0.65).multiplyScalar(0.45);
+		  var level = 0.45 * (0.3 + 0.7 * Math.min(1, luma(mid) / 0.5));
+		  var k = level / Math.max(0.002, luma(haze));
+		  var tones = [high, haze, dirt];
+		  for (var i = 0; i < 3; i++) \{
+		    var c = tones[i].multiplyScalar(k);
+		    var grey = luma(c);
+		    c.lerp(new THREE.Color(grey, grey, grey), 0.5);
+		    var top = Math.max(c.r, c.g, c.b);
+		    if (top > 1) \{ c.multiplyScalar(1 / top); }
+		  }
+		  if (!glow) \{
+		    var canvas = document.createElement("canvas");
+		    canvas.width = 64;
+		    canvas.height = 32;
+		    glow = new THREE.CanvasTexture(canvas);
+		    glow.colorSpace = THREE.SRGBColorSpace;
+		    glow.mapping = THREE.EquirectangularReflectionMapping;
+		  }
+		  var ctx = glow.image.getContext("2d");
+		  var band = ctx.createLinearGradient(0, 0, 0, 32);
+		  band.addColorStop(0, "#" + high.getHexString());
+		  band.addColorStop(0.46, "#" + haze.getHexString());
+		  band.addColorStop(0.54, "#" + dirt.getHexString());
+		  band.addColorStop(1, "#" + dirt.getHexString());
+		  ctx.fillStyle = band;
+		  ctx.fillRect(0, 0, 64, 32);
+		  glow.needsUpdate = true;
+		  glowTex = pmrem.fromEquirectangular(glow, glowTex);
+		  stage.environment = glowTex.texture;
+		}
+
+		function luma(c) \{
+		  return 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+		}
+		`,
+		// One material per surface, shared by every opaque shape made of it whatever
+		// its colour: the colour is the instance's (see place), and what a material
+		// holds is the grain, the relief and how the surface takes the light. A
+		// see-through shape is drawn alone, so it has one per colour as well, which
+		// is still no texture of its own.
+		//
+		// How rough each surface is and how much of a metal, which is most of what
+		// tells a painted car from a painted wall once the light is physical: the paint
+		// is the same colour and only one of them shows the sky in it. Then how much
+		// of its relief the light is told about.
+		//
+		// Under a half for most, and that is measured rather than tasteful. A normal
+		// map is lighting, and lighting amplifies whatever is in it: at full strength
+		// a photographed wall's form-panel structure came out as corrugated iron down
+		// every barrier. What is wanted is that an edge catches the sun, not that a
+		// flat thing stops being flat.
+		`
+		var LOOKS = \{
+		  Turf: [0.95, 0, 0.6], Gravel: [0.9, 0, 0.8], Tarmac: [0.86, 0, 0.45], Kerb: [0.8, 0, 0.45],
+		  Concrete: [0.88, 0, 0.45], Brick: [0.85, 0, 0.7], Panes: [0.82, 0, 0.45],
+		  Planks: [0.72, 0, 0.55], Staves: [0.72, 0, 0.55], Bark: [0.95, 0, 0.9],
+		  Leaves: [0.8, 0, 0.8], Crowd: [0.9, 0, 0.35], Mesh: [0.45, 0.4, 0],
+		  Speckle: [0.6, 0, 0.3], Metal: [0.4, 0.4, 0.25], Carbon: [0.35, 0.1, 0.4],
+		  Rubber: [0.92, 0, 0.45], Glass: [0.05, 0, 0], Gloss: [0.24, 0, 0]
+		};
+
+		function paintOf(finish, colour) \{
+		  var key = finish + "|" + colour;
+		  var m = mats.get(key);
+		  if (m) \{ return m; }
+		  var look = LOOKS[finish] || LOOKS.Planks;
+		  var skin = skinOf(finish);
+		  var thick = colour ? solidity(colour) : 1;
+		`,
 		// A finish with holes in it. A fence is not a faint fence, it is wire with
 		// nothing between the wire — so the pattern's own alpha decides pixel by
 		// pixel. A cut-out rather than a blend, which also means it goes on writing
 		// depth and never has to be sorted.
-		//
-		// The colour is in the texture rather than on the material: a map
-		// multiplies the material's colour, so setting both would square it. How
-		// much of that colour there is stays on the material, which lets a car and
-		// the ghost of one share a single texture.
-		//
-		// What the surface faces, pixel by pixel, as against what colour it is.
-		// Toon shading quantises how lit a face is, so without this every face is
-		// one of three flat cards however finely it is painted. With it, a kerb
-		// has edges and a gravel trap has stones. See relief.
-		//
-		// Under a half, and that is measured rather than tasteful. A normal map
-		// is lighting, and lighting amplifies whatever is in it: at full strength
-		// a photographed wall's form-panel structure came out as corrugated iron
-		// down every barrier. What is wanted is that an edge catches the sun, not
-		// that a flat thing stops being flat.
 		`
-		function paintOf(s) \{
-		  var tile = tiling(s);
-		  var finish = made(s), body = bare(s.c), thick = solidity(s.c);
-		  var key = finish + "|" + body + "|" + tile[0] + "," + tile[1] + "|" + thick;
-		  var m = mats.get(key);
-		  if (!m) \{
-		    var pierced = finish === "Mesh";
-		    m = new THREE.MeshToonMaterial(\{
-		      map: grain(finish, body, tile),
-		      normalMap: bumped(finish) ? relief(finish, tile) : null,
-		      normalScale: new THREE.Vector2(0.45, 0.45),
-		      transparent: thick < 1,
-		      opacity: thick,
-		      alphaTest: pierced ? 0.5 : 0,
-		      side: pierced ? THREE.DoubleSide : THREE.FrontSide,
+		  var pierced = finish === "Mesh";
+		  m = new THREE.MeshStandardMaterial(\{
+		    map: skin.map,
+		    normalMap: skin.relief,
+		    normalScale: new THREE.Vector2(look[2], look[2]),
+		    roughness: look[0],
+		    metalness: look[1],
+		    color: colour ? bare(colour) : 0xffffff,
+		    transparent: thick < 1,
+		    opacity: thick,
+		    alphaTest: pierced ? 0.5 : 0,
+		    side: pierced ? THREE.DoubleSide : THREE.FrontSide,
 		`,
 		// A translucent shape that wrote depth would hide whatever is behind it
 		// from everything drawn after it, which is the whole of what a ghost is
 		// not allowed to do.
 		`
-		      depthWrite: thick >= 1
-		    });
-		    mats.set(key, m);
-		  }
+		    depthWrite: thick >= 1
+		  });
+		  m.defines.TILE = perTile(finish).toFixed(2);
+		  if (finish === "Panes" || finish === "Kerb" || finish === "Crowd") \{ m.defines.OWN = ""; }
+		  if (finish === "Panes") \{ m.defines.GLAZED = ""; }
+		  if (BROAD[finish]) \{ m.defines.BROAD = ""; }
+		  m.onBeforeCompile = dress;
+		  mats.set(key, m);
 		  return m;
+		}
+		`,
+		// Three things three.js's own material does not do, sewn into it.
+		//
+		// **A hill is laid from above.** A cone gentler than it is tall is mapped by
+		// where it is in the world, across x and z, rather than round itself: no tile
+		// is squeezed into its summit, and its slope meets the ground it stands on in
+		// the same grain.
+		//
+		// **The tiling is counted from the stretch.** A unit geometry's vertices say
+		// which of the shape's stretches each face is measured by (see spans); the
+		// stretch is the length of each axis of the matrix it is drawn with, the
+		// instance's for a batch; so the count of tiles each way is that over the
+		// tile's size in metres, rounded and never under one, as it was when every
+		// size had a geometry of its own.
+		//
+		// **The grain is laid over the colour, not in place of it.** A tile is drawn
+		// around mid grey, and its texel times the colour, over mid grey, is the
+		// colour with the grain's light and dark in it — so one tile serves every
+		// colour a surface is painted, and the average of a tile is the colour the
+		// scene asked for. Mid grey is the 0.2159 that 128 decodes to.
+		//
+		// **And the ground is not one colour from a distance.** A tile two metres
+		// across repeats forty times down a street, and past a few dozen metres all
+		// that is left of it is its average — so a field, a road or a slab came out a
+		// single flat colour edge to edge. The same tile read again fourteen and sixty
+		// times as large, smoothly and much louder, puts the unevenness of a real one
+		// back: damp, wear, the grass greener in one place than another. Only for what grows and what is
+		// poured or laid, because a window or a brick drawn fourteen times its size is
+		// a giant window, not weathering.
+		//
+		// A window is the exception, and a kerb's stripes and a crowd's shirts: their
+		// own colours whatever the wall's. Those tiles carry, in their alpha, how much
+		// of each texel is the wall; the rest is the texel as it is. And a window is
+		// glass, so where it is glass it is polished.
+		`
+		var BROAD = \{Turf: true, Gravel: true, Tarmac: true, Concrete: true, Leaves: true, Speckle: true, Bark: true};
+
+		var ROUND_AT = [
+		  "vec3 roundedAt = position;",
+		  "vec3 roundedNormal = normal;",
+		  "if (rounding > 0.5) \{",
+		  "  mat3 roundBy = mat3(modelMatrix);",
+		  "  #ifdef USE_INSTANCING",
+		  "    roundBy = roundBy * mat3(instanceMatrix);",
+		  "  #endif",
+		  "  vec3 size = vec3(length(roundBy[0]), length(roundBy[1]), length(roundBy[2]));",
+		  "  vec3 corner;",
+		  "  if (rounding < 1.5) \{",
+		  "    float bend = min(ROUND_MOST, ROUND_SHARE * min(size.x, min(size.y, size.z)));",
+		  "    corner = sign(position) * (size * 0.5 - bend) + normal * bend;",
+		  "  } else \{",
+		  "    float bend = min(ROUND_MOST, ROUND_SHARE * min(2.0 * size.x, size.y));",
+		  "    float reach = length(position.xz);",
+		  "    vec2 way = reach > 0.0001 ? position.xz / reach : vec2(0.0);",
+		  "    float far = (reach > 0.0001 ? size.x - bend : 0.0) + length(normal.xz) * bend;",
+		  "    corner = vec3(way.x * far, sign(position.y) * (size.y * 0.5 - bend) + normal.y * bend, way.y * far);",
+		  "  }",
+		  "  roundedAt = corner / size;",
+		  "  roundedNormal = normal * size;",
+		  "}"
+		].join("\n");
+
+		var ROUNDED = "#define ROUND_SHARE 0.2\n#define ROUND_MOST 0.35\nattribute float rounding;";
+
+		var TILED = [
+		  ROUND_AT,
+		  "#include <uv_vertex>",
+		  "#ifdef USE_MAP",
+		  "  if (rounding > 0.5) \{",
+		  "    vec2 laid = rounding < 1.5 ? 0.5 + vec2(dot(spanU, roundedAt), dot(spanV, roundedAt))",
+		  "      : rounding < 2.5 ? vec2(uv.x, roundedAt.y + 0.5) : 0.5 + roundedAt.xz * 0.5;",
+		  "    vMapUv = (mapTransform * vec3(laid, 1.0)).xy;",
+		  "  }",
+		  "#endif",
+		  "#ifdef USE_MAP",
+		  "  mat3 stretchedBy = mat3(modelMatrix);",
+		  "  #ifdef USE_INSTANCING",
+		  "    stretchedBy = stretchedBy * mat3(instanceMatrix);",
+		  "  #endif",
+		  "  vec3 stretched = vec3(length(stretchedBy[0]), length(stretchedBy[1]), length(stretchedBy[2]));",
+		  "  vec2 tiles = max(vec2(1.0), floor(vec2(length(stretched * spanU), length(stretched * spanV)) / TILE + 0.5));",
+		  "  vMapUv *= tiles;",
+		  "  if (spanV.x != 0.0 && abs(spanV.x) * stretched.x > stretched.y) \{",
+		  "    vec4 placed = vec4(position, 1.0);",
+		  "    #ifdef USE_INSTANCING",
+		  "      placed = instanceMatrix * placed;",
+		  "    #endif",
+		  "    vMapUv = (modelMatrix * placed).xz / TILE;",
+		  "  }",
+		  "  #ifdef USE_NORMALMAP",
+		  "    vNormalMapUv = vMapUv;",
+		  "  #endif",
+		  "#endif"
+		].join("\n");
+
+		var TINTED = [
+		  "#if defined( USE_COLOR )",
+		  "  diffuseColor.rgb *= vColor;",
+		  "#endif",
+		  "vec4 grainTexel = vec4(0.2158605, 0.2158605, 0.2158605, 1.0);",
+		  "#ifdef USE_MAP",
+		  "  grainTexel = texture2D(map, vMapUv);",
+		  "  #ifdef BROAD",
+		  "    float broad = texture2D(map, vMapUv * 0.0713 + 0.31, 3.0).g + texture2D(map, vMapUv * 0.0171 + 0.77, 5.0).g;",
+		  "    grainTexel.rgb *= clamp(1.0 + (broad * 2.3163 - 1.0) * 2.6, 0.55, 1.5);",
+		  "  #endif",
+		  "#endif",
+		  "#ifdef OWN",
+		  "  diffuseColor.rgb = mix(grainTexel.rgb, diffuseColor.rgb * grainTexel.rgb * 4.6326, grainTexel.a);",
+		  "#else",
+		  "  diffuseColor.rgb *= grainTexel.rgb * 4.6326;",
+		  "  diffuseColor.a *= grainTexel.a;",
+		  "#endif"
+		].join("\n");
+
+		var GLAZED = [
+		  "#include <roughnessmap_fragment>",
+		  "#ifdef GLAZED",
+		  "  roughnessFactor = mix(0.06, roughnessFactor, grainTexel.a);",
+		  "#endif"
+		].join("\n");
+
+		// The sun's shadows are cast by the rounded shape too: one cast by the sharp one
+		// is the sharp one's corner, standing proud of the rounded one, and every lit
+		// edge would be drawn in its own shadow.
+		var roundCaster = null;
+
+		function rounder() \{
+		  if (!roundCaster) \{
+		    roundCaster = new THREE.MeshDepthMaterial(\{depthPacking: THREE.RGBADepthPacking});
+		    roundCaster.onBeforeCompile = function (shader) \{
+		      shader.vertexShader = shader.vertexShader
+		        .replace("#include <common>", "#include <common>\n" + ROUNDED)
+		        .replace("#include <begin_vertex>", ROUND_AT + "\nvec3 transformed = roundedAt;");
+		    };
+		  }
+		  return roundCaster;
+		}
+
+		function dress(shader) \{
+		  shader.vertexShader = shader.vertexShader
+		    .replace("#include <common>", "#include <common>\nattribute vec3 spanU;\nattribute vec3 spanV;\n" + ROUNDED)
+		    .replace("#include <uv_vertex>", TILED)
+		    .replace("#include <beginnormal_vertex>", "vec3 objectNormal = roundedNormal;")
+		    .replace("#include <begin_vertex>", "vec3 transformed = roundedAt;");
+		  shader.fragmentShader = shader.fragmentShader
+		    .replace("#include <map_fragment>", "")
+		    .replace("#include <color_fragment>", TINTED)
+		    .replace("#include <roughnessmap_fragment>", GLAZED);
 		}
 		`,
 		// What a shape is made of: what it said, or — where it said nothing — what its
 		// kind used to imply on its own. That second half is the whole of the story for
 		// a scene written before there were surfaces: it draws exactly as it did.
 		`
-		function made(s) \{
+		function finishOf(s) \{
 		  if (s.s) \{ return s.s; }
 		  if (s.k === "ground") \{ return "Turf"; }
 		  if (s.k === "cylinder" || s.k === "cone") \{ return "Staves"; }
@@ -13881,74 +14530,12 @@ func uiSceneJs(): Str {
 		  return a;
 		}
 		`,
-		// How many times the grain repeats across a shape, so that a wall and a crate
-		// have the same size of grain rather than the same number of it. Roughly one
-		// tile every two metres, and never fewer than one.
-		//
-		// A box says one, because a box's six faces are six different sizes and one
-		// repeat suits four of them badly — a barrier forty metres long and a metre
-		// high, tiled the same each way, is concrete stretched forty to one. A box
-		// carries its tiling in its own geometry instead. See uvsPerFace.
-		//
-		// Across the slope and down its length, the way a tile is laid.
-		`
-		function tiling(s) \{
-		  var d = s.d || [1, 1, 1];
-		  var per = perTile(s);
-		  if (s.k === "ground") \{ return [span(d[0], 3), span(d[1], 3)]; }
-		  if (s.k === "sphere") \{ return [2, 1]; }
-		  if (s.k === "roof") \{ return [span(d[0], per), span(d[2], per)]; }
-		  if (s.k === "cylinder") \{ return [span(d[0] * 6, per), span(d[1], per)]; }
-		`,
-		// A cone carries both its radii, so its girth is the second number and its
-		// height the third. The wider end is what the grain is sized against.
-		`
-		  if (s.k === "cone") \{
-		    return [span(Math.max(d[0], d[1]) * 6, per), span(d[2], per)];
-		  }
-		  return [1, 1];
-		}
-		`,
 		// How many metres of a surface one tile stands for. Two is the size of the
 		// thing a material tile is a picture of; a window is not a material, and its
 		// spacing is a fact about the building — a bay, or a storey.
 		`
-		function perTile(s) \{
-		  return s.s === "Panes" ? 2.9 : 2;
-		}
-		`,
-		// Each face of a box tiled by its own two dimensions, written into the vertices
-		// rather than into the texture.
-		//
-		// The only thing in this renderer that touches a vertex, and it earns it:
-		// nearly every box in every scene is a wall, slab, panel or barrier, all of
-		// which have faces of different sizes. Width and height deciding the repeat on
-		// all six is right for a crate and wrong for anything longer than it is wide.
-		//
-		// A BoxGeometry lays its faces out +X, -X, +Y, -Y, +Z, -Z with four vertices
-		// each and UVs nought to one; multiplying them is the whole of it. Geometries
-		// are cached by their dimensions, so this happens once per size of box.
-		`
-		function uvsPerFace(geo, d, per) \{
-		  var uv = geo.attributes.uv;
-		  if (!uv) \{ return; }
-		  var sides = [
-		    [d[2], d[1]], [d[2], d[1]],
-		    [d[0], d[2]], [d[0], d[2]],
-		    [d[0], d[1]], [d[0], d[1]]
-		  ];
-		  for (var f = 0; f < 6; f++) \{
-		    var across = span(sides[f][0], per), down = span(sides[f][1], per);
-		    for (var v = 0; v < 4; v++) \{
-		      var at = f * 4 + v;
-		      uv.setXY(at, uv.getX(at) * across, uv.getY(at) * down);
-		    }
-		  }
-		  uv.needsUpdate = true;
-		}
-
-		function span(metres, per) \{
-		  return Math.max(1, Math.round(metres / per));
+		function perTile(finish) \{
+		  return finish === "Panes" ? 2.9 : 2;
 		}
 		`,
 		// A three-sided cylinder, rather than a hand-written buffer of six vertices
@@ -13969,105 +14556,187 @@ func uiSceneJs(): Str {
 		  return g;
 		}
 		`,
-		// The grain itself.
+		// The grain itself, and its relief: two textures a surface, made the first time
+		// the surface is asked for and kept, whatever colours it is painted.
 		//
 		// Drawn here, unless the program shipped a photograph of it. The drawings are
 		// the floor: a scene is a value and a Hive program is one file, so a texture
 		// that had to ship as an image would make both untrue. But a road is looked at
-		// for a full lap, and nine hundred dots on a 128-pixel tile is not a road up
-		// close — so assets/textures/<surface>.jpg (see photoOf) is taken where it
-		// exists.
+		// for a full lap, and a drawing is not a road up close — so
+		// assets/textures/<surface>.jpg (see photoOf) is taken where it exists.
 		//
-		// Every pattern goes over the colour rather than instead of it, so one tile
-		// serves every colour: a green crate and a brown one are the same planks.
-		//
-		// Held as a closure rather than run once, because the photograph may not have
-		// arrived yet — see refresh, which calls this again when it does.
+		// **Smooth close up and filtered away from you.** Every surface here is meant
+		// to look like the thing it names, and a magnified tile drawn as hard squares
+		// looks like a tile; a dozen metres ahead the same tile is minified past one
+		// texel per pixel, which mipmaps and anisotropy are for.
 		`
-		function grain(finish, colour, tile) \{
-		  var key = finish + "|" + colour + "|" + tile[0] + "," + tile[1];
-		  var kept = skins.get(key);
+		function skinOf(finish) \{
+		  var kept = skins.get(finish);
 		  if (kept) \{ return kept; }
-		  var canvas = document.createElement("canvas");
-		  var ctx = null;
-		  var draw = function () \{
-		    var shot = photoOf(finish, "");
-		    var size = shot ? photoWeave() : weave();
-		    if (canvas.width !== size) \{
-		      canvas.width = size;
-		      canvas.height = size;
-		      ctx = canvas.getContext("2d");
-		    }
-		    ctx.globalCompositeOperation = "source-over";
-		    ctx.fillStyle = colour;
-		    ctx.fillRect(0, 0, size, size);
-		    if (shot) \{
-		`,
-		// **Laid over the colour, not in place of it.** The file is flattened to a
-		// mean of mid grey before it ships, and overlay returns mid grey exactly
-		// as it found it — so the average of the tile is the colour the scene
-		// asked for and what the photograph contributes is its structure. That is
-		// the whole reason a photographed surface does not cost the game its
-		// palette: the road is still the shade client.hive chose, it merely has
-		// real aggregate in it now.
-		`
-		      ctx.globalCompositeOperation = "overlay";
-		      ctx.drawImage(shot, 0, 0, size, size);
-		      ctx.globalCompositeOperation = "source-over";
-		      return;
-		    }
-		    painted(ctx, finish, size);
-		  };
-		  draw();
-		  var tex = new THREE.CanvasTexture(canvas);
-		  tex.colorSpace = THREE.SRGBColorSpace;
-		  tex.wrapS = THREE.RepeatWrapping;
-		  tex.wrapT = THREE.RepeatWrapping;
-		  tex.repeat.set(tile[0], tile[1]);
-		`,
-		// **Nearest close up and filtered away from you**, which is not a compromise
-		// between the two — it is what each end of the picture actually needs. Under
-		// the wheels a tile is magnified and a smoothed texel is a blurred one, so the
-		// grid the surface was drawn on should be visible. A dozen metres ahead the
-		// same tile is minified past one texel per pixel, and nearest there is the
-		// shimmer anisotropy exists to put down. So magnification is hard, and
-		// minification keeps its mipmaps and its anisotropy.
-		`
-		  tex.magFilter = THREE.NearestFilter;
-		  tex.anisotropy = most();
-		  skins.set(key, tex);
-		  waiting.push(\{finish: finish, draw: draw, tex: tex});
-		  return tex;
+		  var skin = \{finish: finish, map: woven(), relief: bumped(finish) ? woven() : null};
+		  skin.map.colorSpace = THREE.SRGBColorSpace;
+		  skins.set(finish, skin);
+		  weaveInto(skin);
+		  return skin;
+		}
+
+		function woven() \{
+		  var size = weave();
+		  var t = new THREE.DataTexture(new Uint8Array(size * size * 4), size, size);
+		  t.wrapS = THREE.RepeatWrapping;
+		  t.wrapT = THREE.RepeatWrapping;
+		  t.magFilter = THREE.LinearFilter;
+		  t.minFilter = THREE.LinearMipmapLinearFilter;
+		  t.generateMipmaps = true;
+		  t.anisotropy = most();
+		  return t;
 		}
 		`,
-		// How big a tile is: the canvas it is rendered on, the grid it is composed on,
-		// and the canvas a photographed one gets.
+		// How big a tile is: the texels it is resolved at, and the grid it is composed
+		// on.
 		//
-		// The first two are different numbers, and finding that out cost a day. Every
-		// drawing below places its work in pixels, which was right with one canvas size
-		// and wrong the moment there were two: enlarging the canvas without enlarging
-		// the drawing shrinks the pattern, and detail below one texel is not detail but
-		// shimmer.
-		//
-		// Concrete is where it showed — every barrier came out corrugated, and turning
-		// the relief it was blamed on off left it exactly where it was. So grid is the
-		// composition every pattern means, weave is how finely it is resolved, and the
-		// context is scaled between the two.
+		// They are different numbers, and finding that out cost a day. Every drawing
+		// below places its work in units of the grid, which was right with one canvas
+		// size and wrong the moment there were two: enlarging the canvas without
+		// enlarging the drawing shrinks the pattern, and detail below one texel is not
+		// detail but shimmer. So grid is the composition every pattern means, weave is
+		// how finely it is resolved, and the context is scaled between the two. A
+		// photograph is resolved at the same size, which keeps a texture's size the
+		// one it was made at when one arrives.
 		`
 		function grid() \{ return 128; }
 
 		function weave() \{ return 256; }
-
-		function photoWeave() \{ return 512; }
 		`,
-		// The drawing for a finish, laid over whatever is on the canvas, at whatever
-		// size the canvas happens to be.
+		// Both textures of a surface, drawn into what they already hold.
+		//
+		// The drawing is made on two canvases: the grain in light and dark over mid
+		// grey, and on the second whatever of it is a colour of its own — a window's
+		// glass, a kerb's stripe — so that the texel can say how much of it is which.
+		//
+		// **Every drawing is seeded by its surface's name.** The relief is worked out
+		// from the same pixels the grain is, so a stone that catches the light is a
+		// stone that is drawn, and the same surface is the same tile on every run.
+		//
+		// Then the grain is brought to a mean of mid grey, in linear light, because a
+		// tile that averaged a little dark made everything painted with it a little
+		// darker than the scene said — and a photograph is held to the same, whatever
+		// it was shipped as. The rows are turned over on the way, a texture counting
+		// them up where a canvas counts them down.
 		`
-		function painted(ctx, finish, size) \{
-		  ctx.save();
-		  ctx.scale(size / grid(), size / grid());
-		  drawn(ctx, finish, grid());
-		  ctx.restore();
+		var paper = null, pane = null;
+
+		function weaveInto(skin) \{
+		  var finish = skin.finish, size = weave();
+		  if (!paper) \{
+		    paper = document.createElement("canvas");
+		    pane = document.createElement("canvas");
+		    paper.width = paper.height = pane.width = pane.height = size;
+		  }
+		  var ctx = paper.getContext("2d", \{willReadFrequently: true});
+		  var mine = pane.getContext("2d", \{willReadFrequently: true});
+		  ctx.globalCompositeOperation = "source-over";
+		  ctx.clearRect(0, 0, size, size);
+		  mine.clearRect(0, 0, size, size);
+		  var shot = photoOf(skin, "");
+		  if (shot) \{
+		    ctx.drawImage(shot, 0, 0, size, size);
+		  } else \{
+		    ctx.fillStyle = "#808080";
+		    ctx.fillRect(0, 0, size, size);
+		    seed(finish);
+		    ctx.save();
+		    mine.save();
+		    ctx.scale(size / grid(), size / grid());
+		    mine.scale(size / grid(), size / grid());
+		    drawn(ctx, mine, finish, grid());
+		    ctx.restore();
+		    mine.restore();
+		  }
+		  var a = ctx.getImageData(0, 0, size, size).data;
+		  var b = mine.getImageData(0, 0, size, size).data;
+		  var out = skin.map.image.data, high = new Float32Array(size * size);
+		  var sum = 0, weight = 0, i, at, o;
+		  for (i = 0; i < size * size; i++) \{
+		    at = i * 4;
+		    o = b[at + 3] / 255;
+		    var r = a[at] + (b[at] - a[at]) * o;
+		    var g = a[at + 1] + (b[at + 1] - a[at + 1]) * o;
+		    var bl = a[at + 2] + (b[at + 2] - a[at + 2]) * o;
+		    high[i] = (r * 0.299 + g * 0.587 + bl * 0.114) / 255;
+		    if (o === 0 && a[at + 3] > 0) \{
+		      sum += DECODE[a[at]] * 0.299 + DECODE[a[at + 1]] * 0.587 + DECODE[a[at + 2]] * 0.114;
+		      weight++;
+		    }
+		    var to = flipped(i, size) * 4;
+		    out[to] = r;
+		    out[to + 1] = g;
+		    out[to + 2] = bl;
+		    out[to + 3] = o > 0 ? 255 * (1 - o) : a[at + 3];
+		  }
+		  var gain = weight ? Math.min(2, Math.max(0.5, 0.2158605 / (sum / weight))) : 1;
+		  for (i = 0; i < size * size; i++) \{
+		    at = i * 4;
+		    if (b[at + 3] !== 0) \{ continue; }
+		    var into = flipped(i, size) * 4;
+		    out[into] = encoded(DECODE[a[at]] * gain);
+		    out[into + 1] = encoded(DECODE[a[at + 1]] * gain);
+		    out[into + 2] = encoded(DECODE[a[at + 2]] * gain);
+		  }
+		  skin.map.needsUpdate = true;
+		  if (!skin.relief) \{ return; }
+		  var dug = photoOf(skin, "-normal");
+		  if (dug) \{
+		    ctx.clearRect(0, 0, size, size);
+		    ctx.drawImage(dug, 0, 0, size, size);
+		    var n = ctx.getImageData(0, 0, size, size).data, into2 = skin.relief.image.data;
+		    for (i = 0; i < size * size; i++) \{
+		      var dst = flipped(i, size) * 4;
+		      into2[dst] = n[i * 4];
+		      into2[dst + 1] = n[i * 4 + 1];
+		      into2[dst + 2] = n[i * 4 + 2];
+		      into2[dst + 3] = 255;
+		    }
+		  } else \{
+		    slope(high, size, skin.relief.image.data);
+		  }
+		  skin.relief.needsUpdate = true;
+		}
+
+		function flipped(i, size) \{
+		  return (size - 1 - Math.floor(i / size)) * size + i % size;
+		}
+
+		var DECODE = new Float32Array(256);
+		for (var code = 0; code < 256; code++) \{
+		  var v = code / 255;
+		  DECODE[code] = v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+		}
+
+		function encoded(v) \{
+		  v = Math.max(0, Math.min(1, v));
+		  return Math.round(255 * (v <= 0.0031308 ? v * 12.92 : 1.055 * Math.pow(v, 1 / 2.4) - 0.055));
+		}
+		`,
+		// The drawings' own dice: the same surface comes out the same every time it is
+		// drawn, and its grain and its relief are one drawing rather than two.
+		`
+		var dice = 1;
+
+		function seed(text) \{
+		  var h = 2166136261;
+		  for (var i = 0; i < text.length; i++) \{
+		    h ^= text.charCodeAt(i);
+		    h = Math.imul(h, 16777619);
+		  }
+		  dice = h >>> 0;
+		}
+
+		function rand() \{
+		  dice = (dice + 0x6D2B79F5) | 0;
+		  var t = Math.imul(dice ^ (dice >>> 15), dice | 1);
+		  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+		  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
 		}
 		`,
 		// A photograph of a surface, if this program shipped one.
@@ -14080,13 +14749,15 @@ func uiSceneJs(): Str {
 		//
 		// part is "" for the colour and "-normal" for the relief.
 		//
-		// The load is not waited for: grain and relief draw what they can now and
-		// register to be drawn again when the bytes land (see refresh), so the first
-		// frame is never held up. A file that is not there 404s, onload never fires,
-		// and the drawing stands.
+		// The load is not waited for: the textures are drawn from what there is now
+		// and drawn again when the bytes land, so the first frame is never held up.
+		// Nothing is rebuilt and nothing is re-keyed — the materials and the batches
+		// are untouched and the pixels are simply better, which is why a photograph
+		// can arrive mid-lap without a flicker. A file that is not there 404s, onload
+		// never fires, and the drawing stands.
 		`
-		function photoOf(finish, part) \{
-		  var name = finish.toLowerCase() + part;
+		function photoOf(skin, part) \{
+		  var name = skin.finish.toLowerCase() + part;
 		  var kept = photos.get(name);
 		  if (kept) \{ return kept.img; }
 		  var slot = \{img: null};
@@ -14094,94 +14765,11 @@ func uiSceneJs(): Str {
 		  var img = new Image();
 		  img.onload = function () \{
 		    slot.img = img;
-		    refresh(finish);
+		    weaveInto(skin);
+		    dirty = true;
 		  };
 		  img.src = "/_hive/asset/textures/" + name + ".jpg";
 		  return null;
-		}
-		`,
-		// Every canvas already drawn for a surface, drawn again now that there is a
-		// photograph of it.
-		//
-		// Nothing is rebuilt and nothing is re-keyed: the material, geometry and mesh
-		// are untouched and the pixels are simply better, which is why a photograph can
-		// arrive mid-lap without a flicker. Marking the frame dirty is the only other
-		// thing needed, a window not being asked for frames otherwise showing the
-		// drawing until something else moved.
-		`
-		function refresh(finish) \{
-		  for (var i = 0; i < waiting.length; i++) \{
-		    if (waiting[i].finish !== finish) \{ continue; }
-		    waiting[i].draw();
-		    waiting[i].tex.needsUpdate = true;
-		  }
-		  dirty = true;
-		}
-		`,
-		// The relief: which way a surface faces, pixel by pixel.
-		//
-		// Two ways in, and which is used is which there is. A photographed surface
-		// ships a measured height field, drawn straight in. A drawn one has none, so
-		// one is derived: every pattern here is painted in translucent black and white
-		// over a flat colour, which makes its brightness a height field by
-		// construction, and a Sobel across one is a normal. It does not have to be a
-		// measurement — only to put the light where the drawing said the edge was.
-		//
-		// The canvas is shared by every tiling of a surface and the textures over it
-		// are clones, because relief depends on what a wall is made of rather than how
-		// often it repeats. What the clones carry is their own repeat.
-		//
-		// Mid grey, so that the drawing's own light and dark is the height and
-		// nothing else is. The colour a shape is painted must not reach this: a
-		// dark car and a light one are the same shape of carbon.
-		`
-		function relief(finish, tile) \{
-		  var key = finish + "|" + tile[0] + "," + tile[1];
-		  var kept = bumps.get(key);
-		  if (kept) \{ return kept; }
-		  var base = reliefs.get(finish);
-		  if (!base) \{
-		    var canvas = document.createElement("canvas");
-		    var ctx = null;
-		    var draw = function () \{
-		      var shot = photoOf(finish, "-normal");
-		      var size = shot ? photoWeave() : weave();
-		      if (canvas.width !== size) \{
-		        canvas.width = size;
-		        canvas.height = size;
-		        ctx = canvas.getContext("2d");
-		      }
-		      ctx.globalCompositeOperation = "source-over";
-		      if (shot) \{
-		        ctx.drawImage(shot, 0, 0, size, size);
-		        return;
-		      }
-		      ctx.fillStyle = "#808080";
-		      ctx.fillRect(0, 0, size, size);
-		      painted(ctx, finish, size);
-		      slope(ctx, size);
-		    };
-		    draw();
-		    base = new THREE.CanvasTexture(canvas);
-		    base.wrapS = THREE.RepeatWrapping;
-		    base.wrapT = THREE.RepeatWrapping;
-		    base.magFilter = THREE.NearestFilter;
-		    base.anisotropy = most();
-		    reliefs.set(finish, base);
-		    waiting.push(\{finish: finish, draw: draw, tex: base});
-		  }
-		  var tex = base.clone();
-		  tex.wrapS = THREE.RepeatWrapping;
-		  tex.wrapT = THREE.RepeatWrapping;
-		  tex.repeat.set(tile[0], tile[1]);
-		  tex.needsUpdate = true;
-		  bumps.set(key, tex);
-		`,
-		// A clone shares the canvas and not the upload, so it has to be told when the
-		// canvas changes under it as well.
-		`
-		  waiting.push(\{finish: finish, draw: function () \{}, tex: tex});
-		  return tex;
 		}
 		`,
 		// Which surfaces have relief at all.
@@ -14223,40 +14811,26 @@ func uiSceneJs(): Str {
 		  return out;
 		}
 		`,
-		// A height field on a canvas, turned into the directions its surface faces.
+		// A height field, turned into the directions its surface faces.
 		//
 		// Sobel across and down for the two slopes, and the third component is whatever
-		// is left of a unit vector. The signs are the texture's rather than the
-		// canvas's: a canvas counts rows downward and a texture counts them up, so the
+		// is left of a unit vector. The field is in the canvas's rows, counted down, and
+		// the texture's are counted up — so each row is written turned over, and the
 		// vertical slope is written already changed.
 		//
-		// The brightness, once, as its own array. Read nine times per pixel out of the
-		// image data it would be nine multiplies and a bounds wrap each; here it is an
-		// index.
-		//
-		// And then softened, which is the difference between relief and noise. A
+		// And softened first, which is the difference between relief and noise. A
 		// drawing's brightness is only approximately a height field, and least so at
 		// the pixel: a scatter of half-pixel pinholes is colour, not depth, and
 		// differentiating it swings the normal between neighbouring texels. Lit and
 		// minified, that came out as corrugation marching down every wall — a moiré
 		// no anisotropy fixes, the detail never having been real. Two passes of a
 		// three-tap blur take the sub-pixel out and leave every seam the pattern drew.
+		//
+		// How much of a hill the light is told about: enough that an edge catches it,
+		// little enough that a drawn seam is a seam and not a trench.
 		`
-		function slope(ctx, size) \{
-		  var src = ctx.getImageData(0, 0, size, size).data;
-		  var high = new Float32Array(size * size);
-		  for (var i = 0; i < high.length; i++) \{
-		    var at = i * 4;
-		    high[i] = (src[at] * 0.299 + src[at + 1] * 0.587 + src[at + 2] * 0.114) / 255;
-		  }
-		  high = softened(softened(high, size), size);
-		  var out = ctx.createImageData(size, size), b = out.data;
-		`,
-		// How much of a hill the light is told about. Enough that an edge catches it,
-		// little enough that a drawn seam is a seam and not a trench: the drawings
-		// were made to be looked at flat, so reading their contrast as height at face
-		// value makes a chessboard out of a weave.
-		`
+		function slope(field, size, b) \{
+		  var high = softened(softened(field, size), size);
 		  var deep = 1.2;
 		  for (var y = 0; y < size; y++) \{
 		    var up = ((y + size - 1) % size) * size;
@@ -14270,36 +14844,32 @@ func uiSceneJs(): Str {
 		        - (high[up + l] + 2 * high[up + x] + high[up + r]);
 		      var nx = -across * deep, ny = along * deep;
 		      var len = Math.sqrt(nx * nx + ny * ny + 1);
-		      var to = (mid + x) * 4;
+		      var to = flipped(mid + x, size) * 4;
 		      b[to] = (nx / len * 0.5 + 0.5) * 255;
 		      b[to + 1] = (ny / len * 0.5 + 0.5) * 255;
 		      b[to + 2] = (1 / len * 0.5 + 0.5) * 255;
 		      b[to + 3] = 255;
 		    }
 		  }
-		  ctx.putImageData(out, 0, 0);
 		}
 		`,
-		// One drawn pattern, over whatever is already on the canvas.
-		//
-		// Pulled out of grain so that the relief can ask for the same drawing — a
-		// normal map derived from a different pattern than the one it is lighting would
-		// belong to some other surface. One list, read twice.
+		// One drawn pattern, over the grey already on the canvas, with what is a colour
+		// of its own drawn onto mine instead.
 		`
-		function drawn(ctx, finish, size) \{
+		function drawn(ctx, mine, finish, size) \{
 		  if (finish === "Turf") \{ turf(ctx, size); }
 		  else if (finish === "Gravel") \{ gravel(ctx, size); }
 		  else if (finish === "Tarmac") \{ tarmac(ctx, size); }
-		  else if (finish === "Kerb") \{ kerb(ctx, size); }
+		  else if (finish === "Kerb") \{ kerb(ctx, mine, size); }
 		  else if (finish === "Concrete") \{ concrete(ctx, size); }
 		  else if (finish === "Brick") \{ brick(ctx, size); }
-		  else if (finish === "Panes") \{ panes(ctx, size); }
+		  else if (finish === "Panes") \{ panes(ctx, mine, size); }
 		  else if (finish === "Staves") \{ staves(ctx, size); }
 		  else if (finish === "Bark") \{ bark(ctx, size); }
 		  else if (finish === "Leaves") \{ leaves(ctx, size); }
-		  else if (finish === "Crowd") \{ crowd(ctx, size); }
+		  else if (finish === "Crowd") \{ crowd(ctx, mine, size); }
 		  else if (finish === "Mesh") \{ mesh(ctx, size); }
-		  else if (finish === "Speckle") \{ speckle(ctx, size, 90, 0.05); }
+		  else if (finish === "Speckle") \{ speckle(ctx, size); }
 		  else if (finish === "Metal") \{ metal(ctx, size); }
 		  else if (finish === "Carbon") \{ carbon(ctx, size); }
 		  else if (finish === "Rubber") \{ rubber(ctx, size); }
@@ -14308,137 +14878,195 @@ func uiSceneJs(): Str {
 		  else \{ planks(ctx, size); }
 		}
 		`,
-		// Grass: short strokes leaning two ways, over a light mottling. The mottling is
-		// kept faint and the strokes many — the other way round reads as mud.
+		// Light and dark that varies smoothly, at a scale of so many cells across the
+		// tile, and wraps — which is what a surface looks like before anything is drawn
+		// on it: weathering, wear, damp, the unevenness of everything. Several of these
+		// at different scales are most of what keeps a large flat face from reading as
+		// a flat colour, and none of them has an edge for the relief to find.
+		//
+		// In the canvas's own pixels, which the grid's scale does not reach.
+		`
+		function grit(ctx, cells, amount) \{
+		  var size = ctx.canvas.width, img = ctx.getImageData(0, 0, size, size), px = img.data;
+		  var lattice = new Float32Array(cells * cells);
+		  for (var i = 0; i < lattice.length; i++) \{ lattice[i] = rand() * 2 - 1; }
+		  var step = cells / size;
+		  for (var y = 0; y < size; y++) \{
+		    var fy = y * step, y0 = Math.floor(fy), ty = fy - y0;
+		    ty = ty * ty * (3 - 2 * ty);
+		    var r0 = (y0 % cells) * cells, r1 = ((y0 + 1) % cells) * cells;
+		    for (var x = 0; x < size; x++) \{
+		      var fx = x * step, x0 = Math.floor(fx), tx = fx - x0;
+		      tx = tx * tx * (3 - 2 * tx);
+		      var c0 = x0 % cells, c1 = (x0 + 1) % cells;
+		      var n = (lattice[r0 + c0] * (1 - tx) + lattice[r0 + c1] * tx) * (1 - ty)
+		        + (lattice[r1 + c0] * (1 - tx) + lattice[r1 + c1] * tx) * ty;
+		      var k = 1 + n * amount, at = (y * size + x) * 4;
+		      px[at] *= k;
+		      px[at + 1] *= k;
+		      px[at + 2] *= k;
+		    }
+		  }
+		  ctx.putImageData(img, 0, 0);
+		}
+		`,
+		// Something small drawn at a place on the tile, and again across whichever
+		// edges it reaches over, so that the tile has no seam where it meets itself.
+		`
+		function around(size, x, y, reach, draw) \{
+		  for (var dx = -1; dx <= 1; dx++) \{
+		    for (var dy = -1; dy <= 1; dy++) \{
+		      var px = x + dx * size, py = y + dy * size;
+		      if (px > -reach && px < size + reach && py > -reach && py < size + reach) \{ draw(px, py); }
+		    }
+		  }
+		}
+
+		function dot(ctx, size, x, y, r, style) \{
+		  ctx.fillStyle = style;
+		  around(size, x, y, r, function (px, py) \{
+		    ctx.beginPath();
+		    ctx.arc(px, py, r, 0, 6.284);
+		    ctx.fill();
+		  });
+		}
+		`,
+		// Grass: tufts of blades leaning every way, light at the tip and dark at the
+		// root, over clumps of a deeper and a paler green — the clumps are what a lawn
+		// looks like from a car, the blades what it looks like underfoot.
 		`
 		function turf(ctx, size) \{
-		  speckle(ctx, size, 70, 0.035);
-		  for (var i = 0; i < 200; i++) \{
-		    var x = Math.random() * size, y = Math.random() * size;
-		    var lean = (Math.random() - 0.5) * 4;
-		    ctx.strokeStyle = i % 2 ? "rgba(0,0,0,0.10)" : "rgba(255,255,255,0.10)";
-		    ctx.lineWidth = 1;
-		    ctx.beginPath();
-		    ctx.moveTo(x, y);
-		    ctx.lineTo(x + lean, y - 5 - Math.random() * 4);
-		    ctx.stroke();
+		  grit(ctx, 4, 0.12);
+		  grit(ctx, 12, 0.10);
+		  grit(ctx, 48, 0.08);
+		  for (var i = 0; i < 900; i++) \{
+		    var x = rand() * size, y = rand() * size;
+		    var lean = (rand() - 0.5) * 3, tall = 2 + rand() * 3.5;
+		    ctx.strokeStyle = i % 3 === 0 ? "rgba(255,255,220,0.22)" : "rgba(0,0,0,0.20)";
+		    ctx.lineWidth = 0.7;
+		    around(size, x, y, 6, function (px, py) \{
+		      ctx.beginPath();
+		      ctx.moveTo(px, py);
+		      ctx.lineTo(px + lean, py - tall);
+		      ctx.stroke();
+		    });
 		  }
 		}
 		`,
-		// Boards: a panel edge and a couple of seams, which is what makes a box read as a
-		// crate, a wall or a door rather than as a cube.
+		// Boards: four to a tile, each its own shade, the grain running along it in
+		// long streaks, with a dark seam between each and a lit edge under it.
 		`
 		function planks(ctx, size) \{
-		  speckle(ctx, size, 70, 0.04);
-		  ctx.strokeStyle = "rgba(0,0,0,0.22)";
-		  ctx.lineWidth = 3;
-		  ctx.strokeRect(1.5, 1.5, size - 3, size - 3);
-		  ctx.strokeStyle = "rgba(0,0,0,0.13)";
-		  ctx.lineWidth = 2;
-		  for (var i = 1; i < 3; i++) \{
-		    ctx.beginPath();
-		    ctx.moveTo(0, size * i / 3);
-		    ctx.lineTo(size, size * i / 3);
-		    ctx.stroke();
+		  grit(ctx, 6, 0.06);
+		  var boards = 4, high = size / boards;
+		  for (var b = 0; b < boards; b++) \{
+		    var tone = rand() - 0.5;
+		    ctx.fillStyle = tone < 0 ? "rgba(0,0,0," + (-tone * 0.22) + ")" : "rgba(255,255,255," + (tone * 0.16) + ")";
+		    ctx.fillRect(0, b * high, size, high);
+		    for (var s = 0; s < 14; s++) \{
+		      var y = b * high + 2 + rand() * (high - 4), wave = rand() * 2;
+		      ctx.strokeStyle = s % 2 ? "rgba(0,0,0,0.10)" : "rgba(255,255,255,0.07)";
+		      ctx.lineWidth = 0.5 + rand();
+		      ctx.beginPath();
+		      ctx.moveTo(0, y);
+		      ctx.bezierCurveTo(size * 0.3, y + wave, size * 0.7, y - wave, size, y);
+		      ctx.stroke();
+		    }
+		    ctx.fillStyle = "rgba(0,0,0,0.38)";
+		    ctx.fillRect(0, b * high, size, 1.2);
+		    ctx.fillStyle = "rgba(255,255,255,0.12)";
+		    ctx.fillRect(0, b * high + 1.2, size, 0.8);
 		  }
-		  ctx.strokeStyle = "rgba(255,255,255,0.10)";
-		  ctx.lineWidth = 1;
-		  for (var j = 1; j < 3; j++) \{
-		    ctx.beginPath();
-		    ctx.moveTo(0, size * j / 3 + 2);
-		    ctx.lineTo(size, size * j / 3 + 2);
-		    ctx.stroke();
-		  }
+		  grit(ctx, 64, 0.05);
 		}
 		`,
-		// Staves, for anything round: vertical bands, lighter on one side of each seam.
+		// Staves: the same boards stood on end, narrower, as round things are built.
 		`
 		function staves(ctx, size) \{
-		  speckle(ctx, size, 60, 0.04);
-		  for (var i = 0; i < 8; i++) \{
-		    var x = size * i / 8;
-		    ctx.fillStyle = "rgba(0,0,0,0.16)";
-		    ctx.fillRect(x, 0, 2, size);
-		    ctx.fillStyle = "rgba(255,255,255,0.09)";
-		    ctx.fillRect(x + 2, 0, 2, size);
+		  grit(ctx, 6, 0.06);
+		  var count = 8, wide = size / count;
+		  for (var i = 0; i < count; i++) \{
+		    var tone = rand() - 0.5;
+		    ctx.fillStyle = tone < 0 ? "rgba(0,0,0," + (-tone * 0.2) + ")" : "rgba(255,255,255," + (tone * 0.14) + ")";
+		    ctx.fillRect(i * wide, 0, wide, size);
+		    for (var s = 0; s < 5; s++) \{
+		      ctx.fillStyle = s % 2 ? "rgba(0,0,0,0.08)" : "rgba(255,255,255,0.06)";
+		      ctx.fillRect(i * wide + 1 + rand() * (wide - 2), 0, 0.6, size);
+		    }
+		    ctx.fillStyle = "rgba(0,0,0,0.30)";
+		    ctx.fillRect(i * wide, 0, 1.2, size);
 		  }
+		  grit(ctx, 64, 0.05);
 		}
 		`,
-		// Asphalt: a dense scatter of fine aggregate and no seams anywhere. Small and
-		// even is the whole of it — a road is looked at for a full lap, so anything
-		// with a repeat you can pick out becomes a pattern moving under the car.
+		// Asphalt: a dark binder full of small light stones, with the wear of traffic
+		// and the damp lying in it at a larger scale.
 		`
 		function tarmac(ctx, size) \{
-		  for (var i = 0; i < 900; i++) \{
-		    ctx.fillStyle = i % 3 === 0 ? "rgba(255,255,255,0.055)" : "rgba(0,0,0,0.075)";
-		    ctx.beginPath();
-		    ctx.arc(Math.random() * size, Math.random() * size, 0.5 + Math.random() * 1.1, 0, 6.284);
-		    ctx.fill();
+		  grit(ctx, 3, 0.07);
+		  grit(ctx, 16, 0.07);
+		  grit(ctx, 96, 0.10);
+		  for (var i = 0; i < 1600; i++) \{
+		    var light = i % 3 === 0;
+		    dot(ctx, size, rand() * size, rand() * size, 0.25 + rand() * 0.6,
+		      light ? "rgba(255,255,255,0.20)" : "rgba(0,0,0,0.18)");
 		  }
 		}
 		`,
-		// A kerb: broad diagonal bands painted nearly white over whatever colour the
-		// shape is, so one drawing serves a red kerb and a blue one. The slope is one
-		// across for one down and the bands repeat every half tile, so both edges meet
-		// themselves and a kerb can run a hundred metres without a seam.
+		// Kerb stones: the stripe is white whatever colour the kerb is painted, so it
+		// is drawn as a colour of its own.
 		`
-		function kerb(ctx, size) \{
-		  ctx.fillStyle = "rgba(255,255,255,0.88)";
-		  ctx.beginPath();
+		function kerb(ctx, mine, size) \{
+		  grit(ctx, 8, 0.08);
+		  grit(ctx, 64, 0.06);
+		  mine.fillStyle = "#e8e6e0";
+		  mine.beginPath();
 		  for (var i = -2; i < 4; i++) \{
 		    var x = size * i / 2;
-		    ctx.moveTo(x, 0);
-		    ctx.lineTo(x + size / 4, 0);
-		    ctx.lineTo(x + size / 4 + size, size);
-		    ctx.lineTo(x + size, size);
-		    ctx.closePath();
+		    mine.moveTo(x, 0);
+		    mine.lineTo(x + size / 4, 0);
+		    mine.lineTo(x + size / 4 + size, size);
+		    mine.lineTo(x + size, size);
+		    mine.closePath();
 		  }
-		  ctx.fill();
-		  speckle(ctx, size, 40, 0.03);
+		  mine.fill();
+		  ctx.fillStyle = "rgba(0,0,0,0.3)";
+		  ctx.fillRect(0, 0, 1, size);
 		}
 		`,
-		// Gravel: bigger stones than tarmac and far more contrast between them, so a
-		// run-off reads as somewhere you do not want to be from a long way off.
+		// Gravel: stones, each lit from above and shaded below so the relief has
+		// something to stand up, over a darker bed between them.
 		`
 		function gravel(ctx, size) \{
-		  speckle(ctx, size, 60, 0.05);
-		  for (var i = 0; i < 220; i++) \{
-		    ctx.fillStyle = i % 2 ? "rgba(255,255,255,0.13)" : "rgba(0,0,0,0.17)";
-		    ctx.beginPath();
-		    ctx.arc(Math.random() * size, Math.random() * size, 1.5 + Math.random() * 3.5, 0, 6.284);
-		    ctx.fill();
+		  grit(ctx, 8, 0.08);
+		  ctx.fillStyle = "rgba(0,0,0,0.12)";
+		  ctx.fillRect(0, 0, size, size);
+		  for (var i = 0; i < 520; i++) \{
+		    var x = rand() * size, y = rand() * size, r = 0.8 + rand() * 1.8;
+		    var tone = rand() * 0.18;
+		    dot(ctx, size, x, y + r * 0.35, r, "rgba(0,0,0,0.22)");
+		    dot(ctx, size, x, y, r, "rgba(255,255,255," + (0.10 + tone) + ")");
+		    dot(ctx, size, x - r * 0.3, y - r * 0.3, r * 0.45, "rgba(255,255,255,0.12)");
 		  }
+		  grit(ctx, 64, 0.06);
 		}
 		`,
-		// Brushed metal: fine lines all one way, under a band of light across them. The
-		// band runs top to bottom and fades out at both ends, so it tiles; a diagonal
-		// one would look better on a single panel and show every seam on a long one.
+		// Brushed metal. The shine is the light's to give now, so all a tile carries
+		// is the brushing and a little unevenness under it.
 		`
 		function metal(ctx, size) \{
-		  for (var i = 0; i < 130; i++) \{
-		    var y = Math.random() * size;
-		    ctx.strokeStyle = i % 2 ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.07)";
-		    ctx.lineWidth = 1;
+		  grit(ctx, 4, 0.04);
+		  for (var i = 0; i < 220; i++) \{
+		    var y = rand() * size;
+		    ctx.strokeStyle = i % 2 ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)";
+		    ctx.lineWidth = 0.5;
 		    ctx.beginPath();
 		    ctx.moveTo(0, y);
 		    ctx.lineTo(size, y);
 		    ctx.stroke();
 		  }
-		  var sheen = ctx.createLinearGradient(0, 0, 0, size);
-		  sheen.addColorStop(0, "rgba(255,255,255,0)");
-		  sheen.addColorStop(0.5, "rgba(255,255,255,0.13)");
-		  sheen.addColorStop(1, "rgba(255,255,255,0)");
-		  ctx.fillStyle = sheen;
-		  ctx.fillRect(0, 0, size, size);
 		}
-		`,
-		// Carbon: a twill weave, two sets of tows crossing at right angles with one
-		// riding over the other in a checker.
-		//
-		// Sixteen cells across rather than eight, and quiet: a weave you can count the
-		// squares of from three metres is a chessboard. Carbon reads as carbon by being
-		// fine — the strokes inside each cell do more work than the checker does.
-		`
+
 		function carbon(ctx, size) \{
 		  var cells = 16, cell = size / cells;
 		  for (var y = 0; y < cells; y++) \{
@@ -14463,213 +15091,156 @@ func uiSceneJs(): Str {
 		  }
 		}
 		`,
-		// Paint: a panel that reads as sprayed rather than as built out of something.
-		//
-		// A tighter highlight than a gradient, and a flake under it. One soft ramp top
-		// to bottom is a matte panel; what makes paint read as paint is light coming
-		// back off a narrow band. Under it is a scatter of single pixels at a twentieth
-		// of an alpha — metallic flake, individually invisible, and together the
-		// difference between a car that looks sprayed and one that looks printed.
-		//
-		// It adds no grain, because a livery is the one surface here that must not look
-		// made of anything. See bumped, which is why it also has no relief: a highlight
-		// read as height is a dent down the middle of every panel.
+		// Paint: nothing but the faintest orange peel. The sheen is the light's.
 		`
 		function gloss(ctx, size) \{
-		  var sheen = ctx.createLinearGradient(0, 0, 0, size);
-		  sheen.addColorStop(0, "rgba(255,255,255,0.06)");
-		  sheen.addColorStop(0.26, "rgba(255,255,255,0.22)");
-		  sheen.addColorStop(0.40, "rgba(255,255,255,0.05)");
-		  sheen.addColorStop(0.72, "rgba(0,0,0,0.05)");
-		  sheen.addColorStop(1, "rgba(0,0,0,0.16)");
-		  ctx.fillStyle = sheen;
-		  ctx.fillRect(0, 0, size, size);
-		  for (var i = 0; i < 900; i++) \{
-		    ctx.fillStyle = i % 2 ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.04)";
-		    ctx.fillRect(Math.random() * size, Math.random() * size, 1, 1);
-		  }
+		  grit(ctx, 64, 0.02);
 		}
 		`,
-		// Poured concrete: almost nothing, and that is the point. A faint mottle, one
-		// shutter line each way, and a scattering of pinholes. It is what a pit lane, a
-		// grandstand's legs and a barrier wall are — large flat things you want the eye
-		// to slide off.
+		// Concrete: cast in panels with a joint across the middle, mottled where it
+		// cured unevenly and pocked with small air holes.
 		`
 		function concrete(ctx, size) \{
-		  speckle(ctx, size, 120, 0.028);
-		  for (var i = 0; i < 300; i++) \{
-		    ctx.fillStyle = "rgba(0,0,0,0.06)";
-		    ctx.beginPath();
-		    ctx.arc(Math.random() * size, Math.random() * size, 0.4 + Math.random() * 0.8, 0, 6.284);
-		    ctx.fill();
+		  grit(ctx, 3, 0.07);
+		  grit(ctx, 12, 0.06);
+		  grit(ctx, 96, 0.07);
+		  for (var i = 0; i < 260; i++) \{
+		    dot(ctx, size, rand() * size, rand() * size, 0.3 + rand() * 0.5, "rgba(0,0,0,0.22)");
 		  }
-		  ctx.strokeStyle = "rgba(0,0,0,0.10)";
-		  ctx.lineWidth = 1;
-		  ctx.beginPath();
-		  ctx.moveTo(0, size / 2);
-		  ctx.lineTo(size, size / 2);
-		  ctx.moveTo(size / 2, 0);
-		  ctx.lineTo(size / 2, size);
-		  ctx.stroke();
+		  ctx.fillStyle = "rgba(0,0,0,0.22)";
+		  ctx.fillRect(0, size / 2, size, 0.8);
+		  ctx.fillRect(size / 2, 0, 0.8, size);
+		  ctx.fillStyle = "rgba(255,255,255,0.10)";
+		  ctx.fillRect(0, size / 2 + 0.8, size, 0.6);
 		}
 		`,
-		// Brick: a running bond, which is the one thing that makes brick read as brick
-		// rather than as a grid — every other course is offset by half a brick. Four
-		// courses of four, so the offset lands on the tile edge and the wall has no seam.
+		// Brick: a running bond of twelve courses a tile, every brick its own shade of
+		// the colour, set in a paler mortar.
 		`
 		function brick(ctx, size) \{
-		  var courses = 4, high = size / courses, wide = size / 4;
-		  speckle(ctx, size, 70, 0.05);
-		  ctx.strokeStyle = "rgba(255,255,255,0.16)";
-		  ctx.lineWidth = 2;
+		  var courses = 12, high = size / courses, across = 6, wide = size / across;
+		  ctx.fillStyle = "rgba(255,255,255,0.30)";
+		  ctx.fillRect(0, 0, size, size);
 		  for (var y = 0; y < courses; y++) \{
-		    var top = y * high;
-		    ctx.beginPath();
-		    ctx.moveTo(0, top);
-		    ctx.lineTo(size, top);
-		    ctx.stroke();
 		    var shift = (y % 2) * wide / 2;
-		    for (var x = -1; x < 4; x++) \{
-		      var at = x * wide + shift;
-		      ctx.beginPath();
-		      ctx.moveTo(at, top);
-		      ctx.lineTo(at, top + high);
-		      ctx.stroke();
+		    for (var x = -1; x <= across; x++) \{
+		      var tone = rand() - 0.5, left = x * wide + shift;
+		      ctx.fillStyle = "rgba(128,128,128,1)";
+		      ctx.fillRect(left + 0.6, y * high + 0.6, wide - 1.2, high - 1.2);
+		      ctx.fillStyle = tone < 0 ? "rgba(0,0,0," + (-tone * 0.34) + ")" : "rgba(255,255,255," + (tone * 0.22) + ")";
+		      ctx.fillRect(left + 0.6, y * high + 0.6, wide - 1.2, high - 1.2);
+		      ctx.fillStyle = "rgba(0,0,0,0.14)";
+		      ctx.fillRect(left + 0.6, y * high + high - 1.4, wide - 1.2, 0.8);
 		    }
 		  }
+		  grit(ctx, 32, 0.08);
+		  grit(ctx, 128, 0.06);
 		}
 		`,
-		// Panes: one window in the middle of every couple of metres of wall.
-		//
-		// Its glass is a colour and not a shade, which is the one place this breaks the
-		// rule the other patterns keep — a pale window on a pale wall is no window at
-		// all. Crowd spends its colours the same way. The cost is that every building
-		// in a program wears the same glass.
-		//
-		// The reveal, so the window sits in the wall. Rectangles rather than a shadow,
-		// which does not survive being scaled to nine pixels.
-		//
-		// Sky in the top, room in the bottom.
+		// A window in every bay of a wall. The wall is the wall's colour; the glass and
+		// its white frame are their own, drawn onto mine, and the glass is dark with a
+		// sky over it, which is what a window is from the street by day.
 		`
-		function panes(ctx, size) \{
-		  speckle(ctx, size, 60, 0.04);
-		  var wide = size * 0.46, high = size * 0.44;
-		  var left = (size - wide) / 2, top = size * 0.22;
-		  ctx.fillStyle = "rgba(0,0,0,0.34)";
+		function panes(ctx, mine, size) \{
+		  grit(ctx, 6, 0.05);
+		  grit(ctx, 64, 0.05);
+		  var wide = size * 0.44, high = size * 0.46;
+		  var left = (size - wide) / 2, top = size * 0.2;
+		  ctx.fillStyle = "rgba(0,0,0,0.30)";
 		  ctx.fillRect(left - 3, top - 3, wide + 6, high + 6);
-		  ctx.fillStyle = "#8fd6e8";
-		  ctx.fillRect(left, top, wide, high);
-		  ctx.fillStyle = "rgba(255,255,255,0.34)";
-		  ctx.fillRect(left, top, wide, high * 0.44);
-		  ctx.fillStyle = "rgba(0,0,0,0.20)";
-		  ctx.fillRect(left, top + high * 0.72, wide, high * 0.28);
-		`,
-		// The glazing bar, which is what makes it a window rather than a tile, and the
-		// sill under it.
-		`
-		  ctx.fillStyle = "rgba(0,0,0,0.38)";
-		  ctx.fillRect(left, top + high * 0.46, wide, Math.max(1, size * 0.012));
-		  ctx.fillStyle = "rgba(255,255,255,0.30)";
-		  ctx.fillRect(left - 4, top + high + 3, wide + 8, Math.max(1, size * 0.016));
+		  ctx.fillStyle = "rgba(255,255,255,0.32)";
+		  ctx.fillRect(left - 5, top + high + 3, wide + 10, 2.4);
+		  ctx.fillStyle = "rgba(0,0,0,0.22)";
+		  ctx.fillRect(left - 5, top + high + 5.4, wide + 10, 1);
+		  mine.fillStyle = "#ece8de";
+		  mine.fillRect(left - 1.5, top - 1.5, wide + 3, high + 3);
+		  var glass = mine.createLinearGradient(0, top, 0, top + high);
+		  glass.addColorStop(0, "#5b6f7c");
+		  glass.addColorStop(0.5, "#34444f");
+		  glass.addColorStop(1, "#28343c");
+		  mine.fillStyle = glass;
+		  mine.fillRect(left, top, wide, high);
+		  mine.fillStyle = "#ece8de";
+		  mine.fillRect(left, top + high * 0.36, wide, 1.6);
+		  mine.fillRect(left + wide / 2 - 0.8, top, 1.6, high);
 		}
 		`,
-		// Bark: long vertical fissures of very different widths, and no repeat you can
-		// see. A trunk is a cylinder, so the grain runs the way the staves do — what
-		// makes it bark rather than a barrel is that the lines are ragged.
+		// Bark: deep fissures running up the trunk and wandering as they go, between
+		// plates of a lighter skin.
 		`
 		function bark(ctx, size) \{
-		  speckle(ctx, size, 90, 0.06);
-		  for (var i = 0; i < 26; i++) \{
-		    var x = Math.random() * size;
-		    var wide = 1 + Math.random() * 3;
-		    ctx.fillStyle = i % 3 === 0 ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.19)";
-		`,
-		// Drawn in short segments that wander, so a fissure is not a ruled line.
-		`
+		  grit(ctx, 4, 0.08);
+		  grit(ctx, 32, 0.10);
+		  for (var i = 0; i < 34; i++) \{
+		    var x = rand() * size;
+		    var wide = 0.8 + rand() * 2.2;
+		    ctx.fillStyle = i % 4 === 0 ? "rgba(255,255,255,0.10)" : "rgba(0,0,0,0.30)";
 		    var y = 0;
 		    while (y < size) \{
-		      var run = 6 + Math.random() * 18;
-		      ctx.fillRect(x, y, wide, run);
-		      x = x + (Math.random() - 0.5) * 2.5;
-		      y = y + run + Math.random() * 3;
+		      var run = 5 + rand() * 14;
+		      var at = x;
+		      around(size, at, y, wide, function (px, py) \{ ctx.fillRect(px, py, wide, run); });
+		      x = x + (rand() - 0.5) * 2.4;
+		      y = y + run + rand() * 2;
 		    }
 		  }
 		}
 		`,
-		// Foliage: overlapping blobs of light and shade with holes between them. The
-		// holes are what stop a tree's crown reading as a green ball — a canopy is
-		// mostly gaps, and painting the gaps is cheaper than modelling the leaves.
+		// Foliage: a mass of leaves at every depth — lit ones in front, deep shadow
+		// between them — which is what a crown is, rather than a green ball.
 		`
 		function leaves(ctx, size) \{
-		  for (var i = 0; i < 150; i++) \{
-		    var shade = i % 3;
-		    ctx.fillStyle = shade === 0 ? "rgba(255,255,255,0.13)"
-		      : shade === 1 ? "rgba(0,0,0,0.16)" : "rgba(0,0,0,0.30)";
-		    var x = Math.random() * size, y = Math.random() * size;
-		    var r = 3 + Math.random() * 9;
-		    ctx.beginPath();
-		`,
-		// Four arcs round a middle rather than one circle: a clump, not a dot.
-		`
-		    for (var a = 0; a < 4; a++) \{
-		      var turn = a * 1.571 + Math.random();
-		      ctx.arc(x + Math.cos(turn) * r * 0.5, y + Math.sin(turn) * r * 0.5,
-		        r * 0.6, 0, 6.284);
-		    }
-		    ctx.fill();
+		  grit(ctx, 4, 0.10);
+		  ctx.fillStyle = "rgba(0,0,0,0.20)";
+		  ctx.fillRect(0, 0, size, size);
+		  for (var i = 0; i < 520; i++) \{
+		    var shade = i % 4;
+		    var style = shade === 0 ? "rgba(255,255,230,0.20)"
+		      : shade === 1 ? "rgba(255,255,255,0.10)"
+		      : shade === 2 ? "rgba(0,0,0,0.18)" : "rgba(0,0,0,0.30)";
+		    var x = rand() * size, y = rand() * size, r = 1.2 + rand() * 2.6, turn = rand() * 3.14;
+		    ctx.fillStyle = style;
+		    around(size, x, y, r * 2, function (px, py) \{
+		      ctx.beginPath();
+		      ctx.ellipse(px, py, r, r * 0.55, turn, 0, 6.284);
+		      ctx.fill();
+		    });
 		  }
+		  grit(ctx, 48, 0.08);
 		}
 		`,
-		// A crowd, seen from the track. Nobody can make out a person in a grandstand
-		// from a car: what you see is rows of seats with something the colour of
-		// clothes in most of them.
-		//
-		// The colours are muted and the dots are small, and that is the whole of
-		// getting it right. Saturated primaries at three quarters opacity came out as
-		// a wall of LEDs — a crowd at two hundred metres is a texture, and anything you
-		// can pick out of it individually has stopped being one.
-		//
-		// Clothes rather than paint: real colours, well off full saturation. Both
-		// failures either side were tried — primaries at three quarters opacity is a
-		// wall of LEDs, and near-greys at two fifths is an empty stand.
-		//
-		// Darker towards the back, which is the only depth cue a flat texture has
-		// and is most of why this reads as tiers rather than as a pattern.
+		// Rows of people: the stand's colour in the dark between them, their shirts
+		// their own.
 		`
-		function crowd(ctx, size) \{
+		function crowd(ctx, mine, size) \{
 		  var rows = 7, high = size / rows;
 		  var shirts = ["#c94f3d", "#e8c56a", "#5b86b8", "#ece8e0", "#5f9463",
 		    "#a982c4", "#c98da8", "#414850"];
 		  for (var r = 0; r < rows; r++) \{
 		    ctx.fillStyle = "rgba(0,0,0," + (0.10 + (rows - r) * 0.030) + ")";
 		    ctx.fillRect(0, r * high, size, high);
-		`,
-		// The lip of each row of seats.
-		`
 		    ctx.fillStyle = "rgba(0,0,0,0.30)";
 		    ctx.fillRect(0, r * high, size, 1.5);
 		    for (var i = 0; i < 13; i++) \{
-		      ctx.fillStyle = shirts[(r * 5 + i * 3) % shirts.length];
-		      ctx.globalAlpha = 0.62;
-		      var x = (i + 0.5) * size / 13 + (Math.random() - 0.5) * 2.5;
+		      var x = (i + 0.5) * size / 13 + (rand() - 0.5) * 2.5;
 		      var y = r * high + high * 0.56;
-		      ctx.beginPath();
-		      ctx.arc(x, y, high * 0.17, 0, 6.284);
-		      ctx.fill();
-		      ctx.globalAlpha = 1;
+		      mine.fillStyle = shirts[(r * 5 + i * 3) % shirts.length];
+		      mine.beginPath();
+		      mine.arc(x, y, high * 0.17, 0, 6.284);
+		      mine.fill();
+		      mine.fillStyle = "#c99a7a";
+		      mine.beginPath();
+		      mine.arc(x, y - high * 0.24, high * 0.09, 0, 6.284);
+		      mine.fill();
 		    }
 		  }
 		}
-		`,
-		// Chain-link: two sets of wires crossing at forty-five degrees, thin and
-		// bright, over as little as possible. A fence is a thing you see through, so
-		// the pattern gives it the wire and the colour gives it the seeing through.
-		`
+
 		function mesh(ctx, size) \{
 		  ctx.clearRect(0, 0, size, size);
 		  ctx.lineWidth = 1.5;
 		  for (var pass = 0; pass < 2; pass++) \{
-		    ctx.strokeStyle = pass ? "rgba(0,0,0,0.55)" : "rgba(255,255,255,0.75)";
+		    ctx.strokeStyle = pass ? "rgba(90,90,90,1)" : "rgba(170,170,170,1)";
 		    for (var i = -8; i < 16; i++) \{
 		      var at = i * size / 8;
 		      ctx.beginPath();
@@ -14684,20 +15255,14 @@ func uiSceneJs(): Str {
 		    }
 		  }
 		}
-		`,
-		// Rubber: matt, slightly uneven, with a moulding seam round it. It is what a
-		// tyre wall and a barrier of stacked tyres are made of, and the one thing it
-		// must not do is shine.
-		`
+
 		function rubber(ctx, size) \{
-		  speckle(ctx, size, 110, 0.05);
-		  ctx.strokeStyle = "rgba(0,0,0,0.30)";
-		  ctx.lineWidth = 3;
-		  ctx.strokeRect(1.5, 1.5, size - 3, size - 3);
+		  grit(ctx, 8, 0.05);
+		  grit(ctx, 96, 0.08);
 		  for (var i = 0; i < 40; i++) \{
-		    var y = Math.random() * size;
+		    var y = rand() * size;
 		    ctx.strokeStyle = "rgba(0,0,0,0.09)";
-		    ctx.lineWidth = 2 + Math.random() * 3;
+		    ctx.lineWidth = 2 + rand() * 3;
 		    ctx.beginPath();
 		    ctx.moveTo(0, y);
 		    ctx.lineTo(size, y);
@@ -14705,38 +15270,24 @@ func uiSceneJs(): Str {
 		  }
 		}
 		`,
-		// Glass: a pane, and two hard diagonal reflections across it. The reflections
-		// are what make it glass — a flat translucent panel with nothing on it reads as
-		// a hole in a wall — and the frame is what makes it a window rather than a sheet.
+		// Glass: the reflections are the light's now, so a pane is clear but for the
+		// frame round its edge and the faintest smear.
 		`
 		function glass(ctx, size) \{
-		  var sheen = ctx.createLinearGradient(0, size, size, 0);
-		  sheen.addColorStop(0, "rgba(255,255,255,0.02)");
-		  sheen.addColorStop(0.32, "rgba(255,255,255,0.02)");
-		  sheen.addColorStop(0.38, "rgba(255,255,255,0.40)");
-		  sheen.addColorStop(0.46, "rgba(255,255,255,0.05)");
-		  sheen.addColorStop(0.60, "rgba(255,255,255,0.22)");
-		  sheen.addColorStop(0.68, "rgba(255,255,255,0.03)");
-		  sheen.addColorStop(1, "rgba(0,0,0,0.10)");
-		  ctx.fillStyle = sheen;
-		  ctx.fillRect(0, 0, size, size);
+		  grit(ctx, 8, 0.03);
 		  ctx.strokeStyle = "rgba(0,0,0,0.35)";
-		  ctx.lineWidth = 5;
-		  ctx.strokeRect(2.5, 2.5, size - 5, size - 5);
+		  ctx.lineWidth = 2;
+		  ctx.strokeRect(1, 1, size - 2, size - 2);
 		}
 		`,
-		// The mottling every pattern starts from: dots of light and dark, which is what
-		// keeps a large flat face from banding.
+		// The mottling of a plain surface: smooth unevenness and a fine stipple.
 		`
-		function speckle(ctx, size, count, strength) \{
-		  for (var i = 0; i < count; i++) \{
-		    var light = i % 2 === 0;
-		    ctx.fillStyle = light ? "rgba(255,255,255," + strength + ")"
-		                          : "rgba(0,0,0," + (strength * 1.4) + ")";
-		    var r = 1 + Math.random() * 3;
-		    ctx.beginPath();
-		    ctx.arc(Math.random() * size, Math.random() * size, r, 0, 6.284);
-		    ctx.fill();
+		function speckle(ctx, size) \{
+		  grit(ctx, 6, 0.035);
+		  grit(ctx, 48, 0.04);
+		  for (var i = 0; i < 90; i++) \{
+		    dot(ctx, size, rand() * size, rand() * size, 0.5 + rand() * 1.5,
+		      i % 2 ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.09)");
 		  }
 		}
 		`,
@@ -16301,6 +16852,169 @@ func fileWriteSecretWindowsSource(): Str {
 			}
 			return nil
 		}
+		`
+	], "\n\n")
+}
+
+// The Go for `hive.audio`: sound that is not in a scene — a recording or a live
+// stream, played by name until it is stopped. It is a module of its own and asks
+// nothing of `hive.ui`: what it keeps is which streams the program wants, and it
+// offers the window, should the program open one, a script that plays them and a
+// route that tells it when they change. A Hive program's sound is played by its
+// window, a scene's included, because that is where the platform's decoders are.
+func audioSource(): Str {
+	return join([
+		`
+		package hive
+
+		import (
+			"encoding/json"
+			"fmt"
+			"math"
+			"net/http"
+			"sync"
+		)
+		`,
+		// What the program wants playing, by the name it gave each — the name is the
+		// stream's identity, as a sound's is in a scene — and a channel closed and
+		// replaced each time that changes, which is how a page waiting on it wakes.
+		`
+		type audioStream struct \{
+			URL    string  ~BT~json:"url"~BT~
+			Volume float64 ~BT~json:"volume"~BT~
+		}
+
+		var audioMu sync.Mutex
+		var audioStreams = map[string]audioStream\{}
+		var audioChanged = make(chan struct\{})
+
+		func audioTell() \{
+			close(audioChanged)
+			audioChanged = make(chan struct\{})
+		}
+		`,
+		// Asking for what is already playing changes nothing, so a program may say
+		// what it wants every frame and the page hears only when that differs.
+		`
+		func AudioPlay(name string, url string, volume float64) \{
+			want := audioStream\{URL: url, Volume: math.Max(0, math.Min(volume, 1))}
+			audioMu.Lock()
+			defer audioMu.Unlock()
+			if had, ok := audioStreams[name]; ok && had == want \{
+				return
+			}
+			audioStreams[name] = want
+			audioTell()
+		}
+
+		func AudioStop(name string) \{
+			audioMu.Lock()
+			defer audioMu.Unlock()
+			if _, ok := audioStreams[name]; !ok \{
+				return
+			}
+			delete(audioStreams, name)
+			audioTell()
+		}
+		`,
+		// Every stream wanted, as server-sent events: the whole set when the page
+		// connects and again whenever it changes. A page reloaded reconnects by itself
+		// and is told the whole set again.
+		`
+		func audioEvents(rw http.ResponseWriter, req *http.Request) \{
+			flusher, ok := rw.(http.Flusher)
+			if !ok \{
+				http.Error(rw, "no streaming here", http.StatusInternalServerError)
+				return
+			}
+			rw.Header().Set("Content-Type", "text/event-stream")
+			rw.Header().Set("Cache-Control", "no-store")
+			for \{
+				audioMu.Lock()
+				said, _ := json.Marshal(audioStreams)
+				changed := audioChanged
+				audioMu.Unlock()
+				fmt.Fprintf(rw, "data: %s\n\n", said)
+				flusher.Flush()
+				select \{
+				case <-changed:
+				case <-req.Context().Done():
+					return
+				}
+			}
+		}
+
+		func audioScript(rw http.ResponseWriter, _ *http.Request) \{
+			rw.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+			rw.Header().Set("Cache-Control", "no-store")
+			_, _ = rw.Write([]byte(audioJS))
+		}
+
+		func init() \{
+			hivePageScripts = append(hivePageScripts, "<script src=\"/_hive/audio.js\"></script>")
+			hivePageRoutes["/_hive/audio"] = audioEvents
+			hivePageRoutes["/_hive/audio.js"] = audioScript
+		}
+		`,
+		// The page's half: an audio element per stream, which is the browser's own
+		// decoder and buffering, so a live stream is no different from a file.
+		//
+		// A page may not make a noise until somebody has touched it, and says so by
+		// refusing play rather than by failing loudly; a stream refused is tried
+		// again on every touch until one takes. One that drops — a station's server
+		// restarting, a network coming back — is picked up again after a moment
+		// rather than left silent, because a live stream has no end to reach.
+		`
+		const audioJS = ~BT~(function () \{
+		  var playing = \{};
+		  function attempt(el) \{
+		    var p = el.play();
+		    if (p && p.catch) \{ p.catch(function () \{}); }
+		  }
+		  function start(name, want) \{
+		    var el = new Audio();
+		    el.preload = "none";
+		    el.volume = want.volume;
+		    el.src = want.url;
+		    playing[name] = \{ url: want.url, el: el };
+		    var again = function () \{
+		      setTimeout(function () \{
+		        var now = playing[name];
+		        if (now && now.el === el) \{ el.src = want.url; attempt(el); }
+		      }, 2000);
+		    };
+		    el.addEventListener("error", again);
+		    el.addEventListener("ended", again);
+		    attempt(el);
+		  }
+		  function stop(name) \{
+		    var el = playing[name].el;
+		    delete playing[name];
+		    el.pause();
+		    el.removeAttribute("src");
+		    el.load();
+		  }
+		  function apply(wanted) \{
+		    var name;
+		    for (name in playing) \{
+		      if (!wanted[name] || wanted[name].url !== playing[name].url) \{ stop(name); }
+		    }
+		    for (name in wanted) \{
+		      if (!playing[name]) \{ start(name, wanted[name]); }
+		      else \{ playing[name].el.volume = wanted[name].volume; }
+		    }
+		  }
+		  function nudge() \{
+		    for (var name in playing) \{
+		      if (playing[name].el.paused) \{ attempt(playing[name].el); }
+		    }
+		  }
+		  ["pointerdown", "keydown", "touchstart"].forEach(function (kind) \{
+		    addEventListener(kind, nudge, true);
+		  });
+		  new EventSource("/_hive/audio").onmessage = function (e) \{ apply(JSON.parse(e.data)); };
+		})();
+		~BT~
 		`
 	], "\n\n")
 }

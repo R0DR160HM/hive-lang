@@ -942,6 +942,13 @@ a blade, a stack of tyres narrows without coming to a point — and a shape that
 could only be the perfect one would be composed around rather than used. A top of
 nought is the perfect one, and a top equal to the bottom is a `cylinder`.
 
+**A `box` and a `cylinder` have round edges.** Nothing made is as sharp as a
+box: a wall's arris, a bench's edge and a car's wings all catch the light along a
+curve. The radius is a fifth of the shape's smallest side, and never more than 35
+cm, so a wall's edges are softened, a bench's or a bumper's rounded, and a sheet
+of glass or a painted line, a few centimetres thick, stays crisp. A cylinder's
+rims are rounded the same way, by its diameter or its height, whichever is less.
+
 **`ground` is already lying down**, so a floor costs no rotation and `turn` still
 means everywhere what it means anywhere. **`label` takes no rotation** for the
 same reason a label exists: one you can read from one side only is not a label.
@@ -988,9 +995,11 @@ finished in:
 | open | `Mesh` |
 | finished | `Speckle` `Metal` `Carbon` `Rubber` `Glass` `Gloss` |
 
-`Panes` is the exception to the sentence below: it paints its glass a colour of its
-own rather than a shade of the shape's, because a window is a different material
-from the wall. One window lands in every couple of metres of surface.
+`Panes` is the exception to the sentence below: it paints its glass and frames
+colours of their own rather than shades of the shape's, because a window is a
+different material from the wall. One window lands in every couple of metres of
+surface. A `Kerb`'s white stripe and a `Crowd`'s shirts are their own colours for
+the same reason.
 
 Every one is drawn **over** whatever colour the shape is, so one pattern serves a
 red kerb and a blue one, and `Gloss` adds no pattern at all.
@@ -1011,6 +1020,13 @@ Where a shape says nothing, its **kind** decides: a `ground` is `Turf`, a
 is `Planks`. That is what the renderer did before there was a way to say, so a
 scene that never mentions a surface draws exactly as it did — and it is also why
 saying is worth having, because a road drawn as a `ground` came out as a lawn.
+
+**Many shapes are cheap; a see-through one is not.** Every opaque solid of one
+kind in one surface is drawn together, whatever its size and its colour, so a
+scene of ten thousand boxes is a few dozen draws, and a shape may change size or
+colour every frame at no cost beyond the change itself. A translucent shape is
+drawn alone and sorted against the rest, and each translucent colour is a material
+the window keeps, so a program should keep the number of those small.
 
 **Every finish has relief.** A surface is not only a pattern, it is a set of
 directions the surface faces, so a kerb's stripes have edges that catch the sun,
@@ -1038,11 +1054,11 @@ scene is a value, and the same value has to be right whether or not the window
 found a picture. A program that ships the files gets them; one that does not gets
 the drawing; neither says anything.
 
-**A photograph is laid over the colour, not in place of it.** The file must be
-flattened to a mean of mid grey — the window composites it in `overlay`, which
-returns mid grey exactly as it finds it — so the average of a tile is the colour
-the shape asked to be painted and what the photograph contributes is its
-structure. That is what keeps one file serving every colour a finish is ever
+**A photograph is laid over the colour, not in place of it.** It is read as light
+and dark about mid grey — the colour is multiplied by the texel over mid grey, and
+the window brings the file to a mean of mid grey itself, as it does its own
+drawings — so the average of a tile is the colour the shape asked to be painted
+and what the photograph contributes is its structure. That is what keeps one file serving every colour a finish is ever
 asked for, exactly as the drawings do, and what keeps a program's palette its own.
 
 **Nothing waits for it.** The first frame is drawn from the pattern the renderer
@@ -1195,20 +1211,27 @@ highlights and none where the eye is looking.
 Insets are drawn into the same buffer, so a second look at the world is grained
 and quantised with the first.
 
-Lighting is **not** something a scene describes. The rig is fixed — one light
-from the sky and one from a sun — chosen so that a solid painted a colour comes
-out that colour with a shaded side. What makes a scene dark is its palette, which
-is why a night scene is written in dark colours rather than by turning something
-down.
+Lighting is **not** something a scene describes. The rig is fixed — the sky and a
+sun — chosen so that a solid painted a colour comes out that colour on its lit side,
+and a darker, cooler shade of it in shadow and on the side turned away. The light
+is physical, and each surface takes it its own way: `Gloss`, `Glass` and a window's
+panes reflect the sky over them, `Metal` is a metal, and turf, tarmac and bark are
+matt. The sky's colour is what fills the shadows and what a polished surface
+shows, so a sunset tints both.
+
+What makes a scene dark is its palette, which is why a night scene is written in
+dark colours rather than by turning something down. The sky's colour reaches the
+light; very little of its darkness does, or a night scene would be dark twice.
 
 **The sun casts shadows, and it casts them near the eye.** A scene may be miles
 across and a shadow map is one texture; mapped over the whole of a circuit it would
 be a smear. So the map covers a box about fifty metres around wherever the camera
 is, which is where a shadow is read anyway — what a shadow is *for* is telling you
 that a car is beside you and that the kerb is where you think it is, and neither is
-a question about something four hundred metres away. Everything outside the box is
-culled out of the pass, and the map is redrawn on every other frame rather than
-every one. A `ground` receives shadows and does not cast one; every other solid
+a question about something four hundred metres away. The map is redrawn on every
+frame, so nothing moving is shadowed by where it was a frame before, and the box
+follows the eye a whole texel of the map at a time, so no shadow's edge crawls
+while the eye moves. A `ground` receives shadows and does not cast one; every other solid
 does both.
 
 **`shadows(false)` turns them off**, and it is the one thing about the lighting a
@@ -1404,3 +1427,24 @@ nothing.
 
 The **first number is which pad**, so two of them in one machine are told apart
 without anything else changing.
+
+## 14.17 `hive.audio`
+
+```
+hive.audio.play(name: Str, url: Str, volume: Float): void
+hive.audio.stop(name: Str): void
+```
+
+Sound that is not in a scene — a recording or a live stream, such as an internet
+radio station — played by name until it is stopped. **The name is the stream's
+identity**: `play` under a name already playing the same `url` sets only its
+`volume`, clamped to 0–1, so a program may say every frame what it wants and
+nothing restarts; a different `url` replaces the stream; `stop` of a name not
+playing does nothing.
+
+**It is played by the program's window**, whose engine holds the platform's
+decoders and buffers the stream. The window is told of every change as it happens
+and of the whole set when it connects, so a window opened or reloaded later plays
+what is wanted by then; nothing is heard while no window is open. A stream that
+drops is picked up again after a moment, and one the window refused for want of a
+gesture starts on the next key or tap. The module uses nothing of `hive.ui`.
