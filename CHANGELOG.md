@@ -17,6 +17,8 @@
 
 ### Fixes
 
+* **`Speckle` is matt.** It was a little glossy, and the sun shines as brightly at night as by day while a night's palette is a third as bright, so its highlight stood out more the darker the scene: after dark everybody's head, hair and clothes looked like chrome. It is now nearly as rough as turf, as cloth, skin, fur, sand and snow are.
+* **Nothing see-through casts a shadow.** A shape with an alpha cast one as black as a wall's, since a shadow map has no half-shadows: the faint pool a car's headlamps throw on the road shadowed the road under it, and a street lamp's halo threw a dark disc over its own pool of light. A glow, a beam or smoke now lets the sun through, and is still shadowed by what is solid.
 * **The sky changes colour with the light.** It is one texture, redrawn when its colour changes, and three.js keeps the cube it makes of a background for as long as the texture lives — so the sky stayed whatever colour it was first drawn in, a day's blue all night. It is let go and made again on every change of colour.
 * **`roof` is drawn as a roof.** It was sent to the page as a box, so every gable ever written came out a flat-topped block.
 
