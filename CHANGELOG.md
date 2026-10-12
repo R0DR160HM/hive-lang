@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.15
+
+### Standard library
+
+* **A box's and a cylinder's edges are round.** The bevel is a fifth of the shape's smallest side, at most 35 cm, and is put in by the shader at the size the shape is drawn, so one unit geometry still serves every size: a wall's arris is softened, a bench's or a car's wing is rounded, and a pane or a painted line a few centimetres thick stays crisp. A face's texture runs across its rounded edge, and the sun's shadows are cast by the rounded shape, so no lit edge is shadowed by its own sharp corner.
+* **`hive.audio` plays a recording or a live stream by name**: `play(name, url, volume)` and `stop(name)`. It is its own module rather than part of `hive.ui` — a program with a window plays the streams it wants there, with the platform's own decoders, picking a stream that drops back up and one refused for want of a gesture on the next key or tap.
+* **A scene is lit physically.** Toon shading is gone: every surface takes the light its own way (`Gloss`, `Glass` and a window's panes reflect the sky, `Metal` is a metal, turf and tarmac are matt), the sky's colour fills the shadows from above and the ground's from below, and a warm sun carries most of the light, so a lit face and a shaded one are told apart. The tone curve is the shoulder of Khronos's neutral one, which leaves a scene's colours where they were and rolls a sunlit white off instead of clipping it. The rig is still fixed, and a night is still its palette.
+* **Surfaces are filtered smoothly**, with mipmaps and anisotropy, and redrawn: bricks in a running bond each their own shade, boards with grain, tarmac with aggregate, grass in tufts, windows with white frames and dark glass. What grows and what is poured also varies at a scale of tens of metres, so a field or a road is not one flat colour from a distance.
+* **Opaque solids are drawn together.** Every one of a kind in a surface is one instanced draw, whatever its size and colour: a city of three and a half thousand shapes went from about 940 draws a frame to about 40, and the page's thread from a whole core to half of one.
+* **A scene keeps one texture per surface rather than one per colour**, and one geometry per kind rather than one per size. Nine hundred canvases and three thousand geometries a few minutes into a city, never one let go, are now about forty textures and twenty geometries for good; the page and the GPU hold about 300 MB less between them.
+* **A window's scene frames are built at their exact size and sent without being copied**, where each one was a builder grown twice, copied into bytes and copied again behind the websocket header — about 25 MB a second of garbage at sixty frames.
+* **The sun's shadows are redrawn every frame**, and their box follows the eye a whole texel at a time. Every other frame was invisible while the sun was weak; with the sun most of the light, anything moving fast was shadowed on alternate frames by where it had been and flickered, and every shadow's edge crawled while the eye moved.
+* **A hill is textured.** A cone's side is tiled down its slope rather than by its height, and a cone gentler than it is tall is laid from above in metres of the world, so a hill's grain is neither smeared down it nor squeezed into its summit.
+* **A scene draws at one pixel per pixel of its box**, where a screen at twice the density was four times the fragments and a hundred megabytes of multisampled framebuffer.
+
+### Fixes
+
+* **The sky changes colour with the light.** It is one texture, redrawn when its colour changes, and three.js keeps the cube it makes of a background for as long as the texture lives — so the sky stayed whatever colour it was first drawn in, a day's blue all night. It is let go and made again on every change of colour.
+* **`roof` is drawn as a roof.** It was sent to the page as a box, so every gable ever written came out a flat-topped block.
+
 ## v0.2.14
 
 ### Fixes
