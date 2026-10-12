@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.15
 
 ### Standard library
 
@@ -17,6 +17,7 @@
 
 ### Fixes
 
+* **The sky changes colour with the light.** It is one texture, redrawn when its colour changes, and three.js keeps the cube it makes of a background for as long as the texture lives — so the sky stayed whatever colour it was first drawn in, a day's blue all night. It is let go and made again on every change of colour.
 * **`roof` is drawn as a roof.** It was sent to the page as a box, so every gable ever written came out a flat-topped block.
 
 ## v0.2.14
