@@ -132,6 +132,52 @@ test "two fields are two subjects, and a chain may cover either" {
 	assert got == takes("p.left", "Kind.B")
 }
 
+test "a switch covers the product of its subjects" {
+	assert ending("a: Foo, b: Flag", "switch a, b \{ Foo.Bar(_), Flag.On(_) \{ return \"a\" } Foo.Baz, _ \{ return \"b\" } _, Flag.Off \{ return \"c\" } }") == ""
+	got := ending("a: Foo, b: Flag", "switch a, b \{ Foo.Bar(_), Flag.On(_) \{ return \"a\" } Foo.Baz, _ \{ return \"b\" } }")
+	assert got == "in `f`: no arm of this `switch` takes `Foo.Bar(_), Flag.Off`. Give that an arm of its own, or end the `switch` with `_, _`"
+}
+
+test "a switch is held to its subjects even where nothing has to return" {
+	got := problem("type Foo \{ Bar  Baz }\nproc main(): void \{ x := Foo.Bar()  switch x \{ Foo.Bar \{ } } }")
+	assert got == "in `main`: no arm of this `switch` takes `Foo.Baz`. Give that an arm of its own, or end the `switch` with `_`"
+}
+
+test "a switch covers a Bool by true and false, and a vector by its lengths" {
+	assert ending("a: Bool, b: Bool", "switch a, b \{ true, _ \{ return \"a\" } false, true \{ return \"b\" } false, false \{ return \"c\" } }") == ""
+	assert opens(ending("a: Bool, b: Bool", "switch a, b \{ true, _ \{ return \"a\" } false, true \{ return \"b\" } }"), "in `f`: no arm of this `switch` takes `false, false`")
+	assert opens(ending("v: Str[dyn]", "switch v \{ [] \{ return \"a\" } [x] \{ return x } }"), "in `f`: no arm of this `switch` takes `[_, _, ...]`")
+}
+
+test "a switch over a number, an atom or a string ends with _" {
+	assert opens(ending("n: Int", "switch n \{ 0 \{ return \"a\" } 1 \{ return \"b\" } }"), "in `f`: the arms of this `switch` cannot take every value it tests")
+	assert ending("n: Int", "switch n \{ 0 \{ return \"a\" } _ \{ return \"b\" } }") == ""
+}
+
+test "an arm the arms above it already take can never run" {
+	dead := "in `f`: arm 2 of this `switch` can never run"
+	assert opens(ending("a: Foo", "switch a \{ _ \{ return \"a\" } Foo.Baz \{ return \"b\" } }"), dead)
+	assert opens(ending("n: Int", "switch n \{ 3 \{ return \"a\" } 3 \{ return \"b\" } _ \{ return \"c\" } }"), dead)
+	assert opens(ending("a: Foo, b: Flag", "switch a, b \{ Foo.Bar(_), _ \{ return \"a\" } Foo.Bar(_), Flag.Off \{ return \"b\" } _, _ \{ return \"c\" } }"), dead)
+	assert ending("a: Foo, b: Flag", "switch a, b \{ Foo.Bar(_), Flag.Off \{ return \"a\" } Foo.Bar(_), _ \{ return \"b\" } _, _ \{ return \"c\" } }") == ""
+}
+
+test "a switch whose every arm returns is a terminating path, and one that does not is not" {
+	assert ending("a: Foo", "switch a \{ Foo.Bar(n) \{ return \"a\" } Foo.Baz \{ return \"b\" } }") == ""
+	assert opens(ending("a: Foo", "switch a \{ Foo.Bar(n) \{ echo n } Foo.Baz \{ return \"b\" } }"), "in `f`: `f` answers with Str, so every path through it has to return one")
+}
+
+test "a switch needs an arm and a value" {
+	assert opens(problem("type Foo \{ Bar }\nproc main(): void \{ x := Foo.Bar()  switch x \{ } }"), "in `main`: this `switch` has no arms")
+	assert opens(problem("proc log(): void \{ }\nproc main(): void \{ switch log() \{ _ \{ } } }"), "in `main`: this `switch` tests a call that answers with nothing")
+}
+
+test "a switch arm names every field of a variant or none, as `is` does" {
+	got := problem("type Foo \{ Bar \{ n: Int }  Baz }\nproc main(): void \{ x := Foo.Baz()  switch x \{ Foo.Bar() \{ } _ \{ } } }")
+	assert opens(got, "in `main`: `Foo.Bar` has 1 field, and this pattern binds no arguments")
+	assert problemCount("type Foo \{ Bar \{ n: Int }  Baz }\nproc main(): void \{ x := Foo.Baz()  switch x \{ Foo.Bar \{ } Foo.Baz() \{ } } }") == 0
+}
+
 test "a variant a type does not have is named" {
 	got := problem("type Shape \{ Circle \{ radius: Int } }\nproc main(): void \{ echo Shape.Square(1) }")
 	assert got == "in `main`: `Shape` has no variant `Square`"

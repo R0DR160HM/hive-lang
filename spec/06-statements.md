@@ -71,7 +71,39 @@ if x is T.A(v) && v == "ok" { ... }
 
 See [07](07-patterns.md).
 
-## 6.4 Loops
+## 6.4 `switch`
+
+```hive
+switch shape, fill {
+	Shape.Circle(r), Fill.Solid(color) { ... }
+	Shape.Point, _                     { ... }
+	_, _                               { ... }
+}
+```
+
+A `switch` matches one or more values, its **subjects**, against a list of arms.
+Each subject is evaluated **exactly once**, left to right, before any arm is
+tried. An arm has one **position** per subject, and a position is
+
+* a pattern ([07](07-patterns.md)), which matches as it would after `is`;
+* a literal the value has to equal: `0`, `-1`, `2.5`, `#Ready`, `true`; or
+* `_`, which takes any value.
+
+The **first** arm whose every position matches runs, and no other. There is no
+fall-through, so `break` and `continue` in an arm act on the enclosing loop.
+
+An arm is the `if` its positions spell — `Shape.Point, _ { }` is
+`if shape is Shape.Point { }` — so what it binds is in scope in its body and
+nowhere else. An arm binds a name **once** across all its positions; two
+positions binding one name is a compile error.
+
+A `switch` is **always exhaustive**, and **every arm can run**: an arm for every
+value the subjects can take together, and no arm the ones above it already take
+all of. Either falling short is a compile error ([7.8](07-patterns.md#78-switch)).
+That is what makes a `switch` whose every arm terminates a terminating path
+([04](04-declarations.md#44-returning-on-every-path)).
+
+## 6.5 Loops
 
 Two shapes.
 
@@ -104,13 +136,13 @@ one the element does not fit is a compile error. It never indexes, so it needs n
 **`break`** leaves the innermost enclosing loop and **`continue`** skips to its
 next iteration. Either outside a loop is a compile error.
 
-## 6.5 `return`
+## 6.6 `return`
 
 `return expr` in a non-`void` callable, bare `return` in a `void` one or to
 leave a test early. Every non-`void` callable must return on every path
 ([04](04-declarations.md#44-returning-on-every-path)).
 
-## 6.6 `echo`
+## 6.7 `echo`
 
 `echo value` writes one line to stdout, rendering the value the way `hive.Show`
 does: an atom prints its **name**, a vector prints its elements, a map prints its
@@ -123,7 +155,7 @@ those it **is** quoted, which is what tells `["1", "2"]` from `[1, 2]` and from
 `echo` is legal in both a `func` and a `proc`. Echoing a
 [`Secret`](03-types.md#311-secret), or anything holding one, is a compile error.
 
-## 6.7 `assert`
+## 6.8 `assert`
 
 `assert cond` says: this must hold. What happens when it does not is decided by
 **where it is written**:
@@ -143,7 +175,7 @@ panic: hive: assertion failed: total == 10
   right: 10
 ```
 
-## 6.8 `panic`
+## 6.9 `panic`
 
 `panic value` stops the program immediately, showing `value` rendered as a string
 exactly the way `echo` displays it — so `panic err` prints the error's message
@@ -158,7 +190,7 @@ The one exception to "stops the program" is inside a
 [service](14-stdlib.md#1410-hivesyslink), where a panic kills only
 that service and leaves the node running.
 
-## 6.9 `async` as a statement
+## 6.10 `async` as a statement
 
 ```hive
 async f(x)
@@ -167,7 +199,7 @@ async f(x)
 Runs the call on its own virtual thread and carries on. See
 [09](09-concurrency.md).
 
-## 6.10 Expression statements
+## 6.11 Expression statements
 
 A call may stand alone as a statement, and its result is discarded. Two builtins
 mean something particular in that position:
@@ -180,7 +212,7 @@ mean something particular in that position:
 
 An expression that is not a call and has no effect is not a statement.
 
-## 6.11 Scope
+## 6.12 Scope
 
 A block introduces a scope. A name declared in one is visible from its
 declaration to the end of that block, and shadowing an outer name is allowed:

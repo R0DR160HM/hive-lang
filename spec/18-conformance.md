@@ -13,7 +13,8 @@ where it falls short, which is the part worth reading.
    every vector index and slice ([10](10-bounds.md)), every generic
    instantiation ([11](11-generics.md)), every atom's value
    ([03](03-types.md#atom)), the exhaustiveness of a terminating chain
-   ([04](04-declarations.md#44-returning-on-every-path)).
+   ([04](04-declarations.md#44-returning-on-every-path)) and of every `switch`
+   ([07](07-patterns.md#78-switch)).
 3. **Preserve value semantics.** Storage an immutable binding observes is never
    mutated in place afterwards ([08](08-mutability-and-values.md)). *How* that is
    preserved — where copies go, which aliases are proved safe — is an

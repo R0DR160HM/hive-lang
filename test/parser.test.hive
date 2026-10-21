@@ -535,6 +535,38 @@ test "one pattern may not bind a name twice" {
 	assert problemCount("proc p(): void \{ if x is Pair.Of(_, Result.Ok(_)) \{ } }") == 0
 }
 
+test "a switch's arms are the matches an if chain would make" {
+	assert stmt("switch s \{ Shape.Point \{ } _ \{ } }") == "(switch [s] (is s Shape.Point) (block) true (block))"
+	assert stmt("switch r \{ Result.Ok(Shape.Point) \{ } }") == "(switch [r] (&& (is r Result.Ok(_part_1)) (is _part_1 Shape.Point)) (block))"
+}
+
+test "a switch arm takes a literal, a pattern or _ in each position" {
+	got := stmt("switch a, n, s \{ true, -1, \"x\{y}\" \{ } _, _, _ \{ } }")
+	assert got == "(switch [a n s] (&& (&& (== a true) (== n (- 1))) (is s (template \"x\" <y>))) (block) true (block))"
+}
+
+test "a switch subject that is not a path is bound once, first" {
+	got := stmt("switch f(x), y \{ Result.Ok(v), 3 \{ } _, _ \{ } }")
+	assert got == "(switch (let _part_0 (call f x)) [_part_0 y] (&& (is _part_0 Result.Ok(v)) (== y 3)) (block) true (block))"
+	assert stmt("switch y, f(x) \{ _, _ \{ } }") == "(switch (let _part_0 y) (let _part_1 (call f x)) [_part_0 _part_1] true (block))"
+}
+
+test "a switch subject an arm's binding would shadow is bound first" {
+	assert stmt("switch a, b \{ Pair.Of(b, _), _ \{ } }") == "(switch (let _part_1 b) [a _part_1] (is a Pair.Of(b _)) (block))"
+}
+
+test "a switch arm has one position per subject" {
+	assert text.startsWith(problem("proc p(): void \{ switch a, b \{ Shape.Point \{ } } }"), "this arm is short of patterns: the `switch` tests 2 values")
+	assert text.startsWith(problem("proc p(): void \{ switch a \{ _, _ \{ } } }"), "this arm has too many patterns: the `switch` tests one value")
+	assert text.startsWith(problem("proc p(): void \{ switch a \{ other \{ } } }"), "expected a pattern, a literal or `_`")
+	assert text.startsWith(problem("proc p(): void \{ switch _ \{ } }"), "a `switch` tests a value, and `_` is none")
+}
+
+test "a switch arm binds a name once across its positions" {
+	got := problem("proc p(): void \{ switch a, b \{ Result.Ok(x), Result.Ok(x) \{ } } }")
+	assert text.startsWith(got, "this arm binds `x` twice")
+}
+
 test "a nested match cannot be negated either" {
 	got := problem("proc p(): void \{ if !(r is Result.Ok(Shape.Point)) \{ } }")
 	assert text.startsWith(got, "a match cannot be negated")

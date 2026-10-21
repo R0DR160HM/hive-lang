@@ -102,6 +102,7 @@ statement   = var-decl
             | compound-assign
             | step
             | if-stmt
+            | switch-stmt
             | for-stmt
             | return-stmt
             | echo-stmt
@@ -125,6 +126,10 @@ step        = lvalue ( "++" | "--" ) ;
 if-stmt     = "if" expression block { "else" "if" expression block }
                                     [ "else" block ] ;
 
+switch-stmt = "switch" expression { "," expression } "{" { arm } "}" ;
+arm         = position { "," position } block ;
+position    = "_" | pattern | [ "-" ] INT | FLOAT | ATOM | "true" | "false" ;
+
 for-stmt    = "for" [ statement ] ";" [ expression ] ";" [ statement ] block
             | "for" "each" IDENT [ ":" type ] "in" expression block ;
 
@@ -144,6 +149,9 @@ A `;` on its own is skipped, so a statement may be written with one after it.
 A counting loop's init clause declares a variable that is **implicitly
 mutable** — the post clause advances it — so `for i := 0; i < 10; i++` needs no
 `mut`, and that counter is held to the `mut` naming rule (never `UPPER_CASE`).
+
+A `switch` arm has exactly one `position` per subject
+([06](06-statements.md#64-switch)).
 
 ## 2.6 Expressions
 

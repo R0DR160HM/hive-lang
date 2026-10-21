@@ -994,6 +994,8 @@ proc parseStmt(ts: token.Token[], p: mut Parse): ast.Stmt {
 		return parseReturn(ts, p)
 	} else if k == token.Kind.KwIf() {
 		return parseIf(ts, p)
+	} else if k == token.Kind.KwSwitch() {
+		return parseSwitch(ts, p)
 	} else if k == token.Kind.KwFor() {
 		return parseFor(ts, p)
 	} else if k == token.Kind.KwEcho() {
@@ -1281,6 +1283,211 @@ proc parseForEach(ts: token.Token[], p: mut Parse): ast.Stmt {
 	}
 	subject := parseExpr(ts, p)
 	return ast.Stmt.ForEach(name, declared, subject, parseBlock(ts, p))
+}
+
+proc parseSwitch(ts: token.Token[], p: mut Parse): ast.Stmt {
+	line := lineAt(ts, p.pos)
+	advance(p)
+	mut ast.Expr[dyn] written = []
+	mut Str[dyn] hidden = []
+	for ; p.failed == false; {
+		if wordAt(ts, p.pos) == "_" {
+			fail(ts, p, "a `switch` tests a value, and `_` is none: it is what an arm writes to take any value")
+			return ast.Stmt.Nothing()
+		}
+		append(written, parseExpr(ts, p))
+		append(hidden, freshPart(p))
+		if kindAt(ts, p.pos) != token.Kind.Comma() {
+			break
+		}
+		advance(p)
+	}
+	if expect(ts, p, token.Kind.LBrace()) == false {
+		return ast.Stmt.Nothing()
+	}
+	mut ast.Branch[dyn] arms = []
+	for ; p.failed == false && atEnd(ts, p) == false; {
+		skipSemicolons(ts, p)
+		if kindAt(ts, p.pos) == token.Kind.RBrace() {
+			advance(p)
+			return switchOf(written, hidden, arms, line)
+		}
+		condition := parseArm(ts, p, hidden)
+		if p.failed {
+			return ast.Stmt.Nothing()
+		}
+		append(arms, ast.Branch(condition, parseBlock(ts, p)))
+	}
+	if p.failed == false {
+		expected(ts, p, "`}` to close this `switch`")
+	}
+	return ast.Stmt.Nothing()
+}
+
+proc parseArm(ts: token.Token[], p: mut Parse, hidden: Str[]): ast.Expr {
+	mut ast.Expr[dyn] tests = []
+	mut first := true
+	for each name in hidden {
+		if first == false {
+			if kindAt(ts, p.pos) != token.Kind.Comma() {
+				fail(ts, p, "this arm is short of patterns: the `switch` tests " + valueCount(len(hidden)) + ", and an arm has one for each — `_` takes any value")
+				return ast.Expr.Absent()
+			}
+			advance(p)
+		}
+		first = false
+		position := parsePosition(ts, p, ast.Expr.Ident(name))
+		if p.failed {
+			return ast.Expr.Absent()
+		}
+		if (position is ast.Expr.Absent) == false {
+			append(tests, position)
+		}
+	}
+	if kindAt(ts, p.pos) == token.Kind.Comma() {
+		fail(ts, p, "this arm has too many patterns: the `switch` tests " + valueCount(len(hidden)) + ", and an arm has one for each")
+		return ast.Expr.Absent()
+	}
+	mut ast.Expr out = ast.Expr.BoolLit(true)
+	mut empty := true
+	for each position in tests {
+		if empty {
+			out = position
+			empty = false
+		} else {
+			out = ast.Expr.Binary(ast.BinOp.And(), out, position)
+		}
+	}
+	twice := boundTwice(bindingsIn(out))
+	if twice != "" {
+		fail(ts, p, "this arm binds `{twice}` twice, and the two would take parts of different values. Give them different names")
+	}
+	return out
+}
+
+func valueCount(n: Int): Str {
+	if n == 1 {
+		return "one value"
+	}
+	return "{n} values"
+}
+
+proc parsePosition(ts: token.Token[], p: mut Parse, subject: ast.Expr): ast.Expr {
+	if wordAt(ts, p.pos) == "_" && kindAt(ts, p.pos + 1) != token.Kind.Dot() {
+		advance(p)
+		return ast.Expr.Absent()
+	}
+	if opensPattern(ts, p.pos) || kindAt(ts, p.pos) is token.Kind.StrLit(_) {
+		return parseMatch(ts, p, subject)
+	}
+	if startsLiteral(ts, p.pos) {
+		return ast.Expr.Binary(ast.BinOp.Eq(), subject, parseLiteral(ts, p))
+	}
+	expected(ts, p, "a pattern, a literal or `_`")
+	return ast.Expr.Absent()
+}
+
+func bindingsIn(e: ast.Expr): Str[dyn] {
+	if e is ast.Expr.IsMatch(_, pattern) {
+		return boundBy(pattern)
+	}
+	if e is ast.Expr.Binary(op, left, right) {
+		if op is ast.BinOp.And {
+			return bindingsIn(left) + bindingsIn(right)
+		}
+	}
+	return []
+}
+
+// A path is read in place unless an arm's binding shadows it or a later subject's call could change it.
+func switchOf(written: ast.Expr[], hidden: Str[], arms: ast.Branch[], line: Int): ast.Stmt {
+	mut Str[dyn] bound = []
+	for each arm in arms {
+		bound = bound + bindingsIn(arm.condition)
+	}
+	mut lastCall := -1
+	mut at := 0
+	for each subject in written {
+		if len(pathNames(subject)) == 0 {
+			lastCall = at
+		}
+		at = at + 1
+	}
+	mut ast.Stmt[dyn] lets = []
+	mut ast.Expr[dyn] subjects = []
+	mut ast.Branch[dyn] tested = []
+	for each arm in arms {
+		append(tested, arm)
+	}
+	at = 0
+	for each subject in written {
+		mut name := ""
+		if hidden bounds at {
+			name = hidden[at]
+		}
+		if at > lastCall && noneBound(pathNames(subject), bound) {
+			append(subjects, subject)
+			tested = retargeted(tested, name, subject)
+		} else {
+			append(lets, ast.Stmt.VarDecl(name, subject, false, false))
+			append(subjects, ast.Expr.Ident(name))
+		}
+		at = at + 1
+	}
+	return ast.Stmt.SwitchStmt(lets, subjects, tested, line)
+}
+
+func pathNames(e: ast.Expr): Str[dyn] {
+	if e is ast.Expr.Ident(name) {
+		return [name]
+	}
+	if e is ast.Expr.Member(subject, _) {
+		return pathNames(subject)
+	}
+	if e is ast.Expr.Index(subject, index) {
+		root := pathNames(subject)
+		if len(root) == 0 || index is ast.Expr.IntLit(_) {
+			return root
+		}
+		inner := pathNames(index)
+		if len(inner) == 0 {
+			return []
+		}
+		return root + inner
+	}
+	return []
+}
+
+func noneBound(names: Str[], bound: Str[]): Bool {
+	for each name in names {
+		if indexOf(bound, name) is Result.Ok(_) {
+			return false
+		}
+	}
+	return true
+}
+
+func retargeted(arms: ast.Branch[], name: Str, subject: ast.Expr): ast.Branch[dyn] {
+	mut ast.Branch[dyn] out = []
+	for each arm in arms {
+		append(out, ast.Branch(retarget(arm.condition, name, subject), arm.body))
+	}
+	return out
+}
+
+func retarget(e: ast.Expr, name: Str, subject: ast.Expr): ast.Expr {
+	if e is ast.Expr.IsMatch(target, pattern) && target is ast.Expr.Ident(tested) && tested == name {
+		return ast.Expr.IsMatch(subject, pattern)
+	}
+	if e is ast.Expr.Binary(op, left, right) {
+		if op is ast.BinOp.And {
+			return ast.Expr.Binary(op, retarget(left, name, subject), retarget(right, name, subject))
+		}
+		if op is ast.BinOp.Eq && left is ast.Expr.Ident(tested) && tested == name {
+			return ast.Expr.Binary(op, subject, right)
+		}
+	}
+	return e
 }
 
 // --- Expressions -------------------------------------------------------------
@@ -1869,17 +2076,24 @@ func boundBy(pattern: ast.Pattern): Str[dyn] {
 }
 
 proc refuseRebinding(ts: token.Token[], p: mut Parse, bound: Str[]): void {
+	name := boundTwice(bound)
+	if name != "" {
+		fail(ts, p, "this pattern binds `{name}` twice, and the two would take different parts of the value. Give them different names")
+	}
+}
+
+func boundTwice(bound: Str[]): Str {
 	mut Str[dyn] seen = []
 	for each name in bound {
 		if name == "" || name == "_" {
 			continue
 		}
 		if indexOf(seen, name) is Result.Ok(_) {
-			fail(ts, p, "this pattern binds `{name}` twice, and the two would take different parts of the value. Give them different names")
-			return
+			return name
 		}
 		append(seen, name)
 	}
+	return ""
 }
 
 proc parsePattern(ts: token.Token[], p: mut Parse): ast.Pattern {

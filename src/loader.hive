@@ -720,20 +720,37 @@ proc rewriteStmt(rw: mut Rw, s: ast.Stmt): ast.Stmt {
 	} else if s is ast.Stmt.Assign(target, value) {
 		return ast.Stmt.Assign(rewriteExpr(rw, target), rewriteExpr(rw, value))
 	} else if s is ast.Stmt.IfChain(branches, otherwise, hasElse) {
-		mut ast.Branch[dyn] out = []
-		for each b in branches {
-			// A pattern binds into its own branch and no further: the condition
-			// and body share one scope, and the next branch starts where this
-			// one did.
-			mark := len(rw.locals)
-			condition := rewriteExpr(rw, b.condition)
-			body := rewriteBlock(rw, b.body)
-			restoreLocals(rw, mark)
-			append(out, ast.Branch(condition, body))
+		return ast.Stmt.IfChain(rewriteBranches(rw, branches), rewriteBlock(rw, otherwise), hasElse)
+	} else if s is ast.Stmt.SwitchStmt(lets, subjects, arms, line) {
+		mark := len(rw.locals)
+		mut ast.Stmt[dyn] newLets = []
+		for each l in lets {
+			append(newLets, rewriteStmt(rw, l))
 		}
-		return ast.Stmt.IfChain(out, rewriteBlock(rw, otherwise), hasElse)
+		mut ast.Expr[dyn] newSubjects = []
+		for each subject in subjects {
+			append(newSubjects, rewriteExpr(rw, subject))
+		}
+		newArms := rewriteBranches(rw, arms)
+		restoreLocals(rw, mark)
+		return ast.Stmt.SwitchStmt(newLets, newSubjects, newArms, line)
 	}
 	return rewriteStmtTail(rw, s)
+}
+
+proc rewriteBranches(rw: mut Rw, branches: ast.Branch[]): ast.Branch[dyn] {
+	mut ast.Branch[dyn] out = []
+	for each b in branches {
+		// A pattern binds into its own branch and no further: the condition
+		// and body share one scope, and the next branch starts where this
+		// one did.
+		mark := len(rw.locals)
+		condition := rewriteExpr(rw, b.condition)
+		body := rewriteBlock(rw, b.body)
+		restoreLocals(rw, mark)
+		append(out, ast.Branch(condition, body))
+	}
+	return out
 }
 
 proc rewriteStmtTail(rw: mut Rw, s: ast.Stmt): ast.Stmt {

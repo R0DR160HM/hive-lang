@@ -41,6 +41,7 @@ file, plus a generated `hive` runtime package.
 | `x is Result.Ok(v)` / `x is T.Variant(a, _)` | `IsOk()` + accessor / a type assertion, which takes the union — a variant built on the spot is converted to it first; `_` binds nothing |
 | `x is T.Variant(a) && a > 0` outside an `if` | the guards that `if` would write, inside a `func() bool { … }()` answering whether they all held |
 | `if <call> is Result.Ok(v)` | one `if` with an init slot, so the call is evaluated once |
+| `switch a, f() { P, Q { } _, _ { } }` | `f()` bound once to a hidden name, then the `if` chain the arms spell over `a` and that name; a last arm of only `_` is its `else` |
 | `"{a} and {b}"` | concatenation, non-`Str` pieces via `hive.ToStr` |
 | `[x, y] + [z]` / `v1 == v2` | `hive.Concat(..)` / `hive.VecEq(..)` (structural) |
 | `t[1:3]` | `t[1:4]` — Hive's high bound is **inclusive** |

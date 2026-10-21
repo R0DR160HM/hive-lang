@@ -452,6 +452,23 @@ func bindFrom(t: types.Table, env: infer.Env, s: ast.Stmt): infer.Env {
 	return env
 }
 
+func bindAll(t: types.Table, env: infer.Env, stmts: ast.Stmt[], at: Int): infer.Env {
+	if stmts bounds at {
+		return bindAll(t, bindFrom(t, env, stmts[at]), stmts, at + 1)
+	}
+	return env
+}
+
+proc substituteBranches(mo: mut Mono, env: infer.Env, branches: ast.Branch[], variables: Str[], args: ArgList): ast.Branch[dyn] {
+	mut ast.Branch[dyn] out = []
+	for each b in branches {
+		condition := substituteExpr(mo, env, b.condition, variables, args)
+		// A pattern binds into its own branch, and no further.
+		append(out, ast.Branch(condition, substituteBlock(mo, infer.narrowed(env, condition), b.body, variables, args)))
+	}
+	return out
+}
+
 proc substituteStmt(mo: mut Mono, env: infer.Env, s: ast.Stmt, variables: Str[], args: ArgList): ast.Stmt {
 	if s is ast.Stmt.VarDecl(name, value, mutable, deferred) {
 		return ast.Stmt.VarDecl(name, substituteExpr(mo, env, value, variables, args), mutable, deferred)
@@ -464,13 +481,16 @@ proc substituteStmt(mo: mut Mono, env: infer.Env, s: ast.Stmt, variables: Str[],
 	} else if s is ast.Stmt.Assign(target, value) {
 		return ast.Stmt.Assign(substituteExpr(mo, env, target, variables, args), substituteExpr(mo, env, value, variables, args))
 	} else if s is ast.Stmt.IfChain(branches, otherwise, hasElse) {
-		mut ast.Branch[dyn] out = []
-		for each b in branches {
-			condition := substituteExpr(mo, env, b.condition, variables, args)
-			// A pattern binds into its own branch, and no further.
-			append(out, ast.Branch(condition, substituteBlock(mo, infer.narrowed(env, condition), b.body, variables, args)))
+		return ast.Stmt.IfChain(substituteBranches(mo, env, branches, variables, args), substituteBlock(mo, env, otherwise, variables, args), hasElse)
+	} else if s is ast.Stmt.SwitchStmt(lets, subjects, arms, line) {
+		mut ast.Stmt[dyn] newLets = []
+		substituteStmts(mo, env, lets, 0, newLets, variables, args)
+		inner := bindAll(env.table, env, newLets, 0)
+		mut ast.Expr[dyn] newSubjects = []
+		for each subject in subjects {
+			append(newSubjects, substituteExpr(mo, inner, subject, variables, args))
 		}
-		return ast.Stmt.IfChain(out, substituteBlock(mo, env, otherwise, variables, args), hasElse)
+		return ast.Stmt.SwitchStmt(newLets, newSubjects, substituteBranches(mo, inner, arms, variables, args), line)
 	} else if s is ast.Stmt.ForLoop(init, cond, post, body) {
 		// The counter is scoped to the loop, and the condition, the post clause
 		// and the body all read it.

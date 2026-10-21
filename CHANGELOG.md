@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### v0.2.16
+
+* **`switch` matches one or more values against arms**, each a pattern, a literal or `_` per value; the first arm that matches runs.
+* **A `switch` is always exhaustive**: a value no arm takes, and an arm that can never run, are compile errors.
+* **`switch` is a keyword**, so no name may be spelt as it in any casing.
+
 ## v0.2.15
 
 ### Standard library

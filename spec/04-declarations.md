@@ -137,7 +137,9 @@ terminates by ending in:
 * `return`;
 * `panic`, or a call to `hive.term.exit` — both handy for a tail you know is
   unreachable;
-* an `if`/`else` whose every branch terminates; or
+* an `if`/`else` whose every branch terminates;
+* a `switch` whose every arm terminates — a `switch` takes every value of its
+  subjects, so there is no path around it ([06](06-statements.md#64-switch)); or
 * an else-less `if`/`else if` chain whose every branch terminates and whose
   patterns take every value of its subject — a `Result`'s `Ok` and `Error`, every
   variant of a declared union, nested as deep as they go

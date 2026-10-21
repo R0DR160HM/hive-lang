@@ -39,7 +39,7 @@ Every keyword is lower case **and only lower case**:
 
 ```
 import   proc     func     query    test     type
-if       else     return   is       with
+if       else     return   is       with     switch
 void     true     false    echo     assert   panic
 dyn      mut      async    await    for      in
 each     bounds   break    continue
