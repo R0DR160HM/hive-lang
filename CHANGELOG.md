@@ -8,6 +8,10 @@
 * **A `switch` is always exhaustive**: a value no arm takes, and an arm that can never run, are compile errors.
 * **`switch` is a keyword**, so no name may be spelt as it in any casing.
 
+### Standard library
+
+* **`hive.term.readSecretBypass()` and `hive.crypto.decryptBypass(ciphertext, password)`** are `readSecret` and `decrypt` into ordinary memory, as `bypass` is to `hide`, so neither stops at the locked-memory limit.
+
 ## v0.2.15
 
 ### Standard library

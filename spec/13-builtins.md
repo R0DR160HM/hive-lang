@@ -117,7 +117,8 @@ compile error rather than a habit to keep.
 `hide` locks the memory it keeps the text in, and locked memory runs out, so it
 answers a `Result` whose error is a `SecretError`. `bypass` makes the same
 `Secret` without locking anything, so it cannot fail — and is free to be swapped
-to disk.
+to disk. `hive.term.readSecretBypass` and `hive.crypto.decryptBypass` are the
+library's calls of the same kind ([14](14-stdlib.md)).
 
 ## A declaration of your own wins
 

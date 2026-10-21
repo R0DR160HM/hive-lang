@@ -456,8 +456,9 @@ func coreSecret(): Str {
 		// Bypass is a Secret in ordinary memory: as unprintable as any, but free to be
 		// swapped out. Cleared all the same once nothing holds it.
 		`
-		func Bypass(text string) Secret \{
-			b := []byte(text)
+		func Bypass(text string) Secret \{ return bypassed([]byte(text)) }
+
+		func bypassed(b []byte) Secret \{
 			s := Secret\{p: &b}
 			runtime.AddCleanup(s.p, func(b []byte) \{ clear(b) }, b)
 			return s
@@ -589,6 +590,12 @@ func secretSource(): Str {
 				return
 			}
 			unlockMemory(a.mem)
+		}
+		`,
+		// unlockedSecret is newSecret for the calls that bypass the lock.
+		`
+		func unlockedSecret(n int) (Secret, *SecretError) \{
+			return bypassed(make([]byte, n)), nil
 		}
 		`,
 		// lockedPages is n bytes, rounded up to whole pages, that will not be swapped
@@ -3851,12 +3858,21 @@ func cryptoSource(): Str {
 			return base64.StdEncoding.EncodeToString(message)
 		}
 		`,
-		// CryptoDecrypt opens what CryptoEncrypt sealed, or says why it could not. A
+		// openSealed opens what CryptoEncrypt sealed, or says why it could not. A
 		// wrong password and an edited message fail the same way — the tag does not
 		// check out either way, and it cannot tell which. The plaintext is opened
-		// straight into locked memory. Backs hive.crypto.decrypt.
+		// straight into what alloc hands out: locked memory for hive.crypto.decrypt,
+		// ordinary memory for hive.crypto.decryptBypass.
 		`
 		func CryptoDecrypt(ciphertext string, password Secret) Result[Secret, CryptoCryptoError] \{
+			return openSealed(ciphertext, password, newSecret)
+		}
+
+		func CryptoDecryptBypass(ciphertext string, password Secret) Result[Secret, CryptoCryptoError] \{
+			return openSealed(ciphertext, password, unlockedSecret)
+		}
+
+		func openSealed(ciphertext string, password Secret, alloc func(int) (Secret, *SecretError)) Result[Secret, CryptoCryptoError] \{
 			defer runtime.KeepAlive(password)
 			fail := func(reason, msg string) Result[Secret, CryptoCryptoError] \{
 				return Err[Secret, CryptoCryptoError](CryptoCryptoError\{Reason: reason, Message: msg})
@@ -3881,7 +3897,7 @@ func cryptoSource(): Str {
 				return fail("Malformed", "input is too short to be an encrypted message")
 			}
 			sealed := rest[opener.NonceSize():]
-			plaintext, locked := newSecret(len(sealed) - opener.Overhead())
+			plaintext, locked := alloc(len(sealed) - opener.Overhead())
 			if locked != nil \{
 				return fail(locked.Reason, locked.Message)
 			}
@@ -16347,19 +16363,24 @@ func termSecretSource(): Str {
 			interrupts  chan os.Signal
 		)
 		`,
-		// TermReadSecret reads a line as TermRead does, with the terminal's echo turned
-		// off while it waits, a byte at a time into locked memory so the line is never a
-		// Go string. Returns it without the trailing newline and parks only the calling
-		// virtual thread. Backs hive.term.readSecret.
+		// readHidden reads a line as TermRead does, with the terminal's echo turned off
+		// while it waits, a byte at a time into what alloc hands out so the line is
+		// never a Go string. Returns it without the trailing newline and parks only the
+		// calling virtual thread. Backs hive.term.readSecret, into locked memory, and
+		// hive.term.readSecretBypass, into ordinary memory.
 		//
 		// The echo belongs to the terminal rather than to standard input: under hive run
 		// the line is typed at the compiler's terminal and reaches this program through
 		// a relay file (see TermRead). Where there is no terminal, the line is read all
 		// the same and only the hiding of it is lost.
 		`
-		func TermReadSecret() Result[Secret, SecretError] \{
+		func TermReadSecret() Result[Secret, SecretError] \{ return readHidden(newSecret) }
+
+		func TermReadSecretBypass() Secret \{ return readHidden(unlockedSecret).Ok() }
+
+		func readHidden(alloc func(int) (Secret, *SecretError)) Result[Secret, SecretError] \{
 			hidden := hideEcho()
-			typed, failed := newSecret(64)
+			typed, failed := alloc(64)
 			n := 0
 			for \{
 				c, err := termInput.ReadByte()
@@ -16374,7 +16395,7 @@ func termSecretSource(): Str {
 					continue
 				}
 				if n == len(typed.bytes()) \{
-					bigger, err := newSecret(2 * n)
+					bigger, err := alloc(2 * n)
 					if err != nil \{
 						failed = err
 						continue
@@ -16400,7 +16421,7 @@ func termSecretSource(): Str {
 			for n > 0 && typed.bytes()[n-1] == '\r' \{
 				n--
 			}
-			line, err := newSecret(n)
+			line, err := alloc(n)
 			if err != nil \{
 				return Err[Secret, SecretError](*err)
 			}

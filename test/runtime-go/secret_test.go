@@ -1,7 +1,9 @@
 package hive
 
 import (
+	"bufio"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -50,5 +52,17 @@ func TestEqualityIsByContent(t *testing.T) {
 	}
 	if Show(Bypass("a")) != "<secret>" {
 		t.Fatalf("a secret printed as %q", Show(Bypass("a")))
+	}
+}
+
+func TestReadSecretBypassReadsTheLineReadSecretWould(t *testing.T) {
+	was := termInput
+	defer func() { termInput = was }()
+	termInput = bufio.NewReader(strings.NewReader("hunter2\r\nhunter2\r\n"))
+	if got := TermReadSecret(); got.IsError() || Reveal(got.Ok()) != "hunter2" {
+		t.Fatalf("readSecret answered %v", got)
+	}
+	if got := Reveal(TermReadSecretBypass()); got != "hunter2" {
+		t.Fatalf("readSecretBypass read %q", got)
 	}
 }
