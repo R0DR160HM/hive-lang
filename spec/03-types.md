@@ -317,7 +317,7 @@ into a `Str`.
 * `==` compares what two secrets hold, in constant time for a `Secret` itself.
   A `Secret` has no order, so `sort` and `<` refuse one.
 
-**Locked memory is finite**, so everything that makes a `Secret` answers a
+**Locked memory is finite**, so everything that locks a `Secret` answers a
 `Result`: `hide` answers `Result<Secret, SecretError>`, and so do
 `hive.term.readSecret` and `hive.crypto.randomSecret`. A `SecretError` has a
 `reason` — `"LimitExceeded"` when the locked-memory limit is used up,
@@ -326,11 +326,19 @@ A call that already fails in its own way reports it there instead:
 `hive.crypto.decrypt` as a `CryptoError` with that `reason`, and
 `hive.env.getSecret` as an `EnvironmentError`.
 
-`bypass(text)` is the one way to a `Secret` that cannot fail. It is a `Secret` in
-every other respect — never shown, compared the same way, accepted wherever one
-is — but kept in ordinary memory, which the operating system is free to swap out.
-It is for text that was never really secret on the way in: a literal, which the
-executable already holds, or a ciphertext that has to go where a `Secret` does.
+`bypass(text)` makes a `Secret` without locking anything, so it cannot fail. It
+is a `Secret` in every other respect — never shown, compared the same way,
+accepted wherever one is — but kept in ordinary memory, which the operating
+system is free to swap out. It is for text that was never really secret on the
+way in: a literal, which the executable already holds, or a ciphertext that has
+to go where a `Secret` does.
+
+Two library calls bypass the lock the same way: `hive.term.readSecretBypass`
+and `hive.crypto.decryptBypass` are `readSecret` and `decrypt` keeping what they
+make in ordinary memory, so neither runs into the limit. `readSecretBypass`
+answers a plain `Secret`, and `decryptBypass` fails only as `"Malformed"` or
+`"BadSignature"` ([14](14-stdlib.md)). They are for a program that would rather
+hold a secret in memory that may be swapped out than not hold it at all.
 
 What `reveal` answers with is an ordinary `Str`, and is kept like one. The text
 `hide` was handed was a `Str` too, so a secret typed into the source or read as

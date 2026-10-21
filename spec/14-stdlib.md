@@ -163,6 +163,10 @@ Line-oriented terminal I/O.
   through a `Str`. The echo is put back before the call returns, and also if the
   program is interrupted at the prompt. Where there is no terminal at all, the
   line is read exactly as `read()` reads it and only the hiding of it is lost.
+* `readSecretBypass()` → `Secret` is `readSecret()` into ordinary memory, as
+  [`bypass`](13-builtins.md#secrets-hide-bypass-reveal) is to `hide`: free to be
+  swapped out, so there is no limit to run into and it cannot fail. The echo is
+  turned off and put back the same way.
 * `args()` → `Str[dyn]`, the command-line arguments in order, excluding the
   program name.
 * `codec()` → `hive.codec.Codec<hive.term.FlagError>` says **read and write it
@@ -399,6 +403,10 @@ a digest, a ciphertext and a token are `Str`s, safe to print and store.
   same text under the same password never encrypts alike. GCM's tag travels with
   the ciphertext, so an edited message is rejected rather than opened into
   something else — `"BadSignature"`, which is also what a wrong password gives.
+  `decryptBypass(ciphertext, password: Secret)` → `Result<Secret, _>` is
+  `decrypt` opening it into ordinary memory, as
+  [`bypass`](13-builtins.md#secrets-hide-bypass-reveal) is to `hide`: free to be
+  swapped out, so it fails only as `"Malformed"` or `"BadSignature"`.
 * **Encoding** — `base64Encode`, `base64Decode`.
 * **Random** — `randomHex(bytes)`, and `randomSecret(bytes)` →
   `Result<Secret, SecretError>`, the same hex drawn and written in locked memory.
