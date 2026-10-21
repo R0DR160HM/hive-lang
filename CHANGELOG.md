@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.2.16 
 
-### v0.2.16
+### Language
 
 * **`switch` matches one or more values against arms**, each a pattern, a literal or `_` per value; the first arm that matches runs.
 * **A `switch` is always exhaustive**: a value no arm takes, and an arm that can never run, are compile errors.
