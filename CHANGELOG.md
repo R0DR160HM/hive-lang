@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.2.16 
+## v0.2.16
 
 ### Language
 
