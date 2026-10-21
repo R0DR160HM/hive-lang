@@ -1,10 +1,10 @@
 # 07 — Patterns
 
 `is` checks a value against a pattern. It is an ordinary expression yielding a
-`Bool`, so every match is written as a plain `if` / `else if` — there is no
-`match` or `case` statement. When it matches, it **narrows** the value and binds
-parts of it to fresh names, usable immediately: in the rest of the same
-condition after `&&`, and in the branch body.
+`Bool`, written in an `if` — or, for several values at once, as the arms of a
+[`switch`](06-statements.md#64-switch) ([7.8](#78-switch)). When it matches, it
+**narrows** the value and binds parts of it to fresh names, usable immediately:
+in the rest of the same condition after `&&`, and in the branch body.
 
 Four kinds of thing can be matched.
 
@@ -241,9 +241,53 @@ an `else`
 A binding introduced by `is` is:
 
 * **immutable** — it is a new name for part of a value, not storage;
-* in scope for the rest of the condition after `&&`, and for the branch body;
-* out of scope in an `else` branch, where the pattern did *not* match;
+* in scope for the rest of the condition after `&&`, and for the branch body —
+  a `switch` arm's body, for a position of one;
+* out of scope in an `else` branch, or any other arm, where the pattern did *not*
+  match;
 * held to the `Binding` naming rule: `camelCase`, or `_` to throw it away.
 
 Narrowing is per branch. A value typed as a union still has only the fields every
 variant shares outside a branch that narrowed it.
+
+## 7.8 `switch`
+
+A [`switch`](06-statements.md#64-switch)'s arms are held to two rules an `if`
+chain is not.
+
+**Every value has an arm.** Coverage is [7.6](#76-exhaustiveness)'s, taken over
+all the subjects together: an arm covers the values whose every subject its
+positions take, so `Shape.Point, _` covers each fill a point can have, and
+`_, Fill.None` each shape without one. Literals count as patterns do — `true`
+and `false` cover a `Bool` — and since no finite set of them covers a number,
+an atom or a string, a `switch` testing one with literals or templates ends with
+`_` for it. A `switch` that falls short is a compile error naming a value **no
+arm takes**:
+
+```hive
+switch shape, fill {
+	Shape.Circle(_), Fill.Solid(_) { ... }
+	Shape.Point, _                 { ... }
+}
+```
+
+```
+no arm of this `switch` takes `Shape.Circle(_), Fill.None`. Give that an arm of
+its own, or end the `switch` with `_, _`
+```
+
+Since a subject is evaluated once, a call is as good a subject as a variable
+here, which [7.6](#76-exhaustiveness) cannot say of an `if` chain.
+
+**Every arm can run.** An arm whose every value the arms above it already take
+is a compile error — one after `_, _`, a literal written twice, or
+`Shape.Circle(_), Fill.None` below `Shape.Circle(_), _`:
+
+```
+arm 3 of this `switch` can never run: the arms above it take every value it
+would. Take it out, or move it above the arm that takes its values
+```
+
+Only what coverage can tell apart is compared, so two string templates with
+holes are never found to overlap: the error is never wrong, though it can be
+missing.

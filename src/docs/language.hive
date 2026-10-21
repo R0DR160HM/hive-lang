@@ -64,8 +64,8 @@ func index(): Str {
 		| [types](types.md) | scalars, vectors, ~BT~Result~BT~, declared types, maps, what may be assigned to what |
 		| [declarations](declarations.md) | ~BT~type~BT~ ~BT~func~BT~ ~BT~proc~BT~ ~BT~query~BT~ ~BT~test~BT~, and returning on every path |
 		| [expressions](expressions.md) | operators, precedence, calls, named arguments, function values |
-		| [statements](statements.md) | bindings, assignment, ~BT~if~BT~, loops, ~BT~echo~BT~ / ~BT~assert~BT~ / ~BT~panic~BT~ |
-		| [patterns](patterns.md) | ~BT~is~BT~, its four pattern kinds, nesting them, narrowing, exhaustiveness |
+		| [statements](statements.md) | bindings, assignment, ~BT~if~BT~, ~BT~switch~BT~, loops, ~BT~echo~BT~ / ~BT~assert~BT~ / ~BT~panic~BT~ |
+		| [patterns](patterns.md) | ~BT~is~BT~, its four pattern kinds, nesting them, narrowing, exhaustiveness, a ~BT~switch~BT~'s coverage |
 		| [mutability](mutability.md) | ~BT~mut~BT~, mutex parameters, why a binding sometimes copies |
 		| [concurrency](concurrency.md) | ~BT~async~BT~, the await-all, ~BT~with timeout~BT~ |
 		| [bounds](bounds.md) | how every index and slice is proved in range |
@@ -126,7 +126,7 @@ func syntax(): Str {
 
 		~CODE~
 		import   proc     func     query    test     type
-		if       else     return   is       with
+		if       else     return   is       with     switch
 		void     true     false    echo     assert   panic
 		dyn      mut      async    await    for      in
 		each     bounds   break    continue
@@ -548,7 +548,9 @@ func declarations(): Str {
 		* ~BT~return~BT~;
 		* ~BT~panic~BT~, or a call to ~BT~hive.term.exit~BT~ — both handy for a tail you know
 		  is unreachable (an ~BT~assert~BT~ that holds carries on, so it does not count);
-		* an ~BT~if~BT~/~BT~else~BT~ whose every branch terminates; or
+		* an ~BT~if~BT~/~BT~else~BT~ whose every branch terminates;
+		* a ~BT~switch~BT~ whose every arm terminates — a ~BT~switch~BT~ takes every value of its
+		  subjects, so there is no path around it ([statements](statements.md)); or
 		* an **else-less** ~BT~if~BT~/~BT~else if~BT~ chain whose every branch terminates and whose
 		  patterns take every value of its subject — a ~BT~Result~BT~'s ~BT~Ok~BT~ and ~BT~Error~BT~,
 		  every variant of a declared union, nested as deep as they go
@@ -860,6 +862,30 @@ func statements(): Str {
 		~BT~is~BT~ in the condition are in scope in that branch's body and in the rest of the
 		same condition after ~BT~&&~BT~.
 
+		## ~BT~switch~BT~
+
+		~CODE~hive
+		switch shape, fill \{
+			Shape.Circle(r), Fill.Solid(color) \{ }
+			Shape.Point, _                     \{ }
+			_, _                               \{ }
+		}
+		~CODE~
+
+		Each subject is evaluated **exactly once**, left to right, before any arm is
+		tried. An arm has **one position per subject**, and a position is a pattern (as
+		after ~BT~is~BT~), a literal the value has to equal (~BT~0~BT~, ~BT~-1~BT~, ~BT~2.5~BT~, ~BT~#Ready~BT~,
+		~BT~true~BT~), or ~BT~_~BT~ for any value.
+
+		The **first** arm whose every position matches runs, and no other: no
+		fall-through, and ~BT~break~BT~ / ~BT~continue~BT~ act on the enclosing loop. An arm is the
+		~BT~if~BT~ its positions spell, so what it binds is in scope in its body only, and it
+		binds a name once across all its positions.
+
+		A ~BT~switch~BT~ is **always exhaustive** and **every arm can run** — falling short of
+		either is a compile error ([patterns](patterns.md)). So one whose every arm
+		returns is a terminating path.
+
 		## Loops
 
 		~CODE~hive
@@ -938,10 +964,10 @@ func patterns(): Str {
 		# Patterns
 
 		~BT~is~BT~ checks a value against a pattern. It is an ordinary expression yielding a
-		~BT~Bool~BT~, so **every match is a plain ~BT~if~BT~ / ~BT~else if~BT~ — there is no ~BT~match~BT~ or
-		~BT~case~BT~ statement**. When it matches it narrows the value and binds parts of it
-		to fresh names, usable in the rest of the same condition after ~BT~&&~BT~ and in the
-		branch body.
+		~BT~Bool~BT~, written in an ~BT~if~BT~ — or, for several values at once, as the arms of a
+		~BT~switch~BT~ ([statements](statements.md)). When it matches it narrows the value and
+		binds parts of it to fresh names, usable in the rest of the same condition after
+		~BT~&&~BT~ and in the branch body.
 
 		Four kinds of thing can be matched.
 
@@ -1070,6 +1096,21 @@ func patterns(): Str {
 
 		When a chain falls short, the error names a value no branch takes: ~BT~r~BT~ when it
 		is ~BT~Result.Ok(Foo.Baz)~BT~.
+
+		## ~BT~switch~BT~
+
+		A ~BT~switch~BT~'s arms are held to two rules a chain is not, both compile errors:
+
+		* **Every value has an arm.** Coverage is the chain's, over all the subjects
+		  together: ~BT~Shape.Point, _~BT~ covers a point with any fill. The error names a value
+		  no arm takes — ~BT~Shape.Circle(_), Fill.None~BT~ — and a subject that is a number, an
+		  atom or a string needs a ~BT~_~BT~ for it. A call is as good a subject as a variable,
+		  since it is evaluated once.
+		* **Every arm can run.** An arm the arms above it already take all of — anything
+		  after ~BT~_, _~BT~, a literal written twice — is refused by its number, ~BT~arm 3~BT~.
+
+		~BT~Fuzz.Variable()~BT~ still names no fields, so it only matches a variant that has
+		none; ~BT~Fuzz.Variable~BT~ or ~BT~Fuzz.Variable(_)~BT~ takes one whatever it carries.
 
 		## Narrowing and scope
 
@@ -2364,14 +2405,16 @@ func pitfalls(): Str {
 		~BT~proc~BT~. Calling one is fine either way.
 
 		**Every non-~BT~void~BT~ path must return.** An ~BT~if~BT~/~BT~else if~BT~ chain over a whole
-		union counts — and **adding an ~BT~else~BT~ to an exhaustive one is itself an error**.
+		union counts, and so does a ~BT~switch~BT~ whose every arm returns.
 
 		**~BT~mut~BT~ goes nowhere but a declaration and a ~BT~proc~BT~ parameter**: not on a field,
 		not on a return, not in a function type.
 
 		## Matching
 
-		**There is no ~BT~match~BT~ or ~BT~case~BT~.** Every match is ~BT~if x is …~BT~ / ~BT~else if~BT~.
+		**A ~BT~switch~BT~ never falls through and never misses a case.** Each arm has one
+		position per subject, the first arm that matches runs, a value no arm takes is a
+		compile error, and so is an arm that can never run.
 
 		**Name every field of a variant or none** — a partly written argument list is
 		refused. Use ~BT~_~BT~ for the ones you do not want.
@@ -2380,8 +2423,8 @@ func pitfalls(): Str {
 		~BT~Shape.Point~BT~ on its own names the variant rather than a value of it. →
 		~BT~Shape.Point()~BT~, or ~BT~Shape.Circle(_)~BT~ where a function value is wanted.
 
-		**Vector and string patterns never make a chain exhaustive**, so a function
-		matching on those still needs a terminating ~BT~else~BT~ or a final ~BT~return~BT~.
+		**String patterns never make a chain exhaustive** (bar a lone ~BT~"\{s}"~BT~), so a
+		function matching on those still needs a terminating ~BT~else~BT~ or a final ~BT~return~BT~.
 
 		**Two open string-pattern holes may not sit side by side** — ~BT~"\{a}\{b}"~BT~ is
 		ambiguous. Put a literal between them, or give one a regex.

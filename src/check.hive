@@ -80,7 +80,11 @@ proc checkTestTitles(c: mut Check, m: ast.Module): void {
 }
 
 proc report(c: mut Check, message: Str): void {
-	append(c.errors, diag.at(c.line, diag.inDecl(c.inside, message)))
+	reportAt(c, c.line, message)
+}
+
+proc reportAt(c: mut Check, line: Int, message: Str): void {
+	append(c.errors, diag.at(line, diag.inDecl(c.inside, message)))
 }
 
 // --- Declarations ------------------------------------------------------------
@@ -754,7 +758,7 @@ proc checkCallable(c: mut Check, env: infer.Env, name: Str, params: ast.Param[],
 	if missed != "" {
 		report(c, "`{name}` answers with " + types.show(c.result) + ", so every path through it has to return one, and no branch of the else-less `if` chain it ends with takes " + missed + ". Give that a branch of its own, or end the chain with an `else`")
 	} else {
-		report(c, "`{name}` answers with " + types.show(c.result) + ", so every path through it has to return one. A path terminates by ending in `return` or `panic`, in `hive.term.exit`, in an `if`/`else` whose every branch terminates, or in an else-less `if`/`else if` chain that covers its subject's whole type. An `assert` does not: one that holds carries on past it")
+		report(c, "`{name}` answers with " + types.show(c.result) + ", so every path through it has to return one. A path terminates by ending in `return` or `panic`, in `hive.term.exit`, in an `if`/`else` or a `switch` whose every branch terminates, or in an else-less `if`/`else if` chain that covers its subject's whole type. An `assert` does not: one that holds carries on past it")
 	}
 }
 
@@ -858,8 +862,71 @@ proc checkStmt(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
 			checkBlock(c, env, otherwise)
 		}
 		return env
+	} else if s is ast.Stmt.SwitchStmt(lets, subjects, arms, line) {
+		checkSwitch(c, env, lets, subjects, arms, line)
+		return env
 	}
 	return checkStmtTail(c, env, s)
+}
+
+proc checkSwitch(c: mut Check, env: infer.Env, lets: ast.Stmt[], subjects: ast.Expr[], arms: ast.Branch[], line: Int): void {
+	before := len(c.errors)
+	inner := checkLets(c, env, lets, line, 0)
+	for each subject in subjects {
+		checkExpr(c, inner, subject)
+	}
+	for each arm in arms {
+		checkCondition(c, inner, arm.condition)
+	}
+	// Coverage over a pattern already found wrong would only repeat the mistake.
+	clean := len(c.errors) == before
+	for each arm in arms {
+		checkBlock(c, afterCondition(inner, arm.condition), arm.body)
+	}
+	if clean {
+		checkCover(c, subjects, arms, line)
+	}
+}
+
+proc checkLets(c: mut Check, env: infer.Env, lets: ast.Stmt[], line: Int, at: Int): infer.Env {
+	if lets bounds at {
+		if lets[at] is ast.Stmt.VarDecl(name, value, _, _) {
+			checkExpr(c, env, value)
+			ty := infer.typeOf(env, value)
+			if ty is types.Ty.TVoid {
+				reportAt(c, line, "this `switch` tests a call that answers with nothing, so there is nothing for its arms to match")
+			}
+			return checkLets(c, infer.bound(env, name, ty), lets, line, at + 1)
+		}
+		return checkLets(c, env, lets, line, at + 1)
+	}
+	return env
+}
+
+proc checkCover(c: mut Check, subjects: ast.Expr[], arms: ast.Branch[], line: Int): void {
+	for each n in cover.deadArms(c.table, subjects, arms) {
+		reportAt(c, line, "arm {n} of this `switch` can never run: the arms above it take every value it would. Take it out, or move it above the arm that takes its values")
+	}
+	rest := wildcards(len(subjects))
+	if len(arms) == 0 {
+		reportAt(c, line, "this `switch` has no arms, and it has to take every value it tests — an arm of `{rest}` takes anything")
+		return
+	}
+	if cover.unmatched(c.table, subjects, arms) is Result.Ok(value) {
+		if value == rest {
+			reportAt(c, line, "the arms of this `switch` cannot take every value it tests: no finite set of patterns covers a number, an atom or a string, so a `switch` over one ends with `{rest}`")
+		} else {
+			reportAt(c, line, "no arm of this `switch` takes `{value}`. Give that an arm of its own, or end the `switch` with `{rest}`")
+		}
+	}
+}
+
+func wildcards(n: Int): Str {
+	mut Str[dyn] out = []
+	for i := 0; i < n; i++ {
+		append(out, "_")
+	}
+	return join(out, ", ")
 }
 
 // A call that answers with nothing leaves a name nothing to hold.
@@ -2354,7 +2421,7 @@ func segment(path: Str[], index: Int): Str {
 // --- Terminating paths -------------------------------------------------------
 
 // A path terminates by ending in `return`, `panic` or `hive.term.exit`, in an
-// `if`/`else` whose every branch terminates, or in an else-less `if`/`else if`
+// `if`/`else` or a `switch` whose every branch terminates, or in an else-less `if`/`else if`
 // chain that covers its subject's whole type. Not in an `assert`: one that holds
 // carries on past it, with nothing to answer.
 func terminates(t: types.Table, b: ast.Block): Bool {
@@ -2380,6 +2447,15 @@ func terminatesWith(t: types.Table, s: ast.Stmt): Bool {
 		}
 		return cover.covers(t, branches)
 	}
+	// A `switch` that falls short of its subjects is an error of its own.
+	if s is ast.Stmt.SwitchStmt(_, _, arms, _) {
+		for each arm in arms {
+			if terminates(t, arm.body) == false {
+				return false
+			}
+		}
+		return true
+	}
 	return false
 }
 
@@ -2398,6 +2474,13 @@ func missedAtEnd(t: types.Table, b: ast.Block): Str {
 				return missedAtEnd(t, otherwise)
 			}
 			return cover.missed(t, branches)
+		}
+		if b.stmts[last] is ast.Stmt.SwitchStmt(_, _, arms, _) {
+			for each arm in arms {
+				if terminates(t, arm.body) == false {
+					return missedAtEnd(t, arm.body)
+				}
+			}
 		}
 	}
 	return ""
