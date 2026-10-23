@@ -790,3 +790,19 @@ func TestCtrlOverAnEditorProbesTheCharacterUnderThePointer(t *testing.T) {
 		t.Fatalf("Ctrl down and up told %q", got)
 	}
 }
+
+// A code editor scrolled far down whose program then hands it a much shorter text
+// at the same place — another file's diff, say — paints the new text from the top
+// rather than asking for the lines of a scroll it no longer has.
+func TestACodeEditorScrolledPastItsNewTextPaintsWithoutPanicking(t *testing.T) {
+	long := strings.Repeat("line\n", 600)
+	n, _ := uiLaidOut(UiCode([]UiAttr{UiAttrNumbers(true)}, long, []UiRun{UiInk(0, 4, UiToneHex("#ff0000"))}), 400, 300)
+	f := n.fields["r/0"]
+	f.top = 470 * n.boxes["r/0"].lineH
+	uiShowAgain(n, UiCode([]UiAttr{UiAttrNumbers(true)}, "one line", []UiRun{UiInk(0, 3, UiToneHex("#ff0000"))}))
+	cv := &uiCanvas{pix: make([]uint32, 400*300), w: 400, h: 300, flush: func() {}}
+	n.paint(cv)
+	if f.top != 0 {
+		t.Fatalf("a one-line text is still scrolled to %.1f", f.top)
+	}
+}

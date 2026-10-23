@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.17
+
+### Fixes
+
+* **A code editor whose program shortens its text no longer crashes the native window.** `ui.code` keeps where it was scrolled when its program hands it a new text, and nothing held that to the new text's length: an editor scrolled to line 470 that was handed a text of one line — another file's diff, a file reloaded from disk — asked to paint lines 469 to 0, and the window died with `makeslice: len out of range`. The scroll is now held to the end of the text before every paint, and the lines to colour can no longer be counted below none.
+
 ## v0.2.16
 
 ### Language
