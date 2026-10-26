@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.18
+
+### Standard library
+
+* **`ui.figure(attrs, model, bones, paints)` draws a body out of a skinned glTF under `assets/`**: a person, an animal, anything made of bones and a skin. `bones` is three numbers a bone, each one's turn on top of how it stands in the file, so a program poses a body the way it places a box; `paints` is a colour a part — a part being one of the mesh's primitives — and a part painted see-through is neither drawn nor casts a shadow, so one file carries a shirt and the skin under it and a program shows the one it wants. Every figure of a file shares its geometry and is one draw.
+
 ## v0.2.17
 
 ### Fixes

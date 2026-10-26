@@ -12059,10 +12059,11 @@ func uiSceneSource(): Str {
 		// compiler refuses rather than something the renderer drops.
 		`
 		type UiShape struct \{
-			Kind  string
-			Attrs []UiAttr
-			Nums  []float64
-			Text  string
+			Kind   string
+			Attrs  []UiAttr
+			Nums   []float64
+			Text   string
+			Paints []UiTone
 		}
 
 		func UiBox(attrs []UiAttr, width float64, height float64, depth float64) UiShape \{
@@ -12112,6 +12113,21 @@ func uiSceneSource(): Str {
 
 		func UiLabel(attrs []UiAttr, words string) UiShape \{
 			return UiShape\{Kind: "label", Attrs: attrs, Text: words}
+		}
+		`,
+		// A body out of a skinned glTF under assets/: a person, an animal, anything
+		// made of bones and a skin over them, which no number of boxes stands in for
+		// once it is near.
+		//
+		// The bones are numbers, three a bone — its turn on top of how it stands in
+		// the file, in the file's order — so a program poses a body the way it places
+		// a box, and a walk is a walk worked out by the program rather than a clip
+		// played back by the renderer. The paints are a colour a part, a part being
+		// one of the mesh's primitives: a shirt in a colour, the skin under it in a
+		// colour that is see-through, and so not drawn at all.
+		`
+		func UiFigure(attrs []UiAttr, model string, bones []float64, paints []UiTone) UiShape \{
+			return UiShape\{Kind: "figure", Attrs: attrs, Text: model, Nums: bones, Paints: paints}
 		}
 		`,
 		// A sound at a place in the world: something in the scene that is heard from
@@ -12524,6 +12540,9 @@ func uiSceneSource(): Str {
 			if s.Text != "" \{
 				mask |= uiSceneHasWords
 			}
+			if len(s.Paints) > 0 \{
+				mask |= uiSceneHasPaints
+			}
 			uiPackU8(b, uiSceneKindCode(s.Kind))
 			uiPackU8(b, mask)
 		`,
@@ -12555,6 +12574,12 @@ func uiSceneSource(): Str {
 			if mask&uiSceneHasWords != 0 \{
 				uiPackLong(b, s.Text)
 			}
+			if mask&uiSceneHasPaints != 0 \{
+				uiPackU8(b, len(s.Paints))
+				for _, t := range s.Paints \{
+					uiPackWord(b, uiSceneTone(string(t), "#cfd6de"))
+				}
+			}
 		}
 		`,
 		// The kinds as numbers, which of a shape's parts its record carries, and which
@@ -12573,6 +12598,7 @@ func uiSceneSource(): Str {
 			uiSceneSound    = 7
 			uiSceneSprite   = 8
 			uiSceneRoof     = 9
+			uiSceneFigure   = 10
 
 			uiSceneHasAt      = 1
 			uiSceneHasTurn    = 2
@@ -12581,6 +12607,7 @@ func uiSceneSource(): Str {
 			uiSceneHasWords   = 16
 			uiSceneHasVoice   = 32
 			uiSceneHasTrack   = 64
+			uiSceneHasPaints  = 128
 
 			uiSceneEyeLens = 1
 			uiSceneEyeFog  = 2
@@ -12614,6 +12641,8 @@ func uiSceneSource(): Str {
 				return uiSceneSound
 			case "roof":
 				return uiSceneRoof
+			case "figure":
+				return uiSceneFigure
 			}
 			return uiSceneBox
 		}
@@ -13315,10 +13344,10 @@ func uiSceneJs(): Str {
 		// The kinds and the bits, exactly as uiSceneShape and uiSceneCamera write them.
 		`
 		var KINDS = ["box", "sphere", "cylinder", "cone", "ground", "label", "line",
-		  "sound", "sprite", "roof"];
+		  "sound", "sprite", "roof", "figure"];
 		var SOUND = 7;
 		var HAS_AT = 1, HAS_TURN = 2, HAS_SIZE = 4, HAS_SURFACE = 8, HAS_WORDS = 16,
-		  HAS_VOICE = 32, HAS_TRACK = 64;
+		  HAS_VOICE = 32, HAS_TRACK = 64, HAS_PAINTS = 128;
 		var EYE_LENS = 1, EYE_FOG = 2, EYE_SKY = 4, EYE_GRAB = 8, EYE_FLAT = 16,
 		  EYE_GRAIN = 32, EYE_BITS = 64;
 		`,
@@ -13355,7 +13384,7 @@ func uiSceneJs(): Str {
 		// one of these rather than one per shape per frame.
 		`
 		var scratch = \{k: "box", c: "", p: [0, 0, 0], r: [0, 0, 0], d: [1, 1, 1],
-		  s: "", x: "", turned: false};
+		  s: "", x: "", t: [], turned: false};
 
 		function paint(frame) \{
 		  reading = new DataView(frame);
@@ -13394,7 +13423,10 @@ func uiSceneJs(): Str {
 		`
 		function forget() \{
 		  var kids = flock.children;
-		  for (var i = 0; i < kids.length; i++) \{ kids[i].parent = null; }
+		  for (var i = 0; i < kids.length; i++) \{
+		    kids[i].parent = null;
+		    if (kids[i].userData.kind === "figure") \{ retire(kids[i]); }
+		  }
 		  kids.length = 0;
 		  batches.forEach(function (b) \{
 		    for (var j = 0; j < b.seats.length; j++) \{ b.seats[j].index = -1; }
@@ -13518,6 +13550,8 @@ func uiSceneJs(): Str {
 		    var n = readU8();
 		    d.length = n;
 		    for (var i = 0; i < n; i++) \{ d[i] = readF32(); }
+		  } else if (s.k === "figure") \{
+		    d.length = 0;
 		  } else \{
 		    d.length = 3;
 		    d[0] = 1;
@@ -13526,6 +13560,8 @@ func uiSceneJs(): Str {
 		  }
 		  s.s = (mask & HAS_SURFACE) ? readWord() : "";
 		  s.x = (mask & HAS_WORDS) ? readLong() : "";
+		  s.t.length = (mask & HAS_PAINTS) ? readU8() : 0;
+		  for (var j = 0; j < s.t.length; j++) \{ s.t[j] = readWord(); }
 		  var o = live[at];
 		  if (!fits(o, s)) \{
 		    if (o) \{ shed(o); }
@@ -13565,6 +13601,7 @@ func uiSceneJs(): Str {
 		  kids.length = kids.length - 1;
 		  o.parent = null;
 		  o.userData.spot = -1;
+		  if (o.userData.kind === "figure") \{ retire(o); }
 		}
 		`,
 		// A seat: an opaque solid's place in its batch. It stands in a slot exactly as
@@ -13782,6 +13819,7 @@ func uiSceneJs(): Str {
 		  if (s.k === "line") \{ return true; }
 		  if (s.k === "label") \{ return u.words === s.x && u.tint === s.c; }
 		  if (s.k === "sprite") \{ return u.words === s.x && u.dims[0] === s.d[0] && u.dims[1] === s.d[1]; }
+		  if (s.k === "figure") \{ return u.words === s.x; }
 		  return u.key === keyOf(s);
 		}
 
@@ -13840,6 +13878,8 @@ func uiSceneJs(): Str {
 		      color: new THREE.Color(s.c || "#ffffff")}));
 		    made.center.set(0.5, 0);
 		    made.scale.set(s.d[0] || 1, s.d[1] || 1, 1);
+		  } else if (s.k === "figure") \{
+		    made = figureOf(s.x || "");
 		  } else if (solidity(s.c) >= 1) \{
 		    var chair = \{batch: batchOf(formOf(s), finishOf(s)), index: -1, visible: true,
 		      userData: \{kind: s.k, key: keyOf(s), tint: ""}};
@@ -13873,6 +13913,282 @@ func uiSceneJs(): Str {
 		}
 
 		`,
+		// A figure is a body out of a file: a skinned glTF under assets/, read once
+		// and shared by everybody drawn with it, each with bones of their own. What
+		// stands in the slot is a group, placed as any shape is, and the body is put
+		// in it when the file has arrived — until then it is somebody not there yet,
+		// and a file that never arrives is nobody, as a sprite whose picture is
+		// missing is no picture.
+		//
+		// **One draw a body, whatever it is wearing.** The file's primitives are its
+		// parts, and they are read into one geometry with the part each vertex is in
+		// beside it; the paints are a colour a part, handed to the shader as one array,
+		// so a man in a shirt, trousers and shoes is a single draw, and a second in
+		// other colours is a second draw of the same program. A part painted
+		// see-through is not drawn at all — its triangles are put where nothing is
+		// drawn — and casts no shadow either, so what a figure is not wearing is not
+		// there to show through what it is.
+		//
+		// A figure's material and its bones are its own, so one that goes is kept for
+		// the next to come in wearing the same file, rather than made again: people
+		// come and go all the time.
+		`
+		var models = new Map(), spares = new Map(), PARTS = 32;
+
+		function modelOf(path) \{
+		  var m = models.get(path);
+		  if (m) \{ return m; }
+		  m = \{ready: false, waiting: [], geo: null, joints: [], inverses: [], tints: null};
+		  models.set(path, m);
+		  fetch("/_hive/asset/" + path.split("/").map(encodeURIComponent).join("/"))
+		    .then(function (r) \{ if (!r.ok) \{ throw new Error(r.status); } return r.arrayBuffer(); })
+		    .then(function (buf) \{
+		      readModel(m, buf);
+		      m.ready = true;
+		      for (var i = 0; i < m.waiting.length; i++) \{ embody(m.waiting[i]); }
+		      m.waiting.length = 0;
+		      dirty = true;
+		    })
+		    .catch(function () \{ m.waiting.length = 0; });
+		  return m;
+		}
+
+		function figureOf(path) \{
+		  var pool = spares.get(path);
+		  if (pool && pool.length) \{ return pool.pop(); }
+		  var o = new THREE.Group(), m = modelOf(path);
+		  o.userData.model = m;
+		  o.userData.pose = [];
+		  o.userData.paints = [];
+		  o.userData.painted = [];
+		  if (m.ready) \{ embody(o); } else \{ m.waiting.push(o); }
+		  return o;
+		}
+
+		function retire(o) \{
+		  var pool = spares.get(o.userData.words);
+		  if (!pool) \{ pool = []; spares.set(o.userData.words, pool); }
+		  pool.push(o);
+		}
+		`,
+		// A glTF binary: its JSON, and the buffer every accessor reads from. What is
+		// read is what a skinned body needs — places, normals, colours, joints,
+		// weights and triangles — and every primitive of the mesh the skin is on,
+		// each a part.
+		`
+		function readModel(m, buf) \{
+		  var view = new DataView(buf), at = 12, doc = null, bin = null;
+		  while (at + 8 <= buf.byteLength) \{
+		    var size = view.getUint32(at, true), kind = view.getUint32(at + 4, true);
+		    if (kind === 0x4E4F534A) \{ doc = JSON.parse(utf8.decode(new Uint8Array(buf, at + 8, size))); }
+		    if (kind === 0x004E4942) \{ bin = buf.slice(at + 8, at + 8 + size); }
+		    at += 8 + size;
+		  }
+		  function read(i) \{
+		    var a = doc.accessors[i], v = doc.bufferViews[a.bufferView];
+		    var wide = \{SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4, MAT4: 16}[a.type];
+		    var Kind = \{5121: Uint8Array, 5123: Uint16Array, 5125: Uint32Array, 5126: Float32Array}[a.componentType];
+		    var each = wide * Kind.BYTES_PER_ELEMENT, step = v.byteStride || each;
+		    var from = (v.byteOffset || 0) + (a.byteOffset || 0), out = new Kind(a.count * wide);
+		    if (step === each) \{ out.set(new Kind(bin.slice(from, from + a.count * each))); }
+		    else \{
+		      for (var k = 0; k < a.count; k++) \{
+		        out.set(new Kind(bin.slice(from + k * step, from + k * step + each)), k * wide);
+		      }
+		    }
+		    var top = a.normalized ? \{5121: 255, 5123: 65535}[a.componentType] || 1 : 1;
+		    return \{array: out, wide: wide, top: top};
+		  }
+		  var nodes = doc.nodes, holder = null;
+		  for (var n = 0; n < nodes.length; n++) \{
+		    if (nodes[n].skin !== undefined && nodes[n].mesh !== undefined) \{ holder = nodes[n]; break; }
+		  }
+		  var skin = doc.skins[holder.skin], prims = doc.meshes[holder.mesh].primitives;
+		  var count = 0, corners = 0;
+		  prims.forEach(function (p) \{
+		    var many = doc.accessors[p.attributes.POSITION].count;
+		    count += many;
+		    corners += p.indices !== undefined ? doc.accessors[p.indices].count : many;
+		  });
+		  var pos = new Float32Array(count * 3), nrm = new Float32Array(count * 3);
+		  var col = new Uint8Array(count * 3).fill(255), bones = new Uint16Array(count * 4);
+		  var weights = new Float32Array(count * 4), parts = new Uint8Array(count);
+		  var index = count > 65535 ? new Uint32Array(corners) : new Uint16Array(corners);
+		  var base = 0, put = 0, normals = true;
+		  m.tints = new Float32Array(PARTS * 4).fill(1);
+		  prims.forEach(function (p, k) \{
+		    var q = p.attributes, many = doc.accessors[q.POSITION].count, i, c;
+		    pos.set(read(q.POSITION).array, base * 3);
+		    if (q.NORMAL !== undefined) \{ nrm.set(read(q.NORMAL).array, base * 3); } else \{ normals = false; }
+		    if (q.COLOR_0 !== undefined) \{
+		      var C = read(q.COLOR_0), scale = C.top === 1 ? 255 : 255 / C.top;
+		      for (i = 0; i < many; i++) \{
+		        for (c = 0; c < 3; c++) \{ col[(base + i) * 3 + c] = Math.round(C.array[i * C.wide + c] * scale); }
+		      }
+		    }
+		    bones.set(read(q.JOINTS_0).array, base * 4);
+		    var W = read(q.WEIGHTS_0);
+		    for (i = 0; i < many * 4; i++) \{ weights[base * 4 + i] = W.array[i] / W.top; }
+		    parts.fill(Math.min(k, PARTS - 1), base, base + many);
+		    if (p.indices !== undefined) \{
+		      var I = read(p.indices).array;
+		      for (i = 0; i < I.length; i++) \{ index[put + i] = I[i] + base; }
+		      put += I.length;
+		    } else \{
+		      for (i = 0; i < many; i++) \{ index[put + i] = base + i; }
+		      put += many;
+		    }
+		    var mat = p.material !== undefined ? doc.materials[p.material] : null;
+		    var own = mat && mat.pbrMetallicRoughness && mat.pbrMetallicRoughness.baseColorFactor;
+		    if (own && k < PARTS) \{ m.tints.set([own[0], own[1], own[2], 1], k * 4); }
+		    base += many;
+		  });
+		  var g = new THREE.BufferGeometry();
+		  g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+		  g.setAttribute("normal", new THREE.BufferAttribute(nrm, 3));
+		  g.setAttribute("color", new THREE.BufferAttribute(col, 3, true));
+		  g.setAttribute("skinIndex", new THREE.BufferAttribute(bones, 4));
+		  g.setAttribute("skinWeight", new THREE.BufferAttribute(weights, 4));
+		  g.setAttribute("part", new THREE.BufferAttribute(parts, 1));
+		  g.setIndex(new THREE.BufferAttribute(index, 1));
+		  if (!normals) \{ g.computeVertexNormals(); }
+		  m.geo = g;
+		`,
+		// The bones, as the file stands them. A bone whose parent is not one of the
+		// skin's joints stands where it does in the file's world — whatever holds the
+		// skeleton up, an armature turned to stand the right way up, turned with it.
+		`
+		  var upOf = [], joints = skin.joints;
+		  nodes.forEach(function (nd, i) \{ (nd.children || []).forEach(function (c) \{ upOf[c] = i; }); });
+		  function local(i) \{
+		    var nd = nodes[i], mx = new THREE.Matrix4();
+		    if (nd.matrix) \{ mx.fromArray(nd.matrix); }
+		    else \{
+		      mx.compose(new THREE.Vector3().fromArray(nd.translation || [0, 0, 0]),
+		        new THREE.Quaternion().fromArray(nd.rotation || [0, 0, 0, 1]),
+		        new THREE.Vector3().fromArray(nd.scale || [1, 1, 1]));
+		    }
+		    return mx;
+		  }
+		  m.joints = joints.map(function (i) \{
+		    var mx = local(i), up = upOf[i];
+		    var parent = up === undefined ? -1 : joints.indexOf(up);
+		    if (parent < 0) \{
+		      for (; up !== undefined; up = upOf[up]) \{ mx.premultiply(local(up)); }
+		    }
+		    var j = \{parent: parent, t: new THREE.Vector3(), r: new THREE.Quaternion(), s: new THREE.Vector3()};
+		    mx.decompose(j.t, j.r, j.s);
+		    return j;
+		  });
+		  var inv = read(skin.inverseBindMatrices).array;
+		  m.inverses = joints.map(function (_, k) \{ return new THREE.Matrix4().fromArray(inv, k * 16); });
+		}
+		`,
+		// A body for one figure: its own bones, its own material — the paints are
+		// its own — and the shared geometry. Its bounds are a sphere about it as it
+		// stands, wide enough for an arm flung up: worked out from the bones it would
+		// be a walk over every vertex each time the body moved.
+		`
+		var PAINTED = "attribute float part;\nuniform vec4 paints[" + PARTS + "];\n";
+		var UNPAINTED = "if (paints[int(part + 0.5)].a < 0.5) \{ gl_Position = vec4(2.0, 2.0, 2.0, 1.0); }";
+
+		function embody(o) \{
+		  var m = o.userData.model, u = o.userData;
+		  var bones = m.joints.map(function (j) \{
+		    var b = new THREE.Bone();
+		    b.position.copy(j.t);
+		    b.quaternion.copy(j.r);
+		    b.scale.copy(j.s);
+		    return b;
+		  });
+		  var tints = \{value: m.tints.slice()};
+		  var look = new THREE.MeshStandardMaterial(\{vertexColors: true, roughness: 0.72, metalness: 0});
+		  look.onBeforeCompile = function (shader) \{
+		    shader.uniforms.paints = tints;
+		    shader.vertexShader = shader.vertexShader
+		      .replace("#include <common>", "#include <common>\n" + PAINTED + "varying vec3 vPaint;")
+		      .replace("#include <project_vertex>", "#include <project_vertex>\nvPaint = paints[int(part + 0.5)].rgb;\n" + UNPAINTED);
+		    shader.fragmentShader = shader.fragmentShader
+		      .replace("#include <common>", "#include <common>\nvarying vec3 vPaint;")
+		      .replace("#include <color_fragment>", "#include <color_fragment>\ndiffuseColor.rgb *= vPaint;");
+		  };
+		  var caster = new THREE.MeshDepthMaterial(\{depthPacking: THREE.RGBADepthPacking});
+		  caster.onBeforeCompile = function (shader) \{
+		    shader.uniforms.paints = tints;
+		    shader.vertexShader = shader.vertexShader
+		      .replace("#include <common>", "#include <common>\n" + PAINTED)
+		      .replace("#include <project_vertex>", "#include <project_vertex>\n" + UNPAINTED);
+		  };
+		  var body = new THREE.SkinnedMesh(m.geo, look);
+		  bones.forEach(function (b, k) \{
+		    var up = m.joints[k].parent;
+		    if (up >= 0) \{ bones[up].add(b); } else \{ body.add(b); }
+		  });
+		  body.bind(new THREE.Skeleton(bones, m.inverses), new THREE.Matrix4());
+		  body.customDepthMaterial = caster;
+		  body.castShadow = true;
+		  body.receiveShadow = true;
+		  body.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0.9, 0), 1.6);
+		  body.matrixAutoUpdate = false;
+		  o.add(body);
+		  u.body = body;
+		  u.bones = bones;
+		  u.tints = tints;
+		  u.painted.length = 0;
+		  mats.set("figure|" + o.id, look);
+		  mats.set("figure|" + o.id + "|cast", caster);
+		  posed(o);
+		}
+		`,
+		// What a frame says of a figure, kept, and put on its bones and in its paints
+		// if it has a body yet: each bone turned by its three numbers on top of how it
+		// stands, and each part painted, or the file's own colour where the frame says
+		// nothing of it. A colour is only worked out again when it has changed.
+		`
+		var boneSpin = new THREE.Euler(0, 0, 0, "YXZ"), boneTurn = new THREE.Quaternion();
+
+		function posed(o, s) \{
+		  var u = o.userData, k;
+		  if (s) \{
+		    u.pose.length = s.d.length;
+		    for (k = 0; k < s.d.length; k++) \{ u.pose[k] = s.d[k]; }
+		    u.paints.length = s.t.length;
+		    for (k = 0; k < s.t.length; k++) \{ u.paints[k] = s.t[k]; }
+		  }
+		  if (!u.body) \{ return; }
+		  var joints = u.model.joints, d = u.pose;
+		  for (k = 0; k < u.bones.length; k++) \{
+		    var b = u.bones[k];
+		    b.quaternion.copy(joints[k].r);
+		    if (k * 3 + 2 < d.length) \{
+		      boneSpin.set(d[k * 3], d[k * 3 + 1], d[k * 3 + 2]);
+		      b.quaternion.multiply(boneTurn.setFromEuler(boneSpin));
+		    }
+		  }
+		  var tints = u.tints.value, changed = false;
+		  for (k = 0; k < PARTS; k++) \{
+		    var c = k < u.paints.length ? u.paints[k] : "";
+		    if (u.painted[k] === c) \{ continue; }
+		    u.painted[k] = c;
+		    changed = true;
+		    if (c) \{
+		      hue.setStyle(bare(c));
+		      tints[k * 4] = hue.r;
+		      tints[k * 4 + 1] = hue.g;
+		      tints[k * 4 + 2] = hue.b;
+		      tints[k * 4 + 3] = solidity(c);
+		    } else \{
+		      for (var i = 0; i < 4; i++) \{ tints[k * 4 + i] = u.model.tints[k * 4 + i]; }
+		    }
+		  }
+		  if (changed) \{
+		    u.body.material.uniformsNeedUpdate = true;
+		    u.body.customDepthMaterial.uniformsNeedUpdate = true;
+		  }
+		}
+
+		`,
+
 		// Every solid of a kind is one geometry a unit across, and its size is in its
 		// matrix. A geometry per size was one per tree a few minutes into a forest —
 		// three thousand of them, kept for good — and an instanced batch needs one
@@ -14141,6 +14457,11 @@ func uiSceneJs(): Str {
 		  }
 		  if (s.turned) \{ o.rotation.set(s.r[0], s.r[1], s.r[2]); }
 		  else if (o.rotation.x || o.rotation.y || o.rotation.z) \{ o.rotation.set(0, 0, 0); }
+		  if (s.k === "figure") \{
+		    o.updateMatrix();
+		    posed(o, s);
+		    return;
+		  }
 		  stretch(s, o.scale);
 		  o.updateMatrix();
 		`,
