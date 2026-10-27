@@ -63,6 +63,8 @@ file, plus a generated `hive` runtime package.
 | `Msg.Changed(_)` (a constructor hole) | `func(_h0 string) Msg { return Msg(MsgChanged{Text: _h0}) }` |
 | `ui.row(attrs, kids)` / `ui.Tone.Danger()` | `hive.UiRow(..)` / `hive.Tone("Danger")` |
 | `Result<T, E>`, `Table`, `hive.file.TableError` | provided by the runtime package |
+| `hive.file.FileError` and the library's other error unions | a union declared in the program like any other, plus `lift_hive_file_FileError`, which turns the runtime's struct — its `Reason` naming the variant — into one; a call answering with one is wrapped in `hive.LiftBad(.., lift_..)` |
+| `Address<M>` | `hive.SyslinkAddress`, whatever `M` is: the mailbox type is the checker's, and the digest on the wire guards it at run time |
 
 ## 15.2 Two rules worth stating outside the table
 

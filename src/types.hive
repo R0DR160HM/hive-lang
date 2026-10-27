@@ -41,8 +41,8 @@ type Ty {
 	// An opaque type the standard library owns: `hive.net.HttpRequest`,
 	// `hive.sql.SqlConnection`. Carried and compared by name.
 	TLib { module: Str, name: Str }
-	// `Address` — a service, which a call sends to.
-	TAddress
+	// `Address<M>` — a service taking messages of `M`, which a call sends to.
+	TAddress { message: Ty }
 	// `Secret` — text kept out of swap, which nothing prints.
 	TSecret
 	// A type variable, which is what makes a callable generic in it.
@@ -232,9 +232,14 @@ func isBuiltinType(name: Str): Bool {
 		|| name == "Secret" || name == "SecretError"
 }
 
-// What making a `Secret` fails with: a library type the core owns, so of no module.
+// What making a `Secret` fails with: a union the core declares, so of no module.
 func secretError(): Ty {
-	return Ty.TLib("", "SecretError")
+	return libraryError("", "SecretError")
+}
+
+// One of the library's error unions, under the name the loader flattens it in as.
+func libraryError(module: Str, name: Str): Ty {
+	return Ty.TNamed("hive_" + module + "_" + name)
 }
 
 // --- Resolving a written type ------------------------------------------------
@@ -282,7 +287,7 @@ func resolveBase(t: Table, pkg: Str, name: Str, args: ast.TypeExpr[]): Ty {
 	}
 	// The long name, which a program declaring its own `Address` still has.
 	if pkg == "hive" && name == "Address" {
-		return Ty.TAddress()
+		return Ty.TAddress(argAt(t, args, 0))
 	}
 	if pkg == "hive" && name == "Secret" {
 		return Ty.TSecret()
@@ -314,7 +319,7 @@ func resolveBare(t: Table, name: Str, args: ast.TypeExpr[]): Ty {
 	}
 	// After the declarations, which win over a builtin here as everywhere.
 	if name == "Address" {
-		return Ty.TAddress()
+		return Ty.TAddress(argAt(t, args, 0))
 	}
 	if name == "Secret" {
 		return Ty.TSecret()
@@ -353,8 +358,8 @@ func toWritten(ty: Ty): ast.TypeExpr {
 		}
 		return ast.TypeExpr.Named("hive." + module, name, [], [])
 	}
-	if ty is Ty.TAddress {
-		return ast.TypeExpr.Named("hive", "Address", [], [])
+	if ty is Ty.TAddress(message) {
+		return ast.TypeExpr.Named("hive", "Address", [toWritten(message)], [])
 	}
 	if ty is Ty.TSecret {
 		return ast.TypeExpr.Named("hive", "Secret", [], [])
@@ -429,7 +434,9 @@ func show(ty: Ty): Str {
 		}
 		return "hive.{module}.{name}"
 	}
-	else if ty is Ty.TAddress { return "Address" }
+	// What `kill` and `monitor` take: an address of any service at all.
+	else if ty is Ty.TAddress(Ty.TUnknown) { return "Address<M>" }
+	else if ty is Ty.TAddress(message) { return "Address<" + show(message) + ">" }
 	else if ty is Ty.TSecret { return "Secret" }
 	else if ty is Ty.TVec(element, dim) { return show(element) + showDim(dim) }
 	else if ty is Ty.TResult(ok, bad) { return "Result<" + show(ok) + ", " + show(bad) + ">" }
@@ -463,6 +470,10 @@ func shownName(name: Str): Str {
 	module := text.charAt(parts, 1)
 	if len(parts) == 3 && text.charAt(parts, 0) == "hive" && text.isLower(text.charAt(text.chars(module), 0)) {
 		return "hive.{module}." + text.charAt(parts, 2)
+	}
+	// The core's own, which belong to no module: `SecretError`.
+	if len(parts) == 3 && text.charAt(parts, 0) == "hive" && module == "" {
+		return text.charAt(parts, 2)
 	}
 	return name
 }
@@ -630,7 +641,10 @@ func same(a: Ty, b: Ty): Bool {
 		if b is Ty.TLib(bModule, bName) { return aModule == bModule && aName == bName }
 		return false
 	}
-	if a is Ty.TAddress { return b is Ty.TAddress }
+	if a is Ty.TAddress(aMessage) {
+		if b is Ty.TAddress(bMessage) { return same(aMessage, bMessage) }
+		return false
+	}
 	if a is Ty.TSecret { return b is Ty.TSecret }
 	if a is Ty.TVec(aElement, aDim) {
 		if b is Ty.TVec(bElement, bDim) { return same(aElement, bElement) && sameDim(aDim, bDim) }
@@ -888,7 +902,7 @@ func orderedIn(t: Table, ty: Ty, enumerated: func(Str, Str): Bool, seen: Str[]):
 	if ty is Ty.TLib(module, name) {
 		return enumerated(module, name)
 	}
-	if ty is Ty.TFragment(_) || ty is Ty.TCodec(_) || ty is Ty.TVoid || ty is Ty.TAddress || ty is Ty.TSecret {
+	if ty is Ty.TFragment(_) || ty is Ty.TCodec(_) || ty is Ty.TVoid || ty is Ty.TAddress(_) || ty is Ty.TSecret {
 		return false
 	}
 	if ty is Ty.TVec(element, _) {

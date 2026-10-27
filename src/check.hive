@@ -419,6 +419,12 @@ proc checkLibTypes(c: mut Check, ty: types.Ty): void {
 			checkLibTypes(c, p)
 		}
 		checkLibTypes(c, result)
+	} else if ty is types.Ty.TAddress(message) {
+		if message is types.Ty.TUnknown {
+			report(c, "an address says what its service takes: `Address<M>`, with `M` the type of its messages")
+		} else {
+			checkLibTypes(c, message)
+		}
 	}
 }
 
@@ -827,6 +833,10 @@ proc checkStmt(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
 		// to land somewhere that says.
 		if isEmptyMap(value) {
 			report(c, "`hive.map.new()` has to land somewhere that says what it holds: a declaration (`hive.map.Map<Str, Int> m = hive.map.new()`), a `return` whose callable declares a map, or an argument to a parameter declared as one. A `:=` binding reads the type off the value, and this one has none to give")
+		}
+		// A name says where a service is, and nothing about what it takes.
+		if isAtCall(value) && ty is types.Ty.TAddress(types.Ty.TUnknown) {
+			report(c, "`at` has to land somewhere that says what the service takes: a declaration (`Address<Op> counter = at(#Counter)`), a `return` whose callable declares an address, or an argument to a parameter or field declared as one. A `:=` binding reads the type off the value, and this one has none to give")
 		}
 		checkHoldsValue(c, name, ty, deferred)
 		declareName(c, name)
@@ -1270,7 +1280,7 @@ proc checkMember(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str): v
 
 func hasNoFields(ty: types.Ty): Bool {
 	return ty is types.Ty.TStr || ty is types.Ty.TInt || ty is types.Ty.TFloat
-		|| ty is types.Ty.TBool || ty is types.Ty.TAtom || ty is types.Ty.TAddress
+		|| ty is types.Ty.TBool || ty is types.Ty.TAtom || ty is types.Ty.TAddress(_)
 		|| ty is types.Ty.TSecret
 		|| ty is types.Ty.TFn(_, _, _, _) || ty is types.Ty.TVec(_, _)
 		|| ty is types.Ty.TResult(_, _) || ty is types.Ty.TMap(_, _)
@@ -1412,6 +1422,9 @@ proc checkCall(c: mut Check, env: infer.Env, callee: ast.Expr, args: ast.Arg[]):
 		}
 		checkExpr(c, env, a.value)
 	}
+	if infer.typeOf(env, callee) is types.Ty.TAddress(mailbox) {
+		checkSend(c, env, callee, mailbox, args)
+	}
 	if callee is ast.Expr.Ident(name) {
 		checkNamedCall(c, env, name, args)
 		return
@@ -1424,6 +1437,21 @@ proc checkCall(c: mut Check, env: infer.Env, callee: ast.Expr, args: ast.Arg[]):
 	if infer.typeOf(env, callee) is types.Ty.TFn(_, params, mutexes, _) {
 		checkValueArguments(c, env, "this function value", params, mutexes, args)
 	}
+}
+
+// A send carries one message, of the type the address says its service takes.
+proc checkSend(c: mut Check, env: infer.Env, callee: ast.Expr, mailbox: types.Ty, args: ast.Arg[]): void {
+	if len(args) != 1 {
+		report(c, "a send carries one message, and this passes " + countOf(len(args)))
+		return
+	}
+	if mailbox is types.Ty.TUnknown {
+		if isAtCall(callee) {
+			report(c, "`at` says where a service is and nothing about what it takes, so a message cannot be sent straight to what it answers with. Land it somewhere that says: `Address<Op> counter = at(#Counter)`")
+		}
+		return
+	}
+	fits(c, mailbox, typeOfArg(c, env, args, 0), "the message sent to an `" + types.show(types.Ty.TAddress(mailbox)) + "`")
 }
 
 proc checkNamedCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): void {
@@ -1463,7 +1491,7 @@ proc checkCallableValue(c: mut Check, env: infer.Env, name: Str): void {
 	if ty is types.Ty.TVar(_) {
 		return
 	}
-	if ty is types.Ty.TAddress {
+	if ty is types.Ty.TAddress(_) {
 		return
 	}
 	report(c, "`{name}` here is " + types.show(ty) + ", which is not something a call can reach through. A local binding shadows a declaration of the same name, so the `{name}` this calls is the one bound above it rather than any callable")
@@ -1629,6 +1657,12 @@ proc checkLibraryArguments(c: mut Check, env: infer.Env, module: Str, name: Str,
 	if module == "ui" && (name == "window" || name == "webview") && len(args) == 3 {
 		checkWindow(c, env, name, ast.argFor(args, "", 1), ast.argFor(args, "", 2))
 	}
+	// The notice is posted to the watcher, so it is one of the watcher's messages.
+	if module == "syslink" && name == "monitor" && len(args) == 3 {
+		if infer.typeOf(env, ast.argFor(args, "", 0)) is types.Ty.TAddress(mailbox) {
+			fits(c, mailbox, typeOfArg(c, env, args, 2), "the notice `hive.syslink.monitor` posts to the watcher")
+		}
+	}
 	if stdlib.signatureOf(module, name) is Result.Ok(wanted) {
 		if len(args) != len(wanted) {
 			report(c, "`hive.{module}.{name}` takes " + countOf(len(wanted)) + ", and this call passes " + countOf(len(args)))
@@ -1688,7 +1722,7 @@ proc checkHandler(c: mut Check, env: infer.Env, starts: Str, handler: ast.Expr):
 	if ty is types.Ty.TUnknown {
 		return false
 	}
-	shape := "`proc(mut S, M): M`, or `proc(mut S, M, Address): M` to be handed its own address"
+	shape := "`proc(mut S, M): M`, or `proc(mut S, M, Address<M>): M` to be handed its own address"
 	if ty is types.Ty.TFn(_, params, mutexes, result) {
 		if len(params) != 2 && len(params) != 3 {
 			report(c, "{starts} wants a handler of the shape " + shape + ", and this one has {len(params)} parameters")
@@ -1709,9 +1743,10 @@ proc checkHandler(c: mut Check, env: infer.Env, starts: Str, handler: ast.Expr):
 				+ ", and this one returns " + types.show(result))
 			return false
 		}
-		if len(params) == 3 && types.same(infer.typeAt(params, 2), types.Ty.TAddress()) == false {
-			report(c, "a handler with a third parameter is handed its own address there, an `Address`, and this one takes "
-				+ types.show(infer.typeAt(params, 2)))
+		own := types.Ty.TAddress(message)
+		if len(params) == 3 && types.same(infer.typeAt(params, 2), own) == false {
+			report(c, "a handler with a third parameter is handed its own address there, an `" + types.show(own)
+				+ "`, and this one takes " + types.show(infer.typeAt(params, 2)))
 			return false
 		}
 		return true
@@ -1981,7 +2016,7 @@ proc checkBuiltinCall(c: mut Check, env: infer.Env, name: Str, written: ast.Arg[
 		checkAt(c, env, args)
 	} else if name == "kill" {
 		if arity(c, name, args, 1) {
-			fits(c, types.Ty.TAddress(), typeOfArg(c, env, args, 0), "what `kill` stops")
+			fits(c, types.Ty.TAddress(types.Ty.TUnknown()), typeOfArg(c, env, args, 0), "what `kill` stops")
 		}
 	} else if name == "hide" || name == "bypass" {
 		if arity(c, name, args, 1) {
@@ -2500,6 +2535,22 @@ func exitsTheProgram(value: ast.Expr): Bool {
 }
 
 // --- Small questions ---------------------------------------------------------
+
+// `at(...)` or `hive.at(...)`: the builtin, where what it answers with is an
+// address of no message type yet.
+func isAtCall(value: ast.Expr): Bool {
+	if value is ast.Expr.Call(callee, _) {
+		if callee is ast.Expr.Ident(name) {
+			return name == "at"
+		}
+		if callee is ast.Expr.Member(root, name) {
+			if root is ast.Expr.Ident(hiveName) {
+				return hiveName == "hive" && name == "at"
+			}
+		}
+	}
+	return false
+}
 
 func isEmptyMap(value: ast.Expr): Bool {
 	if value is ast.Expr.Call(callee, _) {

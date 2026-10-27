@@ -324,7 +324,7 @@ func goType(ty: types.Ty): Str {
 	else if ty is types.Ty.TLib(module, name) {
 		return "hive." + text.capitalise(module) + name
 	}
-	else if ty is types.Ty.TAddress { return "hive.SyslinkAddress" }
+	else if ty is types.Ty.TAddress(_) { return "hive.SyslinkAddress" }
 	else if ty is types.Ty.TSecret { return "hive.Secret" }
 	else if ty is types.Ty.TFn(_, params, mutexes, result) {
 		mut Str[dyn] out = []
@@ -416,6 +416,74 @@ proc emitTypeDecl(em: mut Emit, name: Str, fields: ast.Field[], variants: ast.Va
 		append(order, quoted(goVariant(name, v.name)))
 	}
 	line(em, "func init() \{ hive.RegisterVariants([]string\{" + join(order, ", ") + "}) }")
+	if stdlib.isErrorUnion(name) {
+		emitErrorLift(em, name, fields, variants)
+	}
+}
+
+// One of the library's error unions. The runtime reports a failure as a struct
+// whose `Reason` names the variant, so a call answering with one is lifted into
+// the union on the way out, and a variant shows the way that struct does.
+proc emitErrorLift(em: mut Emit, name: Str, fields: ast.Field[], variants: ast.Variant[]): void {
+	module := text.charAt(split(name, "_"), 1)
+	if module != "" {
+		useModule(em, module)
+	}
+	runtimeType := stdlib.runtimeErrorType(name)
+	for each v in variants {
+		mut Str[dyn] carried = ["Reason: " + quoted(v.name)]
+		for each f in fields {
+			append(carried, goField(f.name) + ": v." + goField(f.name))
+		}
+		line(em, "func (v " + goVariant(name, v.name) + ") String() string \{ return hive.ShowIn(" + runtimeType + "\{" + join(carried, ", ") + "}) }")
+	}
+	blank(em)
+	open(em, "func " + liftName(name) + "(e " + runtimeType + ") " + goIdent(name) + " \{")
+	open(em, "switch e.Reason \{")
+	for each v in variants {
+		mut Str[dyn] carried = []
+		for each f in fields {
+			append(carried, goField(f.name) + ": e." + goField(f.name))
+		}
+		line(em, "case " + quoted(v.name) + ":")
+		line(em, "\treturn " + goVariant(name, v.name) + "\{" + join(carried, ", ") + "}")
+	}
+	close(em, "}")
+	line(em, "panic(" + quoted("hive: " + types.shownName(name) + " has no variant ") + " + e.Reason)")
+	close(em, "}")
+}
+
+func liftName(name: Str): Str {
+	return "lift_" + name
+}
+
+// What a library call or a send answers with, lifted where it holds an error
+// union: the runtime's `Result[T, hive.FileFileError]` is the program's
+// `Result[T, hive_file_FileError]`.
+func lifted(ty: types.Ty, written: Str): Str {
+	if ty is types.Ty.TResult(_, types.Ty.TNamed(bad)) {
+		if stdlib.isErrorUnion(bad) {
+			return "hive.LiftBad(" + written + ", " + liftName(bad) + ")"
+		}
+	}
+	// A barrier over sends answers with one Result a send.
+	if ty is types.Ty.TVec(types.Ty.TResult(_, types.Ty.TNamed(bad)), _) {
+		if stdlib.isErrorUnion(bad) {
+			return "hive.LiftEach(" + written + ", " + liftName(bad) + ")"
+		}
+	}
+	return written
+}
+
+// The Go type the runtime answers with where the program reads `ty`: the same,
+// but for an error union, which the runtime still reports as its struct.
+func runtimeGoType(ty: types.Ty): Str {
+	if ty is types.Ty.TResult(ok, types.Ty.TNamed(bad)) {
+		if stdlib.isErrorUnion(bad) {
+			return "hive.Result[" + goType(ok) + ", " + stdlib.runtimeErrorType(bad) + "]"
+		}
+	}
+	return goType(ty)
 }
 
 // Reads a shared field through the union's interface, which has no fields of its own.
@@ -654,7 +722,7 @@ proc emitStmt(em: mut Emit, env: infer.Env, s: ast.Stmt, result: types.Ty): infe
 				if value is ast.Expr.Call(address, sent) {
 					line(em, pending + " := " + pendingSend(em, env, address, sent))
 				}
-				line(em, taskName(held) + " := hive.Spawn(func() any \{ return hive.SyslinkAwait(" + pending + ", 0) })")
+				line(em, taskName(held) + " := hive.Spawn(func() any \{ return " + answered("hive.SyslinkAwait(" + pending + ", 0)") + " })")
 			} else {
 				work := onThread(em, env, value, ty)
 				line(em, taskName(held) + " := hive.Spawn(func() any \{ return " + work + " })")
@@ -2140,7 +2208,7 @@ proc call(em: mut Emit, env: infer.Env, callee: ast.Expr, args: ast.Arg[], want:
 	// Calling an address is a send and a wait for the answer. Nothing bounded
 	// this one, so syslink waits its own default.
 	if isAddress(env, callee) {
-		return "hive.SyslinkAwait(" + pendingSend(em, env, callee, args) + ", 0)"
+		return answered("hive.SyslinkAwait(" + pendingSend(em, env, callee, args) + ", 0)")
 	}
 	if callee is ast.Expr.Ident(name) {
 		return namedCall(em, env, name, args, want)
@@ -2816,7 +2884,7 @@ proc builtin(em: mut Emit, env: infer.Env, name: Str, written: ast.Arg[], want: 
 	}
 	if name == "hide" {
 		useModule(em, "secret")
-		return "hive.Hide(" + a + ")"
+		return lifted(types.Ty.TResult(types.Ty.TSecret(), types.secretError()), "hive.Hide(" + a + ")")
 	}
 	if name == "reveal" {
 		return "hive.Reveal(" + a + ")"
@@ -3101,7 +3169,12 @@ func goSideName(flat: Str): Str {
 // so the decoder for a reply is the one its mailbox already uses.
 
 func isAddress(env: infer.Env, e: ast.Expr): Bool {
-	return infer.typeOf(env, e) is types.Ty.TAddress
+	return infer.typeOf(env, e) is types.Ty.TAddress(_)
+}
+
+// A send's answer as the program reads it, its failure lifted into the union.
+func answered(waited: Str): Str {
+	return lifted(types.Ty.TResult(types.Ty.TUnknown(), infer.syslinkError()), waited)
 }
 
 // Whether this expression is a call *of an address*, which is a send rather
@@ -3117,7 +3190,7 @@ func isSend(env: infer.Env, e: ast.Expr): Bool {
 // `0` where nothing bounded the wait, which leaves syslink its own patience.
 proc sendAndWait(em: mut Emit, env: infer.Env, call: ast.Expr, ms: Str): Str {
 	if call is ast.Expr.Call(callee, args) {
-		return "hive.SyslinkAwait(" + pendingSend(em, env, callee, args) + ", " + ms + ")"
+		return answered("hive.SyslinkAwait(" + pendingSend(em, env, callee, args) + ", " + ms + ")")
 	}
 	return expr(em, env, call, types.Ty.TUnknown())
 }
@@ -3125,7 +3198,7 @@ proc sendAndWait(em: mut Emit, env: infer.Env, call: ast.Expr, ms: Str): Str {
 proc pendingSend(em: mut Emit, env: infer.Env, address: ast.Expr, args: ast.Arg[]): Str {
 	useModule(em, "syslink")
 	message := argExpr(args, 0)
-	ty := infer.typeOf(env, message)
+	ty := infer.mailboxOf(env, infer.typeOf(env, address), args)
 	return "hive.SyslinkSendAwaitable(" + expr(em, env, address, types.Ty.TUnknown()) + ", "
 		+ carried(em, env, message, ty) + ", " + syslinkEncoder(em, ty) + ", "
 		+ syslinkDigest(em, ty) + ", hive.SyslinkReplyDecoder(" + decoderRef(em, ty) + "))"
@@ -3151,7 +3224,7 @@ proc awaitAllSends(em: mut Emit, env: infer.Env, calls: ast.Expr[], timeout: ast
 	for each c in calls {
 		if c is ast.Expr.Call(address, args) {
 			append(pending, pendingSend(em, env, address, args))
-			element = infer.typeOf(env, argExpr(args, 0))
+			element = infer.mailboxOf(env, infer.typeOf(env, address), args)
 		}
 	}
 	mut ms := "0"
@@ -3159,7 +3232,8 @@ proc awaitAllSends(em: mut Emit, env: infer.Env, calls: ast.Expr[], timeout: ast
 	} else {
 		ms = expr(em, env, timeout, types.Ty.TInt())
 	}
-	return "hive.SyslinkAwaitAll[" + goType(element) + "]([]*hive.SyslinkPending[" + goType(element) + "]\{" + join(pending, ", ") + "}, " + ms + ")"
+	return lifted(types.Ty.TVec(types.Ty.TResult(element, infer.syslinkError()), ast.Dim.Dynamic()),
+		"hive.SyslinkAwaitAll[" + goType(element) + "]([]*hive.SyslinkPending[" + goType(element) + "]\{" + join(pending, ", ") + "}, " + ms + ")")
 }
 
 // A cast: a send with nothing to hold the answer, which allocates nothing and
@@ -3214,7 +3288,7 @@ proc signatureOf(em: mut Emit, ty: types.Ty, seen: Str[]): Str {
 	if ty is types.Ty.TAtom { return "Atom" }
 	if ty is types.Ty.TVoid { return "void" }
 	if ty is types.Ty.TLib(_, _) { return types.show(ty) }
-	if ty is types.Ty.TAddress { return "Address" }
+	if ty is types.Ty.TAddress(_) { return "Address" }
 	if ty is types.Ty.TVec(element, dim) {
 		return signatureOf(em, element, seen) + types.showDim(dim)
 	}
@@ -3256,8 +3330,9 @@ proc serviceBuiltin(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[]): S
 		if len(args) == 3 {
 			registered = expr(em, env, argExpr(args, 2), types.Ty.TAtom())
 		}
-		return "hive." + addressedName("SyslinkSpawn", env, handler) + "(" + expr(em, env, handler, types.Ty.TUnknown()) + ", "
+		started := "hive." + addressedName("SyslinkSpawn", env, handler) + "(" + expr(em, env, handler, types.Ty.TUnknown()) + ", "
 			+ registered + ", " + serviceTail(em, env, handler, argExpr(args, 1)) + ")"
+		return lifted(types.Ty.TResult(types.Ty.TUnknown(), infer.syslinkError()), started)
 	}
 	if name == "at" {
 		if len(args) == 2 {
@@ -3266,7 +3341,7 @@ proc serviceBuiltin(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[]): S
 		}
 		return "hive.SyslinkAt(" + expr(em, env, argExpr(args, 0), types.Ty.TAtom()) + ")"
 	}
-	return "hive.SyslinkKill(" + expr(em, env, argExpr(args, 0), types.Ty.TAddress()) + ")"
+	return "hive.SyslinkKill(" + expr(em, env, argExpr(args, 0), types.Ty.TAddress(types.Ty.TUnknown())) + ")"
 }
 
 func addressedName(base: Str, env: infer.Env, handler: ast.Expr): Str {
@@ -4411,6 +4486,15 @@ func flatValueName(ty: types.Ty): Str {
 // --- The standard library ----------------------------------------------------
 
 proc libraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, written: ast.Arg[], want: types.Ty): Str {
+	if len(stdlib.fieldsOf(module, name)) > 0 {
+		return runtimeLibraryCall(em, env, module, name, written, want)
+	}
+	answer := infer.typeOf(env, ast.Expr.Call(ast.Expr.Member(ast.Expr.Member(ast.Expr.Ident("hive"), module), name), copiedArgs(written)))
+	return lifted(answer, runtimeLibraryCall(em, env, module, name, written, want))
+}
+
+// A library call as the runtime answers it, before any error union is lifted.
+proc runtimeLibraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, written: ast.Arg[], want: types.Ty): Str {
 	if stdlib.isKnownModule(module) == false {
 		fail(em, "this compiler does not carry `hive.{module}`")
 		return "nil"
@@ -4426,7 +4510,12 @@ proc libraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, written: 
 				mutexes = [true]
 			}
 			h := hoist(em, env, written, names, infer.typesOfArgs(env, stdlib.libraryArgs(module, name, written)), mutexes, true)
-			return inWrittenOrder(h, goResult(answer), libraryCall(em, h.env, module, name, h.args, want))
+			mut asAnswered := goResult(answer)
+			if answer is types.Ty.TVoid {
+			} else {
+				asAnswered = runtimeGoType(answer)
+			}
+			return inWrittenOrder(h, asAnswered, runtimeLibraryCall(em, h.env, module, name, h.args, want))
 		}
 	}
 	args := stdlib.libraryArgs(module, name, written)

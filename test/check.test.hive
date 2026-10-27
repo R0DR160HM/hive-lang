@@ -284,7 +284,7 @@ test "sort needs an order, and a map, an address or a type holding one has none"
 		"in `main`: `sort` puts a vector in its elements' own order, and hive.map.Map<Str, Int> has none")
 	assert opens(problem(inMain("v := [hive.json.JsonValue.Int(1)]  echo sort(v)")),
 		"in `main`: `sort` puts a vector in its elements' own order, and hive.json.JsonValue has none")
-	boxed := "type Box \{ where: Address }\n"
+	boxed := "type Box \{ where: Address<Int> }\n"
 	assert opens(problem(boxed + inMain("v := [Box(at(#A))]  echo len(sort(v))")),
 		"in `main`: `sort` puts a vector in its elements' own order, and Box has none")
 	assert problemCount(inMain("v := [hive.json.JsonValue.Int(1)]  echo sort(v, before)") + "\nfunc before(a: hive.json.JsonValue, b: hive.json.JsonValue): Bool \{ return false }") == 0
@@ -310,7 +310,7 @@ test "a service's handler writes its state and answers with one of its own messa
 
 test "spawn takes a handler with or without its own address, and a name to register it under" {
 	note := "type Note \{ Say \{ text: Str } }\n"
-	loud := "proc loud(n: mut Int, note: Note, me: Address): Note \{ return note }\n"
+	loud := "proc loud(n: mut Int, note: Note, me: Address<Note>): Note \{ return note }\n"
 	assert problemCount(note + loud + inMain("box := spawn(loud, 0)")) == 0
 	assert problemCount(note + loud + inMain("box := spawn(loud, 0, #Loud)  if box is Result.Ok(a) \{ kill(a) }")) == 0
 	assert problemCount(note + loud + inMain("box := hive.spawn(loud, 0, #Loud)")) == 0
@@ -318,27 +318,58 @@ test "spawn takes a handler with or without its own address, and a name to regis
 		"in `main`: the name `spawn` registers the service under wants Atom and this is Str")
 	wrong := "proc loud(n: mut Int, note: Note, me: Str): Note \{ return note }\n"
 	assert opens(problem(note + wrong + inMain("box := spawn(loud, 0)")),
-		"in `main`: a handler with a third parameter is handed its own address there, an `Address`, and this one takes Str")
-	many := "proc loud(n: mut Int, note: Note, me: Address, again: Address): Note \{ return note }\n"
+		"in `main`: a handler with a third parameter is handed its own address there, an `Address<Note>`, and this one takes Str")
+	other := "proc loud(n: mut Int, note: Note, me: Address<Int>): Note \{ return note }\n"
+	assert opens(problem(note + other + inMain("box := spawn(loud, 0)")),
+		"in `main`: a handler with a third parameter is handed its own address there, an `Address<Note>`, and this one takes Address<Int>")
+	many := "proc loud(n: mut Int, note: Note, me: Address<Note>, again: Address<Note>): Note \{ return note }\n"
 	assert opens(problem(note + many + inMain("box := spawn(loud, 0)")),
-		"in `main`: `spawn` wants a handler of the shape `proc(mut S, M): M`, or `proc(mut S, M, Address): M`")
+		"in `main`: `spawn` wants a handler of the shape `proc(mut S, M): M`, or `proc(mut S, M, Address<M>): M`")
 	assert opens(problem(note + loud + inMain("box := spawn(loud, 0)  kill(box)")),
-		"in `main`: what `kill` stops wants Address and this is Result<Address, hive.syslink.SyslinkError>")
+		"in `main`: what `kill` stops wants Address<M> and this is Result<Address<Note>, hive.syslink.SyslinkError>")
+}
+
+test "an address takes the messages its service does" {
+	note := "type Note \{ Say \{ text: Str } }\n"
+	inbox := "proc inbox(n: mut Int, note: Note): Note \{ return note }\n"
+	sent := "if spawn(inbox, 0) is Result.Ok(box) \{ "
+	assert problemCount(note + inbox + inMain(sent + "_ := box(Note.Say(\"hi\")) }")) == 0
+	assert problemCount(note + inbox + inMain(sent + "async box(Note.Say(\"hi\")) }")) == 0
+	assert opens(problem(note + inbox + inMain(sent + "_ := box(3) }")),
+		"in `main`: the message sent to an `Address<Note>` wants Note and this is Int")
+	assert opens(problem(note + inbox + inMain(sent + "_ := box(Note.Say(\"a\"), Note.Say(\"b\")) }")),
+		"in `main`: a send carries one message, and this passes 2 arguments")
+	assert opens(problem("proc h(a: Address): void \{ }\n" + inMain("")),
+		"in `h`: an address says what its service takes: `Address<M>`")
+	assert problemCount(note + "proc ask(a: Address<Note>): void \{ _ := a(Note.Say(\"hi\")) }\n" + inMain("")) == 0
 }
 
 test "at names a service on this node or another, and does no more" {
-	assert problemCount(inMain("here := at(#Cache)  there := at(\"10.0.0.4:9000\", #Cache)  kill(here)  kill(there)")) == 0
-	assert opens(problem(inMain("here := at(\"Cache\")")), "in `main`: the name `at` reaches wants Atom and this is Str")
-	assert opens(problem(inMain("there := at(#Node, #Cache)")),
+	assert problemCount(inMain("Address<Int> here = at(#Cache)  Address<Int> there = at(\"10.0.0.4:9000\", #Cache)  kill(here)  kill(there)")) == 0
+	assert problemCount(inMain("kill(at(#Cache))")) == 0
+	assert opens(problem(inMain("Address<Int> here = at(\"Cache\")")), "in `main`: the name `at` reaches wants Atom and this is Str")
+	assert opens(problem(inMain("Address<Int> there = at(#Node, #Cache)")),
 		"in `main`: the endpoint of the node `at` reaches wants Str and this is Atom")
-	assert opens(problem(inMain("there := at()")), "in `main`: `at` takes the name a service is registered under")
-	assert opens(problem(inMain("kill(#Cache)")), "in `main`: what `kill` stops wants Address and this is Atom")
+	assert opens(problem(inMain("Address<Int> there = at()")), "in `main`: `at` takes the name a service is registered under")
+	assert opens(problem(inMain("kill(#Cache)")), "in `main`: what `kill` stops wants Address<M> and this is Atom")
+	assert opens(problem(inMain("here := at(#Cache)")),
+		"in `main`: `at` has to land somewhere that says what the service takes")
+	assert opens(problem(inMain("_ := at(#Cache)(3)")),
+		"in `main`: `at` says where a service is and nothing about what it takes")
+}
+
+test "a monitor's notice is one of the watcher's messages" {
+	note := "type Note \{ Gone }\n"
+	sent := "Address<Note> watcher = at(#Watcher)  Address<Int> target = at(#Target)  hive.syslink.monitor(watcher, target, "
+	assert problemCount(note + inMain(sent + "Note.Gone())")) == 0
+	assert opens(problem(note + inMain(sent + "3)")),
+		"in `main`: the notice `hive.syslink.monitor` posts to the watcher wants Note and this is Int")
 }
 
 test "a declaration of its own called Address wins, and hive.Address is still the builtin" {
 	own := "type Address \{ street: Str }\n"
 	assert problemCount(own + inMain("home := Address(\"Main St\")  echo home.street")) == 0
-	assert problemCount(own + "proc keep(a: hive.Address): void \{ kill(a) }\n" + inMain("keep(at(#Cache))")) == 0
+	assert problemCount(own + "proc keep(a: hive.Address<Int>): void \{ kill(a) }\n" + inMain("keep(at(#Cache))")) == 0
 	assert opens(problem("proc h(a: hive.syslink.Address): void \{ }\n" + inMain("")),
 		"in `h`: `hive.syslink` has no type `Address`")
 }
@@ -348,7 +379,7 @@ test "a window is a handler for spawn, and its view reads the state its update w
 	up := "proc up(n: mut Int, m: Msg): Msg \{ return m }\n"
 	view := "func view(n: Int): hive.ui.View \{ return hive.ui.text([], \"\{n}\") }\n"
 	assert problemCount(msg + up + view + inMain("w := spawn(hive.ui.window(\"T\", view, up), 0)")) == 0
-	loud := "proc up(n: mut Int, m: Msg, me: Address): Msg \{ return m }\n"
+	loud := "proc up(n: mut Int, m: Msg, me: Address<Msg>): Msg \{ return m }\n"
 	assert problemCount(msg + loud + view + inMain("w := spawn(hive.ui.window(\"T\", view, up), 0, #Main)")) == 0
 	assert opens(problem(msg + up + view + inMain("hive.ui.window(\"T\", view, up, 0)")),
 		"in `main`: `hive.ui.window` takes 3 arguments, and this call passes 4")
@@ -1447,7 +1478,8 @@ test "a Secret has no JSON" {
 }
 
 test "hide answers a Secret or why it could not lock one" {
-	assert problemCount(inMain("if hide(\"pw\") is Result.Ok(s) \{ echo reveal(s) } else if hide(\"pw\") is Result.Error(why) \{ echo why.reason + why.message }")) == 0
+	assert problemCount(inMain("if hide(\"pw\") is Result.Ok(s) \{ echo reveal(s) } else if hide(\"pw\") is Result.Error(why) \{ echo why.message }")) == 0
+	assert problemCount(inMain("if hide(\"pw\") is Result.Error(SecretError.LimitExceeded(m)) \{ echo m }")) == 0
 	assert problemCount(inMain("if hide(text: \"pw\") is Result.Ok(s) \{ echo reveal(secret: s) }")) == 0
 	assert opens(problem(inMain("echo hide(\"pw\")")), "in `main`: `echo` cannot show Result<Secret, SecretError>, which holds a `Secret`")
 	assert opens(problem(inMain("echo reveal(hide(\"pw\"))")), "in `main`: what `reveal` reads wants Secret and this is Result<Secret, SecretError>")
@@ -1472,7 +1504,7 @@ test "secrets compare with == and have no order" {
 
 test "the library takes and hands back secrets" {
 	assert problemCount(inMain("if hive.crypto.decrypt(hive.crypto.encrypt(bypass(\"t\"), bypass(\"pw\")), bypass(\"pw\")) is Result.Ok(s) \{ echo reveal(s) }")) == 0
-	assert problemCount(inMain("if hive.crypto.randomSecret(32) is Result.Ok(k) \{ echo hive.crypto.hmacSha256(\"m\", k) } else if hive.crypto.randomSecret(32) is Result.Error(why) \{ echo why.reason }")) == 0
+	assert problemCount(inMain("if hive.crypto.randomSecret(32) is Result.Ok(k) \{ echo hive.crypto.hmacSha256(\"m\", k) } else if hive.crypto.randomSecret(32) is Result.Error(hive.SecretError.Unsupported(m)) \{ echo m }")) == 0
 	assert problemCount(inMain("if hive.term.readSecret() is Result.Ok(s) \{ echo reveal(s) } else if hive.term.readSecret() is Result.Error(why) \{ echo why.message }")) == 0
 	assert opens(problem(inMain("echo hive.crypto.hmacSha256(\"m\", hive.crypto.randomSecret(32))")), "in `main`: the second argument of `hive.crypto.hmacSha256` wants Secret and this is Result<Secret, SecretError>")
 	assert problemCount(inMain("hive.file.writeSecret(\"k\", bypass(\"s\"))")) == 0
@@ -1487,9 +1519,24 @@ test "the library takes and hands back secrets" {
 test "readSecretBypass cannot fail, and decryptBypass fails only as decrypt does" {
 	assert problemCount(inMain("s := hive.term.readSecretBypass()  echo reveal(s)")) == 0
 	assert opens(problem(inMain("echo hive.term.readSecretBypass()")), "in `main`: `echo` cannot show a `Secret`")
-	assert problemCount(inMain("if hive.crypto.decryptBypass(password: bypass(\"pw\"), ciphertext: \"x\") is Result.Ok(s) \{ echo reveal(s) } else if hive.crypto.decryptBypass(\"x\", bypass(\"pw\")) is Result.Error(why) \{ echo why.reason }")) == 0
+	assert problemCount(inMain("if hive.crypto.decryptBypass(password: bypass(\"pw\"), ciphertext: \"x\") is Result.Ok(s) \{ echo reveal(s) } else if hive.crypto.decryptBypass(\"x\", bypass(\"pw\")) is Result.Error(crypto.CryptoError.BadSignature(m)) \{ echo m }")) == 0
 	assert opens(problem(inMain("echo hive.crypto.decryptBypass(\"x\", bypass(\"pw\"))")), "in `main`: `echo` cannot show Result<Secret, hive.crypto.CryptoError>")
 	assert opens(problem(inMain("echo hive.crypto.decryptBypass(\"x\", \"pw\")")), "in `main`: the second argument of `hive.crypto.decryptBypass` wants Secret and this is Str")
+}
+
+test "a library error is a union of what went wrong" {
+	assert problemCount(inMain("if hive.file.read(\"x\") is Result.Error(why) \{ echo why.path + why.message }")) == 0
+	assert problemCount(inMain("if file.read(\"x\") is Result.Error(file.FileError.NotFound(path, _)) \{ echo path }")) == 0
+	assert opens(problem(inMain("if file.read(\"x\") is Result.Error(why) \{ echo why.reason }")),
+		"in `main`: `hive.file.FileError` has no field `reason`")
+	kinds := "func kind(why: hive.file.FileError): Str \{ switch why \{ file.FileError.NotFound(_, _) \{ return \"gone\" } file.FileError.Io(_, _) \{ return \"io\" } } }\n"
+	assert opens(problem(kinds + inMain("")),
+		"in `kind`: no arm of this `switch` takes `hive.file.FileError.Permission(_, _)`")
+	assert problemCount(inMain("why := hive.sql.SqlError.Statement(\"bad\")  echo why.message")) == 0
+	assert opens(problem(inMain("why := hive.sql.SqlError.Failed(\"bad\")")),
+		"in `main`: `hive.sql.SqlError` has no variant `Failed`")
+	assert problemCount(inMain("if spawn(hive.ui.window(\"T\", v, u), 0) is Result.Error(hive.syslink.SyslinkError.Taken(m)) \{ echo m }")
+		+ "\ntype Msg \{ Bumped }\nproc u(n: mut Int, m: Msg): Msg \{ return m }\nfunc v(n: Int): hive.ui.View \{ return hive.ui.text([], \"\{n}\") }") == 0
 }
 
 test "a program's own Secret comes before the builtin, which is still hive.Secret" {

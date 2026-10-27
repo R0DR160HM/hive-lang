@@ -287,6 +287,25 @@ func coreResult(): Str {
 			}
 			return "Error(" + ShowIn(r.bad) + ")"
 		}
+		`,
+		// A library failure is reported here as a struct with a Reason, and read by
+		// the program as the union its module declares; lift is the generated
+		// function from one to the other.
+		`
+		func LiftBad[T any, E any, F any](r Result[T, E], lift func(E) F) Result[T, F] \{
+			if r.ok \{
+				return Ok[T, F](r.value)
+			}
+			return Err[T, F](lift(r.bad))
+		}
+
+		func LiftEach[T any, E any, F any](rs []Result[T, E], lift func(E) F) []Result[T, F] \{
+			out := make([]Result[T, F], len(rs))
+			for i, r := range rs \{
+				out[i] = LiftBad(r, lift)
+			}
+			return out
+		}
 		`
 	], "\n\n")
 }
@@ -5302,9 +5321,9 @@ func sqlSource(): Str {
 			Name string
 		}
 		`,
-		// SqlSqlError describes a failed database operation. Reason is a short tag —
-		// "Connection", "Query", "Shape" or "Convert" — so a caller can tell a database
-		// that is down from a value that did not fit its declared type.
+		// SqlSqlError describes a failed database operation. Reason names a variant of
+		// hive.sql.SqlError — "Connection", "Statement", "Shape" or "Convert" — so a
+		// caller can tell a database that is down from a value that did not fit.
 		`
 		type SqlSqlError struct \{
 			Reason  string
@@ -5375,7 +5394,7 @@ func sqlSource(): Str {
 			}
 			res, err := conn.db.Exec(sqlPlaceholders(conn, stmt.Text), stmt.Args...)
 			if err != nil \{
-				return Err[int, SqlSqlError](SqlSqlError\{Reason: "Query", Message: err.Error()})
+				return Err[int, SqlSqlError](SqlSqlError\{Reason: "Statement", Message: err.Error()})
 			}
 			n, err := res.RowsAffected()
 			if err != nil \{
@@ -5402,12 +5421,12 @@ func sqlSource(): Str {
 			}
 			rows, err := conn.db.Query(sqlPlaceholders(conn, stmt.Text), stmt.Args...)
 			if err != nil \{
-				return Err[[]T, SqlSqlError](SqlSqlError\{Reason: "Query", Message: err.Error()})
+				return Err[[]T, SqlSqlError](SqlSqlError\{Reason: "Statement", Message: err.Error()})
 			}
 			defer rows.Close()
 			cols, err := rows.Columns()
 			if err != nil \{
-				return Err[[]T, SqlSqlError](SqlSqlError\{Reason: "Query", Message: err.Error()})
+				return Err[[]T, SqlSqlError](SqlSqlError\{Reason: "Statement", Message: err.Error()})
 			}
 			for rows.Next() \{
 				cells := make([]sql.NullString, len(cols))
@@ -5416,7 +5435,7 @@ func sqlSource(): Str {
 					ptrs[i] = &cells[i]
 				}
 				if err := rows.Scan(ptrs...); err != nil \{
-					return Err[[]T, SqlSqlError](SqlSqlError\{Reason: "Query", Message: err.Error()})
+					return Err[[]T, SqlSqlError](SqlSqlError\{Reason: "Statement", Message: err.Error()})
 				}
 				flat := make([]string, len(cols))
 				for i, c := range cells \{
@@ -5434,7 +5453,7 @@ func sqlSource(): Str {
 				out = append(out, v)
 			}
 			if err := rows.Err(); err != nil \{
-				return Err[[]T, SqlSqlError](SqlSqlError\{Reason: "Query", Message: err.Error()})
+				return Err[[]T, SqlSqlError](SqlSqlError\{Reason: "Statement", Message: err.Error()})
 			}
 			return Ok[[]T, SqlSqlError](out)
 		}
@@ -5580,12 +5599,12 @@ func sqlSource(): Str {
 
 		func sqlTable(rows *sql.Rows, err error) Result[Table, SqlSqlError] \{
 			if err != nil \{
-				return Err[Table, SqlSqlError](SqlSqlError\{Reason: "Query", Message: err.Error()})
+				return Err[Table, SqlSqlError](SqlSqlError\{Reason: "Statement", Message: err.Error()})
 			}
 			defer rows.Close()
 			cols, err := rows.Columns()
 			if err != nil \{
-				return Err[Table, SqlSqlError](SqlSqlError\{Reason: "Query", Message: err.Error()})
+				return Err[Table, SqlSqlError](SqlSqlError\{Reason: "Statement", Message: err.Error()})
 			}
 			if len(cols) == 0 \{
 				return Ok[Table, SqlSqlError](Table\{})
@@ -5598,7 +5617,7 @@ func sqlSource(): Str {
 					ptrs[i] = &cells[i]
 				}
 				if err := rows.Scan(ptrs...); err != nil \{
-					return Err[Table, SqlSqlError](SqlSqlError\{Reason: "Query", Message: err.Error()})
+					return Err[Table, SqlSqlError](SqlSqlError\{Reason: "Statement", Message: err.Error()})
 				}
 				row := make([]string, len(cols))
 				for i, c := range cells \{
@@ -5609,7 +5628,7 @@ func sqlSource(): Str {
 				table = append(table, row)
 			}
 			if err := rows.Err(); err != nil \{
-				return Err[Table, SqlSqlError](SqlSqlError\{Reason: "Query", Message: err.Error()})
+				return Err[Table, SqlSqlError](SqlSqlError\{Reason: "Statement", Message: err.Error()})
 			}
 			return Ok[Table, SqlSqlError](table)
 		}

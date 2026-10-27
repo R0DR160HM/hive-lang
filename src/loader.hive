@@ -507,12 +507,33 @@ func importedFlat(rw: Rw, alias: Str, member: Str): Str {
 proc libraryFlat(rw: mut Rw, module: Str, name: Str): Str {
 	key := "hive." + module
 	if hive.map.get(rw.flatNames, key + "#" + name) is Result.Ok(flat) {
-		if indexOf(rw.library, key) is Result.Error(_) {
-			append(rw.library, key)
-		}
+		noteLibrary(rw, key)
 		return flat
 	}
 	return ""
+}
+
+proc noteLibrary(rw: mut Rw, key: Str): void {
+	if indexOf(rw.library, key) is Result.Error(_) {
+		append(rw.library, key)
+	}
+}
+
+// A module's errors come with it, whether or not the program names their type:
+// `file.read(p)` answers with a `FileError` all the same.
+proc noteModule(rw: mut Rw, module: Str): void {
+	for each m in stdlib.errorModulesFor(module) {
+		noteLibrary(rw, "hive." + m)
+	}
+}
+
+// The builtins that answer with a library error, or hand out what does.
+proc noteBuiltin(rw: mut Rw, name: Str): void {
+	if name == "spawn" || name == "at" || name == "kill" {
+		noteModule(rw, "syslink")
+	} else if name == "hide" {
+		noteModule(rw, "")
+	}
 }
 
 // The entrypoint's names are unprefixed, so they would capture another module's bare builtin.
@@ -658,8 +679,15 @@ proc rewriteType(rw: mut Rw, t: ast.TypeExpr): ast.TypeExpr {
 proc namedType(rw: mut Rw, pkg: Str, name: Str, args: ast.TypeExpr[dyn], dims: ast.Dim[dyn]): ast.TypeExpr {
 	if pkg == "" {
 		flat := ownFlat(rw, name)
+		if flat == "" && name == "Address" {
+			noteModule(rw, "syslink")
+		}
 		if name == "Address" && capturedByEntry(rw, name) {
 			return ast.TypeExpr.Named("hive", name, args, dims)
+		}
+		// The core's own error, which a module that declared none means.
+		if flat == "" && name == "SecretError" {
+			return ast.TypeExpr.Named("", libraryFlat(rw, "", name), args, dims)
 		}
 		if flat == "" {
 			return ast.TypeExpr.Named("", name, args, dims)
@@ -669,7 +697,16 @@ proc namedType(rw: mut Rw, pkg: Str, name: Str, args: ast.TypeExpr[dyn], dims: a
 	// `hive.net.HttpRequest` and friends belong to the standard library, which
 	// is named in the program rather than flattened into it.
 	if pkg == "hive" || text.startsWith(pkg, "hive.") {
-		declared := libraryFlat(rw, stdlibModuleOf(pkg), name)
+		mut module := stdlibModuleOf(pkg)
+		if pkg == "hive" {
+			module = ""
+			if name == "Address" {
+				noteModule(rw, "syslink")
+			}
+		} else {
+			noteModule(rw, module)
+		}
+		declared := libraryFlat(rw, module, name)
 		if declared != "" {
 			return ast.TypeExpr.Named("", declared, args, dims)
 		}
@@ -681,6 +718,7 @@ proc namedType(rw: mut Rw, pkg: Str, name: Str, args: ast.TypeExpr[dyn], dims: a
 	}
 	// `ui.View` with `import hive.ui as ui` — the same type, spelled short.
 	if hive.map.get(rw.stdlibAliases, pkg) is Result.Ok(module) {
+		noteModule(rw, module)
 		declared := libraryFlat(rw, module, name)
 		if declared != "" {
 			return ast.TypeExpr.Named("", declared, args, dims)
@@ -799,7 +837,7 @@ proc rewriteExpr(rw: mut Rw, e: ast.Expr): ast.Expr {
 		}
 		flat := ownFlat(rw, name)
 		if flat == "" {
-			return e
+			return coreIdent(rw, e, name)
 		}
 		return ast.Expr.Ident(flat)
 	} else if e is ast.Expr.Member(subject, field) {
@@ -816,6 +854,9 @@ proc rewriteExpr(rw: mut Rw, e: ast.Expr): ast.Expr {
 			append(out, ast.Arg(a.name, rewriteExpr(rw, a.value)))
 		}
 		if callee is ast.Expr.Ident(name) {
+			if isLocal(rw, name) == false && ownFlat(rw, name) == "" {
+				noteBuiltin(rw, name)
+			}
 			if infer.isBuiltin(name) && capturedByEntry(rw, name) {
 				return ast.Expr.Call(ast.Expr.Member(ast.Expr.Ident("hive"), name), out)
 			}
@@ -835,6 +876,14 @@ proc rewriteExpr(rw: mut Rw, e: ast.Expr): ast.Expr {
 		return ast.Expr.Interp(out)
 	}
 	return rewriteExprTail(rw, e)
+}
+
+// A bare `SecretError`, in a module that declared none, is the core's.
+proc coreIdent(rw: mut Rw, e: ast.Expr, name: Str): ast.Expr {
+	if name == "SecretError" {
+		return ast.Expr.Ident(libraryFlat(rw, "", name))
+	}
+	return e
 }
 
 proc rewriteExprTail(rw: mut Rw, e: ast.Expr): ast.Expr {
@@ -874,6 +923,7 @@ proc member(rw: mut Rw, subject: ast.Expr, field: Str): ast.Expr {
 				return ast.Expr.Ident(imported)
 			}
 			if hive.map.get(rw.stdlibAliases, alias) is Result.Ok(module) {
+				noteModule(rw, module)
 				declared := libraryFlat(rw, module, field)
 				if declared != "" {
 					return ast.Expr.Ident(declared)
@@ -890,10 +940,19 @@ proc member(rw: mut Rw, subject: ast.Expr, field: Str): ast.Expr {
 	}
 	if subject is ast.Expr.Member(root, module) {
 		if root is ast.Expr.Ident(head) && head == "hive" {
+			noteModule(rw, module)
 			declared := libraryFlat(rw, module, field)
 			if declared != "" {
 				return ast.Expr.Ident(declared)
 			}
+		}
+	}
+	// `hive.spawn(...)`, a builtin under its long name, and `hive.SecretError`.
+	if subject is ast.Expr.Ident(head) && head == "hive" {
+		noteBuiltin(rw, field)
+		declared := libraryFlat(rw, "", field)
+		if declared != "" {
+			return ast.Expr.Ident(declared)
 		}
 	}
 	return ast.Expr.Member(rewriteExpr(rw, subject), field)
@@ -945,6 +1004,9 @@ proc rewritePatternPath(rw: mut Rw, path: Str[]): Str[dyn] {
 		if flat != "" {
 			return [flat, text.charAt(path, 1)]
 		}
+		if first == "SecretError" {
+			return [libraryFlat(rw, "", first), text.charAt(path, 1)]
+		}
 		imported := importedFlat(rw, first, text.charAt(path, 1))
 		if imported != "" {
 			append(rw.errors, diag.at(0, "`" + join(out, ".") + "` does not name a pattern: it names a type, so a variant of it has to be named too"))
@@ -956,6 +1018,12 @@ proc rewritePatternPath(rw: mut Rw, path: Str[]): Str[dyn] {
 		imported := importedFlat(rw, first, typeName)
 		if imported != "" {
 			return [imported, text.charAt(path, 2)]
+		}
+		if first == "hive" {
+			declared := libraryFlat(rw, "", typeName)
+			if declared != "" {
+				return [declared, text.charAt(path, 2)]
+			}
 		}
 		if hive.map.get(rw.stdlibAliases, first) is Result.Ok(module) {
 			declared := libraryFlat(rw, module, typeName)

@@ -393,11 +393,19 @@ func types(): Str {
 
 		## Address
 
-		A [service](stdlib/syslink.md), in this process or on another machine — what
-		~BT~spawn~BT~ and ~BT~at~BT~ answer with, and what a call sends to: ~BT~box(message)~BT~.
-		An address is an ordinary value, stored, passed and carried inside a message, and
-		it has no order. It is one type rather than one per protocol. A program that
-		declares its own ~BT~Address~BT~ still has the builtin as ~BT~hive.Address~BT~.
+		~BT~Address<M>~BT~ is a [service](stdlib/syslink.md) taking messages of type ~BT~M~BT~, in this
+		process or on another machine — what ~BT~spawn~BT~ and ~BT~at~BT~ answer with, and what a
+		call sends to: ~BT~box(message)~BT~. The message has to be an ~BT~M~BT~, and the answer is
+		one too. ~BT~Address~BT~ without its ~BT~M~BT~ is a compile error.
+
+		* ~BT~spawn~BT~ reads ~BT~M~BT~ off the handler it starts.
+		* ~BT~at~BT~ cannot, since a name says nothing about what the service takes, so it
+		  lands where an address is declared: ~BT~Address<Op> counter = at(#Counter)~BT~.
+		  ~BT~counter := at(#Counter)~BT~ is a compile error.
+		* An address is an ordinary value, stored, passed and carried inside a message,
+		  and it has no order.
+		* A program that declares its own ~BT~Address~BT~ still has the builtin as
+		  ~BT~hive.Address<M>~BT~.
 
 		## Secret
 
@@ -409,7 +417,8 @@ func types(): Str {
 		  in a message: a ~BT~Secret~BT~ has no JSON.
 		* **It is never swapped to disk.** It lives in locked memory, cleared once nothing
 		  holds it. Locked memory runs out, so ~BT~hide~BT~ answers ~BT~Result<Secret, SecretError>~BT~,
-		  its ~BT~reason~BT~ ~BT~"LimitExceeded"~BT~ or ~BT~"Unsupported"~BT~.
+		  the error being ~BT~SecretError.LimitExceeded~BT~ or ~BT~SecretError.Unsupported~BT~, each
+		  with a ~BT~message~BT~.
 		* ~BT~bypass(text)~BT~ is a ~BT~Secret~BT~ in ordinary memory: never shown, but free to be
 		  swapped out, and it cannot fail. For a literal, or a ciphertext.
 		* ~BT~hive.term.readSecretBypass~BT~ and ~BT~hive.crypto.decryptBypass~BT~ are ~BT~readSecret~BT~
@@ -1746,9 +1755,9 @@ func builtins(): Str {
 		| ~BT~filterMap~BT~ | ~BT~(T[], func(T): Result<K, E>): K[dyn]~BT~ | transform and select in one pass |
 		| ~BT~sort~BT~ | ~BT~(T[]): T[dyn]~BT~ / ~BT~(T[], func(T, T): Bool): T[dyn]~BT~ | in order |
 		| ~BT~encode~BT~ | ~BT~(T, hive.codec.Codec<E>): Str~BT~ | written in the format the codec names |
-		| ~BT~spawn~BT~ | ~BT~(handler, S): Result<Address, SyslinkError>~BT~ / ~BT~(handler, S, Atom): …~BT~ | starts a service, optionally registered under a name |
-		| ~BT~at~BT~ | ~BT~(Atom): Address~BT~ / ~BT~(Str, Atom): Address~BT~ | a named service on this node / on the node at an endpoint |
-		| ~BT~kill~BT~ | ~BT~(Address): void~BT~ | stops a service |
+		| ~BT~spawn~BT~ | ~BT~(handler, S): Result<Address<M>, SyslinkError>~BT~ / ~BT~(handler, S, Atom): …~BT~ | starts a service, optionally registered under a name |
+		| ~BT~at~BT~ | ~BT~(Atom): Address<M>~BT~ / ~BT~(Str, Atom): Address<M>~BT~ | a named service on this node / on the node at an endpoint, ~BT~M~BT~ read off where it lands |
+		| ~BT~kill~BT~ | ~BT~(Address<M>): void~BT~ | stops a service |
 		| ~BT~hide~BT~ | ~BT~(Str): Result<Secret, SecretError>~BT~ | text as a [~BT~Secret~BT~](types.md#secret), never swapped to disk |
 		| ~BT~bypass~BT~ | ~BT~(Str): Secret~BT~ | text as a ~BT~Secret~BT~ in ordinary memory; cannot fail |
 		| ~BT~reveal~BT~ | ~BT~(Secret): Str~BT~ | what a ~BT~Secret~BT~ holds, as text |
@@ -1774,10 +1783,11 @@ func builtins(): Str {
 		~BT~T.decode(text, codec)~BT~ — see [json](../stdlib/json.md).
 
 		~BT~spawn~BT~, ~BT~at~BT~ and ~BT~kill~BT~ are [services](stdlib/syslink.md). A handler is
-		~BT~proc(mut S, M): M~BT~, or ~BT~proc(mut S, M, Address): M~BT~ to be handed its own
-		address every turn, and ~BT~spawn~BT~ takes either. A name is one service's at a time,
-		so a second ~BT~spawn~BT~ under a name still held answers ~BT~"Taken"~BT~; one with no name
-		is always ~BT~Ok~BT~. ~BT~at~BT~ builds an address and looks nothing up.
+		~BT~proc(mut S, M): M~BT~, or ~BT~proc(mut S, M, Address<M>): M~BT~ to be handed its own
+		address every turn, and ~BT~spawn~BT~ takes either, answering with an ~BT~Address<M>~BT~. A
+		name is one service's at a time, so a second ~BT~spawn~BT~ under a name still held
+		fails as ~BT~SyslinkError.Taken~BT~; one with no name is always ~BT~Ok~BT~. ~BT~at~BT~ builds an
+		address and looks nothing up, and lands where an ~BT~Address<M>~BT~ is declared.
 
 		## A declaration of your own wins
 
@@ -2446,6 +2456,13 @@ func pitfalls(): Str {
 		would be nothing for the name or the ~BT~Result~BT~ to hold.
 
 		**An ~BT~async~BT~ call gets a copy of a ~BT~mut~BT~ argument**, not the caller's storage.
+
+		**An address says what its service takes.** ~BT~Address~BT~ on its own is an error, and
+		so is ~BT~box := at(#Cache)~BT~, since a name says nothing about the messages. →
+		~BT~Address<Op> box = at(#Cache)~BT~.
+
+		**What went wrong is a library error's variant**, matched like any union's →
+		~BT~why is file.FileError.NotFound~BT~, or a ~BT~switch~BT~ over every one.
 
 		## Collections and modules
 

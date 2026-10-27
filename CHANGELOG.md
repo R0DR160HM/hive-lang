@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.3.0
+
+### Language
+
+* **`Address<M>` says what its service takes**: a message of any other type is a compile error where it is sent, and the answer is an `M`.
+* **`spawn` reads `M` off its handler**, and a handler's third parameter is an `Address<M>` of its own mailbox type.
+* **`at` lands where an `Address<M>` is declared**, as `hive.map.new()` does, so `x := at(#Name)` is a compile error.
+* **`monitor`'s notice is one of the watcher's messages.**
+
+### Standard library
+
+* **A library error is a union of what went wrong**: `FileError`, `WsError`, `SocketError`, `NetError`, `SqlError`, `CryptoError`, `SyslinkError` and `SecretError` have a variant per failure, matched and covered like any other union.
+* **An error comes with the module that answers with it**, whether or not the program names its type.
+
+### Breaking
+
+| was | is |
+| --- | --- |
+| `Address` | `Address<M>`, with `M` the service's message type |
+| `box := at(#Name)` | `Address<M> box = at(#Name)` |
+| `why.reason == "NotFound"` | `why is file.FileError.NotFound` |
+| `SqlError` reason `"Query"` | `SqlError.Statement` |
+
 ## v0.2.18
 
 ### Standard library

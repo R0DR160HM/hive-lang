@@ -108,8 +108,8 @@ if slowShout("worth waiting for") with timeout 100 is Result.Error(err) {
   await-all of them — is refused rather than lowered to a type with no spelling.
 * On a request to a [service](14-stdlib.md#1410-hivesyslink) the clause folds
   into the request's own error rather than wrapping a second `Result` around the
-  first, so the result is still
-  `Result<Message, hive.syslink.SyslinkError>` with reason `"Timeout"`.
+  first, so the result is still `Result<Message, hive.syslink.SyslinkError>`,
+  failing as `SyslinkError.Timeout`.
 * An `async` binding cannot take one ([9.1](#x--async-fa--keep-the-result)).
 
 ## 9.5 What is deliberately absent

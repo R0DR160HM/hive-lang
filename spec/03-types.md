@@ -288,18 +288,42 @@ cannot see is rejected ([10](10-bounds.md#103-a-declared-length-is-a-promise)).
 
 ## 3.10 `Address`
 
-A [service](14-stdlib.md#1410-hivesyslink), in this process or on another
-machine. It is what [`spawn` and `at`](13-builtins.md#services-spawn-at-kill)
-answer with, and it is **called**: `box(message)` sends to the service and waits
-for its answer ([09](09-concurrency.md)).
+A [service](14-stdlib.md#1410-hivesyslink) taking messages of type `M`, in this
+process or on another machine. It is what
+[`spawn` and `at`](13-builtins.md#services-spawn-at-kill) answer with, and it is
+**called**: `box(message)` sends to the service and waits for its answer
+([09](09-concurrency.md)).
+
+**The type says the protocol.** A message sent to an `Address<M>` is an `M`, and
+the answer is an `M` too, since a service answers with one of its own messages —
+so `box(Op.Count())` on an `Address<Op>` is a `Result<Op, SyslinkError>`, and a
+message of any other type is a compile error. `M` is written wherever an address
+is: `Address` on its own says nothing about what the service takes, and is a
+compile error.
+
+```hive
+proc ask(counter: Address<Op>): void {
+	answer := counter(Op.Count())   // Result<Op, hive.syslink.SyslinkError>
+	_ := counter("count")           // compile error: an `Address<Op>` takes an Op
+}
+```
+
+`spawn` reads `M` off the handler it starts. `at` cannot — a name says where a
+service is and nothing about what it takes — so what it answers with has to
+land somewhere that says, as `hive.map.new()` does: a declaration
+(`Address<Op> counter = at(#Counter)`), a `return` whose callable declares an
+address, or an argument to a parameter or field declared as one. Whether the
+service under that name really takes an `M` is a fact about another program, or
+one that has not started yet, so it is checked where the message arrives: a
+service handed a message of another type answers `Decode`
+([14.10](14-stdlib.md#1410-hivesyslink)).
 
 An address is an ordinary value — stored in a field, passed as a parameter,
-carried inside a message — and it has no order, so `sort` refuses one. It is one
-type rather than one per protocol: what a send answers with is the type of the
-message sent, since a service answers with one of its own.
+carried inside a message — and it has no order, so `sort` refuses one. Two
+addresses compare with `==` when they take the same `M`.
 
 A program that declares its own `Address` has that one under the bare name, and
-the builtin is still there as `hive.Address`.
+the builtin is still there as `hive.Address<M>`.
 
 ## 3.11 `Secret`
 
@@ -319,11 +343,19 @@ into a `Str`.
 
 **Locked memory is finite**, so everything that locks a `Secret` answers a
 `Result`: `hide` answers `Result<Secret, SecretError>`, and so do
-`hive.term.readSecret` and `hive.crypto.randomSecret`. A `SecretError` has a
-`reason` — `"LimitExceeded"` when the locked-memory limit is used up,
-`"Unsupported"` where the platform cannot lock memory at all — and a `message`.
+`hive.term.readSecret` and `hive.crypto.randomSecret`. A `SecretError` is a
+union of two variants, each carrying a `message`:
+
+```hive
+type SecretError {
+	LimitExceeded   // the locked-memory limit is used up
+	Unsupported     // the platform cannot lock memory at all
+	message: Str
+}
+```
+
 A call that already fails in its own way reports it there instead:
-`hive.crypto.decrypt` as a `CryptoError` with that `reason`, and
+`hive.crypto.decrypt` as the `CryptoError` variant of the same name, and
 `hive.env.getSecret` as an `EnvironmentError`.
 
 `bypass(text)` makes a `Secret` without locking anything, so it cannot fail. It

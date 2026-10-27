@@ -54,12 +54,27 @@ func index(): Str {
 		Each module owns its types under its own namespace: ~BT~hive.net.HttpRequest~BT~,
 		~BT~hive.json.JsonError~BT~, ~BT~hive.map.Map~BT~, ~BT~hive.syslink.SyslinkError~BT~. The
 		only builtin types that live directly on ~BT~hive~BT~ are the three the language uses
-		without a module: ~BT~Result~BT~, ~BT~Table~BT~ and ~BT~Address~BT~.
+		without a module: ~BT~Result~BT~, ~BT~Table~BT~ and ~BT~Address<M>~BT~.
 
 		**A library call is held to its signature** — how many arguments, and what each
 		is — and a type or an enumeration variant the module does not have
 		(~BT~hive.net.Nonesuch~BT~, ~BT~hive.ui.TextSize.Small()~BT~) is a compile error rather
 		than something the Go toolchain reports later.
+
+		**A failure is a variant.** Where a module can fail in more than one way, its
+		error is a union with a variant per way, sharing a ~BT~message~BT~ and whatever else
+		the module knows — so it is matched and covered like any union:
+
+		~CODE~hive
+		if file.read(path) is Result.Error(file.FileError.NotFound(_, _)) \{
+			echo "nothing there yet"
+		}
+		~CODE~
+
+		These are ~BT~FileError~BT~, ~BT~WsError~BT~, ~BT~SocketError~BT~, ~BT~NetError~BT~, ~BT~SqlError~BT~,
+		~BT~CryptoError~BT~, ~BT~SyslinkError~BT~ and the core's ~BT~SecretError~BT~. One comes with the
+		module that answers with it, whether or not the program names it, and it prints
+		as what went wrong and why.
 
 		**A module you don't use is not in your build.** Every module but two is
 		written against the target's standard library alone, so HTTP, WebSockets, TCP,
@@ -272,8 +287,8 @@ func files(): Str {
 		| ~BT~xlsx(path)~BT~ | ~BT~Result<Table[dyn], TableError>~BT~ — one per sheet |
 		| ~BT~ods(path)~BT~ | ~BT~Result<Table[dyn], TableError>~BT~ — one per table |
 
-		A ~BT~FileError~BT~ carries ~BT~reason~BT~ — ~BT~"NotFound"~BT~, ~BT~"Permission"~BT~, ~BT~"Exists"~BT~ or
-		~BT~"Io"~BT~ — alongside the ~BT~path~BT~ and the underlying ~BT~message~BT~. A file that
+		A ~BT~FileError~BT~ is ~BT~NotFound~BT~, ~BT~Permission~BT~, ~BT~Exists~BT~ or ~BT~Io~BT~, each carrying the
+		~BT~path~BT~ and the underlying ~BT~message~BT~. A file that
 		opened and then turned out not to hold what it said it did is not a filesystem
 		failure, so the readers answer with a ~BT~TableError~BT~ of their own, carrying the
 		~BT~path~BT~ and a ~BT~message~BT~.
@@ -798,8 +813,9 @@ func crypto(): Str {
 		# ~BT~hive.crypto~BT~ — hashing, encoding, random
 
 		Pure, so all of it works in a ~BT~func~BT~ too. Fallible operations return
-		~BT~Result<_, hive.crypto.CryptoError>~BT~, whose ~BT~reason~BT~ is a short tag such as
-		~BT~"BadSignature"~BT~, ~BT~"Expired"~BT~ or ~BT~"Malformed"~BT~, alongside a ~BT~message~BT~.
+		~BT~Result<_, hive.crypto.CryptoError>~BT~: ~BT~Malformed~BT~, ~BT~BadSignature~BT~, or
+		~BT~LimitExceeded~BT~ or ~BT~Unsupported~BT~ where a ~BT~Secret~BT~ could not be locked, each with a
+		~BT~message~BT~.
 
 		Encryption is [crypto-encrypt](crypto-encrypt.md); tokens are
 		[crypto-jwt](crypto-jwt.md).
@@ -853,16 +869,16 @@ func cryptoEncrypt(): Str {
 
 			if hive.crypto.decrypt(sealed, password) is Result.Ok(opened) \{
 				echo reveal(opened)
-			} else if hive.crypto.decrypt(sealed, password) is Result.Error(why) \{
-				echo why.reason    // "BadSignature" for a wrong password
+			} else if hive.crypto.decrypt(sealed, password) is Result.Error(crypto.CryptoError.BadSignature(_)) \{
+				echo "wrong password, or the message was changed"
 			}
 		}
 		~CODE~
 
-		~BT~decrypt~BT~ answers ~BT~"LimitExceeded"~BT~ or ~BT~"Unsupported"~BT~ where there is no locked
+		~BT~decrypt~BT~ fails as ~BT~LimitExceeded~BT~ or ~BT~Unsupported~BT~ where there is no locked
 		memory to open the plaintext into. ~BT~decryptBypass~BT~ opens it into ordinary memory
-		instead, as ~BT~bypass~BT~ is to ~BT~hide~BT~: free to be swapped out, so it fails only with
-		~BT~"Malformed"~BT~ or ~BT~"BadSignature"~BT~.
+		instead, as ~BT~bypass~BT~ is to ~BT~hide~BT~: free to be swapped out, so it fails only as
+		~BT~Malformed~BT~ or ~BT~BadSignature~BT~.
 
 		## What it does, exactly
 
@@ -988,15 +1004,15 @@ func net(): Str {
 
 		## The errors
 
-		Each protocol has its own error type, and each carries a ~BT~reason~BT~ tag and a
-		~BT~message~BT~:
+		Each protocol has its own error type, and each is a union with a variant per way
+		it fails, every one carrying a ~BT~message~BT~:
 
-		| type | ~BT~reason~BT~ is one of |
+		| type | its variants |
 		| --- | --- |
-		| ~BT~HttpError~BT~ | carries the ~BT~url~BT~ and a ~BT~message~BT~ instead of a tag |
-		| ~BT~WsError~BT~ | ~BT~"Handshake"~BT~ ~BT~"Protocol"~BT~ ~BT~"Closed"~BT~ ~BT~"Send"~BT~ ~BT~"Receive"~BT~ |
-		| ~BT~SocketError~BT~ | ~BT~"Connect"~BT~ ~BT~"Closed"~BT~ ~BT~"Send"~BT~ ~BT~"Receive"~BT~ |
-		| ~BT~NetError~BT~ | ~BT~"NotFound"~BT~ ~BT~"Lookup"~BT~ ~BT~"NoAddress"~BT~ |
+		| ~BT~HttpError~BT~ | none — a struct carrying the ~BT~url~BT~ and a ~BT~message~BT~ |
+		| ~BT~WsError~BT~ | ~BT~Handshake~BT~ ~BT~Protocol~BT~ ~BT~Closed~BT~ ~BT~Send~BT~ ~BT~Receive~BT~ |
+		| ~BT~SocketError~BT~ | ~BT~Connect~BT~ ~BT~Closed~BT~ ~BT~Send~BT~ ~BT~Receive~BT~ |
+		| ~BT~NetError~BT~ | ~BT~NotFound~BT~ ~BT~Lookup~BT~ ~BT~NoAddress~BT~ |
 
 		For a server that answers with a **page rather than a string**, ~BT~hive.ui.page~BT~
 		renders the same view tree a window paints: see [ui](ui.md).
@@ -1094,8 +1110,8 @@ func netWebsockets(): Str {
 		~BT~handler~BT~ is a ~BT~proc(WsConnection): void~BT~, run once per connection on a thread
 		of its own. A ~BT~WsConnection~BT~ is **opaque** — a handle to hold and hand back.
 
-		A ~BT~WsError~BT~'s ~BT~reason~BT~ is ~BT~"Handshake"~BT~, ~BT~"Protocol"~BT~, ~BT~"Closed"~BT~, ~BT~"Send"~BT~
-		or ~BT~"Receive"~BT~. **A peer that hangs up is ~BT~"Closed"~BT~ — the ordinary end of a
+		A ~BT~WsError~BT~ is ~BT~Handshake~BT~, ~BT~Protocol~BT~, ~BT~Closed~BT~, ~BT~Send~BT~ or ~BT~Receive~BT~.
+		**A peer that hangs up is ~BT~WsError.Closed~BT~ — the ordinary end of a
 		conversation**, not a failure to report.
 
 		## A server
@@ -1158,8 +1174,7 @@ func netSockets(): Str {
 		~BT~handler~BT~ is a ~BT~proc(SocketConnection): void~BT~, run once per connection on a
 		thread of its own. A ~BT~SocketConnection~BT~ is **opaque**.
 
-		A ~BT~SocketError~BT~'s ~BT~reason~BT~ is ~BT~"Connect"~BT~, ~BT~"Closed"~BT~, ~BT~"Send"~BT~ or
-		~BT~"Receive"~BT~.
+		A ~BT~SocketError~BT~ is ~BT~Connect~BT~, ~BT~Closed~BT~, ~BT~Send~BT~ or ~BT~Receive~BT~.
 
 		## A short read is normal
 
@@ -1205,7 +1220,7 @@ func netNames(): Str {
 		| ~BT~resolve(name)~BT~ | ~BT~Result<Str[dyn], NetError>~BT~ |
 		| ~BT~localAddress()~BT~ | ~BT~Result<Str, NetError>~BT~ |
 
-		A ~BT~NetError~BT~'s ~BT~reason~BT~ is ~BT~"NotFound"~BT~, ~BT~"Lookup"~BT~ or ~BT~"NoAddress"~BT~.
+		A ~BT~NetError~BT~ is ~BT~NotFound~BT~, ~BT~Lookup~BT~ or ~BT~NoAddress~BT~.
 
 		## ~BT~resolve~BT~
 
@@ -1237,7 +1252,7 @@ func netNames(): Str {
 
 		**Nothing is sent to find out**, and **loopback is deliberately not an answer** —
 		~BT~127.0.0.1~BT~ is not an address anybody else can use, so a machine that has only
-		that answers ~BT~"NoAddress"~BT~ rather than something misleading.
+		that answers ~BT~NetError.NoAddress~BT~ rather than something misleading.
 
 		This is what a [node](syslink-nodes.md) prints so another can dial it.
 	`)
@@ -1363,14 +1378,14 @@ func sql(): Str {
 
 		## The errors
 
-		A ~BT~SqlError~BT~ carries a ~BT~reason~BT~ and a ~BT~message~BT~. The reason is:
+		A ~BT~SqlError~BT~ is one of four variants, each carrying a ~BT~message~BT~:
 
-		| ~BT~reason~BT~ | means |
+		| variant | means |
 		| --- | --- |
-		| ~BT~"Connection"~BT~ | the database could not be opened or reached, or the connection is closed |
-		| ~BT~"Query"~BT~ | the statement itself failed |
-		| ~BT~"Shape"~BT~ | a different number of columns came back |
-		| ~BT~"Convert"~BT~ | a cell did not fit its field's type |
+		| ~BT~Connection~BT~ | the database could not be opened or reached, or the connection is closed |
+		| ~BT~Statement~BT~ | the statement itself failed |
+		| ~BT~Shape~BT~ | a different number of columns came back |
+		| ~BT~Convert~BT~ | a cell did not fit its field's type |
 
 		## In-memory SQLite
 
@@ -1393,7 +1408,8 @@ func syslink(): Str {
 
 		Addressable **services**, in this process or on another machine, reached by the
 		same statement either way. A service is long-lived, owns private state only it
-		can touch, and has an identity you can pass around: an ~BT~Address~BT~.
+		can touch, and has an identity you can pass around: an ~BT~Address<M>~BT~, which
+		says the type ~BT~M~BT~ of the messages it takes.
 
 		A service is started, named and stopped by three **builtins** — ~BT~spawn~BT~,
 		~BT~at~BT~ and ~BT~kill~BT~ — and what is left in the module is the node. Every call
@@ -1440,13 +1456,18 @@ func syslink(): Str {
 		The compiler holds a handler to that shape where the service is started: its
 		first parameter takes the mutex, the state it starts with fits that parameter,
 		and it returns its own mailbox type. ~BT~spawn~BT~ answers with a ~BT~Result~BT~, since
-		a service started under a name may find the name taken.
+		a service started under a name may find the name taken, holding an
+		~BT~Address<M>~BT~ read off the handler.
 
 		## The mailbox type is the whole protocol
 
 		**The reply type *is* the mailbox type**, so nothing is annotated: a service
 		answers with one of its own messages. That is what makes one type declaration
-		the whole contract between a caller and a service, on this machine or another.
+		the whole contract between a caller and a service, on this machine or another —
+		and the address carries it, so **a message of another type is a compile error**
+		where it is sent. What the compiler cannot see is whether the service under a
+		name really takes an ~BT~M~BT~, so a message that does not decode where it arrives
+		fails as ~BT~Decode~BT~.
 
 		**Every request is answered** with what its turn returned, and a caller on this
 		node is handed its own copy, since the next turn may write the state the answer
@@ -1455,18 +1476,18 @@ func syslink(): Str {
 		## A crash is local to its service
 
 		A ~BT~panic~BT~ inside a service body **kills only that service**: its monitors are
-		told, its callers get ~BT~"Down"~BT~, and the node keeps running. **This is the one
+		told, its callers get ~BT~Down~BT~, and the node keeps running. **This is the one
 		place ~BT~panic~BT~ does not stop the program.** The node says so on standard error,
 		as ~BT~hive: service Counter crashed: <message>~BT~.
 
 		## A service that knows its own address
 
-		A handler may take a third parameter, an ~BT~Address~BT~, and is then handed its
-		own address every turn — to give to work it starts, so that the result comes
+		A handler may take a third parameter, an ~BT~Address<M>~BT~ of its own mailbox type,
+		and is then handed its own address every turn — to give to work it starts, so that the result comes
 		back as a message. ~BT~spawn~BT~ takes either shape:
 
 		~CODE~hive
-		proc fetcher(pending: mut Int, note: Note, me: Address): Note \{
+		proc fetcher(pending: mut Int, note: Note, me: Address<Note>): Note \{
 			if note is Note.Fetch(url) \{
 				pending += 1
 				async download(me, url)
@@ -1494,10 +1515,10 @@ func syslinkCalls(): Str {
 
 		| call | answers with |
 		| --- | --- |
-		| ~BT~spawn(handler, state)~BT~ | ~BT~Result<Address, SyslinkError>~BT~ — starts a service |
+		| ~BT~spawn(handler, state)~BT~ | ~BT~Result<Address<M>, SyslinkError>~BT~ — starts a service |
 		| ~BT~spawn(handler, state, name)~BT~ | the same, registered under ~BT~name~BT~ |
-		| ~BT~at(name)~BT~ | ~BT~Address~BT~ — that service on **this** node |
-		| ~BT~at(endpoint, name)~BT~ | ~BT~Address~BT~ — the same service on **another** |
+		| ~BT~at(name)~BT~ | ~BT~Address<M>~BT~ — that service on **this** node |
+		| ~BT~at(endpoint, name)~BT~ | ~BT~Address<M>~BT~ — the same service on **another** |
 		| ~BT~kill(address)~BT~ | ~BT~void~BT~ — stops it |
 
 		The rest are the module's own, ~BT~hive.syslink.<call>~BT~:
@@ -1510,21 +1531,22 @@ func syslinkCalls(): Str {
 		| ~BT~peers()~BT~ | ~BT~Str[dyn]~BT~ |
 		| ~BT~setKey(key: Secret)~BT~ | ~BT~void~BT~ |
 
-		~BT~Address~BT~ is a builtin type, and **opaque**: an address is produced by ~BT~spawn~BT~
-		or ~BT~at~BT~. A ~BT~hive.syslink.SyslinkError~BT~ carries a ~BT~reason~BT~ and a
-		~BT~message~BT~:
+		~BT~Address<M>~BT~ is a builtin type, and **opaque**: an address is produced by ~BT~spawn~BT~
+		or ~BT~at~BT~, and ~BT~Address~BT~ without its ~BT~M~BT~ is a compile error. A
+		~BT~hive.syslink.SyslinkError~BT~ is a union of what went wrong, each variant carrying
+		a ~BT~message~BT~:
 
-		| ~BT~reason~BT~ | means |
+		| variant | means |
 		| --- | --- |
-		| ~BT~"Taken"~BT~ | ~BT~spawn~BT~ was given a name another service holds |
-		| ~BT~"Down"~BT~ | the service died before answering, or was already gone — at once |
-		| ~BT~"NoProc"~BT~ | nothing is registered under that name on the node asked |
-		| ~BT~"Timeout"~BT~ | no answer within the time given, or the default |
-		| ~BT~"Unreachable"~BT~ | the node could not be reached |
-		| ~BT~"Decode"~BT~ | the message did not decode as the type the service takes |
-		| ~BT~"NoPeer"~BT~ | the address names no node to send to |
-		| ~BT~"NoListener"~BT~ | ~BT~listen~BT~ could not listen where it was told, or this node has not listened and was asked to reach another |
-		| ~BT~"NoKey"~BT~ | there is no cluster key to authenticate with |
+		| ~BT~Taken~BT~ | ~BT~spawn~BT~ was given a name another service holds |
+		| ~BT~Down~BT~ | the service died before answering, or was already gone — at once |
+		| ~BT~NoProc~BT~ | nothing is registered under that name on the node asked |
+		| ~BT~Timeout~BT~ | no answer within the time given, or the default |
+		| ~BT~Unreachable~BT~ | the node could not be reached |
+		| ~BT~Decode~BT~ | the message did not decode as the type the service takes |
+		| ~BT~NoPeer~BT~ | the address names no node to send to |
+		| ~BT~NoListener~BT~ | ~BT~listen~BT~ could not listen where it was told, or this node has not listened and was asked to reach another |
+		| ~BT~NoKey~BT~ | there is no cluster key to authenticate with |
 
 		## An address is called
 
@@ -1533,36 +1555,38 @@ func syslinkCalls(): Str {
 
 		~CODE~hive
 		async inbox(Note.Say("hi"))          // send it, wait for nothing; cannot fail
-		answer := cache(Op.Count())          // send and wait: Result<Message, SyslinkError>
+		answer := cache(Op.Count())          // send and wait: Result<Op, SyslinkError>
 		answer := cache(Op.Count()) with timeout 250
 		later  := async cache(Op.Count())    // wait where ~BT~later~BT~ is read
 		both   := await [a(m), b(m)]         // one barrier, one deadline
 		~CODE~
 
-		A fire-and-forget send **cannot fail** and has nothing to report. A request
-		answers with ~BT~Result<Message, SyslinkError>~BT~, where ~BT~Message~BT~ is the service's
-		own mailbox type.
+		A fire-and-forget send **cannot fail** and has nothing to report. A request to an
+		~BT~Address<M>~BT~ carries an ~BT~M~BT~ and answers with ~BT~Result<M, SyslinkError>~BT~; a message
+		of any other type is a compile error.
 
 		~BT~with timeout~BT~ **folds into that same error** rather than wrapping a second
-		~BT~Result~BT~ around the first, so the result is still
-		~BT~Result<Message, SyslinkError>~BT~ with ~BT~reason~BT~ ~BT~"Timeout"~BT~.
+		~BT~Result~BT~ around the first, so the result is still ~BT~Result<M, SyslinkError>~BT~,
+		failing as ~BT~SyslinkError.Timeout~BT~.
 
 		## Names and addresses
 
 		A service is named as it is **spawned**, by an **atom**, and a name is one
-		service's at a time on a node: a second ~BT~spawn~BT~ under a name still held answers
-		~BT~"Taken"~BT~. One with no name has nothing to be refused, and is always ~BT~Ok~BT~.
+		service's at a time on a node: a second ~BT~spawn~BT~ under a name still held fails as
+		~BT~Taken~BT~. One with no name has nothing to be refused, and is always ~BT~Ok~BT~.
 
 		~BT~at~BT~ **performs no I/O and cannot fail** — it is address *construction*, not a
-		lookup. Nothing is dialled until something is sent.
+		lookup. Nothing is dialled until something is sent. A name says nothing about
+		what the service takes, so **~BT~at~BT~ lands where an address is declared**, as
+		~BT~hive.map.new()~BT~ does: ~BT~x := at(#Cache)~BT~ is a compile error.
 
 		~CODE~hive
-		if spawn(counter, empty, #Cache) is Result.Error(why) \{
-			echo why.reason                       // "Taken"
+		if spawn(counter, empty, #Cache) is Result.Error(syslink.SyslinkError.Taken(_)) \{
+			echo "somebody else is #Cache"
 		}
 
-		here  := at(#Cache)                     // this node
-		there := at("10.0.0.4:9000", #Cache)    // another
+		Address<Op> here  = at(#Cache)                    // this node
+		Address<Op> there = at("10.0.0.4:9000", #Cache)   // another
 		~CODE~
 
 		**A named address is the only kind that survives its service being restarted**,
@@ -1573,7 +1597,8 @@ func syslinkCalls(): Str {
 
 		~BT~monitor(watcher, target, notice)~BT~ posts ~BT~notice~BT~ to ~BT~watcher~BT~ — a service on
 		this node, such as ~BT~at(#Supervisor)~BT~ or the address a handler is handed — when
-		~BT~target~BT~ dies. That is how a supervisor is written, and it is why a crash
+		~BT~target~BT~ dies. The notice is one of the watcher's messages, and the target may
+		take anything. That is how a supervisor is written, and it is why a crash
 		being local is useful rather than merely quiet.
 
 		~BT~kill(address)~BT~ ends a service, on this node or another. Its name is free
@@ -1659,11 +1684,12 @@ func syslinkNodes(): Str {
 		that something it depended on has gone.
 
 		~BT~with timeout~BT~ is what bounds a call to a machine that may not answer, and it
-		folds into ~BT~SyslinkError~BT~ with ~BT~reason~BT~ ~BT~"Timeout"~BT~:
+		folds into ~BT~SyslinkError.Timeout~BT~:
 
 		~CODE~hive
-		if at(endpoint, #Cache)(Op.Count()) with timeout 250 is Result.Error(why) \{
-			echo why.reason
+		Address<Op> far = at(endpoint, #Cache)
+		if far(Op.Count()) with timeout 250 is Result.Error(syslink.SyslinkError.Timeout(_)) \{
+			echo "no answer in time"
 		}
 		~CODE~
 	`)

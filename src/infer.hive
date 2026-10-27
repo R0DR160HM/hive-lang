@@ -291,7 +291,7 @@ func callType(env: Env, callee: ast.Expr, args: ast.Arg[]): types.Ty {
 	// somewhere to report to. A service answers with one of its own messages, so
 	// what comes back is whatever its mailbox holds.
 	if isAddressType(typeOf(env, callee)) {
-		return sendResult(env, args)
+		return sendResult(env, typeOf(env, callee), args)
 	}
 	argTypes := typesOfArgs(env, args)
 
@@ -381,14 +381,37 @@ func memberCallType(env: Env, subject: ast.Expr, field: Str, argTypes: types.Ty[
 }
 
 // A service answers with one of *its own* messages, so the reply type is the
-// mailbox type — which is the type of the message that was sent. That is what
-// takes the annotation off an await site entirely.
-func sendResult(env: Env, args: ast.Arg[]): types.Ty {
-	mut message := types.Ty.TUnknown()
-	if args bounds 0 {
-		message = typeOf(env, args[0].value)
+// mailbox type the address carries. That is what takes the annotation off an
+// await site entirely.
+func sendResult(env: Env, address: types.Ty, args: ast.Arg[]): types.Ty {
+	return types.Ty.TResult(mailboxOf(env, address, args), syslinkError())
+}
+
+// What a send to `address` carries: its mailbox type, or, where the address
+// never said, the type of the message itself — which the checker has refused.
+func mailboxOf(env: Env, address: types.Ty, args: ast.Arg[]): types.Ty {
+	if address is types.Ty.TAddress(message) {
+		if message is types.Ty.TUnknown {
+		} else {
+			return message
+		}
 	}
-	return types.Ty.TResult(message, types.Ty.TLib("syslink", "SyslinkError"))
+	if args bounds 0 {
+		return typeOf(env, args[0].value)
+	}
+	return types.Ty.TUnknown()
+}
+
+// The message type a `spawn` handler takes, which is what its address takes.
+func handlerMessage(handler: types.Ty): types.Ty {
+	if handler is types.Ty.TFn(_, params, _, _) {
+		return typeAt(params, 1)
+	}
+	return types.Ty.TUnknown()
+}
+
+func syslinkError(): types.Ty {
+	return types.libraryError("syslink", "SyslinkError")
 }
 
 // Whether this expression is a call of an address, which is a send.
@@ -400,7 +423,7 @@ func isSendExpr(env: Env, e: ast.Expr): Bool {
 }
 
 func isAddressType(ty: types.Ty): Bool {
-	return ty is types.Ty.TAddress
+	return ty is types.Ty.TAddress(_)
 }
 
 func resultConstructor(variant: Str, argTypes: types.Ty[]): types.Ty {
@@ -613,12 +636,15 @@ func builtinResult(env: Env, name: Str, argTypes: types.Ty[], args: ast.Arg[]): 
 	if name == "filterMap" {
 		return types.Ty.TVec(okOf(resultOfFn(typeAt(argTypes, 1))), ast.Dim.Dynamic())
 	}
-	// Either form of `spawn` answers a Result, since a name may be taken.
+	// Either form of `spawn` answers a Result, since a name may be taken. The
+	// address takes what the handler does.
 	if name == "spawn" {
-		return types.Ty.TResult(types.Ty.TAddress(), types.Ty.TLib("syslink", "SyslinkError"))
+		return types.Ty.TResult(types.Ty.TAddress(handlerMessage(subject)), syslinkError())
 	}
+	// A name says where a service is and nothing about what it takes, so that is
+	// read off where the address lands.
 	if name == "at" {
-		return types.Ty.TAddress()
+		return types.Ty.TAddress(types.Ty.TUnknown())
 	}
 	if name == "kill" {
 		return types.Ty.TVoid()

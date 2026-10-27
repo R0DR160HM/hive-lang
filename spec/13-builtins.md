@@ -32,11 +32,11 @@ column below; a position overloaded by type answers to each of its names, so
 | `sort(values)` | `sort(T[]): T[dyn]` | in the element type's own order |
 | `sort(values, first)` | `sort(T[], func(T, T): Bool): T[dyn]` | in the order `first` gives |
 | `encode(value, codec)` | `encode(T, hive.codec.Codec<E>): Str` | `value` written in the format `codec` names |
-| `spawn(handler, state)` | `spawn(proc(mut S, M): M, S): Result<Address, hive.syslink.SyslinkError>` | starts a service |
-| `spawn(handler, state, name)` | `spawn(proc(mut S, M): M, S, Atom): Result<Address, hive.syslink.SyslinkError>` | starts one registered under `name` |
-| `at(name)` | `at(Atom): Address` | the service registered under `name` on this node |
-| `at(endpoint, name)` | `at(Str, Atom): Address` | the same service on the node at `endpoint` |
-| `kill(address)` | `kill(Address): void` | stops a service |
+| `spawn(handler, state)` | `spawn(proc(mut S, M): M, S): Result<Address<M>, hive.syslink.SyslinkError>` | starts a service |
+| `spawn(handler, state, name)` | `spawn(proc(mut S, M): M, S, Atom): Result<Address<M>, hive.syslink.SyslinkError>` | starts one registered under `name` |
+| `at(name)` | `at(Atom): Address<M>` | the service registered under `name` on this node, `M` read off where it lands |
+| `at(endpoint, name)` | `at(Str, Atom): Address<M>` | the same service on the node at `endpoint` |
+| `kill(address)` | `kill(Address<M>): void` | stops a service |
 | `hide(text)` | `hide(Str): Result<Secret, SecretError>` | `text` as a [`Secret`](03-types.md#311-secret), in memory never swapped to disk |
 | `bypass(text)` | `bypass(Str): Secret` | `text` as a `Secret` in ordinary memory, which cannot fail |
 | `reveal(secret)` | `reveal(Secret): Str` | what a `Secret` holds, as text |
@@ -90,21 +90,24 @@ A [service](14-stdlib.md#1410-hivesyslink) is started, named and stopped by
 these three, and reached by calling its `Address`.
 
 * **`spawn` takes either shape of handler**: `proc(mut S, M): M`, or
-  `proc(mut S, M, Address): M` for one handed its own address every turn. It is
-  the same call either way, and so is a window from
-  [`hive.ui.window`](14-stdlib.md#1415-hiveui).
+  `proc(mut S, M, Address<M>): M` for one handed its own address every turn. It
+  is the same call either way, and so is a window from
+  [`hive.ui.window`](14-stdlib.md#1415-hiveui). The address it answers with is
+  an `Address<M>`, read off the handler.
 * **A name is optional, and registers the service as it starts.** The name is
   an atom, and a name is one service's at a time on a node: a second `spawn`
-  under a name still held answers `Error` with reason `"Taken"`. A service with no
-  name has nothing to be refused, so its `spawn` is always `Ok`. A named service
-  answers with a **named address**, the only kind that survives the service being
-  restarted under the same name.
+  under a name still held answers `Error(SyslinkError.Taken(...))`. A service
+  with no name has nothing to be refused, so its `spawn` is always `Ok`. A named
+  service answers with a **named address**, the only kind that survives the
+  service being restarted under the same name.
 * **`at` performs no I/O and cannot fail.** It is address construction rather
   than a lookup, so a program may name a service that is not running yet — and a
-  request to one that is not there is what reports it.
-* **`kill` works on any address**, on this node or another. The service's
-  mailbox closes, its monitors are told, and its name is free again before any of
-  them hears about it. Killing one twice is harmless.
+  request to one that is not there is what reports it. A name says nothing about
+  what the service takes, so `at` lands where an `Address<M>` is declared
+  ([3.10](03-types.md#310-address)): `x := at(#Cache)` is a compile error.
+* **`kill` works on any address**, whatever it takes, on this node or another.
+  The service's mailbox closes, its monitors are told, and its name is free again
+  before any of them hears about it. Killing one twice is harmless.
 
 ## Secrets: `hide`, `bypass`, `reveal`
 

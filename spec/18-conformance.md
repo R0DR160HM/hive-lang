@@ -159,12 +159,6 @@ different route, or does not quite do it.
   value, and Hive has neither, so the hash is one line of Go instead of thirty of
   Hive. What matters is that both ends of a wire compute the same number from the
   same declaration, and they do.
-* **An address does not carry its mailbox type.** `Address` is one
-  type rather than one per protocol, and what a send answers with is read off the
-  *message* instead — which is the same type, since a service answers with one of
-  its own messages. The effect is the one the specification describes; what is
-  missing is the compile-time refusal of a send whose message is not the
-  mailbox's.
 
 ## 18.3 Defects this chapter turned up in this one
 
