@@ -35,7 +35,7 @@ operators are listed before their one-character prefixes below.
 
 ### Keywords
 
-Every keyword is lower case **and only lower case**:
+Every keyword is lower case, and **only that spelling is reserved**:
 
 ```
 import   proc     func     query    test     type
@@ -45,33 +45,19 @@ dyn      mut      async    await    for      in
 each     bounds   break    continue
 ```
 
-A word that is a keyword in some other casing — `IF`, `Proc`, `VOID` — is
-**neither a keyword nor a name**. It is a compile error naming both readings.
-The alternative, reading it as an identifier, would hide the mistake somewhere
-further on where its shape is no longer visible.
-
-```hive
-Proc main(): void { }   // compile error: `Proc` is a keyword written the wrong way
-```
-
-This reaches further than it first looks, because it holds of **every**
-identifier position, not only the ones where a keyword would make sense. No
-name anywhere in a program — a type, a variant, a field, a variable — may
-lowercase to a keyword. So a tagged union of statement kinds cannot have a
-variant called `Return`, `Break` or `Echo`, and a type cannot have a field
-called `type` or `query`:
+Any other casing is an ordinary name — `Proc`, `IF`, `proC` — so a union of
+statement kinds may have a variant called `Return`, and a type may be called
+`Query`:
 
 ```hive
 type Stmt {
-	Return { value: Expr }   // compile error: `Return` is `return` shouted
-	ReturnStmt { value: Expr }  // fine
+	Return { value: Expr }   // fine: `Return` is a name, `return` the keyword
+	Break
 }
 ```
 
-The rule is worth the cost. A keyword that meant one thing in lower case and
-another in Pascal case would make `Is` and `is`, or `Type` and `type`, two
-different things that read alike — and the mistake would surface as a parse
-error somewhere else entirely.
+A field cannot be called `type` or `query`, since those are the keywords
+themselves.
 
 Two words are keywords **only where they are written**, and are ordinary
 identifiers everywhere else: `as` (after an import path) and `timeout` (in

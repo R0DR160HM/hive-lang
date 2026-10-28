@@ -79,9 +79,9 @@ Not normative, but it is the standard the language's own messages are held to:
   because Hive never widens a number behind your back; a message that only said
   "expected Float, found Int" would leave the reader hunting for the conversion
   they are supposed to have known about.
-* **Never guess.** A misspelled keyword is reported as a miscased keyword *and*
-  as a name that was taken, because both readings are live and the compiler
-  cannot know which was meant.
+* **Never guess.** A value computed and then dropped is reported with both
+  fixes — keep it with `x := ...`, or discard it with `_ := ...` — because both
+  readings are live and the compiler cannot know which was meant.
 
 ## 17.5 The one diagnostic that is not an error
 

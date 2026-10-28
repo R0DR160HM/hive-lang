@@ -394,7 +394,7 @@ proc checkSqlGroup(c: mut Check, env: infer.Env, group: ast.SqlGroup): void {
 // does.
 proc checkBoundValue(c: mut Check, env: infer.Env, value: ast.Expr): void {
 	ty := infer.typeOf(env, value)
-	if ty is types.Ty.TStr || ty is types.Ty.TInt || ty is types.Ty.TFloat
+	if ty is types.Ty.TStr || types.isNumber(ty)
 		|| ty is types.Ty.TBool || ty is types.Ty.TAtom || ty is types.Ty.TUnknown {
 		return
 	}
@@ -671,6 +671,12 @@ proc checkMarks(c: mut Check, f: ast.Field): void {
 	if types.same(declared, given) {
 		return
 	}
+	if infer.intLiteral(f.marks.fallback) is Result.Ok(n) && types.holdsLiteral(declared, n) {
+		return
+	}
+	if infer.isFloatLiteral(f.marks.fallback) && declared is types.Ty.TFloat32 && holdsFloat32(f.marks.fallback) {
+		return
+	}
 	// A literal of the wrong type would be a field decoding into something its
 	// own declaration says it cannot hold, so this is the one place the
 	// annotation is held to the type beside it.
@@ -849,11 +855,11 @@ proc checkStmt(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
 		// `hive.map.new()` says empty and nothing about what it holds, so it has
 		// to land somewhere that says.
 		if isEmptyMap(value) {
-			report(c, "`hive.map.new()` has to land somewhere that says what it holds: a declaration (`hive.map.Map<Str, Int> m = hive.map.new()`), a `return` whose callable declares a map, or an argument to a parameter declared as one. A `:=` binding reads the type off the value, and this one has none to give")
+			report(c, "`hive.map.new()` has to land somewhere that says what it holds: a declaration (`hive.map.Map<Str, Int> m = hive.map.new()`), a `return` whose callable declares a map, an argument to a parameter declared as one, or a later use of `{name}` that says it, such as `hive.map.set({name}, \"a\", 1)`. Nothing after this binding does")
 		}
 		// A name says where a service is, and nothing about what it takes.
 		if isAtCall(value) && ty is types.Ty.TAddress(types.Ty.TUnknown) {
-			report(c, "`at` has to land somewhere that says what the service takes: a declaration (`Address<Op> counter = at(#Counter)`), a `return` whose callable declares an address, or an argument to a parameter or field declared as one. A `:=` binding reads the type off the value, and this one has none to give")
+			report(c, "`at` has to land somewhere that says what the service takes: a declaration (`Address<Op> counter = at(#Counter)`), a `return` whose callable declares an address, an argument to a parameter or field declared as one, or a later use of `{name}` that says it, such as a send: `{name}(Op.Ping())`. Nothing after this binding does")
 		}
 		checkHoldsValue(c, name, ty, deferred)
 		declareName(c, name)
@@ -867,7 +873,7 @@ proc checkStmt(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
 		checkLibTypes(c, ty)
 		checkHoldsValue(c, name, infer.typeOf(env, value), deferred)
 		if deferred == false {
-			fits(c, ty, infer.typeOf(env, value), "the declaration of `{name}`")
+			fitsValue(c, env, ty, value, "the declaration of `{name}`")
 		}
 		declareName(c, name)
 		if mutable {
@@ -1057,7 +1063,7 @@ proc checkReturn(c: mut Check, env: infer.Env, value: ast.Expr): void {
 		report(c, "this `return` answers with a value, and the declaration says `void`")
 		return
 	}
-	fits(c, c.result, infer.typeOf(env, value), "this `return`")
+	fitsValue(c, env, c.result, value, "this `return`")
 }
 
 proc checkAssign(c: mut Check, env: infer.Env, target: ast.Expr, value: ast.Expr): void {
@@ -1084,7 +1090,7 @@ proc checkAssign(c: mut Check, env: infer.Env, target: ast.Expr, value: ast.Expr
 		report(c, "a value of a union is taken apart with `is` and built whole, so one of its fields is not assigned on its own. Build the variant again with the new value")
 		return
 	}
-	fits(c, infer.typeOf(env, target), infer.typeOf(env, value), "the assignment to `{root}`")
+	fitsValue(c, env, infer.typeOf(env, target), value, "the assignment to `{root}`")
 }
 
 // Whether a target writes through a `Str`'s subscript, at any depth: `s[0]` and
@@ -1164,7 +1170,9 @@ proc checkExpr(c: mut Check, env: infer.Env, e: ast.Expr): void {
 	} else if e is ast.Expr.Negate(operand) {
 		checkExpr(c, env, operand)
 		ty := infer.typeOf(env, operand)
-		if (ty is types.Ty.TInt || ty is types.Ty.TFloat || ty is types.Ty.TUnknown) == false {
+		if types.isUnsigned(ty) {
+			report(c, "unary `-` negates a signed number, and " + types.show(ty) + " is unsigned: it has no negative values to answer with")
+		} else if (types.isNumber(ty) || ty is types.Ty.TUnknown) == false {
 			report(c, "unary `-` negates an `Int` or a `Float`, and this is " + types.show(ty))
 		}
 	} else if e is ast.Expr.AwaitAll(calls, timeout) {
@@ -1296,7 +1304,7 @@ proc checkMember(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str): v
 }
 
 func hasNoFields(ty: types.Ty): Bool {
-	return ty is types.Ty.TStr || ty is types.Ty.TInt || ty is types.Ty.TFloat
+	return ty is types.Ty.TStr || types.isNumber(ty)
 		|| ty is types.Ty.TBool || ty is types.Ty.TAtom || ty is types.Ty.TAddress(_)
 		|| ty is types.Ty.TSecret(_)
 		|| ty is types.Ty.TFn(_, _, _, _) || ty is types.Ty.TVec(_, _)
@@ -1397,17 +1405,31 @@ proc checkOperands(c: mut Check, env: infer.Env, op: ast.BinOp, left: ast.Expr, 
 		report(c, "`" + ast.opSpelling(op) + "` joins two `Bool`s, and these are " + types.show(leftType) + " and " + types.show(rightType))
 		return
 	}
-	if types.operandsFit(leftType, rightType) == false {
-		report(c, "`" + ast.opSpelling(op) + "` wants two of one type, and these are " + types.show(leftType) + " and " + types.show(rightType) + whyMixed(leftType, rightType))
+	operands := infer.operandType(env, left, right)
+	if operands is types.Ty.TUnknown {
+		// Comparing converts nothing that is kept, so two integers compare by value
+		// whatever their sizes, which is what keeps `i < len(v)` a guard.
+		if infer.isComparison(op) && types.isInteger(leftType) && types.isInteger(rightType) {
+			return
+		}
+		if types.operandsFit(leftType, rightType) == false {
+			report(c, "`" + ast.opSpelling(op) + "` wants two of one type, and these are " + types.show(leftType) + " and " + types.show(rightType) + whyMixed(leftType, rightType))
+			return
+		}
+		checkOperandKind(c, op, leftType)
 		return
 	}
-	checkOperandKind(c, op, leftType)
+	spelled := "`" + ast.opSpelling(op) + "`"
+	if literalMisses(c, operands, left, spelled) || literalMisses(c, operands, right, spelled) {
+		return
+	}
+	checkOperandKind(c, op, operands)
 }
 
 // What each operator is defined on (5.6), once both sides are the same type.
 proc checkOperandKind(c: mut Check, op: ast.BinOp, ty: types.Ty): void {
 	spelled := "`" + ast.opSpelling(op) + "`"
-	number := ty is types.Ty.TInt || ty is types.Ty.TFloat
+	number := types.isNumber(ty)
 	if op is ast.BinOp.Eq || op is ast.BinOp.Neq {
 		if types.holds(c.table, ty, isFunction, []) {
 			report(c, spelled + " compares two values, and a function value has no equality to compare — two that do the same thing cannot be told from two that do not. Compare what they answer with instead")
@@ -1468,7 +1490,7 @@ proc checkSend(c: mut Check, env: infer.Env, callee: ast.Expr, mailbox: types.Ty
 		}
 		return
 	}
-	fits(c, mailbox, typeOfArg(c, env, args, 0), "the message sent to an `" + types.show(types.Ty.TAddress(mailbox)) + "`")
+	fitsArg(c, env, mailbox, args, 0, "the message sent to an `" + types.show(types.Ty.TAddress(mailbox)) + "`")
 }
 
 proc checkNamedCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): void {
@@ -1546,6 +1568,15 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
 			}
 			return
 		}
+		if infer.isConversion(head) {
+			target := infer.conversionType(head)
+			if field != "checked" || types.isInteger(target) == false {
+				report(c, "`{head}.{field}` is not a call: an integer type `T` has `T.checked(x)`, which answers `Error(x)` where `x` does not fit, and a float type has only `T(x)`")
+			} else if arity(c, "{head}.checked", args, 1) {
+				checkConversion(c, head, typeOfArg(c, env, args, 0))
+			}
+			return
+		}
 	}
 	if subject is ast.Expr.Member(root, module) {
 		// `T.Variant.decode(text, codec)` — the one variant's own decoder.
@@ -1615,6 +1646,7 @@ proc checkValueArguments(c: mut Check, env: infer.Env, shown: Str, params: types
 		return
 	}
 	partial := hasHole(args)
+	mut ast.Expr[dyn] lent = []
 	mut i := 0
 	for each a in args {
 		if a.name != "" {
@@ -1627,12 +1659,18 @@ proc checkValueArguments(c: mut Check, env: infer.Env, shown: Str, params: types
 		}
 		if types.mutableAt(mutables, i) {
 			checkMutableArgument(c, shown, "parameter {i + 1}", a.value, partial)
+			append(lent, a.value)
 		}
 		if params bounds i {
-			fits(c, params[i], infer.typeOf(env, a.value), "argument {i + 1} of " + shown)
+			if types.mutableAt(mutables, i) {
+				fits(c, params[i], infer.typeOf(env, a.value), "argument {i + 1} of " + shown)
+			} else {
+				fitsValue(c, env, params[i], a.value, "argument {i + 1} of " + shown)
+			}
 		}
 		i = i + 1
 	}
+	checkLentApart(c, shown, lent)
 }
 
 proc checkMutableArgument(c: mut Check, shown: Str, param: Str, found: ast.Expr, partial: Bool): void {
@@ -1644,6 +1682,85 @@ proc checkMutableArgument(c: mut Check, shown: Str, param: Str, found: ast.Expr,
 	if root == "" || isMutable(c.mutable, root) == false {
 		report(c, shown + " writes through {param}, so the argument has to be a `mut` variable or a path into one — this one is not")
 	}
+}
+
+// Through the outer argument the call may grow the vector the inner one is in.
+proc checkLentApart(c: mut Check, shown: Str, lent: ast.Expr[]): void {
+	for each outer in lent {
+		for each inner in lent {
+			if reachesInto(stepsOf(outer), stepsOf(inner)) {
+				report(c, shown + " is lent `" + pathText(outer) + "` and `" + pathText(inner) + "`, which is inside it. Through `" + pathText(outer) + "` the call may grow or replace the vector `" + pathText(inner) + "` is in, and the write to it would land in storage nothing holds any more. Lend `" + pathText(outer) + "` alone and reach the element through it")
+				return
+			}
+		}
+	}
+}
+
+// `[?]` stands for an index that is not a literal.
+func stepsOf(e: ast.Expr): Str[dyn] {
+	if e is ast.Expr.Ident(name) { return [name] }
+	if e is ast.Expr.Member(subject, field) {
+		mut out := stepsOf(subject)
+		if len(out) > 0 {
+			append(out, "." + field)
+		}
+		return out
+	}
+	if e is ast.Expr.Index(subject, index) {
+		mut out := stepsOf(subject)
+		if len(out) > 0 {
+			if index is ast.Expr.IntLit(n) {
+				append(out, "[{n}]")
+			} else {
+				append(out, "[?]")
+			}
+		}
+		return out
+	}
+	return []
+}
+
+// Two indexes may name one element unless both are literals that differ.
+func reachesInto(outer: Str[], inner: Str[]): Bool {
+	if len(outer) == 0 || len(inner) <= len(outer) {
+		return false
+	}
+	mut at := 0
+	for each step in outer {
+		if inner bounds at {
+			if sameStep(step, inner[at]) == false {
+				return false
+			}
+		}
+		at = at + 1
+	}
+	mut rest := len(outer)
+	for each step in inner {
+		if rest <= 0 && text.startsWith(step, "[") {
+			return true
+		}
+		rest = rest - 1
+	}
+	return false
+}
+
+func sameStep(a: Str, b: Str): Bool {
+	if a == b {
+		return true
+	}
+	return (a == "[?]" && text.startsWith(b, "[")) || (b == "[?]" && text.startsWith(a, "["))
+}
+
+func pathText(e: ast.Expr): Str {
+	if e is ast.Expr.Ident(name) { return name }
+	if e is ast.Expr.Member(subject, field) { return pathText(subject) + "." + field }
+	if e is ast.Expr.Index(subject, index) {
+		if index is ast.Expr.IntLit(n) {
+			return pathText(subject) + "[{n}]"
+		}
+		return pathText(subject) + "[" + pathText(index) + "]"
+	}
+	return "…"
 }
 
 // What a standard library call takes: how many, where the table can say, and what
@@ -1680,6 +1797,14 @@ proc checkLibraryArguments(c: mut Check, env: infer.Env, module: Str, name: Str,
 			fits(c, mailbox, typeOfArg(c, env, args, 2), "the notice `hive.syslink.monitor` posts to the watcher")
 		}
 	}
+	if module == "map" && infer.typeOf(env, ast.argFor(args, "", 0)) is types.Ty.TMap(key, value) {
+		if (name == "set" || name == "get" || name == "has" || name == "delete") && args bounds 1 {
+			fitsValue(c, env, key, args[1].value, "the key `hive.map.{name}` is handed")
+		}
+		if name == "set" && args bounds 2 {
+			fitsValue(c, env, value, args[2].value, "the value `hive.map.set` puts in")
+		}
+	}
 	if stdlib.signatureOf(module, name) is Result.Ok(wanted) {
 		if len(args) != len(wanted) {
 			report(c, "`hive.{module}.{name}` takes " + countOf(len(wanted)) + ", and this call passes " + countOf(len(args)))
@@ -1699,7 +1824,11 @@ proc checkLibraryArguments(c: mut Check, env: infer.Env, module: Str, name: Str,
 				which = "the argument `" + names[i] + "`"
 			}
 			if wanted bounds i {
-				fits(c, wanted[i], infer.typeOf(env, a.value), which + " of `hive.{module}.{name}`")
+				mut here := wanted[i]
+				if module == "math" && stdlib.resultOf(module, name, infer.mathArgTypes(env, args)) is types.Ty.TFloat32 {
+					here = types.Ty.TFloat32()
+				}
+				fitsValue(c, env, here, a.value, which + " of `hive.{module}.{name}`")
 			}
 			i = i + 1
 		}
@@ -1713,7 +1842,7 @@ proc checkSpawn(c: mut Check, env: infer.Env, args: ast.Arg[]): void {
 	}
 	if checkHandler(c, env, "`spawn`", ast.argFor(args, "", 0)) {
 		if infer.typeOf(env, ast.argFor(args, "", 0)) is types.Ty.TFn(_, params, _, _) {
-			fits(c, infer.typeAt(params, 0), typeOfArg(c, env, args, 1), "the state `spawn` starts the service with")
+			fitsArg(c, env, infer.typeAt(params, 0), args, 1, "the state `spawn` starts the service with")
 		}
 	}
 	if len(args) == 3 {
@@ -1815,15 +1944,18 @@ func whyMixed(left: types.Ty, right: types.Ty): Str {
 	if isNumberPair(left, right) {
 		return ". Hive never widens a number behind your back — `hive.conv.itf` is how an `Int` becomes a `Float`"
 	}
+	if types.isNumber(left) && types.isNumber(right) {
+		return ". Hive never widens a number behind your back — convert one side to the other's type: `" + types.show(right) + "(x)`"
+	}
 	return ""
 }
 
 func isNumberPair(left: types.Ty, right: types.Ty): Bool {
-	if left is types.Ty.TInt {
-		return right is types.Ty.TFloat
+	if types.isInteger(left) {
+		return types.isFloat(right)
 	}
-	if left is types.Ty.TFloat {
-		return right is types.Ty.TInt
+	if types.isFloat(left) {
+		return types.isInteger(right)
 	}
 	return false
 }
@@ -1837,6 +1969,7 @@ proc checkArguments(c: mut Check, env: infer.Env, name: Str, info: types.Callabl
 		return
 	}
 	partial := hasHole(args)
+	mut ast.Expr[dyn] lent = []
 	mut open := 0
 	for each p in info.params {
 		found := ast.argFor(args, p.name, open)
@@ -1850,9 +1983,15 @@ proc checkArguments(c: mut Check, env: infer.Env, name: Str, info: types.Callabl
 		// to be a `mut` variable or a path into one.
 		if p.mutable {
 			checkMutableArgument(c, "`{name}`", "`{p.name}: mut ...`", found, partial)
+			append(lent, found)
 		}
-		fits(c, types.resolve(env.table, p.declared), infer.typeOf(env, found), "the argument `{p.name}` of `{name}`")
+		if p.mutable {
+			fits(c, types.resolve(env.table, p.declared), infer.typeOf(env, found), "the argument `{p.name}` of `{name}`")
+		} else {
+			fitsValue(c, env, types.resolve(env.table, p.declared), found, "the argument `{p.name}` of `{name}`")
+		}
 	}
+	checkLentApart(c, "`{name}`", lent)
 }
 
 // Neither has a signature a function value could carry.
@@ -1890,7 +2029,7 @@ proc checkFieldArguments(c: mut Check, env: infer.Env, name: Str, fields: ast.Fi
 		if found is ast.Expr.Hole {
 			continue
 		}
-		fits(c, types.resolve(env.table, f.declared), infer.typeOf(env, found), "the field `{f.name}` of `{name}`")
+		fitsValue(c, env, types.resolve(env.table, f.declared), found, "the field `{f.name}` of `{name}`")
 	}
 }
 
@@ -1995,7 +2134,7 @@ proc checkBuiltinCall(c: mut Check, env: infer.Env, name: Str, written: ast.Arg[
 		// What goes in has to be what the vector holds.
 		if len(args) == 2 {
 			element := types.elementOf(typeOfArg(c, env, args, 0))
-			fits(c, element, typeOfArg(c, env, args, 1), "what `{name}` puts in")
+			fitsArg(c, env, element, args, 1, "what `{name}` puts in")
 		}
 	} else if name == "drop" {
 		checkGrows(c, env, name, args, 3)
@@ -2043,6 +2182,10 @@ proc checkBuiltinCall(c: mut Check, env: infer.Env, name: Str, written: ast.Arg[
 		if arity(c, name, args, 1) {
 			fits(c, types.Ty.TSecret(types.Ty.TUnknown()), typeOfArg(c, env, args, 0), "what `reveal` reads")
 		}
+	} else if infer.isConversion(name) {
+		if arity(c, name, args, 1) {
+			checkConversion(c, name, typeOfArg(c, env, args, 0))
+		}
 	} else if name == "row" || name == "column" {
 		if arity(c, name, args, 2) {
 			fits(c, table(), typeOfArg(c, env, args, 0), "what `{name}` reads")
@@ -2066,6 +2209,20 @@ proc checkBuiltinCall(c: mut Check, env: infer.Env, name: Str, written: ast.Arg[
 				checkJsonShape(c, "`encode`", typeOfArg(c, env, args, 0), format)
 			}
 		}
+	}
+}
+
+// An integer converts to any integer type and a float to any float type; crossing
+// between the two is `hive.conv`'s business, which says how it rounds.
+proc checkConversion(c: mut Check, name: Str, given: types.Ty): void {
+	target := infer.conversionType(name)
+	if given is types.Ty.TUnknown {
+		return
+	}
+	if types.isInteger(target) && types.isInteger(given) == false {
+		report(c, "`{name}(x)` converts an integer, and this is " + types.show(given) + ". `hive.conv.round`, `floor` and `ceil` are how a float becomes an `Int`")
+	} else if types.isFloat(target) && types.isFloat(given) == false {
+		report(c, "`{name}(x)` converts a float, and this is " + types.show(given) + ". `hive.conv.itf` and `itf32` are how an integer becomes a float")
 	}
 }
 
@@ -2149,7 +2306,7 @@ proc checkIndexOf(c: mut Check, env: infer.Env, args: ast.Arg[]): void {
 		return
 	}
 	if isVector(subject) {
-		fits(c, types.elementOf(subject), typeOfArg(c, env, args, 1), "what `indexOf` looks for")
+		fitsArg(c, env, types.elementOf(subject), args, 1, "what `indexOf` looks for")
 		return
 	}
 	if isUnknown(subject) {
@@ -2580,6 +2737,72 @@ func isEmptyMap(value: ast.Expr): Bool {
 		}
 	}
 	return false
+}
+
+// `fits` for a value written where it lands: a literal takes the number type of
+// the spot, so `UInt4 x = 9` holds and `UInt4 x = 16` says why it does not.
+proc fitsValue(c: mut Check, env: infer.Env, wanted: types.Ty, e: ast.Expr, where: Str): void {
+	if literalMisses(c, wanted, e, where) {
+		return
+	}
+	fits(c, wanted, infer.landedType(env, e, wanted), where)
+}
+
+proc fitsArg(c: mut Check, env: infer.Env, wanted: types.Ty, args: ast.Arg[], index: Int, where: Str): void {
+	given := ast.argFor(args, "", index)
+	if given is ast.Expr.Hole {
+		return
+	}
+	fitsValue(c, env, wanted, given, where)
+}
+
+proc literalMisses(c: mut Check, wanted: types.Ty, e: ast.Expr, where: Str): Bool {
+	if infer.intLiteral(e) is Result.Ok(n) && wanted is types.Ty.TSized(_, _) && types.holdsLiteral(wanted, n) == false {
+		report(c, where + " wants " + types.show(wanted) + ", which holds " + rangeOf(wanted) + ", and this is {n}")
+		return true
+	}
+	if infer.isFloatLiteral(e) && wanted is types.Ty.TFloat32 && holdsFloat32(e) == false {
+		report(c, where + " wants a `Float32`, which reaches about 3.4e38, and this is past it")
+		return true
+	}
+	if e is ast.Expr.VectorLit(items) && wanted is types.Ty.TVec(element, _) {
+		mut missed := false
+		for each item in items {
+			if literalMisses(c, element, item, where) {
+				missed = true
+			}
+		}
+		return missed
+	}
+	return false
+}
+
+func holdsFloat32(e: ast.Expr): Bool {
+	mut v := 0.0
+	if e is ast.Expr.FloatLit(f) {
+		v = f
+	} else if e is ast.Expr.Negate(operand) && operand is ast.Expr.FloatLit(f) {
+		v = f
+	}
+	return v <= 340282346638528859811704183484516925440.0
+}
+
+// What an integer type holds, written out for a message.
+func rangeOf(ty: types.Ty): Str {
+	if ty is types.Ty.TSized(true, bits) {
+		top := types.twoTo(bits - 1)
+		return "{0 - top} to {top - 1}"
+	}
+	if ty is types.Ty.TSized(false, bits) {
+		if bits == 64 {
+			return "0 to 18446744073709551615"
+		}
+		if bits == 63 {
+			return "0 to 9223372036854775807"
+		}
+		return "0 to {types.twoTo(bits) - 1}"
+	}
+	return "every `Int`"
 }
 
 proc fits(c: mut Check, wanted: types.Ty, given: types.Ty, where: Str): void {

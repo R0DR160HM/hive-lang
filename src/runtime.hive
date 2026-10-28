@@ -181,6 +181,7 @@ func coreSource(): Str {
 		coreShow(),
 		coreSecret(),
 		coreVectors(),
+		corePacked(),
 		coreOrder(),
 		coreWalks(),
 		coreStrings(),
@@ -384,6 +385,8 @@ func coreShow(): Str {
 				return "false"
 			case float64:
 				return strconv.FormatFloat(x, 'g', -1, 64)
+			case float32:
+				return strconv.FormatFloat(float64(x), 'g', -1, 32)
 			case error:
 				return x.Error()
 			case fmt.Stringer:
@@ -672,6 +675,15 @@ func secretValueSource(): Str {
 			SecretPutInt(b, int(math.Float64bits(f)))
 		}
 
+		func SecretPutWhole[T Whole](b *[]byte, x T) \{ SecretPutInt(b, int(x)) }
+
+		func SecretPutFloat32(b *[]byte, f float32) \{
+			if f == 0 \{
+				f = 0
+			}
+			*b = binary.LittleEndian.AppendUint32(*b, math.Float32bits(f))
+		}
+
 		func SecretPutBool(b *[]byte, v bool) \{
 			if v \{
 				*b = append(*b, 1)
@@ -727,6 +739,14 @@ func secretValueSource(): Str {
 		}
 
 		func SecretTakeFloat(r *SecretReader) float64 \{ return math.Float64frombits(uint64(SecretTakeInt(r))) }
+
+		func SecretTakeWhole[T Whole](r *SecretReader) T \{ return T(SecretTakeInt(r)) }
+
+		func SecretTakeFloat32(r *SecretReader) float32 \{
+			v := math.Float32frombits(binary.LittleEndian.Uint32(r.b[r.at:]))
+			r.at += 4
+			return v
+		}
 
 		func SecretTakeBool(r *SecretReader) bool \{
 			v := r.b[r.at] == 1
@@ -973,6 +993,194 @@ func coreVectors(): Str {
 	], "\n\n")
 }
 
+func corePacked(): Str {
+	return join([
+		// Kept canonical — empty is the zero value, bits past the end are zero — so
+		// reflect.DeepEqual compares two by their values.
+		`
+		type Packed[T Whole] struct \{
+			words []uint64
+			n     int
+			width uint8
+		}
+
+		func Pack[T Whole](width uint8, values []T) Packed[T] \{
+			if len(values) == 0 \{
+				return Packed[T]\{}
+			}
+			p := Packed[T]\{words: make([]uint64, (len(values)*int(width)+63)/64), n: len(values), width: width}
+			for i, v := range values \{
+				p.Set(i, v)
+			}
+			return p
+		}
+
+		func (p Packed[T]) Len() int \{ return p.n }
+
+		func (p Packed[T]) Bytes() int \{ return len(p.words) * 8 }
+
+		func (p Packed[T]) At(i int) T \{
+			w := uint(p.width)
+			bit := uint(i) * w
+			k, s := bit>>6, bit&63
+			v := p.words[k] >> s
+			if s+w > 64 \{
+				v |= p.words[k+1] << (64 - s)
+			}
+			v &= 1<<w - 1
+			if ^T(0) < 0 \{
+				return T(int64(v<<(64-w)) >> (64 - w))
+			}
+			return T(v)
+		}
+
+		func (p Packed[T]) Set(i int, x T) \{
+			w := uint(p.width)
+			mask := uint64(1)<<w - 1
+			v := uint64(x) & mask
+			bit := uint(i) * w
+			k, s := bit>>6, bit&63
+			p.words[k] = p.words[k]&^(mask<<s) | v<<s
+			if s+w > 64 \{
+				p.words[k+1] = p.words[k+1]&^(mask>>(64-s)) | v>>(64-s)
+			}
+		}
+
+		func (p Packed[T]) Append(width uint8, x T) Packed[T] \{
+			if p.n == 0 \{
+				p = Packed[T]\{width: width}
+			}
+			if (p.n+1)*int(p.width) > len(p.words)*64 \{
+				p.words = append(p.words, 0)
+			}
+			p.n++
+			p.Set(p.n-1, x)
+			return p
+		}
+
+		func (p Packed[T]) Unpack() []T \{
+			out := make([]T, p.n)
+			for i := range out \{
+				out[i] = p.At(i)
+			}
+			return out
+		}
+
+		func (p Packed[T]) Part(low, high int) Packed[T] \{
+			if high <= low \{
+				return Packed[T]\{}
+			}
+			out := Packed[T]\{words: make([]uint64, ((high-low)*int(p.width)+63)/64), n: high - low, width: p.width}
+			for i := 0; i < out.n; i++ \{
+				out.Set(i, p.At(low+i))
+			}
+			return out
+		}
+
+		func (p Packed[T]) From(low int) Packed[T] \{ return p.Part(low, p.n) }
+
+		func (p Packed[T]) All(yield func(int, T) bool) \{
+			for i := 0; i < p.n; i++ \{
+				if !yield(i, p.At(i)) \{
+					return
+				}
+			}
+		}
+
+		func (p Packed[T]) IndexOf(x T) Result[int, bool] \{
+			for i := 0; i < p.n; i++ \{
+				if p.At(i) == x \{
+					return Ok[int, bool](i)
+				}
+			}
+			return Err[int, bool](false)
+		}
+
+		func (p Packed[T]) String() string \{
+			parts := make([]string, p.n)
+			for i := range parts \{
+				parts[i] = WholeText(p.At(i))
+			}
+			return "[" + strings.Join(parts, ", ") + "]"
+		}
+
+		func (p Packed[T]) lessThan(other any) bool \{
+			o, ok := other.(Packed[T])
+			if !ok \{
+				return false
+			}
+			for i := 0; i < p.n && i < o.n; i++ \{
+				if a, b := p.At(i), o.At(i); a != b \{
+					return a < b
+				}
+			}
+			return p.n < o.n
+		}
+		`,
+		`
+		func ClonePacked[T Whole](p Packed[T]) Packed[T] \{
+			p.words = append([]uint64(nil), p.words...)
+			return p
+		}
+
+		func ConcatPacked[T Whole](a, b Packed[T]) Packed[T] \{
+			out := ClonePacked(a)
+			for i := 0; i < b.n; i++ \{
+				out = out.Append(b.width, b.At(i))
+			}
+			return out
+		}
+
+		func PrependPacked[T Whole](p *Packed[T], width uint8, x T) \{
+			*p = Pack(width, append([]T\{x}, p.Unpack()...))
+		}
+
+		func DropPacked[T Whole](p *Packed[T], low, high int) Packed[T] \{
+			values := p.Unpack()
+			taken := Drop(&values, low, high)
+			width := p.width
+			*p = Pack(width, values)
+			return Pack(width, taken)
+		}
+
+		func InRangePacked[T Whole](i int, p Packed[T]) bool \{ return i >= 0 && i < p.n }
+
+		func SortPacked[T Whole](p Packed[T]) Packed[T] \{ return Pack(p.width, Sort(p.Unpack())) }
+
+		func SortPackedBy[T Whole](p Packed[T], first func(T, T) bool) Packed[T] \{
+			return Pack(p.width, SortBy(p.Unpack(), first))
+		}
+
+		func SortPackedInPlace[T Whole](p Packed[T]) \{
+			for i, v := range Sort(p.Unpack()) \{
+				p.Set(i, v)
+			}
+		}
+
+		func SortPackedInPlaceBy[T Whole](p Packed[T], first func(T, T) bool) \{
+			for i, v := range SortBy(p.Unpack(), first) \{
+				p.Set(i, v)
+			}
+		}
+
+		func PackResult[T Whole, E any](width uint8, r Result[[]T, E]) Result[Packed[T], E] \{
+			if r.ok \{
+				return Ok[Packed[T], E](Pack(width, r.value))
+			}
+			return Err[Packed[T], E](r.bad)
+		}
+		`,
+		// Only where the vector still reaches that far.
+		`
+		func PutBack[T Whole](p *Packed[T], i int, x T) \{
+			if i >= 0 && i < p.n \{
+				p.Set(i, x)
+			}
+		}
+		`
+	], "\n\n")
+}
+
 func coreOrder(): Str {
 	return join([
 		// variantOrder is the declaration order of every tagged union's variants,
@@ -1011,6 +1219,11 @@ func coreOrder(): Str {
 			if !a.IsValid() || !b.IsValid() \{
 				return false
 			}
+			if a.CanInterface() && b.CanInterface() \{
+				if o, ok := a.Interface().(ordered); ok \{
+					return o.lessThan(b.Interface())
+				}
+			}
 			if a.Kind() == reflect.Interface \{
 				return lessInterface(a, b)
 			}
@@ -1022,6 +1235,8 @@ func coreOrder(): Str {
 				return !a.Bool() && b.Bool()
 			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 				return a.Int() < b.Int()
+			case reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+				return a.Uint() < b.Uint()
 			case reflect.Float32, reflect.Float64:
 				return a.Float() < b.Float()
 			case reflect.String:
@@ -1396,6 +1611,140 @@ func coreArithmetic(): Str {
 		}
 
 		func PowFloat(a, b float64) float64 \{ return math.Pow(a, b) }
+		`,
+		// Calls, like Int's, so two literals that overflow together wrap at run time.
+		`
+		type Whole interface \{
+			~int | ~int8 | ~int16 | ~int32 | ~int64 | ~uint8 | ~uint16 | ~uint32 | ~uint64
+		}
+
+		type unsignedWhole interface \{ ~uint8 | ~uint16 | ~uint32 | ~uint64 }
+
+		type signedWhole interface \{ ~int | ~int8 | ~int16 | ~int32 | ~int64 }
+
+		func Add[T Whole](a, b T) T \{ return a + b }
+
+		func Sub[T Whole](a, b T) T \{ return a - b }
+
+		func Mul[T Whole](a, b T) T \{ return a * b }
+
+		func DivWhole[T Whole](a, b T) T \{
+			if b == 0 \{
+				return 0
+			}
+			return a / b
+		}
+
+		func ModWhole[T Whole](a, b T) T \{
+			if b == 0 \{
+				return 0
+			}
+			return a % b
+		}
+
+		func PowWhole[T Whole](a, b T) T \{
+			if b < 0 \{
+				return 0
+			}
+			var out T = 1
+			for ; b > 0; b >>= 1 \{
+				if b&1 == 1 \{
+					out *= a
+				}
+				a *= a
+			}
+			return out
+		}
+
+		func TrimU[T unsignedWhole](x T, bits uint) T \{ return x & (T(1)<<bits - 1) }
+
+		func TrimS[T signedWhole](x T, spare uint) T \{ return x << spare >> spare }
+
+		func Narrow[T Whole, F Whole](x F) T \{ return T(x) }
+
+		func CheckedU[T unsignedWhole, F Whole](x F, bits uint) Result[T, F] \{
+			y := TrimU(T(x), bits)
+			if x < 0 || F(y) != x \{
+				return Err[T, F](x)
+			}
+			return Ok[T, F](y)
+		}
+
+		func CheckedS[T signedWhole, F Whole](x F, spare uint) Result[T, F] \{
+			y := TrimS(T(x), spare)
+			if F(y) != x || (x < 0) != (y < 0) \{
+				return Err[T, F](x)
+			}
+			return Ok[T, F](y)
+		}
+
+		func FitsSized[T Whole](n int, signed bool, bits uint) (T, bool) \{
+			if signed \{
+				top := 1 << (bits - 1)
+				if bits < 64 && (n < -top || n >= top) \{
+					return 0, false
+				}
+				return T(n), true
+			}
+			if n < 0 || bits < 63 && n >= 1<<bits \{
+				return 0, false
+			}
+			return T(n), true
+		}
+
+		func LessWhole[A Whole, B Whole](a A, b B) bool \{
+			if a < 0 || b < 0 \{
+				return (a < 0 && b >= 0) || (a < 0 && b < 0 && int64(a) < int64(b))
+			}
+			return uint64(a) < uint64(b)
+		}
+
+		func EqualWhole[A Whole, B Whole](a A, b B) bool \{
+			if (a < 0) != (b < 0) \{
+				return false
+			}
+			if a < 0 \{
+				return int64(a) == int64(b)
+			}
+			return uint64(a) == uint64(b)
+		}
+
+		func WholeText[T Whole](x T) string \{
+			if x < 0 \{
+				return strconv.FormatInt(int64(x), 10)
+			}
+			return strconv.FormatUint(uint64(x), 10)
+		}
+		`,
+		`
+		func DivFloat32(a, b float32) float32 \{
+			if b == 0 \{
+				return 0
+			}
+			return a / b
+		}
+
+		func ModFloat32(a, b float32) float32 \{
+			if b == 0 \{
+				return 0
+			}
+			return float32(math.Mod(float64(a), float64(b)))
+		}
+
+		func PowFloat32(a, b float32) float32 \{ return float32(math.Pow(float64(a), float64(b))) }
+
+		func Unfolded32(v float32) float32 \{ return v }
+
+		func ToFloat32(v float64) float32 \{ return float32(v) }
+
+		func FitsFloat32(v float64) (float32, bool) \{
+			f := float32(v)
+			return f, !math.IsInf(float64(f), 0) || math.IsInf(v, 0)
+		}
+
+		func FloatText(f float64) string \{ return strconv.FormatFloat(f, 'g', -1, 64) }
+
+		func Float32Text(f float32) string \{ return strconv.FormatFloat(float64(f), 'g', -1, 32) }
 		`
 	], "\n\n")
 }
@@ -1798,6 +2147,7 @@ func convSource(): Str {
 		}
 
 		func ConvItf(v int) float64  \{ return float64(v) }
+		func ConvItf32(v int) float32 \{ return float32(v) }
 		func ConvIts(v int) string   \{ return strconv.Itoa(v) }
 		func ConvFts(v float64) string \{ return strconv.FormatFloat(v, 'g', -1, 64) }
 
@@ -2576,7 +2926,7 @@ func timeSource(): Str {
 			"time"
 		)
 
-		func TimeNow() int \{ return int(time.Now().Unix()) }
+		func TimeNow() int \{ return int(time.Now().UnixMilli()) }
 
 		func TimeTimezone() string \{
 			name, _ := time.Now().Zone()
@@ -2600,7 +2950,7 @@ func timeSource(): Str {
 
 		func TimeDateTimeFrom(year, month, day, hour, minute, second int) int \{
 			t := time.Date(year, time.Month(month), day, hour, minute, second, 0, time.Local)
-			return int(t.Unix())
+			return int(t.UnixMilli())
 		}
 		`,
 		// The fields of the current instant, in local time.
@@ -2640,8 +2990,8 @@ func timeSource(): Str {
 		// A strftime-style template, which is familiar rather than Go's reference
 		// date. An unrecognised %x passes through verbatim.
 		`
-		func TimeFormat(unix int, template string) string \{
-			t := time.Unix(int64(unix), 0)
+		func TimeFormat(stamp int, template string) string \{
+			t := time.UnixMilli(int64(stamp))
 			var out strings.Builder
 			runes := []rune(template)
 			for i := 0; i < len(runes); i++ \{
@@ -2884,6 +3234,28 @@ func jsonSource(): Str {
 				}
 			}
 			return 0, &JsonJsonError\{Path: path, Expected: "Int", Found: jsonKindName(v)}
+		}
+
+		func JsonSized[T Whole](v JsonValue, path string, signed bool, bits int, name string) (T, *JsonJsonError) \{
+			if v.Kind == '#' \{
+				if signed \{
+					if n, err := strconv.ParseInt(v.Num, 10, bits); err == nil \{
+						return T(n), nil
+					}
+				} else if n, err := strconv.ParseUint(v.Num, 10, bits); err == nil \{
+					return T(n), nil
+				}
+			}
+			return 0, &JsonJsonError\{Path: path, Expected: name, Found: jsonKindName(v)}
+		}
+
+		func JsonFloat32(v JsonValue, path string) (float32, *JsonJsonError) \{
+			if v.Kind == '#' \{
+				if f, err := strconv.ParseFloat(v.Num, 32); err == nil \{
+					return float32(f), nil
+				}
+			}
+			return 0, &JsonJsonError\{Path: path, Expected: "Float32", Found: jsonKindName(v)}
 		}
 
 		func JsonFloat(v JsonValue, path string) (float64, *JsonJsonError) \{
@@ -4031,7 +4403,7 @@ func cryptoSource(): Str {
 		}
 		`,
 		// jwtCheckTime enforces the exp/nbf registered claims against the current
-		// time. Absent claims are skipped.
+		// time. Absent claims are skipped. Claims are Unix seconds, as RFC 7519 has them.
 		`
 		func jwtCheckTime(payload []byte) *CryptoCryptoError \{
 			var claims struct \{
@@ -4041,7 +4413,7 @@ func cryptoSource(): Str {
 			if err := json.Unmarshal(payload, &claims); err != nil \{
 				return &CryptoCryptoError\{Reason: "Malformed", Message: "payload is not a JSON object"}
 			}
-			now := int64(TimeNow())
+			now := int64(TimeNow()) / 1000
 			if claims.Exp != "" \{
 				if exp, err := claims.Exp.Int64(); err == nil && now >= exp \{
 					return &CryptoCryptoError\{Reason: "Expired", Message: "token has expired"}
@@ -5568,6 +5940,26 @@ func sqlSource(): Str {
 				return 0, sqlCellError(column, cell, "an Int")
 			}
 			return v, nil
+		}
+
+		func SqlCellSized[T Whole](cell string, column string, signed bool, bits int, name string) (T, error) \{
+			text := strings.TrimSpace(cell)
+			if signed \{
+				if n, err := strconv.ParseInt(text, 10, bits); err == nil \{
+					return T(n), nil
+				}
+			} else if n, err := strconv.ParseUint(text, 10, bits); err == nil \{
+				return T(n), nil
+			}
+			return 0, sqlCellError(column, cell, "a "+name)
+		}
+
+		func SqlCellFloat32(cell string, column string) (float32, error) \{
+			v, err := strconv.ParseFloat(strings.TrimSpace(cell), 32)
+			if err != nil \{
+				return 0, sqlCellError(column, cell, "a Float32")
+			}
+			return float32(v), nil
 		}
 
 		func SqlCellFloat(cell string, column string) (float64, error) \{

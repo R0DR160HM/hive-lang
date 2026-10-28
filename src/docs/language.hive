@@ -122,7 +122,7 @@ func syntax(): Str {
 
 		## Keywords
 
-		Every keyword is lower case **and only lower case**:
+		Every keyword is lower case, and **only that spelling is reserved**:
 
 		~CODE~
 		import   proc     func     query    test     type
@@ -132,10 +132,9 @@ func syntax(): Str {
 		each     bounds   break    continue
 		~CODE~
 
-		A keyword written in another casing — ~BT~Proc~BT~, ~BT~IF~BT~, ~BT~Return~BT~ — is **neither a
-		keyword nor a name**, and is a compile error naming both readings. That holds
-		in *every* identifier position, so a union cannot have a variant called
-		~BT~Return~BT~ or ~BT~Echo~BT~, and a type cannot have a field called ~BT~type~BT~.
+		Any other casing is an ordinary name: a union may have a variant called
+		~BT~Return~BT~, a type may be called ~BT~Query~BT~, and a variable ~BT~proC~BT~. A field cannot
+		be called ~BT~type~BT~, since that is the keyword itself.
 
 		Two words are keywords only where they are written and are ordinary names
 		everywhere else: ~BT~as~BT~ (after an import path) and ~BT~timeout~BT~ (in
@@ -264,10 +263,36 @@ func types(): Str {
 		| --- | --- |
 		| ~BT~Str~BT~ | UTF-8 text |
 		| ~BT~Int~BT~ | a 64-bit signed integer — exactly Go's ~BT~int~BT~; past its largest or smallest value it wraps round to the other |
+		| ~BT~UInt1~BT~ … ~BT~UInt64~BT~ | an unsigned integer of that many bits: a ~BT~UInt4~BT~ holds 0 to 15 |
+		| ~BT~Int1~BT~ … ~BT~Int63~BT~ | a signed integer of that many bits: an ~BT~Int4~BT~ holds −8 to 7 |
 		| ~BT~Float~BT~ | a 64-bit float |
+		| ~BT~Float32~BT~ | a 32-bit float, computed in single precision |
 		| ~BT~Bool~BT~ | ~BT~true~BT~ or ~BT~false~BT~ |
 		| ~BT~Atom~BT~ | an interned symbol, written ~BT~#Name~BT~ |
 		| ~BT~void~BT~ | nothing — a **return type only**, never a variable, field or element |
+
+		~BT~Int64~BT~ and ~BT~Float64~BT~ are second names for ~BT~Int~BT~ and ~BT~Float~BT~.
+
+		### Sized numbers
+
+		For a program keeping many small numbers, each taking only the bits it needs.
+
+		* A sized integer **wraps at its own width**: a ~BT~UInt4~BT~ at 15 plus one is 0. ~BT~-~BT~
+		  on an unsigned type is a compile error.
+		* A **literal takes the type it lands in** and has to fit it: ~BT~UInt4 x = 9~BT~ holds,
+		  ~BT~UInt4 x = 16~BT~ is a compile error. Beside a sized operand, a literal takes its type,
+		  so ~BT~a + 1~BT~ on a ~BT~UInt4~BT~ stays a ~BT~UInt4~BT~.
+		* **No number changes type on its own.** A ~BT~UInt8~BT~ is not an ~BT~Int~BT~ until ~BT~Int(b)~BT~
+		  says so, a ~BT~Float32~BT~ is not a ~BT~Float~BT~ until ~BT~Float(f)~BT~, and ~BT~UInt4 + UInt8~BT~ is
+		  a compile error until one side is converted. Two integers of any sizes still
+		  **compare** by value, which keeps ~BT~i < len(v)~BT~ a guard.
+		* **Every conversion is written**: ~BT~UInt4(x)~BT~ keeps the low bits and never fails;
+		  ~BT~UInt4.checked(x)~BT~ answers ~BT~Error(x)~BT~ where ~BT~x~BT~ does not fit. ~BT~Float32(x)~BT~ rounds a
+		  ~BT~Float~BT~. ~BT~hive.UInt4(x)~BT~ reaches the builtin past a declaration of your own.
+		* A sized index is its own [bounds](bounds.md) proof: a ~BT~UInt4~BT~ indexes any vector
+		  of 16 or more with no guard, and an unsigned index is never negative.
+		* A **vector of them is packed**, each value taking only its own bits: a million
+		  ~BT~UInt4~BT~s take half a megabyte. Widths of 8, 16, 32 and 64 are stored as they are.
 
 		### ~BT~Str~BT~
 
@@ -386,8 +411,10 @@ func types(): Str {
 		* A **key is compared and hashed whole**, so it is a ~BT~Str~BT~, ~BT~Int~BT~, ~BT~Float~BT~,
 		  ~BT~Bool~BT~ or ~BT~Atom~BT~, or a declared type whose every field is one of those.
 		  **Storage cannot be a key**: ~BT~Map<Str[dyn], Int>~BT~ is a compile error.
-		* ~BT~hive.map.new()~BT~ says *empty* and nothing about what it holds, so it must
-		  land somewhere that says. ~BT~m := hive.map.new()~BT~ is a compile error.
+		* ~BT~hive.map.new()~BT~ says *empty* and nothing about what it holds, so it takes its
+		  type from where it lands, or — bound with ~BT~:=~BT~ — from the **first later use**
+		  that says it, such as ~BT~hive.map.set(m, "a", 1)~BT~. Once settled it never changes: a
+		  later use that disagrees is a compile error.
 		* A map is **reached by key, never by position**. ~BT~m[0]~BT~ is a compile error and
 		  so is ~BT~for each~BT~ over one.
 
@@ -399,9 +426,10 @@ func types(): Str {
 		one too. ~BT~Address~BT~ without its ~BT~M~BT~ is a compile error.
 
 		* ~BT~spawn~BT~ reads ~BT~M~BT~ off the handler it starts.
-		* ~BT~at~BT~ cannot, since a name says nothing about what the service takes, so it
-		  lands where an address is declared: ~BT~Address<Op> counter = at(#Counter)~BT~.
-		  ~BT~counter := at(#Counter)~BT~ is a compile error.
+		* ~BT~at~BT~ cannot, since a name says nothing about what the service takes, so ~BT~M~BT~
+		  comes from where the address lands — ~BT~Address<Op> counter = at(#Counter)~BT~ — or,
+		  bound with ~BT~:=~BT~, from its **first later use**: ~BT~counter := at(#Counter)~BT~ then
+		  ~BT~counter(Op.Add(1))~BT~. Once settled it never changes.
 		* An address is an ordinary value, stored, passed and carried inside a message,
 		  and it has no order.
 		* A program that declares its own ~BT~Address~BT~ still has the builtin as
@@ -456,9 +484,9 @@ func types(): Str {
 		3. ~BT~T~BT~ is a ~BT~proc~BT~ type and ~BT~S~BT~ is the ~BT~func~BT~ type with the same shape; or
 		4. ~BT~S~BT~ is ~BT~mut T~BT~ and ~BT~T~BT~ is not ~BT~mut~BT~ — the callee gets an immutable copy.
 
-		There is **no implicit numeric widening**: ~BT~hive.math.max(0, health)~BT~ is a
-		compile error rather than a surprise, and ~BT~hive.conv.itf~BT~ is how an ~BT~Int~BT~
-		becomes a ~BT~Float~BT~. There is **no subtyping and no interface**, and a variant is
+		There is **no implicit numeric conversion**, of size or of kind: ~BT~Int(b)~BT~,
+		~BT~Float(f)~BT~ and ~BT~hive.conv.itf(n)~BT~ are written. ~BT~hive.math.max(0, health)~BT~ is a
+		compile error rather than a surprise. There is **no subtyping and no interface**, and a variant is
 		not a type of its own — ~BT~Shape.Circle~BT~ cannot be a parameter's type.
 
 		A **declared static length is a promise**, so a ~BT~Str[3]~BT~ slot only ever takes a
@@ -1208,6 +1236,12 @@ func mutability(): Str {
 		every length and index fact [already proved](bounds.md) about it, since the callee
 		may rebind it shorter.
 
+		**One call never lends a vector and a path inside it**: ~BT~both(v, v[0])~BT~ is a compile
+		error, since growing ~BT~v~BT~ moves ~BT~v[0]~BT~ and the write to it would be lost. Two
+		elements, ~BT~swap(v[i], v[j])~BT~, and a field beside its record, ~BT~put(box, box.count)~BT~,
+		are fine. An element of a packed vector is lent as a copy and written back after
+		the call.
+
 		## What a value is
 
 		Vectors, ~BT~Table~BT~s, maps and declared types that contain them are **value
@@ -1407,6 +1441,10 @@ func proofs(): Str {
 		  past ~BT~MAX~BT~, so a counter stepping by more, or with nothing above it, proves
 		  nothing;
 		* the index came from **~BT~indexOf~BT~**;
+		* the index is a **sized integer** the vector's known length is past the top of:
+		  a ~BT~UInt4~BT~ indexes any vector of 16 or more, an ~BT~Int4~BT~ one of 8 or more under
+		  an ~BT~i >= 0~BT~ guard. An unsigned index is never negative, so against a ~BT~[dyn]~BT~
+		  vector only ~BT~i < len(v)~BT~ is left. ~BT~Int(i)~BT~ is an ~BT~Int~BT~, and proves nothing;
 		* the access is a **~BT~for each~BT~**, which never indexes.
 
 		A **computed** index is not provable and must be bound to a variable and
@@ -1782,6 +1820,8 @@ func builtins(): Str {
 		| ~BT~hide~BT~ | ~BT~(T): Result<Secret<T>, SecretError>~BT~ | a value as a [~BT~Secret~BT~](types.md#secret), never swapped to disk |
 		| ~BT~bypass~BT~ | ~BT~(T): Secret<T>~BT~ | a value as a ~BT~Secret~BT~ in ordinary memory; cannot fail |
 		| ~BT~reveal~BT~ | ~BT~(Secret<T>): T~BT~ | what a ~BT~Secret~BT~ holds |
+		| ~BT~UInt4~BT~, every number type | ~BT~(integer): UInt4~BT~ | the value kept to the type's bits; never fails |
+		| ~BT~UInt4.checked~BT~ | ~BT~(T): Result<UInt4, T>~BT~ | the value, or ~BT~Error(value)~BT~ where it does not fit |
 
 		~BT~len~BT~ and ~BT~bytes~BT~ differ only for strings: for ~BT~"café"~BT~, ~BT~len~BT~ is ~BT~4~BT~ and ~BT~bytes~BT~
 		is ~BT~5~BT~. ~BT~replaceFirst~BT~ and ~BT~replaceAll~BT~ **answer with a new string**, take plain
@@ -1808,7 +1848,8 @@ func builtins(): Str {
 		address every turn, and ~BT~spawn~BT~ takes either, answering with an ~BT~Address<M>~BT~. A
 		name is one service's at a time, so a second ~BT~spawn~BT~ under a name still held
 		fails as ~BT~SyslinkError.Taken~BT~; one with no name is always ~BT~Ok~BT~. ~BT~at~BT~ builds an
-		address and looks nothing up, and lands where an ~BT~Address<M>~BT~ is declared.
+		address and looks nothing up, and takes its ~BT~M~BT~ from where it lands or from its
+		first later use.
 
 		## A declaration of your own wins
 
@@ -1984,9 +2025,7 @@ func queries(): Str {
 		A ~BT~query~BT~ is a ~BT~func~BT~ whose body is **inline SQL** and whose **return type
 		describes its rows**. Calling one does not touch a database: it answers with a
 		~BT~hive.sql.Fragment<rows>~BT~ — the text, and the values bound beside it — and
-		~BT~hive.sql.run(<connection>, <query>)~BT~ is what runs it. It is spelled
-		~BT~Fragment~BT~ rather than ~BT~Query~BT~ because ~BT~Query~BT~ is ~BT~query~BT~
-		shouted, and a keyword is reserved however it is spelled.
+		~BT~hive.sql.run(<connection>, <query>)~BT~ is what runs it.
 
 		~CODE~hive
 		type User \{
@@ -2422,9 +2461,9 @@ func pitfalls(): Str {
 
 		## Names and declarations
 
-		**A miscased keyword is neither a keyword nor a name.** A union variant called
-		~BT~Return~BT~, ~BT~Break~BT~ or ~BT~Echo~BT~, or a field called ~BT~type~BT~, is an error. →
-		~BT~ReturnStmt~BT~.
+		**A keyword's own spelling is never a name**, so a field cannot be called ~BT~type~BT~.
+		→ ~BT~kind: Str -- JSON as type;~BT~ where the JSON key has to be ~BT~type~BT~. Any other
+		casing is free: ~BT~Return~BT~ is a fine variant.
 
 		**A ~BT~mut~BT~ variable may not be ~BT~UPPER_CASE~BT~**, a counting loop's counter
 		included. The rule runs that way only: an immutable variable **may** be
@@ -2478,17 +2517,26 @@ func pitfalls(): Str {
 
 		**An ~BT~async~BT~ call gets a copy of a ~BT~mut~BT~ argument**, not the caller's storage.
 
+		**One call never lends a vector and a path inside it.** ~BT~both(v, v[0])~BT~ with both
+		parameters ~BT~mut~BT~ is an error. → lend ~BT~v~BT~ alone and reach ~BT~v[0]~BT~ through it.
+
 		**An address says what its service takes.** ~BT~Address~BT~ on its own is an error, and
-		so is ~BT~box := at(#Cache)~BT~, since a name says nothing about the messages. →
-		~BT~Address<Op> box = at(#Cache)~BT~.
+		so is ~BT~box := at(#Cache)~BT~ with nothing after it that sends to ~BT~box~BT~ or hands it to
+		a parameter, since a name says nothing about the messages. →
+		~BT~Address<Op> box = at(#Cache)~BT~, or a send: ~BT~box(Op.Ping())~BT~.
 
 		**What went wrong is a library error's variant**, matched like any union's →
 		~BT~why is file.FileError.NotFound~BT~, or a ~BT~switch~BT~ over every one.
 
 		## Collections and modules
 
-		**~BT~hive.map.new()~BT~ must land somewhere that says what it holds.**
-		~BT~m := hive.map.new()~BT~ is an error. → ~BT~mut hive.map.Map<Str, Int> m = hive.map.new()~BT~.
+		**~BT~hive.map.new()~BT~ must land somewhere that says what it holds**, or be used later
+		in a way that does. ~BT~m := hive.map.new()~BT~ with nothing after it that says is an
+		error. → ~BT~hive.map.set(m, "a", 1)~BT~, or ~BT~mut hive.map.Map<Str, Int> m = hive.map.new()~BT~.
+
+		**A number does not change size on its own.** ~BT~UInt8 b = n~BT~ with ~BT~n~BT~ an ~BT~Int~BT~ is
+		an error, and so is ~BT~Int n = b~BT~, and so is ~BT~UInt4 x = 16~BT~. → ~BT~UInt8(n)~BT~ to keep
+		the low bits, ~BT~UInt8.checked(n)~BT~ for a ~BT~Result~BT~, ~BT~Int(b)~BT~ to widen.
 
 		**A map has no subscript and no ~BT~for each~BT~.** → ~BT~hive.map.get~BT~, and loop over
 		~BT~hive.map.keys(m)~BT~.

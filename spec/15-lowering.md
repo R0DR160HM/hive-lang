@@ -17,6 +17,10 @@ file, plus a generated `hive` runtime package.
 | fields declared outside any variant | appended to **every** variant struct, each read through a getter on the interface: `e.at` → `e.sharedAt()` |
 | `Str` `Int` `Float` `Bool` `Atom` | `string` `int` `float64` `bool` `hive.Atom` |
 | `Str[3]`, `Str[dyn]`, `Str[]` | `[]string` — all three, which is why value semantics exist |
+| `UInt4`, `Int12`, `Float32` | the smallest Go type that holds one: `uint8`, `int16`, `float32`, every result trimmed back to its width by `hive.TrimU` / `hive.TrimS` |
+| `UInt8[dyn]`, a width Go has | `[]uint8` |
+| `UInt4[dyn]`, any other width | `hive.Packed[uint8]`, its values back to back in `uint64` words: `v[i]` is `v.At(i)` and `v[i] = x` is `v.Set(i, x)` |
+| `p(v[i])`, `v` packed, into a `mut` parameter | `v[i]` copied out, `p(&copy)`, and the copy written back by `hive.PutBack` |
 | `test "..." { }` | a `t.Run(...)` in a generated `main_test.go`, run by `go test` |
 | `assert c` (ordinary code) | `hive.Assert(c, "c")` — a panic quoting `c`; a comparison goes through `hive.AssertCmp` with both sides |
 | `assert c` (inside a `test`) | a recorded failure quoting `c` and, for a comparison, both sides |

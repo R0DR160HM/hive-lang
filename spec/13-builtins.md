@@ -12,7 +12,7 @@ column below; a position overloaded by type answers to each of its names, so
 | `len(vector)` | `len(T[]): Int` | number of elements |
 | `len(str)` | `len(Str): Int` | number of **characters** (UTF-8 runes) |
 | `len(map)` | `len(hive.map.Map<K, T>): Int` | number of pairs |
-| `bytes(vector)` | `bytes(T[]): Int` | byte footprint of the contiguous storage |
+| `bytes(vector)` | `bytes(T[]): Int` | byte footprint of the contiguous storage — for a [packed](03-types.md#sized-numbers) vector, the 64-bit words its bits fill |
 | `bytes(str)` | `bytes(Str): Int` | number of **bytes** in the UTF-8 encoding |
 | `append(vector, value)` | `append(T[dyn], T): void` | grows a **mutable dynamic** vector in place |
 | `prepend(vector, value)` | `prepend(T[dyn], T): void` | the same, at the **front** |
@@ -40,6 +40,8 @@ column below; a position overloaded by type answers to each of its names, so
 | `hide(value)` | `hide(T): Result<Secret<T>, SecretError>` | `value` as a [`Secret`](03-types.md#311-secret), in memory never swapped to disk |
 | `bypass(value)` | `bypass(T): Secret<T>` | `value` as a `Secret` in ordinary memory, which cannot fail |
 | `reveal(secret)` | `reveal(Secret<T>): T` | what a `Secret` holds |
+| `UInt4(value)` and every number type | `UInt4(integer): UInt4` | `value` kept to the type's bits — never fails |
+| `UInt4.checked(value)` | `UInt4.checked(T): Result<UInt4, T>` | `value`, or `Error(value)` where it does not fit |
 
 `len` and `bytes` differ only for strings: for `"café"`, `len` is `4` (runes)
 while `bytes` is `5`.
@@ -103,8 +105,9 @@ these three, and reached by calling its `Address`.
 * **`at` performs no I/O and cannot fail.** It is address construction rather
   than a lookup, so a program may name a service that is not running yet — and a
   request to one that is not there is what reports it. A name says nothing about
-  what the service takes, so `at` lands where an `Address<M>` is declared
-  ([3.10](03-types.md#310-address)): `x := at(#Cache)` is a compile error.
+  what the service takes, so `M` comes from where the address lands, or from
+  its first later use ([3.10](03-types.md#310-address)): `x := at(#Cache)` then
+  `x(Op.Get("k"))` makes `x` an `Address<Op>` for good.
 * **`kill` works on any address**, whatever it takes, on this node or another.
   The service's mailbox closes, its monitors are told, and its name is free again
   before any of them hears about it. Killing one twice is harmless.
@@ -125,6 +128,30 @@ it cannot fail — and is free to be swapped to disk. The library's own secrets
 are `Secret<Str>`, and `hive.term.readSecretBypass` and
 `hive.crypto.decryptBypass` are its calls of the same kind as `bypass`
 ([14](14-stdlib.md)).
+
+## Number conversions
+
+No number changes type on its own ([3.9](03-types.md#39-assignability)). Every
+conversion is written, with the target type's name:
+
+* **`UInt4(x)` keeps `x`'s low bits** and never fails: `UInt4(20)` is `4`,
+  `UInt4(-1)` is `15`, `Int4(9)` is `-7`. Every integer type has one, `Int`
+  included, and each takes any integer. It is the wrap arithmetic already does,
+  and it is also how a wrong value quietly becomes a believable one.
+* **`UInt4.checked(x)` answers a `Result`**: `Ok` of the value where it fits, and
+  `Error(x)` — what was handed in — where it does not. It is the form for anything
+  from outside the program, and every integer type has one.
+* **`Float32(x)`** rounds a `Float` to the nearest `Float32`, and one past its range
+  is `±Inf`; **`Float(x)`** widens a `Float32` exactly. A float type has no
+  `checked`.
+
+A conversion into a wider type, `Int(b)` for a `UInt8`, keeps every value, so it
+never changes one.
+
+An integer and a float never convert into each other through these:
+`hive.conv.itf` and `itf32` take an integer to a float, and `hive.conv.round`,
+`floor` and `ceil` take a float to an `Int`. `hive.UInt4(x)` reaches the builtin
+from a program that declares its own `UInt4`.
 
 ## A declaration of your own wins
 

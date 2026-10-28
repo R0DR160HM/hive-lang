@@ -20,6 +20,13 @@ An access is safe when one of these holds:
     so a counter stepping by more, or with nothing above it, could turn negative,
     and proves nothing;
 * the index came from **`indexOf`** ([10.5](#105-indexof-returns-an-index-you-can-use));
+* the index is a **sized integer** ([3.1](03-types.md#sized-numbers)) and the
+  vector's known length is past the top of its type: a `UInt4` indexes any vector
+  of 16 or more, and an `Int4` one of 8 or more under an `i >= 0` guard. An
+  unsigned index is never negative, so against a `[dyn]` vector only
+  `i < len(v)` is left to guard. Wrapping keeps this true after arithmetic: `i + 1`
+  on a `UInt4` at 15 is 0. The bound travels with the type — `Int(i)` is an `Int`,
+  and proves nothing;
 * the access is a **`for each`**, which never indexes.
 
 A **computed** index is not provable and must be bound to a variable and guarded:

@@ -145,20 +145,33 @@ no subscript at all ([03](03-types.md#36-maps)).
 
 | operator | on | yields |
 | --- | --- | --- |
-| `+` | `Int`, `Float` | the sum |
+| `+` | numbers | the sum |
 | `+` | `Str` | concatenation |
 | `+` | vectors | a **new** vector, lengths added |
-| `-` `*` `/` `%` `**` | `Int`, `Float` | arithmetic |
-| unary `-` | `Int`, `Float` | negation |
+| `-` `*` `/` `%` `**` | numbers | arithmetic |
+| unary `-` | signed numbers | negation |
 | unary `!` | `Bool` | the opposite |
 | `==` `!=` | any two values of one type | structural equality |
-| `<` `>` `<=` `>=` | `Int`, `Float`, `Str` | ordering |
+| `<` `>` `<=` `>=` | numbers, `Str` | ordering |
 | `&&` `\|\|` | `Bool` | short-circuiting conjunction, disjunction |
 | `is` | see [07](07-patterns.md) | a `Bool`, binding as it matches |
 | `bounds` | a vector and an `Int` | sugar for `i >= 0 && i < hive.len(v)` |
 | `\|` | a value and a callable | sugar for the call with the value first |
 
 `%` is the remainder operator and has the same precedence as `*` and `/`.
+
+**Arithmetic wants two numbers of one type**, and answers that type:
+`UInt4 + UInt8` is a compile error until one side is converted, `UInt8(a) + b`, and
+so is `Float32 + Float`. A literal on one side takes the other side's type, so
+`a + 1` on a `UInt4` stays a `UInt4` and `a += 1` works — and a literal that type
+cannot hold is a compile error.
+
+**Two integers compare whatever their sizes.** `==`, `!=`, `<`, `>`, `<=` and `>=`
+take any two integers and compare their values — a `UInt64` at its largest is not
+equal to an `Int` of `-1` — since comparing converts nothing that is kept. That is
+what keeps `i < len(v)` and `v bounds i` guards for a sized `i`. Floats of
+different sizes do not compare without a conversion, and an integer never compares
+with a float.
 
 ### Unary `!`
 
@@ -246,6 +259,11 @@ together, `9223372036854775807 + 1`, wrap too, rather than being refused.
 `**` on `Int`s is repeated multiplication and wraps the same way. A negative
 `Int` exponent has no integral answer, so it yields `0` rather than a fraction.
 For the mathematical answer, work in `Float`, where `**` is real exponentiation.
+
+A sized integer follows every row of the table at its own width: a `UInt4` wraps
+at 16, an `Int4` at −8 and 7, and `-` on an unsigned type is a compile error, since
+it has no negative values to answer with. A `Float32` follows `Float`'s rows in
+single precision.
 
 The bounds pass knows a counter can wrap: a counting loop proves its counter's
 low half only where it cannot pass `MAX` ([10](10-bounds.md#101-what-counts-as-a-proof)).

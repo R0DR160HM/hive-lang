@@ -66,6 +66,23 @@ async f(v, "e")       // a thread of its own: it grows a copy
 g := grow(_, "f")     // a `mut` position stays a hole — never captured
 ```
 
+**One call never lends a vector and a path inside it.** Through the vector the
+callee may grow it or replace it, which moves its elements, and a write through
+the other argument would land in storage nothing holds any more:
+
+```hive
+both(v, v[0])         // compile error: v[0] is inside v
+fill(box, box.items[2])  // compile error: the same, a field further down
+swap(v[i], v[j])      // fine: two elements, neither inside the other
+put(box, box.count)   // fine: a field holds still, whatever happens to box
+```
+
+An element of a [packed](03-types.md#sized-numbers) vector has no address of its
+own, so it is lent as a copy and written back when the call returns. Nothing else
+can reach that element during the call, so the two cannot be told apart — except
+by `swap(v[i], v[j])` with `i` and `j` equal, where the copies are written back
+left to right.
+
 One consequence for the [bounds pass](10-bounds.md): a callee given a `mut` parameter may
 rebind the vector to a shorter one, so passing a variable to a `mut` parameter —
 by name or through a function value — costs it every length and index fact

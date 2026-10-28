@@ -65,8 +65,9 @@ Number and string conversions. Pure.
 * **Rounding** (`Float → Int`) — `ceil(v)`, `floor(v)`, `round(v)` (round half
   away from zero). See [05](05-expressions.md#unspecified-behaviour) for
   non-finite inputs.
-* **Widening / rendering** — `itf(v)` widens an `Int` to a `Float`; `its(v)`
-  renders an `Int` as a `Str`; `fts(v)` a `Float` as a `Str`.
+* **Widening / rendering** — `itf(v)` widens an `Int` to a `Float`, and `itf32(v)` to
+  the nearest `Float32`; `its(v)` renders an `Int` as a `Str`; `fts(v)` a `Float` as
+  a `Str`. A sized integer goes into any of these by widening.
 * **Parsing** — `sti(text)` → `Result<Int, hive.conv.ConversionError>`,
   `stf(text)` → `Result<Float, _>`. A `ConversionError` carries the offending
   `input` and a short `message`.
@@ -80,8 +81,9 @@ Number and string conversions. Pure.
 | **Distances** | `sqrt` `hypot(x, y)` `abs` |
 | **Bounds** | `min(a, b)` `max(a, b)` `clamp(value, low, high)` |
 
-**Every one takes and answers with a `Float`**, and there is no integer twin.
-That is one rule for thirteen functions, and it is the same rule the rest of the
+**Every one takes and answers with a `Float`**, and there is no integer twin. A
+call handed only `Float32`s answers a `Float32`. That is one rule for thirteen
+functions, and it is the same rule the rest of the
 language keeps: Hive never widens a number behind your back, so an `Int` goes in
 through `hive.conv.itf` and `hive.math.max(0, health)` is a compile error rather
 than a surprise. Clamping an `Int` is an `if`, and needs no library.
@@ -672,7 +674,7 @@ else `HIVE_SYSLINK_KEY`, else `~/.hive/syslink.key`, which is created on first u
 
 ## 14.12 `hive.time`
 
-Times are plain `Int`s — Unix seconds.
+Times are plain `Int`s — Unix milliseconds.
 
 * `now()`, `timezone()` (the zone name or abbreviation at this instant),
   `timezoneOffset()` (minutes east of UTC).
@@ -698,8 +700,9 @@ Times are plain `Int`s — Unix seconds.
   (0–999) each answer one field of **now**, read in local time. They take no
   arguments; a field of some other stamp is read by rendering it with `format`.
 
-  `millisecond()` is a sub-second **field**, the way `second()` is 0–59 — a
-  reading is still seconds, and there is no millisecond clock here.
+  `millisecond()` is a sub-second **field**, the way `second()` is 0–59; the
+  stamps themselves are already in milliseconds. A JWT's `exp` and `nbf` are
+  seconds, as RFC 7519 has them: `hive.time.now() / 1000`.
 
 ## 14.13 `hive.env`
 

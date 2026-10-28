@@ -199,10 +199,129 @@ func binaryType(env: Env, op: ast.BinOp, left: ast.Expr, right: ast.Expr): types
 	if leftType is types.Ty.TUnknown {
 		return rightType
 	}
+	operands := operandType(env, left, right)
+	if (operands is types.Ty.TUnknown) == false {
+		return operands
+	}
 	if op is ast.BinOp.Add {
 		return addedType(leftType, rightType)
 	}
 	return leftType
+}
+
+// The number type both sides of an operator are worked in, or `TUnknown` when
+// they are not two numbers of one type. A literal takes the other side's type,
+// so `a + 1` on a `UInt4` stays a `UInt4`.
+func operandType(env: Env, left: ast.Expr, right: ast.Expr): types.Ty {
+	leftType := typeOf(env, left)
+	rightType := typeOf(env, right)
+	if types.isNumber(leftType) == false || types.isNumber(rightType) == false {
+		return types.Ty.TUnknown()
+	}
+	if adopts(right, leftType) {
+		return leftType
+	}
+	if adopts(left, rightType) {
+		return rightType
+	}
+	if types.same(leftType, rightType) {
+		return leftType
+	}
+	return types.Ty.TUnknown()
+}
+
+// Whether a literal on one side of an operator takes the other side's type.
+func adopts(e: ast.Expr, other: types.Ty): Bool {
+	if intLiteral(e) is Result.Ok(_) {
+		return types.isInteger(other)
+	}
+	if isFloatLiteral(e) {
+		return types.isFloat(other)
+	}
+	return false
+}
+
+// The value of an integer literal, `-` included.
+func intLiteral(e: ast.Expr): Result<Int, Bool> {
+	if e is ast.Expr.IntLit(n) {
+		return Result.Ok(n)
+	}
+	if e is ast.Expr.Negate(operand) {
+		if operand is ast.Expr.IntLit(n) {
+			return Result.Ok(0 - n)
+		}
+	}
+	return Result.Error(false)
+}
+
+// A `hive.math` call handed a `Float32` reads a float literal beside it as one.
+func mathArgTypes(env: Env, args: ast.Arg[]): types.Ty[dyn] {
+	tys := typesOfArgs(env, args)
+	mut single := false
+	for each ty in tys {
+		if ty is types.Ty.TFloat32 {
+			single = true
+		}
+	}
+	if single == false {
+		return tys
+	}
+	mut types.Ty[dyn] out = []
+	mut i := 0
+	for each a in args {
+		if isFloatLiteral(a.value) {
+			append(out, types.Ty.TFloat32())
+		} else if tys bounds i {
+			append(out, tys[i])
+		}
+		i = i + 1
+	}
+	return out
+}
+
+func isFloatLiteral(e: ast.Expr): Bool {
+	if e is ast.Expr.FloatLit(_) {
+		return true
+	}
+	if e is ast.Expr.Negate(operand) {
+		return operand is ast.Expr.FloatLit(_)
+	}
+	return false
+}
+
+// The type a value has where it lands in `want`: a literal takes `want`'s own
+// number type, and a vector literal of them takes its element type.
+func landedType(env: Env, e: ast.Expr, want: types.Ty): types.Ty {
+	if intLiteral(e) is Result.Ok(n) && types.holdsLiteral(want, n) {
+		return want
+	}
+	if isFloatLiteral(e) && want is types.Ty.TFloat32 {
+		return want
+	}
+	if e is ast.Expr.Call(callee, args) && want is types.Ty.TResult(ok, bad) && args bounds 0 {
+		if callee is ast.Expr.Member(head, variant) && head is ast.Expr.Ident(result) && result == "Result" {
+			mut payloadWant := ok
+			if variant == "Error" {
+				payloadWant = bad
+			}
+			landed := landedType(env, args[0].value, payloadWant)
+			if types.accepts(payloadWant, landed) {
+				return want
+			}
+		}
+	}
+	if e is ast.Expr.VectorLit(items) && len(items) > 0 {
+		if want is types.Ty.TVec(element, _) {
+			for each item in items {
+				landed := landedType(env, item, element)
+				if types.accepts(element, landed) == false {
+					return typeOf(env, e)
+				}
+			}
+			return types.Ty.TVec(element, ast.Dim.Fixed(len(items)))
+		}
+	}
+	return typeOf(env, e)
 }
 
 // What `+` answers with. Concatenation adds the two lengths, keeping
@@ -345,6 +464,9 @@ func memberCallType(env: Env, subject: ast.Expr, field: Str, argTypes: types.Ty[
 		if types.findType(env.table, head) is Result.Ok(_) {
 			return types.Ty.TNamed(head)
 		}
+		if field == "checked" && isConversion(head) {
+			return types.Ty.TResult(conversionType(head), typeAt(argTypes, 0))
+		}
 		// `hive.len(v)` — a builtin under its long name.
 		if head == "hive" {
 			ordered := builtinArgs(field, args)
@@ -364,7 +486,11 @@ func memberCallType(env: Env, subject: ast.Expr, field: Str, argTypes: types.Ty[
 		}
 		if root is ast.Expr.Ident(hiveName) {
 			if hiveName == "hive" {
-				return stdlib.resultOf(module, field, typesOfArgs(env, stdlib.libraryArgs(module, field, args)))
+				ordered := stdlib.libraryArgs(module, field, args)
+				if module == "math" {
+					return stdlib.resultOf(module, field, mathArgTypes(env, ordered))
+				}
+				return stdlib.resultOf(module, field, typesOfArgs(env, ordered))
 			}
 		}
 		// `hive.sql.DatabaseDriver.SQLite()` — a variant of one of the library's
@@ -577,6 +703,9 @@ func callTarget(env: Env, name: Str): CallTarget {
 	if types.fieldsOfStruct(env.table, name) is Result.Ok(fields) {
 		return CallTarget.Struct(fields)
 	}
+	if types.findType(env.table, name) is Result.Ok(_) && isConversion(name) {
+		return CallTarget.Union()
+	}
 	if isBuiltin(name) {
 		return CallTarget.Builtin()
 	}
@@ -661,6 +790,9 @@ func builtinResult(env: Env, name: Str, argTypes: types.Ty[], args: ast.Arg[]): 
 		}
 		return types.Ty.TUnknown()
 	}
+	if isConversion(name) {
+		return conversionType(name)
+	}
 	return types.Ty.TUnknown()
 }
 
@@ -705,6 +837,7 @@ func builtinParams(name: Str, arity: Int): Str[dyn] {
 	if name == "kill" { return ["address"] }
 	if name == "hide" || name == "bypass" { return ["value"] }
 	if name == "reveal" { return ["secret"] }
+	if isConversion(name) { return ["value"] }
 	return []
 }
 
@@ -723,6 +856,21 @@ func isBuiltin(name: Str): Bool {
 		|| name == "replaceFirst" || name == "replaceAll"
 		|| name == "encode" || name == "spawn" || name == "at" || name == "kill"
 		|| name == "hide" || name == "reveal" || name == "bypass"
+		|| isConversion(name)
+}
+
+// `UInt4(x)`, `Int(x)`, `Float32(x)`: a number type's name, called to convert.
+func isConversion(name: Str): Bool {
+	return name == "Int" || name == "Float" || types.sizedName(name) is Result.Ok(_)
+}
+
+func conversionType(name: Str): types.Ty {
+	if name == "Int" { return types.Ty.TInt() }
+	if name == "Float" { return types.Ty.TFloat() }
+	if types.sizedName(name) is Result.Ok(ty) {
+		return ty
+	}
+	return types.Ty.TUnknown()
 }
 
 // --- Patterns ----------------------------------------------------------------

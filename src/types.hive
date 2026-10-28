@@ -16,6 +16,9 @@ type Ty {
 	TStr
 	TInt
 	TFloat
+	// `UInt4`, `Int40`: an integer of a stated width. `Int64` is `Int`.
+	TSized { signed: Bool, bits: Int }
+	TFloat32
 	TBool
 	TAtom
 	// The return type that is no type at all.
@@ -229,7 +232,113 @@ func isVariable(t: Table, name: Str): Bool {
 func isBuiltinType(name: Str): Bool {
 	return name == "Str" || name == "Int" || name == "Float" || name == "Bool"
 		|| name == "Atom" || name == "Table" || name == "Result" || name == "Address"
-		|| name == "Secret" || name == "SecretError"
+		|| name == "Secret" || name == "SecretError" || sizedName(name) is Result.Ok(_)
+}
+
+// `UInt4`, `Int40`, `Float32`, and `Int64` and `Float64` for `Int` and `Float`.
+func sizedName(name: Str): Result<Ty, Bool> {
+	if name == "Int64" { return Result.Ok(Ty.TInt()) }
+	if name == "Float64" { return Result.Ok(Ty.TFloat()) }
+	if name == "Float32" { return Result.Ok(Ty.TFloat32()) }
+	if text.startsWith(name, "UInt") {
+		return widthNamed(name, 4, false)
+	}
+	if text.startsWith(name, "Int") {
+		return widthNamed(name, 3, true)
+	}
+	return Result.Error(false)
+}
+
+func widthNamed(name: Str, from: Int, signed: Bool): Result<Ty, Bool> {
+	cs := text.chars(name)
+	digits := text.span(cs, from, len(cs) - 1)
+	if digits == "" || text.startsWith(digits, "0") {
+		return Result.Error(false)
+	}
+	for each c in text.chars(digits) {
+		if text.isDigit(c) == false {
+			return Result.Error(false)
+		}
+	}
+	if hive.conv.sti(digits) is Result.Ok(bits) && bits >= 1 && bits <= 64 {
+		return Result.Ok(sizedOf(signed, bits))
+	}
+	return Result.Error(false)
+}
+
+func sizedOf(signed: Bool, bits: Int): Ty {
+	if signed && bits == 64 {
+		return Ty.TInt()
+	}
+	return Ty.TSized(signed, bits)
+}
+
+func isInteger(ty: Ty): Bool {
+	return ty is Ty.TInt || ty is Ty.TSized(_, _)
+}
+
+func isFloat(ty: Ty): Bool {
+	return ty is Ty.TFloat || ty is Ty.TFloat32
+}
+
+func isNumber(ty: Ty): Bool {
+	return isInteger(ty) || isFloat(ty)
+}
+
+func isUnsigned(ty: Ty): Bool {
+	return ty is Ty.TSized(false, _)
+}
+
+func bitsOf(ty: Ty): Int {
+	if ty is Ty.TSized(_, bits) {
+		return bits
+	}
+	return 64
+}
+
+// Whether every value of `from` is a value of `to`: an index of any integer type
+// is read as an `Int`.
+func widens(from: Ty, to: Ty): Bool {
+	if from is Ty.TFloat32 {
+		return isFloat(to)
+	}
+	if from is Ty.TFloat {
+		return to is Ty.TFloat
+	}
+	if isInteger(from) == false || isInteger(to) == false {
+		return false
+	}
+	if isUnsigned(to) {
+		return isUnsigned(from) && bitsOf(from) <= bitsOf(to)
+	}
+	if isUnsigned(from) {
+		return bitsOf(from) < bitsOf(to)
+	}
+	return bitsOf(from) <= bitsOf(to)
+}
+
+// Whether the literal `n` is a value of `ty`.
+func holdsLiteral(ty: Ty, n: Int): Bool {
+	if ty is Ty.TInt {
+		return true
+	}
+	if ty is Ty.TSized(signed, bits) {
+		if signed {
+			top := twoTo(bits - 1)
+			return n >= 0 - top && n <= top - 1
+		}
+		return n >= 0 && (bits >= 63 || n <= twoTo(bits) - 1)
+	}
+	return false
+}
+
+// 2 to the `n`, for an `n` below 63.
+func twoTo(n: Int): Int {
+	mut out := 1
+	for i := 0; i < n; i++ {
+		out = out * 2
+	}
+	return out
 }
 
 // What making a `Secret` fails with: a union the core declares, so of no module.
@@ -295,6 +404,9 @@ func resolveBase(t: Table, pkg: Str, name: Str, args: ast.TypeExpr[]): Ty {
 	if pkg == "hive" && name == "SecretError" {
 		return secretError()
 	}
+	if pkg == "hive" && sizedName(name) is Result.Ok(sized) {
+		return sized
+	}
 	if text.startsWith(pkg, "hive.") {
 		return Ty.TLib(text.span(text.chars(pkg), 5, len(pkg) - 1), name)
 	}
@@ -327,6 +439,9 @@ func resolveBare(t: Table, name: Str, args: ast.TypeExpr[]): Ty {
 	if name == "SecretError" {
 		return secretError()
 	}
+	if sizedName(name) is Result.Ok(sized) {
+		return sized
+	}
 	return Ty.TVar(name)
 }
 
@@ -347,6 +462,8 @@ func toWritten(ty: Ty): ast.TypeExpr {
 	if ty is Ty.TStr { return named("Str") }
 	if ty is Ty.TInt { return named("Int") }
 	if ty is Ty.TFloat { return named("Float") }
+	if ty is Ty.TSized(_, _) { return ast.TypeExpr.Named("hive", show(ty), [], []) }
+	if ty is Ty.TFloat32 { return ast.TypeExpr.Named("hive", "Float32", [], []) }
 	if ty is Ty.TBool { return named("Bool") }
 	if ty is Ty.TAtom { return named("Atom") }
 	if ty is Ty.TVoid { return ast.TypeExpr.VoidType() }
@@ -422,6 +539,9 @@ func show(ty: Ty): Str {
 	if ty is Ty.TStr { return "Str" }
 	else if ty is Ty.TInt { return "Int" }
 	else if ty is Ty.TFloat { return "Float" }
+	else if ty is Ty.TSized(true, bits) { return "Int{bits}" }
+	else if ty is Ty.TSized(false, bits) { return "UInt{bits}" }
+	else if ty is Ty.TFloat32 { return "Float32" }
 	else if ty is Ty.TBool { return "Bool" }
 	else if ty is Ty.TAtom { return "Atom" }
 	else if ty is Ty.TVoid { return "void" }
@@ -533,7 +653,7 @@ func isSecret(ty: Ty): Bool {
 }
 
 func unkeepable(t: Table, ty: Ty, seen: Str[]): Result<Ty, Bool> {
-	if ty is Ty.TStr || ty is Ty.TInt || ty is Ty.TFloat || ty is Ty.TBool || ty is Ty.TAtom || ty is Ty.TUnknown {
+	if ty is Ty.TStr || isNumber(ty) || ty is Ty.TBool || ty is Ty.TAtom || ty is Ty.TUnknown {
 		return Result.Error(false)
 	}
 	if ty is Ty.TVec(element, _) {
@@ -677,6 +797,11 @@ func same(a: Ty, b: Ty): Bool {
 	if a is Ty.TStr { return b is Ty.TStr }
 	if a is Ty.TInt { return b is Ty.TInt }
 	if a is Ty.TFloat { return b is Ty.TFloat }
+	if a is Ty.TFloat32 { return b is Ty.TFloat32 }
+	if a is Ty.TSized(aSigned, aBits) {
+		if b is Ty.TSized(bSigned, bBits) { return aSigned == bSigned && aBits == bBits }
+		return false
+	}
 	if a is Ty.TBool { return b is Ty.TBool }
 	if a is Ty.TAtom { return b is Ty.TAtom }
 	if a is Ty.TVoid { return b is Ty.TVoid }
@@ -850,6 +975,9 @@ func operandsFit(a: Ty, b: Ty): Bool {
 	}
 	if a is Ty.TAtom && b is Ty.TStr {
 		return true
+	}
+	if isNumber(a) && isNumber(b) {
+		return same(a, b)
 	}
 	return accepts(a, b) || accepts(b, a)
 }

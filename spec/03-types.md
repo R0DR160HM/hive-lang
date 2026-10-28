@@ -10,14 +10,40 @@ program is rejected rather than deferred to run time.
 | --- | --- | --- |
 | `Str` | UTF-8 text | `string` |
 | `Int` | a 64-bit signed integer | `int` |
+| `UInt1` … `UInt64` | an unsigned integer of that many bits | the smallest of `uint8` … `uint64` that holds it |
+| `Int1` … `Int63` | a signed integer of that many bits | the smallest of `int8` … `int64` that holds it |
 | `Float` | a 64-bit float | `float64` |
+| `Float32` | a 32-bit float | `float32` |
 | `Bool` | `true` or `false` | `bool` |
 | `Atom` | an interned symbol | a small integer |
 | `void` | nothing; a return type only | — |
 
 `Int` is exactly Go's `int`, which is 64-bit on every platform Hive targets.
 It wraps: arithmetic that would pass its largest or smallest value comes round
-from the other ([05](05-expressions.md#57-arithmetic-at-the-edges)).
+from the other ([05](05-expressions.md#57-arithmetic-at-the-edges)). `Int64` is a
+second name for `Int`, and `Float64` for `Float`.
+
+### Sized numbers
+
+`UInt4` holds 0 to 15 and `Int4` holds −8 to 7: any width from 1 to 64 bits, for
+a program that stores many small numbers and wants each to take only the bits it
+needs. A sized integer wraps at its own width, exactly as `Int` wraps at 64: a
+`UInt4` at 15 plus one is 0. While a program works with one, it sits in the
+smallest Go integer that holds it, and every result is trimmed back to its width.
+
+A vector of them is **packed**: its values sit back to back, each taking only its
+own bits, so a million `UInt4`s take half a megabyte and a million `UInt17`s about
+two. A width of 8, 16, 32 or 64 is stored as Go stores that integer, with nothing
+to pack. Packing changes how a vector is kept and nothing about what it does.
+
+A name like `UInt4` is a builtin type the way `Secret` is: a program that declares
+its own `UInt4` has that one under the bare name, and the builtin is still there
+as `hive.UInt4`. `UInt64` literals stop at `Int`'s largest value, since a literal
+is read as an `Int` before it lands; `UInt64(-1)` is the largest `UInt64`.
+
+`Float32` is a 32-bit float, about seven digits, computed in single precision.
+`echo` prints the shortest text that reads back as the same `Float32`, so a
+`Float32` of `0.1` prints `0.1`.
 
 `void` is not a value type. It may be written as a return type and nowhere
 else: there is no `void` variable, no `void` field, and no `void` element.
@@ -233,10 +259,13 @@ Three type-level rules:
   gives a composite key. **Storage cannot be a key**: two vectors can hold equal
   contents and still be different storage, so `Map<Str[dyn], Int>` is a compile
   error.
-* `hive.map.new()` says *empty* and nothing about what it holds, so it must land
-  somewhere that says: a declaration, a `return` whose callable declares a map,
-  or an argument to a parameter or field declared as one. `m := hive.map.new()`
-  is a compile error.
+* `hive.map.new()` says *empty* and nothing about what it holds, so its type
+  comes from somewhere that says: a declaration, a `return` whose callable
+  declares a map, or an argument to a parameter or field declared as one. Bound
+  with `:=`, it takes its type from the **first later use** that says it —
+  `hive.map.set(m, "a", 1)`, or handing `m` to a parameter declared as a map — and
+  keeps it: a later use that disagrees is a compile error, never a second answer.
+  `m := hive.map.new()` with nothing after it that says is a compile error.
 * A map is **reached by key, never by position**. `m[0]` is a compile error
   pointing at `hive.map.get`, and `for each` over a map is one too: a turn of the
   loop would have to be handed the key or the value, and the syntax never said
@@ -274,9 +303,12 @@ A value of type `S` may be used where `T` is expected exactly when:
 4. `S` is `mut T` and `T` is not `mut` — the callee is handed an immutable
    copy ([08](08-mutability-and-values.md)).
 
-There is **no** implicit numeric widening. `Int` does not become `Float`; use
-`hive.conv.itf`. `hive.math.max(0, health)` is a compile error rather than a
-surprise.
+There is **no** implicit numeric conversion, of size or of kind. A `UInt8` does
+not become an `Int`, a `Float32` does not become a `Float`, and an `Int` does not
+become a `Float`: each is written, as `Int(x)`, `Float(f)` or `hive.conv.itf(n)`
+([13](13-builtins.md#number-conversions)). `hive.math.max(0, health)` is a compile
+error rather than a surprise. A literal is not converted but **typed where it
+lands**: `UInt4 x = 9` holds, and `UInt4 x = 16` is a compile error.
 
 There is **no** subtyping between declared types, and no interface. A variant is
 not a type of its own: `Shape.Circle` is a way of building and matching a
@@ -310,9 +342,11 @@ proc ask(counter: Address<Op>): void {
 
 `spawn` reads `M` off the handler it starts. `at` cannot — a name says where a
 service is and nothing about what it takes — so what it answers with has to
-land somewhere that says, as `hive.map.new()` does: a declaration
+come from somewhere that says, as `hive.map.new()`'s does: a declaration
 (`Address<Op> counter = at(#Counter)`), a `return` whose callable declares an
-address, or an argument to a parameter or field declared as one. Whether the
+address, an argument to a parameter or field declared as one, or — bound with
+`:=` — the first later use that says it: `counter(Op.Add(1))` makes it an
+`Address<Op>`, and it stays one. Whether the
 service under that name really takes an `M` is a fact about another program, or
 one that has not started yet, so it is checked where the message arrives: a
 service handed a message of another type answers `Decode`

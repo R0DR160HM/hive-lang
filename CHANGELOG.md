@@ -6,29 +6,38 @@
 
 * **`Address<M>` says what its service takes**: a message of any other type is a compile error where it is sent, and the answer is an `M`.
 * **`spawn` reads `M` off its handler**, and a handler's third parameter is an `Address<M>` of its own mailbox type.
-* **`at` lands where an `Address<M>` is declared**, as `hive.map.new()` does, so `x := at(#Name)` is a compile error.
+* **`at` takes its type from where it land, or from the first later use that says it** — `x := at(#Name)` then `x(Op.Ping())` — and keep it.
 * **`monitor`'s notice is one of the watcher's messages.**
 * **`Secret<T>` keeps any plain value**: `hide(T)` and `bypass(T)` make one, and `reveal` answers the `T` back.
 * **An `Int` wraps round past `MAX` and `MIN`**, as the machine's arithmetic does, where it stopped at the edge.
 * **A counting loop proves its counter only where it cannot wrap**: starting at a non-negative literal, stepping by one, and held below something by a `<`.
+* **Sized numbers**: `UInt1` … `UInt64`, `Int1` … `Int63` and `Float32`, each kept in the smallest Go type that holds it and wrapping at its own width; `Int64` and `Float64` are `Int` and `Float`.
+* **Every number conversion is written**: `Int(b)`, `Float(f)`, `UInt4(x)`, or `UInt4.checked(x)` for a `Result`; two integers of any sizes still compare.
+* **A sized index proves itself** against a vector its type cannot outrun, and an unsigned one is never negative.
+* **A vector of sized integers is packed** where Go has no integer that wide: a `UInt4[dyn]` keeps each value in four bits.
+* **One call never lends a vector and a path inside it**: `both(v, v[0])` with both parameters `mut` is a compile error, where the write through `v[0]` could be lost.
+* **Only a keyword's lower-case spelling is reserved**: `Proc`, `Query` and `proC` are names like any other.
 
 ### Standard library
 
 * **A library error is a union of what went wrong**: `FileError`, `WsError`, `SocketError`, `NetError`, `SqlError`, `CryptoError`, `SyslinkError` and `SecretError` have a variant per failure, matched and covered like any other union.
 * **An error comes with the module that answers with it**, whether or not the program names its type.
+* **`hive.conv.itf32`**, and **`hive.math` answers a `Float32`** when handed only those.
+* **`hive.time` counts milliseconds**: `now()`, `dateFrom`, `dateTimeFrom` and `format` all speak Unix milliseconds.
 
 ### Breaking
 
 | was | is |
 | --- | --- |
 | `Address` | `Address<M>`, with `M` the service's message type |
-| `box := at(#Name)` | `Address<M> box = at(#Name)` |
 | `why.reason == "NotFound"` | `why is file.FileError.NotFound` |
 | `SqlError` reason `"Query"` | `SqlError.Statement` |
 | `Secret` | `Secret<Str>`, and the library's secrets with it |
 | `hide(text: s)`, `bypass(text: s)` | `hide(value: s)`, `bypass(value: s)` |
 | `Int` overflow stopping at `MAX` or `MIN` | it wraps round to the other |
 | `for i := 0; i < n; i += 2 { echo v[i] }` | a guard: `if v bounds i` |
+| `both(v, v[0])`, both `mut` | lend `v` alone and reach `v[0]` through it |
+| `hive.time.now()` in seconds | in milliseconds — `hive.time.now() / 1000` for seconds, as a JWT `exp` wants |
 
 ## v0.2.18
 

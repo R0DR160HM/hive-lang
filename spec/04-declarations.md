@@ -162,9 +162,7 @@ func describe(shape: Shape): Str {
 A `query` is a `func` whose body is inline SQL and whose **return type describes
 its rows**. Calling one does not touch a database: it answers with a
 `hive.sql.Fragment<rows>` — the text, and the values bound beside it — and
-`hive.sql.run` is what runs it. It is spelled `Fragment` rather than `Query`
-because `Query` is `query` shouted, and a keyword is reserved however it is
-spelled ([01](01-lexical.md#keywords)).
+`hive.sql.run` is what runs it.
 
 ```hive
 type User {
