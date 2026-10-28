@@ -49,7 +49,8 @@ b.items[0] = expr
 The target must be a `mut` binding, or a path into one. Assigning to a parameter
 or to a plain `:=` binding is a compile error.
 
-**Compound assignment** on a mutable number — `+= -= *= /=` — and the steps
+**Compound assignment** on a mutable number — `+= -= *= /=`, and on an integer
+`&= |= ^= <<= >>=` — and the steps
 `++` / `--` are each shorthand for the matching `x = x <op> …`.
 
 ## 6.3 `if`

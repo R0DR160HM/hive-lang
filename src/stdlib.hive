@@ -94,7 +94,7 @@ func resultOf(module: Str, name: Str, args: types.Ty[]): types.Ty {
 		return types.Ty.TLib(module, name)
 	}
 	if module == "conv" { return convResult(name) }
-	if module == "math" { return mathResult(name) }
+	if module == "math" { return mathResult(name, args) }
 	if module == "term" { return termResult(name) }
 	if module == "file" { return fileResult(name) }
 	if module == "map" { return mapResult(name, args) }
@@ -124,7 +124,9 @@ func convResult(name: Str): types.Ty {
 		return types.Ty.TInt()
 	}
 	if name == "itf" { return types.Ty.TFloat() }
-	if name == "its" || name == "fts" { return types.Ty.TStr() }
+	if name == "itf32" { return types.Ty.TFloat32() }
+	if name == "its" || name == "fts" || name == "fromBytes" { return types.Ty.TStr() }
+	if name == "bytesOf" { return types.Ty.TVec(types.Ty.TSized(false, 8), dynamic()) }
 	if name == "sti" {
 		return types.Ty.TResult(types.Ty.TInt(), types.Ty.TLib("conv", "ConversionError"))
 	}
@@ -134,16 +136,31 @@ func convResult(name: Str): types.Ty {
 	return types.Ty.TUnknown()
 }
 
-// Every one of them takes and answers with a `Float`, and there is no integer
-// twin — which is one rule for thirteen functions.
-func mathResult(name: Str): types.Ty {
-	if name == "pi" || name == "sin" || name == "cos" || name == "tan"
+// Every one of them takes and answers with a `Float` — or a `Float32`, handed
+// only those — and there is no integer twin.
+func mathResult(name: Str, args: types.Ty[]): types.Ty {
+	if name == "pi" {
+		return types.Ty.TFloat()
+	}
+	if name == "sin" || name == "cos" || name == "tan"
 		|| name == "asin" || name == "acos" || name == "atan2"
 		|| name == "sqrt" || name == "hypot" || name == "abs"
 		|| name == "min" || name == "max" || name == "clamp" {
+		if len(args) > 0 && allFloat32(args) {
+			return types.Ty.TFloat32()
+		}
 		return types.Ty.TFloat()
 	}
 	return types.Ty.TUnknown()
+}
+
+func allFloat32(args: types.Ty[]): Bool {
+	for each a in args {
+		if (a is types.Ty.TFloat32) == false {
+			return false
+		}
+	}
+	return true
 }
 
 func termResult(name: Str): types.Ty {
@@ -151,9 +168,9 @@ func termResult(name: Str): types.Ty {
 	if name == "codec" { return types.Ty.TCodec(codecErrorOf("term")) }
 	if name == "print" || name == "status" { return types.Ty.TVoid() }
 	if name == "read" { return types.Ty.TStr() }
-	if name == "readSecret" { return types.Ty.TResult(types.Ty.TSecret(), types.secretError()) }
+	if name == "readSecret" { return types.Ty.TResult(types.Ty.TSecret(types.Ty.TStr()), types.secretError()) }
 	// Nothing is locked, so there is no limit to run into.
-	if name == "readSecretBypass" { return types.Ty.TSecret() }
+	if name == "readSecretBypass" { return types.Ty.TSecret(types.Ty.TStr()) }
 	// Whether anybody is watching.
 	if name == "isTerminal" { return types.Ty.TBool() }
 	if name == "args" {
@@ -173,7 +190,7 @@ func termResult(name: Str): types.Ty {
 }
 
 func fileResult(name: Str): types.Ty {
-	fileError := types.Ty.TLib("file", "FileError")
+	fileError := types.libraryError("file", "FileError")
 	// Reading a table is its own kind of failure — a file that opened and then
 	// turned out not to hold what it said it did — so it answers with an error
 	// of its own rather than a `FileError`.
@@ -239,7 +256,7 @@ func envResult(name: Str): types.Ty {
 		return types.Ty.TResult(types.Ty.TStr(), types.Ty.TLib("env", "EnvironmentError"))
 	}
 	if name == "getSecret" {
-		return types.Ty.TResult(types.Ty.TSecret(), types.Ty.TLib("env", "EnvironmentError"))
+		return types.Ty.TResult(types.Ty.TSecret(types.Ty.TStr()), types.Ty.TLib("env", "EnvironmentError"))
 	}
 	return types.Ty.TUnknown()
 }
@@ -269,9 +286,10 @@ func jsonResult(name: Str, args: types.Ty[]): types.Ty {
 }
 
 // Types a module declares in Hive, flattened in by the loader when a program
-// names one, so they get everything a declared type gets.
+// names one, so they get everything a declared type gets. `""` is the core's
+// own, which belong to no module.
 func declaringModules(): Str[dyn] {
-	return ["json"]
+	return ["json", "file", "net", "sql", "crypto", "syslink", ""]
 }
 
 func declarationsOf(module: Str): Str {
@@ -288,7 +306,126 @@ func declarationsOf(module: Str): Str {
 			}
 		`
 	}
+	if module == "file" {
+		return `
+			type FileError \{
+				NotFound
+				Permission
+				Exists
+				Io
+				path: Str
+				message: Str
+			}
+		`
+	}
+	if module == "net" {
+		return `
+			type WsError \{
+				Handshake
+				Protocol
+				Closed
+				Send
+				Receive
+				message: Str
+			}
+
+			type SocketError \{
+				Connect
+				Closed
+				Send
+				Receive
+				message: Str
+			}
+
+			type NetError \{
+				NotFound
+				Lookup
+				NoAddress
+				message: Str
+			}
+		`
+	}
+	if module == "sql" {
+		return `
+			type SqlError \{
+				Connection
+				Statement
+				Shape
+				Convert
+				message: Str
+			}
+		`
+	}
+	if module == "crypto" {
+		return `
+			type CryptoError \{
+				Malformed
+				BadSignature
+				LimitExceeded
+				Unsupported
+				message: Str
+			}
+		`
+	}
+	if module == "syslink" {
+		return `
+			type SyslinkError \{
+				Taken
+				Down
+				NoProc
+				Timeout
+				Unreachable
+				Decode
+				NoPeer
+				NoListener
+				NoKey
+				message: Str
+			}
+		`
+	}
+	if module == "" {
+		return `
+			type SecretError \{
+				LimitExceeded
+				Unsupported
+				message: Str
+			}
+		`
+	}
 	return ""
+}
+
+// The declaring modules a program using `module` needs whether or not it names
+// their types: a call that can fail answers with its module's error, and one
+// that makes a `Secret` with the core's.
+func errorModulesFor(module: Str): Str[dyn] {
+	if module == "file" || module == "net" || module == "sql" || module == "syslink" || module == "" {
+		return [module]
+	}
+	if module == "crypto" {
+		return ["crypto", ""]
+	}
+	if module == "term" {
+		return [""]
+	}
+	return []
+}
+
+// Whether a flattened name is one of the error unions above, which the runtime
+// reports as a struct with a `Reason` and the program reads as a union.
+func isErrorUnion(name: Str): Bool {
+	parts := split(name, "_")
+	if len(parts) != 3 || text.charAt(parts, 0) != "hive" {
+		return false
+	}
+	module := text.charAt(parts, 1)
+	return module != "json" && indexOf(declaringModules(), module) is Result.Ok(_)
+}
+
+// The runtime's struct for one of those, which the union is lifted from.
+func runtimeErrorType(name: Str): Str {
+	parts := split(name, "_")
+	return "hive." + text.capitalise(text.charAt(parts, 1)) + text.charAt(parts, 2)
 }
 
 // A type name holds no `_`, so no program can declare one of these.
@@ -305,7 +442,7 @@ func tableHasNoJson(): Str {
 }
 
 func secretHasNoJson(): Str {
-	return "a `Secret` has no JSON, because only `reveal` turns one into text"
+	return "a `Secret` has no JSON, because only `reveal` opens one"
 }
 
 func tableHasNoDecoder(): Str {
@@ -376,7 +513,7 @@ func codecFormats(): Str[dyn] {
 }
 
 func syslinkResult(name: Str): types.Ty {
-	syslinkError := types.Ty.TLib("syslink", "SyslinkError")
+	syslinkError := types.libraryError("syslink", "SyslinkError")
 	if name == "monitor" || name == "setKey" {
 		return types.Ty.TVoid()
 	}
@@ -394,7 +531,7 @@ func syslinkResult(name: Str): types.Ty {
 // module's surface: everything else a program does with a database it does
 // through a `query`, and `run` is what runs one.
 func sqlResult(name: Str, args: types.Ty[]): types.Ty {
-	sqlError := types.Ty.TLib("sql", "SqlError")
+	sqlError := types.libraryError("sql", "SqlError")
 	if name == "connect" || name == "pool" {
 		return types.Ty.TResult(types.Ty.TLib("sql", "SqlConnection"), sqlError)
 	}
@@ -423,9 +560,9 @@ func sqlResult(name: Str, args: types.Ty[]): types.Ty {
 // forever.
 func netResult(name: Str): types.Ty {
 	httpError := types.Ty.TLib("net", "HttpError")
-	wsError := types.Ty.TLib("net", "WsError")
-	socketError := types.Ty.TLib("net", "SocketError")
-	netError := types.Ty.TLib("net", "NetError")
+	wsError := types.libraryError("net", "WsError")
+	socketError := types.libraryError("net", "SocketError")
+	netError := types.libraryError("net", "NetError")
 	if name == "httpServe" || name == "wsServe" || name == "socketServe"
 		|| name == "wsClose" || name == "socketClose" {
 		return types.Ty.TVoid()
@@ -464,7 +601,7 @@ func netResult(name: Str): types.Ty {
 // a token unverified, `randomSecret`, and the codec — a token is written and read
 // by `encode` and `T.decode`, which the codec is handed to.
 func cryptoResult(name: Str): types.Ty {
-	cryptoError := types.Ty.TLib("crypto", "CryptoError")
+	cryptoError := types.libraryError("crypto", "CryptoError")
 	if name == "sha256" || name == "sha512" || name == "hmacSha256"
 		|| name == "base64Encode" || name == "randomHex"
 		|| name == "encrypt" {
@@ -475,9 +612,9 @@ func cryptoResult(name: Str): types.Ty {
 	if name == "base64Decode" {
 		return types.Ty.TResult(types.Ty.TStr(), cryptoError)
 	}
-	if name == "randomSecret" { return types.Ty.TResult(types.Ty.TSecret(), types.secretError()) }
+	if name == "randomSecret" { return types.Ty.TResult(types.Ty.TSecret(types.Ty.TStr()), types.secretError()) }
 	if name == "decrypt" || name == "decryptBypass" {
-		return types.Ty.TResult(types.Ty.TSecret(), cryptoError)
+		return types.Ty.TResult(types.Ty.TSecret(types.Ty.TStr()), cryptoError)
 	}
 	if name == "jwtHeader" {
 		return types.Ty.TResult(types.Ty.TLib("crypto", "Header"), cryptoError)
@@ -587,10 +724,6 @@ func variantsOf(module: Str, name: Str): Str[dyn] {
 // A library type's fields, in the order a positional constructor takes them.
 func fieldsOf(module: Str, name: Str): ast.Field[dyn] {
 	if module == "net" { return netFields(name) }
-	if module == "syslink" {
-		if name == "SyslinkError" { return [field("reason"), field("message")] }
-		return []
-	}
 	if module == "ui" {
 		// Everything `hive.ui` owns is opaque: a view is built by the widget
 		// calls, an attribute by the attribute calls, an enumeration is a closed
@@ -598,16 +731,10 @@ func fieldsOf(module: Str, name: Str): ast.Field[dyn] {
 		return []
 	}
 	if module == "sql" {
-		if name == "SqlError" { return [field("reason"), field("message")] }
 		if name == "DatabaseDriver" { return [field("name")] }
 		return []
 	}
-	if module == "" {
-		if name == "SecretError" { return [field("reason"), field("message")] }
-		return []
-	}
 	if module == "crypto" {
-		if name == "CryptoError" { return [field("reason"), field("message")] }
 		if name == "Header" {
 			return [field("alg"), field("typ"), field("kid")]
 		}
@@ -619,9 +746,6 @@ func fieldsOf(module: Str, name: Str): ast.Field[dyn] {
 		return []
 	}
 	if module == "file" {
-		if name == "FileError" {
-			return [field("reason"), field("path"), field("message")]
-		}
 		if name == "TableError" { return [field("path"), field("message")] }
 		return []
 	}
@@ -655,9 +779,6 @@ func netFields(name: Str): ast.Field[dyn] {
 		return [intField("status"), tableField("headers"), field("body")]
 	}
 	if name == "HttpError" { return [field("url"), field("message")] }
-	if name == "WsError" || name == "SocketError" || name == "NetError" {
-		return [field("reason"), field("message")]
-	}
 	if name == "QueryParamsError" { return decodingFields() }
 	return []
 }
@@ -680,7 +801,7 @@ func flatUnit(format: Str): Str {
 
 // What one key of a flat format can hold. A vector of one is that key repeated.
 func isFlatValue(ty: types.Ty): Bool {
-	return ty is types.Ty.TStr || ty is types.Ty.TInt || ty is types.Ty.TFloat
+	return ty is types.Ty.TStr || types.isNumber(ty)
 		|| ty is types.Ty.TBool || ty is types.Ty.TAtom
 }
 
@@ -1059,14 +1180,15 @@ func paramsOf(module: Str, name: Str): types.Ty[dyn] {
 			|| name == "csv" {
 			return [types.Ty.TStr(), types.Ty.TStr()]
 		}
-		if name == "writeSecret" { return [types.Ty.TStr(), types.Ty.TSecret()] }
+		if name == "writeSecret" { return [types.Ty.TStr(), types.Ty.TSecret(types.Ty.TStr())] }
 		return [types.Ty.TStr()]
 	}
 	if module == "conv" {
 		if name == "ceil" || name == "floor" || name == "round" || name == "fts" {
 			return [types.Ty.TFloat()]
 		}
-		if name == "itf" || name == "its" { return [types.Ty.TInt()] }
+		if name == "itf" || name == "itf32" || name == "its" { return [types.Ty.TInt()] }
+		if name == "fromBytes" { return [types.Ty.TVec(types.Ty.TSized(false, 8), ast.Dim.Any())] }
 		return [types.Ty.TStr()]
 	}
 	if module == "math" { return mathParams(name) }
@@ -1089,10 +1211,10 @@ func paramsOf(module: Str, name: Str): types.Ty[dyn] {
 	if module == "crypto" {
 		if name == "randomHex" || name == "randomSecret" { return [types.Ty.TInt()] }
 		if name == "hmacSha256" || name == "decrypt" || name == "decryptBypass" {
-			return [types.Ty.TStr(), types.Ty.TSecret()]
+			return [types.Ty.TStr(), types.Ty.TSecret(types.Ty.TStr())]
 		}
-		if name == "encrypt" { return [types.Ty.TSecret(), types.Ty.TSecret()] }
-		if name == "jwtCodec" { return [types.Ty.TSecret()] }
+		if name == "encrypt" { return [types.Ty.TSecret(types.Ty.TStr()), types.Ty.TSecret(types.Ty.TStr())] }
+		if name == "jwtCodec" { return [types.Ty.TSecret(types.Ty.TStr())] }
 		return [types.Ty.TStr()]
 	}
 	return []
@@ -1116,7 +1238,8 @@ func paramNamesOf(module: Str, name: Str): Str[dyn] {
 		return ["path"]
 	}
 	if module == "conv" {
-		if name == "sti" || name == "stf" { return ["text"] }
+		if name == "sti" || name == "stf" || name == "bytesOf" { return ["text"] }
+		if name == "fromBytes" { return ["bytes"] }
 		return ["v"]
 	}
 	if module == "math" {
@@ -1288,9 +1411,9 @@ func mapParams(name: Str): types.Ty[dyn] {
 }
 
 func syslinkParams(name: Str): types.Ty[dyn] {
-	address := types.Ty.TAddress()
+	address := types.Ty.TAddress(types.Ty.TUnknown())
 	if name == "listen" { return [types.Ty.TStr()] }
-	if name == "setKey" { return [types.Ty.TSecret()] }
+	if name == "setKey" { return [types.Ty.TSecret(types.Ty.TStr())] }
 	if name == "monitor" { return [address, address, types.Ty.TUnknown()] }
 	// `node` and `peers` ask for nothing.
 	return []

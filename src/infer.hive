@@ -70,6 +70,8 @@ func typeOf(env: Env, e: ast.Expr): types.Ty {
 	// Saying so here keeps a `!` on something odd from spreading a second,
 	// vaguer error downstream.
 	else if e is ast.Expr.Not(_) { return types.Ty.TBool() }
+	else if e is ast.Expr.BitNot(operand) { return typeOf(env, operand) }
+	else if e is ast.Expr.Bits(_) { return types.Ty.TVec(byte(), ast.Dim.Dynamic()) }
 	else if e is ast.Expr.Binary(op, left, right) { return binaryType(env, op, left, right) }
 	else if e is ast.Expr.VectorLit(items) { return vectorType(env, items) }
 	return typeOfTail(env, e)
@@ -179,12 +181,12 @@ func identType(env: Env, name: Str): types.Ty {
 
 func callableType(t: types.Table, info: types.CallableInfo): types.Ty {
 	mut types.Ty[dyn] params = []
-	mut Bool[dyn] mutexes = []
+	mut Bool[dyn] mutables = []
 	for each p in info.params {
 		append(params, types.resolve(t, p.declared))
-		append(mutexes, p.mutex)
+		append(mutables, p.mutable)
 	}
-	return types.Ty.TFn(info.pure, params, mutexes, types.resolve(t, info.result))
+	return types.Ty.TFn(info.pure, params, mutables, types.resolve(t, info.result))
 }
 
 // Arithmetic answers with what it was given; a comparison and a connective
@@ -196,13 +198,151 @@ func binaryType(env: Env, op: ast.BinOp, left: ast.Expr, right: ast.Expr): types
 	}
 	leftType := typeOf(env, left)
 	rightType := typeOf(env, right)
+	// What a shift moves is the left side; the count says only how far.
+	if isShift(op) {
+		return leftType
+	}
 	if leftType is types.Ty.TUnknown {
 		return rightType
+	}
+	operands := operandType(env, left, right)
+	if (operands is types.Ty.TUnknown) == false {
+		return operands
 	}
 	if op is ast.BinOp.Add {
 		return addedType(leftType, rightType)
 	}
 	return leftType
+}
+
+// The number type both sides of an operator are worked in, or `TUnknown` when
+// they are not two numbers of one type. A literal takes the other side's type,
+// so `a + 1` on a `UInt4` stays a `UInt4`.
+func operandType(env: Env, left: ast.Expr, right: ast.Expr): types.Ty {
+	leftType := typeOf(env, left)
+	rightType := typeOf(env, right)
+	if types.isNumber(leftType) == false || types.isNumber(rightType) == false {
+		return types.Ty.TUnknown()
+	}
+	if adopts(right, leftType) {
+		return leftType
+	}
+	if adopts(left, rightType) {
+		return rightType
+	}
+	if types.same(leftType, rightType) {
+		return leftType
+	}
+	return types.Ty.TUnknown()
+}
+
+// Whether a literal on one side of an operator takes the other side's type.
+func adopts(e: ast.Expr, other: types.Ty): Bool {
+	if intLiteral(e) is Result.Ok(_) {
+		return types.isInteger(other)
+	}
+	if flippedLiteral(e) is Result.Ok(n) {
+		return types.isInteger(other) && types.holdsLiteral(other, n)
+	}
+	if isFloatLiteral(e) {
+		return types.isFloat(other)
+	}
+	return false
+}
+
+// The value of an integer literal, `-` included.
+func intLiteral(e: ast.Expr): Result<Int, Bool> {
+	if e is ast.Expr.IntLit(n) {
+		return Result.Ok(n)
+	}
+	if e is ast.Expr.Negate(operand) {
+		if operand is ast.Expr.IntLit(n) {
+			return Result.Ok(0 - n)
+		}
+	}
+	return Result.Error(false)
+}
+
+// The literal under a `~`, whose bits are only known once its width is: `~0x0F`
+// is `0xF0` as a `UInt8` and something else as an `Int`.
+func flippedLiteral(e: ast.Expr): Result<Int, Bool> {
+	if e is ast.Expr.BitNot(operand) {
+		return intLiteral(operand)
+	}
+	return Result.Error(false)
+}
+
+// A `hive.math` call handed a `Float32` reads a float literal beside it as one.
+func mathArgTypes(env: Env, args: ast.Arg[]): types.Ty[dyn] {
+	tys := typesOfArgs(env, args)
+	mut single := false
+	for each ty in tys {
+		if ty is types.Ty.TFloat32 {
+			single = true
+		}
+	}
+	if single == false {
+		return tys
+	}
+	mut types.Ty[dyn] out = []
+	mut i := 0
+	for each a in args {
+		if isFloatLiteral(a.value) {
+			append(out, types.Ty.TFloat32())
+		} else if tys bounds i {
+			append(out, tys[i])
+		}
+		i = i + 1
+	}
+	return out
+}
+
+func isFloatLiteral(e: ast.Expr): Bool {
+	if e is ast.Expr.FloatLit(_) {
+		return true
+	}
+	if e is ast.Expr.Negate(operand) {
+		return operand is ast.Expr.FloatLit(_)
+	}
+	return false
+}
+
+// The type a value has where it lands in `want`: a literal takes `want`'s own
+// number type, and a vector literal of them takes its element type.
+func landedType(env: Env, e: ast.Expr, want: types.Ty): types.Ty {
+	if intLiteral(e) is Result.Ok(n) && types.holdsLiteral(want, n) {
+		return want
+	}
+	if flippedLiteral(e) is Result.Ok(n) && types.isInteger(want) && types.holdsLiteral(want, n) {
+		return want
+	}
+	if isFloatLiteral(e) && want is types.Ty.TFloat32 {
+		return want
+	}
+	if e is ast.Expr.Call(callee, args) && want is types.Ty.TResult(ok, bad) && args bounds 0 {
+		if callee is ast.Expr.Member(head, variant) && head is ast.Expr.Ident(result) && result == "Result" {
+			mut payloadWant := ok
+			if variant == "Error" {
+				payloadWant = bad
+			}
+			landed := landedType(env, args[0].value, payloadWant)
+			if types.accepts(payloadWant, landed) {
+				return want
+			}
+		}
+	}
+	if e is ast.Expr.VectorLit(items) && len(items) > 0 {
+		if want is types.Ty.TVec(element, _) {
+			for each item in items {
+				landed := landedType(env, item, element)
+				if types.accepts(element, landed) == false {
+					return typeOf(env, e)
+				}
+			}
+			return types.Ty.TVec(element, ast.Dim.Fixed(len(items)))
+		}
+	}
+	return typeOf(env, e)
 }
 
 // What `+` answers with. Concatenation adds the two lengths, keeping
@@ -225,6 +365,18 @@ func addedType(leftType: types.Ty, rightType: types.Ty): types.Ty {
 func isComparison(op: ast.BinOp): Bool {
 	return op is ast.BinOp.Eq || op is ast.BinOp.Neq || op is ast.BinOp.Lt
 		|| op is ast.BinOp.Gt || op is ast.BinOp.Le || op is ast.BinOp.Ge
+}
+
+func isBitwise(op: ast.BinOp): Bool {
+	return op is ast.BinOp.BitAnd || op is ast.BinOp.BitOr || op is ast.BinOp.BitXor || isShift(op)
+}
+
+func isShift(op: ast.BinOp): Bool {
+	return op is ast.BinOp.Shl || op is ast.BinOp.Shr
+}
+
+func byte(): types.Ty {
+	return types.Ty.TSized(false, 8)
 }
 
 // A literal's length is what it holds, which is a static one — and that is what
@@ -291,7 +443,7 @@ func callType(env: Env, callee: ast.Expr, args: ast.Arg[]): types.Ty {
 	// somewhere to report to. A service answers with one of its own messages, so
 	// what comes back is whatever its mailbox holds.
 	if isAddressType(typeOf(env, callee)) {
-		return sendResult(env, args)
+		return sendResult(env, typeOf(env, callee), args)
 	}
 	argTypes := typesOfArgs(env, args)
 
@@ -345,6 +497,9 @@ func memberCallType(env: Env, subject: ast.Expr, field: Str, argTypes: types.Ty[
 		if types.findType(env.table, head) is Result.Ok(_) {
 			return types.Ty.TNamed(head)
 		}
+		if field == "checked" && isConversion(head) {
+			return types.Ty.TResult(conversionType(head), typeAt(argTypes, 0))
+		}
 		// `hive.len(v)` — a builtin under its long name.
 		if head == "hive" {
 			ordered := builtinArgs(field, args)
@@ -364,7 +519,11 @@ func memberCallType(env: Env, subject: ast.Expr, field: Str, argTypes: types.Ty[
 		}
 		if root is ast.Expr.Ident(hiveName) {
 			if hiveName == "hive" {
-				return stdlib.resultOf(module, field, typesOfArgs(env, stdlib.libraryArgs(module, field, args)))
+				ordered := stdlib.libraryArgs(module, field, args)
+				if module == "math" {
+					return stdlib.resultOf(module, field, mathArgTypes(env, ordered))
+				}
+				return stdlib.resultOf(module, field, typesOfArgs(env, ordered))
 			}
 		}
 		// `hive.sql.DatabaseDriver.SQLite()` — a variant of one of the library's
@@ -381,14 +540,37 @@ func memberCallType(env: Env, subject: ast.Expr, field: Str, argTypes: types.Ty[
 }
 
 // A service answers with one of *its own* messages, so the reply type is the
-// mailbox type — which is the type of the message that was sent. That is what
-// takes the annotation off an await site entirely.
-func sendResult(env: Env, args: ast.Arg[]): types.Ty {
-	mut message := types.Ty.TUnknown()
-	if args bounds 0 {
-		message = typeOf(env, args[0].value)
+// mailbox type the address carries. That is what takes the annotation off an
+// await site entirely.
+func sendResult(env: Env, address: types.Ty, args: ast.Arg[]): types.Ty {
+	return types.Ty.TResult(mailboxOf(env, address, args), syslinkError())
+}
+
+// What a send to `address` carries: its mailbox type, or, where the address
+// never said, the type of the message itself — which the checker has refused.
+func mailboxOf(env: Env, address: types.Ty, args: ast.Arg[]): types.Ty {
+	if address is types.Ty.TAddress(message) {
+		if message is types.Ty.TUnknown {
+		} else {
+			return message
+		}
 	}
-	return types.Ty.TResult(message, types.Ty.TLib("syslink", "SyslinkError"))
+	if args bounds 0 {
+		return typeOf(env, args[0].value)
+	}
+	return types.Ty.TUnknown()
+}
+
+// The message type a `spawn` handler takes, which is what its address takes.
+func handlerMessage(handler: types.Ty): types.Ty {
+	if handler is types.Ty.TFn(_, params, _, _) {
+		return typeAt(params, 1)
+	}
+	return types.Ty.TUnknown()
+}
+
+func syslinkError(): types.Ty {
+	return types.libraryError("syslink", "SyslinkError")
 }
 
 // Whether this expression is a call of an address, which is a send.
@@ -400,7 +582,7 @@ func isSendExpr(env: Env, e: ast.Expr): Bool {
 }
 
 func isAddressType(ty: types.Ty): Bool {
-	return ty is types.Ty.TAddress
+	return ty is types.Ty.TAddress(_)
 }
 
 func resultConstructor(variant: Str, argTypes: types.Ty[]): types.Ty {
@@ -431,17 +613,17 @@ func hasHole(args: ast.Arg[]): Bool {
 func partialType(env: Env, callee: ast.Expr, args: ast.Arg[]): types.Ty {
 	whole := typeOf(env, callee)
 	mut types.Ty[dyn] holes = []
-	if whole is types.Ty.TFn(pure, params, mutexes, result) {
-		mut Bool[dyn] holeMutexes = []
+	if whole is types.Ty.TFn(pure, params, mutables, result) {
+		mut Bool[dyn] holeMutables = []
 		mut i := 0
 		for each a in args {
 			if a.value is ast.Expr.Hole {
 				append(holes, typeAt(params, i))
-				append(holeMutexes, types.mutexAt(mutexes, i))
+				append(holeMutables, types.mutableAt(mutables, i))
 			}
 			i = i + 1
 		}
-		return types.Ty.TFn(pure, holes, holeMutexes, result)
+		return types.Ty.TFn(pure, holes, holeMutables, result)
 	}
 	// A constructor with a hole is a function too: each `_` still becomes a
 	// parameter in hole order, and what comes back is typed as what it builds.
@@ -458,7 +640,7 @@ func partialType(env: Env, callee: ast.Expr, args: ast.Arg[]): types.Ty {
 		}
 		at = at + 1
 	}
-	return types.Ty.TFn(true, holes, types.noMutexes(len(holes)), built)
+	return types.Ty.TFn(true, holes, types.noMutables(len(holes)), built)
 }
 
 // The fields a constructor takes, or nothing when the callee is not one.
@@ -515,7 +697,7 @@ type CallTarget {
 	Unknown
 }
 
-func mutexArguments(env: Env, callee: ast.Expr, args: ast.Arg[]): ast.Expr[dyn] {
+func mutableArguments(env: Env, callee: ast.Expr, args: ast.Arg[]): ast.Expr[dyn] {
 	mut ast.Expr[dyn] out = []
 	if callee is ast.Expr.Ident(name) {
 		if callTarget(env, name) is CallTarget.Declared(info) {
@@ -525,17 +707,17 @@ func mutexArguments(env: Env, callee: ast.Expr, args: ast.Arg[]): ast.Expr[dyn] 
 				if ast.claimedByName(args, p.name) == false {
 					open = open + 1
 				}
-				if p.mutex {
+				if p.mutable {
 					append(out, found)
 				}
 			}
 			return out
 		}
 	}
-	if typeOf(env, callee) is types.Ty.TFn(_, _, mutexes, _) {
+	if typeOf(env, callee) is types.Ty.TFn(_, _, mutables, _) {
 		mut i := 0
 		for each a in args {
-			if types.mutexAt(mutexes, i) {
+			if types.mutableAt(mutables, i) {
 				append(out, a.value)
 			}
 			i = i + 1
@@ -553,6 +735,9 @@ func callTarget(env: Env, name: Str): CallTarget {
 	}
 	if types.fieldsOfStruct(env.table, name) is Result.Ok(fields) {
 		return CallTarget.Struct(fields)
+	}
+	if types.findType(env.table, name) is Result.Ok(_) && isConversion(name) {
+		return CallTarget.Union()
 	}
 	if isBuiltin(name) {
 		return CallTarget.Builtin()
@@ -613,24 +798,33 @@ func builtinResult(env: Env, name: Str, argTypes: types.Ty[], args: ast.Arg[]): 
 	if name == "filterMap" {
 		return types.Ty.TVec(okOf(resultOfFn(typeAt(argTypes, 1))), ast.Dim.Dynamic())
 	}
-	// Either form of `spawn` answers a Result, since a name may be taken.
+	// Either form of `spawn` answers a Result, since a name may be taken. The
+	// address takes what the handler does.
 	if name == "spawn" {
-		return types.Ty.TResult(types.Ty.TAddress(), types.Ty.TLib("syslink", "SyslinkError"))
+		return types.Ty.TResult(types.Ty.TAddress(handlerMessage(subject)), syslinkError())
 	}
+	// A name says where a service is and nothing about what it takes, so that is
+	// read off where the address lands.
 	if name == "at" {
-		return types.Ty.TAddress()
+		return types.Ty.TAddress(types.Ty.TUnknown())
 	}
 	if name == "kill" {
 		return types.Ty.TVoid()
 	}
 	if name == "hide" {
-		return types.Ty.TResult(types.Ty.TSecret(), types.secretError())
+		return types.Ty.TResult(types.Ty.TSecret(subject), types.secretError())
 	}
 	if name == "bypass" {
-		return types.Ty.TSecret()
+		return types.Ty.TSecret(subject)
 	}
 	if name == "reveal" {
-		return types.Ty.TStr()
+		if subject is types.Ty.TSecret(held) {
+			return held
+		}
+		return types.Ty.TUnknown()
+	}
+	if isConversion(name) {
+		return conversionType(name)
 	}
 	return types.Ty.TUnknown()
 }
@@ -674,8 +868,9 @@ func builtinParams(name: Str, arity: Int): Str[dyn] {
 		return ["endpoint", "name"]
 	}
 	if name == "kill" { return ["address"] }
-	if name == "hide" || name == "bypass" { return ["text"] }
+	if name == "hide" || name == "bypass" { return ["value"] }
 	if name == "reveal" { return ["secret"] }
+	if isConversion(name) { return ["value"] }
 	return []
 }
 
@@ -694,6 +889,21 @@ func isBuiltin(name: Str): Bool {
 		|| name == "replaceFirst" || name == "replaceAll"
 		|| name == "encode" || name == "spawn" || name == "at" || name == "kill"
 		|| name == "hide" || name == "reveal" || name == "bypass"
+		|| isConversion(name)
+}
+
+// `UInt4(x)`, `Int(x)`, `Float32(x)`: a number type's name, called to convert.
+func isConversion(name: Str): Bool {
+	return name == "Int" || name == "Float" || types.sizedName(name) is Result.Ok(_)
+}
+
+func conversionType(name: Str): types.Ty {
+	if name == "Int" { return types.Ty.TInt() }
+	if name == "Float" { return types.Ty.TFloat() }
+	if types.sizedName(name) is Result.Ok(ty) {
+		return ty
+	}
+	return types.Ty.TUnknown()
 }
 
 // --- Patterns ----------------------------------------------------------------
@@ -729,6 +939,39 @@ func afterPattern(env: Env, subject: types.Ty, p: ast.Pattern): Env {
 	}
 	if p is ast.Pattern.StrTemplate(parts) {
 		return boundHoles(env, parts, 0)
+	}
+	if p is ast.Pattern.BitsPat(fields, rest) {
+		out := boundBitFields(env, fields, 0)
+		if rest != "" {
+			if subject is types.Ty.TStr {
+				return bound(out, rest, subject)
+			}
+			return bound(out, rest, types.Ty.TVec(byte(), ast.Dim.Dynamic()))
+		}
+		return out
+	}
+	return env
+}
+
+// What a binary pattern's field holds: one byte unless it says otherwise, and a
+// run of them for `UInt8[size]`.
+func bitFieldType(t: types.Table, f: ast.BitField): types.Ty {
+	if (f.length is ast.Expr.Absent) == false {
+		return types.Ty.TVec(byte(), ast.Dim.Dynamic())
+	}
+	if f.declared is ast.TypeExpr.VoidType {
+		return byte()
+	}
+	return types.resolve(t, f.declared)
+}
+
+func boundBitFields(env: Env, fields: ast.BitField[], at: Int): Env {
+	if fields bounds at {
+		f := fields[at]
+		if f.name != "" {
+			return boundBitFields(bound(env, f.name, bitFieldType(env.table, f)), fields, at + 1)
+		}
+		return boundBitFields(env, fields, at + 1)
 	}
 	return env
 }

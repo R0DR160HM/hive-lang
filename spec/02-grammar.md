@@ -120,7 +120,7 @@ assign      = lvalue "=" expression ;
 lvalue      = IDENT { "." IDENT | "[" expression "]" } ;
 
 compound-assign
-            = lvalue ( "+=" | "-=" | "*=" | "/=" ) expression ;
+            = lvalue ( "+=" | "-=" | "*=" | "/=" | "&=" | "|=" | "^=" | "<<=" | ">>=" ) expression ;
 step        = lvalue ( "++" | "--" ) ;
 
 if-stmt     = "if" expression block { "else" "if" expression block }
@@ -163,14 +163,15 @@ Loosest to tightest:
 | 2 | `&&` | left |
 | 3 | `is`, `bounds` | non-associative |
 | 4 | `>` `<` `>=` `<=` `==` `!=` | non-associative |
-| 5 | `+` `-` | left |
-| 6 | `*` `/` `%` | left |
-| 7 | `\|` | left |
-| 8 | unary `-`, `!` | prefix |
-| 9 | `**` | right |
-| 10 | `with` clause | postfix |
-| 11 | call, index, slice, member | postfix, left |
-| 12 | primary | — |
+| 5 | `&` `\|` `^` `<<` `>>` | left, one of them at a time |
+| 6 | `+` `-` | left |
+| 7 | `*` `/` `%` | left |
+| 8 | `\|>` | left |
+| 9 | unary `-`, `!`, `~` | prefix |
+| 10 | `**` | right |
+| 11 | `with` clause | postfix |
+| 12 | call, index, slice, member | postfix, left |
+| 13 | primary | — |
 
 Unary `-` binds **tighter** than `* / %` and **looser** than `**`, so `-2 ** 2`
 is `-(2 ** 2)` and `2 ** -3` reads the sign as part of the exponent.
@@ -182,11 +183,17 @@ negating a comparison, a `bounds` or anything else at a looser level is written
 with parentheses — `!(a == b)`, `!(v bounds i)`. A **match** may not be negated
 at all; [05](05-expressions.md#no-negated-match) says why.
 
-`|` binds tighter than every binary operator and looser than the prefix ones,
+The bitwise operators bind tighter than a comparison, so `x & 1 == 0` asks about
+`x & 1`. They have **no order** among themselves or against arithmetic: two
+different ones side by side, or one beside `+ - * / % **` outside parentheses,
+are a compile error — `(x >> 4) & 0xF`, never `x >> 4 & 0xF`. The same one
+repeated chains, left to right: `a | b | c`.
+
+`|>` binds tighter than every binary operator and looser than the prefix ones,
 which is what lets a pipeline stand on either side of one without parentheses —
-`v | len > 2` compares the length, `-x | f` pipes the negated value. It takes
-the value written **beside** it, so `1 + 2 | f` is `1 + f(2)` and a computed
-value is parenthesised: `(1 + 2) | f`.
+`v |> len > 2` compares the length, `-x |> f` pipes the negated value. It takes
+the value written **beside** it, so `1 + 2 |> f` is `1 + f(2)` and a computed
+value is parenthesised: `(1 + 2) |> f`.
 
 ```
 expression  = or-expr ;
@@ -194,13 +201,15 @@ or-expr     = and-expr { "||" and-expr } ;
 and-expr    = is-expr { "&&" is-expr } ;
 
 is-expr     = cmp-expr [ "is" pattern ]
-            | cmp-expr "bounds" add-expr ;
+            | cmp-expr "bounds" bit-expr ;
 
-cmp-expr    = add-expr [ ( ">" | "<" | ">=" | "<=" | "==" | "!=" ) add-expr ] ;
+cmp-expr    = bit-expr [ ( ">" | "<" | ">=" | "<=" | "==" | "!=" ) bit-expr ] ;
+bit-expr    = add-expr { ( "&" | "|" | "^" | "<<" | ">>" ) add-expr } ;
+                                    (* one operator throughout, no bare arithmetic *)
 add-expr    = mul-expr { ( "+" | "-" ) mul-expr } ;
 mul-expr    = pipe-expr { ( "*" | "/" | "%" ) pipe-expr } ;
-pipe-expr   = unary-expr { "|" unary-expr } ;
-unary-expr  = "-" unary-expr | "!" unary-expr | pow-expr ;
+pipe-expr   = unary-expr { "|>" unary-expr } ;
+unary-expr  = "-" unary-expr | "!" unary-expr | "~" unary-expr | pow-expr ;
 pow-expr    = with-expr [ "**" unary-expr ] ;
 
 with-expr   = postfix-expr [ "with" "timeout" add-expr ] ;
@@ -218,10 +227,13 @@ primary     = INT | FLOAT | STRING | INTERP | ATOM | "true" | "false"
             | IDENT
             | "_"
             | vector-lit
+            | bits-lit
             | await-all
             | "(" expression ")" ;
 
 vector-lit  = "[" [ expression { "," expression } ] "]" ;
+bits-lit    = "<<" [ part { "," part } ] ">>" ;
+part        = expression [ ":" type ] [ "little" ] ;
 await-all   = "await" "[" call { "," call } "]" ;
 ```
 
@@ -229,9 +241,13 @@ await-all   = "await" "[" call { "," call } "]" ;
 qualified so the guard means the same thing in a program that declared a `len`
 of its own ([13](13-builtins.md#a-declaration-of-your-own-wins)).
 
-`x | f(a)` is **sugar** for `f(x, a)` ([05](05-expressions.md#piping-a-value-in)).
-The right side of a `|` has to be a call, a callable's name or a constructor —
-`x | f` is `f(x)` — and everything after the parser sees the call it stands for.
+`x |> f(a)` is **sugar** for `f(x, a)` ([05](05-expressions.md#piping-a-value-in)).
+The right side of a `|>` has to be a call, a callable's name or a constructor —
+`x |> f` is `f(x)` — and everything after the parser sees the call it stands for.
+
+Inside `<<...>>` a `>>` closes it, so a shift there is written in parentheses:
+`<<(x >> 2): UInt8>>`. Outside it, one `>>` also closes two lists of type
+arguments: `hive.map.Map<Str, Result<Int, Str>>`.
 
 `_` is a **hole**, legal only as a call argument, where it makes the call a
 partial application ([05](05-expressions.md#54-function-values)), and as a
@@ -249,7 +265,7 @@ A slice's high bound is **inclusive** — `t[1:3]` is three elements.
 ## 2.7 Patterns
 
 ```
-pattern     = ctor-pattern | vector-pattern | string-pattern ;
+pattern     = ctor-pattern | vector-pattern | string-pattern | bits-pattern ;
 
 ctor-pattern= path [ "(" [ binding { "," binding } ] ")" ] ;
 path        = IDENT { "." IDENT } ;
@@ -261,6 +277,11 @@ element     = INT | FLOAT | STRING | ATOM | "true" | "false"
             | IDENT | "_" ;
 
 string-pattern = STRING | INTERP ;   (* holes are {name} or {name is (re)} *)
+
+bits-pattern= "<<" [ field { "," field } [ "," "..." IDENT ] ] ">>"
+            | "<<" "..." IDENT ">>" ;
+field       = ( IDENT | "_" | [ "-" ] INT | STRING )
+              [ ":" ( type | IDENT "[" expression "]" ) ] [ "little" ] ;
 ```
 
 A string pattern's holes must be plain binding names, and two **open** holes may

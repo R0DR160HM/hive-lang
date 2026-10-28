@@ -2,7 +2,7 @@
 // =====
 // Source text to a flat list of tokens. It skips `//` comments and whitespace,
 // tracks the line every token sits on, and matches keywords exactly: `IF` is not
-// `if`, and not a name either.
+// `if` but a name.
 //
 // Three constructs need light context tracking, and `Mode` is the whole of it: a
 // quoted or backtick string may hold `{expression}` interpolations, captured raw for the
@@ -132,6 +132,14 @@ proc scanOperator(cs: Str[], s: mut Scan): void {
 		take(s, token.Kind.Ellipsis(), 3)
 		return
 	}
+	if text.matchesAt(cs, s.pos, "<<=") {
+		take(s, token.Kind.ShlEq(), 3)
+		return
+	}
+	if text.matchesAt(cs, s.pos, ">>=") {
+		take(s, token.Kind.ShrEq(), 3)
+		return
+	}
 
 	two := text.span(cs, s.pos, s.pos + 1)
 	if two == ":=" { take(s, token.Kind.ColonEq(), 2) return }
@@ -148,6 +156,12 @@ proc scanOperator(cs: Str[], s: mut Scan): void {
 	else if two == "-=" { take(s, token.Kind.MinusEq(), 2) return }
 	else if two == "*=" { take(s, token.Kind.StarEq(), 2) return }
 	else if two == "/=" { take(s, token.Kind.SlashEq(), 2) return }
+	else if two == "&=" { take(s, token.Kind.AmpEq(), 2) return }
+	else if two == "|=" { take(s, token.Kind.PipeEq(), 2) return }
+	else if two == "^=" { take(s, token.Kind.CaretEq(), 2) return }
+	else if two == "<<" { take(s, token.Kind.Shl(), 2) return }
+	else if two == ">>" { take(s, token.Kind.Shr(), 2) return }
+	else if two == "|>" { take(s, token.Kind.PipeGt(), 2) return }
 
 	one := text.charAt(cs, s.pos)
 	if one == "\{" { take(s, token.Kind.LBrace(), 1) return }
@@ -168,8 +182,10 @@ proc scanOperator(cs: Str[], s: mut Scan): void {
 	else if one == "*" { take(s, token.Kind.Star(), 1) return }
 	else if one == "/" { take(s, token.Kind.Slash(), 1) return }
 	else if one == "%" { take(s, token.Kind.Percent(), 1) return }
-	// Reached only when the `||` above did not fit: a `|` on its own is the pipe.
 	else if one == "|" { take(s, token.Kind.Pipe(), 1) return }
+	else if one == "&" { take(s, token.Kind.Amp(), 1) return }
+	else if one == "^" { take(s, token.Kind.Caret(), 1) return }
+	else if one == "~" { take(s, token.Kind.Tilde(), 1) return }
 	// Reached only when the `!=` above did not fit, which is what makes this a
 	// `!` standing on its own — the negation.
 	else if one == "!" { take(s, token.Kind.Bang(), 1) return }
@@ -184,9 +200,7 @@ proc scanOperator(cs: Str[], s: mut Scan): void {
 
 // --- Words -------------------------------------------------------------------
 
-// A word is a keyword when spelled the way the language spells one, and a name
-// when no keyword answers to it in any casing. What is left — `IF`, `Proc` — is
-// a keyword written wrong, which is worth saying rather than reading as a name.
+// Only a keyword's lower-case spelling is reserved: `Proc` and `IF` are names.
 proc scanWord(cs: Str[], s: mut Scan): void {
 	start := s.pos
 	for ; s.pos < len(cs) && isWordChar(text.charAt(cs, s.pos)); s.pos++ {
@@ -204,10 +218,6 @@ proc scanWord(cs: Str[], s: mut Scan): void {
 		}
 		return
 	}
-	if token.keywordOf(text.lower(word)) is Result.Ok(_) {
-		fail(s, naming.miscasedKeyword(word) + " — or, if a name was meant, one the language has not already taken. A keyword is reserved however it is spelled, so `" + word + "` is no more a name than `" + text.lower(word) + "` is.")
-		return
-	}
 	emit(s, token.Kind.Ident(word))
 }
 
@@ -221,14 +231,19 @@ func isWordChar(c: Str): Bool {
 // decides: without one the dot is an operator, so `v[1:2]` still lexes.
 proc scanNumber(cs: Str[], s: mut Scan): void {
 	start := s.pos
-	for ; s.pos < len(cs) && text.isDigit(text.charAt(cs, s.pos)); s.pos++ {
+	marker := text.charAt(cs, s.pos + 1)
+	if text.charAt(cs, s.pos) == "0" && (marker == "x" || marker == "b") {
+		scanRadix(cs, s)
+		return
+	}
+	for ; s.pos < len(cs) && digitAt(cs, s.pos, 10); s.pos++ {
 	}
 	if text.charAt(cs, s.pos) == "." && text.isDigit(text.charAt(cs, s.pos + 1)) {
 		s.pos = s.pos + 1
-		for ; s.pos < len(cs) && text.isDigit(text.charAt(cs, s.pos)); s.pos++ {
+		for ; s.pos < len(cs) && digitAt(cs, s.pos, 10); s.pos++ {
 		}
 		written := text.span(cs, start, s.pos - 1)
-		if hive.conv.stf(written) is Result.Ok(f) {
+		if hive.conv.stf(text.replace(written, "_", "")) is Result.Ok(f) {
 			emit(s, token.Kind.FloatLit(f))
 		} else {
 			fail(s, "`{written}` is not a number this machine can hold")
@@ -236,11 +251,75 @@ proc scanNumber(cs: Str[], s: mut Scan): void {
 		return
 	}
 	written := text.span(cs, start, s.pos - 1)
-	if hive.conv.sti(written) is Result.Ok(n) {
+	if hive.conv.sti(text.replace(written, "_", "")) is Result.Ok(n) {
 		emit(s, token.Kind.IntLit(n))
 	} else {
 		fail(s, "`{written}` is not a number this machine can hold")
 	}
+}
+
+// A digit of `radix` at `at`, or a `_` with one right after it: `1_000_000`.
+func digitAt(cs: Str[], at: Int, radix: Int): Bool {
+	c := text.charAt(cs, at)
+	if c == "_" {
+		return digitValue(text.charAt(cs, at + 1), radix) >= 0
+	}
+	return digitValue(c, radix) >= 0
+}
+
+func digitValue(c: Str, radix: Int): Int {
+	if indexOf("0123456789abcdef", text.lower(c)) is Result.Ok(n) {
+		if n < radix && c != "" {
+			return n
+		}
+	}
+	return -1
+}
+
+// `0xFF` and `0b1010`, read as the 64 bits they spell. One of 2^63 or more comes
+// out negative, which is how the parser knows it is a `UInt64`.
+proc scanRadix(cs: Str[], s: mut Scan): void {
+	start := s.pos
+	mut radix := 16
+	mut name := "hexadecimal"
+	mut bits := 4
+	if text.charAt(cs, s.pos + 1) == "b" {
+		radix = 2
+		name = "binary"
+		bits = 1
+	}
+	s.pos = s.pos + 2
+	for ; s.pos < len(cs) && isWordChar(text.charAt(cs, s.pos)); s.pos++ {
+	}
+	written := text.span(cs, start, s.pos - 1)
+	mut value := 0
+	mut width := 0
+	mut digits := 0
+	for i := start + 2; i < s.pos; i++ {
+		c := text.charAt(cs, i)
+		if c == "_" && digitValue(text.charAt(cs, i - 1), radix) >= 0 && digitValue(text.charAt(cs, i + 1), radix) >= 0 {
+			continue
+		}
+		d := digitValue(c, radix)
+		if d < 0 {
+			fail(s, "`{written}` is not a {name} number: `{c}` is not one of its digits")
+			return
+		}
+		value = value * radix + d
+		digits = digits + 1
+		if width > 0 || d > 0 {
+			width = width + bits
+		}
+	}
+	if digits == 0 {
+		fail(s, "`{written}` has no digits after its `{text.charAt(cs, start + 1)}`")
+		return
+	}
+	if width > 64 {
+		fail(s, "`{written}` needs more than 64 bits, and no integer type in Hive has more")
+		return
+	}
+	emit(s, token.Kind.IntLit(value))
 }
 
 // --- Atoms -------------------------------------------------------------------

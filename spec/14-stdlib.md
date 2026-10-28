@@ -23,6 +23,33 @@ A library type written down has to be one the module has: `hive.syslink.Nonesuch
 is a compile error wherever a type is written, and so is a variant one of the
 module's enumerations does not have — `hive.ui.TextSize.Small()`.
 
+**A failure says which it was by its variant.** Where a module can fail in more
+than one way, its error is a tagged union with a variant for each way, and the
+fields every one of them has — a `message`, and what else the module knows — are
+shared by every variant:
+
+```hive
+type FileError {
+	NotFound
+	Permission
+	Exists
+	Io
+	path: Str
+	message: Str
+}
+```
+
+So a failure is matched like any other union, the whole of it is covered by a
+`switch`, and a way a module cannot fail is a variant no program can name. A call
+that answers with one brings it into the program whether or not the program ever
+writes its name, and it is a declared type in every respect but where it is
+declared: copied, ordered, compared and encoded like one. It prints the way it
+always did, as what went wrong and why — `Taken: the name Counter is already
+registered on this node`. These are `hive.file.FileError`, `hive.net.WsError`,
+`hive.net.SocketError`, `hive.net.NetError`, `hive.sql.SqlError`,
+`hive.crypto.CryptoError`, `hive.syslink.SyslinkError` and the core's own
+[`SecretError`](03-types.md#311-secret).
+
 **A module you don't use is not in your build**
 ([12](12-modules.md#127-what-is-linked)). Every module but two is written against
 the target's standard library alone, so HTTP, WebSockets, TCP, JSON,
@@ -38,11 +65,16 @@ Number and string conversions. Pure.
 * **Rounding** (`Float → Int`) — `ceil(v)`, `floor(v)`, `round(v)` (round half
   away from zero). See [05](05-expressions.md#unspecified-behaviour) for
   non-finite inputs.
-* **Widening / rendering** — `itf(v)` widens an `Int` to a `Float`; `its(v)`
-  renders an `Int` as a `Str`; `fts(v)` a `Float` as a `Str`.
+* **Widening / rendering** — `itf(v)` widens an `Int` to a `Float`, and `itf32(v)` to
+  the nearest `Float32`; `its(v)` renders an `Int` as a `Str`; `fts(v)` a `Float` as
+  a `Str`. A sized integer is converted into an `Int` first: `its(Int(b))`.
 * **Parsing** — `sti(text)` → `Result<Int, hive.conv.ConversionError>`,
   `stf(text)` → `Result<Float, _>`. A `ConversionError` carries the offending
   `input` and a short `message`.
+* **Bytes** — `bytesOf(text)` → `UInt8[dyn]`, the bytes a `Str` holds, and
+  `fromBytes(bytes)` → `Str`, which never fails: a `Str` holds any bytes. A file
+  or a socket already hands back a `Str` of its raw bytes, so these two are the
+  whole of binary input and output.
 
 ## 14.2 `hive.math`
 
@@ -53,8 +85,9 @@ Number and string conversions. Pure.
 | **Distances** | `sqrt` `hypot(x, y)` `abs` |
 | **Bounds** | `min(a, b)` `max(a, b)` `clamp(value, low, high)` |
 
-**Every one takes and answers with a `Float`**, and there is no integer twin.
-That is one rule for thirteen functions, and it is the same rule the rest of the
+**Every one takes and answers with a `Float`**, and there is no integer twin. A
+call handed only `Float32`s answers a `Float32`. That is one rule for thirteen
+functions, and it is the same rule the rest of the
 language keeps: Hive never widens a number behind your back, so an `Int` goes in
 through `hive.conv.itf` and `hive.math.max(0, health)` is a compile error rather
 than a surprise. Clamping an `Int` is an `if`, and needs no library.
@@ -108,9 +141,14 @@ A dictionary: keys paired with values, looked up by key. Type-level rules are in
 General filesystem access. Contents move as
 `Str`, which holds bytes rather than validated text, so a binary file survives a
 read/write round trip. Everything fallible returns
-`Result<_, hive.file.FileError>`, whose `reason` is `"NotFound"`,
-`"Permission"`, `"Exists"` or `"Io"`, alongside the `path` and the underlying
-`message`.
+`Result<_, hive.file.FileError>`, which is `NotFound`, `Permission`, `Exists`
+or `Io`, each carrying the `path` and the underlying `message`:
+
+```hive
+if file.read(path) is Result.Error(file.FileError.NotFound(_, _)) {
+	echo "nothing at {path} yet"
+}
+```
 
 Reading a **table** out of a file is [14.6](#146-reading-tables): `csv`, `xlsx`
 and `ods` live here too, and each answers with a
@@ -125,7 +163,7 @@ own, carrying the `path` and a `message`.
   `append(path, contents)` adds to the end. Both → `Result<Int, _>`, the bytes
   written. Neither creates missing parent directories.
 * `writeSecret(path, contents)` → `Result<Int, _>` is `write` of a
-  [`Secret`](03-types.md#311-secret), leaving the file
+  [`Secret<Str>`](03-types.md#311-secret), leaving the file
   readable by the user running the program and nobody else: mode `0600` on Linux
   and macOS, and on Windows an access list naming that one account, protected so
   the containing folder hands nothing down. Who may read it is settled before any
@@ -158,12 +196,12 @@ Line-oriented terminal I/O.
 * `read()` blocks for a line of input, stripped of its trailing newline. It parks
   only the calling virtual thread. At end of input it returns whatever preceded
   EOF (`""` if nothing).
-* `readSecret()` → `Result<Secret, SecretError>` ([3.11](03-types.md#311-secret)) is that same read with the
+* `readSecret()` → `Result<Secret<Str>, SecretError>` ([3.11](03-types.md#311-secret)) is that same read with the
   terminal's echo turned off, read straight into locked memory rather than
   through a `Str`. The echo is put back before the call returns, and also if the
   program is interrupted at the prompt. Where there is no terminal at all, the
   line is read exactly as `read()` reads it and only the hiding of it is lost.
-* `readSecretBypass()` → `Secret` is `readSecret()` into ordinary memory, as
+* `readSecretBypass()` → `Secret<Str>` is `readSecret()` into ordinary memory, as
   [`bypass`](13-builtins.md#secrets-hide-bypass-reveal) is to `hide`: free to be
   swapped out, so there is no limit to run into and it cannot fail. The echo is
   turned off and put back the same way.
@@ -382,35 +420,37 @@ type JsonValue {
 `encode`, `T.decode` and a message crossing [`hive.syslink`](#1410-hivesyslink)
 refuse one wherever it sits in the value — `Str[dyn][dyn]` being the same type —
 and `Table.decode` does not exist. **Nor has a [`Secret`](03-types.md#311-secret)**,
-refused the same way: only `reveal` turns one into text.
+refused the same way: only `reveal` opens one.
 
 ## 14.8 `hive.crypto`
 
 Pure, so it works in a `func` too. Fallible operations return
-`Result<_, hive.crypto.CryptoError>`, whose `reason` is a short tag such as
-`"BadSignature"`, `"Expired"` or `"Malformed"`.
+`Result<_, hive.crypto.CryptoError>`: `Malformed` for input that is not what it
+claims to be, `BadSignature` for a message that does not check out, and
+`LimitExceeded` or `Unsupported` where a `Secret` could not be locked, each
+carrying a `message`.
 
-A key, a password and a plaintext are each a [`Secret`](03-types.md#311-secret);
+A key, a password and a plaintext are each a [`Secret<Str>`](03-types.md#311-secret);
 a digest, a ciphertext and a token are `Str`s, safe to print and store.
 
 * **Hashing** — `sha256(input)`, `sha512(input)` (lowercase hex),
-  `hmacSha256(input, key: Secret)`.
-* **Encryption** — `encrypt(plaintext: Secret, password: Secret)` → `Str` seals
+  `hmacSha256(input, key: Secret<Str>)`.
+* **Encryption** — `encrypt(plaintext: Secret<Str>, password: Secret<Str>)` → `Str` seals
   under a password with AES-256-GCM, base64-encoded;
-  `decrypt(ciphertext, password: Secret)` opens it → `Result<Secret, _>`, straight
-  into locked memory, its `reason` a `SecretError`'s where none could be locked. The key is derived with 600,000 rounds of PBKDF2-HMAC-SHA256
+  `decrypt(ciphertext, password: Secret<Str>)` opens it → `Result<Secret<Str>, _>`, straight
+  into locked memory, failing as the `SecretError` would where none could be locked. The key is derived with 600,000 rounds of PBKDF2-HMAC-SHA256
   over a random salt, and the salt and nonce are drawn afresh every call, so the
   same text under the same password never encrypts alike. GCM's tag travels with
   the ciphertext, so an edited message is rejected rather than opened into
-  something else — `"BadSignature"`, which is also what a wrong password gives.
-  `decryptBypass(ciphertext, password: Secret)` → `Result<Secret, _>` is
+  something else — `BadSignature`, which is also what a wrong password gives.
+  `decryptBypass(ciphertext, password: Secret<Str>)` → `Result<Secret<Str>, _>` is
   `decrypt` opening it into ordinary memory, as
   [`bypass`](13-builtins.md#secrets-hide-bypass-reveal) is to `hide`: free to be
-  swapped out, so it fails only as `"Malformed"` or `"BadSignature"`.
+  swapped out, so it fails only as `Malformed` or `BadSignature`.
 * **Encoding** — `base64Encode`, `base64Decode`.
 * **Random** — `randomHex(bytes)`, and `randomSecret(bytes)` →
-  `Result<Secret, SecretError>`, the same hex drawn and written in locked memory.
-* **JWT** — `jwtCodec(secret: Secret)` → `hive.codec.Codec<hive.crypto.JwtError>` says **read and write it as
+  `Result<Secret<Str>, SecretError>`, the same hex drawn and written in locked memory.
+* **JWT** — `jwtCodec(secret: Secret<Str>)` → `hive.codec.Codec<hive.crypto.JwtError>` says **read and write it as
   an HS256 token under this secret**, and is the whole of what this module
   contributes to tokens: `encode(claims, hive.crypto.jwtCodec(key))` signs one
   and `T.decode(token, hive.crypto.jwtCodec(key))` checks the signature and
@@ -444,23 +484,22 @@ rows.
 
 **WebSockets** (RFC 6455). The handshake, frame headers, masking, ping/pong and
 fragmentation are the runtime's business; a program sees whole messages as `Str`.
-A `WsError`'s `reason` is `"Handshake"`, `"Protocol"`, `"Closed"`, `"Send"` or
-`"Receive"`.
+A `WsError` is `Handshake`, `Protocol`, `Closed`, `Send` or `Receive`.
 
 * `wsConnect(url)`, `wsServe(port, handler)`, `wsSend(conn, message)` →
   the bytes it carried, `wsReceive(conn)` → the next message,
   `wsRequest(conn)` → the `HttpRequest` that opened it, `wsClose(conn)`.
-  A peer that hangs up is `"Closed"` — the ordinary end of a conversation.
+  A peer that hangs up is `WsError.Closed` — the ordinary end of a conversation.
 
-**Raw TCP.** A stream, not a queue of messages. A `SocketError`'s `reason` is
-`"Connect"`, `"Closed"`, `"Send"` or `"Receive"`.
+**Raw TCP.** A stream, not a queue of messages. A `SocketError` is `Connect`,
+`Closed`, `Send` or `Receive`.
 
 * `socketConnect(host, port)`, `socketServe(port, handler)`,
   `socketSend(conn, data)`, `socketReceive(conn, bytes)` (a short read is
   normal), `socketReceiveLine(conn)` (without the trailing newline),
   `socketPeer(conn)`, `socketClose(conn)`.
 
-**Names.** A `NetError`'s reason is `"NotFound"`, `"Lookup"` or `"NoAddress"`.
+**Names.** A `NetError` is `NotFound`, `Lookup` or `NoAddress`.
 
 * `resolve(name)` → **every** address behind a name, in resolver order. It takes
   a name, not an endpoint, and an address literal resolves to itself.
@@ -505,14 +544,14 @@ much of it is the language's own. What is left in the module is the node: where
 it listens, who it is connected to, and being told when a service dies.
 
 ```hive
-started := spawn(counter, 0, #Counter)   // Result<Address, SyslinkError>
-here    := at(#Counter)                  // this node
-there   := at("10.0.0.4:9000", #Counter) // another
+started := spawn(counter, 0, #Counter)            // Result<Address<Op>, SyslinkError>
+Address<Op> here  = at(#Counter)                  // this node
+Address<Op> there = at("10.0.0.4:9000", #Counter) // another
 kill(here)
 ```
 
 **The handler is one turn** — `proc (state: mut State, message: Message): Message`.
-It writes its state in place and **returns the answer**. The state is a mutex
+It writes its state in place and **returns the answer**. The state is a `mut`
 parameter only the service's own mailbox ever holds, one message at a time, so
 nothing needs a lock. Because it is an ordinary `proc`, a handler can also be
 called directly — from a test, say — with a `mut` variable of your own.
@@ -527,31 +566,37 @@ proc counter(total: mut Int, op: Op): Op {
 ```
 
 The compiler holds a handler to that shape where the service is started: the
-first parameter takes the mutex, the second is the mailbox type, the return type
+first parameter is `mut`, the second is the mailbox type, the return type
 is the mailbox type too, and the starting state fits the first parameter. A
-handler may take a third parameter, an `Address`, and is then handed its own
-address every turn — to give to work it starts. `spawn` takes either shape.
+handler may take a third parameter, an `Address<M>` of its own mailbox type, and
+is then handed its own address every turn — to give to work it starts. `spawn`
+takes either shape, and answers with an `Address<M>`.
 
 **An address is called.** There is exactly one way to reach a service, and — as
 with a func — the call site decides what it means:
 
 ```hive
 async inbox(Note.Say("hi"))          // send it, wait for nothing; cannot fail
-answer := cache(Op.Count())          // send it and wait: Result<Message, SyslinkError>
+answer := cache(Op.Count())          // send it and wait: Result<Op, SyslinkError>
 answer := cache(Op.Count()) with timeout 250
 later  := async cache(Op.Count())    // wait where `later` is read
 both   := await [a(m), b(m)]         // one barrier, one deadline
 ```
 
 The reply type **is the mailbox type**, so nothing is annotated: a service answers
-with one of its own messages, which makes a mailbox type the whole protocol.
+with one of its own messages, which makes a mailbox type the whole protocol — and
+the address carries it, so a message of another type is a compile error where it
+is sent ([3.10](03-types.md#310-address)). The digest below still guards the one
+thing the compiler cannot see: that the service registered under a name really
+is one of those.
 
 What the module has:
 
 * `monitor(watcher, target, notice)` posts `notice` to `watcher` — a service on
-  this node — when `target` dies; an already-dead target reports at once.
+  this node — when `target` dies; an already-dead target reports at once. The
+  notice is one of the watcher's messages, and the target may take anything.
 * `listen(endpoint)`, `node()`, `peers()`.
-* `setKey(key)` makes `key`, a [`Secret`](03-types.md#311-secret), this
+* `setKey(key)` makes `key`, a [`Secret<Str>`](03-types.md#311-secret), this
   program's cluster key — see below.
 
 **`listen` answers with the endpoint a peer should dial**, which is not always the
@@ -575,24 +620,25 @@ node is handed its own copy, since the next turn may write the state the answer
 was read from. A cast (`async inbox(m)`) discards the answer.
 
 **A crash is local to its service.** A `panic` inside a service body kills only
-that service; its monitors are told, its callers get `"Down"`, and the node keeps
+that service; its monitors are told, its callers get `Down`, and the node keeps
 running. This is the one place `panic` does not stop the program. The node says
 so on standard error — `hive: service Counter crashed: <message>` — as it does
 for a message a service could not read, and for a peer declared down.
 
-**Every failure says which it was**, in a `SyslinkError`'s `reason`:
+**Every failure says which it was**, as a variant of `SyslinkError`, each with a
+`message`:
 
-| reason | what happened |
+| variant | what happened |
 | --- | --- |
-| `"Taken"` | `spawn` was given a name another service holds |
-| `"Down"` | the service died before answering, or was already gone — answered at once |
-| `"NoProc"` | no service is registered under that name on the node asked |
-| `"Timeout"` | the answer did not come within the time given, or the default |
-| `"Unreachable"` | the node could not be reached |
-| `"Decode"` | the message did not decode as the type the service takes |
-| `"NoPeer"` | the address names no node to send to |
-| `"NoListener"` | `listen` could not listen where it was told, or this node has not listened and was asked to reach another |
-| `"NoKey"` | there is no cluster key to authenticate with |
+| `Taken` | `spawn` was given a name another service holds |
+| `Down` | the service died before answering, or was already gone — answered at once |
+| `NoProc` | no service is registered under that name on the node asked |
+| `Timeout` | the answer did not come within the time given, or the default |
+| `Unreachable` | the node could not be reached |
+| `Decode` | the message did not decode as the type the service takes |
+| `NoPeer` | the address names no node to send to |
+| `NoListener` | `listen` could not listen where it was told, or this node has not listened and was asked to reach another |
+| `NoKey` | there is no cluster key to authenticate with |
 
 **On the wire.** One persistent, multiplexed connection per node *pair*, carrying
 length-prefixed frames, dialed lazily. Messages cross as JSON using the same
@@ -632,7 +678,7 @@ else `HIVE_SYSLINK_KEY`, else `~/.hive/syslink.key`, which is created on first u
 
 ## 14.12 `hive.time`
 
-Times are plain `Int`s — Unix seconds.
+Times are plain `Int`s — Unix milliseconds.
 
 * `now()`, `timezone()` (the zone name or abbreviation at this instant),
   `timezoneOffset()` (minutes east of UTC).
@@ -658,8 +704,9 @@ Times are plain `Int`s — Unix seconds.
   (0–999) each answer one field of **now**, read in local time. They take no
   arguments; a field of some other stamp is read by rendering it with `format`.
 
-  `millisecond()` is a sub-second **field**, the way `second()` is 0–59 — a
-  reading is still seconds, and there is no millisecond clock here.
+  `millisecond()` is a sub-second **field**, the way `second()` is 0–59; the
+  stamps themselves are already in milliseconds. A JWT's `exp` and `nbf` are
+  seconds, as RFC 7519 has them: `hive.time.now() / 1000`.
 
 ## 14.13 `hive.env`
 
@@ -667,8 +714,8 @@ Times are plain `Int`s — Unix seconds.
   order: the `.env` file beside the executable; the one in the working directory
   — the entrypoint's folder, under `hive run`; the `.env` in the parent folder of
   either; the OS environment. The first file to name a key wins.
-* `getSecret(name)` → `Result<Secret, hive.env.EnvironmentError>` is `get` as a
-  [`Secret`](03-types.md#311-secret). The environment and the `.env` file still
+* `getSecret(name)` → `Result<Secret<Str>, hive.env.EnvironmentError>` is `get` as a
+  [`Secret<Str>`](03-types.md#311-secret). The environment and the `.env` file still
   hold it as text; it is the program's own copy that is locked and unprintable.
   Where none can be locked, the error's `message` says so.
 * The `.env` file is read **once**, on the first `get` or `getSecret`. Blank lines and `#`
@@ -692,10 +739,10 @@ A `SqlConnection` is a **connection pool**, safe to hold for the life of the
 program and to share across virtual threads. Open it once in `main` and pass it
 along. Never open one per query.
 
-Runtime failures carry a `reason`: `"Connection"` (the database could not be
-opened or reached, or the connection is closed), `"Query"`, `"Shape"` (a
-different number of columns came back) or `"Convert"` (a cell did not fit its
-field's type).
+A runtime failure is a `SqlError`: `Connection` (the database could not be
+opened or reached, or the connection is closed), `Statement` (the database
+refused or failed it), `Shape` (a different number of columns came back) or
+`Convert` (a cell did not fit its field's type), each with a `message`.
 
 **In-memory SQLite** belongs to the *connection*, not the process, which under a
 pool means each connection lands on a database of its own. Ask for a shared
@@ -775,8 +822,8 @@ Two environment variables are read by a window, and by nothing else:
 | `HIVE_FOLDS=1` | prints, once a second, how many turns the window took and drew, the median, 90th-percentile and worst time each spent in `update`, `view` and sending the page, and the collections since the last line |
 
 **The window is a service.** `update` is a service's handler —
-`proc (mut State, Msg): Msg`, or `proc (mut State, Msg, Address): Msg` to be
-handed the window's own address — and is checked as one, and `window` answers
+`proc (mut State, Msg): Msg`, or `proc (mut State, Msg, Address<Msg>): Msg` to
+be handed the window's own address — and is checked as one, and `window` answers
 with a handler of the same shape. So a window has an address, may be spawned
 under a name, and can be posted to by a background task or by another machine.
 That is why the module needs no notion of a *command*. What `update` returns
@@ -784,8 +831,8 @@ answers a request from another node, and is discarded for an event of the
 window's own. Called directly, the handler `window` answers with is `update` and
 nothing more, which is what a test calls.
 
-**The view is a `func`, and that is not a formality.** A func cannot hold a
-mutex, so drawing cannot write the model or anything else the caller can see —
+**The view is a `func`, and that is not a formality.** A func cannot take a
+`mut` parameter, so drawing cannot write the model or anything else the caller can see —
 which matters because a repaint happens on every change.
 
 **Every widget takes the same two things: its attributes, then its payload.**

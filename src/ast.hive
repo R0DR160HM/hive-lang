@@ -26,7 +26,7 @@ type TypeExpr {
 	// `pkg` is `""` when the name was written unqualified.
 	Named { pkg: Str, name: Str, args: TypeExpr[dyn], dims: Dim[dyn] }
 	// `func(Int): Int` (pure) or `proc(mut Int): void`.
-	Fn { pure: Bool, params: TypeExpr[dyn], mutexes: Bool[dyn], result: TypeExpr }
+	Fn { pure: Bool, params: TypeExpr[dyn], mutables: Bool[dyn], result: TypeExpr }
 	// The return type that is no type at all.
 	VoidType
 }
@@ -48,6 +48,11 @@ type BinOp {
 	Ge
 	And
 	Or
+	BitAnd
+	BitOr
+	BitXor
+	Shl
+	Shr
 }
 
 // A piece of an interpolated string, with its `{expression}` parsed.
@@ -81,6 +86,10 @@ type Expr {
 	// `Negate` — bound tighter than any comparison, so what it takes is a value
 	// rather than a condition somebody wrote out.
 	Not { operand: Expr }
+	// `~x`, on an integer.
+	BitNot { operand: Expr }
+	// `<<version, length, payload>>`: bytes built from parts, each as wide as its type.
+	Bits { parts: BitPart[dyn] }
 	Binary { op: BinOp, left: Expr, right: Expr }
 	Call { callee: Expr, args: Arg[dyn] }
 	Member { subject: Expr, field: Str }
@@ -99,7 +108,26 @@ type Expr {
 	Absent
 }
 
+// One part of `<<...>>` being built. `declared` is what a literal says it is —
+// `0x0D0A: UInt16` — and `VoidType` where nothing was said.
+type BitPart {
+	value: Expr
+	declared: TypeExpr
+	little: Bool
+}
+
 // --- Patterns ----------------------------------------------------------------
+
+// One field of a binary pattern. `name` is what it binds, `""` for a literal it
+// has to equal and `_` for bits it skips; `declared` is `VoidType` for one byte.
+// `length` is `Absent` unless the field is a run of bytes, `body: UInt8[size]`.
+type BitField {
+	name: Str
+	value: Expr
+	declared: TypeExpr
+	length: Expr
+	little: Bool
+}
 
 // One position of a vector pattern.
 type VecElem {
@@ -119,6 +147,8 @@ type Pattern {
 	VectorPat { elements: VecElem[dyn], rest: Str }
 	// `"/users/{id}/posts/{postId}"` — literal text and binding holes.
 	StrTemplate { parts: token.StrPart[dyn] }
+	// `<<version: UInt4, ihl: UInt4, ...rest>>`. `rest` as in `VectorPat`.
+	BitsPat { fields: BitField[dyn], rest: Str }
 }
 
 // --- Statements --------------------------------------------------------------
@@ -175,8 +205,8 @@ type Stmt {
 type Param {
 	name: Str
 	declared: TypeExpr
-	// `v: mut T` — the mutex itself, which only a `proc` may ask for.
-	mutex: Bool
+	// `v: mut T` — the caller's own storage, which only a `proc` may ask for.
+	mutable: Bool
 }
 
 // What a field's `--` annotations said, and what a field that carries none
@@ -471,6 +501,28 @@ func positional(args: Arg[], params: Str[]): Arg[dyn] {
 	return out
 }
 
+// The expressions a pattern holds: a binary pattern's lengths can read names.
+func patternExprs(p: Pattern): Expr[dyn] {
+	mut Expr[dyn] out = []
+	if p is Pattern.BitsPat(fields, _) {
+		for each f in fields {
+			if (f.value is Expr.Absent) == false {
+				append(out, f.value)
+			}
+			if (f.length is Expr.Absent) == false {
+				append(out, f.length)
+			}
+		}
+	} else if p is Pattern.VectorPat(elements, _) {
+		for each element in elements {
+			if element is VecElem.Match(value) {
+				append(out, value)
+			}
+		}
+	}
+	return out
+}
+
 // The operator a `BinOp` was written as.
 func opSpelling(op: BinOp): Str {
 	if op is BinOp.Add { return "+" }
@@ -487,5 +539,10 @@ func opSpelling(op: BinOp): Str {
 	else if op is BinOp.Ge { return ">=" }
 	else if op is BinOp.And { return "&&" }
 	else if op is BinOp.Or { return "||" }
+	else if op is BinOp.BitAnd { return "&" }
+	else if op is BinOp.BitOr { return "|" }
+	else if op is BinOp.BitXor { return "^" }
+	else if op is BinOp.Shl { return "<<" }
+	else if op is BinOp.Shr { return ">>" }
 	return ""
 }

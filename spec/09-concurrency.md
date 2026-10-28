@@ -73,12 +73,12 @@ that answer differently are given **names** instead — the `async` binding abov
 `s := async slowShout("a")` then `n := async slowCount("bb")` are two threads
 running at once, each waited for where its own name is read.
 
-## 9.3 Threads and mutex arguments
+## 9.3 Threads and `mut` arguments
 
-A call handed a mutex argument shares the caller's storage **only when the caller
+A call handed a `mut` argument shares the caller's storage **only when the caller
 waits for it there**. An `async` or `await`ed call gets a copy, made on the
 caller's side of the fence. See
-[08](08-mutability-and-values.md#82-mutex-parameters).
+[08](08-mutability-and-values.md#82-mut-parameters).
 
 ## 9.4 `with timeout`
 
@@ -108,13 +108,13 @@ if slowShout("worth waiting for") with timeout 100 is Result.Error(err) {
   await-all of them — is refused rather than lowered to a type with no spelling.
 * On a request to a [service](14-stdlib.md#1410-hivesyslink) the clause folds
   into the request's own error rather than wrapping a second `Result` around the
-  first, so the result is still
-  `Result<Message, hive.syslink.SyslinkError>` with reason `"Timeout"`.
+  first, so the result is still `Result<Message, hive.syslink.SyslinkError>`,
+  failing as `SyslinkError.Timeout`.
 * An `async` binding cannot take one ([9.1](#x--async-fa--keep-the-result)).
 
 ## 9.5 What is deliberately absent
 
-There is no channel type, no mutex primitive, no thread handle, no cancellation
+There is no channel type, no lock, no thread handle, no cancellation
 token and no scheduler to configure. A program that needs long-lived shared state
 reaches for a [service](14-stdlib.md#1410-hivesyslink), whose handler takes one
 message at a time and therefore needs no lock at all; a program that needs a

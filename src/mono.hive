@@ -164,11 +164,11 @@ func spell(t: ast.TypeExpr): Str {
 	if t is ast.TypeExpr.VoidType {
 		return "void"
 	}
-	if t is ast.TypeExpr.Fn(_, params, mutexes, result) {
+	if t is ast.TypeExpr.Fn(_, params, mutables, result) {
 		mut out := "fn"
 		mut i := 0
 		for each p in params {
-			if types.mutexAt(mutexes, i) {
+			if types.mutableAt(mutables, i) {
 				out = out + "mut"
 			}
 			out = out + spell(p)
@@ -248,7 +248,7 @@ proc substituteDecl(mo: mut Mono, env: infer.Env, d: ast.Decl, flat: Str, variab
 	if d is ast.Decl.CallableDecl(kind, _, params, result, body, line) {
 		mut ast.Param[dyn] out = []
 		for each p in params {
-			append(out, ast.Param(p.name, substitute(mo, p.declared, variables, args), p.mutex))
+			append(out, ast.Param(p.name, substitute(mo, p.declared, variables, args), p.mutable))
 		}
 		// The body writes the variables down too — `mut K[dyn] out = []`,
 		// `for each v: T in values` — so each copy substitutes through its own.
@@ -292,12 +292,12 @@ proc substitute(mo: mut Mono, t: ast.TypeExpr, variables: Str[], args: ArgList):
 
 // A written type with every variable replaced by what it stands for here.
 func substituteVars(t: ast.TypeExpr, variables: Str[], args: ArgList): ast.TypeExpr {
-	if t is ast.TypeExpr.Fn(pure, params, mutexes, result) {
+	if t is ast.TypeExpr.Fn(pure, params, mutables, result) {
 		mut ast.TypeExpr[dyn] out = []
 		for each p in params {
 			append(out, substituteVars(p, variables, args))
 		}
-		return ast.TypeExpr.Fn(pure, out, mutexes, substituteVars(result, variables, args))
+		return ast.TypeExpr.Fn(pure, out, mutables, substituteVars(result, variables, args))
 	}
 	if t is ast.TypeExpr.Named(pkg, name, typeArgs, dims) {
 		if pkg == "" {
@@ -319,12 +319,12 @@ func substituteVars(t: ast.TypeExpr, variables: Str[], args: ArgList): ast.TypeE
 // A generic type written out — `Box<Str>` — is a copy of its own, and what it
 // is called after this is the copy's name.
 proc renameGenerics(mo: mut Mono, t: ast.TypeExpr): ast.TypeExpr {
-	if t is ast.TypeExpr.Fn(pure, params, mutexes, result) {
+	if t is ast.TypeExpr.Fn(pure, params, mutables, result) {
 		mut ast.TypeExpr[dyn] out = []
 		for each p in params {
 			append(out, renameGenerics(mo, p))
 		}
-		return ast.TypeExpr.Fn(pure, out, mutexes, renameGenerics(mo, result))
+		return ast.TypeExpr.Fn(pure, out, mutables, renameGenerics(mo, result))
 	}
 	if t is ast.TypeExpr.Named(pkg, name, typeArgs, dims) {
 		mut ast.TypeExpr[dyn] out = []
@@ -536,6 +536,14 @@ proc substituteExpr(mo: mut Mono, env: infer.Env, e: ast.Expr, variables: Str[],
 		return ast.Expr.Negate(substituteExpr(mo, env, operand, variables, args))
 	} else if e is ast.Expr.Not(operand) {
 		return ast.Expr.Not(substituteExpr(mo, env, operand, variables, args))
+	} else if e is ast.Expr.BitNot(operand) {
+		return ast.Expr.BitNot(substituteExpr(mo, env, operand, variables, args))
+	} else if e is ast.Expr.Bits(parts) {
+		mut ast.BitPart[dyn] out = []
+		for each part in parts {
+			append(out, ast.BitPart(substituteExpr(mo, env, part.value, variables, args), part.declared, part.little))
+		}
+		return ast.Expr.Bits(out)
 	} else if e is ast.Expr.Member(subject, field) {
 		return ast.Expr.Member(substituteExpr(mo, env, subject, variables, args), field)
 	} else if e is ast.Expr.Index(subject, index) {
@@ -560,6 +568,13 @@ proc substituteExpr(mo: mut Mono, env: infer.Env, e: ast.Expr, variables: Str[],
 		return ast.Expr.Interp(out)
 	} else if e is ast.Expr.IsMatch(subject, pattern) {
 		newSubject := substituteExpr(mo, env, subject, variables, args)
+		if pattern is ast.Pattern.BitsPat(fields, rest) {
+			mut ast.BitField[dyn] out = []
+			for each f in fields {
+				append(out, ast.BitField(f.name, substituteExpr(mo, env, f.value, variables, args), f.declared, substituteExpr(mo, env, f.length, variables, args), f.little))
+			}
+			return ast.Expr.IsMatch(newSubject, ast.Pattern.BitsPat(out, rest))
+		}
 		return ast.Expr.IsMatch(newSubject, aimPattern(mo, env, newSubject, pattern))
 	} else if e is ast.Expr.Ident(name) {
 		// A generic callable cannot be used as a value: which copy a call reaches
@@ -717,9 +732,15 @@ func peel(ty: types.Ty, n: Int): types.Ty {
 	return out
 }
 
-// The `index`-th type argument of a `Result`, a map, a query or a codec, since
-// those are the four written types that carry any.
+// The `index`-th type argument of a `Result`, a map, a query, a codec, an
+// address or a secret, since those are the written types that carry any.
 func argumentOf(ty: types.Ty, index: Int): types.Ty {
+	if ty is types.Ty.TAddress(message) {
+		return message
+	}
+	if ty is types.Ty.TSecret(held) {
+		return held
+	}
 	if ty is types.Ty.TResult(ok, bad) {
 		if index == 0 { return ok }
 		return bad

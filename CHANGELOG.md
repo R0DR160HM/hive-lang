@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.3.0
+
+### Language
+
+* **`Address<M>` says what its service takes**: a message of any other type is a compile error where it is sent, and the answer is an `M`.
+* **`spawn` reads `M` off its handler**, and a handler's third parameter is an `Address<M>` of its own mailbox type.
+* **`at` takes its type from where it land, or from the first later use that says it** — `x := at(#Name)` then `x(Op.Ping())` — and keep it.
+* **`monitor`'s notice is one of the watcher's messages.**
+* **`Secret<T>` keeps any plain value**: `hide(T)` and `bypass(T)` make one, and `reveal` answers the `T` back.
+* **An `Int` wraps round past `MAX` and `MIN`**, as the machine's arithmetic does, where it stopped at the edge.
+* **A counting loop proves its counter only where it cannot wrap**: starting at a non-negative literal, stepping by one, and held below something by a `<`.
+* **Sized numbers**: `UInt1` … `UInt64`, `Int1` … `Int63` and `Float32`, each kept in the smallest Go type that holds it and wrapping at its own width; `Int64` and `Float64` are `Int` and `Float`.
+* **Every number conversion is written**: `Int(b)`, `Float(f)`, `UInt4(x)`, or `UInt4.checked(x)` for a `Result`; two integers of any sizes still compare.
+* **A sized index proves itself** against a vector its type cannot outrun, and an unsigned one is never negative.
+* **A vector of sized integers is packed** where Go has no integer that wide: a `UInt4[dyn]` keeps each value in four bits.
+* **One call never lends a vector and a path inside it**: `both(v, v[0])` with both parameters `mut` is a compile error, where the write through `v[0]` could be lost.
+* **Only a keyword's lower-case spelling is reserved**: `Proc`, `Query` and `proC` are names like any other.
+* **Bitwise operators**: `&`, `|`, `^`, `~`, `<<` and `>>`, with `&=` `|=` `^=` `<<=` `>>=`; a shift counts by an unsigned number or a literal, and two different ones need parentheses.
+* **The pipe is `|>`**, which leaves `|` to bitwise or.
+* **Binary patterns**: `<<version: UInt4, length: UInt16, body: UInt8[length], ...rest>>` matches bytes, a `Str` or an integer field by field, and the same `<<...>>` builds bytes.
+* **`0xFF`, `0b1010` and `1_000`**; a hexadecimal literal past `Int`'s largest is a `UInt64`.
+* **`v[h & 255]` proves itself** against a vector of 256 or more.
+
+### Standard library
+
+* **A library error is a union of what went wrong**: `FileError`, `WsError`, `SocketError`, `NetError`, `SqlError`, `CryptoError`, `SyslinkError` and `SecretError` have a variant per failure, matched and covered like any other union.
+* **An error comes with the module that answers with it**, whether or not the program names its type.
+* **`hive.conv.itf32`**, and **`hive.math` answers a `Float32`** when handed only those.
+* **`hive.time` counts milliseconds**: `now()`, `dateFrom`, `dateTimeFrom` and `format` all speak Unix milliseconds.
+* **`hive.conv.bytesOf` and `fromBytes`** cross between a `Str` and its bytes.
+
+### Breaking
+
+| was | is |
+| --- | --- |
+| `Address` | `Address<M>`, with `M` the service's message type |
+| `why.reason == "NotFound"` | `why is file.FileError.NotFound` |
+| `SqlError` reason `"Query"` | `SqlError.Statement` |
+| `Secret` | `Secret<Str>`, and the library's secrets with it |
+| `hide(text: s)`, `bypass(text: s)` | `hide(value: s)`, `bypass(value: s)` |
+| `Int` overflow stopping at `MAX` or `MIN` | it wraps round to the other |
+| `for i := 0; i < n; i += 2 { echo v[i] }` | a guard: `if v bounds i` |
+| `both(v, v[0])`, both `mut` | lend `v` alone and reach `v[0]` through it |
+| `x \| f`, the pipe | `x \|> f` |
+| `hive.time.now()` in seconds | in milliseconds — `hive.time.now() / 1000` for seconds, as a JWT `exp` wants |
+
 ## v0.2.18
 
 ### Standard library
@@ -196,7 +242,7 @@
 
 ### Language
 
-* **A `proc` with a mutex parameter is a value.** It can be referenced, partially applied, stored and passed like any other: a function type marks the position `mut` — `proc(mut Str[dyn], Str): void` — and a call through the value hands it a `mut` variable exactly as a direct call does. A partial application leaves a mutex position a hole, and `func(mut ...)` is refused.
+* **A `proc` with a `mut` parameter is a value.** It can be referenced, partially applied, stored and passed like any other: a function type marks the position `mut` — `proc(mut Str[dyn], Str): void` — and a call through the value hands it a `mut` variable exactly as a direct call does. A partial application leaves a `mut` position a hole, and `func(mut ...)` is refused.
 * **A call through a function value is held to its type**: how many arguments, what each one is, and no named arguments, where only a field's argument count was checked and a local's mistakes reached the Go toolchain.
 
 ### Standard library
@@ -208,12 +254,12 @@
 
 ### Performance
 
-* **`x = f(x)` hands `x` over without copying it** wherever nothing but `f`'s result can keep it — no mutex parameter, no thread handed any storage, no function value in the result — nested calls included. A service's `world = ticked(world, dt)` copied its whole world every message.
-* A `proc` with no mutex parameter is lent storage the way a `func` is, and a send counts as starting no thread: its message is copied on the way out.
+* **`x = f(x)` hands `x` over without copying it** wherever nothing but `f`'s result can keep it — no `mut` parameter, no thread handed any storage, no function value in the result — nested calls included. A service's `world = ticked(world, dt)` copied its whole world every message.
+* A `proc` with no `mut` parameter is lent storage the way a `func` is, and a send counts as starting no thread: its message is copied on the way out.
 
 ### Fixes
 
-* **A vector handed to a mutex parameter loses what was proved about its length**, where `shrink(v)` inside `if v bounds 0` left `v[0]` compiling and failing at run time.
+* **A vector handed to a `mut` parameter loses what was proved about its length**, where `shrink(v)` inside `if v bounds 0` left `v[0]` compiling and failing at run time.
 * **A library type the library does not have is refused**, where `hive.net.Nonesuch` compiled and the Go toolchain reported it undefined.
 * **`sort` with nothing to order by is refused.** A vector of maps, addresses or function values — or of a type holding one — compiled and panicked when it ran; it now asks for the `func` that says which of two comes first.
 * A `mut` value handed to a function value's ordinary parameter is copied, as a direct call copies it.
@@ -357,7 +403,7 @@
 
 ### Language
 
-* **A `func` may call a `proc`.** It still cannot declare a mutex parameter,
+* **A `func` may call a `proc`.** It still cannot declare a `mut` parameter,
   which is what keeps it from writing to storage its caller can see.
 * A backtick string reads `\{` as a literal `{`, ahead of backtick strings gaining interpolation.
 
@@ -380,7 +426,7 @@
   them and a stale voice fought the live one for its name: silence, wherever a
   program renamed a `track` mid-run.
 
-* A callable that asks for a mutex is refused as a value — `f := grow`,
+* A callable that takes a `mut` parameter is refused as a value — `f := grow`,
   `grow(_, "x")` — where it used to reach the Go toolchain and be refused there.
 * The loop-invariant finding asks whether the callee really answers off its
   arguments, rather than whether it is a `func`. One that prints, reads the

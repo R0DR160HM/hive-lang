@@ -16,6 +16,9 @@ type Ty {
 	TStr
 	TInt
 	TFloat
+	// `UInt4`, `Int40`: an integer of a stated width. `Int64` is `Int`.
+	TSized { signed: Bool, bits: Int }
+	TFloat32
 	TBool
 	TAtom
 	// The return type that is no type at all.
@@ -37,14 +40,14 @@ type Ty {
 	// `hive.codec.Codec<E>` — a format, and the error decoding in it answers with.
 	TCodec { error: Ty }
 	// A function value: `func(Int): Int` or `proc(mut Str[dyn]): void`.
-	TFn { pure: Bool, params: Ty[dyn], mutexes: Bool[dyn], result: Ty }
+	TFn { pure: Bool, params: Ty[dyn], mutables: Bool[dyn], result: Ty }
 	// An opaque type the standard library owns: `hive.net.HttpRequest`,
 	// `hive.sql.SqlConnection`. Carried and compared by name.
 	TLib { module: Str, name: Str }
-	// `Address` — a service, which a call sends to.
-	TAddress
-	// `Secret` — text kept out of swap, which nothing prints.
-	TSecret
+	// `Address<M>` — a service taking messages of `M`, which a call sends to.
+	TAddress { message: Ty }
+	// `Secret<T>` — a value kept out of swap, which nothing prints.
+	TSecret { held: Ty }
 	// A type variable, which is what makes a callable generic in it.
 	TVar { name: Str }
 	// No answer. Everything that produces one has already reported why.
@@ -229,12 +232,123 @@ func isVariable(t: Table, name: Str): Bool {
 func isBuiltinType(name: Str): Bool {
 	return name == "Str" || name == "Int" || name == "Float" || name == "Bool"
 		|| name == "Atom" || name == "Table" || name == "Result" || name == "Address"
-		|| name == "Secret" || name == "SecretError"
+		|| name == "Secret" || name == "SecretError" || sizedName(name) is Result.Ok(_)
 }
 
-// What making a `Secret` fails with: a library type the core owns, so of no module.
+// `UInt4`, `Int40`, `Float32`, and `Int64` and `Float64` for `Int` and `Float`.
+func sizedName(name: Str): Result<Ty, Bool> {
+	if name == "Int64" { return Result.Ok(Ty.TInt()) }
+	if name == "Float64" { return Result.Ok(Ty.TFloat()) }
+	if name == "Float32" { return Result.Ok(Ty.TFloat32()) }
+	if text.startsWith(name, "UInt") {
+		return widthNamed(name, 4, false)
+	}
+	if text.startsWith(name, "Int") {
+		return widthNamed(name, 3, true)
+	}
+	return Result.Error(false)
+}
+
+func widthNamed(name: Str, from: Int, signed: Bool): Result<Ty, Bool> {
+	cs := text.chars(name)
+	digits := text.span(cs, from, len(cs) - 1)
+	if digits == "" || text.startsWith(digits, "0") {
+		return Result.Error(false)
+	}
+	for each c in text.chars(digits) {
+		if text.isDigit(c) == false {
+			return Result.Error(false)
+		}
+	}
+	if hive.conv.sti(digits) is Result.Ok(bits) && bits >= 1 && bits <= 64 {
+		return Result.Ok(sizedOf(signed, bits))
+	}
+	return Result.Error(false)
+}
+
+func sizedOf(signed: Bool, bits: Int): Ty {
+	if signed && bits == 64 {
+		return Ty.TInt()
+	}
+	return Ty.TSized(signed, bits)
+}
+
+func isInteger(ty: Ty): Bool {
+	return ty is Ty.TInt || ty is Ty.TSized(_, _)
+}
+
+func isFloat(ty: Ty): Bool {
+	return ty is Ty.TFloat || ty is Ty.TFloat32
+}
+
+func isNumber(ty: Ty): Bool {
+	return isInteger(ty) || isFloat(ty)
+}
+
+func isUnsigned(ty: Ty): Bool {
+	return ty is Ty.TSized(false, _)
+}
+
+func bitsOf(ty: Ty): Int {
+	if ty is Ty.TSized(_, bits) {
+		return bits
+	}
+	return 64
+}
+
+// Whether every value of `from` is a value of `to`: an index of any integer type
+// is read as an `Int`.
+func widens(from: Ty, to: Ty): Bool {
+	if from is Ty.TFloat32 {
+		return isFloat(to)
+	}
+	if from is Ty.TFloat {
+		return to is Ty.TFloat
+	}
+	if isInteger(from) == false || isInteger(to) == false {
+		return false
+	}
+	if isUnsigned(to) {
+		return isUnsigned(from) && bitsOf(from) <= bitsOf(to)
+	}
+	if isUnsigned(from) {
+		return bitsOf(from) < bitsOf(to)
+	}
+	return bitsOf(from) <= bitsOf(to)
+}
+
+// Whether the literal `n` is a value of `ty`.
+func holdsLiteral(ty: Ty, n: Int): Bool {
+	if ty is Ty.TInt {
+		return true
+	}
+	if ty is Ty.TSized(signed, bits) {
+		if signed {
+			top := twoTo(bits - 1)
+			return n >= 0 - top && n <= top - 1
+		}
+		return n >= 0 && (bits >= 63 || n <= twoTo(bits) - 1)
+	}
+	return false
+}
+
+// 2 to the `n`, for an `n` below 63.
+func twoTo(n: Int): Int {
+	mut out := 1
+	for i := 0; i < n; i++ {
+		out = out * 2
+	}
+	return out
+}
+
+// What making a `Secret` fails with: a union the core declares, so of no module.
 func secretError(): Ty {
-	return Ty.TLib("", "SecretError")
+	return libraryError("", "SecretError")
+}
+
+// One of the library's error unions, under the name the loader flattens it in as.
+func libraryError(module: Str, name: Str): Ty {
+	return Ty.TNamed("hive_" + module + "_" + name)
 }
 
 // --- Resolving a written type ------------------------------------------------
@@ -244,12 +358,12 @@ func resolve(t: Table, written: ast.TypeExpr): Ty {
 	if written is ast.TypeExpr.VoidType {
 		return Ty.TVoid()
 	}
-	if written is ast.TypeExpr.Fn(pure, params, mutexes, result) {
+	if written is ast.TypeExpr.Fn(pure, params, mutables, result) {
 		mut Ty[dyn] out = []
 		for each p in params {
 			append(out, resolve(t, p))
 		}
-		return Ty.TFn(pure, out, mutexes, resolve(t, result))
+		return Ty.TFn(pure, out, mutables, resolve(t, result))
 	}
 	if written is ast.TypeExpr.Named(pkg, name, args, dims) {
 		return wrap(resolveBase(t, pkg, name, args), dims)
@@ -282,13 +396,16 @@ func resolveBase(t: Table, pkg: Str, name: Str, args: ast.TypeExpr[]): Ty {
 	}
 	// The long name, which a program declaring its own `Address` still has.
 	if pkg == "hive" && name == "Address" {
-		return Ty.TAddress()
+		return Ty.TAddress(argAt(t, args, 0))
 	}
 	if pkg == "hive" && name == "Secret" {
-		return Ty.TSecret()
+		return Ty.TSecret(argAt(t, args, 0))
 	}
 	if pkg == "hive" && name == "SecretError" {
 		return secretError()
+	}
+	if pkg == "hive" && sizedName(name) is Result.Ok(sized) {
+		return sized
 	}
 	if text.startsWith(pkg, "hive.") {
 		return Ty.TLib(text.span(text.chars(pkg), 5, len(pkg) - 1), name)
@@ -314,13 +431,16 @@ func resolveBare(t: Table, name: Str, args: ast.TypeExpr[]): Ty {
 	}
 	// After the declarations, which win over a builtin here as everywhere.
 	if name == "Address" {
-		return Ty.TAddress()
+		return Ty.TAddress(argAt(t, args, 0))
 	}
 	if name == "Secret" {
-		return Ty.TSecret()
+		return Ty.TSecret(argAt(t, args, 0))
 	}
 	if name == "SecretError" {
 		return secretError()
+	}
+	if sizedName(name) is Result.Ok(sized) {
+		return sized
 	}
 	return Ty.TVar(name)
 }
@@ -342,6 +462,8 @@ func toWritten(ty: Ty): ast.TypeExpr {
 	if ty is Ty.TStr { return named("Str") }
 	if ty is Ty.TInt { return named("Int") }
 	if ty is Ty.TFloat { return named("Float") }
+	if ty is Ty.TSized(_, _) { return ast.TypeExpr.Named("hive", show(ty), [], []) }
+	if ty is Ty.TFloat32 { return ast.TypeExpr.Named("hive", "Float32", [], []) }
 	if ty is Ty.TBool { return named("Bool") }
 	if ty is Ty.TAtom { return named("Atom") }
 	if ty is Ty.TVoid { return ast.TypeExpr.VoidType() }
@@ -353,11 +475,11 @@ func toWritten(ty: Ty): ast.TypeExpr {
 		}
 		return ast.TypeExpr.Named("hive." + module, name, [], [])
 	}
-	if ty is Ty.TAddress {
-		return ast.TypeExpr.Named("hive", "Address", [], [])
+	if ty is Ty.TAddress(message) {
+		return ast.TypeExpr.Named("hive", "Address", [toWritten(message)], [])
 	}
-	if ty is Ty.TSecret {
-		return ast.TypeExpr.Named("hive", "Secret", [], [])
+	if ty is Ty.TSecret(held) {
+		return ast.TypeExpr.Named("hive", "Secret", [toWritten(held)], [])
 	}
 	if ty is Ty.TVec(element, dim) {
 		return withDim(toWritten(element), dim)
@@ -374,12 +496,12 @@ func toWritten(ty: Ty): ast.TypeExpr {
 	if ty is Ty.TCodec(error) {
 		return ast.TypeExpr.Named("hive.codec", "Codec", [toWritten(error)], [])
 	}
-	if ty is Ty.TFn(pure, params, mutexes, result) {
+	if ty is Ty.TFn(pure, params, mutables, result) {
 		mut ast.TypeExpr[dyn] out = []
 		for each p in params {
 			append(out, toWritten(p))
 		}
-		return ast.TypeExpr.Fn(pure, out, mutexes, toWritten(result))
+		return ast.TypeExpr.Fn(pure, out, mutables, toWritten(result))
 	}
 	// An unknown has no spelling. It only reaches here from an expression that
 	// has already been reported, and `Str` is as good a stand-in as any.
@@ -417,6 +539,9 @@ func show(ty: Ty): Str {
 	if ty is Ty.TStr { return "Str" }
 	else if ty is Ty.TInt { return "Int" }
 	else if ty is Ty.TFloat { return "Float" }
+	else if ty is Ty.TSized(true, bits) { return "Int{bits}" }
+	else if ty is Ty.TSized(false, bits) { return "UInt{bits}" }
+	else if ty is Ty.TFloat32 { return "Float32" }
 	else if ty is Ty.TBool { return "Bool" }
 	else if ty is Ty.TAtom { return "Atom" }
 	else if ty is Ty.TVoid { return "void" }
@@ -429,14 +554,17 @@ func show(ty: Ty): Str {
 		}
 		return "hive.{module}.{name}"
 	}
-	else if ty is Ty.TAddress { return "Address" }
-	else if ty is Ty.TSecret { return "Secret" }
+	// What `kill` and `monitor` take: an address of any service at all.
+	else if ty is Ty.TAddress(Ty.TUnknown) { return "Address<M>" }
+	else if ty is Ty.TAddress(message) { return "Address<" + show(message) + ">" }
+	else if ty is Ty.TSecret(Ty.TUnknown) { return "Secret<T>" }
+	else if ty is Ty.TSecret(held) { return "Secret<" + show(held) + ">" }
 	else if ty is Ty.TVec(element, dim) { return show(element) + showDim(dim) }
 	else if ty is Ty.TResult(ok, bad) { return "Result<" + show(ok) + ", " + show(bad) + ">" }
 	else if ty is Ty.TMap(key, value) { return "hive.map.Map<" + show(key) + ", " + show(value) + ">" }
 	else if ty is Ty.TFragment(rows) { return "hive.sql.Fragment<" + show(rows) + ">" }
 	else if ty is Ty.TCodec(error) { return "hive.codec.Codec<" + show(error) + ">" }
-	else if ty is Ty.TFn(pure, params, mutexes, result) {
+	else if ty is Ty.TFn(pure, params, mutables, result) {
 		mut word := "proc"
 		if pure {
 			word = "func"
@@ -444,7 +572,7 @@ func show(ty: Ty): Str {
 		mut Str[dyn] out = []
 		mut i := 0
 		for each p in params {
-			if mutexAt(mutexes, i) {
+			if mutableAt(mutables, i) {
 				append(out, "mut " + show(p))
 			} else {
 				append(out, show(p))
@@ -463,6 +591,10 @@ func shownName(name: Str): Str {
 	module := text.charAt(parts, 1)
 	if len(parts) == 3 && text.charAt(parts, 0) == "hive" && text.isLower(text.charAt(text.chars(module), 0)) {
 		return "hive.{module}." + text.charAt(parts, 2)
+	}
+	// The core's own, which belong to no module: `SecretError`.
+	if len(parts) == 3 && text.charAt(parts, 0) == "hive" && module == "" {
+		return text.charAt(parts, 2)
 	}
 	return name
 }
@@ -517,7 +649,50 @@ func holdsSecret(t: Table, ty: Ty): Bool {
 }
 
 func isSecret(ty: Ty): Bool {
-	return ty is Ty.TSecret
+	return ty is Ty.TSecret(_)
+}
+
+func unkeepable(t: Table, ty: Ty, seen: Str[]): Result<Ty, Bool> {
+	if ty is Ty.TStr || isNumber(ty) || ty is Ty.TBool || ty is Ty.TAtom || ty is Ty.TUnknown {
+		return Result.Error(false)
+	}
+	if ty is Ty.TVec(element, _) {
+		return unkeepable(t, element, seen)
+	}
+	if ty is Ty.TResult(ok, bad) {
+		if unkeepable(t, ok, seen) is Result.Ok(inner) {
+			return Result.Ok(inner)
+		}
+		return unkeepable(t, bad, seen)
+	}
+	if ty is Ty.TMap(key, value) {
+		if unkeepable(t, key, seen) is Result.Ok(inner) {
+			return Result.Ok(inner)
+		}
+		return unkeepable(t, value, seen)
+	}
+	if ty is Ty.TNamed(name) {
+		if indexOf(seen, name) is Result.Ok(_) {
+			return Result.Error(false)
+		}
+		if findType(t, name) is Result.Ok(info) {
+			inner := seen + [name]
+			for each f in info.shared {
+				if unkeepable(t, resolve(t, f.declared), inner) is Result.Ok(found) {
+					return Result.Ok(found)
+				}
+			}
+			for each v in info.variants {
+				for each f in v.fields {
+					if unkeepable(t, resolve(t, f.declared), inner) is Result.Ok(found) {
+						return Result.Ok(found)
+					}
+				}
+			}
+		}
+		return Result.Error(false)
+	}
+	return Result.Ok(ty)
 }
 
 func isTable(ty: Ty): Bool {
@@ -584,14 +759,21 @@ func accepts(to: Ty, from: Ty): Bool {
 		}
 		return false
 	}
+	// A secret is never written to, so what it holds fits the way a value would.
+	if to is Ty.TSecret(toHeld) {
+		if from is Ty.TSecret(fromHeld) {
+			return accepts(toHeld, fromHeld)
+		}
+		return false
+	}
 	// A `func` value may fill a `proc` slot — pure widens to impure — and never
 	// the reverse.
-	if to is Ty.TFn(toPure, toParams, toMutexes, toResult) {
-		if from is Ty.TFn(fromPure, fromParams, fromMutexes, fromResult) {
+	if to is Ty.TFn(toPure, toParams, toMutables, toResult) {
+		if from is Ty.TFn(fromPure, fromParams, fromMutables, fromResult) {
 			if toPure && fromPure == false {
 				return false
 			}
-			return paramsAccept(toParams, fromParams, toMutexes) && sameMutexes(toMutexes, fromMutexes, len(toParams))
+			return paramsAccept(toParams, fromParams, toMutables) && sameMutables(toMutables, fromMutables, len(toParams))
 				&& accepts(toResult, fromResult)
 		}
 	}
@@ -615,6 +797,11 @@ func same(a: Ty, b: Ty): Bool {
 	if a is Ty.TStr { return b is Ty.TStr }
 	if a is Ty.TInt { return b is Ty.TInt }
 	if a is Ty.TFloat { return b is Ty.TFloat }
+	if a is Ty.TFloat32 { return b is Ty.TFloat32 }
+	if a is Ty.TSized(aSigned, aBits) {
+		if b is Ty.TSized(bSigned, bBits) { return aSigned == bSigned && aBits == bBits }
+		return false
+	}
 	if a is Ty.TBool { return b is Ty.TBool }
 	if a is Ty.TAtom { return b is Ty.TAtom }
 	if a is Ty.TVoid { return b is Ty.TVoid }
@@ -630,8 +817,14 @@ func same(a: Ty, b: Ty): Bool {
 		if b is Ty.TLib(bModule, bName) { return aModule == bModule && aName == bName }
 		return false
 	}
-	if a is Ty.TAddress { return b is Ty.TAddress }
-	if a is Ty.TSecret { return b is Ty.TSecret }
+	if a is Ty.TAddress(aMessage) {
+		if b is Ty.TAddress(bMessage) { return same(aMessage, bMessage) }
+		return false
+	}
+	if a is Ty.TSecret(aHeld) {
+		if b is Ty.TSecret(bHeld) { return same(aHeld, bHeld) }
+		return false
+	}
 	if a is Ty.TVec(aElement, aDim) {
 		if b is Ty.TVec(bElement, bDim) { return same(aElement, bElement) && sameDim(aDim, bDim) }
 		return false
@@ -652,33 +845,33 @@ func same(a: Ty, b: Ty): Bool {
 		if b is Ty.TCodec(bError) { return same(aError, bError) }
 		return false
 	}
-	if a is Ty.TFn(aPure, aParams, aMutexes, aResult) {
-		if b is Ty.TFn(bPure, bParams, bMutexes, bResult) {
+	if a is Ty.TFn(aPure, aParams, aMutables, aResult) {
+		if b is Ty.TFn(bPure, bParams, bMutables, bResult) {
 			return aPure == bPure && sameList(aParams, bParams)
-				&& sameMutexes(aMutexes, bMutexes, len(aParams)) && same(aResult, bResult)
+				&& sameMutables(aMutables, bMutables, len(aParams)) && same(aResult, bResult)
 		}
 		return false
 	}
 	return false
 }
 
-func mutexAt(mutexes: Bool[], i: Int): Bool {
-	if mutexes bounds i {
-		return mutexes[i]
+func mutableAt(mutables: Bool[], i: Int): Bool {
+	if mutables bounds i {
+		return mutables[i]
 	}
 	return false
 }
 
-func sameMutexes(a: Bool[], b: Bool[], count: Int): Bool {
+func sameMutables(a: Bool[], b: Bool[], count: Int): Bool {
 	for i := 0; i < count; i++ {
-		if mutexAt(a, i) != mutexAt(b, i) {
+		if mutableAt(a, i) != mutableAt(b, i) {
 			return false
 		}
 	}
 	return true
 }
 
-func noMutexes(count: Int): Bool[dyn] {
+func noMutables(count: Int): Bool[dyn] {
 	mut Bool[dyn] out = []
 	for i := 0; i < count; i++ {
 		append(out, false)
@@ -734,15 +927,15 @@ func acceptsVector(toElement: Ty, toDim: ast.Dim, fromElement: Ty, fromDim: ast.
 
 // A function value is handed what the slot's parameters say, so each of its own
 // has to take that: `proc(Str[3])` cannot fill a `proc(Str[])` slot, whose calls
-// pass any length. A mutex position is written back through, so it is exact.
-func paramsAccept(slot: Ty[], given: Ty[], mutexes: Bool[]): Bool {
+// pass any length. A `mut` position is written back through, so it is exact.
+func paramsAccept(slot: Ty[], given: Ty[], mutables: Bool[]): Bool {
 	if len(slot) != len(given) {
 		return false
 	}
 	mut i := 0
 	for each wanted in slot {
 		if given bounds i {
-			if mutexAt(mutexes, i) {
+			if mutableAt(mutables, i) {
 				if same(wanted, given[i]) == false {
 					return false
 				}
@@ -782,6 +975,9 @@ func operandsFit(a: Ty, b: Ty): Bool {
 	}
 	if a is Ty.TAtom && b is Ty.TStr {
 		return true
+	}
+	if isNumber(a) && isNumber(b) {
+		return same(a, b)
 	}
 	return accepts(a, b) || accepts(b, a)
 }
@@ -888,7 +1084,7 @@ func orderedIn(t: Table, ty: Ty, enumerated: func(Str, Str): Bool, seen: Str[]):
 	if ty is Ty.TLib(module, name) {
 		return enumerated(module, name)
 	}
-	if ty is Ty.TFragment(_) || ty is Ty.TCodec(_) || ty is Ty.TVoid || ty is Ty.TAddress || ty is Ty.TSecret {
+	if ty is Ty.TFragment(_) || ty is Ty.TCodec(_) || ty is Ty.TVoid || ty is Ty.TAddress(_) || ty is Ty.TSecret(_) {
 		return false
 	}
 	if ty is Ty.TVec(element, _) {

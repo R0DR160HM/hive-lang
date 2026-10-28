@@ -78,9 +78,9 @@ All of it.
 | generics | monomorphization: one copy per set of type arguments, read off the argument types, for callables and types alike ([11](11-generics.md)) |
 | bounds | every index and slice proved in range, flow-sensitively, on vectors and on a `Str` alike: declared and inferred lengths, guards, counting loops, `indexOf`, and what an assignment or a `drop` costs ([10](10-bounds.md)) |
 | checks | names, arity, named arguments, argument and return types, what a call can reach through, the standard library's own names and what they take, what a walk's function answers with, the proc/func split, mutability, terminating paths, exhaustiveness, conditions, subscripts, `async`'s three refusals, pattern shapes, a query's rows and its bound values ([04](04-declarations.md), [06](06-statements.md), [07](07-patterns.md), [08](08-mutability-and-values.md), [13](13-builtins.md), [14](14-stdlib.md)) |
-| value semantics | copy-on-binding, type-directed deep copies, two `mut` names sharing one header, mutex parameters as pointers ([08](08-mutability-and-values.md)) |
+| value semantics | copy-on-binding, type-directed deep copies, two `mut` names sharing one header, `mut` parameters as pointers ([08](08-mutability-and-values.md)) |
 | concurrency | `async` as a statement, the `async` binding, the await-all, `with timeout` ([09](09-concurrency.md)) |
-| patterns | all four kinds, with narrowing through `&&`; a string template's holes both ways, with its regexes read at compile time and the whole template compiled once ([07](07-patterns.md)) |
+| patterns | all five kinds, with narrowing through `&&`; a binary pattern's fields read in one pass, its alignment checked at compile time; a string template's holes both ways, with its regexes read at compile time and the whole template compiled once ([07](07-patterns.md)) |
 | builtins | all of [13](13-builtins.md) |
 | standard library | every module of [14](14-stdlib.md): `hive.conv`, `hive.math`, `hive.map`, `hive.file`, `hive.env`, `hive.term`, `hive.task`, `hive.time`, `hive.json`, `hive.crypto`, `hive.net`, `hive.syslink`, `hive.sql`, `hive.ui` and `hive.ui.scene` |
 | reading tables | every reader: `hive.file.csv`, `hive.file.xlsx`, `hive.file.ods`, `hive.sql.run` on a declared `query`, and `hive.sql.raw` ([14.6](14-stdlib.md#146-reading-tables)) |
@@ -156,15 +156,10 @@ different route, or does not quite do it.
   ([14.10](14-stdlib.md#1410-hivesyslink)) and this compiler writes the
   *signature* — the type's spelling and every variant and field it declares — for
   the runtime to hash on the way out. FNV-1a wants exclusive-or and a byte's
-  value, and Hive has neither, so the hash is one line of Go instead of thirty of
-  Hive. What matters is that both ends of a wire compute the same number from the
-  same declaration, and they do.
-* **An address does not carry its mailbox type.** `Address` is one
-  type rather than one per protocol, and what a send answers with is read off the
-  *message* instead — which is the same type, since a service answers with one of
-  its own messages. The effect is the one the specification describes; what is
-  missing is the compile-time refusal of a send whose message is not the
-  mailbox's.
+  value, which Hive has, but the compiler is built by the one released before it
+  and that one does not — so the hash stays one line of Go until a release
+  carries `^`. What matters is that both ends of a wire compute the same number
+  from the same declaration, and they do.
 
 ## 18.3 Defects this chapter turned up in this one
 

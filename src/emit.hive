@@ -79,7 +79,7 @@ type Emit {
 	// The names declared `mut`, which is what decides whether a binding off one
 	// of them has to copy.
 	mutables: Str[dyn]
-	// The mutex parameters, which lower to pointers and are read through them.
+	// The `mut` parameters, which lower to pointers and are read through them.
 	pointers: Str[dyn]
 	// The names held as a cell: storage two `mut` names share, as a pointer both
 	// of them hold. Worked out for a whole body before it is walked.
@@ -122,11 +122,14 @@ type Emit {
 	handsBack: Str[dyn]
 	// The path `x` of an `x = f(x)` being written, until the call's arguments take it.
 	handing: Str
+	// The packed elements the call just written lends: copied out before it, back after.
+	fronts: Str[dyn]
+	backs: Str[dyn]
 }
 // Emit a whole program.
 proc emitModule(m: ast.Module): Emitted {
 	t := types.tableOf(m)
-	mut Emit em = Emit(t, [], 0, ["Nil"], [], [], [], [], [], [], 0, [], [], [], [], false, false, false, -1, [], writes.writtenShapes(m), [], 0, "", false, [], [], "")
+	mut Emit em = Emit(t, [], 0, ["Nil"], [], [], [], [], [], [], 0, [], [], [], [], false, false, false, -1, [], writes.writtenShapes(m), [], 0, "", false, [], [], "", [], [])
 
 	line(em, "package main")
 	line(em, "")
@@ -306,10 +309,22 @@ func goType(ty: types.Ty): Str {
 	if ty is types.Ty.TStr { return "string" }
 	else if ty is types.Ty.TInt { return "int" }
 	else if ty is types.Ty.TFloat { return "float64" }
+	else if ty is types.Ty.TSized(signed, bits) {
+		if signed {
+			return "int{containerBits(bits)}"
+		}
+		return "uint{containerBits(bits)}"
+	}
+	else if ty is types.Ty.TFloat32 { return "float32" }
 	else if ty is types.Ty.TBool { return "bool" }
 	else if ty is types.Ty.TAtom { return "hive.Atom" }
 	else if ty is types.Ty.TVoid { return "" }
-	else if ty is types.Ty.TVec(element, _) { return "[]" + goType(element) }
+	else if ty is types.Ty.TVec(element, _) {
+		if isPacked(ty) {
+			return "hive.Packed[" + goType(element) + "]"
+		}
+		return "[]" + goType(element)
+	}
 	else if ty is types.Ty.TNamed(name) { return goIdent(name) }
 	else if ty is types.Ty.TResult(ok, bad) {
 		return "hive.Result[" + goType(ok) + ", " + goType(bad) + "]"
@@ -324,13 +339,13 @@ func goType(ty: types.Ty): Str {
 	else if ty is types.Ty.TLib(module, name) {
 		return "hive." + text.capitalise(module) + name
 	}
-	else if ty is types.Ty.TAddress { return "hive.SyslinkAddress" }
-	else if ty is types.Ty.TSecret { return "hive.Secret" }
-	else if ty is types.Ty.TFn(_, params, mutexes, result) {
+	else if ty is types.Ty.TAddress(_) { return "hive.SyslinkAddress" }
+	else if ty is types.Ty.TSecret(_) { return "hive.Secret" }
+	else if ty is types.Ty.TFn(_, params, mutables, result) {
 		mut Str[dyn] out = []
 		mut i := 0
 		for each p in params {
-			if types.mutexAt(mutexes, i) {
+			if types.mutableAt(mutables, i) {
 				append(out, "*" + goType(p))
 			} else {
 				append(out, goType(p))
@@ -348,14 +363,89 @@ func goType(ty: types.Ty): Str {
 	return "any"
 }
 
+// The Go integer a value of `bits` lives in while the program works with it.
+func containerBits(bits: Int): Int {
+	if bits <= 8 { return 8 }
+	if bits <= 16 { return 16 }
+	if bits <= 32 { return 32 }
+	return 64
+}
+
+// The trim that brings a result back to its width: `""` where the container is
+// exactly that wide and Go's own wrapping is already right.
+func trimmed(ty: types.Ty, written: Str): Str {
+	if ty is types.Ty.TSized(signed, bits) {
+		spare := containerBits(bits) - bits
+		if spare == 0 {
+			return written
+		}
+		if signed {
+			return "hive.TrimS(" + written + ", {spare})"
+		}
+		return "hive.TrimU(" + written + ", {bits})"
+	}
+	return written
+}
+
+// 0 where Go has an integer that wide, and the vector stays a slice.
+func packedBits(ty: types.Ty): Int {
+	if ty is types.Ty.TVec(element, _) {
+		if element is types.Ty.TSized(_, bits) {
+			if bits != 8 && bits != 16 && bits != 32 && bits != 64 {
+				return bits
+			}
+		}
+	}
+	return 0
+}
+
+func isPacked(ty: types.Ty): Bool {
+	return packedBits(ty) > 0
+}
+
+// A packed vector's values as a Go slice, for the walks written against one.
+func unpacked(ty: types.Ty, written: Str): Str {
+	if isPacked(ty) {
+		return "(" + written + ").Unpack()"
+	}
+	return written
+}
+
+// A Go slice of values packed again, where `ty` is a packed vector.
+func packed(ty: types.Ty, written: Str): Str {
+	if isPacked(ty) {
+		return "hive.Pack({packedBits(ty)}, " + written + ")"
+	}
+	return written
+}
+
+func lengthIn(ty: types.Ty, written: Str): Str {
+	if isPacked(ty) {
+		return written + ".Len()"
+	}
+	return "len(" + written + ")"
+}
+
+func elementIn(ty: types.Ty, written: Str, index: Str): Str {
+	if isPacked(ty) {
+		return written + ".At(" + index + ")"
+	}
+	return written + "[" + index + "]"
+}
+
 // The zero value of a type, for a `var` with nothing to initialise it.
 func goZero(ty: types.Ty): Str {
 	if ty is types.Ty.TStr { return "\"\"" }
 	else if ty is types.Ty.TInt { return "0" }
 	else if ty is types.Ty.TFloat { return "0.0" }
+	else if ty is types.Ty.TSized(_, _) || ty is types.Ty.TFloat32 { return goType(ty) + "(0)" }
 	else if ty is types.Ty.TBool { return "false" }
 	else if ty is types.Ty.TAtom { return "hive.Atom(0)" }
-	else if ty is types.Ty.TVec(element, _) { return "[]" + goType(element) + "\{}" }
+	else if ty is types.Ty.TVec(element, _) {
+		if isPacked(ty) == false {
+			return "[]" + goType(element) + "\{}"
+		}
+	}
 	return goType(ty) + "\{}"
 }
 
@@ -416,6 +506,74 @@ proc emitTypeDecl(em: mut Emit, name: Str, fields: ast.Field[], variants: ast.Va
 		append(order, quoted(goVariant(name, v.name)))
 	}
 	line(em, "func init() \{ hive.RegisterVariants([]string\{" + join(order, ", ") + "}) }")
+	if stdlib.isErrorUnion(name) {
+		emitErrorLift(em, name, fields, variants)
+	}
+}
+
+// One of the library's error unions. The runtime reports a failure as a struct
+// whose `Reason` names the variant, so a call answering with one is lifted into
+// the union on the way out, and a variant shows the way that struct does.
+proc emitErrorLift(em: mut Emit, name: Str, fields: ast.Field[], variants: ast.Variant[]): void {
+	module := text.charAt(split(name, "_"), 1)
+	if module != "" {
+		useModule(em, module)
+	}
+	runtimeType := stdlib.runtimeErrorType(name)
+	for each v in variants {
+		mut Str[dyn] carried = ["Reason: " + quoted(v.name)]
+		for each f in fields {
+			append(carried, goField(f.name) + ": v." + goField(f.name))
+		}
+		line(em, "func (v " + goVariant(name, v.name) + ") String() string \{ return hive.ShowIn(" + runtimeType + "\{" + join(carried, ", ") + "}) }")
+	}
+	blank(em)
+	open(em, "func " + liftName(name) + "(e " + runtimeType + ") " + goIdent(name) + " \{")
+	open(em, "switch e.Reason \{")
+	for each v in variants {
+		mut Str[dyn] carried = []
+		for each f in fields {
+			append(carried, goField(f.name) + ": e." + goField(f.name))
+		}
+		line(em, "case " + quoted(v.name) + ":")
+		line(em, "\treturn " + goVariant(name, v.name) + "\{" + join(carried, ", ") + "}")
+	}
+	close(em, "}")
+	line(em, "panic(" + quoted("hive: " + types.shownName(name) + " has no variant ") + " + e.Reason)")
+	close(em, "}")
+}
+
+func liftName(name: Str): Str {
+	return "lift_" + name
+}
+
+// What a library call or a send answers with, lifted where it holds an error
+// union: the runtime's `Result[T, hive.FileFileError]` is the program's
+// `Result[T, hive_file_FileError]`.
+func lifted(ty: types.Ty, written: Str): Str {
+	if ty is types.Ty.TResult(_, types.Ty.TNamed(bad)) {
+		if stdlib.isErrorUnion(bad) {
+			return "hive.LiftBad(" + written + ", " + liftName(bad) + ")"
+		}
+	}
+	// A barrier over sends answers with one Result a send.
+	if ty is types.Ty.TVec(types.Ty.TResult(_, types.Ty.TNamed(bad)), _) {
+		if stdlib.isErrorUnion(bad) {
+			return "hive.LiftEach(" + written + ", " + liftName(bad) + ")"
+		}
+	}
+	return written
+}
+
+// The Go type the runtime answers with where the program reads `ty`: the same,
+// but for an error union, which the runtime still reports as its struct.
+func runtimeGoType(ty: types.Ty): Str {
+	if ty is types.Ty.TResult(ok, types.Ty.TNamed(bad)) {
+		if stdlib.isErrorUnion(bad) {
+			return "hive.Result[" + goType(ok) + ", " + stdlib.runtimeErrorType(bad) + "]"
+		}
+	}
+	return goType(ty)
 }
 
 // Reads a shared field through the union's interface, which has no fields of its own.
@@ -443,9 +601,9 @@ proc emitCallable(em: mut Emit, env: infer.Env, name: Str, params: ast.Param[], 
 	mut Str[dyn] written = []
 	for each p in params {
 		ty := types.resolve(env.table, p.declared)
-		// A mutex parameter lowers to a pointer: a shared backing array would not
+		// A `mut` parameter lowers to a pointer: a shared backing array would not
 		// survive `append`, which produces a new header the caller has to hold.
-		if p.mutex {
+		if p.mutable {
 			append(em.pointers, p.name)
 			append(em.mutables, p.name)
 			append(written, goIdent(p.name) + " *" + goType(ty))
@@ -511,6 +669,9 @@ func cloneFn(t: types.Table, ty: types.Ty): Str {
 	if types.ownsStorage(t, ty) == false {
 		return "hive.Same[" + goType(ty) + "]"
 	}
+	if isPacked(ty) {
+		return "hive.ClonePacked[" + goType(types.elementOf(ty)) + "]"
+	}
 	if ty is types.Ty.TVec(element, _) {
 		if types.ownsStorage(t, element) {
 			return "func(_v []" + goType(element) + ") []" + goType(element) + " \{ return hive.CloneVecFn(_v, " + cloneFn(t, element) + ") }"
@@ -530,6 +691,9 @@ func cloneFn(t: types.Table, ty: types.Ty): Str {
 func cloned(t: types.Table, ty: types.Ty, written: Str): Str {
 	if types.ownsStorage(t, ty) == false {
 		return written
+	}
+	if isPacked(ty) {
+		return "hive.ClonePacked(" + written + ")"
 	}
 	if ty is types.Ty.TVec(element, _) {
 		if types.ownsStorage(t, element) {
@@ -654,7 +818,7 @@ proc emitStmt(em: mut Emit, env: infer.Env, s: ast.Stmt, result: types.Ty): infe
 				if value is ast.Expr.Call(address, sent) {
 					line(em, pending + " := " + pendingSend(em, env, address, sent))
 				}
-				line(em, taskName(held) + " := hive.Spawn(func() any \{ return hive.SyslinkAwait(" + pending + ", 0) })")
+				line(em, taskName(held) + " := hive.Spawn(func() any \{ return " + answered("hive.SyslinkAwait(" + pending + ", 0)") + " })")
 			} else {
 				work := onThread(em, env, value, ty)
 				line(em, taskName(held) + " := hive.Spawn(func() any \{ return " + work + " })")
@@ -828,29 +992,49 @@ proc builtinStatement(em: mut Emit, env: infer.Env, name: Str, written: ast.Arg[
 		held = copiedArgs(written)
 	}
 	args := infer.builtinArgs(name, held)
+	vector := infer.typeOf(env, argExpr(args, 0))
+	bits := packedBits(vector)
+	mut tail := ""
+	if bits > 0 {
+		tail = "Packed"
+	}
 	if name == "append" && len(args) == 2 {
-		target := argExpr(args, 0)
-		line(em, expr(em, env, target, types.Ty.TUnknown()) + " = append(" + expr(em, env, target, types.Ty.TUnknown()) + ", " + expr(em, env, argExpr(args, 1), types.elementOf(infer.typeOf(env, target))) + ")")
+		target := expr(em, env, argExpr(args, 0), types.Ty.TUnknown())
+		value := expr(em, env, argExpr(args, 1), types.elementOf(vector))
+		if bits > 0 {
+			line(em, target + " = " + target + ".Append({bits}, " + value + ")")
+		} else {
+			line(em, target + " = append(" + target + ", " + value + ")")
+		}
 		return true
 	}
 	if name == "prepend" && len(args) == 2 {
-		target := argExpr(args, 0)
-		line(em, "hive.Prepend(&" + expr(em, env, target, types.Ty.TUnknown()) + ", " + expr(em, env, argExpr(args, 1), types.elementOf(infer.typeOf(env, target))) + ")")
+		target := expr(em, env, argExpr(args, 0), types.Ty.TUnknown())
+		value := expr(em, env, argExpr(args, 1), types.elementOf(vector))
+		if bits > 0 {
+			line(em, "hive.PrependPacked(&" + target + ", {bits}, " + value + ")")
+		} else {
+			line(em, "hive.Prepend(&" + target + ", " + value + ")")
+		}
 		return true
 	}
 	if name == "drop" && len(args) == 3 {
 		target := argExpr(args, 0)
-		line(em, "hive.Drop(&" + expr(em, env, target, types.Ty.TUnknown()) + ", " + expr(em, env, argExpr(args, 1), types.Ty.TInt()) + ", " + expr(em, env, argExpr(args, 2), types.Ty.TInt()) + ")")
+		line(em, "hive.Drop" + tail + "(&" + expr(em, env, target, types.Ty.TUnknown()) + ", " + expr(em, env, argExpr(args, 1), types.Ty.TInt()) + ", " + expr(em, env, argExpr(args, 2), types.Ty.TInt()) + ")")
 		return true
 	}
 	// A `sort` whose value is discarded on a `mut` vector sorts in place, with no
 	// copy at either end.
 	if name == "sort" && len(args) >= 1 {
 		target := argExpr(args, 0)
+		mut sorter := "hive.SortInPlace"
+		if bits > 0 {
+			sorter = "hive.SortPackedInPlace"
+		}
 		if len(args) == 2 {
-			line(em, "hive.SortInPlaceBy(" + expr(em, env, target, types.Ty.TUnknown()) + ", " + expr(em, env, argExpr(args, 1), types.Ty.TUnknown()) + ")")
+			line(em, sorter + "By(" + expr(em, env, target, types.Ty.TUnknown()) + ", " + expr(em, env, argExpr(args, 1), types.Ty.TUnknown()) + ")")
 		} else {
-			line(em, "hive.SortInPlace(" + expr(em, env, target, types.Ty.TUnknown()) + ")")
+			line(em, sorter + "(" + expr(em, env, target, types.Ty.TUnknown()) + ")")
 		}
 		return true
 	}
@@ -876,6 +1060,11 @@ proc assignment(em: mut Emit, env: infer.Env, target: ast.Expr, value: ast.Expr)
 	if target is ast.Expr.Ident(name) {
 		if isCell(em, name) {
 			return goIdent(name) + " = " + inCell(em, ty, expr(em, env, value, ty))
+		}
+	}
+	if target is ast.Expr.Index(subject, index) {
+		if isPacked(infer.typeOf(env, subject)) {
+			return expr(em, env, subject, types.Ty.TUnknown()) + ".Set(" + expr(em, env, index, types.Ty.TInt()) + ", " + expr(em, env, value, ty) + ")"
 		}
 	}
 	if handsBack(env, em.handsBack, em.mutables, em.cells, target, value) {
@@ -923,7 +1112,7 @@ proc clause(em: mut Emit, env: infer.Env, s: ast.Stmt): Str {
 	}
 	if s is ast.Stmt.TypedDecl(declared, name, value, _, _) {
 		ty := types.resolve(env.table, declared)
-		return "var " + goIdent(name) + " " + goType(ty) + " = " + expr(em, env, value, ty)
+		return goIdent(name) + " := " + goType(ty) + "(" + expr(em, env, value, ty) + ")"
 	}
 	if s is ast.Stmt.Assign(target, value) {
 		return assignment(em, env, target, value)
@@ -945,13 +1134,18 @@ func bindOnly(em: Emit, env: infer.Env, s: ast.Stmt): infer.Env {
 }
 
 proc emitForEach(em: mut Emit, env: infer.Env, name: Str, declared: ast.TypeExpr, subject: ast.Expr, body: ast.Block, result: types.Ty): void {
-	mut elementType := types.elementOf(infer.typeOf(env, subject))
+	subjectType := infer.typeOf(env, subject)
+	mut elementType := types.elementOf(subjectType)
 	if declared is ast.TypeExpr.VoidType {
 	} else {
 		elementType = types.resolve(env.table, declared)
 	}
 	mut inner := infer.bound(env, name, elementType)
-	open(em, "for _, " + goIdent(name) + " := range " + expr(em, env, subject, types.Ty.TUnknown()) + " \{")
+	mut walked := expr(em, env, subject, types.Ty.TUnknown())
+	if isPacked(subjectType) {
+		walked = walked + ".All"
+	}
+	open(em, "for _, " + goIdent(name) + " := range " + walked + " \{")
 	line(em, "_ = " + goIdent(name))
 	emitStmts(em, inner, body, result)
 	close(em, "}")
@@ -1109,8 +1303,139 @@ proc emitPatternGuard(em: mut Emit, env: infer.Env, subject: ast.Expr, pattern: 
 	if pattern is ast.Pattern.StrTemplate(parts) {
 		return templateGuard(em, env, written, holder, parts)
 	}
+	if pattern is ast.Pattern.BitsPat(fields, rest) {
+		matched := fresh(em, "ok")
+		named := bitsBound(fields, rest)
+		mut Str[dyn] held = []
+		for each name in named {
+			append(held, goIdent(name))
+		}
+		append(held, matched)
+		open(em, "if " + join(held, ", ") + " := " + bitsReader(em, env, written, subjectType, fields, rest) + "; " + matched + " \{")
+		for each name in named {
+			line(em, "_ = " + goIdent(name))
+		}
+		return infer.afterPattern(env, subjectType, pattern)
+	}
 	open(em, "if false \{")
 	return env
+}
+
+// The names a binary pattern hands out, in order: its fields', then its rest.
+func bitsBound(fields: ast.BitField[], rest: Str): Str[dyn] {
+	mut Str[dyn] out = []
+	for each f in fields {
+		if f.name != "" && f.name != "_" {
+			append(out, f.name)
+		}
+	}
+	if rest != "" && rest != "_" {
+		append(out, rest)
+	}
+	return out
+}
+
+// The match as a function literal answering each bound field and whether it
+// matched: a later field's length reads an earlier one, which a condition alone has
+// nowhere to keep.
+proc bitsReader(em: mut Emit, env: infer.Env, written: Str, subjectType: types.Ty, fields: ast.BitField[], rest: Str): Str {
+	reader := fresh(em, "rd")
+	mut Str[dyn] results = []
+	mut Str[dyn] body = []
+	mut opening := "hive.ReadBytes(" + written + ")"
+	if subjectType is types.Ty.TStr {
+		opening = "hive.ReadText(" + written + ")"
+	} else if subjectType is types.Ty.TSized(_, bits) {
+		opening = "hive.ReadWord(" + written + ", {bits})"
+	} else if subjectType is types.Ty.TInt {
+		opening = "hive.ReadWord(" + written + ", 64)"
+	}
+	append(body, reader + " := " + opening)
+	mut scope := env
+	for each f in fields {
+		ty := infer.bitFieldType(env.table, f)
+		width := "{widthOfType(ty)}"
+		mut taken := ""
+		if (f.length is ast.Expr.Absent) == false {
+			taken = reader + ".TakeBytes(int(" + expr(em, scope, f.length, infer.typeOf(scope, f.length)) + "))"
+		} else if f.value is ast.Expr.StrLit(t) {
+			append(body, reader + ".Expect(" + quoted(t) + ")")
+		} else if f.little {
+			taken = "hive.TakeBitsLittle[" + goType(ty) + "](&" + reader + ", " + width + ")"
+		} else {
+			taken = "hive.TakeBits[" + goType(ty) + "](&" + reader + ", " + width + ")"
+		}
+		if taken == "" {
+		} else if (f.value is ast.Expr.Absent) == false {
+			append(body, "if " + taken + " != " + expr(em, scope, f.value, ty) + " \{ return }")
+		} else if f.name == "_" {
+			append(body, "_ = " + taken)
+		} else {
+			append(body, goIdent(f.name) + " := " + taken)
+			scope = infer.bound(scope, f.name, ty)
+		}
+		if f.name != "" && f.name != "_" {
+			append(results, fresh(em, "r") + " " + goType(ty))
+		}
+	}
+	mut ending := ""
+	if rest != "" {
+		restType := types.Ty.TVec(types.Ty.TSized(false, 8), ast.Dim.Dynamic())
+		mut take := reader + ".RestBytes()"
+		if subjectType is types.Ty.TStr {
+			take = reader + ".RestText()"
+			append(results, fresh(em, "r") + " string")
+		} else {
+			append(results, fresh(em, "r") + " " + goType(restType))
+		}
+		if rest != "_" {
+			append(body, goIdent(rest) + " := " + take)
+		}
+		append(body, "if " + reader + ".Failed() \{ return }")
+	} else {
+		append(body, "if !" + reader + ".Done() \{ return }")
+	}
+	matched := fresh(em, "ok")
+	append(results, matched + " bool")
+	mut Str[dyn] answers = []
+	for each name in bitsBound(fields, rest) {
+		append(answers, goIdent(name))
+	}
+	append(answers, "true")
+	append(body, "return " + join(answers, ", "))
+	return "func() (" + join(results, ", ") + ") \{ " + join(body, "; ") + " }()"
+}
+
+func widthOfType(ty: types.Ty): Int {
+	if ty is types.Ty.TSized(_, bits) {
+		return bits
+	}
+	return 64
+}
+
+// `<<a, b: UInt16, payload>>`, written into a buffer in order.
+proc bitsLiteral(em: mut Emit, env: infer.Env, parts: ast.BitPart[]): Str {
+	writer := fresh(em, "wr")
+	mut Str[dyn] body = ["var " + writer + " hive.BitWriter"]
+	for each part in parts {
+		mut ty := infer.landedType(env, part.value, types.Ty.TVec(types.Ty.TSized(false, 8), ast.Dim.Dynamic()))
+		if (part.declared is ast.TypeExpr.VoidType) == false {
+			ty = types.resolve(env.table, part.declared)
+		} else if infer.intLiteral(part.value) is Result.Ok(_) {
+			ty = types.Ty.TSized(false, 8)
+		}
+		if ty is types.Ty.TStr {
+			append(body, writer + ".PutText(" + expr(em, env, part.value, ty) + ")")
+		} else if ty is types.Ty.TVec(_, _) {
+			append(body, writer + ".PutBytes(" + expr(em, env, part.value, ty) + ")")
+		} else if part.little {
+			append(body, "hive.PutBitsLittle(&" + writer + ", " + expr(em, env, part.value, ty) + ", {widthOfType(ty)})")
+		} else {
+			append(body, "hive.PutBits(&" + writer + ", " + expr(em, env, part.value, ty) + ", {widthOfType(ty)})")
+		}
+	}
+	append(body, "return " + writer + ".Bytes()")
+	return "func() []uint8 \{ " + join(body, "; ") + " }()"
 }
 
 proc constructorGuard(em: mut Emit, env: infer.Env, written: Str, holder: Str, subjectType: types.Ty, path: Str[], bindings: Str[], ): infer.Env {
@@ -1188,14 +1513,14 @@ proc vectorGuard(em: mut Emit, env: infer.Env, written: Str, holder: Str, subjec
 	// A trailing `...rest` relaxes the length from an exact count to a lower
 	// bound; without one the pattern matches only a vector of exactly that many.
 	if rest == "" {
-		append(tests, "len(" + holder + ") == {len(elements)}")
+		append(tests, lengthIn(subjectType, holder) + " == {len(elements)}")
 	} else {
-		append(tests, "len(" + holder + ") >= {len(elements)}")
+		append(tests, lengthIn(subjectType, holder) + " >= {len(elements)}")
 	}
 	mut i := 0
 	for each item in elements {
 		if item is ast.VecElem.Match(value) {
-			append(tests, equality(em, env, holder + "[{i}]", expr(em, env, value, element), element))
+			append(tests, equality(em, env, elementIn(subjectType, holder, "{i}"), expr(em, env, value, element), element))
 		}
 		i = i + 1
 	}
@@ -1204,13 +1529,17 @@ proc vectorGuard(em: mut Emit, env: infer.Env, written: Str, holder: Str, subjec
 	mut j := 0
 	for each item in elements {
 		if item is ast.VecElem.Bind(name) {
-			bind(em, name, holder + "[{j}]")
+			bind(em, name, elementIn(subjectType, holder, "{j}"))
 		}
 		j = j + 1
 	}
 	inner := infer.boundElements(env, elements, element, 0)
 	if rest != "" {
-		bind(em, rest, holder + "[{len(elements)}:]")
+		if isPacked(subjectType) {
+			bind(em, rest, holder + ".From({len(elements)})")
+		} else {
+			bind(em, rest, holder + "[{len(elements)}:]")
+		}
 		return infer.bound(inner, rest, types.Ty.TVec(element, ast.Dim.Dynamic()))
 	}
 	return inner
@@ -1325,7 +1654,29 @@ func segment(path: Str[], index: Int): Str {
 // One expression, as Go. `want` is the type the value is landing in, which is
 // the only thing that can settle an empty vector, a `Result` constructor and an
 // empty map.
+// A value where it lands: a literal written as the number type it lands in, and a
+// narrower number widened, which Go never does for it.
 proc expr(em: mut Emit, env: infer.Env, e: ast.Expr, want: types.Ty): Str {
+	written := bareExpr(em, env, e, want)
+	if types.isNumber(want) == false {
+		return written
+	}
+	if numberLiteral(e) {
+		if want is types.Ty.TSized(_, _) || want is types.Ty.TFloat32 {
+			if types.same(infer.landedType(env, e, want), want) {
+				return goType(want) + "(" + written + ")"
+			}
+		}
+		return written
+	}
+	have := infer.typeOf(env, e)
+	if types.isNumber(have) && types.same(have, want) == false && types.widens(have, want) {
+		return goType(want) + "(" + written + ")"
+	}
+	return written
+}
+
+proc bareExpr(em: mut Emit, env: infer.Env, e: ast.Expr, want: types.Ty): Str {
 	if e is ast.Expr.IntLit(v) { return "{v}" }
 	else if e is ast.Expr.FloatLit(v) { return floatLiteral(v) }
 	else if e is ast.Expr.StrLit(t) { return quoted(t) }
@@ -1336,17 +1687,26 @@ proc expr(em: mut Emit, env: infer.Env, e: ast.Expr, want: types.Ty): Str {
 	else if e is ast.Expr.Absent { return "" }
 	else if e is ast.Expr.Negate(operand) {
 		operandType := infer.typeOf(env, operand)
-		// `-MIN` has no Int to be, so it stays at the edge: `MAX`.
 		if operandType is types.Ty.TInt && numberLiteral(operand) == false {
 			return "hive.NegInt(" + expr(em, env, operand, operandType) + ")"
 		}
-		return "-(" + expr(em, env, operand, operandType) + ")"
+		return trimmed(operandType, "-(" + expr(em, env, operand, operandType) + ")")
 	}
 	// Parenthesised for the reason `-` is: what Hive bound tightly, Go has to be
 	// told to bind tightly too.
 	else if e is ast.Expr.Not(operand) {
 		return "!(" + expr(em, env, operand, types.Ty.TBool()) + ")"
 	}
+	// A literal's bits depend on its width, so `~0x0F` is worked in the type it
+	// lands in.
+	else if e is ast.Expr.BitNot(operand) {
+		mut ty := infer.typeOf(env, operand)
+		if types.isInteger(want) && types.same(infer.landedType(env, e, want), want) {
+			ty = want
+		}
+		return trimmed(ty, "^(" + expr(em, env, operand, ty) + ")")
+	}
+	else if e is ast.Expr.Bits(parts) { return bitsLiteral(em, env, parts) }
 	else if e is ast.Expr.Interp(parts) { return interpolation(em, env, parts) }
 	else if e is ast.Expr.VectorLit(items) { return vectorLiteral(em, env, items, want) }
 	else if e is ast.Expr.Binary(op, left, right) { return binary(em, env, op, left, right) }
@@ -1362,10 +1722,11 @@ proc exprTail(em: mut Emit, env: infer.Env, e: ast.Expr, want: types.Ty): Str {
 	} else if e is ast.Expr.Index(subject, index) {
 		// A `Str` is addressed by character and Go addresses it by byte, so one
 		// position of it is a walk rather than a subscript.
-		if infer.typeOf(env, subject) is types.Ty.TStr {
+		subjectType := infer.typeOf(env, subject)
+		if subjectType is types.Ty.TStr {
 			return "hive.IndexStr(" + expr(em, env, subject, types.Ty.TStr()) + ", " + expr(em, env, index, types.Ty.TInt()) + ")"
 		}
-		return expr(em, env, subject, types.Ty.TUnknown()) + "[" + expr(em, env, index, types.Ty.TInt()) + "]"
+		return elementIn(subjectType, expr(em, env, subject, types.Ty.TUnknown()), expr(em, env, index, types.Ty.TInt()))
 	} else if e is ast.Expr.Slice(subject, low, high) {
 		return slice(em, env, subject, low, high)
 	} else if e is ast.Expr.Timed(call, ms) {
@@ -1419,7 +1780,7 @@ proc identExpr(em: mut Emit, env: infer.Env, name: Str): Str {
 	if indexOf(em.deferred, name) is Result.Ok(_) {
 		return taskName(name) + ".Await().(" + goType(infer.lookup(env, name)) + ")"
 	}
-	// A mutex parameter is a pointer, and so is a cell — everything reads and
+	// A `mut` parameter is a pointer, and so is a cell — everything reads and
 	// writes through both.
 	if isIndirect(em, name) {
 		return "(*" + goIdent(name) + ")"
@@ -1465,11 +1826,11 @@ type Shared {
 proc cellNames(t: types.Table, env: infer.Env, params: ast.Param[], body: ast.Block): Str[dyn] {
 	mut Shared s = Shared(t, [], [], [], [], [])
 	for each p in params {
-		// A parameter is never a cell: a mutex one is already a pointer, and a
+		// A parameter is never a cell: a `mut` one is already a pointer, and a
 		// plain one is the callee's own copy.
 		append(s.seen, p.name)
 		append(s.barred, p.name)
-		if p.mutex {
+		if p.mutable {
 			append(s.mutable, p.name)
 		}
 	}
@@ -1601,7 +1962,7 @@ proc shareName(s: mut Shared, name: Str, mutable: Bool): void {
 	}
 }
 
-// Whether this body holds `name` as a cell. A mutex parameter is a pointer of
+// Whether this body holds `name` as a cell. A `mut` parameter is a pointer of
 // its own and is never one.
 proc isCell(em: mut Emit, name: Str): Bool {
 	if indexOf(em.pointers, name) is Result.Ok(_) {
@@ -1700,7 +2061,7 @@ proc vectorLiteral(em: mut Emit, env: infer.Env, items: ast.Expr[], want: types.
 	for each item in items {
 		append(out, expr(em, env, item, element))
 	}
-	return "[]" + goType(element) + "\{" + join(out, ", ") + "}"
+	return packed(types.Ty.TVec(element, ast.Dim.Dynamic()), "[]" + goType(element) + "\{" + join(out, ", ") + "}")
 }
 
 func copiedExprs(items: ast.Expr[]): ast.Expr[dyn] {
@@ -1727,10 +2088,17 @@ proc slice(em: mut Emit, env: infer.Env, subject: ast.Expr, low: ast.Expr, high:
 		}
 		return "hive.SliceStr(" + written + ", " + lowText + ", " + expr(em, env, high, types.Ty.TInt()) + ")"
 	}
+	packedSubject := isPacked(infer.typeOf(env, subject))
 	if high is ast.Expr.Absent {
+		if packedSubject {
+			return written + ".From(" + lowText + ")"
+		}
 		return written + "[" + lowText + ":]"
 	}
 	// Hive's high bound is inclusive, and Go's is not.
+	if packedSubject {
+		return written + ".Part(" + lowText + ", (" + expr(em, env, high, types.Ty.TInt()) + ")+1)"
+	}
 	return written + "[" + lowText + ":(" + expr(em, env, high, types.Ty.TInt()) + ")+1]"
 }
 
@@ -1770,11 +2138,15 @@ proc awaitAll(em: mut Emit, env: infer.Env, calls: ast.Expr[], timeout: ast.Expr
 	}
 	tasks := "[]*hive.Task\{" + join(out, ", ") + "}"
 	if timeout is ast.Expr.Absent {
-		return "hive.AwaitAll[" + goType(element) + "](" + tasks + ")"
+		return packed(vector, "hive.AwaitAll[" + goType(element) + "](" + tasks + ")")
 	}
 	// One deadline across the whole barrier — "both of them within a second",
 	// not a second each.
-	return "hive.AwaitAllTimeout[" + goType(element) + "](" + tasks + ", " + expr(em, env, timeout, types.Ty.TInt()) + ")"
+	bounded := "hive.AwaitAllTimeout[" + goType(element) + "](" + tasks + ", " + expr(em, env, timeout, types.Ty.TInt()) + ")"
+	if isPacked(vector) {
+		return "hive.PackResult({packedBits(vector)}, " + bounded + ")"
+	}
+	return bounded
 }
 
 proc withSpawn(em: mut Emit, env: infer.Env, into: Str[], c: ast.Expr): Str[dyn] {
@@ -1871,6 +2243,15 @@ proc standaloneMatch(em: mut Emit, env: infer.Env, subject: ast.Expr, pattern: a
 	if pattern is ast.Pattern.StrTemplate(parts) {
 		return "func() bool \{ _, ok := " + templateMatch(em, written, parts) + "; return ok }()"
 	}
+	if pattern is ast.Pattern.BitsPat(fields, rest) {
+		mut Str[dyn] held = []
+		for each name in bitsBound(fields, rest) {
+			append(held, "_")
+		}
+		matched := fresh(em, "ok")
+		append(held, matched)
+		return "func() bool \{ " + join(held, ", ") + " := " + bitsReader(em, env, written, infer.typeOf(env, subject), fields, rest) + "; return " + matched + " }()"
+	}
 	fail(em, "a vector pattern outside an `if` condition binds nothing, so it has no value to give")
 	return "false"
 }
@@ -1909,6 +2290,8 @@ func patternBinds(p: ast.Pattern): Bool {
 		}
 	} else if p is ast.Pattern.StrTemplate(parts) {
 		return len(holeNames(parts)) > 0
+	} else if p is ast.Pattern.BitsPat(fields, rest) {
+		return len(bitsBound(fields, rest)) > 0
 	}
 	return false
 }
@@ -1941,17 +2324,33 @@ proc binary(em: mut Emit, env: infer.Env, op: ast.BinOp, left: ast.Expr, right: 
 			return boundConjunction(em, env, parts)
 		}
 	}
+	// A shift answers its left side's type, whatever the count's is; a call, so two
+	// literals shifted past the width wrap rather than being refused by Go.
+	if infer.isShift(op) {
+		moved := infer.typeOf(env, left)
+		mut call := "hive.Shl("
+		if op is ast.BinOp.Shr {
+			call = "hive.Shr("
+		}
+		written := call + expr(em, env, left, moved) + ", " + expr(em, env, right, infer.typeOf(env, right)) + ")"
+		if op is ast.BinOp.Shl {
+			return trimmed(moved, written)
+		}
+		return written
+	}
+	operands := infer.operandType(env, left, right)
+	if (operands is types.Ty.TUnknown) == false {
+		return numeric(em, env, op, left, right, operands)
+	}
 	leftType := infer.typeOf(env, left)
 	rightType := infer.typeOf(env, right)
+	if infer.isComparison(op) && types.isInteger(leftType) && types.isInteger(rightType) {
+		return mixedComparison(op, expr(em, env, left, leftType), expr(em, env, right, rightType))
+	}
 	// An atom coerces to `Str` beside one, as its decimal value rather than its
 	// name — so `"0" + #Nil` is `"00"` and not `"0Nil"`.
-	mut l := coerced(em, env, left, leftType, rightType)
+	l := coerced(em, env, left, leftType, rightType)
 	r := coerced(em, env, right, rightType, leftType)
-	// Go folds two Float constants at compile time and refuses a result that
-	// overflows, where Hive reaches infinity; a call makes it an ordinary value.
-	if leftType is types.Ty.TFloat && numberLiteral(left) && numberLiteral(right) && (op is ast.BinOp.Add || op is ast.BinOp.Sub || op is ast.BinOp.Mul) {
-		l = "hive.Unfolded(" + l + ")"
-	}
 
 	if op is ast.BinOp.And {
 		// `v bounds i` desugars into this shape, and two in one condition would
@@ -1972,6 +2371,39 @@ proc binary(em: mut Emit, env: infer.Env, op: ast.BinOp, left: ast.Expr, right: 
 	if op is ast.BinOp.Le { return "(" + l + " <= " + r + ")" }
 	if op is ast.BinOp.Ge { return "(" + l + " >= " + r + ")" }
 	return arithmetic(em, env, op, l, r, leftType)
+}
+
+// Both sides widened to `ty`, the type the operator works in.
+proc numeric(em: mut Emit, env: infer.Env, op: ast.BinOp, left: ast.Expr, right: ast.Expr, ty: types.Ty): Str {
+	mut l := expr(em, env, left, ty)
+	r := expr(em, env, right, ty)
+	// Go folds two Float constants at compile time and refuses a result that
+	// overflows, where Hive reaches infinity; a call makes it an ordinary value.
+	if types.isFloat(ty) && numberLiteral(left) && numberLiteral(right) && (op is ast.BinOp.Add || op is ast.BinOp.Sub || op is ast.BinOp.Mul) {
+		if ty is types.Ty.TFloat32 {
+			l = "hive.Unfolded32(" + l + ")"
+		} else {
+			l = "hive.Unfolded(" + l + ")"
+		}
+	}
+	if op is ast.BinOp.Eq { return "(" + l + " == " + r + ")" }
+	if op is ast.BinOp.Neq { return "(" + l + " != " + r + ")" }
+	if op is ast.BinOp.Lt { return "(" + l + " < " + r + ")" }
+	if op is ast.BinOp.Gt { return "(" + l + " > " + r + ")" }
+	if op is ast.BinOp.Le { return "(" + l + " <= " + r + ")" }
+	if op is ast.BinOp.Ge { return "(" + l + " >= " + r + ")" }
+	return arithmetic(em, env, op, l, r, ty)
+}
+
+// Two integers of different sizes, compared by value: no Go type holds both a
+// `UInt64` and a negative `Int`, so the runtime asks the sign first.
+func mixedComparison(op: ast.BinOp, l: Str, r: Str): Str {
+	if op is ast.BinOp.Eq { return "hive.EqualWhole(" + l + ", " + r + ")" }
+	if op is ast.BinOp.Neq { return "!hive.EqualWhole(" + l + ", " + r + ")" }
+	if op is ast.BinOp.Lt { return "hive.LessWhole(" + l + ", " + r + ")" }
+	if op is ast.BinOp.Gt { return "hive.LessWhole(" + r + ", " + l + ")" }
+	if op is ast.BinOp.Le { return "!hive.LessWhole(" + r + ", " + l + ")" }
+	return "!hive.LessWhole(" + l + ", " + r + ")"
 }
 
 func numberLiteral(e: ast.Expr): Bool {
@@ -1995,10 +2427,15 @@ proc boundsGuard(em: mut Emit, env: infer.Env, left: ast.Expr, right: ast.Expr):
 						if lengthOf(length) is Result.Ok(vector) {
 							// A `Str` is guarded by character, the way it is
 							// indexed, so it has its own of these.
-							if infer.typeOf(env, vector) is types.Ty.TStr {
+							vectorType := infer.typeOf(env, vector)
+							if vectorType is types.Ty.TStr {
 								return "hive.InRangeStr(" + expr(em, env, index, types.Ty.TInt()) + ", " + expr(em, env, vector, types.Ty.TStr()) + ")"
 							}
-							return "hive.InRange(" + expr(em, env, index, types.Ty.TInt()) + ", " + expr(em, env, vector, types.Ty.TUnknown()) + ")"
+							mut guard := "hive.InRange("
+							if isPacked(vectorType) {
+								guard = "hive.InRangePacked("
+							}
+							return guard + expr(em, env, index, types.Ty.TInt()) + ", " + expr(em, env, vector, types.Ty.TUnknown()) + ")"
 						}
 					}
 				}
@@ -2064,13 +2501,27 @@ proc coerced(em: mut Emit, env: infer.Env, side: ast.Expr, ty: types.Ty, other: 
 // `+` is three operators told apart by one type: a sum, a concatenation, and a
 // fresh vector holding both sides.
 proc arithmetic(em: mut Emit, env: infer.Env, op: ast.BinOp, l: Str, r: Str, ty: types.Ty): Str {
-	// An Int that would pass either edge stays at it rather than wrapping.
+	// Two values already within a width stay within it, so nothing is trimmed.
+	if op is ast.BinOp.BitAnd { return "(" + l + " & " + r + ")" }
+	if op is ast.BinOp.BitOr { return "(" + l + " | " + r + ")" }
+	if op is ast.BinOp.BitXor { return "(" + l + " ^ " + r + ")" }
+	if ty is types.Ty.TSized(_, _) {
+		return trimmed(ty, "hive." + sizedOp(op) + "(" + l + ", " + r + ")")
+	}
+	if ty is types.Ty.TFloat32 {
+		if op is ast.BinOp.Div { return "hive.DivFloat32(" + l + ", " + r + ")" }
+		if op is ast.BinOp.Mod { return "hive.ModFloat32(" + l + ", " + r + ")" }
+		if op is ast.BinOp.Pow { return "hive.PowFloat32(" + l + ", " + r + ")" }
+	}
 	if ty is types.Ty.TInt {
 		if op is ast.BinOp.Add { return "hive.AddInt(" + l + ", " + r + ")" }
 		if op is ast.BinOp.Sub { return "hive.SubInt(" + l + ", " + r + ")" }
 		if op is ast.BinOp.Mul { return "hive.MulInt(" + l + ", " + r + ")" }
 	}
 	if op is ast.BinOp.Add {
+		if isPacked(ty) {
+			return "hive.ConcatPacked(" + l + ", " + r + ")"
+		}
 		if ty is types.Ty.TVec(_, _) {
 			return "hive.Concat(" + l + ", " + r + ")"
 		}
@@ -2100,6 +2551,35 @@ proc arithmetic(em: mut Emit, env: infer.Env, op: ast.BinOp, l: Str, r: Str, ty:
 		return "hive.PowInt(" + l + ", " + r + ")"
 	}
 	return "(" + l + " + " + r + ")"
+}
+
+// `UInt4(x)` keeps the low bits; a call rather than a Go conversion, so a literal
+// that does not fit wraps instead of being refused by Go.
+func conversion(target: types.Ty, written: Str): Str {
+	if target is types.Ty.TFloat32 {
+		return "hive.ToFloat32(" + written + ")"
+	}
+	if target is types.Ty.TFloat {
+		return "float64(" + written + ")"
+	}
+	return trimmed(target, "hive.Narrow[" + goType(target) + "](" + written + ")")
+}
+
+// `UInt4.checked(x)`: the same trim, and `Error(x)` where it changed the value.
+func checkedConversion(target: types.Ty, written: Str): Str {
+	if target is types.Ty.TSized(false, bits) {
+		return "hive.CheckedU[" + goType(target) + "](" + written + ", {bits})"
+	}
+	return "hive.CheckedS[" + goType(target) + "](" + written + ", {containerBits(types.bitsOf(target)) - types.bitsOf(target)})"
+}
+
+func sizedOp(op: ast.BinOp): Str {
+	if op is ast.BinOp.Add { return "Add" }
+	if op is ast.BinOp.Sub { return "Sub" }
+	if op is ast.BinOp.Mul { return "Mul" }
+	if op is ast.BinOp.Div { return "DivWhole" }
+	if op is ast.BinOp.Mod { return "ModWhole" }
+	return "PowWhole"
 }
 
 // A scalar compares with Go's own `==`; anything that owns storage compares
@@ -2140,7 +2620,7 @@ proc call(em: mut Emit, env: infer.Env, callee: ast.Expr, args: ast.Arg[], want:
 	// Calling an address is a send and a wait for the answer. Nothing bounded
 	// this one, so syslink waits its own default.
 	if isAddress(env, callee) {
-		return "hive.SyslinkAwait(" + pendingSend(em, env, callee, args) + ", 0)"
+		return answered("hive.SyslinkAwait(" + pendingSend(em, env, callee, args) + ", 0)")
 	}
 	if callee is ast.Expr.Ident(name) {
 		return namedCall(em, env, name, args, want)
@@ -2148,7 +2628,15 @@ proc call(em: mut Emit, env: infer.Env, callee: ast.Expr, args: ast.Arg[], want:
 	if callee is ast.Expr.Member(subject, field) {
 		return memberCall(em, env, subject, field, args, want)
 	}
-	return expr(em, env, callee, types.Ty.TUnknown()) + "(" + valueArgs(em, env, infer.typeOf(env, callee), args) + ")"
+	calleeType := infer.typeOf(env, callee)
+	return lendingCall(em, expr(em, env, callee, types.Ty.TUnknown()) + "(" + valueArgs(em, env, calleeType, args) + ")", answerOf(calleeType))
+}
+
+func answerOf(fn: types.Ty): types.Ty {
+	if fn is types.Ty.TFn(_, _, _, result) {
+		return result
+	}
+	return types.Ty.TUnknown()
 }
 
 proc namedCall(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[], want: types.Ty): Str {
@@ -2161,16 +2649,16 @@ proc namedCall(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[], want: t
 		answer := types.resolve(env.table, info.result)
 		if em.ferrying == false && (answer is types.Ty.TVoid || concrete(answer)) && writtenOutOfOrder(args, names) {
 			mut types.Ty[dyn] tys = []
-			mut Bool[dyn] mutexes = []
+			mut Bool[dyn] mutables = []
 			for each p in info.params {
 				append(tys, types.resolve(env.table, p.declared))
-				append(mutexes, p.mutex)
+				append(mutables, p.mutable)
 			}
-			h := hoist(em, env, args, names, tys, mutexes, lends(em, name))
-			inner := goIdent(name) + "(" + orderedArgs(em, h.env, info, h.args) + ")"
+			h := hoist(em, env, args, names, tys, mutables, lends(em, name))
+			inner := lendingCall(em, goIdent(name) + "(" + orderedArgs(em, h.env, info, h.args) + ")", answer)
 			return inWrittenOrder(h, goResult(answer), inner)
 		}
-		return goIdent(name) + "(" + orderedArgs(em, env, info, args) + ")"
+		return lendingCall(em, goIdent(name) + "(" + orderedArgs(em, env, info, args) + ")", answer)
 	}
 	if target is infer.CallTarget.Struct(fields) {
 		return structLiteral(em, env, name, fields, args)
@@ -2178,7 +2666,8 @@ proc namedCall(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[], want: t
 	if target is infer.CallTarget.Builtin {
 		return builtin(em, env, name, args, want)
 	}
-	return goIdent(name) + "(" + valueArgs(em, env, infer.typeOf(env, ast.Expr.Ident(name)), args) + ")"
+	fn := infer.typeOf(env, ast.Expr.Ident(name))
+	return lendingCall(em, goIdent(name) + "(" + valueArgs(em, env, fn, args) + ")", answerOf(fn))
 }
 
 // Every `decode` is the same call with a different decoder: the text, and what
@@ -2232,7 +2721,7 @@ proc withCodec(em: mut Emit, env: infer.Env, value: Str, codec: ast.Expr): Str {
 // codec carries.
 proc jwtSecret(em: mut Emit, env: infer.Env, codec: ast.Expr): Str {
 	if stdlib.codecFormat(codec) == "jwt" {
-		return expr(em, env, stdlib.codecSecret(codec), types.Ty.TSecret())
+		return expr(em, env, stdlib.codecSecret(codec), types.Ty.TSecret(types.Ty.TStr()))
 	}
 	return expr(em, env, codec, infer.typeOf(env, codec)) + ".Secret"
 }
@@ -2256,6 +2745,9 @@ proc memberCall(em: mut Emit, env: infer.Env, subject: ast.Expr, field: Str, arg
 		// `Shape.Circle(5)` builds a variant.
 		if types.findVariant(env.table, head, field) is Result.Ok(fields) {
 			return variantLiteral(em, env, head, field, fields, args)
+		}
+		if field == "checked" && infer.isConversion(head) && types.findType(env.table, head) is Result.Error(_) {
+			return checkedConversion(infer.conversionType(head), expr(em, env, argExpr(args, 0), types.Ty.TUnknown()))
 		}
 	}
 	if subject is ast.Expr.Member(root, module) {
@@ -2284,8 +2776,8 @@ proc memberCall(em: mut Emit, env: infer.Env, subject: ast.Expr, field: Str, arg
 			}
 		}
 	}
-	return member(em, env, subject, field) + "("
-		+ valueArgs(em, env, infer.typeOf(env, ast.Expr.Member(subject, field)), args) + ")"
+	fn := infer.typeOf(env, ast.Expr.Member(subject, field))
+	return lendingCall(em, member(em, env, subject, field) + "(" + valueArgs(em, env, fn, args) + ")", answerOf(fn))
 }
 
 // One event attribute. What the user did is reported as one parameter per thing
@@ -2457,7 +2949,7 @@ func writtenOutOfOrder(args: ast.Arg[], names: Str[]): Bool {
 	return false
 }
 
-proc hoist(em: mut Emit, env: infer.Env, args: ast.Arg[], names: Str[], tys: types.Ty[], mutexes: Bool[], lent: Bool): Hoisted {
+proc hoist(em: mut Emit, env: infer.Env, args: ast.Arg[], names: Str[], tys: types.Ty[], mutables: Bool[], lent: Bool): Hoisted {
 	slots := slotsOf(args, names)
 	mut Str[dyn] params = []
 	mut Str[dyn] values = []
@@ -2474,8 +2966,8 @@ proc hoist(em: mut Emit, env: infer.Env, args: ast.Arg[], names: Str[], tys: typ
 		if tys bounds slot {
 			ty = tys[slot]
 		}
-		// A mutex argument is an address, which nothing can move.
-		if types.mutexAt(mutexes, slot) || settled(a.value) || concrete(ty) == false {
+		// A `mut` argument is an address, which nothing can move.
+		if types.mutableAt(mutables, slot) || settled(a.value) || concrete(ty) == false {
 			append(inner, a)
 			continue
 		}
@@ -2565,6 +3057,8 @@ proc orderedArgs(em: mut Emit, env: infer.Env, info: types.CallableInfo, args: a
 	ferry := takeFerry(em)
 	handing := em.handing
 	em.handing = ""
+	mut Str[dyn] fronts = []
+	mut Str[dyn] backs = []
 	mut Str[dyn] out = []
 	mut open := 0
 	for each p in info.params {
@@ -2582,15 +3076,17 @@ proc orderedArgs(em: mut Emit, env: infer.Env, info: types.CallableInfo, args: a
 		if found is ast.Expr.Absent {
 			ferryThis = false
 		}
-		// A thread of its own is handed copies, and a mutex parameter takes the
+		// A thread of its own is handed copies, and a `mut` parameter takes the
 		// address of the copy rather than of what it was made from.
 		if ferryThis {
 			written = ferried(em, env, found, ty, written)
-			if p.mutex {
+			if p.mutable {
 				written = "&" + written
 			}
-		} else if p.mutex {
-			// A mutex parameter takes the caller's own storage, which is its
+		} else if p.mutable && packedElement(env, found) {
+			written = lendElement(em, env, found, fronts, backs)
+		} else if p.mutable {
+			// A `mut` parameter takes the caller's own storage, which is its
 			// address — and if the caller's name is itself a pointer, the address
 			// it already holds.
 			written = addressOf(em, found, written)
@@ -2601,7 +3097,47 @@ proc orderedArgs(em: mut Emit, env: infer.Env, info: types.CallableInfo, args: a
 		}
 		append(out, written)
 	}
+	em.fronts = fronts
+	em.backs = backs
 	return join(out, ", ")
+}
+
+func packedElement(env: infer.Env, e: ast.Expr): Bool {
+	if e is ast.Expr.Index(subject, _) {
+		return isPacked(infer.typeOf(env, subject))
+	}
+	return false
+}
+
+// A packed element has no address, so it is lent as a copy `lendingCall` writes back.
+proc lendElement(em: mut Emit, env: infer.Env, found: ast.Expr, fronts: mut Str[dyn], backs: mut Str[dyn]): Str {
+	if found is ast.Expr.Index(subject, index) {
+		holder := fresh(em, "p")
+		at := fresh(em, "i")
+		element := fresh(em, "t")
+		append(fronts, holder + " := &" + expr(em, env, subject, types.Ty.TUnknown()))
+		append(fronts, at + " := " + expr(em, env, index, types.Ty.TInt()))
+		append(fronts, element + " := " + holder + ".At(" + at + ")")
+		append(backs, "hive.PutBack(" + holder + ", " + at + ", " + element + ")")
+		return "&" + element
+	}
+	return ""
+}
+
+// A function literal around the call, so an expression can hold the write-backs.
+proc lendingCall(em: mut Emit, written: Str, answer: types.Ty): Str {
+	if len(em.fronts) == 0 {
+		return written
+	}
+	fronts := join(em.fronts, "; ")
+	backs := join(em.backs, "; ")
+	em.fronts = []
+	em.backs = []
+	if answer is types.Ty.TVoid {
+		return "func() \{ " + fronts + "; " + written + "; " + backs + " }()"
+	}
+	kept := fresh(em, "r")
+	return "func() " + goType(answer) + " \{ " + fronts + "; " + kept + " := " + written + "; " + backs + "; return " + kept + " }()"
 }
 
 // Whether this callee may be handed the caller's own storage rather than a copy
@@ -2614,7 +3150,7 @@ proc lends(em: mut Emit, name: Str): Bool {
 	return indexOf(em.lent, name) is Result.Ok(_)
 }
 
-// The address of storage a mutex parameter is being handed. A name that is
+// The address of storage a `mut` parameter is being handed. A name that is
 // already a pointer is passed on as it stands.
 proc addressOf(em: mut Emit, found: ast.Expr, written: Str): Str {
 	if found is ast.Expr.Ident(name) {
@@ -2627,12 +3163,14 @@ proc addressOf(em: mut Emit, found: ast.Expr, written: Str): Str {
 
 proc valueArgs(em: mut Emit, env: infer.Env, callee: types.Ty, args: ast.Arg[]): Str {
 	mut types.Ty[dyn] params = []
-	mut Bool[dyn] mutexes = []
+	mut Bool[dyn] mutables = []
 	if callee is types.Ty.TFn(_, declared, marked, _) {
 		params = declared
-		mutexes = marked
+		mutables = marked
 	}
 	ferry := takeFerry(em)
+	mut Str[dyn] fronts = []
+	mut Str[dyn] backs = []
 	mut Str[dyn] out = []
 	mut i := 0
 	for each a in args {
@@ -2640,14 +3178,16 @@ proc valueArgs(em: mut Emit, env: infer.Env, callee: types.Ty, args: ast.Arg[]):
 		if params bounds i {
 			ty = params[i]
 		}
-		mutex := types.mutexAt(mutexes, i)
+		mutable := types.mutableAt(mutables, i)
 		mut written := expr(em, env, a.value, ty)
 		if ferry {
 			written = ferried(em, env, a.value, ty, written)
-			if mutex {
+			if mutable {
 				written = "&" + written
 			}
-		} else if mutex {
+		} else if mutable && packedElement(env, a.value) {
+			written = lendElement(em, env, a.value, fronts, backs)
+		} else if mutable {
 			written = addressOf(em, a.value, written)
 		} else if isMutableSource(em, a.value) && types.ownsStorage(env.table, ty) {
 			written = cloned(env.table, ty, written)
@@ -2655,6 +3195,8 @@ proc valueArgs(em: mut Emit, env: infer.Env, callee: types.Ty, args: ast.Arg[]):
 		append(out, written)
 		i = i + 1
 	}
+	em.fronts = fronts
+	em.backs = backs
 	return join(out, ", ")
 }
 
@@ -2685,11 +3227,11 @@ func hasHole(args: ast.Arg[]): Bool {
 proc partial(em: mut Emit, env: infer.Env, callee: ast.Expr, args: ast.Arg[], want: types.Ty): Str {
 	whole := infer.typeOf(env, ast.Expr.Call(callee, copiedArgs(args)))
 	mut types.Ty[dyn] holeTypes = []
-	mut Bool[dyn] holeMutexes = []
+	mut Bool[dyn] holeMutables = []
 	mut resultType := types.Ty.TUnknown()
 	if whole is types.Ty.TFn(_, holes, marked, r) {
 		holeTypes = holes
-		holeMutexes = marked
+		holeMutables = marked
 		resultType = r
 	}
 
@@ -2710,7 +3252,7 @@ proc partial(em: mut Emit, env: infer.Env, callee: ast.Expr, args: ast.Arg[], wa
 				// A hole's type is the parameter it stands in for.
 				holeType = holeTypes[at]
 			}
-			if types.mutexAt(holeMutexes, at) {
+			if types.mutableAt(holeMutables, at) {
 				append(em.pointers, holeName)
 				append(em.mutables, holeName)
 				append(params, holeName + " *" + goType(holeType))
@@ -2763,11 +3305,11 @@ proc builtin(em: mut Emit, env: infer.Env, name: Str, written: ast.Arg[], want: 
 		answer := infer.typeOf(env, ast.Expr.Call(ast.Expr.Member(ast.Expr.Ident("hive"), name), copiedArgs(written)))
 		if answer is types.Ty.TVoid || concrete(answer) {
 			// What a builtin grows in place is its caller's own storage.
-			mut Bool[dyn] mutexes = []
+			mut Bool[dyn] mutables = []
 			if name == "append" || name == "prepend" || name == "drop" {
-				mutexes = [true]
+				mutables = [true]
 			}
-			h := hoist(em, env, written, names, infer.typesOfArgs(env, infer.builtinArgs(name, written)), mutexes, true)
+			h := hoist(em, env, written, names, infer.typesOfArgs(env, infer.builtinArgs(name, written)), mutables, true)
 			return inWrittenOrder(h, goResult(answer), builtin(em, h.env, name, h.args, want))
 		}
 	}
@@ -2782,10 +3324,11 @@ proc builtin(em: mut Emit, env: infer.Env, name: Str, written: ast.Arg[], want: 
 	if name == "len" {
 		if firstType is types.Ty.TStr { return "hive.LenStr(" + a + ")" }
 		if firstType is types.Ty.TMap(_, _) { return "(" + a + ").Len()" }
-		return "len(" + a + ")"
+		return lengthIn(firstType, a)
 	}
 	if name == "bytes" {
 		if firstType is types.Ty.TStr { return "len(" + a + ")" }
+		if isPacked(firstType) { return a + ".Bytes()" }
 		return "hive.Bytes(" + a + ")"
 	}
 	if name == "join" {
@@ -2803,7 +3346,11 @@ proc builtin(em: mut Emit, env: infer.Env, name: Str, written: ast.Arg[], want: 
 		if firstType is types.Ty.TStr {
 			return "hive.IndexOfStr(" + a + ", " + expr(em, env, argExpr(args, 1), types.Ty.TStr()) + ")"
 		}
-		return "hive.IndexOfVec(" + a + ", " + expr(em, env, argExpr(args, 1), types.elementOf(firstType)) + ")"
+		sought := expr(em, env, argExpr(args, 1), types.elementOf(firstType))
+		if isPacked(firstType) {
+			return a + ".IndexOf(" + sought + ")"
+		}
+		return "hive.IndexOfVec(" + a + ", " + sought + ")"
 	}
 	if name == "row" {
 		return "hive.Row(" + a + ", " + expr(em, env, argExpr(args, 1), types.Ty.TStr()) + ")"
@@ -2814,15 +3361,34 @@ proc builtin(em: mut Emit, env: infer.Env, name: Str, written: ast.Arg[], want: 
 	if name == "toTable" {
 		return "hive.ToTable(" + a + ", " + expr(em, env, argExpr(args, 1), types.Ty.TInt()) + ")"
 	}
+	if infer.isConversion(name) {
+		return conversion(infer.conversionType(name), a)
+	}
 	if name == "hide" {
 		useModule(em, "secret")
-		return "hive.Hide(" + a + ")"
+		answer := types.Ty.TResult(types.Ty.TSecret(firstType), types.secretError())
+		if firstType is types.Ty.TStr {
+			return lifted(answer, "hive.Hide(" + a + ")")
+		}
+		useModule(em, "secretvalue")
+		return lifted(answer, "hive.HideWith(" + a + ", " + secretPutter(em, firstType) + ")")
 	}
 	if name == "reveal" {
+		if firstType is types.Ty.TSecret(held) {
+			if held is types.Ty.TStr {
+				return "hive.Reveal(" + a + ")"
+			}
+			useModule(em, "secretvalue")
+			return "hive.RevealWith(" + a + ", " + secretTaker(em, held) + ")"
+		}
 		return "hive.Reveal(" + a + ")"
 	}
 	if name == "bypass" {
-		return "hive.Bypass(" + a + ")"
+		if firstType is types.Ty.TStr {
+			return "hive.Bypass(" + a + ")"
+		}
+		useModule(em, "secretvalue")
+		return "hive.BypassWith(" + a + ", " + secretPutter(em, firstType) + ")"
 	}
 	// The one builtin that is not a call on the runtime package: the encoder is
 	// written out of the argument's static type and the format its second
@@ -2856,25 +3422,39 @@ proc builtin(em: mut Emit, env: infer.Env, name: Str, written: ast.Arg[], want: 
 
 proc walkBuiltin(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[], a: Str, firstType: types.Ty): Str {
 	second := expr(em, env, argExpr(args, 1), types.Ty.TUnknown())
+	values := unpacked(firstType, a)
+	mut answer := types.Ty.TUnknown()
+	if infer.typeOf(env, argExpr(args, 1)) is types.Ty.TFn(_, _, _, made) {
+		answer = types.Ty.TVec(made, ast.Dim.Dynamic())
+		if made is types.Ty.TResult(kept, _) {
+			if name == "filterMap" {
+				answer = types.Ty.TVec(kept, ast.Dim.Dynamic())
+			}
+		}
+	}
 	if name == "map" {
-		return "hive.Map(" + a + ", " + second + ")"
+		return packed(answer, "hive.Map(" + values + ", " + second + ")")
 	}
 	if name == "filter" {
-		return "hive.Filter(" + a + ", " + second + ")"
+		return packed(firstType, "hive.Filter(" + values + ", " + second + ")")
 	}
 	if name == "filterMap" {
-		return "hive.FilterMap(" + a + ", " + second + ")"
+		return packed(answer, "hive.FilterMap(" + values + ", " + second + ")")
+	}
+	mut tail := ""
+	if isPacked(firstType) {
+		tail = "Packed"
 	}
 	if name == "sort" {
 		if len(args) == 2 {
-			return "hive.SortBy(" + a + ", " + second + ")"
+			return "hive.Sort" + tail + "By(" + a + ", " + second + ")"
 		}
-		return "hive.Sort(" + a + ")"
+		return "hive.Sort" + tail + "(" + a + ")"
 	}
 	// `drop` is both a value and a write: what it hands back is what it removed,
 	// which is the ordinary way to take elements off a vector and keep them.
 	if name == "drop" {
-		return "hive.Drop(&" + a + ", " + expr(em, env, argExpr(args, 1), types.Ty.TInt()) + ", " + expr(em, env, argExpr(args, 2), types.Ty.TInt()) + ")"
+		return "hive.Drop" + tail + "(&" + a + ", " + expr(em, env, argExpr(args, 1), types.Ty.TInt()) + ", " + expr(em, env, argExpr(args, 2), types.Ty.TInt()) + ")"
 	}
 	// `append` and `prepend` hand nothing back — the vector you gave them is the
 	// result — so they may only stand as a statement of their own.
@@ -3101,7 +3681,12 @@ func goSideName(flat: Str): Str {
 // so the decoder for a reply is the one its mailbox already uses.
 
 func isAddress(env: infer.Env, e: ast.Expr): Bool {
-	return infer.typeOf(env, e) is types.Ty.TAddress
+	return infer.typeOf(env, e) is types.Ty.TAddress(_)
+}
+
+// A send's answer as the program reads it, its failure lifted into the union.
+func answered(waited: Str): Str {
+	return lifted(types.Ty.TResult(types.Ty.TUnknown(), infer.syslinkError()), waited)
 }
 
 // Whether this expression is a call *of an address*, which is a send rather
@@ -3117,7 +3702,7 @@ func isSend(env: infer.Env, e: ast.Expr): Bool {
 // `0` where nothing bounded the wait, which leaves syslink its own patience.
 proc sendAndWait(em: mut Emit, env: infer.Env, call: ast.Expr, ms: Str): Str {
 	if call is ast.Expr.Call(callee, args) {
-		return "hive.SyslinkAwait(" + pendingSend(em, env, callee, args) + ", " + ms + ")"
+		return answered("hive.SyslinkAwait(" + pendingSend(em, env, callee, args) + ", " + ms + ")")
 	}
 	return expr(em, env, call, types.Ty.TUnknown())
 }
@@ -3125,7 +3710,7 @@ proc sendAndWait(em: mut Emit, env: infer.Env, call: ast.Expr, ms: Str): Str {
 proc pendingSend(em: mut Emit, env: infer.Env, address: ast.Expr, args: ast.Arg[]): Str {
 	useModule(em, "syslink")
 	message := argExpr(args, 0)
-	ty := infer.typeOf(env, message)
+	ty := infer.mailboxOf(env, infer.typeOf(env, address), args)
 	return "hive.SyslinkSendAwaitable(" + expr(em, env, address, types.Ty.TUnknown()) + ", "
 		+ carried(em, env, message, ty) + ", " + syslinkEncoder(em, ty) + ", "
 		+ syslinkDigest(em, ty) + ", hive.SyslinkReplyDecoder(" + decoderRef(em, ty) + "))"
@@ -3151,7 +3736,7 @@ proc awaitAllSends(em: mut Emit, env: infer.Env, calls: ast.Expr[], timeout: ast
 	for each c in calls {
 		if c is ast.Expr.Call(address, args) {
 			append(pending, pendingSend(em, env, address, args))
-			element = infer.typeOf(env, argExpr(args, 0))
+			element = infer.mailboxOf(env, infer.typeOf(env, address), args)
 		}
 	}
 	mut ms := "0"
@@ -3159,7 +3744,8 @@ proc awaitAllSends(em: mut Emit, env: infer.Env, calls: ast.Expr[], timeout: ast
 	} else {
 		ms = expr(em, env, timeout, types.Ty.TInt())
 	}
-	return "hive.SyslinkAwaitAll[" + goType(element) + "]([]*hive.SyslinkPending[" + goType(element) + "]\{" + join(pending, ", ") + "}, " + ms + ")"
+	return lifted(types.Ty.TVec(types.Ty.TResult(element, infer.syslinkError()), ast.Dim.Dynamic()),
+		"hive.SyslinkAwaitAll[" + goType(element) + "]([]*hive.SyslinkPending[" + goType(element) + "]\{" + join(pending, ", ") + "}, " + ms + ")")
 }
 
 // A cast: a send with nothing to hold the answer, which allocates nothing and
@@ -3208,13 +3794,12 @@ proc syslinkDigest(em: mut Emit, ty: types.Ty): Str {
 // accept, never what an encoder writes.
 proc signatureOf(em: mut Emit, ty: types.Ty, seen: Str[]): Str {
 	if ty is types.Ty.TStr { return "Str" }
-	if ty is types.Ty.TInt { return "Int" }
-	if ty is types.Ty.TFloat { return "Float" }
+	if types.isNumber(ty) { return types.show(ty) }
 	if ty is types.Ty.TBool { return "Bool" }
 	if ty is types.Ty.TAtom { return "Atom" }
 	if ty is types.Ty.TVoid { return "void" }
 	if ty is types.Ty.TLib(_, _) { return types.show(ty) }
-	if ty is types.Ty.TAddress { return "Address" }
+	if ty is types.Ty.TAddress(_) { return "Address" }
 	if ty is types.Ty.TVec(element, dim) {
 		return signatureOf(em, element, seen) + types.showDim(dim)
 	}
@@ -3256,8 +3841,9 @@ proc serviceBuiltin(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[]): S
 		if len(args) == 3 {
 			registered = expr(em, env, argExpr(args, 2), types.Ty.TAtom())
 		}
-		return "hive." + addressedName("SyslinkSpawn", env, handler) + "(" + expr(em, env, handler, types.Ty.TUnknown()) + ", "
+		started := "hive." + addressedName("SyslinkSpawn", env, handler) + "(" + expr(em, env, handler, types.Ty.TUnknown()) + ", "
 			+ registered + ", " + serviceTail(em, env, handler, argExpr(args, 1)) + ")"
+		return lifted(types.Ty.TResult(types.Ty.TUnknown(), infer.syslinkError()), started)
 	}
 	if name == "at" {
 		if len(args) == 2 {
@@ -3266,7 +3852,7 @@ proc serviceBuiltin(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[]): S
 		}
 		return "hive.SyslinkAt(" + expr(em, env, argExpr(args, 0), types.Ty.TAtom()) + ")"
 	}
-	return "hive.SyslinkKill(" + expr(em, env, argExpr(args, 0), types.Ty.TAddress()) + ")"
+	return "hive.SyslinkKill(" + expr(em, env, argExpr(args, 0), types.Ty.TAddress(types.Ty.TUnknown())) + ")"
 }
 
 func addressedName(base: Str, env: infer.Env, handler: ast.Expr): Str {
@@ -3309,7 +3895,7 @@ func answerCopier(t: types.Table, message: types.Ty): Str {
 //
 // Four things are left out, each because the proof does not reach them:
 //
-//   * a callable with a mutex parameter, which it may write through;
+//   * a callable with a `mut` parameter, which it may write through;
 //   * a `query` and an imported Go `func` — a query keeps its arguments in the
 //     fragment it answers with, and the Go boundary copies for reasons of its own;
 //   * a result that carries storage, or holds a function value, since one can be a
@@ -3323,7 +3909,7 @@ proc lentFuncs(t: types.Table, decls: ast.Decl[]): Str[dyn] {
 	mut Str[dyn] out = []
 	for each d in decls {
 		if d is ast.Decl.CallableDecl(_, name, params, result, _, _) {
-			if takesNoMutex(params) && carriesStorage(t, types.resolve(t, result)) == false {
+			if takesNoMutable(params) && carriesStorage(t, types.resolve(t, result)) == false {
 				if indexOf(threading, name) is Result.Error(_) {
 					append(out, name)
 				}
@@ -3333,7 +3919,7 @@ proc lentFuncs(t: types.Table, decls: ast.Decl[]): Str[dyn] {
 	return out
 }
 
-// `x = f(x)`: whatever of the argument outlives a call without a mutex parameter
+// `x = f(x)`: whatever of the argument outlives a call without a `mut` parameter
 // or a thread is in its result, which lands back in `x`. A function value in the
 // result could hold the argument as it stood, so none may be reachable there.
 proc handingBackFuncs(t: types.Table, decls: ast.Decl[]): Str[dyn] {
@@ -3341,7 +3927,7 @@ proc handingBackFuncs(t: types.Table, decls: ast.Decl[]): Str[dyn] {
 	mut Str[dyn] out = []
 	for each d in decls {
 		if d is ast.Decl.CallableDecl(_, name, params, result, _, _) {
-			if takesNoMutex(params) && reachesFn(t, types.resolve(t, result), []) == false {
+			if takesNoMutable(params) && reachesFn(t, types.resolve(t, result), []) == false {
 				if indexOf(threading, name) is Result.Error(_) {
 					append(out, name)
 				}
@@ -3351,9 +3937,9 @@ proc handingBackFuncs(t: types.Table, decls: ast.Decl[]): Str[dyn] {
 	return out
 }
 
-func takesNoMutex(params: ast.Param[]): Bool {
+func takesNoMutable(params: ast.Param[]): Bool {
 	for each p in params {
-		if p.mutex {
+		if p.mutable {
 			return false
 		}
 	}
@@ -3390,7 +3976,7 @@ func reachesFn(t: types.Table, ty: types.Ty, seen: Str[]): Bool {
 	return false
 }
 
-// A mutex parameter, or a `mut` local sharing its storage with no other name.
+// A `mut` parameter, or a `mut` local sharing its storage with no other name.
 func handsBack(env: infer.Env, eligible: Str[], writable: Str[], cells: Str[], target: ast.Expr, value: ast.Expr): Bool {
 	path := pathOf(target)
 	root := rootOf(target)
@@ -3624,6 +4210,12 @@ proc scanExpr(e: ast.Expr, sc: mut Scan, env: infer.Env): void {
 		scanExpr(operand, sc, env)
 	} else if e is ast.Expr.Not(operand) {
 		scanExpr(operand, sc, env)
+	} else if e is ast.Expr.BitNot(operand) {
+		scanExpr(operand, sc, env)
+	} else if e is ast.Expr.Bits(parts) {
+		for each part in parts {
+			scanExpr(part.value, sc, env)
+		}
 	} else if e is ast.Expr.Binary(_, left, right) {
 		scanExpr(left, sc, env)
 		scanExpr(right, sc, env)
@@ -3636,8 +4228,11 @@ proc scanExpr(e: ast.Expr, sc: mut Scan, env: infer.Env): void {
 		scanExpr(subject, sc, env)
 		scanExpr(low, sc, env)
 		scanExpr(high, sc, env)
-	} else if e is ast.Expr.IsMatch(subject, _) {
+	} else if e is ast.Expr.IsMatch(subject, pattern) {
 		scanExpr(subject, sc, env)
+		for each held in ast.patternExprs(pattern) {
+			scanExpr(held, sc, env)
+		}
 	} else if e is ast.Expr.AwaitAll(calls, timeout) {
 		// A barrier runs every call in it on a thread of its own.
 		if anyHandsThread(env, calls) { sc.spawns = true }
@@ -3843,6 +4438,10 @@ proc rowMapper(em: mut Emit, rows: types.Ty): Str {
 func cellConvert(ty: types.Ty, cell: Str, column: Str): Str {
 	if ty is types.Ty.TInt { return "hive.SqlCellInt(" + cell + ", " + column + ")" }
 	if ty is types.Ty.TFloat { return "hive.SqlCellFloat(" + cell + ", " + column + ")" }
+	if ty is types.Ty.TFloat32 { return "hive.SqlCellFloat32(" + cell + ", " + column + ")" }
+	if ty is types.Ty.TSized(signed, bits) {
+		return "hive.SqlCellSized[" + goType(ty) + "](" + cell + ", " + column + ", {signed}, {bits}, " + quoted(types.show(ty)) + ")"
+	}
 	if ty is types.Ty.TBool { return "hive.SqlCellBool(" + cell + ", " + column + ")" }
 	// Anything else arrives as the text it was: a row holds cells, and a cell is
 	// a scalar.
@@ -3934,6 +4533,13 @@ proc emitCodecsFrom(em: mut Emit, from: Int): void {
 // a dot — the second being what `T.Variant.decode` asks for. A variant needs a
 // decoder alone: it is read into the union its type already encodes.
 proc emitCodec(em: mut Emit, name: Str): void {
+	if text.startsWith(name, "secret:") {
+		typeName := text.span(text.chars(name), 7, len(name) - 1)
+		if types.findType(em.table, typeName) is Result.Ok(info) {
+			emitSecretForm(em, typeName, info)
+		}
+		return
+	}
 	for each format in ["query", "term"] {
 		if text.startsWith(name, format + ":") {
 			typeName := text.span(text.chars(name), len(format) + 1, len(name) - 1)
@@ -4158,7 +4764,7 @@ proc decodeFields(em: mut Emit, fields: ast.Field[], path: Str, zero: Str): void
 			// rather than insisting, and reads a `null` as the same nothing an absent
 			// key is. What it does not excuse is a value of the wrong type: a default
 			// stands in for something not said, never for something said wrongly.
-			line(em, "{held} := " + literal(em, f.marks.fallback))
+			line(em, "{held} := " + typedLiteral(em, ty, f.marks.fallback))
 			open(em, "if " + raw + ", found := hive.JsonLook(obj, " + quoted(key) + "); found && " + raw + ".Kind != 'n' \{")
 			line(em, "got, jerr := " + decoderRef(em, ty) + "(" + raw + ", " + where + ")")
 			bailOut(em, zero)
@@ -4166,6 +4772,15 @@ proc decodeFields(em: mut Emit, fields: ast.Field[], path: Str, zero: Str): void
 			close(em, "}")
 		}
 	}
+}
+
+// A `Default` written as the field's own Go type, which Go would otherwise read
+// as an `int` or a `float64`.
+proc typedLiteral(em: mut Emit, ty: types.Ty, e: ast.Expr): Str {
+	if ty is types.Ty.TSized(_, _) || ty is types.Ty.TFloat32 {
+		return goType(ty) + "(" + literal(em, e) + ")"
+	}
+	return literal(em, e)
 }
 
 // A `Default`'s literal, as the Go value it stands for. The parser accepts
@@ -4194,6 +4809,10 @@ proc decoderRef(em: mut Emit, ty: types.Ty): Str {
 	if ty is types.Ty.TStr { return "hive.JsonStr" }
 	if ty is types.Ty.TInt { return "hive.JsonInt" }
 	if ty is types.Ty.TFloat { return "hive.JsonFloat" }
+	if ty is types.Ty.TFloat32 { return "hive.JsonFloat32" }
+	if ty is types.Ty.TSized(signed, bits) {
+		return "func(v hive.JsonValue, p string) (" + goType(ty) + ", *hive.JsonJsonError) \{ return hive.JsonSized[" + goType(ty) + "](v, p, {signed}, {bits}, " + quoted(types.show(ty)) + ") }"
+	}
 	if ty is types.Ty.TBool { return "hive.JsonBool" }
 	if ty is types.Ty.TAtom { return "hive.JsonAtom" }
 	// The check pass catches `encode` and `T.decode`; this is a message type's.
@@ -4201,7 +4820,7 @@ proc decoderRef(em: mut Emit, ty: types.Ty): Str {
 		fail(em, stdlib.tableHasNoJson())
 		return "hive.JsonStr"
 	}
-	if ty is types.Ty.TSecret {
+	if ty is types.Ty.TSecret(_) {
 		fail(em, stdlib.secretHasNoJson())
 		return "hive.JsonStr"
 	}
@@ -4218,6 +4837,9 @@ proc decoderRef(em: mut Emit, ty: types.Ty): Str {
 			// A declared length is a promise, so a document that does not keep it
 			// is an error rather than a shorter vector.
 			call = "hive.JsonVecN(v, p, {n}, " + inner + ")"
+		}
+		if isPacked(ty) {
+			return "func(v hive.JsonValue, p string) (" + goType(ty) + ", *hive.JsonJsonError) \{ r, e := " + call + "; return " + packed(ty, "r") + ", e }"
 		}
 		return "func(v hive.JsonValue, p string) (" + goType(ty) + ", *hive.JsonJsonError) \{ return " + call + " }"
 	}
@@ -4266,13 +4888,15 @@ proc encodeOf(em: mut Emit, ty: types.Ty, value: Str, depth: Int): Str {
 	if ty is types.Ty.TStr { return "hive.JsonEncodeStr(" + value + ")" }
 	if ty is types.Ty.TInt { return "hive.JsonEncodeInt(" + value + ")" }
 	if ty is types.Ty.TFloat { return "hive.JsonEncodeFloat(" + value + ")" }
+	if ty is types.Ty.TFloat32 { return "hive.Float32Text(" + value + ")" }
+	if ty is types.Ty.TSized(_, _) { return "hive.WholeText(" + value + ")" }
 	if ty is types.Ty.TBool { return "hive.JsonEncodeBool(" + value + ")" }
 	if ty is types.Ty.TAtom { return "hive.JsonEncodeAtom(" + value + ")" }
 	if types.isTable(ty) {
 		fail(em, stdlib.tableHasNoJson())
 		return "\"null\""
 	}
-	if ty is types.Ty.TSecret {
+	if ty is types.Ty.TSecret(_) {
 		fail(em, stdlib.secretHasNoJson())
 		return "\"null\""
 	}
@@ -4284,7 +4908,7 @@ proc encodeOf(em: mut Emit, ty: types.Ty, value: Str, depth: Int): Str {
 	}
 	if ty is types.Ty.TVec(element, _) {
 		item := "e{depth}"
-		return "hive.JsonEncodeVec(" + value + ", func(" + item + " " + goType(element) + ") string \{ return " + encodeOf(em, element, item, depth + 1) + " })"
+		return "hive.JsonEncodeVec(" + unpacked(ty, value) + ", func(" + item + " " + goType(element) + ") string \{ return " + encodeOf(em, element, item, depth + 1) + " })"
 	}
 	if ty is types.Ty.TMap(_, _) {
 		fail(em, "a map does not encode: its keys are whatever was put in it, while everything else here is read from a declaration. Send its pairs as a vector of a type declared for them")
@@ -4292,6 +4916,120 @@ proc encodeOf(em: mut Emit, ty: types.Ty, value: Str, depth: Int): Str {
 	}
 	// Anything with no static shape is encoded from what it turns out to be.
 	return "hive.JsonEncodeDynamic(" + value + ")"
+}
+
+// --- Secret forms ------------------------------------------------------------
+
+func secretPutName(name: Str): Str {
+	return "secretPut_" + goIdent(name)
+}
+
+func secretTakeName(name: Str): Str {
+	return "secretTake_" + goIdent(name)
+}
+
+proc emitSecretForm(em: mut Emit, name: Str, info: types.TypeInfo): void {
+	whole := types.Ty.TNamed(name)
+	blank(em)
+	open(em, "func " + secretPutName(name) + "(b *[]byte, x " + goType(whole) + ") \{")
+	if len(info.variants) == 0 {
+		putFields(em, info.shared, "x")
+	}
+	mut i := 0
+	for each variant in info.variants {
+		open(em, "if v, ok := x.(" + goVariant(name, variant.name) + "); ok \{")
+		line(em, "_ = v")
+		line(em, "hive.SecretPutInt(b, {i})")
+		putFields(em, withShared(variant.fields, info.shared), "v")
+		line(em, "return")
+		close(em, "}")
+		i = i + 1
+	}
+	close(em, "}")
+	blank(em)
+	open(em, "func " + secretTakeName(name) + "(r *hive.SecretReader) " + goType(whole) + " \{")
+	if len(info.variants) == 0 {
+		takeFields(em, info.shared)
+		line(em, "return " + goIdent(name) + "\{" + fieldInits(info.shared) + "}")
+		close(em, "}")
+		return
+	}
+	line(em, "which := hive.SecretTakeInt(r)")
+	i = 0
+	for each variant in info.variants {
+		fields := withShared(variant.fields, info.shared)
+		open(em, "if which == {i} \{")
+		takeFields(em, fields)
+		line(em, "return " + goVariant(name, variant.name) + "\{" + fieldInits(fields) + "}")
+		close(em, "}")
+		i = i + 1
+	}
+	line(em, "return nil")
+	close(em, "}")
+}
+
+proc putFields(em: mut Emit, fields: ast.Field[], subject: Str): void {
+	for each f in fields {
+		line(em, secretPutter(em, types.resolve(em.table, f.declared)) + "(b, " + subject + "." + goField(f.name) + ")")
+	}
+}
+
+proc takeFields(em: mut Emit, fields: ast.Field[]): void {
+	for each f in fields {
+		line(em, "f_" + goIdent(f.name) + " := " + secretTaker(em, types.resolve(em.table, f.declared)) + "(r)")
+	}
+}
+
+proc secretPutter(em: mut Emit, ty: types.Ty): Str {
+	if ty is types.Ty.TStr { return "hive.SecretPutStr" }
+	if ty is types.Ty.TInt { return "hive.SecretPutInt" }
+	if ty is types.Ty.TFloat { return "hive.SecretPutFloat" }
+	if ty is types.Ty.TFloat32 { return "hive.SecretPutFloat32" }
+	if ty is types.Ty.TSized(_, _) { return "hive.SecretPutWhole[" + goType(ty) + "]" }
+	if ty is types.Ty.TBool { return "hive.SecretPutBool" }
+	if ty is types.Ty.TAtom { return "hive.SecretPutAtom" }
+	if ty is types.Ty.TNamed(name) {
+		needCodec(em, "secret:" + name)
+		return secretPutName(name)
+	}
+	head := "func(b *[]byte, x " + goType(ty) + ") \{ "
+	if ty is types.Ty.TVec(element, _) {
+		return head + "hive.SecretPutVec(b, " + unpacked(ty, "x") + ", " + secretPutter(em, element) + ") }"
+	}
+	if ty is types.Ty.TResult(ok, bad) {
+		return head + "hive.SecretPutResult(b, x, " + secretPutter(em, ok) + ", " + secretPutter(em, bad) + ") }"
+	}
+	if ty is types.Ty.TMap(key, value) {
+		return head + "hive.SecretPutDict(b, x, " + secretPutter(em, key) + ", " + secretPutter(em, value) + ") }"
+	}
+	fail(em, "a `Secret` cannot keep " + types.show(ty))
+	return "nil"
+}
+
+proc secretTaker(em: mut Emit, ty: types.Ty): Str {
+	if ty is types.Ty.TStr { return "hive.SecretTakeStr" }
+	if ty is types.Ty.TInt { return "hive.SecretTakeInt" }
+	if ty is types.Ty.TFloat { return "hive.SecretTakeFloat" }
+	if ty is types.Ty.TFloat32 { return "hive.SecretTakeFloat32" }
+	if ty is types.Ty.TSized(_, _) { return "hive.SecretTakeWhole[" + goType(ty) + "]" }
+	if ty is types.Ty.TBool { return "hive.SecretTakeBool" }
+	if ty is types.Ty.TAtom { return "hive.SecretTakeAtom" }
+	if ty is types.Ty.TNamed(name) {
+		needCodec(em, "secret:" + name)
+		return secretTakeName(name)
+	}
+	head := "func(r *hive.SecretReader) " + goType(ty) + " \{ return "
+	if ty is types.Ty.TVec(element, _) {
+		return head + packed(ty, "hive.SecretTakeVec(r, " + secretTaker(em, element) + ")") + " }"
+	}
+	if ty is types.Ty.TResult(ok, bad) {
+		return head + "hive.SecretTakeResult(r, " + secretTaker(em, ok) + ", " + secretTaker(em, bad) + ") }"
+	}
+	if ty is types.Ty.TMap(key, value) {
+		return head + "hive.SecretTakeDict(r, " + secretTaker(em, key) + ", " + secretTaker(em, value) + ") }"
+	}
+	fail(em, "a `Secret` cannot keep " + types.show(ty))
+	return "nil"
 }
 
 // --- Flat codecs -------------------------------------------------------------
@@ -4357,15 +5095,22 @@ proc emitFlatDecoder(em: mut Emit, format: Str, name: Str, fields: ast.Field[]):
 			if dim is ast.Dim.Fixed(n) {
 				count = "{n}"
 			}
-			line(em, held + ", qerr := " + prefix + "Vec(q, " + key + ", " + count + ", " + prefix + flatValueName(element) + ")")
+			mut read := held
+			if isPacked(ty) {
+				read = held + "Read"
+			}
+			line(em, read + ", qerr := " + prefix + "Vec(q, " + key + ", " + count + ", " + flatReader(format, element) + ")")
 			flatBailOut(em, zero)
+			if isPacked(ty) {
+				line(em, held + " := " + packed(ty, read))
+			}
 		} else if f.marks.fallback is ast.Expr.Absent {
-			line(em, held + ", qerr := " + prefix + "One(q, " + key + ", " + prefix + flatValueName(ty) + ")")
+			line(em, held + ", qerr := " + prefix + "One(q, " + key + ", " + flatReader(format, ty) + ")")
 			flatBailOut(em, zero)
 		} else {
-			line(em, "{held} := " + literal(em, f.marks.fallback))
+			line(em, "{held} := " + typedLiteral(em, ty, f.marks.fallback))
 			open(em, "if " + prefix + "Has(q, " + key + ") \{")
-			line(em, "got, qerr := " + prefix + "One(q, " + key + ", " + prefix + flatValueName(ty) + ")")
+			line(em, "got, qerr := " + prefix + "One(q, " + key + ", " + flatReader(format, ty) + ")")
 			flatBailOut(em, zero)
 			line(em, held + " = got")
 			close(em, "}")
@@ -4385,9 +5130,9 @@ proc emitFlatEncoder(em: mut Emit, format: Str, name: Str, fields: ast.Field[]):
 		key := quoted(flatKey(format, f))
 		subject := "x." + goField(f.name)
 		if ty is types.Ty.TVec(element, _) {
-			append(groups, prefix + "Each(" + key + ", " + subject + ", " + prefix + "Encode" + flatValueName(element) + ")")
+			append(groups, prefix + "Each(" + key + ", " + unpacked(ty, subject) + ", " + flatWriter(format, element) + ")")
 		} else {
-			append(groups, prefix + "Of(" + key + ", " + prefix + "Encode" + flatValueName(ty) + "(" + subject + "))")
+			append(groups, prefix + "Of(" + key + ", " + flatWriter(format, ty) + "(" + subject + "))")
 		}
 	}
 	line(em, "return " + prefix + "Join(" + join(groups, ", ") + ")")
@@ -4408,9 +5153,49 @@ func flatValueName(ty: types.Ty): Str {
 	return "Str"
 }
 
+// The reader a flat format uses for one value: its own for the types it knows,
+// and for a sized number the wider one, held to the narrower type's range.
+func flatReader(format: Str, ty: types.Ty): Str {
+	prefix := flatPrefix(format)
+	if types.isNumber(ty) == false || ty is types.Ty.TInt || ty is types.Ty.TFloat {
+		return prefix + flatValueName(ty)
+	}
+	mut source := "s string"
+	if format == "term" {
+		source = "s hive.TermFlagPair"
+	}
+	errorType := goType(stdlib.codecErrorOf(format))
+	head := "func(" + source + ", p string) (" + goType(ty) + ", *" + errorType + ") \{ "
+	refused := "return 0, &" + errorType + "\{Path: p, Expected: " + quoted(types.show(ty))
+	if ty is types.Ty.TFloat32 {
+		return head + "f, err := " + prefix + "Float(s, p); if err != nil \{ return 0, err }; if v, ok := hive.FitsFloat32(f); ok \{ return v, nil }; " + refused + ", Found: hive.FloatText(f)} }"
+	}
+	return head + "n, err := " + prefix + "Int(s, p); if err != nil \{ return 0, err }; if v, ok := hive.FitsSized[" + goType(ty) + "](n, {types.isUnsigned(ty) == false}, {types.bitsOf(ty)}); ok \{ return v, nil }; " + refused + ", Found: hive.WholeText(n)} }"
+}
+
+// What writes one value in a flat format.
+func flatWriter(format: Str, ty: types.Ty): Str {
+	if ty is types.Ty.TFloat32 {
+		return "hive.Float32Text"
+	}
+	if ty is types.Ty.TSized(_, _) {
+		return "hive.WholeText[" + goType(ty) + "]"
+	}
+	return flatPrefix(format) + "Encode" + flatValueName(ty)
+}
+
 // --- The standard library ----------------------------------------------------
 
 proc libraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, written: ast.Arg[], want: types.Ty): Str {
+	if len(stdlib.fieldsOf(module, name)) > 0 {
+		return runtimeLibraryCall(em, env, module, name, written, want)
+	}
+	answer := infer.typeOf(env, ast.Expr.Call(ast.Expr.Member(ast.Expr.Member(ast.Expr.Ident("hive"), module), name), copiedArgs(written)))
+	return lifted(answer, runtimeLibraryCall(em, env, module, name, written, want))
+}
+
+// A library call as the runtime answers it, before any error union is lifted.
+proc runtimeLibraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, written: ast.Arg[], want: types.Ty): Str {
 	if stdlib.isKnownModule(module) == false {
 		fail(em, "this compiler does not carry `hive.{module}`")
 		return "nil"
@@ -4421,12 +5206,17 @@ proc libraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, written: 
 		answer := infer.typeOf(env, ast.Expr.Call(ast.Expr.Member(ast.Expr.Member(ast.Expr.Ident("hive"), module), name), copiedArgs(written)))
 		if answer is types.Ty.TVoid || concrete(answer) {
 			// The map `set` and `delete` write into is the caller's own.
-			mut Bool[dyn] mutexes = []
+			mut Bool[dyn] mutables = []
 			if module == "map" && (name == "set" || name == "delete") {
-				mutexes = [true]
+				mutables = [true]
 			}
-			h := hoist(em, env, written, names, infer.typesOfArgs(env, stdlib.libraryArgs(module, name, written)), mutexes, true)
-			return inWrittenOrder(h, goResult(answer), libraryCall(em, h.env, module, name, h.args, want))
+			h := hoist(em, env, written, names, infer.typesOfArgs(env, stdlib.libraryArgs(module, name, written)), mutables, true)
+			mut asAnswered := goResult(answer)
+			if answer is types.Ty.TVoid {
+			} else {
+				asAnswered = runtimeGoType(answer)
+			}
+			return inWrittenOrder(h, asAnswered, runtimeLibraryCall(em, h.env, module, name, h.args, want))
 		}
 	}
 	args := stdlib.libraryArgs(module, name, written)
@@ -4516,7 +5306,11 @@ proc libraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, written: 
 	if len(stdlib.fieldsOf(module, name)) > 0 {
 		return literalOf(em, env, "hive." + text.capitalise(module) + name, stdlib.fieldsOf(module, name), args)
 	}
-	return "hive." + stdlib.goNameOf(module, name) + "(" + typedArgs(em, env, args, stdlib.paramsOf(module, name)) + ")"
+	called := "hive." + stdlib.goNameOf(module, name) + "(" + typedArgs(em, env, args, stdlib.paramsOf(module, name)) + ")"
+	if module == "math" && stdlib.resultOf(module, name, infer.mathArgTypes(env, args)) is types.Ty.TFloat32 {
+		return "hive.ToFloat32(" + called + ")"
+	}
+	return called
 }
 
 // A library call's arguments, each written for the type its parameter declared.
@@ -4545,12 +5339,16 @@ proc typedArgs(em: mut Emit, env: infer.Env, args: ast.Arg[], params: types.Ty[]
 // they change which keys it has.
 proc mapCall(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[]): Str {
 	subject := expr(em, env, argExpr(args, 0), types.Ty.TUnknown())
-	rest := restArgs(em, env, args)
+	rest := restArgs(em, env, args, infer.typeOf(env, argExpr(args, 0)))
 	if name == "set" || name == "delete" {
 		return "(&" + subject + ")." + text.capitalise(name) + "(" + rest + ")"
 	}
-	if name == "get" || name == "has" || name == "keys" || name == "values" {
+	if name == "get" || name == "has" {
 		return "(" + subject + ")." + text.capitalise(name) + "(" + rest + ")"
+	}
+	if name == "keys" || name == "values" {
+		answer := stdlib.mapResult(name, [infer.typeOf(env, argExpr(args, 0))])
+		return packed(answer, "(" + subject + ")." + text.capitalise(name) + "(" + rest + ")")
 	}
 	// These two are conversions rather than questions about a map, so they stay
 	// ordinary functions.
@@ -4558,12 +5356,19 @@ proc mapCall(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[]): Str {
 }
 
 // Every argument but the first, which is the subject a method is called on.
-proc restArgs(em: mut Emit, env: infer.Env, args: ast.Arg[]): Str {
+proc restArgs(em: mut Emit, env: infer.Env, args: ast.Arg[], subject: types.Ty): Str {
 	mut Str[dyn] out = []
 	mut i := 0
 	for each a in args {
+		mut want := types.Ty.TUnknown()
+		if subject is types.Ty.TMap(key, value) {
+			want = key
+			if i == 2 {
+				want = value
+			}
+		}
 		if i > 0 {
-			append(out, expr(em, env, a.value, types.Ty.TUnknown()))
+			append(out, expr(em, env, a.value, want))
 		}
 		i = i + 1
 	}
@@ -4582,7 +5387,7 @@ proc emitTests(m: ast.Module, atoms: Str[], codecs: Str[], modules: Str[]): Emit
 	t := types.tableOf(m)
 	// What `main.go` already wrote or asked for is seeded rather than repeated:
 	// the two files are one Go package.
-	mut Emit em = Emit(t, [], 0, copiedNames(atoms), copiedNames(modules), [], [], lentFuncs(t, m.decls), [], copiedNames(codecs), 0, [], [], [], [], true, false, false, -1, [], writes.writtenShapes(m), [], 0, "", false, [], handingBackFuncs(t, m.decls), "")
+	mut Emit em = Emit(t, [], 0, copiedNames(atoms), copiedNames(modules), [], [], lentFuncs(t, m.decls), [], copiedNames(codecs), 0, [], [], [], [], true, false, false, -1, [], writes.writtenShapes(m), [], 0, "", false, [], handingBackFuncs(t, m.decls), "", [], [])
 	written := len(codecs)
 	mut found := false
 	for each d in m.decls {
@@ -4706,6 +5511,7 @@ func sourceOf(e: ast.Expr): Str {
 		return sourceOf(subject) + " is " + show.showPattern(pattern)
 	}
 	if e is ast.Expr.Negate(operand) { return "-" + sourceOf(operand) }
+	if e is ast.Expr.BitNot(operand) { return "~" + sourceOf(operand) }
 	if e is ast.Expr.Not(operand) { return "!" + sourceOf(operand) }
 	if e is ast.Expr.FloatLit(v) { return "{v}" }
 	if e is ast.Expr.AtomLit(atom) { return "#{atom}" }

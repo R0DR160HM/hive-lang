@@ -235,7 +235,7 @@ proc checkStmt(bo: mut Proofs, env: infer.Env, s: ast.Stmt): infer.Env {
 proc checkStmtTail(bo: mut Proofs, env: infer.Env, s: ast.Stmt): infer.Env {
 	if s is ast.Stmt.ForLoop(init, cond, post, body) {
 		inner := checkStmt(bo, env, init)
-		counter := countsUp(init, post)
+		counter := countsUp(init, cond, post)
 		// A second pass sees what the first one changed, so the body is walked once
 		// without reporting to find out what a turn of the loop costs, and only what
 		// survives that is carried into the turn that is checked.
@@ -346,11 +346,11 @@ proc learnUpper(bo: mut Proofs, env: infer.Env, condition: ast.Expr): void {
 			learnUpper(bo, env, right)
 		} else if op is ast.BinOp.Lt {
 			if lengthOf(right) is Result.Ok(vector) {
-				proveIndex(bo, vector, left)
+				proveIndex(bo, env, vector, left)
 			}
 		} else if op is ast.BinOp.Gt {
 			if lengthOf(left) is Result.Ok(vector) {
-				proveIndex(bo, vector, right)
+				proveIndex(bo, env, vector, right)
 			}
 		}
 		return
@@ -363,7 +363,7 @@ proc learnUpper(bo: mut Proofs, env: infer.Env, condition: ast.Expr): void {
 	}
 }
 
-proc proveIndex(bo: mut Proofs, vector: ast.Expr, index: ast.Expr): void {
+proc proveIndex(bo: mut Proofs, env: infer.Env, vector: ast.Expr, index: ast.Expr): void {
 	if index is ast.Expr.IntLit(at) {
 		if at >= 0 {
 			prove(bo, vector, index)
@@ -372,7 +372,7 @@ proc proveIndex(bo: mut Proofs, vector: ast.Expr, index: ast.Expr): void {
 		return
 	}
 	key := pathKey(index)
-	if key != "" && indexOf(bo.proved, "+|" + key) is Result.Ok(_) {
+	if key != "" && (indexOf(bo.proved, "+|" + key) is Result.Ok(_) || types.isUnsigned(infer.typeOf(env, index))) {
 		prove(bo, vector, index)
 	}
 }
@@ -406,29 +406,44 @@ func literalValue(e: ast.Expr): Result<Int, Bool> {
 	return Result.Error(false)
 }
 
-// `for i := 0; ...; i++`: a counter that starts at no less than nought and only
+// `for i := 0; i < n; i++`: a counter that starts at no less than nought and only
 // ever goes up, which makes it an index's low half on every turn the body leaves
-// it alone.
-func countsUp(init: ast.Stmt, post: ast.Stmt): Str {
+// it alone. Stepping by one from below `n` is what keeps it from wrapping past MAX.
+func countsUp(init: ast.Stmt, cond: ast.Expr, post: ast.Stmt): Str {
 	mut counter := ""
 	if init is ast.Stmt.VarDecl(name, value, _, _) && atLeast(value, 0) {
 		counter = name
 	} else if init is ast.Stmt.TypedDecl(_, name, value, _, _) && atLeast(value, 0) {
 		counter = name
 	}
-	if counter == "" {
+	if counter == "" || keptBelow(cond, counter) == false {
 		return ""
 	}
 	if post is ast.Stmt.Assign(target, value) {
 		if target is ast.Expr.Ident(stepped) && stepped == counter {
 			if value is ast.Expr.Binary(op, left, right) && op is ast.BinOp.Add {
-				if left is ast.Expr.Ident(from) && from == counter && atLeast(right, 0) {
+				if left is ast.Expr.Ident(from) && from == counter && literalValue(right) is Result.Ok(by) && by == 1 {
 					return counter
 				}
 			}
 		}
 	}
 	return ""
+}
+
+func keptBelow(cond: ast.Expr, counter: Str): Bool {
+	if cond is ast.Expr.Binary(op, left, right) {
+		if op is ast.BinOp.And {
+			return keptBelow(left, counter) || keptBelow(right, counter)
+		}
+		if op is ast.BinOp.Lt && left is ast.Expr.Ident(name) {
+			return name == counter
+		}
+		if op is ast.BinOp.Gt && right is ast.Expr.Ident(name) {
+			return name == counter
+		}
+	}
+	return false
 }
 
 // One turn of a counting loop, answering whether the body left the counter's low
@@ -500,6 +515,12 @@ func namesIn(e: ast.Expr): Str[dyn] {
 		out = joined(namesIn(left), namesIn(right))
 	} else if e is ast.Expr.Negate(operand) {
 		out = namesIn(operand)
+	} else if e is ast.Expr.BitNot(operand) {
+		out = namesIn(operand)
+	} else if e is ast.Expr.Bits(parts) {
+		for each part in parts {
+			out = joined(out, namesIn(part.value))
+		}
 	} else if e is ast.Expr.Member(subject, _) {
 		out = namesIn(subject)
 	} else if e is ast.Expr.Index(subject, index) {
@@ -541,6 +562,11 @@ func patternBindings(p: ast.Pattern): Str[dyn] {
 				append(out, name)
 			}
 		}
+	} else if p is ast.Pattern.BitsPat(fields, rest) {
+		for each f in fields {
+			append(out, f.name)
+		}
+		append(out, rest)
 	}
 	return out
 }
@@ -854,7 +880,7 @@ proc checkExpr(bo: mut Proofs, env: infer.Env, e: ast.Expr): void {
 			checkExpr(bo, env, a.value)
 		}
 		checkDrop(bo, env, callee, args)
-		for each written in infer.mutexArguments(env, callee, args) {
+		for each written in infer.mutableArguments(env, callee, args) {
 			name := rootOf(written)
 			if name != "" {
 				lose(bo, name)
@@ -876,6 +902,12 @@ proc checkExpr(bo: mut Proofs, env: infer.Env, e: ast.Expr): void {
 		checkExpr(bo, env, operand)
 	} else if e is ast.Expr.Not(operand) {
 		checkExpr(bo, env, operand)
+	} else if e is ast.Expr.BitNot(operand) {
+		checkExpr(bo, env, operand)
+	} else if e is ast.Expr.Bits(parts) {
+		for each part in parts {
+			checkExpr(bo, env, part.value)
+		}
 	} else if e is ast.Expr.Member(subject, _) {
 		checkExpr(bo, env, subject)
 	} else if e is ast.Expr.VectorLit(items) {
@@ -888,8 +920,11 @@ proc checkExpr(bo: mut Proofs, env: infer.Env, e: ast.Expr): void {
 				checkExpr(bo, env, value)
 			}
 		}
-	} else if e is ast.Expr.IsMatch(subject, _) {
+	} else if e is ast.Expr.IsMatch(subject, pattern) {
 		checkExpr(bo, env, subject)
+		for each held in ast.patternExprs(pattern) {
+			checkExpr(bo, env, held)
+		}
 	}
 }
 
@@ -942,7 +977,38 @@ func provable(bo: Proofs, env: infer.Env, subject: ast.Expr, index: ast.Expr): B
 		}
 		return false
 	}
+	// `i & 15` is never negative and never above 15, whatever `i` holds.
+	if maskOf(index) is Result.Ok(top) {
+		if knownLength(bo, env, subject) is Result.Ok(n) {
+			return top < n
+		}
+	}
+	// A sized index is below its type's top whatever it holds, and an unsigned one
+	// is never negative.
+	ty := infer.typeOf(env, index)
+	if ty is types.Ty.TSized(signed, bits) && bits < 62 {
+		if knownLength(bo, env, subject) is Result.Ok(n) {
+			if signed {
+				key := pathKey(index)
+				return types.twoTo(bits - 1) <= n && key != "" && indexOf(bo.proved, "+|" + key) is Result.Ok(_)
+			}
+			return types.twoTo(bits) <= n
+		}
+	}
 	return false
+}
+
+// The largest `x & k` can be, for a literal `k` that is never negative.
+func maskOf(e: ast.Expr): Result<Int, Bool> {
+	if e is ast.Expr.Binary(op, left, right) && op is ast.BinOp.BitAnd {
+		if right is ast.Expr.IntLit(k) {
+			return Result.Ok(k)
+		}
+		if left is ast.Expr.IntLit(k) {
+			return Result.Ok(k)
+		}
+	}
+	return Result.Error(false)
 }
 
 // The length of a vector, when the compiler knows it. A declared length is a

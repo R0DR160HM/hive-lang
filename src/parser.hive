@@ -39,11 +39,15 @@ type Parse {
 	// Carried into sub-parses too, so no two hidden names in a file meet.
 	parts: Int
 	tests: ast.Expr[dyn]
+	// The `>>` at the cursor has closed one list of type arguments already.
+	split: Bool
+	// Directly inside `<<...>>`, where a `>>` closes it rather than shifting.
+	inBits: Bool
 }
 
 // Parse a whole file.
 proc parse(ts: token.Token[]): Parsed {
-	mut Parse p = Parse(0, false, false, [], 0, [])
+	mut Parse p = Parse(0, false, false, [], 0, [], false, false)
 	mut ast.ImportLine[dyn] imports = []
 	mut ast.Decl[dyn] decls = []
 
@@ -407,7 +411,7 @@ proc parseSqlExpr(source: Str, p: mut Parse): ast.Expr {
 	for each e in lexed.errors {
 		append(p.errors, e)
 	}
-	mut Parse inner = Parse(0, false, false, [], p.parts, [])
+	mut Parse inner = Parse(0, false, false, [], p.parts, [], false, false)
 	written := parseExpr(lexed.tokens, inner)
 	p.parts = inner.parts
 	for each e in inner.errors {
@@ -664,8 +668,14 @@ proc parseMarkLiteral(ts: token.Token[], p: mut Parse): ast.Expr {
 	}
 	// A negative number is unary minus over a literal everywhere else in the
 	// language, and it is the same two tokens here.
+	if refusesWide(ts, p, "a `Default`") {
+		return ast.Expr.Absent()
+	}
 	if kindAt(ts, p.pos) == token.Kind.Minus() {
 		advance(p)
+		if refusesWide(ts, p, "a `Default`") {
+			return ast.Expr.Absent()
+		}
 		negative := kindAt(ts, p.pos)
 		if negative is token.Kind.IntLit(v) {
 			advance(p)
@@ -783,13 +793,13 @@ proc parseParams(ts: token.Token[], p: mut Parse): ast.Param[dyn] {
 		if expect(ts, p, token.Kind.Colon()) == false {
 			return params
 		}
-		// `v: mut T` asks for the mutex itself rather than a view of it. Only a
+		// `v: mut T` asks for the caller's storage itself rather than a view of it. Only a
 		// `proc` may — a later pass's business; here it is only a shape.
-		mutex := kindAt(ts, p.pos) == token.Kind.KwMut()
-		if mutex {
+		mutable := kindAt(ts, p.pos) == token.Kind.KwMut()
+		if mutable {
 			advance(p)
 		}
-		append(params, ast.Param(name, parseTypeExpr(ts, p), mutex))
+		append(params, ast.Param(name, parseTypeExpr(ts, p), mutable))
 		if kindAt(ts, p.pos) == token.Kind.Comma() {
 			advance(p)
 		} else if kindAt(ts, p.pos) != token.Kind.RParen() && p.failed == false {
@@ -828,33 +838,33 @@ proc parseTypeExpr(ts: token.Token[], p: mut Parse): ast.TypeExpr {
 proc parseFnType(ts: token.Token[], p: mut Parse, pure: Bool): ast.TypeExpr {
 	advance(p)
 	mut ast.TypeExpr[dyn] params = []
-	mut Bool[dyn] mutexes = []
+	mut Bool[dyn] mutables = []
 	if expect(ts, p, token.Kind.LParen()) == false {
-		return ast.TypeExpr.Fn(pure, params, mutexes, ast.TypeExpr.VoidType())
+		return ast.TypeExpr.Fn(pure, params, mutables, ast.TypeExpr.VoidType())
 	}
 	for ; p.failed == false && atEnd(ts, p) == false; {
 		if kindAt(ts, p.pos) == token.Kind.RParen() {
 			advance(p)
-			return ast.TypeExpr.Fn(pure, params, mutexes, parseResultType(ts, p))
+			return ast.TypeExpr.Fn(pure, params, mutables, parseResultType(ts, p))
 		}
-		mutex := kindAt(ts, p.pos) == token.Kind.KwMut()
-		if mutex && pure {
-			fail(ts, p, "a `func` type cannot take the mutex itself: what a `func` promises is that it cannot write to storage its caller can see. Write `proc(mut ...)`")
-			return ast.TypeExpr.Fn(pure, params, mutexes, ast.TypeExpr.VoidType())
+		mutable := kindAt(ts, p.pos) == token.Kind.KwMut()
+		if mutable && pure {
+			fail(ts, p, "a `func` type cannot take a `mut` parameter: what a `func` promises is that it cannot write to storage its caller can see. Write `proc(mut ...)`")
+			return ast.TypeExpr.Fn(pure, params, mutables, ast.TypeExpr.VoidType())
 		}
-		if mutex {
+		if mutable {
 			advance(p)
 		}
-		append(mutexes, mutex)
+		append(mutables, mutable)
 		append(params, parseTypeExpr(ts, p))
 		if kindAt(ts, p.pos) == token.Kind.Comma() {
 			advance(p)
 		} else if kindAt(ts, p.pos) != token.Kind.RParen() && p.failed == false {
 			expected(ts, p, "`,` or `)` in a function type")
-			return ast.TypeExpr.Fn(pure, params, mutexes, ast.TypeExpr.VoidType())
+			return ast.TypeExpr.Fn(pure, params, mutables, ast.TypeExpr.VoidType())
 		}
 	}
-	return ast.TypeExpr.Fn(pure, params, mutexes, ast.TypeExpr.VoidType())
+	return ast.TypeExpr.Fn(pure, params, mutables, ast.TypeExpr.VoidType())
 }
 
 // `hive.map.Map<Str, Int>[dyn]` — qualifier segments, the name, its type
@@ -915,6 +925,16 @@ proc parseTypeArgs(ts: token.Token[], p: mut Parse): ast.TypeExpr[dyn] {
 		} else if kindAt(ts, p.pos) == token.Kind.Gt() {
 			advance(p)
 			return args
+		} else if kindAt(ts, p.pos) == token.Kind.Shr() {
+			// `Map<Str, Result<Int, Str>>`: the inner list takes the first `>`, this
+			// one the second.
+			if p.split {
+				p.split = false
+				advance(p)
+			} else {
+				p.split = true
+			}
+			return args
 		} else if p.failed == false {
 			expected(ts, p, "`,` or `>` in a type's arguments")
 			return args
@@ -940,6 +960,9 @@ proc parseDims(ts: token.Token[], p: mut Parse): ast.Dim[dyn] {
 			}
 			append(dims, ast.Dim.Dynamic())
 		} else if inner is token.Kind.IntLit(size) {
+			if refusesWide(ts, p, "a vector's length") {
+				return dims
+			}
 			advance(p)
 			if expect(ts, p, token.Kind.RBracket()) == false {
 				return dims
@@ -1117,6 +1140,7 @@ proc parseTypedOrExpr(ts: token.Token[], p: mut Parse): ast.Stmt {
 		&& kindAt(ts, p.pos + 1) == token.Kind.Assign()
 	p.quiet = false
 	p.failed = false
+	p.split = false
 
 	if committed {
 		name := expectIdent(ts, p, naming.Role.Variable())
@@ -1157,6 +1181,16 @@ proc parseExprStmt(ts: token.Token[], p: mut Parse): ast.Stmt {
 		return compound(ts, p, subject, ast.BinOp.Mul())
 	} else if k == token.Kind.SlashEq() {
 		return compound(ts, p, subject, ast.BinOp.Div())
+	} else if k == token.Kind.AmpEq() {
+		return compound(ts, p, subject, ast.BinOp.BitAnd())
+	} else if k == token.Kind.PipeEq() {
+		return compound(ts, p, subject, ast.BinOp.BitOr())
+	} else if k == token.Kind.CaretEq() {
+		return compound(ts, p, subject, ast.BinOp.BitXor())
+	} else if k == token.Kind.ShlEq() {
+		return compound(ts, p, subject, ast.BinOp.Shl())
+	} else if k == token.Kind.ShrEq() {
+		return compound(ts, p, subject, ast.BinOp.Shr())
 	} else if k == token.Kind.PlusPlus() {
 		advance(p)
 		return step(subject, ast.BinOp.Add())
@@ -1534,7 +1568,7 @@ proc parseIs(ts: token.Token[], p: mut Parse): ast.Expr {
 	// the guard means the same thing in a program with a `len` of its own.
 	if k == token.Kind.KwBounds() {
 		advance(p)
-		index := parseAdditive(ts, p)
+		index := parseBitwise(ts, p)
 		return ast.Expr.Binary(
 			ast.BinOp.And(),
 			ast.Expr.Binary(ast.BinOp.Ge(), index, ast.Expr.IntLit(0)),
@@ -1548,7 +1582,7 @@ proc parseIs(ts: token.Token[], p: mut Parse): ast.Expr {
 }
 
 proc parseComparison(ts: token.Token[], p: mut Parse): ast.Expr {
-	left := parseAdditive(ts, p)
+	left := parseBitwise(ts, p)
 	if p.failed {
 		return left
 	}
@@ -1564,7 +1598,90 @@ proc parseComparison(ts: token.Token[], p: mut Parse): ast.Expr {
 
 proc comparison(ts: token.Token[], p: mut Parse, left: ast.Expr, op: ast.BinOp): ast.Expr {
 	advance(p)
-	return ast.Expr.Binary(op, left, parseAdditive(ts, p))
+	return ast.Expr.Binary(op, left, parseBitwise(ts, p))
+}
+
+// Tighter than a comparison, so `x & 1 == 0` asks about `x & 1`. Two different
+// ones side by side, or one beside arithmetic, have no order: the parentheses say it.
+proc parseBitwise(ts: token.Token[], p: mut Parse): ast.Expr {
+	start := p.pos
+	mut ast.Expr left = parseAdditive(ts, p)
+	mut first := ""
+	for ; p.failed == false; {
+		op := bitwiseAt(ts, p.pos, p.inBits)
+		if op is Result.Ok(found) {
+			spelled := ast.opSpelling(found)
+			if first == "" {
+				first = spelled
+				if refusesMixing(ts, p, start, p.pos, spelled) {
+					return left
+				}
+			} else if spelled != first {
+				fail(ts, p, "`{first}` and `{spelled}` sit side by side with nothing to say which goes first. Bitwise operators have no order among themselves, so write the parentheses: `(a {first} b) {spelled} c` or `a {first} (b {spelled} c)`")
+				return left
+			}
+			advance(p)
+			from := p.pos
+			right := parseAdditive(ts, p)
+			if refusesMixing(ts, p, from, p.pos, spelled) {
+				return left
+			}
+			left = ast.Expr.Binary(found, left, right)
+		} else {
+			return left
+		}
+	}
+	return left
+}
+
+func bitwiseAt(ts: token.Token[], at: Int, inBits: Bool): Result<ast.BinOp, Bool> {
+	k := kindAt(ts, at)
+	if k == token.Kind.Amp() { return Result.Ok(ast.BinOp.BitAnd()) }
+	if k == token.Kind.Pipe() { return Result.Ok(ast.BinOp.BitOr()) }
+	if k == token.Kind.Caret() { return Result.Ok(ast.BinOp.BitXor()) }
+	if k == token.Kind.Shl() { return Result.Ok(ast.BinOp.Shl()) }
+	if k == token.Kind.Shr() && inBits == false { return Result.Ok(ast.BinOp.Shr()) }
+	return Result.Error(false)
+}
+
+// An operand of a bitwise operator holding arithmetic outside any parentheses.
+proc refusesMixing(ts: token.Token[], p: mut Parse, from: Int, to: Int, spelled: Str): Bool {
+	arithmetic := arithmeticIn(ts, from, to)
+	if arithmetic == "" {
+		return false
+	}
+	failAt(ts, p, from, "`{spelled}` and `{arithmetic}` sit side by side with nothing to say which goes first. A bitwise operator has no order against arithmetic, so write the parentheses: `(a {arithmetic} b) {spelled} c` or `a {arithmetic} (b {spelled} c)`")
+	return true
+}
+
+// The first arithmetic operator among these tokens that no bracket encloses.
+func arithmeticIn(ts: token.Token[], from: Int, to: Int): Str {
+	mut depth := 0
+	for i := from; i < to; i++ {
+		k := kindAt(ts, i)
+		if k == token.Kind.LParen() || k == token.Kind.LBracket() || k == token.Kind.LBrace() {
+			depth = depth + 1
+		} else if k == token.Kind.RParen() || k == token.Kind.RBracket() || k == token.Kind.RBrace() {
+			depth = depth - 1
+		} else if depth == 0 {
+			if k == token.Kind.Plus() || k == token.Kind.Star() || k == token.Kind.Slash()
+				|| k == token.Kind.Percent() || k == token.Kind.StarStar() {
+				return token.spelling(k)
+			}
+			if k == token.Kind.Minus() && i > from && endsOperand(kindAt(ts, i - 1)) {
+				return "-"
+			}
+		}
+	}
+	return ""
+}
+
+// Whether a token can end an operand, which makes a `-` after it a subtraction.
+func endsOperand(k: token.Kind): Bool {
+	return k is token.Kind.Ident(_) || k is token.Kind.IntLit(_) || k is token.Kind.FloatLit(_)
+		|| k is token.Kind.StrLit(_) || k is token.Kind.StrParts(_) || k is token.Kind.AtomLit(_)
+		|| k == token.Kind.RParen() || k == token.Kind.RBracket() || k == token.Kind.KwTrue()
+		|| k == token.Kind.KwFalse()
 }
 
 proc parseAdditive(ts: token.Token[], p: mut Parse): ast.Expr {
@@ -1604,12 +1721,12 @@ proc parseMultiplicative(ts: token.Token[], p: mut Parse): ast.Expr {
 	return left
 }
 
-// `x | f(a)` is `f(x, a)` and `x | f` is `f(x)`, left-associative. Tighter than
+// `x |> f(a)` is `f(x, a)` and `x |> f` is `f(x)`, left-associative. Tighter than
 // every binary operator and looser than the prefix ones, so a pipeline may sit
-// on either side of one — `nums | len > 2` — and `1 + 2 | f` is `1 + f(2)`.
+// on either side of one — `nums |> len > 2` — and `1 + 2 |> f` is `1 + f(2)`.
 proc parsePipe(ts: token.Token[], p: mut Parse): ast.Expr {
 	mut ast.Expr left = parseUnary(ts, p)
-	for ; p.failed == false && kindAt(ts, p.pos) == token.Kind.Pipe(); {
+	for ; p.failed == false && kindAt(ts, p.pos) == token.Kind.PipeGt(); {
 		advance(p)
 		at := p.pos
 		left = pipedInto(ts, p, left, parseUnary(ts, p), at)
@@ -1623,7 +1740,7 @@ proc pipedInto(ts: token.Token[], p: mut Parse, value: ast.Expr, stage: ast.Expr
 	if stage is ast.Expr.Call(callee, args) {
 		return ast.Expr.Call(callee, [ast.Arg("", value)] + args)
 	}
-	// A bounded stage — `body | send() with timeout 500` — takes the value into
+	// A bounded stage — `body |> send() with timeout 500` — takes the value into
 	// the call the clause wraps.
 	if stage is ast.Expr.Timed(call, ms) {
 		return ast.Expr.Timed(pipedInto(ts, p, value, call, at), ms)
@@ -1633,17 +1750,21 @@ proc pipedInto(ts: token.Token[], p: mut Parse, value: ast.Expr, stage: ast.Expr
 		return ast.Expr.Call(stage, [ast.Arg("", value)])
 	}
 	if p.failed == false {
-		failAt(ts, p, at, "`|` pipes the value on its left in as the first argument of a call, so what stands on the right has to be one: a callable's name (`x | f`), a call with the rest of its arguments written out (`x | f(a)`), or a constructor (`x | Shout.Loud`). Anything computed goes in parentheses on the left instead — `(a + b) | f`")
+		failAt(ts, p, at, "`|>` pipes the value on its left in as the first argument of a call, so what stands on the right has to be one: a callable's name (`x |> f`), a call with the rest of its arguments written out (`x |> f(a)`), or a constructor (`x |> Shout.Loud`). Anything computed goes in parentheses on the left instead — `(a + b) |> f`")
 	}
 	return stage
 }
 
-// The two prefix operators. Both bind tighter than every comparison and looser
+// The three prefix operators. Each binds tighter than every comparison and looser
 // than `**`, so `-2 ** 2` is `-(2 ** 2)` and `!a && b` is `(!a) && b`.
 proc parseUnary(ts: token.Token[], p: mut Parse): ast.Expr {
 	if kindAt(ts, p.pos) == token.Kind.Minus() {
 		advance(p)
 		return ast.Expr.Negate(parseUnary(ts, p))
+	}
+	if kindAt(ts, p.pos) == token.Kind.Tilde() {
+		advance(p)
+		return ast.Expr.BitNot(parseUnary(ts, p))
 	}
 	if kindAt(ts, p.pos) == token.Kind.Bang() {
 		bang := p.pos
@@ -1743,10 +1864,14 @@ proc parsePostfix(ts: token.Token[], p: mut Parse): ast.Expr {
 		k := kindAt(ts, p.pos)
 		if k == token.Kind.LParen() {
 			advance(p)
+			was := enclose(p)
 			subject = ast.Expr.Call(subject, parseArgs(ts, p))
+			p.inBits = was
 		} else if k == token.Kind.LBracket() {
 			advance(p)
+			was := enclose(p)
 			subject = parseIndexOrSlice(ts, p, subject)
+			p.inBits = was
 		} else if k == token.Kind.Dot() {
 			advance(p)
 			field := wordAt(ts, p.pos)
@@ -1830,7 +1955,13 @@ proc parseIndexOrSlice(ts: token.Token[], p: mut Parse, subject: ast.Expr): ast.
 proc parsePrimary(ts: token.Token[], p: mut Parse): ast.Expr {
 	k := kindAt(ts, p.pos)
 
-	if k is token.Kind.IntLit(v) { advance(p) return ast.Expr.IntLit(v) }
+	if k is token.Kind.IntLit(v) {
+		advance(p)
+		if v < 0 {
+			return wideLiteral(v)
+		}
+		return ast.Expr.IntLit(v)
+	}
 	else if k is token.Kind.FloatLit(v) { advance(p) return ast.Expr.FloatLit(v) }
 	else if k is token.Kind.StrLit(t) { advance(p) return ast.Expr.StrLit(t) }
 	else if k is token.Kind.AtomLit(atom) { advance(p) return ast.Expr.AtomLit(atom) }
@@ -1848,11 +1979,20 @@ proc parsePrimary(ts: token.Token[], p: mut Parse): ast.Expr {
 
 	if k == token.Kind.KwTrue() { advance(p) return ast.Expr.BoolLit(true) }
 	else if k == token.Kind.KwFalse() { advance(p) return ast.Expr.BoolLit(false) }
-	else if k == token.Kind.LBracket() { advance(p) return parseVectorLit(ts, p) }
+	else if k == token.Kind.LBracket() {
+		advance(p)
+		was := enclose(p)
+		items := parseVectorLit(ts, p)
+		p.inBits = was
+		return items
+	}
 	else if k == token.Kind.KwAwait() { return parseAwaitAll(ts, p) }
+	else if k == token.Kind.Shl() { return parseBitsLit(ts, p) }
 	else if k == token.Kind.LParen() {
 		advance(p)
+		was := enclose(p)
 		inner := parseExpr(ts, p)
+		p.inBits = was
 		expect(ts, p, token.Kind.RParen())
 		return inner
 	}
@@ -1866,6 +2006,63 @@ proc parsePrimary(ts: token.Token[], p: mut Parse): ast.Expr {
 
 	fail(ts, p, "unexpected " + token.describe(k) + " in an expression")
 	return ast.Expr.Absent()
+}
+
+// A bracket inside `<<...>>` makes a `>>` a shift again until it closes.
+proc enclose(p: mut Parse): Bool {
+	was := p.inBits
+	p.inBits = false
+	return was
+}
+
+// A literal of 2^63 or more, which the lexer hands over as the negative `Int` its
+// 64 bits make: the `UInt64` holding those bits.
+func wideLiteral(v: Int): ast.Expr {
+	mut ast.Expr bits = ast.Expr.Negate(ast.Expr.IntLit(0 - v))
+	if 0 - v < 0 {
+		// 2^63 itself, whose negation is itself again.
+		bits = ast.Expr.Binary(ast.BinOp.Sub(), ast.Expr.Negate(ast.Expr.IntLit(0 - (v + 1))), ast.Expr.IntLit(1))
+	}
+	return ast.Expr.Call(ast.Expr.Member(ast.Expr.Ident("hive"), "UInt64"), [ast.Arg("", bits)])
+}
+
+// `<<version, length: UInt16, payload>>`. A `>>` closes it, so a shift inside one
+// goes in parentheses.
+proc parseBitsLit(ts: token.Token[], p: mut Parse): ast.Expr {
+	advance(p)
+	was := p.inBits
+	p.inBits = true
+	mut ast.BitPart[dyn] parts = []
+	for ; p.failed == false && atEnd(ts, p) == false; {
+		if kindAt(ts, p.pos) == token.Kind.Shr() {
+			advance(p)
+			p.inBits = was
+			return ast.Expr.Bits(parts)
+		}
+		value := parseExpr(ts, p)
+		mut declared := ast.TypeExpr.VoidType()
+		if kindAt(ts, p.pos) == token.Kind.Colon() {
+			advance(p)
+			declared = parseTypeExpr(ts, p)
+		}
+		append(parts, ast.BitPart(value, declared, littleAt(ts, p)))
+		if kindAt(ts, p.pos) == token.Kind.Comma() {
+			advance(p)
+		} else if kindAt(ts, p.pos) != token.Kind.Shr() && p.failed == false {
+			expected(ts, p, "`,` or `>>` in `<<...>>`")
+		}
+	}
+	p.inBits = was
+	return ast.Expr.Bits(parts)
+}
+
+// `little` after a field or a part, read here rather than reserved.
+proc littleAt(ts: token.Token[], p: mut Parse): Bool {
+	if wordAt(ts, p.pos) == "little" {
+		advance(p)
+		return true
+	}
+	return false
 }
 
 proc parseVectorLit(ts: token.Token[], p: mut Parse): ast.Expr {
@@ -1955,7 +2152,7 @@ proc parseSubExpr(ts: token.Token[], p: mut Parse, source: Str, line: Int): ast.
 		reportSub(ts, p, line, source, "does not lex")
 		return ast.Expr.Absent()
 	}
-	mut Parse inner = Parse(0, false, false, [], p.parts, [])
+	mut Parse inner = Parse(0, false, false, [], p.parts, [], false, false)
 	value := parseExpr(lexed.tokens, inner)
 	p.parts = inner.parts
 	if inner.failed || kindAt(lexed.tokens, inner.pos) != token.Kind.Eof() {
@@ -2020,7 +2217,7 @@ proc freshPart(p: mut Parse): Str {
 
 func opensPattern(ts: token.Token[], i: Int): Bool {
 	k := kindAt(ts, i)
-	if k is token.Kind.StrParts(_) || k == token.Kind.LBracket() {
+	if k is token.Kind.StrParts(_) || k == token.Kind.LBracket() || k == token.Kind.Shl() {
 		return true
 	}
 	return wordAt(ts, i) != "" && kindAt(ts, i + 1) == token.Kind.Dot()
@@ -2035,6 +2232,9 @@ func startsLiteral(ts: token.Token[], i: Int): Bool {
 
 proc parseLiteral(ts: token.Token[], p: mut Parse): ast.Expr {
 	k := kindAt(ts, p.pos)
+	if refusesWide(ts, p, "a pattern") {
+		return ast.Expr.Absent()
+	}
 	advance(p)
 	if k is token.Kind.IntLit(v) { return ast.Expr.IntLit(v) }
 	else if k is token.Kind.FloatLit(v) { return ast.Expr.FloatLit(v) }
@@ -2042,12 +2242,27 @@ proc parseLiteral(ts: token.Token[], p: mut Parse): ast.Expr {
 	else if k is token.Kind.AtomLit(atom) { return ast.Expr.AtomLit(atom) }
 	else if k == token.Kind.KwTrue() { return ast.Expr.BoolLit(true) }
 	else if k == token.Kind.KwFalse() { return ast.Expr.BoolLit(false) }
+	if refusesWide(ts, p, "a pattern") {
+		return ast.Expr.Absent()
+	}
 	if kindAt(ts, p.pos) is token.Kind.IntLit(v) {
 		advance(p)
 		return ast.Expr.Negate(ast.Expr.IntLit(v))
 	}
 	expected(ts, p, "a number after `-` in a pattern")
 	return ast.Expr.Absent()
+}
+
+// A literal past `Int`'s largest is a `UInt64` built by a call, which only an
+// expression has room for.
+proc refusesWide(ts: token.Token[], p: mut Parse, where: Str): Bool {
+	if kindAt(ts, p.pos) is token.Kind.IntLit(v) {
+		if v < 0 {
+			fail(ts, p, "a literal past `Int`'s largest cannot be written in {where}: it is a `UInt64`, built where it is written, and only an expression has room for that")
+			return true
+		}
+	}
+	return false
 }
 
 func boundBy(pattern: ast.Pattern): Str[dyn] {
@@ -2071,6 +2286,11 @@ func boundBy(pattern: ast.Pattern): Str[dyn] {
 				append(out, name)
 			}
 		}
+	} else if pattern is ast.Pattern.BitsPat(fields, rest) {
+		for each f in fields {
+			append(out, f.name)
+		}
+		append(out, rest)
 	}
 	return out
 }
@@ -2118,7 +2338,62 @@ proc parsePattern(ts: token.Token[], p: mut Parse): ast.Pattern {
 		advance(p)
 		return parseVectorPattern(ts, p)
 	}
+	if k == token.Kind.Shl() {
+		advance(p)
+		return parseBitsPattern(ts, p)
+	}
 	return parseConstructorPattern(ts, p)
+}
+
+// `<<version: UInt4, 0x45, "PNG", body: UInt8[size], ...rest>>`.
+proc parseBitsPattern(ts: token.Token[], p: mut Parse): ast.Pattern {
+	mut ast.BitField[dyn] fields = []
+	for ; p.failed == false && atEnd(ts, p) == false; {
+		if kindAt(ts, p.pos) == token.Kind.Shr() {
+			advance(p)
+			return ast.Pattern.BitsPat(fields, "")
+		}
+		if kindAt(ts, p.pos) == token.Kind.Ellipsis() {
+			advance(p)
+			rest := expectIdent(ts, p, naming.Role.Binding())
+			expect(ts, p, token.Kind.Shr())
+			return ast.Pattern.BitsPat(fields, rest)
+		}
+		append(fields, parseBitField(ts, p))
+		if kindAt(ts, p.pos) == token.Kind.Comma() {
+			advance(p)
+		} else if kindAt(ts, p.pos) != token.Kind.Shr() && p.failed == false {
+			expected(ts, p, "`,` or `>>` in a binary pattern")
+		}
+	}
+	return ast.Pattern.BitsPat(fields, "")
+}
+
+proc parseBitField(ts: token.Token[], p: mut Parse): ast.BitField {
+	mut name := ""
+	mut ast.Expr value = ast.Expr.Absent()
+	if startsLiteral(ts, p.pos) {
+		value = parseLiteral(ts, p)
+	} else {
+		name = expectIdent(ts, p, naming.Role.Binding())
+	}
+	mut declared := ast.TypeExpr.VoidType()
+	mut ast.Expr length = ast.Expr.Absent()
+	if kindAt(ts, p.pos) == token.Kind.Colon() {
+		advance(p)
+		// `UInt8[size]`: a length the type grammar has no room for, since it is
+		// read off the value being matched.
+		if wordAt(ts, p.pos) != "" && kindAt(ts, p.pos + 1) == token.Kind.LBracket() {
+			declared = ast.TypeExpr.Named("", wordAt(ts, p.pos), [], [])
+			advance(p)
+			advance(p)
+			length = parseExpr(ts, p)
+			expect(ts, p, token.Kind.RBracket())
+		} else {
+			declared = parseTypeExpr(ts, p)
+		}
+	}
+	return ast.BitField(name, value, declared, length, littleAt(ts, p))
 }
 
 // A string pattern's holes bind; they do not compute. Two rules keep that

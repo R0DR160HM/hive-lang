@@ -56,6 +56,11 @@ test "a name nothing declared is named" {
 	assert problem(inMain("echo nowhere")) == "in `main`: `nowhere` is not a name anything here declared"
 }
 
+test "a keyword in another casing is a name like any other" {
+	stmt := "type Stmt \{ Return \{ value: Int }  Break }\ntype Query \{ text: Str }\n"
+	assert problemCount(stmt + inMain("proC := Query(\"c\")  s := Stmt.Return(1)  echo proC.text  echo s")) == 0
+}
+
 test "a field a type does not have is named" {
 	got := problem("type User \{ id: Int }\nproc main(): void \{ echo User(1).nope }")
 	assert got == "in `main`: `User` has no field `nope`"
@@ -254,29 +259,44 @@ test "a func may call a proc" {
 		+ "func build(): Int[dyn] \{ mut Int[dyn] out = []  fill(out, 1)  return out }") == 0
 }
 
-test "what a func hands a mutex parameter is its own storage and nothing else" {
+test "what a func hands a mut parameter is its own storage and nothing else" {
 	got := problem("proc fill(out: mut Int[dyn], n: Int): void \{ append(out, n) }\n"
 		+ "func sneak(theirs: Int[dyn]): Int \{ fill(theirs, 1)  return len(theirs) }")
-	assert opens(got, "in `sneak`: `fill` asks for the mutex itself in `out: mut ...`")
+	assert opens(got, "in `sneak`: `fill` writes through `out: mut ...`")
 }
 
-test "a callable that asks for a mutex is a value like any other" {
+test "a callable that takes a mut parameter is a value like any other" {
 	grow := "proc grow(v: mut Str[dyn], tag: Str): void \{ append(v, tag) }\n"
 	assert problemCount(grow + inMain("mut Str[dyn] v = []  f := grow  f(v, \"x\")")) == 0
 	assert problemCount(grow + inMain("mut Str[dyn] v = []  f := grow(_, \"x\")  f(v)")) == 0
 	assert problemCount(grow + inMain("proc(mut Str[dyn], Str): void f = grow")) == 0
 }
 
-test "a call through a function value hands a mutex a `mut` variable" {
+test "a call through a function value hands a mut parameter a `mut` variable" {
 	grow := "proc grow(v: mut Str[dyn], tag: Str): void \{ append(v, tag) }\n"
 	assert opens(problem(grow + inMain("f := grow  f([\"a\"], \"x\")")),
-		"in `main`: `f` asks for the mutex itself in parameter 1, so the argument has to be a `mut` variable")
+		"in `main`: `f` writes through parameter 1, so the argument has to be a `mut` variable")
 }
 
-test "a partial application never captures a mutex" {
+test "one call never lends a vector and a path inside it" {
+	both := "proc both(v: mut Int[dyn], x: mut Int): void \{ append(v, 9)  x = 1 }\n"
+	assert opens(problem(both + inMain("mut Int[dyn] v = [1]  if v bounds 0 \{ both(v, v[0]) }")),
+		"in `main`: `both` is lent `v` and `v[0]`, which is inside it")
+	assert opens(problem(both + inMain("mut Int[dyn] v = [1]  f := both  if v bounds 0 \{ f(v, v[0]) }")),
+		"in `main`: `f` is lent `v` and `v[0]`, which is inside it")
+	boxed := "type Box \{ items: Int[dyn]  count: Int }\nproc put(b: mut Box, n: mut Int): void \{ b.count = n }\n"
+	assert opens(problem(boxed + inMain("mut Box b = Box([1], 0)  if b.items bounds 0 \{ put(b, b.items[0]) }")),
+		"in `main`: `put` is lent `b` and `b.items[0]`, which is inside it")
+	// A field holds still, and so do two elements of one vector.
+	assert problemCount(boxed + inMain("mut Box b = Box([1], 0)  put(b, b.count)")) == 0
+	pair := "proc pair(a: mut Int, b: mut Int): void \{ a = b }\n"
+	assert problemCount(pair + inMain("mut Int[dyn] v = [1, 2]  if v bounds 0 && v bounds 1 \{ pair(v[0], v[1]) }")) == 0
+}
+
+test "a partial application never captures a mut argument" {
 	grow := "proc grow(v: mut Str[dyn], tag: Str): void \{ append(v, tag) }\n"
 	assert opens(problem(grow + inMain("mut Str[dyn] v = []  f := grow(v, _)")),
-		"in `main`: `grow` asks for the mutex itself in `v: mut ...`, and a partial application captures")
+		"in `main`: `grow` writes through `v: mut ...`, and a partial application captures")
 }
 
 test "sort needs an order, and a map, an address or a type holding one has none" {
@@ -284,7 +304,7 @@ test "sort needs an order, and a map, an address or a type holding one has none"
 		"in `main`: `sort` puts a vector in its elements' own order, and hive.map.Map<Str, Int> has none")
 	assert opens(problem(inMain("v := [hive.json.JsonValue.Int(1)]  echo sort(v)")),
 		"in `main`: `sort` puts a vector in its elements' own order, and hive.json.JsonValue has none")
-	boxed := "type Box \{ where: Address }\n"
+	boxed := "type Box \{ where: Address<Int> }\n"
 	assert opens(problem(boxed + inMain("v := [Box(at(#A))]  echo len(sort(v))")),
 		"in `main`: `sort` puts a vector in its elements' own order, and Box has none")
 	assert problemCount(inMain("v := [hive.json.JsonValue.Int(1)]  echo sort(v, before)") + "\nfunc before(a: hive.json.JsonValue, b: hive.json.JsonValue): Bool \{ return false }") == 0
@@ -298,7 +318,7 @@ test "a service's handler writes its state and answers with one of its own messa
 	assert problemCount(note + good + inMain("box := spawn(inbox, 0)")) == 0
 	plain := "proc inbox(n: Int, note: Note): Note \{ return note }\n"
 	assert opens(problem(note + plain + inMain("box := spawn(inbox, 0)")),
-		"in `main`: a handler writes its state in place, so its first parameter takes the mutex itself")
+		"in `main`: a handler writes its state in place, so its first parameter is `mut`")
 	answers := "proc inbox(n: mut Int, note: Note): Int \{ return n }\n"
 	assert opens(problem(note + answers + inMain("box := spawn(inbox, 0)")),
 		"in `main`: a handler answers with one of its own messages, so it returns Note, and this one returns Int")
@@ -310,7 +330,7 @@ test "a service's handler writes its state and answers with one of its own messa
 
 test "spawn takes a handler with or without its own address, and a name to register it under" {
 	note := "type Note \{ Say \{ text: Str } }\n"
-	loud := "proc loud(n: mut Int, note: Note, me: Address): Note \{ return note }\n"
+	loud := "proc loud(n: mut Int, note: Note, me: Address<Note>): Note \{ return note }\n"
 	assert problemCount(note + loud + inMain("box := spawn(loud, 0)")) == 0
 	assert problemCount(note + loud + inMain("box := spawn(loud, 0, #Loud)  if box is Result.Ok(a) \{ kill(a) }")) == 0
 	assert problemCount(note + loud + inMain("box := hive.spawn(loud, 0, #Loud)")) == 0
@@ -318,27 +338,61 @@ test "spawn takes a handler with or without its own address, and a name to regis
 		"in `main`: the name `spawn` registers the service under wants Atom and this is Str")
 	wrong := "proc loud(n: mut Int, note: Note, me: Str): Note \{ return note }\n"
 	assert opens(problem(note + wrong + inMain("box := spawn(loud, 0)")),
-		"in `main`: a handler with a third parameter is handed its own address there, an `Address`, and this one takes Str")
-	many := "proc loud(n: mut Int, note: Note, me: Address, again: Address): Note \{ return note }\n"
+		"in `main`: a handler with a third parameter is handed its own address there, an `Address<Note>`, and this one takes Str")
+	other := "proc loud(n: mut Int, note: Note, me: Address<Int>): Note \{ return note }\n"
+	assert opens(problem(note + other + inMain("box := spawn(loud, 0)")),
+		"in `main`: a handler with a third parameter is handed its own address there, an `Address<Note>`, and this one takes Address<Int>")
+	many := "proc loud(n: mut Int, note: Note, me: Address<Note>, again: Address<Note>): Note \{ return note }\n"
 	assert opens(problem(note + many + inMain("box := spawn(loud, 0)")),
-		"in `main`: `spawn` wants a handler of the shape `proc(mut S, M): M`, or `proc(mut S, M, Address): M`")
+		"in `main`: `spawn` wants a handler of the shape `proc(mut S, M): M`, or `proc(mut S, M, Address<M>): M`")
 	assert opens(problem(note + loud + inMain("box := spawn(loud, 0)  kill(box)")),
-		"in `main`: what `kill` stops wants Address and this is Result<Address, hive.syslink.SyslinkError>")
+		"in `main`: what `kill` stops wants Address<M> and this is Result<Address<Note>, hive.syslink.SyslinkError>")
+}
+
+test "an address takes the messages its service does" {
+	note := "type Note \{ Say \{ text: Str } }\n"
+	inbox := "proc inbox(n: mut Int, note: Note): Note \{ return note }\n"
+	sent := "if spawn(inbox, 0) is Result.Ok(box) \{ "
+	assert problemCount(note + inbox + inMain(sent + "_ := box(Note.Say(\"hi\")) }")) == 0
+	assert problemCount(note + inbox + inMain(sent + "async box(Note.Say(\"hi\")) }")) == 0
+	assert opens(problem(note + inbox + inMain(sent + "_ := box(3) }")),
+		"in `main`: the message sent to an `Address<Note>` wants Note and this is Int")
+	assert opens(problem(note + inbox + inMain(sent + "_ := box(Note.Say(\"a\"), Note.Say(\"b\")) }")),
+		"in `main`: a send carries one message, and this passes 2 arguments")
+	assert opens(problem("proc h(a: Address): void \{ }\n" + inMain("")),
+		"in `h`: an address says what its service takes: `Address<M>`")
+	assert problemCount(note + "proc ask(a: Address<Note>): void \{ _ := a(Note.Say(\"hi\")) }\n" + inMain("")) == 0
 }
 
 test "at names a service on this node or another, and does no more" {
-	assert problemCount(inMain("here := at(#Cache)  there := at(\"10.0.0.4:9000\", #Cache)  kill(here)  kill(there)")) == 0
-	assert opens(problem(inMain("here := at(\"Cache\")")), "in `main`: the name `at` reaches wants Atom and this is Str")
-	assert opens(problem(inMain("there := at(#Node, #Cache)")),
+	assert problemCount(inMain("Address<Int> here = at(#Cache)  Address<Int> there = at(\"10.0.0.4:9000\", #Cache)  kill(here)  kill(there)")) == 0
+	assert problemCount(inMain("kill(at(#Cache))")) == 0
+	assert opens(problem(inMain("Address<Int> here = at(\"Cache\")")), "in `main`: the name `at` reaches wants Atom and this is Str")
+	assert opens(problem(inMain("Address<Int> there = at(#Node, #Cache)")),
 		"in `main`: the endpoint of the node `at` reaches wants Str and this is Atom")
-	assert opens(problem(inMain("there := at()")), "in `main`: `at` takes the name a service is registered under")
-	assert opens(problem(inMain("kill(#Cache)")), "in `main`: what `kill` stops wants Address and this is Atom")
+	assert opens(problem(inMain("Address<Int> there = at()")), "in `main`: `at` takes the name a service is registered under")
+	assert opens(problem(inMain("kill(#Cache)")), "in `main`: what `kill` stops wants Address<M> and this is Atom")
+	assert opens(problem(inMain("here := at(#Cache)")),
+		"in `main`: `at` has to land somewhere that says what the service takes")
+	assert problemCount("type Op \{ Ping }\n" + inMain("here := at(#Cache)  _ := here(Op.Ping())")) == 0
+	assert opens(problem("type Op \{ Ping }\ntype Other \{ Pong }\n" + inMain("here := at(#Cache)  _ := here(Op.Ping())  _ := here(Other.Pong())")), "in `main`: the message sent to an `Address<Op>` wants Op and this is Other")
+	assert problemCount("type Op \{ Ping }\nproc call(a: Address<Op>): void \{ }\n" + inMain("here := at(#Cache)  call(here)")) == 0
+	assert opens(problem(inMain("_ := at(#Cache)(3)")),
+		"in `main`: `at` says where a service is and nothing about what it takes")
+}
+
+test "a monitor's notice is one of the watcher's messages" {
+	note := "type Note \{ Gone }\n"
+	sent := "Address<Note> watcher = at(#Watcher)  Address<Int> target = at(#Target)  hive.syslink.monitor(watcher, target, "
+	assert problemCount(note + inMain(sent + "Note.Gone())")) == 0
+	assert opens(problem(note + inMain(sent + "3)")),
+		"in `main`: the notice `hive.syslink.monitor` posts to the watcher wants Note and this is Int")
 }
 
 test "a declaration of its own called Address wins, and hive.Address is still the builtin" {
 	own := "type Address \{ street: Str }\n"
 	assert problemCount(own + inMain("home := Address(\"Main St\")  echo home.street")) == 0
-	assert problemCount(own + "proc keep(a: hive.Address): void \{ kill(a) }\n" + inMain("keep(at(#Cache))")) == 0
+	assert problemCount(own + "proc keep(a: hive.Address<Int>): void \{ kill(a) }\n" + inMain("keep(at(#Cache))")) == 0
 	assert opens(problem("proc h(a: hive.syslink.Address): void \{ }\n" + inMain("")),
 		"in `h`: `hive.syslink` has no type `Address`")
 }
@@ -348,7 +402,7 @@ test "a window is a handler for spawn, and its view reads the state its update w
 	up := "proc up(n: mut Int, m: Msg): Msg \{ return m }\n"
 	view := "func view(n: Int): hive.ui.View \{ return hive.ui.text([], \"\{n}\") }\n"
 	assert problemCount(msg + up + view + inMain("w := spawn(hive.ui.window(\"T\", view, up), 0)")) == 0
-	loud := "proc up(n: mut Int, m: Msg, me: Address): Msg \{ return m }\n"
+	loud := "proc up(n: mut Int, m: Msg, me: Address<Msg>): Msg \{ return m }\n"
 	assert problemCount(msg + loud + view + inMain("w := spawn(hive.ui.window(\"T\", view, up), 0, #Main)")) == 0
 	assert opens(problem(msg + up + view + inMain("hive.ui.window(\"T\", view, up, 0)")),
 		"in `main`: `hive.ui.window` takes 3 arguments, and this call passes 4")
@@ -382,9 +436,9 @@ test "a call through a function value is held to its type" {
 		"in `main`: the declaration of `f` wants proc(mut Str[dyn], Str): void and this is proc(Str[dyn], Str): void")
 }
 
-test "a func cannot declare a mutex parameter" {
+test "a func cannot declare a mut parameter" {
 	got := problem("func grow(v: mut Str[dyn]): void \{ }")
-	assert opens(got, "in `grow`: a `func` cannot declare the mutex parameter `v: mut ...`")
+	assert opens(got, "in `grow`: a `func` cannot declare the `mut` parameter `v: mut ...`")
 }
 
 test "either may call either" {
@@ -431,7 +485,7 @@ test "prepend and drop follow append's rule exactly" {
 
 test "a mut parameter takes the caller's own storage, so its argument has to be mut" {
 	got := problem("proc grow(v: mut Str[dyn]): void \{ }\nproc main(): void \{ Str[dyn] v = []  grow(v) }")
-	assert opens(got, "in `main`: `grow` asks for the mutex itself")
+	assert opens(got, "in `main`: `grow` writes through")
 	assert problemCount("proc grow(v: mut Str[dyn]): void \{ }\nproc main(): void \{ mut Str[dyn] v = []  grow(v) }") == 0
 }
 
@@ -609,6 +663,15 @@ test "an empty map has to land somewhere that says what it holds" {
 	assert problemCount("import hive.map\nproc main(): void \{ hive.map.Map<Str, Int> m = hive.map.new()  echo len(m) }") == 0
 }
 
+test "an empty map takes its type from its first use, and keeps it" {
+	assert problemCount(inMain("mut m := hive.map.new()  hive.map.set(m, \"a\", 1)  echo hive.map.get(m, \"a\")")) == 0
+	assert problemCount("proc fill(m: mut hive.map.Map<Str, Int>): void \{ hive.map.set(m, \"a\", 1) }\n" + inMain("mut m := hive.map.new()  fill(m)  echo len(m)")) == 0
+	assert problemCount("func empty(): hive.map.Map<Str, Bool> \{ m := hive.map.new()  return m }\n" + inMain("echo len(empty())")) == 0
+	assert problemCount(inMain("mut m := hive.map.new()  if true \{ hive.map.set(m, 1, \"one\") }  echo len(m)")) == 0
+	assert opens(problem(inMain("mut m := hive.map.new()  hive.map.set(m, \"a\", 1)  hive.map.set(m, \"b\", \"two\")")), "in `main`: the value `hive.map.set` puts in wants Int and this is Str")
+	assert opens(problem(inMain("m := hive.map.new()  echo hive.map.has(m, \"a\")")), "in `main`: `hive.map.new()` has to land somewhere that says what it holds")
+}
+
 // --- Operators ---------------------------------------------------------------
 
 test "Hive never widens a number behind your back" {
@@ -712,8 +775,7 @@ test "a fragment is what `hive.sql.run` runs" {
 	assert problemCount(withConn("echo hive.sql.run(db, all())")) == 0
 	// It is a value, so it can be bound first and run later.
 	assert problemCount(withConn("q := all()  echo hive.sql.run(db, q)")) == 0
-	// And written down, which is the spelling `Query` could never have had:
-	// `Query` is `query` shouted, and a keyword is reserved however it is spelled.
+	// And written down.
 	assert problemCount(withConn("hive.sql.Fragment<User[dyn]> q = all()  echo hive.sql.run(db, q)")) == 0
 }
 
@@ -962,7 +1024,7 @@ test "the names it does have are left alone" {
 test "hive.syslink.setKey takes the key as a Secret and answers with nothing" {
 	assert problemCount(inMain("hive.syslink.setKey(bypass(\"ours\"))")) == 0
 	assert problemCount(inMain("syslink.setKey(key: bypass(\"ours\"))")) == 0
-	assert opens(problem(inMain("hive.syslink.setKey(\"ours\")")), "in `main`: the first argument of `hive.syslink.setKey` wants Secret and this is Str")
+	assert opens(problem(inMain("hive.syslink.setKey(\"ours\")")), "in `main`: the first argument of `hive.syslink.setKey` wants Secret<Str> and this is Str")
 }
 
 test "hive.time builds a stamp and reads the current instant" {
@@ -1028,7 +1090,7 @@ test "a library call is held to what its module takes" {
 	got := problem(inMain("health := 3  echo hive.math.max(0, health)"))
 	assert opens(got, "in `main`: the first argument of `hive.math.max` wants Float and this is Int")
 	assert opens(problem(inMain("echo hive.crypto.jwtCodec(1)")),
-		"in `main`: the first argument of `hive.crypto.jwtCodec` wants Secret and this is Int")
+		"in `main`: the first argument of `hive.crypto.jwtCodec` wants Secret<Str> and this is Int")
 	assert opens(problem(inMain("health := 3  echo hive.math.max(0.0, health)")),
 		"in `main`: the second argument of `hive.math.max` wants Float and this is Int")
 	assert problemCount(inMain("health := 3.0  echo hive.math.max(0.0, health)")) == 0
@@ -1411,18 +1473,19 @@ test "a function value fills only a slot whose calls it can take" {
 // --- Secrets -------------------------------------------------------------------
 
 test "a Secret is never echoed, panicked or interpolated" {
-	assert problem(inMain("echo bypass(\"pw\")")) == "in `main`: `echo` cannot show a `Secret`: only `reveal` turns one into text"
-	assert problem(inMain("panic bypass(\"pw\")")) == "in `main`: `panic` cannot show a `Secret`: only `reveal` turns one into text"
-	assert problem(inMain("s := bypass(\"pw\")  echo \"pw: \{s}\"")) == "in `main`: an interpolation cannot show a `Secret`: only `reveal` turns one into text"
+	assert problem(inMain("echo bypass(\"pw\")")) == "in `main`: `echo` cannot show Secret<Str>: only `reveal` opens a `Secret`"
+	assert problem(inMain("panic bypass(\"pw\")")) == "in `main`: `panic` cannot show Secret<Str>: only `reveal` opens a `Secret`"
+	assert problem(inMain("s := bypass(\"pw\")  echo \"pw: \{s}\"")) == "in `main`: an interpolation cannot show Secret<Str>: only `reveal` opens a `Secret`"
+	assert problem(inMain("echo bypass(42)")) == "in `main`: `echo` cannot show Secret<Int>: only `reveal` opens a `Secret`"
 	assert problemCount(inMain("echo reveal(bypass(\"pw\"))")) == 0
 }
 
 test "nor is anything holding a Secret" {
-	login := "type Login \{ user: Str  password: Secret }\n"
-	assert problem(login + inMain("echo Login(\"ada\", bypass(\"pw\"))")) == "in `main`: `echo` cannot show Login, which holds a `Secret`: only `reveal` turns one into text"
-	assert opens(problem(inMain("echo [bypass(\"pw\")]")), "in `main`: `echo` cannot show Secret[1], which holds")
+	login := "type Login \{ user: Str  password: Secret<Str> }\n"
+	assert problem(login + inMain("echo Login(\"ada\", bypass(\"pw\"))")) == "in `main`: `echo` cannot show Login, which holds a `Secret`: only `reveal` opens one"
+	assert opens(problem(inMain("echo [bypass(\"pw\")]")), "in `main`: `echo` cannot show Secret<Str>[1], which holds")
 	assert opens(problem("type Wrap \{ A \{ login: Login } }\n" + login + inMain("w := Wrap.A(Login(\"ada\", bypass(\"pw\")))  echo \"\{w}\"")), "in `main`: an interpolation cannot show Wrap, which holds")
-	assert opens(problem(inMain("panic hive.crypto.decrypt(\"x\", bypass(\"pw\"))")), "in `main`: `panic` cannot show Result<Secret, hive.crypto.CryptoError>")
+	assert opens(problem(inMain("panic hive.crypto.decrypt(\"x\", bypass(\"pw\"))")), "in `main`: `panic` cannot show Result<Secret<Str>, hive.crypto.CryptoError>")
 	assert problemCount(login + inMain("echo Login(\"ada\", bypass(\"pw\")).user")) == 0
 }
 
@@ -1436,66 +1499,209 @@ proc expandedProblems(source: Str): Str[dyn] {
 
 test "a generic copy at a Secret is held to the same rule" {
 	shown := "func shown(x: T): Str \{ return \"\{x}\" }\n"
-	assert expandedProblems(shown + inMain("echo shown(bypass(\"pw\"))")) == ["in `shown_hiveSecret`: an interpolation cannot show a `Secret`: only `reveal` turns one into text"]
+	assert expandedProblems(shown + inMain("echo shown(bypass(\"pw\"))")) == ["in `shown_hiveSecretStr`: an interpolation cannot show Secret<Str>: only `reveal` opens a `Secret`"]
 	assert len(expandedProblems(shown + inMain("echo shown(1)"))) == 0
+	keep := "func keep(x: T): Secret<T> \{ return bypass(x) }\n"
+	assert len(expandedProblems(keep + inMain("echo reveal(keep(1)) + 1  echo reveal(keep(\"a\")) + \"b\""))) == 0
 }
 
 test "a Secret has no JSON" {
-	login := "type Login \{ user: Str  password: Secret }\n"
-	assert problem(login + inMain("echo encode(Login(\"ada\", bypass(\"pw\")), hive.json.codec())")) == "in `main`: `encode` cannot carry Login: a `Secret` has no JSON, because only `reveal` turns one into text"
+	login := "type Login \{ user: Str  password: Secret<Str> }\n"
+	assert problem(login + inMain("echo encode(Login(\"ada\", bypass(\"pw\")), hive.json.codec())")) == "in `main`: `encode` cannot carry Login: a `Secret` has no JSON, because only `reveal` opens one"
 	assert opens(problem(login + inMain("if Login.decode(\"x\", hive.json.codec()) is Result.Ok(l) \{ echo l.user }")), "in `main`: `Login.decode` cannot carry Login")
 }
 
 test "hide answers a Secret or why it could not lock one" {
-	assert problemCount(inMain("if hide(\"pw\") is Result.Ok(s) \{ echo reveal(s) } else if hide(\"pw\") is Result.Error(why) \{ echo why.reason + why.message }")) == 0
-	assert problemCount(inMain("if hide(text: \"pw\") is Result.Ok(s) \{ echo reveal(secret: s) }")) == 0
-	assert opens(problem(inMain("echo hide(\"pw\")")), "in `main`: `echo` cannot show Result<Secret, SecretError>, which holds a `Secret`")
-	assert opens(problem(inMain("echo reveal(hide(\"pw\"))")), "in `main`: what `reveal` reads wants Secret and this is Result<Secret, SecretError>")
-	assert opens(problem(inMain("s := hide(1)")), "in `main`: what `hide` keeps wants Str and this is Int")
+	assert problemCount(inMain("if hide(\"pw\") is Result.Ok(s) \{ echo reveal(s) } else if hide(\"pw\") is Result.Error(why) \{ echo why.message }")) == 0
+	assert problemCount(inMain("if hide(\"pw\") is Result.Error(SecretError.LimitExceeded(m)) \{ echo m }")) == 0
+	assert problemCount(inMain("if hide(value: \"pw\") is Result.Ok(s) \{ echo reveal(secret: s) }")) == 0
+	assert opens(problem(inMain("echo hide(\"pw\")")), "in `main`: `echo` cannot show Result<Secret<Str>, SecretError>, which holds a `Secret`")
+	assert opens(problem(inMain("echo reveal(hide(\"pw\"))")), "in `main`: what `reveal` reads wants Secret<T> and this is Result<Secret<Str>, SecretError>")
+	assert problemCount(inMain("if hide(1) is Result.Ok(s) \{ echo reveal(s) + 1 }")) == 0
 }
 
 test "bypass answers a Secret that cannot fail" {
 	assert problemCount(inMain("s := bypass(\"pw\")  echo reveal(s) == \"pw\"")) == 0
-	assert problemCount(inMain("echo reveal(secret: bypass(text: \"pw\"))")) == 0
-	assert opens(problem(inMain("echo bypass(\"pw\")")), "in `main`: `echo` cannot show a `Secret`")
-	assert opens(problem(inMain("s := bypass(1)")), "in `main`: what `bypass` keeps wants Str and this is Int")
-	assert opens(problem(inMain("echo reveal(\"pw\")")), "in `main`: what `reveal` reads wants Secret and this is Str")
+	assert problemCount(inMain("echo reveal(secret: bypass(value: \"pw\"))")) == 0
+	assert opens(problem(inMain("echo bypass(\"pw\")")), "in `main`: `echo` cannot show Secret<Str>")
+	assert opens(problem(inMain("echo reveal(\"pw\")")), "in `main`: what `reveal` reads wants Secret<T> and this is Str")
 	assert opens(problem(inMain("echo reveal(bypass(\"a\"), bypass(\"b\"))")), "in `main`: `reveal`")
+}
+
+test "a Secret holds any plain value, and reveal answers with its type" {
+	login := "type Login \{ user: Str  pin: Int }\n"
+	assert problemCount(login + inMain("s := bypass(Login(\"ada\", 1))  echo reveal(s).pin + 1")) == 0
+	assert problemCount(inMain("Secret<Int[dyn]> v = bypass([1, 2])  echo len(reveal(v))")) == 0
+	assert problemCount(inMain("Result<Int, Str> r = Result.Ok(1)  echo reveal(bypass([r]))")) == 0
+	assert problemCount(inMain("hive.map.Map<Str, Int> m = hive.map.new()  echo hive.map.keys(reveal(bypass(m)))")) == 0
+	assert opens(problem(inMain("Secret<Str> s = bypass(1)")), "in `main`: the declaration of `s` wants Secret<Str> and this is Secret<Int>")
+	assert opens(problem(inMain("echo reveal(bypass(1)) + \"a\"")), "in `main`: `+`")
+}
+
+test "a Secret refuses what is not plain data" {
+	keepsNot := ": a `Secret` holds plain data — text, numbers, vectors, maps, results and declared types made of them — and not a function, an address, a library handle or another `Secret`"
+	assert problem("func twice(n: Int): Int \{ return n * 2 }\n" + inMain("s := bypass(twice)")) == "in `main`: `bypass` cannot keep func(Int): Int" + keepsNot
+	assert problem("type Inner \{ key: Secret<Str> }\n" + inMain("s := bypass(Inner(bypass(\"k\")))")) == "in `main`: `bypass` cannot keep Inner, which holds Secret<Str>" + keepsNot
+	assert problem(inMain("if hide(bypass(1)) is Result.Ok(s) \{ }")) == "in `main`: `hide` cannot keep Secret<Int>" + keepsNot
+	assert problem("proc f(s: Secret<proc(): void>): void \{ }\n" + inMain("")) == "in `f`: a `Secret` cannot keep proc(): void" + keepsNot
+	assert problem("type Box \{ conn: Secret<hive.net.WsConnection> }\n" + inMain("")) == "in `Box`: a `Secret` cannot keep hive.net.WsConnection" + keepsNot
+}
+
+test "a Secret says what it holds" {
+	assert problem("proc f(s: Secret): void \{ }\n" + inMain("")) == "in `f`: a secret says what it holds: `Secret<T>`, with `T` the type of its value"
+	assert problem(inMain("Secret s = bypass(\"pw\")")) == "in `main`: a secret says what it holds: `Secret<T>`, with `T` the type of its value"
 }
 
 test "secrets compare with == and have no order" {
 	assert problemCount(inMain("echo bypass(\"a\") == bypass(\"a\")  echo bypass(\"a\") != bypass(\"b\")")) == 0
+	assert problemCount(inMain("echo bypass([1]) == bypass([1])")) == 0
+	assert opens(problem(inMain("echo bypass(\"a\") == bypass(1)")), "in `main`: `==`")
 	assert opens(problem(inMain("echo bypass(\"a\") < bypass(\"b\")")), "in `main`: `<` orders an `Int`, a `Float` or a `Str`")
-	assert opens(problem(inMain("echo sort([bypass(\"a\")])")), "in `main`: `sort` puts a vector in its elements' own order, and Secret has none")
+	assert opens(problem(inMain("echo sort([bypass(\"a\")])")), "in `main`: `sort` puts a vector in its elements' own order, and Secret<Str> has none")
 	assert opens(problem(inMain("echo bypass(\"a\") + bypass(\"b\")")), "in `main`: `+` adds two numbers")
 }
 
 test "the library takes and hands back secrets" {
 	assert problemCount(inMain("if hive.crypto.decrypt(hive.crypto.encrypt(bypass(\"t\"), bypass(\"pw\")), bypass(\"pw\")) is Result.Ok(s) \{ echo reveal(s) }")) == 0
-	assert problemCount(inMain("if hive.crypto.randomSecret(32) is Result.Ok(k) \{ echo hive.crypto.hmacSha256(\"m\", k) } else if hive.crypto.randomSecret(32) is Result.Error(why) \{ echo why.reason }")) == 0
+	assert problemCount(inMain("if hive.crypto.randomSecret(32) is Result.Ok(k) \{ echo hive.crypto.hmacSha256(\"m\", k) } else if hive.crypto.randomSecret(32) is Result.Error(hive.SecretError.Unsupported(m)) \{ echo m }")) == 0
 	assert problemCount(inMain("if hive.term.readSecret() is Result.Ok(s) \{ echo reveal(s) } else if hive.term.readSecret() is Result.Error(why) \{ echo why.message }")) == 0
-	assert opens(problem(inMain("echo hive.crypto.hmacSha256(\"m\", hive.crypto.randomSecret(32))")), "in `main`: the second argument of `hive.crypto.hmacSha256` wants Secret and this is Result<Secret, SecretError>")
+	assert opens(problem(inMain("echo hive.crypto.hmacSha256(\"m\", hive.crypto.randomSecret(32))")), "in `main`: the second argument of `hive.crypto.hmacSha256` wants Secret<Str> and this is Result<Secret<Str>, SecretError>")
 	assert problemCount(inMain("hive.file.writeSecret(\"k\", bypass(\"s\"))")) == 0
 	assert problemCount(inMain("if hive.env.getSecret(\"KEY\") is Result.Ok(k) \{ echo reveal(k) } else if hive.env.getSecret(\"KEY\") is Result.Error(why) \{ echo why.key }")) == 0
-	assert opens(problem(inMain("echo hive.env.getSecret(\"KEY\")")), "in `main`: `echo` cannot show Result<Secret, hive.env.EnvironmentError>")
-	assert opens(problem(inMain("echo hive.term.readSecret()")), "in `main`: `echo` cannot show Result<Secret, SecretError>")
-	assert opens(problem(inMain("echo hive.crypto.encrypt(\"t\", bypass(\"pw\"))")), "in `main`: the first argument of `hive.crypto.encrypt` wants Secret and this is Str")
-	assert opens(problem(inMain("echo hive.crypto.hmacSha256(\"m\", \"key\")")), "in `main`: the second argument of `hive.crypto.hmacSha256` wants Secret and this is Str")
-	assert opens(problem(inMain("hive.file.writeSecret(\"k\", \"s\")")), "in `main`: the second argument of `hive.file.writeSecret` wants Secret and this is Str")
+	assert opens(problem(inMain("echo hive.env.getSecret(\"KEY\")")), "in `main`: `echo` cannot show Result<Secret<Str>, hive.env.EnvironmentError>")
+	assert opens(problem(inMain("echo hive.term.readSecret()")), "in `main`: `echo` cannot show Result<Secret<Str>, SecretError>")
+	assert opens(problem(inMain("echo hive.crypto.encrypt(\"t\", bypass(\"pw\"))")), "in `main`: the first argument of `hive.crypto.encrypt` wants Secret<Str> and this is Str")
+	assert opens(problem(inMain("echo hive.crypto.encrypt(bypass(1), bypass(\"pw\"))")), "in `main`: the first argument of `hive.crypto.encrypt` wants Secret<Str> and this is Secret<Int>")
+	assert opens(problem(inMain("echo hive.crypto.hmacSha256(\"m\", \"key\")")), "in `main`: the second argument of `hive.crypto.hmacSha256` wants Secret<Str> and this is Str")
+	assert opens(problem(inMain("hive.file.writeSecret(\"k\", \"s\")")), "in `main`: the second argument of `hive.file.writeSecret` wants Secret<Str> and this is Str")
 }
 
 test "readSecretBypass cannot fail, and decryptBypass fails only as decrypt does" {
 	assert problemCount(inMain("s := hive.term.readSecretBypass()  echo reveal(s)")) == 0
-	assert opens(problem(inMain("echo hive.term.readSecretBypass()")), "in `main`: `echo` cannot show a `Secret`")
-	assert problemCount(inMain("if hive.crypto.decryptBypass(password: bypass(\"pw\"), ciphertext: \"x\") is Result.Ok(s) \{ echo reveal(s) } else if hive.crypto.decryptBypass(\"x\", bypass(\"pw\")) is Result.Error(why) \{ echo why.reason }")) == 0
-	assert opens(problem(inMain("echo hive.crypto.decryptBypass(\"x\", bypass(\"pw\"))")), "in `main`: `echo` cannot show Result<Secret, hive.crypto.CryptoError>")
-	assert opens(problem(inMain("echo hive.crypto.decryptBypass(\"x\", \"pw\")")), "in `main`: the second argument of `hive.crypto.decryptBypass` wants Secret and this is Str")
+	assert opens(problem(inMain("echo hive.term.readSecretBypass()")), "in `main`: `echo` cannot show Secret<Str>")
+	assert problemCount(inMain("if hive.crypto.decryptBypass(password: bypass(\"pw\"), ciphertext: \"x\") is Result.Ok(s) \{ echo reveal(s) } else if hive.crypto.decryptBypass(\"x\", bypass(\"pw\")) is Result.Error(crypto.CryptoError.BadSignature(m)) \{ echo m }")) == 0
+	assert opens(problem(inMain("echo hive.crypto.decryptBypass(\"x\", bypass(\"pw\"))")), "in `main`: `echo` cannot show Result<Secret<Str>, hive.crypto.CryptoError>")
+	assert opens(problem(inMain("echo hive.crypto.decryptBypass(\"x\", \"pw\")")), "in `main`: the second argument of `hive.crypto.decryptBypass` wants Secret<Str> and this is Str")
+}
+
+test "a library error is a union of what went wrong" {
+	assert problemCount(inMain("if hive.file.read(\"x\") is Result.Error(why) \{ echo why.path + why.message }")) == 0
+	assert problemCount(inMain("if file.read(\"x\") is Result.Error(file.FileError.NotFound(path, _)) \{ echo path }")) == 0
+	assert opens(problem(inMain("if file.read(\"x\") is Result.Error(why) \{ echo why.reason }")),
+		"in `main`: `hive.file.FileError` has no field `reason`")
+	kinds := "func kind(why: hive.file.FileError): Str \{ switch why \{ file.FileError.NotFound(_, _) \{ return \"gone\" } file.FileError.Io(_, _) \{ return \"io\" } } }\n"
+	assert opens(problem(kinds + inMain("")),
+		"in `kind`: no arm of this `switch` takes `hive.file.FileError.Permission(_, _)`")
+	assert problemCount(inMain("why := hive.sql.SqlError.Statement(\"bad\")  echo why.message")) == 0
+	assert opens(problem(inMain("why := hive.sql.SqlError.Failed(\"bad\")")),
+		"in `main`: `hive.sql.SqlError` has no variant `Failed`")
+	assert problemCount(inMain("if spawn(hive.ui.window(\"T\", v, u), 0) is Result.Error(hive.syslink.SyslinkError.Taken(m)) \{ echo m }")
+		+ "\ntype Msg \{ Bumped }\nproc u(n: mut Int, m: Msg): Msg \{ return m }\nfunc v(n: Int): hive.ui.View \{ return hive.ui.text([], \"\{n}\") }") == 0
 }
 
 test "a program's own Secret comes before the builtin, which is still hive.Secret" {
 	own := "type Secret \{ code: Int }\ntype SecretError \{ code: Int }\n"
 	assert problemCount(own + inMain("echo Secret(1).code  echo SecretError(2).code")) == 0
-	assert problemCount(own + "proc keep(s: hive.Secret, r: Result<hive.Secret, hive.SecretError>): void \{ }\n" + inMain("keep(bypass(\"pw\"), hide(\"pw\"))")) == 0
+	assert problemCount(own + "proc keep(s: hive.Secret<Str>, r: Result<hive.Secret<Str>, hive.SecretError>): void \{ }\n" + inMain("keep(bypass(\"pw\"), hide(\"pw\"))")) == 0
 	same := "func same(a: T, b: T): Bool \{ return a == b }\n"
 	assert len(expandedProblems(own + same + inMain("echo same(bypass(\"a\"), bypass(\"a\"))  echo same(Secret(1), Secret(1))"))) == 0
+}
+
+// --- Bits --------------------------------------------------------------------
+
+test "a bitwise operator works on two integers of one type" {
+	assert problemCount(inMain("UInt8 a = 1  echo a & 0x0F  echo a | 1  echo a ^ 0xFF  echo ~a  UInt8 m = ~0x0F")) == 0
+	assert opens(problem(inMain("echo true & false")), "in `main`: `&` works on an integer's bits, and these are Bool. For two `Bool`s, `&&`")
+	assert opens(problem(inMain("echo 1.5 | 2.0")), "in `main`: `|` works on an integer's bits, and these are Float")
+	assert opens(problem(inMain("UInt8 a = 1  UInt16 b = 2  echo a & b")), "in `main`: `&` wants two of one type, and these are UInt8 and UInt16")
+	assert opens(problem(inMain("UInt8 a = 1  echo a & 0x1FF")), "in `main`: `&` wants UInt8, which holds 0 to 255, and this is 511")
+	assert opens(problem(inMain("echo ~true")), "in `main`: `~` flips an integer's bits, and this is Bool. For a `Bool`, `!`")
+	assert opens(problem(inMain("x := 3  echo !x")), "in `main`: `!` inverts a `Bool`, and this is Int. To flip an integer's bits, `~`")
+}
+
+test "a shift answers its left side, by a count that cannot be negative" {
+	assert problemCount(inMain("UInt8 n = 3  Int x = 1 << n  UInt16 w = 1  UInt16 y = w << 4  echo x  echo y")) == 0
+	assert opens(problem(inMain("n := 2  echo 1 << n")), "in `main`: the count `<<` shifts by has to be unsigned or a literal")
+	assert opens(problem(inMain("echo 1 << -1")), "in `main`: `<<` shifts by a number of bits, and -1 is negative")
+	assert opens(problem(inMain("echo 1.5 >> 1")), "in `main`: `>>` shifts an integer's bits, and this is Float")
+}
+
+test "the parts of a binary value come to whole bytes, a run of them starting on one" {
+	assert problemCount(inMain("UInt8[dyn] b = <<UInt4(4), UInt4(5), 0x0054: UInt16, \"ab\", [1, 2], 7>>  echo b")) == 0
+	assert opens(problem(inMain("echo <<UInt4(1)>>")), "in `main`: the parts of this `<<...>>` come to 4 bits, which is not a whole number of bytes")
+	assert opens(problem(inMain("x := 300  echo <<x: UInt16>>")), "in `main`: only a literal says its width in `<<...>>`")
+	assert opens(problem(inMain("echo <<300>>")), "in `main`: a literal in `<<...>>` is one byte unless it says otherwise, and 300 does not fit one")
+	assert opens(problem(inMain("echo <<UInt4(1), \"ab\", UInt4(2)>>")), "in `main`: `\"ab\"` starts 4 bits into a byte, and a run of bytes has to start on one")
+	assert opens(problem(inMain("echo <<1.5>>")), "in `main`: a part of `<<...>>` is an integer, a `UInt8[]` or a `Str`")
+}
+
+test "a binary pattern reads whole bytes, or every bit of an integer" {
+	bytes := "UInt8[dyn] v = [1, 2]  "
+	assert problemCount(inMain(bytes + "if v is <<a: UInt4, b: UInt4, n, body: UInt8[n], ...rest>> \{ echo a }")) == 0
+	assert problemCount(inMain("UInt16 w = 1  if w is <<a: UInt8, b: Int4, _: UInt4>> \{ echo a }")) == 0
+	assert problemCount(inMain("if \"PNG!\" is <<\"PNG\", ...rest>> \{ echo rest }")) == 0
+	assert opens(problem(inMain(bytes + "if v is <<a: UInt4>> \{ echo a }")), "in `main`: the fields of this pattern come to 4 bits, which is not a whole number of bytes")
+	assert opens(problem(inMain(bytes + "if v is <<a: UInt4, ...rest>> \{ echo a }")), "in `main`: `...rest` starts 4 bits into a byte")
+	assert opens(problem(inMain("UInt16 w = 1  if w is <<a: UInt8>> \{ echo a }")), "in `main`: the fields of this pattern take 8 bits, and UInt16 has 16")
+	assert opens(problem(inMain(bytes + "if v is <<a: UInt12 little, _: UInt4>> \{ echo a }")), "in `main`: `little` orders a number's bytes, and `a` is 12 bits")
+	assert opens(problem(inMain("Float f = 1.0  if f is <<a>> \{ echo a }")), "in `main`: a binary pattern matches a `UInt8[]`, a `Str` or an integer, and this subject is Float")
+	assert opens(problem(inMain(bytes + "if v is <<300>> \{ echo 1 }")), "in `main`: `300` does not fit UInt8, which is what this field reads")
+}
+
+test "a `switch` over binary patterns ends with `_`" {
+	assert problemCount(inMain("UInt8[dyn] v = [1]  switch v \{ <<1>> \{ echo 1 } _ \{ echo 2 } }")) == 0
+}
+
+// --- Sized numbers -----------------------------------------------------------
+
+test "a literal takes the sized type it lands in, and must fit it" {
+	assert problemCount(inMain("UInt4 x = 9  UInt8[dyn] v = [1, 2, 255]  Float32 f = 0.5  echo x  echo v  echo f")) == 0
+	assert problem(inMain("UInt4 x = 16")) == "in `main`: the declaration of `x` wants UInt4, which holds 0 to 15, and this is 16"
+	assert problem(inMain("Int4 x = -9")) == "in `main`: the declaration of `x` wants Int4, which holds -8 to 7, and this is -9"
+	assert opens(problem(inMain("UInt8[dyn] v = [1, 300]")), "in `main`: the declaration of `v` wants UInt8, which holds 0 to 255, and this is 300")
+	assert opens(problem(inMain("Float32 f = 999999999999999999999999999999999999999999.0")), "in `main`: the declaration of `f` wants a `Float32`")
+	assert problemCount("func paint(level: UInt4): UInt4 \{ return level + 1 }\n" + inMain("echo paint(9)")) == 0
+}
+
+test "Int64 and Float64 are Int and Float" {
+	assert problemCount(inMain("Int64 a = 1  Int b = a  Float64 c = 1.5  Float d = c  echo b  echo d")) == 0
+}
+
+test "a number never changes size on its own" {
+	assert problem(inMain("UInt8 a = 200  Int b = a")) == "in `main`: the declaration of `b` wants Int and this is UInt8"
+	assert problem(inMain("Int a = 1  UInt8 b = a")) == "in `main`: the declaration of `b` wants UInt8 and this is Int"
+	assert problem(inMain("Float32 a = 1.5  Float b = a")) == "in `main`: the declaration of `b` wants Float and this is Float32"
+	assert opens(problem("func grow(n: Int): Int \{ return n }\n" + inMain("UInt8 a = 1  echo grow(a)")), "in `main`: the argument `n` of `grow` wants Int and this is UInt8")
+	assert problemCount(inMain("UInt8 a = 200  Int b = Int(a)  UInt16 c = UInt16(a)  Float32 f = 1.5  Float d = Float(f)  echo b  echo c  echo d")) == 0
+}
+
+test "two numbers of different types do not mix, but two integers compare" {
+	assert opens(problem(inMain("UInt4 a = 1  UInt8 b = 2  echo a + b")), "in `main`: `+` wants two of one type, and these are UInt4 and UInt8. Hive never widens a number behind your back — convert one side to the other's type: `UInt8(x)`")
+	assert problemCount(inMain("UInt8 a = 1  Int b = 2  UInt64 c = 3  echo a < b  echo a == b  echo c >= b")) == 0
+	assert problemCount(inMain("UInt8 i = 1  Str[dyn] v = []  if v bounds i \{ echo v[i] }")) == 0
+	assert opens(problem(inMain("Float32 a = 1.5  Float b = 2.0  echo a * b")), "in `main`: `*` wants two of one type, and these are Float32 and Float")
+	assert opens(problem(inMain("Float32 a = 1.5  n := 2  echo a + n")), "in `main`: `+` wants two of one type, and these are Float32 and Int. Hive never widens a number behind your back — `hive.conv.itf`")
+	assert problemCount(inMain("UInt8 a = 1  UInt8 c = a + 2  echo c  echo a == 1")) == 0
+	assert problem(inMain("UInt8 a = 1  UInt8 c = a + 300")) == "in `main`: `+` wants UInt8, which holds 0 to 255, and this is 300"
+}
+
+test "an unsigned number has no negative" {
+	assert problem(inMain("UInt8 a = 1  echo -a")) == "in `main`: unary `-` negates a signed number, and UInt8 is unsigned: it has no negative values to answer with"
+	assert problem(inMain("UInt8 a = -1")) == "in `main`: the declaration of `a` wants UInt8, which holds 0 to 255, and this is -1"
+	assert problemCount(inMain("Int8 a = 1  echo -a")) == 0
+}
+
+test "a conversion is a call, plain or checked" {
+	assert problemCount(inMain("n := 300  echo UInt8(n)  echo Int(UInt64(n))  echo Float32(1.5)  echo hive.UInt4(n)")) == 0
+	assert problemCount(inMain("Float32 f = 2.0  echo hive.math.sqrt(f)  Float32 g = hive.math.max(f, 1.0)  echo g")) == 0
+	assert problemCount(inMain("n := 300  if UInt8.checked(n) is Result.Ok(b) \{ echo b } else if UInt8.checked(n) is Result.Error(bad) \{ echo bad + 1 }")) == 0
+	assert problem(inMain("echo UInt4(1.5)")) == "in `main`: `UInt4(x)` converts an integer, and this is Float. `hive.conv.round`, `floor` and `ceil` are how a float becomes an `Int`"
+	assert problem(inMain("echo Float32(1)")) == "in `main`: `Float32(x)` converts a float, and this is Int. `hive.conv.itf` and `itf32` are how an integer becomes a float"
+	assert opens(problem(inMain("echo Float32.checked(1.5)")), "in `main`: `Float32.checked` is not a call")
+	assert problemCount("type UInt4 \{ v: Int }\n" + inMain("echo UInt4(3).v")) == 0
+}
+
+test "a sized field takes a sized Default" {
+	assert problemCount("type Pixel \{ alpha: UInt8 -- Default as 255; }\n" + inMain("echo Pixel(1)")) == 0
+	assert opens(problem("type Pixel \{ alpha: UInt8 -- Default as 256; }\n" + inMain("echo Pixel(1)")), "in `Pixel`: `alpha` is declared UInt8 and falls back to Int")
 }

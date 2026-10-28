@@ -93,7 +93,7 @@ test "a field outside any variant is added to every variant" {
 	assert has(got, "type EventClosed struct \{\n\tAt int\n}")
 }
 
-test "a mutex parameter lowers to a pointer" {
+test "a mut parameter lowers to a pointer" {
 	got := go("proc grow(v: mut Str[dyn], tag: Str): void \{ }\nproc main(): void \{ }")
 	assert has(got, "func grow(v *[]string, tag string)")
 }
@@ -124,7 +124,7 @@ test "a name nothing shares with is no cell at all" {
 	assert has(got, "a = append(a, \"y\")")
 }
 
-test "a cell handed to a mutex parameter is the pointer it already holds" {
+test "a cell handed to a mut parameter is the pointer it already holds" {
 	got := go("proc grow(v: mut Str[dyn]): void \{ append(v, \"y\") }\nproc main(): void \{ mut Str[dyn] a = [\"x\"]  mut Str[dyn] b = a  grow(a) }")
 	assert has(got, "grow(a)")
 	assert has(got, "grow(&a)") == false
@@ -659,20 +659,43 @@ test "hide locks memory a file per platform, and bypass and reveal need none of 
 	assert has(stmt("echo reveal(bypass(\"pw\"))"), "hive.Reveal(hive.Bypass(\"pw\"))")
 	env := loader.loadText("main.hive", "proc main(): void \{ if hive.env.getSecret(\"K\") is Result.Ok(k) \{ echo reveal(k) } }")
 	assert join(emit.emitModule(env.module).modules, ",") == "env,secret,secretunix,secretwindows,secretother"
-	alone := loader.loadText("main.hive", "proc shown(s: Secret): Str \{ return reveal(s) }\nproc main(): void \{ }")
+	alone := loader.loadText("main.hive", "proc shown(s: Secret<Str>): Str \{ return reveal(s) }\nproc main(): void \{ }")
 	assert len(emit.emitModule(alone.module).modules) == 0
+}
+
+test "a Secret of anything but text is kept in a form written for its type" {
+	got := go("type Login \{ user: Str  pin: Int  codes: Str[dyn] }\nproc main(): void \{ if hide(Login(\"ada\", 1, [])) is Result.Ok(s) \{ echo reveal(s).pin } }")
+	assert has(got, "hive.HideWith(Login\{")
+	assert has(got, "hive.RevealWith(s, secretTake_Login)")
+	assert has(got, "func secretPut_Login(b *[]byte, x Login) \{")
+	assert has(got, "hive.SecretPutStr(b, x.User)")
+	assert has(got, "hive.SecretPutInt(b, x.Pin)")
+	assert has(got, "hive.SecretPutVec(b, x, hive.SecretPutStr)")
+	assert has(got, "func secretTake_Login(r *hive.SecretReader) Login \{")
+	bypassed := emit.emitModule(loader.loadText("main.hive", "proc main(): void \{ echo reveal(bypass([1, 2]))[0] }").module)
+	assert join(bypassed.modules, ",") == "secretvalue"
+	assert has(bypassed.source, "hive.RevealWith(hive.BypassWith(")
+	hidden := emit.emitModule(loader.loadText("main.hive", "proc main(): void \{ if hide(1) is Result.Ok(s) \{ echo reveal(s) } }").module)
+	assert join(hidden.modules, ",") == "secret,secretunix,secretwindows,secretother,secretvalue"
+}
+
+test "a Secret holding a union writes which variant it is" {
+	got := go("type Key \{ Pin \{ digits: Int }\n Phrase \{ words: Str[dyn] } }\nproc main(): void \{ echo reveal(bypass(Key.Pin(1))) is Key.Pin(_) }")
+	assert has(got, "if v, ok := x.(KeyPin); ok \{")
+	assert has(got, "hive.SecretPutInt(b, 1)")
+	assert has(got, "which := hive.SecretTakeInt(r)")
 }
 
 test "secrets compare what they hold, wherever they sit" {
 	assert has(stmt("echo bypass(\"a\") == bypass(\"b\")"), "hive.Eq(hive.Bypass(\"a\"), hive.Bypass(\"b\"))")
-	got := go("type Login \{ user: Str  password: Secret }\nproc main(): void \{ a := Login(\"ada\", bypass(\"pw\"))  echo a == a }")
+	got := go("type Login \{ user: Str  password: Secret<Str> }\nproc main(): void \{ a := Login(\"ada\", bypass(\"pw\"))  echo a == a }")
 	assert has(got, "hive.Eq(a, a)")
 	assert has(got, "Password hive.Secret")
 }
 
 test "a message carrying a Secret is refused where its codec is derived" {
-	got := go("type Msg \{ Key \{ key: Secret } }\nproc inbox(state: mut Int, m: Msg): Msg \{ return m }\nproc main(): void \{ if spawn(inbox, 0) is Result.Ok(a) \{ a(Msg.Key(bypass(\"k\"))) } }")
-	assert got == "emit: a `Secret` has no JSON, because only `reveal` turns one into text"
+	got := go("type Msg \{ Key \{ key: Secret<Str> } }\nproc inbox(state: mut Int, m: Msg): Msg \{ return m }\nproc main(): void \{ if spawn(inbox, 0) is Result.Ok(a) \{ a(Msg.Key(bypass(\"k\"))) } }")
+	assert got == "emit: a `Secret` has no JSON, because only `reveal` opens one"
 }
 
 test "a message carrying a Table is refused where its codec is derived" {
@@ -921,7 +944,7 @@ test "a query declared as a Table runs through the table reader" {
 	assert has(got, "hive.SqlTable(")
 }
 
-test "Int arithmetic stops at an edge rather than wrapping" {
+test "Int arithmetic goes through the runtime, so two literals that overflow wrap" {
 	got := stmt("a := 1  b := 2  echo a + b  echo a - b  echo a * b  echo -a")
 	assert has(got, "hive.AddInt(a, b)")
 	assert has(got, "hive.SubInt(a, b)")
@@ -940,4 +963,66 @@ test "a builtin or a library call takes its arguments by name, in the order writ
 	// Nothing to reorder when every argument is a value already.
 	assert has(stmt("echo hive.math.clamp(high: 1.0, value: 3.0, low: 0.0)"), "hive.MathClamp(3.0, 0.0, 1.0)")
 	assert has(stmt("mut Str[dyn] v = []  append(value: \"a\", vector: v)"), "v = append(v, \"a\")")
+}
+
+test "a sized integer lives in the Go integer that holds it, trimmed after each operation" {
+	got := stmt("UInt4 a = 15  echo a + 1  Int12 b = 1  echo b * b  UInt8 c = 1  echo c + c")
+	assert has(got, "var a uint8 = uint8(15)")
+	assert has(got, "hive.TrimU(hive.Add(a, uint8(1)), 4)")
+	assert has(got, "hive.TrimS(hive.Mul(b, b), 4)")
+	assert has(got, "hive.Add(c, c)")
+}
+
+test "a widening is written, and lowers to a Go conversion" {
+	got := stmt("UInt8 a = 1  Int b = Int(a)  Float32 f = 0.5  Float d = Float(f)  echo b  echo d")
+	assert has(got, "hive.Narrow[int](a)")
+	assert has(got, "float64(f)")
+	assert has(stmt("UInt8 i = 1  Str[dyn] v = []  if i < len(v) \{ echo v[i] }"), "v[int(i)]")
+}
+
+test "a conversion narrows through the runtime" {
+	assert has(stmt("n := 300  echo UInt4(n)"), "hive.TrimU(hive.Narrow[uint8](n), 4)")
+	assert has(stmt("n := 300  echo Int8(n)"), "hive.Narrow[int8](n)")
+	assert has(stmt("n := 300  echo UInt8.checked(n)"), "hive.CheckedU[uint8](n, 8)")
+	assert has(stmt("n := 300  echo Int4.checked(n)"), "hive.CheckedS[int8](n, 4)")
+}
+
+test "a vector of an odd width is packed, and a native width stays a slice" {
+	got := stmt("mut UInt4[dyn] v = [1, 2]  append(v, 3)  if v bounds 0 \{ v[0] = 9  echo v[0] }  for each x in v \{ echo x }  echo len(v)")
+	assert has(got, "var v hive.Packed[uint8] = hive.Pack(4, []uint8\{uint8(1), uint8(2)})")
+	assert has(got, "v = v.Append(4, uint8(3))")
+	assert has(got, "hive.InRangePacked(0, v)")
+	assert has(got, "v.Set(0, uint8(9))")
+	assert has(got, "hive.Echo(v.At(0))")
+	assert has(got, "range v.All \{")
+	assert has(got, "hive.Echo(v.Len())")
+	assert has(stmt("UInt8[dyn] w = [1]  echo w"), "var w []uint8 = []uint8\{uint8(1)}")
+}
+
+test "a packed vector is walked as a slice where the runtime already walks one" {
+	odd := "func odd(x: UInt4): Bool \{ return x % 2 == 1 }" + newline()
+	got := go(odd + "proc main(): void \{ UInt4[dyn] v = [1]  echo sort(v)  echo filter(v, odd) }")
+	assert has(got, "hive.SortPacked(v)")
+	assert has(got, "hive.Pack(4, hive.Filter((v).Unpack(), odd))")
+}
+
+test "a bitwise operator is Go's, trimmed where the result can leave the width" {
+	got := stmt("UInt8 a = 1  UInt8 n = 2  UInt4 s = 3  echo a & 0x0F  echo ~s  echo a << n")
+	assert has(got, "hive.Echo((a & uint8(15)))")
+	assert has(got, "hive.Echo(hive.TrimU(^(s), 4))")
+	assert has(got, "hive.Echo(hive.Shl(a, n))")
+}
+
+test "a binary value is written part by part, and a binary pattern read field by field" {
+	got := stmt("UInt8 a = 1  echo <<a, 0x0102: UInt16 little>>")
+	assert has(got, "hive.PutBits(&_wr1, a, 8); hive.PutBitsLittle(&_wr1, uint16(258), 16); return _wr1.Bytes()")
+	read := stmt("UInt8[dyn] v = [1]  if v is <<x: UInt4, _: UInt4>> \{ echo x }")
+	assert has(read, "x := hive.TakeBits[uint8](&_rd")
+	assert has(read, ".Done() \{ return }; return x, true }(); _ok")
+}
+
+test "a packed element lent to a `mut` parameter is copied out and written back" {
+	bump := "proc bump(x: mut UInt4): void \{ x = x + 1 }" + newline()
+	got := go(bump + "proc main(): void \{ mut UInt4[dyn] v = [1]  if v bounds 0 \{ bump(v[0]) } }")
+	assert has(got, "_p1 := &v; _i2 := 0; _t3 := _p1.At(_i2); bump(&_t3); hive.PutBack(_p1, _i2, _t3)")
 }

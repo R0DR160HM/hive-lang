@@ -35,7 +35,7 @@ operators are listed before their one-character prefixes below.
 
 ### Keywords
 
-Every keyword is lower case **and only lower case**:
+Every keyword is lower case, and **only that spelling is reserved**:
 
 ```
 import   proc     func     query    test     type
@@ -45,33 +45,19 @@ dyn      mut      async    await    for      in
 each     bounds   break    continue
 ```
 
-A word that is a keyword in some other casing — `IF`, `Proc`, `VOID` — is
-**neither a keyword nor a name**. It is a compile error naming both readings.
-The alternative, reading it as an identifier, would hide the mistake somewhere
-further on where its shape is no longer visible.
-
-```hive
-Proc main(): void { }   // compile error: `Proc` is a keyword written the wrong way
-```
-
-This reaches further than it first looks, because it holds of **every**
-identifier position, not only the ones where a keyword would make sense. No
-name anywhere in a program — a type, a variant, a field, a variable — may
-lowercase to a keyword. So a tagged union of statement kinds cannot have a
-variant called `Return`, `Break` or `Echo`, and a type cannot have a field
-called `type` or `query`:
+Any other casing is an ordinary name — `Proc`, `IF`, `proC` — so a union of
+statement kinds may have a variant called `Return`, and a type may be called
+`Query`:
 
 ```hive
 type Stmt {
-	Return { value: Expr }   // compile error: `Return` is `return` shouted
-	ReturnStmt { value: Expr }  // fine
+	Return { value: Expr }   // fine: `Return` is a name, `return` the keyword
+	Break
 }
 ```
 
-The rule is worth the cost. A keyword that meant one thing in lower case and
-another in Pascal case would make `Is` and `is`, or `Type` and `type`, two
-different things that read alike — and the mistake would surface as a parse
-error somewhere else entirely.
+A field cannot be called `type` or `query`, since those are the keywords
+themselves.
 
 Two words are keywords **only where they are written**, and are ordinary
 identifiers everywhere else: `as` (after an import path) and `timeout` (in
@@ -82,20 +68,30 @@ identifiers everywhere else: `as` (after an import path) and `timeout` (in
 
 | | |
 | --- | --- |
-| two-character | `:=` `>=` `<=` `==` `!=` `**` `&&` `\|\|` `++` `--` `+=` `-=` `*=` `/=` |
-| three-character | `...` (the vector-pattern rest marker) |
-| one-character | `{` `}` `(` `)` `[` `]` `:` `;` `,` `.` `>` `<` `=` `+` `-` `*` `/` `%` `\|` `!` |
+| two-character | `:=` `>=` `<=` `==` `!=` `**` `&&` `\|\|` `++` `--` `+=` `-=` `*=` `/=` `&=` `\|=` `^=` `<<` `>>` `\|>` |
+| three-character | `...` (the vector-pattern rest marker), `<<=` `>>=` |
+| one-character | `{` `}` `(` `)` `[` `]` `:` `;` `,` `.` `>` `<` `=` `+` `-` `*` `/` `%` `\|` `&` `^` `~` `!` |
 
 `...` must be matched before `.`, and each two-character operator before its
 prefix. `!=` is therefore looked for before `!`, and a `!` reaching the
-one-character row is one standing on its own: the negation. `||` is looked for
-before `|` the same way, and a `|` reaching that row is the pipe.
+one-character row is one standing on its own: the negation. `||`, `|>` and `|=`
+are looked for before `|` the same way, and a `|` reaching that row is bitwise or.
+
+A `>>` is one token, and also two `>` closing two lists of type arguments —
+`Map<Str, Result<Int, Str>>` — which the parser takes one half at a time.
 
 ### Literals
 
 **Integers** are decimal digit runs: `0`, `42`. There is no sign in the token —
 `-1` is unary minus applied to `1`. An `Int` is 64-bit and signed
 ([05](05-expressions.md#57-arithmetic-at-the-edges)).
+
+`0x` opens a hexadecimal one and `0b` a binary one: `0xFF`, `0b1010`, digits in
+either case after a lower-case prefix. A `_` may sit between two digits of any
+number, `1_000_000` and `0xFFFF_0000`, and means nothing. A hexadecimal or binary
+literal is read as the 64 bits it spells, so one of 2^63 or more —
+`0xFFFF_FFFF_FFFF_FFFF` — is past `Int`'s largest and is a **`UInt64`**; more
+than 64 bits is a compile error. A decimal literal stops at `Int`'s largest.
 
 **Floats** are a digit run, a `.`, and a digit run: `1.0`, `3.14`. A trailing or
 leading dot is not a float.

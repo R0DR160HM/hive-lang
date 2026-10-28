@@ -1,0 +1,367 @@
+// A `:=` binding of `hive.map.new()` or `at(...)` says nothing about what it
+// holds, so it takes its type from the first later use that does, and keeps it.
+import ./ast
+import ./infer
+import ./stdlib
+import ./types
+
+proc pinModule(m: ast.Module): ast.Module {
+	t := types.tableOf(m)
+	base := infer.newEnv(t)
+	mut ast.Decl[dyn] out = []
+	for each d in m.decls {
+		if d is ast.Decl.CallableDecl(kind, name, params, result, body, line) {
+			append(out, ast.Decl.CallableDecl(kind, name, params, result, pinBlock(infer.boundParams(base, params, 0), body, types.resolve(t, result)), line))
+		} else if d is ast.Decl.TestDecl(title, body, line) {
+			append(out, ast.Decl.TestDecl(title, pinBlock(base, body, types.Ty.TVoid()), line))
+		} else {
+			append(out, d)
+		}
+	}
+	return ast.Module(m.imports, out, m.foreign)
+}
+
+proc pinBlock(env: infer.Env, body: ast.Block, result: types.Ty): ast.Block {
+	mut ast.Stmt[dyn] out = []
+	pinStmts(env, body.stmts, 0, result, out)
+	return ast.Block(out)
+}
+
+proc pinStmts(env: infer.Env, stmts: ast.Stmt[], at: Int, result: types.Ty, out: mut ast.Stmt[dyn]): void {
+	if stmts bounds at {
+		mut pinned := pinInside(env, stmts[at], result)
+		if pinned is ast.Stmt.VarDecl(name, value, mutable, deferred) && unwritten(value) {
+			held := unpinned(env, value)
+			found := firstUse(infer.bound(env, name, held), name, stmts, at + 1, result, held)
+			if complete(found) {
+				pinned = ast.Stmt.TypedDecl(types.toWritten(found), name, value, mutable, deferred)
+			}
+		}
+		append(out, pinned)
+		pinStmts(stepped(env, pinned), stmts, at + 1, result, out)
+	}
+}
+
+func unpinned(env: infer.Env, value: ast.Expr): types.Ty {
+	if infer.typeOf(env, value) is types.Ty.TAddress(_) {
+		return infer.typeOf(env, value)
+	}
+	return types.Ty.TMap(types.Ty.TUnknown(), types.Ty.TUnknown())
+}
+
+func stepped(env: infer.Env, s: ast.Stmt): infer.Env {
+	if s is ast.Stmt.VarDecl(name, value, _, _) {
+		return infer.bound(env, name, infer.typeOf(env, value))
+	}
+	if s is ast.Stmt.TypedDecl(declared, name, _, _, _) {
+		return infer.bound(env, name, types.resolve(env.table, declared))
+	}
+	return env
+}
+
+func elementEnv(env: infer.Env, name: Str, declared: ast.TypeExpr, subject: ast.Expr): infer.Env {
+	if declared is ast.TypeExpr.VoidType {
+		return infer.bound(env, name, types.elementOf(infer.typeOf(env, subject)))
+	}
+	return infer.bound(env, name, types.resolve(env.table, declared))
+}
+
+proc pinInside(env: infer.Env, s: ast.Stmt, result: types.Ty): ast.Stmt {
+	if s is ast.Stmt.IfChain(branches, otherwise, hasElse) {
+		mut ast.Branch[dyn] out = []
+		for each b in branches {
+			append(out, ast.Branch(b.condition, pinBlock(infer.narrowed(env, b.condition), b.body, result)))
+		}
+		return ast.Stmt.IfChain(out, pinBlock(env, otherwise, result), hasElse)
+	}
+	if s is ast.Stmt.SwitchStmt(lets, subjects, arms, line) {
+		inner := steppedAll(env, lets, 0)
+		mut ast.Branch[dyn] out = []
+		for each b in arms {
+			append(out, ast.Branch(b.condition, pinBlock(infer.narrowed(inner, b.condition), b.body, result)))
+		}
+		return ast.Stmt.SwitchStmt(lets, subjects, out, line)
+	}
+	if s is ast.Stmt.ForLoop(init, cond, post, body) {
+		return ast.Stmt.ForLoop(init, cond, post, pinBlock(stepped(env, init), body, result))
+	}
+	if s is ast.Stmt.ForEach(name, declared, subject, body) {
+		return ast.Stmt.ForEach(name, declared, subject, pinBlock(elementEnv(env, name, declared, subject), body, result))
+	}
+	return s
+}
+
+func steppedAll(env: infer.Env, stmts: ast.Stmt[], at: Int): infer.Env {
+	if stmts bounds at {
+		return steppedAll(stepped(env, stmts[at]), stmts, at + 1)
+	}
+	return env
+}
+
+func unwritten(value: ast.Expr): Bool {
+	if value is ast.Expr.Call(callee, _) {
+		if callee is ast.Expr.Ident(name) {
+			return name == "at"
+		}
+		if callee is ast.Expr.Member(subject, name) {
+			if subject is ast.Expr.Ident(hiveName) {
+				return hiveName == "hive" && name == "at"
+			}
+			return name == "new" && libraryModule(subject) == "map"
+		}
+	}
+	return false
+}
+
+func libraryModule(e: ast.Expr): Str {
+	if e is ast.Expr.Member(root, module) && root is ast.Expr.Ident(hiveName) && hiveName == "hive" {
+		return module
+	}
+	return ""
+}
+
+func complete(ty: types.Ty): Bool {
+	if ty is types.Ty.TAddress(message) {
+		return (message is types.Ty.TUnknown) == false
+	}
+	if ty is types.Ty.TMap(key, value) {
+		return (key is types.Ty.TUnknown) == false && (value is types.Ty.TUnknown) == false
+	}
+	return false
+}
+
+// What is known so far, with what one use says filled into its gaps. What was
+// known first stays: a later use that disagrees is a type error, not a revision.
+func merged(sofar: types.Ty, seen: types.Ty): types.Ty {
+	if sofar is types.Ty.TAddress(types.Ty.TUnknown) && seen is types.Ty.TAddress(message) {
+		return types.Ty.TAddress(message)
+	}
+	if sofar is types.Ty.TMap(key, value) && seen is types.Ty.TMap(seenKey, seenValue) {
+		mut k := key
+		if k is types.Ty.TUnknown {
+			k = seenKey
+		}
+		mut v := value
+		if v is types.Ty.TUnknown {
+			v = seenValue
+		}
+		return types.Ty.TMap(k, v)
+	}
+	return sofar
+}
+
+proc firstUse(env: infer.Env, name: Str, stmts: ast.Stmt[], at: Int, result: types.Ty, sofar: types.Ty): types.Ty {
+	if complete(sofar) {
+		return sofar
+	}
+	if stmts bounds at {
+		s := stmts[at]
+		found := inStmt(env, name, s, result, sofar)
+		return firstUse(stepped(env, s), name, stmts, at + 1, result, found)
+	}
+	return sofar
+}
+
+proc inBlock(env: infer.Env, name: Str, body: ast.Block, result: types.Ty, sofar: types.Ty): types.Ty {
+	return firstUse(env, name, body.stmts, 0, result, sofar)
+}
+
+proc inStmt(env: infer.Env, name: Str, s: ast.Stmt, result: types.Ty, sofar: types.Ty): types.Ty {
+	if s is ast.Stmt.VarDecl(_, value, _, _) {
+		return inExpr(env, name, value, sofar)
+	}
+	if s is ast.Stmt.TypedDecl(declared, _, value, _, _) {
+		return inExpr(env, name, value, landed(sofar, name, value, types.resolve(env.table, declared)))
+	}
+	if s is ast.Stmt.Assign(target, value) {
+		mut known := landed(sofar, name, value, infer.typeOf(env, target))
+		known = landed(known, name, target, infer.typeOf(env, value))
+		return inExpr(env, name, value, inExpr(env, name, target, known))
+	}
+	if s is ast.Stmt.ReturnStmt(value) {
+		return inExpr(env, name, value, landed(sofar, name, value, result))
+	}
+	if s is ast.Stmt.IfChain(branches, otherwise, _) {
+		mut known := sofar
+		for each b in branches {
+			known = inExpr(env, name, b.condition, known)
+			known = inBlock(infer.narrowed(env, b.condition), name, b.body, result, known)
+		}
+		return inBlock(env, name, otherwise, result, known)
+	}
+	if s is ast.Stmt.SwitchStmt(lets, subjects, arms, _) {
+		mut known := firstUse(env, name, lets, 0, result, sofar)
+		for each subject in subjects {
+			known = inExpr(env, name, subject, known)
+		}
+		inner := steppedAll(env, lets, 0)
+		for each b in arms {
+			known = inBlock(infer.narrowed(inner, b.condition), name, b.body, result, known)
+		}
+		return known
+	}
+	if s is ast.Stmt.ForLoop(init, cond, post, body) {
+		inner := stepped(env, init)
+		mut known := inStmt(env, name, init, result, sofar)
+		known = inExpr(inner, name, cond, known)
+		known = inBlock(inner, name, body, result, known)
+		return inStmt(inner, name, post, result, known)
+	}
+	if s is ast.Stmt.ForEach(element, declared, subject, body) {
+		return inBlock(elementEnv(env, element, declared, subject), name, body, result, inExpr(env, name, subject, sofar))
+	}
+	if s is ast.Stmt.EchoStmt(value) { return inExpr(env, name, value, sofar) }
+	if s is ast.Stmt.AssertStmt(condition) { return inExpr(env, name, condition, sofar) }
+	if s is ast.Stmt.PanicStmt(value) { return inExpr(env, name, value, sofar) }
+	if s is ast.Stmt.AsyncStmt(call) { return inExpr(env, name, call, sofar) }
+	if s is ast.Stmt.Expression(value) { return inExpr(env, name, value, sofar) }
+	return sofar
+}
+
+func landed(sofar: types.Ty, name: Str, e: ast.Expr, wanted: types.Ty): types.Ty {
+	if e is ast.Expr.Ident(written) && written == name {
+		return merged(sofar, wanted)
+	}
+	return sofar
+}
+
+proc inExpr(env: infer.Env, name: Str, e: ast.Expr, sofar: types.Ty): types.Ty {
+	if complete(sofar) {
+		return sofar
+	}
+	if e is ast.Expr.Call(callee, args) {
+		mut known := inExpr(env, name, callee, sofar)
+		for each a in args {
+			known = inExpr(env, name, a.value, known)
+		}
+		return inCall(env, name, callee, args, known)
+	}
+	if e is ast.Expr.Binary(_, left, right) {
+		return inExpr(env, name, right, inExpr(env, name, left, sofar))
+	}
+	if e is ast.Expr.Negate(operand) { return inExpr(env, name, operand, sofar) }
+	if e is ast.Expr.Not(operand) { return inExpr(env, name, operand, sofar) }
+	if e is ast.Expr.BitNot(operand) { return inExpr(env, name, operand, sofar) }
+	if e is ast.Expr.Member(subject, _) { return inExpr(env, name, subject, sofar) }
+	if e is ast.Expr.Index(subject, index) {
+		return inExpr(env, name, index, inExpr(env, name, subject, sofar))
+	}
+	if e is ast.Expr.IsMatch(subject, _) { return inExpr(env, name, subject, sofar) }
+	if e is ast.Expr.Timed(call, ms) {
+		return inExpr(env, name, ms, inExpr(env, name, call, sofar))
+	}
+	if e is ast.Expr.VectorLit(items) {
+		mut known := sofar
+		for each item in items {
+			known = inExpr(env, name, item, known)
+		}
+		return known
+	}
+	if e is ast.Expr.Bits(parts) {
+		mut known := sofar
+		for each part in parts {
+			known = inExpr(env, name, part.value, known)
+		}
+		return known
+	}
+	if e is ast.Expr.Interp(parts) {
+		mut known := sofar
+		for each part in parts {
+			if part is ast.InterpPart.Expression(value) {
+				known = inExpr(env, name, value, known)
+			}
+		}
+		return known
+	}
+	return sofar
+}
+
+proc inCall(env: infer.Env, name: Str, callee: ast.Expr, args: ast.Arg[], sofar: types.Ty): types.Ty {
+	if callee is ast.Expr.Ident(called) && called == name {
+		return merged(sofar, types.Ty.TAddress(infer.typeOf(env, ast.argFor(args, "", 0))))
+	}
+	if callee is ast.Expr.Member(subject, field) && libraryModule(subject) == "map" {
+		ordered := stdlib.libraryArgs("map", field, args)
+		if ordered bounds 0 && ordered[0].value is ast.Expr.Ident(first) && first == name {
+			mut value := types.Ty.TUnknown()
+			if field == "set" && ordered bounds 2 {
+				value = infer.typeOf(env, ordered[2].value)
+			}
+			if ordered bounds 1 {
+				return merged(sofar, types.Ty.TMap(infer.typeOf(env, ordered[1].value), value))
+			}
+		}
+		return sofar
+	}
+	return handedTo(env, name, callee, args, sofar)
+}
+
+proc handedTo(env: infer.Env, name: Str, callee: ast.Expr, args: ast.Arg[], sofar: types.Ty): types.Ty {
+	known := sofar
+	if callee is ast.Expr.Ident(called) {
+		target := infer.callTarget(env, called)
+		if target is infer.CallTarget.Declared(info) {
+			return byName(env, name, info.params, args, known)
+		}
+		if target is infer.CallTarget.Struct(fields) {
+			return byField(env, name, fields, args, known)
+		}
+		if target is infer.CallTarget.Bound {
+			if infer.lookup(env, called) is types.Ty.TFn(_, params, _, _) {
+				return byPosition(name, params, args, known)
+			}
+		}
+		return known
+	}
+	if callee is ast.Expr.Member(subject, field) {
+		if subject is ast.Expr.Ident(head) {
+			if types.findVariant(env.table, head, field) is Result.Ok(fields) {
+				return byField(env, name, fields, args, known)
+			}
+			return known
+		}
+		module := libraryModule(subject)
+		if module != "" {
+			return byPosition(name, stdlib.paramsOf(module, field), stdlib.libraryArgs(module, field, args), known)
+		}
+	}
+	return known
+}
+
+func byName(env: infer.Env, name: Str, params: ast.Param[], args: ast.Arg[], sofar: types.Ty): types.Ty {
+	mut known := sofar
+	mut open := 0
+	for each p in params {
+		found := ast.argFor(args, p.name, open)
+		if ast.claimedByName(args, p.name) == false {
+			open = open + 1
+		}
+		known = landed(known, name, found, types.resolve(env.table, p.declared))
+	}
+	return known
+}
+
+func byField(env: infer.Env, name: Str, fields: ast.Field[], args: ast.Arg[], sofar: types.Ty): types.Ty {
+	mut known := sofar
+	mut open := 0
+	for each f in fields {
+		found := ast.argFor(args, f.name, open)
+		if ast.claimedByName(args, f.name) == false {
+			open = open + 1
+		}
+		known = landed(known, name, found, types.resolve(env.table, f.declared))
+	}
+	return known
+}
+
+func byPosition(name: Str, params: types.Ty[], args: ast.Arg[], sofar: types.Ty): types.Ty {
+	mut known := sofar
+	mut i := 0
+	for each a in args {
+		if params bounds i {
+			known = landed(known, name, a.value, params[i])
+		}
+		i = i + 1
+	}
+	return known
+}

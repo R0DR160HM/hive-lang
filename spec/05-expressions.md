@@ -54,25 +54,25 @@ parameters have no names.
 
 ### Piping a value in
 
-`x | f(a)` is **sugar** for `f(x, a)`: the value on the left becomes the call's
-first argument. `|` is left-associative, so a chain of them reads in the order
+`x |> f(a)` is **sugar** for `f(x, a)`: the value on the left becomes the call's
+first argument. `|>` is left-associative, so a chain of them reads in the order
 it runs:
 
 ```hive
-echo nums | filter(isEven) | map(label) | join(" ")
+echo nums |> filter(isEven) |> map(label) |> join(" ")
 ```
 
 The right side has to be something that can be called — a call, a callable's
 name, or a constructor — and a stage with nothing else in it needs no
-parentheses: `x | f` is `f(x)`, as `x | f()` is. A `proc`, a builtin and a
+parentheses: `x |> f` is `f(x)`, as `x |> f()` is. A `proc`, a builtin and a
 constructor all pipe, and a `_` in a stage still makes that call a partial
 application, since what a pipe leaves behind is the call somebody could have
 written by hand.
 
-`|` binds tighter than every binary operator and looser than the prefix ones,
-which lets a pipeline sit on either side of one — `v | len > 2` compares the
-length. It takes the value written **beside** it, so `1 + 2 | f` is `1 + f(2)`
-and a computed value goes in parentheses: `(1 + 2) | f`.
+`|>` binds tighter than every binary operator and looser than the prefix ones,
+which lets a pipeline sit on either side of one — `v |> len > 2` compares the
+length. It takes the value written **beside** it, so `1 + 2 |> f` is `1 + f(2)`
+and a computed value goes in parentheses: `(1 + 2) |> f`.
 
 ## 5.4 Function values
 
@@ -105,14 +105,14 @@ A constructor has **no bare reference**: a variant is a value once it is built,
 so `Msg.Changed` on its own is a compile error and the hole is what makes one a
 function value ([03](03-types.md#34-declared-types)).
 
-**A callable with a mutex parameter is a value like any other.** `f := grow` is a
+**A callable with a `mut` parameter is a value like any other.** `f := grow` is a
 `proc(mut Str[dyn], Str): void`, and `grow(_, "x")` a `proc(mut Str[dyn]): void`.
-A mutex position in a partial application has to stay a hole: what is supplied is
+A `mut` position in a partial application has to stay a hole: what is supplied is
 captured by value, so writes through it would land in a copy nobody sees.
 
 **A call through a function value is held to the value's type**: how many
 arguments, what each one is, and a `mut` variable or a path into one wherever the
-type says `mut` ([8.2](08-mutability-and-values.md#82-mutex-parameters)). A
+type says `mut` ([8.2](08-mutability-and-values.md#82-mut-parameters)). A
 function value's parameters have no names, so its arguments go by position.
 
 Two things cannot become values:
@@ -145,20 +145,71 @@ no subscript at all ([03](03-types.md#36-maps)).
 
 | operator | on | yields |
 | --- | --- | --- |
-| `+` | `Int`, `Float` | the sum |
+| `+` | numbers | the sum |
 | `+` | `Str` | concatenation |
 | `+` | vectors | a **new** vector, lengths added |
-| `-` `*` `/` `%` `**` | `Int`, `Float` | arithmetic |
-| unary `-` | `Int`, `Float` | negation |
+| `-` `*` `/` `%` `**` | numbers | arithmetic |
+| unary `-` | signed numbers | negation |
 | unary `!` | `Bool` | the opposite |
 | `==` `!=` | any two values of one type | structural equality |
-| `<` `>` `<=` `>=` | `Int`, `Float`, `Str` | ordering |
+| `<` `>` `<=` `>=` | numbers, `Str` | ordering |
 | `&&` `\|\|` | `Bool` | short-circuiting conjunction, disjunction |
 | `is` | see [07](07-patterns.md) | a `Bool`, binding as it matches |
 | `bounds` | a vector and an `Int` | sugar for `i >= 0 && i < hive.len(v)` |
-| `\|` | a value and a callable | sugar for the call with the value first |
+| `&` `\|` `^` | two integers of one type | bitwise and, or, exclusive or |
+| `<<` `>>` | an integer, and a count that is unsigned or a literal | shifted; the left side's type |
+| unary `~` | an integer | every bit flipped |
+| `\|>` | a value and a callable | sugar for the call with the value first |
 
 `%` is the remainder operator and has the same precedence as `*` and `/`.
+
+**Arithmetic wants two numbers of one type**, and answers that type:
+`UInt4 + UInt8` is a compile error until one side is converted, `UInt8(a) + b`, and
+so is `Float32 + Float`. A literal on one side takes the other side's type, so
+`a + 1` on a `UInt4` stays a `UInt4` and `a += 1` works — and a literal that type
+cannot hold is a compile error.
+
+**Two integers compare whatever their sizes.** `==`, `!=`, `<`, `>`, `<=` and `>=`
+take any two integers and compare their values — a `UInt64` at its largest is not
+equal to an `Int` of `-1` — since comparing converts nothing that is kept. That is
+what keeps `i < len(v)` and `v bounds i` guards for a sized `i`. Floats of
+different sizes do not compare without a conversion, and an integer never compares
+with a float.
+
+### Bits
+
+`&`, `|` and `^` take two integers of one type — a literal beside one takes its
+type, as in arithmetic — and answer that type. `~x` flips every bit of an
+integer. A shift, `x << n` or `x >> n`, answers `x`'s type whatever `n` is, and
+`n` is an **unsigned integer or a literal**, so it is never negative; shifting by
+the width or more shifts everything out. A right shift copies the sign bit of a
+signed type and fills an unsigned one with zeros.
+
+A result stays within its type's width, as arithmetic's does: `~` of a `UInt4` 3
+is 12, and a `UInt8` at 202 shifted left by one is 148. `~` on a literal is
+worked in the type it lands in, since a literal's bits depend on its width:
+`UInt8 m = ~0x0F` is `0xF0`.
+
+A `Bool` takes none of these. `&&`, `||` and `!=` are its and, or and exclusive
+or, and `!` its not.
+
+### Building bytes
+
+`<<a, b, c>>` is a `UInt8[dyn]` built from its parts in order, most significant
+bit first. Each part is as wide as its type: a `UInt4` writes four bits, a
+`UInt16` two bytes, an `Int` eight, and a `UInt8[]` or a `Str` its bytes. A literal
+is one byte unless it says otherwise, `0x0D0A: UInt16`. Only a literal says its
+type there: a value of another width is converted, `UInt16(x)`. `little` after a
+part writes its bytes least significant first.
+
+```hive
+UInt8[dyn] header = <<UInt4(4), UInt4(5), 0, length, payload>>
+UInt8[dyn] size = <<UInt32(n) little>>
+```
+
+The parts have to come to whole bytes, and a run of bytes or a `little` number has
+to start on one. Every width is known at compile time, so both are compile
+errors. The way back is a binary pattern ([07](07-patterns.md#79-binary-patterns)).
 
 ### Unary `!`
 
@@ -228,25 +279,32 @@ Most of arithmetic is unsurprising. These are the cases worth stating exactly:
 | expression | result |
 | --- | --- |
 | `a / 0`, `a % 0` (`Int` or `Float`) | `0` — division and remainder by zero are values, not crashes |
-| `Int` overflow (`+ - * **`, unary `-`, `/`) | stays at the edge it would have passed: `MAX + 1` is `MAX`, `MIN - 1` is `MIN` |
-| `2 ** 100` | `9223372036854775807` — the edge above, reached by repeated multiplication |
-| `-MIN`, `MIN * -1`, `MIN / -1` | `MAX` — the one answer `MIN` has no opposite for |
+| `Int` overflow (`+ - * **`, unary `-`, `/`) | wraps round, two's-complement: `MAX + 1` is `MIN`, `MIN - 1` is `MAX` |
+| `2 ** 100` | `0` — the wrap above, reached by repeated multiplication |
+| `-MIN`, `MIN * -1`, `MIN / -1` | `MIN` — the one value with no opposite is its own |
 | `n ** k` with `k < 0` (`Int`) | `0`, including `1 ** -1` |
 | `n ** 0` | `1` |
 | `-7 % 3` | `-1` — the remainder takes the sign of the dividend |
 | `10.0 ** 400.0` | `+Inf` — `Float` arithmetic does produce non-finite values |
 
 `MAX` and `MIN` are the largest and smallest `Int`, `9223372036854775807` and
-`-9223372036854775808`. An `Int` never wraps around from one to the other: a sum,
-difference, product or power that would pass one **is** that one, and it stays
-there — so a counter that reaches `MAX` sits at `MAX` however much more is added,
-rather than turning negative. Compound assignments and `++`/`--` are arithmetic
-like any other and stop at the same edges.
+`-9223372036854775808`. A sum, difference, product or power that would pass one
+comes round from the other, as the machine's own arithmetic does — so a counter
+that passes `MAX` turns negative. Compound assignments and `++`/`--` are
+arithmetic like any other and wrap the same way. Two literals that overflow
+together, `9223372036854775807 + 1`, wrap too, rather than being refused.
 
-`**` on `Int`s is repeated multiplication and stops at an edge the same way. A
-negative `Int` exponent has no integral answer, so it yields `0` rather than a
-fraction. For the mathematical answer, work in `Float`, where `**` is real
-exponentiation.
+`**` on `Int`s is repeated multiplication and wraps the same way. A negative
+`Int` exponent has no integral answer, so it yields `0` rather than a fraction.
+For the mathematical answer, work in `Float`, where `**` is real exponentiation.
+
+A sized integer follows every row of the table at its own width: a `UInt4` wraps
+at 16, an `Int4` at −8 and 7, and `-` on an unsigned type is a compile error, since
+it has no negative values to answer with. A `Float32` follows `Float`'s rows in
+single precision.
+
+The bounds pass knows a counter can wrap: a counting loop proves its counter's
+low half only where it cannot pass `MAX` ([10](10-bounds.md#101-what-counts-as-a-proof)).
 
 ### Unspecified behaviour
 

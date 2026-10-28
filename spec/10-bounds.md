@@ -13,11 +13,26 @@ An access is safe when one of these holds:
 * the access sits under a **guard the pass can read**:
   * `if i >= 0 && i < len(v) { v[i] }`,
   * `if v bounds i { v[i] }` — the same guard, spelled shorter,
-  * the condition of a counting `for` loop;
+  * the condition of a counting `for` loop — `for i := 0; i < len(v); i++` — whose
+    counter starts at a non-negative literal, steps by one, and is held strictly
+    below something by its condition (`i < e`, or that on either side of an
+    `&&`). An `Int` wraps past `MAX` ([05](05-expressions.md#57-arithmetic-at-the-edges)),
+    so a counter stepping by more, or with nothing above it, could turn negative,
+    and proves nothing;
 * the index came from **`indexOf`** ([10.5](#105-indexof-returns-an-index-you-can-use));
+* the index is a **sized integer** ([3.1](03-types.md#sized-numbers)) and the
+  vector's known length is past the top of its type: a `UInt4` indexes any vector
+  of 16 or more, and an `Int4` one of 8 or more under an `i >= 0` guard. An
+  unsigned index is never negative, so against a `[dyn]` vector only
+  `i < len(v)` is left to guard. Wrapping keeps this true after arithmetic: `i + 1`
+  on a `UInt4` at 15 is 0. The bound travels with the type — `Int(i)` is an `Int`,
+  and proves nothing;
+* the index is **masked by a literal**, `i & 15`, against a vector whose known
+  length is past it: the result is never negative and never above the mask,
+  whatever `i` holds — `buckets[hash & 255]` on a `Str[256]`;
 * the access is a **`for each`**, which never indexes.
 
-A **computed** index is not provable and must be bound to a variable and guarded:
+Any other **computed** index is not provable and must be bound to a variable and guarded:
 
 ```hive
 echo v[len(v) - 1]           // compile error: the index is a computed expression

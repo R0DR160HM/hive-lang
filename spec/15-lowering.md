@@ -17,6 +17,10 @@ file, plus a generated `hive` runtime package.
 | fields declared outside any variant | appended to **every** variant struct, each read through a getter on the interface: `e.at` → `e.sharedAt()` |
 | `Str` `Int` `Float` `Bool` `Atom` | `string` `int` `float64` `bool` `hive.Atom` |
 | `Str[3]`, `Str[dyn]`, `Str[]` | `[]string` — all three, which is why value semantics exist |
+| `UInt4`, `Int12`, `Float32` | the smallest Go type that holds one: `uint8`, `int16`, `float32`, every result trimmed back to its width by `hive.TrimU` / `hive.TrimS` |
+| `UInt8[dyn]`, a width Go has | `[]uint8` |
+| `UInt4[dyn]`, any other width | `hive.Packed[uint8]`, its values back to back in `uint64` words: `v[i]` is `v.At(i)` and `v[i] = x` is `v.Set(i, x)` |
+| `p(v[i])`, `v` packed, into a `mut` parameter | `v[i]` copied out, `p(&copy)`, and the copy written back by `hive.PutBack` |
 | `test "..." { }` | a `t.Run(...)` in a generated `main_test.go`, run by `go test` |
 | `assert c` (ordinary code) | `hive.Assert(c, "c")` — a panic quoting `c`; a comparison goes through `hive.AssertCmp` with both sides |
 | `assert c` (inside a `test`) | a recorded failure quoting `c` and, for a comparison, both sides |
@@ -24,7 +28,7 @@ file, plus a generated `hive` runtime package.
 | `mut b = a` (both `mut`, owns storage) | no variable — `b` compiles to `a`, so one slice header is shared |
 | `ys := xs` (needs a copy) | a generated deep clone, chosen by the static type |
 | `f(mutVec)` (argument names `mut` storage) | `f(hive.CloneVec(mutVec))` |
-| `p(v: mut T)` (a mutex parameter) | `p(v *T)`, read and written through `(*v)` |
+| `p(v: mut T)` (a `mut` parameter) | `p(v *T)`, read and written through `(*v)` |
 | `p(mutVec)` (waited for) | `p(&mutVec)` — the callee writes the caller's own storage |
 | `async p(mutVec)` (fired off) | `{ _a0 := hive.CloneVec(mutVec); go p(&_a0) }` |
 | `proc(mut T, U): R` (a function type) | `func(*T, U) R` — a call through one hands over the address exactly as `p(mutVec)` does |
@@ -38,6 +42,10 @@ file, plus a generated `hive` runtime package.
 | `append(v, x)` (a statement) | `v = append(v, x)` — Go's own, with the new header written back |
 | `prepend(v, x)` / `drop(v, a, b)` | `hive.Prepend(&v, x)` / `hive.Drop(&v, a, b)` — the address, since both rewrite the header |
 | `for each x in v { }` | `for _, x := range v { }` |
+| `a & b`, `a \| b`, `a ^ b`, `~a` | Go's own `&`, `\|`, `^`, `^a`; a sized result of `~` trimmed back to its width |
+| `a << n`, `a >> n` | `hive.Shl(a, n)` / `hive.Shr(a, n)`, so two literals shifted past the width wrap rather than being refused by Go; `<<` on a sized integer trimmed |
+| `<<a, b, payload>>` | a function literal filling a `hive.BitWriter` part by part, answering its `[]uint8` |
+| `x is <<v: UInt4, ...rest>>` | a function literal reading a `hive.BitReader` field by field, answering each binding and whether all of it matched, in the `if`'s own header |
 | `x is Result.Ok(v)` / `x is T.Variant(a, _)` | `IsOk()` + accessor / a type assertion, which takes the union — a variant built on the spot is converted to it first; `_` binds nothing |
 | `x is T.Variant(a) && a > 0` outside an `if` | the guards that `if` would write, inside a `func() bool { … }()` answering whether they all held |
 | `if <call> is Result.Ok(v)` | one `if` with an init slot, so the call is evaluated once |
@@ -63,6 +71,8 @@ file, plus a generated `hive` runtime package.
 | `Msg.Changed(_)` (a constructor hole) | `func(_h0 string) Msg { return Msg(MsgChanged{Text: _h0}) }` |
 | `ui.row(attrs, kids)` / `ui.Tone.Danger()` | `hive.UiRow(..)` / `hive.Tone("Danger")` |
 | `Result<T, E>`, `Table`, `hive.file.TableError` | provided by the runtime package |
+| `hive.file.FileError` and the library's other error unions | a union declared in the program like any other, plus `lift_hive_file_FileError`, which turns the runtime's struct — its `Reason` naming the variant — into one; a call answering with one is wrapped in `hive.LiftBad(.., lift_..)` |
+| `Address<M>` | `hive.SyslinkAddress`, whatever `M` is: the mailbox type is the checker's, and the digest on the wire guards it at run time |
 
 ## 15.2 Two rules worth stating outside the table
 
