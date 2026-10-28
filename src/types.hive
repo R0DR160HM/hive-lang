@@ -37,7 +37,7 @@ type Ty {
 	// `hive.codec.Codec<E>` — a format, and the error decoding in it answers with.
 	TCodec { error: Ty }
 	// A function value: `func(Int): Int` or `proc(mut Str[dyn]): void`.
-	TFn { pure: Bool, params: Ty[dyn], mutexes: Bool[dyn], result: Ty }
+	TFn { pure: Bool, params: Ty[dyn], mutables: Bool[dyn], result: Ty }
 	// An opaque type the standard library owns: `hive.net.HttpRequest`,
 	// `hive.sql.SqlConnection`. Carried and compared by name.
 	TLib { module: Str, name: Str }
@@ -249,12 +249,12 @@ func resolve(t: Table, written: ast.TypeExpr): Ty {
 	if written is ast.TypeExpr.VoidType {
 		return Ty.TVoid()
 	}
-	if written is ast.TypeExpr.Fn(pure, params, mutexes, result) {
+	if written is ast.TypeExpr.Fn(pure, params, mutables, result) {
 		mut Ty[dyn] out = []
 		for each p in params {
 			append(out, resolve(t, p))
 		}
-		return Ty.TFn(pure, out, mutexes, resolve(t, result))
+		return Ty.TFn(pure, out, mutables, resolve(t, result))
 	}
 	if written is ast.TypeExpr.Named(pkg, name, args, dims) {
 		return wrap(resolveBase(t, pkg, name, args), dims)
@@ -379,12 +379,12 @@ func toWritten(ty: Ty): ast.TypeExpr {
 	if ty is Ty.TCodec(error) {
 		return ast.TypeExpr.Named("hive.codec", "Codec", [toWritten(error)], [])
 	}
-	if ty is Ty.TFn(pure, params, mutexes, result) {
+	if ty is Ty.TFn(pure, params, mutables, result) {
 		mut ast.TypeExpr[dyn] out = []
 		for each p in params {
 			append(out, toWritten(p))
 		}
-		return ast.TypeExpr.Fn(pure, out, mutexes, toWritten(result))
+		return ast.TypeExpr.Fn(pure, out, mutables, toWritten(result))
 	}
 	// An unknown has no spelling. It only reaches here from an expression that
 	// has already been reported, and `Str` is as good a stand-in as any.
@@ -444,7 +444,7 @@ func show(ty: Ty): Str {
 	else if ty is Ty.TMap(key, value) { return "hive.map.Map<" + show(key) + ", " + show(value) + ">" }
 	else if ty is Ty.TFragment(rows) { return "hive.sql.Fragment<" + show(rows) + ">" }
 	else if ty is Ty.TCodec(error) { return "hive.codec.Codec<" + show(error) + ">" }
-	else if ty is Ty.TFn(pure, params, mutexes, result) {
+	else if ty is Ty.TFn(pure, params, mutables, result) {
 		mut word := "proc"
 		if pure {
 			word = "func"
@@ -452,7 +452,7 @@ func show(ty: Ty): Str {
 		mut Str[dyn] out = []
 		mut i := 0
 		for each p in params {
-			if mutexAt(mutexes, i) {
+			if mutableAt(mutables, i) {
 				append(out, "mut " + show(p))
 			} else {
 				append(out, show(p))
@@ -648,12 +648,12 @@ func accepts(to: Ty, from: Ty): Bool {
 	}
 	// A `func` value may fill a `proc` slot — pure widens to impure — and never
 	// the reverse.
-	if to is Ty.TFn(toPure, toParams, toMutexes, toResult) {
-		if from is Ty.TFn(fromPure, fromParams, fromMutexes, fromResult) {
+	if to is Ty.TFn(toPure, toParams, toMutables, toResult) {
+		if from is Ty.TFn(fromPure, fromParams, fromMutables, fromResult) {
 			if toPure && fromPure == false {
 				return false
 			}
-			return paramsAccept(toParams, fromParams, toMutexes) && sameMutexes(toMutexes, fromMutexes, len(toParams))
+			return paramsAccept(toParams, fromParams, toMutables) && sameMutables(toMutables, fromMutables, len(toParams))
 				&& accepts(toResult, fromResult)
 		}
 	}
@@ -720,33 +720,33 @@ func same(a: Ty, b: Ty): Bool {
 		if b is Ty.TCodec(bError) { return same(aError, bError) }
 		return false
 	}
-	if a is Ty.TFn(aPure, aParams, aMutexes, aResult) {
-		if b is Ty.TFn(bPure, bParams, bMutexes, bResult) {
+	if a is Ty.TFn(aPure, aParams, aMutables, aResult) {
+		if b is Ty.TFn(bPure, bParams, bMutables, bResult) {
 			return aPure == bPure && sameList(aParams, bParams)
-				&& sameMutexes(aMutexes, bMutexes, len(aParams)) && same(aResult, bResult)
+				&& sameMutables(aMutables, bMutables, len(aParams)) && same(aResult, bResult)
 		}
 		return false
 	}
 	return false
 }
 
-func mutexAt(mutexes: Bool[], i: Int): Bool {
-	if mutexes bounds i {
-		return mutexes[i]
+func mutableAt(mutables: Bool[], i: Int): Bool {
+	if mutables bounds i {
+		return mutables[i]
 	}
 	return false
 }
 
-func sameMutexes(a: Bool[], b: Bool[], count: Int): Bool {
+func sameMutables(a: Bool[], b: Bool[], count: Int): Bool {
 	for i := 0; i < count; i++ {
-		if mutexAt(a, i) != mutexAt(b, i) {
+		if mutableAt(a, i) != mutableAt(b, i) {
 			return false
 		}
 	}
 	return true
 }
 
-func noMutexes(count: Int): Bool[dyn] {
+func noMutables(count: Int): Bool[dyn] {
 	mut Bool[dyn] out = []
 	for i := 0; i < count; i++ {
 		append(out, false)
@@ -802,15 +802,15 @@ func acceptsVector(toElement: Ty, toDim: ast.Dim, fromElement: Ty, fromDim: ast.
 
 // A function value is handed what the slot's parameters say, so each of its own
 // has to take that: `proc(Str[3])` cannot fill a `proc(Str[])` slot, whose calls
-// pass any length. A mutex position is written back through, so it is exact.
-func paramsAccept(slot: Ty[], given: Ty[], mutexes: Bool[]): Bool {
+// pass any length. A `mut` position is written back through, so it is exact.
+func paramsAccept(slot: Ty[], given: Ty[], mutables: Bool[]): Bool {
 	if len(slot) != len(given) {
 		return false
 	}
 	mut i := 0
 	for each wanted in slot {
 		if given bounds i {
-			if mutexAt(mutexes, i) {
+			if mutableAt(mutables, i) {
 				if same(wanted, given[i]) == false {
 					return false
 				}

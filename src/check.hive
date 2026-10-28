@@ -26,7 +26,7 @@ type Check {
 	inside: Str
 	// The line it was declared on — the best position a flattened tree offers.
 	line: Int
-	// Whether the body is a `func` — which may not declare a mutex parameter.
+	// Whether the body is a `func` — which may not declare a `mut` parameter.
 	pure: Bool
 	// What the body has to return, or `TVoid`.
 	result: types.Ty
@@ -151,8 +151,8 @@ proc checkQuery(c: mut Check, env: infer.Env, params: ast.Param[], result: ast.T
 			report(c, "this declares the parameter `{p.name}` twice")
 		}
 		append(seen, p.name)
-		if p.mutex {
-			report(c, "a query cannot declare the mutex parameter `{p.name}: mut ...`: its body is SQL, and there is nothing in one that could write through it")
+		if p.mutable {
+			report(c, "a query cannot declare the `mut` parameter `{p.name}: mut ...`: its body is SQL, and there is nothing in one that could write through it")
 		}
 	}
 	inner := infer.boundParams(env, params, 0)
@@ -758,12 +758,12 @@ proc checkCallable(c: mut Check, env: infer.Env, name: Str, params: ast.Param[],
 			report(c, "this declares the parameter `{p.name}` twice")
 		}
 		append(seen, p.name)
-		// Only a `proc` may ask for the mutex itself. A `mut` value handed to a
+		// Only a `proc` may ask for the caller's storage. A `mut` value handed to a
 		// `func` is seen as an ordinary immutable copy instead.
-		if p.mutex && c.pure {
-			report(c, "a `func` cannot declare the mutex parameter `{p.name}: mut ...`. What a `func` promises is that it cannot write to storage its caller can see, and a mutex is exactly that storage — make it a `proc`, or take an ordinary `{p.name}: ...` and answer with the new value")
+		if p.mutable && c.pure {
+			report(c, "a `func` cannot declare the `mut` parameter `{p.name}: mut ...`. What a `func` promises is that it cannot write to storage its caller can see, and a `mut` parameter is exactly that storage — make it a `proc`, or take an ordinary `{p.name}: ...` and answer with the new value")
 		}
-		if p.mutex {
+		if p.mutable {
 			append(c.mutable, p.name)
 		}
 	}
@@ -1451,8 +1451,8 @@ proc checkCall(c: mut Check, env: infer.Env, callee: ast.Expr, args: ast.Arg[]):
 		return
 	}
 	checkExpr(c, env, callee)
-	if infer.typeOf(env, callee) is types.Ty.TFn(_, params, mutexes, _) {
-		checkValueArguments(c, env, "this function value", params, mutexes, args)
+	if infer.typeOf(env, callee) is types.Ty.TFn(_, params, mutables, _) {
+		checkValueArguments(c, env, "this function value", params, mutables, args)
 	}
 }
 
@@ -1478,8 +1478,8 @@ proc checkNamedCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): v
 	target := infer.callTarget(env, name)
 	if target is infer.CallTarget.Bound {
 		checkCallableValue(c, env, name)
-		if infer.typeOf(env, ast.Expr.Ident(name)) is types.Ty.TFn(_, params, mutexes, _) {
-			checkValueArguments(c, env, "`{name}`", params, mutexes, args)
+		if infer.typeOf(env, ast.Expr.Ident(name)) is types.Ty.TFn(_, params, mutables, _) {
+			checkValueArguments(c, env, "`{name}`", params, mutables, args)
 		}
 	} else if target is infer.CallTarget.Declared(info) {
 		checkArguments(c, env, name, info, args)
@@ -1604,12 +1604,12 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
 	checkMember(c, env, subject, field)
 	// A call through a function value is checked by what the value's type says.
 	ty := infer.typeOf(env, ast.Expr.Member(subject, field))
-	if ty is types.Ty.TFn(_, params, mutexes, _) {
-		checkValueArguments(c, env, "`{field}`", params, mutexes, args)
+	if ty is types.Ty.TFn(_, params, mutables, _) {
+		checkValueArguments(c, env, "`{field}`", params, mutables, args)
 	}
 }
 
-proc checkValueArguments(c: mut Check, env: infer.Env, shown: Str, params: types.Ty[], mutexes: Bool[], args: ast.Arg[]): void {
+proc checkValueArguments(c: mut Check, env: infer.Env, shown: Str, params: types.Ty[], mutables: Bool[], args: ast.Arg[]): void {
 	if len(params) != len(args) {
 		report(c, shown + " takes " + countOf(len(params)) + ", and this call passes " + countOf(len(args)))
 		return
@@ -1625,8 +1625,8 @@ proc checkValueArguments(c: mut Check, env: infer.Env, shown: Str, params: types
 			i = i + 1
 			continue
 		}
-		if types.mutexAt(mutexes, i) {
-			checkMutexArgument(c, shown, "parameter {i + 1}", a.value, partial)
+		if types.mutableAt(mutables, i) {
+			checkMutableArgument(c, shown, "parameter {i + 1}", a.value, partial)
 		}
 		if params bounds i {
 			fits(c, params[i], infer.typeOf(env, a.value), "argument {i + 1} of " + shown)
@@ -1635,14 +1635,14 @@ proc checkValueArguments(c: mut Check, env: infer.Env, shown: Str, params: types
 	}
 }
 
-proc checkMutexArgument(c: mut Check, shown: Str, param: Str, found: ast.Expr, partial: Bool): void {
+proc checkMutableArgument(c: mut Check, shown: Str, param: Str, found: ast.Expr, partial: Bool): void {
 	if partial {
-		report(c, shown + " asks for the mutex itself in {param}, and a partial application captures what it is given by value, so the writes would land in a copy nobody sees. Leave it a hole, `_`, and hand the storage over where the result is called")
+		report(c, shown + " writes through {param}, and a partial application captures what it is given by value, so the writes would land in a copy nobody sees. Leave it a hole, `_`, and hand the storage over where the result is called")
 		return
 	}
 	root := rootName(found)
 	if root == "" || isMutable(c.mutable, root) == false {
-		report(c, shown + " asks for the mutex itself in {param}, so the argument has to be a `mut` variable or a path into one — this one is not")
+		report(c, shown + " writes through {param}, so the argument has to be a `mut` variable or a path into one — this one is not")
 	}
 }
 
@@ -1740,18 +1740,18 @@ proc checkHandler(c: mut Check, env: infer.Env, starts: Str, handler: ast.Expr):
 		return false
 	}
 	shape := "`proc(mut S, M): M`, or `proc(mut S, M, Address<M>): M` to be handed its own address"
-	if ty is types.Ty.TFn(_, params, mutexes, result) {
+	if ty is types.Ty.TFn(_, params, mutables, result) {
 		if len(params) != 2 && len(params) != 3 {
 			report(c, "{starts} wants a handler of the shape " + shape + ", and this one has {len(params)} parameters")
 			return false
 		}
-		if types.mutexAt(mutexes, 0) == false {
-			report(c, "a handler writes its state in place, so its first parameter takes the mutex itself: `state: mut "
+		if types.mutableAt(mutables, 0) == false {
+			report(c, "a handler writes its state in place, so its first parameter is `mut`: `state: mut "
 				+ types.show(infer.typeAt(params, 0)) + "`, which is what {starts} hands it")
 			return false
 		}
-		if types.mutexAt(mutexes, 1) {
-			report(c, "a handler is handed its message, never lent it, so its second parameter cannot take the mutex itself")
+		if types.mutableAt(mutables, 1) {
+			report(c, "a handler is handed its message, never lent it, so its second parameter cannot be `mut`")
 			return false
 		}
 		message := infer.typeAt(params, 1)
@@ -1848,8 +1848,8 @@ proc checkArguments(c: mut Check, env: infer.Env, name: Str, info: types.Callabl
 		}
 		// A `mut T` parameter takes the caller's own storage, so the argument has
 		// to be a `mut` variable or a path into one.
-		if p.mutex {
-			checkMutexArgument(c, "`{name}`", "`{p.name}: mut ...`", found, partial)
+		if p.mutable {
+			checkMutableArgument(c, "`{name}`", "`{p.name}: mut ...`", found, partial)
 		}
 		fits(c, types.resolve(env.table, p.declared), infer.typeOf(env, found), "the argument `{p.name}` of `{name}`")
 	}

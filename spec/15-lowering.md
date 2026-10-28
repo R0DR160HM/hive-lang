@@ -24,7 +24,7 @@ file, plus a generated `hive` runtime package.
 | `mut b = a` (both `mut`, owns storage) | no variable — `b` compiles to `a`, so one slice header is shared |
 | `ys := xs` (needs a copy) | a generated deep clone, chosen by the static type |
 | `f(mutVec)` (argument names `mut` storage) | `f(hive.CloneVec(mutVec))` |
-| `p(v: mut T)` (a mutex parameter) | `p(v *T)`, read and written through `(*v)` |
+| `p(v: mut T)` (a `mut` parameter) | `p(v *T)`, read and written through `(*v)` |
 | `p(mutVec)` (waited for) | `p(&mutVec)` — the callee writes the caller's own storage |
 | `async p(mutVec)` (fired off) | `{ _a0 := hive.CloneVec(mutVec); go p(&_a0) }` |
 | `proc(mut T, U): R` (a function type) | `func(*T, U) R` — a call through one hands over the address exactly as `p(mutVec)` does |

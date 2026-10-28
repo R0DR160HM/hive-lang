@@ -78,7 +78,7 @@ All of it.
 | generics | monomorphization: one copy per set of type arguments, read off the argument types, for callables and types alike ([11](11-generics.md)) |
 | bounds | every index and slice proved in range, flow-sensitively, on vectors and on a `Str` alike: declared and inferred lengths, guards, counting loops, `indexOf`, and what an assignment or a `drop` costs ([10](10-bounds.md)) |
 | checks | names, arity, named arguments, argument and return types, what a call can reach through, the standard library's own names and what they take, what a walk's function answers with, the proc/func split, mutability, terminating paths, exhaustiveness, conditions, subscripts, `async`'s three refusals, pattern shapes, a query's rows and its bound values ([04](04-declarations.md), [06](06-statements.md), [07](07-patterns.md), [08](08-mutability-and-values.md), [13](13-builtins.md), [14](14-stdlib.md)) |
-| value semantics | copy-on-binding, type-directed deep copies, two `mut` names sharing one header, mutex parameters as pointers ([08](08-mutability-and-values.md)) |
+| value semantics | copy-on-binding, type-directed deep copies, two `mut` names sharing one header, `mut` parameters as pointers ([08](08-mutability-and-values.md)) |
 | concurrency | `async` as a statement, the `async` binding, the await-all, `with timeout` ([09](09-concurrency.md)) |
 | patterns | all four kinds, with narrowing through `&&`; a string template's holes both ways, with its regexes read at compile time and the whole template compiled once ([07](07-patterns.md)) |
 | builtins | all of [13](13-builtins.md) |

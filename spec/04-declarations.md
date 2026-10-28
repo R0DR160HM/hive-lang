@@ -100,13 +100,13 @@ func greet(name: Str, style: Greeting): Str {
 
 A `func` **may perform I/O** — `echo`, `hive.file`, `hive.net` are all allowed —
 and it **may call a `proc`**. It differs from a `proc` in exactly one way: it
-cannot declare a mutex parameter (`v: mut T`), and a `mut` value passed to a
+cannot declare a `mut` parameter (`v: mut T`), and a `mut` value passed to a
 `func` is seen as an ordinary immutable copy instead.
 
 What a `func` promises, then, is not purity in the mathematical sense but that
 **it cannot write to storage its caller can see**. That one rule is the whole of
-what keeps the promise, together with the rule on a mutex *argument*
-([8.2](08-mutability-and-values.md#82-mutex-parameters)): a mutex has to be
+what keeps the promise, together with the rule on a `mut` *argument*
+([8.2](08-mutability-and-values.md#82-mut-parameters)): a `mut` parameter has to be
 handed a `mut` variable or a path into one, and the only `mut` variables in a
 `func` are its own. So whatever a `proc` it calls writes through, the caller
 cannot see it.
@@ -123,7 +123,7 @@ proc grow(vec: mut Str[dyn], tag: Str): void {
 }
 ```
 
-A `proc` may do everything a `func` may, plus declare mutex parameters. Programs
+A `proc` may do everything a `func` may, plus declare `mut` parameters. Programs
 start at `proc main(): void`, in the file handed to `hive build` / `hive run`.
 Nothing calls `main` with arguments or reads what it answers, so any other
 signature is a compile error: the command line is `hive.term.args()`, and an exit

@@ -79,7 +79,7 @@ type Emit {
 	// The names declared `mut`, which is what decides whether a binding off one
 	// of them has to copy.
 	mutables: Str[dyn]
-	// The mutex parameters, which lower to pointers and are read through them.
+	// The `mut` parameters, which lower to pointers and are read through them.
 	pointers: Str[dyn]
 	// The names held as a cell: storage two `mut` names share, as a pointer both
 	// of them hold. Worked out for a whole body before it is walked.
@@ -326,11 +326,11 @@ func goType(ty: types.Ty): Str {
 	}
 	else if ty is types.Ty.TAddress(_) { return "hive.SyslinkAddress" }
 	else if ty is types.Ty.TSecret(_) { return "hive.Secret" }
-	else if ty is types.Ty.TFn(_, params, mutexes, result) {
+	else if ty is types.Ty.TFn(_, params, mutables, result) {
 		mut Str[dyn] out = []
 		mut i := 0
 		for each p in params {
-			if types.mutexAt(mutexes, i) {
+			if types.mutableAt(mutables, i) {
 				append(out, "*" + goType(p))
 			} else {
 				append(out, goType(p))
@@ -511,9 +511,9 @@ proc emitCallable(em: mut Emit, env: infer.Env, name: Str, params: ast.Param[], 
 	mut Str[dyn] written = []
 	for each p in params {
 		ty := types.resolve(env.table, p.declared)
-		// A mutex parameter lowers to a pointer: a shared backing array would not
+		// A `mut` parameter lowers to a pointer: a shared backing array would not
 		// survive `append`, which produces a new header the caller has to hold.
-		if p.mutex {
+		if p.mutable {
 			append(em.pointers, p.name)
 			append(em.mutables, p.name)
 			append(written, goIdent(p.name) + " *" + goType(ty))
@@ -1487,7 +1487,7 @@ proc identExpr(em: mut Emit, env: infer.Env, name: Str): Str {
 	if indexOf(em.deferred, name) is Result.Ok(_) {
 		return taskName(name) + ".Await().(" + goType(infer.lookup(env, name)) + ")"
 	}
-	// A mutex parameter is a pointer, and so is a cell — everything reads and
+	// A `mut` parameter is a pointer, and so is a cell — everything reads and
 	// writes through both.
 	if isIndirect(em, name) {
 		return "(*" + goIdent(name) + ")"
@@ -1533,11 +1533,11 @@ type Shared {
 proc cellNames(t: types.Table, env: infer.Env, params: ast.Param[], body: ast.Block): Str[dyn] {
 	mut Shared s = Shared(t, [], [], [], [], [])
 	for each p in params {
-		// A parameter is never a cell: a mutex one is already a pointer, and a
+		// A parameter is never a cell: a `mut` one is already a pointer, and a
 		// plain one is the callee's own copy.
 		append(s.seen, p.name)
 		append(s.barred, p.name)
-		if p.mutex {
+		if p.mutable {
 			append(s.mutable, p.name)
 		}
 	}
@@ -1669,7 +1669,7 @@ proc shareName(s: mut Shared, name: Str, mutable: Bool): void {
 	}
 }
 
-// Whether this body holds `name` as a cell. A mutex parameter is a pointer of
+// Whether this body holds `name` as a cell. A `mut` parameter is a pointer of
 // its own and is never one.
 proc isCell(em: mut Emit, name: Str): Bool {
 	if indexOf(em.pointers, name) is Result.Ok(_) {
@@ -2229,12 +2229,12 @@ proc namedCall(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[], want: t
 		answer := types.resolve(env.table, info.result)
 		if em.ferrying == false && (answer is types.Ty.TVoid || concrete(answer)) && writtenOutOfOrder(args, names) {
 			mut types.Ty[dyn] tys = []
-			mut Bool[dyn] mutexes = []
+			mut Bool[dyn] mutables = []
 			for each p in info.params {
 				append(tys, types.resolve(env.table, p.declared))
-				append(mutexes, p.mutex)
+				append(mutables, p.mutable)
 			}
-			h := hoist(em, env, args, names, tys, mutexes, lends(em, name))
+			h := hoist(em, env, args, names, tys, mutables, lends(em, name))
 			inner := goIdent(name) + "(" + orderedArgs(em, h.env, info, h.args) + ")"
 			return inWrittenOrder(h, goResult(answer), inner)
 		}
@@ -2525,7 +2525,7 @@ func writtenOutOfOrder(args: ast.Arg[], names: Str[]): Bool {
 	return false
 }
 
-proc hoist(em: mut Emit, env: infer.Env, args: ast.Arg[], names: Str[], tys: types.Ty[], mutexes: Bool[], lent: Bool): Hoisted {
+proc hoist(em: mut Emit, env: infer.Env, args: ast.Arg[], names: Str[], tys: types.Ty[], mutables: Bool[], lent: Bool): Hoisted {
 	slots := slotsOf(args, names)
 	mut Str[dyn] params = []
 	mut Str[dyn] values = []
@@ -2542,8 +2542,8 @@ proc hoist(em: mut Emit, env: infer.Env, args: ast.Arg[], names: Str[], tys: typ
 		if tys bounds slot {
 			ty = tys[slot]
 		}
-		// A mutex argument is an address, which nothing can move.
-		if types.mutexAt(mutexes, slot) || settled(a.value) || concrete(ty) == false {
+		// A `mut` argument is an address, which nothing can move.
+		if types.mutableAt(mutables, slot) || settled(a.value) || concrete(ty) == false {
 			append(inner, a)
 			continue
 		}
@@ -2650,15 +2650,15 @@ proc orderedArgs(em: mut Emit, env: infer.Env, info: types.CallableInfo, args: a
 		if found is ast.Expr.Absent {
 			ferryThis = false
 		}
-		// A thread of its own is handed copies, and a mutex parameter takes the
+		// A thread of its own is handed copies, and a `mut` parameter takes the
 		// address of the copy rather than of what it was made from.
 		if ferryThis {
 			written = ferried(em, env, found, ty, written)
-			if p.mutex {
+			if p.mutable {
 				written = "&" + written
 			}
-		} else if p.mutex {
-			// A mutex parameter takes the caller's own storage, which is its
+		} else if p.mutable {
+			// A `mut` parameter takes the caller's own storage, which is its
 			// address — and if the caller's name is itself a pointer, the address
 			// it already holds.
 			written = addressOf(em, found, written)
@@ -2682,7 +2682,7 @@ proc lends(em: mut Emit, name: Str): Bool {
 	return indexOf(em.lent, name) is Result.Ok(_)
 }
 
-// The address of storage a mutex parameter is being handed. A name that is
+// The address of storage a `mut` parameter is being handed. A name that is
 // already a pointer is passed on as it stands.
 proc addressOf(em: mut Emit, found: ast.Expr, written: Str): Str {
 	if found is ast.Expr.Ident(name) {
@@ -2695,10 +2695,10 @@ proc addressOf(em: mut Emit, found: ast.Expr, written: Str): Str {
 
 proc valueArgs(em: mut Emit, env: infer.Env, callee: types.Ty, args: ast.Arg[]): Str {
 	mut types.Ty[dyn] params = []
-	mut Bool[dyn] mutexes = []
+	mut Bool[dyn] mutables = []
 	if callee is types.Ty.TFn(_, declared, marked, _) {
 		params = declared
-		mutexes = marked
+		mutables = marked
 	}
 	ferry := takeFerry(em)
 	mut Str[dyn] out = []
@@ -2708,14 +2708,14 @@ proc valueArgs(em: mut Emit, env: infer.Env, callee: types.Ty, args: ast.Arg[]):
 		if params bounds i {
 			ty = params[i]
 		}
-		mutex := types.mutexAt(mutexes, i)
+		mutable := types.mutableAt(mutables, i)
 		mut written := expr(em, env, a.value, ty)
 		if ferry {
 			written = ferried(em, env, a.value, ty, written)
-			if mutex {
+			if mutable {
 				written = "&" + written
 			}
-		} else if mutex {
+		} else if mutable {
 			written = addressOf(em, a.value, written)
 		} else if isMutableSource(em, a.value) && types.ownsStorage(env.table, ty) {
 			written = cloned(env.table, ty, written)
@@ -2753,11 +2753,11 @@ func hasHole(args: ast.Arg[]): Bool {
 proc partial(em: mut Emit, env: infer.Env, callee: ast.Expr, args: ast.Arg[], want: types.Ty): Str {
 	whole := infer.typeOf(env, ast.Expr.Call(callee, copiedArgs(args)))
 	mut types.Ty[dyn] holeTypes = []
-	mut Bool[dyn] holeMutexes = []
+	mut Bool[dyn] holeMutables = []
 	mut resultType := types.Ty.TUnknown()
 	if whole is types.Ty.TFn(_, holes, marked, r) {
 		holeTypes = holes
-		holeMutexes = marked
+		holeMutables = marked
 		resultType = r
 	}
 
@@ -2778,7 +2778,7 @@ proc partial(em: mut Emit, env: infer.Env, callee: ast.Expr, args: ast.Arg[], wa
 				// A hole's type is the parameter it stands in for.
 				holeType = holeTypes[at]
 			}
-			if types.mutexAt(holeMutexes, at) {
+			if types.mutableAt(holeMutables, at) {
 				append(em.pointers, holeName)
 				append(em.mutables, holeName)
 				append(params, holeName + " *" + goType(holeType))
@@ -2831,11 +2831,11 @@ proc builtin(em: mut Emit, env: infer.Env, name: Str, written: ast.Arg[], want: 
 		answer := infer.typeOf(env, ast.Expr.Call(ast.Expr.Member(ast.Expr.Ident("hive"), name), copiedArgs(written)))
 		if answer is types.Ty.TVoid || concrete(answer) {
 			// What a builtin grows in place is its caller's own storage.
-			mut Bool[dyn] mutexes = []
+			mut Bool[dyn] mutables = []
 			if name == "append" || name == "prepend" || name == "drop" {
-				mutexes = [true]
+				mutables = [true]
 			}
-			h := hoist(em, env, written, names, infer.typesOfArgs(env, infer.builtinArgs(name, written)), mutexes, true)
+			h := hoist(em, env, written, names, infer.typesOfArgs(env, infer.builtinArgs(name, written)), mutables, true)
 			return inWrittenOrder(h, goResult(answer), builtin(em, h.env, name, h.args, want))
 		}
 	}
@@ -3400,7 +3400,7 @@ func answerCopier(t: types.Table, message: types.Ty): Str {
 //
 // Four things are left out, each because the proof does not reach them:
 //
-//   * a callable with a mutex parameter, which it may write through;
+//   * a callable with a `mut` parameter, which it may write through;
 //   * a `query` and an imported Go `func` — a query keeps its arguments in the
 //     fragment it answers with, and the Go boundary copies for reasons of its own;
 //   * a result that carries storage, or holds a function value, since one can be a
@@ -3414,7 +3414,7 @@ proc lentFuncs(t: types.Table, decls: ast.Decl[]): Str[dyn] {
 	mut Str[dyn] out = []
 	for each d in decls {
 		if d is ast.Decl.CallableDecl(_, name, params, result, _, _) {
-			if takesNoMutex(params) && carriesStorage(t, types.resolve(t, result)) == false {
+			if takesNoMutable(params) && carriesStorage(t, types.resolve(t, result)) == false {
 				if indexOf(threading, name) is Result.Error(_) {
 					append(out, name)
 				}
@@ -3424,7 +3424,7 @@ proc lentFuncs(t: types.Table, decls: ast.Decl[]): Str[dyn] {
 	return out
 }
 
-// `x = f(x)`: whatever of the argument outlives a call without a mutex parameter
+// `x = f(x)`: whatever of the argument outlives a call without a `mut` parameter
 // or a thread is in its result, which lands back in `x`. A function value in the
 // result could hold the argument as it stood, so none may be reachable there.
 proc handingBackFuncs(t: types.Table, decls: ast.Decl[]): Str[dyn] {
@@ -3432,7 +3432,7 @@ proc handingBackFuncs(t: types.Table, decls: ast.Decl[]): Str[dyn] {
 	mut Str[dyn] out = []
 	for each d in decls {
 		if d is ast.Decl.CallableDecl(_, name, params, result, _, _) {
-			if takesNoMutex(params) && reachesFn(t, types.resolve(t, result), []) == false {
+			if takesNoMutable(params) && reachesFn(t, types.resolve(t, result), []) == false {
 				if indexOf(threading, name) is Result.Error(_) {
 					append(out, name)
 				}
@@ -3442,9 +3442,9 @@ proc handingBackFuncs(t: types.Table, decls: ast.Decl[]): Str[dyn] {
 	return out
 }
 
-func takesNoMutex(params: ast.Param[]): Bool {
+func takesNoMutable(params: ast.Param[]): Bool {
 	for each p in params {
-		if p.mutex {
+		if p.mutable {
 			return false
 		}
 	}
@@ -3481,7 +3481,7 @@ func reachesFn(t: types.Table, ty: types.Ty, seen: Str[]): Bool {
 	return false
 }
 
-// A mutex parameter, or a `mut` local sharing its storage with no other name.
+// A `mut` parameter, or a `mut` local sharing its storage with no other name.
 func handsBack(env: infer.Env, eligible: Str[], writable: Str[], cells: Str[], target: ast.Expr, value: ast.Expr): Bool {
 	path := pathOf(target)
 	root := rootOf(target)
@@ -4638,11 +4638,11 @@ proc runtimeLibraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, wr
 		answer := infer.typeOf(env, ast.Expr.Call(ast.Expr.Member(ast.Expr.Member(ast.Expr.Ident("hive"), module), name), copiedArgs(written)))
 		if answer is types.Ty.TVoid || concrete(answer) {
 			// The map `set` and `delete` write into is the caller's own.
-			mut Bool[dyn] mutexes = []
+			mut Bool[dyn] mutables = []
 			if module == "map" && (name == "set" || name == "delete") {
-				mutexes = [true]
+				mutables = [true]
 			}
-			h := hoist(em, env, written, names, infer.typesOfArgs(env, stdlib.libraryArgs(module, name, written)), mutexes, true)
+			h := hoist(em, env, written, names, infer.typesOfArgs(env, stdlib.libraryArgs(module, name, written)), mutables, true)
 			mut asAnswered := goResult(answer)
 			if answer is types.Ty.TVoid {
 			} else {

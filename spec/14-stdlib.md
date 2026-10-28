@@ -545,7 +545,7 @@ kill(here)
 ```
 
 **The handler is one turn** — `proc (state: mut State, message: Message): Message`.
-It writes its state in place and **returns the answer**. The state is a mutex
+It writes its state in place and **returns the answer**. The state is a `mut`
 parameter only the service's own mailbox ever holds, one message at a time, so
 nothing needs a lock. Because it is an ordinary `proc`, a handler can also be
 called directly — from a test, say — with a `mut` variable of your own.
@@ -560,7 +560,7 @@ proc counter(total: mut Int, op: Op): Op {
 ```
 
 The compiler holds a handler to that shape where the service is started: the
-first parameter takes the mutex, the second is the mailbox type, the return type
+first parameter is `mut`, the second is the mailbox type, the return type
 is the mailbox type too, and the starting state fits the first parameter. A
 handler may take a third parameter, an `Address<M>` of its own mailbox type, and
 is then handed its own address every turn — to give to work it starts. `spawn`
@@ -824,8 +824,8 @@ answers a request from another node, and is discarded for an event of the
 window's own. Called directly, the handler `window` answers with is `update` and
 nothing more, which is what a test calls.
 
-**The view is a `func`, and that is not a formality.** A func cannot hold a
-mutex, so drawing cannot write the model or anything else the caller can see —
+**The view is a `func`, and that is not a formality.** A func cannot take a
+`mut` parameter, so drawing cannot write the model or anything else the caller can see —
 which matters because a repaint happens on every change.
 
 **Every widget takes the same two things: its attributes, then its payload.**

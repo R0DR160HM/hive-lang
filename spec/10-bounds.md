@@ -13,7 +13,12 @@ An access is safe when one of these holds:
 * the access sits under a **guard the pass can read**:
   * `if i >= 0 && i < len(v) { v[i] }`,
   * `if v bounds i { v[i] }` — the same guard, spelled shorter,
-  * the condition of a counting `for` loop;
+  * the condition of a counting `for` loop — `for i := 0; i < len(v); i++` — whose
+    counter starts at a non-negative literal, steps by one, and is held strictly
+    below something by its condition (`i < e`, or that on either side of an
+    `&&`). An `Int` wraps past `MAX` ([05](05-expressions.md#57-arithmetic-at-the-edges)),
+    so a counter stepping by more, or with nothing above it, could turn negative,
+    and proves nothing;
 * the index came from **`indexOf`** ([10.5](#105-indexof-returns-an-index-you-can-use));
 * the access is a **`for each`**, which never indexes.
 

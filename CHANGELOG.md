@@ -9,6 +9,8 @@
 * **`at` lands where an `Address<M>` is declared**, as `hive.map.new()` does, so `x := at(#Name)` is a compile error.
 * **`monitor`'s notice is one of the watcher's messages.**
 * **`Secret<T>` keeps any plain value**: `hide(T)` and `bypass(T)` make one, and `reveal` answers the `T` back.
+* **An `Int` wraps round past `MAX` and `MIN`**, as the machine's arithmetic does, where it stopped at the edge.
+* **A counting loop proves its counter only where it cannot wrap**: starting at a non-negative literal, stepping by one, and held below something by a `<`.
 
 ### Standard library
 
@@ -25,6 +27,8 @@
 | `SqlError` reason `"Query"` | `SqlError.Statement` |
 | `Secret` | `Secret<Str>`, and the library's secrets with it |
 | `hide(text: s)`, `bypass(text: s)` | `hide(value: s)`, `bypass(value: s)` |
+| `Int` overflow stopping at `MAX` or `MIN` | it wraps round to the other |
+| `for i := 0; i < n; i += 2 { echo v[i] }` | a guard: `if v bounds i` |
 
 ## v0.2.18
 
@@ -222,7 +226,7 @@
 
 ### Language
 
-* **A `proc` with a mutex parameter is a value.** It can be referenced, partially applied, stored and passed like any other: a function type marks the position `mut` — `proc(mut Str[dyn], Str): void` — and a call through the value hands it a `mut` variable exactly as a direct call does. A partial application leaves a mutex position a hole, and `func(mut ...)` is refused.
+* **A `proc` with a `mut` parameter is a value.** It can be referenced, partially applied, stored and passed like any other: a function type marks the position `mut` — `proc(mut Str[dyn], Str): void` — and a call through the value hands it a `mut` variable exactly as a direct call does. A partial application leaves a `mut` position a hole, and `func(mut ...)` is refused.
 * **A call through a function value is held to its type**: how many arguments, what each one is, and no named arguments, where only a field's argument count was checked and a local's mistakes reached the Go toolchain.
 
 ### Standard library
@@ -234,12 +238,12 @@
 
 ### Performance
 
-* **`x = f(x)` hands `x` over without copying it** wherever nothing but `f`'s result can keep it — no mutex parameter, no thread handed any storage, no function value in the result — nested calls included. A service's `world = ticked(world, dt)` copied its whole world every message.
-* A `proc` with no mutex parameter is lent storage the way a `func` is, and a send counts as starting no thread: its message is copied on the way out.
+* **`x = f(x)` hands `x` over without copying it** wherever nothing but `f`'s result can keep it — no `mut` parameter, no thread handed any storage, no function value in the result — nested calls included. A service's `world = ticked(world, dt)` copied its whole world every message.
+* A `proc` with no `mut` parameter is lent storage the way a `func` is, and a send counts as starting no thread: its message is copied on the way out.
 
 ### Fixes
 
-* **A vector handed to a mutex parameter loses what was proved about its length**, where `shrink(v)` inside `if v bounds 0` left `v[0]` compiling and failing at run time.
+* **A vector handed to a `mut` parameter loses what was proved about its length**, where `shrink(v)` inside `if v bounds 0` left `v[0]` compiling and failing at run time.
 * **A library type the library does not have is refused**, where `hive.net.Nonesuch` compiled and the Go toolchain reported it undefined.
 * **`sort` with nothing to order by is refused.** A vector of maps, addresses or function values — or of a type holding one — compiled and panicked when it ran; it now asks for the `func` that says which of two comes first.
 * A `mut` value handed to a function value's ordinary parameter is copied, as a direct call copies it.
@@ -383,7 +387,7 @@
 
 ### Language
 
-* **A `func` may call a `proc`.** It still cannot declare a mutex parameter,
+* **A `func` may call a `proc`.** It still cannot declare a `mut` parameter,
   which is what keeps it from writing to storage its caller can see.
 * A backtick string reads `\{` as a literal `{`, ahead of backtick strings gaining interpolation.
 
@@ -406,7 +410,7 @@
   them and a stale voice fought the live one for its name: silence, wherever a
   program renamed a `track` mid-run.
 
-* A callable that asks for a mutex is refused as a value — `f := grow`,
+* A callable that takes a `mut` parameter is refused as a value — `f := grow`,
   `grow(_, "x")` — where it used to reach the Go toolchain and be refused there.
 * The loop-invariant finding asks whether the callee really answers off its
   arguments, rather than whether it is a `func`. One that prints, reads the

@@ -23,7 +23,7 @@ Source files end in **`.hive`**. The standard library is reached as **`hive.*`**
 | [05 — Expressions](05-expressions.md) | operators, precedence, calls, interpolation, arithmetic at the edges |
 | [06 — Statements](06-statements.md) | bindings, assignment, control flow, `switch`, `echo` / `assert` / `panic` |
 | [07 — Patterns](07-patterns.md) | `is`, its four pattern kinds, the two kinds of string hole, narrowing and exhaustiveness, a `switch`'s coverage |
-| [08 — Mutability and value semantics](08-mutability-and-values.md) | `mut`, mutex parameters, copy-on-binding |
+| [08 — Mutability and value semantics](08-mutability-and-values.md) | `mut`, `mut` parameters, copy-on-binding |
 | [09 — Concurrency](09-concurrency.md) | `async`, the await-all, `with timeout` |
 | [10 — Bounds](10-bounds.md) | how every index and slice is proved in range |
 | [11 — Generics](11-generics.md) | type variables and monomorphization |

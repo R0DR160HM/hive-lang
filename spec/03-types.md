@@ -16,8 +16,8 @@ program is rejected rather than deferred to run time.
 | `void` | nothing; a return type only | — |
 
 `Int` is exactly Go's `int`, which is 64-bit on every platform Hive targets.
-It never wraps: arithmetic that would pass its largest or smallest value stays
-at that value ([05](05-expressions.md#57-arithmetic-at-the-edges)).
+It wraps: arithmetic that would pass its largest or smallest value comes round
+from the other ([05](05-expressions.md#57-arithmetic-at-the-edges)).
 
 `void` is not a value type. It may be written as a return type and nowhere
 else: there is no `void` variable, no `void` field, and no `void` element.
@@ -216,9 +216,9 @@ The `proc`/`func` split is preserved through values: a `func` value **may** be
 used where a `proc` is expected, and a `proc` value may **not** fill a `func`
 slot.
 
-**A `proc` type may mark a parameter `mut`**, which is a mutex parameter of the
-value ([8.2](08-mutability-and-values.md#82-mutex-parameters)); a `func` type may
-not, and `func(mut Int)` is a compile error. A mutex position is part of the type:
+**A `proc` type may mark a parameter `mut`**, which is a `mut` parameter of the
+value ([8.2](08-mutability-and-values.md#82-mut-parameters)); a `func` type may
+not, and `func(mut Int)` is a compile error. A `mut` position is part of the type:
 `proc(mut Int): void` and `proc(Int): void` are different types, and neither fills
 the other's slot.
 
@@ -242,10 +242,10 @@ Three type-level rules:
   loop would have to be handed the key or the value, and the syntax never said
   which.
 
-## 3.7 Mutex types
+## 3.7 `mut` types
 
-Conceptually a `mut T` is a `Mutex<T>`: identical to `T` at run time, but only
-mutexes may be altered at compile time. It has no spelling of its own outside a
+A `mut T` is identical to `T` at run time; `mut` only says, at compile time, that
+the name may be altered. It has no spelling of its own outside a
 declaration, a `proc` parameter and a `proc` type's parameter. See
 [08](08-mutability-and-values.md).
 
@@ -271,7 +271,7 @@ A value of type `S` may be used where `T` is expected exactly when:
    element types match; or
 3. `T` is a `proc` function type and `S` is the `func` type with the same
    parameters and return; or
-4. `S` is `mut T` and `T` names no mutex — the callee is handed an immutable
+4. `S` is `mut T` and `T` is not `mut` — the callee is handed an immutable
    copy ([08](08-mutability-and-values.md)).
 
 There is **no** implicit numeric widening. `Int` does not become `Float`; use

@@ -105,14 +105,14 @@ A constructor has **no bare reference**: a variant is a value once it is built,
 so `Msg.Changed` on its own is a compile error and the hole is what makes one a
 function value ([03](03-types.md#34-declared-types)).
 
-**A callable with a mutex parameter is a value like any other.** `f := grow` is a
+**A callable with a `mut` parameter is a value like any other.** `f := grow` is a
 `proc(mut Str[dyn], Str): void`, and `grow(_, "x")` a `proc(mut Str[dyn]): void`.
-A mutex position in a partial application has to stay a hole: what is supplied is
+A `mut` position in a partial application has to stay a hole: what is supplied is
 captured by value, so writes through it would land in a copy nobody sees.
 
 **A call through a function value is held to the value's type**: how many
 arguments, what each one is, and a `mut` variable or a path into one wherever the
-type says `mut` ([8.2](08-mutability-and-values.md#82-mutex-parameters)). A
+type says `mut` ([8.2](08-mutability-and-values.md#82-mut-parameters)). A
 function value's parameters have no names, so its arguments go by position.
 
 Two things cannot become values:
@@ -228,25 +228,27 @@ Most of arithmetic is unsurprising. These are the cases worth stating exactly:
 | expression | result |
 | --- | --- |
 | `a / 0`, `a % 0` (`Int` or `Float`) | `0` — division and remainder by zero are values, not crashes |
-| `Int` overflow (`+ - * **`, unary `-`, `/`) | stays at the edge it would have passed: `MAX + 1` is `MAX`, `MIN - 1` is `MIN` |
-| `2 ** 100` | `9223372036854775807` — the edge above, reached by repeated multiplication |
-| `-MIN`, `MIN * -1`, `MIN / -1` | `MAX` — the one answer `MIN` has no opposite for |
+| `Int` overflow (`+ - * **`, unary `-`, `/`) | wraps round, two's-complement: `MAX + 1` is `MIN`, `MIN - 1` is `MAX` |
+| `2 ** 100` | `0` — the wrap above, reached by repeated multiplication |
+| `-MIN`, `MIN * -1`, `MIN / -1` | `MIN` — the one value with no opposite is its own |
 | `n ** k` with `k < 0` (`Int`) | `0`, including `1 ** -1` |
 | `n ** 0` | `1` |
 | `-7 % 3` | `-1` — the remainder takes the sign of the dividend |
 | `10.0 ** 400.0` | `+Inf` — `Float` arithmetic does produce non-finite values |
 
 `MAX` and `MIN` are the largest and smallest `Int`, `9223372036854775807` and
-`-9223372036854775808`. An `Int` never wraps around from one to the other: a sum,
-difference, product or power that would pass one **is** that one, and it stays
-there — so a counter that reaches `MAX` sits at `MAX` however much more is added,
-rather than turning negative. Compound assignments and `++`/`--` are arithmetic
-like any other and stop at the same edges.
+`-9223372036854775808`. A sum, difference, product or power that would pass one
+comes round from the other, as the machine's own arithmetic does — so a counter
+that passes `MAX` turns negative. Compound assignments and `++`/`--` are
+arithmetic like any other and wrap the same way. Two literals that overflow
+together, `9223372036854775807 + 1`, wrap too, rather than being refused.
 
-`**` on `Int`s is repeated multiplication and stops at an edge the same way. A
-negative `Int` exponent has no integral answer, so it yields `0` rather than a
-fraction. For the mathematical answer, work in `Float`, where `**` is real
-exponentiation.
+`**` on `Int`s is repeated multiplication and wraps the same way. A negative
+`Int` exponent has no integral answer, so it yields `0` rather than a fraction.
+For the mathematical answer, work in `Float`, where `**` is real exponentiation.
+
+The bounds pass knows a counter can wrap: a counting loop proves its counter's
+low half only where it cannot pass `MAX` ([10](10-bounds.md#101-what-counts-as-a-proof)).
 
 ### Unspecified behaviour
 

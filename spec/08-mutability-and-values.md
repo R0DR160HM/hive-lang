@@ -5,27 +5,27 @@
 Variables are immutable by default. Prefixing a declaration with `mut` allows
 reassignment, writing through (`v[0] = …`, `rec.f = …`) and `append`.
 
-Conceptually a `mut T` is a **`Mutex<T>`**: identical to `T` at run time, but
-only mutexes may be altered at compile time.
+A `mut T` is identical to `T` at run time; `mut` only says, at compile time,
+that the name may be altered.
 
-A parameter or return of type `T` accepts a `Mutex<T>` — the callee just sees an
+A parameter or return of type `T` accepts a `mut T` — the callee just sees an
 immutable `T` — never the reverse. So assigning to a parameter, or to a plain
 `:=` binding, is a compile error.
 
-A mutex passed into such a parameter is **copied** on the way in, so the callee's
+A `mut` value passed into such a parameter is **copied** on the way in, so the callee's
 immutable view really is one: it cannot see the caller's later writes, whether
 the two run in sequence or, for an `async` call, at the same time.
 
 `mut` may not appear anywhere else a type can: not on a field, not on a return,
 not in a `func(...)` type. Each of those binds nothing. A `proc(...)` type may mark
-a parameter `mut`, which is a mutex parameter of whatever value it describes.
+a parameter `mut`, which is a `mut` parameter of whatever value it describes.
 
 A `mut` variable may not be named `UPPER_CASE`
 ([01](01-lexical.md#14-names-have-shapes)).
 
-## 8.2 Mutex parameters
+## 8.2 `mut` parameters
 
-A **`proc` — and only a `proc`** — may ask for the mutex itself:
+A **`proc` — and only a `proc`** — may ask for the caller's storage itself:
 
 ```hive
 proc grow(vec: mut Str[dyn], tag: Str): void {
@@ -53,20 +53,20 @@ the call's result is kept makes no difference: `n := async count(v)` gets storag
 of its own too, and so does each call in an `await [...]` — one copy each, never
 one between them. What decides is the thread, not the name.
 
-**The same holds through a function value.** A callable with a mutex parameter
+**The same holds through a function value.** A callable with a `mut` parameter
 may be referenced, stored, passed and partially applied
-([5.4](05-expressions.md#54-function-values)); its type says which positions take
-the mutex (`proc(mut Str[dyn], Str): void`), and a call through it is where the
+([5.4](05-expressions.md#54-function-values)); its type says which positions are
+`mut` (`proc(mut Str[dyn], Str): void`), and a call through it is where the
 storage is handed over:
 
 ```hive
 f := grow
 f(v, "d")             // waited for: v grows
 async f(v, "e")       // a thread of its own: it grows a copy
-g := grow(_, "f")     // a mutex position stays a hole — never captured
+g := grow(_, "f")     // a `mut` position stays a hole — never captured
 ```
 
-One consequence for the [bounds pass](10-bounds.md): a callee holding a mutex may
+One consequence for the [bounds pass](10-bounds.md): a callee given a `mut` parameter may
 rebind the vector to a shorter one, so passing a variable to a `mut` parameter —
 by name or through a function value — costs it every length and index fact
 already proved about it.
