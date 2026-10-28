@@ -327,24 +327,49 @@ the builtin is still there as `hive.Address<M>`.
 
 ## 3.11 `Secret`
 
-Text that must not leak: a password, a key, a token. `hide(text)` makes one and
-`reveal(secret)` is its text again ([13](13-builtins.md)); nothing else turns one
-into a `Str`.
+A value that must not leak: a password, a key, a token, or a record of them.
+`hide(value)` makes a `Secret<T>` of any `T`, and `reveal(secret)` is that `T`
+again ([13](13-builtins.md)); nothing else opens one. The library's secrets are
+text, so they are `Secret<Str>`.
+
+```hive
+type Login {
+	user: Str
+	pin: Int
+}
+
+if hide(Login("ada", 1234)) is Result.Ok(kept) {
+	echo reveal(kept).pin
+}
+```
+
+`T` is plain data: `Str`, `Int`, `Float`, `Bool`, `Atom`, and vectors, maps,
+`Result`s and declared types made of them. A function, an address, a library
+handle such as `hive.net.WsConnection`, or another `Secret` stands for something
+the bytes of a value cannot carry, so a `Secret` of one — or of anything holding
+one — is a compile error wherever it is written. So is a bare `Secret`, which
+does not say what it holds.
 
 * **It is never shown.** `echo`, `panic` and an interpolation of a `Secret` are
   compile errors, and so are they of anything holding one — a field, an element,
   a variant's payload, a `Result` — wherever it sits. So is `encode`ing or
   decoding one, and sending one in a message, since a `Secret` has no JSON.
-* **It is never swapped to disk.** What it holds lives in memory the operating
-  system is told to keep in RAM (`mlock` on Linux and macOS, `VirtualLock` on
-  Windows), and is cleared once nothing holds the `Secret` any more.
-* `==` compares what two secrets hold, in constant time for a `Secret` itself.
-  A `Secret` has no order, so `sort` and `<` refuse one.
+* **It is never swapped to disk.** What it holds is written as bytes into memory
+  the operating system is told to keep in RAM (`mlock` on Linux and macOS,
+  `VirtualLock` on Windows), and cleared once nothing holds the `Secret` any more.
+* `==` compares what two secrets hold, byte for byte and in constant time. The
+  bytes are canonical — a map's pairs are kept in key order rather than the order
+  they were set in, and `-0.0` as `0.0` — so two secrets are equal exactly when
+  what they hold is, save that a `NaN` equals itself. `reveal` hands a map back
+  in that key order. A `Secret` has no order, so `sort` and `<` refuse one.
+* A `Secret<T>` fits where a `Secret<U>` is wanted when a `T` fits where a `U`
+  does: a `Secret<Int[3]>` fills a `Secret<Int[dyn]>`.
 
 **Locked memory is finite**, so everything that locks a `Secret` answers a
-`Result`: `hide` answers `Result<Secret, SecretError>`, and so do
-`hive.term.readSecret` and `hive.crypto.randomSecret`. A `SecretError` is a
-union of two variants, each carrying a `message`:
+`Result`: `hide` answers `Result<Secret<T>, SecretError>`, and
+`hive.term.readSecret` and `hive.crypto.randomSecret` answer
+`Result<Secret<Str>, SecretError>`. A `SecretError` is a union of two variants,
+each carrying a `message`:
 
 ```hive
 type SecretError {
@@ -358,26 +383,27 @@ A call that already fails in its own way reports it there instead:
 `hive.crypto.decrypt` as the `CryptoError` variant of the same name, and
 `hive.env.getSecret` as an `EnvironmentError`.
 
-`bypass(text)` makes a `Secret` without locking anything, so it cannot fail. It
-is a `Secret` in every other respect — never shown, compared the same way,
+`bypass(value)` makes a `Secret<T>` without locking anything, so it cannot fail.
+It is a `Secret` in every other respect — never shown, compared the same way,
 accepted wherever one is — but kept in ordinary memory, which the operating
-system is free to swap out. It is for text that was never really secret on the
-way in: a literal, which the executable already holds, or a ciphertext that has
-to go where a `Secret` does.
+system is free to swap out. It is for a value that was never really secret on
+the way in: a literal, which the executable already holds, or a ciphertext that
+has to go where a `Secret<Str>` does.
 
 Two library calls bypass the lock the same way: `hive.term.readSecretBypass`
 and `hive.crypto.decryptBypass` are `readSecret` and `decrypt` keeping what they
 make in ordinary memory, so neither runs into the limit. `readSecretBypass`
-answers a plain `Secret`, and `decryptBypass` fails only as `"Malformed"` or
-`"BadSignature"` ([14](14-stdlib.md)). They are for a program that would rather
+answers a plain `Secret<Str>`, and `decryptBypass` fails only as `Malformed` or
+`BadSignature` ([14](14-stdlib.md)). They are for a program that would rather
 hold a secret in memory that may be swapped out than not hold it at all.
 
-What `reveal` answers with is an ordinary `Str`, and is kept like one. The text
-`hide` was handed was a `Str` too, so a secret typed into the source or read as
+What `reveal` answers with is an ordinary value, and is kept like one. The value
+`hide` was handed was ordinary too, so a secret typed into the source or read as
 a `Str` was ordinary memory before it was hidden: `hive.term.readSecret`,
 `hive.env.getSecret` and `hive.crypto.randomSecret` hand one over without that
 ([14](14-stdlib.md)). Go's own cryptography keeps what it derives from a key on
 its heap while it works.
 
 A program that declares its own `Secret` or `SecretError` has that one under the
-bare name, and the builtin is still there as `hive.Secret` or `hive.SecretError`.
+bare name, and the builtin is still there as `hive.Secret<T>` or
+`hive.SecretError`.

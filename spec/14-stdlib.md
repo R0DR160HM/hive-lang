@@ -157,7 +157,7 @@ own, carrying the `path` and a `message`.
   `append(path, contents)` adds to the end. Both → `Result<Int, _>`, the bytes
   written. Neither creates missing parent directories.
 * `writeSecret(path, contents)` → `Result<Int, _>` is `write` of a
-  [`Secret`](03-types.md#311-secret), leaving the file
+  [`Secret<Str>`](03-types.md#311-secret), leaving the file
   readable by the user running the program and nobody else: mode `0600` on Linux
   and macOS, and on Windows an access list naming that one account, protected so
   the containing folder hands nothing down. Who may read it is settled before any
@@ -190,12 +190,12 @@ Line-oriented terminal I/O.
 * `read()` blocks for a line of input, stripped of its trailing newline. It parks
   only the calling virtual thread. At end of input it returns whatever preceded
   EOF (`""` if nothing).
-* `readSecret()` → `Result<Secret, SecretError>` ([3.11](03-types.md#311-secret)) is that same read with the
+* `readSecret()` → `Result<Secret<Str>, SecretError>` ([3.11](03-types.md#311-secret)) is that same read with the
   terminal's echo turned off, read straight into locked memory rather than
   through a `Str`. The echo is put back before the call returns, and also if the
   program is interrupted at the prompt. Where there is no terminal at all, the
   line is read exactly as `read()` reads it and only the hiding of it is lost.
-* `readSecretBypass()` → `Secret` is `readSecret()` into ordinary memory, as
+* `readSecretBypass()` → `Secret<Str>` is `readSecret()` into ordinary memory, as
   [`bypass`](13-builtins.md#secrets-hide-bypass-reveal) is to `hide`: free to be
   swapped out, so there is no limit to run into and it cannot fail. The echo is
   turned off and put back the same way.
@@ -414,7 +414,7 @@ type JsonValue {
 `encode`, `T.decode` and a message crossing [`hive.syslink`](#1410-hivesyslink)
 refuse one wherever it sits in the value — `Str[dyn][dyn]` being the same type —
 and `Table.decode` does not exist. **Nor has a [`Secret`](03-types.md#311-secret)**,
-refused the same way: only `reveal` turns one into text.
+refused the same way: only `reveal` opens one.
 
 ## 14.8 `hive.crypto`
 
@@ -424,27 +424,27 @@ claims to be, `BadSignature` for a message that does not check out, and
 `LimitExceeded` or `Unsupported` where a `Secret` could not be locked, each
 carrying a `message`.
 
-A key, a password and a plaintext are each a [`Secret`](03-types.md#311-secret);
+A key, a password and a plaintext are each a [`Secret<Str>`](03-types.md#311-secret);
 a digest, a ciphertext and a token are `Str`s, safe to print and store.
 
 * **Hashing** — `sha256(input)`, `sha512(input)` (lowercase hex),
-  `hmacSha256(input, key: Secret)`.
-* **Encryption** — `encrypt(plaintext: Secret, password: Secret)` → `Str` seals
+  `hmacSha256(input, key: Secret<Str>)`.
+* **Encryption** — `encrypt(plaintext: Secret<Str>, password: Secret<Str>)` → `Str` seals
   under a password with AES-256-GCM, base64-encoded;
-  `decrypt(ciphertext, password: Secret)` opens it → `Result<Secret, _>`, straight
+  `decrypt(ciphertext, password: Secret<Str>)` opens it → `Result<Secret<Str>, _>`, straight
   into locked memory, failing as the `SecretError` would where none could be locked. The key is derived with 600,000 rounds of PBKDF2-HMAC-SHA256
   over a random salt, and the salt and nonce are drawn afresh every call, so the
   same text under the same password never encrypts alike. GCM's tag travels with
   the ciphertext, so an edited message is rejected rather than opened into
   something else — `BadSignature`, which is also what a wrong password gives.
-  `decryptBypass(ciphertext, password: Secret)` → `Result<Secret, _>` is
+  `decryptBypass(ciphertext, password: Secret<Str>)` → `Result<Secret<Str>, _>` is
   `decrypt` opening it into ordinary memory, as
   [`bypass`](13-builtins.md#secrets-hide-bypass-reveal) is to `hide`: free to be
   swapped out, so it fails only as `Malformed` or `BadSignature`.
 * **Encoding** — `base64Encode`, `base64Decode`.
 * **Random** — `randomHex(bytes)`, and `randomSecret(bytes)` →
-  `Result<Secret, SecretError>`, the same hex drawn and written in locked memory.
-* **JWT** — `jwtCodec(secret: Secret)` → `hive.codec.Codec<hive.crypto.JwtError>` says **read and write it as
+  `Result<Secret<Str>, SecretError>`, the same hex drawn and written in locked memory.
+* **JWT** — `jwtCodec(secret: Secret<Str>)` → `hive.codec.Codec<hive.crypto.JwtError>` says **read and write it as
   an HS256 token under this secret**, and is the whole of what this module
   contributes to tokens: `encode(claims, hive.crypto.jwtCodec(key))` signs one
   and `T.decode(token, hive.crypto.jwtCodec(key))` checks the signature and
@@ -590,7 +590,7 @@ What the module has:
   this node — when `target` dies; an already-dead target reports at once. The
   notice is one of the watcher's messages, and the target may take anything.
 * `listen(endpoint)`, `node()`, `peers()`.
-* `setKey(key)` makes `key`, a [`Secret`](03-types.md#311-secret), this
+* `setKey(key)` makes `key`, a [`Secret<Str>`](03-types.md#311-secret), this
   program's cluster key — see below.
 
 **`listen` answers with the endpoint a peer should dial**, which is not always the
@@ -707,8 +707,8 @@ Times are plain `Int`s — Unix seconds.
   order: the `.env` file beside the executable; the one in the working directory
   — the entrypoint's folder, under `hive run`; the `.env` in the parent folder of
   either; the OS environment. The first file to name a key wins.
-* `getSecret(name)` → `Result<Secret, hive.env.EnvironmentError>` is `get` as a
-  [`Secret`](03-types.md#311-secret). The environment and the `.env` file still
+* `getSecret(name)` → `Result<Secret<Str>, hive.env.EnvironmentError>` is `get` as a
+  [`Secret<Str>`](03-types.md#311-secret). The environment and the `.env` file still
   hold it as text; it is the program's own copy that is locked and unprintable.
   Where none can be locked, the error's `message` says so.
 * The `.env` file is read **once**, on the first `get` or `getSecret`. Blank lines and `#`

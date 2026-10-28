@@ -37,9 +37,9 @@ column below; a position overloaded by type answers to each of its names, so
 | `at(name)` | `at(Atom): Address<M>` | the service registered under `name` on this node, `M` read off where it lands |
 | `at(endpoint, name)` | `at(Str, Atom): Address<M>` | the same service on the node at `endpoint` |
 | `kill(address)` | `kill(Address<M>): void` | stops a service |
-| `hide(text)` | `hide(Str): Result<Secret, SecretError>` | `text` as a [`Secret`](03-types.md#311-secret), in memory never swapped to disk |
-| `bypass(text)` | `bypass(Str): Secret` | `text` as a `Secret` in ordinary memory, which cannot fail |
-| `reveal(secret)` | `reveal(Secret): Str` | what a `Secret` holds, as text |
+| `hide(value)` | `hide(T): Result<Secret<T>, SecretError>` | `value` as a [`Secret`](03-types.md#311-secret), in memory never swapped to disk |
+| `bypass(value)` | `bypass(T): Secret<T>` | `value` as a `Secret` in ordinary memory, which cannot fail |
+| `reveal(secret)` | `reveal(Secret<T>): T` | what a `Secret` holds |
 
 `len` and `bytes` differ only for strings: for `"café"`, `len` is `4` (runes)
 while `bytes` is `5`.
@@ -114,14 +114,17 @@ these three, and reached by calling its `Address`.
 A [`Secret`](03-types.md#311-secret) is a language type rather than a library's,
 since `hive.term`, `hive.env`, `hive.file`, `hive.crypto` and `hive.syslink` all
 take or hand one back — so making one and reading one are builtins. `reveal` is
-the only way from a `Secret` to text, which is what makes printing one a
-compile error rather than a habit to keep.
+the only way from a `Secret<T>` back to its `T`, which is what makes printing one
+a compile error rather than a habit to keep.
 
-`hide` locks the memory it keeps the text in, and locked memory runs out, so it
-answers a `Result` whose error is a `SecretError`. `bypass` makes the same
-`Secret` without locking anything, so it cannot fail — and is free to be swapped
-to disk. `hive.term.readSecretBypass` and `hive.crypto.decryptBypass` are the
-library's calls of the same kind ([14](14-stdlib.md)).
+`hide` takes any plain value — text, numbers, vectors, maps, results and
+declared types made of them — and locks the memory it keeps that value's bytes
+in. Locked memory runs out, so it answers a `Result` whose error is a
+`SecretError`. `bypass` makes the same `Secret<T>` without locking anything, so
+it cannot fail — and is free to be swapped to disk. The library's own secrets
+are `Secret<Str>`, and `hive.term.readSecretBypass` and
+`hive.crypto.decryptBypass` are its calls of the same kind as `bypass`
+([14](14-stdlib.md)).
 
 ## A declaration of your own wins
 

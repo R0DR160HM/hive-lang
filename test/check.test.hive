@@ -993,7 +993,7 @@ test "the names it does have are left alone" {
 test "hive.syslink.setKey takes the key as a Secret and answers with nothing" {
 	assert problemCount(inMain("hive.syslink.setKey(bypass(\"ours\"))")) == 0
 	assert problemCount(inMain("syslink.setKey(key: bypass(\"ours\"))")) == 0
-	assert opens(problem(inMain("hive.syslink.setKey(\"ours\")")), "in `main`: the first argument of `hive.syslink.setKey` wants Secret and this is Str")
+	assert opens(problem(inMain("hive.syslink.setKey(\"ours\")")), "in `main`: the first argument of `hive.syslink.setKey` wants Secret<Str> and this is Str")
 }
 
 test "hive.time builds a stamp and reads the current instant" {
@@ -1059,7 +1059,7 @@ test "a library call is held to what its module takes" {
 	got := problem(inMain("health := 3  echo hive.math.max(0, health)"))
 	assert opens(got, "in `main`: the first argument of `hive.math.max` wants Float and this is Int")
 	assert opens(problem(inMain("echo hive.crypto.jwtCodec(1)")),
-		"in `main`: the first argument of `hive.crypto.jwtCodec` wants Secret and this is Int")
+		"in `main`: the first argument of `hive.crypto.jwtCodec` wants Secret<Str> and this is Int")
 	assert opens(problem(inMain("health := 3  echo hive.math.max(0.0, health)")),
 		"in `main`: the second argument of `hive.math.max` wants Float and this is Int")
 	assert problemCount(inMain("health := 3.0  echo hive.math.max(0.0, health)")) == 0
@@ -1442,18 +1442,19 @@ test "a function value fills only a slot whose calls it can take" {
 // --- Secrets -------------------------------------------------------------------
 
 test "a Secret is never echoed, panicked or interpolated" {
-	assert problem(inMain("echo bypass(\"pw\")")) == "in `main`: `echo` cannot show a `Secret`: only `reveal` turns one into text"
-	assert problem(inMain("panic bypass(\"pw\")")) == "in `main`: `panic` cannot show a `Secret`: only `reveal` turns one into text"
-	assert problem(inMain("s := bypass(\"pw\")  echo \"pw: \{s}\"")) == "in `main`: an interpolation cannot show a `Secret`: only `reveal` turns one into text"
+	assert problem(inMain("echo bypass(\"pw\")")) == "in `main`: `echo` cannot show Secret<Str>: only `reveal` opens a `Secret`"
+	assert problem(inMain("panic bypass(\"pw\")")) == "in `main`: `panic` cannot show Secret<Str>: only `reveal` opens a `Secret`"
+	assert problem(inMain("s := bypass(\"pw\")  echo \"pw: \{s}\"")) == "in `main`: an interpolation cannot show Secret<Str>: only `reveal` opens a `Secret`"
+	assert problem(inMain("echo bypass(42)")) == "in `main`: `echo` cannot show Secret<Int>: only `reveal` opens a `Secret`"
 	assert problemCount(inMain("echo reveal(bypass(\"pw\"))")) == 0
 }
 
 test "nor is anything holding a Secret" {
-	login := "type Login \{ user: Str  password: Secret }\n"
-	assert problem(login + inMain("echo Login(\"ada\", bypass(\"pw\"))")) == "in `main`: `echo` cannot show Login, which holds a `Secret`: only `reveal` turns one into text"
-	assert opens(problem(inMain("echo [bypass(\"pw\")]")), "in `main`: `echo` cannot show Secret[1], which holds")
+	login := "type Login \{ user: Str  password: Secret<Str> }\n"
+	assert problem(login + inMain("echo Login(\"ada\", bypass(\"pw\"))")) == "in `main`: `echo` cannot show Login, which holds a `Secret`: only `reveal` opens one"
+	assert opens(problem(inMain("echo [bypass(\"pw\")]")), "in `main`: `echo` cannot show Secret<Str>[1], which holds")
 	assert opens(problem("type Wrap \{ A \{ login: Login } }\n" + login + inMain("w := Wrap.A(Login(\"ada\", bypass(\"pw\")))  echo \"\{w}\"")), "in `main`: an interpolation cannot show Wrap, which holds")
-	assert opens(problem(inMain("panic hive.crypto.decrypt(\"x\", bypass(\"pw\"))")), "in `main`: `panic` cannot show Result<Secret, hive.crypto.CryptoError>")
+	assert opens(problem(inMain("panic hive.crypto.decrypt(\"x\", bypass(\"pw\"))")), "in `main`: `panic` cannot show Result<Secret<Str>, hive.crypto.CryptoError>")
 	assert problemCount(login + inMain("echo Login(\"ada\", bypass(\"pw\")).user")) == 0
 }
 
@@ -1467,38 +1468,65 @@ proc expandedProblems(source: Str): Str[dyn] {
 
 test "a generic copy at a Secret is held to the same rule" {
 	shown := "func shown(x: T): Str \{ return \"\{x}\" }\n"
-	assert expandedProblems(shown + inMain("echo shown(bypass(\"pw\"))")) == ["in `shown_hiveSecret`: an interpolation cannot show a `Secret`: only `reveal` turns one into text"]
+	assert expandedProblems(shown + inMain("echo shown(bypass(\"pw\"))")) == ["in `shown_hiveSecretStr`: an interpolation cannot show Secret<Str>: only `reveal` opens a `Secret`"]
 	assert len(expandedProblems(shown + inMain("echo shown(1)"))) == 0
+	keep := "func keep(x: T): Secret<T> \{ return bypass(x) }\n"
+	assert len(expandedProblems(keep + inMain("echo reveal(keep(1)) + 1  echo reveal(keep(\"a\")) + \"b\""))) == 0
 }
 
 test "a Secret has no JSON" {
-	login := "type Login \{ user: Str  password: Secret }\n"
-	assert problem(login + inMain("echo encode(Login(\"ada\", bypass(\"pw\")), hive.json.codec())")) == "in `main`: `encode` cannot carry Login: a `Secret` has no JSON, because only `reveal` turns one into text"
+	login := "type Login \{ user: Str  password: Secret<Str> }\n"
+	assert problem(login + inMain("echo encode(Login(\"ada\", bypass(\"pw\")), hive.json.codec())")) == "in `main`: `encode` cannot carry Login: a `Secret` has no JSON, because only `reveal` opens one"
 	assert opens(problem(login + inMain("if Login.decode(\"x\", hive.json.codec()) is Result.Ok(l) \{ echo l.user }")), "in `main`: `Login.decode` cannot carry Login")
 }
 
 test "hide answers a Secret or why it could not lock one" {
 	assert problemCount(inMain("if hide(\"pw\") is Result.Ok(s) \{ echo reveal(s) } else if hide(\"pw\") is Result.Error(why) \{ echo why.message }")) == 0
 	assert problemCount(inMain("if hide(\"pw\") is Result.Error(SecretError.LimitExceeded(m)) \{ echo m }")) == 0
-	assert problemCount(inMain("if hide(text: \"pw\") is Result.Ok(s) \{ echo reveal(secret: s) }")) == 0
-	assert opens(problem(inMain("echo hide(\"pw\")")), "in `main`: `echo` cannot show Result<Secret, SecretError>, which holds a `Secret`")
-	assert opens(problem(inMain("echo reveal(hide(\"pw\"))")), "in `main`: what `reveal` reads wants Secret and this is Result<Secret, SecretError>")
-	assert opens(problem(inMain("s := hide(1)")), "in `main`: what `hide` keeps wants Str and this is Int")
+	assert problemCount(inMain("if hide(value: \"pw\") is Result.Ok(s) \{ echo reveal(secret: s) }")) == 0
+	assert opens(problem(inMain("echo hide(\"pw\")")), "in `main`: `echo` cannot show Result<Secret<Str>, SecretError>, which holds a `Secret`")
+	assert opens(problem(inMain("echo reveal(hide(\"pw\"))")), "in `main`: what `reveal` reads wants Secret<T> and this is Result<Secret<Str>, SecretError>")
+	assert problemCount(inMain("if hide(1) is Result.Ok(s) \{ echo reveal(s) + 1 }")) == 0
 }
 
 test "bypass answers a Secret that cannot fail" {
 	assert problemCount(inMain("s := bypass(\"pw\")  echo reveal(s) == \"pw\"")) == 0
-	assert problemCount(inMain("echo reveal(secret: bypass(text: \"pw\"))")) == 0
-	assert opens(problem(inMain("echo bypass(\"pw\")")), "in `main`: `echo` cannot show a `Secret`")
-	assert opens(problem(inMain("s := bypass(1)")), "in `main`: what `bypass` keeps wants Str and this is Int")
-	assert opens(problem(inMain("echo reveal(\"pw\")")), "in `main`: what `reveal` reads wants Secret and this is Str")
+	assert problemCount(inMain("echo reveal(secret: bypass(value: \"pw\"))")) == 0
+	assert opens(problem(inMain("echo bypass(\"pw\")")), "in `main`: `echo` cannot show Secret<Str>")
+	assert opens(problem(inMain("echo reveal(\"pw\")")), "in `main`: what `reveal` reads wants Secret<T> and this is Str")
 	assert opens(problem(inMain("echo reveal(bypass(\"a\"), bypass(\"b\"))")), "in `main`: `reveal`")
+}
+
+test "a Secret holds any plain value, and reveal answers with its type" {
+	login := "type Login \{ user: Str  pin: Int }\n"
+	assert problemCount(login + inMain("s := bypass(Login(\"ada\", 1))  echo reveal(s).pin + 1")) == 0
+	assert problemCount(inMain("Secret<Int[dyn]> v = bypass([1, 2])  echo len(reveal(v))")) == 0
+	assert problemCount(inMain("Result<Int, Str> r = Result.Ok(1)  echo reveal(bypass([r]))")) == 0
+	assert problemCount(inMain("hive.map.Map<Str, Int> m = hive.map.new()  echo hive.map.keys(reveal(bypass(m)))")) == 0
+	assert opens(problem(inMain("Secret<Str> s = bypass(1)")), "in `main`: the declaration of `s` wants Secret<Str> and this is Secret<Int>")
+	assert opens(problem(inMain("echo reveal(bypass(1)) + \"a\"")), "in `main`: `+`")
+}
+
+test "a Secret refuses what is not plain data" {
+	keepsNot := ": a `Secret` holds plain data — text, numbers, vectors, maps, results and declared types made of them — and not a function, an address, a library handle or another `Secret`"
+	assert problem("func twice(n: Int): Int \{ return n * 2 }\n" + inMain("s := bypass(twice)")) == "in `main`: `bypass` cannot keep func(Int): Int" + keepsNot
+	assert problem("type Inner \{ key: Secret<Str> }\n" + inMain("s := bypass(Inner(bypass(\"k\")))")) == "in `main`: `bypass` cannot keep Inner, which holds Secret<Str>" + keepsNot
+	assert problem(inMain("if hide(bypass(1)) is Result.Ok(s) \{ }")) == "in `main`: `hide` cannot keep Secret<Int>" + keepsNot
+	assert problem("proc f(s: Secret<proc(): void>): void \{ }\n" + inMain("")) == "in `f`: a `Secret` cannot keep proc(): void" + keepsNot
+	assert problem("type Box \{ conn: Secret<hive.net.WsConnection> }\n" + inMain("")) == "in `Box`: a `Secret` cannot keep hive.net.WsConnection" + keepsNot
+}
+
+test "a Secret says what it holds" {
+	assert problem("proc f(s: Secret): void \{ }\n" + inMain("")) == "in `f`: a secret says what it holds: `Secret<T>`, with `T` the type of its value"
+	assert problem(inMain("Secret s = bypass(\"pw\")")) == "in `main`: a secret says what it holds: `Secret<T>`, with `T` the type of its value"
 }
 
 test "secrets compare with == and have no order" {
 	assert problemCount(inMain("echo bypass(\"a\") == bypass(\"a\")  echo bypass(\"a\") != bypass(\"b\")")) == 0
+	assert problemCount(inMain("echo bypass([1]) == bypass([1])")) == 0
+	assert opens(problem(inMain("echo bypass(\"a\") == bypass(1)")), "in `main`: `==`")
 	assert opens(problem(inMain("echo bypass(\"a\") < bypass(\"b\")")), "in `main`: `<` orders an `Int`, a `Float` or a `Str`")
-	assert opens(problem(inMain("echo sort([bypass(\"a\")])")), "in `main`: `sort` puts a vector in its elements' own order, and Secret has none")
+	assert opens(problem(inMain("echo sort([bypass(\"a\")])")), "in `main`: `sort` puts a vector in its elements' own order, and Secret<Str> has none")
 	assert opens(problem(inMain("echo bypass(\"a\") + bypass(\"b\")")), "in `main`: `+` adds two numbers")
 }
 
@@ -1506,22 +1534,23 @@ test "the library takes and hands back secrets" {
 	assert problemCount(inMain("if hive.crypto.decrypt(hive.crypto.encrypt(bypass(\"t\"), bypass(\"pw\")), bypass(\"pw\")) is Result.Ok(s) \{ echo reveal(s) }")) == 0
 	assert problemCount(inMain("if hive.crypto.randomSecret(32) is Result.Ok(k) \{ echo hive.crypto.hmacSha256(\"m\", k) } else if hive.crypto.randomSecret(32) is Result.Error(hive.SecretError.Unsupported(m)) \{ echo m }")) == 0
 	assert problemCount(inMain("if hive.term.readSecret() is Result.Ok(s) \{ echo reveal(s) } else if hive.term.readSecret() is Result.Error(why) \{ echo why.message }")) == 0
-	assert opens(problem(inMain("echo hive.crypto.hmacSha256(\"m\", hive.crypto.randomSecret(32))")), "in `main`: the second argument of `hive.crypto.hmacSha256` wants Secret and this is Result<Secret, SecretError>")
+	assert opens(problem(inMain("echo hive.crypto.hmacSha256(\"m\", hive.crypto.randomSecret(32))")), "in `main`: the second argument of `hive.crypto.hmacSha256` wants Secret<Str> and this is Result<Secret<Str>, SecretError>")
 	assert problemCount(inMain("hive.file.writeSecret(\"k\", bypass(\"s\"))")) == 0
 	assert problemCount(inMain("if hive.env.getSecret(\"KEY\") is Result.Ok(k) \{ echo reveal(k) } else if hive.env.getSecret(\"KEY\") is Result.Error(why) \{ echo why.key }")) == 0
-	assert opens(problem(inMain("echo hive.env.getSecret(\"KEY\")")), "in `main`: `echo` cannot show Result<Secret, hive.env.EnvironmentError>")
-	assert opens(problem(inMain("echo hive.term.readSecret()")), "in `main`: `echo` cannot show Result<Secret, SecretError>")
-	assert opens(problem(inMain("echo hive.crypto.encrypt(\"t\", bypass(\"pw\"))")), "in `main`: the first argument of `hive.crypto.encrypt` wants Secret and this is Str")
-	assert opens(problem(inMain("echo hive.crypto.hmacSha256(\"m\", \"key\")")), "in `main`: the second argument of `hive.crypto.hmacSha256` wants Secret and this is Str")
-	assert opens(problem(inMain("hive.file.writeSecret(\"k\", \"s\")")), "in `main`: the second argument of `hive.file.writeSecret` wants Secret and this is Str")
+	assert opens(problem(inMain("echo hive.env.getSecret(\"KEY\")")), "in `main`: `echo` cannot show Result<Secret<Str>, hive.env.EnvironmentError>")
+	assert opens(problem(inMain("echo hive.term.readSecret()")), "in `main`: `echo` cannot show Result<Secret<Str>, SecretError>")
+	assert opens(problem(inMain("echo hive.crypto.encrypt(\"t\", bypass(\"pw\"))")), "in `main`: the first argument of `hive.crypto.encrypt` wants Secret<Str> and this is Str")
+	assert opens(problem(inMain("echo hive.crypto.encrypt(bypass(1), bypass(\"pw\"))")), "in `main`: the first argument of `hive.crypto.encrypt` wants Secret<Str> and this is Secret<Int>")
+	assert opens(problem(inMain("echo hive.crypto.hmacSha256(\"m\", \"key\")")), "in `main`: the second argument of `hive.crypto.hmacSha256` wants Secret<Str> and this is Str")
+	assert opens(problem(inMain("hive.file.writeSecret(\"k\", \"s\")")), "in `main`: the second argument of `hive.file.writeSecret` wants Secret<Str> and this is Str")
 }
 
 test "readSecretBypass cannot fail, and decryptBypass fails only as decrypt does" {
 	assert problemCount(inMain("s := hive.term.readSecretBypass()  echo reveal(s)")) == 0
-	assert opens(problem(inMain("echo hive.term.readSecretBypass()")), "in `main`: `echo` cannot show a `Secret`")
+	assert opens(problem(inMain("echo hive.term.readSecretBypass()")), "in `main`: `echo` cannot show Secret<Str>")
 	assert problemCount(inMain("if hive.crypto.decryptBypass(password: bypass(\"pw\"), ciphertext: \"x\") is Result.Ok(s) \{ echo reveal(s) } else if hive.crypto.decryptBypass(\"x\", bypass(\"pw\")) is Result.Error(crypto.CryptoError.BadSignature(m)) \{ echo m }")) == 0
-	assert opens(problem(inMain("echo hive.crypto.decryptBypass(\"x\", bypass(\"pw\"))")), "in `main`: `echo` cannot show Result<Secret, hive.crypto.CryptoError>")
-	assert opens(problem(inMain("echo hive.crypto.decryptBypass(\"x\", \"pw\")")), "in `main`: the second argument of `hive.crypto.decryptBypass` wants Secret and this is Str")
+	assert opens(problem(inMain("echo hive.crypto.decryptBypass(\"x\", bypass(\"pw\"))")), "in `main`: `echo` cannot show Result<Secret<Str>, hive.crypto.CryptoError>")
+	assert opens(problem(inMain("echo hive.crypto.decryptBypass(\"x\", \"pw\")")), "in `main`: the second argument of `hive.crypto.decryptBypass` wants Secret<Str> and this is Str")
 }
 
 test "a library error is a union of what went wrong" {
@@ -1542,7 +1571,7 @@ test "a library error is a union of what went wrong" {
 test "a program's own Secret comes before the builtin, which is still hive.Secret" {
 	own := "type Secret \{ code: Int }\ntype SecretError \{ code: Int }\n"
 	assert problemCount(own + inMain("echo Secret(1).code  echo SecretError(2).code")) == 0
-	assert problemCount(own + "proc keep(s: hive.Secret, r: Result<hive.Secret, hive.SecretError>): void \{ }\n" + inMain("keep(bypass(\"pw\"), hide(\"pw\"))")) == 0
+	assert problemCount(own + "proc keep(s: hive.Secret<Str>, r: Result<hive.Secret<Str>, hive.SecretError>): void \{ }\n" + inMain("keep(bypass(\"pw\"), hide(\"pw\"))")) == 0
 	same := "func same(a: T, b: T): Bool \{ return a == b }\n"
 	assert len(expandedProblems(own + same + inMain("echo same(bypass(\"a\"), bypass(\"a\"))  echo same(Secret(1), Secret(1))"))) == 0
 }

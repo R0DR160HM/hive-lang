@@ -8,6 +8,7 @@
 * **`spawn` reads `M` off its handler**, and a handler's third parameter is an `Address<M>` of its own mailbox type.
 * **`at` lands where an `Address<M>` is declared**, as `hive.map.new()` does, so `x := at(#Name)` is a compile error.
 * **`monitor`'s notice is one of the watcher's messages.**
+* **`Secret<T>` keeps any plain value**: `hide(T)` and `bypass(T)` make one, and `reveal` answers the `T` back.
 
 ### Standard library
 
@@ -22,6 +23,8 @@
 | `box := at(#Name)` | `Address<M> box = at(#Name)` |
 | `why.reason == "NotFound"` | `why is file.FileError.NotFound` |
 | `SqlError` reason `"Query"` | `SqlError.Statement` |
+| `Secret` | `Secret<Str>`, and the library's secrets with it |
+| `hide(text: s)`, `bypass(text: s)` | `hide(value: s)`, `bypass(value: s)` |
 
 ## v0.2.18
 

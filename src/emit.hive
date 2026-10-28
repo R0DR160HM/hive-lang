@@ -325,7 +325,7 @@ func goType(ty: types.Ty): Str {
 		return "hive." + text.capitalise(module) + name
 	}
 	else if ty is types.Ty.TAddress(_) { return "hive.SyslinkAddress" }
-	else if ty is types.Ty.TSecret { return "hive.Secret" }
+	else if ty is types.Ty.TSecret(_) { return "hive.Secret" }
 	else if ty is types.Ty.TFn(_, params, mutexes, result) {
 		mut Str[dyn] out = []
 		mut i := 0
@@ -2300,7 +2300,7 @@ proc withCodec(em: mut Emit, env: infer.Env, value: Str, codec: ast.Expr): Str {
 // codec carries.
 proc jwtSecret(em: mut Emit, env: infer.Env, codec: ast.Expr): Str {
 	if stdlib.codecFormat(codec) == "jwt" {
-		return expr(em, env, stdlib.codecSecret(codec), types.Ty.TSecret())
+		return expr(em, env, stdlib.codecSecret(codec), types.Ty.TSecret(types.Ty.TStr()))
 	}
 	return expr(em, env, codec, infer.typeOf(env, codec)) + ".Secret"
 }
@@ -2884,13 +2884,29 @@ proc builtin(em: mut Emit, env: infer.Env, name: Str, written: ast.Arg[], want: 
 	}
 	if name == "hide" {
 		useModule(em, "secret")
-		return lifted(types.Ty.TResult(types.Ty.TSecret(), types.secretError()), "hive.Hide(" + a + ")")
+		answer := types.Ty.TResult(types.Ty.TSecret(firstType), types.secretError())
+		if firstType is types.Ty.TStr {
+			return lifted(answer, "hive.Hide(" + a + ")")
+		}
+		useModule(em, "secretvalue")
+		return lifted(answer, "hive.HideWith(" + a + ", " + secretPutter(em, firstType) + ")")
 	}
 	if name == "reveal" {
+		if firstType is types.Ty.TSecret(held) {
+			if held is types.Ty.TStr {
+				return "hive.Reveal(" + a + ")"
+			}
+			useModule(em, "secretvalue")
+			return "hive.RevealWith(" + a + ", " + secretTaker(em, held) + ")"
+		}
 		return "hive.Reveal(" + a + ")"
 	}
 	if name == "bypass" {
-		return "hive.Bypass(" + a + ")"
+		if firstType is types.Ty.TStr {
+			return "hive.Bypass(" + a + ")"
+		}
+		useModule(em, "secretvalue")
+		return "hive.BypassWith(" + a + ", " + secretPutter(em, firstType) + ")"
 	}
 	// The one builtin that is not a call on the runtime package: the encoder is
 	// written out of the argument's static type and the format its second
@@ -4009,6 +4025,13 @@ proc emitCodecsFrom(em: mut Emit, from: Int): void {
 // a dot — the second being what `T.Variant.decode` asks for. A variant needs a
 // decoder alone: it is read into the union its type already encodes.
 proc emitCodec(em: mut Emit, name: Str): void {
+	if text.startsWith(name, "secret:") {
+		typeName := text.span(text.chars(name), 7, len(name) - 1)
+		if types.findType(em.table, typeName) is Result.Ok(info) {
+			emitSecretForm(em, typeName, info)
+		}
+		return
+	}
 	for each format in ["query", "term"] {
 		if text.startsWith(name, format + ":") {
 			typeName := text.span(text.chars(name), len(format) + 1, len(name) - 1)
@@ -4276,7 +4299,7 @@ proc decoderRef(em: mut Emit, ty: types.Ty): Str {
 		fail(em, stdlib.tableHasNoJson())
 		return "hive.JsonStr"
 	}
-	if ty is types.Ty.TSecret {
+	if ty is types.Ty.TSecret(_) {
 		fail(em, stdlib.secretHasNoJson())
 		return "hive.JsonStr"
 	}
@@ -4347,7 +4370,7 @@ proc encodeOf(em: mut Emit, ty: types.Ty, value: Str, depth: Int): Str {
 		fail(em, stdlib.tableHasNoJson())
 		return "\"null\""
 	}
-	if ty is types.Ty.TSecret {
+	if ty is types.Ty.TSecret(_) {
 		fail(em, stdlib.secretHasNoJson())
 		return "\"null\""
 	}
@@ -4367,6 +4390,116 @@ proc encodeOf(em: mut Emit, ty: types.Ty, value: Str, depth: Int): Str {
 	}
 	// Anything with no static shape is encoded from what it turns out to be.
 	return "hive.JsonEncodeDynamic(" + value + ")"
+}
+
+// --- Secret forms ------------------------------------------------------------
+
+func secretPutName(name: Str): Str {
+	return "secretPut_" + goIdent(name)
+}
+
+func secretTakeName(name: Str): Str {
+	return "secretTake_" + goIdent(name)
+}
+
+proc emitSecretForm(em: mut Emit, name: Str, info: types.TypeInfo): void {
+	whole := types.Ty.TNamed(name)
+	blank(em)
+	open(em, "func " + secretPutName(name) + "(b *[]byte, x " + goType(whole) + ") \{")
+	if len(info.variants) == 0 {
+		putFields(em, info.shared, "x")
+	}
+	mut i := 0
+	for each variant in info.variants {
+		open(em, "if v, ok := x.(" + goVariant(name, variant.name) + "); ok \{")
+		line(em, "_ = v")
+		line(em, "hive.SecretPutInt(b, {i})")
+		putFields(em, withShared(variant.fields, info.shared), "v")
+		line(em, "return")
+		close(em, "}")
+		i = i + 1
+	}
+	close(em, "}")
+	blank(em)
+	open(em, "func " + secretTakeName(name) + "(r *hive.SecretReader) " + goType(whole) + " \{")
+	if len(info.variants) == 0 {
+		takeFields(em, info.shared)
+		line(em, "return " + goIdent(name) + "\{" + fieldInits(info.shared) + "}")
+		close(em, "}")
+		return
+	}
+	line(em, "which := hive.SecretTakeInt(r)")
+	i = 0
+	for each variant in info.variants {
+		fields := withShared(variant.fields, info.shared)
+		open(em, "if which == {i} \{")
+		takeFields(em, fields)
+		line(em, "return " + goVariant(name, variant.name) + "\{" + fieldInits(fields) + "}")
+		close(em, "}")
+		i = i + 1
+	}
+	line(em, "return nil")
+	close(em, "}")
+}
+
+proc putFields(em: mut Emit, fields: ast.Field[], subject: Str): void {
+	for each f in fields {
+		line(em, secretPutter(em, types.resolve(em.table, f.declared)) + "(b, " + subject + "." + goField(f.name) + ")")
+	}
+}
+
+proc takeFields(em: mut Emit, fields: ast.Field[]): void {
+	for each f in fields {
+		line(em, "f_" + goIdent(f.name) + " := " + secretTaker(em, types.resolve(em.table, f.declared)) + "(r)")
+	}
+}
+
+proc secretPutter(em: mut Emit, ty: types.Ty): Str {
+	if ty is types.Ty.TStr { return "hive.SecretPutStr" }
+	if ty is types.Ty.TInt { return "hive.SecretPutInt" }
+	if ty is types.Ty.TFloat { return "hive.SecretPutFloat" }
+	if ty is types.Ty.TBool { return "hive.SecretPutBool" }
+	if ty is types.Ty.TAtom { return "hive.SecretPutAtom" }
+	if ty is types.Ty.TNamed(name) {
+		needCodec(em, "secret:" + name)
+		return secretPutName(name)
+	}
+	head := "func(b *[]byte, x " + goType(ty) + ") \{ "
+	if ty is types.Ty.TVec(element, _) {
+		return head + "hive.SecretPutVec(b, x, " + secretPutter(em, element) + ") }"
+	}
+	if ty is types.Ty.TResult(ok, bad) {
+		return head + "hive.SecretPutResult(b, x, " + secretPutter(em, ok) + ", " + secretPutter(em, bad) + ") }"
+	}
+	if ty is types.Ty.TMap(key, value) {
+		return head + "hive.SecretPutDict(b, x, " + secretPutter(em, key) + ", " + secretPutter(em, value) + ") }"
+	}
+	fail(em, "a `Secret` cannot keep " + types.show(ty))
+	return "nil"
+}
+
+proc secretTaker(em: mut Emit, ty: types.Ty): Str {
+	if ty is types.Ty.TStr { return "hive.SecretTakeStr" }
+	if ty is types.Ty.TInt { return "hive.SecretTakeInt" }
+	if ty is types.Ty.TFloat { return "hive.SecretTakeFloat" }
+	if ty is types.Ty.TBool { return "hive.SecretTakeBool" }
+	if ty is types.Ty.TAtom { return "hive.SecretTakeAtom" }
+	if ty is types.Ty.TNamed(name) {
+		needCodec(em, "secret:" + name)
+		return secretTakeName(name)
+	}
+	head := "func(r *hive.SecretReader) " + goType(ty) + " \{ return "
+	if ty is types.Ty.TVec(element, _) {
+		return head + "hive.SecretTakeVec(r, " + secretTaker(em, element) + ") }"
+	}
+	if ty is types.Ty.TResult(ok, bad) {
+		return head + "hive.SecretTakeResult(r, " + secretTaker(em, ok) + ", " + secretTaker(em, bad) + ") }"
+	}
+	if ty is types.Ty.TMap(key, value) {
+		return head + "hive.SecretTakeDict(r, " + secretTaker(em, key) + ", " + secretTaker(em, value) + ") }"
+	}
+	fail(em, "a `Secret` cannot keep " + types.show(ty))
+	return "nil"
 }
 
 // --- Flat codecs -------------------------------------------------------------

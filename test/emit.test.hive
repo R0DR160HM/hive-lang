@@ -659,20 +659,43 @@ test "hide locks memory a file per platform, and bypass and reveal need none of 
 	assert has(stmt("echo reveal(bypass(\"pw\"))"), "hive.Reveal(hive.Bypass(\"pw\"))")
 	env := loader.loadText("main.hive", "proc main(): void \{ if hive.env.getSecret(\"K\") is Result.Ok(k) \{ echo reveal(k) } }")
 	assert join(emit.emitModule(env.module).modules, ",") == "env,secret,secretunix,secretwindows,secretother"
-	alone := loader.loadText("main.hive", "proc shown(s: Secret): Str \{ return reveal(s) }\nproc main(): void \{ }")
+	alone := loader.loadText("main.hive", "proc shown(s: Secret<Str>): Str \{ return reveal(s) }\nproc main(): void \{ }")
 	assert len(emit.emitModule(alone.module).modules) == 0
+}
+
+test "a Secret of anything but text is kept in a form written for its type" {
+	got := go("type Login \{ user: Str  pin: Int  codes: Str[dyn] }\nproc main(): void \{ if hide(Login(\"ada\", 1, [])) is Result.Ok(s) \{ echo reveal(s).pin } }")
+	assert has(got, "hive.HideWith(Login\{")
+	assert has(got, "hive.RevealWith(s, secretTake_Login)")
+	assert has(got, "func secretPut_Login(b *[]byte, x Login) \{")
+	assert has(got, "hive.SecretPutStr(b, x.User)")
+	assert has(got, "hive.SecretPutInt(b, x.Pin)")
+	assert has(got, "hive.SecretPutVec(b, x, hive.SecretPutStr)")
+	assert has(got, "func secretTake_Login(r *hive.SecretReader) Login \{")
+	bypassed := emit.emitModule(loader.loadText("main.hive", "proc main(): void \{ echo reveal(bypass([1, 2]))[0] }").module)
+	assert join(bypassed.modules, ",") == "secretvalue"
+	assert has(bypassed.source, "hive.RevealWith(hive.BypassWith(")
+	hidden := emit.emitModule(loader.loadText("main.hive", "proc main(): void \{ if hide(1) is Result.Ok(s) \{ echo reveal(s) } }").module)
+	assert join(hidden.modules, ",") == "secret,secretunix,secretwindows,secretother,secretvalue"
+}
+
+test "a Secret holding a union writes which variant it is" {
+	got := go("type Key \{ Pin \{ digits: Int }\n Phrase \{ words: Str[dyn] } }\nproc main(): void \{ echo reveal(bypass(Key.Pin(1))) is Key.Pin(_) }")
+	assert has(got, "if v, ok := x.(KeyPin); ok \{")
+	assert has(got, "hive.SecretPutInt(b, 1)")
+	assert has(got, "which := hive.SecretTakeInt(r)")
 }
 
 test "secrets compare what they hold, wherever they sit" {
 	assert has(stmt("echo bypass(\"a\") == bypass(\"b\")"), "hive.Eq(hive.Bypass(\"a\"), hive.Bypass(\"b\"))")
-	got := go("type Login \{ user: Str  password: Secret }\nproc main(): void \{ a := Login(\"ada\", bypass(\"pw\"))  echo a == a }")
+	got := go("type Login \{ user: Str  password: Secret<Str> }\nproc main(): void \{ a := Login(\"ada\", bypass(\"pw\"))  echo a == a }")
 	assert has(got, "hive.Eq(a, a)")
 	assert has(got, "Password hive.Secret")
 }
 
 test "a message carrying a Secret is refused where its codec is derived" {
-	got := go("type Msg \{ Key \{ key: Secret } }\nproc inbox(state: mut Int, m: Msg): Msg \{ return m }\nproc main(): void \{ if spawn(inbox, 0) is Result.Ok(a) \{ a(Msg.Key(bypass(\"k\"))) } }")
-	assert got == "emit: a `Secret` has no JSON, because only `reveal` turns one into text"
+	got := go("type Msg \{ Key \{ key: Secret<Str> } }\nproc inbox(state: mut Int, m: Msg): Msg \{ return m }\nproc main(): void \{ if spawn(inbox, 0) is Result.Ok(a) \{ a(Msg.Key(bypass(\"k\"))) } }")
+	assert got == "emit: a `Secret` has no JSON, because only `reveal` opens one"
 }
 
 test "a message carrying a Table is refused where its codec is derived" {

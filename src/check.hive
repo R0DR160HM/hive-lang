@@ -425,6 +425,23 @@ proc checkLibTypes(c: mut Check, ty: types.Ty): void {
 		} else {
 			checkLibTypes(c, message)
 		}
+	} else if ty is types.Ty.TSecret(held) {
+		if held is types.Ty.TUnknown {
+			report(c, "a secret says what it holds: `Secret<T>`, with `T` the type of its value")
+		} else {
+			checkLibTypes(c, held)
+			checkKeepable(c, "a `Secret`", held)
+		}
+	}
+}
+
+proc checkKeepable(c: mut Check, what: Str, ty: types.Ty): void {
+	if types.unkeepable(c.table, ty, []) is Result.Ok(found) {
+		mut held := ""
+		if types.same(found, ty) == false {
+			held = ", which holds " + types.show(found)
+		}
+		report(c, what + " cannot keep " + types.show(ty) + held + ": a `Secret` holds plain data — text, numbers, vectors, maps, results and declared types made of them — and not a function, an address, a library handle or another `Secret`")
 	}
 }
 
@@ -1191,13 +1208,13 @@ proc checkExpr(c: mut Check, env: infer.Env, e: ast.Expr): void {
 	}
 }
 
-// Only `reveal` turns a `Secret` into text, so nothing that shows a value shows one.
+// Only `reveal` opens a `Secret`, so nothing that shows a value shows one.
 proc checkShown(c: mut Check, env: infer.Env, value: ast.Expr, what: Str): void {
 	ty := infer.typeOf(env, value)
-	if ty is types.Ty.TSecret {
-		report(c, what + " cannot show a `Secret`: only `reveal` turns one into text")
+	if ty is types.Ty.TSecret(_) {
+		report(c, what + " cannot show " + types.show(ty) + ": only `reveal` opens a `Secret`")
 	} else if types.holdsSecret(c.table, ty) {
-		report(c, what + " cannot show " + types.show(ty) + ", which holds a `Secret`: only `reveal` turns one into text")
+		report(c, what + " cannot show " + types.show(ty) + ", which holds a `Secret`: only `reveal` opens one")
 	}
 }
 
@@ -1281,7 +1298,7 @@ proc checkMember(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str): v
 func hasNoFields(ty: types.Ty): Bool {
 	return ty is types.Ty.TStr || ty is types.Ty.TInt || ty is types.Ty.TFloat
 		|| ty is types.Ty.TBool || ty is types.Ty.TAtom || ty is types.Ty.TAddress(_)
-		|| ty is types.Ty.TSecret
+		|| ty is types.Ty.TSecret(_)
 		|| ty is types.Ty.TFn(_, _, _, _) || ty is types.Ty.TVec(_, _)
 		|| ty is types.Ty.TResult(_, _) || ty is types.Ty.TMap(_, _)
 }
@@ -2020,11 +2037,11 @@ proc checkBuiltinCall(c: mut Check, env: infer.Env, name: Str, written: ast.Arg[
 		}
 	} else if name == "hide" || name == "bypass" {
 		if arity(c, name, args, 1) {
-			fits(c, types.Ty.TStr(), typeOfArg(c, env, args, 0), "what `{name}` keeps")
+			checkKeepable(c, "`{name}`", typeOfArg(c, env, args, 0))
 		}
 	} else if name == "reveal" {
 		if arity(c, name, args, 1) {
-			fits(c, types.Ty.TSecret(), typeOfArg(c, env, args, 0), "what `reveal` reads")
+			fits(c, types.Ty.TSecret(types.Ty.TUnknown()), typeOfArg(c, env, args, 0), "what `reveal` reads")
 		}
 	} else if name == "row" || name == "column" {
 		if arity(c, name, args, 2) {

@@ -43,8 +43,8 @@ type Ty {
 	TLib { module: Str, name: Str }
 	// `Address<M>` — a service taking messages of `M`, which a call sends to.
 	TAddress { message: Ty }
-	// `Secret` — text kept out of swap, which nothing prints.
-	TSecret
+	// `Secret<T>` — a value kept out of swap, which nothing prints.
+	TSecret { held: Ty }
 	// A type variable, which is what makes a callable generic in it.
 	TVar { name: Str }
 	// No answer. Everything that produces one has already reported why.
@@ -290,7 +290,7 @@ func resolveBase(t: Table, pkg: Str, name: Str, args: ast.TypeExpr[]): Ty {
 		return Ty.TAddress(argAt(t, args, 0))
 	}
 	if pkg == "hive" && name == "Secret" {
-		return Ty.TSecret()
+		return Ty.TSecret(argAt(t, args, 0))
 	}
 	if pkg == "hive" && name == "SecretError" {
 		return secretError()
@@ -322,7 +322,7 @@ func resolveBare(t: Table, name: Str, args: ast.TypeExpr[]): Ty {
 		return Ty.TAddress(argAt(t, args, 0))
 	}
 	if name == "Secret" {
-		return Ty.TSecret()
+		return Ty.TSecret(argAt(t, args, 0))
 	}
 	if name == "SecretError" {
 		return secretError()
@@ -361,8 +361,8 @@ func toWritten(ty: Ty): ast.TypeExpr {
 	if ty is Ty.TAddress(message) {
 		return ast.TypeExpr.Named("hive", "Address", [toWritten(message)], [])
 	}
-	if ty is Ty.TSecret {
-		return ast.TypeExpr.Named("hive", "Secret", [], [])
+	if ty is Ty.TSecret(held) {
+		return ast.TypeExpr.Named("hive", "Secret", [toWritten(held)], [])
 	}
 	if ty is Ty.TVec(element, dim) {
 		return withDim(toWritten(element), dim)
@@ -437,7 +437,8 @@ func show(ty: Ty): Str {
 	// What `kill` and `monitor` take: an address of any service at all.
 	else if ty is Ty.TAddress(Ty.TUnknown) { return "Address<M>" }
 	else if ty is Ty.TAddress(message) { return "Address<" + show(message) + ">" }
-	else if ty is Ty.TSecret { return "Secret" }
+	else if ty is Ty.TSecret(Ty.TUnknown) { return "Secret<T>" }
+	else if ty is Ty.TSecret(held) { return "Secret<" + show(held) + ">" }
 	else if ty is Ty.TVec(element, dim) { return show(element) + showDim(dim) }
 	else if ty is Ty.TResult(ok, bad) { return "Result<" + show(ok) + ", " + show(bad) + ">" }
 	else if ty is Ty.TMap(key, value) { return "hive.map.Map<" + show(key) + ", " + show(value) + ">" }
@@ -528,7 +529,50 @@ func holdsSecret(t: Table, ty: Ty): Bool {
 }
 
 func isSecret(ty: Ty): Bool {
-	return ty is Ty.TSecret
+	return ty is Ty.TSecret(_)
+}
+
+func unkeepable(t: Table, ty: Ty, seen: Str[]): Result<Ty, Bool> {
+	if ty is Ty.TStr || ty is Ty.TInt || ty is Ty.TFloat || ty is Ty.TBool || ty is Ty.TAtom || ty is Ty.TUnknown {
+		return Result.Error(false)
+	}
+	if ty is Ty.TVec(element, _) {
+		return unkeepable(t, element, seen)
+	}
+	if ty is Ty.TResult(ok, bad) {
+		if unkeepable(t, ok, seen) is Result.Ok(inner) {
+			return Result.Ok(inner)
+		}
+		return unkeepable(t, bad, seen)
+	}
+	if ty is Ty.TMap(key, value) {
+		if unkeepable(t, key, seen) is Result.Ok(inner) {
+			return Result.Ok(inner)
+		}
+		return unkeepable(t, value, seen)
+	}
+	if ty is Ty.TNamed(name) {
+		if indexOf(seen, name) is Result.Ok(_) {
+			return Result.Error(false)
+		}
+		if findType(t, name) is Result.Ok(info) {
+			inner := seen + [name]
+			for each f in info.shared {
+				if unkeepable(t, resolve(t, f.declared), inner) is Result.Ok(found) {
+					return Result.Ok(found)
+				}
+			}
+			for each v in info.variants {
+				for each f in v.fields {
+					if unkeepable(t, resolve(t, f.declared), inner) is Result.Ok(found) {
+						return Result.Ok(found)
+					}
+				}
+			}
+		}
+		return Result.Error(false)
+	}
+	return Result.Ok(ty)
 }
 
 func isTable(ty: Ty): Bool {
@@ -595,6 +639,13 @@ func accepts(to: Ty, from: Ty): Bool {
 		}
 		return false
 	}
+	// A secret is never written to, so what it holds fits the way a value would.
+	if to is Ty.TSecret(toHeld) {
+		if from is Ty.TSecret(fromHeld) {
+			return accepts(toHeld, fromHeld)
+		}
+		return false
+	}
 	// A `func` value may fill a `proc` slot — pure widens to impure — and never
 	// the reverse.
 	if to is Ty.TFn(toPure, toParams, toMutexes, toResult) {
@@ -645,7 +696,10 @@ func same(a: Ty, b: Ty): Bool {
 		if b is Ty.TAddress(bMessage) { return same(aMessage, bMessage) }
 		return false
 	}
-	if a is Ty.TSecret { return b is Ty.TSecret }
+	if a is Ty.TSecret(aHeld) {
+		if b is Ty.TSecret(bHeld) { return same(aHeld, bHeld) }
+		return false
+	}
 	if a is Ty.TVec(aElement, aDim) {
 		if b is Ty.TVec(bElement, bDim) { return same(aElement, bElement) && sameDim(aDim, bDim) }
 		return false
@@ -902,7 +956,7 @@ func orderedIn(t: Table, ty: Ty, enumerated: func(Str, Str): Bool, seen: Str[]):
 	if ty is Ty.TLib(module, name) {
 		return enumerated(module, name)
 	}
-	if ty is Ty.TFragment(_) || ty is Ty.TCodec(_) || ty is Ty.TVoid || ty is Ty.TAddress(_) || ty is Ty.TSecret {
+	if ty is Ty.TFragment(_) || ty is Ty.TCodec(_) || ty is Ty.TVoid || ty is Ty.TAddress(_) || ty is Ty.TSecret(_) {
 		return false
 	}
 	if ty is Ty.TVec(element, _) {
