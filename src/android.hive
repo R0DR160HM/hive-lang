@@ -23,15 +23,6 @@ func generatorSource(): Str {
 	return `
 		package main
 
-		// Writes a signed APK. Run by the build under its own directory and deleted
-		// with it, the way the Windows resource generator is: an APK is byte work, and
-		// this keeps the bytes where bytes are natural.
-		//
-		// apk <out> <stem> <label> <versionCode> <versionName> <payload> <dexhex> <icon>
-		//
-		// <icon> may be empty, and then the app carries no launcher icon and no
-		// resource table at all.
-
 		import (
 			"bytes"
 			"compress/flate"
@@ -123,14 +114,10 @@ func generatorSource(): Str {
 			}
 		}
 
-		// The payload is named lib*.so so the installer extracts it into
-		// nativeLibraryDir, the one directory in an app that is executable.
 		const payloadName = "libhiveapp.so"
 
 		const iconPath = "res/mipmap/icon.png"
 
-		// Where the signing key is kept: beside the syslink cluster secret, for the
-		// same reason and made the same way.
 		func keyFile() (string, error) \{
 			home, err := os.UserHomeDir()
 			if err != nil \{
@@ -143,9 +130,6 @@ func generatorSource(): Str {
 			return filepath.Join(dir, "android.key"), nil
 		}
 
-		// An application id derived from the entrypoint: shop.hive becomes hive.shop.
-		// A segment must start with a letter and carry only letters, digits and
-		// underscores, so anything else in the name is dropped.
 		func applicationID(stem string) string \{
 			clean := make([]byte, 0, len(stem))
 			for i := 0; i < len(stem); i++ \{
@@ -173,10 +157,6 @@ func generatorSource(): Str {
 			return hex.DecodeString(string(clean))
 		}
 
-		// ---------------------------------------------------------------------------
-		// AndroidManifest.xml, in the binary form Android reads
-		// ---------------------------------------------------------------------------
-
 		const (
 			chunkStringPool  = 0x0001
 			chunkXML         = 0x0003
@@ -195,9 +175,6 @@ func generatorSource(): Str {
 			androidNS = "http://schemas.android.com/apk/res/android"
 		)
 
-		// The framework attribute ids this manifest uses, read out of aapt2's own
-		// resource map. A framework id is stable across releases, which is what lets
-		// them be written here rather than looked up in an SDK nobody has.
 		var attrID = map[string]uint32\{
 			"theme":                0x01010000,
 			"label":                0x01010001,
@@ -216,14 +193,9 @@ func generatorSource(): Str {
 		}
 
 		const (
-			// @android:style/Theme.DeviceDefault.NoActionBar: the window is the page and
-			// nothing else.
 			themeNoActionBar = 0x01030129
-			// Everything the shim redraws itself rather than being recreated for.
 			configChangesMask = 0x40001ffc
-			// adjustResize, so the keyboard shortens the page instead of covering it.
 			adjustResize = 0x10
-			// package 0x7f, first type, first entry — what resourceTable writes.
 			iconResource = 0x7f010000
 
 			minSdk    = 24
@@ -298,11 +270,7 @@ func generatorSource(): Str {
 					num("minSdkVersion", minSdk),
 					num("targetSdkVersion", targetSdk),
 				}},
-				// Creating any socket needs this, loopback included, and a window is a
-				// server.
 				\{name: "uses-permission", attrs: []attr\{str("name", "android.permission.INTERNET")}},
-				// Without this every ConnectivityManager call throws, so the shim learns
-				// no DNS servers and writes none.
 				\{name: "uses-permission", attrs: []attr\{str("name", "android.permission.ACCESS_NETWORK_STATE")}},
 				application,
 			}}
@@ -316,8 +284,6 @@ func generatorSource(): Str {
 		}
 
 		func encodeXML(root elem) ([]byte, error) \{
-			// Every attribute name carrying a framework id takes the pool's first slots,
-			// in id order, because the resource map is a parallel array over them.
 			named := map[string]uint32\{}
 			var others []string
 			seen := map[string]bool\{}
@@ -481,8 +447,6 @@ func generatorSource(): Str {
 			return append(out, append(end, tail...)...), nil
 		}
 
-		// A ResStringPool. UTF-8 carries two lengths, in characters then in bytes;
-		// UTF-16 carries one, in code units. Both end with a terminator.
 		func stringPool(items []string, utf8 bool) []byte \{
 			var data []byte
 			offsets := make([]uint32, len(items))
@@ -549,12 +513,6 @@ func generatorSource(): Str {
 			return u
 		}
 
-		// ---------------------------------------------------------------------------
-		// resources.arsc — one package, one mipmap, one entry
-		// ---------------------------------------------------------------------------
-
-		// The whole resource table an app needs, because android:label takes a literal
-		// string and only android:icon must be a reference.
 		func resourceTable(appID, icon string) []byte \{
 			const (
 				chunkTable    = 0x0002
@@ -574,8 +532,6 @@ func generatorSource(): Str {
 			le.PutUint16(spec[2:], 16)
 			le.PutUint32(spec[4:], uint32(len(spec)))
 			spec[8] = mipmapID
-			// res1 was reserved and is now how many ResTable_type chunks follow for this
-			// spec. There is one, the default configuration.
 			le.PutUint16(spec[10:], 1)
 			le.PutUint32(spec[12:], 1)
 
@@ -624,19 +580,12 @@ func generatorSource(): Str {
 			return append(append(table, values...), pack...)
 		}
 
-		// ---------------------------------------------------------------------------
-		// The archive, and the signature over it
-		// ---------------------------------------------------------------------------
-
 		type file struct \{
 			name   string
 			body   []byte
 			stored bool
 		}
 
-		// The zip is written by hand because every offset has to be known: a stored
-		// entry starts on a 4-byte boundary, and the signing block goes between the
-		// last entry and the central directory.
 		func archive(files []file, keyPath string) ([]byte, error) \{
 			type placed struct \{
 				file
@@ -679,8 +628,6 @@ func generatorSource(): Str {
 				central.Write(centralRecord(e.name, e.crc, len(e.packed), len(e.body), e.stored, e.at))
 			}
 
-			// The recorded offset is where the signing block will start, which is what
-			// the digest is required to see.
 			end := endRecord(len(entries), central.Len(), body.Len())
 			block, err := signingBlock(body.Bytes(), central.Bytes(), end, keyPath)
 			if err != nil \{
@@ -748,9 +695,6 @@ func generatorSource(): Str {
 			blockMagic  = "APK Sig Block 42"
 		)
 
-		// Each 1MB chunk is digested salted with 0xa5 and its length, then all the
-		// chunk digests salted with 0x5a and their count. Splitting it this way is what
-		// lets a verifier work in parallel.
 		func contentDigest(sections ...[]byte) []byte \{
 			var digests [][]byte
 			for _, s := range sections \{
@@ -793,8 +737,6 @@ func generatorSource(): Str {
 			algo := make([]byte, 4)
 			le.PutUint32(algo, sigRSAPKCS1)
 
-			// Each of these is a length-prefixed sequence of length-prefixed records, so
-			// a lone record still carries both prefixes.
 			digests := prefixed(prefixed(append(algo, prefixed(contentDigest(body, central, end))...)))
 			certs := prefixed(prefixed(cert))
 			signedData := append(append(digests, certs...), prefixed(nil)...)
@@ -827,9 +769,6 @@ func generatorSource(): Str {
 			return append(block, blockMagic...), nil
 		}
 
-		// The key is kept where the syslink cluster secret is kept and made the same
-		// way on first use: one stable key a machine over, so successive builds install
-		// over each other instead of being refused as a different app.
 		func identity(path string) (*rsa.PrivateKey, []byte, error) \{
 			if body, err := os.ReadFile(path); err == nil && len(body) > 4 \{
 				n := le.Uint32(body)

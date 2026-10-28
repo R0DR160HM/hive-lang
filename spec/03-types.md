@@ -38,8 +38,9 @@ to pack. Packing changes how a vector is kept and nothing about what it does.
 
 A name like `UInt4` is a builtin type the way `Secret` is: a program that declares
 its own `UInt4` has that one under the bare name, and the builtin is still there
-as `hive.UInt4`. `UInt64` literals stop at `Int`'s largest value, since a literal
-is read as an `Int` before it lands; `UInt64(-1)` is the largest `UInt64`.
+as `hive.UInt4`. A decimal literal stops at `Int`'s largest value, since it is read
+as an `Int` before it lands; a hexadecimal or binary one reaches all 64 bits, so
+`0xFFFF_FFFF_FFFF_FFFF` is the largest `UInt64` ([01](01-lexical.md#literals)).
 
 `Float32` is a 32-bit float, about seven digits, computed in single precision.
 `echo` prints the shortest text that reads back as the same `Float32`, so a

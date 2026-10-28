@@ -1303,8 +1303,139 @@ proc emitPatternGuard(em: mut Emit, env: infer.Env, subject: ast.Expr, pattern: 
 	if pattern is ast.Pattern.StrTemplate(parts) {
 		return templateGuard(em, env, written, holder, parts)
 	}
+	if pattern is ast.Pattern.BitsPat(fields, rest) {
+		matched := fresh(em, "ok")
+		named := bitsBound(fields, rest)
+		mut Str[dyn] held = []
+		for each name in named {
+			append(held, goIdent(name))
+		}
+		append(held, matched)
+		open(em, "if " + join(held, ", ") + " := " + bitsReader(em, env, written, subjectType, fields, rest) + "; " + matched + " \{")
+		for each name in named {
+			line(em, "_ = " + goIdent(name))
+		}
+		return infer.afterPattern(env, subjectType, pattern)
+	}
 	open(em, "if false \{")
 	return env
+}
+
+// The names a binary pattern hands out, in order: its fields', then its rest.
+func bitsBound(fields: ast.BitField[], rest: Str): Str[dyn] {
+	mut Str[dyn] out = []
+	for each f in fields {
+		if f.name != "" && f.name != "_" {
+			append(out, f.name)
+		}
+	}
+	if rest != "" && rest != "_" {
+		append(out, rest)
+	}
+	return out
+}
+
+// The match as a function literal answering each bound field and whether it
+// matched: a later field's length reads an earlier one, which a condition alone has
+// nowhere to keep.
+proc bitsReader(em: mut Emit, env: infer.Env, written: Str, subjectType: types.Ty, fields: ast.BitField[], rest: Str): Str {
+	reader := fresh(em, "rd")
+	mut Str[dyn] results = []
+	mut Str[dyn] body = []
+	mut opening := "hive.ReadBytes(" + written + ")"
+	if subjectType is types.Ty.TStr {
+		opening = "hive.ReadText(" + written + ")"
+	} else if subjectType is types.Ty.TSized(_, bits) {
+		opening = "hive.ReadWord(" + written + ", {bits})"
+	} else if subjectType is types.Ty.TInt {
+		opening = "hive.ReadWord(" + written + ", 64)"
+	}
+	append(body, reader + " := " + opening)
+	mut scope := env
+	for each f in fields {
+		ty := infer.bitFieldType(env.table, f)
+		width := "{widthOfType(ty)}"
+		mut taken := ""
+		if (f.length is ast.Expr.Absent) == false {
+			taken = reader + ".TakeBytes(int(" + expr(em, scope, f.length, infer.typeOf(scope, f.length)) + "))"
+		} else if f.value is ast.Expr.StrLit(t) {
+			append(body, reader + ".Expect(" + quoted(t) + ")")
+		} else if f.little {
+			taken = "hive.TakeBitsLittle[" + goType(ty) + "](&" + reader + ", " + width + ")"
+		} else {
+			taken = "hive.TakeBits[" + goType(ty) + "](&" + reader + ", " + width + ")"
+		}
+		if taken == "" {
+		} else if (f.value is ast.Expr.Absent) == false {
+			append(body, "if " + taken + " != " + expr(em, scope, f.value, ty) + " \{ return }")
+		} else if f.name == "_" {
+			append(body, "_ = " + taken)
+		} else {
+			append(body, goIdent(f.name) + " := " + taken)
+			scope = infer.bound(scope, f.name, ty)
+		}
+		if f.name != "" && f.name != "_" {
+			append(results, fresh(em, "r") + " " + goType(ty))
+		}
+	}
+	mut ending := ""
+	if rest != "" {
+		restType := types.Ty.TVec(types.Ty.TSized(false, 8), ast.Dim.Dynamic())
+		mut take := reader + ".RestBytes()"
+		if subjectType is types.Ty.TStr {
+			take = reader + ".RestText()"
+			append(results, fresh(em, "r") + " string")
+		} else {
+			append(results, fresh(em, "r") + " " + goType(restType))
+		}
+		if rest != "_" {
+			append(body, goIdent(rest) + " := " + take)
+		}
+		append(body, "if " + reader + ".Failed() \{ return }")
+	} else {
+		append(body, "if !" + reader + ".Done() \{ return }")
+	}
+	matched := fresh(em, "ok")
+	append(results, matched + " bool")
+	mut Str[dyn] answers = []
+	for each name in bitsBound(fields, rest) {
+		append(answers, goIdent(name))
+	}
+	append(answers, "true")
+	append(body, "return " + join(answers, ", "))
+	return "func() (" + join(results, ", ") + ") \{ " + join(body, "; ") + " }()"
+}
+
+func widthOfType(ty: types.Ty): Int {
+	if ty is types.Ty.TSized(_, bits) {
+		return bits
+	}
+	return 64
+}
+
+// `<<a, b: UInt16, payload>>`, written into a buffer in order.
+proc bitsLiteral(em: mut Emit, env: infer.Env, parts: ast.BitPart[]): Str {
+	writer := fresh(em, "wr")
+	mut Str[dyn] body = ["var " + writer + " hive.BitWriter"]
+	for each part in parts {
+		mut ty := infer.landedType(env, part.value, types.Ty.TVec(types.Ty.TSized(false, 8), ast.Dim.Dynamic()))
+		if (part.declared is ast.TypeExpr.VoidType) == false {
+			ty = types.resolve(env.table, part.declared)
+		} else if infer.intLiteral(part.value) is Result.Ok(_) {
+			ty = types.Ty.TSized(false, 8)
+		}
+		if ty is types.Ty.TStr {
+			append(body, writer + ".PutText(" + expr(em, env, part.value, ty) + ")")
+		} else if ty is types.Ty.TVec(_, _) {
+			append(body, writer + ".PutBytes(" + expr(em, env, part.value, ty) + ")")
+		} else if part.little {
+			append(body, "hive.PutBitsLittle(&" + writer + ", " + expr(em, env, part.value, ty) + ", {widthOfType(ty)})")
+		} else {
+			append(body, "hive.PutBits(&" + writer + ", " + expr(em, env, part.value, ty) + ", {widthOfType(ty)})")
+		}
+	}
+	append(body, "return " + writer + ".Bytes()")
+	return "func() []uint8 \{ " + join(body, "; ") + " }()"
 }
 
 proc constructorGuard(em: mut Emit, env: infer.Env, written: Str, holder: Str, subjectType: types.Ty, path: Str[], bindings: Str[], ): infer.Env {
@@ -1566,6 +1697,16 @@ proc bareExpr(em: mut Emit, env: infer.Env, e: ast.Expr, want: types.Ty): Str {
 	else if e is ast.Expr.Not(operand) {
 		return "!(" + expr(em, env, operand, types.Ty.TBool()) + ")"
 	}
+	// A literal's bits depend on its width, so `~0x0F` is worked in the type it
+	// lands in.
+	else if e is ast.Expr.BitNot(operand) {
+		mut ty := infer.typeOf(env, operand)
+		if types.isInteger(want) && types.same(infer.landedType(env, e, want), want) {
+			ty = want
+		}
+		return trimmed(ty, "^(" + expr(em, env, operand, ty) + ")")
+	}
+	else if e is ast.Expr.Bits(parts) { return bitsLiteral(em, env, parts) }
 	else if e is ast.Expr.Interp(parts) { return interpolation(em, env, parts) }
 	else if e is ast.Expr.VectorLit(items) { return vectorLiteral(em, env, items, want) }
 	else if e is ast.Expr.Binary(op, left, right) { return binary(em, env, op, left, right) }
@@ -2102,6 +2243,15 @@ proc standaloneMatch(em: mut Emit, env: infer.Env, subject: ast.Expr, pattern: a
 	if pattern is ast.Pattern.StrTemplate(parts) {
 		return "func() bool \{ _, ok := " + templateMatch(em, written, parts) + "; return ok }()"
 	}
+	if pattern is ast.Pattern.BitsPat(fields, rest) {
+		mut Str[dyn] held = []
+		for each name in bitsBound(fields, rest) {
+			append(held, "_")
+		}
+		matched := fresh(em, "ok")
+		append(held, matched)
+		return "func() bool \{ " + join(held, ", ") + " := " + bitsReader(em, env, written, infer.typeOf(env, subject), fields, rest) + "; return " + matched + " }()"
+	}
 	fail(em, "a vector pattern outside an `if` condition binds nothing, so it has no value to give")
 	return "false"
 }
@@ -2140,6 +2290,8 @@ func patternBinds(p: ast.Pattern): Bool {
 		}
 	} else if p is ast.Pattern.StrTemplate(parts) {
 		return len(holeNames(parts)) > 0
+	} else if p is ast.Pattern.BitsPat(fields, rest) {
+		return len(bitsBound(fields, rest)) > 0
 	}
 	return false
 }
@@ -2171,6 +2323,20 @@ proc binary(em: mut Emit, env: infer.Env, op: ast.BinOp, left: ast.Expr, right: 
 		if conjunctsBind(parts) {
 			return boundConjunction(em, env, parts)
 		}
+	}
+	// A shift answers its left side's type, whatever the count's is; a call, so two
+	// literals shifted past the width wrap rather than being refused by Go.
+	if infer.isShift(op) {
+		moved := infer.typeOf(env, left)
+		mut call := "hive.Shl("
+		if op is ast.BinOp.Shr {
+			call = "hive.Shr("
+		}
+		written := call + expr(em, env, left, moved) + ", " + expr(em, env, right, infer.typeOf(env, right)) + ")"
+		if op is ast.BinOp.Shl {
+			return trimmed(moved, written)
+		}
+		return written
 	}
 	operands := infer.operandType(env, left, right)
 	if (operands is types.Ty.TUnknown) == false {
@@ -2335,6 +2501,10 @@ proc coerced(em: mut Emit, env: infer.Env, side: ast.Expr, ty: types.Ty, other: 
 // `+` is three operators told apart by one type: a sum, a concatenation, and a
 // fresh vector holding both sides.
 proc arithmetic(em: mut Emit, env: infer.Env, op: ast.BinOp, l: Str, r: Str, ty: types.Ty): Str {
+	// Two values already within a width stay within it, so nothing is trimmed.
+	if op is ast.BinOp.BitAnd { return "(" + l + " & " + r + ")" }
+	if op is ast.BinOp.BitOr { return "(" + l + " | " + r + ")" }
+	if op is ast.BinOp.BitXor { return "(" + l + " ^ " + r + ")" }
 	if ty is types.Ty.TSized(_, _) {
 		return trimmed(ty, "hive." + sizedOp(op) + "(" + l + ", " + r + ")")
 	}
@@ -4040,6 +4210,12 @@ proc scanExpr(e: ast.Expr, sc: mut Scan, env: infer.Env): void {
 		scanExpr(operand, sc, env)
 	} else if e is ast.Expr.Not(operand) {
 		scanExpr(operand, sc, env)
+	} else if e is ast.Expr.BitNot(operand) {
+		scanExpr(operand, sc, env)
+	} else if e is ast.Expr.Bits(parts) {
+		for each part in parts {
+			scanExpr(part.value, sc, env)
+		}
 	} else if e is ast.Expr.Binary(_, left, right) {
 		scanExpr(left, sc, env)
 		scanExpr(right, sc, env)
@@ -4052,8 +4228,11 @@ proc scanExpr(e: ast.Expr, sc: mut Scan, env: infer.Env): void {
 		scanExpr(subject, sc, env)
 		scanExpr(low, sc, env)
 		scanExpr(high, sc, env)
-	} else if e is ast.Expr.IsMatch(subject, _) {
+	} else if e is ast.Expr.IsMatch(subject, pattern) {
 		scanExpr(subject, sc, env)
+		for each held in ast.patternExprs(pattern) {
+			scanExpr(held, sc, env)
+		}
 	} else if e is ast.Expr.AwaitAll(calls, timeout) {
 		// A barrier runs every call in it on a thread of its own.
 		if anyHandsThread(env, calls) { sc.spawns = true }
@@ -5332,6 +5511,7 @@ func sourceOf(e: ast.Expr): Str {
 		return sourceOf(subject) + " is " + show.showPattern(pattern)
 	}
 	if e is ast.Expr.Negate(operand) { return "-" + sourceOf(operand) }
+	if e is ast.Expr.BitNot(operand) { return "~" + sourceOf(operand) }
 	if e is ast.Expr.Not(operand) { return "!" + sourceOf(operand) }
 	if e is ast.Expr.FloatLit(v) { return "{v}" }
 	if e is ast.Expr.AtomLit(atom) { return "#{atom}" }

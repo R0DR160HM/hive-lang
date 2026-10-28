@@ -1142,7 +1142,113 @@ proc checkNegated(c: mut Check, env: infer.Env, operand: ast.Expr): void {
 		report(c, "an atom is a label, not a yes or a no, so there is nothing about it for `!` to invert. Compare it with the one you mean — `flag != #Ready` — or use a `Bool`")
 		return
 	}
+	if types.isInteger(ty) {
+		report(c, "`!` inverts a `Bool`, and this is " + types.show(ty) + ". To flip an integer's bits, `~`")
+		return
+	}
 	report(c, "`!` inverts a `Bool`, and this is " + types.show(ty) + ". There is no truthiness in Hive, so there is nothing here to be the opposite of: say what you are comparing it to")
+}
+
+// --- Bits ----------------------------------------------------------------------
+
+// How many bits an integer type takes, or 0 for anything else.
+func widthOf(ty: types.Ty): Int {
+	if ty is types.Ty.TInt {
+		return 64
+	}
+	if ty is types.Ty.TSized(_, bits) {
+		return bits
+	}
+	return 0
+}
+
+func isByteVector(ty: types.Ty): Bool {
+	if ty is types.Ty.TVec(element, _) {
+		return types.same(element, types.Ty.TSized(false, 8))
+	}
+	return false
+}
+
+// `<<a, b: UInt16, payload>>`: every part's width is known here, so whether they
+// come to whole bytes, and land a run of bytes on a byte, is too.
+proc checkBitsLit(c: mut Check, env: infer.Env, parts: ast.BitPart[]): void {
+	mut offset := 0
+	for each part in parts {
+		checkExpr(c, env, part.value)
+		width := partWidth(c, env, part)
+		if width < 0 {
+			return
+		}
+		if refusesAlignment(c, pathText(part.value), offset, width, part.little) {
+			return
+		}
+		offset = offset + width
+	}
+	if offset % 8 != 0 {
+		report(c, "the parts of this `<<...>>` come to {offset} bits, which is not a whole number of bytes. Add the {8 - offset % 8} bits that finish the last one")
+	}
+}
+
+// A run of bytes, and a `little` number, start on a byte; `little` orders whole bytes.
+proc refusesAlignment(c: mut Check, shown: Str, offset: Int, width: Int, little: Bool): Bool {
+	if little && width == 0 {
+		report(c, "`little` orders a number's bytes, and `{shown}` is a run of bytes, already in the order it is written")
+		return true
+	}
+	if little && width % 8 != 0 {
+		report(c, "`little` orders a number's bytes, and `{shown}` is {width} bits, which is not a whole number of them")
+		return true
+	}
+	if (width == 0 || little) && offset % 8 != 0 {
+		mut what := "a run of bytes"
+		if little {
+			what = "a `little` number"
+		}
+		report(c, "`{shown}` starts {offset % 8} bits into a byte, and " + what + " has to start on one. Fill the bits before it to a whole byte")
+		return true
+	}
+	return false
+}
+
+// A part's width in bits: 0 for a run of bytes of any length, -1 once it has been
+// refused.
+proc partWidth(c: mut Check, env: infer.Env, part: ast.BitPart): Int {
+	if (part.declared is ast.TypeExpr.VoidType) == false {
+		said := types.resolve(c.table, part.declared)
+		if infer.intLiteral(part.value) is Result.Ok(n) {
+			if widthOf(said) == 0 {
+				report(c, "`{n}: " + types.show(said) + "` says the literal is a " + types.show(said) + ", which is no integer type")
+				return -1
+			}
+			if types.holdsLiteral(said, n) == false {
+				report(c, "`{n}` does not fit " + types.show(said))
+				return -1
+			}
+			return widthOf(said)
+		}
+		report(c, "only a literal says its width in `<<...>>`: a value has a type of its own, and a different width is a conversion — `" + types.show(said) + "(" + pathText(part.value) + ")`")
+		return -1
+	}
+	if infer.intLiteral(part.value) is Result.Ok(n) {
+		if n < 0 || n > 255 {
+			report(c, "a literal in `<<...>>` is one byte unless it says otherwise, and {n} does not fit one. Say its type — `{n}: Int16`")
+			return -1
+		}
+		return 8
+	}
+	ty := infer.landedType(env, part.value, types.Ty.TVec(types.Ty.TSized(false, 8), ast.Dim.Dynamic()))
+	if ty is types.Ty.TStr || isByteVector(ty) {
+		return 0
+	}
+	width := widthOf(ty)
+	if width > 0 {
+		return width
+	}
+	if ty is types.Ty.TUnknown {
+		return -1
+	}
+	report(c, "a part of `<<...>>` is an integer, a `UInt8[]` or a `Str`, and `" + pathText(part.value) + "` is " + types.show(ty))
+	return -1
 }
 
 // The scope a condition leaves behind, which is whatever its patterns bound.
@@ -1186,6 +1292,18 @@ proc checkExpr(c: mut Check, env: infer.Env, e: ast.Expr): void {
 	} else if e is ast.Expr.Not(operand) {
 		checkExpr(c, env, operand)
 		checkNegated(c, env, operand)
+	} else if e is ast.Expr.BitNot(operand) {
+		checkExpr(c, env, operand)
+		ty := infer.typeOf(env, operand)
+		if (types.isInteger(ty) || ty is types.Ty.TUnknown) == false {
+			mut instead := ""
+			if ty is types.Ty.TBool {
+				instead = ". For a `Bool`, `!`"
+			}
+			report(c, "`~` flips an integer's bits, and this is " + types.show(ty) + instead)
+		}
+	} else if e is ast.Expr.Bits(parts) {
+		checkBitsLit(c, env, parts)
 	} else if e is ast.Expr.Index(subject, index) {
 		checkExpr(c, env, subject)
 		checkExpr(c, env, index)
@@ -1405,6 +1523,10 @@ proc checkOperands(c: mut Check, env: infer.Env, op: ast.BinOp, left: ast.Expr, 
 		report(c, "`" + ast.opSpelling(op) + "` joins two `Bool`s, and these are " + types.show(leftType) + " and " + types.show(rightType))
 		return
 	}
+	if infer.isShift(op) {
+		checkShift(c, op, right, leftType, rightType)
+		return
+	}
 	operands := infer.operandType(env, left, right)
 	if operands is types.Ty.TUnknown {
 		// Comparing converts nothing that is kept, so two integers compare by value
@@ -1443,8 +1565,42 @@ proc checkOperandKind(c: mut Check, op: ast.BinOp, ty: types.Ty): void {
 			report(c, "`+` adds two numbers, joins two `Str`s or joins two vectors, and these are " + types.show(ty))
 		}
 	} else if op is ast.BinOp.And || op is ast.BinOp.Or {
+	} else if infer.isBitwise(op) {
+		if types.isInteger(ty) == false {
+			report(c, spelled + " works on an integer's bits, and these are " + types.show(ty) + boolInstead(op, ty))
+		}
 	} else if number == false {
 		report(c, spelled + " is arithmetic, on an `Int` or a `Float`, and these are " + types.show(ty))
+	}
+}
+
+// The `Bool` operator somebody reaching for a bitwise one on two `Bool`s meant.
+func boolInstead(op: ast.BinOp, ty: types.Ty): Str {
+	if (ty is types.Ty.TBool) == false {
+		return ""
+	}
+	if op is ast.BinOp.BitAnd { return ". For two `Bool`s, `&&`" }
+	if op is ast.BinOp.BitOr { return ". For two `Bool`s, `||`" }
+	if op is ast.BinOp.BitXor { return ". For two `Bool`s, `!=` is exclusive or" }
+	return ""
+}
+
+// A shift moves the left side's bits, so its answer is that type whatever the count
+// is. The count is unsigned or a literal: a negative one has no answer to give.
+proc checkShift(c: mut Check, op: ast.BinOp, count: ast.Expr, leftType: types.Ty, countType: types.Ty): void {
+	spelled := "`" + ast.opSpelling(op) + "`"
+	if types.isInteger(leftType) == false {
+		report(c, spelled + " shifts an integer's bits, and this is " + types.show(leftType))
+		return
+	}
+	if infer.intLiteral(count) is Result.Ok(n) {
+		if n < 0 {
+			report(c, spelled + " shifts by a number of bits, and {n} is negative")
+		}
+		return
+	}
+	if types.isUnsigned(countType) == false {
+		report(c, "the count " + spelled + " shifts by has to be unsigned or a literal, so it can never be negative, and this is " + types.show(countType) + ". Convert it — `x " + ast.opSpelling(op) + " UInt8(n)`")
 	}
 }
 
@@ -1760,6 +1916,8 @@ func pathText(e: ast.Expr): Str {
 		}
 		return pathText(subject) + "[" + pathText(index) + "]"
 	}
+	if e is ast.Expr.StrLit(t) { return "\"{t}\"" }
+	if infer.intLiteral(e) is Result.Ok(n) { return "{n}" }
 	return "…"
 }
 
@@ -2574,7 +2732,127 @@ proc checkPattern(c: mut Check, env: infer.Env, subject: ast.Expr, p: ast.Patter
 			return
 		}
 		report(c, "a string pattern matches a `Str`, and this subject is " + types.show(subjectType))
+	} else if p is ast.Pattern.BitsPat(fields, rest) {
+		checkBitsPattern(c, env, subjectType, fields, rest)
 	}
+}
+
+// Every field's width is known here but a run's, which is whole bytes — so where
+// each one starts within a byte is too.
+proc checkBitsPattern(c: mut Check, env: infer.Env, subject: types.Ty, fields: ast.BitField[], rest: Str): void {
+	whole := widthOf(subject)
+	if subject is types.Ty.TUnknown {
+		return
+	}
+	if (subject is types.Ty.TStr || isByteVector(subject) || whole > 0) == false {
+		report(c, "a binary pattern matches a `UInt8[]`, a `Str` or an integer, and this subject is " + types.show(subject))
+		return
+	}
+	if whole > 0 && rest != "" {
+		report(c, "a binary pattern over " + types.show(subject) + " has no rest to bind: the fields take every one of its bits")
+		return
+	}
+	mut scope := env
+	mut offset := 0
+	for each f in fields {
+		width := fieldWidth(c, scope, subject, f)
+		if width < 0 {
+			return
+		}
+		if refusesAlignment(c, fieldText(f), offset, width, f.little) {
+			return
+		}
+		offset = offset + width
+		if f.name != "" {
+			scope = infer.bound(scope, f.name, infer.bitFieldType(c.table, f))
+		}
+	}
+	if whole > 0 {
+		if offset != whole {
+			report(c, "the fields of this pattern take {offset} bits, and " + types.show(subject) + " has {whole}: they take every one of them")
+		}
+		return
+	}
+	if offset % 8 == 0 {
+		return
+	}
+	if rest != "" {
+		report(c, "`...{rest}` starts {offset % 8} bits into a byte, and what is left is whole bytes. Take the {8 - offset % 8} bits that finish this one first — `_: UInt{8 - offset % 8}`")
+		return
+	}
+	report(c, "the fields of this pattern come to {offset} bits, which is not a whole number of bytes. Take the {8 - offset % 8} bits that finish the last one — `_: UInt{8 - offset % 8}`")
+}
+
+// A field's width in bits: 0 for a run of bytes, -1 once it has been refused.
+proc fieldWidth(c: mut Check, env: infer.Env, subject: types.Ty, f: ast.BitField): Int {
+	shown := fieldText(f)
+	if (f.length is ast.Expr.Absent) == false {
+		if (f.value is ast.Expr.Absent) == false {
+			report(c, "a run of bytes binds what it reads, and `{shown}` is a literal: match its bytes as a string, `\"...\"`, or each one on its own")
+			return -1
+		}
+		if widthOf(subject) > 0 {
+			report(c, "`{shown}` is a run of bytes, and an integer has none to give: a run reads from a `UInt8[]` or a `Str`")
+			return -1
+		}
+		element := types.resolve(c.table, f.declared)
+		if types.same(element, types.Ty.TSized(false, 8)) == false {
+			report(c, "a run in a binary pattern is bytes — `{shown}: UInt8[n]` — and this one is " + types.show(element))
+			return -1
+		}
+		checkExpr(c, env, f.length)
+		counted := infer.typeOf(env, f.length)
+		if (types.isInteger(counted) || counted is types.Ty.TUnknown) == false {
+			report(c, "the length of `{shown}` is a number of bytes, an integer, and this is " + types.show(counted))
+			return -1
+		}
+		return 0
+	}
+	if f.value is ast.Expr.StrLit(_) {
+		if widthOf(subject) > 0 {
+			report(c, "`{shown}` matches bytes, and an integer has none to give")
+			return -1
+		}
+		if (f.declared is ast.TypeExpr.VoidType) == false {
+			report(c, "`{shown}` matches its own bytes, so it says no type")
+			return -1
+		}
+		return 0
+	}
+	mut ty := types.Ty.TSized(false, 8)
+	if (f.declared is ast.TypeExpr.VoidType) == false {
+		ty = types.resolve(c.table, f.declared)
+	}
+	width := widthOf(ty)
+	if width == 0 {
+		report(c, "`{shown}: " + types.show(ty) + "` reads bits as an integer, and " + types.show(ty) + " is not one")
+		return -1
+	}
+	if f.value is ast.Expr.Absent {
+		return width
+	}
+	if infer.intLiteral(f.value) is Result.Ok(n) {
+		if types.holdsLiteral(ty, n) == false {
+			report(c, "`{n}` does not fit " + types.show(ty) + ", which is what this field reads")
+			return -1
+		}
+		return width
+	}
+	report(c, "a binary pattern matches an integer literal or a string literal, and `{shown}` is neither")
+	return -1
+}
+
+func fieldText(f: ast.BitField): Str {
+	if f.name != "" {
+		return f.name
+	}
+	if infer.intLiteral(f.value) is Result.Ok(n) {
+		return "{n}"
+	}
+	if f.value is ast.Expr.StrLit(t) {
+		return "\"{t}\""
+	}
+	return "…"
 }
 
 proc checkConstructorPattern(c: mut Check, subjectType: types.Ty, path: Str[], bindings: Str[], parenthesised: Bool): void {

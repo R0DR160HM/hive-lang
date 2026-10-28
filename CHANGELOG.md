@@ -17,6 +17,11 @@
 * **A vector of sized integers is packed** where Go has no integer that wide: a `UInt4[dyn]` keeps each value in four bits.
 * **One call never lends a vector and a path inside it**: `both(v, v[0])` with both parameters `mut` is a compile error, where the write through `v[0]` could be lost.
 * **Only a keyword's lower-case spelling is reserved**: `Proc`, `Query` and `proC` are names like any other.
+* **Bitwise operators**: `&`, `|`, `^`, `~`, `<<` and `>>`, with `&=` `|=` `^=` `<<=` `>>=`; a shift counts by an unsigned number or a literal, and two different ones need parentheses.
+* **The pipe is `|>`**, which leaves `|` to bitwise or.
+* **Binary patterns**: `<<version: UInt4, length: UInt16, body: UInt8[length], ...rest>>` matches bytes, a `Str` or an integer field by field, and the same `<<...>>` builds bytes.
+* **`0xFF`, `0b1010` and `1_000`**; a hexadecimal literal past `Int`'s largest is a `UInt64`.
+* **`v[h & 255]` proves itself** against a vector of 256 or more.
 
 ### Standard library
 
@@ -24,6 +29,7 @@
 * **An error comes with the module that answers with it**, whether or not the program names its type.
 * **`hive.conv.itf32`**, and **`hive.math` answers a `Float32`** when handed only those.
 * **`hive.time` counts milliseconds**: `now()`, `dateFrom`, `dateTimeFrom` and `format` all speak Unix milliseconds.
+* **`hive.conv.bytesOf` and `fromBytes`** cross between a `Str` and its bytes.
 
 ### Breaking
 
@@ -37,6 +43,7 @@
 | `Int` overflow stopping at `MAX` or `MIN` | it wraps round to the other |
 | `for i := 0; i < n; i += 2 { echo v[i] }` | a guard: `if v bounds i` |
 | `both(v, v[0])`, both `mut` | lend `v` alone and reach `v[0]` through it |
+| `x \| f`, the pipe | `x \|> f` |
 | `hive.time.now()` in seconds | in milliseconds — `hive.time.now() / 1000` for seconds, as a JWT `exp` wants |
 
 ## v0.2.18

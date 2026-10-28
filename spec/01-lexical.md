@@ -68,20 +68,30 @@ identifiers everywhere else: `as` (after an import path) and `timeout` (in
 
 | | |
 | --- | --- |
-| two-character | `:=` `>=` `<=` `==` `!=` `**` `&&` `\|\|` `++` `--` `+=` `-=` `*=` `/=` |
-| three-character | `...` (the vector-pattern rest marker) |
-| one-character | `{` `}` `(` `)` `[` `]` `:` `;` `,` `.` `>` `<` `=` `+` `-` `*` `/` `%` `\|` `!` |
+| two-character | `:=` `>=` `<=` `==` `!=` `**` `&&` `\|\|` `++` `--` `+=` `-=` `*=` `/=` `&=` `\|=` `^=` `<<` `>>` `\|>` |
+| three-character | `...` (the vector-pattern rest marker), `<<=` `>>=` |
+| one-character | `{` `}` `(` `)` `[` `]` `:` `;` `,` `.` `>` `<` `=` `+` `-` `*` `/` `%` `\|` `&` `^` `~` `!` |
 
 `...` must be matched before `.`, and each two-character operator before its
 prefix. `!=` is therefore looked for before `!`, and a `!` reaching the
-one-character row is one standing on its own: the negation. `||` is looked for
-before `|` the same way, and a `|` reaching that row is the pipe.
+one-character row is one standing on its own: the negation. `||`, `|>` and `|=`
+are looked for before `|` the same way, and a `|` reaching that row is bitwise or.
+
+A `>>` is one token, and also two `>` closing two lists of type arguments —
+`Map<Str, Result<Int, Str>>` — which the parser takes one half at a time.
 
 ### Literals
 
 **Integers** are decimal digit runs: `0`, `42`. There is no sign in the token —
 `-1` is unary minus applied to `1`. An `Int` is 64-bit and signed
 ([05](05-expressions.md#57-arithmetic-at-the-edges)).
+
+`0x` opens a hexadecimal one and `0b` a binary one: `0xFF`, `0b1010`, digits in
+either case after a lower-case prefix. A `_` may sit between two digits of any
+number, `1_000_000` and `0xFFFF_0000`, and means nothing. A hexadecimal or binary
+literal is read as the 64 bits it spells, so one of 2^63 or more —
+`0xFFFF_FFFF_FFFF_FFFF` — is past `Int`'s largest and is a **`UInt64`**; more
+than 64 bits is a compile error. A decimal literal stops at `Int`'s largest.
 
 **Floats** are a digit run, a `.`, and a digit run: `1.0`, `3.14`. A trailing or
 leading dot is not a float.

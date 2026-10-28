@@ -186,6 +186,7 @@ func coreSource(): Str {
 		coreWalks(),
 		coreStrings(),
 		coreArithmetic(),
+		coreBits(),
 		coreDict(),
 		coreTasks(),
 		coreTesting(),
@@ -568,7 +569,6 @@ func secretSource(): Str {
 			return Ok[Secret, SecretError](s)
 		}
 
-		// hideBytes is Hide that clears what it was handed.
 		func hideBytes(b []byte) (Secret, *SecretError) \{
 			defer clear(b)
 			s, err := newSecret(len(b))
@@ -668,7 +668,6 @@ func secretValueSource(): Str {
 		func SecretPutInt(b *[]byte, n int) \{ *b = binary.LittleEndian.AppendUint64(*b, uint64(n)) }
 
 		func SecretPutFloat(b *[]byte, f float64) \{
-			// -0.0 becomes 0.0, so the two hide as equal bytes.
 			if f == 0 \{
 				f = 0
 			}
@@ -717,7 +716,6 @@ func secretValueSource(): Str {
 
 		func SecretPutDict[K comparable, V any](b *[]byte, d Dict[K, V], key func(*[]byte, K), value func(*[]byte, V)) \{
 			keys := CloneVec(d.order)
-			// In key order rather than as they were set, as == on a map ignores that.
 			sort.Slice(keys, func(i, j int) bool \{ return Less(keys[i], keys[j]) })
 			SecretPutInt(b, len(keys))
 			for _, k := range keys \{
@@ -1554,8 +1552,6 @@ func coreArithmetic(): Str {
 			return a / b
 		}
 
-		// Unfolded keeps Go from folding two Float literals at compile time, where
-		// an overflow is refused rather than reaching infinity.
 		func Unfolded(v float64) float64 \{ return v }
 		`,
 		// Calls rather than Go's operators, so two literals that overflow together
@@ -1745,6 +1741,175 @@ func coreArithmetic(): Str {
 		func FloatText(f float64) string \{ return strconv.FormatFloat(f, 'g', -1, 64) }
 
 		func Float32Text(f float32) string \{ return strconv.FormatFloat(float64(f), 'g', -1, 32) }
+		`
+	], "\n\n")
+}
+
+func coreBits(): Str {
+	return join([
+		// The checker allows only an unsigned count or a literal one, so no shift
+		// here is ever by a negative number.
+		`
+		func Shl[T Whole, N Whole](x T, n N) T \{ return x << n }
+
+		func Shr[T Whole, N Whole](x T, n N) T \{ return x >> n }
+		`,
+		// What a binary pattern reads, most significant bit first. A read past the
+		// end answers 0 and marks the match failed, so a length read off a field
+		// that was never there cannot reach anything.
+		`
+		type BitReader struct \{
+			bytes  []byte
+			text   string
+			isText bool
+			isWord bool
+			word   uint64
+			size   int
+			at     int
+			failed bool
+		}
+
+		func ReadBytes(b []uint8) BitReader \{ return BitReader\{bytes: b, size: len(b) * 8} }
+
+		func ReadText(s string) BitReader \{ return BitReader\{text: s, isText: true, size: len(s) * 8} }
+
+		func ReadWord[T Whole](x T, width int) BitReader \{
+			return BitReader\{isWord: true, word: uint64(x) << uint(64-width), size: width}
+		}
+
+		func (r *BitReader) byteAt(i int) uint64 \{
+			if r.isText \{
+				return uint64(r.text[i])
+			}
+			return uint64(r.bytes[i])
+		}
+
+		func (r *BitReader) take(n int) uint64 \{
+			if n <= 0 \{
+				return 0
+			}
+			if r.at+n > r.size \{
+				r.failed = true
+				r.at = r.size
+				return 0
+			}
+			if r.isWord \{
+				v := (r.word << uint(r.at)) >> uint(64-n)
+				r.at += n
+				return v
+			}
+			var v uint64
+			for n > 0 \{
+				off := r.at & 7
+				k := 8 - off
+				if n < k \{
+					k = n
+				}
+				chunk := (r.byteAt(r.at>>3) >> uint(8-off-k)) & (1<<uint(k) - 1)
+				v = v<<uint(k) | chunk
+				r.at += k
+				n -= k
+			}
+			return v
+		}
+
+		func extended[T Whole](v uint64, n int) T \{
+			if ^T(0) < 0 && n < 64 \{
+				s := uint(64 - n)
+				return T(int64(v<<s) >> s)
+			}
+			return T(v)
+		}
+
+		func TakeBits[T Whole](r *BitReader, n int) T \{ return extended[T](r.take(n), n) }
+
+		func TakeBitsLittle[T Whole](r *BitReader, n int) T \{
+			var v uint64
+			for i := 0; i < n/8; i++ \{
+				v |= r.take(8) << uint(8*i)
+			}
+			return extended[T](v, n)
+		}
+
+		func (r *BitReader) TakeBytes(n int) []uint8 \{
+			if n < 0 || r.at+n*8 > r.size \{
+				r.failed = true
+				r.at = r.size
+				return []uint8\{}
+			}
+			out := make([]uint8, n)
+			for i := range out \{
+				out[i] = uint8(r.byteAt(r.at/8 + i))
+			}
+			r.at += n * 8
+			return out
+		}
+
+		func (r *BitReader) Expect(text string) \{
+			got := r.TakeBytes(len(text))
+			if string(got) != text \{
+				r.failed = true
+			}
+		}
+
+		func (r *BitReader) RestBytes() []uint8 \{ return r.TakeBytes((r.size - r.at) / 8) }
+
+		func (r *BitReader) RestText() string \{
+			if r.failed \{
+				return ""
+			}
+			out := r.text[r.at/8:]
+			r.at = r.size
+			return out
+		}
+
+		func (r *BitReader) Failed() bool \{ return r.failed }
+
+		func (r *BitReader) Done() bool \{ return !r.failed && r.at == r.size }
+		`,
+		// What `<<...>>` builds, most significant bit first. The checker has every
+		// run of bytes start on a byte and the whole come to whole bytes.
+		`
+		type BitWriter struct \{
+			out []uint8
+			acc uint64
+			n   int
+		}
+
+		func (w *BitWriter) put(v uint64, width int) \{
+			for width > 0 \{
+				k := 8 - w.n
+				if width < k \{
+					k = width
+				}
+				w.acc = w.acc<<uint(k) | (v>>uint(width-k))&(1<<uint(k)-1)
+				w.n += k
+				width -= k
+				if w.n == 8 \{
+					w.out = append(w.out, uint8(w.acc))
+					w.acc, w.n = 0, 0
+				}
+			}
+		}
+
+		func PutBits[T Whole](w *BitWriter, x T, width int) \{ w.put(uint64(x), width) }
+
+		func PutBitsLittle[T Whole](w *BitWriter, x T, width int) \{
+			for i := 0; i < width/8; i++ \{
+				w.put(uint64(x)>>uint(8*i), 8)
+			}
+		}
+
+		func (w *BitWriter) PutBytes(b []uint8) \{ w.out = append(w.out, b...) }
+
+		func (w *BitWriter) PutText(s string) \{ w.out = append(w.out, s...) }
+
+		func (w *BitWriter) Bytes() []uint8 \{
+			if w.out == nil \{
+				return []uint8\{}
+			}
+			return w.out
+		}
 		`
 	], "\n\n")
 }
@@ -2148,6 +2313,8 @@ func convSource(): Str {
 
 		func ConvItf(v int) float64  \{ return float64(v) }
 		func ConvItf32(v int) float32 \{ return float32(v) }
+		func ConvBytesOf(s string) []uint8 \{ return []uint8(s) }
+		func ConvFromBytes(b []uint8) string \{ return string(b) }
 		func ConvIts(v int) string   \{ return strconv.Itoa(v) }
 		func ConvFts(v float64) string \{ return strconv.FormatFloat(v, 'g', -1, 64) }
 
@@ -2243,8 +2410,6 @@ func termSource(): Str {
 
 		func TermCodec() CodecCodec[TermFlagError] \{ return CodecCodec[TermFlagError]\{} }
 
-		// TermFlagPair is one flag as written: its name without the dashes, and its
-		// value unless it stood alone.
 		type TermFlagPair struct \{
 			Key   string
 			Value string
@@ -2391,7 +2556,6 @@ func termSource(): Str {
 			return read(found[0], path)
 		}
 
-		// TermFlagVec reads a flag repeated. n below zero is a vector of any length.
 		func TermFlagVec[T any](q []TermFlagPair, key string, n int, read func(TermFlagPair, string) (T, *TermFlagError)) ([]T, *TermFlagError) \{
 			path := "--" + key
 			found := termFlagsNamed(q, key)
@@ -2665,10 +2829,8 @@ func codecSource(): Str {
 			Secret Secret
 		}
 
-		// String keeps a secret out of anything that prints a codec.
 		func (c CodecCodec[E]) String() string \{ return "codec" }
 
-		// CodecWith evaluates a held codec where it is used, and answers with value.
 		func CodecWith[T any, E any](value T, _ CodecCodec[E]) T \{ return value }
 		`
 	], "\n\n")
@@ -3149,7 +3311,6 @@ func jsonSource(): Str {
 						if err != nil \{
 							return JsonValue\{}, err
 						}
-						// A key written twice keeps the last value, where the first one stood.
 						if i, seen := at[key]; seen \{
 							obj[i].Value = val
 							continue
@@ -3495,7 +3656,6 @@ func csvSource(): Str {
 			if err != nil \{
 				return Err[Table, FileTableError](FileTableError\{Path: path, Message: err.Error()})
 			}
-			// Spreadsheets often save CSV with a byte-order mark.
 			reader := csv.NewReader(strings.NewReader(strings.TrimPrefix(string(raw), "\uFEFF")))
 			reader.FieldsPerRecord = -1
 			if len([]rune(separator)) > 1 \{
@@ -6057,8 +6217,6 @@ func sqlSource(): Str {
 			return sqlTable(conn.db.Query(query))
 		}
 
-		// SqlTable is what a query declared as a Table runs through: the same answer,
-		// with its values bound.
 		func SqlTable(conn SqlSqlConnection, stmt SqlFragment) Result[Table, SqlSqlError] \{
 			if conn.db == nil \{
 				return Err[Table, SqlSqlError](SqlSqlError\{Reason: "Connection", Message: "connection is not open"})
@@ -8519,7 +8677,6 @@ func uiSource(): Str {
 			return r
 		}
 
-		// What a note says: its text, kept beside the tone.
 		func uiNoteText(r UiRun) string \{
 			if a, ok := uiFind(r.Attrs, "note"); ok \{
 				return a.Word
@@ -8733,7 +8890,6 @@ func uiSource(): Str {
 		func UiAttrBorderTone(v UiTone) UiAttr \{ return uiEnum("borderTone", string(v)) }
 		func UiAttrHover(v UiTone) UiAttr      \{ return uiEnum("hover", string(v)) }
 
-		// The widgets drawn in a frame of their own: a button, a field, a list, an editor.
 		func uiFramed(kind string) bool \{
 			switch kind \{
 			case "button", "input", "textarea", "select", "code":
@@ -9008,8 +9164,6 @@ func uiSource(): Str {
 					}
 				}
 			}
-			// A framed widget in a colour of its own has no stylesheet edge round it
-			// unless it asks for one: the edge was there to set it off from the page.
 			if uiFramed(kind) \{
 				_, coloured := uiFind(attrs, "background")
 				_, edged := uiFind(attrs, "border")
@@ -9142,10 +9296,6 @@ func uiSource(): Str {
 		// v.Text and goes into r.scenes rather than into the document. A static
 		// render has no socket to send frames down, so it leaves an empty box.
 		`
-		// A code editor: the line numbers, then a textarea whose own text is clear over
-		// a copy of it in the runs' colours, the two scrolled as one by the shell. Each
-		// pre and the textarea open on a newline the parser drops, so a text that
-		// starts on an empty line keeps it.
 		func (r *uiRender) code(v UiView) \{
 			r.out.WriteString("<div")
 			r.common(v.Kind, v.Attrs)
@@ -9203,7 +9353,6 @@ func uiSource(): Str {
 			r.out.WriteString("</textarea></div></div>")
 		}
 
-		// One number a line, and a line a marker names carries its tone at the edge.
 		func (r *uiRender) gutter(v UiView) \{
 			lines := strings.Count(v.Text, "\n") + 1
 			marked := map[int]string\{}
@@ -9228,8 +9377,6 @@ func uiSource(): Str {
 			}
 		}
 
-		// What a run's tone is to a stylesheet: a colour as written, a role as the
-		// role's own variable, and nothing for Normal.
 		func uiRunColour(tone string) string \{
 			if css, ok := uiToneColour(tone); ok \{
 				return css
@@ -9247,8 +9394,6 @@ func uiSource(): Str {
 			return ""
 		}
 
-		// The text cut where any run starts or ends, each piece in what covers it: the
-		// run given last wins where two of a kind overlap, as a later style rule does.
 		func uiRunsTo(out *strings.Builder, text string, runs []UiRun) \{
 			type cut struct \{
 				at    int
@@ -9264,7 +9409,6 @@ func uiSource(): Str {
 				cuts = append(cuts, cut\{int(m.Nums[0]), i, true, false})
 				cuts = append(cuts, cut\{int(m.Nums[1]), i, false, false})
 			}
-			// A note goes where its line ends, in characters.
 			var notes []int
 			for i, m := range runs \{
 				if m.Kind == "note" && len(m.Nums) == 2 \{
@@ -11648,9 +11792,6 @@ func uiSource(): Str {
 		// outlived it. The wait is what tells a closed window from a reloaded one.
 		`
 		func (w *uiWindow) linger() \{
-			// Where a host owns the window, it is the one that ends the program, and
-			// a sleeping device can hold a socket quiet for minutes. Exiting on a
-			// quiet socket there would read as a crash.
 			if runtime.GOOS == "android" \{
 				return
 			}
@@ -11696,8 +11837,6 @@ func uiSource(): Str {
 			return uiMeaning(attrs, kind, value, index)
 		}
 
-		// "12,30,rest" as 12, 30 and whatever follows the second comma, commas and all:
-		// an edit's text, a selection's or a view's nothing.
 		func uiCut(value string) (int, int, string) \{
 			a, rest, _ := strings.Cut(value, ",")
 			b, text, _ := strings.Cut(rest, ",")
@@ -12167,9 +12306,6 @@ func uiSource(): Str {
 			}
 		}
 
-		// A window drawn by the program itself usually has no console, so what a
-		// crash prints would go nowhere: it is also kept, appended, in
-		// <temp>/<program>-crash.log.
 		var uiCrashOnce sync.Once
 
 		func uiCrashLog() \{
@@ -12375,9 +12511,6 @@ func uiSource(): Str {
 		// Silverblue and Bluefin desktop. Asked by id instead, they are there.
 		`
 		func uiOpen(url string) error \{
-			// A handset has no browser to launch and a host in front of it that
-			// opens the window itself. Said in a shape meant to be read rather than
-			// left to be picked out of prose.
 			if runtime.GOOS == "android" || os.Getenv("HIVE_WINDOW") == "print" \{
 				fmt.Println("hive-window " + url)
 				return nil
@@ -14373,9 +14506,6 @@ func uiSceneJs(): Str {
 		      userData: \{kind: s.k, key: keyOf(s), tint: ""}};
 		    return chair;
 		  } else \{
-		    // See-through is light or air — a glow, a beam, the pool a lamp throws, smoke — and
-		    // none of it stands in the sun's way. A shadow map has no half-shadows, so one cast
-		    // would be as black as a wall's: a lamp's halo shadowing its own pool of light.
 		    made = new THREE.Mesh(unit(formOf(s)), paintOf(finishOf(s), s.c));
 		    made.castShadow = false;
 		    made.receiveShadow = true;
@@ -15011,9 +15141,6 @@ func uiSceneJs(): Str {
 		    skyTex.mapping = THREE.EquirectangularReflectionMapping;
 		    skyTex.wrapS = THREE.RepeatWrapping;
 		  }
-		  // three.js turns an equirectangular background into a cube once per texture and
-		  // keeps the cube, however often the texture is redrawn: without letting it go, the
-		  // sky stayed the colour it was first drawn in — day blue, all night.
 		  skyTex.dispose();
 		  var ctx = skyTex.image.getContext("2d");
 		  var band = ctx.createLinearGradient(0, 0, 0, 256);
@@ -15292,9 +15419,6 @@ func uiSceneJs(): Str {
 		  "#endif"
 		].join("\n");
 
-		// The sun's shadows are cast by the rounded shape too: one cast by the sharp one
-		// is the sharp one's corner, standing proud of the rounded one, and every lit
-		// edge would be drawn in its own shadow.
 		var roundCaster = null;
 
 		function rounder() \{
@@ -16963,7 +17087,6 @@ func uiSceneJs(): Str {
 		  delete fingers[e.pointerId];
 		}
 
-		// A finger on a ui.touch(name) is pad -1: name is 1 while held, nameX and nameY where on it.
 		function touches() \{
 		  var now = \{};
 		  for (var name in touchNames) \{ now[name] = 0; now[name + "X"] = 0; now[name + "Y"] = 0; }

@@ -421,8 +421,17 @@ proc reachExpr(r: mut Reaching, e: ast.Expr): void {
 		reachExpr(r, operand)
 	} else if e is ast.Expr.Not(operand) {
 		reachExpr(r, operand)
-	} else if e is ast.Expr.IsMatch(subject, _) {
+	} else if e is ast.Expr.BitNot(operand) {
+		reachExpr(r, operand)
+	} else if e is ast.Expr.Bits(parts) {
+		for each part in parts {
+			reachExpr(r, part.value)
+		}
+	} else if e is ast.Expr.IsMatch(subject, pattern) {
 		reachExpr(r, subject)
+		for each held in ast.patternExprs(pattern) {
+			reachExpr(r, held)
+		}
 	} else if e is ast.Expr.VectorLit(items) {
 		for each i in items {
 			reachExpr(r, i)
@@ -669,6 +678,13 @@ proc walkExpr(w: mut Walk, at: At, e: ast.Expr): void {
 	}
 	if e is ast.Expr.Negate(operand) { walkExpr(w, at, operand) return }
 	if e is ast.Expr.Not(operand) { walkExpr(w, at, operand) return }
+	if e is ast.Expr.BitNot(operand) { walkExpr(w, at, operand) return }
+	if e is ast.Expr.Bits(parts) {
+		for each part in parts {
+			walkExpr(w, at, part.value)
+		}
+		return
+	}
 	if e is ast.Expr.VectorLit(items) {
 		for each item in items {
 			walkExpr(w, at, item)
@@ -683,7 +699,13 @@ proc walkExpr(w: mut Walk, at: At, e: ast.Expr): void {
 		}
 		return
 	}
-	if e is ast.Expr.IsMatch(subject, _) { walkExpr(w, at, subject) return }
+	if e is ast.Expr.IsMatch(subject, pattern) {
+		walkExpr(w, at, subject)
+		for each held in ast.patternExprs(pattern) {
+			walkExpr(w, at, held)
+		}
+		return
+	}
 	if e is ast.Expr.Timed(inner, ms) {
 		walkExpr(w, at, inner)
 		walkExpr(w, at, ms)
@@ -834,6 +856,7 @@ func settled(at: At, e: ast.Expr): Bool {
 	}
 	if e is ast.Expr.Negate(operand) { return settled(at, operand) }
 	if e is ast.Expr.Not(operand) { return settled(at, operand) }
+	if e is ast.Expr.BitNot(operand) { return settled(at, operand) }
 	return false
 }
 
@@ -1175,6 +1198,13 @@ func mentions(e: ast.Expr, name: Str): Bool {
 	}
 	if e is ast.Expr.Negate(operand) { return mentions(operand, name) }
 	if e is ast.Expr.Not(operand) { return mentions(operand, name) }
+	if e is ast.Expr.BitNot(operand) { return mentions(operand, name) }
+	if e is ast.Expr.Bits(parts) {
+		for each part in parts {
+			if mentions(part.value, name) { return true }
+		}
+		return false
+	}
 	if e is ast.Expr.Call(callee, args) {
 		if mentions(callee, name) { return true }
 		for each a in args {
@@ -1196,7 +1226,12 @@ func mentions(e: ast.Expr, name: Str): Bool {
 		}
 		return false
 	}
-	if e is ast.Expr.IsMatch(subject, _) { return mentions(subject, name) }
+	if e is ast.Expr.IsMatch(subject, pattern) {
+		for each held in ast.patternExprs(pattern) {
+			if mentions(held, name) { return true }
+		}
+		return mentions(subject, name)
+	}
 	return false
 }
 
@@ -1225,6 +1260,13 @@ func calling(w: Walk, at: At, e: ast.Expr): Bool {
 	}
 	if e is ast.Expr.Not(operand) { return calling(w, at, operand) }
 	if e is ast.Expr.Negate(operand) { return calling(w, at, operand) }
+	if e is ast.Expr.BitNot(operand) { return calling(w, at, operand) }
+	if e is ast.Expr.Bits(parts) {
+		for each part in parts {
+			if calling(w, at, part.value) { return true }
+		}
+		return false
+	}
 	if e is ast.Expr.Member(subject, _) { return calling(w, at, subject) }
 	if e is ast.Expr.Index(subject, index) {
 		return calling(w, at, subject) || calling(w, at, index)
@@ -1357,6 +1399,13 @@ proc changingExpr(t: types.Table, e: ast.Expr, out: mut Str[dyn]): void {
 	}
 	if e is ast.Expr.Negate(operand) { changingExpr(t, operand, out) return }
 	if e is ast.Expr.Not(operand) { changingExpr(t, operand, out) return }
+	if e is ast.Expr.BitNot(operand) { changingExpr(t, operand, out) return }
+	if e is ast.Expr.Bits(parts) {
+		for each part in parts {
+			changingExpr(t, part.value, out)
+		}
+		return
+	}
 	if e is ast.Expr.VectorLit(items) {
 		for each item in items {
 			changingExpr(t, item, out)
@@ -1430,6 +1479,17 @@ proc boundByPattern(p: ast.Pattern, out: mut Str[dyn]): void {
 			} else if part is token.StrPart.Hole(name, _) {
 				put(out, name)
 			}
+		}
+		return
+	}
+	if p is ast.Pattern.BitsPat(fields, rest) {
+		for each f in fields {
+			if f.name != "" {
+				put(out, f.name)
+			}
+		}
+		if rest != "" {
+			put(out, rest)
 		}
 	}
 }
@@ -1842,6 +1902,7 @@ func drawn(e: ast.Expr): Str {
 	}
 	if e is ast.Expr.Negate(operand) { return "-" + drawn(operand) }
 	if e is ast.Expr.Not(operand) { return "!" + drawn(operand) }
+	if e is ast.Expr.BitNot(operand) { return "~" + drawn(operand) }
 	if e is ast.Expr.VectorLit(items) {
 		mut Str[dyn] out = []
 		for each item in items {

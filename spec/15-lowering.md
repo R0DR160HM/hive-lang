@@ -42,6 +42,10 @@ file, plus a generated `hive` runtime package.
 | `append(v, x)` (a statement) | `v = append(v, x)` — Go's own, with the new header written back |
 | `prepend(v, x)` / `drop(v, a, b)` | `hive.Prepend(&v, x)` / `hive.Drop(&v, a, b)` — the address, since both rewrite the header |
 | `for each x in v { }` | `for _, x := range v { }` |
+| `a & b`, `a \| b`, `a ^ b`, `~a` | Go's own `&`, `\|`, `^`, `^a`; a sized result of `~` trimmed back to its width |
+| `a << n`, `a >> n` | `hive.Shl(a, n)` / `hive.Shr(a, n)`, so two literals shifted past the width wrap rather than being refused by Go; `<<` on a sized integer trimmed |
+| `<<a, b, payload>>` | a function literal filling a `hive.BitWriter` part by part, answering its `[]uint8` |
+| `x is <<v: UInt4, ...rest>>` | a function literal reading a `hive.BitReader` field by field, answering each binding and whether all of it matched, in the `if`'s own header |
 | `x is Result.Ok(v)` / `x is T.Variant(a, _)` | `IsOk()` + accessor / a type assertion, which takes the union — a variant built on the spot is converted to it first; `_` binds nothing |
 | `x is T.Variant(a) && a > 0` outside an `if` | the guards that `if` would write, inside a `func() bool { … }()` answering whether they all held |
 | `if <call> is Result.Ok(v)` | one `if` with an init slot, so the call is evaluated once |

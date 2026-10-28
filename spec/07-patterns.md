@@ -6,7 +6,7 @@
 **narrows** the value and binds parts of it to fresh names, usable immediately:
 in the rest of the same condition after `&&`, and in the branch body.
 
-Four kinds of thing can be matched.
+Five kinds of thing can be matched.
 
 ## 7.1 Variant patterns
 
@@ -291,3 +291,50 @@ would. Take it out, or move it above the arm that takes its values
 Only what coverage can tell apart is compared, so two string templates with
 holes are never found to overlap: the error is never wrong, though it can be
 missing.
+
+## 7.9 Binary patterns
+
+`<<...>>` reads its subject's bits in order, most significant first, each field
+as many as its type has:
+
+```hive
+if packet is <<version: UInt4, ihl: UInt4, _: UInt8, length: UInt16, ...rest>> {
+	echo "IPv{version}, {length} bytes"
+}
+
+if file is <<0x89, "PNG", 0x0D0A_1A0A: UInt32, size: UInt32, body: UInt8[size], ...more>> {
+	...
+}
+```
+
+| field | matches | binds |
+| --- | --- | --- |
+| `name: UInt4` | 4 bits | a `UInt4` |
+| `name: Int12` | 12 bits, the top one the sign | an `Int12` |
+| `name` | one byte | a `UInt8` |
+| `0x45`, `0x45: UInt16` | a byte, or 16 bits, equal to that value | nothing |
+| `"PNG"` | exactly those bytes | nothing |
+| `_: UInt3` | 3 bits, skipped | nothing |
+| `body: UInt8[size]` | `size` bytes, `size` read from an earlier field or anything in scope | a `UInt8[dyn]` |
+| `...rest` | what is left | the rest, as a `Str` for a `Str` and a `UInt8[dyn]` otherwise |
+
+A multi-byte field is big-endian, the order a network writes; `size: UInt32
+little` reads one least significant byte first. `little` is read there and
+reserved nowhere.
+
+The subject is a `UInt8[]`, a `Str` — by its bytes, so a `Str` is matched without
+a copy — or an integer of any size, whose bits the fields have to take every one
+of: `op is <<code: UInt4, reg: UInt4>>` on a `UInt8`. An integer has no rest, no
+run of bytes and no string to match.
+
+**The match checks the length**, so a field needs no bounds proof. Without
+`...rest` the pattern takes exactly that many bytes; with it, at least that many.
+
+**Alignment is checked at compile time.** Every width is known but a run's, and a
+run is whole bytes, so where each field starts within a byte is too. A pattern
+over bytes whose fields come to a part of a byte, a run, a string or `...rest`
+that starts mid-byte, and a `little` field that is not whole bytes at a byte's
+start are each a compile error naming the bits that finish the byte.
+
+A binary pattern is never exhaustive, so a `switch` over one ends with `_`. The
+way to build what one reads is [`<<...>>` as a value](05-expressions.md#building-bytes).

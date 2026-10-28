@@ -54,25 +54,25 @@ parameters have no names.
 
 ### Piping a value in
 
-`x | f(a)` is **sugar** for `f(x, a)`: the value on the left becomes the call's
-first argument. `|` is left-associative, so a chain of them reads in the order
+`x |> f(a)` is **sugar** for `f(x, a)`: the value on the left becomes the call's
+first argument. `|>` is left-associative, so a chain of them reads in the order
 it runs:
 
 ```hive
-echo nums | filter(isEven) | map(label) | join(" ")
+echo nums |> filter(isEven) |> map(label) |> join(" ")
 ```
 
 The right side has to be something that can be called — a call, a callable's
 name, or a constructor — and a stage with nothing else in it needs no
-parentheses: `x | f` is `f(x)`, as `x | f()` is. A `proc`, a builtin and a
+parentheses: `x |> f` is `f(x)`, as `x |> f()` is. A `proc`, a builtin and a
 constructor all pipe, and a `_` in a stage still makes that call a partial
 application, since what a pipe leaves behind is the call somebody could have
 written by hand.
 
-`|` binds tighter than every binary operator and looser than the prefix ones,
-which lets a pipeline sit on either side of one — `v | len > 2` compares the
-length. It takes the value written **beside** it, so `1 + 2 | f` is `1 + f(2)`
-and a computed value goes in parentheses: `(1 + 2) | f`.
+`|>` binds tighter than every binary operator and looser than the prefix ones,
+which lets a pipeline sit on either side of one — `v |> len > 2` compares the
+length. It takes the value written **beside** it, so `1 + 2 |> f` is `1 + f(2)`
+and a computed value goes in parentheses: `(1 + 2) |> f`.
 
 ## 5.4 Function values
 
@@ -156,7 +156,10 @@ no subscript at all ([03](03-types.md#36-maps)).
 | `&&` `\|\|` | `Bool` | short-circuiting conjunction, disjunction |
 | `is` | see [07](07-patterns.md) | a `Bool`, binding as it matches |
 | `bounds` | a vector and an `Int` | sugar for `i >= 0 && i < hive.len(v)` |
-| `\|` | a value and a callable | sugar for the call with the value first |
+| `&` `\|` `^` | two integers of one type | bitwise and, or, exclusive or |
+| `<<` `>>` | an integer, and a count that is unsigned or a literal | shifted; the left side's type |
+| unary `~` | an integer | every bit flipped |
+| `\|>` | a value and a callable | sugar for the call with the value first |
 
 `%` is the remainder operator and has the same precedence as `*` and `/`.
 
@@ -172,6 +175,41 @@ equal to an `Int` of `-1` — since comparing converts nothing that is kept. Tha
 what keeps `i < len(v)` and `v bounds i` guards for a sized `i`. Floats of
 different sizes do not compare without a conversion, and an integer never compares
 with a float.
+
+### Bits
+
+`&`, `|` and `^` take two integers of one type — a literal beside one takes its
+type, as in arithmetic — and answer that type. `~x` flips every bit of an
+integer. A shift, `x << n` or `x >> n`, answers `x`'s type whatever `n` is, and
+`n` is an **unsigned integer or a literal**, so it is never negative; shifting by
+the width or more shifts everything out. A right shift copies the sign bit of a
+signed type and fills an unsigned one with zeros.
+
+A result stays within its type's width, as arithmetic's does: `~` of a `UInt4` 3
+is 12, and a `UInt8` at 202 shifted left by one is 148. `~` on a literal is
+worked in the type it lands in, since a literal's bits depend on its width:
+`UInt8 m = ~0x0F` is `0xF0`.
+
+A `Bool` takes none of these. `&&`, `||` and `!=` are its and, or and exclusive
+or, and `!` its not.
+
+### Building bytes
+
+`<<a, b, c>>` is a `UInt8[dyn]` built from its parts in order, most significant
+bit first. Each part is as wide as its type: a `UInt4` writes four bits, a
+`UInt16` two bytes, an `Int` eight, and a `UInt8[]` or a `Str` its bytes. A literal
+is one byte unless it says otherwise, `0x0D0A: UInt16`. Only a literal says its
+type there: a value of another width is converted, `UInt16(x)`. `little` after a
+part writes its bytes least significant first.
+
+```hive
+UInt8[dyn] header = <<UInt4(4), UInt4(5), 0, length, payload>>
+UInt8[dyn] size = <<UInt32(n) little>>
+```
+
+The parts have to come to whole bytes, and a run of bytes or a `little` number has
+to start on one. Every width is known at compile time, so both are compile
+errors. The way back is a binary pattern ([07](07-patterns.md#79-binary-patterns)).
 
 ### Unary `!`
 

@@ -1607,6 +1607,51 @@ test "a program's own Secret comes before the builtin, which is still hive.Secre
 	assert len(expandedProblems(own + same + inMain("echo same(bypass(\"a\"), bypass(\"a\"))  echo same(Secret(1), Secret(1))"))) == 0
 }
 
+// --- Bits --------------------------------------------------------------------
+
+test "a bitwise operator works on two integers of one type" {
+	assert problemCount(inMain("UInt8 a = 1  echo a & 0x0F  echo a | 1  echo a ^ 0xFF  echo ~a  UInt8 m = ~0x0F")) == 0
+	assert opens(problem(inMain("echo true & false")), "in `main`: `&` works on an integer's bits, and these are Bool. For two `Bool`s, `&&`")
+	assert opens(problem(inMain("echo 1.5 | 2.0")), "in `main`: `|` works on an integer's bits, and these are Float")
+	assert opens(problem(inMain("UInt8 a = 1  UInt16 b = 2  echo a & b")), "in `main`: `&` wants two of one type, and these are UInt8 and UInt16")
+	assert opens(problem(inMain("UInt8 a = 1  echo a & 0x1FF")), "in `main`: `&` wants UInt8, which holds 0 to 255, and this is 511")
+	assert opens(problem(inMain("echo ~true")), "in `main`: `~` flips an integer's bits, and this is Bool. For a `Bool`, `!`")
+	assert opens(problem(inMain("x := 3  echo !x")), "in `main`: `!` inverts a `Bool`, and this is Int. To flip an integer's bits, `~`")
+}
+
+test "a shift answers its left side, by a count that cannot be negative" {
+	assert problemCount(inMain("UInt8 n = 3  Int x = 1 << n  UInt16 w = 1  UInt16 y = w << 4  echo x  echo y")) == 0
+	assert opens(problem(inMain("n := 2  echo 1 << n")), "in `main`: the count `<<` shifts by has to be unsigned or a literal")
+	assert opens(problem(inMain("echo 1 << -1")), "in `main`: `<<` shifts by a number of bits, and -1 is negative")
+	assert opens(problem(inMain("echo 1.5 >> 1")), "in `main`: `>>` shifts an integer's bits, and this is Float")
+}
+
+test "the parts of a binary value come to whole bytes, a run of them starting on one" {
+	assert problemCount(inMain("UInt8[dyn] b = <<UInt4(4), UInt4(5), 0x0054: UInt16, \"ab\", [1, 2], 7>>  echo b")) == 0
+	assert opens(problem(inMain("echo <<UInt4(1)>>")), "in `main`: the parts of this `<<...>>` come to 4 bits, which is not a whole number of bytes")
+	assert opens(problem(inMain("x := 300  echo <<x: UInt16>>")), "in `main`: only a literal says its width in `<<...>>`")
+	assert opens(problem(inMain("echo <<300>>")), "in `main`: a literal in `<<...>>` is one byte unless it says otherwise, and 300 does not fit one")
+	assert opens(problem(inMain("echo <<UInt4(1), \"ab\", UInt4(2)>>")), "in `main`: `\"ab\"` starts 4 bits into a byte, and a run of bytes has to start on one")
+	assert opens(problem(inMain("echo <<1.5>>")), "in `main`: a part of `<<...>>` is an integer, a `UInt8[]` or a `Str`")
+}
+
+test "a binary pattern reads whole bytes, or every bit of an integer" {
+	bytes := "UInt8[dyn] v = [1, 2]  "
+	assert problemCount(inMain(bytes + "if v is <<a: UInt4, b: UInt4, n, body: UInt8[n], ...rest>> \{ echo a }")) == 0
+	assert problemCount(inMain("UInt16 w = 1  if w is <<a: UInt8, b: Int4, _: UInt4>> \{ echo a }")) == 0
+	assert problemCount(inMain("if \"PNG!\" is <<\"PNG\", ...rest>> \{ echo rest }")) == 0
+	assert opens(problem(inMain(bytes + "if v is <<a: UInt4>> \{ echo a }")), "in `main`: the fields of this pattern come to 4 bits, which is not a whole number of bytes")
+	assert opens(problem(inMain(bytes + "if v is <<a: UInt4, ...rest>> \{ echo a }")), "in `main`: `...rest` starts 4 bits into a byte")
+	assert opens(problem(inMain("UInt16 w = 1  if w is <<a: UInt8>> \{ echo a }")), "in `main`: the fields of this pattern take 8 bits, and UInt16 has 16")
+	assert opens(problem(inMain(bytes + "if v is <<a: UInt12 little, _: UInt4>> \{ echo a }")), "in `main`: `little` orders a number's bytes, and `a` is 12 bits")
+	assert opens(problem(inMain("Float f = 1.0  if f is <<a>> \{ echo a }")), "in `main`: a binary pattern matches a `UInt8[]`, a `Str` or an integer, and this subject is Float")
+	assert opens(problem(inMain(bytes + "if v is <<300>> \{ echo 1 }")), "in `main`: `300` does not fit UInt8, which is what this field reads")
+}
+
+test "a `switch` over binary patterns ends with `_`" {
+	assert problemCount(inMain("UInt8[dyn] v = [1]  switch v \{ <<1>> \{ echo 1 } _ \{ echo 2 } }")) == 0
+}
+
 // --- Sized numbers -----------------------------------------------------------
 
 test "a literal takes the sized type it lands in, and must fit it" {

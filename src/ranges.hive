@@ -515,6 +515,12 @@ func namesIn(e: ast.Expr): Str[dyn] {
 		out = joined(namesIn(left), namesIn(right))
 	} else if e is ast.Expr.Negate(operand) {
 		out = namesIn(operand)
+	} else if e is ast.Expr.BitNot(operand) {
+		out = namesIn(operand)
+	} else if e is ast.Expr.Bits(parts) {
+		for each part in parts {
+			out = joined(out, namesIn(part.value))
+		}
 	} else if e is ast.Expr.Member(subject, _) {
 		out = namesIn(subject)
 	} else if e is ast.Expr.Index(subject, index) {
@@ -556,6 +562,11 @@ func patternBindings(p: ast.Pattern): Str[dyn] {
 				append(out, name)
 			}
 		}
+	} else if p is ast.Pattern.BitsPat(fields, rest) {
+		for each f in fields {
+			append(out, f.name)
+		}
+		append(out, rest)
 	}
 	return out
 }
@@ -891,6 +902,12 @@ proc checkExpr(bo: mut Proofs, env: infer.Env, e: ast.Expr): void {
 		checkExpr(bo, env, operand)
 	} else if e is ast.Expr.Not(operand) {
 		checkExpr(bo, env, operand)
+	} else if e is ast.Expr.BitNot(operand) {
+		checkExpr(bo, env, operand)
+	} else if e is ast.Expr.Bits(parts) {
+		for each part in parts {
+			checkExpr(bo, env, part.value)
+		}
 	} else if e is ast.Expr.Member(subject, _) {
 		checkExpr(bo, env, subject)
 	} else if e is ast.Expr.VectorLit(items) {
@@ -903,8 +920,11 @@ proc checkExpr(bo: mut Proofs, env: infer.Env, e: ast.Expr): void {
 				checkExpr(bo, env, value)
 			}
 		}
-	} else if e is ast.Expr.IsMatch(subject, _) {
+	} else if e is ast.Expr.IsMatch(subject, pattern) {
 		checkExpr(bo, env, subject)
+		for each held in ast.patternExprs(pattern) {
+			checkExpr(bo, env, held)
+		}
 	}
 }
 
@@ -957,6 +977,12 @@ func provable(bo: Proofs, env: infer.Env, subject: ast.Expr, index: ast.Expr): B
 		}
 		return false
 	}
+	// `i & 15` is never negative and never above 15, whatever `i` holds.
+	if maskOf(index) is Result.Ok(top) {
+		if knownLength(bo, env, subject) is Result.Ok(n) {
+			return top < n
+		}
+	}
 	// A sized index is below its type's top whatever it holds, and an unsigned one
 	// is never negative.
 	ty := infer.typeOf(env, index)
@@ -970,6 +996,19 @@ func provable(bo: Proofs, env: infer.Env, subject: ast.Expr, index: ast.Expr): B
 		}
 	}
 	return false
+}
+
+// The largest `x & k` can be, for a literal `k` that is never negative.
+func maskOf(e: ast.Expr): Result<Int, Bool> {
+	if e is ast.Expr.Binary(op, left, right) && op is ast.BinOp.BitAnd {
+		if right is ast.Expr.IntLit(k) {
+			return Result.Ok(k)
+		}
+		if left is ast.Expr.IntLit(k) {
+			return Result.Ok(k)
+		}
+	}
+	return Result.Error(false)
 }
 
 // The length of a vector, when the compiler knows it. A declared length is a

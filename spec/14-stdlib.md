@@ -67,10 +67,14 @@ Number and string conversions. Pure.
   non-finite inputs.
 * **Widening / rendering** — `itf(v)` widens an `Int` to a `Float`, and `itf32(v)` to
   the nearest `Float32`; `its(v)` renders an `Int` as a `Str`; `fts(v)` a `Float` as
-  a `Str`. A sized integer goes into any of these by widening.
+  a `Str`. A sized integer is converted into an `Int` first: `its(Int(b))`.
 * **Parsing** — `sti(text)` → `Result<Int, hive.conv.ConversionError>`,
   `stf(text)` → `Result<Float, _>`. A `ConversionError` carries the offending
   `input` and a short `message`.
+* **Bytes** — `bytesOf(text)` → `UInt8[dyn]`, the bytes a `Str` holds, and
+  `fromBytes(bytes)` → `Str`, which never fails: a `Str` holds any bytes. A file
+  or a socket already hands back a `Str` of its raw bytes, so these two are the
+  whole of binary input and output.
 
 ## 14.2 `hive.math`
 

@@ -27,9 +27,12 @@ An access is safe when one of these holds:
   `i < len(v)` is left to guard. Wrapping keeps this true after arithmetic: `i + 1`
   on a `UInt4` at 15 is 0. The bound travels with the type — `Int(i)` is an `Int`,
   and proves nothing;
+* the index is **masked by a literal**, `i & 15`, against a vector whose known
+  length is past it: the result is never negative and never above the mask,
+  whatever `i` holds — `buckets[hash & 255]` on a `Str[256]`;
 * the access is a **`for each`**, which never indexes.
 
-A **computed** index is not provable and must be bound to a variable and guarded:
+Any other **computed** index is not provable and must be bound to a variable and guarded:
 
 ```hive
 echo v[len(v) - 1]           // compile error: the index is a computed expression

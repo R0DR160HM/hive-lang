@@ -80,7 +80,7 @@ All of it.
 | checks | names, arity, named arguments, argument and return types, what a call can reach through, the standard library's own names and what they take, what a walk's function answers with, the proc/func split, mutability, terminating paths, exhaustiveness, conditions, subscripts, `async`'s three refusals, pattern shapes, a query's rows and its bound values ([04](04-declarations.md), [06](06-statements.md), [07](07-patterns.md), [08](08-mutability-and-values.md), [13](13-builtins.md), [14](14-stdlib.md)) |
 | value semantics | copy-on-binding, type-directed deep copies, two `mut` names sharing one header, `mut` parameters as pointers ([08](08-mutability-and-values.md)) |
 | concurrency | `async` as a statement, the `async` binding, the await-all, `with timeout` ([09](09-concurrency.md)) |
-| patterns | all four kinds, with narrowing through `&&`; a string template's holes both ways, with its regexes read at compile time and the whole template compiled once ([07](07-patterns.md)) |
+| patterns | all five kinds, with narrowing through `&&`; a binary pattern's fields read in one pass, its alignment checked at compile time; a string template's holes both ways, with its regexes read at compile time and the whole template compiled once ([07](07-patterns.md)) |
 | builtins | all of [13](13-builtins.md) |
 | standard library | every module of [14](14-stdlib.md): `hive.conv`, `hive.math`, `hive.map`, `hive.file`, `hive.env`, `hive.term`, `hive.task`, `hive.time`, `hive.json`, `hive.crypto`, `hive.net`, `hive.syslink`, `hive.sql`, `hive.ui` and `hive.ui.scene` |
 | reading tables | every reader: `hive.file.csv`, `hive.file.xlsx`, `hive.file.ods`, `hive.sql.run` on a declared `query`, and `hive.sql.raw` ([14.6](14-stdlib.md#146-reading-tables)) |
@@ -156,9 +156,10 @@ different route, or does not quite do it.
   ([14.10](14-stdlib.md#1410-hivesyslink)) and this compiler writes the
   *signature* — the type's spelling and every variant and field it declares — for
   the runtime to hash on the way out. FNV-1a wants exclusive-or and a byte's
-  value, and Hive has neither, so the hash is one line of Go instead of thirty of
-  Hive. What matters is that both ends of a wire compute the same number from the
-  same declaration, and they do.
+  value, which Hive has, but the compiler is built by the one released before it
+  and that one does not — so the hash stays one line of Go until a release
+  carries `^`. What matters is that both ends of a wire compute the same number
+  from the same declaration, and they do.
 
 ## 18.3 Defects this chapter turned up in this one
 
