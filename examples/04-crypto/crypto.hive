@@ -6,121 +6,121 @@
 // `hive.json.codec`, so `encode` signs a value of this type and `Session.decode`
 // checks a token and reads it straight back.
 type Session {
-	user: Str
-	role: Str
-	exp: Int
+    user: Str
+    role: Str
+    exp: Int
 }
 
 proc main(): void {
-	// --- General-purpose crypto -------------------------------------------
+    // --- General-purpose crypto -------------------------------------------
 
-	// Hashing. sha256/sha512 return a lowercase hex digest.
-	echo hive.crypto.sha256("hello")
-	echo hive.crypto.sha512("hello")
+    // Hashing. sha256/sha512 return a lowercase hex digest.
+    echo hive.crypto.sha256("hello")
+    echo hive.crypto.sha512("hello")
 
-	// Keyed hashing (HMAC-SHA256), also hex. A key is a `Secret`, which printing
-	// is a compile error. A literal is in the executable already, so this one is
-	// made with `bypass`, which keeps it in ordinary memory and cannot fail.
-	echo hive.crypto.hmacSha256("message", bypass("shared-key"))
+    // Keyed hashing (HMAC-SHA256), also hex. A key is a `Secret`, which printing
+    // is a compile error. A literal is in the executable already, so this one is
+    // made with `bypass`, which keeps it in ordinary memory and cannot fail.
+    echo hive.crypto.hmacSha256("message", bypass("shared-key"))
 
-	// Base64 round-trip. Encoding can't fail; decoding returns a Result.
-	encoded := hive.crypto.base64Encode("Hive loves Go")
-	echo encoded
-	decoded := hive.crypto.base64Decode(encoded)
-	if decoded is Result.Ok(text) {
-		echo text
-	} else if decoded is Result.Error(error) {
-		echo "bad base64: {error.message}"
-	}
+    // Base64 round-trip. Encoding can't fail; decoding returns a Result.
+    encoded := hive.crypto.base64Encode("Hive loves Go")
+    echo encoded
+    decoded := hive.crypto.base64Decode(encoded)
+    if decoded is Result.Ok(text) {
+        echo text
+    } else if decoded is Result.Error(error) {
+        echo "bad base64: {error.message}"
+    }
 
-	// --- Encryption -------------------------------------------------------
+    // --- Encryption -------------------------------------------------------
 
-	// `hide` keeps text in memory that is never swapped to disk, and answers
-	// with why not when there is none left to lock.
-	hidden := hide("attack at dawn")
-	if hidden is Result.Error(why) {
-		echo why
-		return
-	}
+    // `hide` keeps text in memory that is never swapped to disk, and answers
+    // with why not when there is none left to lock.
+    hidden := hide("attack at dawn")
+    if hidden is Result.Error(why) {
+        echo why
+        return
+    }
 
-	// AES-256-GCM under a password. The text and the password are `Secret`s;
-	// what comes back is a plain Str — base64, ready to be written to a file or
-	// put in a JSON field. The key is derived from the password with PBKDF2 over
-	// a random salt, so encrypting cannot fail.
-	password := bypass("correct horse battery staple")
-	if hidden is Result.Ok(message) {
-		echo hive.crypto.encrypt(message, password)
-	}
+    // AES-256-GCM under a password. The text and the password are `Secret`s;
+    // what comes back is a plain Str — base64, ready to be written to a file or
+    // put in a JSON field. The key is derived from the password with PBKDF2 over
+    // a random salt, so encrypting cannot fail.
+    password := bypass("correct horse battery staple")
+    if hidden is Result.Ok(message) {
+        echo hive.crypto.encrypt(message, password)
+    }
 
-	// A fresh salt and nonce every call: the same text under the same password
-	// never comes out the same twice.
-	sealed := hive.crypto.encrypt(bypass("attack at dawn"), password)
-	echo sealed
+    // A fresh salt and nonce every call: the same text under the same password
+    // never comes out the same twice.
+    sealed := hive.crypto.encrypt(bypass("attack at dawn"), password)
+    echo sealed
 
-	// What decrypting opens is a `Secret` too, and `reveal` is its text.
-	opened := hive.crypto.decrypt(sealed, password)
-	if opened is Result.Ok(plain) {
-		echo "decrypted: {reveal(plain)}"
-	}
+    // What decrypting opens is a `Secret` too, and `reveal` is its text.
+    opened := hive.crypto.decrypt(sealed, password)
+    if opened is Result.Ok(plain) {
+        echo "decrypted: {reveal(plain)}"
+    }
 
-	// A wrong password fails the authentication tag — and so does a message
-	// edited after it was encrypted. The tag cannot tell the two apart, so the
-	// failure is the same for both.
-	if hive.crypto.decrypt(sealed, bypass("hunter2")) is Result.Error(crypto.CryptoError.BadSignature(message)) {
-		echo "rejected (BadSignature): {message}"
-	}
+    // A wrong password fails the authentication tag — and so does a message
+    // edited after it was encrypted. The tag cannot tell the two apart, so the
+    // failure is the same for both.
+    if hive.crypto.decrypt(sealed, bypass("hunter2")) is Result.Error(crypto.CryptoError.BadSignature(message)) {
+        echo "rejected (BadSignature): {message}"
+    }
 
-	// A secure random 32-byte secret (64 hex chars), drawn straight into locked
-	// memory. Non-deterministic.
-	if hive.crypto.randomSecret(32) is Result.Ok(secret) {
-		tokens(secret)
-	}
+    // A secure random 32-byte secret (64 hex chars), drawn straight into locked
+    // memory. Non-deterministic.
+    if hive.crypto.randomSecret(32) is Result.Ok(secret) {
+        tokens(secret)
+    }
 }
 
 // --- JSON Web Tokens ------------------------------------------------------
 
 proc tokens(secret: Secret<Str>): void {
 
-	// Sign: `encode` with a JWT codec. The claims are a typed value, and `exp`
-	// is in Unix seconds, as JWT has it, where `hive.time.now()` is milliseconds.
-	token := encode(Session("ada", "admin", hive.time.now() / 1000 + 3600), hive.crypto.jwtCodec(secret))
+    // Sign: `encode` with a JWT codec. The claims are a typed value, and `exp`
+    // is in Unix seconds, as JWT has it, where `hive.time.now()` is milliseconds.
+    token := encode(Session("ada", "admin", hive.time.now() / 1000 + 3600), hive.crypto.jwtCodec(secret))
 
-	// Read it back: the signature and `exp` are checked, then the claims are
-	// decoded into the type that declared them. A token that does not check out
-	// and claims of the wrong shape are both one hive.crypto.JwtError.
-	verified := Session.decode(token, hive.crypto.jwtCodec(secret))
-	if verified is Result.Ok(session) {
-		echo "welcome {session.user} (role: {session.role})"
-	} else if verified is Result.Error(error) {
-		echo "unexpected: {error.found}"
-	}
+    // Read it back: the signature and `exp` are checked, then the claims are
+    // decoded into the type that declared them. A token that does not check out
+    // and claims of the wrong shape are both one hive.crypto.JwtError.
+    verified := Session.decode(token, hive.crypto.jwtCodec(secret))
+    if verified is Result.Ok(session) {
+        echo "welcome {session.user} (role: {session.role})"
+    } else if verified is Result.Error(error) {
+        echo "unexpected: {error.found}"
+    }
 
-	// The wrong secret fails the signature check.
-	forged := Session.decode(token, hive.crypto.jwtCodec(bypass("not-the-secret")))
-	if forged is Result.Error(error) {
-		echo "rejected: {error.found}"
-	}
+    // The wrong secret fails the signature check.
+    forged := Session.decode(token, hive.crypto.jwtCodec(bypass("not-the-secret")))
+    if forged is Result.Error(error) {
+        echo "rejected: {error.found}"
+    }
 
-	// A token whose `exp` is in the past is rejected as expired.
-	old := encode(Session("bob", "guest", hive.time.now() / 1000 - 60), hive.crypto.jwtCodec(secret))
-	stale := Session.decode(old, hive.crypto.jwtCodec(secret))
-	if stale is Result.Error(error) {
-		echo "rejected: {error.found}"
-	}
+    // A token whose `exp` is in the past is rejected as expired.
+    old := encode(Session("bob", "guest", hive.time.now() / 1000 - 60), hive.crypto.jwtCodec(secret))
+    stale := Session.decode(old, hive.crypto.jwtCodec(secret))
+    if stale is Result.Error(error) {
+        echo "rejected: {error.found}"
+    }
 
-	// `jwtHeader` peeks at the algorithm without verifying — e.g. to choose a
-	// key by `kid` before naming the codec that checks it.
-	head := hive.crypto.jwtHeader(token)
-	if head is Result.Ok(h) {
-		echo "token algorithm: {h.alg}"
-	}
+    // `jwtHeader` peeks at the algorithm without verifying — e.g. to choose a
+    // key by `kid` before naming the codec that checks it.
+    head := hive.crypto.jwtHeader(token)
+    if head is Result.Ok(h) {
+        echo "token algorithm: {h.alg}"
+    }
 
-	// `jwtDecode` reads the payload WITHOUT verifying it — never trust the
-	// result for authorization, only for inspection.
-	peeked := hive.crypto.jwtDecode(token)
-	if peeked is Result.Ok(claims) {
-		if Session.decode(claims, hive.json.codec()) is Result.Ok(session) {
-			echo "unverified peek: {session.user}"
-		}
-	}
+    // `jwtDecode` reads the payload WITHOUT verifying it — never trust the
+    // result for authorization, only for inspection.
+    peeked := hive.crypto.jwtDecode(token)
+    if peeked is Result.Ok(claims) {
+        if Session.decode(claims, hive.json.codec()) is Result.Ok(session) {
+            echo "unverified peek: {session.user}"
+        }
+    }
 }
