@@ -52,6 +52,10 @@ type Mono {
 	// The line the declaration being rewritten was declared on — the only
 	// position a flattened program can offer.
 	line: Int
+	// What the callable being rewritten returns, with its variables substituted
+	// but the generic types in it not yet renamed: a constructor in a `return`
+	// is told which copy it builds by it, as one beside a declaration is.
+	returning: ast.TypeExpr
 	errors: diag.Diagnostic[dyn]
 }
 
@@ -66,12 +70,14 @@ type ArgList {
 // compiler does, so it is the one pass that speaks while it works.
 proc expand(m: ast.Module, from: Int): Expanded {
 	t := types.tableOf(m)
-	mut Mono mo = Mono(t, m.decls, genericNames(t, m.decls), [], [], [], 0, 0, [])
+	mut Mono mo = Mono(t, m.decls, genericNames(t, m.decls), [], [], [], 0, 0, ast.TypeExpr.VoidType(), [])
+	written := writtenOut(mo, t)
+	mo.table = written
 
 	// Nothing generic is emitted as it stands: a copy is what runs, and the
 	// original is only a template.
 	mut ast.Decl[dyn] out = []
-	env := infer.newEnv(t)
+	env := infer.newEnv(written)
 	mut walked := 0
 	for each d in m.decls {
 		if isGeneric(mo.generics, ast.declName(d)) == false {
@@ -133,6 +139,54 @@ func variablesOf(t: types.Table, names: Str[]): Str[dyn] {
 
 func isGeneric(generics: Str[], name: Str): Bool {
 	return indexOf(generics, name) is Result.Ok(_)
+}
+
+// The table this pass reads types against, with every generic type a concrete
+// signature or field writes out — `Box<Int>` — under the name of its copy, which
+// is what that type is from here on. Resolved as written, `Box<Int>` is only
+// `Box`, and a `Box<T>` parameter handed what `makeBox()` answers with would
+// have nothing to read `T` off. A template keeps its variables: there is no copy
+// of `Box<T>` to name.
+proc writtenOut(mo: mut Mono, t: types.Table): types.Table {
+	mut Str[dyn] nothing = []
+	mut types.TypeInfo[dyn] typeInfos = []
+	for each info in t.types {
+		if len(variablesOf(t, info.parameters)) > 0 {
+			append(typeInfos, info)
+		} else {
+			append(typeInfos, types.TypeInfo(info.name, substituteVariants(mo, info.variants, nothing, ArgList([])), substituteFields(mo, info.shared, nothing, ArgList([])), info.parameters))
+		}
+	}
+	mut types.CallableInfo[dyn] callables = []
+	for each info in t.callables {
+		if len(variablesOf(t, info.parameters)) > 0 {
+			append(callables, info)
+		} else {
+			mut ast.Param[dyn] params = []
+			for each p in info.params {
+				append(params, ast.Param(p.name, renameGenerics(mo, p.declared), p.mutable))
+			}
+			append(callables, types.CallableInfo(info.name, info.pure, params, renameGenerics(mo, info.result), info.parameters))
+		}
+	}
+	return types.Table(typeInfos, callables)
+}
+
+// The copy called `flat`, as its place in the worklist, or `Error` when the name
+// is not one.
+proc copyAt(mo: mut Mono, flat: Str): Result<Int, Bool> {
+	if flat == "" {
+		return Result.Error(false)
+	}
+	return indexOf(mo.wantedFlat, flat)
+}
+
+// The type arguments the copy at `at` was asked for at.
+proc argsAt(mo: mut Mono, at: Int): ArgList {
+	if mo.wantedArgs bounds at {
+		return mo.wantedArgs[at]
+	}
+	return ArgList([])
 }
 
 // --- Asking for a copy -------------------------------------------------------
@@ -254,6 +308,7 @@ proc substituteDecl(mo: mut Mono, env: infer.Env, d: ast.Decl, flat: Str, variab
 		// `for each v: T in values` — so each copy substitutes through its own.
 		// The parameters go into scope first, with the types this copy gave them.
 		inner := infer.boundParams(env, out, 0)
+		mo.returning = substituteVars(result, variables, args)
 		return ast.Decl.CallableDecl(kind, flat, out, substitute(mo, result, variables, args), substituteBlock(mo, inner, body, variables, args), line)
 	}
 	if d is ast.Decl.TestDecl(title, body, line) {
@@ -261,6 +316,7 @@ proc substituteDecl(mo: mut Mono, env: infer.Env, d: ast.Decl, flat: Str, variab
 		// to appear in — but what it calls is, and a copy is only ever made for a
 		// call this walk saw. A body skipped here leaves a generic reached from
 		// nowhere else with no copy at all.
+		mo.returning = ast.TypeExpr.VoidType()
 		return ast.Decl.TestDecl(title, substituteBlock(mo, env, body, variables, args), line)
 	}
 	return d
@@ -437,24 +493,24 @@ proc substituteStmts(mo: mut Mono, env: infer.Env, stmts: ast.Stmt[], at: Int, i
 	if stmts bounds at {
 		next := substituteStmt(mo, env, stmts[at], variables, args)
 		append(into, next)
-		substituteStmts(mo, bindFrom(env.table, env, next), stmts, at + 1, into, variables, args)
+		substituteStmts(mo, bindFrom(mo, env, next), stmts, at + 1, into, variables, args)
 	}
 }
 
 // The scope a statement leaves behind.
-func bindFrom(t: types.Table, env: infer.Env, s: ast.Stmt): infer.Env {
+proc bindFrom(mo: mut Mono, env: infer.Env, s: ast.Stmt): infer.Env {
 	if s is ast.Stmt.VarDecl(name, value, _, _) {
-		return infer.bound(env, name, infer.typeOf(env, value))
+		return infer.bound(env, name, typeIn(mo, env, value))
 	}
 	if s is ast.Stmt.TypedDecl(declared, name, _, _, _) {
-		return infer.bound(env, name, types.resolve(t, declared))
+		return infer.bound(env, name, types.resolve(env.table, declared))
 	}
 	return env
 }
 
-func bindAll(t: types.Table, env: infer.Env, stmts: ast.Stmt[], at: Int): infer.Env {
+proc bindAll(mo: mut Mono, env: infer.Env, stmts: ast.Stmt[], at: Int): infer.Env {
 	if stmts bounds at {
-		return bindAll(t, bindFrom(t, env, stmts[at]), stmts, at + 1)
+		return bindAll(mo, bindFrom(mo, env, stmts[at]), stmts, at + 1)
 	}
 	return env
 }
@@ -474,9 +530,11 @@ proc substituteStmt(mo: mut Mono, env: infer.Env, s: ast.Stmt, variables: Str[],
 		return ast.Stmt.VarDecl(name, substituteExpr(mo, env, value, variables, args), mutable, deferred)
 	} else if s is ast.Stmt.TypedDecl(declared, name, value, mutable, deferred) {
 		// The variables are replaced first and the generic name second, because
-		// what the constructor needs is the type arguments as written.
+		// what the constructor needs is the type arguments as written. It is aimed
+		// before its arguments are read, so the declaration wins over them: in
+		// `Page<Entry> none = Page([], 1)` the `[]` says nothing about `T`.
 		asWritten := substituteVars(declared, variables, args)
-		newValue := retarget(mo, asWritten, substituteExpr(mo, env, value, variables, args))
+		newValue := substituteExpr(mo, env, retarget(mo, asWritten, value), variables, args)
 		return ast.Stmt.TypedDecl(renameGenerics(mo, asWritten), name, newValue, mutable, deferred)
 	} else if s is ast.Stmt.Assign(target, value) {
 		return ast.Stmt.Assign(substituteExpr(mo, env, target, variables, args), substituteExpr(mo, env, value, variables, args))
@@ -485,7 +543,7 @@ proc substituteStmt(mo: mut Mono, env: infer.Env, s: ast.Stmt, variables: Str[],
 	} else if s is ast.Stmt.SwitchStmt(lets, subjects, arms, line) {
 		mut ast.Stmt[dyn] newLets = []
 		substituteStmts(mo, env, lets, 0, newLets, variables, args)
-		inner := bindAll(env.table, env, newLets, 0)
+		inner := bindAll(mo, env, newLets, 0)
 		mut ast.Expr[dyn] newSubjects = []
 		for each subject in subjects {
 			append(newSubjects, substituteExpr(mo, inner, subject, variables, args))
@@ -495,12 +553,12 @@ proc substituteStmt(mo: mut Mono, env: infer.Env, s: ast.Stmt, variables: Str[],
 		// The counter is scoped to the loop, and the condition, the post clause
 		// and the body all read it.
 		newInit := substituteStmt(mo, env, init, variables, args)
-		inner := bindFrom(env.table, env, newInit)
+		inner := bindFrom(mo, env, newInit)
 		return ast.Stmt.ForLoop(newInit, substituteExpr(mo, inner, cond, variables, args), substituteStmt(mo, inner, post, variables, args), substituteBlock(mo, inner, body, variables, args))
 	} else if s is ast.Stmt.ForEach(name, declared, subject, body) {
 		newSubject := substituteExpr(mo, env, subject, variables, args)
 		newType := substitute(mo, declared, variables, args)
-		mut element := types.elementOf(infer.typeOf(env, newSubject))
+		mut element := types.elementOf(typeIn(mo, env, newSubject))
 		if newType is ast.TypeExpr.VoidType {
 		} else {
 			element = types.resolve(env.table, newType)
@@ -512,7 +570,10 @@ proc substituteStmt(mo: mut Mono, env: infer.Env, s: ast.Stmt, variables: Str[],
 
 proc substituteStmtTail(mo: mut Mono, env: infer.Env, s: ast.Stmt, variables: Str[], args: ArgList): ast.Stmt {
 	if s is ast.Stmt.ReturnStmt(value) {
-		return ast.Stmt.ReturnStmt(substituteExpr(mo, env, value, variables, args))
+		// The declared result is a declaration like any other, so `return Page([], 1)`
+		// in a callable answering with `Page<Entry>` builds a `Page_Entry`.
+		want := mo.returning
+		return ast.Stmt.ReturnStmt(substituteExpr(mo, env, retarget(mo, want, value), variables, args))
 	} else if s is ast.Stmt.EchoStmt(value) {
 		return ast.Stmt.EchoStmt(substituteExpr(mo, env, value, variables, args))
 	} else if s is ast.Stmt.AssertStmt(condition) {
@@ -596,7 +657,7 @@ proc aimPattern(mo: mut Mono, env: infer.Env, subject: ast.Expr, p: ast.Pattern)
 			// The copy is not in the table this pass reads — that is of the
 			// program as written — so its name arrives as a type variable rather
 			// than a declared type. Either way it is the name.
-			flat := nameOfType(infer.typeOf(env, subject))
+			flat := nameOfType(typeIn(mo, env, subject))
 			if flat != "" {
 				return ast.Pattern.Constructor([flat, nameAt(path, 1)], bindings, parenthesised)
 			}
@@ -633,17 +694,18 @@ proc chosen(mo: mut Mono, env: infer.Env, name: Str, callArgs: ast.Arg[]): Str {
 		variables := variablesOf(env.table, info.parameters)
 		mut ast.TypeExpr[dyn] found = []
 		for each v in variables {
-			append(found, solve(mo, env, info.params, callArgs, v))
+			append(found, solve(mo, env, name, info.params, callArgs, v))
 		}
 		return wanted(mo, name, ArgList(found))
 	}
-	// A generic *type* being constructed: `Box(["a"], "people")` names the copy
-	// its declaration was written out as, already asked for at that site.
+	// A generic *type* built where no declaration says which copy —
+	// `count(Box([1], "x"))` — has its arguments read off the fields, as a
+	// callable's are read off the parameters.
 	if types.findType(env.table, name) is Result.Ok(info) {
 		variables := variablesOf(env.table, info.parameters)
 		mut ast.TypeExpr[dyn] found = []
 		for each v in variables {
-			append(found, solveFields(mo, env, info.shared, callArgs, v))
+			append(found, solveFields(mo, env, name, info.shared, callArgs, v))
 		}
 		return wanted(mo, name, ArgList(found))
 	}
@@ -652,58 +714,119 @@ proc chosen(mo: mut Mono, env: infer.Env, name: Str, callArgs: ast.Arg[]): Str {
 
 // What one variable stands for at this call. A variable is pinned down wherever
 // it appears in the parameters, *inside* a parameter's own type included — which
-// is what makes a higher-order generic work.
-proc solve(mo: mut Mono, env: infer.Env, params: ast.Param[], callArgs: ast.Arg[], variable: Str): ast.TypeExpr {
-	mut i := 0
+// is what makes a higher-order generic work — and the first argument that says
+// what it is decides.
+proc solve(mo: mut Mono, env: infer.Env, callee: Str, params: ast.Param[], callArgs: ast.Arg[], variable: Str): ast.TypeExpr {
+	mut open := 0
+	mut mentioned := false
+	mut supplied := false
+	mut held := false
 	for each p in params {
-		given := argExpr(callArgs, p.name, i)
-		if given is ast.Expr.Absent {
-			i = i + 1
+		given := ast.argFor(callArgs, p.name, open)
+		if ast.claimedByName(callArgs, p.name) == false {
+			open = open + 1
+		}
+		if mentions(p.declared, variable) == false {
 			continue
 		}
-		found := match(p.declared, infer.typeOf(env, given), variable)
-		if found is Result.Ok(t) {
-			return t
+		mentioned = true
+		if given is ast.Expr.Hole {
+			held = true
+		} else if (given is ast.Expr.Absent) == false {
+			supplied = true
+			found := match(mo, env, p.declared, typeIn(mo, env, given), variable)
+			if found is Result.Ok(t) {
+				return t
+			}
 		}
-		i = i + 1
 	}
 	// A variable appearing only in the return type has nothing to be inferred
 	// from, and would otherwise produce a copy nobody meant.
-	append(mo.errors, diag.at(mo.line, "`{variable}` appears nowhere in the parameters, so there is nothing at a call to read it off. A type variable is pinned down by what is passed, never written at the call site"))
-	return ast.TypeExpr.Named("", "Str", [], [])
+	if mentioned == false {
+		append(mo.errors, diag.at(mo.line, "`{variable}` appears nowhere in the parameters, so there is nothing at a call to read it off. A type variable is pinned down by what is passed, never written at the call site"))
+		return standIn()
+	}
+	// A `_` is a parameter of the function value the call makes, and a value
+	// carries no types. Where the holes are the only places the variable could
+	// be read off, there is no copy for the value to call.
+	if held && supplied == false {
+		append(mo.errors, diag.at(mo.line, "`_` stands where `{callee}` reads `{variable}` from, so the function value this makes could not say which copy it calls: a partial application of something generic has to fix every type variable with what it does pass. Pass that argument, or wrap the call in a callable of your own that is not generic"))
+		return standIn()
+	}
+	// Passed, but as something that says nothing about it: an empty `[]`, or a
+	// value whose own mistake the checker reports.
+	return standIn()
 }
 
-proc solveFields(mo: mut Mono, env: infer.Env, fields: ast.Field[], callArgs: ast.Arg[], variable: Str): ast.TypeExpr {
-	mut i := 0
+// The same for a generic type built by its own name, whose fields are what its
+// constructor takes.
+proc solveFields(mo: mut Mono, env: infer.Env, name: Str, fields: ast.Field[], callArgs: ast.Arg[], variable: Str): ast.TypeExpr {
+	mut ast.Param[dyn] params = []
+	mut mentioned := false
 	for each f in fields {
-		given := argExpr(callArgs, f.name, i)
-		if given is ast.Expr.Absent {
-			i = i + 1
-			continue
-		}
-		found := match(f.declared, infer.typeOf(env, given), variable)
-		if found is Result.Ok(t) {
-			return t
-		}
-		i = i + 1
+		append(params, ast.Param(f.name, f.declared, false))
+		mentioned = mentioned || mentions(f.declared, variable)
 	}
-	return ast.TypeExpr.Named("", "Str", [], [])
+	// A union's variables are in its variants, and a union is built through one
+	// of them rather than by its own name — which is the checker's to report,
+	// not a variable that appears nowhere.
+	if mentioned == false {
+		return standIn()
+	}
+	return solve(mo, env, name, params, callArgs, variable)
+}
+
+// What a variable nothing pinned down is taken to be, so the expansion can go
+// on. The copy it makes is checked like any other.
+func standIn(): ast.TypeExpr {
+	return types.named("Str")
+}
+
+// Whether `variable` appears anywhere in a written type.
+func mentions(t: ast.TypeExpr, variable: Str): Bool {
+	if t is ast.TypeExpr.Named(pkg, name, typeArgs, _) {
+		if pkg == "" && name == variable {
+			return true
+		}
+		for each a in typeArgs {
+			if mentions(a, variable) {
+				return true
+			}
+		}
+		return false
+	}
+	if t is ast.TypeExpr.Fn(_, params, _, result) {
+		for each p in params {
+			if mentions(p, variable) {
+				return true
+			}
+		}
+		return mentions(result, variable)
+	}
+	return false
 }
 
 // Match a written parameter type against the type actually passed, looking for
-// what one variable stood for.
-func match(param: ast.TypeExpr, given: types.Ty, variable: Str): Result<ast.TypeExpr, Bool> {
+// what one variable stood for. A type that says nothing — the element of an
+// empty `[]`, a value already gone wrong — pins nothing down, and the search
+// goes on to the next parameter.
+proc match(mo: mut Mono, env: infer.Env, param: ast.TypeExpr, given: types.Ty, variable: Str): Result<ast.TypeExpr, Bool> {
 	if param is ast.TypeExpr.Named(pkg, name, typeArgs, dims) {
+		// `T[]` matched against `Str[dyn]` says `T` is `Str`, and `Box<T>[]`
+		// against a vector of `Box_Int` is read inside one `Box_Int`: the
+		// parameter's own dimensions are peeled off what was given first.
+		inner := peel(given, len(dims))
 		if pkg == "" && name == variable {
-			// `T[]` matched against `Str[dyn]` says `T` is `Str`: the parameter's
-			// own dimensions are peeled off what was given.
-			return Result.Ok(types.toWritten(peel(given, len(dims))))
+			if inner is types.Ty.TUnknown {
+				return Result.Error(false)
+			}
+			return Result.Ok(types.toWritten(inner))
 		}
 		mut i := 0
 		for each a in typeArgs {
-			inner := match(a, argumentOf(given, i), variable)
-			if inner is Result.Ok(_) {
-				return inner
+			found := match(mo, env, a, argumentOf(mo, env, name, inner, i), variable)
+			if found is Result.Ok(_) {
+				return found
 			}
 			i = i + 1
 		}
@@ -712,13 +835,13 @@ func match(param: ast.TypeExpr, given: types.Ty, variable: Str): Result<ast.Type
 	if param is ast.TypeExpr.Fn(_, params, _, result) {
 		mut i := 0
 		for each p in params {
-			inner := match(p, parameterOf(given, i), variable)
-			if inner is Result.Ok(_) {
-				return inner
+			found := match(mo, env, p, parameterOf(given, i), variable)
+			if found is Result.Ok(_) {
+				return found
 			}
 			i = i + 1
 		}
-		return match(result, resultOf(given), variable)
+		return match(mo, env, result, resultOf(given), variable)
 	}
 	return Result.Error(false)
 }
@@ -732,9 +855,26 @@ func peel(ty: types.Ty, n: Int): types.Ty {
 	return out
 }
 
+// The `index`-th type argument of what was given, where the parameter wrote out
+// `template`. A copy of a generic type carries the arguments it was asked for
+// at — `Box_Int` is `Box` at `Int` — but only for the template it is a copy of:
+// a `Page_Int` says nothing about the `T` of a `Box<T>`.
+proc argumentOf(mo: mut Mono, env: infer.Env, template: Str, ty: types.Ty, index: Int): types.Ty {
+	if copyAt(mo, nameOfType(ty)) is Result.Ok(at) {
+		if nameAt(mo.wantedNames, at) == template {
+			args := argsAt(mo, at)
+			if args.written bounds index {
+				return types.resolve(env.table, args.written[index])
+			}
+		}
+		return types.Ty.TUnknown()
+	}
+	return builtinArgumentOf(ty, index)
+}
+
 // The `index`-th type argument of a `Result`, a map, a query, a codec, an
-// address or a secret, since those are the written types that carry any.
-func argumentOf(ty: types.Ty, index: Int): types.Ty {
+// address or a secret, since those are the builtin types that carry any.
+func builtinArgumentOf(ty: types.Ty, index: Int): types.Ty {
 	if ty is types.Ty.TAddress(message) {
 		return message
 	}
@@ -774,20 +914,92 @@ func resultOf(ty: types.Ty): types.Ty {
 	return types.Ty.TUnknown()
 }
 
-func argExpr(args: ast.Arg[], name: Str, index: Int): ast.Expr {
-	for each a in args {
-		if a.name == name {
-			return a.value
-		}
+// --- What a copy's values are ------------------------------------------------
+//
+// Inference reads the table of the program as written, which declares `Box` and
+// `paginate` and none of their copies, so a call to `Box_Int` or to
+// `paginate_Entry`, or a field of a value of one, is something it has no answer
+// for. These answer from the template at the arguments the copy was asked for
+// at, which is all a copy is.
+
+// What `e` is, copies included.
+proc typeIn(mo: mut Mono, env: infer.Env, e: ast.Expr): types.Ty {
+	found := infer.typeOf(env, e)
+	if found is types.Ty.TUnknown {
+		return copyTypeOf(mo, env, e)
 	}
-	mut seen := 0
-	for each a in args {
-		if a.name == "" {
-			if seen == index {
-				return a.value
+	return found
+}
+
+proc copyTypeOf(mo: mut Mono, env: infer.Env, e: ast.Expr): types.Ty {
+	if e is ast.Expr.Call(callee, callArgs) {
+		if infer.hasHole(callArgs) {
+			return types.Ty.TUnknown()
+		}
+		// `Box_Int(...)` and `paginate_Entry(...)`, unless a local of that name
+		// is what is being called.
+		if callee is ast.Expr.Ident(name) && infer.isBound(env, name) == false {
+			if copyAt(mo, name) is Result.Ok(at) {
+				return copyResult(mo, env, at)
 			}
-			seen = seen + 1
+		}
+		// `Either_Str_Int.Left(...)`, which builds the union.
+		if callee is ast.Expr.Member(head, _) && head is ast.Expr.Ident(name) {
+			if copyAt(mo, name) is Result.Ok(_) {
+				return types.resolve(env.table, types.named(name))
+			}
+		}
+	} else if e is ast.Expr.Member(subject, field) {
+		if copyAt(mo, nameOfType(typeIn(mo, env, subject))) is Result.Ok(at) {
+			return copyField(mo, env, at, field)
+		}
+	} else if e is ast.Expr.Index(subject, _) {
+		// Inference read the subject without the copies, so the element is read
+		// again with them.
+		whole := typeIn(mo, env, subject)
+		if whole is types.Ty.TStr {
+			return whole
+		}
+		return types.elementOf(whole)
+	}
+	return types.Ty.TUnknown()
+}
+
+// What a call to the copy at `at` answers with: a type's copy is what it builds,
+// and a callable's answers with its template's result at the copy's arguments.
+proc copyResult(mo: mut Mono, env: infer.Env, at: Int): types.Ty {
+	name := nameAt(mo.wantedNames, at)
+	if types.findCallable(env.table, name) is Result.Ok(info) {
+		return types.resolve(env.table, substitute(mo, info.result, variablesOf(env.table, info.parameters), argsAt(mo, at)))
+	}
+	return types.resolve(env.table, types.named(nameAt(mo.wantedFlat, at)))
+}
+
+// A field of a value of the type copy at `at`: the template's field, at the
+// copy's arguments.
+proc copyField(mo: mut Mono, env: infer.Env, at: Int, field: Str): types.Ty {
+	if types.findType(env.table, nameAt(mo.wantedNames, at)) is Result.Ok(info) {
+		if fieldNamed(info, field) is Result.Ok(declared) {
+			return types.resolve(env.table, substitute(mo, declared, variablesOf(env.table, info.parameters), argsAt(mo, at)))
 		}
 	}
-	return ast.Expr.Absent()
+	return types.Ty.TUnknown()
+}
+
+// The written type of a declared type's field, its own or any variant's, as
+// inference looks one up.
+func fieldNamed(info: types.TypeInfo, field: Str): Result<ast.TypeExpr, Bool> {
+	for each f in info.shared {
+		if f.name == field {
+			return Result.Ok(f.declared)
+		}
+	}
+	for each v in info.variants {
+		for each f in v.fields {
+			if f.name == field {
+				return Result.Ok(f.declared)
+			}
+		}
+	}
+	return Result.Error(false)
 }

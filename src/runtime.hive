@@ -3388,6 +3388,26 @@ func jsonSource(): Str {
 			return "", &JsonJsonError\{Path: path, Expected: "Str", Found: jsonKindName(v)}
 		}
 
+		// A field read into a Secret that did not decode: what was wanted and
+		// where, but only the kind of what came — never the text, which is the
+		// part that was meant to be secret.
+		func JsonSecretError(e *JsonJsonError, v JsonValue) *JsonJsonError \{
+			found := "an object"
+			switch v.Kind \{
+			case 'n':
+				found = "null"
+			case 'b':
+				found = "a boolean"
+			case '#':
+				found = "a number"
+			case 's':
+				found = "a string"
+			case 'a':
+				found = "an array"
+			}
+			return &JsonJsonError\{Path: e.Path, Expected: e.Expected, Found: found}
+		}
+
 		func JsonInt(v JsonValue, path string) (int, *JsonJsonError) \{
 			if v.Kind == '#' \{
 				if i, err := strconv.Atoi(v.Num); err == nil \{
@@ -6016,12 +6036,16 @@ func sqlSource(): Str {
 		}
 		`,
 		// SqlRows runs a query and maps every row through row, which the compiler
-		// derived from the type the query declared. A cell that does not fit its field
+		// derived from the type the query declared. fields are that type's fields in
+		// the order row reads them, and each is found among the columns by name, so
+		// the order of a SELECT is the query's own business. A single column has no
+		// name to be found by, and comes with nil. A cell that does not fit its field
 		// stops the read and comes back as an error, rather than becoming a zero.
 		`
 		func SqlRows[T any](
 			conn SqlSqlConnection,
 			stmt SqlFragment,
+			fields []string,
 			row func([]string) (T, error),
 		) Result[[]T, SqlSqlError] \{
 			out := []T\{}
@@ -6037,6 +6061,10 @@ func sqlSource(): Str {
 			if err != nil \{
 				return Err[[]T, SqlSqlError](SqlSqlError\{Reason: "Statement", Message: err.Error()})
 			}
+			at, why := sqlColumnsFor(fields, cols)
+			if why != "" \{
+				return Err[[]T, SqlSqlError](SqlSqlError\{Reason: "Shape", Message: why})
+			}
 			for rows.Next() \{
 				cells := make([]sql.NullString, len(cols))
 				ptrs := make([]any, len(cols))
@@ -6046,10 +6074,10 @@ func sqlSource(): Str {
 				if err := rows.Scan(ptrs...); err != nil \{
 					return Err[[]T, SqlSqlError](SqlSqlError\{Reason: "Statement", Message: err.Error()})
 				}
-				flat := make([]string, len(cols))
-				for i, c := range cells \{
-					if c.Valid \{
-						flat[i] = c.String
+				flat := make([]string, len(at))
+				for i, c := range at \{
+					if cells[c].Valid \{
+						flat[i] = cells[c].String
 					}
 				}
 				v, err := row(flat)
@@ -6067,16 +6095,61 @@ func sqlSource(): Str {
 			return Ok[[]T, SqlSqlError](out)
 		}
 		`,
-		// SqlShapeError reports a row that arrived with the wrong number of columns —
-		// which the compiler checks the query text for, so it means the database
-		// disagreed with the query at runtime.
+		// sqlColumnsFor finds the column that fills each field, or says why it could
+		// not. Every column has to fill a field and every field has to be filled,
+		// exactly once; anything else is a query whose result does not have its rows'
+		// shape. That is decided from the column names alone, before a row is read,
+		// so an empty table is no reason for a wrong query to pass.
+		//
+		// A name matches in any case. PostgreSQL folds a name nobody quoted to lower
+		// case and SQLite keeps it as written, so `AS userId` comes back as `userid`
+		// from one and as `userId` from the other, and one declaration has to read
+		// both. A column spelt exactly like a field is that field's before it is
+		// another's that differs only in case.
 		`
-		func SqlShapeError(want, got int) error \{
-			return SqlSqlError\{
-				Reason: "Shape",
-				Message: "expected " + strconv.Itoa(want) + " columns but the row had " +
-					strconv.Itoa(got),
+		func sqlColumnsFor(fields []string, cols []string) ([]int, string) \{
+			if fields == nil \{
+				if len(cols) != 1 \{
+					return nil, "expected 1 column but the query answered with " + strconv.Itoa(len(cols))
+				}
+				return []int\{0}, ""
 			}
+			at := make([]int, len(fields))
+			for i := range at \{
+				at[i] = -1
+			}
+			for c, name := range cols \{
+				f := sqlFieldNamed(fields, name)
+				if f < 0 \{
+					return nil, "column " + name + " fills no field of the row (" + strings.Join(fields, ", ") +
+						"): name it after the field it fills, with AS"
+				}
+				if at[f] >= 0 \{
+					return nil, "columns " + cols[at[f]] + " and " + name + " both fill the field " + fields[f]
+				}
+				at[f] = c
+			}
+			for f, c := range at \{
+				if c < 0 \{
+					return nil, "no column fills the field " + fields[f] + ": the query answered with " +
+						strings.Join(cols, ", ")
+				}
+			}
+			return at, ""
+		}
+
+		func sqlFieldNamed(fields []string, name string) int \{
+			for i, f := range fields \{
+				if f == name \{
+					return i
+				}
+			}
+			for i, f := range fields \{
+				if strings.EqualFold(f, name) \{
+					return i
+				}
+			}
+			return -1
 		}
 
 		func sqlCellError(column, value, want string) error \{

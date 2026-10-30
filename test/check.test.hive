@@ -87,8 +87,28 @@ test "a variant pattern matches only its own type" {
 }
 
 test "a literal in a variant's position is compared with what it holds" {
-	assert problem(inMain("r := Result.Ok(3)  if r is Result.Ok(\"three\") \{ }")) == "in `main`: `==` wants two of one type, and these are Int and Str"
-	assert problemCount(inMain("r := Result.Ok(3)  if r is Result.Ok(3) \{ }")) == 0
+	assert problem(inMain("Result<Int, Str> r = Result.Ok(3)  if r is Result.Ok(\"three\") \{ }")) == "in `main`: `==` wants two of one type, and these are Int and Str"
+	assert problemCount(inMain("Result<Int, Str> r = Result.Ok(3)  if r is Result.Ok(3) \{ }")) == 0
+}
+
+test "a Result built on the spot takes the half it cannot say from its first later use" {
+	takes := "proc show(r: Result<Str, Str>): void \{ }\n"
+	assert problemCount(takes + inMain("x := Result.Ok(\"ok\")  show(x)")) == 0
+	assert problemCount(takes + inMain("x := Result.Error(\"no\")  if true \{ show(x) }")) == 0
+	assert problemCount("func f(): Result<Int, Str> \{ r := Result.Ok(1)  return r }\n" + inMain("echo f()")) == 0
+	assert problemCount("func half(n: Int): Result<Int, Str> \{ return Result.Ok(n / 2) }\n" + inMain("a := Result.Ok(2)  echo half(4) == a")) == 0
+	assert problemCount(inMain("mut r := Result.Ok(1)  r = Result.Error(\"no\")  echo r")) == 0
+	// What was known first stays, so a use that disagrees is a type error.
+	assert opens(problem(takes + inMain("x := Result.Ok(3)  show(x)")), "in `main`: the argument `r` of `show` wants Result<Str, Str> and this is Result<Int, Str>")
+}
+
+test "a Result built on the spot with nothing to say its other half is refused" {
+	assert opens(problem(inMain("r := Result.Ok(3)  if r is Result.Ok(n) \{ echo n }")),
+		"in `main`: `Result.Ok` says what an `Ok` holds and nothing about an `Error`, so `r` has to be told the rest: by a declaration that writes the whole type (`Result<Int, Str> r = Result.Ok(...)`)")
+	assert opens(problem(inMain("mut r := Result.Error(\"no\")  echo r")),
+		"in `main`: `Result.Error` says what an `Error` holds and nothing about an `Ok`")
+	// A payload already found wrong is not reported a second time.
+	assert problemCount(inMain("r := Result.Ok(nowhere)")) == 1
 }
 
 proc ending(params: Str, chain: Str): Str {
@@ -672,6 +692,24 @@ test "an empty map takes its type from its first use, and keeps it" {
 	assert opens(problem(inMain("m := hive.map.new()  echo hive.map.has(m, \"a\")")), "in `main`: `hive.map.new()` has to land somewhere that says what it holds")
 }
 
+test "set and delete follow append's rule: only a mut map is written" {
+	got := problem(inMain("hive.map.Map<Str, Int> m = hive.map.new()  hive.map.set(m, \"a\", 1)"))
+	assert got == "in `main`: `hive.map.set` changes a map in place, so the map it is handed has to be `mut` — this one is not"
+	assert opens(problem(inMain("hive.map.Map<Str, Int> m = hive.map.new()  hive.map.delete(m, \"a\")")), "in `main`: `hive.map.delete` changes a map in place")
+	assert opens(problem(inMain("hive.map.Map<Str, Int> m = hive.map.new()  hive.map.set(key: \"a\", value: 1, m: m)")), "in `main`: `hive.map.set` changes a map in place")
+	// A `func`'s parameter is the caller's map seen through an immutable name, and
+	// so is a field of one: a write through either would reach the caller.
+	books := "type Books \{ teds: hive.map.Map<Int, Int> }\n"
+	assert opens(problem(books + "func count(books: Books): Int \{ hive.map.set(books.teds, 1, 3)  return len(books.teds) }\n" + inMain("echo count(Books(hive.map.new()))")),
+		"in `count`: `hive.map.set` changes a map in place")
+	assert opens(problem("func emptied(m: hive.map.Map<Str, Int>): Int \{ hive.map.delete(m, \"a\")  return len(m) }\n" + inMain("echo emptied(hive.map.new())")),
+		"in `emptied`: `hive.map.delete` changes a map in place")
+	// A `mut` parameter, a field of one, and a `mut` copy taken inside a `func` are
+	// all storage the call may write.
+	assert problemCount(books + "proc fill(books: mut Books): void \{ hive.map.set(books.teds, 1, 3)  hive.map.delete(books.teds, 2) }\n" + inMain("mut b := Books(hive.map.new())  fill(b)")) == 0
+	assert problemCount(books + "func count(books: Books): Int \{ mut teds := books.teds  hive.map.set(teds, 1, 3)  return len(teds) }\n" + inMain("echo count(Books(hive.map.new()))")) == 0
+}
+
 // --- Operators ---------------------------------------------------------------
 
 test "Hive never widens a number behind your back" {
@@ -1018,7 +1056,7 @@ test "the names it does have are left alone" {
 	assert problemCount(inMain("hive.task.sleep(1)")) == 0
 	assert problemCount(inMain("echo hive.conv.its(1)")) == 0
 	assert problemCount(inMain("echo hive.crypto.jwtDecode(\"t\")")) == 0
-	assert problemCount(inMain("hive.map.Map<Str, Int> m = hive.map.new()  hive.map.set(m, \"a\", 1)")) == 0
+	assert problemCount(inMain("mut hive.map.Map<Str, Int> m = hive.map.new()  hive.map.set(m, \"a\", 1)")) == 0
 }
 
 test "hive.syslink.setKey takes the key as a Secret and answers with nothing" {
@@ -1505,10 +1543,13 @@ test "a generic copy at a Secret is held to the same rule" {
 	assert len(expandedProblems(keep + inMain("echo reveal(keep(1)) + 1  echo reveal(keep(\"a\")) + \"b\""))) == 0
 }
 
-test "a Secret has no JSON" {
+test "a Secret is read from a document but never written to one" {
 	login := "type Login \{ user: Str  password: Secret<Str> }\n"
-	assert problem(login + inMain("echo encode(Login(\"ada\", bypass(\"pw\")), hive.json.codec())")) == "in `main`: `encode` cannot carry Login: a `Secret` has no JSON, because only `reveal` opens one"
-	assert opens(problem(login + inMain("if Login.decode(\"x\", hive.json.codec()) is Result.Ok(l) \{ echo l.user }")), "in `main`: `Login.decode` cannot carry Login")
+	assert problem(login + inMain("echo encode(Login(\"ada\", bypass(\"pw\")), hive.json.codec())")) == "in `main`: `encode` cannot carry Login: a `Secret` is never written out, because only `reveal` opens one"
+	assert problemCount(login + inMain("if Login.decode(\"x\", hive.json.codec()) is Result.Ok(l) \{ echo l.user }")) == 0
+	card := "type Card \{ last4: Str  pin: Secret<Int>  backup: Secret<Str[dyn]> }\n"
+	assert problemCount(card + inMain("if Card.decode(\"x\", hive.json.codec()) is Result.Ok(c) \{ echo c.last4 }")) == 0
+	assert opens(problem(card + inMain("if Card.decode(\"x\", hive.json.codec()) is Result.Ok(c) \{ echo encode(c, hive.json.codec()) }")), "in `main`: `encode` cannot carry Card")
 }
 
 test "hide answers a Secret or why it could not lock one" {

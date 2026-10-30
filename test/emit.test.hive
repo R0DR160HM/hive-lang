@@ -588,9 +588,28 @@ test "what a query declared its rows to be decides how it is run" {
 	assert has(got, "hive.SqlExec(")
 	assert has(got, "hive.SqlQuery(")
 	assert has(got, "hive.SqlDatabaseDriver\{Name: \"sqlite\"}")
-	// One mapper per row type, and it checks the shape it was given.
+	// One mapper per row type, and beside it the fields it reads: their columns
+	// are found by name, wherever the SELECT happened to put them.
 	assert has(got, "func sqlRow_User(_r []string) (User, error) \{")
-	assert has(got, "hive.SqlShapeError(1, len(_r))")
+	assert has(got, "var sqlFields_User = []string\{\"id\"}")
+	assert has(got, "sqlFields_User, sqlRow_User)")
+}
+
+test "a row type's columns are found by its field names, in the order it reads them" {
+	rows := "type Entry \{ id: Int\n account: Int\n memo: Str }\nquery entries(): Entry[dyn] \{ SELECT account, memo, id FROM entries }\n"
+	got := go(rows + "proc main(): void \{ db := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"x.db\")  if db is Result.Ok(open) \{ echo hive.sql.run(open, entries()) } }")
+	// Declaration order, not the order the query wrote them in.
+	assert has(got, "var sqlFields_Entry = []string\{\"id\", \"account\", \"memo\"}")
+	assert has(got, "hive.SqlCellInt(_r[0], \"id\")")
+	assert has(got, "hive.SqlCellInt(_r[1], \"account\")")
+	assert has(got, "hive.SqlCellStr(_r[2], \"memo\")")
+}
+
+test "a single column has no name to match, and no fields to find" {
+	one := "query names(): Str[dyn] \{ SELECT memo FROM entries }\n"
+	got := go(one + "proc main(): void \{ db := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"x.db\")  if db is Result.Ok(open) \{ echo hive.sql.run(open, names()) } }")
+	assert has(got, ", nil, func(_r []string) (string, error) \{ return hive.SqlCellStr(_r[0], \"1\") })")
+	assert has(got, "sqlFields_") == false
 }
 
 // --- JSON --------------------------------------------------------------------
@@ -693,9 +712,25 @@ test "secrets compare what they hold, wherever they sit" {
 	assert has(got, "Password hive.Secret")
 }
 
+test "a Secret is decoded the way bypass keeps one, and nothing encodes it" {
+	got := go("type Login \{ user: Str  password: Secret<Str>  pin: Secret<Int> }\nproc main(): void \{ if Login.decode(\"x\", hive.json.codec()) is Result.Ok(l) \{ echo l.user } }")
+	assert has(got, "return hive.Bypass(x), nil")
+	assert has(got, "hive.BypassWith(x, hive.SecretPutInt)")
+	assert has(got, "hive.JsonSecretError(e, v)")
+	assert has(got, "func jsonDecode_Login(")
+	// Decoded and never encoded, so there is no encoder to refuse the `Secret`.
+	assert has(got, "func jsonEncode_Login(") == false
+}
+
+test "a type both decoded and encoded gets one decoder" {
+	got := go("type Entry \{ memo: Str }\nproc main(): void \{ if Entry.decode(\"x\", hive.json.codec()) is Result.Ok(e) \{ echo encode(e, hive.json.codec()) } }")
+	assert len(split(got, "func jsonDecode_Entry(")) == 2
+	assert has(got, "func jsonEncode_Entry(")
+}
+
 test "a message carrying a Secret is refused where its codec is derived" {
 	got := go("type Msg \{ Key \{ key: Secret<Str> } }\nproc inbox(state: mut Int, m: Msg): Msg \{ return m }\nproc main(): void \{ if spawn(inbox, 0) is Result.Ok(a) \{ a(Msg.Key(bypass(\"k\"))) } }")
-	assert got == "emit: a `Secret` has no JSON, because only `reveal` opens one"
+	assert got == "emit: a `Secret` is never written out, because only `reveal` opens one"
 }
 
 test "a message carrying a Table is refused where its codec is derived" {

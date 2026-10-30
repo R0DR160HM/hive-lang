@@ -2118,7 +2118,7 @@ proc running(em: mut Emit, env: infer.Env, args: ast.Arg[]): Str {
 		if types.isTable(rows) {
 			return "hive.SqlTable(" + connection + ", " + fragment + ")"
 		}
-		return "hive.SqlRows(" + connection + ", " + fragment + ", " + rowMapper(em, rows) + ")"
+		return "hive.SqlRows(" + connection + ", " + fragment + ", " + rowReader(em, rows) + ")"
 	}
 	fail(em, "`hive.sql.run` runs a `hive.sql.Fragment`, and this is " + types.show(held))
 	return "nil"
@@ -2348,9 +2348,11 @@ proc binary(em: mut Emit, env: infer.Env, op: ast.BinOp, left: ast.Expr, right: 
 		return mixedComparison(op, expr(em, env, left, leftType), expr(em, env, right, rightType))
 	}
 	// An atom coerces to `Str` beside one, as its decimal value rather than its
-	// name — so `"0" + #Nil` is `"00"` and not `"0Nil"`.
-	l := coerced(em, env, left, leftType, rightType)
-	r := coerced(em, env, right, rightType, leftType)
+	// name — so `"0" + #Nil` is `"00"` and not `"0Nil"`. A `Result` built on the
+	// spot is told the half it cannot say by the other side, so both are one Go
+	// type and `half(4) == Result.Ok(2)` compares what they hold.
+	l := coerced(em, env, left, types.filledIn(leftType, rightType), rightType)
+	r := coerced(em, env, right, types.filledIn(rightType, leftType), leftType)
 
 	if op is ast.BinOp.And {
 		// `v bounds i` desugars into this shape, and two in one condition would
@@ -4421,18 +4423,20 @@ proc predicateArgs(em: mut Emit, env: infer.Env, body: ast.SqlPart[]): Str {
 
 // --- Reading rows ------------------------------------------------------------
 
-// The mapper that turns one row of cells into what a query declared its rows
-// to be: a generated one per row type, or a one-cell reader for a single
-// column.
-proc rowMapper(em: mut Emit, rows: types.Ty): Str {
+// How a row is read, as the two arguments `hive.SqlRows` takes after the query:
+// the fields whose columns it finds by name, and the mapper that turns those
+// cells, in that order, into what the query declared its rows to be. A row type
+// has a generated mapper and the list of the fields it reads; a single column
+// has no name to be found by, so it has no list and a one-cell reader.
+proc rowReader(em: mut Emit, rows: types.Ty): Str {
 	element := types.elementOf(rows)
 	if element is types.Ty.TNamed(name) {
 		if types.findType(em.table, name) is Result.Ok(_) {
 			needRow(em, name)
-			return rowName(name)
+			return rowFieldsName(name) + ", " + rowName(name)
 		}
 	}
-	return "func(_r []string) (" + goType(element) + ", error) \{ if len(_r) != 1 \{ var _z " + goType(element) + "; return _z, hive.SqlShapeError(1, len(_r)) }; return " + cellConvert(element, "_r[0]", quoted("1")) + " }"
+	return "nil, func(_r []string) (" + goType(element) + ", error) \{ return " + cellConvert(element, "_r[0]", quoted("1")) + " }"
 }
 
 func cellConvert(ty: types.Ty, cell: Str, column: Str): Str {
@@ -4452,13 +4456,18 @@ func rowName(name: Str): Str {
 	return "sqlRow_" + goIdent(name)
 }
 
+func rowFieldsName(name: Str): Str {
+	return "sqlFields_" + goIdent(name)
+}
+
 proc needRow(em: mut Emit, name: Str): void {
 	if indexOf(em.rows, name) is Result.Error(_) {
 		append(em.rows, name)
 	}
 }
 
-// One mapper per row type a typed query reads.
+// One mapper per row type a typed query reads, and beside it the fields it reads
+// in the order it reads them, written by the one loop so the two cannot disagree.
 proc emitRows(em: mut Emit): void {
 	mut done := 0
 	for ; done < len(em.rows); {
@@ -4474,12 +4483,12 @@ proc emitRow(em: mut Emit, name: Str): void {
 	if types.findType(em.table, name) is Result.Ok(info) {
 		fields := info.shared
 		blank(em)
+		// The cells arrive in field order, one per field: `hive.SqlRows` has
+		// already found each field's column by name, or refused the query.
 		open(em, "func " + rowName(name) + "(_r []string) (" + goIdent(name) + ", error) \{")
-		open(em, "if len(_r) != {len(fields)} \{")
-		line(em, "return " + goIdent(name) + "\{}, hive.SqlShapeError({len(fields)}, len(_r))")
-		close(em, "}")
 		mut i := 0
 		mut Str[dyn] inits = []
+		mut Str[dyn] names = []
 		for each f in fields {
 			ty := types.resolve(em.table, f.declared)
 			line(em, "f{i}, err{i} := " + cellConvert(ty, "_r[{i}]", quoted(f.name)))
@@ -4487,10 +4496,13 @@ proc emitRow(em: mut Emit, name: Str): void {
 			line(em, "return " + goIdent(name) + "\{}, err{i}")
 			close(em, "}")
 			append(inits, goField(f.name) + ": f{i}")
+			append(names, quoted(f.name))
 			i = i + 1
 		}
 		line(em, "return " + goIdent(name) + "\{" + join(inits, ", ") + "}, nil")
 		close(em, "}")
+		blank(em)
+		line(em, "var " + rowFieldsName(name) + " = []string\{" + join(names, ", ") + "}")
 	}
 }
 
@@ -4511,6 +4523,28 @@ proc needCodec(em: mut Emit, name: Str): void {
 	}
 }
 
+// Ask for a type's decoder alone — what `T.decode` and a field being decoded
+// need. A type that is decoded and never encoded gets no encoder, which is what
+// lets one holding a `Secret` be read: writing one out is still refused, by the
+// encoder that is now never asked for.
+proc needDecoder(em: mut Emit, name: Str): void {
+	if indexOf(em.codecs, name) is Result.Error(_) {
+		needCodec(em, "decode:" + name)
+	}
+}
+
+// Whether a request before `at` has already written `name`'s decoder: the full
+// codec writes one, and so does a request for the decoder alone. The worklist is
+// written in order, so whatever came first is what wrote it.
+func decoderWritten(codecs: Str[], name: Str, at: Int): Bool {
+	for each wanted in [name, "decode:" + name] {
+		if indexOf(codecs, wanted) is Result.Ok(i) && i < at {
+			return true
+		}
+	}
+	return false
+}
+
 // Write every codec that was asked for, and every one those asked for in turn.
 proc emitCodecs(em: mut Emit): void {
 	emitCodecsFrom(em, 0)
@@ -4524,15 +4558,30 @@ proc emitCodecsFrom(em: mut Emit, from: Int): void {
 		at := done
 		done = done + 1
 		if em.codecs bounds at {
-			emitCodec(em, em.codecs[at])
+			emitCodec(em, em.codecs[at], at)
 		}
 	}
 }
 
 // A request is either a type's name, or a type and one of its variants joined by
 // a dot — the second being what `T.Variant.decode` asks for. A variant needs a
-// decoder alone: it is read into the union its type already encodes.
-proc emitCodec(em: mut Emit, name: Str): void {
+// decoder alone: it is read into the union its type already encodes. `decode:`
+// asks for a type's decoder and nothing else, and `at` is where the request sits
+// in the worklist, which says whether an earlier one already wrote that decoder.
+proc emitCodec(em: mut Emit, name: Str, at: Int): void {
+	if text.startsWith(name, "decode:") {
+		typeName := text.span(text.chars(name), 7, len(name) - 1)
+		if decoderWritten(em.codecs, typeName, at) == false {
+			if types.findType(em.table, typeName) is Result.Ok(info) {
+				if stdlib.isJsonValue(typeName) {
+					emitJsonValueDecoder(em, typeName)
+				} else {
+					emitDecoder(em, typeName, info)
+				}
+			}
+		}
+		return
+	}
 	if text.startsWith(name, "secret:") {
 		typeName := text.span(text.chars(name), 7, len(name) - 1)
 		if types.findType(em.table, typeName) is Result.Ok(info) {
@@ -4549,23 +4598,28 @@ proc emitCodec(em: mut Emit, name: Str): void {
 			return
 		}
 	}
-	at := dotAt(name)
-	if at >= 0 {
+	dot := dotAt(name)
+	if dot >= 0 {
 		cs := text.chars(name)
-		typeName := text.span(cs, 0, at - 1)
-		variant := text.span(cs, at + 1, len(cs) - 1)
+		typeName := text.span(cs, 0, dot - 1)
+		variant := text.span(cs, dot + 1, len(cs) - 1)
 		if types.findType(em.table, typeName) is Result.Ok(_) {
 			emitVariantDecoder(em, typeName, variant)
 		}
 		return
 	}
 	if types.findType(em.table, name) is Result.Ok(info) {
+		decoded := decoderWritten(em.codecs, name, at)
 		if stdlib.isJsonValue(name) {
-			emitJsonValueDecoder(em, name)
+			if decoded == false {
+				emitJsonValueDecoder(em, name)
+			}
 			emitJsonValueEncoder(em, name)
 			return
 		}
-		emitDecoder(em, name, info)
+		if decoded == false {
+			emitDecoder(em, name, info)
+		}
 		emitEncoder(em, name, info)
 	}
 }
@@ -4820,13 +4874,25 @@ proc decoderRef(em: mut Emit, ty: types.Ty): Str {
 		fail(em, stdlib.tableHasNoJson())
 		return "hive.JsonStr"
 	}
-	if ty is types.Ty.TSecret(_) {
-		fail(em, stdlib.secretHasNoJson())
-		return "hive.JsonStr"
+	// A `Secret` arrives as what it holds, and is kept the way `bypass` keeps one:
+	// the document was ordinary text before it got here, so locking it now would
+	// promise more than it can. Writing one out is still refused, by the encoder.
+	// A value of the wrong kind says what kind it was and never what it said, since
+	// that is the part meant to be secret.
+	if ty is types.Ty.TSecret(held) {
+		inner := decoderRef(em, held)
+		mut kept := "hive.Bypass(x)"
+		if held is types.Ty.TStr {
+			// `Bypass` keeps text as it is.
+		} else {
+			useModule(em, "secretvalue")
+			kept = "hive.BypassWith(x, " + secretPutter(em, held) + ")"
+		}
+		return "func(v hive.JsonValue, p string) (" + goType(ty) + ", *hive.JsonJsonError) \{ x, e := " + inner + "(v, p); if e != nil \{ var zero " + goType(ty) + "; return zero, hive.JsonSecretError(e, v) }; return " + kept + ", nil }"
 	}
 	if ty is types.Ty.TNamed(name) {
 		if types.findType(em.table, name) is Result.Ok(_) {
-			needCodec(em, name)
+			needDecoder(em, name)
 			return decoderName(name)
 		}
 	}
@@ -5452,12 +5518,14 @@ proc emitTestStmts(em: mut Emit, env: infer.Env, body: ast.Block): infer.Env {
 proc emitAssert(em: mut Emit, env: infer.Env, condition: ast.Expr): void {
 	if condition is ast.Expr.Binary(op, left, right) {
 		if op is ast.BinOp.Eq || op is ast.BinOp.Neq {
-			leftType := infer.typeOf(env, left)
+			// Both sides are written as the left side's type, with a half a `Result`
+			// built on the spot cannot say taken from the right.
+			compared := types.filledIn(infer.typeOf(env, left), infer.typeOf(env, right))
 			l := fresh(em, "l")
 			r := fresh(em, "r")
-			line(em, l + " := " + expr(em, env, left, leftType))
-			line(em, r + " := " + expr(em, env, right, leftType))
-			mut checked := equality(em, env, l, r, leftType)
+			line(em, l + " := " + expr(em, env, left, compared))
+			line(em, r + " := " + expr(em, env, right, compared))
+			mut checked := equality(em, env, l, r, compared)
 			if op is ast.BinOp.Neq {
 				checked = "!(" + checked + ")"
 			}
@@ -5471,12 +5539,12 @@ proc emitAssert(em: mut Emit, env: infer.Env, condition: ast.Expr): void {
 proc emitTestAssert(em: mut Emit, env: infer.Env, condition: ast.Expr): void {
 	if condition is ast.Expr.Binary(op, left, right) {
 		if op is ast.BinOp.Eq || op is ast.BinOp.Neq {
-			leftType := infer.typeOf(env, left)
+			compared := types.filledIn(infer.typeOf(env, left), infer.typeOf(env, right))
 			l := fresh(em, "l")
 			r := fresh(em, "r")
-			line(em, l + " := " + expr(em, env, left, leftType))
-			line(em, r + " := " + expr(em, env, right, leftType))
-			mut checked := equality(em, env, l, r, leftType)
+			line(em, l + " := " + expr(em, env, left, compared))
+			line(em, r + " := " + expr(em, env, right, compared))
+			mut checked := equality(em, env, l, r, compared)
 			if op is ast.BinOp.Neq {
 				checked = "!(" + checked + ")"
 			}

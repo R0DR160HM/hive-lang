@@ -204,7 +204,12 @@ Rules the compiler enforces:
 
 * **Columns match fields by name**, so reordering the `SELECT` cannot silently
   remap them. A column whose name differs from its field needs an alias
-  (`SELECT u.name AS author`). A row type holds scalars only.
+  (`SELECT u.name AS author`), and a name matches in any case — PostgreSQL
+  answers an unquoted `AS userId` as `userid` — though an exact spelling is
+  preferred where two differ only in case. Every column has to fill a field and
+  every field a column; the names are matched when the query runs, before any
+  row is read, and a mismatch is a `SqlError.Shape` naming the column or field.
+  A row type holds scalars only.
 * **A `Table` takes whatever comes back**, so it is the one result `SELECT *`
   fills: there are no fields for the columns to disagree with. Any other vector of
   vectors is a compile error.

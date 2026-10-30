@@ -530,11 +530,14 @@ proc checkDecodes(c: mut Check, env: infer.Env, what: Str, typeName: Str, args: 
 		format := stdlib.formatOfCodec(infer.typeOf(env, args[1].value))
 		checkNamesCodec(c, env, what, args[1].value)
 		checkFlatShape(c, what, types.Ty.TNamed(typeName), format)
-		checkJsonShape(c, what, types.Ty.TNamed(typeName), format)
+		checkJsonShape(c, what, types.Ty.TNamed(typeName), format, true)
 	}
 }
 
-proc checkJsonShape(c: mut Check, what: Str, ty: types.Ty, format: Str): void {
+// A `Secret` is only ever read: a document carrying one is ordinary text by the
+// time it arrives, so decoding keeps what it says the way `bypass` would, and
+// nothing about that can leak. Writing one out is the leak, so `encode` refuses.
+proc checkJsonShape(c: mut Check, what: Str, ty: types.Ty, format: Str, decoding: Bool): void {
 	if format != "json" && format != "jwt" {
 		return
 	}
@@ -545,7 +548,7 @@ proc checkJsonShape(c: mut Check, what: Str, ty: types.Ty, format: Str): void {
 		}
 		report(c, what + " cannot carry " + carried + ": " + stdlib.tableHasNoJson())
 	}
-	if types.holdsSecret(c.table, ty) {
+	if decoding == false && types.holdsSecret(c.table, ty) {
 		report(c, what + " cannot carry " + types.show(ty) + ": " + stdlib.secretHasNoJson())
 	}
 }
@@ -861,6 +864,10 @@ proc checkStmt(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
 		if isAtCall(value) && ty is types.Ty.TAddress(types.Ty.TUnknown) {
 			report(c, "`at` has to land somewhere that says what the service takes: a declaration (`Address<Op> counter = at(#Counter)`), a `return` whose callable declares an address, an argument to a parameter or field declared as one, or a later use of `{name}` that says it, such as a send: `{name}(Op.Ping())`. Nothing after this binding does")
 		}
+		// `Result.Ok(v)` says one half of what it is, and the other has to be said.
+		if infer.isResultLiteral(value) {
+			checkResultHalves(c, name, ty)
+		}
 		checkHoldsValue(c, name, ty, deferred)
 		declareName(c, name)
 		if mutable {
@@ -960,6 +967,28 @@ func wildcards(n: Int): Str {
 		append(out, "_")
 	}
 	return join(out, ", ")
+}
+
+// `r := Result.Ok(3)` still missing a half. A later use that said it would have
+// pinned the binding before the check ran, so nothing in the program says it. A
+// payload whose own type is unknown leaves both halves so, and has been reported.
+proc checkResultHalves(c: mut Check, name: Str, ty: types.Ty): void {
+	if ty is types.Ty.TResult(ok, bad) {
+		mut said := "Ok"
+		mut unsaid := "Error"
+		mut example := types.Ty.TResult(ok, types.Ty.TStr())
+		if ok is types.Ty.TUnknown {
+			if bad is types.Ty.TUnknown {
+				return
+			}
+			said = "Error"
+			unsaid = "Ok"
+			example = types.Ty.TResult(types.Ty.TInt(), bad)
+		} else if (bad is types.Ty.TUnknown) == false {
+			return
+		}
+		report(c, "`Result.{said}` says what an `{said}` holds and nothing about an `{unsaid}`, so `{name}` has to be told the rest: by a declaration that writes the whole type (`" + types.show(example) + " {name} = Result.{said}(...)`), or by a later use of `{name}` that says it — handing it to a parameter or field declared as a `Result`, returning it, or comparing it with one. Nothing after this binding does")
+	}
 }
 
 // A call that answers with nothing leaves a name nothing to hold.
@@ -1955,6 +1984,16 @@ proc checkLibraryArguments(c: mut Check, env: infer.Env, module: Str, name: Str,
 			fits(c, mailbox, typeOfArg(c, env, args, 2), "the notice `hive.syslink.monitor` posts to the watcher")
 		}
 	}
+	// `set` and `delete` write into the map they are handed, so they follow
+	// `append`'s rule: the map is a `mut` variable or a path into one. Anything
+	// else would be storage some immutable name still observes — a `func`'s
+	// parameter among them, through which the write would reach the caller.
+	if module == "map" && (name == "set" || name == "delete") && args bounds 0 {
+		root := rootName(args[0].value)
+		if root == "" || isMutable(c.mutable, root) == false {
+			report(c, "`hive.map.{name}` changes a map in place, so the map it is handed has to be `mut` — this one is not")
+		}
+	}
 	if module == "map" && infer.typeOf(env, ast.argFor(args, "", 0)) is types.Ty.TMap(key, value) {
 		if (name == "set" || name == "get" || name == "has" || name == "delete") && args bounds 1 {
 			fitsValue(c, env, key, args[1].value, "the key `hive.map.{name}` is handed")
@@ -2364,7 +2403,7 @@ proc checkBuiltinCall(c: mut Check, env: infer.Env, name: Str, written: ast.Arg[
 				format := stdlib.formatOfCodec(infer.typeOf(env, args[1].value))
 				checkNamesCodec(c, env, "`encode`", args[1].value)
 				checkFlatShape(c, "`encode`", typeOfArg(c, env, args, 0), format)
-				checkJsonShape(c, "`encode`", typeOfArg(c, env, args, 0), format)
+				checkJsonShape(c, "`encode`", typeOfArg(c, env, args, 0), format, false)
 			}
 		}
 	}

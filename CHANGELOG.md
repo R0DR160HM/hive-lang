@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.3.1
+
+### Language
+
+* **A `Result` literal takes its other half from where it is used**: `half(4) == Result.Ok(2)` compares two `Result<Int, Str>`s, either side round, in `assert` and out of it. `x := Result.Ok(...)` takes the error type from the first later use that says it, as `at` does, and is a compile error when nothing does.
+* **A generic parameter reads its variables off a generic type's arguments**: `count(b: Box<T>)` handed a `Box<Int>` is `count_Int`, nested and across modules alike. A constructor is aimed by a declared type or a declared return type, so `Page([], 1)` builds the `Page<Entry>` it is declared as, and a partial application whose holes leave a type variable unfixed is a compile error.
+* **`hive.map.set` and `delete` need a `mut` map**, as `append` needs a `mut` vector: a `func` could write its parameter's map, and the caller's map saw half of the write.
+* **A `Secret` is read from a document**: `T.decode` reads a `Secret<U>` field as the `U` it holds and keeps it the way `bypass` does. Writing one out — `encode`, a message — is still refused.
+
+### Standard library
+
+* **`hive.sql` matches a row's columns to its fields by name**, in any case, as the spec always said; the columns were read by position, so a reordered `SELECT` swapped two fields of one type in silence. A column that fills no field, or a field no column fills, is a `SqlError.Shape` naming it — even when no row comes back.
+
+### Tooling
+
+* **Two compilers reading imported Go files at once no longer read each other's**: each copies its file under a name of its own, and the reader tool is written atomically.
+
+### Breaking
+
+| was | is |
+| --- | --- |
+| `hive.map.set(m, …)` on a name that is not `mut` | declare it `mut` |
+| `x := Result.Ok(v)` with nothing saying the error type | `Result<T, E> x = Result.Ok(v)`, or a use that says it |
+| a `SELECT` whose column names are not the row's fields | an `AS` alias naming the field |
+
 ## v0.3.0
 
 ### Language
