@@ -10,288 +10,288 @@ import ./token
 import ./types
 
 type Pat {
-	// The name is what a later `name is ...` in the same condition narrows.
-	Any { name: Str }
-	Variant { head: Str, name: Str, args: Pat[dyn] }
-	Truth { value: Bool }
-	Vec { elements: Pat[dyn], open: Bool }
-	Literal { key: Str }
-	// Refutable, over values no finite set of patterns covers.
-	Opaque
+    // The name is what a later `name is ...` in the same condition narrows.
+    Any { name: Str }
+    Variant { head: Str, name: Str, args: Pat[dyn] }
+    Truth { value: Bool }
+    Vec { elements: Pat[dyn], open: Bool }
+    Literal { key: Str }
+    // Refutable, over values no finite set of patterns covers.
+    Opaque
 }
 
 func covers(t: types.Table, branches: ast.Branch[]): Bool {
-	for each subject in subjectsOf(branches) {
-		if gap(t, rowsFor(t, branches, subject), 1) is Result.Error(_) {
-			return true
-		}
-	}
-	return false
+    for each subject in subjectsOf(branches) {
+        if gap(t, rowsFor(t, branches, subject), 1) is Result.Error(_) {
+            return true
+        }
+    }
+    return false
 }
 
 // "`subject` when it is `value`" for a value of the first subject no branch takes,
 // or `""` where there is no one value to name.
 func missed(t: types.Table, branches: ast.Branch[]): Str {
-	for each subject in subjectsOf(branches) {
-		if gap(t, rowsFor(t, branches, subject), 1) is Result.Ok(values) {
-			value := shownAll(values)
-			if value == "_" {
-				return ""
-			}
-			return "`{subject}` when it is `{value}`"
-		}
-		return ""
-	}
-	return ""
+    for each subject in subjectsOf(branches) {
+        if gap(t, rowsFor(t, branches, subject), 1) is Result.Ok(values) {
+            value := shownAll(values)
+            if value == "_" {
+                return ""
+            }
+            return "`{subject}` when it is `{value}`"
+        }
+        return ""
+    }
+    return ""
 }
 
 // --- Rows --------------------------------------------------------------------
 
 func subjectsOf(branches: ast.Branch[]): Str[dyn] {
-	mut Str[dyn] out = []
-	for each b in branches {
-		if opening(b.condition) is ast.Expr.IsMatch(matched, _) {
-			subject := pathOf(matched)
-			if subject != "" && indexOf(out, subject) is Result.Error(_) {
-				append(out, subject)
-			}
-		}
-	}
-	return out
+    mut Str[dyn] out = []
+    for each b in branches {
+        if opening(b.condition) is ast.Expr.IsMatch(matched, _) {
+            subject := pathOf(matched)
+            if subject != "" && indexOf(out, subject) is Result.Error(_) {
+                append(out, subject)
+            }
+        }
+    }
+    return out
 }
 
 func opening(e: ast.Expr): ast.Expr {
-	if e is ast.Expr.Binary(op, left, _) {
-		if op is ast.BinOp.And {
-			return opening(left)
-		}
-	}
-	return e
+    if e is ast.Expr.Binary(op, left, _) {
+        if op is ast.BinOp.And {
+            return opening(left)
+        }
+    }
+    return e
 }
 
 // A call is never a subject: it may answer differently each time it is made.
 func pathOf(e: ast.Expr): Str {
-	if e is ast.Expr.Ident(name) {
-		return name
-	}
-	if e is ast.Expr.Member(subject, field) {
-		return extended(pathOf(subject), "." + field)
-	}
-	if e is ast.Expr.Index(subject, index) {
-		if index is ast.Expr.IntLit(n) {
-			return extended(pathOf(subject), "[{n}]")
-		}
-		inner := pathOf(index)
-		if inner != "" {
-			return extended(pathOf(subject), "[{inner}]")
-		}
-	}
-	return ""
+    if e is ast.Expr.Ident(name) {
+        return name
+    }
+    if e is ast.Expr.Member(subject, field) {
+        return extended(pathOf(subject), "." + field)
+    }
+    if e is ast.Expr.Index(subject, index) {
+        if index is ast.Expr.IntLit(n) {
+            return extended(pathOf(subject), "[{n}]")
+        }
+        inner := pathOf(index)
+        if inner != "" {
+            return extended(pathOf(subject), "[{inner}]")
+        }
+    }
+    return ""
 }
 
 func extended(base: Str, more: Str): Str {
-	if base == "" {
-		return ""
-	}
-	return base + more
+    if base == "" {
+        return ""
+    }
+    return base + more
 }
 
 func conjuncts(e: ast.Expr): ast.Expr[dyn] {
-	if e is ast.Expr.Binary(op, left, right) {
-		if op is ast.BinOp.And {
-			return conjuncts(left) + conjuncts(right)
-		}
-	}
-	return [e]
+    if e is ast.Expr.Binary(op, left, right) {
+        if op is ast.BinOp.And {
+            return conjuncts(left) + conjuncts(right)
+        }
+    }
+    return [e]
 }
 
 func rowsFor(t: types.Table, branches: ast.Branch[], subject: Str): Pat[dyn][dyn] {
-	mut Pat[dyn][dyn] out = []
-	for each b in branches {
-		if rowOf(t, b.condition, subject) is Result.Ok(p) {
-			append(out, [p])
-		}
-	}
-	return out
+    mut Pat[dyn][dyn] out = []
+    for each b in branches {
+        if rowOf(t, b.condition, subject) is Result.Ok(p) {
+            append(out, [p])
+        }
+    }
+    return out
 }
 
 // A branch counts only where its whole condition is its pattern, the tests on the
 // pattern's own bindings included: anything else takes part of what it matches.
 func rowOf(t: types.Table, condition: ast.Expr, subject: Str): Result<Pat, Bool> {
-	mut Pat tree = Pat.Opaque()
-	mut first := true
-	for each c in conjuncts(condition) {
-		if first {
-			first = false
-			if c is ast.Expr.IsMatch(matched, pattern) && pathOf(matched) == subject {
-				tree = patOf(t, pattern)
-			} else {
-				return Result.Error(false)
-			}
-		} else if narrowed(t, tree, c) is Result.Ok(next) {
-			tree = next
-		} else {
-			return Result.Error(false)
-		}
-	}
-	return Result.Ok(tree)
+    mut Pat tree = Pat.Opaque()
+    mut first := true
+    for each c in conjuncts(condition) {
+        if first {
+            first = false
+            if c is ast.Expr.IsMatch(matched, pattern) && pathOf(matched) == subject {
+                tree = patOf(t, pattern)
+            } else {
+                return Result.Error(false)
+            }
+        } else if narrowed(t, tree, c) is Result.Ok(next) {
+            tree = next
+        } else {
+            return Result.Error(false)
+        }
+    }
+    return Result.Ok(tree)
 }
 
 func narrowed(t: types.Table, tree: Pat, c: ast.Expr): Result<Pat, Bool> {
-	if c is ast.Expr.IsMatch(target, pattern) {
-		if target is ast.Expr.Ident(name) && anyCount(tree, name) == 1 {
-			return Result.Ok(refine(tree, name, patOf(t, pattern)))
-		}
-	}
-	if c is ast.Expr.Binary(op, left, right) {
-		if op is ast.BinOp.Eq {
-			if left is ast.Expr.Ident(name) && anyCount(tree, name) == 1 {
-				return Result.Ok(refine(tree, name, literalPat(right)))
-			}
-		}
-	}
-	return Result.Error(false)
+    if c is ast.Expr.IsMatch(target, pattern) {
+        if target is ast.Expr.Ident(name) && anyCount(tree, name) == 1 {
+            return Result.Ok(refine(tree, name, patOf(t, pattern)))
+        }
+    }
+    if c is ast.Expr.Binary(op, left, right) {
+        if op is ast.BinOp.Eq {
+            if left is ast.Expr.Ident(name) && anyCount(tree, name) == 1 {
+                return Result.Ok(refine(tree, name, literalPat(right)))
+            }
+        }
+    }
+    return Result.Error(false)
 }
 
 func patOf(t: types.Table, p: ast.Pattern): Pat {
-	if p is ast.Pattern.Constructor(path, bindings, parenthesised) {
-		head := nth(path, 0)
-		variant := nth(path, 1)
-		arity := arityOf(t, head, variant)
-		if arity < 0 || len(path) != 2 {
-			return Pat.Opaque()
-		}
-		if parenthesised == false {
-			return Pat.Variant(head, variant, anys(arity))
-		}
-		if len(bindings) != arity {
-			return Pat.Opaque()
-		}
-		mut Pat[dyn] args = []
-		for each b in bindings {
-			append(args, Pat.Any(b))
-		}
-		return Pat.Variant(head, variant, args)
-	}
-	if p is ast.Pattern.VectorPat(elements, rest) {
-		mut Pat[dyn] out = []
-		for each element in elements {
-			if element is ast.VecElem.Bind(name) {
-				append(out, Pat.Any(name))
-			} else if element is ast.VecElem.Match(value) {
-				append(out, literalPat(value))
-			}
-		}
-		return Pat.Vec(out, rest != "")
-	}
-	// One open hole takes every string, the empty one included.
-	if p is ast.Pattern.StrTemplate(parts) {
-		if len(parts) == 1 {
-			for each part in parts {
-				if part is token.StrPart.Code(source) {
-					return Pat.Any(text.trim(source))
-				}
-				if part is token.StrPart.Literal(written) {
-					return Pat.Literal("\"{written}\"")
-				}
-			}
-		}
-	}
-	return Pat.Opaque()
+    if p is ast.Pattern.Constructor(path, bindings, parenthesised) {
+        head := nth(path, 0)
+        variant := nth(path, 1)
+        arity := arityOf(t, head, variant)
+        if arity < 0 || len(path) != 2 {
+            return Pat.Opaque()
+        }
+        if parenthesised == false {
+            return Pat.Variant(head, variant, anys(arity))
+        }
+        if len(bindings) != arity {
+            return Pat.Opaque()
+        }
+        mut Pat[dyn] args = []
+        for each b in bindings {
+            append(args, Pat.Any(b))
+        }
+        return Pat.Variant(head, variant, args)
+    }
+    if p is ast.Pattern.VectorPat(elements, rest) {
+        mut Pat[dyn] out = []
+        for each element in elements {
+            if element is ast.VecElem.Bind(name) {
+                append(out, Pat.Any(name))
+            } else if element is ast.VecElem.Match(value) {
+                append(out, literalPat(value))
+            }
+        }
+        return Pat.Vec(out, rest != "")
+    }
+    // One open hole takes every string, the empty one included.
+    if p is ast.Pattern.StrTemplate(parts) {
+        if len(parts) == 1 {
+            for each part in parts {
+                if part is token.StrPart.Code(source) {
+                    return Pat.Any(text.trim(source))
+                }
+                if part is token.StrPart.Literal(written) {
+                    return Pat.Literal("\"{written}\"")
+                }
+            }
+        }
+    }
+    return Pat.Opaque()
 }
 
 func literalPat(e: ast.Expr): Pat {
-	if e is ast.Expr.BoolLit(value) {
-		return Pat.Truth(value)
-	}
-	key := literalKey(e)
-	if key != "" {
-		return Pat.Literal(key)
-	}
-	return Pat.Opaque()
+    if e is ast.Expr.BoolLit(value) {
+        return Pat.Truth(value)
+    }
+    key := literalKey(e)
+    if key != "" {
+        return Pat.Literal(key)
+    }
+    return Pat.Opaque()
 }
 
 func literalKey(e: ast.Expr): Str {
-	if e is ast.Expr.IntLit(n) {
-		return "{n}"
-	}
-	if e is ast.Expr.FloatLit(f) {
-		return "{f}"
-	}
-	if e is ast.Expr.StrLit(written) {
-		return "\"{written}\""
-	}
-	if e is ast.Expr.AtomLit(atom) {
-		return "#" + atom
-	}
-	if e is ast.Expr.Negate(operand) {
-		inner := literalKey(operand)
-		if inner != "" {
-			return "-" + inner
-		}
-	}
-	return ""
+    if e is ast.Expr.IntLit(n) {
+        return "{n}"
+    }
+    if e is ast.Expr.FloatLit(f) {
+        return "{f}"
+    }
+    if e is ast.Expr.StrLit(written) {
+        return "\"{written}\""
+    }
+    if e is ast.Expr.AtomLit(atom) {
+        return "#" + atom
+    }
+    if e is ast.Expr.Negate(operand) {
+        inner := literalKey(operand)
+        if inner != "" {
+            return "-" + inner
+        }
+    }
+    return ""
 }
 
 func arityOf(t: types.Table, head: Str, variant: Str): Int {
-	if head == "Result" {
-		if variant == "Ok" || variant == "Error" {
-			return 1
-		}
-		return -1
-	}
-	if types.findVariant(t, head, variant) is Result.Ok(fields) {
-		return len(fields)
-	}
-	return -1
+    if head == "Result" {
+        if variant == "Ok" || variant == "Error" {
+            return 1
+        }
+        return -1
+    }
+    if types.findVariant(t, head, variant) is Result.Ok(fields) {
+        return len(fields)
+    }
+    return -1
 }
 
 func variantsOf(t: types.Table, head: Str): Str[dyn] {
-	if head == "Result" {
-		return ["Ok", "Error"]
-	}
-	return types.variantNames(t, head)
+    if head == "Result" {
+        return ["Ok", "Error"]
+    }
+    return types.variantNames(t, head)
 }
 
 func anyCount(p: Pat, name: Str): Int {
-	if p is Pat.Any(bound) {
-		if bound == name && name != "_" {
-			return 1
-		}
-		return 0
-	}
-	mut n := 0
-	if p is Pat.Variant(_, _, args) {
-		for each a in args {
-			n = n + anyCount(a, name)
-		}
-	} else if p is Pat.Vec(elements, _) {
-		for each e in elements {
-			n = n + anyCount(e, name)
-		}
-	}
-	return n
+    if p is Pat.Any(bound) {
+        if bound == name && name != "_" {
+            return 1
+        }
+        return 0
+    }
+    mut n := 0
+    if p is Pat.Variant(_, _, args) {
+        for each a in args {
+            n = n + anyCount(a, name)
+        }
+    } else if p is Pat.Vec(elements, _) {
+        for each e in elements {
+            n = n + anyCount(e, name)
+        }
+    }
+    return n
 }
 
 func refine(p: Pat, name: Str, narrower: Pat): Pat {
-	if p is Pat.Any(bound) && bound == name {
-		return narrower
-	}
-	if p is Pat.Variant(head, variant, args) {
-		return Pat.Variant(head, variant, refineAll(args, name, narrower))
-	}
-	if p is Pat.Vec(elements, open) {
-		return Pat.Vec(refineAll(elements, name, narrower), open)
-	}
-	return p
+    if p is Pat.Any(bound) && bound == name {
+        return narrower
+    }
+    if p is Pat.Variant(head, variant, args) {
+        return Pat.Variant(head, variant, refineAll(args, name, narrower))
+    }
+    if p is Pat.Vec(elements, open) {
+        return Pat.Vec(refineAll(elements, name, narrower), open)
+    }
+    return p
 }
 
 func refineAll(ps: Pat[], name: Str, narrower: Pat): Pat[dyn] {
-	mut Pat[dyn] out = []
-	for each p in ps {
-		append(out, refine(p, name, narrower))
-	}
-	return out
+    mut Pat[dyn] out = []
+    for each p in ps {
+        append(out, refine(p, name, narrower))
+    }
+    return out
 }
 
 // --- Usefulness --------------------------------------------------------------
@@ -299,398 +299,398 @@ func refineAll(ps: Pat[], name: Str, narrower: Pat): Pat[dyn] {
 // A vector of values, one per column, that no row takes; `Error` when every one is
 // taken.
 func gap(t: types.Table, rows: Pat[dyn][dyn], width: Int): Result<Pat[dyn], Bool> {
-	return gapIn(t, rows, anys(width), width)
+    return gapIn(t, rows, anys(width), width)
 }
 
 // The same, among the values `space` takes. A row's `Opaque` takes nothing and the
 // space's takes anything, so neither answer can be wrong.
 func gapIn(t: types.Table, rows: Pat[dyn][dyn], space: Pat[], width: Int): Result<Pat[dyn], Bool> {
-	if len(rows) == 0 {
-		return Result.Ok(afterN(space, 0))
-	}
-	if width <= 0 {
-		return Result.Error(false)
-	}
-	first := firstOf(space)
-	rest := afterN(space, 1)
-	if first is Pat.Variant(head, variant, args) {
-		return variantIn(t, rows, width, head, variant, args, rest)
-	}
-	if first is Pat.Truth(_) || first is Pat.Literal(_) {
-		return valueIn(t, rows, width, first, rest)
-	}
-	column := firsts(rows)
-	longest := longestVec(column)
-	if first is Pat.Vec(elements, open) {
-		return vectorGap(t, rows, width, longest, elements, open, rest)
-	}
-	if longest >= 0 {
-		return vectorGap(t, rows, width, longest, anys(0), true, rest)
-	}
-	head := headOf(column)
-	if head != "" && len(variantsOf(t, head)) > 0 {
-		return variantGap(t, rows, width, head, column, rest)
-	}
-	if hasTruth(column) {
-		return truthGap(t, rows, width, column, rest)
-	}
-	return defaultGap(t, rows, width, Pat.Any("_"), rest)
+    if len(rows) == 0 {
+        return Result.Ok(afterN(space, 0))
+    }
+    if width <= 0 {
+        return Result.Error(false)
+    }
+    first := firstOf(space)
+    rest := afterN(space, 1)
+    if first is Pat.Variant(head, variant, args) {
+        return variantIn(t, rows, width, head, variant, args, rest)
+    }
+    if first is Pat.Truth(_) || first is Pat.Literal(_) {
+        return valueIn(t, rows, width, first, rest)
+    }
+    column := firsts(rows)
+    longest := longestVec(column)
+    if first is Pat.Vec(elements, open) {
+        return vectorGap(t, rows, width, longest, elements, open, rest)
+    }
+    if longest >= 0 {
+        return vectorGap(t, rows, width, longest, anys(0), true, rest)
+    }
+    head := headOf(column)
+    if head != "" && len(variantsOf(t, head)) > 0 {
+        return variantGap(t, rows, width, head, column, rest)
+    }
+    if hasTruth(column) {
+        return truthGap(t, rows, width, column, rest)
+    }
+    return defaultGap(t, rows, width, Pat.Any("_"), rest)
 }
 
 func defaultGap(t: types.Table, rows: Pat[dyn][dyn], width: Int, missing: Pat, rest: Pat[]): Result<Pat[dyn], Bool> {
-	mut Pat[dyn][dyn] taking = []
-	for each row in rows {
-		if firstOf(row) is Pat.Any(_) {
-			append(taking, afterN(row, 1))
-		}
-	}
-	if gapIn(t, taking, rest, width - 1) is Result.Ok(values) {
-		return Result.Ok([missing] + values)
-	}
-	return Result.Error(false)
+    mut Pat[dyn][dyn] taking = []
+    for each row in rows {
+        if firstOf(row) is Pat.Any(_) {
+            append(taking, afterN(row, 1))
+        }
+    }
+    if gapIn(t, taking, rest, width - 1) is Result.Ok(values) {
+        return Result.Ok([missing] + values)
+    }
+    return Result.Error(false)
 }
 
 func variantGap(t: types.Table, rows: Pat[dyn][dyn], width: Int, head: Str, column: Pat[], rest: Pat[]): Result<Pat[dyn], Bool> {
-	all := variantsOf(t, head)
-	for each v in all {
-		if hasVariant(column, head, v) == false {
-			return defaultGap(t, rows, width, Pat.Variant(head, v, anys(arityOf(t, head, v))), rest)
-		}
-	}
-	for each v in all {
-		if variantIn(t, rows, width, head, v, anys(arityOf(t, head, v)), rest) is Result.Ok(values) {
-			return Result.Ok(values)
-		}
-	}
-	return Result.Error(false)
+    all := variantsOf(t, head)
+    for each v in all {
+        if hasVariant(column, head, v) == false {
+            return defaultGap(t, rows, width, Pat.Variant(head, v, anys(arityOf(t, head, v))), rest)
+        }
+    }
+    for each v in all {
+        if variantIn(t, rows, width, head, v, anys(arityOf(t, head, v)), rest) is Result.Ok(values) {
+            return Result.Ok(values)
+        }
+    }
+    return Result.Error(false)
 }
 
 func variantIn(t: types.Table, rows: Pat[dyn][dyn], width: Int, head: Str, variant: Str, args: Pat[], rest: Pat[]): Result<Pat[dyn], Bool> {
-	arity := len(args)
-	mut Pat[dyn][dyn] taking = []
-	for each row in rows {
-		first := firstOf(row)
-		if first is Pat.Any(_) {
-			append(taking, anys(arity) + afterN(row, 1))
-		} else if first is Pat.Variant(h, name, inner) && h == head && name == variant {
-			append(taking, inner + afterN(row, 1))
-		}
-	}
-	if gapIn(t, taking, args + rest, arity + width - 1) is Result.Ok(values) {
-		return Result.Ok([Pat.Variant(head, variant, firstN(values, arity))] + afterN(values, arity))
-	}
-	return Result.Error(false)
+    arity := len(args)
+    mut Pat[dyn][dyn] taking = []
+    for each row in rows {
+        first := firstOf(row)
+        if first is Pat.Any(_) {
+            append(taking, anys(arity) + afterN(row, 1))
+        } else if first is Pat.Variant(h, name, inner) && h == head && name == variant {
+            append(taking, inner + afterN(row, 1))
+        }
+    }
+    if gapIn(t, taking, args + rest, arity + width - 1) is Result.Ok(values) {
+        return Result.Ok([Pat.Variant(head, variant, firstN(values, arity))] + afterN(values, arity))
+    }
+    return Result.Error(false)
 }
 
 func truthGap(t: types.Table, rows: Pat[dyn][dyn], width: Int, column: Pat[], rest: Pat[]): Result<Pat[dyn], Bool> {
-	for each value in [true, false] {
-		if hasTruthOf(column, value) == false {
-			return defaultGap(t, rows, width, Pat.Truth(value), rest)
-		}
-	}
-	for each value in [true, false] {
-		if valueIn(t, rows, width, Pat.Truth(value), rest) is Result.Ok(values) {
-			return Result.Ok(values)
-		}
-	}
-	return Result.Error(false)
+    for each value in [true, false] {
+        if hasTruthOf(column, value) == false {
+            return defaultGap(t, rows, width, Pat.Truth(value), rest)
+        }
+    }
+    for each value in [true, false] {
+        if valueIn(t, rows, width, Pat.Truth(value), rest) is Result.Ok(values) {
+            return Result.Ok(values)
+        }
+    }
+    return Result.Error(false)
 }
 
 func valueIn(t: types.Table, rows: Pat[dyn][dyn], width: Int, value: Pat, rest: Pat[]): Result<Pat[dyn], Bool> {
-	mut Pat[dyn][dyn] taking = []
-	for each row in rows {
-		first := firstOf(row)
-		if first is Pat.Any(_) {
-			append(taking, afterN(row, 1))
-		} else if first == value {
-			append(taking, afterN(row, 1))
-		}
-	}
-	if gapIn(t, taking, rest, width - 1) is Result.Ok(values) {
-		return Result.Ok([value] + values)
-	}
-	return Result.Error(false)
+    mut Pat[dyn][dyn] taking = []
+    for each row in rows {
+        first := firstOf(row)
+        if first is Pat.Any(_) {
+            append(taking, afterN(row, 1))
+        } else if first == value {
+            append(taking, afterN(row, 1))
+        }
+    }
+    if gapIn(t, taking, rest, width - 1) is Result.Ok(values) {
+        return Result.Ok([value] + values)
+    }
+    return Result.Error(false)
 }
 
 // Every length from the space's up to one past the longest pattern's, which stands
 // for all the longer ones: every row treats them alike.
 func vectorGap(t: types.Table, rows: Pat[dyn][dyn], width: Int, longest: Int, elements: Pat[], open: Bool, rest: Pat[]): Result<Pat[dyn], Bool> {
-	low := len(elements)
-	mut high := low
-	if open && longest + 1 > high {
-		high = longest + 1
-	}
-	for size := low; size <= high; size++ {
-		mut Pat[dyn][dyn] taking = []
-		for each row in rows {
-			first := firstOf(row)
-			if first is Pat.Any(_) {
-				append(taking, anys(size) + afterN(row, 1))
-			} else if first is Pat.Vec(given, rowOpen) {
-				if len(given) == size || (rowOpen && len(given) < size) {
-					append(taking, given + anys(size - len(given)) + afterN(row, 1))
-				}
-			}
-		}
-		if gapIn(t, taking, elements + anys(size - low) + rest, size + width - 1) is Result.Ok(values) {
-			return Result.Ok([Pat.Vec(firstN(values, size), open && size > longest)] + afterN(values, size))
-		}
-	}
-	return Result.Error(false)
+    low := len(elements)
+    mut high := low
+    if open && longest + 1 > high {
+        high = longest + 1
+    }
+    for size := low; size <= high; size++ {
+        mut Pat[dyn][dyn] taking = []
+        for each row in rows {
+            first := firstOf(row)
+            if first is Pat.Any(_) {
+                append(taking, anys(size) + afterN(row, 1))
+            } else if first is Pat.Vec(given, rowOpen) {
+                if len(given) == size || (rowOpen && len(given) < size) {
+                    append(taking, given + anys(size - len(given)) + afterN(row, 1))
+                }
+            }
+        }
+        if gapIn(t, taking, elements + anys(size - low) + rest, size + width - 1) is Result.Ok(values) {
+            return Result.Ok([Pat.Vec(firstN(values, size), open && size > longest)] + afterN(values, size))
+        }
+    }
+    return Result.Error(false)
 }
 
 // --- Columns -----------------------------------------------------------------
 
 func firsts(rows: Pat[dyn][dyn]): Pat[dyn] {
-	mut Pat[dyn] out = []
-	for each row in rows {
-		append(out, firstOf(row))
-	}
-	return out
+    mut Pat[dyn] out = []
+    for each row in rows {
+        append(out, firstOf(row))
+    }
+    return out
 }
 
 func firstOf(row: Pat[]): Pat {
-	if row bounds 0 {
-		return row[0]
-	}
-	return Pat.Opaque()
+    if row bounds 0 {
+        return row[0]
+    }
+    return Pat.Opaque()
 }
 
 func longestVec(column: Pat[]): Int {
-	mut longest := -1
-	for each p in column {
-		if p is Pat.Vec(elements, _) && len(elements) > longest {
-			longest = len(elements)
-		}
-	}
-	return longest
+    mut longest := -1
+    for each p in column {
+        if p is Pat.Vec(elements, _) && len(elements) > longest {
+            longest = len(elements)
+        }
+    }
+    return longest
 }
 
 func headOf(column: Pat[]): Str {
-	for each p in column {
-		if p is Pat.Variant(head, _, _) {
-			return head
-		}
-	}
-	return ""
+    for each p in column {
+        if p is Pat.Variant(head, _, _) {
+            return head
+        }
+    }
+    return ""
 }
 
 func hasVariant(column: Pat[], head: Str, variant: Str): Bool {
-	for each p in column {
-		if p is Pat.Variant(h, name, _) && h == head && name == variant {
-			return true
-		}
-	}
-	return false
+    for each p in column {
+        if p is Pat.Variant(h, name, _) && h == head && name == variant {
+            return true
+        }
+    }
+    return false
 }
 
 func hasTruth(column: Pat[]): Bool {
-	return hasTruthOf(column, true) || hasTruthOf(column, false)
+    return hasTruthOf(column, true) || hasTruthOf(column, false)
 }
 
 func hasTruthOf(column: Pat[], value: Bool): Bool {
-	for each p in column {
-		if p is Pat.Truth(v) && v == value {
-			return true
-		}
-	}
-	return false
+    for each p in column {
+        if p is Pat.Truth(v) && v == value {
+            return true
+        }
+    }
+    return false
 }
 
 func anys(n: Int): Pat[dyn] {
-	mut Pat[dyn] out = []
-	for i := 0; i < n; i++ {
-		append(out, Pat.Any("_"))
-	}
-	return out
+    mut Pat[dyn] out = []
+    for i := 0; i < n; i++ {
+        append(out, Pat.Any("_"))
+    }
+    return out
 }
 
 func firstN(ps: Pat[], n: Int): Pat[dyn] {
-	mut Pat[dyn] out = []
-	mut i := 0
-	for each p in ps {
-		if i < n {
-			append(out, p)
-		}
-		i = i + 1
-	}
-	return out
+    mut Pat[dyn] out = []
+    mut i := 0
+    for each p in ps {
+        if i < n {
+            append(out, p)
+        }
+        i = i + 1
+    }
+    return out
 }
 
 func afterN(ps: Pat[], n: Int): Pat[dyn] {
-	mut Pat[dyn] out = []
-	mut i := 0
-	for each p in ps {
-		if i >= n {
-			append(out, p)
-		}
-		i = i + 1
-	}
-	return out
+    mut Pat[dyn] out = []
+    mut i := 0
+    for each p in ps {
+        if i >= n {
+            append(out, p)
+        }
+        i = i + 1
+    }
+    return out
 }
 
 func nth(path: Str[], i: Int): Str {
-	if path bounds i {
-		return path[i]
-	}
-	return ""
+    if path bounds i {
+        return path[i]
+    }
+    return ""
 }
 
 // --- Naming what is missing --------------------------------------------------
 
 func shownAll(ps: Pat[]): Str {
-	return join(shownEach(ps), ", ")
+    return join(shownEach(ps), ", ")
 }
 
 func shownEach(ps: Pat[]): Str[dyn] {
-	mut Str[dyn] out = []
-	for each p in ps {
-		append(out, shown(p))
-	}
-	return out
+    mut Str[dyn] out = []
+    for each p in ps {
+        append(out, shown(p))
+    }
+    return out
 }
 
 func shown(p: Pat): Str {
-	if p is Pat.Variant(head, name, args) {
-		written := types.shownName(head) + "." + name
-		if len(args) == 0 {
-			return written
-		}
-		return written + "(" + shownAll(args) + ")"
-	}
-	if p is Pat.Truth(value) {
-		if value {
-			return "true"
-		}
-		return "false"
-	}
-	if p is Pat.Vec(elements, open) {
-		mut Str[dyn] parts = shownEach(elements)
-		if open {
-			append(parts, "...")
-		}
-		return "[" + join(parts, ", ") + "]"
-	}
-	if p is Pat.Literal(key) {
-		return key
-	}
-	return "_"
+    if p is Pat.Variant(head, name, args) {
+        written := types.shownName(head) + "." + name
+        if len(args) == 0 {
+            return written
+        }
+        return written + "(" + shownAll(args) + ")"
+    }
+    if p is Pat.Truth(value) {
+        if value {
+            return "true"
+        }
+        return "false"
+    }
+    if p is Pat.Vec(elements, open) {
+        mut Str[dyn] parts = shownEach(elements)
+        if open {
+            append(parts, "...")
+        }
+        return "[" + join(parts, ", ") + "]"
+    }
+    if p is Pat.Literal(key) {
+        return key
+    }
+    return "_"
 }
 
 // --- `switch` ----------------------------------------------------------------
 
 func unmatched(t: types.Table, subjects: ast.Expr[], arms: ast.Branch[]): Result<Str, Bool> {
-	if gap(t, armRows(t, subjects, arms), len(subjects)) is Result.Ok(values) {
-		return Result.Ok(shownAll(values))
-	}
-	return Result.Error(false)
+    if gap(t, armRows(t, subjects, arms), len(subjects)) is Result.Ok(values) {
+        return Result.Ok(shownAll(values))
+    }
+    return Result.Error(false)
 }
 
 func deadArms(t: types.Table, subjects: ast.Expr[], arms: ast.Branch[]): Int[dyn] {
-	mut Int[dyn] out = []
-	mut Pat[dyn][dyn] above = []
-	mut n := 1
-	for each row in armRows(t, subjects, arms) {
-		if gapIn(t, above, row, len(subjects)) is Result.Error(_) {
-			append(out, n)
-		}
-		append(above, row)
-		n = n + 1
-	}
-	return out
+    mut Int[dyn] out = []
+    mut Pat[dyn][dyn] above = []
+    mut n := 1
+    for each row in armRows(t, subjects, arms) {
+        if gapIn(t, above, row, len(subjects)) is Result.Error(_) {
+            append(out, n)
+        }
+        append(above, row)
+        n = n + 1
+    }
+    return out
 }
 
 func armRows(t: types.Table, subjects: ast.Expr[], arms: ast.Branch[]): Pat[dyn][dyn] {
-	mut Str[dyn] paths = []
-	for each subject in subjects {
-		append(paths, pathOf(subject))
-	}
-	mut Pat[dyn][dyn] out = []
-	for each arm in arms {
-		append(out, armRow(t, paths, arm.condition))
-	}
-	return out
+    mut Str[dyn] paths = []
+    for each subject in subjects {
+        append(paths, pathOf(subject))
+    }
+    mut Pat[dyn][dyn] out = []
+    for each arm in arms {
+        append(out, armRow(t, paths, arm.condition))
+    }
+    return out
 }
 
 // A conjunct the parser could not have written makes the row opaque throughout,
 // which neither question asked of it can be wrong about.
 func armRow(t: types.Table, paths: Str[], condition: ast.Expr): Pat[dyn] {
-	mut Pat[dyn] row = anys(len(paths))
-	mut Bool[dyn] tested = []
-	for i := 0; i < len(paths); i++ {
-		append(tested, false)
-	}
-	for each c in conjuncts(condition) {
-		column := columnOf(paths, tested, c)
-		if c is ast.Expr.BoolLit(true) {
-			continue
-		} else if row bounds column && tested bounds column {
-			row[column] = headPat(t, c)
-			tested[column] = true
-		} else if narrowedRow(t, row, c) is Result.Ok(next) {
-			row = next
-		} else {
-			return opaques(len(paths))
-		}
-	}
-	return row
+    mut Pat[dyn] row = anys(len(paths))
+    mut Bool[dyn] tested = []
+    for i := 0; i < len(paths); i++ {
+        append(tested, false)
+    }
+    for each c in conjuncts(condition) {
+        column := columnOf(paths, tested, c)
+        if c is ast.Expr.BoolLit(true) {
+            continue
+        } else if row bounds column && tested bounds column {
+            row[column] = headPat(t, c)
+            tested[column] = true
+        } else if narrowedRow(t, row, c) is Result.Ok(next) {
+            row = next
+        } else {
+            return opaques(len(paths))
+        }
+    }
+    return row
 }
 
 func columnOf(paths: Str[], tested: Bool[], c: ast.Expr): Int {
-	target := testedPath(c)
-	mut i := 0
-	for each path in paths {
-		if target != "" && path == target && tested bounds i && tested[i] == false {
-			return i
-		}
-		i = i + 1
-	}
-	return -1
+    target := testedPath(c)
+    mut i := 0
+    for each path in paths {
+        if target != "" && path == target && tested bounds i && tested[i] == false {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
 }
 
 func testedPath(c: ast.Expr): Str {
-	if c is ast.Expr.IsMatch(target, _) {
-		return pathOf(target)
-	}
-	if c is ast.Expr.Binary(op, left, _) {
-		if op is ast.BinOp.Eq {
-			return pathOf(left)
-		}
-	}
-	return ""
+    if c is ast.Expr.IsMatch(target, _) {
+        return pathOf(target)
+    }
+    if c is ast.Expr.Binary(op, left, _) {
+        if op is ast.BinOp.Eq {
+            return pathOf(left)
+        }
+    }
+    return ""
 }
 
 func headPat(t: types.Table, c: ast.Expr): Pat {
-	if c is ast.Expr.IsMatch(_, pattern) {
-		return patOf(t, pattern)
-	}
-	if c is ast.Expr.Binary(_, _, right) {
-		return literalPat(right)
-	}
-	return Pat.Opaque()
+    if c is ast.Expr.IsMatch(_, pattern) {
+        return patOf(t, pattern)
+    }
+    if c is ast.Expr.Binary(_, _, right) {
+        return literalPat(right)
+    }
+    return Pat.Opaque()
 }
 
 func narrowedRow(t: types.Table, row: Pat[], c: ast.Expr): Result<Pat[dyn], Bool> {
-	mut Pat[dyn] out = []
-	mut found := false
-	for each tree in row {
-		if found == false && narrowed(t, tree, c) is Result.Ok(next) {
-			append(out, next)
-			found = true
-		} else {
-			append(out, tree)
-		}
-	}
-	if found {
-		return Result.Ok(out)
-	}
-	return Result.Error(false)
+    mut Pat[dyn] out = []
+    mut found := false
+    for each tree in row {
+        if found == false && narrowed(t, tree, c) is Result.Ok(next) {
+            append(out, next)
+            found = true
+        } else {
+            append(out, tree)
+        }
+    }
+    if found {
+        return Result.Ok(out)
+    }
+    return Result.Error(false)
 }
 
 func opaques(n: Int): Pat[dyn] {
-	mut Pat[dyn] out = []
-	for i := 0; i < n; i++ {
-		append(out, Pat.Opaque())
-	}
-	return out
+    mut Pat[dyn] out = []
+    for i := 0; i < n; i++ {
+        append(out, Pat.Opaque())
+    }
+    return out
 }

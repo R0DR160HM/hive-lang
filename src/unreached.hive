@@ -8,184 +8,184 @@ import ./text
 import hive.map
 
 type Declaration {
-	display: Str
-	word: Str
-	line: Int
-	// The unreached declarations that name it; empty where nothing does.
-	namedBy: Str[dyn]
+    display: Str
+    word: Str
+    line: Int
+    // The unreached declarations that name it; empty where nothing does.
+    namedBy: Str[dyn]
 }
 
 type Parameter {
-	callable: Str
-	line: Int
-	name: Str
+    callable: Str
+    line: Int
+    name: Str
 }
 
 type Found {
-	// What reaching is counted from, as the report says it; `""` for a program with
-	// neither a `main` nor a test, where nothing is reported.
-	startsAt: Str
-	declarations: Declaration[dyn]
-	parameters: Parameter[dyn]
+    // What reaching is counted from, as the report says it; `""` for a program with
+    // neither a `main` nor a test, where nothing is reported.
+    startsAt: Str
+    declarations: Declaration[dyn]
+    parameters: Parameter[dyn]
 }
 
 func nothing(): Found {
-	return Found("", [], [])
+    return Found("", [], [])
 }
 
 type Refs {
-	names: Str[dyn]
-	// Named other than as the callee of a call, so its shape is a slot's to decide.
-	values: Str[dyn]
+    names: Str[dyn]
+    // Named other than as the callee of a call, so its shape is a slot's to decide.
+    values: Str[dyn]
 }
 
 proc find(m: ast.Module, sources: loader.Source[]): Found {
-	mut hive.map.Map<Str, ast.Decl> byName = hive.map.new()
-	mut Str[dyn] queue = []
-	mut hasMain := false
-	mut hasTests := false
-	for each d in m.decls {
-		name := ast.declName(d)
-		hive.map.set(byName, name, d)
-		if d is ast.Decl.TestDecl(_, _, _) {
-			hasTests = true
-			append(queue, name)
-		} else if name == "main" && d is ast.Decl.CallableDecl(_, _, _, _, _, _) {
-			hasMain = true
-			append(queue, name)
-		}
-	}
-	if len(queue) == 0 {
-		return nothing()
-	}
+    mut hive.map.Map<Str, ast.Decl> byName = hive.map.new()
+    mut Str[dyn] queue = []
+    mut hasMain := false
+    mut hasTests := false
+    for each d in m.decls {
+        name := ast.declName(d)
+        hive.map.set(byName, name, d)
+        if d is ast.Decl.TestDecl(_, _, _) {
+            hasTests = true
+            append(queue, name)
+        } else if name == "main" && d is ast.Decl.CallableDecl(_, _, _, _, _, _) {
+            hasMain = true
+            append(queue, name)
+        }
+    }
+    if len(queue) == 0 {
+        return nothing()
+    }
 
-	mut hive.map.Map<Str, Bool> reached = hive.map.new()
-	for each root in queue {
-		hive.map.set(reached, root, true)
-	}
-	mut hive.map.Map<Str, Bool> asValue = hive.map.new()
-	for i := 0; i < len(queue); i++ {
-		if queue bounds i {
-			if hive.map.get(byName, queue[i]) is Result.Ok(d) {
-				mut Refs own = Refs([], [])
-				refsOf(d, own)
-				for each v in own.values {
-					hive.map.set(asValue, v, true)
-				}
-				for each r in own.names {
-					if hive.map.has(byName, r) && hive.map.has(reached, r) == false {
-						hive.map.set(reached, r, true)
-						append(queue, r)
-					}
-				}
-			}
-		}
-	}
+    mut hive.map.Map<Str, Bool> reached = hive.map.new()
+    for each root in queue {
+        hive.map.set(reached, root, true)
+    }
+    mut hive.map.Map<Str, Bool> asValue = hive.map.new()
+    for i := 0; i < len(queue); i++ {
+        if queue bounds i {
+            if hive.map.get(byName, queue[i]) is Result.Ok(d) {
+                mut Refs own = Refs([], [])
+                refsOf(d, own)
+                for each v in own.values {
+                    hive.map.set(asValue, v, true)
+                }
+                for each r in own.names {
+                    if hive.map.has(byName, r) && hive.map.has(reached, r) == false {
+                        hive.map.set(reached, r, true)
+                        append(queue, r)
+                    }
+                }
+            }
+        }
+    }
 
-	mut hive.map.Map<Str, Str[dyn]> namers = hive.map.new()
-	for each d in m.decls {
-		name := ast.declName(d)
-		if hive.map.has(reached, name) == false {
-			mut Refs own = Refs([], [])
-			refsOf(d, own)
-			for each r in own.names {
-				if r != name && hive.map.has(byName, r) {
-					mut Str[dyn] by = []
-					if hive.map.get(namers, r) is Result.Ok(already) {
-						by = already
-					}
-					shown := displayOf(sources, name)
-					if indexOf(by, shown) is Result.Error(_) {
-						append(by, shown)
-					}
-					hive.map.set(namers, r, by)
-				}
-			}
-		}
-	}
+    mut hive.map.Map<Str, Str[dyn]> namers = hive.map.new()
+    for each d in m.decls {
+        name := ast.declName(d)
+        if hive.map.has(reached, name) == false {
+            mut Refs own = Refs([], [])
+            refsOf(d, own)
+            for each r in own.names {
+                if r != name && hive.map.has(byName, r) {
+                    mut Str[dyn] by = []
+                    if hive.map.get(namers, r) is Result.Ok(already) {
+                        by = already
+                    }
+                    shown := displayOf(sources, name)
+                    if indexOf(by, shown) is Result.Error(_) {
+                        append(by, shown)
+                    }
+                    hive.map.set(namers, r, by)
+                }
+            }
+        }
+    }
 
-	mut Declaration[dyn] declarations = []
-	mut Parameter[dyn] parameters = []
-	for each d in m.decls {
-		name := ast.declName(d)
-		if reportable(d, sources, name) == false {
-			continue
-		}
-		if hive.map.has(reached, name) == false {
-			mut Str[dyn] by = []
-			if hive.map.get(namers, name) is Result.Ok(found) {
-				by = found
-			}
-			append(declarations, Declaration(displayOf(sources, name), wordOf(d), ast.declLine(d), by))
-		} else if d is ast.Decl.CallableDecl(_, _, params, _, body, line) {
-			if hive.map.has(asValue, name) == false {
-				mut Refs inBody = Refs([], [])
-				block(body, inBody)
-				for each p in params {
-					if text.startsWith(p.name, "_") == false && indexOf(inBody.names, p.name) is Result.Error(_) {
-						append(parameters, Parameter(displayOf(sources, name), line, p.name))
-					}
-				}
-			}
-		}
-	}
-	return Found(startsAt(hasMain, hasTests), declarations, parameters)
+    mut Declaration[dyn] declarations = []
+    mut Parameter[dyn] parameters = []
+    for each d in m.decls {
+        name := ast.declName(d)
+        if reportable(d, sources, name) == false {
+            continue
+        }
+        if hive.map.has(reached, name) == false {
+            mut Str[dyn] by = []
+            if hive.map.get(namers, name) is Result.Ok(found) {
+                by = found
+            }
+            append(declarations, Declaration(displayOf(sources, name), wordOf(d), ast.declLine(d), by))
+        } else if d is ast.Decl.CallableDecl(_, _, params, _, body, line) {
+            if hive.map.has(asValue, name) == false {
+                mut Refs inBody = Refs([], [])
+                block(body, inBody)
+                for each p in params {
+                    if text.startsWith(p.name, "_") == false && indexOf(inBody.names, p.name) is Result.Error(_) {
+                        append(parameters, Parameter(displayOf(sources, name), line, p.name))
+                    }
+                }
+            }
+        }
+    }
+    return Found(startsAt(hasMain, hasTests), declarations, parameters)
 }
 
 func startsAt(hasMain: Bool, hasTests: Bool): Str {
-	if hasMain && hasTests {
-		return "`main` or a test"
-	}
-	if hasMain {
-		return "`main`"
-	}
-	return "a test"
+    if hasMain && hasTests {
+        return "`main` or a test"
+    }
+    if hasMain {
+        return "`main`"
+    }
+    return "a test"
 }
 
 // What the program wrote itself: not the library's, not what an imported Go file
 // declares, and not a test, which is where reaching starts.
 func reportable(d: ast.Decl, sources: loader.Source[], name: Str): Bool {
-	if text.startsWith(name, "hive_") || d is ast.Decl.TestDecl(_, _, _) || d is ast.Decl.ForeignDecl(_, _, _, _, _, _, _) {
-		return false
-	}
-	for each src in sources {
-		if src.prefix != "" && text.startsWith(name, src.prefix) && text.endsWith(src.key, ".go") {
-			return false
-		}
-	}
-	return name != "main"
+    if text.startsWith(name, "hive_") || d is ast.Decl.TestDecl(_, _, _) || d is ast.Decl.ForeignDecl(_, _, _, _, _, _, _) {
+        return false
+    }
+    for each src in sources {
+        if src.prefix != "" && text.startsWith(name, src.prefix) && text.endsWith(src.key, ".go") {
+            return false
+        }
+    }
+    return name != "main"
 }
 
 func wordOf(d: ast.Decl): Str {
-	if d is ast.Decl.TypeDecl(_, _, _, _) {
-		return "type"
-	}
-	if d is ast.Decl.QueryDecl(_, _, _, _, _) {
-		return "query"
-	}
-	if d is ast.Decl.CallableDecl(kind, _, _, _, _, _) {
-		if kind is ast.CallableKind.ProcKind {
-			return "proc"
-		}
-	}
-	return "func"
+    if d is ast.Decl.TypeDecl(_, _, _, _) {
+        return "type"
+    }
+    if d is ast.Decl.QueryDecl(_, _, _, _, _) {
+        return "query"
+    }
+    if d is ast.Decl.CallableDecl(kind, _, _, _, _, _) {
+        if kind is ast.CallableKind.ProcKind {
+            return "proc"
+        }
+    }
+    return "func"
 }
 
 // `text.repeat` for `text_5_repeat`, by the file it came from.
 func displayOf(sources: loader.Source[], flat: Str): Str {
-	mut prefix := ""
-	mut stem := ""
-	for each src in sources {
-		if src.prefix != "" && text.startsWith(flat, src.prefix) && len(src.prefix) > len(prefix) {
-			prefix = src.prefix
-			stem = paths.stem(src.key)
-		}
-	}
-	if prefix == "" {
-		return flat
-	}
-	cs := text.chars(flat)
-	return stem + "." + text.span(cs, len(prefix), len(cs) - 1)
+    mut prefix := ""
+    mut stem := ""
+    for each src in sources {
+        if src.prefix != "" && text.startsWith(flat, src.prefix) && len(src.prefix) > len(prefix) {
+            prefix = src.prefix
+            stem = paths.stem(src.key)
+        }
+    }
+    if prefix == "" {
+        return flat
+    }
+    cs := text.chars(flat)
+    return stem + "." + text.span(cs, len(prefix), len(cs) - 1)
 }
 
 // --- What a declaration names --------------------------------------------------
@@ -194,194 +194,194 @@ func displayOf(sources: loader.Source[], flat: Str): Str {
 // is never reached; what is reached may hide a little that is not.
 
 proc refsOf(d: ast.Decl, r: mut Refs): void {
-	if d is ast.Decl.TypeDecl(_, shared, variants, _) {
-		fields(shared, r)
-		for each v in variants {
-			fields(v.fields, r)
-		}
-	} else if d is ast.Decl.CallableDecl(_, _, params, result, body, _) {
-		for each p in params {
-			typeExpr(p.declared, r)
-		}
-		typeExpr(result, r)
-		block(body, r)
-	} else if d is ast.Decl.ForeignDecl(_, params, result, _, _, _, _) {
-		for each p in params {
-			typeExpr(p.declared, r)
-		}
-		typeExpr(result, r)
-	} else if d is ast.Decl.QueryDecl(_, params, result, parts, _) {
-		for each p in params {
-			typeExpr(p.declared, r)
-		}
-		typeExpr(result, r)
-		sql(parts, r)
-	} else if d is ast.Decl.TestDecl(_, body, _) {
-		block(body, r)
-	}
+    if d is ast.Decl.TypeDecl(_, shared, variants, _) {
+        fields(shared, r)
+        for each v in variants {
+            fields(v.fields, r)
+        }
+    } else if d is ast.Decl.CallableDecl(_, _, params, result, body, _) {
+        for each p in params {
+            typeExpr(p.declared, r)
+        }
+        typeExpr(result, r)
+        block(body, r)
+    } else if d is ast.Decl.ForeignDecl(_, params, result, _, _, _, _) {
+        for each p in params {
+            typeExpr(p.declared, r)
+        }
+        typeExpr(result, r)
+    } else if d is ast.Decl.QueryDecl(_, params, result, parts, _) {
+        for each p in params {
+            typeExpr(p.declared, r)
+        }
+        typeExpr(result, r)
+        sql(parts, r)
+    } else if d is ast.Decl.TestDecl(_, body, _) {
+        block(body, r)
+    }
 }
 
 proc fields(fs: ast.Field[], r: mut Refs): void {
-	for each f in fs {
-		typeExpr(f.declared, r)
-		expr(f.marks.fallback, r)
-	}
+    for each f in fs {
+        typeExpr(f.declared, r)
+        expr(f.marks.fallback, r)
+    }
 }
 
 proc typeExpr(t: ast.TypeExpr, r: mut Refs): void {
-	if t is ast.TypeExpr.Named(pkg, name, args, _) {
-		if pkg == "" {
-			append(r.names, name)
-		}
-		for each a in args {
-			typeExpr(a, r)
-		}
-	} else if t is ast.TypeExpr.Fn(_, params, _, result) {
-		for each p in params {
-			typeExpr(p, r)
-		}
-		typeExpr(result, r)
-	}
+    if t is ast.TypeExpr.Named(pkg, name, args, _) {
+        if pkg == "" {
+            append(r.names, name)
+        }
+        for each a in args {
+            typeExpr(a, r)
+        }
+    } else if t is ast.TypeExpr.Fn(_, params, _, result) {
+        for each p in params {
+            typeExpr(p, r)
+        }
+        typeExpr(result, r)
+    }
 }
 
 proc block(b: ast.Block, r: mut Refs): void {
-	for each s in b.stmts {
-		stmt(s, r)
-	}
+    for each s in b.stmts {
+        stmt(s, r)
+    }
 }
 
 proc stmt(s: ast.Stmt, r: mut Refs): void {
-	if s is ast.Stmt.VarDecl(_, value, _, _) {
-		expr(value, r)
-	} else if s is ast.Stmt.TypedDecl(declared, _, value, _, _) {
-		typeExpr(declared, r)
-		expr(value, r)
-	} else if s is ast.Stmt.Assign(target, value) {
-		expr(target, r)
-		expr(value, r)
-	} else if s is ast.Stmt.IfChain(branches, otherwise, _) {
-		for each b in branches {
-			expr(b.condition, r)
-			block(b.body, r)
-		}
-		block(otherwise, r)
-	} else if s is ast.Stmt.SwitchStmt(lets, subjects, arms, _) {
-		for each subject in subjects {
-			expr(subject, r)
-		}
-		block(ast.switchBlock(lets, arms), r)
-	} else if s is ast.Stmt.ForLoop(init, cond, post, body) {
-		stmt(init, r)
-		expr(cond, r)
-		stmt(post, r)
-		block(body, r)
-	} else if s is ast.Stmt.ForEach(_, declared, subject, body) {
-		typeExpr(declared, r)
-		expr(subject, r)
-		block(body, r)
-	} else if s is ast.Stmt.ReturnStmt(value) {
-		expr(value, r)
-	} else if s is ast.Stmt.EchoStmt(value) {
-		expr(value, r)
-	} else if s is ast.Stmt.AssertStmt(value) {
-		expr(value, r)
-	} else if s is ast.Stmt.PanicStmt(value) {
-		expr(value, r)
-	} else if s is ast.Stmt.AsyncStmt(value) {
-		expr(value, r)
-	} else if s is ast.Stmt.Expression(value) {
-		expr(value, r)
-	}
+    if s is ast.Stmt.VarDecl(_, value, _, _) {
+        expr(value, r)
+    } else if s is ast.Stmt.TypedDecl(declared, _, value, _, _) {
+        typeExpr(declared, r)
+        expr(value, r)
+    } else if s is ast.Stmt.Assign(target, value) {
+        expr(target, r)
+        expr(value, r)
+    } else if s is ast.Stmt.IfChain(branches, otherwise, _) {
+        for each b in branches {
+            expr(b.condition, r)
+            block(b.body, r)
+        }
+        block(otherwise, r)
+    } else if s is ast.Stmt.SwitchStmt(lets, subjects, arms, _, _) {
+        for each subject in subjects {
+            expr(subject, r)
+        }
+        block(ast.switchBlock(lets, arms), r)
+    } else if s is ast.Stmt.ForLoop(init, cond, post, body) {
+        stmt(init, r)
+        expr(cond, r)
+        stmt(post, r)
+        block(body, r)
+    } else if s is ast.Stmt.ForEach(_, declared, subject, body) {
+        typeExpr(declared, r)
+        expr(subject, r)
+        block(body, r)
+    } else if s is ast.Stmt.ReturnStmt(value) {
+        expr(value, r)
+    } else if s is ast.Stmt.EchoStmt(value) {
+        expr(value, r)
+    } else if s is ast.Stmt.AssertStmt(value) {
+        expr(value, r)
+    } else if s is ast.Stmt.PanicStmt(value) {
+        expr(value, r)
+    } else if s is ast.Stmt.AsyncStmt(value) {
+        expr(value, r)
+    } else if s is ast.Stmt.Expression(value) {
+        expr(value, r)
+    }
 }
 
 proc expr(e: ast.Expr, r: mut Refs): void {
-	if e is ast.Expr.Ident(name) {
-		append(r.names, name)
-		append(r.values, name)
-	} else if e is ast.Expr.Call(callee, args) {
-		if callee is ast.Expr.Ident(name) {
-			append(r.names, name)
-		} else {
-			expr(callee, r)
-		}
-		for each a in args {
-			expr(a.value, r)
-		}
-	} else if e is ast.Expr.Interp(parts) {
-		for each part in parts {
-			if part is ast.InterpPart.Expression(value) {
-				expr(value, r)
-			}
-		}
-	} else if e is ast.Expr.VectorLit(items) {
-		for each item in items {
-			expr(item, r)
-		}
-	} else if e is ast.Expr.Negate(operand) {
-		expr(operand, r)
-	} else if e is ast.Expr.Not(operand) {
-		expr(operand, r)
-	} else if e is ast.Expr.BitNot(operand) {
-		expr(operand, r)
-	} else if e is ast.Expr.Bits(parts) {
-		for each part in parts {
-			expr(part.value, r)
-		}
-	} else if e is ast.Expr.Binary(_, left, right) {
-		expr(left, r)
-		expr(right, r)
-	} else if e is ast.Expr.Member(subject, _) {
-		expr(subject, r)
-	} else if e is ast.Expr.Index(subject, index) {
-		expr(subject, r)
-		expr(index, r)
-	} else if e is ast.Expr.Slice(subject, low, high) {
-		expr(subject, r)
-		expr(low, r)
-		expr(high, r)
-	} else if e is ast.Expr.IsMatch(subject, p) {
-		expr(subject, r)
-		pattern(p, r)
-	} else if e is ast.Expr.AwaitAll(calls, timeout) {
-		for each c in calls {
-			expr(c, r)
-		}
-		expr(timeout, r)
-	} else if e is ast.Expr.Timed(call, ms) {
-		expr(call, r)
-		expr(ms, r)
-	}
+    if e is ast.Expr.Ident(name) {
+        append(r.names, name)
+        append(r.values, name)
+    } else if e is ast.Expr.Call(callee, args) {
+        if callee is ast.Expr.Ident(name) {
+            append(r.names, name)
+        } else {
+            expr(callee, r)
+        }
+        for each a in args {
+            expr(a.value, r)
+        }
+    } else if e is ast.Expr.Interp(parts) {
+        for each part in parts {
+            if part is ast.InterpPart.Expression(value) {
+                expr(value, r)
+            }
+        }
+    } else if e is ast.Expr.VectorLit(items) {
+        for each item in items {
+            expr(item, r)
+        }
+    } else if e is ast.Expr.Negate(operand) {
+        expr(operand, r)
+    } else if e is ast.Expr.Not(operand) {
+        expr(operand, r)
+    } else if e is ast.Expr.BitNot(operand) {
+        expr(operand, r)
+    } else if e is ast.Expr.Bits(parts) {
+        for each part in parts {
+            expr(part.value, r)
+        }
+    } else if e is ast.Expr.Binary(_, left, right) {
+        expr(left, r)
+        expr(right, r)
+    } else if e is ast.Expr.Member(subject, _) {
+        expr(subject, r)
+    } else if e is ast.Expr.Index(subject, index) {
+        expr(subject, r)
+        expr(index, r)
+    } else if e is ast.Expr.Slice(subject, low, high) {
+        expr(subject, r)
+        expr(low, r)
+        expr(high, r)
+    } else if e is ast.Expr.IsMatch(subject, p) {
+        expr(subject, r)
+        pattern(p, r)
+    } else if e is ast.Expr.AwaitAll(calls, timeout) {
+        for each c in calls {
+            expr(c, r)
+        }
+        expr(timeout, r)
+    } else if e is ast.Expr.Timed(call, ms) {
+        expr(call, r)
+        expr(ms, r)
+    }
 }
 
 proc pattern(p: ast.Pattern, r: mut Refs): void {
-	if p is ast.Pattern.Constructor(path, _, _) {
-		if path bounds 0 {
-			append(r.names, path[0])
-		}
-	} else {
-		for each held in ast.patternExprs(p) {
-			expr(held, r)
-		}
-	}
+    if p is ast.Pattern.Constructor(path, _, _) {
+        if path bounds 0 {
+            append(r.names, path[0])
+        }
+    } else {
+        for each held in ast.patternExprs(p) {
+            expr(held, r)
+        }
+    }
 }
 
 proc sql(parts: ast.SqlPart[], r: mut Refs): void {
-	for each part in parts {
-		if part is ast.SqlPart.Param(value) {
-			expr(value, r)
-		} else if part is ast.SqlPart.Where(group) {
-			sqlGroup(group, r)
-		}
-	}
+    for each part in parts {
+        if part is ast.SqlPart.Param(value) {
+            expr(value, r)
+        } else if part is ast.SqlPart.Where(group) {
+            sqlGroup(group, r)
+        }
+    }
 }
 
 proc sqlGroup(group: ast.SqlGroup, r: mut Refs): void {
-	for each item in group.items {
-		if item is ast.SqlItem.Cond(condition, body) {
-			expr(condition, r)
-			sql(body, r)
-		} else if item is ast.SqlItem.Nested(inner) {
-			sqlGroup(inner, r)
-		}
-	}
+    for each item in group.items {
+        if item is ast.SqlItem.Cond(condition, body) {
+            expr(condition, r)
+            sql(body, r)
+        } else if item is ast.SqlItem.Nested(inner) {
+            sqlGroup(inner, r)
+        }
+    }
 }

@@ -2,7 +2,8 @@
 
 `is` checks a value against a pattern. It is an ordinary expression yielding a
 `Bool`, written in an `if` — or, for several values at once, as the arms of a
-[`switch`](06-statements.md#64-switch) ([7.8](#78-switch)). When it matches, it
+[`switch`](06-statements.md#64-switch) ([7.8](#78-switch)), and for the rest of a
+block on the left of a [`:=`](06-statements.md#binding-with-a-pattern). When it matches, it
 **narrows** the value and binds parts of it to fresh names, usable immediately:
 in the rest of the same condition after `&&`, and in the branch body.
 
@@ -242,7 +243,8 @@ A binding introduced by `is` is:
 
 * **immutable** — it is a new name for part of a value, not storage;
 * in scope for the rest of the condition after `&&`, and for the branch body —
-  a `switch` arm's body, for a position of one;
+  a `switch` arm's body, for a position of one, and the rest of the block, for a
+  pattern on the left of `:=`;
 * out of scope in an `else` branch, or any other arm, where the pattern did *not*
   match;
 * held to the `Binding` naming rule: `camelCase`, or `_` to throw it away.
@@ -291,6 +293,25 @@ would. Take it out, or move it above the arm that takes its values
 Only what coverage can tell apart is compared, so two string templates with
 holes are never found to overlap: the error is never wrong, though it can be
 missing.
+
+**A binding's `else` is held to both**, with the pattern on the left of the `:=`
+as its first arm ([06](06-statements.md#binding-with-a-pattern)). The arms are
+numbered from the first inside the `else`:
+
+```hive
+Result.Ok(Shape.Circle(r)) := parse(text) else {
+	Result.Error(why) { return 0 }
+}
+```
+
+```
+neither the pattern nor an arm of this `else` takes
+`Result.Ok(Shape.Rectangle(_, _))`. Give that an arm of its own, or end the `else`
+with `_`
+```
+
+An arm the pattern already takes — `Result.Ok(_)` under `Result.Ok(n) := ...` —
+can never run, and is refused with nothing to move it above.
 
 ## 7.9 Binary patterns
 

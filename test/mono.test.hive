@@ -10,116 +10,116 @@ import ../src/text
 
 // The program `source` expands to, rendered.
 proc expanded(source: Str): Str {
-	p := loader.loadText("main.hive", source)
-	if len(p.errors) > 0 {
-		for each e in p.errors {
-			return "loader: " + e.message
-		}
-	}
-	out := mono.expand(p.module, 0)
-	if len(out.errors) > 0 {
-		for each e in out.errors {
-			return "mono: " + e.message
-		}
-	}
-	return show.showModule(out.module)
+    p := loader.loadText("main.hive", source)
+    if len(p.errors) > 0 {
+        for each e in p.errors {
+            return "loader: " + e.message
+        }
+    }
+    out := mono.expand(p.module, 0)
+    if len(out.errors) > 0 {
+        for each e in out.errors {
+            return "mono: " + e.message
+        }
+    }
+    return show.showModule(out.module)
 }
 
 proc problem(source: Str): Str {
-	p := loader.loadText("main.hive", source)
-	for each e in mono.expand(p.module, 0).errors {
-		return e.message
-	}
-	return ""
+    p := loader.loadText("main.hive", source)
+    for each e in mono.expand(p.module, 0).errors {
+        return e.message
+    }
+    return ""
 }
 
 func has(haystack: Str, needle: Str): Bool {
-	return text.contains(haystack, needle)
+    return text.contains(haystack, needle)
 }
 
 // A generic `first`, and a `main` that uses it however the test says.
 func withFirst(body: Str): Str {
-	return "func first(v: T[]): Result<T, Bool> \{ if len(v) > 0 \{ return Result.Ok(v[0]) } return Result.Error(false) }\nproc main(): void \{ " + body + " }"
+    return "func first(v: T[]): Result<T, Bool> \{ if len(v) > 0 \{ return Result.Ok(v[0]) } return Result.Error(false) }\nproc main(): void \{ " + body + " }"
 }
 
 // --- Nothing to do -----------------------------------------------------------
 
 test "a program with no generics comes out as it went in" {
-	got := expanded("proc main(): void \{ echo 1 }")
-	assert got == "(proc main () void (block (echo 1)))"
+    got := expanded("proc main(): void \{ echo 1 }")
+    assert got == "(proc main () void (block (echo 1)))"
 }
 
 // --- Callables ---------------------------------------------------------------
 
 test "a call to a generic becomes a call to the copy for its arguments" {
-	got := expanded(withFirst("Str[2] names = [\"a\", \"b\"]  echo first(names)"))
-	assert has(got, "(call first_Str names)")
-	assert has(got, "(func first_Str ((v Str[])) Result<Str,Bool>")
+    got := expanded(withFirst("Str[2] names = [\"a\", \"b\"]  echo first(names)"))
+    assert has(got, "(call first_Str names)")
+    assert has(got, "(func first_Str ((v Str[])) Result<Str,Bool>")
 }
 
 test "the type argument is read off the argument, never written at the call" {
-	got := expanded(withFirst("Int[dyn] counts = [1]  echo first(counts)"))
-	assert has(got, "(call first_Int counts)")
-	assert has(got, "(func first_Int ((v Int[])) Result<Int,Bool>")
+    got := expanded(withFirst("Int[dyn] counts = [1]  echo first(counts)"))
+    assert has(got, "(call first_Int counts)")
+    assert has(got, "(func first_Int ((v Int[])) Result<Int,Bool>")
 }
 
 test "two uses at two types are two copies" {
-	got := expanded(withFirst("Str[2] names = [\"a\", \"b\"]  Int[dyn] counts = [1]  echo first(names)  echo first(counts)"))
-	assert has(got, "(func first_Str")
-	assert has(got, "(func first_Int")
+    got := expanded(withFirst("Str[2] names = [\"a\", \"b\"]  Int[dyn] counts = [1]  echo first(names)  echo first(counts)"))
+    assert has(got, "(func first_Str")
+    assert has(got, "(func first_Int")
 }
 
 test "two uses at one type are one copy" {
-	got := expanded(withFirst("Str[2] a = [\"a\", \"b\"]  Str[dyn] b = [\"c\"]  echo first(a)  echo first(b)"))
-	assert has(got, "(func first_Str")
-	assert has(got, "(func first_Int") == false
-	// One declaration, named twice.
-	first := indexOf(got, "(func first_Str")
-	if first is Result.Ok(at) {
-		rest := text.span(text.chars(got), at + 1, len(got) - 1)
-		assert has(rest, "(func first_Str") == false
-	}
+    got := expanded(withFirst("Str[2] a = [\"a\", \"b\"]  Str[dyn] b = [\"c\"]  echo first(a)  echo first(b)"))
+    assert has(got, "(func first_Str")
+    assert has(got, "(func first_Int") == false
+    // One declaration, named twice.
+    first := indexOf(got, "(func first_Str")
+    if first is Result.Ok(at) {
+        rest := text.span(text.chars(got), at + 1, len(got) - 1)
+        assert has(rest, "(func first_Str") == false
+    }
 }
 
 test "the generic itself is not emitted: a copy is what runs" {
-	got := expanded(withFirst("Str[2] names = [\"a\", \"b\"]  echo first(names)"))
-	assert has(got, "(func first ((v T[]))") == false
+    got := expanded(withFirst("Str[2] names = [\"a\", \"b\"]  echo first(names)"))
+    assert has(got, "(func first ((v T[]))") == false
 }
 
 test "a generic that is never used costs nothing" {
-	got := expanded(withFirst("echo 1"))
-	assert got == "(proc main () void (block (echo 1)))"
+    got := expanded(withFirst("echo 1"))
+    assert got == "(proc main () void (block (echo 1)))"
 }
 
 test "the body has its variables substituted through" {
-	source := "func makeOne(v: T[], extra: T): T[dyn] \{ mut T[dyn] out = []  for each item in v \{ append(out, item) }  append(out, extra)  return out }\nproc main(): void \{ Str[dyn] words = [\"a\"]  echo makeOne(words, \"b\") }"
-	got := expanded(source)
-	assert has(got, "(mutt Str[dyn] out [])")
-	assert has(got, "(func makeOne_Str ((v Str[]) (extra Str)) Str[dyn]")
+    source := "func makeOne(v: T[], extra: T): T[dyn] \{ mut T[dyn] out = []  for each item in v \{ append(out, item) }  append(out, extra)  return out }\nproc main(): void \{ Str[dyn] words = [\"a\"]  echo makeOne(words, \"b\") }"
+    got := expanded(source)
+    assert has(got, "(mutt Str[dyn] out [])")
+    assert has(got, "(func makeOne_Str ((v Str[]) (extra Str)) Str[dyn]")
 }
 
 test "a generic reached from another generic is expanded too" {
-	source := "func first(v: T[]): Result<T, Bool> \{ return Result.Error(false) }\nfunc firstOr(v: T[], fallback: T): T \{ if first(v) is Result.Ok(found) \{ return found } return fallback }\nproc main(): void \{ Str[dyn] words = [\"a\"]  echo firstOr(words, \"x\") }"
-	got := expanded(source)
-	assert has(got, "(call firstOr_Str words \"x\")")
-	assert has(got, "(func firstOr_Str")
-	// firstOr_Str asked for first_Str, which nothing else did.
-	assert has(got, "(func first_Str")
+    source := "func first(v: T[]): Result<T, Bool> \{ return Result.Error(false) }\nfunc firstOr(v: T[], fallback: T): T \{ if first(v) is Result.Ok(found) \{ return found } return fallback }\nproc main(): void \{ Str[dyn] words = [\"a\"]  echo firstOr(words, \"x\") }"
+    got := expanded(source)
+    assert has(got, "(call firstOr_Str words \"x\")")
+    assert has(got, "(func firstOr_Str")
+    // firstOr_Str asked for first_Str, which nothing else did.
+    assert has(got, "(func first_Str")
 }
 
 test "a variable inside a parameter's own type is pinned down by it" {
-	// The vector says what `T` is, and the function says what `K` and `E` are —
-	// three variables, none of them written at the call site.
-	source := "func filterMap(values: T[], transform: func(T): Result<K, E>): K[dyn] \{ mut K[dyn] out = []  return out }\nfunc asPort(s: Str): Result<Int, Bool> \{ return Result.Error(false) }\nproc main(): void \{ Str[dyn] raw = [\"1\"]  echo filterMap(raw, asPort) }"
-	got := expanded(source)
-	assert has(got, "(call filterMap_Str_Int_Bool raw asPort)")
-	assert has(got, "(func filterMap_Str_Int_Bool ((values Str[]) (transform (func(Str) Result<Int,Bool>))) Int[dyn]")
+    // The vector says what `T` is, and the function says what `K` and `E` are —
+    // three variables, none of them written at the call site.
+    source := "func filterMap(values: T[], transform: func(T): Result<K, E>): K[dyn] \{ mut K[dyn] out = []  return out }\nfunc asPort(s: Str): Result<Int, Bool> \{ return Result.Error(false) }\nproc main(): void \{ Str[dyn] raw = [\"1\"]  echo filterMap(raw, asPort) }"
+    got := expanded(source)
+    assert has(got, "(call filterMap_Str_Int_Bool raw asPort)")
+    assert has(got, "(func filterMap_Str_Int_Bool ((values Str[]) (transform (func(Str) Result<Int,Bool>))) Int[dyn]")
 }
 
 test "a generic proc is a generic like any other" {
-	source := "proc showAll(label: Str, v: T[]): void \{ for each item in v \{ echo item } }\nproc main(): void \{ Int[dyn] counts = [1]  showAll(\"c\", counts) }"
-	got := expanded(source)
-	assert has(got, "(proc showAll_Int ((label Str) (v Int[])) void")
+    source := "proc showAll(label: Str, v: T[]): void \{ for each item in v \{ echo item } }\nproc main(): void \{ Int[dyn] counts = [1]  showAll(\"c\", counts) }"
+    got := expanded(source)
+    assert has(got, "(proc showAll_Int ((label Str) (v Int[])) void")
 }
 
 // --- Tests are bodies like any other -----------------------------------------
@@ -131,53 +131,53 @@ test "a generic proc is a generic like any other" {
 
 // A generic `first`, and a `test` that uses it however the test says.
 func firstInTest(body: Str): Str {
-	return "func first(v: T[]): Result<T, Bool> \{ if len(v) > 0 \{ return Result.Ok(v[0]) } return Result.Error(false) }\ntest \"it holds\" \{ " + body + " }"
+    return "func first(v: T[]): Result<T, Bool> \{ if len(v) > 0 \{ return Result.Ok(v[0]) } return Result.Error(false) }\ntest \"it holds\" \{ " + body + " }"
 }
 
 test "a generic reached only from a test is copied for it" {
-	got := expanded(firstInTest("Str[2] names = [\"a\", \"b\"]  assert first(names) is Result.Ok(_)"))
-	assert has(got, "(call first_Str names)")
-	assert has(got, "(func first_Str ((v Str[])) Result<Str,Bool>")
+    got := expanded(firstInTest("Str[2] names = [\"a\", \"b\"]  assert first(names) is Result.Ok(_)"))
+    assert has(got, "(call first_Str names)")
+    assert has(got, "(func first_Str ((v Str[])) Result<Str,Bool>")
 }
 
 test "and each test's own argument types get their own copy" {
-	got := expanded("func first(v: T[]): Result<T, Bool> \{ if len(v) > 0 \{ return Result.Ok(v[0]) } return Result.Error(false) }\n"
-		+ "test \"strings\" \{ Str[2] a = [\"a\", \"b\"]  assert first(a) is Result.Ok(_) }\n"
-		+ "test \"numbers\" \{ Int[dyn] b = [1]  assert first(b) is Result.Ok(_) }")
-	assert has(got, "(func first_Str")
-	assert has(got, "(func first_Int")
+    got := expanded("func first(v: T[]): Result<T, Bool> \{ if len(v) > 0 \{ return Result.Ok(v[0]) } return Result.Error(false) }\n"
+        + "test \"strings\" \{ Str[2] a = [\"a\", \"b\"]  assert first(a) is Result.Ok(_) }\n"
+        + "test \"numbers\" \{ Int[dyn] b = [1]  assert first(b) is Result.Ok(_) }")
+    assert has(got, "(func first_Str")
+    assert has(got, "(func first_Int")
 }
 
 // --- Types -------------------------------------------------------------------
 
 test "a generic type is written out where it is used, and that names the copy" {
-	source := "type Box \{ items: T[dyn]  label: Str }\nproc main(): void \{ Box<Str> people = Box([\"a\"], \"people\")  echo people.label }"
-	got := expanded(source)
-	assert has(got, "(type Box_Str (items Str[dyn]) (label Str))")
-	assert has(got, "(lett Box_Str people (call Box_Str [\"a\"] \"people\"))")
+    source := "type Box \{ items: T[dyn]  label: Str }\nproc main(): void \{ Box<Str> people = Box([\"a\"], \"people\")  echo people.label }"
+    got := expanded(source)
+    assert has(got, "(type Box_Str (items Str[dyn]) (label Str))")
+    assert has(got, "(lett Box_Str people (call Box_Str [\"a\"] \"people\"))")
 }
 
 test "two instantiations of one type are two types" {
-	source := "type Box \{ items: T[dyn]  label: Str }\nproc main(): void \{ Box<Str> a = Box([\"x\"], \"a\")  Box<Int> b = Box([1], \"b\")  echo a.label  echo b.label }"
-	got := expanded(source)
-	assert has(got, "(type Box_Str (items Str[dyn]) (label Str))")
-	assert has(got, "(type Box_Int (items Int[dyn]) (label Str))")
+    source := "type Box \{ items: T[dyn]  label: Str }\nproc main(): void \{ Box<Str> a = Box([\"x\"], \"a\")  Box<Int> b = Box([1], \"b\")  echo a.label  echo b.label }"
+    got := expanded(source)
+    assert has(got, "(type Box_Str (items Str[dyn]) (label Str))")
+    assert has(got, "(type Box_Int (items Int[dyn]) (label Str))")
 }
 
 test "a generic union's constructor is told which copy by the declaration" {
-	// The argument pins down `A` and says nothing at all about `B`, so only the
-	// declaration could have said which instantiation this builds.
-	source := "type Either \{ Left \{ left: A } Right \{ right: B } }\nproc main(): void \{ Either<Str, Int> went = Either.Left(\"l\")  if went is Either.Left(v) \{ echo v } }"
-	got := expanded(source)
-	assert has(got, "(type Either_Str_Int (| Left (left Str)) (| Right (right Int)))")
-	assert has(got, "(call (. Either_Str_Int Left) \"l\")")
-	assert has(got, "(is went Either_Str_Int.Left(v))")
+    // The argument pins down `A` and says nothing at all about `B`, so only the
+    // declaration could have said which instantiation this builds.
+    source := "type Either \{ Left \{ left: A } Right \{ right: B } }\nproc main(): void \{ Either<Str, Int> went = Either.Left(\"l\")  if went is Either.Left(v) \{ echo v } }"
+    got := expanded(source)
+    assert has(got, "(type Either_Str_Int (| Left (left Str)) (| Right (right Int)))")
+    assert has(got, "(call (. Either_Str_Int Left) \"l\")")
+    assert has(got, "(is went Either_Str_Int.Left(v))")
 }
 
 test "a generic type in a signature is the copy there too" {
-	source := "type Box \{ items: T[dyn]  label: Str }\nfunc sizeOf(b: Box<Str>): Int \{ return len(b.items) }\nproc main(): void \{ Box<Str> people = Box([\"a\"], \"people\")  echo sizeOf(people) }"
-	got := expanded(source)
-	assert has(got, "(func sizeOf ((b Box_Str)) Int")
+    source := "type Box \{ items: T[dyn]  label: Str }\nfunc sizeOf(b: Box<Str>): Int \{ return len(b.items) }\nproc main(): void \{ Box<Str> people = Box([\"a\"], \"people\")  echo sizeOf(people) }"
+    got := expanded(source)
+    assert has(got, "(func sizeOf ((b Box_Str)) Int")
 }
 
 // --- A variable inside a generic type ----------------------------------------
@@ -189,43 +189,43 @@ test "a generic type in a signature is the copy there too" {
 // A generic `Box`, a `count` taking one, `extra` declarations, and a `main` that
 // uses them however the test says.
 func withBox(extra: Str, body: Str): Str {
-	return "type Box \{ items: T[dyn]  label: Str }\nfunc count(b: Box<T>): Int \{ return len(b.items) }\n" + extra + "\nproc main(): void \{ " + body + " }"
+    return "type Box \{ items: T[dyn]  label: Str }\nfunc count(b: Box<T>): Int \{ return len(b.items) }\n" + extra + "\nproc main(): void \{ " + body + " }"
 }
 
 test "a variable inside a generic type is read off that type's arguments" {
-	got := expanded(withBox("", "Box<Int> n = Box([1, 2, 3], \"n\")  echo count(n)"))
-	assert has(got, "(call count_Int n)")
-	assert has(got, "(func count_Int ((b Box_Int)) Int")
-	assert has(got, "count_Str") == false
+    got := expanded(withBox("", "Box<Int> n = Box([1, 2, 3], \"n\")  echo count(n)"))
+    assert has(got, "(call count_Int n)")
+    assert has(got, "(func count_Int ((b Box_Int)) Int")
+    assert has(got, "count_Str") == false
 }
 
 test "a box of boxes is read one layer at a time" {
-	got := expanded(withBox("func deep(b: Box<Box<T>>): Int \{ return len(b.items) }", "Box<Box<Int>> n = Box([Box([1], \"a\")], \"n\")  echo deep(n)  echo count(n)"))
-	assert has(got, "(call deep_Int n)")
-	assert has(got, "(call count_Box_Int n)")
+    got := expanded(withBox("func deep(b: Box<Box<T>>): Int \{ return len(b.items) }", "Box<Box<Int>> n = Box([Box([1], \"a\")], \"n\")  echo deep(n)  echo count(n)"))
+    assert has(got, "(call deep_Int n)")
+    assert has(got, "(call count_Box_Int n)")
 }
 
 test "a box inside a Result is read through it" {
-	got := expanded(withBox("func okCount(r: Result<Box<T>, Str>): Int \{ if r is Result.Ok(b) \{ return count(b) } return 0 }", "Box<Int> n = Box([1], \"n\")  Result<Box<Int>, Str> r = Result.Ok(n)  echo okCount(r)"))
-	assert has(got, "(call okCount_Int r)")
-	assert has(got, "(call count_Int b)")
+    got := expanded(withBox("func okCount(r: Result<Box<T>, Str>): Int \{ if r is Result.Ok(b) \{ return count(b) } return 0 }", "Box<Int> n = Box([1], \"n\")  Result<Box<Int>, Str> r = Result.Ok(n)  echo okCount(r)"))
+    assert has(got, "(call okCount_Int r)")
+    assert has(got, "(call count_Int b)")
 }
 
 test "a box built in place, bound with :=, or answered by a call says the same" {
-	got := expanded(withBox("func made(): Box<Int> \{ return Box([4], \"made\") }", "echo count(Box([1], \"in place\"))  b := Box([2.5], \"bound\")  echo count(b)  echo count(made())"))
-	assert has(got, "(call count_Int (call Box_Int [1] \"in place\"))")
-	assert has(got, "(call count_Float b)")
-	assert has(got, "(call count_Int (call made))")
+    got := expanded(withBox("func made(): Box<Int> \{ return Box([4], \"made\") }", "echo count(Box([1], \"in place\"))  b := Box([2.5], \"bound\")  echo count(b)  echo count(made())"))
+    assert has(got, "(call count_Int (call Box_Int [1] \"in place\"))")
+    assert has(got, "(call count_Float b)")
+    assert has(got, "(call count_Int (call made))")
 }
 
 test "and so does a field holding one" {
-	got := expanded(withBox("type Holder \{ box: Box<Int> }", "Holder h = Holder(Box([1], \"held\"))  echo count(h.box)"))
-	assert has(got, "(call count_Int (. h box))")
+    got := expanded(withBox("type Holder \{ box: Box<Int> }", "Holder h = Holder(Box([1], \"held\"))  echo count(h.box)"))
+    assert has(got, "(call count_Int (. h box))")
 }
 
 test "a generic's own answer is read as the copy it answers with" {
-	got := expanded(withBox("func boxOf(v: T[]): Box<T> \{ return Box(v, \"of\") }", "Int[dyn] v = [1]  b := boxOf(v)  echo count(b)"))
-	assert has(got, "(call count_Int b)")
+    got := expanded(withBox("func boxOf(v: T[]): Box<T> \{ return Box(v, \"of\") }", "Int[dyn] v = [1]  b := boxOf(v)  echo count(b)"))
+    assert has(got, "(call count_Int b)")
 }
 
 // --- What an empty vector says -----------------------------------------------
@@ -234,69 +234,69 @@ test "a generic's own answer is read as the copy it answers with" {
 // the declaration the value lands in.
 
 test "an empty vector pins nothing down, so another argument does" {
-	got := expanded("func firstOr(v: T[], fallback: T): T \{ return fallback }\nproc main(): void \{ echo firstOr([], 42) }")
-	assert has(got, "(call firstOr_Int [] 42)")
+    got := expanded("func firstOr(v: T[], fallback: T): T \{ return fallback }\nproc main(): void \{ echo firstOr([], 42) }")
+    assert has(got, "(call firstOr_Int [] 42)")
 }
 
 test "a declaration says which copy a constructor builds, ahead of its arguments" {
-	got := expanded(withBox("", "Box<Int> none = Box([], \"none\")  echo count(none)"))
-	assert has(got, "(lett Box_Int none (call Box_Int [] \"none\"))")
-	assert has(got, "Box_Str") == false
+    got := expanded(withBox("", "Box<Int> none = Box([], \"none\")  echo count(none)"))
+    assert has(got, "(lett Box_Int none (call Box_Int [] \"none\"))")
+    assert has(got, "Box_Str") == false
 }
 
 test "and so does a declared result" {
-	got := expanded(withBox("func none(): Box<Int> \{ return Box([], \"none\") }", "echo count(none())"))
-	assert has(got, "(return (call Box_Int [] \"none\"))")
-	assert has(got, "Box_Str") == false
+    got := expanded(withBox("func none(): Box<Int> \{ return Box([], \"none\") }", "echo count(none())"))
+    assert has(got, "(return (call Box_Int [] \"none\"))")
+    assert has(got, "Box_Str") == false
 }
 
 test "a generic's declared result aims a constructor in each copy" {
-	got := expanded(withBox("func boxOf(v: T[]): Box<T> \{ if len(v) > 0 \{ return Box(v, \"of\") } return Box([], \"empty\") }", "Int[dyn] v = [1]  echo count(boxOf(v))"))
-	assert has(got, "(return (call Box_Int [] \"empty\"))")
-	assert has(got, "Box_Str") == false
+    got := expanded(withBox("func boxOf(v: T[]): Box<T> \{ if len(v) > 0 \{ return Box(v, \"of\") } return Box([], \"empty\") }", "Int[dyn] v = [1]  echo count(boxOf(v))"))
+    assert has(got, "(return (call Box_Int [] \"empty\"))")
+    assert has(got, "Box_Str") == false
 }
 
 test "a union's variant in a return is aimed by the declared result" {
-	source := "type Either \{ Left \{ left: A } Right \{ right: B } }\nfunc goLeft(s: Str): Either<Str, Int> \{ return Either.Left(s) }\nproc main(): void \{ if goLeft(\"l\") is Either.Left(v) \{ echo v } }"
-	got := expanded(source)
-	assert has(got, "(return (call (. Either_Str_Int Left) s))")
-	assert has(got, "(is (call goLeft \"l\") Either_Str_Int.Left(v))")
+    source := "type Either \{ Left \{ left: A } Right \{ right: B } }\nfunc goLeft(s: Str): Either<Str, Int> \{ return Either.Left(s) }\nproc main(): void \{ if goLeft(\"l\") is Either.Left(v) \{ echo v } }"
+    got := expanded(source)
+    assert has(got, "(return (call (. Either_Str_Int Left) s))")
+    assert has(got, "(is (call goLeft \"l\") Either_Str_Int.Left(v))")
 }
 
 // --- Partial application -----------------------------------------------------
 
 test "a hole is fine once what is passed fixes every variable" {
-	got := expanded("func firstOr(v: T[], fallback: T): T \{ return fallback }\nproc main(): void \{ pick := firstOr(_, \"x\")  echo 1 }")
-	assert has(got, "(call firstOr_Str _ \"x\")")
+    got := expanded("func firstOr(v: T[], fallback: T): T \{ return fallback }\nproc main(): void \{ pick := firstOr(_, \"x\")  echo 1 }")
+    assert has(got, "(call firstOr_Str _ \"x\")")
 }
 
 // --- What is refused ---------------------------------------------------------
 
 test "a hole may not stand where the only type variable is read from" {
-	// `_` becomes a parameter of the function value, and a value carries no
-	// types, so nothing would say which copy it calls.
-	got := problem(withFirst("f := first(_)  echo 1"))
-	assert text.startsWith(got, "`_` stands where `first` reads `T` from")
+    // `_` becomes a parameter of the function value, and a value carries no
+    // types, so nothing would say which copy it calls.
+    got := problem(withFirst("f := first(_)  echo 1"))
+    assert text.startsWith(got, "`_` stands where `first` reads `T` from")
 }
 
 test "nor in a constructor of a generic type" {
-	got := problem(withBox("", "builder := Box(_, \"x\")  echo 1"))
-	assert text.startsWith(got, "`_` stands where `Box` reads `T` from")
+    got := problem(withBox("", "builder := Box(_, \"x\")  echo 1"))
+    assert text.startsWith(got, "`_` stands where `Box` reads `T` from")
 }
 
 test "a generic callable cannot be used as a value" {
-	got := problem(withFirst("f := first  echo f"))
-	assert text.startsWith(got, "`first` is generic, so it cannot be used as a value")
+    got := problem(withFirst("f := first  echo f"))
+    assert text.startsWith(got, "`first` is generic, so it cannot be used as a value")
 }
 
 test "a variable that appears only in the return type has nothing to read it off" {
-	source := "func makeOne(n: Int): T \{ panic \"no\" }\nproc main(): void \{ echo makeOne(1) }"
-	got := problem(source)
-	assert text.startsWith(got, "`T` appears nowhere in the parameters")
+    source := "func makeOne(n: Int): T \{ panic \"no\" }\nproc main(): void \{ echo makeOne(1) }"
+    got := problem(source)
+    assert text.startsWith(got, "`T` appears nowhere in the parameters")
 }
 
 test "a bare type name is part of a constructor path, not a value" {
-	// `Either.Left(...)` names a type and is not a use of one as a value.
-	source := "type Either \{ Left \{ left: A } Right \{ right: B } }\nproc main(): void \{ Either<Str, Int> went = Either.Left(\"l\")  echo 1 }"
-	assert problem(source) == ""
+    // `Either.Left(...)` names a type and is not a use of one as a value.
+    source := "type Either \{ Left \{ left: A } Right \{ right: B } }\nproc main(): void \{ Either<Str, Int> went = Either.Left(\"l\")  echo 1 }"
+    assert problem(source) == ""
 }

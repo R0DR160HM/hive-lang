@@ -98,6 +98,7 @@ block       = "{" { statement } "}" ;
 
 statement   = var-decl
             | typed-decl
+            | pattern-decl
             | assign
             | compound-assign
             | step
@@ -115,6 +116,8 @@ statement   = var-decl
 
 var-decl    = [ "mut" ] IDENT ":=" [ "async" ] expression ;
 typed-decl  = [ "mut" ] type IDENT "=" [ "async" ] expression ;
+pattern-decl
+            = pattern ":=" expression "else" "{" arm { arm } "}" ;
 
 assign      = lvalue "=" expression ;
 lvalue      = IDENT { "." IDENT | "[" expression "]" } ;
@@ -151,7 +154,9 @@ mutable** — the post clause advances it — so `for i := 0; i < 10; i++` needs
 `mut`, and that counter is held to the `mut` naming rule (never `UPPER_CASE`).
 
 A `switch` arm has exactly one `position` per subject
-([06](06-statements.md#64-switch)).
+([06](06-statements.md#64-switch)), and a `pattern-decl`'s arm has one. A
+`pattern-decl` takes the rest of its block as the body its pattern matched into
+([06](06-statements.md#binding-with-a-pattern)).
 
 ## 2.6 Expressions
 

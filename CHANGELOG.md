@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.2
+
+### Language
+
+* **A pattern on the left of `:=` binds for the rest of the block**: `Result.Ok(text) := read(path) else { Result.Error(why) { return ... } }`, whose `else` arms take every other value and each has to leave the block.
+
+### Tooling
+
+* **`hive indent <path>`** respells every Hive file's indentation in spaces, a tab to the next multiple of four, and never what a literal holds.
+
 ## v0.3.1
 
 ### Language
