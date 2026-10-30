@@ -419,8 +419,10 @@ type JsonValue {
 **A `Table` has no JSON.** It is rows of cells with nothing to name them, so
 `encode`, `T.decode` and a message crossing [`hive.syslink`](#1410-hivesyslink)
 refuse one wherever it sits in the value — `Str[dyn][dyn]` being the same type —
-and `Table.decode` does not exist. **Nor has a [`Secret`](03-types.md#311-secret)**,
-refused the same way: only `reveal` opens one.
+and `Table.decode` does not exist. **A [`Secret`](03-types.md#311-secret) is
+never written**: `encode` and a message refuse one the same way, since only
+`reveal` opens one. It can be *read*, though — `T.decode` reads a `Secret<U>`
+field as the `U` the document holds and keeps it the way `bypass` would.
 
 ## 14.8 `hive.crypto`
 
@@ -741,7 +743,8 @@ along. Never open one per query.
 
 A runtime failure is a `SqlError`: `Connection` (the database could not be
 opened or reached, or the connection is closed), `Statement` (the database
-refused or failed it), `Shape` (a different number of columns came back) or
+refused or failed it), `Shape` (the columns that came back are not the row's
+fields: one fills no field, a field has none, or two fill the same one) or
 `Convert` (a cell did not fit its field's type), each with a `message`.
 
 **In-memory SQLite** belongs to the *connection*, not the process, which under a

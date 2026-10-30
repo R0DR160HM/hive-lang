@@ -1,5 +1,7 @@
 // A `:=` binding of `hive.map.new()` or `at(...)` says nothing about what it
-// holds, so it takes its type from the first later use that does, and keeps it.
+// holds, and one of `Result.Ok(v)` says nothing about its `Error` half (nor
+// `Result.Error(e)` about its `Ok`), so it takes its type from the first later
+// use that does, and keeps it.
 import ./ast
 import ./infer
 import ./stdlib
@@ -43,8 +45,9 @@ proc pinStmts(env: infer.Env, stmts: ast.Stmt[], at: Int, result: types.Ty, out:
 }
 
 func unpinned(env: infer.Env, value: ast.Expr): types.Ty {
-	if infer.typeOf(env, value) is types.Ty.TAddress(_) {
-		return infer.typeOf(env, value)
+	held := infer.typeOf(env, value)
+	if held is types.Ty.TAddress(_) || held is types.Ty.TResult(_, _) {
+		return held
 	}
 	return types.Ty.TMap(types.Ty.TUnknown(), types.Ty.TUnknown())
 }
@@ -99,6 +102,9 @@ func steppedAll(env: infer.Env, stmts: ast.Stmt[], at: Int): infer.Env {
 }
 
 func unwritten(value: ast.Expr): Bool {
+	if infer.isResultLiteral(value) {
+		return true
+	}
 	if value is ast.Expr.Call(callee, _) {
 		if callee is ast.Expr.Ident(name) {
 			return name == "at"
@@ -127,6 +133,9 @@ func complete(ty: types.Ty): Bool {
 	if ty is types.Ty.TMap(key, value) {
 		return (key is types.Ty.TUnknown) == false && (value is types.Ty.TUnknown) == false
 	}
+	if ty is types.Ty.TResult(ok, bad) {
+		return (ok is types.Ty.TUnknown) == false && (bad is types.Ty.TUnknown) == false
+	}
 	return false
 }
 
@@ -147,7 +156,7 @@ func merged(sofar: types.Ty, seen: types.Ty): types.Ty {
 		}
 		return types.Ty.TMap(k, v)
 	}
-	return sofar
+	return types.filledIn(sofar, seen)
 }
 
 proc firstUse(env: infer.Env, name: Str, stmts: ast.Stmt[], at: Int, result: types.Ty, sofar: types.Ty): types.Ty {
@@ -236,8 +245,14 @@ proc inExpr(env: infer.Env, name: Str, e: ast.Expr, sofar: types.Ty): types.Ty {
 		}
 		return inCall(env, name, callee, args, known)
 	}
-	if e is ast.Expr.Binary(_, left, right) {
-		return inExpr(env, name, right, inExpr(env, name, left, sofar))
+	if e is ast.Expr.Binary(op, left, right) {
+		mut known := inExpr(env, name, right, inExpr(env, name, left, sofar))
+		// The two sides of an `==` are one type, so each says what the other is.
+		if op is ast.BinOp.Eq || op is ast.BinOp.Neq {
+			known = landed(known, name, left, infer.typeOf(env, right))
+			known = landed(known, name, right, infer.typeOf(env, left))
+		}
+		return known
 	}
 	if e is ast.Expr.Negate(operand) { return inExpr(env, name, operand, sofar) }
 	if e is ast.Expr.Not(operand) { return inExpr(env, name, operand, sofar) }

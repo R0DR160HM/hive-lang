@@ -180,7 +180,109 @@ test "a generic type in a signature is the copy there too" {
 	assert has(got, "(func sizeOf ((b Box_Str)) Int")
 }
 
+// --- A variable inside a generic type ----------------------------------------
+//
+// A parameter written `Box<T>` reads `T` off the arguments the box it is handed
+// was written out at. Only the copy's name still says what those were, so they
+// are read back from the copy, however the value got there.
+
+// A generic `Box`, a `count` taking one, `extra` declarations, and a `main` that
+// uses them however the test says.
+func withBox(extra: Str, body: Str): Str {
+	return "type Box \{ items: T[dyn]  label: Str }\nfunc count(b: Box<T>): Int \{ return len(b.items) }\n" + extra + "\nproc main(): void \{ " + body + " }"
+}
+
+test "a variable inside a generic type is read off that type's arguments" {
+	got := expanded(withBox("", "Box<Int> n = Box([1, 2, 3], \"n\")  echo count(n)"))
+	assert has(got, "(call count_Int n)")
+	assert has(got, "(func count_Int ((b Box_Int)) Int")
+	assert has(got, "count_Str") == false
+}
+
+test "a box of boxes is read one layer at a time" {
+	got := expanded(withBox("func deep(b: Box<Box<T>>): Int \{ return len(b.items) }", "Box<Box<Int>> n = Box([Box([1], \"a\")], \"n\")  echo deep(n)  echo count(n)"))
+	assert has(got, "(call deep_Int n)")
+	assert has(got, "(call count_Box_Int n)")
+}
+
+test "a box inside a Result is read through it" {
+	got := expanded(withBox("func okCount(r: Result<Box<T>, Str>): Int \{ if r is Result.Ok(b) \{ return count(b) } return 0 }", "Box<Int> n = Box([1], \"n\")  Result<Box<Int>, Str> r = Result.Ok(n)  echo okCount(r)"))
+	assert has(got, "(call okCount_Int r)")
+	assert has(got, "(call count_Int b)")
+}
+
+test "a box built in place, bound with :=, or answered by a call says the same" {
+	got := expanded(withBox("func made(): Box<Int> \{ return Box([4], \"made\") }", "echo count(Box([1], \"in place\"))  b := Box([2.5], \"bound\")  echo count(b)  echo count(made())"))
+	assert has(got, "(call count_Int (call Box_Int [1] \"in place\"))")
+	assert has(got, "(call count_Float b)")
+	assert has(got, "(call count_Int (call made))")
+}
+
+test "and so does a field holding one" {
+	got := expanded(withBox("type Holder \{ box: Box<Int> }", "Holder h = Holder(Box([1], \"held\"))  echo count(h.box)"))
+	assert has(got, "(call count_Int (. h box))")
+}
+
+test "a generic's own answer is read as the copy it answers with" {
+	got := expanded(withBox("func boxOf(v: T[]): Box<T> \{ return Box(v, \"of\") }", "Int[dyn] v = [1]  b := boxOf(v)  echo count(b)"))
+	assert has(got, "(call count_Int b)")
+}
+
+// --- What an empty vector says -----------------------------------------------
+//
+// Nothing: `[]` has no element to read `T` off, so another argument decides, or
+// the declaration the value lands in.
+
+test "an empty vector pins nothing down, so another argument does" {
+	got := expanded("func firstOr(v: T[], fallback: T): T \{ return fallback }\nproc main(): void \{ echo firstOr([], 42) }")
+	assert has(got, "(call firstOr_Int [] 42)")
+}
+
+test "a declaration says which copy a constructor builds, ahead of its arguments" {
+	got := expanded(withBox("", "Box<Int> none = Box([], \"none\")  echo count(none)"))
+	assert has(got, "(lett Box_Int none (call Box_Int [] \"none\"))")
+	assert has(got, "Box_Str") == false
+}
+
+test "and so does a declared result" {
+	got := expanded(withBox("func none(): Box<Int> \{ return Box([], \"none\") }", "echo count(none())"))
+	assert has(got, "(return (call Box_Int [] \"none\"))")
+	assert has(got, "Box_Str") == false
+}
+
+test "a generic's declared result aims a constructor in each copy" {
+	got := expanded(withBox("func boxOf(v: T[]): Box<T> \{ if len(v) > 0 \{ return Box(v, \"of\") } return Box([], \"empty\") }", "Int[dyn] v = [1]  echo count(boxOf(v))"))
+	assert has(got, "(return (call Box_Int [] \"empty\"))")
+	assert has(got, "Box_Str") == false
+}
+
+test "a union's variant in a return is aimed by the declared result" {
+	source := "type Either \{ Left \{ left: A } Right \{ right: B } }\nfunc goLeft(s: Str): Either<Str, Int> \{ return Either.Left(s) }\nproc main(): void \{ if goLeft(\"l\") is Either.Left(v) \{ echo v } }"
+	got := expanded(source)
+	assert has(got, "(return (call (. Either_Str_Int Left) s))")
+	assert has(got, "(is (call goLeft \"l\") Either_Str_Int.Left(v))")
+}
+
+// --- Partial application -----------------------------------------------------
+
+test "a hole is fine once what is passed fixes every variable" {
+	got := expanded("func firstOr(v: T[], fallback: T): T \{ return fallback }\nproc main(): void \{ pick := firstOr(_, \"x\")  echo 1 }")
+	assert has(got, "(call firstOr_Str _ \"x\")")
+}
+
 // --- What is refused ---------------------------------------------------------
+
+test "a hole may not stand where the only type variable is read from" {
+	// `_` becomes a parameter of the function value, and a value carries no
+	// types, so nothing would say which copy it calls.
+	got := problem(withFirst("f := first(_)  echo 1"))
+	assert text.startsWith(got, "`_` stands where `first` reads `T` from")
+}
+
+test "nor in a constructor of a generic type" {
+	got := problem(withBox("", "builder := Box(_, \"x\")  echo 1"))
+	assert text.startsWith(got, "`_` stands where `Box` reads `T` from")
+}
 
 test "a generic callable cannot be used as a value" {
 	got := problem(withFirst("f := first  echo f"))

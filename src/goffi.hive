@@ -29,6 +29,7 @@ import ./fetch
 import ./naming
 import ./paths
 import ./text
+import hive.crypto
 import hive.file
 import hive.term
 
@@ -432,9 +433,15 @@ func packageOf(path: Str): Str {
 
 // --- Asking the Go toolchain -------------------------------------------------
 
-// Runs the reader over `path` and answers with what it printed. The file is
-// copied into the tool's own directory first under a non-`.go` name, so
-// `go run .` still compiles only the reader.
+// Runs the reader over `path` and answers with what it printed. The reader runs
+// in the tool's own directory, and `path` is relative to this compiler's, which
+// Hive has no way to name — so the file is copied in beside the reader first,
+// under a non-`.go` name so `go run .` still compiles only the reader.
+//
+// The copy's name is this run's alone. Every compiler on the machine shares the
+// tool, and two running at once — a parallel test run, two terminals — would
+// otherwise each read whichever copy was written last, and check a program
+// against signatures it never imported.
 proc run(path: Str, display: Str): Result<Str, Str> {
 	where := install()
 	if where is Result.Error(why) {
@@ -445,12 +452,17 @@ proc run(path: Str, display: Str): Result<Str, Str> {
 		if source is Result.Error(why) {
 			return Result.Error("could not read {display}: {why.message}")
 		}
+		staged := "subject-" + hive.crypto.randomHex(8) + ".gotext"
+		stagedPath := paths.joinPath(directory, staged)
 		if source is Result.Ok(contents) {
-			if hive.file.write(paths.joinPath(directory, "subject.gotext"), contents) is Result.Error(why) {
+			if hive.file.write(stagedPath, contents) is Result.Error(why) {
+				hive.file.delete(stagedPath)
 				return Result.Error("could not stage {display} for reading: {why.message}")
 			}
 		}
-		said := hive.term.exec("go", ["run", ".", "subject.gotext"], directory)
+		said := hive.term.exec("go", ["run", ".", staged], directory)
+		// The copy goes whatever the reader made of it.
+		hive.file.delete(stagedPath)
 		if said is Result.Ok(printed) {
 			return Result.Ok(printed)
 		}
@@ -458,7 +470,9 @@ proc run(path: Str, display: Str): Result<Str, Str> {
 			if why.code < 0 {
 				return Result.Error("importing a Go file needs the Go toolchain on the PATH, and `go` is not there. It is the same toolchain a build already needs; install it from https://go.dev/dl/.")
 			}
-			return Result.Error("the Go toolchain could not read {display}. A Go file has to be valid Go before Hive can call it:\n\n" + why.output)
+			// Go's parser names the file it read, which was the copy. The lines are
+			// the same, so the original's name is put back where the copy's was.
+			return Result.Error("the Go toolchain could not read {display}. A Go file has to be valid Go before Hive can call it:\n\n" + text.replace(why.output, staged, path))
 		}
 	}
 	return Result.Error("could not run the Go declaration reader")
@@ -483,13 +497,33 @@ proc install(): Result<Str, Str> {
 
 // Written only when it differs, so an unchanged tool is left alone and Go's
 // build cache keeps holding it.
+//
+// The compiler that finds the tool missing is seldom the only one: a parallel
+// test run starts several at once, and each finds it missing. Writing in place
+// would let one `go run` compile a `main.go` another had only half written, and
+// report the result as the imported file's fault. So the file is written under
+// a name of its own and renamed into place, which a reader sees whole or not at
+// all. Windows refuses a rename onto a file somebody has open; when it does,
+// another compiler has just put the file there, and whether it holds the same
+// bytes is checked rather than assumed.
 proc write(path: Str, contents: Str): Result<Bool, Str> {
 	if hive.file.read(path) is Result.Ok(already) {
 		if already == contents {
 			return Result.Ok(true)
 		}
 	}
-	if hive.file.write(path, contents) is Result.Error(why) {
+	pending := path + "." + hive.crypto.randomHex(8) + ".tmp"
+	if hive.file.write(pending, contents) is Result.Error(why) {
+		hive.file.delete(pending)
+		return Result.Error("could not write {pending}: {why.message}")
+	}
+	if hive.file.move(pending, path) is Result.Error(why) {
+		hive.file.delete(pending)
+		if hive.file.read(path) is Result.Ok(already) {
+			if already == contents {
+				return Result.Ok(true)
+			}
+		}
 		return Result.Error("could not write {path}: {why.message}")
 	}
 	return Result.Ok(true)

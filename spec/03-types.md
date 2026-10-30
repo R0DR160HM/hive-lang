@@ -108,6 +108,17 @@ Result.Error(payload) // carries an E
 It is how every fallible operation reports itself. Matching both variants is
 exhaustive ([07](07-patterns.md#76-exhaustiveness)).
 
+`Result.Ok(value)` says what an `Ok` holds and nothing about an `Error`, and
+`Result.Error(payload)` the reverse, so the other half comes from where it
+lands: a declaration, a `return` whose callable declares a `Result`, an argument
+to a parameter or field declared as one, or the other side of an `==` or `!=` —
+`half(4) == Result.Ok(2)` builds the `Ok` that `half` answers with. Bound with
+`:=`, it takes the other half from the **first later use** that says it, as
+`hive.map.new()` does ([3.6](#36-maps)), and keeps it: a later use that
+disagrees is a compile error. `r := Result.Ok(3)` with nothing after it that
+says is a compile error too, and `Result<Int, Str> r = Result.Ok(3)` is the
+declaration that says it.
+
 ## 3.3 Vectors
 
 A vector is memory-contiguous and homogeneous. Its type is an element type
@@ -387,8 +398,14 @@ does not say what it holds.
 
 * **It is never shown.** `echo`, `panic` and an interpolation of a `Secret` are
   compile errors, and so are they of anything holding one — a field, an element,
-  a variant's payload, a `Result` — wherever it sits. So is `encode`ing or
-  decoding one, and sending one in a message, since a `Secret` has no JSON.
+  a variant's payload, a `Result` — wherever it sits. So is `encode`ing one, and
+  sending one in a message: a `Secret` is never written out.
+* **It can be read.** `T.decode` reads a field declared `Secret<U>` as the `U`
+  the document holds, with `U`'s own decoder, and keeps it the way `bypass`
+  would: in ordinary memory, since it was ordinary text in the document before
+  it got there. A value of the wrong kind is refused saying which kind it was —
+  "found a number" — and never what it held. `hide(reveal(s))` moves one into
+  locked memory where that matters.
 * **It is never swapped to disk.** What it holds is written as bytes into memory
   the operating system is told to keep in RAM (`mlock` on Linux and macOS,
   `VirtualLock` on Windows), and cleared once nothing holds the `Secret` any more.
