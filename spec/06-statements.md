@@ -37,6 +37,37 @@ for `v` to hold — and neither can an `async` call to one.
 a call `with timeout`). A value computed and then dropped — `x + 1` on a line of
 its own — is a compile error; `_ := x + 1` is how to drop one on purpose.
 
+### Binding with a pattern
+
+```hive
+Result.Ok(text) := hive.file.read(path) else {
+	Result.Error(file.FileError.NotFound(_, _)) { return Result.Ok(defaults()) }
+	Result.Error(why)                           { return Result.Error(why.message) }
+}
+echo text
+```
+
+A [pattern](07-patterns.md) on the left of `:=` binds what it takes from the value
+on the right, and the `else` holds an arm for **every value it does not take**.
+The arms are a [`switch`](#64-switch)'s, with one position each — a pattern, a
+literal or `_` — and the first that matches runs.
+
+**Every arm leaves the block**: it ends in `return`, `panic`, `break` or
+`continue`, or in an `if` or a `switch` whose every branch does. One that could
+reach its end is a compile error, so the lines after the binding run only once
+the pattern has matched, and nothing can reach them without what it bound.
+
+**It is a `switch`** whose first arm is the pattern, with the rest of the block
+for its body, and it is held to everything a `switch` is: the value is evaluated
+once, the pattern and the arms together take every value it can have, and an arm
+the pattern or the arms above it already take is a compile error
+([7.8](07-patterns.md#78-switch)).
+
+What the pattern binds is **immutable** and belongs to the block the binding is
+written in, so a name the block already declared, or declares after it, is a
+compile error. A binding is a statement of its own: it may not be a loop's init
+or post clause, and its value may not be `async`.
+
 ## 6.2 Assignment
 
 ```hive

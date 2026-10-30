@@ -12,6 +12,7 @@
 //   hive analyze   <entrypoint.hive>       score what it will cost, and write a page
 //   hive container <entrypoint.hive>       write a Dockerfile that builds and runs it
 //   hive agents                            write .hivedocs/ for a coding agent to read
+//   hive indent    <directory or file>     indent every Hive file there with spaces
 //   hive version                           which release this compiler is
 //
 // Everything a compiler is made of happens here, as does driving the Go
@@ -20,6 +21,7 @@ import ./agents
 import ./analyzereport
 import ./container
 import ./diag
+import ./indent
 import ./paths
 import ./progress
 import ./project
@@ -30,75 +32,79 @@ import hive.file
 import hive.term
 
 proc main(): void {
-	args := hive.term.args()
-	// Answered ahead of everything below, because these are the two commands with
-	// no source to read: the dispatch further down has resolved an entrypoint and
-	// started a clock before it gets to choose.
-	if at(args, 0) == "version" {
-		release(rest(args, 1))
-		return
-	}
-	if at(args, 0) == "agents" {
-		document(rest(args, 1))
-		return
-	}
-	if len(args) == 0 {
-		usage()
-		return
-	}
-	command := at(args, 0)
-	if isCommand(command) == false {
-		refuse("`{command}` is not a command. `hive` alone lists the ones there are.")
-	}
-	if len(args) < 2 {
-		refuse("`hive {command}` needs an entrypoint: `hive {command} <entrypoint.hive>`.")
-	}
-	// The one path that comes from a shell rather than from Hive source. Left as
-	// typed, `src\hivec.hive` holds no `/` at all, so every import resolves
-	// against the folder the command ran in.
-	entry := paths.fromShell(at(args, 1))
-	// One clock for the whole command, started before anything is read, so every
-	// line of progress says how long *this* has been going.
-	from := progress.started()
+    args := hive.term.args()
+    // Answered ahead of everything below, because these are the commands with no
+    // entrypoint: the dispatch further down has resolved one and started a clock
+    // before it gets to choose.
+    if at(args, 0) == "version" {
+        release(rest(args, 1))
+        return
+    }
+    if at(args, 0) == "agents" {
+        document(rest(args, 1))
+        return
+    }
+    if at(args, 0) == "indent" {
+        reindent(rest(args, 1))
+        return
+    }
+    if len(args) == 0 {
+        usage()
+        return
+    }
+    command := at(args, 0)
+    if isCommand(command) == false {
+        refuse("`{command}` is not a command. `hive` alone lists the ones there are.")
+    }
+    if len(args) < 2 {
+        refuse("`hive {command}` needs an entrypoint: `hive {command} <entrypoint.hive>`.")
+    }
+    // The one path that comes from a shell rather than from Hive source. Left as
+    // typed, `src\hivec.hive` holds no `/` at all, so every import resolves
+    // against the folder the command ran in.
+    entry := paths.fromShell(at(args, 1))
+    // One clock for the whole command, started before anything is read, so every
+    // line of progress says how long *this* has been going.
+    from := progress.started()
 
-	// `--target` belongs to the two commands that write something for a platform:
-	// two others compile nothing, two more are about this machine by definition,
-	// and `run` hands everything past the entrypoint to the program.
-	if command != "build" && command != "export" && command != "run" {
-		if mentions(rest(args, 2), "--target") {
-			refuse("`--target` is a flag of `hive build` and `hive export`. `{command}` builds nothing for another platform.")
-		}
-	}
-	// Something typed and then ignored is a command that quietly disobeyed.
-	if command != "build" && command != "export" && command != "run" && len(args) > 2 {
-		refuse("`hive {command}` takes an entrypoint and nothing else. `" + at(args, 2) + "` was given to it.")
-	}
+    // `--target` belongs to the two commands that write something for a platform:
+    // two others compile nothing, two more are about this machine by definition,
+    // and `run` hands everything past the entrypoint to the program.
+    if command != "build" && command != "export" && command != "run" {
+        if mentions(rest(args, 2), "--target") {
+            refuse("`--target` is a flag of `hive build` and `hive export`. `{command}` builds nothing for another platform.")
+        }
+    }
+    // Something typed and then ignored is a command that quietly disobeyed.
+    if command != "build" && command != "export" && command != "run" && len(args) > 2 {
+        refuse("`hive {command}` takes an entrypoint and nothing else. `" + at(args, 2) + "` was given to it.")
+    }
 
-	if command == "check" {
-		report(project.check(entry, from), "No problems found in {entry}", from)
-	} else if command == "emit" {
-		emit(entry, from)
-	} else if command == "build" {
-		build(entry, rest(args, 2), from)
-	} else if command == "export" {
-		export(entry, rest(args, 2), from)
-	} else if command == "run" {
-		run(entry, rest(args, 2), from)
-	} else if command == "test" {
-		if hive.file.list(entry) is Result.Ok(_) {
-			suites(entry, from)
-		} else {
-			suite(entry, from)
-		}
-	} else if command == "analyze" {
-		score(entry, from)
-	} else if command == "container" {
-		dockerfile(entry, from)
-	}
+    if command == "check" {
+        report(project.check(entry, from), "No problems found in {entry}", from)
+    } else if command == "emit" {
+        emit(entry, from)
+    } else if command == "build" {
+        build(entry, rest(args, 2), from)
+    } else if command == "export" {
+        export(entry, rest(args, 2), from)
+    } else if command == "run" {
+        run(entry, rest(args, 2), from)
+    } else if command == "test" {
+        if hive.file.list(entry) is Result.Ok(_) {
+            suites(entry, from)
+        } else {
+            suite(entry, from)
+        }
+    } else if command == "analyze" {
+        score(entry, from)
+    } else if command == "container" {
+        dockerfile(entry, from)
+    }
 }
 
 func isCommand(command: Str): Bool {
-	return indexOf(["check", "emit", "build", "export", "run", "test", "analyze", "container"], command) is Result.Ok(_)
+    return indexOf(["check", "emit", "build", "export", "run", "test", "analyze", "container"], command) is Result.Ok(_)
 }
 
 // --- The commands ------------------------------------------------------------
@@ -107,184 +113,184 @@ func isCommand(command: Str): Bool {
 // `hive emit x.hive > main.go` work — and the reason progress goes to standard
 // error rather than getting in the way of it.
 proc emit(entry: Str, from: Int): void {
-	written := project.emitOnly(entry, from)
-	if written is Result.Ok(source) {
-		echo source
-	} else if written is Result.Error(errors) {
-		complain(errors)
-	}
+    written := project.emitOnly(entry, from)
+    if written is Result.Ok(source) {
+        echo source
+    } else if written is Result.Error(errors) {
+        complain(errors)
+    }
 }
 
 proc build(entry: Str, flags: Str[], from: Int): void {
-	asked := askedFor("build", flags)
-	if asked.error != "" {
-		refuse(asked.error)
-	}
-	// A platform the toolchain cannot build for is a mistake in what was typed
-	// rather than in the program, so it is said now rather than after a whole
-	// compile. A toolchain that could not be asked at all is about the build.
-	if asked.target != "" {
-		known := project.buildsFor(entry, asked.target)
-		if known is Result.Error(why) {
-			complain([why])
-			return
-		}
-		if known is Result.Ok(builds) {
-			if builds == false {
-				refuse("`--target " + asked.target + "` is not a platform the Go toolchain builds for. A target is a `goos/goarch` pair — `linux/arm64`, `darwin/arm64`, `windows/amd64` — and `go tool dist list` names every one it knows.")
-			}
-		}
-	}
-	written := project.compile(entry, asked.target, from)
-	if len(written.errors) > 0 {
-		complain(written.errors)
-		return
-	}
-	// What it cost is part of the answer, so this goes to standard output and is
-	// said whether anybody was watching or not.
-	echo "Compiled {entry} -> " + project.executableOf(entry, asked.target) + " (" + progress.took(progress.since(from)) + ")"
+    asked := askedFor("build", flags)
+    if asked.error != "" {
+        refuse(asked.error)
+    }
+    // A platform the toolchain cannot build for is a mistake in what was typed
+    // rather than in the program, so it is said now rather than after a whole
+    // compile. A toolchain that could not be asked at all is about the build.
+    if asked.target != "" {
+        known := project.buildsFor(entry, asked.target)
+        if known is Result.Error(why) {
+            complain([why])
+            return
+        }
+        if known is Result.Ok(builds) {
+            if builds == false {
+                refuse("`--target " + asked.target + "` is not a platform the Go toolchain builds for. A target is a `goos/goarch` pair — `linux/arm64`, `darwin/arm64`, `windows/amd64` — and `go tool dist list` names every one it knows.")
+            }
+        }
+    }
+    written := project.compile(entry, asked.target, from)
+    if len(written.errors) > 0 {
+        complain(written.errors)
+        return
+    }
+    // What it cost is part of the answer, so this goes to standard output and is
+    // said whether anybody was watching or not.
+    echo "Compiled {entry} -> " + project.executableOf(entry, asked.target) + " (" + progress.took(progress.since(from)) + ")"
 }
 
 // The program wrapped in an app that can be installed. The one format it knows
 // is Android's, and the target is asked for rather than assumed: another format
 // would make a default mean something else.
 proc export(entry: Str, flags: Str[], from: Int): void {
-	asked := askedFor("export", flags)
-	if asked.error != "" {
-		refuse(asked.error)
-	}
-	if asked.target == "" {
-		refuse("`hive export` needs a target, and the one it knows is `--target android/arm64`.")
-	}
-	if asked.target != "android/arm64" {
-		refuse(refusalOf(asked.target))
-	}
-	written := project.export(entry, asked.target, from)
-	if len(written.errors) > 0 {
-		complain(written.errors)
-		return
-	}
-	echo "Packaged {entry} -> " + project.apkOf(entry, asked.target) + " (" + progress.took(progress.since(from)) + ")"
+    asked := askedFor("export", flags)
+    if asked.error != "" {
+        refuse(asked.error)
+    }
+    if asked.target == "" {
+        refuse("`hive export` needs a target, and the one it knows is `--target android/arm64`.")
+    }
+    if asked.target != "android/arm64" {
+        refuse(refusalOf(asked.target))
+    }
+    written := project.export(entry, asked.target, from)
+    if len(written.errors) > 0 {
+        complain(written.errors)
+        return
+    }
+    echo "Packaged {entry} -> " + project.apkOf(entry, asked.target) + " (" + progress.took(progress.since(from)) + ")"
 }
 
 // Why a target is not one an app can be written for. Android's other
 // architectures are answered apart, because they are the ones somebody would
 // reasonably expect to work.
 func refusalOf(target: Str): Str {
-	if target == "android/386" || target == "android/amd64" || target == "android/arm" {
-		return "`--target {target}` needs a C cross-compiler, which is the one thing a machine with the Go toolchain on it cannot be assumed to have. `android/arm64` is the only Android target Go links on its own, and it is what a handset is."
-	}
-	return "`hive export` knows one format, and it is Android's. It takes `--target android/arm64`; `{target}` has no app to be packaged into."
+    if target == "android/386" || target == "android/amd64" || target == "android/arm" {
+        return "`--target {target}` needs a C cross-compiler, which is the one thing a machine with the Go toolchain on it cannot be assumed to have. `android/arm64` is the only Android target Go links on its own, and it is what a handset is."
+    }
+    return "`hive export` knows one format, and it is Android's. It takes `--target android/arm64`; `{target}` has no app to be packaged into."
 }
 
 proc run(entry: Str, args: Str[], from: Int): void {
-	answered := project.run(entry, args, from)
-	if answered is Result.Error(errors) {
-		complain(errors)
-	} else if answered is Result.Ok(code) {
-		// The program's status is this command's status: a script that runs a
-		// Hive program through `hive run` should see what the program said.
-		if code != 0 {
-			hive.term.exit(code)
-		}
-	}
+    answered := project.run(entry, args, from)
+    if answered is Result.Error(errors) {
+        complain(errors)
+    } else if answered is Result.Ok(code) {
+        // The program's status is this command's status: a script that runs a
+        // Hive program through `hive run` should see what the program said.
+        if code != 0 {
+            hive.term.exit(code)
+        }
+    }
 }
 
 // Named `suite` rather than `test`, because `test` is a keyword.
 proc suite(entry: Str, from: Int): void {
-	titles := project.testTitles(entry)
-	answered := project.runTests(entry, titles, from)
-	if answered is Result.Error(errors) {
-		complain(errors)
-		return
-	}
-	if answered is Result.Ok(said) {
-		progress.step(from, "reading the report")
-		echo testreport.render(project.buildDirOf(entry), titles, said)
-		// A failing suite is a failing command, which is what makes `hive test`
-		// the thing a commit hook or a CI step runs.
-		if testreport.failures(titles, said) > 0 {
-			hive.term.exit(1)
-		}
-	}
+    titles := project.testTitles(entry)
+    answered := project.runTests(entry, titles, from)
+    if answered is Result.Error(errors) {
+        complain(errors)
+        return
+    }
+    if answered is Result.Ok(said) {
+        progress.step(from, "reading the report")
+        echo testreport.render(project.buildDirOf(entry), titles, said)
+        // A failing suite is a failing command, which is what makes `hive test`
+        // the thing a commit hook or a CI step runs.
+        if testreport.failures(titles, said) > 0 {
+            hive.term.exit(1)
+        }
+    }
 }
 
 // `hive test <directory>`: every test under it, and every test outside it that a
 // file under it imports, each file's tests run once.
 proc suites(directory: Str, from: Int): void {
-	progress.step(from, "finding the tests under {directory}")
-	mut project.Reached[dyn] reached = []
-	mut broken := 0
-	for each file in project.hiveFilesUnder(directory) {
-		found := project.reached(file)
-		if found is Result.Error(errors) {
-			tell(errors)
-			broken = broken + 1
-		} else if found is Result.Ok(r) {
-			append(reached, r)
-		}
-	}
-	planned := project.plan(reached)
-	if len(planned) == 0 && broken == 0 {
-		echo "No tests under {directory} (" + progress.took(progress.since(from)) + ")"
-		return
-	}
-	mut passed := 0
-	mut failed := 0
-	for each p in planned {
-		echo p.entry
-		answered := project.runTests(p.entry, p.titles, from)
-		if answered is Result.Error(errors) {
-			tell(errors)
-			broken = broken + 1
-		} else if answered is Result.Ok(said) {
-			echo testreport.render(project.buildDirOf(p.entry), p.titles, said)
-			missed := testreport.failures(p.titles, said)
-			failed = failed + missed
-			passed = passed + len(p.titles) - missed
-		}
-		echo ""
-	}
-	echo totals(len(planned), passed, failed, broken)
-	if failed > 0 || broken > 0 {
-		hive.term.exit(1)
-	}
+    progress.step(from, "finding the tests under {directory}")
+    mut project.Reached[dyn] reached = []
+    mut broken := 0
+    for each file in project.hiveFilesUnder(directory) {
+        found := project.reached(file)
+        if found is Result.Error(errors) {
+            tell(errors)
+            broken = broken + 1
+        } else if found is Result.Ok(r) {
+            append(reached, r)
+        }
+    }
+    planned := project.plan(reached)
+    if len(planned) == 0 && broken == 0 {
+        echo "No tests under {directory} (" + progress.took(progress.since(from)) + ")"
+        return
+    }
+    mut passed := 0
+    mut failed := 0
+    for each p in planned {
+        echo p.entry
+        answered := project.runTests(p.entry, p.titles, from)
+        if answered is Result.Error(errors) {
+            tell(errors)
+            broken = broken + 1
+        } else if answered is Result.Ok(said) {
+            echo testreport.render(project.buildDirOf(p.entry), p.titles, said)
+            missed := testreport.failures(p.titles, said)
+            failed = failed + missed
+            passed = passed + len(p.titles) - missed
+        }
+        echo ""
+    }
+    echo totals(len(planned), passed, failed, broken)
+    if failed > 0 || broken > 0 {
+        hive.term.exit(1)
+    }
 }
 
 func totals(programs: Int, passed: Int, failed: Int, broken: Int): Str {
-	said := "  " + progress.counted(programs, "program") + ", " + text.trim(testreport.tally(passed, failed))
-	if broken > 0 {
-		return said + "; {broken} did not compile"
-	}
-	return said
+    said := "  " + progress.counted(programs, "program") + ", " + text.trim(testreport.tally(passed, failed))
+    if broken > 0 {
+        return said + "; {broken} did not compile"
+    }
+    return said
 }
 
 // A score per `proc` and `func`, the copies and loops behind it, and an HTML page
 // beside the entrypoint. Everything found goes on the page; what it prints is the
 // part worth reading without opening one.
 proc score(entry: Str, from: Int): void {
-	answered := project.analyse(entry, from)
-	if answered is Result.Error(errors) {
-		complain(errors)
-		return
-	}
-	if answered is Result.Ok(done) {
-		for each line in analyzereport.lines(entry, done.report, done.path, from) {
-			echo line
-		}
-	}
+    answered := project.analyse(entry, from)
+    if answered is Result.Error(errors) {
+        complain(errors)
+        return
+    }
+    if answered is Result.Ok(done) {
+        for each line in analyzereport.lines(entry, done.report, done.path, from) {
+            echo line
+        }
+    }
 }
 
 // Writes a Dockerfile that builds this program and runs it, into the folder the
 // command was run in. A folder that already had a `Dockerfile` gets ours under a
 // name of its own, and the command says which file it wrote.
 proc dockerfile(entry: Str, from: Int): void {
-	written := container.write(entry, from)
-	if written is Result.Error(errors) {
-		complain(errors)
-	} else if written is Result.Ok(path) {
-		echo "Wrote " + path + " for {entry} (" + progress.took(progress.since(from)) + ")"
-	}
+    written := container.write(entry, from)
+    if written is Result.Error(errors) {
+        complain(errors)
+    } else if written is Result.Ok(path) {
+        echo "Wrote " + path + " for {entry} (" + progress.took(progress.since(from)) + ")"
+    }
 }
 
 // Writes documentation rather than a program: `.hivedocs/`, a short page per
@@ -292,51 +298,75 @@ proc dockerfile(entry: Str, from: Int): void {
 // sure of. Every line it prints is something it did, so a second run says what
 // changed.
 proc document(args: Str[]): void {
-	wrong := agents.refusal(args)
-	if wrong != "" {
-		refuse(wrong)
-	}
-	written := agents.write()
-	if written is Result.Error(errors) {
-		complain(errors)
-		return
-	}
-	if written is Result.Ok(said) {
-		for each line in agents.report(said) {
-			echo line
-		}
-	}
+    wrong := agents.refusal(args)
+    if wrong != "" {
+        refuse(wrong)
+    }
+    written := agents.write()
+    if written is Result.Error(errors) {
+        complain(errors)
+        return
+    }
+    if written is Result.Ok(said) {
+        for each line in agents.report(said) {
+            echo line
+        }
+    }
 }
 
 // Which compiler this is. What it prints is bare — `v0.1.9` and nothing else —
 // so a script can use the line as it stands. No timing: a version that came back
 // with a duration stuck to it would not be a version.
+// `hive indent <path>`: names each file it rewrote, and fails on any it had to leave.
+proc reindent(args: Str[]): void {
+    if len(args) == 0 {
+        refuse("`hive indent` needs a directory or a `.hive` file: `hive indent .` indents the whole project.")
+    }
+    if len(args) > 1 {
+        refuse("`hive indent` takes one directory or file, and `" + at(args, 1) + "` was given after it.")
+    }
+    found := indent.filesAt(paths.fromShell(at(args, 0)))
+    if found is Result.Error(why) {
+        refuse(why)
+    }
+    if found is Result.Ok(files) {
+        done := indent.indentAll(files)
+        for each file in done.changed {
+            echo file
+        }
+        echo "Indented " + progress.counted(len(done.changed), "file") + " of {done.looked}"
+        if len(done.problems) > 0 {
+            complain(done.problems)
+        }
+    }
+}
+
 proc release(args: Str[]): void {
-	wrong := versionRefusal(args)
-	if wrong != "" {
-		refuse(wrong)
-	}
-	echo version.current()
+    wrong := versionRefusal(args)
+    if wrong != "" {
+        refuse(wrong)
+    }
+    echo version.current()
 }
 
 // Why whatever followed `hive version` cannot be used, or `""`. It takes no
 // entrypoint and no flags, so anything after it is refused rather than dropped:
 // something typed and then ignored is a command that quietly disobeyed.
 func versionRefusal(args: Str[]): Str {
-	if len(args) > 0 {
-		return "`hive version` takes nothing — it names this compiler and reads no source. `" + at(args, 0) + "` was given to it."
-	}
-	return ""
+    if len(args) > 0 {
+        return "`hive version` takes nothing — it names this compiler and reads no source. `" + at(args, 0) + "` was given to it."
+    }
+    return ""
 }
 
 // --- Saying so ---------------------------------------------------------------
 
 proc report(errors: diag.Diagnostic[], quiet: Str, from: Int): void {
-	if len(errors) > 0 {
-		complain(errors)
-		return
-	}
-	echo quiet + " (" + progress.took(progress.since(from)) + ")"
+    if len(errors) > 0 {
+        complain(errors)
+        return
+    }
+    echo quiet + " (" + progress.took(progress.since(from)) + ")"
 }
 
 // A compile error is printed exactly as the compiler wrote it: it opens with
@@ -344,39 +374,39 @@ proc report(errors: diag.Diagnostic[], quiet: Str, from: Int): void {
 // front of that would break it. Standard error, so `hive emit x.hive > main.go`
 // never writes one into the Go.
 proc complain(errors: diag.Diagnostic[]): void {
-	tell(errors)
-	hive.term.exit(1)
+    tell(errors)
+    hive.term.exit(1)
 }
 
 proc tell(errors: diag.Diagnostic[]): void {
-	for each e in errors {
-		hive.term.status(diag.render(e))
-	}
+    for each e in errors {
+        hive.term.status(diag.render(e))
+    }
 }
 
 // A mistake in what was typed rather than in any source, so it says who is
 // complaining.
 proc refuse(why: Str): void {
-	hive.term.status("hive: " + why)
-	hive.term.exit(1)
+    hive.term.status("hive: " + why)
+    hive.term.exit(1)
 }
 
 func at(args: Str[], index: Int): Str {
-	if args bounds index {
-		return args[index]
-	}
-	return ""
+    if args bounds index {
+        return args[index]
+    }
+    return ""
 }
 
 // Everything after the entrypoint is the program's own, forwarded to it.
 func rest(args: Str[], from: Int): Str[dyn] {
-	mut Str[dyn] out = []
-	for i := from; i < len(args); i++ {
-		if args bounds i {
-			append(out, args[i])
-		}
-	}
-	return out
+    mut Str[dyn] out = []
+    for i := from; i < len(args); i++ {
+        if args bounds i {
+            append(out, args[i])
+        }
+    }
+    return out
 }
 
 // --- What a build was asked for ------------------------------------------------
@@ -385,66 +415,67 @@ func rest(args: Str[], from: Int): Str[dyn] {
 // there, so `error` is either empty or the whole of what went wrong — a build
 // has nothing to get half right.
 type Asked {
-	// The platform to build for, `goos/goarch`, or `""` for this machine.
-	target: Str
-	error: Str
+    // The platform to build for, `goos/goarch`, or `""` for this machine.
+    target: Str
+    error: Str
 }
 
 // `--target linux/arm64` and `--target=linux/arm64` are one flag spelled two
 // ways. Anything else is refused rather than skipped: a flag a build ignored
 // is a build that did something other than what it was told, and said nothing.
 func askedFor(command: Str, flags: Str[]): Asked {
-	mut target := ""
-	mut wants := false
-	for each flag in flags {
-		if wants {
-			target = flag
-			wants = false
-		} else if flag == "--target" {
-			wants = true
-		} else if text.startsWith(flag, "--target=") {
-			target = text.span(text.chars(flag), len("--target="), len(flag) - 1)
-		} else {
-			return Asked("", "`" + flag + "` is not something `hive {command}` takes. The one flag here is `--target <goos>/<goarch>`.")
-		}
-	}
-	// `--target` with the platform left off, and `--target=` with it left empty,
-	// are the same mistake and get the same answer.
-	if wants || (len(flags) > 0 && target == "") {
-		return Asked("", "`--target` was given no platform to build for. It takes a `goos/goarch` pair — `hive {command} <entrypoint.hive> --target linux/arm64`.")
-	}
-	return Asked(target, "")
+    mut target := ""
+    mut wants := false
+    for each flag in flags {
+        if wants {
+            target = flag
+            wants = false
+        } else if flag == "--target" {
+            wants = true
+        } else if text.startsWith(flag, "--target=") {
+            target = text.span(text.chars(flag), len("--target="), len(flag) - 1)
+        } else {
+            return Asked("", "`" + flag + "` is not something `hive {command}` takes. The one flag here is `--target <goos>/<goarch>`.")
+        }
+    }
+    // `--target` with the platform left off, and `--target=` with it left empty,
+    // are the same mistake and get the same answer.
+    if wants || (len(flags) > 0 && target == "") {
+        return Asked("", "`--target` was given no platform to build for. It takes a `goos/goarch` pair — `hive {command} <entrypoint.hive> --target linux/arm64`.")
+    }
+    return Asked(target, "")
 }
 
 // Whether `flags` holds `name`, either spelling. Asked of the commands that
 // have no use for a flag, so that they can say so.
 func mentions(flags: Str[], name: Str): Bool {
-	for each flag in flags {
-		if flag == name || text.startsWith(flag, name + "=") {
-			return true
-		}
-	}
-	return false
+    for each flag in flags {
+        if flag == name || text.startsWith(flag, name + "=") {
+            return true
+        }
+    }
+    return false
 }
 
 proc usage(): void {
-	echo "Hive — a memory-managed language that compiles to Go"
-	echo ""
-	echo "Usage:"
-	echo "  hive check     <entrypoint.hive>       Report any errors, build nothing"
-	echo "  hive emit      <entrypoint.hive>       Print the generated Go source"
-	echo "  hive build     <entrypoint.hive>       Compile to a native executable"
-	echo "  hive export    <entrypoint.hive>       Package as an app, with --target android/arm64"
-	echo "  hive run       <entrypoint.hive> [..]  Compile and run"
-	echo "  hive test      <entrypoint.hive>       Run the program's tests, with coverage"
-	echo "  hive test      <directory>             Run every test under it, git-ignored files aside"
-	echo "  hive analyze   <entrypoint.hive>       Score what it will cost, and write a page"
-	echo "  hive container <entrypoint.hive>       Write a Dockerfile that builds and runs it"
-	echo "  hive agents                            Write .hivedocs/ for a coding agent to read"
-	echo "  hive version                           Print which release this compiler is"
-	echo ""
-	echo "Flags:"
-	echo "  --target <goos>/<goarch>               Build for another platform, on `build` and"
-	echo "                                         `export` alone. `go tool dist list` names"
-	echo "                                         every one; `export` takes android/arm64."
+    echo "Hive — a memory-managed language that compiles to Go"
+    echo ""
+    echo "Usage:"
+    echo "  hive check     <entrypoint.hive>       Report any errors, build nothing"
+    echo "  hive emit      <entrypoint.hive>       Print the generated Go source"
+    echo "  hive build     <entrypoint.hive>       Compile to a native executable"
+    echo "  hive export    <entrypoint.hive>       Package as an app, with --target android/arm64"
+    echo "  hive run       <entrypoint.hive> [..]  Compile and run"
+    echo "  hive test      <entrypoint.hive>       Run the program's tests, with coverage"
+    echo "  hive test      <directory>             Run every test under it, git-ignored files aside"
+    echo "  hive analyze   <entrypoint.hive>       Score what it will cost, and write a page"
+    echo "  hive container <entrypoint.hive>       Write a Dockerfile that builds and runs it"
+    echo "  hive agents                            Write .hivedocs/ for a coding agent to read"
+    echo "  hive indent    <directory or file>     Indent every Hive file there with spaces"
+    echo "  hive version                           Print which release this compiler is"
+    echo ""
+    echo "Flags:"
+    echo "  --target <goos>/<goarch>               Build for another platform, on `build` and"
+    echo "                                         `export` alone. `go tool dist list` names"
+    echo "                                         every one; `export` takes android/arm64."
 }

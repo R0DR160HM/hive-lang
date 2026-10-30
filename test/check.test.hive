@@ -197,6 +197,38 @@ test "a switch needs an arm and a value" {
 	assert opens(problem("proc log(): void \{ }\nproc main(): void \{ switch log() \{ _ \{ } } }"), "in `main`: this `switch` tests a call that answers with nothing")
 }
 
+test "a pattern bound with := covers its value together with its else" {
+	assert ending("r: Result<Int, Str>", "Result.Ok(n) := r else \{ Result.Error(e) \{ return e } }  return \"\{n}\"") == ""
+	assert ending("a: Foo", "Foo.Bar(n) := a else \{ _ \{ return \"none\" } }  return \"\{n}\"") == ""
+	got := ending("r: Result<Foo, Str>", "Result.Ok(Foo.Bar(n)) := r else \{ Result.Error(e) \{ return e } }  return \"\{n}\"")
+	assert got == "in `f`: neither the pattern nor an arm of this `else` takes `Result.Ok(Foo.Baz)`. Give that an arm of its own, or end the `else` with `_`"
+	assert opens(ending("s: Str", "\"/u/\{id}\" := s else \{ \"/x\" \{ return \"x\" } }  return id"), "in `f`: the arms of this `else` cannot take every value the pattern leaves")
+}
+
+test "an arm of a binding's else has to leave the block" {
+	got := ending("r: Result<Int, Str>", "Result.Ok(n) := r else \{ Result.Error(e) \{ echo e } }  return \"\{n}\"")
+	assert opens(got, "in `f`: arm 1 of this `else` can carry on past its end")
+	assert ending("r: Result<Int, Str>", "Result.Ok(n) := r else \{ Result.Error(e) \{ if e == \"\" \{ return \"a\" } else \{ panic e } } }  return \"\{n}\"") == ""
+	loop := "proc main(): void \{ for each r in rs() \{ Result.Ok(n) := r else \{ Result.Error(_) \{ continue } }  echo n } }"
+	assert problemCount("func rs(): Result<Int, Str>[dyn] \{ return [] }\n" + loop) == 0
+}
+
+test "an arm of a binding's else that the pattern or the arms above it take can never run" {
+	assert opens(ending("r: Result<Int, Str>", "Result.Ok(n) := r else \{ Result.Ok(_) \{ return \"a\" } Result.Error(_) \{ return \"b\" } }  return \"\{n}\""), "in `f`: arm 1 of this `else` can never run: the pattern takes every value it would")
+	assert opens(ending("a: Foo", "Foo.Bar(n) := a else \{ _ \{ return \"a\" } Foo.Baz \{ return \"b\" } }  return \"\{n}\""), "in `f`: arm 2 of this `else` can never run: the arms above it take every value it would")
+}
+
+test "what a pattern bound with := binds belongs to the block it is written in" {
+	already := "in `f`: `n` is already declared in this block"
+	assert opens(ending("r: Result<Int, Str>", "n := 1  Result.Ok(n) := r else \{ _ \{ return \"a\" } }  return \"\{n}\""), already)
+	assert opens(ending("r: Result<Int, Str>", "Result.Ok(n) := r else \{ _ \{ return \"a\" } }  n := 2  return \"\{n}\""), already)
+}
+
+test "a pattern bound with := has to be given a value" {
+	got := problem("proc log(): void \{ }\nproc main(): void \{ Result.Ok(n) := log() else \{ _ \{ return } } }")
+	assert opens(got, "in `main`: this binding takes its value from a call that answers with nothing")
+}
+
 test "a switch arm names every field of a variant or none, as `is` does" {
 	got := problem("type Foo \{ Bar \{ n: Int }  Baz }\nproc main(): void \{ x := Foo.Baz()  switch x \{ Foo.Bar() \{ } _ \{ } } }")
 	assert opens(got, "in `main`: `Foo.Bar` has 1 field, and this pattern binds no arguments")

@@ -600,6 +600,39 @@ test "a switch arm binds a name once across its positions" {
 	assert text.startsWith(got, "this arm binds `x` twice")
 }
 
+test "a pattern bound with := is a switch whose first arm holds the rest of its block" {
+	got := stmt("echo 1  Result.Ok(v) := r else \{ _ \{ panic \"no\" } }  echo v  echo 2")
+	assert got == "(echo 1) (bind [r] (is r Result.Ok(v)) (block (echo v) (echo 2)) true (block (panic \"no\")))"
+	assert stmt("Result.Ok(v) := f(x) else \{ Result.Error(e) \{ panic e } }") == "(bind (let _part_0 (call f x)) [_part_0] (is _part_0 Result.Ok(v)) (block) (is _part_0 Result.Error(e)) (block (panic e)))"
+}
+
+test "a pattern bound with := nests, and takes every kind of pattern" {
+	assert stmt("Result.Ok(Shape.Circle(r)) := s else \{ _ \{ panic \"no\" } }") == "(bind [s] (&& (is s Result.Ok(_part_1)) (is _part_1 Shape.Circle(r))) (block) true (block (panic \"no\")))"
+	assert text.startsWith(stmt("[first, ...rest] := v else \{ [] \{ panic \"no\" } }"), "(bind [v] (is v [first ...rest])")
+	assert text.startsWith(stmt("\"/users/\{id}\" := path else \{ _ \{ panic \"no\" } }"), "(bind [path] (is path (template \"/users/\" <id>))")
+}
+
+test "a path statement that is no pattern binding parses as it did" {
+	assert stmt("hive.file.write(p, \"x\" + y)") == "(call (. (. hive file) write) p (+ \"x\" y))"
+	assert stmt("r.count = 3") == "(= (. r count) 3)"
+}
+
+test "a pattern bound with := needs an else with arms" {
+	assert text.startsWith(problem("proc p(): void \{ Result.Ok(v) := r  echo v }"), "a pattern on the left of `:=` binds only the values it takes, so it needs an `else`")
+	assert text.startsWith(problem("proc p(): void \{ Result.Ok(v) := r else \{ } }"), "this `else` has no arms")
+	assert text.startsWith(problem("proc p(): void \{ Result.Ok(v) := r else \{ _, _ \{ } } }"), "this arm has too many patterns: the `else` tests one value")
+}
+
+test "a field written with := is most likely an assignment" {
+	got := problem("proc p(): void \{ r.count := 3 }")
+	assert text.contains(got, "To assign to `r.count`, write `=`")
+}
+
+test "a loop clause cannot bind with a pattern" {
+	got := problem("proc p(): void \{ for Result.Ok(v) := r else \{ _ \{ return } }; ; \{ } }")
+	assert text.startsWith(got, "a loop's init clause cannot bind with a pattern")
+}
+
 test "a nested match cannot be negated either" {
 	got := problem("proc p(): void \{ if !(r is Result.Ok(Shape.Point)) \{ } }")
 	assert text.startsWith(got, "a match cannot be negated")

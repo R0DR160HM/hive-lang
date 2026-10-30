@@ -9,6 +9,7 @@ rem   hive test      <entrypoint.hive>       Run the program's tests, with cover
 rem   hive test      <directory>             Run every test under it, git-ignored files aside
 rem   hive container <entrypoint.hive>       Write a Dockerfile that builds and runs it
 rem   hive agents                            Write .hivedocs/ for a coding agent to read
+rem   hive indent    <directory or file>     Indent every Hive file there with spaces
 rem   hive version                           Which release this compiler is
 rem
 rem A batch file rather than a PowerShell one, for one reason: this runs from
