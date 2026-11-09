@@ -1,0 +1,199 @@
+// Switching releases
+// ==================
+// `hive use <version>`: this compiler, replaced by another release's.
+import ./host.go
+import ./progress
+import ./text
+import ./version
+import hive.conv
+import hive.file
+import hive.net
+
+type Release {
+    major: Int
+    minor: Int
+    patch: Int
+}
+
+// The first release with `hive use`; from an earlier one there is no coming back.
+func minimum(): Release {
+    return Release(0, 3, 3)
+}
+
+func refusal(args: Str[]): Str {
+    if len(args) == 0 {
+        return "`hive use` needs a version: `hive use " + tagOf(minimum()) + "`."
+    }
+    if args bounds 1 {
+        return "`hive use` takes one version, and `" + args[1] + "` was given after it."
+    }
+    if args bounds 0 {
+        asked := releaseOf(args[0])
+        if asked is Result.Error(_) {
+            return "`" + args[0] + "` is not a version. A release is spelled `v<major>.<minor>.<patch>`, like `" + tagOf(minimum()) + "`."
+        }
+        if asked is Result.Ok(release) && older(release, minimum()) {
+            return "`hive use` reaches back to " + tagOf(minimum()) + ", the first release that has it: " + tagOf(release) + " would have no `hive use` to come back with."
+        }
+    }
+    return ""
+}
+
+func releaseOf(typed: Str): Result<Release, Bool> {
+    mut bare := typed
+    if text.startsWith(typed, "v") {
+        bare = text.span(text.chars(typed), 1, len(typed) - 1)
+    }
+    parts := split(bare, ".")
+    if len(parts) == 3 && parts bounds 0 && parts bounds 1 && parts bounds 2 {
+        if numberOf(parts[0]) is Result.Ok(major) {
+            if numberOf(parts[1]) is Result.Ok(minor) {
+                if numberOf(parts[2]) is Result.Ok(patch) {
+                    return Result.Ok(Release(major, minor, patch))
+                }
+            }
+        }
+    }
+    return Result.Error(false)
+}
+
+func numberOf(digits: Str): Result<Int, Bool> {
+    if digits == "" {
+        return Result.Error(false)
+    }
+    for each c in text.chars(digits) {
+        if text.isDigit(c) == false {
+            return Result.Error(false)
+        }
+    }
+    if hive.conv.sti(digits) is Result.Ok(n) {
+        return Result.Ok(n)
+    }
+    return Result.Error(false)
+}
+
+func tagOf(release: Release): Str {
+    return "v{release.major}.{release.minor}.{release.patch}"
+}
+
+func older(a: Release, b: Release): Bool {
+    if a.major != b.major {
+        return a.major < b.major
+    }
+    if a.minor != b.minor {
+        return a.minor < b.minor
+    }
+    return a.patch < b.patch
+}
+
+func assetFor(platform: Str): Str {
+    name := "hivec-" + text.replace(platform, "/", "-")
+    if text.startsWith(platform, "windows/") {
+        return name + ".exe"
+    }
+    return name
+}
+
+// The digest `SHA256SUMS` gives `asset`, or `""` when it names no such file.
+func digestIn(sums: Str, asset: Str): Str {
+    for each line in split(sums, "\n") {
+        clean := text.trim(line)
+        if text.endsWith(clean, " " + asset) || text.endsWith(clean, " *" + asset) {
+            fields := split(clean, " ")
+            if fields bounds 0 {
+                return fields[0]
+            }
+        }
+    }
+    return ""
+}
+
+func releaseUrl(tag: Str, file: Str): Str {
+    return "https://github.com/R0DR160HM/hive-lang/releases/download/" + tag + "/" + file
+}
+
+// What `hive use` says once it is done, or why it did nothing. `typed` has
+// passed `refusal`.
+proc switchTo(typed: Str): Result<Str, Str> {
+    asked := releaseOf(typed)
+    if asked is Result.Ok(release) {
+        tag := tagOf(release)
+        if tag == version.current() {
+            return Result.Ok("Already " + tag)
+        }
+        asset := assetFor(host.platform())
+        sums := hive.net.httpRequest(hive.net.HttpRequest("GET", releaseUrl(tag, "SHA256SUMS"), [], ""))
+        if sums is Result.Error(why) {
+            return Result.Error("could not reach " + releaseUrl(tag, "SHA256SUMS") + ": " + why.message)
+        }
+        if sums is Result.Ok(response) {
+            if response.status == 404 {
+                return Result.Error("there is no release " + tag + ". https://github.com/R0DR160HM/hive-lang/releases lists every one.")
+            }
+            if response.status != 200 {
+                return Result.Error("could not read " + releaseUrl(tag, "SHA256SUMS") + ": GitHub answered {response.status}")
+            }
+            want := digestIn(response.body, asset)
+            if want == "" {
+                return Result.Error(tag + " has no " + asset + ", so it has no compiler for this platform.")
+            }
+            return replaceWith(tag, asset, want)
+        }
+    }
+    return Result.Error("`" + typed + "` is not a version")
+}
+
+proc replaceWith(tag: Str, asset: Str, want: Str): Result<Str, Str> {
+    found := host.executable()
+    if found is Result.Error(why) {
+        return Result.Error("could not tell which file this compiler is: " + why)
+    }
+    if found is Result.Ok(exe) {
+        incoming := exe + ".download"
+        url := releaseUrl(tag, asset)
+        progress.note("fetching " + tag + " (" + asset + ")")
+        fetched := host.download(url, incoming)
+        if fetched is Result.Error(why) {
+            return Result.Error("could not download " + url + ": " + why)
+        }
+        if fetched is Result.Ok(got) {
+            if got != want {
+                hive.file.delete(incoming)
+                return Result.Error(url + " is not the file " + tag + "'s SHA256SUMS names. Expected SHA-256 " + want + ", got " + got + ". Nothing was replaced.")
+            }
+            placed := place(incoming, exe)
+            if placed is Result.Error(why) {
+                return Result.Error(why)
+            }
+            return Result.Ok("Switched from " + version.current() + " to " + tag)
+        }
+    }
+    return Result.Error("could not tell which file this compiler is")
+}
+
+proc place(incoming: Str, exe: Str): Result<Bool, Str> {
+    // Windows lets a running executable be renamed, never overwritten.
+    if text.startsWith(host.platform(), "windows/") {
+        aside := exe + "~"
+        hive.file.delete(aside)
+        if hive.file.move(exe, aside) is Result.Error(why) {
+            hive.file.delete(incoming)
+            return Result.Error("could not move " + exe + " aside: " + why.message)
+        }
+        if hive.file.move(incoming, exe) is Result.Error(why) {
+            hive.file.move(aside, exe)
+            hive.file.delete(incoming)
+            return Result.Error("could not put the new compiler at " + exe + ": " + why.message)
+        }
+        return Result.Ok(true)
+    }
+    if host.makeExecutable(incoming) is Result.Error(why) {
+        hive.file.delete(incoming)
+        return Result.Error("could not make " + incoming + " executable: " + why)
+    }
+    if hive.file.move(incoming, exe) is Result.Error(why) {
+        hive.file.delete(incoming)
+        return Result.Error("could not put the new compiler at " + exe + ": " + why.message)
+    }
+    return Result.Ok(true)
+}

@@ -1,9 +1,9 @@
 # Installing Hive
 
-The compiler is one executable, `hivec`. It carries the Go it compiles against as
-source text, so there is nothing to install beside it: put it on your `PATH`.
-Every release has one for each platform Go targets, on the
-[releases page](../../releases).
+The compiler is one executable, published as `hivec-<os>-<arch>` and installed as
+`hive`. It carries the Go it compiles against as source text, so there is nothing
+to install beside it: put it on your `PATH`. Every release has one for each
+platform Go targets, on the [releases page](../../releases).
 
 | also needed | for |
 | --- | --- |
@@ -14,8 +14,8 @@ Every release has one for each platform Go targets, on the
 ## Linux and macOS
 
 ```sh
-chmod +x hivec
-mkdir -p ~/.local/bin && mv hivec ~/.local/bin/
+chmod +x hivec-linux-amd64
+mkdir -p ~/.local/bin && mv hivec-linux-amd64 ~/.local/bin/hive
 ```
 
 If `~/.local/bin` is not on your `PATH`, add `export PATH="$HOME/.local/bin:$PATH"`
@@ -23,32 +23,48 @@ to your shell's startup file.
 
 On macOS, pick `arm64` for Apple silicon and `amd64` for Intel, and clear the
 download's quarantine or Gatekeeper refuses it:
-`xattr -d com.apple.quarantine ~/.local/bin/hivec`.
+`xattr -d com.apple.quarantine ~/.local/bin/hive`.
 
 ## Windows
 
-In PowerShell:
+Run [`hive-windows.msi`](../../releases/latest/download/hive-windows.msi). It needs
+no administrator: it downloads `hive.exe` for this machine (x64 or Arm64) into
+`%LOCALAPPDATA%\Programs\Hive`, or a folder you pick, and adds that folder to your
+`PATH` unless it is there already.
+When Go 1.24 or newer is missing, it offers to install it as it finishes. If
+SmartScreen asks, choose *More info → Run anyway*.
+
+Unattended, with no questions asked: `msiexec /i hive-windows.msi /qn`, adding
+`INSTALLFOLDER=D:\Tools\Hive` to choose the folder.
+
+By hand instead, in PowerShell:
 
 ```powershell
-$dir = "$env:LOCALAPPDATA\Hive"
+$dir = "$env:LOCALAPPDATA\Programs\Hive"
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
-Move-Item .\hivec.exe $dir
-Unblock-File "$dir\hivec.exe"
+Move-Item .\hivec-windows-amd64.exe "$dir\hive.exe"
+Unblock-File "$dir\hive.exe"
 $user = [Environment]::GetEnvironmentVariable("Path", "User")
 [Environment]::SetEnvironmentVariable("Path", "$user;$dir", "User")
 ```
 
-Open a new terminal afterwards. If SmartScreen asks, choose *More info → Run anyway*.
+Open a new terminal afterwards.
 
 ## Checking that it worked
 
 ```sh
-$ hivec version
-v0.2.9
+$ hive version
+v0.3.3
 $ printf 'proc main(): void {\n\techo "it works"\n}\n' > hello.hive
-$ hivec run hello.hive
+$ hive run hello.hive
 it works
 ```
+
+## Switching versions
+
+`hive use v0.3.4` replaces the compiler with that release's, once it matches the
+release's `SHA256SUMS`. It reaches back to v0.3.3, the first release with
+`hive use`.
 
 If `run` says `go` is not on the `PATH`, the compiler is installed and Go is not:
 [go.dev/dl](https://go.dev/dl/) has it.
@@ -92,7 +108,8 @@ HIVEC=/tmp/hivec-linux-amd64 ./bootstrap    # the release builds src/hivec
 ./bootstrap                                 # which then builds itself
 ```
 
-After that, `./hive` (`hive.cmd` on Windows) runs the compiler in `src/`.
+After that, `./hive` (`hive.cmd` on Windows) runs the compiler in `src/`. The
+compiler imports a Go file, so even `./hive check src/hivec.hive` needs Go.
 [`seed/README.md`](seed/README.md) says how a release becomes the next seed.
 
 ### For another platform
