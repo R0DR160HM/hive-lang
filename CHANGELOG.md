@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.3.3
+
+### Standard library
+
+* **`hive.term.platform()`** is the platform a program was built for, `goos/goarch`.
+
+### Tooling
+
+* **`hive-windows.msi`** comes with every release: it installs `hive.exe` for this machine's architecture, puts its folder on the `PATH`, and offers to install Go when there is none.
+* **`hive use <version>`** replaces the running compiler with another release's, checked against that release's `SHA256SUMS`; it reaches back to v0.3.3.
+* **The compiler imports a Go file**, so `hive check src/hivec.hive` needs Go on the `PATH`.
+
 ## v0.3.2
 
 ### Language

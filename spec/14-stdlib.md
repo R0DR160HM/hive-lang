@@ -193,6 +193,8 @@ Line-oriented terminal I/O.
   file or a pipe — the difference between somebody sitting there waiting and
   output being collected for later. A program that reports its own progress asks
   this first.
+* `platform()` → `Str`, the platform the program was built for as `goos/goarch`
+  — `windows/amd64`, `darwin/arm64` — the spelling `hive build --target` takes.
 * `read()` blocks for a line of input, stripped of its trailing newline. It parks
   only the calling virtual thread. At end of input it returns whatever preceded
   EOF (`""` if nothing).

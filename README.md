@@ -17,23 +17,26 @@ This repository holds the [specification](spec/) and the compiler, written in Hi
 
 ## Install
 
-Put the `hivec` binary from a [release](../../releases) on your `PATH`, and install
-[Go 1.24+](https://go.dev/dl/) to build and run programs.
+On Windows, run `hive-windows.msi` from the [latest release](../../releases/latest).
+Elsewhere, put the `hivec` binary from a [release](../../releases) on your `PATH` as
+`hive`, and install [Go 1.24+](https://go.dev/dl/) to build and run programs.
 [INSTALL.md](INSTALL.md) has the details, and how to build it from source.
 
 ## Use
 
 ```
-hivec run       <entrypoint.hive>    compile and run
-hivec test      <entrypoint.hive>    run its tests, with coverage
-hivec check     <entrypoint.hive>    report errors, build nothing
-hivec build     <entrypoint.hive>    compile to a native executable
-hivec export    <entrypoint.hive>    package it as an Android app
-hivec analyze   <entrypoint.hive>    score what it will cost to run
-hivec emit      <entrypoint.hive>    print the generated Go
-hivec container <entrypoint.hive>    write a Dockerfile that builds and runs it
-hivec agents                         write .hivedocs/ for a coding agent to read
-hivec version                        which release this compiler is
+hive run       <entrypoint.hive>    compile and run
+hive test      <entrypoint.hive>    run its tests, with coverage
+hive check     <entrypoint.hive>    report errors, build nothing
+hive build     <entrypoint.hive>    compile to a native executable
+hive export    <entrypoint.hive>    package it as an Android app
+hive analyze   <entrypoint.hive>    score what it will cost to run
+hive emit      <entrypoint.hive>    print the generated Go
+hive container <entrypoint.hive>    write a Dockerfile that builds and runs it
+hive agents                         write .hivedocs/ for a coding agent to read
+hive indent    <directory or file>  indent every Hive file there with spaces
+hive use       <version>            replace this compiler with another release
+hive version                        which release this compiler is
 ```
 
 `build` and `export` take `--target <goos>/<goarch>`.
