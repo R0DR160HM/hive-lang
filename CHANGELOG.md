@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.4
+
+### Standard library
+
+* **`ui.terrain(attrs, wide, cell, heights, colours)`** is the ground as one surface: a height and a colour (`0xRRGGBB`) a corner, lit smoothly and finished across the whole of it. What crosses to the window each frame is a name for its numbers, and the numbers only when the name is new.
+* **Every `figure` of one file is one draw**, however many there are and however each is posed and painted, and none is culled for standing half off the screen — a figure was a draw each, and vanished whole when its feet left the picture.
+* **`ui.scale(x, y, z)`** is a figure's size, as a multiple of the file's own.
+* **`ui.sun(yaw, pitch)`** says where the sun stands, and a low one is warmer and weaker; **`ui.cast(metres)`** says how far round the eye it casts shadows.
+* **A `sprite` painted see-through is smoke**: filtered, and as faint as the paint's alpha. An opaque one keeps its pixels.
+
 ## v0.3.3
 
 ### Standard library

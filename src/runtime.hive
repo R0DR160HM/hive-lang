@@ -12689,8 +12689,12 @@ func uiSceneSource(): Str {
 
         import (
         	"embed"
+        	"encoding/binary"
+        	"math"
         	"net/http"
         	"strings"
+        	"strconv"
+        	"sync"
         )
         `,
         // The library, fetched at compile time against a pinned digest and embedded
@@ -12708,6 +12712,7 @@ func uiSceneSource(): Str {
         func init() \{
         	uiExtraScript = "<script type=\"module\" src=\"/_hive/scene.js\"></script>"
         	uiExtraRoutes["/_hive/scene.js"] = uiSceneText("text/javascript", uiSceneJS)
+        	uiExtraRoutes["/_hive/terrain/"] = uiSceneTerrainData
         	uiExtraRoutes["/_hive/three.module.min.js"] = uiSceneAsset("three.module.min.js")
         	uiExtraRoutes["/_hive/three.core.min.js"] = uiSceneAsset("three.core.min.js")
         `,
@@ -12827,6 +12832,92 @@ func uiSceneSource(): Str {
         func UiFigure(attrs []UiAttr, model string, bones []float64, paints []UiTone) UiShape \{
         	return UiShape\{Kind: "figure", Attrs: attrs, Text: model, Nums: bones, Paints: paints}
         }
+
+        // The ground, as one surface: a height at every corner of a grid so many corners
+        // across and so many metres between them, and a colour at every corner, 0xRRGGBB.
+        //
+        // It is the one shape too big to say again sixty times a second — an island is a
+        // quarter of a megabyte of heights — so what a frame carries is a name for what
+        // the ground is, worked out from every number in it, and the page asks for the
+        // numbers themselves when the name is one it has not got. A program hands over
+        // the same two vectors every frame and nothing crosses; a shell digs a crater,
+        // the name changes, and the page fetches the ground once.
+        var uiTerrainLock sync.Mutex
+        var uiTerrainData = map[string][]byte\{}
+        var uiTerrainSeen = map[string]uint64\{}
+        var uiTerrainTick uint64
+
+        func UiTerrain(attrs []UiAttr, wide int, cell float64, heights []float64, colours []int) UiShape \{
+        	if wide < 2 || len(heights) < wide*2 \{
+        		return UiShape\{Kind: "terrain", Attrs: attrs}
+        	}
+        	rows := len(heights) / wide
+        	count := rows * wide
+        	h := uint64(1469598103934665603)
+        	h = (h ^ uint64(wide)) * 1099511628211
+        	h = (h ^ math.Float64bits(cell)) * 1099511628211
+        	for _, v := range heights[:count] \{
+        		h = (h ^ math.Float64bits(v)) * 1099511628211
+        	}
+        	for i := 0; i < count && i < len(colours); i++ \{
+        		h = (h ^ uint64(colours[i])) * 1099511628211
+        	}
+        	id := strconv.FormatUint(h, 16)
+        	uiTerrainLock.Lock()
+        	uiTerrainTick++
+        	if _, ok := uiTerrainData[id]; !ok \{
+        		data := make([]byte, 12+count*7)
+        		binary.LittleEndian.PutUint32(data[0:], uint32(wide))
+        		binary.LittleEndian.PutUint32(data[4:], uint32(rows))
+        		binary.LittleEndian.PutUint32(data[8:], math.Float32bits(float32(cell)))
+        		for i := 0; i < count; i++ \{
+        			binary.LittleEndian.PutUint32(data[12+i*4:], math.Float32bits(float32(heights[i])))
+        		}
+        		tint := data[12+count*4:]
+        		for i := 0; i < count; i++ \{
+        			c := 0x808080
+        			if i < len(colours) \{
+        				c = colours[i]
+        			}
+        			tint[i*3] = byte(c >> 16)
+        			tint[i*3+1] = byte(c >> 8)
+        			tint[i*3+2] = byte(c)
+        		}
+        		uiTerrainData[id] = data
+        		// The ones nobody has named for longest go, once there are more than a scene
+        		// could be showing.
+        		for len(uiTerrainData) > 16 \{
+        			oldest, when := "", uiTerrainTick
+        			for k, seen := range uiTerrainSeen \{
+        				if seen < when \{
+        					oldest, when = k, seen
+        				}
+        			}
+        			if oldest == "" \{
+        				break
+        			}
+        			delete(uiTerrainData, oldest)
+        			delete(uiTerrainSeen, oldest)
+        		}
+        	}
+        	uiTerrainSeen[id] = uiTerrainTick
+        	uiTerrainLock.Unlock()
+        	return UiShape\{Kind: "terrain", Attrs: attrs, Text: id}
+        }
+
+        func uiSceneTerrainData(w http.ResponseWriter, req *http.Request) \{
+        	id := strings.TrimPrefix(req.URL.Path, "/_hive/terrain/")
+        	uiTerrainLock.Lock()
+        	data, ok := uiTerrainData[id]
+        	uiTerrainLock.Unlock()
+        	if !ok \{
+        		http.NotFound(w, req)
+        		return
+        	}
+        	w.Header().Set("Content-Type", "application/octet-stream")
+        	w.Header().Set("Cache-Control", "no-store")
+        	w.Write(data)
+        }
         `,
         // A sound at a place in the world: something in the scene that is heard from
         // where it stands instead of drawn where it stands.
@@ -12869,6 +12960,12 @@ func uiSceneSource(): Str {
         func UiAttrTurn(x float64, y float64, z float64) UiAttr \{
         	return uiNums("turn", []float64\{x, y, z})
         }
+
+        // How many times its own size a figure is drawn, each way: the one shape whose size
+        // is in a file and not in what the program says of it.
+        func UiAttrScale(x float64, y float64, z float64) UiAttr \{
+        	return uiNums("scale", []float64\{x, y, z})
+        }
         `,
         // What it is made of. Absent, a shape is made of what its kind used to imply
         // on its own — a floor is turf, a barrel is staves — so nothing that never
@@ -12898,10 +12995,17 @@ func uiSceneSource(): Str {
         	return uiNums("aim", []float64\{yaw, pitch})
         }
 
+        // Where the sun stands, said as a camera's aim is: a bearing, and how high.
+        // Absent, it stands where it always has.
+        func UiAttrSun(yaw float64, pitch float64) UiAttr \{
+        	return uiNums("sun", []float64\{yaw, pitch})
+        }
+
         func UiAttrLens(fov int) UiAttr        \{ return uiNum("lens", fov) }
         func UiAttrGrain(px int) UiAttr        \{ return uiNum("grain", px) }
         func UiAttrBits(each int) UiAttr       \{ return uiNum("bits", each) }
         func UiAttrFog(far int) UiAttr         \{ return uiNum("fog", far) }
+        func UiAttrCast(far int) UiAttr        \{ return uiNum("cast", far) }
         func UiAttrGrab(on bool) UiAttr        \{ return UiAttr\{Kind: "grab", Flag: on} }
         func UiAttrCrosshair(on bool) UiAttr   \{ return UiAttr\{Kind: "crosshair", Flag: on} }
         `,
@@ -13026,6 +13130,11 @@ func uiSceneSource(): Str {
         	if hasBits \{
         		bits |= uiSceneEyeBits
         	}
+        	sunAt, hasSun := uiFind(attrs, "sun")
+        	shade, hasShade := uiFind(attrs, "cast")
+        	if hasSun || hasShade \{
+        		bits |= uiSceneEyeSun
+        	}
         	uiPackU8(b, bits)
         	if hasLens \{
         		uiPackU16(b, lens.Num)
@@ -13041,6 +13150,18 @@ func uiSceneSource(): Str {
         	}
         	if hasSky \{
         		uiPackWord(b, uiSceneTone(sky.Word, "#8ecbff"))
+        	}
+        	if hasSun || hasShade \{
+        		yaw, pitch, far := 0.0, -100.0, 0
+        		if hasSun && len(sunAt.Nums) >= 2 \{
+        			yaw, pitch = sunAt.Nums[0], sunAt.Nums[1]
+        		}
+        		if hasShade \{
+        			far = shade.Num
+        		}
+        		uiPackF32(b, yaw)
+        		uiPackF32(b, pitch)
+        		uiPackU16(b, far)
         	}
         `,
         // Which events the program is actually listening for. A page that would only
@@ -13107,7 +13228,7 @@ func uiSceneSource(): Str {
         // caller's own slice. First match wins, which is what uiFind does.
         `
         type uiSceneParts struct \{
-        	at, turn, paint, surface, voice, track, pitch, volume *UiAttr
+        	at, turn, paint, surface, voice, track, pitch, volume, scale *UiAttr
         }
 
         func uiScenePartsOf(attrs []UiAttr) uiSceneParts \{
@@ -13118,6 +13239,10 @@ func uiSceneSource(): Str {
         		case "at":
         			if p.at == nil \{
         				p.at = one
+        			}
+        		case "scale":
+        			if p.scale == nil \{
+        				p.scale = one
         			}
         		case "turn":
         			if p.turn == nil \{
@@ -13228,6 +13353,9 @@ func uiSceneSource(): Str {
             	if p.turn != nil && uiSceneAny(p.turn.Nums) \{
             		mask |= uiSceneHasTurn
             	}
+            	if p.scale != nil \{
+            		mask |= uiSceneHasScale
+            	}
             }
             if len(s.Nums) > 0 \{
             	mask |= uiSceneHasSize
@@ -13250,7 +13378,7 @@ func uiSceneSource(): Str {
         // nobody had an opinion about.
         `
         	bare := "#cfd6de"
-        	if s.Kind == "sprite" \{
+        	if s.Kind == "sprite" || s.Kind == "terrain" \{
         		bare = "#ffffff"
         	}
         	uiPackWord(b, uiSceneTone(uiScenePartEnum(p.paint), bare))
@@ -13259,6 +13387,9 @@ func uiSceneSource(): Str {
         	}
         	if mask&uiSceneHasTurn != 0 \{
         		uiSceneVecTo(b, uiScenePartNums(p.turn, uiSceneOrigin))
+        	}
+        	if mask&uiSceneHasScale != 0 \{
+        		uiSceneVecTo(b, uiScenePartNums(p.scale, []float64\{1, 1, 1}))
         	}
         	if mask&uiSceneHasSize != 0 \{
         		uiPackU8(b, len(s.Nums))
@@ -13297,6 +13428,7 @@ func uiSceneSource(): Str {
         	uiSceneSprite   = 8
         	uiSceneRoof     = 9
         	uiSceneFigure   = 10
+        	uiSceneTerrain  = 11
 
         	uiSceneHasAt      = 1
         	uiSceneHasTurn    = 2
@@ -13306,6 +13438,7 @@ func uiSceneSource(): Str {
         	uiSceneHasVoice   = 32
         	uiSceneHasTrack   = 64
         	uiSceneHasPaints  = 128
+        	uiSceneHasScale   = 32
 
         	uiSceneEyeLens = 1
         	uiSceneEyeFog  = 2
@@ -13314,6 +13447,7 @@ func uiSceneSource(): Str {
         	uiSceneEyeFlat = 16
         	uiSceneEyeGrain = 32
         	uiSceneEyeBits  = 64
+        	uiSceneEyeSun   = 128
         )
         `,
         // A kind the page does not know is drawn as a box, which is what an unknown
@@ -13341,6 +13475,8 @@ func uiSceneSource(): Str {
         		return uiSceneRoof
         	case "figure":
         		return uiSceneFigure
+        	case "terrain":
+        		return uiSceneTerrain
         	}
         	return uiSceneBox
         }
@@ -13631,7 +13767,35 @@ func uiSceneJs(): Str {
         // shadow is read. It was eighty: what a shadow map costs is its area, and the
         // outer quarter of that box was buying a shadow you would have gone looking for.
         `
-        function reach() \{ return 55; }
+        var shadeFar = 55, sunAt = [0, -100], sunLow = new THREE.Color(0xffb46e);
+
+        function reach() \{ return shadeFar; }
+
+        function sunned(at, far) \{
+          sunAt[0] = at[0];
+          sunAt[1] = at[1];
+          shadeFar = far;
+          if (at[1] > -10) \{
+            var high = Math.max(0.05, Math.min(1.55, at[1]));
+            SUNWARD.set(-Math.sin(at[0]) * Math.cos(high), Math.sin(high), -Math.cos(at[0]) * Math.cos(high));
+            var low = Math.max(0, Math.min(1, 1 - Math.sin(high) / 0.5));
+            sun.color.setHex(0xfff0dc).lerp(sunLow, low * 0.8);
+            sun.intensity = 2.6 * (1 - 0.35 * low);
+          } else \{
+            SUNWARD.set(0.36, 0.85, 0.48).normalize();
+            sun.color.setHex(0xfff0dc);
+            sun.intensity = 2.6;
+          }
+          SUN_ACROSS.set(0, 1, 0).cross(SUNWARD).normalize();
+          SUN_UP.copy(SUNWARD).cross(SUN_ACROSS);
+          var box = sun.shadow.camera;
+          box.left = -far;
+          box.right = far;
+          box.top = far;
+          box.bottom = -far;
+          box.far = far * 3;
+          box.updateProjectionMatrix();
+        }
         `,
         // Which way the sun is — the same 6, 14, 8 the rig was built with — and the
         // two directions across its view, as three.js's lookAt builds them, which are
@@ -14042,12 +14206,12 @@ func uiSceneJs(): Str {
         // The kinds and the bits, exactly as uiSceneShape and uiSceneCamera write them.
         `
         var KINDS = ["box", "sphere", "cylinder", "cone", "ground", "label", "line",
-          "sound", "sprite", "roof", "figure"];
+          "sound", "sprite", "roof", "figure", "terrain"];
         var SOUND = 7;
         var HAS_AT = 1, HAS_TURN = 2, HAS_SIZE = 4, HAS_SURFACE = 8, HAS_WORDS = 16,
-          HAS_VOICE = 32, HAS_TRACK = 64, HAS_PAINTS = 128;
+          HAS_VOICE = 32, HAS_TRACK = 64, HAS_PAINTS = 128, HAS_SCALE = 32;
         var EYE_LENS = 1, EYE_FOG = 2, EYE_SKY = 4, EYE_GRAB = 8, EYE_FLAT = 16,
-          EYE_GRAIN = 32, EYE_BITS = 64;
+          EYE_GRAIN = 32, EYE_BITS = 64, EYE_SUN = 128;
         `,
         // Where an eye is and what it can see. The same block for the world's own
         // camera and for every inset looking at that world, which is why an inset
@@ -14068,13 +14232,22 @@ func uiSceneJs(): Str {
           into.sky = (bits & EYE_SKY) ? readWord() : "";
           into.grab = (bits & EYE_GRAB) !== 0;
           into.flat = (bits & EYE_FLAT) !== 0;
+          if (bits & EYE_SUN) \{
+            into.sun[0] = readF32();
+            into.sun[1] = readF32();
+            into.shade = readU16();
+          } else \{
+            into.sun[0] = 0;
+            into.sun[1] = -100;
+            into.shade = 0;
+          }
           into.on = readWord();
           return into;
         }
 
         function eyeless() \{
           return \{eye: [0, 0, 0], aim: [0, 0], lens: 0, fog: 0, grain: 0, bits: 0,
-            sky: "", grab: false, flat: false, on: ""};
+            sky: "", grab: false, flat: false, on: "", sun: [0, -100], shade: 0};
         }
         `,
         // One shape, read into the same object every time: a record is written straight
@@ -14082,7 +14255,7 @@ func uiSceneJs(): Str {
         // one of these rather than one per shape per frame.
         `
         var scratch = \{k: "box", c: "", p: [0, 0, 0], r: [0, 0, 0], d: [1, 1, 1],
-          s: "", x: "", t: [], turned: false};
+          s: "", x: "", t: [], z: [1, 1, 1], turned: false};
 
         function paint(frame) \{
           reading = new DataView(frame);
@@ -14123,13 +14296,17 @@ func uiSceneJs(): Str {
           var kids = flock.children;
           for (var i = 0; i < kids.length; i++) \{
             kids[i].parent = null;
-            if (kids[i].userData.kind === "figure") \{ retire(kids[i]); }
           }
           kids.length = 0;
           batches.forEach(function (b) \{
             for (var j = 0; j < b.seats.length; j++) \{ b.seats[j].index = -1; }
             b.seats.length = 0;
             b.mesh.count = 0;
+          });
+          crowds.forEach(function (c) \{
+            for (var j = 0; j < c.seats.length; j++) \{ c.seats[j].index = -1; }
+            c.seats.length = 0;
+            if (c.mesh) \{ c.mesh.count = 0; }
           });
           live.length = 0;
           voiceOf.length = 0;
@@ -14243,6 +14420,16 @@ func uiSceneJs(): Str {
             r[1] = readF32();
             r[2] = readF32();
           }
+          var z = s.z;
+          if (mask & HAS_SCALE) \{
+            z[0] = readF32();
+            z[1] = readF32();
+            z[2] = readF32();
+          } else \{
+            z[0] = 1;
+            z[1] = 1;
+            z[2] = 1;
+          }
           var d = s.d;
           if (mask & HAS_SIZE) \{
             var n = readU8();
@@ -14278,6 +14465,7 @@ func uiSceneJs(): Str {
         `
         function sow(o) \{
           if (o.batch) \{ seat(o); return; }
+          if (o.crowd) \{ enlist(o); return; }
           o.parent = flock;
           o.userData.spot = flock.children.length;
           flock.children.push(o);
@@ -14285,11 +14473,13 @@ func uiSceneJs(): Str {
 
         function hide(o) \{
           if (o.batch) \{ unseat(o); return; }
+          if (o.crowd) \{ discharge(o); return; }
           o.visible = false;
         }
 
         function shed(o) \{
           if (o.batch) \{ unseat(o); return; }
+          if (o.crowd) \{ discharge(o); return; }
           var kids = flock.children, at = o.userData.spot;
           if (kids[at] !== o) \{ at = kids.indexOf(o); }
           if (at < 0) \{ return; }
@@ -14299,7 +14489,6 @@ func uiSceneJs(): Str {
           kids.length = kids.length - 1;
           o.parent = null;
           o.userData.spot = -1;
-          if (o.userData.kind === "figure") \{ retire(o); }
         }
         `,
         // A seat: an opaque solid's place in its batch. It stands in a slot exactly as
@@ -14463,6 +14652,8 @@ func uiSceneJs(): Str {
             mats.forEach(function (m) \{ m.needsUpdate = true; });
             renderer.shadowMap.needsUpdate = true;
           }
+          var far = w.shade || 55;
+          if (far !== shadeFar || w.sun[0] !== sunAt[0] || w.sun[1] !== sunAt[1]) \{ sunned(w.sun, far); }
           if (wantLit) \{
             var texel = reach() * 2 / 2048;
             under.set(w.eye[0], 0, w.eye[2]);
@@ -14516,7 +14707,10 @@ func uiSceneJs(): Str {
           if (u.kind !== s.k) \{ return false; }
           if (s.k === "line") \{ return true; }
           if (s.k === "label") \{ return u.words === s.x && u.tint === s.c; }
-          if (s.k === "sprite") \{ return u.words === s.x && u.dims[0] === s.d[0] && u.dims[1] === s.d[1]; }
+          if (s.k === "sprite") \{
+            return u.words === s.x && u.dims[0] === s.d[0] && u.dims[1] === s.d[1] && u.soft === (solidity(s.c) < 1);
+          }
+          if (s.k === "terrain") \{ return true; }
           if (s.k === "figure") \{ return u.words === s.x; }
           return u.key === keyOf(s);
         }
@@ -14549,6 +14743,17 @@ func uiSceneJs(): Str {
           return t;
         }
 
+        function smooth(path) \{
+          var t = pics.get("~" + path);
+          if (!t) \{
+            t = new THREE.TextureLoader().load("/_hive/asset/" +
+              path.split("/").map(encodeURIComponent).join("/"));
+            t.colorSpace = THREE.SRGBColorSpace;
+            pics.set("~" + path, t);
+          }
+          return t;
+        }
+
         function build(s) \{
           var made;
           if (s.k === "line") \{
@@ -14570,14 +14775,23 @@ func uiSceneJs(): Str {
         // buried to the waist in it.
         `
           } else if (s.k === "sprite") \{
-            var pic = pixels(s.x || "");
+            var soft = solidity(s.c) < 1;
+            var pic = soft ? smooth(s.x || "") : pixels(s.x || "");
             made = new THREE.Sprite(new THREE.SpriteMaterial(\{map: pic,
-              transparent: true, depthWrite: false, alphaTest: 0.4,
+              transparent: true, depthWrite: false, alphaTest: soft ? 0 : 0.4,
               color: new THREE.Color(s.c || "#ffffff")}));
             made.center.set(0.5, 0);
             made.scale.set(s.d[0] || 1, s.d[1] || 1, 1);
+            made.userData.soft = soft;
           } else if (s.k === "figure") \{
-            made = figureOf(s.x || "");
+            return \{crowd: crowdOf(s.x || ""), index: -1, visible: true, at: [0, 0, 0], turn: [0, 0, 0],
+              size: [1, 1, 1], pose: [], paints: [], userData: \{kind: "figure", words: s.x, key: "", tint: ""}};
+          } else if (s.k === "terrain") \{
+            made = new THREE.Mesh(new THREE.BufferGeometry(), groundLook(finishOf(s), s.c));
+            made.castShadow = true;
+            made.receiveShadow = true;
+            made.frustumCulled = false;
+            made.userData.asked = "";
           } else if (solidity(s.c) >= 1) \{
             var chair = \{batch: batchOf(formOf(s), finishOf(s)), index: -1, visible: true,
               userData: \{kind: s.k, key: keyOf(s), tint: ""}};
@@ -14624,23 +14838,23 @@ func uiSceneJs(): Str {
         // drawn — and casts no shadow either, so what a figure is not wearing is not
         // there to show through what it is.
         //
-        // A figure's material and its bones are its own, so one that goes is kept for
-        // the next to come in wearing the same file, rather than made again: people
-        // come and go all the time.
+        // Every figure of one file is one draw, however many there are and however each
+        // is posed and painted: see `muster`. What a figure keeps of its own is a seat.
+        // A crowd is a hundred people, and a wood is a hundred trees.
         `
-        var models = new Map(), spares = new Map(), PARTS = 32;
+        var models = new Map(), PARTS = 32;
 
         function modelOf(path) \{
           var m = models.get(path);
           if (m) \{ return m; }
-          m = \{ready: false, waiting: [], geo: null, joints: [], inverses: [], tints: null};
+          m = \{ready: false, waiting: [], geo: null, joints: [], inverses: [], tints: null, order: []};
           models.set(path, m);
           fetch("/_hive/asset/" + path.split("/").map(encodeURIComponent).join("/"))
             .then(function (r) \{ if (!r.ok) \{ throw new Error(r.status); } return r.arrayBuffer(); })
             .then(function (buf) \{
               readModel(m, buf);
               m.ready = true;
-              for (var i = 0; i < m.waiting.length; i++) \{ embody(m.waiting[i]); }
+              for (var i = 0; i < m.waiting.length; i++) \{ muster(m.waiting[i]); }
               m.waiting.length = 0;
               dirty = true;
             })
@@ -14648,22 +14862,16 @@ func uiSceneJs(): Str {
           return m;
         }
 
-        function figureOf(path) \{
-          var pool = spares.get(path);
-          if (pool && pool.length) \{ return pool.pop(); }
-          var o = new THREE.Group(), m = modelOf(path);
-          o.userData.model = m;
-          o.userData.pose = [];
-          o.userData.paints = [];
-          o.userData.painted = [];
-          if (m.ready) \{ embody(o); } else \{ m.waiting.push(o); }
-          return o;
-        }
+        var crowds = new Map();
 
-        function retire(o) \{
-          var pool = spares.get(o.userData.words);
-          if (!pool) \{ pool = []; spares.set(o.userData.words, pool); }
-          pool.push(o);
+        function crowdOf(path) \{
+          var c = crowds.get(path);
+          if (c) \{ return c; }
+          c = \{path: path, model: modelOf(path), mesh: null, seats: [], room: 0, wide: 1,
+            uBones: \{value: null}, uPaints: \{value: null}, look: null, caster: null};
+          crowds.set(path, c);
+          if (c.model.ready) \{ muster(c); } else \{ c.model.waiting.push(c); }
+          return c;
         }
         `,
         // A glTF binary: its JSON, and the buffer every accessor reads from. What is
@@ -14777,109 +14985,299 @@ func uiSceneJs(): Str {
           });
           var inv = read(skin.inverseBindMatrices).array;
           m.inverses = joints.map(function (_, k) \{ return new THREE.Matrix4().fromArray(inv, k * 16); });
+          // Parents before their children, whatever order the file lists them in.
+          var stood = [];
+          function reached(k) \{
+            if (stood[k]) \{ return; }
+            stood[k] = true;
+            if (m.joints[k].parent >= 0) \{ reached(m.joints[k].parent); }
+            m.order.push(k);
+          }
+          for (var each = 0; each < m.joints.length; each++) \{ reached(each); }
         }
         `,
-        // A body for one figure: its own bones, its own material — the paints are
-        // its own — and the shared geometry. Its bounds are a sphere about it as it
-        // stands, wide enough for an arm flung up: worked out from the bones it would
-        // be a walk over every vertex each time the body moved.
+        // The crowd of one file: one mesh drawn once for all of them. Each figure's bones
+        // are a row of a texture and its paints a row of another, read in the shader by
+        // which of the crowd is being drawn, so a pose and a coat of paint cost a figure
+        // nothing but its row. Nothing is culled figure by figure, as nothing is box by
+        // box: a tree with its foot off the screen is still a tree.
         `
-        var PAINTED = "attribute float part;\nuniform vec4 paints[" + PARTS + "];\n";
-        var UNPAINTED = "if (paints[int(part + 0.5)].a < 0.5) \{ gl_Position = vec4(2.0, 2.0, 2.0, 1.0); }";
+        var FLOCK = [
+          "attribute float part;",
+          "attribute vec4 skinIndex;",
+          "attribute vec4 skinWeight;",
+          "uniform highp sampler2D flockBones;",
+          "uniform highp sampler2D flockPaints;",
+          "mat4 flockBone(float i) \{",
+          "  int x = int(i + 0.5) * 4;",
+          "  return mat4(texelFetch(flockBones, ivec2(x, gl_InstanceID), 0), texelFetch(flockBones, ivec2(x + 1, gl_InstanceID), 0),",
+          "    texelFetch(flockBones, ivec2(x + 2, gl_InstanceID), 0), texelFetch(flockBones, ivec2(x + 3, gl_InstanceID), 0));",
+          "}"
+        ].join("\n");
+        var FLOCK_BY = "mat4 flockBy = skinWeight.x * flockBone(skinIndex.x) + skinWeight.y * flockBone(skinIndex.y)" +
+          " + skinWeight.z * flockBone(skinIndex.z) + skinWeight.w * flockBone(skinIndex.w);";
+        var FLOCK_TINT = "vec4 flockTint = texelFetch(flockPaints, ivec2(int(part + 0.5), gl_InstanceID), 0);\n" +
+          "vPaint = flockTint.rgb;\nif (flockTint.a < 0.5) \{ gl_Position = vec4(2.0, 2.0, 2.0, 1.0); }";
 
-        function embody(o) \{
-          var m = o.userData.model, u = o.userData;
-          var bones = m.joints.map(function (j) \{
-            var b = new THREE.Bone();
-            b.position.copy(j.t);
-            b.quaternion.copy(j.r);
-            b.scale.copy(j.s);
-            return b;
-          });
-          var tints = \{value: m.tints.slice()};
-          var look = new THREE.MeshStandardMaterial(\{vertexColors: true, roughness: 0.72, metalness: 0});
-          look.onBeforeCompile = function (shader) \{
-            shader.uniforms.paints = tints;
-            shader.vertexShader = shader.vertexShader
-              .replace("#include <common>", "#include <common>\n" + PAINTED + "varying vec3 vPaint;")
-              .replace("#include <project_vertex>", "#include <project_vertex>\nvPaint = paints[int(part + 0.5)].rgb;\n" + UNPAINTED);
+        function flocked(shader, c) \{
+          shader.uniforms.flockBones = c.uBones;
+          shader.uniforms.flockPaints = c.uPaints;
+          shader.vertexShader = shader.vertexShader
+            .replace("#include <common>", "#include <common>\n" + FLOCK + "\nvarying vec3 vPaint;")
+            .replace("#include <skinbase_vertex>", FLOCK_BY)
+            .replace("#include <skinnormal_vertex>", "objectNormal = (flockBy * vec4(objectNormal, 0.0)).xyz;")
+            .replace("#include <skinning_vertex>", "transformed = (flockBy * vec4(transformed, 1.0)).xyz;")
+            .replace("#include <project_vertex>", "#include <project_vertex>\n" + FLOCK_TINT);
+        }
+
+        function muster(c) \{
+          c.wide = Math.max(1, c.model.joints.length);
+          c.look = new THREE.MeshStandardMaterial(\{vertexColors: true, roughness: 0.72, metalness: 0});
+          c.look.onBeforeCompile = function (shader) \{
+            flocked(shader, c);
             shader.fragmentShader = shader.fragmentShader
               .replace("#include <common>", "#include <common>\nvarying vec3 vPaint;")
               .replace("#include <color_fragment>", "#include <color_fragment>\ndiffuseColor.rgb *= vPaint;");
           };
-          var caster = new THREE.MeshDepthMaterial(\{depthPacking: THREE.RGBADepthPacking});
-          caster.onBeforeCompile = function (shader) \{
-            shader.uniforms.paints = tints;
-            shader.vertexShader = shader.vertexShader
-              .replace("#include <common>", "#include <common>\n" + PAINTED)
-              .replace("#include <project_vertex>", "#include <project_vertex>\n" + UNPAINTED);
-          };
-          var body = new THREE.SkinnedMesh(m.geo, look);
-          bones.forEach(function (b, k) \{
-            var up = m.joints[k].parent;
-            if (up >= 0) \{ bones[up].add(b); } else \{ body.add(b); }
-          });
-          body.bind(new THREE.Skeleton(bones, m.inverses), new THREE.Matrix4());
-          body.customDepthMaterial = caster;
-          body.castShadow = true;
-          body.receiveShadow = true;
-          body.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0.9, 0), 1.6);
-          body.matrixAutoUpdate = false;
-          o.add(body);
-          u.body = body;
-          u.bones = bones;
-          u.tints = tints;
-          u.painted.length = 0;
-          mats.set("figure|" + o.id, look);
-          mats.set("figure|" + o.id + "|cast", caster);
-          posed(o);
+          c.caster = new THREE.MeshDepthMaterial(\{depthPacking: THREE.RGBADepthPacking});
+          c.caster.onBeforeCompile = function (shader) \{ flocked(shader, c); };
+          mats.set("figure|" + c.path, c.look);
+          mats.set("figure|" + c.path + "|cast", c.caster);
+          quarters(c, Math.max(16, c.seats.length));
+          for (var i = 0; i < c.seats.length; i++) \{ stand(c.seats[i]); }
+        }
+
+        function quarters(c, many) \{
+          var was = c.mesh;
+          var mesh = new THREE.InstancedMesh(c.model.geo, c.look, many);
+          mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+          mesh.customDepthMaterial = c.caster;
+          mesh.castShadow = true;
+          mesh.receiveShadow = true;
+          mesh.matrixAutoUpdate = false;
+          mesh.frustumCulled = false;
+          mesh.count = c.seats.length;
+          var bones = new THREE.DataTexture(new Float32Array(many * c.wide * 16), c.wide * 4, many,
+            THREE.RGBAFormat, THREE.FloatType);
+          var paints = new THREE.DataTexture(new Float32Array(many * PARTS * 4), PARTS, many,
+            THREE.RGBAFormat, THREE.FloatType);
+          if (was) \{
+            mesh.instanceMatrix.array.set(was.instanceMatrix.array);
+            bones.image.data.set(c.uBones.value.image.data);
+            paints.image.data.set(c.uPaints.value.image.data);
+            c.uBones.value.dispose();
+            c.uPaints.value.dispose();
+            stage.remove(was);
+            was.dispose();
+          }
+          bones.needsUpdate = true;
+          paints.needsUpdate = true;
+          c.uBones.value = bones;
+          c.uPaints.value = paints;
+          stage.add(mesh);
+          c.mesh = mesh;
+          c.room = many;
         }
         `,
-        // What a frame says of a figure, kept, and put on its bones and in its paints
-        // if it has a body yet: each bone turned by its three numbers on top of how it
-        // stands, and each part painted, or the file's own colour where the frame says
-        // nothing of it. A colour is only worked out again when it has changed.
+        // A figure's seat taken and given up, and what a frame says of it written into
+        // its rows: where it stands and how big, each bone turned by its three numbers on
+        // top of how it stands in the file, and each part painted, or the file's own
+        // colour where the frame says nothing of it. Kept as well, so that a figure whose
+        // file arrives late, or whose crowd outgrows its mesh, is stood again from it.
+        //
+        // And the ground: a mesh of the heights and colours the page fetched for the name
+        // a frame gave it, its normals taken from its neighbours' heights, and its finish
+        // laid across the whole of it rather than begun again on every square.
         `
-        var boneSpin = new THREE.Euler(0, 0, 0, "YXZ"), boneTurn = new THREE.Quaternion();
+        var boneSpin = new THREE.Euler(0, 0, 0, "YXZ"), boneTurn = new THREE.Quaternion(), boneTwist = new THREE.Quaternion();
+        var boneLocal = new THREE.Matrix4(), boneOut = new THREE.Matrix4(), boneWorld = [];
 
-        function posed(o, s) \{
-          var u = o.userData, k;
-          if (s) \{
-            u.pose.length = s.d.length;
-            for (k = 0; k < s.d.length; k++) \{ u.pose[k] = s.d[k]; }
-            u.paints.length = s.t.length;
-            for (k = 0; k < s.t.length; k++) \{ u.paints[k] = s.t[k]; }
+        function enlist(o) \{
+          if (o.index >= 0) \{ return; }
+          var c = o.crowd;
+          o.index = c.seats.length;
+          c.seats.push(o);
+          if (c.mesh) \{
+            if (c.seats.length > c.room) \{ quarters(c, c.room * 2); }
+            c.mesh.count = c.seats.length;
           }
-          if (!u.body) \{ return; }
-          var joints = u.model.joints, d = u.pose;
-          for (k = 0; k < u.bones.length; k++) \{
-            var b = u.bones[k];
-            b.quaternion.copy(joints[k].r);
+        }
+
+        function discharge(o) \{
+          var c = o.crowd, at = o.index;
+          if (at < 0) \{ return; }
+          var last = c.seats.length - 1, end = c.seats[last];
+          c.seats.length = last;
+          o.index = -1;
+          if (at !== last) \{
+            c.seats[at] = end;
+            end.index = at;
+            stand(end);
+          }
+          if (c.mesh) \{ c.mesh.count = last; }
+        }
+
+        function arrayed(o, s) \{
+          var k;
+          if (o.index < 0) \{ enlist(o); }
+          for (k = 0; k < 3; k++) \{
+            o.at[k] = s.p[k];
+            o.turn[k] = s.turned ? s.r[k] : 0;
+            o.size[k] = s.z[k];
+          }
+          o.pose.length = s.d.length;
+          for (k = 0; k < s.d.length; k++) \{ o.pose[k] = s.d[k]; }
+          o.paints.length = s.t.length;
+          for (k = 0; k < s.t.length; k++) \{ o.paints[k] = s.t[k]; }
+          stand(o);
+        }
+
+        function stand(o) \{
+          var c = o.crowd, at = o.index, m = c.model, k;
+          if (!c.mesh || at < 0) \{ return; }
+          spot.set(o.at[0], o.at[1], o.at[2]);
+          spin.set(o.turn[0], o.turn[1], o.turn[2]);
+          turn.setFromEuler(spin);
+          size.set(o.size[0], o.size[1], o.size[2]);
+          pose.compose(spot, turn, size);
+          pose.toArray(c.mesh.instanceMatrix.array, at * 16);
+          touched(c.mesh.instanceMatrix, at, 16);
+          var joints = m.joints, d = o.pose, out = c.uBones.value.image.data, base = at * c.wide * 16;
+          for (var n = 0; n < m.order.length; n++) \{
+            k = m.order[n];
+            var j = joints[k];
+            boneTurn.copy(j.r);
             if (k * 3 + 2 < d.length) \{
               boneSpin.set(d[k * 3], d[k * 3 + 1], d[k * 3 + 2]);
-              b.quaternion.multiply(boneTurn.setFromEuler(boneSpin));
+              boneTurn.multiply(boneTwist.setFromEuler(boneSpin));
             }
+            boneLocal.compose(j.t, boneTurn, j.s);
+            if (!boneWorld[k]) \{ boneWorld[k] = new THREE.Matrix4(); }
+            if (j.parent >= 0) \{ boneWorld[k].multiplyMatrices(boneWorld[j.parent], boneLocal); }
+            else \{ boneWorld[k].copy(boneLocal); }
+            boneOut.multiplyMatrices(boneWorld[k], m.inverses[k]).toArray(out, base + k * 16);
           }
-          var tints = u.tints.value, changed = false;
+          c.uBones.value.needsUpdate = true;
+          var tints = c.uPaints.value.image.data, from = at * PARTS * 4;
           for (k = 0; k < PARTS; k++) \{
-            var c = k < u.paints.length ? u.paints[k] : "";
-            if (u.painted[k] === c) \{ continue; }
-            u.painted[k] = c;
-            changed = true;
-            if (c) \{
-              hue.setStyle(bare(c));
-              tints[k * 4] = hue.r;
-              tints[k * 4 + 1] = hue.g;
-              tints[k * 4 + 2] = hue.b;
-              tints[k * 4 + 3] = solidity(c);
+            var tone = k < o.paints.length ? o.paints[k] : "";
+            if (tone) \{
+              hue.setStyle(bare(tone));
+              tints[from + k * 4] = hue.r;
+              tints[from + k * 4 + 1] = hue.g;
+              tints[from + k * 4 + 2] = hue.b;
+              tints[from + k * 4 + 3] = solidity(tone);
             } else \{
-              for (var i = 0; i < 4; i++) \{ tints[k * 4 + i] = u.model.tints[k * 4 + i]; }
+              for (var i = 0; i < 4; i++) \{ tints[from + k * 4 + i] = m.tints[k * 4 + i]; }
             }
           }
-          if (changed) \{
-            u.body.material.uniformsNeedUpdate = true;
-            u.body.customDepthMaterial.uniformsNeedUpdate = true;
+          c.uPaints.value.needsUpdate = true;
+        }
+
+        function groundLook(finish, colour) \{
+          var key = "terrain|" + finish + "|" + colour;
+          var m = mats.get(key);
+          if (m) \{ return m; }
+          var look = LOOKS[finish] || LOOKS.Turf, skin = skinOf(finish);
+          m = new THREE.MeshStandardMaterial(\{map: skin.map, normalMap: skin.relief,
+            normalScale: new THREE.Vector2(look[2], look[2]), roughness: look[0], metalness: look[1],
+            color: colour ? bare(colour) : 0xffffff, vertexColors: true});
+          m.defines.TILE = perTile(finish).toFixed(2);
+          if (BROAD[finish]) \{ m.defines.BROAD = ""; }
+          m.onBeforeCompile = dress;
+          mats.set(key, m);
+          return m;
+        }
+
+        function lie(o, s) \{
+          var u = o.userData, want = groundLook(finishOf(s), s.c);
+          if (o.material !== want) \{ o.material = want; }
+          if (!s.x || u.asked === s.x) \{ return; }
+          var id = s.x;
+          u.asked = id;
+          fetch("/_hive/terrain/" + id)
+            .then(function (r) \{ if (!r.ok) \{ throw new Error(r.status); } return r.arrayBuffer(); })
+            .then(function (buf) \{
+              if (u.asked !== id) \{ return; }
+              laid(o, buf);
+              dirty = true;
+            })
+            .catch(function () \{ if (u.asked === id) \{ u.asked = ""; } });
+        }
+
+        function laid(o, buf) \{
+          var view = new DataView(buf), wide = view.getUint32(0, true), rows = view.getUint32(4, true);
+          var cell = view.getFloat32(8, true), count = wide * rows, u = o.userData;
+          if (wide < 2 || rows < 2 || buf.byteLength < 12 + count * 7) \{ return; }
+          var high = new Float32Array(buf, 12, count), tint = new Uint8Array(buf, 12 + count * 4, count * 3);
+          var g = o.geometry, i, j, k;
+          if (u.wide !== wide || u.rows !== rows || u.cell !== cell) \{
+            g.dispose();
+            g = new THREE.BufferGeometry();
+            var at = new Float32Array(count * 3), uv = new Float32Array(count * 2);
+            var spanU = new Float32Array(count * 3), spanV = new Float32Array(count * 3);
+            var halfX = (wide - 1) * cell / 2, halfZ = (rows - 1) * cell / 2;
+            for (j = 0; j < rows; j++) \{
+              for (i = 0; i < wide; i++) \{
+                k = j * wide + i;
+                at[k * 3] = i * cell - halfX;
+                at[k * 3 + 2] = j * cell - halfZ;
+                uv[k * 2] = i / (wide - 1);
+                uv[k * 2 + 1] = j / (rows - 1);
+                spanU[k * 3] = halfX * 2;
+                spanV[k * 3 + 2] = halfZ * 2;
+              }
+            }
+            var index = new Uint32Array((wide - 1) * (rows - 1) * 6), n = 0;
+            for (j = 0; j < rows - 1; j++) \{
+              for (i = 0; i < wide - 1; i++) \{
+                k = j * wide + i;
+                index[n] = k;
+                index[n + 1] = k + wide;
+                index[n + 2] = k + 1;
+                index[n + 3] = k + 1;
+                index[n + 4] = k + wide;
+                index[n + 5] = k + wide + 1;
+                n += 6;
+              }
+            }
+            g.setAttribute("position", new THREE.BufferAttribute(at, 3));
+            g.setAttribute("normal", new THREE.BufferAttribute(new Float32Array(count * 3), 3));
+            g.setAttribute("color", new THREE.BufferAttribute(new Float32Array(count * 3), 3));
+            g.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+            g.setAttribute("spanU", new THREE.BufferAttribute(spanU, 3));
+            g.setAttribute("spanV", new THREE.BufferAttribute(spanV, 3));
+            g.setAttribute("rounding", new THREE.BufferAttribute(new Float32Array(count), 1));
+            g.setIndex(new THREE.BufferAttribute(index, 1));
+            o.geometry = g;
+            u.wide = wide;
+            u.rows = rows;
+            u.cell = cell;
           }
+          var p = g.attributes.position.array, nrm = g.attributes.normal.array, col = g.attributes.color.array;
+          for (k = 0; k < count; k++) \{
+            p[k * 3 + 1] = high[k];
+            hue.setRGB(tint[k * 3] / 255, tint[k * 3 + 1] / 255, tint[k * 3 + 2] / 255, THREE.SRGBColorSpace);
+            col[k * 3] = hue.r;
+            col[k * 3 + 1] = hue.g;
+            col[k * 3 + 2] = hue.b;
+          }
+          for (j = 0; j < rows; j++) \{
+            for (i = 0; i < wide; i++) \{
+              k = j * wide + i;
+              var west = high[k - (i > 0 ? 1 : 0)], east = high[k + (i < wide - 1 ? 1 : 0)];
+              var north = high[k - (j > 0 ? wide : 0)], south = high[k + (j < rows - 1 ? wide : 0)];
+              var sx = (east - west) / ((i > 0 && i < wide - 1 ? 2 : 1) * cell);
+              var sz = (south - north) / ((j > 0 && j < rows - 1 ? 2 : 1) * cell);
+              var long = Math.sqrt(sx * sx + 1 + sz * sz);
+              nrm[k * 3] = -sx / long;
+              nrm[k * 3 + 1] = 1 / long;
+              nrm[k * 3 + 2] = -sz / long;
+            }
+          }
+          g.attributes.position.needsUpdate = true;
+          g.attributes.normal.needsUpdate = true;
+          g.attributes.color.needsUpdate = true;
         }
 
         `,
@@ -15118,6 +15516,7 @@ func uiSceneJs(): Str {
 
         function put(o, s) \{
           if (o.batch) \{ place(o, s); return; }
+          if (o.crowd) \{ arrayed(o, s); return; }
           var u = o.userData;
           if (s.k === "line") \{
             var p = o.geometry.attributes.position;
@@ -15145,6 +15544,7 @@ func uiSceneJs(): Str {
           if (s.k === "sprite") \{
             if (u.tint !== s.c) \{
               o.material.color.setStyle(bare(s.c));
+              o.material.opacity = solidity(s.c);
               u.tint = s.c;
             }
             o.updateMatrix();
@@ -15152,9 +15552,9 @@ func uiSceneJs(): Str {
           }
           if (s.turned) \{ o.rotation.set(s.r[0], s.r[1], s.r[2]); }
           else if (o.rotation.x || o.rotation.y || o.rotation.z) \{ o.rotation.set(0, 0, 0); }
-          if (s.k === "figure") \{
+          if (s.k === "terrain") \{
             o.updateMatrix();
-            posed(o, s);
+            lie(o, s);
             return;
           }
           stretch(s, o.scale);
@@ -15528,7 +15928,7 @@ func uiSceneJs(): Str {
         `
         function finishOf(s) \{
           if (s.s) \{ return s.s; }
-          if (s.k === "ground") \{ return "Turf"; }
+          if (s.k === "ground" || s.k === "terrain") \{ return "Turf"; }
           if (s.k === "cylinder" || s.k === "cone") \{ return "Staves"; }
           if (s.k === "roof") \{ return "Planks"; }
           if (s.k === "sphere") \{ return "Speckle"; }
