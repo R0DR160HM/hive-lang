@@ -7,6 +7,7 @@
 * **A `scene` is drawn by [Filament](https://github.com/google/filament)**, through an engine of Hive's own in `scene/`, and three.js is gone.
 * **Windows and Linux draw a window with a `scene` in it themselves**, on amd64: the engine runs beside the program, on Vulkan or OpenGL, and no browser opens.
 * **A page draws with the same engine, as WebAssembly**, so a scene looks the same wherever it is shown.
+* **`hive.audio` plays in a window that draws its own scene**, through the scene's engine: an MP3 stream, or a recording in MP3, Ogg Vorbis, FLAC or WAV.
 
 ### Tooling
 
