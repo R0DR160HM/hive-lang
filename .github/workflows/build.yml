@@ -32,6 +32,9 @@ jobs:
   # hour that only a change to `scene/build`'s pins should cost again.
   scene:
     strategy:
+      # Each engine is built alone, so one that fails does not stop the others:
+      # the web one can be most of an hour in, and what it built is cached.
+      fail-fast: false
       matrix:
         include:
           - name: linux
@@ -59,12 +62,29 @@ jobs:
             ~/.hive/vendor/filament@*/third
           key: scene-${{ matrix.name }}-${{ hashFiles('scene/build') }}
 
+      # Only what the build uses, and asked for again when an archive does not
+      # answer. LLVM's own installer brings a debugger and a language server
+      # besides, and it was their packages a runner could not fetch the one time
+      # it could not find Ubuntu's mirror.
       - name: A compiler new enough for Filament
         if: runner.os == 'Linux'
         run: |
-          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
-          sudo apt-get install -y libc++-18-dev libc++abi-18-dev ninja-build \
-            libgl1-mesa-dev libglu1-mesa-dev libxi-dev libxcomposite-dev libxxf86vm-dev
+          release=$(lsb_release -cs)
+          wget -qO- --tries=5 https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          echo "deb https://apt.llvm.org/$release/ llvm-toolchain-$release-18 main" | sudo tee /etc/apt/sources.list.d/llvm-18.list > /dev/null
+          for attempt in 1 2 3 4 5; do
+            sudo apt-get update || true
+            if sudo apt-get install -y -o Acquire::Retries=3 clang-18 lld-18 libc++-18-dev libc++abi-18-dev ninja-build \
+              libgl1-mesa-dev libglu1-mesa-dev libxi-dev libxcomposite-dev libxxf86vm-dev; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then
+              echo "::error::apt could not fetch what the engine is built with, five times over."
+              exit 1
+            fi
+            echo "::warning::apt could not fetch everything (attempt $attempt of 5). Trying again in a minute."
+            sleep 60
+          done
           echo "CC=clang-18" >> "$GITHUB_ENV"
           echo "CXX=clang++-18" >> "$GITHUB_ENV"
 
