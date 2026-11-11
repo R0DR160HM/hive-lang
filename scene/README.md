@@ -100,8 +100,9 @@ of `scene/build`. Moving one is changing it there.
 
 Two things lean on this Filament in particular, and want looking at when it moves:
 
-- Every engine is built with `material.enable_material_instance_uniform_batching`
-  off. With it on, as 1.80 has it, a scene that gave way to another on Vulkan drew
-  some materials with another's numbers: a floor all fog, a flag the wrong colour.
+- A texture is handed its pixels in the type it keeps them in: bytes for one of
+  bytes, floats for one of floats, half floats for the two cubes of light. Handed
+  floats, a half-float cube filled a second time came out rubbish on Vulkan, and
+  the scene after the first was lit white, or every colour at once.
 - A see-through solid reads `frameUniforms` to work out how bright it will be lit
   (`materials/solid.mat`), which is no part of Filament's promise to a material.

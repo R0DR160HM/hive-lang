@@ -76,7 +76,7 @@ EMSCRIPTEN_KEEPALIVE int hs_start(const char* canvas) {
     EMSCRIPTEN_WEBGL_CONTEXT_HANDLE context = emscripten_webgl_create_context(canvas, &with);
     if (context <= 0) { return 0; }
     emscripten_webgl_make_context_current(context);
-    engine = Engine::Builder().backend(Engine::Backend::OPENGL).feature(hive::SHARED_BUFFER, false).build();
+    engine = Engine::Builder().backend(Engine::Backend::OPENGL).build();
     if (!engine) { return 0; }
     renderer = engine->createRenderer();
     Renderer::ClearOptions wipe;

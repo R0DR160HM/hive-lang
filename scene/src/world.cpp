@@ -30,6 +30,7 @@
 #include <filament/VertexBuffer.h>
 #include <filament/View.h>
 #include <filament/Viewport.h>
+#include <math/half.h>
 #include <math/mat3.h>
 #include <math/mat4.h>
 #include <math/quat.h>
@@ -657,8 +658,9 @@ struct World::Inner {
         fogged();
     }
 
+    // Handed over as the halves a cube keeps. Given floats, Vulkan fills a cube it has filled before with rubbish.
     template <typename F> void fill(Texture* cube, int level, int side, F colour) {
-        std::vector<float> data(size_t(side) * side * 6 * 4);
+        std::vector<math::half> data(size_t(side) * side * 6 * 4);
         for (int face = 0; face < 6; face++) {
             for (int y = 0; y < side; y++) {
                 for (int x = 0; x < side; x++) {
@@ -673,16 +675,16 @@ struct World::Inner {
                     default: d = float3{-s, -t, -1}; break;
                     }
                     float3 c = colour(normalize(d));
-                    float* out = &data[((size_t(face) * side + y) * side + x) * 4];
-                    out[0] = c.r;
-                    out[1] = c.g;
-                    out[2] = c.b;
-                    out[3] = 1;
+                    math::half* out = &data[((size_t(face) * side + y) * side + x) * 4];
+                    out[0] = math::half(c.r);
+                    out[1] = math::half(c.g);
+                    out[2] = math::half(c.b);
+                    out[3] = math::half(1.0f);
                 }
             }
         }
         cube->setImage(engine, size_t(level), 0, 0, 0, uint32_t(side), uint32_t(side), 6,
-            pixels(data.data(), data.size() * 4, Texture::Format::RGBA, Texture::Type::FLOAT));
+            pixels(data.data(), data.size() * sizeof(math::half), Texture::Format::RGBA, Texture::Type::HALF));
     }
 
     // Below the horizon is the ground; its brightness barely follows the sky, or night would be dark twice.
