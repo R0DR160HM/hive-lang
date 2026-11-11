@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.6
+
+### Fixes
+
+* **A Linux window holding the mouse no longer looks round many times as far as the mouse moved**: X queues what the mouse did before the pointer is warped back to the centre, and every queued event was measured from the centre, so a burst counted its first move once, its second twice and so on; a move is now measured from the event before it.
+
 ## v0.3.5
 
 ### Standard library
