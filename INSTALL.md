@@ -131,6 +131,9 @@ scene/build        # the engine a window starts beside itself, for this machine
 scene/build web    # the engine a page runs
 ```
 
+On Linux both the engine and the building of it need glibc 2.38 or newer, which is
+Ubuntu 24.04 or Debian 13. Where the engine cannot start, a window is a page.
+
 ### For another platform
 
 A build leaves the Go module it compiled in `src/hivec.hive-build`, so Go can

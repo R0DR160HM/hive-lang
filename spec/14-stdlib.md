@@ -987,6 +987,10 @@ window is a page, and runs it as WebAssembly. So what a scene looks like does
 not depend on where it is shown, and a program that draws one still builds with
 no C compiler.
 
+**On Linux the engine needs glibc 2.38 or newer** — Ubuntu 24.04, Debian 13,
+Fedora 39 — because that is what Filament's own libraries are built against.
+On an older system it does not start, and the window is a page there.
+
 Three environment variables are read by a window that draws its own scene:
 
 | variable | does |
