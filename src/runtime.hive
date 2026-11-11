@@ -11485,11 +11485,27 @@ func uiSource(): Str {
         	read bool
         }
 
+        func uiPaced(v *UiView) bool \{
+        	if _, ok := uiFind(v.Attrs, "onFrame"); ok \{
+        		return true
+        	}
+        	for i := range v.Children \{
+        		if uiPaced(&v.Children[i]) \{
+        			return true
+        		}
+        	}
+        	return false
+        }
+
         func (w *uiWindow) publish(v UiView) \{
         	w.mu.Lock()
         	painter := w.painter
         	w.mu.Unlock()
         	if painter != nil \{
+        		paced := uiPaced(&v)
+        		w.mu.Lock()
+        		w.paced = paced
+        		w.mu.Unlock()
         		painter.show(v)
         		return
         	}
@@ -12666,13 +12682,14 @@ func uiSource(): Str {
 
 // The Go for `hive.ui.scene`: three dimensions in a window. The set of shapes
 // is small on purpose — a shape is here only if it cannot be made out of the
-// others — and the drawing is done by a pinned three.js the build fetches once.
+// others — and the drawing is done by the engine in `scene/`, built on Filament:
+// beside the program for a window it draws itself, and as WebAssembly for a page.
 func uiSceneSource(): Str {
     return join([
         // hive.ui's third dimension.
         //
         // A scene is a widget like any other, rendering to a box on the page that a
-        // small three.js program draws into. What makes it different is that the box is
+        // small engine draws into. What makes it different is that the box is
         // kept: the payload travels on a frame of its own (see publish in ui.go), so
         // the world can be redrawn sixty times a second without the document around it
         // being re-sent or the canvas replaced.
@@ -12682,7 +12699,7 @@ func uiSceneSource(): Str {
         // renderer, where a mesh and a shader would mean something only to this one.
         //
         // ---------------------------------------------------------------------------
-        // three.js
+        // The engine
         // ---------------------------------------------------------------------------
         `
         package hive
@@ -12697,12 +12714,13 @@ func uiSceneSource(): Str {
         	"sync"
         )
         `,
-        // The library, fetched at compile time against a pinned digest and embedded
-        // here. Nothing is loaded from the network when the program runs: a built Hive
-        // program is one file, and a window opening a socket to a CDN would end that.
+        // The engine as a page runs it, placed at compile time against a pinned digest
+        // and embedded here. Nothing is loaded from the network when the program runs: a
+        // built Hive program is one file, and a window opening a socket to a CDN would
+        // end that.
         //
         `
-        //go:embed three.module.min.js three.core.min.js
+        //go:embed hive-scene.js hive-scene.wasm
         var uiSceneLib embed.FS
         `,
         // What the window serves and puts on the page. This runs because the file is
@@ -12713,8 +12731,8 @@ func uiSceneSource(): Str {
         	uiExtraScript = "<script type=\"module\" src=\"/_hive/scene.js\"></script>"
         	uiExtraRoutes["/_hive/scene.js"] = uiSceneText("text/javascript", uiSceneJS)
         	uiExtraRoutes["/_hive/terrain/"] = uiSceneTerrainData
-        	uiExtraRoutes["/_hive/three.module.min.js"] = uiSceneAsset("three.module.min.js")
-        	uiExtraRoutes["/_hive/three.core.min.js"] = uiSceneAsset("three.core.min.js")
+        	uiExtraRoutes["/_hive/hive-scene.js"] = uiSceneAsset("hive-scene.js", "text/javascript; charset=utf-8")
+        	uiExtraRoutes["/_hive/hive-scene.wasm"] = uiSceneAsset("hive-scene.wasm", "application/wasm")
         `,
         `
         }
@@ -12728,27 +12746,24 @@ func uiSceneSource(): Str {
         	}
         }
         `,
-        // A file out of the embedded library. It carries no token: it is the same public
-        // library bytes on every machine, it says nothing about the program serving it,
-        // and the page that loads it was already let in.
+        // A file of the embedded engine. It carries no token: it is the same public
+        // bytes on every machine, it says nothing about the program serving it, and the
+        // page that loads it was already let in.
         `
-        func uiSceneAsset(name string) func(http.ResponseWriter, *http.Request) \{
+        func uiSceneAsset(name, mime string) func(http.ResponseWriter, *http.Request) \{
         	return func(rw http.ResponseWriter, _ *http.Request) \{
         		body, err := uiSceneLib.ReadFile(name)
         		if err != nil \{
         			http.Error(rw, "not found", http.StatusNotFound)
         			return
         		}
-        		rw.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+        		rw.Header().Set("Content-Type", mime)
         `,
-        // The bytes are pinned to a version, so a page may keep them for as long
-        // as it likes.
-        //
         // ---------------------------------------------------------------------------
         // The shapes
         // ---------------------------------------------------------------------------
         `
-        		rw.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+        		rw.Header().Set("Cache-Control", "no-store")
         		_, _ = rw.Write(body)
         	}
         }
@@ -13555,7 +13570,7 @@ func uiSceneJs(): Str {
         // The page's half of hive.ui.scene, served at /_hive/scene.js.
         `
         const uiSceneJS = ~BT~
-        import * as THREE from "./three.module.min.js";
+        import summon from "./hive-scene.js";
         `,
         // The canvas lives here, outside the element the window swaps on every repaint.
         // A canvas inside it would be destroyed by each swap, and with it the WebGL
@@ -13566,15 +13581,13 @@ func uiSceneJs(): Str {
         holder.className = "h-world";
         holder.style.display = "none";
         document.body.appendChild(holder);
+        var canvas = document.createElement("canvas");
+        canvas.id = "h-world-canvas";
+        holder.appendChild(canvas);
 
-        var renderer = null, stage = null, camera = null;
-        var host = null, handle = "", world = eyeless();
-        `,
-        // The insets: where each one is looking, and the box on the page it is looking
-        // out of. A camera of their own is not needed one apiece — they are drawn one
-        // after another and never at the same instant — so there is one, moved.
-        `
-        var looks = [], boxes = [], spare = null;
+        var engine = null;
+        var host = null, handle = "", world = \{grab: false};
+        var boxes = [], insetsSaid = "";
         var seen = \{left: -1, top: -1, width: -1, height: -1};
         `,
         // Whether that rectangle might be out of date, the observer that says so, and
@@ -13582,244 +13595,151 @@ func uiSceneJs(): Str {
         `
         var boxMoved = true, boxWatch = null, boxWatched = false, boxBeat = 0;
         var sizeSaid = [-1, -1];
-        var live = [], geoms = new Map(), mats = new Map(), signs = new Map();
-        `,
-        // Everything on the stage that is not a light and not in a batch, under one
-        // node, so a shape can go on and come off in constant time. See sow and shed.
-        //
-        // A batch is every opaque solid of one kind in one finish, drawn as one
-        // instanced mesh: a city is thousands of boxes in a dozen finishes, and a draw
-        // call apiece was the whole of a frame's time on the page's thread. See seat.
-        `
-        var flock = null, batches = new Map();
-        `,
-        // Which frame of the world arrived last, and the sounds among its slots. Only
-        // the sounds are kept slot by slot: a solid that changed arrives whole, and its
-        // own mesh already holds everything about it worth knowing.
-        `
-        var seq = 0, voiceOf = [], soundSlots = [], sounded = [], soundsMoved = false;
         `,
         // Set by a frame this page cannot make sense of, cleared once the ask for the
         // whole world has gone out. See paint.
         `
         var needFull = false;
-        `,
-        // One texture of grain and one of relief per surface, whatever colour it is
-        // painted: a texture apiece for every colour a scene ever asked for was nine
-        // hundred canvases a few minutes into a city, and never one of them let go.
-        //
-        // The sky is one canvas, redrawn when its colour changes, and the light it
-        // throws is a second one, blurred for the surfaces to reflect. See heavens.
-        `
-        var skins = new Map();
-        var skyTex = null, skyHex = "", glow = null, glowTex = null, glowHex = "", glowAt = 0, pmrem = null;
-        `,
-        // The sun is held rather than let go of, because it now has to be moved: a
-        // shadow map covers a box, and the box has to be wherever the eye is.
-        `
-        var sun = null;
-        `,
-        // Every photograph this program shipped. See photoOf.
-        `
-        var photos = new Map();
-        `,
-        // Shadows, and the one thing that makes them affordable. A shadow map is a
-        // second pass from where the sun is, and a scene here can be a circuit two
-        // miles round — mapped whole, a shadow would be a smear a metre wide.
-        //
-        // So the map covers a box round the eye (see reach) rather than the world,
-        // which is where shadows are read anyway: what a shadow is for is telling you
-        // a car is beside you and the kerb is where you think it is.
-        //
-        // A shadow map costs twice, and the second time is the expensive one: once to
-        // draw, and once to read for every lit fragment on the screen. At 3800x1800
-        // that read is seven million times a frame.
-        //
-        // Measured on an Iris Xe at that size: PCFSoft thirty-four frames, PCF
-        // thirty-three, Basic forty. Basic is the cheap one and it is not usable
-        // here — unfiltered, every wall lit edge-on comes back corrugated (see the
-        // note on normalBias), and the only bias big enough to clear it lifts a car's
-        // shadow clean off the car.
-        //
-        // So: PCF, three.js's own default, a frame cheaper than PCFSoft and the same
-        // at this scale.
-        //
-        // **It is redrawn every frame.** It was every other frame, which was half the
-        // pass saved and was invisible while the sun was a third of the light; once
-        // the sun was most of it, everything moving was shadowed on alternate frames
-        // by where it had been a frame before — a running man or a car at speed
-        // flickering from lit to dark thirty times a second. The pass is a few dozen
-        // instanced draws now (see seat), which is what made every frame affordable.
-        //
-        // And the sun is moved on the same beat. That pairing is not optional: move
-        // the light without redrawing the map and every shadow slides about under the
-        // thing casting it.
-        //
-        // Yaw, then pitch. With the default order a camera that is looking up rolls as
-        // it turns, which is the one thing an eye never does.
-        //
-        // A fixed rig, because lighting is not something a scene describes: the sky
-        // and a sun, chosen so a solid painted a colour comes out that colour on its
-        // lit side and a cooler, darker shade of it on its shaded one. three.js takes
-        // these in physical units, and the tone mapping is the shoulder of Khronos's
-        // neutral curve without its toe: a colour below the highlights is left where
-        // it was found, and a sunlit white rolls off gently instead of clipping. The
-        // toe was the curve's own darkening of the darks, which made every deep red
-        // and green a deeper and more saturated one than the scene had asked for.
-        //
-        // One pixel per pixel of the box, however dense the screen. A doubled
-        // density is four times the fragments and four times a multisampled
-        // framebuffer, and on a laptop's panel the second of those alone was a
-        // hundred megabytes; the edges are what multisampling is for.
-        //
-        // Two thousand and forty-eight, and it is very nearly free. Halving it to
-        // 1024 moved the frame rate by less than the noise between two runs: what a
-        // shadow map costs to draw is the geometry that survives the cull, and inside
-        // fifty-five metres there is not much of it.
-        //
-        // Over a box that size it is a shadow texel of five and a half centimetres,
-        // which is what lets the unfiltered edge pass for a drawn one.
-        `
-        var SHOULDER = [
-          "vec3 shoulder(vec3 c) \{",
-          "  float peak = max(c.r, max(c.g, c.b));",
-          "  if (peak < 0.8) \{ return c; }",
-          "  float fresh = 1.0 - 0.04 / (peak - 0.6);",
-          "  c *= fresh / peak;",
-          "  return mix(c, vec3(fresh), 1.0 - 1.0 / (0.15 * (peak - fresh) + 1.0));",
-          "}"
-        ].join("\n");
 
         var want = "", grabbing = false, lookX = 0, lookY = 0, last = 0, dirty = false;
         var held = \{};
-        var frame = null, sheet = null, screen = null, coarse = 0, deep = 0, shrink = 1;
-        var pics = new Map();
-
-        function boot() \{
-          renderer = new THREE.WebGLRenderer(\{antialias: true});
-          renderer.setPixelRatio(1);
-          THREE.ShaderChunk.tonemapping_pars_fragment = THREE.ShaderChunk.tonemapping_pars_fragment
-            .replace("vec3 CustomToneMapping( vec3 color ) \{ return color; }",
-              SHOULDER + "\nvec3 CustomToneMapping( vec3 color ) \{ return shoulder( toneMappingExposure * color ); }");
-          renderer.toneMapping = THREE.CustomToneMapping;
-          renderer.shadowMap.enabled = true;
-          renderer.shadowMap.type = THREE.PCFShadowMap;
-          renderer.shadowMap.autoUpdate = false;
-          stage = new THREE.Scene();
-          camera = new THREE.PerspectiveCamera(75, 1, 0.08, 800);
-          camera.rotation.order = "YXZ";
-          pmrem = new THREE.PMREMGenerator(renderer);
         `,
-        // **The sky lights the world, and the sun is warm.** The light from above is
-        // the sky itself, blurred (see heavens), so a wall facing away from the sun
-        // is lit by blue from above and by the ground's own brown from below — which
-        // is what makes it read as a wall in daylight rather than a darker card — and
-        // a car or a window reflects the sky it stands under.
-        //
-        // The sun carries most of the light, so a face toward it and a face away
-        // from it are told apart at a glance; a shadow is then the sky's light alone,
-        // a little blue, as it is outdoors.
+        // What the engine asked for, answered between frames and never from inside it,
+        // and the stretch of its memory a frame or a picture is handed over in.
         `
-          sun = new THREE.DirectionalLight(0xfff0dc, 2.6);
-          sun.position.set(6, 14, 8);
-          sun.castShadow = true;
-          sun.shadow.mapSize.set(2048, 2048);
-          var box = sun.shadow.camera;
-          box.left = -reach();
-          box.right = reach();
-          box.top = reach();
-          box.bottom = -reach();
-          box.near = 1;
-          box.far = reach() * 3;
-          box.updateProjectionMatrix();
-        `,
-        // How far a surface stands out of its own way, and it is a quarter of a metre
-        // because a tenth was not enough.
-        //
-        // A shadow map is one depth per texel, and a surface lit edge-on changes
-        // depth across a texel by more than the map can express — so half its texels
-        // shade themselves and half do not, and a wall seen down its length comes out
-        // corrugated. It is the most convincing wrong thing a renderer produces,
-        // because it looks exactly like a texture; it was blamed on a normal map,
-        // then a photograph, then a canvas size. One build with
-        // renderer.shadowMap.enabled off settles it.
-        //
-        // normalBias moves the point being tested out along the surface, which is the
-        // honest lever: what the map cannot resolve is depth across the surface. It
-        // is paid for in contact — a shadow may sit a quarter of a metre from the
-        // foot of what casts it — which against a circuit's scale is nothing. The far
-        // plane is pulled in to three times the reach for the same reason: depth
-        // range not used is precision the near end gets back.
-        `
-          sun.shadow.bias = -0.0006;
-          sun.shadow.normalBias = 0.25;
-          stage.add(sun);
-          stage.add(sun.target);
-          flock = new THREE.Group();
-          stage.add(flock);
-          holder.appendChild(renderer.domElement);
-          listen();
-        }
-        `,
-        // How far from the eye a shadow is drawn, in metres.
-        //
-        // Fifty-five is about a second at speed, and a second is as far ahead as a
-        // shadow is read. It was eighty: what a shadow map costs is its area, and the
-        // outer quarter of that box was buying a shadow you would have gone looking for.
-        `
-        var shadeFar = 55, sunAt = [0, -100], sunLow = new THREE.Color(0xffb46e);
+        var asks = [], room = 0, roomAt = 0;
 
-        function reach() \{ return shadeFar; }
-
-        function sunned(at, far) \{
-          sunAt[0] = at[0];
-          sunAt[1] = at[1];
-          shadeFar = far;
-          if (at[1] > -10) \{
-            var high = Math.max(0.05, Math.min(1.55, at[1]));
-            SUNWARD.set(-Math.sin(at[0]) * Math.cos(high), Math.sin(high), -Math.cos(at[0]) * Math.cos(high));
-            var low = Math.max(0, Math.min(1, 1 - Math.sin(high) / 0.5));
-            sun.color.setHex(0xfff0dc).lerp(sunLow, low * 0.8);
-            sun.intensity = 2.6 * (1 - 0.35 * low);
-          } else \{
-            SUNWARD.set(0.36, 0.85, 0.48).normalize();
-            sun.color.setHex(0xfff0dc);
-            sun.intensity = 2.6;
+        function lent(bytes) \{
+          if (bytes.length > room) \{
+            if (roomAt) \{ engine._free(roomAt); }
+            room = Math.max(bytes.length, room * 2, 65536);
+            roomAt = engine._malloc(room);
           }
-          SUN_ACROSS.set(0, 1, 0).cross(SUNWARD).normalize();
-          SUN_UP.copy(SUNWARD).cross(SUN_ACROSS);
-          var box = sun.shadow.camera;
-          box.left = -far;
-          box.right = far;
-          box.top = far;
-          box.bottom = -far;
-          box.far = far * 3;
-          box.updateProjectionMatrix();
+          engine.HEAPU8.set(bytes, roomAt);
+          return roomAt;
+        }
+
+        function worded(text) \{ return engine.stringToNewUTF8(text); }
+        `,
+        // A frame cut from one this page never drew is not taken, and the whole world
+        // is asked for instead. See tick.
+        `
+        function paint(frame) \{
+          var bytes = new Uint8Array(frame);
+          if (!engine._hs_frame(lent(bytes), bytes.length)) \{
+            needFull = true;
+            return;
+          }
+          world = JSON.parse(engine.UTF8ToString(engine._hs_told()));
+          want = world.on || "";
+          if (world.sounds.length || voices.size) \{ sounds(world.sounds, world); }
+          if (!world.grab && grabbing) \{ document.exitPointerLock(); }
+          dirty = true;
+        }
+
+        function answer() \{
+          if (!asks.length) \{ return; }
+          var waiting = asks;
+          asks = [];
+          for (var i = 0; i < waiting.length; i++) \{
+            var kind = waiting[i][0], first = waiting[i][1], second = waiting[i][2];
+            if (kind === 0) \{
+              pictured(first);
+            } else if (kind === 1) \{
+              filed(first);
+            } else if (kind === 2) \{
+              grounded(first);
+            } else \{
+              sign(first, second);
+            }
+          }
+        }
+
+        function assetOf(path) \{
+          return "/_hive/asset/" + path.split("/").map(encodeURIComponent).join("/");
+        }
+
+        function handed(name, bytes, give) \{
+          var word = worded(name);
+          give(word, bytes ? lent(bytes) : 0, bytes ? bytes.length : 0);
+          engine._free(word);
+          dirty = true;
         }
         `,
-        // Which way the sun is — the same 6, 14, 8 the rig was built with — and the
-        // two directions across its view, as three.js's lookAt builds them, which are
-        // what the shadow box is moved along a texel at a time.
+        // A picture goes over as straight pixels, rows from the top. One that is not
+        // there is said to be missing, so the engine stops waiting for it.
         `
-        var SUNWARD = new THREE.Vector3(0.36, 0.85, 0.48).normalize();
-        var SUN_ACROSS = new THREE.Vector3(0, 1, 0).cross(SUNWARD).normalize();
-        var SUN_UP = SUNWARD.clone().cross(SUN_ACROSS);
-        var under = new THREE.Vector3();
+        function pictured(path) \{
+          fetch(assetOf(path))
+            .then(function (r) \{ if (!r.ok) \{ throw new Error(r.status); } return r.blob(); })
+            .then(function (blob) \{
+              return createImageBitmap(blob, \{premultiplyAlpha: "none", colorSpaceConversion: "none"});
+            })
+            .then(function (shot) \{
+              var flat = document.createElement("canvas");
+              flat.width = shot.width;
+              flat.height = shot.height;
+              var ctx = flat.getContext("2d", \{willReadFrequently: true});
+              ctx.drawImage(shot, 0, 0);
+              return ctx.getImageData(0, 0, flat.width, flat.height);
+            })
+            .then(function (shot) \{
+              handed(path, shot.data, function (word, at) \{ engine._hs_picture(word, shot.width, shot.height, at); });
+            }, function () \{
+              handed(path, null, function (word) \{ engine._hs_picture(word, 0, 0, 0); });
+            });
+        }
+
+        function filed(path) \{
+          fetch(assetOf(path))
+            .then(function (r) \{ if (!r.ok) \{ throw new Error(r.status); } return r.arrayBuffer(); })
+            .then(function (buf) \{
+              handed(path, new Uint8Array(buf), function (word, at, size) \{ engine._hs_file(word, at, size, 1); });
+            }, function () \{
+              handed(path, null, function (word) \{ engine._hs_file(word, 0, 0, 0); });
+            });
+        }
+
+        function grounded(id) \{
+          fetch("/_hive/terrain/" + id)
+            .then(function (r) \{ if (!r.ok) \{ throw new Error(r.status); } return r.arrayBuffer(); })
+            .then(function (buf) \{
+              handed(id, new Uint8Array(buf), function (word, at, size) \{ engine._hs_terrain(word, at, size); });
+            }, function () \{});
+        }
         `,
-        // The most anisotropy the card will give, within reason. It is what stops a
-        // road seen at a glancing angle from turning to mush a dozen metres ahead.
-        //
-        // Four and not eight. A road at a glancing angle is most of what a racing game
-        // draws, so this is a multiplier on the largest thing in the picture, and what
-        // eight buys past four is sharpness somewhere the fog has already taken.
-        //
+        // A label is words drawn once onto a canvas, in the page's own typeface, and
+        // kept by the engine from then on.
+        `
+        function sign(text, colour) \{
+          var pad = 16, size = 52;
+          var face = "bold " + size + "px system-ui, -apple-system, Segoe UI, sans-serif";
+          var plate = document.createElement("canvas");
+          var ctx = plate.getContext("2d");
+          ctx.font = face;
+          plate.width = Math.ceil(ctx.measureText(text).width) + pad * 2;
+          plate.height = size + pad * 2;
+        `,
+        // Sizing the canvas resets everything about the context, so the font goes on
+        // again after it.
+        `
+          ctx = plate.getContext("2d", \{willReadFrequently: true});
+          ctx.font = face;
+          ctx.fillStyle = "rgba(10,12,16,0.5)";
+          ctx.fillRect(0, 0, plate.width, plate.height);
+          ctx.fillStyle = colour;
+          ctx.textBaseline = "middle";
+          ctx.fillText(text, pad, plate.height / 2 + 2);
+          var px = ctx.getImageData(0, 0, plate.width, plate.height).data;
+          var word = worded(text), tint = worded(colour);
+          engine._hs_label(word, tint, plate.width, plate.height, lent(px));
+          engine._free(word);
+          engine._free(tint);
+          dirty = true;
+        }
+        `,
         // --- the box the picture goes in -------------------------------------------
-        `
-        function most() \{
-          if (!renderer) \{ return 4; }
-          return Math.min(4, renderer.capabilities.getMaxAnisotropy());
-        }
-        `,
+        //
         // Called after every document swap: the element is a new one each time, so what
         // is found again here is where the canvas has to be laid over.
         `
@@ -13841,7 +13761,6 @@ func uiSceneJs(): Str {
         // onto this one.
         `
           watchBox(el);
-          if (!renderer) \{ boot(); }
           holder.style.display = "block";
           follow(true);
         }
@@ -13876,7 +13795,7 @@ func uiSceneJs(): Str {
         }
 
         function follow(force) \{
-          if (!host || !renderer) \{ return; }
+          if (!host || !engine) \{ return; }
           var mark = host.classList.contains("h-aiming") ? "h-world h-aiming" : "h-world";
           if (holder.className !== mark) \{ holder.className = mark; }
         `,
@@ -13904,10 +13823,10 @@ func uiSceneJs(): Str {
           holder.style.top = r.top + "px";
           holder.style.width = w + "px";
           holder.style.height = h + "px";
-          renderer.setSize(w, h, false);
-          sized(w, h);
-          camera.aspect = w / h;
-          camera.updateProjectionMatrix();
+          canvas.width = w;
+          canvas.height = h;
+          engine._hs_sized(w, h, w, h);
+          insetsSaid = "";
           dirty = true;
         }
         `,
@@ -13924,2846 +13843,33 @@ func uiSceneJs(): Str {
           }
         }
         `,
-        // The second look, and it is a second pass over the same stage. An inset is a
-        // box on the page and a camera; what it shows is whatever the scene is already
-        // showing, from wherever that camera stands. So it costs one more draw of
-        // shapes already built and nothing in what the program has to say — the whole
-        // argument for it being a camera rather than a second scene.
-        //
-        // Drawn into the scene's own canvas, scissored to where its box landed, which
-        // decides the one rule an inset has: it has to be over the picture. A box the
-        // canvas does not reach is clipped, and skipped when there is none of it left.
-        `
-        function handheld() \{ return coarse > 0 || deep > 0; }
-        `,
-        // THE PICTURE A HANDHELD WOULD HAVE DRAWN. Two numbers, and between them the
-        // whole of the look: grain is how few pixels the world is drawn into before it
-        // is blown up again, and bits is how few values each of its three channels may
-        // take. Neither is a filter over a modern picture — the world is *rendered* at
-        // the coarse size, so a wall a pixel wide is a pixel wide rather than a grey
-        // smear of one, which is the difference between pixel art and a blur.
-        //
-        // The quantisation is dithered rather than rounded, and that is the half that
-        // matters. Rounded, a sky gradient becomes eight flat bands with hard steps
-        // across the screen; dithered, the step is broken up into a fixed pattern that
-        // reads as a gradient and gives the picture the woven look a machine with
-        // fifteen bits of colour had. It is the same decision this program already
-        // made about its music, which is bit-reduced to ten bits for the same reason
-        // and with the same catch: what you hear is not the crunch, it is the noise
-        // staying put instead of following the signal down.
-        //
-        // A four-by-four ordered matrix, held as a texture rather than a constant
-        // array: dynamic indexing into one is not something every GL ES 1.0 driver
-        // will do, and a four-texel-square lookup is free.
-        `
-        function bayer() \{
-          var m = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
-          var px = new Uint8Array(16);
-          for (var i = 0; i < 16; i++) \{ px[i] = Math.round(m[i] * 255 / 16); }
-          var t = new THREE.DataTexture(px, 4, 4, THREE.RedFormat);
-          t.minFilter = THREE.NearestFilter;
-          t.magFilter = THREE.NearestFilter;
-          t.wrapS = THREE.RepeatWrapping;
-          t.wrapT = THREE.RepeatWrapping;
-          t.needsUpdate = true;
-          return t;
-        }
-        `,
-        // The quad the coarse picture is blown up onto. Nearest all the way: the whole
-        // point is that one drawn pixel becomes a square of them with an edge on it.
-        `
-        function sheeting() \{
-          var vert = [
-            "varying vec2 vUv;",
-            "void main() \{",
-            "  vUv = uv;",
-            "  gl_Position = vec4(position.xy, 0.0, 1.0);",
-            "}"
-          ].join("\n");
-        `,
-        // **The buffer is linear and the screen is not.** Rendering to the canvas,
-        // three.js encodes the frame on its way out; rendering to a target it does not,
-        // and a raw shader reading that target gets light in linear units. Write those
-        // to the page and every midtone is about half as bright as it should be — which
-        // is not subtle: measured against the same circuit before the pass existed, the
-        // world came out at a quarter of its brightness and read as a different time of
-        // day. So the encode is done here, by hand, because nothing else is going to.
-        //
-        // And the quantisation happens *after* it, which is the other half of being
-        // right: fifteen-bit colour was fifteen bits of what the screen displayed, not
-        // of what the maths was carried in. Dithering in linear space puts all of the
-        // steps in the highlights and none in the shadows, where the eye is looking.
-        //
-        // The tone mapping is skipped for a target too, for the same reason, so it is
-        // done here as well and first — the same curve the screen gets (see boot), or
-        // a handheld's sunlit wall would clip where the screen's does not.
-        `
-          var frag = [
-            "uniform sampler2D tex;",
-            "uniform sampler2D mix4;",
-            "uniform vec2 size;",
-            "uniform float steps;",
-            "varying vec2 vUv;",
-            SHOULDER,
-            "vec3 shown(vec3 c) \{",
-            "  c = shoulder(c);",
-            "  vec3 lo = c * 12.92;",
-            "  vec3 hi = 1.055 * pow(max(c, vec3(0.0)), vec3(0.4166667)) - 0.055;",
-            "  return mix(lo, hi, step(vec3(0.0031308), c));",
-            "}",
-            "void main() \{",
-            "  vec3 c = shown(texture2D(tex, vUv).rgb);",
-            "  if (steps > 0.0) \{",
-            "    vec2 cell = floor(vUv * size);",
-            "    float d = texture2D(mix4, (cell + 0.5) / 4.0).r - 0.5;",
-            "    c = floor(c * steps + d + 0.5) / steps;",
-            "  }",
-            "  gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);",
-            "}"
-          ].join("\n");
-          var mat = new THREE.ShaderMaterial(\{
-            uniforms: \{
-              tex: \{value: null},
-              mix4: \{value: bayer()},
-              size: \{value: new THREE.Vector2(1, 1)},
-              steps: \{value: 0}
-            },
-            vertexShader: vert,
-            fragmentShader: frag,
-            depthTest: false,
-            depthWrite: false
-          });
-          var quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat);
-          quad.frustumCulled = false;
-          var over = new THREE.Scene();
-          over.add(quad);
-          screen = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-          return \{scene: over, mat: mat};
-        }
-        `,
-        // The coarse buffer, remade only when the shape of it changes. Depth is asked
-        // for because the world is drawn into this and a world without a depth buffer
-        // is a world drawn in the order it was declared.
-        `
-        function sized(w, h) \{
-          if (!handheld()) \{
-            if (frame) \{ frame.dispose(); frame = null; }
-            shrink = 1;
-            return;
-          }
-          shrink = 1;
-          if (coarse > 0) \{
-            shrink = Math.min(1, coarse / Math.max(1, Math.min(w, h)));
-          }
-          var tw = Math.max(1, Math.round(w * shrink));
-          var th = Math.max(1, Math.round(h * shrink));
-          if (!frame) \{
-            frame = new THREE.WebGLRenderTarget(tw, th, \{depthBuffer: true, samples: 4});
-          } else if (frame.width !== tw || frame.height !== th) \{
-            frame.setSize(tw, th);
-          }
-          frame.texture.minFilter = THREE.NearestFilter;
-          frame.texture.magFilter = THREE.NearestFilter;
-          frame.texture.generateMipmaps = false;
-        }
-        `,
-        // One frame through the pass: the world into the coarse buffer, the insets
-        // into it after — they are set *into* the picture, so they are set into the
-        // same pixels — and then the whole of it blown up onto the page.
-        `
-        function blown() \{
-          if (!sheet) \{ sheet = sheeting(); }
-          renderer.setRenderTarget(frame);
-          renderer.clear();
-          renderer.render(stage, camera);
-          if (looks.length) \{ insets(); }
-          renderer.setRenderTarget(null);
-          sheet.mat.uniforms.tex.value = frame.texture;
-          sheet.mat.uniforms.size.value.set(frame.width, frame.height);
-          sheet.mat.uniforms.steps.value = deep > 0 ? Math.pow(2, deep) - 1 : 0;
-          renderer.render(sheet.scene, screen);
-        }
-        `,
+        // An inset is a box on the page and a camera: the engine draws it into the
+        // scene's own canvas, where its box landed, so it has to be over the picture.
+        // Told only when a box moved.
         `
         function insets() \{
-          var drew = false;
-          for (var i = 0; i < looks.length; i++) \{
-            var box = boxes[i], look = looks[i];
-            if (!box || !look) \{ continue; }
+          var flat = [];
+          for (var i = 0; i < boxes.length; i++) \{
+            var box = boxes[i];
+            if (!box) \{
+              flat.push(0, 0, 0, 0);
+              continue;
+            }
             var r = box.getBoundingClientRect();
             var left = Math.max(0, Math.round(r.left - seen.left));
             var top = Math.max(0, Math.round(r.top - seen.top));
             var right = Math.min(seen.width, Math.round(r.right - seen.left));
             var low = Math.min(seen.height, Math.round(r.bottom - seen.top));
-            var w = right - left, h = low - top;
-            if (w < 8 || h < 8) \{ continue; }
-            if (!spare) \{
-              spare = new THREE.PerspectiveCamera(75, 1, 0.08, 800);
-              spare.rotation.order = "YXZ";
-            }
-            var lens = look.lens || 75;
-            if (spare.fov !== lens || spare.aspect !== w / h) \{
-              spare.fov = lens;
-              spare.aspect = w / h;
-              spare.updateProjectionMatrix();
-            }
-            spare.position.set(look.eye[0], look.eye[1], look.eye[2]);
-            spare.rotation.set(look.aim[1], look.aim[0], 0);
-            drew = true;
-        `,
-        // A page counts down from the top of the canvas and WebGL counts up from
-        // the bottom of it, which is the whole of this line.
-        //
-        // --- one frame -------------------------------------------------------------
-        `
-            framed(Math.round(left * shrink), Math.round((seen.height - low) * shrink),
-              Math.round(w * shrink), Math.round(h * shrink), true);
-            renderer.render(stage, spare);
-          }
-          if (drew) \{ framed(0, 0, 0, 0, false); }
-        }
-        `,
-        // Where an inset is drawn, and the whole picture put back afterwards.
-        //
-        // **Into a buffer, the rectangle is the buffer's own and not the renderer's.**
-        // renderer.setViewport and setScissor always write the canvas's rectangle, times
-        // the pixel ratio, even while a render target is bound, and setRenderTarget(null)
-        // puts that rectangle back on the canvas on the way out. So an inset set that way
-        // under ui.grain drew in the wrong place and then left the canvas at the size of
-        // the buffer, and the blown-up picture came out shrunk into the bottom-left corner
-        // for as long as any inset was up. A target carries its own viewport, scissor and
-        // scissorTest, which setRenderTarget reads when it binds, so into a target those
-        // are set and it is bound again, and the canvas is never touched.
-        `
-        function framed(x, y, w, h, cut) \{
-          var into = renderer.getRenderTarget();
-          if (into) \{
-            if (cut) \{
-              into.viewport.set(x, y, w, h);
-              into.scissor.set(x, y, w, h);
-            } else \{
-              into.viewport.set(0, 0, into.width, into.height);
-              into.scissor.set(0, 0, into.width, into.height);
-            }
-            into.scissorTest = cut;
-            renderer.setRenderTarget(into);
-            return;
-          }
-          if (!cut) \{
-            x = 0;
-            y = 0;
-            w = seen.width;
-            h = seen.height;
-          }
-          renderer.setScissorTest(cut);
-          renderer.setViewport(x, y, w, h);
-          renderer.setScissor(x, y, w, h);
-        }
-        `,
-        // A frame of the world, taken apart. It is the numbers in the order this reader
-        // takes them out — nothing parsed, nothing looked up by name — and a slot
-        // missing from it is a mesh already standing in the right place. A circuit was
-        // a hundred and eighty kilobytes a frame as JSON, and is nearer fifteen here.
-        //
-        // The layout, which uiSceneFrame writes:
-        //
-        //   S  seq  prev  camera  count  insets  moves  [dst, src, len]...  edits  [slot, record]...
-        //
-        // seq names this frame and prev the one it was taken from, so a page can tell
-        // it has missed one; prev nought means the frame carries the whole world.
-        `
-        var reading = null, byte = null, cur = 0;
-        var utf8 = new TextDecoder();
-
-        function readU8() \{ var n = byte[cur]; cur += 1; return n; }
-
-        function readU16() \{ var n = reading.getUint16(cur, true); cur += 2; return n; }
-
-        function readU32() \{ var n = reading.getUint32(cur, true); cur += 4; return n; }
-
-        function readF32() \{ var n = reading.getFloat32(cur, true); cur += 4; return n; }
-
-        function readWord() \{ return readText(readU8()); }
-
-        function readLong() \{ return readText(readU16()); }
-        `,
-        // Nearly every string in a frame is a colour or a surface name — seven ASCII
-        // characters, hundreds of times a second — so the decoder is only woken for
-        // one with something in it worth decoding.
-        `
-        function readText(n) \{
-          var s = "", i = 0;
-          for (; i < n; i++) \{
-            var c = byte[cur + i];
-            if (c > 127) \{ break; }
-            s += String.fromCharCode(c);
-          }
-          if (i < n) \{ s = utf8.decode(byte.subarray(cur, cur + n)); }
-          cur += n;
-          return s;
-        }
-        `,
-        // The kinds and the bits, exactly as uiSceneShape and uiSceneCamera write them.
-        `
-        var KINDS = ["box", "sphere", "cylinder", "cone", "ground", "label", "line",
-          "sound", "sprite", "roof", "figure", "terrain"];
-        var SOUND = 7;
-        var HAS_AT = 1, HAS_TURN = 2, HAS_SIZE = 4, HAS_SURFACE = 8, HAS_WORDS = 16,
-          HAS_VOICE = 32, HAS_TRACK = 64, HAS_PAINTS = 128, HAS_SCALE = 32;
-        var EYE_LENS = 1, EYE_FOG = 2, EYE_SKY = 4, EYE_GRAB = 8, EYE_FLAT = 16,
-          EYE_GRAIN = 32, EYE_BITS = 64, EYE_SUN = 128;
-        `,
-        // Where an eye is and what it can see. The same block for the world's own
-        // camera and for every inset looking at that world, which is why an inset
-        // costs a second pass and not a second scene.
-        `
-        function readCamera(into) \{
-          var e = into.eye, a = into.aim;
-          e[0] = readF32();
-          e[1] = readF32();
-          e[2] = readF32();
-          a[0] = readF32();
-          a[1] = readF32();
-          var bits = readU8();
-          into.lens = (bits & EYE_LENS) ? readU16() : 0;
-          into.fog = (bits & EYE_FOG) ? readU16() : 0;
-          into.grain = (bits & EYE_GRAIN) ? readU16() : 0;
-          into.bits = (bits & EYE_BITS) ? readU16() : 0;
-          into.sky = (bits & EYE_SKY) ? readWord() : "";
-          into.grab = (bits & EYE_GRAB) !== 0;
-          into.flat = (bits & EYE_FLAT) !== 0;
-          if (bits & EYE_SUN) \{
-            into.sun[0] = readF32();
-            into.sun[1] = readF32();
-            into.shade = readU16();
-          } else \{
-            into.sun[0] = 0;
-            into.sun[1] = -100;
-            into.shade = 0;
-          }
-          into.on = readWord();
-          return into;
-        }
-
-        function eyeless() \{
-          return \{eye: [0, 0, 0], aim: [0, 0], lens: 0, fog: 0, grain: 0, bits: 0,
-            sky: "", grab: false, flat: false, on: "", sun: [0, -100], shade: 0};
-        }
-        `,
-        // One shape, read into the same object every time: a record is written straight
-        // into the mesh standing in its slot and is of no further interest, so there is
-        // one of these rather than one per shape per frame.
-        `
-        var scratch = \{k: "box", c: "", p: [0, 0, 0], r: [0, 0, 0], d: [1, 1, 1],
-          s: "", x: "", t: [], z: [1, 1, 1], turned: false};
-
-        function paint(frame) \{
-          reading = new DataView(frame);
-          byte = new Uint8Array(frame);
-          cur = 1;
-          var stamp = readU32(), after = readU32();
-        `,
-        // A difference taken from a frame this page never held would put the world
-        // somewhere it has never been. Ask for the whole of it and draw nothing.
-        `
-          if (after !== 0 && after !== seq) \{
-            needFull = true;
-            return;
-          }
-          if (!renderer) \{ boot(); }
-          readCamera(world);
-          var count = readU32();
-          var many = readU8();
-          for (var i = 0; i < many; i++) \{
-            if (!looks[i]) \{ looks[i] = eyeless(); }
-            readCamera(looks[i]);
-          }
-          looks.length = many;
-          if (after === 0) \{ forget(); }
-          var moves = readU32();
-          if (moves) \{ carried(moves); }
-          var edits = readU32();
-          for (var e = 0; e < edits; e++) \{ slotted(readU32()); }
-          trim(count);
-          seq = stamp;
-          apply(world);
-          dirty = true;
-        }
-        `,
-        // Everything this page holds, dropped, because what follows is the whole world.
-        `
-        function forget() \{
-          var kids = flock.children;
-          for (var i = 0; i < kids.length; i++) \{
-            kids[i].parent = null;
-          }
-          kids.length = 0;
-          batches.forEach(function (b) \{
-            for (var j = 0; j < b.seats.length; j++) \{ b.seats[j].index = -1; }
-            b.seats.length = 0;
-            b.mesh.count = 0;
-          });
-          crowds.forEach(function (c) \{
-            for (var j = 0; j < c.seats.length; j++) \{ c.seats[j].index = -1; }
-            c.seats.length = 0;
-            if (c.mesh) \{ c.mesh.count = 0; }
-          });
-          live.length = 0;
-          voiceOf.length = 0;
-          soundSlots.length = 0;
-          soundsMoved = true;
-        }
-        `,
-        // The slots past the end of the world this frame describes, hidden rather than
-        // taken down: a horizon coming and going is the same shapes leaving and coming
-        // back, and a mesh nobody can see costs a pointer. Anything past the last
-        // frame's count is always sent whole, so a returning slot is never a stale one.
-        //
-        // **The bound is not live.length.** Only a solid is ever written to live, so a
-        // sound's slot sits past its end, and a loop stopping there leaves the voice
-        // holding whatever track it last had. sounds() keys voices by name and rebuilds
-        // one whose track has changed, so the stranded slot and the live one then tear
-        // each other down every frame. It sounds like silence.
-        `
-        var runs = [], carry = 0;
-
-        function carried(n) \{
-          var was = live.slice(), heard = voiceOf.slice(), m, j, k;
-          runs.length = 0;
-          carry++;
-          for (m = 0; m < n * 3; m++) \{ runs.push(readU32()); }
-          for (m = 0; m < runs.length; m += 3) \{
-            for (j = 0; j < runs[m + 2]; j++) \{
-              k = runs[m + 1] + j;
-              if (was[k]) \{ was[k].userData.carry = carry; }
-              if (heard[k]) \{ heard[k].carry = carry; }
-            }
-          }
-          for (m = 0; m < runs.length; m += 3) \{
-            for (j = 0; j < runs[m + 2]; j++) \{
-              var dst = runs[m] + j, src = runs[m + 1] + j;
-              if (was[dst] && was[dst].userData.carry !== carry) \{ shed(was[dst]); }
-              live[dst] = was[src] || null;
-              voiceOf[dst] = heard[src] || null;
-              if (voiceOf[dst]) \{ soundSlots.push(dst); }
-            }
-          }
-          for (m = 0; m < runs.length; m += 3) \{
-            for (j = 0; j < runs[m + 2]; j++) \{
-              k = runs[m + 1] + j;
-              if (was[k] && live[k] === was[k]) \{ live[k] = null; }
-              if (heard[k] && voiceOf[k] === heard[k]) \{ voiceOf[k] = null; }
-            }
-          }
-          soundsMoved = true;
-        }
-
-        function trim(count) \{
-          var far = live.length;
-          if (voiceOf.length > far) \{ far = voiceOf.length; }
-          for (var i = count; i < far; i++) \{
-            if (live[i]) \{ hide(live[i]); }
-            if (voiceOf[i]) \{
-              voiceOf[i] = null;
-              soundsMoved = true;
-            }
-          }
-        }
-        `,
-        // One slot, as this frame has it.
-        `
-        function slotted(at) \{
-          var kind = byte[cur], mask = byte[cur + 1];
-          cur += 2;
-          if (kind === SOUND) \{
-            var was = voiceOf[at];
-            var heard = was || \{k: "sound", p: [0, 0, 0], x: "", v: "", t: "", h: 1, g: 1};
-            heard.p[0] = readF32();
-            heard.p[1] = readF32();
-            heard.p[2] = readF32();
-            heard.x = readLong();
-            heard.v = (mask & HAS_VOICE) ? readWord() : "";
-            heard.t = (mask & HAS_TRACK) ? readWord() : "";
-            heard.h = readF32();
-            heard.g = readF32();
-            if (!was) \{
-              voiceOf[at] = heard;
-              soundSlots.push(at);
-            }
-            soundsMoved = true;
-        `,
-        // A sound standing where a solid stood takes the solid off the stage with it.
-        `
-            if (live[at]) \{
-              shed(live[at]);
-              live[at] = null;
-            }
-            return;
-          }
-          if (voiceOf[at]) \{
-            voiceOf[at] = null;
-            soundsMoved = true;
-          }
-          var s = scratch;
-          s.k = KINDS[kind] || "box";
-          s.c = readWord();
-          if (mask & HAS_AT) \{
-            var p = s.p;
-            p[0] = readF32();
-            p[1] = readF32();
-            p[2] = readF32();
-          }
-          s.turned = (mask & HAS_TURN) !== 0;
-          if (s.turned) \{
-            var r = s.r;
-            r[0] = readF32();
-            r[1] = readF32();
-            r[2] = readF32();
-          }
-          var z = s.z;
-          if (mask & HAS_SCALE) \{
-            z[0] = readF32();
-            z[1] = readF32();
-            z[2] = readF32();
-          } else \{
-            z[0] = 1;
-            z[1] = 1;
-            z[2] = 1;
-          }
-          var d = s.d;
-          if (mask & HAS_SIZE) \{
-            var n = readU8();
-            d.length = n;
-            for (var i = 0; i < n; i++) \{ d[i] = readF32(); }
-          } else if (s.k === "figure") \{
-            d.length = 0;
-          } else \{
-            d.length = 3;
-            d[0] = 1;
-            d[1] = 1;
-            d[2] = 1;
-          }
-          s.s = (mask & HAS_SURFACE) ? readWord() : "";
-          s.x = (mask & HAS_WORDS) ? readLong() : "";
-          s.t.length = (mask & HAS_PAINTS) ? readU8() : 0;
-          for (var j = 0; j < s.t.length; j++) \{ s.t[j] = readWord(); }
-          var o = live[at];
-          if (!fits(o, s)) \{
-            if (o) \{ shed(o); }
-            o = build(s);
-            live[at] = o;
-            sow(o);
-          }
-          o.visible = true;
-          put(o, s);
-        }
-        `,
-        // On the stage and off it, in constant time. Object3D.remove scans the child
-        // list to find what is leaving; order means nothing to a list of solids, so
-        // each remembers where it stands and is replaced by the one at the end. Taking
-        // down two thousand shapes was a fifth of a second of scanning.
-        `
-        function sow(o) \{
-          if (o.batch) \{ seat(o); return; }
-          if (o.crowd) \{ enlist(o); return; }
-          o.parent = flock;
-          o.userData.spot = flock.children.length;
-          flock.children.push(o);
-        }
-
-        function hide(o) \{
-          if (o.batch) \{ unseat(o); return; }
-          if (o.crowd) \{ discharge(o); return; }
-          o.visible = false;
-        }
-
-        function shed(o) \{
-          if (o.batch) \{ unseat(o); return; }
-          if (o.crowd) \{ discharge(o); return; }
-          var kids = flock.children, at = o.userData.spot;
-          if (kids[at] !== o) \{ at = kids.indexOf(o); }
-          if (at < 0) \{ return; }
-          var end = kids[kids.length - 1];
-          kids[at] = end;
-          end.userData.spot = at;
-          kids.length = kids.length - 1;
-          o.parent = null;
-          o.userData.spot = -1;
-        }
-        `,
-        // A seat: an opaque solid's place in its batch. It stands in a slot exactly as
-        // a mesh does — carried, trimmed and shed by the same code — and what it holds
-        // is an index into the batch's instance buffers rather than a mesh of its own.
-        //
-        // Taking one out moves the last one into its place, the same constant-time
-        // trade sow and shed make, and the moved one's matrix and colour go with it.
-        // Only what changed is sent to the card: a city's batch is thousands of
-        // instances of which a frame moves a handful.
-        //
-        // A batch that is full is made again at twice the size. The old buffers go
-        // with its mesh, because a buffer three.js has uploaded cannot be resized.
-        `
-        function seat(o) \{
-          if (o.index >= 0) \{ return; }
-          var b = o.batch;
-          if (b.seats.length === b.room) \{ grow(b, b.room * 2); }
-          o.index = b.seats.length;
-          b.seats.push(o);
-          b.mesh.count = b.seats.length;
-          o.userData.tint = "";
-        }
-
-        function unseat(o) \{
-          var b = o.batch, at = o.index;
-          if (at < 0) \{ return; }
-          var last = b.seats.length - 1, end = b.seats[last];
-          if (at !== last) \{
-            var m = b.mesh.instanceMatrix, c = b.mesh.instanceColor;
-            m.array.copyWithin(at * 16, last * 16, last * 16 + 16);
-            c.array.copyWithin(at * 3, last * 3, last * 3 + 3);
-            touched(m, at, 16);
-            touched(c, at, 3);
-            b.seats[at] = end;
-            end.index = at;
-          }
-          b.seats.length = last;
-          b.mesh.count = last;
-          o.index = -1;
-        }
-
-        function touched(attr, at, width) \{
-          attr.addUpdateRange(at * width, width);
-          attr.needsUpdate = true;
-        }
-
-        function grow(b, room) \{
-          var mesh = new THREE.InstancedMesh(b.geo, b.mat, room);
-          mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-          mesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(room * 3), 3);
-          mesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
-          mesh.castShadow = b.cast;
-          if (b.round) \{ mesh.customDepthMaterial = rounder(); }
-          mesh.receiveShadow = true;
-          mesh.matrixAutoUpdate = false;
-        `,
-        // Never culled as a whole: a batch is spread over everything near enough to
-        // draw, so its bounds always reach the eye, and working them out again after
-        // every change would be a walk over every instance a frame.
-        `
-          mesh.frustumCulled = false;
-          mesh.count = b.seats.length;
-          if (b.mesh) \{
-            mesh.instanceMatrix.array.set(b.mesh.instanceMatrix.array.subarray(0, b.seats.length * 16));
-            mesh.instanceColor.array.set(b.mesh.instanceColor.array.subarray(0, b.seats.length * 3));
-            stage.remove(b.mesh);
-            b.mesh.dispose();
-          }
-          stage.add(mesh);
-          b.mesh = mesh;
-          b.room = room;
-        }
-
-        function batchOf(form, finish) \{
-          var key = form + "|" + finish;
-          var b = batches.get(key);
-          if (!b) \{
-            b = \{geo: unit(form), mat: paintOf(finish, ""), mesh: null, seats: [], room: 0,
-              cast: form !== "ground", round: (form === "box" || form === "cylinder") && finish !== "Mesh"};
-            grow(b, 64);
-            batches.set(key, b);
-          }
-          return b;
-        }
-        `,
-        // The sounds, gathered again after the slots holding them changed — rare enough
-        // to be worth a flag: a race is sixteen sounds against eighteen hundred solids.
-        //
-        // The haze is the horizon's colour and not the sky's, which are now two
-        // different colours. A road fades into the band it is actually disappearing
-        // behind; faded into the colour overhead it would end in a stripe of the
-        // wrong blue.
-        //
-        // The attribute is the distance at which the sky swallows things whole, and
-        // the haze starts at half of it — near enough to give depth, far enough that
-        // an arena that size is not looked at through a mist.
-        //
-        // The sun keeps its bearing and changes its address. A directional light has
-        // no place, only a direction — but the box its shadow covers has one, so the
-        // light is carried along under the eye. The offsets are the same 6, 14, 8 the
-        // rig was built with, scaled up.
-        //
-        // Whether the sun casts at all. Turning this changes every shader in the
-        // scene, because whether a material samples a shadow map is compiled into it
-        // — so it is done on the frame it changes and never on any other, and every
-        // material already built is told to rebuild itself.
-        //
-        // Every frame, and the map is redrawn on the same one. The two have to move
-        // together (see boot), because the shadow map is only correct for where the
-        // light was standing when it was taken.
-        //
-        // The light's direction never changes, so nothing about the shading depends
-        // on this. It is only ever the box that moves — and it moves a whole texel of
-        // the map at a time, across the light's view: carried along by less, every
-        // edge in the map is sampled a fraction of a texel differently each frame,
-        // and every shadow's outline crawls while the eye moves. Along the light the
-        // box may go anywhere, since that changes no texel.
-        //
-        // A slot holds a sound or a solid, and which slots hold sounds is remembered
-        // between frames rather than worked out again in each of them.
-        `
-        function regather() \{
-          soundsMoved = false;
-          sounded.length = 0;
-          var keep = [];
-          soundSlots.sort(function (a, b) \{ return a - b; });
-          for (var i = 0; i < soundSlots.length; i++) \{
-            var at = soundSlots[i], heard = voiceOf[at];
-            if (!heard) \{ continue; }
-            if (i > 0 && at === soundSlots[i - 1]) \{ continue; }
-            keep.push(at);
-            sounded.push(heard);
-          }
-          soundSlots = keep;
-        }
-
-        function apply(w) \{
-          want = w.on || "";
-          if (w.grain !== coarse || w.bits !== deep) \{
-            coarse = w.grain;
-            deep = w.bits;
-            sized(seen.width, seen.height);
-          }
-          var sky = w.sky ? heavens(w.sky) : null;
-          if (sky) \{ stage.background = sky; }
-          lit(w.sky || "#8ecbff");
-          if (w.fog) \{
-            if (!stage.fog) \{ stage.fog = new THREE.Fog(0x8ecbff, 1, 100); }
-            if (sky) \{ stage.fog.color.copy(sky.userData.haze); }
-            stage.fog.near = w.fog * 0.5;
-            stage.fog.far = w.fog;
-          } else if (stage.fog) \{
-            stage.fog = null;
-          }
-          camera.position.set(w.eye[0], w.eye[1], w.eye[2]);
-          camera.rotation.set(w.aim[1], w.aim[0], 0);
-          var wantLit = !w.flat;
-          if (wantLit !== renderer.shadowMap.enabled) \{
-            renderer.shadowMap.enabled = wantLit;
-            mats.forEach(function (m) \{ m.needsUpdate = true; });
-            renderer.shadowMap.needsUpdate = true;
-          }
-          var far = w.shade || 55;
-          if (far !== shadeFar || w.sun[0] !== sunAt[0] || w.sun[1] !== sunAt[1]) \{ sunned(w.sun, far); }
-          if (wantLit) \{
-            var texel = reach() * 2 / 2048;
-            under.set(w.eye[0], 0, w.eye[2]);
-            var across = Math.round(under.dot(SUN_ACROSS) / texel) * texel;
-            var up = Math.round(under.dot(SUN_UP) / texel) * texel;
-            sun.target.position.copy(SUNWARD).multiplyScalar(under.dot(SUNWARD))
-              .addScaledVector(SUN_ACROSS, across).addScaledVector(SUN_UP, up);
-            sun.position.copy(sun.target.position).addScaledVector(SUNWARD, reach() * 1.0405);
-            sun.target.updateMatrixWorld();
-            renderer.shadowMap.needsUpdate = true;
-          }
-          var lens = w.lens || 75;
-          if (camera.fov !== lens) \{ camera.fov = lens; camera.updateProjectionMatrix(); }
-          if (soundsMoved) \{ regather(); }
-          if (sounded.length || voices.size) \{ sounds(sounded, w); }
-        `,
-        // Letting go is the program's to decide; taking hold needs a click, which is
-        // the browser's rule and not ours.
-        `
-          if (!w.grab && grabbing) \{ document.exitPointerLock(); }
-        }
-        `,
-        // Whether what stands in this slot is still the right thing to stand in it.
-        // Position, rotation and colour are left out on purpose — those are written
-        // into whatever is there. A line leaves its ends out too: they are its payload,
-        // and a tracer rebuilt every frame would be a new buffer sixty times a second.
-        //
-        // A solid's size is not asked about either: every solid of a kind is one
-        // geometry a unit across, stretched by its matrix (see unit), so a shape
-        // that grows is a shape that moved. What decides is which batch it sits in
-        // — its kind and its finish — and whether it is see-through, which keeps it
-        // out of every batch.
-        //
-        // A floor receives and does not cast, and that is not a saving. A plane
-        // lying on the ground casts onto itself: every pixel is both caster and
-        // catcher, the same distance from the sun to within the map's precision,
-        // and what comes out is the stripes every shadow bias exists to argue with.
-        //
-        // A heading, as the camera is read. three.js defaults to XYZ, which pitches
-        // about the *world* axis: a slab yawed east-west and then pitched for a hill
-        // comes out rolled instead of tilted.
-        //
-        // Composed when it moves and not otherwise: left alone, three.js recomposes a
-        // matrix for every object on the stage every frame, and a circuit is thousands
-        // of objects of which a handful ever move. put is the only other place a
-        // matrix is built, and the only place a shape is moved.
-        `
-        function fits(o, s) \{
-          if (!o) \{ return false; }
-          var u = o.userData;
-          if (u.kind !== s.k) \{ return false; }
-          if (s.k === "line") \{ return true; }
-          if (s.k === "label") \{ return u.words === s.x && u.tint === s.c; }
-          if (s.k === "sprite") \{
-            return u.words === s.x && u.dims[0] === s.d[0] && u.dims[1] === s.d[1] && u.soft === (solidity(s.c) < 1);
-          }
-          if (s.k === "terrain") \{ return true; }
-          if (s.k === "figure") \{ return u.words === s.x; }
-          return u.key === keyOf(s);
-        }
-
-        function keyOf(s) \{
-          return formOf(s) + "|" + finishOf(s) + (solidity(s.c) < 1 ? "|see" : "");
-        }
-        `,
-        // Which unit geometry a solid is stretched from. A cone's two radii are the
-        // one shape a stretch cannot change — it only scales them together — so a
-        // cone is a geometry per ratio of its ends, to a thirty-second.
-        `
-        function formOf(s) \{
-          if (s.k !== "cone") \{ return s.k; }
-          var m = Math.max(s.d[0], s.d[1]) || 1;
-          return "cone|" + Math.round(s.d[0] / m * 32) + "|" + Math.round(s.d[1] / m * 32);
-        }
-
-        function pixels(path) \{
-          var t = pics.get(path);
-          if (!t) \{
-            t = new THREE.TextureLoader().load("/_hive/asset/" +
-              path.split("/").map(encodeURIComponent).join("/"));
-            t.minFilter = THREE.NearestFilter;
-            t.magFilter = THREE.NearestFilter;
-            t.generateMipmaps = false;
-            t.colorSpace = THREE.SRGBColorSpace;
-            pics.set(path, t);
-          }
-          return t;
-        }
-
-        function smooth(path) \{
-          var t = pics.get("~" + path);
-          if (!t) \{
-            t = new THREE.TextureLoader().load("/_hive/asset/" +
-              path.split("/").map(encodeURIComponent).join("/"));
-            t.colorSpace = THREE.SRGBColorSpace;
-            pics.set("~" + path, t);
-          }
-          return t;
-        }
-
-        function build(s) \{
-          var made;
-          if (s.k === "line") \{
-            var g = new THREE.BufferGeometry();
-            g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(6), 3));
-            made = new THREE.Line(g, new THREE.LineBasicMaterial(\{color: 0xffffff}));
-            made.frustumCulled = false;
-          } else if (s.k === "label") \{
-            var tex = sign(s.x || "", s.c);
-            made = new THREE.Sprite(new THREE.SpriteMaterial(\{map: tex, transparent: true, depthWrite: false}));
-            made.scale.set(0.42 * tex.userData.aspect, 0.42, 1);
-        `,
-        // A picture that always faces you, standing on its place.
-        //
-        // **Its centre is its foot and not its middle**, which is the one thing about
-        // it that is not obvious and is the only thing that makes it usable: what a
-        // sprite is for is a tree, a marshal, somebody in a grandstand — things that
-        // stand on the ground — and a picture centred on its position is a picture
-        // buried to the waist in it.
-        `
-          } else if (s.k === "sprite") \{
-            var soft = solidity(s.c) < 1;
-            var pic = soft ? smooth(s.x || "") : pixels(s.x || "");
-            made = new THREE.Sprite(new THREE.SpriteMaterial(\{map: pic,
-              transparent: true, depthWrite: false, alphaTest: soft ? 0 : 0.4,
-              color: new THREE.Color(s.c || "#ffffff")}));
-            made.center.set(0.5, 0);
-            made.scale.set(s.d[0] || 1, s.d[1] || 1, 1);
-            made.userData.soft = soft;
-          } else if (s.k === "figure") \{
-            return \{crowd: crowdOf(s.x || ""), index: -1, visible: true, at: [0, 0, 0], turn: [0, 0, 0],
-              size: [1, 1, 1], pose: [], paints: [], userData: \{kind: "figure", words: s.x, key: "", tint: ""}};
-          } else if (s.k === "terrain") \{
-            made = new THREE.Mesh(new THREE.BufferGeometry(), groundLook(finishOf(s), s.c));
-            made.castShadow = true;
-            made.receiveShadow = true;
-            made.frustumCulled = false;
-            made.userData.asked = "";
-          } else if (solidity(s.c) >= 1) \{
-            var chair = \{batch: batchOf(formOf(s), finishOf(s)), index: -1, visible: true,
-              userData: \{kind: s.k, key: keyOf(s), tint: ""}};
-            return chair;
-          } else \{
-            made = new THREE.Mesh(unit(formOf(s)), paintOf(finishOf(s), s.c));
-            made.castShadow = false;
-            made.receiveShadow = true;
-          }
-          made.rotation.order = "YXZ";
-          made.matrixAutoUpdate = false;
-          made.updateMatrix();
-          var u = made.userData;
-          u.kind = s.k;
-          u.key = keyOf(s);
-          u.dims = s.d.slice();
-          u.words = s.x;
-        `,
-        // Left empty so the first put dresses it, whatever it was built wearing.
-        //
-        // The matrix build stopped composing for free. A frame only carries the slots
-        // that changed, so this happens for the shapes that moved and for no others.
-        `
-          u.tint = "";
-          u.finish = "";
-          u.spot = -1;
-          return made;
-        }
-
-        `,
-        // A figure is a body out of a file: a skinned glTF under assets/, read once
-        // and shared by everybody drawn with it, each with bones of their own. What
-        // stands in the slot is a group, placed as any shape is, and the body is put
-        // in it when the file has arrived — until then it is somebody not there yet,
-        // and a file that never arrives is nobody, as a sprite whose picture is
-        // missing is no picture.
-        //
-        // **One draw a body, whatever it is wearing.** The file's primitives are its
-        // parts, and they are read into one geometry with the part each vertex is in
-        // beside it; the paints are a colour a part, handed to the shader as one array,
-        // so a man in a shirt, trousers and shoes is a single draw, and a second in
-        // other colours is a second draw of the same program. A part painted
-        // see-through is not drawn at all — its triangles are put where nothing is
-        // drawn — and casts no shadow either, so what a figure is not wearing is not
-        // there to show through what it is.
-        //
-        // Every figure of one file is one draw, however many there are and however each
-        // is posed and painted: see `muster`. What a figure keeps of its own is a seat.
-        // A crowd is a hundred people, and a wood is a hundred trees.
-        `
-        var models = new Map(), PARTS = 32;
-
-        function modelOf(path) \{
-          var m = models.get(path);
-          if (m) \{ return m; }
-          m = \{ready: false, waiting: [], geo: null, joints: [], inverses: [], tints: null, order: []};
-          models.set(path, m);
-          fetch("/_hive/asset/" + path.split("/").map(encodeURIComponent).join("/"))
-            .then(function (r) \{ if (!r.ok) \{ throw new Error(r.status); } return r.arrayBuffer(); })
-            .then(function (buf) \{
-              readModel(m, buf);
-              m.ready = true;
-              for (var i = 0; i < m.waiting.length; i++) \{ muster(m.waiting[i]); }
-              m.waiting.length = 0;
-              dirty = true;
-            })
-            .catch(function () \{ m.waiting.length = 0; });
-          return m;
-        }
-
-        var crowds = new Map();
-
-        function crowdOf(path) \{
-          var c = crowds.get(path);
-          if (c) \{ return c; }
-          c = \{path: path, model: modelOf(path), mesh: null, seats: [], room: 0, wide: 1,
-            uBones: \{value: null}, uPaints: \{value: null}, look: null, caster: null};
-          crowds.set(path, c);
-          if (c.model.ready) \{ muster(c); } else \{ c.model.waiting.push(c); }
-          return c;
-        }
-        `,
-        // A glTF binary: its JSON, and the buffer every accessor reads from. What is
-        // read is what a skinned body needs — places, normals, colours, joints,
-        // weights and triangles — and every primitive of the mesh the skin is on,
-        // each a part.
-        `
-        function readModel(m, buf) \{
-          var view = new DataView(buf), at = 12, doc = null, bin = null;
-          while (at + 8 <= buf.byteLength) \{
-            var size = view.getUint32(at, true), kind = view.getUint32(at + 4, true);
-            if (kind === 0x4E4F534A) \{ doc = JSON.parse(utf8.decode(new Uint8Array(buf, at + 8, size))); }
-            if (kind === 0x004E4942) \{ bin = buf.slice(at + 8, at + 8 + size); }
-            at += 8 + size;
-          }
-          function read(i) \{
-            var a = doc.accessors[i], v = doc.bufferViews[a.bufferView];
-            var wide = \{SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4, MAT4: 16}[a.type];
-            var Kind = \{5121: Uint8Array, 5123: Uint16Array, 5125: Uint32Array, 5126: Float32Array}[a.componentType];
-            var each = wide * Kind.BYTES_PER_ELEMENT, step = v.byteStride || each;
-            var from = (v.byteOffset || 0) + (a.byteOffset || 0), out = new Kind(a.count * wide);
-            if (step === each) \{ out.set(new Kind(bin.slice(from, from + a.count * each))); }
-            else \{
-              for (var k = 0; k < a.count; k++) \{
-                out.set(new Kind(bin.slice(from + k * step, from + k * step + each)), k * wide);
-              }
-            }
-            var top = a.normalized ? \{5121: 255, 5123: 65535}[a.componentType] || 1 : 1;
-            return \{array: out, wide: wide, top: top};
-          }
-          var nodes = doc.nodes, holder = null;
-          for (var n = 0; n < nodes.length; n++) \{
-            if (nodes[n].skin !== undefined && nodes[n].mesh !== undefined) \{ holder = nodes[n]; break; }
-          }
-          var skin = doc.skins[holder.skin], prims = doc.meshes[holder.mesh].primitives;
-          var count = 0, corners = 0;
-          prims.forEach(function (p) \{
-            var many = doc.accessors[p.attributes.POSITION].count;
-            count += many;
-            corners += p.indices !== undefined ? doc.accessors[p.indices].count : many;
-          });
-          var pos = new Float32Array(count * 3), nrm = new Float32Array(count * 3);
-          var col = new Uint8Array(count * 3).fill(255), bones = new Uint16Array(count * 4);
-          var weights = new Float32Array(count * 4), parts = new Uint8Array(count);
-          var index = count > 65535 ? new Uint32Array(corners) : new Uint16Array(corners);
-          var base = 0, put = 0, normals = true;
-          m.tints = new Float32Array(PARTS * 4).fill(1);
-          prims.forEach(function (p, k) \{
-            var q = p.attributes, many = doc.accessors[q.POSITION].count, i, c;
-            pos.set(read(q.POSITION).array, base * 3);
-            if (q.NORMAL !== undefined) \{ nrm.set(read(q.NORMAL).array, base * 3); } else \{ normals = false; }
-            if (q.COLOR_0 !== undefined) \{
-              var C = read(q.COLOR_0), scale = C.top === 1 ? 255 : 255 / C.top;
-              for (i = 0; i < many; i++) \{
-                for (c = 0; c < 3; c++) \{ col[(base + i) * 3 + c] = Math.round(C.array[i * C.wide + c] * scale); }
-              }
-            }
-            bones.set(read(q.JOINTS_0).array, base * 4);
-            var W = read(q.WEIGHTS_0);
-            for (i = 0; i < many * 4; i++) \{ weights[base * 4 + i] = W.array[i] / W.top; }
-            parts.fill(Math.min(k, PARTS - 1), base, base + many);
-            if (p.indices !== undefined) \{
-              var I = read(p.indices).array;
-              for (i = 0; i < I.length; i++) \{ index[put + i] = I[i] + base; }
-              put += I.length;
-            } else \{
-              for (i = 0; i < many; i++) \{ index[put + i] = base + i; }
-              put += many;
-            }
-            var mat = p.material !== undefined ? doc.materials[p.material] : null;
-            var own = mat && mat.pbrMetallicRoughness && mat.pbrMetallicRoughness.baseColorFactor;
-            if (own && k < PARTS) \{ m.tints.set([own[0], own[1], own[2], 1], k * 4); }
-            base += many;
-          });
-          var g = new THREE.BufferGeometry();
-          g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-          g.setAttribute("normal", new THREE.BufferAttribute(nrm, 3));
-          g.setAttribute("color", new THREE.BufferAttribute(col, 3, true));
-          g.setAttribute("skinIndex", new THREE.BufferAttribute(bones, 4));
-          g.setAttribute("skinWeight", new THREE.BufferAttribute(weights, 4));
-          g.setAttribute("part", new THREE.BufferAttribute(parts, 1));
-          g.setIndex(new THREE.BufferAttribute(index, 1));
-          if (!normals) \{ g.computeVertexNormals(); }
-          m.geo = g;
-        `,
-        // The bones, as the file stands them. A bone whose parent is not one of the
-        // skin's joints stands where it does in the file's world — whatever holds the
-        // skeleton up, an armature turned to stand the right way up, turned with it.
-        `
-          var upOf = [], joints = skin.joints;
-          nodes.forEach(function (nd, i) \{ (nd.children || []).forEach(function (c) \{ upOf[c] = i; }); });
-          function local(i) \{
-            var nd = nodes[i], mx = new THREE.Matrix4();
-            if (nd.matrix) \{ mx.fromArray(nd.matrix); }
-            else \{
-              mx.compose(new THREE.Vector3().fromArray(nd.translation || [0, 0, 0]),
-                new THREE.Quaternion().fromArray(nd.rotation || [0, 0, 0, 1]),
-                new THREE.Vector3().fromArray(nd.scale || [1, 1, 1]));
-            }
-            return mx;
-          }
-          m.joints = joints.map(function (i) \{
-            var mx = local(i), up = upOf[i];
-            var parent = up === undefined ? -1 : joints.indexOf(up);
-            if (parent < 0) \{
-              for (; up !== undefined; up = upOf[up]) \{ mx.premultiply(local(up)); }
-            }
-            var j = \{parent: parent, t: new THREE.Vector3(), r: new THREE.Quaternion(), s: new THREE.Vector3()};
-            mx.decompose(j.t, j.r, j.s);
-            return j;
-          });
-          var inv = read(skin.inverseBindMatrices).array;
-          m.inverses = joints.map(function (_, k) \{ return new THREE.Matrix4().fromArray(inv, k * 16); });
-          // Parents before their children, whatever order the file lists them in.
-          var stood = [];
-          function reached(k) \{
-            if (stood[k]) \{ return; }
-            stood[k] = true;
-            if (m.joints[k].parent >= 0) \{ reached(m.joints[k].parent); }
-            m.order.push(k);
-          }
-          for (var each = 0; each < m.joints.length; each++) \{ reached(each); }
-        }
-        `,
-        // The crowd of one file: one mesh drawn once for all of them. Each figure's bones
-        // are a row of a texture and its paints a row of another, read in the shader by
-        // which of the crowd is being drawn, so a pose and a coat of paint cost a figure
-        // nothing but its row. Nothing is culled figure by figure, as nothing is box by
-        // box: a tree with its foot off the screen is still a tree.
-        `
-        var FLOCK = [
-          "attribute float part;",
-          "attribute vec4 skinIndex;",
-          "attribute vec4 skinWeight;",
-          "uniform highp sampler2D flockBones;",
-          "uniform highp sampler2D flockPaints;",
-          "mat4 flockBone(float i) \{",
-          "  int x = int(i + 0.5) * 4;",
-          "  return mat4(texelFetch(flockBones, ivec2(x, gl_InstanceID), 0), texelFetch(flockBones, ivec2(x + 1, gl_InstanceID), 0),",
-          "    texelFetch(flockBones, ivec2(x + 2, gl_InstanceID), 0), texelFetch(flockBones, ivec2(x + 3, gl_InstanceID), 0));",
-          "}"
-        ].join("\n");
-        var FLOCK_BY = "mat4 flockBy = skinWeight.x * flockBone(skinIndex.x) + skinWeight.y * flockBone(skinIndex.y)" +
-          " + skinWeight.z * flockBone(skinIndex.z) + skinWeight.w * flockBone(skinIndex.w);";
-        var FLOCK_TINT = "vec4 flockTint = texelFetch(flockPaints, ivec2(int(part + 0.5), gl_InstanceID), 0);\n" +
-          "vPaint = flockTint.rgb;\nif (flockTint.a < 0.5) \{ gl_Position = vec4(2.0, 2.0, 2.0, 1.0); }";
-
-        function flocked(shader, c) \{
-          shader.uniforms.flockBones = c.uBones;
-          shader.uniforms.flockPaints = c.uPaints;
-          shader.vertexShader = shader.vertexShader
-            .replace("#include <common>", "#include <common>\n" + FLOCK + "\nvarying vec3 vPaint;")
-            .replace("#include <skinbase_vertex>", FLOCK_BY)
-            .replace("#include <skinnormal_vertex>", "objectNormal = (flockBy * vec4(objectNormal, 0.0)).xyz;")
-            .replace("#include <skinning_vertex>", "transformed = (flockBy * vec4(transformed, 1.0)).xyz;")
-            .replace("#include <project_vertex>", "#include <project_vertex>\n" + FLOCK_TINT);
-        }
-
-        function muster(c) \{
-          c.wide = Math.max(1, c.model.joints.length);
-          c.look = new THREE.MeshStandardMaterial(\{vertexColors: true, roughness: 0.72, metalness: 0});
-          c.look.onBeforeCompile = function (shader) \{
-            flocked(shader, c);
-            shader.fragmentShader = shader.fragmentShader
-              .replace("#include <common>", "#include <common>\nvarying vec3 vPaint;")
-              .replace("#include <color_fragment>", "#include <color_fragment>\ndiffuseColor.rgb *= vPaint;");
-          };
-          c.caster = new THREE.MeshDepthMaterial(\{depthPacking: THREE.RGBADepthPacking});
-          c.caster.onBeforeCompile = function (shader) \{ flocked(shader, c); };
-          mats.set("figure|" + c.path, c.look);
-          mats.set("figure|" + c.path + "|cast", c.caster);
-          quarters(c, Math.max(16, c.seats.length));
-          for (var i = 0; i < c.seats.length; i++) \{ stand(c.seats[i]); }
-        }
-
-        function quarters(c, many) \{
-          var was = c.mesh;
-          var mesh = new THREE.InstancedMesh(c.model.geo, c.look, many);
-          mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-          mesh.customDepthMaterial = c.caster;
-          mesh.castShadow = true;
-          mesh.receiveShadow = true;
-          mesh.matrixAutoUpdate = false;
-          mesh.frustumCulled = false;
-          mesh.count = c.seats.length;
-          var bones = new THREE.DataTexture(new Float32Array(many * c.wide * 16), c.wide * 4, many,
-            THREE.RGBAFormat, THREE.FloatType);
-          var paints = new THREE.DataTexture(new Float32Array(many * PARTS * 4), PARTS, many,
-            THREE.RGBAFormat, THREE.FloatType);
-          if (was) \{
-            mesh.instanceMatrix.array.set(was.instanceMatrix.array);
-            bones.image.data.set(c.uBones.value.image.data);
-            paints.image.data.set(c.uPaints.value.image.data);
-            c.uBones.value.dispose();
-            c.uPaints.value.dispose();
-            stage.remove(was);
-            was.dispose();
-          }
-          bones.needsUpdate = true;
-          paints.needsUpdate = true;
-          c.uBones.value = bones;
-          c.uPaints.value = paints;
-          stage.add(mesh);
-          c.mesh = mesh;
-          c.room = many;
-        }
-        `,
-        // A figure's seat taken and given up, and what a frame says of it written into
-        // its rows: where it stands and how big, each bone turned by its three numbers on
-        // top of how it stands in the file, and each part painted, or the file's own
-        // colour where the frame says nothing of it. Kept as well, so that a figure whose
-        // file arrives late, or whose crowd outgrows its mesh, is stood again from it.
-        //
-        // And the ground: a mesh of the heights and colours the page fetched for the name
-        // a frame gave it, its normals taken from its neighbours' heights, and its finish
-        // laid across the whole of it rather than begun again on every square.
-        `
-        var boneSpin = new THREE.Euler(0, 0, 0, "YXZ"), boneTurn = new THREE.Quaternion(), boneTwist = new THREE.Quaternion();
-        var boneLocal = new THREE.Matrix4(), boneOut = new THREE.Matrix4(), boneWorld = [];
-
-        function enlist(o) \{
-          if (o.index >= 0) \{ return; }
-          var c = o.crowd;
-          o.index = c.seats.length;
-          c.seats.push(o);
-          if (c.mesh) \{
-            if (c.seats.length > c.room) \{ quarters(c, c.room * 2); }
-            c.mesh.count = c.seats.length;
-          }
-        }
-
-        function discharge(o) \{
-          var c = o.crowd, at = o.index;
-          if (at < 0) \{ return; }
-          var last = c.seats.length - 1, end = c.seats[last];
-          c.seats.length = last;
-          o.index = -1;
-          if (at !== last) \{
-            c.seats[at] = end;
-            end.index = at;
-            stand(end);
-          }
-          if (c.mesh) \{ c.mesh.count = last; }
-        }
-
-        function arrayed(o, s) \{
-          var k;
-          if (o.index < 0) \{ enlist(o); }
-          for (k = 0; k < 3; k++) \{
-            o.at[k] = s.p[k];
-            o.turn[k] = s.turned ? s.r[k] : 0;
-            o.size[k] = s.z[k];
-          }
-          o.pose.length = s.d.length;
-          for (k = 0; k < s.d.length; k++) \{ o.pose[k] = s.d[k]; }
-          o.paints.length = s.t.length;
-          for (k = 0; k < s.t.length; k++) \{ o.paints[k] = s.t[k]; }
-          stand(o);
-        }
-
-        function stand(o) \{
-          var c = o.crowd, at = o.index, m = c.model, k;
-          if (!c.mesh || at < 0) \{ return; }
-          spot.set(o.at[0], o.at[1], o.at[2]);
-          spin.set(o.turn[0], o.turn[1], o.turn[2]);
-          turn.setFromEuler(spin);
-          size.set(o.size[0], o.size[1], o.size[2]);
-          pose.compose(spot, turn, size);
-          pose.toArray(c.mesh.instanceMatrix.array, at * 16);
-          touched(c.mesh.instanceMatrix, at, 16);
-          var joints = m.joints, d = o.pose, out = c.uBones.value.image.data, base = at * c.wide * 16;
-          for (var n = 0; n < m.order.length; n++) \{
-            k = m.order[n];
-            var j = joints[k];
-            boneTurn.copy(j.r);
-            if (k * 3 + 2 < d.length) \{
-              boneSpin.set(d[k * 3], d[k * 3 + 1], d[k * 3 + 2]);
-              boneTurn.multiply(boneTwist.setFromEuler(boneSpin));
-            }
-            boneLocal.compose(j.t, boneTurn, j.s);
-            if (!boneWorld[k]) \{ boneWorld[k] = new THREE.Matrix4(); }
-            if (j.parent >= 0) \{ boneWorld[k].multiplyMatrices(boneWorld[j.parent], boneLocal); }
-            else \{ boneWorld[k].copy(boneLocal); }
-            boneOut.multiplyMatrices(boneWorld[k], m.inverses[k]).toArray(out, base + k * 16);
-          }
-          c.uBones.value.needsUpdate = true;
-          var tints = c.uPaints.value.image.data, from = at * PARTS * 4;
-          for (k = 0; k < PARTS; k++) \{
-            var tone = k < o.paints.length ? o.paints[k] : "";
-            if (tone) \{
-              hue.setStyle(bare(tone));
-              tints[from + k * 4] = hue.r;
-              tints[from + k * 4 + 1] = hue.g;
-              tints[from + k * 4 + 2] = hue.b;
-              tints[from + k * 4 + 3] = solidity(tone);
-            } else \{
-              for (var i = 0; i < 4; i++) \{ tints[from + k * 4 + i] = m.tints[k * 4 + i]; }
-            }
-          }
-          c.uPaints.value.needsUpdate = true;
-        }
-
-        function groundLook(finish, colour) \{
-          var key = "terrain|" + finish + "|" + colour;
-          var m = mats.get(key);
-          if (m) \{ return m; }
-          var look = LOOKS[finish] || LOOKS.Turf, skin = skinOf(finish);
-          m = new THREE.MeshStandardMaterial(\{map: skin.map, normalMap: skin.relief,
-            normalScale: new THREE.Vector2(look[2], look[2]), roughness: look[0], metalness: look[1],
-            color: colour ? bare(colour) : 0xffffff, vertexColors: true});
-          m.defines.TILE = perTile(finish).toFixed(2);
-          if (BROAD[finish]) \{ m.defines.BROAD = ""; }
-          m.onBeforeCompile = dress;
-          mats.set(key, m);
-          return m;
-        }
-
-        function lie(o, s) \{
-          var u = o.userData, want = groundLook(finishOf(s), s.c);
-          if (o.material !== want) \{ o.material = want; }
-          if (!s.x || u.asked === s.x) \{ return; }
-          var id = s.x;
-          u.asked = id;
-          fetch("/_hive/terrain/" + id)
-            .then(function (r) \{ if (!r.ok) \{ throw new Error(r.status); } return r.arrayBuffer(); })
-            .then(function (buf) \{
-              if (u.asked !== id) \{ return; }
-              laid(o, buf);
-              dirty = true;
-            })
-            .catch(function () \{ if (u.asked === id) \{ u.asked = ""; } });
-        }
-
-        function laid(o, buf) \{
-          var view = new DataView(buf), wide = view.getUint32(0, true), rows = view.getUint32(4, true);
-          var cell = view.getFloat32(8, true), count = wide * rows, u = o.userData;
-          if (wide < 2 || rows < 2 || buf.byteLength < 12 + count * 7) \{ return; }
-          var high = new Float32Array(buf, 12, count), tint = new Uint8Array(buf, 12 + count * 4, count * 3);
-          var g = o.geometry, i, j, k;
-          if (u.wide !== wide || u.rows !== rows || u.cell !== cell) \{
-            g.dispose();
-            g = new THREE.BufferGeometry();
-            var at = new Float32Array(count * 3), uv = new Float32Array(count * 2);
-            var spanU = new Float32Array(count * 3), spanV = new Float32Array(count * 3);
-            var halfX = (wide - 1) * cell / 2, halfZ = (rows - 1) * cell / 2;
-            for (j = 0; j < rows; j++) \{
-              for (i = 0; i < wide; i++) \{
-                k = j * wide + i;
-                at[k * 3] = i * cell - halfX;
-                at[k * 3 + 2] = j * cell - halfZ;
-                uv[k * 2] = i / (wide - 1);
-                uv[k * 2 + 1] = j / (rows - 1);
-                spanU[k * 3] = halfX * 2;
-                spanV[k * 3 + 2] = halfZ * 2;
-              }
-            }
-            var index = new Uint32Array((wide - 1) * (rows - 1) * 6), n = 0;
-            for (j = 0; j < rows - 1; j++) \{
-              for (i = 0; i < wide - 1; i++) \{
-                k = j * wide + i;
-                index[n] = k;
-                index[n + 1] = k + wide;
-                index[n + 2] = k + 1;
-                index[n + 3] = k + 1;
-                index[n + 4] = k + wide;
-                index[n + 5] = k + wide + 1;
-                n += 6;
-              }
-            }
-            g.setAttribute("position", new THREE.BufferAttribute(at, 3));
-            g.setAttribute("normal", new THREE.BufferAttribute(new Float32Array(count * 3), 3));
-            g.setAttribute("color", new THREE.BufferAttribute(new Float32Array(count * 3), 3));
-            g.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
-            g.setAttribute("spanU", new THREE.BufferAttribute(spanU, 3));
-            g.setAttribute("spanV", new THREE.BufferAttribute(spanV, 3));
-            g.setAttribute("rounding", new THREE.BufferAttribute(new Float32Array(count), 1));
-            g.setIndex(new THREE.BufferAttribute(index, 1));
-            o.geometry = g;
-            u.wide = wide;
-            u.rows = rows;
-            u.cell = cell;
-          }
-          var p = g.attributes.position.array, nrm = g.attributes.normal.array, col = g.attributes.color.array;
-          for (k = 0; k < count; k++) \{
-            p[k * 3 + 1] = high[k];
-            hue.setRGB(tint[k * 3] / 255, tint[k * 3 + 1] / 255, tint[k * 3 + 2] / 255, THREE.SRGBColorSpace);
-            col[k * 3] = hue.r;
-            col[k * 3 + 1] = hue.g;
-            col[k * 3 + 2] = hue.b;
-          }
-          for (j = 0; j < rows; j++) \{
-            for (i = 0; i < wide; i++) \{
-              k = j * wide + i;
-              var west = high[k - (i > 0 ? 1 : 0)], east = high[k + (i < wide - 1 ? 1 : 0)];
-              var north = high[k - (j > 0 ? wide : 0)], south = high[k + (j < rows - 1 ? wide : 0)];
-              var sx = (east - west) / ((i > 0 && i < wide - 1 ? 2 : 1) * cell);
-              var sz = (south - north) / ((j > 0 && j < rows - 1 ? 2 : 1) * cell);
-              var long = Math.sqrt(sx * sx + 1 + sz * sz);
-              nrm[k * 3] = -sx / long;
-              nrm[k * 3 + 1] = 1 / long;
-              nrm[k * 3 + 2] = -sz / long;
-            }
-          }
-          g.attributes.position.needsUpdate = true;
-          g.attributes.normal.needsUpdate = true;
-          g.attributes.color.needsUpdate = true;
-        }
-
-        `,
-
-        // Every solid of a kind is one geometry a unit across, and its size is in its
-        // matrix. A geometry per size was one per tree a few minutes into a forest —
-        // three thousand of them, kept for good — and an instanced batch needs one
-        // geometry anyway.
-        //
-        // Twenty faces round a cylinder and a cone, because a program may stand
-        // things on the faces of a cone as drawn; a sphere is sixteen by eleven,
-        // which is round at any size a sphere is drawn at and a third fewer vertices
-        // than it was, in the shape that is most of a forest.
-        `
-        function unit(form) \{
-          var g = geoms.get(form);
-          if (g) \{ return g; }
-          if (form === "sphere") \{
-            g = new THREE.SphereGeometry(1, 16, 11);
-            spans(g, globe);
-          } else if (form === "cylinder") \{
-            g = roundedDrum();
-          } else if (form.indexOf("cone|") === 0) \{
-            var ends = form.split("|");
-            g = new THREE.CylinderGeometry(+ends[1] / 32, +ends[2] / 32, 1, 20);
-            spans(g, sloped((+ends[2] - +ends[1]) / 32));
-          } else if (form === "roof") \{
-            g = gable(1, 1, 1);
-            spans(g, ridge);
-          } else if (form === "ground") \{
-            g = new THREE.PlaneGeometry(1, 1);
-            g.rotateX(-Math.PI / 2);
-            spans(g, floor);
-          } else \{
-            g = roundedBox();
-          }
-          geoms.set(form, g);
-          return g;
-        }
-        `,
-        // **Edges are round.** Nothing made is as sharp as a box is: a wall's arris,
-        // a bench's edge, a car's wings all catch the light along a curve. So a box
-        // and a cylinder are drawn with their edges rounded — and since a unit
-        // geometry is stretched to every size, a bevel built into it would be
-        // stretched too, a wall's ten times as long as it is deep. The geometry only
-        // says, for each vertex, which corner it belongs to and which way the bevel
-        // faces it there (its normal); the shader puts the corner in at the size it
-        // is drawn (see ROUND_AT). Its position is the sharp shape, near enough,
-        // which is what anything that does not know that reads.
-        //
-        // A box is three.js's own split three ways along each side: the middle third
-        // of each face is flat, and its edge vertices are pushed round the corner.
-        `
-        function roundedBox() \{
-          var g = new THREE.BoxGeometry(1, 1, 1, 3, 3, 3);
-          spans(g, faces);
-          var p = g.attributes.position, n = g.attributes.normal, v = new THREE.Vector3();
-          for (var i = 0; i < p.count; i++) \{
-            var x = Math.sign(p.getX(i)), y = Math.sign(p.getY(i)), z = Math.sign(p.getZ(i));
-            v.set(p.getX(i) - x / 6, p.getY(i) - y / 6, p.getZ(i) - z / 6).normalize();
-            n.setXYZ(i, v.x, v.y, v.z);
-            p.setXYZ(i, x * 0.499 + v.x * 0.001, y * 0.499 + v.y * 0.001, z * 0.499 + v.z * 0.001);
-          }
-          rounds(g, 1);
-          return g;
-        }
-        `,
-        // A cylinder is twenty faces round, as it always was: a band from the top
-        // rim, round the side, to the bottom rim — rounding 2 — and a disc at either
-        // end — rounding 3. The band's rows, top to bottom, face up, half out, out,
-        // out, half out and down.
-        `
-        function roundedDrum() \{
-          var rows = [[0, 1, 1], [0.7071068, 0.7071068, 1], [1, 0, 1], [1, 0, -1], [0.7071068, -0.7071068, -1], [0, -1, -1]];
-          var at = [], normals = [], uvs = [], su = [], sv = [], kind = [], index = [];
-          function put(out, up, side, turn, round, u) \{
-            var sn = Math.sin(turn), cs = Math.cos(turn);
-            var reach = round === 3 && side === 0 ? 0 : 0.999 + out * 0.001;
-            var y = side === 0 ? up * 0.5 : side * 0.499 + up * 0.001;
-            at.push(reach * sn, y, reach * cs);
-            normals.push(out * sn, up, out * cs);
-            uvs.push(u, 0);
-            kind.push(round);
-            if (round === 2) \{ su.push(2 * Math.PI, 0, 0); sv.push(0, 1, 0); }
-            else \{ su.push(2, 0, 0); sv.push(0, 0, 2); }
-          }
-          for (var r = 0; r < rows.length; r++) \{
-            for (var k = 0; k <= 20; k++) \{
-              put(rows[r][0], rows[r][1], rows[r][2], k / 20 * 2 * Math.PI, 2, k / 20);
-            }
-          }
-          for (r = 0; r < rows.length - 1; r++) \{
-            for (k = 0; k < 20; k++) \{
-              var a = r * 21 + k, b = a + 21;
-              index.push(a, b, a + 1, b, b + 1, a + 1);
-            }
-          }
-          for (var end = 1; end >= -1; end -= 2) \{
-            var middle = at.length / 3;
-            put(0, end, 0, 0, 3, 0);
-            for (k = 0; k <= 20; k++) \{ put(0, end, end, k / 20 * 2 * Math.PI, 3, 0); }
-            for (k = 0; k < 20; k++) \{
-              if (end > 0) \{ index.push(middle + 1 + k, middle + 2 + k, middle); }
-              else \{ index.push(middle + 2 + k, middle + 1 + k, middle); }
-            }
-          }
-          var g = new THREE.BufferGeometry();
-          g.setIndex(index);
-          g.setAttribute("position", new THREE.Float32BufferAttribute(at, 3));
-          g.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
-          g.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
-          g.setAttribute("spanU", new THREE.Float32BufferAttribute(su, 3));
-          g.setAttribute("spanV", new THREE.Float32BufferAttribute(sv, 3));
-          g.setAttribute("rounding", new THREE.Float32BufferAttribute(kind, 1));
-          return g;
-        }
-
-        function rounds(g, kind) \{
-          g.setAttribute("rounding", new THREE.BufferAttribute(new Float32Array(g.attributes.position.count).fill(kind), 1));
-        }
-        `,
-        // How a face's texture is tiled, written into its vertices: which of the
-        // shape's three stretches each way across the face is measured by. The
-        // shader multiplies them by the stretch it is drawn at and counts tiles of
-        // that many metres (see dress), so a wall forty metres long and one high is
-        // forty tiles by one, as it was when every size had a geometry of its own.
-        //
-        // A box lays its faces out +X, -X, +Y, -Y, +Z, -Z; its normal says which.
-        // Round things go round: a cylinder's side is its girth by its height, its
-        // ends a disc two radii across. A floor is tiled every three metres rather
-        // than two, as it always was.
-        `
-        function spans(g, along) \{
-          var n = g.attributes.normal, count = n.count;
-          var u = new Float32Array(count * 3), v = new Float32Array(count * 3);
-          for (var i = 0; i < count; i++) \{
-            along(n.getX(i), n.getY(i), n.getZ(i), u, v, i * 3);
-          }
-          g.setAttribute("spanU", new THREE.BufferAttribute(u, 3));
-          g.setAttribute("spanV", new THREE.BufferAttribute(v, 3));
-          rounds(g, 0);
-        }
-        `,
-        // A box's spans carry the way its texture runs across each face as well, which
-        // is how a rounded face is mapped where the corner is put in: three.js lays
-        // +X out by -Z and Y, -X by Z and Y, +Y by X and -Z, -Y by X and Z, +Z by X
-        // and Y, and -Z by -X and Y.
-        `
-        function faces(x, y, z, u, v, at) \{
-          if (Math.abs(x) > 0.5) \{ u[at + 2] = -Math.sign(x); v[at + 1] = 1; }
-          else if (Math.abs(y) > 0.5) \{ u[at] = 1; v[at + 2] = -Math.sign(y); }
-          else \{ u[at] = Math.sign(z); v[at + 1] = 1; }
-        }
-
-        function globe(x, y, z, u, v, at) \{
-          u[at] = 2 * Math.PI;
-          v[at + 1] = Math.PI;
-        }
-
-        function drum(x, y, z, u, v, at) \{
-          if (Math.abs(y) > 0.99) \{ u[at] = 2; v[at + 2] = 2; }
-          else \{ u[at] = 2 * Math.PI; v[at + 1] = 1; }
-        }
-        `,
-        // A cone's side is measured down its slope rather than by its height: the
-        // ends' difference in radius rides along in the first of its second span, so
-        // the shader's length of the stretched span is the slant. A hill of three
-        // hundred metres' slope and sixty of height was tiled sixty metres' worth down
-        // it, a tile smeared five times its length — which, filtered smoothly, came
-        // out as no texture at all.
-        //
-        // The ends carry it too, so that a cone gentler than it is tall — a hill, a
-        // mound — is told apart by every one of its vertices, and is laid from above
-        // in metres of the world (see dress): wrapped round like a cylinder, every
-        // tile its foot has is squeezed into its summit.
-        `
-        function sloped(widening) \{
-          return function (x, y, z, u, v, at) \{
-            drum(x, y, z, u, v, at);
-            v[at] = widening;
-          };
-        }
-
-        function ridge(x, y, z, u, v, at) \{
-          u[at] = 1;
-          if (Math.abs(z) > 0.99) \{ v[at + 1] = 1; }
-          else \{ v[at + 2] = 1; }
-        }
-
-        function floor(x, y, z, u, v, at) \{
-          u[at] = 2 / 3;
-          v[at + 2] = 2 / 3;
-        }
-        `,
-        // The stretch a unit geometry is drawn at to be the shape asked for. Never
-        // quite nought: a matrix with a flat axis has no inverse, and the normals are
-        // worked out through one.
-        `
-        function stretch(s, v) \{
-          var d = s.d, k = s.k;
-          if (k === "sphere") \{ v.set(d[0], d[0], d[0]); }
-          else if (k === "cylinder") \{ v.set(d[0], d[1], d[0]); }
-          else if (k === "cone") \{
-            var m = Math.max(d[0], d[1]);
-            v.set(m, d[2], m);
-          } else if (k === "ground") \{ v.set(d[0], 1, d[1]); }
-          else \{ v.set(d[0], d[1], d[2]); }
-          v.set(Math.max(v.x, 0.0001), Math.max(v.y, 0.0001), Math.max(v.z, 0.0001));
-        }
-        `,
-        // Where a seat is, and what colour, written into its batch's buffers. A matrix
-        // is only built here and in put, and only for a shape a frame says changed.
-        `
-        var spot = new THREE.Vector3(), spin = new THREE.Euler(0, 0, 0, "YXZ");
-        var turn = new THREE.Quaternion(), size = new THREE.Vector3();
-        var pose = new THREE.Matrix4(), hue = new THREE.Color();
-
-        function place(o, s) \{
-          if (o.index < 0) \{ seat(o); }
-          var mesh = o.batch.mesh, at = o.index;
-          spot.set(s.p[0], s.p[1], s.p[2]);
-          if (s.turned) \{ spin.set(s.r[0], s.r[1], s.r[2]); }
-          else \{ spin.set(0, 0, 0); }
-          turn.setFromEuler(spin);
-          stretch(s, size);
-          pose.compose(spot, turn, size);
-          pose.toArray(mesh.instanceMatrix.array, at * 16);
-          touched(mesh.instanceMatrix, at, 16);
-          if (o.userData.tint !== s.c) \{
-            hue.setStyle(bare(s.c));
-            hue.toArray(mesh.instanceColor.array, at * 3);
-            touched(mesh.instanceColor, at, 3);
-            o.userData.tint = s.c;
-          }
-        }
-
-        function put(o, s) \{
-          if (o.batch) \{ place(o, s); return; }
-          if (o.crowd) \{ arrayed(o, s); return; }
-          var u = o.userData;
-          if (s.k === "line") \{
-            var p = o.geometry.attributes.position;
-            for (var i = 0; i < 6; i++) \{ p.array[i] = s.d[i]; }
-            p.needsUpdate = true;
-            if (u.tint !== s.c) \{
-              o.material.color.setStyle(bare(s.c));
-              o.material.opacity = solidity(s.c);
-              o.material.transparent = o.material.opacity < 1;
-              u.tint = s.c;
-            }
-            return;
-          }
-          o.position.set(s.p[0], s.p[1], s.p[2]);
-          if (s.k === "label") \{ o.updateMatrix(); return; }
-        `,
-        // **A sprite dresses itself and leaves before the wardrobe below.** What is at
-        // the bottom of this function is `paintOf`, which answers with a *mesh*
-        // material — a map, a normal map and a toon ramp — and a billboard wearing one
-        // samples a surface texture it has no normals for and comes out solid black.
-        // A label got out of the way of that on the line above; this is the same exit
-        // for the same reason, with the tint kept up to date on the way through
-        // because a sprite's colour is the one thing about it a frame can change.
-        `
-          if (s.k === "sprite") \{
-            if (u.tint !== s.c) \{
-              o.material.color.setStyle(bare(s.c));
-              o.material.opacity = solidity(s.c);
-              u.tint = s.c;
-            }
-            o.updateMatrix();
-            return;
-          }
-          if (s.turned) \{ o.rotation.set(s.r[0], s.r[1], s.r[2]); }
-          else if (o.rotation.x || o.rotation.y || o.rotation.z) \{ o.rotation.set(0, 0, 0); }
-          if (s.k === "terrain") \{
-            o.updateMatrix();
-            lie(o, s);
-            return;
-          }
-          stretch(s, o.scale);
-          o.updateMatrix();
-        `,
-        // A see-through solid wears a material of its own colour, because it is drawn
-        // alone and sorted, rather than in a batch. Its surface cannot change under
-        // it — fits would have built another — so only the colour is looked at.
-        `
-          if (u.tint !== s.c) \{
-            var m = paintOf(finishOf(s), s.c);
-            if (o.material !== m) \{ o.material = m; }
-            u.tint = s.c;
-          }
-        }
-        `,
-        // The sky, as a band of colour rather than a colour.
-        //
-        // A flat background cannot be looked at: it has no up and no far, so a horizon
-        // drawn against it is a line where the world stops — and a circuit is nearly
-        // all horizon. What a sky does is give the eye somewhere to put "far away", by
-        // being two colours: deeper overhead, paler where the ground meets it.
-        //
-        // An equirectangular texture four pixels wide, wrapped round the inside of the
-        // world. Four rather than one because a texture wants a width; nothing varies
-        // across it, because a bright patch that did not agree with where the shadows
-        // fall would be worse than none.
-        //
-        // Haze is scattered light, so a sky with no light in it does not have any.
-        // Lifting the horizon 42 per cent of the way to white whatever the sky was is
-        // right outdoors and exactly wrong for a cave or for space: the far distance
-        // came back mid grey, so a lap underground looked like an overcast afternoon.
-        // No colour got a program out of it — 42 per cent of white is 107 whatever it
-        // starts from.
-        //
-        // So the lift is in proportion to how much light the sky has to scatter, with
-        // the threshold where it changes nothing that already worked: a third of full
-        // luminance is darker than any daylight a scene has asked for, so everything
-        // at or above it comes out pixel for pixel as it did.
-        //
-        // And below the horizon, the same haze going quietly darker — which is never
-        // seen from a car on the ground and is exactly what a camera tipped down over
-        // a rostrum sees.
-        //
-        // One canvas, drawn again when the colour changes. A sky that goes over from
-        // one light to another is a new colour every few frames, and a texture kept
-        // for each of them was a texture kept for good.
-        `
-        function heavens(hex) \{
-          if (skyTex && skyHex === hex) \{ return skyTex; }
-          var mid = new THREE.Color();
-          mid.setStyle(hex);
-          var high = mid.clone().multiplyScalar(0.66);
-          var haze = hazeOf(mid);
-          if (!skyTex) \{
-            var canvas = document.createElement("canvas");
-            canvas.width = 4;
-            canvas.height = 256;
-            skyTex = new THREE.CanvasTexture(canvas);
-            skyTex.colorSpace = THREE.SRGBColorSpace;
-            skyTex.mapping = THREE.EquirectangularReflectionMapping;
-            skyTex.wrapS = THREE.RepeatWrapping;
-          }
-          skyTex.dispose();
-          var ctx = skyTex.image.getContext("2d");
-          var band = ctx.createLinearGradient(0, 0, 0, 256);
-          band.addColorStop(0, "#" + high.getHexString());
-          band.addColorStop(0.42, "#" + mid.getHexString());
-          band.addColorStop(0.52, "#" + haze.getHexString());
-          band.addColorStop(1, "#" + haze.clone().multiplyScalar(0.82).getHexString());
-          ctx.fillStyle = band;
-          ctx.fillRect(0, 0, 4, 256);
-          skyTex.needsUpdate = true;
-          skyHex = hex;
-        `,
-        // Carried on the texture because the fog has to match the band the road is
-        // vanishing into, and this is the one place that knows what that band is.
-        `
-          skyTex.userData.haze = haze;
-          return skyTex;
-        }
-
-        function hazeOf(mid) \{
-          var lit = 0.2126 * mid.r + 0.7152 * mid.g + 0.0722 * mid.b;
-          return mid.clone().lerp(new THREE.Color(1, 1, 1), 0.42 * Math.min(1, lit / 0.35));
-        }
-        `,
-        // The light the sky throws, which is the sky made into something to light by:
-        // overhead and the horizon as the band has them, and below the horizon the
-        // ground's own colour, warm and dark, which is what lights the underside of a
-        // balcony. Blurred by three.js into the reflections a rough surface and a
-        // polished one each see, and the light the sky casts on a face, in one.
-        //
-        // **Its brightness barely follows the sky's.** What makes a scene dark is its
-        // palette (see apply), so a night sky lighting a night palette would be dark
-        // twice — a shaded wall at midnight came out black. Its colour is the sky's,
-        // half as saturated, at a level that falls only a little from day to night.
-        //
-        // Worked out again when the sky's colour changes, at most twice a second: a
-        // sky going over from one light to another changes every few frames, and the
-        // blur is a dozen passes on the card.
-        `
-        function lit(hex) \{
-          var now = performance.now();
-          if (hex === glowHex || (glowTex && now - glowAt < 500)) \{ return; }
-          glowHex = hex;
-          glowAt = now;
-          var mid = new THREE.Color();
-          mid.setStyle(hex);
-          var haze = hazeOf(mid);
-          var high = mid.clone().multiplyScalar(0.66);
-          var dirt = haze.clone().lerp(new THREE.Color(0.3, 0.25, 0.18), 0.65).multiplyScalar(0.45);
-          var level = 0.45 * (0.3 + 0.7 * Math.min(1, luma(mid) / 0.5));
-          var k = level / Math.max(0.002, luma(haze));
-          var tones = [high, haze, dirt];
-          for (var i = 0; i < 3; i++) \{
-            var c = tones[i].multiplyScalar(k);
-            var grey = luma(c);
-            c.lerp(new THREE.Color(grey, grey, grey), 0.5);
-            var top = Math.max(c.r, c.g, c.b);
-            if (top > 1) \{ c.multiplyScalar(1 / top); }
-          }
-          if (!glow) \{
-            var canvas = document.createElement("canvas");
-            canvas.width = 64;
-            canvas.height = 32;
-            glow = new THREE.CanvasTexture(canvas);
-            glow.colorSpace = THREE.SRGBColorSpace;
-            glow.mapping = THREE.EquirectangularReflectionMapping;
-          }
-          var ctx = glow.image.getContext("2d");
-          var band = ctx.createLinearGradient(0, 0, 0, 32);
-          band.addColorStop(0, "#" + high.getHexString());
-          band.addColorStop(0.46, "#" + haze.getHexString());
-          band.addColorStop(0.54, "#" + dirt.getHexString());
-          band.addColorStop(1, "#" + dirt.getHexString());
-          ctx.fillStyle = band;
-          ctx.fillRect(0, 0, 64, 32);
-          glow.needsUpdate = true;
-          glowTex = pmrem.fromEquirectangular(glow, glowTex);
-          stage.environment = glowTex.texture;
-        }
-
-        function luma(c) \{
-          return 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
-        }
-        `,
-        // One material per surface, shared by every opaque shape made of it whatever
-        // its colour: the colour is the instance's (see place), and what a material
-        // holds is the grain, the relief and how the surface takes the light. A
-        // see-through shape is drawn alone, so it has one per colour as well, which
-        // is still no texture of its own.
-        //
-        // How rough each surface is and how much of a metal, which is most of what
-        // tells a painted car from a painted wall once the light is physical: the paint
-        // is the same colour and only one of them shows the sky in it. Then how much
-        // of its relief the light is told about.
-        //
-        // Under a half for most, and that is measured rather than tasteful. A normal
-        // map is lighting, and lighting amplifies whatever is in it: at full strength
-        // a photographed wall's form-panel structure came out as corrugated iron down
-        // every barrier. What is wanted is that an edge catches the sun, not that a
-        // flat thing stops being flat.
-        //
-        // Speckle — cloth, skin, fur, sand, snow — is nearly as rough as turf. At 0.6
-        // the sun's highlight on a head was a small bright spot, and the sun is as
-        // strong at night as by day while a night's palette is a third as bright: the
-        // highlight was not darkened with it, and everybody in the street after dark
-        // was chrome.
-        `
-        var LOOKS = \{
-          Turf: [0.95, 0, 0.6], Gravel: [0.9, 0, 0.8], Tarmac: [0.86, 0, 0.45], Kerb: [0.8, 0, 0.45],
-          Concrete: [0.88, 0, 0.45], Brick: [0.85, 0, 0.7], Panes: [0.82, 0, 0.45],
-          Planks: [0.72, 0, 0.55], Staves: [0.72, 0, 0.55], Bark: [0.95, 0, 0.9],
-          Leaves: [0.8, 0, 0.8], Crowd: [0.9, 0, 0.35], Mesh: [0.45, 0.4, 0],
-          Speckle: [0.9, 0, 0.3], Metal: [0.4, 0.4, 0.25], Carbon: [0.35, 0.1, 0.4],
-          Rubber: [0.92, 0, 0.45], Glass: [0.05, 0, 0], Gloss: [0.24, 0, 0]
-        };
-
-        function paintOf(finish, colour) \{
-          var key = finish + "|" + colour;
-          var m = mats.get(key);
-          if (m) \{ return m; }
-          var look = LOOKS[finish] || LOOKS.Planks;
-          var skin = skinOf(finish);
-          var thick = colour ? solidity(colour) : 1;
-        `,
-        // A finish with holes in it. A fence is not a faint fence, it is wire with
-        // nothing between the wire — so the pattern's own alpha decides pixel by
-        // pixel. A cut-out rather than a blend, which also means it goes on writing
-        // depth and never has to be sorted.
-        `
-          var pierced = finish === "Mesh";
-          m = new THREE.MeshStandardMaterial(\{
-            map: skin.map,
-            normalMap: skin.relief,
-            normalScale: new THREE.Vector2(look[2], look[2]),
-            roughness: look[0],
-            metalness: look[1],
-            color: colour ? bare(colour) : 0xffffff,
-            transparent: thick < 1,
-            opacity: thick,
-            alphaTest: pierced ? 0.5 : 0,
-            side: pierced ? THREE.DoubleSide : THREE.FrontSide,
-        `,
-        // A translucent shape that wrote depth would hide whatever is behind it
-        // from everything drawn after it, which is the whole of what a ghost is
-        // not allowed to do.
-        `
-            depthWrite: thick >= 1
-          });
-          m.defines.TILE = perTile(finish).toFixed(2);
-          if (finish === "Panes" || finish === "Kerb" || finish === "Crowd") \{ m.defines.OWN = ""; }
-          if (finish === "Panes") \{ m.defines.GLAZED = ""; }
-          if (BROAD[finish]) \{ m.defines.BROAD = ""; }
-          m.onBeforeCompile = dress;
-          mats.set(key, m);
-          return m;
-        }
-        `,
-        // Three things three.js's own material does not do, sewn into it.
-        //
-        // **A hill is laid from above.** A cone gentler than it is tall is mapped by
-        // where it is in the world, across x and z, rather than round itself: no tile
-        // is squeezed into its summit, and its slope meets the ground it stands on in
-        // the same grain.
-        //
-        // **The tiling is counted from the stretch.** A unit geometry's vertices say
-        // which of the shape's stretches each face is measured by (see spans); the
-        // stretch is the length of each axis of the matrix it is drawn with, the
-        // instance's for a batch; so the count of tiles each way is that over the
-        // tile's size in metres, rounded and never under one, as it was when every
-        // size had a geometry of its own.
-        //
-        // **The grain is laid over the colour, not in place of it.** A tile is drawn
-        // around mid grey, and its texel times the colour, over mid grey, is the
-        // colour with the grain's light and dark in it — so one tile serves every
-        // colour a surface is painted, and the average of a tile is the colour the
-        // scene asked for. Mid grey is the 0.2159 that 128 decodes to.
-        //
-        // **And the ground is not one colour from a distance.** A tile two metres
-        // across repeats forty times down a street, and past a few dozen metres all
-        // that is left of it is its average — so a field, a road or a slab came out a
-        // single flat colour edge to edge. The same tile read again fourteen and sixty
-        // times as large, smoothly and much louder, puts the unevenness of a real one
-        // back: damp, wear, the grass greener in one place than another. Only for what grows and what is
-        // poured or laid, because a window or a brick drawn fourteen times its size is
-        // a giant window, not weathering.
-        //
-        // A window is the exception, and a kerb's stripes and a crowd's shirts: their
-        // own colours whatever the wall's. Those tiles carry, in their alpha, how much
-        // of each texel is the wall; the rest is the texel as it is. And a window is
-        // glass, so where it is glass it is polished.
-        `
-        var BROAD = \{Turf: true, Gravel: true, Tarmac: true, Concrete: true, Leaves: true, Speckle: true, Bark: true};
-
-        var ROUND_AT = [
-          "vec3 roundedAt = position;",
-          "vec3 roundedNormal = normal;",
-          "if (rounding > 0.5) \{",
-          "  mat3 roundBy = mat3(modelMatrix);",
-          "  #ifdef USE_INSTANCING",
-          "    roundBy = roundBy * mat3(instanceMatrix);",
-          "  #endif",
-          "  vec3 size = vec3(length(roundBy[0]), length(roundBy[1]), length(roundBy[2]));",
-          "  vec3 corner;",
-          "  if (rounding < 1.5) \{",
-          "    float bend = min(ROUND_MOST, ROUND_SHARE * min(size.x, min(size.y, size.z)));",
-          "    corner = sign(position) * (size * 0.5 - bend) + normal * bend;",
-          "  } else \{",
-          "    float bend = min(ROUND_MOST, ROUND_SHARE * min(2.0 * size.x, size.y));",
-          "    float reach = length(position.xz);",
-          "    vec2 way = reach > 0.0001 ? position.xz / reach : vec2(0.0);",
-          "    float far = (reach > 0.0001 ? size.x - bend : 0.0) + length(normal.xz) * bend;",
-          "    corner = vec3(way.x * far, sign(position.y) * (size.y * 0.5 - bend) + normal.y * bend, way.y * far);",
-          "  }",
-          "  roundedAt = corner / size;",
-          "  roundedNormal = normal * size;",
-          "}"
-        ].join("\n");
-
-        var ROUNDED = "#define ROUND_SHARE 0.2\n#define ROUND_MOST 0.35\nattribute float rounding;";
-
-        var TILED = [
-          ROUND_AT,
-          "#include <uv_vertex>",
-          "#ifdef USE_MAP",
-          "  if (rounding > 0.5) \{",
-          "    vec2 laid = rounding < 1.5 ? 0.5 + vec2(dot(spanU, roundedAt), dot(spanV, roundedAt))",
-          "      : rounding < 2.5 ? vec2(uv.x, roundedAt.y + 0.5) : 0.5 + roundedAt.xz * 0.5;",
-          "    vMapUv = (mapTransform * vec3(laid, 1.0)).xy;",
-          "  }",
-          "#endif",
-          "#ifdef USE_MAP",
-          "  mat3 stretchedBy = mat3(modelMatrix);",
-          "  #ifdef USE_INSTANCING",
-          "    stretchedBy = stretchedBy * mat3(instanceMatrix);",
-          "  #endif",
-          "  vec3 stretched = vec3(length(stretchedBy[0]), length(stretchedBy[1]), length(stretchedBy[2]));",
-          "  vec2 tiles = max(vec2(1.0), floor(vec2(length(stretched * spanU), length(stretched * spanV)) / TILE + 0.5));",
-          "  vMapUv *= tiles;",
-          "  if (spanV.x != 0.0 && abs(spanV.x) * stretched.x > stretched.y) \{",
-          "    vec4 placed = vec4(position, 1.0);",
-          "    #ifdef USE_INSTANCING",
-          "      placed = instanceMatrix * placed;",
-          "    #endif",
-          "    vMapUv = (modelMatrix * placed).xz / TILE;",
-          "  }",
-          "  #ifdef USE_NORMALMAP",
-          "    vNormalMapUv = vMapUv;",
-          "  #endif",
-          "#endif"
-        ].join("\n");
-
-        var TINTED = [
-          "#if defined( USE_COLOR )",
-          "  diffuseColor.rgb *= vColor;",
-          "#endif",
-          "vec4 grainTexel = vec4(0.2158605, 0.2158605, 0.2158605, 1.0);",
-          "#ifdef USE_MAP",
-          "  grainTexel = texture2D(map, vMapUv);",
-          "  #ifdef BROAD",
-          "    float broad = texture2D(map, vMapUv * 0.0713 + 0.31, 3.0).g + texture2D(map, vMapUv * 0.0171 + 0.77, 5.0).g;",
-          "    grainTexel.rgb *= clamp(1.0 + (broad * 2.3163 - 1.0) * 2.6, 0.55, 1.5);",
-          "  #endif",
-          "#endif",
-          "#ifdef OWN",
-          "  diffuseColor.rgb = mix(grainTexel.rgb, diffuseColor.rgb * grainTexel.rgb * 4.6326, grainTexel.a);",
-          "#else",
-          "  diffuseColor.rgb *= grainTexel.rgb * 4.6326;",
-          "  diffuseColor.a *= grainTexel.a;",
-          "#endif"
-        ].join("\n");
-
-        var GLAZED = [
-          "#include <roughnessmap_fragment>",
-          "#ifdef GLAZED",
-          "  roughnessFactor = mix(0.06, roughnessFactor, grainTexel.a);",
-          "#endif"
-        ].join("\n");
-
-        var roundCaster = null;
-
-        function rounder() \{
-          if (!roundCaster) \{
-            roundCaster = new THREE.MeshDepthMaterial(\{depthPacking: THREE.RGBADepthPacking});
-            roundCaster.onBeforeCompile = function (shader) \{
-              shader.vertexShader = shader.vertexShader
-                .replace("#include <common>", "#include <common>\n" + ROUNDED)
-                .replace("#include <begin_vertex>", ROUND_AT + "\nvec3 transformed = roundedAt;");
-            };
-          }
-          return roundCaster;
-        }
-
-        function dress(shader) \{
-          shader.vertexShader = shader.vertexShader
-            .replace("#include <common>", "#include <common>\nattribute vec3 spanU;\nattribute vec3 spanV;\n" + ROUNDED)
-            .replace("#include <uv_vertex>", TILED)
-            .replace("#include <beginnormal_vertex>", "vec3 objectNormal = roundedNormal;")
-            .replace("#include <begin_vertex>", "vec3 transformed = roundedAt;");
-          shader.fragmentShader = shader.fragmentShader
-            .replace("#include <map_fragment>", "")
-            .replace("#include <color_fragment>", TINTED)
-            .replace("#include <roughnessmap_fragment>", GLAZED);
-        }
-        `,
-        // What a shape is made of: what it said, or — where it said nothing — what its
-        // kind used to imply on its own. That second half is the whole of the story for
-        // a scene written before there were surfaces: it draws exactly as it did.
-        `
-        function finishOf(s) \{
-          if (s.s) \{ return s.s; }
-          if (s.k === "ground" || s.k === "terrain") \{ return "Turf"; }
-          if (s.k === "cylinder" || s.k === "cone") \{ return "Staves"; }
-          if (s.k === "roof") \{ return "Planks"; }
-          if (s.k === "sphere") \{ return "Speckle"; }
-          return "Planks";
-        }
-        `,
-        // A colour arrives as CSS, which keeps the alpha inside the colour — a canvas
-        // honours that by itself and a material has to be told separately. So the two
-        // are split apart here.
-        `
-        function bare(colour) \{
-          if (colour.indexOf("rgba(") === 0) \{
-            var p = colour.slice(5, -1).split(",");
-            return "rgb(" + p[0] + "," + p[1] + "," + p[2] + ")";
-          }
-          if (colour.charAt(0) === "#") \{
-            if (colour.length === 9) \{ return colour.slice(0, 7); }
-            if (colour.length === 5) \{ return colour.slice(0, 4); }
-          }
-          return colour;
-        }
-        `,
-        // How much of it there is, nought to one. Anything that cannot be read as an
-        // alpha is a whole one — a colour that did not say is not a colour that meant
-        // invisible.
-        `
-        function solidity(colour) \{
-          var a = 1;
-          if (colour.indexOf("rgba(") === 0) \{
-            var p = colour.slice(5, -1).split(",");
-            a = p.length > 3 ? parseFloat(p[3]) : 1;
-          } else if (colour.charAt(0) === "#") \{
-            if (colour.length === 9) \{ a = parseInt(colour.slice(7), 16) / 255; }
-            else if (colour.length === 5) \{ a = parseInt(colour.charAt(4), 16) / 15; }
-          }
-          if (!(a >= 0 && a <= 1)) \{ return 1; }
-          return a;
-        }
-        `,
-        // How many metres of a surface one tile stands for. Two is the size of the
-        // thing a material tile is a picture of; a window is not a material, and its
-        // spacing is a fact about the building — a bay, or a storey.
-        `
-        function perTile(finish) \{
-          return finish === "Panes" ? 2.9 : 2;
-        }
-        `,
-        // A three-sided cylinder, rather than a hand-written buffer of six vertices
-        // whose normals and windings all have to agree. Three segments puts one corner
-        // at +Z and an edge across the back; turned a quarter about X that corner is
-        // the ridge and the edge is the eaves.
-        `
-        function gable(wide, tall, long) \{
-          var g = new THREE.CylinderGeometry(1, 1, long, 3);
-          g.rotateX(-Math.PI / 2);
-        `,
-        // Equilateral to the pitch asked for: the triangle is 2 x cos(30) across the
-        // eaves and 1.5 from eaves to ridge, in units of the radius it was built at.
-        // The shift then centres it, which is where at() promises the middle is.
-        `
-          g.scale(wide / 1.7320508, tall / 1.5, 1);
-          g.translate(0, 0 - tall / 6, 0);
-          return g;
-        }
-        `,
-        // The grain itself, and its relief: two textures a surface, made the first time
-        // the surface is asked for and kept, whatever colours it is painted.
-        //
-        // Drawn here, unless the program shipped a photograph of it. The drawings are
-        // the floor: a scene is a value and a Hive program is one file, so a texture
-        // that had to ship as an image would make both untrue. But a road is looked at
-        // for a full lap, and a drawing is not a road up close — so
-        // assets/textures/<surface>.jpg (see photoOf) is taken where it exists.
-        //
-        // **Smooth close up and filtered away from you.** Every surface here is meant
-        // to look like the thing it names, and a magnified tile drawn as hard squares
-        // looks like a tile; a dozen metres ahead the same tile is minified past one
-        // texel per pixel, which mipmaps and anisotropy are for.
-        `
-        function skinOf(finish) \{
-          var kept = skins.get(finish);
-          if (kept) \{ return kept; }
-          var skin = \{finish: finish, map: woven(), relief: bumped(finish) ? woven() : null};
-          skin.map.colorSpace = THREE.SRGBColorSpace;
-          skins.set(finish, skin);
-          weaveInto(skin);
-          return skin;
-        }
-
-        function woven() \{
-          var size = weave();
-          var t = new THREE.DataTexture(new Uint8Array(size * size * 4), size, size);
-          t.wrapS = THREE.RepeatWrapping;
-          t.wrapT = THREE.RepeatWrapping;
-          t.magFilter = THREE.LinearFilter;
-          t.minFilter = THREE.LinearMipmapLinearFilter;
-          t.generateMipmaps = true;
-          t.anisotropy = most();
-          return t;
-        }
-        `,
-        // How big a tile is: the texels it is resolved at, and the grid it is composed
-        // on.
-        //
-        // They are different numbers, and finding that out cost a day. Every drawing
-        // below places its work in units of the grid, which was right with one canvas
-        // size and wrong the moment there were two: enlarging the canvas without
-        // enlarging the drawing shrinks the pattern, and detail below one texel is not
-        // detail but shimmer. So grid is the composition every pattern means, weave is
-        // how finely it is resolved, and the context is scaled between the two. A
-        // photograph is resolved at the same size, which keeps a texture's size the
-        // one it was made at when one arrives.
-        `
-        function grid() \{ return 128; }
-
-        function weave() \{ return 256; }
-        `,
-        // Both textures of a surface, drawn into what they already hold.
-        //
-        // The drawing is made on two canvases: the grain in light and dark over mid
-        // grey, and on the second whatever of it is a colour of its own — a window's
-        // glass, a kerb's stripe — so that the texel can say how much of it is which.
-        //
-        // **Every drawing is seeded by its surface's name.** The relief is worked out
-        // from the same pixels the grain is, so a stone that catches the light is a
-        // stone that is drawn, and the same surface is the same tile on every run.
-        //
-        // Then the grain is brought to a mean of mid grey, in linear light, because a
-        // tile that averaged a little dark made everything painted with it a little
-        // darker than the scene said — and a photograph is held to the same, whatever
-        // it was shipped as. The rows are turned over on the way, a texture counting
-        // them up where a canvas counts them down.
-        `
-        var paper = null, pane = null;
-
-        function weaveInto(skin) \{
-          var finish = skin.finish, size = weave();
-          if (!paper) \{
-            paper = document.createElement("canvas");
-            pane = document.createElement("canvas");
-            paper.width = paper.height = pane.width = pane.height = size;
-          }
-          var ctx = paper.getContext("2d", \{willReadFrequently: true});
-          var mine = pane.getContext("2d", \{willReadFrequently: true});
-          ctx.globalCompositeOperation = "source-over";
-          ctx.clearRect(0, 0, size, size);
-          mine.clearRect(0, 0, size, size);
-          var shot = photoOf(skin, "");
-          if (shot) \{
-            ctx.drawImage(shot, 0, 0, size, size);
-          } else \{
-            ctx.fillStyle = "#808080";
-            ctx.fillRect(0, 0, size, size);
-            seed(finish);
-            ctx.save();
-            mine.save();
-            ctx.scale(size / grid(), size / grid());
-            mine.scale(size / grid(), size / grid());
-            drawn(ctx, mine, finish, grid());
-            ctx.restore();
-            mine.restore();
-          }
-          var a = ctx.getImageData(0, 0, size, size).data;
-          var b = mine.getImageData(0, 0, size, size).data;
-          var out = skin.map.image.data, high = new Float32Array(size * size);
-          var sum = 0, weight = 0, i, at, o;
-          for (i = 0; i < size * size; i++) \{
-            at = i * 4;
-            o = b[at + 3] / 255;
-            var r = a[at] + (b[at] - a[at]) * o;
-            var g = a[at + 1] + (b[at + 1] - a[at + 1]) * o;
-            var bl = a[at + 2] + (b[at + 2] - a[at + 2]) * o;
-            high[i] = (r * 0.299 + g * 0.587 + bl * 0.114) / 255;
-            if (o === 0 && a[at + 3] > 0) \{
-              sum += DECODE[a[at]] * 0.299 + DECODE[a[at + 1]] * 0.587 + DECODE[a[at + 2]] * 0.114;
-              weight++;
-            }
-            var to = flipped(i, size) * 4;
-            out[to] = r;
-            out[to + 1] = g;
-            out[to + 2] = bl;
-            out[to + 3] = o > 0 ? 255 * (1 - o) : a[at + 3];
-          }
-          var gain = weight ? Math.min(2, Math.max(0.5, 0.2158605 / (sum / weight))) : 1;
-          for (i = 0; i < size * size; i++) \{
-            at = i * 4;
-            if (b[at + 3] !== 0) \{ continue; }
-            var into = flipped(i, size) * 4;
-            out[into] = encoded(DECODE[a[at]] * gain);
-            out[into + 1] = encoded(DECODE[a[at + 1]] * gain);
-            out[into + 2] = encoded(DECODE[a[at + 2]] * gain);
-          }
-          skin.map.needsUpdate = true;
-          if (!skin.relief) \{ return; }
-          var dug = photoOf(skin, "-normal");
-          if (dug) \{
-            ctx.clearRect(0, 0, size, size);
-            ctx.drawImage(dug, 0, 0, size, size);
-            var n = ctx.getImageData(0, 0, size, size).data, into2 = skin.relief.image.data;
-            for (i = 0; i < size * size; i++) \{
-              var dst = flipped(i, size) * 4;
-              into2[dst] = n[i * 4];
-              into2[dst + 1] = n[i * 4 + 1];
-              into2[dst + 2] = n[i * 4 + 2];
-              into2[dst + 3] = 255;
-            }
-          } else \{
-            slope(high, size, skin.relief.image.data);
-          }
-          skin.relief.needsUpdate = true;
-        }
-
-        function flipped(i, size) \{
-          return (size - 1 - Math.floor(i / size)) * size + i % size;
-        }
-
-        var DECODE = new Float32Array(256);
-        for (var code = 0; code < 256; code++) \{
-          var v = code / 255;
-          DECODE[code] = v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
-        }
-
-        function encoded(v) \{
-          v = Math.max(0, Math.min(1, v));
-          return Math.round(255 * (v <= 0.0031308 ? v * 12.92 : 1.055 * Math.pow(v, 1 / 2.4) - 0.055));
-        }
-        `,
-        // The drawings' own dice: the same surface comes out the same every time it is
-        // drawn, and its grain and its relief are one drawing rather than two.
-        `
-        var dice = 1;
-
-        function seed(text) \{
-          var h = 2166136261;
-          for (var i = 0; i < text.length; i++) \{
-            h ^= text.charCodeAt(i);
-            h = Math.imul(h, 16777619);
-          }
-          dice = h >>> 0;
-        }
-
-        function rand() \{
-          dice = (dice + 0x6D2B79F5) | 0;
-          var t = Math.imul(dice ^ (dice >>> 15), dice | 1);
-          t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-          return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-        }
-        `,
-        // A photograph of a surface, if this program shipped one.
-        //
-        // There is no call for this and no attribute that asks for it, and that is the
-        // design. A Surface is a closed set of names, so that any renderer can answer
-        // for one, and what a name is worth is that the window may answer it better
-        // tomorrow. A program with assets/textures/tarmac.jpg has photographed tarmac;
-        // one without has drawn tarmac; the same scene value is correct in both.
-        //
-        // part is "" for the colour and "-normal" for the relief.
-        //
-        // The load is not waited for: the textures are drawn from what there is now
-        // and drawn again when the bytes land, so the first frame is never held up.
-        // Nothing is rebuilt and nothing is re-keyed — the materials and the batches
-        // are untouched and the pixels are simply better, which is why a photograph
-        // can arrive mid-lap without a flicker. A file that is not there 404s, onload
-        // never fires, and the drawing stands.
-        `
-        function photoOf(skin, part) \{
-          var name = skin.finish.toLowerCase() + part;
-          var kept = photos.get(name);
-          if (kept) \{ return kept.img; }
-          var slot = \{img: null};
-          photos.set(name, slot);
-          var img = new Image();
-          img.onload = function () \{
-            slot.img = img;
-            weaveInto(skin);
-            dirty = true;
-          };
-          img.src = "/_hive/asset/textures/" + name + ".jpg";
-          return null;
-        }
-        `,
-        // Which surfaces have relief at all.
-        //
-        // The question is not "is this bumpy in life", it is "was what was drawn a
-        // texture or a diagram". A photographed surface always has relief; a drawn one
-        // has whatever its pattern's brightness implies, which is right for most. Not
-        // for three: gloss and glass are paint, whose whole definition is that they add
-        // no texture, and mesh is a cut-out whose holes are alpha rather than geometry.
-        //
-        // Concrete was on this list for a while and should not have been — see the note
-        // on grid, which is where the fault actually was. Worth leaving written down: a
-        // normal map is the loudest thing in a renderer and so the first thing blamed.
-        `
-        function bumped(finish) \{
-          return finish !== "Gloss" && finish !== "Glass" && finish !== "Mesh";
-        }
-        `,
-        // One separable pass of a 1-2-1 blur over a square field that wraps. Separable
-        // because across-then-down is the same as the nine-tap at a third of the reads,
-        // and wrapping because a tile blurred against nothing would have a seam in its
-        // lighting that it does not have in its colour.
-        `
-        function softened(field, size) \{
-          var mid = new Float32Array(size * size), out = new Float32Array(size * size);
-          for (var y = 0; y < size; y++) \{
-            var row = y * size;
-            for (var x = 0; x < size; x++) \{
-              mid[row + x] = (field[row + (x + size - 1) % size]
-                + 2 * field[row + x] + field[row + (x + 1) % size]) / 4;
-            }
-          }
-          for (var j = 0; j < size; j++) \{
-            var up = ((j + size - 1) % size) * size, at = j * size, down = ((j + 1) % size) * size;
-            for (var i = 0; i < size; i++) \{
-              out[at + i] = (mid[up + i] + 2 * mid[at + i] + mid[down + i]) / 4;
-            }
-          }
-          return out;
-        }
-        `,
-        // A height field, turned into the directions its surface faces.
-        //
-        // Sobel across and down for the two slopes, and the third component is whatever
-        // is left of a unit vector. The field is in the canvas's rows, counted down, and
-        // the texture's are counted up — so each row is written turned over, and the
-        // vertical slope is written already changed.
-        //
-        // And softened first, which is the difference between relief and noise. A
-        // drawing's brightness is only approximately a height field, and least so at
-        // the pixel: a scatter of half-pixel pinholes is colour, not depth, and
-        // differentiating it swings the normal between neighbouring texels. Lit and
-        // minified, that came out as corrugation marching down every wall — a moiré
-        // no anisotropy fixes, the detail never having been real. Two passes of a
-        // three-tap blur take the sub-pixel out and leave every seam the pattern drew.
-        //
-        // How much of a hill the light is told about: enough that an edge catches it,
-        // little enough that a drawn seam is a seam and not a trench.
-        `
-        function slope(field, size, b) \{
-          var high = softened(softened(field, size), size);
-          var deep = 1.2;
-          for (var y = 0; y < size; y++) \{
-            var up = ((y + size - 1) % size) * size;
-            var mid = y * size;
-            var down = ((y + 1) % size) * size;
-            for (var x = 0; x < size; x++) \{
-              var l = (x + size - 1) % size, r = (x + 1) % size;
-              var across = (high[up + r] + 2 * high[mid + r] + high[down + r])
-                - (high[up + l] + 2 * high[mid + l] + high[down + l]);
-              var along = (high[down + l] + 2 * high[down + x] + high[down + r])
-                - (high[up + l] + 2 * high[up + x] + high[up + r]);
-              var nx = -across * deep, ny = along * deep;
-              var len = Math.sqrt(nx * nx + ny * ny + 1);
-              var to = flipped(mid + x, size) * 4;
-              b[to] = (nx / len * 0.5 + 0.5) * 255;
-              b[to + 1] = (ny / len * 0.5 + 0.5) * 255;
-              b[to + 2] = (1 / len * 0.5 + 0.5) * 255;
-              b[to + 3] = 255;
-            }
-          }
-        }
-        `,
-        // One drawn pattern, over the grey already on the canvas, with what is a colour
-        // of its own drawn onto mine instead.
-        `
-        function drawn(ctx, mine, finish, size) \{
-          if (finish === "Turf") \{ turf(ctx, size); }
-          else if (finish === "Gravel") \{ gravel(ctx, size); }
-          else if (finish === "Tarmac") \{ tarmac(ctx, size); }
-          else if (finish === "Kerb") \{ kerb(ctx, mine, size); }
-          else if (finish === "Concrete") \{ concrete(ctx, size); }
-          else if (finish === "Brick") \{ brick(ctx, size); }
-          else if (finish === "Panes") \{ panes(ctx, mine, size); }
-          else if (finish === "Staves") \{ staves(ctx, size); }
-          else if (finish === "Bark") \{ bark(ctx, size); }
-          else if (finish === "Leaves") \{ leaves(ctx, size); }
-          else if (finish === "Crowd") \{ crowd(ctx, mine, size); }
-          else if (finish === "Mesh") \{ mesh(ctx, size); }
-          else if (finish === "Speckle") \{ speckle(ctx, size); }
-          else if (finish === "Metal") \{ metal(ctx, size); }
-          else if (finish === "Carbon") \{ carbon(ctx, size); }
-          else if (finish === "Rubber") \{ rubber(ctx, size); }
-          else if (finish === "Glass") \{ glass(ctx, size); }
-          else if (finish === "Gloss") \{ gloss(ctx, size); }
-          else \{ planks(ctx, size); }
-        }
-        `,
-        // Light and dark that varies smoothly, at a scale of so many cells across the
-        // tile, and wraps — which is what a surface looks like before anything is drawn
-        // on it: weathering, wear, damp, the unevenness of everything. Several of these
-        // at different scales are most of what keeps a large flat face from reading as
-        // a flat colour, and none of them has an edge for the relief to find.
-        //
-        // In the canvas's own pixels, which the grid's scale does not reach.
-        `
-        function grit(ctx, cells, amount) \{
-          var size = ctx.canvas.width, img = ctx.getImageData(0, 0, size, size), px = img.data;
-          var lattice = new Float32Array(cells * cells);
-          for (var i = 0; i < lattice.length; i++) \{ lattice[i] = rand() * 2 - 1; }
-          var step = cells / size;
-          for (var y = 0; y < size; y++) \{
-            var fy = y * step, y0 = Math.floor(fy), ty = fy - y0;
-            ty = ty * ty * (3 - 2 * ty);
-            var r0 = (y0 % cells) * cells, r1 = ((y0 + 1) % cells) * cells;
-            for (var x = 0; x < size; x++) \{
-              var fx = x * step, x0 = Math.floor(fx), tx = fx - x0;
-              tx = tx * tx * (3 - 2 * tx);
-              var c0 = x0 % cells, c1 = (x0 + 1) % cells;
-              var n = (lattice[r0 + c0] * (1 - tx) + lattice[r0 + c1] * tx) * (1 - ty)
-                + (lattice[r1 + c0] * (1 - tx) + lattice[r1 + c1] * tx) * ty;
-              var k = 1 + n * amount, at = (y * size + x) * 4;
-              px[at] *= k;
-              px[at + 1] *= k;
-              px[at + 2] *= k;
-            }
-          }
-          ctx.putImageData(img, 0, 0);
-        }
-        `,
-        // Something small drawn at a place on the tile, and again across whichever
-        // edges it reaches over, so that the tile has no seam where it meets itself.
-        `
-        function around(size, x, y, reach, draw) \{
-          for (var dx = -1; dx <= 1; dx++) \{
-            for (var dy = -1; dy <= 1; dy++) \{
-              var px = x + dx * size, py = y + dy * size;
-              if (px > -reach && px < size + reach && py > -reach && py < size + reach) \{ draw(px, py); }
-            }
-          }
-        }
-
-        function dot(ctx, size, x, y, r, style) \{
-          ctx.fillStyle = style;
-          around(size, x, y, r, function (px, py) \{
-            ctx.beginPath();
-            ctx.arc(px, py, r, 0, 6.284);
-            ctx.fill();
-          });
-        }
-        `,
-        // Grass: tufts of blades leaning every way, light at the tip and dark at the
-        // root, over clumps of a deeper and a paler green — the clumps are what a lawn
-        // looks like from a car, the blades what it looks like underfoot.
-        `
-        function turf(ctx, size) \{
-          grit(ctx, 4, 0.12);
-          grit(ctx, 12, 0.10);
-          grit(ctx, 48, 0.08);
-          for (var i = 0; i < 900; i++) \{
-            var x = rand() * size, y = rand() * size;
-            var lean = (rand() - 0.5) * 3, tall = 2 + rand() * 3.5;
-            ctx.strokeStyle = i % 3 === 0 ? "rgba(255,255,220,0.22)" : "rgba(0,0,0,0.20)";
-            ctx.lineWidth = 0.7;
-            around(size, x, y, 6, function (px, py) \{
-              ctx.beginPath();
-              ctx.moveTo(px, py);
-              ctx.lineTo(px + lean, py - tall);
-              ctx.stroke();
-            });
-          }
-        }
-        `,
-        // Boards: four to a tile, each its own shade, the grain running along it in
-        // long streaks, with a dark seam between each and a lit edge under it.
-        `
-        function planks(ctx, size) \{
-          grit(ctx, 6, 0.06);
-          var boards = 4, high = size / boards;
-          for (var b = 0; b < boards; b++) \{
-            var tone = rand() - 0.5;
-            ctx.fillStyle = tone < 0 ? "rgba(0,0,0," + (-tone * 0.22) + ")" : "rgba(255,255,255," + (tone * 0.16) + ")";
-            ctx.fillRect(0, b * high, size, high);
-            for (var s = 0; s < 14; s++) \{
-              var y = b * high + 2 + rand() * (high - 4), wave = rand() * 2;
-              ctx.strokeStyle = s % 2 ? "rgba(0,0,0,0.10)" : "rgba(255,255,255,0.07)";
-              ctx.lineWidth = 0.5 + rand();
-              ctx.beginPath();
-              ctx.moveTo(0, y);
-              ctx.bezierCurveTo(size * 0.3, y + wave, size * 0.7, y - wave, size, y);
-              ctx.stroke();
-            }
-            ctx.fillStyle = "rgba(0,0,0,0.38)";
-            ctx.fillRect(0, b * high, size, 1.2);
-            ctx.fillStyle = "rgba(255,255,255,0.12)";
-            ctx.fillRect(0, b * high + 1.2, size, 0.8);
-          }
-          grit(ctx, 64, 0.05);
-        }
-        `,
-        // Staves: the same boards stood on end, narrower, as round things are built.
-        `
-        function staves(ctx, size) \{
-          grit(ctx, 6, 0.06);
-          var count = 8, wide = size / count;
-          for (var i = 0; i < count; i++) \{
-            var tone = rand() - 0.5;
-            ctx.fillStyle = tone < 0 ? "rgba(0,0,0," + (-tone * 0.2) + ")" : "rgba(255,255,255," + (tone * 0.14) + ")";
-            ctx.fillRect(i * wide, 0, wide, size);
-            for (var s = 0; s < 5; s++) \{
-              ctx.fillStyle = s % 2 ? "rgba(0,0,0,0.08)" : "rgba(255,255,255,0.06)";
-              ctx.fillRect(i * wide + 1 + rand() * (wide - 2), 0, 0.6, size);
-            }
-            ctx.fillStyle = "rgba(0,0,0,0.30)";
-            ctx.fillRect(i * wide, 0, 1.2, size);
-          }
-          grit(ctx, 64, 0.05);
-        }
-        `,
-        // Asphalt: a dark binder full of small light stones, with the wear of traffic
-        // and the damp lying in it at a larger scale.
-        `
-        function tarmac(ctx, size) \{
-          grit(ctx, 3, 0.07);
-          grit(ctx, 16, 0.07);
-          grit(ctx, 96, 0.10);
-          for (var i = 0; i < 1600; i++) \{
-            var light = i % 3 === 0;
-            dot(ctx, size, rand() * size, rand() * size, 0.25 + rand() * 0.6,
-              light ? "rgba(255,255,255,0.20)" : "rgba(0,0,0,0.18)");
-          }
-        }
-        `,
-        // Kerb stones: the stripe is white whatever colour the kerb is painted, so it
-        // is drawn as a colour of its own.
-        `
-        function kerb(ctx, mine, size) \{
-          grit(ctx, 8, 0.08);
-          grit(ctx, 64, 0.06);
-          mine.fillStyle = "#e8e6e0";
-          mine.beginPath();
-          for (var i = -2; i < 4; i++) \{
-            var x = size * i / 2;
-            mine.moveTo(x, 0);
-            mine.lineTo(x + size / 4, 0);
-            mine.lineTo(x + size / 4 + size, size);
-            mine.lineTo(x + size, size);
-            mine.closePath();
-          }
-          mine.fill();
-          ctx.fillStyle = "rgba(0,0,0,0.3)";
-          ctx.fillRect(0, 0, 1, size);
-        }
-        `,
-        // Gravel: stones, each lit from above and shaded below so the relief has
-        // something to stand up, over a darker bed between them.
-        `
-        function gravel(ctx, size) \{
-          grit(ctx, 8, 0.08);
-          ctx.fillStyle = "rgba(0,0,0,0.12)";
-          ctx.fillRect(0, 0, size, size);
-          for (var i = 0; i < 520; i++) \{
-            var x = rand() * size, y = rand() * size, r = 0.8 + rand() * 1.8;
-            var tone = rand() * 0.18;
-            dot(ctx, size, x, y + r * 0.35, r, "rgba(0,0,0,0.22)");
-            dot(ctx, size, x, y, r, "rgba(255,255,255," + (0.10 + tone) + ")");
-            dot(ctx, size, x - r * 0.3, y - r * 0.3, r * 0.45, "rgba(255,255,255,0.12)");
+            flat.push(left, top, Math.max(0, right - left), Math.max(0, low - top));
           }
-          grit(ctx, 64, 0.06);
+          var said = flat.join(",");
+          if (said === insetsSaid) \{ return; }
+          insetsSaid = said;
+          engine._hs_insets(lent(new Uint8Array(new Int32Array(flat).buffer)), boxes.length);
         }
-        `,
-        // Brushed metal. The shine is the light's to give now, so all a tile carries
-        // is the brushing and a little unevenness under it.
-        `
-        function metal(ctx, size) \{
-          grit(ctx, 4, 0.04);
-          for (var i = 0; i < 220; i++) \{
-            var y = rand() * size;
-            ctx.strokeStyle = i % 2 ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)";
-            ctx.lineWidth = 0.5;
-            ctx.beginPath();
-            ctx.moveTo(0, y);
-            ctx.lineTo(size, y);
-            ctx.stroke();
-          }
-        }
-
-        function carbon(ctx, size) \{
-          var cells = 16, cell = size / cells;
-          for (var y = 0; y < cells; y++) \{
-            for (var x = 0; x < cells; x++) \{
-              var over = (x + y) % 2 === 0;
-              ctx.fillStyle = over ? "rgba(255,255,255,0.055)" : "rgba(0,0,0,0.11)";
-              ctx.fillRect(x * cell, y * cell, cell, cell);
-              ctx.strokeStyle = over ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.07)";
-              ctx.lineWidth = 1;
-              for (var i = 1; i < 3; i++) \{
-                ctx.beginPath();
-                if (over) \{
-                  ctx.moveTo(x * cell, y * cell + cell * i / 3);
-                  ctx.lineTo(x * cell + cell, y * cell + cell * i / 3);
-                } else \{
-                  ctx.moveTo(x * cell + cell * i / 3, y * cell);
-                  ctx.lineTo(x * cell + cell * i / 3, y * cell + cell);
-                }
-                ctx.stroke();
-              }
-            }
-          }
-        }
-        `,
-        // Paint: nothing but the faintest orange peel. The sheen is the light's.
-        `
-        function gloss(ctx, size) \{
-          grit(ctx, 64, 0.02);
-        }
-        `,
-        // Concrete: cast in panels with a joint across the middle, mottled where it
-        // cured unevenly and pocked with small air holes.
-        `
-        function concrete(ctx, size) \{
-          grit(ctx, 3, 0.07);
-          grit(ctx, 12, 0.06);
-          grit(ctx, 96, 0.07);
-          for (var i = 0; i < 260; i++) \{
-            dot(ctx, size, rand() * size, rand() * size, 0.3 + rand() * 0.5, "rgba(0,0,0,0.22)");
-          }
-          ctx.fillStyle = "rgba(0,0,0,0.22)";
-          ctx.fillRect(0, size / 2, size, 0.8);
-          ctx.fillRect(size / 2, 0, 0.8, size);
-          ctx.fillStyle = "rgba(255,255,255,0.10)";
-          ctx.fillRect(0, size / 2 + 0.8, size, 0.6);
-        }
-        `,
-        // Brick: a running bond of twelve courses a tile, every brick its own shade of
-        // the colour, set in a paler mortar.
-        `
-        function brick(ctx, size) \{
-          var courses = 12, high = size / courses, across = 6, wide = size / across;
-          ctx.fillStyle = "rgba(255,255,255,0.30)";
-          ctx.fillRect(0, 0, size, size);
-          for (var y = 0; y < courses; y++) \{
-            var shift = (y % 2) * wide / 2;
-            for (var x = -1; x <= across; x++) \{
-              var tone = rand() - 0.5, left = x * wide + shift;
-              ctx.fillStyle = "rgba(128,128,128,1)";
-              ctx.fillRect(left + 0.6, y * high + 0.6, wide - 1.2, high - 1.2);
-              ctx.fillStyle = tone < 0 ? "rgba(0,0,0," + (-tone * 0.34) + ")" : "rgba(255,255,255," + (tone * 0.22) + ")";
-              ctx.fillRect(left + 0.6, y * high + 0.6, wide - 1.2, high - 1.2);
-              ctx.fillStyle = "rgba(0,0,0,0.14)";
-              ctx.fillRect(left + 0.6, y * high + high - 1.4, wide - 1.2, 0.8);
-            }
-          }
-          grit(ctx, 32, 0.08);
-          grit(ctx, 128, 0.06);
-        }
-        `,
-        // A window in every bay of a wall. The wall is the wall's colour; the glass and
-        // its white frame are their own, drawn onto mine, and the glass is dark with a
-        // sky over it, which is what a window is from the street by day.
-        `
-        function panes(ctx, mine, size) \{
-          grit(ctx, 6, 0.05);
-          grit(ctx, 64, 0.05);
-          var wide = size * 0.44, high = size * 0.46;
-          var left = (size - wide) / 2, top = size * 0.2;
-          ctx.fillStyle = "rgba(0,0,0,0.30)";
-          ctx.fillRect(left - 3, top - 3, wide + 6, high + 6);
-          ctx.fillStyle = "rgba(255,255,255,0.32)";
-          ctx.fillRect(left - 5, top + high + 3, wide + 10, 2.4);
-          ctx.fillStyle = "rgba(0,0,0,0.22)";
-          ctx.fillRect(left - 5, top + high + 5.4, wide + 10, 1);
-          mine.fillStyle = "#ece8de";
-          mine.fillRect(left - 1.5, top - 1.5, wide + 3, high + 3);
-          var glass = mine.createLinearGradient(0, top, 0, top + high);
-          glass.addColorStop(0, "#5b6f7c");
-          glass.addColorStop(0.5, "#34444f");
-          glass.addColorStop(1, "#28343c");
-          mine.fillStyle = glass;
-          mine.fillRect(left, top, wide, high);
-          mine.fillStyle = "#ece8de";
-          mine.fillRect(left, top + high * 0.36, wide, 1.6);
-          mine.fillRect(left + wide / 2 - 0.8, top, 1.6, high);
-        }
-        `,
-        // Bark: deep fissures running up the trunk and wandering as they go, between
-        // plates of a lighter skin.
-        `
-        function bark(ctx, size) \{
-          grit(ctx, 4, 0.08);
-          grit(ctx, 32, 0.10);
-          for (var i = 0; i < 34; i++) \{
-            var x = rand() * size;
-            var wide = 0.8 + rand() * 2.2;
-            ctx.fillStyle = i % 4 === 0 ? "rgba(255,255,255,0.10)" : "rgba(0,0,0,0.30)";
-            var y = 0;
-            while (y < size) \{
-              var run = 5 + rand() * 14;
-              var at = x;
-              around(size, at, y, wide, function (px, py) \{ ctx.fillRect(px, py, wide, run); });
-              x = x + (rand() - 0.5) * 2.4;
-              y = y + run + rand() * 2;
-            }
-          }
-        }
-        `,
-        // Foliage: a mass of leaves at every depth — lit ones in front, deep shadow
-        // between them — which is what a crown is, rather than a green ball.
-        `
-        function leaves(ctx, size) \{
-          grit(ctx, 4, 0.10);
-          ctx.fillStyle = "rgba(0,0,0,0.20)";
-          ctx.fillRect(0, 0, size, size);
-          for (var i = 0; i < 520; i++) \{
-            var shade = i % 4;
-            var style = shade === 0 ? "rgba(255,255,230,0.20)"
-              : shade === 1 ? "rgba(255,255,255,0.10)"
-              : shade === 2 ? "rgba(0,0,0,0.18)" : "rgba(0,0,0,0.30)";
-            var x = rand() * size, y = rand() * size, r = 1.2 + rand() * 2.6, turn = rand() * 3.14;
-            ctx.fillStyle = style;
-            around(size, x, y, r * 2, function (px, py) \{
-              ctx.beginPath();
-              ctx.ellipse(px, py, r, r * 0.55, turn, 0, 6.284);
-              ctx.fill();
-            });
-          }
-          grit(ctx, 48, 0.08);
-        }
-        `,
-        // Rows of people: the stand's colour in the dark between them, their shirts
-        // their own.
-        `
-        function crowd(ctx, mine, size) \{
-          var rows = 7, high = size / rows;
-          var shirts = ["#c94f3d", "#e8c56a", "#5b86b8", "#ece8e0", "#5f9463",
-            "#a982c4", "#c98da8", "#414850"];
-          for (var r = 0; r < rows; r++) \{
-            ctx.fillStyle = "rgba(0,0,0," + (0.10 + (rows - r) * 0.030) + ")";
-            ctx.fillRect(0, r * high, size, high);
-            ctx.fillStyle = "rgba(0,0,0,0.30)";
-            ctx.fillRect(0, r * high, size, 1.5);
-            for (var i = 0; i < 13; i++) \{
-              var x = (i + 0.5) * size / 13 + (rand() - 0.5) * 2.5;
-              var y = r * high + high * 0.56;
-              mine.fillStyle = shirts[(r * 5 + i * 3) % shirts.length];
-              mine.beginPath();
-              mine.arc(x, y, high * 0.17, 0, 6.284);
-              mine.fill();
-              mine.fillStyle = "#c99a7a";
-              mine.beginPath();
-              mine.arc(x, y - high * 0.24, high * 0.09, 0, 6.284);
-              mine.fill();
-            }
-          }
-        }
-
-        function mesh(ctx, size) \{
-          ctx.clearRect(0, 0, size, size);
-          ctx.lineWidth = 1.5;
-          for (var pass = 0; pass < 2; pass++) \{
-            ctx.strokeStyle = pass ? "rgba(90,90,90,1)" : "rgba(170,170,170,1)";
-            for (var i = -8; i < 16; i++) \{
-              var at = i * size / 8;
-              ctx.beginPath();
-              if (pass) \{
-                ctx.moveTo(at, 0);
-                ctx.lineTo(at + size, size);
-              } else \{
-                ctx.moveTo(at, 0);
-                ctx.lineTo(at - size, size);
-              }
-              ctx.stroke();
-            }
-          }
-        }
-
-        function rubber(ctx, size) \{
-          grit(ctx, 8, 0.05);
-          grit(ctx, 96, 0.08);
-          for (var i = 0; i < 40; i++) \{
-            var y = rand() * size;
-            ctx.strokeStyle = "rgba(0,0,0,0.09)";
-            ctx.lineWidth = 2 + rand() * 3;
-            ctx.beginPath();
-            ctx.moveTo(0, y);
-            ctx.lineTo(size, y);
-            ctx.stroke();
-          }
-        }
-        `,
-        // Glass: the reflections are the light's now, so a pane is clear but for the
-        // frame round its edge and the faintest smear.
-        `
-        function glass(ctx, size) \{
-          grit(ctx, 8, 0.03);
-          ctx.strokeStyle = "rgba(0,0,0,0.35)";
-          ctx.lineWidth = 2;
-          ctx.strokeRect(1, 1, size - 2, size - 2);
-        }
-        `,
-        // The mottling of a plain surface: smooth unevenness and a fine stipple.
-        `
-        function speckle(ctx, size) \{
-          grit(ctx, 6, 0.035);
-          grit(ctx, 48, 0.04);
-          for (var i = 0; i < 90; i++) \{
-            dot(ctx, size, rand() * size, rand() * size, 0.5 + rand() * 1.5,
-              i % 2 ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.09)");
-          }
-        }
-        `,
-        // A label is words drawn once onto a canvas and kept: a name over somebody's head
-        // does not change while they are running around, so the texture for it is made
-        // the first time it is seen and reused every frame after.
-        `
-        function sign(text, colour) \{
-          var key = text + "|" + colour;
-          var kept = signs.get(key);
-          if (kept) \{ return kept; }
-          var pad = 16, size = 52;
-          var face = "bold " + size + "px system-ui, -apple-system, Segoe UI, sans-serif";
-          var canvas = document.createElement("canvas");
-          var ctx = canvas.getContext("2d");
-          ctx.font = face;
-          canvas.width = Math.ceil(ctx.measureText(text).width) + pad * 2;
-          canvas.height = size + pad * 2;
         `,
-        // Sizing the canvas resets everything about the context, so the font goes on
-        // again after it.
-        //
         // --- the clock -------------------------------------------------------------
-        `
-          ctx = canvas.getContext("2d");
-          ctx.font = face;
-          ctx.fillStyle = "rgba(10,12,16,0.5)";
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
-          ctx.fillStyle = colour;
-          ctx.textBaseline = "middle";
-          ctx.fillText(text, pad, canvas.height / 2 + 2);
-          var tex = new THREE.CanvasTexture(canvas);
-          tex.colorSpace = THREE.SRGBColorSpace;
-          tex.userData.aspect = canvas.width / canvas.height;
-          signs.set(key, tex);
-          return tex;
-        }
-        `,
+        //
         // The browser's own frame, which is the only clock worth stepping a picture by:
         // it is the refresh rate, it stops while the window is hidden, and it never runs
         // twice for one paint.
@@ -16779,7 +13885,7 @@ func uiSceneJs(): Str {
         function tick(now) \{
           requestAnimationFrame(tick);
           paced(now);
-          if (!renderer || !host) \{ last = now; return; }
+          if (!engine || !host) \{ last = now; return; }
           follow(false);
           if (needFull && post("resync", "", 0)) \{ needFull = false; }
           if (lookX || lookY) \{
@@ -16790,14 +13896,10 @@ func uiSceneJs(): Str {
           if (want.indexOf("p") >= 0) \{ pads(); touches(); }
           reported(now);
           if (pendingScenes.length) \{ flushScene(); }
-          if (dirty) \{
-            if (handheld()) \{ blown(); dirty = false; return; }
-            renderer.render(stage, camera);
-        `,
-        // After the picture and never instead of it: an inset is set *into* what
-        // the scene drew, so whatever it covers has already been drawn under it.
-        `
-            if (looks.length) \{ insets(); }
+          answer();
+          if (dirty || engine._hs_stale()) \{
+            insets();
+            engine._hs_draw();
             dirty = false;
           }
         }
@@ -17429,7 +14531,7 @@ func uiSceneJs(): Str {
           document.addEventListener("mousedown", function (e) \{
             if (world && world.grab && !grabbing) \{
               if (interactive(e.target)) \{ return; }
-              renderer.domElement.requestPointerLock();
+              canvas.requestPointerLock();
               e.preventDefault();
               return;
             }
@@ -17440,7 +14542,7 @@ func uiSceneJs(): Str {
           });
           holder.addEventListener("contextmenu", function (e) \{ if (grabbing) \{ e.preventDefault(); } });
           document.addEventListener("pointerlockchange", function () \{
-            grabbing = document.pointerLockElement === renderer.domElement;
+            grabbing = document.pointerLockElement === canvas;
             if (!grabbing) \{ release(); }
             if (want.indexOf("g") >= 0) \{ post("grab", grabbing ? "1" : "", 0); }
           });
@@ -17737,7 +14839,18 @@ func uiSceneJs(): Str {
           return k.toLowerCase();
         }
 
-        window.hiveSceneReady(paint, attach);
+        summon(\{wanted: function (kind, first, second) \{ asks.push([kind, first, second]); }}).then(function (made) \{
+          var name = made.stringToNewUTF8("#h-world-canvas");
+          var started = made._hs_start(name);
+          made._free(name);
+          if (!started) \{
+            console.error("hive: this window cannot draw a scene");
+            return;
+          }
+          engine = made;
+          listen();
+          window.hiveSceneReady(paint, attach);
+        });
         ~BT~
         `
     ], "\n\n")

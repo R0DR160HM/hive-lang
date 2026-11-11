@@ -76,11 +76,12 @@ If `run` says `go` is not on the `PATH`, the compiler is installed and Go is not
 | `PATH` | where `go` and `git` are found |
 | `HOME` (`USERPROFILE` on Windows) | where the cache goes: `~/.hive` |
 | `HIVE_PROGRESS` | `1` always reports progress, `0` never; unset, only when standard error is a terminal |
+| `HIVE_SCENE_DIST` | a directory of scene engines to build with, rather than the ones this compiler fetches |
 | `GOTOOLCHAIN`, `GOFLAGS`, `GOPROXY`, … | Go's own, since a build runs Go |
 
 ```
 ~/.hive/pkg/<repo>@<commit>/   remote imports, cloned once
-~/.hive/vendor/three@0.180.0/  the three.js a scene is drawn with
+~/.hive/vendor/scene@<version>/ the engine a scene is drawn by
 ~/.hive/tool/godecl/           the reader for imported Go files
 ~/.hive/syslink.key            the cluster key hive.syslink nodes share
 ~/.hive/android.key            the key hive export signs apps with
@@ -111,6 +112,24 @@ HIVEC=/tmp/hivec-linux-amd64 ./bootstrap    # the release builds src/hivec
 After that, `./hive` (`hive.cmd` on Windows) runs the compiler in `src/`. The
 compiler imports a Go file, so even `./hive check src/hivec.hive` needs Go.
 [`seed/README.md`](seed/README.md) says how a release becomes the next seed.
+
+### The scene engine
+
+A release's compiler fetches the engine a `hive.ui.scene` is drawn by from its own
+release, against digests written into it. One built from source has none written
+in and takes what is in `~/.hive/vendor/scene@dev/`, so a scene compiles once
+that holds an engine — a release's:
+
+```sh
+gh release download "$tag" --pattern 'hive-scene*' --dir ~/.hive/vendor/scene@dev
+```
+
+or the one in [`scene/`](scene/README.md), built here:
+
+```sh
+scene/build        # the engine a window starts beside itself, for this machine
+scene/build web    # the engine a page runs
+```
 
 ### For another platform
 

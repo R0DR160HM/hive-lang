@@ -16,7 +16,72 @@ permissions:
   contents: read
 
 jobs:
+  # The engine a `hive.ui.scene` is drawn by, built the three ways it is run: the
+  # process a window starts beside itself on Linux and on Windows, and the
+  # WebAssembly a page runs. A job of its own because none of it is Hive — it is
+  # C++ against Filament — and because everything after it needs what it makes:
+  # a compiler built from source embeds whatever engines it is pointed at.
+  #
+  # `scene/build` fetches what it builds against and pins it, so all this adds is
+  # a compiler. Filament's libraries are built with a libc++ newer than the
+  # runner's own, and the runner is the oldest still offered so that the engine
+  # asks for no newer a C library than it has to.
+  #
+  # What is cached is what was fetched and, for the web, Filament built for
+  # WebAssembly: it publishes no such libraries, and building them is most of an
+  # hour that only a change to `scene/build`'s pins should cost again.
+  scene:
+    strategy:
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-22.04
+            what: ''
+          - name: windows
+            os: windows-latest
+            what: ''
+          - name: web
+            os: ubuntu-22.04
+            what: web
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore what it is built against
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.hive/vendor/filament@*/linux
+            ~/.hive/vendor/filament@*/windows
+            ~/.hive/vendor/filament@*/wasm
+            ~/.hive/vendor/filament@*/third
+          key: scene-${{ matrix.name }}-${{ hashFiles('scene/build') }}
+
+      - name: A compiler new enough for Filament
+        if: runner.os == 'Linux'
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
+          sudo apt-get install -y libc++-18-dev libc++abi-18-dev ninja-build \
+            libglu1-mesa-dev libxi-dev libxcomposite-dev libxxf86vm-dev
+          echo "CC=clang-18" >> "$GITHUB_ENV"
+          echo "CXX=clang++-18" >> "$GITHUB_ENV"
+
+      - name: Build it
+        shell: bash
+        run: |
+          scene/build ${{ matrix.what }} dist
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scene-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
+
   build:
+    needs: scene
     runs-on: ubuntu-latest
     # The compiler is twenty-three thousand lines and the chain compiles it
     # four times over. On a runner that is most of an hour.
@@ -32,9 +97,9 @@ jobs:
           go-version: '1.24'
           cache: false
 
-      # Go's own caches, and the one the compiler keeps: a fetched three.js and
-      # the reader it writes for describing a Go file. Both are re-fetchable, so
-      # a cache miss costs a download rather than a failure.
+      # Go's own caches, and the one the compiler keeps: the reader it writes for
+      # describing a Go file. Re-fetchable, so a cache miss costs a download
+      # rather than a failure.
       - name: Restore the caches
         uses: actions/cache@v4
         with:
@@ -45,6 +110,34 @@ jobs:
           key: hive-${{ runner.os }}-${{ hashFiles('src/**/*.hive', 'seed/pinned.txt') }}
           restore-keys: |
             hive-${{ runner.os }}-
+
+      # The engines the `scene` job built, and the compiler told to look there: the
+      # tests and the examples below draw with what this commit's `scene/` is.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: scene-*
+          path: scene-dist
+          merge-multiple: true
+
+      - name: Point the compiler at the engines
+        run: |
+          ls -l scene-dist
+          echo "HIVE_SCENE_DIST=$PWD/scene-dist" >> "$GITHUB_ENV"
+
+      # A released compiler fetches its engines from its own release and trusts
+      # them as far as their digests go, so on a tag the digests are written in:
+      # the same rewrite, and the same read-back, as the version below.
+      - name: Stamp the engines into the compiler
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          for file in hive-scene-windows-amd64.exe hive-scene-linux-amd64 hive-scene.js hive-scene.wasm; do
+            sum=$(sha256sum "scene-dist/$file" | cut -d' ' -f1)
+            sed -i "/^    if file == \"$file\" {\$/{n;s|return \"[0-9a-f]*\"|return \"$sum\"|;}" src/vendor.hive
+            if ! grep -A1 "^    if file == \"$file\" {\$" src/vendor.hive | grep -q "return \"$sum\""; then
+              echo "::error file=src/vendor.hive::could not write the digest of $file into engineDigest in src/vendor.hive. The lines this rewrites are 'if file == \"$file\" {' and the 'return \"\"' under it."
+              exit 1
+            fi
+          done
 
       # Every Dockerfile `hive container` writes downloads the compiler that wrote
       # it, by the release named in src/version.hive — so on a tag, the tag is
@@ -128,7 +221,7 @@ jobs:
         run: ./test/run
 
       # Twenty-one programs, five of them with test suites of their own. This is
-      # the step that needs a network: the SQL drivers and a scene's three.js.
+      # the step that needs a network, for the SQL drivers.
       - name: Every example
         run: ./examples/run
 
@@ -155,7 +248,8 @@ jobs:
             echo "  $name — $(du -h "../../dist/$name" | cut -f1)"
           done
           cd ../..
-          cd dist && sha256sum hivec-* > SHA256SUMS && cd ..
+          cp scene-dist/hive-scene* dist/
+          cd dist && sha256sum hivec-* hive-scene* > SHA256SUMS && cd ..
           cat dist/SHA256SUMS
 
       - name: Keep them
@@ -226,6 +320,7 @@ jobs:
           mkdir -p .seed
           cp dist/hivec-windows-amd64.exe .seed/hivec.exe
           cp dist/hivec-windows-amd64.exe src/hivec.exe
+          echo "HIVE_SCENE_DIST=$(pwd -W)/dist" >> "$GITHUB_ENV"
 
       # The one thing no Linux runner can fail: cmd.exe completes a filename with
       # `\`, and an entrypoint spelled that way is what every import resolves
@@ -366,9 +461,9 @@ jobs:
           } > notes.md
 
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" hivec-* hive-windows.msi SHA256SUMS --clobber
+            gh release upload "$tag" hivec-* hive-scene* hive-windows.msi SHA256SUMS --clobber
             gh release edit "$tag" --notes-file notes.md
           else
-            gh release create "$tag" hivec-* hive-windows.msi SHA256SUMS \
+            gh release create "$tag" hivec-* hive-scene* hive-windows.msi SHA256SUMS \
               --title "$tag" --notes-file notes.md
           fi

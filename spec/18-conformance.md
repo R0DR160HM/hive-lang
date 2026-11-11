@@ -88,8 +88,8 @@ All of it.
 
 A module nothing reaches for is still not in the build: what a program links is
 what it named. `hive.sql` is the one that carries dependencies (its two drivers)
-and `hive.ui.scene` the one that carries a download (a pinned three.js, fetched
-once against its SHA-256 and embedded), and a program that opens no database and
+and `hive.ui.scene` the one that carries a download (the engine that draws it,
+fetched once against its SHA-256 and embedded), and a program that opens no database and
 draws no scene fetches neither.
 
 ### Where it deviates

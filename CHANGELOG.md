@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.3.5
+
+### Standard library
+
+* **A `scene` is drawn by [Filament](https://github.com/google/filament)**, through an engine of Hive's own in `scene/`, and three.js is gone.
+* **Windows and Linux draw a window with a `scene` in it themselves**, on amd64: the engine runs beside the program, on Vulkan or OpenGL, and no browser opens.
+* **A page draws with the same engine, as WebAssembly**, so a scene looks the same wherever it is shown.
+
+### Tooling
+
+* **`scene/build`** builds the engine; a release's compiler fetches its own against pinned digests, and `HIVE_SCENE_DIST` names a directory to take it from instead.
+
 ## v0.3.4
 
 ### Standard library
