@@ -62,28 +62,43 @@ jobs:
             ~/.hive/vendor/filament@*/third
           key: scene-${{ matrix.name }}-${{ hashFiles('scene/build') }}
 
-      # Only what the build uses, and asked for again when an archive does not
-      # answer. LLVM's own installer brings a debugger and a language server
-      # besides, and it was their packages a runner could not fetch the one time
-      # it could not find Ubuntu's mirror.
+      # Only what the build uses. LLVM's own installer brings a debugger and a
+      # language server besides, and it was their packages a runner could not
+      # fetch the first time this ran.
+      #
+      # That runner could not find Ubuntu's archive at all, under any of the
+      # three names it knows it by, for most of an hour. So where the archive
+      # does not answer its packages come from kernel.org's mirror of it, which
+      # is safe to take them from: apt holds every one against Ubuntu's own
+      # signature, wherever it was fetched.
       - name: A compiler new enough for Filament
         if: runner.os == 'Linux'
         run: |
           release=$(lsb_release -cs)
+          elsewhere() {
+            echo "::warning::Ubuntu's archive does not answer from this runner. Its packages are being taken from kernel.org's mirror of it."
+            printf 'https://mirrors.edge.kernel.org/ubuntu/\tpriority:1\n' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+          }
+          if ! getent hosts azure.archive.ubuntu.com archive.ubuntu.com > /dev/null; then elsewhere; fi
           wget -qO- --tries=5 https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
           echo "deb https://apt.llvm.org/$release/ llvm-toolchain-$release-18 main" | sudo tee /etc/apt/sources.list.d/llvm-18.list > /dev/null
-          for attempt in 1 2 3 4 5; do
+          sudo apt-get update 2>&1 | tee "$RUNNER_TEMP/update.log" || true
+          if grep -q 'Failed to fetch mirror+file' "$RUNNER_TEMP/update.log" && ! grep -q kernel.org /etc/apt/apt-mirrors.txt; then
+            elsewhere
             sudo apt-get update || true
+          fi
+          for attempt in 1 2 3; do
             if sudo apt-get install -y -o Acquire::Retries=3 clang-18 lld-18 libc++-18-dev libc++abi-18-dev ninja-build \
               libgl1-mesa-dev libglu1-mesa-dev libxi-dev libxcomposite-dev libxxf86vm-dev; then
               break
             fi
-            if [ "$attempt" = 5 ]; then
-              echo "::error::apt could not fetch what the engine is built with, five times over."
+            if [ "$attempt" = 3 ]; then
+              echo "::error::apt could not fetch what the engine is built with, three times over."
               exit 1
             fi
-            echo "::warning::apt could not fetch everything (attempt $attempt of 5). Trying again in a minute."
-            sleep 60
+            echo "::warning::apt could not fetch everything (attempt $attempt of 3). Trying again in half a minute."
+            sleep 30
+            sudo apt-get update || true
           done
           echo "CC=clang-18" >> "$GITHUB_ENV"
           echo "CXX=clang++-18" >> "$GITHUB_ENV"
