@@ -12,7 +12,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -51,8 +53,11 @@ void put16(std::string& out, size_t v) {
     out.push_back(char(v >> 8));
 }
 
+std::mutex saying;
+
 void say(char kind, const std::string& body) {
     if (!said) { return; }
+    std::lock_guard<std::mutex> held(saying);
     std::string head(1, kind);
     put32(head, uint32_t(body.size()));
     fwrite(head.data(), 1, head.size(), said);
@@ -186,13 +191,14 @@ struct Seat {
 
     double draw(hive::World& world) {
         auto began = std::chrono::steady_clock::now();
-        if (renderer->beginFrame(chain)) {
-            world.draw(*renderer, false, true);
-            renderer->readPixels(0, 0, uint32_t(wide), uint32_t(tall),
-                backend::PixelBufferDescriptor(memory.at, memory.size, backend::PixelDataFormat::RGBA,
-                    backend::PixelDataType::UBYTE));
-            renderer->endFrame();
-        }
+        // Drawn whatever Filament says of its pace: the window asked, and waits for this picture.
+        world.ready(false, true);
+        renderer->beginFrame(chain);
+        world.draw(*renderer);
+        renderer->readPixels(0, 0, uint32_t(wide), uint32_t(tall),
+            backend::PixelBufferDescriptor(memory.at, memory.size, backend::PixelDataFormat::RGBA,
+                backend::PixelDataType::UBYTE));
+        renderer->endFrame();
         engine->flushAndWait();
         return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - began).count();
     }
@@ -250,6 +256,13 @@ int main(int argc, char** argv) {
     {
         hive::World world(*seat.engine, asking);
         hive::Sound sound([](const std::string& path) { say('f', path); });
+        // A stream ends in its own time, and a still scene sends nothing to be woken by.
+        std::thread([&sound]() {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                for (const std::string& name : sound.spent()) { say('a', name); }
+            }
+        }).detach();
         say('R', "");
 
         char kind = 0;
@@ -345,6 +358,23 @@ int main(int argc, char** argv) {
             case 'V':
                 sound.loud(body.empty() ? 1.0f : float(body[0]) / 255.0f);
                 break;
+            case 'A': {
+                if (replay || body.empty()) { break; }
+                int what = body[0];
+                r.at = 1;
+                std::string name = r.named();
+                float loud = r.left() > 0 ? float(*r.rest()) / 255.0f : 1.0f;
+                if (what == 0) {
+                    sound.shut(name);
+                } else if (what == 1) {
+                    sound.open(name, loud);
+                } else if (what == 2) {
+                    sound.feed(name, r.rest(), r.left());
+                } else if (what == 3) {
+                    sound.turn(name, loud);
+                }
+                break;
+            }
             default:
                 break;
             }

@@ -58,8 +58,11 @@ public:
     void sized(int sheetWide, int sheetTall, int drawnWide, int drawnTall);
     void insetsAt(const std::vector<Box>& boxes);
 
-    // Between beginFrame and endFrame; a window reading the picture back wants red and blue traded.
-    void draw(filament::Renderer& renderer, bool upsideDown, bool traded);
+    // Before beginFrame, which is when Filament takes what a material was told: a
+    // window reading the picture back wants red and blue traded.
+    void ready(bool upsideDown, bool traded);
+    // Between beginFrame and endFrame.
+    void draw(filament::Renderer& renderer);
 
     void picture(const std::string& path, int wide, int tall, const uint8_t* rgba);
     void file(const std::string& path, const uint8_t* data, size_t size, bool found);

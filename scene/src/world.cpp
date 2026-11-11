@@ -396,6 +396,7 @@ struct World::Inner {
     std::vector<Eye> looks;
     std::vector<Box> boxes;
     std::vector<Sight> insets;
+    std::vector<Sight*> drawing;
     Sight main;
     View* sheetView = nullptr;
     Camera* sheetCamera = nullptr;
@@ -1834,7 +1835,7 @@ struct World::Inner {
         l.staged = on;
     }
 
-    void render(Renderer& renderer, bool upsideDown, bool swapped) {
+    void ready(bool upsideDown, bool swapped) {
         upside = upsideDown;
         traded = swapped;
         float shrink = 1;
@@ -1856,7 +1857,7 @@ struct World::Inner {
             insets.pop_back();
         }
         float density = float(sheetWide) / float(std::max(1, drawnWide));
-        std::vector<Sight*> drawn;
+        drawing.clear();
         for (size_t i = 0; i < insets.size(); i++) {
             Sight& l = insets[i];
             Box box = i < boxes.size() ? boxes[i] : Box();
@@ -1872,7 +1873,7 @@ struct World::Inner {
             l.view->setShadowingEnabled(!world.flat);
             laidOut(l, float(left), float(top), float(right - left), float(low - top));
             staged(l, true);
-            drawn.push_back(&l);
+            drawing.push_back(&l);
         }
 
         for (auto& all : batches) {
@@ -1912,9 +1913,11 @@ struct World::Inner {
             c.high = -1;
         }
         ruled();
+    }
 
+    void render(Renderer& renderer) {
         renderer.render(main.view);
-        for (Sight* l : drawn) { renderer.render(l->view); }
+        for (Sight* l : drawing) { renderer.render(l->view); }
         renderer.render(sheetView);
         for (size_t i = 0; i < spent.size();) {
             if (--spent[i].frames > 0) {
@@ -1960,7 +1963,9 @@ void World::insetsAt(const std::vector<Box>& boxes) {
     in->dirty = true;
 }
 
-void World::draw(Renderer& renderer, bool upsideDown, bool traded) { in->render(renderer, upsideDown, traded); }
+void World::ready(bool upsideDown, bool traded) { in->ready(upsideDown, traded); }
+
+void World::draw(Renderer& renderer) { in->render(renderer); }
 
 void World::picture(const std::string& path, int wide, int tall, const uint8_t* rgba) {
     Inner& w = *in;

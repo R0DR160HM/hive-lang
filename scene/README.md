@@ -33,7 +33,7 @@ src/shapes.*     the unit geometry of every kind of solid
 src/surfaces.*   the nineteen finishes, drawn rather than shipped
 src/canvas.*     the little of a 2D canvas those drawings need
 src/model.*      a figure's file: a skinned glTF binary
-src/sound.*      what a world sounds like (native; a page uses Web Audio)
+src/sound.*      what a world sounds like, and what hive.audio plays (native; a page uses Web Audio)
 src/native.cpp   the process a window starts
 src/web.cpp      the functions a page calls
 materials/       Filament materials, compiled by matc and baked into the binary
@@ -60,6 +60,7 @@ In, from the window:
 | `t` | named id, bytes | a terrain's numbers |
 | `l` | named words, named colour, `u32` wide, tall, RGBA | a label, drawn in the window's typeface |
 | `V` | `u8` | how loud, of 255 |
+| `A` | `u8` what, named stream, the rest | a `hive.audio` stream: 1 opens it at a `u8` volume, 2 is more of its bytes (none: no more are coming), 3 is a new volume, 0 shuts it |
 | `Q` | | stop |
 
 Out, to the window:
@@ -73,6 +74,7 @@ Out, to the window:
 | `C` | | something asked for arrived, and the picture is stale |
 | `p` `f` `t` | a path or an id | asking for a picture, a file, a terrain |
 | `l` | `u16` length, words, then the colour | asking for a label |
+| `a` | a stream's name | that stream has played all it was fed |
 
 "Named" is a `u16` length and that many bytes. Pixels are straight alpha, rows
 from the top.

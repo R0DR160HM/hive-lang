@@ -158,8 +158,9 @@ EMSCRIPTEN_KEEPALIVE void hs_insets(const int32_t* at, int many) {
 
 EMSCRIPTEN_KEEPALIVE void hs_draw() {
     if (!world) { return; }
+    world->ready(false, false);
     if (renderer->beginFrame(chain)) {
-        world->draw(*renderer, false, false);
+        world->draw(*renderer);
         renderer->endFrame();
     }
     engine->execute();

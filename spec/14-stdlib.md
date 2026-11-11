@@ -786,9 +786,7 @@ serves through XWayland — and sets it in the system's own sans-serif, read and
 drawn by the program, so neither needs a C compiler to build. A Linux machine
 with no display or no usable font gets the page, and so do macOS and Android. A
 `scene` there is drawn by its engine, started beside the program
-([14.16](#1416-hiveuiscene)) — unless the program also plays
-[`hive.audio`](#1417-hiveaudio), which is a page's to play, and then the window is
-a page. The layout is modelled on
+([14.16](#1416-hiveuiscene)). The layout is modelled on
 [Clay](https://github.com/nicbarker/clay), by Nic Barker.
 
 **Such a window behaves as a page would.** Its text is selected and copied, a
@@ -1528,3 +1526,8 @@ and of the whole set when it connects, so a window opened or reloaded later play
 what is wanted by then; nothing is heard while no window is open. A stream that
 drops is picked up again after a moment, and one the window refused for want of a
 gesture starts on the next key or tap. The module uses nothing of `hive.ui`.
+
+**A window the program draws itself plays it through its scene's engine**
+([14.16](#1416-hiveuiscene)): a stream in MP3, which is what most stations send,
+and a recording in MP3, Ogg Vorbis, FLAC or WAV. One with no scene in it has no
+engine, and plays nothing.

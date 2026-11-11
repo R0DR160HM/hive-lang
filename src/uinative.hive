@@ -20074,8 +20074,9 @@ func fontVarSource(): Str {
 // A paint waits for the picture a turn asked for, so that what is over the world
 // and the world come from the same turn.
 //
-// A program that also needs something only a page does — `hive.audio` plays
-// through one — keeps the page, as every scene did before.
+// What `hive.audio` wants played is played here too. The window listens to the
+// same feed a page would, fetches each stream itself, and hands the engine its
+// bytes; one that runs out is started again after a moment, as a page does.
 func sceneSource(): Str {
     return `
         //go:build windows || (linux && !android)
@@ -20084,16 +20085,21 @@ func sceneSource(): Str {
 
         import (
         	"bytes"
+        	"context"
         	"crypto/sha256"
         	"encoding/hex"
+        	"encoding/json"
         	"image"
         	"image/draw"
         	"math"
+        	"net/http"
+        	"net/url"
         	"os"
         	"path/filepath"
         	"runtime"
         	"sort"
         	"strconv"
+        	"strings"
         	"sync"
         	"sync/atomic"
         	"time"
@@ -20102,9 +20108,185 @@ func sceneSource(): Str {
 
         func init() \{
         	uiStageMake = func(n *uiNative) uiStaging \{
-        		return &uiStage\{n: n, held: map[string]bool\{}, whole: true, tally: os.Getenv("HIVE_FOLDS") != ""}
+        		s := &uiStage\{n: n, held: map[string]bool\{}, whole: true, tally: os.Getenv("HIVE_FOLDS") != ""}
+        		s.radio.watch()
+        		return s
         	}
-        	uiStageReady = func() bool \{ return len(hivePageScripts) == 0 && uiEngineProbe() }
+        	uiStageReady = uiEngineProbe
+        }
+
+        type uiTuned struct \{
+        	from string
+        	loud float64
+        }
+
+        type uiPlayed struct \{
+        	uiTuned
+        	stop context.CancelFunc
+        }
+
+        type uiRadio struct \{
+        	mu      sync.Mutex
+        	engine  *uiEngine
+        	wanted  map[string]uiTuned
+        	playing map[string]*uiPlayed
+        }
+
+        type uiRadioSaid struct \{
+        	head  http.Header
+        	held  []byte
+        	radio *uiRadio
+        }
+
+        func (w *uiRadioSaid) Header() http.Header \{ return w.head }
+
+        func (w *uiRadioSaid) WriteHeader(int) \{}
+
+        func (w *uiRadioSaid) Write(b []byte) (int, error) \{
+        	w.held = append(w.held, b...)
+        	return len(b), nil
+        }
+
+        func (w *uiRadioSaid) Flush() \{
+        	said := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(w.held)), "data:"))
+        	w.held = w.held[:0]
+        	var streams map[string]map[string]any
+        	if json.Unmarshal([]byte(said), &streams) != nil \{
+        		return
+        	}
+        	wanted := map[string]uiTuned\{}
+        	for name, stream := range streams \{
+        		from, _ := stream["url"].(string)
+        		loud, _ := stream["volume"].(float64)
+        		wanted[name] = uiTuned\{from, loud}
+        	}
+        	w.radio.mu.Lock()
+        	w.radio.wanted = wanted
+        	w.radio.settle()
+        	w.radio.mu.Unlock()
+        }
+
+        func (r *uiRadio) watch() \{
+        	serve, ok := hivePageRoutes["/_hive/audio"].(func(http.ResponseWriter, *http.Request))
+        	if !ok \{
+        		return
+        	}
+        	req, err := http.NewRequest("GET", "/_hive/audio", nil)
+        	if err != nil \{
+        		return
+        	}
+        	go serve(&uiRadioSaid\{head: http.Header\{}, radio: r}, req)
+        }
+
+        func (r *uiRadio) onto(e *uiEngine) \{
+        	r.mu.Lock()
+        	defer r.mu.Unlock()
+        	for name, p := range r.playing \{
+        		p.stop()
+        		delete(r.playing, name)
+        	}
+        	r.engine = e
+        	r.settle()
+        }
+
+        func (r *uiRadio) settle() \{
+        	if r.engine == nil \{
+        		return
+        	}
+        	if r.playing == nil \{
+        		r.playing = map[string]*uiPlayed\{}
+        	}
+        	for name, p := range r.playing \{
+        		if want, ok := r.wanted[name]; !ok || want.from != p.from \{
+        			p.stop()
+        			r.engine.stream(0, name, nil)
+        			delete(r.playing, name)
+        		}
+        	}
+        	for name, want := range r.wanted \{
+        		p := r.playing[name]
+        		if p == nil \{
+        			r.start(name, want)
+        		} else if p.loud != want.loud \{
+        			p.loud = want.loud
+        			r.engine.stream(3, name, []byte\{uiRadioLoud(want.loud)})
+        		}
+        	}
+        }
+
+        func (r *uiRadio) start(name string, want uiTuned) \{
+        	ctx, stop := context.WithCancel(context.Background())
+        	r.playing[name] = &uiPlayed\{want, stop}
+        	e := r.engine
+        	e.stream(1, name, []byte\{uiRadioLoud(want.loud)})
+        	go func() \{
+        		uiRadioFetch(ctx, want.from, func(part []byte) \{
+        			if ctx.Err() == nil \{
+        				e.stream(2, name, part)
+        			}
+        		})
+        		if ctx.Err() == nil \{
+        			e.stream(2, name, nil)
+        		}
+        	}()
+        }
+
+        func (r *uiRadio) again(e *uiEngine, name string) \{
+        	r.mu.Lock()
+        	was := r.playing[name]
+        	r.mu.Unlock()
+        	if was == nil \{
+        		return
+        	}
+        	time.AfterFunc(2*time.Second, func() \{
+        		r.mu.Lock()
+        		defer r.mu.Unlock()
+        		if r.engine != e || r.playing[name] != was \{
+        			return
+        		}
+        		was.stop()
+        		delete(r.playing, name)
+        		r.settle()
+        	})
+        }
+
+        func uiRadioLoud(v float64) byte \{
+        	return byte(math.Round(math.Max(0, math.Min(1, v)) * 255))
+        }
+
+        func uiRadioFetch(ctx context.Context, from string, feed func([]byte)) \{
+        	if strings.HasPrefix(from, "/_hive/asset/") \{
+        		path, err := url.PathUnescape(strings.TrimPrefix(from, "/_hive/asset/"))
+        		if err != nil \{
+        			return
+        		}
+        		if body, ok := uiEngineRead(path); ok && len(body) > 0 \{
+        			feed(body)
+        		}
+        		return
+        	}
+        	req, err := http.NewRequestWithContext(ctx, "GET", from, nil)
+        	if err != nil \{
+        		return
+        	}
+        	res, err := http.DefaultClient.Do(req)
+        	if err != nil \{
+        		return
+        	}
+        	defer res.Body.Close()
+        	if res.StatusCode != http.StatusOK \{
+        		return
+        	}
+        	part := make([]byte, 16384)
+        	for \{
+        		n, err := res.Body.Read(part)
+        		if n > 0 \{
+        			feed(append([]byte(nil), part[:n]...))
+        		}
+        		if err != nil \{
+        			return
+        		}
+        	}
         }
 
         type uiPlaying interface \{
@@ -20122,6 +20304,7 @@ func sceneSource(): Str {
 
         type uiStage struct \{
         	n        *uiNative
+        	radio    uiRadio
         	engine   *uiEngine
         	starting bool
         	failures int
@@ -20222,6 +20405,7 @@ func sceneSource(): Str {
         				s.nudge()
         			}
         			e.stale = func() \{ s.stale.Store(true); s.nudge() }
+        			e.spent = func(name string) \{ s.radio.again(e, name) }
         			e.resync = func() \{ s.lost.Store(true); s.nudge() }
         			e.died = func() \{ s.died.Store(true); s.nudge() }
         			e.picture = uiStagePicture
@@ -20376,6 +20560,7 @@ func sceneSource(): Str {
         	if e := s.begun.Swap(nil); e != nil \{
         		s.engine, s.starting, s.whole = e, false, true
         		s.owed, s.wanted = false, false
+        		s.radio.onto(e)
         		if s.shown && s.n.sceneBox != nil \{
         			s.settle()
         		}
@@ -20385,6 +20570,7 @@ func sceneSource(): Str {
         			s.engine.close()
         		}
         		s.engine, s.starting, s.owed = nil, false, false
+        		s.radio.onto(nil)
         		s.failures++
         		if s.shown \{
         			s.start()
@@ -20782,6 +20968,7 @@ func sceneSource(): Str {
         }
 
         func (s *uiStage) close() \{
+        	s.radio.onto(nil)
         	if s.engine != nil \{
         		s.engine.close()
         		s.engine = nil
@@ -20880,6 +21067,7 @@ func engineSource(): Str {
         	shares int
 
         	painted func(serial uint32, wide, tall int, micros int)
+        	spent   func(name string)
         	stale   func()
         	resync  func()
         	picture func(path string) (int, int, []byte)
@@ -20977,6 +21165,10 @@ func engineSource(): Str {
 
         func (e *uiEngine) frame(payload []byte) \{ e.say('S', payload[1:]) }
 
+        func (e *uiEngine) stream(what byte, name string, rest []byte) \{
+        	e.say('A', []byte\{what}, uiEngineNamed(name), rest)
+        }
+
         func (e *uiEngine) size(sheetWide, sheetTall, drawnWide, drawnTall int) bool \{
         	e.mu.Lock()
         	e.shares++
@@ -21072,6 +21264,10 @@ func engineSource(): Str {
         			go e.answerPicture(string(body))
         		case 'f':
         			go e.answerFile(string(body))
+        		case 'a':
+        			if e.spent != nil \{
+        				e.spent(string(body))
+        			}
         		case 't':
         			id := string(body)
         			uiTerrainLock.Lock()

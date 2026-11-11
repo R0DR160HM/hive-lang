@@ -14,7 +14,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <set>
@@ -154,6 +158,117 @@ float noteOf(int step) { return 55 * std::pow(2.0f, float(step) / 12); }
 
 bool strikes(const std::string& kind) { return kind == "Impact" || kind == "Chime" || kind == "Talk"; }
 
+// A stream's bytes arrive at whatever pace the network keeps, are decoded off to
+// one side, and are played out of the two seconds of sound that came of them.
+struct Stream {
+    static const size_t ROOM = 96000;
+    std::mutex lock;
+    std::condition_variable woke;
+    std::deque<uint8_t> fed;
+    bool over = false;
+    std::atomic<bool> gone{false}, spent{false};
+    std::vector<float> ring = std::vector<float>(ROOM * 2);
+    std::atomic<size_t> wrote{0}, read{0};
+    std::atomic<float> volume{1};
+    bool going = false, said = false;
+};
+
+size_t taken(Stream& s, uint8_t* out, size_t want) {
+    std::unique_lock<std::mutex> held(s.lock);
+    s.woke.wait(held, [&] { return s.fed.size() >= want || s.over || s.gone; });
+    size_t n = s.gone ? 0 : std::min(want, s.fed.size());
+    if (out) { std::copy(s.fed.begin(), s.fed.begin() + long(n), out); }
+    s.fed.erase(s.fed.begin(), s.fed.begin() + long(n));
+    return n;
+}
+
+size_t pulled(void* stream, void* out, size_t want) {
+    return taken(*static_cast<Stream*>(stream), static_cast<uint8_t*>(out), want);
+}
+
+// What cannot be gone back over can still be skipped.
+ma_bool32 skipped(void* stream, int offset, ma_dr_mp3_seek_origin origin) {
+    if (origin != ma_dr_mp3_seek_origin_current || offset < 0) { return MA_FALSE; }
+    return taken(*static_cast<Stream*>(stream), nullptr, size_t(offset)) == size_t(offset) ? MA_TRUE : MA_FALSE;
+}
+
+void pushed(Stream& s, const float* frames, size_t many) {
+    size_t at = 0;
+    while (at < many && !s.gone) {
+        size_t w = s.wrote.load(), held = w - s.read.load();
+        if (held >= Stream::ROOM) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        size_t n = std::min(many - at, Stream::ROOM - held);
+        for (size_t i = 0; i < n; i++) {
+            size_t to = ((w + i) % Stream::ROOM) * 2;
+            s.ring[to] = frames[(at + i) * 2];
+            s.ring[to + 1] = frames[(at + i) * 2 + 1];
+        }
+        s.wrote.store(w + n);
+        at += n;
+    }
+}
+
+// An MP3 is decoded as it comes, which is what a station sends. Anything else is a
+// recording, and is decoded once the whole of it is here.
+void played(std::shared_ptr<Stream> s) {
+    uint8_t mark[4] = {0, 0, 0, 0};
+    {
+        std::unique_lock<std::mutex> held(s->lock);
+        s->woke.wait(held, [&] { return s->fed.size() >= 4 || s->over || s->gone; });
+        for (size_t i = 0; i < 4 && i < s->fed.size(); i++) { mark[i] = s->fed[i]; }
+    }
+    bool whole = !memcmp(mark, "OggS", 4) || !memcmp(mark, "fLaC", 4) || !memcmp(mark, "RIFF", 4);
+    if (whole) {
+        std::vector<uint8_t> bytes;
+        {
+            std::unique_lock<std::mutex> held(s->lock);
+            s->woke.wait(held, [&] { return s->over || s->gone; });
+            bytes.assign(s->fed.begin(), s->fed.end());
+            s->fed.clear();
+        }
+        ma_decoder_config config = ma_decoder_config_init(ma_format_f32, 2, ma_uint32(RATE));
+        ma_uint64 frames = 0;
+        void* pcm = nullptr;
+        if (!s->gone && ma_decode_memory(bytes.data(), bytes.size(), &config, &frames, &pcm) == MA_SUCCESS) {
+            pushed(*s, static_cast<float*>(pcm), size_t(frames));
+            ma_free(pcm, nullptr);
+        }
+        s->spent = true;
+        return;
+    }
+    ma_dr_mp3 mp3;
+    if (!ma_dr_mp3_init(&mp3, pulled, skipped, s.get(), nullptr)) {
+        s->spent = true;
+        return;
+    }
+    ma_data_converter_config shape = ma_data_converter_config_init(ma_format_f32, ma_format_f32, mp3.channels, 2,
+        mp3.sampleRate, ma_uint32(RATE));
+    ma_data_converter fitted;
+    if (ma_data_converter_init(&shape, nullptr, &fitted) == MA_SUCCESS) {
+        std::vector<float> in(1152 * mp3.channels), out(4096 * 2);
+        while (!s->gone) {
+            ma_uint64 got = ma_dr_mp3_read_pcm_frames_f32(&mp3, 1152, in.data());
+            if (got == 0) { break; }
+            ma_uint64 at = 0;
+            while (at < got) {
+                ma_uint64 took = got - at, made = 4096;
+                if (ma_data_converter_process_pcm_frames(&fitted, in.data() + at * mp3.channels, &took, out.data(),
+                        &made) != MA_SUCCESS || (took == 0 && made == 0)) {
+                    break;
+                }
+                pushed(*s, out.data(), size_t(made));
+                at += took;
+            }
+        }
+        ma_data_converter_uninit(&fitted, nullptr);
+    }
+    ma_dr_mp3_uninit(&mp3);
+    s->spent = true;
+}
+
 } // namespace
 
 struct Sound::Inner {
@@ -168,6 +283,7 @@ struct Sound::Inner {
     std::set<std::string> asked;
     float ear[3] = {0, 0, 0}, ahead[3] = {0, 0, -1};
     float master = 0.8f, level = 1;
+    std::map<std::string, std::shared_ptr<Stream>> streams;
 
     bool open() {
         if (tried) { return opened; }
@@ -454,6 +570,23 @@ struct Sound::Inner {
         }
     }
 
+    // Nothing is heard until a quarter of a second is in hand, and a stream that
+    // runs dry waits for that much again rather than stuttering.
+    void tuned(Stream& s, float* left, float* right, int many) {
+        size_t r = s.read.load(), held = s.wrote.load() - r;
+        if (!s.going) { s.going = held >= size_t(RATE) / 4 || (s.spent && held > 0); }
+        if (!s.going) { return; }
+        size_t n = std::min(held, size_t(many));
+        float loud = s.volume.load();
+        for (size_t i = 0; i < n; i++) {
+            size_t from = ((r + i) % Stream::ROOM) * 2;
+            left[i] += s.ring[from] * loud;
+            right[i] += s.ring[from + 1] * loud;
+        }
+        s.read.store(r + n);
+        if (n < size_t(many)) { s.going = false; }
+    }
+
     void mix(float* out, ma_uint32 frames) {
         std::lock_guard<std::mutex> held(lock);
         float left[CHUNK], right[CHUNK];
@@ -472,8 +605,13 @@ struct Sound::Inner {
                 [](const std::shared_ptr<Voice>& v) { return v->done; }), sounding.end());
             float loud = master * level;
             for (int i = 0; i < many; i++) {
-                out[(at + ma_uint32(i)) * 2] = std::min(1.0f, std::max(-1.0f, left[i] * loud));
-                out[(at + ma_uint32(i)) * 2 + 1] = std::min(1.0f, std::max(-1.0f, right[i] * loud));
+                left[i] *= loud;
+                right[i] *= loud;
+            }
+            for (auto& named : streams) { tuned(*named.second, left, right, many); }
+            for (int i = 0; i < many; i++) {
+                out[(at + ma_uint32(i)) * 2] = std::min(1.0f, std::max(-1.0f, left[i]));
+                out[(at + ma_uint32(i)) * 2 + 1] = std::min(1.0f, std::max(-1.0f, right[i]));
             }
             at += ma_uint32(many);
         }
@@ -520,6 +658,72 @@ bool Sound::file(const std::string& path, const uint8_t* data, size_t size, bool
 void Sound::loud(float volume) {
     std::lock_guard<std::mutex> held(in->lock);
     in->level = volume;
+}
+
+void Sound::open(const std::string& name, float volume) {
+    shut(name);
+    if (!in->open()) { return; }
+    auto stream = std::make_shared<Stream>();
+    stream->volume = volume;
+    {
+        std::lock_guard<std::mutex> held(in->lock);
+        in->streams[name] = stream;
+    }
+    std::thread(played, stream).detach();
+}
+
+void Sound::feed(const std::string& name, const uint8_t* data, size_t size) {
+    std::shared_ptr<Stream> stream;
+    {
+        std::lock_guard<std::mutex> held(in->lock);
+        auto found = in->streams.find(name);
+        if (found == in->streams.end()) { return; }
+        stream = found->second;
+    }
+    {
+        std::lock_guard<std::mutex> held(stream->lock);
+        if (size == 0) {
+            stream->over = true;
+        } else {
+            stream->fed.insert(stream->fed.end(), data, data + size);
+        }
+    }
+    stream->woke.notify_all();
+}
+
+void Sound::turn(const std::string& name, float volume) {
+    std::lock_guard<std::mutex> held(in->lock);
+    auto found = in->streams.find(name);
+    if (found != in->streams.end()) { found->second->volume = volume; }
+}
+
+void Sound::shut(const std::string& name) {
+    std::shared_ptr<Stream> stream;
+    {
+        std::lock_guard<std::mutex> held(in->lock);
+        auto found = in->streams.find(name);
+        if (found == in->streams.end()) { return; }
+        stream = found->second;
+        in->streams.erase(found);
+    }
+    {
+        std::lock_guard<std::mutex> held(stream->lock);
+        stream->gone = true;
+    }
+    stream->woke.notify_all();
+}
+
+std::vector<std::string> Sound::spent() {
+    std::vector<std::string> names;
+    std::lock_guard<std::mutex> held(in->lock);
+    for (auto& named : in->streams) {
+        Stream& s = *named.second;
+        if (!s.said && s.spent && s.wrote.load() == s.read.load()) {
+            s.said = true;
+            names.push_back(named.first);
+        }
+    }
+    return names;
 }
 
 } // namespace hive
