@@ -97,3 +97,11 @@ frames, never from inside the call.
 
 Filament, Emscripten, miniaudio and stb_vorbis, by version and digest at the top
 of `scene/build`. Moving one is changing it there.
+
+Two things lean on this Filament in particular, and want looking at when it moves:
+
+- Every engine is built with `material.enable_material_instance_uniform_batching`
+  off. With it on, as 1.80 has it, a scene that gave way to another on Vulkan drew
+  some materials with another's numbers: a floor all fog, a flag the wrong colour.
+- A see-through solid reads `frameUniforms` to work out how bright it will be lit
+  (`materials/solid.mat`), which is no part of Filament's promise to a material.

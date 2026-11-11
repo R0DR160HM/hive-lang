@@ -33,7 +33,7 @@ endfunction()
 
 material(solid_opaque solid -TKIND=opaque -TBLENDING=opaque -TDEPTHWRITE=true -TDOUBLESIDED=false)
 material(solid_pierced solid -TKIND=pierced -TBLENDING=masked -TDEPTHWRITE=true -TDOUBLESIDED=true)
-material(solid_soft solid -TKIND=soft -TBLENDING=fade -TDEPTHWRITE=false -TDOUBLESIDED=true)
+material(solid_soft solid -TKIND=soft -TBLENDING=transparent -TDEPTHWRITE=false -TDOUBLESIDED=true)
 material(figure figure)
 material(sprite sprite)
 material(line line)

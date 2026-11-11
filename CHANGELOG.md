@@ -8,6 +8,7 @@
 * **Windows and Linux draw a window with a `scene` in it themselves**, on amd64: the engine runs beside the program, on Vulkan or OpenGL, and no browser opens.
 * **A page draws with the same engine, as WebAssembly**, so a scene looks the same wherever it is shown.
 * **`hive.audio` plays in a window that draws its own scene**, through the scene's engine: an MP3 stream, or a recording in MP3, Ogg Vorbis, FLAC or WAV.
+* **A `row` or `column` wider than the row it sits in is cut to it in a window that draws itself**, as it always was on a page.
 
 ### Tooling
 

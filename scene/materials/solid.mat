@@ -87,6 +87,27 @@ vertex {
 }
 
 fragment {
+#if defined(BLEND_MODE_TRANSPARENT)
+    // The sky's light from one way, as Filament sums it.
+    vec3 sky(vec3 n) {
+        vec3 sum = frameUniforms.iblSH[0].rgb + frameUniforms.iblSH[1].rgb * n.y + frameUniforms.iblSH[2].rgb * n.z
+            + frameUniforms.iblSH[3].rgb * n.x + frameUniforms.iblSH[4].rgb * (n.y * n.x)
+            + frameUniforms.iblSH[5].rgb * (n.y * n.z) + frameUniforms.iblSH[6].rgb * (3.0 * n.z * n.z - 1.0)
+            + frameUniforms.iblSH[7].rgb * (n.z * n.x) + frameUniforms.iblSH[8].rgb * (n.x * n.x - n.y * n.y);
+        return max(sum, vec3(0.0)) * frameUniforms.iblLuminance;
+    }
+
+    // The picture's own curve, as world.cpp's Shoulder has it.
+    vec3 shoulder(vec3 c) {
+        float peak = max(c.r, max(c.g, c.b));
+        if (peak < 0.8) { return c; }
+        float fresh = 1.0 - 0.04 / (peak - 0.6);
+        c *= fresh / peak;
+        float g = 1.0 - 1.0 / (0.15 * (peak - fresh) + 1.0);
+        return c + (vec3(fresh) - c) * g;
+    }
+#endif
+
     void material(inout MaterialInputs material) {
         vec2 uv = variable_laid.xy;
         // A tile is drawn around mid grey, so its texel times the colour over mid grey keeps the colour.
@@ -119,13 +140,28 @@ fragment {
 
         float depth = -mulMat4x4Float3(getViewFromWorldMatrix(), getWorldPosition()).z;
         float veil = materialParams.fog.z * smoothstep(materialParams.fog.x, materialParams.fog.y, depth);
-#if defined(BLEND_MODE_FADE)
+#if defined(BLEND_MODE_TRANSPARENT)
         thick *= 1.0 - veil;
         material.postLightingColor = vec4(0.0);
+        // A see-through colour is mixed as the screen shows it, not as light adds up: a pale veil over a dark
+        // thing stays a veil. So this asks how bright it will be lit, and what to lay down for that mix.
+        vec3 facing = getWorldNormalVector();
+        float sunward = max(dot(facing, frameUniforms.lightDirection), 0.0);
+        vec3 lamp = frameUniforms.lightColorIntensity.rgb * (frameUniforms.lightColorIntensity.w * sunward * 0.31831);
+        float square = clamp(dot(facing, getWorldViewVector()), 0.0, 1.0);
+        vec3 mirror = mix(vec3(0.04), colour, materialParams.look.y);
+        mirror += (max(vec3(1.0 - rough), mirror) - mirror) * pow(1.0 - square, 5.0);
+        vec3 lit = colour * (1.0 - materialParams.look.y) * (sky(facing) + lamp) + mirror * sky(getWorldReflectedVector());
+        // Right over a middling grey, 0.4 on the screen, and near it either side.
+        vec3 mixed = thick * pow(shoulder(lit), vec3(0.4545)) + (1.0 - thick) * 0.4;
+        float keep = clamp(dot((1.0 - thick) * pow(mixed * 2.5, vec3(1.2)), vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+        vec3 share = min(max(pow(mixed, vec3(2.2)) - keep * 0.1332, vec3(0.0)) / max(lit, vec3(0.0001)), vec3(1.0));
+        material.baseColor = vec4(colour * share, 1.0 - keep);
+        material.specularFactor = dot(share, vec3(0.3333));
 #else
         material.postLightingColor = vec4(materialParams.haze.rgb * veil, veil);
-#endif
         material.baseColor = vec4(colour * thick, thick);
+#endif
         material.roughness = rough;
         material.metallic = materialParams.look.y;
     }

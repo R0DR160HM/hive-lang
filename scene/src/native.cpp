@@ -241,7 +241,7 @@ int main(int argc, char** argv) {
     }
 
     Seat seat;
-    seat.engine = Engine::Builder().backend(backend).build();
+    seat.engine = Engine::Builder().backend(backend).feature(hive::SHARED_BUFFER, false).build();
     if (!seat.engine) {
         say('X', "nothing here to draw a scene with");
         if (replay) { fprintf(stderr, "hive-scene: nothing here to draw a scene with\n"); }

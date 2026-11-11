@@ -14,6 +14,10 @@ class SwapChain;
 
 namespace hive {
 
+// Switched off in every engine built: Filament 1.80 keeps what all materials are told in one buffer, and on
+// Vulkan hands a material another's once many have come and gone.
+inline constexpr const char* SHARED_BUFFER = "material.enable_material_instance_uniform_batching";
+
 // Asked of whoever runs the world; each is answered later through the World, or never.
 struct Host {
     virtual ~Host() {}
