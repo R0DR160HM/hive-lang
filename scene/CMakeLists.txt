@@ -1,4 +1,11 @@
 cmake_minimum_required(VERSION 3.19)
+
+# On Linux this is built against libc++ and nothing else, so that is what the compiler is tried with too: a
+# machine can have clang and no libstdc++ it can find, and CMake would call that compiler broken.
+if(CMAKE_HOST_UNIX AND NOT CMAKE_HOST_APPLE AND NOT CMAKE_TOOLCHAIN_FILE)
+    set(CMAKE_CXX_FLAGS_INIT "-stdlib=libc++")
+endif()
+
 project(hive-scene CXX)
 
 set(CMAKE_CXX_STANDARD 20)
