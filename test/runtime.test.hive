@@ -10,53 +10,60 @@
 import ../src/runtime
 import ../src/stdlib
 import ../src/text
+import ../src/uinative
+import hive.file
+
+// A scene is drawn by the engine in `scene/`, which is C++ and something the
+// compiler checks even less of. What broke silently in a renderer breaks silently
+// there, so the same things are asserted of its source, as text. A test runs from
+// the directory it was built into, which is two below the repository's root.
+proc engine(file: Str): Str {
+    if hive.file.read("../../scene/" + file) is Result.Ok(source) {
+        return source
+    }
+    return ""
+}
 
 // **Sounds live in slots past the end of `live`.** Only a solid is ever written
-// there, so a trim loop bounded by `live.length` never clears a voice: the
-// stranded slot keeps the track it last had and fights the live one for the name,
-// tearing it down every frame. What that sounds like is no music at all.
+// there, so a trim loop bounded by `live` alone never clears a voice: the stranded
+// slot keeps the track it last had and fights the live one for the name, tearing
+// it down every frame. What that sounds like is no music at all.
 //
 // It has been written the wrong way twice, and both times everything else passed.
 test "the frame's trim loop reaches the sound slots, not only the solids" {
-    js := runtime.uiSceneJs()
-    assert text.contains(js, "function trim(count)")
-    assert text.contains(js, "for (var i = count; i < live.length; i++)") == false
-    assert text.contains(js, "far = voiceOf.length;")
-    assert text.contains(js, "for (var i = count; i < far; i++)")
+    world := engine("src/world.cpp")
+    assert text.contains(world, "void trim(uint32_t count)")
+    assert text.contains(world, "for (size_t i = count; i < voiceOf.size(); i++)")
 }
 
-// Clearing the voice is the whole of letting a sound go: `regather` drops any
-// slot `trim` has nulled, so nothing else has to be tidied up.
+// Clearing the voice is the whole of letting a sound go: the list of what is
+// heard is gathered again without any slot `trim` has emptied.
 test "a trimmed voice is dropped rather than left in the list" {
-    js := runtime.uiSceneJs()
-    assert text.contains(js, "function regather()")
-    assert text.contains(js, "if (!heard)")
+    world := engine("src/world.cpp")
+    assert text.contains(world, "voiceOf[i] = nullptr;")
+    assert text.contains(world, "if (h) \{ sounded.push_back(h); }")
 }
 
 // The coarse buffer and the dither are one pass, and the order inside it is the
-// only thing about it easy to get wrong. Rendering to a target skips the encode
-// three.js does on its way to the canvas, so the pass has to do it — and it has
-// to do it *before* the quantise, because a display's bit depth is a fact about
+// only thing about it easy to get wrong: the picture it reads is already encoded
+// for the screen, and it quantises after — a display's bit depth is a fact about
 // what it displays. Wrong once: the world came back at a quarter of its
 // brightness and read as a different time of day.
-test "the handheld pass encodes for the screen before it quantises" {
-    js := runtime.uiSceneJs()
-    assert text.contains(js, "vec3 shown(vec3 c)")
-    assert text.contains(js, "c = shown(texture2D(tex, vUv).rgb);")
+test "the handheld pass quantises a picture already encoded for the screen" {
+    sheet := engine("materials/sheet.mat")
+    assert text.contains(sheet, "vec3 c = texture(materialParams_picture, uvToRenderTargetUV(getUV0())).rgb;")
+    assert text.contains(sheet, "c = floor(c * steps + d + 0.5) / steps;")
     // The dither reads the coarse buffer's own pixel rather than the screen's, so
     // the pattern is at the size the world was actually drawn at.
-    assert text.contains(js, "vec2 cell = floor(vUv * size);")
+    assert text.contains(sheet, "vec2 cell = floor(gl_FragCoord.xy / materialParams.frame.zw * materialParams.frame.xy);")
 }
 
-// A sprite wears a SpriteMaterial and every solid wears what `paintOf` answers
-// with. They meet in `put`, and a billboard handed a mesh material samples a
-// surface texture it has no normals for and comes out solid black — which is
-// exactly what the trees did the first time.
+// A sprite is a material of its own, unlit: a billboard handed a solid's samples a
+// surface texture it has no normals for and comes out black — which is exactly
+// what the trees did the first time.
 test "a sprite keeps its own material through a frame" {
-    js := runtime.uiSceneJs()
-    assert text.contains(js, "o.material.color.setStyle(bare(s.c));")
-    assert text.contains(js, "made.center.set(0.5, 0);")
-    assert text.contains(js, "sprite")
+    assert text.contains(engine("materials/sprite.mat"), "shadingModel : unlit")
+    assert text.contains(engine("src/world.cpp"), "o->look = billboard->createInstance();")
 }
 
 // The window is set in the program's own typeface when it ships one and in the
@@ -131,46 +138,36 @@ test "what the runtime says about itself goes to stderr" {
     assert text.contains(runtime.uiSource(), "fmt.Println(\"hive-window \" + url)")
 }
 
-// A kind the Go half does not name is sent as a box, so a kind on the page's list
+// A kind the Go half does not name is sent as a box, so a kind the engine draws
 // and missing from `uiSceneKindCode` draws as a box and nothing says so — which is
 // what every roof did, until it was seen from the air.
-test "a roof is sent to the page as a roof" {
+test "a roof is sent to the engine as a roof" {
     go := runtime.uiSceneSource()
     assert text.contains(go, "case \"roof\":")
     assert text.contains(go, "uiSceneRoof     = 9")
-    js := runtime.uiSceneJs()
-    assert text.contains(js, "\"sound\", \"sprite\", \"roof\", \"figure\", \"terrain\"];")
+    assert text.contains(engine("src/world.cpp"), "\"roof\", \"figure\", \"terrain\"};")
 }
 
 // A figure is sent as one, with its paints after everything else a shape carries, and
-// the page reads them in that place. Sent as a box, everybody in a scene was a grey
+// the engine reads them in that place. Sent as a box, everybody in a scene was a grey
 // brick; read a field early, every colour after it was a bone.
-test "a figure is sent to the page as a figure, its paints last" {
+test "a figure is sent to the engine as a figure, its paints last" {
     go := runtime.uiSceneSource()
     assert text.contains(go, "case \"figure\":")
     assert text.contains(go, "uiSceneFigure   = 10")
     assert text.contains(go, "uiSceneHasPaints  = 128")
-    js := runtime.uiSceneJs()
-    assert text.contains(js, "HAS_PAINTS = 128")
-    assert text.contains(js, "s.t.length = (mask & HAS_PAINTS) ? readU8() : 0;")
-    // No bones is the file's own pose, not a solid's default size of one: read as
-    // three ones, it turned the hips a radian.
-    assert text.contains(js, "else if (s.k === \"figure\")")
-    assert text.contains(js, "d.length = 0;")
+    world := engine("src/world.cpp")
+    assert text.contains(world, "HAS_PAINTS = 128")
 }
 
 // What a figure is not wearing is not there: hidden in the picture and in the
 // shadow both, or the skin under a shirt casts the shirt's shadow and a hat's
-// cropped hair shows through it from the sun's side.
+// cropped hair shows through it from the sun's side. One material draws a figure
+// and casts for it, so a part put nowhere throws no shadow either.
 test "a part painted see-through is neither drawn nor casts a shadow" {
-    js := runtime.uiSceneJs()
-    assert text.contains(js, "var FLOCK_TINT = ")
-    assert text.contains(js, "vPaint = flockTint.rgb;\\nif (flockTint.a < 0.5)")
-    assert text.contains(js, "#include <project_vertex>\\n\" + FLOCK_TINT")
-    // The same shader edit dresses what is drawn and what casts, so a part that is
-    // not there throws no shadow either.
-    assert text.contains(js, "c.caster.onBeforeCompile = function (shader)")
-    assert text.contains(js, "mesh.customDepthMaterial = c.caster;")
+    figure := engine("materials/figure.mat")
+    assert text.contains(figure, "vec4 tint = texelFetch(materialParams_paints, ivec2(int(part + 0.5), who), 0);")
+    assert text.contains(figure, "if (tint.a < 0.5)")
 }
 
 // Every figure of one file is one instanced draw: its bones a row of one texture and
@@ -178,12 +175,11 @@ test "a part painted see-through is neither drawn nor casts a shadow" {
 // a draw each — a wood was a hundred — and each was culled by a ball a person's size
 // about its feet, so a tree whose foot left the screen took its crown with it.
 test "every figure of a file is drawn together, and none is culled alone" {
-    js := runtime.uiSceneJs()
-    assert text.contains(js, "new THREE.InstancedMesh(c.model.geo, c.look, many)")
-    assert text.contains(js, "texelFetch(flockBones, ivec2(x, gl_InstanceID), 0)")
-    assert text.contains(js, "texelFetch(flockPaints, ivec2(int(part + 0.5), gl_InstanceID), 0)")
-    assert text.contains(js, "mesh.frustumCulled = false;")
-    assert text.contains(js, "boundingSphere") == false
+    figure := engine("materials/figure.mat")
+    assert text.contains(figure, "texelFetch(materialParams_bones, ivec2(x, who), 0)")
+    assert text.contains(figure, "int who = getInstanceIndex() + int(materialParams.base);")
+    world := engine("src/world.cpp")
+    assert text.contains(world, "c.form.corners, 0, c.form.count).material(0, c.look).culling(false).castShadows(true)")
 }
 
 // A figure's size is a part of its record a solid's never has, on a bit only a
@@ -195,15 +191,13 @@ test "a figure's scale and a scene's sun each ride a bit of their own" {
     assert text.contains(go, "func UiAttrScale(x float64, y float64, z float64) UiAttr")
     assert text.contains(go, "func UiAttrSun(yaw float64, pitch float64) UiAttr")
     assert text.contains(go, "func UiAttrCast(far int) UiAttr")
-    js := runtime.uiSceneJs()
-    assert text.contains(js, "HAS_SCALE = 32")
-    assert text.contains(js, "if (mask & HAS_SCALE)")
-    assert text.contains(js, "EYE_SUN = 128")
-    assert text.contains(js, "if (bits & EYE_SUN)")
+    world := engine("src/world.cpp")
+    assert text.contains(world, "HAS_SCALE = 32")
+    assert text.contains(world, "EYE_SUN = 128")
 }
 
-// The ground is too big to say every frame, so a frame carries a name for it and the
-// page asks for what the name stands for.
+// The ground is too big to say every frame, so a frame carries a name for it and
+// whoever runs the engine is asked for what the name stands for: a page fetches it.
 test "a terrain is sent by name, and its numbers are fetched by that name" {
     go := runtime.uiSceneSource()
     assert text.contains(go, "case \"terrain\":")
@@ -212,26 +206,39 @@ test "a terrain is sent by name, and its numbers are fetched by that name" {
     assert text.contains(go, "func UiTerrain(attrs []UiAttr, wide int, cell float64, heights []float64, colours []int) UiShape")
     js := runtime.uiSceneJs()
     assert text.contains(js, "fetch(\"/_hive/terrain/\" + id)")
-    assert text.contains(js, "if (s.k === \"terrain\")")
+    assert text.contains(engine("src/world.cpp"), "host.wantTerrain(")
 }
 
 // A sprite painted see-through is smoke: filtered and faint. An opaque one keeps
 // the hard edge and the pixels a picture drawn small is drawn for.
 test "a see-through sprite is filtered and as faint as its paint" {
-    js := runtime.uiSceneJs()
-    assert text.contains(js, "var soft = solidity(s.c) < 1;")
-    assert text.contains(js, "alphaTest: soft ? 0 : 0.4,")
-    assert text.contains(js, "o.material.opacity = solidity(s.c);")
+    world := engine("src/world.cpp")
+    assert text.contains(world, "o->soft = colourOf(s.c).a < 1;")
+    assert text.contains(world, "o->soft ? 0.0f : 0.4f")
 }
 
 // A seat taken out of its batch has the last one moved into its place, and the
 // last one's colour has to come with its matrix: moved alone, a car leaving the
-// street repaints whichever box took its place the colour of the car.
+// street repaints whichever box took its place the colour of the car. They are one
+// row of sixteen numbers here, so they cannot be moved apart.
 test "a seat taken out of a batch moves the last one's matrix and colour both" {
+    world := engine("src/world.cpp")
+    assert text.contains(world, "memcpy(&b.rows[size_t(at) * 16], &b.rows[size_t(last) * 16], 64);")
+    assert text.contains(world, "b.seats[size_t(at)]->index = at;")
+}
+
+// The page is what a window falls back to and what every other platform runs, and
+// it draws with the same engine, as WebAssembly: a frame goes to it whole, and
+// what it asks for is answered between frames.
+test "a page hands each frame to the engine and draws nothing itself" {
     js := runtime.uiSceneJs()
-    assert text.contains(js, "m.array.copyWithin(at * 16, last * 16, last * 16 + 16);")
-    assert text.contains(js, "c.array.copyWithin(at * 3, last * 3, last * 3 + 3);")
-    assert text.contains(js, "end.index = at;")
+    assert text.contains(js, "import summon from \"./hive-scene.js\";")
+    assert text.contains(js, "engine._hs_frame(lent(bytes), bytes.length)")
+    assert text.contains(js, "engine._hs_draw();")
+    assert text.contains(js, "THREE") == false
+    go := runtime.uiSceneSource()
+    assert text.contains(go, "//go:embed hive-scene.js hive-scene.wasm")
+    assert text.contains(go, "uiSceneAsset(\"hive-scene.wasm\", \"application/wasm\")")
 }
 
 // `hive.audio` is a module of its own: its Go names nothing of `hive.ui`, and it
@@ -246,21 +253,53 @@ test "hive.audio asks nothing of hive.ui, and a window serves what it registers"
     assert text.contains(runtime.uiSource(), "strings.Join(hivePageScripts, \"\")")
 }
 
-// A box is rounded by the shader, at the size it is drawn, so what draws it and what
-// casts its shadow have to agree: a shadow cast by the sharp box would darken every
-// lit edge of the round one.
-test "a box and a cylinder are drawn with round edges, and cast round shadows" {
-    js := runtime.uiSceneJs()
-    assert text.contains(js, "g = roundedBox();")
-    assert text.contains(js, "g = roundedDrum();")
-    assert text.contains(js, ".replace(\"#include <begin_vertex>\", \"vec3 transformed = roundedAt;\")")
-    assert text.contains(js, "if (b.round) \{ mesh.customDepthMaterial = rounder(); }")
+// A window that draws its own scene has no page to play `hive.audio` through, so
+// it listens to the feed a page would and hands the engine each stream's bytes.
+// Without it a game's radio went quiet the day its window stopped being a page.
+test "a window that draws its own scene plays hive.audio through the engine" {
+    stage := uinative.sceneSource()
+    assert text.contains(stage, "hivePageRoutes[\"/_hive/audio\"].(func(http.ResponseWriter, *http.Request))")
+    assert text.contains(stage, "s.radio.onto(e)")
+    assert text.contains(uinative.engineSource(), "e.say('A', []byte\{what}, uiEngineNamed(name), rest)")
+    sound := engine("src/sound.cpp")
+    assert text.contains(sound, "ma_dr_mp3_read_pcm_frames_f32(&mp3, 1152, in.data())")
+    assert text.contains(engine("src/native.cpp"), "case 'A':")
 }
 
-// three.js turns an equirectangular background into a cube once per texture and keeps
-// it; the one sky texture is redrawn as the light changes, so it has to be let go each
-// time, or the sky keeps the colour it was first drawn in.
+// A box is rounded by the shader, at the size it is drawn. One material draws it
+// and casts for it, so its shadow is the round box's: a shadow cast by the sharp
+// one would darken every lit edge.
+test "a box and a cylinder are drawn with round edges, and cast round shadows" {
+    shapes := engine("src/shapes.cpp")
+    assert text.contains(shapes, "roundedBox")
+    assert text.contains(shapes, "roundedDrum")
+    solid := engine("materials/solid.mat")
+    assert text.contains(solid, "float rounding = spanU.w;")
+    assert text.contains(solid, "corner = sign(position) * (size * 0.5 - bend) + normal * bend;")
+}
+
+// A see-through colour used to be mixed after the picture's curve, in what the screen
+// shows. Mixed as light, before it, a pale veil over a dark thing comes out nearly solid.
+test "a see-through solid is mixed as the screen shows it" {
+    solid := engine("materials/solid.mat")
+    assert text.contains(solid, "vec3 mixed = thick * pow(shoulder(lit), vec3(0.4545)) + (1.0 - thick) * 0.4;")
+    assert text.contains(solid, "material.baseColor = vec4(colour * share, 1.0 - keep);")
+    assert text.contains(engine("CMakeLists.txt"), "material(solid_soft solid -TKIND=soft -TBLENDING=transparent ")
+}
+
+// The sky and the light it throws are kept as half floats. Handed over as floats, a
+// cube filled a second time came out rubbish on Vulkan: a scene after the first was
+// lit white, or every colour at once.
+test "a cube of light is handed over as the halves it is kept as" {
+    world := engine("src/world.cpp")
+    assert text.contains(world, "std::vector<math::half> data(size_t(side) * side * 6 * 4);")
+    assert text.contains(world, "pixels(data.data(), data.size() * sizeof(math::half), Texture::Format::RGBA, Texture::Type::HALF));")
+    assert text.contains(world, ".sampler(Texture::Sampler::SAMPLER_CUBEMAP).format(Texture::InternalFormat::RGBA16F).build(engine);")
+}
+
+// The sky is one cube, drawn again when its colour changes and only then.
 test "the sky is drawn again in its new colour when the light changes" {
-    js := runtime.uiSceneJs()
-    assert text.contains(js, "skyTex.dispose();")
+    world := engine("src/world.cpp")
+    assert text.contains(world, "if (skyHex == hex) \{ return; }")
+    assert text.contains(world, "skyHex = hex;")
 }

@@ -161,6 +161,20 @@ func TestAPinnedPanelLetsClicksThroughAroundIt(t *testing.T) {
 	}
 }
 
+func TestARowWiderThanTheWindowIsCutToIt(t *testing.T) {
+	bar := UiRow([]UiAttr{UiAttrWidth(4000)}, []UiView{UiText(nil, "left"), UiSpacer(), UiButton(nil, "Go")})
+	v := UiColumn(nil, []UiView{
+		UiText(nil, "under"),
+		UiOverlay([]UiAttr{UiAttrAlign("End"), UiAttrJustify("Start")}, bar),
+	})
+	n, _ := uiLaidOut(v, 400, 300)
+	row := n.layers[0].panel.kids[0]
+	button := row.kids[2]
+	if !uiNear(row.w, 376) || !uiNear(button.x+button.w, 388) {
+		t.Errorf("the row is %.2f wide and its button ends at %.2f, wanted 376 and 388", row.w, button.x+button.w)
+	}
+}
+
 func TestATextareaMovesALineAtATimeAsItWraps(t *testing.T) {
 	n, _ := uiLaidOut(UiColumn(nil, []UiView{UiTextarea([]UiAttr{UiAttrWidth(100)}, "aaa bbb ccc ddd")}), 400, 300)
 	b := n.boxes["r/0/0"]

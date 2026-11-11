@@ -56,7 +56,7 @@ the target's standard library alone, so HTTP, WebSockets, TCP, JSON,
 cryptography, spreadsheets and windows all build offline with no dependencies.
 The two exceptions are fetched on the first build that needs them, cached, and
 never linked into a program that does not: `hive.sql` links database drivers, and
-`hive.ui.scene` is drawn with a pinned three.js.
+`hive.ui.scene` is drawn by a pinned engine.
 
 ## 14.1 `hive.conv`
 
@@ -778,14 +778,15 @@ Chromium-family browser falls back to an ordinary tab, which is the one case
 where the window belongs to a browser.
 
 **On Windows and Linux the program draws its window itself**, with no browser
-anywhere, unless the window holds a `scene`, the program ships a typeface of its
-own, or it was opened with `webview`. Every other widget has a version of its own
-there, laid out by the stylesheet's own rules and light or dark as the desktop is.
+anywhere, unless the program ships a typeface of its own or it was opened with
+`webview`. Every widget has a version of its own there, laid out by the
+stylesheet's own rules and light or dark as the desktop is.
 Windows sets the text in Segoe UI; Linux speaks X11 — which a Wayland desktop
 serves through XWayland — and sets it in the system's own sans-serif, read and
 drawn by the program, so neither needs a C compiler to build. A Linux machine
-with no display or no usable font gets the page, and so do macOS, Android and
-every window with a scene in it. The layout is modelled on
+with no display or no usable font gets the page, and so do macOS and Android. A
+`scene` there is drawn by its engine, started beside the program
+([14.16](#1416-hiveuiscene)). The layout is modelled on
 [Clay](https://github.com/nicbarker/clay), by Nic Barker.
 
 **Such a window behaves as a page would.** Its text is selected and copied, a
@@ -824,7 +825,7 @@ Two environment variables are read by a window, and by nothing else:
 | variable | does |
 | --- | --- |
 | `HIVE_WINDOW=print` | prints `hive-window <url>` instead of opening a browser, for whatever is going to show the page — and keeps a window the program would draw itself a page, so there is one to show |
-| `HIVE_FOLDS=1` | prints, once a second, how many turns the window took and drew, the median, 90th-percentile and worst time each spent in `update`, `view` and sending the page, and the collections since the last line |
+| `HIVE_FOLDS=1` | prints, once a second, how many turns the window took and drew, the median, 90th-percentile and worst time each spent in `update`, `view` and sending the page, and the collections since the last line — and, where the window draws a scene itself, how many pictures it drew and how long the engine and the window took over each |
 
 **The window is a service.** `update` is a service's handler —
 `proc (mut State, Msg): Msg`, or `proc (mut State, Msg, Address<Msg>): Msg` to
@@ -974,8 +975,29 @@ to keep, no material to allocate and no canvas to hold — so a program that dra
 one answers "what is there right now" and never "what has changed".
 
 It is **a module of its own because it is the one that carries a download**
-([14](#14--standard-library)): a pinned three.js, fetched on the first build that
-needs it and cached. A window that draws no scene links none of this.
+([14](#14--standard-library)): the engine that draws it, fetched on the first
+build that needs it against a pinned SHA-256, cached, and embedded in the
+executable. A window that draws no scene links none of this.
+
+**The engine is the same everywhere.** It is the one in `scene/`, built on
+[Filament](https://github.com/google/filament). A window the program draws
+itself starts it as a process of its own, beside the program, and puts its
+picture under the widgets: that is Windows and Linux on amd64. Every other
+window is a page, and runs it as WebAssembly. So what a scene looks like does
+not depend on where it is shown, and a program that draws one still builds with
+no C compiler.
+
+**On Linux the engine needs glibc 2.38 or newer** — Ubuntu 24.04, Debian 13,
+Fedora 39 — because that is what Filament's own libraries are built against.
+On an older system it does not start, and the window is a page there.
+
+Three environment variables are read by a window that draws its own scene:
+
+| variable | does |
+| --- | --- |
+| `HIVE_SCENE=opengl` | draws with OpenGL, which is otherwise what the engine falls back to where Vulkan does not start. Where neither does, the window is a page |
+| `HIVE_SCENE_LOG=1` | passes on what the engine itself has to say, on standard error |
+| `HIVE_SCENE_ENGINE=<path>` | starts the engine at `path` rather than the one the program carries |
 
 ### The shapes
 
@@ -1508,3 +1530,8 @@ and of the whole set when it connects, so a window opened or reloaded later play
 what is wanted by then; nothing is heard while no window is open. A stream that
 drops is picked up again after a moment, and one the window refused for want of a
 gesture starts on the next key or tap. The module uses nothing of `hive.ui`.
+
+**A window the program draws itself plays it through its scene's engine**
+([14.16](#1416-hiveuiscene)): a stream in MP3, which is what most stations send,
+and a recording in MP3, Ogg Vorbis, FLAC or WAV. One with no scene in it has no
+engine, and plays nothing.

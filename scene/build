@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# Build the engine a `hive.ui.scene` is drawn by.
+#
+#   scene/build            the engine a window starts beside itself, for this machine
+#   scene/build web        the engine a page runs, as WebAssembly
+#   scene/build [web] DIR  either, left in DIR rather than where a compiler built
+#                          from source looks: ~/.hive/vendor/scene@dev
+#
+# Everything it builds against is fetched once and pinned: Filament's SDK and
+# the two single-file libraries the sounds are made with by SHA-256, and for
+# the web the Emscripten and Filament source that are built from by tag.
+#
+# It needs cmake and ninja, and a compiler: clang with libc++ on Linux (`CC` and
+# `CXX` name another), Visual Studio's on Windows, where this runs from the
+# shell that ships with git. The web build runs on Linux and wants git and
+# python3 too; its first run builds Filament for WebAssembly, which is most of
+# an hour, and no later one does.
+#
+# On Linux it needs glibc 2.38 or newer besides (Ubuntu 24.04, Debian 13):
+# Filament's own tools and libraries are built against it, so on anything older
+# its `matc` does not start, and neither would the engine this links.
+set -euo pipefail
+
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+filament=1.80.0
+filament_linux=15e5ce6024f12a551d0348b025453705cfdb6e4e91c06f5d7ae0c7033f21c2f6
+filament_windows=d464617fd70e756d75a86893388d4438f0023826ff989f4de03ce1bd9bc5798f
+emscripten=5.0.4
+miniaudio=0.11.22
+miniaudio_sum=9019743287e443c55e5737a7297f38e5e358561701d6db2d905afb114390c410
+stb=1ee679ca2ef753a528db5ba6801e1067b40481b8
+stb_sum=4c7cb2ff1f7011e9d67950446b7eb9ca044f2e464d76bfbb0b84dd2e23e65636
+
+what=native
+if [ "${1:-}" == web ]; then
+	what=web
+	shift
+fi
+home="${HOME:-${USERPROFILE:-.}}/.hive"
+into="${1:-$home/vendor/scene@dev}"
+kept="$home/vendor/filament@$filament"
+third="$kept/third"
+
+# A file from the network, kept only if it is the one pinned.
+fetched() {
+	local url="$1" file="$2" want="$3" got
+	if [ -f "$file" ] && [ "$(sha256sum "$file" | cut -d' ' -f1)" == "$want" ]; then
+		return
+	fi
+	mkdir -p "$(dirname "$file")"
+	echo "scene/build: fetching $url"
+	curl -fsSL -o "$file.part" "$url"
+	got="$(sha256sum "$file.part" | cut -d' ' -f1)"
+	if [ "$got" != "$want" ]; then
+		rm -f "$file.part"
+		echo "scene/build: $url is not the file this pins." >&2
+		echo "             Expected $want" >&2
+		echo "             and got  $got" >&2
+		exit 1
+	fi
+	mv "$file.part" "$file"
+}
+
+libraries() {
+	fetched "https://raw.githubusercontent.com/mackron/miniaudio/$miniaudio/miniaudio.h" "$third/miniaudio.h" "$miniaudio_sum"
+	fetched "https://raw.githubusercontent.com/nothings/stb/$stb/stb_vorbis.c" "$third/stb_vorbis.c" "$stb_sum"
+}
+
+# Filament as its release ships it for Linux: what the engine links there, and the
+# headers and the material compiler every build uses.
+linux_sdk() {
+	if [ -x "$kept/linux/bin/matc" ]; then
+		return
+	fi
+	fetched "https://github.com/google/filament/releases/download/v$filament/filament-v$filament-linux.tgz" \
+		"$kept/filament-linux.tgz" "$filament_linux"
+	rm -rf "$kept/linux"
+	mkdir -p "$kept/linux"
+	tar xzf "$kept/filament-linux.tgz" -C "$kept/linux" --strip-components=1 filament/include filament/bin/matc filament/lib
+	rm -f "$kept/filament-linux.tgz"
+}
+
+placed() {
+	mkdir -p "$into"
+	cp "$1" "$into/$2"
+	echo "scene/build: $into/$2 — $(du -h "$into/$2" | cut -f1)"
+}
+
+linux() {
+	local tree="$here/out/linux-amd64"
+	libraries
+	linux_sdk
+	CXX="${CXX:-clang++}" cmake -S "$here" -B "$tree" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+		"-DFILAMENT=$kept/linux" "-DTHIRD=$third"
+	cmake --build "$tree"
+	placed "$tree/hive-scene" hive-scene-linux-amd64
+}
+
+# The archive is most of a gigabyte and four copies of every library; one is kept.
+windows() {
+	local tree="$here/out/windows-amd64" studio finder
+	libraries
+	if [ ! -f "$kept/windows/bin/matc.exe" ]; then
+		fetched "https://github.com/google/filament/releases/download/v$filament/filament-v$filament-windows.tgz" \
+			"$kept/filament-windows.tgz" "$filament_windows"
+		rm -rf "$kept/windows"
+		mkdir -p "$kept/windows"
+		tar xzf "$kept/filament-windows.tgz" -C "$kept/windows" include bin/matc.exe lib/x86_64/mt
+		rm -f "$kept/filament-windows.tgz"
+	fi
+	finder="$(cygpath -u "$(printenv 'ProgramFiles(x86)')")/Microsoft Visual Studio/Installer/vswhere.exe"
+	studio="$("$finder" -latest -prerelease -products '*' -property installationPath | tr -d '\r')"
+	if [ -z "$studio" ]; then
+		echo "scene/build: no Visual Studio here to build the engine with." >&2
+		exit 1
+	fi
+	mkdir -p "$tree"
+	{
+		printf '@echo off\r\n'
+		printf 'call "%s\\VC\\Auxiliary\\Build\\vcvars64.bat" >nul || exit /b 1\r\n' "$studio"
+		printf 'set "PATH=%s\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin;%s\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\Ninja;%%PATH%%"\r\n' "$studio" "$studio"
+		printf 'cmake -S "%s" -B "%s" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=cl "-DFILAMENT=%s" "-DMATC=%s" "-DTHIRD=%s" || exit /b 1\r\n' \
+			"$(cygpath -m "$here")" "$(cygpath -m "$tree")" "$(cygpath -m "$kept/windows")" \
+			"$(cygpath -m "$kept/windows/bin/matc.exe")" "$(cygpath -m "$third")"
+		printf 'cmake --build "%s" || exit /b 1\r\n' "$(cygpath -m "$tree")"
+	} > "$tree/build.bat"
+	(cd "$tree" && cmd.exe //c '.\build.bat')
+	placed "$tree/hive-scene.exe" hive-scene-windows-amd64.exe
+}
+
+# Filament publishes no libraries for WebAssembly, only its own JavaScript, so
+# they are built from its source the once, by its own script.
+web() {
+	local tree="$here/out/web" built="$kept/source/out/cmake-wasm-release"
+	linux_sdk
+	if [ ! -f "$kept/emsdk/upstream/emscripten/emcc" ]; then
+		if [ ! -d "$kept/emsdk" ]; then
+			git clone --depth 1 --branch "$emscripten" https://github.com/emscripten-core/emsdk "$kept/emsdk"
+		fi
+		(cd "$kept/emsdk" && ./emsdk install "$emscripten" && ./emsdk activate "$emscripten")
+	fi
+	if [ ! -f "$kept/wasm/lib/libfilament.a" ]; then
+		if [ ! -d "$kept/source" ]; then
+			git clone --depth 1 --branch "v$filament" https://github.com/google/filament "$kept/source"
+		fi
+		(cd "$kept/source" && EMSDK="$kept/emsdk" CC="${CC:-clang}" CXX="${CXX:-clang++}" ./build.sh -p wasm release)
+		rm -rf "$kept/wasm"
+		mkdir -p "$kept/wasm/lib"
+		cp -r "$kept/linux/include" "$kept/wasm/include"
+		cp "$built/filament/libfilament.a" "$built/filament/backend/libbackend.a" \
+			"$built/libs/filabridge/libfilabridge.a" "$built/libs/filaflat/libfilaflat.a" \
+			"$built/libs/utils/libutils.a" "$built/libs/geometry/libgeometry.a" "$built/libs/ibl/libibl.a" \
+			"$built/third_party/smol-v/tnt/libsmol-v.a" "$built/third_party/zstd/tnt/libzstd.a" "$kept/wasm/lib/"
+		cp "$built/third_party/abseil/tnt/libabseil_combined.a" "$kept/wasm/lib/libabseil.a"
+	fi
+	# shellcheck disable=SC1091
+	source "$kept/emsdk/emsdk_env.sh" > /dev/null 2>&1
+	emcmake cmake -S "$here" -B "$tree" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+		"-DFILAMENT=$kept/wasm" "-DMATC=$kept/linux/bin/matc" "-DTHIRD=$third"
+	cmake --build "$tree"
+	placed "$tree/hive-scene.js" hive-scene.js
+	placed "$tree/hive-scene.wasm" hive-scene.wasm
+}
+
+if [ "$what" == web ]; then
+	web
+	exit 0
+fi
+case "$(uname -s)" in
+	Linux*) linux ;;
+	MINGW*|MSYS*|CYGWIN*) windows ;;
+	*)
+		echo "scene/build: a window draws its own scene on Linux and Windows only." >&2
+		echo "             Everywhere else the scene is a page's: scene/build web" >&2
+		exit 1
+		;;
+esac

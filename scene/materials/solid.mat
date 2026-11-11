@@ -1,0 +1,168 @@
+// Every solid in a finish in one draw, each a row of a texture. Compiled opaque, pierced and soft.
+material {
+    name : solid_${KIND},
+    shadingModel : lit,
+    blending : ${BLENDING},
+    depthWrite : ${DEPTHWRITE},
+    doubleSided : ${DOUBLESIDED},
+    maskThreshold : 0.5,
+    postLightingBlending : transparent,
+    instanced : true,
+    flipUV : false,
+    requires : [ uv0, color, custom0, custom1, custom2 ],
+    parameters : [
+        { type : sampler2d, name : things, precision : high },
+        { type : sampler2d, name : grain },
+        { type : sampler2d, name : relief },
+        { type : float4, name : look },
+        { type : float4, name : flags },
+        { type : float4, name : fog },
+        { type : float4, name : haze },
+        { type : float, name : base }
+    ],
+    variables : [ tint, laid ]
+}
+
+vertex {
+    void materialVertex(inout MaterialVertexInputs material) {
+        // Four texels a solid: three rows of its matrix, then its colour.
+        int which = getInstanceIndex() + int(materialParams.base);
+        int x = (which & 255) * 4;
+        int y = which >> 8;
+        vec4 r0 = texelFetch(materialParams_things, ivec2(x, y), 0);
+        vec4 r1 = texelFetch(materialParams_things, ivec2(x + 1, y), 0);
+        vec4 r2 = texelFetch(materialParams_things, ivec2(x + 2, y), 0);
+        vec4 tint = texelFetch(materialParams_things, ivec2(x + 3, y), 0);
+        vec3 c0 = vec3(r0.x, r1.x, r2.x);
+        vec3 c1 = vec3(r0.y, r1.y, r2.y);
+        vec3 c2 = vec3(r0.z, r1.z, r2.z);
+        vec3 size = max(vec3(length(c0), length(c1), length(c2)), vec3(0.00001));
+
+        vec3 position = getPosition().xyz;
+        vec3 normal = material.worldNormal;
+        vec4 spanU = getCustom0();
+        vec4 spanV = getCustom1();
+        vec4 along = getCustom2();
+        float rounding = spanU.w;
+
+        vec3 at = position;
+        vec3 facing = normal;
+        if (rounding > 0.5) {
+            vec3 corner;
+            if (rounding < 1.5) {
+                float bend = min(0.35, 0.2 * min(size.x, min(size.y, size.z)));
+                corner = sign(position) * (size * 0.5 - bend) + normal * bend;
+            } else {
+                float bend = min(0.35, 0.2 * min(2.0 * size.x, size.y));
+                float reach = length(position.xz);
+                vec2 way = reach > 0.0001 ? position.xz / reach : vec2(0.0);
+                float far = (reach > 0.0001 ? size.x - bend : 0.0) + length(normal.xz) * bend;
+                corner = vec3(way.x * far, sign(position.y) * (size.y * 0.5 - bend) + normal.y * bend, way.y * far);
+            }
+            at = corner / size;
+            facing = normal * size;
+        }
+
+        vec2 uv = material.uv0;
+        if (rounding > 0.5) {
+            uv = rounding < 1.5 ? 0.5 + vec2(dot(spanU.xyz, at), dot(spanV.xyz, at))
+                : rounding < 2.5 ? vec2(uv.x, at.y + 0.5) : 0.5 + at.xz * 0.5;
+        }
+        float tile = materialParams.look.w;
+        vec2 tiles = max(vec2(1.0), floor(vec2(length(size * spanU.xyz), length(size * spanV.xyz)) / tile + 0.5));
+        uv *= tiles;
+        if (spanV.x != 0.0 && abs(spanV.x) * size.x > size.y) {
+            vec3 placed = vec3(dot(r0.xyz, position) + r0.w, dot(r1.xyz, position) + r1.w, dot(r2.xyz, position) + r2.w);
+            uv = placed.xz / tile;
+        }
+
+        vec3 world = vec3(dot(r0.xyz, at) + r0.w, dot(r1.xyz, at) + r1.w, dot(r2.xyz, at) + r2.w);
+        vec3 inverse = facing / (size * size);
+        material.worldNormal = normalize(c0 * inverse.x + c1 * inverse.y + c2 * inverse.z);
+        vertex_worldTangent = vec4(normalize(c0 * along.x + c1 * along.y + c2 * along.z), along.w);
+        material.worldPosition = getWorldFromModelMatrix() * vec4(world, 1.0);
+        material.tint = tint * material.color;
+        material.laid = vec4(uv, 0.0, 0.0);
+    }
+}
+
+fragment {
+#if defined(BLEND_MODE_TRANSPARENT)
+    // The sky's light from one way, as Filament sums it.
+    vec3 sky(vec3 n) {
+        vec3 sum = frameUniforms.iblSH[0].rgb + frameUniforms.iblSH[1].rgb * n.y + frameUniforms.iblSH[2].rgb * n.z
+            + frameUniforms.iblSH[3].rgb * n.x + frameUniforms.iblSH[4].rgb * (n.y * n.x)
+            + frameUniforms.iblSH[5].rgb * (n.y * n.z) + frameUniforms.iblSH[6].rgb * (3.0 * n.z * n.z - 1.0)
+            + frameUniforms.iblSH[7].rgb * (n.z * n.x) + frameUniforms.iblSH[8].rgb * (n.x * n.x - n.y * n.y);
+        return max(sum, vec3(0.0)) * frameUniforms.iblLuminance;
+    }
+
+    // The picture's own curve, as world.cpp's Shoulder has it.
+    vec3 shoulder(vec3 c) {
+        float peak = max(c.r, max(c.g, c.b));
+        if (peak < 0.8) { return c; }
+        float fresh = 1.0 - 0.04 / (peak - 0.6);
+        c *= fresh / peak;
+        float g = 1.0 - 1.0 / (0.15 * (peak - fresh) + 1.0);
+        return c + (vec3(fresh) - c) * g;
+    }
+#endif
+
+    void material(inout MaterialInputs material) {
+        vec2 uv = variable_laid.xy;
+        // A tile is drawn around mid grey, so its texel times the colour over mid grey keeps the colour.
+        vec4 grain = texture(materialParams_grain, uv);
+        if (materialParams.flags.z > 0.5) {
+            float broad = texture(materialParams_grain, uv * 0.0713 + 0.31, 3.0).g
+                + texture(materialParams_grain, uv * 0.0171 + 0.77, 5.0).g;
+            grain.rgb *= clamp(1.0 + (broad * 2.3163 - 1.0) * 2.6, 0.55, 1.5);
+        }
+        if (materialParams.flags.w > 0.5) {
+            vec3 lie = texture(materialParams_relief, uv).xyz * 2.0 - 1.0;
+            lie.xy *= materialParams.look.z;
+            material.normal = normalize(lie);
+        }
+        prepareMaterial(material);
+
+        vec4 tint = variable_tint;
+        vec3 colour;
+        float thick = tint.a;
+        if (materialParams.flags.x > 0.5) {
+            colour = mix(grain.rgb, tint.rgb * grain.rgb * 4.6326, grain.a);
+        } else {
+            colour = tint.rgb * grain.rgb * 4.6326;
+            thick *= grain.a;
+        }
+        float rough = materialParams.look.x;
+        if (materialParams.flags.y > 0.5) {
+            rough = mix(0.06, rough, grain.a);
+        }
+
+        float depth = -mulMat4x4Float3(getViewFromWorldMatrix(), getWorldPosition()).z;
+        float veil = materialParams.fog.z * smoothstep(materialParams.fog.x, materialParams.fog.y, depth);
+#if defined(BLEND_MODE_TRANSPARENT)
+        thick *= 1.0 - veil;
+        material.postLightingColor = vec4(0.0);
+        // A see-through colour is mixed as the screen shows it, not as light adds up: a pale veil over a dark
+        // thing stays a veil. So this asks how bright it will be lit, and what to lay down for that mix.
+        vec3 facing = getWorldNormalVector();
+        float sunward = max(dot(facing, frameUniforms.lightDirection), 0.0);
+        vec3 lamp = frameUniforms.lightColorIntensity.rgb * (frameUniforms.lightColorIntensity.w * sunward * 0.31831);
+        float square = clamp(dot(facing, getWorldViewVector()), 0.0, 1.0);
+        vec3 mirror = mix(vec3(0.04), colour, materialParams.look.y);
+        mirror += (max(vec3(1.0 - rough), mirror) - mirror) * pow(1.0 - square, 5.0);
+        vec3 lit = colour * (1.0 - materialParams.look.y) * (sky(facing) + lamp) + mirror * sky(getWorldReflectedVector());
+        // Right over a middling grey, 0.4 on the screen, and near it either side.
+        vec3 mixed = thick * pow(shoulder(lit), vec3(0.4545)) + (1.0 - thick) * 0.4;
+        float keep = clamp(dot((1.0 - thick) * pow(mixed * 2.5, vec3(1.2)), vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+        vec3 share = min(max(pow(mixed, vec3(2.2)) - keep * 0.1332, vec3(0.0)) / max(lit, vec3(0.0001)), vec3(1.0));
+        material.baseColor = vec4(colour * share, 1.0 - keep);
+        material.specularFactor = dot(share, vec3(0.3333));
+#else
+        material.postLightingColor = vec4(materialParams.haze.rgb * veil, veil);
+        material.baseColor = vec4(colour * thick, thick);
+#endif
+        material.roughness = rough;
+        material.metallic = materialParams.look.y;
+    }
+}

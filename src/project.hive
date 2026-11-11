@@ -85,6 +85,13 @@ proc goArch(target: Str): Str {
     return ""
 }
 
+proc goOs(target: Str): Str {
+    if hive.term.execWith("go", ["env", "GOOS"], "", crossing(target)) is Result.Ok(said) {
+        return text.trim(said)
+    }
+    return ""
+}
+
 // The environment the toolchain is given for `target`. An empty target is an empty
 // overlay, which is `exec` byte for byte, so a build for this machine takes no
 // second path through here.
@@ -218,9 +225,14 @@ proc build(entry: Str, titles: Str[], from: Int): Written {
     }
     // A typeface of the program's own is one only the page can set.
     font := paths.joinPath(paths.joinPath(paths.dirOf(entry), "assets"), "font.woff2")
-    if drawsItself && drawsAScene == false && hive.file.exists(font) == false {
+    if drawsItself && hive.file.exists(font) == false {
         for each source in uinative.sources() {
             put(directory + "/hive", source.file, source.text + "\n", written, errors)
+        }
+        if drawsAScene {
+            for each source in uinative.sceneSources() {
+                put(directory + "/hive", source.file, source.text + "\n", written, errors)
+            }
         }
     }
     // A windowed program's own icon, embedded so the window can link it. Written
@@ -229,16 +241,16 @@ proc build(entry: Str, titles: Str[], from: Int): Written {
     if emitted.window {
         placeIcon(entry, directory + "/hive", written, errors)
     }
-    // The one thing a build ever downloads: the three.js a scene is drawn with,
+    // The one thing a build ever downloads: the engine a scene is drawn by,
     // fetched once against a pinned digest and embedded into the executable. A
     // program that stopped drawing scenes takes it back out.
     if drawsAScene {
-        progress.step(from, "three.js")
-        if vendor.placeThree(directory + "/hive") is Result.Error(why) {
+        progress.step(from, "scene engine")
+        if vendor.placePage(directory + "/hive") is Result.Error(why) {
             append(errors, diag.about(entry, why))
         }
     } else {
-        vendor.clearThree(directory + "/hive")
+        vendor.clearPage(directory + "/hive")
     }
     if drawsAScene || emitted.window {
         placeAssets(entry, directory + "/hive", from, written, errors)
@@ -362,6 +374,37 @@ proc placeIcon(entry: Str, into: Str, written: mut Str[dyn], errors: mut diag.Di
     }
     append(written, target)
     put(into, "windowicon.go", icon.embedSource() + "\n", written, errors)
+}
+
+// A window that draws a scene itself carries the engine that draws it, for the
+// platform being built for. Where there is none the window is a page.
+proc placeEngine(entry: Str, written: Written, target: Str, from: Int): Result<Bool, diag.Diagnostic> {
+    into := paths.joinPath(written.directory, "hive")
+    if hive.file.exists(paths.joinPath(into, "uinative_scene.go")) == false {
+        return Result.Ok(false)
+    }
+    os := goOs(target)
+    arch := goArch(target)
+    found := vendor.engineFor(os, arch)
+    if found is Result.Error(why) {
+        return Result.Error(diag.about(entry, why))
+    }
+    if found is Result.Ok(engine) {
+        if engine.path == "" {
+            return Result.Ok(false)
+        }
+        progress.step(from, "window engine")
+        file := vendor.engineFile(os, arch)
+        if hive.file.copy(engine.path, paths.joinPath(into, file)) is Result.Error(why) {
+            return Result.Error(diag.about(entry, "cannot copy the scene engine into the build: {why.message}"))
+        }
+        carried := uinative.carried(file, engine.digest, os, arch)
+        if hive.file.write(paths.joinPath(into, carried.file), carried.text + "\n") is Result.Error(why) {
+            return Result.Error(diag.about(entry, "cannot write `{carried.file}`: {why.message}"))
+        }
+        return Result.Ok(true)
+    }
+    return Result.Ok(false)
 }
 
 // The icon as a Windows resource object, so the executable itself carries it,
@@ -557,6 +600,9 @@ proc compile(entry: Str, target: Str, from: Int): Written {
     if resolveDeps(written, from) is Result.Error(why) {
         return Written(written.directory, written.files, written.thirdParty, written.windowed, [why])
     }
+    if placeEngine(entry, written, target, from) is Result.Error(why) {
+        return Written(written.directory, written.files, written.thirdParty, written.windowed, [why])
+    }
     // Asked once: it is a question with a `go env` behind it, and both answers
     // below are the same one.
     windows := windowsTarget(target)
@@ -614,6 +660,9 @@ proc run(entry: Str, args: Str[], from: Int): Result<Int, diag.Diagnostic[dyn]> 
         return Result.Error(written.errors)
     }
     if resolveDeps(written, from) is Result.Error(why) {
+        return Result.Error([why])
+    }
+    if placeEngine(entry, written, "", from) is Result.Error(why) {
         return Result.Error([why])
     }
     progress.step(from, "go build")

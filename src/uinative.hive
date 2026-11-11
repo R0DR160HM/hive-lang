@@ -1,8 +1,9 @@
 // The window hive.ui draws itself
 // ================================
-// On Windows and Linux, a window with no scene in it is drawn by the program rather
-// than by a browser. The layout is modelled on Clay (https://github.com/nicbarker/clay)
-// by Nic Barker: widths, then the text wrapped to them, then heights, then places.
+// On Windows and Linux a window is drawn by the program rather than by a browser.
+// The layout is modelled on Clay (https://github.com/nicbarker/clay) by Nic Barker:
+// widths, then the text wrapped to them, then heights, then places. A scene in one
+// is drawn by the engine in `scene/`, started beside the program.
 
 type Source {
     file: Str
@@ -37,6 +38,31 @@ func sources(): Source[dyn] {
         Source("uinative_font_cff_linux.go", fontCffSource()),
         Source("uinative_font_var_linux.go", fontVarSource())
     ]
+}
+
+// What a window holding a scene is written as besides.
+func sceneSources(): Source[dyn] {
+    return [
+        Source("uinative_scene.go", sceneSource()),
+        Source("uiengine.go", engineSource()),
+        Source("uiengine_windows.go", engineWindowsSource()),
+        Source("uiengine_linux.go", engineLinuxSource())
+    ]
+}
+
+// The engine itself, carried in the executable. The file's name ends in its
+// platform, which is what keeps the toolchain from linking it into any other.
+func carried(file: Str, digest: Str, os: Str, arch: Str): Source {
+    return Source("uiengine_carried_" + os + "_" + arch + ".go", `
+        package hive
+
+        import _ "embed"
+
+        //go:embed {file}
+        var uiEngineCarried []byte
+
+        func init() \{ uiEngineData, uiEngineSum = uiEngineCarried, "{digest}" }
+    `)
 }
 
 // The tree laid out as the stylesheet lays it out, and what the widgets remember.
@@ -215,8 +241,11 @@ func coreSource(): Str {
         			}
         			continue
         		}
-        		for x := range row \{
-        			row[x] = uiBlendPixel(row[x], c, 1)
+        		a, under := uint32(c.a), 255-uint32(c.a)
+        		cr, cg, cb := uint32(c.r)*a+127, uint32(c.g)*a+127, uint32(c.b)*a+127
+        		for x, d := range row \{
+        			r, g, b := (d>>16&0xff)*under+cr, (d>>8&0xff)*under+cg, (d&0xff)*under+cb
+        			row[x] = (r+1+r>>8)>>8<<16 | (g+1+g>>8)>>8<<8 | (b+1+b>>8)>>8 | 0xff000000
         		}
         	}
         }
@@ -736,6 +765,46 @@ func coreSource(): Str {
         	cover  []uint8
 
         	wake func()
+
+        	stage      uiStaging
+        	sceneBox   *uiBox
+        	insetBoxes []*uiBox
+        	owed       atomic.Bool
+        }
+
+        type uiStaging interface \{
+        	settle()
+        	idle()
+        	pump() bool
+        	paint(cv *uiCanvas, b *uiBox, clip uiClip)
+        	hidden(x, y float64) bool
+        	key(name string, down bool) bool
+        	press(button int, x, y float64) bool
+        	lift(button int) bool
+        	drag(x, y float64)
+        	looked(dx, dy float64)
+        	blur()
+        	tick()
+        	close()
+        }
+
+        var uiStageMake func(n *uiNative) uiStaging
+        var uiStageReady func() bool
+
+        type uiGamepad struct \{
+        	named    bool
+        	controls map[string]float64
+        }
+
+        func (n *uiNative) staged() bool \{
+        	if uiStageMake == nil \{
+        		return true
+        	}
+        	n.layout()
+        	if n.stage == nil \{
+        		return true
+        	}
+        	return n.stage.pump()
         }
 
         func uiNewNative() *uiNative \{
@@ -762,6 +831,7 @@ func coreSource(): Str {
         	defer n.mu.Unlock()
         	n.next = &v
         	n.last = v
+        	n.owed.Store(false)
         	wake := !n.queued
         	n.queued = true
         	return wake
@@ -954,9 +1024,16 @@ func coreSource(): Str {
         	}
         	b.lineH = b.font.px * 1.5
         	switch v.Kind \{
-        	case "row", "column", "overlay":
+        	case "row", "column", "overlay", "inset":
         		b.container = true
         		b.row = v.Kind == "row"
+        		if v.Kind == "inset" \{
+        			n.insetBoxes = append(n.insetBoxes, b)
+        		}
+        	case "scene":
+        		if n.sceneBox == nil \{
+        			n.sceneBox = b
+        		}
         	case "button":
         		if !padded \{
         			b.padX, b.padY = 14, 6
@@ -1387,6 +1464,9 @@ func coreSource(): Str {
         				it.min = math.Max(it.min, it.basis)
         			}
         			if k.width >= 0 && (k.container || k.kind == "image") \{
+        				if b.scroll != "Horizontal" \{
+        					it.min = math.Min(it.min, inner)
+        				}
         				it.max = math.Max(inner, it.min)
         			}
         			items[i] = it
@@ -1756,6 +1836,7 @@ func coreSource(): Str {
         	view := n.last
         	n.seq = 0
         	n.layers = n.layers[:0]
+        	n.sceneBox, n.insetBoxes = nil, n.insetBoxes[:0]
         	root := n.build(&UiView\{Kind: "column", Children: []UiView\{view}}, "r", nil)
         	n.forget()
         	n.intrinsic(root)
@@ -1784,6 +1865,16 @@ func coreSource(): Str {
         		if b, ok := n.boxes[path]; !ok || b.kind != "textarea" \{
         			delete(n.grown, path)
         		}
+        	}
+        	switch \{
+        	case uiStageMake == nil:
+        	case n.sceneBox != nil:
+        		if n.stage == nil \{
+        			n.stage = uiStageMake(n)
+        		}
+        		n.stage.settle()
+        	case n.stage != nil:
+        		n.stage.idle()
         	}
         }
 
@@ -2098,6 +2189,12 @@ func paintSource(): Str {
         		n.paintImage(cv, b, clip, under)
         	case "canvas":
         		n.paintCanvas(cv, b, clip, under)
+        	case "scene":
+        		if n.stage != nil && b == n.sceneBox \{
+        			n.stage.paint(cv, b, clip)
+        		} else \{
+        			cv.fill(box.x0, box.y0, box.x1, box.y1, uiHexRGB(0x0b0d10), clip)
+        		}
         	}
         	inner := clip
         	if b.scroll != "" \{
@@ -3074,6 +3171,9 @@ func inputSource(): Str {
         	var chain []*uiBox
         	var walk func(b *uiBox) bool
         	walk = func(b *uiBox) bool \{
+        		if b.kind == "inset" \{
+        			return false
+        		}
         		inside := x >= b.x && x < b.x+b.w && y >= b.y+b.margin && y < b.y+b.h-b.margin
         		if b.scroll != "" && !inside \{
         			return false
@@ -3223,6 +3323,9 @@ func inputSource(): Str {
         func (n *uiNative) cursor(x, y float64) string \{
         	n.layout()
         	x, y = x/n.scale, y/n.scale
+        	if n.stage != nil && n.stage.hidden(x, y) \{
+        		return "none"
+        	}
         	if n.popup != nil && n.inPopup(x, y) \{
         		return "arrow"
         	}
@@ -11080,6 +11183,7 @@ func windowsSource(): Str {
         	"sync"
         	"sync/atomic"
         	"syscall"
+        	"time"
         	"unsafe"
         )
 
@@ -11130,6 +11234,9 @@ func windowsSource(): Str {
         	uiwSetClipboardData    = uiwUser32.NewProc("SetClipboardData")
         	uiwCreateIconFromBytes = uiwUser32.NewProc("CreateIconFromResourceEx")
         	uiwDestroyIcon         = uiwUser32.NewProc("DestroyIcon")
+        	uiwClipCursor          = uiwUser32.NewProc("ClipCursor")
+        	uiwSetCursorPos        = uiwUser32.NewProc("SetCursorPos")
+        	uiwClientToScreen      = uiwUser32.NewProc("ClientToScreen")
 
         	uiwCreateCompatibleDC = uiwGdi32.NewProc("CreateCompatibleDC")
         	uiwCreateDIBSection   = uiwGdi32.NewProc("CreateDIBSection")
@@ -11154,6 +11261,7 @@ func windowsSource(): Str {
         	uiwGetLocaleInfoEx = uiwKernel32.NewProc("GetLocaleInfoEx")
 
         	uiwDwmSetWindowAttribute = uiwDwmapi.NewProc("DwmSetWindowAttribute")
+        	uiwDwmFlush              = uiwDwmapi.NewProc("DwmFlush")
         	uiwRegGetValue           = uiwAdvapi32.NewProc("RegGetValueW")
 
         	uiwImmGetContext           = uiwImm32.NewProc("ImmGetContext")
@@ -11190,6 +11298,10 @@ func windowsSource(): Str {
         	uiwWmDpiChanged    = 0x02E0
         	uiwWmSetIcon       = 0x0080
         	uiwWmAppView       = 0x8001
+        	uiwWmAppTick       = 0x8002
+        	uiwWmSysKeyUp      = 0x0105
+        	uiwWmRButtonDown   = 0x0204
+        	uiwWmMButtonDown   = 0x0207
         	uiwWsOverlapped    = 0x00CF0000
         	uiwCwUseDefault    = 0x80000000
         	uiwTransparent     = 1
@@ -11325,6 +11437,13 @@ func windowsSource(): Str {
         	title    string
         	swallow  bool
         	msg      uiwMsg
+
+        	grabbed bool
+        	centre  uiwPoint
+        	ticks   chan struct\{}
+        	ticked  atomic.Bool
+        	padHere [4]bool
+        	padBeat int
         }
 
         func (w *uiwWindow) show(v UiView) \{
@@ -11342,6 +11461,9 @@ func windowsSource(): Str {
         func (w *uiwWindow) last() UiView \{ return w.n.latest() }
 
         func (w *uiwWindow) open(title string, addr SyslinkAddress) bool \{
+        	if uiStageReady != nil && !uiStageReady() \{
+        		return false
+        	}
         	w.n.addr = addr
         	opened := make(chan bool, 1)
         	go w.run(title, opened)
@@ -11476,12 +11598,24 @@ func windowsSource(): Str {
         	case uiwWmEraseBkgnd:
         		return 1, true
         	case uiwWmSize:
+        		if w.grabbed \{
+        			w.grabbed = false
+        			w.holding(true)
+        		}
         		w.invalidate()
         		return 0, true
         	case uiwWmAppView:
         		n.adopt()
         		w.retitle()
-        		w.invalidate()
+        		if n.staged() \{
+        			w.invalidate()
+        		}
+        		return 0, true
+        	case uiwWmAppTick:
+        		w.ticked.Store(false)
+        		if n.stage != nil \{
+        			n.stage.tick()
+        		}
         		return 0, true
         	case uiwWmDpiChanged:
         		r := (*uiwRect)(uiwAt(lp))
@@ -11500,6 +11634,9 @@ func windowsSource(): Str {
         		}
         		var shape uintptr = 32512
         		switch n.cursor(n.pointer[0]*n.scale, n.pointer[1]*n.scale) \{
+        		case "none":
+        			uiwCall(uiwSetCursor, 0)
+        			return 1, true
         		case "text":
         			shape = 32513
         		case "hand":
@@ -11518,12 +11655,26 @@ func windowsSource(): Str {
         			uiwCall(uiwTrackMouseEvent, uintptr(unsafe.Pointer(&track)))
         			w.tracking = true
         		}
+        		if w.grabbed \{
+        			dx, dy := uiwLow(lp)-int(w.centre.x), uiwHigh(lp)-int(w.centre.y)
+        			if (dx != 0 || dy != 0) && n.stage != nil \{
+        				n.stage.looked(float64(dx)/n.scale, float64(dy)/n.scale)
+        				w.recentre()
+        			}
+        			return 0, true
+        		}
+        		if n.stage != nil \{
+        			n.stage.drag(float64(uiwLow(lp))/n.scale, float64(uiwHigh(lp))/n.scale)
+        		}
         		n.ctrl = wp&0x0008 != 0
         		if n.move(float64(uiwLow(lp)), float64(uiwHigh(lp))) \{
         			w.invalidate()
         		}
         		return 0, true
-        	case uiwWmKeyUp:
+        	case uiwWmKeyUp, uiwWmSysKeyUp:
+        		if n.stage != nil \{
+        			n.stage.key(w.sceneKey(wp), false)
+        		}
         		if wp == 0x11 && n.setCtrl(false) \{
         			w.invalidate()
         		}
@@ -11534,12 +11685,30 @@ func windowsSource(): Str {
         			w.invalidate()
         		}
         		return 0, true
+        	case uiwWmMButtonDown, uiwWmRButtonDown:
+        		button := 3
+        		if msg == uiwWmMButtonDown \{
+        			button = 2
+        		}
+        		if n.stage != nil && n.stage.press(button, float64(uiwLow(lp))/n.scale, float64(uiwHigh(lp))/n.scale) \{
+        			return 0, true
+        		}
+        		return 0, false
         	case uiwWmMButtonUp:
+        		if n.stage != nil && n.stage.lift(2) \{
+        			return 0, true
+        		}
         		if n.middle(float64(uiwLow(lp)), float64(uiwHigh(lp))) \{
         			w.invalidate()
         		}
         		return 0, true
         	case uiwWmLButtonDown:
+        		if n.stage != nil && n.stage.press(1, float64(uiwLow(lp))/n.scale, float64(uiwHigh(lp))/n.scale) \{
+        			if !w.grabbed \{
+        				uiwCall(uiwSetCapture, w.hwnd)
+        			}
+        			return 0, true
+        		}
         		uiwCall(uiwSetCapture, w.hwnd)
         		n.ctrl = wp&0x0008 != 0
         		if n.down(float64(uiwLow(lp)), float64(uiwHigh(lp))) \{
@@ -11547,12 +11716,21 @@ func windowsSource(): Str {
         		}
         		return 0, true
         	case uiwWmLButtonUp:
+        		if n.stage != nil && n.stage.lift(1) \{
+        			if !w.grabbed \{
+        				uiwCall(uiwReleaseCapture)
+        			}
+        			return 0, true
+        		}
         		uiwCall(uiwReleaseCapture)
         		if n.up(float64(uiwLow(lp)), float64(uiwHigh(lp))) \{
         			w.invalidate()
         		}
         		return 0, true
         	case uiwWmRButtonUp:
+        		if n.stage != nil && n.stage.lift(3) \{
+        			return 0, true
+        		}
         		if n.menu(float64(uiwLow(lp)), float64(uiwHigh(lp))) \{
         			w.invalidate()
         		}
@@ -11571,6 +11749,10 @@ func windowsSource(): Str {
         		return 0, true
         	case uiwWmKeyDown, uiwWmSysKeyDown:
         		w.swallow = false
+        		if n.stage != nil && n.stage.key(w.sceneKey(wp), true) \{
+        			w.swallow = true
+        			return 0, true
+        		}
         		if wp == 0x11 \{
         			if n.setCtrl(true) \{
         				w.invalidate()
@@ -11640,6 +11822,9 @@ func windowsSource(): Str {
         		}
         		return 0, true
         	case uiwWmKillFocus:
+        		if n.stage != nil \{
+        			n.stage.blur()
+        		}
         		w.active = false
         		n.blink = false
         		n.unfocused()
@@ -12064,7 +12249,193 @@ func windowsSource(): Str {
         	return append(out, make([]byte, side*((side+31)/32*4))...)
         }
 
+        var uiwSceneKeys = map[uintptr]string\{
+        	0x08: "backspace", 0x09: "tab", 0x0D: "enter", 0x10: "shift", 0x11: "ctrl", 0x12: "alt", 0x13: "pause",
+        	0x14: "capslock", 0x1B: "escape", 0x20: "space", 0x21: "pageup", 0x22: "pagedown", 0x23: "end", 0x24: "home",
+        	0x25: "left", 0x26: "up", 0x27: "right", 0x28: "down", 0x2C: "printscreen", 0x2D: "insert", 0x2E: "delete",
+        	0x5B: "meta", 0x5C: "meta", 0x5D: "contextmenu", 0x6A: "*", 0x6B: "+", 0x6D: "-", 0x6E: ".", 0x6F: "/",
+        	0x90: "numlock", 0x91: "scrolllock",
+        }
+
+        func (w *uiwWindow) sceneKey(vk uintptr) string \{
+        	switch \{
+        	case vk >= 0x30 && vk <= 0x39:
+        		return string(rune(vk))
+        	case vk >= 0x41 && vk <= 0x5A:
+        		return string(rune(vk + 32))
+        	case vk >= 0x60 && vk <= 0x69:
+        		return string(rune('0' + vk - 0x60))
+        	case vk >= 0x70 && vk <= 0x87:
+        		return "f" + strconv.Itoa(int(vk-0x6F))
+        	}
+        	if name, ok := uiwSceneKeys[vk]; ok \{
+        		return name
+        	}
+        	if r := rune(uiwCall(uiwMapVirtualKey, vk, 2) & 0x7FFF); r > 0x20 \{
+        		return strings.ToLower(string(r))
+        	}
+        	return ""
+        }
+
+        func (w *uiwWindow) ticking(on bool) \{
+        	if on == (w.ticks != nil) \{
+        		return
+        	}
+        	if !on \{
+        		close(w.ticks)
+        		w.ticks = nil
+        		return
+        	}
+        	stop := make(chan struct\{})
+        	w.ticks = stop
+        	hwnd := w.hwnd
+        	go func() \{
+        		for \{
+        			select \{
+        			case <-stop:
+        				return
+        			default:
+        			}
+        			began := time.Now()
+        			if uiwDwmFlush.Find() != nil || uiwCall(uiwDwmFlush) != 0 || time.Since(began) < 2*time.Millisecond \{
+        				time.Sleep(8 * time.Millisecond)
+        			}
+        			if w.ticked.CompareAndSwap(false, true) \{
+        				uiwCall(uiwPostMessage, hwnd, uiwWmAppTick, 0, 0)
+        			}
+        		}
+        	}()
+        }
+
+        func (w *uiwWindow) recentre() \{
+        	at := w.centre
+        	uiwCall(uiwClientToScreen, w.hwnd, uintptr(unsafe.Pointer(&at)))
+        	uiwCall(uiwSetCursorPos, uintptr(at.x), uintptr(at.y))
+        }
+
+        func (w *uiwWindow) holding(on bool) \{
+        	if on == w.grabbed \{
+        		return
+        	}
+        	w.grabbed = on
+        	if !on \{
+        		uiwCall(uiwClipCursor, 0)
+        		uiwCall(uiwReleaseCapture)
+        		return
+        	}
+        	var r uiwRect
+        	uiwCall(uiwGetClientRect, w.hwnd, uintptr(unsafe.Pointer(&r)))
+        	w.centre = uiwPoint\{(r.right - r.left) / 2, (r.bottom - r.top) / 2}
+        	from, to := uiwPoint\{0, 0}, uiwPoint\{r.right, r.bottom}
+        	uiwCall(uiwClientToScreen, w.hwnd, uintptr(unsafe.Pointer(&from)))
+        	uiwCall(uiwClientToScreen, w.hwnd, uintptr(unsafe.Pointer(&to)))
+        	clip := uiwRect\{from.x, from.y, to.x, to.y}
+        	uiwCall(uiwClipCursor, uintptr(unsafe.Pointer(&clip)))
+        	uiwCall(uiwSetCapture, w.hwnd)
+        	w.recentre()
+        	uiwCall(uiwSetCursor, 0)
+        }
+
+        func (w *uiwWindow) blot(f uiFont, s string) (int, int, []uint8) \{
+        	wide := int(math.Ceil(w.measure(f, s) * w.n.scale))
+        	tall := int(math.Ceil(w.metric(f).tall * w.n.scale))
+        	if wide < 1 || tall < 1 \{
+        		return 0, 0, nil
+        	}
+        	dc := uiwCall(uiwCreateCompatibleDC, 0)
+        	info := uiwBitmapInfo\{width: int32(wide), height: -int32(tall), planes: 1, bitCount: 32}
+        	info.size = 40
+        	var bits uintptr
+        	bitmap := uiwCall(uiwCreateDIBSection, dc, uintptr(unsafe.Pointer(&info)), 0, uintptr(unsafe.Pointer(&bits)), 0, 0)
+        	if bitmap == 0 \{
+        		uiwCall(uiwDeleteDC, dc)
+        		return 0, 0, nil
+        	}
+        	was := uiwCall(uiwSelectObject, dc, bitmap)
+        	face := uiwCall(uiwSelectObject, dc, w.font(f))
+        	uiwCall(uiwSetBkMode, dc, uiwTransparent)
+        	uiwCall(uiwSetTextColor, dc, 0xFFFFFF)
+        	u := uiwText(s)
+        	uiwCall(uiwExtTextOut, dc, 0, 0, 0, 0, uintptr(unsafe.Pointer(&u[0])), uintptr(len(u)-1), 0)
+        	uiwCall(uiwGdiFlush)
+        	cover := make([]uint8, wide*tall)
+        	for i, p := range unsafe.Slice((*uint32)(uiwAt(bits)), wide*tall) \{
+        		cover[i] = uint8((p>>16&0xff + p>>8&0xff + p&0xff) / 3)
+        	}
+        	uiwCall(uiwSelectObject, dc, face)
+        	uiwCall(uiwSelectObject, dc, was)
+        	uiwCall(uiwDeleteObject, bitmap)
+        	uiwCall(uiwDeleteDC, dc)
+        	return wide, tall, cover
+        }
+
+        type uiwPadState struct \{
+        	packet         uint32
+        	buttons        uint16
+        	lt, rt         uint8
+        	lx, ly, rx, ry int16
+        }
+
+        var (
+        	uiwPadOnce sync.Once
+        	uiwPadRead *syscall.LazyProc
+        )
+
+        var uiwPadButtons = []struct \{
+        	bit  uint16
+        	name string
+        }\{
+        	\{0x0001, "up"}, \{0x0002, "down"}, \{0x0004, "left"}, \{0x0008, "right"}, \{0x0010, "start"}, \{0x0020, "back"},
+        	\{0x0040, "lstick"}, \{0x0080, "rstick"}, \{0x0100, "lb"}, \{0x0200, "rb"}, \{0x1000, "a"}, \{0x2000, "b"},
+        	\{0x4000, "x"}, \{0x8000, "y"},
+        }
+
+        func (w *uiwWindow) pads() map[int]uiGamepad \{
+        	uiwPadOnce.Do(func() \{
+        		for _, name := range []string\{"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"} \{
+        			dll := syscall.NewLazyDLL(name)
+        			if dll.Load() == nil \{
+        				uiwPadRead = dll.NewProc("XInputGetState")
+        				return
+        			}
+        		}
+        	})
+        	out := map[int]uiGamepad\{}
+        	if uiwPadRead == nil \{
+        		return out
+        	}
+        	w.padBeat++
+        	for i := 0; i < 4; i++ \{
+        		if !w.padHere[i] && w.padBeat%60 != i*15 \{
+        			continue
+        		}
+        		var st uiwPadState
+        		w.padHere[i] = uiwCall(uiwPadRead, uintptr(i), uintptr(unsafe.Pointer(&st))) == 0
+        		if !w.padHere[i] \{
+        			continue
+        		}
+        		stick := func(v int16) float64 \{ return math.Max(-1, float64(v)/32767) }
+        		c := map[string]float64\{
+        			"leftX": stick(st.lx), "leftY": -stick(st.ly), "rightX": stick(st.rx), "rightY": -stick(st.ry),
+        			"lt": float64(st.lt) / 255, "rt": float64(st.rt) / 255,
+        		}
+        		for _, b := range uiwPadButtons \{
+        			c[b.name] = 0
+        			if st.buttons&b.bit != 0 \{
+        				c[b.name] = 1
+        			}
+        		}
+        		out[i] = uiGamepad\{named: true, controls: c}
+        	}
+        	return out
+        }
+
         func (w *uiwWindow) closed() \{
+        	w.ticking(false)
+        	w.holding(false)
+        	if w.n.stage != nil \{
+        		w.n.stage.close()
+        	}
         	uiwCall(uiwKillTimer, w.hwnd, uiwBlinkTimer)
         	uiwCall(uiwKillTimer, w.hwnd, uiwFrameTimer)
         	uiwWindows.Delete(w.hwnd)
@@ -13205,6 +13576,7 @@ func linuxSource(): Str {
         	"strconv"
         	"strings"
         	"sync"
+        	"syscall"
         	"time"
         	"unicode"
         )
@@ -13624,6 +13996,16 @@ func linuxSource(): Str {
         	title    string
         	told     time.Time
         	tell     <-chan time.Time
+
+        	beat     *time.Ticker
+        	beats    <-chan time.Time
+        	grabbed  bool
+        	lifting  bool
+        	lifted   byte
+        	liftedAt uint32
+        	liftedAs string
+        	padFiles [4]*uixPadFile
+        	padBeat  int
         }
 
         func (w *uixWindow) show(v UiView) \{
@@ -13642,6 +14024,9 @@ func linuxSource(): Str {
         func (w *uixWindow) last() UiView \{ return w.n.latest() }
 
         func (w *uixWindow) open(title string, addr SyslinkAddress) bool \{
+        	if uiStageReady != nil && !uiStageReady() \{
+        		return false
+        	}
         	w.n.addr = addr
         	fonts := uixSystemFonts()
         	if fonts == nil \{
@@ -13692,6 +14077,12 @@ func linuxSource(): Str {
         			u16(0).u16(0).u16(0).u16(0xffff).u16(0xffff).u16(0xffff))
         		w.cursors[shape] = id
         	}
+        	blank, ink, none := c.id(), c.id(), c.id()
+        	c.send(uixRequest(53, 1).u32(blank).u32(w.win).u16(1).u16(1))
+        	c.send(uixRequest(55, 0).u32(ink).u32(blank).u32(0x4).u32(0))
+        	c.send(uixRequest(70, 0).u32(blank).u32(ink).u16(0).u16(0).u16(1).u16(1))
+        	c.send(uixRequest(93, 0).u32(none).u32(blank).u32(blank).u16(0).u16(0).u16(0).u16(0).u16(0).u16(0).u16(0).u16(0))
+        	w.cursors["none"] = none
         	w.shape = "arrow"
         	w.setCursor("arrow")
         	w.retitle(title)
@@ -13952,13 +14343,20 @@ func linuxSource(): Str {
         					return
         				}
         			}
+        			w.letUp()
         		case <-w.woke:
         			w.n.adopt()
         			if title := uiTitleOf(w.n.latest()); title != "" && title != w.title \{
         				w.retitle(title)
         				w.c.flush()
         			}
-        			w.dirty = true
+        			if w.n.staged() \{
+        				w.dirty = true
+        			}
+        		case <-w.beats:
+        			if w.n.stage != nil \{
+        				w.n.stage.tick()
+        			}
         		case f := <-w.inbox:
         			f()
         		case <-w.tell:
@@ -14003,11 +14401,22 @@ func linuxSource(): Str {
         	switch ev[0] & 0x7f \{
         	case 2, 3:
         		w.stamp = uixLE.Uint32(ev[4:])
+        		if n.stage != nil && w.sceneKeyed(ev[1], uixLE.Uint16(ev[28:]), ev[0]&0x7f == 3) \{
+        			break
+        		}
         		w.keyEvent(ev[1], uixLE.Uint16(ev[28:]), ev[0]&0x7f == 3)
         	case 4, 5:
         		w.stamp = uixLE.Uint32(ev[4:])
         		x, y := float64(int16(uixLE.Uint16(ev[24:]))), float64(int16(uixLE.Uint16(ev[26:])))
         		state := uixLE.Uint16(ev[28:])
+        		if button := int(ev[1]); n.stage != nil && button <= 3 \{
+        			if ev[0]&0x7f == 4 && n.stage.press(button, x/w.scale, y/w.scale) \{
+        				break
+        			}
+        			if ev[0]&0x7f == 5 && n.stage.lift(button) \{
+        				break
+        			}
+        		}
         		switch button := ev[1]; \{
         		case button == 1 && ev[0]&0x7f == 4:
         			n.ctrl = state&4 != 0
@@ -14027,6 +14436,16 @@ func linuxSource(): Str {
         		}
         	case 6, 7:
         		x, y := float64(int16(uixLE.Uint16(ev[24:]))), float64(int16(uixLE.Uint16(ev[26:])))
+        		if w.grabbed \{
+        			if dx, dy := x-float64(w.w/2), y-float64(w.h/2); (dx != 0 || dy != 0) && n.stage != nil \{
+        				n.stage.looked(dx/w.scale, dy/w.scale)
+        				w.recentre()
+        			}
+        			break
+        		}
+        		if n.stage != nil \{
+        			n.stage.drag(x/w.scale, y/w.scale)
+        		}
         		n.ctrl = uixLE.Uint16(ev[28:])&4 != 0
         		w.dirty = n.move(x, y) || w.dirty
         		w.setCursor(n.cursor(x, y))
@@ -14050,6 +14469,10 @@ func linuxSource(): Str {
         		}
         	case 10:
         		if ev[1] != 2 && ev[1] != 5 && ev[1] != 7 \{
+        			w.letUp()
+        			if n.stage != nil \{
+        				n.stage.blur()
+        			}
         			w.focused = false
         			n.blink = false
         			n.unfocused()
@@ -14620,8 +15043,223 @@ func linuxSource(): Str {
         	}
         }
 
+        var uixSceneKeys = map[uint32]string\{
+        	0xff08: "backspace", 0xff09: "tab", 0xfe20: "tab", 0xff0d: "enter", 0xff8d: "enter", 0xff1b: "escape",
+        	0xffff: "delete", 0xff9f: "delete", 0xff63: "insert", 0x20: "space", 0xff50: "home", 0xff95: "home",
+        	0xff57: "end", 0xff9c: "end", 0xff51: "left", 0xff96: "left", 0xff53: "right", 0xff98: "right",
+        	0xff52: "up", 0xff97: "up", 0xff54: "down", 0xff99: "down", 0xff55: "pageup", 0xff9a: "pageup",
+        	0xff56: "pagedown", 0xff9b: "pagedown", 0xffe1: "shift", 0xffe2: "shift", 0xffe3: "ctrl", 0xffe4: "ctrl",
+        	0xffe9: "alt", 0xffea: "alt", 0xffeb: "meta", 0xffec: "meta", 0xffe5: "capslock", 0xff13: "pause",
+        	0xff7f: "numlock", 0xff14: "scrolllock", 0xff61: "printscreen", 0xff67: "contextmenu",
+        	0xffaa: "*", 0xffab: "+", 0xffad: "-", 0xffae: ".", 0xffaf: "/",
+        }
+
+        func (w *uixWindow) sceneKey(code byte, state uint16) string \{
+        	sym := w.keysym(code, state&^1)
+        	if name, ok := uixSceneKeys[sym]; ok \{
+        		return name
+        	}
+        	switch \{
+        	case sym >= 0xffbe && sym <= 0xffd5:
+        		return "f" + strconv.Itoa(int(sym-0xffbd))
+        	case sym >= 0xffb0 && sym <= 0xffb9:
+        		return string(rune('0' + sym - 0xffb0))
+        	}
+        	if r := uixRune(sym); r > 0x20 \{
+        		return strings.ToLower(string(r))
+        	}
+        	return ""
+        }
+
+        func (w *uixWindow) letUp() \{
+        	if w.lifting \{
+        		w.lifting = false
+        		if w.n.stage != nil \{
+        			w.n.stage.key(w.liftedAs, false)
+        		}
+        	}
+        }
+
+        func (w *uixWindow) sceneKeyed(code byte, state uint16, release bool) bool \{
+        	name := w.sceneKey(code, state)
+        	if release \{
+        		w.letUp()
+        		w.lifting, w.lifted, w.liftedAt, w.liftedAs = true, code, w.stamp, name
+        		return false
+        	}
+        	if w.lifting && w.lifted == code && w.liftedAt == w.stamp \{
+        		w.lifting = false
+        	} else \{
+        		w.letUp()
+        	}
+        	return w.n.stage.key(name, true)
+        }
+
+        func (w *uixWindow) ticking(on bool) \{
+        	if on == (w.beat != nil) \{
+        		return
+        	}
+        	if !on \{
+        		w.beat.Stop()
+        		w.beat, w.beats = nil, nil
+        		return
+        	}
+        	w.beat = time.NewTicker(time.Second / 60)
+        	w.beats = w.beat.C
+        }
+
+        func (w *uixWindow) recentre() \{
+        	w.c.send(uixRequest(41, 0).u32(0).u32(w.win).u16(0).u16(0).u16(0).u16(0).u16(w.w / 2).u16(w.h / 2))
+        }
+
+        func (w *uixWindow) holding(on bool) \{
+        	if on == w.grabbed \{
+        		return
+        	}
+        	if !on \{
+        		w.grabbed = false
+        		w.c.send(uixRequest(27, 0).u32(0))
+        		w.shape = ""
+        		return
+        	}
+        	reply, ok := w.c.call(uixRequest(26, 1).u32(w.win).u16(0x204C).u8(1).u8(1).u32(w.win).u32(w.cursors["none"]).u32(0))
+        	if !ok || len(reply) < 2 || reply[1] != 0 \{
+        		return
+        	}
+        	w.grabbed = true
+        	w.recentre()
+        }
+
+        func (w *uixWindow) blot(f uiFont, s string) (int, int, []uint8) \{
+        	wide := int(math.Ceil(w.fonts.measure(f, s) * w.scale))
+        	tall := int(math.Ceil(w.fonts.tall(f) * w.scale))
+        	if wide < 1 || tall < 1 \{
+        		return 0, 0, nil
+        	}
+        	cv := &uiCanvas\{pix: make([]uint32, wide*tall), w: wide, h: tall, flush: func() \{}}
+        	for i := range cv.pix \{
+        		cv.pix[i] = 0xff000000
+        	}
+        	w.fonts.draw(cv, f, f.px*w.scale, 0, 0, s, uiWhite, uiClip\{0, 0, wide, tall})
+        	cover := make([]uint8, wide*tall)
+        	for i, p := range cv.pix \{
+        		cover[i] = uint8(p >> 8)
+        	}
+        	return wide, tall, cover
+        }
+
+        type uixPadFile struct \{
+        	fd      int
+        	axes    [16]float64
+        	buttons [32]float64
+        	axisN   int
+        	buttonN int
+        }
+
+        var uixPadLooseButtons = []string\{"a", "b", "x", "y", "lb", "rb", "back", "start", "guide", "lstick", "rstick"}
+        var uixPadLooseAxes = []string\{"leftX", "leftY", "lt", "rightX", "rightY", "rt", "dpadX", "dpadY"}
+        var uixPadButtons = []string\{"a", "b", "x", "y", "lb", "rb", "lt", "rt", "back", "start", "lstick", "rstick",
+        	"up", "down", "left", "right", "guide"}
+        var uixPadAxes = []string\{"leftX", "leftY", "rightX", "rightY"}
+
+        func uixPadName(names []string, at int, rest string) string \{
+        	if at < len(names) \{
+        		return names[at]
+        	}
+        	return rest + strconv.Itoa(at)
+        }
+
+        func (w *uixWindow) pads() map[int]uiGamepad \{
+        	out := map[int]uiGamepad\{}
+        	w.padBeat++
+        	for i := range w.padFiles \{
+        		p := w.padFiles[i]
+        		if p == nil \{
+        			if w.padBeat%60 != i*15 \{
+        				continue
+        			}
+        			fd, err := syscall.Open("/dev/input/js"+strconv.Itoa(i), syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
+        			if err != nil \{
+        				continue
+        			}
+        			p = &uixPadFile\{fd: fd}
+        			w.padFiles[i] = p
+        		}
+        		var ev [8]byte
+        		gone := false
+        		for \{
+        			got, err := syscall.Read(p.fd, ev[:])
+        			if got == 8 \{
+        				value, kind, at := float64(int16(uixLE.Uint16(ev[4:]))), ev[6]&^0x80, int(ev[7])
+        				switch \{
+        				case kind == 1 && at < len(p.buttons):
+        					p.buttons[at] = value
+        					p.buttonN = max(p.buttonN, at+1)
+        				case kind == 2 && at < len(p.axes):
+        					p.axes[at] = math.Max(-1, value/32767)
+        					p.axisN = max(p.axisN, at+1)
+        				}
+        				continue
+        			}
+        			gone = err != nil && err != syscall.EAGAIN
+        			break
+        		}
+        		if gone \{
+        			syscall.Close(p.fd)
+        			w.padFiles[i] = nil
+        			continue
+        		}
+        		wide := p.axisN >= 6 && p.buttonN <= 12
+        		c := map[string]float64\{}
+        		for at := 0; at < p.buttonN; at++ \{
+        			if wide \{
+        				c[uixPadName(uixPadLooseButtons, at, "b")] = p.buttons[at]
+        			} else \{
+        				c[uixPadName(uixPadButtons, at, "b")] = p.buttons[at]
+        			}
+        		}
+        		for at := 0; at < p.axisN; at++ \{
+        			v := p.axes[at]
+        			name := uixPadName(uixPadAxes, at, "axis")
+        			if wide \{
+        				name = uixPadName(uixPadLooseAxes, at, "axis")
+        			}
+        			switch name \{
+        			case "lt", "rt":
+        				if v != 0 \{
+        					v = uiClamp((v+1)/2, 0, 1)
+        				}
+        				c[name] = v
+        			case "dpadX":
+        				c["left"], c["right"] = 0, 0
+        				if v < -0.5 \{
+        					c["left"] = 1
+        				}
+        				if v > 0.5 \{
+        					c["right"] = 1
+        				}
+        			case "dpadY":
+        				c["up"], c["down"] = 0, 0
+        				if v < -0.5 \{
+        					c["up"] = 1
+        				}
+        				if v > 0.5 \{
+        					c["down"] = 1
+        				}
+        			default:
+        				c[name] = v
+        			}
+        		}
+        		out[i] = uiGamepad\{controls: c}
+        	}
+        	return out
+        }
+
         func (w *uixWindow) closed() \{
         	w.gone.Do(func() \{
+        		if w.n.stage != nil \{
+        			w.n.stage.close()
+        		}
         		if w.ime != nil \{
         			w.ime.bus.close()
         		}
@@ -19430,6 +20068,1365 @@ func fontVarSource(): Str {
         		return d2
         	}
         	return d1 + (p-c1)*(d2-d1)/(c2-c1)
+        }
+    `
+}
+
+// A scene in a window the program draws: the engine it starts beside itself, the
+// frames and the box it is sent, the picture read back, and what the player did.
+// A paint waits for the picture a turn asked for, so that what is over the world
+// and the world come from the same turn.
+//
+// What `hive.audio` wants played is played here too. The window listens to the
+// same feed a page would, fetches each stream itself, and hands the engine its
+// bytes; one that runs out is started again after a moment, as a page does.
+func sceneSource(): Str {
+    return `
+        //go:build windows || (linux && !android)
+
+        package hive
+
+        import (
+        	"bytes"
+        	"context"
+        	"crypto/sha256"
+        	"encoding/hex"
+        	"encoding/json"
+        	"image"
+        	"image/draw"
+        	"math"
+        	"net/http"
+        	"net/url"
+        	"os"
+        	"path/filepath"
+        	"runtime"
+        	"sort"
+        	"strconv"
+        	"strings"
+        	"sync"
+        	"sync/atomic"
+        	"time"
+        	"unsafe"
+        )
+
+        func init() \{
+        	uiStageMake = func(n *uiNative) uiStaging \{
+        		s := &uiStage\{n: n, held: map[string]bool\{}, whole: true, tally: os.Getenv("HIVE_FOLDS") != ""}
+        		s.radio.watch()
+        		return s
+        	}
+        	uiStageReady = uiEngineProbe
+        }
+
+        type uiTuned struct \{
+        	from string
+        	loud float64
+        }
+
+        type uiPlayed struct \{
+        	uiTuned
+        	stop context.CancelFunc
+        }
+
+        type uiRadio struct \{
+        	mu      sync.Mutex
+        	engine  *uiEngine
+        	wanted  map[string]uiTuned
+        	playing map[string]*uiPlayed
+        }
+
+        type uiRadioSaid struct \{
+        	head  http.Header
+        	held  []byte
+        	radio *uiRadio
+        }
+
+        func (w *uiRadioSaid) Header() http.Header \{ return w.head }
+
+        func (w *uiRadioSaid) WriteHeader(int) \{}
+
+        func (w *uiRadioSaid) Write(b []byte) (int, error) \{
+        	w.held = append(w.held, b...)
+        	return len(b), nil
+        }
+
+        func (w *uiRadioSaid) Flush() \{
+        	said := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(w.held)), "data:"))
+        	w.held = w.held[:0]
+        	var streams map[string]map[string]any
+        	if json.Unmarshal([]byte(said), &streams) != nil \{
+        		return
+        	}
+        	wanted := map[string]uiTuned\{}
+        	for name, stream := range streams \{
+        		from, _ := stream["url"].(string)
+        		loud, _ := stream["volume"].(float64)
+        		wanted[name] = uiTuned\{from, loud}
+        	}
+        	w.radio.mu.Lock()
+        	w.radio.wanted = wanted
+        	w.radio.settle()
+        	w.radio.mu.Unlock()
+        }
+
+        func (r *uiRadio) watch() \{
+        	serve, ok := hivePageRoutes["/_hive/audio"].(func(http.ResponseWriter, *http.Request))
+        	if !ok \{
+        		return
+        	}
+        	req, err := http.NewRequest("GET", "/_hive/audio", nil)
+        	if err != nil \{
+        		return
+        	}
+        	go serve(&uiRadioSaid\{head: http.Header\{}, radio: r}, req)
+        }
+
+        func (r *uiRadio) onto(e *uiEngine) \{
+        	r.mu.Lock()
+        	defer r.mu.Unlock()
+        	for name, p := range r.playing \{
+        		p.stop()
+        		delete(r.playing, name)
+        	}
+        	r.engine = e
+        	r.settle()
+        }
+
+        func (r *uiRadio) settle() \{
+        	if r.engine == nil \{
+        		return
+        	}
+        	if r.playing == nil \{
+        		r.playing = map[string]*uiPlayed\{}
+        	}
+        	for name, p := range r.playing \{
+        		if want, ok := r.wanted[name]; !ok || want.from != p.from \{
+        			p.stop()
+        			r.engine.stream(0, name, nil)
+        			delete(r.playing, name)
+        		}
+        	}
+        	for name, want := range r.wanted \{
+        		p := r.playing[name]
+        		if p == nil \{
+        			r.start(name, want)
+        		} else if p.loud != want.loud \{
+        			p.loud = want.loud
+        			r.engine.stream(3, name, []byte\{uiRadioLoud(want.loud)})
+        		}
+        	}
+        }
+
+        func (r *uiRadio) start(name string, want uiTuned) \{
+        	ctx, stop := context.WithCancel(context.Background())
+        	r.playing[name] = &uiPlayed\{want, stop}
+        	e := r.engine
+        	e.stream(1, name, []byte\{uiRadioLoud(want.loud)})
+        	go func() \{
+        		uiRadioFetch(ctx, want.from, func(part []byte) \{
+        			if ctx.Err() == nil \{
+        				e.stream(2, name, part)
+        			}
+        		})
+        		if ctx.Err() == nil \{
+        			e.stream(2, name, nil)
+        		}
+        	}()
+        }
+
+        func (r *uiRadio) again(e *uiEngine, name string) \{
+        	r.mu.Lock()
+        	was := r.playing[name]
+        	r.mu.Unlock()
+        	if was == nil \{
+        		return
+        	}
+        	time.AfterFunc(2*time.Second, func() \{
+        		r.mu.Lock()
+        		defer r.mu.Unlock()
+        		if r.engine != e || r.playing[name] != was \{
+        			return
+        		}
+        		was.stop()
+        		delete(r.playing, name)
+        		r.settle()
+        	})
+        }
+
+        func uiRadioLoud(v float64) byte \{
+        	return byte(math.Round(math.Max(0, math.Min(1, v)) * 255))
+        }
+
+        func uiRadioFetch(ctx context.Context, from string, feed func([]byte)) \{
+        	if strings.HasPrefix(from, "/_hive/asset/") \{
+        		path, err := url.PathUnescape(strings.TrimPrefix(from, "/_hive/asset/"))
+        		if err != nil \{
+        			return
+        		}
+        		if body, ok := uiEngineRead(path); ok && len(body) > 0 \{
+        			feed(body)
+        		}
+        		return
+        	}
+        	req, err := http.NewRequestWithContext(ctx, "GET", from, nil)
+        	if err != nil \{
+        		return
+        	}
+        	res, err := http.DefaultClient.Do(req)
+        	if err != nil \{
+        		return
+        	}
+        	defer res.Body.Close()
+        	if res.StatusCode != http.StatusOK \{
+        		return
+        	}
+        	part := make([]byte, 16384)
+        	for \{
+        		n, err := res.Body.Read(part)
+        		if n > 0 \{
+        			feed(append([]byte(nil), part[:n]...))
+        		}
+        		if err != nil \{
+        			return
+        		}
+        	}
+        }
+
+        type uiPlaying interface \{
+        	ticking(on bool)
+        	holding(on bool)
+        	blot(f uiFont, s string) (int, int, []uint8)
+        	pads() map[int]uiGamepad
+        }
+
+        type uiFinger struct \{
+        	name                  string
+        	left, top, wide, tall float64
+        	x, y                  float64
+        }
+
+        type uiStage struct \{
+        	n        *uiNative
+        	radio    uiRadio
+        	engine   *uiEngine
+        	starting bool
+        	failures int
+
+        	rect  [4]int
+        	drawn [2]int
+        	spots [][4]int
+        	sized [2]int
+
+        	scene string
+        	cuts  []int32
+        	looks string
+        	seq   uint32
+        	whole bool
+
+        	pix        []byte
+        	wide, tall int
+        	owed       bool
+        	wanted     bool
+        	since      time.Time
+        	serial     uint32
+
+        	arrived atomic.Bool
+        	stale   atomic.Bool
+        	lost    atomic.Bool
+        	died    atomic.Bool
+        	begun   atomic.Pointer[uiEngine]
+        	mu      sync.Mutex
+        	asked   [][2]string
+
+        	attrs    []UiAttr
+        	want     string
+        	grab     bool
+        	cross    bool
+        	shown    bool
+        	grabbing bool
+        	held     map[string]bool
+        	lookX    float64
+        	lookY    float64
+        	last     time.Time
+
+        	gaps      [240]float64
+        	gapAt     int
+        	gapsIn    int
+        	beat      time.Time
+        	rateSaid  int
+        	rateAsked time.Time
+
+        	draws      atomic.Int64
+        	drawMicros atomic.Int64
+        	work       time.Duration
+        	told       time.Time
+        	tally      bool
+
+        	padWas    map[int]map[string]float64
+        	finger    *uiFinger
+        	touches   map[string]bool
+        	touchTold map[string]float64
+        }
+
+        func (s *uiStage) wants(event byte) bool \{
+        	for i := 0; i < len(s.want); i++ \{
+        		if s.want[i] == event \{
+        			return true
+        		}
+        	}
+        	return false
+        }
+
+        func (s *uiStage) post(kind, value string, index int) \{ s.n.post(s.attrs, kind, value, index) }
+
+        func (s *uiStage) nudge() \{
+        	if s.n.wake != nil \{
+        		s.n.wake()
+        	}
+        }
+
+        func (s *uiStage) play() uiPlaying \{
+        	p, _ := s.n.dev.(uiPlaying)
+        	return p
+        }
+
+        func (s *uiStage) start() \{
+        	if s.starting || s.failures > 2 \{
+        		return
+        	}
+        	s.starting = true
+        	go func() \{
+        		e := uiEngineSpare.Swap(nil)
+        		if e == nil \{
+        			e, _ = uiEngineStart(uiEnginePath())
+        		}
+        		if e != nil \{
+        			e.painted = func(_ uint32, _, _ int, micros int) \{
+        				s.drawMicros.Add(int64(micros))
+        				s.draws.Add(1)
+        				s.arrived.Store(true)
+        				s.nudge()
+        			}
+        			e.stale = func() \{ s.stale.Store(true); s.nudge() }
+        			e.spent = func(name string) \{ s.radio.again(e, name) }
+        			e.resync = func() \{ s.lost.Store(true); s.nudge() }
+        			e.died = func() \{ s.died.Store(true); s.nudge() }
+        			e.picture = uiStagePicture
+        			e.label = func(words, colour string) \{
+        				s.mu.Lock()
+        				s.asked = append(s.asked, [2]string\{words, colour})
+        				s.mu.Unlock()
+        				s.nudge()
+        			}
+        			e.heed()
+        		}
+        		s.begun.Store(e)
+        		if e == nil \{
+        			s.died.Store(true)
+        		}
+        		s.nudge()
+        	}()
+        }
+
+        func uiStagePicture(path string) (int, int, []byte) \{
+        	body, ok := uiEngineRead(path)
+        	if !ok \{
+        		return 0, 0, nil
+        	}
+        	decoded, _, err := image.Decode(bytes.NewReader(body))
+        	if err != nil \{
+        		return 0, 0, nil
+        	}
+        	b := decoded.Bounds()
+        	plain := image.NewNRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+        	draw.Draw(plain, plain.Bounds(), decoded, b.Min, draw.Src)
+        	return b.Dx(), b.Dy(), plain.Pix
+        }
+
+        func (s *uiStage) tallied(began time.Time) \{
+        	if !s.tally \{
+        		return
+        	}
+        	s.work += time.Since(began)
+        	if time.Since(s.told) < time.Second \{
+        		return
+        	}
+        	draws, micros := s.draws.Swap(0), s.drawMicros.Swap(0)
+        	if draws > 0 \{
+        		os.Stderr.WriteString("hive: scene " + strconv.FormatInt(draws, 10) + "/s | engine " +
+        			strconv.FormatFloat(float64(micros)/float64(draws)/1000, 'f', 1, 64) + "ms | window " +
+        			strconv.FormatFloat(float64(s.work)/float64(time.Millisecond)/float64(draws), 'f', 1, 64) + "ms\n")
+        	}
+        	s.work, s.told = 0, time.Now()
+        }
+
+        func (s *uiStage) settle() \{
+        	defer s.tallied(time.Now())
+        	n := s.n
+        	b := n.sceneBox
+        	s.shown = true
+        	s.attrs = b.v.Attrs
+        	s.want = uiSceneWants(b.v.Attrs)
+        	grab, _ := uiFind(b.v.Attrs, "grab")
+        	cross, _ := uiFind(b.v.Attrs, "crosshair")
+        	s.grab, s.cross = grab.Flag, cross.Flag
+        	if s.grabbing && !s.grab \{
+        		s.letGo()
+        	}
+        	x0, y0, x1, y1 := n.rectOf(b)
+        	rect := [4]int\{int(x0), int(y0), int(x1), int(y1)}
+        	drawn := [2]int\{max(int(math.Round(b.w)), 1), max(int(math.Round(b.h)), 1)}
+        	moved := rect[2]-rect[0] != s.rect[2]-s.rect[0] || rect[3]-rect[1] != s.rect[3]-s.rect[1] || drawn != s.drawn
+        	s.rect, s.drawn = rect, drawn
+        	if s.wants('s') && drawn != s.sized && rect[2] > rect[0] && rect[3] > rect[1] \{
+        		s.sized = drawn
+        		s.post("size", strconv.Itoa(drawn[0])+","+strconv.Itoa(drawn[1]), 0)
+        	}
+        	spots := make([][4]int, len(n.insetBoxes))
+        	looks := make([]string, len(n.insetBoxes))
+        	for i, in := range n.insetBoxes \{
+        		ix0, iy0, ix1, iy1 := n.rectOf(in)
+        		spots[i] = [4]int\{int(ix0) - rect[0], int(iy0) - rect[1], int(ix1 - ix0), int(iy1 - iy0)}
+        		looks[i] = in.v.Text
+        	}
+        	if p := s.play(); p != nil \{
+        		p.ticking(s.want != "")
+        	}
+        	if s.engine == nil \{
+        		s.start()
+        		return
+        	}
+        	wide, tall := rect[2]-rect[0], rect[3]-rect[1]
+        	if wide < 1 || tall < 1 \{
+        		return
+        	}
+        	if moved || s.whole \{
+        		if !s.engine.size(wide, tall, drawn[0], drawn[1]) \{
+        			return
+        		}
+        		s.wanted = true
+        	}
+        	same := len(spots) == len(s.spots)
+        	for i := 0; same && i < len(spots); i++ \{
+        		same = spots[i] == s.spots[i]
+        	}
+        	if !same || s.whole \{
+        		s.spots = spots
+        		s.engine.insets(spots)
+        		s.wanted = true
+        	}
+        	world := uiSceneLooks(looks)
+        	if s.whole || b.v.Text != s.scene || world != s.looks \{
+        		prev := s.seq
+        		s.seq++
+        		if s.whole \{
+        			s.engine.frame(uiSceneFrame(b.v.Text, b.v.Cuts, world, "", nil, s.seq, 0))
+        		} else \{
+        			s.engine.frame(uiSceneFrame(b.v.Text, b.v.Cuts, world, s.scene, s.cuts, s.seq, prev))
+        		}
+        		s.scene, s.cuts, s.looks, s.whole = b.v.Text, b.v.Cuts, world, false
+        		s.wanted = true
+        	}
+        	s.ask()
+        }
+
+        func (s *uiStage) ask() \{
+        	if !s.wanted || s.owed || s.engine == nil \{
+        		return
+        	}
+        	s.wanted, s.owed, s.since = false, true, time.Now()
+        	s.serial++
+        	s.engine.draw(s.serial)
+        }
+
+        func (s *uiStage) idle() \{
+        	if !s.shown \{
+        		return
+        	}
+        	s.shown = false
+        	s.release()
+        	s.letGo()
+        	if p := s.play(); p != nil \{
+        		p.ticking(false)
+        	}
+        	if s.engine != nil \{
+        		empty := UiScene(nil, nil)
+        		s.seq++
+        		s.engine.frame(uiSceneFrame(empty.Text, empty.Cuts, uiSceneLooks(nil), "", nil, s.seq, 0))
+        	}
+        	s.scene, s.cuts, s.looks, s.whole = "", nil, "", true
+        	s.rect, s.drawn, s.sized, s.spots = [4]int\{}, [2]int\{}, [2]int\{}, nil
+        }
+
+        func (s *uiStage) pump() bool \{
+        	defer s.tallied(time.Now())
+        	if e := s.begun.Swap(nil); e != nil \{
+        		s.engine, s.starting, s.whole = e, false, true
+        		s.owed, s.wanted = false, false
+        		s.radio.onto(e)
+        		if s.shown && s.n.sceneBox != nil \{
+        			s.settle()
+        		}
+        	}
+        	if s.died.Swap(false) \{
+        		if s.engine != nil \{
+        			s.engine.close()
+        		}
+        		s.engine, s.starting, s.owed = nil, false, false
+        		s.radio.onto(nil)
+        		s.failures++
+        		if s.shown \{
+        			s.start()
+        		}
+        	}
+        	if s.engine == nil \{
+        		return true
+        	}
+        	s.mu.Lock()
+        	asked := s.asked
+        	s.asked = nil
+        	s.mu.Unlock()
+        	for _, a := range asked \{
+        		wide, tall, rgba := s.lettered(a[0], a[1])
+        		s.engine.labelled(a[0], a[1], wide, tall, rgba)
+        	}
+        	if s.lost.Swap(false) \{
+        		s.whole = true
+        		if s.shown && s.n.sceneBox != nil \{
+        			s.settle()
+        		}
+        	}
+        	if s.stale.Swap(false) \{
+        		s.wanted = true
+        	}
+        	fresh := false
+        	if s.arrived.Swap(false) \{
+        		if got := s.engine.pixels(); len(got) > 0 \{
+        			wide, tall := s.rect[2]-s.rect[0], s.rect[3]-s.rect[1]
+        			if len(got) == wide*tall*4 \{
+        				if len(s.pix) != len(got) \{
+        					s.pix = make([]byte, len(got))
+        				}
+        				copy(s.pix, got)
+        				s.wide, s.tall = wide, tall
+        			}
+        		}
+        		s.owed = false
+        		fresh = true
+        	}
+        	s.ask()
+        	return fresh || !s.owed || time.Since(s.since) > 120*time.Millisecond
+        }
+
+        func (s *uiStage) lettered(words, colour string) (int, int, []byte) \{
+        	p := s.play()
+        	if p == nil \{
+        		return 0, 0, nil
+        	}
+        	const pad, plate = 16, 84
+        	tw, th, cover := p.blot(uiFont\{px: 52 / s.n.scale, weight: 700}, words)
+        	wide := tw + 2*pad
+        	ink, ok := uiParseColour(colour)
+        	if !ok \{
+        		ink = uiWhite
+        	}
+        	out := make([]byte, wide*plate*4)
+        	top := (plate-th)/2 + 2
+        	for y := 0; y < plate; y++ \{
+        		for x := 0; x < wide; x++ \{
+        			a := 0.0
+        			if tx, ty := x-pad, y-top; tx >= 0 && tx < tw && ty >= 0 && ty < th \{
+        				a = float64(cover[ty*tw+tx]) / 255 * float64(ink.a) / 255
+        			}
+        			under := 0.5 * (1 - a)
+        			all := a + under
+        			at := (y*wide + x) * 4
+        			out[at] = uint8(math.Round((float64(ink.r)*a + 10*under) / all))
+        			out[at+1] = uint8(math.Round((float64(ink.g)*a + 12*under) / all))
+        			out[at+2] = uint8(math.Round((float64(ink.b)*a + 16*under) / all))
+        			out[at+3] = uint8(math.Round(all * 255))
+        		}
+        	}
+        	return wide, plate, out
+        }
+
+        var uiStageDark = uiHexRGB(0x0b0d10)
+
+        func (s *uiStage) paint(cv *uiCanvas, b *uiBox, clip uiClip) \{
+        	defer s.tallied(time.Now())
+        	x0, y0, x1, y1 := s.n.rectOf(b)
+        	box := uiClip\{int(x0), int(y0), int(x1), int(y1)}
+        	r := cv.bounds(clip).and(box)
+        	if r.empty() \{
+        		return
+        	}
+        	cv.fill(box.x0, box.y0, box.x1, box.y1, uiStageDark, clip)
+        	if len(s.pix) >= s.wide*s.tall*4 && s.wide > 0 \{
+        		cv.flush()
+        		src := unsafe.Slice((*uint32)(unsafe.Pointer(&s.pix[0])), s.wide*s.tall)
+        		for y := r.y0; y < r.y1 && y-box.y0 < s.tall; y++ \{
+        			from := (y-box.y0)*s.wide + r.x0 - box.x0
+        			run := min(r.x1-r.x0, s.wide-(r.x0-box.x0))
+        			if run > 0 \{
+        				copy(cv.pix[y*cv.w+r.x0:y*cv.w+r.x0+run], src[from:from+run])
+        			}
+        		}
+        	}
+        	if s.cross \{
+        		mark := uiRGBA\{255, 255, 255, 204}
+        		cx, cy := (x0+x1)/2, (y0+y1)/2
+        		k := s.n.scale
+        		cv.fill(int(cx-k), int(cy-7*k), int(cx+k), int(cy+8*k), mark, clip)
+        		cv.fill(int(cx-7*k), int(cy-k), int(cx-k), int(cy+k), mark, clip)
+        		cv.fill(int(cx+k), int(cy-k), int(cx+8*k), int(cy+k), mark, clip)
+        	}
+        }
+
+        func (s *uiStage) over(x, y float64) bool \{
+        	chain := s.n.under(x, y)
+        	return len(chain) > 0 && chain[len(chain)-1] == s.n.sceneBox
+        }
+
+        func (s *uiStage) hidden(x, y float64) bool \{
+        	return s.grabbing || s.cross && s.over(x, y)
+        }
+
+        func (s *uiStage) down(k string) \{
+        	if s.held[k] \{
+        		return
+        	}
+        	s.held[k] = true
+        	if s.wants('k') \{
+        		s.post("keydown", k, 0)
+        	}
+        }
+
+        func (s *uiStage) up(k string) \{
+        	if !s.held[k] \{
+        		return
+        	}
+        	delete(s.held, k)
+        	if s.wants('u') \{
+        		s.post("keyup", k, 0)
+        	}
+        }
+
+        func (s *uiStage) release() \{
+        	for k := range s.held \{
+        		if s.wants('u') \{
+        			s.post("keyup", k, 0)
+        		}
+        	}
+        	clear(s.held)
+        	s.finger = nil
+        }
+
+        func (s *uiStage) letGo() \{
+        	if !s.grabbing \{
+        		return
+        	}
+        	s.grabbing = false
+        	if p := s.play(); p != nil \{
+        		p.holding(false)
+        	}
+        	s.release()
+        	if s.wants('g') \{
+        		s.post("grab", "", 0)
+        	}
+        }
+
+        func uiStageSwallows(k string) bool \{
+        	switch k \{
+        	case "space", "tab", "up", "down", "left", "right":
+        		return true
+        	}
+        	return false
+        }
+
+        func (s *uiStage) key(name string, down bool) bool \{
+        	if !s.shown || name == "" \{
+        		return false
+        	}
+        	if !down \{
+        		s.up(name)
+        		return false
+        	}
+        	if s.grabbing && name == "escape" \{
+        		s.letGo()
+        		return true
+        	}
+        	if s.n.typing() \{
+        		return false
+        	}
+        	if b, ok := s.n.boxes[s.n.focus]; ok && b.kind == "input" && b.input == "Range" \{
+        		switch name \{
+        		case "up", "down", "left", "right", "pageup", "pagedown", "home", "end":
+        			return false
+        		}
+        	}
+        	s.down(name)
+        	return s.grabbing && uiStageSwallows(name)
+        }
+
+        func (s *uiStage) press(button int, x, y float64) bool \{
+        	if !s.shown \{
+        		return false
+        	}
+        	n := s.n
+        	chain := n.under(x, y)
+        	if button == 1 \{
+        		for i := len(chain) - 1; i >= 0; i-- \{
+        			if t, ok := chain[i].attr("touch"); ok && t.Word != "" \{
+        				b := chain[i]
+        				if s.touches == nil \{
+        					s.touches, s.touchTold = map[string]bool\{}, map[string]float64\{}
+        				}
+        				s.touches[t.Word] = true
+        				s.finger = &uiFinger\{name: t.Word, left: b.x, top: b.y, wide: b.w, tall: b.h}
+        				s.drag(x, y)
+        				return true
+        			}
+        		}
+        	}
+        	onScene := len(chain) > 0 && chain[len(chain)-1] == n.sceneBox
+        	if s.grab && !s.grabbing \{
+        		for i := len(chain) - 1; i >= 0; i-- \{
+        			if chain[i] != n.sceneBox && chain[i].answers() \{
+        				return false
+        			}
+        		}
+        		if p := s.play(); p != nil \{
+        			s.grabbing = true
+        			p.holding(true)
+        			if s.wants('g') \{
+        				s.post("grab", "1", 0)
+        			}
+        			return true
+        		}
+        	}
+        	if s.grabbing || onScene \{
+        		s.down("mouse" + strconv.Itoa(button))
+        	}
+        	return s.grabbing
+        }
+
+        func (s *uiStage) lift(button int) bool \{
+        	if button == 1 && s.finger != nil \{
+        		s.finger = nil
+        		return true
+        	}
+        	s.up("mouse" + strconv.Itoa(button))
+        	return s.grabbing
+        }
+
+        func (s *uiStage) drag(x, y float64) \{
+        	f := s.finger
+        	if f == nil \{
+        		return
+        	}
+        	fx := (x - f.left - f.wide/2) / math.Max(1, f.wide/2)
+        	fy := (y - f.top - f.tall/2) / math.Max(1, f.tall/2)
+        	if far := math.Hypot(fx, fy); far > 1 \{
+        		fx, fy = fx/far, fy/far
+        	}
+        	f.x, f.y = fx, fy
+        }
+
+        func (s *uiStage) looked(dx, dy float64) \{
+        	s.lookX += dx
+        	s.lookY += dy
+        }
+
+        func (s *uiStage) blur() \{
+        	s.release()
+        	s.letGo()
+        }
+
+        func uiStageRound(v float64) string \{
+        	return strconv.FormatFloat(math.Round(v*100)/100, 'f', -1, 64)
+        }
+
+        func (s *uiStage) tick() \{
+        	if !s.shown \{
+        		return
+        	}
+        	now := time.Now()
+        	s.paced(now)
+        	if s.lookX != 0 || s.lookY != 0 \{
+        		if s.wants('l') \{
+        			s.post("look", uiStageRound(s.lookX)+","+uiStageRound(s.lookY), 0)
+        		}
+        		s.lookX, s.lookY = 0, 0
+        	}
+        	if s.wants('p') \{
+        		s.padded()
+        		s.touched()
+        	}
+        	if !s.wants('f') || s.last.IsZero() \{
+        		s.last = now
+        		return
+        	}
+        	ms := int(math.Round(float64(now.Sub(s.last)) / float64(time.Millisecond)))
+        	if ms <= 0 || s.n.owed.Load() \{
+        		return
+        	}
+        	s.last = now
+        	s.n.owed.Store(true)
+        	s.post("frame", "", min(100, ms))
+        }
+
+        func (s *uiStage) paced(now time.Time) \{
+        	if !s.beat.IsZero() \{
+        		ms := float64(now.Sub(s.beat)) / float64(time.Millisecond)
+        		if ms > 0.5 && ms < 200 \{
+        			s.gaps[s.gapAt] = ms
+        			s.gapAt = (s.gapAt + 1) % len(s.gaps)
+        			if s.gapsIn < len(s.gaps) \{
+        				s.gapsIn++
+        			}
+        		}
+        	}
+        	s.beat = now
+        	if !s.wants('r') || s.gapsIn < 30 || now.Sub(s.rateAsked) < time.Second \{
+        		return
+        	}
+        	s.rateAsked = now
+        	sorted := append([]float64(nil), s.gaps[:s.gapsIn]...)
+        	sort.Float64s(sorted)
+        	hz := int(math.Round(1000 / sorted[s.gapsIn/10]))
+        	hz = max(20, min(480, hz))
+        	if hz != s.rateSaid \{
+        		s.rateSaid = hz
+        		s.post("rate", "", hz)
+        	}
+        }
+
+        func (s *uiStage) padded() \{
+        	p := s.play()
+        	if p == nil \{
+        		return
+        	}
+        	now := p.pads()
+        	if s.padWas == nil \{
+        		s.padWas = map[int]map[string]float64\{}
+        	}
+        	for i, was := range s.padWas \{
+        		if _, here := now[i]; here \{
+        			continue
+        		}
+        		for control, at := range was \{
+        			if at != 0 \{
+        				s.post("pad", control+"|0", i)
+        			}
+        		}
+        		delete(s.padWas, i)
+        		s.post("pad", "here|0", i)
+        	}
+        	for i, pad := range now \{
+        		was, known := s.padWas[i]
+        		if !known \{
+        			was = map[string]float64\{}
+        			s.padWas[i] = was
+        			if pad.named \{
+        				s.post("pad", "here|1", i)
+        			} else \{
+        				s.post("pad", "here|2", i)
+        			}
+        		}
+        		for control, at := range pad.controls \{
+        			switch control \{
+        			case "leftX", "leftY", "rightX", "rightY":
+        				if at > -0.08 && at < 0.08 \{
+        					at = 0
+        				}
+        			}
+        			if math.Abs(at-was[control]) < 0.02 \{
+        				continue
+        			}
+        			was[control] = at
+        			s.post("pad", control+"|"+uiStageRound(at), i)
+        		}
+        	}
+        }
+
+        func (s *uiStage) touched() \{
+        	if len(s.touches) == 0 \{
+        		return
+        	}
+        	now := map[string]float64\{}
+        	for name := range s.touches \{
+        		now[name], now[name+"X"], now[name+"Y"] = 0, 0, 0
+        	}
+        	if f := s.finger; f != nil \{
+        		now[f.name], now[f.name+"X"], now[f.name+"Y"] = 1, f.x, f.y
+        	}
+        	for control, at := range now \{
+        		told := s.touchTold[control]
+        		if at == told || at != 0 && math.Abs(at-told) < 0.02 \{
+        			continue
+        		}
+        		s.touchTold[control] = at
+        		s.post("pad", control+"|"+uiStageRound(at), -1)
+        	}
+        }
+
+        func (s *uiStage) close() \{
+        	s.radio.onto(nil)
+        	if s.engine != nil \{
+        		s.engine.close()
+        		s.engine = nil
+        	}
+        }
+
+        var (
+        	uiEngineData  []byte
+        	uiEngineSum   string
+        	uiEngineOnce  sync.Once
+        	uiEngineWorks bool
+        	uiEngineSpare atomic.Pointer[uiEngine]
+        )
+
+        func uiEnginePath() string \{
+        	if path := os.Getenv("HIVE_SCENE_ENGINE"); path != "" \{
+        		return path
+        	}
+        	return uiEngineUnpacked()
+        }
+
+        func uiEngineUnpacked() string \{
+        	if len(uiEngineData) == 0 \{
+        		return ""
+        	}
+        	dir, err := os.UserCacheDir()
+        	if err != nil \{
+        		dir = os.TempDir()
+        	}
+        	dir = filepath.Join(dir, "hive", "scene-"+uiEngineSum[:16])
+        	path := filepath.Join(dir, "hive-scene")
+        	if runtime.GOOS == "windows" \{
+        		path += ".exe"
+        	}
+        	if held, err := os.ReadFile(path); err == nil \{
+        		sum := sha256.Sum256(held)
+        		if hex.EncodeToString(sum[:]) == uiEngineSum \{
+        			return path
+        		}
+        	}
+        	if os.MkdirAll(dir, 0o755) != nil \{
+        		return ""
+        	}
+        	fresh := path + "." + strconv.Itoa(os.Getpid())
+        	if os.WriteFile(fresh, uiEngineData, 0o755) != nil \{
+        		return ""
+        	}
+        	if os.Rename(fresh, path) != nil \{
+        		os.Remove(fresh)
+        		if _, err := os.Stat(path); err != nil \{
+        			return ""
+        		}
+        	}
+        	return path
+        }
+
+        func uiEngineProbe() bool \{
+        	uiEngineOnce.Do(func() \{
+        		if e, err := uiEngineStart(uiEnginePath()); err == nil \{
+        			uiEngineSpare.Store(e)
+        			uiEngineWorks = true
+        		}
+        	})
+        	return uiEngineWorks
+        }
+    `
+}
+
+// The engine, as a process: frames in on one pipe, the picture out through memory
+// both hold. Vulkan is tried first and OpenGL after it.
+func engineSource(): Str {
+    return `
+        //go:build windows || (linux && !android)
+
+        package hive
+
+        import (
+        	"bufio"
+        	"encoding/binary"
+        	"errors"
+        	"io"
+        	"os"
+        	"os/exec"
+        	"sync"
+        )
+
+        type uiEngine struct \{
+        	mu   sync.Mutex
+        	cmd  *exec.Cmd
+        	in   io.WriteCloser
+        	gone bool
+        	out  *bufio.Reader
+
+        	held   *uiEngineShared
+        	spare  *uiEngineShared
+        	shares int
+
+        	painted func(serial uint32, wide, tall int, micros int)
+        	spent   func(name string)
+        	stale   func()
+        	resync  func()
+        	picture func(path string) (int, int, []byte)
+        	label   func(words, colour string)
+        	died    func()
+        }
+
+        func uiEngineStart(path string) (*uiEngine, error) \{
+        	if path == "" \{
+        		return nil, errors.New("this program carries no engine to draw a scene with")
+        	}
+        	if os.Getenv("HIVE_SCENE") != "opengl" \{
+        		if e, err := uiEngineRun(path); err == nil \{
+        			return e, nil
+        		}
+        	}
+        	return uiEngineRun(path, "--opengl")
+        }
+
+        func uiEngineRun(path string, args ...string) (*uiEngine, error) \{
+        	cmd := exec.Command(path, args...)
+        	uiEngineQuiet(cmd)
+        	in, err := cmd.StdinPipe()
+        	if err != nil \{
+        		return nil, err
+        	}
+        	out, err := cmd.StdoutPipe()
+        	if err != nil \{
+        		return nil, err
+        	}
+        	if os.Getenv("HIVE_SCENE_LOG") != "" \{
+        		cmd.Stderr = os.Stderr
+        	}
+        	if err := cmd.Start(); err != nil \{
+        		return nil, err
+        	}
+        	e := &uiEngine\{cmd: cmd, in: in, out: bufio.NewReaderSize(out, 1<<16)}
+        	if why := e.begin(); why != "" \{
+        		e.close()
+        		return nil, errors.New(why)
+        	}
+        	return e, nil
+        }
+
+        func (e *uiEngine) begin() string \{
+        	var head [5]byte
+        	if _, err := io.ReadFull(e.out, head[:]); err != nil \{
+        		return "the scene's engine stopped before it started"
+        	}
+        	body := make([]byte, binary.LittleEndian.Uint32(head[1:]))
+        	if _, err := io.ReadFull(e.out, body); err != nil || head[0] != 'R' \{
+        		return "the scene's engine could not start: " + string(body)
+        	}
+        	return ""
+        }
+
+        func (e *uiEngine) heed() \{ go e.listen(e.out) }
+
+        func (e *uiEngine) say(kind byte, parts ...[]byte) \{
+        	size := 0
+        	for _, p := range parts \{
+        		size += len(p)
+        	}
+        	head := [5]byte\{kind}
+        	binary.LittleEndian.PutUint32(head[1:], uint32(size))
+        	e.mu.Lock()
+        	defer e.mu.Unlock()
+        	if e.gone \{
+        		return
+        	}
+        	if _, err := e.in.Write(head[:]); err != nil \{
+        		e.gone = true
+        		return
+        	}
+        	for _, p := range parts \{
+        		if _, err := e.in.Write(p); err != nil \{
+        			e.gone = true
+        			return
+        		}
+        	}
+        }
+
+        func uiEngineU32(values ...int) []byte \{
+        	out := make([]byte, 0, len(values)*4)
+        	for _, v := range values \{
+        		out = binary.LittleEndian.AppendUint32(out, uint32(v))
+        	}
+        	return out
+        }
+
+        func uiEngineNamed(s string) []byte \{
+        	out := binary.LittleEndian.AppendUint16(nil, uint16(len(s)))
+        	return append(out, s...)
+        }
+
+        func (e *uiEngine) frame(payload []byte) \{ e.say('S', payload[1:]) }
+
+        func (e *uiEngine) stream(what byte, name string, rest []byte) \{
+        	e.say('A', []byte\{what}, uiEngineNamed(name), rest)
+        }
+
+        func (e *uiEngine) size(sheetWide, sheetTall, drawnWide, drawnTall int) bool \{
+        	e.mu.Lock()
+        	e.shares++
+        	serial := e.shares
+        	e.mu.Unlock()
+        	next, err := uiEngineShare(sheetWide*sheetTall*4, serial)
+        	if err != nil \{
+        		return false
+        	}
+        	e.say('Z', uiEngineU32(sheetWide, sheetTall, drawnWide, drawnTall), []byte(next.name))
+        	e.mu.Lock()
+        	if e.spare != nil \{
+        		e.spare.close()
+        	}
+        	e.spare = e.held
+        	e.held = next
+        	e.mu.Unlock()
+        	return true
+        }
+
+        func (e *uiEngine) insets(boxes [][4]int) \{
+        	body := []byte\{byte(len(boxes))}
+        	for _, b := range boxes \{
+        		body = append(body, uiEngineU32(b[0], b[1], b[2], b[3])...)
+        	}
+        	e.say('I', body)
+        }
+
+        func (e *uiEngine) draw(serial uint32) \{ e.say('D', uiEngineU32(int(serial))) }
+
+        func (e *uiEngine) pixels() []byte \{
+        	e.mu.Lock()
+        	defer e.mu.Unlock()
+        	if e.held == nil \{
+        		return nil
+        	}
+        	return e.held.bytes
+        }
+
+        func (e *uiEngine) labelled(words, colour string, wide, tall int, rgba []byte) \{
+        	e.say('l', uiEngineNamed(words), uiEngineNamed(colour), uiEngineU32(wide, tall), rgba)
+        }
+
+        func (e *uiEngine) close() \{
+        	e.say('Q')
+        	e.mu.Lock()
+        	e.gone = true
+        	e.in.Close()
+        	for _, s := range []*uiEngineShared\{e.held, e.spare} \{
+        		if s != nil \{
+        			s.close()
+        		}
+        	}
+        	e.held, e.spare = nil, nil
+        	e.mu.Unlock()
+        	go e.cmd.Wait()
+        }
+
+        func (e *uiEngine) listen(out *bufio.Reader) \{
+        	defer func() \{
+        		e.mu.Lock()
+        		gone := e.gone
+        		e.gone = true
+        		e.mu.Unlock()
+        		if !gone && e.died != nil \{
+        			e.died()
+        		}
+        	}()
+        	var head [5]byte
+        	for \{
+        		if _, err := io.ReadFull(out, head[:]); err != nil \{
+        			return
+        		}
+        		body := make([]byte, binary.LittleEndian.Uint32(head[1:]))
+        		if _, err := io.ReadFull(out, body); err != nil \{
+        			return
+        		}
+        		switch head[0] \{
+        		case 'P':
+        			if len(body) >= 16 && e.painted != nil \{
+        				e.painted(binary.LittleEndian.Uint32(body), int(binary.LittleEndian.Uint32(body[4:])),
+        					int(binary.LittleEndian.Uint32(body[8:])), int(binary.LittleEndian.Uint32(body[12:])))
+        			}
+        		case 'N':
+        			if e.resync != nil \{
+        				e.resync()
+        			}
+        		case 'C':
+        			if e.stale != nil \{
+        				e.stale()
+        			}
+        		case 'p':
+        			go e.answerPicture(string(body))
+        		case 'f':
+        			go e.answerFile(string(body))
+        		case 'a':
+        			if e.spent != nil \{
+        				e.spent(string(body))
+        			}
+        		case 't':
+        			id := string(body)
+        			uiTerrainLock.Lock()
+        			data := uiTerrainData[id]
+        			uiTerrainLock.Unlock()
+        			e.say('t', uiEngineNamed(id), data)
+        		case 'l':
+        			if len(body) >= 2 && e.label != nil \{
+        				n := int(binary.LittleEndian.Uint16(body))
+        				if 2+n <= len(body) \{
+        					e.label(string(body[2:2+n]), string(body[2+n:]))
+        				}
+        			}
+        		}
+        	}
+        }
+
+        func (e *uiEngine) answerPicture(path string) \{
+        	wide, tall, rgba := 0, 0, []byte(nil)
+        	if e.picture != nil \{
+        		wide, tall, rgba = e.picture(path)
+        	}
+        	e.say('p', uiEngineNamed(path), uiEngineU32(wide, tall), rgba)
+        }
+
+        var uiEngineRead = func(path string) ([]byte, bool) \{
+        	if uiAssets == nil || path == "" \{
+        		return nil, false
+        	}
+        	body, err := uiAssets.ReadFile("assets/" + path)
+        	return body, err == nil
+        }
+
+        func (e *uiEngine) answerFile(path string) \{
+        	body, ok := uiEngineRead(path)
+        	found := byte(0)
+        	if ok \{
+        		found = 1
+        	}
+        	e.say('f', uiEngineNamed(path), []byte\{found}, body)
+        }
+    `
+}
+
+// The memory a picture comes back through, on Windows.
+func engineWindowsSource(): Str {
+    return `
+        //go:build windows
+
+        package hive
+
+        import (
+        	"errors"
+        	"os"
+        	"os/exec"
+        	"strconv"
+        	"syscall"
+        	"unsafe"
+        )
+
+        var (
+        	uiShareKernel = syscall.NewLazyDLL("kernel32.dll")
+        	uiShareCreate = uiShareKernel.NewProc("CreateFileMappingW")
+        	uiShareMap    = uiShareKernel.NewProc("MapViewOfFile")
+        	uiShareUnmap  = uiShareKernel.NewProc("UnmapViewOfFile")
+        )
+
+        type uiEngineShared struct \{
+        	name   string
+        	bytes  []byte
+        	handle uintptr
+        	at     uintptr
+        }
+
+        func uiEngineShare(size int, serial int) (*uiEngineShared, error) \{
+        	name := "Local\\hive-scene-" + strconv.Itoa(os.Getpid()) + "-" + strconv.Itoa(serial)
+        	wide, err := syscall.UTF16PtrFromString(name)
+        	if err != nil \{
+        		return nil, err
+        	}
+        	handle, _, _ := uiShareCreate.Call(^uintptr(0), 0, 4, uintptr(uint64(size)>>32), uintptr(uint32(size)),
+        		uintptr(unsafe.Pointer(wide)))
+        	if handle == 0 \{
+        		return nil, errors.New("no memory to share the picture through")
+        	}
+        	at, _, _ := uiShareMap.Call(handle, 6, 0, 0, uintptr(size))
+        	if at == 0 \{
+        		syscall.CloseHandle(syscall.Handle(handle))
+        		return nil, errors.New("no memory to share the picture through")
+        	}
+        	return &uiEngineShared\{name: name, handle: handle, at: at,
+        		bytes: unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&at))), size)}, nil
+        }
+
+        func (s *uiEngineShared) close() \{
+        	uiShareUnmap.Call(s.at)
+        	syscall.CloseHandle(syscall.Handle(s.handle))
+        	s.bytes = nil
+        }
+
+        func uiEngineQuiet(cmd *exec.Cmd) \{
+        	cmd.SysProcAttr = &syscall.SysProcAttr\{HideWindow: true, CreationFlags: 0x08000000}
+        }
+    `
+}
+
+// And on Linux.
+func engineLinuxSource(): Str {
+    return `
+        //go:build linux && !android
+
+        package hive
+
+        import (
+        	"os"
+        	"os/exec"
+        	"strconv"
+        	"syscall"
+        )
+
+        type uiEngineShared struct \{
+        	name  string
+        	bytes []byte
+        }
+
+        func uiEngineShare(size int, serial int) (*uiEngineShared, error) \{
+        	dir := "/dev/shm"
+        	if info, err := os.Stat(dir); err != nil || !info.IsDir() \{
+        		dir = os.TempDir()
+        	}
+        	name := dir + "/hive-scene-" + strconv.Itoa(os.Getpid()) + "-" + strconv.Itoa(serial)
+        	f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+        	if err != nil \{
+        		return nil, err
+        	}
+        	defer f.Close()
+        	if err := f.Truncate(int64(size)); err != nil \{
+        		os.Remove(name)
+        		return nil, err
+        	}
+        	bytes, err := syscall.Mmap(int(f.Fd()), 0, size, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+        	if err != nil \{
+        		os.Remove(name)
+        		return nil, err
+        	}
+        	return &uiEngineShared\{name: name, bytes: bytes}, nil
+        }
+
+        func (s *uiEngineShared) close() \{
+        	syscall.Munmap(s.bytes)
+        	os.Remove(s.name)
+        	s.bytes = nil
+        }
+
+        func uiEngineQuiet(cmd *exec.Cmd) \{
+        	cmd.SysProcAttr = &syscall.SysProcAttr\{Pdeathsig: syscall.SIGKILL}
         }
     `
 }
