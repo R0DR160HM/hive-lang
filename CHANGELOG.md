@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.3.6
+## v0.3.7
 
 ### Tooling
 
@@ -16,6 +16,8 @@
 * **A module of the standard library is declared once**, in a stub beside its Go — `term.hive` beside `term.go` — where it was three tables in the compiler.
 * **A call added to the library and used by the compiler is one build**: `./bootstrap` has the compiler read the checkout's `runtime/`, which `HIVE_RUNTIME` names.
 * **`scene/build` downloads the engine of the latest release** where that was built from the same `scene/`, and `--force` compiles regardless.
+
+## v0.3.6
 
 ### Fixes
 * **A Linux window holding the mouse no longer looks round many times as far as the mouse moved**: X queues what the mouse did before the pointer is warped back to the centre, and every queued event was measured from the centre, so a burst counted its first move once, its second twice and so on; a move is now measured from the event before it.
