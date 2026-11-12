@@ -111,10 +111,7 @@ type Emit {
     // becomes one package-level variable, so a pattern is compiled once at
     // startup and two that read the same share one.
     patterns: Str[dyn]
-    // The line the declaration being emitted was declared on — the only position
-    // a flattened program can offer.
-    line: Int
-    // Its name, which is what places a message in the file it came from.
+    at: token.Pos
     decl: Str
     // Set where a window is emitted, and read off `Emitted` by the build.
     window: Bool
@@ -125,11 +122,17 @@ type Emit {
     // The packed elements the call just written lends: copied out before it, back after.
     fronts: Str[dyn]
     backs: Str[dyn]
+    landings: infer.Landing[dyn]
 }
-// Emit a whole program.
+
+// For a test of this pass: a program nothing has checked.
 proc emitModule(m: ast.Module): Emitted {
+    return emitChecked(m, [])
+}
+
+proc emitChecked(m: ast.Module, landings: infer.Landing[]): Emitted {
     t := types.tableOf(m)
-    mut Emit em = Emit(t, [], 0, ["Nil"], [], [], [], [], [], [], 0, [], [], [], [], false, false, false, -1, [], writes.writtenShapes(m), [], 0, "", false, [], [], "", [], [])
+    mut Emit em = Emit(t, [], 0, ["Nil"], [], [], [], [], [], [], 0, [], [], [], [], false, false, false, -1, [], writes.writtenShapes(m), [], token.nowhere(), "", false, [], [], "", [], [], landings)
 
     line(em, "package main")
     line(em, "")
@@ -160,7 +163,7 @@ proc emitModule(m: ast.Module): Emitted {
     emitMirrors(em, m)
     emitClones(em, m.decls)
     for each d in m.decls {
-        em.line = ast.declLine(d)
+        em.at = d.at
         em.decl = ast.declName(d)
         emitDecl(em, env, d)
     }
@@ -221,9 +224,9 @@ proc close(em: mut Emit, written: Str): void {
 
 // A type's decoder and encoder can each fail for one reason, which is said once.
 proc fail(em: mut Emit, message: Str): void {
-    mut found := diag.at(em.line, message)
+    mut found := diag.on(em.at, message)
     if em.decl != "" {
-        found = diag.at(em.line, diag.inDecl(em.decl, message))
+        found = diag.on(em.at, diag.inDecl(em.decl, message))
     }
     if indexOf(em.errors, found) is Result.Error(_) {
         append(em.errors, found)
@@ -597,7 +600,7 @@ proc emitCallable(em: mut Emit, env: infer.Env, name: Str, params: ast.Param[], 
     firstLine := len(em.out) + 1
     mut resultType := types.resolve(env.table, result)
     inner := infer.boundParams(env, params, 0)
-    em.cells = cellNames(em.table, inner, params, body)
+    em.cells = cellNames(env.table, inner, params, body)
     mut Str[dyn] written = []
     for each p in params {
         ty := types.resolve(env.table, p.declared)
@@ -718,9 +721,9 @@ func cloneName(typeName: Str): Str {
 // right-hand side — a literal, a concatenation, a call's result — is already
 // independent, and is never copied.
 func namesStorage(e: ast.Expr): Bool {
-    if e is ast.Expr.Ident(_) { return true }
-    if e is ast.Expr.Member(_, _) { return true }
-    if e is ast.Expr.Index(_, _) { return true }
+    if e is ast.Expr.Ident(_, _) { return true }
+    if e is ast.Expr.Member(_, _, _) { return true }
+    if e is ast.Expr.Index(_, _, _) { return true }
     return false
 }
 
@@ -800,7 +803,10 @@ proc emitEach(em: mut Emit, env: infer.Env, stmts: ast.Stmt[], at: Int, result: 
 }
 
 proc emitStmt(em: mut Emit, env: infer.Env, s: ast.Stmt, result: types.Ty): infer.Env {
-    if s is ast.Stmt.VarDecl(name, value, mutable, deferred) {
+    if (s is ast.Stmt.Nothing) == false {
+        em.at = s.at
+    }
+    if s is ast.Stmt.VarDecl(name, value, mutable, deferred, _) {
         ty := infer.typeOf(env, value)
         // `x := async f(a)` starts the call now; the wait happens wherever `x` is
         // read, and only if the call has not finished — which is why the name is
@@ -815,7 +821,7 @@ proc emitStmt(em: mut Emit, env: infer.Env, s: ast.Stmt, result: types.Ty): infe
             // sending, so only the answer waits for where the name is read.
             if isSend(env, value) {
                 pending := "_pending_" + goIdent(held)
-                if value is ast.Expr.Call(address, sent) {
+                if value is ast.Expr.Call(address, sent, _) {
                     line(em, pending + " := " + pendingSend(em, env, address, sent))
                 }
                 line(em, taskName(held) + " := hive.Spawn(func() any \{ return " + answered("hive.SyslinkAwait(" + pending + ", 0)") + " })")
@@ -854,7 +860,7 @@ proc emitStmt(em: mut Emit, env: infer.Env, s: ast.Stmt, result: types.Ty): infe
         }
         line(em, "_ = " + goIdent(name))
         return infer.bound(env, name, ty)
-    } else if s is ast.Stmt.TypedDecl(declared, name, value, mutable, _) {
+    } else if s is ast.Stmt.TypedDecl(declared, name, value, mutable, _, _) {
         ty := types.resolve(env.table, declared)
         if name == "_" {
             line(em, "var _ " + goType(ty) + " = " + expr(em, env, value, ty))
@@ -873,33 +879,33 @@ proc emitStmt(em: mut Emit, env: infer.Env, s: ast.Stmt, result: types.Ty): infe
         }
         line(em, "_ = " + goIdent(name))
         return infer.bound(env, name, ty)
-    } else if s is ast.Stmt.Assign(target, value) {
+    } else if s is ast.Stmt.Assign(target, value, _) {
         emitAssign(em, env, target, value)
         return env
-    } else if s is ast.Stmt.IfChain(branches, otherwise, hasElse) {
+    } else if s is ast.Stmt.IfChain(branches, otherwise, hasElse, _) {
         emitIf(em, env, branches, otherwise, hasElse, result)
         return env
     } else if s is ast.Stmt.SwitchStmt(lets, _, arms, _, _) {
         emitStmts(em, env, ast.switchBlock(lets, arms), result)
         return env
-    } else if s is ast.Stmt.ReturnStmt(value) {
+    } else if s is ast.Stmt.ReturnStmt(value, _) {
         if value is ast.Expr.Absent {
             line(em, "return")
         } else {
             line(em, "return " + expr(em, env, value, result))
         }
         return env
-    } else if s is ast.Stmt.EchoStmt(value) {
+    } else if s is ast.Stmt.EchoStmt(value, _) {
         line(em, "hive.Echo(" + expr(em, env, value, types.Ty.TUnknown()) + ")")
         return env
-    } else if s is ast.Stmt.AssertStmt(condition) {
+    } else if s is ast.Stmt.AssertStmt(condition, _) {
         if em.inTest {
             emitTestAssert(em, env, condition)
         } else {
             emitAssert(em, env, condition)
         }
         return env
-    } else if s is ast.Stmt.PanicStmt(value) {
+    } else if s is ast.Stmt.PanicStmt(value, _) {
         line(em, "panic(hive.Show(" + expr(em, env, value, types.Ty.TUnknown()) + "))")
         return env
     } else if s is ast.Stmt.BreakStmt {
@@ -913,13 +919,13 @@ proc emitStmt(em: mut Emit, env: infer.Env, s: ast.Stmt, result: types.Ty): infe
 }
 
 proc emitStmtTail(em: mut Emit, env: infer.Env, s: ast.Stmt, result: types.Ty): infer.Env {
-    if s is ast.Stmt.ForLoop(init, cond, post, body) {
+    if s is ast.Stmt.ForLoop(init, cond, post, body, _) {
         emitFor(em, env, init, cond, post, body, result)
         return env
-    } else if s is ast.Stmt.ForEach(name, declared, subject, body) {
+    } else if s is ast.Stmt.ForEach(name, declared, subject, body, _) {
         emitForEach(em, env, name, declared, subject, body, result)
         return env
-    } else if s is ast.Stmt.AsyncStmt(call) {
+    } else if s is ast.Stmt.AsyncStmt(call, _) {
         // A send nothing waits for is a cast: it never blocks and never fails,
         // which is what keeps a local send and a remote one the same statement.
         if isSend(env, call) {
@@ -928,7 +934,7 @@ proc emitStmtTail(em: mut Emit, env: infer.Env, s: ast.Stmt, result: types.Ty): 
         }
         line(em, "go " + onThread(em, env, call, types.Ty.TUnknown()))
         return env
-    } else if s is ast.Stmt.Expression(value) {
+    } else if s is ast.Stmt.Expression(value, _) {
         emitExprStmt(em, env, value)
         return env
     }
@@ -940,7 +946,7 @@ proc emitStmtTail(em: mut Emit, env: infer.Env, s: ast.Stmt, result: types.Ty): 
 proc emitExprStmt(em: mut Emit, env: infer.Env, value: ast.Expr): void {
     // Over `void` calls the barrier has no value either, and is a statement
     // meaning "both of these, then carry on".
-    if value is ast.Expr.AwaitAll(calls, _) {
+    if value is ast.Expr.AwaitAll(calls, _, _) {
         mut Str[dyn] spawned = []
         for each c in calls {
             spawned = withSpawn(em, env, spawned, c)
@@ -948,8 +954,8 @@ proc emitExprStmt(em: mut Emit, env: infer.Env, value: ast.Expr): void {
         line(em, "hive.AwaitAllVoid([]*hive.Task\{" + join(spawned, ", ") + "})")
         return
     }
-    if value is ast.Expr.Call(callee, args) {
-        if callee is ast.Expr.Ident(name) {
+    if value is ast.Expr.Call(callee, args, _) {
+        if callee is ast.Expr.Ident(name, _) {
             // A declaration or a binding of your own is an ordinary call, so
             // only a bare name that still reaches the builtin is lowered as one.
             if infer.callTarget(env, name) is infer.CallTarget.Builtin {
@@ -958,8 +964,8 @@ proc emitExprStmt(em: mut Emit, env: infer.Env, value: ast.Expr): void {
                 }
             }
         }
-        if callee is ast.Expr.Member(head, name) {
-            if head is ast.Expr.Ident(hiveName) {
+        if callee is ast.Expr.Member(head, name, _) {
+            if head is ast.Expr.Ident(hiveName, _) {
                 // The long name is the builtin whatever the program declared,
                 // which is what it is for.
                 if hiveName == "hive" && builtinStatement(em, env, name, args) {
@@ -985,7 +991,7 @@ proc builtinStatement(em: mut Emit, env: infer.Env, name: Str, written: ast.Arg[
             } else {
                 temp := fresh(em, "w")
                 line(em, temp + " := " + expr(em, env, a.value, infer.typeOf(env, a.value)))
-                append(held, ast.Arg(a.name, ast.Expr.Ident(temp)))
+                append(held, ast.Arg(a.name, ast.Expr.Ident(temp, em.at)))
             }
         }
     } else {
@@ -1045,7 +1051,7 @@ func argExpr(args: ast.Arg[], index: Int): ast.Expr {
     if args bounds index {
         return args[index].value
     }
-    return ast.Expr.Absent()
+    return ast.absent()
 }
 
 proc emitAssign(em: mut Emit, env: infer.Env, target: ast.Expr, value: ast.Expr): void {
@@ -1057,12 +1063,12 @@ proc emitAssign(em: mut Emit, env: infer.Env, target: ast.Expr, value: ast.Expr)
 // rather than having the one it shares written over.
 proc assignment(em: mut Emit, env: infer.Env, target: ast.Expr, value: ast.Expr): Str {
     ty := infer.typeOf(env, target)
-    if target is ast.Expr.Ident(name) {
+    if target is ast.Expr.Ident(name, _) {
         if isCell(em, name) {
             return goIdent(name) + " = " + inCell(em, ty, expr(em, env, value, ty))
         }
     }
-    if target is ast.Expr.Index(subject, index) {
+    if target is ast.Expr.Index(subject, index, _) {
         if isPacked(infer.typeOf(env, subject)) {
             return expr(em, env, subject, types.Ty.TUnknown()) + ".Set(" + expr(em, env, index, types.Ty.TInt()) + ", " + expr(em, env, value, ty) + ")"
         }
@@ -1107,27 +1113,27 @@ proc emitForRest(em: mut Emit, env: infer.Env, opening: Str, cond: ast.Expr, pos
 
 // A loop clause written inline rather than as a line of its own.
 proc clause(em: mut Emit, env: infer.Env, s: ast.Stmt): Str {
-    if s is ast.Stmt.VarDecl(name, value, _, _) {
+    if s is ast.Stmt.VarDecl(name, value, _, _, _) {
         return goIdent(name) + " := " + expr(em, env, value, infer.typeOf(env, value))
     }
-    if s is ast.Stmt.TypedDecl(declared, name, value, _, _) {
+    if s is ast.Stmt.TypedDecl(declared, name, value, _, _, _) {
         ty := types.resolve(env.table, declared)
         return goIdent(name) + " := " + goType(ty) + "(" + expr(em, env, value, ty) + ")"
     }
-    if s is ast.Stmt.Assign(target, value) {
+    if s is ast.Stmt.Assign(target, value, _) {
         return assignment(em, env, target, value)
     }
-    if s is ast.Stmt.Expression(value) {
+    if s is ast.Stmt.Expression(value, _) {
         return expr(em, env, value, types.Ty.TUnknown())
     }
     return ""
 }
 
 func bindOnly(em: Emit, env: infer.Env, s: ast.Stmt): infer.Env {
-    if s is ast.Stmt.VarDecl(name, value, _, _) {
+    if s is ast.Stmt.VarDecl(name, value, _, _, _) {
         return infer.bound(env, name, infer.typeOf(env, value))
     }
-    if s is ast.Stmt.TypedDecl(declared, name, _, _, _) {
+    if s is ast.Stmt.TypedDecl(declared, name, _, _, _, _) {
         return infer.bound(env, name, types.resolve(env.table, declared))
     }
     return env
@@ -1207,7 +1213,7 @@ proc emitPlainIf(em: mut Emit, env: infer.Env, branches: ast.Branch[], otherwise
 }
 
 proc emitBranch(em: mut Emit, env: infer.Env, b: ast.Branch, flag: Str, result: types.Ty): void {
-    emitGuards(em, env, conjuncts(b.condition), 0, b.body, flag, result)
+    emitGuards(em, env, ast.conjuncts(b.condition), 0, b.body, flag, result)
 }
 
 // One `if` per conjunct, innermost first, with the body and the flag at the
@@ -1218,11 +1224,11 @@ proc emitGuards(em: mut Emit, env: infer.Env, parts: ast.Expr[], index: Int, bod
         emitStmts(em, env, body, result)
         return
     }
-    mut ast.Expr part = ast.Expr.Absent()
+    mut ast.Expr part = ast.absent()
     if parts bounds index {
         part = parts[index]
     }
-    if part is ast.Expr.IsMatch(subject, pattern) {
+    if part is ast.Expr.IsMatch(subject, pattern, _) {
         mut inner := emitPatternGuard(em, env, subject, pattern)
         emitGuards(em, inner, parts, index + 1, body, flag, result)
         close(em, "}")
@@ -1232,29 +1238,10 @@ proc emitGuards(em: mut Emit, env: infer.Env, parts: ast.Expr[], index: Int, bod
     emitGuards(em, env, parts, index + 1, body, flag, result)
     close(em, "}")
 }
-
-// The `&&`-separated tests of a condition, left to right. Only `&&` splits one:
-// a binding made on one side of `||` would not exist on the other.
-func conjuncts(e: ast.Expr): ast.Expr[dyn] {
-    if e is ast.Expr.Binary(op, left, right) {
-        if op is ast.BinOp.And {
-            mut ast.Expr[dyn] out = []
-            for each part in conjuncts(left) {
-                append(out, part)
-            }
-            for each part in conjuncts(right) {
-                append(out, part)
-            }
-            return out
-        }
-    }
-    return [e]
-}
-
 func chainBinds(branches: ast.Branch[]): Bool {
     for each b in branches {
-        for each part in conjuncts(b.condition) {
-            if part is ast.Expr.IsMatch(_, _) {
+        for each part in ast.conjuncts(b.condition) {
+            if part is ast.Expr.IsMatch(_, _, _) {
                 return true
             }
         }
@@ -1277,9 +1264,9 @@ proc matchSubject(em: mut Emit, env: infer.Env, subject: ast.Expr): Str {
 // Whether this expression builds a variant of a declared union on the spot.
 // `Result` is not one of them: its test is a method rather than an assertion.
 func buildsVariant(t: types.Table, e: ast.Expr): Bool {
-    if e is ast.Expr.Call(callee, _) {
-        if callee is ast.Expr.Member(subject, field) {
-            if subject is ast.Expr.Ident(head) {
+    if e is ast.Expr.Call(callee, _, _) {
+        if callee is ast.Expr.Member(subject, field, _) {
+            if subject is ast.Expr.Ident(head, _) {
                 return types.findVariant(t, head, field) is Result.Ok(_)
             }
         }
@@ -1358,7 +1345,7 @@ proc bitsReader(em: mut Emit, env: infer.Env, written: Str, subjectType: types.T
         mut taken := ""
         if (f.length is ast.Expr.Absent) == false {
             taken = reader + ".TakeBytes(int(" + expr(em, scope, f.length, infer.typeOf(scope, f.length)) + "))"
-        } else if f.value is ast.Expr.StrLit(t) {
+        } else if f.value is ast.Expr.StrLit(t, _) {
             append(body, reader + ".Expect(" + quoted(t) + ")")
         } else if f.little {
             taken = "hive.TakeBitsLittle[" + goType(ty) + "](&" + reader + ", " + width + ")"
@@ -1677,15 +1664,15 @@ proc expr(em: mut Emit, env: infer.Env, e: ast.Expr, want: types.Ty): Str {
 }
 
 proc bareExpr(em: mut Emit, env: infer.Env, e: ast.Expr, want: types.Ty): Str {
-    if e is ast.Expr.IntLit(v) { return "{v}" }
-    else if e is ast.Expr.FloatLit(v) { return floatLiteral(v) }
-    else if e is ast.Expr.StrLit(t) { return quoted(t) }
-    else if e is ast.Expr.BoolLit(v) { return "{v}" }
-    else if e is ast.Expr.AtomLit(name) { return "hive.Atom({atomValue(em, name)})" }
-    else if e is ast.Expr.Ident(name) { return identExpr(em, env, name) }
+    if e is ast.Expr.IntLit(v, _) { return "{v}" }
+    else if e is ast.Expr.FloatLit(v, _) { return floatLiteral(v) }
+    else if e is ast.Expr.StrLit(t, _) { return quoted(t) }
+    else if e is ast.Expr.BoolLit(v, _) { return "{v}" }
+    else if e is ast.Expr.AtomLit(name, _) { return "hive.Atom({atomValue(em, name)})" }
+    else if e is ast.Expr.Ident(name, _) { return identExpr(em, env, name) }
     else if e is ast.Expr.Hole { return "_" }
     else if e is ast.Expr.Absent { return "" }
-    else if e is ast.Expr.Negate(operand) {
+    else if e is ast.Expr.Negate(operand, _) {
         operandType := infer.typeOf(env, operand)
         if operandType is types.Ty.TInt && numberLiteral(operand) == false {
             return "hive.NegInt(" + expr(em, env, operand, operandType) + ")"
@@ -1694,32 +1681,32 @@ proc bareExpr(em: mut Emit, env: infer.Env, e: ast.Expr, want: types.Ty): Str {
     }
     // Parenthesised for the reason `-` is: what Hive bound tightly, Go has to be
     // told to bind tightly too.
-    else if e is ast.Expr.Not(operand) {
+    else if e is ast.Expr.Not(operand, _) {
         return "!(" + expr(em, env, operand, types.Ty.TBool()) + ")"
     }
     // A literal's bits depend on its width, so `~0x0F` is worked in the type it
     // lands in.
-    else if e is ast.Expr.BitNot(operand) {
+    else if e is ast.Expr.BitNot(operand, _) {
         mut ty := infer.typeOf(env, operand)
         if types.isInteger(want) && types.same(infer.landedType(env, e, want), want) {
             ty = want
         }
         return trimmed(ty, "^(" + expr(em, env, operand, ty) + ")")
     }
-    else if e is ast.Expr.Bits(parts) { return bitsLiteral(em, env, parts) }
-    else if e is ast.Expr.Interp(parts) { return interpolation(em, env, parts) }
-    else if e is ast.Expr.VectorLit(items) { return vectorLiteral(em, env, items, want) }
-    else if e is ast.Expr.Binary(op, left, right) { return binary(em, env, op, left, right) }
-    else if e is ast.Expr.IsMatch(subject, pattern) { return standaloneMatch(em, env, subject, pattern) }
+    else if e is ast.Expr.Bits(parts, _) { return bitsLiteral(em, env, parts) }
+    else if e is ast.Expr.Interp(parts, _) { return interpolation(em, env, parts) }
+    else if e is ast.Expr.VectorLit(items, _) { return vectorLiteral(em, env, items, want) }
+    else if e is ast.Expr.Binary(op, left, right, _) { return binary(em, env, op, left, right) }
+    else if e is ast.Expr.IsMatch(subject, pattern, _) { return standaloneMatch(em, env, subject, pattern) }
     return exprTail(em, env, e, want)
 }
 
 proc exprTail(em: mut Emit, env: infer.Env, e: ast.Expr, want: types.Ty): Str {
-    if e is ast.Expr.Call(callee, args) {
+    if e is ast.Expr.Call(callee, args, _) {
         return call(em, env, callee, args, want)
-    } else if e is ast.Expr.Member(subject, field) {
+    } else if e is ast.Expr.Member(subject, field, _) {
         return member(em, env, subject, field)
-    } else if e is ast.Expr.Index(subject, index) {
+    } else if e is ast.Expr.Index(subject, index, _) {
         // A `Str` is addressed by character and Go addresses it by byte, so one
         // position of it is a walk rather than a subscript.
         subjectType := infer.typeOf(env, subject)
@@ -1727,9 +1714,9 @@ proc exprTail(em: mut Emit, env: infer.Env, e: ast.Expr, want: types.Ty): Str {
             return "hive.IndexStr(" + expr(em, env, subject, types.Ty.TStr()) + ", " + expr(em, env, index, types.Ty.TInt()) + ")"
         }
         return elementIn(subjectType, expr(em, env, subject, types.Ty.TUnknown()), expr(em, env, index, types.Ty.TInt()))
-    } else if e is ast.Expr.Slice(subject, low, high) {
+    } else if e is ast.Expr.Slice(subject, low, high, _) {
         return slice(em, env, subject, low, high)
-    } else if e is ast.Expr.Timed(call, ms) {
+    } else if e is ast.Expr.Timed(call, ms, _) {
         // A bounded send is the same send with the patience written down.
         if isSend(env, call) {
             return sendAndWait(em, env, call, expr(em, env, ms, types.Ty.TInt()))
@@ -1737,7 +1724,7 @@ proc exprTail(em: mut Emit, env: infer.Env, e: ast.Expr, want: types.Ty): Str {
         // The type argument is written out: Go cannot read it off a Task, whose
         // value is an `any` by the time it is waited for.
         return "hive.AwaitTimeout[" + goType(infer.typeOf(env, call)) + "](" + spawned(em, env, call) + ", " + expr(em, env, ms, types.Ty.TInt()) + ")"
-    } else if e is ast.Expr.AwaitAll(calls, timeout) {
+    } else if e is ast.Expr.AwaitAll(calls, timeout, _) {
         // A barrier over sends is syslink's own: every request goes out, one
         // deadline across all of them, each answer on its own connection's
         // reader — so nothing is spawned.
@@ -1896,17 +1883,17 @@ proc shareEach(s: mut Shared, env: infer.Env, stmts: ast.Stmt[], at: Int): void 
 }
 
 proc shareStmt(s: mut Shared, env: infer.Env, st: ast.Stmt): infer.Env {
-    if st is ast.Stmt.VarDecl(name, value, mutable, _) {
+    if st is ast.Stmt.VarDecl(name, value, mutable, _, _) {
         ty := infer.typeOf(env, value)
         shareBinding(s, env, name, value, ty, mutable)
         return infer.bound(env, name, ty)
     }
-    if st is ast.Stmt.TypedDecl(declared, name, value, mutable, _) {
+    if st is ast.Stmt.TypedDecl(declared, name, value, mutable, _, _) {
         ty := types.resolve(s.table, declared)
         shareBinding(s, env, name, value, ty, mutable)
         return infer.bound(env, name, ty)
     }
-    if st is ast.Stmt.IfChain(branches, otherwise, _) {
+    if st is ast.Stmt.IfChain(branches, otherwise, _, _) {
         for each b in branches {
             shareBlock(s, infer.narrowed(env, b.condition), b.body)
         }
@@ -1917,13 +1904,13 @@ proc shareStmt(s: mut Shared, env: infer.Env, st: ast.Stmt): infer.Env {
         shareBlock(s, env, ast.switchBlock(lets, arms))
         return env
     }
-    if st is ast.Stmt.ForLoop(init, _, post, body) {
+    if st is ast.Stmt.ForLoop(init, _, post, body, _) {
         inner := shareStmt(s, env, init)
         shareStmt(s, inner, post)
         shareBlock(s, inner, body)
         return env
     }
-    if st is ast.Stmt.ForEach(name, declared, subject, body) {
+    if st is ast.Stmt.ForEach(name, declared, subject, body, _) {
         mut element := types.elementOf(infer.typeOf(env, subject))
         if declared is ast.TypeExpr.VoidType {
         } else {
@@ -1942,7 +1929,7 @@ proc shareBinding(s: mut Shared, env: infer.Env, name: Str, value: ast.Expr, ty:
     // A `mut` name bound from a `mut` name's storage: both ends hold the one cell.
     // The same three questions `bindingValue` asks, so the two cannot disagree.
     if mutable && namesStorage(value) && types.ownsStorage(s.table, ty) {
-        if value is ast.Expr.Ident(source) {
+        if value is ast.Expr.Ident(source, _) {
             if indexOf(s.mutable, source) is Result.Ok(_) {
                 append(s.shareFrom, source)
                 append(s.shareTo, name)
@@ -1993,7 +1980,7 @@ proc bindingValue(em: mut Emit, env: infer.Env, name: Str, value: ast.Expr, ty: 
     }
     sourceMut := isMutableSource(em, value)
     if mutable && sourceMut {
-        if value is ast.Expr.Ident(_) {
+        if value is ast.Expr.Ident(_, _) {
             if isCell(em, name) {
                 return ""
             }
@@ -2025,9 +2012,9 @@ proc isMutableSource(em: mut Emit, value: ast.Expr): Bool {
 // The name an expression is a path into, which is the one whose mutability
 // decides.
 func rootOf(e: ast.Expr): Str {
-    if e is ast.Expr.Ident(name) { return name }
-    if e is ast.Expr.Member(subject, _) { return rootOf(subject) }
-    if e is ast.Expr.Index(subject, _) { return rootOf(subject) }
+    if e is ast.Expr.Ident(name, _) { return name }
+    if e is ast.Expr.Member(subject, _, _) { return rootOf(subject) }
+    if e is ast.Expr.Index(subject, _, _) { return rootOf(subject) }
     return ""
 }
 
@@ -2055,7 +2042,7 @@ proc interpolation(em: mut Emit, env: infer.Env, parts: ast.InterpPart[]): Str {
 proc vectorLiteral(em: mut Emit, env: infer.Env, items: ast.Expr[], want: types.Ty): Str {
     mut element := types.elementOf(want)
     if element is types.Ty.TUnknown {
-        element = types.elementOf(infer.typeOf(env, ast.Expr.VectorLit(copiedExprs(items))))
+        element = types.elementOf(infer.typeOf(env, ast.Expr.VectorLit(copiedExprs(items), em.at)))
     }
     mut Str[dyn] out = []
     for each item in items {
@@ -2220,11 +2207,11 @@ proc ferried(em: mut Emit, env: infer.Env, value: ast.Expr, want: types.Ty, writ
 // Whether an expression is a value already, with nothing to work out and nothing
 // anybody could write to.
 func settled(e: ast.Expr): Bool {
-    if e is ast.Expr.IntLit(_) { return true }
-    if e is ast.Expr.FloatLit(_) { return true }
-    if e is ast.Expr.StrLit(_) { return true }
-    if e is ast.Expr.BoolLit(_) { return true }
-    if e is ast.Expr.AtomLit(_) { return true }
+    if e is ast.Expr.IntLit(_, _) { return true }
+    if e is ast.Expr.FloatLit(_, _) { return true }
+    if e is ast.Expr.StrLit(_, _) { return true }
+    if e is ast.Expr.BoolLit(_, _) { return true }
+    if e is ast.Expr.AtomLit(_, _) { return true }
     return false
 }
 
@@ -2255,47 +2242,6 @@ proc standaloneMatch(em: mut Emit, env: infer.Env, subject: ast.Expr, pattern: a
     fail(em, "a vector pattern outside an `if` condition binds nothing, so it has no value to give")
     return "false"
 }
-
-// --- Operators ---------------------------------------------------------------
-
-// Whether an `is` among these conjuncts binds a name a later one could read.
-func conjunctsBind(parts: ast.Expr[]): Bool {
-    for each part in parts {
-        if part is ast.Expr.IsMatch(_, pattern) {
-            if patternBinds(pattern) {
-                return true
-            }
-        }
-    }
-    return false
-}
-
-func patternBinds(p: ast.Pattern): Bool {
-    if p is ast.Pattern.Constructor(_, bindings, _) {
-        for each b in bindings {
-            if b != "_" {
-                return true
-            }
-        }
-    } else if p is ast.Pattern.VectorPat(elements, rest) {
-        if rest != "" && rest != "_" {
-            return true
-        }
-        for each item in elements {
-            if item is ast.VecElem.Bind(name) {
-                if name != "_" {
-                    return true
-                }
-            }
-        }
-    } else if p is ast.Pattern.StrTemplate(parts) {
-        return len(holeNames(parts)) > 0
-    } else if p is ast.Pattern.BitsPat(fields, rest) {
-        return len(bitsBound(fields, rest)) > 0
-    }
-    return false
-}
-
 // A condition outside an `if` whose `is` binds for the rest of it. The guards an
 // `if` would write go into a closure answering whether they all held.
 proc boundConjunction(em: mut Emit, env: infer.Env, parts: ast.Expr[]): Str {
@@ -2316,11 +2262,11 @@ proc boundConjunction(em: mut Emit, env: infer.Env, parts: ast.Expr[]): Str {
 
 proc binary(em: mut Emit, env: infer.Env, op: ast.BinOp, left: ast.Expr, right: ast.Expr): Str {
     if op is ast.BinOp.And {
-        mut parts := conjuncts(left)
-        for each part in conjuncts(right) {
+        mut parts := ast.conjuncts(left)
+        for each part in ast.conjuncts(right) {
             append(parts, part)
         }
-        if conjunctsBind(parts) {
+        if ast.conjunctsBind(parts) {
             return boundConjunction(em, env, parts)
         }
     }
@@ -2409,9 +2355,9 @@ func mixedComparison(op: ast.BinOp, l: Str, r: Str): Str {
 }
 
 func numberLiteral(e: ast.Expr): Bool {
-    if e is ast.Expr.IntLit(_) { return true }
-    if e is ast.Expr.FloatLit(_) { return true }
-    if e is ast.Expr.Negate(operand) { return numberLiteral(operand) }
+    if e is ast.Expr.IntLit(_, _) { return true }
+    if e is ast.Expr.FloatLit(_, _) { return true }
+    if e is ast.Expr.Negate(operand, _) { return numberLiteral(operand) }
     return false
 }
 
@@ -2419,12 +2365,12 @@ func numberLiteral(e: ast.Expr): Bool {
 // the shape the parser desugars `bounds` into — and a hand-written guard of the
 // same shape, which means the same thing and deserves the same lowering.
 proc boundsGuard(em: mut Emit, env: infer.Env, left: ast.Expr, right: ast.Expr): Str {
-    if left is ast.Expr.Binary(leftOp, index, zero) {
-        if right is ast.Expr.Binary(rightOp, again, length) {
+    if left is ast.Expr.Binary(leftOp, index, zero, _) {
+        if right is ast.Expr.Binary(rightOp, again, length, _) {
             if leftOp is ast.BinOp.Ge && rightOp is ast.BinOp.Lt {
                 // A variant pattern binds by position; it does not match a
                 // literal, so the zero is bound and then compared.
-                if zero is ast.Expr.IntLit(zeroValue) {
+                if zero is ast.Expr.IntLit(zeroValue, _) {
                     if zeroValue == 0 && sameExpr(index, again) {
                         if lengthOf(length) is Result.Ok(vector) {
                             // A `Str` is guarded by character, the way it is
@@ -2449,16 +2395,16 @@ proc boundsGuard(em: mut Emit, env: infer.Env, left: ast.Expr, right: ast.Expr):
 
 // The vector a `len(...)` was taken of.
 func lengthOf(e: ast.Expr): Result<ast.Expr, Bool> {
-    if e is ast.Expr.Call(callee, args) {
+    if e is ast.Expr.Call(callee, args, _) {
         if args bounds 0 {
-            if callee is ast.Expr.Member(head, name) {
-                if head is ast.Expr.Ident(hiveName) {
+            if callee is ast.Expr.Member(head, name, _) {
+                if head is ast.Expr.Ident(hiveName, _) {
                     if hiveName == "hive" && name == "len" {
                         return Result.Ok(args[0].value)
                     }
                 }
             }
-            if callee is ast.Expr.Ident(bare) {
+            if callee is ast.Expr.Ident(bare, _) {
                 if bare == "len" {
                     return Result.Ok(args[0].value)
                 }
@@ -2471,18 +2417,18 @@ func lengthOf(e: ast.Expr): Result<ast.Expr, Bool> {
 // Whether two expressions are the same one written twice. Only the shapes an
 // index takes are worth asking about: a name, or a path into one.
 func sameExpr(a: ast.Expr, b: ast.Expr): Bool {
-    if a is ast.Expr.Ident(left) {
-        if b is ast.Expr.Ident(right) {
+    if a is ast.Expr.Ident(left, _) {
+        if b is ast.Expr.Ident(right, _) {
             return left == right
         }
     }
-    if a is ast.Expr.Member(leftSubject, leftField) {
-        if b is ast.Expr.Member(rightSubject, rightField) {
+    if a is ast.Expr.Member(leftSubject, leftField, _) {
+        if b is ast.Expr.Member(rightSubject, rightField, _) {
             return leftField == rightField && sameExpr(leftSubject, rightSubject)
         }
     }
-    if a is ast.Expr.IntLit(left) {
-        if b is ast.Expr.IntLit(right) {
+    if a is ast.Expr.IntLit(left, _) {
+        if b is ast.Expr.IntLit(right, _) {
             return left == right
         }
     }
@@ -2624,10 +2570,10 @@ proc call(em: mut Emit, env: infer.Env, callee: ast.Expr, args: ast.Arg[], want:
     if isAddress(env, callee) {
         return answered("hive.SyslinkAwait(" + pendingSend(em, env, callee, args) + ", 0)")
     }
-    if callee is ast.Expr.Ident(name) {
+    if callee is ast.Expr.Ident(name, _) {
         return namedCall(em, env, name, args, want)
     }
-    if callee is ast.Expr.Member(subject, field) {
+    if callee is ast.Expr.Member(subject, field, _) {
         return memberCall(em, env, subject, field, args, want)
     }
     calleeType := infer.typeOf(env, callee)
@@ -2668,7 +2614,7 @@ proc namedCall(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[], want: t
     if target is infer.CallTarget.Builtin {
         return builtin(em, env, name, args, want)
     }
-    fn := infer.typeOf(env, ast.Expr.Ident(name))
+    fn := infer.typeOf(env, ast.Expr.Ident(name, em.at))
     return lendingCall(em, goIdent(name) + "(" + valueArgs(em, env, fn, args) + ")", answerOf(fn))
 }
 
@@ -2729,7 +2675,7 @@ proc jwtSecret(em: mut Emit, env: infer.Env, codec: ast.Expr): Str {
 }
 
 proc memberCall(em: mut Emit, env: infer.Env, subject: ast.Expr, field: Str, args: ast.Arg[], want: types.Ty): Str {
-    if subject is ast.Expr.Ident(head) {
+    if subject is ast.Expr.Ident(head, _) {
         if head == "Result" {
             return resultConstructor(em, env, field, args, want)
         }
@@ -2740,7 +2686,7 @@ proc memberCall(em: mut Emit, env: infer.Env, subject: ast.Expr, field: Str, arg
         // Ahead of the variant case, which would otherwise read it as a
         // constructor.
         if field == "decode" {
-            if types.findType(em.table, head) is Result.Ok(_) {
+            if types.findType(env.table, head) is Result.Ok(_) {
                 return decoding(em, env, args, head, "")
             }
         }
@@ -2752,33 +2698,38 @@ proc memberCall(em: mut Emit, env: infer.Env, subject: ast.Expr, field: Str, arg
             return checkedConversion(infer.conversionType(head), expr(em, env, argExpr(args, 0), types.Ty.TUnknown()))
         }
     }
-    if subject is ast.Expr.Member(root, module) {
+    if subject is ast.Expr.Member(root, module, _) {
         // `Sig.Move.decode(text, codec)` reads the payload alone, so it needs a
         // decoder of its own beside the union's — written only where one is asked
         // for.
         if field == "decode" {
-            if root is ast.Expr.Ident(head) {
-                if types.findVariant(em.table, head, module) is Result.Ok(_) {
+            if root is ast.Expr.Ident(head, _) {
+                if types.findVariant(env.table, head, module) is Result.Ok(_) {
                     return decoding(em, env, args, head, module)
                 }
             }
         }
-        if root is ast.Expr.Ident(hiveName) {
+        if root is ast.Expr.Ident(hiveName, _) {
             if hiveName == "hive" {
+                if module == "map" && field == "new" {
+                    if infer.landedAt(em.landings, em.decl, subject.at) is Result.Ok(landed) {
+                        return libraryCall(em, env, module, field, args, landed)
+                    }
+                }
                 return libraryCall(em, env, module, field, args, want)
             }
         }
         // `hive.sql.DatabaseDriver.SQLite()` — a variant of one of the library's
         // own enumerations, each a closed set the runtime can answer for.
-        if root is ast.Expr.Member(head, libModule) {
-            if head is ast.Expr.Ident(rootName) && rootName == "hive" {
-                if indexOf(stdlib.variantsOf(libModule, module), field) is Result.Ok(_) {
+        if root is ast.Expr.Member(head, libModule, _) {
+            if head is ast.Expr.Ident(rootName, _) && rootName == "hive" {
+                if indexOf(stdlib.variantsOf(env.table, libModule, module), field) is Result.Ok(_) {
                     return libVariant(em, env, libModule, module, field, args)
                 }
             }
         }
     }
-    fn := infer.typeOf(env, ast.Expr.Member(subject, field))
+    fn := infer.typeOf(env, ast.Expr.Member(subject, field, em.at))
     return lendingCall(em, member(em, env, subject, field) + "(" + valueArgs(em, env, fn, args) + ")", answerOf(fn))
 }
 
@@ -2787,12 +2738,12 @@ proc memberCall(em: mut Emit, env: infer.Env, subject: ast.Expr, field: Str, arg
 // gave: a func, or a constructor with that many holes.
 proc uiEvent(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[]): Str {
     useModule(em, "ui")
-    if stdlib.isUiScene(name) {
+    if stdlib.isUiScene(env.table, name) {
         useModule(em, "uiscene")
     }
     handler := argExpr(args, 0)
-    reports := stdlib.uiEventArgs(name)
-    go := "hive." + stdlib.goNameOf("ui", name)
+    reports := stdlib.uiEventArgs(env.table, name)
+    go := "hive." + stdlib.goNameOf(env.table, "ui", name)
     if len(reports) == 0 {
         // `on` and `onDismiss` report nothing: they take the message itself.
         return go + "(" + expr(em, env, handler, types.Ty.TUnknown()) + ")"
@@ -2980,7 +2931,7 @@ proc hoist(em: mut Emit, env: infer.Env, args: ast.Arg[], names: Str[], tys: typ
         }
         append(params, name + " " + goType(ty))
         append(values, written)
-        append(inner, ast.Arg(a.name, ast.Expr.Ident(name)))
+        append(inner, ast.Arg(a.name, ast.Expr.Ident(name, em.at)))
         scope = infer.bound(scope, name, ty)
     }
     return Hoisted(params, values, inner, scope)
@@ -3105,7 +3056,7 @@ proc orderedArgs(em: mut Emit, env: infer.Env, info: types.CallableInfo, args: a
 }
 
 func packedElement(env: infer.Env, e: ast.Expr): Bool {
-    if e is ast.Expr.Index(subject, _) {
+    if e is ast.Expr.Index(subject, _, _) {
         return isPacked(infer.typeOf(env, subject))
     }
     return false
@@ -3113,7 +3064,7 @@ func packedElement(env: infer.Env, e: ast.Expr): Bool {
 
 // A packed element has no address, so it is lent as a copy `lendingCall` writes back.
 proc lendElement(em: mut Emit, env: infer.Env, found: ast.Expr, fronts: mut Str[dyn], backs: mut Str[dyn]): Str {
-    if found is ast.Expr.Index(subject, index) {
+    if found is ast.Expr.Index(subject, index, _) {
         holder := fresh(em, "p")
         at := fresh(em, "i")
         element := fresh(em, "t")
@@ -3155,7 +3106,7 @@ proc lends(em: mut Emit, name: Str): Bool {
 // The address of storage a `mut` parameter is being handed. A name that is
 // already a pointer is passed on as it stands.
 proc addressOf(em: mut Emit, found: ast.Expr, written: Str): Str {
-    if found is ast.Expr.Ident(name) {
+    if found is ast.Expr.Ident(name, _) {
         if isIndirect(em, name) {
             return goIdent(name)
         }
@@ -3227,7 +3178,7 @@ func hasHole(args: ast.Arg[]): Bool {
 // A partial application is a closure whose parameters are the holes, in the
 // order they were written, capturing everything supplied where it was written.
 proc partial(em: mut Emit, env: infer.Env, callee: ast.Expr, args: ast.Arg[], want: types.Ty): Str {
-    whole := infer.typeOf(env, ast.Expr.Call(callee, copiedArgs(args)))
+    whole := infer.typeOf(env, ast.Expr.Call(callee, copiedArgs(args), em.at))
     mut types.Ty[dyn] holeTypes = []
     mut Bool[dyn] holeMutables = []
     mut resultType := types.Ty.TUnknown()
@@ -3261,7 +3212,7 @@ proc partial(em: mut Emit, env: infer.Env, callee: ast.Expr, args: ast.Arg[], wa
             } else {
                 append(params, holeName + " " + goType(holeType))
             }
-            append(filled, ast.Arg(a.name, ast.Expr.Ident(holeName)))
+            append(filled, ast.Arg(a.name, ast.Expr.Ident(holeName, a.value.at)))
         } else if settled(a.value) == false && concrete(whole) && concrete(infer.typeOf(env, a.value)) {
             supplied := infer.typeOf(env, a.value)
             name := fresh(em, "c")
@@ -3271,7 +3222,7 @@ proc partial(em: mut Emit, env: infer.Env, callee: ast.Expr, args: ast.Arg[], wa
             }
             append(captures, name + " " + goType(supplied))
             append(captured, written)
-            append(filled, ast.Arg(a.name, ast.Expr.Ident(name)))
+            append(filled, ast.Arg(a.name, ast.Expr.Ident(name, em.at)))
             scope = infer.bound(scope, name, supplied)
         } else {
             append(filled, a)
@@ -3304,7 +3255,7 @@ func copiedArgs(args: ast.Arg[]): ast.Arg[dyn] {
 proc builtin(em: mut Emit, env: infer.Env, name: Str, written: ast.Arg[], want: types.Ty): Str {
     names := infer.builtinParams(name, len(written))
     if writtenOutOfOrder(written, names) {
-        answer := infer.typeOf(env, ast.Expr.Call(ast.Expr.Member(ast.Expr.Ident("hive"), name), copiedArgs(written)))
+        answer := infer.typeOf(env, ast.Expr.Call(ast.Expr.Member(ast.Expr.Ident("hive", em.at), name, em.at), copiedArgs(written), em.at))
         if answer is types.Ty.TVoid || concrete(answer) {
             // What a builtin grows in place is its caller's own storage.
             mut Bool[dyn] mutables = []
@@ -3694,7 +3645,7 @@ func answered(waited: Str): Str {
 // Whether this expression is a call *of an address*, which is a send rather
 // than a call of a function.
 func isSend(env: infer.Env, e: ast.Expr): Bool {
-    if e is ast.Expr.Call(callee, _) {
+    if e is ast.Expr.Call(callee, _, _) {
         return isAddress(env, callee)
     }
     return false
@@ -3703,7 +3654,7 @@ func isSend(env: infer.Env, e: ast.Expr): Bool {
 // A send with somewhere for the answer to arrive, and the wait for it. `ms` is
 // `0` where nothing bounded the wait, which leaves syslink its own patience.
 proc sendAndWait(em: mut Emit, env: infer.Env, call: ast.Expr, ms: Str): Str {
-    if call is ast.Expr.Call(callee, args) {
+    if call is ast.Expr.Call(callee, args, _) {
         return answered("hive.SyslinkAwait(" + pendingSend(em, env, callee, args) + ", " + ms + ")")
     }
     return expr(em, env, call, types.Ty.TUnknown())
@@ -3736,7 +3687,7 @@ proc awaitAllSends(em: mut Emit, env: infer.Env, calls: ast.Expr[], timeout: ast
     mut Str[dyn] pending = []
     mut element := types.Ty.TUnknown()
     for each c in calls {
-        if c is ast.Expr.Call(address, args) {
+        if c is ast.Expr.Call(address, args, _) {
             append(pending, pendingSend(em, env, address, args))
             element = infer.mailboxOf(env, infer.typeOf(env, address), args)
         }
@@ -3753,7 +3704,7 @@ proc awaitAllSends(em: mut Emit, env: infer.Env, calls: ast.Expr[], timeout: ast
 // A cast: a send with nothing to hold the answer, which allocates nothing and
 // cannot fail.
 proc sendOnly(em: mut Emit, env: infer.Env, call: ast.Expr): Str {
-    if call is ast.Expr.Call(address, args) {
+    if call is ast.Expr.Call(address, args, _) {
         useModule(em, "syslink")
         message := argExpr(args, 0)
         ty := infer.typeOf(env, message)
@@ -3876,7 +3827,7 @@ proc serviceTail(em: mut Emit, env: infer.Env, handler: ast.Expr, state: ast.Exp
         message = infer.typeAt(params, 1)
     }
     return carried(em, env, state, stateType) + ", hive.SyslinkDecoder(" + decoderRef(em, message) + "), "
-        + syslinkDigest(em, message) + ", " + syslinkEncoder(em, message) + ", " + answerCopier(em.table, message)
+        + syslinkDigest(em, message) + ", " + syslinkEncoder(em, message) + ", " + answerCopier(env.table, message)
 }
 
 // The next turn writes the state an answer may have been read from.
@@ -3989,7 +3940,7 @@ func handsBack(env: infer.Env, eligible: Str[], writable: Str[], cells: Str[], t
 }
 
 func handedIn(env: infer.Env, eligible: Str[], path: Str, call: ast.Expr): Bool {
-    if call is ast.Expr.Call(_, args) {
+    if call is ast.Expr.Call(_, args, _) {
         for each a in args {
             if pathOf(a.value) == path {
                 return true
@@ -4003,8 +3954,8 @@ func handedIn(env: infer.Env, eligible: Str[], path: Str, call: ast.Expr): Bool 
 }
 
 func handsOn(env: infer.Env, eligible: Str[], arg: ast.Expr): Bool {
-    if arg is ast.Expr.Call(callee, args) {
-        if callee is ast.Expr.Ident(name) {
+    if arg is ast.Expr.Call(callee, args, _) {
+        if callee is ast.Expr.Ident(name, _) {
             if hasHole(args) == false && indexOf(eligible, name) is Result.Ok(_) {
                 return infer.callTarget(env, name) is infer.CallTarget.Declared(_)
             }
@@ -4015,10 +3966,10 @@ func handsOn(env: infer.Env, eligible: Str[], arg: ast.Expr): Bool {
 
 // `x` or `x.field.field`, spelled out; `""` for anything else.
 func pathOf(e: ast.Expr): Str {
-    if e is ast.Expr.Ident(name) {
+    if e is ast.Expr.Ident(name, _) {
         return name
     }
-    if e is ast.Expr.Member(subject, field) {
+    if e is ast.Expr.Member(subject, field, _) {
         inner := pathOf(subject)
         if inner != "" {
             return inner + "." + field
@@ -4139,18 +4090,18 @@ proc scanStmts(stmts: ast.Stmt[], sc: mut Scan, env: infer.Env, at: Int): void {
 // What matters about a thread is what it is handed. A send's message is copied on
 // the way out, and a call handed nothing that carries storage holds none of ours.
 proc scanStmt(s: ast.Stmt, sc: mut Scan, env: infer.Env): infer.Env {
-    if s is ast.Stmt.VarDecl(name, value, _, deferred) {
+    if s is ast.Stmt.VarDecl(name, value, _, deferred, _) {
         if deferred && handsThread(env, value) { sc.spawns = true }
         scanExpr(value, sc, env)
         return infer.bound(env, name, infer.typeOf(env, value))
-    } else if s is ast.Stmt.TypedDecl(declared, name, value, _, deferred) {
+    } else if s is ast.Stmt.TypedDecl(declared, name, value, _, deferred, _) {
         if deferred && handsThread(env, value) { sc.spawns = true }
         scanExpr(value, sc, env)
         return infer.bound(env, name, types.resolve(env.table, declared))
-    } else if s is ast.Stmt.Assign(target, value) {
+    } else if s is ast.Stmt.Assign(target, value, _) {
         scanExpr(target, sc, env)
         scanExpr(value, sc, env)
-    } else if s is ast.Stmt.IfChain(branches, otherwise, _) {
+    } else if s is ast.Stmt.IfChain(branches, otherwise, _, _) {
         for each b in branches {
             scanExpr(b.condition, sc, env)
             scanBlock(b.body, sc, infer.narrowed(env, b.condition))
@@ -4158,12 +4109,12 @@ proc scanStmt(s: ast.Stmt, sc: mut Scan, env: infer.Env): infer.Env {
         scanBlock(otherwise, sc, env)
     } else if s is ast.Stmt.SwitchStmt(lets, _, arms, _, _) {
         scanBlock(ast.switchBlock(lets, arms), sc, env)
-    } else if s is ast.Stmt.ForLoop(init, cond, post, body) {
+    } else if s is ast.Stmt.ForLoop(init, cond, post, body, _) {
         inner := scanStmt(init, sc, env)
         scanExpr(cond, sc, inner)
         scanStmt(post, sc, inner)
         scanBlock(body, sc, inner)
-    } else if s is ast.Stmt.ForEach(name, declared, subject, body) {
+    } else if s is ast.Stmt.ForEach(name, declared, subject, body, _) {
         scanExpr(subject, sc, env)
         mut element := types.elementOf(infer.typeOf(env, subject))
         if declared is ast.TypeExpr.VoidType {
@@ -4171,26 +4122,26 @@ proc scanStmt(s: ast.Stmt, sc: mut Scan, env: infer.Env): infer.Env {
             element = types.resolve(env.table, declared)
         }
         scanBlock(body, sc, infer.bound(env, name, element))
-    } else if s is ast.Stmt.ReturnStmt(value) {
+    } else if s is ast.Stmt.ReturnStmt(value, _) {
         scanExpr(value, sc, env)
-    } else if s is ast.Stmt.EchoStmt(value) {
+    } else if s is ast.Stmt.EchoStmt(value, _) {
         scanExpr(value, sc, env)
-    } else if s is ast.Stmt.AssertStmt(condition) {
+    } else if s is ast.Stmt.AssertStmt(condition, _) {
         scanExpr(condition, sc, env)
-    } else if s is ast.Stmt.PanicStmt(value) {
+    } else if s is ast.Stmt.PanicStmt(value, _) {
         scanExpr(value, sc, env)
-    } else if s is ast.Stmt.AsyncStmt(call) {
+    } else if s is ast.Stmt.AsyncStmt(call, _) {
         if handsThread(env, call) { sc.spawns = true }
         scanExpr(call, sc, env)
-    } else if s is ast.Stmt.Expression(value) {
+    } else if s is ast.Stmt.Expression(value, _) {
         scanExpr(value, sc, env)
     }
     return env
 }
 
 proc scanExpr(e: ast.Expr, sc: mut Scan, env: infer.Env): void {
-    if e is ast.Expr.Call(callee, args) {
-        if callee is ast.Expr.Ident(name) {
+    if e is ast.Expr.Call(callee, args, _) {
+        if callee is ast.Expr.Ident(name, _) {
             append(sc.calls, name)
         } else {
             scanExpr(callee, sc, env)
@@ -4198,51 +4149,51 @@ proc scanExpr(e: ast.Expr, sc: mut Scan, env: infer.Env): void {
         for each a in args {
             scanExpr(a.value, sc, env)
         }
-    } else if e is ast.Expr.Interp(parts) {
+    } else if e is ast.Expr.Interp(parts, _) {
         for each part in parts {
             if part is ast.InterpPart.Expression(inner) {
                 scanExpr(inner, sc, env)
             }
         }
-    } else if e is ast.Expr.VectorLit(items) {
+    } else if e is ast.Expr.VectorLit(items, _) {
         for each item in items {
             scanExpr(item, sc, env)
         }
-    } else if e is ast.Expr.Negate(operand) {
+    } else if e is ast.Expr.Negate(operand, _) {
         scanExpr(operand, sc, env)
-    } else if e is ast.Expr.Not(operand) {
+    } else if e is ast.Expr.Not(operand, _) {
         scanExpr(operand, sc, env)
-    } else if e is ast.Expr.BitNot(operand) {
+    } else if e is ast.Expr.BitNot(operand, _) {
         scanExpr(operand, sc, env)
-    } else if e is ast.Expr.Bits(parts) {
+    } else if e is ast.Expr.Bits(parts, _) {
         for each part in parts {
             scanExpr(part.value, sc, env)
         }
-    } else if e is ast.Expr.Binary(_, left, right) {
+    } else if e is ast.Expr.Binary(_, left, right, _) {
         scanExpr(left, sc, env)
         scanExpr(right, sc, env)
-    } else if e is ast.Expr.Member(subject, _) {
+    } else if e is ast.Expr.Member(subject, _, _) {
         scanExpr(subject, sc, env)
-    } else if e is ast.Expr.Index(subject, index) {
+    } else if e is ast.Expr.Index(subject, index, _) {
         scanExpr(subject, sc, env)
         scanExpr(index, sc, env)
-    } else if e is ast.Expr.Slice(subject, low, high) {
+    } else if e is ast.Expr.Slice(subject, low, high, _) {
         scanExpr(subject, sc, env)
         scanExpr(low, sc, env)
         scanExpr(high, sc, env)
-    } else if e is ast.Expr.IsMatch(subject, pattern) {
+    } else if e is ast.Expr.IsMatch(subject, pattern, _) {
         scanExpr(subject, sc, env)
         for each held in ast.patternExprs(pattern) {
             scanExpr(held, sc, env)
         }
-    } else if e is ast.Expr.AwaitAll(calls, timeout) {
+    } else if e is ast.Expr.AwaitAll(calls, timeout, _) {
         // A barrier runs every call in it on a thread of its own.
         if anyHandsThread(env, calls) { sc.spawns = true }
         for each c in calls {
             scanExpr(c, sc, env)
         }
         scanExpr(timeout, sc, env)
-    } else if e is ast.Expr.Timed(call, ms) {
+    } else if e is ast.Expr.Timed(call, ms, _) {
         // `f(x) with timeout ms` waits on a thread, so it starts one.
         if handsThread(env, call) { sc.spawns = true }
         scanExpr(call, sc, env)
@@ -4264,8 +4215,8 @@ func handsThread(env: infer.Env, call: ast.Expr): Bool {
     if infer.isSendExpr(env, call) {
         return false
     }
-    if call is ast.Expr.Call(callee, args) {
-        if callee is ast.Expr.Ident(name) {
+    if call is ast.Expr.Call(callee, args, _) {
+        if callee is ast.Expr.Ident(name, _) {
             declared := infer.callTarget(env, name) is infer.CallTarget.Declared(_)
             if declared == false {
                 return true
@@ -4284,9 +4235,9 @@ func handsThread(env: infer.Env, call: ast.Expr): Bool {
 }
 
 func libraryOf(callee: ast.Expr): Str[dyn] {
-    if callee is ast.Expr.Member(root, name) {
-        if root is ast.Expr.Member(head, module) {
-            if head is ast.Expr.Ident(rootName) && rootName == "hive" {
+    if callee is ast.Expr.Member(root, name, _) {
+        if root is ast.Expr.Member(head, module, _) {
+            if head is ast.Expr.Ident(rootName, _) && rootName == "hive" {
                 return [module, name]
             }
         }
@@ -4840,11 +4791,11 @@ proc typedLiteral(em: mut Emit, ty: types.Ty, e: ast.Expr): Str {
 // A `Default`'s literal, as the Go value it stands for. The parser accepts
 // nothing but a literal there, so this needs no scope and can never fail.
 proc literal(em: mut Emit, e: ast.Expr): Str {
-    if e is ast.Expr.IntLit(v) { return "{v}" }
-    if e is ast.Expr.FloatLit(v) { return floatLiteral(v) }
-    if e is ast.Expr.StrLit(t) { return quoted(t) }
-    if e is ast.Expr.BoolLit(b) { return "{b}" }
-    if e is ast.Expr.AtomLit(name) { return "hive.Atom({atomValue(em, name)})" }
+    if e is ast.Expr.IntLit(v, _) { return "{v}" }
+    if e is ast.Expr.FloatLit(v, _) { return floatLiteral(v) }
+    if e is ast.Expr.StrLit(t, _) { return quoted(t) }
+    if e is ast.Expr.BoolLit(b, _) { return "{b}" }
+    if e is ast.Expr.AtomLit(name, _) { return "hive.Atom({atomValue(em, name)})" }
     return "nil"
 }
 
@@ -4977,7 +4928,7 @@ proc encodeOf(em: mut Emit, ty: types.Ty, value: Str, depth: Int): Str {
         return "hive.JsonEncodeVec(" + unpacked(ty, value) + ", func(" + item + " " + goType(element) + ") string \{ return " + encodeOf(em, element, item, depth + 1) + " })"
     }
     if ty is types.Ty.TMap(_, _) {
-        fail(em, "a map does not encode: its keys are whatever was put in it, while everything else here is read from a declaration. Send its pairs as a vector of a type declared for them")
+        fail(em, stdlib.mapHasNoJson())
         return "\"null\""
     }
     // Anything with no static shape is encoded from what it turns out to be.
@@ -5253,10 +5204,10 @@ func flatWriter(format: Str, ty: types.Ty): Str {
 // --- The standard library ----------------------------------------------------
 
 proc libraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, written: ast.Arg[], want: types.Ty): Str {
-    if len(stdlib.fieldsOf(module, name)) > 0 {
+    if len(stdlib.fieldsOf(env.table, module, name)) > 0 {
         return runtimeLibraryCall(em, env, module, name, written, want)
     }
-    answer := infer.typeOf(env, ast.Expr.Call(ast.Expr.Member(ast.Expr.Member(ast.Expr.Ident("hive"), module), name), copiedArgs(written)))
+    answer := infer.typeOf(env, ast.Expr.Call(ast.Expr.Member(ast.Expr.Member(ast.Expr.Ident("hive", em.at), module, em.at), name, em.at), copiedArgs(written), em.at))
     return lifted(answer, runtimeLibraryCall(em, env, module, name, written, want))
 }
 
@@ -5267,16 +5218,16 @@ proc runtimeLibraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, wr
         return "nil"
     }
     useModule(em, module)
-    names := stdlib.paramNamesOf(module, name)
-    if len(stdlib.fieldsOf(module, name)) == 0 && writtenOutOfOrder(written, names) {
-        answer := infer.typeOf(env, ast.Expr.Call(ast.Expr.Member(ast.Expr.Member(ast.Expr.Ident("hive"), module), name), copiedArgs(written)))
+    names := stdlib.paramNamesOf(env.table, module, name)
+    if len(stdlib.fieldsOf(env.table, module, name)) == 0 && writtenOutOfOrder(written, names) {
+        answer := infer.typeOf(env, ast.Expr.Call(ast.Expr.Member(ast.Expr.Member(ast.Expr.Ident("hive", em.at), module, em.at), name, em.at), copiedArgs(written), em.at))
         if answer is types.Ty.TVoid || concrete(answer) {
             // The map `set` and `delete` write into is the caller's own.
             mut Bool[dyn] mutables = []
             if module == "map" && (name == "set" || name == "delete") {
                 mutables = [true]
             }
-            h := hoist(em, env, written, names, infer.typesOfArgs(env, stdlib.libraryArgs(module, name, written)), mutables, true)
+            h := hoist(em, env, written, names, infer.typesOfArgs(env, stdlib.libraryArgs(env.table, module, name, written)), mutables, true)
             mut asAnswered := goResult(answer)
             if answer is types.Ty.TVoid {
             } else {
@@ -5285,7 +5236,7 @@ proc runtimeLibraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, wr
             return inWrittenOrder(h, asAnswered, runtimeLibraryCall(em, h.env, module, name, h.args, want))
         }
     }
-    args := stdlib.libraryArgs(module, name, written)
+    args := stdlib.libraryArgs(env.table, module, name, written)
     // Turning the terminal's echo off is a file of its own plus one per platform,
     // so a program that never asks for a secret carries none of them.
     if module == "term" && (name == "readSecret" || name == "readSecretBypass") {
@@ -5337,10 +5288,10 @@ proc runtimeLibraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, wr
     if module == "ui" {
         // A scene is a module of its own, because it is the one that carries a
         // download: what brings it into a build is exactly what needs it.
-        if stdlib.isUiScene(name) {
+        if stdlib.isUiScene(env.table, name) {
             useModule(em, "uiscene")
         }
-        if stdlib.isUiEvent(name) {
+        if stdlib.isUiEvent(env.table, name) {
             return uiEvent(em, env, name, args)
         }
         if name == "window" || name == "webview" {
@@ -5369,11 +5320,11 @@ proc runtimeLibraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, wr
     // A name that opens with a capital is one of the library's own types being
     // built rather than a call: `hive.net.HttpResponse(200, [], "ok")` is a
     // value, and the fields it lands in say what its arguments are.
-    if len(stdlib.fieldsOf(module, name)) > 0 {
-        return literalOf(em, env, "hive." + text.capitalise(module) + name, stdlib.fieldsOf(module, name), args)
+    if len(stdlib.fieldsOf(env.table, module, name)) > 0 {
+        return literalOf(em, env, "hive." + text.capitalise(module) + name, stdlib.fieldsOf(env.table, module, name), args)
     }
-    called := "hive." + stdlib.goNameOf(module, name) + "(" + typedArgs(em, env, args, stdlib.paramsOf(module, name)) + ")"
-    if module == "math" && stdlib.resultOf(module, name, infer.mathArgTypes(env, args)) is types.Ty.TFloat32 {
+    called := "hive." + stdlib.goNameOf(env.table, module, name) + "(" + typedArgs(em, env, args, stdlib.paramsOf(env.table, module, name)) + ")"
+    if module == "math" && stdlib.resultOf(env.table, module, name, infer.mathArgTypes(env, args)) is types.Ty.TFloat32 {
         return "hive.ToFloat32(" + called + ")"
     }
     return called
@@ -5413,12 +5364,12 @@ proc mapCall(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[]): Str {
         return "(" + subject + ")." + text.capitalise(name) + "(" + rest + ")"
     }
     if name == "keys" || name == "values" {
-        answer := stdlib.mapResult(name, [infer.typeOf(env, argExpr(args, 0))])
+        answer := stdlib.resultOf(env.table, "map", name, [infer.typeOf(env, argExpr(args, 0))])
         return packed(answer, "(" + subject + ")." + text.capitalise(name) + "(" + rest + ")")
     }
     // These two are conversions rather than questions about a map, so they stay
     // ordinary functions.
-    return "hive." + stdlib.goNameOf("map", name) + "(" + plainArgs(em, env, args) + ")"
+    return "hive." + stdlib.goNameOf(env.table, "map", name) + "(" + plainArgs(em, env, args) + ")"
 }
 
 // Every argument but the first, which is the subject a method is called on.
@@ -5450,10 +5401,14 @@ func testingT(): Str {
 // The `main_test.go` for a program's tests (`""` when it has none), and the
 // modules the build carries once a test's own calls are counted.
 proc emitTests(m: ast.Module, atoms: Str[], codecs: Str[], modules: Str[]): Emitted {
+    return emitCheckedTests(m, atoms, codecs, modules, [])
+}
+
+proc emitCheckedTests(m: ast.Module, atoms: Str[], codecs: Str[], modules: Str[], landings: infer.Landing[]): Emitted {
     t := types.tableOf(m)
     // What `main.go` already wrote or asked for is seeded rather than repeated:
     // the two files are one Go package.
-    mut Emit em = Emit(t, [], 0, copiedNames(atoms), copiedNames(modules), [], [], lentFuncs(t, m.decls), [], copiedNames(codecs), 0, [], [], [], [], true, false, false, -1, [], writes.writtenShapes(m), [], 0, "", false, [], handingBackFuncs(t, m.decls), "", [], [])
+    mut Emit em = Emit(t, [], 0, copiedNames(atoms), copiedNames(modules), [], [], lentFuncs(t, m.decls), [], copiedNames(codecs), 0, [], [], [], [], true, false, false, -1, [], writes.writtenShapes(m), [], token.nowhere(), "", false, [], handingBackFuncs(t, m.decls), "", [], [], landings)
     written := len(codecs)
     mut found := false
     for each d in m.decls {
@@ -5478,7 +5433,7 @@ proc emitTests(m: ast.Module, atoms: Str[], codecs: Str[], modules: Str[]): Emit
     env := infer.newEnv(t)
     for each d in m.decls {
         if d is ast.Decl.TestDecl(title, body, declaredOn) {
-            em.line = declaredOn
+            em.at = declaredOn
             em.decl = ast.declName(d)
             enterBody(em)
             em.cells = cellNames(t, env, [], body)
@@ -5516,7 +5471,7 @@ proc emitTestStmts(em: mut Emit, env: infer.Env, body: ast.Block): infer.Env {
 // effect runs exactly once.
 // Outside a test a failed `assert` ends the program, saying what it asserted.
 proc emitAssert(em: mut Emit, env: infer.Env, condition: ast.Expr): void {
-    if condition is ast.Expr.Binary(op, left, right) {
+    if condition is ast.Expr.Binary(op, left, right, _) {
         if op is ast.BinOp.Eq || op is ast.BinOp.Neq {
             // Both sides are written as the left side's type, with a half a `Result`
             // built on the spot cannot say taken from the right.
@@ -5537,7 +5492,7 @@ proc emitAssert(em: mut Emit, env: infer.Env, condition: ast.Expr): void {
 }
 
 proc emitTestAssert(em: mut Emit, env: infer.Env, condition: ast.Expr): void {
-    if condition is ast.Expr.Binary(op, left, right) {
+    if condition is ast.Expr.Binary(op, left, right, _) {
         if op is ast.BinOp.Eq || op is ast.BinOp.Neq {
             compared := types.filledIn(infer.typeOf(env, left), infer.typeOf(env, right))
             l := fresh(em, "l")
@@ -5559,31 +5514,31 @@ proc emitTestAssert(em: mut Emit, env: infer.Env, condition: ast.Expr): void {
 // understood it rather than character for character what was typed — the more
 // useful of the two when they differ.
 func sourceOf(e: ast.Expr): Str {
-    if e is ast.Expr.Binary(op, left, right) {
+    if e is ast.Expr.Binary(op, left, right, _) {
         return sourceOf(left) + " " + ast.opSpelling(op) + " " + sourceOf(right)
     }
-    if e is ast.Expr.IntLit(v) { return "{v}" }
-    if e is ast.Expr.StrLit(t) { return quoted(t) }
-    if e is ast.Expr.BoolLit(v) { return "{v}" }
-    if e is ast.Expr.Ident(name) { return name }
-    if e is ast.Expr.Member(subject, field) { return sourceOf(subject) + "." + field }
-    if e is ast.Expr.Index(subject, index) { return sourceOf(subject) + "[" + sourceOf(index) + "]" }
-    if e is ast.Expr.Call(callee, args) {
+    if e is ast.Expr.IntLit(v, _) { return "{v}" }
+    if e is ast.Expr.StrLit(t, _) { return quoted(t) }
+    if e is ast.Expr.BoolLit(v, _) { return "{v}" }
+    if e is ast.Expr.Ident(name, _) { return name }
+    if e is ast.Expr.Member(subject, field, _) { return sourceOf(subject) + "." + field }
+    if e is ast.Expr.Index(subject, index, _) { return sourceOf(subject) + "[" + sourceOf(index) + "]" }
+    if e is ast.Expr.Call(callee, args, _) {
         mut Str[dyn] out = []
         for each a in args {
             append(out, sourceOf(a.value))
         }
         return sourceOf(callee) + "(" + join(out, ", ") + ")"
     }
-    if e is ast.Expr.IsMatch(subject, pattern) {
+    if e is ast.Expr.IsMatch(subject, pattern, _) {
         return sourceOf(subject) + " is " + show.showPattern(pattern)
     }
-    if e is ast.Expr.Negate(operand) { return "-" + sourceOf(operand) }
-    if e is ast.Expr.BitNot(operand) { return "~" + sourceOf(operand) }
-    if e is ast.Expr.Not(operand) { return "!" + sourceOf(operand) }
-    if e is ast.Expr.FloatLit(v) { return "{v}" }
-    if e is ast.Expr.AtomLit(atom) { return "#{atom}" }
-    if e is ast.Expr.VectorLit(items) {
+    if e is ast.Expr.Negate(operand, _) { return "-" + sourceOf(operand) }
+    if e is ast.Expr.BitNot(operand, _) { return "~" + sourceOf(operand) }
+    if e is ast.Expr.Not(operand, _) { return "!" + sourceOf(operand) }
+    if e is ast.Expr.FloatLit(v, _) { return "{v}" }
+    if e is ast.Expr.AtomLit(atom, _) { return "#{atom}" }
+    if e is ast.Expr.VectorLit(items, _) {
         mut Str[dyn] out = []
         for each item in items {
             append(out, sourceOf(item))
@@ -5592,10 +5547,10 @@ func sourceOf(e: ast.Expr): Str {
     }
     // A slice's bounds are `Absent` when not written, which is what makes `v[:2]`
     // and `v[2:]` read back as they were typed.
-    if e is ast.Expr.Slice(subject, low, high) {
+    if e is ast.Expr.Slice(subject, low, high, _) {
         return sourceOf(subject) + "[" + sourceOf(low) + ":" + sourceOf(high) + "]"
     }
-    if e is ast.Expr.Interp(parts) {
+    if e is ast.Expr.Interp(parts, _) {
         mut Str[dyn] out = []
         for each part in parts {
             if part is ast.InterpPart.Literal(t) {

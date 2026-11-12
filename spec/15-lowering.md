@@ -93,10 +93,10 @@ The emitter runs a lightweight type-inference pass over locals so overloaded
 syntax picks the right lowering: `+` on vectors versus strings versus numbers,
 atom → `Str` coercions, zero-safe division, vector literal element types.
 
-The same pass decides the constructs that have **no honest lowering** —
-indexing a `Str` is the one that exists today — so they are rejected as Hive
-errors rather than emitted as code that either fails to compile or quietly means
-something else.
+It refuses nothing. A construct with **no honest lowering** is the checker's to
+reject, before any Go is written ([18.2](18-conformance.md#182-this-implementation)),
+and the one thing a value cannot say for itself — what an empty
+`hive.map.new()` holds — the checker settles from where it lands and hands over.
 
 ## 15.4 Source positions
 

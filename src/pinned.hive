@@ -20,7 +20,7 @@ proc pinModule(m: ast.Module): ast.Module {
             append(out, d)
         }
     }
-    return ast.Module(m.imports, out, m.foreign)
+    return ast.Module(m.imports, out, m.foreign, m.library)
 }
 
 proc pinBlock(env: infer.Env, body: ast.Block, result: types.Ty): ast.Block {
@@ -32,11 +32,11 @@ proc pinBlock(env: infer.Env, body: ast.Block, result: types.Ty): ast.Block {
 proc pinStmts(env: infer.Env, stmts: ast.Stmt[], at: Int, result: types.Ty, out: mut ast.Stmt[dyn]): void {
     if stmts bounds at {
         mut pinned := pinInside(env, stmts[at], result)
-        if pinned is ast.Stmt.VarDecl(name, value, mutable, deferred) && unwritten(value) {
+        if pinned is ast.Stmt.VarDecl(name, value, mutable, deferred, _) && unwritten(value) {
             held := unpinned(env, value)
             found := firstUse(infer.bound(env, name, held), name, stmts, at + 1, result, held)
             if complete(found) {
-                pinned = ast.Stmt.TypedDecl(types.toWritten(found), name, value, mutable, deferred)
+                pinned = ast.Stmt.TypedDecl(types.toWritten(found), name, value, mutable, deferred, pinned.at)
             }
         }
         append(out, pinned)
@@ -53,10 +53,10 @@ func unpinned(env: infer.Env, value: ast.Expr): types.Ty {
 }
 
 func stepped(env: infer.Env, s: ast.Stmt): infer.Env {
-    if s is ast.Stmt.VarDecl(name, value, _, _) {
+    if s is ast.Stmt.VarDecl(name, value, _, _, _) {
         return infer.bound(env, name, infer.typeOf(env, value))
     }
-    if s is ast.Stmt.TypedDecl(declared, name, _, _, _) {
+    if s is ast.Stmt.TypedDecl(declared, name, _, _, _, _) {
         return infer.bound(env, name, types.resolve(env.table, declared))
     }
     return env
@@ -70,26 +70,26 @@ func elementEnv(env: infer.Env, name: Str, declared: ast.TypeExpr, subject: ast.
 }
 
 proc pinInside(env: infer.Env, s: ast.Stmt, result: types.Ty): ast.Stmt {
-    if s is ast.Stmt.IfChain(branches, otherwise, hasElse) {
+    if s is ast.Stmt.IfChain(branches, otherwise, hasElse, _) {
         mut ast.Branch[dyn] out = []
         for each b in branches {
             append(out, ast.Branch(b.condition, pinBlock(infer.narrowed(env, b.condition), b.body, result)))
         }
-        return ast.Stmt.IfChain(out, pinBlock(env, otherwise, result), hasElse)
+        return ast.Stmt.IfChain(out, pinBlock(env, otherwise, result), hasElse, s.at)
     }
-    if s is ast.Stmt.SwitchStmt(lets, subjects, arms, line, binds) {
+    if s is ast.Stmt.SwitchStmt(lets, subjects, arms, binds, line) {
         inner := steppedAll(env, lets, 0)
         mut ast.Branch[dyn] out = []
         for each b in arms {
             append(out, ast.Branch(b.condition, pinBlock(infer.narrowed(inner, b.condition), b.body, result)))
         }
-        return ast.Stmt.SwitchStmt(lets, subjects, out, line, binds)
+        return ast.Stmt.SwitchStmt(lets, subjects, out, binds, line)
     }
-    if s is ast.Stmt.ForLoop(init, cond, post, body) {
-        return ast.Stmt.ForLoop(init, cond, post, pinBlock(stepped(env, init), body, result))
+    if s is ast.Stmt.ForLoop(init, cond, post, body, _) {
+        return ast.Stmt.ForLoop(init, cond, post, pinBlock(stepped(env, init), body, result), s.at)
     }
-    if s is ast.Stmt.ForEach(name, declared, subject, body) {
-        return ast.Stmt.ForEach(name, declared, subject, pinBlock(elementEnv(env, name, declared, subject), body, result))
+    if s is ast.Stmt.ForEach(name, declared, subject, body, _) {
+        return ast.Stmt.ForEach(name, declared, subject, pinBlock(elementEnv(env, name, declared, subject), body, result), s.at)
     }
     return s
 }
@@ -105,12 +105,12 @@ func unwritten(value: ast.Expr): Bool {
     if infer.isResultLiteral(value) {
         return true
     }
-    if value is ast.Expr.Call(callee, _) {
-        if callee is ast.Expr.Ident(name) {
+    if value is ast.Expr.Call(callee, _, _) {
+        if callee is ast.Expr.Ident(name, _) {
             return name == "at"
         }
-        if callee is ast.Expr.Member(subject, name) {
-            if subject is ast.Expr.Ident(hiveName) {
+        if callee is ast.Expr.Member(subject, name, _) {
+            if subject is ast.Expr.Ident(hiveName, _) {
                 return hiveName == "hive" && name == "at"
             }
             return name == "new" && libraryModule(subject) == "map"
@@ -120,7 +120,7 @@ func unwritten(value: ast.Expr): Bool {
 }
 
 func libraryModule(e: ast.Expr): Str {
-    if e is ast.Expr.Member(root, module) && root is ast.Expr.Ident(hiveName) && hiveName == "hive" {
+    if e is ast.Expr.Member(root, module, _) && root is ast.Expr.Ident(hiveName, _) && hiveName == "hive" {
         return module
     }
     return ""
@@ -176,21 +176,21 @@ proc inBlock(env: infer.Env, name: Str, body: ast.Block, result: types.Ty, sofar
 }
 
 proc inStmt(env: infer.Env, name: Str, s: ast.Stmt, result: types.Ty, sofar: types.Ty): types.Ty {
-    if s is ast.Stmt.VarDecl(_, value, _, _) {
+    if s is ast.Stmt.VarDecl(_, value, _, _, _) {
         return inExpr(env, name, value, sofar)
     }
-    if s is ast.Stmt.TypedDecl(declared, _, value, _, _) {
+    if s is ast.Stmt.TypedDecl(declared, _, value, _, _, _) {
         return inExpr(env, name, value, landed(sofar, name, value, types.resolve(env.table, declared)))
     }
-    if s is ast.Stmt.Assign(target, value) {
+    if s is ast.Stmt.Assign(target, value, _) {
         mut known := landed(sofar, name, value, infer.typeOf(env, target))
         known = landed(known, name, target, infer.typeOf(env, value))
         return inExpr(env, name, value, inExpr(env, name, target, known))
     }
-    if s is ast.Stmt.ReturnStmt(value) {
+    if s is ast.Stmt.ReturnStmt(value, _) {
         return inExpr(env, name, value, landed(sofar, name, value, result))
     }
-    if s is ast.Stmt.IfChain(branches, otherwise, _) {
+    if s is ast.Stmt.IfChain(branches, otherwise, _, _) {
         mut known := sofar
         for each b in branches {
             known = inExpr(env, name, b.condition, known)
@@ -209,26 +209,26 @@ proc inStmt(env: infer.Env, name: Str, s: ast.Stmt, result: types.Ty, sofar: typ
         }
         return known
     }
-    if s is ast.Stmt.ForLoop(init, cond, post, body) {
+    if s is ast.Stmt.ForLoop(init, cond, post, body, _) {
         inner := stepped(env, init)
         mut known := inStmt(env, name, init, result, sofar)
         known = inExpr(inner, name, cond, known)
         known = inBlock(inner, name, body, result, known)
         return inStmt(inner, name, post, result, known)
     }
-    if s is ast.Stmt.ForEach(element, declared, subject, body) {
+    if s is ast.Stmt.ForEach(element, declared, subject, body, _) {
         return inBlock(elementEnv(env, element, declared, subject), name, body, result, inExpr(env, name, subject, sofar))
     }
-    if s is ast.Stmt.EchoStmt(value) { return inExpr(env, name, value, sofar) }
-    if s is ast.Stmt.AssertStmt(condition) { return inExpr(env, name, condition, sofar) }
-    if s is ast.Stmt.PanicStmt(value) { return inExpr(env, name, value, sofar) }
-    if s is ast.Stmt.AsyncStmt(call) { return inExpr(env, name, call, sofar) }
-    if s is ast.Stmt.Expression(value) { return inExpr(env, name, value, sofar) }
+    if s is ast.Stmt.EchoStmt(value, _) { return inExpr(env, name, value, sofar) }
+    if s is ast.Stmt.AssertStmt(condition, _) { return inExpr(env, name, condition, sofar) }
+    if s is ast.Stmt.PanicStmt(value, _) { return inExpr(env, name, value, sofar) }
+    if s is ast.Stmt.AsyncStmt(call, _) { return inExpr(env, name, call, sofar) }
+    if s is ast.Stmt.Expression(value, _) { return inExpr(env, name, value, sofar) }
     return sofar
 }
 
 func landed(sofar: types.Ty, name: Str, e: ast.Expr, wanted: types.Ty): types.Ty {
-    if e is ast.Expr.Ident(written) && written == name {
+    if e is ast.Expr.Ident(written, _) && written == name {
         return merged(sofar, wanted)
     }
     return sofar
@@ -238,14 +238,14 @@ proc inExpr(env: infer.Env, name: Str, e: ast.Expr, sofar: types.Ty): types.Ty {
     if complete(sofar) {
         return sofar
     }
-    if e is ast.Expr.Call(callee, args) {
+    if e is ast.Expr.Call(callee, args, _) {
         mut known := inExpr(env, name, callee, sofar)
         for each a in args {
             known = inExpr(env, name, a.value, known)
         }
         return inCall(env, name, callee, args, known)
     }
-    if e is ast.Expr.Binary(op, left, right) {
+    if e is ast.Expr.Binary(op, left, right, _) {
         mut known := inExpr(env, name, right, inExpr(env, name, left, sofar))
         // The two sides of an `==` are one type, so each says what the other is.
         if op is ast.BinOp.Eq || op is ast.BinOp.Neq {
@@ -254,32 +254,32 @@ proc inExpr(env: infer.Env, name: Str, e: ast.Expr, sofar: types.Ty): types.Ty {
         }
         return known
     }
-    if e is ast.Expr.Negate(operand) { return inExpr(env, name, operand, sofar) }
-    if e is ast.Expr.Not(operand) { return inExpr(env, name, operand, sofar) }
-    if e is ast.Expr.BitNot(operand) { return inExpr(env, name, operand, sofar) }
-    if e is ast.Expr.Member(subject, _) { return inExpr(env, name, subject, sofar) }
-    if e is ast.Expr.Index(subject, index) {
+    if e is ast.Expr.Negate(operand, _) { return inExpr(env, name, operand, sofar) }
+    if e is ast.Expr.Not(operand, _) { return inExpr(env, name, operand, sofar) }
+    if e is ast.Expr.BitNot(operand, _) { return inExpr(env, name, operand, sofar) }
+    if e is ast.Expr.Member(subject, _, _) { return inExpr(env, name, subject, sofar) }
+    if e is ast.Expr.Index(subject, index, _) {
         return inExpr(env, name, index, inExpr(env, name, subject, sofar))
     }
-    if e is ast.Expr.IsMatch(subject, _) { return inExpr(env, name, subject, sofar) }
-    if e is ast.Expr.Timed(call, ms) {
+    if e is ast.Expr.IsMatch(subject, _, _) { return inExpr(env, name, subject, sofar) }
+    if e is ast.Expr.Timed(call, ms, _) {
         return inExpr(env, name, ms, inExpr(env, name, call, sofar))
     }
-    if e is ast.Expr.VectorLit(items) {
+    if e is ast.Expr.VectorLit(items, _) {
         mut known := sofar
         for each item in items {
             known = inExpr(env, name, item, known)
         }
         return known
     }
-    if e is ast.Expr.Bits(parts) {
+    if e is ast.Expr.Bits(parts, _) {
         mut known := sofar
         for each part in parts {
             known = inExpr(env, name, part.value, known)
         }
         return known
     }
-    if e is ast.Expr.Interp(parts) {
+    if e is ast.Expr.Interp(parts, _) {
         mut known := sofar
         for each part in parts {
             if part is ast.InterpPart.Expression(value) {
@@ -292,12 +292,12 @@ proc inExpr(env: infer.Env, name: Str, e: ast.Expr, sofar: types.Ty): types.Ty {
 }
 
 proc inCall(env: infer.Env, name: Str, callee: ast.Expr, args: ast.Arg[], sofar: types.Ty): types.Ty {
-    if callee is ast.Expr.Ident(called) && called == name {
+    if callee is ast.Expr.Ident(called, _) && called == name {
         return merged(sofar, types.Ty.TAddress(infer.typeOf(env, ast.argFor(args, "", 0))))
     }
-    if callee is ast.Expr.Member(subject, field) && libraryModule(subject) == "map" {
-        ordered := stdlib.libraryArgs("map", field, args)
-        if ordered bounds 0 && ordered[0].value is ast.Expr.Ident(first) && first == name {
+    if callee is ast.Expr.Member(subject, field, _) && libraryModule(subject) == "map" {
+        ordered := stdlib.libraryArgs(env.table, "map", field, args)
+        if ordered bounds 0 && ordered[0].value is ast.Expr.Ident(first, _) && first == name {
             mut value := types.Ty.TUnknown()
             if field == "set" && ordered bounds 2 {
                 value = infer.typeOf(env, ordered[2].value)
@@ -313,7 +313,7 @@ proc inCall(env: infer.Env, name: Str, callee: ast.Expr, args: ast.Arg[], sofar:
 
 proc handedTo(env: infer.Env, name: Str, callee: ast.Expr, args: ast.Arg[], sofar: types.Ty): types.Ty {
     known := sofar
-    if callee is ast.Expr.Ident(called) {
+    if callee is ast.Expr.Ident(called, _) {
         target := infer.callTarget(env, called)
         if target is infer.CallTarget.Declared(info) {
             return byName(env, name, info.params, args, known)
@@ -328,8 +328,8 @@ proc handedTo(env: infer.Env, name: Str, callee: ast.Expr, args: ast.Arg[], sofa
         }
         return known
     }
-    if callee is ast.Expr.Member(subject, field) {
-        if subject is ast.Expr.Ident(head) {
+    if callee is ast.Expr.Member(subject, field, _) {
+        if subject is ast.Expr.Ident(head, _) {
             if types.findVariant(env.table, head, field) is Result.Ok(fields) {
                 return byField(env, name, fields, args, known)
             }
@@ -337,7 +337,7 @@ proc handedTo(env: infer.Env, name: Str, callee: ast.Expr, args: ast.Arg[], sofa
         }
         module := libraryModule(subject)
         if module != "" {
-            return byPosition(name, stdlib.paramsOf(module, field), stdlib.libraryArgs(module, field, args), known)
+            return byPosition(name, stdlib.paramsOf(env.table, module, field), stdlib.libraryArgs(env.table, module, field, args), known)
         }
     }
     return known

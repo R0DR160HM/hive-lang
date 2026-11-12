@@ -11,6 +11,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      compile_scene:
+        description: Compile the scene engines even where the last release carries them
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -30,6 +35,9 @@ jobs:
   # What is cached is what was fetched and, for the web, Filament built for
   # WebAssembly: it publishes no such libraries, and building them is most of an
   # hour that only a change to `scene/build`'s pins should cost again.
+  #
+  # Skipped where the last release was built from this `scene/`: its engines are
+  # downloaded instead. Running by hand with `compile_scene` builds them regardless.
   scene:
     strategy:
       # Each engine is built alone, so one that fails does not stop the others:
@@ -52,7 +60,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Take it from the last release, where that is this engine
+        id: last
+        if: inputs.compile_scene != true
+        shell: bash
+        run: |
+          if scene/build --fetch ${{ matrix.what }} dist; then
+            echo "taken=true" >> "$GITHUB_OUTPUT"
+            ls -l dist
+          fi
+
       - name: Restore what it is built against
+        if: steps.last.outputs.taken != 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -70,7 +89,7 @@ jobs:
       # to take them from: apt holds every one against Ubuntu's own signature,
       # wherever it was fetched.
       - name: A compiler new enough for Filament
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && steps.last.outputs.taken != 'true'
         run: |
           elsewhere() {
             echo "::warning::Ubuntu's archive does not answer from this runner. Its packages are being taken from kernel.org's mirror of it."
@@ -99,9 +118,10 @@ jobs:
           echo "CXX=clang++-18" >> "$GITHUB_ENV"
 
       - name: Build it
+        if: steps.last.outputs.taken != 'true'
         shell: bash
         run: |
-          scene/build ${{ matrix.what }} dist
+          scene/build --force ${{ matrix.what }} dist
           ls -l dist
 
       - uses: actions/upload-artifact@v4
@@ -137,7 +157,7 @@ jobs:
             ~/.cache/go-build
             ~/go/pkg/mod
             ~/.hive
-          key: hive-${{ runner.os }}-${{ hashFiles('src/**/*.hive', 'seed/pinned.txt') }}
+          key: hive-${{ runner.os }}-${{ hashFiles('src/**/*.hive', 'runtime/**', 'seed/pinned.txt') }}
           restore-keys: |
             hive-${{ runner.os }}-
 
@@ -352,6 +372,13 @@ jobs:
           cp dist/hivec-windows-amd64.exe src/hivec.exe
           echo "HIVE_SCENE_DIST=$(pwd -W)/dist" >> "$GITHUB_ENV"
 
+      # The compiler compiles itself here, which is what a Windows checkout is
+      # for. The seed copy does the compiling so the output is not the file
+      # running. First, because it writes the runtime the compiler's source imports.
+      - name: Build the compiler with itself
+        shell: bash
+        run: HIVEC="$PWD/.seed/hivec.exe" ./bootstrap
+
       # The one thing no Linux runner can fail: cmd.exe completes a filename with
       # `\`, and an entrypoint spelled that way is what every import resolves
       # against. Run from cmd.exe rather than bash so the path arrives as a
@@ -361,13 +388,6 @@ jobs:
         run: |
           call hive.cmd check src\hivec.hive
           if errorlevel 1 exit /b 1
-
-      # And the compiler compiles itself here, which is what a Windows checkout is
-      # for. The seed copy does the compiling so the output is not the file
-      # running.
-      - name: Build the compiler with itself
-        shell: bash
-        run: HIVEC="$PWD/.seed/hivec.exe" ./bootstrap
 
       - name: The compiler's own tests
         shell: bash

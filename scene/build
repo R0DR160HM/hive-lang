@@ -5,6 +5,10 @@
 #   scene/build web        the engine a page runs, as WebAssembly
 #   scene/build [web] DIR  either, left in DIR rather than where a compiler built
 #                          from source looks: ~/.hive/vendor/scene@dev
+#   scene/build --force .. compiled here, whatever a release carries
+#   scene/build --fetch .. taken from a release, or not at all
+#
+# Compiled only when the latest release was not built from these same sources.
 #
 # Everything it builds against is fetched once and pinned: Filament's SDK and
 # the two single-file libraries the sounds are made with by SHA-256, and for
@@ -32,6 +36,13 @@ miniaudio_sum=9019743287e443c55e5737a7297f38e5e358561701d6db2d905afb114390c410
 stb=1ee679ca2ef753a528db5ba6801e1067b40481b8
 stb_sum=4c7cb2ff1f7011e9d67950446b7eb9ca044f2e464d76bfbb0b84dd2e23e65636
 
+repository=R0DR160HM/hive-lang
+
+how=either
+case "${1:-}" in
+	--force) how=compiled; shift ;;
+	--fetch) how=fetched; shift ;;
+esac
 what=native
 if [ "${1:-}" == web ]; then
 	what=web
@@ -163,16 +174,50 @@ web() {
 	placed "$tree/hive-scene.wasm" hive-scene.wasm
 }
 
-if [ "$what" == web ]; then
-	web
-	exit 0
-fi
-case "$(uname -s)" in
-	Linux*) linux ;;
-	MINGW*|MSYS*|CYGWIN*) windows ;;
+# Line endings are set aside, so a checkout on Windows and one on Linux agree.
+sources() {
+	(cd "$here" && find . -type f ! -path './out/*' ! -name '*.md' | LC_ALL=C sort | while read -r file; do
+		echo "$(tr -d '\r' < "$file" | sha256sum | cut -d' ' -f1) $file"
+	done) | sha256sum | cut -d' ' -f1
+}
+
+# Whatever goes wrong on the way is a reason to compile instead.
+taken() {
+	local page tag base sums file want
+	page="$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/$repository/releases/latest" 2>/dev/null)" || return 1
+	case "$page" in
+		*/tag/*) tag="${page##*/tag/}" ;;
+		*) return 1 ;;
+	esac
+	base="https://github.com/$repository/releases/download/$tag"
+	[ "$(curl -fsSL "$base/hive-scene.sources" 2>/dev/null)" == "$(sources)" ] || return 1
+	sums="$(curl -fsSL "$base/SHA256SUMS" 2>/dev/null)" || return 1
+	for file in "$@"; do
+		want="$(awk -v name="$file" '$2 == name { print $1 }' <<< "$sums")"
+		[ -n "$want" ] || return 1
+		(fetched "$base/$file" "$into/$file" "$want") || return 1
+		echo "scene/build: $into/$file — from $tag, unchanged since"
+	done
+}
+
+case "$what $(uname -s)" in
+	"web "*) wanted="hive-scene.js hive-scene.wasm"; compile=web ;;
+	"native Linux"*) wanted=hive-scene-linux-amd64; compile=linux ;;
+	"native MINGW"*|"native MSYS"*|"native CYGWIN"*) wanted=hive-scene-windows-amd64.exe; compile=windows ;;
 	*)
 		echo "scene/build: a window draws its own scene on Linux and Windows only." >&2
 		echo "             Everywhere else the scene is a page's: scene/build web" >&2
 		exit 1
 		;;
 esac
+
+# shellcheck disable=SC2086
+if [ "$how" == compiled ] || ! taken $wanted; then
+	if [ "$how" == fetched ]; then
+		echo "scene/build: the latest release was not built from these sources, so there is nothing to take from it." >&2
+		exit 1
+	fi
+	"$compile"
+fi
+mkdir -p "$into"
+sources > "$into/hive-scene.sources"

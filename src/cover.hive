@@ -50,7 +50,7 @@ func missed(t: types.Table, branches: ast.Branch[]): Str {
 func subjectsOf(branches: ast.Branch[]): Str[dyn] {
     mut Str[dyn] out = []
     for each b in branches {
-        if opening(b.condition) is ast.Expr.IsMatch(matched, _) {
+        if opening(b.condition) is ast.Expr.IsMatch(matched, _, _) {
             subject := pathOf(matched)
             if subject != "" && indexOf(out, subject) is Result.Error(_) {
                 append(out, subject)
@@ -61,7 +61,7 @@ func subjectsOf(branches: ast.Branch[]): Str[dyn] {
 }
 
 func opening(e: ast.Expr): ast.Expr {
-    if e is ast.Expr.Binary(op, left, _) {
+    if e is ast.Expr.Binary(op, left, _, _) {
         if op is ast.BinOp.And {
             return opening(left)
         }
@@ -71,14 +71,14 @@ func opening(e: ast.Expr): ast.Expr {
 
 // A call is never a subject: it may answer differently each time it is made.
 func pathOf(e: ast.Expr): Str {
-    if e is ast.Expr.Ident(name) {
+    if e is ast.Expr.Ident(name, _) {
         return name
     }
-    if e is ast.Expr.Member(subject, field) {
+    if e is ast.Expr.Member(subject, field, _) {
         return extended(pathOf(subject), "." + field)
     }
-    if e is ast.Expr.Index(subject, index) {
-        if index is ast.Expr.IntLit(n) {
+    if e is ast.Expr.Index(subject, index, _) {
+        if index is ast.Expr.IntLit(n, _) {
             return extended(pathOf(subject), "[{n}]")
         }
         inner := pathOf(index)
@@ -95,16 +95,6 @@ func extended(base: Str, more: Str): Str {
     }
     return base + more
 }
-
-func conjuncts(e: ast.Expr): ast.Expr[dyn] {
-    if e is ast.Expr.Binary(op, left, right) {
-        if op is ast.BinOp.And {
-            return conjuncts(left) + conjuncts(right)
-        }
-    }
-    return [e]
-}
-
 func rowsFor(t: types.Table, branches: ast.Branch[], subject: Str): Pat[dyn][dyn] {
     mut Pat[dyn][dyn] out = []
     for each b in branches {
@@ -120,10 +110,10 @@ func rowsFor(t: types.Table, branches: ast.Branch[], subject: Str): Pat[dyn][dyn
 func rowOf(t: types.Table, condition: ast.Expr, subject: Str): Result<Pat, Bool> {
     mut Pat tree = Pat.Opaque()
     mut first := true
-    for each c in conjuncts(condition) {
+    for each c in ast.conjuncts(condition) {
         if first {
             first = false
-            if c is ast.Expr.IsMatch(matched, pattern) && pathOf(matched) == subject {
+            if c is ast.Expr.IsMatch(matched, pattern, _) && pathOf(matched) == subject {
                 tree = patOf(t, pattern)
             } else {
                 return Result.Error(false)
@@ -138,14 +128,14 @@ func rowOf(t: types.Table, condition: ast.Expr, subject: Str): Result<Pat, Bool>
 }
 
 func narrowed(t: types.Table, tree: Pat, c: ast.Expr): Result<Pat, Bool> {
-    if c is ast.Expr.IsMatch(target, pattern) {
-        if target is ast.Expr.Ident(name) && anyCount(tree, name) == 1 {
+    if c is ast.Expr.IsMatch(target, pattern, _) {
+        if target is ast.Expr.Ident(name, _) && anyCount(tree, name) == 1 {
             return Result.Ok(refine(tree, name, patOf(t, pattern)))
         }
     }
-    if c is ast.Expr.Binary(op, left, right) {
+    if c is ast.Expr.Binary(op, left, right, _) {
         if op is ast.BinOp.Eq {
-            if left is ast.Expr.Ident(name) && anyCount(tree, name) == 1 {
+            if left is ast.Expr.Ident(name, _) && anyCount(tree, name) == 1 {
                 return Result.Ok(refine(tree, name, literalPat(right)))
             }
         }
@@ -201,7 +191,7 @@ func patOf(t: types.Table, p: ast.Pattern): Pat {
 }
 
 func literalPat(e: ast.Expr): Pat {
-    if e is ast.Expr.BoolLit(value) {
+    if e is ast.Expr.BoolLit(value, _) {
         return Pat.Truth(value)
     }
     key := literalKey(e)
@@ -212,19 +202,19 @@ func literalPat(e: ast.Expr): Pat {
 }
 
 func literalKey(e: ast.Expr): Str {
-    if e is ast.Expr.IntLit(n) {
+    if e is ast.Expr.IntLit(n, _) {
         return "{n}"
     }
-    if e is ast.Expr.FloatLit(f) {
+    if e is ast.Expr.FloatLit(f, _) {
         return "{f}"
     }
-    if e is ast.Expr.StrLit(written) {
+    if e is ast.Expr.StrLit(written, _) {
         return "\"{written}\""
     }
-    if e is ast.Expr.AtomLit(atom) {
+    if e is ast.Expr.AtomLit(atom, _) {
         return "#" + atom
     }
-    if e is ast.Expr.Negate(operand) {
+    if e is ast.Expr.Negate(operand, _) {
         inner := literalKey(operand)
         if inner != "" {
             return "-" + inner
@@ -620,9 +610,9 @@ func armRow(t: types.Table, paths: Str[], condition: ast.Expr): Pat[dyn] {
     for i := 0; i < len(paths); i++ {
         append(tested, false)
     }
-    for each c in conjuncts(condition) {
+    for each c in ast.conjuncts(condition) {
         column := columnOf(paths, tested, c)
-        if c is ast.Expr.BoolLit(true) {
+        if c is ast.Expr.BoolLit(true, _) {
             continue
         } else if row bounds column && tested bounds column {
             row[column] = headPat(t, c)
@@ -649,10 +639,10 @@ func columnOf(paths: Str[], tested: Bool[], c: ast.Expr): Int {
 }
 
 func testedPath(c: ast.Expr): Str {
-    if c is ast.Expr.IsMatch(target, _) {
+    if c is ast.Expr.IsMatch(target, _, _) {
         return pathOf(target)
     }
-    if c is ast.Expr.Binary(op, left, _) {
+    if c is ast.Expr.Binary(op, left, _, _) {
         if op is ast.BinOp.Eq {
             return pathOf(left)
         }
@@ -661,10 +651,10 @@ func testedPath(c: ast.Expr): Str {
 }
 
 func headPat(t: types.Table, c: ast.Expr): Pat {
-    if c is ast.Expr.IsMatch(_, pattern) {
+    if c is ast.Expr.IsMatch(_, pattern, _) {
         return patOf(t, pattern)
     }
-    if c is ast.Expr.Binary(_, _, right) {
+    if c is ast.Expr.Binary(_, _, right, _) {
         return literalPat(right)
     }
     return Pat.Opaque()

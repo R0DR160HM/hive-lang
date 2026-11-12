@@ -9,7 +9,7 @@ built two ways:
 | web | `hive-scene.js`, `hive-scene.wasm` | a page: `webview`, macOS, Android, and any window that fell back to one |
 
 A scene is a value the program packs into a frame (`uiSceneFrame` in
-`src/runtime.hive`). The engine is handed each frame and keeps the world it
+`runtime/hive/uiscene.go`). The engine is handed each frame and keeps the world it
 describes; it knows nothing of Hive, of widgets or of windows.
 
 ## Building
@@ -18,7 +18,14 @@ describes; it knows nothing of Hive, of widgets or of windows.
 scene/build            # native, for this machine, into ~/.hive/vendor/scene@dev
 scene/build web        # the page's
 scene/build [web] DIR  # either, left in DIR
+scene/build --force .. # compiled here, whatever a release carries
+scene/build --fetch .. # taken from a release, or not at all
 ```
+
+Nothing is compiled that a release already built: each release carries
+`hive-scene.sources`, one number for everything under `scene/` its engines came
+from, and where the latest one's matches this tree the engines are downloaded
+from it. `--force` compiles regardless.
 
 `scene/build` says what it needs at its top. A compiler built from source embeds
 whatever is in `~/.hive/vendor/scene@dev`; a released one fetches its release's
@@ -87,7 +94,7 @@ the last picture. That is how a change to the engine is measured.
 ## The web engine
 
 The same world on the page's own canvas, through WebGL 2. `src/web.cpp` exports
-what the page's script (`uiSceneJs` in `src/runtime.hive`) calls: `hs_start`,
+what the page's script (`uiSceneJS` in `runtime/hive/uiscene.go`) calls: `hs_start`,
 `hs_frame`, `hs_told`, `hs_sized`, `hs_insets`, `hs_draw`, `hs_stale`, and
 `hs_picture`, `hs_file`, `hs_terrain`, `hs_label` for the answers. What it asks
 for arrives at `Module.wanted(kind, first, second)`, and is answered between

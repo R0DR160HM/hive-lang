@@ -52,7 +52,8 @@ as a compile error is left for the Go toolchain to refuse: what `hive check`
 accepts, `go build` builds. That is what makes the toolchain's own refusal mean
 what [17](17-diagnostics.md) says it means — a bug in this compiler, or in a Go
 file the program imported — rather than a message about Go standing in for a
-message about Hive.
+message about Hive. Nor is one left for the emitter: `hive check` stops before any
+Go is written, and what it accepts the emitter has nothing to say about.
 
 **It runs every example.** [`../examples`](../examples) holds twenty-two
 programs, and all but the last are the same programs the compiler this one
@@ -129,10 +130,11 @@ different route, or does not quite do it.
   because the report is written from the flattened module.
 * **A test failure names the generated file.** The specification says a failure
   reports the `.hive` line, through `//line` directives
-  ([15](15-lowering.md#154-source-positions)). Here it reports `main_test.go`,
-  because the tree carries no positions past the parser — the same reason
-  [17](17-diagnostics.md#173-a-limit-worth-knowing) gives for the other
-  passes reporting against a declaration.
+  ([15](15-lowering.md#154-source-positions)). Here it reports `main_test.go`.
+  Every node knows where it was written
+  ([17.3](17-diagnostics.md#173-where-an-error-lands)); the emitter does not yet
+  write that down, since the coverage report reads its spans off the generated
+  file and would have to follow.
 * **The bounds pass proves less than it could.** Everything
   [10](10-bounds.md) describes is implemented, and it is conservative in three
   places the specification leaves open: a proof is keyed on a *path* — a name, a
@@ -142,12 +144,6 @@ different route, or does not quite do it.
   `row := t[r]`, is what proves it. All three refuse a program the specification
   permits rather than accepting one it forbids, which is the safe direction to be
   wrong in.
-* **A message from a pass after the parser names a declaration rather than a
-  statement.** Those passes run on the flattened program, whose nodes carry a
-  position on a declaration and nowhere else, so a message opens at the
-  declaration's line and says which declaration it is about
-  ([17](17-diagnostics.md#173-a-limit-worth-knowing)). In a program of more
-  than one file the message is placed in the file the declaration came from.
 * **A local that is never read still compiles.** Hive allows it and Go does not,
   so every generated local is followed by `_ = name`. That is noise in the
   generated Go and nothing else.
@@ -163,7 +159,7 @@ different route, or does not quite do it.
 
 ## 18.3 Defects this chapter turned up in this one
 
-Holding this compiler against 18.1 found six things wrong with it. All six are
+Holding this compiler against 18.1 found seven things wrong with it. All seven are
 fixed; they are recorded because each says something about what the requirement
 in [18.1](#181-what-a-conforming-implementation-must-do) actually costs to keep.
 The first is much the largest, and the shape of it is worth the paragraph: a
@@ -218,6 +214,17 @@ program *is* still refused. What is lost is which language the message is about.
 6. **`argFor(args, "", i)` answered with the first argument whatever `i` was.**
    An empty name matched the first argument with no name of its own. Nothing had
    ever asked for anything but position 0, so it never showed.
+
+7. **Five rejections were the emitter's alone.** A message type that cannot be
+   written out — one holding a `Table`, a `Secret` or a map — a map handed to
+   `encode`, a vector pattern standing where a value was wanted, an `append`
+   inside an expression, and a `hive.map.new()` landing nowhere that says what it
+   holds were each refused only once Go was being written. So `hive check` had
+   to write the whole program to answer, and `hive analyze`, which stops short
+   of that, scored programs that do not compile. All five are the checker's now,
+   reported against the line they are on. Where an empty map lands is settled
+   there too and handed on, so the emitter builds what the checker saw rather
+   than deciding a second time.
 
 One message was wrong rather than absent: a comparison of two types that fit
 nowhere near each other closed with "Hive never widens a number behind your

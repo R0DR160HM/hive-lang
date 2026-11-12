@@ -9,6 +9,7 @@ import ../src/loader
 import ../src/mono
 import ../src/stdlib
 import ../src/text
+import ../src/types
 
 // The first thing wrong with `source`, or `""`.
 proc problem(source: Str): Str {
@@ -1514,9 +1515,10 @@ test "a builtin or a library call takes named arguments like any callable" {
 }
 
 test "every library call has a name for each position it takes" {
+    t := types.tableOf(loader.loadText("main.hive", "proc main(): void \{ }").module)
     for each call in [["term", "execWith"], ["file", "csv"], ["math", "clamp"], ["time", "dateTimeFrom"], ["map", "set"], ["ui", "line"], ["ui", "select"], ["ui", "at"], ["ui", "onInput"], ["sql", "pool"], ["net", "socketReceive"], ["crypto", "decrypt"], ["crypto", "decryptBypass"], ["syslink", "monitor"], ["task", "sleep"], ["conv", "sti"], ["env", "get"], ["audio", "play"], ["audio", "stop"]] {
         if call bounds 1 {
-            assert len(stdlib.paramNamesOf(call[0], call[1])) == len(stdlib.paramsOf(call[0], call[1]))
+            assert len(stdlib.paramNamesOf(t, call[0], call[1])) == len(stdlib.paramsOf(t, call[0], call[1]))
         }
     }
 }
@@ -1777,4 +1779,102 @@ test "a conversion is a call, plain or checked" {
 test "a sized field takes a sized Default" {
     assert problemCount("type Pixel \{ alpha: UInt8 -- Default as 255; }\n" + inMain("echo Pixel(1)")) == 0
     assert opens(problem("type Pixel \{ alpha: UInt8 -- Default as 256; }\n" + inMain("echo Pixel(1)")), "in `Pixel`: `alpha` is declared UInt8 and falls back to Int")
+}
+
+// --- Where a mistake is reported -----------------------------------------------
+
+proc lines(source: Str): Str {
+    p := loader.loadText("main.hive", source)
+    mut Str[dyn] out = []
+    for each e in check.checkModule(p.module) {
+        append(out, "{e.line}")
+    }
+    return join(out, " ")
+}
+
+proc place(source: Str): Str {
+    p := loader.loadText("main.hive", source)
+    for each e in check.checkModule(p.module) {
+        return "{e.line}:{e.col}"
+    }
+    return ""
+}
+
+test "a mistake is reported on the line it is on, not its declaration's" {
+    assert lines("proc main(): void \{\n    echo 1\n    echo nowhere\n    echo alsoNowhere\n}") == "3 4"
+}
+
+test "a mistake is reported at the thing that is wrong" {
+    assert place("proc main(): void \{\n    echo nowhere\n}") == "2:10"
+    assert place("type User \{ id: Int }\nproc main(): void \{\n    user := User(1)\n    echo user.nope\n}") == "4:15"
+}
+
+test "an argument on a line of its own is reported there" {
+    assert lines("func area(width: Int, height: Int): Int \{ return width * height }\nproc main(): void \{\n    echo area(3,\n        \"four\")\n}") == "4"
+}
+
+test "what an operator cannot join is reported at the operator" {
+    assert place("proc main(): void \{\n    total := 1 +\n        \"two\"\n    echo total\n}") == "2:16"
+}
+
+test "a mistake inside an interpolation is reported where its string is" {
+    assert lines("proc main(): void \{\n    echo 1\n    echo \"it is \{nowhere}\"\n}") == "3"
+}
+
+test "a diagnostic says which file its line is in" {
+    p := loader.loadText("main.hive", "proc main(): void \{\n    echo nowhere\n}")
+    for each e in check.checkModule(p.module) {
+        assert e.file == "main.hive"
+    }
+}
+
+// --- What only writing the Go used to refuse -------------------------------------
+
+func service(carried: Str): Str {
+    return "type Msg \{ Carried \{ held: " + carried + " } }\nproc inbox(state: mut Int, m: Msg): Msg \{ return m }\n"
+}
+
+test "a message type that cannot be written out is refused where its service starts" {
+    starts := inMain("if spawn(inbox, 0) is Result.Ok(a) \{ echo 1 }")
+    assert problem(service("Secret<Str>") + starts) == "in `main`: a message to a service cannot carry Msg: a `Secret` is never written out, because only `reveal` opens one"
+    assert opens(problem(service("Table") + starts), "in `main`: a message to a service cannot carry `Msg.held`: a `Table`")
+    assert opens(problem(service("hive.map.Map<Str, Int>") + starts), "in `main`: a message to a service cannot carry Msg: a map does not encode")
+    assert problemCount(service("Str[dyn]") + starts) == 0
+}
+
+test "a message is held to the same where it is sent" {
+    assert opens(problem("proc send(a: Address<Table>): void \{ t := [[\"a\"]]  a(t) }\n" + inMain("echo 1")), "in `send`: a message to a service cannot carry this: a `Table`")
+}
+
+test "a map is not something `encode` writes" {
+    assert opens(problem(inMain("mut hive.map.Map<Str, Int> m = hive.map.new()  echo encode(m, hive.json.codec())")), "in `main`: `encode` cannot carry hive.map.Map<Str, Int>: a map does not encode")
+    assert problemCount(inMain("if hive.json.JsonValue.decode(\"1\", hive.json.codec()) is Result.Ok(v) \{ echo encode(v, hive.json.codec()) }")) == 0
+}
+
+test "a vector pattern gives no value outside a condition" {
+    assert problem(inMain("v := [\"a\", \"b\"]  found := v is [\"a\", second]  echo found")) == "in `main`: a vector pattern outside an `if` condition binds nothing, so it has no value to give"
+    assert problemCount(inMain("v := [\"a\", \"b\"]  if v is [\"a\", second] \{ echo second }")) == 0
+}
+
+test "an `&&` chain that binds is tested as a condition is, wherever it stands" {
+    assert problemCount("type Route \{ Page \{ segments: Str[dyn] }  Missing }\n" + inMain("Route[dyn] routes = [Route.Missing()]  echo routes is [Route.Missing, _]")) == 0
+}
+
+test "`append` inside an expression is refused, and `drop` is not" {
+    assert opens(problem(inMain("mut Int[dyn] v = []  echo append(v, 1)")), "in `main`: `append` hands nothing back")
+    assert opens(problem(inMain("mut Int[dyn] v = []  x := [prepend(v, 1)]  echo len(x)")), "in `main`: `prepend` hands nothing back")
+    assert problemCount(inMain("mut Int[dyn] v = [1, 2]  echo drop(v, 0, 0)")) == 0
+    assert problemCount(inMain("mut Int[dyn] v = []  append(v, 1)")) == 0
+}
+
+test "an empty map inside an expression has nowhere to land" {
+    assert opens(problem(inMain("echo hive.map.new()")), "in `main`: `hive.map.new()` has to land somewhere that says what it holds: a declaration, a return")
+    assert opens(problem(inMain("v := [hive.map.new()]  echo len(v)")), "in `main`: `hive.map.new()` has to land somewhere")
+}
+
+test "an empty map takes the type of the slot it lands in, through what is written around it" {
+    assert problemCount("type Box \{ items: hive.map.Map<Str, Int> }\n" + inMain("b := Box(hive.map.new())  echo len(hive.map.keys(b.items))")) == 0
+    assert problemCount(inMain("hive.map.Map<Str, Int>[dyn] all = [hive.map.new(), hive.map.new()]  echo len(all)")) == 0
+    assert problemCount("func make(): Result<hive.map.Map<Str, Int>, Str> \{ return Result.Ok(hive.map.new()) }\n" + inMain("if make() is Result.Ok(m) \{ echo 1 }")) == 0
+    assert problemCount(inMain("mut hive.map.Map<Str, hive.map.Map<Str, Int>> outer = hive.map.new()  hive.map.set(outer, \"a\", hive.map.new())  echo 1")) == 0
 }

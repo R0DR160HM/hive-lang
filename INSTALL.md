@@ -113,6 +113,17 @@ After that, `./hive` (`hive.cmd` on Windows) runs the compiler in `src/`. The
 compiler imports a Go file, so even `./hive check src/hivec.hive` needs Go.
 [`seed/README.md`](seed/README.md) says how a release becomes the next seed.
 
+The Go a Hive program is compiled against is under [`runtime/`](runtime), as Go,
+and beside each module's Go is its stub: `term.hive` declares what `hive.term` has,
+`term.go` is what it does. `./bootstrap` writes both into `src/embedded.hive`
+first, which is what the compiler's source imports and nothing tracks — so a
+change to the runtime is a `./bootstrap`, and a clean checkout needs one before
+`./hive check src/hivec.hive` has anything to read.
+
+A new call is a line in the stub and a function in the Go, and the compiler's own
+source may use it in the same change: `./bootstrap` sets `HIVE_RUNTIME` to the
+checkout's `runtime/`, which a compiler reads in place of the runtime it carries.
+
 ### The scene engine
 
 A release's compiler fetches the engine a `hive.ui.scene` is drawn by from its own
@@ -130,6 +141,10 @@ or the one in [`scene/`](scene/README.md), built here:
 scene/build        # the engine a window starts beside itself, for this machine
 scene/build web    # the engine a page runs
 ```
+
+Where the latest release was built from the `scene/` in the checkout, `scene/build`
+downloads its engine rather than compiling one; `scene/build --force` compiles
+regardless.
 
 On Linux both the engine and the building of it need glibc 2.38 or newer, which is
 Ubuntu 24.04 or Debian 13. Where the engine cannot start, a window is a page.

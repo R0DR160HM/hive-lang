@@ -2,7 +2,7 @@
 // ======
 // A recursive-descent parser turning a token list into an `ast.Module`. It is also
 // where a name's spelling is held to the rules in `naming`: this is the pass that
-// knows what a name is, and the last one holding the line to report it against.
+// knows what a name is.
 //
 // Errors do not stop it. A failure sets a flag, every loop checks it and stops, and
 // the declaration loop clears it and skips to the next declaration. One error per
@@ -43,11 +43,17 @@ type Parse {
     split: Bool
     // Directly inside `<<...>>`, where a `>>` closes it rather than shifting.
     inBits: Bool
+    file: Str
+    // The string an interpolation or a query's value is parsed out of, where its nodes are placed.
+    within: token.Pos
 }
 
-// Parse a whole file.
 proc parse(ts: token.Token[]): Parsed {
-    mut Parse p = Parse(0, false, false, [], 0, [], false, false)
+    return parseFile(ts, "")
+}
+
+proc parseFile(ts: token.Token[], file: Str): Parsed {
+    mut Parse p = Parse(0, false, false, [], 0, [], false, false, file, token.nowhere())
     mut ast.ImportLine[dyn] imports = []
     mut ast.Decl[dyn] decls = []
 
@@ -67,7 +73,7 @@ proc parse(ts: token.Token[]): Parsed {
             p.pos = p.pos + 1
         }
     }
-    return Parsed(ast.Module(imports, decls, []), p.errors)
+    return Parsed(ast.Module(imports, decls, [], ast.noLibrary()), p.errors)
 }
 
 proc appendImport(ts: token.Token[], p: mut Parse, into: mut ast.ImportLine[dyn]): void {
@@ -93,15 +99,22 @@ func kindAt(ts: token.Token[], i: Int): token.Kind {
     return token.Kind.Eof()
 }
 
-func lineAt(ts: token.Token[], i: Int): Int {
+func placeAt(ts: token.Token[], p: Parse, i: Int): token.Pos {
+    if p.within.line > 0 {
+        return p.within
+    }
     if ts bounds i {
-        return ts[i].line
+        return token.Pos(p.file, ts[i].line, ts[i].col)
     }
     last := len(ts) - 1
     if ts bounds last {
-        return ts[last].line
+        return token.Pos(p.file, ts[last].line, ts[last].col)
     }
-    return 1
+    return token.Pos(p.file, 1, 1)
+}
+
+func place(ts: token.Token[], p: Parse): token.Pos {
+    return placeAt(ts, p, p.pos)
 }
 
 // The identifier a token spells, or `""`. Several words are keywords only where
@@ -132,7 +145,7 @@ proc fail(ts: token.Token[], p: mut Parse, message: Str): void {
 // until the operand has been read.
 proc failAt(ts: token.Token[], p: mut Parse, at: Int, message: Str): void {
     if p.quiet == false && p.failed == false {
-        append(p.errors, diag.at(lineAt(ts, at), message))
+        append(p.errors, diag.on(placeAt(ts, p, at), message))
     }
     p.failed = true
 }
@@ -175,7 +188,7 @@ proc expectIdent(ts: token.Token[], p: mut Parse, role: naming.Role): Str {
         // The cursor has moved past the name, so report against the name itself
         // rather than whatever follows it.
         if p.quiet == false && p.failed == false {
-            append(p.errors, diag.at(lineAt(ts, p.pos - 1), why))
+            append(p.errors, diag.on(placeAt(ts, p, p.pos - 1), why))
         }
         p.failed = true
     }
@@ -205,7 +218,7 @@ func startsDecl(k: token.Kind): Bool {
 // --- Imports -----------------------------------------------------------------
 
 proc parseImport(ts: token.Token[], p: mut Parse): ast.ImportLine {
-    line := lineAt(ts, p.pos)
+    line := place(ts, p)
     advance(p)
     path := wordOfPath(ts, p)
     if p.failed {
@@ -238,7 +251,7 @@ proc wordOfPath(ts: token.Token[], p: mut Parse): Str {
 
 // The name a module is reached through when the import did not say: the last
 // segment of the path, with any extension dropped.
-proc defaultAlias(ts: token.Token[], p: mut Parse, path: Str, line: Int): Str {
+proc defaultAlias(ts: token.Token[], p: mut Parse, path: Str, line: token.Pos): Str {
     segments := split(path, "/")
     mut last := text.charAt(segments, len(segments) - 1)
     // A standard library module names no file, so its last segment is separated
@@ -258,9 +271,9 @@ proc defaultAlias(ts: token.Token[], p: mut Parse, path: Str, line: Int): Str {
             // library: naming something *inside* a module is the mistake there, and
             // no alias makes it one.
             if text.startsWith(path, "hive.") {
-                append(p.errors, diag.at(line, "`{path}` names more than a module. An import of the standard library is the module and nothing in it: `import hive.ui`, never `import hive.ui.View`"))
+                append(p.errors, diag.on(line, "`{path}` names more than a module. An import of the standard library is the module and nothing in it: `import hive.ui`, never `import hive.ui.View`"))
             } else {
-                append(p.errors, diag.at(line, "`import {path}` needs a name of its own: `{last}` cannot be used as one — write `import {path} as <name>`"))
+                append(p.errors, diag.on(line, "`import {path}` needs a name of its own: `{last}` cannot be used as one — write `import {path} as <name>`"))
             }
         }
         p.failed = true
@@ -291,7 +304,7 @@ proc parseDecl(ts: token.Token[], p: mut Parse): ast.Decl {
         return parseTestDecl(ts, p)
     }
     fail(ts, p, "expected a declaration — `type`, `proc`, `func`, `query` or `test` — but found " + token.describe(k))
-    return ast.Decl.TestDecl("", ast.Block([]), lineAt(ts, p.pos))
+    return ast.Decl.TestDecl("", ast.Block([]), place(ts, p))
 }
 
 // --- Query bodies ------------------------------------------------------------
@@ -303,10 +316,10 @@ proc parseDecl(ts: token.Token[], p: mut Parse): ast.Decl {
 // be anywhere else.
 
 // A query body's own failures. It has no tokens to report against — the body
-// arrived as one — so it reports against the declaration.
+// arrived as one — so it reports against where that one is.
 proc sqlFail(p: mut Parse, message: Str): void {
     if p.quiet == false && p.failed == false {
-        append(p.errors, diag.at(0, message))
+        append(p.errors, diag.on(p.within, message))
     }
     p.failed = true
 }
@@ -411,7 +424,7 @@ proc parseSqlExpr(source: Str, p: mut Parse): ast.Expr {
     for each e in lexed.errors {
         append(p.errors, e)
     }
-    mut Parse inner = Parse(0, false, false, [], p.parts, [], false, false)
+    mut Parse inner = Parse(0, false, false, [], p.parts, [], false, false, p.file, p.within)
     written := parseExpr(lexed.tokens, inner)
     p.parts = inner.parts
     for each e in inner.errors {
@@ -495,7 +508,7 @@ func withoutWhere(lit: Str): Str {
 // be interleaved: a field written outside any variant is added to every one of
 // them, and where it was written says nothing about which.
 proc parseTypeDecl(ts: token.Token[], p: mut Parse): ast.Decl {
-    line := lineAt(ts, p.pos)
+    line := place(ts, p)
     advance(p)
     name := expectIdent(ts, p, naming.Role.TypeName())
     mut ast.Field[dyn] fields = []
@@ -524,12 +537,13 @@ proc parseTypeDecl(ts: token.Token[], p: mut Parse): ast.Decl {
 }
 
 proc parseField(ts: token.Token[], p: mut Parse): ast.Field {
+    at := place(ts, p)
     name := expectIdent(ts, p, naming.Role.Field())
     if expect(ts, p, token.Kind.Colon()) == false {
-        return ast.Field(name, ast.TypeExpr.VoidType(), ast.unmarked())
+        return ast.Field(name, ast.TypeExpr.VoidType(), ast.unmarked(), at)
     }
     declared := parseTypeExpr(ts, p)
-    return ast.Field(name, declared, parseMarks(ts, p))
+    return ast.Field(name, declared, parseMarks(ts, p), at)
 }
 
 // --- A field's annotations ---------------------------------------------------
@@ -552,7 +566,7 @@ proc parseMarks(ts: token.Token[], p: mut Parse): ast.Marks {
     mut json := ""
     mut url := ""
     mut flag := ""
-    mut ast.Expr fallback = ast.Expr.Absent()
+    mut ast.Expr fallback = ast.absent()
     for ; p.failed == false && atEnd(ts, p) == false; {
         at := p.pos
         kind := wordAt(ts, p.pos)
@@ -663,40 +677,41 @@ func markWord(ts: token.Token[], i: Int): Str {
 // What a `Default` falls back to. A **literal**, so it needs nothing in scope
 // and nothing runs to work it out: it is written into the decoder itself.
 proc parseMarkLiteral(ts: token.Token[], p: mut Parse): ast.Expr {
+    at := place(ts, p)
     if expectWord(ts, p, "as") == false {
-        return ast.Expr.Absent()
+        return ast.absent()
     }
     // A negative number is unary minus over a literal everywhere else in the
     // language, and it is the same two tokens here.
     if refusesWide(ts, p, "a `Default`") {
-        return ast.Expr.Absent()
+        return ast.absent()
     }
     if kindAt(ts, p.pos) == token.Kind.Minus() {
         advance(p)
         if refusesWide(ts, p, "a `Default`") {
-            return ast.Expr.Absent()
+            return ast.absent()
         }
         negative := kindAt(ts, p.pos)
         if negative is token.Kind.IntLit(v) {
             advance(p)
-            return ast.Expr.IntLit(0 - v)
+            return ast.Expr.IntLit(0 - v, at)
         }
         if negative is token.Kind.FloatLit(v) {
             advance(p)
-            return ast.Expr.FloatLit(0.0 - v)
+            return ast.Expr.FloatLit(0.0 - v, at)
         }
         expected(ts, p, "a number after the `-`")
-        return ast.Expr.Absent()
+        return ast.absent()
     }
     k := kindAt(ts, p.pos)
-    if k is token.Kind.IntLit(v) { advance(p) return ast.Expr.IntLit(v) }
-    if k is token.Kind.FloatLit(v) { advance(p) return ast.Expr.FloatLit(v) }
-    if k is token.Kind.StrLit(t) { advance(p) return ast.Expr.StrLit(t) }
-    if k is token.Kind.AtomLit(a) { advance(p) return ast.Expr.AtomLit(a) }
-    if k == token.Kind.KwTrue() { advance(p) return ast.Expr.BoolLit(true) }
-    if k == token.Kind.KwFalse() { advance(p) return ast.Expr.BoolLit(false) }
+    if k is token.Kind.IntLit(v) { advance(p) return ast.Expr.IntLit(v, at) }
+    if k is token.Kind.FloatLit(v) { advance(p) return ast.Expr.FloatLit(v, at) }
+    if k is token.Kind.StrLit(t) { advance(p) return ast.Expr.StrLit(t, at) }
+    if k is token.Kind.AtomLit(a) { advance(p) return ast.Expr.AtomLit(a, at) }
+    if k == token.Kind.KwTrue() { advance(p) return ast.Expr.BoolLit(true, at) }
+    if k == token.Kind.KwFalse() { advance(p) return ast.Expr.BoolLit(false, at) }
     expected(ts, p, "a literal for this field to fall back to")
-    return ast.Expr.Absent()
+    return ast.absent()
 }
 
 // What was written where a clause was expected.
@@ -705,16 +720,17 @@ func unknownMark(ts: token.Token[], p: Parse): Str {
 }
 
 proc parseVariant(ts: token.Token[], p: mut Parse): ast.Variant {
+    at := place(ts, p)
     name := expectIdent(ts, p, naming.Role.Variant())
     mut ast.Field[dyn] fields = []
     if kindAt(ts, p.pos) != token.Kind.LBrace() {
-        return ast.Variant(name, fields)
+        return ast.Variant(name, fields, at)
     }
     advance(p)
     for ; p.failed == false && atEnd(ts, p) == false; {
         if kindAt(ts, p.pos) == token.Kind.RBrace() {
             advance(p)
-            return ast.Variant(name, fields)
+            return ast.Variant(name, fields, at)
         }
         append(fields, parseField(ts, p))
         skipCommas(ts, p)
@@ -722,7 +738,7 @@ proc parseVariant(ts: token.Token[], p: mut Parse): ast.Variant {
     if p.failed == false {
         expected(ts, p, "`}` to close this variant")
     }
-    return ast.Variant(name, fields)
+    return ast.Variant(name, fields, at)
 }
 
 // A field list may be written with commas between its entries or without them.
@@ -732,7 +748,7 @@ proc skipCommas(ts: token.Token[], p: mut Parse): void {
 }
 
 proc parseCallable(ts: token.Token[], p: mut Parse, kind: ast.CallableKind): ast.Decl {
-    line := lineAt(ts, p.pos)
+    line := place(ts, p)
     advance(p)
     name := expectIdent(ts, p, naming.Role.Callable())
     params := parseParams(ts, p)
@@ -742,7 +758,7 @@ proc parseCallable(ts: token.Token[], p: mut Parse, kind: ast.CallableKind): ast
 }
 
 proc parseQueryDecl(ts: token.Token[], p: mut Parse): ast.Decl {
-    line := lineAt(ts, p.pos)
+    line := place(ts, p)
     advance(p)
     name := expectIdent(ts, p, naming.Role.Callable())
     params := parseParams(ts, p)
@@ -750,8 +766,10 @@ proc parseQueryDecl(ts: token.Token[], p: mut Parse): ast.Decl {
     mut ast.SqlPart[dyn] sql = []
     k := kindAt(ts, p.pos)
     if k is token.Kind.SqlBody(body) {
+        p.within = place(ts, p)
         advance(p)
         sql = parseSqlBody(body, p)
+        p.within = token.nowhere()
     } else if p.failed == false {
         expected(ts, p, "a `\{ ... }` SQL body after the query's return type")
     }
@@ -762,7 +780,7 @@ proc parseQueryDecl(ts: token.Token[], p: mut Parse): ast.Decl {
 // documentation rather than something anything calls — which is also why it takes
 // no parameters and returns nothing.
 proc parseTestDecl(ts: token.Token[], p: mut Parse): ast.Decl {
-    line := lineAt(ts, p.pos)
+    line := place(ts, p)
     advance(p)
     mut title := ""
     k := kindAt(ts, p.pos)
@@ -789,6 +807,7 @@ proc parseParams(ts: token.Token[], p: mut Parse): ast.Param[dyn] {
             advance(p)
             return params
         }
+        at := place(ts, p)
         name := expectIdent(ts, p, naming.Role.Parameter())
         if expect(ts, p, token.Kind.Colon()) == false {
             return params
@@ -799,7 +818,7 @@ proc parseParams(ts: token.Token[], p: mut Parse): ast.Param[dyn] {
         if mutable {
             advance(p)
         }
-        append(params, ast.Param(name, parseTypeExpr(ts, p), mutable))
+        append(params, ast.Param(name, parseTypeExpr(ts, p), mutable, at))
         if kindAt(ts, p.pos) == token.Kind.Comma() {
             advance(p)
         } else if kindAt(ts, p.pos) != token.Kind.RParen() && p.failed == false {
@@ -1004,8 +1023,8 @@ proc parseRest(ts: token.Token[], p: mut Parse): ast.Block {
             expected(ts, p, "a statement")
             return ast.Block(stmts)
         }
-        if s is ast.Stmt.SwitchStmt(lets, subjects, arms, line, binds) && binds {
-            append(stmts, ast.Stmt.SwitchStmt(lets, subjects, withRest(arms, parseRest(ts, p)), line, binds))
+        if s is ast.Stmt.SwitchStmt(lets, subjects, arms, binds, line) && binds {
+            append(stmts, ast.Stmt.SwitchStmt(lets, subjects, withRest(arms, parseRest(ts, p)), binds, line))
             return ast.Block(stmts)
         }
         append(stmts, s)
@@ -1018,7 +1037,7 @@ proc parseRest(ts: token.Token[], p: mut Parse): ast.Block {
 
 // `r.count := 3` reads as a pattern, and was most likely an assignment.
 func fieldHint(taken: ast.Expr): Str {
-    if taken is ast.Expr.IsMatch(_, pattern) {
+    if taken is ast.Expr.IsMatch(_, pattern, _) {
         if pattern is ast.Pattern.Constructor(path, _, parenthesised) && parenthesised == false {
             return ". To assign to `" + join(path, ".") + "`, write `=`"
         }
@@ -1044,6 +1063,7 @@ proc skipSemicolons(ts: token.Token[], p: mut Parse): void {
 }
 
 proc parseStmt(ts: token.Token[], p: mut Parse): ast.Stmt {
+    at := place(ts, p)
     k := kindAt(ts, p.pos)
     if k == token.Kind.KwReturn() {
         return parseReturn(ts, p)
@@ -1055,21 +1075,21 @@ proc parseStmt(ts: token.Token[], p: mut Parse): ast.Stmt {
         return parseFor(ts, p)
     } else if k == token.Kind.KwEcho() {
         advance(p)
-        return ast.Stmt.EchoStmt(parseExpr(ts, p))
+        return ast.Stmt.EchoStmt(parseExpr(ts, p), at)
     } else if k == token.Kind.KwAssert() {
         advance(p)
-        return ast.Stmt.AssertStmt(parseExpr(ts, p))
+        return ast.Stmt.AssertStmt(parseExpr(ts, p), at)
     } else if k == token.Kind.KwPanic() {
         advance(p)
-        return ast.Stmt.PanicStmt(parseExpr(ts, p))
+        return ast.Stmt.PanicStmt(parseExpr(ts, p), at)
     } else if k == token.Kind.KwBreak() {
         advance(p)
-        return ast.Stmt.BreakStmt()
+        return ast.Stmt.BreakStmt(at)
     } else if k == token.Kind.KwContinue() {
         advance(p)
-        return ast.Stmt.ContinueStmt()
+        return ast.Stmt.ContinueStmt(at)
     } else if k == token.Kind.KwAsync() {
-        return ast.Stmt.AsyncStmt(parseAsyncCall(ts, p))
+        return ast.Stmt.AsyncStmt(parseAsyncCall(ts, p), at)
     } else if k == token.Kind.KwMut() {
         return parseMut(ts, p)
     }
@@ -1093,7 +1113,7 @@ proc bindsAPattern(ts: token.Token[], p: mut Parse): Bool {
     inBits := p.inBits
     wasSplit := p.split
     p.quiet = true
-    _ := parseMatch(ts, p, ast.Expr.Absent())
+    _ := parseMatch(ts, p, ast.absent())
     found := p.failed == false && kindAt(ts, p.pos) == token.Kind.ColonEq()
     p.quiet = false
     p.failed = false
@@ -1108,21 +1128,21 @@ proc bindsAPattern(ts: token.Token[], p: mut Parse): Bool {
 // `Result.Ok(v) := f() else { Result.Error(why) { return ... } }`: a `switch` whose first arm
 // is the pattern, given the rest of the block by `parseRest`.
 proc parseBinding(ts: token.Token[], p: mut Parse): ast.Stmt {
-    line := lineAt(ts, p.pos)
+    at := place(ts, p)
     hidden := freshPart(p)
-    taken := parseMatch(ts, p, ast.Expr.Ident(hidden))
+    taken := parseMatch(ts, p, ast.Expr.Ident(hidden, at))
     advance(p)
     subject := parseExpr(ts, p)
     if p.failed {
-        return ast.Stmt.Nothing()
+        return ast.nothing()
     }
     if kindAt(ts, p.pos) != token.Kind.KwElse() {
         fail(ts, p, "a pattern on the left of `:=` binds only the values it takes, so it needs an `else` with an arm for every other one: `Result.Ok(v) := f() else \{ Result.Error(why) \{ return ... } }`" + fieldHint(taken))
-        return ast.Stmt.Nothing()
+        return ast.nothing()
     }
     advance(p)
     if expect(ts, p, token.Kind.LBrace()) == false {
-        return ast.Stmt.Nothing()
+        return ast.nothing()
     }
     mut ast.Branch[dyn] arms = [ast.Branch(taken, ast.Block([]))]
     for ; p.failed == false && atEnd(ts, p) == false; {
@@ -1130,26 +1150,27 @@ proc parseBinding(ts: token.Token[], p: mut Parse): ast.Stmt {
         if kindAt(ts, p.pos) == token.Kind.RBrace() {
             if len(arms) == 1 {
                 fail(ts, p, "this `else` has no arms, and it needs one for every value the pattern does not take — an arm of `_` takes anything")
-                return ast.Stmt.Nothing()
+                return ast.nothing()
             }
             advance(p)
-            return switchOf([subject], [hidden], arms, line, true)
+            return switchOf([subject], [hidden], arms, at, true)
         }
         condition := parseArm(ts, p, [hidden], "the `else`")
         if p.failed {
-            return ast.Stmt.Nothing()
+            return ast.nothing()
         }
         append(arms, ast.Branch(condition, parseBlock(ts, p)))
     }
     if p.failed == false {
         expected(ts, p, "`}` to close this `else`")
     }
-    return ast.Stmt.Nothing()
+    return ast.nothing()
 }
 
 // `name := value`, and `name := async f(x)`, which starts the call now and waits
 // wherever the name is read.
 proc parseInferredDecl(ts: token.Token[], p: mut Parse, mutable: Bool): ast.Stmt {
+    at := place(ts, p)
     mut role := naming.Role.Variable()
     if mutable {
         role = naming.Role.MutVariable()
@@ -1157,38 +1178,39 @@ proc parseInferredDecl(ts: token.Token[], p: mut Parse, mutable: Bool): ast.Stmt
     name := expectIdent(ts, p, role)
     advance(p)
     if mutable && refuseMutAsync(ts, p) {
-        return ast.Stmt.Nothing()
+        return ast.nothing()
     }
     deferred := kindAt(ts, p.pos) == token.Kind.KwAsync()
     if deferred {
         call := parseAsyncCall(ts, p)
         refuseDeferredTimeout(ts, p)
-        return ast.Stmt.VarDecl(name, call, mutable, true)
+        return ast.Stmt.VarDecl(name, call, mutable, true, at)
     }
-    return ast.Stmt.VarDecl(name, parseExpr(ts, p), mutable, false)
+    return ast.Stmt.VarDecl(name, parseExpr(ts, p), mutable, false, at)
 }
 
 // `mut name := value` or `mut Type name = value`.
 proc parseMut(ts: token.Token[], p: mut Parse): ast.Stmt {
+    at := place(ts, p)
     advance(p)
     if kindAt(ts, p.pos + 1) == token.Kind.ColonEq() && wordAt(ts, p.pos) != "" {
         return parseInferredDecl(ts, p, true)
     }
     mut declared := parseTypeExpr(ts, p)
     if p.failed {
-        return ast.Stmt.Nothing()
+        return ast.nothing()
     }
     name := wordAt(ts, p.pos)
     if name == "" || kindAt(ts, p.pos + 1) != token.Kind.Assign() {
         fail(ts, p, "expected `name := value` or `Type name = value` after `mut`")
-        return ast.Stmt.Nothing()
+        return ast.nothing()
     }
     bound := expectIdent(ts, p, naming.Role.MutVariable())
     advance(p)
     if refuseMutAsync(ts, p) {
-        return ast.Stmt.Nothing()
+        return ast.nothing()
     }
-    return ast.Stmt.TypedDecl(declared, bound, parseExpr(ts, p), true, false)
+    return ast.Stmt.TypedDecl(declared, bound, parseExpr(ts, p), true, false, at)
 }
 
 // `mut` asks for storage that can be written to; an `async` binding is a value
@@ -1218,13 +1240,13 @@ proc parseAsyncCall(ts: token.Token[], p: mut Parse): ast.Expr {
     advance(p)
     operand := parsePostfix(ts, p)
     if p.failed {
-        return ast.Expr.Absent()
+        return ast.absent()
     }
-    if operand is ast.Expr.Call(_, _) {
+    if operand is ast.Expr.Call(_, _, _) {
         return operand
     }
     fail(ts, p, "`async` takes a call — `async slowThing(x)` runs it on its own virtual thread and does not wait for it. There is nothing else to fire off: every other expression is already finished by the time it is written.")
-    return ast.Expr.Absent()
+    return ast.absent()
 }
 
 // An identifier-led statement is either a typed declaration (`Type name =
@@ -1232,6 +1254,7 @@ proc parseAsyncCall(ts: token.Token[], p: mut Parse): ast.Expr {
 // commits only when a type expression is followed by `identifier =` — one of
 // the two places this parser looks ahead.
 proc parseTypedOrExpr(ts: token.Token[], p: mut Parse): ast.Stmt {
+    at := place(ts, p)
     start := p.pos
     p.quiet = true
     mut declared := parseTypeExpr(ts, p)
@@ -1249,9 +1272,9 @@ proc parseTypedOrExpr(ts: token.Token[], p: mut Parse): ast.Stmt {
         if deferred {
             call := parseAsyncCall(ts, p)
             refuseDeferredTimeout(ts, p)
-            return ast.Stmt.TypedDecl(declared, name, call, false, true)
+            return ast.Stmt.TypedDecl(declared, name, call, false, true, at)
         }
-        return ast.Stmt.TypedDecl(declared, name, parseExpr(ts, p), false, false)
+        return ast.Stmt.TypedDecl(declared, name, parseExpr(ts, p), false, false, at)
     }
     p.pos = start
     return parseExprStmt(ts, p)
@@ -1261,67 +1284,71 @@ proc parseTypedOrExpr(ts: token.Token[], p: mut Parse): ast.Stmt {
 // parsed as an ordinary expression — so `v`, `v[0]` and `v.field` all work — and
 // a trailing `=` promotes it to an assignment.
 proc parseExprStmt(ts: token.Token[], p: mut Parse): ast.Stmt {
+    at := place(ts, p)
     subject := parseExpr(ts, p)
     if p.failed {
-        return ast.Stmt.Nothing()
+        return ast.nothing()
     }
     k := kindAt(ts, p.pos)
     if k == token.Kind.Assign() {
         advance(p)
-        return ast.Stmt.Assign(subject, parseExpr(ts, p))
+        return ast.Stmt.Assign(subject, parseExpr(ts, p), at)
     }
     // Compound assignment and the two steps desugar into a plain one, so nothing
     // downstream has four more shapes to know about — and the mutability check
     // and zero-safe division apply to them unchanged.
     if k == token.Kind.PlusEq() {
-        return compound(ts, p, subject, ast.BinOp.Add())
+        return compound(ts, p, subject, ast.BinOp.Add(), at)
     } else if k == token.Kind.MinusEq() {
-        return compound(ts, p, subject, ast.BinOp.Sub())
+        return compound(ts, p, subject, ast.BinOp.Sub(), at)
     } else if k == token.Kind.StarEq() {
-        return compound(ts, p, subject, ast.BinOp.Mul())
+        return compound(ts, p, subject, ast.BinOp.Mul(), at)
     } else if k == token.Kind.SlashEq() {
-        return compound(ts, p, subject, ast.BinOp.Div())
+        return compound(ts, p, subject, ast.BinOp.Div(), at)
     } else if k == token.Kind.AmpEq() {
-        return compound(ts, p, subject, ast.BinOp.BitAnd())
+        return compound(ts, p, subject, ast.BinOp.BitAnd(), at)
     } else if k == token.Kind.PipeEq() {
-        return compound(ts, p, subject, ast.BinOp.BitOr())
+        return compound(ts, p, subject, ast.BinOp.BitOr(), at)
     } else if k == token.Kind.CaretEq() {
-        return compound(ts, p, subject, ast.BinOp.BitXor())
+        return compound(ts, p, subject, ast.BinOp.BitXor(), at)
     } else if k == token.Kind.ShlEq() {
-        return compound(ts, p, subject, ast.BinOp.Shl())
+        return compound(ts, p, subject, ast.BinOp.Shl(), at)
     } else if k == token.Kind.ShrEq() {
-        return compound(ts, p, subject, ast.BinOp.Shr())
+        return compound(ts, p, subject, ast.BinOp.Shr(), at)
     } else if k == token.Kind.PlusPlus() {
         advance(p)
-        return step(subject, ast.BinOp.Add())
+        return step(subject, ast.BinOp.Add(), at)
     } else if k == token.Kind.MinusMinus() {
         advance(p)
-        return step(subject, ast.BinOp.Sub())
+        return step(subject, ast.BinOp.Sub(), at)
     }
-    return ast.Stmt.Expression(subject)
+    return ast.Stmt.Expression(subject, at)
 }
 
-proc compound(ts: token.Token[], p: mut Parse, target: ast.Expr, op: ast.BinOp): ast.Stmt {
+proc compound(ts: token.Token[], p: mut Parse, target: ast.Expr, op: ast.BinOp, from: token.Pos): ast.Stmt {
+    at := place(ts, p)
     advance(p)
-    return ast.Stmt.Assign(target, ast.Expr.Binary(op, target, parseExpr(ts, p)))
+    return ast.Stmt.Assign(target, ast.Expr.Binary(op, target, parseExpr(ts, p), at), from)
 }
 
-func step(target: ast.Expr, op: ast.BinOp): ast.Stmt {
-    return ast.Stmt.Assign(target, ast.Expr.Binary(op, target, ast.Expr.IntLit(1)))
+func step(target: ast.Expr, op: ast.BinOp, from: token.Pos): ast.Stmt {
+    return ast.Stmt.Assign(target, ast.Expr.Binary(op, target, ast.Expr.IntLit(1, from), from), from)
 }
 
 proc parseReturn(ts: token.Token[], p: mut Parse): ast.Stmt {
+    at := place(ts, p)
     advance(p)
     k := kindAt(ts, p.pos)
     // A bare `return` leaves a `void` callable, or a test, early. What makes it
     // bare is that nothing follows it on this statement.
     if k == token.Kind.RBrace() || k == token.Kind.Semicolon() || k == token.Kind.Eof() {
-        return ast.Stmt.ReturnStmt(ast.Expr.Absent())
+        return ast.Stmt.ReturnStmt(ast.absent(), at)
     }
-    return ast.Stmt.ReturnStmt(parseExpr(ts, p))
+    return ast.Stmt.ReturnStmt(parseExpr(ts, p), at)
 }
 
 proc parseIf(ts: token.Token[], p: mut Parse): ast.Stmt {
+    at := place(ts, p)
     mut ast.Branch[dyn] branches = []
     advance(p)
     condition := parseExpr(ts, p)
@@ -1335,62 +1362,63 @@ proc parseIf(ts: token.Token[], p: mut Parse): ast.Stmt {
             nextCondition := parseExpr(ts, p)
             append(branches, ast.Branch(nextCondition, parseBlock(ts, p)))
         } else {
-            return ast.Stmt.IfChain(branches, parseBlock(ts, p), true)
+            return ast.Stmt.IfChain(branches, parseBlock(ts, p), true, at)
         }
     }
-    return ast.Stmt.IfChain(branches, ast.Block([]), false)
+    return ast.Stmt.IfChain(branches, ast.Block([]), false, at)
 }
 
 proc parseFor(ts: token.Token[], p: mut Parse): ast.Stmt {
+    at := place(ts, p)
     advance(p)
     if kindAt(ts, p.pos) == token.Kind.KwEach() {
         return parseForEach(ts, p)
     }
 
-    mut ast.Stmt init = ast.Stmt.Nothing()
+    mut ast.Stmt init = ast.nothing()
     if kindAt(ts, p.pos) != token.Kind.Semicolon() {
         init = asCounter(ts, p, parseStmt(ts, p))
     }
     if expect(ts, p, token.Kind.Semicolon()) == false {
-        return ast.Stmt.Nothing()
+        return ast.nothing()
     }
-    mut ast.Expr cond = ast.Expr.Absent()
+    mut ast.Expr cond = ast.absent()
     if kindAt(ts, p.pos) != token.Kind.Semicolon() {
         cond = parseExpr(ts, p)
     }
     if expect(ts, p, token.Kind.Semicolon()) == false {
-        return ast.Stmt.Nothing()
+        return ast.nothing()
     }
-    mut ast.Stmt post = ast.Stmt.Nothing()
+    mut ast.Stmt post = ast.nothing()
     if kindAt(ts, p.pos) != token.Kind.LBrace() {
         post = parseStmt(ts, p)
         refuseClauseAsync(ts, p, post, "post")
     }
-    return ast.Stmt.ForLoop(init, cond, post, parseBlock(ts, p))
+    return ast.Stmt.ForLoop(init, cond, post, parseBlock(ts, p), at)
 }
 
 // A variable an init clause declares is forced mutable: the post clause advances
 // it, which the mutability check would otherwise reject. Its name is rechecked
 // for the same reason — a counter is not a constant.
 proc asCounter(ts: token.Token[], p: mut Parse, s: ast.Stmt): ast.Stmt {
-    if s is ast.Stmt.VarDecl(name, value, _, deferred) {
+    if s is ast.Stmt.VarDecl(name, value, _, deferred, _) {
         refuseCounterAsync(ts, p, deferred)
         checkCounterName(ts, p, name)
-        return ast.Stmt.VarDecl(name, value, true, deferred)
-    } else if s is ast.Stmt.TypedDecl(declared, name, value, _, deferred) {
+        return ast.Stmt.VarDecl(name, value, true, deferred, s.at)
+    } else if s is ast.Stmt.TypedDecl(declared, name, value, _, deferred, _) {
         refuseCounterAsync(ts, p, deferred)
         checkCounterName(ts, p, name)
-        return ast.Stmt.TypedDecl(declared, name, value, true, deferred)
+        return ast.Stmt.TypedDecl(declared, name, value, true, deferred, s.at)
     }
     refuseClauseAsync(ts, p, s, "init")
     return s
 }
 
 proc refuseClauseAsync(ts: token.Token[], p: mut Parse, s: ast.Stmt, clause: Str): void {
-    if s is ast.Stmt.AsyncStmt(_) {
+    if s is ast.Stmt.AsyncStmt(_, _) {
         fail(ts, p, "a loop's {clause} clause cannot be an `async` statement: it is there to set up and advance the condition, and work running on another thread has nothing to advance it with")
     }
-    if s is ast.Stmt.SwitchStmt(_, _, _, _, binds) && binds {
+    if s is ast.Stmt.SwitchStmt(_, _, _, binds, _) && binds {
         fail(ts, p, "a loop's {clause} clause cannot bind with a pattern: what a pattern binds is for the rest of its block, and a clause has none. Bind it at the top of the loop's body")
     }
 }
@@ -1408,6 +1436,7 @@ proc refuseCounterAsync(ts: token.Token[], p: mut Parse, deferred: Bool): void {
 }
 
 proc parseForEach(ts: token.Token[], p: mut Parse): ast.Stmt {
+    at := place(ts, p)
     advance(p)
     name := expectIdent(ts, p, naming.Role.Binding())
     mut ast.TypeExpr declared = ast.TypeExpr.VoidType()
@@ -1416,21 +1445,21 @@ proc parseForEach(ts: token.Token[], p: mut Parse): ast.Stmt {
         declared = parseTypeExpr(ts, p)
     }
     if expect(ts, p, token.Kind.KwIn()) == false {
-        return ast.Stmt.Nothing()
+        return ast.nothing()
     }
     subject := parseExpr(ts, p)
-    return ast.Stmt.ForEach(name, declared, subject, parseBlock(ts, p))
+    return ast.Stmt.ForEach(name, declared, subject, parseBlock(ts, p), at)
 }
 
 proc parseSwitch(ts: token.Token[], p: mut Parse): ast.Stmt {
-    line := lineAt(ts, p.pos)
+    line := place(ts, p)
     advance(p)
     mut ast.Expr[dyn] written = []
     mut Str[dyn] hidden = []
     for ; p.failed == false; {
         if wordAt(ts, p.pos) == "_" {
             fail(ts, p, "a `switch` tests a value, and `_` is none: it is what an arm writes to take any value")
-            return ast.Stmt.Nothing()
+            return ast.nothing()
         }
         append(written, parseExpr(ts, p))
         append(hidden, freshPart(p))
@@ -1440,7 +1469,7 @@ proc parseSwitch(ts: token.Token[], p: mut Parse): ast.Stmt {
         advance(p)
     }
     if expect(ts, p, token.Kind.LBrace()) == false {
-        return ast.Stmt.Nothing()
+        return ast.nothing()
     }
     mut ast.Branch[dyn] arms = []
     for ; p.failed == false && atEnd(ts, p) == false; {
@@ -1451,31 +1480,32 @@ proc parseSwitch(ts: token.Token[], p: mut Parse): ast.Stmt {
         }
         condition := parseArm(ts, p, hidden, "the `switch`")
         if p.failed {
-            return ast.Stmt.Nothing()
+            return ast.nothing()
         }
         append(arms, ast.Branch(condition, parseBlock(ts, p)))
     }
     if p.failed == false {
         expected(ts, p, "`}` to close this `switch`")
     }
-    return ast.Stmt.Nothing()
+    return ast.nothing()
 }
 
 proc parseArm(ts: token.Token[], p: mut Parse, hidden: Str[], tester: Str): ast.Expr {
+    at := place(ts, p)
     mut ast.Expr[dyn] tests = []
     mut first := true
     for each name in hidden {
         if first == false {
             if kindAt(ts, p.pos) != token.Kind.Comma() {
                 fail(ts, p, "this arm is short of patterns: {tester} tests " + valueCount(len(hidden)) + ", and an arm has one for each — `_` takes any value")
-                return ast.Expr.Absent()
+                return ast.absent()
             }
             advance(p)
         }
         first = false
-        position := parsePosition(ts, p, ast.Expr.Ident(name))
+        position := parsePosition(ts, p, ast.Expr.Ident(name, at))
         if p.failed {
-            return ast.Expr.Absent()
+            return ast.absent()
         }
         if (position is ast.Expr.Absent) == false {
             append(tests, position)
@@ -1483,16 +1513,16 @@ proc parseArm(ts: token.Token[], p: mut Parse, hidden: Str[], tester: Str): ast.
     }
     if kindAt(ts, p.pos) == token.Kind.Comma() {
         fail(ts, p, "this arm has too many patterns: {tester} tests " + valueCount(len(hidden)) + ", and an arm has one for each")
-        return ast.Expr.Absent()
+        return ast.absent()
     }
-    mut ast.Expr out = ast.Expr.BoolLit(true)
+    mut ast.Expr out = ast.Expr.BoolLit(true, at)
     mut empty := true
     for each position in tests {
         if empty {
             out = position
             empty = false
         } else {
-            out = ast.Expr.Binary(ast.BinOp.And(), out, position)
+            out = ast.Expr.Binary(ast.BinOp.And(), out, position, at)
         }
     }
     twice := boundTwice(ast.bindingsIn(out))
@@ -1510,22 +1540,23 @@ func valueCount(n: Int): Str {
 }
 
 proc parsePosition(ts: token.Token[], p: mut Parse, subject: ast.Expr): ast.Expr {
+    at := place(ts, p)
     if wordAt(ts, p.pos) == "_" && kindAt(ts, p.pos + 1) != token.Kind.Dot() {
         advance(p)
-        return ast.Expr.Absent()
+        return ast.absent()
     }
     if opensPattern(ts, p.pos) || kindAt(ts, p.pos) is token.Kind.StrLit(_) {
         return parseMatch(ts, p, subject)
     }
     if startsLiteral(ts, p.pos) {
-        return ast.Expr.Binary(ast.BinOp.Eq(), subject, parseLiteral(ts, p))
+        return ast.Expr.Binary(ast.BinOp.Eq(), subject, parseLiteral(ts, p), at)
     }
     expected(ts, p, "a pattern, a literal or `_`")
-    return ast.Expr.Absent()
+    return ast.absent()
 }
 
 // A path is read in place unless an arm's binding shadows it or a later subject's call could change it.
-func switchOf(written: ast.Expr[], hidden: Str[], arms: ast.Branch[], line: Int, binds: Bool): ast.Stmt {
+func switchOf(written: ast.Expr[], hidden: Str[], arms: ast.Branch[], line: token.Pos, binds: Bool): ast.Stmt {
     mut Str[dyn] bound = []
     for each arm in arms {
         bound = bound + ast.bindingsIn(arm.condition)
@@ -1554,24 +1585,24 @@ func switchOf(written: ast.Expr[], hidden: Str[], arms: ast.Branch[], line: Int,
             append(subjects, subject)
             tested = retargeted(tested, name, subject)
         } else {
-            append(lets, ast.Stmt.VarDecl(name, subject, false, false))
-            append(subjects, ast.Expr.Ident(name))
+            append(lets, ast.Stmt.VarDecl(name, subject, false, false, subject.at))
+            append(subjects, ast.Expr.Ident(name, subject.at))
         }
         at = at + 1
     }
-    return ast.Stmt.SwitchStmt(lets, subjects, tested, line, binds)
+    return ast.Stmt.SwitchStmt(lets, subjects, tested, binds, line)
 }
 
 func pathNames(e: ast.Expr): Str[dyn] {
-    if e is ast.Expr.Ident(name) {
+    if e is ast.Expr.Ident(name, _) {
         return [name]
     }
-    if e is ast.Expr.Member(subject, _) {
+    if e is ast.Expr.Member(subject, _, _) {
         return pathNames(subject)
     }
-    if e is ast.Expr.Index(subject, index) {
+    if e is ast.Expr.Index(subject, index, _) {
         root := pathNames(subject)
-        if len(root) == 0 || index is ast.Expr.IntLit(_) {
+        if len(root) == 0 || index is ast.Expr.IntLit(_, _) {
             return root
         }
         inner := pathNames(index)
@@ -1601,15 +1632,15 @@ func retargeted(arms: ast.Branch[], name: Str, subject: ast.Expr): ast.Branch[dy
 }
 
 func retarget(e: ast.Expr, name: Str, subject: ast.Expr): ast.Expr {
-    if e is ast.Expr.IsMatch(target, pattern) && target is ast.Expr.Ident(tested) && tested == name {
-        return ast.Expr.IsMatch(subject, pattern)
+    if e is ast.Expr.IsMatch(target, pattern, _) && target is ast.Expr.Ident(tested, _) && tested == name {
+        return ast.Expr.IsMatch(subject, pattern, e.at)
     }
-    if e is ast.Expr.Binary(op, left, right) {
+    if e is ast.Expr.Binary(op, left, right, _) {
         if op is ast.BinOp.And {
-            return ast.Expr.Binary(op, retarget(left, name, subject), retarget(right, name, subject))
+            return ast.Expr.Binary(op, retarget(left, name, subject), retarget(right, name, subject), e.at)
         }
-        if op is ast.BinOp.Eq && left is ast.Expr.Ident(tested) && tested == name {
-            return ast.Expr.Binary(op, subject, right)
+        if op is ast.BinOp.Eq && left is ast.Expr.Ident(tested, _) && tested == name {
+            return ast.Expr.Binary(op, subject, right, left.at)
         }
     }
     return e
@@ -1628,8 +1659,9 @@ proc parseExpr(ts: token.Token[], p: mut Parse): ast.Expr {
 proc parseOr(ts: token.Token[], p: mut Parse): ast.Expr {
     mut ast.Expr left = parseAnd(ts, p)
     for ; p.failed == false && kindAt(ts, p.pos) == token.Kind.PipePipe(); {
+        at := place(ts, p)
         advance(p)
-        left = ast.Expr.Binary(ast.BinOp.Or(), left, parseAnd(ts, p))
+        left = ast.Expr.Binary(ast.BinOp.Or(), left, parseAnd(ts, p), at)
     }
     return left
 }
@@ -1637,8 +1669,9 @@ proc parseOr(ts: token.Token[], p: mut Parse): ast.Expr {
 proc parseAnd(ts: token.Token[], p: mut Parse): ast.Expr {
     mut ast.Expr left = parseIs(ts, p)
     for ; p.failed == false && kindAt(ts, p.pos) == token.Kind.AmpAmp(); {
+        at := place(ts, p)
         advance(p)
-        left = ast.Expr.Binary(ast.BinOp.And(), left, parseIs(ts, p))
+        left = ast.Expr.Binary(ast.BinOp.And(), left, parseIs(ts, p), at)
     }
     return left
 }
@@ -1649,6 +1682,7 @@ proc parseIs(ts: token.Token[], p: mut Parse): ast.Expr {
         return left
     }
     k := kindAt(ts, p.pos)
+    at := place(ts, p)
     if k == token.Kind.KwIs() {
         advance(p)
         return parseMatch(ts, p, left)
@@ -1662,12 +1696,12 @@ proc parseIs(ts: token.Token[], p: mut Parse): ast.Expr {
         index := parseBitwise(ts, p)
         return ast.Expr.Binary(
             ast.BinOp.And(),
-            ast.Expr.Binary(ast.BinOp.Ge(), index, ast.Expr.IntLit(0)),
+            ast.Expr.Binary(ast.BinOp.Ge(), index, ast.Expr.IntLit(0, at), at),
             ast.Expr.Binary(ast.BinOp.Lt(), index, ast.Expr.Call(
-                ast.Expr.Member(ast.Expr.Ident("hive"), "len"),
+                ast.Expr.Member(ast.Expr.Ident("hive", at), "len", at),
                 [ast.Arg("", left)]
-            ))
-        )
+            , at), at)
+        , at)
     }
     return left
 }
@@ -1688,8 +1722,9 @@ proc parseComparison(ts: token.Token[], p: mut Parse): ast.Expr {
 }
 
 proc comparison(ts: token.Token[], p: mut Parse, left: ast.Expr, op: ast.BinOp): ast.Expr {
+    at := place(ts, p)
     advance(p)
-    return ast.Expr.Binary(op, left, parseBitwise(ts, p))
+    return ast.Expr.Binary(op, left, parseBitwise(ts, p), at)
 }
 
 // Tighter than a comparison, so `x & 1 == 0` asks about `x & 1`. Two different
@@ -1711,13 +1746,14 @@ proc parseBitwise(ts: token.Token[], p: mut Parse): ast.Expr {
                 fail(ts, p, "`{first}` and `{spelled}` sit side by side with nothing to say which goes first. Bitwise operators have no order among themselves, so write the parentheses: `(a {first} b) {spelled} c` or `a {first} (b {spelled} c)`")
                 return left
             }
+            at := place(ts, p)
             advance(p)
             from := p.pos
             right := parseAdditive(ts, p)
             if refusesMixing(ts, p, from, p.pos, spelled) {
                 return left
             }
-            left = ast.Expr.Binary(found, left, right)
+            left = ast.Expr.Binary(found, left, right, at)
         } else {
             return left
         }
@@ -1779,12 +1815,13 @@ proc parseAdditive(ts: token.Token[], p: mut Parse): ast.Expr {
     mut ast.Expr left = parseMultiplicative(ts, p)
     for ; p.failed == false; {
         k := kindAt(ts, p.pos)
+        at := place(ts, p)
         if k == token.Kind.Plus() {
             advance(p)
-            left = ast.Expr.Binary(ast.BinOp.Add(), left, parseMultiplicative(ts, p))
+            left = ast.Expr.Binary(ast.BinOp.Add(), left, parseMultiplicative(ts, p), at)
         } else if k == token.Kind.Minus() {
             advance(p)
-            left = ast.Expr.Binary(ast.BinOp.Sub(), left, parseMultiplicative(ts, p))
+            left = ast.Expr.Binary(ast.BinOp.Sub(), left, parseMultiplicative(ts, p), at)
         } else {
             return left
         }
@@ -1796,15 +1833,16 @@ proc parseMultiplicative(ts: token.Token[], p: mut Parse): ast.Expr {
     mut ast.Expr left = parsePipe(ts, p)
     for ; p.failed == false; {
         k := kindAt(ts, p.pos)
+        at := place(ts, p)
         if k == token.Kind.Star() {
             advance(p)
-            left = ast.Expr.Binary(ast.BinOp.Mul(), left, parsePipe(ts, p))
+            left = ast.Expr.Binary(ast.BinOp.Mul(), left, parsePipe(ts, p), at)
         } else if k == token.Kind.Slash() {
             advance(p)
-            left = ast.Expr.Binary(ast.BinOp.Div(), left, parsePipe(ts, p))
+            left = ast.Expr.Binary(ast.BinOp.Div(), left, parsePipe(ts, p), at)
         } else if k == token.Kind.Percent() {
             advance(p)
-            left = ast.Expr.Binary(ast.BinOp.Mod(), left, parsePipe(ts, p))
+            left = ast.Expr.Binary(ast.BinOp.Mod(), left, parsePipe(ts, p), at)
         } else {
             return left
         }
@@ -1828,17 +1866,17 @@ proc parsePipe(ts: token.Token[], p: mut Parse): ast.Expr {
 // Desugared here rather than carried, so nothing after the parser has a pipe to
 // know about: what comes out is the call somebody could have written by hand.
 proc pipedInto(ts: token.Token[], p: mut Parse, value: ast.Expr, stage: ast.Expr, at: Int): ast.Expr {
-    if stage is ast.Expr.Call(callee, args) {
-        return ast.Expr.Call(callee, [ast.Arg("", value)] + args)
+    if stage is ast.Expr.Call(callee, args, _) {
+        return ast.Expr.Call(callee, [ast.Arg("", value)] + args, stage.at)
     }
     // A bounded stage — `body |> send() with timeout 500` — takes the value into
     // the call the clause wraps.
-    if stage is ast.Expr.Timed(call, ms) {
-        return ast.Expr.Timed(pipedInto(ts, p, value, call, at), ms)
+    if stage is ast.Expr.Timed(call, ms, _) {
+        return ast.Expr.Timed(pipedInto(ts, p, value, call, at), ms, stage.at)
     }
     // A name, a module member or a constructor: the call with nothing else in it.
-    if stage is ast.Expr.Ident(_) || stage is ast.Expr.Member(_, _) {
-        return ast.Expr.Call(stage, [ast.Arg("", value)])
+    if stage is ast.Expr.Ident(_, _) || stage is ast.Expr.Member(_, _, _) {
+        return ast.Expr.Call(stage, [ast.Arg("", value)], stage.at)
     }
     if p.failed == false {
         failAt(ts, p, at, "`|>` pipes the value on its left in as the first argument of a call, so what stands on the right has to be one: a callable's name (`x |> f`), a call with the rest of its arguments written out (`x |> f(a)`), or a constructor (`x |> Shout.Loud`). Anything computed goes in parentheses on the left instead — `(a + b) |> f`")
@@ -1849,13 +1887,14 @@ proc pipedInto(ts: token.Token[], p: mut Parse, value: ast.Expr, stage: ast.Expr
 // The three prefix operators. Each binds tighter than every comparison and looser
 // than `**`, so `-2 ** 2` is `-(2 ** 2)` and `!a && b` is `(!a) && b`.
 proc parseUnary(ts: token.Token[], p: mut Parse): ast.Expr {
+    here := place(ts, p)
     if kindAt(ts, p.pos) == token.Kind.Minus() {
         advance(p)
-        return ast.Expr.Negate(parseUnary(ts, p))
+        return ast.Expr.Negate(parseUnary(ts, p), here)
     }
     if kindAt(ts, p.pos) == token.Kind.Tilde() {
         advance(p)
-        return ast.Expr.BitNot(parseUnary(ts, p))
+        return ast.Expr.BitNot(parseUnary(ts, p), here)
     }
     if kindAt(ts, p.pos) == token.Kind.Bang() {
         bang := p.pos
@@ -1868,7 +1907,7 @@ proc parseUnary(ts: token.Token[], p: mut Parse): ast.Expr {
         if holdsMatch(operand) {
             failAt(ts, p, bang, negatedMatch())
         }
-        return ast.Expr.Not(operand)
+        return ast.Expr.Not(operand, here)
     }
     return parsePower(ts, p)
 }
@@ -1877,13 +1916,13 @@ proc parseUnary(ts: token.Token[], p: mut Parse): ast.Expr {
 // through `&&`, `||` and a second `!`, and no further: `is` binds looser than every
 // comparison, so a match can sit under those three operators and nowhere else.
 func holdsMatch(e: ast.Expr): Bool {
-    if e is ast.Expr.IsMatch(_, _) {
+    if e is ast.Expr.IsMatch(_, _, _) {
         return true
     }
-    if e is ast.Expr.Not(operand) {
+    if e is ast.Expr.Not(operand, _) {
         return holdsMatch(operand)
     }
-    if e is ast.Expr.Binary(op, left, right) {
+    if e is ast.Expr.Binary(op, left, right, _) {
         if op is ast.BinOp.And || op is ast.BinOp.Or {
             return holdsMatch(left) || holdsMatch(right)
         }
@@ -1900,8 +1939,9 @@ func negatedMatch(): Str {
 proc parsePower(ts: token.Token[], p: mut Parse): ast.Expr {
     base := parseWith(ts, p)
     if p.failed == false && kindAt(ts, p.pos) == token.Kind.StarStar() {
+        at := place(ts, p)
         advance(p)
-        return ast.Expr.Binary(ast.BinOp.Pow(), base, parseUnary(ts, p))
+        return ast.Expr.Binary(ast.BinOp.Pow(), base, parseUnary(ts, p), at)
     }
     return base
 }
@@ -1931,17 +1971,17 @@ proc parseWith(ts: token.Token[], p: mut Parse): ast.Expr {
 // Anything that waits may be bounded: one blocking call, or the whole barrier of
 // an await-all.
 proc timed(ts: token.Token[], p: mut Parse, value: ast.Expr, ms: ast.Expr): ast.Expr {
-    if value is ast.Expr.AwaitAll(calls, existing) {
+    if value is ast.Expr.AwaitAll(calls, existing, _) {
         if existing is ast.Expr.Absent {
-            return ast.Expr.AwaitAll(calls, ms)
+            return ast.Expr.AwaitAll(calls, ms, value.at)
         }
         fail(ts, p, "this `await` already has a `with timeout` clause")
         return value
     }
-    if value is ast.Expr.Call(_, _) {
-        return ast.Expr.Timed(value, ms)
+    if value is ast.Expr.Call(_, _, _) {
+        return ast.Expr.Timed(value, ms, value.at)
     }
-    if value is ast.Expr.Timed(_, _) {
+    if value is ast.Expr.Timed(_, _, _) {
         fail(ts, p, "this call already has a `with timeout` clause")
         return value
     }
@@ -1956,7 +1996,7 @@ proc parsePostfix(ts: token.Token[], p: mut Parse): ast.Expr {
         if k == token.Kind.LParen() {
             advance(p)
             was := enclose(p)
-            subject = ast.Expr.Call(subject, parseArgs(ts, p))
+            subject = ast.Expr.Call(subject, parseArgs(ts, p), subject.at)
             p.inBits = was
         } else if k == token.Kind.LBracket() {
             advance(p)
@@ -1970,8 +2010,9 @@ proc parsePostfix(ts: token.Token[], p: mut Parse): ast.Expr {
                 expected(ts, p, "a name after `.`")
                 return subject
             }
+            at := place(ts, p)
             advance(p)
-            subject = ast.Expr.Member(subject, field)
+            subject = ast.Expr.Member(subject, field, at)
         } else {
             return subject
         }
@@ -2012,16 +2053,17 @@ proc parseArg(ts: token.Token[], p: mut Parse): ast.Arg {
 }
 
 proc parseIndexOrSlice(ts: token.Token[], p: mut Parse, subject: ast.Expr): ast.Expr {
+    at := place(ts, p)
     // `[:` — a slice with no low bound.
     if kindAt(ts, p.pos) == token.Kind.Colon() {
         advance(p)
         if kindAt(ts, p.pos) == token.Kind.RBracket() {
             advance(p)
-            return ast.Expr.Slice(subject, ast.Expr.Absent(), ast.Expr.Absent())
+            return ast.Expr.Slice(subject, ast.absent(), ast.absent(), at)
         }
         high := parseExpr(ts, p)
         expect(ts, p, token.Kind.RBracket())
-        return ast.Expr.Slice(subject, ast.Expr.Absent(), high)
+        return ast.Expr.Slice(subject, ast.absent(), high, at)
     }
     low := parseExpr(ts, p)
     if p.failed {
@@ -2029,33 +2071,34 @@ proc parseIndexOrSlice(ts: token.Token[], p: mut Parse, subject: ast.Expr): ast.
     }
     if kindAt(ts, p.pos) == token.Kind.RBracket() {
         advance(p)
-        return ast.Expr.Index(subject, low)
+        return ast.Expr.Index(subject, low, at)
     }
     if expect(ts, p, token.Kind.Colon()) == false {
         return subject
     }
     if kindAt(ts, p.pos) == token.Kind.RBracket() {
         advance(p)
-        return ast.Expr.Slice(subject, low, ast.Expr.Absent())
+        return ast.Expr.Slice(subject, low, ast.absent(), at)
     }
     high := parseExpr(ts, p)
     expect(ts, p, token.Kind.RBracket())
-    return ast.Expr.Slice(subject, low, high)
+    return ast.Expr.Slice(subject, low, high, at)
 }
 
 proc parsePrimary(ts: token.Token[], p: mut Parse): ast.Expr {
+    began := place(ts, p)
     k := kindAt(ts, p.pos)
 
     if k is token.Kind.IntLit(v) {
         advance(p)
         if v < 0 {
-            return wideLiteral(v)
+            return wideLiteral(v, began)
         }
-        return ast.Expr.IntLit(v)
+        return ast.Expr.IntLit(v, began)
     }
-    else if k is token.Kind.FloatLit(v) { advance(p) return ast.Expr.FloatLit(v) }
-    else if k is token.Kind.StrLit(t) { advance(p) return ast.Expr.StrLit(t) }
-    else if k is token.Kind.AtomLit(atom) { advance(p) return ast.Expr.AtomLit(atom) }
+    else if k is token.Kind.FloatLit(v) { advance(p) return ast.Expr.FloatLit(v, began) }
+    else if k is token.Kind.StrLit(t) { advance(p) return ast.Expr.StrLit(t, began) }
+    else if k is token.Kind.AtomLit(atom) { advance(p) return ast.Expr.AtomLit(atom, began) }
     else if k is token.Kind.StrParts(parts) { return parseInterp(ts, p, parts) }
     else if k is token.Kind.Ident(name) {
         advance(p)
@@ -2063,13 +2106,13 @@ proc parsePrimary(ts: token.Token[], p: mut Parse): ast.Expr {
         // binding everywhere else. Where it landed decides, so it is carried as
         // itself and read later.
         if name == "_" {
-            return ast.Expr.Hole()
+            return ast.Expr.Hole(began)
         }
-        return ast.Expr.Ident(name)
+        return ast.Expr.Ident(name, began)
     }
 
-    if k == token.Kind.KwTrue() { advance(p) return ast.Expr.BoolLit(true) }
-    else if k == token.Kind.KwFalse() { advance(p) return ast.Expr.BoolLit(false) }
+    if k == token.Kind.KwTrue() { advance(p) return ast.Expr.BoolLit(true, began) }
+    else if k == token.Kind.KwFalse() { advance(p) return ast.Expr.BoolLit(false, began) }
     else if k == token.Kind.LBracket() {
         advance(p)
         was := enclose(p)
@@ -2092,11 +2135,11 @@ proc parsePrimary(ts: token.Token[], p: mut Parse): ast.Expr {
     // Anywhere else the value is wanted right there.
     else if k == token.Kind.KwAsync() {
         fail(ts, p, "`async` has no value of its own: it says how a call runs, not what it evaluates to, so it cannot sit inside a larger expression. Give it a name and read the name here — `x := async f(a)` starts the call now and waits at the first place `x` is read — or drop the `async` to wait for the result on the spot.")
-        return ast.Expr.Absent()
+        return ast.absent()
     }
 
     fail(ts, p, "unexpected " + token.describe(k) + " in an expression")
-    return ast.Expr.Absent()
+    return ast.absent()
 }
 
 // A bracket inside `<<...>>` makes a `>>` a shift again until it closes.
@@ -2108,18 +2151,19 @@ proc enclose(p: mut Parse): Bool {
 
 // A literal of 2^63 or more, which the lexer hands over as the negative `Int` its
 // 64 bits make: the `UInt64` holding those bits.
-func wideLiteral(v: Int): ast.Expr {
-    mut ast.Expr bits = ast.Expr.Negate(ast.Expr.IntLit(0 - v))
+func wideLiteral(v: Int, at: token.Pos): ast.Expr {
+    mut ast.Expr bits = ast.Expr.Negate(ast.Expr.IntLit(0 - v, at), at)
     if 0 - v < 0 {
         // 2^63 itself, whose negation is itself again.
-        bits = ast.Expr.Binary(ast.BinOp.Sub(), ast.Expr.Negate(ast.Expr.IntLit(0 - (v + 1))), ast.Expr.IntLit(1))
+        bits = ast.Expr.Binary(ast.BinOp.Sub(), ast.Expr.Negate(ast.Expr.IntLit(0 - (v + 1), at), at), ast.Expr.IntLit(1, at), at)
     }
-    return ast.Expr.Call(ast.Expr.Member(ast.Expr.Ident("hive"), "UInt64"), [ast.Arg("", bits)])
+    return ast.Expr.Call(ast.Expr.Member(ast.Expr.Ident("hive", at), "UInt64", at), [ast.Arg("", bits)], at)
 }
 
 // `<<version, length: UInt16, payload>>`. A `>>` closes it, so a shift inside one
 // goes in parentheses.
 proc parseBitsLit(ts: token.Token[], p: mut Parse): ast.Expr {
+    at := place(ts, p)
     advance(p)
     was := p.inBits
     p.inBits = true
@@ -2128,7 +2172,7 @@ proc parseBitsLit(ts: token.Token[], p: mut Parse): ast.Expr {
         if kindAt(ts, p.pos) == token.Kind.Shr() {
             advance(p)
             p.inBits = was
-            return ast.Expr.Bits(parts)
+            return ast.Expr.Bits(parts, at)
         }
         value := parseExpr(ts, p)
         mut declared := ast.TypeExpr.VoidType()
@@ -2144,7 +2188,7 @@ proc parseBitsLit(ts: token.Token[], p: mut Parse): ast.Expr {
         }
     }
     p.inBits = was
-    return ast.Expr.Bits(parts)
+    return ast.Expr.Bits(parts, at)
 }
 
 // `little` after a field or a part, read here rather than reserved.
@@ -2157,34 +2201,36 @@ proc littleAt(ts: token.Token[], p: mut Parse): Bool {
 }
 
 proc parseVectorLit(ts: token.Token[], p: mut Parse): ast.Expr {
+    at := place(ts, p)
     mut ast.Expr[dyn] items = []
     for ; p.failed == false && atEnd(ts, p) == false; {
         if kindAt(ts, p.pos) == token.Kind.RBracket() {
             advance(p)
-            return ast.Expr.VectorLit(items)
+            return ast.Expr.VectorLit(items, at)
         }
         append(items, parseExpr(ts, p))
         if kindAt(ts, p.pos) == token.Kind.Comma() {
             advance(p)
         } else if kindAt(ts, p.pos) == token.Kind.RBracket() {
             advance(p)
-            return ast.Expr.VectorLit(items)
+            return ast.Expr.VectorLit(items, at)
         } else if p.failed == false {
             expected(ts, p, "`,` or `]` in a vector literal")
-            return ast.Expr.VectorLit(items)
+            return ast.Expr.VectorLit(items, at)
         }
     }
-    return ast.Expr.VectorLit(items)
+    return ast.Expr.VectorLit(items, at)
 }
 
 // `await [f(a), g(b)]` — the await-all, and the only `await` there is. A single
 // call needs no keyword, calling it blocks already, so the `[` is required.
 proc parseAwaitAll(ts: token.Token[], p: mut Parse): ast.Expr {
+    where := place(ts, p)
     advance(p)
     mut ast.Expr[dyn] calls = []
     if kindAt(ts, p.pos) != token.Kind.LBracket() {
         fail(ts, p, "`await` takes a list of calls to run all at once — `await [f(a), f(b)]` — but found " + token.describe(kindAt(ts, p.pos)) + ". One call on its own needs no `await`: calling it already blocks until it answers.")
-        return ast.Expr.Absent()
+        return ast.absent()
     }
     advance(p)
     for ; p.failed == false && atEnd(ts, p) == false; {
@@ -2193,69 +2239,69 @@ proc parseAwaitAll(ts: token.Token[], p: mut Parse): ast.Expr {
             if len(calls) == 0 {
                 fail(ts, p, "`await []` waits for nothing at all. List the calls to run together: `await [f(a), f(b)]`.")
             }
-            return ast.Expr.AwaitAll(calls, ast.Expr.Absent())
+            return ast.Expr.AwaitAll(calls, ast.absent(), where)
         }
         item := parseExpr(ts, p)
         if p.failed {
-            return ast.Expr.Absent()
+            return ast.absent()
         }
-        if item is ast.Expr.Call(_, _) {
+        if item is ast.Expr.Call(_, _, _) {
             append(calls, item)
         } else {
             fail(ts, p, "`await` runs each of its calls on its own virtual thread, so every entry has to be a call — this one is not. A value that is already in hand has nothing to wait for.")
-            return ast.Expr.Absent()
+            return ast.absent()
         }
         if kindAt(ts, p.pos) == token.Kind.Comma() {
             advance(p)
         } else if kindAt(ts, p.pos) != token.Kind.RBracket() && p.failed == false {
             expected(ts, p, "`,` or `]` in an `await` list")
-            return ast.Expr.Absent()
+            return ast.absent()
         }
     }
-    return ast.Expr.AwaitAll(calls, ast.Expr.Absent())
+    return ast.Expr.AwaitAll(calls, ast.absent(), where)
 }
 
 // An interpolated string, with each captured `{...}` parsed as a full
 // expression of its own.
 proc parseInterp(ts: token.Token[], p: mut Parse, parts: token.StrPart[]): ast.Expr {
-    line := lineAt(ts, p.pos)
+    at := place(ts, p)
     advance(p)
     mut ast.InterpPart[dyn] out = []
     for each part in parts {
         if part is token.StrPart.Literal(t) {
             append(out, ast.InterpPart.Literal(t))
         } else if part is token.StrPart.Code(source) {
-            append(out, ast.InterpPart.Expression(parseSubExpr(ts, p, source, line)))
+            append(out, ast.InterpPart.Expression(parseSubExpr(ts, p, source, at)))
         } else if part is token.StrPart.Hole(name, _) {
             // `\{name is (regex)}` asks a question, and a string being built has
             // nobody to answer it.
             fail(ts, p, "`\{{name} is (...)}` is a pattern's hole, not something a string can hold: it says what the text there has to look like, which only means anything on the right of an `is`. To put a `\{` in a string, write `\\\{`")
         }
     }
-    return ast.Expr.Interp(out)
+    return ast.Expr.Interp(out, at)
 }
 
 // An expression captured as text — a string's interpolation — parsed by running
 // the lexer and the parser over it again: same grammar, same two passes.
-proc parseSubExpr(ts: token.Token[], p: mut Parse, source: Str, line: Int): ast.Expr {
+proc parseSubExpr(ts: token.Token[], p: mut Parse, source: Str, line: token.Pos): ast.Expr {
     lexed := lexer.lex(source)
     if len(lexed.errors) > 0 {
         reportSub(ts, p, line, source, "does not lex")
-        return ast.Expr.Absent()
+        return ast.absent()
     }
-    mut Parse inner = Parse(0, false, false, [], p.parts, [], false, false)
+    mut Parse inner = Parse(0, false, false, [], p.parts, [], false, false, p.file, line)
     value := parseExpr(lexed.tokens, inner)
     p.parts = inner.parts
     if inner.failed || kindAt(lexed.tokens, inner.pos) != token.Kind.Eof() {
         reportSub(ts, p, line, source, "is not one expression")
-        return ast.Expr.Absent()
+        return ast.absent()
     }
     return value
 }
 
-proc reportSub(ts: token.Token[], p: mut Parse, line: Int, source: Str, why: Str): void {
+proc reportSub(ts: token.Token[], p: mut Parse, line: token.Pos, source: Str, why: Str): void {
     if p.quiet == false && p.failed == false {
-        append(p.errors, diag.at(line, "the interpolated expression `{source}` {why}"))
+        append(p.errors, diag.on(line, "the interpolated expression `{source}` {why}"))
     }
     p.failed = true
 }
@@ -2265,14 +2311,15 @@ proc reportSub(ts: token.Token[], p: mut Parse, line: Int, source: Str, why: Str
 // `x is P(Q)` is `x is P(t) && t is Q`, with `t` a name no program can write, so
 // nothing after the parser has a nested pattern to know about.
 proc parseMatch(ts: token.Token[], p: mut Parse, subject: ast.Expr): ast.Expr {
+    at := place(ts, p)
     held := p.tests
     p.tests = []
     pattern := parsePattern(ts, p)
-    mut ast.Expr out = ast.Expr.IsMatch(subject, pattern)
+    mut ast.Expr out = ast.Expr.IsMatch(subject, pattern, at)
     mut Str[dyn] bound = ast.boundBy(pattern)
     for each step in p.tests {
-        out = ast.Expr.Binary(ast.BinOp.And(), out, step)
-        if step is ast.Expr.IsMatch(_, inner) {
+        out = ast.Expr.Binary(ast.BinOp.And(), out, step, at)
+        if step is ast.Expr.IsMatch(_, inner, _) {
             bound = bound + ast.boundBy(inner)
         }
     }
@@ -2283,10 +2330,11 @@ proc parseMatch(ts: token.Token[], p: mut Parse, subject: ast.Expr): ast.Expr {
 
 // Filed before the part is read, so an outer part is tested before its own parts.
 proc nestedPart(ts: token.Token[], p: mut Parse): Str {
+    where := place(ts, p)
     name := freshPart(p)
     at := len(p.tests)
-    append(p.tests, ast.Expr.Absent())
-    step := ast.Expr.IsMatch(ast.Expr.Ident(name), parsePattern(ts, p))
+    append(p.tests, ast.absent())
+    step := ast.Expr.IsMatch(ast.Expr.Ident(name, where), parsePattern(ts, p), where)
     if p.tests bounds at {
         p.tests[at] = step
     }
@@ -2294,8 +2342,9 @@ proc nestedPart(ts: token.Token[], p: mut Parse): Str {
 }
 
 proc literalPart(ts: token.Token[], p: mut Parse): Str {
+    at := place(ts, p)
     name := freshPart(p)
-    append(p.tests, ast.Expr.Binary(ast.BinOp.Eq(), ast.Expr.Ident(name), parseLiteral(ts, p)))
+    append(p.tests, ast.Expr.Binary(ast.BinOp.Eq(), ast.Expr.Ident(name, at), parseLiteral(ts, p), at))
     return name
 }
 
@@ -2322,26 +2371,27 @@ func startsLiteral(ts: token.Token[], i: Int): Bool {
 }
 
 proc parseLiteral(ts: token.Token[], p: mut Parse): ast.Expr {
+    at := place(ts, p)
     k := kindAt(ts, p.pos)
     if refusesWide(ts, p, "a pattern") {
-        return ast.Expr.Absent()
+        return ast.absent()
     }
     advance(p)
-    if k is token.Kind.IntLit(v) { return ast.Expr.IntLit(v) }
-    else if k is token.Kind.FloatLit(v) { return ast.Expr.FloatLit(v) }
-    else if k is token.Kind.StrLit(t) { return ast.Expr.StrLit(t) }
-    else if k is token.Kind.AtomLit(atom) { return ast.Expr.AtomLit(atom) }
-    else if k == token.Kind.KwTrue() { return ast.Expr.BoolLit(true) }
-    else if k == token.Kind.KwFalse() { return ast.Expr.BoolLit(false) }
+    if k is token.Kind.IntLit(v) { return ast.Expr.IntLit(v, at) }
+    else if k is token.Kind.FloatLit(v) { return ast.Expr.FloatLit(v, at) }
+    else if k is token.Kind.StrLit(t) { return ast.Expr.StrLit(t, at) }
+    else if k is token.Kind.AtomLit(atom) { return ast.Expr.AtomLit(atom, at) }
+    else if k == token.Kind.KwTrue() { return ast.Expr.BoolLit(true, at) }
+    else if k == token.Kind.KwFalse() { return ast.Expr.BoolLit(false, at) }
     if refusesWide(ts, p, "a pattern") {
-        return ast.Expr.Absent()
+        return ast.absent()
     }
     if kindAt(ts, p.pos) is token.Kind.IntLit(v) {
         advance(p)
-        return ast.Expr.Negate(ast.Expr.IntLit(v))
+        return ast.Expr.Negate(ast.Expr.IntLit(v, at), at)
     }
     expected(ts, p, "a number after `-` in a pattern")
-    return ast.Expr.Absent()
+    return ast.absent()
 }
 
 // A literal past `Int`'s largest is a `UInt64` built by a call, which only an
@@ -2432,14 +2482,14 @@ proc parseBitsPattern(ts: token.Token[], p: mut Parse): ast.Pattern {
 
 proc parseBitField(ts: token.Token[], p: mut Parse): ast.BitField {
     mut name := ""
-    mut ast.Expr value = ast.Expr.Absent()
+    mut ast.Expr value = ast.absent()
     if startsLiteral(ts, p.pos) {
         value = parseLiteral(ts, p)
     } else {
         name = expectIdent(ts, p, naming.Role.Binding())
     }
     mut declared := ast.TypeExpr.VoidType()
-    mut ast.Expr length = ast.Expr.Absent()
+    mut ast.Expr length = ast.absent()
     if kindAt(ts, p.pos) == token.Kind.Colon() {
         advance(p)
         // `UInt8[size]`: a length the type grammar has no room for, since it is
