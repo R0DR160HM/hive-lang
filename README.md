@@ -42,6 +42,10 @@ hive version                        which release this compiler is
 
 `build` and `export` take `--target <goos>/<goarch>`.
 
+`hive lsp` puts the compiler in your editor: errors as you type, what a name is,
+where it was declared, what could come next. [LSP.md](LSP.md) sets it up in
+Neovim and VS Code.
+
 ## Learn
 
 * [The tour](https://hive-lang.run): the whole language. All of it.

@@ -5,6 +5,8 @@
 ### Tooling
 
 * **`hive lsp` is a language server**: errors as a file is typed, hover, go to definition, completion, an outline, and reindenting.
+* **[LSP.md](LSP.md) sets it up in Neovim and VS Code**, the second through the extension in `editors/vscode`.
+* **`hive agents` sends a coding agent to the language server**: a page on what to ask it, and a Claude Code plugin in `.hivedocs/plugin` that starts it.
 * **A name that is no value is refused where a value was wanted**: `hive.env.nope`, a module or a type on its own, and a variant nobody declared passed `hive check` and failed in Go.
 * **An error inside a string's `{...}` is reported at the expression**, where it was at the string.
 * **An error is reported on the line it is on**, from every pass: an index at the index, an argument at the argument, a field at the field — where it was the line of the declaration around it.

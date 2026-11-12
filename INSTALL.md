@@ -72,14 +72,8 @@ If `run` says `go` is not on the `PATH`, the compiler is installed and Go is not
 ## In an editor
 
 `hive lsp` is a language server: errors as you type, what a name is, where it was
-declared, and what could come next. Any editor that speaks the Language Server
-Protocol runs it as `hive lsp`, for files ending in `.hive`. In Neovim 0.11 or later:
-
-```lua
-vim.filetype.add({ extension = { hive = 'hive' } })
-vim.lsp.config('hive', { cmd = { 'hive', 'lsp' }, filetypes = { 'hive' } })
-vim.lsp.enable('hive')
-```
+declared, and what could come next. [LSP.md](LSP.md) sets it up in Neovim and
+VS Code, and says what any other editor needs to be told.
 
 ## What it reads and writes
 
