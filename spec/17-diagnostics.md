@@ -48,6 +48,12 @@ The two `%-G` items discard what is not a diagnostic: the first drops the
 indented continuation lines of a message that runs on, the last drops everything
 else.
 
+`hive lsp` is the other way in: a language server, which an editor starts and
+talks to over standard input and output. It reports the same errors as a file is
+typed, each with its column, and answers what a name is, where it was declared,
+and what could come next. It reads a file as the editor holds it, saved or not,
+and as a program of its own, so there is no entrypoint to name.
+
 ## 17.3 Where an error lands
 
 **On the line of what is wrong.** Every expression, statement and declaration

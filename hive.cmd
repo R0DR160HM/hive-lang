@@ -10,6 +10,7 @@ rem   hive test      <directory>             Run every test under it, git-ignore
 rem   hive container <entrypoint.hive>       Write a Dockerfile that builds and runs it
 rem   hive agents                            Write .hivedocs/ for a coding agent to read
 rem   hive indent    <directory or file>     Indent every Hive file there with spaces
+rem   hive lsp                               Answer an editor, as a language server
 rem   hive use       <version>               Replace this compiler with another release
 rem   hive version                          Which release this compiler is
 rem

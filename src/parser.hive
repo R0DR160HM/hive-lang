@@ -46,6 +46,8 @@ type Parse {
     file: Str
     // The string an interpolation or a query's value is parsed out of, where its nodes are placed.
     within: token.Pos
+    // Where that text's first character is, when that is known: its nodes are then placed exactly.
+    base: token.Pos
 }
 
 proc parse(ts: token.Token[]): Parsed {
@@ -53,7 +55,7 @@ proc parse(ts: token.Token[]): Parsed {
 }
 
 proc parseFile(ts: token.Token[], file: Str): Parsed {
-    mut Parse p = Parse(0, false, false, [], 0, [], false, false, file, token.nowhere())
+    mut Parse p = Parse(0, false, false, [], 0, [], false, false, file, token.nowhere(), token.nowhere())
     mut ast.ImportLine[dyn] imports = []
     mut ast.Decl[dyn] decls = []
 
@@ -101,6 +103,9 @@ func kindAt(ts: token.Token[], i: Int): token.Kind {
 
 func placeAt(ts: token.Token[], p: Parse, i: Int): token.Pos {
     if p.within.line > 0 {
+        if p.base.line > 0 && ts bounds i {
+            return shifted(p.base, ts[i].line, ts[i].col)
+        }
         return p.within
     }
     if ts bounds i {
@@ -115,6 +120,27 @@ func placeAt(ts: token.Token[], p: Parse, i: Int): token.Pos {
 
 func place(ts: token.Token[], p: Parse): token.Pos {
     return placeAt(ts, p, p.pos)
+}
+
+// A place in text whose first character is at `base`.
+func shifted(base: token.Pos, line: Int, col: Int): token.Pos {
+    if line == 1 {
+        return token.Pos(base.file, base.line, base.col + col - 1)
+    }
+    return token.Pos(base.file, base.line + line - 1, col)
+}
+
+func codeAt(p: Parse, line: Int, col: Int): token.Pos {
+    if line == 0 {
+        return token.nowhere()
+    }
+    if p.within.line == 0 {
+        return token.Pos(p.file, line, col)
+    }
+    if p.base.line > 0 {
+        return shifted(p.base, line, col)
+    }
+    return token.nowhere()
 }
 
 // The identifier a token spells, or `""`. Several words are keywords only where
@@ -424,7 +450,7 @@ proc parseSqlExpr(source: Str, p: mut Parse): ast.Expr {
     for each e in lexed.errors {
         append(p.errors, e)
     }
-    mut Parse inner = Parse(0, false, false, [], p.parts, [], false, false, p.file, p.within)
+    mut Parse inner = Parse(0, false, false, [], p.parts, [], false, false, p.file, p.within, token.nowhere())
     written := parseExpr(lexed.tokens, inner)
     p.parts = inner.parts
     for each e in inner.errors {
@@ -2270,8 +2296,8 @@ proc parseInterp(ts: token.Token[], p: mut Parse, parts: token.StrPart[]): ast.E
     for each part in parts {
         if part is token.StrPart.Literal(t) {
             append(out, ast.InterpPart.Literal(t))
-        } else if part is token.StrPart.Code(source) {
-            append(out, ast.InterpPart.Expression(parseSubExpr(ts, p, source, at)))
+        } else if part is token.StrPart.Code(source, line, col) {
+            append(out, ast.InterpPart.Expression(parseSubExpr(ts, p, source, at, codeAt(p, line, col))))
         } else if part is token.StrPart.Hole(name, _) {
             // `\{name is (regex)}` asks a question, and a string being built has
             // nobody to answer it.
@@ -2283,13 +2309,13 @@ proc parseInterp(ts: token.Token[], p: mut Parse, parts: token.StrPart[]): ast.E
 
 // An expression captured as text — a string's interpolation — parsed by running
 // the lexer and the parser over it again: same grammar, same two passes.
-proc parseSubExpr(ts: token.Token[], p: mut Parse, source: Str, line: token.Pos): ast.Expr {
+proc parseSubExpr(ts: token.Token[], p: mut Parse, source: Str, line: token.Pos, base: token.Pos): ast.Expr {
     lexed := lexer.lex(source)
     if len(lexed.errors) > 0 {
         reportSub(ts, p, line, source, "does not lex")
         return ast.absent()
     }
-    mut Parse inner = Parse(0, false, false, [], p.parts, [], false, false, p.file, line)
+    mut Parse inner = Parse(0, false, false, [], p.parts, [], false, false, p.file, line, base)
     value := parseExpr(lexed.tokens, inner)
     p.parts = inner.parts
     if inner.failed || kindAt(lexed.tokens, inner.pos) != token.Kind.Eof() {
@@ -2514,7 +2540,7 @@ proc stringPattern(ts: token.Token[], p: mut Parse, parts: token.StrPart[]): ast
     mut token.StrPart[dyn] out = []
     mut Str[dyn] named = []
     for each part in parts {
-        if part is token.StrPart.Code(source) {
+        if part is token.StrPart.Code(source, _, _) {
             name := text.trim(source)
             if naming.fits(naming.Role.Binding(), name) == false || name == "_" {
                 fail(ts, p, "a string pattern's `\{{source}}` has to be a plain name to bind the text to — it is a hole, not an expression")

@@ -1,0 +1,902 @@
+// The editor's view
+// =================
+// What an editor asks of a file somebody is still writing: what is wrong with it,
+// what a name is and where it came from, and what could be written next.
+// `lsp.hive` is the protocol; nothing here knows there is one.
+import ./ast
+import ./check as checks
+import ./diag
+import ./infer
+import ./lexer
+import ./loader
+import ./mono
+import ./parser
+import ./paths
+import ./ranges
+import ./stdlib
+import ./text
+import ./token
+import ./types
+import hive.map
+
+type Kind {
+    Callable
+    TypeName
+    Variant
+    Field
+    Local
+    Module
+    Keyword
+}
+
+type Named {
+    name: Str
+    shown: Str
+    kind: Kind
+    at: token.Pos
+}
+
+type Imported {
+    alias: Str
+    prefix: Str
+    // The library module it names, or `""` for a file.
+    library: Str
+}
+
+type Reading {
+    entry: Str
+    errors: diag.Diagnostic[dyn]
+    loaded: Bool
+    table: types.Table
+    // Every declaration, before generics were expanded.
+    known: Named[dyn]
+    imports: Imported[dyn]
+    prefixes: Str[dyn]
+    stems: Str[dyn]
+    uses: infer.Use[dyn]
+    scopes: infer.Scope[dyn]
+}
+
+type Described {
+    shown: Str
+    at: token.Pos
+}
+
+type Offered {
+    label: Str
+    detail: Str
+    kind: Kind
+}
+
+type Outlined {
+    name: Str
+    detail: Str
+    kind: Kind
+    line: Int
+    col: Int
+    last: Int
+    children: Outlined[dyn]
+}
+
+type Word {
+    name: Str
+    line: Int
+    col: Int
+    index: Int
+}
+
+proc unread(entry: Str): Reading {
+    return Reading(entry, [], false, types.emptyTable(), [], [], [], [], [], [])
+}
+
+// `held` is every file the editor has open, by normalised path, as it stands unsaved.
+proc read(entry: Str, held: hive.map.Map<Str, Str>): Reading {
+    program := loader.loadHeld(entry, held)
+    if len(program.errors) > 0 {
+        mut diag.Diagnostic[dyn] errors = []
+        for each e in program.errors {
+            append(errors, diag.inFile(entry, e))
+        }
+        return Reading(entry, errors, false, types.emptyTable(), [], [], [], [], [], [])
+    }
+    mut Str[dyn] prefixes = []
+    mut Str[dyn] stems = []
+    for each src in program.sources {
+        if src.prefix != "" {
+            append(prefixes, src.prefix)
+            append(stems, paths.stem(src.key) + ".")
+        }
+    }
+    all := types.tableOf(program.module)
+    known := declared(all, program.module)
+    imports := importsOf(program, paths.normalise(entry))
+    expanded := mono.expand(program.module, 0)
+    if len(expanded.errors) > 0 {
+        return Reading(entry, loader.placed(program, entry, expanded.errors), true, all, known, imports, prefixes, stems, [], [])
+    }
+    found := checks.checkWatching(expanded.module, entry)
+    mut diag.Diagnostic[dyn] errors = []
+    for each e in loader.placed(program, entry, found.errors) {
+        append(errors, e)
+    }
+    if len(found.errors) == 0 {
+        for each e in loader.placed(program, entry, ranges.checkModule(expanded.module)) {
+            append(errors, e)
+        }
+    }
+    return Reading(entry, errors, true, types.tableOf(expanded.module), known, imports, prefixes, stems, found.uses, found.scopes)
+}
+
+proc declared(t: types.Table, m: ast.Module): Named[dyn] {
+    mut Named[dyn] out = []
+    for each d in m.decls {
+        if d is ast.Decl.TypeDecl(name, fields, variants, at) {
+            append(out, Named(name, typeShown(t, name, fields, variants), Kind.TypeName(), at))
+        } else if d is ast.Decl.CallableDecl(kind, name, params, result, _, at) {
+            mut word := "proc"
+            if kind is ast.CallableKind.FuncKind {
+                word = "func"
+            }
+            append(out, Named(name, word + " " + name + signature(t, params, result), Kind.Callable(), at))
+        } else if d is ast.Decl.QueryDecl(name, params, result, _, at) {
+            append(out, Named(name, "query " + name + signature(t, params, result), Kind.Callable(), at))
+        } else if d is ast.Decl.ForeignDecl(name, params, result, _, _, _, at) {
+            append(out, Named(name, "func " + name + signature(t, params, result), Kind.Callable(), at))
+        }
+    }
+    return out
+}
+
+func signature(t: types.Table, params: ast.Param[], result: ast.TypeExpr): Str {
+    mut Str[dyn] out = []
+    for each p in params {
+        mut shown := p.name + ": "
+        if p.mutable {
+            shown = shown + "mut "
+        }
+        append(out, shown + types.show(types.resolve(t, p.declared)))
+    }
+    return "(" + join(out, ", ") + "): " + types.show(types.resolve(t, result))
+}
+
+func fieldShown(t: types.Table, f: ast.Field): Str {
+    return f.name + ": " + types.show(types.resolve(t, f.declared))
+}
+
+func typeShown(t: types.Table, name: Str, fields: ast.Field[], variants: ast.Variant[]): Str {
+    mut Str[dyn] lines = []
+    append(lines, "type " + types.shownName(name) + " \{")
+    for each f in fields {
+        append(lines, "    " + fieldShown(t, f))
+    }
+    for each v in variants {
+        append(lines, "    " + variantShown(t, v))
+    }
+    append(lines, "}")
+    return join(lines, "\n")
+}
+
+func variantShown(t: types.Table, v: ast.Variant): Str {
+    if len(v.fields) == 0 {
+        return v.name
+    }
+    mut Str[dyn] inner = []
+    for each f in v.fields {
+        append(inner, fieldShown(t, f))
+    }
+    return v.name + " \{ " + join(inner, ", ") + " }"
+}
+
+// A type as a stub writes it, where its own module's names need no prefix.
+func written(t: ast.TypeExpr): Str {
+    if t is ast.TypeExpr.Fn(pure, params, mutables, result) {
+        mut word := "proc"
+        if pure {
+            word = "func"
+        }
+        mut Str[dyn] out = []
+        mut i := 0
+        for each p in params {
+            if types.mutableAt(mutables, i) {
+                append(out, "mut " + written(p))
+            } else {
+                append(out, written(p))
+            }
+            i = i + 1
+        }
+        return word + "(" + join(out, ", ") + "): " + written(result)
+    }
+    if t is ast.TypeExpr.Named(pkg, name, args, dims) {
+        mut out := name
+        if pkg != "" {
+            out = pkg + "." + name
+        }
+        if len(args) > 0 {
+            mut Str[dyn] inner = []
+            for each a in args {
+                append(inner, written(a))
+            }
+            out = out + "<" + join(inner, ", ") + ">"
+        }
+        for each d in dims {
+            out = out + types.showDim(d)
+        }
+        return out
+    }
+    return "void"
+}
+
+proc importsOf(program: loader.Program, key: Str): Imported[dyn] {
+    mut Imported[dyn] out = []
+    for each src in program.sources {
+        if src.key != key {
+            continue
+        }
+        for each line in src.module.imports {
+            if text.startsWith(line.path, "hive.") {
+                append(out, Imported(line.alias, "", text.replace(line.path, "hive.", "")))
+            } else if hive.map.get(src.resolved, line.path) is Result.Ok(found) {
+                for each other in program.sources {
+                    if other.key == found {
+                        append(out, Imported(line.alias, other.prefix, ""))
+                    }
+                }
+            }
+        }
+    }
+    return out
+}
+
+func spelt(r: Reading, shown: Str): Str {
+    mut out := shown
+    mut i := 0
+    for each prefix in r.prefixes {
+        out = text.replace(out, prefix, text.charAt(r.stems, i))
+        i = i + 1
+    }
+    return out
+}
+
+// A generic's copy is named for its arguments, after the name it was copied from.
+func origin(r: Reading, name: Str): Result<Named, Bool> {
+    mut best := Named("", "", Kind.Local(), token.nowhere())
+    for each k in r.known {
+        if k.name == name {
+            return Result.Ok(k)
+        }
+        if text.startsWith(name, k.name + "_") && len(k.name) > len(best.name) {
+            best = k
+        }
+    }
+    if best.name != "" {
+        return Result.Ok(best)
+    }
+    return Result.Error(false)
+}
+
+func nothing(): Described {
+    return Described("", token.nowhere())
+}
+
+func reached(line: Int, col: Int, at: token.Pos): Bool {
+    return line > at.line || (line == at.line && col >= at.col)
+}
+
+// --- What a name is ------------------------------------------------------------
+
+proc wordAt(tokens: token.Token[], line: Int, col: Int): Word {
+    mut i := 0
+    for each t in tokens {
+        if t.line == line && t.kind is token.Kind.Ident(name) {
+            if col >= t.col && col <= t.col + len(name) {
+                return Word(name, t.line, t.col, i)
+            }
+        }
+        if t.kind is token.Kind.StrParts(parts) {
+            found := wordIn(parts, line, col)
+            if found.name != "" {
+                return found
+            }
+        }
+        i = i + 1
+    }
+    return Word("", 0, 0, -1)
+}
+
+// A name inside a string's `\{...}`, which the lexer keeps as text.
+proc wordIn(parts: token.StrPart[], line: Int, col: Int): Word {
+    for each part in parts {
+        if part is token.StrPart.Code(source, codeLine, codeCol) {
+            if codeLine == 0 {
+                continue
+            }
+            for each t in lexer.lex(source).tokens {
+                if t.kind is token.Kind.Ident(name) {
+                    mut at := token.Pos("", codeLine + t.line - 1, t.col)
+                    if t.line == 1 {
+                        at = token.Pos("", codeLine, codeCol + t.col - 1)
+                    }
+                    if at.line == line && col >= at.col && col <= at.col + len(name) {
+                        return Word(name, at.line, at.col, -1)
+                    }
+                }
+            }
+        }
+    }
+    return Word("", 0, 0, -1)
+}
+
+func chainTo(tokens: token.Token[], index: Int): Str[dyn] {
+    mut Str[dyn] names = []
+    mut i := index
+    mut going := true
+    for ; going; {
+        going = false
+        if tokens bounds i {
+            if tokens[i].kind is token.Kind.Ident(name) {
+                prepend(names, name)
+                dot := i - 1
+                before := i - 2
+                if tokens bounds dot && tokens bounds before {
+                    if tokens[dot].kind is token.Kind.Dot && tokens[before].kind is token.Kind.Ident(_) {
+                        i = before
+                        going = true
+                    }
+                }
+            }
+        }
+    }
+    return names
+}
+
+func useAt(r: Reading, line: Int, col: Int): Result<infer.Use, Bool> {
+    for each u in r.uses {
+        if u.at.line == line && u.at.col == col {
+            return Result.Ok(u)
+        }
+    }
+    return Result.Error(false)
+}
+
+// `line` and `col` count from 1, in characters.
+proc describe(r: Reading, source: Str, line: Int, col: Int): Described {
+    tokens := lexer.lex(source).tokens
+    word := wordAt(tokens, line, col)
+    if word.name == "" {
+        return nothing()
+    }
+    if useAt(r, word.line, word.col) is Result.Ok(u) {
+        found := describeUse(r, tokens, u)
+        if found.shown != "" {
+            return found
+        }
+    }
+    return describeWord(r, tokens, word)
+}
+
+func describeUse(r: Reading, tokens: token.Token[], u: infer.Use): Described {
+    if u.local {
+        return Described(u.name + ": " + spelt(r, types.show(u.ty)), bindingOf(r, tokens, u))
+    }
+    if u.member == false {
+        return describeName(r, u.name)
+    }
+    if u.path == "" {
+        return describeField(r, u.owner, u.name, u.ty)
+    }
+    return describePath(r, split(u.path, "."), u.name)
+}
+
+func describeName(r: Reading, name: Str): Described {
+    if origin(r, name) is Result.Ok(found) {
+        return Described(spelt(r, found.shown), found.at)
+    }
+    if infer.isBuiltin(name) {
+        return Described("builtin " + name, token.nowhere())
+    }
+    return nothing()
+}
+
+func describeField(r: Reading, owner: types.Ty, field: Str, ty: types.Ty): Described {
+    if owner is types.Ty.TNamed(typeName) {
+        if types.findType(r.table, typeName) is Result.Ok(info) {
+            for each f in info.shared {
+                if f.name == field {
+                    return Described(spelt(r, fieldShown(r.table, f)), f.at)
+                }
+            }
+            for each v in info.variants {
+                for each f in v.fields {
+                    if f.name == field {
+                        return Described(spelt(r, fieldShown(r.table, f)), f.at)
+                    }
+                }
+            }
+        }
+    }
+    if (ty is types.Ty.TUnknown) == false {
+        return Described(field + ": " + spelt(r, types.show(ty)), token.nowhere())
+    }
+    return nothing()
+}
+
+func describePath(r: Reading, path: Str[], name: Str): Described {
+    head := text.charAt(path, 0)
+    if head == "hive" {
+        module := text.charAt(path, 1)
+        if len(path) == 1 && stdlib.isKnownModule(name) {
+            return Described("module hive." + name, token.nowhere())
+        }
+        if len(path) == 1 && infer.isBuiltin(name) {
+            return Described("builtin " + name, token.nowhere())
+        }
+        if len(path) == 2 {
+            return libraryShown(r.table, module, name)
+        }
+        if len(path) == 3 && indexOf(stdlib.variantsOf(r.table, module, text.charAt(path, 2)), name) is Result.Ok(_) {
+            return Described("hive." + module + "." + text.charAt(path, 2) + "." + name, token.nowhere())
+        }
+        return nothing()
+    }
+    if head == "Result" && (name == "Ok" || name == "Error") {
+        return Described("Result." + name, token.nowhere())
+    }
+    if types.findType(r.table, head) is Result.Ok(info) {
+        for each v in info.variants {
+            if v.name == name {
+                return Described(spelt(r, types.shownName(head) + "." + variantShown(r.table, v)), v.at)
+            }
+        }
+        return describeName(r, head)
+    }
+    return nothing()
+}
+
+func libraryShown(t: types.Table, module: Str, name: Str): Described {
+    at := types.libraryAt(t, module, name)
+    if t.library.decls bounds at {
+        d := t.library.decls[at]
+        if d is ast.Decl.CallableDecl(_, _, params, result, _, _) {
+            mut Str[dyn] out = []
+            for each p in params {
+                append(out, types.unreserved(p.name) + ": " + written(p.declared))
+            }
+            return Described("func hive." + module + "." + name + "(" + join(out, ", ") + "): " + written(result), token.nowhere())
+        }
+        if d is ast.Decl.TypeDecl(_, fields, variants, _) {
+            mut Str[dyn] lines = []
+            append(lines, "type hive." + module + "." + name + " \{")
+            for each f in fields {
+                append(lines, "    " + f.name + ": " + written(f.declared))
+            }
+            for each v in variants {
+                append(lines, "    " + v.name)
+            }
+            append(lines, "}")
+            return Described(join(lines, "\n"), token.nowhere())
+        }
+    }
+    return nothing()
+}
+
+// The last statement before the use that did not have the name yet is what bound it.
+func bindingOf(r: Reading, tokens: token.Token[], u: infer.Use): token.Pos {
+    mut from := token.nowhere()
+    if origin(r, u.inside) is Result.Ok(found) {
+        from = found.at
+    }
+    for each s in r.scopes {
+        if s.inside == u.inside && reached(u.at.line, u.at.col, s.at) && hive.map.has(s.before, u.name) == false {
+            from = s.at
+        }
+    }
+    for each t in tokens {
+        if t.kind is token.Kind.Ident(name) {
+            if name == u.name && reached(t.line, t.col, from) {
+                return token.Pos(u.at.file, t.line, t.col)
+            }
+        }
+    }
+    return token.nowhere()
+}
+
+func describeWord(r: Reading, tokens: token.Token[], word: Word): Described {
+    here := token.Pos(r.entry, word.line, word.col)
+    chain := chainTo(tokens, word.index)
+    if len(chain) > 1 {
+        return describeChain(r, chain)
+    }
+    before := word.index - 1
+    if tokens bounds before {
+        k := tokens[before].kind
+        if k is token.Kind.KwFunc || k is token.Kind.KwProc || k is token.Kind.KwQuery || k is token.Kind.KwType {
+            if origin(r, word.name) is Result.Ok(found) {
+                return Described(spelt(r, found.shown), here)
+            }
+        }
+    }
+    for each i in r.imports {
+        if i.alias == word.name && i.library != "" {
+            return Described("module hive." + i.library, token.nowhere())
+        }
+    }
+    if text.isUpper(text.charAt(text.chars(word.name), 0)) {
+        return describeName(r, word.name)
+    }
+    ty := boundAt(r, word)
+    if (ty is types.Ty.TUnknown) == false {
+        return Described(word.name + ": " + spelt(r, types.show(ty)), here)
+    }
+    return describeName(r, word.name)
+}
+
+// A path outside any expression: a type in a signature, a pattern's variant.
+func describeChain(r: Reading, chain: Str[]): Described {
+    head := text.charAt(chain, 0)
+    name := text.charAt(chain, len(chain) - 1)
+    mut Str[dyn] middle = []
+    for i := 1; i < len(chain) - 1; i++ {
+        append(middle, text.charAt(chain, i))
+    }
+    if head == "hive" {
+        return describePath(r, withHead(["hive"], middle), name)
+    }
+    for each i in r.imports {
+        if i.alias == head {
+            if i.library != "" {
+                return describePath(r, withHead(["hive", i.library], middle), name)
+            }
+            if len(chain) == 2 {
+                return describeName(r, i.prefix + name)
+            }
+            return describePath(r, [i.prefix + text.charAt(chain, 1)], name)
+        }
+    }
+    if stdlib.isKnownModule(head) {
+        return describePath(r, withHead(["hive", head], middle), name)
+    }
+    if len(chain) == 2 {
+        return describePath(r, [head], name)
+    }
+    return nothing()
+}
+
+func withHead(head: Str[], rest: Str[]): Str[dyn] {
+    mut Str[dyn] out = []
+    for each h in head {
+        append(out, h)
+    }
+    for each x in rest {
+        append(out, x)
+    }
+    return out
+}
+
+func boundAt(r: Reading, word: Word): types.Ty {
+    mut found := types.Ty.TUnknown()
+    for each s in r.scopes {
+        if reached(word.line, word.col, s.at) {
+            found = types.Ty.TUnknown()
+            if s.at.line == word.line {
+                if hive.map.get(s.after, word.name) is Result.Ok(ty) {
+                    found = ty
+                }
+            }
+        } else if found is types.Ty.TUnknown {
+            if hive.map.get(s.before, word.name) is Result.Ok(ty) {
+                return ty
+            }
+            return found
+        }
+    }
+    return found
+}
+
+// --- What could be written -----------------------------------------------------
+
+func keywords(): Str[dyn] {
+    return ["import", "proc", "func", "query", "test", "type", "if", "else", "return", "is", "with", "void", "true", "false", "echo", "assert", "panic", "dyn", "mut", "async", "await", "for", "in", "each", "bounds", "break", "continue", "switch"]
+}
+
+func builtins(): Str[dyn] {
+    return ["len", "bytes", "append", "prepend", "drop", "join", "split", "indexOf", "row", "column", "toTable", "map", "filter", "filterMap", "sort", "replaceFirst", "replaceAll", "encode", "spawn", "at", "kill", "hide", "reveal", "bypass"]
+}
+
+// `last` is the file as it read when it last read at all, for when it does not now.
+proc complete(entry: Str, held: hive.map.Map<Str, Str>, last: Reading, line: Int, col: Int): Offered[dyn] {
+    mut source := ""
+    if hive.map.get(held, entry) is Result.Ok(found) {
+        source = found
+    }
+    lines := split(text.replace(source, "\r\n", "\n"), "\n")
+    row := line - 1
+    cs := text.chars(text.charAt(lines, row))
+    mut start := col - 1
+    for ; start > 0 && lexer.isWordChar(text.charAt(cs, start - 1)); {
+        start = start - 1
+    }
+    // A name has to stand where the cursor is for the line to read at all.
+    mut patched := held
+    if start == col - 1 {
+        patched = withLine(held, entry, lines, row, text.span(cs, 0, col - 2) + "zz" + text.span(cs, col - 1, len(cs) - 1))
+    }
+    now := read(entry, patched)
+    dotted := text.charAt(cs, start - 1) == "."
+    mut r := now
+    if now.loaded == false && last.loaded {
+        r = last
+    } else if now.loaded == false && dotted {
+        // What an import has no such name in does not load: read it with the whole path gone.
+        mut from := start - 1
+        for ; from > 0 && (lexer.isWordChar(text.charAt(cs, from - 1)) || text.charAt(cs, from - 1) == "."); {
+            from = from - 1
+        }
+        r = read(entry, withLine(held, entry, lines, row, text.span(cs, 0, from - 1) + "zz" + text.span(cs, col - 1, len(cs) - 1)))
+    }
+    if dotted {
+        return completeMember(now, r, cs, start, line)
+    }
+    return completeName(now, r, line, col)
+}
+
+proc withLine(held: hive.map.Map<Str, Str>, entry: Str, lines: Str[], row: Int, line: Str): hive.map.Map<Str, Str> {
+    mut Str[dyn] rewritten = []
+    mut i := 0
+    for each l in lines {
+        if i == row {
+            append(rewritten, line)
+        } else {
+            append(rewritten, l)
+        }
+        i = i + 1
+    }
+    mut out := held
+    hive.map.set(out, entry, join(rewritten, "\n"))
+    return out
+}
+
+// Empty when what the `.` hangs off is no name: a call, an index.
+func receiver(cs: Str[], start: Int): Str[dyn] {
+    mut Str[dyn] chain = []
+    mut at := start - 1
+    for ; at >= 0 && text.charAt(cs, at) == "."; {
+        last := at - 1
+        mut first := last
+        for ; first >= 0 && lexer.isWordChar(text.charAt(cs, first)); {
+            first = first - 1
+        }
+        if first == last {
+            return []
+        }
+        prepend(chain, text.span(cs, first + 1, last))
+        at = first
+    }
+    return chain
+}
+
+func completeMember(now: Reading, r: Reading, cs: Str[], start: Int, line: Int): Offered[dyn] {
+    chain := receiver(cs, start)
+    head := text.charAt(chain, 0)
+    inScope := scopeAt(r, line, start + 1)
+    if head != "" && hive.map.has(inScope, head) == false {
+        path := pathOf(r, chain)
+        if len(path) > 0 {
+            return pathMembers(r, path)
+        }
+    }
+    if useAt(now, line, start + 1) is Result.Ok(u) {
+        if u.member && u.path == "" {
+            return members(now, u.owner)
+        }
+    }
+    // The line does not read, so the receiver is followed by hand from what was last in scope.
+    mut ty := types.Ty.TUnknown()
+    if hive.map.get(inScope, head) is Result.Ok(found) {
+        ty = found
+    }
+    for i := 1; i < len(chain); i++ {
+        ty = memberType(r, ty, text.charAt(chain, i))
+    }
+    return members(r, ty)
+}
+
+func memberType(r: Reading, owner: types.Ty, field: Str): types.Ty {
+    if owner is types.Ty.TNamed(name) {
+        if types.findType(r.table, name) is Result.Ok(info) {
+            for each f in info.shared {
+                if f.name == field {
+                    return types.resolve(r.table, f.declared)
+                }
+            }
+        }
+    }
+    if owner is types.Ty.TLib(module, name) {
+        return stdlib.fieldTypeOf(r.table, module, name, field)
+    }
+    return types.Ty.TUnknown()
+}
+
+func pathOf(r: Reading, chain: Str[]): Str[dyn] {
+    head := text.charAt(chain, 0)
+    mut Str[dyn] rest = []
+    for i := 1; i < len(chain); i++ {
+        append(rest, text.charAt(chain, i))
+    }
+    if head == "hive" {
+        return withHead(["hive"], rest)
+    }
+    for each i in r.imports {
+        if i.alias == head {
+            if i.library != "" {
+                return withHead(["hive", i.library], rest)
+            }
+            if len(chain) == 1 {
+                return ["import", i.prefix]
+            }
+            return [i.prefix + text.charAt(chain, 1)]
+        }
+    }
+    if stdlib.isKnownModule(head) {
+        return withHead(["hive", head], rest)
+    }
+    if len(chain) == 1 && types.findType(r.table, head) is Result.Ok(_) {
+        return [head]
+    }
+    return []
+}
+
+func pathMembers(r: Reading, path: Str[]): Offered[dyn] {
+    mut Offered[dyn] out = []
+    head := text.charAt(path, 0)
+    second := text.charAt(path, 1)
+    if head == "import" {
+        for each k in r.known {
+            if text.startsWith(k.name, second) {
+                append(out, Offered(text.replace(k.name, second, ""), firstLine(spelt(r, k.shown)), k.kind))
+            }
+        }
+        return out
+    }
+    if head == "hive" && len(path) == 1 {
+        for each module in stdlib.modules() {
+            append(out, Offered(module, "module hive." + module, Kind.Module()))
+        }
+        return out
+    }
+    if head == "hive" && len(path) == 2 {
+        for each key in hive.map.keys(r.table.library.index) {
+            if text.startsWith(key, second + ".") {
+                name := text.replace(key, second + ".", "")
+                mut kind := Kind.Callable()
+                if stdlib.isLibType(r.table, second, name) {
+                    kind = Kind.TypeName()
+                }
+                append(out, Offered(name, firstLine(libraryShown(r.table, second, name).shown), kind))
+            }
+        }
+        return out
+    }
+    if head == "hive" && len(path) == 3 {
+        for each v in stdlib.variantsOf(r.table, second, text.charAt(path, 2)) {
+            append(out, Offered(v, "hive." + second + "." + text.charAt(path, 2) + "." + v, Kind.Variant()))
+        }
+        return out
+    }
+    if types.findType(r.table, head) is Result.Ok(info) {
+        for each v in info.variants {
+            append(out, Offered(v.name, spelt(r, variantShown(r.table, v)), Kind.Variant()))
+        }
+    }
+    return out
+}
+
+func firstLine(shown: Str): Str {
+    return text.replace(text.charAt(split(shown, "\n"), 0), " \{", "")
+}
+
+func members(r: Reading, ty: types.Ty): Offered[dyn] {
+    mut Offered[dyn] out = []
+    if ty is types.Ty.TNamed(name) {
+        if types.findType(r.table, name) is Result.Ok(info) {
+            for each f in info.shared {
+                append(out, Offered(f.name, spelt(r, types.show(types.resolve(r.table, f.declared))), Kind.Field()))
+            }
+        }
+    } else if ty is types.Ty.TLib(module, name) {
+        for each f in stdlib.fieldsOf(r.table, module, name) {
+            append(out, Offered(f.name, types.show(stdlib.fieldTypeOf(r.table, module, name, f.name)), Kind.Field()))
+        }
+    }
+    return out
+}
+
+// What is bound at a place: before the statement on that line, after the last one above it.
+func scopeAt(r: Reading, line: Int, col: Int): hive.map.Map<Str, types.Ty> {
+    mut hive.map.Map<Str, types.Ty> names = hive.map.new()
+    for each s in r.scopes {
+        if reached(line, col, s.at) {
+            if s.at.line == line {
+                names = s.before
+            } else {
+                names = s.after
+            }
+        }
+    }
+    return names
+}
+
+func completeName(now: Reading, r: Reading, line: Int, col: Int): Offered[dyn] {
+    mut Offered[dyn] out = []
+    mut inScope := scopeAt(now, line, col)
+    if len(now.scopes) == 0 {
+        inScope = scopeAt(r, line, col)
+    }
+    for each name in hive.map.keys(inScope) {
+        if hive.map.get(inScope, name) is Result.Ok(ty) {
+            append(out, Offered(name, spelt(r, types.show(ty)), Kind.Local()))
+        }
+    }
+    for each k in r.known {
+        if k.at.file == r.entry {
+            append(out, Offered(k.name, firstLine(k.shown), k.kind))
+        }
+    }
+    for each i in r.imports {
+        append(out, Offered(i.alias, "import", Kind.Module()))
+    }
+    for each module in stdlib.modules() {
+        append(out, Offered(module, "module hive." + module, Kind.Module()))
+    }
+    append(out, Offered("hive", "the standard library", Kind.Module()))
+    for each name in builtins() {
+        append(out, Offered(name, "builtin", Kind.Callable()))
+    }
+    for each word in keywords() {
+        append(out, Offered(word, "", Kind.Keyword()))
+    }
+    return out
+}
+
+// --- What a file declares ------------------------------------------------------
+
+// `Error` for a file that does not parse, whose declarations stop at whatever is being typed.
+proc outline(entry: Str, source: Str): Result<Outlined[dyn], Bool> {
+    lexed := lexer.lex(source)
+    parsed := parser.parseFile(lexed.tokens, entry)
+    if len(lexed.errors) > 0 || len(parsed.errors) > 0 {
+        return Result.Error(false)
+    }
+    ends := len(split(text.replace(source, "\r\n", "\n"), "\n"))
+    t := types.emptyTable()
+    mut Outlined[dyn] out = []
+    mut i := 0
+    for each d in parsed.module.decls {
+        mut last := ends
+        next := i + 1
+        if parsed.module.decls bounds next {
+            last = parsed.module.decls[next].at.line - 1
+        }
+        i = next
+        if d is ast.Decl.TypeDecl(name, fields, variants, at) {
+            mut Outlined[dyn] inside = []
+            for each f in fields {
+                append(inside, Outlined(f.name, written(f.declared), Kind.Field(), f.at.line, f.at.col, f.at.line, []))
+            }
+            for each v in variants {
+                append(inside, Outlined(v.name, "", Kind.Variant(), v.at.line, v.at.col, v.at.line, []))
+            }
+            append(out, Outlined(name, "type", Kind.TypeName(), at.line, at.col, last, inside))
+        } else if d is ast.Decl.CallableDecl(kind, name, params, result, _, at) {
+            mut word := "proc"
+            if kind is ast.CallableKind.FuncKind {
+                word = "func"
+            }
+            append(out, Outlined(name, word + signature(t, params, result), Kind.Callable(), at.line, at.col, last, []))
+        } else if d is ast.Decl.QueryDecl(name, params, result, _, at) {
+            append(out, Outlined(name, "query" + signature(t, params, result), Kind.Callable(), at.line, at.col, last, []))
+        } else if d is ast.Decl.TestDecl(title, _, at) {
+            append(out, Outlined(title, "test", Kind.Callable(), at.line, at.col, last, []))
+        }
+    }
+    return Result.Ok(out)
+}

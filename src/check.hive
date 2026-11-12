@@ -48,11 +48,17 @@ type Check {
     // Whether the call walked stands as a statement, and what that statement has left to say.
     bare: Bool
     pending: diag.Diagnostic[dyn]
+    // The file an editor has open, or `""`, and what stands in it.
+    watching: Str
+    uses: infer.Use[dyn]
+    scopes: infer.Scope[dyn]
 }
 
 type Checked {
     errors: diag.Diagnostic[dyn]
     landings: infer.Landing[dyn]
+    uses: infer.Use[dyn]
+    scopes: infer.Scope[dyn]
 }
 
 proc checkModule(m: ast.Module): diag.Diagnostic[dyn] {
@@ -60,15 +66,47 @@ proc checkModule(m: ast.Module): diag.Diagnostic[dyn] {
 }
 
 proc checkProgram(m: ast.Module): Checked {
+    return checkWatching(m, "")
+}
+
+proc checkWatching(m: ast.Module, file: Str): Checked {
     t := types.tableOf(m)
-    mut Check c = Check([], "", token.nowhere(), false, types.Ty.TVoid(), false, 0, [], [], 0, false, [], [], false, [])
+    mut Check c = Check([], "", token.nowhere(), false, types.Ty.TVoid(), false, 0, [], [], 0, false, [], [], false, [], file, [], [])
     env := infer.newEnv(t)
     checkTestTitles(c, m)
     for each d in m.decls {
         checkDecl(c, env, d)
         settleMaps(c)
     }
-    return Checked(c.errors, c.landings)
+    return Checked(c.errors, c.landings, c.uses, c.scopes)
+}
+
+proc see(c: mut Check, env: infer.Env, e: ast.Expr): void {
+    if e is ast.Expr.Ident(name, at) {
+        append(c.uses, infer.Use(at, c.inside, name, "", types.Ty.TUnknown(), infer.typeOf(env, e), infer.isBound(env, name), false))
+    } else if e is ast.Expr.Member(subject, field, at) {
+        append(c.uses, infer.Use(at, c.inside, field, pathOf(env, subject), infer.typeOf(env, subject), infer.typeOf(env, e), false, true))
+    } else if e is ast.Expr.Call(callee, _, _) {
+        if callee is ast.Expr.Ident(_, _) || callee is ast.Expr.Member(_, _, _) {
+            see(c, env, callee)
+        }
+    }
+}
+
+func pathOf(env: infer.Env, subject: ast.Expr): Str {
+    if subject is ast.Expr.Ident(name, _) {
+        if infer.isBound(env, name) {
+            return ""
+        }
+        return name
+    }
+    if subject is ast.Expr.Member(inner, field, _) {
+        head := pathOf(env, inner)
+        if head == "hive" || text.startsWith(head, "hive.") {
+            return head + "." + field
+        }
+    }
+    return ""
 }
 
 // An empty map nothing gave a type to is one nothing could be built for.
@@ -950,7 +988,15 @@ proc checkStmt(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
     before := len(c.errors)
     held := c.pending
     c.pending = []
+    watched := c.watching != "" && s.at.file == c.watching
+    slot := len(c.scopes)
+    if watched {
+        append(c.scopes, infer.Scope(s.at, c.inside, env.names, env.names))
+    }
     after := checkWrittenStmt(c, env, s)
+    if watched && c.scopes bounds slot {
+        c.scopes[slot] = infer.Scope(s.at, c.inside, env.names, after.names)
+    }
     if len(c.errors) == before {
         for each left in c.pending {
             append(c.errors, left)
@@ -1468,6 +1514,9 @@ proc checkExpr(c: mut Check, env: infer.Env, e: ast.Expr): void {
     }
     outer := c.at
     c.at = e.at
+    if c.watching != "" && e.at.file == c.watching {
+        see(c, env, e)
+    }
     if (e is ast.Expr.Call(_, _, _)) == false {
         c.bare = false
     }
@@ -1589,19 +1638,21 @@ proc checkIndexable(c: mut Check, env: infer.Env, subject: ast.Expr): void {
 }
 
 proc checkName(c: mut Check, env: infer.Env, name: Str): void {
-    if name == "_" || name == "hive" {
+    if name == "_" {
         return
     }
     if infer.isBound(env, name) {
         return
     }
+    if name == "hive" {
+        report(c, "`hive` is the standard library, and it is not a value: what it has is reached through it, as `hive.<module>.<name>`")
+        return
+    }
     if types.findCallable(env.table, name) is Result.Ok(_) {
         return
     }
-    if types.findType(env.table, name) is Result.Ok(_) {
-        return
-    }
-    if name == "Result" {
+    if types.findType(env.table, name) is Result.Ok(_) || name == "Result" {
+        report(c, "`" + types.shownName(name) + "` is a type, and a type is not a value")
         return
     }
     // A builtin is a name a *call* reaches, never a value. Several are overloaded
@@ -1622,10 +1673,19 @@ proc checkMember(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str): v
         if head == "hive" {
             if infer.isBuiltin(field) {
                 report(c, "`hive.{field}` is a builtin, so it cannot be used as a value: several builtins are overloaded, and which one a reference means is decided by the argument types a value does not carry. Call it, or wrap it in a `func` of your own")
+            } else if stdlib.isKnownModule(field) {
+                report(c, "`hive.{field}` is a module, and a module is not a value: what it has is reached through it, as `hive.{field}.<name>`")
+            } else {
+                report(c, "this compiler does not carry `hive.{field}`")
             }
             return
         }
         if head == "Result" {
+            if field == "Ok" || field == "Error" {
+                report(c, "`Result.{field}` is a variant of `Result`, and a variant is a value only once it is built: `Result.{field}(...)` builds one. Nor is a constructor a bare reference — `Result.{field}(_)` is the spelling that is a function value")
+            } else {
+                report(c, "`Result` has two variants, `Ok` and `Error`, and `{field}` is neither")
+            }
             return
         }
         if types.findType(env.table, head) is Result.Ok(_) {
@@ -1636,9 +1696,18 @@ proc checkMember(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str): v
     if subject is ast.Expr.Member(root, module, _) {
         if root is ast.Expr.Ident(hiveName, _) {
             if hiveName == "hive" {
-                if stdlib.isKnownModule(module) && stdlib.hasName(env.table, module, field) && stdlib.isLibType(env.table, module, field) == false {
-                    report(c, "`hive.{module}.{field}` is a library call, and a library call cannot be used as a value. Wrap it in a `func` of your own, and use that")
+                wrong := libraryValue(env.table, module, field)
+                if wrong == "" {
+                    report(c, "`hive.{module}.{field}` is a type, and a type is not a value")
+                } else {
+                    report(c, wrong)
                 }
+                return
+            }
+        }
+        if root is ast.Expr.Member(head, libModule, _) {
+            if head is ast.Expr.Ident(rootName, _) && rootName == "hive" {
+                checkLibraryMember(c, env, libModule, module, field)
                 return
             }
         }
@@ -1653,6 +1722,37 @@ proc checkMember(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str): v
         }
     } else if hasNoFields(ty) {
         report(c, "`" + types.show(ty) + "` has no field `{field}`" + shadowedModule(subject))
+    }
+}
+
+// What is wrong with `hive.<module>.<name>` where a value was wanted, or `""` for a type.
+func libraryValue(t: types.Table, module: Str, name: Str): Str {
+    if stdlib.isKnownModule(module) == false {
+        return "this compiler does not carry `hive.{module}`"
+    }
+    if stdlib.hasName(t, module, name) == false {
+        return "`hive.{module}` has no `{name}`"
+    }
+    if stdlib.isLibType(t, module, name) == false {
+        return "`hive.{module}.{name}` is a library call, and a library call cannot be used as a value. Wrap it in a `func` of your own, and use that"
+    }
+    return ""
+}
+
+proc checkLibraryMember(c: mut Check, env: infer.Env, module: Str, typeName: Str, field: Str): void {
+    wrong := libraryValue(env.table, module, typeName)
+    if wrong != "" {
+        report(c, wrong)
+        return
+    }
+    shown := "hive.{module}.{typeName}"
+    variants := stdlib.variantsOf(env.table, module, typeName)
+    if indexOf(variants, field) is Result.Ok(_) {
+        report(c, "`{shown}.{field}` is a variant of `{shown}`, and a variant is a value only once it is built: write `{shown}.{field}()`. One that carries nothing is still built by calling it")
+    } else if len(variants) > 0 {
+        report(c, "`{shown}` has no variant `{field}`. Its variants are " + join(variants, ", "))
+    } else {
+        report(c, "`{shown}` has no `{field}`")
     }
 }
 
@@ -1715,13 +1815,16 @@ func variantOnly(t: types.Table, typeName: Str, field: Str): Str {
 // call a variant carrying fields is built by — so the name on its own is the
 // variant rather than a value of it, and Go has nothing to make of it.
 proc checkVariantValue(c: mut Check, env: infer.Env, head: Str, field: Str): void {
+    shown := types.shownName(head)
     if types.findVariant(env.table, head, field) is Result.Ok(fields) {
         if len(fields) == 0 {
-            report(c, "`{head}.{field}` is a variant of `{head}`, and a variant is a value only once it is built: write `{head}.{field}()`. One that carries nothing is still built by calling it")
+            report(c, "`{shown}.{field}` is a variant of `{shown}`, and a variant is a value only once it is built: write `{shown}.{field}()`. One that carries nothing is still built by calling it")
             return
         }
-        report(c, "`{head}.{field}` is a variant of `{head}`, and a variant is a value only once it is built: `{head}.{field}(...)` builds one. Nor is a constructor a bare reference — `{head}.{field}(_)` is the spelling that is a function value")
+        report(c, "`{shown}.{field}` is a variant of `{shown}`, and a variant is a value only once it is built: `{shown}.{field}(...)` builds one. Nor is a constructor a bare reference — `{shown}.{field}(_)` is the spelling that is a function value")
+        return
     }
+    report(c, "`{shown}` has no variant `{field}`")
 }
 
 func hasField(t: types.Table, typeName: Str, field: Str): Bool {

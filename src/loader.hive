@@ -61,11 +61,18 @@ type Load {
     // written back at the end, so a build that fetched nothing leaves it alone.
     lock: fetch.Lock
     errors: diag.Diagnostic[dyn]
+    // Files an editor holds unsaved, by key, read instead of what is on disk.
+    held: hive.map.Map<Str, Str>
 }
 
 // Load the program rooted at `entry` and flatten it.
 proc load(entry: Str): Program {
-    walked := reach(entry)
+    mut hive.map.Map<Str, Str> nothing = hive.map.new()
+    return loadHeld(entry, nothing)
+}
+
+proc loadHeld(entry: Str, held: hive.map.Map<Str, Str>): Program {
+    walked := reachHeld(entry, held)
     if len(walked.errors) > 0 {
         return walked
     }
@@ -74,7 +81,12 @@ proc load(entry: Str): Program {
 
 // Every file the program rooted at `entry` reaches, walked but not flattened.
 proc reach(entry: Str): Program {
-    mut Load l = Load([], [], [], fetch.readLock(entry), [])
+    mut hive.map.Map<Str, Str> nothing = hive.map.new()
+    return reachHeld(entry, nothing)
+}
+
+proc reachHeld(entry: Str, held: hive.map.Map<Str, Str>): Program {
+    mut Load l = Load([], [], [], fetch.readLock(entry), [], held)
     loadFile(l, paths.normalise(entry), entry, token.Pos(entry, 0, 0))
     fetch.writeLock(l.lock)
     return Program(ast.Module([], [], [], ast.noLibrary()), l.sources, l.errors)
@@ -84,7 +96,8 @@ proc reach(entry: Str): Program {
 // test reaches for, needing no source on disk.
 proc loadText(name: Str, source: Str): Program {
     // A program held in memory has nowhere to keep a lock, and nothing to pin.
-    mut Load l = Load([], [], [], fetch.Lock("", [], [], false), [])
+    mut hive.map.Map<Str, Str> nothing = hive.map.new()
+    mut Load l = Load([], [], [], fetch.Lock("", [], [], false), [], nothing)
     key := paths.normalise(name)
     appendSource(l, key, name, source)
     if len(l.errors) > 0 {
@@ -109,6 +122,12 @@ proc loadFile(l: mut Load, key: Str, display: Str, asked: token.Pos): void {
     // of what it exports, which the Go toolchain reads, not this compiler.
     if text.endsWith(key, ".go") {
         appendForeign(l, key, display, asked)
+        return
+    }
+    if hive.map.get(l.held, key) is Result.Ok(source) {
+        append(l.stack, key)
+        appendSource(l, key, display, source)
+        popStack(l)
         return
     }
     read := hive.file.read(display)
@@ -307,7 +326,6 @@ func placed(program: Program, entry: Str, ds: diag.Diagnostic[]): diag.Diagnosti
     }
     return out
 }
-
 // What a module's declarations are renamed with. The entrypoint keeps its own
 // names, so `hive emit` shows an untouched `main` beside a `text_1_repeat`.
 func prefixFor(key: Str, index: Int, isEntry: Bool): Str {
@@ -1019,7 +1037,7 @@ proc rewritePattern(rw: mut Rw, p: ast.Pattern): ast.Pattern {
         return ast.Pattern.BitsPat(out, rest)
     } else if p is ast.Pattern.StrTemplate(parts) {
         for each part in parts {
-            if part is token.StrPart.Code(source) {
+            if part is token.StrPart.Code(source, _, _) {
                 bindLocal(rw, text.trim(source))
             } else if part is token.StrPart.Hole(name, _) {
                 bindLocal(rw, name)

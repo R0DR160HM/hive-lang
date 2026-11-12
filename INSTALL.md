@@ -69,6 +69,18 @@ release's `SHA256SUMS`. It reaches back to v0.3.3, the first release with
 If `run` says `go` is not on the `PATH`, the compiler is installed and Go is not:
 [go.dev/dl](https://go.dev/dl/) has it.
 
+## In an editor
+
+`hive lsp` is a language server: errors as you type, what a name is, where it was
+declared, and what could come next. Any editor that speaks the Language Server
+Protocol runs it as `hive lsp`, for files ending in `.hive`. In Neovim 0.11 or later:
+
+```lua
+vim.filetype.add({ extension = { hive = 'hive' } })
+vim.lsp.config('hive', { cmd = { 'hive', 'lsp' }, filetypes = { 'hive' } })
+vim.lsp.enable('hive')
+```
+
 ## What it reads and writes
 
 | variable | effect |

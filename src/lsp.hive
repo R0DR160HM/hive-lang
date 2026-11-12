@@ -1,0 +1,524 @@
+// The language server
+// ===================
+// `hive lsp`: an editor's questions arrive as JSON-RPC on standard input, are put
+// to `editor.hive`, and the answers go back on standard output. Nothing else may
+// be written there, which is why no pass run from here is handed a clock.
+import ./diag
+import ./editor
+import ./indent
+import ./lexer
+import ./paths
+import ./text
+import ./token
+import ./version
+import ./wire.go
+import hive.file
+import hive.json
+import hive.map
+
+type Server {
+    // Every open file as the editor holds it, by path, and the address it knows each by.
+    held: hive.map.Map<Str, Str>
+    links: hive.map.Map<Str, Str>
+    // The open files nothing has been said about since they changed.
+    stale: Str[dyn]
+    // Files that are not open and were last reported as having something wrong.
+    blamed: Str[dyn]
+    reading: editor.Reading
+    // The last reading that loaded, which is what completion falls back on mid-edit.
+    good: editor.Reading
+    // Each file's outline as it was when the file last parsed, as the JSON sent.
+    outlines: hive.map.Map<Str, Str>
+    stopped: Bool
+}
+
+// --- What arrives --------------------------------------------------------------
+
+type Head {
+    method: Str -- Default as "";
+}
+
+type IntId {
+    id: Int
+}
+
+type StrId {
+    id: Str
+}
+
+type TextDocument {
+    uri: Str
+    text: Str -- Default as "";
+}
+
+type Position {
+    line: Int
+    character: Int
+}
+
+type Change {
+    text: Str
+}
+
+type DocParams {
+    textDocument: TextDocument
+}
+
+type DocMessage {
+    params: DocParams
+}
+
+type ChangeParams {
+    textDocument: TextDocument
+    contentChanges: Change[dyn]
+}
+
+type ChangeMessage {
+    params: ChangeParams
+}
+
+type PlaceParams {
+    textDocument: TextDocument
+    position: Position
+}
+
+type PlaceMessage {
+    params: PlaceParams
+}
+
+// --- What is sent --------------------------------------------------------------
+
+type Span {
+    start: Position
+    end: Position
+}
+
+type Problem {
+    range: Span
+    severity: Int
+    source: Str
+    message: Str
+}
+
+type Problems {
+    uri: Str
+    diagnostics: Problem[dyn]
+}
+
+type Location {
+    uri: Str
+    range: Span
+}
+
+type Markup {
+    kind: Str
+    value: Str
+}
+
+type Hover {
+    contents: Markup
+}
+
+type Item {
+    label: Str
+    kind: Int
+    detail: Str
+}
+
+type Symbol {
+    name: Str
+    detail: Str
+    kind: Int
+    range: Span
+    selectionRange: Span
+    children: Symbol[dyn]
+}
+
+type Edit {
+    range: Span
+    newText: Str
+}
+
+func reply(id: Str, result: Str): Str {
+    return `\{"jsonrpc":"2.0","id":{id},"result":{result}}`
+}
+
+func notice(method: Str, params: Str): Str {
+    return `\{"jsonrpc":"2.0","method":"{method}","params":{params}}`
+}
+
+func capabilities(): Str {
+    return `\{"capabilities":\{"positionEncoding":"utf-16","textDocumentSync":\{"openClose":true,"change":1,"save":true},"hoverProvider":true,"definitionProvider":true,"documentSymbolProvider":true,"documentFormattingProvider":true,"completionProvider":\{"triggerCharacters":["."]}},"serverInfo":\{"name":"hive","version":"{version.current()}"}}`
+}
+
+// --- The loop ------------------------------------------------------------------
+
+proc start(): Server {
+    mut hive.map.Map<Str, Str> held = hive.map.new()
+    mut hive.map.Map<Str, Str> links = hive.map.new()
+    mut hive.map.Map<Str, Str> outlines = hive.map.new()
+    return Server(held, links, [], [], editor.unread(""), editor.unread(""), outlines, false)
+}
+
+proc serve(): void {
+    mut Server s = start()
+    mut going := true
+    for ; going; {
+        // A file is read once the typing pauses, not once a keystroke.
+        mut wait := -1
+        if len(s.stale) > 0 {
+            wait = 200
+        }
+        got := wire.read(wait)
+        if got is Result.Error(_) {
+            going = false
+        } else if got is Result.Ok(body) {
+            mut Str[dyn] out = []
+            if body == "" {
+                settle(s, out)
+            } else {
+                handle(s, body, out)
+            }
+            for each message in out {
+                wire.write(message)
+            }
+            if s.stopped {
+                going = false
+            }
+        }
+    }
+}
+
+// The answers are collected rather than written, so a test can read them.
+proc handle(s: mut Server, body: Str, out: mut Str[dyn]): void {
+    mut method := ""
+    if Head.decode(body, hive.json.codec()) is Result.Ok(head) {
+        method = head.method
+    }
+    id := idOf(body)
+    if method == "initialize" {
+        append(out, reply(id, capabilities()))
+    } else if method == "shutdown" {
+        append(out, reply(id, "null"))
+    } else if method == "exit" {
+        s.stopped = true
+    } else if method == "textDocument/didOpen" {
+        if DocMessage.decode(body, hive.json.codec()) is Result.Ok(m) {
+            hold(s, m.params.textDocument.uri, m.params.textDocument.text)
+        }
+    } else if method == "textDocument/didChange" {
+        if ChangeMessage.decode(body, hive.json.codec()) is Result.Ok(m) {
+            for each change in m.params.contentChanges {
+                hold(s, m.params.textDocument.uri, change.text)
+            }
+        }
+    } else if method == "textDocument/didSave" {
+        // What was saved is what every other open file imports from now on.
+        for each path in hive.map.keys(s.held) {
+            if indexOf(s.stale, path) is Result.Error(_) {
+                append(s.stale, path)
+            }
+        }
+    } else if method == "textDocument/didClose" {
+        if DocMessage.decode(body, hive.json.codec()) is Result.Ok(m) {
+            close(s, m.params.textDocument.uri, out)
+        }
+    } else if method == "textDocument/hover" {
+        append(out, reply(id, hover(s, body, out)))
+    } else if method == "textDocument/definition" {
+        append(out, reply(id, definition(s, body, out)))
+    } else if method == "textDocument/completion" {
+        append(out, reply(id, completion(s, body)))
+    } else if method == "textDocument/documentSymbol" {
+        append(out, reply(id, symbols(s, body)))
+    } else if method == "textDocument/formatting" {
+        append(out, reply(id, formatting(s, body)))
+    } else if id != "" && method != "" {
+        // A request nobody answers leaves its asker waiting.
+        said := encode("hive lsp does not answer " + method, hive.json.codec())
+        append(out, `\{"jsonrpc":"2.0","id":{id},"error":\{"code":-32601,"message":{said}}}`)
+    }
+}
+
+// A request's id as the JSON it arrived as, or `""` for a notification.
+func idOf(body: Str): Str {
+    if IntId.decode(body, hive.json.codec()) is Result.Ok(found) {
+        return "{found.id}"
+    }
+    if StrId.decode(body, hive.json.codec()) is Result.Ok(found) {
+        return encode(found.id, hive.json.codec())
+    }
+    return ""
+}
+
+func pathOf(uri: Str): Str {
+    return paths.normalise(wire.path(uri))
+}
+
+proc hold(s: mut Server, uri: Str, source: Str): void {
+    path := pathOf(uri)
+    hive.map.set(s.held, path, source)
+    hive.map.set(s.links, path, uri)
+    if indexOf(s.stale, path) is Result.Error(_) {
+        append(s.stale, path)
+    }
+}
+
+proc close(s: mut Server, uri: Str, out: mut Str[dyn]): void {
+    path := pathOf(uri)
+    hive.map.delete(s.held, path)
+    hive.map.delete(s.links, path)
+    hive.map.delete(s.outlines, path)
+    if indexOf(s.stale, path) is Result.Ok(at) {
+        drop(s.stale, at, at)
+    }
+    append(out, notice("textDocument/publishDiagnostics", encode(Problems(uri, []), hive.json.codec())))
+}
+
+// --- What is wrong -------------------------------------------------------------
+
+// One file a time, so a question asked meanwhile waits for one reading and not for all.
+proc settle(s: mut Server, out: mut Str[dyn]): void {
+    if s.stale bounds 0 {
+        path := s.stale[0]
+        drop(s.stale, 0, 0)
+        if hive.map.has(s.held, path) {
+            look(s, path, out)
+        }
+    }
+}
+
+proc look(s: mut Server, path: Str, out: mut Str[dyn]): void {
+    s.reading = editor.read(path, s.held)
+    if s.reading.loaded {
+        s.good = s.reading
+    }
+    publish(s, out)
+}
+
+// The reading `s.reading` holds is of `path` as it now stands.
+proc current(s: mut Server, path: Str, out: mut Str[dyn]): void {
+    if indexOf(s.stale, path) is Result.Ok(at) {
+        drop(s.stale, at, at)
+        look(s, path, out)
+    } else if s.reading.entry != path {
+        look(s, path, out)
+    }
+}
+
+// An open file is told about by its own reading, so only a closed one is spoken for here.
+proc publish(s: mut Server, out: mut Str[dyn]): void {
+    mut Str[dyn] files = [s.reading.entry]
+    for each e in s.reading.errors {
+        if indexOf(files, e.file) is Result.Error(_) && hive.map.has(s.held, e.file) == false {
+            append(files, e.file)
+        }
+    }
+    mut Str[dyn] blamed = []
+    for each file in files {
+        if file != s.reading.entry {
+            append(blamed, file)
+        }
+    }
+    for each old in s.blamed {
+        if indexOf(files, old) is Result.Error(_) && hive.map.has(s.held, old) == false {
+            append(files, old)
+        }
+    }
+    s.blamed = blamed
+    for each file in files {
+        lines := linesOf(s, file)
+        mut Problem[dyn] problems = []
+        for each e in s.reading.errors {
+            if e.file == file {
+                append(problems, problemOf(lines, e))
+            }
+        }
+        append(out, notice("textDocument/publishDiagnostics", encode(Problems(linkOf(s, file), problems), hive.json.codec())))
+    }
+}
+
+func problemOf(lines: Str[], d: diag.Diagnostic): Problem {
+    mut row := d.line - 1
+    if row < 0 {
+        row = 0
+    }
+    line := text.charAt(lines, row)
+    cs := text.chars(line)
+    mut first := d.col - 1
+    mut last := len(cs)
+    if d.col <= 0 {
+        first = text.leadingBlanks(line)
+    } else {
+        last = first
+        for ; lexer.isWordChar(text.charAt(cs, last)); {
+            last = last + 1
+        }
+        if last == first {
+            last = first + 1
+        }
+    }
+    return Problem(Span(Position(row, units(cs, first)), Position(row, units(cs, last))), 1, "hive", d.message)
+}
+
+// --- Places --------------------------------------------------------------------
+
+proc linesOf(s: mut Server, path: Str): Str[dyn] {
+    mut source := ""
+    if hive.map.get(s.held, path) is Result.Ok(found) {
+        source = found
+    } else if hive.file.read(path) is Result.Ok(found) {
+        source = found
+    }
+    return split(text.replace(source, "\r\n", "\n"), "\n")
+}
+
+proc linkOf(s: mut Server, path: Str): Str {
+    if hive.map.get(s.links, path) is Result.Ok(uri) {
+        return uri
+    }
+    return wire.link(path)
+}
+
+// An editor counts a line in UTF-16 units and the compiler in characters.
+func units(cs: Str[], index: Int): Int {
+    mut count := 0
+    for i := 0; i < index; i++ {
+        if bytes(text.charAt(cs, i)) == 4 {
+            count = count + 2
+        } else {
+            count = count + 1
+        }
+    }
+    return count
+}
+
+// The column, from 1, that a count of units reaches.
+func column(cs: Str[], character: Int): Int {
+    mut seen := 0
+    mut i := 0
+    for ; i < len(cs) && seen < character; i++ {
+        if bytes(text.charAt(cs, i)) == 4 {
+            seen = seen + 2
+        } else {
+            seen = seen + 1
+        }
+    }
+    return i + 1
+}
+
+func spanAt(lines: Str[], at: token.Pos): Span {
+    cs := text.chars(text.charAt(lines, at.line - 1))
+    point := Position(at.line - 1, units(cs, at.col - 1))
+    return Span(point, point)
+}
+
+// --- Questions -----------------------------------------------------------------
+
+proc hover(s: mut Server, body: Str, out: mut Str[dyn]): Str {
+    if PlaceMessage.decode(body, hive.json.codec()) is Result.Ok(m) {
+        found := described(s, m.params, out)
+        if found.shown != "" {
+            return encode(Hover(Markup("markdown", "```hive\n" + found.shown + "\n```")), hive.json.codec())
+        }
+    }
+    return "null"
+}
+
+proc definition(s: mut Server, body: Str, out: mut Str[dyn]): Str {
+    if PlaceMessage.decode(body, hive.json.codec()) is Result.Ok(m) {
+        found := described(s, m.params, out)
+        if found.at.line > 0 {
+            return encode(Location(linkOf(s, found.at.file), spanAt(linesOf(s, found.at.file), found.at)), hive.json.codec())
+        }
+    }
+    return "null"
+}
+
+proc described(s: mut Server, asked: PlaceParams, out: mut Str[dyn]): editor.Described {
+    path := pathOf(asked.textDocument.uri)
+    current(s, path, out)
+    lines := linesOf(s, path)
+    cs := text.chars(text.charAt(lines, asked.position.line))
+    return editor.describe(s.reading, join(lines, "\n"), asked.position.line + 1, column(cs, asked.position.character))
+}
+
+proc completion(s: mut Server, body: Str): Str {
+    mut Item[dyn] items = []
+    if PlaceMessage.decode(body, hive.json.codec()) is Result.Ok(m) {
+        path := pathOf(m.params.textDocument.uri)
+        cs := text.chars(text.charAt(linesOf(s, path), m.params.position.line))
+        mut last := s.good
+        if last.entry != path {
+            last = editor.unread(path)
+        }
+        for each o in editor.complete(path, s.held, last, m.params.position.line + 1, column(cs, m.params.position.character)) {
+            append(items, Item(o.label, itemKind(o.kind), o.detail))
+        }
+    }
+    return encode(items, hive.json.codec())
+}
+
+func itemKind(kind: editor.Kind): Int {
+    if kind is editor.Kind.Callable { return 3 }
+    if kind is editor.Kind.TypeName { return 22 }
+    if kind is editor.Kind.Variant { return 20 }
+    if kind is editor.Kind.Field { return 5 }
+    if kind is editor.Kind.Local { return 6 }
+    if kind is editor.Kind.Module { return 9 }
+    return 14
+}
+
+func symbolKind(kind: editor.Kind): Int {
+    if kind is editor.Kind.TypeName { return 23 }
+    if kind is editor.Kind.Variant { return 22 }
+    if kind is editor.Kind.Field { return 8 }
+    return 12
+}
+
+proc symbols(s: mut Server, body: Str): Str {
+    if DocMessage.decode(body, hive.json.codec()) is Result.Ok(m) {
+        path := pathOf(m.params.textDocument.uri)
+        lines := linesOf(s, path)
+        if editor.outline(path, join(lines, "\n")) is Result.Ok(outlined) {
+            mut Symbol[dyn] found = []
+            for each o in outlined {
+                append(found, symbolOf(lines, o))
+            }
+            hive.map.set(s.outlines, path, encode(found, hive.json.codec()))
+        }
+        if hive.map.get(s.outlines, path) is Result.Ok(last) {
+            return last
+        }
+    }
+    return "[]"
+}
+
+func symbolOf(lines: Str[], o: editor.Outlined): Symbol {
+    mut last := o.last
+    if last < o.line {
+        last = o.line
+    }
+    name := Position(o.line - 1, units(text.chars(text.charAt(lines, o.line - 1)), o.col - 1))
+    whole := Span(name, Position(last - 1, units(text.chars(text.charAt(lines, last - 1)), len(text.chars(text.charAt(lines, last - 1))))))
+    mut Symbol[dyn] children = []
+    for each child in o.children {
+        append(children, symbolOf(lines, child))
+    }
+    return Symbol(o.name, o.detail, symbolKind(o.kind), whole, Span(name, name), children)
+}
+
+proc formatting(s: mut Server, body: Str): Str {
+    mut Edit[dyn] edits = []
+    if DocMessage.decode(body, hive.json.codec()) is Result.Ok(m) {
+        path := pathOf(m.params.textDocument.uri)
+        if hive.map.get(s.held, path) is Result.Ok(source) {
+            if indent.indentSource(source) is Result.Ok(indented) {
+                if indented != source {
+                    append(edits, Edit(Span(Position(0, 0), Position(len(split(source, "\n")), 0)), indented))
+                }
+            }
+        }
+    }
+    return encode(edits, hive.json.codec())
+}

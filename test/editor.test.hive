@@ -1,0 +1,235 @@
+// Tests for `src/editor`.
+import ../src/editor
+import ../src/text
+import hive.map
+
+type Spot {
+    line: Int
+    col: Int
+}
+
+// Where `needle` first stands in `source`, or the place its `|` marks.
+func spot(source: Str, needle: Str): Spot {
+    halves := split(needle, "|")
+    mut skipped := 0
+    if len(halves) > 1 {
+        skipped = len(text.charAt(halves, 0))
+    }
+    mut line := 1
+    for each l in split(source, "\n") {
+        if indexOf(l, join(halves, "")) is Result.Ok(at) {
+            return Spot(line, at + skipped + 1)
+        }
+        line = line + 1
+    }
+    return Spot(0, 0)
+}
+
+proc files(main: Str, shapes: Str): hive.map.Map<Str, Str> {
+    mut hive.map.Map<Str, Str> held = hive.map.new()
+    hive.map.set(held, "main.hive", main)
+    if shapes != "" {
+        hive.map.set(held, "lib/shapes.hive", shapes)
+    }
+    return held
+}
+
+proc shown(source: Str, needle: Str): Str {
+    at := spot(source, needle)
+    return editor.describe(editor.read("main.hive", files(source, "")), source, at.line, at.col).shown
+}
+
+proc declaredAt(source: Str, needle: Str): Str {
+    at := spot(source, needle)
+    found := editor.describe(editor.read("main.hive", files(source, "")), source, at.line, at.col).at
+    return "{found.line}:{found.col}"
+}
+
+func shapes(): Str {
+    return "type Shape \{\n    name: Str\n    Point\n    Circle \{ radius: Float }\n}\n\nfunc area(width: Int, height: Int): Int \{\n    return width * height\n}\n"
+}
+
+proc offered(main: Str, needle: Str): Str {
+    at := spot(main, needle)
+    held := files(main, shapes())
+    mut Str[dyn] labels = []
+    for each o in editor.complete("main.hive", held, editor.unread("main.hive"), at.line, at.col + len(needle)) {
+        append(labels, o.label)
+    }
+    return join(labels, " ")
+}
+
+func player(): Str {
+    return "type Player \{\n    name: Str\n    score: Int\n}\n\nfunc describe(player: Player, bonus: Int): Str \{\n    total := player.score + bonus\n    return \"\{player.name}: \{total}\"\n}\n"
+}
+
+// --- What a name is --------------------------------------------------------------
+
+test "a local says what it holds" {
+    assert shown(player(), "total := ") == "total: Int"
+    assert shown(player(), "player.score") == "player: Player"
+}
+
+test "a field says what it holds, and is declared in its type" {
+    assert shown(player(), "score + bonus") == "score: Int"
+    assert declaredAt(player(), "score + bonus") == "3:5"
+}
+
+test "a call shows what it calls, and goes to it" {
+    source := player() + "proc main(): void \{\n    echo describe(Player(\"Ada\", 3), 1)\n}\n"
+    assert shown(source, "describe(Player") == "func describe(player: Player, bonus: Int): Str"
+    assert declaredAt(source, "describe(Player") == "6:1"
+    assert shown(source, "Player(\"Ada\"") == "type Player \{\n    name: Str\n    score: Int\n}"
+}
+
+test "a name inside a string is a name like any other" {
+    assert shown(player(), "total}") == "total: Int"
+    assert declaredAt(player(), "total}") == "7:5"
+    assert shown(player(), "name}") == "name: Str"
+}
+
+test "a local goes to whatever bound it: a parameter, a declaration, a pattern" {
+    assert declaredAt(player(), "+ |bonus") == "6:31"
+    source := "proc main(): void \{\n    if hive.conv.sti(\"3\") is Result.Ok(number) \{\n        echo number\n    }\n}\n"
+    assert declaredAt(source, "echo |number") == "2:40"
+    assert shown(source, "echo |number") == "number: Int"
+}
+
+test "two loops binding one name are two names" {
+    source := "proc main(): void \{\n    for each item in [1] \{\n        echo item\n    }\n    for each item in [\"a\"] \{\n        echo item + \"!\"\n    }\n}\n"
+    assert declaredAt(source, "item + ") == "5:14"
+    assert shown(source, "item + ") == "item: Str"
+}
+
+test "a library call shows what its stub declares" {
+    source := "proc main(): void \{\n    echo hive.term.exec(\"ls\", [], \".\")\n    echo conv.its(3)\n}\n"
+    assert shown(source, "exec(") == "func hive.term.exec(command: Str, arguments: Str[dyn], directory: Str): Result<Str, ExecError>"
+    assert shown(source, "its(3)") == "func hive.conv.its(v: Int): Str"
+}
+
+test "a type in a signature and a variant in a pattern are read without the checker" {
+    source := "type Shape \{\n    Point\n    Circle \{ radius: Float }\n}\n\nfunc isRound(shape: Shape): Bool \{\n    return shape is Shape.Circle(_)\n}\n"
+    assert text.startsWith(shown(source, "Shape): Bool"), "type Shape \{")
+    assert shown(source, "Circle(_)") == "Shape.Circle \{ radius: Float }"
+    assert declaredAt(source, "Circle(_)") == "3:5"
+}
+
+test "a name bound here says what it holds where it is bound" {
+    assert shown(player(), "bonus: Int") == "bonus: Int"
+    assert shown(player(), "total := ") == "total: Int"
+}
+
+test "what another file declares is reached through its import" {
+    main := "import ./lib/shapes\n\nproc main(): void \{\n    echo shapes.area(2, 3)\n    spot := shapes.Shape.Point(\"here\")\n    echo spot.name\n}\n"
+    held := files(main, shapes())
+    r := editor.read("main.hive", held)
+    assert len(r.errors) == 0
+    area := spot(main, "area(2")
+    found := editor.describe(r, main, area.line, area.col)
+    assert found.shown == "func shapes.area(width: Int, height: Int): Int"
+    assert found.at.file == "lib/shapes.hive"
+    assert found.at.line == 7
+    point := spot(main, "Point(")
+    assert editor.describe(r, main, point.line, point.col).shown == "shapes.Shape.Point"
+    name := spot(main, "spot.|name")
+    assert editor.describe(r, main, name.line, name.col).at.file == "lib/shapes.hive"
+}
+
+test "a generic shows what it was declared as, whichever copy is called" {
+    source := "func first(items: T[], fallback: T): T \{\n    for each item in items \{\n        return item\n    }\n    return fallback\n}\n\nproc main(): void \{\n    echo first([1], 0)\n}\n"
+    assert shown(source, "first([1]") == "func first(items: T[], fallback: T): T"
+    assert declaredAt(source, "first([1]") == "1:1"
+}
+
+// --- What is wrong ---------------------------------------------------------------
+
+test "a reading says what is wrong and where, and reads on past it" {
+    source := "proc main(): void \{\n    count := 3\n    echo count.size\n    echo nowhere\n}\n"
+    r := editor.read("main.hive", files(source, ""))
+    assert len(r.errors) == 2
+    for each e in r.errors {
+        assert e.file == "main.hive"
+    }
+    at := spot(source, "count.size")
+    assert editor.describe(r, source, at.line, at.col).shown == "count: Int"
+}
+
+test "what is wrong in an imported file is said against that file" {
+    main := "import ./lib/shapes\n\nproc main(): void \{\n    echo shapes.area(2, 3)\n}\n"
+    r := editor.read("main.hive", files(main, "func area(width: Int, height: Int): Int \{\n    return width * nowhere\n}\n"))
+    assert len(r.errors) == 1
+    for each e in r.errors {
+        assert e.file == "lib/shapes.hive"
+        assert e.line == 2
+    }
+}
+
+test "a file that does not parse still says so, and nothing more" {
+    r := editor.read("main.hive", files("proc main(): void \{\n    echo (\n}\n", ""))
+    assert r.loaded == false
+    assert len(r.errors) == 1
+}
+
+// --- What could be written -------------------------------------------------------
+
+test "after a value's dot come its fields" {
+    main := player() + "proc main(): void \{\n    ada := Player(\"Ada\", 3)\n    echo ada.\n}\n"
+    assert offered(main, "echo ada.") == "name score"
+}
+
+test "a line that does not close is completed from what was last in scope" {
+    main := player() + "proc main(): void \{\n    ada := Player(\"Ada\", 3)\n    echo len(ada.\n}\n"
+    at := spot(main, "len(ada.")
+    held := files(main, "")
+    good := editor.read("main.hive", files(player() + "proc main(): void \{\n    ada := Player(\"Ada\", 3)\n    echo 1\n}\n", ""))
+    mut Str[dyn] labels = []
+    for each o in editor.complete("main.hive", held, good, at.line, at.col + len("len(ada.")) {
+        append(labels, o.label)
+    }
+    assert join(labels, " ") == "name score"
+}
+
+test "after an import's dot comes what the file declares" {
+    main := "import ./lib/shapes\n\nproc main(): void \{\n    x := shapes.\n}\n"
+    assert offered(main, "shapes.") == "Shape area"
+    variants := "import ./lib/shapes\n\nproc main(): void \{\n    x := shapes.Shape.\n}\n"
+    assert offered(variants, "Shape.") == "Point Circle"
+}
+
+test "after the library's dot come its modules, and after a module's what it has" {
+    assert text.contains(offered("proc main(): void \{\n    hive.\n}\n", "hive."), "term")
+    inTerm := offered("proc main(): void \{\n    x := hive.term.\n}\n", "term.")
+    assert text.contains(inTerm, "exec")
+    assert text.contains(inTerm, "ExecError")
+    assert text.contains(offered("proc main(): void \{\n    x := term.\n}\n", "term."), "exec")
+    assert offered("proc main(): void \{\n    x := hive.sql.DatabaseDriver.\n}\n", "Driver.") == "SQLite PostgreSQL Other"
+}
+
+test "with no dot come the names in scope, the file's own, and the language's" {
+    main := player() + "proc main(): void \{\n    ada := Player(\"Ada\", 3)\n    echo \n}\n"
+    got := " " + offered(main, "echo ") + " "
+    assert text.contains(got, " ada ")
+    assert text.contains(got, " describe ")
+    assert text.contains(got, " Player ")
+    assert text.contains(got, " term ")
+    assert text.contains(got, " len ")
+    assert text.contains(got, " return ")
+    assert text.contains(got, " total ") == false
+}
+
+// --- What a file declares --------------------------------------------------------
+
+test "an outline is every declaration, with what a type holds inside it" {
+    mut Str[dyn] got = []
+    if editor.outline("main.hive", player() + "test \"it adds\" \{\n    assert 1 == 1\n}\n") is Result.Ok(outlined) {
+        for each o in outlined {
+            mut Str[dyn] inside = []
+            for each child in o.children {
+                append(inside, child.name)
+            }
+            append(got, "{o.name}@{o.line}-{o.last}[" + join(inside, ",") + "]")
+        }
+    }
+    assert join(got, " ") == "Player@1-5[name,score] describe@6-9[] it adds@10-13[]"
+    assert editor.outline("main.hive", "proc main(): void \{\n    echo (\n}\n") is Result.Error(_)
+}

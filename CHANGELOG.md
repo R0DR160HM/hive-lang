@@ -4,6 +4,9 @@
 
 ### Tooling
 
+* **`hive lsp` is a language server**: errors as a file is typed, hover, go to definition, completion, an outline, and reindenting.
+* **A name that is no value is refused where a value was wanted**: `hive.env.nope`, a module or a type on its own, and a variant nobody declared passed `hive check` and failed in Go.
+* **An error inside a string's `{...}` is reported at the expression**, where it was at the string.
 * **An error is reported on the line it is on**, from every pass: an index at the index, an argument at the argument, a field at the field — where it was the line of the declaration around it.
 * **`hive check` writes no Go**: it stops after the checks and the bounds pass.
 * **`hive analyze` no longer scores a program that does not compile**: five rejections that were the emitter's alone are the checker's.
