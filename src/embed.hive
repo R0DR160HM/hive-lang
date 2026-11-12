@@ -1,0 +1,63 @@
+// Embedding the runtime
+// =====================
+// `./bootstrap` runs this from `src/` before compiling the compiler: it writes
+// `embedded.hive`, untracked, holding every file under `runtime/` as a string.
+import ./gosource
+import ./text
+import hive.file
+
+proc main(): void {
+    mut Str[dyn] out = [
+        "// Written by ./bootstrap from runtime/, and not tracked: change the files there.",
+        "",
+        "func source(file: Str): Str \{"
+    ]
+    mut Str[dyn] carried = ["go.mod"]
+    module := hive.file.read("../runtime/go.mod")
+    if module is Result.Error(why) {
+        panic "cannot read ../runtime/go.mod: {why.message}"
+    }
+    if module is Result.Ok(written) {
+        append(out, held("go.mod", text.replace(written, "\r\n", "\n")))
+    }
+    listed := hive.file.list("../runtime/hive")
+    if listed is Result.Error(why) {
+        panic "cannot list ../runtime/hive: {why.message}"
+    }
+    if listed is Result.Ok(names) {
+        for each name in sort(names) {
+            stub := text.endsWith(name, ".hive")
+            if stub == false && text.endsWith(name, ".go") == false {
+                continue
+            }
+            read := hive.file.read("../runtime/hive/" + name)
+            if read is Result.Error(why) {
+                panic "cannot read {name}: {why.message}"
+            }
+            if read is Result.Ok(source) {
+                append(carried, name)
+                if stub {
+                    append(out, held(name, text.replace(source, "\r\n", "\n")))
+                } else {
+                    append(out, held(name, gosource.carried(source)))
+                }
+            }
+        }
+    }
+    append(out, "    return \"\"")
+    append(out, "}")
+    append(out, "")
+    append(out, "func names(): Str[dyn] \{")
+    append(out, "    return [\"" + join(carried, "\", \"") + "\"]")
+    append(out, "}")
+    append(out, "")
+    if hive.file.write("embedded.hive", join(out, "\n")) is Result.Error(why) {
+        panic "cannot write src/embedded.hive: {why.message}"
+    }
+}
+
+// A backtick string reads `\{` as an interpolation and cannot hold a backtick: `~BT~` stands for one.
+func held(name: Str, contents: Str): Str {
+    escaped := text.replace(text.replace(contents, "\{", "\\\{"), "`", "~BT~")
+    return "    if file == \"{name}\" \{\n        return `\n" + escaped + "\n`\n    }"
+}

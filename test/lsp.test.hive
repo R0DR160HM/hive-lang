@@ -1,0 +1,100 @@
+// Tests for `src/lsp`.
+import ../src/lsp
+import ../src/text
+import hive.json
+
+type Opened {
+    uri: Str
+    text: Str
+}
+
+type Changed {
+    text: Str
+}
+
+func opening(source: Str): Str {
+    held := encode(Opened("file:///work/main.hive", source), hive.json.codec())
+    return `\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":\{"textDocument":{held}}}`
+}
+
+func asking(id: Int, method: Str, line: Int, character: Int): Str {
+    return `\{"jsonrpc":"2.0","id":{id},"method":"textDocument/{method}","params":\{"textDocument":\{"uri":"file:///work/main.hive"},"position":\{"line":{line},"character":{character}}}}`
+}
+
+// Everything the server says to `messages`, with one pause after them.
+proc said(messages: Str[]): Str {
+    mut s := lsp.start()
+    mut Str[dyn] out = []
+    for each m in messages {
+        lsp.handle(s, m, out)
+    }
+    lsp.settle(s, out)
+    return join(out, "\n")
+}
+
+func program(): Str {
+    return "type Player \{\n    name: Str\n    score: Int\n}\n\nproc main(): void \{\n    ada := Player(\"Ada\", 3)\n    echo ada.score\n}\n"
+}
+
+test "a request is answered under the id it came with, whatever that is" {
+    assert text.startsWith(said([`\{"jsonrpc":"2.0","id":7,"method":"initialize","params":\{}}`]), `\{"jsonrpc":"2.0","id":7,"result":\{"capabilities":`)
+    assert text.startsWith(said([`\{"jsonrpc":"2.0","id":"a-1","method":"shutdown"}`]), `\{"jsonrpc":"2.0","id":"a-1","result":null}`)
+}
+
+test "a request nobody answers is refused, and a notice nobody reads is let pass" {
+    assert text.contains(said([`\{"jsonrpc":"2.0","id":2,"method":"textDocument/rename","params":\{}}`]), `"error":\{"code":-32601`)
+    assert said([`\{"jsonrpc":"2.0","method":"$/setTrace","params":\{"value":"off"}}`]) == ""
+}
+
+test "an opened file is read once the typing pauses" {
+    got := said([opening(program())])
+    assert got == `\{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":\{"uri":"file:///work/main.hive","diagnostics":[]}}`
+}
+
+test "what is wrong is said where it is, in the units an editor counts in" {
+    got := said([opening("proc main(): void \{\n    face := \"😀\"  echo nowhere\n}\n")])
+    assert text.contains(got, `"range":\{"start":\{"line":1,"character":23},"end":\{"line":1,"character":30}}`)
+    assert text.contains(got, "`nowhere` is not a name anything here declared")
+}
+
+test "a hover is Hive, and a definition is a place in a file" {
+    got := said([opening(program()), asking(1, "hover", 7, 14), asking(2, "definition", 7, 14), asking(3, "definition", 7, 9)])
+    assert text.contains(got, `\{"jsonrpc":"2.0","id":1,"result":\{"contents":\{"kind":"markdown","value":"` + "```hive\\nscore: Int\\n```" + `"}}}`)
+    assert text.contains(got, `\{"jsonrpc":"2.0","id":2,"result":\{"uri":"file:///work/main.hive","range":\{"start":\{"line":2,"character":4},"end":\{"line":2,"character":4}}}}`)
+    assert text.contains(got, `\{"jsonrpc":"2.0","id":3,"result":\{"uri":"file:///work/main.hive","range":\{"start":\{"line":6,"character":4},"end":\{"line":6,"character":4}}}}`)
+}
+
+test "a question about nothing is answered with nothing" {
+    assert text.contains(said([opening(program()), asking(1, "hover", 4, 0)]), `"id":1,"result":null`)
+}
+
+test "a completion is asked of the file as it stands, unfinished line and all" {
+    source := "type Player \{\n    name: Str\n    score: Int\n}\n\nproc main(): void \{\n    ada := Player(\"Ada\", 3)\n    echo ada.\n}\n"
+    got := said([opening(source), asking(1, "completion", 7, 13)])
+    assert text.contains(got, `"id":1,"result":[\{"label":"name","kind":5,"detail":"Str"},\{"label":"score","kind":5,"detail":"Int"}]`)
+}
+
+test "an outline and a reindenting are answered from the text alone" {
+    symbols := `\{"jsonrpc":"2.0","id":1,"method":"textDocument/documentSymbol","params":\{"textDocument":\{"uri":"file:///work/main.hive"}}}`
+    got := said([opening(program()), symbols])
+    assert text.contains(got, `"name":"Player","detail":"type","kind":23`)
+    assert text.contains(got, `"name":"main","detail":"proc(): void","kind":12`)
+    formatting := `\{"jsonrpc":"2.0","id":2,"method":"textDocument/formatting","params":\{"textDocument":\{"uri":"file:///work/main.hive"}}}`
+    assert text.contains(said([opening(program()), formatting]), `"id":2,"result":[]`)
+    tabbed := said([opening("proc main(): void \{\n\techo 1\n}\n"), formatting])
+    assert text.contains(tabbed, `"newText":"proc main(): void \{\n    echo 1\n}\n"`)
+}
+
+test "an outline is kept while what is being typed does not parse" {
+    symbols := `\{"jsonrpc":"2.0","id":1,"method":"textDocument/documentSymbol","params":\{"textDocument":\{"uri":"file:///work/main.hive"}}}`
+    typed := encode(Changed("proc main(): void \{\n    echo (\n}\n"), hive.json.codec())
+    change := `\{"jsonrpc":"2.0","method":"textDocument/didChange","params":\{"textDocument":\{"uri":"file:///work/main.hive"},"contentChanges":[{typed}]}}`
+    got := said([opening(program()), symbols, change, `\{"jsonrpc":"2.0","id":2,"method":"textDocument/documentSymbol","params":\{"textDocument":\{"uri":"file:///work/main.hive"}}}`])
+    assert text.contains(got, `"id":2,"result":[\{"name":"Player"`)
+}
+
+test "a closed file has nothing wrong with it any more" {
+    closing := `\{"jsonrpc":"2.0","method":"textDocument/didClose","params":\{"textDocument":\{"uri":"file:///work/main.hive"}}}`
+    got := said([opening("proc main(): void \{\n    echo nowhere\n}\n"), closing])
+    assert got == `\{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":\{"uri":"file:///work/main.hive","diagnostics":[]}}`
+}

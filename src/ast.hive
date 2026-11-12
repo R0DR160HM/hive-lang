@@ -9,6 +9,7 @@
 // Better than a parallel `Bool` beside every field, which can be read without it.
 import ./text
 import ./token
+import hive.map
 
 // --- Types -------------------------------------------------------------------
 
@@ -70,6 +71,8 @@ type Arg {
 }
 
 type Expr {
+    // The token that makes it what it is: a call's callee, `a.b`'s `b`, `a + b`'s `+`.
+    at: token.Pos
     IntLit { intValue: Int }
     FloatLit { floatValue: Float }
     StrLit { text: Str }
@@ -167,6 +170,7 @@ type Branch {
 }
 
 type Stmt {
+    at: token.Pos
     // `x := v` / `mut x := v`. `deferred` is `x := async f(v)`, whose wait
     // happens wherever `x` is read.
     VarDecl { name: Str, value: Expr, mutable: Bool, deferred: Bool }
@@ -180,7 +184,7 @@ type Stmt {
     IfChain { branches: Branch[dyn], otherwise: Block, hasElse: Bool }
     // `lets` binds the hidden names standing in for subjects that are not read in place.
     // `binds` is `P := x else { ... }`: the first arm is `P`, its body the rest of the block.
-    SwitchStmt { lets: Stmt[dyn], subjects: Expr[dyn], arms: Branch[dyn], line: Int, binds: Bool }
+    SwitchStmt { lets: Stmt[dyn], subjects: Expr[dyn], arms: Branch[dyn], binds: Bool }
     // `for init; cond; post { }`. Any clause may be `Stmt.Nothing` /
     // `Expr.Absent`, which is how a while loop is written.
     ForLoop { init: Stmt, cond: Expr, post: Stmt, body: Block }
@@ -209,6 +213,7 @@ type Param {
     declared: TypeExpr
     // `v: mut T` — the caller's own storage, which only a `proc` may ask for.
     mutable: Bool
+    at: token.Pos
 }
 
 // What a field's `--` annotations said, and what a field that carries none
@@ -231,7 +236,7 @@ type Marks {
 // A field annotated with nothing, which is every field written before there
 // was a way to annotate one.
 func unmarked(): Marks {
-    return Marks("", "", "", Expr.Absent())
+    return Marks("", "", "", absent())
 }
 
 // The command-line flag a field is read from and written as, without `--`.
@@ -264,11 +269,13 @@ type Field {
     name: Str
     declared: TypeExpr
     marks: Marks
+    at: token.Pos
 }
 
 type Variant {
     name: Str
     fields: Field[dyn]
+    at: token.Pos
 }
 
 type CallableKind {
@@ -277,11 +284,12 @@ type CallableKind {
 }
 
 type Decl {
+    at: token.Pos
     // `type T { ... }`. No variants is a struct; `fields` outside any variant
     // are added to every one of them.
-    TypeDecl { name: Str, fields: Field[dyn], variants: Variant[dyn], line: Int }
+    TypeDecl { name: Str, fields: Field[dyn], variants: Variant[dyn] }
     // A `proc` or a `func`.
-    CallableDecl { kind: CallableKind, name: Str, params: Param[dyn], result: TypeExpr, body: Block, line: Int }
+    CallableDecl { kind: CallableKind, name: Str, params: Param[dyn], result: TypeExpr, body: Block }
     // A function in an imported Go file, as the `func` Hive calls. Its signature
     // is read off the file by the Go toolchain and mapped onto Hive types, so
     // every call is checked like any other.
@@ -289,11 +297,11 @@ type Decl {
     // A `func` rather than a `proc` because the emitter's wrapper copies each
     // argument in and the answer out, and nothing across a copy can write to
     // storage the caller sees.
-    ForeignDecl { name: Str, params: Param[dyn], result: TypeExpr, packageName: Str, symbol: Str, goResults: Int, line: Int }
+    ForeignDecl { name: Str, params: Param[dyn], result: TypeExpr, packageName: Str, symbol: Str, goResults: Int }
     // A `query`, whose body is SQL and whose return type describes its rows.
-    QueryDecl { name: Str, params: Param[dyn], result: TypeExpr, sql: SqlPart[dyn], line: Int }
+    QueryDecl { name: Str, params: Param[dyn], result: TypeExpr, sql: SqlPart[dyn] }
     // `test "..." { }` — named in prose, taking nothing and returning nothing.
-    TestDecl { title: Str, body: Block, line: Int }
+    TestDecl { title: Str, body: Block }
 }
 
 // --- Query bodies ------------------------------------------------------------
@@ -329,7 +337,7 @@ type SqlItem {
 type ImportLine {
     path: Str
     alias: Str
-    line: Int
+    at: token.Pos
 }
 
 type Module {
@@ -338,6 +346,20 @@ type Module {
     // The Go files this program imports — nothing in one is Hive, so this is
     // only what the build needs to compile them beside the program.
     foreign: Foreign[dyn]
+    library: Library
+}
+
+// Every stub's declarations, a call and a type alike under `<module>.<name>`.
+type Library {
+    decls: Decl[dyn]
+    index: hive.map.Map<Str, Int>
+    // The stub each declaration came from, in the same order.
+    parts: Str[dyn]
+}
+
+proc noLibrary(): Library {
+    mut hive.map.Map<Str, Int> none = hive.map.new()
+    return Library([], none, [])
 }
 
 // One imported Go file: the package it declares, where it is, whether it needs
@@ -363,13 +385,12 @@ func declName(d: Decl): Str {
     return ""
 }
 
-func declLine(d: Decl): Int {
-    if d is Decl.TypeDecl(_, _, _, line) { return line }
-    else if d is Decl.CallableDecl(_, _, _, _, _, line) { return line }
-    else if d is Decl.QueryDecl(_, _, _, _, line) { return line }
-    else if d is Decl.ForeignDecl(_, _, _, _, _, _, line) { return line }
-    else if d is Decl.TestDecl(_, _, line) { return line }
-    return 0
+func absent(): Expr {
+    return Expr.Absent(token.nowhere())
+}
+
+func nothing(): Stmt {
+    return Stmt.Nothing(token.nowhere())
 }
 
 // A last arm of only `_` becomes the `else`.
@@ -385,22 +406,63 @@ func switchBlock(lets: Stmt[], arms: Branch[]): Block {
     last := len(tested) - 1
     if last > 0 && tested bounds last {
         final := tested[last]
-        if final.condition is Expr.BoolLit(true) {
+        if final.condition is Expr.BoolLit(true, _) {
             drop(tested, last, last)
-            append(out, Stmt.IfChain(tested, final.body, true))
+            append(out, Stmt.IfChain(tested, final.body, true, firstOf(tested)))
             return Block(out)
         }
     }
-    append(out, Stmt.IfChain(tested, Block([]), false))
+    append(out, Stmt.IfChain(tested, Block([]), false, firstOf(tested)))
     return Block(out)
+}
+
+func firstOf(arms: Branch[]): token.Pos {
+    for each arm in arms {
+        return arm.condition.at
+    }
+    return token.nowhere()
+}
+
+// Only `&&` splits a condition: a binding made on one side of `||` would not exist on the other.
+func conjuncts(e: Expr): Expr[dyn] {
+    if e is Expr.Binary(op, left, right, _) {
+        if op is BinOp.And {
+            return conjuncts(left) + conjuncts(right)
+        }
+    }
+    return [e]
+}
+
+func conjunctsBind(parts: Expr[]): Bool {
+    for each part in parts {
+        if part is Expr.IsMatch(_, pattern, _) {
+            if patternBinds(pattern) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// A template's hole always binds; elsewhere `_` takes a part and keeps nothing.
+func patternBinds(p: Pattern): Bool {
+    if p is Pattern.StrTemplate(_) {
+        return len(boundBy(p)) > 0
+    }
+    for each name in boundBy(p) {
+        if name != "" && name != "_" {
+            return true
+        }
+    }
+    return false
 }
 
 // The names a condition's matches bind, in the order they are written.
 func bindingsIn(e: Expr): Str[dyn] {
-    if e is Expr.IsMatch(_, pattern) {
+    if e is Expr.IsMatch(_, pattern, _) {
         return boundBy(pattern)
     }
-    if e is Expr.Binary(op, left, right) {
+    if e is Expr.Binary(op, left, right, _) {
         if op is BinOp.And {
             return bindingsIn(left) + bindingsIn(right)
         }
@@ -423,7 +485,7 @@ func boundBy(pattern: Pattern): Str[dyn] {
         append(out, rest)
     } else if pattern is Pattern.StrTemplate(parts) {
         for each part in parts {
-            if part is token.StrPart.Code(source) {
+            if part is token.StrPart.Code(source, _, _) {
                 append(out, text.trim(source))
             } else if part is token.StrPart.Hole(name, _) {
                 append(out, name)
@@ -481,7 +543,7 @@ func argFor(args: Arg[], name: Str, open: Int): Expr {
             seen = seen + 1
         }
     }
-    return Expr.Absent()
+    return absent()
 }
 
 func anyNamed(args: Arg[]): Bool {
@@ -529,7 +591,7 @@ func positional(args: Arg[], params: Str[]): Arg[dyn] {
     }
     mut open := 0
     for each p in params {
-        mut found := Expr.Absent()
+        mut found := absent()
         mut claimed := false
         for each a in args {
             if a.name != "" && namesParam(p, a.name) {

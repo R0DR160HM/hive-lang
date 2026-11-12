@@ -13,6 +13,7 @@ import ./ast
 import ./check as checks
 import ./diag
 import ./icon
+import ./infer
 import ./emit
 import ./loader
 import ./mono
@@ -126,6 +127,7 @@ type Compiled {
     sources: loader.Source[dyn]
     // Before generics were expanded, which drops a generic nothing calls.
     loaded: ast.Module
+    landings: infer.Landing[dyn]
 }
 
 // `from` is when the command started; every line of progress counts from it.
@@ -135,11 +137,11 @@ proc passes(entry: Str, from: Int): Compiled {
         return made
     }
     progress.step(from, "emitting Go")
-    emitted := emit.emitModule(made.module)
+    emitted := emit.emitChecked(made.module, made.landings)
     if len(emitted.errors) > 0 {
         return refused(loader.placed(loader.Program(made.module, made.sources, []), entry, emitted.errors))
     }
-    return Compiled(made.module, emitted, [], made.sources, made.loaded)
+    return Compiled(made.module, emitted, [], made.sources, made.loaded, made.landings)
 }
 
 // Everything up to the emitter and no further. Split out because `hive analyze`
@@ -158,9 +160,9 @@ proc checked(entry: Str, from: Int): Compiled {
         return refused(loader.placed(program, entry, expanded.errors))
     }
     progress.step(from, "checking " + progress.counted(len(expanded.module.decls), "declaration"))
-    found := checks.checkModule(expanded.module)
-    if len(found) > 0 {
-        return refused(loader.placed(program, entry, found))
+    found := checks.checkProgram(expanded.module)
+    if len(found.errors) > 0 {
+        return refused(loader.placed(program, entry, found.errors))
     }
     // Every index and slice is proved in range before anything is written, so
     // the Go that comes out can never fail out of one.
@@ -169,11 +171,11 @@ proc checked(entry: Str, from: Int): Compiled {
     if len(inRange) > 0 {
         return refused(loader.placed(program, entry, inRange))
     }
-    return Compiled(expanded.module, emit.Emitted("", [], [], [], [], false, []), [], program.sources, program.module)
+    return Compiled(expanded.module, emit.Emitted("", [], [], [], [], false, []), [], program.sources, program.module, found.landings)
 }
 
 func refused(errors: diag.Diagnostic[dyn]): Compiled {
-    return Compiled(ast.Module([], [], []), emit.Emitted("", [], [], [], [], false, []), errors, [], ast.Module([], [], []))
+    return Compiled(ast.Module([], [], [], ast.noLibrary()), emit.Emitted("", [], [], [], [], false, []), errors, [], ast.Module([], [], [], ast.noLibrary()), [])
 }
 
 // Compile `entry` and write the Go project for it, with the tests titled in `titles`.
@@ -187,7 +189,7 @@ proc build(entry: Str, titles: Str[], from: Int): Written {
     mut Str[dyn] modules = emitted.modules
     mut tests := ""
     if len(titles) > 0 {
-        testing := emit.emitTests(onlyTests(made.module, titles), emitted.atoms, emitted.codecs, emitted.modules)
+        testing := emit.emitCheckedTests(onlyTests(made.module, titles), emitted.atoms, emitted.codecs, emitted.modules, made.landings)
         if len(testing.errors) > 0 {
             return Written("", [], false, false, loader.placed(loader.Program(made.module, made.sources, []), entry, testing.errors))
         }
@@ -286,7 +288,7 @@ func onlyTests(module: ast.Module, titles: Str[]): ast.Module {
         }
         append(kept, d)
     }
-    return ast.Module(module.imports, kept, module.foreign)
+    return ast.Module(module.imports, kept, module.foreign, module.library)
 }
 
 // Whether any imported Go file imports something the toolchain has to fetch.
@@ -902,11 +904,11 @@ func byEntry(a: Planned, b: Planned): Bool {
     return a.entry < b.entry
 }
 
-// Run every pass and build nothing, which is what an editor wants on every
-// save. Unlike a build it asks for no entrypoint: a file holding only tests or
-// only declarations is a perfectly good file.
+// Run every pass that can refuse a program and build nothing, which is what an
+// editor wants on every save. Unlike a build it asks for no entrypoint: a file
+// holding only tests or only declarations is a perfectly good file.
 proc check(entry: Str, from: Int): diag.Diagnostic[dyn] {
-    return passes(entry, from).errors
+    return checked(entry, from).errors
 }
 
 // --- Analysing rather than building -------------------------------------------

@@ -14,8 +14,9 @@
 //
 // Four things happen, and only the first overwrites anything:
 //
-//   .hivedocs/     every page this compiler carries, rewritten. Anything else in
-//                  there is left alone.
+//   .hivedocs/     every page this compiler carries, rewritten, and a Claude Code
+//                  plugin that starts `hive lsp`. Anything else in there is left
+//                  alone.
 //   AGENTS.md      created if absent; otherwise the pointer is appended.
 //   .gitignore     `.hivedocs/` added, if there is one and it lacks it.
 //   CLAUDE.md      `@AGENTS.md` put on the front, if there is one and it lacks it.
@@ -47,11 +48,18 @@ type Written {
 // with what happened.
 proc write(): Result<Written, diag.Diagnostic[dyn]> {
     all := everyPage()
-    if made(all) is Result.Error(why) {
+    mut page.Page[dyn] files = []
+    for each one in all {
+        append(files, one)
+    }
+    for each one in plugin() {
+        append(files, one)
+    }
+    if made(files) is Result.Error(why) {
         return Result.Error([why])
     }
     mut diag.Diagnostic[dyn] failed = []
-    for each one in all {
+    for each one in files {
         path := paths.joinPath(directory(), one.path)
         if hive.file.write(path, one.body) is Result.Error(why) {
             append(failed, diag.about(path, "cannot write `{path}`: {why.message}"))
@@ -60,7 +68,7 @@ proc write(): Result<Written, diag.Diagnostic[dyn]> {
     if len(failed) > 0 {
         return Result.Error(failed)
     }
-    mut Str[dyn] notes = []
+    mut Str[dyn] notes = ["Wrote a Claude Code plugin to {pluginDirectory()}/, which starts `hive lsp`"]
     if pointed(notes) is Result.Error(why) {
         return Result.Error([why])
     }
@@ -92,6 +100,33 @@ func everyPage(): page.Page[dyn] {
 // Where the pages go, relative to wherever the command was run.
 func directory(): Str {
     return ".hivedocs"
+}
+
+func pluginDirectory(): Str {
+    return paths.joinPath(directory(), "plugin")
+}
+
+// Claude Code takes a language server from a plugin and nowhere else, so an agent told
+// to use `hive lsp` needs one to exist. Every key is one its schema names: it refuses
+// a file holding any other.
+func plugin(): page.Page[dyn] {
+    release := text.replace(version.current(), "v", "")
+    return [
+        page.Page("plugin/.lsp.json", `\{
+  "hive": \{
+    "command": "hive",
+    "args": ["lsp"],
+    "extensionToLanguage": \{ ".hive": "hive" }
+  }
+}
+`),
+        page.Page("plugin/.claude-plugin/plugin.json", `\{
+  "name": "hive-lsp",
+  "description": "The Hive language server: what a name is, where it was declared, what a file declares, and what is wrong after each edit.",
+  "version": "{release}"
+}
+`)
+    ]
 }
 
 // The directories the pages need, made before any of them is written:
@@ -197,10 +232,19 @@ func agentsFile(): Str {
         The entrypoint is the file holding ~BT~proc main(): void~BT~, and a program is that
         file plus everything it imports.
 
-        **~BT~hive check~BT~ is the one to run after an edit**: it runs every compiler pass,
-        stops before the Go toolchain, and writes nothing beside the file.
+        **~BT~hive check~BT~ is the one to run after an edit**: it runs every check,
+        stops before any Go is written, and writes nothing beside the file.
         **~BT~hive test~BT~ exits non-zero when any test fails**, and reports coverage
         without being asked.
+
+        ## The language server
+
+        ~BT~hive lsp~BT~ is the compiler as a language server. **If you have a
+        language-server tool, ask it before reading a file to find something out**: hover
+        a name for its type or its signature, go to its definition, list what a file
+        declares. It also says what is wrong with a file after each edit.
+        [~BT~.hivedocs/lsp.md~BT~](.hivedocs/lsp.md) has what it answers and how to connect it;
+        for Claude Code that is ~BT~claude --plugin-dir .hivedocs/plugin~BT~.
 
         ## Keeping the pages current
 
@@ -229,6 +273,10 @@ func pointer(): Str {
         [~BT~.hivedocs/pitfalls.md~BT~](.hivedocs/pitfalls.md) lists the mistakes that do
         not compile. ~BT~hive check <entrypoint.hive>~BT~ is what says whether they were
         avoided.
+
+        ~BT~hive lsp~BT~ is the compiler as a language server: with a language-server tool,
+        hover a name and go to its definition rather than reading files to find out.
+        [~BT~.hivedocs/lsp.md~BT~](.hivedocs/lsp.md) says how to connect it.
 
         The directory is written by ~BT~hive agents~BT~, out of the compiler that ran it —
         run that again if it is missing or ~BT~hive~BT~ has been upgraded.

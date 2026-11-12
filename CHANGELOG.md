@@ -2,8 +2,22 @@
 
 ## v0.3.6
 
-### Fixes
+### Tooling
 
+* **`hive lsp` is a language server**: errors as a file is typed, hover, go to definition, completion, an outline, and reindenting.
+* **[LSP.md](LSP.md) sets it up in Neovim and VS Code**, the second through the extension in `editors/vscode`.
+* **`hive agents` sends a coding agent to the language server**: a page on what to ask it, and a Claude Code plugin in `.hivedocs/plugin` that starts it.
+* **A name that is no value is refused where a value was wanted**: `hive.env.nope`, a module or a type on its own, and a variant nobody declared passed `hive check` and failed in Go.
+* **An error inside a string's `{...}` is reported at the expression**, where it was at the string.
+* **An error is reported on the line it is on**, from every pass: an index at the index, an argument at the argument, a field at the field — where it was the line of the declaration around it.
+* **`hive check` writes no Go**: it stops after the checks and the bounds pass.
+* **`hive analyze` no longer scores a program that does not compile**: five rejections that were the emitter's alone are the checker's.
+* **The runtime is Go under `runtime/`**, with its comments, and `./bootstrap` puts it in the compiler; it was strings in the compiler's source.
+* **A module of the standard library is declared once**, in a stub beside its Go — `term.hive` beside `term.go` — where it was three tables in the compiler.
+* **A call added to the library and used by the compiler is one build**: `./bootstrap` has the compiler read the checkout's `runtime/`, which `HIVE_RUNTIME` names.
+* **`scene/build` downloads the engine of the latest release** where that was built from the same `scene/`, and `--force` compiles regardless.
+
+### Fixes
 * **A Linux window holding the mouse no longer looks round many times as far as the mouse moved**: X queues what the mouse did before the pointer is warped back to the centre, and every queued event was measured from the centre, so a burst counted its first move once, its second twice and so on; a move is now measured from the event before it.
 
 ## v0.3.5

@@ -19,6 +19,7 @@ import ./diag
 import ./infer
 import ./progress
 import ./text
+import ./token
 import ./types
 
 // A program with every generic resolved away.
@@ -49,9 +50,7 @@ type Mono {
     wantedFlat: Str[dyn]
     // How far down `wanted` the worklist has got.
     done: Int
-    // The line the declaration being rewritten was declared on — the only
-    // position a flattened program can offer.
-    line: Int
+    at: token.Pos
     // What the callable being rewritten returns, with its variables substituted
     // but the generic types in it not yet renamed: a constructor in a `return`
     // is told which copy it builds by it, as one beside a declaration is.
@@ -70,7 +69,7 @@ type ArgList {
 // compiler does, so it is the one pass that speaks while it works.
 proc expand(m: ast.Module, from: Int): Expanded {
     t := types.tableOf(m)
-    mut Mono mo = Mono(t, m.decls, genericNames(t, m.decls), [], [], [], 0, 0, ast.TypeExpr.VoidType(), [])
+    mut Mono mo = Mono(t, m.decls, genericNames(t, m.decls), [], [], [], 0, token.nowhere(), ast.TypeExpr.VoidType(), [])
     written := writtenOut(mo, t)
     mo.table = written
 
@@ -81,7 +80,7 @@ proc expand(m: ast.Module, from: Int): Expanded {
     mut walked := 0
     for each d in m.decls {
         if isGeneric(mo.generics, ast.declName(d)) == false {
-            mo.line = ast.declLine(d)
+            mo.at = d.at
             append(out, rewriteDecl(mo, env, d))
         }
         walked = walked + 1
@@ -99,15 +98,15 @@ proc expand(m: ast.Module, from: Int): Expanded {
             progress.step(from, "  {at} copies of generics made")
         }
         if len(mo.wantedNames) > expansionLimit() {
-            append(mo.errors, diag.at(0, "this program's generics expand without settling: more than {expansionLimit()} copies were asked for. A generic that instantiates itself at a larger type every time round never finishes"))
-            return Expanded(ast.Module([], out, m.foreign), mo.errors)
+            append(mo.errors, diag.on(mo.at, "this program's generics expand without settling: more than {expansionLimit()} copies were asked for. A generic that instantiates itself at a larger type every time round never finishes"))
+            return Expanded(ast.Module([], out, m.foreign, m.library), mo.errors)
         }
         copy := instantiate(mo, env, at)
         if copy is Result.Ok(made) {
             append(out, made)
         }
     }
-    return Expanded(ast.Module([], out, m.foreign), mo.errors)
+    return Expanded(ast.Module([], out, m.foreign, m.library), mo.errors)
 }
 
 // A declaration is generic when its signature mentions a name that is neither a
@@ -164,12 +163,12 @@ proc writtenOut(mo: mut Mono, t: types.Table): types.Table {
         } else {
             mut ast.Param[dyn] params = []
             for each p in info.params {
-                append(params, ast.Param(p.name, renameGenerics(mo, p.declared), p.mutable))
+                append(params, ast.Param(p.name, renameGenerics(mo, p.declared), p.mutable, p.at))
             }
             append(callables, types.CallableInfo(info.name, info.pure, params, renameGenerics(mo, info.result), info.parameters))
         }
     }
-    return types.Table(typeInfos, callables)
+    return types.withDeclarations(t, typeInfos, callables)
 }
 
 // The copy called `flat`, as its place in the worklist, or `Error` when the name
@@ -264,10 +263,10 @@ proc instantiate(mo: mut Mono, env: infer.Env, at: Int): Result<ast.Decl, Bool> 
 
     for each d in mo.source {
         if ast.declName(d) == name {
-            mo.line = ast.declLine(d)
+            mo.at = d.at
             variables := variablesOfDecl(mo.table, d)
             if len(variables) != len(args.written) {
-                append(mo.errors, diag.at(mo.line, "`{name}` is generic in " + countWord(len(variables)) + ", and this use gives " + countWord(len(args.written))))
+                append(mo.errors, diag.on(mo.at, "`{name}` is generic in " + countWord(len(variables)) + ", and this use gives " + countWord(len(args.written))))
                 return Result.Error(false)
             }
             return Result.Ok(substituteDecl(mo, env, d, flat, variables, args))
@@ -302,7 +301,7 @@ proc substituteDecl(mo: mut Mono, env: infer.Env, d: ast.Decl, flat: Str, variab
     if d is ast.Decl.CallableDecl(kind, _, params, result, body, line) {
         mut ast.Param[dyn] out = []
         for each p in params {
-            append(out, ast.Param(p.name, substitute(mo, p.declared, variables, args), p.mutable))
+            append(out, ast.Param(p.name, substitute(mo, p.declared, variables, args), p.mutable, p.at))
         }
         // The body writes the variables down too — `mut K[dyn] out = []`,
         // `for each v: T in values` — so each copy substitutes through its own.
@@ -325,7 +324,7 @@ proc substituteDecl(mo: mut Mono, env: infer.Env, d: ast.Decl, flat: Str, variab
 proc substituteFields(mo: mut Mono, fields: ast.Field[], variables: Str[], args: ArgList): ast.Field[dyn] {
     mut ast.Field[dyn] out = []
     for each f in fields {
-        append(out, ast.Field(f.name, substitute(mo, f.declared, variables, args), f.marks))
+        append(out, ast.Field(f.name, substitute(mo, f.declared, variables, args), f.marks, f.at))
     }
     return out
 }
@@ -333,7 +332,7 @@ proc substituteFields(mo: mut Mono, fields: ast.Field[], variables: Str[], args:
 proc substituteVariants(mo: mut Mono, variants: ast.Variant[], variables: Str[], args: ArgList): ast.Variant[dyn] {
     mut ast.Variant[dyn] out = []
     for each v in variants {
-        append(out, ast.Variant(v.name, substituteFields(mo, v.fields, variables, args)))
+        append(out, ast.Variant(v.name, substituteFields(mo, v.fields, variables, args), v.at))
     }
     return out
 }
@@ -418,17 +417,17 @@ proc renamedAll(mo: mut Mono, ts: ast.TypeExpr[]): ast.TypeExpr[dyn] {
 
 // `T.Variant(...)` and `T(...)`, with `T` replaced by the copy's name.
 func aimedAt(name: Str, flat: Str, value: ast.Expr): ast.Expr {
-    if value is ast.Expr.Call(callee, args) {
-        if callee is ast.Expr.Member(head, variant) {
-            if head is ast.Expr.Ident(written) {
+    if value is ast.Expr.Call(callee, args, _) {
+        if callee is ast.Expr.Member(head, variant, _) {
+            if head is ast.Expr.Ident(written, _) {
                 if written == name {
-                    return ast.Expr.Call(ast.Expr.Member(ast.Expr.Ident(flat), variant), args)
+                    return ast.Expr.Call(ast.Expr.Member(ast.Expr.Ident(flat, head.at), variant, head.at), args, head.at)
                 }
             }
         }
-        if callee is ast.Expr.Ident(written) {
+        if callee is ast.Expr.Ident(written, _) {
             if written == name {
-                return ast.Expr.Call(ast.Expr.Ident(flat), args)
+                return ast.Expr.Call(ast.Expr.Ident(flat, callee.at), args, callee.at)
             }
         }
     }
@@ -499,10 +498,10 @@ proc substituteStmts(mo: mut Mono, env: infer.Env, stmts: ast.Stmt[], at: Int, i
 
 // The scope a statement leaves behind.
 proc bindFrom(mo: mut Mono, env: infer.Env, s: ast.Stmt): infer.Env {
-    if s is ast.Stmt.VarDecl(name, value, _, _) {
+    if s is ast.Stmt.VarDecl(name, value, _, _, _) {
         return infer.bound(env, name, typeIn(mo, env, value))
     }
-    if s is ast.Stmt.TypedDecl(declared, name, _, _, _) {
+    if s is ast.Stmt.TypedDecl(declared, name, _, _, _, _) {
         return infer.bound(env, name, types.resolve(env.table, declared))
     }
     return env
@@ -526,21 +525,24 @@ proc substituteBranches(mo: mut Mono, env: infer.Env, branches: ast.Branch[], va
 }
 
 proc substituteStmt(mo: mut Mono, env: infer.Env, s: ast.Stmt, variables: Str[], args: ArgList): ast.Stmt {
-    if s is ast.Stmt.VarDecl(name, value, mutable, deferred) {
-        return ast.Stmt.VarDecl(name, substituteExpr(mo, env, value, variables, args), mutable, deferred)
-    } else if s is ast.Stmt.TypedDecl(declared, name, value, mutable, deferred) {
+    if (s is ast.Stmt.Nothing) == false {
+        mo.at = s.at
+    }
+    if s is ast.Stmt.VarDecl(name, value, mutable, deferred, _) {
+        return ast.Stmt.VarDecl(name, substituteExpr(mo, env, value, variables, args), mutable, deferred, s.at)
+    } else if s is ast.Stmt.TypedDecl(declared, name, value, mutable, deferred, _) {
         // The variables are replaced first and the generic name second, because
         // what the constructor needs is the type arguments as written. It is aimed
         // before its arguments are read, so the declaration wins over them: in
         // `Page<Entry> none = Page([], 1)` the `[]` says nothing about `T`.
         asWritten := substituteVars(declared, variables, args)
         newValue := substituteExpr(mo, env, retarget(mo, asWritten, value), variables, args)
-        return ast.Stmt.TypedDecl(renameGenerics(mo, asWritten), name, newValue, mutable, deferred)
-    } else if s is ast.Stmt.Assign(target, value) {
-        return ast.Stmt.Assign(substituteExpr(mo, env, target, variables, args), substituteExpr(mo, env, value, variables, args))
-    } else if s is ast.Stmt.IfChain(branches, otherwise, hasElse) {
-        return ast.Stmt.IfChain(substituteBranches(mo, env, branches, variables, args), substituteBlock(mo, env, otherwise, variables, args), hasElse)
-    } else if s is ast.Stmt.SwitchStmt(lets, subjects, arms, line, binds) {
+        return ast.Stmt.TypedDecl(renameGenerics(mo, asWritten), name, newValue, mutable, deferred, s.at)
+    } else if s is ast.Stmt.Assign(target, value, _) {
+        return ast.Stmt.Assign(substituteExpr(mo, env, target, variables, args), substituteExpr(mo, env, value, variables, args), s.at)
+    } else if s is ast.Stmt.IfChain(branches, otherwise, hasElse, _) {
+        return ast.Stmt.IfChain(substituteBranches(mo, env, branches, variables, args), substituteBlock(mo, env, otherwise, variables, args), hasElse, s.at)
+    } else if s is ast.Stmt.SwitchStmt(lets, subjects, arms, binds, line) {
         mut ast.Stmt[dyn] newLets = []
         substituteStmts(mo, env, lets, 0, newLets, variables, args)
         inner := bindAll(mo, env, newLets, 0)
@@ -548,14 +550,14 @@ proc substituteStmt(mo: mut Mono, env: infer.Env, s: ast.Stmt, variables: Str[],
         for each subject in subjects {
             append(newSubjects, substituteExpr(mo, inner, subject, variables, args))
         }
-        return ast.Stmt.SwitchStmt(newLets, newSubjects, substituteBranches(mo, inner, arms, variables, args), line, binds)
-    } else if s is ast.Stmt.ForLoop(init, cond, post, body) {
+        return ast.Stmt.SwitchStmt(newLets, newSubjects, substituteBranches(mo, inner, arms, variables, args), binds, line)
+    } else if s is ast.Stmt.ForLoop(init, cond, post, body, _) {
         // The counter is scoped to the loop, and the condition, the post clause
         // and the body all read it.
         newInit := substituteStmt(mo, env, init, variables, args)
         inner := bindFrom(mo, env, newInit)
-        return ast.Stmt.ForLoop(newInit, substituteExpr(mo, inner, cond, variables, args), substituteStmt(mo, inner, post, variables, args), substituteBlock(mo, inner, body, variables, args))
-    } else if s is ast.Stmt.ForEach(name, declared, subject, body) {
+        return ast.Stmt.ForLoop(newInit, substituteExpr(mo, inner, cond, variables, args), substituteStmt(mo, inner, post, variables, args), substituteBlock(mo, inner, body, variables, args), s.at)
+    } else if s is ast.Stmt.ForEach(name, declared, subject, body, _) {
         newSubject := substituteExpr(mo, env, subject, variables, args)
         newType := substitute(mo, declared, variables, args)
         mut element := types.elementOf(typeIn(mo, env, newSubject))
@@ -563,61 +565,64 @@ proc substituteStmt(mo: mut Mono, env: infer.Env, s: ast.Stmt, variables: Str[],
         } else {
             element = types.resolve(env.table, newType)
         }
-        return ast.Stmt.ForEach(name, newType, newSubject, substituteBlock(mo, infer.bound(env, name, element), body, variables, args))
+        return ast.Stmt.ForEach(name, newType, newSubject, substituteBlock(mo, infer.bound(env, name, element), body, variables, args), s.at)
     }
     return substituteStmtTail(mo, env, s, variables, args)
 }
 
 proc substituteStmtTail(mo: mut Mono, env: infer.Env, s: ast.Stmt, variables: Str[], args: ArgList): ast.Stmt {
-    if s is ast.Stmt.ReturnStmt(value) {
+    if s is ast.Stmt.ReturnStmt(value, _) {
         // The declared result is a declaration like any other, so `return Page([], 1)`
         // in a callable answering with `Page<Entry>` builds a `Page_Entry`.
         want := mo.returning
-        return ast.Stmt.ReturnStmt(substituteExpr(mo, env, retarget(mo, want, value), variables, args))
-    } else if s is ast.Stmt.EchoStmt(value) {
-        return ast.Stmt.EchoStmt(substituteExpr(mo, env, value, variables, args))
-    } else if s is ast.Stmt.AssertStmt(condition) {
-        return ast.Stmt.AssertStmt(substituteExpr(mo, env, condition, variables, args))
-    } else if s is ast.Stmt.PanicStmt(value) {
-        return ast.Stmt.PanicStmt(substituteExpr(mo, env, value, variables, args))
-    } else if s is ast.Stmt.AsyncStmt(call) {
-        return ast.Stmt.AsyncStmt(substituteExpr(mo, env, call, variables, args))
-    } else if s is ast.Stmt.Expression(value) {
-        return ast.Stmt.Expression(substituteExpr(mo, env, value, variables, args))
+        return ast.Stmt.ReturnStmt(substituteExpr(mo, env, retarget(mo, want, value), variables, args), s.at)
+    } else if s is ast.Stmt.EchoStmt(value, _) {
+        return ast.Stmt.EchoStmt(substituteExpr(mo, env, value, variables, args), s.at)
+    } else if s is ast.Stmt.AssertStmt(condition, _) {
+        return ast.Stmt.AssertStmt(substituteExpr(mo, env, condition, variables, args), s.at)
+    } else if s is ast.Stmt.PanicStmt(value, _) {
+        return ast.Stmt.PanicStmt(substituteExpr(mo, env, value, variables, args), s.at)
+    } else if s is ast.Stmt.AsyncStmt(call, _) {
+        return ast.Stmt.AsyncStmt(substituteExpr(mo, env, call, variables, args), s.at)
+    } else if s is ast.Stmt.Expression(value, _) {
+        return ast.Stmt.Expression(substituteExpr(mo, env, value, variables, args), s.at)
     }
     return s
 }
 
 proc substituteExpr(mo: mut Mono, env: infer.Env, e: ast.Expr, variables: Str[], args: ArgList): ast.Expr {
-    if e is ast.Expr.Call(callee, callArgs) {
+    if (e is ast.Expr.Absent) == false {
+        mo.at = e.at
+    }
+    if e is ast.Expr.Call(callee, callArgs, _) {
         return substituteCall(mo, env, callee, callArgs, variables, args)
-    } else if e is ast.Expr.Binary(op, left, right) {
-        return ast.Expr.Binary(op, substituteExpr(mo, env, left, variables, args), substituteExpr(mo, env, right, variables, args))
-    } else if e is ast.Expr.Negate(operand) {
-        return ast.Expr.Negate(substituteExpr(mo, env, operand, variables, args))
-    } else if e is ast.Expr.Not(operand) {
-        return ast.Expr.Not(substituteExpr(mo, env, operand, variables, args))
-    } else if e is ast.Expr.BitNot(operand) {
-        return ast.Expr.BitNot(substituteExpr(mo, env, operand, variables, args))
-    } else if e is ast.Expr.Bits(parts) {
+    } else if e is ast.Expr.Binary(op, left, right, _) {
+        return ast.Expr.Binary(op, substituteExpr(mo, env, left, variables, args), substituteExpr(mo, env, right, variables, args), e.at)
+    } else if e is ast.Expr.Negate(operand, _) {
+        return ast.Expr.Negate(substituteExpr(mo, env, operand, variables, args), e.at)
+    } else if e is ast.Expr.Not(operand, _) {
+        return ast.Expr.Not(substituteExpr(mo, env, operand, variables, args), e.at)
+    } else if e is ast.Expr.BitNot(operand, _) {
+        return ast.Expr.BitNot(substituteExpr(mo, env, operand, variables, args), e.at)
+    } else if e is ast.Expr.Bits(parts, _) {
         mut ast.BitPart[dyn] out = []
         for each part in parts {
             append(out, ast.BitPart(substituteExpr(mo, env, part.value, variables, args), part.declared, part.little))
         }
-        return ast.Expr.Bits(out)
-    } else if e is ast.Expr.Member(subject, field) {
-        return ast.Expr.Member(substituteExpr(mo, env, subject, variables, args), field)
-    } else if e is ast.Expr.Index(subject, index) {
-        return ast.Expr.Index(substituteExpr(mo, env, subject, variables, args), substituteExpr(mo, env, index, variables, args))
-    } else if e is ast.Expr.Slice(subject, low, high) {
-        return ast.Expr.Slice(substituteExpr(mo, env, subject, variables, args), substituteExpr(mo, env, low, variables, args), substituteExpr(mo, env, high, variables, args))
-    } else if e is ast.Expr.VectorLit(items) {
+        return ast.Expr.Bits(out, e.at)
+    } else if e is ast.Expr.Member(subject, field, _) {
+        return ast.Expr.Member(substituteExpr(mo, env, subject, variables, args), field, e.at)
+    } else if e is ast.Expr.Index(subject, index, _) {
+        return ast.Expr.Index(substituteExpr(mo, env, subject, variables, args), substituteExpr(mo, env, index, variables, args), e.at)
+    } else if e is ast.Expr.Slice(subject, low, high, _) {
+        return ast.Expr.Slice(substituteExpr(mo, env, subject, variables, args), substituteExpr(mo, env, low, variables, args), substituteExpr(mo, env, high, variables, args), e.at)
+    } else if e is ast.Expr.VectorLit(items, _) {
         mut ast.Expr[dyn] out = []
         for each item in items {
             append(out, substituteExpr(mo, env, item, variables, args))
         }
-        return ast.Expr.VectorLit(out)
-    } else if e is ast.Expr.Interp(parts) {
+        return ast.Expr.VectorLit(out, e.at)
+    } else if e is ast.Expr.Interp(parts, _) {
         mut ast.InterpPart[dyn] out = []
         for each part in parts {
             if part is ast.InterpPart.Expression(value) {
@@ -626,24 +631,24 @@ proc substituteExpr(mo: mut Mono, env: infer.Env, e: ast.Expr, variables: Str[],
                 append(out, part)
             }
         }
-        return ast.Expr.Interp(out)
-    } else if e is ast.Expr.IsMatch(subject, pattern) {
+        return ast.Expr.Interp(out, e.at)
+    } else if e is ast.Expr.IsMatch(subject, pattern, _) {
         newSubject := substituteExpr(mo, env, subject, variables, args)
         if pattern is ast.Pattern.BitsPat(fields, rest) {
             mut ast.BitField[dyn] out = []
             for each f in fields {
                 append(out, ast.BitField(f.name, substituteExpr(mo, env, f.value, variables, args), f.declared, substituteExpr(mo, env, f.length, variables, args), f.little))
             }
-            return ast.Expr.IsMatch(newSubject, ast.Pattern.BitsPat(out, rest))
+            return ast.Expr.IsMatch(newSubject, ast.Pattern.BitsPat(out, rest), e.at)
         }
-        return ast.Expr.IsMatch(newSubject, aimPattern(mo, env, newSubject, pattern))
-    } else if e is ast.Expr.Ident(name) {
+        return ast.Expr.IsMatch(newSubject, aimPattern(mo, env, newSubject, pattern), e.at)
+    } else if e is ast.Expr.Ident(name, _) {
         // A generic callable cannot be used as a value: which copy a call reaches
         // is decided by the argument types, and a value carries none. A call's
         // callee never gets here — `substituteCall` reads it first. Only a
         // callable: a bare type name is always part of a constructor path.
         if isGeneric(mo.generics, name) && types.findCallable(env.table, name) is Result.Ok(_) {
-            append(mo.errors, diag.at(mo.line, "`{name}` is generic, so it cannot be used as a value: which copy a call reaches is decided by the argument types, and a value carries none. Call it, or wrap it in a callable of your own that is not generic"))
+            append(mo.errors, diag.on(mo.at, "`{name}` is generic, so it cannot be used as a value: which copy a call reaches is decided by the argument types, and a value carries none. Call it, or wrap it in a callable of your own that is not generic"))
         }
         return e
     }
@@ -680,12 +685,12 @@ proc substituteCall(mo: mut Mono, env: infer.Env, callee: ast.Expr, callArgs: as
     for each a in callArgs {
         append(out, ast.Arg(a.name, substituteExpr(mo, env, a.value, variables, args)))
     }
-    if callee is ast.Expr.Ident(name) {
+    if callee is ast.Expr.Ident(name, _) {
         if isGeneric(mo.generics, name) {
-            return ast.Expr.Call(ast.Expr.Ident(chosen(mo, env, name, out)), out)
+            return ast.Expr.Call(ast.Expr.Ident(chosen(mo, env, name, out), callee.at), out, callee.at)
         }
     }
-    return ast.Expr.Call(substituteExpr(mo, env, callee, variables, args), out)
+    return ast.Expr.Call(substituteExpr(mo, env, callee, variables, args), out, callee.at)
 }
 
 // The copy a call reaches, asked for if it has not been asked for yet.
@@ -743,14 +748,14 @@ proc solve(mo: mut Mono, env: infer.Env, callee: Str, params: ast.Param[], callA
     // A variable appearing only in the return type has nothing to be inferred
     // from, and would otherwise produce a copy nobody meant.
     if mentioned == false {
-        append(mo.errors, diag.at(mo.line, "`{variable}` appears nowhere in the parameters, so there is nothing at a call to read it off. A type variable is pinned down by what is passed, never written at the call site"))
+        append(mo.errors, diag.on(mo.at, "`{variable}` appears nowhere in the parameters, so there is nothing at a call to read it off. A type variable is pinned down by what is passed, never written at the call site"))
         return standIn()
     }
     // A `_` is a parameter of the function value the call makes, and a value
     // carries no types. Where the holes are the only places the variable could
     // be read off, there is no copy for the value to call.
     if held && supplied == false {
-        append(mo.errors, diag.at(mo.line, "`_` stands where `{callee}` reads `{variable}` from, so the function value this makes could not say which copy it calls: a partial application of something generic has to fix every type variable with what it does pass. Pass that argument, or wrap the call in a callable of your own that is not generic"))
+        append(mo.errors, diag.on(mo.at, "`_` stands where `{callee}` reads `{variable}` from, so the function value this makes could not say which copy it calls: a partial application of something generic has to fix every type variable with what it does pass. Pass that argument, or wrap the call in a callable of your own that is not generic"))
         return standIn()
     }
     // Passed, but as something that says nothing about it: an empty `[]`, or a
@@ -764,7 +769,7 @@ proc solveFields(mo: mut Mono, env: infer.Env, name: Str, fields: ast.Field[], c
     mut ast.Param[dyn] params = []
     mut mentioned := false
     for each f in fields {
-        append(params, ast.Param(f.name, f.declared, false))
+        append(params, ast.Param(f.name, f.declared, false, f.at))
         mentioned = mentioned || mentions(f.declared, variable)
     }
     // A union's variables are in its variants, and a union is built through one
@@ -932,28 +937,28 @@ proc typeIn(mo: mut Mono, env: infer.Env, e: ast.Expr): types.Ty {
 }
 
 proc copyTypeOf(mo: mut Mono, env: infer.Env, e: ast.Expr): types.Ty {
-    if e is ast.Expr.Call(callee, callArgs) {
+    if e is ast.Expr.Call(callee, callArgs, _) {
         if infer.hasHole(callArgs) {
             return types.Ty.TUnknown()
         }
         // `Box_Int(...)` and `paginate_Entry(...)`, unless a local of that name
         // is what is being called.
-        if callee is ast.Expr.Ident(name) && infer.isBound(env, name) == false {
+        if callee is ast.Expr.Ident(name, _) && infer.isBound(env, name) == false {
             if copyAt(mo, name) is Result.Ok(at) {
                 return copyResult(mo, env, at)
             }
         }
         // `Either_Str_Int.Left(...)`, which builds the union.
-        if callee is ast.Expr.Member(head, _) && head is ast.Expr.Ident(name) {
+        if callee is ast.Expr.Member(head, _, _) && head is ast.Expr.Ident(name, _) {
             if copyAt(mo, name) is Result.Ok(_) {
                 return types.resolve(env.table, types.named(name))
             }
         }
-    } else if e is ast.Expr.Member(subject, field) {
+    } else if e is ast.Expr.Member(subject, field, _) {
         if copyAt(mo, nameOfType(typeIn(mo, env, subject))) is Result.Ok(at) {
             return copyField(mo, env, at, field)
         }
-    } else if e is ast.Expr.Index(subject, _) {
+    } else if e is ast.Expr.Index(subject, _, _) {
         // Inference read the subject without the copies, so the element is read
         // again with them.
         whole := typeIn(mo, env, subject)

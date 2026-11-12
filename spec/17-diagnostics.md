@@ -39,34 +39,44 @@ setlocal makeprg=hive\ check\ %:S
 setlocal errorformat=%-G\ %.%#,%f:%l:\ %m,%-G%.%#
 ```
 
-`hive check` runs every compiler pass and stops before the Go toolchain, so it
-answers as fast as the front end does and writes nothing next to the file — which
-is what makes it usable on every save. `:make` then fills the quickfix list, and
-`:cn` walks the errors.
+`hive check` runs every pass that can refuse a program and stops there: no Go is
+written, let alone compiled. It answers as fast as the front end does and writes
+nothing next to the file — which is what makes it usable on every save. `:make`
+then fills the quickfix list, and `:cn` walks the errors.
 
 The two `%-G` items discard what is not a diagnostic: the first drops the
 indented continuation lines of a message that runs on, the last drops everything
 else.
 
-## 17.3 A limit worth knowing
+`hive lsp` is the other way in: a language server, which an editor starts and
+talks to over standard input and output. It reports the same errors as a file is
+typed, each with its column, and answers what a name is, where it was declared,
+and what could come next. It reads a file as the editor holds it, saved or not,
+and as a program of its own, so there is no entrypoint to name.
 
-**Errors from the passes after parsing land on a declaration.** Mutability,
-bounds, the proc/func split and the type checks all run on a flattened module
-whose nodes carry a position on a declaration and nowhere else, so the
-declaration the mistake is inside is as precise as they get: its line is what the
-message opens with, and its name is what the message says. A pass holding no
-declaration at all reports against the file's first line, because `file:0:` is
-not somewhere to jump to.
+## 17.3 Where an error lands
 
-The declaration still says which file it came from, so an error inside an
-imported module names **that module's file**, and every name in the message is
-spelled the way the source spells it — `text.pad`, not the flattened
-`text_0_pad`. Errors the lexer, parser and import resolver raise name the right
-file and line too; an import that names no file is reported at the import.
+**On the line of what is wrong.** Every expression, statement and declaration
+carries the file, line and column it was written at, through every pass, so a
+mistake found by the type checks or the bounds pass is reported where a mistake
+found by the parser is: against the thing itself. An index nothing proved in
+range is reported at the index, an argument of the wrong type at the argument —
+on its own line, where a call is written over several — and a field that does
+not exist at the field.
 
-The limit is a consequence of one decision — that the passes after the loader see
-one flat program — and would be lifted by carrying a position on every node.
-[18](18-conformance.md) records this as a known gap rather than a requirement.
+The message still says which declaration it is in — `` in `total`: ... `` —
+because that is the first thing a reader of a quickfix list wants to know, and an
+error inside an imported module names **that module's file**. Every name in a
+message is spelled the way the source spells it: `text.pad`, not the name the
+generated Go knows it by. A copy of a generic is reported inside the generic's own
+body, under the copy's name, so the message says which instantiation went wrong.
+
+What is printed is `file:line:`. The column is known and carried with every
+diagnostic, for a tool that asks the compiler directly; it is left out of the
+printed form so the two-part pattern in [17.2](#172-editor-support) keeps
+matching. A message about something nobody wrote — a file that could not be
+read — is reported against the file's first line, because `file:0:` is not
+somewhere to jump to.
 
 ## 17.4 What a message should say
 

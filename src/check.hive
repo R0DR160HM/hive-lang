@@ -8,24 +8,24 @@
 // Every check reports and carries on. A program with six mistakes is one whose
 // author would rather hear about six than about the first.
 //
-// The pass runs on a flattened module whose nodes carry no position, so a message
-// names the declaration rather than a line. Spec 17.3 records that limit.
+// A message says which declaration it is in and is reported against the line of
+// what is wrong (spec 17.3). This is the last pass that may refuse a program.
 import ./ast
 import ./cover
 import ./diag
 import ./infer
 import ./stdlib
 import ./text
+import ./token
 import ./types
 import hive.map
 
+// The table is not here: every check reads it from `env`, which copies nothing.
 type Check {
-    table: types.Table
     errors: diag.Diagnostic[dyn]
     // The declaration being walked, which is what a message names.
     inside: Str
-    // The line it was declared on — the best position a flattened tree offers.
-    line: Int
+    at: token.Pos
     // Whether the body is a `func` — which may not declare a `mut` parameter.
     pure: Bool
     // What the body has to return, or `TVoid`.
@@ -40,17 +40,107 @@ type Check {
     // block's own start in it: one block may not declare a name twice.
     declared: Str[dyn]
     blockStart: Int
+    // Whether the expression walked is one of a branch's own `&&` tests, where a match binds.
+    guard: Bool
+    // Every `hive.map.new()` in the declaration walked, and what each that landed became.
+    empties: token.Pos[dyn]
+    landings: infer.Landing[dyn]
+    // Whether the call walked stands as a statement, and what that statement has left to say.
+    bare: Bool
+    pending: diag.Diagnostic[dyn]
+    // The file an editor has open, or `""`, and what stands in it.
+    watching: Str
+    uses: infer.Use[dyn]
+    scopes: infer.Scope[dyn]
 }
-// Check a whole flattened program.
+
+type Checked {
+    errors: diag.Diagnostic[dyn]
+    landings: infer.Landing[dyn]
+    uses: infer.Use[dyn]
+    scopes: infer.Scope[dyn]
+}
+
 proc checkModule(m: ast.Module): diag.Diagnostic[dyn] {
+    return checkProgram(m).errors
+}
+
+proc checkProgram(m: ast.Module): Checked {
+    return checkWatching(m, "")
+}
+
+proc checkWatching(m: ast.Module, file: Str): Checked {
     t := types.tableOf(m)
-    mut Check c = Check(t, [], "", 0, false, types.Ty.TVoid(), false, 0, [], [], 0)
+    mut Check c = Check([], "", token.nowhere(), false, types.Ty.TVoid(), false, 0, [], [], 0, false, [], [], false, [], file, [], [])
     env := infer.newEnv(t)
     checkTestTitles(c, m)
     for each d in m.decls {
         checkDecl(c, env, d)
+        settleMaps(c)
     }
-    return c.errors
+    return Checked(c.errors, c.landings, c.uses, c.scopes)
+}
+
+proc see(c: mut Check, env: infer.Env, e: ast.Expr): void {
+    if e is ast.Expr.Ident(name, at) {
+        append(c.uses, infer.Use(at, c.inside, name, "", types.Ty.TUnknown(), infer.typeOf(env, e), infer.isBound(env, name), false))
+    } else if e is ast.Expr.Member(subject, field, at) {
+        append(c.uses, infer.Use(at, c.inside, field, pathOf(env, subject), infer.typeOf(env, subject), infer.typeOf(env, e), false, true))
+    } else if e is ast.Expr.Call(callee, _, _) {
+        if callee is ast.Expr.Ident(_, _) || callee is ast.Expr.Member(_, _, _) {
+            see(c, env, callee)
+        }
+    }
+}
+
+func pathOf(env: infer.Env, subject: ast.Expr): Str {
+    if subject is ast.Expr.Ident(name, _) {
+        if infer.isBound(env, name) {
+            return ""
+        }
+        return name
+    }
+    if subject is ast.Expr.Member(inner, field, _) {
+        head := pathOf(env, inner)
+        if head == "hive" || text.startsWith(head, "hive.") {
+            return head + "." + field
+        }
+    }
+    return ""
+}
+
+// An empty map nothing gave a type to is one nothing could be built for.
+proc settleMaps(c: mut Check): void {
+    for each at in c.empties {
+        if infer.landedAt(c.landings, c.inside, at) is Result.Error(_) {
+            reportAt(c, at, "`hive.map.new()` has to land somewhere that says what it holds: a declaration, a return, or an argument to a parameter declared as a map")
+        }
+    }
+    c.empties = []
+}
+
+// An empty map takes the slot's type, through a vector or a `Result` written around it.
+proc land(c: mut Check, wanted: types.Ty, e: ast.Expr): void {
+    if infer.isEmptyMap(e) {
+        if wanted is types.Ty.TMap(_, _) {
+            append(c.landings, infer.Landing(c.inside, infer.emptyMapAt(e), wanted))
+        }
+        return
+    }
+    if e is ast.Expr.VectorLit(items, _) && wanted is types.Ty.TVec(element, _) {
+        for each item in items {
+            land(c, element, item)
+        }
+    }
+    if e is ast.Expr.Call(callee, args, _) && wanted is types.Ty.TResult(ok, bad) && args bounds 0 {
+        if callee is ast.Expr.Member(head, variant, _) && head is ast.Expr.Ident(result, _) && result == "Result" {
+            if variant == "Error" {
+                land(c, bad, args[0].value)
+            } else {
+                land(c, ok, args[0].value)
+            }
+        }
+    }
 }
 
 // A test's title is its name in the report, so two tests answering to one name
@@ -60,11 +150,11 @@ proc checkTestTitles(c: mut Check, m: ast.Module): void {
     mut Str[dyn] seen = []
     mut Str[dyn] titles = []
     for each d in m.decls {
-        if d is ast.Decl.TestDecl(title, _, line) {
+        if d is ast.Decl.TestDecl(title, _, _) {
             key := join(split(title, " "), "_")
             if indexOf(seen, key) is Result.Ok(at) {
                 c.inside = "\"{title}\""
-                c.line = line
+                c.at = d.at
                 if titles bounds at {
                     if titles[at] == title {
                         report(c, "another test is already called this. A title is how the report names a test, so two with one title would be reported as one — give each its own")
@@ -80,45 +170,45 @@ proc checkTestTitles(c: mut Check, m: ast.Module): void {
 }
 
 proc report(c: mut Check, message: Str): void {
-    reportAt(c, c.line, message)
+    reportAt(c, c.at, message)
 }
 
-proc reportAt(c: mut Check, line: Int, message: Str): void {
-    append(c.errors, diag.at(line, diag.inDecl(c.inside, message)))
+proc reportAt(c: mut Check, at: token.Pos, message: Str): void {
+    append(c.errors, diag.on(at, diag.inDecl(c.inside, message)))
 }
 
 // --- Declarations ------------------------------------------------------------
 
 proc checkDecl(c: mut Check, env: infer.Env, d: ast.Decl): void {
-    if d is ast.Decl.TypeDecl(name, fields, variants, line) {
+    if d is ast.Decl.TypeDecl(name, fields, variants, at) {
         c.inside = name
-        c.line = line
-        checkTypeDecl(c, fields, variants)
+        c.at = at
+        checkTypeDecl(c, env, fields, variants)
         checkHoldsItself(c, env.table, name)
         for each f in fields {
-            checkLibTypes(c, types.resolve(env.table, f.declared))
+            checkLibTypes(c, env, types.resolve(env.table, f.declared))
         }
         for each v in variants {
             for each f in v.fields {
-                checkLibTypes(c, types.resolve(env.table, f.declared))
+                checkLibTypes(c, env, types.resolve(env.table, f.declared))
             }
         }
-    } else if d is ast.Decl.CallableDecl(kind, name, params, result, body, line) {
+    } else if d is ast.Decl.CallableDecl(kind, name, params, result, body, at) {
         c.inside = name
-        c.line = line
+        c.at = at
         c.pure = kind is ast.CallableKind.FuncKind
         c.result = types.resolve(env.table, result)
-        checkLibTypes(c, c.result)
+        checkLibTypes(c, env, c.result)
         for each p in params {
-            checkLibTypes(c, types.resolve(env.table, p.declared))
+            checkLibTypes(c, env, types.resolve(env.table, p.declared))
         }
         c.inTest = false
         c.loops = 0
         c.mutable = []
         checkCallable(c, env, name, params, body)
-    } else if d is ast.Decl.QueryDecl(name, params, result, sql, line) {
+    } else if d is ast.Decl.QueryDecl(name, params, result, sql, at) {
         c.inside = name
-        c.line = line
+        c.at = at
         // A query is a `func` whose body happens to be SQL: nothing in one could
         // write to storage its caller can see.
         c.pure = true
@@ -127,9 +217,9 @@ proc checkDecl(c: mut Check, env: infer.Env, d: ast.Decl): void {
         c.loops = 0
         c.mutable = []
         checkQuery(c, env, params, result, sql)
-    } else if d is ast.Decl.TestDecl(title, body, line) {
+    } else if d is ast.Decl.TestDecl(title, body, at) {
         c.inside = "\"{title}\""
-        c.line = line
+        c.at = at
         c.pure = false
         c.result = types.Ty.TVoid()
         c.inTest = true
@@ -157,20 +247,20 @@ proc checkQuery(c: mut Check, env: infer.Env, params: ast.Param[], result: ast.T
     }
     inner := infer.boundParams(env, params, 0)
     rows := types.resolve(env.table, result)
-    checkRowType(c, rows)
-    checkSelectStar(c, rows, sql)
+    checkRowType(c, env, rows)
+    checkSelectStar(c, env, rows, sql)
     checkSql(c, inner, sql)
 }
 
 // What a query declares its rows to be. Three shapes mean something: one row
 // type per row, a single column, and no rows at all.
-proc checkRowType(c: mut Check, declared: types.Ty): void {
+proc checkRowType(c: mut Check, env: infer.Env, declared: types.Ty): void {
     if declared is types.Ty.TVoid {
         return
     }
     if declared is types.Ty.TVec(element, _) {
         if element is types.Ty.TNamed(name) {
-            if types.findType(c.table, name) is Result.Ok(info) {
+            if types.findType(env.table, name) is Result.Ok(info) {
                 if len(info.variants) > 0 {
                     report(c, "a query's rows are a struct, and `{name}` is a tagged union: a row is a fixed set of columns, and there is nothing in a result set to say which variant one of them is")
                 }
@@ -198,8 +288,8 @@ proc checkRowType(c: mut Check, declared: types.Ty): void {
 //
 // The rule is about the result and only the result: `count(*)`, `a * 2`, a star
 // inside a subquery and a `void` statement's select list all still compile.
-proc checkSelectStar(c: mut Check, declared: types.Ty, sql: ast.SqlPart[]): void {
-    if rowTyped(c.table, declared) == false {
+proc checkSelectStar(c: mut Check, env: infer.Env, declared: types.Ty, sql: ast.SqlPart[]): void {
+    if rowTyped(env.table, declared) == false {
         return
     }
     if selectsEverything(sqlText(sql)) == false {
@@ -401,42 +491,42 @@ proc checkBoundValue(c: mut Check, env: infer.Env, value: ast.Expr): void {
     report(c, "a bound value is one cell, and this is " + types.show(ty) + ". A cell is a `Str`, an `Int`, a `Float`, a `Bool` or an `Atom`; anything else would have to be spliced into the text, which is the one thing a query never does")
 }
 
-proc checkLibTypes(c: mut Check, ty: types.Ty): void {
+proc checkLibTypes(c: mut Check, env: infer.Env, ty: types.Ty): void {
     if ty is types.Ty.TLib(module, name) {
-        if stdlib.isLibType(module, name) == false {
+        if stdlib.isLibType(env.table, module, name) == false {
             report(c, "`hive.{module}` has no type `{name}`")
         }
     } else if ty is types.Ty.TVec(element, _) {
-        checkLibTypes(c, element)
+        checkLibTypes(c, env, element)
     } else if ty is types.Ty.TResult(ok, bad) {
-        checkLibTypes(c, ok)
-        checkLibTypes(c, bad)
+        checkLibTypes(c, env, ok)
+        checkLibTypes(c, env, bad)
     } else if ty is types.Ty.TMap(key, value) {
-        checkLibTypes(c, key)
-        checkLibTypes(c, value)
+        checkLibTypes(c, env, key)
+        checkLibTypes(c, env, value)
     } else if ty is types.Ty.TFn(_, params, _, result) {
         for each p in params {
-            checkLibTypes(c, p)
+            checkLibTypes(c, env, p)
         }
-        checkLibTypes(c, result)
+        checkLibTypes(c, env, result)
     } else if ty is types.Ty.TAddress(message) {
         if message is types.Ty.TUnknown {
             report(c, "an address says what its service takes: `Address<M>`, with `M` the type of its messages")
         } else {
-            checkLibTypes(c, message)
+            checkLibTypes(c, env, message)
         }
     } else if ty is types.Ty.TSecret(held) {
         if held is types.Ty.TUnknown {
             report(c, "a secret says what it holds: `Secret<T>`, with `T` the type of its value")
         } else {
-            checkLibTypes(c, held)
-            checkKeepable(c, "a `Secret`", held)
+            checkLibTypes(c, env, held)
+            checkKeepable(c, env, "a `Secret`", held)
         }
     }
 }
 
-proc checkKeepable(c: mut Check, what: Str, ty: types.Ty): void {
-    if types.unkeepable(c.table, ty, []) is Result.Ok(found) {
+proc checkKeepable(c: mut Check, env: infer.Env, what: Str, ty: types.Ty): void {
+    if types.unkeepable(env.table, ty, []) is Result.Ok(found) {
         mut held := ""
         if types.same(found, ty) == false {
             held = ", which holds " + types.show(found)
@@ -445,7 +535,7 @@ proc checkKeepable(c: mut Check, what: Str, ty: types.Ty): void {
     }
 }
 
-proc checkTypeDecl(c: mut Check, fields: ast.Field[], variants: ast.Variant[]): void {
+proc checkTypeDecl(c: mut Check, env: infer.Env, fields: ast.Field[], variants: ast.Variant[]): void {
     mut hive.map.Map<Str, Bool> seen = hive.map.new()
     for each f in fields {
         if hive.map.has(seen, f.name) {
@@ -453,7 +543,7 @@ proc checkTypeDecl(c: mut Check, fields: ast.Field[], variants: ast.Variant[]): 
         }
         hive.map.set(seen, f.name, true)
         checkReservedField(c, f.name)
-        checkMarks(c, f)
+        checkMarks(c, env, f)
     }
     mut hive.map.Map<Str, Bool> variantNames = hive.map.new()
     for each v in variants {
@@ -468,7 +558,7 @@ proc checkTypeDecl(c: mut Check, fields: ast.Field[], variants: ast.Variant[]): 
                 report(c, "the variant `{v.name}` declares `{f.name}`, which the type already declares outside every variant — a shared field is added to each of them, so this one would be there twice")
             }
             checkReservedField(c, f.name)
-            checkMarks(c, f)
+            checkMarks(c, env, f)
         }
     }
     checkJsonNames(c, fields, variants)
@@ -529,28 +619,67 @@ proc checkDecodes(c: mut Check, env: infer.Env, what: Str, typeName: Str, args: 
     if args bounds 1 {
         format := stdlib.formatOfCodec(infer.typeOf(env, args[1].value))
         checkNamesCodec(c, env, what, args[1].value)
-        checkFlatShape(c, what, types.Ty.TNamed(typeName), format)
-        checkJsonShape(c, what, types.Ty.TNamed(typeName), format, true)
+        checkFlatShape(c, env, what, types.Ty.TNamed(typeName), format)
+        checkJsonShape(c, env, what, types.Ty.TNamed(typeName), format, true)
     }
 }
 
 // A `Secret` is only ever read: a document carrying one is ordinary text by the
 // time it arrives, so decoding keeps what it says the way `bypass` would, and
 // nothing about that can leak. Writing one out is the leak, so `encode` refuses.
-proc checkJsonShape(c: mut Check, what: Str, ty: types.Ty, format: Str, decoding: Bool): void {
+proc checkJsonShape(c: mut Check, env: infer.Env, what: Str, ty: types.Ty, format: Str, decoding: Bool): void {
     if format != "json" && format != "jwt" {
         return
     }
-    if tableIn(c.table, ty, []) is Result.Ok(place) {
+    if tableIn(env.table, ty, []) is Result.Ok(place) {
         mut carried := "this"
         if place != "" {
             carried = place
         }
         report(c, what + " cannot carry " + carried + ": " + stdlib.tableHasNoJson())
     }
-    if decoding == false && types.holdsSecret(c.table, ty) {
+    if decoding == false && types.holdsSecret(env.table, ty) {
         report(c, what + " cannot carry " + types.show(ty) + ": " + stdlib.secretHasNoJson())
     }
+    if decoding == false && mapIn(env.table, ty, []) {
+        report(c, what + " cannot carry " + types.show(ty) + ": " + stdlib.mapHasNoJson())
+    }
+}
+
+// Follows the road the encoder is derived along; a `JsonValue` is written by its own.
+func mapIn(t: types.Table, ty: types.Ty, seen: Str[]): Bool {
+    if ty is types.Ty.TMap(_, _) {
+        return true
+    }
+    if ty is types.Ty.TVec(element, _) {
+        return mapIn(t, element, seen)
+    }
+    if ty is types.Ty.TNamed(name) {
+        if stdlib.isJsonValue(name) || indexOf(seen, name) is Result.Ok(_) {
+            return false
+        }
+        if types.findType(t, name) is Result.Ok(info) {
+            inner := seen + [name]
+            for each f in info.shared {
+                if mapIn(t, types.resolve(t, f.declared), inner) {
+                    return true
+                }
+            }
+            for each v in info.variants {
+                for each f in v.fields {
+                    if mapIn(t, types.resolve(t, f.declared), inner) {
+                        return true
+                    }
+                }
+            }
+        }
+    }
+    return false
+}
+
+// A message is encoded even when it never leaves the machine, so it is held to what `encode` takes.
+proc checkCrosses(c: mut Check, env: infer.Env, what: Str, message: types.Ty): void {
+    checkJsonShape(c, env, what, message, "json", false)
 }
 
 // Where a `Table` sits in `ty`: `""` for `ty` itself, or the field holding one.
@@ -589,19 +718,19 @@ func tableIn(t: types.Table, ty: types.Ty, seen: Str[]): Result<Str, Bool> {
 
 // A query string and a command line are one flat set of parameters, so only a
 // type without variants whose fields are values, or vectors of values, travels as one.
-proc checkFlatShape(c: mut Check, what: Str, ty: types.Ty, format: Str): void {
+proc checkFlatShape(c: mut Check, env: infer.Env, what: Str, ty: types.Ty, format: Str): void {
     if stdlib.isFlatFormat(format) == false || ty is types.Ty.TUnknown {
         return
     }
     carrier := stdlib.flatCarrier(format)
     if ty is types.Ty.TNamed(name) {
-        if types.findType(c.table, name) is Result.Ok(info) {
+        if types.findType(env.table, name) is Result.Ok(info) {
             if len(info.variants) > 0 {
                 report(c, carrier + " is one flat set of parameters, so " + what + " cannot carry `" + types.shownName(name) + "`, which has variants")
                 return
             }
             for each f in info.shared {
-                checkFlatField(c, name, f, stdlib.flatUnit(format))
+                checkFlatField(c, env, name, f, stdlib.flatUnit(format))
             }
             return
         }
@@ -609,8 +738,8 @@ proc checkFlatShape(c: mut Check, what: Str, ty: types.Ty, format: Str): void {
     report(c, carrier + " is a declared type's fields, so " + what + " cannot carry " + types.show(ty))
 }
 
-proc checkFlatField(c: mut Check, typeName: Str, f: ast.Field, unit: Str): void {
-    ty := types.resolve(c.table, f.declared)
+proc checkFlatField(c: mut Check, env: infer.Env, typeName: Str, f: ast.Field, unit: Str): void {
+    ty := types.resolve(env.table, f.declared)
     if stdlib.isFlatValue(ty) {
         return
     }
@@ -665,11 +794,11 @@ proc checkReservedField(c: mut Check, name: Str): void {
 // What a field's `--` annotations have to be true of. The parser has already
 // settled their shape; what is left is the one thing it could not know, which is
 // what the field's type is.
-proc checkMarks(c: mut Check, f: ast.Field): void {
+proc checkMarks(c: mut Check, env: infer.Env, f: ast.Field): void {
     if f.marks.fallback is ast.Expr.Absent {
         return
     }
-    declared := types.resolve(c.table, f.declared)
+    declared := types.resolve(env.table, f.declared)
     given := literalType(f.marks.fallback)
     if types.same(declared, given) {
         return
@@ -746,11 +875,11 @@ proc reportFlagClashes(c: mut Check, fields: ast.Field[]): void {
 // What a literal is, which is the whole of what a `Default` may be — the parser
 // accepts nothing else there, so this needs no scope to answer.
 func literalType(e: ast.Expr): types.Ty {
-    if e is ast.Expr.IntLit(_) { return types.Ty.TInt() }
-    if e is ast.Expr.FloatLit(_) { return types.Ty.TFloat() }
-    if e is ast.Expr.StrLit(_) { return types.Ty.TStr() }
-    if e is ast.Expr.BoolLit(_) { return types.Ty.TBool() }
-    if e is ast.Expr.AtomLit(_) { return types.Ty.TAtom() }
+    if e is ast.Expr.IntLit(_, _) { return types.Ty.TInt() }
+    if e is ast.Expr.FloatLit(_, _) { return types.Ty.TFloat() }
+    if e is ast.Expr.StrLit(_, _) { return types.Ty.TStr() }
+    if e is ast.Expr.BoolLit(_, _) { return types.Ty.TBool() }
+    if e is ast.Expr.AtomLit(_, _) { return types.Ty.TAtom() }
     return types.Ty.TUnknown()
 }
 
@@ -851,13 +980,41 @@ proc restore(c: mut Check, mark: Int): void {
     }
 }
 
+// What a statement left to say is said only where it was otherwise right.
 proc checkStmt(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
-    if s is ast.Stmt.VarDecl(name, value, mutable, deferred) {
+    if (s is ast.Stmt.Nothing) == false {
+        c.at = s.at
+    }
+    before := len(c.errors)
+    held := c.pending
+    c.pending = []
+    watched := c.watching != "" && s.at.file == c.watching
+    slot := len(c.scopes)
+    if watched {
+        append(c.scopes, infer.Scope(s.at, c.inside, env.names, env.names))
+    }
+    after := checkWrittenStmt(c, env, s)
+    if watched && c.scopes bounds slot {
+        c.scopes[slot] = infer.Scope(s.at, c.inside, env.names, after.names)
+    }
+    if len(c.errors) == before {
+        for each left in c.pending {
+            append(c.errors, left)
+        }
+    }
+    c.pending = held
+    return after
+}
+
+proc checkWrittenStmt(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
+    if s is ast.Stmt.VarDecl(name, value, mutable, deferred, _) {
         checkExpr(c, env, value)
         ty := infer.typeOf(env, value)
         // `hive.map.new()` says empty and nothing about what it holds, so it has
         // to land somewhere that says.
-        if isEmptyMap(value) {
+        if infer.isEmptyMap(value) {
+            // Said here, in full, so it is not said again when the declaration ends.
+            append(c.landings, infer.Landing(c.inside, infer.emptyMapAt(value), types.Ty.TUnknown()))
             report(c, "`hive.map.new()` has to land somewhere that says what it holds: a declaration (`hive.map.Map<Str, Int> m = hive.map.new()`), a `return` whose callable declares a map, an argument to a parameter declared as one, or a later use of `{name}` that says it, such as `hive.map.set({name}, \"a\", 1)`. Nothing after this binding does")
         }
         // A name says where a service is, and nothing about what it takes.
@@ -874,10 +1031,10 @@ proc checkStmt(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
             append(c.mutable, name)
         }
         return infer.bound(env, name, ty)
-    } else if s is ast.Stmt.TypedDecl(declared, name, value, mutable, deferred) {
+    } else if s is ast.Stmt.TypedDecl(declared, name, value, mutable, deferred, _) {
         checkExpr(c, env, value)
         ty := types.resolve(env.table, declared)
-        checkLibTypes(c, ty)
+        checkLibTypes(c, env, ty)
         checkHoldsValue(c, name, infer.typeOf(env, value), deferred)
         if deferred == false {
             fitsValue(c, env, ty, value, "the declaration of `{name}`")
@@ -887,36 +1044,36 @@ proc checkStmt(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
             append(c.mutable, name)
         }
         return infer.bound(env, name, ty)
-    } else if s is ast.Stmt.Assign(target, value) {
+    } else if s is ast.Stmt.Assign(target, value, _) {
         checkAssign(c, env, target, value)
         return env
-    } else if s is ast.Stmt.ReturnStmt(value) {
+    } else if s is ast.Stmt.ReturnStmt(value, _) {
         checkReturn(c, env, value)
         return env
-    } else if s is ast.Stmt.IfChain(branches, otherwise, hasElse) {
+    } else if s is ast.Stmt.IfChain(branches, otherwise, hasElse, _) {
         for each b in branches {
-            checkCondition(c, env, b.condition)
+            checkGuard(c, env, b.condition)
             checkBlock(c, afterCondition(env, b.condition), b.body)
         }
         if hasElse {
             checkBlock(c, env, otherwise)
         }
         return env
-    } else if s is ast.Stmt.SwitchStmt(lets, subjects, arms, line, binds) {
-        checkSwitch(c, env, lets, subjects, arms, line, binds)
+    } else if s is ast.Stmt.SwitchStmt(lets, subjects, arms, binds, where) {
+        checkSwitch(c, env, lets, subjects, arms, where, binds)
         return env
     }
     return checkStmtTail(c, env, s)
 }
 
-proc checkSwitch(c: mut Check, env: infer.Env, lets: ast.Stmt[], subjects: ast.Expr[], arms: ast.Branch[], line: Int, binds: Bool): void {
+proc checkSwitch(c: mut Check, env: infer.Env, lets: ast.Stmt[], subjects: ast.Expr[], arms: ast.Branch[], where: token.Pos, binds: Bool): void {
     before := len(c.errors)
-    inner := checkLets(c, env, lets, line, binds, 0)
+    inner := checkLets(c, env, lets, where, binds, 0)
     for each subject in subjects {
         checkExpr(c, inner, subject)
     }
     for each arm in arms {
-        checkCondition(c, inner, arm.condition)
+        checkGuard(c, inner, arm.condition)
     }
     // Coverage over a pattern already found wrong would only repeat the mistake.
     clean := len(c.errors) == before
@@ -929,29 +1086,29 @@ proc checkSwitch(c: mut Check, env: infer.Env, lets: ast.Stmt[], subjects: ast.E
         }
     }
     if binds {
-        checkElseLeaves(c, arms, line)
+        checkElseLeaves(c, env, arms, where)
         checkRest(c, inner, arms)
     }
     if clean && binds {
-        checkElseCover(c, subjects, arms, line)
+        checkElseCover(c, env, subjects, arms, where)
     } else if clean {
-        checkCover(c, subjects, arms, line)
+        checkCover(c, env, subjects, arms, where)
     }
 }
 
-proc checkLets(c: mut Check, env: infer.Env, lets: ast.Stmt[], line: Int, binds: Bool, at: Int): infer.Env {
+proc checkLets(c: mut Check, env: infer.Env, lets: ast.Stmt[], where: token.Pos, binds: Bool, at: Int): infer.Env {
     if lets bounds at {
-        if lets[at] is ast.Stmt.VarDecl(name, value, _, _) {
+        if lets[at] is ast.Stmt.VarDecl(name, value, _, _, _) {
             checkExpr(c, env, value)
             ty := infer.typeOf(env, value)
             if ty is types.Ty.TVoid && binds {
-                reportAt(c, line, "this binding takes its value from a call that answers with nothing, so there is nothing for its pattern to match")
+                reportAt(c, where, "this binding takes its value from a call that answers with nothing, so there is nothing for its pattern to match")
             } else if ty is types.Ty.TVoid {
-                reportAt(c, line, "this `switch` tests a call that answers with nothing, so there is nothing for its arms to match")
+                reportAt(c, where, "this `switch` tests a call that answers with nothing, so there is nothing for its arms to match")
             }
-            return checkLets(c, infer.bound(env, name, ty), lets, line, binds, at + 1)
+            return checkLets(c, infer.bound(env, name, ty), lets, where, binds, at + 1)
         }
-        return checkLets(c, env, lets, line, binds, at + 1)
+        return checkLets(c, env, lets, where, binds, at + 1)
     }
     return env
 }
@@ -967,52 +1124,52 @@ proc checkRest(c: mut Check, env: infer.Env, arms: ast.Branch[]): void {
     }
 }
 
-proc checkElseLeaves(c: mut Check, arms: ast.Branch[], line: Int): void {
+proc checkElseLeaves(c: mut Check, env: infer.Env, arms: ast.Branch[], where: token.Pos): void {
     mut n := 0
     for each arm in arms {
-        if n > 0 && leaves(c.table, arm.body) == false {
-            reportAt(c, line, "arm {n} of this `else` can carry on past its end, into the lines that run only once the pattern has matched. End it in `return`, `panic`, `break` or `continue`")
+        if n > 0 && leaves(env.table, arm.body) == false {
+            reportAt(c, where, "arm {n} of this `else` can carry on past its end, into the lines that run only once the pattern has matched. End it in `return`, `panic`, `break` or `continue`")
         }
         n++
     }
 }
 
-proc checkElseCover(c: mut Check, subjects: ast.Expr[], arms: ast.Branch[], line: Int): void {
-    for each n in cover.deadArms(c.table, subjects, arms) {
+proc checkElseCover(c: mut Check, env: infer.Env, subjects: ast.Expr[], arms: ast.Branch[], where: token.Pos): void {
+    for each n in cover.deadArms(env.table, subjects, arms) {
         at := n - 1
         mut byPattern := false
         if arms bounds 0 && arms bounds at {
-            byPattern = len(cover.deadArms(c.table, subjects, [arms[0], arms[at]])) > 0
+            byPattern = len(cover.deadArms(env.table, subjects, [arms[0], arms[at]])) > 0
         }
         if byPattern {
-            reportAt(c, line, "arm {at} of this `else` can never run: the pattern takes every value it would. Take it out")
+            reportAt(c, where, "arm {at} of this `else` can never run: the pattern takes every value it would. Take it out")
         } else {
-            reportAt(c, line, "arm {at} of this `else` can never run: the arms above it take every value it would. Take it out, or move it above the arm that takes its values")
+            reportAt(c, where, "arm {at} of this `else` can never run: the arms above it take every value it would. Take it out, or move it above the arm that takes its values")
         }
     }
-    if cover.unmatched(c.table, subjects, arms) is Result.Ok(value) {
+    if cover.unmatched(env.table, subjects, arms) is Result.Ok(value) {
         if value == "_" {
-            reportAt(c, line, "the arms of this `else` cannot take every value the pattern leaves: no finite set of patterns covers a number, an atom or a string, so this `else` ends with `_`")
+            reportAt(c, where, "the arms of this `else` cannot take every value the pattern leaves: no finite set of patterns covers a number, an atom or a string, so this `else` ends with `_`")
         } else {
-            reportAt(c, line, "neither the pattern nor an arm of this `else` takes `{value}`. Give that an arm of its own, or end the `else` with `_`")
+            reportAt(c, where, "neither the pattern nor an arm of this `else` takes `{value}`. Give that an arm of its own, or end the `else` with `_`")
         }
     }
 }
 
-proc checkCover(c: mut Check, subjects: ast.Expr[], arms: ast.Branch[], line: Int): void {
-    for each n in cover.deadArms(c.table, subjects, arms) {
-        reportAt(c, line, "arm {n} of this `switch` can never run: the arms above it take every value it would. Take it out, or move it above the arm that takes its values")
+proc checkCover(c: mut Check, env: infer.Env, subjects: ast.Expr[], arms: ast.Branch[], where: token.Pos): void {
+    for each n in cover.deadArms(env.table, subjects, arms) {
+        reportAt(c, where, "arm {n} of this `switch` can never run: the arms above it take every value it would. Take it out, or move it above the arm that takes its values")
     }
     rest := wildcards(len(subjects))
     if len(arms) == 0 {
-        reportAt(c, line, "this `switch` has no arms, and it has to take every value it tests — an arm of `{rest}` takes anything")
+        reportAt(c, where, "this `switch` has no arms, and it has to take every value it tests — an arm of `{rest}` takes anything")
         return
     }
-    if cover.unmatched(c.table, subjects, arms) is Result.Ok(value) {
+    if cover.unmatched(env.table, subjects, arms) is Result.Ok(value) {
         if value == rest {
-            reportAt(c, line, "the arms of this `switch` cannot take every value it tests: no finite set of patterns covers a number, an atom or a string, so a `switch` over one ends with `{rest}`")
+            reportAt(c, where, "the arms of this `switch` cannot take every value it tests: no finite set of patterns covers a number, an atom or a string, so a `switch` over one ends with `{rest}`")
         } else {
-            reportAt(c, line, "no arm of this `switch` takes `{value}`. Give that an arm of its own, or end the `switch` with `{rest}`")
+            reportAt(c, where, "no arm of this `switch` takes `{value}`. Give that an arm of its own, or end the `switch` with `{rest}`")
         }
     }
 }
@@ -1060,7 +1217,7 @@ proc checkHoldsValue(c: mut Check, name: Str, ty: types.Ty, deferred: Bool): voi
 }
 
 proc checkStmtTail(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
-    if s is ast.Stmt.ForLoop(init, cond, post, body) {
+    if s is ast.Stmt.ForLoop(init, cond, post, body, _) {
         mark := len(c.mutable)
         // The counter belongs to the loop, not to the block around it.
         declaredMark := len(c.declared)
@@ -1084,7 +1241,7 @@ proc checkStmtTail(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
             }
         }
         return env
-    } else if s is ast.Stmt.ForEach(name, declared, subject, body) {
+    } else if s is ast.Stmt.ForEach(name, declared, subject, body, _) {
         checkExpr(c, env, subject)
         subjectType := infer.typeOf(env, subject)
         // A turn of the loop would have to be handed a map's key or its value,
@@ -1110,22 +1267,24 @@ proc checkStmtTail(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
             report(c, "`break` and `continue` act on the innermost enclosing loop, and there is none here")
         }
         return env
-    } else if s is ast.Stmt.EchoStmt(value) {
+    } else if s is ast.Stmt.EchoStmt(value, _) {
         checkExpr(c, env, value)
         checkShown(c, env, value, "`echo`")
         return env
-    } else if s is ast.Stmt.AssertStmt(condition) {
+    } else if s is ast.Stmt.AssertStmt(condition, _) {
         checkCondition(c, env, condition)
         return env
-    } else if s is ast.Stmt.PanicStmt(value) {
+    } else if s is ast.Stmt.PanicStmt(value, _) {
         checkExpr(c, env, value)
         checkShown(c, env, value, "`panic`")
         return env
-    } else if s is ast.Stmt.AsyncStmt(call) {
+    } else if s is ast.Stmt.AsyncStmt(call, _) {
         checkAsync(c, env, call)
         return env
-    } else if s is ast.Stmt.Expression(value) {
+    } else if s is ast.Stmt.Expression(value, _) {
+        c.bare = true
         checkStatementExpr(c, env, value)
+        c.bare = false
         return env
     }
     return env
@@ -1171,7 +1330,7 @@ proc checkAssign(c: mut Check, env: infer.Env, target: ast.Expr, value: ast.Expr
         report(c, "cannot assign to `{root}`: it is immutable — declare it with `mut` to allow reassignment")
         return
     }
-    if target is ast.Expr.Member(owner, _) && types.isUnion(env.table, infer.typeOf(env, owner)) {
+    if target is ast.Expr.Member(owner, _, _) && types.isUnion(env.table, infer.typeOf(env, owner)) {
         report(c, "a value of a union is taken apart with `is` and built whole, so one of its fields is not assigned on its own. Build the variant again with the new value")
         return
     }
@@ -1181,7 +1340,7 @@ proc checkAssign(c: mut Check, env: infer.Env, target: ast.Expr, value: ast.Expr
 // Whether a target writes through a `Str`'s subscript, at any depth: `s[0]` and
 // `rows[2][1]` where the row is a `Str` are the same mistake.
 func writesIntoStr(env: infer.Env, target: ast.Expr): Bool {
-    if target is ast.Expr.Index(subject, _) {
+    if target is ast.Expr.Index(subject, _, _) {
         return infer.typeOf(env, subject) is types.Ty.TStr
     }
     return false
@@ -1190,9 +1349,9 @@ func writesIntoStr(env: infer.Env, target: ast.Expr): Bool {
 // The name a target is a path into: `v`, `v[0]`, `rec.f` and `b.items[2]` all
 // answer with the variable at the bottom, whose mutability decides.
 func rootName(target: ast.Expr): Str {
-    if target is ast.Expr.Ident(name) { return name }
-    if target is ast.Expr.Member(subject, _) { return rootName(subject) }
-    if target is ast.Expr.Index(subject, _) { return rootName(subject) }
+    if target is ast.Expr.Ident(name, _) { return name }
+    if target is ast.Expr.Member(subject, _, _) { return rootName(subject) }
+    if target is ast.Expr.Index(subject, _, _) { return rootName(subject) }
     return ""
 }
 
@@ -1202,6 +1361,12 @@ func isMutable(mutable: Str[], name: Str): Bool {
 
 // A condition is a `Bool` and nothing else. There is no truthiness in Hive: an
 // atom is a label rather than a yes or a no, and a number is a number.
+proc checkGuard(c: mut Check, env: infer.Env, condition: ast.Expr): void {
+    c.guard = true
+    checkCondition(c, env, condition)
+    c.guard = false
+}
+
 proc checkCondition(c: mut Check, env: infer.Env, condition: ast.Expr): void {
     checkExpr(c, env, condition)
     ty := infer.typeOf(env, condition)
@@ -1299,7 +1464,7 @@ proc refusesAlignment(c: mut Check, shown: Str, offset: Int, width: Int, little:
 // refused.
 proc partWidth(c: mut Check, env: infer.Env, part: ast.BitPart): Int {
     if (part.declared is ast.TypeExpr.VoidType) == false {
-        said := types.resolve(c.table, part.declared)
+        said := types.resolve(env.table, part.declared)
         if infer.intLiteral(part.value) is Result.Ok(n) {
             if widthOf(said) == 0 {
                 report(c, "`{n}: " + types.show(said) + "` says the literal is a " + types.show(said) + ", which is no integer type")
@@ -1344,9 +1509,43 @@ func afterCondition(env: infer.Env, condition: ast.Expr): infer.Env {
 // --- Expressions -------------------------------------------------------------
 
 proc checkExpr(c: mut Check, env: infer.Env, e: ast.Expr): void {
-    if e is ast.Expr.Call(callee, args) {
+    if e is ast.Expr.Absent {
+        return
+    }
+    outer := c.at
+    c.at = e.at
+    if c.watching != "" && e.at.file == c.watching {
+        see(c, env, e)
+    }
+    if (e is ast.Expr.Call(_, _, _)) == false {
+        c.bare = false
+    }
+    // An `&&` chain that binds is tested the way a branch's condition is, wherever it stands.
+    guarded := c.guard || (isConjunction(e) && ast.conjunctsBind(ast.conjuncts(e)))
+    held := c.guard
+    c.guard = guarded && isConjunction(e)
+    if guarded == false && e is ast.Expr.IsMatch(_, pattern, _) && pattern is ast.Pattern.VectorPat(_, _) {
+        report(c, "a vector pattern outside an `if` condition binds nothing, so it has no value to give")
+    }
+    checkWritten(c, env, e)
+    c.guard = held
+    c.at = outer
+}
+
+func isConjunction(e: ast.Expr): Bool {
+    if e is ast.Expr.Binary(op, _, _, _) {
+        return op is ast.BinOp.And
+    }
+    return false
+}
+
+proc checkWritten(c: mut Check, env: infer.Env, e: ast.Expr): void {
+    if e is ast.Expr.Call(callee, args, _) {
+        if infer.isEmptyMap(e) {
+            append(c.empties, infer.emptyMapAt(e))
+        }
         checkCall(c, env, callee, args)
-    } else if e is ast.Expr.Binary(op, left, right) {
+    } else if e is ast.Expr.Binary(op, left, right, _) {
         checkExpr(c, env, left)
         // A binding an `is` made is usable in the rest of the same condition after
         // `&&`, which is why the two are told apart here.
@@ -1358,7 +1557,7 @@ proc checkExpr(c: mut Check, env: infer.Env, e: ast.Expr): void {
             checkExpr(c, env, right)
             checkOperands(c, env, op, left, right)
         }
-    } else if e is ast.Expr.Negate(operand) {
+    } else if e is ast.Expr.Negate(operand, _) {
         checkExpr(c, env, operand)
         ty := infer.typeOf(env, operand)
         if types.isUnsigned(ty) {
@@ -1366,18 +1565,18 @@ proc checkExpr(c: mut Check, env: infer.Env, e: ast.Expr): void {
         } else if (types.isNumber(ty) || ty is types.Ty.TUnknown) == false {
             report(c, "unary `-` negates an `Int` or a `Float`, and this is " + types.show(ty))
         }
-    } else if e is ast.Expr.AwaitAll(calls, timeout) {
+    } else if e is ast.Expr.AwaitAll(calls, timeout, _) {
         checkAwaitAll(c, env, calls, timeout)
-    } else if e is ast.Expr.Timed(call, ms) {
+    } else if e is ast.Expr.Timed(call, ms, _) {
         checkExpr(c, env, call)
         fits(c, types.Ty.TInt(), infer.typeOf(env, ms), "the milliseconds `with timeout` waits")
         if infer.isSendExpr(env, call) == false && infer.typeOf(env, call) is types.Ty.TVoid {
             report(c, "`with timeout` answers with a `Result` of what the call answers, and this call answers with nothing, so there is no value to wait for. Fire it off with `async`, or have it answer with something")
         }
-    } else if e is ast.Expr.Not(operand) {
+    } else if e is ast.Expr.Not(operand, _) {
         checkExpr(c, env, operand)
         checkNegated(c, env, operand)
-    } else if e is ast.Expr.BitNot(operand) {
+    } else if e is ast.Expr.BitNot(operand, _) {
         checkExpr(c, env, operand)
         ty := infer.typeOf(env, operand)
         if (types.isInteger(ty) || ty is types.Ty.TUnknown) == false {
@@ -1387,34 +1586,34 @@ proc checkExpr(c: mut Check, env: infer.Env, e: ast.Expr): void {
             }
             report(c, "`~` flips an integer's bits, and this is " + types.show(ty) + instead)
         }
-    } else if e is ast.Expr.Bits(parts) {
+    } else if e is ast.Expr.Bits(parts, _) {
         checkBitsLit(c, env, parts)
-    } else if e is ast.Expr.Index(subject, index) {
+    } else if e is ast.Expr.Index(subject, index, _) {
         checkExpr(c, env, subject)
         checkExpr(c, env, index)
         checkIndexable(c, env, subject)
-    } else if e is ast.Expr.Slice(subject, low, high) {
+    } else if e is ast.Expr.Slice(subject, low, high, _) {
         checkExpr(c, env, subject)
         checkExpr(c, env, low)
         checkExpr(c, env, high)
         checkIndexable(c, env, subject)
-    } else if e is ast.Expr.VectorLit(items) {
+    } else if e is ast.Expr.VectorLit(items, _) {
         for each item in items {
             checkExpr(c, env, item)
         }
-    } else if e is ast.Expr.Interp(parts) {
+    } else if e is ast.Expr.Interp(parts, _) {
         for each part in parts {
             if part is ast.InterpPart.Expression(value) {
                 checkExpr(c, env, value)
                 checkShown(c, env, value, "an interpolation")
             }
         }
-    } else if e is ast.Expr.IsMatch(subject, pattern) {
+    } else if e is ast.Expr.IsMatch(subject, pattern, _) {
         checkExpr(c, env, subject)
         checkPattern(c, env, subject, pattern)
-    } else if e is ast.Expr.Ident(name) {
+    } else if e is ast.Expr.Ident(name, _) {
         checkName(c, env, name)
-    } else if e is ast.Expr.Member(subject, field) {
+    } else if e is ast.Expr.Member(subject, field, _) {
         checkMember(c, env, subject, field)
     }
 }
@@ -1424,7 +1623,7 @@ proc checkShown(c: mut Check, env: infer.Env, value: ast.Expr, what: Str): void 
     ty := infer.typeOf(env, value)
     if ty is types.Ty.TSecret(_) {
         report(c, what + " cannot show " + types.show(ty) + ": only `reveal` opens a `Secret`")
-    } else if types.holdsSecret(c.table, ty) {
+    } else if types.holdsSecret(env.table, ty) {
         report(c, what + " cannot show " + types.show(ty) + ", which holds a `Secret`: only `reveal` opens one")
     }
 }
@@ -1439,19 +1638,21 @@ proc checkIndexable(c: mut Check, env: infer.Env, subject: ast.Expr): void {
 }
 
 proc checkName(c: mut Check, env: infer.Env, name: Str): void {
-    if name == "_" || name == "hive" {
+    if name == "_" {
         return
     }
     if infer.isBound(env, name) {
         return
     }
+    if name == "hive" {
+        report(c, "`hive` is the standard library, and it is not a value: what it has is reached through it, as `hive.<module>.<name>`")
+        return
+    }
     if types.findCallable(env.table, name) is Result.Ok(_) {
         return
     }
-    if types.findType(env.table, name) is Result.Ok(_) {
-        return
-    }
-    if name == "Result" {
+    if types.findType(env.table, name) is Result.Ok(_) || name == "Result" {
+        report(c, "`" + types.shownName(name) + "` is a type, and a type is not a value")
         return
     }
     // A builtin is a name a *call* reaches, never a value. Several are overloaded
@@ -1468,14 +1669,23 @@ proc checkName(c: mut Check, env: infer.Env, name: Str): void {
 proc checkMember(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str): void {
     // A `hive.<module>.<name>` is a library call and is checked where it is
     // called, not where the module is named.
-    if subject is ast.Expr.Ident(head) {
+    if subject is ast.Expr.Ident(head, _) {
         if head == "hive" {
             if infer.isBuiltin(field) {
                 report(c, "`hive.{field}` is a builtin, so it cannot be used as a value: several builtins are overloaded, and which one a reference means is decided by the argument types a value does not carry. Call it, or wrap it in a `func` of your own")
+            } else if stdlib.isKnownModule(field) {
+                report(c, "`hive.{field}` is a module, and a module is not a value: what it has is reached through it, as `hive.{field}.<name>`")
+            } else {
+                report(c, "this compiler does not carry `hive.{field}`")
             }
             return
         }
         if head == "Result" {
+            if field == "Ok" || field == "Error" {
+                report(c, "`Result.{field}` is a variant of `Result`, and a variant is a value only once it is built: `Result.{field}(...)` builds one. Nor is a constructor a bare reference — `Result.{field}(_)` is the spelling that is a function value")
+            } else {
+                report(c, "`Result` has two variants, `Ok` and `Error`, and `{field}` is neither")
+            }
             return
         }
         if types.findType(env.table, head) is Result.Ok(_) {
@@ -1483,12 +1693,21 @@ proc checkMember(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str): v
             return
         }
     }
-    if subject is ast.Expr.Member(root, module) {
-        if root is ast.Expr.Ident(hiveName) {
+    if subject is ast.Expr.Member(root, module, _) {
+        if root is ast.Expr.Ident(hiveName, _) {
             if hiveName == "hive" {
-                if stdlib.isKnownModule(module) && stdlib.hasName(module, field) && stdlib.isLibType(module, field) == false {
-                    report(c, "`hive.{module}.{field}` is a library call, and a library call cannot be used as a value. Wrap it in a `func` of your own, and use that")
+                wrong := libraryValue(env.table, module, field)
+                if wrong == "" {
+                    report(c, "`hive.{module}.{field}` is a type, and a type is not a value")
+                } else {
+                    report(c, wrong)
                 }
+                return
+            }
+        }
+        if root is ast.Expr.Member(head, libModule, _) {
+            if head is ast.Expr.Ident(rootName, _) && rootName == "hive" {
+                checkLibraryMember(c, env, libModule, module, field)
                 return
             }
         }
@@ -1506,6 +1725,37 @@ proc checkMember(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str): v
     }
 }
 
+// What is wrong with `hive.<module>.<name>` where a value was wanted, or `""` for a type.
+func libraryValue(t: types.Table, module: Str, name: Str): Str {
+    if stdlib.isKnownModule(module) == false {
+        return "this compiler does not carry `hive.{module}`"
+    }
+    if stdlib.hasName(t, module, name) == false {
+        return "`hive.{module}` has no `{name}`"
+    }
+    if stdlib.isLibType(t, module, name) == false {
+        return "`hive.{module}.{name}` is a library call, and a library call cannot be used as a value. Wrap it in a `func` of your own, and use that"
+    }
+    return ""
+}
+
+proc checkLibraryMember(c: mut Check, env: infer.Env, module: Str, typeName: Str, field: Str): void {
+    wrong := libraryValue(env.table, module, typeName)
+    if wrong != "" {
+        report(c, wrong)
+        return
+    }
+    shown := "hive.{module}.{typeName}"
+    variants := stdlib.variantsOf(env.table, module, typeName)
+    if indexOf(variants, field) is Result.Ok(_) {
+        report(c, "`{shown}.{field}` is a variant of `{shown}`, and a variant is a value only once it is built: write `{shown}.{field}()`. One that carries nothing is still built by calling it")
+    } else if len(variants) > 0 {
+        report(c, "`{shown}` has no variant `{field}`. Its variants are " + join(variants, ", "))
+    } else {
+        report(c, "`{shown}` has no `{field}`")
+    }
+}
+
 func hasNoFields(ty: types.Ty): Bool {
     return ty is types.Ty.TStr || types.isNumber(ty)
         || ty is types.Ty.TBool || ty is types.Ty.TAtom || ty is types.Ty.TAddress(_)
@@ -1515,7 +1765,7 @@ func hasNoFields(ty: types.Ty): Bool {
 }
 
 func shadowedModule(subject: ast.Expr): Str {
-    if subject is ast.Expr.Ident(name) {
+    if subject is ast.Expr.Ident(name, _) {
         if stdlib.isKnownModule(name) {
             return ": this `{name}` is the program's own, and the library module is `hive.{name}`"
         }
@@ -1565,13 +1815,16 @@ func variantOnly(t: types.Table, typeName: Str, field: Str): Str {
 // call a variant carrying fields is built by — so the name on its own is the
 // variant rather than a value of it, and Go has nothing to make of it.
 proc checkVariantValue(c: mut Check, env: infer.Env, head: Str, field: Str): void {
+    shown := types.shownName(head)
     if types.findVariant(env.table, head, field) is Result.Ok(fields) {
         if len(fields) == 0 {
-            report(c, "`{head}.{field}` is a variant of `{head}`, and a variant is a value only once it is built: write `{head}.{field}()`. One that carries nothing is still built by calling it")
+            report(c, "`{shown}.{field}` is a variant of `{shown}`, and a variant is a value only once it is built: write `{shown}.{field}()`. One that carries nothing is still built by calling it")
             return
         }
-        report(c, "`{head}.{field}` is a variant of `{head}`, and a variant is a value only once it is built: `{head}.{field}(...)` builds one. Nor is a constructor a bare reference — `{head}.{field}(_)` is the spelling that is a function value")
+        report(c, "`{shown}.{field}` is a variant of `{shown}`, and a variant is a value only once it is built: `{shown}.{field}(...)` builds one. Nor is a constructor a bare reference — `{shown}.{field}(_)` is the spelling that is a function value")
+        return
     }
+    report(c, "`{shown}` has no variant `{field}`")
 }
 
 func hasField(t: types.Table, typeName: Str, field: Str): Bool {
@@ -1623,22 +1876,22 @@ proc checkOperands(c: mut Check, env: infer.Env, op: ast.BinOp, left: ast.Expr, 
             report(c, "`" + ast.opSpelling(op) + "` wants two of one type, and these are " + types.show(leftType) + " and " + types.show(rightType) + whyMixed(leftType, rightType))
             return
         }
-        checkOperandKind(c, op, leftType)
+        checkOperandKind(c, env, op, leftType)
         return
     }
     spelled := "`" + ast.opSpelling(op) + "`"
     if literalMisses(c, operands, left, spelled) || literalMisses(c, operands, right, spelled) {
         return
     }
-    checkOperandKind(c, op, operands)
+    checkOperandKind(c, env, op, operands)
 }
 
 // What each operator is defined on (5.6), once both sides are the same type.
-proc checkOperandKind(c: mut Check, op: ast.BinOp, ty: types.Ty): void {
+proc checkOperandKind(c: mut Check, env: infer.Env, op: ast.BinOp, ty: types.Ty): void {
     spelled := "`" + ast.opSpelling(op) + "`"
     number := types.isNumber(ty)
     if op is ast.BinOp.Eq || op is ast.BinOp.Neq {
-        if types.holds(c.table, ty, isFunction, []) {
+        if types.holds(env.table, ty, isFunction, []) {
             report(c, spelled + " compares two values, and a function value has no equality to compare — two that do the same thing cannot be told from two that do not. Compare what they answer with instead")
         }
     } else if op is ast.BinOp.Lt || op is ast.BinOp.Gt || op is ast.BinOp.Le || op is ast.BinOp.Ge {
@@ -1696,6 +1949,8 @@ func isFunction(ty: types.Ty): Bool {
 // --- Calls -------------------------------------------------------------------
 
 proc checkCall(c: mut Check, env: infer.Env, callee: ast.Expr, args: ast.Arg[]): void {
+    bare := c.bare
+    c.bare = false
     for each a in args {
         if a.value is ast.Expr.Hole {
             continue
@@ -1705,12 +1960,16 @@ proc checkCall(c: mut Check, env: infer.Env, callee: ast.Expr, args: ast.Arg[]):
     if infer.typeOf(env, callee) is types.Ty.TAddress(mailbox) {
         checkSend(c, env, callee, mailbox, args)
     }
-    if callee is ast.Expr.Ident(name) {
+    if callee is ast.Expr.Ident(name, _) {
+        c.bare = bare
         checkNamedCall(c, env, name, args)
+        c.bare = false
         return
     }
-    if callee is ast.Expr.Member(subject, field) {
+    if callee is ast.Expr.Member(subject, field, _) {
+        c.bare = bare
         checkMemberCall(c, env, subject, field, args)
+        c.bare = false
         return
     }
     checkExpr(c, env, callee)
@@ -1732,6 +1991,7 @@ proc checkSend(c: mut Check, env: infer.Env, callee: ast.Expr, mailbox: types.Ty
         return
     }
     fitsArg(c, env, mailbox, args, 0, "the message sent to an `" + types.show(types.Ty.TAddress(mailbox)) + "`")
+    checkCrosses(c, env, "a message to a service", mailbox)
 }
 
 proc checkNamedCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): void {
@@ -1741,7 +2001,7 @@ proc checkNamedCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): v
     target := infer.callTarget(env, name)
     if target is infer.CallTarget.Bound {
         checkCallableValue(c, env, name)
-        if infer.typeOf(env, ast.Expr.Ident(name)) is types.Ty.TFn(_, params, mutables, _) {
+        if infer.typeOf(env, ast.Expr.Ident(name, c.at)) is types.Ty.TFn(_, params, mutables, _) {
             checkValueArguments(c, env, "`{name}`", params, mutables, args)
         }
     } else if target is infer.CallTarget.Declared(info) {
@@ -1761,7 +2021,7 @@ proc checkNamedCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): v
 // or an address, which a call sends to and waits for the answer of. `TUnknown` and a
 // type variable are not complained about, having been complained about already.
 proc checkCallableValue(c: mut Check, env: infer.Env, name: Str): void {
-    ty := infer.typeOf(env, ast.Expr.Ident(name))
+    ty := infer.typeOf(env, ast.Expr.Ident(name, c.at))
     if ty is types.Ty.TFn(_, _, _, _) {
         return
     }
@@ -1778,7 +2038,7 @@ proc checkCallableValue(c: mut Check, env: infer.Env, name: Str): void {
 }
 
 proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str, args: ast.Arg[]): void {
-    if subject is ast.Expr.Ident(head) {
+    if subject is ast.Expr.Ident(head, _) {
         if head == "Result" {
             if field != "Ok" && field != "Error" {
                 report(c, "`Result` has two variants, `Ok` and `Error`, and `{field}` is neither")
@@ -1819,10 +2079,10 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
             return
         }
     }
-    if subject is ast.Expr.Member(root, module) {
+    if subject is ast.Expr.Member(root, module, _) {
         // `T.Variant.decode(text, codec)` — the one variant's own decoder.
         if field == "decode" {
-            if root is ast.Expr.Ident(head) {
+            if root is ast.Expr.Ident(head, _) {
                 shown := types.shownName(head)
                 if stdlib.isJsonValue(head) {
                     report(c, "a document says for itself which variant of `{shown}` it is, so it is read whole: `{shown}.decode(text, codec)`")
@@ -1838,11 +2098,11 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
                 }
             }
         }
-        if root is ast.Expr.Ident(hiveName) {
+        if root is ast.Expr.Ident(hiveName, _) {
             if hiveName == "hive" {
                 if stdlib.isKnownModule(module) == false {
                     report(c, "this compiler does not carry `hive.{module}`")
-                } else if stdlib.hasName(module, field) == false {
+                } else if stdlib.hasName(env.table, module, field) == false {
                     report(c, "`hive.{module}` has no `{field}`")
                 } else {
                     checkLibraryArguments(c, env, module, field, args)
@@ -1853,9 +2113,9 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
         // `hive.ui.TextSize.Caption()` — a variant of one of the library's own
         // enumerations. Nothing downstream can refuse a name that is not one: it
         // lowers to a member of a member and the Go toolchain reports it.
-        if root is ast.Expr.Member(head, libModule) {
-            if head is ast.Expr.Ident(rootName) && rootName == "hive" {
-                variants := stdlib.variantsOf(libModule, module)
+        if root is ast.Expr.Member(head, libModule, _) {
+            if head is ast.Expr.Ident(rootName, _) && rootName == "hive" {
+                variants := stdlib.variantsOf(env.table, libModule, module)
                 if len(variants) > 0 {
                     if indexOf(variants, field) is Result.Error(_) {
                         report(c, "`hive.{libModule}.{module}` has no variant `{field}`. Its variants are " + join(variants, ", "))
@@ -1866,7 +2126,7 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
                     report(c, "this compiler does not carry `hive.{libModule}`")
                     return
                 }
-                if stdlib.isLibType(libModule, module) == false {
+                if stdlib.isLibType(env.table, libModule, module) == false {
                     report(c, "`hive.{libModule}` has no `{module}`")
                     return
                 }
@@ -1875,7 +2135,7 @@ proc checkMemberCall(c: mut Check, env: infer.Env, subject: ast.Expr, field: Str
     }
     checkMember(c, env, subject, field)
     // A call through a function value is checked by what the value's type says.
-    ty := infer.typeOf(env, ast.Expr.Member(subject, field))
+    ty := infer.typeOf(env, ast.Expr.Member(subject, field, c.at))
     if ty is types.Ty.TFn(_, params, mutables, _) {
         checkValueArguments(c, env, "`{field}`", params, mutables, args)
     }
@@ -1939,18 +2199,18 @@ proc checkLentApart(c: mut Check, shown: Str, lent: ast.Expr[]): void {
 
 // `[?]` stands for an index that is not a literal.
 func stepsOf(e: ast.Expr): Str[dyn] {
-    if e is ast.Expr.Ident(name) { return [name] }
-    if e is ast.Expr.Member(subject, field) {
+    if e is ast.Expr.Ident(name, _) { return [name] }
+    if e is ast.Expr.Member(subject, field, _) {
         mut out := stepsOf(subject)
         if len(out) > 0 {
             append(out, "." + field)
         }
         return out
     }
-    if e is ast.Expr.Index(subject, index) {
+    if e is ast.Expr.Index(subject, index, _) {
         mut out := stepsOf(subject)
         if len(out) > 0 {
-            if index is ast.Expr.IntLit(n) {
+            if index is ast.Expr.IntLit(n, _) {
                 append(out, "[{n}]")
             } else {
                 append(out, "[?]")
@@ -1993,15 +2253,15 @@ func sameStep(a: Str, b: Str): Bool {
 }
 
 func pathText(e: ast.Expr): Str {
-    if e is ast.Expr.Ident(name) { return name }
-    if e is ast.Expr.Member(subject, field) { return pathText(subject) + "." + field }
-    if e is ast.Expr.Index(subject, index) {
-        if index is ast.Expr.IntLit(n) {
+    if e is ast.Expr.Ident(name, _) { return name }
+    if e is ast.Expr.Member(subject, field, _) { return pathText(subject) + "." + field }
+    if e is ast.Expr.Index(subject, index, _) {
+        if index is ast.Expr.IntLit(n, _) {
             return pathText(subject) + "[{n}]"
         }
         return pathText(subject) + "[" + pathText(index) + "]"
     }
-    if e is ast.Expr.StrLit(t) { return "\"{t}\"" }
+    if e is ast.Expr.StrLit(t, _) { return "\"{t}\"" }
     if infer.intLiteral(e) is Result.Ok(n) { return "{n}" }
     return "…"
 }
@@ -2016,7 +2276,7 @@ func pathText(e: ast.Expr): Str {
 proc checkLibraryArguments(c: mut Check, env: infer.Env, module: Str, name: Str, written: ast.Arg[]): void {
     // One of the library's own types being built takes its fields, matched by
     // name the way a declared type's are.
-    fields := stdlib.fieldsOf(module, name)
+    fields := stdlib.fieldsOf(env.table, module, name)
     if len(fields) > 0 {
         checkFieldArguments(c, env, "hive.{module}.{name}", fields, written)
         return
@@ -2024,10 +2284,10 @@ proc checkLibraryArguments(c: mut Check, env: infer.Env, module: Str, name: Str,
     if refusesHoles(c, "`hive.{module}.{name}`", written) {
         return
     }
-    if checkArgumentNames(c, "hive.{module}.{name}", stdlib.paramNamesOf(module, name), written) == false {
+    if checkArgumentNames(c, "hive.{module}.{name}", stdlib.paramNamesOf(env.table, module, name), written) == false {
         return
     }
-    args := stdlib.libraryArgs(module, name, written)
+    args := stdlib.libraryArgs(env.table, module, name, written)
     if module == "sql" && name == "run" {
         checkRunsQuery(c, env, args)
     }
@@ -2039,6 +2299,7 @@ proc checkLibraryArguments(c: mut Check, env: infer.Env, module: Str, name: Str,
         if infer.typeOf(env, ast.argFor(args, "", 0)) is types.Ty.TAddress(mailbox) {
             fits(c, mailbox, typeOfArg(c, env, args, 2), "the notice `hive.syslink.monitor` posts to the watcher")
         }
+        checkCrosses(c, env, "the notice `hive.syslink.monitor` posts", typeOfArg(c, env, args, 2))
     }
     // `set` and `delete` write into the map they are handed, so they follow
     // `append`'s rule: the map is a `mut` variable or a path into one. Anything
@@ -2058,12 +2319,12 @@ proc checkLibraryArguments(c: mut Check, env: infer.Env, module: Str, name: Str,
             fitsValue(c, env, value, args[2].value, "the value `hive.map.set` puts in")
         }
     }
-    if stdlib.signatureOf(module, name) is Result.Ok(wanted) {
+    if stdlib.signatureOf(env.table, module, name) is Result.Ok(wanted) {
         if len(args) != len(wanted) {
             report(c, "`hive.{module}.{name}` takes " + countOf(len(wanted)) + ", and this call passes " + countOf(len(args)))
             return
         }
-        names := stdlib.paramNamesOf(module, name)
+        names := stdlib.paramNamesOf(env.table, module, name)
         named := ast.anyNamed(written)
         mut i := 0
         for each a in args {
@@ -2078,7 +2339,7 @@ proc checkLibraryArguments(c: mut Check, env: infer.Env, module: Str, name: Str,
             }
             if wanted bounds i {
                 mut here := wanted[i]
-                if module == "math" && stdlib.resultOf(module, name, infer.mathArgTypes(env, args)) is types.Ty.TFloat32 {
+                if module == "math" && stdlib.resultOf(env.table, module, name, infer.mathArgTypes(env, args)) is types.Ty.TFloat32 {
                     here = types.Ty.TFloat32()
                 }
                 fitsValue(c, env, here, a.value, which + " of `hive.{module}.{name}`")
@@ -2148,6 +2409,7 @@ proc checkHandler(c: mut Check, env: infer.Env, starts: Str, handler: ast.Expr):
                 + "`, and this one takes " + types.show(infer.typeAt(params, 2)))
             return false
         }
+        checkCrosses(c, env, "a message to a service", message)
         return true
     }
     report(c, "{starts} starts a service from a handler, " + shape + ", and this is " + types.show(ty))
@@ -2429,7 +2691,7 @@ proc checkBuiltinCall(c: mut Check, env: infer.Env, name: Str, written: ast.Arg[
         }
     } else if name == "hide" || name == "bypass" {
         if arity(c, name, args, 1) {
-            checkKeepable(c, "`{name}`", typeOfArg(c, env, args, 0))
+            checkKeepable(c, env, "`{name}`", typeOfArg(c, env, args, 0))
         }
     } else if name == "reveal" {
         if arity(c, name, args, 1) {
@@ -2458,8 +2720,8 @@ proc checkBuiltinCall(c: mut Check, env: infer.Env, name: Str, written: ast.Arg[
             if args bounds 1 {
                 format := stdlib.formatOfCodec(infer.typeOf(env, args[1].value))
                 checkNamesCodec(c, env, "`encode`", args[1].value)
-                checkFlatShape(c, "`encode`", typeOfArg(c, env, args, 0), format)
-                checkJsonShape(c, "`encode`", typeOfArg(c, env, args, 0), format, false)
+                checkFlatShape(c, env, "`encode`", typeOfArg(c, env, args, 0), format)
+                checkJsonShape(c, env, "`encode`", typeOfArg(c, env, args, 0), format, false)
             }
         }
     }
@@ -2482,10 +2744,6 @@ proc checkConversion(c: mut Check, name: Str, given: types.Ty): void {
 // `sort(v)` orders a vector by its element type's own order; `sort(v, first)`
 // orders it by a `func` answering whether its first element comes before its
 // second.
-func isEnumeration(module: Str, name: Str): Bool {
-    return len(stdlib.variantsOf(module, name)) > 0
-}
-
 proc checkSort(c: mut Check, env: infer.Env, args: ast.Arg[]): void {
     if len(args) != 1 && len(args) != 2 {
         report(c, "`sort` takes a vector, and optionally the `func` that says which of two elements comes first")
@@ -2498,7 +2756,7 @@ proc checkSort(c: mut Check, env: infer.Env, args: ast.Arg[]): void {
     }
     element := types.elementOf(subject)
     if len(args) == 1 {
-        if isVector(subject) && types.isOrdered(env.table, element, isEnumeration) == false {
+        if isVector(subject) && types.isOrdered(env.table, element) == false {
             report(c, "`sort` puts a vector in its elements' own order, and " + types.show(element)
                 + " has none: a map, an address, a `Secret` and a function value have no order, and nor does a type holding one. Hand `sort` the `func` that says which of two comes first")
         }
@@ -2580,11 +2838,11 @@ proc checkRowWidth(c: mut Check, args: ast.Arg[]): void {
 }
 
 func literalInt(e: ast.Expr): Result<Int, Bool> {
-    if e is ast.Expr.IntLit(n) {
+    if e is ast.Expr.IntLit(n, _) {
         return Result.Ok(n)
     }
-    if e is ast.Expr.Negate(operand) {
-        if operand is ast.Expr.IntLit(n) {
+    if e is ast.Expr.Negate(operand, _) {
+        if operand is ast.Expr.IntLit(n, _) {
             return Result.Ok(0 - n)
         }
     }
@@ -2691,6 +2949,10 @@ func typeAt(list: types.Ty[], index: Int): types.Ty {
 // mutable dynamic one. Dynamic has to be declared: a `:=` binding reads its
 // length off the value, and that is a static length it cannot grow out of.
 proc checkGrows(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[], wanted: Int): void {
+    // `drop` answers with what it took off; the other two answer with nothing.
+    if c.bare == false && name != "drop" {
+        append(c.pending, diag.on(c.at, diag.inDecl(c.inside, "`{name}` hands nothing back: the vector you gave it is the result, so it stands as a statement of its own rather than inside an expression")))
+    }
     if len(args) != wanted {
         report(c, "`{name}` takes " + countOf(wanted) + ", and this call passes " + countOf(len(args)))
         return
@@ -2720,16 +2982,16 @@ proc checkStatementExpr(c: mut Check, env: infer.Env, value: ast.Expr): void {
     checkExpr(c, env, value)
     // A call may stand alone for what it does; anything else only computes a
     // value, and one nothing keeps is a line that does nothing.
-    if (value is ast.Expr.Call(_, _) || value is ast.Expr.AwaitAll(_, _) || value is ast.Expr.Timed(_, _)) == false {
+    if (value is ast.Expr.Call(_, _, _) || value is ast.Expr.AwaitAll(_, _, _) || value is ast.Expr.Timed(_, _, _)) == false {
         report(c, "this computes a value and does nothing with it, so it is not a statement. Keep it — `x := ...` — or, if the value really is not wanted, `_ := ...`")
         return
     }
-    if value is ast.Expr.Call(callee, args) {
+    if value is ast.Expr.Call(callee, args, _) {
         mut name := ""
-        if callee is ast.Expr.Ident(bare) {
+        if callee is ast.Expr.Ident(bare, _) {
             name = bare
-        } else if callee is ast.Expr.Member(head, member) {
-            if head is ast.Expr.Ident(hiveName) {
+        } else if callee is ast.Expr.Member(head, member, _) {
+            if head is ast.Expr.Ident(hiveName, _) {
                 if hiveName == "hive" {
                     name = member
                 }
@@ -2754,7 +3016,7 @@ proc checkStatementExpr(c: mut Check, env: infer.Env, value: ast.Expr): void {
 proc checkAwaitAll(c: mut Check, env: infer.Env, calls: ast.Expr[], timeout: ast.Expr): void {
     mut types.Ty first = types.Ty.TUnknown()
     for each call in calls {
-        if (call is ast.Expr.Call(_, _)) == false {
+        if (call is ast.Expr.Call(_, _, _)) == false {
             checkExpr(c, env, call)
             report(c, "every entry of an await-all is a call, started on a thread of its own — this one is a value already in hand, with nothing to wait for")
             continue
@@ -2780,14 +3042,14 @@ proc checkAwaitAll(c: mut Check, env: infer.Env, calls: ast.Expr[], timeout: ast
 // `async` works on any call, and what it refuses it refuses by name.
 proc checkAsync(c: mut Check, env: infer.Env, call: ast.Expr): void {
     checkExpr(c, env, call)
-    if call is ast.Expr.Call(callee, args) {
+    if call is ast.Expr.Call(callee, args, _) {
         for each a in args {
             if a.value is ast.Expr.Hole {
                 report(c, "`async` cannot fire off a partial application: `f(1, _)` makes a function value, and nothing runs until something calls it")
                 return
             }
         }
-        if callee is ast.Expr.Ident(name) {
+        if callee is ast.Expr.Ident(name, _) {
             // A declaration of your own named after a builtin is an ordinary
             // callable, so it is fired off like any other.
             target := infer.callTarget(env, name)
@@ -2801,8 +3063,8 @@ proc checkAsync(c: mut Check, env: infer.Env, call: ast.Expr): void {
                 report(c, "`async` cannot fire off a constructor: `{name}(...)` builds a value and runs no body")
             }
         }
-        if callee is ast.Expr.Member(head, variant) {
-            if head is ast.Expr.Ident(typeName) {
+        if callee is ast.Expr.Member(head, variant, _) {
+            if head is ast.Expr.Ident(typeName, _) {
                 if typeName == "Result" || types.findType(env.table, typeName) is Result.Ok(_) {
                     report(c, "`async` cannot fire off a constructor: `{typeName}.{variant}(...)` builds a value and runs no body")
                 }
@@ -2816,7 +3078,7 @@ proc checkAsync(c: mut Check, env: infer.Env, call: ast.Expr): void {
 proc checkPattern(c: mut Check, env: infer.Env, subject: ast.Expr, p: ast.Pattern): void {
     subjectType := infer.typeOf(env, subject)
     if p is ast.Pattern.Constructor(path, bindings, parenthesised) {
-        checkConstructorPattern(c, subjectType, path, bindings, parenthesised)
+        checkConstructorPattern(c, env, subjectType, path, bindings, parenthesised)
     } else if p is ast.Pattern.VectorPat(_, _) {
         if subjectType is types.Ty.TVec(_, _) || subjectType is types.Ty.TUnknown {
             return
@@ -2859,7 +3121,7 @@ proc checkBitsPattern(c: mut Check, env: infer.Env, subject: types.Ty, fields: a
         }
         offset = offset + width
         if f.name != "" {
-            scope = infer.bound(scope, f.name, infer.bitFieldType(c.table, f))
+            scope = infer.bound(scope, f.name, infer.bitFieldType(env.table, f))
         }
     }
     if whole > 0 {
@@ -2890,7 +3152,7 @@ proc fieldWidth(c: mut Check, env: infer.Env, subject: types.Ty, f: ast.BitField
             report(c, "`{shown}` is a run of bytes, and an integer has none to give: a run reads from a `UInt8[]` or a `Str`")
             return -1
         }
-        element := types.resolve(c.table, f.declared)
+        element := types.resolve(env.table, f.declared)
         if types.same(element, types.Ty.TSized(false, 8)) == false {
             report(c, "a run in a binary pattern is bytes — `{shown}: UInt8[n]` — and this one is " + types.show(element))
             return -1
@@ -2903,7 +3165,7 @@ proc fieldWidth(c: mut Check, env: infer.Env, subject: types.Ty, f: ast.BitField
         }
         return 0
     }
-    if f.value is ast.Expr.StrLit(_) {
+    if f.value is ast.Expr.StrLit(_, _) {
         if widthOf(subject) > 0 {
             report(c, "`{shown}` matches bytes, and an integer has none to give")
             return -1
@@ -2916,7 +3178,7 @@ proc fieldWidth(c: mut Check, env: infer.Env, subject: types.Ty, f: ast.BitField
     }
     mut ty := types.Ty.TSized(false, 8)
     if (f.declared is ast.TypeExpr.VoidType) == false {
-        ty = types.resolve(c.table, f.declared)
+        ty = types.resolve(env.table, f.declared)
     }
     width := widthOf(ty)
     if width == 0 {
@@ -2944,13 +3206,13 @@ func fieldText(f: ast.BitField): Str {
     if infer.intLiteral(f.value) is Result.Ok(n) {
         return "{n}"
     }
-    if f.value is ast.Expr.StrLit(t) {
+    if f.value is ast.Expr.StrLit(t, _) {
         return "\"{t}\""
     }
     return "…"
 }
 
-proc checkConstructorPattern(c: mut Check, subjectType: types.Ty, path: Str[], bindings: Str[], parenthesised: Bool): void {
+proc checkConstructorPattern(c: mut Check, env: infer.Env, subjectType: types.Ty, path: Str[], bindings: Str[], parenthesised: Bool): void {
     head := segment(path, 0)
     variant := segment(path, 1)
     if head == "Result" {
@@ -2963,11 +3225,11 @@ proc checkConstructorPattern(c: mut Check, subjectType: types.Ty, path: Str[], b
         }
         return
     }
-    if types.findType(c.table, head) is Result.Error(_) {
+    if types.findType(env.table, head) is Result.Error(_) {
         report(c, "`{head}` is not a type anything here declared")
         return
     }
-    if types.findVariant(c.table, head, variant) is Result.Ok(fields) {
+    if types.findVariant(env.table, head, variant) is Result.Ok(fields) {
         // Name every field or none, so a pattern never quietly skips one.
         if parenthesised && len(bindings) != len(fields) {
             report(c, "`" + types.shownName(head) + ".{variant}` has " + fieldCount(len(fields)) + ", and this pattern binds " + countOf(len(bindings)) + ". Name every field or none — `_` is how one is skipped")
@@ -3015,10 +3277,10 @@ func terminates(t: types.Table, b: ast.Block): Bool {
 }
 
 func terminatesWith(t: types.Table, s: ast.Stmt): Bool {
-    if s is ast.Stmt.ReturnStmt(_) { return true }
-    if s is ast.Stmt.PanicStmt(_) { return true }
-    if s is ast.Stmt.Expression(value) { return exitsTheProgram(value) }
-    if s is ast.Stmt.IfChain(branches, otherwise, hasElse) {
+    if s is ast.Stmt.ReturnStmt(_, _) { return true }
+    if s is ast.Stmt.PanicStmt(_, _) { return true }
+    if s is ast.Stmt.Expression(value, _) { return exitsTheProgram(value) }
+    if s is ast.Stmt.IfChain(branches, otherwise, hasElse, _) {
         for each branch in branches {
             if terminates(t, branch.body) == false {
                 return false
@@ -3053,7 +3315,7 @@ func leaves(t: types.Table, b: ast.Block): Bool {
 func leavesWith(t: types.Table, s: ast.Stmt): Bool {
     if s is ast.Stmt.BreakStmt { return true }
     if s is ast.Stmt.ContinueStmt { return true }
-    if s is ast.Stmt.IfChain(branches, otherwise, hasElse) {
+    if s is ast.Stmt.IfChain(branches, otherwise, hasElse, _) {
         for each branch in branches {
             if leaves(t, branch.body) == false {
                 return false
@@ -3080,7 +3342,7 @@ func leavesWith(t: types.Table, s: ast.Stmt): Bool {
 func missedAtEnd(t: types.Table, b: ast.Block): Str {
     last := len(b.stmts) - 1
     if b.stmts bounds last {
-        if b.stmts[last] is ast.Stmt.IfChain(branches, otherwise, hasElse) {
+        if b.stmts[last] is ast.Stmt.IfChain(branches, otherwise, hasElse, _) {
             for each branch in branches {
                 if terminates(t, branch.body) == false {
                     return missedAtEnd(t, branch.body)
@@ -3103,10 +3365,10 @@ func missedAtEnd(t: types.Table, b: ast.Block): Str {
 }
 
 func exitsTheProgram(value: ast.Expr): Bool {
-    if value is ast.Expr.Call(callee, _) {
-        if callee is ast.Expr.Member(subject, name) && name == "exit" {
-            if subject is ast.Expr.Member(root, module) && module == "term" {
-                if root is ast.Expr.Ident(head) {
+    if value is ast.Expr.Call(callee, _, _) {
+        if callee is ast.Expr.Member(subject, name, _) && name == "exit" {
+            if subject is ast.Expr.Member(root, module, _) && module == "term" {
+                if root is ast.Expr.Ident(head, _) {
                     return head == "hive"
                 }
             }
@@ -3120,39 +3382,31 @@ func exitsTheProgram(value: ast.Expr): Bool {
 // `at(...)` or `hive.at(...)`: the builtin, where what it answers with is an
 // address of no message type yet.
 func isAtCall(value: ast.Expr): Bool {
-    if value is ast.Expr.Call(callee, _) {
-        if callee is ast.Expr.Ident(name) {
+    if value is ast.Expr.Call(callee, _, _) {
+        if callee is ast.Expr.Ident(name, _) {
             return name == "at"
         }
-        if callee is ast.Expr.Member(root, name) {
-            if root is ast.Expr.Ident(hiveName) {
+        if callee is ast.Expr.Member(root, name, _) {
+            if root is ast.Expr.Ident(hiveName, _) {
                 return hiveName == "hive" && name == "at"
             }
         }
     }
     return false
 }
-
-func isEmptyMap(value: ast.Expr): Bool {
-    if value is ast.Expr.Call(callee, _) {
-        if callee is ast.Expr.Member(subject, name) {
-            if name == "new" && subject is ast.Expr.Member(root, module) {
-                if module == "map" && root is ast.Expr.Ident(hiveName) {
-                    return hiveName == "hive"
-                }
-            }
-        }
-    }
-    return false
-}
-
 // `fits` for a value written where it lands: a literal takes the number type of
 // the spot, so `UInt4 x = 9` holds and `UInt4 x = 16` says why it does not.
+// Reported where the value is, which in a call over several lines is not where the call is.
 proc fitsValue(c: mut Check, env: infer.Env, wanted: types.Ty, e: ast.Expr, where: Str): void {
-    if literalMisses(c, wanted, e, where) {
-        return
+    outer := c.at
+    if e.at.line > 0 {
+        c.at = e.at
     }
-    fits(c, wanted, infer.landedType(env, e, wanted), where)
+    if literalMisses(c, wanted, e, where) == false {
+        fits(c, wanted, infer.landedType(env, e, wanted), where)
+    }
+    land(c, wanted, e)
+    c.at = outer
 }
 
 proc fitsArg(c: mut Check, env: infer.Env, wanted: types.Ty, args: ast.Arg[], index: Int, where: Str): void {
@@ -3172,7 +3426,7 @@ proc literalMisses(c: mut Check, wanted: types.Ty, e: ast.Expr, where: Str): Boo
         report(c, where + " wants a `Float32`, which reaches about 3.4e38, and this is past it")
         return true
     }
-    if e is ast.Expr.VectorLit(items) && wanted is types.Ty.TVec(element, _) {
+    if e is ast.Expr.VectorLit(items, _) && wanted is types.Ty.TVec(element, _) {
         mut missed := false
         for each item in items {
             if literalMisses(c, element, item, where) {
@@ -3186,9 +3440,9 @@ proc literalMisses(c: mut Check, wanted: types.Ty, e: ast.Expr, where: Str): Boo
 
 func holdsFloat32(e: ast.Expr): Bool {
     mut v := 0.0
-    if e is ast.Expr.FloatLit(f) {
+    if e is ast.Expr.FloatLit(f, _) {
         v = f
-    } else if e is ast.Expr.Negate(operand) && operand is ast.Expr.FloatLit(f) {
+    } else if e is ast.Expr.Negate(operand, _) && operand is ast.Expr.FloatLit(f, _) {
         v = f
     }
     return v <= 340282346638528859811704183484516925440.0

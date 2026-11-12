@@ -1,0 +1,79 @@
+// Go, as a build carries it
+// =========================
+// The runtime's Go is written to be read; what a build carries has the comments gone.
+import ./text
+
+// Only a raw string and a block comment carry from one line to the next.
+type Lex {
+    Code
+    Raw
+    Block
+}
+
+// `cut` is where the line's `//` comment opens, or -1.
+type Line {
+    cut: Int
+    state: Lex
+}
+
+// A `//go:` or `//export` line is a directive rather than a comment, and stays.
+func carried(source: Str): Str {
+    mut Str[dyn] out = []
+    mut state := Lex.Code()
+    for each line in split(text.replace(source, "\r\n", "\n"), "\n") {
+        cs := text.chars(line)
+        read := lineOf(cs, state)
+        state = read.state
+        if read.cut < 0 || text.matchesAt(cs, read.cut, "//go:") || text.matchesAt(cs, read.cut, "//export ") {
+            // A file opens with its package, not with the gap a comment left.
+            if len(out) > 0 || line != "" {
+                append(out, line)
+            }
+        } else if text.trim(text.span(cs, 0, read.cut - 1)) != "" {
+            append(out, ending(cs, read.cut - 1))
+        }
+    }
+    return join(out, "\n")
+}
+
+// A `//` inside a string is text, which is the whole of why this is a lexer.
+func lineOf(cs: Str[], from: Lex): Line {
+    mut state := from
+    mut quote := ""
+    for i := 0; i < len(cs); i++ {
+        c := text.charAt(cs, i)
+        if quote != "" {
+            if c == "\\" {
+                i = i + 1
+            } else if c == quote {
+                quote = ""
+            }
+        } else if state is Lex.Raw {
+            if c == "`" {
+                state = Lex.Code()
+            }
+        } else if state is Lex.Block {
+            if c == "*" && text.charAt(cs, i + 1) == "/" {
+                state = Lex.Code()
+                i = i + 1
+            }
+        } else if c == "/" && text.charAt(cs, i + 1) == "/" {
+            return Line(i, state)
+        } else if c == "/" && text.charAt(cs, i + 1) == "*" {
+            state = Lex.Block()
+            i = i + 1
+        } else if c == "`" {
+            state = Lex.Raw()
+        } else if c == "\"" || c == "'" {
+            quote = c
+        }
+    }
+    return Line(-1, state)
+}
+
+func ending(cs: Str[], last: Int): Str {
+    mut high := last
+    for ; high >= 0 && text.isSpace(text.charAt(cs, high)); high-- {
+    }
+    return text.span(cs, 0, high)
+}

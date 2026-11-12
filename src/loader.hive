@@ -8,9 +8,6 @@
 // uniquely, every reference rewritten, and one `ast.Module` out. The rename is
 // what makes names mean nothing across a module boundary — two files may each
 // declare an `Align` and both stay distinct types.
-//
-// It costs one thing: the result carries no record of which file each
-// declaration came from, so later passes report against the entrypoint.
 import ./ast
 import ./diag
 import ./fetch
@@ -20,6 +17,7 @@ import ./lexer
 import ./parser
 import ./paths
 import ./pinned
+import ./runtime
 import ./stdlib
 import ./text
 import ./token
@@ -63,11 +61,18 @@ type Load {
     // written back at the end, so a build that fetched nothing leaves it alone.
     lock: fetch.Lock
     errors: diag.Diagnostic[dyn]
+    // Files an editor holds unsaved, by key, read instead of what is on disk.
+    held: hive.map.Map<Str, Str>
 }
 
 // Load the program rooted at `entry` and flatten it.
 proc load(entry: Str): Program {
-    walked := reach(entry)
+    mut hive.map.Map<Str, Str> nothing = hive.map.new()
+    return loadHeld(entry, nothing)
+}
+
+proc loadHeld(entry: Str, held: hive.map.Map<Str, Str>): Program {
+    walked := reachHeld(entry, held)
     if len(walked.errors) > 0 {
         return walked
     }
@@ -76,31 +81,37 @@ proc load(entry: Str): Program {
 
 // Every file the program rooted at `entry` reaches, walked but not flattened.
 proc reach(entry: Str): Program {
-    mut Load l = Load([], [], [], fetch.readLock(entry), [])
-    loadFile(l, paths.normalise(entry), entry, entry, 0)
+    mut hive.map.Map<Str, Str> nothing = hive.map.new()
+    return reachHeld(entry, nothing)
+}
+
+proc reachHeld(entry: Str, held: hive.map.Map<Str, Str>): Program {
+    mut Load l = Load([], [], [], fetch.readLock(entry), [], held)
+    loadFile(l, paths.normalise(entry), entry, token.Pos(entry, 0, 0))
     fetch.writeLock(l.lock)
-    return Program(ast.Module([], [], []), l.sources, l.errors)
+    return Program(ast.Module([], [], [], ast.noLibrary()), l.sources, l.errors)
 }
 
 // Load a program already in memory, under a name to report against — what a
 // test reaches for, needing no source on disk.
 proc loadText(name: Str, source: Str): Program {
     // A program held in memory has nowhere to keep a lock, and nothing to pin.
-    mut Load l = Load([], [], [], fetch.Lock("", [], [], false), [])
+    mut hive.map.Map<Str, Str> nothing = hive.map.new()
+    mut Load l = Load([], [], [], fetch.Lock("", [], [], false), [], nothing)
     key := paths.normalise(name)
     appendSource(l, key, name, source)
     if len(l.errors) > 0 {
-        return Program(ast.Module([], [], []), l.sources, l.errors)
+        return Program(ast.Module([], [], [], ast.noLibrary()), l.sources, l.errors)
     }
     return flatten(l.sources, key, l.errors)
 }
 
 // --- The walk ----------------------------------------------------------------
 
-// `importer` is the file whose import `line` asked for this one.
-proc loadFile(l: mut Load, key: Str, display: Str, importer: Str, line: Int): void {
+// `asked` is where the import that named this file was written.
+proc loadFile(l: mut Load, key: Str, display: Str, asked: token.Pos): void {
     if onStack(l, key) {
-        append(l.errors, diag.Diagnostic(importer, diag.onSomeLine(line), cycleMessage(l, key)))
+        append(l.errors, diag.on(asked, cycleMessage(l, key)))
         return
     }
     // A file is loaded once however many modules reach for it.
@@ -110,12 +121,18 @@ proc loadFile(l: mut Load, key: Str, display: Str, importer: Str, line: Int): vo
     // A Go file is not a Hive module. What Hive takes from it is the signatures
     // of what it exports, which the Go toolchain reads, not this compiler.
     if text.endsWith(key, ".go") {
-        appendForeign(l, key, display, line)
+        appendForeign(l, key, display, asked)
+        return
+    }
+    if hive.map.get(l.held, key) is Result.Ok(source) {
+        append(l.stack, key)
+        appendSource(l, key, display, source)
+        popStack(l)
         return
     }
     read := hive.file.read(display)
     if read is Result.Error(why) {
-        append(l.errors, diag.Diagnostic(importer, diag.onSomeLine(line), "cannot read `{display}`: {why.message}"))
+        append(l.errors, diag.on(asked, "cannot read `{display}`: {why.message}"))
         return
     }
     if read is Result.Ok(source) {
@@ -127,16 +144,16 @@ proc loadFile(l: mut Load, key: Str, display: Str, importer: Str, line: Int): vo
 
 // One imported Go file, as the declarations Hive reaches in it. It imports
 // nothing as far as Hive is concerned; whatever it imports is Go's business.
-proc appendForeign(l: mut Load, key: Str, display: Str, line: Int): void {
+proc appendForeign(l: mut Load, key: Str, display: Str, asked: token.Pos): void {
     got := goffi.read(display, "`{display}`")
     if got is Result.Error(why) {
-        append(l.errors, diag.Diagnostic(display, line, why))
+        append(l.errors, diag.Diagnostic(display, diag.onSomeLine(asked.line), why, 0))
         return
     }
     if got is Result.Ok(read) {
         append(l.keys, key)
         mut hive.map.Map<Str, Str> nothing = hive.map.new()
-        append(l.sources, Source(key, paths.dirOf(display), "", nothing, ast.Module([], read.decls, [read.foreign])))
+        append(l.sources, Source(key, paths.dirOf(display), "", nothing, ast.Module([], read.decls, [read.foreign], ast.noLibrary())))
     }
 }
 
@@ -151,7 +168,7 @@ proc appendSource(l: mut Load, key: Str, display: Str, source: Str): void {
     if len(lexed.errors) > 0 {
         return
     }
-    parsed := parser.parse(lexed.tokens)
+    parsed := parser.parseFile(lexed.tokens, display)
     for each e in parsed.errors {
         append(l.errors, diag.inFile(display, e))
     }
@@ -165,7 +182,7 @@ proc appendSource(l: mut Load, key: Str, display: Str, source: Str): void {
         found := resolveImport(l, dir, line, display)
         if found != "" {
             hive.map.set(resolved, line.path, paths.normalise(found))
-            loadFile(l, paths.normalise(found), found, display, line.line)
+            loadFile(l, paths.normalise(found), found, line.at)
         }
     }
     append(l.keys, key)
@@ -178,7 +195,7 @@ proc resolveImport(l: mut Load, dir: Str, line: ast.ImportLine, display: Str): S
     // Checked here rather than at flattening time so it is reported instead of
     // whatever the import would have failed to load.
     if line.alias == "hive" {
-        append(l.errors, diag.Diagnostic(display, line.line, "an import cannot be named `hive`: that name belongs to the standard library"))
+        append(l.errors, diag.on(line.at, "an import cannot be named `hive`: that name belongs to the standard library"))
         return ""
     }
     if namesStdlib(path) {
@@ -191,12 +208,12 @@ proc resolveImport(l: mut Load, dir: Str, line: ast.ImportLine, display: Str): S
         // got it wrong.
         segments := split(path, ".")
         if len(segments) > 2 {
-            append(l.errors, diag.Diagnostic(display, line.line, "`{path}` names more than a module. An import of the standard library is the module and nothing in it: `import hive.ui`, never `import hive.ui.View`"))
+            append(l.errors, diag.on(line.at, "`{path}` names more than a module. An import of the standard library is the module and nothing in it: `import hive.ui`, never `import hive.ui.View`"))
             return ""
         }
         module := stdlibModuleOf(path)
         if stdlib.isKnownModule(module) == false {
-            append(l.errors, diag.Diagnostic(display, line.line, "this compiler does not carry `hive.{module}`"))
+            append(l.errors, diag.on(line.at, "this compiler does not carry `hive.{module}`"))
         }
         return ""
     }
@@ -219,13 +236,13 @@ proc resolveImport(l: mut Load, dir: Str, line: ast.ImportLine, display: Str): S
 proc fetchRemote(l: mut Load, path: Str, line: ast.ImportLine, display: Str): Str {
     named := fetch.repoOf(path)
     if named is Result.Error(why) {
-        append(l.errors, diag.Diagnostic(display, line.line, why))
+        append(l.errors, diag.on(line.at, why))
         return ""
     }
     if named is Result.Ok(repo) {
         got := fetch.fetch(repo, l.lock)
         if got is Result.Error(why) {
-            append(l.errors, diag.Diagnostic(display, line.line, why))
+            append(l.errors, diag.on(line.at, why))
             return ""
         }
         if got is Result.Ok(here) {
@@ -236,7 +253,7 @@ proc fetchRemote(l: mut Load, path: Str, line: ast.ImportLine, display: Str): St
             }
             written := inside + ".hive"
             if hive.file.exists(written) == false {
-                append(l.errors, diag.Diagnostic(display, line.line, "`{repo.url}` has no `" + repo.inner + ".hive` at " + here.commit))
+                append(l.errors, diag.on(line.at, "`{repo.url}` has no `" + repo.inner + ".hive` at " + here.commit))
                 return ""
             }
             return written
@@ -287,21 +304,14 @@ func arrow(entry: Str, indented: Bool): Str {
 
 // --- Flattening --------------------------------------------------------------
 
-// The passes after this one report against a declaration's flattened name, and
-// its prefix is what says which file it came from: the message moves there, and
-// every flattened name in it reads the way the source spells it.
+// The passes after this one know a declaration by its flattened name; a message
+// spells each one back the way the source does.
 func placed(program: Program, entry: Str, ds: diag.Diagnostic[]): diag.Diagnostic[dyn] {
     mut diag.Diagnostic[dyn] out = []
     for each d in ds {
-        if d.file != "" {
-            append(out, d)
-            continue
-        }
-        mut file := entry
         mut message := d.message
         for each src in program.sources {
             if src.prefix != "" && text.startsWith(message, "in `" + src.prefix) {
-                file = paths.joinPath(src.dir, paths.baseOf(src.key))
                 cs := text.chars(message)
                 message = "in `" + text.span(cs, len("in `" + src.prefix), len(cs) - 1)
             }
@@ -311,11 +321,11 @@ func placed(program: Program, entry: Str, ds: diag.Diagnostic[]): diag.Diagnosti
                 message = text.replace(message, src.prefix, paths.stem(src.key) + ".")
             }
         }
-        append(out, diag.Diagnostic(file, d.line, message))
+        // A node the compiler made up is nowhere, and is reported against the program.
+        append(out, diag.inFile(entry, diag.Diagnostic(d.file, d.line, message, d.col)))
     }
     return out
 }
-
 // What a module's declarations are renamed with. The entrypoint keeps its own
 // names, so `hive emit` shows an untouched `main` beside a `text_1_repeat`.
 func prefixFor(key: Str, index: Int, isEntry: Bool): Str {
@@ -385,7 +395,7 @@ proc flatten(sources: Source[], entryKey: Str, found: diag.Diagnostic[]): Progra
     mut Str[dyn] used = []
     mut ast.Decl[dyn] decls = []
     for each src in prefixed {
-        mut Rw rw = Rw(src.key, entryKey, hive.map.new(), hive.map.new(), flatNames, [], [], [])
+        mut Rw rw = Rw(src.key, entryKey, hive.map.new(), hive.map.new(), flatNames, [], [], [], token.nowhere())
         bindImports(rw, src, known)
         for each d in src.module.decls {
             append(decls, rewriteDecl(rw, d))
@@ -402,13 +412,36 @@ proc flatten(sources: Source[], entryKey: Str, found: diag.Diagnostic[]): Progra
     // Only what the program named, so a program that never names one builds as before.
     for each src in library {
         if indexOf(used, src.key) is Result.Ok(_) {
-            mut Rw rw = Rw(src.key, entryKey, hive.map.new(), hive.map.new(), flatNames, [], [], [])
+            mut Rw rw = Rw(src.key, entryKey, hive.map.new(), hive.map.new(), flatNames, [], [], [], token.nowhere())
             for each d in src.module.decls {
                 append(decls, rewriteDecl(rw, d))
             }
         }
     }
-    return Program(pinned.pinModule(ast.Module([], decls, foreignOf(prefixed))), prefixed, errors)
+    return Program(pinned.pinModule(ast.Module([], decls, foreignOf(prefixed), stubs(errors))), prefixed, errors)
+}
+
+// Read each time rather than kept, so `HIVE_RUNTIME` can name another runtime's calls.
+proc stubs(errors: mut diag.Diagnostic[dyn]): ast.Library {
+    mut ast.Decl[dyn] decls = []
+    mut hive.map.Map<Str, Int> index = hive.map.new()
+    mut Str[dyn] parts = []
+    carried := runtime.stubs()
+    for each stub in carried {
+        module := runtime.moduleOf(carried, stub)
+        parsed := parser.parseFile(lexer.lex(runtime.file(stub + ".hive")).tokens, "runtime/hive/" + stub + ".hive")
+        for each e in parsed.errors {
+            append(errors, e)
+        }
+        for each d in parsed.module.decls {
+            if d is ast.Decl.TypeDecl(_, _, _, _) || d is ast.Decl.CallableDecl(_, _, _, _, _, _) {
+                hive.map.set(index, module + "." + ast.declName(d), len(decls))
+                append(decls, d)
+                append(parts, stub)
+            }
+        }
+    }
+    return ast.Library(decls, index, parts)
 }
 
 // Each name goes into `flatNames` under `hive.<module>#<Name>`.
@@ -447,6 +480,8 @@ type Rw {
     errors: diag.Diagnostic[dyn]
     // The `hive.<module>` keys whose declarations this module named.
     library: Str[dyn]
+    // A type and a pattern's path carry no place of their own.
+    at: token.Pos
 }
 
 proc bindImports(rw: mut Rw, src: Source, known: hive.map.Map<Str, Bool>): void {
@@ -466,7 +501,7 @@ proc bindImports(rw: mut Rw, src: Source, known: hive.map.Map<Str, Bool>): void 
                 continue
             }
         }
-        append(rw.errors, diag.at(line.line, "could not resolve `import {line.path}`"))
+        append(rw.errors, diag.on(line.at, "could not resolve `import {line.path}`"))
     }
     for each module in stdlib.modules() {
         if hive.map.has(rw.aliasKeys, module) == false && hive.map.has(rw.stdlibAliases, module) == false
@@ -563,6 +598,7 @@ proc restoreLocals(rw: mut Rw, mark: Int): void {
 }
 
 proc rewriteDecl(rw: mut Rw, d: ast.Decl): ast.Decl {
+    rw.at = d.at
     if d is ast.Decl.TypeDecl(name, fields, variants, line) {
         return ast.Decl.TypeDecl(rename(rw, name), rewriteFields(rw, fields), rewriteVariants(rw, variants), line)
     } else if d is ast.Decl.CallableDecl(kind, name, params, result, body, line) {
@@ -635,7 +671,8 @@ proc rewriteSqlGroup(rw: mut Rw, group: ast.SqlGroup): ast.SqlGroup {
 proc rewriteFields(rw: mut Rw, fields: ast.Field[]): ast.Field[dyn] {
     mut ast.Field[dyn] out = []
     for each f in fields {
-        append(out, ast.Field(f.name, rewriteType(rw, f.declared), f.marks))
+        rw.at = f.at
+        append(out, ast.Field(f.name, rewriteType(rw, f.declared), f.marks, f.at))
     }
     return out
 }
@@ -643,7 +680,7 @@ proc rewriteFields(rw: mut Rw, fields: ast.Field[]): ast.Field[dyn] {
 proc rewriteVariants(rw: mut Rw, variants: ast.Variant[]): ast.Variant[dyn] {
     mut ast.Variant[dyn] out = []
     for each v in variants {
-        append(out, ast.Variant(v.name, rewriteFields(rw, v.fields)))
+        append(out, ast.Variant(v.name, rewriteFields(rw, v.fields), v.at))
     }
     return out
 }
@@ -652,7 +689,8 @@ proc rewriteParams(rw: mut Rw, params: ast.Param[]): ast.Param[dyn] {
     mut ast.Param[dyn] out = []
     for each param in params {
         bindLocal(rw, param.name)
-        append(out, ast.Param(param.name, rewriteType(rw, param.declared), param.mutable))
+        rw.at = param.at
+        append(out, ast.Param(param.name, rewriteType(rw, param.declared), param.mutable, param.at))
     }
     return out
 }
@@ -727,7 +765,7 @@ proc namedType(rw: mut Rw, pkg: Str, name: Str, args: ast.TypeExpr[dyn], dims: a
         return ast.TypeExpr.Named("hive." + module, name, args, dims)
     }
     if hive.map.has(rw.aliasKeys, pkg) {
-        append(rw.errors, diag.at(0, "the module imported as `{pkg}` has no `{name}`"))
+        append(rw.errors, diag.on(rw.at, "the module imported as `{pkg}` has no `{name}`"))
     }
     return ast.TypeExpr.Named(pkg, name, args, dims)
 }
@@ -745,22 +783,25 @@ proc rewriteBlock(rw: mut Rw, b: ast.Block): ast.Block {
 }
 
 proc rewriteStmt(rw: mut Rw, s: ast.Stmt): ast.Stmt {
-    if s is ast.Stmt.VarDecl(name, value, mutable, deferred) {
+    if (s is ast.Stmt.Nothing) == false {
+        rw.at = s.at
+    }
+    if s is ast.Stmt.VarDecl(name, value, mutable, deferred, _) {
         // The value is rewritten *before* the name is bound: `x := x` on the
         // right names whatever `x` meant before this statement.
         newValue := rewriteExpr(rw, value)
         bindLocal(rw, name)
-        return ast.Stmt.VarDecl(name, newValue, mutable, deferred)
-    } else if s is ast.Stmt.TypedDecl(declared, name, value, mutable, deferred) {
+        return ast.Stmt.VarDecl(name, newValue, mutable, deferred, s.at)
+    } else if s is ast.Stmt.TypedDecl(declared, name, value, mutable, deferred, _) {
         newType := rewriteType(rw, declared)
         newValue := rewriteExpr(rw, value)
         bindLocal(rw, name)
-        return ast.Stmt.TypedDecl(newType, name, newValue, mutable, deferred)
-    } else if s is ast.Stmt.Assign(target, value) {
-        return ast.Stmt.Assign(rewriteExpr(rw, target), rewriteExpr(rw, value))
-    } else if s is ast.Stmt.IfChain(branches, otherwise, hasElse) {
-        return ast.Stmt.IfChain(rewriteBranches(rw, branches), rewriteBlock(rw, otherwise), hasElse)
-    } else if s is ast.Stmt.SwitchStmt(lets, subjects, arms, line, binds) {
+        return ast.Stmt.TypedDecl(newType, name, newValue, mutable, deferred, s.at)
+    } else if s is ast.Stmt.Assign(target, value, _) {
+        return ast.Stmt.Assign(rewriteExpr(rw, target), rewriteExpr(rw, value), s.at)
+    } else if s is ast.Stmt.IfChain(branches, otherwise, hasElse, _) {
+        return ast.Stmt.IfChain(rewriteBranches(rw, branches), rewriteBlock(rw, otherwise), hasElse, s.at)
+    } else if s is ast.Stmt.SwitchStmt(lets, subjects, arms, binds, line) {
         mark := len(rw.locals)
         mut ast.Stmt[dyn] newLets = []
         for each l in lets {
@@ -772,7 +813,7 @@ proc rewriteStmt(rw: mut Rw, s: ast.Stmt): ast.Stmt {
         }
         newArms := rewriteBranches(rw, arms)
         restoreLocals(rw, mark)
-        return ast.Stmt.SwitchStmt(newLets, newSubjects, newArms, line, binds)
+        return ast.Stmt.SwitchStmt(newLets, newSubjects, newArms, binds, line)
     }
     return rewriteStmtTail(rw, s)
 }
@@ -793,7 +834,7 @@ proc rewriteBranches(rw: mut Rw, branches: ast.Branch[]): ast.Branch[dyn] {
 }
 
 proc rewriteStmtTail(rw: mut Rw, s: ast.Stmt): ast.Stmt {
-    if s is ast.Stmt.ForLoop(init, cond, post, body) {
+    if s is ast.Stmt.ForLoop(init, cond, post, body, _) {
         // The counter is scoped to the loop, which is why the mark is taken
         // before the init clause and restored after the body.
         mark := len(rw.locals)
@@ -802,27 +843,27 @@ proc rewriteStmtTail(rw: mut Rw, s: ast.Stmt): ast.Stmt {
         newPost := rewriteStmt(rw, post)
         newBody := rewriteBlock(rw, body)
         restoreLocals(rw, mark)
-        return ast.Stmt.ForLoop(newInit, newCond, newPost, newBody)
-    } else if s is ast.Stmt.ForEach(name, declared, subject, body) {
+        return ast.Stmt.ForLoop(newInit, newCond, newPost, newBody, s.at)
+    } else if s is ast.Stmt.ForEach(name, declared, subject, body, _) {
         newType := rewriteType(rw, declared)
         newSubject := rewriteExpr(rw, subject)
         mark := len(rw.locals)
         bindLocal(rw, name)
         newBody := rewriteBlock(rw, body)
         restoreLocals(rw, mark)
-        return ast.Stmt.ForEach(name, newType, newSubject, newBody)
-    } else if s is ast.Stmt.ReturnStmt(value) {
-        return ast.Stmt.ReturnStmt(rewriteExpr(rw, value))
-    } else if s is ast.Stmt.EchoStmt(value) {
-        return ast.Stmt.EchoStmt(rewriteExpr(rw, value))
-    } else if s is ast.Stmt.AssertStmt(condition) {
-        return ast.Stmt.AssertStmt(rewriteExpr(rw, condition))
-    } else if s is ast.Stmt.PanicStmt(value) {
-        return ast.Stmt.PanicStmt(rewriteExpr(rw, value))
-    } else if s is ast.Stmt.AsyncStmt(call) {
-        return ast.Stmt.AsyncStmt(rewriteExpr(rw, call))
-    } else if s is ast.Stmt.Expression(value) {
-        return ast.Stmt.Expression(rewriteExpr(rw, value))
+        return ast.Stmt.ForEach(name, newType, newSubject, newBody, s.at)
+    } else if s is ast.Stmt.ReturnStmt(value, _) {
+        return ast.Stmt.ReturnStmt(rewriteExpr(rw, value), s.at)
+    } else if s is ast.Stmt.EchoStmt(value, _) {
+        return ast.Stmt.EchoStmt(rewriteExpr(rw, value), s.at)
+    } else if s is ast.Stmt.AssertStmt(condition, _) {
+        return ast.Stmt.AssertStmt(rewriteExpr(rw, condition), s.at)
+    } else if s is ast.Stmt.PanicStmt(value, _) {
+        return ast.Stmt.PanicStmt(rewriteExpr(rw, value), s.at)
+    } else if s is ast.Stmt.AsyncStmt(call, _) {
+        return ast.Stmt.AsyncStmt(rewriteExpr(rw, call), s.at)
+    } else if s is ast.Stmt.Expression(value, _) {
+        return ast.Stmt.Expression(rewriteExpr(rw, value), s.at)
     }
     return s
 }
@@ -830,7 +871,7 @@ proc rewriteStmtTail(rw: mut Rw, s: ast.Stmt): ast.Stmt {
 // --- Expressions -------------------------------------------------------------
 
 proc rewriteExpr(rw: mut Rw, e: ast.Expr): ast.Expr {
-    if e is ast.Expr.Ident(name) {
+    if e is ast.Expr.Ident(name, _) {
         // A local shadows a module-level name, so one the scope bound is left
         // alone.
         if isLocal(rw, name) {
@@ -840,40 +881,40 @@ proc rewriteExpr(rw: mut Rw, e: ast.Expr): ast.Expr {
         if flat == "" {
             return coreIdent(rw, e, name)
         }
-        return ast.Expr.Ident(flat)
-    } else if e is ast.Expr.Member(subject, field) {
-        return member(rw, subject, field)
-    } else if e is ast.Expr.Binary(op, left, right) {
-        return ast.Expr.Binary(op, rewriteExpr(rw, left), rewriteExpr(rw, right))
-    } else if e is ast.Expr.Negate(operand) {
-        return ast.Expr.Negate(rewriteExpr(rw, operand))
-    } else if e is ast.Expr.Not(operand) {
-        return ast.Expr.Not(rewriteExpr(rw, operand))
-    } else if e is ast.Expr.BitNot(operand) {
-        return ast.Expr.BitNot(rewriteExpr(rw, operand))
-    } else if e is ast.Expr.Bits(parts) {
+        return ast.Expr.Ident(flat, e.at)
+    } else if e is ast.Expr.Member(subject, field, _) {
+        return member(rw, subject, field, e.at)
+    } else if e is ast.Expr.Binary(op, left, right, _) {
+        return ast.Expr.Binary(op, rewriteExpr(rw, left), rewriteExpr(rw, right), e.at)
+    } else if e is ast.Expr.Negate(operand, _) {
+        return ast.Expr.Negate(rewriteExpr(rw, operand), e.at)
+    } else if e is ast.Expr.Not(operand, _) {
+        return ast.Expr.Not(rewriteExpr(rw, operand), e.at)
+    } else if e is ast.Expr.BitNot(operand, _) {
+        return ast.Expr.BitNot(rewriteExpr(rw, operand), e.at)
+    } else if e is ast.Expr.Bits(parts, _) {
         mut ast.BitPart[dyn] out = []
         for each part in parts {
             append(out, ast.BitPart(rewriteExpr(rw, part.value), rewriteType(rw, part.declared), part.little))
         }
-        return ast.Expr.Bits(out)
-    } else if e is ast.Expr.Call(callee, args) {
+        return ast.Expr.Bits(out, e.at)
+    } else if e is ast.Expr.Call(callee, args, _) {
         mut ast.Arg[dyn] out = []
         for each a in args {
             append(out, ast.Arg(a.name, rewriteExpr(rw, a.value)))
         }
-        if callee is ast.Expr.Ident(name) {
+        if callee is ast.Expr.Ident(name, _) {
             if isLocal(rw, name) == false && ownFlat(rw, name) == "" {
                 noteBuiltin(rw, name)
             }
             if infer.isBuiltin(name) && capturedByEntry(rw, name) {
-                return ast.Expr.Call(ast.Expr.Member(ast.Expr.Ident("hive"), name), out)
+                return ast.Expr.Call(ast.Expr.Member(ast.Expr.Ident("hive", callee.at), name, callee.at), out, callee.at)
             }
         }
-        return ast.Expr.Call(rewriteExpr(rw, callee), out)
-    } else if e is ast.Expr.VectorLit(items) {
-        return ast.Expr.VectorLit(rewriteExprs(rw, items))
-    } else if e is ast.Expr.Interp(parts) {
+        return ast.Expr.Call(rewriteExpr(rw, callee), out, e.at)
+    } else if e is ast.Expr.VectorLit(items, _) {
+        return ast.Expr.VectorLit(rewriteExprs(rw, items), e.at)
+    } else if e is ast.Expr.Interp(parts, _) {
         mut ast.InterpPart[dyn] out = []
         for each part in parts {
             if part is ast.InterpPart.Expression(value) {
@@ -882,7 +923,7 @@ proc rewriteExpr(rw: mut Rw, e: ast.Expr): ast.Expr {
                 append(out, part)
             }
         }
-        return ast.Expr.Interp(out)
+        return ast.Expr.Interp(out, e.at)
     }
     return rewriteExprTail(rw, e)
 }
@@ -890,25 +931,25 @@ proc rewriteExpr(rw: mut Rw, e: ast.Expr): ast.Expr {
 // A bare `SecretError`, in a module that declared none, is the core's.
 proc coreIdent(rw: mut Rw, e: ast.Expr, name: Str): ast.Expr {
     if name == "SecretError" {
-        return ast.Expr.Ident(libraryFlat(rw, "", name))
+        return ast.Expr.Ident(libraryFlat(rw, "", name), e.at)
     }
     return e
 }
 
 proc rewriteExprTail(rw: mut Rw, e: ast.Expr): ast.Expr {
-    if e is ast.Expr.Index(subject, index) {
-        return ast.Expr.Index(rewriteExpr(rw, subject), rewriteExpr(rw, index))
-    } else if e is ast.Expr.Slice(subject, low, high) {
-        return ast.Expr.Slice(rewriteExpr(rw, subject), rewriteExpr(rw, low), rewriteExpr(rw, high))
-    } else if e is ast.Expr.IsMatch(subject, pattern) {
+    if e is ast.Expr.Index(subject, index, _) {
+        return ast.Expr.Index(rewriteExpr(rw, subject), rewriteExpr(rw, index), e.at)
+    } else if e is ast.Expr.Slice(subject, low, high, _) {
+        return ast.Expr.Slice(rewriteExpr(rw, subject), rewriteExpr(rw, low), rewriteExpr(rw, high), e.at)
+    } else if e is ast.Expr.IsMatch(subject, pattern, _) {
         // A pattern's bindings are in scope from here on, which the caller's
         // scope mark is what bounds.
         newSubject := rewriteExpr(rw, subject)
-        return ast.Expr.IsMatch(newSubject, rewritePattern(rw, pattern))
-    } else if e is ast.Expr.AwaitAll(calls, timeout) {
-        return ast.Expr.AwaitAll(rewriteExprs(rw, calls), rewriteExpr(rw, timeout))
-    } else if e is ast.Expr.Timed(call, ms) {
-        return ast.Expr.Timed(rewriteExpr(rw, call), rewriteExpr(rw, ms))
+        return ast.Expr.IsMatch(newSubject, rewritePattern(rw, pattern), e.at)
+    } else if e is ast.Expr.AwaitAll(calls, timeout, _) {
+        return ast.Expr.AwaitAll(rewriteExprs(rw, calls), rewriteExpr(rw, timeout), e.at)
+    } else if e is ast.Expr.Timed(call, ms, _) {
+        return ast.Expr.Timed(rewriteExpr(rw, call), rewriteExpr(rw, ms), e.at)
     }
     return e
 }
@@ -924,47 +965,47 @@ proc rewriteExprs(rw: mut Rw, es: ast.Expr[]): ast.Expr[dyn] {
 // `alias.member` is three different things, told apart by what the left side
 // names: another module's declaration, a standard library module, or an
 // ordinary field of a value.
-proc member(rw: mut Rw, subject: ast.Expr, field: Str): ast.Expr {
-    if subject is ast.Expr.Ident(alias) {
+proc member(rw: mut Rw, subject: ast.Expr, field: Str, at: token.Pos): ast.Expr {
+    if subject is ast.Expr.Ident(alias, _) {
         if isLocal(rw, alias) == false {
             imported := importedFlat(rw, alias, field)
             if imported != "" {
-                return ast.Expr.Ident(imported)
+                return ast.Expr.Ident(imported, at)
             }
             if hive.map.get(rw.stdlibAliases, alias) is Result.Ok(module) {
                 noteModule(rw, module)
                 declared := libraryFlat(rw, module, field)
                 if declared != "" {
-                    return ast.Expr.Ident(declared)
+                    return ast.Expr.Ident(declared, at)
                 }
                 // `ui.row` and `hive.ui.row` are the same call. Written back out
                 // in full, so the emitter only ever sees the one spelling.
-                return ast.Expr.Member(ast.Expr.Member(ast.Expr.Ident("hive"), module), field)
+                return ast.Expr.Member(ast.Expr.Member(ast.Expr.Ident("hive", subject.at), module, subject.at), field, at)
             }
             if hive.map.has(rw.aliasKeys, alias) {
-                append(rw.errors, diag.at(0, "the module imported as `{alias}` has no `{field}`"))
-                return ast.Expr.Member(subject, field)
+                append(rw.errors, diag.on(at, "the module imported as `{alias}` has no `{field}`"))
+                return ast.Expr.Member(subject, field, at)
             }
         }
     }
-    if subject is ast.Expr.Member(root, module) {
-        if root is ast.Expr.Ident(head) && head == "hive" {
+    if subject is ast.Expr.Member(root, module, _) {
+        if root is ast.Expr.Ident(head, _) && head == "hive" {
             noteModule(rw, module)
             declared := libraryFlat(rw, module, field)
             if declared != "" {
-                return ast.Expr.Ident(declared)
+                return ast.Expr.Ident(declared, at)
             }
         }
     }
     // `hive.spawn(...)`, a builtin under its long name, and `hive.SecretError`.
-    if subject is ast.Expr.Ident(head) && head == "hive" {
+    if subject is ast.Expr.Ident(head, _) && head == "hive" {
         noteBuiltin(rw, field)
         declared := libraryFlat(rw, "", field)
         if declared != "" {
-            return ast.Expr.Ident(declared)
+            return ast.Expr.Ident(declared, at)
         }
     }
-    return ast.Expr.Member(rewriteExpr(rw, subject), field)
+    return ast.Expr.Member(rewriteExpr(rw, subject), field, at)
 }
 
 // --- Patterns ----------------------------------------------------------------
@@ -996,7 +1037,7 @@ proc rewritePattern(rw: mut Rw, p: ast.Pattern): ast.Pattern {
         return ast.Pattern.BitsPat(out, rest)
     } else if p is ast.Pattern.StrTemplate(parts) {
         for each part in parts {
-            if part is token.StrPart.Code(source) {
+            if part is token.StrPart.Code(source, _, _) {
                 bindLocal(rw, text.trim(source))
             } else if part is token.StrPart.Hole(name, _) {
                 bindLocal(rw, name)
@@ -1029,7 +1070,7 @@ proc rewritePatternPath(rw: mut Rw, path: Str[]): Str[dyn] {
         }
         imported := importedFlat(rw, first, text.charAt(path, 1))
         if imported != "" {
-            append(rw.errors, diag.at(0, "`" + join(out, ".") + "` does not name a pattern: it names a type, so a variant of it has to be named too"))
+            append(rw.errors, diag.on(rw.at, "`" + join(out, ".") + "` does not name a pattern: it names a type, so a variant of it has to be named too"))
         }
         return out
     }

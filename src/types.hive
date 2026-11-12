@@ -11,6 +11,7 @@
 // what type equality means here — no subtyping, no interface to widen through.
 import ./ast
 import ./text
+import hive.map
 
 type Ty {
     TStr
@@ -82,7 +83,17 @@ type CallableInfo {
 type Table {
     types: TypeInfo[dyn]
     callables: CallableInfo[dyn]
+    library: ast.Library
 }
+
+proc emptyTable(): Table {
+    return Table([], [], ast.noLibrary())
+}
+
+func withDeclarations(t: Table, types: TypeInfo[], callables: CallableInfo[]): Table {
+    return Table(types, callables, t.library)
+}
+
 // Read a flattened module's declarations into a table.
 proc tableOf(m: ast.Module): Table {
     mut TypeInfo[dyn] types = []
@@ -107,7 +118,220 @@ proc tableOf(m: ast.Module): Table {
             append(callables, CallableInfo(name, true, params, held, variablesOfSignature(params, held)))
         }
     }
-    return Table(types, callables)
+    return Table(types, callables, m.library)
+}
+
+// --- What the standard library declares ---------------------------------------
+// Worked out from a stub's declaration when a pass asks: a program names few of them.
+
+func libraryAt(t: Table, module: Str, name: Str): Int {
+    if hive.map.get(t.library.index, module + "." + name) is Result.Ok(at) {
+        return at
+    }
+    return -1
+}
+
+func isCall(t: Table, module: Str, name: Str): Bool {
+    at := libraryAt(t, module, name)
+    if t.library.decls bounds at {
+        return t.library.decls[at] is ast.Decl.CallableDecl(_, _, _, _, _, _)
+    }
+    return false
+}
+
+func owns(t: Table, module: Str, name: Str): Bool {
+    at := libraryAt(t, module, name)
+    if t.library.decls bounds at {
+        return t.library.decls[at] is ast.Decl.TypeDecl(_, _, _, _)
+    }
+    return false
+}
+
+func callNames(t: Table, module: Str, name: Str): Str[dyn] {
+    mut Str[dyn] out = []
+    at := libraryAt(t, module, name)
+    if t.library.decls bounds at {
+        if t.library.decls[at] is ast.Decl.CallableDecl(_, _, params, _, _, _) {
+            for each p in params {
+                append(out, unreserved(p.name))
+            }
+        }
+    }
+    return out
+}
+
+func callTakes(t: Table, module: Str, name: Str): Ty[dyn] {
+    mut Ty[dyn] out = []
+    at := libraryAt(t, module, name)
+    if t.library.decls bounds at {
+        if t.library.decls[at] is ast.Decl.CallableDecl(_, _, params, _, _, _) {
+            none := emptyTable()
+            for each p in params {
+                append(out, lifted(t, module, resolve(none, p.declared)))
+            }
+        }
+    }
+    return out
+}
+
+// `TUnknown` in a position that is the program's own business: a map's key, a service's message.
+func callParams(t: Table, module: Str, name: Str): Ty[dyn] {
+    mut Ty[dyn] out = []
+    for each written in callTakes(t, module, name) {
+        append(out, relaxed(written))
+    }
+    return out
+}
+
+// The result with every type variable read off the arguments, or `TUnknown` where one cannot be.
+func callAnswer(t: Table, module: Str, name: Str, args: Ty[]): Ty {
+    at := libraryAt(t, module, name)
+    if t.library.decls bounds at {
+        if t.library.decls[at] is ast.Decl.CallableDecl(_, _, _, result, _, _) {
+            answer := lifted(t, module, resolve(emptyTable(), result))
+            if mentionsVar(answer) == false {
+                return answer
+            }
+            mut hive.map.Map<Str, Ty> bound = hive.map.new()
+            mut i := 0
+            for each written in callTakes(t, module, name) {
+                if args bounds i {
+                    bind(bound, written, args[i])
+                }
+                i = i + 1
+            }
+            filled := substituted(bound, answer)
+            if mentionsVar(filled) == false {
+                return filled
+            }
+        }
+    }
+    return Ty.TUnknown()
+}
+
+// The stub a call is declared in: `uiscene` for a call of `ui`'s second file.
+func callPart(t: Table, module: Str, name: Str): Str {
+    return text.charAt(t.library.parts, libraryAt(t, module, name))
+}
+
+func ownedFields(t: Table, module: Str, name: Str): ast.Field[dyn] {
+    at := libraryAt(t, module, name)
+    if t.library.decls bounds at {
+        if t.library.decls[at] is ast.Decl.TypeDecl(_, fields, _, _) {
+            return fields
+        }
+    }
+    return []
+}
+
+func ownedVariants(t: Table, module: Str, name: Str): Str[dyn] {
+    mut Str[dyn] out = []
+    at := libraryAt(t, module, name)
+    if t.library.decls bounds at {
+        if t.library.decls[at] is ast.Decl.TypeDecl(_, _, variants, _) {
+            for each v in variants {
+                append(out, v.name)
+            }
+        }
+    }
+    return out
+}
+
+// A parameter named with a reserved word (`query`) is written `_query` in its stub.
+func unreserved(name: Str): Str {
+    if text.startsWith(name, "_") {
+        return text.span(text.chars(name), 1, len(name) - 1)
+    }
+    return name
+}
+
+// A name of more than a letter is a type of the stub's own module; a single letter is a type variable.
+func lifted(t: Table, module: Str, ty: Ty): Ty {
+    if ty is Ty.TVar(name) {
+        if len(name) < 2 {
+            return ty
+        }
+        if owns(t, module, name) {
+            return Ty.TLib(module, name)
+        }
+        return libraryError(module, name)
+    }
+    if ty is Ty.TVec(element, dim) { return Ty.TVec(lifted(t, module, element), dim) }
+    if ty is Ty.TResult(ok, bad) { return Ty.TResult(lifted(t, module, ok), lifted(t, module, bad)) }
+    if ty is Ty.TMap(key, value) { return Ty.TMap(lifted(t, module, key), lifted(t, module, value)) }
+    if ty is Ty.TFragment(rows) { return Ty.TFragment(lifted(t, module, rows)) }
+    if ty is Ty.TCodec(error) { return Ty.TCodec(lifted(t, module, error)) }
+    if ty is Ty.TAddress(message) { return Ty.TAddress(lifted(t, module, message)) }
+    if ty is Ty.TSecret(held) { return Ty.TSecret(lifted(t, module, held)) }
+    if ty is Ty.TFn(pure, params, mutables, result) {
+        mut Ty[dyn] out = []
+        for each p in params {
+            append(out, lifted(t, module, p))
+        }
+        return Ty.TFn(pure, out, mutables, lifted(t, module, result))
+    }
+    return ty
+}
+
+// A parameter naming a type variable is the program's own business, but an address stays an address.
+func relaxed(ty: Ty): Ty {
+    if ty is Ty.TAddress(_) {
+        return Ty.TAddress(Ty.TUnknown())
+    }
+    if mentionsVar(ty) {
+        return Ty.TUnknown()
+    }
+    return ty
+}
+
+func mentionsVar(ty: Ty): Bool {
+    if ty is Ty.TVar(_) { return true }
+    if ty is Ty.TVec(element, _) { return mentionsVar(element) }
+    if ty is Ty.TResult(ok, bad) { return mentionsVar(ok) || mentionsVar(bad) }
+    if ty is Ty.TMap(key, value) { return mentionsVar(key) || mentionsVar(value) }
+    if ty is Ty.TFragment(rows) { return mentionsVar(rows) }
+    if ty is Ty.TCodec(error) { return mentionsVar(error) }
+    if ty is Ty.TAddress(message) { return mentionsVar(message) }
+    if ty is Ty.TSecret(held) { return mentionsVar(held) }
+    if ty is Ty.TFn(_, params, _, result) {
+        for each p in params {
+            if mentionsVar(p) {
+                return true
+            }
+        }
+        return mentionsVar(result)
+    }
+    return false
+}
+
+proc bind(bound: mut hive.map.Map<Str, Ty>, written: Ty, given: Ty): void {
+    if written is Ty.TVar(name) {
+        if hive.map.has(bound, name) == false {
+            hive.map.set(bound, name, given)
+        }
+    } else if written is Ty.TMap(key, value) && given is Ty.TMap(givenKey, givenValue) {
+        bind(bound, key, givenKey)
+        bind(bound, value, givenValue)
+    } else if written is Ty.TVec(element, _) && given is Ty.TVec(givenElement, _) {
+        bind(bound, element, givenElement)
+    } else if written is Ty.TFragment(rows) && given is Ty.TFragment(givenRows) {
+        bind(bound, rows, givenRows)
+    } else if written is Ty.TAddress(message) && given is Ty.TAddress(givenMessage) {
+        bind(bound, message, givenMessage)
+    }
+}
+
+func substituted(bound: hive.map.Map<Str, Ty>, ty: Ty): Ty {
+    if ty is Ty.TVar(name) {
+        if hive.map.get(bound, name) is Result.Ok(found) {
+            return found
+        }
+        return ty
+    }
+    if ty is Ty.TVec(element, dim) { return Ty.TVec(substituted(bound, element), dim) }
+    if ty is Ty.TResult(ok, bad) { return Ty.TResult(substituted(bound, ok), substituted(bound, bad)) }
+    if ty is Ty.TMap(key, value) { return Ty.TMap(substituted(bound, key), substituted(bound, value)) }
+    return ty
 }
 
 func findType(t: Table, name: Str): Result<TypeInfo, Bool> {
@@ -1090,28 +1314,27 @@ func dimOf(ty: Ty): ast.Dim {
 }
 
 // Whether a type has an order of its own — which `sort` with one argument
-// needs, and which a function value and a service address do not have.
-// `enumerated` says which library types are enumerations, which the library
-// knows and this module does not.
-func isOrdered(t: Table, ty: Ty, enumerated: func(Str, Str): Bool): Bool {
-    return orderedIn(t, ty, enumerated, [])
+// needs, and which a function value and a service address do not have. Of the
+// library's own types an enumeration has one, and nothing else.
+func isOrdered(t: Table, ty: Ty): Bool {
+    return orderedIn(t, ty, [])
 }
 
-func orderedIn(t: Table, ty: Ty, enumerated: func(Str, Str): Bool, seen: Str[]): Bool {
+func orderedIn(t: Table, ty: Ty, seen: Str[]): Bool {
     if ty is Ty.TFn(_, _, _, _) || ty is Ty.TMap(_, _) || ty is Ty.TUnknown {
         return false
     }
     if ty is Ty.TLib(module, name) {
-        return enumerated(module, name)
+        return len(ownedVariants(t, module, name)) > 0
     }
     if ty is Ty.TFragment(_) || ty is Ty.TCodec(_) || ty is Ty.TVoid || ty is Ty.TAddress(_) || ty is Ty.TSecret(_) {
         return false
     }
     if ty is Ty.TVec(element, _) {
-        return orderedIn(t, element, enumerated, seen)
+        return orderedIn(t, element, seen)
     }
     if ty is Ty.TResult(ok, bad) {
-        return orderedIn(t, ok, enumerated, seen) && orderedIn(t, bad, enumerated, seen)
+        return orderedIn(t, ok, seen) && orderedIn(t, bad, seen)
     }
     if ty is Ty.TNamed(name) {
         if indexOf(seen, name) is Result.Ok(_) {
@@ -1120,13 +1343,13 @@ func orderedIn(t: Table, ty: Ty, enumerated: func(Str, Str): Bool, seen: Str[]):
         if findType(t, name) is Result.Ok(info) {
             inner := seen + [name]
             for each f in info.shared {
-                if orderedIn(t, resolve(t, f.declared), enumerated, inner) == false {
+                if orderedIn(t, resolve(t, f.declared), inner) == false {
                     return false
                 }
             }
             for each v in info.variants {
                 for each f in v.fields {
-                    if orderedIn(t, resolve(t, f.declared), enumerated, inner) == false {
+                    if orderedIn(t, resolve(t, f.declared), inner) == false {
                         return false
                     }
                 }

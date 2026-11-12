@@ -35,11 +35,16 @@ hive emit      <entrypoint.hive>    print the generated Go
 hive container <entrypoint.hive>    write a Dockerfile that builds and runs it
 hive agents                         write .hivedocs/ for a coding agent to read
 hive indent    <directory or file>  indent every Hive file there with spaces
+hive lsp                            answer an editor, as a language server
 hive use       <version>            replace this compiler with another release
 hive version                        which release this compiler is
 ```
 
 `build` and `export` take `--target <goos>/<goarch>`.
+
+`hive lsp` puts the compiler in your editor: errors as you type, what a name is,
+where it was declared, what could come next. [LSP.md](LSP.md) sets it up in
+Neovim and VS Code.
 
 ## Learn
 

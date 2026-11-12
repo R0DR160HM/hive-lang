@@ -50,11 +50,16 @@ type Scan {
     tokens: token.Token[dyn]
     errors: diag.Diagnostic[dyn]
     literals: Literal[dyn]
+    // `lineStart` is where line `startOf` begins, looked for again once `line` has moved on.
+    col: Int
+    lineStart: Int
+    startOf: Int
 }
+
 // Lex the whole source.
 proc lex(source: Str): Lexed {
     cs := text.chars(normalised(source))
-    mut Scan s = Scan(0, 1, Mode.Normal(), [], [], [])
+    mut Scan s = Scan(0, 1, Mode.Normal(), [], [], [], 1, 0, 1)
     for ; s.pos < len(cs); {
         scanOne(cs, s)
     }
@@ -77,7 +82,7 @@ proc spanned(s: mut Scan, opened: Int, opens: Int, dedented: Bool): void {
 // --- Moving the cursor -------------------------------------------------------
 
 proc emit(s: mut Scan, kind: token.Kind): void {
-    append(s.tokens, token.Token(kind, s.line))
+    append(s.tokens, token.Token(kind, s.line, s.col))
 }
 
 // Emit a token and step past the `width` characters it was written with.
@@ -87,12 +92,17 @@ proc take(s: mut Scan, kind: token.Kind, width: Int): void {
 }
 
 proc fail(s: mut Scan, message: Str): void {
-    append(s.errors, diag.at(s.line, message))
+    append(s.errors, diag.on(token.Pos("", s.line, s.col), message))
 }
 
 // --- One token ---------------------------------------------------------------
 
 proc scanOne(cs: Str[], s: mut Scan): void {
+    if s.line != s.startOf {
+        s.lineStart = startOfLine(cs, s.pos)
+        s.startOf = s.line
+    }
+    s.col = s.pos - s.lineStart + 1
     if s.mode is Mode.AwaitPath {
         scanImportPath(cs, s)
         return
@@ -103,6 +113,8 @@ proc scanOne(cs: Str[], s: mut Scan): void {
     if c == "\n" {
         s.line = s.line + 1
         s.pos = s.pos + 1
+        s.lineStart = s.pos
+        s.startOf = s.line
         return
     }
     if text.isSpace(c) {
@@ -143,6 +155,13 @@ proc scanOne(cs: Str[], s: mut Scan): void {
         return
     }
     scanOperator(cs, s)
+}
+
+func startOfLine(cs: Str[], pos: Int): Int {
+    mut start := pos
+    for ; start > 0 && text.charAt(cs, start - 1) != "\n"; start-- {
+    }
+    return start
 }
 
 // Operators and punctuation, longest first: the scan commits to the first
@@ -393,7 +412,7 @@ proc scanString(cs: Str[], s: mut Scan): void {
             // that exact shape and nothing looser, which lets the regex hold the
             // `\` and `\{` that would otherwise be the string's.
             if scanRegexHole(cs, s, b) == false {
-                if scanInterpolation(cs, s, b, opened) == false {
+                if scanInterpolation(cs, s, b, opened, true) == false {
                     // The interpolation already said what went wrong; an
                     // unterminated string on top would name it twice.
                     return
@@ -501,8 +520,14 @@ func holeName(cs: Str[], start: Int): Str {
 // The `{...}` of an interpolation: everything to the matching `}`, captured raw.
 // Braces are counted rather than stopped at, so an expression holding one of its
 // own is read whole. Answers whether it closed.
-proc scanInterpolation(cs: Str[], s: mut Scan, b: mut StrPartBuf, opened: Int): Bool {
+proc scanInterpolation(cs: Str[], s: mut Scan, b: mut StrPartBuf, opened: Int, placed: Bool): Bool {
     start := s.pos
+    mut line := 0
+    mut col := 0
+    if placed {
+        line = s.line
+        col = start - startOfLine(cs, start) + 1
+    }
     mut depth := 1
     for ; s.pos < len(cs); s.pos++ {
         c := text.charAt(cs, s.pos)
@@ -512,7 +537,7 @@ proc scanInterpolation(cs: Str[], s: mut Scan, b: mut StrPartBuf, opened: Int): 
             depth = depth - 1
             if depth == 0 {
                 pushLiteral(b)
-                append(b.parts, token.StrPart.Code(text.span(cs, start, s.pos - 1)))
+                append(b.parts, token.StrPart.Code(text.span(cs, start, s.pos - 1), line, col))
                 s.pos = s.pos + 1
                 return true
             }
@@ -550,7 +575,7 @@ proc scanBacktick(cs: Str[], s: mut Scan): void {
 // A backtick string's dedented text, in pieces. Literal text is taken a run at a
 // time, since a runtime source is one long string.
 proc scanBacktickText(cs: Str[], s: mut Scan, opened: Int): void {
-    mut Scan inner = Scan(0, opened, Mode.Normal(), [], [], [])
+    mut Scan inner = Scan(0, opened, Mode.Normal(), [], [], [], s.col, 0, opened)
     mut StrPartBuf b = StrPartBuf([], "")
     mut run := 0
     for ; inner.pos < len(cs); {
@@ -563,7 +588,7 @@ proc scanBacktickText(cs: Str[], s: mut Scan, opened: Int): void {
             b.buf = b.buf + text.span(cs, run, inner.pos - 1)
             inner.pos = inner.pos + 1
             if scanRegexHole(cs, inner, b) == false {
-                if scanInterpolation(cs, inner, b, opened) == false {
+                if scanInterpolation(cs, inner, b, opened, false) == false {
                     for each e in inner.errors {
                         append(s.errors, e)
                     }
@@ -617,11 +642,11 @@ proc pushLiteral(b: mut StrPartBuf): void {
 
 proc finishString(s: mut Scan, b: mut StrPartBuf, opened: Int): void {
     if len(b.parts) == 0 {
-        append(s.tokens, token.Token(token.Kind.StrLit(b.buf), opened))
+        append(s.tokens, token.Token(token.Kind.StrLit(b.buf), opened, s.col))
         return
     }
     pushLiteral(b)
-    append(s.tokens, token.Token(token.Kind.StrParts(b.parts), opened))
+    append(s.tokens, token.Token(token.Kind.StrParts(b.parts), opened, s.col))
 }
 
 // --- Query bodies ------------------------------------------------------------
@@ -647,7 +672,7 @@ proc scanSqlBody(cs: Str[], s: mut Scan): void {
                 s.mode = Mode.Normal()
                 // The blanks around a body are where the braces were written,
                 // not something the database is going to read.
-                append(s.tokens, token.Token(token.Kind.SqlBody(text.trim(text.dedent(body))), opened))
+                append(s.tokens, token.Token(token.Kind.SqlBody(text.trim(text.dedent(body))), opened, s.col))
                 return
             }
         } else if c == "\n" {
@@ -703,7 +728,7 @@ proc scanQuotedImportPath(cs: Str[], s: mut Scan): void {
                 append(s.errors, diag.at(opened, "`import \"\"` names no module: put the path between the quotes"))
                 return
             }
-            append(s.tokens, token.Token(token.Kind.PathLit(path), opened))
+            append(s.tokens, token.Token(token.Kind.PathLit(path), opened, s.col))
             return
         }
     }

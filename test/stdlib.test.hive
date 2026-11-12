@@ -1,0 +1,115 @@
+// Tests for `src/stdlib`.
+import ../src/loader
+import ../src/stdlib
+import ../src/types
+
+proc table(): types.Table {
+    return types.tableOf(loader.loadText("main.hive", "proc main(): void \{ }").module)
+}
+
+func shown(tys: types.Ty[]): Str {
+    mut Str[dyn] out = []
+    for each ty in tys {
+        append(out, types.show(ty))
+    }
+    return join(out, ", ")
+}
+
+test "a module is a stub, and a second stub is more of one" {
+    assert stdlib.isKnownModule("term")
+    assert stdlib.isKnownModule("ui")
+    assert stdlib.isKnownModule("uiscene") == false
+    assert stdlib.isKnownModule("nosuch") == false
+}
+
+test "a call is what its stub declares: its names, what it takes, what it answers with" {
+    t := table()
+    assert join(stdlib.paramNamesOf(t, "term", "exec"), ", ") == "command, arguments, directory"
+    assert shown(stdlib.paramsOf(t, "term", "exec")) == "Str, Str[dyn], Str"
+    assert types.show(stdlib.resultOf(t, "term", "exec", [])) == "Result<Str, hive.term.ExecError>"
+}
+
+test "a name no stub declares is not in the library" {
+    t := table()
+    assert stdlib.hasName(t, "term", "exec")
+    assert stdlib.hasName(t, "term", "slurp") == false
+    assert stdlib.hasName(t, "nosuch", "exec") == false
+    assert stdlib.resultOf(t, "term", "slurp", []) is types.Ty.TUnknown
+}
+
+test "a type variable in an answer is read off what the call was handed" {
+    t := table()
+    held := types.Ty.TMap(types.Ty.TStr(), types.Ty.TInt())
+    assert types.show(stdlib.resultOf(t, "map", "get", [held, types.Ty.TStr()])) == "Result<Int, Bool>"
+    assert types.show(stdlib.resultOf(t, "map", "keys", [held])) == "Str[dyn]"
+    assert types.show(stdlib.resultOf(t, "map", "values", [held])) == "Int[dyn]"
+    assert stdlib.resultOf(t, "map", "new", []) is types.Ty.TUnknown
+    assert stdlib.resultOf(t, "map", "get", [types.Ty.TInt(), types.Ty.TStr()]) is types.Ty.TUnknown
+}
+
+test "a position that is the program's own business is held to nothing" {
+    t := table()
+    assert shown(stdlib.paramsOf(t, "map", "set")) == "?, ?, ?"
+    assert shown(stdlib.paramsOf(t, "syslink", "monitor")) == "Address<M>, Address<M>, ?"
+}
+
+test "a module's own unions and the core's are told from what its Go owns" {
+    t := table()
+    assert types.show(stdlib.resultOf(t, "file", "read", [])) == "Result<Str, hive.file.FileError>"
+    assert types.show(stdlib.resultOf(t, "file", "csv", [])) == "Result<Str[dyn][dyn], hive.file.TableError>"
+    assert types.show(stdlib.resultOf(t, "term", "readSecret", [])) == "Result<Secret<Str>, SecretError>"
+    assert stdlib.isLibType(t, "file", "TableError")
+    assert stdlib.isLibType(t, "file", "FileError") == false
+}
+
+test "a type its Go owns is a record, an enumeration or a handle" {
+    t := table()
+    mut Str[dyn] fields = []
+    for each f in stdlib.fieldsOf(t, "net", "HttpResponse") {
+        append(fields, f.name)
+    }
+    assert join(fields, ", ") == "status, headers, body"
+    assert types.show(stdlib.fieldTypeOf(t, "net", "HttpResponse", "headers")) == "Str[dyn][dyn]"
+    assert join(stdlib.variantsOf(t, "ui", "Axis"), ", ") == "Horizontal, Vertical, Both"
+    assert stdlib.isLibType(t, "net", "WsConnection")
+    assert len(stdlib.fieldsOf(t, "net", "WsConnection")) == 0
+    assert types.show(stdlib.resultOf(t, "net", "HttpResponse", [])) == "hive.net.HttpResponse"
+}
+
+test "a `hive.math` call handed only `Float32`s answers with one" {
+    t := table()
+    single := types.Ty.TFloat32()
+    assert types.show(stdlib.resultOf(t, "math", "max", [single, single])) == "Float32"
+    assert types.show(stdlib.resultOf(t, "math", "max", [single, types.Ty.TFloat()])) == "Float"
+    assert types.show(stdlib.resultOf(t, "math", "pi", [])) == "Float"
+}
+
+test "a statement run as a query answers with how many rows it touched" {
+    t := table()
+    connection := types.Ty.TLib("sql", "SqlConnection")
+    assert types.show(stdlib.resultOf(t, "sql", "run", [connection, types.Ty.TFragment(types.Ty.TVoid())])) == "Result<Int, hive.sql.SqlError>"
+    assert types.show(stdlib.resultOf(t, "sql", "run", [connection, types.Ty.TFragment(types.Ty.TStr())])) == "Result<Str, hive.sql.SqlError>"
+}
+
+test "a parameter named with a word the language reserves keeps its name" {
+    assert join(stdlib.paramNamesOf(table(), "sql", "run"), ", ") == "connection, query"
+}
+
+test "what a scene is made of is the same module, in a file of its own" {
+    t := table()
+    assert stdlib.isUiScene(t, "box")
+    assert stdlib.isUiScene(t, "row") == false
+    assert types.show(stdlib.resultOf(t, "ui", "box", [])) == "hive.ui.Shape"
+    assert types.show(stdlib.resultOf(t, "ui", "row", [])) == "hive.ui.View"
+}
+
+test "an event is an attribute, and reports what its function takes" {
+    t := table()
+    assert stdlib.isUiEvent(t, "onLook")
+    assert shown(stdlib.uiEventArgs(t, "onLook")) == "Float, Float"
+    assert stdlib.isUiEvent(t, "on")
+    assert len(stdlib.uiEventArgs(t, "on")) == 0
+    assert stdlib.isUiEvent(t, "gap") == false
+    assert stdlib.goNameOf(t, "ui", "onLook") == "UiAttrOnLook"
+    assert stdlib.goNameOf(t, "ui", "row") == "UiRow"
+}
