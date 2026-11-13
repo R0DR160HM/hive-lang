@@ -44,7 +44,9 @@ hive version                        which release this compiler is
 
 `hive lsp` puts the compiler in your editor: errors as you type, what a name is,
 where it was declared, what could come next. [LSP.md](LSP.md) sets it up in
-Neovim and VS Code.
+Neovim and in VS Code, whose extension is
+[hive-vscode](https://github.com/R0DR160HM/hive-vscode) and colours a Hive file
+too.
 
 ## Learn
 

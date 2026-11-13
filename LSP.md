@@ -18,14 +18,14 @@ Checked against Neovim 0.12, VS Code 1.136 and Claude Code 2.1.
 
 ## First: a `hive` that has it
 
-The server is the compiler itself, from **v0.3.6** on.
+The server is the compiler itself, from **v0.3.7** on.
 
 ```sh
 $ hive version
-v0.3.6
+v0.3.7
 ```
 
-[INSTALL.md](INSTALL.md) installs it, and `hive use v0.3.6` moves an older one
+[INSTALL.md](INSTALL.md) installs it, and `hive use v0.3.7` moves an older one
 forward. The editor starts whatever `hive` is on its `PATH`, so open the editor
 from a shell where `hive version` answers.
 
@@ -72,33 +72,36 @@ it written beside the line as well: `vim.diagnostic.config({ virtual_text = true
 
 ## VS Code
 
-VS Code starts a language server only through an extension, and Hive's is in
-this repository, in [`editors/vscode`](editors/vscode). It is not on the
-Marketplace, so it is packaged where it is and installed from the file. That
-takes [Node.js](https://nodejs.org) and VS Code's `code` command:
+VS Code starts a language server only through an extension, and Hive's has a
+repository of its own: [hive-vscode](https://github.com/R0DR160HM/hive-vscode).
+It is not on the Marketplace, so it is packaged there and installed from the
+file. That takes [Node.js](https://nodejs.org) 22 or later and VS Code's `code`
+command:
 
 ```sh
-$ git clone https://github.com/R0DR160HM/hive-lang
-$ cd hive-lang/editors/vscode
+$ git clone https://github.com/R0DR160HM/hive-vscode
+$ cd hive-vscode
 $ npm install
-$ npx @vscode/vsce package
-$ code --install-extension hive-lang-0.1.0.vsix
+$ npm run package
+$ code --install-extension hive-lang.vsix
 ```
 
-Open a `.hive` file. Errors appear in the editor and in the Problems panel;
-hovering a name says what it is; `F12` goes to where it was declared;
-`Ctrl+Space` offers what could come next, and so does typing a `.`; the Outline
-view lists the file's declarations; and **Format Document** reindents it.
+Open a `.hive` file. It is coloured, the SQL of a `query` body included. Errors
+appear in the editor and in the Problems panel; hovering a name says what it
+is; `F12` goes to where it was declared; `Ctrl+Space` offers what could come
+next, and so does typing a `.`; the Outline view lists the file's declarations;
+and **Format Document** reindents it.
 
-If `hive` is not on the `PATH` VS Code was started with, name it in the
-settings:
+If `hive` is not on the `PATH` VS Code was started with, the extension says so,
+and the settings name it:
 
 ```json
 { "hive.path": "C:\\Users\\you\\bin\\hive.exe" }
 ```
 
-The extension starts the server and nothing more: a Hive file is not coloured
-yet.
+The extension's own
+[README](https://github.com/R0DR160HM/hive-vscode#readme) has the rest: what is
+coloured, its snippets and its settings.
 
 ## A coding agent
 
@@ -135,13 +138,15 @@ and formatting, and publishes diagnostics.
 
 * **`hive lsp` in a terminal prints nothing and waits.** That is it working: it
   is waiting for an editor to speak. `Ctrl+C` ends it.
-* **`` `lsp` is not a command ``** — that `hive` is older than v0.3.6.
+* **`` `lsp` is not a command ``** — that `hive` is older than v0.3.7.
 * **Neovim:** `:checkhealth vim.lsp` lists the servers attached to the buffer
   and where the log is. No `hive` there means the file's type is not `hive`
   (`:set filetype?`) or `hive` is not on the `PATH` (`:echo exepath('hive')`).
 * **VS Code:** the Output panel has a **Hive** channel with what the server
   said. `"hive.trace.server": "verbose"` in the settings writes every message
-  there.
+  there, and **Hive: Restart Language Server** starts it again. In Restricted
+  Mode a file is coloured and the server is not started: trusting the workspace
+  starts it.
 
 ## What it does not do yet
 
