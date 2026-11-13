@@ -72,18 +72,13 @@ it written beside the line as well: `vim.diagnostic.config({ virtual_text = true
 
 ## VS Code
 
-VS Code starts a language server only through an extension, and Hive's has a
-repository of its own: [hive-vscode](https://github.com/R0DR160HM/hive-vscode).
-It is not on the Marketplace, so it is packaged there and installed from the
-file. That takes [Node.js](https://nodejs.org) 22 or later and VS Code's `code`
-command:
+VS Code starts a language server only through an extension, and Hive's is on
+the Marketplace as
+[Hive Language](https://marketplace.visualstudio.com/items?itemName=R0DR160HM.hive-lang).
+Search for that name in the Extensions view, or install it from a shell:
 
 ```sh
-$ git clone https://github.com/R0DR160HM/hive-vscode
-$ cd hive-vscode
-$ npm install
-$ npm run package
-$ code --install-extension hive-lang.vsix
+$ code --install-extension R0DR160HM.hive-lang
 ```
 
 Open a `.hive` file. It is coloured, the SQL of a `query` body included. Errors
@@ -99,9 +94,9 @@ and the settings name it:
 { "hive.path": "C:\\Users\\you\\bin\\hive.exe" }
 ```
 
-The extension's own
-[README](https://github.com/R0DR160HM/hive-vscode#readme) has the rest: what is
-coloured, its snippets and its settings.
+The extension has a repository of its own,
+[hive-vscode](https://github.com/R0DR160HM/hive-vscode), whose README has the
+rest: what is coloured, its snippets and its settings.
 
 ## A coding agent
 
