@@ -887,13 +887,13 @@ test "a canvas draws without linking a scene" {
 test "a program with no tests generates no test file" {
     p := loader.loadText("main.hive", "proc main(): void \{ }")
     out := emit.emitModule(p.module)
-    assert emit.emitTests(p.module, out.atoms, out.codecs, out.modules).source == ""
+    assert emit.emitTests(p.module, out.atoms, out.codecs, out.rows, out.modules).source == ""
 }
 
 test "each test is a subtest, named in the prose it was written with" {
     p := loader.loadText("main.hive", "test \"it holds\" \{ assert true }")
     out := emit.emitModule(p.module)
-    generated := emit.emitTests(p.module, out.atoms, out.codecs, out.modules).source
+    generated := emit.emitTests(p.module, out.atoms, out.codecs, out.rows, out.modules).source
     assert has(generated, "func TestHive(__t *testing.T)")
     assert has(generated, "__t.Run(\"it holds\", func(__t *testing.T) \{")
     assert has(generated, "defer hive.TestRecover(__t)")
@@ -902,7 +902,7 @@ test "each test is a subtest, named in the prose it was written with" {
 test "a test's own `t` is not the one Go's testing hands it" {
     p := loader.loadText("main.hive", "test \"its own t\" \{\n\tt := 3\n\tassert t == 3\n}")
     out := emit.emitModule(p.module)
-    generated := emit.emitTests(p.module, out.atoms, out.codecs, out.modules).source
+    generated := emit.emitTests(p.module, out.atoms, out.codecs, out.rows, out.modules).source
     assert has(generated, "var t int = 3")
     assert has(generated, "hive.TestAssertCmp(__t,")
     assert has(generated, "(t *testing.T)") == false
@@ -911,7 +911,7 @@ test "a test's own `t` is not the one Go's testing hands it" {
 test "an assertion over a comparison binds each side once and reports both" {
     p := loader.loadText("main.hive", "func two(): Int \{ return 2 }\ntest \"t\" \{ assert two() == 2 }")
     out := emit.emitModule(p.module)
-    generated := emit.emitTests(p.module, out.atoms, out.codecs, out.modules).source
+    generated := emit.emitTests(p.module, out.atoms, out.codecs, out.rows, out.modules).source
     // The call is written once, into a temporary, and the temporary is what both
     // the comparison and the report read.
     assert has(generated, ":= two()")
@@ -922,9 +922,28 @@ test "an assertion over a comparison binds each side once and reports both" {
 test "a module only a test calls is carried" {
     p := loader.loadText("main.hive", "test \"t\" \{ assert hive.conv.sti(\"1\") is Result.Ok(_) }")
     out := emit.emitModule(p.module)
-    tests := emit.emitTests(p.module, out.atoms, out.codecs, out.modules)
+    tests := emit.emitTests(p.module, out.atoms, out.codecs, out.rows, out.modules)
     assert indexOf(out.modules, "conv") is Result.Error(_)
     assert indexOf(tests.modules, "conv") is Result.Ok(_)
+}
+
+test "a row mapper only a test asks for is written beside the tests, once" {
+    rows := "type User \{ id: Int }\nquery all(): User[dyn] \{ SELECT id FROM users }\n"
+    asking := "if hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"x.db\") is Result.Ok(open) \{ echo hive.sql.run(open, all()) }"
+    p := loader.loadText("main.hive", rows + "test \"t\" \{ " + asking + " }")
+    out := emit.emitModule(p.module)
+    tests := emit.emitTests(p.module, out.atoms, out.codecs, out.rows, out.modules)
+    assert has(out.source, "func sqlRow_User(") == false
+    assert has(tests.source, "func sqlRow_User(_r []string) (User, error) \{")
+    assert has(tests.source, "var sqlFields_User = []string\{\"id\"}")
+
+    // The two files are one Go package, so one `main.go` wrote is not repeated.
+    both := loader.loadText("main.hive", rows + "proc main(): void \{ " + asking + " }\ntest \"t\" \{ " + asking + " }")
+    wrote := emit.emitModule(both.module)
+    again := emit.emitTests(both.module, wrote.atoms, wrote.codecs, wrote.rows, wrote.modules)
+    assert has(wrote.source, "func sqlRow_User(")
+    assert has(again.source, "sqlFields_User, sqlRow_User)")
+    assert has(again.source, "func sqlRow_User(") == false
 }
 
 test "a name an `is` binds outside an `if` reaches the rest of the condition" {

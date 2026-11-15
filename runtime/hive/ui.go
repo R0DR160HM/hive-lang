@@ -3700,7 +3700,7 @@ func uiServe(w *uiWindow, addr SyslinkAddress, page string, ready chan int) {
 		if err != nil {
 			return
 		}
-		conn := NetWsConnection{ws: socket}
+		conn := wsConnection(socket)
 		defer socket.close()
 		w.mu.Lock()
 		w.watchers[conn] = w.worldGen

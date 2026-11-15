@@ -977,14 +977,14 @@ func net(): Str {
         | page | what is on it |
         | --- | --- |
         | [net-http](net-http.md) | ~BT~httpRequest~BT~, ~BT~httpServe~BT~, and the two types |
-        | [net-websockets](net-websockets.md) | ~BT~wsConnect~BT~, ~BT~wsServe~BT~, ~BT~wsSend~BT~, ~BT~wsReceive~BT~ |
+        | [net-websockets](net-websockets.md) | ~BT~wsConnect~BT~, ~BT~wsServe~BT~, ~BT~wsSend~BT~, ~BT~wsReceive~BT~, and ~BT~httpWsServe~BT~ for HTTP on the same port |
         | [net-sockets](net-sockets.md) | ~BT~socketConnect~BT~, ~BT~socketServe~BT~, and the stream |
         | [net-names](net-names.md) | ~BT~resolve~BT~, ~BT~localAddress~BT~ |
         | [net-urls](net-urls.md) | ~BT~urlEncode~BT~, ~BT~queryParamsCodec~BT~ |
 
         ## What every server here has in common
 
-        **Each of the three servers blocks forever**, so it usually goes on a virtual
+        **Each of the four servers blocks forever**, so it usually goes on a virtual
         thread of its own:
 
         ~CODE~hive
@@ -1009,7 +1009,8 @@ func net(): Str {
         ~CODE~
 
         **Every call names its protocol**, so nothing reads as "the" default one: there
-        is no ~BT~serve~BT~, only ~BT~httpServe~BT~, ~BT~wsServe~BT~ and ~BT~socketServe~BT~.
+        is no ~BT~serve~BT~, only ~BT~httpServe~BT~, ~BT~wsServe~BT~, ~BT~socketServe~BT~ — and
+        ~BT~httpWsServe~BT~, which is the first two on one port and says so.
 
         ## The errors
 
@@ -1097,6 +1098,10 @@ func netHttp(): Str {
         ~BT~httpServe~BT~ blocks forever, so a program doing anything else puts it on a
         thread: ~BT~async hive.net.httpServe(8080, handle)~BT~. It runs ~BT~handle~BT~ once per
         request, on a thread of its own.
+
+        **A server that takes WebSockets on the same port** is ~BT~httpWsServe~BT~, whose
+        handler is this one and may answer 101 to hand a request over: see
+        [net-websockets](net-websockets.md).
     `)
 }
 
@@ -1111,13 +1116,15 @@ func netWebsockets(): Str {
         | --- | --- |
         | ~BT~wsConnect(url)~BT~ | ~BT~Result<WsConnection, WsError>~BT~ |
         | ~BT~wsServe(port, handler)~BT~ | ~BT~void~BT~ — **blocks forever** |
+        | ~BT~httpWsServe(port, handler, wsHandler)~BT~ | ~BT~void~BT~ — **blocks forever**; HTTP and WebSockets on one port |
         | ~BT~wsSend(conn, message)~BT~ | ~BT~Result<Int, WsError>~BT~ — the bytes it carried |
         | ~BT~wsReceive(conn)~BT~ | ~BT~Result<Str, WsError>~BT~ — the next message |
         | ~BT~wsRequest(conn)~BT~ | ~BT~HttpRequest~BT~ — the request that opened it |
         | ~BT~wsClose(conn)~BT~ | ~BT~void~BT~ |
 
         ~BT~handler~BT~ is a ~BT~proc(WsConnection): void~BT~, run once per connection on a thread
-        of its own. A ~BT~WsConnection~BT~ is **opaque** — a handle to hold and hand back.
+        of its own. A ~BT~WsConnection~BT~ is a handle to hold and hand back, and says one
+        thing of itself: **~BT~conn.address~BT~, the far end as ~BT~host:port~BT~**.
 
         A ~BT~WsError~BT~ is ~BT~Handshake~BT~, ~BT~Protocol~BT~, ~BT~Closed~BT~, ~BT~Send~BT~ or ~BT~Receive~BT~.
         **A peer that hangs up is ~BT~WsError.Closed~BT~ — the ordinary end of a
@@ -1160,6 +1167,62 @@ func netWebsockets(): Str {
 
         A receive **blocks the calling virtual thread** and nobody else, so a client
         that also does something else reads on a thread of its own.
+
+        ## Who is at the far end
+
+        ~BT~conn.address~BT~ is a **field**, not a call: the client's ~BT~host:port~BT~ on a
+        connection a server accepted, the server's on one ~BT~wsConnect~BT~ opened. An IPv6
+        host is written in brackets, which is what tells its colons from the port's:
+
+        ~CODE~hive
+        func host(conn: hive.net.WsConnection): Str \{
+        	switch conn.address \{
+        		"[\{name}]:\{port is (\d+)}" \{ return name }
+        		"\{name}:\{port is (\d+)}" \{ return name }
+        		_ \{ return conn.address }
+        	}
+        }
+        ~CODE~
+
+        **Behind a reverse proxy it is the proxy's address.** The client's own is then
+        whatever header the proxy wrote — ~BT~X-Forwarded-For~BT~, usually — read off
+        ~BT~wsRequest(conn)~BT~, and worth believing only from a proxy you put there.
+
+        Being a field, it is also what a connection is built from:
+        ~BT~hive.net.WsConnection("203.0.113.9:4711")~BT~ has that address and **no socket
+        behind it**, so every call on it answers ~BT~Closed~BT~. That is how a test hands a
+        connection to the code that reads where it came from.
+
+        ## HTTP and WebSockets on one port
+
+        ~BT~httpWsServe(port, handler, wsHandler)~BT~ is ~BT~httpServe~BT~ whose handler may hand a
+        request over. **Every request reaches ~BT~handler~BT~ as HTTP, and answering 101 is
+        what sends that one to ~BT~wsHandler~BT~**, which takes it as it would under
+        ~BT~wsServe~BT~:
+
+        ~CODE~hive
+        proc route(req: hive.net.HttpRequest): hive.net.HttpResponse \{
+        	switch req.url \{
+        		"/health" \{ return hive.net.HttpResponse(200, [], "up") }
+        		"/feed" \{ return hive.net.HttpResponse(101, [], "") }
+        		_ \{ return hive.net.HttpResponse(404, [], "not found") }
+        	}
+        }
+
+        proc main(): void \{
+        	hive.net.httpWsServe(8080, route, echoBack)
+        }
+        ~CODE~
+
+        So there is **one router**, and whether a path is a page, a WebSocket or nothing
+        is decided where everything else about a request is — a token that is wrong is
+        a 401 from ~BT~route~BT~, an ordinary HTTP answer, before any upgrade.
+
+        * **Of a 101 only the status is read.** The handshake is the runtime's to write,
+          so the answer's headers and body are not sent.
+        * **A 101 to a request that asked for no upgrade is a 400**, the answer
+          ~BT~wsServe~BT~ gives the same request.
+        * ~BT~wsRequest(conn)~BT~ is the request ~BT~handler~BT~ was just handed.
     `)
 }
 
@@ -1382,6 +1445,25 @@ func sql(): Str {
         program and to share across virtual threads. **Open it once in ~BT~main~BT~ and pass
         it along; never open one per query.** A handler reaches it through a partial
         application — ~BT~hive.net.httpServe(8080, handle(db, _))~BT~.
+
+        ## A statement is prepared once
+
+        **~BT~run~BT~ prepares a statement the first time its text is run, and runs that
+        one from then on.** A ~BT~query~BT~ writes the same text on every call — only the
+        bound values differ — so the database parses and plans it once per pooled
+        connection instead of once per call. For a short statement that was about half
+        of what running it cost.
+
+        * Nothing is asked of the program: there is no statement to hold or close, and
+          ~BT~close(conn)~BT~ releases them with the pool.
+        * A [~BT~WHERE~BT~ block](../queries.md) writes one text per combination of its
+          conditions. A connection keeps 512 statements, and a text past that runs
+          unprepared, as one the database will not prepare does — PostgreSQL refuses a
+          script of several statements.
+        * **~BT~raw~BT~ is never prepared**: its text is the program's to assemble, and no
+          two need be alike.
+        * PostgreSQL behind a pooler in *transaction* mode needs one that follows
+          prepared statements: PgBouncer 1.21 or newer, with ~BT~max_prepared_statements~BT~ set.
 
         ## The errors
 

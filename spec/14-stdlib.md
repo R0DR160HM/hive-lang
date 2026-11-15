@@ -472,7 +472,7 @@ a digest, a ciphertext and a token are `Str`s, safe to print and store.
 HTTP, WebSockets and raw TCP, clients and servers. Everything here performs I/O,
 so it works inside a `func` or a `proc`, and none of it adds a dependency.
 
-Each of the three servers blocks forever, so it usually goes on a virtual thread
+Each of the four servers blocks forever, so it usually goes on a virtual thread
 of its own, and each runs its handler once per request/connection on a thread of
 its own too. Every call names its protocol, so nothing reads as "the" default
 one. A handler is passed **by name** and its declared shape is checked at compile
@@ -494,6 +494,19 @@ A `WsError` is `Handshake`, `Protocol`, `Closed`, `Send` or `Receive`.
   the bytes it carried, `wsReceive(conn)` → the next message,
   `wsRequest(conn)` → the `HttpRequest` that opened it, `wsClose(conn)`.
   A peer that hangs up is `WsError.Closed` — the ordinary end of a conversation.
+* A `WsConnection` is a handle with one field: `conn.address`, the far end as
+  `host:port` — the client's on a connection a server accepted, the server's on
+  one `wsConnect` opened — with an IPv6 host in brackets. Behind a reverse proxy
+  it is the proxy's. `WsConnection(address)` builds a connection with that
+  address and no socket behind it, which every call answers as `Closed`; it is
+  there for a test to hand to code that reads the address.
+* `httpWsServe(port, handler, wsHandler)` serves HTTP and WebSockets on one port.
+  `handler` is `httpServe`'s and is handed every request; answering status 101
+  hands that request over, and `wsHandler` — `wsServe`'s — then runs with the
+  connection, `wsRequest(conn)` being the request `handler` saw. Of a 101 only
+  the status is read: the handshake is the runtime's, so its headers and body
+  are not sent. A 101 to a request that asked for no upgrade is answered 400, as
+  `wsServe` answers it.
 
 **Raw TCP.** A stream, not a queue of messages. A `SocketError` is `Connect`,
 `Closed`, `Send` or `Receive`.
@@ -742,6 +755,13 @@ into your executable) and **PostgreSQL** (`github.com/lib/pq`).
 A `SqlConnection` is a **connection pool**, safe to hold for the life of the
 program and to share across virtual threads. Open it once in `main` and pass it
 along. Never open one per query.
+
+`run` **prepares a statement the first time its text is run** and runs that one
+from then on, so the database parses and plans a query once per pooled
+connection rather than once per call. A connection keeps 512 of them, which
+`close` releases; a text past that — a `WHERE` block writes one per combination
+of its conditions — runs unprepared, as does one the database will not prepare
+(PostgreSQL refuses a script of several statements). `raw` is never prepared.
 
 A runtime failure is a `SqlError`: `Connection` (the database could not be
 opened or reached, or the connection is closed), `Statement` (the database

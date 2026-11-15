@@ -93,28 +93,37 @@ func NetHttpSend(req NetHttpRequest) Result[NetHttpResponse, NetHttpError] {
 func NetHttpServe(port int, handler func(NetHttpRequest) NetHttpResponse) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		resp := handler(NetHttpRequest{
-			Method:  r.Method,
-			Url:     r.URL.String(),
-			Headers: headerTable(r.Header),
-			Body:    string(body),
-		})
-		for _, row := range resp.Headers {
-			if len(row) >= 2 {
-				w.Header().Add(row[0], row[1])
-			}
-		}
-		status := resp.Status
-		if status == 0 {
-			status = 200
-		}
-		w.WriteHeader(status)
-		io.WriteString(w, resp.Body)
+		httpRespond(w, handler(httpRequestOf(r)))
 	})
 	if err := http.ListenAndServe(":"+strconv.Itoa(port), mux); err != nil {
 		panic("hive: net.httpServe: " + err.Error())
 	}
+}
+
+// httpRequestOf is an incoming request as a handler sees it, body and all.
+func httpRequestOf(r *http.Request) NetHttpRequest {
+	body, _ := io.ReadAll(r.Body)
+	return NetHttpRequest{
+		Method:  r.Method,
+		Url:     r.URL.String(),
+		Headers: headerTable(r.Header),
+		Body:    string(body),
+	}
+}
+
+// httpRespond writes what a handler answered. A status nobody set is 200.
+func httpRespond(w http.ResponseWriter, resp NetHttpResponse) {
+	for _, row := range resp.Headers {
+		if len(row) >= 2 {
+			w.Header().Add(row[0], row[1])
+		}
+	}
+	status := resp.Status
+	if status == 0 {
+		status = 200
+	}
+	w.WriteHeader(status)
+	io.WriteString(w, resp.Body)
 }
 
 func headerTable(h http.Header) Table {
@@ -171,7 +180,18 @@ func (e NetWsError) Error() string {
 //
 // Guards writes and the closed flag; a message may be sent from any thread.
 type NetWsConnection struct {
+	// The far end, as "host:port": the client's for a connection a server
+	// accepted, the server's for one hive.net.wsConnect opened. A field, so a
+	// program reads it without a call, and a test builds a connection that has
+	// one and no socket behind it.
+	Address string
+
 	ws *wsSocket
+}
+
+// wsConnection is the handle a program holds for socket.
+func wsConnection(socket *wsSocket) NetWsConnection {
+	return NetWsConnection{Address: socket.conn.RemoteAddr().String(), ws: socket}
 }
 
 type wsSocket struct {
@@ -487,7 +507,7 @@ func NetWsConnect(rawURL string) Result[NetWsConnection, NetWsError] {
 		_ = conn.Close()
 		return fail("Handshake", "the server's Sec-WebSocket-Accept does not match the key we sent")
 	}
-	return Ok[NetWsConnection, NetWsError](NetWsConnection{ws: &wsSocket{
+	return Ok[NetWsConnection, NetWsError](wsConnection(&wsSocket{
 		conn:    conn,
 		r:       reader,
 		masking: true,
@@ -496,7 +516,7 @@ func NetWsConnect(rawURL string) Result[NetWsConnection, NetWsError] {
 			Url:     rawURL,
 			Headers: headerTable(resp.Header),
 		},
-	}})
+	}))
 }
 
 // NetWsSend delivers one text message and reports how many bytes it carried.
@@ -564,10 +584,43 @@ func NetWsServe(port int, handler func(NetWsConnection)) {
 			return
 		}
 		defer socket.close()
-		handler(NetWsConnection{ws: socket})
+		handler(wsConnection(socket))
 	})
 	if err := http.ListenAndServe(":"+strconv.Itoa(port), mux); err != nil {
 		panic("hive: net.wsServe: " + err.Error())
+	}
+}
+
+// NetHttpWsServe serves HTTP and WebSockets on one port. Every request goes to
+// handler, as under NetHttpServe, and answering 101 Switching Protocols is how
+// it hands one over: the handshake is completed and upgraded runs with the
+// connection, as under NetWsServe, closing it on return. Of a 101 only the
+// status is read. One answered to a request that asked for no upgrade is
+// refused the way NetWsServe refuses it. Blocks forever, and panics if the
+// listener cannot start. Backs hive.net.httpWsServe.
+func NetHttpWsServe(port int, handler func(NetHttpRequest) NetHttpResponse, upgraded func(NetWsConnection)) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		req := httpRequestOf(r)
+		resp := handler(req)
+		if resp.Status != http.StatusSwitchingProtocols {
+			httpRespond(w, resp)
+			return
+		}
+		socket, err := wsAccept(w, r)
+		if err != nil {
+
+			// wsAccept has already answered the rejected handshake.
+			return
+		}
+		defer socket.close()
+
+		// The body went to handler, so the request wsAccept kept has none.
+		socket.req = req
+		upgraded(wsConnection(socket))
+	})
+	if err := http.ListenAndServe(":"+strconv.Itoa(port), mux); err != nil {
+		panic("hive: net.httpWsServe: " + err.Error())
 	}
 }
 

@@ -7,6 +7,8 @@ import (
 	"database/sql"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	_ "github.com/lib/pq"
 	_ "modernc.org/sqlite"
@@ -84,7 +86,7 @@ func SqlExec(conn SqlSqlConnection, stmt SqlFragment) Result[int, SqlSqlError] {
 	if conn.db == nil {
 		return Err[int, SqlSqlError](SqlSqlError{Reason: "Connection", Message: "connection is not open"})
 	}
-	res, err := conn.db.Exec(sqlPlaceholders(conn, stmt.Text), stmt.Args...)
+	res, err := conn.exec(stmt)
 	if err != nil {
 		return Err[int, SqlSqlError](SqlSqlError{Reason: "Statement", Message: err.Error()})
 	}
@@ -113,7 +115,7 @@ func SqlRows[T any](
 	if conn.db == nil {
 		return Err[[]T, SqlSqlError](SqlSqlError{Reason: "Connection", Message: "connection is not open"})
 	}
-	rows, err := conn.db.Query(sqlPlaceholders(conn, stmt.Text), stmt.Args...)
+	rows, err := conn.query(stmt)
 	if err != nil {
 		return Err[[]T, SqlSqlError](SqlSqlError{Reason: "Statement", Message: err.Error()})
 	}
@@ -283,6 +285,72 @@ type SqlSqlConnection struct {
 	// Which driver this connection speaks, so placeholders can be written in the
 	// dialect it expects.
 	driver string
+
+	// The statements this connection keeps prepared. A pointer, because the
+	// handle is copied wherever a program passes it and they are one database.
+	kept *sqlPrepared
+}
+
+// sqlPrepared is the statements a connection keeps prepared, each under the
+// text a query built. A database parses and plans a statement before it runs
+// it, and for a short one that is most of the work; a query declaration writes
+// the same text on every call, so that work is done once per pooled connection
+// rather than once per call.
+type sqlPrepared struct {
+	byText sync.Map
+	count  atomic.Int32
+}
+
+// A program's queries are a fixed set of texts, but a WHERE block writes one
+// per combination of its conditions, so how many are kept is bounded rather
+// than assumed. A text past the limit runs unprepared, as every one used to.
+const sqlPreparedLimit = 512
+
+// prepared is the statement kept for text, prepared on its first use, or nil
+// for one to run unprepared: the connection keeps as many as it will, or the
+// driver refused — PostgreSQL prepares one command at a time, so a script of
+// several is refused, and so is a statement that is wrong, which then fails
+// where it always did.
+func (c SqlSqlConnection) prepared(text string) *sql.Stmt {
+	if c.kept == nil {
+		return nil
+	}
+	if st, ok := c.kept.byText.Load(text); ok {
+		return st.(*sql.Stmt)
+	}
+	if c.kept.count.Load() >= sqlPreparedLimit {
+		return nil
+	}
+	st, err := c.db.Prepare(sqlPlaceholders(c, text))
+	if err != nil {
+		return nil
+	}
+
+	// Two threads may meet a text for the first time at once; one statement is
+	// kept and the other closed.
+	if prior, loaded := c.kept.byText.LoadOrStore(text, st); loaded {
+		st.Close()
+		return prior.(*sql.Stmt)
+	}
+	c.kept.count.Add(1)
+	return st
+}
+
+// exec and query run what a query declaration built, through its prepared
+// statement where there is one. hive.sql.raw goes through neither: its text is
+// the program's to assemble, and no two need be alike.
+func (c SqlSqlConnection) exec(stmt SqlFragment) (sql.Result, error) {
+	if st := c.prepared(stmt.Text); st != nil {
+		return st.Exec(stmt.Args...)
+	}
+	return c.db.Exec(sqlPlaceholders(c, stmt.Text), stmt.Args...)
+}
+
+func (c SqlSqlConnection) query(stmt SqlFragment) (*sql.Rows, error) {
+	if st := c.prepared(stmt.Text); st != nil {
+		return st.Query(stmt.Args...)
+	}
+	return c.db.Query(sqlPlaceholders(c, stmt.Text), stmt.Args...)
 }
 
 // sqlDriverName maps a SqlDatabaseDriver onto the registered database/sql driver.
@@ -308,7 +376,7 @@ func SqlConnect(driver SqlDatabaseDriver, connString string) Result[SqlSqlConnec
 		db.Close()
 		return Err[SqlSqlConnection, SqlSqlError](SqlSqlError{Reason: "Connection", Message: err.Error()})
 	}
-	return Ok[SqlSqlConnection, SqlSqlError](SqlSqlConnection{db: db, driver: sqlDriverName(driver)})
+	return Ok[SqlSqlConnection, SqlSqlError](SqlSqlConnection{db: db, driver: sqlDriverName(driver), kept: &sqlPrepared{}})
 }
 
 // SqlPool is SqlConnect with explicit pool limits (max open and idle
@@ -324,7 +392,8 @@ func SqlPool(driver SqlDatabaseDriver, connString string, maxOpen int, maxIdle i
 	return Ok[SqlSqlConnection, SqlSqlError](conn)
 }
 
-// SqlClose releases a connection pool. It is safe to call more than once.
+// SqlClose releases a connection pool, and with it every statement the pool
+// kept prepared. It is safe to call more than once.
 func SqlClose(conn SqlSqlConnection) {
 	if conn.db != nil {
 		conn.db.Close()
@@ -345,7 +414,7 @@ func SqlTable(conn SqlSqlConnection, stmt SqlFragment) Result[Table, SqlSqlError
 	if conn.db == nil {
 		return Err[Table, SqlSqlError](SqlSqlError{Reason: "Connection", Message: "connection is not open"})
 	}
-	return sqlTable(conn.db.Query(sqlPlaceholders(conn, stmt.Text), stmt.Args...))
+	return sqlTable(conn.query(stmt))
 }
 
 func sqlTable(rows *sql.Rows, err error) Result[Table, SqlSqlError] {

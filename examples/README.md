@@ -16,7 +16,7 @@ hive test examples/15-testing/cart.test.hive
 | --- | --- | --- |
 | 01 | [basic-io](01-basic-io) | `echo`, a type with variants, and a CSV read with `hive.file.csv` |
 | 02 | [types](02-types) | every type there is: strings, vectors, atoms, numbers, bools, `mut`, and a `query` |
-| 03 | [networking](03-networking) | an HTTP server and client, raw TCP, and WebSockets |
+| 03 | [networking](03-networking) | an HTTP server and client, raw TCP, WebSockets, and HTTP and WebSockets on one port |
 | 04 | [crypto](04-crypto) | hashing, HMAC, base64, password encryption, and JWTs |
 | 05 | [sql](05-sql) | `query` declarations, typed rows, optional filters, and `hive.sql.raw` |
 | 06 | [value-semantics](06-value-semantics) | why two names never observe each other's writes, and the one case where they do |

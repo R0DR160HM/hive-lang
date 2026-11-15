@@ -1,0 +1,104 @@
+// HTTP and WebSockets on one port
+// ===============================
+// A page and its live feed are usually reached at one address, and a host that
+// gives a program a port gives it one. `hive.net.httpWsServe` is `httpServe`
+// whose handler may also hand a request over: every request comes to it as
+// HTTP, and answering 101 — Switching Protocols — sends that one to the
+// WebSocket handler, which takes it from there exactly as under `wsServe`.
+//
+// Like websockets.hive, this is both halves in one process: the server goes on
+// a virtual thread of its own, the client talks to it, and the program exits.
+
+// The HTTP handler is the only router there is. Whether a path is a page, a
+// WebSocket or nothing is decided here, in one place, by the patterns that
+// already route everything else.
+proc route(request: hive.net.HttpRequest): hive.net.HttpResponse {
+    if request.url == "/health" {
+        return hive.net.HttpResponse(200, [], "up")
+    }
+    if request.url is "/feed/{room}" {
+        // Of a 101 only the status is read: the handshake is the runtime's to
+        // write. A room nobody may enter would be a 403 here, and an ordinary
+        // HTTP answer — which is why this is asked before the upgrade.
+        return hive.net.HttpResponse(101, [], "")
+    }
+    return hive.net.HttpResponse(404, [], "nothing at {request.url}")
+}
+
+// What was handed over arrives as it would under `wsServe`, and the request
+// that opened it is still there — the same one `route` has just read.
+proc feed(connection: hive.net.WsConnection): void {
+    mut room := ""
+    if hive.net.wsRequest(connection).url is "/feed/{name}" {
+        room = name
+    }
+    for ;; {
+        if hive.net.wsReceive(connection) is Result.Ok(message) {
+            _ := hive.net.wsSend(connection, "{host(connection)} said {message} in {room}")
+        } else {
+            return
+        }
+    }
+}
+
+// `address` is who is at the far end, as `host:port`. It is a field rather
+// than a call, because it was settled when the connection opened. An IPv6 host
+// is written in brackets, which is what tells its colons from the port's.
+func host(connection: hive.net.WsConnection): Str {
+    switch connection.address {
+        "[{name}]:{port is (\d+)}" { return name }
+        "{name}:{port is (\d+)}" { return name }
+        _ { return connection.address }
+    }
+}
+
+// Like every server in the module it blocks forever, so the caller writes
+// `async serveForever()`.
+func serveForever(): void {
+    hive.net.httpWsServe(9003, route, feed)
+}
+
+func get(path: Str): hive.net.HttpRequest {
+    return hive.net.HttpRequest("GET", "http://127.0.0.1:9003{path}", [], "")
+}
+
+proc visit(): void {
+    // Plain HTTP is answered as `httpServe` answers it.
+    for each path in ["/health", "/missing"] {
+        if hive.net.httpRequest(get(path)) is Result.Ok(answer) {
+            echo "GET {path}: {answer.status} {answer.body}"
+        }
+    }
+
+    // A 101 means something only to a request that asked for an upgrade. To
+    // any other the runtime answers 400 itself, as `wsServe` does.
+    if hive.net.httpRequest(get("/feed/bees")) is Result.Ok(answer) {
+        echo "GET /feed/bees, not as a WebSocket: {answer.status}"
+    }
+
+    // The same path, asked for as a WebSocket, is one.
+    if hive.net.wsConnect("ws://127.0.0.1:9003/feed/bees") is Result.Ok(connection) {
+        // A client's connection has an address too: the server's.
+        echo "connected to {connection.address}"
+        _ := hive.net.wsSend(connection, "hello")
+        if hive.net.wsReceive(connection) is Result.Ok(reply) {
+            echo reply
+        }
+        hive.net.wsClose(connection)
+    }
+}
+
+proc main(): void {
+    async serveForever()
+    // Give the listener a moment to bind before dialling it.
+    hive.task.sleep(200)
+    visit()
+
+    // A connection can be built by hand as well, which is how a test hands one
+    // to the code that reads its address. It has no socket behind it, so
+    // everything asked of it answers `Closed`.
+    absent := hive.net.WsConnection("203.0.113.9:4711")
+    if hive.net.wsSend(absent, "anyone?") is Result.Error(hive.net.WsError.Closed(_)) {
+        echo "{host(absent)} was never connected"
+    }
+}

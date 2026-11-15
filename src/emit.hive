@@ -42,6 +42,9 @@ type Emitted {
     // own file in the same Go package, so this keeps a codec a test needs from
     // being written twice — or, where only a test needed it, from being missed.
     codecs: Str[dyn]
+    // The row types a query's mapper was written for, kept for the same reason:
+    // a mapper only a test asked for is written beside the tests, once.
+    rows: Str[dyn]
     // Whether the program opens a `hive.ui.window` or `webview`. A windowed program is linked
     // without a console, which is what makes it one window rather than two — and
     // `hive.ui.html` alone is not that, so the module list cannot answer it.
@@ -184,7 +187,7 @@ proc emitChecked(m: ast.Module, landings: infer.Landing[]): Emitted {
         line(em, "hive.InitAtoms(" + atomTable(em) + ")")
         close(em, "}")
     }
-    return Emitted(join(em.out, "\n") + "\n", em.spans, em.atoms, em.modules, em.codecs, em.window, em.errors)
+    return Emitted(join(em.out, "\n") + "\n", em.spans, em.atoms, em.modules, em.codecs, em.rows, em.window, em.errors)
 }
 
 func hasMain(m: ast.Module): Bool {
@@ -4420,7 +4423,13 @@ proc needRow(em: mut Emit, name: Str): void {
 // One mapper per row type a typed query reads, and beside it the fields it reads
 // in the order it reads them, written by the one loop so the two cannot disagree.
 proc emitRows(em: mut Emit): void {
-    mut done := 0
+    emitRowsFrom(em, 0)
+}
+
+// The same, skipping the ones already written elsewhere — what a test file does
+// with the mappers `main.go` wrote, the two being one Go package.
+proc emitRowsFrom(em: mut Emit, from: Int): void {
+    mut done := from
     for ; done < len(em.rows); {
         at := done
         done = done + 1
@@ -5400,16 +5409,17 @@ func testingT(): Str {
 
 // The `main_test.go` for a program's tests (`""` when it has none), and the
 // modules the build carries once a test's own calls are counted.
-proc emitTests(m: ast.Module, atoms: Str[], codecs: Str[], modules: Str[]): Emitted {
-    return emitCheckedTests(m, atoms, codecs, modules, [])
+proc emitTests(m: ast.Module, atoms: Str[], codecs: Str[], rows: Str[], modules: Str[]): Emitted {
+    return emitCheckedTests(m, atoms, codecs, rows, modules, [])
 }
 
-proc emitCheckedTests(m: ast.Module, atoms: Str[], codecs: Str[], modules: Str[], landings: infer.Landing[]): Emitted {
+proc emitCheckedTests(m: ast.Module, atoms: Str[], codecs: Str[], rows: Str[], modules: Str[], landings: infer.Landing[]): Emitted {
     t := types.tableOf(m)
     // What `main.go` already wrote or asked for is seeded rather than repeated:
     // the two files are one Go package.
-    mut Emit em = Emit(t, [], 0, copiedNames(atoms), copiedNames(modules), [], [], lentFuncs(t, m.decls), [], copiedNames(codecs), 0, [], [], [], [], true, false, false, -1, [], writes.writtenShapes(m), [], token.nowhere(), "", false, [], handingBackFuncs(t, m.decls), "", [], [], landings)
+    mut Emit em = Emit(t, [], 0, copiedNames(atoms), copiedNames(modules), [], [], lentFuncs(t, m.decls), copiedNames(rows), copiedNames(codecs), 0, [], [], [], [], true, false, false, -1, [], writes.writtenShapes(m), [], token.nowhere(), "", false, [], handingBackFuncs(t, m.decls), "", [], [], landings)
     written := len(codecs)
+    mapped := len(rows)
     mut found := false
     for each d in m.decls {
         if d is ast.Decl.TestDecl(_, _, _) {
@@ -5417,7 +5427,7 @@ proc emitCheckedTests(m: ast.Module, atoms: Str[], codecs: Str[], modules: Str[]
         }
     }
     if found == false {
-        return Emitted("", [], em.atoms, em.modules, em.codecs, false, [])
+        return Emitted("", [], em.atoms, em.modules, em.codecs, em.rows, false, [])
     }
 
     line(em, "package main")
@@ -5445,10 +5455,11 @@ proc emitCheckedTests(m: ast.Module, atoms: Str[], codecs: Str[], modules: Str[]
     }
     close(em, "}")
     // A codec only a test asked for is written here, beside the tests that
-    // wanted it. A pattern only a test used is the same story.
+    // wanted it. A row mapper and a pattern only a test used are the same story.
+    emitRowsFrom(em, mapped)
     emitCodecsFrom(em, written)
     emitPatterns(em)
-    return Emitted(join(em.out, "\n") + "\n", [], em.atoms, em.modules, em.codecs, false, em.errors)
+    return Emitted(join(em.out, "\n") + "\n", [], em.atoms, em.modules, em.codecs, em.rows, false, em.errors)
 }
 
 func copiedNames(names: Str[]): Str[dyn] {
