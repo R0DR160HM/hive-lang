@@ -11,6 +11,9 @@ import (
 var uiShade = uiRGBA{0, 0, 0, 115}
 
 func (n *uiNative) paint(cv *uiCanvas) {
+	if n.easingLive {
+		n.stale = true
+	}
 	n.layout()
 	all := uiClip{0, 0, cv.w, cv.h}
 	if !cv.dirty.empty() {
@@ -28,6 +31,7 @@ func (n *uiNative) paint(cv *uiCanvas) {
 		n.paintLayer(cv, l, all)
 	}
 	n.paintPopup(cv, all)
+	n.paintCarried(cv, all)
 	n.paintTip(cv, all)
 }
 
@@ -46,7 +50,14 @@ func (n *uiNative) paintBox(cv *uiCanvas, b *uiBox, clip uiClip, under uiRGBA) {
 		saved := cv.grab(area)
 		defer cv.fade(saved, area, b.opacity)
 	}
-	framed := b.kind == "button" || b.kind == "input" || b.kind == "textarea" || b.kind == "select"
+	framed := uiFramedKind(b.kind)
+	corner := b.corner
+	if b.radius >= 0 && !framed {
+		corner = b.radius
+	}
+	if b.shadow > 0 && !framed {
+		n.boxShadow(cv, b, corner, clip)
+	}
 	if b.hoverTone != "" && b.path == n.lit && !b.disabled && !framed && !visible.empty() {
 		lit := n.runColour(b.hoverTone, n.pal.surface)
 		corner := b.corner
@@ -59,16 +70,31 @@ func (n *uiNative) paintBox(cv *uiCanvas, b *uiBox, clip uiClip, under uiRGBA) {
 			cv.fill(box.x0, box.y0, box.x1, box.y1, lit, clip)
 		}
 		under = uiMix(under, lit, 1)
+	} else if b.gradient != nil && !visible.empty() && !framed {
+		cv.shade(x0, y0, x1, y1, corner*n.scale, b.gradient, clip)
+		under = uiMix(under, uiLerpColour(b.gradient.from, b.gradient.to, 0.5), 1)
 	} else if b.fill.a > 0 && !visible.empty() && !framed {
-		if b.corner > 0 {
-			cv.round(x0, y0, x1, y1, b.corner*n.scale, b.fill, clip)
+		if corner > 0 {
+			cv.round(x0, y0, x1, y1, corner*n.scale, b.fill, clip)
 		} else {
 			cv.fill(box.x0, box.y0, box.x1, box.y1, b.fill, clip)
 		}
 		under = uiMix(under, b.fill, 1)
 	}
+	switch {
+	case b.kind == "choices" && b.edge < 0 && b.edgeTone == "":
+		cv.ring(x0, y0, x1, y1, corner*n.scale, n.hairline(), n.pal.line, clip)
+	case !framed && b.border > 0:
+		edge := b.colour
+		if b.edgeTone != "" {
+			edge = n.runColour(b.edgeTone, b.colour)
+		}
+		cv.ring(x0, y0, x1, y1, corner*n.scale, math.Max(1, math.Round(b.border*n.scale)), edge, clip)
+	}
 	switch b.kind {
-	case "text", "link", "icon":
+	case "icon":
+		n.paintIcon(cv, b, clip, under)
+	case "text", "link":
 		n.paintLines(cv, b, clip, under, b.colour, x0, y0)
 	case "button":
 		n.paintButton(cv, b, clip, under)
@@ -76,8 +102,12 @@ func (n *uiNative) paintBox(cv *uiCanvas, b *uiBox, clip uiClip, under uiRGBA) {
 		switch b.input {
 		case "Range":
 			n.paintRange(cv, b, clip, under)
-		case "Date":
+		case "Date", "Time", "DateTime":
 			n.paintDate(cv, b, clip, under)
+		case "Color":
+			n.paintColour(cv, b, clip, under)
+		case "File":
+			n.paintFile(cv, b, clip, under)
 		default:
 			n.paintInput(cv, b, clip, under)
 		}
@@ -95,6 +125,10 @@ func (n *uiNative) paintBox(cv *uiCanvas, b *uiBox, clip uiClip, under uiRGBA) {
 		n.paintImage(cv, b, clip, under)
 	case "canvas":
 		n.paintCanvas(cv, b, clip, under)
+	case "paragraph":
+		n.paintParagraph(cv, b, clip, under)
+	case "radioItem", "tab", "choice", "branchHead", "twisty", "label", "progress":
+		n.paintItem(cv, b, clip, under)
 	case "scene":
 		if n.stage != nil && b == n.sceneBox {
 			n.stage.paint(cv, b, clip)
@@ -107,6 +141,9 @@ func (n *uiNative) paintBox(cv *uiCanvas, b *uiBox, clip uiClip, under uiRGBA) {
 		inner = visible
 	}
 	for _, k := range b.kids {
+		if b.kind == "paragraph" && uiWorded(k.kind) {
+			continue
+		}
 		n.paintBox(cv, k, inner, under)
 	}
 	if b.scroll != "" && b != n.root {
@@ -131,13 +168,24 @@ func (n *uiNative) paintLines(cv *uiCanvas, b *uiBox, clip uiClip, under uiRGBA,
 	if n.lit == b.path {
 		underline = false
 	}
+	inner := math.Max(b.w-2*b.padX-2*b.border, 0)
 	for i, line := range b.lines {
-		n.paintChosen(cv, b, -1, i, line, left, top+float64(i)*b.lineH*n.scale, b.font, b.lineH, clip)
+		shift, spread := n.lineShift(b, i, line, inner)
+		start := left + shift*n.scale
+		n.paintChosen(cv, b, -1, i, line, start, top+float64(i)*b.lineH*n.scale, b.font, b.lineH, clip)
 		y := top + float64(i)*b.lineH*n.scale + lift
-		n.say(b.font, left, y, line, colour, clip)
+		if spread > 0 {
+			at := start
+			for _, word := range uiWords(line) {
+				n.say(b.font, at, y, word, colour, clip)
+				at += (n.measure(b.font, word) + spread*float64(strings.Count(word, " "))) * n.scale
+			}
+		} else {
+			n.say(b.font, start, y, line, colour, clip)
+		}
 		if underline && line != "" {
 			at := math.Round(y + n.dev.tall(b.font)*n.scale*0.86)
-			cv.fill(int(math.Round(left)), int(at), int(math.Round(left+n.measure(b.font, line)*n.scale)), int(at+n.hairline()), colour, clip)
+			cv.fill(int(math.Round(start)), int(at), int(math.Round(start+n.measure(b.font, line)*n.scale)), int(at+n.hairline()), colour, clip)
 		}
 	}
 	if b.kind == "link" && b.path == n.focus && n.keyboard {
@@ -358,9 +406,8 @@ func (n *uiNative) paintRange(cv *uiCanvas, b *uiBox, clip uiClip, under uiRGBA)
 	cy := (y0 + y1) / 2
 	knob := 8 * n.scale
 	track := 2 * n.scale
-	value := n.rangeValue(b)
 	from, to := x0+knob, x1-knob
-	at := from + (to-from)*float64(value)/100
+	at := from + (to-from)*n.rangeFraction(b)
 	rest, lit := n.pal.line, n.pal.accent
 	if b.path == n.hover || b.path == n.sliding {
 		lit = uiMix(lit, n.pal.fg, 0.15)
@@ -389,9 +436,10 @@ func (n *uiNative) paintDate(cv *uiCanvas, b *uiBox, clip uiClip, under uiRGBA) 
 	top := (y0+y1)/2 - b.lineH*n.scale/2
 	lift := n.lift(b)
 	box := clip.and(uiClip{int(left) - 2, int(y0), int(right), int(y1)})
-	order, sep := n.dateOrder()
+	order := n.stampOrder(b)
 	x := left
 	for i, part := range order {
+		sep := n.stampSep(order, i)
 		text, empty := d.show(part)
 		w := n.measure(b.font, text) * n.scale
 		colour := n.ink(b)
@@ -404,10 +452,18 @@ func (n *uiNative) paintDate(cv *uiCanvas, b *uiBox, clip uiClip, under uiRGBA) 
 		}
 		n.say(b.font, x, top+lift, text, colour, box)
 		x += w
-		if i < len(order)-1 {
+		if sep != "" {
 			n.say(b.font, x, top+lift, sep, n.ink(b), box)
 			x += n.measure(b.font, sep) * n.scale
 		}
+	}
+	if b.input == "Time" {
+		ink := n.ink(b)
+		side := int(math.Round(13 * n.scale))
+		if pix := n.iconPixels("Clock", ink, side); pix != nil {
+			cv.blit(pix, side, side, int(math.Round(right-14*n.scale)), int(math.Round((y0+y1)/2-float64(side)/2)), clip)
+		}
+		return
 	}
 	n.paintCalendarMark(cv, b, right-14*n.scale, (y0+y1)/2, clip)
 }
@@ -415,7 +471,7 @@ func (n *uiNative) paintDate(cv *uiCanvas, b *uiBox, clip uiClip, under uiRGBA) 
 func (n *uiNative) paintCalendarMark(cv *uiCanvas, b *uiBox, x, cy float64, clip uiClip) {
 	s := n.scale
 	ink := n.ink(b)
-	if b.path == n.hover && n.hoverPart == 3 {
+	if b.path == n.hover && n.hoverPart == 100 {
 		ink = n.pal.accent
 	}
 	line := n.hairline()
@@ -734,6 +790,10 @@ func (n *uiNative) paintPopup(cv *uiCanvas, all uiClip) {
 		n.paintCalendar(cv, b, all)
 		return
 	}
+	if p.kind == "colour" {
+		n.paintPicker(cv, all)
+		return
+	}
 	box := all.and(uiClip{int(x0 + line), int(y0 + line), int(x1 - line), int(y1 - line)})
 	f := b.font
 	lift := n.lift(b)
@@ -891,3 +951,46 @@ func (n *uiNative) paintTip(cv *uiCanvas, all uiClip) {
 		n.say(f, x0+8*s, y0+(4+float64(i)*lineH)*s+lift, text, uiMix(n.pal.surface, n.pal.fg, 1), all)
 	}
 }
+
+func (n *uiNative) paintParagraph(cv *uiCanvas, b *uiBox, clip uiClip, under uiRGBA) {
+	if b.layout == nil {
+		return
+	}
+	s := n.scale
+	left := (b.x + b.padX + b.border) * s
+	top := (b.y + b.padY + b.border) * s
+	for i, f := range b.layout.frags {
+		k := b.kids[f.kid]
+		if !uiWorded(k.kind) || f.text == "" {
+			continue
+		}
+		x, y := left+f.x*s, top+f.y*s
+		ground := under
+		if k.fill.a > 0 {
+			tall := n.dev.tall(k.font)
+			cv.fill(int(math.Round(x)), int(math.Round(y+(k.lineH-tall)/2*s)), int(math.Round(x+f.w*s)),
+				int(math.Round(y+(k.lineH+tall)/2*s)), k.fill, clip)
+			ground = uiMix(under, k.fill, 1)
+		}
+		n.paintChosen(cv, k, uiFragCell(i), 0, f.text, x, y, k.font, k.lineH, clip)
+		ink := uiMix(ground, k.colour, 1)
+		n.say(k.font, x, y+n.lift(k), f.text, ink, clip)
+		if k.kind == "link" && k.path == n.hover && k.hoverTone == "" {
+			at := math.Round(y + n.lift(k) + n.dev.tall(k.font)*s*0.86)
+			w := n.measure(k.font, strings.TrimRight(f.text, " ")) * s
+			cv.fill(int(math.Round(x)), int(at), int(math.Round(x+w)), int(at+n.hairline()), ink, clip)
+		}
+	}
+	for _, k := range b.kids {
+		if k.kind == "link" && k.path == n.focus && n.keyboard {
+			x0, y0, x1, y1 := n.rectOf(k)
+			line := n.hairline()
+			cv.ring(x0-2*line, y0-2*line, x1+2*line, y1+2*line, 4*s, 2*line, n.pal.accent, clip)
+		}
+	}
+}
+
+// A paragraph's words are a selection run each, told apart from a table's cells by a bit of their own.
+func uiFragCell(i int) int { return 1<<30 | i }
+
+func uiIsFragCell(cell int) bool { return cell >= 0 && cell&(1<<30) != 0 }

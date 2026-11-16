@@ -22,46 +22,45 @@ type uiPopup struct {
 	x, y, w, h float64
 	rowH       float64
 	pressed    bool
+	hsv        [3]float64
+	area       int
 }
 
 type uiSpan struct{ from, to int }
 
 type uiDate struct {
-	parts      [3]int // year, month, day; nought where none is set
+	parts      [5]int // year, month, day, then hour and minute each one more; nought where none is set
+	kind       string
 	at         int
 	typed      string
 	typingSlot int
 	sent       string
 }
 
-func (d *uiDate) set(value string) {
-	d.parts = [3]int{}
-	d.typed = ""
-	if t, err := time.Parse("2006-01-02", value); err == nil {
-		d.parts = [3]int{t.Year(), int(t.Month()), t.Day()}
-	}
-	d.sent = d.value()
-}
+func (d *uiDate) set(value string) { d.setStamp(value) }
 
 func (d *uiDate) value() string {
-	y, m, day := d.parts[0], d.parts[1], d.parts[2]
-	if y == 0 || m == 0 || day == 0 {
-		return ""
+	switch d.kind {
+	case "Time":
+		return d.clockValue()
+	case "DateTime":
+		day, clock := d.dayValue(), d.clockValue()
+		if day == "" || clock == "" {
+			return ""
+		}
+		return day + "T" + clock
 	}
-	if t := time.Date(y, time.Month(m), day, 0, 0, 0, 0, time.UTC); t.Day() != day {
-		return ""
-	}
-	return uiPad(y, 4) + "-" + uiPad(m, 2) + "-" + uiPad(day, 2)
+	return d.dayValue()
 }
 
 func (d *uiDate) partial() bool {
-	set := 0
-	for _, p := range d.parts {
-		if p != 0 {
+	set, slots := 0, uiStampSlots(d.kind)
+	for _, s := range slots {
+		if d.parts[s] != 0 {
 			set++
 		}
 	}
-	return set > 0 && set < 3 || d.typed != ""
+	return set > 0 && set < len(slots) || d.typed != ""
 }
 
 func uiPad(v, width int) string {
@@ -78,6 +77,10 @@ func uiDateSlot(part byte) int {
 		return 0
 	case 'M':
 		return 1
+	case 'h':
+		return 3
+	case 'm':
+		return 4
 	}
 	return 2
 }
@@ -96,6 +99,9 @@ func (d *uiDate) show(part byte) (string, bool) {
 		return uiPad(v, 2), false
 	}
 	if v := d.parts[slot]; v != 0 {
+		if slot >= 3 {
+			v--
+		}
 		return uiPad(v, width), false
 	}
 	switch part {
@@ -103,6 +109,8 @@ func (d *uiDate) show(part byte) (string, bool) {
 		return "yyyy", true
 	case 'M':
 		return "mm", true
+	case 'h', 'm':
+		return "--", true
 	}
 	return "dd", true
 }
@@ -187,6 +195,22 @@ func uiWalk(from *uiBox, x, y float64) []*uiBox {
 			return false
 		}
 		chain = append(chain, b)
+		if b.kind == "paragraph" {
+			for i := len(b.kids) - 1; i >= 0; i-- {
+				if !uiWorded(b.kids[i].kind) && walk(b.kids[i]) {
+					return true
+				}
+			}
+			if at, ok := uiFragAt(b, x, y); ok {
+				chain = append(chain, b.kids[b.layout.frags[at].kid])
+				return true
+			}
+			if inside {
+				return true
+			}
+			chain = chain[:len(chain)-1]
+			return false
+		}
 		for i := len(b.kids) - 1; i >= 0; i-- {
 			if walk(b.kids[i]) {
 				return true
@@ -240,9 +264,9 @@ func (n *uiNative) part(b *uiBox, x, y float64) int {
 				}
 				return 2
 			}
-		case "Date":
+		case "Date", "Time", "DateTime":
 			if x >= right-18 {
-				return 3
+				return 100
 			}
 			return n.dateSegment(b, x)
 		}
@@ -301,7 +325,7 @@ func (n *uiNative) dateSegment(b *uiBox, x float64) int {
 	if d == nil {
 		return 0
 	}
-	order, sep := n.dateOrder()
+	order := n.stampOrder(b)
 	at := b.x + b.padX + b.border
 	best := 0
 	for i, part := range order {
@@ -310,7 +334,7 @@ func (n *uiNative) dateSegment(b *uiBox, x float64) int {
 		if x >= at-2 {
 			best = i
 		}
-		at += w + n.measure(b.font, sep)
+		at += w + n.measure(b.font, n.stampSep(order, i))
 	}
 	return best
 }
@@ -340,6 +364,9 @@ func (n *uiNative) cursor(x, y float64) string {
 	if shape := n.grabCursor(x, y); shape != "" {
 		return shape
 	}
+	if c := n.carrying; c != nil && c.started {
+		return "hand"
+	}
 	if d := n.heard(x, y, "onDrag"); d != nil {
 		if t := n.target(x, y); t == nil || t == d || !t.focusable() {
 			if d.w >= d.h {
@@ -367,9 +394,9 @@ func (n *uiNative) cursor(x, y float64) string {
 	switch b.kind {
 	case "input":
 		switch {
-		case b.input == "Range":
+		case b.input == "Range", b.input == "Color", b.input == "File":
 			return "hand"
-		case b.input == "Date", part != 0:
+		case uiStamp(b.input), part != 0:
 			return "arrow"
 		}
 		return "text"
@@ -394,6 +421,9 @@ func (n *uiNative) move(x, y float64) bool {
 	n.layout()
 	x, y = x/n.scale, y/n.scale
 	n.pointer = [2]float64{x, y}
+	if n.pointed(x, y) {
+		return true
+	}
 	if d := n.drag; d != nil {
 		dx, dy := int(math.Round(x-d.x)), int(math.Round(y-d.y))
 		if dx != d.dx || dy != d.dy {
@@ -447,6 +477,10 @@ func (n *uiNative) move(x, y float64) bool {
 		n.quiet = ""
 	}
 	hover, part := "", 0
+	if p := n.popup; p != nil && p.kind == "colour" && p.pressed {
+		n.colourDrag(x, y)
+		return true
+	}
 	if n.popup != nil && n.inPopup(x, y) {
 		hover, part = n.popup.path+"/popup", n.popupPart(x, y)
 		if (n.popup.kind == "select" || n.popup.kind == "menu") && part >= 0 && part != n.popup.lit {
@@ -589,6 +623,7 @@ func (n *uiNative) unhover(keep string) {
 
 func (n *uiNative) leave() bool {
 	n.touched()
+	n.crossed(0, 0, false)
 	n.unhover("")
 	n.lit = ""
 	n.probe(-1, -1)
@@ -601,11 +636,16 @@ func (n *uiNative) leave() bool {
 func (n *uiNative) down(x, y float64) bool {
 	n.touched()
 	n.layout()
+	defer n.focusMoved()
 	x, y = x/n.scale, y/n.scale
+	n.pressed(x, y)
 	n.quiet, n.tip = n.tip, ""
 	if p := n.popup; p != nil {
 		if n.inPopup(x, y) {
 			p.pressed = true
+			if p.kind == "colour" {
+				n.colourPress(x, y)
+			}
 			return true
 		}
 		n.popup = nil
@@ -650,7 +690,7 @@ func (n *uiNative) down(x, y float64) bool {
 		return true
 	}
 	n.press, n.pressPart = b.path, n.part(b, x, y)
-	if b.focusable() {
+	if b.focusable() || b.kind == "radioItem" && !b.disabled {
 		n.focus = b.path
 	} else {
 		n.focus = ""
@@ -662,9 +702,13 @@ func (n *uiNative) down(x, y float64) bool {
 	case b.kind == "input" && b.input == "Range":
 		n.sliding = b.path
 		n.slide(b, x)
-	case b.kind == "input" && b.input == "Date":
-		if d := n.dates[b.path]; d != nil && n.pressPart < 3 {
+	case b.kind == "input" && uiStamp(b.input):
+		if d := n.dates[b.path]; d != nil && n.pressPart < 100 {
 			d.at, d.typed = n.pressPart, ""
+		}
+	case b.kind == "input" && b.input == "Color":
+		if p := n.popup; p == nil {
+			n.openColour(b)
 		}
 	case b.kind == "input" && b.input == "Number" && n.pressPart > 0:
 		n.stepNumber(b, 3-2*n.pressPart)
@@ -690,6 +734,10 @@ func (n *uiNative) up(x, y float64) bool {
 	n.touched()
 	n.layout()
 	x, y = x/n.scale, y/n.scale
+	if n.released(x, y) {
+		n.dragging = false
+		return true
+	}
 	n.dragging = false
 	if d := n.drag; d != nil {
 		n.drag = nil
@@ -733,6 +781,12 @@ func (n *uiNative) activate(b *uiBox, part int) {
 	if b.disabled {
 		return
 	}
+	if b.item != nil {
+		if n.itemClickable(b) {
+			n.activateItem(b)
+		}
+		return
+	}
 	switch b.kind {
 	case "link":
 		if _, ok := b.attr("on"); ok {
@@ -758,8 +812,10 @@ func (n *uiNative) activate(b *uiBox, part int) {
 		switch {
 		case b.input == "Search" && part == 1:
 			n.clearField(b)
-		case b.input == "Date" && part == 3:
+		case (b.input == "Date" || b.input == "DateTime") && part == 100:
 			n.open(b)
+		case b.input == "File":
+			n.chooseFile(b)
 		}
 		return
 	}
@@ -819,44 +875,16 @@ func (n *uiNative) chosenIndex(b *uiBox) int {
 	return 0
 }
 
-func (n *uiNative) rangeValue(b *uiBox) int {
-	text := b.v.Text
-	if v, ok := n.pending[b.path]; ok {
-		text = v
-	}
-	v, err := strconv.ParseFloat(strings.TrimSpace(text), 64)
-	if err != nil {
-		return 50
-	}
-	return int(uiClamp(math.Round(v), 0, 100))
-}
-
-func (n *uiNative) setRange(b *uiBox, v int) bool {
-	v = max(0, min(100, v))
-	if v == n.rangeValue(b) {
-		return false
-	}
-	n.pending[b.path] = strconv.Itoa(v)
-	n.post(b.v.Attrs, "input", strconv.Itoa(v), 0)
-	return true
-}
-
-func (n *uiNative) slide(b *uiBox, x float64) bool {
-	from := b.x + b.inset + b.padX + 8
-	to := b.x + b.w - b.inset - b.padX - 8
-	if to <= from {
-		return false
-	}
-	n.setRange(b, int(math.Round((x-from)/(to-from)*100)))
-	return true
-}
-
 func (n *uiNative) open(b *uiBox) {
+	if b.kind == "input" && b.input == "Color" {
+		n.openColour(b)
+		return
+	}
 	p := &uiPopup{path: b.path, kind: "select", rowH: b.lineH}
 	if b.kind == "input" {
 		p.kind = "calendar"
 		p.day = time.Now()
-		if t, err := time.Parse("2006-01-02", n.dates[b.path].value()); err == nil {
+		if t, err := time.Parse("2006-01-02", n.dates[b.path].dayValue()); err == nil {
 			p.day = t
 		}
 		p.month = time.Date(p.day.Year(), p.day.Month(), 1, 0, 0, 0, 0, time.Local)
@@ -883,7 +911,9 @@ func (n *uiNative) placePopup() {
 	if b == nil {
 		return
 	}
-	if p.kind == "calendar" {
+	if p.kind == "colour" {
+		p.w, p.h = uiPickWide+2*uiPickPad, uiPickHueAt+uiPickHue+uiPickPad
+	} else if p.kind == "calendar" {
 		p.w, p.h = 240, 240
 		first := time.Date(p.month.Year(), p.month.Month(), 1, 0, 0, 0, 0, time.Local)
 		start := first.AddDate(0, 0, -int(first.Weekday()))
@@ -912,6 +942,9 @@ func (n *uiNative) popupPart(x, y float64) int {
 	p := n.popup
 	if p.kind == "menu" {
 		return n.menuPart(y)
+	}
+	if p.kind == "colour" {
+		return -1
 	}
 	x, y = x-p.x, y-p.y
 	if p.kind == "select" {
@@ -950,6 +983,10 @@ func (n *uiNative) popupClick(part int) {
 		n.popup = nil
 		return
 	}
+	if p.kind == "colour" {
+		p.area = 0
+		return
+	}
 	if p.kind == "select" {
 		if part >= 0 {
 			n.choose(b, part)
@@ -976,7 +1013,7 @@ func (n *uiNative) turnMonth(by int) {
 
 func (n *uiNative) pickDay(b *uiBox, day time.Time) {
 	if d := n.dates[b.path]; d != nil {
-		d.parts = [3]int{day.Year(), int(day.Month()), day.Day()}
+		d.parts[0], d.parts[1], d.parts[2] = day.Year(), int(day.Month()), day.Day()
 		d.typed = ""
 		n.dateChanged(b, d)
 	}
@@ -997,9 +1034,12 @@ func (n *uiNative) popupKey(k uiKey) bool {
 		n.popup = nil
 		return false
 	}
-	if k == uiKeyEscape || k == uiKeyTab {
+	if k == uiKeyEscape || k == uiKeyTab || p.kind == "colour" && k == uiKeyEnter {
 		n.popup = nil
-		return k == uiKeyEscape
+		return k != uiKeyTab
+	}
+	if p.kind == "colour" {
+		return false
 	}
 	if p.kind == "calendar" {
 		step := map[uiKey]int{uiKeyLeft: -1, uiKeyRight: 1, uiKeyUp: -7, uiKeyDown: 7}
@@ -1521,6 +1561,9 @@ func (n *uiNative) wheel(x, y float64, lines float64, sideways bool) bool {
 	if n.tip != "" {
 		n.quiet, n.tip = n.tip, ""
 	}
+	if n.wheeled(x, y, lines, sideways) {
+		return false
+	}
 	chain := n.under(x, y)
 	step := lines * 100
 	for i := len(chain) - 1; i >= 0; i-- {
@@ -1678,6 +1721,7 @@ func uiCombo(key string, ctrl, shift, alt bool) string {
 func (n *uiNative) key(k uiKey, shift, word bool) bool {
 	n.touched()
 	n.layout()
+	defer n.focusMoved()
 	if n.popup != nil && n.popupKey(k) {
 		return true
 	}
@@ -1705,8 +1749,8 @@ func (n *uiNative) key(k uiKey, shift, word bool) bool {
 			n.blink = true
 			return true
 		}
-		if ok && b.kind == "input" && b.input == "Date" {
-			if d := n.dates[b.path]; d != nil && (shift && d.at > 0 || !shift && d.at < 2) {
+		if ok && b.kind == "input" && uiStamp(b.input) {
+			if d := n.dates[b.path]; d != nil && (shift && d.at > 0 || !shift && d.at < len(n.stampOrder(b))-1) {
 				if shift {
 					d.at--
 				} else {
@@ -1736,8 +1780,16 @@ func (n *uiNative) key(k uiKey, shift, word bool) bool {
 		switch b.input {
 		case "Range":
 			return n.rangeKey(b, k)
-		case "Date":
+		case "Date", "Time", "DateTime":
 			return n.dateKey(b, k)
+		case "Color":
+			return n.colourKey(b, k)
+		case "File":
+			if k == uiKeyEnter || k == uiKeySpace {
+				n.activate(b, 0)
+				return true
+			}
+			return false
 		case "Number":
 			if k == uiKeyUp || k == uiKeyDown {
 				n.stepNumber(b, map[uiKey]int{uiKeyUp: 1, uiKeyDown: -1}[k])
@@ -1750,6 +1802,9 @@ func (n *uiNative) key(k uiKey, shift, word bool) bool {
 			}
 		}
 		return n.fieldKey(b, k, shift, word)
+	}
+	if b.item != nil && n.itemKey(b, k) {
+		return true
 	}
 	if k == uiKeyEnter || k == uiKeySpace {
 		n.activate(b, 0)
@@ -1920,41 +1975,19 @@ func (n *uiNative) selectKey(b *uiBox, k uiKey) bool {
 	return true
 }
 
-func (n *uiNative) rangeKey(b *uiBox, k uiKey) bool {
-	v := n.rangeValue(b)
-	switch k {
-	case uiKeyLeft, uiKeyDown:
-		v--
-	case uiKeyRight, uiKeyUp:
-		v++
-	case uiKeyPageUp:
-		v += 10
-	case uiKeyPageDown:
-		v -= 10
-	case uiKeyHome:
-		v = 0
-	case uiKeyEnd:
-		v = 100
-	default:
-		return false
-	}
-	n.setRange(b, v)
-	return true
-}
-
 func (n *uiNative) dateKey(b *uiBox, k uiKey) bool {
 	d := n.dates[b.path]
 	if d == nil {
 		return false
 	}
-	order, _ := n.dateOrder()
+	order := n.stampOrder(b)
 	slot := uiDateSlot(order[d.at])
 	switch k {
 	case uiKeyLeft:
 		d.at, d.typed = max(0, d.at-1), ""
 		return true
 	case uiKeyRight:
-		d.at, d.typed = min(2, d.at+1), ""
+		d.at, d.typed = min(len(order)-1, d.at+1), ""
 		return true
 	case uiKeyUp, uiKeyDown:
 		by := map[uiKey]int{uiKeyUp: 1, uiKeyDown: -1}[k]
@@ -1968,6 +2001,10 @@ func (n *uiNative) dateKey(b *uiBox, k uiKey) bool {
 			}
 		case 1:
 			v = uiWrap(v, by, 12)
+		case 3:
+			v = uiWrap(v, by, 24)
+		case 4:
+			v = uiWrap(v, by, 60)
 		default:
 			most := 31
 			if d.parts[0] != 0 && d.parts[1] != 0 {
@@ -1982,7 +2019,9 @@ func (n *uiNative) dateKey(b *uiBox, k uiKey) bool {
 		n.post(b.v.Attrs, "submit", d.value(), 0)
 		return true
 	case uiKeySpace:
-		n.open(b)
+		if b.input != "Time" {
+			n.open(b)
+		}
 		return true
 	default:
 		return false
@@ -2009,7 +2048,7 @@ func uiWrap(v, by, most int) int {
 }
 
 func (n *uiNative) dateDigit(b *uiBox, d *uiDate, r rune) {
-	order, _ := n.dateOrder()
+	order := n.stampOrder(b)
 	slot := uiDateSlot(order[d.at])
 	if d.typingSlot != slot {
 		d.typed = ""
@@ -2032,10 +2071,16 @@ func (n *uiNative) dateDigit(b *uiBox, d *uiDate, r rune) {
 		if v > 0 {
 			d.parts[2] = min(v, 31)
 		}
+	case 3:
+		done = len(d.typed) >= 2 || v > 2
+		d.parts[3] = min(v, 23) + 1
+	case 4:
+		done = len(d.typed) >= 2 || v > 5
+		d.parts[4] = min(v, 59) + 1
 	}
 	if done {
 		d.typed = ""
-		if d.at < 2 {
+		if d.at < len(order)-1 {
 			d.at++
 		}
 	}
@@ -2082,20 +2127,20 @@ func (n *uiNative) typed(r rune) bool {
 			return true
 		}
 		return false
-	case b.kind == "input" && b.input == "Date":
+	case b.kind == "input" && uiStamp(b.input):
 		d := n.dates[b.path]
 		switch {
 		case d == nil:
 			return false
 		case r >= '0' && r <= '9':
 			n.dateDigit(b, d, r)
-		case strings.ContainsRune("/-.", r):
-			d.at, d.typed = min(2, d.at+1), ""
+		case strings.ContainsRune("/-.: ", r):
+			d.at, d.typed = min(len(n.stampOrder(b))-1, d.at+1), ""
 		default:
 			return false
 		}
 		return true
-	case b.kind == "input" && b.input == "Range":
+	case b.kind == "input" && (b.input == "Range" || b.input == "Color"):
 		return false
 	case b.editable():
 		if r < 0x20 || r == 0x7f || b.input == "Number" && !uiNumberRune(r) {
@@ -2177,19 +2222,6 @@ func uiValidNumber(s string) bool {
 		}
 	}
 	return i == len(s)
-}
-
-func (n *uiNative) stepNumber(b *uiBox, by int) {
-	f := n.fields[b.path]
-	if f == nil {
-		return
-	}
-	v, err := strconv.ParseFloat(strings.TrimSpace(string(f.text)), 64)
-	if err != nil {
-		v = 0
-	}
-	text := strconv.FormatFloat(v+float64(by), 'f', -1, 64)
-	n.edit(b, f, 0, len(f.text), text)
 }
 
 func (n *uiNative) clearField(b *uiBox) {
@@ -2307,7 +2339,7 @@ func (n *uiNative) typing() bool {
 
 func (n *uiNative) frameDue() time.Duration {
 	due := time.Duration(0)
-	if len(n.spins) > 0 {
+	if len(n.spins) > 0 || n.easingLive {
 		due = 16 * time.Millisecond
 	}
 	if n.animDue > 0 && (due == 0 || n.animDue < due) {

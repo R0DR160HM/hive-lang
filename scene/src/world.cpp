@@ -55,15 +55,21 @@ namespace hive {
 
 namespace {
 
-enum Kind { BOX, SPHERE, CYLINDER, CONE, GROUND, LABEL, LINE, SOUND, SPRITE, ROOF, FIGURE, TERRAIN, KINDS };
+enum Kind { BOX, SPHERE, CYLINDER, CONE, GROUND, LABEL, LINE, SOUND, SPRITE, ROOF, FIGURE, TERRAIN, TORUS, CAPSULE,
+    DISC, MESH, SIGN, LAMP, SPOT, KINDS };
 
 const int HAS_AT = 1, HAS_TURN = 2, HAS_SIZE = 4, HAS_SURFACE = 8, HAS_WORDS = 16, HAS_VOICE = 32, HAS_TRACK = 64,
-    HAS_PAINTS = 128, HAS_SCALE = 32;
+    HAS_PAINTS = 128, HAS_SCALE = 32, HAS_MORE = 64;
+const int MORE_MATRIX = 1, MORE_LOOK = 2, MORE_GLOW = 4, MORE_FLAGS = 8, MORE_TEXTURE = 16, MORE_PLAY = 32;
+const int FLAG_UNLIT = 1, FLAG_WIRE = 2, FLAG_UNSHADED = 4;
 const int EYE_LENS = 1, EYE_FOG = 2, EYE_SKY = 4, EYE_GRAB = 8, EYE_FLAT = 16, EYE_GRAIN = 32, EYE_BITS = 64,
     EYE_SUN = 128;
+const int SEEN_ROLL = 1, SEEN_ORTHO = 2, SEEN_DEPTH = 4, SEEN_AMBIENT = 8, SEEN_SUNLIGHT = 16, SEEN_PANORAMA = 32;
 
+// Twenty numbers a thing: three rows of its matrix, its colour, and how it shines.
+const int ROW = 20;
 const int PER_ROW = 256;
-const int ROW_TEXELS = PER_ROW * 4;
+const int ROW_TEXELS = PER_ROW * 5;
 const int MOST_SEATS = 127 * PER_ROW;
 const int POOL_ROWS = 64;
 const int SHADOW_MAP = 2048;
@@ -178,7 +184,32 @@ struct Form {
     VertexBuffer* points = nullptr;
     IndexBuffer* corners = nullptr;
     uint32_t count = 0;
+    IndexBuffer* edges = nullptr;
+    uint32_t edgeCount = 0;
 };
+
+// Each edge of a set of triangles once, as pairs of corners.
+std::vector<uint32_t> edgesOf(const std::vector<uint32_t>& index) {
+    std::vector<uint64_t> seen;
+    seen.reserve(index.size());
+    for (size_t t = 0; t + 2 < index.size(); t += 3) {
+        for (int k = 0; k < 3; k++) {
+            uint32_t a = index[t + size_t(k)], b = index[t + size_t((k + 1) % 3)];
+            if (a == b) { continue; }
+            if (a > b) { std::swap(a, b); }
+            seen.push_back(uint64_t(a) << 32 | b);
+        }
+    }
+    std::sort(seen.begin(), seen.end());
+    seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
+    std::vector<uint32_t> out;
+    out.reserve(seen.size() * 2);
+    for (uint64_t e : seen) {
+        out.push_back(uint32_t(e >> 32));
+        out.push_back(uint32_t(e));
+    }
+    return out;
+}
 
 struct Coat {
     std::string finish;
@@ -198,6 +229,13 @@ struct Batch {
     int low = 1 << 30, high = -1;
     Entity entity;
     bool cast = true, shown = false;
+};
+
+// What a solid is drawn with besides its form: its finish, a picture of its own, and how it is drawn.
+struct Dress {
+    std::string finish, pic, bump;
+    float tile[2] = {1, 1};
+    bool wire = false, unshaded = false, mirror = false;
 };
 
 struct Crowd {
@@ -229,6 +267,7 @@ struct Land {
     int wide = 0, rows = 0;
     float cell = 0, reach = 1;
     std::string asked, laid;
+    bool mesh = false, wire = false;
 };
 
 struct Thing {
@@ -253,6 +292,11 @@ struct Thing {
     Land* land = nullptr;
     float ends[6] = {0, 0, 0, 0, 0, 0};
     Colour stroke;
+    bool placed = false, loop = false;
+    float m[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+    std::string clip;
+    float clipAt = 0;
+    float spread = 1;
 };
 
 struct Record {
@@ -262,6 +306,17 @@ struct Record {
     std::vector<float> d;
     std::vector<std::string> t;
     bool turned = false;
+    // Where a shape in a group stands, as the three rows of a matrix; its size is still the kind's own.
+    bool placed = false;
+    float m[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+    // How rough, how metal (less than nought: as its finish has it), how much it glows, and whether it is lit.
+    float shine[4] = {-1, -1, 0, 0};
+    int flags = 0;
+    std::string pic, bump;
+    float tile[2] = {1, 1};
+    std::string clip;
+    float clipAt = 0;
+    bool loop = false;
 };
 
 struct Sight {
@@ -281,14 +336,25 @@ std::string finishOf(const Record& s) {
     if (!s.s.empty()) { return s.s; }
     if (s.kind == GROUND || s.kind == TERRAIN) { return "Turf"; }
     if (s.kind == CYLINDER || s.kind == CONE) { return "Staves"; }
-    if (s.kind == SPHERE) { return "Speckle"; }
+    if (s.kind == SPHERE || s.kind == TORUS || s.kind == CAPSULE || s.kind == DISC) { return "Speckle"; }
+    if (s.kind == MESH) { return "Gloss"; }
     return "Planks";
 }
 
 const char* const FORMS[KINDS] = {"box", "sphere", "cylinder", "cone", "ground", "label", "line", "sound", "sprite",
-    "roof", "figure", "terrain"};
+    "roof", "figure", "terrain", "torus", "capsule", "disc", "mesh", "sign", "lamp", "spot"};
+
+// A ratio in sixty-fourths, for the forms whose proportions a stretch cannot give.
+std::string sixtyFourths(const char* form, float q) {
+    if (!(q >= 0)) { q = 0; }
+    return std::string(form) + "|" + std::to_string(int(std::lround(std::min(q, 1.0f) * 64)));
+}
 
 std::string formOf(const Record& s) {
+    auto d = [&](size_t i) { return i < s.d.size() ? s.d[i] : 1.0f; };
+    if (s.kind == TORUS) { return sixtyFourths("torus", d(1) / std::max(d(0) + d(1), 1e-6f)); }
+    if (s.kind == CAPSULE) { return sixtyFourths("capsule", 2 * d(0) / std::max(std::max(d(1), 2 * d(0)), 1e-6f)); }
+    if (s.kind == DISC) { return sixtyFourths("disc", d(0) / std::max(d(1), 1e-6f)); }
     if (s.kind != CONE) { return FORMS[s.kind]; }
     float top = s.d.size() > 0 ? s.d[0] : 1, bottom = s.d.size() > 1 ? s.d[1] : 1;
     float m = std::max(top, bottom);
@@ -296,9 +362,51 @@ std::string formOf(const Record& s) {
     return "cone|" + std::to_string(int(std::lround(top / m * 32))) + "|" + std::to_string(int(std::lround(bottom / m * 32)));
 }
 
+bool mirrored(const Record& s) {
+    if (s.placed) {
+        const float* m = s.m;
+        return m[0] * (m[5] * m[10] - m[6] * m[9]) - m[1] * (m[4] * m[10] - m[6] * m[8]) +
+            m[2] * (m[4] * m[9] - m[5] * m[8]) < 0;
+    }
+    return s.z[0] * s.z[1] * s.z[2] < 0;
+}
+
+Dress dressOf(const Record& s) {
+    Dress d;
+    d.finish = finishOf(s);
+    d.pic = s.pic;
+    d.bump = s.bump;
+    d.tile[0] = s.tile[0];
+    d.tile[1] = s.tile[1];
+    d.wire = (s.flags & FLAG_WIRE) != 0;
+    d.unshaded = (s.flags & FLAG_UNSHADED) != 0;
+    d.mirror = mirrored(s);
+    return d;
+}
+
+std::string extrasOf(const Dress& d) {
+    std::string k;
+    if (d.wire) { k += "|wire"; }
+    if (d.unshaded) { k += "|unshaded"; }
+    if (d.mirror) { k += "|mirror"; }
+    if (!d.pic.empty() || !d.bump.empty()) {
+        k += "|pic:" + d.pic + "|" + d.bump + "|" + std::to_string(d.tile[0]) + "|" + std::to_string(d.tile[1]);
+    }
+    return k;
+}
+
 void stretch(const Record& s, float v[3]) {
     auto d = [&](size_t i) { return i < s.d.size() ? s.d[i] : 1.0f; };
-    if (s.kind == SPHERE) {
+    if (s.kind == TORUS) {
+        v[0] = v[1] = v[2] = d(0) + d(1);
+    } else if (s.kind == CAPSULE) {
+        v[0] = v[1] = v[2] = std::max(d(1), 2 * d(0));
+    } else if (s.kind == DISC) {
+        v[0] = v[2] = d(1);
+        v[1] = 1;
+    } else if (s.kind == MESH || s.kind == SIGN) {
+        v[0] = v[1] = v[2] = 1;
+    } else if (s.kind == SPHERE) {
         v[0] = v[1] = v[2] = d(0);
     } else if (s.kind == CYLINDER) {
         v[0] = v[2] = d(0);
@@ -315,7 +423,53 @@ void stretch(const Record& s, float v[3]) {
         v[1] = d(1);
         v[2] = d(2);
     }
-    for (int i = 0; i < 3; i++) { v[i] = std::max(v[i], 0.0001f); }
+    // Scaled on top, a negative way turning it inside out; a group's matrix has its scale in it already.
+    for (int i = 0; i < 3; i++) {
+        float k = s.placed ? 1.0f : s.z[i];
+        v[i] = std::max(std::max(v[i], 0.0001f) * std::fabs(k), 0.0001f) * (k < 0 ? -1.0f : 1.0f);
+    }
+}
+
+// Three rows of where a thing stands and how big it is, then its colour, then how it shines.
+void rowOf(float* row, const Record& s, const float size[3], bool atOrigin) {
+    if (s.placed) {
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 3; c++) { row[r * 4 + c] = s.m[r * 4 + c] * size[c]; }
+            row[r * 4 + 3] = atOrigin ? 0.0f : s.m[r * 4 + 3];
+        }
+    } else {
+        const float origin[3] = {0, 0, 0};
+        placed(row, atOrigin ? origin : s.p, s.turned ? turned(s.r[0], s.r[1], s.r[2]) : turned(0, 0, 0), size);
+    }
+    Colour c = colourOf(s.c);
+    row[12] = c.r;
+    row[13] = c.g;
+    row[14] = c.b;
+    row[15] = c.a;
+    float unlit = (s.flags & FLAG_UNLIT) ? 1.0f : 0.0f;
+    row[16] = s.shine[0];
+    row[17] = s.shine[1];
+    row[18] = s.shine[2];
+    row[19] = unlit;
+}
+
+// How a shape stands, as Filament takes a transform.
+mat4f stoodAs(const Record& s) {
+    if (s.placed) {
+        mat4f m;
+        m[0] = float4{s.m[0], s.m[4], s.m[8], 0};
+        m[1] = float4{s.m[1], s.m[5], s.m[9], 0};
+        m[2] = float4{s.m[2], s.m[6], s.m[10], 0};
+        m[3] = float4{s.m[3], s.m[7], s.m[11], 1};
+        return m;
+    }
+    Turn t = s.turned ? turned(s.r[0], s.r[1], s.r[2]) : turned(0, 0, 0);
+    mat4f m;
+    m[0] = float4{t.m[0] * s.z[0], t.m[1] * s.z[0], t.m[2] * s.z[0], 0};
+    m[1] = float4{t.m[3] * s.z[1], t.m[4] * s.z[1], t.m[5] * s.z[1], 0};
+    m[2] = float4{t.m[6] * s.z[2], t.m[7] * s.z[2], t.m[8] * s.z[2], 0};
+    m[3] = float4{s.p[0], s.p[1], s.p[2], 1};
+    return m;
 }
 
 float hazeAmount(const Colour& mid) {
@@ -373,6 +527,16 @@ struct World::Inner {
     std::unordered_map<std::string, Shared*> pics;
     std::unordered_map<std::string, std::vector<uint8_t>> grounds;
     std::vector<MaterialInstance*> veiled;
+    Texture* white = nullptr;
+    // A picture a program laid on a shape, kept by path, and every look still waiting for one.
+    std::unordered_map<std::string, Texture*> laidOn;
+    std::unordered_map<std::string, std::vector<std::pair<MaterialInstance*, std::string>>> laying;
+    std::unordered_map<std::string, bool> layAsked;
+    std::string panoramaAsked, panoramaMade;
+    Picture panorama;
+    bool panoramaArrived = false;
+    std::string sunToneAt;
+    float sunBrightAt = 1;
 
     Texture* pool = nullptr;
     std::vector<float> poolRows;
@@ -447,8 +611,9 @@ struct World::Inner {
     }
 
     // A page's picture counts its rows down and a texture counts them up.
-    Texture* shown(int wide, int tall, const uint8_t* rgba) {
-        Texture* t = texture(wide, tall, Texture::InternalFormat::SRGB8_A8, true, "shown");
+    Texture* shown(int wide, int tall, const uint8_t* rgba, bool linear = false) {
+        Texture* t = texture(wide, tall, linear ? Texture::InternalFormat::RGBA8 : Texture::InternalFormat::SRGB8_A8,
+            true, "shown");
         std::vector<uint8_t> up(size_t(wide) * tall * 4);
         for (int y = 0; y < tall; y++) {
             memcpy(&up[size_t(tall - 1 - y) * wide * 4], rgba + size_t(y) * wide * 4, size_t(wide) * 4);
@@ -501,7 +666,20 @@ struct World::Inner {
             .build(engine);
         f.corners->setBuffer(engine, kept(m.index.data(), m.index.size() * 4));
         f.count = uint32_t(m.index.size());
+        edged(f, m.index);
         return f;
+    }
+
+    void edged(Form& f, const std::vector<uint32_t>& index) {
+        std::vector<uint32_t> lines = edgesOf(index);
+        if (f.edges) { engine.destroy(f.edges); }
+        f.edges = nullptr;
+        f.edgeCount = 0;
+        if (lines.empty()) { return; }
+        f.edges = IndexBuffer::Builder().indexCount(uint32_t(lines.size())).bufferType(IndexBuffer::IndexType::UINT)
+            .build(engine);
+        f.edges->setBuffer(engine, kept(lines.data(), lines.size() * 4));
+        f.edgeCount = uint32_t(lines.size());
     }
 
     VertexBuffer* solidPoints(uint32_t count) {
@@ -540,6 +718,9 @@ struct World::Inner {
         flat->setImage(engine, 0, pixels(level, 4, Texture::Format::RGBA, Texture::Type::UBYTE));
         blank = texture(1, 1, Texture::InternalFormat::SRGB8_A8, false);
         blank->setImage(engine, 0, pixels(nothing, 4, Texture::Format::RGBA, Texture::Type::UBYTE));
+        const uint8_t whole[4] = {255, 255, 255, 255};
+        white = texture(1, 1, Texture::InternalFormat::SRGB8_A8, false);
+        white->setImage(engine, 0, pixels(whole, 4, Texture::Format::RGBA, Texture::Type::UBYTE));
         const int order[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
         uint8_t woven[16];
         for (int i = 0; i < 16; i++) { woven[i] = uint8_t(std::lround(order[i] * 255.0 / 16.0)); }
@@ -787,11 +968,119 @@ struct World::Inner {
         glowMade = true;
     }
 
-    void sunned(const float at[2], float far) {
+    // A picture all round, left to right once and top to bottom, as the sky and what lights everything.
+    void surround(const Picture& p) {
+        const float TAU = 2 * PI_F;
+        auto read = [&](int x, int y) {
+            const uint8_t* c = &p.rgba[(size_t(y) * size_t(p.wide) + size_t(x)) * 4];
+            return float3{float(c[0]) / 255, float(c[1]) / 255, float(c[2]) / 255};
+        };
+        auto at = [&](const float3& d, float& u, float& v) {
+            u = 0.5f + std::atan2(d.x, -d.z) / TAU;
+            v = std::acos(std::max(-1.0f, std::min(1.0f, d.y))) / PI_F;
+        };
+        auto shown = [&](const float3& d) {
+            float u, v;
+            at(d, u, v);
+            float fx = u * float(p.wide) - 0.5f, fy = v * float(p.tall) - 0.5f;
+            int x0 = int(std::floor(fx)), y0 = int(std::floor(fy));
+            float tx = fx - float(x0), ty = fy - float(y0);
+            auto wrap = [&](int x) { return ((x % p.wide) + p.wide) % p.wide; };
+            auto clampY = [&](int y) { return std::max(0, std::min(p.tall - 1, y)); };
+            float3 top = lerp3(read(wrap(x0), clampY(y0)), read(wrap(x0 + 1), clampY(y0)), tx);
+            float3 low = lerp3(read(wrap(x0), clampY(y0 + 1)), read(wrap(x0 + 1), clampY(y0 + 1)), tx);
+            return lerp3(top, low, ty);
+        };
+        fill(skyCube, 0, SKY_FACE, [&](float3 d) { return unshouldered(lightOf(shown(d))); });
+
+        const int sw = 128, sh = 64;
+        std::vector<float3> shrunk(size_t(sw) * sh, float3(0.0f));
+        for (int y = 0; y < sh; y++) {
+            for (int x = 0; x < sw; x++) {
+                int x0 = x * p.wide / sw, x1 = std::max(x0 + 1, (x + 1) * p.wide / sw);
+                int y0 = y * p.tall / sh, y1 = std::max(y0 + 1, (y + 1) * p.tall / sh);
+                float3 sum(0.0f);
+                for (int yy = y0; yy < y1 && yy < p.tall; yy++) {
+                    for (int xx = x0; xx < x1 && xx < p.wide; xx++) { sum += lightOf(read(xx, yy)); }
+                }
+                shrunk[size_t(y) * sw + size_t(x)] = sum * (1.0f / float(std::max(1, (x1 - x0) * (y1 - y0))));
+            }
+        }
+        auto from = [&](const float3& d) {
+            float u, v;
+            at(d, u, v);
+            float fx = u * sw - 0.5f, fy = v * sh - 0.5f;
+            int x0 = int(std::floor(fx)), y0 = int(std::floor(fy));
+            float tx = fx - float(x0), ty = fy - float(y0);
+            auto cell = [&](int x, int y) {
+                return shrunk[size_t(std::max(0, std::min(sh - 1, y))) * sw + size_t(((x % sw) + sw) % sw)];
+            };
+            return lerp3(lerp3(cell(x0, y0), cell(x0 + 1, y0), tx), lerp3(cell(x0, y0 + 1), cell(x0 + 1, y0 + 1), tx), ty);
+        };
+        for (int lod = 0; lod < GLOW_LEVELS; lod++) {
+            float mix = float(lod) / float(GLOW_LEVELS - 1);
+            float rough = 1 - std::sqrt(1 - mix);
+            float alpha = std::max(rough * rough, 0.001f);
+            const int taps = 64;
+            fill(glowCube, lod, GLOW_FACE >> lod, [&](float3 n) {
+                if (lod == 0) { return from(n); }
+                float3 side = normalize(cross(std::fabs(n.y) < 0.99f ? float3{0, 1, 0} : float3{1, 0, 0}, n));
+                float3 up = cross(n, side);
+                float3 sum(0.0f);
+                float weight = 0;
+                for (int i = 0; i < taps; i++) {
+                    float u = (float(i) + 0.5f) / taps;
+                    uint32_t bits = uint32_t(i);
+                    bits = (bits << 16) | (bits >> 16);
+                    bits = ((bits & 0x55555555u) << 1) | ((bits & 0xAAAAAAAAu) >> 1);
+                    bits = ((bits & 0x33333333u) << 2) | ((bits & 0xCCCCCCCCu) >> 2);
+                    bits = ((bits & 0x0F0F0F0Fu) << 4) | ((bits & 0xF0F0F0F0u) >> 4);
+                    bits = ((bits & 0x00FF00FFu) << 8) | ((bits & 0xFF00FF00u) >> 8);
+                    float v = float(bits) * 2.3283064365386963e-10f;
+                    float phi = TAU * v;
+                    float cosT = std::sqrt((1 - u) / (1 + (alpha * alpha - 1) * u));
+                    float sinT = std::sqrt(std::max(0.0f, 1 - cosT * cosT));
+                    float3 half = side * (sinT * std::cos(phi)) + up * (sinT * std::sin(phi)) + n * cosT;
+                    float3 l = half * (2 * dot(n, half)) - n;
+                    float nl = dot(n, l);
+                    if (nl <= 0) { continue; }
+                    sum += from(l) * nl;
+                    weight += nl;
+                }
+                return weight > 0 ? sum * (1 / weight) : from(n);
+            });
+        }
+        float3 sh9[9];
+        for (auto& s : sh9) { s = float3(0.0f); }
+        for (int y = 0; y < sh; y++) {
+            float theta = (float(y) + 0.5f) / sh * PI_F;
+            float ring = std::sin(theta), dy = std::cos(theta);
+            for (int x = 0; x < sw; x++) {
+                float a = ((float(x) + 0.5f) / sw - 0.5f) * TAU;
+                float dx = std::sin(a) * ring, dz = -std::cos(a) * ring;
+                float area = ring * (PI_F / sh) * (TAU / sw);
+                const float basis[9] = {0.282095f, 0.488603f * dy, 0.488603f * dz, 0.488603f * dx, 1.092548f * dx * dy,
+                    1.092548f * dy * dz, 0.315392f * (3 * dz * dz - 1), 1.092548f * dx * dz, 0.546274f * (dx * dx - dy * dy)};
+                const float3& c = shrunk[size_t(y) * sw + size_t(x)];
+                for (int k = 0; k < 9; k++) { sh9[k] += c * (basis[k] * area); }
+            }
+        }
+        IndirectLight* next = IndirectLight::Builder().reflections(glowCube).radiance(3, sh9).intensity(1.0f)
+            .build(engine);
+        stage->setIndirectLight(next);
+        if (glow) { engine.destroy(glow); }
+        glow = next;
+        glowMade = true;
+        glowAt = std::chrono::steady_clock::now();
+    }
+
+    void sunned(const float at[2], float far, const std::string& tone, float bright) {
         sunAt[0] = at[0];
         sunAt[1] = at[1];
         shadeFar = far;
         sunSet = true;
+        sunToneAt = tone;
+        sunBrightAt = bright;
         float3 sunward = normalize(float3{0.36f, 0.85f, 0.48f});
         float3 colour{1.0f, 0.8714f, 0.7157f};
         float strength = 2.6f;
@@ -802,8 +1091,15 @@ struct World::Inner {
             colour = lerp3(colour, float3{1.0f, 0.4564f, 0.1559f}, low * 0.8f);
             strength = 2.6f * (1 - 0.35f * low);
         }
+        if (!tone.empty()) {
+            Colour c = colourOf(tone);
+            colour = float3{c.r, c.g, c.b};
+            strength = 2.6f;
+        }
+        strength *= std::max(0.0f, bright);
         auto& lights = engine.getLightManager();
         auto light = lights.getInstance(sun);
+        lights.setShadowCaster(light, strength > 0);
         lights.setDirection(light, -sunward);
         lights.setColor(light, LinearColor{colour.r, colour.g, colour.b});
         lights.setIntensity(light, strength);
@@ -866,43 +1162,75 @@ struct World::Inner {
         }
     }
 
-    MaterialInstance* dressed(Material* from, const std::string& finish, Texture* things, bool land) {
+    MaterialInstance* dressed(Material* from, const Dress& dress, Texture* things, bool land, bool both = false) {
+        const std::string& finish = dress.finish;
         Coat& skin = skinOf(finish);
         hive::Look look = lookOf(finish);
+        bool pictured = !dress.pic.empty(), bumped = !dress.bump.empty();
         MaterialInstance* m = from->createInstance();
         m->setParameter("things", things, exact());
-        m->setParameter("grain", skin.grain, tiled());
-        m->setParameter("relief", skin.relief ? skin.relief : flat, tiled());
-        m->setParameter("look", float4{look.rough, look.metal, look.relief, perTile(finish)});
-        bool own = !land && (finish == "Panes" || finish == "Kerb" || finish == "Crowd");
-        m->setParameter("flags", float4{own ? 1.0f : 0.0f, (!land && finish == "Panes") ? 1.0f : 0.0f,
-            broad(finish) ? 1.0f : 0.0f, skin.relief ? 1.0f : 0.0f});
+        m->setParameter("grain", pictured ? white : skin.grain, tiled());
+        m->setParameter("relief", skin.relief && !pictured ? skin.relief : flat, tiled());
+        if (pictured) { layOn(m, dress.pic, "grain"); }
+        if (bumped) { layOn(m, dress.bump, "relief"); }
+        m->setParameter("look", float4{look.rough, look.metal, bumped ? 1.0f : look.relief, perTile(finish)});
+        bool own = !land && !pictured && (finish == "Panes" || finish == "Kerb" || finish == "Crowd");
+        m->setParameter("flags", float4{own ? 1.0f : 0.0f, (!land && !pictured && finish == "Panes") ? 1.0f : 0.0f,
+            (broad(finish) && !pictured) ? 1.0f : 0.0f, (bumped || (skin.relief && !pictured)) ? 1.0f : 0.0f});
+        m->setParameter("picture", float4{pictured ? 1.0f : 0.0f, dress.tile[0], dress.tile[1], 0.0f});
         m->setParameter("base", 0.0f);
+        bool holes = finish == "Mesh";
         if (from != opaque) {
-            bool holes = finish == "Mesh";
             m->setDoubleSided(holes);
-            m->setCullingMode(holes ? MaterialInstance::CullingMode::NONE : MaterialInstance::CullingMode::BACK);
             if (from == pierced) { m->setMaskThreshold(0.5f); }
         }
+        if (both) { m->setDoubleSided(true); }
+        m->setCullingMode(holes || both ? MaterialInstance::CullingMode::NONE
+                : dress.mirror ? MaterialInstance::CullingMode::FRONT : MaterialInstance::CullingMode::BACK);
         veil(m);
         veiled.push_back(m);
         return m;
     }
 
-    Batch* batchOf(const std::string& form, const std::string& finish) {
-        auto& all = batches[form + "|" + finish];
+    // A picture under assets/ laid on a look, now if it is here and when it arrives if it is not.
+    void layOn(MaterialInstance* m, const std::string& path, const char* slot) {
+        std::string key = path + (strcmp(slot, "relief") == 0 ? "#relief" : "");
+        auto found = laidOn.find(key);
+        if (found != laidOn.end()) {
+            m->setParameter(slot, found->second, tiled());
+            return;
+        }
+        laying[key].push_back({m, slot});
+        if (!layAsked[path]) {
+            layAsked[path] = true;
+            host.wantPicture(path);
+        }
+    }
+
+    void unlayOn(MaterialInstance* m) {
+        for (auto& each : laying) {
+            auto& list = each.second;
+            list.erase(std::remove_if(list.begin(), list.end(),
+                [m](const std::pair<MaterialInstance*, std::string>& p) { return p.first == m; }), list.end());
+        }
+    }
+
+    Batch* batchOf(const std::string& form, const Dress& dress) {
+        auto& all = batches[form + "|" + dress.finish + extrasOf(dress)];
         for (Batch* b : all) {
             if (int(b->seats.size()) < MOST_SEATS) { return b; }
         }
         Batch* b = new Batch();
         b->form = &unit(form);
-        b->cast = form != "ground";
+        b->cast = form != "ground" && !dress.unshaded;
         b->entity = EntityManager::get().create();
-        b->look = dressed(finish == "Mesh" ? pierced : opaque, finish, flat, false);
+        b->look = dressed(dress.finish == "Mesh" ? pierced : opaque, dress, flat, false);
         grow(*b, PER_ROW);
-        RenderableManager::Builder(1).geometry(0, RenderableManager::PrimitiveType::TRIANGLES, b->form->points,
-            b->form->corners, 0, b->form->count).material(0, b->look).culling(false).castShadows(b->cast)
-            .receiveShadows(true).instances(1).boundingBox({{0, 0, 0}, {1, 1, 1}}).build(engine, b->entity);
+        bool wire = dress.wire && b->form->edges;
+        RenderableManager::Builder(1).geometry(0, wire ? RenderableManager::PrimitiveType::LINES
+                : RenderableManager::PrimitiveType::TRIANGLES, b->form->points, wire ? b->form->edges : b->form->corners,
+            0, wire ? b->form->edgeCount : b->form->count).material(0, b->look).culling(false).castShadows(b->cast)
+            .receiveShadows(!dress.unshaded).instances(1).boundingBox({{0, 0, 0}, {1, 1, 1}}).build(engine, b->entity);
         all.push_back(b);
         return b;
     }
@@ -910,7 +1238,7 @@ struct World::Inner {
     void grow(Batch& b, int room) {
         room = std::min(room, MOST_SEATS + PER_ROW - 1) / PER_ROW * PER_ROW;
         Texture* next = texture(ROW_TEXELS, room / PER_ROW, Texture::InternalFormat::RGBA32F, false, "things");
-        b.rows.resize(size_t(room) * 16, 0);
+        b.rows.resize(size_t(room) * ROW, 0);
         if (b.things) { engine.destroy(b.things); }
         b.things = next;
         b.room = room;
@@ -935,7 +1263,7 @@ struct World::Inner {
         if (at < 0) { return; }
         int last = int(b.seats.size()) - 1;
         if (at != last) {
-            memcpy(&b.rows[size_t(at) * 16], &b.rows[size_t(last) * 16], 64);
+            memcpy(&b.rows[size_t(at) * ROW], &b.rows[size_t(last) * ROW], ROW * 4);
             touched(b, at);
             b.seats[size_t(at)] = b.seats[size_t(last)];
             b.seats[size_t(at)]->index = at;
@@ -966,18 +1294,12 @@ struct World::Inner {
     void place(Thing* o, const Record& s) {
         if (o->index < 0) { seat(o); }
         Batch& b = *o->batch;
-        float* row = &b.rows[size_t(o->index) * 16];
+        float* row = &b.rows[size_t(o->index) * ROW];
         float size[3];
         stretch(s, size);
-        placed(row, s.p, s.turned ? turned(s.r[0], s.r[1], s.r[2]) : turned(0, 0, 0), size);
-        if (o->tint != s.c || o->tint.empty()) {
-            Colour c = colourOf(s.c);
-            row[12] = c.r;
-            row[13] = c.g;
-            row[14] = c.b;
-            row[15] = 1;
-            o->tint = s.c;
-        }
+        rowOf(row, s, size, false);
+        row[15] = 1;
+        o->tint = s.c;
         touched(b, o->index);
     }
 
@@ -986,7 +1308,7 @@ struct World::Inner {
         if (count == 0) { return; }
         float3 low(1e30f), high(-1e30f);
         for (size_t i = 0; i < count; i++) {
-            const float* r = &rows[i * 16];
+            const float* r = &rows[i * ROW];
             float reach = std::sqrt(r[0] * r[0] + r[4] * r[4] + r[8] * r[8]) +
                 std::sqrt(r[1] * r[1] + r[5] * r[5] + r[9] * r[9]) +
                 std::sqrt(r[2] * r[2] + r[6] * r[6] + r[10] * r[10]);
@@ -1018,18 +1340,20 @@ struct World::Inner {
     float* pooled(int slot) {
         poolLow = std::min(poolLow, slot / PER_ROW);
         poolHigh = std::max(poolHigh, slot / PER_ROW);
-        return &poolRows[size_t(slot) * 16];
+        return &poolRows[size_t(slot) * ROW];
     }
 
-    void alone(Thing* o, const Form& form, Material* from, const std::string& finish, bool cast, bool land) {
+    void alone(Thing* o, const Form& form, Material* from, const Dress& dress, bool cast, bool land, bool both = false) {
         o->slot = lent();
-        o->look = dressed(from, finish, pool, land);
+        o->look = dressed(from, dress, pool, land, both);
         o->look->setParameter("base", float(std::max(0, o->slot)));
         o->entity = EntityManager::get().create();
         o->standing = true;
-        RenderableManager::Builder(1).geometry(0, RenderableManager::PrimitiveType::TRIANGLES, form.points,
-            form.corners, 0, form.count).material(0, o->look).culling(false).castShadows(cast).receiveShadows(true)
-            .instances(1).boundingBox({{0, 0, 0}, {1, 1, 1}}).build(engine, o->entity);
+        bool wire = dress.wire && form.edges;
+        RenderableManager::Builder(1).geometry(0, wire ? RenderableManager::PrimitiveType::LINES
+                : RenderableManager::PrimitiveType::TRIANGLES, form.points, wire ? form.edges : form.corners, 0,
+            wire ? form.edgeCount : form.count).material(0, o->look).culling(false).castShadows(cast && !dress.unshaded)
+            .receiveShadows(!dress.unshaded).instances(1).boundingBox({{0, 0, 0}, {1, 1, 1}}).build(engine, o->entity);
         engine.getTransformManager().create(o->entity);
     }
 
@@ -1055,10 +1379,24 @@ struct World::Inner {
         size_t n = m.place.size() / 3;
         const int wide = 23;
         std::vector<float> data(n * wide);
+        // How far its points reach as the file stands it, each carried by the first joint it hangs from.
+        std::vector<mat4f> rest(m.joints.size());
+        for (int k : m.order) {
+            const Joint& j = m.joints[size_t(k)];
+            mat4f own = composed(j.t, quatf{j.r[3], j.r[0], j.r[1], j.r[2]}, j.s);
+            rest[size_t(k)] = j.parent >= 0 ? rest[size_t(j.parent)] * own : own;
+        }
+        for (size_t k = 0; k < rest.size(); k++) {
+            mat4f inverse;
+            memcpy(&inverse, &m.inverses[k * 16], 64);
+            rest[k] = rest[k] * inverse;
+        }
         for (size_t i = 0; i < n; i++) {
             float* v = &data[i * wide];
             memcpy(v, &m.place[i * 3], 12);
-            c.reach = std::max(c.reach, 1.5f * std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]));
+            size_t bone = size_t(m.bones[i * 4]);
+            float4 stood = bone < rest.size() ? rest[bone] * float4{v[0], v[1], v[2], 1} : float4{v[0], v[1], v[2], 1};
+            c.reach = std::max(c.reach, 1.5f * length(stood.xyz));
             const float any[4] = {0, 0, 0, 1};
             quatf q = framed(&m.facing[i * 3], any);
             v[3] = q.x;
@@ -1167,15 +1505,32 @@ struct World::Inner {
         if (!c.model.ready || at < 0 || at >= c.room) { return; }
         Model& m = c.model;
         float* row = &c.boneRows[size_t(at) * c.wide * 4];
-        placed(row, o->at, turned(o->turn[0], o->turn[1], o->turn[2]), o->size);
+        if (o->placed) {
+            memcpy(row, o->m, 48);
+        } else {
+            placed(row, o->at, turned(o->turn[0], o->turn[1], o->turn[2]), o->size);
+        }
+        // A clip that runs past its end starts again, or stays at its last pose.
+        const Clip* clip = m.clipNamed(o->clip);
+        float when = o->clipAt;
+        if (clip && clip->length > 0) {
+            if (o->loop) {
+                when = std::fmod(when, clip->length);
+                if (when < 0) { when += clip->length; }
+            } else {
+                when = std::min(std::max(when, 0.0f), clip->length);
+            }
+        }
         std::vector<mat4f> stood(m.joints.size());
         for (int k : m.order) {
             const Joint& j = m.joints[size_t(k)];
-            quatf turn{j.r[3], j.r[0], j.r[1], j.r[2]};
+            float t[3] = {j.t[0], j.t[1], j.t[2]}, r[4] = {j.r[0], j.r[1], j.r[2], j.r[3]}, s[3] = {j.s[0], j.s[1], j.s[2]};
+            if (clip) { clip->pose(k, when, t, r, s); }
+            quatf turn{r[3], r[0], r[1], r[2]};
             if (size_t(k) * 3 + 2 < o->pose.size()) {
                 turn = turn * spun(o->pose[size_t(k) * 3], o->pose[size_t(k) * 3 + 1], o->pose[size_t(k) * 3 + 2]);
             }
-            mat4f local = composed(j.t, turn, j.s);
+            mat4f local = composed(t, turn, s);
             stood[size_t(k)] = j.parent >= 0 ? stood[size_t(j.parent)] * local : local;
             mat4f inverse;
             memcpy(&inverse, &m.inverses[size_t(k) * 16], 64);
@@ -1207,6 +1562,11 @@ struct World::Inner {
         }
         o->pose = s.d;
         o->paints = s.t;
+        o->placed = s.placed;
+        memcpy(o->m, s.m, sizeof(o->m));
+        o->clip = s.clip;
+        o->clipAt = s.clipAt;
+        o->loop = s.loop;
         stand(o);
     }
 
@@ -1216,10 +1576,104 @@ struct World::Inner {
         land.asked = s.x;
         auto held = grounds.find(s.x);
         if (held != grounds.end()) {
-            laid(o, held->second.data(), held->second.size());
+            arrived(o, held->second.data(), held->second.size());
             return;
         }
         host.wantTerrain(s.x);
+    }
+
+    void arrived(Thing* o, const uint8_t* data, size_t size) {
+        if (o->land->mesh) { meshed(o, data, size); }
+        else { laid(o, data, size); }
+    }
+
+    // A mesh built by the program: its points, which way each faces, two ways of laying a picture on it, a
+    // colour each and which way across runs, then its triangles.
+    void meshed(Thing* o, const uint8_t* data, size_t size) {
+        Land& land = *o->land;
+        if (size < 8) { return; }
+        Reader r(data, size);
+        uint32_t count = r.u32(), many = r.u32();
+        const size_t each = 17;
+        if (count == 0 || many < 3 || size < 8 + size_t(count) * each * 4 + size_t(many) * 4) { return; }
+        std::vector<float> in(size_t(count) * each);
+        memcpy(in.data(), data + 8, in.size() * 4);
+        std::vector<uint32_t> index(many);
+        memcpy(index.data(), data + 8 + in.size() * 4, size_t(many) * 4);
+        for (uint32_t& i : index) {
+            if (i >= count) { i = 0; }
+        }
+        const int wide = 25;
+        std::vector<float> points(size_t(count) * wide, 0.0f);
+        float reach = 0.001f;
+        for (size_t i = 0; i < count; i++) {
+            const float* f = &in[i * each];
+            float* v = &points[i * wide];
+            memcpy(v, f, 12);
+            reach = std::max(reach, std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]));
+            quatf q = framed(f + 3, f + 13);
+            v[3] = q.x;
+            v[4] = q.y;
+            v[5] = q.z;
+            v[6] = q.w;
+            v[7] = f[6];
+            v[8] = f[7];
+            v[9] = decoded(f[10]);
+            v[10] = decoded(f[11]);
+            v[11] = decoded(f[12]);
+            v[12] = 1;
+            v[13] = f[8];
+            v[14] = f[9];
+            v[16] = 4;
+            memcpy(v + 21, f + 13, 16);
+        }
+        Form old = land.form;
+        land.form = Form();
+        land.form.points = solidPoints(count);
+        land.form.points->setBufferAt(engine, 0, kept(points.data(), points.size() * 4));
+        land.form.corners = IndexBuffer::Builder().indexCount(many).bufferType(IndexBuffer::IndexType::UINT)
+            .build(engine);
+        land.form.corners->setBuffer(engine, kept(index.data(), index.size() * 4));
+        land.form.count = many;
+        edged(land.form, index);
+        bool wire = land.wire && land.form.edges;
+        auto& solids = engine.getRenderableManager();
+        auto made = solids.getInstance(o->entity);
+        solids.setGeometryAt(made, 0, wire ? RenderableManager::PrimitiveType::LINES
+                : RenderableManager::PrimitiveType::TRIANGLES, land.form.points, wire ? land.form.edges : land.form.corners,
+            0, wire ? land.form.edgeCount : land.form.count);
+        if (old.points) { engine.destroy(old.points); }
+        if (old.corners) { engine.destroy(old.corners); }
+        if (old.edges) { engine.destroy(old.edges); }
+        land.reach = reach;
+        land.laid = land.asked;
+        solids.setAxisAlignedBoundingBox(made, filament::Box{float3(0.0f), float3(reach * o->spread)});
+        show(o, o->visible);
+    }
+
+    // A lamp shines every way from where it stands; a spot shines down until it is turned.
+    void lamped(Thing* o, const Record& s) {
+        auto& lights = engine.getLightManager();
+        auto light = lights.getInstance(o->entity);
+        Colour c = colourOf(s.c);
+        float bright = s.d.size() > 0 ? s.d[0] : 1, reach = s.d.size() > 1 ? s.d[1] : 10;
+        lights.setPosition(light, float3{s.p[0], s.p[1], s.p[2]});
+        lights.setColor(light, LinearColor{c.r, c.g, c.b});
+        lights.setIntensityCandela(light, 2.6f * std::max(0.0f, bright));
+        lights.setFalloff(light, std::max(0.01f, reach));
+        if (s.kind != SPOT) { return; }
+        float3 up{0, 1, 0};
+        if (s.placed) {
+            up = float3{s.m[1], s.m[5], s.m[9]};
+        } else if (s.turned) {
+            Turn t = turned(s.r[0], s.r[1], s.r[2]);
+            up = float3{t.m[3], t.m[4], t.m[5]};
+        }
+        if (length(up) < 1e-6f) { up = float3{0, 1, 0}; }
+        lights.setDirection(light, -normalize(up));
+        float cone = s.d.size() > 2 ? s.d[2] : 0.8f;
+        float outer = std::min(std::max(cone / 2, 0.01f), PI_F / 2 - 0.01f);
+        lights.setSpotLightCone(light, outer * 0.8f, outer);
     }
 
     void laid(Thing* o, const uint8_t* data, size_t size) {
@@ -1326,6 +1780,7 @@ struct World::Inner {
             quadForm.corners, 0, 6).material(0, o->look).culling(false).castShadows(false).receiveShadows(false)
             .boundingBox({{0, 0, 0}, {1, 1, 1}}).build(engine, o->entity);
         engine.getTransformManager().create(o->entity);
+        o->look->setParameter("stance", float4{o->kind == SIGN ? 1.0f : 0.0f, 0, 0, 0});
         o->shared->users.push_back(o);
         worn(o);
     }
@@ -1333,9 +1788,10 @@ struct World::Inner {
     void worn(Thing* o) {
         Shared& s = *o->shared;
         Texture* t = s.texture ? s.texture : blank;
-        if (o->kind == LABEL) {
+        if (o->kind == LABEL || o->kind == SIGN) {
+            float tall = o->kind == SIGN ? o->dims[0] : 0.42f;
             o->look->setParameter("picture", t, smooth());
-            o->look->setParameter("shape", float4{0.42f * s.aspect, 0.42f, 0.5f, 0.0f});
+            o->look->setParameter("shape", float4{tall * s.aspect, tall, 0.5f, 0.0f});
             o->look->setParameter("tint", float4{1, 1, 1, 1});
         } else {
             o->look->setParameter("picture", t, o->soft ? smooth() : exact());
@@ -1402,7 +1858,7 @@ struct World::Inner {
     }
 
     std::string keyOf(const Record& s) {
-        return formOf(s) + "|" + finishOf(s) + (colourOf(s.c).a < 1 ? "|see" : "");
+        return formOf(s) + "|" + finishOf(s) + (colourOf(s.c).a < 1 ? "|see" : "") + extrasOf(dressOf(s));
     }
 
     bool fits(Thing* o, const Record& s) {
@@ -1410,8 +1866,11 @@ struct World::Inner {
         switch (s.kind) {
         case LINE:
         case TERRAIN:
+        case LAMP:
+        case SPOT:
             return true;
         case LABEL:
+        case SIGN:
             return o->words == s.x && o->tint == s.c;
         case SPRITE:
             return o->words == s.x && o->dims[0] == (s.d.size() > 0 ? s.d[0] : 0) &&
@@ -1428,13 +1887,15 @@ struct World::Inner {
         o->kind = s.kind;
         o->key = keyOf(s);
         o->words = s.x;
-        std::string finish = finishOf(s);
+        Dress dress = dressOf(s);
         switch (s.kind) {
         case LINE:
             lines.push_back(o);
             break;
         case LABEL:
+        case SIGN:
             o->tint = s.c;
+            o->dims[0] = s.d.size() > 0 ? s.d[0] : 1;
             o->shared = signOf(s.x, s.c);
             upright(o);
             break;
@@ -1450,15 +1911,30 @@ struct World::Inner {
             break;
         case TERRAIN:
             o->land = new Land();
-            o->finish = finish;
-            alone(o, quadFormed(), opaque, finish, true, true);
+            o->finish = dress.finish;
+            alone(o, quadFormed(), opaque, dress, true, true);
+            break;
+        case MESH:
+            o->land = new Land();
+            o->land->mesh = true;
+            o->land->wire = dress.wire;
+            o->finish = dress.finish;
+            o->soft = colourOf(s.c).a < 1;
+            alone(o, quadFormed(), o->soft ? see : dress.finish == "Mesh" ? pierced : opaque, dress, !o->soft, false, true);
+            break;
+        case LAMP:
+        case SPOT:
+            o->entity = EntityManager::get().create();
+            LightManager::Builder(s.kind == SPOT ? LightManager::Type::SPOT : LightManager::Type::POINT)
+                .intensityCandela(1.0f).falloff(10.0f).castShadows(false).build(engine, o->entity);
+            o->standing = true;
             break;
         default:
             if (colourOf(s.c).a >= 1) {
-                o->batch = batchOf(formOf(s), finish);
+                o->batch = batchOf(formOf(s), dress);
             } else {
                 o->soft = true;
-                alone(o, unit(formOf(s)), see, finish, false, false);
+                alone(o, unit(formOf(s)), see, dress, false, false);
             }
         }
         return o;
@@ -1482,6 +1958,11 @@ struct World::Inner {
             linesMoved = true;
             return;
         }
+        if (s.kind == LAMP || s.kind == SPOT) {
+            lamped(o, s);
+            show(o, o->visible);
+            return;
+        }
         auto& places = engine.getTransformManager();
         if (s.kind == LABEL || s.kind == SPRITE) {
             places.setTransform(places.getInstance(o->entity), mat4f::translation(float3{s.p[0], s.p[1], s.p[2]}));
@@ -1493,19 +1974,24 @@ struct World::Inner {
             show(o, o->visible);
             return;
         }
-        Turn t = s.turned ? turned(s.r[0], s.r[1], s.r[2]) : turned(0, 0, 0);
+        if (s.kind == SIGN) {
+            places.setTransform(places.getInstance(o->entity), stoodAs(s));
+            float tall = s.d.size() > 0 ? s.d[0] : 1;
+            if (o->dims[0] != tall) {
+                o->dims[0] = tall;
+                worn(o);
+            }
+            show(o, o->visible);
+            return;
+        }
         if (o->slot < 0) { return; }
         float* row = pooled(o->slot);
+        auto& solids = engine.getRenderableManager();
         if (s.kind == TERRAIN) {
             const float one[3] = {1, 1, 1};
-            placed(row, s.p, t, one);
-            Colour c = colourOf(s.c);
-            row[12] = c.r;
-            row[13] = c.g;
-            row[14] = c.b;
+            rowOf(row, s, one, false);
             row[15] = 1;
             lie(o, s);
-            auto& solids = engine.getRenderableManager();
             solids.setAxisAlignedBoundingBox(solids.getInstance(o->entity),
                 filament::Box{float3{s.p[0], s.p[1], s.p[2]}, float3(o->land->reach)});
             show(o, o->visible && !o->land->laid.empty());
@@ -1513,20 +1999,31 @@ struct World::Inner {
         }
         // Sorted against the rest by where it stands, so that is what its place says.
         float size[3];
-        const float origin[3] = {0, 0, 0};
         stretch(s, size);
-        placed(row, origin, t, size);
-        Colour c = colourOf(s.c);
-        row[12] = c.r;
-        row[13] = c.g;
-        row[14] = c.b;
-        row[15] = c.a;
+        rowOf(row, s, size, true);
         o->tint = s.c;
+        o->spread = spreadOf(s);
         places.setTransform(places.getInstance(o->entity), mat4f::translation(float3{s.p[0], s.p[1], s.p[2]}));
-        auto& solids = engine.getRenderableManager();
-        solids.setAxisAlignedBoundingBox(solids.getInstance(o->entity),
-            filament::Box{float3(0.0f), float3(size[0] + size[1] + size[2])});
+        if (o->land) {
+            lie(o, s);
+            solids.setAxisAlignedBoundingBox(solids.getInstance(o->entity),
+                filament::Box{float3(0.0f), float3(o->land->reach * o->spread)});
+            show(o, o->visible && !o->land->laid.empty());
+            return;
+        }
+        float reach = (std::fabs(size[0]) + std::fabs(size[1]) + std::fabs(size[2])) * (s.placed ? o->spread : 1.0f);
+        solids.setAxisAlignedBoundingBox(solids.getInstance(o->entity), filament::Box{float3(0.0f), float3(reach)});
         show(o, o->visible);
+    }
+
+    // How many times its own size a shape is drawn at most, any way.
+    static float spreadOf(const Record& s) {
+        if (!s.placed) { return std::max(std::fabs(s.z[0]), std::max(std::fabs(s.z[1]), std::fabs(s.z[2]))); }
+        float most = 0;
+        for (int c = 0; c < 3; c++) {
+            most = std::max(most, std::sqrt(s.m[c] * s.m[c] + s.m[4 + c] * s.m[4 + c] + s.m[8 + c] * s.m[8 + c]));
+        }
+        return most;
     }
 
     void hide(Thing* o) {
@@ -1559,6 +2056,7 @@ struct World::Inner {
         }
         if (o->look) {
             unveiled(o->look);
+            unlayOn(o->look);
             engine.destroy(o->look);
         }
         if (o->slot >= 0) { poolSpare.push_back(o->slot); }
@@ -1569,6 +2067,7 @@ struct World::Inner {
         if (o->land) {
             if (o->land->form.points) { engine.destroy(o->land->form.points); }
             if (o->land->form.corners) { engine.destroy(o->land->form.corners); }
+            if (o->land->form.edges) { engine.destroy(o->land->form.edges); }
             delete o->land;
         }
         delete o;
@@ -1689,6 +2188,33 @@ struct World::Inner {
             s.t.resize(r.u8());
             for (auto& tone : s.t) { tone = r.word(); }
         }
+        if (mask & HAS_MORE) {
+            int more = r.u16();
+            if (more & MORE_MATRIX) {
+                for (float& v : s.m) { v = r.f32(); }
+                s.placed = true;
+                s.p[0] = s.m[3];
+                s.p[1] = s.m[7];
+                s.p[2] = s.m[11];
+            }
+            if (more & MORE_LOOK) {
+                s.shine[0] = r.f32();
+                s.shine[1] = r.f32();
+            }
+            if (more & MORE_GLOW) { s.shine[2] = r.f32(); }
+            if (more & MORE_FLAGS) { s.flags = r.u8(); }
+            if (more & MORE_TEXTURE) {
+                s.pic = r.word();
+                s.bump = r.word();
+                s.tile[0] = r.f32();
+                s.tile[1] = r.f32();
+            }
+            if (more & MORE_PLAY) {
+                s.clip = r.word();
+                s.clipAt = r.f32();
+                s.loop = r.u8() != 0;
+            }
+        }
         if (r.short_) { return; }
         Thing* o = live[at];
         if (!fits(o, s)) {
@@ -1722,6 +2248,28 @@ struct World::Inner {
             into.shade = 0;
         }
         into.on = r.word();
+        int seen = r.u8();
+        into.roll = (seen & SEEN_ROLL) ? r.f32() : 0;
+        into.ortho = (seen & SEEN_ORTHO) ? r.f32() : 0;
+        into.near = 0.08f;
+        into.far = 800;
+        if (seen & SEEN_DEPTH) {
+            into.near = r.f32();
+            into.far = r.f32();
+        }
+        into.ambient.clear();
+        into.ambientBright = 1;
+        if (seen & SEEN_AMBIENT) {
+            into.ambient = r.word();
+            into.ambientBright = r.f32();
+        }
+        into.sunTone.clear();
+        into.sunBright = 1;
+        if (seen & SEEN_SUNLIGHT) {
+            into.sunTone = r.word();
+            into.sunBright = r.f32();
+        }
+        into.panorama = (seen & SEEN_PANORAMA) ? r.word() : "";
     }
 
     bool paint(const uint8_t* data, size_t size) {
@@ -1750,6 +2298,8 @@ struct World::Inner {
         return true;
     }
 
+    bool seeing() const { return !world.sky.empty() && colourOf(world.sky).a < 1; }
+
     void apply() {
         const Eye& w = world;
         if (w.grain != coarse || w.bits != deep) {
@@ -1757,13 +2307,32 @@ struct World::Inner {
             deep = w.bits;
             shaped = true;
         }
-        bool skied = !w.sky.empty();
-        if (skied) { heavens(w.sky); }
+        bool see = seeing();
+        if (w.panorama != panoramaAsked) {
+            panoramaAsked = w.panorama;
+            panoramaArrived = false;
+            panorama = Picture();
+            if (!w.panorama.empty()) { host.wantPicture(w.panorama); }
+        }
+        bool pano = !w.panorama.empty() && panoramaArrived && !panorama.empty();
+        if (pano) {
+            if (panoramaMade != w.panorama) {
+                surround(panorama);
+                panoramaMade = w.panorama;
+                skyHex.clear();
+                glowHex.clear();
+            }
+        } else {
+            panoramaMade.clear();
+            if (!w.sky.empty() && !see) { heavens(w.sky); }
+            lit(!w.ambient.empty() ? w.ambient : (!w.sky.empty() && !see) ? w.sky : "#8ecbff");
+        }
+        bool skied = !see && (pano || !w.sky.empty());
         if (skied != skyStaged) {
             stage->setSkybox(skied ? sky : nullptr);
             skyStaged = skied;
         }
-        lit(skied ? w.sky : "#8ecbff");
+        if (glow) { glow->setIntensity(std::max(0.0f, w.ambientBright)); }
         float near = w.fog ? float(w.fog) * 0.5f : 0, far = float(w.fog), on = w.fog ? 1.0f : 0.0f;
         if (near != fogNear || far != fogFar || on != fogOn) {
             fogNear = near;
@@ -1772,7 +2341,10 @@ struct World::Inner {
             fogged();
         }
         float far2 = w.shade ? float(w.shade) : 55.0f;
-        if (!sunSet || far2 != shadeFar || w.sun[0] != sunAt[0] || w.sun[1] != sunAt[1]) { sunned(w.sun, far2); }
+        if (!sunSet || far2 != shadeFar || w.sun[0] != sunAt[0] || w.sun[1] != sunAt[1] || w.sunTone != sunToneAt ||
+            w.sunBright != sunBrightAt) {
+            sunned(w.sun, far2, w.sunTone, w.sunBright);
+        }
         if (soundsMoved) {
             soundsMoved = false;
             sounded.clear();
@@ -1784,9 +2356,16 @@ struct World::Inner {
 
     void aimed(Sight& l, const Eye& e, int wide, int tall) {
         float lens = e.lens ? float(e.lens) : 75.0f;
-        l.camera->setProjection(double(lens), double(wide) / double(std::max(1, tall)), 0.08, 800.0,
-            Camera::Fov::VERTICAL);
-        Turn t = turned(e.aim[1], e.aim[0], 0);
+        double aspect = double(wide) / double(std::max(1, tall));
+        double near = e.near > 0 ? double(e.near) : 0.08;
+        double far = e.far > e.near ? double(e.far) : std::max(800.0, near * 2);
+        if (e.ortho > 0) {
+            double h = double(e.ortho) / 2, w = h * aspect;
+            l.camera->setProjection(Camera::Projection::ORTHO, -w, w, -h, h, near, far);
+        } else {
+            l.camera->setProjection(double(lens), aspect, near, far, Camera::Fov::VERTICAL);
+        }
+        Turn t = turned(e.aim[1], e.aim[0], e.roll);
         mat4f m;
         m[0] = float4{t.m[0], t.m[1], t.m[2], 0};
         m[1] = float4{t.m[3], t.m[4], t.m[5], 0};
@@ -1826,7 +2405,8 @@ struct World::Inner {
             rough ? TextureSampler::MinFilter::NEAREST : TextureSampler::MinFilter::LINEAR,
             rough ? TextureSampler::MagFilter::NEAREST : TextureSampler::MagFilter::LINEAR));
         float steps = deep > 0 ? std::pow(2.0f, float(deep)) - 1 : 0;
-        l.sheet->setParameter("shape", float4{steps, traded ? 1.0f : 0.0f, upside ? 1.0f : 0.0f, 0});
+        l.sheet->setParameter("shape", float4{steps, traded ? 1.0f : 0.0f, upside ? 1.0f : 0.0f,
+            (&l == &main && seeing()) ? 1.0f : 0.0f});
         l.sheet->setParameter("frame", float4{float(main.wide), float(main.tall), float(sheetWide), float(sheetTall)});
     }
 
@@ -1845,6 +2425,7 @@ struct World::Inner {
         backed(main, int(std::lround(float(drawnWide) * shrink)), int(std::lround(float(drawnTall) * shrink)));
         aimed(main, world, drawnWide, drawnTall);
         main.view->setShadowingEnabled(!world.flat);
+        main.view->setBlendMode(seeing() ? View::BlendMode::TRANSLUCENT : View::BlendMode::OPAQUE);
         laidOut(main, 0, 0, float(sheetWide), float(sheetTall));
         staged(main, true);
         sheetView->setViewport(Viewport{0, 0, uint32_t(sheetWide), uint32_t(sheetTall)});
@@ -1971,6 +2552,27 @@ void World::draw(Renderer& renderer) { in->render(renderer); }
 
 void World::picture(const std::string& path, int wide, int tall, const uint8_t* rgba) {
     Inner& w = *in;
+    bool here = rgba && wide > 0 && tall > 0;
+    if (!path.empty() && path == w.panoramaAsked && !w.panoramaArrived) {
+        w.panoramaArrived = true;
+        if (here) {
+            w.panorama.wide = wide;
+            w.panorama.tall = tall;
+            w.panorama.rgba.assign(rgba, rgba + size_t(wide) * tall * 4);
+        }
+        w.apply();
+        w.dirty = true;
+    }
+    for (int bump = 0; bump < 2; bump++) {
+        std::string key = path + (bump ? "#relief" : "");
+        auto waiting = w.laying.find(key);
+        if (waiting == w.laying.end() || w.laidOn.count(key)) { continue; }
+        Texture* t = here ? w.shown(wide, tall, rgba, bump == 1) : (bump ? w.flat : w.white);
+        w.laidOn[key] = t;
+        for (auto& each : waiting->second) { each.first->setParameter(each.second.c_str(), t, Inner::tiled()); }
+        w.laying.erase(waiting);
+        w.dirty = true;
+    }
     const std::string folder = "textures/";
     if (path.compare(0, folder.size(), folder) == 0 && path.size() > folder.size() + 4) {
         std::string name = path.substr(folder.size(), path.size() - folder.size() - 4);
@@ -2016,12 +2618,12 @@ void World::file(const std::string& path, const uint8_t* data, size_t size, bool
 
 void World::terrain(const std::string& id, const uint8_t* data, size_t size) {
     Inner& w = *in;
-    if (!data || size < 12) { return; }
+    if (!data || size < 8) { return; }
     if (w.grounds.size() > 8) { w.grounds.clear(); }
     w.grounds[id].assign(data, data + size);
     for (Thing* o : w.live) {
         if (o && o->land && o->land->asked == id && o->land->laid != id) {
-            w.laid(o, data, size);
+            w.arrived(o, data, size);
             w.dirty = true;
         }
     }
@@ -2040,6 +2642,8 @@ void World::label(const std::string& words, const std::string& colour, int wide,
 }
 
 bool World::stale() const { return in->dirty; }
+
+bool World::seeThrough() const { return in->seeing(); }
 
 const Eye& World::eye() const { return in->world; }
 

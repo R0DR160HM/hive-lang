@@ -230,9 +230,7 @@ func (e *uiEngine) listen(out *bufio.Reader) {
 			}
 		case 't':
 			id := string(body)
-			uiTerrainLock.Lock()
-			data := uiTerrainData[id]
-			uiTerrainLock.Unlock()
+			data, _ := uiSceneData(id)
 			e.say('t', uiEngineNamed(id), data)
 		case 'l':
 			if len(body) >= 2 && e.label != nil {

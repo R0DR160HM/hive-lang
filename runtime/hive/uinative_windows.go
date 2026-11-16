@@ -29,6 +29,14 @@ var (
 	uiwDwmapi   = syscall.NewLazyDLL("dwmapi.dll")
 	uiwAdvapi32 = syscall.NewLazyDLL("advapi32.dll")
 	uiwImm32    = syscall.NewLazyDLL("imm32.dll")
+	uiwShell32  = syscall.NewLazyDLL("shell32.dll")
+	uiwComdlg32 = syscall.NewLazyDLL("comdlg32.dll")
+
+	uiwDragAcceptFiles = uiwShell32.NewProc("DragAcceptFiles")
+	uiwDragQueryFile   = uiwShell32.NewProc("DragQueryFileW")
+	uiwDragQueryPoint  = uiwShell32.NewProc("DragQueryPoint")
+	uiwDragFinish      = uiwShell32.NewProc("DragFinish")
+	uiwGetOpenFileName = uiwComdlg32.NewProc("GetOpenFileNameW")
 
 	uiwRegisterClassEx     = uiwUser32.NewProc("RegisterClassExW")
 	uiwCreateWindowEx      = uiwUser32.NewProc("CreateWindowExW")
@@ -132,6 +140,8 @@ const (
 	uiwWmSetIcon       = 0x0080
 	uiwWmAppView       = 0x8001
 	uiwWmAppTick       = 0x8002
+	uiwWmAppChoose     = 0x8003
+	uiwWmDropFiles     = 0x0233
 	uiwWmSysKeyUp      = 0x0105
 	uiwWmRButtonDown   = 0x0204
 	uiwWmMButtonDown   = 0x0207
@@ -252,6 +262,7 @@ type uiwMetrics struct {
 
 type uiwWindow struct {
 	n        *uiNative
+	choosing func(path string)
 	mu       sync.Mutex
 	hwnd     uintptr
 	dc       uintptr
@@ -407,6 +418,7 @@ func (w *uiwWindow) handle(msg, wp, lp uintptr) (uintptr, bool) {
 	n := w.n
 	switch msg {
 	case uiwWmCreate:
+		uiwCall(uiwDragAcceptFiles, w.hwnd, 1)
 		w.dc = uiwCall(uiwCreateCompatibleDC, 0)
 		w.fonts = map[uiFont]uintptr{}
 		w.metrics = map[uiFont]uiwMetrics{}
@@ -443,6 +455,15 @@ func (w *uiwWindow) handle(msg, wp, lp uintptr) (uintptr, bool) {
 		if n.staged() {
 			w.invalidate()
 		}
+		return 0, true
+	case uiwWmDropFiles:
+		if w.dropped(wp) {
+			w.invalidate()
+		}
+		return 0, true
+	case uiwWmAppChoose:
+		w.choose()
+		w.invalidate()
 		return 0, true
 	case uiwWmAppTick:
 		w.ticked.Store(false)
@@ -847,22 +868,45 @@ func (w *uiwWindow) font(f uiFont) uintptr {
 	if h, ok := w.fonts[f]; ok {
 		return h
 	}
-	face, weight := "Segoe UI", f.weight
-	if f.weight == 600 {
-		face, weight = "Segoe UI Semibold", 400
-	}
+	face, weight := uiwFace(f.weight)
 	if f.icon {
 		face = "Segoe UI Symbol"
 	}
 	if f.mono {
-		face = "Consolas"
+		face, weight = "Consolas", 400
+		if f.weight >= 600 {
+			weight = 700
+		}
 	}
 	name := uiwText(face)
 	px := int32(-math.Round(f.px * w.n.scale))
-	h := uiwCall(uiwCreateFont, uintptr(px), 0, 0, 0, uintptr(weight), 0, 0, 0, 1, 0, 0, 5, 0,
+	italic := uintptr(0)
+	if f.italic {
+		italic = 1
+	}
+	wide := uintptr(0)
+	if f.stretch > 0 && f.stretch != 1 {
+		wide = uintptr(int32(math.Round(w.metric(uiFont{px: f.px, weight: f.weight, mono: f.mono, italic: f.italic}).average * w.n.scale * f.stretch)))
+	}
+	h := uiwCall(uiwCreateFont, uintptr(px), wide, 0, 0, uintptr(weight), italic, 0, 0, 1, 0, 0, 5, 0,
 		uintptr(unsafe.Pointer(&name[0])))
 	w.fonts[f] = h
 	return h
+}
+
+// Segoe UI keeps its lighter and heavier cuts as families of their own, so a weight names a family as CSS would pick it.
+func uiwFace(weight int) (string, uintptr) {
+	switch {
+	case weight < 350:
+		return "Segoe UI Light", 400
+	case weight < 550:
+		return "Segoe UI", 400
+	case weight < 650:
+		return "Segoe UI Semibold", 400
+	case weight < 850:
+		return "Segoe UI", 700
+	}
+	return "Segoe UI Black", 400
 }
 
 func (w *uiwWindow) dropFonts() {
@@ -1286,4 +1330,67 @@ func (w *uiwWindow) closed() {
 		os.Exit(0)
 	}
 	uiwCall(uiwPostQuitMessage, 0)
+}
+
+func (w *uiwWindow) dropped(drop uintptr) bool {
+	defer uiwCall(uiwDragFinish, drop)
+	count := int(uint32(uiwCall(uiwDragQueryFile, drop, 0xFFFFFFFF, 0, 0)))
+	var paths []string
+	for i := 0; i < count; i++ {
+		size := int(uint32(uiwCall(uiwDragQueryFile, drop, uintptr(i), 0, 0)))
+		if size <= 0 {
+			continue
+		}
+		buf := make([]uint16, size+1)
+		uiwCall(uiwDragQueryFile, drop, uintptr(i), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+		paths = append(paths, syscall.UTF16ToString(buf))
+	}
+	var at [2]int32
+	uiwCall(uiwDragQueryPoint, drop, uintptr(unsafe.Pointer(&at)))
+	return len(paths) > 0 && w.n.filesDropped(float64(at[0]), float64(at[1]), paths)
+}
+
+type uiwOpenFile struct {
+	size                  uint32
+	_                     uint32
+	owner, instance       uintptr
+	filter, custom        uintptr
+	maxCustom, index      uint32
+	file                  uintptr
+	maxFile               uint32
+	_                     uint32
+	title                 uintptr
+	maxTitle              uint32
+	_                     uint32
+	folder, caption       uintptr
+	flags                 uint32
+	offset, extension     uint16
+	ext, data, hook, name uintptr
+	reserved              uintptr
+	reserved2, flagsEx    uint32
+}
+
+// The dialog runs its own loop, so it is opened from a message of its own rather than inside another's handling.
+func (w *uiwWindow) chooseFile(done func(path string)) {
+	w.choosing = done
+	uiwCall(uiwPostMessage, w.hwnd, uiwWmAppChoose, 0, 0)
+}
+
+func (w *uiwWindow) choose() {
+	done := w.choosing
+	w.choosing = nil
+	if done == nil {
+		return
+	}
+	buf := make([]uint16, 32768)
+	ofn := uiwOpenFile{owner: w.hwnd, file: uintptr(unsafe.Pointer(&buf[0])), maxFile: uint32(len(buf)),
+		flags: 0x1000 | 0x800 | 0x80000 | 0x8}
+	ofn.size = uint32(unsafe.Sizeof(ofn))
+	chosen := uiwCall(uiwGetOpenFileName, uintptr(unsafe.Pointer(&ofn))) != 0
+	runtime.KeepAlive(buf)
+	if chosen {
+		done(syscall.UTF16ToString(buf))
+		return
+	}
+	done("")
 }

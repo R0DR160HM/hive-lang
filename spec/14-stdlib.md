@@ -868,14 +868,20 @@ elsewhere is an entry in the attribute vector.
 | widget | payload |
 | --- | --- |
 | `row` / `column` | `View[]` |
+| `grid(attrs, children)` | `View[]` — columns that line up, `columns(Int[])` wide, a child `span(n)` of them |
+| `stack(attrs, children)` | `View[]` — one over another, each `place(across, down)` in it |
+| `paragraph(attrs, children)` | `View[]` — `text`s, `link`s and `icon`s wrapped as one run of words |
 | `spacer()` / `spinner(attrs)` / `none()` | — |
+| `progress(attrs, done)` | `Float` — a bar `done` of the way along, 0 to 1 |
 | `overlay(attrs, child)` | `View` |
 | `text(attrs, content)` | `Str` |
 | `image(attrs, src, alt)` / `link(attrs, href, label)` | `Str, Str` |
 | `icon(attrs, name)` | `Icon` |
 | `button(attrs, label)` / `input(attrs, value)` / `textarea(attrs, value)` | `Str` |
 | `checkbox(attrs, label, checked)` | `Str, Bool` |
-| `select(attrs, options, chosen)` | `Str[], Str` |
+| `select(attrs, options, chosen)` / `radio(…)` / `tabs(…)` | `Str[], Str` — one of several, heard through `onChoose` |
+| `choices(attrs, options, chosen)` | `Str[], Str[]` — any number of several; `onChoose` hears the one clicked |
+| `tree(attrs, branches)` / `branch(attrs, label, open, children)` | `View[]` / `Str, Bool, View[]` — `on` picks a branch, `onToggle` opens it |
 | `table(attrs, rows)` | `Table` |
 | `canvas(attrs, marks)` | `Mark[]` — see [below](#a-canvas) |
 | `scene(attrs, shapes)` | `Shape[]` — see [14.16](#1416-hiveuiscene) |
@@ -904,18 +910,21 @@ all.
 
 | | |
 | --- | --- |
-| Layout | `gap` `pad` `width` `height` `grow` `align` `justify` `scroll` |
-| Text | `size` `heading` `tone` |
-| Colour | `background(Tone)` `paint(Tone)` |
-| Canvas | `region(x, y, width, height)` `thick(Float)` |
-| State | `disabled` `busy` `placeholder` `hint` `kind` |
+| Layout | `gap` `pad` `width` `height` `grow` `align` `justify` `scroll` `wrap(Bool)` `minWidth` `maxWidth` `minHeight` `maxHeight` `aspect(wide, tall)` `fit(Fit)` `scrollTo(x, y, serial)` |
+| Text | `size` `heading` `tone` `weight(Int)` `italic(Bool)` `mono(Bool)` `lines(Int)`; `justify` lines a text's words up |
+| Colour | `background(Tone)` `paint(Tone)` `gradient(from, to, angle)` |
+| Canvas | `region(x, y, width, height)` `thick(Float)` `edge(Tone)` `dash(on, off)` `crop(x, y, width, height)` |
+| State | `disabled` `busy` `placeholder` `hint` — a tooltip — `kind` `limits(low, high, step)` `selected(Bool)` |
 | Touch | `touch(Str)` |
 | Window | `title` — on the outermost widget, the title bar |
 | Events | `on(Msg)` `onDismiss(Msg)` `onInput(f)` `onSubmit(f)` `onChoose(f)` `onToggle(f)` `onPick(f)` `onSort(f)` `onKey(f)` |
 | Code | `code(attrs, text, runs)` with `ink` `shade` `squiggle` `underline` `marker` `band` `note`; `caret(anchor, head, serial)` `numbers` `tabSize` `readOnly` `perform(command, serial)` `onEdit(f)` `onCaret(f)` `onView(f)` `onFit(f)` `onHover(f)` `onJump(f)` `onProbe(f)` `onPaste(f)` |
 | Look | `border(n)` `radius(n)` `borderTone(Tone)` `ring(b)` — a button's or a field's edge and focus ring; `hover(Tone)` — any widget's colour under the pointer |
 | Requests | `focus(serial)` focuses a widget, `clip(text, serial)` fills the clipboard — once per serial |
-| Pointer | `onMenu(Msg)` `onMiddle(Msg)` `onDouble(Msg)` `onDrag(f)`; `anchor(Anchor)` opens an overlay at the pointer or the caret |
+| Pointer | `onMenu(Msg)` `onMiddle(Msg)` `onDouble(Msg)` `onDrag(f)` `onEnter(Msg)` `onLeave(Msg)` `onPress(f)` `onPoint(f)` `onRelease(f)` `onWheel(f)` — where, in pixels, or a canvas's own units; `anchor(Anchor)` opens an overlay at the pointer or the caret |
+| Focus and size | `onFocus(Msg)` `onBlur(Msg)` — the focus arriving in a widget or anything in it, and leaving; `onScroll(f)` `onSize(f)` |
+| Carrying | `carry(Str)` lets a widget be dragged, and `onDrop(f)` hears the word where it lands; `onFile(f)` hears a file's name and bytes, chosen or dropped |
+| Look, more | `opacity(Float)` `shadow(Int)` `ease(ms)` — a change arrives over that many milliseconds |
 | Keys | `keys(Str[dyn])` — which keys a widget takes for its `onKey`; the innermost around the focus wins |
 
 A scene takes attributes of its own — a camera, a sky, and the events a game
@@ -941,11 +950,13 @@ what the user did, which is what a constructor with a hole is for:
 `ui.onInput(Msg.Changed(_))`.
 
 `ui.kind(ui.InputKind.Range())` makes an `input` a slider running 0–100, whose
-value and `onInput` text are that number. While it has focus it keeps only the
+value and `onInput` text are that number, unless `limits(low, high, step)` says
+otherwise. While it has focus it keeps only the
 keys that move it, so a scene beside it still hears `Escape`.
 
 The enumerations are ordinary closed types (`Align`, `Justify`, `TextSize`,
-`Tone`, `Axis`, `InputKind`, `Icon`), reached the way every other type is. None
+`Tone`, `Axis`, `InputKind`, `Fit`, `Icon`), reached the way every other type is.
+`Icon` is 320 drawn from Lucide, the same lines on a page and in a window. None
 is an atom, deliberately: the atom table belongs to your program, and a library
 that added to it would renumber the atoms you wrote.
 
@@ -965,23 +976,36 @@ schedule and nothing to clear.
 
 | mark | payload |
 | --- | --- |
-| `dot(attrs, x, y, radius)` | a filled circle |
+| `dot(attrs, x, y, radius)` | a circle |
+| `oval(attrs, x, y, width, height)` | an ellipse, **from its middle** |
 | `bar(attrs, x, y, width, height)` | a rectangle, **from its middle** |
 | `path(attrs, points)` | `Float[]` — x, y, x, y … — a line through them |
 | `patch(attrs, points)` | the same numbers, filled |
-| `words(attrs, x, y, height, text)` | words **centred** on the place |
+| `curve(attrs, points)` | a start, then a cubic Bézier piece every six numbers |
+| `arc(attrs, x, y, radius, from, to)` / `wedge(…)` | a circle's edge between two angles, or the slice between them |
+| `cutout(attrs, outer, holes)` | `Mark, Mark[]` — closed marks with holes cut in them |
+| `symbol(attrs, x, y, angle, size, marks)` | `Mark[]` — marks moved, turned and sized together; `crop` and `opacity` act on them as one |
+| `picture(attrs, src, x, y, width, height)` | a picture, **from its middle**, as `fit` says |
+| `words(attrs, x, y, height, text)` | words **centred** on the place, as wide as `measure(text, height)` says |
 
 `region(x, y, width, height)` says which part of the plane the box shows, and
 **everything on a canvas is said in those units** — a map of a circuit is written
 in metres, and a car nine metres long is drawn nine long. The box may be any
 shape; what is drawn keeps its own and is centred in it. `paint(Tone)` is a
-mark's colour and `thick(Float)` is how wide a `path` is drawn, in the region's
-units too — so a map zoomed in has thicker roads, which is what zooming in means.
+mark's colour and `thick(Float)` is how wide a line or an `edge` is drawn, in the
+region's units too — so a map zoomed in has thicker roads, which is what zooming
+in means. A closed mark is filled with its `paint` and outlined by its `edge`; an
+edge with no paint is a ring. Angles are radians, nought pointing right and a
+positive one turning clockwise, as `gradient`'s are.
+
+`measure(words, height)` answers how wide `words` of that height are, and **every
+window draws them that wide**, stretching its own face to it, so what is drawn
+around words can be laid out by the program.
 
 A dimension is the payload rather than an attribute, the same way it is for a
-shape: a dot without a radius is not a dot with a default one. `bar` is placed by
-its middle because everything else on a canvas is, and one mark placed by its
-corner would be the one that is always half a width out.
+shape: a dot without a radius is not a dot with a default one. `bar`, `oval` and
+`picture` are placed by their middle because everything else on a canvas is, and
+one mark placed by its corner would be the one that is always half a width out.
 
 The same tree a window swaps in is what `page` writes out, so a chart drawn for a
 program is a chart served by a web server with nothing changed.
@@ -1037,6 +1061,21 @@ without a radius is not a sphere with a default one.
 | `sprite(attrs, image, wide, tall)` | a picture that always faces the viewer |
 | `line(attrs, fromX, fromY, fromZ, toX, toY, toZ)` | |
 | `sound(attrs, name)` | a noise at a place — see [below](#a-sound-is-a-shape) |
+| `torus(attrs, radius, tube)` / `capsule(attrs, radius, height)` / `disc(attrs, inner, outer)` | round where a stretch would squash them; a disc lies flat |
+| `mesh(attrs, points, triangles, colours)` | three numbers a point, three indices a triangle counter-clockwise from the front, a colour a point |
+| `tube(attrs, points, radius)` / `extrude(attrs, outline, height)` / `lathe(attrs, profile, sides)` / `cloud(attrs, points, size)` | meshes worked out from a path, an outline on the ground, a profile, or points |
+| `model(attrs, file)` | a glTF binary under `assets/` as it stands in the file |
+| `sign(attrs, words, height)` | words standing in the world, turned like any shape |
+| `group(attrs, shapes)` | shapes moved, turned and scaled together |
+| `lamp(attrs, bright, reach)` / `spot(attrs, bright, reach, cone)` | a light shining every way, or down until turned; `bright` 1 lights a metre away as the sun does |
+
+**A mesh travels as a terrain does**: a frame carries a name for what it is, and
+its points cross once, when the name is new. A `model` is drawn the way a figure
+is, every copy of a file in one draw, and `play(clip, at, loop)` plays one of its
+animations at the time the program gives. **Neither lamp nor spot casts a
+shadow**, and **neither lights a camera with an `ortho` lens**: the engine's
+lights are assigned by perspective, so a flat camera is lit by the sun and the
+sky.
 
 **`cone` takes both of its radii** rather than only the base. A cone in the world
 is hardly ever the perfect one — a track marker is snub-nosed, a nose cone ends in
@@ -1080,6 +1119,13 @@ nothing is drawn, and the scene carries on.
 | `turn(x, y, z)` | its rotation, in radians: yaw, then pitch, then roll |
 | `paint(Tone)` | its colour |
 | `surface(Surface)` | what it is made of |
+| `scale(x, y, z)` | how many times its own size, each way; a negative one mirrors it |
+| `rough(Float)` `metal(Float)` | how rough, how much a metal, instead of its finish's |
+| `glow(Float)` `unlit(Bool)` `wire(Bool)` | light of its own; drawn lit by nothing; drawn as its edges |
+| `shadows(Bool)` | `false`: it neither casts a shadow nor takes one |
+| `texture(Str)` `relief(Str)` `tile(across, down)` | a picture and a normal map of its own from `assets/`, repeated that many times |
+| `tag(Int)` | what `onHit` and `onOver` answer with; a group's reaches what it holds |
+| `thick(Float)` | on a `line`, a round bar that many metres across |
 
 `turn` is a heading and not three world axes: `y` first, then `x` about the shape's
 *own* lateral axis and `z` about its own length, so a thing yawed to face somewhere
@@ -1289,6 +1335,14 @@ These go on the `scene` itself rather than on a shape.
 | `bits(Int)` | how many bits of colour each channel keeps |
 | `grab(Bool)` | whether the window should hold the mouse |
 | `crosshair(Bool)` | whether to draw one in the middle |
+| `toward(x, y, z)` / `orbit(x, y, z, yaw, pitch, distance)` | aim at a place, or stand `distance` from it aimed at it |
+| `roll(Float)` `ortho(Float)` `depth(near, far)` | the picture turned; a flat camera that many metres tall; how near and far it draws |
+| `sunlight(Tone, Float)` `ambient(Tone, Float)` | the sun's colour and strength, and the light from all round; nought puts either out |
+| `panorama(Str)` | a picture all round from `assets/`: the sky, and the light it gives |
+| `snapshot(Int)` | a picture of the scene, once each time the number changes, to `onSnapshot` |
+
+**A `background` whose alpha is nought is no sky**: what is behind the scene shows
+wherever nothing is drawn.
 
 ### A picture may be drawn coarsely
 
@@ -1417,6 +1471,11 @@ unshadowed.
 | `onPad(f)` | `Int, Str, Float` — which pad, which control, where it now is |
 | `onRate(f)` | `Int` — the screen's refresh rate, in hertz |
 | `onSize(f)` | `Int, Int` — how wide and how tall the scene's box is, in pixels |
+| `onHit(f)` / `onOver(f)` | `Int, Float, Float, Float` — the tag of what a press landed on, or the pointer is over, and where; `-1` is the sky |
+| `onSnapshot(f)` | `Str` — the picture `snapshot` asked for, as a PNG |
+
+What is under the pointer is worked out by the program's side of the window, against
+the shapes it last drew, so a window and a page answer alike.
 
 **`touch(name)` makes any widget a thumb control**, heard through `onPad` as pad
 -1: `name` is 1 while a finger is on it and 0 once it lifts, and `nameX` and

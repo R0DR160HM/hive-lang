@@ -22,6 +22,7 @@ package hive
 import (
 	"embed"
 	"encoding/binary"
+	"encoding/json"
 	"math"
 	"net/http"
 	"strconv"
@@ -85,11 +86,13 @@ func uiSceneAsset(name, mime string) func(http.ResponseWriter, *http.Request) {
 // keeping them apart is what makes a button inside a scene something the
 // compiler refuses rather than something the renderer drops.
 type UiShape struct {
-	Kind   string
-	Attrs  []UiAttr
-	Nums   []float64
-	Text   string
-	Paints []UiTone
+	Kind     string
+	Attrs    []UiAttr
+	Nums     []float64
+	Text     string
+	Paints   []UiTone
+	Parts    []UiShape
+	coloured bool
 }
 
 func UiBox(attrs []UiAttr, width float64, height float64, depth float64) UiShape {
@@ -225,9 +228,7 @@ func UiTerrain(attrs []UiAttr, wide int, cell float64, heights []float64, colour
 
 func uiSceneTerrainData(w http.ResponseWriter, req *http.Request) {
 	id := strings.TrimPrefix(req.URL.Path, "/_hive/terrain/")
-	uiTerrainLock.Lock()
-	data, ok := uiTerrainData[id]
-	uiTerrainLock.Unlock()
+	data, ok := uiSceneData(id)
 	if !ok {
 		http.NotFound(w, req)
 		return
@@ -276,8 +277,7 @@ func UiAttrTurn(x float64, y float64, z float64) UiAttr {
 	return uiNums("turn", []float64{x, y, z})
 }
 
-// How many times its own size a figure is drawn, each way: the one shape whose size
-// is in a file and not in what the program says of it.
+// How many times its own size a shape is drawn, each way, on top of the size it was given.
 func UiAttrScale(x float64, y float64, z float64) UiAttr {
 	return uiNums("scale", []float64{x, y, z})
 }
@@ -348,10 +348,6 @@ func UiAttrOnPad(f func(int, string, float64) any) UiAttr {
 	return UiAttr{Kind: "onPad", heard: &uiHeard{FnPad: f}}
 }
 
-func UiAttrOnSize(f func(int, int) any) UiAttr {
-	return UiAttr{Kind: "onSize", heard: &uiHeard{FnSize: f}}
-}
-
 // UiScene is the widget. The tree keeps the attributes — the layout ones are
 // what put the box on the page — and the whole description of the world is
 // written out here, once, into the payload the window sends on its own frame.
@@ -362,20 +358,27 @@ func UiAttrOnSize(f func(int, int) any) UiAttr {
 // half a megabyte of copying before a single shape was described. The
 // estimate need not be right, only close enough that the doubling stops.
 func UiScene(attrs []UiAttr, shapes []UiShape) UiView {
+	placed := uiSceneFlatten(shapes, nil, 0, make([]uiStood, 0, len(shapes)))
 	var b strings.Builder
-	b.Grow(len(shapes)*64 + 256)
+	b.Grow(len(placed)*64 + 256)
 	uiSceneCamera(&b, attrs)
-	uiPackU32(&b, len(shapes))
+	uiPackU32(&b, len(placed))
 
 	// Where each record starts, and after the last of them where it ends. One
 	// integer a shape, and all the window needs to send one without its
 	// neighbours — see uiSceneFrame.
-	cuts := make([]int32, len(shapes)+1)
-	for i := range shapes {
+	cuts := make([]int32, len(placed)+1)
+	for i := range placed {
 		cuts[i] = int32(b.Len())
-		uiSceneShape(&b, &shapes[i])
+		uiSceneShape(&b, &placed[i])
 	}
-	cuts[len(shapes)] = int32(b.Len())
+	cuts[len(placed)] = int32(b.Len())
+	uiSceneFramed()
+	_, hits := uiFind(attrs, "onHit")
+	_, overs := uiFind(attrs, "onOver")
+	if hits || overs {
+		attrs = append(attrs[:len(attrs):len(attrs)], UiAttr{Kind: "picks", heard: &uiHeard{Picks: uiScenePicksOf(placed)}})
+	}
 	return UiView{Kind: "scene", Attrs: attrs, Text: b.String(), Cuts: cuts}
 }
 
@@ -407,13 +410,12 @@ func UiInset(attrs []UiAttr, views []UiView) UiView {
 // Set only when it is false, which is what makes "absent means yes" true on
 // the page as well as here: a scene that says nothing gets shadows.
 func uiSceneCamera(b *strings.Builder, attrs []UiAttr) {
-	eye := uiSceneNums(attrs, "eye", uiSceneEyeAt)
-	aim := uiSceneNums(attrs, "aim", uiSceneAimAt)
+	eye, yaw, pitch := uiSceneEyeOf(attrs)
 	uiPackF32(b, eye[0])
 	uiPackF32(b, eye[1])
 	uiPackF32(b, eye[2])
-	uiPackF32(b, aim[0])
-	uiPackF32(b, aim[1])
+	uiPackF32(b, yaw)
+	uiPackF32(b, pitch)
 	lens, hasLens := uiFind(attrs, "lens")
 	fog, hasFog := uiFind(attrs, "fog")
 	sky, hasSky := uiFind(attrs, "background")
@@ -481,6 +483,66 @@ func uiSceneCamera(b *strings.Builder, attrs []UiAttr) {
 	// Working out what the screen can do costs a sort of two seconds of gaps
 	// once a second. A scene that does not ask does not pay for it.
 	uiPackWord(b, uiSceneWants(attrs))
+	uiSceneCameraMore(b, attrs)
+}
+
+// The rest of a camera, each part only where the program named it.
+func uiSceneCameraMore(b *strings.Builder, attrs []UiAttr) {
+	roll, hasRoll := uiFind(attrs, "roll")
+	ortho, hasOrtho := uiFind(attrs, "ortho")
+	depth, hasDepth := uiFind(attrs, "depth")
+	ambient, hasAmbient := uiFind(attrs, "ambient")
+	sunlight, hasSunlight := uiFind(attrs, "sunlight")
+	panorama, hasPanorama := uiFind(attrs, "panorama")
+	hasRoll = hasRoll && len(roll.Nums) == 1
+	hasOrtho = hasOrtho && len(ortho.Nums) == 1 && ortho.Nums[0] > 0
+	hasDepth = hasDepth && len(depth.Nums) == 2
+	hasAmbient = hasAmbient && len(ambient.Nums) == 1
+	hasSunlight = hasSunlight && len(sunlight.Nums) == 1
+	hasPanorama = hasPanorama && panorama.Word != ""
+	bits := 0
+	for i, on := range []bool{hasRoll, hasOrtho, hasDepth, hasAmbient, hasSunlight, hasPanorama} {
+		if on {
+			bits |= 1 << i
+		}
+	}
+	uiPackU8(b, bits)
+	if hasRoll {
+		uiPackF32(b, roll.Nums[0])
+	}
+	if hasOrtho {
+		uiPackF32(b, ortho.Nums[0])
+	}
+	if hasDepth {
+		uiPackF32(b, depth.Nums[0])
+		uiPackF32(b, depth.Nums[1])
+	}
+	if hasAmbient {
+		uiPackWord(b, uiSceneTone(ambient.Word, "#ffffff"))
+		uiPackF32(b, ambient.Nums[0])
+	}
+	if hasSunlight {
+		uiPackWord(b, uiSceneTone(sunlight.Word, "#ffffff"))
+		uiPackF32(b, sunlight.Nums[0])
+	}
+	if hasPanorama {
+		uiPackWord(b, panorama.Word)
+	}
+}
+
+// Whether what is behind a scene shows through where nothing in it is drawn.
+func uiSceneSeeThrough(attrs []UiAttr) bool {
+	sky, ok := uiFind(attrs, "background")
+	if !ok {
+		return false
+	}
+	colour := uiSceneTone(sky.Word, "#8ecbff")
+	if !strings.HasPrefix(colour, "rgba(") {
+		return false
+	}
+	last := strings.LastIndexByte(colour, ',')
+	alpha, err := strconv.ParseFloat(strings.TrimSuffix(strings.TrimSpace(colour[last+1:]), ")"), 64)
+	return err == nil && alpha < 1
 }
 
 func uiSceneWants(attrs []UiAttr) string {
@@ -512,6 +574,21 @@ func uiSceneWants(attrs []UiAttr) string {
 	if _, ok := uiFind(attrs, "onSize"); ok {
 		b.WriteString("s")
 	}
+	if _, ok := uiFind(attrs, "onHit"); ok {
+		b.WriteString("h")
+	}
+	if _, ok := uiFind(attrs, "onOver"); ok {
+		b.WriteString("o")
+	}
+	if uiSceneSeeThrough(attrs) {
+		b.WriteString("t")
+	}
+	// The picture is wanted once for each number the program names.
+	if shot, ok := uiFind(attrs, "snapshot"); ok {
+		if _, heard := uiFind(attrs, "onSnapshot"); heard {
+			b.WriteString("#" + strconv.Itoa(shot.Num))
+		}
+	}
 	return b.String()
 }
 
@@ -535,7 +612,8 @@ var (
 // This is the same question asked once, answered with pointers into the
 // caller's own slice. First match wins, which is what uiFind does.
 type uiSceneParts struct {
-	at, turn, paint, surface, voice, track, pitch, volume, scale *UiAttr
+	at, turn, paint, surface, voice, track, pitch, volume, scale                 *UiAttr
+	rough, metal, glow, unlit, wire, texture, relief, tile, play, thick, shadows *UiAttr
 }
 
 func uiScenePartsOf(attrs []UiAttr) uiSceneParts {
@@ -579,6 +657,28 @@ func uiScenePartsOf(attrs []UiAttr) uiSceneParts {
 			if p.volume == nil {
 				p.volume = one
 			}
+		case "rough":
+			p.rough = uiFirst(p.rough, one)
+		case "metal":
+			p.metal = uiFirst(p.metal, one)
+		case "glow":
+			p.glow = uiFirst(p.glow, one)
+		case "unlit":
+			p.unlit = uiFirst(p.unlit, one)
+		case "wire":
+			p.wire = uiFirst(p.wire, one)
+		case "texture":
+			p.texture = uiFirst(p.texture, one)
+		case "relief":
+			p.relief = uiFirst(p.relief, one)
+		case "tile":
+			p.tile = uiFirst(p.tile, one)
+		case "play":
+			p.play = uiFirst(p.play, one)
+		case "thick":
+			p.thick = uiFirst(p.thick, one)
+		case "shadows":
+			p.shadows = uiFirst(p.shadows, one)
 		}
 	}
 	return p
@@ -598,6 +698,13 @@ func uiScenePartsOf(attrs []UiAttr) uiSceneParts {
 //
 // A sound that names no recording says nothing, and is the sound this
 // renderer has always made.
+func uiFirst(was, one *UiAttr) *UiAttr {
+	if was == nil {
+		return one
+	}
+	return was
+}
+
 func uiScenePartNums(one *UiAttr, fallback []float64) []float64 {
 	if one != nil && len(one.Nums) == len(fallback) {
 		return one.Nums
@@ -619,7 +726,8 @@ func uiScenePartEnum(one *UiAttr) string {
 	return ""
 }
 
-func uiSceneShape(b *strings.Builder, s *UiShape) {
+func uiSceneShape(b *strings.Builder, at *uiStood) {
+	s := at.s
 	p := uiScenePartsOf(s.Attrs)
 	if s.Kind == "sound" {
 		voice := uiScenePartEnum(p.voice)
@@ -636,7 +744,12 @@ func uiSceneShape(b *strings.Builder, s *UiShape) {
 		}
 		uiPackU8(b, uiSceneSound)
 		uiPackU8(b, mask)
-		uiSceneVecTo(b, uiScenePartNums(p.at, uiSceneOrigin))
+		where := uiScenePartNums(p.at, uiSceneOrigin)
+		if at.m != nil {
+			x, y, z := at.m.point(where[0], where[1], where[2])
+			where = []float64{x, y, z}
+		}
+		uiSceneVecTo(b, where)
 		uiPackLong(b, s.Text)
 		if voice != "" {
 			uiPackWord(b, voice)
@@ -648,12 +761,45 @@ func uiSceneShape(b *strings.Builder, s *UiShape) {
 		uiPackF32(b, uiScenePartOne(p.volume, 1))
 		return
 	}
+	kind, nums := s.Kind, s.Nums
+	where := uiScenePartNums(p.at, uiSceneOrigin)
+
+	// Inside a group a shape stands where the group's matrix carries it, and says so as a matrix of its own.
+	var place *uiMat
+	if at.m != nil {
+		local := uiSceneLocal(&p)
+		if kind == "terrain" {
+			local = uiPlacedAt(where, uiScenePartNums(p.turn, uiSceneOrigin), uiSceneOnes)
+		}
+		m := at.m.times(&local)
+		place = &m
+	}
+	if kind == "line" && len(nums) == 6 {
+		if p.thick != nil && len(p.thick.Nums) == 1 && p.thick.Nums[0] > 0 {
+			bar := uiSceneBar(nums, p.thick.Nums[0])
+			if at.m != nil {
+				bar = at.m.times(&bar)
+			}
+			kind, nums, place = "cylinder", []float64{1, 1}, &bar
+		} else if at.m != nil {
+			x0, y0, z0 := at.m.point(nums[0], nums[1], nums[2])
+			x1, y1, z1 := at.m.point(nums[3], nums[4], nums[5])
+			nums, place = []float64{x0, y0, z0, x1, y1, z1}, nil
+		}
+	}
+	if kind == "label" || kind == "sprite" || kind == "lamp" {
+		if place != nil {
+			where = []float64{place[3], place[7], place[11]}
+			place = nil
+		}
+	}
 	made := uiScenePartEnum(p.surface)
+	more := uiSceneMoreOf(&p, place)
 	mask := 0
 
 	// A line carries both its ends in its payload, so it has no position of its
 	// own and no rotation to apply to it.
-	if s.Kind != "line" {
+	if kind != "line" && place == nil {
 		mask |= uiSceneHasAt
 		if p.turn != nil && uiSceneAny(p.turn.Nums) {
 			mask |= uiSceneHasTurn
@@ -662,7 +808,7 @@ func uiSceneShape(b *strings.Builder, s *UiShape) {
 			mask |= uiSceneHasScale
 		}
 	}
-	if len(s.Nums) > 0 {
+	if len(nums) > 0 {
 		mask |= uiSceneHasSize
 	}
 	if made != "" {
@@ -674,30 +820,34 @@ func uiSceneShape(b *strings.Builder, s *UiShape) {
 	if len(s.Paints) > 0 {
 		mask |= uiSceneHasPaints
 	}
-	uiPackU8(b, uiSceneKindCode(s.Kind))
+	if more != 0 {
+		mask |= uiSceneHasMore
+	}
+	uiPackU8(b, uiSceneKindCode(kind))
 	uiPackU8(b, mask)
 
 	// A sprite unpainted is white, where every solid unpainted is grey. A picture
 	// already has its own colours and the tint multiplies them, so the default has
 	// to be the one that changes nothing; grey would quietly darken every sprite
-	// nobody had an opinion about.
+	// nobody had an opinion about. A mesh with colours of its own, and a light, are
+	// the same.
 	bare := "#cfd6de"
-	if s.Kind == "sprite" || s.Kind == "terrain" {
+	if kind == "sprite" || kind == "terrain" || kind == "lamp" || kind == "spot" || s.coloured {
 		bare = "#ffffff"
 	}
 	uiPackWord(b, uiSceneTone(uiScenePartEnum(p.paint), bare))
 	if mask&uiSceneHasAt != 0 {
-		uiSceneVecTo(b, uiScenePartNums(p.at, uiSceneOrigin))
+		uiSceneVecTo(b, where)
 	}
 	if mask&uiSceneHasTurn != 0 {
 		uiSceneVecTo(b, uiScenePartNums(p.turn, uiSceneOrigin))
 	}
 	if mask&uiSceneHasScale != 0 {
-		uiSceneVecTo(b, uiScenePartNums(p.scale, []float64{1, 1, 1}))
+		uiSceneVecTo(b, uiScenePartNums(p.scale, uiSceneOnes))
 	}
 	if mask&uiSceneHasSize != 0 {
-		uiPackU8(b, len(s.Nums))
-		for _, n := range s.Nums {
+		uiPackU8(b, len(nums))
+		for _, n := range nums {
 			uiPackF32(b, n)
 		}
 	}
@@ -706,6 +856,9 @@ func uiSceneShape(b *strings.Builder, s *UiShape) {
 	}
 	if mask&uiSceneHasWords != 0 {
 		uiPackLong(b, s.Text)
+		if kind == "mesh" {
+			uiMeshNamed(s.Text)
+		}
 	}
 	if mask&uiSceneHasPaints != 0 {
 		uiPackU8(b, len(s.Paints))
@@ -713,6 +866,82 @@ func uiSceneShape(b *strings.Builder, s *UiShape) {
 			uiPackWord(b, uiSceneTone(string(t), "#cfd6de"))
 		}
 	}
+	if more == 0 {
+		return
+	}
+	uiPackU16(b, more)
+	if more&uiSceneMoreMatrix != 0 {
+		for _, v := range place {
+			uiPackF32(b, v)
+		}
+	}
+	if more&uiSceneMoreLook != 0 {
+		uiPackF32(b, uiScenePartOne(p.rough, -1))
+		uiPackF32(b, uiScenePartOne(p.metal, -1))
+	}
+	if more&uiSceneMoreGlow != 0 {
+		uiPackF32(b, uiScenePartOne(p.glow, 0))
+	}
+	if more&uiSceneMoreFlags != 0 {
+		flags := 0
+		if p.unlit != nil && p.unlit.Flag {
+			flags |= 1
+		}
+		if p.wire != nil && p.wire.Flag {
+			flags |= 2
+		}
+		if p.shadows != nil && !p.shadows.Flag {
+			flags |= 4
+		}
+		uiPackU8(b, flags)
+	}
+	if more&uiSceneMoreTexture != 0 {
+		picture, relief := "", ""
+		if p.texture != nil {
+			picture = p.texture.Word
+		}
+		if p.relief != nil {
+			relief = p.relief.Word
+		}
+		uiPackWord(b, picture)
+		uiPackWord(b, relief)
+		tile := uiScenePartNums(p.tile, []float64{1, 1})
+		uiPackF32(b, tile[0])
+		uiPackF32(b, tile[1])
+	}
+	if more&uiSceneMorePlay != 0 {
+		uiPackWord(b, p.play.Word)
+		uiPackF32(b, uiScenePartOne(p.play, 0))
+		loop := 0
+		if p.play.Flag {
+			loop = 1
+		}
+		uiPackU8(b, loop)
+	}
+}
+
+// Which of the rest a shape's record carries.
+func uiSceneMoreOf(p *uiSceneParts, place *uiMat) int {
+	more := 0
+	if place != nil {
+		more |= uiSceneMoreMatrix
+	}
+	if p.rough != nil && len(p.rough.Nums) == 1 || p.metal != nil && len(p.metal.Nums) == 1 {
+		more |= uiSceneMoreLook
+	}
+	if p.glow != nil && len(p.glow.Nums) == 1 && p.glow.Nums[0] != 0 {
+		more |= uiSceneMoreGlow
+	}
+	if p.unlit != nil && p.unlit.Flag || p.wire != nil && p.wire.Flag || p.shadows != nil && !p.shadows.Flag {
+		more |= uiSceneMoreFlags
+	}
+	if p.texture != nil && p.texture.Word != "" || p.relief != nil && p.relief.Word != "" {
+		more |= uiSceneMoreTexture
+	}
+	if p.play != nil && p.play.Word != "" {
+		more |= uiSceneMorePlay
+	}
+	return more
 }
 
 // The kinds as numbers, which of a shape's parts its record carries, and which
@@ -732,6 +961,13 @@ const (
 	uiSceneRoof     = 9
 	uiSceneFigure   = 10
 	uiSceneTerrain  = 11
+	uiSceneTorus    = 12
+	uiSceneCapsule  = 13
+	uiSceneDisc     = 14
+	uiSceneMesh     = 15
+	uiSceneSign     = 16
+	uiSceneLamp     = 17
+	uiSceneSpot     = 18
 
 	uiSceneHasAt      = 1
 	uiSceneHasTurn    = 2
@@ -742,6 +978,14 @@ const (
 	uiSceneHasTrack   = 64
 	uiSceneHasPaints  = 128
 	uiSceneHasScale   = 32
+	uiSceneHasMore    = 64
+
+	uiSceneMoreMatrix  = 1
+	uiSceneMoreLook    = 2
+	uiSceneMoreGlow    = 4
+	uiSceneMoreFlags   = 8
+	uiSceneMoreTexture = 16
+	uiSceneMorePlay    = 32
 
 	uiSceneEyeLens  = 1
 	uiSceneEyeFog   = 2
@@ -779,6 +1023,20 @@ func uiSceneKindCode(kind string) int {
 		return uiSceneFigure
 	case "terrain":
 		return uiSceneTerrain
+	case "torus":
+		return uiSceneTorus
+	case "capsule":
+		return uiSceneCapsule
+	case "disc":
+		return uiSceneDisc
+	case "mesh":
+		return uiSceneMesh
+	case "sign":
+		return uiSceneSign
+	case "lamp":
+		return uiSceneLamp
+	case "spot":
+		return uiSceneSpot
 	}
 	return uiSceneBox
 }
@@ -844,6 +1102,1560 @@ func uiSceneVecTo(b *strings.Builder, nums []float64) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// More shapes: round ones the engine keeps a unit of, ones built here as a mesh,
+// a group, lights, and words that stand in the world
+// ---------------------------------------------------------------------------
+
+func UiTorus(attrs []UiAttr, radius float64, tube float64) UiShape {
+	return UiShape{Kind: "torus", Attrs: attrs, Nums: []float64{radius, tube}}
+}
+
+func UiCapsule(attrs []UiAttr, radius float64, height float64) UiShape {
+	return UiShape{Kind: "capsule", Attrs: attrs, Nums: []float64{radius, height}}
+}
+
+func UiDisc(attrs []UiAttr, inner float64, outer float64) UiShape {
+	return UiShape{Kind: "disc", Attrs: attrs, Nums: []float64{inner, outer}}
+}
+
+// A figure with nothing to pose and nothing to paint is a model as it stands in its file.
+func UiModel(attrs []UiAttr, file string) UiShape {
+	return UiShape{Kind: "figure", Attrs: attrs, Text: file}
+}
+
+func UiSign(attrs []UiAttr, words string, height float64) UiShape {
+	return UiShape{Kind: "sign", Attrs: attrs, Text: words, Nums: []float64{height}}
+}
+
+func UiGroup(attrs []UiAttr, shapes []UiShape) UiShape {
+	return UiShape{Kind: "group", Attrs: attrs, Parts: shapes}
+}
+
+func UiLamp(attrs []UiAttr, bright float64, reach float64) UiShape {
+	return UiShape{Kind: "lamp", Attrs: attrs, Nums: []float64{bright, reach}}
+}
+
+func UiSpot(attrs []UiAttr, bright float64, reach float64, cone float64) UiShape {
+	return UiShape{Kind: "spot", Attrs: attrs, Nums: []float64{bright, reach, cone}}
+}
+
+func UiAttrRough(v float64) UiAttr           { return uiNums("rough", []float64{v}) }
+func UiAttrMetal(v float64) UiAttr           { return uiNums("metal", []float64{v}) }
+func UiAttrGlow(v float64) UiAttr            { return uiNums("glow", []float64{v}) }
+func UiAttrUnlit(on bool) UiAttr             { return UiAttr{Kind: "unlit", Flag: on} }
+func UiAttrWire(on bool) UiAttr              { return UiAttr{Kind: "wire", Flag: on} }
+func UiAttrTexture(path string) UiAttr       { return uiStr("texture", path) }
+func UiAttrRelief(path string) UiAttr        { return uiStr("relief", path) }
+func UiAttrTile(across, down float64) UiAttr { return uiNums("tile", []float64{across, down}) }
+func UiAttrUvs(values []float64) UiAttr      { return uiNums("uvs", values) }
+func UiAttrTag(n int) UiAttr                 { return uiNum("tag", n) }
+func UiAttrToward(x, y, z float64) UiAttr    { return uiNums("toward", []float64{x, y, z}) }
+func UiAttrRoll(v float64) UiAttr            { return uiNums("roll", []float64{v}) }
+func UiAttrOrtho(height float64) UiAttr      { return uiNums("ortho", []float64{height}) }
+func UiAttrDepth(near, far float64) UiAttr   { return uiNums("depth", []float64{near, far}) }
+func UiAttrPanorama(path string) UiAttr      { return uiStr("panorama", path) }
+func UiAttrSnapshot(serial int) UiAttr       { return uiNum("snapshot", serial) }
+func UiAttrOnSnapshot(f func(string) any) UiAttr {
+	return UiAttr{Kind: "onSnapshot", heard: &uiHeard{FnStr: f}}
+}
+
+func UiAttrPlay(clip string, at float64, loop bool) UiAttr {
+	return UiAttr{Kind: "play", Word: clip, Nums: []float64{at}, Flag: loop}
+}
+
+func UiAttrOrbit(x, y, z, yaw, pitch, distance float64) UiAttr {
+	return uiNums("orbit", []float64{x, y, z, yaw, pitch, distance})
+}
+
+func UiAttrAmbient(tone UiTone, bright float64) UiAttr {
+	return UiAttr{Kind: "ambient", Word: string(tone), Nums: []float64{bright}}
+}
+
+func UiAttrSunlight(tone UiTone, bright float64) UiAttr {
+	return UiAttr{Kind: "sunlight", Word: string(tone), Nums: []float64{bright}}
+}
+
+func UiAttrOnHit(f func(int, float64, float64, float64) any) UiAttr {
+	return UiAttr{Kind: "onHit", heard: &uiHeard{FnHit: f}}
+}
+
+func UiAttrOnOver(f func(int, float64, float64, float64) any) UiAttr {
+	return UiAttr{Kind: "onOver", heard: &uiHeard{FnHit: f}}
+}
+
+// ---------------------------------------------------------------------------
+// Where a shape stands, as a matrix: what a group hands down to what it holds
+// ---------------------------------------------------------------------------
+
+// Three rows of x' = a·x + b·y + c·z + d.
+type uiMat [12]float64
+
+var uiMatOne = uiMat{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}
+
+func (m *uiMat) times(n *uiMat) uiMat {
+	var out uiMat
+	for r := 0; r < 3; r++ {
+		for c := 0; c < 4; c++ {
+			v := m[r*4]*n[c] + m[r*4+1]*n[4+c] + m[r*4+2]*n[8+c]
+			if c == 3 {
+				v += m[r*4+3]
+			}
+			out[r*4+c] = v
+		}
+	}
+	return out
+}
+
+func (m *uiMat) point(x, y, z float64) (float64, float64, float64) {
+	return m[0]*x + m[1]*y + m[2]*z + m[3], m[4]*x + m[5]*y + m[6]*z + m[7], m[8]*x + m[9]*y + m[10]*z + m[11]
+}
+
+func (m *uiMat) way(x, y, z float64) (float64, float64, float64) {
+	return m[0]*x + m[1]*y + m[2]*z, m[4]*x + m[5]*y + m[6]*z, m[8]*x + m[9]*y + m[10]*z
+}
+
+func (m *uiMat) inverse() (uiMat, bool) {
+	a, b, c, d, e, f, g, h, i := m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]
+	det := a*(e*i-f*h) - b*(d*i-f*g) + c*(d*h-e*g)
+	if math.Abs(det) < 1e-300 {
+		return uiMat{}, false
+	}
+	k := 1 / det
+	r := uiMat{
+		(e*i - f*h) * k, (c*h - b*i) * k, (b*f - c*e) * k, 0,
+		(f*g - d*i) * k, (a*i - c*g) * k, (c*d - a*f) * k, 0,
+		(d*h - e*g) * k, (b*g - a*h) * k, (a*e - b*d) * k, 0,
+	}
+	r[3] = -(r[0]*m[3] + r[1]*m[7] + r[2]*m[11])
+	r[7] = -(r[4]*m[3] + r[5]*m[7] + r[6]*m[11])
+	r[11] = -(r[8]*m[3] + r[9]*m[7] + r[10]*m[11])
+	return r, true
+}
+
+// The engine's turn: yaw about Y, then pitch about the shape's own X, then roll about its own Z.
+func uiTurned(x, y, z float64) [9]float64 {
+	a, b, c, d, e, f := math.Cos(x), math.Sin(x), math.Cos(y), math.Sin(y), math.Cos(z), math.Sin(z)
+	return [9]float64{
+		c*e + d*b*f, d*b*e - c*f, d * a,
+		a * f, a * e, -b,
+		c*b*f - d*e, d*f + c*b*e, c * a,
+	}
+}
+
+func uiPlacedAt(at, turn, scale []float64) uiMat {
+	r := uiTurned(turn[0], turn[1], turn[2])
+	return uiMat{
+		r[0] * scale[0], r[1] * scale[1], r[2] * scale[2], at[0],
+		r[3] * scale[0], r[4] * scale[1], r[5] * scale[2], at[1],
+		r[6] * scale[0], r[7] * scale[1], r[8] * scale[2], at[2],
+	}
+}
+
+var uiSceneOnes = []float64{1, 1, 1}
+
+func uiSceneLocal(p *uiSceneParts) uiMat {
+	return uiPlacedAt(uiScenePartNums(p.at, uiSceneOrigin), uiScenePartNums(p.turn, uiSceneOrigin),
+		uiScenePartNums(p.scale, uiSceneOnes))
+}
+
+// A shape as it is drawn: the group around it, if any, and the tag it answers to.
+type uiStood struct {
+	s   *UiShape
+	m   *uiMat
+	tag int
+}
+
+func uiSceneFlatten(shapes []UiShape, around *uiMat, tag int, out []uiStood) []uiStood {
+	for i := range shapes {
+		s := &shapes[i]
+		own := tag
+		if t, ok := uiFind(s.Attrs, "tag"); ok {
+			own = t.Num
+		}
+		if s.Kind != "group" {
+			out = append(out, uiStood{s: s, m: around, tag: own})
+			continue
+		}
+		p := uiScenePartsOf(s.Attrs)
+		local := uiSceneLocal(&p)
+		if around != nil {
+			local = around.times(&local)
+		}
+		out = uiSceneFlatten(s.Parts, &local, own, out)
+	}
+	return out
+}
+
+// A line between two places with a thickness is a round bar between them.
+func uiSceneBar(nums []float64, thick float64) uiMat {
+	ax, ay, az, bx, by, bz := nums[0], nums[1], nums[2], nums[3], nums[4], nums[5]
+	dx, dy, dz := bx-ax, by-ay, bz-az
+	long := math.Sqrt(dx*dx + dy*dy + dz*dz)
+	ux, uy, uz := 0.0, 1.0, 0.0
+	if long > 1e-12 {
+		ux, uy, uz = dx/long, dy/long, dz/long
+	}
+	// Any two directions square to the bar and to each other.
+	px, py, pz := 1.0, 0.0, 0.0
+	if math.Abs(ux) > 0.9 {
+		px, py, pz = 0, 0, 1
+	}
+	sx, sy, sz := py*uz-pz*uy, pz*ux-px*uz, px*uy-py*ux
+	sl := math.Sqrt(sx*sx + sy*sy + sz*sz)
+	sx, sy, sz = sx/sl, sy/sl, sz/sl
+	tx, ty, tz := sy*uz-sz*uy, sz*ux-sx*uz, sx*uy-sy*ux
+	r := thick / 2
+	return uiMat{
+		sx * r, ux * long, tx * r, (ax + bx) / 2,
+		sy * r, uy * long, ty * r, (ay + by) / 2,
+		sz * r, uz * long, tz * r, (az + bz) / 2,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Shapes built here: a mesh is points, which way each faces, two ways of laying
+// a picture on it and a colour each, and the triangles between them. It travels
+// as terrain does, by a name for what it is, and is fetched once.
+// ---------------------------------------------------------------------------
+
+type uiGeometry struct {
+	p, n   []float64 // x y z
+	uv     []float64 // a picture laid on it, 0 to 1
+	m      []float64 // a finish laid on it, in metres
+	c      []int     // 0xRRGGBB, or none
+	index  []uint32
+	smooth bool
+}
+
+type uiMeshHeld struct {
+	data   []byte
+	points []float32
+	index  []uint32
+	low    [3]float64
+	high   [3]float64
+	gen    uint64
+}
+
+var (
+	uiMeshLock  sync.Mutex
+	uiMeshData  = map[string]*uiMeshHeld{}
+	uiMeshBytes int
+	uiMeshGen   uint64
+)
+
+// Kept while a frame in the last two names it, and past that only while there is room.
+const uiMeshRoom = 96 << 20
+
+func uiSceneData(id string) ([]byte, bool) {
+	uiTerrainLock.Lock()
+	data, ok := uiTerrainData[id]
+	uiTerrainLock.Unlock()
+	if ok {
+		return data, true
+	}
+	uiMeshLock.Lock()
+	defer uiMeshLock.Unlock()
+	if held, ok := uiMeshData[id]; ok {
+		return held.data, true
+	}
+	return nil, false
+}
+
+func uiMeshOf(id string) *uiMeshHeld {
+	uiMeshLock.Lock()
+	defer uiMeshLock.Unlock()
+	return uiMeshData[id]
+}
+
+func uiMeshNamed(id string) {
+	uiMeshLock.Lock()
+	if held, ok := uiMeshData[id]; ok {
+		held.gen = uiMeshGen
+	}
+	uiMeshLock.Unlock()
+}
+
+func uiSceneFramed() {
+	uiMeshLock.Lock()
+	uiMeshGen++
+	uiMeshLock.Unlock()
+}
+
+func uiFaceNormals(g *uiGeometry) {
+	count := len(g.p) / 3
+	g.n = make([]float64, count*3)
+	for t := 0; t+2 < len(g.index); t += 3 {
+		i0, i1, i2 := int(g.index[t]), int(g.index[t+1]), int(g.index[t+2])
+		ax, ay, az := g.p[i1*3]-g.p[i0*3], g.p[i1*3+1]-g.p[i0*3+1], g.p[i1*3+2]-g.p[i0*3+2]
+		bx, by, bz := g.p[i2*3]-g.p[i0*3], g.p[i2*3+1]-g.p[i0*3+1], g.p[i2*3+2]-g.p[i0*3+2]
+		nx, ny, nz := ay*bz-az*by, az*bx-ax*bz, ax*by-ay*bx
+		for _, i := range [3]int{i0, i1, i2} {
+			g.n[i*3] += nx
+			g.n[i*3+1] += ny
+			g.n[i*3+2] += nz
+		}
+	}
+	for i := 0; i < count; i++ {
+		x, y, z := g.n[i*3], g.n[i*3+1], g.n[i*3+2]
+		l := math.Sqrt(x*x + y*y + z*z)
+		if l < 1e-20 {
+			g.n[i*3], g.n[i*3+1], g.n[i*3+2] = 0, 1, 0
+			continue
+		}
+		g.n[i*3], g.n[i*3+1], g.n[i*3+2] = x/l, y/l, z/l
+	}
+}
+
+// A finish laid on a point from the two axes it faces least, in metres.
+func uiBoxLaid(g *uiGeometry) {
+	count := len(g.p) / 3
+	g.m = make([]float64, count*2)
+	for i := 0; i < count; i++ {
+		x, y, z := g.p[i*3], g.p[i*3+1], g.p[i*3+2]
+		nx, ny, nz := math.Abs(g.n[i*3]), math.Abs(g.n[i*3+1]), math.Abs(g.n[i*3+2])
+		switch {
+		case ny >= nx && ny >= nz:
+			g.m[i*2], g.m[i*2+1] = x, z
+		case nx >= nz:
+			g.m[i*2], g.m[i*2+1] = z, y
+		default:
+			g.m[i*2], g.m[i*2+1] = x, y
+		}
+	}
+}
+
+func uiSceneMeshOf(attrs []UiAttr, g *uiGeometry) UiShape {
+	count := len(g.p) / 3
+	if count == 0 || len(g.index) < 3 {
+		return UiShape{Kind: "mesh", Attrs: attrs}
+	}
+	if len(g.n) != count*3 {
+		uiFaceNormals(g)
+	}
+	if len(g.m) != count*2 {
+		uiBoxLaid(g)
+	}
+	if len(g.uv) != count*2 {
+		g.uv = make([]float64, count*2)
+		low, high := [2]float64{math.Inf(1), math.Inf(1)}, [2]float64{math.Inf(-1), math.Inf(-1)}
+		for i := 0; i < count; i++ {
+			for k := 0; k < 2; k++ {
+				low[k], high[k] = math.Min(low[k], g.m[i*2+k]), math.Max(high[k], g.m[i*2+k])
+			}
+		}
+		for i := 0; i < count; i++ {
+			for k := 0; k < 2; k++ {
+				if span := high[k] - low[k]; span > 0 {
+					g.uv[i*2+k] = (g.m[i*2+k] - low[k]) / span
+				}
+			}
+		}
+	}
+	along := uiAlong(g)
+	const each = 17
+	data := make([]byte, 8+count*each*4+len(g.index)*4)
+	binary.LittleEndian.PutUint32(data[0:], uint32(count))
+	binary.LittleEndian.PutUint32(data[4:], uint32(len(g.index)))
+	held := &uiMeshHeld{points: make([]float32, count*3), index: g.index,
+		low: [3]float64{math.Inf(1), math.Inf(1), math.Inf(1)}, high: [3]float64{math.Inf(-1), math.Inf(-1), math.Inf(-1)}}
+	at := 8
+	put := func(v float64) {
+		binary.LittleEndian.PutUint32(data[at:], math.Float32bits(float32(v)))
+		at += 4
+	}
+	for i := 0; i < count; i++ {
+		for k := 0; k < 3; k++ {
+			put(g.p[i*3+k])
+			held.points[i*3+k] = float32(g.p[i*3+k])
+			held.low[k], held.high[k] = math.Min(held.low[k], g.p[i*3+k]), math.Max(held.high[k], g.p[i*3+k])
+		}
+		put(g.n[i*3])
+		put(g.n[i*3+1])
+		put(g.n[i*3+2])
+		put(g.uv[i*2])
+		put(g.uv[i*2+1])
+		put(g.m[i*2])
+		put(g.m[i*2+1])
+		c := 0xffffff
+		if i < len(g.c) {
+			c = g.c[i]
+		}
+		put(float64(c>>16&255) / 255)
+		put(float64(c>>8&255) / 255)
+		put(float64(c&255) / 255)
+		for k := 0; k < 4; k++ {
+			put(along[i*4+k])
+		}
+	}
+	for _, v := range g.index {
+		binary.LittleEndian.PutUint32(data[at:], v)
+		at += 4
+	}
+	h := uint64(1469598103934665603)
+	for _, v := range data {
+		h = (h ^ uint64(v)) * 1099511628211
+	}
+	id := "m" + strconv.FormatUint(h, 16)
+	held.data = data
+	uiMeshLock.Lock()
+	if old, ok := uiMeshData[id]; ok {
+		old.gen = uiMeshGen
+	} else {
+		held.gen = uiMeshGen
+		uiMeshData[id] = held
+		uiMeshBytes += len(data)
+		for uiMeshBytes > uiMeshRoom && uiMeshGen > 0 {
+			oldest, when := "", uiMeshGen-1
+			for k, v := range uiMeshData {
+				if v.gen < when {
+					oldest, when = k, v.gen
+				}
+			}
+			if oldest == "" {
+				break
+			}
+			uiMeshBytes -= len(uiMeshData[oldest].data)
+			delete(uiMeshData, oldest)
+		}
+	}
+	uiMeshLock.Unlock()
+	return UiShape{Kind: "mesh", Attrs: attrs, Text: id, coloured: len(g.c) > 0}
+}
+
+// Which way a picture's across runs at each point, and on which hand its down is.
+func uiAlong(g *uiGeometry) []float64 {
+	count := len(g.p) / 3
+	tan, bit := make([]float64, count*3), make([]float64, count*3)
+	for t := 0; t+2 < len(g.index); t += 3 {
+		i0, i1, i2 := int(g.index[t]), int(g.index[t+1]), int(g.index[t+2])
+		e1 := [3]float64{g.p[i1*3] - g.p[i0*3], g.p[i1*3+1] - g.p[i0*3+1], g.p[i1*3+2] - g.p[i0*3+2]}
+		e2 := [3]float64{g.p[i2*3] - g.p[i0*3], g.p[i2*3+1] - g.p[i0*3+1], g.p[i2*3+2] - g.p[i0*3+2]}
+		du1, dv1 := g.uv[i1*2]-g.uv[i0*2], g.uv[i1*2+1]-g.uv[i0*2+1]
+		du2, dv2 := g.uv[i2*2]-g.uv[i0*2], g.uv[i2*2+1]-g.uv[i0*2+1]
+		det := du1*dv2 - du2*dv1
+		if math.Abs(det) < 1e-12 {
+			continue
+		}
+		r := 1 / det
+		for k := 0; k < 3; k++ {
+			tk, bk := (e1[k]*dv2-e2[k]*dv1)*r, (e2[k]*du1-e1[k]*du2)*r
+			for _, i := range [3]int{i0, i1, i2} {
+				tan[i*3+k] += tk
+				bit[i*3+k] += bk
+			}
+		}
+	}
+	out := make([]float64, count*4)
+	for i := 0; i < count; i++ {
+		fx, fy, fz := g.n[i*3], g.n[i*3+1], g.n[i*3+2]
+		tx, ty, tz := tan[i*3], tan[i*3+1], tan[i*3+2]
+		d := fx*tx + fy*ty + fz*tz
+		x, y, z := tx-fx*d, ty-fy*d, tz-fz*d
+		l := math.Sqrt(x*x + y*y + z*z)
+		if l < 1e-9 {
+			if math.Abs(fx) < 0.9 {
+				x, y, z = 0, fz, -fy
+			} else {
+				x, y, z = -fz, 0, fx
+			}
+			l = math.Sqrt(x*x + y*y + z*z)
+		}
+		x, y, z = x/l, y/l, z/l
+		cx, cy, cz := fy*z-fz*y, fz*x-fx*z, fx*y-fy*x
+		hand := 1.0
+		if cx*bit[i*3]+cy*bit[i*3+1]+cz*bit[i*3+2] < 0 {
+			hand = -1
+		}
+		out[i*4], out[i*4+1], out[i*4+2], out[i*4+3] = x, y, z, hand
+	}
+	return out
+}
+
+func UiMesh(attrs []UiAttr, points []float64, triangles []int, colours []int) UiShape {
+	count := len(points) / 3
+	g := &uiGeometry{p: points[:count*3]}
+	for t := 0; t+2 < len(triangles); t += 3 {
+		a, b, c := triangles[t], triangles[t+1], triangles[t+2]
+		if a < 0 || b < 0 || c < 0 || a >= count || b >= count || c >= count {
+			continue
+		}
+		g.index = append(g.index, uint32(a), uint32(b), uint32(c))
+	}
+	if len(colours) > 0 {
+		g.c = make([]int, count)
+		for i := range g.c {
+			g.c[i] = 0xffffff
+			if i < len(colours) {
+				g.c[i] = colours[i]
+			}
+		}
+	}
+	if u, ok := uiFind(attrs, "uvs"); ok && len(u.Nums) >= count*2 {
+		g.uv = u.Nums[:count*2]
+	}
+	return uiSceneMeshOf(attrs, g)
+}
+
+// Sides enough that a round thing this big reads as round.
+func uiSides(radius float64) int {
+	return min(max(int(math.Ceil(radius*48)), 12), 48)
+}
+
+func UiTube(attrs []UiAttr, points []float64, radius float64) UiShape {
+	var path [][3]float64
+	for i := 0; i+2 < len(points); i += 3 {
+		p := [3]float64{points[i], points[i+1], points[i+2]}
+		if len(path) > 0 {
+			q := path[len(path)-1]
+			if math.Abs(p[0]-q[0])+math.Abs(p[1]-q[1])+math.Abs(p[2]-q[2]) < 1e-9 {
+				continue
+			}
+		}
+		path = append(path, p)
+	}
+	if len(path) < 2 || radius <= 0 {
+		return UiShape{Kind: "mesh", Attrs: attrs}
+	}
+	sides := uiSides(radius)
+	g := &uiGeometry{}
+	n := len(path)
+	ways := make([][3]float64, n)
+	for i := range path {
+		var d [3]float64
+		if i+1 < n {
+			d = uiUnit(uiSub(path[i+1], path[i]))
+		}
+		if i > 0 {
+			back := uiUnit(uiSub(path[i], path[i-1]))
+			d = uiUnit([3]float64{d[0] + back[0], d[1] + back[1], d[2] + back[2]})
+			if d == ([3]float64{}) {
+				d = back
+			}
+		}
+		ways[i] = d
+	}
+	// Carried along the path rather than worked out afresh, so the tube does not twist.
+	side := [3]float64{1, 0, 0}
+	if math.Abs(ways[0][0]) > 0.9 {
+		side = [3]float64{0, 0, 1}
+	}
+	length, run := 0.0, make([]float64, n)
+	for i := 1; i < n; i++ {
+		length += uiLen(uiSub(path[i], path[i-1]))
+		run[i] = length
+	}
+	for i := range path {
+		w := ways[i]
+		next := uiUnit(uiSub(side, uiScale(w, uiDot(side, w))))
+		if next == ([3]float64{}) {
+			next = uiUnit(uiCross3(w, [3]float64{0, 1, 0}))
+			if next == ([3]float64{}) {
+				next = uiUnit(uiCross3(w, [3]float64{1, 0, 0}))
+			}
+		}
+		side = next
+		up := uiCross3(w, side)
+		// Where the path bends, the ring is the cut between the two straight runs: stretched across the bend.
+		var bend [3]float64
+		stretch := 0.0
+		if i > 0 && i+1 < n {
+			in := uiUnit(uiSub(path[i], path[i-1]))
+			c := uiDot(in, w)
+			bend = uiUnit(uiSub(in, uiScale(w, c)))
+			stretch = 1/math.Max(c, 0.25) - 1
+		}
+		for k := 0; k <= sides; k++ {
+			a := 2 * math.Pi * float64(k) / float64(sides)
+			ca, sa := math.Cos(a), math.Sin(a)
+			nx, ny, nz := side[0]*ca+up[0]*sa, side[1]*ca+up[1]*sa, side[2]*ca+up[2]*sa
+			out := uiScale([3]float64{nx, ny, nz}, radius)
+			out = [3]float64{out[0] + bend[0]*radius*stretch*uiDot([3]float64{nx, ny, nz}, bend),
+				out[1] + bend[1]*radius*stretch*uiDot([3]float64{nx, ny, nz}, bend),
+				out[2] + bend[2]*radius*stretch*uiDot([3]float64{nx, ny, nz}, bend)}
+			g.p = append(g.p, path[i][0]+out[0], path[i][1]+out[1], path[i][2]+out[2])
+			g.n = append(g.n, nx, ny, nz)
+			g.uv = append(g.uv, run[i]/math.Max(length, 1e-12), float64(k)/float64(sides))
+			g.m = append(g.m, run[i], float64(k)/float64(sides)*2*math.Pi*radius)
+		}
+	}
+	for i := 0; i+1 < n; i++ {
+		for k := 0; k < sides; k++ {
+			a := uint32(i*(sides+1) + k)
+			b := a + uint32(sides+1)
+			g.index = append(g.index, a, a+1, b, b, a+1, b+1)
+		}
+	}
+	for end := 0; end < 2; end++ {
+		i, face := 0, uiScale(ways[0], -1)
+		if end == 1 {
+			i, face = n-1, ways[n-1]
+		}
+		middle := uint32(len(g.p) / 3)
+		g.p = append(g.p, path[i][0], path[i][1], path[i][2])
+		g.n = append(g.n, face[0], face[1], face[2])
+		g.uv = append(g.uv, 0.5, 0.5)
+		g.m = append(g.m, 0, 0)
+		ring := uint32(i * (sides + 1))
+		for k := 0; k <= sides; k++ {
+			at := (ring + uint32(k)) * 3
+			x, y, z := g.p[at], g.p[at+1], g.p[at+2]
+			a := 2 * math.Pi * float64(k) / float64(sides)
+			g.p = append(g.p, x, y, z)
+			g.n = append(g.n, face[0], face[1], face[2])
+			g.uv = append(g.uv, 0.5+0.5*math.Cos(a), 0.5+0.5*math.Sin(a))
+			g.m = append(g.m, radius*math.Cos(a), radius*math.Sin(a))
+		}
+		for k := uint32(0); k < uint32(sides); k++ {
+			if end == 0 {
+				g.index = append(g.index, middle, middle+2+k, middle+1+k)
+			} else {
+				g.index = append(g.index, middle, middle+1+k, middle+2+k)
+			}
+		}
+	}
+	return uiSceneMeshOf(attrs, g)
+}
+
+// Ear by ear, for an outline that does not cross itself, wound either way.
+func uiEars(xs, zs []float64) []uint32 {
+	n := len(xs)
+	if n < 3 {
+		return nil
+	}
+	area := 0.0
+	for i := 0; i < n; i++ {
+		j := (i + 1) % n
+		area += xs[i]*zs[j] - xs[j]*zs[i]
+	}
+	left := make([]int, n)
+	for i := range left {
+		left[i] = i
+	}
+	if area < 0 {
+		for i, j := 0, n-1; i < j; i, j = i+1, j-1 {
+			left[i], left[j] = left[j], left[i]
+		}
+	}
+	turn := func(a, b, c int) float64 {
+		return (xs[b]-xs[a])*(zs[c]-zs[a]) - (zs[b]-zs[a])*(xs[c]-xs[a])
+	}
+	inside := func(p, a, b, c int) bool {
+		return turn(a, b, p) >= 0 && turn(b, c, p) >= 0 && turn(c, a, p) >= 0
+	}
+	var out []uint32
+	for guard := 0; len(left) > 3 && guard < n*n; guard++ {
+		cut := false
+		for i := range left {
+			a, b, c := left[(i+len(left)-1)%len(left)], left[i], left[(i+1)%len(left)]
+			if turn(a, b, c) <= 0 {
+				continue
+			}
+			ear := true
+			for _, p := range left {
+				if p != a && p != b && p != c && inside(p, a, b, c) {
+					ear = false
+					break
+				}
+			}
+			if !ear {
+				continue
+			}
+			out = append(out, uint32(a), uint32(b), uint32(c))
+			left = append(left[:i], left[i+1:]...)
+			cut = true
+			break
+		}
+		if !cut {
+			break
+		}
+	}
+	if len(left) == 3 {
+		out = append(out, uint32(left[0]), uint32(left[1]), uint32(left[2]))
+	}
+	return out
+}
+
+func UiExtrude(attrs []UiAttr, outline []float64, height float64) UiShape {
+	var xs, zs []float64
+	for i := 0; i+1 < len(outline); i += 2 {
+		x, z := outline[i], outline[i+1]
+		if k := len(xs); k > 0 && math.Abs(x-xs[k-1])+math.Abs(z-zs[k-1]) < 1e-9 {
+			continue
+		}
+		xs, zs = append(xs, x), append(zs, z)
+	}
+	if k := len(xs); k > 1 && math.Abs(xs[0]-xs[k-1])+math.Abs(zs[0]-zs[k-1]) < 1e-9 {
+		xs, zs = xs[:k-1], zs[:k-1]
+	}
+	n := len(xs)
+	if n < 3 {
+		return UiShape{Kind: "mesh", Attrs: attrs}
+	}
+	area := 0.0
+	for i := 0; i < n; i++ {
+		j := (i + 1) % n
+		area += xs[i]*zs[j] - xs[j]*zs[i]
+	}
+	// Seen from above, x to the right and z toward the viewer: positive area runs clockwise.
+	way := 1.0
+	if area < 0 {
+		way = -1
+	}
+	lowX, lowZ, highX, highZ := xs[0], zs[0], xs[0], zs[0]
+	for i := range xs {
+		lowX, highX = math.Min(lowX, xs[i]), math.Max(highX, xs[i])
+		lowZ, highZ = math.Min(lowZ, zs[i]), math.Max(highZ, zs[i])
+	}
+	g := &uiGeometry{}
+	ears := uiEars(xs, zs)
+	for cap := 0; cap < 2; cap++ {
+		y, ny := 0.0, -1.0
+		if cap == 1 {
+			y, ny = height, 1
+		}
+		base := uint32(len(g.p) / 3)
+		for i := range xs {
+			g.p = append(g.p, xs[i], y, zs[i])
+			g.n = append(g.n, 0, ny, 0)
+			g.uv = append(g.uv, uiShareOf(xs[i], lowX, highX), uiShareOf(zs[i], lowZ, highZ))
+			g.m = append(g.m, xs[i], zs[i])
+		}
+		for t := 0; t+2 < len(ears); t += 3 {
+			a, b, c := base+ears[t], base+ears[t+1], base+ears[t+2]
+			if cap == 1 {
+				g.index = append(g.index, a, c, b)
+			} else {
+				g.index = append(g.index, a, b, c)
+			}
+		}
+	}
+	// A wall's corner is sharp where the outline turns sharply, and smooth where it only bends.
+	perimeter, run := 0.0, make([]float64, n+1)
+	for i := 0; i < n; i++ {
+		j := (i + 1) % n
+		perimeter += math.Hypot(xs[j]-xs[i], zs[j]-zs[i])
+		run[i+1] = perimeter
+	}
+	face := func(i int) (float64, float64) {
+		j := (i + 1) % n
+		dx, dz := xs[j]-xs[i], zs[j]-zs[i]
+		l := math.Hypot(dx, dz)
+		return dz / l * way, -dx / l * way
+	}
+	for i := 0; i < n; i++ {
+		j := (i + 1) % n
+		fx, fz := face(i)
+		ends := [2][2]float64{{fx, fz}, {fx, fz}}
+		for e, k := range [2]int{(i + n - 1) % n, j} {
+			ox, oz := face(k)
+			if fx*ox+fz*oz > 0.866 {
+				sx, sz := fx+ox, fz+oz
+				l := math.Hypot(sx, sz)
+				ends[e] = [2]float64{sx / l, sz / l}
+			}
+		}
+		base := uint32(len(g.p) / 3)
+		for _, c := range [4][2]int{{i, 0}, {j, 0}, {j, 1}, {i, 1}} {
+			k, up := c[0], c[1]
+			e := 0
+			if k == j {
+				e = 1
+			}
+			along := run[i]
+			if k == j {
+				along = run[i+1]
+			}
+			g.p = append(g.p, xs[k], float64(up)*height, zs[k])
+			g.n = append(g.n, ends[e][0], 0, ends[e][1])
+			g.uv = append(g.uv, along/perimeter, float64(up))
+			g.m = append(g.m, along, float64(up)*height)
+		}
+		if way > 0 {
+			g.index = append(g.index, base, base+2, base+1, base, base+3, base+2)
+		} else {
+			g.index = append(g.index, base, base+1, base+2, base, base+2, base+3)
+		}
+	}
+	return uiSceneMeshOf(attrs, g)
+}
+
+func uiShareOf(v, low, high float64) float64 {
+	if high-low <= 0 {
+		return 0
+	}
+	return (v - low) / (high - low)
+}
+
+func UiLathe(attrs []UiAttr, profile []float64, sides int) UiShape {
+	var rs, hs []float64
+	for i := 0; i+1 < len(profile); i += 2 {
+		r, h := math.Max(0, profile[i]), profile[i+1]
+		if k := len(rs); k > 0 && math.Abs(r-rs[k-1])+math.Abs(h-hs[k-1]) < 1e-9 {
+			continue
+		}
+		rs, hs = append(rs, r), append(hs, h)
+	}
+	n := len(rs)
+	if n < 2 {
+		return UiShape{Kind: "mesh", Attrs: attrs}
+	}
+	sides = min(max(sides, 3), 256)
+	along, run := 0.0, make([]float64, n)
+	for i := 1; i < n; i++ {
+		along += math.Hypot(rs[i]-rs[i-1], hs[i]-hs[i-1])
+		run[i] = along
+	}
+	widest := 0.0
+	for _, r := range rs {
+		widest = math.Max(widest, r)
+	}
+	// Each segment's outward way in the profile's plane, and where two meet at a sharp angle the point is doubled.
+	slope := func(i int) (float64, float64) {
+		dr, dh := rs[i+1]-rs[i], hs[i+1]-hs[i]
+		l := math.Hypot(dr, dh)
+		return dh / l, -dr / l
+	}
+	g := &uiGeometry{}
+	type row struct {
+		r, h, nr, nh, at float64
+	}
+	var rows []row
+	for i := 0; i < n; i++ {
+		var in, out [2]float64
+		has := [2]bool{i > 0, i+1 < n}
+		if has[0] {
+			in[0], in[1] = slope(i - 1)
+		}
+		if has[1] {
+			out[0], out[1] = slope(i)
+		}
+		switch {
+		case has[0] && has[1] && in[0]*out[0]+in[1]*out[1] > 0.7:
+			sr, sh := in[0]+out[0], in[1]+out[1]
+			l := math.Hypot(sr, sh)
+			rows = append(rows, row{rs[i], hs[i], sr / l, sh / l, run[i]})
+		case has[0] && has[1]:
+			rows = append(rows, row{rs[i], hs[i], in[0], in[1], run[i]}, row{rs[i], hs[i], out[0], out[1], run[i]})
+		case has[0]:
+			rows = append(rows, row{rs[i], hs[i], in[0], in[1], run[i]})
+		default:
+			rows = append(rows, row{rs[i], hs[i], out[0], out[1], run[i]})
+		}
+	}
+	for _, w := range rows {
+		for k := 0; k <= sides; k++ {
+			a := 2 * math.Pi * float64(k) / float64(sides)
+			s, c := math.Sin(a), math.Cos(a)
+			g.p = append(g.p, w.r*s, w.h, w.r*c)
+			g.n = append(g.n, w.nr*s, w.nh, w.nr*c)
+			g.uv = append(g.uv, float64(k)/float64(sides), w.at/math.Max(along, 1e-12))
+			g.m = append(g.m, float64(k)/float64(sides)*2*math.Pi*widest, w.at)
+		}
+	}
+	for i := 0; i+1 < len(rows); i++ {
+		if rows[i].r == rows[i+1].r && rows[i].h == rows[i+1].h {
+			continue
+		}
+		for k := 0; k < sides; k++ {
+			a := uint32(i*(sides+1) + k)
+			b := a + uint32(sides+1)
+			g.index = append(g.index, a, a+1, b, b, a+1, b+1)
+		}
+	}
+	return uiSceneMeshOf(attrs, g)
+}
+
+func UiCloud(attrs []UiAttr, points []float64, size float64) UiShape {
+	count := len(points) / 3
+	if count == 0 || size <= 0 {
+		return UiShape{Kind: "mesh", Attrs: attrs}
+	}
+	r := size / 2
+	ways := [6][3]float64{{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}}
+	faces := [8][3]uint32{{0, 2, 4}, {4, 2, 1}, {1, 2, 5}, {5, 2, 0}, {4, 3, 0}, {1, 3, 4}, {5, 3, 1}, {0, 3, 5}}
+	g := &uiGeometry{p: make([]float64, 0, count*18), n: make([]float64, 0, count*18)}
+	for i := 0; i < count; i++ {
+		x, y, z := points[i*3], points[i*3+1], points[i*3+2]
+		base := uint32(i * 6)
+		for _, w := range ways {
+			g.p = append(g.p, x+w[0]*r, y+w[1]*r, z+w[2]*r)
+			g.n = append(g.n, w[0], w[1], w[2])
+		}
+		for _, f := range faces {
+			g.index = append(g.index, base+f[0], base+f[1], base+f[2])
+		}
+	}
+	return uiSceneMeshOf(attrs, g)
+}
+
+func uiSub(a, b [3]float64) [3]float64 { return [3]float64{a[0] - b[0], a[1] - b[1], a[2] - b[2]} }
+func uiDot(a, b [3]float64) float64    { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2] }
+func uiLen(a [3]float64) float64       { return math.Sqrt(uiDot(a, a)) }
+func uiScale(a [3]float64, k float64) [3]float64 {
+	return [3]float64{a[0] * k, a[1] * k, a[2] * k}
+}
+func uiCross3(a, b [3]float64) [3]float64 {
+	return [3]float64{a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0]}
+}
+func uiUnit(a [3]float64) [3]float64 {
+	l := uiLen(a)
+	if l < 1e-12 {
+		return [3]float64{}
+	}
+	return uiScale(a, 1/l)
+}
+
+// ---------------------------------------------------------------------------
+// What is under a point of the picture: the camera's ray, cast here against
+// every shape the scene holds, so a window and a page answer alike
+// ---------------------------------------------------------------------------
+
+type uiPick struct {
+	kind   string
+	m      uiMat
+	tag    int
+	q, q2  float64
+	id     string
+	wide   float64
+	tall   float64
+	facing bool
+}
+
+type uiPicks struct {
+	all []uiPick
+}
+
+// Where the eye is and how it is turned once orbit and toward have had their say.
+func uiSceneEyeOf(attrs []UiAttr) ([3]float64, float64, float64) {
+	e := uiSceneNums(attrs, "eye", uiSceneEyeAt)
+	a := uiSceneNums(attrs, "aim", uiSceneAimAt)
+	eye, yaw, pitch := [3]float64{e[0], e[1], e[2]}, a[0], a[1]
+	if o, ok := uiFind(attrs, "orbit"); ok && len(o.Nums) == 6 {
+		yaw, pitch = o.Nums[3], o.Nums[4]
+		ahead := uiAhead(yaw, pitch)
+		eye = [3]float64{o.Nums[0] - ahead[0]*o.Nums[5], o.Nums[1] - ahead[1]*o.Nums[5], o.Nums[2] - ahead[2]*o.Nums[5]}
+	}
+	if t, ok := uiFind(attrs, "toward"); ok && len(t.Nums) == 3 {
+		d := uiUnit([3]float64{t.Nums[0] - eye[0], t.Nums[1] - eye[1], t.Nums[2] - eye[2]})
+		if d != ([3]float64{}) {
+			pitch = math.Asin(math.Max(-1, math.Min(1, d[1])))
+			if math.Abs(d[1]) < 1-1e-12 {
+				yaw = math.Atan2(-d[0], -d[2])
+			}
+		}
+	}
+	return eye, yaw, pitch
+}
+
+func uiAhead(yaw, pitch float64) [3]float64 {
+	return [3]float64{-math.Sin(yaw) * math.Cos(pitch), math.Sin(pitch), -math.Cos(yaw) * math.Cos(pitch)}
+}
+
+// The ray through a point of a picture so wide and so tall, in the world.
+func uiSceneRay(attrs []UiAttr, x, y, wide, tall float64) ([3]float64, [3]float64) {
+	eye, yaw, pitch := uiSceneEyeOf(attrs)
+	r := uiTurned(pitch, yaw, uiSceneOne(attrs, "roll", 0))
+	turn := func(v [3]float64) [3]float64 {
+		return [3]float64{r[0]*v[0] + r[1]*v[1] + r[2]*v[2], r[3]*v[0] + r[4]*v[1] + r[5]*v[2], r[6]*v[0] + r[7]*v[1] + r[8]*v[2]}
+	}
+	aspect := wide / math.Max(tall, 1e-9)
+	nx, ny := 2*x/math.Max(wide, 1e-9)-1, 1-2*y/math.Max(tall, 1e-9)
+	if o := uiSceneOne(attrs, "ortho", 0); o > 0 {
+		off := turn([3]float64{nx * o / 2 * aspect, ny * o / 2, 0})
+		return [3]float64{eye[0] + off[0], eye[1] + off[1], eye[2] + off[2]}, turn([3]float64{0, 0, -1})
+	}
+	lens := 75.0
+	if l, ok := uiFind(attrs, "lens"); ok && l.Num > 0 {
+		lens = float64(l.Num)
+	}
+	half := math.Tan(lens * math.Pi / 360)
+	return eye, uiUnit(turn([3]float64{nx * half * aspect, ny * half, -1}))
+}
+
+// The size the engine stretches a kind's unit shape to.
+func uiSceneStretch(s *UiShape) [3]float64 {
+	d := func(i int) float64 {
+		if i < len(s.Nums) {
+			return s.Nums[i]
+		}
+		return 1
+	}
+	var v [3]float64
+	switch s.Kind {
+	case "sphere":
+		v = [3]float64{d(0), d(0), d(0)}
+	case "cylinder":
+		v = [3]float64{d(0), d(1), d(0)}
+	case "cone":
+		w := math.Max(d(0), d(1))
+		v = [3]float64{w, d(2), w}
+	case "ground":
+		v = [3]float64{d(0), 1, d(1)}
+	case "torus":
+		w := d(0) + d(1)
+		v = [3]float64{w, w, w}
+	case "capsule":
+		w := math.Max(d(1), 2*d(0))
+		v = [3]float64{w, w, w}
+	case "disc":
+		v = [3]float64{d(1), 1, d(1)}
+	case "mesh", "figure", "sign", "terrain":
+		v = [3]float64{1, 1, 1}
+	default:
+		v = [3]float64{d(0), d(1), d(2)}
+	}
+	for i := range v {
+		v[i] = math.Max(v[i], 0.0001)
+	}
+	return v
+}
+
+func uiScenePicksOf(placed []uiStood) *uiPicks {
+	out := &uiPicks{}
+	for _, p := range placed {
+		s := p.s
+		parts := uiScenePartsOf(s.Attrs)
+		pick := uiPick{kind: s.Kind, tag: p.tag, id: s.Text}
+		switch s.Kind {
+		case "sound", "lamp", "spot", "label":
+			continue
+		case "line":
+			t, ok := uiFind(s.Attrs, "thick")
+			if !ok || len(t.Nums) != 1 || t.Nums[0] <= 0 || len(s.Nums) != 6 {
+				continue
+			}
+			bar := uiSceneBar(s.Nums, t.Nums[0])
+			if p.m != nil {
+				bar = p.m.times(&bar)
+			}
+			out.all = append(out.all, uiPick{kind: "cylinder", m: bar, tag: p.tag})
+			continue
+		case "sprite":
+			if len(s.Nums) < 2 {
+				continue
+			}
+			at := uiScenePartNums(parts.at, uiSceneOrigin)
+			x, y, z := at[0], at[1], at[2]
+			if p.m != nil {
+				x, y, z = p.m.point(x, y, z)
+			}
+			pick.m = uiMat{1, 0, 0, x, 0, 1, 0, y, 0, 0, 1, z}
+			pick.wide, pick.tall, pick.facing = math.Abs(s.Nums[0]), math.Abs(s.Nums[1]), true
+			out.all = append(out.all, pick)
+			continue
+		}
+		world := uiSceneLocal(&parts)
+		if s.Kind == "terrain" {
+			world = uiPlacedAt(uiScenePartNums(parts.at, uiSceneOrigin), uiScenePartNums(parts.turn, uiSceneOrigin), uiSceneOnes)
+		}
+		if p.m != nil {
+			world = p.m.times(&world)
+		}
+		size := uiSceneStretch(s)
+		stretch := uiMat{size[0], 0, 0, 0, 0, size[1], 0, 0, 0, 0, size[2], 0}
+		pick.m = world.times(&stretch)
+		num := func(i int) float64 {
+			if i < len(s.Nums) {
+				return s.Nums[i]
+			}
+			return 1
+		}
+		switch s.Kind {
+		case "cone":
+			w := math.Max(math.Max(num(0), num(1)), 1e-12)
+			pick.q, pick.q2 = num(0)/w, num(1)/w
+		case "torus":
+			pick.q = num(1) / math.Max(num(0)+num(1), 1e-12)
+		case "capsule":
+			pick.q = 2 * num(0) / math.Max(math.Max(num(1), 2*num(0)), 1e-12)
+		case "disc":
+			pick.q = num(0) / math.Max(num(1), 1e-12)
+		case "sign":
+			pick.tall = num(0)
+			pick.wide = UiMeasure(s.Text, num(0))
+		}
+		out.all = append(out.all, pick)
+	}
+	return out
+}
+
+// The nearest thing a ray meets: its tag, and where; false where it meets nothing.
+func (ps *uiPicks) cast(o, d [3]float64) (int, [3]float64, bool) {
+	best, tag := math.Inf(1), -1
+	for i := range ps.all {
+		p := &ps.all[i]
+		var t float64
+		var ok bool
+		if p.facing {
+			t, ok = uiHitFacing(p, o, d)
+		} else {
+			inv, fine := p.m.inverse()
+			if !fine {
+				continue
+			}
+			var lo, ld [3]float64
+			lo[0], lo[1], lo[2] = inv.point(o[0], o[1], o[2])
+			ld[0], ld[1], ld[2] = inv.way(d[0], d[1], d[2])
+			t, ok = uiHitUnit(p, lo, ld)
+		}
+		if ok && t > 1e-9 && t < best {
+			best, tag = t, p.tag
+		}
+	}
+	if math.IsInf(best, 1) {
+		return -1, [3]float64{}, false
+	}
+	return tag, [3]float64{o[0] + d[0]*best, o[1] + d[1]*best, o[2] + d[2]*best}, true
+}
+
+// A picture that turns to face the eye, standing on its place.
+func uiHitFacing(p *uiPick, o, d [3]float64) (float64, bool) {
+	at := [3]float64{p.m[3], p.m[7], p.m[11]}
+	face := uiScale(d, -1)
+	den := uiDot(d, face)
+	if math.Abs(den) < 1e-12 {
+		return 0, false
+	}
+	t := uiDot(uiSub(at, o), face) / den
+	hit := uiSub([3]float64{o[0] + d[0]*t, o[1] + d[1]*t, o[2] + d[2]*t}, at)
+	right := uiUnit(uiCross3([3]float64{0, 1, 0}, face))
+	if right == ([3]float64{}) {
+		right = [3]float64{1, 0, 0}
+	}
+	up := uiCross3(face, right)
+	across, high := uiDot(hit, right), uiDot(hit, up)
+	return t, math.Abs(across) <= p.wide/2 && high >= 0 && high <= p.tall
+}
+
+func uiHitUnit(p *uiPick, o, d [3]float64) (float64, bool) {
+	switch p.kind {
+	case "sphere":
+		return uiHitBall(o, d, 1)
+	case "cylinder":
+		return uiHitCone(o, d, 1, 1)
+	case "cone":
+		return uiHitCone(o, d, p.q, p.q2)
+	case "ground":
+		return uiHitFlat(o, d, func(x, z float64) bool { return math.Abs(x) <= 0.5 && math.Abs(z) <= 0.5 })
+	case "disc":
+		return uiHitFlat(o, d, func(x, z float64) bool { r := math.Hypot(x, z); return r <= 1 && r >= p.q })
+	case "sign":
+		return uiHitFlatZ(o, d, func(x, y float64) bool { return math.Abs(x) <= p.wide/2 && math.Abs(y) <= p.tall/2 })
+	case "torus":
+		r, big := p.q, 1-p.q
+		return uiTraced(o, d, 1, func(x, y, z float64) float64 { return math.Hypot(math.Hypot(x, z)-big, y) - r })
+	case "capsule":
+		r, h := p.q/2, math.Max(0, 0.5-p.q/2)
+		return uiTraced(o, d, 0.5, func(x, y, z float64) float64 {
+			lift := math.Max(math.Abs(y)-h, 0)
+			return math.Sqrt(x*x+z*z+lift*lift) - r
+		})
+	case "roof":
+		return uiHitTriangles(o, d, uiRoofPoints, uiRoofIndex)
+	case "mesh":
+		held := uiMeshOf(p.id)
+		if held == nil {
+			return 0, false
+		}
+		if _, ok := uiHitBox(o, d, held.low, held.high); !ok {
+			return 0, false
+		}
+		return uiHitTriangles(o, d, held.points, held.index)
+	case "terrain":
+		return uiHitLand(p.id, o, d)
+	case "figure":
+		low, high, ok := uiModelBox(p.id)
+		if !ok {
+			return 0, false
+		}
+		return uiHitBox(o, d, low, high)
+	}
+	return uiHitBox(o, d, [3]float64{-0.5, -0.5, -0.5}, [3]float64{0.5, 0.5, 0.5})
+}
+
+func uiHitBox(o, d, low, high [3]float64) (float64, bool) {
+	near, far := math.Inf(-1), math.Inf(1)
+	for k := 0; k < 3; k++ {
+		if math.Abs(d[k]) < 1e-15 {
+			if o[k] < low[k] || o[k] > high[k] {
+				return 0, false
+			}
+			continue
+		}
+		a, b := (low[k]-o[k])/d[k], (high[k]-o[k])/d[k]
+		if a > b {
+			a, b = b, a
+		}
+		near, far = math.Max(near, a), math.Min(far, b)
+	}
+	if near > far || far < 0 {
+		return 0, false
+	}
+	if near < 0 {
+		return far, true
+	}
+	return near, true
+}
+
+func uiHitBall(o, d [3]float64, r float64) (float64, bool) {
+	a, b, c := uiDot(d, d), 2*uiDot(o, d), uiDot(o, o)-r*r
+	return uiNearRoot(a, b, c, func(float64) bool { return true })
+}
+
+func uiNearRoot(a, b, c float64, fits func(float64) bool) (float64, bool) {
+	if math.Abs(a) < 1e-18 {
+		if math.Abs(b) < 1e-18 {
+			return 0, false
+		}
+		t := -c / b
+		return t, t > 0 && fits(t)
+	}
+	disc := b*b - 4*a*c
+	if disc < 0 {
+		return 0, false
+	}
+	s := math.Sqrt(disc)
+	t0, t1 := (-b-s)/(2*a), (-b+s)/(2*a)
+	if t0 > t1 {
+		t0, t1 = t1, t0
+	}
+	if t0 > 0 && fits(t0) {
+		return t0, true
+	}
+	if t1 > 0 && fits(t1) {
+		return t1, true
+	}
+	return 0, false
+}
+
+// A side between a top and a bottom radius, half a unit up and down, and the two ends.
+func uiHitCone(o, d [3]float64, top, bottom float64) (float64, bool) {
+	k := bottom - top
+	base := top + 0.5*k
+	at := func(t float64) [3]float64 { return [3]float64{o[0] + d[0]*t, o[1] + d[1]*t, o[2] + d[2]*t} }
+	best, hit := math.Inf(1), false
+	a := d[0]*d[0] + d[2]*d[2] - k*k*d[1]*d[1]
+	b := 2 * (o[0]*d[0] + o[2]*d[2] + k*d[1]*(base-k*o[1]))
+	c := o[0]*o[0] + o[2]*o[2] - (base-k*o[1])*(base-k*o[1])
+	side := func(t float64) bool { y := at(t)[1]; return math.Abs(y) <= 0.5 && base-k*y >= 0 }
+	if t, ok := uiNearRoot(a, b, c, side); ok {
+		best, hit = t, true
+	}
+	for _, end := range [2][2]float64{{0.5, top}, {-0.5, bottom}} {
+		if math.Abs(d[1]) < 1e-15 || end[1] <= 0 {
+			continue
+		}
+		t := (end[0] - o[1]) / d[1]
+		p := at(t)
+		if t > 0 && p[0]*p[0]+p[2]*p[2] <= end[1]*end[1] && t < best {
+			best, hit = t, true
+		}
+	}
+	return best, hit
+}
+
+func uiHitFlat(o, d [3]float64, in func(x, z float64) bool) (float64, bool) {
+	if math.Abs(d[1]) < 1e-15 {
+		return 0, false
+	}
+	t := -o[1] / d[1]
+	return t, t > 0 && in(o[0]+d[0]*t, o[2]+d[2]*t)
+}
+
+func uiHitFlatZ(o, d [3]float64, in func(x, y float64) bool) (float64, bool) {
+	if math.Abs(d[2]) < 1e-15 {
+		return 0, false
+	}
+	t := -o[2] / d[2]
+	return t, t > 0 && in(o[0]+d[0]*t, o[1]+d[1]*t)
+}
+
+// Stepped along by how far the nearest surface is, from where the ray enters a ball around it.
+func uiTraced(o, d [3]float64, reach float64, far func(x, y, z float64) float64) (float64, bool) {
+	l := uiLen(d)
+	if l < 1e-18 {
+		return 0, false
+	}
+	u := uiScale(d, 1/l)
+	start, end := 0.0, 0.0
+	if from := uiLen(o); from <= reach*1.001 {
+		end = from + reach*1.002
+	} else {
+		t, ok := uiHitBall(o, u, reach*1.001)
+		if !ok {
+			return 0, false
+		}
+		start, end = t, t+2*reach*1.002
+	}
+	for t, i := start, 0; t <= end && i < 512; i++ {
+		gap := far(o[0]+u[0]*t, o[1]+u[1]*t, o[2]+u[2]*t)
+		if gap < 1e-6 {
+			return t / l, true
+		}
+		t += gap
+	}
+	return 0, false
+}
+
+func uiHitTriangles(o, d [3]float64, points []float32, index []uint32) (float64, bool) {
+	best, hit := math.Inf(1), false
+	count := uint32(len(points) / 3)
+	for t := 0; t+2 < len(index); t += 3 {
+		i0, i1, i2 := index[t], index[t+1], index[t+2]
+		if i0 >= count || i1 >= count || i2 >= count {
+			continue
+		}
+		p0 := [3]float64{float64(points[i0*3]), float64(points[i0*3+1]), float64(points[i0*3+2])}
+		e1 := uiSub([3]float64{float64(points[i1*3]), float64(points[i1*3+1]), float64(points[i1*3+2])}, p0)
+		e2 := uiSub([3]float64{float64(points[i2*3]), float64(points[i2*3+1]), float64(points[i2*3+2])}, p0)
+		h := uiCross3(d, e2)
+		a := uiDot(e1, h)
+		if math.Abs(a) < 1e-18 {
+			continue
+		}
+		f := 1 / a
+		s := uiSub(o, p0)
+		u := f * uiDot(s, h)
+		if u < 0 || u > 1 {
+			continue
+		}
+		q := uiCross3(s, e1)
+		v := f * uiDot(d, q)
+		if v < 0 || u+v > 1 {
+			continue
+		}
+		if tt := f * uiDot(e2, q); tt > 1e-12 && tt < best {
+			best, hit = tt, true
+		}
+	}
+	return best, hit
+}
+
+var uiRoofPoints = []float32{-0.5, -0.5, -0.5, 0.5, -0.5, -0.5, 0, 0.5, -0.5, -0.5, -0.5, 0.5, 0.5, -0.5, 0.5, 0, 0.5, 0.5}
+var uiRoofIndex = []uint32{0, 1, 2, 3, 5, 4, 0, 3, 4, 0, 4, 1, 1, 4, 5, 1, 5, 2, 2, 5, 3, 2, 3, 0}
+
+// Over the ground's corners, half a cell at a time, then halved down to where it crosses.
+func uiHitLand(id string, o, d [3]float64) (float64, bool) {
+	data, ok := uiSceneData(id)
+	if !ok || len(data) < 12 {
+		return 0, false
+	}
+	wide, rows := int(binary.LittleEndian.Uint32(data)), int(binary.LittleEndian.Uint32(data[4:]))
+	cell := float64(math.Float32frombits(binary.LittleEndian.Uint32(data[8:])))
+	if wide < 2 || rows < 2 || len(data) < 12+wide*rows*4 || !(cell > 0) {
+		return 0, false
+	}
+	halfX, halfZ := float64(wide-1)*cell/2, float64(rows-1)*cell/2
+	height := func(i, j int) float64 {
+		return float64(math.Float32frombits(binary.LittleEndian.Uint32(data[12+(j*wide+i)*4:])))
+	}
+	low, high := math.Inf(1), math.Inf(-1)
+	for k := 0; k < wide*rows; k++ {
+		h := height(k%wide, k/wide)
+		low, high = math.Min(low, h), math.Max(high, h)
+	}
+	ground := func(x, z float64) float64 {
+		fx, fz := (x+halfX)/cell, (z+halfZ)/cell
+		i, j := min(max(int(math.Floor(fx)), 0), wide-2), min(max(int(math.Floor(fz)), 0), rows-2)
+		u, v := math.Max(0, math.Min(1, fx-float64(i))), math.Max(0, math.Min(1, fz-float64(j)))
+		return (height(i, j)*(1-u)+height(i+1, j)*u)*(1-v) + (height(i, j+1)*(1-u)+height(i+1, j+1)*u)*v
+	}
+	enter, ok := uiHitBox(o, d, [3]float64{-halfX, low, -halfZ}, [3]float64{halfX, high, halfZ})
+	if !ok {
+		return 0, false
+	}
+	start := enter
+	if o[0] >= -halfX && o[0] <= halfX && o[2] >= -halfZ && o[2] <= halfZ && o[1] >= low && o[1] <= high {
+		start = 0
+	}
+	above := func(t float64) float64 { return o[1] + d[1]*t - ground(o[0]+d[0]*t, o[2]+d[2]*t) }
+	if above(start) <= 0 {
+		return start, start > 0
+	}
+	step := cell / 2 / math.Max(uiLen(d), 1e-18)
+	for t, i := start+step, 0; i < 1<<20; t, i = t+step, i+1 {
+		x, z := o[0]+d[0]*t, o[2]+d[2]*t
+		if x < -halfX-cell || x > halfX+cell || z < -halfZ-cell || z > halfZ+cell {
+			return 0, false
+		}
+		if above(t) <= 0 {
+			a, b := t-step, t
+			for k := 0; k < 48; k++ {
+				mid := (a + b) / 2
+				if above(mid) > 0 {
+					a = mid
+				} else {
+					b = mid
+				}
+			}
+			return b, true
+		}
+	}
+	return 0, false
+}
+
+type uiModelBounds struct {
+	low, high [3]float64
+	ok        bool
+}
+
+var (
+	uiModelLock  sync.Mutex
+	uiModelBoxes = map[string]uiModelBounds{}
+)
+
+// The box a glTF's own accessors say its points stay within, carried through each mesh's place in the file.
+func uiModelBox(path string) ([3]float64, [3]float64, bool) {
+	uiModelLock.Lock()
+	defer uiModelLock.Unlock()
+	if b, ok := uiModelBoxes[path]; ok {
+		return b.low, b.high, b.ok
+	}
+	b := uiModelBounds{low: [3]float64{math.Inf(1), math.Inf(1), math.Inf(1)},
+		high: [3]float64{math.Inf(-1), math.Inf(-1), math.Inf(-1)}}
+	defer func() { uiModelBoxes[path] = b }()
+	if uiAssets == nil || strings.Contains(path, "..") {
+		return b.low, b.high, false
+	}
+	body, err := uiAssets.ReadFile("assets/" + path)
+	if err != nil || len(body) < 20 || binary.LittleEndian.Uint32(body) != 0x46546C67 {
+		return b.low, b.high, false
+	}
+	size := int(binary.LittleEndian.Uint32(body[12:]))
+	if binary.LittleEndian.Uint32(body[16:]) != 0x4E4F534A || 20+size > len(body) {
+		return b.low, b.high, false
+	}
+	var doc struct {
+		Nodes []struct {
+			Mesh        *int      `json:"mesh"`
+			Skin        *int      `json:"skin"`
+			Children    []int     `json:"children"`
+			Matrix      []float64 `json:"matrix"`
+			Translation []float64 `json:"translation"`
+			Rotation    []float64 `json:"rotation"`
+			Scale       []float64 `json:"scale"`
+		} `json:"nodes"`
+		Meshes []struct {
+			Primitives []struct {
+				Attributes map[string]int `json:"attributes"`
+			} `json:"primitives"`
+		} `json:"meshes"`
+		Accessors []struct {
+			Min []float64 `json:"min"`
+			Max []float64 `json:"max"`
+		} `json:"accessors"`
+	}
+	if json.Unmarshal(body[20:20+size], &doc) != nil {
+		return b.low, b.high, false
+	}
+	up := make([]int, len(doc.Nodes))
+	for i := range up {
+		up[i] = -1
+	}
+	for i, n := range doc.Nodes {
+		for _, k := range n.Children {
+			if k >= 0 && k < len(up) {
+				up[k] = i
+			}
+		}
+	}
+	local := func(i int) uiMat {
+		n := doc.Nodes[i]
+		if len(n.Matrix) == 16 {
+			m := n.Matrix
+			return uiMat{m[0], m[4], m[8], m[12], m[1], m[5], m[9], m[13], m[2], m[6], m[10], m[14]}
+		}
+		t, q, s := []float64{0, 0, 0}, []float64{0, 0, 0, 1}, []float64{1, 1, 1}
+		if len(n.Translation) == 3 {
+			t = n.Translation
+		}
+		if len(n.Rotation) == 4 {
+			q = n.Rotation
+		}
+		if len(n.Scale) == 3 {
+			s = n.Scale
+		}
+		x, y, z, w := q[0], q[1], q[2], q[3]
+		return uiMat{
+			(1 - 2*(y*y+z*z)) * s[0], 2 * (x*y - z*w) * s[1], 2 * (x*z + y*w) * s[2], t[0],
+			2 * (x*y + z*w) * s[0], (1 - 2*(x*x+z*z)) * s[1], 2 * (y*z - x*w) * s[2], t[1],
+			2 * (x*z - y*w) * s[0], 2 * (y*z + x*w) * s[1], (1 - 2*(x*x+y*y)) * s[2], t[2],
+		}
+	}
+	for i, n := range doc.Nodes {
+		if n.Mesh == nil || *n.Mesh < 0 || *n.Mesh >= len(doc.Meshes) {
+			continue
+		}
+		place := uiMatOne
+		if n.Skin == nil {
+			for k, guard := i, 0; k >= 0 && guard < 1024; k, guard = up[k], guard+1 {
+				l := local(k)
+				place = l.times(&place)
+			}
+		}
+		for _, prim := range doc.Meshes[*n.Mesh].Primitives {
+			a, ok := prim.Attributes["POSITION"]
+			if !ok || a < 0 || a >= len(doc.Accessors) || len(doc.Accessors[a].Min) != 3 || len(doc.Accessors[a].Max) != 3 {
+				continue
+			}
+			lo, hi := doc.Accessors[a].Min, doc.Accessors[a].Max
+			for c := 0; c < 8; c++ {
+				x, y, z := lo[0], lo[1], lo[2]
+				if c&1 != 0 {
+					x = hi[0]
+				}
+				if c&2 != 0 {
+					y = hi[1]
+				}
+				if c&4 != 0 {
+					z = hi[2]
+				}
+				x, y, z = place.point(x, y, z)
+				p := [3]float64{x, y, z}
+				for k := 0; k < 3; k++ {
+					b.low[k], b.high[k] = math.Min(b.low[k], p[k]), math.Max(b.high[k], p[k])
+				}
+				b.ok = true
+			}
+		}
+	}
+	return b.low, b.high, b.ok
+}
+
+// A press or a move over a scene, as "x,y,wide,tall" in the same units: what it is over.
+func uiScenePick(attrs []UiAttr, value string) (int, float64, float64, float64) {
+	parts := strings.Split(value, ",")
+	if len(parts) != 4 {
+		return -1, 0, 0, 0
+	}
+	var v [4]float64
+	for i, s := range parts {
+		f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+		if err != nil {
+			return -1, 0, 0, 0
+		}
+		v[i] = f
+	}
+	var picks *uiPicks
+	for i := range attrs {
+		if attrs[i].Kind == "picks" && attrs[i].heard != nil {
+			picks, _ = attrs[i].heard.Picks.(*uiPicks)
+		}
+	}
+	if picks == nil {
+		return -1, 0, 0, 0
+	}
+	o, d := uiSceneRay(attrs, v[0], v[1], v[2], v[3])
+	tag, at, ok := picks.cast(o, d)
+	if !ok {
+		return -1, 0, 0, 0
+	}
+	return tag, at[0], at[1], at[2]
+}
+
+func init() { uiScenePicker = uiScenePick }
+
 // The JavaScript a scene is drawn by: the half of `hive.ui.scene` that runs in
 // the page, talking to the same socket the rest of a window uses.
 // The page's half of hive.ui.scene, served at /_hive/scene.js.
@@ -880,6 +2692,8 @@ var sizeSaid = [-1, -1];
 	`var needFull = false;
 
 var want = "", grabbing = false, lookX = 0, lookY = 0, last = 0, dirty = false;
+var overAt = null, shotWas = "", shotSeen = false, shotOwed = false;
+window.uiWorldHost = function () { return holder.style.display === "none" ? null : host; };
 var held = {};
 
 ` +
@@ -910,6 +2724,7 @@ function worded(text) { return engine.stringToNewUTF8(text); }
   }
   world = JSON.parse(engine.UTF8ToString(engine._hs_told()));
   want = world.on || "";
+  wanted();
   if (world.sounds.length || voices.size) { sounds(world.sounds, world); }
   if (!world.grab && grabbing) { document.exitPointerLock(); }
   dirty = true;
@@ -1172,6 +2987,7 @@ var w = Math.max(1, Math.round(r.width)), h = Math.max(1, Math.round(r.height));
     lookY = 0;
   }
   if (want.indexOf("p") >= 0) { pads(); touches(); }
+  if (overAt) { post("over", overAt, 0); overAt = null; }
   reported(now);
   if (pendingScenes.length) { flushScene(); }
   answer();
@@ -1179,6 +2995,7 @@ var w = Math.max(1, Math.round(r.width)), h = Math.max(1, Math.round(r.height));
     insets();
     engine._hs_draw();
     dirty = false;
+    if (shotOwed) { shotOwed = false; shoot(); }
   }
 }
 requestAnimationFrame(tick);
@@ -1263,7 +3080,43 @@ function round(n) { return Math.round(n * 100) / 100; }
 	//
 	// It says whether it went, and one caller cares: a pad keeps a record of what
 	// it has told the program, and a message that was dropped was never told.
-	`function post(kind, value, index) {
+	`function pointed(e) {
+  var r = canvas.getBoundingClientRect();
+  return round(e.clientX - r.left) + "," + round(e.clientY - r.top) + "," + round(r.width) + "," + round(r.height);
+}
+
+` +
+	// A number the program names is a picture it wants, once; the first it names is where it starts counting.
+	// What is behind a see-through scene is what the page shows there.
+	`function wanted() {
+  var at = want.indexOf("#"), shot = at >= 0 ? want.slice(at + 1) : "";
+  if (!shotSeen || shot !== shotWas) {
+    if (shotSeen && shot !== "") { shotOwed = true; dirty = true; }
+    shotWas = shot;
+    shotSeen = true;
+  }
+  if (host) { host.style.background = want.indexOf("t") >= 0 ? "transparent" : ""; }
+}
+
+` +
+	// Taken straight after the picture is drawn, while the canvas still holds it, and sent up in pieces.
+	`function shoot() {
+  var id = handle;
+  canvas.toBlob(function (blob) {
+    if (!blob) { return; }
+    blob.arrayBuffer().then(function (buf) {
+      var bytes = new Uint8Array(buf), text = "", step = 32768;
+      for (var i = 0; i < bytes.length; i += step) {
+        text += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
+      }
+      var body = btoa(text), size = 4194304, at = 0;
+      for (; at + size < body.length; at += size) { send(id, "filepart", body.slice(at, at + size), 0); }
+      send(id, "snapshot", body.slice(at), 0);
+    });
+  }, "image/png");
+}
+
+function post(kind, value, index) {
   if (!handle || sock.readyState !== 1 || sock.bufferedAmount > 65536) { return false; }
   send(handle, kind, value, index);
   return true;
@@ -1818,6 +3671,12 @@ function silence() {
     if (grabbing || holder.contains(e.target)) { up("mouse" + (e.button + 1)); }
   });
   holder.addEventListener("contextmenu", function (e) { if (grabbing) { e.preventDefault(); } });
+  holder.addEventListener("pointerdown", function (e) {
+    if (!grabbing && host && e.button === 0 && want.indexOf("h") >= 0) { post("hit", pointed(e), 0); }
+  });
+  holder.addEventListener("pointermove", function (e) {
+    if (!grabbing && host && want.indexOf("o") >= 0) { overAt = pointed(e); }
+  });
   document.addEventListener("pointerlockchange", function () {
     grabbing = document.pointerLockElement === canvas;
     if (!grabbing) { release(); }

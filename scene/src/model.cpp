@@ -212,7 +212,8 @@ struct File {
         out.wide = kind == "SCALAR" ? 1 : kind == "VEC2" ? 2 : kind == "VEC3" ? 3 : kind == "VEC4" ? 4
             : kind == "MAT4" ? 16 : 0;
         int component = a.whole("componentType", 0);
-        int bytes = component == 5121 ? 1 : component == 5123 ? 2 : component == 5125 ? 4 : component == 5126 ? 4 : 0;
+        int bytes = component == 5120 || component == 5121 ? 1 : component == 5122 || component == 5123 ? 2
+            : component == 5125 || component == 5126 ? 4 : 0;
         if (out.wide == 0 || bytes == 0) { return out; }
         size_t count = size_t(a.num("count", 0));
         size_t each = size_t(out.wide) * size_t(bytes);
@@ -227,7 +228,9 @@ struct File {
                 const uint8_t* q = p + size_t(c) * size_t(bytes);
                 double value = 0;
                 if (component == 5121) { value = q[0]; }
+                else if (component == 5120) { value = int8_t(q[0]); }
                 else if (component == 5123) { value = uint16_t(q[0] | q[1] << 8); }
+                else if (component == 5122) { value = int16_t(uint16_t(q[0] | q[1] << 8)); }
                 else if (component == 5125) { value = word(q); }
                 else {
                     float f;
@@ -239,7 +242,8 @@ struct File {
         }
         const Json* normalised = a.get("normalized");
         if (normalised && normalised->number != 0) {
-            out.top = component == 5121 ? 255 : component == 5123 ? 65535 : 1;
+            out.top = component == 5121 ? 255 : component == 5123 ? 65535 : component == 5120 ? 127
+                : component == 5122 ? 32767 : 1;
         }
         out.ok = true;
         return out;
@@ -373,85 +377,157 @@ bool readModel(Model& m, const uint8_t* data, size_t size) {
     const Json* skins = doc.get("skins");
     const Json* meshes = doc.get("meshes");
     const Json* accessors = doc.get("accessors");
-    if (!nodes || !skins || !meshes || !accessors) { return false; }
-    const Json* holder = nullptr;
-    for (size_t n = 0; n < nodes->size(); n++) {
-        if (nodes->at(n).has("skin") && nodes->at(n).has("mesh")) {
-            holder = &nodes->at(n);
-            break;
+    if (!nodes || !meshes || !accessors) { return false; }
+
+    std::vector<int> upOf(nodes->size(), -1);
+    for (size_t i = 0; i < nodes->size(); i++) {
+        const Json* kids = nodes->at(i).get("children");
+        if (!kids) { continue; }
+        for (size_t c = 0; c < kids->size(); c++) {
+            int kid = int(kids->at(c).number);
+            if (kid >= 0 && kid < int(upOf.size())) { upOf[size_t(kid)] = int(i); }
         }
     }
-    if (!holder) { return false; }
-    int skinAt = holder->whole("skin", -1), meshAt = holder->whole("mesh", -1);
-    if (skinAt < 0 || size_t(skinAt) >= skins->size() || meshAt < 0 || size_t(meshAt) >= meshes->size()) { return false; }
-    const Json& skin = skins->at(size_t(skinAt));
-    const Json* prims = meshes->at(size_t(meshAt)).get("primitives");
-    const Json* skinJoints = skin.get("joints");
-    if (!prims || !skinJoints) { return false; }
+    auto local = [&](int i) {
+        const Json& nd = nodes->at(size_t(i));
+        const Json* mx = nd.get("matrix");
+        if (mx && mx->size() == 16) {
+            Mat r;
+            for (int k = 0; k < 16; k++) { r.m[k] = mx->at(size_t(k)).number; }
+            return r;
+        }
+        double t[3] = {0, 0, 0}, q[4] = {0, 0, 0, 1}, s[3] = {1, 1, 1};
+        const Json* jt = nd.get("translation");
+        const Json* jr = nd.get("rotation");
+        const Json* js = nd.get("scale");
+        for (int k = 0; k < 3; k++) {
+            if (jt && jt->size() == 3) { t[k] = jt->at(size_t(k)).number; }
+            if (js && js->size() == 3) { s[k] = js->at(size_t(k)).number; }
+        }
+        for (int k = 0; k < 4; k++) {
+            if (jr && jr->size() == 4) { q[k] = jr->at(size_t(k)).number; }
+        }
+        return composed(t, q, s);
+    };
+
+    // Every node that holds a mesh is drawn; the first one with a skin says what the joints are.
+    std::vector<int> drawn;
+    int skinAt = -1;
+    for (size_t n = 0; n < nodes->size(); n++) {
+        const Json& nd = nodes->at(n);
+        int mesh = nd.whole("mesh", -1);
+        if (mesh < 0 || size_t(mesh) >= meshes->size()) { continue; }
+        drawn.push_back(int(n));
+        int skin = nd.whole("skin", -1);
+        if (skinAt < 0 && skins && skin >= 0 && size_t(skin) < skins->size()) { skinAt = skin; }
+    }
+    if (drawn.empty()) { return false; }
+    std::vector<int> jointNodes;
+    if (skinAt >= 0) {
+        const Json* skinJoints = skins->at(size_t(skinAt)).get("joints");
+        if (!skinJoints) { return false; }
+        for (size_t k = 0; k < skinJoints->size(); k++) {
+            int node = int(skinJoints->at(k).number);
+            if (node < 0 || size_t(node) >= nodes->size()) { return false; }
+            jointNodes.push_back(node);
+        }
+    }
+    const size_t skinned = jointNodes.size();
+    auto jointOf = [&](int node) {
+        auto found = std::find(jointNodes.begin(), jointNodes.end(), node);
+        return found == jointNodes.end() ? -1 : int(found - jointNodes.begin());
+    };
+    // A mesh with no skin rides a joint of its own, after the skin's, with every node above it a joint too.
+    auto enlist = [&](int node) {
+        std::vector<int> chain;
+        for (int k = node, guard = 0; k >= 0 && jointOf(k) < 0 && guard < 1024; k = upOf[size_t(k)], guard++) {
+            chain.push_back(k);
+        }
+        for (size_t i = chain.size(); i > 0; i--) { jointNodes.push_back(chain[i - 1]); }
+        return jointOf(node);
+    };
 
     for (int k = 0; k < PARTS * 4; k++) { m.tints[k] = 1; }
     bool normals = true;
     const Json* materials = doc.get("materials");
-    for (size_t k = 0; k < prims->size(); k++) {
-        const Json& p = prims->at(k);
-        const Json* q = p.get("attributes");
-        if (!q) { return false; }
-        Column place = file.read(q->whole("POSITION", -1));
-        if (!place.ok || place.wide != 3) { return false; }
-        size_t many = place.values.size() / 3, base = m.place.size() / 3;
-        for (double v : place.values) { m.place.push_back(float(v)); }
-        m.facing.resize((base + many) * 3, 0);
-        if (q->has("NORMAL")) {
-            Column facing = file.read(q->whole("NORMAL", -1));
-            if (facing.ok && facing.values.size() == many * 3) {
-                for (size_t i = 0; i < many * 3; i++) { m.facing[base * 3 + i] = float(facing.values[i]); }
+    size_t part = 0;
+    for (int node : drawn) {
+        const Json& nd = nodes->at(size_t(node));
+        bool rides = nd.whole("skin", -1) != skinAt || skinAt < 0;
+        int own = rides ? enlist(node) : -1;
+        const Json* prims = meshes->at(size_t(nd.whole("mesh", -1))).get("primitives");
+        if (!prims) { continue; }
+        for (size_t k = 0; k < prims->size(); k++, part++) {
+            const Json& p = prims->at(k);
+            int mode = p.whole("mode", 4);
+            if (mode != 4) { continue; }
+            const Json* q = p.get("attributes");
+            if (!q) { return false; }
+            Column place = file.read(q->whole("POSITION", -1));
+            if (!place.ok || place.wide != 3) { return false; }
+            size_t many = place.values.size() / 3, base = m.place.size() / 3;
+            for (double v : place.values) { m.place.push_back(float(v)); }
+            m.facing.resize((base + many) * 3, 0);
+            if (q->has("NORMAL")) {
+                Column facing = file.read(q->whole("NORMAL", -1));
+                if (facing.ok && facing.values.size() == many * 3) {
+                    for (size_t i = 0; i < many * 3; i++) { m.facing[base * 3 + i] = float(facing.values[i] / facing.top); }
+                } else {
+                    normals = false;
+                }
             } else {
                 normals = false;
             }
-        } else {
-            normals = false;
-        }
-        m.tint.resize((base + many) * 3, 255);
-        if (q->has("COLOR_0")) {
-            Column c = file.read(q->whole("COLOR_0", -1));
-            if (c.ok && c.wide >= 3 && c.values.size() == many * size_t(c.wide)) {
-                double scale = c.top == 1 ? 255 : 255 / c.top;
-                for (size_t i = 0; i < many; i++) {
-                    for (int ch = 0; ch < 3; ch++) {
-                        double v = std::nearbyint(c.values[i * size_t(c.wide) + size_t(ch)] * scale);
-                        m.tint[(base + i) * 3 + size_t(ch)] = uint8_t(std::min(255.0, std::max(0.0, v)));
+            m.tint.resize((base + many) * 3, 255);
+            if (q->has("COLOR_0")) {
+                Column c = file.read(q->whole("COLOR_0", -1));
+                if (c.ok && c.wide >= 3 && c.values.size() == many * size_t(c.wide)) {
+                    double scale = c.top == 1 ? 255 : 255 / c.top;
+                    for (size_t i = 0; i < many; i++) {
+                        for (int ch = 0; ch < 3; ch++) {
+                            double v = std::nearbyint(c.values[i * size_t(c.wide) + size_t(ch)] * scale);
+                            m.tint[(base + i) * 3 + size_t(ch)] = uint8_t(std::min(255.0, std::max(0.0, v)));
+                        }
                     }
                 }
             }
-        }
-        Column bones = file.read(q->whole("JOINTS_0", -1));
-        Column weights = file.read(q->whole("WEIGHTS_0", -1));
-        if (!bones.ok || !weights.ok || bones.values.size() != many * 4 || weights.values.size() != many * 4) {
-            return false;
-        }
-        for (double v : bones.values) { m.bones.push_back(float(v)); }
-        for (double v : weights.values) { m.weights.push_back(float(v / weights.top)); }
-        m.part.resize(base + many, uint8_t(std::min<size_t>(k, PARTS - 1)));
-        if (p.has("indices")) {
-            Column index = file.read(p.whole("indices", -1));
-            if (!index.ok) { return false; }
-            for (double v : index.values) { m.index.push_back(uint32_t(v) + uint32_t(base)); }
-        } else {
-            for (size_t i = 0; i < many; i++) { m.index.push_back(uint32_t(base + i)); }
-        }
-        int material = p.whole("material", -1);
-        if (materials && material >= 0 && size_t(material) < materials->size() && k < size_t(PARTS)) {
-            const Json* pbr = materials->at(size_t(material)).get("pbrMetallicRoughness");
-            const Json* own = pbr ? pbr->get("baseColorFactor") : nullptr;
-            if (own && own->size() >= 3) {
-                m.tints[k * 4] = float(own->at(0).number);
-                m.tints[k * 4 + 1] = float(own->at(1).number);
-                m.tints[k * 4 + 2] = float(own->at(2).number);
-                m.tints[k * 4 + 3] = 1;
+            if (rides) {
+                for (size_t i = 0; i < many; i++) {
+                    m.bones.insert(m.bones.end(), {float(own), 0, 0, 0});
+                    m.weights.insert(m.weights.end(), {1, 0, 0, 0});
+                }
+            } else {
+                Column bones = file.read(q->whole("JOINTS_0", -1));
+                Column weights = file.read(q->whole("WEIGHTS_0", -1));
+                if (!bones.ok || !weights.ok || bones.values.size() != many * 4 || weights.values.size() != many * 4) {
+                    return false;
+                }
+                for (double v : bones.values) { m.bones.push_back(float(v)); }
+                for (double v : weights.values) { m.weights.push_back(float(v / weights.top)); }
+            }
+            m.part.resize(base + many, uint8_t(std::min<size_t>(part, PARTS - 1)));
+            if (p.has("indices")) {
+                Column index = file.read(p.whole("indices", -1));
+                if (!index.ok) { return false; }
+                for (double v : index.values) { m.index.push_back(uint32_t(v) + uint32_t(base)); }
+            } else {
+                for (size_t i = 0; i < many; i++) { m.index.push_back(uint32_t(base + i)); }
+            }
+            int material = p.whole("material", -1);
+            if (materials && material >= 0 && size_t(material) < materials->size() && part < size_t(PARTS)) {
+                const Json* pbr = materials->at(size_t(material)).get("pbrMetallicRoughness");
+                const Json* colour = pbr ? pbr->get("baseColorFactor") : nullptr;
+                if (colour && colour->size() >= 3) {
+                    m.tints[part * 4] = float(colour->at(0).number);
+                    m.tints[part * 4 + 1] = float(colour->at(1).number);
+                    m.tints[part * 4 + 2] = float(colour->at(2).number);
+                    m.tints[part * 4 + 3] = 1;
+                }
             }
         }
     }
     size_t count = m.place.size() / 3;
+    if (count == 0 || jointNodes.size() > 500) { return false; }
     for (uint32_t i : m.index) {
         if (i >= count) { return false; }
     }
@@ -478,52 +554,12 @@ bool readModel(Model& m, const uint8_t* data, size_t size) {
         }
     }
 
-    // A bone whose parent is no joint of the skin keeps the file's world transform.
-    std::vector<int> upOf(nodes->size(), -1);
-    for (size_t i = 0; i < nodes->size(); i++) {
-        const Json* kids = nodes->at(i).get("children");
-        if (!kids) { continue; }
-        for (size_t c = 0; c < kids->size(); c++) {
-            int kid = int(kids->at(c).number);
-            if (kid >= 0 && size_t(kid) < upOf.size()) { upOf[size_t(kid)] = int(i); }
-        }
-    }
-    auto local = [&](int i) {
-        const Json& nd = nodes->at(size_t(i));
-        const Json* mx = nd.get("matrix");
-        if (mx && mx->size() == 16) {
-            Mat r;
-            for (int k = 0; k < 16; k++) { r.m[k] = mx->at(size_t(k)).number; }
-            return r;
-        }
-        double t[3] = {0, 0, 0}, q[4] = {0, 0, 0, 1}, s[3] = {1, 1, 1};
-        const Json* jt = nd.get("translation");
-        const Json* jr = nd.get("rotation");
-        const Json* js = nd.get("scale");
-        for (int k = 0; k < 3; k++) {
-            if (jt && jt->size() == 3) { t[k] = jt->at(size_t(k)).number; }
-            if (js && js->size() == 3) { s[k] = js->at(size_t(k)).number; }
-        }
-        for (int k = 0; k < 4; k++) {
-            if (jr && jr->size() == 4) { q[k] = jr->at(size_t(k)).number; }
-        }
-        return composed(t, q, s);
-    };
-    std::vector<int> jointNodes;
-    for (size_t k = 0; k < skinJoints->size(); k++) {
-        int node = int(skinJoints->at(k).number);
-        if (node < 0 || size_t(node) >= nodes->size()) { return false; }
-        jointNodes.push_back(node);
-    }
+    // A joint whose parent is no joint keeps the file's world transform.
     for (size_t k = 0; k < jointNodes.size(); k++) {
         int node = jointNodes[k];
         Mat mx = local(node);
         int up = upOf[size_t(node)];
-        int parent = -1;
-        if (up >= 0) {
-            auto found = std::find(jointNodes.begin(), jointNodes.end(), up);
-            if (found != jointNodes.end()) { parent = int(found - jointNodes.begin()); }
-        }
+        int parent = up >= 0 ? jointOf(up) : -1;
         if (parent < 0) {
             int guard = 0;
             for (; up >= 0 && guard < 1024; up = upOf[size_t(up)], guard++) { mx = times(local(up), mx); }
@@ -537,10 +573,10 @@ bool readModel(Model& m, const uint8_t* data, size_t size) {
     for (size_t k = 0; k < m.joints.size(); k++) {
         for (int d = 0; d < 4; d++) { m.inverses[k * 16 + size_t(d) * 5] = 1; }
     }
-    if (skin.has("inverseBindMatrices")) {
-        Column inv = file.read(skin.whole("inverseBindMatrices", -1));
-        if (inv.ok && inv.values.size() >= m.joints.size() * 16) {
-            for (size_t i = 0; i < m.joints.size() * 16; i++) { m.inverses[i] = float(inv.values[i]); }
+    if (skinAt >= 0 && skins->at(size_t(skinAt)).has("inverseBindMatrices")) {
+        Column inv = file.read(skins->at(size_t(skinAt)).whole("inverseBindMatrices", -1));
+        if (inv.ok && inv.values.size() >= skinned * 16) {
+            for (size_t i = 0; i < skinned * 16; i++) { m.inverses[i] = float(inv.values[i]); }
         }
     }
     for (float b : m.bones) {
@@ -559,8 +595,119 @@ bool readModel(Model& m, const uint8_t* data, size_t size) {
         }
         for (size_t i = chain.size(); i > 0; i--) { m.order.push_back(chain[i - 1]); }
     }
+
+    const Json* animations = doc.get("animations");
+    for (size_t a = 0; animations && a < animations->size(); a++) {
+        const Json& an = animations->at(a);
+        Clip clip;
+        const Json* name = an.get("name");
+        clip.name = name && !name->text.empty() ? name->text : std::to_string(a);
+        const Json* channels = an.get("channels");
+        const Json* samplers = an.get("samplers");
+        for (size_t c = 0; channels && samplers && c < channels->size(); c++) {
+            const Json& ch = channels->at(c);
+            const Json* target = ch.get("target");
+            int sampler = ch.whole("sampler", -1);
+            if (!target || sampler < 0 || size_t(sampler) >= samplers->size()) { continue; }
+            Track t;
+            t.joint = jointOf(target->whole("node", -1));
+            const Json* path = target->get("path");
+            std::string way = path ? path->text : "";
+            t.path = way == "translation" ? 0 : way == "rotation" ? 1 : way == "scale" ? 2 : -1;
+            if (t.joint < 0 || t.path < 0) { continue; }
+            const Json& sm = samplers->at(size_t(sampler));
+            const Json* how = sm.get("interpolation");
+            std::string kind = how ? how->text : "LINEAR";
+            t.how = kind == "STEP" ? 1 : kind == "CUBICSPLINE" ? 2 : 0;
+            Column in = file.read(sm.whole("input", -1)), out = file.read(sm.whole("output", -1));
+            int width = t.path == 1 ? 4 : 3;
+            size_t keys = in.values.size(), need = keys * size_t(width) * (t.how == 2 ? 3 : 1);
+            if (!in.ok || !out.ok || in.wide != 1 || out.wide != width || keys == 0 || out.values.size() < need) {
+                continue;
+            }
+            for (double v : in.values) { t.times.push_back(float(v)); }
+            for (size_t i = 0; i < need; i++) { t.values.push_back(float(std::max(-1.0, out.values[i] / out.top))); }
+            if (out.top == 1) {
+                for (size_t i = 0; i < need; i++) { t.values[i] = float(out.values[i]); }
+            }
+            clip.length = std::max(clip.length, t.times.back());
+            clip.tracks.push_back(std::move(t));
+        }
+        m.clips.push_back(std::move(clip));
+    }
     m.ready = true;
     return true;
+}
+
+const Clip* Model::clipNamed(const std::string& name) const {
+    if (name.empty()) { return nullptr; }
+    for (const Clip& c : clips) {
+        if (c.name == name) { return &c; }
+    }
+    return nullptr;
+}
+
+void Clip::pose(int joint, float at, float t[3], float r[4], float s[3]) const {
+    for (const Track& k : tracks) {
+        if (k.joint != joint) { continue; }
+        int width = k.path == 1 ? 4 : 3;
+        size_t keys = k.times.size();
+        auto value = [&](size_t key, int c) {
+            return k.how == 2 ? k.values[(key * 3 + 1) * size_t(width) + size_t(c)] : k.values[key * size_t(width) + size_t(c)];
+        };
+        float got[4];
+        size_t i = 0;
+        while (i + 1 < keys && k.times[i + 1] <= at) { i++; }
+        if (keys == 1 || at <= k.times[0] || i + 1 >= keys) {
+            size_t key = at <= k.times[0] ? 0 : i;
+            for (int c = 0; c < width; c++) { got[c] = value(key, c); }
+        } else {
+            float span = k.times[i + 1] - k.times[i];
+            float f = span > 0 ? (at - k.times[i]) / span : 0;
+            if (k.how == 1) {
+                for (int c = 0; c < width; c++) { got[c] = value(i, c); }
+            } else if (k.how == 2) {
+                float f2 = f * f, f3 = f2 * f;
+                for (int c = 0; c < width; c++) {
+                    float p0 = value(i, c), p1 = value(i + 1, c);
+                    float m0 = span * k.values[(i * 3 + 2) * size_t(width) + size_t(c)];
+                    float m1 = span * k.values[((i + 1) * 3) * size_t(width) + size_t(c)];
+                    got[c] = (2 * f3 - 3 * f2 + 1) * p0 + (f3 - 2 * f2 + f) * m0 + (-2 * f3 + 3 * f2) * p1 + (f3 - f2) * m1;
+                }
+            } else if (k.path == 1) {
+                // The shorter way round between two turns.
+                float a[4], b[4], dot = 0;
+                for (int c = 0; c < 4; c++) {
+                    a[c] = value(i, c);
+                    b[c] = value(i + 1, c);
+                    dot += a[c] * b[c];
+                }
+                if (dot < 0) {
+                    for (float& v : b) { v = -v; }
+                    dot = -dot;
+                }
+                float wa = 1 - f, wb = f;
+                if (dot < 0.9995f) {
+                    float angle = std::acos(std::min(1.0f, dot)), sine = std::sin(angle);
+                    wa = std::sin((1 - f) * angle) / sine;
+                    wb = std::sin(f * angle) / sine;
+                }
+                for (int c = 0; c < 4; c++) { got[c] = wa * a[c] + wb * b[c]; }
+            } else {
+                for (int c = 0; c < width; c++) { got[c] = value(i, c) + (value(i + 1, c) - value(i, c)) * f; }
+            }
+        }
+        if (k.path == 0) {
+            for (int c = 0; c < 3; c++) { t[c] = got[c]; }
+        } else if (k.path == 2) {
+            for (int c = 0; c < 3; c++) { s[c] = got[c]; }
+        } else {
+            float len = std::sqrt(got[0] * got[0] + got[1] * got[1] + got[2] * got[2] + got[3] * got[3]);
+            if (len > 0) {
+                for (int c = 0; c < 4; c++) { r[c] = got[c] / len; }
+            }
+        }
+    }
 }
 
 } // namespace hive

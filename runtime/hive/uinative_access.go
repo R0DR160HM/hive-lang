@@ -68,7 +68,7 @@ func (n *uiNative) accessAdd(parent, node *uiAccess) *uiAccess {
 	if node.checked == 0 && node.role != "checkbox" {
 		node.checked = -1
 	}
-	if node.role != "combobox" {
+	if node.role != "combobox" && node.role != "treeitem" {
 		node.expanded = -1
 	}
 	node.parent = parent
@@ -90,6 +90,14 @@ func (n *uiNative) accessWalk(b *uiBox, into *uiAccess) {
 		n.accessBounds(parent, b)
 		if b.kind == "table" {
 			n.accessTable(b, parent)
+		}
+		if b.kind == "paragraph" {
+			for _, k := range b.kids {
+				if !uiWorded(k.kind) || k.kind == "link" {
+					n.accessWalk(k, parent)
+				}
+			}
+			return
 		}
 		if p := n.popup; p != nil && p.path == b.path && p.kind == "select" {
 			n.accessOptions(b, parent)
@@ -137,10 +145,18 @@ func (n *uiNative) accessNode(b *uiBox) *uiAccess {
 		node.name = placeholder.Word
 		switch b.input {
 		case "Range":
-			node.role, node.low, node.high = "slider", 0, 100
-			node.now = float64(n.rangeValue(b))
-			node.value = strconv.Itoa(n.rangeValue(b))
-		case "Date":
+			node.role = "slider"
+			node.low, node.high, _ = uiLimits(b.v.Attrs)
+			node.now = n.rangeValue(b)
+			node.value = uiNumberText(n.rangeValue(b))
+		case "Color":
+			node.role, node.value = "button", n.colourValue(b)
+		case "File":
+			node.role, node.value = "button", n.fileLabel(b)
+			if node.name == "" {
+				node.name = uiChooseFile
+			}
+		case "Date", "Time", "DateTime":
 			node.role, node.editable = "date", !b.disabled
 			if d := n.dates[b.path]; d != nil {
 				node.value = d.value()
@@ -170,11 +186,16 @@ func (n *uiNative) accessNode(b *uiBox) *uiAccess {
 		node.role, node.name = "image", node.help
 		if node.name == "" {
 			var words []string
-			for _, m := range b.v.Marks {
-				if m.Kind == "words" && m.Text != "" {
-					words = append(words, m.Text)
+			var gather func(marks []UiMark)
+			gather = func(marks []UiMark) {
+				for _, m := range marks {
+					if m.Kind == "words" && m.Text != "" {
+						words = append(words, m.Text)
+					}
+					gather(m.Marks)
 				}
 			}
+			gather(b.v.Marks)
 			node.name = strings.Join(words, " ")
 		}
 	case "spinner":
@@ -184,7 +205,44 @@ func (n *uiNative) accessNode(b *uiBox) *uiAccess {
 		if b.row {
 			node.role = "group"
 		}
-	case "row", "column":
+	case "paragraph":
+		var words []string
+		for _, k := range b.kids {
+			if uiWorded(k.kind) {
+				words = append(words, k.v.Text)
+			}
+		}
+		node.role, node.name = "text", strings.Join(words, "")
+		if strings.TrimSpace(node.name) == "" {
+			return nil
+		}
+	case "progress":
+		node.role, node.low, node.high, node.now = "progress", 0, 1, uiDone(b.v)
+		node.value = strconv.Itoa(int(math.Round(uiDone(b.v)*100))) + "%"
+	case "radio":
+		node.role = "group"
+	case "radioItem":
+		node.role, node.name, node.selected = "radio", b.v.Text, n.itemOn(b)
+	case "tabs":
+		node.role = "tablist"
+	case "tab":
+		node.role, node.name, node.selected = "tab", b.v.Text, n.itemOn(b)
+	case "choices":
+		node.role = "list"
+	case "choice":
+		node.role, node.name, node.selected = "listitem", b.v.Text, n.itemOn(b)
+	case "tree":
+		node.role = "tree"
+	case "branchHead":
+		owner := b.item.owner
+		node.role, node.name, node.selected = "treeitem", owner.v.Text, owner.selected
+		if len(owner.v.Children) > 0 {
+			node.expanded = 0
+			if owner.v.Flag {
+				node.expanded = 1
+			}
+		}
+	case "row", "column", "grid", "stack":
 		if node.help == "" {
 			return nil
 		}
@@ -289,13 +347,14 @@ func (n *uiNative) accessAct(id int32, action string) bool {
 			return false
 		}
 		n.focus, n.keyboard, n.blink = b.path, true, true
+		n.focusMoved()
 		return true
 	case "press":
 		switch {
-		case a.role == "listitem":
+		case a.role == "listitem" && b.kind == "select":
 			n.choose(b, a.part)
 			n.popup = nil
-		case b.kind == "select" || b.kind == "input" && b.input == "Date":
+		case b.kind == "select" || b.kind == "input" && (b.input == "Date" || b.input == "DateTime"):
 			if n.popup != nil && n.popup.path == b.path {
 				n.popup = nil
 			} else {
@@ -332,10 +391,15 @@ func (n *uiNative) accessSet(id int32, value string) bool {
 	case b.kind == "input" && b.input == "Range":
 		v, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
 		if err == nil {
-			n.setRange(b, int(math.Round(v)))
+			n.setRange(b, v)
 			return true
 		}
-	case b.kind == "input" && b.input == "Date":
+	case b.kind == "input" && b.input == "Color":
+		if c, ok := uiParseColour(strings.TrimSpace(value)); ok {
+			n.colourChosen(b, uiHexOf(c))
+			return true
+		}
+	case b.kind == "input" && uiStamp(b.input):
 		if d := n.dates[b.path]; d != nil {
 			d.set(value)
 			d.sent = ""

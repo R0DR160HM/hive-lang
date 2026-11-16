@@ -229,7 +229,7 @@ func TestADateIsTypedASegmentAtATime(t *testing.T) {
 	if got := uiPosted(box); !strings.HasSuffix(got, "0202-09-30,2026-09-30,") {
 		t.Errorf("heard %s", got)
 	}
-	if d := n.dates["r/0"]; d.parts != [3]int{0, 10, 30} {
+	if d := n.dates["r/0"]; d.parts != [5]int{0, 10, 30, 0, 0} {
 		t.Errorf("the date holds %v", d.parts)
 	}
 }

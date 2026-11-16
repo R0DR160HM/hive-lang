@@ -1,5 +1,6 @@
 #include "shapes.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <functional>
@@ -309,6 +310,84 @@ Mesh ground() {
     return m;
 }
 
+// A ring, a tube around it, its widest one unit out; the tube's own radius is the ratio given.
+Mesh torus(float q) {
+    Mesh m;
+    const int around = 48, round = 24;
+    float big = 1 - q;
+    for (int j = 0; j <= round; j++) {
+        float v = float(j) / float(round), b = v * 2 * PI;
+        for (int i = 0; i <= around; i++) {
+            float u = float(i) / float(around), a = u * 2 * PI;
+            float sn = std::sin(a), cs = std::cos(a), out = std::cos(b), up = std::sin(b);
+            push3(m.place, sn * (big + q * out), q * up, cs * (big + q * out));
+            push3(m.facing, sn * out, up, cs * out);
+            m.uv.push_back(u);
+            m.uv.push_back(v);
+        }
+    }
+    for (int j = 0; j < round; j++) {
+        for (int i = 0; i < around; i++) {
+            uint32_t a = uint32_t(j * (around + 1) + i), b = a + uint32_t(around + 1);
+            m.index.insert(m.index.end(), {a, a + 1, b, b, a + 1, b + 1});
+        }
+    }
+    return m;
+}
+
+// A cylinder one unit tall overall with half a sphere for each end; the ratio is how wide it is to how tall.
+Mesh capsule(float q) {
+    Mesh m;
+    const int around = 32, cap = 12;
+    float r = q / 2, h = 0.5f - r;
+    std::vector<float> lean;
+    for (int k = 0; k <= cap; k++) { lean.push_back(float(k) / float(cap) * PI / 2); }
+    for (int k = 0; k <= cap; k++) { lean.push_back(PI / 2 + float(k) / float(cap) * PI / 2); }
+    for (size_t row = 0; row < lean.size(); row++) {
+        float phi = lean[row], reach = r * std::sin(phi);
+        float y = (row <= size_t(cap) ? h : -h) + r * std::cos(phi);
+        for (int i = 0; i <= around; i++) {
+            float u = float(i) / float(around), a = u * 2 * PI;
+            float sn = std::sin(a), cs = std::cos(a);
+            push3(m.place, sn * reach, y, cs * reach);
+            push3(m.facing, sn * std::sin(phi), std::cos(phi), cs * std::sin(phi));
+            m.uv.push_back(u);
+            m.uv.push_back(y + 0.5f);
+        }
+    }
+    for (uint32_t row = 0; row + 1 < uint32_t(lean.size()); row++) {
+        for (int i = 0; i < around; i++) {
+            uint32_t a = row * uint32_t(around + 1) + uint32_t(i), b = a + uint32_t(around + 1);
+            m.index.insert(m.index.end(), {a, b, a + 1, b, b + 1, a + 1});
+        }
+    }
+    return m;
+}
+
+// A flat ring lying as the ground does, one unit out; the hole's radius is the ratio given.
+Mesh disc(float q) {
+    Mesh m;
+    const int around = 48;
+    for (int ring = 0; ring < 2; ring++) {
+        float reach = ring == 0 ? q : 1;
+        for (int i = 0; i <= around; i++) {
+            float a = float(i) / float(around) * 2 * PI;
+            float x = std::sin(a) * reach, z = std::cos(a) * reach;
+            push3(m.place, x, 0, z);
+            push3(m.facing, 0, 1, 0);
+            m.uv.push_back(0.5f + x / 2);
+            m.uv.push_back(0.5f - z / 2);
+        }
+    }
+    for (uint32_t i = 0; i < uint32_t(around); i++) {
+        uint32_t in = i, out = i + uint32_t(around + 1);
+        m.index.insert(m.index.end(), {in, out, in + 1, in + 1, out, out + 1});
+    }
+    return m;
+}
+
+float ratio(const std::string& form, size_t from) { return float(atoi(form.substr(from).c_str())) / 64.0f; }
+
 } // namespace
 
 void directions(Mesh& m) {
@@ -394,6 +473,35 @@ Mesh unitMesh(const std::string& form) {
     if (form == "roof") {
         Mesh m = gable();
         spans(m, ridge);
+        directions(m);
+        return m;
+    }
+    if (form.compare(0, 6, "torus|") == 0) {
+        float q = std::min(std::max(ratio(form, 6), 1.0f / 64), 63.0f / 64);
+        Mesh m = torus(q);
+        spans(m, [q](float, float, float, float* u, float* v) {
+            u[0] = 2 * PI;
+            v[1] = 2 * PI * q;
+        });
+        directions(m);
+        return m;
+    }
+    if (form.compare(0, 8, "capsule|") == 0) {
+        float q = std::min(std::max(ratio(form, 8), 1.0f / 64), 1.0f);
+        Mesh m = capsule(q);
+        spans(m, [q](float, float, float, float* u, float* v) {
+            u[0] = PI * q;
+            v[1] = 1;
+        });
+        directions(m);
+        return m;
+    }
+    if (form.compare(0, 5, "disc|") == 0) {
+        Mesh m = disc(std::min(std::max(ratio(form, 5), 0.0f), 63.0f / 64));
+        spans(m, [](float, float, float, float* u, float* v) {
+            u[0] = 2;
+            v[2] = 2;
+        });
         directions(m);
         return m;
     }

@@ -15,10 +15,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"image"
 	"image/draw"
+	"image/png"
 	"math"
 	"net/http"
 	"net/url"
@@ -291,6 +293,12 @@ type uiStage struct {
 	finger    *uiFinger
 	touches   map[string]bool
 	touchTold map[string]float64
+
+	overAt   [2]float64
+	overOwed bool
+	shotWas  string
+	shotSeen bool
+	shotOwed bool
 }
 
 func (s *uiStage) wants(event byte) bool {
@@ -392,6 +400,13 @@ func (s *uiStage) settle() {
 	s.shown = true
 	s.attrs = b.v.Attrs
 	s.want = uiSceneWants(b.v.Attrs)
+	// A number the program names is a picture it wants, once; the first it names is where it starts counting.
+	if shot := uiStageShot(s.want); !s.shotSeen || shot != s.shotWas {
+		if s.shotSeen && shot != "" {
+			s.shotOwed, s.wanted = true, true
+		}
+		s.shotWas, s.shotSeen = shot, true
+	}
 	grab, _ := uiFind(b.v.Attrs, "grab")
 	cross, _ := uiFind(b.v.Attrs, "crosshair")
 	s.grab, s.cross = grab.Flag, cross.Flag
@@ -538,6 +553,10 @@ func (s *uiStage) pump() bool {
 		}
 		s.owed = false
 		fresh = true
+		if s.shotOwed && len(s.pix) == s.wide*s.tall*4 && s.wide > 0 {
+			s.shotOwed = false
+			s.post("snapshot", uiStagePNG(s.pix, s.wide, s.tall, s.wants('t')), 0)
+		}
 	}
 	s.ask()
 	return fresh || !s.owed || time.Since(s.since) > 120*time.Millisecond
@@ -585,15 +604,32 @@ func (s *uiStage) paint(cv *uiCanvas, b *uiBox, clip uiClip) {
 	if r.empty() {
 		return
 	}
-	cv.fill(box.x0, box.y0, box.x1, box.y1, uiStageDark, clip)
+	through := s.wants('t')
+	if !through {
+		cv.fill(box.x0, box.y0, box.x1, box.y1, uiStageDark, clip)
+	}
 	if len(s.pix) >= s.wide*s.tall*4 && s.wide > 0 {
 		cv.flush()
 		src := unsafe.Slice((*uint32)(unsafe.Pointer(&s.pix[0])), s.wide*s.tall)
 		for y := r.y0; y < r.y1 && y-box.y0 < s.tall; y++ {
 			from := (y-box.y0)*s.wide + r.x0 - box.x0
 			run := min(r.x1-r.x0, s.wide-(r.x0-box.x0))
-			if run > 0 {
-				copy(cv.pix[y*cv.w+r.x0:y*cv.w+r.x0+run], src[from:from+run])
+			if run <= 0 {
+				continue
+			}
+			to := cv.pix[y*cv.w+r.x0 : y*cv.w+r.x0+run]
+			if !through {
+				copy(to, src[from:from+run])
+				continue
+			}
+			// The picture's colours already carry its own coverage, so what is behind adds what it leaves.
+			for i, p := range src[from : from+run] {
+				keep := 255 - p>>24
+				q := to[i]
+				r := min(p>>16&255+(q>>16&255)*keep/255, 255)
+				g := min(p>>8&255+(q>>8&255)*keep/255, 255)
+				b := min(p&255+(q&255)*keep/255, 255)
+				to[i] = 0xff000000 | r<<16 | g<<8 | b
 			}
 		}
 	}
@@ -699,6 +735,9 @@ func (s *uiStage) press(button int, x, y float64) bool {
 	}
 	n := s.n
 	chain := n.under(x, y)
+	if button == 1 && !s.grabbing && s.wants('h') && len(chain) > 0 && chain[len(chain)-1] == n.sceneBox {
+		s.post("hit", s.pointed(x, y), 0)
+	}
 	if button == 1 {
 		for i := len(chain) - 1; i >= 0; i-- {
 			if t, ok := chain[i].attr("touch"); ok && t.Word != "" {
@@ -744,7 +783,16 @@ func (s *uiStage) lift(button int) bool {
 	return s.grabbing
 }
 
+// Where a point is on the picture, and how big the picture is, as "x,y,wide,tall".
+func (s *uiStage) pointed(x, y float64) string {
+	b := s.n.sceneBox
+	return uiStageRound(x-b.x) + "," + uiStageRound(y-b.y) + "," + uiStageRound(b.w) + "," + uiStageRound(b.h)
+}
+
 func (s *uiStage) drag(x, y float64) {
+	if s.shown && !s.grabbing && s.wants('o') && s.n.sceneBox != nil && s.over(x, y) {
+		s.overAt, s.overOwed = [2]float64{x, y}, true
+	}
 	f := s.finger
 	if f == nil {
 		return
@@ -767,6 +815,31 @@ func (s *uiStage) blur() {
 	s.letGo()
 }
 
+func uiStageShot(want string) string {
+	if at := strings.IndexByte(want, '#'); at >= 0 {
+		return want[at+1:]
+	}
+	return ""
+}
+
+// The picture as a PNG, its colours freed of the coverage they were drawn with.
+func uiStagePNG(pix []byte, wide, tall int, through bool) string {
+	img := image.NewNRGBA(image.Rect(0, 0, wide, tall))
+	for i := 0; i < wide*tall; i++ {
+		b, g, r, a := pix[i*4], pix[i*4+1], pix[i*4+2], pix[i*4+3]
+		if !through {
+			a = 255
+		}
+		if a > 0 && a < 255 {
+			r, g, b = uint8(min(int(r)*255/int(a), 255)), uint8(min(int(g)*255/int(a), 255)), uint8(min(int(b)*255/int(a), 255))
+		}
+		img.Pix[i*4], img.Pix[i*4+1], img.Pix[i*4+2], img.Pix[i*4+3] = r, g, b, a
+	}
+	var out bytes.Buffer
+	png.Encode(&out, img)
+	return base64.StdEncoding.EncodeToString(out.Bytes())
+}
+
 func uiStageRound(v float64) string {
 	return strconv.FormatFloat(math.Round(v*100)/100, 'f', -1, 64)
 }
@@ -786,6 +859,12 @@ func (s *uiStage) tick() {
 	if s.wants('p') {
 		s.padded()
 		s.touched()
+	}
+	if s.overOwed {
+		s.overOwed = false
+		if s.n.sceneBox != nil {
+			s.post("over", s.pointed(s.overAt[0], s.overAt[1]), 0)
+		}
 	}
 	if !s.wants('f') || s.last.IsZero() {
 		s.last = now

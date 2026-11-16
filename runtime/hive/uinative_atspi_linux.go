@@ -51,6 +51,8 @@ var uixRoles = map[string]uixRole{
 	"cell": {56, "table cell"}, "columnheader": {57, "table column header"}, "image": {27, "image"},
 	"progress": {42, "progress bar"}, "dialog": {16, "dialog"}, "group": {39, "panel"},
 	"list": {98, "list box"}, "listitem": {32, "list item"}, "tooltip": {64, "tool tip"},
+	"radio": {44, "radio button"}, "tab": {37, "page tab"}, "tablist": {38, "page tab list"},
+	"tree": {65, "tree"}, "treeitem": {91, "tree item"},
 }
 
 func uixRoleOf(node *uiAccess) uixRole {
@@ -340,10 +342,23 @@ func (a *uixA11y) states(node *uiAccess) []any {
 		} else {
 			set(5)
 		}
-	case "listitem":
+	case "listitem", "tab", "treeitem":
 		set(22)
 		if node.selected {
 			set(23)
+		}
+		if node.expanded >= 0 && node.role == "treeitem" {
+			set(9)
+			if node.expanded == 1 {
+				set(10)
+			} else {
+				set(5)
+			}
+		}
+	case "radio":
+		set(41)
+		if node.selected {
+			set(4)
 		}
 	case "progress":
 		set(3)
@@ -375,7 +390,7 @@ func (a *uixA11y) interfaces(node *uiAccess) []string {
 	}
 	if node.role != "window" && node.role != "table" && node.role != "row" && node.role != "group" &&
 		node.role != "dialog" && node.role != "list" && node.role != "image" && node.role != "progress" &&
-		node.role != "slider" {
+		node.role != "slider" && node.role != "tablist" && node.role != "tree" {
 		out = append(out, "org.a11y.atspi.Text")
 	}
 	if node.editable {
@@ -391,7 +406,7 @@ func uixPressName(node *uiAccess) (string, bool) {
 		return "", false
 	}
 	switch node.role {
-	case "button", "link", "listitem":
+	case "button", "link", "listitem", "radio", "tab", "treeitem":
 		return "click", true
 	case "checkbox":
 		return "toggle", true

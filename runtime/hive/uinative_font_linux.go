@@ -566,12 +566,12 @@ func (p *uixPen) close()                             { p.add('Z') }
 
 func (p *uixPen) empty() bool { return len(p.ops) == 0 || p.lx > p.hx }
 
-func (p *uixPen) replay(r *uiRaster, sx, dx, sy, dy float64) {
+func (p *uixPen) replay(r *uiRaster, sx, kx, dx, sy, dy float64) {
 	at := 0
 	var ox, oy, cx, cy float64
 	open := false
 	pt := func() (float64, float64) {
-		x, y := p.pts[at]*sx+dx, p.pts[at+1]*sy+dy
+		x, y := p.pts[at]*sx+p.pts[at+1]*kx+dx, p.pts[at+1]*sy+dy
 		at += 2
 		return x, y
 	}
@@ -804,11 +804,13 @@ func (f *uixFace) composite(pen *uixPen, g uint16, d []byte, m uixAffine, depth 
 }
 
 type uixGlyphKey struct {
-	face *uixFace
-	size int32
-	g    uint16
-	sub  uint8
-	bold bool
+	face  *uixFace
+	size  int32
+	g     uint16
+	sub   uint8
+	bold  bool
+	slant bool
+	wide  int32
 }
 
 type uixGlyph struct {
@@ -1299,9 +1301,11 @@ func (fs *uixFonts) fromCharset(r rune, pattern string, least int) *uixFace {
 }
 
 type uixPlaced struct {
-	face *uixFace
-	g    uint16
-	bold bool
+	face  *uixFace
+	g     uint16
+	bold  bool
+	slant bool
+	wide  float64
 }
 
 func (fs *uixFonts) layout(f uiFont, s string, each func(p uixPlaced, kern, advance float64)) {
@@ -1318,7 +1322,7 @@ func (fs *uixFonts) layout(f uiFont, s string, each func(p uixPlaced, kern, adva
 		if found := fs.find(r, primary, f.weight >= 600); found != primary {
 			face, heavy = uixStyled(found, f.weight, f.px)
 		}
-		p := uixPlaced{face: face, g: face.glyph(r), bold: heavy}
+		p := uixPlaced{face: face, g: face.glyph(r), bold: heavy, slant: f.italic, wide: uixWide(f)}
 		kern := 0.0
 		if prev.face == face {
 			kern = face.kern(prev.g, p.g) / face.upm
@@ -1327,7 +1331,7 @@ func (fs *uixFonts) layout(f uiFont, s string, each func(p uixPlaced, kern, adva
 		if p.bold {
 			advance += 1.0 / 24
 		}
-		each(p, kern, advance)
+		each(p, kern*p.wide, advance*p.wide)
 		prev = p
 	}
 }
@@ -1374,8 +1378,19 @@ func (fs *uixFonts) draw(cv *uiCanvas, f uiFont, size float64, x, y int, s strin
 	})
 }
 
+// A face with no italic of its own leans, as a browser makes one lean.
+const uixSlant = 0.2
+
+func uixWide(f uiFont) float64 {
+	if f.stretch > 0 {
+		return f.stretch
+	}
+	return 1
+}
+
 func (fs *uixFonts) render(p uixPlaced, size float64, quarter uint8) (glyph *uixGlyph) {
-	key := uixGlyphKey{face: p.face, size: int32(math.Round(size * 16)), g: p.g, sub: quarter, bold: p.bold}
+	key := uixGlyphKey{face: p.face, size: int32(math.Round(size * 16)), g: p.g, sub: quarter, bold: p.bold,
+		slant: p.slant, wide: int32(math.Round(p.wide * 1000))}
 	if gl, ok := fs.glyphs[key]; ok {
 		return gl
 	}
@@ -1402,8 +1417,16 @@ func (fs *uixFonts) render(p uixPlaced, size float64, quarter uint8) (glyph *uix
 	if p.bold {
 		extra = size / 24
 	}
-	x0 := int(math.Floor(pen.lx*scale+shift)) - 1
-	x1 := int(math.Ceil(pen.hx*scale+shift+extra)) + 1
+	wide := scale
+	if p.wide > 0 {
+		wide = scale * p.wide
+	}
+	lean := 0.0
+	if p.slant {
+		lean = uixSlant * scale
+	}
+	x0 := int(math.Floor(pen.lx*wide+math.Min(pen.ly*lean, 0)+shift)) - 1
+	x1 := int(math.Ceil(pen.hx*wide+math.Max(pen.hy*lean, 0)+shift+extra)) + 1
 	y0 := int(math.Floor(-pen.hy*scale)) - 1
 	y1 := int(math.Ceil(-pen.ly*scale)) + 1
 	w, h := x1-x0, y1-y0
@@ -1411,10 +1434,10 @@ func (fs *uixFonts) render(p uixPlaced, size float64, quarter uint8) (glyph *uix
 		return glyph
 	}
 	fs.raster.reset(w, h)
-	pen.replay(&fs.raster, scale, shift-float64(x0), -scale, -float64(y0))
+	pen.replay(&fs.raster, wide, lean, shift-float64(x0), -scale, -float64(y0))
 	if p.bold {
 		for _, step := range []float64{0.5, 1} {
-			pen.replay(&fs.raster, scale, shift-float64(x0)+extra*step, -scale, -float64(y0))
+			pen.replay(&fs.raster, wide, lean, shift-float64(x0)+extra*step, -scale, -float64(y0))
 		}
 	}
 	mask := fs.raster.mask(nil)

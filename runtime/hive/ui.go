@@ -19,6 +19,7 @@ package hive
 
 import (
 	"embed"
+	"encoding/base64"
 	"fmt"
 	"hash/fnv"
 	"hash/maphash"
@@ -94,7 +95,13 @@ type uiHeard struct {
 	FnSize func(int, int) any
 	FnEdit func(int, int, string) any
 	FnDrag func(int, int, bool) any
+	FnFile func(string, string) any
+	FnHit  func(int, float64, float64, float64) any
+	Picks  any
 }
+
+// What is under a point of a scene; set by the scene's own file, so a program without one carries none of it.
+var uiScenePicker func(attrs []UiAttr, value string) (int, float64, float64, float64)
 
 func uiNode(kind string, attrs []UiAttr, children []UiView) UiView {
 	return UiView{Kind: kind, Attrs: attrs, Children: children}
@@ -153,6 +160,7 @@ type UiMark struct {
 	Attrs []UiAttr
 	Nums  []float64
 	Text  string
+	Marks []UiMark
 }
 
 // A filled circle: a car on a map, a point on a plot, a bulb on a dial.
@@ -191,6 +199,102 @@ func UiWords(attrs []UiAttr, x float64, y float64, height float64, text string) 
 // picture arriving with its page needs no second channel and cannot lag it.
 func UiCanvas(attrs []UiAttr, marks []UiMark) UiView {
 	return UiView{Kind: "canvas", Attrs: attrs, Marks: marks}
+}
+
+func UiOval(attrs []UiAttr, x float64, y float64, width float64, height float64) UiMark {
+	return UiMark{Kind: "oval", Attrs: attrs, Nums: []float64{x, y, width, height}}
+}
+
+func UiArc(attrs []UiAttr, x float64, y float64, radius float64, from float64, to float64) UiMark {
+	return UiMark{Kind: "arc", Attrs: attrs, Nums: []float64{x, y, radius, from, to}}
+}
+
+func UiWedge(attrs []UiAttr, x float64, y float64, radius float64, from float64, to float64) UiMark {
+	return UiMark{Kind: "wedge", Attrs: attrs, Nums: []float64{x, y, radius, from, to}}
+}
+
+func UiCurve(attrs []UiAttr, points []float64) UiMark {
+	return UiMark{Kind: "curve", Attrs: attrs, Nums: points}
+}
+
+// The outer mark comes first, its holes after it.
+func UiCutout(attrs []UiAttr, outer UiMark, holes []UiMark) UiMark {
+	return UiMark{Kind: "cutout", Attrs: attrs, Marks: append([]UiMark{outer}, holes...)}
+}
+
+func UiSymbol(attrs []UiAttr, x float64, y float64, angle float64, size float64, marks []UiMark) UiMark {
+	return UiMark{Kind: "symbol", Attrs: attrs, Nums: []float64{x, y, angle, size}, Marks: marks}
+}
+
+func UiPicture(attrs []UiAttr, src string, x float64, y float64, width float64, height float64) UiMark {
+	return UiMark{Kind: "picture", Attrs: attrs, Text: src, Nums: []float64{x, y, width, height}}
+}
+
+func UiAttrEdge(v UiTone) UiAttr { return uiEnum("edge", string(v)) }
+
+func UiAttrDash(on float64, off float64) UiAttr {
+	return uiNums("dash", []float64{math.Max(uiFinite(on), 0), math.Max(uiFinite(off), 0)})
+}
+
+func UiAttrCrop(x float64, y float64, width float64, height float64) UiAttr {
+	return uiNums("crop", []float64{uiFinite(x), uiFinite(y), math.Max(uiFinite(width), 0), math.Max(uiFinite(height), 0)})
+}
+
+func uiFinite(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0
+	}
+	return v
+}
+
+// How wide words are on a canvas, in the units their height is in. Every renderer sets them to this width,
+// whatever face it has, so the answer is exact everywhere.
+func UiMeasure(words string, height float64) float64 {
+	total := 0.0
+	for _, r := range words {
+		total += float64(uiWordsAdvance(r))
+	}
+	return total / 1000 * uiFinite(height)
+}
+
+// Advances in thousandths of the height, from the metrics Arial and Liberation Sans share.
+func uiWordsAdvance(r rune) int {
+	switch {
+	case r >= 0x20 && r <= 0x17F:
+		return int(uiWordsWidth[r-0x20])
+	case r < 0x20, r >= 0x300 && r <= 0x36F, r == 0x200B, r == 0x200C, r == 0x200D, r == 0xFEFF:
+		return 0
+	case r >= 0x1100 && r <= 0x115F, r >= 0x2E80 && r <= 0xA4CF, r >= 0xAC00 && r <= 0xD7A3,
+		r >= 0xF900 && r <= 0xFAFF, r >= 0xFE30 && r <= 0xFE4F, r >= 0xFF00 && r <= 0xFF60,
+		r >= 0xFFE0 && r <= 0xFFE6, r >= 0x1F300 && r <= 0x1FAFF, r >= 0x20000 && r <= 0x3FFFD:
+		return 1000
+	}
+	return 556
+}
+
+var uiWordsWidth = [...]uint16{
+	278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278,
+	556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556,
+	1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778,
+	667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556,
+	333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556,
+	556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	278, 333, 556, 556, 556, 556, 260, 556, 333, 737, 370, 556, 584, 333, 737, 552,
+	400, 549, 333, 333, 333, 576, 537, 333, 333, 333, 365, 556, 834, 834, 834, 611,
+	667, 667, 667, 667, 667, 667, 1000, 722, 667, 667, 667, 667, 278, 278, 278, 278,
+	722, 722, 778, 778, 778, 778, 778, 584, 778, 722, 722, 722, 722, 667, 667, 611,
+	556, 556, 556, 556, 556, 556, 889, 500, 556, 556, 556, 556, 278, 278, 278, 278,
+	556, 556, 556, 556, 556, 556, 556, 549, 611, 556, 556, 556, 556, 500, 556, 500,
+	667, 556, 667, 556, 667, 556, 722, 500, 722, 500, 722, 500, 722, 500, 722, 615,
+	722, 556, 667, 556, 667, 556, 667, 556, 667, 556, 667, 556, 778, 556, 778, 556,
+	778, 556, 778, 556, 722, 556, 722, 556, 278, 278, 278, 278, 278, 278, 278, 222,
+	278, 278, 735, 444, 500, 222, 667, 500, 500, 556, 222, 556, 222, 556, 292, 556,
+	334, 556, 222, 722, 556, 722, 556, 722, 556, 604, 723, 556, 778, 556, 778, 556,
+	778, 556, 1000, 944, 722, 333, 722, 333, 722, 333, 667, 500, 667, 500, 667, 500,
+	667, 500, 611, 278, 611, 375, 611, 278, 722, 556, 722, 556, 722, 556, 722, 556,
+	722, 556, 722, 556, 944, 722, 667, 500, 667, 611, 500, 611, 500, 611, 500, 222,
 }
 
 // A code editor's runs are marks of its own: the same record, carried where a
@@ -266,6 +370,59 @@ func UiSpinner(attrs []UiAttr) UiView { return UiView{Kind: "spinner", Attrs: at
 // ---------------------------------------------------------------------------
 func UiNone() UiView { return UiView{Kind: "none"} }
 
+func UiGrid(attrs []UiAttr, views []UiView) UiView      { return uiNode("grid", attrs, views) }
+func UiStack(attrs []UiAttr, views []UiView) UiView     { return uiNode("stack", attrs, views) }
+func UiParagraph(attrs []UiAttr, views []UiView) UiView { return uiNode("paragraph", attrs, views) }
+func UiTree(attrs []UiAttr, views []UiView) UiView      { return uiNode("tree", attrs, views) }
+
+func UiBranch(attrs []UiAttr, label string, open bool, views []UiView) UiView {
+	return UiView{Kind: "branch", Attrs: attrs, Text: label, Flag: open, Children: views}
+}
+
+func UiRadio(attrs []UiAttr, options []string, chosen string) UiView {
+	return UiView{Kind: "radio", Attrs: attrs, Options: options, Text: chosen}
+}
+
+func UiTabs(attrs []UiAttr, labels []string, chosen string) UiView {
+	return UiView{Kind: "tabs", Attrs: attrs, Options: labels, Text: chosen}
+}
+
+// The chosen set rides in Rows, the one field of a view that holds a list of lists.
+func UiChoices(attrs []UiAttr, options []string, chosen []string) UiView {
+	return UiView{Kind: "choices", Attrs: attrs, Options: options, Rows: Table{chosen}}
+}
+
+func uiPicked(v *UiView, option string) bool {
+	if len(v.Rows) == 0 {
+		return false
+	}
+	for _, c := range v.Rows[0] {
+		if c == option {
+			return true
+		}
+	}
+	return false
+}
+
+func UiProgress(attrs []UiAttr, done float64) UiView {
+	return UiView{Kind: "progress", Attrs: attrs, Text: strconv.FormatFloat(uiFraction(done), 'f', -1, 64)}
+}
+
+func uiFraction(v float64) float64 {
+	if math.IsNaN(v) || v < 0 {
+		return 0
+	}
+	return math.Min(v, 1)
+}
+
+func uiDone(v *UiView) float64 {
+	done, err := strconv.ParseFloat(v.Text, 64)
+	if err != nil {
+		return 0
+	}
+	return uiFraction(done)
+}
+
 // The enumerations hive.ui owns. Each is a closed set the renderer can answer
 // for in full, which is what a raw CSS value would take away. None is an atom,
 // because the atom table belongs to the program rather than to a library.
@@ -277,6 +434,7 @@ type UiAxis string
 type UiAnchor string
 type UiInputKind string
 type UiIcon string
+type UiFit string
 
 // What a solid in a scene is made of, as against what colour it is. It lives
 // here with the other enumerations because a closed set of names is a name and
@@ -472,6 +630,129 @@ func UiAttrOnToggle(f func(bool) any) UiAttr {
 func UiAttrOnPick(f func(int) any) UiAttr { return UiAttr{Kind: "onPick", heard: &uiHeard{FnInt: f}} }
 func UiAttrOnSort(f func(int) any) UiAttr { return UiAttr{Kind: "onSort", heard: &uiHeard{FnInt: f}} }
 
+func UiAttrOnEnter(msg any) UiAttr { return UiAttr{Kind: "onEnter", heard: &uiHeard{Msg: msg}} }
+func UiAttrOnLeave(msg any) UiAttr { return UiAttr{Kind: "onLeave", heard: &uiHeard{Msg: msg}} }
+func UiAttrOnFocus(msg any) UiAttr { return UiAttr{Kind: "onFocus", heard: &uiHeard{Msg: msg}} }
+func UiAttrOnBlur(msg any) UiAttr  { return UiAttr{Kind: "onBlur", heard: &uiHeard{Msg: msg}} }
+
+func UiAttrOnWheel(f func(float64, float64) any) UiAttr {
+	return UiAttr{Kind: "onWheel", heard: &uiHeard{FnLook: f}}
+}
+func UiAttrOnPress(f func(float64, float64) any) UiAttr {
+	return UiAttr{Kind: "onPress", heard: &uiHeard{FnLook: f}}
+}
+func UiAttrOnPoint(f func(float64, float64) any) UiAttr {
+	return UiAttr{Kind: "onPoint", heard: &uiHeard{FnLook: f}}
+}
+func UiAttrOnRelease(f func(float64, float64) any) UiAttr {
+	return UiAttr{Kind: "onRelease", heard: &uiHeard{FnLook: f}}
+}
+func UiAttrOnScroll(f func(int, int) any) UiAttr {
+	return UiAttr{Kind: "onScroll", heard: &uiHeard{FnSize: f}}
+}
+func UiAttrOnSize(f func(int, int) any) UiAttr {
+	return UiAttr{Kind: "onSize", heard: &uiHeard{FnSize: f}}
+}
+func UiAttrOnDrop(f func(string) any) UiAttr {
+	return UiAttr{Kind: "onDrop", heard: &uiHeard{FnStr: f}}
+}
+func UiAttrOnFile(f func(string, string) any) UiAttr {
+	return UiAttr{Kind: "onFile", heard: &uiHeard{FnFile: f}}
+}
+
+func UiAttrWrap(on bool) UiAttr     { return UiAttr{Kind: "wrap", Flag: on} }
+func UiAttrSpan(n int) UiAttr       { return uiNum("span", max(n, 1)) }
+func UiAttrMinWidth(n int) UiAttr   { return uiNum("minWidth", max(n, 0)) }
+func UiAttrMaxWidth(n int) UiAttr   { return uiNum("maxWidth", max(n, 0)) }
+func UiAttrMinHeight(n int) UiAttr  { return uiNum("minHeight", max(n, 0)) }
+func UiAttrMaxHeight(n int) UiAttr  { return uiNum("maxHeight", max(n, 0)) }
+func UiAttrFit(v UiFit) UiAttr      { return uiEnum("fit", string(v)) }
+func UiAttrItalic(on bool) UiAttr   { return UiAttr{Kind: "italic", Flag: on} }
+func UiAttrMono(on bool) UiAttr     { return UiAttr{Kind: "mono", Flag: on} }
+func UiAttrLines(n int) UiAttr      { return uiNum("lines", max(n, 1)) }
+func UiAttrShadow(n int) UiAttr     { return uiNum("shadow", max(n, 0)) }
+func UiAttrEase(ms int) UiAttr      { return uiNum("ease", max(ms, 0)) }
+func UiAttrSelected(on bool) UiAttr { return UiAttr{Kind: "selected", Flag: on} }
+func UiAttrCarry(s string) UiAttr   { return uiStr("carry", s) }
+
+// CSS reads 1 to 1000 and a face has its weights in hundreds between, so a weight is held there.
+func UiAttrWeight(n int) UiAttr { return uiNum("weight", min(max(n, 100), 900)) }
+
+func UiAttrColumns(widths []int) UiAttr {
+	shares := make([]float64, len(widths))
+	for i, w := range widths {
+		shares[i] = float64(max(w, 0))
+	}
+	return uiNums("columns", shares)
+}
+
+func UiAttrPlace(across UiAlign, down UiAlign) UiAttr {
+	return UiAttr{Kind: "place", Word: string(across) + " " + string(down)}
+}
+
+func uiPlaced(attrs []UiAttr) (string, string) {
+	if p, ok := uiFind(attrs, "place"); ok {
+		across, down, _ := strings.Cut(p.Word, " ")
+		return across, down
+	}
+	return "Stretch", "Stretch"
+}
+
+func UiAttrAspect(wide int, tall int) UiAttr {
+	if wide <= 0 || tall <= 0 {
+		return UiAttr{Kind: "aspect"}
+	}
+	return uiNums("aspect", []float64{float64(wide), float64(tall)})
+}
+
+func UiAttrOpacity(v float64) UiAttr { return uiNums("opacity", []float64{uiFraction(v)}) }
+
+func uiOpacity(attrs []UiAttr) float64 {
+	if a, ok := uiFind(attrs, "opacity"); ok && len(a.Nums) == 1 {
+		return a.Nums[0]
+	}
+	return 1
+}
+
+func UiAttrGradient(from UiTone, to UiTone, angle float64) UiAttr {
+	if math.IsNaN(angle) || math.IsInf(angle, 0) {
+		angle = 0
+	}
+	return UiAttr{Kind: "gradient", Word: string(from) + "|" + string(to), Nums: []float64{angle}}
+}
+
+func uiGradientOf(a UiAttr) (string, string, float64) {
+	from, to, _ := strings.Cut(a.Word, "|")
+	angle := 0.0
+	if len(a.Nums) == 1 {
+		angle = a.Nums[0]
+	}
+	return from, to, angle
+}
+
+func UiAttrLimits(low float64, high float64, step float64) UiAttr {
+	for _, v := range []*float64{&low, &high, &step} {
+		if math.IsNaN(*v) || math.IsInf(*v, 0) {
+			*v = 0
+		}
+	}
+	if high < low {
+		low, high = high, low
+	}
+	return uiNums("limits", []float64{low, high, math.Max(step, 0)})
+}
+
+func uiLimits(attrs []UiAttr) (float64, float64, float64) {
+	if a, ok := uiFind(attrs, "limits"); ok && len(a.Nums) == 3 {
+		return a.Nums[0], a.Nums[1], a.Nums[2]
+	}
+	return 0, 100, 1
+}
+
+func UiAttrScrollTo(x int, y int, serial int) UiAttr {
+	return uiNums("scrollTo", []float64{float64(max(x, 0)), float64(max(y, 0)), float64(serial)})
+}
+
 // Finding one attribute among a node's. Attributes are few and a view is
 // rebuilt every turn, so a scan beats anything with a map's allocation.
 func uiFind(attrs []UiAttr, kind string) (UiAttr, bool) {
@@ -487,7 +768,8 @@ func uiHasEvent(attrs []UiAttr) bool {
 	for _, a := range attrs {
 		switch a.Kind {
 		case "on", "onDismiss", "onInput", "onSubmit", "onChoose", "onToggle", "onPick", "onSort", "onKey",
-			"onCaret", "onView", "onFit", "onEdit", "onPaste", "onProbe", "onMenu", "onMiddle", "onDouble", "onDrag", "onHover", "onJump":
+			"onCaret", "onView", "onFit", "onEdit", "onPaste", "onProbe", "onMenu", "onMiddle", "onDouble", "onDrag", "onHover", "onJump",
+			"onEnter", "onLeave", "onFocus", "onBlur", "onWheel", "onPress", "onPoint", "onRelease", "onScroll", "onDrop", "onFile":
 			return true
 
 			// A scene's own events, listed here rather than anywhere the scene
@@ -501,7 +783,8 @@ func uiHasEvent(attrs []UiAttr) bool {
 			// ---------------------------------------------------------------------------
 			// Rendering
 			// ---------------------------------------------------------------------------
-		case "onFrame", "onRate", "onKeyDown", "onKeyUp", "onLook", "onGrab", "onPad", "onSize":
+		case "onFrame", "onRate", "onKeyDown", "onKeyUp", "onLook", "onGrab", "onPad", "onSize", "onHit", "onOver",
+			"onSnapshot":
 			return true
 		}
 	}
@@ -534,6 +817,13 @@ type uiRender struct {
 	// camera that moves is a document that would be re-sent every frame.
 	insets []string
 	paced  bool
+
+	// Whether the next node opened sits directly in a grid or a stack, the only parents `place` and `span` speak to.
+	placing bool
+	// Whether the next node opened sits directly in a paragraph, where text is never a heading.
+	inline bool
+	// Numbers the document's own ids: a gradient's, a radio group's name.
+	serial int
 }
 
 var uiEscaper = strings.NewReplacer(
@@ -612,7 +902,7 @@ func uiEscapeInto(b []byte, s string) []byte {
 // The two tones that carry a colour. The value reaching this point has
 // been through UiToneHex or UiToneRGBA, so it is a colour and not
 // whatever the program had in the string.
-func uiStyle(b []byte, kind string, attrs []UiAttr) []byte {
+func uiStyle(b []byte, kind string, attrs []UiAttr, placed bool) []byte {
 	switch kind {
 	case "row":
 		b = append(b, "display:flex;flex-direction:row;"...)
@@ -620,7 +910,12 @@ func uiStyle(b []byte, kind string, attrs []UiAttr) []byte {
 		b = append(b, "display:flex;flex-direction:column;"...)
 	case "spacer":
 		b = append(b, "flex:1 1 auto;"...)
+	case "grid":
+		b = append(b, "display:grid;grid-template-columns:"...)
+		b = uiTracks(b, attrs)
+		b = append(b, ";"...)
 	}
+	worded := kind == "text" || kind == "paragraph"
 	for _, a := range attrs {
 		switch a.Kind {
 		case "gap":
@@ -647,9 +942,104 @@ func uiStyle(b []byte, kind string, attrs []UiAttr) []byte {
 			b = append(b, uiFlexPos(a.Word)...)
 			b = append(b, ";"...)
 		case "justify":
-			b = append(b, "justify-content:"...)
-			b = append(b, uiFlexPos(a.Word)...)
+			switch {
+			case worded:
+				b = append(b, "text-align:"...)
+				b = append(b, uiTextAlign(a.Word)...)
+			case kind == "grid":
+				b = append(b, "justify-items:"...)
+				b = append(b, uiSelfPos(a.Word)...)
+			default:
+				b = append(b, "justify-content:"...)
+				b = append(b, uiFlexPos(a.Word)...)
+			}
 			b = append(b, ";"...)
+		case "wrap":
+			switch {
+			case kind == "row" && a.Flag:
+				b = append(b, "flex-wrap:wrap;align-content:flex-start;"...)
+			case worded && !a.Flag:
+				b = append(b, "white-space:pre;"...)
+			}
+		case "span":
+			if placed {
+				b = append(b, "grid-column:span "...)
+				b = uiInt(b, a.Num)
+				b = append(b, ";"...)
+			}
+		case "place":
+			if placed {
+				across, down := uiPlaced(attrs)
+				b = append(b, "justify-self:"...)
+				b = append(b, uiSelfPos(across)...)
+				b = append(b, ";align-self:"...)
+				b = append(b, uiSelfPos(down)...)
+				b = append(b, ";"...)
+			}
+		case "aspect":
+			if len(a.Nums) == 2 {
+				b = append(b, "aspect-ratio:"...)
+				b = uiInt(b, int(a.Nums[0]))
+				b = append(b, "/"...)
+				b = uiInt(b, int(a.Nums[1]))
+				b = append(b, ";"...)
+			}
+		case "fit":
+			b = append(b, "object-fit:"...)
+			b = uiLower(b, a.Word)
+			b = append(b, ";"...)
+		case "weight":
+			b = append(b, "font-weight:"...)
+			b = uiInt(b, a.Num)
+			b = append(b, ";"...)
+		case "italic":
+			if a.Flag {
+				b = append(b, "font-style:italic;"...)
+			} else {
+				b = append(b, "font-style:normal;"...)
+			}
+		case "mono":
+			if a.Flag {
+				b = append(b, "font-family:"...)
+				b = append(b, uiMonoFaces...)
+				b = append(b, ";"...)
+			}
+		case "lines":
+			if worded {
+				b = append(b, "display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:"...)
+				b = uiInt(b, a.Num)
+				b = append(b, ";line-clamp:"...)
+				b = uiInt(b, a.Num)
+				b = append(b, ";overflow:hidden;"...)
+			}
+		case "opacity":
+			if len(a.Nums) == 1 && a.Nums[0] < 1 {
+				b = append(b, "opacity:"...)
+				b = append(b, uiNumber(a.Nums[0])...)
+				b = append(b, ";"...)
+			}
+		case "shadow":
+			if a.Num > 0 {
+				b = append(b, "box-shadow:0 "...)
+				b = append(b, uiNumber(float64(a.Num)/2)...)
+				b = append(b, "px "...)
+				b = uiInt(b, a.Num)
+				b = append(b, "px rgba(0,0,0,.25);"...)
+			}
+		case "ease":
+			if a.Num > 0 {
+				b = append(b, "transition:"...)
+				for i, p := range uiEased {
+					if i > 0 {
+						b = append(b, ","...)
+					}
+					b = append(b, p...)
+					b = append(b, " "...)
+					b = uiInt(b, a.Num)
+					b = append(b, "ms ease"...)
+				}
+				b = append(b, ";"...)
+			}
 		case "scroll":
 			switch a.Word {
 			case "Horizontal":
@@ -700,10 +1090,29 @@ func uiStyle(b []byte, kind string, attrs []UiAttr) []byte {
 	}
 	if uiFramed(kind) {
 		_, coloured := uiFind(attrs, "background")
+		_, shaded := uiFind(attrs, "gradient")
 		_, edged := uiFind(attrs, "border")
 		_, toned := uiFind(attrs, "borderTone")
-		if coloured && !edged && !toned {
+		if (coloured || shaded) && !edged && !toned {
 			b = append(b, "border-color:transparent;"...)
+		}
+	}
+	if g, ok := uiFind(attrs, "gradient"); ok {
+		from, to, angle := uiGradientOf(g)
+		b = append(b, "background:linear-gradient("...)
+		b = append(b, uiNumber(90+angle*180/math.Pi)...)
+		b = append(b, "deg,"...)
+		b = append(b, uiFillColour(from)...)
+		b = append(b, ","...)
+		b = append(b, uiFillColour(to)...)
+		b = append(b, ");"...)
+	}
+	for _, edge := range [4][2]string{{"minWidth", "min-width:"}, {"maxWidth", "max-width:"},
+		{"minHeight", "min-height:"}, {"maxHeight", "max-height:"}} {
+		if a, ok := uiFind(attrs, edge[0]); ok {
+			b = append(b, edge[1]...)
+			b = uiInt(b, a.Num)
+			b = append(b, "px;"...)
 		}
 	}
 
@@ -718,6 +1127,72 @@ func uiStyle(b []byte, kind string, attrs []UiAttr) []byte {
 		b = append(b, "flex:0 0 auto;"...)
 	}
 	return b
+}
+
+var uiEased = [...]string{"background-color", "color", "opacity", "width", "height", "box-shadow", "border-color"}
+
+const uiMonoFaces = `ui-monospace,'Cascadia Mono','Cascadia Code',Consolas,'Liberation Mono','DejaVu Sans Mono',monospace`
+
+func uiTracks(b []byte, attrs []UiAttr) []byte {
+	a, ok := uiFind(attrs, "columns")
+	if !ok || len(a.Nums) == 0 {
+		return append(b, "minmax(0,1fr)"...)
+	}
+	for i, share := range a.Nums {
+		if i > 0 {
+			b = append(b, ' ')
+		}
+		if share == 0 {
+			b = append(b, "auto"...)
+			continue
+		}
+		b = append(b, "minmax(0,"...)
+		b = uiInt(b, int(share))
+		b = append(b, "fr)"...)
+	}
+	return b
+}
+
+func uiTextAlign(v string) string {
+	switch v {
+	case "Center":
+		return "center"
+	case "End":
+		return "end"
+	case "Between":
+		return "justify"
+	}
+	return "start"
+}
+
+func uiSelfPos(v string) string {
+	switch v {
+	case "Start":
+		return "start"
+	case "Center":
+		return "center"
+	case "End":
+		return "end"
+	}
+	return "stretch"
+}
+
+// A role behind something is the page's or a state's fill, as `background` paints it.
+func uiFillColour(tone string) string {
+	if c, ok := uiToneColour(tone); ok {
+		return c
+	}
+	switch tone {
+	case "Muted":
+		return "var(--surface)"
+	case "Good":
+		return "var(--good)"
+	case "Warn":
+		return "var(--warn)"
+	case "Danger":
+		return "var(--danger)"
+	}
+	return "var(--bg)"
 }
 
 func uiFlexPos(v string) string {
@@ -782,6 +1257,10 @@ func uiClasses(b []byte, kind string, attrs []UiAttr) []byte {
 		case "scroll":
 			if a.Word == "Horizontal" {
 				b = append(b, " h-scroll-x"...)
+			}
+		case "wrap":
+			if a.Flag && kind == "radio" {
+				b = append(b, " h-wrap"...)
 			}
 		}
 	}
@@ -1058,7 +1537,9 @@ func (r *uiRender) common(kind string, attrs []UiAttr) {
 	was := len(b)
 	b = append(b, " style=\""...)
 	held := len(b)
-	b = uiStyle(b, kind, attrs)
+	placed := r.placing
+	r.placing = false
+	b = uiStyle(b, kind, attrs, placed)
 	if len(b) == held {
 		b = b[:was]
 	} else {
@@ -1103,10 +1584,26 @@ func (r *uiRender) common(kind string, attrs []UiAttr) {
 		b = strconv.AppendInt(b, int64(p.Num), 10)
 		b = append(b, '"')
 	}
+	if s, ok := uiFind(attrs, "scrollTo"); ok && len(s.Nums) == 3 {
+		b = append(b, " data-scrollto=\""...)
+		b = uiInt(b, int(s.Nums[0]))
+		b = append(b, ',')
+		b = uiInt(b, int(s.Nums[1]))
+		b = append(b, ',')
+		b = uiInt(b, int(s.Nums[2]))
+		b = append(b, '"')
+	}
+	if c, ok := uiFind(attrs, "carry"); ok {
+		b = append(b, " draggable=\"true\" data-carry=\""...)
+		b = uiEscapeInto(b, c.Word)
+		b = append(b, '"')
+	}
 	heard := len(b)
 	for _, a := range attrs {
 		switch a.Kind {
-		case "onMenu", "onMiddle", "onDouble", "onDrag", "onHover", "onJump", "onPaste", "onProbe":
+		case "onMenu", "onMiddle", "onDouble", "onDrag", "onHover", "onJump", "onPaste", "onProbe",
+			"onEnter", "onLeave", "onFocus", "onBlur", "onWheel", "onPress", "onPoint", "onRelease",
+			"onScroll", "onDrop", "onFile", "onSize":
 			if len(b) == heard {
 				b = append(b, " data-ev=\""...)
 			} else {
@@ -1134,6 +1631,8 @@ func (r *uiRender) common(kind string, attrs []UiAttr) {
 }
 
 func (r *uiRender) view(v UiView) {
+	inline := r.inline
+	r.inline = false
 	switch v.Kind {
 	case "none":
 		r.out.WriteString("<!--none-->")
@@ -1179,7 +1678,7 @@ func (r *uiRender) view(v UiView) {
 		r.out.WriteString("</div></div>")
 	case "text":
 		tag := "span"
-		if h, ok := uiFind(v.Attrs, "heading"); ok && h.Num >= 1 && h.Num <= 6 {
+		if h, ok := uiFind(v.Attrs, "heading"); ok && h.Num >= 1 && h.Num <= 6 && !inline {
 			tag = "h" + strconv.Itoa(h.Num)
 		}
 		r.out.WriteString("<")
@@ -1206,7 +1705,7 @@ func (r *uiRender) view(v UiView) {
 		r.out.WriteString("<span")
 		r.common(v.Kind, v.Attrs)
 		r.out.WriteString(" aria-hidden=\"true\">")
-		r.out.WriteString(uiIconGlyph(v.Text))
+		r.out.WriteString(uiIconSvg(v.Text))
 		r.out.WriteString("</span>")
 	case "link":
 		href := ""
@@ -1237,9 +1736,21 @@ func (r *uiRender) view(v UiView) {
 		r.out.WriteString("\"")
 		r.common(v.Kind, v.Attrs)
 		r.out.WriteString(r.disabled(v.Attrs))
-		r.out.WriteString(" value=\"")
-		uiEscapeTo(&r.out, v.Text)
-		r.out.WriteString("\"")
+		if kind != "file" {
+			r.out.WriteString(" value=\"")
+			uiEscapeTo(&r.out, v.Text)
+			r.out.WriteString("\"")
+		}
+		if _, ok := uiFind(v.Attrs, "limits"); ok && (kind == "range" || kind == "number") {
+			low, high, step := uiLimits(v.Attrs)
+			r.out.WriteString(" min=\"" + uiNumber(low) + "\" max=\"" + uiNumber(high) + "\" step=\"")
+			if step > 0 {
+				r.out.WriteString(uiNumber(step))
+			} else {
+				r.out.WriteString("any")
+			}
+			r.out.WriteString("\"")
+		}
 		if p, ok := uiFind(v.Attrs, "placeholder"); ok {
 			r.out.WriteString(" placeholder=\"")
 			uiEscapeTo(&r.out, p.Word)
@@ -1333,6 +1844,97 @@ func (r *uiRender) view(v UiView) {
 		r.out.WriteString("<div")
 		r.common(v.Kind, v.Attrs)
 		r.out.WriteString(" role=\"status\"></div>")
+	case "grid", "stack":
+		r.out.WriteString("<div")
+		r.common(v.Kind, v.Attrs)
+		r.out.WriteString(">")
+		for _, c := range v.Children {
+			r.placing = true
+			r.view(c)
+		}
+		r.placing = false
+		r.out.WriteString("</div>")
+	case "paragraph":
+		r.out.WriteString("<div")
+		r.common(v.Kind, v.Attrs)
+		r.out.WriteString(">")
+		for _, c := range v.Children {
+			r.inline = true
+			r.view(c)
+		}
+		r.inline = false
+		r.out.WriteString("</div>")
+	case "progress":
+		done := uiNumber(uiDone(&v))
+		r.out.WriteString("<div")
+		r.common(v.Kind, v.Attrs)
+		r.out.WriteString(" role=\"progressbar\" aria-valuemin=\"0\" aria-valuemax=\"1\" aria-valuenow=\"" + done +
+			"\"><div style=\"width:" + uiNumber(uiDone(&v)*100) + "%\"></div></div>")
+	case "radio":
+		r.serial++
+		group := "hr" + strconv.Itoa(r.serial)
+		off := r.disabled(v.Attrs)
+		r.out.WriteString("<div")
+		r.common(v.Kind, v.Attrs)
+		r.out.WriteString(" role=\"radiogroup\">")
+		for _, opt := range v.Options {
+			r.out.WriteString("<label class=\"h-option\"><input type=\"radio\" name=\"" + group + "\" value=\"")
+			uiEscapeTo(&r.out, opt)
+			r.out.WriteString("\"")
+			if opt == v.Text {
+				r.out.WriteString(" checked")
+			}
+			r.out.WriteString(off + "><span>")
+			uiEscapeTo(&r.out, opt)
+			r.out.WriteString("</span></label>")
+		}
+		r.out.WriteString("</div>")
+	case "choices", "tabs":
+		role, item, class, many := "tablist", "tab", "tab", ""
+		if v.Kind == "choices" {
+			role, item, class, many = "listbox", "option", "choice", " aria-multiselectable=\"true\""
+		}
+		off := r.disabled(v.Attrs)
+		choose, choosing := uiFind(v.Attrs, "onChoose")
+		r.out.WriteString("<div")
+		r.common(v.Kind, v.Attrs)
+		r.out.WriteString(" role=\"" + role + "\"" + many + ">")
+		for _, opt := range v.Options {
+			on := opt == v.Text
+			if v.Kind == "choices" {
+				on = uiPicked(&v, opt)
+			}
+			r.out.WriteString("<button type=\"button\" class=\"h-" + class + "\" role=\"" + item + "\" aria-selected=\"" +
+				strconv.FormatBool(on) + "\"" + off)
+			if r.handlers != nil && choosing {
+				r.next++
+				id := "h" + strconv.Itoa(r.next)
+				r.handlers[id] = []UiAttr{{Kind: "choice", heard: choose.heard, Word: opt}}
+				r.out.WriteString(" data-h=\"" + id + "\"")
+			}
+			r.out.WriteString(">")
+			if v.Kind == "choices" {
+				r.out.WriteString("<span class=\"h-tick\">")
+				if on {
+					r.out.WriteString(uiIconSvg("Check"))
+				}
+				r.out.WriteString("</span>")
+			}
+			r.out.WriteString("<span>")
+			uiEscapeTo(&r.out, opt)
+			r.out.WriteString("</span></button>")
+		}
+		r.out.WriteString("</div>")
+	case "tree":
+		r.out.WriteString("<div")
+		r.common(v.Kind, v.Attrs)
+		r.out.WriteString(" role=\"tree\">")
+		for _, c := range v.Children {
+			r.view(c)
+		}
+		r.out.WriteString("</div>")
+	case "branch":
+		r.branch(v)
 	default:
 		r.out.WriteString("<!--unknown widget-->")
 	}
@@ -1380,53 +1982,349 @@ func (r *uiRender) canvas(v UiView) {
 }
 
 func (r *uiRender) mark(m UiMark) {
-	colour := uiMarkColour(m.Attrs)
+	switch m.Kind {
+	case "symbol":
+		r.symbol(m)
+		return
+	case "words":
+		r.words(m)
+		return
+	case "picture":
+		r.picture(m)
+		return
+	}
+	shape, box, closed := uiMarkShape(m)
+	if shape == "" {
+		return
+	}
+	_, painted := uiFind(m.Attrs, "paint")
+	edge, edged := uiFind(m.Attrs, "edge")
+	fill := uiMarkColour(m.Attrs)
+	if g, ok := uiFind(m.Attrs, "gradient"); ok {
+		fill = "url(#" + r.gradient(g, box) + ")"
+		painted = true
+	}
+	var b strings.Builder
+	b.WriteString(shape)
+	if closed {
+		switch {
+		case !painted && edged:
+			b.WriteString(" fill=\"none\"")
+		default:
+			b.WriteString(" fill=\"" + fill + "\"")
+		}
+		if m.Kind == "cutout" {
+			b.WriteString(" fill-rule=\"evenodd\"")
+		}
+		if edged {
+			b.WriteString(" stroke=\"" + uiMarkColour([]UiAttr{{Kind: "paint", Word: edge.Word}}) + "\" stroke-width=\"" +
+				uiNumber(uiThick(m.Attrs)) + "\"")
+			uiDashTo(&b, m.Attrs)
+		}
+	} else {
+		b.WriteString(" fill=\"none\" stroke=\"" + fill + "\" stroke-width=\"" + uiNumber(uiThick(m.Attrs)) +
+			"\" stroke-linecap=\"round\" stroke-linejoin=\"round\"")
+		uiDashTo(&b, m.Attrs)
+	}
+	if o := uiOpacity(m.Attrs); o < 1 {
+		b.WriteString(" opacity=\"" + uiNumber(o) + "\"")
+	}
+	b.WriteString("/>")
+	r.out.WriteString(b.String())
+}
+
+func uiDashTo(b *strings.Builder, attrs []UiAttr) {
+	if d, ok := uiFind(attrs, "dash"); ok && len(d.Nums) == 2 && d.Nums[0]+d.Nums[1] > 0 {
+		b.WriteString(" stroke-dasharray=\"" + uiNumber(d.Nums[0]) + " " + uiNumber(d.Nums[1]) + "\"")
+	}
+}
+
+// The element a mark is drawn as, its box in the canvas's units, and whether it encloses anything to fill.
+func uiMarkShape(m UiMark) (string, [4]float64, bool) {
+	n := m.Nums
 	switch m.Kind {
 	case "dot":
-		if len(m.Nums) < 3 {
-			return
+		if len(n) < 3 {
+			return "", [4]float64{}, false
 		}
-		r.out.WriteString("<circle cx=\"" + uiNumber(m.Nums[0]) + "\" cy=\"" +
-			uiNumber(m.Nums[1]) + "\" r=\"" + uiNumber(m.Nums[2]) +
-			"\" fill=\"" + colour + "\"/>")
+		return "<circle cx=\"" + uiNumber(n[0]) + "\" cy=\"" + uiNumber(n[1]) + "\" r=\"" + uiNumber(n[2]) + "\"",
+			[4]float64{n[0] - n[2], n[1] - n[2], n[0] + n[2], n[1] + n[2]}, true
 	case "bar":
-		if len(m.Nums) < 4 {
-			return
+		if len(n) < 4 {
+			return "", [4]float64{}, false
 		}
-		r.out.WriteString("<rect x=\"" + uiNumber(m.Nums[0]-m.Nums[2]/2) +
-			"\" y=\"" + uiNumber(m.Nums[1]-m.Nums[3]/2) +
-			"\" width=\"" + uiNumber(m.Nums[2]) +
-			"\" height=\"" + uiNumber(m.Nums[3]) +
-			"\" fill=\"" + colour + "\"/>")
-	case "path":
-		points := uiPoints(m.Nums)
+		return "<rect x=\"" + uiNumber(n[0]-n[2]/2) + "\" y=\"" + uiNumber(n[1]-n[3]/2) + "\" width=\"" + uiNumber(n[2]) +
+			"\" height=\"" + uiNumber(n[3]) + "\"", [4]float64{n[0] - n[2]/2, n[1] - n[3]/2, n[0] + n[2]/2, n[1] + n[3]/2}, true
+	case "oval":
+		if len(n) < 4 {
+			return "", [4]float64{}, false
+		}
+		return "<ellipse cx=\"" + uiNumber(n[0]) + "\" cy=\"" + uiNumber(n[1]) + "\" rx=\"" + uiNumber(n[2]/2) +
+			"\" ry=\"" + uiNumber(n[3]/2) + "\"", [4]float64{n[0] - n[2]/2, n[1] - n[3]/2, n[0] + n[2]/2, n[1] + n[3]/2}, true
+	case "path", "patch":
+		points := uiPoints(n)
 		if points == "" {
-			return
+			return "", [4]float64{}, false
 		}
-		r.out.WriteString("<polyline points=\"" + points + "\" fill=\"none\" stroke=\"" +
-			colour + "\" stroke-width=\"" + uiNumber(uiThick(m.Attrs)) +
-			"\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>")
-	case "patch":
-		points := uiPoints(m.Nums)
-		if points == "" {
-			return
+		if m.Kind == "path" {
+			return "<polyline points=\"" + points + "\"", uiBoxOf(n), false
 		}
-		r.out.WriteString("<polygon points=\"" + points + "\" fill=\"" + colour + "\"/>")
-	case "words":
-		if len(m.Nums) < 3 {
-			return
+		return "<polygon points=\"" + points + "\"", uiBoxOf(n), true
+	case "arc", "wedge", "curve", "cutout":
+		d, box, ok := uiPathData(m)
+		if !ok {
+			return "", [4]float64{}, false
 		}
-
-		// Centred on the place both ways. Words placed by their baseline and their
-		// left edge are words the caller has to offset by hand, and every caller
-		// would offset them the same way.
-		r.out.WriteString("<text x=\"" + uiNumber(m.Nums[0]) + "\" y=\"" +
-			uiNumber(m.Nums[1]) + "\" font-size=\"" + uiNumber(m.Nums[2]) +
-			"\" fill=\"" + colour + "\" text-anchor=\"middle\"" +
-			" dominant-baseline=\"central\"" +
-			" font-family=\"system-ui,-apple-system,sans-serif\">" +
-			uiEscape(m.Text) + "</text>")
+		return "<path d=\"" + d + "\"", box, m.Kind != "arc" && m.Kind != "curve"
 	}
+	return "", [4]float64{}, false
+}
+
+func uiBoxOf(n []float64) [4]float64 {
+	box := [4]float64{math.Inf(1), math.Inf(1), math.Inf(-1), math.Inf(-1)}
+	for i := 0; i+1 < len(n); i += 2 {
+		box[0], box[1] = math.Min(box[0], n[i]), math.Min(box[1], n[i+1])
+		box[2], box[3] = math.Max(box[2], n[i]), math.Max(box[3], n[i+1])
+	}
+	if math.IsInf(box[0], 0) {
+		return [4]float64{}
+	}
+	return box
+}
+
+func uiJoinBox(a, b [4]float64) [4]float64 {
+	return [4]float64{math.Min(a[0], b[0]), math.Min(a[1], b[1]), math.Max(a[2], b[2]), math.Max(a[3], b[3])}
+}
+
+// A turn of at least a whole circle is the whole circle.
+func uiSweep(from, to float64) (float64, bool) {
+	sweep := to - from
+	if math.Abs(sweep) >= 2*math.Pi-1e-9 {
+		return sweep, true
+	}
+	return sweep, false
+}
+
+func uiOnCircle(x, y, r, at float64) (float64, float64) {
+	return x + r*math.Cos(at), y + r*math.Sin(at)
+}
+
+// SVG path data for the marks that are not one of its own shapes, and for a cutout's rings.
+func uiPathData(m UiMark) (string, [4]float64, bool) {
+	n := m.Nums
+	var d strings.Builder
+	pt := func(x, y float64) string { return uiNumber(x) + " " + uiNumber(y) }
+	circle := func(x, y, rx, ry float64) {
+		d.WriteString("M" + pt(x-rx, y) + "A" + uiNumber(rx) + " " + uiNumber(ry) + " 0 1 0 " + pt(x+rx, y) +
+			"A" + uiNumber(rx) + " " + uiNumber(ry) + " 0 1 0 " + pt(x-rx, y) + "Z")
+	}
+	switch m.Kind {
+	case "dot":
+		if len(n) < 3 {
+			return "", [4]float64{}, false
+		}
+		circle(n[0], n[1], n[2], n[2])
+		return d.String(), [4]float64{n[0] - n[2], n[1] - n[2], n[0] + n[2], n[1] + n[2]}, true
+	case "oval":
+		if len(n) < 4 {
+			return "", [4]float64{}, false
+		}
+		circle(n[0], n[1], n[2]/2, n[3]/2)
+		return d.String(), [4]float64{n[0] - n[2]/2, n[1] - n[3]/2, n[0] + n[2]/2, n[1] + n[3]/2}, true
+	case "bar":
+		if len(n) < 4 {
+			return "", [4]float64{}, false
+		}
+		x0, y0 := n[0]-n[2]/2, n[1]-n[3]/2
+		d.WriteString("M" + pt(x0, y0) + "H" + uiNumber(x0+n[2]) + "V" + uiNumber(y0+n[3]) + "H" + uiNumber(x0) + "Z")
+		return d.String(), [4]float64{x0, y0, x0 + n[2], y0 + n[3]}, true
+	case "patch":
+		if len(n) < 6 {
+			return "", [4]float64{}, false
+		}
+		for i := 0; i+1 < len(n); i += 2 {
+			if i == 0 {
+				d.WriteString("M")
+			} else {
+				d.WriteString("L")
+			}
+			d.WriteString(pt(n[i], n[i+1]))
+		}
+		d.WriteString("Z")
+		return d.String(), uiBoxOf(n), true
+	case "arc", "wedge":
+		if len(n) < 5 || n[2] <= 0 {
+			return "", [4]float64{}, false
+		}
+		x, y, r := n[0], n[1], n[2]
+		box := [4]float64{x - r, y - r, x + r, y + r}
+		sweep, whole := uiSweep(n[3], n[4])
+		if whole {
+			circle(x, y, r, r)
+			return d.String(), box, true
+		}
+		x0, y0 := uiOnCircle(x, y, r, n[3])
+		x1, y1 := uiOnCircle(x, y, r, n[4])
+		large, clockwise := "0", "1"
+		if math.Abs(sweep) > math.Pi {
+			large = "1"
+		}
+		if sweep < 0 {
+			clockwise = "0"
+		}
+		if m.Kind == "wedge" {
+			d.WriteString("M" + pt(x, y) + "L" + pt(x0, y0))
+		} else {
+			d.WriteString("M" + pt(x0, y0))
+		}
+		d.WriteString("A" + uiNumber(r) + " " + uiNumber(r) + " 0 " + large + " " + clockwise + " " + pt(x1, y1))
+		if m.Kind == "wedge" {
+			d.WriteString("Z")
+		}
+		return d.String(), box, true
+	case "curve":
+		if len(n) < 8 {
+			return "", [4]float64{}, false
+		}
+		d.WriteString("M" + pt(n[0], n[1]))
+		for i := 2; i+5 < len(n); i += 6 {
+			d.WriteString("C" + pt(n[i], n[i+1]) + " " + pt(n[i+2], n[i+3]) + " " + pt(n[i+4], n[i+5]))
+		}
+		return d.String(), uiBoxOf(n), true
+	case "cutout":
+		var box [4]float64
+		for i, ring := range m.Marks {
+			part, b, ok := uiPathData(ring)
+			if !ok || ring.Kind == "cutout" || ring.Kind == "arc" || ring.Kind == "curve" {
+				continue
+			}
+			d.WriteString(part)
+			if i == 0 {
+				box = b
+			} else {
+				box = uiJoinBox(box, b)
+			}
+		}
+		if d.Len() == 0 {
+			return "", [4]float64{}, false
+		}
+		return d.String(), box, true
+	}
+	return "", [4]float64{}, false
+}
+
+// A gradient laid across a box in the canvas's units, as CSS lays one across a box: through its middle at the angle.
+func (r *uiRender) gradient(g UiAttr, box [4]float64) string {
+	from, to, angle := uiGradientOf(g)
+	r.serial++
+	id := "hg" + strconv.Itoa(r.serial)
+	dx, dy := math.Cos(angle), math.Sin(angle)
+	w, h := box[2]-box[0], box[3]-box[1]
+	half := (math.Abs(w*dx) + math.Abs(h*dy)) / 2
+	cx, cy := (box[0]+box[2])/2, (box[1]+box[3])/2
+	r.out.WriteString("<defs><linearGradient id=\"" + id + "\" gradientUnits=\"userSpaceOnUse\" x1=\"" +
+		uiNumber(cx-dx*half) + "\" y1=\"" + uiNumber(cy-dy*half) + "\" x2=\"" + uiNumber(cx+dx*half) + "\" y2=\"" +
+		uiNumber(cy+dy*half) + "\"><stop offset=\"0\" stop-color=\"" + uiMarkColour([]UiAttr{{Kind: "paint", Word: from}}) +
+		"\"/><stop offset=\"1\" stop-color=\"" + uiMarkColour([]UiAttr{{Kind: "paint", Word: to}}) + "\"/></linearGradient></defs>")
+	return id
+}
+
+func (r *uiRender) symbol(m UiMark) {
+	if len(m.Nums) < 4 {
+		return
+	}
+	n := m.Nums
+	r.out.WriteString("<g transform=\"translate(" + uiNumber(n[0]) + " " + uiNumber(n[1]) + ") rotate(" +
+		uiNumber(n[2]*180/math.Pi) + ") scale(" + uiNumber(n[3]) + ")\"")
+	if o := uiOpacity(m.Attrs); o < 1 {
+		r.out.WriteString(" opacity=\"" + uiNumber(o) + "\"")
+	}
+	r.out.WriteString(">")
+	cropped := false
+	if c, ok := uiFind(m.Attrs, "crop"); ok && len(c.Nums) == 4 {
+		r.serial++
+		id := "hc" + strconv.Itoa(r.serial)
+		r.out.WriteString("<clipPath id=\"" + id + "\"><rect x=\"" + uiNumber(c.Nums[0]) + "\" y=\"" + uiNumber(c.Nums[1]) +
+			"\" width=\"" + uiNumber(c.Nums[2]) + "\" height=\"" + uiNumber(c.Nums[3]) + "\"/></clipPath><g clip-path=\"url(#" + id + ")\">")
+		cropped = true
+	}
+	for _, k := range m.Marks {
+		r.mark(k)
+	}
+	if cropped {
+		r.out.WriteString("</g>")
+	}
+	r.out.WriteString("</g>")
+}
+
+// Words are set to exactly the width measure says, so a program that measured them knows where they end.
+func (r *uiRender) words(m UiMark) {
+	if len(m.Nums) < 3 {
+		return
+	}
+	x, y, height := m.Nums[0], m.Nums[1], m.Nums[2]
+	wide := UiMeasure(m.Text, height)
+	cx, cy := uiAnchored(m.Attrs, x, y, wide, height)
+	r.out.WriteString("<text x=\"" + uiNumber(cx) + "\" y=\"" + uiNumber(cy) + "\" font-size=\"" + uiNumber(height) +
+		"\" fill=\"" + uiMarkColour(m.Attrs) + "\" text-anchor=\"middle\" dominant-baseline=\"central\"")
+	if wide > 0 {
+		r.out.WriteString(" textLength=\"" + uiNumber(wide) + "\" lengthAdjust=\"spacingAndGlyphs\"")
+	}
+	if w, ok := uiFind(m.Attrs, "weight"); ok {
+		r.out.WriteString(" font-weight=\"" + strconv.Itoa(w.Num) + "\"")
+	}
+	if uiFlagOf(m.Attrs, "italic") {
+		r.out.WriteString(" font-style=\"italic\"")
+	}
+	if o := uiOpacity(m.Attrs); o < 1 {
+		r.out.WriteString(" opacity=\"" + uiNumber(o) + "\"")
+	}
+	r.out.WriteString(" font-family=\"system-ui,-apple-system,sans-serif\">" + uiEscape(m.Text) + "</text>")
+}
+
+// The middle of words placed by their start, middle or end across, and their top, middle or bottom down.
+func uiAnchored(attrs []UiAttr, x, y, wide, height float64) (float64, float64) {
+	if j, ok := uiFind(attrs, "justify"); ok {
+		switch j.Word {
+		case "Start":
+			x += wide / 2
+		case "End":
+			x -= wide / 2
+		}
+	}
+	if a, ok := uiFind(attrs, "align"); ok {
+		switch a.Word {
+		case "Start":
+			y += height / 2
+		case "End":
+			y -= height / 2
+		}
+	}
+	return x, y
+}
+
+func (r *uiRender) picture(m UiMark) {
+	if len(m.Nums) < 4 {
+		return
+	}
+	n := m.Nums
+	fit := "none"
+	if f, ok := uiFind(m.Attrs, "fit"); ok {
+		switch f.Word {
+		case "Contain":
+			fit = "xMidYMid meet"
+		case "Cover":
+			fit = "xMidYMid slice"
+		}
+	}
+	r.out.WriteString("<image href=\"")
+	uiEscapeTo(&r.out, m.Text)
+	r.out.WriteString("\" x=\"" + uiNumber(n[0]-n[2]/2) + "\" y=\"" + uiNumber(n[1]-n[3]/2) + "\" width=\"" + uiNumber(n[2]) +
+		"\" height=\"" + uiNumber(n[3]) + "\" preserveAspectRatio=\"" + fit + "\"")
+	if o := uiOpacity(m.Attrs); o < 1 {
+		r.out.WriteString(" opacity=\"" + uiNumber(o) + "\"")
+	}
+	r.out.WriteString("/>")
 }
 
 // What a mark is painted. A tone naming a role becomes the colour that role is
@@ -1593,52 +2491,81 @@ func uiInputType(v string) string {
 		return "search"
 	case "Range":
 		return "range"
+	case "Time":
+		return "time"
+	case "DateTime":
+		return "datetime-local"
+	case "Email":
+		return "email"
+	case "Tel":
+		return "tel"
+	case "Url":
+		return "url"
+	case "Color":
+		return "color"
+	case "File":
+		return "file"
 	}
 	return "text"
 }
 
-// A closed set, which is the whole reason icons are a widget rather than an
-// escape hatch for arbitrary markup: every renderer can answer for all of them.
-func uiIconGlyph(name string) string {
-	switch name {
-	case "Search":
-		return "\u2315"
-	case "Close":
-		return "\u2715"
-	case "Check":
-		return "\u2713"
-	case "Plus":
-		return "\uff0b"
-	case "Minus":
-		return "\u2212"
-	case "Up":
-		return "\u2191"
-	case "Down":
-		return "\u2193"
-	case "Left":
-		return "\u2190"
-	case "Right":
-		return "\u2192"
-	case "Warning":
-		return "\u26a0"
-	case "Info":
-		return "\u2139"
-	case "Star":
-		return "\u2605"
-	case "Heart":
-		return "\u2665"
-	case "Reply":
-		return "\u21a9"
-	case "Repeat":
-		return "\u21bb"
-	case "Trash":
-		return "\u2326"
-	case "User":
-		return "\u25cf"
-	case "Menu":
-		return "\u2261"
+// The handlers sit on the header row rather than on the branch, so a click in a child is never its parent's.
+func (r *uiRender) branch(v UiView) {
+	selected := uiFlagOf(v.Attrs, "selected")
+	r.out.WriteString("<div class=\"h-branch\" role=\"treeitem\"")
+	if len(v.Children) > 0 {
+		r.out.WriteString(" aria-expanded=\"" + strconv.FormatBool(v.Flag) + "\"")
 	}
-	return "\u25a1"
+	r.out.WriteString(" aria-selected=\"" + strconv.FormatBool(selected) + "\"><div")
+	r.common("branch-head", v.Attrs)
+	if _, ok := uiFind(v.Attrs, "on"); ok {
+		r.out.WriteString(" tabindex=\"0\"")
+	}
+	r.out.WriteString("><span class=\"h-twisty\"")
+	toggle, toggling := uiFind(v.Attrs, "onToggle")
+	if len(v.Children) > 0 && r.handlers != nil && toggling {
+		r.next++
+		id := "h" + strconv.Itoa(r.next)
+		r.handlers[id] = []UiAttr{{Kind: "onToggle", heard: toggle.heard}}
+		next := ""
+		if !v.Flag {
+			next = "1"
+		}
+		r.out.WriteString(" data-h=\"" + id + "\" data-toggle=\"" + next + "\"")
+	}
+	r.out.WriteString(">")
+	if len(v.Children) > 0 {
+		if v.Flag {
+			r.out.WriteString(uiIconSvg("ChevronDown"))
+		} else {
+			r.out.WriteString(uiIconSvg("ChevronRight"))
+		}
+	}
+	r.out.WriteString("</span><span class=\"h-label\">")
+	uiEscapeTo(&r.out, v.Text)
+	r.out.WriteString("</span></div>")
+	if v.Flag && len(v.Children) > 0 {
+		r.out.WriteString("<div class=\"h-branch-kids\" role=\"group\">")
+		for _, c := range v.Children {
+			r.view(c)
+		}
+		r.out.WriteString("</div>")
+	}
+	r.out.WriteString("</div>")
+}
+
+func uiFlagOf(attrs []UiAttr, kind string) bool {
+	a, ok := uiFind(attrs, kind)
+	return ok && a.Flag
+}
+
+func uiIconSvg(name string) string {
+	shape, ok := uiIconShapes[name]
+	if !ok {
+		shape = `<rect x="3" y="3" width="18" height="18" rx="2"/>`
+	}
+	return `<svg viewBox="0 0 24 24" width="1em" height="1em" fill="none" stroke="currentColor" stroke-width="2" ` +
+		`stroke-linecap="round" stroke-linejoin="round">` + shape + `</svg>`
 }
 
 // UiHtml renders a view as a fragment of HTML, with no ids and nothing to talk
@@ -1749,12 +2676,14 @@ sock.onmessage = function (e) {
     uiTitle();
     uiCodeSync();
     uiAnchorSync();
+    uiAfter();
     return;
   }
   if (uiPatch(e.data.slice(1)) && attachScene) { attachScene(); }
   uiTitle();
   uiCodeSync();
   uiAnchorSync();
+  uiAfter();
 };
 
 ` +
@@ -1938,6 +2867,7 @@ function uiPatchAttrs(a, b) {
       if (a.checked !== on) { a.checked = on; }
       return;
     }
+    if (a.type === "file") { return; }
     var want = b.getAttribute("value");
     if (want !== null && a.value !== want) { a.value = want; }
     return;
@@ -2020,8 +2950,13 @@ root.addEventListener("click", function (e) {
   }
   var idx = parseInt(el.getAttribute("data-index") || "0", 10);
   settled = true;
-  send(el.getAttribute("data-h"), "click", "", idx);
+  uiClicked(el, idx);
 });
+function uiClicked(el, idx) {
+  var turned = el.getAttribute("data-toggle");
+  if (turned !== null) { send(el.getAttribute("data-h"), "toggle", turned, 0); }
+  else { send(el.getAttribute("data-h"), "click", "", idx); }
+}
 
 ` +
 	// A click is a press and a release on the same node, and a repaint between the
@@ -2051,20 +2986,22 @@ root.addEventListener("mouseup", function (e) {
   settled = false;
   setTimeout(function () {
     if (settled) { return; }
-    send(id, "click", "", idx);
+    uiClicked(el, idx);
   }, 0);
 });
 root.addEventListener("input", function (e) {
   var el = holder(e.target);
   if (!el) { return; }
   var t = e.target;
+  if (t.type === "radio" || t.type === "file") { return; }
   if (t.type === "checkbox") { send(el.getAttribute("data-h"), "toggle", t.checked ? "1" : "", 0); }
   else { send(el.getAttribute("data-h"), "input", t.value, 0); }
 });
 root.addEventListener("change", function (e) {
-  var el = holder(e.target);
-  if (!el || e.target.tagName !== "SELECT") { return; }
-  send(el.getAttribute("data-h"), "choose", e.target.value, 0);
+  var el = holder(e.target), t = e.target;
+  if (!el) { return; }
+  if (t.tagName === "SELECT" || t.type === "radio") { send(el.getAttribute("data-h"), "choose", t.value, 0); }
+  else if (t.type === "file") { uiSendFiles(el, t.files); }
 });
 
 ` +
@@ -2326,8 +3263,12 @@ window.addEventListener("resize", function () { uiCodeSync(); uiAnchorSync(); })
 ` +
 	// The pointer's own events: a right click, a middle click, a double click, a
 	// drag. Each goes to the innermost element around the pointer that hears it.
-	`function uiHearer(el, ev) {
-  for (; el && el !== root && el.getAttribute; el = el.parentNode) {
+	`function uiInWorld(el) {
+  var world = el && el.closest && el.closest(".h-world");
+  return world && window.uiWorldHost ? window.uiWorldHost() || el : el;
+}
+function uiHearer(el, ev) {
+  for (el = uiInWorld(el); el && el !== root && el.getAttribute; el = el.parentNode) {
     var heard = el.getAttribute("data-ev");
     if (heard && el.getAttribute("data-h") && (" " + heard + " ").indexOf(" " + ev + " ") >= 0) { return el; }
   }
@@ -2502,6 +3443,202 @@ root.addEventListener("keydown", function (e) {
   if (!el || e.target.tagName === "TEXTAREA") { return; }
   send(el.getAttribute("data-h"), "submit", e.target.value, 0);
 });
+root.addEventListener("keydown", function (e) {
+  var t = e.target;
+  if (!t.classList || !t.classList.contains("h-branch-head")) { return; }
+  if ((e.key === "Enter" || e.key === " ") && t.getAttribute("data-h")) {
+    e.preventDefault();
+    send(t.getAttribute("data-h"), "click", "", 0);
+  } else if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+    var twisty = t.querySelector(".h-twisty[data-h]");
+    if (twisty && (twisty.getAttribute("data-toggle") === "1") === (e.key === "ArrowRight")) {
+      e.preventDefault();
+      uiClicked(twisty, 0);
+    }
+  }
+});
+function uiHears(el, ev) {
+  var heard = el.getAttribute && el.getAttribute("data-ev");
+  return !!heard && !!el.getAttribute("data-h") && (" " + heard + " ").indexOf(" " + ev + " ") >= 0;
+}
+
+` +
+	// A canvas answers in its own units, through the matrix the browser drew it with.
+	`function uiLocal(el, e) {
+  if (el.tagName === "svg" && el.getScreenCTM && el.getScreenCTM()) {
+    var p = el.createSVGPoint();
+    p.x = e.clientX;
+    p.y = e.clientY;
+    p = p.matrixTransform(el.getScreenCTM().inverse());
+    return p.x + "," + p.y;
+  }
+  var r = el.getBoundingClientRect();
+  return (e.clientX - r.left) + "," + (e.clientY - r.top);
+}
+var uiReleasing = null, uiPointing = null, uiPointAt = null, uiPointOwed = false;
+document.addEventListener("pointerdown", function (e) {
+  var el = uiHearer(e.target, "press");
+  if (el) { send(el.getAttribute("data-h"), "press", uiLocal(el, e), 0); }
+  uiReleasing = uiHearer(e.target, "release");
+  uiPointing = uiHearer(e.target, "point");
+}, true);
+document.addEventListener("pointermove", function (e) {
+  var el = e.buttons && uiPointing && root.contains(uiPointing) ? uiPointing : uiHearer(e.target, "point");
+  if (!el) { return; }
+  uiPointAt = [el, uiLocal(el, e)];
+  if (uiPointOwed) { return; }
+  uiPointOwed = true;
+  requestAnimationFrame(function () {
+    uiPointOwed = false;
+    var at = uiPointAt;
+    uiPointAt = null;
+    if (at && root.contains(at[0])) { send(at[0].getAttribute("data-h"), "point", at[1], 0); }
+  });
+}, true);
+document.addEventListener("pointerup", function (e) {
+  var el = uiReleasing;
+  uiReleasing = null;
+  uiPointing = null;
+  if (el && root.contains(el)) { send(el.getAttribute("data-h"), "release", uiLocal(el, e), 0); }
+}, true);
+document.addEventListener("pointercancel", function () { uiReleasing = null; uiPointing = null; }, true);
+function uiCrossed(at, other, ev) {
+  at = uiInWorld(at);
+  other = uiInWorld(other);
+  if (at === other) { return; }
+  for (var el = at; el && el !== root && el.getAttribute; el = el.parentNode) {
+    if (uiHears(el, ev) && !(other && el.contains(other))) { send(el.getAttribute("data-h"), ev, "", 0); }
+  }
+}
+document.addEventListener("pointerover", function (e) { uiCrossed(e.target, e.relatedTarget, "enter"); }, true);
+document.addEventListener("pointerout", function (e) { uiCrossed(e.target, e.relatedTarget, "leave"); }, true);
+
+` +
+	// The window itself losing the focus is not a widget losing it: the same element has it back on return.
+	`var uiParked = null;
+document.addEventListener("focusout", function (e) {
+  var from = e.target, to = e.relatedTarget;
+  if (to) { uiCrossed(from, to, "blur"); return; }
+  setTimeout(function () {
+    if (!document.hasFocus() && document.activeElement === from) { uiParked = from; return; }
+    var now = document.activeElement;
+    uiCrossed(from, now && now !== document.body ? now : null, "blur");
+  }, 0);
+}, true);
+document.addEventListener("focusin", function (e) {
+  if (uiParked && e.target === uiParked && !e.relatedTarget) { uiParked = null; return; }
+  uiParked = null;
+  uiCrossed(e.target, e.relatedTarget, "focus");
+}, true);
+var uiWheelOn = null, uiWheelX = 0, uiWheelY = 0;
+function uiWheelSent() {
+  if (uiWheelOn && root.contains(uiWheelOn) && (uiWheelX || uiWheelY)) {
+    send(uiWheelOn.getAttribute("data-h"), "wheel", uiWheelX + "," + uiWheelY, 0);
+  }
+  uiWheelOn = null;
+  uiWheelX = uiWheelY = 0;
+}
+document.addEventListener("wheel", function (e) {
+  var el = uiHearer(e.target, "wheel");
+  if (!el) { return; }
+  e.preventDefault();
+  if (uiWheelOn && uiWheelOn !== el) { uiWheelSent(); }
+  var k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? window.innerHeight : 1;
+  if (!uiWheelOn) { requestAnimationFrame(uiWheelSent); }
+  uiWheelOn = el;
+  uiWheelX += e.deltaX * k;
+  uiWheelY += e.deltaY * k;
+}, { capture: true, passive: false });
+var uiScrolling = [];
+document.addEventListener("scroll", function (e) {
+  var el = e.target;
+  if (!uiHears(el, "scroll") || uiScrolling.indexOf(el) >= 0) { return; }
+  uiScrolling.push(el);
+  if (uiScrolling.length > 1) { return; }
+  requestAnimationFrame(function () {
+    var all = uiScrolling;
+    uiScrolling = [];
+    for (var i = 0; i < all.length; i++) {
+      if (root.contains(all[i])) {
+        send(all[i].getAttribute("data-h"), "scroll", Math.round(all[i].scrollLeft) + "," + Math.round(all[i].scrollTop), 0);
+      }
+    }
+  });
+}, true);
+var uiSizes = window.ResizeObserver ? new ResizeObserver(function (seen) {
+  for (var i = 0; i < seen.length; i++) {
+    var el = seen[i].target, r = el.getBoundingClientRect();
+    var said = Math.round(r.width) + "," + Math.round(r.height);
+    if (root.contains(el) && el.getAttribute("data-h") && el.__size !== said) {
+      el.__size = said;
+      send(el.getAttribute("data-h"), "size", said, 0);
+    }
+  }
+}) : null;
+function uiAfter() {
+  var asked = root.querySelectorAll("[data-scrollto]");
+  for (var i = 0; i < asked.length; i++) {
+    var el = asked[i], want = el.getAttribute("data-scrollto");
+    if (el.__scrollTo === want) { continue; }
+    el.__scrollTo = want;
+    var p = want.split(",");
+    el.scrollTo(p[0] | 0, p[1] | 0);
+  }
+  var sized = root.querySelectorAll('[data-ev~="size"]');
+  for (var k = 0; k < sized.length; k++) {
+    if (uiSizes && !sized[k].__observed && !sized[k].classList.contains("h-scene")) {
+      sized[k].__observed = true;
+      uiSizes.observe(sized[k]);
+    }
+  }
+}
+
+` +
+	// A file goes up in pieces small enough for any socket, the name ahead of the last.
+	`function uiSendFiles(el, files) {
+  Array.prototype.forEach.call(files, function (f) {
+    var reader = new FileReader();
+    reader.onload = function () {
+      if (!root.contains(el) || !el.getAttribute("data-h")) { return; }
+      var id = el.getAttribute("data-h"), data = String(reader.result), body = data.slice(data.indexOf(",") + 1);
+      var step = 4194304, at = 0;
+      for (; at + step < body.length; at += step) { send(id, "filepart", body.slice(at, at + step), 0); }
+      send(id, "file", btoa(unescape(encodeURIComponent(f.name))) + "," + body.slice(at), 0);
+    };
+    reader.readAsDataURL(f);
+  });
+}
+function uiCarries(dt, kind) { return !!dt && Array.prototype.indexOf.call(dt.types || [], kind) >= 0; }
+document.addEventListener("dragstart", function (e) {
+  var el = e.target && e.target.closest ? e.target.closest("[data-carry]") : null;
+  if (!el || !root.contains(el)) { return; }
+  e.dataTransfer.setData("application/x-hive", el.getAttribute("data-carry"));
+  e.dataTransfer.effectAllowed = "move";
+}, true);
+document.addEventListener("dragover", function (e) {
+  var dt = e.dataTransfer;
+  if (uiCarries(dt, "Files")) {
+    e.preventDefault();
+    dt.dropEffect = uiHearer(e.target, "file") ? "copy" : "none";
+  } else if (uiCarries(dt, "application/x-hive") && uiHearer(e.target, "drop")) {
+    e.preventDefault();
+    dt.dropEffect = "move";
+  }
+}, true);
+document.addEventListener("drop", function (e) {
+  var dt = e.dataTransfer;
+  if (uiCarries(dt, "Files")) {
+    e.preventDefault();
+    var to = uiHearer(e.target, "file");
+    if (to) { uiSendFiles(to, dt.files); }
+    return;
+  }
+  var into = uiHearer(e.target, "drop");
+  if (into && uiCarries(dt, "application/x-hive")) {
+    e.preventDefault();
+    send(into.getAttribute("data-h"), "drop", dt.getData("application/x-hive"), 0);
+  }
+}, true);
 </script>
 __EXTRA__
 </body></html>`
@@ -2552,6 +3689,13 @@ touch-action:manipulation}
 border:1px solid var(--line);border-radius:8px;padding:8px 10px;min-width:0}
 .h-input:focus,.h-textarea:focus{outline:2px solid var(--accent);border-color:transparent}
 .h-input[type=range]{padding:0;border:0;background:none;accent-color:var(--accent);cursor:pointer}
+.h-input[type=color]{width:64px;height:39px;padding:6px;cursor:pointer}
+.h-input[type=color]::-webkit-color-swatch-wrapper{padding:0}
+.h-input[type=color]::-webkit-color-swatch{border:0;border-radius:4px}
+.h-input[type=color]::-moz-color-swatch{border:0;border-radius:4px}
+.h-input[type=file]{cursor:pointer}
+.h-input[type=file]::file-selector-button{font:inherit;color:inherit;background:var(--surface);border:0;
+border-radius:6px;padding:0 10px;margin:0 8px 0 -4px;cursor:pointer}
 .h-textarea{resize:vertical;min-height:64px;width:100%}
 .h-checkbox{display:inline-flex;align-items:center;gap:6px;cursor:pointer}
 .h-noring:focus,.h-noring:focus-visible,.h-noring:focus-within{outline:none}
@@ -2600,7 +3744,41 @@ max-width:calc(100vw - 24px);box-shadow:0 12px 40px rgba(0,0,0,.3)}
 border-top-color:var(--accent);border-radius:50%;animation:h-spin .7s linear infinite}
 @keyframes h-spin{to{transform:rotate(360deg)}}
 .h-busy{opacity:.6}
-.h-icon{font-style:normal}
+.h-icon{display:inline-flex;align-items:center;justify-content:center;width:1em;height:1.5em;vertical-align:top;flex:none}
+.h-icon>svg{display:block;width:1em;height:1em}
+.h-grid,.h-stack,.h-paragraph,.h-tree{min-width:0}
+.h-stack{display:grid;grid-template-columns:minmax(0,1fr)}
+.h-stack>*{grid-area:1/1}
+.h-paragraph{display:block;white-space:pre-wrap;overflow-wrap:anywhere}
+.h-paragraph>:not(.h-text):not(.h-link):not(.h-icon){display:inline-flex;vertical-align:middle}
+.h-radio{display:flex;flex-direction:column;gap:6px}
+.h-radio.h-wrap{flex-direction:row;flex-wrap:wrap;column-gap:16px}
+.h-option{display:inline-flex;align-items:center;gap:6px;cursor:pointer}
+.h-option>input{margin:0 3px 0 4px;accent-color:var(--accent)}
+.h-progress{display:block;width:100%;height:6px;border-radius:3px;background:var(--line);overflow:hidden}
+.h-progress>div{height:100%;border-radius:3px;background:var(--accent)}
+.h-choices{display:flex;flex-direction:column;padding:4px;border:1px solid var(--line);border-radius:8px;overflow:auto}
+.h-choice,.h-tab{font:inherit;color:inherit;background:none;border:0;cursor:pointer;text-align:start}
+.h-choice{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px}
+.h-choice:hover:not(:disabled){background:var(--surface)}
+.h-choice[aria-selected=true]{background:color-mix(in srgb,var(--accent) 14%,transparent)}
+.h-tick{display:inline-flex;width:1em;height:1em;flex:none;color:var(--accent)}
+.h-tick>svg{width:1em;height:1em}
+.h-tabs{display:flex;gap:4px;box-shadow:inset 0 -1px 0 var(--line);overflow-x:auto}
+.h-tab{flex:none;color:var(--muted);padding:8px 12px;border-bottom:2px solid transparent;white-space:nowrap}
+.h-tab:hover:not(:disabled){color:inherit}
+.h-tab[aria-selected=true]{color:var(--accent);border-bottom-color:var(--accent)}
+.h-choice:disabled,.h-tab:disabled{opacity:.5;cursor:default}
+.h-tree,.h-branch,.h-branch-kids{display:flex;flex-direction:column}
+.h-branch-kids{padding-left:16px}
+.h-branch-head{display:flex;align-items:center;gap:4px;padding:2px 4px;border-radius:6px}
+.h-branch-head[data-h]{cursor:pointer}
+.h-branch-head[data-h]:hover{background:var(--surface)}
+.h-branch[aria-selected=true]>.h-branch-head{background:color-mix(in srgb,var(--accent) 14%,transparent)}
+.h-twisty{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;flex:none;color:var(--muted)}
+.h-twisty[data-h]{cursor:pointer}
+.h-twisty>svg{width:14px;height:14px}
+.h-label{white-space:pre;overflow:hidden;text-overflow:ellipsis}
 .h-image{max-width:100%;height:auto;display:block}
 .h-closed::after{content:"disconnected";position:fixed;bottom:12px;left:12px;
 background:var(--danger);color:#fff;padding:4px 10px;border-radius:6px;font-size:12px}
@@ -3409,6 +4587,40 @@ func uiMeaning(attrs []UiAttr, kind string, value string, index int) (any, bool)
 		case kind == "size" && a.Kind == "onSize" && h.FnSize != nil:
 			wide, tall := uiPair(value)
 			return h.FnSize(int(wide), int(tall)), true
+		case kind == "enter" && a.Kind == "onEnter", kind == "leave" && a.Kind == "onLeave",
+			kind == "focus" && a.Kind == "onFocus", kind == "blur" && a.Kind == "onBlur":
+			return h.Msg, true
+		case kind == "wheel" && a.Kind == "onWheel" && h.FnLook != nil,
+			kind == "press" && a.Kind == "onPress" && h.FnLook != nil,
+			kind == "point" && a.Kind == "onPoint" && h.FnLook != nil,
+			kind == "release" && a.Kind == "onRelease" && h.FnLook != nil:
+			x, y := uiPair(value)
+			return h.FnLook(x, y), true
+		case kind == "scroll" && a.Kind == "onScroll" && h.FnSize != nil:
+			x, y := uiPair(value)
+			return h.FnSize(int(x), int(y)), true
+		case kind == "drop" && a.Kind == "onDrop" && h.FnStr != nil:
+			return h.FnStr(value), true
+		case kind == "file" && a.Kind == "onFile" && h.FnFile != nil:
+			name, contents, ok := uiFileOf(value)
+			if !ok {
+				return nil, false
+			}
+			return h.FnFile(name, contents), true
+		case kind == "click" && a.Kind == "choice" && h.FnStr != nil:
+			return h.FnStr(a.Word), true
+		case (kind == "hit" && a.Kind == "onHit" || kind == "over" && a.Kind == "onOver") && h.FnHit != nil:
+			if uiScenePicker == nil {
+				return nil, false
+			}
+			tag, x, y, z := uiScenePicker(attrs, value)
+			return h.FnHit(tag, x, y, z), true
+		case kind == "snapshot" && a.Kind == "onSnapshot" && h.FnStr != nil:
+			shot, err := base64.StdEncoding.DecodeString(value)
+			if err != nil {
+				return nil, false
+			}
+			return h.FnStr(string(shot)), true
 		}
 	}
 	return nil, false
@@ -3753,6 +4965,7 @@ func (w *uiWindow) reseed(conn NetWsConnection) {
 
 // Everything a socket says, turned into messages and posted to the fold.
 func uiPump(w *uiWindow, addr SyslinkAddress, conn NetWsConnection) {
+	parts := uiFileParts{}
 	for {
 		got := NetWsReceive(conn)
 		if got.IsError() {
@@ -3760,6 +4973,10 @@ func uiPump(w *uiWindow, addr SyslinkAddress, conn NetWsConnection) {
 		}
 		id, kind, value, index := uiEvent(got.Ok())
 		if id == "" {
+			continue
+		}
+		value, whole := parts.take(id, kind, value)
+		if !whole {
 			continue
 		}
 
@@ -3798,10 +5015,56 @@ func uiCrashLog() {
 
 func uiDrawnAfter(kind string) bool {
 	switch kind {
-	case "frame", "click", "input", "submit", "choose", "toggle", "key", "edit", "menu", "middle", "double", "jump":
+	case "frame", "click", "input", "submit", "choose", "toggle", "key", "edit", "menu", "middle", "double", "jump",
+		"enter", "leave", "focus", "blur", "press", "release", "drop", "file":
 		return true
 	}
 	return false
+}
+
+// A file crosses as its name and its bytes, each in base64, because a name may hold any character and a file any byte.
+func uiFileOf(value string) (string, string, bool) {
+	name, body, ok := strings.Cut(value, ",")
+	if !ok {
+		return "", "", false
+	}
+	n, err := base64.StdEncoding.DecodeString(name)
+	if err != nil {
+		return "", "", false
+	}
+	b, err := base64.StdEncoding.DecodeString(body)
+	if err != nil {
+		return "", "", false
+	}
+	return string(n), string(b), true
+}
+
+// The pieces of files still arriving, by the widget they are for.
+type uiFileParts map[string]*strings.Builder
+
+// An event as it can be delivered: a piece of a file is held, and the file's last carries the rest in front of it.
+func (p uiFileParts) take(id, kind, value string) (string, bool) {
+	if kind == "filepart" {
+		if p[id] == nil {
+			p[id] = &strings.Builder{}
+		}
+		p[id].WriteString(value)
+		return "", false
+	}
+	if kind == "file" && p[id] != nil {
+		name, last, _ := strings.Cut(value, ",")
+		value = name + "," + p[id].String() + last
+		delete(p, id)
+	}
+	if kind == "snapshot" && p[id] != nil {
+		value = p[id].String() + value
+		delete(p, id)
+	}
+	return value, true
+}
+
+func uiFileValue(name string, contents []byte) string {
+	return base64.StdEncoding.EncodeToString([]byte(name)) + "," + base64.StdEncoding.EncodeToString(contents)
 }
 
 // Reads the four fields the shell sends. The payload is this program's own
@@ -4043,4 +5306,329 @@ func uiBrowsers() []string {
 			"microsoft-edge", "brave-browser", "vivaldi",
 		}
 	}
+}
+
+// What every Icon is drawn as: a Lucide icon (lucide.dev, ISC; see runtime/NOTICE.md), stroked in the current colour.
+
+var uiIconShapes = map[string]string{
+	"Search":          `<path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/>`,
+	"Close":           `<path d="M18 6 6 18"/><path d="m6 6 12 12"/>`,
+	"Check":           `<path d="M20 6 9 17l-5-5"/>`,
+	"Plus":            `<path d="M5 12h14"/><path d="M12 5v14"/>`,
+	"Minus":           `<path d="M5 12h14"/>`,
+	"Up":              `<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>`,
+	"Down":            `<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>`,
+	"Left":            `<path d="m12 19-7-7 7-7"/><path d="M19 12H5"/>`,
+	"Right":           `<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>`,
+	"Warning":         `<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>`,
+	"Info":            `<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>`,
+	"Star":            `<path d="M11.525 2.295a.53.53 0 0 1 .95 0l2.31 4.679a2.123 2.123 0 0 0 1.595 1.16l5.166.756a.53.53 0 0 1 .294.904l-3.736 3.638a2.123 2.123 0 0 0-.611 1.878l.882 5.14a.53.53 0 0 1-.771.56l-4.618-2.428a2.122 2.122 0 0 0-1.973 0L6.396 21.01a.53.53 0 0 1-.77-.56l.881-5.139a2.122 2.122 0 0 0-.611-1.879L2.16 9.795a.53.53 0 0 1 .294-.906l5.165-.755a2.122 2.122 0 0 0 1.597-1.16z"/>`,
+	"Heart":           `<path d="M2 9.5a5.5 5.5 0 0 1 9.591-3.676.56.56 0 0 0 .818 0A5.49 5.49 0 0 1 22 9.5c0 2.29-1.5 4-3 5.5l-5.492 5.313a2 2 0 0 1-3 .019L5 15c-1.5-1.5-3-3.2-3-5.5"/>`,
+	"Reply":           `<path d="M20 18v-2a4 4 0 0 0-4-4H4"/><path d="m9 17-5-5 5-5"/>`,
+	"Repeat":          `<path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/>`,
+	"Trash":           `<path d="M10 11v6"/><path d="M14 11v6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>`,
+	"User":            `<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>`,
+	"Menu":            `<path d="M4 5h16"/><path d="M4 12h16"/><path d="M4 19h16"/>`,
+	"ChevronUp":       `<path d="m18 15-6-6-6 6"/>`,
+	"ChevronDown":     `<path d="m6 9 6 6 6-6"/>`,
+	"ChevronLeft":     `<path d="m15 18-6-6 6-6"/>`,
+	"ChevronRight":    `<path d="m9 18 6-6-6-6"/>`,
+	"ChevronsUp":      `<path d="m17 11-5-5-5 5"/><path d="m17 18-5-5-5 5"/>`,
+	"ChevronsDown":    `<path d="m7 6 5 5 5-5"/><path d="m7 13 5 5 5-5"/>`,
+	"ChevronsLeft":    `<path d="m11 17-5-5 5-5"/><path d="m18 17-5-5 5-5"/>`,
+	"ChevronsRight":   `<path d="m6 17 5-5-5-5"/><path d="m13 17 5-5-5-5"/>`,
+	"UpRight":         `<path d="M7 7h10v10"/><path d="M7 17 17 7"/>`,
+	"UpLeft":          `<path d="M7 17V7h10"/><path d="M17 17 7 7"/>`,
+	"DownRight":       `<path d="m7 7 10 10"/><path d="M17 7v10H7"/>`,
+	"DownLeft":        `<path d="M17 7 7 17"/><path d="M17 17H7V7"/>`,
+	"CornerDownLeft":  `<path d="M20 4v7a4 4 0 0 1-4 4H4"/><path d="m9 10-5 5 5 5"/>`,
+	"CornerUpRight":   `<path d="m15 14 5-5-5-5"/><path d="M4 20v-7a4 4 0 0 1 4-4h12"/>`,
+	"Expand":          `<path d="m15 15 6 6"/><path d="m15 9 6-6"/><path d="M21 16v5h-5"/><path d="M21 8V3h-5"/><path d="M3 16v5h5"/><path d="m3 21 6-6"/><path d="M3 8V3h5"/><path d="M9 9 3 3"/>`,
+	"Shrink":          `<path d="m15 15 6 6m-6-6v4.8m0-4.8h4.8"/><path d="M9 19.8V15m0 0H4.2M9 15l-6 6"/><path d="M15 4.2V9m0 0h4.8M15 9l6-6"/><path d="M9 4.2V9m0 0H4.2M9 9 3 3"/>`,
+	"Maximize":        `<path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/>`,
+	"Minimize":        `<path d="M8 3v3a2 2 0 0 1-2 2H3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M16 21v-3a2 2 0 0 1 2-2h3"/>`,
+	"ExternalLink":    `<path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>`,
+	"Undo":            `<path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11"/>`,
+	"Redo":            `<path d="m15 14 5-5-5-5"/><path d="M20 9H9.5A5.5 5.5 0 0 0 4 14.5A5.5 5.5 0 0 0 9.5 20H13"/>`,
+	"Refresh":         `<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>`,
+	"RotateLeft":      `<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/>`,
+	"RotateRight":     `<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>`,
+	"Home":            `<path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8"/><path d="M3 10a2 2 0 0 1 .709-1.528l7-6a2 2 0 0 1 2.582 0l7 6A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>`,
+	"More":            `<circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/>`,
+	"MoreVertical":    `<circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/>`,
+	"Grip":            `<circle cx="9" cy="12" r="1"/><circle cx="9" cy="5" r="1"/><circle cx="9" cy="19" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="15" cy="5" r="1"/><circle cx="15" cy="19" r="1"/>`,
+	"Move":            `<path d="M12 2v20"/><path d="m15 19-3 3-3-3"/><path d="m19 9 3 3-3 3"/><path d="M2 12h20"/><path d="m5 9-3 3 3 3"/><path d="m9 5 3-3 3 3"/>`,
+	"LogIn":           `<path d="m10 17 5-5-5-5"/><path d="M15 12H3"/><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>`,
+	"LogOut":          `<path d="m16 17 5-5-5-5"/><path d="M21 12H9"/><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>`,
+	"Sidebar":         `<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/>`,
+	"Columns":         `<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M12 3v18"/>`,
+	"Edit":            `<path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/>`,
+	"Copy":            `<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>`,
+	"Clipboard":       `<rect width="8" height="4" x="8" y="2" rx="1" ry="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>`,
+	"ClipboardCheck":  `<rect width="8" height="4" x="8" y="2" rx="1" ry="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="m9 14 2 2 4-4"/>`,
+	"Cut":             `<circle cx="6" cy="6" r="3"/><path d="M8.12 8.12 12 12"/><path d="M20 4 8.12 15.88"/><circle cx="6" cy="18" r="3"/><path d="M14.8 14.8 20 20"/>`,
+	"Save":            `<path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7"/><path d="M7 3v4a1 1 0 0 0 1 1h7"/>`,
+	"Download":        `<path d="M12 15V3"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/>`,
+	"Upload":          `<path d="M12 3v12"/><path d="m17 8-5-5-5 5"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>`,
+	"Share":           `<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"/><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"/>`,
+	"Send":            `<path d="M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z"/><path d="m21.854 2.147-10.94 10.939"/>`,
+	"Print":           `<path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><path d="M6 9V3a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v6"/><rect x="6" y="14" width="12" height="8" rx="1"/>`,
+	"Filter":          `<path d="M10 20a1 1 0 0 0 .553.895l2 1A1 1 0 0 0 14 21v-7a2 2 0 0 1 .517-1.341L21.74 4.67A1 1 0 0 0 21 3H3a1 1 0 0 0-.742 1.67l7.225 7.989A2 2 0 0 1 10 14z"/>`,
+	"Sort":            `<path d="m21 16-4 4-4-4"/><path d="M17 20V4"/><path d="m3 8 4-4 4 4"/><path d="M7 4v16"/>`,
+	"SortUp":          `<path d="m3 8 4-4 4 4"/><path d="M7 4v16"/><path d="M11 12h4"/><path d="M11 16h7"/><path d="M11 20h10"/>`,
+	"SortDown":        `<path d="m3 16 4 4 4-4"/><path d="M7 20V4"/><path d="M11 4h10"/><path d="M11 8h7"/><path d="M11 12h4"/>`,
+	"ZoomIn":          `<circle cx="11" cy="11" r="8"/><line x1="21" x2="16.65" y1="21" y2="16.65"/><line x1="11" x2="11" y1="8" y2="14"/><line x1="8" x2="14" y1="11" y2="11"/>`,
+	"ZoomOut":         `<circle cx="11" cy="11" r="8"/><line x1="21" x2="16.65" y1="21" y2="16.65"/><line x1="8" x2="14" y1="11" y2="11"/>`,
+	"Settings":        `<path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915"/><circle cx="12" cy="12" r="3"/>`,
+	"Sliders":         `<path d="M10 5H3"/><path d="M12 19H3"/><path d="M14 3v4"/><path d="M16 17v4"/><path d="M21 12h-9"/><path d="M21 19h-5"/><path d="M21 5h-7"/><path d="M8 10v4"/><path d="M8 12H3"/>`,
+	"Wrench":          `<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.106-3.105c.32-.322.863-.22.983.218a6 6 0 0 1-8.259 7.057l-7.91 7.91a1 1 0 0 1-2.999-3l7.91-7.91a6 6 0 0 1 7.057-8.259c.438.12.54.662.219.984z"/>`,
+	"Lock":            `<rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>`,
+	"Unlock":          `<rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/>`,
+	"Key":             `<path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"/><circle cx="16.5" cy="7.5" r=".5" fill="currentColor"/>`,
+	"Shield":          `<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/>`,
+	"ShieldCheck":     `<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>`,
+	"Eye":             `<path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/>`,
+	"EyeOff":          `<path d="M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49"/><path d="M14.084 14.158a3 3 0 0 1-4.242-4.242"/><path d="M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143"/><path d="m2 2 20 20"/>`,
+	"Pin":             `<path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/>`,
+	"Unpin":           `<path d="M12 17v5"/><path d="M15 9.34V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H7.89"/><path d="m2 2 20 20"/><path d="M9 9v1.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h11"/>`,
+	"Bookmark":        `<path d="M17 3a2 2 0 0 1 2 2v15a1 1 0 0 1-1.496.868l-4.512-2.578a2 2 0 0 0-1.984 0l-4.512 2.578A1 1 0 0 1 5 20V5a2 2 0 0 1 2-2z"/>`,
+	"Tag":             `<path d="M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42z"/><circle cx="7.5" cy="7.5" r=".5" fill="currentColor"/>`,
+	"Flag":            `<path d="M4 22V4a1 1 0 0 1 .4-.8A6 6 0 0 1 8 2c3 0 5 2 7.333 2q2 0 3.067-.8A1 1 0 0 1 20 4v10a1 1 0 0 1-.4.8A6 6 0 0 1 16 16c-3 0-5-2-8-2a6 6 0 0 0-4 1.528"/>`,
+	"Link":            `<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>`,
+	"Unlink":          `<path d="m18.84 12.25 1.72-1.71h-.02a5.004 5.004 0 0 0-.12-7.07 5.006 5.006 0 0 0-6.95 0l-1.72 1.71"/><path d="m5.17 11.75-1.71 1.71a5.004 5.004 0 0 0 .12 7.07 5.006 5.006 0 0 0 6.95 0l1.71-1.71"/><line x1="8" x2="8" y1="2" y2="5"/><line x1="2" x2="5" y1="8" y2="8"/><line x1="16" x2="16" y1="19" y2="22"/><line x1="19" x2="22" y1="16" y2="16"/>`,
+	"Paperclip":       `<path d="m16 6-8.414 8.586a2 2 0 0 0 2.829 2.829l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551"/>`,
+	"Archive":         `<rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/>`,
+	"Inbox":           `<polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>`,
+	"Bell":            `<path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/>`,
+	"BellOff":         `<path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M17 17H4a1 1 0 0 1-.74-1.673C4.59 13.956 6 12.499 6 8a6 6 0 0 1 .258-1.742"/><path d="m2 2 20 20"/><path d="M8.668 3.01A6 6 0 0 1 18 8c0 2.687.77 4.653 1.707 6.05"/>`,
+	"Mail":            `<path d="m22 7-8.991 5.727a2 2 0 0 1-2.009 0L2 7"/><rect x="2" y="4" width="20" height="16" rx="2"/>`,
+	"Message":         `<path d="M22 17a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 21.286V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2z"/>`,
+	"Messages":        `<path d="M16 10a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 14.286V4a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/><path d="M20 9a2 2 0 0 1 2 2v10.286a.71.71 0 0 1-1.212.502l-2.202-2.202A2 2 0 0 0 17.172 19H10a2 2 0 0 1-2-2v-1"/>`,
+	"Phone":           `<path d="M13.832 16.568a1 1 0 0 0 1.213-.303l.355-.465A2 2 0 0 1 17 15h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2A18 18 0 0 1 2 4a2 2 0 0 1 2-2h3a2 2 0 0 1 2 2v3a2 2 0 0 1-.8 1.6l-.468.351a1 1 0 0 0-.292 1.233 14 14 0 0 0 6.392 6.384"/>`,
+	"Video":           `<path d="m16 13 5.223 3.482a.5.5 0 0 0 .777-.416V7.87a.5.5 0 0 0-.752-.432L16 10.5"/><rect x="2" y="6" width="14" height="12" rx="2"/>`,
+	"VideoOff":        `<path d="M10.66 6H14a2 2 0 0 1 2 2v2.5l5.248-3.062A.5.5 0 0 1 22 7.87v8.196"/><path d="M16 16a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h2"/><path d="m2 2 20 20"/>`,
+	"Mic":             `<path d="M12 19v3"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><rect x="9" y="2" width="6" height="13" rx="3"/>`,
+	"MicOff":          `<path d="M12 19v3"/><path d="M15 9.34V5a3 3 0 0 0-5.68-1.33"/><path d="M16.95 16.95A7 7 0 0 1 5 12v-2"/><path d="M18.89 13.23A7 7 0 0 0 19 12v-2"/><path d="m2 2 20 20"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12"/>`,
+	"Camera":          `<path d="M13.997 4a2 2 0 0 1 1.76 1.05l.486.9A2 2 0 0 0 18.003 7H20a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h1.997a2 2 0 0 0 1.759-1.048l.489-.904A2 2 0 0 1 10.004 4z"/><circle cx="12" cy="13" r="3"/>`,
+	"Image":           `<rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>`,
+	"Film":            `<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M7 3v18"/><path d="M3 7.5h4"/><path d="M3 12h18"/><path d="M3 16.5h4"/><path d="M17 3v18"/><path d="M17 7.5h4"/><path d="M17 16.5h4"/>`,
+	"Music":           `<path d="M21 16V3a1 1 0 0 0-1.28-.96l-10 2.917a1 1 0 0 0-.72.96V19"/><circle cx="18" cy="16" r="3"/><circle cx="6" cy="19" r="3"/>`,
+	"Headphones":      `<path d="M3 14h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-7a9 9 0 0 1 18 0v7a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3"/>`,
+	"Volume":          `<path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="M16 9a5 5 0 0 1 0 6"/><path d="M19.364 18.364a9 9 0 0 0 0-12.728"/>`,
+	"VolumeLow":       `<path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="M16 9a5 5 0 0 1 0 6"/>`,
+	"Mute":            `<path d="M11 4.702a.7.7 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.7.7 0 0 0 11 19.298z"/><path d="m16.5 14.5 5-5"/><path d="m16.5 9.5 5 5"/>`,
+	"Play":            `<path d="M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z"/>`,
+	"Pause":           `<rect x="14" y="3" width="5" height="18" rx="1"/><rect x="5" y="3" width="5" height="18" rx="1"/>`,
+	"Stop":            `<rect width="18" height="18" x="3" y="3" rx="2"/>`,
+	"SkipForward":     `<path d="M21 4v16"/><path d="M6.029 4.285A2 2 0 0 0 3 6v12a2 2 0 0 0 3.029 1.715l9.997-5.998a2 2 0 0 0 .003-3.432z"/>`,
+	"SkipBack":        `<path d="M17.971 4.285A2 2 0 0 1 21 6v12a2 2 0 0 1-3.029 1.715l-9.997-5.998a2 2 0 0 1-.003-3.432z"/><path d="M3 20V4"/>`,
+	"FastForward":     `<path d="M12 6a2 2 0 0 1 3.414-1.414l6 6a2 2 0 0 1 0 2.828l-6 6A2 2 0 0 1 12 18z"/><path d="M2 6a2 2 0 0 1 3.414-1.414l6 6a2 2 0 0 1 0 2.828l-6 6A2 2 0 0 1 2 18z"/>`,
+	"Rewind":          `<path d="M12 6a2 2 0 0 0-3.414-1.414l-6 6a2 2 0 0 0 0 2.828l6 6A2 2 0 0 0 12 18z"/><path d="M22 6a2 2 0 0 0-3.414-1.414l-6 6a2 2 0 0 0 0 2.828l6 6A2 2 0 0 0 22 18z"/>`,
+	"Shuffle":         `<path d="m18 14 4 4-4 4"/><path d="m18 2 4 4-4 4"/><path d="M2 18h1.973a4 4 0 0 0 3.3-1.7l5.454-8.6a4 4 0 0 1 3.3-1.7H22"/><path d="M2 6h1.972a4 4 0 0 1 3.6 2.2"/><path d="M22 18h-6.041a4 4 0 0 1-3.3-1.8l-.359-.45"/>`,
+	"File":            `<path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z"/><path d="M14 2v5a1 1 0 0 0 1 1h5"/>`,
+	"FileText":        `<path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z"/><path d="M14 2v5a1 1 0 0 0 1 1h5"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/>`,
+	"FilePlus":        `<path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z"/><path d="M14 2v5a1 1 0 0 0 1 1h5"/><path d="M9 15h6"/><path d="M12 18v-6"/>`,
+	"Files":           `<path d="M15 2h-4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V8"/><path d="M16.706 2.706A2.4 2.4 0 0 0 15 2v5a1 1 0 0 0 1 1h5a2.4 2.4 0 0 0-.706-1.706z"/><path d="M5 7a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h8a2 2 0 0 0 1.732-1"/>`,
+	"Folder":          `<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>`,
+	"FolderOpen":      `<path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/>`,
+	"FolderPlus":      `<path d="M12 10v6"/><path d="M9 13h6"/><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>`,
+	"Code":            `<path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/>`,
+	"Terminal":        `<path d="M12 19h8"/><path d="m4 17 6-6-6-6"/>`,
+	"Database":        `<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/>`,
+	"Server":          `<rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/>`,
+	"Cloud":           `<path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/>`,
+	"CloudUpload":     `<path d="M12 13v8"/><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="m8 17 4-4 4 4"/>`,
+	"CloudDownload":   `<path d="M12 13v8l-4-4"/><path d="m12 21 4-4"/><path d="M4.393 15.269A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.436 8.284"/>`,
+	"HardDrive":       `<path d="M10 16h.01"/><path d="M2.212 11.577a2 2 0 0 0-.212.896V18a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-5.527a2 2 0 0 0-.212-.896L18.55 5.11A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><path d="M21.946 12.013H2.054"/><path d="M6 16h.01"/>`,
+	"Package":         `<path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z"/><path d="M12 22V12"/><polyline points="3.29 7 12 12 20.71 7"/><path d="m7.5 4.27 9 5.15"/>`,
+	"Layers":          `<path d="M12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83z"/><path d="M2 12a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 12"/><path d="M2 17a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 17"/>`,
+	"Dashboard":       `<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>`,
+	"Grid":            `<rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/>`,
+	"List":            `<path d="M3 5h.01"/><path d="M3 12h.01"/><path d="M3 19h.01"/><path d="M8 5h13"/><path d="M8 12h13"/><path d="M8 19h13"/>`,
+	"ListOrdered":     `<path d="M11 5h10"/><path d="M11 12h10"/><path d="M11 19h10"/><path d="M4 4h1v5"/><path d="M4 9h2"/><path d="M6.5 20H3.4c0-1 2.6-1.925 2.6-3.5a1.5 1.5 0 0 0-2.6-1.02"/>`,
+	"ListChecks":      `<path d="M13 5h8"/><path d="M13 12h8"/><path d="M13 19h8"/><path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/>`,
+	"Kanban":          `<path d="M5 3v14"/><path d="M12 3v8"/><path d="M19 3v18"/>`,
+	"Calendar":        `<path d="M8 2v3"/><path d="M16 2v3"/><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/>`,
+	"Clock":           `<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>`,
+	"Timer":           `<line x1="10" x2="14" y1="2" y2="2"/><line x1="12" x2="15" y1="14" y2="11"/><circle cx="12" cy="14" r="8"/>`,
+	"Hourglass":       `<path d="M5 22h14"/><path d="M5 2h14"/><path d="M17 22v-4.172a2 2 0 0 0-.586-1.414L12 12l-4.414 4.414A2 2 0 0 0 7 17.828V22"/><path d="M7 2v4.172a2 2 0 0 0 .586 1.414L12 12l4.414-4.414A2 2 0 0 0 17 6.172V2"/>`,
+	"Alarm":           `<circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2"/><path d="M5 3 2 6"/><path d="m22 6-3-3"/><path d="M6.38 18.7 4 21"/><path d="M17.64 18.67 20 21"/>`,
+	"History":         `<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>`,
+	"Users":           `<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><path d="M16 3.128a4 4 0 0 1 0 7.744"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><circle cx="9" cy="7" r="4"/>`,
+	"UserPlus":        `<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" x2="19" y1="8" y2="14"/><line x1="22" x2="16" y1="11" y2="11"/>`,
+	"UserMinus":       `<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="22" x2="16" y1="11" y2="11"/>`,
+	"UserCheck":       `<path d="m16 11 2 2 4-4"/><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>`,
+	"Contact":         `<path d="M16 2v2"/><path d="M7 21v-2a2 2 0 012-2h6a2 2 0 012 2v2"/><path d="M8 2v2"/><circle cx="12" cy="10" r="3"/><rect x="3" y="3" width="18" height="18" rx="2"/>`,
+	"Smile":           `<path d="M15 10V9"/><path d="M16.472 15a6 6 0 01-8.943 0"/><path d="M9 10V9"/><circle cx="12" cy="12" r="10"/>`,
+	"Frown":           `<path d="M15 10V9"/><path d="M9 10V9"/><path d="M9 16a5 5 0 016 0"/><circle cx="12" cy="12" r="10"/>`,
+	"Meh":             `<path d="M15 10V9"/><path d="M8 16h8"/><path d="M9 10V9"/><circle cx="12" cy="12" r="10"/>`,
+	"Laugh":           `<path d="M15 10V9"/><path d="M7.084 14.302a5.12 5.12 0 009.833 0 .24.24 0 00-.235-.302H7.32a.24.24 0 00-.235.302"/><path d="M9 10V9"/><circle cx="12" cy="12" r="10"/>`,
+	"ThumbsUp":        `<path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88Z"/><path d="M7 10v12"/>`,
+	"ThumbsDown":      `<path d="M9 18.12 10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H20a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22a3.13 3.13 0 0 1-3-3.88Z"/><path d="M17 14V2"/>`,
+	"Award":           `<path d="m15.477 12.89 1.515 8.526a.5.5 0 0 1-.81.47l-3.58-2.687a1 1 0 0 0-1.197 0l-3.586 2.686a.5.5 0 0 1-.81-.469l1.514-8.526"/><circle cx="12" cy="8" r="6"/>`,
+	"Trophy":          `<path d="M10 14.66V17a1 1 0 0 1-1 1 2 2 0 0 0-2 2v2"/><path d="M14 14.66V17a1 1 0 0 0 1 1 2 2 0 0 1 2 2v2"/><path d="M17.916 10H19.5A2.5 2.5 0 0 0 22 7.5V5a1 1 0 0 0-1-1h-3"/><path d="M4 22h16"/><path d="M6 9a6 6 0 0 0 12 0V3a1 1 0 0 0-1-1H7a1 1 0 0 0-1 1z"/><path d="M6.084 10H4.5A2.5 2.5 0 0 1 2 7.5V5a1 1 0 0 1 1-1h3"/>`,
+	"Crown":           `<path d="M11.562 3.266a.5.5 0 0 1 .876 0L15.39 8.87a1 1 0 0 0 1.516.294L21.183 5.5a.5.5 0 0 1 .798.519l-2.834 10.246a1 1 0 0 1-.956.734H5.81a1 1 0 0 1-.957-.734L2.02 6.02a.5.5 0 0 1 .798-.519l4.276 3.664a1 1 0 0 0 1.516-.294z"/><path d="M5 21h14"/>`,
+	"Gift":            `<path d="M12 7v14"/><path d="M20 11v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-8"/><path d="M7.5 7a1 1 0 0 1 0-5A4.8 8 0 0 1 12 7a4.8 8 0 0 1 4.5-5 1 1 0 0 1 0 5"/><rect x="3" y="7" width="18" height="4" rx="1"/>`,
+	"Cake":            `<path d="M20 21v-8a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8"/><path d="M4 16s.5-1 2-1 2.5 2 4 2 2.5-2 4-2 2.5 2 4 2 2-1 2-1"/><path d="M2 21h20"/><path d="M7 8v3"/><path d="M12 8v3"/><path d="M17 8v3"/><path d="M7 4h.01"/><path d="M12 4h.01"/><path d="M17 4h.01"/>`,
+	"Hand":            `<path d="M18 11V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2"/><path d="M14 10V4a2 2 0 0 0-2-2a2 2 0 0 0-2 2v2"/><path d="M10 10.5V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/>`,
+	"Handshake":       `<path d="m11 17 2 2a1 1 0 1 0 3-3"/><path d="m14 14 2.5 2.5a1 1 0 1 0 3-3l-3.88-3.88a3 3 0 0 0-4.24 0l-.88.88a1 1 0 1 1-3-3l2.81-2.81a5.79 5.79 0 0 1 7.06-.87l.47.28a2 2 0 0 0 1.42.25L21 4"/><path d="m21 3 1 11h-2"/><path d="M3 3 2 14l6.5 6.5a1 1 0 1 0 3-3"/><path d="M3 4h8"/>`,
+	"Accessibility":   `<circle cx="16" cy="4" r="1"/><path d="m18 19 1-7-6 1"/><path d="m5 8 3-3 5.5 3-2.36 3.5"/><path d="M4.24 14.5a5 5 0 0 0 6.88 6"/><path d="M13.76 17.5a5 5 0 0 0-6.88-6"/>`,
+	"Baby":            `<path d="M10 16c.5.3 1.2.5 2 .5s1.5-.2 2-.5"/><path d="M15 12h.01"/><path d="M19.38 6.813A9 9 0 0 1 20.8 10.2a2 2 0 0 1 0 3.6 9 9 0 0 1-17.6 0 2 2 0 0 1 0-3.6A9 9 0 0 1 12 3c2 0 3.5 1.1 3.5 2.5s-.9 2.5-2 2.5c-.8 0-1.5-.4-1.5-1"/><path d="M9 12h.01"/>`,
+	"CircleAlert":     `<circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/>`,
+	"CircleX":         `<circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/>`,
+	"CircleCheck":     `<circle cx="12" cy="12" r="10"/><path d="m16 9-5.5 5.5L8 12"/>`,
+	"CircleHelp":      `<circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/>`,
+	"Ban":             `<circle cx="12" cy="12" r="10"/><path d="M4.929 4.929 19.07 19.071"/>`,
+	"Loader":          `<path d="M12 2v4"/><path d="m16.2 7.8 2.9-2.9"/><path d="M18 12h4"/><path d="m16.2 16.2 2.9 2.9"/><path d="M12 18v4"/><path d="m4.9 19.1 2.9-2.9"/><path d="M2 12h4"/><path d="m4.9 4.9 2.9 2.9"/>`,
+	"Activity":        `<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>`,
+	"Zap":             `<path d="M15.914 4a1.5 1.5 0 00-2.474-1.561l-9 9A1.5 1.5 0 005.5 14h4.002a.5.5 0 01.471.666L8.086 20a1.5 1.5 0 002.475 1.56l9-9A1.5 1.5 0 0018.5 10h-3.997a.5.5 0 01-.472-.667z"/>`,
+	"Flame":           `<path d="M12 3q1 4 4 6.5t3 5.5a1 1 0 0 1-14 0 5 5 0 0 1 1-3 1 1 0 0 0 5 0c0-2-1.5-3-1.5-5q0-2 2.5-4"/>`,
+	"Battery":         `<path d="M 22 14 L 22 10"/><rect x="2" y="6" width="16" height="12" rx="2"/>`,
+	"BatteryLow":      `<path d="M22 14v-4"/><path d="M6 14v-4"/><rect x="2" y="6" width="16" height="12" rx="2"/>`,
+	"BatteryCharging": `<path d="m11 7-3 5h4l-3 5"/><path d="M14.856 6H16a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.935"/><path d="M22 14v-4"/><path d="M5.14 18H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h2.936"/>`,
+	"Wifi":            `<path d="M12 20h.01"/><path d="M2 8.82a15 15 0 0 1 20 0"/><path d="M5 12.859a10 10 0 0 1 14 0"/><path d="M8.5 16.429a5 5 0 0 1 7 0"/>`,
+	"WifiOff":         `<path d="M12 20h.01"/><path d="M8.5 16.429a5 5 0 0 1 7 0"/><path d="M5 12.859a10 10 0 0 1 5.17-2.69"/><path d="M19 12.859a10 10 0 0 0-2.007-1.523"/><path d="M2 8.82a15 15 0 0 1 4.177-2.643"/><path d="M22 8.82a15 15 0 0 0-11.288-3.764"/><path d="m2 2 20 20"/>`,
+	"Bluetooth":       `<path d="m7 7 10 10-5 5V2l5 5L7 17"/>`,
+	"Signal":          `<path d="M2 20h.01"/><path d="M7 20v-4"/><path d="M12 20v-8"/><path d="M17 20V8"/><path d="M22 4v16"/>`,
+	"Power":           `<path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/>`,
+	"Plug":            `<path d="M12 22v-5"/><path d="M15 8V2"/><path d="M17 8a1 1 0 0 1 1 1v4a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V9a1 1 0 0 1 1-1z"/><path d="M9 8V2"/>`,
+	"Cpu":             `<path d="M12 20v2"/><path d="M12 2v2"/><path d="M17 20v2"/><path d="M17 2v2"/><path d="M2 12h2"/><path d="M2 17h2"/><path d="M2 7h2"/><path d="M20 12h2"/><path d="M20 17h2"/><path d="M20 7h2"/><path d="M7 20v2"/><path d="M7 2v2"/><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="8" y="8" width="8" height="8" rx="1"/>`,
+	"Monitor":         `<rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/>`,
+	"Laptop":          `<path d="M18 5a2 2 0 0 1 2 2v8.526a2 2 0 0 0 .212.897l1.068 2.127a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45l1.068-2.127A2 2 0 0 0 4 15.526V7a2 2 0 0 1 2-2z"/><path d="M20.054 15.987H3.946"/>`,
+	"Smartphone":      `<rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/>`,
+	"Tablet":          `<rect width="16" height="20" x="4" y="2" rx="2" ry="2"/><line x1="12" x2="12.01" y1="18" y2="18"/>`,
+	"Keyboard":        `<path d="M10 8h.01"/><path d="M12 12h.01"/><path d="M14 8h.01"/><path d="M16 12h.01"/><path d="M18 8h.01"/><path d="M6 8h.01"/><path d="M7 16h10"/><path d="M8 12h.01"/><rect width="20" height="16" x="2" y="4" rx="2"/>`,
+	"Mouse":           `<rect x="5" y="2" width="14" height="20" rx="7"/><path d="M12 6v4"/>`,
+	"Gamepad":         `<line x1="6" x2="10" y1="11" y2="11"/><line x1="8" x2="8" y1="9" y2="13"/><line x1="15" x2="15.01" y1="12" y2="12"/><line x1="18" x2="18.01" y1="10" y2="10"/><path d="M17.32 5H6.68a4 4 0 0 0-3.978 3.59c-.006.052-.01.101-.017.152C2.604 9.416 2 14.456 2 16a3 3 0 0 0 3 3c1 0 1.5-.5 2-1l1.414-1.414A2 2 0 0 1 9.828 16h4.344a2 2 0 0 1 1.414.586L17 18c.5.5 1 1 2 1a3 3 0 0 0 3-3c0-1.545-.604-6.584-.685-7.258-.007-.05-.011-.1-.017-.151A4 4 0 0 0 17.32 5z"/>`,
+	"Tv":              `<path d="m17 2-5 5-5-5"/><rect width="20" height="15" x="2" y="7" rx="2"/>`,
+	"Watch":           `<path d="M12 10v2.2l1.6 1"/><path d="m16.13 7.66-.81-4.05a2 2 0 0 0-2-1.61h-2.68a2 2 0 0 0-2 1.61l-.78 4.05"/><path d="m7.88 16.36.8 4a2 2 0 0 0 2 1.61h2.72a2 2 0 0 0 2-1.61l.81-4.05"/><circle cx="12" cy="12" r="6"/>`,
+	"Speaker":         `<rect width="16" height="20" x="4" y="2" rx="2"/><path d="M12 6h.01"/><circle cx="12" cy="14" r="4"/><path d="M12 14h.01"/>`,
+	"Usb":             `<circle cx="10" cy="7" r="1"/><circle cx="4" cy="20" r="1"/><path d="M4.7 19.3 19 5"/><path d="m21 3-3 1 2 2Z"/><path d="M9.26 7.68 5 12l2 5"/><path d="m10 14 5 2 3.5-3.5"/><path d="m18 12 1-1 1 1-1 1Z"/>`,
+	"Router":          `<rect width="20" height="8" x="2" y="14" rx="2"/><path d="M6.01 18H6"/><path d="M10.01 18H10"/><path d="M15 10v4"/><path d="M17.84 7.17a4 4 0 0 0-5.66 0"/><path d="M20.66 4.34a8 8 0 0 0-11.31 0"/>`,
+	"Network":         `<rect x="16" y="16" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="9" y="2" width="6" height="6" rx="1"/><path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3"/><path d="M12 12V8"/>`,
+	"Satellite":       `<path d="m13.5 6.5-3.148-3.148a1.205 1.205 0 0 0-1.704 0L6.352 5.648a1.205 1.205 0 0 0 0 1.704L9.5 10.5"/><path d="M16.5 7.5 19 5"/><path d="m17.5 10.5 3.148 3.148a1.205 1.205 0 0 1 0 1.704l-2.296 2.296a1.205 1.205 0 0 1-1.704 0L13.5 14.5"/><path d="M9 21a6 6 0 0 0-6-6"/><path d="M9.352 10.648a1.205 1.205 0 0 0 0 1.704l2.296 2.296a1.205 1.205 0 0 0 1.704 0l4.296-4.296a1.205 1.205 0 0 0 0-1.704l-2.296-2.296a1.205 1.205 0 0 0-1.704 0z"/>`,
+	"Radio":           `<path d="M16.247 7.761a6 6 0 0 1 0 8.478"/><path d="M19.075 4.933a10 10 0 0 1 0 14.134"/><path d="M4.925 19.067a10 10 0 0 1 0-14.134"/><path d="M7.753 16.239a6 6 0 0 1 0-8.478"/><circle cx="12" cy="12" r="2"/>`,
+	"Rss":             `<path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/>`,
+	"Scan":            `<path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/>`,
+	"QrCode":          `<rect width="5" height="5" x="3" y="3" rx="1"/><rect width="5" height="5" x="16" y="3" rx="1"/><rect width="5" height="5" x="3" y="16" rx="1"/><path d="M21 16h-3a2 2 0 0 0-2 2v3"/><path d="M21 21v.01"/><path d="M12 7v3a2 2 0 0 1-2 2H7"/><path d="M3 12h.01"/><path d="M12 3h.01"/><path d="M12 16v.01"/><path d="M16 12h1"/><path d="M21 12v.01"/><path d="M12 21v-1"/>`,
+	"Barcode":         `<path d="M3 5v14"/><path d="M8 5v14"/><path d="M12 5v14"/><path d="M17 5v14"/><path d="M21 5v14"/>`,
+	"Fingerprint":     `<path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4"/><path d="M14 13.12c0 2.38 0 6.38-1 8.88"/><path d="M17.29 21.02c.12-.6.43-2.3.5-3.02"/><path d="M2 12a10 10 0 0 1 18-6"/><path d="M2 16h.01"/><path d="M21.8 16c.2-2 .131-5.354 0-6"/><path d="M5 19.5C5.5 18 6 15 6 12a6 6 0 0 1 .34-2"/><path d="M8.65 22c.21-.66.45-1.32.57-2"/><path d="M9 6.8a6 6 0 0 1 9 5.2v2"/>`,
+	"Bot":             `<path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/>`,
+	"Brain":           `<path d="M12 18V5"/><path d="M15 13a4.17 4.17 0 01-3-4 4.17 4.17 0 01-3 4"/><path d="M17.707 6.294A3 3 0 1012 5a3 3 0 10-5.707 1.294"/><path d="M17.996 5.125a4 4 0 012.526 5.77"/><path d="M18 18a4 4 0 002-7.465"/><path d="M19.967 17.482a4 4 0 11-7.967.517 4 4 0 11-7.967-.517"/><path d="M6 18a4 4 0 01-2-7.465"/><path d="M6.004 5.125a4 4 0 00-2.526 5.77"/>`,
+	"Bug":             `<path d="M12 20v-9"/><path d="M14 7a4 4 0 0 1 4 4v3a6 6 0 0 1-12 0v-3a4 4 0 0 1 4-4z"/><path d="M14.12 3.88 16 2"/><path d="M21 21a4 4 0 0 0-3.81-4"/><path d="M21 5a4 4 0 0 1-3.55 3.97"/><path d="M22 13h-4"/><path d="M3 21a4 4 0 0 1 3.81-4"/><path d="M3 5a4 4 0 0 0 3.55 3.97"/><path d="M6 13H2"/><path d="m8 2 1.88 1.88"/><path d="M9 7.13V6a3 3 0 1 1 6 0v1.13"/>`,
+	"Branch":          `<path d="M15 6a9 9 0 0 0-9 9V3"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/>`,
+	"Commit":          `<circle cx="12" cy="12" r="3"/><line x1="3" x2="9" y1="12" y2="12"/><line x1="15" x2="21" y1="12" y2="12"/>`,
+	"Merge":           `<circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/>`,
+	"PullRequest":     `<circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 0 1 2 2v7"/><line x1="6" x2="6" y1="9" y2="21"/>`,
+	"Command":         `<path d="M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3"/>`,
+	"Cart":            `<path d="m2.05 2.05 1.099-.028a1 1 0 0 1 1.008.815l2.69 14.347A1 1 0 0 0 7.83 18H18"/><path d="M4.563 5h16.435a1 1 0 0 1 .981 1.204l-1.026 6.226A2 2 0 0 1 18.962 14H6.25"/><circle cx="18" cy="20" r="2"/><circle cx="8" cy="20" r="2"/>`,
+	"Bag":             `<path d="M16 10a4 4 0 0 1-8 0"/><path d="M3.103 6.034h17.794"/><path d="M3.4 5.467a2 2 0 0 0-.4 1.2V20a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6.667a2 2 0 0 0-.4-1.2l-2-2.667A2 2 0 0 0 17 2H7a2 2 0 0 0-1.6.8z"/>`,
+	"CreditCard":      `<rect width="20" height="14" x="2" y="5" rx="2"/><line x1="2" x2="22" y1="10" y2="10"/><path d="M6 14h2"/>`,
+	"Wallet":          `<path d="M19 7V4a1 1 0 0 0-1-1H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1v4h-3a2 2 0 0 0 0 4h3a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1"/><path d="M3 5v14a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-4"/>`,
+	"Dollar":          `<line x1="12" x2="12" y1="2" y2="22"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>`,
+	"Euro":            `<path d="M4 10h12"/><path d="M4 14h9"/><path d="M19 6a7.7 7.7 0 0 0-5.2-2A7.9 7.9 0 0 0 6 12c0 4.4 3.5 8 7.8 8 2 0 3.8-.8 5.2-2"/>`,
+	"Percent":         `<line x1="19" x2="5" y1="5" y2="19"/><circle cx="6.5" cy="6.5" r="2.5"/><circle cx="17.5" cy="17.5" r="2.5"/>`,
+	"Receipt":         `<path d="M12 17V7"/><path d="M16 8h-6a2 2 0 0 0 0 4h4a2 2 0 0 1 0 4H8"/><path d="M4 3a1 1 0 0 1 1-1 1.3 1.3 0 0 1 .7.2l.933.6a1.3 1.3 0 0 0 1.4 0l.934-.6a1.3 1.3 0 0 1 1.4 0l.933.6a1.3 1.3 0 0 0 1.4 0l.933-.6a1.3 1.3 0 0 1 1.4 0l.934.6a1.3 1.3 0 0 0 1.4 0l.933-.6A1.3 1.3 0 0 1 19 2a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1 1.3 1.3 0 0 1-.7-.2l-.933-.6a1.3 1.3 0 0 0-1.4 0l-.934.6a1.3 1.3 0 0 1-1.4 0l-.933-.6a1.3 1.3 0 0 0-1.4 0l-.933.6a1.3 1.3 0 0 1-1.4 0l-.934-.6a1.3 1.3 0 0 0-1.4 0l-.933.6a1.3 1.3 0 0 1-.7.2 1 1 0 0 1-1-1z"/>`,
+	"Store":           `<path d="M15 21v-5a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v5"/><path d="M17.774 10.31a1.12 1.12 0 0 0-1.549 0 2.5 2.5 0 0 1-3.451 0 1.12 1.12 0 0 0-1.548 0 2.5 2.5 0 0 1-3.452 0 1.12 1.12 0 0 0-1.549 0 2.5 2.5 0 0 1-3.77-3.248l2.889-4.184A2 2 0 0 1 7 2h10a2 2 0 0 1 1.653.873l2.895 4.192a2.5 2.5 0 0 1-3.774 3.244"/><path d="M4 10.95V19a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8.05"/>`,
+	"Truck":           `<path d="M14 18V6a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v11a1 1 0 0 0 1 1h2"/><path d="M15 18H9"/><path d="M19 18h2a1 1 0 0 0 1-1v-3.65a1 1 0 0 0-.22-.624l-3.48-4.35A1 1 0 0 0 17.52 8H14"/><circle cx="17" cy="18" r="2"/><circle cx="7" cy="18" r="2"/>`,
+	"Coins":           `<path d="M13.744 17.736a6 6 0 1 1-7.48-7.48"/><path d="M15 6h1v4"/><path d="m6.134 14.768.866-.5 2 3.464"/><circle cx="16" cy="8" r="6"/>`,
+	"Banknote":        `<rect width="20" height="12" x="2" y="6" rx="2"/><circle cx="12" cy="12" r="2"/><path d="M6 12h.01M18 12h.01"/>`,
+	"Calculator":      `<rect width="16" height="20" x="4" y="2" rx="2"/><line x1="8" x2="16" y1="6" y2="6"/><line x1="16" x2="16" y1="14" y2="18"/><path d="M16 10h.01"/><path d="M12 10h.01"/><path d="M8 10h.01"/><path d="M12 14h.01"/><path d="M8 14h.01"/><path d="M12 18h.01"/><path d="M8 18h.01"/>`,
+	"ChartBar":        `<path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/>`,
+	"ChartLine":       `<path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="m19 9-5 5-4-4-3 3"/>`,
+	"ChartPie":        `<path d="M21 12c.552 0 1.005-.449.95-.998a10 10 0 0 0-8.953-8.951c-.55-.055-.998.398-.998.95v8a1 1 0 0 0 1 1z"/><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/>`,
+	"TrendingUp":      `<path d="M16 7h6v6"/><path d="m22 7-8.5 8.5-5-5L2 17"/>`,
+	"TrendingDown":    `<path d="M16 17h6v-6"/><path d="m22 17-8.5-8.5-5 5L2 7"/>`,
+	"Gauge":           `<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>`,
+	"Target":          `<circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/>`,
+	"Map":             `<path d="M14.106 5.553a2 2 0 0 0 1.788 0l3.659-1.83A1 1 0 0 1 21 4.619v12.764a1 1 0 0 1-.553.894l-4.553 2.277a2 2 0 0 1-1.788 0l-4.212-2.106a2 2 0 0 0-1.788 0l-3.659 1.83A1 1 0 0 1 3 19.381V6.618a1 1 0 0 1 .553-.894l4.553-2.277a2 2 0 0 1 1.788 0z"/><path d="M15 5.764v15"/><path d="M9 3.236v15"/>`,
+	"MapPin":          `<path d="M20 10c0 4.993-5.539 10.193-7.399 11.799a1 1 0 0 1-1.202 0C9.539 20.193 4 14.993 4 10a8 8 0 0 1 16 0"/><circle cx="12" cy="10" r="3"/>`,
+	"Navigation":      `<polygon points="3 11 22 2 13 21 11 13 3 11"/>`,
+	"Compass":         `<circle cx="12" cy="12" r="10"/><path d="m16.24 7.76-1.804 5.411a2 2 0 0 1-1.265 1.265L7.76 16.24l1.804-5.411a2 2 0 0 1 1.265-1.265z"/>`,
+	"Globe":           `<circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/>`,
+	"Building":        `<path d="M10 12h4"/><path d="M10 8h4"/><path d="M14 21v-3a2 2 0 0 0-4 0v3"/><path d="M6 10H4a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-2"/><path d="M6 21V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v16"/>`,
+	"Factory":         `<path d="M12 16h.01"/><path d="M16 16h.01"/><path d="M3 19a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V8.5a.5.5 0 0 0-.769-.422l-4.462 2.844A.5.5 0 0 1 15 10.5v-2a.5.5 0 0 0-.769-.422L9.77 10.922A.5.5 0 0 1 9 10.5V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2z"/><path d="M8 16h.01"/>`,
+	"School":          `<path d="M14 21v-3a2 2 0 0 0-4 0v3"/><path d="M18 4.933V21"/><path d="m4 6 7.106-3.79a2 2 0 0 1 1.788 0L20 6"/><path d="m6 11-3.52 2.147a1 1 0 0 0-.48.854V19a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-5a1 1 0 0 0-.48-.853L18 11"/><path d="M6 4.933V21"/><circle cx="12" cy="9" r="2"/>`,
+	"Hospital":        `<path d="M12 7v4"/><path d="M14 21v-3a2 2 0 0 0-4 0v3"/><path d="M14 9h-4"/><path d="M18 11h2a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2h2"/><path d="M18 21V5a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v16"/>`,
+	"Car":             `<path d="M19 17h2c.6 0 1-.4 1-1v-3c0-.9-.7-1.7-1.5-1.9C18.7 10.6 16 10 16 10s-1.3-1.4-2.2-2.3c-.5-.4-1.1-.7-1.8-.7H5c-.6 0-1.1.4-1.4.9l-1.4 2.9A3.7 3.7 0 0 0 2 12v4c0 .6.4 1 1 1h2"/><circle cx="7" cy="17" r="2"/><path d="M9 17h6"/><circle cx="17" cy="17" r="2"/>`,
+	"Bus":             `<path d="M8 6v6"/><path d="M15 6v6"/><path d="M2 12h19.6"/><path d="M18 18h3s.5-1.7.8-2.8c.1-.4.2-.8.2-1.2 0-.4-.1-.8-.2-1.2l-1.4-5C20.1 6.8 19.1 6 18 6H4a2 2 0 0 0-2 2v10h3"/><circle cx="7" cy="18" r="2"/><path d="M9 18h5"/><circle cx="16" cy="18" r="2"/>`,
+	"Train":           `<path d="M8 3.1V7a4 4 0 0 0 8 0V3.1"/><path d="m9 15-1-1"/><path d="m15 15 1-1"/><path d="M9 19c-2.8 0-5-2.2-5-5v-4a8 8 0 0 1 16 0v4c0 2.8-2.2 5-5 5Z"/><path d="m8 19-2 3"/><path d="m16 19 2 3"/>`,
+	"Plane":           `<path d="M17.8 19.2 16 11l3.5-3.5C21 6 21.5 4 21 3c-1-.5-3 0-4.5 1.5L13 8 4.8 6.2c-.5-.1-.9.1-1.1.5l-.3.5c-.2.5-.1 1 .3 1.3L9 12l-2 3H4l-1 1 3 2 2 3 1-1v-3l3-2 3.5 5.3c.3.4.8.5 1.3.3l.5-.2c.4-.3.6-.7.5-1.2z"/>`,
+	"Ship":            `<path d="M12 2v2"/><path d="M12 9.189V13"/><path d="M19 12V6a2 2 0 00-2-2H7a2 2 0 00-2 2v6"/><path d="M19.38 19A11.6 11.6 0 0021 13l-8.188-3.639a2 2 0 00-1.624 0L3 13.001a11.6 11.6 0 002.81 7.76"/><path d="M2 20c.6.5 1.2 1 2.5 1 2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1s1.2 1 2.5 1c2.5 0 2.5-2 5-2 1.3 0 1.9.5 2.5 1"/>`,
+	"Bike":            `<circle cx="18.5" cy="17.5" r="3.5"/><circle cx="5.5" cy="17.5" r="3.5"/><circle cx="15" cy="5" r="1"/><path d="M12 17.5V14l-3-3 4-3 2 3h2"/>`,
+	"Rocket":          `<path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09"/><path d="M9 12a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.4 22.4 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 .05 5 .05"/>`,
+	"Fuel":            `<path d="M14 13h2a2 2 0 0 1 2 2v2a2 2 0 0 0 4 0v-6.998a2 2 0 0 0-.59-1.42L18 5"/><path d="M14 21V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v16"/><path d="M2 21h13"/><path d="M3 9h11"/>`,
+	"Footprints":      `<path d="M4 16v-2.38C4 11.5 2.97 10.5 3 8c.03-2.72 1.49-6 4.5-6C9.37 2 10 3.8 10 5.5c0 3.11-2 5.66-2 8.68V16a2 2 0 1 1-4 0Z"/><path d="M20 20v-2.38c0-2.12 1.03-3.12 1-5.62-.03-2.72-1.49-6-4.5-6C14.63 6 14 7.8 14 9.5c0 3.11 2 5.66 2 8.68V20a2 2 0 1 0 4 0Z"/><path d="M16 17h4"/><path d="M4 13h4"/>`,
+	"Sun":             `<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>`,
+	"Moon":            `<path d="M20.985 12.486a9 9 0 1 1-9.473-9.472c.405-.022.617.46.402.803a6 6 0 0 0 8.268 8.268c.344-.215.825-.004.803.401"/>`,
+	"Sunrise":         `<path d="M12 2v8"/><path d="m4.93 10.93 1.41 1.41"/><path d="M2 18h2"/><path d="M20 18h2"/><path d="m19.07 10.93-1.41 1.41"/><path d="M22 22H2"/><path d="m8 6 4-4 4 4"/><path d="M16 18a4 4 0 0 0-8 0"/>`,
+	"Sunset":          `<path d="M12 10V2"/><path d="m4.93 10.93 1.41 1.41"/><path d="M2 18h2"/><path d="M20 18h2"/><path d="m19.07 10.93-1.41 1.41"/><path d="M22 22H2"/><path d="m16 6-4 4-4-4"/><path d="M16 18a4 4 0 0 0-8 0"/>`,
+	"CloudRain":       `<path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M16 14v6"/><path d="M8 14v6"/><path d="M12 16v6"/>`,
+	"Snowflake":       `<path d="m10 20-1.25-2.5L6 18"/><path d="M10 4 8.75 6.5 6 6"/><path d="m14 20 1.25-2.5L18 18"/><path d="m14 4 1.25 2.5L18 6"/><path d="m17 21-3-6h-4"/><path d="m17 3-3 6 1.5 3"/><path d="M2 12h6.5L10 9"/><path d="m20 10-1.5 2 1.5 2"/><path d="M22 12h-6.5L14 15"/><path d="m4 10 1.5 2L4 14"/><path d="m7 21 3-6-1.5-3"/><path d="m7 3 3 6h4"/>`,
+	"Wind":            `<path d="M12.8 19.6A2 2 0 1 0 14 16H2"/><path d="M17.5 8a2.5 2.5 0 1 1 2 4H2"/><path d="M9.8 4.4A2 2 0 1 1 11 8H2"/>`,
+	"Umbrella":        `<path d="M12 13v7a2 2 0 0 0 4 0"/><path d="M12 2v2"/><path d="M20.992 13a1 1 0 0 0 .97-1.274 10.284 10.284 0 0 0-19.923 0A1 1 0 0 0 3 13z"/>`,
+	"Thermometer":     `<path d="M14 4v10.54a4 4 0 1 1-4 0V4a2 2 0 0 1 4 0Z"/>`,
+	"Droplet":         `<path d="M12 22a7 7 0 0 0 7-7c0-2-1-3.9-3-5.5s-3.5-4-4-6.5c-.5 2.5-2 4.9-4 6.5C6 11.1 5 13 5 15a7 7 0 0 0 7 7z"/>`,
+	"Leaf":            `<path d="M11 20a10 10 0 0010-10 25.9 25.9 0 00-1.04-7.281 1 1 0 00-1.755-.325C15.833 5.5 13 5.5 9.8 6.1A7 7 0 0011 20"/><path d="M2 21a5 5 0 012.911-4.544C7.613 15.212 8.351 15.24 11 13"/>`,
+	"Flower":          `<circle cx="12" cy="12" r="3"/><path d="M12 16.5A4.5 4.5 0 1 1 7.5 12 4.5 4.5 0 1 1 12 7.5a4.5 4.5 0 1 1 4.5 4.5 4.5 4.5 0 1 1-4.5 4.5"/><path d="M12 7.5V9"/><path d="M7.5 12H9"/><path d="M16.5 12H15"/><path d="M12 16.5V15"/><path d="m8 8 1.88 1.88"/><path d="M14.12 9.88 16 8"/><path d="m8 16 1.88-1.88"/><path d="M14.12 14.12 16 16"/>`,
+	"Tree":            `<path d="m17 14 3 3.3a1 1 0 0 1-.7 1.7H4.7a1 1 0 0 1-.7-1.7L7 14h-.3a1 1 0 0 1-.7-1.7L9 9h-.2A1 1 0 0 1 8 7.3L12 3l4 4.3a1 1 0 0 1-.8 1.7H15l3 3.3a1 1 0 0 1-.7 1.7H17Z"/><path d="M12 22v-3"/>`,
+	"Mountain":        `<path d="m8 3 4 8 5-5 5 15H2L8 3z"/>`,
+	"Waves":           `<path d="M2 12q2.5 2 5 0t5 0 5 0 5 0"/><path d="M2 19q2.5 2 5 0t5 0 5 0 5 0"/><path d="M2 5q2.5 2 5 0t5 0 5 0 5 0"/>`,
+	"Bold":            `<path d="M6 12h9a4 4 0 0 1 0 8H7a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h7a4 4 0 0 1 0 8"/>`,
+	"Italic":          `<line x1="19" x2="10" y1="4" y2="4"/><line x1="14" x2="5" y1="20" y2="20"/><line x1="15" x2="9" y1="4" y2="20"/>`,
+	"Underline":       `<path d="M6 4v6a6 6 0 0 0 12 0V4"/><line x1="4" x2="20" y1="20" y2="20"/>`,
+	"Strikethrough":   `<path d="M16 4H9a3 3 0 0 0-2.83 4"/><path d="M14 12a4 4 0 0 1 0 8H6"/><line x1="4" x2="20" y1="12" y2="12"/>`,
+	"Heading":         `<path d="M6 12h12"/><path d="M6 20V4"/><path d="M18 20V4"/>`,
+	"Quote":           `<path d="M16 3a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2 1 1 0 0 1 1 1v1a2 2 0 0 1-2 2 1 1 0 0 0-1 1v2a1 1 0 0 0 1 1 6 6 0 0 0 6-6V5a2 2 0 0 0-2-2z"/><path d="M5 3a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2 1 1 0 0 1 1 1v1a2 2 0 0 1-2 2 1 1 0 0 0-1 1v2a1 1 0 0 0 1 1 6 6 0 0 0 6-6V5a2 2 0 0 0-2-2z"/>`,
+	"AlignLeft":       `<path d="M21 5H3"/><path d="M15 12H3"/><path d="M17 19H3"/>`,
+	"AlignCenter":     `<path d="M21 5H3"/><path d="M17 12H7"/><path d="M19 19H5"/>`,
+	"AlignRight":      `<path d="M21 5H3"/><path d="M21 12H9"/><path d="M21 19H7"/>`,
+	"AlignJustify":    `<path d="M3 5h18"/><path d="M3 12h18"/><path d="M3 19h18"/>`,
+	"Hash":            `<line x1="4" x2="20" y1="9" y2="9"/><line x1="4" x2="20" y1="15" y2="15"/><line x1="10" x2="8" y1="3" y2="21"/><line x1="16" x2="14" y1="3" y2="21"/>`,
+	"At":              `<circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8"/>`,
+	"Asterisk":        `<path d="M12 5v14"/><path d="m18.065 8.496-12.125 7"/><path d="m5.94 8.504 12.125 7"/>`,
+	"Circle":          `<circle cx="12" cy="12" r="10"/>`,
+	"Triangle":        `<path d="M13.73 4a2 2 0 0 0-3.46 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/>`,
+	"Hexagon":         `<path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>`,
+	"Diamond":         `<path d="M2.7 10.3a2.41 2.41 0 0 0 0 3.41l7.59 7.59a2.41 2.41 0 0 0 3.41 0l7.59-7.59a2.41 2.41 0 0 0 0-3.41l-7.59-7.59a2.41 2.41 0 0 0-3.41 0Z"/>`,
+	"Sparkles":        `<path d="M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z"/><path d="M20 2v4"/><path d="M22 4h-4"/><circle cx="4" cy="20" r="2"/>`,
+	"Wand":            `<path d="m21.64 3.64-1.28-1.28a1.21 1.21 0 0 0-1.72 0L2.36 18.64a1.21 1.21 0 0 0 0 1.72l1.28 1.28a1.2 1.2 0 0 0 1.72 0L21.64 5.36a1.2 1.2 0 0 0 0-1.72"/><path d="m14 7 3 3"/><path d="M5 6v4"/><path d="M19 14v4"/><path d="M10 2v2"/><path d="M7 8H3"/><path d="M21 16h-4"/><path d="M11 3H9"/>`,
+	"Palette":         `<path d="M12 22a1 1 0 0 1 0-20 10 9 0 0 1 10 9 5 5 0 0 1-5 5h-2.25a1.75 1.75 0 0 0-1.4 2.8l.3.4a1.75 1.75 0 0 1-1.4 2.8z"/><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/>`,
+	"Brush":           `<path d="m11 10 3 3"/><path d="M6.5 21A3.5 3.5 0 1 0 3 17.5a2.62 2.62 0 0 1-.708 1.792A1 1 0 0 0 3 21z"/><path d="M9.969 17.031 21.378 5.624a1 1 0 0 0-3.002-3.002L6.967 14.031"/>`,
+	"PenTool":         `<path d="m18 13-.654-4.736a4 4 0 00-2.756-3.266l-9.163-2.9a2 2 0 00-2.017.493l-.82.819a2 2 0 00-.492 2.017l2.9 9.163a4 4 0 003.266 2.756L13 18"/><path d="M18.648 12.352a1.205 1.205 0 011.704 0l1.296 1.296a1.205 1.205 0 010 1.704l-6.296 6.296a1.205 1.205 0 01-1.704 0l-1.296-1.296a1.205 1.205 0 010-1.704z"/><path d="m3 3 6.586 6.586"/><circle cx="11" cy="11" r="2"/>`,
+	"Crop":            `<path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/>`,
+	"Ruler":           `<path d="M21.3 15.3a2.4 2.4 0 0 1 0 3.4l-2.6 2.6a2.4 2.4 0 0 1-3.4 0L2.7 8.7a2.41 2.41 0 0 1 0-3.4l2.6-2.6a2.41 2.41 0 0 1 3.4 0Z"/><path d="m14.5 12.5 2-2"/><path d="m11.5 9.5 2-2"/><path d="m8.5 6.5 2-2"/><path d="m17.5 15.5 2-2"/>`,
+	"Pipette":         `<path d="m12 9-8.414 8.414A2 2 0 0 0 3 18.828v1.344a2 2 0 0 1-.586 1.414A2 2 0 0 1 3.828 21h1.344a2 2 0 0 0 1.414-.586L15 12"/><path d="m18 9 .4.4a1 1 0 1 1-3 3l-3.8-3.8a1 1 0 1 1 3-3l.4.4 3.4-3.4a1 1 0 1 1 3 3z"/><path d="m2 22 .414-.414"/>`,
+	"Eraser":          `<path d="M21 21H8a2 2 0 0 1-1.42-.587l-3.994-3.999a2 2 0 0 1 0-2.828l10-10a2 2 0 0 1 2.829 0l5.999 6a2 2 0 0 1 0 2.828L12.834 21"/><path d="m5.082 11.09 8.828 8.828"/>`,
+	"Shapes":          `<path d="M8.3 10a.7.7 0 0 1-.626-1.079L11.4 3a.7.7 0 0 1 1.198-.043L16.3 8.9a.7.7 0 0 1-.572 1.1Z"/><rect x="3" y="14" width="7" height="7" rx="1"/><circle cx="17.5" cy="17.5" r="3.5"/>`,
+	"Puzzle":          `<path d="M15.39 4.39a1 1 0 0 0 1.68-.474 2.5 2.5 0 1 1 3.014 3.015 1 1 0 0 0-.474 1.68l1.683 1.682a2.414 2.414 0 0 1 0 3.414L19.61 15.39a1 1 0 0 1-1.68-.474 2.5 2.5 0 1 0-3.014 3.015 1 1 0 0 1 .474 1.68l-1.683 1.682a2.414 2.414 0 0 1-3.414 0L8.61 19.61a1 1 0 0 0-1.68.474 2.5 2.5 0 1 1-3.014-3.015 1 1 0 0 0 .474-1.68l-1.683-1.682a2.414 2.414 0 0 1 0-3.414L4.39 8.61a1 1 0 0 1 1.68.474 2.5 2.5 0 1 0 3.014-3.015 1 1 0 0 1-.474-1.68l1.683-1.682a2.414 2.414 0 0 1 3.414 0z"/>`,
+	"Lightbulb":       `<path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/>`,
+	"Book":            `<path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H19a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1H6.5a1 1 0 0 1 0-5H20"/>`,
+	"BookOpen":        `<path d="M12 5v16"/><path d="M20.001 19A2 2 0 0022 17V5a2 2 0 00-1.999-2L16 3.002A5 5 0 0012 5a5 5 0 00-4-2H4a2 2 0 00-2 2v12a2 2 0 001.999 2H8a5 5 0 014 2 5 5 0 014-2z"/>`,
+	"Newspaper":       `<path d="M15 18h-5"/><path d="M18 14h-8"/><path d="M4 22h16a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v16a2 2 0 0 1-4 0v-9a2 2 0 0 1 2-2h2"/><rect width="8" height="4" x="10" y="6" rx="1"/>`,
+	"GraduationCap":   `<path d="M21.42 10.922a1 1 0 0 0-.019-1.838L12.83 5.18a2 2 0 0 0-1.66 0L2.6 9.08a1 1 0 0 0 0 1.832l8.57 3.908a2 2 0 0 0 1.66 0z"/><path d="M22 10v6"/><path d="M6 12.5V16a6 3 0 0 0 12 0v-3.5"/>`,
+	"Briefcase":       `<path d="M16 20V4a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/><rect width="20" height="14" x="2" y="6" rx="2"/>`,
+	"CheckSquare":     `<rect width="18" height="18" x="3" y="3" rx="2"/><path d="m16 9-5.5 5.5L8 12"/>`,
+	"ToggleLeft":      `<circle cx="9" cy="12" r="3"/><rect width="20" height="14" x="2" y="5" rx="7"/>`,
+	"ToggleRight":     `<circle cx="15" cy="12" r="3"/><rect width="20" height="14" x="2" y="5" rx="7"/>`,
+	"Infinity":        `<path d="M6 16c5 0 7-8 12-8a4 4 0 0 1 0 8c-5 0-7-8-12-8a4 4 0 1 0 0 8"/>`,
+	"Sigma":           `<path d="M18 7V5a1 1 0 0 0-1-1H6.5a.5.5 0 0 0-.4.8l4.5 6a2 2 0 0 1 0 2.4l-4.5 6a.5.5 0 0 0 .4.8H17a1 1 0 0 0 1-1v-2"/>`,
+	"Crosshair":       `<circle cx="12" cy="12" r="10"/><line x1="22" x2="18" y1="12" y2="12"/><line x1="6" x2="2" y1="12" y2="12"/><line x1="12" x2="12" y1="6" y2="2"/><line x1="12" x2="12" y1="22" y2="18"/>`,
+	"Focus":           `<circle cx="12" cy="12" r="3"/><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/>`,
+	"Aperture":        `<circle cx="12" cy="12" r="10"/><path d="m14.31 8 5.74 9.94"/><path d="M9.69 8h11.48"/><path d="m7.38 12 5.74-9.94"/><path d="M9.69 16 3.95 6.06"/><path d="M14.31 16H2.83"/><path d="m16.62 12-5.74 9.94"/>`,
+	"Feather":         `<path d="M14.086 18.412A2 2 0 0112.67 19H5v-7.672a2 2 0 01.586-1.414L11.75 3.75a6 6 0 118.49 8.49z"/><path d="M16 8 2 22"/><path d="M17.488 15H9"/>`,
+	"Ghost":           `<path d="M15 10v1"/><path d="M7.528 20.472a1.6 1.6 0 012.277 0l1.057 1.056a1.6 1.6 0 002.276 0l1.057-1.056a1.6 1.6 0 012.277 0l1.114 1.114a1.4 1.4 0 002.414-1V10a8 8 0 00-16 0v10.586a1.4 1.4 0 002.414 1z"/><path d="M9 10v1"/>`,
+	"Dice":            `<rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><path d="M16 8h.01"/><path d="M8 8h.01"/><path d="M8 16h.01"/><path d="M16 16h.01"/><path d="M12 12h.01"/>`,
+	"Megaphone":       `<path d="M11 6a13 13 0 0 0 8.4-2.8A1 1 0 0 1 21 4v12a1 1 0 0 1-1.6.8A13 13 0 0 0 11 14H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2z"/><path d="M6 14a12 12 0 0 0 2.4 7.2 2 2 0 0 0 3.2-2.4A8 8 0 0 1 10 14"/><path d="M8 6v8"/>`,
+	"Coffee":          `<path d="M10 2v2"/><path d="M14 2v2"/><path d="M16 8a1 1 0 0 1 1 1v8a4 4 0 0 1-4 4H7a4 4 0 0 1-4-4V9a1 1 0 0 1 1-1h14a4 4 0 1 1 0 8h-1"/><path d="M6 2v2"/>`,
+	"Pizza":           `<path d="m12 14-1 1"/><path d="m13.75 18.25-1.25 1.42"/><path d="M17.775 5.654a15.68 15.68 0 0 0-12.121 12.12"/><path d="M18.8 9.3a1 1 0 0 0 2.1 7.7"/><path d="M21.964 20.732a1 1 0 0 1-1.232 1.232l-18-5a1 1 0 0 1-.695-1.232A19.68 19.68 0 0 1 15.732 2.037a1 1 0 0 1 1.232.695z"/>`,
+	"Utensils":        `<path d="M3 2v7c0 1.1.9 2 2 2h4a2 2 0 0 0 2-2V2"/><path d="M7 2v20"/><path d="M21 15V2a5 5 0 0 0-5 5v6c0 1.1.9 2 2 2h3Zm0 0v7"/>`,
+	"Wine":            `<path d="M8 22h8"/><path d="M7 10h10"/><path d="M12 15v7"/><path d="M12 15a5 5 0 0 0 5-5c0-2-.5-4-2-8H9c-1.5 4-2 6-2 8a5 5 0 0 0 5 5Z"/>`,
+	"Apple":           `<path d="M12 6.528V3a1 1 0 0 1 1-1h0"/><path d="M18.237 21A15 15 0 0 0 22 11a6 6 0 0 0-10-4.472A6 6 0 0 0 2 11a15.1 15.1 0 0 0 3.763 10 3 3 0 0 0 3.648.648 5.5 5.5 0 0 1 5.178 0A3 3 0 0 0 18.237 21"/>`,
+	"Shirt":           `<path d="M20.38 3.46 16 2a4 4 0 0 1-8 0L3.62 3.46a2 2 0 0 0-1.34 2.23l.58 3.47a1 1 0 0 0 .99.84H6v10c0 1.1.9 2 2 2h8a2 2 0 0 0 2-2V10h2.15a1 1 0 0 0 .99-.84l.58-3.47a2 2 0 0 0-1.34-2.23z"/>`,
+	"Glasses":         `<circle cx="6" cy="15" r="4"/><circle cx="18" cy="15" r="4"/><path d="M14 15a2 2 0 0 0-2-2 2 2 0 0 0-2 2"/><path d="M2.5 13 5 7c.7-1.3 1.4-2 3-2"/><path d="M21.5 13 19 7c-.7-1.3-1.5-2-3-2"/>`,
+	"Dog":             `<path d="M11.25 16.25h1.5L12 17z"/><path d="M16 14v.5"/><path d="M4.42 11.247A13.152 13.152 0 0 0 4 14.556C4 18.728 7.582 21 12 21s8-2.272 8-6.444a11.702 11.702 0 0 0-.493-3.309"/><path d="M8 14v.5"/><path d="M8.5 8.5c-.384 1.05-1.083 2.028-2.344 2.5-1.931.722-3.576-.297-3.656-1-.113-.994 1.177-6.53 4-7 1.923-.321 3.651.845 3.651 2.235A7.497 7.497 0 0 1 14 5.277c0-1.39 1.844-2.598 3.767-2.277 2.823.47 4.113 6.006 4 7-.08.703-1.725 1.722-3.656 1-1.261-.472-1.855-1.45-2.239-2.5"/>`,
+	"Cat":             `<path d="M12 5c.67 0 1.35.09 2 .26 1.78-2 5.03-2.84 6.42-2.26 1.4.58-.42 7-.42 7 .57 1.07 1 2.24 1 3.44C21 17.9 16.97 21 12 21s-9-3-9-7.56c0-1.25.5-2.4 1-3.44 0 0-1.89-6.42-.5-7 1.39-.58 4.72.23 6.5 2.23A9.04 9.04 0 0 1 12 5Z"/><path d="M8 14v.5"/><path d="M16 14v.5"/><path d="M11.25 16.25h1.5L12 17l-.75-.75Z"/>`,
+	"Bird":            `<path d="M16 7h.01"/><path d="M3.4 18H12a8 8 0 0 0 8-8V7a4 4 0 0 0-7.28-2.3L2 20"/><path d="m20 7 2 .5-2 .5"/><path d="M10 18v3"/><path d="M14 17.75V21"/><path d="M7 18a6 6 0 0 0 3.84-10.61"/>`,
+	"Fish":            `<path d="M6.5 12c.94-3.46 4.94-6 8.5-6 3.56 0 6.06 2.54 7 6-.94 3.47-3.44 6-7 6s-7.56-2.53-8.5-6Z"/><path d="M18 12v.5"/><path d="M16 17.93a9.77 9.77 0 0 1 0-11.86"/><path d="M7 10.67C7 8 5.58 5.97 2.73 5.5c-1 1.5-1 5 .23 6.5-1.24 1.5-1.24 5-.23 6.5C5.58 18.03 7 16 7 13.33"/><path d="M10.46 7.26C10.2 5.88 9.17 4.24 8 3h5.8a2 2 0 0 1 1.98 1.67l.23 1.4"/><path d="m16.01 17.93-.23 1.4A2 2 0 0 1 13.8 21H9.5a5.96 5.96 0 0 0 1.49-3.98"/>`,
 }

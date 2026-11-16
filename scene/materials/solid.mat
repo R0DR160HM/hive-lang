@@ -16,23 +16,25 @@ material {
         { type : sampler2d, name : relief },
         { type : float4, name : look },
         { type : float4, name : flags },
+        { type : float4, name : picture },
         { type : float4, name : fog },
         { type : float4, name : haze },
         { type : float, name : base }
     ],
-    variables : [ tint, laid ]
+    variables : [ tint, laid, shine ]
 }
 
 vertex {
     void materialVertex(inout MaterialVertexInputs material) {
-        // Four texels a solid: three rows of its matrix, then its colour.
+        // Five texels a solid: three rows of its matrix, its colour, then how it shines.
         int which = getInstanceIndex() + int(materialParams.base);
-        int x = (which & 255) * 4;
+        int x = (which & 255) * 5;
         int y = which >> 8;
         vec4 r0 = texelFetch(materialParams_things, ivec2(x, y), 0);
         vec4 r1 = texelFetch(materialParams_things, ivec2(x + 1, y), 0);
         vec4 r2 = texelFetch(materialParams_things, ivec2(x + 2, y), 0);
         vec4 tint = texelFetch(materialParams_things, ivec2(x + 3, y), 0);
+        vec4 shine = texelFetch(materialParams_things, ivec2(x + 4, y), 0);
         vec3 c0 = vec3(r0.x, r1.x, r2.x);
         vec3 c1 = vec3(r0.y, r1.y, r2.y);
         vec3 c2 = vec3(r0.z, r1.z, r2.z);
@@ -43,11 +45,13 @@ vertex {
         vec4 spanU = getCustom0();
         vec4 spanV = getCustom1();
         vec4 along = getCustom2();
+        // Nought is a plain point, one a box's corner, two a drum's side, three a drum's end, four a mesh's.
         float rounding = spanU.w;
+        bool bent = rounding > 0.5 && rounding < 3.5;
 
         vec3 at = position;
         vec3 facing = normal;
-        if (rounding > 0.5) {
+        if (bent) {
             vec3 corner;
             if (rounding < 1.5) {
                 float bend = min(0.35, 0.2 * min(size.x, min(size.y, size.z)));
@@ -64,16 +68,24 @@ vertex {
         }
 
         vec2 uv = material.uv0;
-        if (rounding > 0.5) {
+        if (bent) {
             uv = rounding < 1.5 ? 0.5 + vec2(dot(spanU.xyz, at), dot(spanV.xyz, at))
                 : rounding < 2.5 ? vec2(uv.x, at.y + 0.5) : 0.5 + at.xz * 0.5;
         }
         float tile = materialParams.look.w;
-        vec2 tiles = max(vec2(1.0), floor(vec2(length(size * spanU.xyz), length(size * spanV.xyz)) / tile + 0.5));
-        uv *= tiles;
-        if (spanV.x != 0.0 && abs(spanV.x) * size.x > size.y) {
-            vec3 placed = vec3(dot(r0.xyz, position) + r0.w, dot(r1.xyz, position) + r1.w, dot(r2.xyz, position) + r2.w);
-            uv = placed.xz / tile;
+        if (materialParams.picture.x > 0.5) {
+            // A picture of the program's own is laid once across each face, as many times as it says.
+            uv *= materialParams.picture.yz;
+        } else if (rounding > 3.5) {
+            uv = spanU.xy / tile;
+        } else {
+            vec2 tiles = max(vec2(1.0), floor(vec2(length(size * spanU.xyz), length(size * spanV.xyz)) / tile + 0.5));
+            uv *= tiles;
+            if (spanV.x != 0.0 && abs(spanV.x) * size.x > size.y) {
+                vec3 placed = vec3(dot(r0.xyz, position) + r0.w, dot(r1.xyz, position) + r1.w,
+                    dot(r2.xyz, position) + r2.w);
+                uv = placed.xz / tile;
+            }
         }
 
         vec3 world = vec3(dot(r0.xyz, at) + r0.w, dot(r1.xyz, at) + r1.w, dot(r2.xyz, at) + r2.w);
@@ -83,6 +95,7 @@ vertex {
         material.worldPosition = getWorldFromModelMatrix() * vec4(world, 1.0);
         material.tint = tint * material.color;
         material.laid = vec4(uv, 0.0, 0.0);
+        material.shine = shine;
     }
 }
 
@@ -110,6 +123,7 @@ fragment {
 
     void material(inout MaterialInputs material) {
         vec2 uv = variable_laid.xy;
+        bool pictured = materialParams.picture.x > 0.5;
         // A tile is drawn around mid grey, so its texel times the colour over mid grey keeps the colour.
         vec4 grain = texture(materialParams_grain, uv);
         if (materialParams.flags.z > 0.5) {
@@ -125,18 +139,26 @@ fragment {
         prepareMaterial(material);
 
         vec4 tint = variable_tint;
+        vec4 shine = variable_shine;
         vec3 colour;
         float thick = tint.a;
-        if (materialParams.flags.x > 0.5) {
+        if (pictured) {
+            colour = tint.rgb * grain.rgb;
+            thick *= grain.a;
+        } else if (materialParams.flags.x > 0.5) {
             colour = mix(grain.rgb, tint.rgb * grain.rgb * 4.6326, grain.a);
         } else {
             colour = tint.rgb * grain.rgb * 4.6326;
             thick *= grain.a;
         }
+        // A program's own roughness or metal, where it gave one, stands in for the finish's.
         float rough = materialParams.look.x;
         if (materialParams.flags.y > 0.5) {
             rough = mix(0.06, rough, grain.a);
         }
+        rough = shine.x >= 0.0 ? clamp(shine.x, 0.0, 1.0) : rough;
+        float metal = shine.y >= 0.0 ? clamp(shine.y, 0.0, 1.0) : materialParams.look.y;
+        bool unlit = shine.w > 0.5;
 
         float depth = -mulMat4x4Float3(getViewFromWorldMatrix(), getWorldPosition()).z;
         float veil = materialParams.fog.z * smoothstep(materialParams.fog.x, materialParams.fog.y, depth);
@@ -149,20 +171,36 @@ fragment {
         float sunward = max(dot(facing, frameUniforms.lightDirection), 0.0);
         vec3 lamp = frameUniforms.lightColorIntensity.rgb * (frameUniforms.lightColorIntensity.w * sunward * 0.31831);
         float square = clamp(dot(facing, getWorldViewVector()), 0.0, 1.0);
-        vec3 mirror = mix(vec3(0.04), colour, materialParams.look.y);
+        vec3 mirror = mix(vec3(0.04), colour, metal);
         mirror += (max(vec3(1.0 - rough), mirror) - mirror) * pow(1.0 - square, 5.0);
-        vec3 lit = colour * (1.0 - materialParams.look.y) * (sky(facing) + lamp) + mirror * sky(getWorldReflectedVector());
+        vec3 lit = unlit ? colour
+            : colour * (1.0 - metal) * (sky(facing) + lamp) + mirror * sky(getWorldReflectedVector());
         // Right over a middling grey, 0.4 on the screen, and near it either side.
         vec3 mixed = thick * pow(shoulder(lit), vec3(0.4545)) + (1.0 - thick) * 0.4;
         float keep = clamp(dot((1.0 - thick) * pow(mixed * 2.5, vec3(1.2)), vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
         vec3 share = min(max(pow(mixed, vec3(2.2)) - keep * 0.1332, vec3(0.0)) / max(lit, vec3(0.0001)), vec3(1.0));
-        material.baseColor = vec4(colour * share, 1.0 - keep);
-        material.specularFactor = dot(share, vec3(0.3333));
+        if (unlit) {
+            // Laid down as light of its own, which Filament weighs by how much of it covers.
+            material.baseColor = vec4(0.0, 0.0, 0.0, 1.0 - keep);
+            material.emissive = vec4(colour * share / max(1.0 - keep, 0.0001), 0.0);
+            material.specularFactor = 0.0;
+        } else {
+            material.baseColor = vec4(colour * share, 1.0 - keep);
+            material.specularFactor = dot(share, vec3(0.3333));
+            material.emissive = vec4(colour * shine.z, 0.0);
+        }
 #else
         material.postLightingColor = vec4(materialParams.haze.rgb * veil, veil);
-        material.baseColor = vec4(colour * thick, thick);
+        if (unlit) {
+            material.baseColor = vec4(0.0, 0.0, 0.0, thick);
+            material.emissive = vec4(colour * thick, 0.0);
+            material.reflectance = 0.0;
+        } else {
+            material.baseColor = vec4(colour * thick, thick);
+            material.emissive = vec4(colour * thick * shine.z, 0.0);
+        }
 #endif
         material.roughness = rough;
-        material.metallic = materialParams.look.y;
+        material.metallic = unlit ? 0.0 : metal;
     }
 }
