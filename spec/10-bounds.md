@@ -164,6 +164,13 @@ the call inline works the same way.
   value, since the callee may rebind it to a shorter one;
 * replacing a **field** that held it.
 
+**Writing an element does not cost a proof about the vector**: `v[i] = x` swaps
+one element and leaves the length as it was, whether it stands on its own or in a
+branch or a loop, so a guard on `v` around it still proves `v[i]` after it. What
+it does cost is everything proved *through* the vector's elements — a guard on
+`grid[0]`, a search of `grid[0]` — since the element written may be any of them,
+and `grid[0] = [1]` makes that row shorter.
+
 ## 10.7 `drop`'s own bounds
 
 `drop(v, low, high)` removes `low` through `high`, **both inclusive** — the same

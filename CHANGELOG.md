@@ -27,6 +27,8 @@
 ### Fixes
 
 * **`onDrag` reaches a scene on a page**, where the picture drawn over the scene took the press.
+* **Writing an element inside a branch or a loop keeps what was proved about its vector**: `t[k] = 1` in an inner `if` cost the outer `t bounds k`, which a write cannot change.
+* **A proof is lost when what it was about is replaced**: an `indexOf` over a vector since rebound, and a guard on `grid[0]` after `grid[0] = [1]`, still proved an index that could be out of range.
 
 ### Breaking
 
