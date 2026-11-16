@@ -475,8 +475,10 @@ func uiaPatterns(a *uiAccess) []uintptr {
 			return []uintptr{10000, 10002}
 		}
 		return []uintptr{10000}
-	case "listitem":
+	case "listitem", "radio", "tab":
 		return []uintptr{10000, 10010}
+	case "treeitem":
+		return []uintptr{10000}
 	case "row", "columnheader":
 		if a.part != -1 {
 			return []uintptr{10000}
@@ -511,6 +513,7 @@ var uiaControlTypes = map[string]int32{
 	"combobox": 50003, "list": 50008, "listitem": 50007, "edit": 50004, "password": 50004, "spin": 50004,
 	"date": 50004, "slider": 50015, "table": 50036, "row": 50029, "cell": 50020, "columnheader": 50035,
 	"image": 50006, "progress": 50012, "dialog": 50032, "group": 50026, "tooltip": 50022,
+	"radio": 50013, "tab": 50019, "tablist": 50018, "tree": 50023, "treeitem": 50024,
 }
 
 func uiaControlType(a *uiAccess) int32 {

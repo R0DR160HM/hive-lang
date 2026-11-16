@@ -16,6 +16,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -454,6 +455,10 @@ type uixWindow struct {
 	liftedAs string
 	padFiles [4]*uixPadFile
 	padBeat  int
+
+	dndFrom   uint32
+	dndAt     [2]float64
+	dndTaking bool
 }
 
 func (w *uixWindow) show(v UiView) {
@@ -498,7 +503,9 @@ func (w *uixWindow) create(title string) bool {
 	c := w.c
 	w.atoms = map[string]uint32{}
 	for _, name := range []string{"WM_PROTOCOLS", "WM_DELETE_WINDOW", "_NET_WM_NAME", "UTF8_STRING", "_NET_WM_PID",
-		"_NET_WM_ICON", "CLIPBOARD", "TARGETS", "TEXT", "HIVE_CLIPBOARD", "_NET_WM_WINDOW_TYPE", "_NET_WM_WINDOW_TYPE_NORMAL"} {
+		"_NET_WM_ICON", "CLIPBOARD", "TARGETS", "TEXT", "HIVE_CLIPBOARD", "_NET_WM_WINDOW_TYPE", "_NET_WM_WINDOW_TYPE_NORMAL",
+		"XdndAware", "XdndEnter", "XdndPosition", "XdndStatus", "XdndLeave", "XdndDrop", "XdndFinished",
+		"XdndSelection", "XdndActionCopy", "text/uri-list", "HIVE_DND"} {
 		w.atoms[name] = c.atom(name)
 		if w.atoms[name] == 0 {
 			return false
@@ -542,6 +549,7 @@ func (w *uixWindow) create(title string) bool {
 	hints := uixLE.AppendUint32(nil, 1)
 	hints = uixLE.AppendUint32(hints, 1)
 	c.property(w.win, uixAtomWmHints, uixAtomWmHints, 32, append(hints, make([]byte, 28)...))
+	c.property(w.win, w.atoms["XdndAware"], uixAtomAtom, 32, uixLE.AppendUint32(nil, 5))
 	c.property(w.win, w.atoms["_NET_WM_ICON"], uixAtomCardinal, 32, uixIcon())
 	w.n.wake = w.poke
 	w.n.adopt()
@@ -960,11 +968,16 @@ func (w *uixWindow) handle(ev []byte) bool {
 		}
 	case 30:
 		w.answer(ev)
+	case 31:
+		if uixLE.Uint32(ev[12:]) == w.atoms["XdndSelection"] {
+			w.dropRead(ev)
+		}
 	case 33:
 		if uixLE.Uint32(ev[8:]) == w.atoms["WM_PROTOCOLS"] && uixLE.Uint32(ev[12:]) == w.atoms["WM_DELETE_WINDOW"] {
 			w.closed()
 			return false
 		}
+		w.dnd(ev)
 	case 34:
 		if ev[4] != 2 {
 			w.loadKeymap()
@@ -1380,7 +1393,9 @@ func (w *uixWindow) clipboard() string {
 		deadline := time.Now().Add(time.Second)
 		var answer []byte
 		for answer == nil && time.Now().Before(deadline) {
-			answer = c.take(func(ev []byte) bool { return ev[0]&0x7f == 31 && uixLE.Uint32(ev[8:]) == w.win })
+			answer = c.take(func(ev []byte) bool {
+				return ev[0]&0x7f == 31 && uixLE.Uint32(ev[8:]) == w.win && uixLE.Uint32(ev[12:]) == w.atoms["CLIPBOARD"]
+			})
 			if answer == nil {
 				select {
 				case <-c.ready:
@@ -1734,4 +1749,158 @@ func (w *uixWindow) closed() {
 			os.Exit(0)
 		}
 	})
+}
+
+// A drop from another program, by XDND: it says where it is, is told whether a file may land there, and hands
+// the files over as a list of URIs when let go.
+func (w *uixWindow) dnd(ev []byte) {
+	kind := uixLE.Uint32(ev[8:])
+	from := uixLE.Uint32(ev[12:])
+	switch kind {
+	case w.atoms["XdndEnter"]:
+		w.dndFrom, w.dndTaking = from, false
+	case w.atoms["XdndPosition"]:
+		at := uixLE.Uint32(ev[20:])
+		ox, oy := w.originOnRoot()
+		x, y := float64(int(at>>16)-ox), float64(int(at&0xffff)-oy)
+		w.n.layout()
+		w.dndAt = [2]float64{x, y}
+		w.dndTaking = w.n.hearer(x/w.scale, y/w.scale, "onFile") != nil
+		action := uint32(0)
+		flags := uint32(2)
+		if w.dndTaking {
+			action, flags = w.atoms["XdndActionCopy"], 3
+		}
+		w.dndSay(from, w.atoms["XdndStatus"], w.win, flags, 0, 0, action)
+	case w.atoms["XdndLeave"]:
+		w.dndFrom, w.dndTaking = 0, false
+	case w.atoms["XdndDrop"]:
+		if !w.dndTaking {
+			w.dndSay(from, w.atoms["XdndFinished"], w.win, 0, 0, 0, 0)
+			return
+		}
+		stamp := uixLE.Uint32(ev[20:])
+		w.c.send(uixRequest(24, 0).u32(w.win).u32(w.atoms["XdndSelection"]).u32(w.atoms["text/uri-list"]).
+			u32(w.atoms["HIVE_DND"]).u32(stamp))
+	}
+}
+
+func (w *uixWindow) dndSay(to, kind uint32, data ...uint32) {
+	ev := make([]byte, 32)
+	ev[0], ev[1] = 33, 32
+	uixLE.PutUint32(ev[4:], to)
+	uixLE.PutUint32(ev[8:], kind)
+	for i, v := range data {
+		uixLE.PutUint32(ev[12+4*i:], v)
+	}
+	w.c.send(uixRequest(25, 0).u32(to).u32(0).raw(ev))
+}
+
+func (w *uixWindow) dropRead(ev []byte) {
+	from := w.dndFrom
+	w.dndFrom = 0
+	var paths []string
+	if uixLE.Uint32(ev[20:]) != 0 {
+		for _, line := range strings.Split(string(w.c.getProperty(w.win, w.atoms["HIVE_DND"], true)), "\n") {
+			line = strings.TrimSpace(line)
+			if u, err := url.Parse(line); err == nil && u.Scheme == "file" && !strings.HasPrefix(line, "#") {
+				paths = append(paths, u.Path)
+			}
+		}
+	}
+	taken := len(paths) > 0 && w.n.filesDropped(w.dndAt[0], w.dndAt[1], paths)
+	if from != 0 {
+		accepted, action := uint32(0), uint32(0)
+		if taken {
+			accepted, action = 1, w.atoms["XdndActionCopy"]
+		}
+		w.dndSay(from, w.atoms["XdndFinished"], w.win, accepted, action)
+	}
+	w.dirty = true
+}
+
+// Asked of the desktop's portal where there is one, and of zenity or kdialog where there is not.
+func (w *uixWindow) chooseFile(done func(path string)) {
+	win := w.win
+	go func() {
+		path, asked := uixPortalChoose(win)
+		if !asked {
+			path = uixChooserTool()
+		}
+		w.post(func() { done(path) })
+	}()
+}
+
+func uixPortalChoose(win uint32) (string, bool) {
+	address := os.Getenv("DBUS_SESSION_BUS_ADDRESS")
+	if address == "" {
+		return "", false
+	}
+	answers := make(chan *uixMsg, 8)
+	bus, err := uixBusDial(address, func(m *uixMsg) {
+		if m.kind == uixSignal && m.member == "Response" {
+			select {
+			case answers <- m:
+			default:
+			}
+		}
+	})
+	if err != nil {
+		return "", false
+	}
+	defer bus.close()
+	bus.match("type='signal',interface='org.freedesktop.portal.Request',member='Response'")
+	reply, err := bus.callWithin(5*time.Second, "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+		"org.freedesktop.portal.FileChooser", "OpenFile", "ssa{sv}", "x11:"+strconv.FormatUint(uint64(win), 16), "", []any{})
+	if err != nil || len(reply) == 0 {
+		return "", false
+	}
+	handle, _ := reply[0].(string)
+	for {
+		select {
+		case m := <-answers:
+			if m.path != handle || len(m.body) < 2 {
+				continue
+			}
+			if code, _ := m.body[0].(uint32); code != 0 {
+				return "", true
+			}
+			results, _ := m.body[1].([]any)
+			for _, entry := range results {
+				pair, _ := entry.([]any)
+				if len(pair) != 2 || pair[0] != "uris" {
+					continue
+				}
+				v := pair[1]
+				if inner, ok := v.(uixVariant); ok {
+					v = inner.v
+				}
+				uris, _ := v.([]any)
+				for _, one := range uris {
+					if s, ok := one.(string); ok {
+						if u, err := url.Parse(s); err == nil && u.Scheme == "file" {
+							return u.Path, true
+						}
+					}
+				}
+			}
+			return "", true
+		case <-bus.dead:
+			return "", true
+		}
+	}
+}
+
+func uixChooserTool() string {
+	for _, tool := range [][]string{{"zenity", "--file-selection"}, {"kdialog", "--getopenfilename"}} {
+		if _, err := exec.LookPath(tool[0]); err != nil {
+			continue
+		}
+		out, err := exec.Command(tool[0], tool[1:]...).Output()
+		if err != nil {
+			return ""
+		}
+		return strings.TrimRight(string(out), "\r\n")
+	}
+	return ""
 }

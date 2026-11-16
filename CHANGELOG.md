@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.3.9
+
+### Standard library
+
+* **`hive.ui` lays out grids and stacks**: `grid` with `columns` and `span`, `stack` with `place`, a row that `wrap`s, and `minWidth`, `maxWidth`, `minHeight`, `maxHeight` and `aspect` on any box.
+* **Text takes a weight, a slant and a length**: `weight`, `italic`, `mono`, `lines` ending in an ellipsis, `justify` across a text's lines, and `paragraph` for words in several styles wrapped as one.
+* **`radio`, `choices`, `tabs`, `tree` and `progress` are widgets**, the first four heard through `onChoose`, `on` and `onToggle`.
+* **Any widget hears the pointer and the focus**: `onEnter`, `onLeave`, `onPress`, `onPoint`, `onRelease`, `onWheel`, `onFocus`, `onBlur`, `onScroll` and `onSize`; `carry` and `onDrop` drag one onto another, and `onFile` hears a file chosen or dropped.
+* **A box looks more ways**: `gradient`, `opacity`, `shadow`, `ease` to bring a change in over time, and `fit` for a picture.
+* **`limits` sets a slider's or a number's range and step**, and `InputKind` adds `Time`, `DateTime`, `Email`, `Tel`, `Url`, `Color` and `File`.
+* **`Icon` has 320**, drawn from Lucide alike on a page and in a window.
+* **A canvas draws more**: `oval`, `arc`, `wedge`, `curve`, `cutout`, `symbol`, `picture`, an `edge`, a `dash` and a `gradient`, and `measure` says how wide `words` will be everywhere.
+* **A scene has more shapes**: `torus`, `capsule`, `disc`, `mesh`, `tube`, `extrude`, `lathe`, `cloud`, `model`, `sign`, `group`, and a `line` with `thick`.
+* **A shape says how it shines**: `rough`, `metal`, `glow`, `unlit`, `wire`, `shadows`, and a `texture` and `relief` of its own laid by `tile`; `scale` sizes every shape.
+* **A scene's light is the program's**: `lamp`, `spot`, `sunlight`, `ambient`, a `panorama`, and a `background` with no alpha to see through.
+* **The camera can `orbit`, look `toward` a place, `roll`, go `ortho` and set its `depth`.**
+* **A scene says what is under the pointer** through `onHit` and `onOver`, and hands over a PNG of itself through `snapshot` and `onSnapshot`.
+* **A `model` or `figure` plays its file's animations** with `play(clip, at, loop)`, and a glTF without a skin, or with many meshes, is drawn whole.
+
+### Fixes
+
+* **`onDrag` reaches a scene on a page**, where the picture drawn over the scene took the press.
+
 ## v0.3.8
 
 ### Standard library

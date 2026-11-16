@@ -182,6 +182,14 @@ struct Reading {
     size_t left() const { return b.size() - at; }
 };
 
+// Cleared to nothing where a scene is see-through, so what is behind it shows where nothing is drawn.
+void wiped(Renderer* renderer, bool through) {
+    Renderer::ClearOptions wipe;
+    wipe.clearColor = {0, 0, 0, through ? 0.0f : 1.0f};
+    wipe.clear = true;
+    renderer->setClearOptions(wipe);
+}
+
 struct Seat {
     Engine* engine = nullptr;
     Renderer* renderer = nullptr;
@@ -193,6 +201,7 @@ struct Seat {
         auto began = std::chrono::steady_clock::now();
         // Drawn whatever Filament says of its pace: the window asked, and waits for this picture.
         world.ready(false, true);
+        wiped(renderer, world.seeThrough());
         renderer->beginFrame(chain);
         world.draw(*renderer);
         renderer->readPixels(0, 0, uint32_t(wide), uint32_t(tall),
@@ -289,7 +298,8 @@ int main(int argc, char** argv) {
                 else if (!seat.memory.take(name, bytes)) { break; }
                 if (sheetWide != seat.wide || sheetTall != seat.tall) {
                     if (seat.chain) { seat.engine->destroy(seat.chain); }
-                    seat.chain = seat.engine->createSwapChain(uint32_t(sheetWide), uint32_t(sheetTall), 0);
+                    seat.chain = seat.engine->createSwapChain(uint32_t(sheetWide), uint32_t(sheetTall),
+                        SwapChain::CONFIG_TRANSPARENT);
                     seat.wide = sheetWide;
                     seat.tall = sheetTall;
                 }

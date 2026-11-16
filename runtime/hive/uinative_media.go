@@ -13,6 +13,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -292,9 +293,13 @@ func (n *uiNative) paintImage(cv *uiCanvas, b *uiBox, clip uiClip, under uiRGBA)
 	if pix == nil {
 		return
 	}
-	left, top := int(x0), int(y0)
+	cv.blit(pix, w, h, int(x0), int(y0), clip)
+}
+
+// Pixels whose colour is already multiplied by their alpha, laid over what is there.
+func (cv *uiCanvas) blit(pix []uint8, w, h, left, top int, clip uiClip) {
 	r := cv.bounds(clip).and(uiClip{left, top, left + w, top + h})
-	if r.empty() {
+	if r.empty() || len(pix) < w*h*4 {
 		return
 	}
 	cv.flush()
@@ -314,6 +319,46 @@ func (n *uiNative) paintImage(cv *uiCanvas, b *uiBox, clip uiClip, under uiRGBA)
 			row[x] = min(rr, 255)<<16 | min(gg, 255)<<8 | min(bb, 255) | 0xff000000
 		}
 	}
+}
+
+func (n *uiNative) paintIcon(cv *uiCanvas, b *uiBox, clip uiClip, under uiRGBA) {
+	x0, y0, _, _ := n.rectOf(b)
+	side := int(math.Round(b.font.px * n.scale))
+	left := int(math.Round(x0 + (b.padX+b.border)*n.scale))
+	top := int(math.Round(y0 + (b.padY+b.border+(b.lineH-b.font.px)/2)*n.scale))
+	colour := uiMix(under, b.colour, 1)
+	if b.disabled {
+		colour = uiMix(under, colour, 0.5)
+	}
+	if pix := n.iconPixels(b.v.Text, colour, side); pix != nil {
+		cv.blit(pix, side, side, left, top, clip)
+	}
+}
+
+func (n *uiNative) iconPixels(name string, c uiRGBA, side int) []uint8 {
+	if side <= 0 {
+		return nil
+	}
+	hex := "#" + strconv.FormatUint(uint64(uiPack(c)&0xffffff)|1<<24, 16)[1:]
+	key := name + "|" + hex + "|" + strconv.Itoa(side)
+	if pix, ok := n.icons[key]; ok {
+		return pix
+	}
+	if len(n.icons) > 512 {
+		n.icons = map[string][]uint8{}
+	}
+	shape, ok := uiIconShapes[name]
+	if !ok {
+		shape = `<rect x="3" y="3" width="18" height="18" rx="2"/>`
+	}
+	svg := `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="` + hex +
+		`" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">` + shape + `</svg>`
+	var pix []uint8
+	if v, drawn := uiParseSVG([]byte(svg)); drawn {
+		pix = v.render(side, side)
+	}
+	n.icons[key] = pix
+	return pix
 }
 
 func (n *uiNative) fillPolys(cv *uiCanvas, polys [][]float64, c uiRGBA, clip uiClip) {
@@ -410,47 +455,5 @@ func (n *uiNative) paintCanvas(cv *uiCanvas, b *uiBox, clip uiClip, under uiRGBA
 	s := math.Min((x1-x0)/region[2], (y1-y0)/region[3])
 	ox := x0 + ((x1-x0)-region[2]*s)/2 - region[0]*s
 	oy := y0 + ((y1-y0)-region[3]*s)/2 - region[1]*s
-	place := func(nums []float64) []float64 {
-		out := make([]float64, len(nums)&^1)
-		for i := 0; i+1 < len(nums); i += 2 {
-			out[i], out[i+1] = ox+nums[i]*s, oy+nums[i+1]*s
-		}
-		return out
-	}
-	for _, m := range b.v.Marks {
-		colour := n.markColour(m.Attrs, b.colour)
-		switch m.Kind {
-		case "dot":
-			if len(m.Nums) >= 3 {
-				n.fillPolys(cv, [][]float64{uiCircle(ox+m.Nums[0]*s, oy+m.Nums[1]*s, m.Nums[2]*s)}, colour, box)
-			}
-		case "bar":
-			if len(m.Nums) >= 4 {
-				l, t := ox+(m.Nums[0]-m.Nums[2]/2)*s, oy+(m.Nums[1]-m.Nums[3]/2)*s
-				r, d := l+m.Nums[2]*s, t+m.Nums[3]*s
-				n.fillPolys(cv, [][]float64{{l, t, r, t, r, d, l, d}}, colour, box)
-			}
-		case "path":
-			if len(m.Nums) >= 4 {
-				n.fillPolys(cv, uiStroke(place(m.Nums), uiThick(m.Attrs)*s/2), colour, box)
-			}
-		case "patch":
-			if len(m.Nums) >= 6 {
-				n.fillPolys(cv, [][]float64{place(m.Nums)}, colour, box)
-			}
-		case "words":
-			if len(m.Nums) < 3 || m.Nums[2] <= 0 || m.Text == "" {
-				continue
-			}
-			f := uiFont{px: math.Round(m.Nums[2]*s/n.scale*8) / 8, weight: 400}
-			if f.px < 1 {
-				continue
-			}
-			wide := n.measure(f, m.Text) * n.scale
-			tall := n.dev.tall(f) * n.scale
-			x := ox + m.Nums[0]*s - wide/2
-			y := oy + m.Nums[1]*s - tall/2
-			n.dev.text(f, int(math.Round(x)), int(math.Round(y)), m.Text, uiMix(under, colour, 1), box)
-		}
-	}
+	n.paintMarks(cv, b.v.Marks, uiAffine{a: s, d: s, e: ox, f: oy}, uiInk{box: box, under: under, colour: b.colour})
 }

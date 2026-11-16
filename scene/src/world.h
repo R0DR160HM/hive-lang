@@ -32,6 +32,9 @@ struct Eye {
     float sun[2] = {0, -100};
     int shade = 0;
     std::string on;
+    float roll = 0, ortho = 0, near = 0.08f, far = 800;
+    std::string ambient, sunTone, panorama;
+    float ambientBright = 1, sunBright = 1;
 };
 
 struct Heard {
@@ -70,6 +73,8 @@ public:
     void label(const std::string& words, const std::string& colour, int wide, int tall, const uint8_t* rgba);
 
     bool stale() const;
+    // Whether what is behind the picture shows through where nothing is drawn.
+    bool seeThrough() const;
     const Eye& eye() const;
     const std::vector<const Heard*>& sounds();
 

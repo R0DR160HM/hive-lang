@@ -68,7 +68,8 @@ EMSCRIPTEN_KEEPALIVE int hs_start(const char* canvas) {
     emscripten_webgl_init_context_attributes(&with);
     with.majorVersion = 2;
     with.minorVersion = 0;
-    with.alpha = false;
+    with.alpha = true;
+    with.premultipliedAlpha = true;
     with.depth = true;
     with.stencil = false;
     with.antialias = false;
@@ -159,6 +160,10 @@ EMSCRIPTEN_KEEPALIVE void hs_insets(const int32_t* at, int many) {
 EMSCRIPTEN_KEEPALIVE void hs_draw() {
     if (!world) { return; }
     world->ready(false, false);
+    Renderer::ClearOptions wipe;
+    wipe.clearColor = {0, 0, 0, world->seeThrough() ? 0.0f : 1.0f};
+    wipe.clear = true;
+    renderer->setClearOptions(wipe);
     if (renderer->beginFrame(chain)) {
         world->draw(*renderer);
         renderer->endFrame();

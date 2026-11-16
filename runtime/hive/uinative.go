@@ -107,10 +107,12 @@ func uiClamp(v, lo, hi float64) float64 {
 }
 
 type uiFont struct {
-	px     float64
-	weight int
-	icon   bool
-	mono   bool
+	px      float64
+	weight  int
+	icon    bool
+	mono    bool
+	italic  bool
+	stretch float64
 }
 
 type uiClip struct{ x0, y0, x1, y1 int }
@@ -529,6 +531,23 @@ type uiBox struct {
 	radius     float64
 	noRing     bool
 	hoverTone  string
+
+	wrap      bool
+	unwrapped bool
+	clamp     int
+	shadow    float64
+	gradient  *uiShading
+	ease      int
+	loW, hiW  float64
+	loH, hiH  float64
+	aspect    float64
+	fit       string
+	across    string
+	down      string
+	span      int
+	selected  bool
+	layout    *uiLaid
+	item      *uiItem
 }
 
 type uiGrid struct {
@@ -557,6 +576,9 @@ type uiLayer struct {
 func (b *uiBox) attr(kind string) (UiAttr, bool) { return uiFind(b.v.Attrs, kind) }
 
 func (b *uiBox) focusable() bool {
+	if b.item != nil {
+		return b.item.native.itemFocusable(b)
+	}
 	switch b.kind {
 	case "button", "input", "link", "textarea", "select", "checkbox":
 		return !b.disabled
@@ -565,6 +587,9 @@ func (b *uiBox) focusable() bool {
 }
 
 func (b *uiBox) clickable() bool {
+	if b.item != nil {
+		return b.item.native.itemClickable(b)
+	}
 	if b.disabled {
 		return false
 	}
@@ -577,7 +602,8 @@ func (b *uiBox) clickable() bool {
 }
 
 func (b *uiBox) editable() bool {
-	return !b.disabled && (b.kind == "textarea" || b.kind == "input" && b.input != "Range" && b.input != "Date")
+	return !b.disabled && (b.kind == "textarea" || b.kind == "input" && b.input != "Range" && !uiStamp(b.input) &&
+		b.input != "Color" && b.input != "File")
 }
 
 type uiEntry struct {
@@ -625,46 +651,59 @@ type uiNative struct {
 	last   UiView
 	addr   SyslinkAddress
 
-	dev     uiDevice
-	scale   float64
-	vw, vh  float64
-	pal     uiPalette
-	stale   bool
-	root    *uiBox
-	layers  []*uiLayer
-	seq     int
-	boxes   map[string]*uiBox
-	order   []*uiBox
-	fields  map[string]*uiEntry
-	dates   map[string]*uiDate
-	scrolls map[string][2]float64
-	sized   map[uiMeasured]float64
-	pending map[string]string
-	pics    map[string]*uiPicture
-	popup   *uiPopup
+	dev         uiDevice
+	scale       float64
+	vw, vh      float64
+	pal         uiPalette
+	stale       bool
+	root        *uiBox
+	layers      []*uiLayer
+	seq         int
+	boxes       map[string]*uiBox
+	order       []*uiBox
+	fields      map[string]*uiEntry
+	dates       map[string]*uiDate
+	scrolls     map[string][2]float64
+	sized       map[uiMeasured]float64
+	pending     map[string]string
+	pics        map[string]*uiPicture
+	icons       map[string][]uint8
+	easing      map[string]*uiEasing
+	scrollAsked map[string]int
+	popup       *uiPopup
 
-	hover     string
-	hoverPart int
-	press     string
-	pressPart int
-	focus     string
-	keyboard  bool
-	blink     bool
-	dragging  bool
-	sliding   string
-	pointer   [2]float64
-	tip       string
-	quiet     string
-	tipSince  time.Time
-	tipAt     [2]float64
-	spins     []uiClip
-	anims     []uiClip
-	animDue   time.Duration
-	tipDrawn  bool
-	epoch     time.Time
-	dateShape [3]byte
-	dateSep   string
-	redo      atomic.Bool
+	hover      string
+	hoverPart  int
+	press      string
+	pressPart  int
+	focus      string
+	keyboard   bool
+	blink      bool
+	dragging   bool
+	sliding    string
+	pointer    [2]float64
+	tip        string
+	quiet      string
+	tipSince   time.Time
+	tipAt      [2]float64
+	spins      []uiClip
+	anims      []uiClip
+	animDue    time.Duration
+	tipDrawn   bool
+	epoch      time.Time
+	dateShape  [3]byte
+	dateSep    string
+	redo       atomic.Bool
+	easingLive bool
+
+	entered   []string
+	focusSaid string
+	releasing string
+	pointing  string
+	pressing  bool
+	pointSaid string
+	carrying  *uiCarry
+	said      map[string]string
 
 	runs      []uiRun
 	runIndex  map[string]int
@@ -740,20 +779,24 @@ func (n *uiNative) staged() bool {
 
 func uiNewNative() *uiNative {
 	return &uiNative{
-		scale:     1,
-		pal:       uiLightPalette,
-		fields:    map[string]*uiEntry{},
-		dates:     map[string]*uiDate{},
-		scrolls:   map[string][2]float64{},
-		sized:     map[uiMeasured]float64{},
-		pending:   map[string]string{},
-		pics:      map[string]*uiPicture{},
-		grown:     map[string]float64{},
-		asked:     map[string]int{},
-		clips:     map[string]int{},
-		performed: map[string]int{},
-		blink:     true,
-		epoch:     time.Now(),
+		scale:       1,
+		pal:         uiLightPalette,
+		fields:      map[string]*uiEntry{},
+		dates:       map[string]*uiDate{},
+		scrolls:     map[string][2]float64{},
+		sized:       map[uiMeasured]float64{},
+		pending:     map[string]string{},
+		pics:        map[string]*uiPicture{},
+		icons:       map[string][]uint8{},
+		easing:      map[string]*uiEasing{},
+		said:        map[string]string{},
+		scrollAsked: map[string]int{},
+		grown:       map[string]float64{},
+		asked:       map[string]int{},
+		clips:       map[string]int{},
+		performed:   map[string]int{},
+		blink:       true,
+		epoch:       time.Now(),
 	}
 }
 
@@ -851,7 +894,8 @@ func (n *uiNative) build(v *UiView, path string, parent *uiBox) *uiBox {
 		v = &c
 	}
 	n.seq++
-	b := &uiBox{kind: v.Kind, v: v, path: path, seq: n.seq, width: -1, height: -1, opacity: 1, edge: -1, radius: -1}
+	b := &uiBox{kind: v.Kind, v: v, path: path, seq: n.seq, width: -1, height: -1, opacity: 1, edge: -1, radius: -1,
+		loW: -1, hiW: -1, loH: -1, hiH: -1, across: "Stretch", down: "Stretch", span: 1}
 	if parent == nil {
 		b.font = uiFont{px: 14, weight: 400}
 		b.colour = n.pal.fg
@@ -903,6 +947,41 @@ func (n *uiNative) build(v *UiView, path string, parent *uiBox) *uiBox {
 			b.noRing = !a.Flag
 		case "hover":
 			b.hoverTone = a.Word
+		case "wrap":
+			b.wrap, b.unwrapped = a.Flag, !a.Flag
+		case "lines":
+			b.clamp = a.Num
+		case "opacity":
+			if len(a.Nums) == 1 {
+				b.opacity *= a.Nums[0]
+			}
+		case "shadow":
+			b.shadow = float64(a.Num)
+		case "gradient":
+			from, to, angle := uiGradientOf(a)
+			b.gradient = &uiShading{from: n.fillOf(from), to: n.fillOf(to), angle: angle}
+		case "ease":
+			b.ease = a.Num
+		case "minWidth":
+			b.loW = float64(a.Num)
+		case "maxWidth":
+			b.hiW = float64(a.Num)
+		case "minHeight":
+			b.loH = float64(a.Num)
+		case "maxHeight":
+			b.hiH = float64(a.Num)
+		case "aspect":
+			if len(a.Nums) == 2 {
+				b.aspect = a.Nums[1] / a.Nums[0]
+			}
+		case "fit":
+			b.fit = a.Word
+		case "place":
+			b.across, b.down = uiPlaced(v.Attrs)
+		case "span":
+			b.span = max(a.Num, 1)
+		case "selected":
+			b.selected = a.Flag
 		}
 	}
 	level := 0
@@ -920,6 +999,15 @@ func (n *uiNative) build(v *UiView, path string, parent *uiBox) *uiBox {
 		case "Caption":
 			b.font.px = 12
 		}
+	}
+	if w, ok := uiFind(v.Attrs, "weight"); ok {
+		b.font.weight = w.Num
+	}
+	if i, ok := uiFind(v.Attrs, "italic"); ok {
+		b.font.italic = i.Flag
+	}
+	if m, ok := uiFind(v.Attrs, "mono"); ok && m.Flag {
+		b.font.mono = true
 	}
 	b.margin = uiHeadingMargin[level] * b.font.px
 	if c, ok := uiParseColour(background); ok {
@@ -955,7 +1043,7 @@ func (n *uiNative) build(v *UiView, path string, parent *uiBox) *uiBox {
 	}
 	b.lineH = b.font.px * 1.5
 	switch v.Kind {
-	case "row", "column", "overlay", "inset":
+	case "row", "column", "overlay", "inset", "grid", "stack", "tree":
 		b.container = true
 		b.row = v.Kind == "row"
 		if v.Kind == "inset" {
@@ -1001,8 +1089,12 @@ func (n *uiNative) build(v *UiView, path string, parent *uiBox) *uiBox {
 		b.full = b.width < 0
 	case "image":
 		b.pic = n.picture(v.Text)
-	case "icon":
-		b.font.icon = true
+	case "progress":
+		b.full = b.width < 0
+	case "radio", "tabs", "choices", "branch":
+		n.adopted(b)
+		n.expand(b)
+		return b
 	case "link":
 		if _, own := uiParseColour(tone); !own {
 			b.colour = n.pal.accent
@@ -1012,6 +1104,7 @@ func (n *uiNative) build(v *UiView, path string, parent *uiBox) *uiBox {
 		b.container = true
 		b.row = false
 	}
+	n.adopted(b)
 	for i := range v.Children {
 		k := n.build(&v.Children[i], path+"/"+strconv.Itoa(i), b)
 		switch {
@@ -1112,10 +1205,7 @@ func (b *uiBox) cellFont(row int) uiFont {
 }
 
 func (n *uiNative) glyphs(b *uiBox) string {
-	if b.kind == "icon" {
-		return uiIconGlyph(b.v.Text)
-	}
-	if b.kind == "input" {
+	if b.kind == "input" || b.kind == "icon" {
 		return ""
 	}
 	return b.v.Text
@@ -1148,13 +1238,26 @@ func (n *uiNative) intrinsic(b *uiBox) {
 		n.intrinsic(k)
 	}
 	edge := 2*b.padX + 2*b.border
+	if n.itemIntrinsic(b, edge) {
+		n.limitIntrinsic(b)
+		return
+	}
 	switch b.kind {
-	case "text", "link", "icon":
+	case "paragraph":
+		n.paragraphIntrinsic(b, edge)
+	case "grid":
+		n.gridIntrinsic(b, edge)
+	case "icon":
+		b.maxW, b.minW = b.font.px+edge, b.font.px+edge
+	case "text", "link":
 		widest := 0.0
 		for _, line := range strings.Split(n.glyphs(b), "\n") {
 			widest = math.Max(widest, n.measure(b.font, line))
 		}
 		b.maxW, b.minW = widest+edge, n.letter(b.font, n.glyphs(b))+edge
+		if b.unwrapped {
+			b.minW = b.maxW
+		}
 	case "button":
 		b.maxW = n.measure(b.font, b.v.Text) + edge
 		b.minW = n.longestWord(b.font, b.v.Text) + edge
@@ -1162,8 +1265,12 @@ func (n *uiNative) intrinsic(b *uiBox) {
 		switch b.input {
 		case "Range":
 			b.maxW = 129 + 2*b.inset + edge
-		case "Date":
-			b.maxW = n.measure(b.font, n.dateSample()) + uiDateRoom + edge
+		case "Date", "Time", "DateTime":
+			b.maxW = n.measure(b.font, n.stampSample(b)) + uiDateRoom + edge
+		case "Color":
+			b.maxW = 64
+		case "File":
+			b.maxW = n.measure(b.font, uiChooseFile) + 28 + n.measure(b.font, uiNoFile) + edge
 		default:
 			b.maxW = 20*n.dev.average(b.font) + edge
 		}
@@ -1221,15 +1328,23 @@ func (n *uiNative) intrinsic(b *uiBox) {
 			topMax = math.Max(topMax, k.maxW)
 			topMin = math.Max(topMin, k.minW)
 		}
-		if b.row {
+		switch {
+		case b.row && b.wrap:
+			b.maxW, b.minW = sumMax+gaps+edge, topMin+edge
+		case b.row:
 			b.maxW, b.minW = sumMax+gaps+edge, sumMin+gaps+edge
-		} else {
+		default:
 			b.maxW, b.minW = topMax+edge, topMin+edge
 		}
 	}
+	n.limitIntrinsic(b)
+}
+
+func (n *uiNative) limitIntrinsic(b *uiBox) {
 	if b.width >= 0 {
 		b.maxW, b.minW = b.width, b.width
 	}
+	b.maxW, b.minW = uiLimit(b.maxW, b.loW, b.hiW), uiLimit(b.minW, b.loW, b.hiW)
 }
 
 func (n *uiNative) pictureSize(b *uiBox, w float64) (float64, float64) {
@@ -1368,11 +1483,27 @@ func (n *uiNative) sizeW(b *uiBox, w float64) {
 	if b.kind == "table" {
 		w = math.Max(w, b.minW)
 	}
+	w = uiLimit(w, b.loW, b.hiW)
 	b.w = w
+	if b.kind == "paragraph" {
+		n.paragraphW(b, b.innerW())
+		return
+	}
 	if !b.container {
 		return
 	}
-	inner := math.Max(w-2*b.padX, 0)
+	inner := b.innerW()
+	switch {
+	case b.kind == "grid":
+		n.gridW(b, inner)
+		return
+	case b.kind == "stack":
+		n.stackW(b, inner)
+		return
+	case b.row && b.wrap:
+		n.wrapW(b, inner)
+		return
+	}
 	if b.row {
 		items := make([]uiFlex, len(b.kids))
 		for i, k := range b.kids {
@@ -1400,6 +1531,7 @@ func (n *uiNative) sizeW(b *uiBox, w float64) {
 				}
 				it.max = math.Max(inner, it.min)
 			}
+			uiFlexLimits(&it, k)
 			items[i] = it
 		}
 		uiResolveFlex(items, inner-b.gap*float64(max(len(b.kids)-1, 0)))
@@ -1485,6 +1617,15 @@ func (n *uiNative) fits(f uiFont, s string, width float64) int {
 
 func uiColumnItem(k *uiBox) uiFlex {
 	it := uiFlex{max: math.Inf(1), shrink: 1, min: k.minH}
+	defer func() {
+		if k.hiH >= 0 {
+			it.max = math.Max(math.Min(it.max, k.hiH), it.min)
+		}
+		if k.loH >= 0 {
+			it.min = math.Max(it.min, k.loH)
+			it.max = math.Max(it.max, it.min)
+		}
+	}()
 	switch {
 	case k.grow > 0:
 		it.grow = k.grow
@@ -1531,9 +1672,13 @@ func (n *uiNative) natural(b *uiBox) {
 	edgeY := 2*b.padY + 2*b.border
 	content := 0.0
 	switch b.kind {
-	case "text", "link", "icon":
-		b.lines = n.wrap(b.font, n.glyphs(b), math.Max(b.w-edgeX, 0), true)
+	case "icon":
+		content = b.lineH + edgeY
+	case "text", "link":
+		b.lines = n.textLines(b, math.Max(b.w-edgeX, 0))
 		content = float64(len(b.lines))*b.lineH + edgeY + 2*b.margin
+	case "paragraph":
+		content = n.paragraphNatural(b) + edgeY
 	case "button":
 		b.lines = n.wrap(b.font, b.v.Text, math.Max(b.w-edgeX, 0), false)
 		content = float64(len(b.lines))*b.lineH + edgeY
@@ -1542,7 +1687,7 @@ func (n *uiNative) natural(b *uiBox) {
 		switch b.input {
 		case "Range":
 			content = 16 + 2*b.inset + edgeY
-		case "Date":
+		case "Date", "Time", "DateTime":
 			content += 2
 		}
 	case "textarea":
@@ -1563,11 +1708,34 @@ func (n *uiNative) natural(b *uiBox) {
 		}
 		content = b.w * region[3] / region[2]
 	default:
+		if c, ok := n.itemNatural(b, edgeX, edgeY); ok {
+			content = c
+			break
+		}
 		if !b.container {
 			content = edgeY
 			break
 		}
 		gaps := b.gap * float64(max(len(b.kids)-1, 0))
+		if b.kind == "grid" {
+			content = n.gridNatural(b) + edgeY
+			break
+		}
+		if b.kind == "stack" {
+			for _, k := range b.kids {
+				tall := k.natH
+				if k.height >= 0 {
+					tall = k.height
+				}
+				content = math.Max(content, tall)
+			}
+			content += edgeY
+			break
+		}
+		if b.row && b.wrap {
+			content = n.wrapNatural(b) + edgeY
+			break
+		}
 		if b.row {
 			for _, k := range b.kids {
 				tall := k.natH
@@ -1587,10 +1755,17 @@ func (n *uiNative) natural(b *uiBox) {
 	}
 	b.natH = content
 	b.minH = content
+	if b.aspect > 0 && b.height < 0 {
+		b.natH = b.w * b.aspect
+		if b.scroll == "" {
+			b.natH = math.Max(b.natH, content)
+		}
+	}
 	if b.height >= 0 {
 		b.natH = b.height
 		b.minH = math.Min(b.height, content)
 	}
+	b.natH, b.minH = uiLimit(b.natH, b.loH, b.hiH), uiLimit(b.minH, b.loH, b.hiH)
 	if b.floor > 0 {
 		b.natH = math.Max(b.natH, b.floor)
 		b.minH = math.Max(b.minH, b.floor)
@@ -1623,11 +1798,23 @@ func (n *uiNative) tableRows(b *uiBox) float64 {
 }
 
 func (n *uiNative) sizeH(b *uiBox, h float64) {
+	h = uiLimit(h, b.loH, b.hiH)
 	b.h = h
 	if !b.container {
 		return
 	}
-	inner := math.Max(h-2*b.padY, 0)
+	inner := b.innerH()
+	switch {
+	case b.kind == "grid":
+		n.gridH(b)
+		return
+	case b.kind == "stack":
+		n.stackH(b)
+		return
+	case b.row && b.wrap:
+		n.wrapH(b)
+		return
+	}
 	if !b.row {
 		items := make([]uiFlex, len(b.kids))
 		for i, k := range b.kids {
@@ -1678,11 +1865,29 @@ func uiCross(align string, room float64, size float64) float64 {
 
 func (n *uiNative) place(b *uiBox, x, y float64) {
 	b.x, b.y = x, y
+	if b.kind == "paragraph" {
+		n.paragraphPlace(b, x, y)
+		return
+	}
 	if !b.container {
 		return
 	}
-	innerW := math.Max(b.w-2*b.padX, 0)
-	innerH := math.Max(b.h-2*b.padY, 0)
+	switch {
+	case b.kind == "grid":
+		n.gridPlace(b, x, y)
+	case b.kind == "stack":
+		n.stackPlace(b, x, y)
+	case b.row && b.wrap:
+		n.wrapPlace(b, x, y)
+	}
+	if b.kind == "grid" || b.kind == "stack" || b.row && b.wrap {
+		if b.scroll != "" {
+			n.scrolled(b, b.padX+b.border, b.padY+b.border)
+		}
+		return
+	}
+	innerW := b.innerW()
+	innerH := b.innerH()
 	used := b.gap * float64(max(len(b.kids)-1, 0))
 	for _, k := range b.kids {
 		if b.row {
@@ -1693,21 +1898,21 @@ func (n *uiNative) place(b *uiBox, x, y float64) {
 	}
 	if b.row {
 		start, extra := uiJustify(b.justify, innerW-used, len(b.kids))
-		at := x + b.padX + start
+		at := x + b.padX + b.border + start
 		for _, k := range b.kids {
-			n.place(k, at, y+b.padY+uiCross(b.align, innerH, k.h))
+			n.place(k, at, y+b.padY+b.border+uiCross(b.align, innerH, k.h))
 			at += k.w + b.gap + extra
 		}
 	} else {
 		start, extra := uiJustify(b.justify, innerH-used, len(b.kids))
-		at := y + b.padY + start
+		at := y + b.padY + b.border + start
 		for _, k := range b.kids {
-			n.place(k, x+b.padX+uiCross(b.align, innerW, k.w), at)
+			n.place(k, x+b.padX+b.border+uiCross(b.align, innerW, k.w), at)
 			at += k.h + b.gap + extra
 		}
 	}
 	if b.scroll != "" {
-		n.scrolled(b, b.padX, b.padY)
+		n.scrolled(b, b.padX+b.border, b.padY+b.border)
 	}
 }
 
@@ -1768,8 +1973,10 @@ func (n *uiNative) layout() {
 	n.seq = 0
 	n.layers = n.layers[:0]
 	n.sceneBox, n.insetBoxes = nil, n.insetBoxes[:0]
+	n.easingLive = false
 	root := n.build(&UiView{Kind: "column", Children: []UiView{view}}, "r", nil)
 	n.forget()
+	n.forgetEasing()
 	n.intrinsic(root)
 	n.sizeW(root, n.vw)
 	n.natural(root)
@@ -1797,6 +2004,8 @@ func (n *uiNative) layout() {
 			delete(n.grown, path)
 		}
 	}
+	n.reported()
+	n.focusMoved()
 	switch {
 	case uiStageMake == nil:
 	case n.sceneBox != nil:
@@ -1973,15 +2182,15 @@ func (n *uiNative) reconcile() {
 		}
 	}
 	for path, d := range n.dates {
-		if b, ok := n.boxes[path]; !ok || b.kind != "input" || b.input != "Date" {
+		if b, ok := n.boxes[path]; !ok || b.kind != "input" || !uiStamp(b.input) || b.input != d.kind {
 			delete(n.dates, path)
 		} else if path != n.focus || d.value() != b.v.Text && !d.partial() {
 			d.set(b.v.Text)
 		}
 	}
 	for path, b := range n.boxes {
-		if b.kind == "input" && b.input == "Date" && n.dates[path] == nil {
-			d := &uiDate{}
+		if b.kind == "input" && uiStamp(b.input) && n.dates[path] == nil {
+			d := &uiDate{kind: b.input}
 			d.set(b.v.Text)
 			n.dates[path] = d
 		}

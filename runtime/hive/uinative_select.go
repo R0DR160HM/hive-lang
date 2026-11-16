@@ -23,6 +23,8 @@ type uiRun struct {
 	text   []rune
 	lines  []string
 	starts []int
+	frag   *uiFrag
+	within *uiBox
 }
 
 type uiSelection struct{ anchor, focus uiMark }
@@ -47,6 +49,25 @@ func (n *uiNative) collectRuns() {
 	var walk func(b *uiBox)
 	walk = func(b *uiBox) {
 		switch b.kind {
+		case "paragraph":
+			if b.layout != nil {
+				for i := range b.layout.frags {
+					f := &b.layout.frags[i]
+					k := b.kids[f.kid]
+					if !uiWorded(k.kind) || f.text == "" {
+						continue
+					}
+					text := []rune(f.text)
+					n.runs = append(n.runs, uiRun{box: k, cell: uiFragCell(i), text: text, lines: []string{f.text},
+						starts: []int{0}, frag: f, within: b})
+				}
+			}
+			for _, k := range b.kids {
+				if !uiWorded(k.kind) {
+					walk(k)
+				}
+			}
+			return
 		case "text", "link":
 			text := []rune(b.v.Text)
 			n.runs = append(n.runs, uiRun{box: b, cell: -1, text: text, lines: b.lines, starts: uiLineStarts(text, b.lines)})
@@ -85,6 +106,10 @@ func (n *uiNative) collectRuns() {
 
 func (n *uiNative) runOrigin(r *uiRun) (float64, float64, float64, uiFont) {
 	b := r.box
+	if r.frag != nil {
+		p := r.within
+		return p.x + p.padX + p.border + r.frag.x, p.y + p.padY + p.border + r.frag.y, b.lineH, b.font
+	}
 	if r.cell < 0 {
 		return b.x + b.padX + b.border, b.y + b.margin + b.padY + b.border, b.lineH, b.font
 	}
@@ -106,6 +131,9 @@ func (n *uiNative) runOrigin(r *uiRun) (float64, float64, float64, uiFont) {
 
 func (n *uiNative) runRect(r *uiRun) (float64, float64, float64, float64) {
 	x, y, lineH, _ := n.runOrigin(r)
+	if r.frag != nil {
+		return x, y, r.frag.w, lineH
+	}
 	if r.cell < 0 {
 		return r.box.x, y, r.box.w, float64(len(r.lines)) * lineH
 	}
@@ -165,6 +193,17 @@ func (n *uiNative) textAt(x, y float64) (uiMark, bool) {
 		b := chain[i]
 		cell := -1
 		switch b.kind {
+		case "paragraph":
+			at, ok := n.fragAt(b, x, y)
+			if !ok {
+				return uiMark{}, false
+			}
+			k := b.kids[b.layout.frags[at].kid]
+			run, found := n.runIndex[uiRunKey(k.path, uiFragCell(at))]
+			if !found {
+				return uiMark{}, false
+			}
+			return uiMark{k.path, uiFragCell(at), n.runOffset(&n.runs[run], x, y)}, true
 		case "text", "link":
 		case "table":
 			if cell = n.cellAt(b, x, y); cell < 0 {
@@ -263,9 +302,14 @@ func (n *uiNative) selectedText() string {
 		}
 		if i > ai {
 			prev := &n.runs[i-1]
-			if prev.box == r.box && prev.cell >= 0 && prev.cell>>16 == r.cell>>16 {
+			switch {
+			case r.frag != nil && prev.frag != nil && prev.within == r.within:
+				if r.frag.line != prev.frag.line && prev.frag.hard {
+					out.WriteByte('\n')
+				}
+			case prev.box == r.box && prev.cell >= 0 && prev.cell>>16 == r.cell>>16:
 				out.WriteByte('\t')
-			} else {
+			default:
 				out.WriteByte('\n')
 			}
 		}
