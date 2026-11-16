@@ -69,6 +69,13 @@ release's `SHA256SUMS`. It reaches back to v0.3.3, the first release with
 If `run` says `go` is not on the `PATH`, the compiler is installed and Go is not:
 [go.dev/dl](https://go.dev/dl/) has it.
 
+## Installing a program of your own
+
+`hive install tool.hive` builds it and moves it where a shell finds commands, so
+it runs by name: `~/.local/bin` on Linux and macOS, and on Windows
+`%LOCALAPPDATA%\Programs\Hive\bin`, which it puts on your `PATH` the first time.
+`--name notes` installs it as `notes` instead.
+
 ## In an editor
 
 `hive lsp` is a language server: errors as you type, what a name is, where it was

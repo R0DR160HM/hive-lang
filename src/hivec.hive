@@ -7,6 +7,8 @@
 //   hive build     <entrypoint.hive>       compile to a native executable
 //   hive build     <entrypoint.hive> --target <goos>/<goarch>
 //   hive run       <entrypoint.hive> [..]  compile and run
+//   hive install   <entrypoint.hive>       build it, and put it where a shell finds commands
+//   hive install   <entrypoint.hive> --name <name>
 //   hive test      <entrypoint.hive>       run the program's tests, with coverage
 //   hive test      <directory>             run every test under it, git-ignored files aside
 //   hive analyze   <entrypoint.hive>       score what it will cost, and write a page
@@ -24,6 +26,7 @@ import ./analyzereport
 import ./container
 import ./diag
 import ./indent
+import ./install
 import ./lsp
 import ./paths
 import ./progress
@@ -82,14 +85,15 @@ proc main(): void {
 
     // `--target` belongs to the two commands that write something for a platform:
     // two others compile nothing, two more are about this machine by definition,
-    // and `run` hands everything past the entrypoint to the program.
-    if command != "build" && command != "export" && command != "run" {
+    // and `run` hands everything past the entrypoint to the program. `install`
+    // reads its own flags, and says why it takes no target itself.
+    if command != "build" && command != "export" && command != "run" && command != "install" {
         if mentions(rest(args, 2), "--target") {
             refuse("`--target` is a flag of `hive build` and `hive export`. `{command}` builds nothing for another platform.")
         }
     }
     // Something typed and then ignored is a command that quietly disobeyed.
-    if command != "build" && command != "export" && command != "run" && len(args) > 2 {
+    if command != "build" && command != "export" && command != "run" && command != "install" && len(args) > 2 {
         refuse("`hive {command}` takes an entrypoint and nothing else. `" + at(args, 2) + "` was given to it.")
     }
 
@@ -103,6 +107,8 @@ proc main(): void {
         export(entry, rest(args, 2), from)
     } else if command == "run" {
         run(entry, rest(args, 2), from)
+    } else if command == "install" {
+        installProgram(entry, rest(args, 2), from)
     } else if command == "test" {
         if hive.file.list(entry) is Result.Ok(_) {
             suites(entry, from)
@@ -117,7 +123,7 @@ proc main(): void {
 }
 
 func isCommand(command: Str): Bool {
-    return indexOf(["check", "emit", "build", "export", "run", "test", "analyze", "container"], command) is Result.Ok(_)
+    return indexOf(["check", "emit", "build", "export", "run", "install", "test", "analyze", "container"], command) is Result.Ok(_)
 }
 
 // --- The commands ------------------------------------------------------------
@@ -205,6 +211,37 @@ proc run(entry: Str, args: Str[], from: Int): void {
         // Hive program through `hive run` should see what the program said.
         if code != 0 {
             hive.term.exit(code)
+        }
+    }
+}
+
+// Built as `build` builds it, then moved where the user's shell finds commands —
+// see `install.hive` for where that is on each platform. Named apart from the
+// module it calls.
+proc installProgram(entry: Str, flags: Str[], from: Int): void {
+    asked := install.askedFor(flags, hive.term.flags())
+    if asked.error != "" {
+        refuse(asked.error)
+    }
+    written := project.compile(entry, "", from)
+    if len(written.errors) > 0 {
+        complain(written.errors)
+        return
+    }
+    // The build writes the program beside its entrypoint, under this name.
+    placed := install.place(paths.joinPath(paths.dirOf(entry), project.executableOf(entry, "")), asked.name)
+    if placed is Result.Error(why) {
+        refuse(why)
+    }
+    if placed is Result.Ok(done) {
+        echo "Installed {entry} -> " + done.path + " (" + progress.took(progress.since(from)) + ")"
+        for each line in done.notes {
+            echo line
+        }
+        // The program is in place either way; a PATH that could not be changed is
+        // still a command that did not do all it was asked.
+        if done.failed != "" {
+            refuse(done.failed)
         }
     }
 }
@@ -493,6 +530,7 @@ proc usage(): void {
     echo "  hive build     <entrypoint.hive>       Compile to a native executable"
     echo "  hive export    <entrypoint.hive>       Package as an app, with --target android/arm64"
     echo "  hive run       <entrypoint.hive> [..]  Compile and run"
+    echo "  hive install   <entrypoint.hive>       Build it and put it where a shell finds commands"
     echo "  hive test      <entrypoint.hive>       Run the program's tests, with coverage"
     echo "  hive test      <directory>             Run every test under it, git-ignored files aside"
     echo "  hive analyze   <entrypoint.hive>       Score what it will cost, and write a page"
@@ -507,4 +545,5 @@ proc usage(): void {
     echo "  --target <goos>/<goarch>               Build for another platform, on `build` and"
     echo "                                         `export` alone. `go tool dist list` names"
     echo "                                         every one; `export` takes android/arm64."
+    echo "  --name <name>                          What `install` puts the program in as."
 }

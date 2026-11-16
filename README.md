@@ -26,6 +26,7 @@ Elsewhere, put the `hivec` binary from a [release](../../releases) on your `PATH
 
 ```
 hive run       <entrypoint.hive>    compile and run
+hive install   <entrypoint.hive>    build it and put it where a shell finds commands
 hive test      <entrypoint.hive>    run its tests, with coverage
 hive check     <entrypoint.hive>    report errors, build nothing
 hive build     <entrypoint.hive>    compile to a native executable

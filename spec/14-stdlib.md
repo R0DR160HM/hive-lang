@@ -209,9 +209,14 @@ Line-oriented terminal I/O.
   turned off and put back the same way.
 * `args()` → `Str[dyn]`, the command-line arguments in order, excluding the
   program name.
+* `flags()` → `Str`, those arguments as one line that `codec()` splits back into
+  the very same words: a word holding a space, a quote or a backslash is quoted,
+  after its `=` when it is a flag with its value, so a flag stays a flag. It is
+  what `T.decode` is handed; the arguments joined with spaces would split a
+  quoted one again.
 * `codec()` → `hive.codec.Codec<hive.term.FlagError>` says **read and write it
   as command-line flags** ([14.7](#147-hivejson)). `T.decode` reads a `Str` —
-  the arguments, joined — and splits it into words the way a shell does, so a
+  `flags()`, or any line — and splits it into words the way a shell does, so a
   quoted argument stays one word, backslashes included. A flag **always
   opens with `--`**: a field is `--name value` or `--name=value`, its name the
   field's own or what `-- Flag as <name>;` says, so `--something-else` is
