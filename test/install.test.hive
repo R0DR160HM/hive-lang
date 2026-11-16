@@ -1,0 +1,89 @@
+// Tests for `src/install`.
+//
+// What `hive install` decides before it touches anything: what followed the
+// entrypoint, whether a name can be what a program is run as, and what file a
+// name becomes. Each case gives the words after the entrypoint and the line
+// `hive.term.flags()` makes of them. Where the program goes and the PATH it goes
+// on are the machine's, and are tried by hand.
+import ../src/install
+import ../src/text
+
+test "no flags installs under the program's own name" {
+    asked := install.askedFor([], "")
+    assert asked.name == ""
+    assert asked.error == ""
+}
+
+test "--name takes the next word, or what follows its =" {
+    assert install.askedFor(["--name", "notes"], "--name notes").name == "notes"
+    assert install.askedFor(["--name=notes"], "--name=notes").name == "notes"
+}
+
+test "the command and the entrypoint in the line are no flag's value" {
+    asked := install.askedFor(["--name", "notes"], "install notes.hive --name notes")
+    assert asked.name == "notes"
+    assert asked.error == ""
+}
+
+test "--name said twice is refused, as hive.term reads any flag twice" {
+    asked := install.askedFor(["--name", "first", "--name=second"], "--name first --name=second")
+    assert asked.name == ""
+    assert text.contains(asked.error, "one value")
+}
+
+test "--name with nothing after it is refused" {
+    assert text.contains(install.askedFor(["--name"], "--name").error, "no name")
+    assert text.contains(install.askedFor(["--name="], "--name=\"\"").error, "no name")
+}
+
+test "--target is refused, and says where it belongs" {
+    said := install.askedFor(["--target", "linux/arm64"], "--target linux/arm64").error
+    assert text.contains(said, "this machine")
+    assert text.contains(said, "hive build")
+    assert text.contains(install.askedFor(["--target=linux/arm64"], "--target=linux/arm64").error, "hive build")
+}
+
+test "a flag it does not take is refused by name" {
+    said := install.askedFor(["--force"], "--force").error
+    assert text.contains(said, "--force")
+    assert text.contains(said, "--name")
+}
+
+test "a word that is no flag's value is refused rather than passed over" {
+    assert text.contains(install.askedFor(["extra"], "extra").error, "extra")
+    assert text.contains(install.askedFor(["--name", "notes", "extra"], "--name notes extra").error, "extra")
+}
+
+test "a quoted name reaches the check whole, and is refused for its space" {
+    assert text.contains(install.askedFor(["--name", "my notes"], "--name \"my notes\"").error, "space")
+    assert text.contains(install.askedFor(["--name=my notes"], "--name=\"my notes\"").error, "space")
+}
+
+test "a name that is a path, a flag or a folder is refused" {
+    assert text.contains(install.nameRefusal("bin/notes"), "path")
+    assert text.contains(install.nameRefusal("bin\\notes"), "path")
+    assert text.contains(install.nameRefusal("-v"), "flag")
+    assert install.nameRefusal(".") != ""
+    assert install.nameRefusal("..") != ""
+}
+
+test "a name a shell or Windows would mangle is refused" {
+    assert text.contains(install.nameRefusal("my notes"), "space")
+    assert text.contains(install.nameRefusal("notes?"), "Windows")
+    assert text.contains(install.nameRefusal("a:b"), "Windows")
+    assert text.contains(install.nameRefusal("notes."), "Windows")
+}
+
+test "an ordinary name is taken as it is" {
+    for each name in ["notes", "notes-2", "notes_cli", "Notes.v2", "n"] {
+        assert install.nameRefusal(name) == ""
+    }
+}
+
+test "Windows finds a program by its .exe, so one is added where it is missing" {
+    assert install.fileNameOf("notes", true) == "notes.exe"
+    assert install.fileNameOf("notes.exe", true) == "notes.exe"
+    assert install.fileNameOf("Notes.EXE", true) == "Notes.EXE"
+    assert install.fileNameOf("notes", false) == "notes"
+    assert install.fileNameOf("notes.exe", false) == "notes.exe"
+}

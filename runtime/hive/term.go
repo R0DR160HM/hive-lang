@@ -422,3 +422,36 @@ func TermArgs() []string {
 	}
 	return CloneVec(os.Args[1:])
 }
+
+// TermFlags is the arguments as one line the flag codec reads back into the very
+// words they arrived as. The shell has already split them, so joining them with
+// spaces would split a word holding one a second time.
+func TermFlags() string { return termLine(TermArgs()) }
+
+func termLine(args []string) string {
+	parts := make([]string, 0, len(args))
+	for _, arg := range args {
+		parts = append(parts, termSpoken(arg))
+	}
+	return strings.Join(parts, " ")
+}
+
+// A word as it would have to be typed. One opening with `--` stays a flag, its
+// value quoted after the `=` where it needs to be, since a word that opens quoted
+// is never a flag; any other word is quoted where it would split or vanish.
+func termSpoken(arg string) string {
+	if !strings.HasPrefix(arg, "--") {
+		if arg != "" && !strings.ContainsAny(arg, " \t\n\r\"'\\") {
+			return arg
+		}
+		return termQuote(arg)
+	}
+	key, value, found := strings.Cut(arg, "=")
+	if strings.ContainsAny(key, " \t\n\r\"'\\") {
+		return termQuote(arg)
+	}
+	if !found {
+		return arg
+	}
+	return key + "=" + termQuote(value)
+}

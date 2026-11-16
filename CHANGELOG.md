@@ -1,9 +1,14 @@
 # Changelog
 
-## v0.3.9
+## v0.4.0
+
+### Tooling
+
+* **`hive install <entrypoint.hive>` builds a program and puts it where a shell finds commands**: `~/.local/bin` on Linux and macOS, and on Windows `%LOCALAPPDATA%\Programs\Hive\bin`, put on the user's `PATH` the first time. `--name` installs it under another name.
 
 ### Standard library
 
+* **`hive.term.flags()` is the program's arguments as one line `hive.term.codec()` reads back word for word**, a word holding a space or a quote quoted again; `join(hive.term.args(), " ")` split such a word in two.
 * **`hive.ui` lays out grids and stacks**: `grid` with `columns` and `span`, `stack` with `place`, a row that `wrap`s, and `minWidth`, `maxWidth`, `minHeight`, `maxHeight` and `aspect` on any box.
 * **Text takes a weight, a slant and a length**: `weight`, `italic`, `mono`, `lines` ending in an ellipsis, `justify` across a text's lines, and `paragraph` for words in several styles wrapped as one.
 * **`radio`, `choices`, `tabs`, `tree` and `progress` are widgets**, the first four heard through `onChoose`, `on` and `onToggle`.
@@ -22,6 +27,14 @@
 ### Fixes
 
 * **`onDrag` reaches a scene on a page**, where the picture drawn over the scene took the press.
+* **Writing an element inside a branch or a loop keeps what was proved about its vector**: `t[k] = 1` in an inner `if` cost the outer `t bounds k`, which a write cannot change.
+* **A proof is lost when what it was about is replaced**: an `indexOf` over a vector since rebound, and a guard on `grid[0]` after `grid[0] = [1]`, still proved an index that could be out of range.
+
+### Breaking
+
+| was | is |
+| --- | --- |
+| the compiler built from source by any release | by v0.3.8 or later, the seed it is now pinned to: its own source calls `hive.term.flags()` |
 
 ## v0.3.8
 

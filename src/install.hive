@@ -1,0 +1,157 @@
+// Installing a program
+// ====================
+// `hive install <entrypoint.hive> [--name <name>]`: the program built, and put in
+// the folder of the user's own that a shell finds commands in — `~/.local/bin`, or
+// on Windows `%LOCALAPPDATA%\Programs\Hive\bin`, put on the user's PATH the first
+// time.
+import ./host.go
+import ./paths
+import ./text
+import hive.file
+import hive.term
+
+// What followed the entrypoint, read: the name to install as, `""` for the
+// program's own, or why it cannot be used.
+type Asked {
+    name: Str
+    error: Str
+}
+
+// The flags `hive install` takes, as `hive.term.codec()` reads them.
+type Flags {
+    name: Str -- Default as "";
+}
+
+// Where the program went, and anything the user has to do before it can be run
+// by name. `failed` is a step that went wrong after the program was in place.
+type Placed {
+    path: Str
+    notes: Str[dyn]
+    failed: Str
+}
+
+// The flags, as `hive.term.flags()` hands them to `hive.term.codec()` — `--name tool`
+// and `--name=tool` alike — checked first against `words`, what followed the
+// entrypoint. The codec passes over a word no field asks for, so those are refused
+// here: something typed and then ignored is a command that quietly disobeyed.
+func askedFor(words: Str[], line: Str): Asked {
+    mut before := ""
+    for each word in words {
+        key := at(split(word, "="), 0)
+        if key == "--target" {
+            return Asked("", "`hive install` builds for this machine, which is where it installs. `--target` belongs to `hive build`.")
+        }
+        if word == "--name=" {
+            return Asked("", noName())
+        }
+        if key != "--name" && (text.startsWith(word, "-") || before != "--name") {
+            return Asked("", "`" + word + "` is not something `hive install` takes. The one flag here is `--name <name>`.")
+        }
+        before = word
+    }
+    read := Flags.decode(line, hive.term.codec())
+    if read is Result.Error(why) {
+        if why.path == "--name" && why.found == "the flag alone" {
+            return Asked("", noName())
+        }
+        return Asked("", "`{why.path}` wants {why.expected}, and was given {why.found}.")
+    }
+    if read is Result.Ok(flags) {
+        if flags.name != "" {
+            wrong := nameRefusal(flags.name)
+            if wrong != "" {
+                return Asked("", wrong)
+            }
+        }
+        return Asked(flags.name, "")
+    }
+    return Asked("", "`hive install` could not read what followed the entrypoint.")
+}
+
+func noName(): Str {
+    return "`--name` was given no name. It takes what the program is to be run as — `hive install <entrypoint.hive> --name tool`."
+}
+
+func at(parts: Str[], index: Int): Str {
+    if parts bounds index {
+        return parts[index]
+    }
+    return ""
+}
+
+
+// Why `name` cannot be what a program is installed as, or `""`. A name is typed at
+// a prompt and is a file on every platform, so it takes no folder, nothing a
+// shell would split it at, and nothing Windows refuses in a file's name.
+func nameRefusal(name: Str): Str {
+    if name == "." || name == ".." {
+        return "`--name {name}` names a folder, not a program."
+    }
+    if text.startsWith(name, "-") {
+        return "`--name {name}` would be read as a flag wherever it was typed. A name starts with something else."
+    }
+    for each c in text.chars(name) {
+        if c == "/" || c == "\\" {
+            return "`--name {name}` is a path. It takes a name alone — the folder is always the same one."
+        }
+        if text.isSpace(c) {
+            return "`--name {name}` has a space in it, and a shell would read it as two words."
+        }
+        if text.isOneOf(c, "<>:\"|?*") {
+            return "`--name {name}` holds `{c}`, which Windows refuses in a file's name."
+        }
+    }
+    if text.endsWith(name, ".") {
+        return "`--name {name}` ends in `.`, which Windows drops from a file's name."
+    }
+    return ""
+}
+
+// The file a name is installed as: on Windows a program is found by its `.exe`, so
+// one is added where the name has none.
+func fileNameOf(name: Str, windows: Bool): Str {
+    if windows && text.endsWith(text.lower(name), ".exe") == false {
+        return name + ".exe"
+    }
+    return name
+}
+
+// `built` is moved into the folder under `name`, or under its own name when that
+// is `""`, and the folder is put on the PATH where Windows keeps one for the user.
+proc place(built: Str, name: Str): Result<Placed, Str> {
+    windows := text.startsWith(host.platform(), "windows/")
+    mut file := paths.baseOf(built)
+    if name != "" {
+        file = fileNameOf(name, windows)
+    }
+    found := host.binDir()
+    if found is Result.Error(why) {
+        return Result.Error("could not tell where to install it: " + why)
+    }
+    if found is Result.Ok(dir) {
+        installed := host.install(built, dir, file)
+        if installed is Result.Error(why) {
+            return Result.Error("could not put it in " + dir + ": " + why)
+        }
+        if installed is Result.Ok(path) {
+            hive.file.delete(built)
+            if host.onPath(dir) {
+                return Result.Ok(Placed(path, [], ""))
+            }
+            if windows == false {
+                return Result.Ok(Placed(path, [dir + " is not on your PATH. To run it by name, add this to your shell's startup file:", "    export PATH=\"$HOME/.local/bin:$PATH\""], ""))
+            }
+            added := host.addToUserPath(dir)
+            if added is Result.Error(why) {
+                return Result.Ok(Placed(path, [], "could not add " + dir + " to your PATH: " + why))
+            }
+            if added is Result.Ok(fresh) {
+                if fresh {
+                    return Result.Ok(Placed(path, ["Added " + dir + " to your PATH. Open a new terminal to run it by name."], ""))
+                }
+                return Result.Ok(Placed(path, [dir + " is on your PATH, but this terminal started before it was. Open a new one to run it by name."], ""))
+            }
+        }
+    }
+    return Result.Error("could not tell where to install it")
+}

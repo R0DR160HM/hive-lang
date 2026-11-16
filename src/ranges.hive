@@ -156,7 +156,11 @@ func boundOrAssignedIn(b: ast.Block): Str[dyn] {
         } else if s is ast.Stmt.TypedDecl(_, name, _, _, _, _) {
             out = joined(out, [name])
         }
-        out = joined(out, assignedIn(s))
+        for each cost in assignedIn(s) {
+            if text.endsWith(cost, "[") == false && text.endsWith(cost, ".") == false {
+                out = joined(out, [cost])
+            }
+        }
     }
     return out
 }
@@ -491,6 +495,7 @@ proc truncate(bo: mut Proofs, count: Int): void {
 proc declare(bo: mut Proofs, name: Str, value: ast.Expr): void {
     dropProofs(bo, name)
     forgetSearch(bo, ast.Expr.Ident(name, bo.at))
+    forgetSearchesOver(bo, name)
     mut Str[dyn] kept = []
     for each promised in bo.promised {
         if promised != name {
@@ -719,21 +724,87 @@ func isProved(bo: Proofs, vector: ast.Expr, index: ast.Expr): Bool {
 // A vector that has been written over is a different vector, so every fact about
 // it goes.
 proc rebind(bo: mut Proofs, target: ast.Expr): void {
-    name := rootOf(target)
-    if name == "" {
+    pay(bo, costOf(target))
+}
+
+// What writing to `target` costs: a name, whose every fact goes, or a path ending
+// in `[` or `.`, under which every fact goes and nothing else does.
+//
+// Writing *through* a vector — `v[i] = x` — swaps an element without changing the
+// length, so what was proved about `v` itself stands. What was proved through its
+// elements does not, since the one written may be any of them: `grid[0] = [1]`
+// makes the row shorter. Replacing a variable or a field costs the whole name.
+func costOf(target: ast.Expr): Str {
+    if target is ast.Expr.Index(_, _, _) {
+        return keyedBelow(target)
+    }
+    return rootOf(target)
+}
+
+// The longest stable path a written place lies under, with what comes after it:
+// `t[` for `t[k][j]`, `r.rows[` for `r.rows[k].cells[j]`, or `""` for a place no
+// path names.
+func keyedBelow(e: ast.Expr): Str {
+    if e is ast.Expr.Index(subject, _, _) {
+        key := pathKey(subject)
+        if key != "" {
+            return key + "["
+        }
+        return keyedBelow(subject)
+    }
+    if e is ast.Expr.Member(subject, _, _) {
+        key := pathKey(subject)
+        if key != "" {
+            return key + "."
+        }
+        return keyedBelow(subject)
+    }
+    return ""
+}
+
+proc pay(bo: mut Proofs, cost: Str): void {
+    if cost == "" {
         return
     }
-    // Writing *through* a name — `v[i] = x` — swaps an element without changing
-    // the length, so only replacing the name itself costs anything.
-    if target is ast.Expr.Ident(_, _) {
-        lose(bo, name)
-        return
+    if text.endsWith(cost, "[") || text.endsWith(cost, ".") {
+        loseUnder(bo, cost)
+    } else {
+        lose(bo, cost)
     }
-    // Replacing a field costs whatever had been proved about the old value,
-    // exactly as rebinding a variable does.
-    if target is ast.Expr.Member(_, _, _) {
-        lose(bo, name)
+}
+
+// Every proof and search about a path under `prefix`, as the vector or as the
+// index alike.
+proc loseUnder(bo: mut Proofs, prefix: Str): void {
+    mut Str[dyn] kept = []
+    for each entry in bo.proved {
+        pieces := split(entry, "|")
+        if text.startsWith(nameAt(pieces, 0), prefix) == false && text.startsWith(nameAt(pieces, 1), prefix) == false {
+            append(kept, entry)
+        }
     }
+    bo.proved = kept
+    mut Str[dyn] searches = []
+    for each entry in bo.searches {
+        pieces := split(entry, "|")
+        if text.startsWith(nameAt(pieces, 0), prefix) == false && text.startsWith(nameAt(pieces, 1), prefix) == false {
+            append(searches, entry)
+        }
+    }
+    bo.searches = searches
+}
+
+// A search over a vector that has since been replaced says nothing about the one
+// there now.
+proc forgetSearchesOver(bo: mut Proofs, name: Str): void {
+    mut Str[dyn] kept = []
+    for each entry in bo.searches {
+        pieces := split(entry, "|")
+        if startsWithName(nameAt(pieces, 1), name) == false {
+            append(kept, entry)
+        }
+    }
+    bo.searches = kept
 }
 
 proc lose(bo: mut Proofs, name: Str): void {
@@ -746,6 +817,7 @@ proc lose(bo: mut Proofs, name: Str): void {
         }
     }
     dropProofs(bo, name)
+    forgetSearchesOver(bo, name)
 }
 
 // Every proof about `name` goes, as the vector and as the index alike: an index
@@ -779,17 +851,19 @@ func startsWithName(path: Str, name: Str): Bool {
 // Everything any branch of a statement rebound. An inferred length dies even in
 // a branch that may not run: what the compiler knows has to hold on every path.
 proc loseAssigned(bo: mut Proofs, s: ast.Stmt): void {
-    for each name in assignedIn(s) {
-        lose(bo, name)
+    for each cost in assignedIn(s) {
+        pay(bo, cost)
     }
 }
 
+// What each write in a statement costs, as `costOf` says it: the same cost the
+// write paid where it stood, so a branch around it costs no more.
 func assignedIn(s: ast.Stmt): Str[dyn] {
     mut Str[dyn] out = []
     if s is ast.Stmt.Assign(target, _, _) {
-        name := rootOf(target)
-        if name != "" {
-            append(out, name)
+        cost := costOf(target)
+        if cost != "" {
+            append(out, cost)
         }
         return out
     }
