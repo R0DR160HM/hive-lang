@@ -146,6 +146,7 @@ func catchInterrupts() {
 		echoMu.Unlock()
 
 		// The status a shell reports for a program an interrupt ended.
+		Ending()
 		os.Exit(130)
 	}(interrupts)
 }

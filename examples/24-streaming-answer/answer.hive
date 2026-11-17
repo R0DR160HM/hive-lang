@@ -1,0 +1,181 @@
+// A streamed answer
+// =================
+// A language model answers a few words at a time, and a server for one sends
+// each piece the moment it has it: one JSON object per line, in a body that is
+// still arriving. `hive.net.httpRequest` waits for the whole body, so it would
+// show nothing until the very end. These read the answer as it comes:
+//
+//   httpOpen          sends the request, and answers once the status and the
+//                     headers are in — before any of the body
+//   httpReceiveLine   the next line of the body, as soon as it has arrived
+//   httpClose         drops the connection, which is how a client tells the
+//                     server to stop
+//
+// The model is a stand-in, so nothing has to be installed: a server in this
+// file that "generates" its answers from a script, a word every few
+// milliseconds, in the shape a real one streams in. `httpServe` answers with a
+// whole body, so the stand-in speaks just enough HTTP itself, over a socket.
+// One of its answers never ends, as a model stuck in a loop never does, and the
+// client stops it.
+
+// What the client asks, and each piece of what comes back.
+type Ask {
+    prompt: Str
+}
+
+type Chunk {
+    content: Str
+    done: Bool
+}
+
+proc main(): void {
+    async hive.net.socketServe(9024, model)
+    // Long enough for the stand-in to be listening.
+    hive.task.sleep(200)
+
+    ask("Why is the sky blue?", "/api/chat")
+    ask("Count sheep.", "/api/chat")
+    ask("Is anybody there?", "/api/nothing")
+}
+
+// --- The client ----------------------------------------------------------------
+
+proc ask(prompt: Str, path: Str): void {
+    echo "> {prompt}"
+    asked := hive.net.HttpRequest("POST", "http://127.0.0.1:9024" + path, [], encode(Ask(prompt), hive.json.codec()))
+    opened := hive.net.httpOpen(asked)
+    if opened is Result.Error(why) {
+        echo "nobody answered: {why.message}"
+        return
+    }
+    if opened is Result.Ok(stream) {
+        // The status is in before any of the body. One that is not the answer
+        // asked for still has a body, and it is read the same way.
+        if stream.status != 200 {
+            if hive.net.httpReceiveLine(stream) is Result.Ok(said) {
+                echo "{stream.status}: {said}"
+            }
+            hive.net.httpClose(stream)
+            return
+        }
+        read(stream)
+    }
+}
+
+// Prints each piece as it arrives. `hive.term.print` ends no line, so the
+// pieces join up the way they would on a screen.
+//
+// A model can get stuck saying one thing over and over. Three identical pieces
+// running is taken for that, and closing the stream is what stops it: the
+// stand-in finds nobody listening and gives up.
+proc read(stream: hive.net.HttpStream): void {
+    mut last := ""
+    mut repeats := 0
+    for ; true; {
+        line := hive.net.httpReceiveLine(stream)
+        if line is Result.Error(why) {
+            hive.term.println("")
+            echo "[the answer broke off: {why.message}]"
+            return
+        }
+        if line is Result.Ok(text) {
+            if Chunk.decode(text, hive.json.codec()) is Result.Ok(piece) {
+                if piece.done {
+                    hive.term.println("")
+                    hive.net.httpClose(stream)
+                    return
+                }
+                hive.term.print(piece.content)
+                if piece.content == last {
+                    repeats += 1
+                } else {
+                    repeats = 0
+                }
+                last = piece.content
+                if repeats == 2 {
+                    hive.net.httpClose(stream)
+                    hive.term.println("")
+                    echo "[stopped: it said the same thing three times running]"
+                    return
+                }
+            }
+        }
+    }
+}
+
+// --- The stand-in model ----------------------------------------------------------
+
+// One request per connection: what was asked, then the answer a line at a time.
+proc model(conn: hive.net.SocketConnection): void {
+    asked := request(conn)
+    if asked.path != "/api/chat" {
+        respond(conn, "404 Not Found", "text/plain")
+        hive.net.socketSend(conn, "there is no model at {asked.path}\n")
+        return
+    }
+    respond(conn, "200 OK", "application/x-ndjson")
+    if Ask.decode(asked.body, hive.json.codec()) is Result.Ok(question) && question.prompt == "Count sheep." {
+        mut listening := say(conn, "Counting sheep:")
+        for ; listening; {
+            listening = say(conn, " one sheep,")
+        }
+        return
+    }
+    for each word in ["Sunlight", " scatters", " off", " the", " air,", " and", " blue", " scatters", " the", " most."] {
+        say(conn, word)
+    }
+    hive.net.socketSend(conn, encode(Chunk("", true), hive.json.codec()) + "\n")
+}
+
+// The status line and the headers. No length is given, so the body runs until
+// the connection closes — which is what lets it be written a piece at a time.
+proc respond(conn: hive.net.SocketConnection, status: Str, kind: Str): void {
+    hive.net.socketSend(conn, "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nConnection: close\r\n\r\n")
+}
+
+// One piece of the answer, a moment after the last, as a model produces them.
+// Answers false once the client has gone.
+proc say(conn: hive.net.SocketConnection, piece: Str): Bool {
+    hive.task.sleep(30)
+    sent := hive.net.socketSend(conn, encode(Chunk(piece, false), hive.json.codec()) + "\n")
+    return sent is Result.Ok(_)
+}
+
+type Asked {
+    path: Str
+    body: Str
+}
+
+// The request line, the headers down to the blank line, then as many bytes of
+// body as `Content-Length` said.
+proc request(conn: hive.net.SocketConnection): Asked {
+    mut path := ""
+    mut length := 0
+    mut reading := true
+    for ; reading; {
+        line := hive.net.socketReceiveLine(conn)
+        if line is Result.Ok(text) {
+            if text == "" {
+                reading = false
+            } else if text is "POST {target} HTTP/1.1" {
+                path = target
+            } else if text is "Content-Length: {digits}" {
+                if hive.conv.sti(digits) is Result.Ok(n) {
+                    length = n
+                }
+            }
+        } else {
+            reading = false
+        }
+    }
+    mut body := ""
+    for ; bytes(body) < length; {
+        more := hive.net.socketReceive(conn, length - bytes(body))
+        if more is Result.Ok(piece) {
+            body += piece
+        } else {
+            return Asked(path, body)
+        }
+    }
+    return Asked(path, body)
+}

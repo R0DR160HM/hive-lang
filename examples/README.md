@@ -1,6 +1,6 @@
 # Examples
 
-Twenty-three programs, and between them every feature the language has. Each one
+Twenty-six programs, and between them every feature the language has. Each one
 compiles and runs on the compiler in [`../src`](../src) — that is what `./run`
 checks, and what makes these examples rather than illustrations.
 
@@ -37,6 +37,9 @@ hive test examples/15-testing/cart.test.hive
 | 21 | [advent-2025-day-3](21-advent-2025-day-3) | day 3, where every index is proved in range |
 | 22 | [formula-kart](22-formula-kart) | a ten-car race on a circuit rolled from a number, with a landscape round it, a server, a map and a dial |
 | 23 | [every-widget](23-every-widget) | every `hive.ui` widget but the 3D ones, with every attribute and event among them, in one window |
+| 24 | [streaming-answer](24-streaming-answer) | a language model's answer read as it arrives, and a looping one stopped by hanging up |
+| 25 | [programs-alongside](25-programs-alongside) | a program started, talked to, and stopped with everything it started — the program being itself |
+| 26 | [pictures](26-pictures) | Hive's logo read from inside the executable, decoded, scaled and drawn in characters |
 
 ## What `./run` does with them
 

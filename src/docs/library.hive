@@ -15,6 +15,7 @@ func pages(): page.Page[dyn] {
         page.Page("stdlib/math.md", math()),
         page.Page("stdlib/map.md", maps()),
         page.Page("stdlib/file.md", files()),
+        page.Page("stdlib/image.md", image()),
         page.Page("stdlib/term.md", term()),
         page.Page("stdlib/term-exec.md", termExec()),
         page.Page("stdlib/env.md", env()),
@@ -71,8 +72,8 @@ func index(): Str {
         }
         ~CODE~
 
-        These are ~BT~FileError~BT~, ~BT~WsError~BT~, ~BT~SocketError~BT~, ~BT~NetError~BT~, ~BT~SqlError~BT~,
-        ~BT~CryptoError~BT~, ~BT~SyslinkError~BT~ and the core's ~BT~SecretError~BT~. One comes with the
+        These are ~BT~FileError~BT~, ~BT~HttpStreamError~BT~, ~BT~WsError~BT~, ~BT~SocketError~BT~, ~BT~NetError~BT~, ~BT~SqlError~BT~,
+        ~BT~CryptoError~BT~, ~BT~SyslinkError~BT~, ~BT~TermError~BT~, ~BT~ProcessError~BT~ and the core's ~BT~SecretError~BT~. One comes with the
         module that answers with it, whether or not the program names it, and it prints
         as what went wrong and why.
 
@@ -88,9 +89,10 @@ func index(): Str {
         | [conv](conv.md) | ~BT~hive.conv~BT~ | rounding, widening, rendering, parsing |
         | [math](math.md) | ~BT~hive.math~BT~ | thirteen ~BT~Float~BT~ functions |
         | [map](map.md) | ~BT~hive.map~BT~ | the dictionary |
-        | [file](file.md) | ~BT~hive.file~BT~ | the filesystem |
-        | [term](term.md) | ~BT~hive.term~BT~ | stdout, stderr, input, arguments, exit |
-        | [term-exec](term-exec.md) | ~BT~hive.term~BT~ | running another program |
+        | [file](file.md) | ~BT~hive.file~BT~ | the filesystem, where the program is, and what it carries in ~BT~assets/~BT~ |
+        | [image](image.md) | ~BT~hive.image~BT~ | pictures read into their pixels, and resized |
+        | [term](term.md) | ~BT~hive.term~BT~ | stdout, stderr, lines and keys of input, the window's size, arguments, exit |
+        | [term-exec](term-exec.md) | ~BT~hive.term~BT~ | running another program, and one that runs alongside |
         | [env](env.md) | ~BT~hive.env~BT~ | the environment and ~BT~.env~BT~ |
         | [task](task.md) | ~BT~hive.task~BT~ | ~BT~sleep~BT~, ~BT~sleepForever~BT~, and where ~BT~with timeout~BT~ lives |
         | [time](time.md) | ~BT~hive.time~BT~ | Unix milliseconds and ~BT~strftime~BT~ |
@@ -289,6 +291,11 @@ func files(): Str {
         | ~BT~move(from, to)~BT~ | ~BT~Result<Bool, FileError>~BT~ |
         | ~BT~list(path)~BT~ | ~BT~Result<Str[dyn], FileError>~BT~ |
         | ~BT~exists(path)~BT~ | ~BT~Bool~BT~ — **not** a ~BT~Result~BT~; a directory counts |
+        | ~BT~isDir(path)~BT~ | ~BT~Bool~BT~ — whether it is a directory |
+        | ~BT~workingDirectory()~BT~ | ~BT~Result<Str, FileError>~BT~ — absolute |
+        | ~BT~home()~BT~ | ~BT~Result<Str, FileError>~BT~ — the user's home folder |
+        | ~BT~executable()~BT~ | ~BT~Result<Str, FileError>~BT~ — the running program's file |
+        | ~BT~asset(path)~BT~ | ~BT~Result<Str, FileError>~BT~ — a file from ~BT~assets/~BT~, out of the executable |
         | ~BT~csv(path, separator)~BT~ | ~BT~Result<Table, TableError>~BT~ |
         | ~BT~xlsx(path)~BT~ | ~BT~Result<Table[dyn], TableError>~BT~ — one per sheet |
         | ~BT~ods(path)~BT~ | ~BT~Result<Table[dyn], TableError>~BT~ — one per table |
@@ -341,6 +348,35 @@ func files(): Str {
         A test runs with the working directory set to the generated project rather than
         the entrypoint's folder, so **a test that needs files should write them itself**
         with ~BT~makeDir~BT~ and ~BT~write~BT~. See [testing](../testing.md).
+
+        ## Where the program is
+
+        ~BT~workingDirectory()~BT~, ~BT~home()~BT~ and ~BT~executable()~BT~ each answer an **absolute path
+        with ~BT~/~BT~ between its parts on every platform** — which every call here takes,
+        Windows included — or a ~BT~NotFound~BT~ where the system cannot say. Under ~BT~hive run~BT~
+        the working directory is the entrypoint's folder, and the executable is the copy
+        the compiler built. ~BT~isDir(path)~BT~ is whether a path is a directory, where
+        ~BT~exists~BT~ says yes to both.
+
+        ## What the program carries
+
+        **An ~BT~assets/~BT~ folder beside the entrypoint is built into the executable** whenever
+        the program reads from it with ~BT~asset~BT~ — as it is for a window's typeface and a
+        scene's recordings — so a program copied anywhere, with nothing beside it, still
+        has its files:
+
+        ~CODE~hive
+        // assets/logo.png, beside this file
+        if hive.file.asset("logo.png") is Result.Ok(data) \{
+        	if hive.image.decode(data) is Result.Ok(logo) \{
+        		echo "\{logo.width} by \{logo.height}"
+        	}
+        }
+        ~CODE~
+
+        The path is the file's under ~BT~assets/~BT~. One the build put nothing at is ~BT~NotFound~BT~,
+        and so is every path in a program built with no ~BT~assets/~BT~ folder. Files whose
+        names open with ~BT~.~BT~ or ~BT~_~BT~ are left out, as ~BT~//go:embed~BT~ leaves them.
     `)
 }
 
@@ -348,26 +384,33 @@ func term(): Str {
     return page.backticked(`
         # ~BT~hive.term~BT~
 
-        Line-oriented terminal I/O. Running *another* program is
+        The terminal: lines of it, or a key at a time. Running *another* program is
         [term-exec](term-exec.md).
 
         | call | answers with |
         | --- | --- |
-        | ~BT~print(text)~BT~ | ~BT~void~BT~ — a line to **stdout** |
+        | ~BT~print(text)~BT~ | ~BT~void~BT~ — the text to **stdout**, ending no line |
+        | ~BT~println(text)~BT~ | ~BT~void~BT~ — a line to **stdout** |
         | ~BT~status(text)~BT~ | ~BT~void~BT~ — a line to **stderr** |
         | ~BT~isTerminal()~BT~ | ~BT~Bool~BT~ |
         | ~BT~platform()~BT~ | ~BT~Str~BT~ — ~BT~goos/goarch~BT~, e.g. ~BT~linux/arm64~BT~ |
         | ~BT~read()~BT~ | ~BT~Str~BT~ |
         | ~BT~readSecret()~BT~ | ~BT~Result<Secret<Str>, SecretError>~BT~ — see [~BT~Secret~BT~](../types.md#secret) |
         | ~BT~readSecretBypass()~BT~ | ~BT~Secret<Str>~BT~ — the same, in ordinary memory; **cannot fail** |
+        | ~BT~raw(on)~BT~ | ~BT~Result<Bool, TermError>~BT~ — keys arrive one at a time, unshown |
+        | ~BT~readKey()~BT~ | ~BT~Result<Key, TermError>~BT~ — the next key, or a paste |
+        | ~BT~size()~BT~ | ~BT~Result<Size, TermError>~BT~ — the window's ~BT~width~BT~ and ~BT~height~BT~ |
         | ~BT~args()~BT~ | ~BT~Str[dyn]~BT~ |
         | ~BT~flags()~BT~ | ~BT~Str~BT~ — the arguments as one line for ~BT~codec()~BT~, quoted where they were |
+        | ~BT~positional(line)~BT~ | ~BT~Str[dyn]~BT~ — the line's words that are no flag's |
         | ~BT~codec()~BT~ | ~BT~hive.codec.Codec<FlagError>~BT~ — the value that says command-line flags |
         | ~BT~exit(code)~BT~ | ~BT~void~BT~ — nothing after it runs |
 
         ## Which stream, and why it matters
 
-        ~BT~print~BT~ is ~BT~echo~BT~ restricted to a ~BT~Str~BT~ — the same lowering. ~BT~status~BT~ writes to
+        ~BT~print~BT~ writes its text **exactly as it is, ending no line** — a prompt, an escape
+        sequence, a line built a piece at a time. ~BT~println~BT~ is ~BT~echo~BT~ restricted to a
+        ~BT~Str~BT~. ~BT~status~BT~ writes a line to
         **standard error**: what a program is *doing*, as against what it was asked for.
         Redirecting the answer never takes the progress with it, which is what lets
         ~BT~hive emit x.hive > main.go~BT~ be Go while the compiler still says where it has
@@ -394,6 +437,59 @@ func term(): Str {
         ~BT~readSecretBypass()~BT~ is that read into ordinary memory, as ~BT~bypass~BT~ is to
         ~BT~hide~BT~: never shown, but free to be swapped out, so there is no locked-memory
         limit to run into and it answers a ~BT~Secret<Str>~BT~ rather than a ~BT~Result~BT~.
+
+        ## A key at a time
+
+        For a program that draws its own screen — a prompt that keeps taking keys while
+        an answer is printed above it.
+
+        ~BT~raw(true)~BT~ turns **raw mode** on for the terminal standard input reads from: what
+        is typed is neither shown nor held back for a whole line, and **Ctrl+C arrives as
+        a key** rather than ending the program. Output is untouched, so a newline still
+        starts the next line. **Raw mode is put back however the program ends** — ~BT~main~BT~
+        returning, a panic, ~BT~exit~BT~, the last window closing, a signal from outside — and
+        ~BT~raw(false)~BT~ puts it back sooner. Turning it on where standard input is not a
+        terminal is ~BT~NotATerminal~BT~. While it is on, ~BT~read()~BT~ waits for a line nobody
+        can end: read keys instead.
+
+        ~BT~readKey()~BT~ blocks for the next key and answers with a ~BT~Key~BT~: a ~BT~name~BT~ and the
+        ~BT~text~BT~ it types. **The name is the one ~BT~hive.ui~BT~ gives a key** ([ui-events](ui-events.md)):
+
+        * what it types when nothing but Shift is held — ~BT~"a"~BT~, ~BT~"A"~BT~, ~BT~":"~BT~, ~BT~"ç"~BT~;
+        * the key itself, modifiers first — Ctrl, then Shift, then Alt — when Ctrl or
+          Alt is held: ~BT~"Ctrl+C"~BT~, ~BT~"Shift+Alt+X"~BT~, ~BT~"Ctrl+ArrowRight"~BT~;
+        * a name of its own for a key that types nothing: ~BT~Enter~BT~ ~BT~Escape~BT~ ~BT~Tab~BT~
+          ~BT~Backspace~BT~ ~BT~Delete~BT~ ~BT~Insert~BT~ ~BT~Space~BT~ ~BT~ArrowUp~BT~ ~BT~ArrowDown~BT~
+          ~BT~ArrowLeft~BT~ ~BT~ArrowRight~BT~ ~BT~Home~BT~ ~BT~End~BT~ ~BT~PageUp~BT~ ~BT~PageDown~BT~ ~BT~F1~BT~…~BT~F12~BT~.
+
+        ~BT~text~BT~ is what the key puts in a line: the character, ~BT~" "~BT~ for ~BT~Space~BT~, and ~BT~""~BT~
+        for a key that edits or moves, or is held with Ctrl or Alt. **A paste, while raw
+        mode is on, is one key named ~BT~Paste~BT~** whose ~BT~text~BT~ is all of it, its line
+        breaks ~BT~"\n"~BT~ — so a newline in it is never ~BT~Enter~BT~. Input that is not a
+        terminal is read the same way, a key at a time, and its end is ~BT~Closed~BT~.
+
+        ~BT~size()~BT~ is the window standard output is shown in, ~BT~width~BT~ and ~BT~height~BT~ in
+        cells, and ~BT~NotATerminal~BT~ where standard output is a file or a pipe.
+
+        A ~BT~TermError~BT~ is ~BT~NotATerminal~BT~, ~BT~Closed~BT~ or ~BT~Io~BT~, each with a ~BT~message~BT~.
+
+        ~CODE~hive
+        hive.term.raw(true)
+        mut line := ""
+        for ; true; \{
+        	if hive.term.readKey() is Result.Ok(key) \{
+        		if key.name == "Enter" || key.name == "Ctrl+C" \{
+        			break
+        		}
+        		line += key.text
+        		hive.term.print("\r> " + line)
+        	}
+        }
+        hive.term.raw(false)
+        ~CODE~
+
+        On Windows the console paints the escape sequences a program prints, as every
+        other terminal does: the runtime turns that on when the program starts.
 
         ## Arguments and exit
 
@@ -428,34 +524,117 @@ func term(): Str {
         ~CODE~hive
         type Options \{
         	name: Str
-        	dryRun: Bool -- Flag as dry-run; Default as false;
-        	count: Int -- Default as 10;
+        	dryRun: Bool -- Flag as dry-run n; Default as false;
+        	count: Int -- Flag as count c; Default as 10;
         }
 
-        options := Options.decode(hive.term.flags(), hive.term.codec())
+        line := hive.term.flags()
+        options := Options.decode(line, hive.term.codec())
         if options is Result.Error(why) \{
         	hive.term.status("\{why.path}: expected \{why.expected}, found \{why.found}")
         	hive.term.exit(2)
         }
+        words := hive.term.positional(line)
 
-        Options.decode("--name Ada --dry-run --count=3", hive.term.codec())
+        Options.decode("--name Ada -n -c=3", hive.term.codec())
         encode(Options("Ada Lovelace", true, 3), hive.term.codec())
         // --name "Ada Lovelace" --dry-run true --count 3
         ~CODE~
 
-        * **A flag always opens with ~BT~--~BT~**: ~BT~--name value~BT~ or ~BT~--name=value~BT~. Its name
-          is the field's own, or what ~BT~Flag as~BT~ says without the dashes — so
-          ~BT~--something-else~BT~ is ~BT~somethingElse: Str -- Flag as something-else;~BT~.
-        * A ~BT~Bool~BT~ standing alone is ~BT~true~BT~; followed by ~BT~true~BT~ or ~BT~false~BT~, it is that.
+        * **A field is ~BT~--name value~BT~ or ~BT~--name=value~BT~.** Its name is the field's own, or
+          what ~BT~Flag as~BT~ says without the dashes — so ~BT~--something-else~BT~ is
+          ~BT~somethingElse: Str -- Flag as something-else;~BT~.
+        * **A second name is a short one**, read after a single dash:
+          ~BT~Flag as dry-run n;~BT~ is ~BT~--dry-run~BT~ and ~BT~-n~BT~ alike. Whichever of the two is
+          shorter is the short one. Two of one length, a third name, and two fields with
+          one short name are compile errors; ~BT~-abc~BT~ is one flag, never ~BT~-a -b -c~BT~.
+        * A ~BT~Bool~BT~ standing alone is ~BT~true~BT~, and **takes the next word only when it is
+          ~BT~true~BT~ or ~BT~false~BT~**. Any other flag takes the next word unless that is a flag;
+          a negative number never is, and a value opening with a dash is written
+          ~BT~--name=-x~BT~ or quoted.
         * A vector is its flag repeated, once per element.
         * **A missing flag is an error** unless the field has a ~BT~Default~BT~ — a ~BT~Bool~BT~
           included — and so is one given twice for a field that is not a vector.
-        * Words that are no flag's value are ignored, and so is everything after a lone
-          ~BT~--~BT~. Quotes and a backslash keep a word together, and a quoted word is never
-          a flag.
+        * Quotes and a backslash keep a word together, and a quoted word is never a flag.
         * Only a type without variants travels as flags, each field a ~BT~Str~BT~, ~BT~Int~BT~,
           ~BT~Float~BT~, ~BT~Bool~BT~ or ~BT~Atom~BT~, or a vector of one. A failure is a
-          ~BT~hive.term.FlagError~BT~ whose ~BT~path~BT~ is the flag as written, ~BT~--count~BT~.
+          ~BT~hive.term.FlagError~BT~ whose ~BT~path~BT~ is the flag as written — ~BT~--count~BT~, or ~BT~-c~BT~.
+
+        ## The program's own words
+
+        **The words before the first flag, and every one after a lone ~BT~--~BT~, are the
+        program's own**: ~BT~positional(line)~BT~ answers with them, in order, and ~BT~decode~BT~
+        passes them over. Between them is nothing but flags and their values, so **a flag
+        the type does not declare is an error** — listing the ones it does — and so is a
+        word that is no flag's value:
+
+        ~CODE~
+        lodemaria what is this               positional: what, is, this
+        lodemaria -m llama -- what is this   positional: what, is, this
+        lodemaria -m llama what is this      $: expected a flag (words go before the flags or after --), found "what"
+        lodemaria --modle llama              --modle: expected --model/-m, ..., found a flag nothing declares
+        ~CODE~
+
+        ~BT~positional~BT~ knows no type, which is why a word after the flags has to follow a
+        ~BT~--~BT~: it cannot tell ~BT~--model llama~BT~, a value, from ~BT~--code explain~BT~, a ~BT~Bool~BT~
+        and then a word. A line with a quote left open has no words.
+    `)
+}
+
+func image(): Str {
+    return page.backticked(`
+        # ~BT~hive.image~BT~
+
+        A picture read from the bytes of a file, and the same picture at another size.
+        Nothing here performs I/O: the bytes come from ~BT~hive.file.read~BT~,
+        [~BT~hive.file.asset~BT~](file.md#what-the-program-carries) or a response's body.
+
+        | call | answers with |
+        | --- | --- |
+        | ~BT~decode(data)~BT~ | ~BT~Result<Picture, ImageError>~BT~ |
+        | ~BT~scale(picture, width, height)~BT~ | ~BT~Picture~BT~ — exactly that size |
+
+        ~CODE~hive
+        hive.image.Picture(width, height, pixels)     // Int, Int, UInt8[dyn]
+        ~CODE~
+
+        ## What a picture is
+
+        ~BT~decode~BT~ reads **PNG, JPEG, GIF and WebP** — lossy or lossless, with or without
+        alpha; a moving GIF or WebP is its first frame. Whatever the file kept, it reads
+        into the same thing: **four bytes a pixel — red, green, blue and alpha, not
+        multiplied by the alpha — row by row from the top left**, so pixel ~BT~(x, y)~BT~ opens
+        at ~BT~(y * width + x) * 4~BT~. Every index into ~BT~pixels~BT~ is proved in range like any
+        other:
+
+        ~CODE~hive
+        red := (y * picture.width + x) * 4
+        alpha := red + 3
+        pixels := picture.pixels
+        if pixels bounds red && pixels bounds alpha \{
+        	echo "\{pixels[red]} red at \{pixels[alpha]} alpha"
+        }
+        ~CODE~
+
+        An ~BT~ImageError~BT~ carries a ~BT~message~BT~: for something that is no such file, one cut
+        short or broken, and **one claiming more than 100 million pixels**, which is
+        refused before anything is decoded — a file of a few kilobytes can claim a size
+        that would take every byte of memory there is.
+
+        ## Another size
+
+        ~BT~scale~BT~ answers the picture at exactly ~BT~width~BT~ by ~BT~height~BT~. Each new pixel is the
+        **average of the ones it covers, weighted by how opaque each is**, so a shrunk
+        picture keeps its colours and an edge against transparency does not darken; a
+        grown one repeats them. A size of nought is a picture of nothing. Keeping the
+        proportions is the caller's arithmetic:
+
+        ~CODE~hive
+        smaller := hive.image.scale(picture, 40, picture.height * 40 / picture.width)
+        ~CODE~
+
+        ~BT~examples/26-pictures~BT~ reads Hive's logo out of the executable, scales it and
+        draws it in characters.
     `)
 }
 
@@ -463,14 +642,23 @@ func termExec(): Str {
     return page.backticked(`
         # ~BT~hive.term~BT~ — running another program
 
-        Three calls. The difference between the first two is **who is talking to the
-        terminal**; the third is the first with an environment.
+        Three calls wait for the command to end. The difference between the first two
+        is **who is talking to the terminal**; the third is the first with an
+        environment. The rest [run one alongside](#a-program-that-runs-alongside).
 
         | call | answers with |
         | --- | --- |
         | ~BT~exec(command, arguments, directory)~BT~ | ~BT~Result<Str, ExecError>~BT~ |
         | ~BT~attach(command, arguments, directory)~BT~ | ~BT~Int~BT~ — the exit status |
         | ~BT~execWith(command, arguments, directory, environment)~BT~ | ~BT~Result<Str, ExecError>~BT~ |
+        | ~BT~start(command, arguments, directory)~BT~ | ~BT~Result<Process, ExecError>~BT~ — at once |
+        | ~BT~startWith(command, arguments, directory, environment)~BT~ | ~BT~Result<Process, ExecError>~BT~ |
+        | ~BT~processReceiveLine(process)~BT~ | ~BT~Result<Str, ProcessError>~BT~ — without the newline |
+        | ~BT~processReceive(process, bytes)~BT~ | ~BT~Result<Str, ProcessError>~BT~ — at most that many |
+        | ~BT~processSend(process, text)~BT~ | ~BT~Result<Int, ProcessError>~BT~ |
+        | ~BT~processCloseInput(process)~BT~ | ~BT~void~BT~ |
+        | ~BT~processWait(process)~BT~ | ~BT~Int~BT~ — the exit status |
+        | ~BT~processKill(process)~BT~ | ~BT~void~BT~ — once it has ended |
 
         ~BT~arguments~BT~ is a ~BT~Str[]~BT~ and ~BT~directory~BT~ is a ~BT~Str~BT~ — empty meaning where this
         program is. ~BT~environment~BT~ is a ~BT~hive.map.Map<Str, Str>~BT~.
@@ -523,6 +711,46 @@ func termExec(): Str {
         ~CODE~
 
         This is what ~BT~hive build --target~BT~ is built on.
+
+        ## A program that runs alongside
+
+        ~BT~start~BT~ starts the command and **answers at once** with a ~BT~Process~BT~, whose one field
+        is ~BT~id~BT~, the system's number for it. While it runs, its output is read as it
+        arrives, its input is written, and it can be stopped:
+
+        ~CODE~hive
+        if hive.term.start("go", ["test", "./..."], directory) is Result.Ok(tests) \{
+        	for ; true; \{
+        		if hive.term.processReceiveLine(tests) is Result.Ok(line) \{
+        			echo line
+        		} else \{
+        			break
+        		}
+        	}
+        	echo "status \{hive.term.processWait(tests)}"
+        }
+        ~CODE~
+
+        * **Its output and its errors are one stream**, in the order written, as ~BT~exec~BT~
+          hands them over. A receive blocks only the calling virtual thread, and a last
+          line with no newline is a line all the same.
+        * ~BT~processCloseInput~BT~ ends its input, for a command that reads until there is no
+          more — ~BT~sort~BT~, ~BT~wc~BT~.
+        * ~BT~processWait~BT~ answers its exit status. Waiting takes nothing from it, so
+          ~BT~processWait(p) with timeout 500~BT~ gives up the wait and loses nothing.
+        * **~BT~processKill~BT~ stops it and everything it started**, and answers once it has
+          ended: on Unix it leads a process group of its own, asked to end and a moment
+          later made to; on Windows it is in a job of its own, ended whole. Its status
+          is then ~BT~-1~BT~, and nothing more is read from it.
+        * A ~BT~ProcessError~BT~ is ~BT~Closed~BT~ — its output has ended, it was stopped, or its
+          input was closed or has nobody reading it — ~BT~Send~BT~ or ~BT~Receive~BT~, each with a
+          ~BT~message~BT~. One that could not start is the ~BT~ExecError~BT~ ~BT~exec~BT~ gives, ~BT~code~BT~ ~BT~-1~BT~.
+
+        **A started program belongs to the one that started it**: whatever is left of it
+        is stopped when that one ends — ~BT~main~BT~ returning, a panic, ~BT~hive.term.exit~BT~, its
+        last window closing, or an interrupt — and on Windows even when it is killed.
+        ~BT~hive.term.Process(id)~BT~ builds one with no program behind it, for a test.
+        ~BT~examples/25-programs-alongside~BT~ starts itself, talks to itself and stops itself.
     `)
 }
 
@@ -980,7 +1208,7 @@ func net(): Str {
 
         | page | what is on it |
         | --- | --- |
-        | [net-http](net-http.md) | ~BT~httpRequest~BT~, ~BT~httpServe~BT~, and the two types |
+        | [net-http](net-http.md) | ~BT~httpRequest~BT~, ~BT~httpOpen~BT~ for a body read as it arrives, ~BT~httpServe~BT~, and the types |
         | [net-websockets](net-websockets.md) | ~BT~wsConnect~BT~, ~BT~wsServe~BT~, ~BT~wsSend~BT~, ~BT~wsReceive~BT~, and ~BT~httpWsServe~BT~ for HTTP on the same port |
         | [net-sockets](net-sockets.md) | ~BT~socketConnect~BT~, ~BT~socketServe~BT~, and the stream |
         | [net-names](net-names.md) | ~BT~resolve~BT~, ~BT~localAddress~BT~ |
@@ -1024,6 +1252,7 @@ func net(): Str {
         | type | its variants |
         | --- | --- |
         | ~BT~HttpError~BT~ | none — a struct carrying the ~BT~url~BT~ and a ~BT~message~BT~ |
+        | ~BT~HttpStreamError~BT~ | ~BT~Closed~BT~ ~BT~Receive~BT~ |
         | ~BT~WsError~BT~ | ~BT~Handshake~BT~ ~BT~Protocol~BT~ ~BT~Closed~BT~ ~BT~Send~BT~ ~BT~Receive~BT~ |
         | ~BT~SocketError~BT~ | ~BT~Connect~BT~ ~BT~Closed~BT~ ~BT~Send~BT~ ~BT~Receive~BT~ |
         | ~BT~NetError~BT~ | ~BT~NotFound~BT~ ~BT~Lookup~BT~ ~BT~NoAddress~BT~ |
@@ -1040,15 +1269,20 @@ func netHttp(): Str {
         | call | answers with |
         | --- | --- |
         | ~BT~httpRequest(req)~BT~ | ~BT~Result<HttpResponse, HttpError>~BT~ |
+        | ~BT~httpOpen(req)~BT~ | ~BT~Result<HttpStream, HttpError>~BT~ — once the headers are in |
+        | ~BT~httpReceiveLine(stream)~BT~ | ~BT~Result<Str, HttpStreamError>~BT~ — without the newline |
+        | ~BT~httpReceive(stream, bytes)~BT~ | ~BT~Result<Str, HttpStreamError>~BT~ — at most that many |
+        | ~BT~httpClose(stream)~BT~ | ~BT~void~BT~ |
         | ~BT~httpServe(port, handler)~BT~ | ~BT~void~BT~ — **blocks forever** |
 
         ~BT~handler~BT~ is a ~BT~proc(HttpRequest): HttpResponse~BT~.
 
-        ## The two types
+        ## The types
 
         ~CODE~hive
         hive.net.HttpRequest(method, url, headers, body)     // Str, Str, Table, Str
         hive.net.HttpResponse(status, headers, body)         // Int, Table, Str
+        hive.net.HttpStream(status, headers)                 // Int, Table, and a body still arriving
         ~CODE~
 
         **Headers are a ~BT~Table~BT~ of ~BT~[name, value]~BT~ rows**, which is what makes
@@ -1077,6 +1311,47 @@ func netHttp(): Str {
         ~CODE~hive
         both := await [hive.net.httpRequest(a), hive.net.httpRequest(b)]
         ~CODE~
+
+        ## A body read as it arrives
+
+        ~BT~httpRequest~BT~ answers when the whole body is in. **A body that is written a
+        piece at a time** — a language model's answer, a log being followed, server-sent
+        events — is read with ~BT~httpOpen~BT~, which answers as soon as the **status and
+        headers** are in, with an ~BT~HttpStream~BT~ whose body is read as it comes:
+
+        ~CODE~hive
+        if hive.net.httpOpen(asked) is Result.Ok(stream) \{
+        	for ; true; \{
+        		if hive.net.httpReceiveLine(stream) is Result.Ok(line) \{
+        			echo line
+        		} else \{
+        			break
+        		}
+        	}
+        }
+        ~CODE~
+
+        * Its ~BT~Ok~BT~ means what ~BT~httpRequest~BT~'s does: a 404 is an ~BT~HttpStream~BT~ with ~BT~status~BT~
+          404, and its body is read the same way. A request that got no answer is an
+          ~BT~HttpError~BT~.
+        * ~BT~httpReceiveLine~BT~ answers each line without its ~BT~\n~BT~ or ~BT~\r\n~BT~ — the last one
+          too, newline or not — and ~BT~httpReceive(stream, bytes)~BT~ at most that many bytes,
+          whatever has arrived. Both **block only the calling virtual thread**.
+        * **~BT~httpClose~BT~ drops the connection**, which is how a server learns that nobody
+          is reading: it is how a client stops a model that is going on. It may be
+          called from another thread while a receive waits, and that receive answers
+          ~BT~Closed~BT~. Every copy of a stream is the same stream.
+        * An ~BT~HttpStreamError~BT~ is ~BT~Closed~BT~ — the body ended, or the stream was closed —
+          or ~BT~Receive~BT~, the connection breaking part-way, each with a ~BT~message~BT~.
+        * **Nothing bounds the wait** but connecting: a model server sends its headers
+          only once its model has loaded, and a body may take minutes. ~BT~with timeout~BT~
+          on a receive gives up the waiting and not the receive, which still takes the
+          line that arrives next — so a program that does something else meanwhile
+          reads on a thread of its own, as with a WebSocket.
+
+        ~BT~hive.net.HttpStream(200, [])~BT~ builds one with no connection behind it, for a
+        test: reading it answers ~BT~Closed~BT~. ~BT~examples/24-streaming-answer~BT~ reads a
+        stand-in model's answer as it arrives, and stops one stuck in a loop.
 
         ## A server
 

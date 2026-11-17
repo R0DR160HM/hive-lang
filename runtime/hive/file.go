@@ -2,6 +2,7 @@ package hive
 
 import (
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -70,6 +71,33 @@ func FileAppend(path, contents string) Result[int, FileFileError] {
 func FileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+func FileIsDir(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+// Where the program is, and whose it is. Each is absolute, with / between its
+// parts on every platform — which every call here takes, Windows included.
+func FileWorkingDirectory() Result[string, FileFileError] {
+	return filePlace(".", os.Getwd)
+}
+
+func FileHome() Result[string, FileFileError] {
+	return filePlace("~", os.UserHomeDir)
+}
+
+func FileExecutable() Result[string, FileFileError] {
+	return filePlace("", os.Executable)
+}
+
+func filePlace(path string, find func() (string, error)) Result[string, FileFileError] {
+	found, err := find()
+	if err != nil {
+		return Err[string, FileFileError](FileFileError{Reason: "NotFound", Path: path, Message: err.Error()})
+	}
+	return Ok[string, FileFileError](filepath.ToSlash(found))
 }
 
 func FileSize(path string) Result[int, FileFileError] {

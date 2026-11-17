@@ -5,6 +5,7 @@ package hive
 
 import (
 	"crypto/subtle"
+	"embed"
 	"fmt"
 	"math"
 	"reflect"
@@ -1507,6 +1508,16 @@ func TaskSleepForever() {
 	}
 }
 
+// Everything under the program's own assets/ directory, embedded at compile
+// time: what hive.file.asset reads, and what a window serves its page. Nil in
+// a program that has no such directory; hive/assets.go fills it in.
+//
+// Not loaded at run time: the bytes are in the executable. A built Hive program
+// is one file, and this only changes how big that file is.
+var programAssets *embed.FS
+
+func assetsAre(files embed.FS) { programAssets = &files }
+
 // Open windows: the last to close ends the program, so a returning `main` waits.
 var holding struct {
 	mu    sync.Mutex
@@ -1532,6 +1543,35 @@ func MainReturned() {
 	holding.mu.Unlock()
 	if held {
 		TaskSleepForever()
+	}
+}
+
+// What has to be put back however the program ends — a terminal left raw — run
+// once, last registered first: when main returns or panics (main defers it),
+// at hive.term.exit, and when the last window closes.
+var endings struct {
+	mu      sync.Mutex
+	fns     []func()
+	running sync.Mutex
+}
+
+func atEnd(f func()) {
+	endings.mu.Lock()
+	endings.fns = append(endings.fns, f)
+	endings.mu.Unlock()
+}
+
+// A second caller — an interrupt arriving while main returns — waits for the
+// first to finish putting things back, rather than ending the program under it.
+func Ending() {
+	endings.running.Lock()
+	defer endings.running.Unlock()
+	endings.mu.Lock()
+	fns := endings.fns
+	endings.fns = nil
+	endings.mu.Unlock()
+	for i := len(fns) - 1; i >= 0; i-- {
+		fns[i]()
 	}
 }
 

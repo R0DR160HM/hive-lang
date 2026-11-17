@@ -2515,10 +2515,10 @@ func uiModelBox(path string) ([3]float64, [3]float64, bool) {
 	b := uiModelBounds{low: [3]float64{math.Inf(1), math.Inf(1), math.Inf(1)},
 		high: [3]float64{math.Inf(-1), math.Inf(-1), math.Inf(-1)}}
 	defer func() { uiModelBoxes[path] = b }()
-	if uiAssets == nil || strings.Contains(path, "..") {
+	if programAssets == nil || strings.Contains(path, "..") {
 		return b.low, b.high, false
 	}
-	body, err := uiAssets.ReadFile("assets/" + path)
+	body, err := programAssets.ReadFile("assets/" + path)
 	if err != nil || len(body) < 20 || binary.LittleEndian.Uint32(body) != 0x46546C67 {
 		return b.low, b.high, false
 	}

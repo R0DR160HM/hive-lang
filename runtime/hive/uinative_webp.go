@@ -1,4 +1,6 @@
 // WebP, read in Go: the container, its alpha, and the frames of a moving one.
+// A window that draws itself carries it, and so does hive.image, which is why
+// the one type it shares with the window's pictures is here.
 package hive
 
 import (
@@ -11,6 +13,13 @@ import (
 func init() {
 	image.RegisterFormat("webp", "RIFF????WEBP", uiWebPDecode, uiWebPConfig)
 }
+
+type uiFrame struct {
+	pix   []uint8
+	delay time.Duration
+}
+
+const uiFramesBudget = 192 << 20
 
 type uiWpChunk struct {
 	id   string

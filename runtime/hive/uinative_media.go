@@ -33,11 +33,6 @@ type uiPicture struct {
 	shown  int
 }
 
-type uiFrame struct {
-	pix   []uint8
-	delay time.Duration
-}
-
 type uiVector interface {
 	size() (float64, float64)
 	render(w, h int) []uint8
@@ -126,10 +121,10 @@ func uiPictureBytes(src string) ([]byte, bool) {
 		return []byte(out), err == nil
 	case strings.HasPrefix(src, "/_hive/asset/"):
 		name := strings.TrimPrefix(src, "/_hive/asset/")
-		if uiAssets == nil || name == "" || strings.Contains(name, "..") {
+		if programAssets == nil || name == "" || strings.Contains(name, "..") {
 			return nil, false
 		}
-		out, err := uiAssets.ReadFile("assets/" + name)
+		out, err := programAssets.ReadFile("assets/" + name)
 		return out, err == nil
 	case src == "/_hive/icon":
 		return uiWindowIcon, len(uiWindowIcon) > 0

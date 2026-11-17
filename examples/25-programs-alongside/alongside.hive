@@ -1,0 +1,107 @@
+// Programs alongside
+// ==================
+// `hive.term.exec` runs a program and waits for it to finish. `hive.term.start`
+// starts one and carries on, and while it runs, its output is read as it
+// arrives, its input is written, and it can be stopped — together with
+// everything it started:
+//
+//   start                starts it, answering with a `Process` at once
+//   processReceiveLine   the next line it wrote, as soon as it has written it
+//   processSend          text for it to read
+//   processCloseInput    the end of what it will be sent
+//   processWait          waits for it to end, and answers with its status
+//   processKill          stops it and everything it started, and waits
+//
+// The program started here is this one again — `hive.file.executable()` says
+// where it is — told by its first argument which part to play, so the example
+// needs nothing installed. A program started this way belongs to this one:
+// whatever is left of it is stopped when this one ends.
+
+proc main(): void {
+    args := hive.term.args()
+    if args bounds 0 {
+        if args[0] == "--listener" {
+            listener()
+        }
+        if args[0] == "--ticker" {
+            ticker()
+        }
+        return
+    }
+    me := hive.file.executable()
+    if me is Result.Error(why) {
+        echo "cannot tell where this program is: {why.message}"
+        return
+    }
+    if me is Result.Ok(path) {
+        converse(path)
+        interrupt(path)
+    }
+}
+
+// --- A conversation --------------------------------------------------------------
+
+// Writes it a word at a time and reads each answer before the next. Closing its
+// input ends its reading, and so it finishes and says with what status.
+proc converse(path: Str): void {
+    started := hive.term.start(path, ["--listener"], "")
+    if started is Result.Error(why) {
+        echo "could not start it: {why.message}"
+        return
+    }
+    if started is Result.Ok(listener) {
+        for each word in ["hive", "processes", "alongside"] {
+            hive.term.processSend(listener, word + "\n")
+            if hive.term.processReceiveLine(listener) is Result.Ok(answer) {
+                echo "it said: {answer}"
+            }
+        }
+        hive.term.processCloseInput(listener)
+        if hive.term.processReceiveLine(listener) is Result.Ok(last) {
+            echo "it said: {last}"
+        }
+        echo "it ended with status {hive.term.processWait(listener)}"
+    }
+}
+
+// The other side: a line in, a line out, until there is nothing more to read.
+proc listener(): void {
+    mut heard := 0
+    for ; true; {
+        line := hive.term.read()
+        if line == "" {
+            echo "goodbye, after {heard} words"
+            hive.term.exit(3)
+        }
+        heard += 1
+        echo "{line} has {len(line)} letters"
+    }
+}
+
+// --- One that never ends ---------------------------------------------------------
+
+// Reads what it says for a while, then stops it. A program stopped this way
+// answers -1 for its status, and nothing more is read from it.
+proc interrupt(path: Str): void {
+    if hive.term.start(path, ["--ticker"], "") is Result.Ok(ticking) {
+        for i := 0; i < 3; i++ {
+            if hive.term.processReceiveLine(ticking) is Result.Ok(line) {
+                echo "it said: {line}"
+            }
+        }
+        hive.term.processKill(ticking)
+        echo "stopped it: status {hive.term.processWait(ticking)}"
+        if hive.term.processReceiveLine(ticking) is Result.Error(why) {
+            echo "reading it now: {why.message}"
+        }
+    }
+}
+
+proc ticker(): void {
+    mut n := 0
+    for ; true; {
+        n += 1
+        echo "tick {n}"
+        hive.task.sleep(50)
+    }
+}

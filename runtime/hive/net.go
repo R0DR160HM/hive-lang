@@ -16,9 +16,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -59,14 +61,9 @@ func NetHttpSend(req NetHttpRequest) Result[NetHttpResponse, NetHttpError] {
 	fail := func(err error) Result[NetHttpResponse, NetHttpError] {
 		return Err[NetHttpResponse, NetHttpError](NetHttpError{Url: req.Url, Message: err.Error()})
 	}
-	hreq, err := http.NewRequest(strings.ToUpper(req.Method), req.Url, strings.NewReader(req.Body))
+	hreq, err := httpOutgoing(context.Background(), req)
 	if err != nil {
 		return fail(err)
-	}
-	for _, row := range req.Headers {
-		if len(row) >= 2 {
-			hreq.Header.Add(row[0], row[1])
-		}
 	}
 	resp, err := httpClient.Do(hreq)
 	if err != nil {
@@ -82,6 +79,155 @@ func NetHttpSend(req NetHttpRequest) Result[NetHttpResponse, NetHttpError] {
 		Headers: headerTable(resp.Header),
 		Body:    string(body),
 	})
+}
+
+func httpOutgoing(ctx context.Context, req NetHttpRequest) (*http.Request, error) {
+	hreq, err := http.NewRequestWithContext(ctx, strings.ToUpper(req.Method), req.Url, strings.NewReader(req.Body))
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range req.Headers {
+		if len(row) >= 2 {
+			hreq.Header.Add(row[0], row[1])
+		}
+	}
+	return hreq, nil
+}
+
+// ---------------------------------------------------------------------------
+// HTTP, a body read as it arrives
+// ---------------------------------------------------------------------------
+
+// NetHttpStream is a response whose body is still arriving: hive.net.httpOpen
+// answers with one once the status and headers are in. The body is reached
+// through a pointer, so every copy of a stream reads and closes the same one —
+// and a test builds a stream with a status and no body behind it.
+type NetHttpStream struct {
+	Status  int
+	Headers Table
+
+	body *httpBody
+}
+
+type httpBody struct {
+	reading sync.Mutex
+	r       *bufio.Reader
+	raw     io.Closer
+	cancel  context.CancelFunc
+	closed  atomic.Bool
+}
+
+// NetHttpStreamError is what the program reads as hive.net.HttpStreamError:
+// Reason is Closed — the body ended, or the stream was closed — or Receive.
+type NetHttpStreamError struct {
+	Reason  string
+	Message string
+}
+
+func (e NetHttpStreamError) Error() string {
+	return "hive: http stream " + e.Reason + ": " + e.Message
+}
+
+// No limit on the whole exchange, as httpClient has: a body may take minutes to
+// arrive, and so may the headers — a model server sends them once the model has
+// loaded. Connecting is bounded as for any request.
+var httpStreamClient = &http.Client{}
+
+// NetHttpOpen backs hive.net.httpOpen: the request is sent and the call answers
+// as soon as the status and headers have arrived, before any of the body.
+func NetHttpOpen(req NetHttpRequest) Result[NetHttpStream, NetHttpError] {
+	ctx, cancel := context.WithCancel(context.Background())
+	hreq, err := httpOutgoing(ctx, req)
+	if err == nil {
+		var resp *http.Response
+		if resp, err = httpStreamClient.Do(hreq); err == nil {
+			body := &httpBody{r: bufio.NewReader(resp.Body), raw: resp.Body, cancel: cancel}
+			// A stream nobody can reach any more — one an abandoned `with timeout`
+			// opened — still lets the server know it can stop.
+			runtime.SetFinalizer(body, (*httpBody).close)
+			return Ok[NetHttpStream, NetHttpError](NetHttpStream{
+				Status:  resp.StatusCode,
+				Headers: headerTable(resp.Header),
+				body:    body,
+			})
+		}
+	}
+	cancel()
+	return Err[NetHttpStream, NetHttpError](NetHttpError{Url: req.Url, Message: err.Error()})
+}
+
+// NetHttpReceiveLine backs hive.net.httpReceiveLine: the next line of the body
+// without its "\n" or "\r\n". A last line with no newline is a line all the same.
+func NetHttpReceiveLine(s NetHttpStream) Result[string, NetHttpStreamError] {
+	b := s.body
+	if b == nil {
+		return Err[string, NetHttpStreamError](httpNoBody())
+	}
+	b.reading.Lock()
+	defer b.reading.Unlock()
+	line, err := b.r.ReadString('\n')
+	if err == nil || (errors.Is(err, io.EOF) && line != "" && !b.closed.Load()) {
+		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+		return Ok[string, NetHttpStreamError](line)
+	}
+	return Err[string, NetHttpStreamError](b.failure(err))
+}
+
+// NetHttpReceive backs hive.net.httpReceive: at most limit bytes of the body,
+// whatever has arrived.
+func NetHttpReceive(s NetHttpStream, limit int) Result[string, NetHttpStreamError] {
+	b := s.body
+	if b == nil {
+		return Err[string, NetHttpStreamError](httpNoBody())
+	}
+	if limit <= 0 {
+		return Ok[string, NetHttpStreamError]("")
+	}
+	b.reading.Lock()
+	defer b.reading.Unlock()
+	buf := make([]byte, limit)
+	for {
+		n, err := b.r.Read(buf)
+		if n > 0 {
+			return Ok[string, NetHttpStreamError](string(buf[:n]))
+		}
+		if err != nil {
+			return Err[string, NetHttpStreamError](b.failure(err))
+		}
+	}
+}
+
+// NetHttpClose backs hive.net.httpClose: the connection is dropped, which is how
+// a server learns nobody is reading any more. A receive waiting on another
+// thread answers Closed.
+func NetHttpClose(s NetHttpStream) {
+	if s.body != nil {
+		s.body.close()
+	}
+}
+
+func (b *httpBody) close() {
+	if b.closed.Swap(true) {
+		return
+	}
+	b.cancel()
+	b.raw.Close()
+}
+
+// failure says why a read stopped, and lets go of a body that will give nothing more.
+func (b *httpBody) failure(err error) NetHttpStreamError {
+	if b.closed.Load() {
+		return NetHttpStreamError{Reason: "Closed", Message: "the stream was closed"}
+	}
+	b.close()
+	if errors.Is(err, io.EOF) {
+		return NetHttpStreamError{Reason: "Closed", Message: "the body has ended"}
+	}
+	return NetHttpStreamError{Reason: "Receive", Message: err.Error()}
+}
+
+func httpNoBody() NetHttpStreamError {
+	return NetHttpStreamError{Reason: "Closed", Message: "the stream has no connection behind it"}
 }
 
 // NetHttpServe backs hive.net.httpServe: it serves every route through the given

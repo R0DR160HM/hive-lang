@@ -45,10 +45,11 @@ that answers with one brings it into the program whether or not the program ever
 writes its name, and it is a declared type in every respect but where it is
 declared: copied, ordered, compared and encoded like one. It prints the way it
 always did, as what went wrong and why — `Taken: the name Counter is already
-registered on this node`. These are `hive.file.FileError`, `hive.net.WsError`,
-`hive.net.SocketError`, `hive.net.NetError`, `hive.sql.SqlError`,
-`hive.crypto.CryptoError`, `hive.syslink.SyslinkError` and the core's own
-[`SecretError`](03-types.md#311-secret).
+registered on this node`. These are `hive.file.FileError`,
+`hive.net.HttpStreamError`, `hive.net.WsError`, `hive.net.SocketError`,
+`hive.net.NetError`, `hive.sql.SqlError`,
+`hive.crypto.CryptoError`, `hive.syslink.SyslinkError`, `hive.term.TermError`,
+`hive.term.ProcessError` and the core's own [`SecretError`](03-types.md#311-secret).
 
 **A module you don't use is not in your build**
 ([12](12-modules.md#127-what-is-linked)). Every module but two is written against
@@ -172,19 +173,39 @@ own, carrying the `path` and a `message`.
   written in the clear. Permissions are all it is, so it is not encryption and
   never claims to be: an administrator, and `root`, can read any file on the
   machine.
-* `exists(path)` → `Bool` (a directory counts); `size(path)` → `Result<Int, _>`.
+* `exists(path)` → `Bool` (a directory counts); `isDir(path)` → `Bool`, whether
+  it is a directory; `size(path)` → `Result<Int, _>`.
 * `delete(path)` removes a file, or an already-empty directory.
 * `list(path)` → `Result<Str[dyn], _>`, sorted and without any leading path;
   `makeDir(path)` creates a directory along with any missing parents, and is not
   an error when it is already there.
 * `copy(from, to)` → `Result<Int, _>`; `move(from, to)` renames.
 
+**Where the program is.** Each answers an absolute path with `/` between its parts
+on every platform — which every call here takes, Windows included — or a
+`NotFound` where the system cannot say.
+
+* `workingDirectory()` → `Result<Str, _>`, the folder relative paths are read
+  from: under `hive run`, the entrypoint's.
+* `home()` → `Result<Str, _>`, the user's home folder.
+* `executable()` → `Result<Str, _>`, the running program's own file — under
+  `hive run`, the copy the compiler built.
+
+**What the program carries.** A program's `assets/` folder, beside its entrypoint,
+is built into its executable whenever the program reads one of its files, as it is
+for a window's typeface and a scene's recordings. `asset(path)` →
+`Result<Str, _>` reads one back out, by its path under `assets/` — so a program
+copied anywhere, with nothing beside it, still has them. A path that names nothing
+the build put there, or a program built with no `assets/` folder, is `NotFound`.
+Files whose names open with `.` or `_` are not built in.
+
 ## 14.5 `hive.term`
 
-Line-oriented terminal I/O.
+The terminal: lines of it, or a key at a time.
 
-* `print(text)` writes a line to stdout — the same lowering as `echo`, but
-  restricted to a `Str`.
+* `print(text)` writes `text` to stdout **exactly as it is, ending no line** — a
+  prompt, an escape sequence, a line built a piece at a time.
+* `println(text)` writes it and a newline: `echo` restricted to a `Str`.
 * `status(text)` writes a line to **standard error**: what a program is *doing*,
   as against what it was asked for. Redirecting the answer never takes the
   progress with it, which is what lets `hive emit x.hive > main.go` be Go while
@@ -217,20 +238,97 @@ Line-oriented terminal I/O.
 * `codec()` → `hive.codec.Codec<hive.term.FlagError>` says **read and write it
   as command-line flags** ([14.7](#147-hivejson)). `T.decode` reads a `Str` —
   `flags()`, or any line — and splits it into words the way a shell does, so a
-  quoted argument stays one word, backslashes included. A flag **always
-  opens with `--`**: a field is `--name value` or `--name=value`, its name the
-  field's own or what `-- Flag as <name>;` says, so `--something-else` is
-  `somethingElse: Str -- Flag as something-else;`. A quoted word is never a flag.
-  A `Bool` standing alone is `true`, and a vector is its flag repeated. A flag
-  that is missing is an error unless the field has a `Default`, as is one given
-  twice for a field that is not a vector; words that are no flag's value are
-  ignored, and so is everything after a lone `--`. Only a type without variants
-  whose fields are values, or vectors of values, travels as flags, and a
-  failure's `path` is the flag as written. `encode` writes every field as
-  `--name value` in declaration order, quoting a value where it has to.
+  quoted argument stays one word, backslashes included. A field is
+  `--name value` or `--name=value`, its name the field's own or what
+  `-- Flag as <name>;` says, so `--something-else` is
+  `somethingElse: Str -- Flag as something-else;`. **A second name is a short
+  one**, read after a single dash — `-- Flag as background-task bg;` is
+  `--background-task` and `-bg` alike, `-bg value` and `-bg=value` — and whichever
+  of the two is shorter is the short one, so they may come in either order. Two
+  names of one length, a third name, and two fields with one short name are
+  compile errors; a short name of several letters is one flag, so `-abc` is
+  never `-a -b -c`.
+  A quoted word is never a flag, and neither is a negative number. A `Bool`
+  standing alone is `true`, and **takes the word after it only when that word
+  is `true` or `false`**; any other flag takes the next word unless that word is
+  a flag. A vector is its flag repeated. A flag that is missing is an error
+  unless the field has a `Default`, as is one given twice for a field that is
+  not a vector.
+  **The words before the first flag, and every one after a lone `--`, are the
+  program's own** — what `positional` answers with — and are passed over. Between
+  them is nothing but flags and their values: **a flag the type does not declare
+  is an error**, listing the ones it does, and so is a word that is no flag's
+  value, which has to go before the flags or after `--`. Only a type without
+  variants whose fields are values, or vectors of values, travels as flags, and a
+  failure's `path` is the flag as written — `-bg` where that is what was typed.
+  `encode` writes every field as `--name value` in declaration order, quoting a
+  value where it has to.
+* `positional(line)` → `Str[dyn]`, the words of a command line that are the
+  program's own rather than any flag's: those before the first flag, and every one
+  after a lone `--`, in order. It reads the line as `T.decode` does and knows no
+  type, which is why a word after the flags has to follow a `--`:
+  `lodemaria -m llama -- what is this` is `["what", "is", "this"]`. A line with a
+  quote left open has none.
+
+  ```hive
+  line := hive.term.flags()
+  options := Options.decode(line, hive.term.codec())
+  prompt := join(hive.term.positional(line), " ")
+  ```
 * `exit(code)` ends the program with a status. There is no value to answer with
   and nothing after it runs, which is what makes it a statement rather than a
   call.
+
+**A key at a time.** Three calls, for a program that draws its own screen — a
+prompt that keeps taking keys while an answer is printed above it.
+
+* `size()` → `Result<hive.term.Size, hive.term.TermError>`, the window standard
+  output is shown in, as `width` and `height` in cells. A `NotATerminal` error
+  where standard output is a file or a pipe.
+* `raw(on)` → `Result<Bool, hive.term.TermError>` turns **raw mode** on or off for
+  the terminal standard input reads from: what is typed is neither shown nor held
+  back for a whole line, and **Ctrl+C arrives as a key** rather than ending the
+  program. Output is untouched, so a newline still starts the next line. Raw mode
+  is **put back however the program ends** — `main` returning, a panic,
+  `hive.term.exit`, the last window closing, or a signal from outside. Turning it
+  on twice, or off when it is off, is not an error; turning it on where standard
+  input is not a terminal is `NotATerminal`. While it is on, `read()` waits for a
+  line nobody can end, so keys are read with `readKey()`.
+* `readKey()` → `Result<hive.term.Key, hive.term.TermError>` blocks for the next
+  key, parking only the calling virtual thread. A `Key` is a `name` and the
+  `text` it types. **The name is the one `hive.ui` gives a key**
+  ([14.15](#1415-hiveui)): what it types when nothing but Shift is held — `"a"`,
+  `"A"`, `":"` — and the key itself, modifiers first, when Ctrl or Alt is —
+  `"Ctrl+C"`, `"Shift+Alt+X"`, `"Ctrl+ArrowRight"`. Keys that type nothing have
+  their own names: `Enter`, `Escape`, `Tab`, `Backspace`, `Delete`, `Insert`,
+  `Space`, the arrows, `Home`, `End`, `PageUp`, `PageDown`, `F1`…`F12`. `text` is
+  what the key puts in a line: the character, `" "` for `Space`, and `""` for a
+  key that edits or moves rather than types, or is held with Ctrl or Alt. **A
+  paste** — while raw mode is on — is one `Key` named `Paste` whose `text` is all
+  of it, its line breaks `"\n"`, so a newline in it is never `Enter`. Input that
+  is not a terminal is read the same way, a key at a time; its end is a `Closed`
+  error.
+
+A `hive.term.TermError` is `NotATerminal`, `Closed` or `Io`, each with a
+`message`.
+
+```hive
+hive.term.raw(true)
+mut line := ""
+for ; true; {
+	if hive.term.readKey() is Result.Ok(key) {
+		if key.name == "Enter" || key.name == "Ctrl+C" {
+			break
+		}
+		line += key.text
+		hive.term.print("\r> " + line)
+	}
+}
+hive.term.raw(false)
+```
+
+On Windows a program's console paints escape sequences, as every other terminal
+does: the runtime turns that on when the program starts.
 
 **Running another program.** Three calls. The difference between the first two is
 who is talking to the terminal; the third is the first with an environment.
@@ -284,6 +382,52 @@ hive.term.execWith("go", ["build", "."], buildDirectory, asked)
 This is what `hive build --target` is built on
 ([15.6](15-lowering.md#156-building-for-another-platform)) — and it is the only
 thing in the compiler that needs an environment at all.
+
+**A program that runs alongside.** `exec` and `attach` wait for the command to
+end. `start(command, arguments, directory)` →
+`Result<hive.term.Process, ExecError>` starts it and answers at once, and
+`startWith` is `start` with an environment overlay, as `execWith` is `exec`. A
+command that could not be started is the `ExecError` `exec` gives, `code` `-1`. A
+`Process` has one field, `id`, the system's number for it.
+
+* `processReceiveLine(process)` → `Result<Str, hive.term.ProcessError>` is the next
+  line it wrote, without its newline — a last line with none included — and
+  `processReceive(process, bytes)` at most that many bytes, whatever has arrived.
+  Standard output and standard error are **one stream**, in the order they were
+  written, as `exec` hands them over. Each blocks only the calling virtual thread.
+* `processSend(process, text)` → `Result<Int, _>` writes to its standard input;
+  `processCloseInput(process)` is the end of that input, for a command that reads
+  until there is no more.
+* `processWait(process)` → `Int` blocks until it ends and answers its status.
+  Waiting takes nothing from it, so `processWait(p) with timeout 500` gives up the
+  wait and loses nothing.
+* `processKill(process)` stops it **and everything it started**, and answers once
+  it has ended: on Unix it leads a process group of its own, which is asked to
+  end and a moment later made to; on Windows it is in a job of its own, ended
+  whole. A stopped process's status is `-1`, and nothing more is read from it.
+* A `ProcessError` is `Closed` — its output has ended, it was stopped, or its
+  input was closed or has nobody reading it — `Send` or `Receive`, each with a
+  `message`.
+
+**A started program belongs to the program that started it.** Whatever is left of
+it is stopped when that program ends — `main` returning, a panic,
+`hive.term.exit`, its last window closing, or an interrupt — and on Windows even
+when it is killed, since its jobs end with it. `Process(id)` builds one with no
+program behind it, for a test: it reads as `Closed`, waits as `-1`, and stopping
+it is nothing.
+
+```hive
+if hive.term.start("go", ["test", "./..."], directory) is Result.Ok(tests) {
+	for ; true; {
+		if hive.term.processReceiveLine(tests) is Result.Ok(line) {
+			echo line
+		} else {
+			break
+		}
+	}
+	echo "status {hive.term.processWait(tests)}"
+}
+```
 
 ## 14.6 Reading tables
 
@@ -490,6 +634,32 @@ rows.
 * `httpRequest(req)` → `Result<HttpResponse, HttpError>`.
 * `httpServe(port, handler)`, with `handler` a
   `proc (HttpRequest): HttpResponse`.
+
+**A body read as it arrives.** `httpRequest` answers once the whole body is in;
+these read one that is written a piece at a time — a language model's answer, a
+log being followed, server-sent events.
+
+* `httpOpen(req)` → `Result<HttpStream, HttpError>` sends the request and answers
+  as soon as the **status and headers** are in, before any of the body. Its `Ok`
+  means what `httpRequest`'s does: a 404 is a stream with `status` 404 whose body
+  reads the same way. An `HttpStream` has `status` and `headers` fields and a
+  connection behind it; every copy is the same stream.
+* `httpReceiveLine(stream)` → `Result<Str, HttpStreamError>`, the next line of the
+  body without its `\n` or `\r\n` — a last line with no newline included — and
+  `httpReceive(stream, bytes)` at most that many bytes, whatever has arrived. Each
+  blocks only the calling virtual thread.
+* `httpClose(stream)` drops the connection, which is how a server learns nobody is
+  reading — what stops a model generating. It may be called from another thread
+  while a receive waits, and that receive answers `Closed`; closing twice is
+  nothing. A stream nothing can reach any more is closed when it is collected.
+* An `HttpStreamError` is `Closed` — the body ended, or the stream was closed — or
+  `Receive`, the connection breaking part-way, each with a `message`.
+* Nothing bounds the wait but connecting: a model server sends its headers once its
+  model has loaded, and a body may take minutes. `with timeout` on a receive gives
+  up the waiting and not the receive, which still takes the line that arrives
+  next, so a program doing something else meanwhile reads on a thread of its own.
+* `HttpStream(status, headers)` builds a stream with no connection behind it, which
+  every receive answers as `Closed`, for a test.
 
 **WebSockets** (RFC 6455). The handshake, frame headers, masking, ping/pong and
 fragmentation are the runtime's business; a program sees whole messages as `Str`.
@@ -1619,3 +1789,25 @@ gesture starts on the next key or tap. The module uses nothing of `hive.ui`.
 ([14.16](#1416-hiveuiscene)): a stream in MP3, which is what most stations send,
 and a recording in MP3, Ogg Vorbis, FLAC or WAV. One with no scene in it has no
 engine, and plays nothing.
+
+## 14.18 `hive.image`
+
+A picture read from the bytes of a file, and the same picture at another size.
+Nothing here performs I/O: the bytes come from `hive.file.read`, `hive.file.asset`
+or a response's body.
+
+* `decode(data)` → `Result<hive.image.Picture, hive.image.ImageError>` reads a
+  **PNG, JPEG, GIF or WebP** file — lossy or lossless, with or without alpha; a
+  moving GIF or WebP is its first frame. A `Picture` is its `width`, its `height`
+  and its `pixels`, a `UInt8[dyn]` of four bytes a pixel — red, green, blue and
+  alpha, not multiplied by the alpha — row by row from the top left, so pixel
+  `(x, y)` opens at `(y * width + x) * 4`. Whatever the file kept, that is what it
+  reads into. An `ImageError` carries a `message`: something that is no such file,
+  one cut short or broken, and one claiming more than 100 million pixels, which is
+  refused before anything is decoded.
+* `scale(picture, width, height)` → `Picture` is the picture at exactly that size.
+  Each new pixel is the average of the ones it covers, weighted by how opaque each
+  is, so a shrunk picture keeps its colours and an edge against transparency does
+  not darken; a grown one repeats them. A size of nought is a picture of nothing.
+  Keeping the proportions is the caller's arithmetic:
+  `scale(p, 40, p.height * 40 / p.width)`.

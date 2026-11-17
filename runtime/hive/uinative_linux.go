@@ -1746,6 +1746,7 @@ func (w *uixWindow) closed() {
 		SyslinkKill(w.n.addr)
 		if Release() == 0 {
 			fmt.Fprintln(os.Stderr, "hive: the window was closed")
+			Ending()
 			os.Exit(0)
 		}
 	})
