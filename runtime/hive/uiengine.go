@@ -252,10 +252,10 @@ func (e *uiEngine) answerPicture(path string) {
 }
 
 var uiEngineRead = func(path string) ([]byte, bool) {
-	if uiAssets == nil || path == "" {
+	if programAssets == nil || path == "" {
 		return nil, false
 	}
-	body, err := uiAssets.ReadFile("assets/" + path)
+	body, err := programAssets.ReadFile("assets/" + path)
 	return body, err == nil
 }
 

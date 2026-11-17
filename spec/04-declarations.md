@@ -48,6 +48,7 @@ type User {
 | `JSON as <name>;` | the key this field is read from and written as |
 | `URL as <name>;` | the same, in a query string ([14.9](14-stdlib.md#149-hivenet)) |
 | `Flag as <name>;` | the same, as a command-line flag without its dashes ([14.5](14-stdlib.md#145-hiveterm)) |
+| `Flag as <name> <short>;` | the same, with a short name read after one dash: the shorter of the two |
 | `Default as <literal>;` | what to use where the document has `null` or nothing at all |
 
 A `--` opens them and each clause ends at its `;`, so **they may be written in
@@ -71,7 +72,15 @@ format, which is a compile error naming it: the decoder would read the same
 member twice and the encoder would write it twice. The names are independent, so
 none of them changes another format's key. A flag is named **without its
 dashes** — `Flag as dry-run;` is `--dry-run` — and a name opening with `-` is
-refused.
+refused. Words joined by `-` are one name only where they touch: `Flag as dry -run;`
+is refused rather than read as `dry-run`.
+
+**`Flag as` takes a second name, which is a short one** read after a single dash:
+`Flag as background-task bg;` is `--background-task` and `-bg`. Whichever of the
+two is shorter is the short one, so `Flag as bg background-task;` says the same.
+Two names of one length, and a third, are compile errors, and so are two fields
+of one type with the same short name; a short name and a long one never clash,
+since one dash and two are told apart.
 
 **`Default as` takes a literal** — an `Int`, `Float`, `Str`, `Bool` or `Atom`,
 with a leading `-` where a number is negative — and it must be a value the field

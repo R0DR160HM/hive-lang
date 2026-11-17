@@ -592,6 +592,7 @@ proc parseMarks(ts: token.Token[], p: mut Parse): ast.Marks {
     mut json := ""
     mut url := ""
     mut flag := ""
+    mut short := ""
     mut ast.Expr fallback = ast.absent()
     for ; p.failed == false && atEnd(ts, p) == false; {
         at := p.pos
@@ -600,49 +601,68 @@ proc parseMarks(ts: token.Token[], p: mut Parse): ast.Marks {
             advance(p)
             if json != "" {
                 failAt(ts, p, at, "this field says `JSON as` twice, and a field has one name on the wire")
-                return ast.Marks(json, url, flag, fallback)
+                return ast.Marks(json, url, flag, short, fallback)
             }
             json = parseMarkName(ts, p, "JSON", "JSON key")
         } else if kind == "URL" {
             advance(p)
             if url != "" {
                 failAt(ts, p, at, "this field says `URL as` twice, and a field has one name in a query string")
-                return ast.Marks(json, url, flag, fallback)
+                return ast.Marks(json, url, flag, short, fallback)
             }
             url = parseMarkName(ts, p, "URL", "query parameter")
         } else if kind == "Flag" {
             advance(p)
             if flag != "" {
                 failAt(ts, p, at, "this field says `Flag as` twice, and a field has one name on a command line")
-                return ast.Marks(json, url, flag, fallback)
+                return ast.Marks(json, url, flag, short, fallback)
             }
             flag = parseMarkName(ts, p, "Flag", "flag")
-            if text.startsWith(flag, "-") {
-                failAt(ts, p, at, "`Flag as` names a flag without its dashes, since `--` is added wherever it is written")
-                return ast.Marks(json, url, flag, fallback)
+            // A second name is a short one, read after a single dash: whichever
+            // of the two is shorter, so they may come in either order.
+            if p.failed == false && opensMarkWord(ts, p) {
+                other := parseMarkWord(ts, p, "Flag", "flag")
+                if len(other) == len(flag) {
+                    failAt(ts, p, at, "`Flag as {flag} {other};` gives two names of one length, and the shorter of the two is the one read after a single dash")
+                    return ast.Marks(json, url, flag, short, fallback)
+                }
+                if opensMarkWord(ts, p) {
+                    failAt(ts, p, at, "`Flag as` takes two names at most: the flag's, and a shorter one read after a single dash")
+                    return ast.Marks(json, url, flag, short, fallback)
+                }
+                short = other
+                if len(flag) < len(other) {
+                    short = flag
+                    flag = other
+                }
+            }
+            dashed := kindAt(ts, p.pos) == token.Kind.Minus() || kindAt(ts, p.pos) == token.Kind.MinusMinus()
+            if dashed || text.startsWith(flag, "-") || text.startsWith(short, "-") {
+                failAt(ts, p, at, "`Flag as` names a flag without its dashes, since they are added wherever it is written")
+                return ast.Marks(json, url, flag, short, fallback)
             }
         } else if kind == "Default" {
             advance(p)
             if fallback is ast.Expr.Absent {
             } else {
                 failAt(ts, p, at, "this field says `Default as` twice, and a field has one value to fall back to")
-                return ast.Marks(json, url, flag, fallback)
+                return ast.Marks(json, url, flag, short, fallback)
             }
             fallback = parseMarkLiteral(ts, p)
         } else {
             fail(ts, p, unknownMark(ts, p))
-            return ast.Marks(json, url, flag, fallback)
+            return ast.Marks(json, url, flag, short, fallback)
         }
         if expect(ts, p, token.Kind.Semicolon()) == false {
-            return ast.Marks(json, url, flag, fallback)
+            return ast.Marks(json, url, flag, short, fallback)
         }
         // Another clause only where another one was written: what follows a `;`
         // is the next field as often as it is more of this one.
         if opensMark(ts, p) == false {
-            return ast.Marks(json, url, flag, fallback)
+            return ast.Marks(json, url, flag, short, fallback)
         }
     }
-    return ast.Marks(json, url, flag, fallback)
+    return ast.Marks(json, url, flag, short, fallback)
 }
 
 // Whether what sits here is another clause rather than the field after it. Both
@@ -661,6 +681,19 @@ proc parseMarkName(ts: token.Token[], p: mut Parse, clause: Str, what: Str): Str
     if expectWord(ts, p, "as") == false {
         return ""
     }
+    return parseMarkWord(ts, p, clause, what)
+}
+
+// Whether a name, rather than the `;` that ends the clause, sits here.
+func opensMarkWord(ts: token.Token[], p: Parse): Bool {
+    if kindAt(ts, p.pos) is token.Kind.StrLit(_) {
+        return true
+    }
+    return markWord(ts, p.pos) != ""
+}
+
+// One name: a word, words joined by `-`, or a quoted string.
+proc parseMarkWord(ts: token.Token[], p: mut Parse, clause: Str, what: Str): Str {
     if kindAt(ts, p.pos) is token.Kind.StrLit(written) {
         advance(p)
         if written == "" {
@@ -675,14 +708,25 @@ proc parseMarkName(ts: token.Token[], p: mut Parse, clause: Str, what: Str): Str
         return ""
     }
     advance(p)
-    // `something-else` is three tokens, read back as the one name it was written as.
+    // `something-else` is three tokens, read back as the one name it was written
+    // as — when they touch: `alpha -a` is two names, not `alpha-a`.
     mut spelled := name
-    for ; kindAt(ts, p.pos) == token.Kind.Minus() && markWord(ts, p.pos + 1) != ""; {
+    for ; kindAt(ts, p.pos) == token.Kind.Minus() && markWord(ts, p.pos + 1) != "" && touches(ts, p.pos, len(markWord(ts, p.pos - 1))) && touches(ts, p.pos + 1, 1); {
         spelled = spelled + "-" + markWord(ts, p.pos + 1)
         advance(p)
         advance(p)
     }
     return spelled
+}
+
+// Whether the token at `i` starts right where the one before it, `wide`
+// characters long, ends.
+func touches(ts: token.Token[], i: Int, wide: Int): Bool {
+    before := i - 1
+    if ts bounds i && ts bounds before {
+        return ts[i].line == ts[before].line && ts[i].col == ts[before].col + wide
+    }
+    return false
 }
 
 // One word of a clause's name: a name, a keyword, or a number.
@@ -742,7 +786,7 @@ proc parseMarkLiteral(ts: token.Token[], p: mut Parse): ast.Expr {
 
 // What was written where a clause was expected.
 func unknownMark(ts: token.Token[], p: Parse): Str {
-    return "a field's annotations are `JSON as <name>;`, `URL as <name>;`, `Flag as <name>;` and `Default as <literal>;`, in any order, and " + token.describe(kindAt(ts, p.pos)) + " is none of them"
+    return "a field's annotations are `JSON as <name>;`, `URL as <name>;`, `Flag as <name> <short name>;` — the short name may be left out — and `Default as <literal>;`, in any order, and " + token.describe(kindAt(ts, p.pos)) + " is none of them"
 }
 
 proc parseVariant(ts: token.Token[], p: mut Parse): ast.Variant {

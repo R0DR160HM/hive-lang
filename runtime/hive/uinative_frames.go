@@ -9,8 +9,6 @@ import (
 	"time"
 )
 
-const uiFramesBudget = 192 << 20
-
 func uiDecodeFrames(body []byte) ([]uiFrame, int, int, bool) {
 	if bytes.HasPrefix(body, []byte("GIF8")) {
 		return uiGifFrames(body)

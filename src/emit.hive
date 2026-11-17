@@ -630,6 +630,8 @@ proc emitCallable(em: mut Emit, env: infer.Env, name: Str, params: ast.Param[], 
         // it yet, so only where the line sits is worth remembering.
         em.atomLine = len(em.out)
         line(em, "hive.InitAtoms(" + atomTable(em) + ")")
+        // A panic runs it too, so a terminal left raw is put back either way.
+        line(em, "defer hive.Ending()")
         // Returning from the body waits for open windows; a panic skips the wait.
         open(em, "func() \{")
     }
@@ -2644,7 +2646,12 @@ proc decoding(em: mut Emit, env: infer.Env, args: ast.Arg[], typeName: Str, vari
     if stdlib.isFlatFormat(format) {
         useModule(em, flatModule(format))
         needCodec(em, format + ":" + typeName)
-        parsed := flatPrefix(format) + "Parse(" + expr(em, env, argExpr(args, 0), types.Ty.TStr()) + ", " + flatDecoderName(format, typeName) + ")"
+        read := expr(em, env, argExpr(args, 0), types.Ty.TStr())
+        mut parsed := flatPrefix(format) + "Parse(" + read + ", " + flatDecoderName(format, typeName) + ")"
+        // A command line's words are paired against what the type's flags are.
+        if format == "term" {
+            parsed = "hive.TermFlagRead(" + read + ", " + termShapeName(typeName) + ", " + flatDecoderName(format, typeName) + ")"
+        }
         return withCodec(em, env, parsed, codec)
     }
     if variant != "" {
@@ -5083,6 +5090,10 @@ func flatEncoderName(format: Str, name: Str): Str {
     return format + "Encode_" + goIdent(name)
 }
 
+func termShapeName(name: Str): Str {
+    return "termShape_" + goIdent(name)
+}
+
 func flatKey(format: Str, f: ast.Field): Str {
     if format == "term" { return ast.flagKey(f) }
     return ast.urlKey(f)
@@ -5109,6 +5120,9 @@ proc emitFlatDecoder(em: mut Emit, format: Str, name: Str, fields: ast.Field[]):
     zero := goZero(whole)
     prefix := flatPrefix(format)
     blank(em)
+    if format == "term" {
+        emitTermShape(em, name, fields)
+    }
     open(em, "func " + flatDecoderName(format, name) + "(q []" + prefix + "Pair) (" + goType(whole) + ", *" + goType(stdlib.codecErrorOf(format)) + ") \{")
     line(em, "_ = q")
     for each f in fields {
@@ -5144,6 +5158,24 @@ proc emitFlatDecoder(em: mut Emit, format: Str, name: Str, fields: ast.Field[]):
     }
     line(em, "return " + goIdent(name) + "\{" + fieldInits(fields) + "}, nil")
     close(em, "}")
+}
+
+// What a type's flags are — each one's long name, its short one, and whether it
+// is a `Bool` — which is what a line's words are paired against before the
+// decoder reads them.
+proc emitTermShape(em: mut Emit, name: Str, fields: ast.Field[]): void {
+    mut Str[dyn] longs = []
+    mut Str[dyn] shorts = []
+    mut Str[dyn] bools = []
+    for each f in fields {
+        ty := types.resolve(em.table, f.declared)
+        isBool := ty is types.Ty.TBool || types.elementOf(ty) is types.Ty.TBool
+        append(longs, quoted(ast.flagKey(f)))
+        append(shorts, quoted(f.marks.flagShort))
+        append(bools, "{isBool}")
+    }
+    line(em, "var " + termShapeName(name) + " = hive.TermFlagShape\{Long: []string\{" + join(longs, ", ") + "}, Short: []string\{" + join(shorts, ", ") + "}, Bool: []bool\{" + join(bools, ", ") + "}}")
+    blank(em)
 }
 
 proc emitFlatEncoder(em: mut Emit, format: Str, name: Str, fields: ast.Field[]): void {
@@ -5250,6 +5282,18 @@ proc runtimeLibraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, wr
     // so a program that never asks for a secret carries none of them.
     if module == "term" && (name == "readSecret" || name == "readSecretBypass") {
         useModule(em, "termsecret")
+    }
+    // And a terminal read a key at a time is the same again, as is a program
+    // that runs alongside this one.
+    if module == "term" && (name == "raw" || name == "readKey" || name == "size") {
+        useModule(em, "termraw")
+    }
+    if module == "term" && (name == "start" || name == "startWith" || text.startsWith(name, "process")) {
+        useModule(em, "termproc")
+    }
+    // A program that reads its own assets carries them, window or none.
+    if module == "file" && name == "asset" {
+        useModule(em, "fileasset")
     }
     // Writing one is a file per platform too: what only-this-user means is the
     // one thing that differs between them.

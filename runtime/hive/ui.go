@@ -18,7 +18,6 @@
 package hive
 
 import (
-	"embed"
 	"encoding/base64"
 	"fmt"
 	"hash/fnv"
@@ -4485,6 +4484,7 @@ func (w *uiWindow) linger() {
 	}
 	if Release() == 0 {
 		fmt.Fprintln(os.Stderr, "hive: the window was closed")
+		Ending()
 		os.Exit(0)
 	}
 }
@@ -4798,15 +4798,6 @@ func uiSpread(xs []float64) string {
 var uiExtraScript string
 var uiExtraRoutes = map[string]func(http.ResponseWriter, *http.Request){}
 
-// Everything under the program's own assets/ directory, embedded at compile
-// time. Nil in a program that has no such directory; hive/assets.go fills it in.
-//
-// Not loaded at run time: the bytes are in the executable. A built Hive program
-// is one file, and this only changes how big that file is.
-var uiAssets *embed.FS
-
-func uiAssetsAre(files embed.FS) { uiAssets = &files }
-
 // One embedded file, named by its path under assets/. A miss is a 404 rather
 // than an error the program hears about: a sound whose recording is not there
 // falls back to the synthesised voice.
@@ -4815,7 +4806,7 @@ func uiAssetsAre(files embed.FS) { uiAssets = &files }
 // that tries is a path this never meant to answer, and saying so is cheaper
 // than reasoning about what ReadFile would do with it.
 func uiStored(rw http.ResponseWriter, req *http.Request) {
-	if uiAssets == nil {
+	if programAssets == nil {
 		http.Error(rw, "not found", http.StatusNotFound)
 		return
 	}
@@ -4824,7 +4815,7 @@ func uiStored(rw http.ResponseWriter, req *http.Request) {
 		http.Error(rw, "not found", http.StatusNotFound)
 		return
 	}
-	body, err := uiAssets.ReadFile("assets/" + name)
+	body, err := programAssets.ReadFile("assets/" + name)
 	if err != nil {
 		http.Error(rw, "not found", http.StatusNotFound)
 		return
