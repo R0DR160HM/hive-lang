@@ -1,10 +1,12 @@
 # Changelog
 
-## v0.4.0
+## v0.3.9
 
 ### Tooling
 
 * **`hive install <entrypoint.hive>` builds a program and puts it where a shell finds commands**: `~/.local/bin` on Linux and macOS, and on Windows `%LOCALAPPDATA%\Programs\Hive\bin`, put on the user's `PATH` the first time. `--name` installs it under another name.
+* **`hive install --desktop` adds a windowed program to the system's app launcher**, with its icon, on Linux, macOS and Windows.
+* **`hive install --target android/arm64` installs the program as an app on a phone connected over USB**, through `adb`.
 
 ### Standard library
 
@@ -34,7 +36,7 @@
 
 | was | is |
 | --- | --- |
-| the compiler built from source by any release | by v0.3.8 or later, the seed it is now pinned to: its own source calls `hive.term.flags()` |
+| an index proved for a vector, or for a row, used after the vector or a row of it is written | guarded again after the write: writing `grid[1]` costs the proofs about every row of `grid` |
 
 ## v0.3.8
 

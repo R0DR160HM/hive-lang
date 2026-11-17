@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -221,13 +222,29 @@ func AddToUserPath(dir string) (bool, error) {
 // is reached from Go only by a file built for Windows alone. The value keeps its
 // kind and its unexpanded entries, and running programs are told it changed.
 func addToUserVariable(dir string, variable string) (bool, error) {
+	said, err := powerShell(pathScript, "HIVE_INSTALL_DIR="+dir, "HIVE_INSTALL_VARIABLE="+variable)
+	if err != nil {
+		return false, err
+	}
+	switch said {
+	case "added":
+		return true, nil
+	case "present":
+		return false, nil
+	}
+	return false, fmt.Errorf("PowerShell answered %q", said)
+}
+
+// The script's values come through the environment, so nothing in them is ever
+// read as PowerShell.
+func powerShell(script string, env ...string) (string, error) {
 	shell := "powershell.exe"
 	if root := os.Getenv("SystemRoot"); root != "" {
 		shell = filepath.Join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
 	}
 	command := exec.Command(shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-		"-EncodedCommand", encodedScript(pathScript))
-	command.Env = append(os.Environ(), "HIVE_INSTALL_DIR="+dir, "HIVE_INSTALL_VARIABLE="+variable)
+		"-EncodedCommand", encodedScript(script))
+	command.Env = append(os.Environ(), env...)
 	var said, failed bytes.Buffer
 	command.Stdout, command.Stderr = &said, &failed
 	if err := command.Run(); err != nil {
@@ -235,16 +252,167 @@ func addToUserVariable(dir string, variable string) (bool, error) {
 		if why == "" {
 			why = err.Error()
 		}
-		return false, fmt.Errorf("PowerShell could not change it: %s", why)
+		return "", fmt.Errorf("PowerShell said: %s", why)
 	}
-	switch strings.TrimSpace(said.String()) {
-	case "added":
-		return true, nil
-	case "present":
-		return false, nil
-	}
-	return false, fmt.Errorf("PowerShell answered %q", strings.TrimSpace(said.String()))
+	return strings.TrimSpace(said.String()), nil
 }
+
+// Launcher puts the installed binary in the system's app launcher, with the PNG
+// at icon where that is not "", and answers with what it wrote: a .desktop entry
+// on Linux, an .app bundle on macOS, a Start Menu shortcut on Windows.
+func Launcher(binary string, icon string) (string, error) {
+	name := strings.TrimSuffix(filepath.Base(binary), ".exe")
+	switch runtime.GOOS {
+	case "windows":
+		return startMenuShortcut(binary, name)
+	case "darwin":
+		return appBundle(binary, name, icon)
+	}
+	return desktopEntry(binary, name, icon)
+}
+
+func dataHome() (string, error) {
+	if dir := os.Getenv("XDG_DATA_HOME"); filepath.IsAbs(dir) {
+		return dir, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".local", "share"), nil
+}
+
+func desktopEntry(binary string, name string, icon string) (string, error) {
+	data, err := dataHome()
+	if err != nil {
+		return "", err
+	}
+	shown := "application-x-executable"
+	if icon != "" {
+		shown = filepath.Join(data, "icons", windowClass(name)+".png")
+		if err := os.MkdirAll(filepath.Dir(shown), 0o755); err != nil {
+			return "", err
+		}
+		if err := copyFile(icon, shown); err != nil {
+			return "", err
+		}
+	}
+	entry := "[Desktop Entry]\nType=Application\nName=" + name + "\nExec=" + execQuoted(binary) +
+		"\nIcon=" + strings.ReplaceAll(shown, "\\", "\\\\") + "\nStartupWMClass=" + windowClass(name) + "\nTerminal=false\n"
+	path := filepath.Join(data, "applications", "hive-"+windowClass(name)+".desktop")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	return path, os.WriteFile(path, []byte(entry), 0o644)
+}
+
+// The desktop entry spec's quoting for one Exec argument, with its string escape
+// of a backslash applied on top.
+func execQuoted(path string) string {
+	quoted := strings.NewReplacer(`\`, `\\\\`, `"`, `\\"`, "`", "\\\\`", `$`, `\\$`, `%`, `%%`).Replace(path)
+	return `"` + quoted + `"`
+}
+
+// What runtime/hive's uiAppName makes of the same file, which a window carries as
+// its class: the launcher groups the window under its entry by it.
+func windowClass(name string) string {
+	kept := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r + 32
+		}
+		return -1
+	}, name)
+	if kept == "" {
+		return "hive"
+	}
+	return kept
+}
+
+func appBundle(binary string, name string, icon string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	bundle := filepath.Join(home, "Applications", name+".app")
+	contents := filepath.Join(bundle, "Contents")
+	if _, err := Install(binary, filepath.Join(contents, "MacOS"), name); err != nil {
+		return "", err
+	}
+	iconKey := ""
+	if icon != "" {
+		body, err := os.ReadFile(icon)
+		if err != nil {
+			return "", err
+		}
+		if err := os.MkdirAll(filepath.Join(contents, "Resources"), 0o755); err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(filepath.Join(contents, "Resources", "icon.icns"), icns(body), 0o644); err != nil {
+			return "", err
+		}
+		iconKey = "<key>CFBundleIconFile</key><string>icon</string>\n"
+	}
+	var shown strings.Builder
+	xml.EscapeText(&shown, []byte(name))
+	plist := `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>` + shown.String() + `</string>
+<key>CFBundleName</key><string>` + shown.String() + `</string>
+<key>CFBundleIdentifier</key><string>dev.hive.` + windowClass(name) + `</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>NSHighResolutionCapable</key><true/>
+` + iconKey + `</dict></plist>
+`
+	if err := os.WriteFile(filepath.Join(contents, "Info.plist"), []byte(plist), 0o644); err != nil {
+		return "", err
+	}
+	return bundle, nil
+}
+
+// An .icns holding the PNG as it is, under the type for the size nearest its
+// width: macOS scales it from there.
+// ponytail: one size, not resampled; a set of sizes if a small icon looks soft.
+func icns(png []byte) []byte {
+	width := 0
+	if len(png) >= 24 {
+		width = int(binary.BigEndian.Uint32(png[16:20]))
+	}
+	kind := "ic10"
+	for _, size := range []struct {
+		upTo int
+		kind string
+	}{{24, "icp4"}, {48, "icp5"}, {96, "icp6"}, {192, "ic07"}, {384, "ic08"}, {768, "ic09"}} {
+		if width <= size.upTo {
+			kind = size.kind
+			break
+		}
+	}
+	out := make([]byte, 16, 16+len(png))
+	copy(out, "icns")
+	binary.BigEndian.PutUint32(out[4:], uint32(16+len(png)))
+	copy(out[8:], kind)
+	binary.BigEndian.PutUint32(out[12:], uint32(8+len(png)))
+	return append(out, png...)
+}
+
+func startMenuShortcut(binary string, name string) (string, error) {
+	return powerShell(shortcutScript, "HIVE_INSTALL_TARGET="+binary, "HIVE_INSTALL_NAME="+name)
+}
+
+const shortcutScript = `
+$ErrorActionPreference = 'Stop'
+$programs = [Environment]::GetFolderPath('Programs')
+$path = Join-Path $programs ($env:HIVE_INSTALL_NAME + '.lnk')
+$link = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
+$link.TargetPath = $env:HIVE_INSTALL_TARGET
+$link.WorkingDirectory = Split-Path $env:HIVE_INSTALL_TARGET
+$link.Save()
+$path
+`
 
 // What -EncodedCommand takes: the script as UTF-16, little-endian, in base64.
 func encodedScript(script string) string {

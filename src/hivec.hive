@@ -9,6 +9,8 @@
 //   hive run       <entrypoint.hive> [..]  compile and run
 //   hive install   <entrypoint.hive>       build it, and put it where a shell finds commands
 //   hive install   <entrypoint.hive> --name <name>
+//   hive install   <entrypoint.hive> --desktop    and add it to the system's app launcher
+//   hive install   <entrypoint.hive> --target android/arm64    as an app, on a phone over USB
 //   hive test      <entrypoint.hive>       run the program's tests, with coverage
 //   hive test      <directory>             run every test under it, git-ignored files aside
 //   hive analyze   <entrypoint.hive>       score what it will cost, and write a page
@@ -25,6 +27,7 @@ import ./agents
 import ./analyzereport
 import ./container
 import ./diag
+import ./icon
 import ./indent
 import ./install
 import ./lsp
@@ -86,7 +89,7 @@ proc main(): void {
     // `--target` belongs to the two commands that write something for a platform:
     // two others compile nothing, two more are about this machine by definition,
     // and `run` hands everything past the entrypoint to the program. `install`
-    // reads its own flags, and says why it takes no target itself.
+    // reads its own flags, and takes Android's target alone.
     if command != "build" && command != "export" && command != "run" && command != "install" {
         if mentions(rest(args, 2), "--target") {
             refuse("`--target` is a flag of `hive build` and `hive export`. `{command}` builds nothing for another platform.")
@@ -223,18 +226,36 @@ proc installProgram(entry: Str, flags: Str[], from: Int): void {
     if asked.error != "" {
         refuse(asked.error)
     }
+    if asked.target != "" {
+        installApp(entry, asked.target, from)
+        return
+    }
     written := project.compile(entry, "", from)
     if len(written.errors) > 0 {
         complain(written.errors)
         return
     }
     // The build writes the program beside its entrypoint, under this name.
-    placed := install.place(paths.joinPath(paths.dirOf(entry), project.executableOf(entry, "")), asked.name)
+    built := paths.joinPath(paths.dirOf(entry), project.executableOf(entry, ""))
+    if asked.desktop && written.windowed == false {
+        hive.file.delete(built)
+        refuse("`{paths.baseOf(entry)}` opens no window, so a launcher would start it with nowhere to show anything. `hive install` without `--desktop` puts it where a shell finds it.")
+    }
+    placed := install.place(built, asked.name)
     if placed is Result.Error(why) {
         refuse(why)
     }
     if placed is Result.Ok(done) {
         echo "Installed {entry} -> " + done.path + " (" + progress.took(progress.since(from)) + ")"
+        if asked.desktop {
+            launched := install.toLauncher(done.path, icon.iconOf(entry))
+            if launched is Result.Error(why) {
+                refuse(why)
+            }
+            if launched is Result.Ok(path) {
+                echo "Added it to the launcher -> " + path
+            }
+        }
         for each line in done.notes {
             echo line
         }
@@ -244,6 +265,23 @@ proc installProgram(entry: Str, flags: Str[], from: Int): void {
             refuse(done.failed)
         }
     }
+}
+
+// Packaged as `export` packages it, then installed on the phone `adb` reaches.
+proc installApp(entry: Str, target: Str, from: Int): void {
+    written := project.export(entry, target, from)
+    if len(written.errors) > 0 {
+        complain(written.errors)
+        return
+    }
+    apk := paths.joinPath(paths.dirOf(entry), project.apkOf(entry, target))
+    progress.step(from, "adb install")
+    sent := install.onPhone(apk)
+    hive.file.delete(apk)
+    if sent is Result.Error(why) {
+        refuse(why)
+    }
+    echo "Installed {entry} on the phone (" + progress.took(progress.since(from)) + ")"
 }
 
 // Named `suite` rather than `test`, because `test` is a keyword.
@@ -542,8 +580,10 @@ proc usage(): void {
     echo "  hive version                           Print which release this compiler is"
     echo ""
     echo "Flags:"
-    echo "  --target <goos>/<goarch>               Build for another platform, on `build` and"
-    echo "                                         `export` alone. `go tool dist list` names"
-    echo "                                         every one; `export` takes android/arm64."
+    echo "  --target <goos>/<goarch>               Build for another platform, on `build`, `export`"
+    echo "                                         and `install`. `go tool dist list` names every"
+    echo "                                         one; `export` and `install` take android/arm64,"
+    echo "                                         which `install` puts on a phone over USB."
     echo "  --name <name>                          What `install` puts the program in as."
+    echo "  --desktop                              Have `install` add it to the app launcher too."
 }

@@ -1,9 +1,10 @@
 // Installing a program
 // ====================
-// `hive install <entrypoint.hive> [--name <name>]`: the program built, and put in
-// the folder of the user's own that a shell finds commands in — `~/.local/bin`, or
-// on Windows `%LOCALAPPDATA%\Programs\Hive\bin`, put on the user's PATH the first
-// time.
+// `hive install <entrypoint.hive> [--name <name>] [--desktop]`: the program built, and
+// put in the folder of the user's own that a shell finds commands in — `~/.local/bin`,
+// or on Windows `%LOCALAPPDATA%\Programs\Hive\bin`, put on the user's PATH the first
+// time. `--desktop` adds it to the system's app launcher too, and
+// `--target android/arm64` installs it as an app on a phone over USB instead.
 import ./host.go
 import ./paths
 import ./text
@@ -14,12 +15,20 @@ import hive.term
 // program's own, or why it cannot be used.
 type Asked {
     name: Str
+    desktop: Bool
+    target: Str
     error: Str
 }
 
 // The flags `hive install` takes, as `hive.term.codec()` reads them.
 type Flags {
     name: Str -- Default as "";
+    desktop: Bool -- Default as false;
+    target: Str -- Default as "";
+}
+
+func refused(why: Str): Asked {
+    return Asked("", false, "", why)
 }
 
 // Where the program went, and anything the user has to do before it can be run
@@ -38,34 +47,51 @@ func askedFor(words: Str[], line: Str): Asked {
     mut before := ""
     for each word in words {
         key := at(split(word, "="), 0)
-        if key == "--target" {
-            return Asked("", "`hive install` builds for this machine, which is where it installs. `--target` belongs to `hive build`.")
-        }
         if word == "--name=" {
-            return Asked("", noName())
+            return refused(noName())
         }
-        if key != "--name" && (text.startsWith(word, "-") || before != "--name") {
-            return Asked("", "`" + word + "` is not something `hive install` takes. The one flag here is `--name <name>`.")
+        if word == "--target=" {
+            return refused(noTarget())
+        }
+        valued := before == "--name" || before == "--target"
+        if key != "--name" && key != "--target" && key != "--desktop" && (text.startsWith(word, "-") || valued == false) {
+            return refused("`" + word + "` is not something `hive install` takes. Its flags are `--name <name>`, `--desktop` and `--target android/arm64`.")
         }
         before = word
     }
     read := Flags.decode(line, hive.term.codec())
     if read is Result.Error(why) {
         if why.path == "--name" && why.found == "the flag alone" {
-            return Asked("", noName())
+            return refused(noName())
         }
-        return Asked("", "`{why.path}` wants {why.expected}, and was given {why.found}.")
+        if why.path == "--target" && why.found == "the flag alone" {
+            return refused(noTarget())
+        }
+        return refused("`{why.path}` wants {why.expected}, and was given {why.found}.")
     }
     if read is Result.Ok(flags) {
+        if flags.target != "" && flags.target != "android/arm64" {
+            return refused("`hive install` builds for this machine, which is where it installs, or for a phone with `--target android/arm64`. `hive build --target {flags.target}` compiles for another platform.")
+        }
+        if flags.target != "" && flags.desktop {
+            return refused("`--desktop` puts the program in this machine's launcher. An app installed on a phone is in the phone's already.")
+        }
+        if flags.target != "" && flags.name != "" {
+            return refused("`--name` is what the program is run as on this machine. An app on a phone is named after its entrypoint.")
+        }
         if flags.name != "" {
-            wrong := nameRefusal(flags.name)
+            wrong := nameRefusal(flags.name, flags.desktop)
             if wrong != "" {
-                return Asked("", wrong)
+                return refused(wrong)
             }
         }
-        return Asked(flags.name, "")
+        return Asked(flags.name, flags.desktop, flags.target, "")
     }
-    return Asked("", "`hive install` could not read what followed the entrypoint.")
+    return refused("`hive install` could not read what followed the entrypoint.")
+}
+
+func noTarget(): Str {
+    return "`--target` was given no platform. `hive install` takes `--target android/arm64`, which installs the program on a phone connected over USB."
 }
 
 func noName(): Str {
@@ -80,10 +106,11 @@ func at(parts: Str[], index: Int): Str {
 }
 
 
-// Why `name` cannot be what a program is installed as, or `""`. A name is typed at
-// a prompt and is a file on every platform, so it takes no folder, nothing a
-// shell would split it at, and nothing Windows refuses in a file's name.
-func nameRefusal(name: Str): Str {
+// Why `name` cannot be what a program is installed as, or `""`. A name is a file on
+// every platform, so it takes no folder and nothing Windows refuses in a file's
+// name; one typed at a prompt takes nothing a shell would split it at, and one
+// started from a launcher may hold a space between words.
+func nameRefusal(name: Str, launched: Bool): Str {
     if name == "." || name == ".." {
         return "`--name {name}` names a folder, not a program."
     }
@@ -94,12 +121,18 @@ func nameRefusal(name: Str): Str {
         if c == "/" || c == "\\" {
             return "`--name {name}` is a path. It takes a name alone — the folder is always the same one."
         }
+        if launched && c == " " {
+            continue
+        }
         if text.isSpace(c) {
-            return "`--name {name}` has a space in it, and a shell would read it as two words."
+            return "`--name {name}` has a space in it, and a shell would read it as two words. With `--desktop` it may have one."
         }
         if text.isOneOf(c, "<>:\"|?*") {
             return "`--name {name}` holds `{c}`, which Windows refuses in a file's name."
         }
+    }
+    if text.trim(name) != name {
+        return "`--name {name}` starts or ends with a space, which Windows drops from a file's name."
     }
     if text.endsWith(name, ".") {
         return "`--name {name}` ends in `.`, which Windows drops from a file's name."
@@ -154,4 +187,30 @@ proc place(built: Str, name: Str): Result<Placed, Str> {
         }
     }
     return Result.Error("could not tell where to install it")
+}
+
+proc toLauncher(binary: Str, icon: Str): Result<Str, Str> {
+    made := host.launcher(binary, icon)
+    if made is Result.Error(why) {
+        return Result.Error("could not add it to the launcher: " + why)
+    }
+    return made
+}
+
+// The app installed on the phone `adb` reaches, over any earlier one signed alike.
+proc onPhone(apk: Str): Result<Bool, Str> {
+    said := hive.term.exec("adb", ["install", "-r", apk], "")
+    if said is Result.Error(why) {
+        if why.code < 0 {
+            return Result.Error("installing on a phone needs `adb`, and it is not on the PATH. It comes with Android's platform tools: https://developer.android.com/tools/releases/platform-tools")
+        }
+        if text.contains(why.output, "no devices") {
+            return Result.Error("`adb` sees no phone. Connect one over USB with USB debugging on in its developer options, and allow this computer when it asks.")
+        }
+        if text.contains(why.output, "INSTALL_FAILED_USER_RESTRICTED") {
+            return Result.Error("the phone refused the install. Allow installing over USB in its developer options (on Xiaomi, \"Install via USB\") and accept the prompt it shows.")
+        }
+        return Result.Error("`adb` could not install it. It said:\n\n" + text.trim(why.output))
+    }
+    return Result.Ok(true)
 }

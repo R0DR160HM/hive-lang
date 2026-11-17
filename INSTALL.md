@@ -76,6 +76,15 @@ it runs by name: `~/.local/bin` on Linux and macOS, and on Windows
 `%LOCALAPPDATA%\Programs\Hive\bin`, which it puts on your `PATH` the first time.
 `--name notes` installs it as `notes` instead.
 
+`--desktop` also puts a program that opens a window in your app launcher, with
+`assets/icon.png` as its icon: a `.desktop` entry on Linux, an app in
+`~/Applications` on macOS, a Start Menu shortcut on Windows.
+
+`--target android/arm64` packages it as `hive export` would and installs it on a
+phone connected over USB, through `adb` from Android's
+[platform tools](https://developer.android.com/tools/releases/platform-tools).
+The phone needs USB debugging on in its developer options.
+
 ## In an editor
 
 `hive lsp` is a language server: errors as you type, what a name is, where it was
