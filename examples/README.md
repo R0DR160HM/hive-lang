@@ -40,7 +40,7 @@ hive test examples/15-testing/cart.test.hive
 | 24 | [streaming-answer](24-streaming-answer) | a language model's answer read as it arrives, and a looping one stopped by hanging up |
 | 25 | [programs-alongside](25-programs-alongside) | a program started, talked to, and stopped with everything it started — the program being itself |
 | 26 | [pictures](26-pictures) | Hive's logo read from inside the executable, decoded, scaled and drawn in characters |
-| 27 | [laws](27-laws) | a `law` of each kind: a cancelled booking stays cancelled, proved for every booking and event while the program compiles; every booking names a guest and a room, kept wherever one is made or changed; and a guest reads only their own bookings, in every query on the table |
+| 27 | [laws](27-laws) | a chat app with a `law` of each kind: a read message never goes back, proved for every message and receipt while the program compiles; every message has a body and goes to someone else, kept wherever one is written; and a contact reads only their own chats, in every query on the table |
 
 ## What `./run` does with them
 
