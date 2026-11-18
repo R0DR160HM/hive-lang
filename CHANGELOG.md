@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.0
+
+### Fixes
+
+* **An assignment never lets a write through one name reach another**: `rec.f = xs` copies an immutable `xs`, as a binding does.
+
 ## v0.3.9
 
 ### Tooling

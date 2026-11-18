@@ -1070,7 +1070,7 @@ proc assignment(em: mut Emit, env: infer.Env, target: ast.Expr, value: ast.Expr)
     ty := infer.typeOf(env, target)
     if target is ast.Expr.Ident(name, _) {
         if isCell(em, name) {
-            return goIdent(name) + " = " + inCell(em, ty, expr(em, env, value, ty))
+            return goIdent(name) + " = " + inCell(em, ty, stored(em, env, target, value, ty))
         }
     }
     if target is ast.Expr.Index(subject, index, _) {
@@ -1081,9 +1081,34 @@ proc assignment(em: mut Emit, env: infer.Env, target: ast.Expr, value: ast.Expr)
     if handsBack(env, em.handsBack, em.mutables, em.cells, target, value) {
         em.handing = pathOf(target)
     }
-    written := expr(em, env, target, types.Ty.TUnknown()) + " = " + expr(em, env, value, ty)
+    written := expr(em, env, target, types.Ty.TUnknown()) + " = " + stored(em, env, target, value, ty)
     em.handing = ""
     return written
+}
+
+proc stored(em: mut Emit, env: infer.Env, target: ast.Expr, value: ast.Expr, ty: types.Ty): Str {
+    written := expr(em, env, value, ty)
+    if assignCopies(env, em.written, em.mutables, target, value, ty) {
+        return cloned(env.table, ty, written)
+    }
+    return written
+}
+
+// A target is always `mut`, so an immutable source copies as in 8.4, bar a field no write reaches.
+func assignCopies(env: infer.Env, written: Str[], mutables: Str[], target: ast.Expr, value: ast.Expr, ty: types.Ty): Bool {
+    if namesStorage(value) == false || types.ownsStorage(env.table, ty) == false {
+        return false
+    }
+    root := rootOf(value)
+    if root != "" && indexOf(mutables, root) is Result.Ok(_) {
+        return false
+    }
+    if target is ast.Expr.Member(subject, field, _) {
+        if infer.typeOf(env, subject) is types.Ty.TNamed(owner) {
+            return writes.mustCopy(env.table, written, owner, field, ty)
+        }
+    }
+    return true
 }
 
 proc emitFor(em: mut Emit, env: infer.Env, init: ast.Stmt, cond: ast.Expr, post: ast.Stmt, body: ast.Block, result: types.Ty): void {
