@@ -90,8 +90,9 @@ proc expand(m: ast.Module, from: Int): Expanded {
     }
 
     // Everything the concrete declarations asked for, and everything those copies
-    // ask for in turn.
-    for ; mo.done < len(mo.wantedNames); {
+    // ask for in turn — and then a generic law's copies, at every set of types the
+    // program uses what it calls at, until nothing new is asked for.
+    for ; mo.done < len(mo.wantedNames) || lawCopies(mo, env, m.decls); {
         at := mo.done
         mo.done = mo.done + 1
         if at % 100 == 0 && at > 0 {
@@ -107,6 +108,204 @@ proc expand(m: ast.Module, from: Int): Expanded {
         }
     }
     return Expanded(ast.Module([], out, m.foreign, m.library), mo.errors)
+}
+
+// A generic law is never called, so nothing asks for a copy of it. It is copied at
+// every set of types the program copies a generic callable it calls at, read off
+// what the law hands that callable — and a law nothing instantiates that way is
+// not copied at all. Whether that asked for anything new.
+proc lawCopies(mo: mut Mono, env: infer.Env, decls: ast.Decl[]): Bool {
+    before := len(mo.wantedNames)
+    for each d in decls {
+        if d is ast.Decl.CallableDecl(kind, name, params, _, body, _) {
+            if kind is ast.CallableKind.LawKind && isGeneric(mo.generics, name) {
+                if types.findCallable(env.table, name) is Result.Ok(info) {
+                    variables := variablesOf(env.table, info.parameters)
+                    scope := infer.boundParams(env, params, 0)
+                    for each call in callsIn(body.stmts) {
+                        for each args in lawArguments(mo, env, scope, call, variables) {
+                            _ := wanted(mo, name, args)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return len(mo.wantedNames) > before
+}
+
+// The law's type arguments each copy of the callable `call` reaches would pin
+// down, where they pin every one.
+proc lawArguments(mo: mut Mono, env: infer.Env, scope: infer.Env, call: ast.Expr, variables: Str[]): ArgList[dyn] {
+    mut ArgList[dyn] out = []
+    if call is ast.Expr.Call(callee, callArgs, _) {
+        if callee is ast.Expr.Ident(called, _) {
+            if isGeneric(mo.generics, called) {
+                if types.findCallable(env.table, called) is Result.Ok(info) {
+                    calledVariables := variablesOf(env.table, info.parameters)
+                    mut k := 0
+                    for each wantedName in mo.wantedNames {
+                        if wantedName == called && mo.wantedArgs bounds k {
+                            copyArgs := mo.wantedArgs[k]
+                            mut ast.TypeExpr[dyn] found = []
+                            for each v in variables {
+                                pinned := pinnedBy(mo, scope, info.params, callArgs, calledVariables, copyArgs, v)
+                                if pinned is Result.Ok(t) {
+                                    append(found, t)
+                                }
+                            }
+                            if len(found) == len(variables) {
+                                append(out, ArgList(found))
+                            }
+                        }
+                        k = k + 1
+                    }
+                }
+            }
+        }
+    }
+    return out
+}
+
+// What the law's `variable` stands for, where the law hands a parameter something
+// whose type mentions it and the copy says what that parameter's type is.
+proc pinnedBy(mo: mut Mono, scope: infer.Env, params: ast.Param[], callArgs: ast.Arg[], calledVariables: Str[], copyArgs: ArgList, variable: Str): Result<ast.TypeExpr, Bool> {
+    mut open := 0
+    for each p in params {
+        given := ast.argFor(callArgs, p.name, open)
+        if ast.claimedByName(callArgs, p.name) == false {
+            open = open + 1
+        }
+        if (given is ast.Expr.Absent) == false && (given is ast.Expr.Hole) == false {
+            passed := infer.typeOf(scope, given)
+            concrete := types.resolve(scope.table, substituteVars(p.declared, calledVariables, copyArgs))
+            found := boundIn(passed, concrete, variable)
+            if found is Result.Ok(_) {
+                return found
+            }
+        }
+    }
+    return Result.Error(false)
+}
+
+// `passed`, a type with the law's variables in it, laid over `concrete`: what
+// `variable` stands for where they line up.
+func boundIn(passed: types.Ty, concrete: types.Ty, variable: Str): Result<ast.TypeExpr, Bool> {
+    if passed is types.Ty.TVar(name) {
+        if name == variable && (concrete is types.Ty.TUnknown) == false && (concrete is types.Ty.TVar(_)) == false {
+            return Result.Ok(types.toWritten(concrete))
+        }
+        return Result.Error(false)
+    }
+    if passed is types.Ty.TVec(element, _) && concrete is types.Ty.TVec(other, _) {
+        return boundIn(element, other, variable)
+    }
+    if passed is types.Ty.TResult(ok, bad) && concrete is types.Ty.TResult(ok2, bad2) {
+        if boundIn(ok, ok2, variable) is Result.Ok(t) {
+            return Result.Ok(t)
+        }
+        return boundIn(bad, bad2, variable)
+    }
+    if passed is types.Ty.TMap(k, v) && concrete is types.Ty.TMap(k2, v2) {
+        if boundIn(k, k2, variable) is Result.Ok(t) {
+            return Result.Ok(t)
+        }
+        return boundIn(v, v2, variable)
+    }
+    return Result.Error(false)
+}
+
+// Every call a block makes, at any depth.
+func callsIn(stmts: ast.Stmt[]): ast.Expr[dyn] {
+    mut ast.Expr[dyn] out = []
+    for each s in stmts {
+        for each e in stmtExprs(s) {
+            for each c in callsOf(e) {
+                append(out, c)
+            }
+        }
+        for each b in stmtBlocks(s) {
+            for each c in callsIn(b.stmts) {
+                append(out, c)
+            }
+        }
+    }
+    return out
+}
+
+func callsOf(e: ast.Expr): ast.Expr[dyn] {
+    mut ast.Expr[dyn] out = []
+    if e is ast.Expr.Call(callee, args, _) {
+        append(out, e)
+        for each c in callsOf(callee) {
+            append(out, c)
+        }
+        for each a in args {
+            for each c in callsOf(a.value) {
+                append(out, c)
+            }
+        }
+    } else if e is ast.Expr.Binary(_, l, r, _) {
+        return callsOf(l) + callsOf(r)
+    } else if e is ast.Expr.Not(x, _) {
+        return callsOf(x)
+    } else if e is ast.Expr.Negate(x, _) {
+        return callsOf(x)
+    } else if e is ast.Expr.Member(x, _, _) {
+        return callsOf(x)
+    } else if e is ast.Expr.Index(x, i, _) {
+        return callsOf(x) + callsOf(i)
+    } else if e is ast.Expr.IsMatch(x, _, _) {
+        return callsOf(x)
+    } else if e is ast.Expr.VectorLit(items, _) {
+        for each item in items {
+            for each c in callsOf(item) {
+                append(out, c)
+            }
+        }
+    }
+    return out
+}
+
+func stmtExprs(s: ast.Stmt): ast.Expr[dyn] {
+    mut ast.Expr[dyn] out = []
+    if s is ast.Stmt.VarDecl(_, value, _, _, _) {
+        append(out, value)
+    } else if s is ast.Stmt.TypedDecl(_, _, value, _, _, _) {
+        append(out, value)
+    } else if s is ast.Stmt.Assign(_, value, _) {
+        append(out, value)
+    } else if s is ast.Stmt.IfChain(branches, _, _, _) {
+        for each b in branches {
+            append(out, b.condition)
+        }
+    } else if s is ast.Stmt.ForEach(_, _, subject, _, _) {
+        append(out, subject)
+    } else if s is ast.Stmt.ReturnStmt(value, _) {
+        append(out, value)
+    } else if s is ast.Stmt.AssertStmt(value, _) {
+        append(out, value)
+    } else if s is ast.Stmt.Expression(value, _) {
+        append(out, value)
+    }
+    return out
+}
+
+func stmtBlocks(s: ast.Stmt): ast.Block[dyn] {
+    mut ast.Block[dyn] out = []
+    if s is ast.Stmt.IfChain(branches, otherwise, _, _) {
+        for each b in branches {
+            append(out, b.body)
+        }
+        append(out, otherwise)
+    } else if s is ast.Stmt.SwitchStmt(lets, _, arms, _, _) {
+        append(out, ast.switchBlock(lets, arms))
+    } else if s is ast.Stmt.ForLoop(_, _, _, body, _) {
+        append(out, body)
+    } else if s is ast.Stmt.ForEach(_, _, _, body, _) {
+        append(out, body)
+    }
+    return out
 }
 
 // A declaration is generic when its signature mentions a name that is neither a

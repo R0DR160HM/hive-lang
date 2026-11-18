@@ -285,7 +285,22 @@ anything calls — and for the same reason it takes no parameters and returns
 nothing. `return value` inside one is a compile error; a bare `return` to leave
 early is fine. Its body is an ordinary `proc` body. See [16](16-testing.md).
 
-## 4.7 Nothing about a declaration says how it runs
+## 4.7 `law`
+
+```hive
+law cancelledIsFinal(booking: Booking, event: Event) {
+	if booking.status is Status.Cancelled {
+		assert apply(booking, event).status == booking.status
+	}
+}
+```
+
+A law is a claim the compiler proves for every value its parameters can take; one
+it cannot prove is a compile error. It has no return type and no `mut`
+parameter, only another law may call it, and it is never emitted. See
+[19](19-laws.md).
+
+## 4.8 Nothing about a declaration says how it runs
 
 **Every call blocks its caller.** There is no `async func`, no Future and no
 Promise type to name; what a call means is decided where it is written

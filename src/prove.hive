@@ -1,0 +1,3415 @@
+// The prover
+// ==========
+// Runs what a law reaches on values that may be unknown. A law's parameters start
+// as unknowns; looking inside one splits the run into a path per thing it could
+// be — a union per variant, a vector into empty or first-and-rest — and a condition
+// nothing settles splits it into the path where it holds and the one where it does
+// not. Every path keeps what it has learned, and every `assert` it reaches is
+// decided from that (`solve`).
+//
+// The same runs, handed values instead of unknowns, are how counterexamples are
+// found and how a law over a small type is checked against every value of it.
+//
+// Anything this cannot follow ends its path as lost, with the reason, and a lost
+// path proves nothing: a law is proved only when every path came to an end the
+// prover understood.
+import ./ast
+import ./infer
+import ./solve
+import ./terms
+import ./text
+import ./token
+import ./types
+import hive.map
+
+type Info {
+    ty: types.Ty
+    label: Str
+}
+
+type End {
+    Running
+    Returned { value: terms.Term }
+    Broke
+    Continued
+    // The prover cannot follow the program past here.
+    Lost { why: Str, at: token.Pos }
+}
+
+// The callable a path is inside, and what it was called with.
+type Frame {
+    callable: Str
+    args: terms.Term[dyn]
+}
+
+type Path {
+    env: hive.map.Map<Str, terms.Term>
+    facts: terms.Term[dyn]
+    // What a case split decided an unknown is, by `u<id>`.
+    shapes: hive.map.Map<Str, terms.Term>
+    lemmas: solve.Lemma[dyn]
+    ended: End
+    // The case splits taken, in words, for a message.
+    cases: Str[dyn]
+    frame: Frame
+    depth: Int
+    // The names bound `mut` on this path, which a `mut x := y` shares rather than copies.
+    muts: Str[dyn]
+}
+
+type Out {
+    path: Path
+    value: terms.Term
+}
+
+type Outs {
+    path: Path
+    values: terms.Term[dyn]
+}
+
+type Problem {
+    at: token.Pos
+    message: Str
+    // Shown false, rather than only not shown true.
+    refuted: Bool
+    // Not a question of truth: the prover could not follow the program.
+    lost: Bool
+}
+
+// What every run reads and nothing writes.
+type Context {
+    callables: hive.map.Map<Str, ast.Decl>
+    // A callable whose body opens with `for each x in p`, `p` a parameter the rest
+    // of the body never names again: such a loop over a vector's rest is the same
+    // callable called on that rest. By name, the parameter's position and the
+    // loop's place.
+    loopParam: hive.map.Map<Str, Int>
+    loopAt: hive.map.Map<Str, Str>
+    // The callables that hold, or reach, an `assert` or a `panic`: leaving a call to
+    // one unopened would leave whether it fails unasked.
+    mayFail: hive.map.Map<Str, Bool>
+    // The callables that call themselves.
+    recursive: hive.map.Map<Str, Bool>
+    base: infer.Env
+}
+
+type Prover {
+    infos: Info[dyn]
+    parts: hive.map.Map<Str, Int>
+    steps: Int
+    budget: Int
+    // Whether an `assert` reached is a claim to prove, or — while another law is
+    // assumed — a conclusion to remember.
+    claiming: Bool
+    problems: Problem[dyn]
+    proved: Int
+    // What the values are, written out, while a law runs on values rather than
+    // unknowns; `""` otherwise.
+    witness: Str
+    // The unknowns a law has called itself on: a recursive callable handed one is
+    // left unopened, so it is the same term the induction says something about.
+    frontier: Str[dyn]
+    // While a law is assumed: the path's facts and shapes when it started, and
+    // what it concluded since.
+    baseFacts: Int
+    baseShapes: Str[dyn]
+    concluded: solve.Lemma[dyn]
+}
+
+func unfoldLimit(): Int {
+    return 3
+}
+
+func depthLimit(): Int {
+    return 48
+}
+
+proc newContext(m: ast.Module, t: types.Table): Context {
+    mut hive.map.Map<Str, ast.Decl> callables = hive.map.new()
+    mut hive.map.Map<Str, Int> loopParam = hive.map.new()
+    mut hive.map.Map<Str, Str> loopAt = hive.map.new()
+    mut Str[dyn] lenders = []
+    for each d in m.decls {
+        if d is ast.Decl.CallableDecl(_, name, params, _, _, _) {
+            for each p in params {
+                if p.mutable {
+                    append(lenders, name)
+                    break
+                }
+            }
+        }
+    }
+    for each d in m.decls {
+        if d is ast.Decl.CallableDecl(_, name, params, _, body, _) {
+            hive.map.set(callables, name, d)
+            if tailLoop(params, body, lenders) is Result.Ok(found) {
+                hive.map.set(loopParam, name, found)
+                for each s in body.stmts {
+                    hive.map.set(loopAt, name, place(s.at))
+                    break
+                }
+            }
+        }
+    }
+    mut hive.map.Map<Str, Bool> recursive = hive.map.new()
+    for each d in m.decls {
+        if d is ast.Decl.CallableDecl(kind, name, _, _, body, _) {
+            if (kind is ast.CallableKind.LawKind) == false && indexOf(namesInStmts(body.stmts), name) is Result.Ok(_) {
+                hive.map.set(recursive, name, true)
+            }
+        }
+    }
+    return Context(callables, loopParam, loopAt, failing(m), recursive, infer.newEnv(t))
+}
+
+// Every callable with an `assert` or a `panic` in it, or a call to one that has.
+func failing(m: ast.Module): hive.map.Map<Str, Bool> {
+    mut hive.map.Map<Str, Bool> out = hive.map.new()
+    mut hive.map.Map<Str, Str[dyn]> callees = hive.map.new()
+    for each d in m.decls {
+        if d is ast.Decl.CallableDecl(_, name, _, _, body, _) {
+            if mayStop(body.stmts) {
+                hive.map.set(out, name, true)
+            }
+            hive.map.set(callees, name, namesInStmts(body.stmts))
+        }
+    }
+    for round := 0; round < len(m.decls) + 1; round++ {
+        mut grew := false
+        for each name in hive.map.keys(callees) {
+            if hive.map.has(out, name) == false {
+                if hive.map.get(callees, name) is Result.Ok(called) {
+                    for each c in called {
+                        if hive.map.has(out, c) {
+                            hive.map.set(out, name, true)
+                            grew = true
+                            break
+                        }
+                    }
+                }
+            }
+        }
+        if grew == false {
+            return out
+        }
+    }
+    return out
+}
+
+// Whether a block holds an `assert` or a `panic`, at any depth.
+func mayStop(stmts: ast.Stmt[]): Bool {
+    for each st in stmts {
+        if st is ast.Stmt.AssertStmt(_, _) || st is ast.Stmt.PanicStmt(_, _) {
+            return true
+        }
+        for each b in blocksOfStmt(st) {
+            if mayStop(b.stmts) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// Whether a block, or anything it calls, could stop with an `assert` or a `panic`.
+func blockMayFail(cx: Context, stmts: ast.Stmt[]): Bool {
+    if mayStop(stmts) {
+        return true
+    }
+    for each n in namesInStmts(stmts) {
+        if hive.map.has(cx.mayFail, n) {
+            return true
+        }
+    }
+    return false
+}
+
+proc newProver(budget: Int): Prover {
+    mut hive.map.Map<Str, Int> parts = hive.map.new()
+    return Prover([], parts, 0, budget, true, [], 0, "", [], 0, [], [])
+}
+
+func place(at: token.Pos): Str {
+    return "{at.line}:{at.col}"
+}
+
+// --- Unknowns -------------------------------------------------------------------
+
+proc fresh(pr: mut Prover, ty: types.Ty, label: Str): terms.Term {
+    id := len(pr.infos)
+    append(pr.infos, Info(ty, label))
+    return terms.Term.Unknown(id, ty)
+}
+
+// The one unknown standing for a part of another, the same every time it is asked
+// for — so a fact about `booking.status` on one path is about the same thing on
+// every path.
+proc part(pr: mut Prover, k: Str, ty: types.Ty, label: Str): terms.Term {
+    if hive.map.get(pr.parts, k) is Result.Ok(id) {
+        return terms.Term.Unknown(id, ty)
+    }
+    t := fresh(pr, ty, label)
+    if t is terms.Term.Unknown(id, _) {
+        hive.map.set(pr.parts, k, id)
+    }
+    return t
+}
+
+proc labelOf(pr: mut Prover, id: Int): Str {
+    if pr.infos bounds id {
+        return pr.infos[id].label
+    }
+    return "u{id}"
+}
+
+// --- Paths ----------------------------------------------------------------------
+
+func running(p: Path): Bool {
+    return p.ended is End.Running
+}
+
+func lost(p: Path, why: Str, at: token.Pos): Path {
+    mut Path q = p
+    q.ended = End.Lost(why, at)
+    return q
+}
+
+func ended(p: Path, how: End): Path {
+    mut Path q = p
+    q.ended = how
+    return q
+}
+
+func withValue(p: Path, name: Str, value: terms.Term): Path {
+    mut Path q = p
+    hive.map.set(q.env, name, value)
+    return q
+}
+
+func withShape(p: Path, id: Int, shape: terms.Term, said: Str): Path {
+    mut Path q = p
+    hive.map.set(q.shapes, "u{id}", shape)
+    if said != "" {
+        append(q.cases, said)
+    }
+    return q
+}
+
+func withMut(p: Path, name: Str): Path {
+    mut Path q = p
+    append(q.muts, name)
+    return q
+}
+
+func lostOut(p: Path, why: Str, at: token.Pos): Out[dyn] {
+    return [Out(lost(p, why, at), terms.Term.VoidK())]
+}
+
+func one(p: Path, value: terms.Term): Out[dyn] {
+    return [Out(p, value)]
+}
+
+// --- Normal forms ---------------------------------------------------------------
+
+// `t` with every unknown a case split has decided replaced by what it was decided
+// to be, and every operation that can now be worked out worked out.
+func norm(t: types.Table, shapes: hive.map.Map<Str, terms.Term>, term: terms.Term): terms.Term {
+    if term is terms.Term.Unknown(id, _) {
+        if hive.map.get(shapes, "u{id}") is Result.Ok(s) {
+            return norm(t, shapes, s)
+        }
+        return term
+    } else if term is terms.Term.Op(name, args, ty) {
+        return rebuild(t, name, normAll(t, shapes, args), ty)
+    } else if term is terms.Term.VecK(items) {
+        return terms.Term.VecK(normAll(t, shapes, items))
+    } else if term is terms.Term.VecS(known, rest) {
+        return vecJoin(normAll(t, shapes, known), norm(t, shapes, rest))
+    } else if term is terms.Term.RecK(typeName, variant, fields) {
+        return terms.Term.RecK(typeName, variant, normAll(t, shapes, fields))
+    } else if term is terms.Term.OkK(payload) {
+        return terms.Term.OkK(norm(t, shapes, payload))
+    } else if term is terms.Term.ErrK(payload) {
+        return terms.Term.ErrK(norm(t, shapes, payload))
+    } else if term is terms.Term.FnK(name, args) {
+        return terms.Term.FnK(name, normAll(t, shapes, args))
+    }
+    return term
+}
+
+func normAll(t: types.Table, shapes: hive.map.Map<Str, terms.Term>, ts: terms.Term[]): terms.Term[dyn] {
+    mut terms.Term[dyn] out = []
+    for each one in ts {
+        append(out, norm(t, shapes, one))
+    }
+    return out
+}
+
+func normIn(cx: Context, p: Path, term: terms.Term): terms.Term {
+    return norm(cx.base.table, p.shapes, term)
+}
+
+func normFacts(cx: Context, p: Path): terms.Term[dyn] {
+    return normAll(cx.base.table, p.shapes, p.facts)
+}
+
+func normLemmas(cx: Context, p: Path): solve.Lemma[dyn] {
+    mut solve.Lemma[dyn] out = []
+    for each l in p.lemmas {
+        append(out, solve.Lemma(normAll(cx.base.table, p.shapes, l.guards), norm(cx.base.table, p.shapes, l.conclusion)))
+    }
+    return out
+}
+
+// A known front and a rest, as one vector term.
+func vecJoin(known: terms.Term[], rest: terms.Term): terms.Term {
+    if rest is terms.Term.VecK(items) {
+        return terms.Term.VecK(known + items)
+    }
+    if rest is terms.Term.VecS(more, tail) {
+        return terms.Term.VecS(known + more, tail)
+    }
+    if len(known) == 0 {
+        return rest
+    }
+    mut terms.Term[dyn] front = []
+    for each k in known {
+        append(front, k)
+    }
+    return terms.Term.VecS(front, rest)
+}
+
+// An operation over terms that may since have become known, worked out as far as
+// they allow.
+func rebuild(t: types.Table, name: Str, args: terms.Term[], ty: types.Ty): terms.Term {
+    a := terms.nth(args, 0)
+    b := terms.nth(args, 1)
+    if name == "add" || name == "sub" || name == "mul" || name == "div" || name == "mod" || name == "pow" {
+        return arith(name, a, b)
+    } else if name == "neg" {
+        return negate(a)
+    } else if name == "eq" {
+        return equal(a, b)
+    } else if name == "lt" || name == "le" {
+        return order(name, a, b)
+    } else if name == "not" {
+        return terms.negation(a)
+    } else if name == "and" {
+        return terms.both(a, b)
+    } else if name == "or" {
+        return terms.either(a, b)
+    } else if name == "len" {
+        return lengthOf(a)
+    } else if name == "cat" {
+        return concat(a, b, ty)
+    } else if name == "elem" {
+        return element(a, b, ty)
+    } else if name == "nil" || name == "cons" {
+        return shapeTest(name, a)
+    } else if text.startsWith(name, "is:") {
+        return variantTest(after(name, 3), a)
+    } else if text.startsWith(name, "field:") {
+        return fieldOf(t, a, after(name, 6), ty)
+    }
+    return terms.op(name, args, ty)
+}
+
+func after(s: Str, from: Int): Str {
+    cs := text.chars(s)
+    return text.span(cs, from, len(cs) - 1)
+}
+
+func arith(name: Str, a: terms.Term, b: terms.Term): terms.Term {
+    if a is terms.Term.IntK(x) && b is terms.Term.IntK(y) {
+        if name == "add" {
+            return terms.Term.IntK(x + y)
+        } else if name == "sub" {
+            return terms.Term.IntK(x - y)
+        } else if name == "mul" {
+            return terms.Term.IntK(x * y)
+        } else if name == "div" {
+            return terms.Term.IntK(x / y)
+        } else if name == "mod" {
+            return terms.Term.IntK(x % y)
+        }
+        return terms.Term.IntK(x ** y)
+    }
+    if name == "add" {
+        if isInt(a, 0) {
+            return b
+        }
+        if isInt(b, 0) {
+            return a
+        }
+        return terms.op("add", terms.ordered(a, b), terms.integer())
+    }
+    if name == "sub" {
+        if isInt(b, 0) {
+            return a
+        }
+        if terms.key(a) == terms.key(b) {
+            return terms.Term.IntK(0)
+        }
+    }
+    if name == "mul" {
+        if isInt(a, 0) || isInt(b, 0) {
+            return terms.Term.IntK(0)
+        }
+        if isInt(a, 1) {
+            return b
+        }
+        if isInt(b, 1) {
+            return a
+        }
+        return terms.op("mul", terms.ordered(a, b), terms.integer())
+    }
+    return terms.op(name, [a, b], terms.integer())
+}
+
+func isInt(t: terms.Term, value: Int): Bool {
+    if t is terms.Term.IntK(v) {
+        return v == value
+    }
+    return false
+}
+
+func negate(a: terms.Term): terms.Term {
+    if a is terms.Term.IntK(x) {
+        return terms.Term.IntK(0 - x)
+    }
+    if a is terms.Term.Op(name, args, _) {
+        if name == "neg" {
+            return terms.nth(args, 0)
+        }
+    }
+    return terms.op("neg", [a], terms.integer())
+}
+
+// `a == b`, structurally as far as both are known. Two floats compare as floats
+// do, so a float is never taken to equal itself without being known.
+func equal(a: terms.Term, b: terms.Term): terms.Term {
+    if terms.known(a) && terms.known(b) {
+        return terms.Term.BoolK(sameValue(a, b))
+    }
+    if terms.key(a) == terms.key(b) && mayHoldFloat(a) == false {
+        return terms.Term.BoolK(true)
+    }
+    if a is terms.Term.RecK(ta, va, fa) && b is terms.Term.RecK(tb, vb, fb) {
+        if ta != tb || va != vb || len(fa) != len(fb) {
+            return terms.Term.BoolK(false)
+        }
+        return pairwise(fa, fb)
+    }
+    if a is terms.Term.OkK(pa) {
+        if b is terms.Term.OkK(pb) {
+            return equal(pa, pb)
+        }
+        if b is terms.Term.ErrK(_) {
+            return terms.Term.BoolK(false)
+        }
+    }
+    if a is terms.Term.ErrK(pa) {
+        if b is terms.Term.ErrK(pb) {
+            return equal(pa, pb)
+        }
+        if b is terms.Term.OkK(_) {
+            return terms.Term.BoolK(false)
+        }
+    }
+    if a is terms.Term.VecK(ia) && b is terms.Term.VecK(ib) {
+        if len(ia) != len(ib) {
+            return terms.Term.BoolK(false)
+        }
+        return pairwise(ia, ib)
+    }
+    if a is terms.Term.BoolK(x) {
+        if x {
+            return b
+        }
+        return terms.negation(b)
+    }
+    if b is terms.Term.BoolK(y) {
+        if y {
+            return a
+        }
+        return terms.negation(a)
+    }
+    return terms.op("eq", terms.ordered(a, b), terms.boolean())
+}
+
+func pairwise(a: terms.Term[], b: terms.Term[]): terms.Term {
+    mut terms.Term all = terms.Term.BoolK(true)
+    mut i := 0
+    for each x in a {
+        all = terms.both(all, equal(x, terms.nth(b, i)))
+        i = i + 1
+    }
+    return all
+}
+
+// Whether a term is, or holds anywhere inside it, something that could be a float.
+func mayHoldFloat(t: terms.Term): Bool {
+    if t is terms.Term.Unknown(_, ty) {
+        return holdsFloat(ty)
+    }
+    if t is terms.Term.Op(_, _, ty) {
+        return holdsFloat(ty)
+    }
+    if t is terms.Term.FloatK(_) {
+        return true
+    }
+    if t is terms.Term.OkK(payload) {
+        return mayHoldFloat(payload)
+    }
+    if t is terms.Term.ErrK(payload) {
+        return mayHoldFloat(payload)
+    }
+    if t is terms.Term.VecK(items) {
+        return anyFloat(items)
+    }
+    if t is terms.Term.VecS(known, rest) {
+        return anyFloat(known) || mayHoldFloat(rest)
+    }
+    if t is terms.Term.RecK(_, _, fields) {
+        return anyFloat(fields)
+    }
+    if t is terms.Term.FnK(_, args) {
+        return anyFloat(args)
+    }
+    return false
+}
+
+func anyFloat(ts: terms.Term[]): Bool {
+    for each t in ts {
+        if mayHoldFloat(t) {
+            return true
+        }
+    }
+    return false
+}
+
+// Whether a value of `ty` could be or hold a float. A declared type is taken to,
+// which only ever costs a proof, never makes a false one.
+func holdsFloat(ty: types.Ty): Bool {
+    if ty is types.Ty.TFloat || ty is types.Ty.TFloat32 || ty is types.Ty.TNamed(_) || ty is types.Ty.TUnknown || ty is types.Ty.TVar(_) {
+        return true
+    }
+    if ty is types.Ty.TVec(element, _) {
+        return holdsFloat(element)
+    }
+    if ty is types.Ty.TResult(ok, bad) {
+        return holdsFloat(ok) || holdsFloat(bad)
+    }
+    if ty is types.Ty.TMap(k, v) {
+        return holdsFloat(k) || holdsFloat(v)
+    }
+    return false
+}
+
+func sameValue(a: terms.Term, b: terms.Term): Bool {
+    if a is terms.Term.FloatK(x) && b is terms.Term.FloatK(y) {
+        return x == y
+    }
+    if a is terms.Term.VecK(ia) && b is terms.Term.VecK(ib) {
+        if len(ia) != len(ib) {
+            return false
+        }
+        mut i := 0
+        for each x in ia {
+            if sameValue(x, terms.nth(ib, i)) == false {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if a is terms.Term.RecK(ta, va, fa) && b is terms.Term.RecK(tb, vb, fb) {
+        if ta != tb || va != vb || len(fa) != len(fb) {
+            return false
+        }
+        mut i := 0
+        for each x in fa {
+            if sameValue(x, terms.nth(fb, i)) == false {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if a is terms.Term.OkK(pa) && b is terms.Term.OkK(pb) {
+        return sameValue(pa, pb)
+    }
+    if a is terms.Term.ErrK(pa) && b is terms.Term.ErrK(pb) {
+        return sameValue(pa, pb)
+    }
+    return terms.key(a) == terms.key(b)
+}
+
+// `a < b` or `a <= b`, worked out where both are known.
+func order(name: Str, a: terms.Term, b: terms.Term): terms.Term {
+    if a is terms.Term.IntK(x) && b is terms.Term.IntK(y) {
+        if name == "lt" {
+            return terms.Term.BoolK(x < y)
+        }
+        return terms.Term.BoolK(x <= y)
+    }
+    if a is terms.Term.StrK(x) && b is terms.Term.StrK(y) {
+        if name == "lt" {
+            return terms.Term.BoolK(x < y)
+        }
+        return terms.Term.BoolK(x <= y)
+    }
+    if a is terms.Term.FloatK(x) && b is terms.Term.FloatK(y) {
+        if name == "lt" {
+            return terms.Term.BoolK(x < y)
+        }
+        return terms.Term.BoolK(x <= y)
+    }
+    if name == "le" && terms.key(a) == terms.key(b) && mayHoldFloat(a) == false {
+        return terms.Term.BoolK(true)
+    }
+    if name == "lt" && terms.key(a) == terms.key(b) && mayHoldFloat(a) == false {
+        return terms.Term.BoolK(false)
+    }
+    return terms.op(name, [a, b], terms.boolean())
+}
+
+func lengthOf(a: terms.Term): terms.Term {
+    if a is terms.Term.VecK(items) {
+        return terms.Term.IntK(len(items))
+    }
+    if a is terms.Term.VecS(known, rest) {
+        return arith("add", terms.Term.IntK(len(known)), lengthOf(rest))
+    }
+    if a is terms.Term.StrK(s) {
+        return terms.Term.IntK(len(s))
+    }
+    if a is terms.Term.Op(name, args, _) {
+        if name == "cat" {
+            return arith("add", lengthOf(terms.nth(args, 0)), lengthOf(terms.nth(args, 1)))
+        }
+    }
+    return terms.op("len", [a], terms.integer())
+}
+
+func concat(a: terms.Term, b: terms.Term, ty: types.Ty): terms.Term {
+    if ty is types.Ty.TStr {
+        if a is terms.Term.StrK(x) && b is terms.Term.StrK(y) {
+            return terms.Term.StrK(x + y)
+        }
+        if a is terms.Term.StrK(x) {
+            if x == "" {
+                return b
+            }
+        }
+        if b is terms.Term.StrK(y) {
+            if y == "" {
+                return a
+            }
+        }
+        return terms.op("cat", [a, b], ty)
+    }
+    if a is terms.Term.VecK(items) {
+        if len(items) == 0 {
+            return b
+        }
+        return vecJoin(items, b)
+    }
+    if a is terms.Term.VecS(known, rest) {
+        return vecJoin(known, concat(rest, b, ty))
+    }
+    if b is terms.Term.VecK(items) {
+        if len(items) == 0 {
+            return a
+        }
+    }
+    return terms.op("cat", [a, b], ty)
+}
+
+func element(v: terms.Term, i: terms.Term, ty: types.Ty): terms.Term {
+    if i is terms.Term.IntK(n) {
+        if v is terms.Term.VecK(items) {
+            if items bounds n {
+                return items[n]
+            }
+        }
+        if v is terms.Term.VecS(known, _) {
+            if known bounds n {
+                return known[n]
+            }
+        }
+        if v is terms.Term.StrK(s) {
+            cs := text.chars(s)
+            if cs bounds n {
+                return terms.Term.StrK(cs[n])
+            }
+        }
+    }
+    return terms.op("elem", [v, i], ty)
+}
+
+func shapeTest(name: Str, a: terms.Term): terms.Term {
+    if a is terms.Term.VecK(items) {
+        return terms.Term.BoolK((len(items) == 0) == (name == "nil"))
+    }
+    if a is terms.Term.VecS(known, rest) {
+        if len(known) > 0 {
+            return terms.Term.BoolK(name == "cons")
+        }
+        return shapeTest(name, rest)
+    }
+    return terms.op(name, [a], terms.boolean())
+}
+
+func variantTest(name: Str, a: terms.Term): terms.Term {
+    if a is terms.Term.RecK(typeName, variant, _) {
+        return terms.Term.BoolK(typeName + "." + variant == name)
+    }
+    if a is terms.Term.OkK(_) {
+        return terms.Term.BoolK(name == "Result.Ok")
+    }
+    if a is terms.Term.ErrK(_) {
+        return terms.Term.BoolK(name == "Result.Error")
+    }
+    return terms.op("is:" + name, [a], terms.boolean())
+}
+
+// The fields a value of `typeName`'s `variant` has, in the order a record term
+// holds them: the variant's own, then the shared ones.
+func fieldsFor(t: types.Table, typeName: Str, variant: Str): ast.Field[dyn] {
+    if variant == "" {
+        if types.fieldsOfStruct(t, typeName) is Result.Ok(fields) {
+            return fields
+        }
+    } else if types.findVariant(t, typeName, variant) is Result.Ok(fields) {
+        return fields
+    }
+    mut ast.Field[dyn] none = []
+    return none
+}
+
+func fieldOf(t: types.Table, record: terms.Term, field: Str, ty: types.Ty): terms.Term {
+    if record is terms.Term.RecK(typeName, variant, values) {
+        mut i := 0
+        for each f in fieldsFor(t, typeName, variant) {
+            if f.name == field {
+                return terms.nth(values, i)
+            }
+            i = i + 1
+        }
+    }
+    return terms.op("field:" + field, [record], ty)
+}
+
+// --- Running a block --------------------------------------------------------------
+
+proc execBlock(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, stmts: ast.Stmt[]): Path[dyn] {
+    return execFrom(pr, cx, scope, path, stmts, 0)
+}
+
+proc execFrom(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, stmts: ast.Stmt[], at: Int): Path[dyn] {
+    if running(path) == false {
+        return [path]
+    }
+    if stmts bounds at {
+        s := stmts[at]
+        pr.steps = pr.steps + 1
+        if pr.steps > pr.budget {
+            return [lost(path, "it gave up after {pr.budget} steps", s.at)]
+        }
+        afterwards := execStmt(pr, cx, scope, path, s)
+        next := scopeAfter(scope, s)
+        mut Path[dyn] out = []
+        for each p in afterwards {
+            for each q in execFrom(pr, cx, next, p, stmts, at + 1) {
+                append(out, q)
+            }
+        }
+        return out
+    }
+    return [path]
+}
+
+func scopeAfter(scope: infer.Env, s: ast.Stmt): infer.Env {
+    if s is ast.Stmt.VarDecl(name, value, _, _, _) {
+        return infer.bound(scope, name, infer.typeOf(scope, value))
+    }
+    if s is ast.Stmt.TypedDecl(declared, name, _, _, _, _) {
+        return infer.bound(scope, name, types.resolve(scope.table, declared))
+    }
+    return scope
+}
+
+// A block whose own declarations, and whatever a branch's match bound, go out of
+// scope with it: an outer name it shadowed has its old value back.
+proc execScoped(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, stmts: ast.Stmt[], bound: Str[]): Path[dyn] {
+    mut Str[dyn] names = []
+    for each n in bound {
+        append(names, n)
+    }
+    for each s in stmts {
+        if s is ast.Stmt.VarDecl(name, _, _, _, _) {
+            append(names, name)
+        } else if s is ast.Stmt.TypedDecl(_, name, _, _, _, _) {
+            append(names, name)
+        }
+    }
+    mut Path[dyn] out = []
+    for each p in execBlock(pr, cx, scope, path, stmts) {
+        append(out, restored(p, path, names))
+    }
+    return out
+}
+
+func restored(later: Path, before: Path, names: Str[]): Path {
+    mut Path p = later
+    for each n in names {
+        if hive.map.get(before.env, n) is Result.Ok(v) {
+            hive.map.set(p.env, n, v)
+        } else if hive.map.has(p.env, n) {
+            hive.map.delete(p.env, n)
+        }
+    }
+    return p
+}
+
+proc execStmt(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, s: ast.Stmt): Path[dyn] {
+    if s is ast.Stmt.VarDecl(name, value, mutable, deferred, at) {
+        return declare(pr, cx, scope, path, name, value, mutable, deferred, at)
+    } else if s is ast.Stmt.TypedDecl(_, name, value, mutable, deferred, at) {
+        return declare(pr, cx, scope, path, name, value, mutable, deferred, at)
+    } else if s is ast.Stmt.Assign(target, value, at) {
+        mut Path[dyn] out = []
+        for each o in eval(pr, cx, scope, path, value) {
+            if running(o.path) {
+                for each p in store(pr, cx, scope, o.path, target, o.value, at) {
+                    append(out, p)
+                }
+            } else {
+                append(out, o.path)
+            }
+        }
+        return out
+    } else if s is ast.Stmt.IfChain(branches, otherwise, hasElse, _) {
+        return execIf(pr, cx, scope, path, branches, 0, otherwise, hasElse)
+    } else if s is ast.Stmt.SwitchStmt(lets, _, arms, _, _) {
+        lowered := ast.switchBlock(lets, arms)
+        return execScoped(pr, cx, scope, path, lowered.stmts, [])
+    } else if s is ast.Stmt.ForEach(name, _, subject, body, at) {
+        return execEach(pr, cx, scope, path, name, subject, body, at)
+    } else if s is ast.Stmt.ForLoop(init, cond, post, body, at) {
+        return execCounting(pr, cx, scope, path, init, cond, post, body, at)
+    } else if s is ast.Stmt.ReturnStmt(value, _) {
+        if value is ast.Expr.Absent {
+            return [ended(path, End.Returned(terms.Term.VoidK()))]
+        }
+        mut Path[dyn] out = []
+        for each o in eval(pr, cx, scope, path, value) {
+            if running(o.path) {
+                append(out, ended(o.path, End.Returned(o.value)))
+            } else {
+                append(out, o.path)
+            }
+        }
+        return out
+    } else if s is ast.Stmt.EchoStmt(_, _) {
+        // It writes, but nothing a law can see depends on what.
+        return [path]
+    } else if s is ast.Stmt.AssertStmt(condition, at) {
+        mut Path[dyn] out = []
+        for each o in eval(pr, cx, scope, path, condition) {
+            if running(o.path) {
+                for each p in checkAssert(pr, cx, o.path, o.value, condition, at) {
+                    append(out, p)
+                }
+            } else {
+                append(out, o.path)
+            }
+        }
+        return out
+    } else if s is ast.Stmt.PanicStmt(_, at) {
+        return panicked(pr, cx, path, at)
+    } else if s is ast.Stmt.BreakStmt(_) {
+        return [ended(path, End.Broke())]
+    } else if s is ast.Stmt.ContinueStmt(_) {
+        return [ended(path, End.Continued())]
+    } else if s is ast.Stmt.AsyncStmt(_, at) {
+        return [lost(path, "it cannot reason about `async`: what runs alongside is not a value", at)]
+    } else if s is ast.Stmt.Expression(value, at) {
+        if lawCalled(cx, value) is Result.Ok(name) {
+            return assumeLaw(pr, cx, scope, path, name, value, at)
+        }
+        mut Path[dyn] out = []
+        for each o in eval(pr, cx, scope, path, value) {
+            append(out, o.path)
+        }
+        return out
+    }
+    return [path]
+}
+
+proc declare(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, name: Str, value: ast.Expr, mutable: Bool, deferred: Bool, at: token.Pos): Path[dyn] {
+    if deferred {
+        return [lost(path, "it cannot reason about `async`: what runs alongside is not a value", at)]
+    }
+    if mutable {
+        if value is ast.Expr.Ident(other, _) {
+            if indexOf(path.muts, other) is Result.Ok(_) {
+                return [lost(path, "it cannot follow `mut {name} := {other}`, which shares `{other}`'s storage rather than copying it", at)]
+            }
+        }
+    }
+    mut Path[dyn] out = []
+    for each o in eval(pr, cx, scope, path, value) {
+        if running(o.path) {
+            mut Path p = withValue(o.path, name, o.value)
+            if mutable {
+                p = withMut(p, name)
+            }
+            append(out, p)
+        } else {
+            append(out, o.path)
+        }
+    }
+    return out
+}
+
+// Write `value` where `target` names: a variable, a field of one, or an element.
+proc store(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, target: ast.Expr, value: terms.Term, at: token.Pos): Path[dyn] {
+    if target is ast.Expr.Ident(name, _) {
+        return [withValue(path, name, value)]
+    }
+    if target is ast.Expr.Member(subject, field, _) {
+        mut Path[dyn] out = []
+        for each o in eval(pr, cx, scope, path, subject) {
+            if running(o.path) {
+                for each m in materialize(pr, cx, o.path, o.value, [], "") {
+                    record := normIn(cx, m.path, m.value)
+                    if record is terms.Term.RecK(typeName, variant, fields) {
+                        mut terms.Term[dyn] changed = []
+                        mut i := 0
+                        for each f in fieldsFor(cx.base.table, typeName, variant) {
+                            if f.name == field {
+                                append(changed, value)
+                            } else {
+                                append(changed, terms.nth(fields, i))
+                            }
+                            i = i + 1
+                        }
+                        for each p in store(pr, cx, scope, m.path, subject, terms.Term.RecK(typeName, variant, changed), at) {
+                            append(out, p)
+                        }
+                    } else {
+                        append(out, lost(m.path, "it cannot follow a write into `{exprText(subject)}`", at))
+                    }
+                }
+            } else {
+                append(out, o.path)
+            }
+        }
+        return out
+    }
+    if target is ast.Expr.Index(subject, index, _) {
+        mut Path[dyn] out = []
+        for each o in evalAll(pr, cx, scope, path, [subject, index], 0, []) {
+            if running(o.path) {
+                vector := normIn(cx, o.path, terms.nth(o.values, 0))
+                position := normIn(cx, o.path, terms.nth(o.values, 1))
+                if vector is terms.Term.VecK(items) && position is terms.Term.IntK(n) && items bounds n {
+                    mut terms.Term[dyn] changed = items
+                    if changed bounds n {
+                        changed[n] = value
+                    }
+                    for each p in store(pr, cx, scope, o.path, subject, terms.Term.VecK(changed), at) {
+                        append(out, p)
+                    }
+                } else {
+                    append(out, lost(o.path, "it cannot follow a write to an element it cannot place", at))
+                }
+            } else {
+                append(out, o.path)
+            }
+        }
+        return out
+    }
+    return [lost(path, "it cannot follow this assignment", at)]
+}
+
+proc execIf(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, branches: ast.Branch[], at: Int, otherwise: ast.Block, hasElse: Bool): Path[dyn] {
+    if branches bounds at {
+        br := branches[at]
+        inner := infer.narrowed(scope, br.condition)
+        names := ast.bindingsIn(br.condition)
+        mut Path[dyn] out = []
+        for each o in eval(pr, cx, scope, path, br.condition) {
+            if running(o.path) == false {
+                append(out, o.path)
+                continue
+            }
+            c := normIn(cx, o.path, o.value)
+            if terms.isTrue(c) {
+                for each p in execScoped(pr, cx, inner, o.path, br.body.stmts, names) {
+                    append(out, p)
+                }
+            } else if terms.isFalse(c) {
+                for each p in execIf(pr, cx, scope, restored(o.path, path, names), branches, at + 1, otherwise, hasElse) {
+                    append(out, p)
+                }
+            } else {
+                if assume(pr, cx, o.path, c) is Result.Ok(yes) {
+                    for each p in execScoped(pr, cx, inner, yes, br.body.stmts, names) {
+                        append(out, p)
+                    }
+                }
+                if assume(pr, cx, o.path, terms.negation(c)) is Result.Ok(no) {
+                    for each p in execIf(pr, cx, scope, restored(no, path, names), branches, at + 1, otherwise, hasElse) {
+                        append(out, p)
+                    }
+                }
+            }
+        }
+        return out
+    }
+    if hasElse {
+        return execScoped(pr, cx, scope, path, otherwise.stmts, [])
+    }
+    return [path]
+}
+
+proc execEach(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, name: Str, subject: ast.Expr, body: ast.Block, at: token.Pos): Path[dyn] {
+    inner := infer.bound(scope, name, types.elementOf(infer.typeOf(scope, subject)))
+    mut Path[dyn] out = []
+    for each o in eval(pr, cx, scope, path, subject) {
+        if running(o.path) == false {
+            append(out, o.path)
+            continue
+        }
+        for each m in fixedLength(pr, cx, o.path, o.value) {
+            v := normIn(cx, m.path, m.value)
+            if v is terms.Term.VecK(items) {
+                for each p in eachItem(pr, cx, inner, m.path, name, items, terms.Term.VecK([]), body, 0, at) {
+                    append(out, restored(p, path, [name]))
+                }
+            } else if v is terms.Term.VecS(known, rest) {
+                for each p in eachItem(pr, cx, inner, m.path, name, known, rest, body, 0, at) {
+                    append(out, restored(p, path, [name]))
+                }
+            } else {
+                for each p in eachItem(pr, cx, inner, m.path, name, [], v, body, 0, at) {
+                    append(out, restored(p, path, [name]))
+                }
+            }
+        }
+    }
+    return out
+}
+
+// The loop's body for each known item, then whatever the rest of the vector is.
+proc eachItem(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, name: Str, items: terms.Term[], rest: terms.Term, body: ast.Block, at: Int, loopAt: token.Pos): Path[dyn] {
+    if running(path) == false {
+        return [path]
+    }
+    if items bounds at {
+        mut Path[dyn] out = []
+        for each p in execScoped(pr, cx, scope, withValue(path, name, items[at]), body.stmts, []) {
+            if p.ended is End.Broke {
+                append(out, ended(p, End.Running()))
+            } else if p.ended is End.Continued || p.ended is End.Running {
+                for each q in eachItem(pr, cx, scope, ended(p, End.Running()), name, items, rest, body, at + 1, loopAt) {
+                    append(out, q)
+                }
+            } else {
+                append(out, p)
+            }
+        }
+        return out
+    }
+    tail := normIn(cx, path, rest)
+    if tail is terms.Term.VecK(more) {
+        if len(more) == 0 {
+            return [path]
+        }
+        return eachItem(pr, cx, scope, path, name, more, terms.Term.VecK([]), body, 0, loopAt)
+    }
+    if tail is terms.Term.VecS(more, further) {
+        return eachItem(pr, cx, scope, path, name, more, further, body, 0, loopAt)
+    }
+    // What is left is a vector of unknown length. Where the loop is all the callable
+    // does with it, the rest of the loop is that callable on the rest.
+    callable := path.frame.callable
+    if blockMayFail(cx, body.stmts) {
+        return [lost(path, "it cannot follow this loop over a vector of unknown length far enough to show that nothing in it fails an `assert` or reaches a `panic`", loopAt)]
+    }
+    if hive.map.get(cx.loopAt, callable) is Result.Ok(spot) && spot == place(loopAt) && hive.map.has(cx.mayFail, callable) == false {
+        if hive.map.get(cx.loopParam, callable) is Result.Ok(position) {
+            if hive.map.get(cx.callables, callable) is Result.Ok(d) {
+                if d is ast.Decl.CallableDecl(_, _, _, result, _, _) {
+                    mut terms.Term[dyn] args = []
+                    mut i := 0
+                    for each a in path.frame.args {
+                        if i == position {
+                            append(args, tail)
+                        } else {
+                            append(args, a)
+                        }
+                        i = i + 1
+                    }
+                    return [ended(path, End.Returned(terms.op("call:" + callable, args, types.resolve(cx.base.table, result))))]
+                }
+            }
+        }
+    }
+    return carried(pr, cx, scope, path, name, tail, body, loopAt)
+}
+
+// The rest of a loop that carries something from one turn to the next: every
+// variable it writes is left holding what the rest of the loop makes of it — one
+// unknown function of that rest and of everything the loop reads, the same wherever
+// the same loop runs on the same things.
+proc carried(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, name: Str, tail: terms.Term, body: ast.Block, loopAt: token.Pos): Path[dyn] {
+    if leaves(body.stmts) {
+        return [lost(path, "it cannot follow this loop over a vector of unknown length: it can `return` or `break` part of the way through", loopAt)]
+    }
+    lentOut := lentInStmts(cx, body.stmts)
+    mut Str[dyn] lent = []
+    if lentOut is Result.Ok(names) {
+        lent = names
+    } else {
+        return [lost(path, "it cannot follow this loop over a vector of unknown length: it hands a `mut` parameter something that is not a plain variable", loopAt)]
+    }
+    inside := declaredInStmts(body.stmts)
+    mut Str[dyn] written = []
+    for each w in assignedInStmts(body.stmts) + lent {
+        if w != name && w != "" && (indexOf(inside, w) is Result.Ok(_)) == false && (indexOf(written, w) is Result.Ok(_)) == false {
+            append(written, w)
+        }
+    }
+    mut Str[dyn] state = []
+    for each n in namesInStmts(body.stmts) {
+        if n != name && (indexOf(inside, n) is Result.Ok(_)) == false && hive.map.has(path.env, n) && (indexOf(state, n) is Result.Ok(_)) == false {
+            append(state, n)
+        }
+    }
+    for each w in written {
+        if (indexOf(state, w) is Result.Ok(_)) == false {
+            append(state, w)
+        }
+    }
+    sorted := sort(state)
+    mut terms.Term[dyn] args = [tail]
+    for each n in sorted {
+        if hive.map.get(path.env, n) is Result.Ok(v) {
+            append(args, normIn(cx, path, v))
+        }
+    }
+    mut Path p = path
+    for each w in written {
+        held := infer.lookup(scope, w)
+        hive.map.set(p.env, w, terms.op("loop:" + path.frame.callable + "@" + place(loopAt) + ":" + w + ":" + join(sorted, ","), args, held))
+    }
+    return [p]
+}
+
+// Whether a block can leave the loop it is in part of the way through.
+func leaves(stmts: ast.Stmt[]): Bool {
+    for each st in stmts {
+        if st is ast.Stmt.ReturnStmt(_, _) || st is ast.Stmt.BreakStmt(_) {
+            return true
+        }
+        if st is ast.Stmt.IfChain(_, _, _, _) || st is ast.Stmt.SwitchStmt(_, _, _, _, _) {
+            for each b in blocksOfStmt(st) {
+                if leaves(b.stmts) {
+                    return true
+                }
+            }
+        }
+        if st is ast.Stmt.ForEach(_, _, _, inner, _) {
+            if returns(inner.stmts) {
+                return true
+            }
+        }
+        if st is ast.Stmt.ForLoop(_, _, _, inner, _) {
+            if returns(inner.stmts) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+func returns(stmts: ast.Stmt[]): Bool {
+    for each st in stmts {
+        if st is ast.Stmt.ReturnStmt(_, _) {
+            return true
+        }
+        for each b in blocksOfStmt(st) {
+            if returns(b.stmts) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// The variables a block hands to a `mut` parameter, which the callee may write; or
+// `Error` where one of those is not a plain variable.
+func lentInStmts(cx: Context, stmts: ast.Stmt[]): Result<Str[dyn], Bool> {
+    mut Str[dyn] out = []
+    for each s in stmts {
+        for each e in exprsOfStmt(s) {
+            for each call in callsIn(e) {
+                lent := lentBy(cx, call)
+                if lent is Result.Ok(names) {
+                    for each n in names {
+                        append(out, n)
+                    }
+                } else {
+                    return Result.Error(false)
+                }
+            }
+        }
+        for each b in blocksOfStmt(s) {
+            inner := lentInStmts(cx, b.stmts)
+            if inner is Result.Ok(names) {
+                for each n in names {
+                    append(out, n)
+                }
+            } else {
+                return Result.Error(false)
+            }
+        }
+    }
+    return Result.Ok(out)
+}
+
+// What one call hands to `mut` parameters.
+func lentBy(cx: Context, call: ast.Expr): Result<Str[dyn], Bool> {
+    mut Str[dyn] out = []
+    if call is ast.Expr.Call(callee, args, _) {
+        if callee is ast.Expr.Ident(name, _) {
+            if hive.map.get(cx.callables, name) is Result.Ok(d) {
+                if d is ast.Decl.CallableDecl(_, _, params, _, _, _) {
+                    mut Str[dyn] names = []
+                    for each p in params {
+                        append(names, p.name)
+                    }
+                    mut i := 0
+                    for each a in ast.positional(args, names) {
+                        if params bounds i {
+                            if params[i].mutable {
+                                if a.value is ast.Expr.Ident(lent, _) {
+                                    append(out, lent)
+                                } else {
+                                    return Result.Error(false)
+                                }
+                            }
+                        }
+                        i = i + 1
+                    }
+                }
+            }
+        }
+    }
+    return Result.Ok(out)
+}
+
+// Every call in an expression, the expression's own included.
+func callsIn(e: ast.Expr): ast.Expr[dyn] {
+    mut ast.Expr[dyn] out = []
+    if e is ast.Expr.Call(callee, args, _) {
+        append(out, e)
+        for each c in callsIn(callee) {
+            append(out, c)
+        }
+        for each a in args {
+            for each c in callsIn(a.value) {
+                append(out, c)
+            }
+        }
+    } else if e is ast.Expr.Binary(_, l, r, _) {
+        return callsIn(l) + callsIn(r)
+    } else if e is ast.Expr.Not(x, _) {
+        return callsIn(x)
+    } else if e is ast.Expr.Negate(x, _) {
+        return callsIn(x)
+    } else if e is ast.Expr.Member(x, _, _) {
+        return callsIn(x)
+    } else if e is ast.Expr.Index(x, i, _) {
+        return callsIn(x) + callsIn(i)
+    } else if e is ast.Expr.IsMatch(x, _, _) {
+        return callsIn(x)
+    } else if e is ast.Expr.VectorLit(items, _) {
+        for each item in items {
+            for each c in callsIn(item) {
+                append(out, c)
+            }
+        }
+    }
+    return out
+}
+
+proc execCounting(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, init: ast.Stmt, cond: ast.Expr, post: ast.Stmt, body: ast.Block, at: token.Pos): Path[dyn] {
+    if cond is ast.Expr.Absent {
+        return [lost(path, "it cannot follow a loop with no condition", at)]
+    }
+    inner := scopeAfter(scope, init)
+    mut Str[dyn] counters = []
+    if init is ast.Stmt.VarDecl(name, _, _, _, _) {
+        append(counters, name)
+    }
+    mut Path[dyn] out = []
+    for each p in execStmt(pr, cx, scope, path, init) {
+        for each q in countingTurn(pr, cx, inner, p, cond, post, body, at) {
+            append(out, restored(q, path, counters))
+        }
+    }
+    return out
+}
+
+proc countingTurn(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, cond: ast.Expr, post: ast.Stmt, body: ast.Block, at: token.Pos): Path[dyn] {
+    if running(path) == false {
+        return [path]
+    }
+    pr.steps = pr.steps + 1
+    if pr.steps > pr.budget {
+        return [lost(path, "it gave up after {pr.budget} steps", at)]
+    }
+    mut Path[dyn] out = []
+    for each o in eval(pr, cx, scope, path, cond) {
+        if running(o.path) == false {
+            append(out, o.path)
+            continue
+        }
+        c := normIn(cx, o.path, o.value)
+        if terms.isFalse(c) {
+            append(out, o.path)
+        } else if terms.isTrue(c) {
+            for each p in execScoped(pr, cx, scope, o.path, body.stmts, []) {
+                if p.ended is End.Broke {
+                    append(out, ended(p, End.Running()))
+                } else if p.ended is End.Continued || p.ended is End.Running {
+                    for each q in execStmt(pr, cx, scope, ended(p, End.Running()), post) {
+                        for each r in countingTurn(pr, cx, scope, q, cond, post, body, at) {
+                            append(out, r)
+                        }
+                    }
+                } else {
+                    append(out, p)
+                }
+            }
+        } else {
+            append(out, lost(o.path, "it cannot follow a counting loop whose bound is not known: it learns what one does only by running it", at))
+        }
+    }
+    return out
+}
+
+// --- Asserts, panics and other laws -------------------------------------------------
+
+proc checkAssert(pr: mut Prover, cx: Context, path: Path, value: terms.Term, written: ast.Expr, at: token.Pos): Path[dyn] {
+    c := normIn(cx, path, value)
+    if pr.claiming {
+        verdict := solve.decide(normFacts(cx, path), normLemmas(cx, path), c)
+        if verdict is solve.Verdict.Holds {
+            pr.proved = pr.proved + 1
+        } else if pr.witness != "" {
+            append(pr.problems, Problem(at, "it does not hold for " + pr.witness + ": `" + exprText(written) + "` is false", true, false))
+        } else if verdict is solve.Verdict.Fails {
+            append(pr.problems, Problem(at, "cannot prove `" + exprText(written) + "`: it is false" + caseText(path), false, false))
+        } else {
+            append(pr.problems, Problem(at, "cannot prove `" + render(pr, c) + "`" + caseText(path) + knownText(pr, cx, path), false, false))
+        }
+    } else {
+        append(pr.concluded, solve.Lemma(guardsSince(pr, cx, path), c))
+    }
+    if assume(pr, cx, path, c) is Result.Ok(p) {
+        return [p]
+    }
+    mut Path[dyn] none = []
+    return none
+}
+
+proc panicked(pr: mut Prover, cx: Context, path: Path, at: token.Pos): Path[dyn] {
+    mut Path[dyn] none = []
+    if pr.claiming {
+        if solve.impossible(normFacts(cx, path), normLemmas(cx, path)) == false {
+            if pr.witness != "" {
+                append(pr.problems, Problem(at, "it does not hold for " + pr.witness + ": this `panic` is reached", true, false))
+            } else {
+                append(pr.problems, Problem(at, "cannot prove this `panic` is never reached" + caseText(path), false, false))
+            }
+        }
+    }
+    return none
+}
+
+// Whether `e` is a call to a law, and which.
+func lawCalled(cx: Context, e: ast.Expr): Result<Str, Bool> {
+    if e is ast.Expr.Call(callee, _, _) {
+        if callee is ast.Expr.Ident(name, _) {
+            if hive.map.get(cx.callables, name) is Result.Ok(d) {
+                if ast.isLaw(d) {
+                    return Result.Ok(name)
+                }
+            }
+        }
+    }
+    return Result.Error(false)
+}
+
+// A law called from a law: what it claims, for these arguments, becomes something
+// this path knows wherever its conditions hold.
+proc assumeLaw(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, name: Str, call: ast.Expr, at: token.Pos): Path[dyn] {
+    if pr.claiming == false {
+        // A hint inside a law being assumed is that law's own business.
+        return [path]
+    }
+    mut ast.Arg[dyn] args = []
+    if call is ast.Expr.Call(_, written, _) {
+        for each a in written {
+            append(args, a)
+        }
+    }
+    if hive.map.get(cx.callables, name) is Result.Ok(d) {
+        if d is ast.Decl.CallableDecl(_, _, params, _, body, _) {
+            mut Path[dyn] out = []
+            for each o in evalArgs(pr, cx, scope, path, args, params) {
+                if running(o.path) == false {
+                    append(out, o.path)
+                    continue
+                }
+                mut hive.map.Map<Str, terms.Term> env = hive.map.new()
+                mut i := 0
+                for each p in params {
+                    hive.map.set(env, p.name, terms.nth(o.values, i))
+                    i = i + 1
+                }
+                if name == lawOf(path) {
+                    for each v in o.values {
+                        held := normIn(cx, o.path, v)
+                        if held is terms.Term.Unknown(_, _) {
+                            append(pr.frontier, terms.key(held))
+                        }
+                    }
+                }
+                mut Path start = o.path
+                start.env = env
+                start.frame = Frame(name, o.values)
+                start.muts = []
+                pr.claiming = false
+                pr.baseFacts = len(o.path.facts)
+                pr.baseShapes = hive.map.keys(o.path.shapes)
+                pr.concluded = []
+                lawScope := infer.boundParams(cx.base, params, 0)
+                _ := execBlock(pr, cx, lawScope, start, withoutHints(cx, body.stmts))
+                pr.claiming = true
+                mut Path kept = o.path
+                for each l in pr.concluded {
+                    append(kept.lemmas, l)
+                }
+                pr.concluded = []
+                append(out, kept)
+            }
+            return out
+        }
+    }
+    return [path]
+}
+
+// The law a path is proving: the frame at its bottom, the only one at depth 0.
+func lawOf(path: Path): Str {
+    if path.depth == 0 {
+        return path.frame.callable
+    }
+    return ""
+}
+
+// A law's body without the hints its own proof needed: a call to a law, and an `if`
+// or a `switch` whose branches claim nothing and change nothing outside themselves —
+// whatever they compute for the hints in them goes out of scope with them. Assumed
+// rather than proved, a law is its claim, and a case split for a hint would only put
+// its conclusions behind conditions.
+func withoutHints(cx: Context, stmts: ast.Stmt[]): ast.Stmt[dyn] {
+    mut ast.Stmt[dyn] out = []
+    for each s in stmts {
+        if isHint(cx, s) == false {
+            append(out, s)
+        }
+    }
+    return out
+}
+
+func isHint(cx: Context, s: ast.Stmt): Bool {
+    if s is ast.Stmt.Expression(value, _) {
+        return lawCalled(cx, value) is Result.Ok(_)
+    }
+    if s is ast.Stmt.IfChain(_, _, _, _) || s is ast.Stmt.SwitchStmt(_, _, _, _, _) {
+        for each b in blocksOfStmt(s) {
+            if keepsToItself(cx, b.stmts) == false {
+                return false
+            }
+        }
+        return true
+    }
+    return false
+}
+
+// Whether a block asserts nothing and writes nothing declared outside it.
+func keepsToItself(cx: Context, stmts: ast.Stmt[]): Bool {
+    if mayStop(stmts) {
+        return false
+    }
+    inside := declaredInStmts(stmts)
+    lent := lentInStmts(cx, stmts)
+    mut Str[dyn] written = assignedInStmts(stmts)
+    if lent is Result.Ok(names) {
+        written = written + names
+    } else {
+        return false
+    }
+    for each w in written {
+        if (indexOf(inside, w) is Result.Ok(_)) == false {
+            return false
+        }
+    }
+    return true
+}
+
+// What a path assumed since a law being assumed started: the facts it learned, and
+// the case splits it took, each as a condition.
+proc guardsSince(pr: mut Prover, cx: Context, path: Path): terms.Term[dyn] {
+    mut terms.Term[dyn] out = []
+    mut i := 0
+    for each f in path.facts {
+        if i >= pr.baseFacts {
+            append(out, normIn(cx, path, f))
+        }
+        i = i + 1
+    }
+    for each k in hive.map.keys(path.shapes) {
+        if (indexOf(pr.baseShapes, k) is Result.Ok(_)) == false {
+            if hive.map.get(path.shapes, k) is Result.Ok(shape) {
+                id := idOf(k)
+                if pr.infos bounds id {
+                    g := shapeGuard(terms.Term.Unknown(id, pr.infos[id].ty), shape)
+                    if g is Result.Ok(guard) {
+                        append(out, guard)
+                    }
+                }
+            }
+        }
+    }
+    return out
+}
+
+func idOf(k: Str): Int {
+    mut n := 0
+    for each c in text.chars(after(k, 1)) {
+        n = n * 10 + digit(c)
+    }
+    return n
+}
+
+func digit(c: Str): Int {
+    if indexOf(["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"], c) is Result.Ok(d) {
+        return d
+    }
+    return 0
+}
+
+// The condition a case split decided, or `Error` where deciding it took nothing —
+// a struct is the one shape its type has.
+func shapeGuard(u: terms.Term, shape: terms.Term): Result<terms.Term, Bool> {
+    if shape is terms.Term.RecK(typeName, variant, _) {
+        if variant == "" {
+            return Result.Error(false)
+        }
+        return Result.Ok(terms.op("is:" + typeName + "." + variant, [u], terms.boolean()))
+    }
+    if shape is terms.Term.OkK(_) {
+        return Result.Ok(terms.op("is:Result.Ok", [u], terms.boolean()))
+    }
+    if shape is terms.Term.ErrK(_) {
+        return Result.Ok(terms.op("is:Result.Error", [u], terms.boolean()))
+    }
+    if shape is terms.Term.VecK(items) {
+        if u is terms.Term.Unknown(_, ty) {
+            if ty is types.Ty.TVec(_, dim) {
+                if dim is ast.Dim.Fixed(_) {
+                    return Result.Error(false)
+                }
+            }
+        }
+        if len(items) == 0 {
+            return Result.Ok(terms.op("nil", [u], terms.boolean()))
+        }
+        return Result.Ok(terms.op("cons", [u], terms.boolean()))
+    }
+    if shape is terms.Term.VecS(_, _) {
+        return Result.Ok(terms.op("cons", [u], terms.boolean()))
+    }
+    if terms.known(shape) {
+        return Result.Ok(equal(u, shape))
+    }
+    return Result.Error(false)
+}
+
+// --- What a path knows ----------------------------------------------------------
+
+// The path, knowing `cond` too, or `Error` where the two cannot both be.
+proc assume(pr: mut Prover, cx: Context, path: Path, cond: terms.Term): Result<Path, Bool> {
+    c := normIn(cx, path, cond)
+    if c is terms.Term.BoolK(b) {
+        if b {
+            return Result.Ok(path)
+        }
+        return Result.Error(false)
+    }
+    if c is terms.Term.Op(name, args, _) {
+        if name == "and" {
+            if assume(pr, cx, path, terms.nth(args, 0)) is Result.Ok(p) {
+                return assume(pr, cx, p, terms.nth(args, 1))
+            }
+            return Result.Error(false)
+        }
+        if name == "not" {
+            inner := terms.nth(args, 0)
+            if inner is terms.Term.Op(innerName, innerArgs, _) {
+                if innerName == "or" {
+                    if assume(pr, cx, path, terms.negation(terms.nth(innerArgs, 0))) is Result.Ok(p) {
+                        return assume(pr, cx, p, terms.negation(terms.nth(innerArgs, 1)))
+                    }
+                    return Result.Error(false)
+                }
+            }
+            if inner is terms.Term.Unknown(id, ty) {
+                if ty is types.Ty.TBool {
+                    return checked(pr, cx, withShape(path, id, terms.Term.BoolK(false), ""))
+                }
+            }
+        }
+        if name == "eq" {
+            x := terms.nth(args, 0)
+            y := terms.nth(args, 1)
+            if settles(x, y) is Result.Ok(id) {
+                return checked(pr, cx, withShape(path, id, y, ""))
+            }
+            if settles(y, x) is Result.Ok(id) {
+                return checked(pr, cx, withShape(path, id, x, ""))
+            }
+        }
+    }
+    if c is terms.Term.Unknown(id, ty) {
+        if ty is types.Ty.TBool {
+            return checked(pr, cx, withShape(path, id, terms.Term.BoolK(true), ""))
+        }
+    }
+    mut Path p = path
+    append(p.facts, c)
+    return checked(pr, cx, p)
+}
+
+// The unknown `x` is, where `x == y` with `y` a scalar value says exactly what it is.
+func settles(x: terms.Term, y: terms.Term): Result<Int, Bool> {
+    if x is terms.Term.Unknown(id, ty) {
+        if ty is types.Ty.TInt || ty is types.Ty.TStr || ty is types.Ty.TAtom || ty is types.Ty.TBool {
+            if y is terms.Term.IntK(_) || y is terms.Term.StrK(_) || y is terms.Term.AtomK(_) || y is terms.Term.BoolK(_) {
+                return Result.Ok(id)
+            }
+        }
+    }
+    return Result.Error(false)
+}
+
+proc checked(pr: mut Prover, cx: Context, path: Path): Result<Path, Bool> {
+    if solve.impossible(normFacts(cx, path), normLemmas(cx, path)) {
+        return Result.Error(false)
+    }
+    return Result.Ok(path)
+}
+
+// --- Looking inside a value -------------------------------------------------------
+
+// What a term could be, one path for each: a union per variant, a `Result` per
+// side, a `Bool` per value; a struct, or a vector of known length, its one shape.
+// Anything else is handed back as it is.
+proc materialize(pr: mut Prover, cx: Context, path: Path, value: terms.Term, labels: Str[], labelled: Str): Out[dyn] {
+    v := normIn(cx, path, value)
+    if v is terms.Term.Unknown(id, ty) {
+        label := labelOf(pr, id)
+        if ty is types.Ty.TNamed(typeName) {
+            if types.findType(cx.base.table, typeName) is Result.Ok(info) {
+                if len(info.variants) == 0 {
+                    mut terms.Term[dyn] fields = []
+                    for each f in info.shared {
+                        append(fields, part(pr, "u{id}.{f.name}", types.resolve(cx.base.table, f.declared), label + "." + f.name))
+                    }
+                    shaped := terms.Term.RecK(typeName, "", fields)
+                    return one(withShape(path, id, shaped, ""), shaped)
+                }
+                mut Out[dyn] out = []
+                for each variant in info.variants {
+                    mut terms.Term[dyn] fields = []
+                    mut i := 0
+                    for each f in variant.fields {
+                        mut fieldLabel := label + "." + f.name
+                        if labels bounds i && variant.name == labelled {
+                            if labels[i] != "_" && labels[i] != "" {
+                                fieldLabel = labels[i]
+                            }
+                        }
+                        append(fields, part(pr, "u{id}:{variant.name}.{f.name}", types.resolve(cx.base.table, f.declared), fieldLabel))
+                        i = i + 1
+                    }
+                    for each f in info.shared {
+                        append(fields, part(pr, "u{id}.{f.name}", types.resolve(cx.base.table, f.declared), label + "." + f.name))
+                    }
+                    shaped := terms.Term.RecK(typeName, variant.name, fields)
+                    if checked(pr, cx, withShape(path, id, shaped, label + " is " + types.shownName(typeName) + "." + variant.name)) is Result.Ok(p) {
+                        append(out, Out(p, shaped))
+                    }
+                }
+                return out
+            }
+        }
+        if ty is types.Ty.TResult(ok, bad) {
+            mut Out[dyn] out = []
+            good := terms.Term.OkK(part(pr, "u{id}:ok", ok, firstLabel(labels, label + "'s value")))
+            if checked(pr, cx, withShape(path, id, good, label + " is Result.Ok")) is Result.Ok(p) {
+                append(out, Out(p, good))
+            }
+            bad2 := terms.Term.ErrK(part(pr, "u{id}:error", bad, firstLabel(labels, label + "'s error")))
+            if checked(pr, cx, withShape(path, id, bad2, label + " is Result.Error")) is Result.Ok(p) {
+                append(out, Out(p, bad2))
+            }
+            return out
+        }
+        if ty is types.Ty.TVec(element, dim) {
+            if dim is ast.Dim.Fixed(n) {
+                mut terms.Term[dyn] items = []
+                for k := 0; k < n; k++ {
+                    append(items, part(pr, "u{id}[{k}]", element, label + "[{k}]"))
+                }
+                shaped := terms.Term.VecK(items)
+                return one(withShape(path, id, shaped, ""), shaped)
+            }
+        }
+    }
+    return one(path, v)
+}
+
+func firstLabel(labels: Str[], otherwise: Str): Str {
+    for each l in labels {
+        if l != "" && l != "_" {
+            return l
+        }
+        return otherwise
+    }
+    return otherwise
+}
+
+// A vector term of known length, where it has one: the value itself otherwise.
+proc fixedLength(pr: mut Prover, cx: Context, path: Path, value: terms.Term): Out[dyn] {
+    v := normIn(cx, path, value)
+    if v is terms.Term.Unknown(_, ty) {
+        if ty is types.Ty.TVec(_, dim) {
+            if dim is ast.Dim.Fixed(_) {
+                return materialize(pr, cx, path, v, [], "")
+            }
+        }
+    }
+    return one(path, v)
+}
+
+// The vector split until at least `n` of its elements are known, or it is known to
+// have fewer — and, for an `exact` pattern, until whether anything follows them is
+// known too.
+proc prefixed(pr: mut Prover, cx: Context, path: Path, value: terms.Term, n: Int, exact: Bool, labels: Str[], restLabel: Str, at: token.Pos): Out[dyn] {
+    v := normIn(cx, path, value)
+    if v is terms.Term.VecK(_) {
+        return one(path, v)
+    }
+    mut terms.Term[dyn] known = []
+    mut terms.Term tail = v
+    if v is terms.Term.VecS(front, rest) {
+        known = front
+        tail = rest
+    }
+    if len(known) >= n && (exact == false || len(known) > n) {
+        return one(path, v)
+    }
+    if tail is terms.Term.Unknown(id, ty) {
+        if ty is types.Ty.TVec(element, dim) {
+            if dim is ast.Dim.Fixed(_) {
+                mut Out[dyn] out = []
+                for each m in materialize(pr, cx, path, tail, [], "") {
+                    for each r in prefixed(pr, cx, m.path, vecJoin(known, m.value), n, exact, labels, restLabel, at) {
+                        append(out, r)
+                    }
+                }
+                return out
+            }
+            label := labelOf(pr, id)
+            mut Out[dyn] out = []
+            empty := terms.Term.VecK([])
+            if checked(pr, cx, withShape(path, id, empty, label + " is []")) is Result.Ok(p) {
+                append(out, Out(p, vecJoin(known, empty)))
+            }
+            position := len(known)
+            mut headLabel := "the first of " + label
+            if labels bounds position {
+                if labels[position] != "_" && labels[position] != "" {
+                    headLabel = labels[position]
+                }
+            }
+            mut tailLabel := "the rest of " + label
+            if position + 1 >= n && restLabel != "" && restLabel != "_" && text.startsWith(restLabel, "_rest_of_") == false {
+                tailLabel = restLabel
+            }
+            head := part(pr, "u{id}:head", element, headLabel)
+            rest := part(pr, "u{id}:tail", types.Ty.TVec(element, ast.Dim.Dynamic()), tailLabel)
+            consed := terms.Term.VecS([head], rest)
+            if checked(pr, cx, withShape(path, id, consed, label + " is [" + headLabel + ", ..." + tailLabel + "]")) is Result.Ok(p) {
+                if position + 1 >= n && exact == false {
+                    append(out, Out(p, vecJoin(known, consed)))
+                } else {
+                    for each r in prefixed(pr, cx, p, vecJoin(known, consed), n, exact, labels, restLabel, at) {
+                        append(out, r)
+                    }
+                }
+            }
+            return out
+        }
+    }
+    if len(known) >= n {
+        // Exact, and what follows the known front is not something to split.
+        return one(path, v)
+    }
+    return lostOut(path, "it cannot look inside `" + render(pr, tail) + "`", at)
+}
+
+// --- Evaluating -------------------------------------------------------------------
+
+proc eval(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, e: ast.Expr): Out[dyn] {
+    pr.steps = pr.steps + 1
+    if pr.steps > pr.budget {
+        return lostOut(path, "it gave up after {pr.budget} steps", e.at)
+    }
+    if e is ast.Expr.IntLit(v, _) {
+        return one(path, terms.Term.IntK(v))
+    } else if e is ast.Expr.FloatLit(v, _) {
+        return one(path, terms.Term.FloatK(v))
+    } else if e is ast.Expr.StrLit(v, _) {
+        return one(path, terms.Term.StrK(v))
+    } else if e is ast.Expr.BoolLit(v, _) {
+        return one(path, terms.Term.BoolK(v))
+    } else if e is ast.Expr.AtomLit(v, _) {
+        return one(path, terms.Term.AtomK(v))
+    } else if e is ast.Expr.Ident(name, at) {
+        if hive.map.get(path.env, name) is Result.Ok(v) {
+            return one(path, v)
+        }
+        if hive.map.has(cx.callables, name) {
+            return one(path, terms.Term.FnK(name, []))
+        }
+        return lostOut(path, "it cannot reason about `{name}`", at)
+    } else if e is ast.Expr.Interp(parts, at) {
+        return evalInterp(pr, cx, scope, path, parts, at)
+    } else if e is ast.Expr.VectorLit(items, _) {
+        mut Out[dyn] out = []
+        for each o in evalAll(pr, cx, scope, path, items, 0, []) {
+            append(out, Out(o.path, terms.Term.VecK(o.values)))
+        }
+        return out
+    } else if e is ast.Expr.Negate(operand, at) {
+        ty := infer.typeOf(scope, operand)
+        mut Out[dyn] out = []
+        for each o in eval(pr, cx, scope, path, operand) {
+            v := normIn(cx, o.path, o.value)
+            if ty is types.Ty.TInt {
+                append(out, Out(o.path, negate(v)))
+            } else if v is terms.Term.FloatK(f) {
+                append(out, Out(o.path, terms.Term.FloatK(-f)))
+            } else if ty is types.Ty.TFloat {
+                append(out, Out(o.path, terms.op("fneg", [v], ty)))
+            } else {
+                append(out, Out(lost(o.path, "it cannot reason about this negation", at), terms.Term.VoidK()))
+            }
+        }
+        return out
+    } else if e is ast.Expr.Not(operand, _) {
+        mut Out[dyn] out = []
+        for each o in eval(pr, cx, scope, path, operand) {
+            append(out, Out(o.path, terms.negation(normIn(cx, o.path, o.value))))
+        }
+        return out
+    } else if e is ast.Expr.Binary(op, left, right, at) {
+        return evalBinary(pr, cx, scope, path, op, left, right, at)
+    } else if e is ast.Expr.Call(callee, args, at) {
+        return evalCall(pr, cx, scope, path, callee, args, at)
+    } else if e is ast.Expr.Member(subject, field, _) {
+        ty := infer.typeOf(scope, e)
+        mut Out[dyn] out = []
+        for each o in eval(pr, cx, scope, path, subject) {
+            if running(o.path) == false {
+                append(out, o)
+                continue
+            }
+            for each r in project(pr, cx, o.path, o.value, field, ty) {
+                append(out, r)
+            }
+        }
+        return out
+    } else if e is ast.Expr.Index(subject, index, _) {
+        ty := infer.typeOf(scope, e)
+        mut Out[dyn] out = []
+        for each o in evalAll(pr, cx, scope, path, [subject, index], 0, []) {
+            append(out, Out(o.path, element(normIn(cx, o.path, terms.nth(o.values, 0)), normIn(cx, o.path, terms.nth(o.values, 1)), ty)))
+        }
+        return out
+    } else if e is ast.Expr.Slice(subject, low, high, at) {
+        return evalSlice(pr, cx, scope, path, subject, low, high, at)
+    } else if e is ast.Expr.IsMatch(subject, pattern, at) {
+        mut Out[dyn] out = []
+        for each o in eval(pr, cx, scope, path, subject) {
+            if running(o.path) == false {
+                append(out, o)
+                continue
+            }
+            for each r in matchPattern(pr, cx, scope, o.path, o.value, pattern, at) {
+                append(out, r)
+            }
+        }
+        return out
+    } else if e is ast.Expr.Hole(_) {
+        return one(path, terms.Term.Hole())
+    } else if e is ast.Expr.Absent(_) {
+        return one(path, terms.Term.VoidK())
+    }
+    return lostOut(path, "it cannot reason about `" + exprText(e) + "` yet", e.at)
+}
+
+proc evalAll(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, es: ast.Expr[], at: Int, done: terms.Term[]): Outs[dyn] {
+    if running(path) == false {
+        return [Outs(path, done)]
+    }
+    if es bounds at {
+        mut Outs[dyn] out = []
+        for each o in eval(pr, cx, scope, path, es[at]) {
+            if running(o.path) {
+                for each m in evalAll(pr, cx, scope, o.path, es, at + 1, done + [o.value]) {
+                    append(out, m)
+                }
+            } else {
+                append(out, Outs(o.path, done))
+            }
+        }
+        return out
+    }
+    mut terms.Term[dyn] values = []
+    for each d in done {
+        append(values, d)
+    }
+    return [Outs(path, values)]
+}
+
+// The arguments of a call in the order its parameters come in.
+proc evalArgs(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, args: ast.Arg[], params: ast.Param[]): Outs[dyn] {
+    mut Str[dyn] names = []
+    for each p in params {
+        append(names, p.name)
+    }
+    mut ast.Expr[dyn] ordered = []
+    for each a in ast.positional(args, names) {
+        append(ordered, a.value)
+    }
+    return evalAll(pr, cx, scope, path, ordered, 0, [])
+}
+
+proc evalBinary(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, op: ast.BinOp, left: ast.Expr, right: ast.Expr, at: token.Pos): Out[dyn] {
+    if op is ast.BinOp.And || op is ast.BinOp.Or {
+        conjunction := op is ast.BinOp.And
+        mut Out[dyn] out = []
+        for each o in eval(pr, cx, scope, path, left) {
+            if running(o.path) == false {
+                append(out, o)
+                continue
+            }
+            l := normIn(cx, o.path, o.value)
+            mut decided := false
+            mut goOn := false
+            if l is terms.Term.BoolK(b) {
+                decided = true
+                goOn = b == conjunction
+            }
+            if decided && goOn == false {
+                append(out, Out(o.path, l))
+            } else if decided {
+                for each r in eval(pr, cx, infer.narrowed(scope, left), o.path, right) {
+                    append(out, r)
+                }
+            } else {
+                // Neither side of the left is known: one path for each.
+                mut terms.Term onward = l
+                if conjunction == false {
+                    onward = terms.negation(l)
+                }
+                if assume(pr, cx, o.path, onward) is Result.Ok(yes) {
+                    for each r in eval(pr, cx, infer.narrowed(scope, left), yes, right) {
+                        append(out, r)
+                    }
+                }
+                if assume(pr, cx, o.path, terms.negation(onward)) is Result.Ok(no) {
+                    append(out, Out(no, terms.Term.BoolK(conjunction == false)))
+                }
+            }
+        }
+        return out
+    }
+    ty := infer.typeOf(scope, left)
+    mut Out[dyn] out = []
+    for each o in evalAll(pr, cx, scope, path, [left, right], 0, []) {
+        if running(o.path) == false {
+            append(out, Out(o.path, terms.Term.VoidK()))
+            continue
+        }
+        a := normIn(cx, o.path, terms.nth(o.values, 0))
+        b := normIn(cx, o.path, terms.nth(o.values, 1))
+        combined := combine(op, ty, a, b)
+        if combined is Result.Ok(v) {
+            append(out, Out(o.path, v))
+        } else {
+            append(out, Out(lost(o.path, "it cannot reason about `" + ast.opSpelling(op) + "` on " + types.show(ty) + " yet", at), terms.Term.VoidK()))
+        }
+    }
+    return out
+}
+
+func combine(op: ast.BinOp, ty: types.Ty, a: terms.Term, b: terms.Term): Result<terms.Term, Bool> {
+    if op is ast.BinOp.Eq {
+        return Result.Ok(equal(a, b))
+    }
+    if op is ast.BinOp.Neq {
+        return Result.Ok(terms.negation(equal(a, b)))
+    }
+    if ty is types.Ty.TInt {
+        if op is ast.BinOp.Add {
+            return Result.Ok(arith("add", a, b))
+        } else if op is ast.BinOp.Sub {
+            return Result.Ok(arith("sub", a, b))
+        } else if op is ast.BinOp.Mul {
+            return Result.Ok(arith("mul", a, b))
+        } else if op is ast.BinOp.Div {
+            return Result.Ok(arith("div", a, b))
+        } else if op is ast.BinOp.Mod {
+            return Result.Ok(arith("mod", a, b))
+        } else if op is ast.BinOp.Pow {
+            return Result.Ok(arith("pow", a, b))
+        }
+        return compared(op, a, b)
+    }
+    if ty is types.Ty.TStr {
+        if op is ast.BinOp.Add {
+            return Result.Ok(concat(a, b, ty))
+        }
+        return compared(op, a, b)
+    }
+    if ty is types.Ty.TFloat {
+        if a is terms.Term.FloatK(x) && b is terms.Term.FloatK(y) {
+            if op is ast.BinOp.Add {
+                return Result.Ok(terms.Term.FloatK(x + y))
+            } else if op is ast.BinOp.Sub {
+                return Result.Ok(terms.Term.FloatK(x - y))
+            } else if op is ast.BinOp.Mul {
+                return Result.Ok(terms.Term.FloatK(x * y))
+            } else if op is ast.BinOp.Div {
+                return Result.Ok(terms.Term.FloatK(x / y))
+            }
+        }
+        if op is ast.BinOp.Add || op is ast.BinOp.Sub || op is ast.BinOp.Mul || op is ast.BinOp.Div {
+            return Result.Ok(terms.op("f" + ast.opSpelling(op), [a, b], ty))
+        }
+        return compared(op, a, b)
+    }
+    if ty is types.Ty.TVec(_, _) {
+        if op is ast.BinOp.Add {
+            return Result.Ok(concat(a, b, ty))
+        }
+    }
+    return Result.Error(false)
+}
+
+func compared(op: ast.BinOp, a: terms.Term, b: terms.Term): Result<terms.Term, Bool> {
+    if op is ast.BinOp.Lt {
+        return Result.Ok(order("lt", a, b))
+    } else if op is ast.BinOp.Le {
+        return Result.Ok(order("le", a, b))
+    } else if op is ast.BinOp.Gt {
+        return Result.Ok(order("lt", b, a))
+    } else if op is ast.BinOp.Ge {
+        return Result.Ok(order("le", b, a))
+    }
+    return Result.Error(false)
+}
+
+proc evalInterp(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, parts: ast.InterpPart[], at: token.Pos): Out[dyn] {
+    mut ast.Expr[dyn] holes = []
+    for each p in parts {
+        if p is ast.InterpPart.Expression(value) {
+            append(holes, value)
+        }
+    }
+    mut Out[dyn] out = []
+    for each o in evalAll(pr, cx, scope, path, holes, 0, []) {
+        if running(o.path) == false {
+            append(out, Out(o.path, terms.Term.VoidK()))
+            continue
+        }
+        mut written := ""
+        mut whole := true
+        mut i := 0
+        for each p in parts {
+            if p is ast.InterpPart.Literal(t) {
+                written = written + t
+            } else {
+                v := normIn(cx, o.path, terms.nth(o.values, i))
+                if v is terms.Term.StrK(s) {
+                    written = written + s
+                } else if v is terms.Term.IntK(n) {
+                    written = written + "{n}"
+                } else if v is terms.Term.BoolK(b) {
+                    written = written + "{b}"
+                } else {
+                    whole = false
+                }
+                i = i + 1
+            }
+        }
+        if whole {
+            append(out, Out(o.path, terms.Term.StrK(written)))
+        } else {
+            append(out, Out(lost(o.path, "it cannot reason about an interpolation of something it does not know", at), terms.Term.VoidK()))
+        }
+    }
+    return out
+}
+
+proc evalSlice(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, subject: ast.Expr, low: ast.Expr, high: ast.Expr, at: token.Pos): Out[dyn] {
+    mut Out[dyn] out = []
+    for each o in evalAll(pr, cx, scope, path, [subject, low, high], 0, []) {
+        if running(o.path) == false {
+            append(out, Out(o.path, terms.Term.VoidK()))
+            continue
+        }
+        v := normIn(cx, o.path, terms.nth(o.values, 0))
+        lo := normIn(cx, o.path, terms.nth(o.values, 1))
+        hi := normIn(cx, o.path, terms.nth(o.values, 2))
+        mut items := 0
+        mut isVector := false
+        mut terms.Term[dyn] elements = []
+        mut Str[dyn] cs = []
+        if v is terms.Term.VecK(all) {
+            elements = all
+            items = len(all)
+            isVector = true
+        } else if v is terms.Term.StrK(s) {
+            cs = text.chars(s)
+            items = len(cs)
+        } else {
+            append(out, Out(lost(o.path, "it cannot reason about a slice of something whose length it does not know", at), terms.Term.VoidK()))
+            continue
+        }
+        mut first := 0
+        mut last := items - 1
+        if lo is terms.Term.IntK(l) {
+            first = l
+        } else if (lo is terms.Term.VoidK) == false {
+            append(out, Out(lost(o.path, "it cannot reason about a slice whose bounds it does not know", at), terms.Term.VoidK()))
+            continue
+        }
+        if hi is terms.Term.IntK(h) {
+            last = h
+        } else if (hi is terms.Term.VoidK) == false {
+            append(out, Out(lost(o.path, "it cannot reason about a slice whose bounds it does not know", at), terms.Term.VoidK()))
+            continue
+        }
+        if isVector {
+            mut terms.Term[dyn] taken = []
+            for k := first; k <= last; k++ {
+                if elements bounds k {
+                    append(taken, elements[k])
+                }
+            }
+            append(out, Out(o.path, terms.Term.VecK(taken)))
+        } else {
+            mut taken := ""
+            for k := first; k <= last; k++ {
+                if cs bounds k {
+                    taken = taken + cs[k]
+                }
+            }
+            append(out, Out(o.path, terms.Term.StrK(taken)))
+        }
+    }
+    return out
+}
+
+proc project(pr: mut Prover, cx: Context, path: Path, value: terms.Term, field: Str, ty: types.Ty): Out[dyn] {
+    v := normIn(cx, path, value)
+    if v is terms.Term.RecK(_, _, _) {
+        return one(path, fieldOf(cx.base.table, v, field, ty))
+    }
+    if v is terms.Term.Unknown(id, vty) {
+        if vty is types.Ty.TNamed(typeName) {
+            if types.findType(cx.base.table, typeName) is Result.Ok(info) {
+                if len(info.variants) == 0 {
+                    mut Out[dyn] out = []
+                    for each m in materialize(pr, cx, path, v, [], "") {
+                        append(out, Out(m.path, fieldOf(cx.base.table, normIn(cx, m.path, m.value), field, ty)))
+                    }
+                    return out
+                }
+                // A field every variant shares is the same part of the value
+                // whichever variant it turns out to be.
+                return one(path, part(pr, "u{id}.{field}", ty, labelOf(pr, id) + "." + field))
+            }
+        }
+    }
+    return one(path, terms.op("field:" + field, [v], ty))
+}
+
+// --- Patterns ---------------------------------------------------------------------
+
+proc matchPattern(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, value: terms.Term, pattern: ast.Pattern, at: token.Pos): Out[dyn] {
+    if pattern is ast.Pattern.Constructor(names, bindings, _) {
+        typeName := nameAt(names, 0)
+        variant := nameAt(names, 1)
+        mut Out[dyn] out = []
+        mut Str[dyn] labels = []
+        if path.depth == 0 {
+            labels = bindings
+        }
+        for each m in materialize(pr, cx, path, value, labels, variant) {
+            shaped := normIn(cx, m.path, m.value)
+            if shaped is terms.Term.RecK(tn, vn, fields) {
+                if tn == typeName && vn == variant {
+                    append(out, Out(bindAll(m.path, bindings, fields), terms.Term.BoolK(true)))
+                } else {
+                    append(out, Out(m.path, terms.Term.BoolK(false)))
+                }
+            } else if shaped is terms.Term.OkK(payload) {
+                if typeName == "Result" && variant == "Ok" {
+                    append(out, Out(bindAll(m.path, bindings, [payload]), terms.Term.BoolK(true)))
+                } else {
+                    append(out, Out(m.path, terms.Term.BoolK(false)))
+                }
+            } else if shaped is terms.Term.ErrK(payload) {
+                if typeName == "Result" && variant == "Error" {
+                    append(out, Out(bindAll(m.path, bindings, [payload]), terms.Term.BoolK(true)))
+                } else {
+                    append(out, Out(m.path, terms.Term.BoolK(false)))
+                }
+            } else {
+                append(out, Out(lost(m.path, "it cannot look inside `" + render(pr, shaped) + "`", at), terms.Term.VoidK()))
+            }
+        }
+        return out
+    }
+    if pattern is ast.Pattern.VectorPat(elements, rest) {
+        mut Str[dyn] labels = []
+        for each el in elements {
+            if el is ast.VecElem.Bind(name) {
+                append(labels, name)
+            } else {
+                append(labels, "")
+            }
+        }
+        n := len(elements)
+        exact := rest == ""
+        mut restLabel := rest
+        if path.depth > 0 {
+            labels = []
+            restLabel = ""
+        }
+        mut Out[dyn] out = []
+        for each m in prefixed(pr, cx, path, value, n, exact, labels, restLabel, at) {
+            if running(m.path) == false {
+                append(out, m)
+                continue
+            }
+            for each r in matchVector(pr, cx, scope, m.path, normIn(cx, m.path, m.value), elements, rest, at) {
+                append(out, r)
+            }
+        }
+        return out
+    }
+    if pattern is ast.Pattern.StrTemplate(parts) {
+        v := normIn(cx, path, value)
+        if v is terms.Term.StrK(s) {
+            mut literal := ""
+            mut plain := true
+            for each p in parts {
+                if p is token.StrPart.Literal(t) {
+                    literal = literal + t
+                } else {
+                    plain = false
+                }
+            }
+            if plain {
+                return one(path, terms.Term.BoolK(s == literal))
+            }
+        }
+        return lostOut(path, "it cannot reason about a string pattern with holes yet", at)
+    }
+    return lostOut(path, "it cannot reason about a binary pattern yet", at)
+}
+
+proc matchVector(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, v: terms.Term, elements: ast.VecElem[], rest: Str, at: token.Pos): Out[dyn] {
+    n := len(elements)
+    exact := rest == ""
+    mut terms.Term[dyn] known = []
+    mut terms.Term tail = terms.Term.VecK([])
+    mut closed := true
+    if v is terms.Term.VecK(items) {
+        known = items
+    } else if v is terms.Term.VecS(front, more) {
+        known = front
+        tail = more
+        closed = false
+    }
+    if len(known) < n {
+        if closed {
+            return one(path, terms.Term.BoolK(false))
+        }
+        return lostOut(path, "it cannot tell how long `" + render(pr, v) + "` is", at)
+    }
+    if exact && (len(known) > n || closed == false) {
+        return one(path, terms.Term.BoolK(false))
+    }
+    mut Path p = path
+    mut terms.Term holds = terms.Term.BoolK(true)
+    mut i := 0
+    mut ast.Expr[dyn] literals = []
+    mut Int[dyn] positions = []
+    for each el in elements {
+        if el is ast.VecElem.Bind(name) {
+            if name != "_" && name != "" {
+                p = withValue(p, name, terms.nth(known, i))
+            }
+        } else if el is ast.VecElem.Match(value) {
+            append(literals, value)
+            append(positions, i)
+        }
+        i = i + 1
+    }
+    if rest != "" && rest != "_" {
+        mut terms.Term[dyn] leftover = []
+        mut k := 0
+        for each item in known {
+            if k >= n {
+                append(leftover, item)
+            }
+            k = k + 1
+        }
+        p = withValue(p, rest, vecJoin(leftover, tail))
+    }
+    mut Out[dyn] out = []
+    for each o in evalAll(pr, cx, scope, p, literals, 0, []) {
+        if running(o.path) == false {
+            append(out, Out(o.path, terms.Term.VoidK()))
+            continue
+        }
+        mut terms.Term all = holds
+        mut j := 0
+        for each pos in positions {
+            all = terms.both(all, equal(terms.nth(known, pos), normIn(cx, o.path, terms.nth(o.values, j))))
+            j = j + 1
+        }
+        append(out, Out(o.path, all))
+    }
+    return out
+}
+
+func nameAt(path: Str[], index: Int): Str {
+    if path bounds index {
+        return path[index]
+    }
+    return ""
+}
+
+func bindAll(path: Path, bindings: Str[], values: terms.Term[]): Path {
+    mut Path p = path
+    mut i := 0
+    for each b in bindings {
+        if b != "_" && b != "" {
+            hive.map.set(p.env, b, terms.nth(values, i))
+        }
+        i = i + 1
+    }
+    return p
+}
+
+// --- Calls ------------------------------------------------------------------------
+
+proc evalCall(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, callee: ast.Expr, args: ast.Arg[], at: token.Pos): Out[dyn] {
+    if callee is ast.Expr.Ident(name, _) {
+        if hive.map.get(path.env, name) is Result.Ok(held) {
+            mut Out[dyn] out = []
+            for each o in evalAll(pr, cx, scope, path, argValues(args), 0, []) {
+                if running(o.path) == false {
+                    append(out, Out(o.path, terms.Term.VoidK()))
+                    continue
+                }
+                for each r in applyFn(pr, cx, o.path, normIn(cx, o.path, held), o.values, at) {
+                    append(out, r)
+                }
+            }
+            return out
+        }
+        if hive.map.get(cx.callables, name) is Result.Ok(d) {
+            if d is ast.Decl.CallableDecl(kind, _, params, _, _, _) {
+                if kind is ast.CallableKind.LawKind {
+                    return one(path, terms.Term.VoidK())
+                }
+                if infer.hasHole(args) {
+                    mut Out[dyn] out = []
+                    for each o in evalArgs(pr, cx, scope, path, args, params) {
+                        append(out, Out(o.path, terms.Term.FnK(name, o.values)))
+                    }
+                    return out
+                }
+                mut Out[dyn] out = []
+                for each o in evalArgs(pr, cx, scope, path, args, params) {
+                    if running(o.path) == false {
+                        append(out, Out(o.path, terms.Term.VoidK()))
+                        continue
+                    }
+                    for each r in callUser(pr, cx, scope, o.path, d, o.values, args, at) {
+                        append(out, r)
+                    }
+                }
+                return out
+            }
+        }
+        if types.fieldsOfStruct(scope.table, name) is Result.Ok(fields) {
+            return construct(pr, cx, scope, path, name, "", fields, args)
+        }
+        return evalBuiltin(pr, cx, scope, path, name, args, at)
+    }
+    if callee is ast.Expr.Member(subject, field, _) {
+        if subject is ast.Expr.Ident(head, _) {
+            if head == "Result" {
+                mut Out[dyn] out = []
+                for each o in evalAll(pr, cx, scope, path, argValues(args), 0, []) {
+                    payload := terms.nth(o.values, 0)
+                    if field == "Ok" {
+                        append(out, Out(o.path, terms.Term.OkK(payload)))
+                    } else {
+                        append(out, Out(o.path, terms.Term.ErrK(payload)))
+                    }
+                }
+                return out
+            }
+            if head == "hive" {
+                return evalBuiltin(pr, cx, scope, path, field, args, at)
+            }
+            if infer.isBound(scope, head) == false {
+                if types.findVariant(scope.table, head, field) is Result.Ok(fields) {
+                    return construct(pr, cx, scope, path, head, field, fields, args)
+                }
+            }
+        }
+        return lostOut(path, "it cannot reason about `" + exprText(callee) + "`: only a call the prover can read the body of can be followed", at)
+    }
+    return lostOut(path, "it cannot reason about this call", at)
+}
+
+func argValues(args: ast.Arg[]): ast.Expr[dyn] {
+    mut ast.Expr[dyn] out = []
+    for each a in args {
+        append(out, a.value)
+    }
+    return out
+}
+
+proc construct(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, typeName: Str, variant: Str, fields: ast.Field[], args: ast.Arg[]): Out[dyn] {
+    mut Str[dyn] names = []
+    for each f in fields {
+        append(names, f.name)
+    }
+    mut ast.Expr[dyn] ordered = []
+    for each a in ast.positional(args, names) {
+        append(ordered, a.value)
+    }
+    mut Out[dyn] out = []
+    for each o in evalAll(pr, cx, scope, path, ordered, 0, []) {
+        append(out, Out(o.path, terms.Term.RecK(typeName, variant, o.values)))
+    }
+    return out
+}
+
+proc applyFn(pr: mut Prover, cx: Context, path: Path, fn: terms.Term, args: terms.Term[], at: token.Pos): Out[dyn] {
+    if fn is terms.Term.FnK(name, bound) {
+        mut terms.Term[dyn] full = []
+        mut used := 0
+        if len(bound) == 0 {
+            for each a in args {
+                append(full, a)
+            }
+        } else {
+            for each b in bound {
+                if b is terms.Term.Hole {
+                    append(full, terms.nth(args, used))
+                    used = used + 1
+                } else {
+                    append(full, b)
+                }
+            }
+        }
+        if hive.map.get(cx.callables, name) is Result.Ok(d) {
+            return callUser(pr, cx, cx.base, path, d, full, [], at)
+        }
+        return lostOut(path, "it cannot reason about calling `" + types.shownName(name) + "` through a value", at)
+    }
+    return lostOut(path, "it cannot reason about a call through a value it does not know", at)
+}
+
+// A call to something the program declared: its body, run on the arguments — or,
+// past a few levels of the same callable inside itself, the call left as it is.
+proc callUser(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, d: ast.Decl, args: terms.Term[], written: ast.Arg[], at: token.Pos): Out[dyn] {
+    if d is ast.Decl.CallableDecl(_, name, params, result, body, _) {
+        resultType := types.resolve(cx.base.table, result)
+        mut Bool[dyn] lends = []
+        mut anyMut := false
+        for each p in params {
+            append(lends, p.mutable)
+            if p.mutable {
+                anyMut = true
+            }
+        }
+        if path.depth >= depthLimit() || timesInside(path, name) >= unfoldLimit() || onFrontier(pr, cx, path, name, args) {
+            if anyMut {
+                return lostOut(path, "it cannot follow `" + types.shownName(name) + "` any deeper", at)
+            }
+            if hive.map.has(cx.mayFail, name) {
+                return lostOut(path, "it cannot follow `" + types.shownName(name) + "` deep enough to show that nothing in it fails an `assert` or reaches a `panic`", at)
+            }
+            return one(path, terms.op("call:" + name, normAll(cx.base.table, path.shapes, args), resultType))
+        }
+        mut Str[dyn] lentTo = []
+        if anyMut {
+            mut Str[dyn] names = []
+            for each p in params {
+                append(names, p.name)
+            }
+            ordered := ast.positional(written, names)
+            mut i := 0
+            for each p in params {
+                if p.mutable {
+                    mut lent := ""
+                    if ordered bounds i {
+                        if ordered[i].value is ast.Expr.Ident(name, _) {
+                            lent = name
+                        }
+                    }
+                    if lent == "" {
+                        return lostOut(path, "it cannot follow a `mut` argument that is not a plain variable", at)
+                    }
+                    append(lentTo, lent)
+                } else {
+                    append(lentTo, "")
+                }
+                i = i + 1
+            }
+        }
+        mut hive.map.Map<Str, terms.Term> env = hive.map.new()
+        mut Str[dyn] muts = []
+        mut i := 0
+        for each p in params {
+            hive.map.set(env, p.name, terms.nth(args, i))
+            if p.mutable {
+                append(muts, p.name)
+            }
+            i = i + 1
+        }
+        callerEnv := path.env
+        callerFrame := path.frame
+        callerMuts := path.muts
+        mut Path inside = path
+        inside.env = env
+        inside.frame = Frame(name, normAll(cx.base.table, path.shapes, args))
+        inside.depth = path.depth + 1
+        inside.muts = muts
+        calleeScope := infer.boundParams(cx.base, params, 0)
+        mut Out[dyn] out = []
+        for each p in execBlock(pr, cx, calleeScope, inside, body.stmts) {
+            // The caller's names again, with what the callee wrote through each `mut`
+            // parameter. Built whole rather than as a `mut` copy of `p` with fields
+            // written into it: such a copy can share `p`'s storage, and a write
+            // through it be lost.
+            mut hive.map.Map<Str, terms.Term> env2 = hive.map.new()
+            for each k in hive.map.keys(callerEnv) {
+                if hive.map.get(callerEnv, k) is Result.Ok(v) {
+                    hive.map.set(env2, k, v)
+                }
+            }
+            mut j := 0
+            for each lent in lentTo {
+                if lent != "" {
+                    if params bounds j {
+                        if hive.map.get(p.env, params[j].name) is Result.Ok(v) {
+                            hive.map.set(env2, lent, v)
+                        }
+                    }
+                }
+                j = j + 1
+            }
+            mut End how = p.ended
+            mut terms.Term value = terms.Term.VoidK()
+            if p.ended is End.Returned(v) {
+                how = End.Running()
+                value = v
+            }
+            back := Path(env2, p.facts, p.shapes, p.lemmas, how, p.cases, callerFrame, path.depth, callerMuts)
+            append(out, Out(back, value))
+        }
+        return out
+    }
+    return lostOut(path, "it cannot reason about this call", at)
+}
+
+// Whether a recursive callable is handed one of the unknowns the law has called
+// itself on.
+proc onFrontier(pr: mut Prover, cx: Context, path: Path, name: Str, args: terms.Term[]): Bool {
+    if len(pr.frontier) == 0 || hive.map.has(cx.recursive, name) == false {
+        return false
+    }
+    for each a in args {
+        if indexOf(pr.frontier, terms.key(normIn(cx, path, a))) is Result.Ok(_) {
+            return true
+        }
+    }
+    return false
+}
+
+// How many times a callable is already open on this path's way here. The frame
+// records only the innermost, so this counts what the depth allows.
+func timesInside(path: Path, name: Str): Int {
+    if path.frame.callable == name {
+        return path.depth
+    }
+    return 0
+}
+
+// --- Builtins ---------------------------------------------------------------------
+
+proc evalBuiltin(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, name: Str, args: ast.Arg[], at: token.Pos): Out[dyn] {
+    ordered := infer.builtinArgs(name, args)
+    mut ast.Expr[dyn] values = []
+    for each a in ordered {
+        append(values, a.value)
+    }
+    if name == "len" {
+        mut Out[dyn] out = []
+        for each o in evalAll(pr, cx, scope, path, values, 0, []) {
+            append(out, Out(o.path, lengthOf(normIn(cx, o.path, terms.nth(o.values, 0)))))
+        }
+        return out
+    }
+    if name == "append" || name == "prepend" {
+        if values bounds 0 {
+            if values[0] is ast.Expr.Ident(vector, _) {
+                ty := infer.typeOf(scope, values[0])
+                mut Out[dyn] out = []
+                for each o in evalAll(pr, cx, scope, path, values, 0, []) {
+                    if running(o.path) == false {
+                        append(out, Out(o.path, terms.Term.VoidK()))
+                        continue
+                    }
+                    old := normIn(cx, o.path, terms.nth(o.values, 0))
+                    item := terms.Term.VecK([terms.nth(o.values, 1)])
+                    mut terms.Term grown = concat(old, item, ty)
+                    if name == "prepend" {
+                        grown = concat(item, old, ty)
+                    }
+                    append(out, Out(withValue(o.path, vector, grown), terms.Term.VoidK()))
+                }
+                return out
+            }
+        }
+        return lostOut(path, "it cannot follow `{name}` onto anything but a variable", at)
+    }
+    if name == "join" || name == "split" || name == "replaceFirst" || name == "replaceAll" || name == "indexOf" {
+        mut Out[dyn] out = []
+        for each o in evalAll(pr, cx, scope, path, values, 0, []) {
+            if running(o.path) == false {
+                append(out, Out(o.path, terms.Term.VoidK()))
+                continue
+            }
+            done := concreteBuiltin(name, normAll(cx.base.table, o.path.shapes, o.values))
+            if done is Result.Ok(v) {
+                append(out, Out(o.path, v))
+            } else {
+                append(out, Out(lost(o.path, "it can follow `{name}` only on values it knows", at), terms.Term.VoidK()))
+            }
+        }
+        return out
+    }
+    if name == "map" || name == "filter" {
+        mut Out[dyn] out = []
+        for each o in evalAll(pr, cx, scope, path, values, 0, []) {
+            if running(o.path) == false {
+                append(out, Out(o.path, terms.Term.VoidK()))
+                continue
+            }
+            v := normIn(cx, o.path, terms.nth(o.values, 0))
+            fn := normIn(cx, o.path, terms.nth(o.values, 1))
+            if v is terms.Term.VecK(items) {
+                for each r in mapped(pr, cx, o.path, items, fn, name == "filter", 0, [], at) {
+                    append(out, r)
+                }
+            } else {
+                append(out, Out(lost(o.path, "it can follow `{name}` only over a vector whose length it knows", at), terms.Term.VoidK()))
+            }
+        }
+        return out
+    }
+    return lostOut(path, "it cannot reason about `{name}` yet", at)
+}
+
+func concreteBuiltin(name: Str, args: terms.Term[]): Result<terms.Term, Bool> {
+    a := terms.nth(args, 0)
+    b := terms.nth(args, 1)
+    c := terms.nth(args, 2)
+    if name == "split" {
+        if a is terms.Term.StrK(s) && b is terms.Term.StrK(sep) {
+            mut terms.Term[dyn] pieces = []
+            for each piece in split(s, sep) {
+                append(pieces, terms.Term.StrK(piece))
+            }
+            return Result.Ok(terms.Term.VecK(pieces))
+        }
+    }
+    if name == "join" {
+        if a is terms.Term.VecK(items) && b is terms.Term.StrK(sep) {
+            mut Str[dyn] pieces = []
+            for each item in items {
+                if item is terms.Term.StrK(s) {
+                    append(pieces, s)
+                } else {
+                    return Result.Error(false)
+                }
+            }
+            return Result.Ok(terms.Term.StrK(join(pieces, sep)))
+        }
+    }
+    if name == "replaceFirst" || name == "replaceAll" {
+        if a is terms.Term.StrK(s) && b is terms.Term.StrK(from) && c is terms.Term.StrK(to) {
+            if name == "replaceFirst" {
+                return Result.Ok(terms.Term.StrK(replaceFirst(s, from, to)))
+            }
+            return Result.Ok(terms.Term.StrK(replaceAll(s, from, to)))
+        }
+    }
+    if name == "indexOf" {
+        if a is terms.Term.StrK(s) && b is terms.Term.StrK(needle) {
+            if indexOf(s, needle) is Result.Ok(at) {
+                return Result.Ok(terms.Term.OkK(terms.Term.IntK(at)))
+            }
+            return Result.Ok(terms.Term.ErrK(terms.Term.BoolK(false)))
+        }
+        if a is terms.Term.VecK(items) && terms.known(b) {
+            mut i := 0
+            for each item in items {
+                if terms.known(item) == false {
+                    return Result.Error(false)
+                }
+                if sameValue(item, b) {
+                    return Result.Ok(terms.Term.OkK(terms.Term.IntK(i)))
+                }
+                i = i + 1
+            }
+            return Result.Ok(terms.Term.ErrK(terms.Term.BoolK(false)))
+        }
+    }
+    return Result.Error(false)
+}
+
+proc mapped(pr: mut Prover, cx: Context, path: Path, items: terms.Term[], fn: terms.Term, keeping: Bool, at: Int, done: terms.Term[], where: token.Pos): Out[dyn] {
+    if items bounds at {
+        mut Out[dyn] out = []
+        for each r in applyFn(pr, cx, path, fn, [items[at]], where) {
+            if running(r.path) == false {
+                append(out, r)
+                continue
+            }
+            v := normIn(cx, r.path, r.value)
+            if keeping {
+                if terms.isTrue(v) {
+                    for each m in mapped(pr, cx, r.path, items, fn, keeping, at + 1, done + [items[at]], where) {
+                        append(out, m)
+                    }
+                } else if terms.isFalse(v) {
+                    for each m in mapped(pr, cx, r.path, items, fn, keeping, at + 1, done, where) {
+                        append(out, m)
+                    }
+                } else {
+                    if assume(pr, cx, r.path, v) is Result.Ok(yes) {
+                        for each m in mapped(pr, cx, yes, items, fn, keeping, at + 1, done + [items[at]], where) {
+                            append(out, m)
+                        }
+                    }
+                    if assume(pr, cx, r.path, terms.negation(v)) is Result.Ok(no) {
+                        for each m in mapped(pr, cx, no, items, fn, keeping, at + 1, done, where) {
+                            append(out, m)
+                        }
+                    }
+                }
+            } else {
+                for each m in mapped(pr, cx, r.path, items, fn, keeping, at + 1, done + [v], where) {
+                    append(out, m)
+                }
+            }
+        }
+        return out
+    }
+    mut terms.Term[dyn] values = []
+    for each d in done {
+        append(values, d)
+    }
+    return one(path, terms.Term.VecK(values))
+}
+
+// --- The loop that is the callable on the rest --------------------------------------
+
+// The parameter a callable's opening `for each` walks, where that loop is the same
+// as the callable called again on what is left: the body never names the
+// parameter again, nothing before the loop, and the loop changes nothing outside
+// itself.
+func tailLoop(params: ast.Param[], body: ast.Block, lenders: Str[]): Result<Int, Bool> {
+    if body.stmts bounds 0 {
+        first := body.stmts[0]
+        if first is ast.Stmt.ForEach(_, _, subject, loopBody, _) {
+            if subject is ast.Expr.Ident(walked, _) {
+                mut position := -1
+                mut i := 0
+                for each p in params {
+                    if p.name == walked && p.mutable == false {
+                        position = i
+                    }
+                    if p.mutable {
+                        return Result.Error(false)
+                    }
+                    i = i + 1
+                }
+                if position < 0 {
+                    return Result.Error(false)
+                }
+                mut ast.Stmt[dyn] restOfBody = []
+                mut k := 0
+                for each s in body.stmts {
+                    if k > 0 {
+                        append(restOfBody, s)
+                    }
+                    k = k + 1
+                }
+                if indexOf(namesInStmts(loopBody.stmts) + namesInStmts(restOfBody), walked) is Result.Ok(_) {
+                    return Result.Error(false)
+                }
+                declaredInside := declaredInStmts(loopBody.stmts)
+                for each written in assignedInStmts(loopBody.stmts) {
+                    if (indexOf(declaredInside, written) is Result.Ok(_)) == false {
+                        return Result.Error(false)
+                    }
+                }
+                // A call that writes through a `mut` parameter could carry
+                // something from one turn to the next, which the callable called
+                // again would not.
+                for each n in namesInStmts(loopBody.stmts) {
+                    if indexOf(lenders, n) is Result.Ok(_) {
+                        return Result.Error(false)
+                    }
+                }
+                return Result.Ok(position)
+            }
+        }
+    }
+    return Result.Error(false)
+}
+
+func namesInStmts(stmts: ast.Stmt[]): Str[dyn] {
+    mut Str[dyn] out = []
+    for each s in stmts {
+        for each n in namesInStmt(s) {
+            append(out, n)
+        }
+    }
+    return out
+}
+
+func namesInStmt(s: ast.Stmt): Str[dyn] {
+    mut Str[dyn] out = []
+    for each e in exprsOfStmt(s) {
+        for each n in namesIn(e) {
+            append(out, n)
+        }
+    }
+    for each b in blocksOfStmt(s) {
+        for each n in namesInStmts(b.stmts) {
+            append(out, n)
+        }
+    }
+    return out
+}
+
+func exprsOfStmt(s: ast.Stmt): ast.Expr[dyn] {
+    mut ast.Expr[dyn] out = []
+    if s is ast.Stmt.VarDecl(_, value, _, _, _) {
+        append(out, value)
+    } else if s is ast.Stmt.TypedDecl(_, _, value, _, _, _) {
+        append(out, value)
+    } else if s is ast.Stmt.Assign(target, value, _) {
+        append(out, target)
+        append(out, value)
+    } else if s is ast.Stmt.IfChain(branches, _, _, _) {
+        for each b in branches {
+            append(out, b.condition)
+        }
+    } else if s is ast.Stmt.SwitchStmt(lets, subjects, arms, _, _) {
+        for each subject in subjects {
+            append(out, subject)
+        }
+        for each l in lets {
+            for each e in exprsOfStmt(l) {
+                append(out, e)
+            }
+        }
+        for each a in arms {
+            append(out, a.condition)
+        }
+    } else if s is ast.Stmt.ForLoop(init, cond, post, _, _) {
+        append(out, cond)
+        for each e in exprsOfStmt(init) {
+            append(out, e)
+        }
+        for each e in exprsOfStmt(post) {
+            append(out, e)
+        }
+    } else if s is ast.Stmt.ForEach(_, _, subject, _, _) {
+        append(out, subject)
+    } else if s is ast.Stmt.ReturnStmt(value, _) {
+        append(out, value)
+    } else if s is ast.Stmt.EchoStmt(value, _) {
+        append(out, value)
+    } else if s is ast.Stmt.AssertStmt(value, _) {
+        append(out, value)
+    } else if s is ast.Stmt.PanicStmt(value, _) {
+        append(out, value)
+    } else if s is ast.Stmt.AsyncStmt(value, _) {
+        append(out, value)
+    } else if s is ast.Stmt.Expression(value, _) {
+        append(out, value)
+    }
+    return out
+}
+
+func blocksOfStmt(s: ast.Stmt): ast.Block[dyn] {
+    mut ast.Block[dyn] out = []
+    if s is ast.Stmt.IfChain(branches, otherwise, _, _) {
+        for each b in branches {
+            append(out, b.body)
+        }
+        append(out, otherwise)
+    } else if s is ast.Stmt.SwitchStmt(_, _, arms, _, _) {
+        for each a in arms {
+            append(out, a.body)
+        }
+    } else if s is ast.Stmt.ForLoop(_, _, _, body, _) {
+        append(out, body)
+    } else if s is ast.Stmt.ForEach(_, _, _, body, _) {
+        append(out, body)
+    }
+    return out
+}
+
+func namesIn(e: ast.Expr): Str[dyn] {
+    mut Str[dyn] out = []
+    if e is ast.Expr.Ident(name, _) {
+        append(out, name)
+    } else if e is ast.Expr.Interp(parts, _) {
+        for each p in parts {
+            if p is ast.InterpPart.Expression(value) {
+                for each n in namesIn(value) {
+                    append(out, n)
+                }
+            }
+        }
+    } else if e is ast.Expr.VectorLit(items, _) {
+        for each item in items {
+            for each n in namesIn(item) {
+                append(out, n)
+            }
+        }
+    } else if e is ast.Expr.Negate(x, _) {
+        return namesIn(x)
+    } else if e is ast.Expr.Not(x, _) {
+        return namesIn(x)
+    } else if e is ast.Expr.BitNot(x, _) {
+        return namesIn(x)
+    } else if e is ast.Expr.Binary(_, l, r, _) {
+        return namesIn(l) + namesIn(r)
+    } else if e is ast.Expr.Call(callee, args, _) {
+        for each n in namesIn(callee) {
+            append(out, n)
+        }
+        for each a in args {
+            for each n in namesIn(a.value) {
+                append(out, n)
+            }
+        }
+    } else if e is ast.Expr.Member(subject, _, _) {
+        return namesIn(subject)
+    } else if e is ast.Expr.Index(subject, index, _) {
+        return namesIn(subject) + namesIn(index)
+    } else if e is ast.Expr.Slice(subject, low, high, _) {
+        return namesIn(subject) + namesIn(low) + namesIn(high)
+    } else if e is ast.Expr.IsMatch(subject, pattern, _) {
+        for each n in namesIn(subject) {
+            append(out, n)
+        }
+        for each x in ast.patternExprs(pattern) {
+            for each n in namesIn(x) {
+                append(out, n)
+            }
+        }
+    } else if e is ast.Expr.AwaitAll(calls, timeout, _) {
+        for each c in calls {
+            for each n in namesIn(c) {
+                append(out, n)
+            }
+        }
+        for each n in namesIn(timeout) {
+            append(out, n)
+        }
+    } else if e is ast.Expr.Timed(call, ms, _) {
+        return namesIn(call) + namesIn(ms)
+    }
+    return out
+}
+
+func declaredInStmts(stmts: ast.Stmt[]): Str[dyn] {
+    mut Str[dyn] out = []
+    for each s in stmts {
+        if s is ast.Stmt.VarDecl(name, _, _, _, _) {
+            append(out, name)
+        } else if s is ast.Stmt.TypedDecl(_, name, _, _, _, _) {
+            append(out, name)
+        } else if s is ast.Stmt.ForLoop(init, _, _, _, _) {
+            for each n in declaredInStmts([init]) {
+                append(out, n)
+            }
+        }
+        for each b in blocksOfStmt(s) {
+            for each n in declaredInStmts(b.stmts) {
+                append(out, n)
+            }
+        }
+    }
+    return out
+}
+
+// Every name a statement writes to: assigned, or grown by `append`/`prepend`/`drop`.
+func assignedInStmts(stmts: ast.Stmt[]): Str[dyn] {
+    mut Str[dyn] out = []
+    for each s in stmts {
+        if s is ast.Stmt.Assign(target, _, _) {
+            append(out, rootOf(target))
+        } else if s is ast.Stmt.Expression(value, _) {
+            if value is ast.Expr.Call(callee, args, _) {
+                if callee is ast.Expr.Ident(name, _) {
+                    if name == "append" || name == "prepend" || name == "drop" || name == "sort" {
+                        for each a in args {
+                            append(out, rootOf(a.value))
+                            break
+                        }
+                    }
+                }
+            }
+        }
+        for each b in blocksOfStmt(s) {
+            for each n in assignedInStmts(b.stmts) {
+                append(out, n)
+            }
+        }
+    }
+    return out
+}
+
+func rootOf(e: ast.Expr): Str {
+    if e is ast.Expr.Ident(name, _) {
+        return name
+    }
+    if e is ast.Expr.Member(subject, _, _) {
+        return rootOf(subject)
+    }
+    if e is ast.Expr.Index(subject, _, _) {
+        return rootOf(subject)
+    }
+    return ""
+}
+
+// --- Writing things down ------------------------------------------------------------
+
+// A term as a reader would write it: unknowns by the names they came from.
+proc render(pr: mut Prover, t: terms.Term): Str {
+    if t is terms.Term.Unknown(id, _) {
+        return labelOf(pr, id)
+    }
+    if t is terms.Term.Op(name, args, _) {
+        a := terms.nth(args, 0)
+        b := terms.nth(args, 1)
+        if name == "add" {
+            return render(pr, a) + " + " + render(pr, b)
+        } else if name == "sub" {
+            return render(pr, a) + " - " + grouped(pr, b)
+        } else if name == "mul" {
+            return grouped(pr, a) + " * " + grouped(pr, b)
+        } else if name == "div" {
+            return grouped(pr, a) + " / " + grouped(pr, b)
+        } else if name == "mod" {
+            return grouped(pr, a) + " % " + grouped(pr, b)
+        } else if name == "neg" {
+            return "-" + grouped(pr, a)
+        } else if name == "eq" {
+            return render(pr, a) + " == " + render(pr, b)
+        } else if name == "lt" {
+            return render(pr, a) + " < " + render(pr, b)
+        } else if name == "le" {
+            return render(pr, a) + " <= " + render(pr, b)
+        } else if name == "not" {
+            if a is terms.Term.Op(innerName, innerArgs, _) {
+                if innerName == "eq" {
+                    return render(pr, terms.nth(innerArgs, 0)) + " != " + render(pr, terms.nth(innerArgs, 1))
+                }
+                if innerName == "lt" {
+                    return render(pr, terms.nth(innerArgs, 1)) + " <= " + render(pr, terms.nth(innerArgs, 0))
+                }
+                if innerName == "le" {
+                    return render(pr, terms.nth(innerArgs, 1)) + " < " + render(pr, terms.nth(innerArgs, 0))
+                }
+            }
+            return "!(" + render(pr, a) + ")"
+        } else if name == "and" {
+            return grouped(pr, a) + " && " + grouped(pr, b)
+        } else if name == "or" {
+            return grouped(pr, a) + " || " + grouped(pr, b)
+        } else if name == "len" {
+            return "len(" + render(pr, a) + ")"
+        } else if name == "cat" {
+            return render(pr, a) + " + " + render(pr, b)
+        } else if name == "elem" {
+            return grouped(pr, a) + "[" + render(pr, b) + "]"
+        } else if name == "nil" {
+            return render(pr, a) + " is []"
+        } else if name == "cons" {
+            return render(pr, a) + " is [_, ...]"
+        } else if text.startsWith(name, "is:") {
+            return render(pr, a) + " is " + types.shownName(after(name, 3))
+        } else if text.startsWith(name, "field:") {
+            return grouped(pr, a) + "." + after(name, 6)
+        } else if text.startsWith(name, "call:") {
+            return types.shownName(after(name, 5)) + "(" + renderAll(pr, args) + ")"
+        } else if text.startsWith(name, "loop:") {
+            return loopText(pr, name, args)
+        }
+        return name + "(" + renderAll(pr, args) + ")"
+    }
+    if t is terms.Term.VecK(items) {
+        return "[" + renderAll(pr, items) + "]"
+    }
+    if t is terms.Term.VecS(known, rest) {
+        return "[" + renderAll(pr, known) + "] + " + render(pr, rest)
+    }
+    if t is terms.Term.RecK(typeName, variant, fields) {
+        whole := wholeOf(pr, fields)
+        if variant == "" && whole != "" {
+            return whole
+        }
+        if variant == "" {
+            return types.shownName(typeName) + "(" + renderAll(pr, fields) + ")"
+        }
+        return types.shownName(typeName) + "." + variant + "(" + renderAll(pr, fields) + ")"
+    }
+    if t is terms.Term.OkK(payload) {
+        return "Result.Ok(" + render(pr, payload) + ")"
+    }
+    if t is terms.Term.ErrK(payload) {
+        return "Result.Error(" + render(pr, payload) + ")"
+    }
+    if t is terms.Term.FnK(name, _) {
+        return types.shownName(name)
+    }
+    return terms.key(t)
+}
+
+// `current after the loop at line 12 over log`, for what a loop carried to its end.
+proc loopText(pr: mut Prover, name: Str, args: terms.Term[]): Str {
+    pieces := split(after(name, 5), ":")
+    mut variable := ""
+    mut line := ""
+    mut Str[dyn] state = []
+    if pieces bounds 0 {
+        at := split(pieces[0], "@")
+        if at bounds 1 {
+            line = at[1]
+        }
+    }
+    if pieces bounds 2 {
+        variable = pieces[2]
+    }
+    if pieces bounds 3 {
+        state = split(pieces[3], ",")
+    }
+    mut Str[dyn] from = []
+    mut i := 1
+    for each n in state {
+        if n != "" {
+            append(from, n + " = " + render(pr, terms.nth(args, i)))
+        }
+        i = i + 1
+    }
+    mut starting := ""
+    if len(from) > 0 {
+        starting = ", starting from " + join(from, ", ")
+    }
+    return "(" + variable + " after the loop at line " + line + " over " + render(pr, terms.nth(args, 0)) + starting + ")"
+}
+
+// The name of the unknown a struct's fields were all taken from, where they were:
+// `b` rather than `Booking(b.room, b.checkInDay, ...)`.
+proc wholeOf(pr: mut Prover, fields: terms.Term[]): Str {
+    mut whole := ""
+    for each f in fields {
+        if f is terms.Term.Unknown(id, _) {
+            label := labelOf(pr, id)
+            parts := split(label, ".")
+            if len(parts) < 2 {
+                return ""
+            }
+            mut Str[dyn] front = []
+            mut k := 0
+            for each piece in parts {
+                if k < len(parts) - 1 {
+                    append(front, piece)
+                }
+                k = k + 1
+            }
+            owner := join(front, ".")
+            if whole == "" {
+                whole = owner
+            } else if whole != owner {
+                return ""
+            }
+        } else {
+            return ""
+        }
+    }
+    return whole
+}
+
+proc grouped(pr: mut Prover, t: terms.Term): Str {
+    if t is terms.Term.Op(name, _, _) {
+        if name == "add" || name == "sub" || name == "and" || name == "or" || name == "eq" || name == "lt" || name == "le" || name == "cat" {
+            return "(" + render(pr, t) + ")"
+        }
+    }
+    return render(pr, t)
+}
+
+proc renderAll(pr: mut Prover, ts: terms.Term[]): Str {
+    mut Str[dyn] out = []
+    for each t in ts {
+        append(out, render(pr, t))
+    }
+    return join(out, ", ")
+}
+
+func caseText(path: Path): Str {
+    if len(path.cases) == 0 {
+        return ""
+    }
+    return "\n    in the case " + join(path.cases, ", and ")
+}
+
+proc knownText(pr: mut Prover, cx: Context, path: Path): Str {
+    mut Str[dyn] shown = []
+    for each f in normFacts(cx, path) {
+        if len(shown) < 4 {
+            append(shown, render(pr, f))
+        }
+    }
+    for each l in normLemmas(cx, path) {
+        if len(shown) < 6 && solve.guardsHold(normFacts(cx, path), l.guards) {
+            append(shown, render(pr, l.conclusion))
+        }
+    }
+    if len(shown) == 0 {
+        return ""
+    }
+    return "\n    known: " + join(shown, "; ")
+}
+
+// An expression as it was written, near enough for a message.
+func exprText(e: ast.Expr): Str {
+    if e is ast.Expr.IntLit(v, _) {
+        return "{v}"
+    } else if e is ast.Expr.FloatLit(v, _) {
+        return "{v}"
+    } else if e is ast.Expr.StrLit(v, _) {
+        return "\"" + v + "\""
+    } else if e is ast.Expr.BoolLit(v, _) {
+        return "{v}"
+    } else if e is ast.Expr.AtomLit(v, _) {
+        return "#" + v
+    } else if e is ast.Expr.Ident(name, _) {
+        return types.shownName(name)
+    } else if e is ast.Expr.VectorLit(items, _) {
+        mut Str[dyn] out = []
+        for each item in items {
+            append(out, exprText(item))
+        }
+        return "[" + join(out, ", ") + "]"
+    } else if e is ast.Expr.Negate(x, _) {
+        return "-" + exprText(x)
+    } else if e is ast.Expr.Not(x, _) {
+        return "!" + exprText(x)
+    } else if e is ast.Expr.Binary(op, l, r, _) {
+        return exprText(l) + " " + ast.opSpelling(op) + " " + exprText(r)
+    } else if e is ast.Expr.Call(callee, args, _) {
+        mut Str[dyn] out = []
+        for each a in args {
+            if a.name != "" {
+                append(out, a.name + ": " + exprText(a.value))
+            } else {
+                append(out, exprText(a.value))
+            }
+        }
+        return exprText(callee) + "(" + join(out, ", ") + ")"
+    } else if e is ast.Expr.Member(subject, field, _) {
+        return exprText(subject) + "." + field
+    } else if e is ast.Expr.Index(subject, index, _) {
+        return exprText(subject) + "[" + exprText(index) + "]"
+    } else if e is ast.Expr.IsMatch(subject, pattern, _) {
+        if pattern is ast.Pattern.Constructor(names, _, _) {
+            mut Str[dyn] shown = []
+            for each n in names {
+                append(shown, types.shownName(n))
+            }
+            return exprText(subject) + " is " + join(shown, ".")
+        }
+        return exprText(subject) + " is ..."
+    } else if e is ast.Expr.Hole(_) {
+        return "_"
+    }
+    return "..."
+}

@@ -33,6 +33,7 @@ func pages(): page.Page[dyn] {
         page.Page("tables.md", tables()),
         page.Page("queries.md", queries()),
         page.Page("testing.md", testing()),
+        page.Page("laws.md", laws()),
         page.Page("cli.md", cli()),
         page.Page("lsp.md", lsp()),
         page.Page("pitfalls.md", pitfalls())
@@ -68,7 +69,7 @@ func index(): Str {
         | --- | --- |
         | [syntax](syntax.md) | comments, keywords, how a name must be spelled, both string forms |
         | [types](types.md) | scalars, vectors, ~BT~Result~BT~, declared types, maps, what may be assigned to what |
-        | [declarations](declarations.md) | ~BT~type~BT~ ~BT~func~BT~ ~BT~proc~BT~ ~BT~query~BT~ ~BT~test~BT~, and returning on every path |
+        | [declarations](declarations.md) | ~BT~type~BT~ ~BT~func~BT~ ~BT~proc~BT~ ~BT~query~BT~ ~BT~test~BT~ ~BT~law~BT~, and returning on every path |
         | [expressions](expressions.md) | operators, precedence, calls, named arguments, function values |
         | [statements](statements.md) | bindings, assignment, ~BT~if~BT~, ~BT~switch~BT~, loops, ~BT~echo~BT~ / ~BT~assert~BT~ / ~BT~panic~BT~ |
         | [patterns](patterns.md) | ~BT~is~BT~, its four pattern kinds, nesting them, narrowing, exhaustiveness, a ~BT~switch~BT~'s coverage |
@@ -81,6 +82,7 @@ func index(): Str {
         | [tables](tables.md) | CSV, spreadsheets, and the ~BT~Table~BT~ type |
         | [queries](queries.md) | ~BT~query~BT~ declarations and the SQL in them |
         | [testing](testing.md) | ~BT~test~BT~, ~BT~assert~BT~, coverage |
+        | [laws](laws.md) | ~BT~law~BT~: claims the compiler proves for every value, and what a law may reach |
         | [cli](cli.md) | every ~BT~hive~BT~ command |
         | [lsp](lsp.md) | the language server: what to ask it instead of reading files, and how to connect it |
         | [pitfalls](pitfalls.md) | **the mistakes that do not compile** — read this one first |
@@ -136,8 +138,10 @@ func syntax(): Str {
         if       else     return   is       with     switch
         void     true     false    echo     assert   panic
         dyn      mut      async    await    for      in
-        each     bounds   break    continue
+        each     bounds   break    continue law      axiom
         ~CODE~
+
+        ~BT~axiom~BT~ is **reserved**: it means nothing yet, and any use of it is a compile error.
 
         Any other casing is an ordinary name: a union may have a variant called
         ~BT~Return~BT~, a type may be called ~BT~Query~BT~, and a variable ~BT~proC~BT~. A field cannot
@@ -519,7 +523,7 @@ func declarations(): Str {
     return page.backticked(`
         # Declarations
 
-        A file holds imports and then declarations, in any order. There are five kinds
+        A file holds imports and then declarations, in any order. There are six kinds
         and **no ~BT~pub~BT~/~BT~priv~BT~ distinction**: everything a module declares is visible to
         whoever imports it. Declarations at module level are mutually visible, so two
         callables may call each other.
@@ -664,6 +668,20 @@ func declarations(): Str {
         Named in prose, takes no parameters, returns nothing. ~BT~return value~BT~ inside one
         is a compile error; a bare ~BT~return~BT~ to leave early is fine. See
         [testing](testing.md).
+
+        ## ~BT~law~BT~
+
+        ~CODE~hive
+        law cancelledIsFinal(booking: Booking, event: Event) \{
+        	if booking.status is Status.Cancelled \{
+        		assert apply(booking, event).status == booking.status
+        	}
+        }
+        ~CODE~
+
+        A claim the compiler proves for every value of its parameters; one it cannot
+        prove is a compile error. No return type, no ~BT~mut~BT~ parameter, only another law
+        may call it, and it is never emitted. See [laws](laws.md).
 
         ## ~BT~import~BT~
 
@@ -2336,6 +2354,117 @@ func testing(): Str {
     `)
 }
 
+func laws(): Str {
+    return page.backticked(`
+        # Laws
+
+        A ~BT~law~BT~ is a claim about the program that the compiler proves while it
+        compiles. Its parameters take every value of their types, and every ~BT~assert~BT~ its
+        body reaches has to hold for all of them. **A law the compiler cannot prove is a
+        compile error**, and nothing accepts one anyway. A law is never emitted and never
+        runs.
+
+        ~CODE~hive
+        law cancelledIsFinal(booking: Booking, event: Event) \{
+        	if booking.status is Status.Cancelled \{
+        		assert apply(booking, event).status == booking.status
+        	}
+        }
+        ~CODE~
+
+        ## Writing one
+
+        * Named in ~BT~camelCase~BT~ like a callable. **No return type** — writing one is an
+          error — and **no ~BT~mut~BT~ parameter**.
+        * The body may hold anything a ~BT~func~BT~ body may. **Every ~BT~assert~BT~ it reaches is
+          the claim**; one under an ~BT~if~BT~ claims something only where the ~BT~if~BT~ holds,
+          and a pattern narrows the same way.
+        * **Nothing the law reaches may panic or fail an ~BT~assert~BT~**, so a law with no
+          ~BT~assert~BT~ claims exactly that: ~BT~law parses(text: Str) \{ _ := nightsOf(text) }~BT~.
+        * An ~BT~assert~BT~ is a fact for the statements after it.
+
+        ## Calling a law
+
+        Only a law may call a law, as a statement; anywhere else, or as a value, it is an
+        error. A call is a hint and never runs:
+
+        * **another law** hands over its claim for those arguments;
+        * **the law itself** is an induction, and has to pass, in a parameter's place,
+          **a part a pattern took from that parameter** — the rest of a vector, an
+          element, a variant's field;
+        * **laws may not call each other round in a circle.**
+
+        ~CODE~hive
+        law replayKeepsTheRoom(booking: Booking, log: Event[dyn]) \{
+        	if log is [first, ...rest] \{
+        		applyKeepsTheRoom(booking, first)                  // another law
+        		replayKeepsTheRoom(apply(booking, first), rest)    // itself, on less
+        	}
+        	assert replay(booking, log).room == booking.room
+        }
+        ~CODE~
+
+        Hints first, the claim last. Most laws need none: the compiler tries an induction
+        on each vector parameter itself.
+
+        ## What a law may reach
+
+        Only code that gives the same answer every time and ends. Anything else is an
+        error naming the path from the law to it.
+
+        | reached | |
+        | --- | --- |
+        | ~BT~func~BT~ and ~BT~proc~BT~ bodies, local ~BT~mut~BT~ | yes |
+        | recursion on a part a pattern took from a parameter | yes |
+        | ~BT~for each~BT~, a counting loop of the shape [bounds](bounds.md) trusts | yes |
+        | any other loop, two callables calling each other | no |
+        | a ~BT~hive.*~BT~ call, a ~BT~query~BT~, an imported Go function | no |
+        | ~BT~async~BT~, the await-all, ~BT~with timeout~BT~, ~BT~spawn~BT~, ~BT~at~BT~, ~BT~hide~BT~, ~BT~encode~BT~ | no |
+        | ~BT~echo~BT~ | yes, ignored |
+
+        A ~BT~func~BT~ may still do I/O; only what a law reaches is held to this.
+
+        ## What values mean
+
+        * **~BT~Int~BT~ wraps**, as at run time: ~BT~a + 1 > a~BT~ is refused with ~BT~a = 9223372036854775807~BT~.
+          Division by zero is ~BT~0~BT~.
+        * **No vector or string is taken to hold more than 2^60 elements**, which is what
+          lets ~BT~len(v) + 1~BT~ not wrap.
+        * **A ~BT~Float~BT~ is carried and compared**, and nothing about float arithmetic is
+          proved.
+
+        ## When a law is refused
+
+        ~CODE~
+        main.hive:12: in law ~BT~grows~BT~: it does not hold for a = 9223372036854775807: ~BT~a + 1 > a~BT~ is false
+        main.hive:30: in law ~BT~countNeverNegative~BT~: cannot prove ~BT~0 <= 1 + count(the rest of v)~BT~
+            in the case v is [the first of v, ...the rest of v]
+            known: 0 <= count(the rest of v)
+        main.hive:41: in law ~BT~stamped~BT~: it reaches ~BT~stamp~BT~ (line 1), where it calls ~BT~hive.time.now~BT~ (line 2), and the prover cannot read the body of a library call
+        ~CODE~
+
+        A counterexample, an open goal with its case and what was known, or what could
+        not be followed. **An open goal is helped in the law's body** — split the case, or
+        call a law that settles what is missing — or the law is narrowed with an ~BT~if~BT~.
+
+        ## How it is proved
+
+        In order, the first that settles it winning: the law runs on **edge values**
+        (~BT~0~BT~, ~BT~±1~BT~, ~BT~MIN~BT~, ~BT~MAX~BT~, empty and short vectors, every variant); on **every
+        value** where the types are small; on **unknowns**, split into cases wherever
+        something looks inside one; and again with an **induction** on each vector
+        parameter. Every stage counts steps, never time, so a result is the same on every
+        machine. The laws of every file the entrypoint reaches are proved by ~BT~check~BT~,
+        ~BT~build~BT~, ~BT~run~BT~ and ~BT~test~BT~.
+
+        **A generic law is proved on each copy**: at every set of types the program uses
+        the generic callables it calls at. One nothing instantiates that way is not
+        checked.
+
+        *From ~BT~spec/19-laws.md~BT~.*
+    `)
+}
+
 func cli(): Str {
     return page.backticked(`
         # The ~BT~hive~BT~ command line
@@ -2798,6 +2927,25 @@ func pitfalls(): Str {
 
         **An import may not be named ~BT~hive~BT~**, and ~BT~import hive~BT~ is not a thing to
         write — the library is reached a module at a time.
+
+        ## Laws
+
+        **~BT~law~BT~ is a keyword, and ~BT~axiom~BT~ is reserved**, so a variable, parameter or
+        field called either does not compile. → ~BT~rule~BT~, ~BT~statute~BT~, whatever the code
+        means by it.
+
+        **Only a law may call a law**, and none is a value. A law is proved while the
+        program compiles; nothing runs it.
+
+        **A law calling itself has to pass something smaller** — a part a pattern took
+        from that parameter, ~BT~if xs is [_, ...rest] \{ itself(rest) }~BT~ — and two laws
+        may not call each other round in a circle.
+
+        **A law may not reach a ~BT~hive.*~BT~ call, a loop other than ~BT~for each~BT~ or a
+        trusted counting loop, or a recursion that does not shrink.** The error names the
+        path from the law to it.
+
+        **~BT~a + 1 > a~BT~ is not a law.** ~BT~Int~BT~ wraps, and the compiler finds ~BT~a = MAX~BT~.
 
         ## Generics and values
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.4.0
+
+### Laws
+
+* **`law` declares a claim the compiler proves for every value of its parameters**, and one it cannot prove is a compile error.
+* **A false law is refused with a counterexample**, and one nothing settles with the goal left open, the case it is in and what was known.
+* **A law cites another by calling it, and is an induction by calling itself on a part a pattern took apart**; the compiler tries an induction on each vector parameter on its own.
+* **A generic law is proved at every set of types the program uses what it calls at**, each copy on its own.
+* **A law reaches only code that ends and answers the same every time**: no library call, no `async`, no loop but `for each` and a counting loop the bounds pass trusts.
+* **`law` is a keyword**, so a name spelled `law` no longer compiles.
+* **`axiom` is reserved**: any use of it is a compile error, so a later version can give it a meaning without breaking a name.
+
 ## v0.3.9
 
 ### Tooling

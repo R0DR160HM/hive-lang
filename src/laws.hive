@@ -1,0 +1,1050 @@
+// Laws
+// ====
+// Every `law` the program declares, proved while it compiles. A law is a claim:
+// its parameters take every value of their types, and every `assert` its body
+// reaches has to hold for all of them. One the compiler cannot prove is a compile
+// error, and there is no way to accept one anyway.
+//
+// A law goes through four stages, and the first that settles it wins:
+//
+// 1. run on edge values of every parameter, looking for a counterexample;
+// 2. where every parameter's type is small, run on every value of it;
+// 3. run on unknowns (`prove`), deciding every `assert` from what each path knows;
+// 4. where that is stuck, the same again with an induction on each vector
+//    parameter, as if the law had called itself on that vector's rest.
+//
+// Before any of that, what the law reaches has to be something the prover can
+// treat as an equation: the same answer every time, and an end. Nothing here runs
+// the program, and a law is never emitted.
+import ./ast
+import ./diag
+import ./infer
+import ./prove
+import ./ranges
+import ./terms
+import ./token
+import ./types
+import hive.map
+
+// The module the emitter is handed: everything but the laws, which never run.
+func without(m: ast.Module): ast.Module {
+    mut ast.Decl[dyn] kept = []
+    for each d in m.decls {
+        if ast.isLaw(d) == false {
+            append(kept, d)
+        }
+    }
+    return ast.Module(m.imports, kept, m.foreign, m.library)
+}
+
+func count(m: ast.Module): Int {
+    mut n := 0
+    for each d in m.decls {
+        if ast.isLaw(d) {
+            n = n + 1
+        }
+    }
+    return n
+}
+
+func budget(): Int {
+    return 200000
+}
+
+// How many combinations of edge values one law is run on, at most.
+func sampled(): Int {
+    return 512
+}
+
+// How many values every-value runs may cover between them.
+func exhaustive(): Int {
+    return 65536
+}
+
+// A generic law arrives as its copies, one per set of types the program uses what
+// it calls at (`mono`), and each is proved like any other.
+proc checkModule(expanded: ast.Module): diag.Diagnostic[dyn] {
+    mut diag.Diagnostic[dyn] out = []
+    t := types.tableOf(expanded)
+    cx := prove.newContext(expanded, t)
+    for each problem in lawCycles(expanded) {
+        append(out, problem)
+    }
+    if len(out) > 0 {
+        return out
+    }
+    for each d in expanded.decls {
+        if d is ast.Decl.CallableDecl(kind, name, params, _, body, at) {
+            if kind is ast.CallableKind.LawKind {
+                reach := reachProblem(cx, name, body, at)
+                if reach != "" {
+                    append(out, diag.on(at, inLaw(name, reach)))
+                    continue
+                }
+                shrink := shrinkProblem(name, params, body)
+                if shrink != "" {
+                    append(out, diag.on(at, inLaw(name, shrink)))
+                    continue
+                }
+                for each p in proveLaw(cx, name, params, body, at) {
+                    append(out, diag.on(p.at, inLaw(name, p.message)))
+                    break
+                }
+            }
+        }
+    }
+    return out
+}
+
+func inLaw(name: Str, message: Str): Str {
+    return "in law `" + types.shownName(name) + "`: " + message
+}
+
+// --- The stages -----------------------------------------------------------------
+
+proc proveLaw(cx: prove.Context, name: Str, params: ast.Param[], body: ast.Block, at: token.Pos): prove.Problem[dyn] {
+    mut types.Ty[dyn] declared = []
+    for each p in params {
+        append(declared, types.resolve(cx.base.table, p.declared))
+    }
+
+    // 1. Edge values.
+    mut terms.Term[dyn][dyn] edges = []
+    mut withEdges := true
+    for each ty in declared {
+        values := edgeValues(cx.base.table, ty, 0)
+        if len(values) == 0 {
+            withEdges = false
+        }
+        append(edges, values)
+    }
+    if withEdges {
+        for each args in combinations(edges, sampled()) {
+            run := concrete(cx, name, params, body, args)
+            if run.refuted is Result.Ok(problem) {
+                return [problem]
+            }
+        }
+    }
+
+    // 2. Every value, where there are few enough.
+    mut terms.Term[dyn][dyn] every = []
+    mut finite := true
+    mut total := 1
+    for each ty in declared {
+        all := allValues(cx.base.table, ty, exhaustive())
+        if all is Result.Ok(values) {
+            if terms.safeMul(total, len(values)) is Result.Ok(n) && n <= exhaustive() {
+                total = n
+            } else {
+                finite = false
+            }
+            append(every, values)
+        } else {
+            finite = false
+        }
+    }
+    if finite {
+        mut settled := true
+        for each args in combinations(every, exhaustive()) {
+            run := concrete(cx, name, params, body, args)
+            if run.refuted is Result.Ok(problem) {
+                return [problem]
+            }
+            if run.followed == false {
+                settled = false
+                break
+            }
+        }
+        if settled {
+            mut prove.Problem[dyn] none = []
+            return none
+        }
+    }
+
+    // 3. Unknowns.
+    first := symbolic(cx, name, params, body)
+    if len(first) == 0 {
+        return first
+    }
+    // A law that already calls itself has its induction written out, and what that
+    // one left open is what to report.
+    if indexOf(calleesOf(body.stmts), name) is Result.Ok(_) {
+        return ranked(first)
+    }
+
+    // 4. An induction on each vector parameter. Where one was tried and still left a
+    // goal open, that goal says more than the first: it is shown beside what the
+    // induction knew.
+    mut prove.Problem[dyn] closest = []
+    mut i := 0
+    for each p in params {
+        if declared bounds i {
+            if declared[i] is types.Ty.TVec(_, dim) {
+                if (dim is ast.Dim.Fixed(_)) == false {
+                    attempt := symbolic(cx, name, params, inducted(name, params, body, i, at))
+                    if len(attempt) == 0 {
+                        mut prove.Problem[dyn] none = []
+                        return none
+                    }
+                    if len(closest) == 0 {
+                        for each problem in ranked(attempt) {
+                            if problem.lost == false {
+                                append(closest, problem)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    for each problem in ranked(first) {
+        if problem.refuted {
+            return [problem]
+        }
+    }
+    if len(closest) > 0 {
+        return closest
+    }
+    return ranked(first)
+}
+
+// The problems worth reporting first: what is false, then what is open, then what
+// the prover could not follow.
+func ranked(problems: prove.Problem[]): prove.Problem[dyn] {
+    mut prove.Problem[dyn] out = []
+    for each p in problems {
+        if p.refuted {
+            append(out, p)
+        }
+    }
+    // The open goal on the shallowest path says the most: the deepest one is mostly
+    // the same callable unfolded again.
+    mut prove.Problem[dyn] open = []
+    for each p in problems {
+        if p.refuted == false && p.lost == false {
+            append(open, p)
+        }
+    }
+    for each p in sort(open, shorter) {
+        append(out, p)
+    }
+    for each p in problems {
+        if p.lost {
+            append(out, p)
+        }
+    }
+    return out
+}
+
+func shorter(a: prove.Problem, b: prove.Problem): Bool {
+    return len(a.message) < len(b.message)
+}
+
+type Run {
+    refuted: Result<prove.Problem, Bool>
+    // Whether every path came to an end the prover understood.
+    followed: Bool
+}
+
+proc concrete(cx: prove.Context, name: Str, params: ast.Param[], body: ast.Block, args: terms.Term[]): Run {
+    mut pr := prove.newProver(budget())
+    pr.witness = witnessText(cx.base.table, params, args)
+    paths := start(pr, cx, name, params, body, args)
+    for each p in pr.problems {
+        if p.refuted {
+            return Run(Result.Ok(p), false)
+        }
+    }
+    return Run(Result.Error(false), len(pr.problems) == 0 && allFollowed(paths))
+}
+
+proc symbolic(cx: prove.Context, name: Str, params: ast.Param[], body: ast.Block): prove.Problem[dyn] {
+    mut pr := prove.newProver(budget())
+    mut terms.Term[dyn] args = []
+    for each p in params {
+        append(args, prove.fresh(pr, types.resolve(cx.base.table, p.declared), p.name))
+    }
+    paths := start(pr, cx, name, params, body, args)
+    mut prove.Problem[dyn] out = []
+    for each p in pr.problems {
+        append(out, p)
+    }
+    for each p in paths {
+        if p.ended is prove.End.Lost(why, where) {
+            append(out, prove.Problem(where, "cannot prove this law: " + why, false, true))
+        }
+    }
+    return out
+}
+
+proc start(pr: mut prove.Prover, cx: prove.Context, name: Str, params: ast.Param[], body: ast.Block, args: terms.Term[]): prove.Path[dyn] {
+    mut hive.map.Map<Str, terms.Term> env = hive.map.new()
+    mut i := 0
+    for each p in params {
+        hive.map.set(env, p.name, terms.nth(args, i))
+        i = i + 1
+    }
+    mut hive.map.Map<Str, terms.Term> shapes = hive.map.new()
+    mut terms.Term[dyn] held = []
+    for each a in args {
+        append(held, a)
+    }
+    begin := prove.Path(env, [], shapes, [], prove.End.Running(), [], prove.Frame(name, held), 0, [])
+    scope := infer.boundParams(cx.base, params, 0)
+    return prove.execBlock(pr, cx, scope, begin, body.stmts)
+}
+
+func allFollowed(paths: prove.Path[]): Bool {
+    for each p in paths {
+        if p.ended is prove.End.Lost(_, _) {
+            return false
+        }
+    }
+    return true
+}
+
+// The law's body with a call to itself on the rest of the `at`-th parameter put in
+// front of it — the induction stage 4 tries, written as a programmer would.
+func inducted(name: Str, params: ast.Param[], body: ast.Block, at: Int, where: token.Pos): ast.Block {
+    rest := "_rest_of_" + paramName(params, at)
+    mut ast.Arg[dyn] args = []
+    mut i := 0
+    for each p in params {
+        if i == at {
+            append(args, ast.Arg("", ast.Expr.Ident(rest, where)))
+        } else {
+            append(args, ast.Arg("", ast.Expr.Ident(p.name, where)))
+        }
+        i = i + 1
+    }
+    call := ast.Stmt.Expression(ast.Expr.Call(ast.Expr.Ident(name, where), args, where), where)
+    pattern := ast.Pattern.VectorPat([ast.VecElem.Bind("_")], rest)
+    condition := ast.Expr.IsMatch(ast.Expr.Ident(paramName(params, at), where), pattern, where)
+    hint := ast.Stmt.IfChain([ast.Branch(condition, ast.Block([call]))], ast.Block([]), false, where)
+    mut ast.Stmt[dyn] stmts = [hint]
+    for each s in body.stmts {
+        append(stmts, s)
+    }
+    return ast.Block(stmts)
+}
+
+func paramName(params: ast.Param[], at: Int): Str {
+    if params bounds at {
+        return params[at].name
+    }
+    return ""
+}
+
+// --- Values to run on -----------------------------------------------------------
+
+// The values most likely to break a claim about a `ty`: the ends of a number's
+// range, the empty and the one-long, every variant.
+func edgeValues(t: types.Table, ty: types.Ty, depth: Int): terms.Term[dyn] {
+    mut terms.Term[dyn] out = []
+    if ty is types.Ty.TInt {
+        return [terms.Term.IntK(0), terms.Term.IntK(1), terms.Term.IntK(-1), terms.Term.IntK(terms.intMax()), terms.Term.IntK(terms.intMin())]
+    }
+    if ty is types.Ty.TBool {
+        return [terms.Term.BoolK(false), terms.Term.BoolK(true)]
+    }
+    if ty is types.Ty.TStr {
+        return [terms.Term.StrK(""), terms.Term.StrK("a")]
+    }
+    if ty is types.Ty.TAtom {
+        return [terms.Term.AtomK("Nil")]
+    }
+    if ty is types.Ty.TFloat {
+        return [terms.Term.FloatK(0.0), terms.Term.FloatK(1.0), terms.Term.FloatK(-1.0)]
+    }
+    if ty is types.Ty.TVec(element, dim) {
+        inner := edgeValues(t, element, depth + 1)
+        if dim is ast.Dim.Fixed(n) {
+            if n > 4 || len(inner) == 0 {
+                return out
+            }
+            for each e in inner {
+                mut terms.Term[dyn] items = []
+                for k := 0; k < n; k++ {
+                    append(items, e)
+                }
+                append(out, terms.Term.VecK(items))
+            }
+            return out
+        }
+        append(out, terms.Term.VecK([]))
+        if depth < 2 {
+            mut k := 0
+            for each e in inner {
+                if k < 3 {
+                    append(out, terms.Term.VecK([e]))
+                }
+                k = k + 1
+            }
+            if inner bounds 0 && inner bounds 1 {
+                append(out, terms.Term.VecK([inner[1], inner[0]]))
+            }
+        }
+        return out
+    }
+    if ty is types.Ty.TResult(ok, bad) {
+        mut k := 0
+        for each e in edgeValues(t, ok, depth + 1) {
+            if k < 3 {
+                append(out, terms.Term.OkK(e))
+            }
+            k = k + 1
+        }
+        for each e in edgeValues(t, bad, depth + 1) {
+            append(out, terms.Term.ErrK(e))
+            break
+        }
+        return out
+    }
+    if ty is types.Ty.TNamed(typeName) {
+        if types.findType(t, typeName) is Result.Ok(info) {
+            if len(info.variants) == 0 {
+                return diagonal(t, typeName, "", info.shared, depth)
+            }
+            for each v in info.variants {
+                mut ast.Field[dyn] fields = []
+                for each f in v.fields {
+                    append(fields, f)
+                }
+                for each f in info.shared {
+                    append(fields, f)
+                }
+                if depth < 2 || len(fields) == 0 {
+                    for each value in diagonal(t, typeName, v.name, fields, depth) {
+                        append(out, value)
+                    }
+                }
+            }
+        }
+        return out
+    }
+    return out
+}
+
+// Values of a record: every field at its first edge, its second, and so on — and
+// each field on its own away from the first while the rest stay there.
+func diagonal(t: types.Table, typeName: Str, variant: Str, fields: ast.Field[], depth: Int): terms.Term[dyn] {
+    mut terms.Term[dyn][dyn] lists = []
+    mut widest := 0
+    for each f in fields {
+        values := edgeValues(t, types.resolve(t, f.declared), depth + 1)
+        if len(values) == 0 {
+            mut terms.Term[dyn] none = []
+            return none
+        }
+        if len(values) > widest {
+            widest = len(values)
+        }
+        append(lists, values)
+    }
+    mut terms.Term[dyn] out = []
+    if len(fields) == 0 {
+        append(out, terms.Term.RecK(typeName, variant, []))
+        return out
+    }
+    for k := 0; k < widest; k++ {
+        mut terms.Term[dyn] row = []
+        for each values in lists {
+            append(row, pick(values, k))
+        }
+        append(out, terms.Term.RecK(typeName, variant, row))
+    }
+    mut i := 0
+    for each values in lists {
+        mut j := 1
+        for each _v in values {
+            if j < len(values) {
+                mut terms.Term[dyn] row = []
+                mut k := 0
+                for each others in lists {
+                    if k == i {
+                        append(row, pick(values, j))
+                    } else {
+                        append(row, pick(others, 0))
+                    }
+                    k = k + 1
+                }
+                append(out, terms.Term.RecK(typeName, variant, row))
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+func pick(values: terms.Term[], k: Int): terms.Term {
+    n := len(values)
+    if n == 0 {
+        return terms.Term.VoidK()
+    }
+    return terms.nth(values, k % n)
+}
+
+// Every value of `ty`, where there are no more than `cap`: `Error` otherwise.
+func allValues(t: types.Table, ty: types.Ty, cap: Int): Result<terms.Term[dyn], Bool> {
+    if ty is types.Ty.TBool {
+        return Result.Ok([terms.Term.BoolK(false), terms.Term.BoolK(true)])
+    }
+    if ty is types.Ty.TResult(ok, bad) {
+        if allValues(t, ok, cap) is Result.Ok(goods) && allValues(t, bad, cap) is Result.Ok(bads) {
+            if len(goods) + len(bads) > cap {
+                return Result.Error(false)
+            }
+            mut terms.Term[dyn] out = []
+            for each g in goods {
+                append(out, terms.Term.OkK(g))
+            }
+            for each b in bads {
+                append(out, terms.Term.ErrK(b))
+            }
+            return Result.Ok(out)
+        }
+        return Result.Error(false)
+    }
+    if ty is types.Ty.TNamed(typeName) {
+        if types.findType(t, typeName) is Result.Ok(info) {
+            if len(info.variants) == 0 {
+                return records(t, typeName, "", info.shared, cap)
+            }
+            mut terms.Term[dyn] out = []
+            for each v in info.variants {
+                mut ast.Field[dyn] fields = []
+                for each f in v.fields {
+                    append(fields, f)
+                }
+                for each f in info.shared {
+                    append(fields, f)
+                }
+                some := records(t, typeName, v.name, fields, cap)
+                if some is Result.Ok(values) {
+                    if len(out) + len(values) > cap {
+                        return Result.Error(false)
+                    }
+                    for each value in values {
+                        append(out, value)
+                    }
+                } else {
+                    return Result.Error(false)
+                }
+            }
+            return Result.Ok(out)
+        }
+    }
+    return Result.Error(false)
+}
+
+func records(t: types.Table, typeName: Str, variant: Str, fields: ast.Field[], cap: Int): Result<terms.Term[dyn], Bool> {
+    mut terms.Term[dyn][dyn] lists = []
+    mut total := 1
+    for each f in fields {
+        all := allValues(t, types.resolve(t, f.declared), cap)
+        if all is Result.Ok(values) {
+            if terms.safeMul(total, len(values)) is Result.Ok(n) && n <= cap {
+                total = n
+            } else {
+                return Result.Error(false)
+            }
+            append(lists, values)
+        } else {
+            return Result.Error(false)
+        }
+    }
+    mut terms.Term[dyn] out = []
+    for each row in combinations(lists, cap) {
+        append(out, terms.Term.RecK(typeName, variant, row))
+    }
+    return Result.Ok(out)
+}
+
+// One value from each list, every way there is — or, past `cap`, `cap` of them
+// spread across the rest by a fixed step, so a build always tries the same ones.
+func combinations(lists: terms.Term[dyn][], cap: Int): terms.Term[dyn][dyn] {
+    mut total := 1
+    mut whole := true
+    for each l in lists {
+        if len(l) == 0 {
+            mut terms.Term[dyn][dyn] none = []
+            return none
+        }
+        if terms.safeMul(total, len(l)) is Result.Ok(n) && n <= 1000000000 {
+            total = n
+        } else {
+            whole = false
+        }
+    }
+    mut count := total
+    if whole == false || total > cap {
+        count = cap
+    }
+    mut terms.Term[dyn][dyn] out = []
+    for k := 0; k < count; k++ {
+        mut index := k
+        if count < total || whole == false {
+            index = (k * 2654435761) % 1000000007
+        }
+        mut terms.Term[dyn] row = []
+        for each l in lists {
+            n := len(l)
+            append(row, terms.nth(l, index % n))
+            index = index / n
+        }
+        append(out, row)
+    }
+    return out
+}
+
+func witnessText(t: types.Table, params: ast.Param[], args: terms.Term[]): Str {
+    mut Str[dyn] out = []
+    mut i := 0
+    for each p in params {
+        append(out, p.name + " = " + valueText(t, terms.nth(args, i)))
+        i = i + 1
+    }
+    if len(out) == 0 {
+        return "every value"
+    }
+    return join(out, ", ")
+}
+
+// A value as Hive would write it.
+func valueText(t: types.Table, v: terms.Term): Str {
+    if v is terms.Term.StrK(s) {
+        return "\"" + s + "\""
+    }
+    if v is terms.Term.VecK(items) {
+        mut Str[dyn] out = []
+        for each item in items {
+            append(out, valueText(t, item))
+        }
+        return "[" + join(out, ", ") + "]"
+    }
+    if v is terms.Term.OkK(payload) {
+        return "Result.Ok(" + valueText(t, payload) + ")"
+    }
+    if v is terms.Term.ErrK(payload) {
+        return "Result.Error(" + valueText(t, payload) + ")"
+    }
+    if v is terms.Term.RecK(typeName, variant, fields) {
+        mut Str[dyn] out = []
+        mut i := 0
+        for each f in prove.fieldsFor(t, typeName, variant) {
+            append(out, f.name + ": " + valueText(t, terms.nth(fields, i)))
+            i = i + 1
+        }
+        if variant == "" {
+            return types.shownName(typeName) + "(" + join(out, ", ") + ")"
+        }
+        return types.shownName(typeName) + "." + variant + "(" + join(out, ", ") + ")"
+    }
+    if v is terms.Term.FloatK(f) {
+        return "{f}"
+    }
+    return terms.key(v)
+}
+
+// --- What a law may reach ---------------------------------------------------------
+
+// Why what the law reaches cannot be treated as an equation, or `""`.
+proc reachProblem(cx: prove.Context, lawName: Str, body: ast.Block, at: token.Pos): Str {
+    mut Str[dyn] queue = [lawName]
+    mut Str[dyn] seen = [lawName]
+    for i := 0; i < len(queue); i++ {
+        if queue bounds i {
+            name := queue[i]
+            if hive.map.get(cx.callables, name) is Result.Ok(d) {
+                if d is ast.Decl.CallableDecl(_, _, _, _, b, declaredAt) {
+                    problem := blockProblem(cx, b.stmts)
+                    if problem != "" {
+                        if name == lawName {
+                            return problem
+                        }
+                        return "it reaches `" + types.shownName(name) + "` (line {declaredAt.line}), where " + problem
+                    }
+                    for each callee in calleesOf(b.stmts) {
+                        if (indexOf(seen, callee) is Result.Ok(_)) == false {
+                            append(seen, callee)
+                            append(queue, callee)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return recursionProblem(cx, lawName, seen)
+}
+
+proc blockProblem(cx: prove.Context, stmts: ast.Stmt[]): Str {
+    for each s in stmts {
+        problem := stmtProblem(cx, s)
+        if problem != "" {
+            return problem
+        }
+    }
+    return ""
+}
+
+proc stmtProblem(cx: prove.Context, s: ast.Stmt): Str {
+    if s is ast.Stmt.AsyncStmt(_, at) {
+        return "it runs something `async` (line {at.line}), and what runs alongside is not a value"
+    }
+    if s is ast.Stmt.VarDecl(_, _, _, deferred, at) {
+        if deferred {
+            return "it runs something `async` (line {at.line}), and what runs alongside is not a value"
+        }
+    }
+    if s is ast.Stmt.ForLoop(init, cond, post, _, at) {
+        if ranges.countsUp(init, cond, post) == "" {
+            return "it has a loop (line {at.line}) that nothing shows comes to an end: only `for each`, and a counting loop that starts at a literal, steps by one and stays below a bound, can be reached by a law"
+        }
+    }
+    for each e in prove.exprsOfStmt(s) {
+        problem := exprProblem(cx, e)
+        if problem != "" {
+            return problem
+        }
+    }
+    for each b in prove.blocksOfStmt(s) {
+        problem := blockProblem(cx, b.stmts)
+        if problem != "" {
+            return problem
+        }
+    }
+    return ""
+}
+
+proc exprProblem(cx: prove.Context, e: ast.Expr): Str {
+    if e is ast.Expr.AwaitAll(_, _, at) {
+        return "it waits on calls running alongside (line {at.line}), and what runs alongside is not a value"
+    }
+    if e is ast.Expr.Timed(_, _, at) {
+        return "it times a call (line {at.line}), and how long something takes is not a value"
+    }
+    if e is ast.Expr.Call(callee, args, at) {
+        word := libraryPath(callee)
+        if word != "" {
+            return "it calls `{word}` (line {at.line}), and the prover cannot read the body of a library call"
+        }
+        if callee is ast.Expr.Ident(name, _) {
+            if hive.map.has(cx.callables, name) == false && (name == "spawn" || name == "at" || name == "kill" || name == "hide" || name == "encode") {
+                return "it calls `{name}` (line {at.line}), whose answer depends on more than its arguments"
+            }
+        }
+        for each a in args {
+            problem := exprProblem(cx, a.value)
+            if problem != "" {
+                return problem
+            }
+        }
+        return exprProblem(cx, callee)
+    }
+    if e is ast.Expr.Binary(_, l, r, _) {
+        left := exprProblem(cx, l)
+        if left != "" {
+            return left
+        }
+        return exprProblem(cx, r)
+    }
+    if e is ast.Expr.Not(x, _) {
+        return exprProblem(cx, x)
+    }
+    if e is ast.Expr.Negate(x, _) {
+        return exprProblem(cx, x)
+    }
+    if e is ast.Expr.Member(subject, _, _) {
+        return exprProblem(cx, subject)
+    }
+    if e is ast.Expr.Index(subject, index, _) {
+        left := exprProblem(cx, subject)
+        if left != "" {
+            return left
+        }
+        return exprProblem(cx, index)
+    }
+    if e is ast.Expr.IsMatch(subject, _, _) {
+        return exprProblem(cx, subject)
+    }
+    if e is ast.Expr.VectorLit(items, _) {
+        for each item in items {
+            problem := exprProblem(cx, item)
+            if problem != "" {
+                return problem
+            }
+        }
+    }
+    return ""
+}
+
+// `hive.file.read` for a library call written that way, `""` otherwise.
+func libraryPath(callee: ast.Expr): Str {
+    if callee is ast.Expr.Member(subject, field, _) {
+        if subject is ast.Expr.Member(inner, module, _) {
+            if inner is ast.Expr.Ident(head, _) {
+                if head == "hive" {
+                    return "hive.{module}.{field}"
+                }
+            }
+        }
+    }
+    return ""
+}
+
+// Every callable the program declared that a block calls by name.
+func calleesOf(stmts: ast.Stmt[]): Str[dyn] {
+    mut Str[dyn] out = []
+    for each s in stmts {
+        for each e in prove.exprsOfStmt(s) {
+            for each name in calledIn(e) {
+                append(out, name)
+            }
+        }
+        for each b in prove.blocksOfStmt(s) {
+            for each name in calleesOf(b.stmts) {
+                append(out, name)
+            }
+        }
+    }
+    return out
+}
+
+func calledIn(e: ast.Expr): Str[dyn] {
+    // Every name the expression mentions: what is not a callable is not looked up.
+    return prove.namesIn(e)
+}
+
+// A callable that calls itself must do it on something smaller, and two callables
+// may not call each other round in a circle.
+proc recursionProblem(cx: prove.Context, lawName: Str, reached: Str[]): Str {
+    for each name in reached {
+        if name == lawName {
+            continue
+        }
+        if hive.map.get(cx.callables, name) is Result.Ok(d) {
+            if d is ast.Decl.CallableDecl(_, _, params, _, body, at) {
+                for each callee in calleesOf(body.stmts) {
+                    if callee == name {
+                        problem := shrinkProblem(name, params, body)
+                        if problem != "" {
+                            return "it reaches `" + types.shownName(name) + "` (line {at.line}), which calls itself, and " + problem
+                        }
+                    } else if callee != lawName && indexOf(reached, callee) is Result.Ok(_) {
+                        if calls(cx, callee, name, []) {
+                            return "it reaches `" + types.shownName(name) + "` and `" + types.shownName(callee) + "`, which call each other round in a circle: a law may only reach a callable that calls itself, on something smaller"
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return ""
+}
+
+// Whether `from` reaches `to` through the program's callables.
+proc calls(cx: prove.Context, from: Str, to: Str, seen: Str[]): Bool {
+    if indexOf(seen, from) is Result.Ok(_) {
+        return false
+    }
+    if hive.map.get(cx.callables, from) is Result.Ok(d) {
+        if d is ast.Decl.CallableDecl(kind, _, _, _, body, _) {
+            if kind is ast.CallableKind.LawKind {
+                return false
+            }
+            for each callee in calleesOf(body.stmts) {
+                if callee == to {
+                    return true
+                }
+                if hive.map.has(cx.callables, callee) {
+                    if calls(cx, callee, to, seen + [from]) {
+                        return true
+                    }
+                }
+            }
+        }
+    }
+    return false
+}
+
+// Why a callable's calls to itself are not each on something smaller than one of
+// its parameters, or `""`. Smaller is what a pattern took apart: the rest of a
+// vector, a field of a variant, an element.
+func shrinkProblem(name: Str, params: ast.Param[], body: ast.Block): Str {
+    mut Str[dyn] none = []
+    return shrinkIn(name, params, body.stmts, none, none)
+}
+
+func shrinkIn(name: Str, params: ast.Param[], stmts: ast.Stmt[], smaller: Str[], of: Str[]): Str {
+    for each s in stmts {
+        for each e in prove.exprsOfStmt(s) {
+            problem := callsShrink(name, params, e, smaller, of)
+            if problem != "" {
+                return problem
+            }
+        }
+        if s is ast.Stmt.IfChain(branches, otherwise, _, _) {
+            for each b in branches {
+                mut Str[dyn] more = []
+                mut Str[dyn] owners = []
+                for each x in smaller {
+                    append(more, x)
+                }
+                for each x in of {
+                    append(owners, x)
+                }
+                for each part in ast.conjuncts(b.condition) {
+                    if part is ast.Expr.IsMatch(subject, pattern, _) {
+                        owner := ownerOf(subject, smaller, of, params)
+                        if owner != "" {
+                            for each bound in ast.boundBy(pattern) {
+                                if bound != "_" && bound != "" {
+                                    append(more, bound)
+                                    append(owners, owner)
+                                }
+                            }
+                        }
+                    }
+                }
+                problem := shrinkIn(name, params, b.body.stmts, more, owners)
+                if problem != "" {
+                    return problem
+                }
+            }
+            problem := shrinkIn(name, params, otherwise.stmts, smaller, of)
+            if problem != "" {
+                return problem
+            }
+        } else {
+            for each b in prove.blocksOfStmt(s) {
+                problem := shrinkIn(name, params, b.stmts, smaller, of)
+                if problem != "" {
+                    return problem
+                }
+            }
+        }
+    }
+    return ""
+}
+
+// The parameter `subject` is part of, where it is a parameter or a part already
+// taken from one: `""` where it is neither.
+func ownerOf(subject: ast.Expr, smaller: Str[], of: Str[], params: ast.Param[]): Str {
+    if subject is ast.Expr.Ident(n, _) {
+        for each p in params {
+            if p.name == n {
+                return n
+            }
+        }
+        if indexOf(smaller, n) is Result.Ok(at) {
+            if of bounds at {
+                return of[at]
+            }
+        }
+    }
+    return ""
+}
+
+func callsShrink(name: Str, params: ast.Param[], e: ast.Expr, smaller: Str[], of: Str[]): Str {
+    if e is ast.Expr.Call(callee, args, at) {
+        if callee is ast.Expr.Ident(called, _) {
+            if called == name {
+                mut Str[dyn] names = []
+                for each p in params {
+                    append(names, p.name)
+                }
+                mut ok := false
+                mut i := 0
+                for each a in ast.positional(args, names) {
+                    if a.value is ast.Expr.Ident(passed, _) {
+                        if indexOf(smaller, passed) is Result.Ok(k) {
+                            if of bounds k && params bounds i {
+                                if of[k] == params[i].name {
+                                    ok = true
+                                }
+                            }
+                        }
+                    }
+                    i = i + 1
+                }
+                if ok == false {
+                    return "its call to itself (line {at.line}) is not on something smaller: pass, in a parameter's place, a part a pattern took from that parameter — `if xs is [_, ...rest] \{ " + types.shownName(name) + "(rest, ...) }`"
+                }
+            }
+        }
+        for each a in args {
+            problem := callsShrink(name, params, a.value, smaller, of)
+            if problem != "" {
+                return problem
+            }
+        }
+    }
+    if e is ast.Expr.Binary(_, l, r, _) {
+        problem := callsShrink(name, params, l, smaller, of)
+        if problem != "" {
+            return problem
+        }
+        return callsShrink(name, params, r, smaller, of)
+    }
+    if e is ast.Expr.Not(x, _) {
+        return callsShrink(name, params, x, smaller, of)
+    }
+    if e is ast.Expr.Member(subject, _, _) {
+        return callsShrink(name, params, subject, smaller, of)
+    }
+    if e is ast.Expr.IsMatch(subject, _, _) {
+        return callsShrink(name, params, subject, smaller, of)
+    }
+    return ""
+}
+
+// Laws that call each other round in a circle: each would be assumed to prove the
+// other.
+proc lawCycles(m: ast.Module): diag.Diagnostic[dyn] {
+    mut hive.map.Map<Str, Str[dyn]> callsOf = hive.map.new()
+    mut Str[dyn] laws = []
+    for each d in m.decls {
+        if d is ast.Decl.CallableDecl(kind, name, _, _, body, _) {
+            if kind is ast.CallableKind.LawKind {
+                append(laws, name)
+                hive.map.set(callsOf, name, calleesOf(body.stmts))
+            }
+        }
+    }
+    mut diag.Diagnostic[dyn] out = []
+    for each d in m.decls {
+        if d is ast.Decl.CallableDecl(kind, name, _, _, _, at) {
+            if kind is ast.CallableKind.LawKind {
+                if circles(callsOf, laws, name, name, []) {
+                    append(out, diag.on(at, inLaw(name, "it calls another law that, in turn, calls it: each would be assumed to prove the other. Only a law calling itself, on something smaller, is an induction")))
+                }
+            }
+        }
+    }
+    return out
+}
+
+func circles(callsOf: hive.map.Map<Str, Str[dyn]>, laws: Str[], from: Str, target: Str, seen: Str[]): Bool {
+    if hive.map.get(callsOf, from) is Result.Ok(callees) {
+        for each c in callees {
+            if c == from {
+                continue
+            }
+            if (indexOf(laws, c) is Result.Ok(_)) == false {
+                continue
+            }
+            if c == target {
+                return true
+            }
+            if (indexOf(seen, c) is Result.Ok(_)) == false {
+                if circles(callsOf, laws, c, target, seen + [from]) {
+                    return true
+                }
+            }
+        }
+    }
+    return false
+}
