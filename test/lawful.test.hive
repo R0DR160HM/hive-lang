@@ -1,0 +1,138 @@
+// Laws, written as a program writes them. This file compiles only while every law in
+// it is proved, so a change to the prover that loses one fails the suite here, at
+// the law it lost.
+type Status {
+    Requested
+    Confirmed
+    CheckedIn
+    CheckedOut
+    Cancelled
+}
+
+type Event {
+    Confirm
+    Cancel { reason: Str }
+    Arrive
+    Leave
+}
+
+type Booking {
+    room: Str
+    checkInDay: Int
+    checkOutDay: Int
+    status: Status
+}
+
+func apply(booking: Booking, event: Event): Booking {
+    if booking.status is Status.Cancelled || booking.status is Status.CheckedOut {
+        return booking
+    }
+    switch event {
+        Event.Confirm {
+            if booking.status is Status.Requested {
+                return Booking(booking.room, booking.checkInDay, booking.checkOutDay, Status.Confirmed())
+            }
+            return booking
+        }
+        Event.Cancel(_) {
+            return Booking(booking.room, booking.checkInDay, booking.checkOutDay, Status.Cancelled())
+        }
+        Event.Arrive {
+            if booking.status is Status.Confirmed {
+                return Booking(booking.room, booking.checkInDay, booking.checkOutDay, Status.CheckedIn())
+            }
+            return booking
+        }
+        Event.Leave {
+            if booking.status is Status.CheckedIn {
+                return Booking(booking.room, booking.checkInDay, booking.checkOutDay, Status.CheckedOut())
+            }
+            return booking
+        }
+    }
+}
+
+func replay(booking: Booking, log: Event[]): Booking {
+    mut current := booking
+    for each event in log {
+        current = apply(current, event)
+    }
+    return current
+}
+
+func isBooked(bookings: Booking[], room: Str, day: Int): Bool {
+    for each b in bookings {
+        if b.room == room && b.checkInDay <= day && day < b.checkOutDay {
+            return true
+        }
+    }
+    return false
+}
+
+func nights(b: Booking): Int {
+    return b.checkOutDay - b.checkInDay
+}
+
+func guestsCanCancel(b: Booking): Bool {
+    return b.status is Status.Requested || b.status is Status.Confirmed
+}
+
+law cancelledIsFinal(booking: Booking, event: Event) {
+    if booking.status is Status.Cancelled {
+        assert apply(booking, event).status == booking.status
+    }
+}
+
+law applyKeepsTheRoom(booking: Booking, event: Event) {
+    assert apply(booking, event).room == booking.room
+}
+
+law applyKeepsTheDates(booking: Booking, event: Event) {
+    after := apply(booking, event)
+    assert after.checkInDay == booking.checkInDay && after.checkOutDay == booking.checkOutDay
+}
+
+law guestsCannotCancelAfterArrival(booking: Booking) {
+    if booking.status is Status.CheckedIn {
+        assert guestsCanCancel(booking) == false
+    }
+}
+
+law aStayHasNights(booking: Booking) {
+    if booking.checkInDay >= 0 && booking.checkInDay < booking.checkOutDay {
+        assert nights(booking) > 0
+    }
+}
+
+law bookingNeverFreesARoom(bookings: Booking[dyn], extra: Booking, room: Str, day: Int) {
+    if isBooked(bookings, room, day) {
+        assert isBooked(bookings + [extra], room, day)
+    }
+}
+
+law cancelledSurvivesReplay(booking: Booking, log: Event[dyn]) {
+    if booking.status is Status.Cancelled {
+        assert replay(booking, log).status == booking.status
+    }
+}
+
+law replayKeepsTheRoom(booking: Booking, log: Event[dyn]) {
+    if log is [first, ...rest] {
+        applyKeepsTheRoom(booking, first)
+        replayKeepsTheRoom(apply(booking, first), rest)
+    }
+    assert replay(booking, log).room == booking.room
+}
+
+test "a booking checks in and out in order" {
+    b := Booking("12", 4, 6, Status.Requested())
+    done := replay(b, [Event.Confirm(), Event.Arrive(), Event.Leave()])
+    assert done.status == Status.CheckedOut()
+    assert done.room == "12"
+}
+
+test "a cancelled booking ignores what follows" {
+    b := Booking("12", 4, 6, Status.Requested())
+    done := replay(b, [Event.Cancel("change of plans"), Event.Confirm(), Event.Arrive()])
+    assert done.status == Status.Cancelled()
+}

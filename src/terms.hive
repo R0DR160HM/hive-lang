@@ -1,0 +1,245 @@
+// Terms
+// =====
+// What the law prover knows about one value. Either all of it — a literal, a
+// vector whose length is known, a record whose fields are terms — or only part:
+// an unknown, a vector that goes on into an unknown, an operation on unknowns.
+//
+// Two terms are the same value when their keys are the same string, which is what
+// lets a fact learned about `isBooked(rest, room, day)` in one place be found again
+// in another. A key never says anything about how the term was reached.
+import ./types
+
+type Term {
+    IntK { value: Int }
+    BoolK { value: Bool }
+    StrK { value: Str }
+    AtomK { name: Str }
+    FloatK { value: Float }
+    VoidK
+    // A vector whose every element is known to be there.
+    VecK { items: Term[dyn] }
+    // A vector that starts with `known` and goes on with `rest`, a vector term of
+    // unknown length.
+    VecS { known: Term[dyn], rest: Term }
+    // A value of a declared type. `variant` is `""` for a struct; `fields` are in
+    // the order the variant's own come in, then the type's shared ones.
+    RecK { typeName: Str, variant: Str, fields: Term[dyn] }
+    OkK { payload: Term }
+    ErrK { payload: Term }
+    // A function value: the callable it calls, and what was applied already. A
+    // `Hole` stands where `_` was written.
+    FnK { name: Str, args: Term[dyn] }
+    Hole
+    // Something nothing is known about yet, numbered by the prover.
+    Unknown { id: Int, ty: types.Ty }
+    // An operation on terms that are not all known, and the type it answers with.
+    Op { op: Str, args: Term[dyn], ty: types.Ty }
+}
+
+func intMax(): Int {
+    return 9223372036854775807
+}
+
+func intMin(): Int {
+    return -9223372036854775807 - 1
+}
+
+func key(t: Term): Str {
+    if t is Term.IntK(v) {
+        return "{v}"
+    } else if t is Term.BoolK(b) {
+        if b {
+            return "true"
+        }
+        return "false"
+    } else if t is Term.StrK(s) {
+        return "\"" + replaceAll(replaceAll(s, "\\", "\\\\"), "\"", "\\\"") + "\""
+    } else if t is Term.AtomK(name) {
+        return "#" + name
+    } else if t is Term.FloatK(f) {
+        return "f{f}"
+    } else if t is Term.VoidK {
+        return "void"
+    } else if t is Term.VecK(items) {
+        return "[" + keys(items) + "]"
+    } else if t is Term.VecS(known, rest) {
+        return "[" + keys(known) + ";..." + key(rest) + "]"
+    } else if t is Term.RecK(typeName, variant, fields) {
+        return typeName + "." + variant + "(" + keys(fields) + ")"
+    } else if t is Term.OkK(payload) {
+        return "Ok(" + key(payload) + ")"
+    } else if t is Term.ErrK(payload) {
+        return "Error(" + key(payload) + ")"
+    } else if t is Term.FnK(name, args) {
+        return "fn:" + name + "(" + keys(args) + ")"
+    } else if t is Term.Hole {
+        return "_"
+    } else if t is Term.Unknown(id, _) {
+        return "u{id}"
+    } else if t is Term.Op(op, args, _) {
+        return op + "(" + keys(args) + ")"
+    }
+    return "?"
+}
+
+func keys(ts: Term[]): Str {
+    mut Str[dyn] out = []
+    for each t in ts {
+        append(out, key(t))
+    }
+    return join(out, ",")
+}
+
+// Whether nothing about the term is unknown.
+func known(t: Term): Bool {
+    if t is Term.Unknown(_, _) || t is Term.Op(_, _, _) || t is Term.VecS(_, _) {
+        return false
+    } else if t is Term.VecK(items) {
+        return allKnown(items)
+    } else if t is Term.RecK(_, _, fields) {
+        return allKnown(fields)
+    } else if t is Term.OkK(payload) {
+        return known(payload)
+    } else if t is Term.ErrK(payload) {
+        return known(payload)
+    } else if t is Term.FnK(_, args) {
+        return allKnown(args)
+    }
+    return true
+}
+
+func allKnown(ts: Term[]): Bool {
+    for each t in ts {
+        if known(t) == false {
+            return false
+        }
+    }
+    return true
+}
+
+func isTrue(t: Term): Bool {
+    if t is Term.BoolK(b) {
+        return b
+    }
+    return false
+}
+
+func isFalse(t: Term): Bool {
+    if t is Term.BoolK(b) {
+        return b == false
+    }
+    return false
+}
+
+func op(name: Str, args: Term[], ty: types.Ty): Term {
+    mut Term[dyn] held = []
+    for each a in args {
+        append(held, a)
+    }
+    return Term.Op(name, held, ty)
+}
+
+func boolean(): types.Ty {
+    return types.Ty.TBool()
+}
+
+func integer(): types.Ty {
+    return types.Ty.TInt()
+}
+
+// `!t`, with the double negation and the literals folded away.
+func negation(t: Term): Term {
+    if t is Term.BoolK(b) {
+        return Term.BoolK(b == false)
+    }
+    if t is Term.Op(name, args, _) {
+        if name == "not" {
+            for each a in args {
+                return a
+            }
+        }
+    }
+    return op("not", [t], boolean())
+}
+
+// `a && b`, folded where either side is known.
+func both(a: Term, b: Term): Term {
+    if isFalse(a) || isFalse(b) {
+        return Term.BoolK(false)
+    }
+    if isTrue(a) {
+        return b
+    }
+    if isTrue(b) {
+        return a
+    }
+    if key(a) == key(b) {
+        return a
+    }
+    return op("and", ordered(a, b), boolean())
+}
+
+// `a || b`, folded where either side is known.
+func either(a: Term, b: Term): Term {
+    if isTrue(a) || isTrue(b) {
+        return Term.BoolK(true)
+    }
+    if isFalse(a) {
+        return b
+    }
+    if isFalse(b) {
+        return a
+    }
+    if key(a) == key(b) {
+        return a
+    }
+    return op("or", ordered(a, b), boolean())
+}
+
+// Two operands of something that does not care about their order, in one order,
+// so `a == b` and `b == a` are one key.
+func ordered(a: Term, b: Term): Term[dyn] {
+    if key(b) < key(a) {
+        return [b, a]
+    }
+    return [a, b]
+}
+
+// Safe arithmetic on the prover's own numbers: `Error` where the answer would
+// wrap round, which is where the prover has to stop trusting a sum.
+func safeAdd(a: Int, b: Int): Result<Int, Bool> {
+    sum := a + b
+    if a > 0 && b > 0 && sum < 0 {
+        return Result.Error(false)
+    }
+    if a < 0 && b < 0 && sum >= 0 {
+        return Result.Error(false)
+    }
+    return Result.Ok(sum)
+}
+
+func safeNeg(a: Int): Result<Int, Bool> {
+    if a == intMin() {
+        return Result.Error(false)
+    }
+    return Result.Ok(0 - a)
+}
+
+func safeMul(a: Int, b: Int): Result<Int, Bool> {
+    if a == 0 || b == 0 {
+        return Result.Ok(0)
+    }
+    product := a * b
+    if product / b != a || (a == -1 && b == intMin()) || (b == -1 && a == intMin()) {
+        return Result.Error(false)
+    }
+    return Result.Ok(product)
+}
+
+// The `i`-th of `ts`, or a `Hole` where there is none.
+func nth(ts: Term[], i: Int): Term {
+    if ts bounds i {
+        return ts[i]
+    }
+    return Term.Hole()
+}

@@ -409,11 +409,13 @@ proc flatten(sources: Source[], entryKey: Str, found: diag.Diagnostic[]): Progra
             }
         }
     }
-    // Only what the program named, so a program that never names one builds as before.
+    // Only what the program named, so a program that never names one builds as before:
+    // a whole module, or one declaration of it, as `hive.json#JsonError`.
     for each src in library {
-        if indexOf(used, src.key) is Result.Ok(_) {
-            mut Rw rw = Rw(src.key, entryKey, hive.map.new(), hive.map.new(), flatNames, [], [], [], token.nowhere())
-            for each d in src.module.decls {
+        whole := indexOf(used, src.key) is Result.Ok(_)
+        mut Rw rw = Rw(src.key, entryKey, hive.map.new(), hive.map.new(), flatNames, [], [], [], token.nowhere())
+        for each d in src.module.decls {
+            if whole || indexOf(used, src.key + "#" + ast.declName(d)) is Result.Ok(_) {
                 append(decls, rewriteDecl(rw, d))
             }
         }
@@ -561,6 +563,9 @@ proc noteModule(rw: mut Rw, module: Str): void {
     for each m in stdlib.errorModulesFor(module) {
         noteLibrary(rw, "hive." + m)
     }
+    for each name in stdlib.errorTypesFor(module) {
+        noteLibrary(rw, "hive." + module + "#" + name)
+    }
 }
 
 // The builtins that answer with a library error, or hand out what does.
@@ -623,6 +628,12 @@ proc rewriteDecl(rw: mut Rw, d: ast.Decl): ast.Decl {
         newSql := rewriteSql(rw, sql)
         restoreLocals(rw, mark)
         return ast.Decl.QueryDecl(rename(rw, name), newParams, newResult, newSql, line)
+    } else if d is ast.Decl.TableLawDecl(name, params, table, filter, line) {
+        mark := len(rw.locals)
+        newParams := rewriteParams(rw, params)
+        newFilter := rewriteSql(rw, filter)
+        restoreLocals(rw, mark)
+        return ast.Decl.TableLawDecl(rename(rw, name), newParams, table, newFilter, line)
     } else if d is ast.Decl.TestDecl(title, body, line) {
         mark := len(rw.locals)
         newBody := rewriteBlock(rw, body)

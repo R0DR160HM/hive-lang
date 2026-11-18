@@ -88,6 +88,9 @@ func TermStatus(text string) { fmt.Fprintln(os.Stderr, text) }
 // Command-line flags as a codec
 // ---------------------------------------------------------------------------
 type TermFlagError struct {
+	// The variant of the program's union: `Mismatch`, or `Broken` where the
+	// value was read whole but does not keep its type's law.
+	Reason   string
 	Path     string
 	Expected string
 	Found    string
@@ -169,10 +172,10 @@ func termWords(line string) ([]termWord, *TermFlagError) {
 		}
 	}
 	if quote != 0 {
-		return nil, &TermFlagError{Path: "$", Expected: "a closing quote", Found: "the end of the text"}
+		return nil, &TermFlagError{Reason: "Mismatch", Path: "$", Expected: "a closing quote", Found: "the end of the text"}
 	}
 	if escaped {
-		return nil, &TermFlagError{Path: "$", Expected: "a character after the backslash", Found: "the end of the text"}
+		return nil, &TermFlagError{Reason: "Mismatch", Path: "$", Expected: "a character after the backslash", Found: "the end of the text"}
 	}
 	if inWord {
 		words = append(words, termWord{b.String(), quoted})
@@ -222,12 +225,12 @@ func termFlags(words []termWord, shape TermFlagShape) ([]TermFlagPair, *TermFlag
 	for i := 0; i < len(words); i++ {
 		w := words[i]
 		if !termFlagLike(w) {
-			return nil, &TermFlagError{Path: "$", Expected: "a flag (words go before the flags or after --)", Found: strconv.Quote(w.text)}
+			return nil, &TermFlagError{Reason: "Mismatch", Path: "$", Expected: "a flag (words go before the flags or after --)", Found: strconv.Quote(w.text)}
 		}
 		written, value, valued := strings.Cut(w.text, "=")
 		at := termFlagIndex(shape, written)
 		if at < 0 {
-			return nil, &TermFlagError{Path: written, Expected: termFlagNames(shape), Found: "a flag nothing declares"}
+			return nil, &TermFlagError{Reason: "Mismatch", Path: written, Expected: termFlagNames(shape), Found: "a flag nothing declares"}
 		}
 		key := shape.Long[at]
 		switch {
@@ -384,10 +387,10 @@ func TermFlagOne[T any](q []TermFlagPair, key string, read func(TermFlagPair, st
 	path := "--" + key
 	found := termFlagsNamed(q, key)
 	if len(found) == 0 {
-		return zero, &TermFlagError{Path: path, Expected: "a value", Found: "nothing"}
+		return zero, &TermFlagError{Reason: "Mismatch", Path: path, Expected: "a value", Found: "nothing"}
 	}
 	if len(found) > 1 {
-		return zero, &TermFlagError{Path: path, Expected: "one value", Found: termFlagCount(len(found))}
+		return zero, &TermFlagError{Reason: "Mismatch", Path: path, Expected: "one value", Found: termFlagCount(len(found))}
 	}
 	return read(found[0], termWritten(found[0], path))
 }
@@ -403,7 +406,7 @@ func TermFlagVec[T any](q []TermFlagPair, key string, n int, read func(TermFlagP
 	path := "--" + key
 	found := termFlagsNamed(q, key)
 	if n >= 0 && len(found) != n {
-		return nil, &TermFlagError{Path: path, Expected: termFlagCount(n), Found: termFlagCount(len(found))}
+		return nil, &TermFlagError{Reason: "Mismatch", Path: path, Expected: termFlagCount(n), Found: termFlagCount(len(found))}
 	}
 	out := make([]T, 0, len(found))
 	for i, f := range found {
@@ -419,7 +422,7 @@ func TermFlagVec[T any](q []TermFlagPair, key string, n int, read func(TermFlagP
 // Every reader but Bool's needs a value; a Bool standing alone is true.
 func termFlagValue(f TermFlagPair, path string) (string, *TermFlagError) {
 	if f.Bare {
-		return "", &TermFlagError{Path: path, Expected: "a value", Found: "the flag alone"}
+		return "", &TermFlagError{Reason: "Mismatch", Path: path, Expected: "a value", Found: "the flag alone"}
 	}
 	return f.Value, nil
 }
@@ -435,7 +438,7 @@ func TermFlagInt(f TermFlagPair, path string) (int, *TermFlagError) {
 	}
 	n, err := strconv.Atoi(s)
 	if err != nil {
-		return 0, &TermFlagError{Path: path, Expected: "Int", Found: strconv.Quote(s)}
+		return 0, &TermFlagError{Reason: "Mismatch", Path: path, Expected: "Int", Found: strconv.Quote(s)}
 	}
 	return n, nil
 }
@@ -447,7 +450,7 @@ func TermFlagFloat(f TermFlagPair, path string) (float64, *TermFlagError) {
 	}
 	n, err := strconv.ParseFloat(s, 64)
 	if err != nil {
-		return 0, &TermFlagError{Path: path, Expected: "Float", Found: strconv.Quote(s)}
+		return 0, &TermFlagError{Reason: "Mismatch", Path: path, Expected: "Float", Found: strconv.Quote(s)}
 	}
 	return n, nil
 }
@@ -459,7 +462,7 @@ func TermFlagBool(f TermFlagPair, path string) (bool, *TermFlagError) {
 	if f.Value == "true" || f.Value == "false" {
 		return f.Value == "true", nil
 	}
-	return false, &TermFlagError{Path: path, Expected: "Bool", Found: strconv.Quote(f.Value)}
+	return false, &TermFlagError{Reason: "Mismatch", Path: path, Expected: "Bool", Found: strconv.Quote(f.Value)}
 }
 
 func TermFlagAtom(f TermFlagPair, path string) (Atom, *TermFlagError) {
@@ -472,7 +475,7 @@ func TermFlagAtom(f TermFlagPair, path string) (Atom, *TermFlagError) {
 			return Atom(i), nil
 		}
 	}
-	return 0, &TermFlagError{Path: path, Expected: "a known atom", Found: strconv.Quote(s)}
+	return 0, &TermFlagError{Reason: "Mismatch", Path: path, Expected: "a known atom", Found: strconv.Quote(s)}
 }
 
 // Encoding writes every field as --name value, quoting a value that would

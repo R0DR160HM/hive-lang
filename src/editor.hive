@@ -7,6 +7,7 @@ import ./ast
 import ./check as checks
 import ./diag
 import ./infer
+import ./laws
 import ./lexer
 import ./loader
 import ./mono
@@ -120,8 +121,14 @@ proc read(entry: Str, held: hive.map.Map<Str, Str>): Reading {
         append(errors, e)
     }
     if len(found.errors) == 0 {
-        for each e in loader.placed(program, entry, ranges.checkModule(expanded.module)) {
+        inRange := ranges.checkModule(expanded.module)
+        for each e in loader.placed(program, entry, inRange) {
             append(errors, e)
+        }
+        if len(inRange) == 0 && laws.count(expanded.module) > 0 {
+            for each e in loader.placed(program, entry, laws.checkModule(expanded.module)) {
+                append(errors, e)
+            }
         }
     }
     return Reading(entry, errors, true, types.tableOf(expanded.module), known, imports, prefixes, stems, found.uses, found.scopes)
@@ -133,10 +140,7 @@ proc declared(t: types.Table, m: ast.Module): Named[dyn] {
         if d is ast.Decl.TypeDecl(name, fields, variants, at) {
             append(out, Named(name, typeShown(t, name, fields, variants), Kind.TypeName(), at))
         } else if d is ast.Decl.CallableDecl(kind, name, params, result, _, at) {
-            mut word := "proc"
-            if kind is ast.CallableKind.FuncKind {
-                word = "func"
-            }
+            word := ast.kindWord(kind)
             append(out, Named(name, word + " " + name + signature(t, params, result), Kind.Callable(), at))
         } else if d is ast.Decl.QueryDecl(name, params, result, _, at) {
             append(out, Named(name, "query " + name + signature(t, params, result), Kind.Callable(), at))
@@ -595,7 +599,7 @@ func boundAt(r: Reading, word: Word): types.Ty {
 // --- What could be written -----------------------------------------------------
 
 func keywords(): Str[dyn] {
-    return ["import", "proc", "func", "query", "test", "type", "if", "else", "return", "is", "with", "void", "true", "false", "echo", "assert", "panic", "dyn", "mut", "async", "await", "for", "in", "each", "bounds", "break", "continue", "switch"]
+    return ["import", "proc", "func", "query", "test", "law", "type", "if", "else", "return", "is", "with", "void", "true", "false", "echo", "assert", "panic", "dyn", "mut", "async", "await", "for", "in", "each", "bounds", "break", "continue", "switch"]
 }
 
 func builtins(): Str[dyn] {
@@ -887,13 +891,12 @@ proc outline(entry: Str, source: Str): Result<Outlined[dyn], Bool> {
             }
             append(out, Outlined(name, "type", Kind.TypeName(), at.line, at.col, last, inside))
         } else if d is ast.Decl.CallableDecl(kind, name, params, result, _, at) {
-            mut word := "proc"
-            if kind is ast.CallableKind.FuncKind {
-                word = "func"
-            }
+            word := ast.kindWord(kind)
             append(out, Outlined(name, word + signature(t, params, result), Kind.Callable(), at.line, at.col, last, []))
         } else if d is ast.Decl.QueryDecl(name, params, result, _, at) {
             append(out, Outlined(name, "query" + signature(t, params, result), Kind.Callable(), at.line, at.col, last, []))
+        } else if d is ast.Decl.TableLawDecl(name, _, table, _, at) {
+            append(out, Outlined(name, "law for table " + table, Kind.Callable(), at.line, at.col, last, []))
         } else if d is ast.Decl.TestDecl(title, _, at) {
             append(out, Outlined(title, "test", Kind.Callable(), at.line, at.col, last, []))
         }

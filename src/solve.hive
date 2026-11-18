@@ -1,0 +1,1024 @@
+// Deciding
+// ========
+// Whether a condition holds on a path, given the facts the path has learned. The
+// answer is `Holds`, `Fails`, or `Open` — and `Open` is what every question this
+// cannot settle gets, which is what keeps the prover sound: nothing here ever
+// guesses.
+//
+// Integers are reasoned about as the mathematics they are only where they cannot
+// have wrapped. A sum the facts cannot keep inside `Int` is an opaque atom, so
+// `a + 1 > a` is never proved; the counterexample stage finds `a = MAX` instead.
+import ./terms
+import ./text
+import ./types
+import hive.map
+
+type Verdict {
+    Holds
+    Fails
+    Open
+}
+
+// What another law, or the law itself on something smaller, says: wherever every
+// guard holds, so does the conclusion.
+type Lemma {
+    guards: terms.Term[dyn]
+    conclusion: terms.Term
+}
+
+// `Σ coeffs·atoms + constant ≤ 0`.
+type Lin {
+    atoms: Str[dyn]
+    coeffs: Int[dyn]
+    constant: Int
+}
+
+type Range {
+    low: Int
+    high: Int
+}
+
+type Edge {
+    from: Str
+    to: Str
+    weight: Int
+}
+
+// --- Questions ----------------------------------------------------------------
+
+proc decide(facts: terms.Term[], lemmas: Lemma[], goal: terms.Term): Verdict {
+    known := saturated(facts, lemmas)
+    if contradictory(known) {
+        return Verdict.Holds()
+    }
+    return judge(known, goal, 0)
+}
+
+// Whether the facts cannot all hold at once — a path that cannot happen.
+proc impossible(facts: terms.Term[], lemmas: Lemma[]): Bool {
+    return contradictory(saturated(facts, lemmas))
+}
+
+// The facts, with every lemma whose guards they settle added, a few rounds deep.
+proc saturated(facts: terms.Term[], lemmas: Lemma[]): terms.Term[dyn] {
+    mut terms.Term[dyn] out = []
+    for each f in facts {
+        append(out, f)
+    }
+    mut Bool[dyn] used = []
+    for each l in lemmas {
+        append(used, false)
+    }
+    for round := 0; round < 4; round++ {
+        mut grew := false
+        mut i := 0
+        for each l in lemmas {
+            if used bounds i {
+                if used[i] == false && guardsHold(out, l.guards) {
+                    used[i] = true
+                    append(out, l.conclusion)
+                    grew = true
+                }
+            }
+            i = i + 1
+        }
+        if grew == false {
+            return out
+        }
+    }
+    return out
+}
+
+proc guardsHold(facts: terms.Term[], guards: terms.Term[]): Bool {
+    for each g in guards {
+        if (judge(facts, g, 0) is Verdict.Holds) == false {
+            return false
+        }
+    }
+    return true
+}
+
+proc contradictory(facts: terms.Term[]): Bool {
+    mut hive.map.Map<Str, Bool> seen = hive.map.new()
+    for each f in facts {
+        if terms.isFalse(f) {
+            return true
+        }
+        hive.map.set(seen, terms.key(f), true)
+    }
+    for each f in facts {
+        if hive.map.has(seen, terms.key(terms.negation(f))) {
+            return true
+        }
+    }
+    return infeasible(constraintsOf(facts))
+}
+
+proc judge(facts: terms.Term[], goal: terms.Term, depth: Int): Verdict {
+    if goal is terms.Term.BoolK(b) {
+        if b {
+            return Verdict.Holds()
+        }
+        return Verdict.Fails()
+    }
+    wanted := terms.key(goal)
+    opposite := terms.key(terms.negation(goal))
+    for each f in facts {
+        k := terms.key(f)
+        if k == wanted {
+            return Verdict.Holds()
+        }
+        if k == opposite {
+            return Verdict.Fails()
+        }
+    }
+    if goal is terms.Term.Op(name, args, _) {
+        if name == "not" {
+            for each inner in args {
+                return flipped(judge(facts, inner, depth))
+            }
+        }
+        if name == "and" && len(args) == 2 {
+            left := judge(facts, terms.nth(args, 0), depth)
+            right := judge(facts, terms.nth(args, 1), depth)
+            if left is Verdict.Holds && right is Verdict.Holds {
+                return Verdict.Holds()
+            }
+            if left is Verdict.Fails || right is Verdict.Fails {
+                return Verdict.Fails()
+            }
+            return Verdict.Open()
+        }
+        if name == "or" && len(args) == 2 {
+            left := judge(facts, terms.nth(args, 0), depth)
+            right := judge(facts, terms.nth(args, 1), depth)
+            if left is Verdict.Holds || right is Verdict.Holds {
+                return Verdict.Holds()
+            }
+            if left is Verdict.Fails && right is Verdict.Fails {
+                return Verdict.Fails()
+            }
+            // Where the left side does not hold, the right one has to.
+            if depth < 3 {
+                if judge(facts + [terms.negation(terms.nth(args, 0))], terms.nth(args, 1), depth + 1) is Verdict.Holds {
+                    return Verdict.Holds()
+                }
+            }
+            return Verdict.Open()
+        }
+        if isIntComparison(name, args) {
+            return arithmetic(facts, goal)
+        }
+    }
+    return Verdict.Open()
+}
+
+func flipped(v: Verdict): Verdict {
+    if v is Verdict.Holds {
+        return Verdict.Fails()
+    }
+    if v is Verdict.Fails {
+        return Verdict.Holds()
+    }
+    return Verdict.Open()
+}
+
+func isIntComparison(name: Str, args: terms.Term[]): Bool {
+    if name != "le" && name != "lt" && name != "eq" && name != "ne" {
+        return false
+    }
+    for each a in args {
+        return isIntTerm(a)
+    }
+    return false
+}
+
+func isIntTerm(t: terms.Term): Bool {
+    if t is terms.Term.IntK(_) {
+        return true
+    }
+    if t is terms.Term.Op(_, _, ty) {
+        return ty is types.Ty.TInt
+    }
+    if t is terms.Term.Unknown(_, ty) {
+        return ty is types.Ty.TInt
+    }
+    return false
+}
+
+// --- Arithmetic -----------------------------------------------------------------
+
+// A comparison holds where the facts leave no room for it not to, and fails where
+// they leave no room for it to.
+proc arithmetic(facts: terms.Term[], goal: terms.Term): Verdict {
+    if goal is terms.Term.Op(name, args, _) {
+        if name == "eq" && congruent(facts, terms.nth(args, 0), terms.nth(args, 1)) {
+            return Verdict.Holds()
+        }
+    }
+    known := constraintsOf(facts)
+    // The goal's own products are held to their ranges as the facts' are.
+    base := known + productBounds([goal], rangesOf(known))
+    if refutes(base, terms.negation(goal), facts) {
+        return Verdict.Holds()
+    }
+    if refutes(base, goal, facts) {
+        return Verdict.Fails()
+    }
+    return Verdict.Open()
+}
+
+// Whether `base` together with `condition` cannot hold. A `!=` is two cases, and
+// both have to be impossible.
+proc refutes(base: Lin[], condition: terms.Term, facts: terms.Term[]): Bool {
+    limits := rangesOf(base)
+    if condition is terms.Term.Op(name, args, _) {
+        if name == "ne" && len(args) == 2 {
+            below := comparison("lt", terms.nth(args, 0), terms.nth(args, 1), limits)
+            above := comparison("lt", terms.nth(args, 1), terms.nth(args, 0), limits)
+            if below is Result.Ok(b) && above is Result.Ok(a) {
+                return infeasible(withLengths(base + b)) && infeasible(withLengths(base + a))
+            }
+            return false
+        }
+        if name == "not" {
+            for each inner in args {
+                if inner is terms.Term.Op(innerName, innerArgs, _) {
+                    a := terms.nth(innerArgs, 0)
+                    b := terms.nth(innerArgs, 1)
+                    if len(innerArgs) == 2 {
+                        if innerName == "eq" {
+                            return refutes(base, terms.op("ne", [a, b], terms.boolean()), facts)
+                        }
+                        if innerName == "ne" {
+                            return refutes(base, terms.op("eq", [a, b], terms.boolean()), facts)
+                        }
+                        if innerName == "le" {
+                            return refutes(base, terms.op("lt", [b, a], terms.boolean()), facts)
+                        }
+                        if innerName == "lt" {
+                            return refutes(base, terms.op("le", [b, a], terms.boolean()), facts)
+                        }
+                    }
+                }
+            }
+            return false
+        }
+        if len(args) == 2 {
+            if comparison(name, terms.nth(args, 0), terms.nth(args, 1), limits) is Result.Ok(more) {
+                return infeasible(withLengths(base + more))
+            }
+        }
+    }
+    return false
+}
+
+// --- Equalities, round and round -----------------------------------------------------
+//
+// `+`, `-` and multiplying by a literal wrap round, and wrapping round is arithmetic
+// modulo 2^64 — where equals added to equals are still equal. So an equality between
+// integers is decided as one modulo 2^64: the difference of the two sides, with every
+// equality the facts hold used to cancel what it can, has to come to zero. No sum
+// here has to be kept from wrapping, and the prover's own sums may wrap freely.
+
+proc congruent(facts: terms.Term[], a: terms.Term, b: terms.Term): Bool {
+    mut d := modSub(modular(a), modular(b))
+    mut Lin[dyn] rules = []
+    for each f in facts {
+        if f is terms.Term.Op(name, args, _) {
+            if name == "eq" && len(args) == 2 && isIntTerm(terms.nth(args, 0)) {
+                append(rules, modSub(modular(terms.nth(args, 0)), modular(terms.nth(args, 1))))
+            }
+        }
+    }
+    for round := 0; round < 3; round++ {
+        if len(d.atoms) == 0 {
+            return d.constant == 0
+        }
+        for each r in rules {
+            d = eliminated(d, r)
+        }
+    }
+    return len(d.atoms) == 0 && d.constant == 0
+}
+
+// `d` with one of the rule's atoms whose coefficient is ±1 cancelled out of it.
+func eliminated(d: Lin, rule: Lin): Lin {
+    mut i := 0
+    for each atom in rule.atoms {
+        mut c := 0
+        if rule.coeffs bounds i {
+            c = rule.coeffs[i]
+        }
+        if c == 1 || c == -1 {
+            if indexOf(d.atoms, atom) is Result.Ok(at) {
+                if d.coeffs bounds at {
+                    // d - (d's coefficient / c) * rule takes the atom out.
+                    by := d.coeffs[at] * c
+                    return modSub(d, modScale(rule, by))
+                }
+            }
+        }
+        i = i + 1
+    }
+    return d
+}
+
+// A term as a linear form modulo 2^64: every `+`, `-`, negation and multiplication
+// by a literal taken apart, wrapping or not.
+func modular(t: terms.Term): Lin {
+    if t is terms.Term.IntK(v) {
+        return Lin([], [], v)
+    }
+    if t is terms.Term.Op(name, args, _) {
+        if name == "add" && len(args) == 2 {
+            return modAdd(modular(terms.nth(args, 0)), modular(terms.nth(args, 1)))
+        }
+        if name == "sub" && len(args) == 2 {
+            return modSub(modular(terms.nth(args, 0)), modular(terms.nth(args, 1)))
+        }
+        if name == "neg" && len(args) == 1 {
+            return modScale(modular(terms.nth(args, 0)), -1)
+        }
+        if name == "mul" && len(args) == 2 {
+            if terms.nth(args, 0) is terms.Term.IntK(k) {
+                return modScale(modular(terms.nth(args, 1)), k)
+            }
+            if terms.nth(args, 1) is terms.Term.IntK(k) {
+                return modScale(modular(terms.nth(args, 0)), k)
+            }
+        }
+    }
+    return Lin([terms.key(t)], [1], 0)
+}
+
+func modAdd(a: Lin, b: Lin): Lin {
+    mut Str[dyn] atoms = []
+    mut Int[dyn] coeffs = []
+    mut i := 0
+    for each atom in a.atoms {
+        append(atoms, atom)
+        if a.coeffs bounds i {
+            append(coeffs, a.coeffs[i])
+        }
+        i = i + 1
+    }
+    mut j := 0
+    for each atom in b.atoms {
+        mut c := 0
+        if b.coeffs bounds j {
+            c = b.coeffs[j]
+        }
+        if indexOf(atoms, atom) is Result.Ok(at) {
+            if coeffs bounds at {
+                coeffs[at] = coeffs[at] + c
+            }
+        } else {
+            append(atoms, atom)
+            append(coeffs, c)
+        }
+        j = j + 1
+    }
+    return pruned(Lin(atoms, coeffs, a.constant + b.constant))
+}
+
+func modSub(a: Lin, b: Lin): Lin {
+    return modAdd(a, modScale(b, -1))
+}
+
+func modScale(a: Lin, by: Int): Lin {
+    mut Int[dyn] coeffs = []
+    for each c in a.coeffs {
+        append(coeffs, c * by)
+    }
+    mut Str[dyn] atoms = []
+    for each atom in a.atoms {
+        append(atoms, atom)
+    }
+    return pruned(Lin(atoms, coeffs, a.constant * by))
+}
+
+// Every fact that is a comparison of integers, as constraints. Two rounds, because
+// the ranges the first round finds are what make some sums safe to read in the
+// second.
+proc constraintsOf(facts: terms.Term[]): Lin[dyn] {
+    mut hive.map.Map<Str, Range> none = hive.map.new()
+    first := withLengths(constraintsWithin(facts, none))
+    second := withLengths(constraintsWithin(facts, rangesOf(first)))
+    return second + productBounds(facts, rangesOf(second))
+}
+
+// A product of two unknowns, or a quotient by a positive literal, is an atom the
+// difference constraints cannot see into. Where its operands' ranges are known and
+// its own range is an `Int`, that range is what it is held to: such a product
+// cannot have wrapped, so it is the number the range says.
+func productBounds(facts: terms.Term[], limits: hive.map.Map<Str, Range>): Lin[dyn] {
+    mut Lin[dyn] out = []
+    mut Str[dyn] seen = []
+    for each f in facts {
+        for each t in nonlinearIn(f) {
+            k := terms.key(t)
+            if (indexOf(seen, k) is Result.Ok(_)) == false {
+                append(seen, k)
+                if intervalOf(t, limits, 0) is Result.Ok(r) {
+                    append(out, Lin([k], [-1], r.low))
+                    if terms.safeNeg(r.high) is Result.Ok(nh) {
+                        append(out, Lin([k], [1], nh))
+                    }
+                }
+            }
+        }
+    }
+    return out
+}
+
+// The products and quotients a fact mentions, at any depth.
+func nonlinearIn(t: terms.Term): terms.Term[dyn] {
+    mut terms.Term[dyn] out = []
+    if t is terms.Term.Op(name, args, _) {
+        a := terms.nth(args, 0)
+        b := terms.nth(args, 1)
+        if name == "mul" && len(args) == 2 && (a is terms.Term.IntK(_)) == false && (b is terms.Term.IntK(_)) == false {
+            append(out, t)
+        }
+        if name == "div" && len(args) == 2 {
+            append(out, t)
+        }
+        for each x in args {
+            for each n in nonlinearIn(x) {
+                append(out, n)
+            }
+        }
+    }
+    return out
+}
+
+// The range a term's value lies in, worked out from the ranges of what it is made
+// of, wherever no step of working it out wraps.
+func intervalOf(t: terms.Term, limits: hive.map.Map<Str, Range>, depth: Int): Result<Range, Bool> {
+    if depth > 6 {
+        return Result.Error(false)
+    }
+    if t is terms.Term.IntK(v) {
+        return Result.Ok(Range(v, v))
+    }
+    if t is terms.Term.Op(name, args, _) {
+        if len(args) == 2 && (name == "add" || name == "sub" || name == "mul" || name == "div") {
+            left := intervalOf(terms.nth(args, 0), limits, depth + 1)
+            right := intervalOf(terms.nth(args, 1), limits, depth + 1)
+            if left is Result.Ok(a) && right is Result.Ok(b) {
+                if name == "add" {
+                    lo := terms.safeAdd(a.low, b.low)
+                    hi := terms.safeAdd(a.high, b.high)
+                    if lo is Result.Ok(l) && hi is Result.Ok(h) {
+                        return Result.Ok(Range(l, h))
+                    }
+                } else if name == "sub" {
+                    lo := terms.safeAdd(a.low, 0 - b.high)
+                    hi := terms.safeAdd(a.high, 0 - b.low)
+                    if b.high != terms.intMin() && b.low != terms.intMin() && lo is Result.Ok(l) && hi is Result.Ok(h) {
+                        return Result.Ok(Range(l, h))
+                    }
+                } else if name == "mul" {
+                    return productRange(a, b)
+                } else if b.low > 0 && b.low == b.high {
+                    // A quotient by a positive literal keeps the order of what is divided.
+                    return Result.Ok(Range(a.low / b.low, a.high / b.low))
+                }
+            }
+            return Result.Error(false)
+        }
+    }
+    r := atomRange(terms.key(t), limits)
+    if r.low == terms.intMin() && r.high == terms.intMax() {
+        return Result.Error(false)
+    }
+    return Result.Ok(r)
+}
+
+func productRange(a: Range, b: Range): Result<Range, Bool> {
+    mut Int[dyn] corners = []
+    for each x in [a.low, a.high] {
+        for each y in [b.low, b.high] {
+            if terms.safeMul(x, y) is Result.Ok(p) {
+                append(corners, p)
+            } else {
+                return Result.Error(false)
+            }
+        }
+    }
+    mut low := terms.intMax()
+    mut high := terms.intMin()
+    for each c in corners {
+        if c < low {
+            low = c
+        }
+        if c > high {
+            high = c
+        }
+    }
+    return Result.Ok(Range(low, high))
+}
+
+// The longest a vector or a string is taken to be: 2^60 elements. No machine can hold
+// more — a packed vector of `UInt1`s that long is 128 PiB — and it is what lets a
+// length, or anything equal to one, have one added to it without wrapping round.
+func longest(): Int {
+    return 1152921504606846976
+}
+
+// The constraints, with `0 <= len(x) <= 2^60` for every length they mention.
+func withLengths(cs: Lin[]): Lin[dyn] {
+    mut Lin[dyn] out = []
+    mut Str[dyn] seen = []
+    for each c in cs {
+        append(out, c)
+        for each atom in c.atoms {
+            if text.startsWith(atom, "len(") && (indexOf(seen, atom) is Result.Ok(_)) == false {
+                append(seen, atom)
+                append(out, Lin([atom], [-1], 0))
+                append(out, Lin([atom], [1], 0 - longest()))
+            }
+        }
+    }
+    return out
+}
+
+proc constraintsWithin(facts: terms.Term[], limits: hive.map.Map<Str, Range>): Lin[dyn] {
+    mut Lin[dyn] out = []
+    for each f in facts {
+        for each c in factConstraints(f, limits) {
+            append(out, c)
+        }
+    }
+    return out
+}
+
+func factConstraints(f: terms.Term, limits: hive.map.Map<Str, Range>): Lin[dyn] {
+    mut Lin[dyn] none = []
+    if f is terms.Term.Op(name, args, _) {
+        if name == "not" {
+            for each inner in args {
+                if inner is terms.Term.Op(innerName, innerArgs, _) {
+                    a := terms.nth(innerArgs, 0)
+                    b := terms.nth(innerArgs, 1)
+                    if len(innerArgs) == 2 && isIntTerm(a) {
+                        if innerName == "le" {
+                            return okOrNone(comparison("lt", b, a, limits))
+                        }
+                        if innerName == "lt" {
+                            return okOrNone(comparison("le", b, a, limits))
+                        }
+                    }
+                }
+            }
+            return none
+        }
+        if len(args) == 2 && isIntTerm(terms.nth(args, 0)) {
+            if name == "le" || name == "lt" || name == "eq" {
+                return okOrNone(comparison(name, terms.nth(args, 0), terms.nth(args, 1), limits))
+            }
+        }
+    }
+    return none
+}
+
+func okOrNone(r: Result<Lin[dyn], Bool>): Lin[dyn] {
+    if r is Result.Ok(cs) {
+        return cs
+    }
+    mut Lin[dyn] none = []
+    return none
+}
+
+// `a op b` as constraints `… ≤ 0`, or `Error` where either side cannot be read.
+func comparison(name: Str, a: terms.Term, b: terms.Term, limits: hive.map.Map<Str, Range>): Result<Lin[dyn], Bool> {
+    la := linear(a, limits)
+    lb := linear(b, limits)
+    diff := linSub(la, lb)
+    if diff is Result.Ok(d) {
+        if name == "le" {
+            return Result.Ok([d])
+        }
+        if name == "lt" {
+            if shifted(d, 1) is Result.Ok(strict) {
+                return Result.Ok([strict])
+            }
+            return Result.Error(false)
+        }
+        if name == "eq" {
+            if linSub(lb, la) is Result.Ok(back) {
+                return Result.Ok([d, back])
+            }
+        }
+    }
+    return Result.Error(false)
+}
+
+// A term as a linear form, where every step of it is known not to wrap; anything
+// else is an atom of its own.
+func linear(t: terms.Term, limits: hive.map.Map<Str, Range>): Lin {
+    if t is terms.Term.IntK(v) {
+        return Lin([], [], v)
+    }
+    if t is terms.Term.Op(name, args, _) {
+        if (name == "add" || name == "sub") && len(args) == 2 {
+            la := linear(terms.nth(args, 0), limits)
+            lb := linear(terms.nth(args, 1), limits)
+            mut Result<Lin, Bool> combined = Result.Error(false)
+            if name == "add" {
+                combined = linAdd(la, lb)
+            } else {
+                combined = linSub(la, lb)
+            }
+            if combined is Result.Ok(c) && withinInt(c, limits) {
+                return c
+            }
+        }
+        if name == "neg" && len(args) == 1 {
+            l := linear(terms.nth(args, 0), limits)
+            if linScale(l, -1) is Result.Ok(c) && withinInt(c, limits) {
+                return c
+            }
+        }
+        if name == "mul" && len(args) == 2 {
+            if terms.nth(args, 0) is terms.Term.IntK(k) {
+                if linScale(linear(terms.nth(args, 1), limits), k) is Result.Ok(c) && withinInt(c, limits) {
+                    return c
+                }
+            }
+            if terms.nth(args, 1) is terms.Term.IntK(k) {
+                if linScale(linear(terms.nth(args, 0), limits), k) is Result.Ok(c) && withinInt(c, limits) {
+                    return c
+                }
+            }
+        }
+    }
+    return Lin([terms.key(t)], [1], 0)
+}
+
+// Whether every value the form can take, given what is known of its atoms, is an
+// `Int` — so the term it came from cannot have wrapped.
+func withinInt(l: Lin, limits: hive.map.Map<Str, Range>): Bool {
+    return rangeOf(l, limits) is Result.Ok(_)
+}
+
+func rangeOf(l: Lin, limits: hive.map.Map<Str, Range>): Result<Range, Bool> {
+    mut low := l.constant
+    mut high := l.constant
+    mut i := 0
+    for each atom in l.atoms {
+        r := atomRange(atom, limits)
+        mut c := 0
+        if l.coeffs bounds i {
+            c = l.coeffs[i]
+        }
+        lowTerm := terms.safeMul(c, r.low)
+        highTerm := terms.safeMul(c, r.high)
+        if lowTerm is Result.Ok(lt) && highTerm is Result.Ok(ht) {
+            mut least := lt
+            mut most := ht
+            if c < 0 {
+                least = ht
+                most = lt
+            }
+            nextLow := terms.safeAdd(low, least)
+            nextHigh := terms.safeAdd(high, most)
+            if nextLow is Result.Ok(nl) && nextHigh is Result.Ok(nh) {
+                low = nl
+                high = nh
+            } else {
+                return Result.Error(false)
+            }
+        } else {
+            return Result.Error(false)
+        }
+        i = i + 1
+    }
+    return Result.Ok(Range(low, high))
+}
+
+func atomRange(atom: Str, limits: hive.map.Map<Str, Range>): Range {
+    if hive.map.get(limits, atom) is Result.Ok(r) {
+        return r
+    }
+    if text.startsWith(atom, "len(") {
+        return Range(0, longest())
+    }
+    return Range(terms.intMin(), terms.intMax())
+}
+
+func linAdd(a: Lin, b: Lin): Result<Lin, Bool> {
+    mut Str[dyn] atoms = []
+    mut Int[dyn] coeffs = []
+    mut i := 0
+    for each atom in a.atoms {
+        append(atoms, atom)
+        if a.coeffs bounds i {
+            append(coeffs, a.coeffs[i])
+        }
+        i = i + 1
+    }
+    mut j := 0
+    for each atom in b.atoms {
+        mut c := 0
+        if b.coeffs bounds j {
+            c = b.coeffs[j]
+        }
+        if indexOf(atoms, atom) is Result.Ok(at) {
+            if coeffs bounds at {
+                sum := terms.safeAdd(coeffs[at], c)
+                if sum is Result.Ok(s) {
+                    coeffs[at] = s
+                } else {
+                    return Result.Error(false)
+                }
+            }
+        } else {
+            append(atoms, atom)
+            append(coeffs, c)
+        }
+        j = j + 1
+    }
+    constant := terms.safeAdd(a.constant, b.constant)
+    if constant is Result.Ok(k) {
+        return Result.Ok(pruned(Lin(atoms, coeffs, k)))
+    }
+    return Result.Error(false)
+}
+
+func linSub(a: Lin, b: Lin): Result<Lin, Bool> {
+    if linScale(b, -1) is Result.Ok(nb) {
+        return linAdd(a, nb)
+    }
+    return Result.Error(false)
+}
+
+func linScale(a: Lin, by: Int): Result<Lin, Bool> {
+    mut Int[dyn] coeffs = []
+    for each c in a.coeffs {
+        if terms.safeMul(c, by) is Result.Ok(m) {
+            append(coeffs, m)
+        } else {
+            return Result.Error(false)
+        }
+    }
+    if terms.safeMul(a.constant, by) is Result.Ok(k) {
+        mut Str[dyn] atoms = []
+        for each atom in a.atoms {
+            append(atoms, atom)
+        }
+        return Result.Ok(Lin(atoms, coeffs, k))
+    }
+    return Result.Error(false)
+}
+
+func shifted(a: Lin, by: Int): Result<Lin, Bool> {
+    if terms.safeAdd(a.constant, by) is Result.Ok(k) {
+        mut Str[dyn] atoms = []
+        for each atom in a.atoms {
+            append(atoms, atom)
+        }
+        mut Int[dyn] coeffs = []
+        for each c in a.coeffs {
+            append(coeffs, c)
+        }
+        return Result.Ok(Lin(atoms, coeffs, k))
+    }
+    return Result.Error(false)
+}
+
+// Without the atoms whose coefficients came to zero.
+func pruned(l: Lin): Lin {
+    mut Str[dyn] atoms = []
+    mut Int[dyn] coeffs = []
+    mut i := 0
+    for each atom in l.atoms {
+        if l.coeffs bounds i {
+            if l.coeffs[i] != 0 {
+                append(atoms, atom)
+                append(coeffs, l.coeffs[i])
+            }
+        }
+        i = i + 1
+    }
+    return Lin(atoms, coeffs, l.constant)
+}
+
+// --- Difference constraints -----------------------------------------------------
+//
+// The constraints of the shape `x - y ≤ c`, `x ≤ c` and `-x ≤ c` make a graph whose
+// negative cycles are exactly the contradictions among them (Bellman–Ford). Any
+// other shape is left out, which only ever makes a contradiction harder to find.
+
+func edgesOf(cs: Lin[]): Edge[dyn] {
+    mut Edge[dyn] out = []
+    for each c in cs {
+        neg := terms.safeNeg(c.constant)
+        if neg is Result.Ok(w) {
+            if len(c.atoms) == 1 && c.atoms bounds 0 && c.coeffs bounds 0 {
+                if c.coeffs[0] == 1 {
+                    append(out, Edge("0", c.atoms[0], w))
+                } else if c.coeffs[0] == -1 {
+                    append(out, Edge(c.atoms[0], "0", w))
+                }
+            } else if len(c.atoms) == 2 && c.atoms bounds 0 && c.atoms bounds 1 && c.coeffs bounds 0 && c.coeffs bounds 1 {
+                if c.coeffs[0] == 1 && c.coeffs[1] == -1 {
+                    append(out, Edge(c.atoms[1], c.atoms[0], w))
+                } else if c.coeffs[0] == -1 && c.coeffs[1] == 1 {
+                    append(out, Edge(c.atoms[0], c.atoms[1], w))
+                }
+            }
+        }
+    }
+    return out
+}
+
+proc infeasible(cs: Lin[]): Bool {
+    for each c in cs {
+        if len(c.atoms) == 0 && c.constant > 0 {
+            return true
+        }
+    }
+    if negativeCycle(cs) {
+        return true
+    }
+    return eliminates(cs)
+}
+
+// Fourier–Motzkin: each atom in turn taken out by adding every pair of
+// constraints that bound it from opposite sides, until what is left either has no
+// atoms and cannot hold, or cannot be taken further. What it finds is a
+// contradiction over the rationals, and so over the integers too. A pair whose
+// sum would overflow the prover's own arithmetic is left out, which only ever
+// makes a contradiction harder to find.
+proc eliminates(cs: Lin[]): Bool {
+    mut Lin[dyn] current = []
+    for each c in cs {
+        append(current, c)
+    }
+    for round := 0; round < 12; round++ {
+        mut atom := ""
+        for each c in current {
+            if len(c.atoms) == 0 && c.constant > 0 {
+                return true
+            }
+            for each a in c.atoms {
+                if atom == "" {
+                    atom = a
+                }
+            }
+        }
+        if atom == "" {
+            return false
+        }
+        mut Lin[dyn] above = []
+        mut Lin[dyn] below = []
+        mut Lin[dyn] next = []
+        for each c in current {
+            k := coefficientOf(c, atom)
+            if k > 0 {
+                append(above, c)
+            } else if k < 0 {
+                append(below, c)
+            } else {
+                append(next, c)
+            }
+        }
+        for each a in above {
+            for each b in below {
+                ka := coefficientOf(a, atom)
+                kb := 0 - coefficientOf(b, atom)
+                if linScale(a, kb) is Result.Ok(sa) && linScale(b, ka) is Result.Ok(sb) {
+                    if linAdd(sa, sb) is Result.Ok(sum) {
+                        append(next, sum)
+                    }
+                }
+                if len(next) > 400 {
+                    return false
+                }
+            }
+        }
+        current = next
+    }
+    return false
+}
+
+func coefficientOf(c: Lin, atom: Str): Int {
+    if indexOf(c.atoms, atom) is Result.Ok(at) {
+        if c.coeffs bounds at {
+            return c.coeffs[at]
+        }
+    }
+    return 0
+}
+
+// The difference constraints among `cs`, as a graph with a negative cycle.
+proc negativeCycle(cs: Lin[]): Bool {
+    edges := edgesOf(cs)
+    mut Str[dyn] nodes = ["0"]
+    for each e in edges {
+        if (indexOf(nodes, e.from) is Result.Ok(_)) == false {
+            append(nodes, e.from)
+        }
+        if (indexOf(nodes, e.to) is Result.Ok(_)) == false {
+            append(nodes, e.to)
+        }
+    }
+    mut hive.map.Map<Str, Int> dist = hive.map.new()
+    for each n in nodes {
+        hive.map.set(dist, n, 0)
+    }
+    for round := 0; round < len(nodes); round++ {
+        mut changed := false
+        for each e in edges {
+            if hive.map.get(dist, e.from) is Result.Ok(df) && hive.map.get(dist, e.to) is Result.Ok(dt) {
+                sum := terms.safeAdd(df, e.weight)
+                if sum is Result.Ok(s) {
+                    if s < dt {
+                        hive.map.set(dist, e.to, s)
+                        changed = true
+                    }
+                } else {
+                    return false
+                }
+            }
+        }
+        if changed == false {
+            return false
+        }
+    }
+    return true
+}
+
+// What the constraints say about each atom on its own: the shortest path from the
+// zero node is its upper bound, and the one back to it its lower bound.
+proc rangesOf(cs: Lin[]): hive.map.Map<Str, Range> {
+    edges := edgesOf(cs)
+    upper := shortestFrom(edges, false)
+    lower := shortestFrom(edges, true)
+    mut hive.map.Map<Str, Range> out = hive.map.new()
+    for each e in edges {
+        for each atom in [e.from, e.to] {
+            if atom != "0" && hive.map.has(out, atom) == false {
+                mut high := terms.intMax()
+                mut low := terms.intMin()
+                if hive.map.get(upper, atom) is Result.Ok(u) {
+                    high = u
+                }
+                if hive.map.get(lower, atom) is Result.Ok(l) {
+                    if terms.safeNeg(l) is Result.Ok(nl) {
+                        low = nl
+                    }
+                }
+                if text.startsWith(atom, "len(") {
+                    if low < 0 {
+                        low = 0
+                    }
+                    if high > longest() {
+                        high = longest()
+                    }
+                }
+                hive.map.set(out, atom, Range(low, high))
+            }
+        }
+    }
+    return out
+}
+
+// Shortest distances from the zero node, or to it when `reversed`. A node nothing
+// reaches is left out, which is "no bound".
+proc shortestFrom(edges: Edge[], reversed: Bool): hive.map.Map<Str, Int> {
+    mut hive.map.Map<Str, Int> dist = hive.map.new()
+    hive.map.set(dist, "0", 0)
+    for round := 0; round < len(edges) + 1; round++ {
+        mut changed := false
+        for each e in edges {
+            mut from := e.from
+            mut to := e.to
+            if reversed {
+                from = e.to
+                to = e.from
+            }
+            if hive.map.get(dist, from) is Result.Ok(df) {
+                if terms.safeAdd(df, e.weight) is Result.Ok(s) {
+                    if hive.map.get(dist, to) is Result.Ok(dt) {
+                        if s < dt {
+                            hive.map.set(dist, to, s)
+                            changed = true
+                        }
+                    } else {
+                        hive.map.set(dist, to, s)
+                        changed = true
+                    }
+                }
+            }
+        }
+        if changed == false {
+            return dist
+        }
+    }
+    // A negative cycle: the facts contradict each other, and no bound means anything.
+    mut hive.map.Map<Str, Int> none = hive.map.new()
+    return none
+}

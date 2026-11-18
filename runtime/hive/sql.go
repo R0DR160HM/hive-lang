@@ -337,7 +337,7 @@ func (c SqlSqlConnection) prepared(text string) *sql.Stmt {
 }
 
 // exec and query run what a query declaration built, through its prepared
-// statement where there is one. hive.sql.raw goes through neither: its text is
+// statement where there is one. hive.sql.unsafe goes through neither: its text is
 // the program's to assemble, and no two need be alike.
 func (c SqlSqlConnection) exec(stmt SqlFragment) (sql.Result, error) {
 	if st := c.prepared(stmt.Text); st != nil {

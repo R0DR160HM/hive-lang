@@ -1,0 +1,122 @@
+// A chat app's messages, and three laws they keep. A message never goes back: once
+// it is read, a late "delivered" from the other phone leaves it read. That `law` is
+// proved while this file compiles — for every message and every receipt, not for
+// the few a test would pick — so if `receive` ever let a read message slip back, the
+// program would stop compiling and say which message and receipt do it. Every
+// message has something in it and goes to someone else: that one lives in the type,
+// so every place that writes a message has to keep it. And a contact only ever reads
+// their own chats: that one is about a table, so every query on it has to say so in
+// its SQL.
+//
+// Nothing runs a law: `hive run` prints what `main` prints, and the laws were
+// settled before any of it was written.
+
+type Contact {
+    id: Int
+    name: Str
+}
+
+type Status {
+    Sent
+    Delivered
+    Read
+}
+
+// What the other phone reports back about a message.
+type Receipt {
+    Delivered
+    Read
+}
+
+type Message {
+    from: Int
+    to: Int
+    body: Str
+    status: Status
+
+    law addressed(m: Message) {
+        assert m.from != m.to && m.body != ""
+    }
+
+}
+
+// One line of a conversation, as the database answers with it.
+type Line {
+    sender: Str
+    body: Str
+}
+
+// What a receipt does to a message, written into it.
+proc receive(message: mut Message, receipt: Receipt): void {
+    if receipt is Receipt.Read {
+        message.status = Status.Read()
+    } else if message.status is Status.Sent {
+        message.status = Status.Delivered()
+    }
+}
+
+func progress(s: Status): Int {
+    switch s {
+        Status.Sent { return 0 }
+        Status.Delivered { return 1 }
+        Status.Read { return 2 }
+    }
+}
+
+func statusName(s: Status): Str {
+    switch s {
+        Status.Sent { return "sent" }
+        Status.Delivered { return "delivered" }
+        Status.Read { return "read" }
+    }
+}
+
+// Receipts arrive out of order, so whatever comes, a message never goes back.
+law statusNeverGoesBack(message: Message, receipt: Receipt) {
+    mut after := message
+    receive(after, receipt)
+    assert progress(after.status) >= progress(message.status)
+}
+
+law usersCanOnlyAccessTheirOwnChat(contact: Contact) for table chats {
+    fk_contact_from_id = {contact.id} or
+    fk_contact_to_id = {contact.id}
+}
+
+query sent(contact: Contact, to: Int, body: Str): void {
+    INSERT INTO chats (fk_contact_from_id, fk_contact_to_id, body) VALUES ({contact.id}, {to}, {body})
+}
+
+query conversation(contact: Contact): Line[dyn] {
+    SELECT contacts.name AS sender, chats.body FROM chats
+    JOIN contacts ON contacts.id = chats.fk_contact_from_id
+    WHERE chats.fk_contact_from_id = {contact.id} OR chats.fk_contact_to_id = {contact.id}
+    ORDER BY chats.id
+}
+
+proc main(): void {
+    ada := Contact(1, "Ada")
+    grace := Contact(2, "Grace")
+    tim := Contact(3, "Tim")
+
+    mut lunch := Message(ada.id, grace.id, "lunch at noon?", Status.Sent())
+    receive(lunch, Receipt.Read())
+    receive(lunch, Receipt.Delivered())
+    echo "{lunch.body} {statusName(lunch.status)}"
+
+    opened := hive.sql.pool(hive.sql.DatabaseDriver.SQLite(), ":memory:", 1, 1)
+    if opened is Result.Ok(db) {
+        _ := hive.sql.unsafe(db, "CREATE TABLE contacts (id INTEGER, name TEXT)")
+        _ := hive.sql.unsafe(db, "INSERT INTO contacts VALUES (1, 'Ada'), (2, 'Grace'), (3, 'Tim')")
+        _ := hive.sql.unsafe(db, "CREATE TABLE chats (id INTEGER PRIMARY KEY, fk_contact_from_id INTEGER, fk_contact_to_id INTEGER, body TEXT)")
+        _ := hive.sql.run(db, sent(ada, lunch.to, lunch.body))
+        _ := hive.sql.run(db, sent(grace, ada.id, "see you there"))
+        _ := hive.sql.run(db, sent(tim, grace.id, "the report is late"))
+        if hive.sql.run(db, conversation(ada)) is Result.Ok(lines) {
+            for each line in lines {
+                echo "{line.sender}: {line.body}"
+            }
+        }
+        hive.sql.close(db)
+    }
+}

@@ -48,6 +48,8 @@ type Parse {
     within: token.Pos
     // Where that text's first character is, when that is known: its nodes are then placed exactly.
     base: token.Pos
+    // The laws a type's body declared, lifted out to stand beside it.
+    lifted: ast.Decl[dyn]
 }
 
 proc parse(ts: token.Token[]): Parsed {
@@ -55,7 +57,7 @@ proc parse(ts: token.Token[]): Parsed {
 }
 
 proc parseFile(ts: token.Token[], file: Str): Parsed {
-    mut Parse p = Parse(0, false, false, [], 0, [], false, false, file, token.nowhere(), token.nowhere())
+    mut Parse p = Parse(0, false, false, [], 0, [], false, false, file, token.nowhere(), token.nowhere(), [])
     mut ast.ImportLine[dyn] imports = []
     mut ast.Decl[dyn] decls = []
 
@@ -89,7 +91,11 @@ proc appendDecl(ts: token.Token[], p: mut Parse, into: mut ast.Decl[dyn]): void 
     d := parseDecl(ts, p)
     if p.failed == false {
         append(into, d)
+        for each typeLaw in p.lifted {
+            append(into, typeLaw)
+        }
     }
+    p.lifted = []
 }
 
 // --- The cursor --------------------------------------------------------------
@@ -238,6 +244,7 @@ func startsDecl(k: token.Kind): Bool {
         || k == token.Kind.KwQuery()
         || k == token.Kind.KwType()
         || k == token.Kind.KwTest()
+        || k == token.Kind.KwLaw()
         || k == token.Kind.KwImport()
 }
 
@@ -328,8 +335,10 @@ proc parseDecl(ts: token.Token[], p: mut Parse): ast.Decl {
         return parseQueryDecl(ts, p)
     } else if k == token.Kind.KwTest() {
         return parseTestDecl(ts, p)
+    } else if k == token.Kind.KwLaw() {
+        return parseLawDecl(ts, p)
     }
-    fail(ts, p, "expected a declaration — `type`, `proc`, `func`, `query` or `test` — but found " + token.describe(k))
+    fail(ts, p, "expected a declaration — `type`, `proc`, `func`, `query`, `test` or `law` — but found " + token.describe(k))
     return ast.Decl.TestDecl("", ast.Block([]), place(ts, p))
 }
 
@@ -450,7 +459,7 @@ proc parseSqlExpr(source: Str, p: mut Parse): ast.Expr {
     for each e in lexed.errors {
         append(p.errors, e)
     }
-    mut Parse inner = Parse(0, false, false, [], p.parts, [], false, false, p.file, p.within, token.nowhere())
+    mut Parse inner = Parse(0, false, false, [], p.parts, [], false, false, p.file, p.within, token.nowhere(), [])
     written := parseExpr(lexed.tokens, inner)
     p.parts = inner.parts
     for each e in inner.errors {
@@ -547,9 +556,15 @@ proc parseTypeDecl(ts: token.Token[], p: mut Parse): ast.Decl {
             advance(p)
             return ast.Decl.TypeDecl(name, fields, variants, line)
         }
-        // A name followed by `:` is a field; anything else at this position is a
-        // variant, whose own fields are in the braces after it.
-        if kindAt(ts, p.pos + 1) == token.Kind.Colon() {
+        // A name followed by `:` is a field, `law` opens what every value keeps, and
+        // anything else at this position is a variant, whose own fields are in the
+        // braces after it.
+        if kindAt(ts, p.pos) == token.Kind.KwLaw() {
+            typeLaw := parseTypeLaw(ts, p, name)
+            if p.failed == false {
+                append(p.lifted, typeLaw)
+            }
+        } else if kindAt(ts, p.pos + 1) == token.Kind.Colon() {
             append(fields, parseField(ts, p))
         } else {
             append(variants, parseVariant(ts, p))
@@ -825,6 +840,112 @@ proc parseCallable(ts: token.Token[], p: mut Parse, kind: ast.CallableKind): ast
     result := parseResultType(ts, p)
     body := parseBlock(ts, p)
     return ast.Decl.CallableDecl(kind, name, params, result, body, line)
+}
+
+// `law name(params) { ... }`. A law answers with nothing, so it has no return type
+// to write: what it claims is the `assert`s in its body.
+proc parseLawDecl(ts: token.Token[], p: mut Parse): ast.Decl {
+    line := place(ts, p)
+    advance(p)
+    name := expectIdent(ts, p, naming.Role.Callable())
+    params := parseParams(ts, p)
+    if p.failed == false && kindAt(ts, p.pos) == token.Kind.Colon() {
+        fail(ts, p, "a law has no return type: it answers with nothing, and what it claims is the `assert`s in its body")
+    }
+    if p.failed == false && kindAt(ts, p.pos) == token.Kind.KwFor() {
+        return parseTableLaw(ts, p, name, params, line)
+    }
+    body := parseBlock(ts, p)
+    return ast.Decl.CallableDecl(ast.CallableKind.LawKind(), name, params, ast.TypeExpr.VoidType(), body, line)
+}
+
+// `law name(session: Session) for table users { filter }`: the filter every query
+// on the table carries. A body opening with `if`, `or` or `and` is a `WHERE { }`
+// block, and any other is a filter that always applies.
+proc parseTableLaw(ts: token.Token[], p: mut Parse, name: Str, params: ast.Param[], line: token.Pos): ast.Decl {
+    advance(p)
+    mut ast.SqlPart[dyn] filter = []
+    mut table := ""
+    mut sawTable := false
+    if kindAt(ts, p.pos) is token.Kind.Ident(word) {
+        if word == "table" {
+            advance(p)
+            sawTable = true
+        }
+    }
+    if sawTable == false {
+        fail(ts, p, "a law about a table is written `law {name}(...) for table <name> \{ ... }`")
+        return ast.Decl.TableLawDecl(name, params, table, filter, line)
+    }
+    if kindAt(ts, p.pos) is token.Kind.Ident(first) {
+        table = first
+        advance(p)
+        for ; kindAt(ts, p.pos) == token.Kind.Dot(); {
+            advance(p)
+            if kindAt(ts, p.pos) is token.Kind.Ident(more) {
+                table = table + "." + more
+                advance(p)
+            } else {
+                expected(ts, p, "the rest of the table's name after `.`")
+                return ast.Decl.TableLawDecl(name, params, table, filter, line)
+            }
+        }
+    } else {
+        expected(ts, p, "the name of the table after `for table`")
+        return ast.Decl.TableLawDecl(name, params, table, filter, line)
+    }
+    if len(params) != 1 && p.quiet == false {
+        append(p.errors, diag.on(line, "a law about a table is about the one value a query is run for, so it takes exactly one parameter: `law {name}(session: Session) for table {table} \{ ... }`"))
+        p.failed = true
+    }
+    if kindAt(ts, p.pos) is token.Kind.SqlBody(body) {
+        p.within = place(ts, p)
+        advance(p)
+        filter = lawFilter(body, p)
+        p.within = token.nowhere()
+    } else if p.failed == false {
+        expected(ts, p, "a `\{ ... }` filter after the table's name")
+    }
+    return ast.Decl.TableLawDecl(name, params, table, filter, line)
+}
+
+proc lawFilter(body: Str, p: mut Parse): ast.SqlPart[dyn] {
+    cs := text.chars(body)
+    word := sqlWord(cs, pastBlanks(cs, 0))
+    if word == "if" || word == "or" || word == "and" {
+        mut ast.SqlPart[dyn] group = []
+        append(group, ast.SqlPart.Where(parseSqlGroup(body, true, p)))
+        return group
+    }
+    return parseSqlParts(body, p)
+}
+
+// `law name(v: Type) { ... }` inside `type Type { }`: one parameter, of the type
+// that holds it, and declared beside the type as `Type__name`.
+proc parseTypeLaw(ts: token.Token[], p: mut Parse, typeName: Str): ast.Decl {
+    d := parseLawDecl(ts, p)
+    if p.failed {
+        return d
+    }
+    if d is ast.Decl.CallableDecl(_, name, params, result, body, at) {
+        mut ok := len(params) == 1
+        for each param in params {
+            if param.declared is ast.TypeExpr.Named(pkg, written, _, dims) {
+                ok = ok && pkg == "" && written == typeName && len(dims) == 0
+            } else {
+                ok = false
+            }
+        }
+        if ok == false {
+            if p.quiet == false {
+                append(p.errors, diag.on(at, "a law inside `{typeName}` is about one value of it, so it takes exactly one parameter, of type `{typeName}`: `law {name}(value: {typeName}) \{ ... }`"))
+            }
+            p.failed = true
+            return d
+        }
+        return ast.Decl.CallableDecl(ast.CallableKind.TypeLawKind(), ast.typeLawName(typeName, name), params, result, body, at)
+    }
+    return d
 }
 
 proc parseQueryDecl(ts: token.Token[], p: mut Parse): ast.Decl {
@@ -2359,7 +2480,7 @@ proc parseSubExpr(ts: token.Token[], p: mut Parse, source: Str, line: token.Pos,
         reportSub(ts, p, line, source, "does not lex")
         return ast.absent()
     }
-    mut Parse inner = Parse(0, false, false, [], p.parts, [], false, false, p.file, line, base)
+    mut Parse inner = Parse(0, false, false, [], p.parts, [], false, false, p.file, line, base, [])
     value := parseExpr(lexed.tokens, inner)
     p.parts = inner.parts
     if inner.failed || kindAt(lexed.tokens, inner.pos) != token.Kind.Eof() {

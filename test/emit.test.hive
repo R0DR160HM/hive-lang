@@ -143,6 +143,29 @@ test "a name standing for two bindings copies rather than sharing by capacity" {
     assert has(got, "hive.CloneVec(s)")
 }
 
+test "an assignment copies storage an immutable name still sees" {
+    holder := "import hive.map\ntype Holder \{ m: hive.map.Map<Str, Int> }\n"
+    got := go(holder + "proc main(): void \{ h := Holder(hive.map.new())  shared := h.m  mut Holder a = h  a.m = shared  hive.map.set(a.m, \"x\", 1) }")
+    assert has(got, "a.M = (shared).Clone(hive.Same[int])")
+    vector := stmt("v := [\"a\"]  mut Str[dyn] w = []  w = v  w[0] = \"z\"")
+    assert has(vector, "w = hive.CloneVec(v)")
+}
+
+test "an assignment shares what a copy of the record would share" {
+    holder := "import hive.map\ntype Holder \{ m: hive.map.Map<Str, Int> }\n"
+    got := go(holder + "proc main(): void \{ h := Holder(hive.map.new())  shared := h.m  mut Holder a = h  a.m = shared  echo len(a.m) }")
+    assert has(got, "a.M = shared")
+    // Both ends `mut`: the storage is shared on purpose.
+    both := stmt("mut Str[dyn] v = [\"a\"]  mut Str[dyn] w = []  w = v  w[0] = \"z\"")
+    assert has(both, "w = v")
+}
+
+test "a field given a `mut` name's storage is copied with its record" {
+    tray := "import hive.map\ntype Tray \{ m: hive.map.Map<Str, Int> }\n"
+    got := go(tray + "proc main(): void \{ mut hive.map.Map<Str, Int> loose = hive.map.new()  mut Tray t = Tray(hive.map.new())  t.m = loose  kept := t  hive.map.set(loose, \"x\", 1)  echo len(kept.m) }")
+    assert has(got, "out.M = (v.M).Clone(hive.Same[int])")
+}
+
 test "a callable whose name is a Go keyword is suffixed" {
     got := go("func map(a: Int): Int \{ return a }\nproc main(): void \{ }")
     assert has(got, "func map_(a int) int")
@@ -586,7 +609,7 @@ test "a WHERE block is gathered at run time and joined" {
 
 test "what a query declared its rows to be decides how it is run" {
     rows := "type User \{ id: Int }\nquery all(): User[dyn] \{ SELECT id FROM users }\nquery wipe(): void \{ DELETE FROM users }\n"
-    got := go(rows + "proc main(): void \{ db := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"x.db\")  if db is Result.Ok(open) \{ echo hive.sql.run(open, all())  echo hive.sql.run(open, wipe())  echo hive.sql.raw(open, \"SELECT 1\") } }")
+    got := go(rows + "proc main(): void \{ db := hive.sql.connect(hive.sql.DatabaseDriver.SQLite(), \"x.db\")  if db is Result.Ok(open) \{ echo hive.sql.run(open, all())  echo hive.sql.run(open, wipe())  echo hive.sql.unsafe(open, \"SELECT 1\") } }")
     assert has(got, "hive.SqlRows(")
     assert has(got, "sqlRow_User")
     assert has(got, "hive.SqlExec(")

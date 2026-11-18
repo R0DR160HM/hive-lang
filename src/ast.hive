@@ -284,6 +284,12 @@ type Variant {
 type CallableKind {
     ProcKind
     FuncKind
+    // `law name(params) { ... }`: a claim the compiler proves for every argument.
+    // Never emitted, and only another law may call one.
+    LawKind
+    // A law written inside a `type`: what every value of that type keeps. Its one
+    // parameter is of the type, and its name is `Type__law`.
+    TypeLawKind
 }
 
 type Decl {
@@ -303,6 +309,9 @@ type Decl {
     ForeignDecl { name: Str, params: Param[dyn], result: TypeExpr, packageName: Str, symbol: Str, goResults: Int }
     // A `query`, whose body is SQL and whose return type describes its rows.
     QueryDecl { name: Str, params: Param[dyn], result: TypeExpr, sql: SqlPart[dyn] }
+    // `law name(session: Session) for table users { filter }`: what every query
+    // on the table carries. `filter` is SQL, or one `WHERE { }` group.
+    TableLawDecl { name: Str, params: Param[dyn], table: Str, filter: SqlPart[dyn] }
     // `test "..." { }` — named in prose, taking nothing and returning nothing.
     TestDecl { title: Str, body: Block }
 }
@@ -383,9 +392,41 @@ func declName(d: Decl): Str {
     if d is Decl.TypeDecl(name, _, _, _) { return name }
     else if d is Decl.CallableDecl(_, name, _, _, _, _) { return name }
     else if d is Decl.QueryDecl(name, _, _, _, _) { return name }
+    else if d is Decl.TableLawDecl(name, _, _, _, _) { return name }
     else if d is Decl.ForeignDecl(name, _, _, _, _, _, _) { return name }
     else if d is Decl.TestDecl(title, _, _) { return "\"{title}\"" }
     return ""
+}
+
+// The keyword a callable of this kind is declared with.
+func kindWord(kind: CallableKind): Str {
+    if kind is CallableKind.FuncKind { return "func" }
+    else if kind is CallableKind.LawKind || kind is CallableKind.TypeLawKind { return "law" }
+    return "proc"
+}
+
+func isLaw(d: Decl): Bool {
+    if d is Decl.CallableDecl(kind, _, _, _, _, _) {
+        return kind is CallableKind.LawKind || kind is CallableKind.TypeLawKind
+    }
+    return d is Decl.TableLawDecl(_, _, _, _, _)
+}
+
+func isTypeLaw(d: Decl): Bool {
+    if d is Decl.CallableDecl(kind, _, _, _, _, _) {
+        return kind is CallableKind.TypeLawKind
+    }
+    return false
+}
+
+// The name a law written inside a type is declared under.
+func typeLawName(typeName: Str, lawName: Str): Str {
+    return typeName + "__" + lawName
+}
+
+// `Booking.atLeastOneNight` for `Booking__atLeastOneNight`, as a message says it.
+func lawShown(name: Str): Str {
+    return join(split(name, "__"), ".")
 }
 
 func absent(): Expr {

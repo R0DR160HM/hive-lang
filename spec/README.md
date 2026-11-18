@@ -19,7 +19,7 @@ Source files end in **`.hive`**. The standard library is reached as **`hive.*`**
 | [01 — Lexical structure](01-lexical.md) | source text, comments, tokens, literals, and what a name may look like |
 | [02 — Grammar](02-grammar.md) | the whole surface syntax, in EBNF |
 | [03 — Types](03-types.md) | scalars, vectors, `Result`, declared types, function types, maps |
-| [04 — Declarations](04-declarations.md) | `type`, `func`, `proc`, `query`, `test`, `import` |
+| [04 — Declarations](04-declarations.md) | `type`, `func`, `proc`, `query`, `test`, `law`, `import` |
 | [05 — Expressions](05-expressions.md) | operators, precedence, calls, interpolation, arithmetic at the edges |
 | [06 — Statements](06-statements.md) | bindings, assignment, control flow, `switch`, `echo` / `assert` / `panic` |
 | [07 — Patterns](07-patterns.md) | `is`, its four pattern kinds, the two kinds of string hole, narrowing and exhaustiveness, a `switch`'s coverage |
@@ -34,6 +34,7 @@ Source files end in **`.hive`**. The standard library is reached as **`hive.*`**
 | [16 — Testing](16-testing.md) | `test`, `assert` inside one, coverage |
 | [17 — Diagnostics](17-diagnostics.md) | the error format and what an editor can do with it |
 | [18 — Conformance](18-conformance.md) | what an implementation must do, and this repository's status |
+| [19 — Laws](19-laws.md) | `law`: what it claims, what it may reach, when it is refused, and the laws of a type and of a table |
 
 ## How to read this
 

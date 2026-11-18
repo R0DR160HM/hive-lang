@@ -1,0 +1,121 @@
+// Type laws, kept the way a program keeps them. This file compiles only while every
+// value it builds or writes keeps its type's laws, and every function law over those
+// types is proved from them.
+type Status {
+    Requested
+    Confirmed
+    Cancelled
+}
+
+type Booking {
+    room: Str
+    checkInDay: Int
+    checkOutDay: Int
+    status: Status
+
+    law atLeastOneNight(b: Booking) {
+        assert b.checkInDay >= 0 && b.checkInDay < b.checkOutDay
+    }
+
+}
+
+type Discount {
+    Percent { percent: Int }
+    Fixed { cents: Int }
+
+    law sensible(d: Discount) {
+        if d is Discount.Percent(p) {
+            assert p > 0 && p <= 100
+        } else if d is Discount.Fixed(c) {
+            assert c > 0
+        }
+    }
+
+}
+
+func book(room: Str, firstDay: Int, nights: Int): Result<Booking, Str> {
+    if firstDay < 0 || firstDay > 100000 || nights < 1 || nights > 365 {
+        return Result.Error("dates out of range")
+    }
+    return Result.Ok(Booking(room, firstDay, firstDay + nights, Status.Requested()))
+}
+
+func moveEarlier(b: Booking, days: Int): Booking {
+    if days >= 0 && days <= b.checkInDay {
+        return Booking(b.room, b.checkInDay - days, b.checkOutDay - days, b.status)
+    }
+    return b
+}
+
+proc confirm(b: mut Booking): void {
+    if b.status is Status.Requested {
+        b.status = Status.Confirmed()
+    }
+}
+
+proc extendStay(b: mut Booking, extra: Int): void {
+    if extra > 0 && extra <= 365 && b.checkOutDay <= 100000 {
+        b.checkOutDay += extra
+    }
+}
+
+func percentOff(n: Int): Result<Discount, Str> {
+    if n < 1 || n > 100 {
+        return Result.Error("a percentage off is 1 to 100")
+    }
+    return Result.Ok(Discount.Percent(n))
+}
+
+func nights(b: Booking): Int {
+    return b.checkOutDay - b.checkInDay
+}
+
+func priceAfter(cents: Int, d: Discount): Int {
+    if d is Discount.Percent(p) {
+        return cents - cents * p / 100
+    }
+    if d is Discount.Fixed(c) {
+        if c > cents {
+            return 0
+        }
+        return cents - c
+    }
+    return cents
+}
+
+law aStayHasNights(b: Booking) {
+    assert nights(b) > 0
+}
+
+law aDiscountNeverRaisesThePrice(cents: Int, d: Discount) {
+    if cents >= 0 && cents <= 100000000 {
+        assert priceAfter(cents, d) <= cents
+    }
+}
+
+test "a booking is made, confirmed and extended" {
+    if book("12", 4, 3) is Result.Ok(b) {
+        mut kept := b
+        confirm(kept)
+        extendStay(kept, 2)
+        assert kept.status == Status.Confirmed()
+        assert nights(kept) == 5
+    } else {
+        assert false
+    }
+}
+
+test "dates out of range are refused before a booking exists" {
+    assert book("12", -1, 3) is Result.Error(_)
+    assert book("12", 4, 0) is Result.Error(_)
+}
+
+test "a discount takes off what it says" {
+    if percentOff(25) is Result.Ok(d) {
+        assert priceAfter(1000, d) == 750
+    } else {
+        assert false
+    }
+    assert priceAfter(1000, Discount.Fixed(300)) == 700
+    assert priceAfter(100, Discount.Fixed(300)) == 0
+}

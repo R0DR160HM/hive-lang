@@ -52,6 +52,10 @@ type Check {
     watching: Str
     uses: infer.Use[dyn]
     scopes: infer.Scope[dyn]
+    // Every law the program declares, and whether the body walked is one: only a
+    // law may call a law, and none is ever a value.
+    laws: Str[dyn]
+    inLaw: Bool
 }
 
 type Checked {
@@ -71,7 +75,7 @@ proc checkProgram(m: ast.Module): Checked {
 
 proc checkWatching(m: ast.Module, file: Str): Checked {
     t := types.tableOf(m)
-    mut Check c = Check([], "", token.nowhere(), false, types.Ty.TVoid(), false, 0, [], [], 0, false, [], [], false, [], file, [], [])
+    mut Check c = Check([], "", token.nowhere(), false, types.Ty.TVoid(), false, 0, [], [], 0, false, [], [], false, [], file, [], [], lawsOf(m), false)
     env := infer.newEnv(t)
     checkTestTitles(c, m)
     for each d in m.decls {
@@ -79,6 +83,16 @@ proc checkWatching(m: ast.Module, file: Str): Checked {
         settleMaps(c)
     }
     return Checked(c.errors, c.landings, c.uses, c.scopes)
+}
+
+func lawsOf(m: ast.Module): Str[dyn] {
+    mut Str[dyn] out = []
+    for each d in m.decls {
+        if ast.isLaw(d) {
+            append(out, ast.declName(d))
+        }
+    }
+    return out
 }
 
 proc see(c: mut Check, env: infer.Env, e: ast.Expr): void {
@@ -174,7 +188,7 @@ proc report(c: mut Check, message: Str): void {
 }
 
 proc reportAt(c: mut Check, at: token.Pos, message: Str): void {
-    append(c.errors, diag.on(at, diag.inDecl(c.inside, message)))
+    append(c.errors, diag.on(at, diag.inDecl(ast.lawShown(c.inside), message)))
 }
 
 // --- Declarations ------------------------------------------------------------
@@ -197,6 +211,7 @@ proc checkDecl(c: mut Check, env: infer.Env, d: ast.Decl): void {
         c.inside = name
         c.at = at
         c.pure = kind is ast.CallableKind.FuncKind
+        c.inLaw = kind is ast.CallableKind.LawKind || kind is ast.CallableKind.TypeLawKind
         c.result = types.resolve(env.table, result)
         checkLibTypes(c, env, c.result)
         for each p in params {
@@ -212,15 +227,32 @@ proc checkDecl(c: mut Check, env: infer.Env, d: ast.Decl): void {
         // A query is a `func` whose body happens to be SQL: nothing in one could
         // write to storage its caller can see.
         c.pure = true
+        c.inLaw = false
         c.result = types.resolve(env.table, result)
         c.inTest = false
         c.loops = 0
         c.mutable = []
         checkQuery(c, env, params, result, sql)
+    } else if d is ast.Decl.TableLawDecl(name, params, _, filter, at) {
+        c.inside = name
+        c.at = at
+        c.pure = true
+        c.inLaw = false
+        c.result = types.Ty.TVoid()
+        c.inTest = false
+        c.loops = 0
+        c.mutable = []
+        for each p in params {
+            if p.mutable {
+                report(c, "a law cannot declare the `mut` parameter `{p.name}: mut ...`: a law only ever reads what it is given")
+            }
+        }
+        checkSql(c, infer.boundParams(env, params, 0), filter)
     } else if d is ast.Decl.TestDecl(title, body, at) {
         c.inside = "\"{title}\""
         c.at = at
         c.pure = false
+        c.inLaw = false
         c.result = types.Ty.TVoid()
         c.inTest = true
         c.loops = 0
@@ -906,7 +938,9 @@ proc checkCallable(c: mut Check, env: infer.Env, name: Str, params: ast.Param[],
         append(seen, p.name)
         // Only a `proc` may ask for the caller's storage. A `mut` value handed to a
         // `func` is seen as an ordinary immutable copy instead.
-        if p.mutable && c.pure {
+        if p.mutable && c.inLaw {
+            report(c, "a law cannot declare the `mut` parameter `{p.name}: mut ...`. A law's parameters take every value of their types, and nothing a law does is seen by anyone — take an ordinary `{p.name}: ...`")
+        } else if p.mutable && c.pure {
             report(c, "a `func` cannot declare the `mut` parameter `{p.name}: mut ...`. What a `func` promises is that it cannot write to storage its caller can see, and a `mut` parameter is exactly that storage — make it a `proc`, or take an ordinary `{p.name}: ...` and answer with the new value")
         }
         if p.mutable {
@@ -1656,6 +1690,10 @@ proc checkName(c: mut Check, env: infer.Env, name: Str): void {
         report(c, "`hive` is the standard library, and it is not a value: what it has is reached through it, as `hive.<module>.<name>`")
         return
     }
+    if indexOf(c.laws, name) is Result.Ok(_) {
+        report(c, "`" + types.shownName(name) + "` is a law, and a law is not a value: it is proved while the program compiles, and nothing ever runs it")
+        return
+    }
     if types.findCallable(env.table, name) is Result.Ok(_) {
         return
     }
@@ -2013,6 +2051,9 @@ proc checkNamedCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): v
             checkValueArguments(c, env, "`{name}`", params, mutables, args)
         }
     } else if target is infer.CallTarget.Declared(info) {
+        if c.inLaw == false && indexOf(c.laws, name) is Result.Ok(_) {
+            report(c, "`" + types.shownName(name) + "` is a law, and only another law may call one. A law is never run: it is proved while the program compiles, so there is nothing for code to call")
+        }
         checkArguments(c, env, name, info, args)
     } else if target is infer.CallTarget.Struct(fields) {
         checkFieldArguments(c, env, name, fields, args)

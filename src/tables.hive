@@ -1,0 +1,1443 @@
+// Tables
+// ======
+// A law about a table is a filter every query on the table carries. Nothing runs
+// one: the compiler reads each query's SQL — which tables each statement takes rows
+// from, and what its WHERE says about them — and holds the query to the filter.
+//
+// A statement that reads, changes or deletes rows of the table carries the filter
+// where its WHERE, or the ON of the JOIN that brings the table in, has it as one of
+// its ANDed parts — or has a part that says more, as `a = x` says more than
+// `a = x OR b = x` — wherever the law's `if` holds. A row a statement writes, by
+// INSERT or by UPDATE ... SET, has to land inside the filter. `hive.sql.unsafe` is
+// not a query, and no law reads it.
+import ./ast
+import ./diag
+import ./infer
+import ./prove
+import ./terms
+import ./text
+import ./token
+import ./types
+import hive.map
+
+// --- SQL, as tokens -------------------------------------------------------------
+
+// One token of a query's SQL: `w` a word, lower-cased; `q` a quoted name; `s` a
+// string; `n` a number; `p` punctuation or an operator; `h` a bound value; and `g`
+// a `WHERE { }` block, standing for the WHERE it is.
+type Tok {
+    kind: Str
+    text: Str
+    hole: ast.Expr
+    group: ast.SqlGroup
+}
+
+func plain(kind: Str, spelled: Str): Tok {
+    return Tok(kind, spelled, ast.absent(), ast.SqlGroup(true, []))
+}
+
+func tokAt(toks: Tok[], at: Int): Tok {
+    if toks bounds at {
+        return toks[at]
+    }
+    return plain("", "")
+}
+
+func isWord(t: Tok, w: Str): Bool {
+    return t.kind == "w" && t.text == w
+}
+
+func isPunct(t: Tok, p: Str): Bool {
+    return t.kind == "p" && t.text == p
+}
+
+func isName(t: Tok): Bool {
+    return t.kind == "q" || (t.kind == "w" && isKeyword(t.text) == false)
+}
+
+func tokens(parts: ast.SqlPart[]): Tok[dyn] {
+    mut Tok[dyn] out = []
+    for each part in parts {
+        if part is ast.SqlPart.Lit(written) {
+            for each t in lexSql(written) {
+                append(out, t)
+            }
+        } else if part is ast.SqlPart.Param(value) {
+            append(out, Tok("h", "\{" + prove.exprText(value) + "}", value, ast.SqlGroup(true, [])))
+        } else if part is ast.SqlPart.Where(group) {
+            append(out, Tok("g", "where", ast.absent(), group))
+        }
+    }
+    return out
+}
+
+func lexSql(source: Str): Tok[dyn] {
+    cs := text.chars(source)
+    mut Tok[dyn] out = []
+    mut at := 0
+    for ; at < len(cs); {
+        c := text.charAt(cs, at)
+        n := text.charAt(cs, at + 1)
+        if text.isSpace(c) {
+            at = at + 1
+        } else if c == "-" && n == "-" {
+            for ; at < len(cs) && text.charAt(cs, at) != "\n"; at++ {
+            }
+        } else if c == "/" && n == "*" {
+            at = at + 2
+            for ; at < len(cs) && (text.charAt(cs, at) == "*" && text.charAt(cs, at + 1) == "/") == false; at++ {
+            }
+            at = at + 2
+        } else if c == "'" {
+            mut j := at + 1
+            mut open := true
+            for ; open && j < len(cs); {
+                if text.charAt(cs, j) == "'" && text.charAt(cs, j + 1) == "'" {
+                    j = j + 2
+                } else if text.charAt(cs, j) == "'" {
+                    open = false
+                } else {
+                    j = j + 1
+                }
+            }
+            append(out, plain("s", text.span(cs, at, j)))
+            at = j + 1
+        } else if c == "\"" || c == "`" {
+            mut j := at + 1
+            for ; j < len(cs) && text.charAt(cs, j) != c; j++ {
+            }
+            append(out, plain("q", text.span(cs, at + 1, j - 1)))
+            at = j + 1
+        } else if text.isDigit(c) {
+            mut j := at
+            for ; j < len(cs) && (text.isDigit(text.charAt(cs, j)) || text.charAt(cs, j) == "."); j++ {
+            }
+            append(out, plain("n", text.span(cs, at, j - 1)))
+            at = j
+        } else if text.isAlpha(c) || c == "_" {
+            mut j := at
+            for ; j < len(cs) && (text.isAlnum(text.charAt(cs, j)) || text.charAt(cs, j) == "_" || text.charAt(cs, j) == "$"); j++ {
+            }
+            append(out, plain("w", text.lower(text.span(cs, at, j - 1))))
+            at = j
+        } else {
+            two := c + n
+            if two == "<=" || two == ">=" || two == "<>" || two == "!=" || two == "||" || two == "::" {
+                mut spelled := two
+                if two == "!=" {
+                    spelled = "<>"
+                }
+                append(out, plain("p", spelled))
+                at = at + 2
+            } else {
+                append(out, plain("p", c))
+                at = at + 1
+            }
+        }
+    }
+    return out
+}
+
+// The words SQL means something by, which are never a column.
+func isKeyword(w: Str): Bool {
+    return w == "and" || w == "or" || w == "not" || w == "is" || w == "null" || w == "true"
+        || w == "false" || w == "in" || w == "between" || w == "like" || w == "ilike"
+        || w == "exists" || w == "any" || w == "all" || w == "some" || w == "case" || w == "when"
+        || w == "then" || w == "else" || w == "end" || w == "as" || w == "collate" || w == "escape"
+        || w == "similar" || w == "to" || w == "distinct" || w == "from" || w == "interval"
+        || w == "select" || w == "where" || w == "on" || w == "using" || w == "join"
+        || w == "inner" || w == "left" || w == "right" || w == "full" || w == "outer" || w == "cross"
+        || w == "natural" || w == "lateral" || w == "group" || w == "order" || w == "by"
+        || w == "having" || w == "limit" || w == "offset" || w == "fetch" || w == "window"
+        || w == "for" || w == "union" || w == "intersect" || w == "except" || w == "returning"
+        || w == "set" || w == "values" || w == "into" || w == "insert" || w == "update"
+        || w == "delete" || w == "with" || w == "recursive" || w == "only" || w == "default"
+        || w == "conflict" || w == "do" || w == "nothing" || w == "asc" || w == "desc"
+}
+
+// Where a FROM list, or a WHERE, stops.
+func endsClause(t: Tok): Bool {
+    if t.kind == "g" {
+        return true
+    }
+    if t.kind != "w" {
+        return isPunct(t, ";")
+    }
+    w := t.text
+    return w == "where" || w == "group" || w == "having" || w == "order" || w == "limit"
+        || w == "offset" || w == "fetch" || w == "window" || w == "for" || w == "union"
+        || w == "intersect" || w == "except" || w == "returning" || w == "set"
+        || w == "values" || w == "do"
+}
+
+func isJoinWord(t: Tok): Bool {
+    return isWord(t, "join") || isWord(t, "inner") || isWord(t, "left") || isWord(t, "right")
+        || isWord(t, "full") || isWord(t, "outer") || isWord(t, "cross") || isWord(t, "natural")
+}
+
+// The `)` that closes the `(` at `at`, or `hi` where none does before it.
+func closing(toks: Tok[], at: Int, hi: Int): Int {
+    mut depth := 0
+    for i := at; i < hi; i++ {
+        t := tokAt(toks, i)
+        if isPunct(t, "(") {
+            depth = depth + 1
+        } else if isPunct(t, ")") {
+            depth = depth - 1
+            if depth == 0 {
+                return i
+            }
+        }
+    }
+    return hi
+}
+
+// The first token from `lo` on, outside any parentheses, that `stops` says ends
+// what is being read — or `hi`.
+func nextStop(toks: Tok[], lo: Int, hi: Int, joins: Bool): Int {
+    mut depth := 0
+    for i := lo; i < hi; i++ {
+        t := tokAt(toks, i)
+        if isPunct(t, "(") {
+            depth = depth + 1
+        } else if isPunct(t, ")") {
+            depth = depth - 1
+        } else if depth == 0 && (endsClause(t) || (joins && (isPunct(t, ",") || isJoinWord(t)))) {
+            return i
+        }
+    }
+    return hi
+}
+
+type Range {
+    lo: Int
+    hi: Int
+}
+
+// The pieces between each `word` outside parentheses: the `AND`ed parts of a
+// predicate, or the `OR`ed parts of one of those. An AND that closes a BETWEEN
+// stays inside it.
+func pieces(toks: Tok[], r: Range, word: Str): Range[dyn] {
+    mut Range[dyn] out = []
+    mut depth := 0
+    mut start := r.lo
+    mut between := false
+    for i := r.lo; i < r.hi; i++ {
+        t := tokAt(toks, i)
+        if isPunct(t, "(") {
+            depth = depth + 1
+        } else if isPunct(t, ")") {
+            depth = depth - 1
+        } else if depth == 0 && isWord(t, "between") {
+            between = true
+        } else if depth == 0 && (isWord(t, word) || isPunct(t, word)) {
+            if word == "and" && between {
+                between = false
+            } else {
+                append(out, Range(start, i))
+                start = i + 1
+            }
+        }
+    }
+    append(out, Range(start, r.hi))
+    return out
+}
+
+// Without the parentheses around the whole of it.
+func unwrapped(toks: Tok[], r: Range): Range {
+    if r.hi - r.lo >= 2 && isPunct(tokAt(toks, r.lo), "(") && closing(toks, r.lo, r.hi) == r.hi - 1 {
+        return unwrapped(toks, Range(r.lo + 1, r.hi - 1))
+    }
+    return r
+}
+
+// --- What a part of a predicate says ----------------------------------------------
+
+// A predicate's text with the table's columns written `@.column`: those named
+// through `alias`, and, where the table is the only one in scope, those named bare.
+// Two parts that say the same thing about the table read the same this way.
+func canon(toks: Tok[], r: Range, alias: Str, only: Bool): Str {
+    mut Str[dyn] out = []
+    mut i := r.lo
+    for ; i < r.hi; {
+        t := tokAt(toks, i)
+        dot := tokAt(toks, i + 1)
+        after := tokAt(toks, i + 2)
+        if (t.kind == "w" || t.kind == "q") && isPunct(dot, ".") && (after.kind == "w" || after.kind == "q") {
+            if t.text == alias {
+                append(out, "@." + after.text)
+            } else {
+                append(out, t.text + "." + after.text)
+            }
+            i = i + 3
+        } else if isName(t) && isPunct(dot, "(") == false {
+            if only {
+                append(out, "@." + t.text)
+            } else {
+                append(out, t.text)
+            }
+            i = i + 1
+        } else {
+            append(out, t.text)
+            i = i + 1
+        }
+    }
+    return join(out, " ")
+}
+
+// The same text as a person would write it, the table's columns put through
+// `prefix` (`u.`, or nothing).
+func shown(toks: Tok[], r: Range, alias: Str, prefix: Str): Str {
+    mut out := ""
+    mut i := r.lo
+    mut glue := true
+    for ; i < r.hi; {
+        t := tokAt(toks, i)
+        dot := tokAt(toks, i + 1)
+        after := tokAt(toks, i + 2)
+        mut word := t.text
+        if t.kind == "q" {
+            word = "\"" + t.text + "\""
+        }
+        if t.kind == "w" && isKeyword(t.text) {
+            word = text.upper(t.text)
+        }
+        if (t.kind == "w" || t.kind == "q") && isPunct(dot, ".") && (after.kind == "w" || after.kind == "q") {
+            if t.text == alias {
+                word = prefix + after.text
+            } else {
+                word = t.text + "." + after.text
+            }
+            i = i + 3
+        } else {
+            if isName(t) && isPunct(dot, "(") == false {
+                word = prefix + word
+            }
+            i = i + 1
+        }
+        tight := isPunct(t, ")") || isPunct(t, ",") || isPunct(t, ".")
+        if glue || tight {
+            out = out + word
+        } else {
+            out = out + " " + word
+        }
+        glue = isPunct(t, "(") || isPunct(t, ".")
+    }
+    return out
+}
+
+// What is known of each row a statement takes from the table: an ANDed part of
+// its WHERE, as the `OR`ed parts it is made of, and the `if`s it holds under.
+type Fact {
+    conds: ast.Expr[dyn]
+    atoms: Str[dyn]
+}
+
+func atomsOf(toks: Tok[], r: Range, alias: Str, only: Bool): Str[dyn] {
+    mut Str[dyn] out = []
+    for each d in pieces(toks, unwrapped(toks, r), "or") {
+        append(out, canon(toks, unwrapped(toks, d), alias, only))
+    }
+    return out
+}
+
+func factsOf(toks: Tok[], r: Range, conds: ast.Expr[], alias: Str, only: Bool): Fact[dyn] {
+    mut Fact[dyn] out = []
+    for each c in pieces(toks, unwrapped(toks, r), "and") {
+        if c.hi > c.lo {
+            append(out, Fact(exprs(conds, []), atomsOf(toks, c, alias, only)))
+        }
+    }
+    return out
+}
+
+// What a `WHERE { }` block knows: each `if`'s predicate under its condition, through
+// every group that ANDs. An `or { }` knows nothing of any one row.
+proc groupFacts(group: ast.SqlGroup, conds: ast.Expr[], alias: Str, only: Bool, into: mut Fact[dyn]): void {
+    if group.conjunction == false {
+        return
+    }
+    for each item in group.items {
+        if item is ast.SqlItem.Cond(condition, body) {
+            inner := exprs(conds, [condition])
+            bodyToks := tokens(body)
+            for each f in factsOf(bodyToks, Range(0, len(bodyToks)), inner, alias, only) {
+                append(into, f)
+            }
+        } else if item is ast.SqlItem.Nested(nested) {
+            groupFacts(nested, conds, alias, only, into)
+        }
+    }
+}
+
+func exprs(a: ast.Expr[], b: ast.Expr[]): ast.Expr[dyn] {
+    mut ast.Expr[dyn] out = []
+    for each e in a {
+        append(out, e)
+    }
+    for each e in b {
+        append(out, e)
+    }
+    return out
+}
+
+// --- Reading a query -------------------------------------------------------------
+
+// One place a statement takes rows from the table: what the statement calls it,
+// what it does with them, and what each row is known to satisfy.
+type Ref {
+    alias: Str
+    verb: Str
+    only: Bool
+    facts: Fact[dyn]
+}
+
+// A row a statement writes into the table: each column it names and what it puts
+// there, as one token's text, or `""` where it is more than a token. An UPDATE's
+// row is also what its WHERE knew of it.
+type Written {
+    update: Bool
+    columns: Str[dyn]
+    values: Str[dyn]
+    facts: Fact[dyn]
+    readable: Str
+}
+
+// One FROM item: what the statement calls it, whether it is the table, how it
+// was joined, and where its ON is.
+type Item {
+    alias: Str
+    isTable: Bool
+    joined: Str
+    on: Range
+}
+
+type Reader {
+    toks: Tok[dyn]
+    table: Str
+    refs: Ref[dyn]
+    writes: Written[dyn]
+    unread: Str[dyn]
+}
+
+proc readQuery(table: Str, sql: ast.SqlPart[]): Reader {
+    toks := tokens(sql)
+    mut Reader rd = Reader(toks, table, [], [], [])
+    mut start := 0
+    mut depth := 0
+    for i := 0; i < len(toks); i++ {
+        t := tokAt(toks, i)
+        if isPunct(t, "(") {
+            depth = depth + 1
+        } else if isPunct(t, ")") {
+            depth = depth - 1
+        } else if depth == 0 && isPunct(t, ";") {
+            readStatement(rd, start, i)
+            start = i + 1
+        }
+    }
+    readStatement(rd, start, len(toks))
+    readGroups(rd, 0, len(toks))
+    return rd
+}
+
+func isTable(rd: Reader, t: Tok): Bool {
+    return (t.kind == "w" && t.text == text.lower(rd.table)) || (t.kind == "q" && t.text == rd.table)
+}
+
+func mentions(rd: Reader, lo: Int, hi: Int): Bool {
+    for i := lo; i < hi; i++ {
+        if isTable(rd, tokAt(rd.toks, i)) {
+            return true
+        }
+    }
+    return false
+}
+
+proc readStatement(rd: mut Reader, lo: Int, hi: Int): void {
+    if lo >= hi {
+        return
+    }
+    first := tokAt(rd.toks, lo)
+    if isPunct(first, "(") && closing(rd.toks, lo, hi) == hi - 1 {
+        readStatement(rd, lo + 1, hi - 1)
+    } else if isWord(first, "with") {
+        readWith(rd, lo, hi)
+    } else if isWord(first, "select") || isPunct(first, "(") {
+        readSelect(rd, lo, hi)
+    } else if isWord(first, "insert") || isWord(first, "replace") {
+        readInsert(rd, lo, hi)
+    } else if isWord(first, "update") {
+        readUpdate(rd, lo, hi)
+    } else if isWord(first, "delete") {
+        readDelete(rd, lo, hi)
+    } else if mentions(rd, lo, hi) {
+        append(rd.unread, "it names `{rd.table}` in a `" + text.upper(first.text) + "` statement, which says nothing about which of its rows it takes")
+    }
+}
+
+// `WITH name AS (...), ... <statement>`: each named statement, then the one that
+// uses them.
+proc readWith(rd: mut Reader, lo: Int, hi: Int): void {
+    mut i := lo + 1
+    if isWord(tokAt(rd.toks, i), "recursive") {
+        i = i + 1
+    }
+    for ; i < hi; {
+        for ; i < hi && isPunct(tokAt(rd.toks, i), "(") == false; i++ {
+        }
+        shut := closing(rd.toks, i, hi)
+        readStatement(rd, i + 1, shut)
+        i = shut + 1
+        if isPunct(tokAt(rd.toks, i), ",") {
+            i = i + 1
+        } else {
+            readStatement(rd, i, hi)
+            return
+        }
+    }
+}
+
+// Every statement in parentheses inside `[lo, hi)`: a subquery is read as a
+// statement of its own.
+proc readNested(rd: mut Reader, lo: Int, hi: Int): void {
+    mut i := lo
+    for ; i < hi; {
+        if isPunct(tokAt(rd.toks, i), "(") && (isWord(tokAt(rd.toks, i + 1), "select") || isWord(tokAt(rd.toks, i + 1), "with")) {
+            shut := closing(rd.toks, i, hi)
+            readStatement(rd, i + 1, shut)
+            i = shut + 1
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+// A `WHERE { }` block's own predicates may hold a subquery too.
+proc readGroups(rd: mut Reader, lo: Int, hi: Int): void {
+    for i := lo; i < hi; i++ {
+        t := tokAt(rd.toks, i)
+        if t.kind == "g" {
+            readGroupBodies(rd, t.group)
+        }
+    }
+}
+
+proc readGroupBodies(rd: mut Reader, group: ast.SqlGroup): void {
+    for each item in group.items {
+        if item is ast.SqlItem.Cond(_, body) {
+            inner := readQuery(rd.table, body)
+            for each r in inner.refs {
+                append(rd.refs, r)
+            }
+            for each w in inner.writes {
+                append(rd.writes, w)
+            }
+            for each u in inner.unread {
+                append(rd.unread, u)
+            }
+        } else if item is ast.SqlItem.Nested(nested) {
+            readGroupBodies(rd, nested)
+        }
+    }
+}
+
+// `SELECT ... UNION SELECT ...`: each select on its own.
+proc readSelect(rd: mut Reader, lo: Int, hi: Int): void {
+    mut start := lo
+    mut depth := 0
+    for i := lo; i < hi; i++ {
+        t := tokAt(rd.toks, i)
+        if isPunct(t, "(") {
+            depth = depth + 1
+        } else if isPunct(t, ")") {
+            depth = depth - 1
+        } else if depth == 0 && (isWord(t, "union") || isWord(t, "intersect") || isWord(t, "except")) {
+            readOneSelect(rd, start, i)
+            start = i + 1
+            if isWord(tokAt(rd.toks, start), "all") || isWord(tokAt(rd.toks, start), "distinct") {
+                start = start + 1
+            }
+        }
+    }
+    readOneSelect(rd, start, hi)
+}
+
+proc readOneSelect(rd: mut Reader, lo: Int, hi: Int): void {
+    if isPunct(tokAt(rd.toks, lo), "(") && closing(rd.toks, lo, hi) == hi - 1 {
+        readSelect(rd, lo + 1, hi - 1)
+        return
+    }
+    mut from := -1
+    mut depth := 0
+    for i := lo; i < hi && from < 0; i++ {
+        t := tokAt(rd.toks, i)
+        if isPunct(t, "(") {
+            depth = depth + 1
+        } else if isPunct(t, ")") {
+            depth = depth - 1
+        } else if depth == 0 && isWord(t, "from") {
+            from = i
+        }
+    }
+    if from < 0 {
+        readNested(rd, lo, hi)
+        return
+    }
+    readNested(rd, lo, from)
+    fromEnd := nextStop(rd.toks, from + 1, hi, false)
+    items := readFrom(rd, from + 1, fromEnd)
+    rest := whereOf(rd, fromEnd, hi)
+    readNested(rd, fromEnd, hi)
+    for each item in items {
+        if item.isTable {
+            append(rd.refs, Ref(item.alias, "reads", len(items) == 1, knownOf(rd, rest, item, len(items) == 1)))
+        }
+    }
+}
+
+// The WHERE a statement has at `at`, if it has one: its own range, or the
+// `WHERE { }` block at that place.
+func whereOf(rd: Reader, at: Int, hi: Int): Range {
+    t := tokAt(rd.toks, at)
+    if isWord(t, "where") {
+        return Range(at + 1, nextStop(rd.toks, at + 1, hi, false))
+    }
+    if t.kind == "g" {
+        return Range(at, at + 1)
+    }
+    return Range(at, at)
+}
+
+// What every row of `item` is known to satisfy: the statement's WHERE, and the ON
+// of the join that brought it in, where that join keeps only the rows matching it.
+proc knownOf(rd: Reader, where: Range, item: Item, only: Bool): Fact[dyn] {
+    mut Fact[dyn] out = []
+    t := tokAt(rd.toks, where.lo)
+    if t.kind == "g" && where.hi == where.lo + 1 {
+        groupFacts(t.group, [], item.alias, only, out)
+    } else {
+        for each f in factsOf(rd.toks, where, [], item.alias, only) {
+            append(out, f)
+        }
+    }
+    if item.on.hi > item.on.lo && (item.joined == "join" || item.joined == "inner" || item.joined == "left") {
+        for each f in factsOf(rd.toks, item.on, [], item.alias, only) {
+            append(out, f)
+        }
+    }
+    return out
+}
+
+// A FROM list: each table, subquery or function it takes rows from, and how each
+// was joined to the ones before it.
+proc readFrom(rd: mut Reader, lo: Int, hi: Int): Item[dyn] {
+    mut Item[dyn] items = []
+    mut joined := "first"
+    mut i := lo
+    for ; i < hi; {
+        t := tokAt(rd.toks, i)
+        if isPunct(t, ",") {
+            joined = "comma"
+            i = i + 1
+        } else if isJoinWord(t) {
+            // `LEFT OUTER JOIN`: the first word says which, `JOIN` ends it.
+            if isWord(t, "join") == false && joined != "left" && joined != "right" && joined != "full" && joined != "cross" && joined != "inner" {
+                joined = t.text
+            } else if isWord(t, "join") && (joined == "first" || joined == "comma") {
+                joined = "join"
+            }
+            if isWord(t, "natural") {
+                joined = "natural"
+            }
+            i = i + 1
+        } else if isWord(t, "lateral") || isWord(t, "only") {
+            i = i + 1
+        } else if isWord(t, "on") {
+            shut := nextStop(rd.toks, i + 1, hi, true)
+            last := len(items) - 1
+            if items bounds last {
+                items[last].on = Range(i + 1, shut)
+            }
+            readNested(rd, i + 1, shut)
+            i = shut
+        } else if isWord(t, "using") {
+            i = closing(rd.toks, i + 1, hi) + 1
+        } else if isPunct(t, "(") {
+            shut := closing(rd.toks, i, hi)
+            if isWord(tokAt(rd.toks, i + 1), "select") || isWord(tokAt(rd.toks, i + 1), "with") {
+                readStatement(rd, i + 1, shut)
+            } else if mentions(rd, i + 1, shut) {
+                append(rd.unread, "it takes rows from `{rd.table}` inside parentheses in a FROM list, which this reader does not follow")
+            }
+            i = shut + 1
+            named := aliasAt(rd, i, hi)
+            append(items, Item(named.name, false, joined, Range(0, 0)))
+            i = named.next
+            joined = "comma"
+        } else if t.kind == "w" || t.kind == "q" {
+            mut last := t
+            i = i + 1
+            for ; isPunct(tokAt(rd.toks, i), ".") && (tokAt(rd.toks, i + 1).kind == "w" || tokAt(rd.toks, i + 1).kind == "q"); {
+                last = tokAt(rd.toks, i + 1)
+                i = i + 2
+            }
+            if isPunct(tokAt(rd.toks, i), "(") {
+                // A function answering with rows reads none of the table's.
+                i = closing(rd.toks, i, hi) + 1
+            }
+            named := aliasAt(rd, i, hi)
+            mut alias := named.name
+            if alias == "" {
+                alias = last.text
+            }
+            append(items, Item(alias, isTable(rd, last), joined, Range(0, 0)))
+            i = named.next
+            if joined == "first" {
+                joined = "comma"
+            }
+        } else {
+            i = i + 1
+        }
+    }
+    return items
+}
+
+type Named {
+    name: Str
+    next: Int
+}
+
+// `AS u`, or a bare `u`, after a FROM item.
+func aliasAt(rd: Reader, at: Int, hi: Int): Named {
+    t := tokAt(rd.toks, at)
+    if isWord(t, "as") {
+        return Named(tokAt(rd.toks, at + 1).text, at + 2)
+    }
+    if at < hi && isName(t) {
+        return Named(t.text, at + 1)
+    }
+    return Named("", at)
+}
+
+// `UPDATE t [AS a] SET ... [FROM ...] [WHERE ...]`.
+proc readUpdate(rd: mut Reader, lo: Int, hi: Int): void {
+    mut i := lo + 1
+    if isWord(tokAt(rd.toks, i), "only") {
+        i = i + 1
+    }
+    mut last := tokAt(rd.toks, i)
+    i = i + 1
+    for ; isPunct(tokAt(rd.toks, i), "."); {
+        last = tokAt(rd.toks, i + 1)
+        i = i + 2
+    }
+    named := aliasAt(rd, i, hi)
+    mut alias := named.name
+    if alias == "" {
+        alias = last.text
+    }
+    i = named.next
+    if isWord(tokAt(rd.toks, i), "set") == false {
+        if isTable(rd, last) {
+            append(rd.unread, "it updates `{rd.table}` without a SET this reader can find")
+        }
+        return
+    }
+    setLo := i + 1
+    setHi := nextStop(rd.toks, setLo, hi, false)
+    mut Item[dyn] others = []
+    mut at := setHi
+    if isWord(tokAt(rd.toks, at), "from") {
+        fromEnd := nextStop(rd.toks, at + 1, hi, false)
+        others = readFrom(rd, at + 1, fromEnd)
+        at = fromEnd
+    }
+    where := whereOf(rd, at, hi)
+    readNested(rd, setLo, hi)
+    only := len(others) == 0
+    target := Item(alias, isTable(rd, last), "first", Range(0, 0))
+    if target.isTable {
+        facts := knownOf(rd, where, target, only)
+        append(rd.refs, Ref(alias, "changes", only, facts))
+        append(rd.writes, assignments(rd, Range(setLo, setHi), alias, only, facts))
+    }
+    for each item in others {
+        if item.isTable {
+            append(rd.refs, Ref(item.alias, "reads", false, knownOf(rd, where, item, false)))
+        }
+    }
+}
+
+// What a SET writes, column by column.
+proc assignments(rd: mut Reader, r: Range, alias: Str, only: Bool, facts: Fact[]): Written {
+    mut Str[dyn] columns = []
+    mut Str[dyn] values = []
+    mut readable := ""
+    mut Fact[dyn] known = []
+    for each f in facts {
+        append(known, f)
+    }
+    for each piece in pieces(rd.toks, r, ",") {
+        name := tokAt(rd.toks, piece.lo)
+        if isPunct(name, "(") {
+            readable = "it sets several columns at once, `(a, b) = ...`"
+        } else {
+            mut column := name.text
+            mut eq := piece.lo + 1
+            if isPunct(tokAt(rd.toks, eq), ".") {
+                column = tokAt(rd.toks, eq + 1).text
+                eq = eq + 2
+            }
+            append(columns, "@." + column)
+            if piece.hi - eq == 2 {
+                append(values, valueText(tokAt(rd.toks, eq + 1)))
+            } else {
+                append(values, "")
+            }
+        }
+    }
+    return Written(true, columns, values, known, readable)
+}
+
+// A value written into a column, where it is one token: what it compares as.
+func valueText(t: Tok): Str {
+    if t.kind == "h" || t.kind == "n" || t.kind == "s" || isWord(t, "true") || isWord(t, "false") || isWord(t, "null") {
+        return t.text
+    }
+    return ""
+}
+
+// `DELETE FROM t [AS a] [USING ...] [WHERE ...]`.
+proc readDelete(rd: mut Reader, lo: Int, hi: Int): void {
+    mut i := lo + 1
+    if isWord(tokAt(rd.toks, i), "from") {
+        i = i + 1
+    }
+    if isWord(tokAt(rd.toks, i), "only") {
+        i = i + 1
+    }
+    mut last := tokAt(rd.toks, i)
+    i = i + 1
+    for ; isPunct(tokAt(rd.toks, i), "."); {
+        last = tokAt(rd.toks, i + 1)
+        i = i + 2
+    }
+    named := aliasAt(rd, i, hi)
+    mut alias := named.name
+    if alias == "" {
+        alias = last.text
+    }
+    i = named.next
+    mut Item[dyn] others = []
+    if isWord(tokAt(rd.toks, i), "using") {
+        usingEnd := nextStop(rd.toks, i + 1, hi, false)
+        others = readFrom(rd, i + 1, usingEnd)
+        i = usingEnd
+    }
+    where := whereOf(rd, i, hi)
+    readNested(rd, i, hi)
+    only := len(others) == 0
+    if isTable(rd, last) {
+        append(rd.refs, Ref(alias, "deletes from", only, knownOf(rd, where, Item(alias, true, "first", Range(0, 0)), only)))
+    }
+    for each item in others {
+        if item.isTable {
+            append(rd.refs, Ref(item.alias, "reads", false, knownOf(rd, where, item, false)))
+        }
+    }
+}
+
+// `INSERT INTO t [(columns)] VALUES (...), ... [ON CONFLICT ... DO UPDATE SET ...]`.
+proc readInsert(rd: mut Reader, lo: Int, hi: Int): void {
+    mut i := lo + 1
+    for ; i < hi && isWord(tokAt(rd.toks, i), "into") == false; i++ {
+    }
+    i = i + 1
+    mut last := tokAt(rd.toks, i)
+    i = i + 1
+    for ; isPunct(tokAt(rd.toks, i), "."); {
+        last = tokAt(rd.toks, i + 1)
+        i = i + 2
+    }
+    mut alias := last.text
+    if isWord(tokAt(rd.toks, i), "as") {
+        alias = tokAt(rd.toks, i + 1).text
+        i = i + 2
+    }
+    into := isTable(rd, last)
+    mut Str[dyn] columns = []
+    mut named := false
+    if isPunct(tokAt(rd.toks, i), "(") && isWord(tokAt(rd.toks, i + 1), "select") == false {
+        shut := closing(rd.toks, i, hi)
+        for each piece in pieces(rd.toks, Range(i + 1, shut), ",") {
+            append(columns, "@." + tokAt(rd.toks, piece.hi - 1).text)
+        }
+        named = true
+        i = shut + 1
+    }
+    source := tokAt(rd.toks, i)
+    conflict := conflictAt(rd, i, hi)
+    if isWord(source, "values") {
+        mut at := i + 1
+        for ; at < conflict && isPunct(tokAt(rd.toks, at), "("); {
+            shut := closing(rd.toks, at, conflict)
+            mut Str[dyn] values = []
+            for each piece in pieces(rd.toks, Range(at + 1, shut), ",") {
+                if piece.hi - piece.lo == 1 {
+                    append(values, valueText(tokAt(rd.toks, piece.lo)))
+                } else {
+                    append(values, "")
+                }
+            }
+            readNested(rd, at, shut)
+            if into {
+                mut readable := ""
+                if named == false {
+                    readable = "it names no columns, so which value lands in which cannot be read"
+                }
+                append(rd.writes, Written(false, columns, values, [], readable))
+            }
+            at = shut + 1
+            if isPunct(tokAt(rd.toks, at), ",") {
+                at = at + 1
+            }
+        }
+    } else {
+        readStatement(rd, i, conflict)
+        if into {
+            mut what := "inserts what a SELECT answers with"
+            if isWord(source, "default") {
+                what = "inserts a row of defaults"
+            }
+            append(rd.writes, Written(false, columns, [], [], "it {what}, so what lands in each column cannot be read"))
+        }
+    }
+    // `ON CONFLICT ... DO UPDATE SET ...` changes a row already there: one the
+    // insert's own values never said anything about.
+    if conflict < hi {
+        mut set := conflict
+        for ; set < hi && isWord(tokAt(rd.toks, set), "set") == false; set++ {
+        }
+        if set < hi && into {
+            setHi := nextStop(rd.toks, set + 1, hi, false)
+            where := whereOf(rd, setHi, hi)
+            facts := knownOf(rd, where, Item(alias, true, "first", Range(0, 0)), true)
+            append(rd.refs, Ref(alias, "changes", true, facts))
+            append(rd.writes, assignments(rd, Range(set + 1, setHi), alias, true, facts))
+        }
+        readNested(rd, conflict, hi)
+    }
+}
+
+func conflictAt(rd: Reader, lo: Int, hi: Int): Int {
+    mut depth := 0
+    for i := lo; i < hi; i++ {
+        t := tokAt(rd.toks, i)
+        if isPunct(t, "(") {
+            depth = depth + 1
+        } else if isPunct(t, ")") {
+            depth = depth - 1
+        } else if depth == 0 && isWord(t, "on") && isWord(tokAt(rd.toks, i + 1), "conflict") {
+            return i
+        } else if depth == 0 && isWord(t, "returning") {
+            return i
+        }
+    }
+    return hi
+}
+
+// --- What a law asks for -----------------------------------------------------------
+
+// One part of a law's filter: the `OR`ed things one of which every row has to
+// satisfy, as they compare and as a person would write them, under the law's `if`s
+// that hold for it — and, where it is `column = value`, those columns and values.
+type Wanted {
+    conds: ast.Expr[dyn]
+    atoms: Str[dyn]
+    written: Str
+    columns: Str[dyn]
+    eqColumns: Str[dyn]
+    eqValues: Str[dyn]
+}
+
+proc wantedOf(table: Str, filter: ast.SqlPart[], prefix: Str): Wanted[dyn] {
+    mut Wanted[dyn] out = []
+    toks := tokens(filter)
+    alias := text.lower(lastPart(table))
+    if len(toks) == 1 && tokAt(toks, 0).kind == "g" {
+        wantedOfGroup(tokAt(toks, 0).group, [], alias, prefix, out)
+        return out
+    }
+    for each c in pieces(toks, Range(0, len(toks)), "and") {
+        if c.hi > c.lo {
+            append(out, wantedPart(toks, c, [], alias, prefix))
+        }
+    }
+    return out
+}
+
+proc wantedOfGroup(group: ast.SqlGroup, conds: ast.Expr[], alias: Str, prefix: Str, into: mut Wanted[dyn]): void {
+    for each item in group.items {
+        if item is ast.SqlItem.Cond(condition, body) {
+            inner := exprs(conds, [condition])
+            toks := tokens(body)
+            for each c in pieces(toks, Range(0, len(toks)), "and") {
+                if c.hi > c.lo {
+                    append(into, wantedPart(toks, c, inner, alias, prefix))
+                }
+            }
+        } else if item is ast.SqlItem.Nested(nested) {
+            wantedOfGroup(nested, conds, alias, prefix, into)
+        }
+    }
+}
+
+func wantedPart(toks: Tok[], c: Range, conds: ast.Expr[], alias: Str, prefix: Str): Wanted {
+    mut Str[dyn] columns = []
+    mut Str[dyn] eqColumns = []
+    mut Str[dyn] eqValues = []
+    for each d in pieces(toks, unwrapped(toks, c), "or") {
+        r := unwrapped(toks, d)
+        for i := r.lo; i < r.hi; i++ {
+            t := tokAt(toks, i)
+            if isName(t) && isPunct(tokAt(toks, i + 1), "(") == false && isPunct(tokAt(toks, i - 1), ".") == false && isPunct(tokAt(toks, i + 1), ".") == false {
+                append(columns, "@." + t.text)
+            } else if isPunct(tokAt(toks, i + 1), ".") && t.text == alias {
+                append(columns, "@." + tokAt(toks, i + 2).text)
+            }
+        }
+        // `column = value`, either way round.
+        mut column := ""
+        mut value := ""
+        if r.hi - r.lo == 3 && isPunct(tokAt(toks, r.lo + 1), "=") {
+            if isName(tokAt(toks, r.lo)) && valueText(tokAt(toks, r.lo + 2)) != "" {
+                column = tokAt(toks, r.lo).text
+                value = valueText(tokAt(toks, r.lo + 2))
+            } else if isName(tokAt(toks, r.lo + 2)) && valueText(tokAt(toks, r.lo)) != "" {
+                column = tokAt(toks, r.lo + 2).text
+                value = valueText(tokAt(toks, r.lo))
+            }
+        }
+        if column != "" {
+            append(eqColumns, "@." + column)
+            append(eqValues, value)
+        }
+    }
+    return Wanted(exprs(conds, []), atomsOf(toks, c, alias, true), shown(toks, unwrapped(toks, c), alias, prefix), columns, eqColumns, eqValues)
+}
+
+func lastPart(name: Str): Str {
+    mut out := name
+    for each piece in split(name, ".") {
+        out = piece
+    }
+    return out
+}
+
+// --- Holding queries to laws -------------------------------------------------------
+
+proc checkModule(m: ast.Module, cx: prove.Context): diag.Diagnostic[dyn] {
+    mut diag.Diagnostic[dyn] out = []
+    for each d in m.decls {
+        if d is ast.Decl.TableLawDecl(lawName, lawParams, table, filter, lawAt) {
+            shape := filterShape(filter)
+            if shape != "" {
+                append(out, diag.on(lawAt, diag.inDecl(types.shownName(lawName), shape)))
+                continue
+            }
+            for each q in m.decls {
+                if q is ast.Decl.QueryDecl(queryName, params, _, sql, at) {
+                    for each problem in checkQuery(cx, lawName, lawParams, table, filter, queryName, params, sql) {
+                        append(out, diag.on(at, diag.inDecl(types.shownName(queryName), problem)))
+                        break
+                    }
+                }
+            }
+        }
+    }
+    return out
+}
+
+// What is wrong with a law's filter as a filter, or "": an `or { }` block says
+// nothing about any one row, and a filter is SQL or one `WHERE { }` block.
+func filterShape(filter: ast.SqlPart[]): Str {
+    mut groups := 0
+    for each part in filter {
+        if part is ast.SqlPart.Where(group) {
+            groups = groups + 1
+            if hasOr(group) {
+                return "a law's filter cannot hold an `or \{ }` block, which says nothing about any one row\n    write the alternatives in its SQL: `a = \{x} OR b = \{x}`"
+            }
+        }
+    }
+    if groups > 0 && len(filter) > 1 {
+        return "a law's filter is SQL, or one `WHERE \{ }` block's `if`s, and not both"
+    }
+    return ""
+}
+
+func hasOr(group: ast.SqlGroup): Bool {
+    for each item in group.items {
+        if item is ast.SqlItem.Nested(nested) {
+            if nested.conjunction == false || hasOr(nested) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// What is wrong with one query under one law: nothing, where some parameter of
+// the law's type makes the query carry the filter everywhere it touches the table.
+proc checkQuery(cx: prove.Context, lawName: Str, lawParams: ast.Param[], table: Str, filter: ast.SqlPart[], queryName: Str, params: ast.Param[], sql: ast.SqlPart[]): Str[dyn] {
+    mut Str[dyn] none = []
+    rd := readQuery(lastPart(table), sql)
+    if len(rd.refs) == 0 && len(rd.writes) == 0 && len(rd.unread) == 0 {
+        return none
+    }
+    shownLaw := "`" + types.shownName(lawName) + "`"
+    for each why in rd.unread {
+        return ["cannot hold this query to law {shownLaw}: {why}"]
+    }
+    mut lawParam := ""
+    mut types.Ty lawType = types.Ty.TUnknown()
+    for each p in lawParams {
+        lawParam = p.name
+        lawType = types.resolve(cx.base.table, p.declared)
+    }
+    mut Str[dyn] first = []
+    mut tried := false
+    for each p in params {
+        if types.resolve(cx.base.table, p.declared) == lawType {
+            tried = true
+            problems := underParam(cx, rd, shownLaw, lawParam, p.name, table, filter, params)
+            if len(problems) == 0 {
+                return none
+            }
+            if len(first) == 0 {
+                first = problems
+            }
+        }
+    }
+    if tried == false {
+        return ["this query touches `{table}`, which law {shownLaw} filters by a `" + types.show(lawType) + "`, so it has to take one"]
+    }
+    return first
+}
+
+proc underParam(cx: prove.Context, rd: Reader, shownLaw: Str, lawParam: Str, param: Str, table: Str, filter: ast.SqlPart[], params: ast.Param[]): Str[dyn] {
+    mut Str[dyn] out = []
+    renamedFilter := renameParts(filter, lawParam, param)
+    for each ref in rd.refs {
+        mut prefix := ""
+        if ref.only == false {
+            prefix = ref.alias + "."
+        }
+        for each want in wantedOf(table, renamedFilter, prefix) {
+            if carried(cx, params, ref.facts, want) == false {
+                mut where := "`" + want.written + "`"
+                if len(want.conds) > 0 {
+                    where = where + " wherever `" + condText(want.conds) + "` holds: `WHERE \{ if " + condText(want.conds) + " \{ " + want.written + " } }`"
+                }
+                append(out, "this query {ref.verb} `{table}` without the filter law {shownLaw} keeps on it\n    its WHERE has to carry {where}")
+                return out
+            }
+        }
+    }
+    for each w in rd.writes {
+        for each want in wantedOf(table, renamedFilter, "") {
+            problem := keepsRow(cx, params, w, want, table, shownLaw)
+            if problem != "" {
+                append(out, problem)
+                return out
+            }
+        }
+    }
+    return out
+}
+
+// Whether some part of what the statement knows of each row says what `want`
+// does, or more, under `if`s the law's own imply.
+proc carried(cx: prove.Context, params: ast.Param[], facts: Fact[], want: Wanted): Bool {
+    for each f in facts {
+        if within(f.atoms, want.atoms) && implied(cx, params, want.conds, f.conds) {
+            return true
+        }
+    }
+    return false
+}
+
+func within(some: Str[], all: Str[]): Bool {
+    if len(some) == 0 {
+        return false
+    }
+    for each a in some {
+        if (indexOf(all, a) is Result.Ok(_)) == false {
+            return false
+        }
+    }
+    return true
+}
+
+// A row written into the table lands inside the filter: an INSERT writes, for one
+// of the filter's `column = value` parts, that value into that column; an UPDATE
+// leaves the filter's columns alone, sets one of them to its value, or leaves a
+// part its WHERE already guaranteed alone.
+proc keepsRow(cx: prove.Context, params: ast.Param[], w: Written, want: Wanted, table: Str, shownLaw: Str): Str {
+    if w.update {
+        mut touches := false
+        for each c in w.columns {
+            if indexOf(want.columns, c) is Result.Ok(_) {
+                touches = true
+            }
+        }
+        if touches == false {
+            return ""
+        }
+        if w.readable != "" {
+            return "cannot hold this query to law {shownLaw}: {w.readable}"
+        }
+        if writesOne(w, want) {
+            return ""
+        }
+        // A part of the filter whose columns stay as they were, and which the
+        // WHERE guaranteed for the row, still holds once the row is written.
+        for each atom in want.atoms {
+            mut untouched := true
+            for each c in w.columns {
+                if text.contains(" " + atom + " ", " " + c + " ") {
+                    untouched = false
+                }
+            }
+            if untouched && carried(cx, params, w.facts, Wanted(want.conds, [atom], want.written, want.columns, [], [])) {
+                return ""
+            }
+        }
+        return "this query moves a row of `{table}` out of law {shownLaw}'s filter: it sets " + columnList(w, want) + " to something the filter does not keep\n    the row has to stay inside `" + want.written + "`"
+    }
+    if w.readable != "" {
+        return "cannot hold this query to law {shownLaw}: {w.readable}"
+    }
+    if len(want.eqColumns) == 0 {
+        return "this query inserts into `{table}`, and law {shownLaw}'s filter `" + want.written + "` is not `column = value`, so no row an insert writes can be held to it"
+    }
+    if writesOne(w, want) {
+        return ""
+    }
+    return "this query inserts a row into `{table}` that law {shownLaw}'s filter does not keep\n    it has to write " + eqList(want)
+}
+
+func writesOne(w: Written, want: Wanted): Bool {
+    mut i := 0
+    for each c in want.eqColumns {
+        if want.eqValues bounds i {
+            wanted := want.eqValues[i]
+            mut j := 0
+            for each written in w.columns {
+                if written == c && w.values bounds j {
+                    if w.values[j] == wanted && wanted != "" {
+                        return true
+                    }
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+func eqList(want: Wanted): Str {
+    mut Str[dyn] out = []
+    mut i := 0
+    for each c in want.eqColumns {
+        if want.eqValues bounds i {
+            append(out, "`" + bare(c) + "` as `" + want.eqValues[i] + "`")
+        }
+        i = i + 1
+    }
+    if len(out) == 1 {
+        for each one in out {
+            return one
+        }
+    }
+    return "one of " + join(out, ", or ")
+}
+
+func columnList(w: Written, want: Wanted): Str {
+    mut Str[dyn] out = []
+    for each c in w.columns {
+        if indexOf(want.columns, c) is Result.Ok(_) {
+            append(out, "`" + bare(c) + "`")
+        }
+    }
+    return join(out, " and ")
+}
+
+func bare(column: Str): Str {
+    if text.startsWith(column, "@.") {
+        cs := text.chars(column)
+        return text.span(cs, 2, len(cs) - 1)
+    }
+    return column
+}
+
+func condText(conds: ast.Expr[]): Str {
+    mut Str[dyn] out = []
+    for each c in conds {
+        append(out, prove.exprText(c))
+    }
+    return join(out, " && ")
+}
+
+// Whether, for every value of the query's parameters, the law's conditions holding
+// means the query's do too — proved the way a law is, on unknowns.
+proc implied(cx: prove.Context, params: ast.Param[], premises: ast.Expr[], conclusions: ast.Expr[]): Bool {
+    if len(conclusions) == 0 {
+        return true
+    }
+    at := token.nowhere()
+    mut ast.Stmt[dyn] body = []
+    claim := ast.Stmt.AssertStmt(allOf(conclusions), at)
+    if len(premises) == 0 {
+        append(body, claim)
+    } else {
+        append(body, ast.Stmt.IfChain([ast.Branch(allOf(premises), ast.Block([claim]))], ast.Block([]), false, at))
+    }
+    mut pr := prove.newProver(100000)
+    mut hive.map.Map<Str, terms.Term> env = hive.map.new()
+    mut terms.Term[dyn] held = []
+    for each p in params {
+        v := prove.fresh(pr, types.resolve(cx.base.table, p.declared), p.name)
+        hive.map.set(env, p.name, v)
+        append(held, v)
+    }
+    mut hive.map.Map<Str, terms.Term> shapes = hive.map.new()
+    mut prove.Path begin = prove.Path(env, [], shapes, [], prove.End.Running(), [], prove.Frame("a table law", held), 0, [], [])
+    for each v in held {
+        begin = prove.withTypeLaws(pr, cx, begin, v)
+    }
+    paths := prove.execBlock(pr, cx, infer.boundParams(cx.base, params, 0), begin, body)
+    if len(pr.problems) > 0 {
+        return false
+    }
+    for each p in paths {
+        if p.ended is prove.End.Lost(_, _) {
+            return false
+        }
+    }
+    return true
+}
+
+func allOf(es: ast.Expr[]): ast.Expr {
+    mut ast.Expr out = ast.Expr.BoolLit(true, token.nowhere())
+    mut first := true
+    for each e in es {
+        if first {
+            out = e
+            first = false
+        } else {
+            out = ast.Expr.Binary(ast.BinOp.And(), out, e, e.at)
+        }
+    }
+    return out
+}
+
+// --- The law's parameter, as the query calls it ------------------------------------
+
+func renameParts(parts: ast.SqlPart[], from: Str, to: Str): ast.SqlPart[dyn] {
+    mut ast.SqlPart[dyn] out = []
+    for each part in parts {
+        if part is ast.SqlPart.Param(value) {
+            append(out, ast.SqlPart.Param(renamed(value, from, to)))
+        } else if part is ast.SqlPart.Where(group) {
+            append(out, ast.SqlPart.Where(renameGroup(group, from, to)))
+        } else {
+            append(out, part)
+        }
+    }
+    return out
+}
+
+func renameGroup(group: ast.SqlGroup, from: Str, to: Str): ast.SqlGroup {
+    mut ast.SqlItem[dyn] items = []
+    for each item in group.items {
+        if item is ast.SqlItem.Cond(condition, body) {
+            append(items, ast.SqlItem.Cond(renamed(condition, from, to), renameParts(body, from, to)))
+        } else if item is ast.SqlItem.Nested(nested) {
+            append(items, ast.SqlItem.Nested(renameGroup(nested, from, to)))
+        }
+    }
+    return ast.SqlGroup(group.conjunction, items)
+}
+
+func renamed(e: ast.Expr, from: Str, to: Str): ast.Expr {
+    if from == to {
+        return e
+    }
+    if e is ast.Expr.Ident(name, at) {
+        if name == from {
+            return ast.Expr.Ident(to, at)
+        }
+        return e
+    } else if e is ast.Expr.Interp(parts, at) {
+        mut ast.InterpPart[dyn] out = []
+        for each part in parts {
+            if part is ast.InterpPart.Expression(value) {
+                append(out, ast.InterpPart.Expression(renamed(value, from, to)))
+            } else {
+                append(out, part)
+            }
+        }
+        return ast.Expr.Interp(out, at)
+    } else if e is ast.Expr.VectorLit(items, at) {
+        return ast.Expr.VectorLit(renamedAll(items, from, to), at)
+    } else if e is ast.Expr.Negate(x, at) {
+        return ast.Expr.Negate(renamed(x, from, to), at)
+    } else if e is ast.Expr.Not(x, at) {
+        return ast.Expr.Not(renamed(x, from, to), at)
+    } else if e is ast.Expr.BitNot(x, at) {
+        return ast.Expr.BitNot(renamed(x, from, to), at)
+    } else if e is ast.Expr.Binary(op, l, r, at) {
+        return ast.Expr.Binary(op, renamed(l, from, to), renamed(r, from, to), at)
+    } else if e is ast.Expr.Call(callee, args, at) {
+        mut ast.Arg[dyn] out = []
+        for each a in args {
+            append(out, ast.Arg(a.name, renamed(a.value, from, to)))
+        }
+        return ast.Expr.Call(renamed(callee, from, to), out, at)
+    } else if e is ast.Expr.Member(subject, field, at) {
+        return ast.Expr.Member(renamed(subject, from, to), field, at)
+    } else if e is ast.Expr.Index(subject, index, at) {
+        return ast.Expr.Index(renamed(subject, from, to), renamed(index, from, to), at)
+    } else if e is ast.Expr.Slice(subject, low, high, at) {
+        return ast.Expr.Slice(renamed(subject, from, to), renamed(low, from, to), renamed(high, from, to), at)
+    } else if e is ast.Expr.IsMatch(subject, pattern, at) {
+        return ast.Expr.IsMatch(renamed(subject, from, to), renamedPattern(pattern, from, to), at)
+    }
+    return e
+}
+
+func renamedAll(es: ast.Expr[], from: Str, to: Str): ast.Expr[dyn] {
+    mut ast.Expr[dyn] out = []
+    for each e in es {
+        append(out, renamed(e, from, to))
+    }
+    return out
+}
+
+func renamedPattern(p: ast.Pattern, from: Str, to: Str): ast.Pattern {
+    if p is ast.Pattern.VectorPat(elements, rest) {
+        mut ast.VecElem[dyn] out = []
+        for each el in elements {
+            if el is ast.VecElem.Match(value) {
+                append(out, ast.VecElem.Match(renamed(value, from, to)))
+            } else {
+                append(out, el)
+            }
+        }
+        return ast.Pattern.VectorPat(out, rest)
+    }
+    return p
+}

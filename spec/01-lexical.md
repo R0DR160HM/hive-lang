@@ -42,8 +42,12 @@ import   proc     func     query    test     type
 if       else     return   is       with     switch
 void     true     false    echo     assert   panic
 dyn      mut      async    await    for      in
-each     bounds   break    continue
+each     bounds   break    continue law      axiom
 ```
+
+`axiom` is **reserved**: it means nothing yet, and any use of it — as a name, a
+declaration or anything else — is a compile error, so a later version can give it
+a meaning without breaking a program.
 
 Any other casing is an ordinary name — `Proc`, `IF`, `proC` — so a union of
 statement kinds may have a variant called `Return`, and a type may be called
@@ -59,10 +63,10 @@ type Stmt {
 A field cannot be called `type` or `query`, since those are the keywords
 themselves.
 
-Two words are keywords **only where they are written**, and are ordinary
-identifiers everywhere else: `as` (after an import path) and `timeout` (in
-`with timeout`). Because they are not reserved, a variable may be called
-`timeout`.
+Three words are keywords **only where they are written**, and are ordinary
+identifiers everywhere else: `as` (after an import path), `timeout` (in
+`with timeout`) and `table` (in a law's `for table`). Because they are not
+reserved, a variable may be called `timeout` or `table`.
 
 ### Operators and punctuation
 

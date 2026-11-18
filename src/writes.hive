@@ -48,6 +48,8 @@ type Written {
     // shared after that — a field is shared only when the program has been
     // *shown* never to write it, and a walk that lost track has shown nothing.
     blind: Bool
+    // Every `mut` name of the body being walked, unscoped: too many only marks more.
+    mutables: Str[dyn]
 }
 
 // What a deep copy still has to copy, as `Type.field` entries and escaped
@@ -55,7 +57,7 @@ type Written {
 // the answer is missing because nothing in the program writes it.
 proc writtenShapes(m: ast.Module): Str[dyn] {
     t := types.tableOf(m)
-    mut Written w = Written([], [], hive.map.new(), hive.map.new(), t, false)
+    mut Written w = Written([], [], hive.map.new(), hive.map.new(), t, false, [])
     env := infer.newEnv(t)
     markLeaks(w, m.decls)
     for each d in m.decls {
@@ -79,7 +81,7 @@ proc writtenShapes(m: ast.Module): Str[dyn] {
 // the signature half of the walk is run: a shape marked by `markShape` escaped a
 // write, and a write has no signature to point at.
 proc leakedBy(t: types.Table, decls: ast.Decl[]): hive.map.Map<Str, Str> {
-    mut Written w = Written([], [], hive.map.new(), hive.map.new(), t, false)
+    mut Written w = Written([], [], hive.map.new(), hive.map.new(), t, false, [])
     markLeaks(w, decls)
     return w.leakedBy
 }
@@ -362,7 +364,13 @@ proc shapesOf(t: types.Table, ty: types.Ty, out: mut Str[dyn], seen: Str[]): voi
 // --- Declarations -------------------------------------------------------------
 
 proc walkDecl(w: mut Written, env: infer.Env, d: ast.Decl): void {
+    w.mutables = []
     if d is ast.Decl.CallableDecl(_, _, params, _, body, _) {
+        for each p in params {
+            if p.mutable {
+                append(w.mutables, p.name)
+            }
+        }
         walkBlock(w, infer.boundParams(env, params, 0), body)
     } else if d is ast.Decl.QueryDecl(_, _, _, _, _) {
         // A query body holds no assignment: its bound values are expressions, and
@@ -393,6 +401,10 @@ proc walkStmt(w: mut Written, env: infer.Env, s: ast.Stmt): infer.Env {
         // copies — so a value that names storage in a field puts a second name on
         // it, and the target can be written through.
         markThrough(w, env, value)
+        // And the other way: a `mut` name's storage put in a field is written through that name.
+        if indexOf(w.mutables, rootName(value)) is Result.Ok(_) {
+            markThrough(w, env, target)
+        }
         return env
     }
     if s is ast.Stmt.VarDecl(name, value, mutable, _, _) {
@@ -402,6 +414,7 @@ proc walkStmt(w: mut Written, env: infer.Env, s: ast.Stmt): infer.Env {
         // is a name that can write there.
         if mutable {
             markThrough(w, env, value)
+            append(w.mutables, name)
         }
         return infer.bound(env, name, infer.typeOf(env, value))
     }
@@ -409,6 +422,7 @@ proc walkStmt(w: mut Written, env: infer.Env, s: ast.Stmt): infer.Env {
         walkExpr(w, env, value)
         if mutable {
             markThrough(w, env, value)
+            append(w.mutables, name)
         }
         return infer.bound(env, name, types.resolve(w.table, declared))
     }
@@ -590,6 +604,14 @@ proc markCall(w: mut Written, env: infer.Env, callee: ast.Expr, args: ast.Arg[])
     for each found in infer.mutableArguments(env, callee, args) {
         markThrough(w, env, found)
     }
+}
+
+// The name a path of fields and indexes starts from, or `""`.
+func rootName(e: ast.Expr): Str {
+    if e is ast.Expr.Ident(name, _) { return name }
+    if e is ast.Expr.Member(subject, _, _) { return rootName(subject) }
+    if e is ast.Expr.Index(subject, _, _) { return rootName(subject) }
+    return ""
 }
 
 func calleeName(callee: ast.Expr): Str {

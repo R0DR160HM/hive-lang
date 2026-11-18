@@ -1,0 +1,1117 @@
+// Tests for `src/laws`, `src/prove` and `src/solve`: the law prover.
+//
+// Most tests here are a law and what the compiler makes of it — proved, refuted
+// with a counterexample, or refused with what it could not follow. The assertion
+// is on the opening of the message, so a message can be improved without a test
+// being rewritten.
+import ../src/check
+import ../src/laws
+import ../src/loader
+import ../src/mono
+import ../src/ranges
+import ../src/solve
+import ../src/terms
+import ../src/text
+import ../src/types
+
+// What the compiler says about the laws in `source`: `""` when every one is proved.
+proc verdict(source: Str): Str {
+    p := loader.loadText("main.hive", source)
+    for each e in p.errors {
+        return "loader: " + e.message
+    }
+    expanded := mono.expand(p.module, 0)
+    for each e in expanded.errors {
+        return "mono: " + e.message
+    }
+    for each e in check.checkModule(expanded.module) {
+        return "check: " + e.message
+    }
+    for each e in ranges.checkModule(expanded.module) {
+        return e.message
+    }
+    for each e in laws.checkModule(expanded.module) {
+        return e.message
+    }
+    return ""
+}
+
+proc proves(source: Str): Bool {
+    return verdict(source) == ""
+}
+
+func opens(got: Str, wanted: Str): Bool {
+    return text.startsWith(got, wanted)
+}
+
+func withMain(source: Str): Str {
+    return source + "\nproc main(): void \{ }\n"
+}
+
+func int(name: Str, id: Int): terms.Term {
+    return terms.Term.Unknown(id, types.Ty.TInt())
+}
+
+func cmp(name: Str, a: terms.Term, b: terms.Term): terms.Term {
+    return terms.op(name, [a, b], terms.boolean())
+}
+
+// --- The solver -------------------------------------------------------------------
+
+test "a difference between two ordered integers is positive" {
+    a := int("a", 0)
+    b := int("b", 1)
+    facts := [cmp("le", terms.Term.IntK(0), a), cmp("lt", a, b)]
+    goal := cmp("lt", terms.Term.IntK(0), terms.op("sub", [b, a], terms.integer()))
+    assert solve.decide(facts, [], goal) is solve.Verdict.Holds
+}
+
+test "a sum nothing keeps below the top is not trusted" {
+    a := int("a", 0)
+    goal := cmp("lt", a, terms.op("add", [a, terms.Term.IntK(1)], terms.integer()))
+    assert solve.decide([], [], goal) is solve.Verdict.Open
+}
+
+test "a sum the facts keep below the top is trusted" {
+    a := int("a", 0)
+    facts := [cmp("lt", a, terms.Term.IntK(100))]
+    goal := cmp("lt", a, terms.op("add", [a, terms.Term.IntK(1)], terms.integer()))
+    assert solve.decide(facts, [], goal) is solve.Verdict.Holds
+}
+
+test "facts that contradict each other prove anything" {
+    a := int("a", 0)
+    facts := [cmp("lt", a, terms.Term.IntK(0)), cmp("lt", terms.Term.IntK(5), a)]
+    assert solve.decide(facts, [], terms.Term.BoolK(false)) is solve.Verdict.Holds
+}
+
+test "a lemma whose guards hold adds its conclusion" {
+    a := int("a", 0)
+    hidden := terms.op("call:f", [a], types.Ty.TBool())
+    lemma := solve.Lemma([cmp("lt", a, terms.Term.IntK(3))], hidden)
+    assert solve.decide([cmp("lt", a, terms.Term.IntK(1))], [lemma], hidden) is solve.Verdict.Holds
+    assert solve.decide([], [lemma], hidden) is solve.Verdict.Open
+}
+
+// --- Laws over small types ----------------------------------------------------------
+
+test "a law over a union whose variants carry nothing is checked against every value" {
+    assert proves(withMain(`
+        type Light \{
+            Red
+            Amber
+            Green
+        }
+        func next(l: Light): Light \{
+            switch l \{
+                Light.Red \{ return Light.Green() }
+                Light.Green \{ return Light.Amber() }
+                Light.Amber \{ return Light.Red() }
+            }
+        }
+        law cycles(l: Light) \{
+            assert next(next(next(l))) == l
+        }
+    `))
+}
+
+test "a false law over a small type is refused with the value that breaks it" {
+    got := verdict(withMain(`
+        type Light \{
+            Red
+            Green
+        }
+        func next(l: Light): Light \{
+            return Light.Green()
+        }
+        law flips(l: Light) \{
+            assert next(l) != l
+        }
+    `))
+    assert opens(got, "in law `flips`: it does not hold for l = Light.Green()")
+}
+
+// --- Counterexamples ----------------------------------------------------------------
+
+test "wrapping round is found at the top of the range" {
+    got := verdict(withMain(`
+        law grows(a: Int) \{
+            assert a + 1 > a
+        }
+    `))
+    assert opens(got, "in law `grows`: it does not hold for a = 9223372036854775807")
+}
+
+test "an odd number is a counterexample to halving and doubling" {
+    got := verdict(withMain(`
+        func half(n: Int): Int \{
+            return n / 2
+        }
+        law halves(n: Int) \{
+            assert half(n) * 2 == n
+        }
+    `))
+    assert opens(got, "in law `halves`: it does not hold for n = 1")
+}
+
+// --- Proofs over unknowns -----------------------------------------------------------
+
+test "an ordered pair of days makes a positive number of nights" {
+    assert proves(withMain(`
+        func nights(checkIn: Int, checkOut: Int): Int \{
+            return checkOut - checkIn
+        }
+        law positive(a: Int, b: Int) \{
+            if a >= 0 && a < b \{
+                assert nights(a, b) > 0
+            }
+        }
+    `))
+}
+
+test "a guard keeps a sum from wrapping" {
+    assert proves(withMain(`
+        law below(a: Int) \{
+            if a < 100 \{
+                assert a + 1 <= 100
+            }
+        }
+    `))
+}
+
+test "integers equal modulo wrapping stay equal with the same added to both" {
+    assert proves(withMain(`
+        func count(v: Int[]): Int \{
+            if v is [_, ...rest] \{
+                return 1 + count(rest)
+            }
+            return 0
+        }
+        law countIsLength(v: Int[dyn]) \{
+            assert count(v) == len(v)
+        }
+    `))
+}
+
+test "a length is never taken to be near the top of the range" {
+    assert proves(withMain(`
+        law oneMore(v: Int[dyn], x: Int) \{
+            assert len(v + [x]) > len(v)
+        }
+    `))
+}
+
+test "another law is cited by calling it" {
+    assert proves(withMain(`
+        func count(v: Int[]): Int \{
+            if v is [_, ...rest] \{
+                return 1 + count(rest)
+            }
+            return 0
+        }
+        law countIsLength(v: Int[dyn]) \{
+            assert count(v) == len(v)
+        }
+        law countNeverNegative(v: Int[dyn]) \{
+            countIsLength(v)
+            assert count(v) >= 0
+        }
+    `))
+}
+
+test "without the law it needs, a count is not known to be non-negative" {
+    got := verdict(withMain(`
+        func count(v: Int[]): Int \{
+            if v is [_, ...rest] \{
+                return 1 + count(rest)
+            }
+            return 0
+        }
+        law countNeverNegative(v: Int[dyn]) \{
+            assert count(v) >= 0
+        }
+    `))
+    assert opens(got, "in law `countNeverNegative`: cannot prove `0 <= 1 + count(the rest of v)`")
+}
+
+// --- Records, variants and induction --------------------------------------------------
+
+func bookings(): Str {
+    return `
+        type Status \{
+            Requested
+            Confirmed
+            CheckedIn
+            CheckedOut
+            Cancelled
+        }
+        type Event \{
+            Confirm
+            Cancel \{ reason: Str }
+            Arrive
+            Leave
+        }
+        type Booking \{
+            room: Str
+            checkInDay: Int
+            checkOutDay: Int
+            status: Status
+        }
+        func apply(booking: Booking, event: Event): Booking \{
+            if booking.status is Status.Cancelled || booking.status is Status.CheckedOut \{
+                return booking
+            }
+            switch event \{
+                Event.Confirm \{
+                    if booking.status is Status.Requested \{
+                        return Booking(booking.room, booking.checkInDay, booking.checkOutDay, Status.Confirmed())
+                    }
+                    return booking
+                }
+                Event.Cancel(_) \{
+                    return Booking(booking.room, booking.checkInDay, booking.checkOutDay, Status.Cancelled())
+                }
+                Event.Arrive \{
+                    if booking.status is Status.Confirmed \{
+                        return Booking(booking.room, booking.checkInDay, booking.checkOutDay, Status.CheckedIn())
+                    }
+                    return booking
+                }
+                Event.Leave \{
+                    if booking.status is Status.CheckedIn \{
+                        return Booking(booking.room, booking.checkInDay, booking.checkOutDay, Status.CheckedOut())
+                    }
+                    return booking
+                }
+            }
+        }
+        func replay(booking: Booking, log: Event[]): Booking \{
+            mut current := booking
+            for each event in log \{
+                current = apply(current, event)
+            }
+            return current
+        }
+        func isBooked(bookings: Booking[], room: Str, day: Int): Bool \{
+            for each b in bookings \{
+                if b.room == room && b.checkInDay <= day && day < b.checkOutDay \{
+                    return true
+                }
+            }
+            return false
+        }
+        law applyKeepsTheRoom(booking: Booking, event: Event) \{
+            assert apply(booking, event).room == booking.room
+        }
+    `
+}
+
+test "a cancelled booking stays cancelled whatever event arrives" {
+    assert proves(withMain(bookings() + `
+        law cancelledIsFinal(booking: Booking, event: Event) \{
+            if booking.status is Status.Cancelled \{
+                assert apply(booking, event).status == booking.status
+            }
+        }
+    `))
+}
+
+test "a booking that can be un-cancelled is refused with the event that does it" {
+    got := verdict(withMain(`
+        type Status \{
+            Open
+            Cancelled
+        }
+        type Event \{
+            Close
+            Reopen
+        }
+        func apply(s: Status, e: Event): Status \{
+            if e is Event.Reopen \{
+                return Status.Open()
+            }
+            return Status.Cancelled()
+        }
+        law cancelledIsFinal(s: Status, e: Event) \{
+            if s is Status.Cancelled \{
+                assert apply(s, e) == s
+            }
+        }
+    `))
+    assert opens(got, "in law `cancelledIsFinal`: it does not hold for s = Status.Cancelled(), e = Event.Reopen()")
+}
+
+test "adding a booking never frees a room, by an induction the prover finds itself" {
+    assert proves(withMain(bookings() + `
+        law bookingNeverFreesARoom(bookings: Booking[dyn], extra: Booking, room: Str, day: Int) \{
+            if isBooked(bookings, room, day) \{
+                assert isBooked(bookings + [extra], room, day)
+            }
+        }
+    `))
+}
+
+test "a loop that carries a booking needs the induction written out" {
+    unhinted := verdict(withMain(bookings() + `
+        law replayKeepsTheRoom(b: Booking, log: Event[dyn]) \{
+            assert replay(b, log).room == b.room
+        }
+    `))
+    assert opens(unhinted, "in law `replayKeepsTheRoom`: cannot prove `(current after the loop at line")
+    assert proves(withMain(bookings() + `
+        law replayKeepsTheRoom(b: Booking, log: Event[dyn]) \{
+            if log is [first, ...rest] \{
+                applyKeepsTheRoom(b, first)
+                replayKeepsTheRoom(apply(b, first), rest)
+            }
+            assert replay(b, log).room == b.room
+        }
+    `))
+}
+
+// --- A law with no assert ---------------------------------------------------------------
+
+test "a law with no assert claims nothing it calls panics" {
+    got := verdict(withMain(`
+        func nightsOf(text: Str): Int \{
+            if text == "" \{
+                panic "no nights"
+            }
+            return 1
+        }
+        law parses(text: Str) \{
+            _ := nightsOf(text)
+        }
+    `))
+    assert opens(got, "in law `parses`: it does not hold for text = \"\": this `panic` is reached")
+}
+
+test "a guard keeps a panic from being reached" {
+    assert proves(withMain(`
+        func nightsOf(text: Str): Int \{
+            if text == "" \{
+                panic "no nights"
+            }
+            return 1
+        }
+        law parses(text: Str) \{
+            if text != "" \{
+                _ := nightsOf(text)
+            }
+        }
+    `))
+}
+
+// --- What a law may reach -----------------------------------------------------------------
+
+test "a law may not reach a library call" {
+    got := verdict(withMain(`
+        func stamp(n: Int): Int \{
+            t := hive.time.now()
+            return n
+        }
+        law stamped(n: Int) \{
+            assert stamp(n) == n
+        }
+    `))
+    assert opens(got, "in law `stamped`: it reaches `stamp` (line 1), where it calls `hive.time.now` (line 2)")
+}
+
+test "a law may not reach a loop nothing shows ends" {
+    got := verdict(withMain(`
+        func spin(n: Int): Int \{
+            mut x := n
+            for ; x > 0; \{
+                x = x - 1
+            }
+            return x
+        }
+        law spins(n: Int) \{
+            assert spin(n) <= n
+        }
+    `))
+    assert opens(got, "in law `spins`: it reaches `spin` (line 1), where it has a loop (line 3) that nothing shows comes to an end")
+}
+
+test "a recursion that does not shrink is refused" {
+    got := verdict(withMain(`
+        func forever(n: Int): Int \{
+            return forever(n)
+        }
+        law loops(n: Int) \{
+            assert forever(n) == forever(n)
+        }
+    `))
+    assert opens(got, "in law `loops`: it reaches `forever` (line 1), which calls itself, and its call to itself (line 2) is not on something smaller")
+}
+
+test "two callables calling each other round in a circle are refused" {
+    got := verdict(withMain(`
+        func even(v: Int[]): Bool \{
+            if v is [_, ...rest] \{
+                return odd(rest)
+            }
+            return true
+        }
+        func odd(v: Int[]): Bool \{
+            if v is [_, ...rest] \{
+                return even(rest)
+            }
+            return false
+        }
+        law evenOrOdd(v: Int[dyn]) \{
+            assert even(v) || odd(v)
+        }
+    `))
+    assert text.contains(got, "which call each other round in a circle")
+}
+
+test "a law calling itself on the same thing is refused" {
+    got := verdict(withMain(`
+        law circular(n: Int) \{
+            circular(n)
+            assert n == n
+        }
+    `))
+    assert opens(got, "in law `circular`: its call to itself (line 2) is not on something smaller")
+}
+
+test "two laws citing each other are refused" {
+    got := verdict(withMain(`
+        law first(n: Int) \{
+            second(n)
+            assert n == n
+        }
+        law second(n: Int) \{
+            first(n)
+            assert n == n
+        }
+    `))
+    assert opens(got, "in law `first`: it calls another law that, in turn, calls it")
+}
+
+func firstOf(): Str {
+    return `
+        func first(v: T[]): Result<T, Bool> \{
+            if v bounds 0 \{
+                return Result.Ok(v[0])
+            }
+            return Result.Error(false)
+        }
+    `
+}
+
+test "a generic law is proved at every type the program uses what it calls at" {
+    assert proves(firstOf() + `
+        law firstIsFirst(v: T[dyn]) \{
+            if v is [x, ...rest] \{
+                assert first(v) == Result.Ok(x)
+            }
+        }
+        proc main(): void \{
+            echo first([1, 2])
+            echo first(["a"])
+        }
+    `)
+}
+
+test "a generic law that fails at one of its types is refused at that copy" {
+    got := verdict(firstOf() + `
+        law firstIsFirst(v: T[dyn]) \{
+            if v is [x, ...rest] \{
+                assert first(v) == Result.Ok(x)
+            }
+        }
+        proc main(): void \{
+            echo first([1.5])
+        }
+    `)
+    assert opens(got, "in law `firstIsFirst_Float`: cannot prove")
+}
+
+test "a generic law nothing instantiates is not copied, and so not checked" {
+    assert proves(withMain(firstOf() + `
+        law firstIsFirst(v: T[dyn]) \{
+            if v is [x, ...rest] \{
+                assert first(v) == Result.Ok(x)
+            }
+        }
+    `))
+}
+
+// --- What only a law may do -----------------------------------------------------------------
+
+test "only a law may call a law" {
+    got := verdict(`
+        law holds(n: Int) \{
+            assert n == n
+        }
+        proc main(): void \{
+            holds(3)
+        }
+    `)
+    assert opens(got, "check: in `main`: `holds` is a law, and only another law may call one")
+}
+
+test "a law is not a value" {
+    got := verdict(`
+        law holds(n: Int) \{
+            assert n == n
+        }
+        proc main(): void \{
+            f := holds
+        }
+    `)
+    assert opens(got, "check: in `main`: `holds` is a law, and a law is not a value")
+}
+
+test "a law takes no mut parameter" {
+    got := verdict(withMain(`
+        law grows(n: mut Int) \{
+            assert n == n
+        }
+    `))
+    assert opens(got, "check: in `grows`: a law cannot declare the `mut` parameter `n: mut ...`")
+}
+
+test "a law has no return type" {
+    got := verdict(withMain(`
+        law answers(n: Int): Bool \{
+            assert n == n
+        }
+    `))
+    assert opens(got, "loader: a law has no return type")
+}
+
+test "axiom is reserved, and nothing may be written with it" {
+    got := verdict(withMain(`
+        func axiom(n: Int): Int \{
+            return n
+        }
+    `))
+    assert opens(got, "loader: `axiom` is reserved for a later version of Hive")
+}
+
+test "what a proc writes through a mut parameter reaches the variable it was handed" {
+    assert proves(withMain(`
+        type Status \{
+            Requested
+            Cancelled
+        }
+        type Event \{
+            Cancel
+            Wait
+        }
+        type Booking \{
+            room: Str
+            status: Status
+        }
+        proc apply(booking: mut Booking, event: Event): void \{
+            if event is Event.Cancel \{
+                booking.status = Status.Cancelled()
+            }
+        }
+        func replay(booking: Booking, log: Event[]): Booking \{
+            mut current := booking
+            for each event in log \{
+                apply(current, event)
+            }
+            return current
+        }
+        law cancels(booking: Booking) \{
+            mut next := booking
+            apply(next, Event.Cancel())
+            assert next.status == Status.Cancelled()
+        }
+        law keepsRoom(booking: Booking, log: Event[dyn]) \{
+            if log is [first, ...rest] \{
+                mut next := booking
+                apply(next, first)
+                keepsRoom(next, rest)
+            }
+            assert replay(booking, log).room == booking.room
+        }
+    `))
+}
+
+// --- Type laws ------------------------------------------------------------------------
+
+func stays(): Str {
+    return `
+        type Booking \{
+            room: Str
+            checkInDay: Int
+            checkOutDay: Int
+            law atLeastOneNight(b: Booking) \{
+                assert b.checkInDay >= 0 && b.checkInDay < b.checkOutDay
+            }
+        }
+    `
+}
+
+test "a value built behind the right guards keeps its type's law" {
+    assert proves(withMain(stays() + `
+        func book(room: Str, firstDay: Int, nights: Int): Result<Booking, Str> \{
+            if firstDay < 0 || firstDay > 100000 || nights < 1 || nights > 365 \{
+                return Result.Error("dates out of range")
+            }
+            return Result.Ok(Booking(room, firstDay, firstDay + nights))
+        }
+    `))
+}
+
+test "a value built without them is refused where it is built" {
+    got := verdict(withMain(stays() + `
+        func moveEarlier(b: Booking, days: Int): Booking \{
+            return Booking(b.room, b.checkInDay - days, b.checkOutDay - days)
+        }
+    `))
+    assert opens(got, "in `moveEarlier`: cannot prove `Booking.atLeastOneNight` for this `Booking(...)`: nothing here shows `0 <= b.checkInDay - days`")
+}
+
+test "a write that may break the law is refused where it is written" {
+    got := verdict(withMain(stays() + `
+        proc shorten(b: mut Booking): void \{
+            b.checkOutDay = b.checkOutDay - 1
+        }
+    `))
+    assert opens(got, "in `shorten`: cannot prove `Booking.atLeastOneNight` for this write to `b.checkOutDay`")
+}
+
+test "a write the guards keep in range keeps the law" {
+    assert proves(withMain(stays() + `
+        proc extendStay(b: mut Booking, extra: Int): void \{
+            if extra > 0 && extra <= 365 && b.checkOutDay <= 100000 \{
+                b.checkOutDay += extra
+            }
+        }
+    `))
+}
+
+test "a value that plainly breaks the law says so" {
+    got := verdict(withMain(stays() + `
+        func empty(): Booking \{
+            return Booking("12", 5, 5)
+        }
+    `))
+    assert opens(got, "in `empty`: this `Booking(...)` does not keep `Booking.atLeastOneNight`: `b.checkInDay < b.checkOutDay` is false")
+}
+
+test "a function law may rely on the laws of its parameters' types" {
+    assert proves(withMain(stays() + `
+        func nights(b: Booking): Int \{
+            return b.checkOutDay - b.checkInDay
+        }
+        law aStayHasNights(b: Booking) \{
+            assert nights(b) > 0
+        }
+    `))
+}
+
+test "a law inside a type takes one value of it" {
+    got := verdict(withMain(`
+        type Pair \{
+            a: Int
+            b: Int
+            law same(x: Pair, y: Pair) \{
+                assert x.a == y.a
+            }
+        }
+    `))
+    assert opens(got, "loader: a law inside `Pair` is about one value of it, so it takes exactly one parameter, of type `Pair`")
+}
+
+test "a type's law is held to what any law may reach" {
+    got := verdict(withMain(`
+        type Stamp \{
+            at: Int
+            law recent(s: Stamp) \{
+                assert s.at <= hive.time.now()
+            }
+        }
+    `))
+    assert opens(got, "in law `Stamp.recent`: it calls `hive.time.now`")
+}
+
+func orders(): Str {
+    return `
+        type Order \{
+            lines: Str[dyn]
+            law hasLines(o: Order) \{
+                assert len(o.lines) > 0
+            }
+        }
+    `
+}
+
+test "growing a field in place keeps a law about its length" {
+    assert proves(withMain(orders() + `
+        proc addLine(o: mut Order, line: Str): void \{
+            append(o.lines, line)
+        }
+    `))
+}
+
+test "shrinking a field in place is a write the law is held to" {
+    got := verdict(withMain(orders() + `
+        proc removeFirst(o: mut Order): void \{
+            if o.lines bounds 0 \{
+                _ := drop(o.lines, 0, 0)
+            }
+        }
+    `))
+    assert opens(got, "in `removeFirst`: cannot prove `Order.hasLines` for this `drop` on `o.lines`: nothing here shows `0 < len(new o.lines)`")
+}
+
+test "shrinking it behind a guard that leaves enough keeps the law" {
+    assert proves(withMain(orders() + `
+        proc removeFirst(o: mut Order): void \{
+            if len(o.lines) > 1 && o.lines bounds 0 \{
+                _ := drop(o.lines, 0, 0)
+            }
+        }
+    `))
+}
+
+test "a field handed to a mut parameter may come back as anything" {
+    got := verdict(withMain(orders() + `
+        proc clearAll(lines: mut Str[dyn]): void \{
+            lines = []
+        }
+        proc emptyOut(o: mut Order): void \{
+            clearAll(o.lines)
+        }
+    `))
+    assert opens(got, "in `emptyOut`: cannot prove `Order.hasLines` for this `clearAll` on `o.lines`")
+}
+
+test "an index a type's law guarantees needs no guard" {
+    assert proves(withMain(orders() + `
+        type Picker \{
+            rooms: Str[dyn]
+            selected: Int
+            law inRange(p: Picker) \{
+                assert p.rooms bounds p.selected
+            }
+        }
+        func chosen(p: Picker): Str \{
+            return p.rooms[p.selected]
+        }
+        func firstLine(o: Order): Str \{
+            return o.lines[0]
+        }
+    `))
+}
+
+test "an index past what the law guarantees still needs one" {
+    got := verdict(withMain(orders() + `
+        func secondLine(o: Order): Str \{
+            return o.lines[1]
+        }
+    `))
+    assert opens(got, "in `secondLine`: cannot prove `1` is in range")
+}
+
+test "a mut sharing part of a value with laws may not write it" {
+    got := verdict(withMain(orders() + `
+        proc trim(o: mut Order): void \{
+            mut lines := o.lines
+            append(lines, "extra")
+        }
+    `))
+    assert opens(got, "in `trim`: cannot prove `Order.hasLines` for this `append` on `lines`: `lines` shares the storage of `o.lines`")
+}
+
+test "a mut given storage of its own may" {
+    assert proves(withMain(orders() + `
+        proc trim(o: mut Order): void \{
+            mut lines := o.lines
+            lines = ["fresh"]
+            append(lines, "extra")
+        }
+    `))
+}
+
+test "a write through one name is a write through every name sharing it" {
+    got := verdict(withMain(stays() + `
+        proc reschedule(b: mut Booking): void \{
+            mut same := b
+            if b.checkInDay == 0 && b.checkOutDay == 10 \{
+                same.checkOutDay = 1
+                b.checkInDay = 5
+            }
+        }
+    `))
+    assert opens(got, "in `reschedule`: cannot prove `Booking.atLeastOneNight` for this write to `b.checkInDay`")
+}
+
+test "a law cannot follow a mut that shares a path into another" {
+    got := verdict(withMain(`
+        type Box \{
+            items: Int[dyn]
+        }
+        func emptied(b: Box): Int \{
+            mut copy := b
+            mut items := copy.items
+            append(items, 1)
+            return len(copy.items)
+        }
+        law emptiedCounts(b: Box) \{
+            assert emptied(b) == len(b.items)
+        }
+    `))
+    assert opens(got, "in law `emptiedCounts`: ")
+    assert text.contains(got, "shares `copy`'s storage")
+}
+
+test "a name rebound in one branch still shares in the other" {
+    got := verdict(withMain(stays() + `
+        proc reschedule(b: mut Booking): void \{
+            mut same := b
+            if b.room == "12" \{
+                same = Booking("14", 0, 1)
+            }
+            if b.checkInDay == 0 && b.checkOutDay == 10 && same.checkInDay == 0 \{
+                same.checkOutDay = 1
+                b.checkInDay = 5
+            }
+        }
+    `))
+    assert opens(got, "in `reschedule`: cannot prove `Booking.atLeastOneNight` for this write to `b.checkInDay`")
+}
+
+// --- Table laws -----------------------------------------------------------------------
+
+func tenants(): Str {
+    return `
+        type Session \{
+            userId: Int
+            orgId: Int
+        }
+        type Person \{
+            id: Int
+            name: Str
+        }
+        law sameOrganization(session: Session) for table users \{
+            org_id = \{session.orgId}
+        }
+    `
+}
+
+func chats(): Str {
+    return `
+        type Contact \{
+            id: Int
+        }
+        type Chat \{
+            id: Int
+            body: Str
+        }
+        law ownChatsOnly(contact: Contact) for table chats \{
+            fk_contact_from_id = \{contact.id} or
+            fk_contact_to_id = \{contact.id}
+        }
+    `
+}
+
+test "a query carrying a table's filter compiles" {
+    assert proves(withMain(tenants() + `
+        query colleagues(session: Session): Person[dyn] \{
+            SELECT id, name FROM users WHERE org_id = \{session.orgId} ORDER BY name
+        }
+        query rename(session: Session, id: Int, name: Str): void \{
+            UPDATE users SET name = \{name} WHERE id = \{id} AND org_id = \{session.orgId}
+        }
+        query remove(session: Session, id: Int): void \{
+            DELETE FROM users WHERE org_id = \{session.orgId} AND id = \{id}
+        }
+    `))
+}
+
+test "a query without it is refused, and told what to carry" {
+    got := verdict(withMain(tenants() + `
+        query everyoneActive(session: Session): Person[dyn] \{
+            SELECT id, name FROM users WHERE active = 1
+        }
+    `))
+    assert opens(got, "in `everyoneActive`: this query reads `users` without the filter law `sameOrganization` keeps on it\n    its WHERE has to carry `org_id = \{session.orgId}`")
+}
+
+test "a query on the table has to take the law's parameter" {
+    got := verdict(withMain(tenants() + `
+        query everyone(): Person[dyn] \{
+            SELECT id, name FROM users
+        }
+    `))
+    assert opens(got, "in `everyone`: this query touches `users`, which law `sameOrganization` filters by a `Session`, so it has to take one")
+}
+
+test "a join names the table's columns through its alias" {
+    assert proves(withMain(tenants() + `
+        query withTeams(session: Session): Person[dyn] \{
+            SELECT u.id, u.name FROM users u JOIN teams t ON t.id = u.team_id WHERE u.org_id = \{session.orgId}
+        }
+    `))
+    got := verdict(withMain(tenants() + `
+        query withTeams(session: Session): Person[dyn] \{
+            SELECT u.id, u.name FROM users u JOIN teams t ON t.id = u.team_id WHERE org_id = \{session.orgId}
+        }
+    `))
+    assert opens(got, "in `withTeams`: this query reads `users` without the filter law `sameOrganization` keeps on it\n    its WHERE has to carry `u.org_id = \{session.orgId}`")
+}
+
+test "a subquery carries the filter on its own" {
+    assert proves(withMain(tenants() + `
+        query titles(session: Session): Str[dyn] \{
+            SELECT title FROM posts WHERE author IN (SELECT id FROM users WHERE org_id = \{session.orgId})
+        }
+    `))
+    got := verdict(withMain(tenants() + `
+        query titles(session: Session): Str[dyn] \{
+            SELECT title FROM posts WHERE author IN (SELECT id FROM users)
+        }
+    `))
+    assert opens(got, "in `titles`: this query reads `users` without the filter law `sameOrganization` keeps on it")
+}
+
+test "a part that says more carries a filter of alternatives" {
+    assert proves(withMain(chats() + `
+        query conversation(contact: Contact): Chat[dyn] \{
+            SELECT id, body FROM chats WHERE (fk_contact_from_id = \{contact.id} OR fk_contact_to_id = \{contact.id}) AND body <> ''
+        }
+        query sent(contact: Contact): Chat[dyn] \{
+            SELECT id, body FROM chats WHERE fk_contact_from_id = \{contact.id}
+        }
+    `))
+    got := verdict(withMain(chats() + `
+        query theirs(contact: Contact, other: Int): Chat[dyn] \{
+            SELECT id, body FROM chats WHERE fk_contact_from_id = \{other}
+        }
+    `))
+    assert opens(got, "in `theirs`: this query reads `chats` without the filter law `ownChatsOnly` keeps on it")
+}
+
+test "an insert writes a value the filter keeps" {
+    assert proves(withMain(chats() + `
+        query send(contact: Contact, to: Int, body: Str): void \{
+            INSERT INTO chats (fk_contact_from_id, fk_contact_to_id, body) VALUES (\{contact.id}, \{to}, \{body})
+        }
+    `))
+    got := verdict(withMain(chats() + `
+        query forge(contact: Contact, from: Int, to: Int, body: Str): void \{
+            INSERT INTO chats (fk_contact_from_id, fk_contact_to_id, body) VALUES (\{from}, \{to}, \{body})
+        }
+    `))
+    assert opens(got, "in `forge`: this query inserts a row into `chats` that law `ownChatsOnly`'s filter does not keep\n    it has to write one of `fk_contact_from_id` as `\{contact.id}`, or `fk_contact_to_id` as `\{contact.id}`")
+}
+
+test "an update may not move a row out of the filter" {
+    assert proves(withMain(chats() + `
+        query redirect(contact: Contact, id: Int, to: Int): void \{
+            UPDATE chats SET fk_contact_to_id = \{to} WHERE id = \{id} AND fk_contact_from_id = \{contact.id}
+        }
+    `))
+    got := verdict(withMain(tenants() + `
+        query move(session: Session, id: Int, org: Int): void \{
+            UPDATE users SET org_id = \{org} WHERE id = \{id} AND org_id = \{session.orgId}
+        }
+    `))
+    assert opens(got, "in `move`: this query moves a row of `users` out of law `sameOrganization`'s filter: it sets `org_id` to something the filter does not keep")
+}
+
+test "a law's if is carried by a query whose if it implies" {
+    base := `
+        type User \{
+            Admin
+            Regular
+            id: Int
+            orgId: Int
+        }
+        type Session \{
+            user: User
+        }
+        type Person \{
+            id: Int
+            name: Str
+        }
+        law sameOrganization(session: Session) for table users \{
+            if session.user is User.Regular \{
+                org_id = \{session.user.orgId}
+            }
+        }
+    `
+    assert proves(withMain(base + `
+        query people(session: Session, everything: Bool): Person[dyn] \{
+            SELECT id, name FROM users
+            WHERE \{
+                if session.user is User.Regular || everything == false \{ org_id = \{session.user.orgId} }
+            }
+        }
+    `))
+    got := verdict(withMain(base + `
+        query people(session: Session): Person[dyn] \{
+            SELECT id, name FROM users
+            WHERE \{
+                if session.user is User.Admin \{ org_id = \{session.user.orgId} }
+            }
+        }
+    `))
+    assert opens(got, "in `people`: this query reads `users` without the filter law `sameOrganization` keeps on it")
+}
+
+test "hive.sql.unsafe is not a query, and no law reads it" {
+    assert proves(withMain(tenants() + `
+        proc wipe(db: hive.sql.SqlConnection): void \{
+            _ := hive.sql.unsafe(db, "DELETE FROM users")
+        }
+    `))
+}
+
+test "a law about a table takes one parameter, and says `for table`" {
+    got := verdict(withMain(`
+        type A \{
+            id: Int
+        }
+        law twoThings(a: A, b: A) for table users \{
+            id = \{a.id}
+        }
+    `))
+    assert opens(got, "loader: a law about a table is about the one value a query is run for, so it takes exactly one parameter")
+    missing := verdict(withMain(`
+        type A \{
+            id: Int
+        }
+        law noTable(a: A) for users \{
+            id = \{a.id}
+        }
+    `))
+    assert opens(missing, "loader: a law about a table is written `law noTable(...) for table <name> \{ ... }`")
+}
+
+test "table is a word only after a law's for" {
+    assert proves(withMain(`
+        proc total(): Int \{
+            mut sum := 0
+            for table := 0; table < 3; table++ \{
+                sum = sum + table
+            }
+            return sum
+        }
+    `))
+}
+
+test "a law's filter is SQL or one WHERE block's ifs, and never an or block" {
+    got := verdict(withMain(`
+        type Contact \{
+            id: Int
+            admin: Bool
+        }
+        law choices(contact: Contact) for table chats \{
+            or \{
+                if contact.admin \{ public = 1 }
+                if true \{ owner = \{contact.id} }
+            }
+        }
+    `))
+    assert opens(got, "in `choices`: a law's filter cannot hold an `or \{ }` block, which says nothing about any one row")
+}

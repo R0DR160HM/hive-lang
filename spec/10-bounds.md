@@ -30,6 +30,11 @@ An access is safe when one of these holds:
 * the index is **masked by a literal**, `i & 15`, against a vector whose known
   length is past it: the result is never negative and never above the mask,
   whatever `i` holds — `buckets[hash & 255]` on a `Str[256]`;
+* a **type's law** says it: each `assert` at the top of a type's law proves, for
+  every value of the type, what the same condition would as a guard — so
+  `o.lines[0]` is safe where `Order`'s law asserts `len(o.lines) > 0`, and
+  `p.rooms[p.selected]` where `Picker`'s asserts `p.rooms bounds p.selected`
+  ([19.6.2](19-laws.md#1962-where-it-is-known));
 * the access is a **`for each`**, which never indexes.
 
 Any other **computed** index is not provable and must be bound to a variable and guarded:

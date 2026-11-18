@@ -126,6 +126,9 @@ type Emit {
     fronts: Str[dyn]
     backs: Str[dyn]
     landings: infer.Landing[dyn]
+    // Each type's laws, as `Type<tab>law`: what a decoder checks a value it read
+    // keeps before handing it over.
+    typeLaws: Str[dyn]
 }
 
 // For a test of this pass: a program nothing has checked.
@@ -135,7 +138,7 @@ proc emitModule(m: ast.Module): Emitted {
 
 proc emitChecked(m: ast.Module, landings: infer.Landing[]): Emitted {
     t := types.tableOf(m)
-    mut Emit em = Emit(t, [], 0, ["Nil"], [], [], [], [], [], [], 0, [], [], [], [], false, false, false, -1, [], writes.writtenShapes(m), [], token.nowhere(), "", false, [], [], "", [], [], landings)
+    mut Emit em = Emit(t, [], 0, ["Nil"], [], [], [], [], [], [], 0, [], [], [], [], false, false, false, -1, [], writes.writtenShapes(m), [], token.nowhere(), "", false, [], [], "", [], [], landings, typeLawsIn(t, m.decls))
 
     line(em, "package main")
     line(em, "")
@@ -341,7 +344,7 @@ func goType(ty: types.Ty): Str {
     // A query is the text and the values bound beside it. Its row type is a type
     // and never a value, so nothing of it survives into the Go.
     else if ty is types.Ty.TFragment(_) { return "hive.SqlFragment" }
-    else if ty is types.Ty.TCodec(error) { return "hive.CodecCodec[" + goType(error) + "]" }
+    else if ty is types.Ty.TCodec(error) { return "hive.CodecCodec[" + runtimeErrorGo(error) + "]" }
     else if ty is types.Ty.TLib(module, name) {
         return "hive." + text.capitalise(module) + name
     }
@@ -437,6 +440,17 @@ func elementIn(ty: types.Ty, written: Str, index: Str): Str {
         return written + ".At(" + index + ")"
     }
     return written + "[" + index + "]"
+}
+
+// The runtime's own struct where the program reads one of the library's error
+// unions: what a codec value is typed by in Go, its format being read off it.
+func runtimeErrorGo(ty: types.Ty): Str {
+    if ty is types.Ty.TNamed(name) {
+        if stdlib.isErrorUnion(name) {
+            return stdlib.runtimeErrorType(name)
+        }
+    }
+    return goType(ty)
 }
 
 // The zero value of a type, for a `var` with nothing to initialise it.
@@ -1070,7 +1084,7 @@ proc assignment(em: mut Emit, env: infer.Env, target: ast.Expr, value: ast.Expr)
     ty := infer.typeOf(env, target)
     if target is ast.Expr.Ident(name, _) {
         if isCell(em, name) {
-            return goIdent(name) + " = " + inCell(em, ty, expr(em, env, value, ty))
+            return goIdent(name) + " = " + inCell(em, ty, stored(em, env, target, value, ty))
         }
     }
     if target is ast.Expr.Index(subject, index, _) {
@@ -1081,9 +1095,34 @@ proc assignment(em: mut Emit, env: infer.Env, target: ast.Expr, value: ast.Expr)
     if handsBack(env, em.handsBack, em.mutables, em.cells, target, value) {
         em.handing = pathOf(target)
     }
-    written := expr(em, env, target, types.Ty.TUnknown()) + " = " + expr(em, env, value, ty)
+    written := expr(em, env, target, types.Ty.TUnknown()) + " = " + stored(em, env, target, value, ty)
     em.handing = ""
     return written
+}
+
+proc stored(em: mut Emit, env: infer.Env, target: ast.Expr, value: ast.Expr, ty: types.Ty): Str {
+    written := expr(em, env, value, ty)
+    if assignCopies(env, em.written, em.mutables, target, value, ty) {
+        return cloned(env.table, ty, written)
+    }
+    return written
+}
+
+// A target is always `mut`, so an immutable source copies as in 8.4, bar a field no write reaches.
+func assignCopies(env: infer.Env, written: Str[], mutables: Str[], target: ast.Expr, value: ast.Expr, ty: types.Ty): Bool {
+    if namesStorage(value) == false || types.ownsStorage(env.table, ty) == false {
+        return false
+    }
+    root := rootOf(value)
+    if root != "" && indexOf(mutables, root) is Result.Ok(_) {
+        return false
+    }
+    if target is ast.Expr.Member(subject, field, _) {
+        if infer.typeOf(env, subject) is types.Ty.TNamed(owner) {
+            return writes.mustCopy(env.table, written, owner, field, ty)
+        }
+    }
+    return true
 }
 
 proc emitFor(em: mut Emit, env: infer.Env, init: ast.Stmt, cond: ast.Expr, post: ast.Stmt, body: ast.Block, result: types.Ty): void {
@@ -2639,8 +2678,14 @@ proc reading(em: mut Emit, env: infer.Env, args: ast.Arg[], decoder: Str): Str {
     return withCodec(em, env, "hive.JsonParse(" + source + ", " + decoder + ")", codec)
 }
 
-// `T.decode` and `T.Variant.decode`, with the decoder the codec's format asks for.
+// `T.decode` and `T.Variant.decode`, with the decoder the codec's format asks for,
+// answering with the codec's error union lifted from the runtime's struct.
 proc decoding(em: mut Emit, env: infer.Env, args: ast.Arg[], typeName: Str, variant: Str): Str {
+    answer := types.Ty.TResult(types.Ty.TNamed(typeName), stdlib.codecErrorOf(formatOf(env, argExpr(args, 1))))
+    return lifted(answer, decodingRuntime(em, env, args, typeName, variant))
+}
+
+proc decodingRuntime(em: mut Emit, env: infer.Env, args: ast.Arg[], typeName: Str, variant: Str): Str {
     codec := argExpr(args, 1)
     format := formatOf(env, codec)
     if stdlib.isFlatFormat(format) {
@@ -4466,7 +4511,19 @@ proc emitRow(em: mut Emit, name: Str): void {
             append(names, quoted(f.name))
             i = i + 1
         }
-        line(em, "return " + goIdent(name) + "\{" + join(inits, ", ") + "}, nil")
+        rowLaws := lawsOfType(em, name)
+        if len(rowLaws) == 0 {
+            line(em, "return " + goIdent(name) + "\{" + join(inits, ", ") + "}, nil")
+        } else {
+            line(em, "kept := " + goIdent(name) + "\{" + join(inits, ", ") + "}")
+            for each l in rowLaws {
+                said := "a row does not keep `" + ast.lawShown(types.shownName(l)) + "`: "
+                open(em, "if why := " + goIdent(l) + "(kept); why != \"\" \{")
+                line(em, "return " + goIdent(name) + "\{}, hive.SqlSqlError\{Reason: \"Broken\", Message: " + quoted(said) + " + why + " + quoted(" is false") + "}")
+                close(em, "}")
+            }
+            line(em, "return kept, nil")
+        }
         close(em, "}")
         blank(em)
         line(em, "var " + rowFieldsName(name) + " = []string\{" + join(names, ", ") + "}")
@@ -4686,7 +4743,7 @@ proc emitVariantDecoder(em: mut Emit, name: Str, variant: Str): void {
     bailOut(em, "nil")
     if types.findVariant(em.table, name, variant) is Result.Ok(fields) {
         decodeFields(em, fields, "path", "nil")
-        line(em, "return " + goVariant(name, variant) + "\{" + fieldInits(fields) + "}, nil")
+        returnKept(em, name, goVariant(name, variant) + "\{" + fieldInits(fields) + "}", "nil", "path", "hive.JsonJsonError")
     }
     close(em, "}")
 }
@@ -4700,7 +4757,7 @@ proc emitDecoder(em: mut Emit, name: Str, info: types.TypeInfo): void {
         line(em, "obj, jerr := hive.JsonObject(v, path)")
         bailOut(em, zero)
         decodeFields(em, info.shared, "path", zero)
-        line(em, "return " + goIdent(name) + "\{" + fieldInits(info.shared) + "}, nil")
+        returnKept(em, name, goIdent(name) + "\{" + fieldInits(info.shared) + "}", zero, "path", "hive.JsonJsonError")
         close(em, "}")
         return
     }
@@ -4710,7 +4767,7 @@ proc emitDecoder(em: mut Emit, name: Str, info: types.TypeInfo): void {
     fieldless := firstFieldless(info)
     if fieldless != "" && len(info.shared) == 0 {
         open(em, "if v.Kind == 'n' \{")
-        line(em, "return " + goVariant(name, fieldless) + "\{}, nil")
+        returnKept(em, name, goVariant(name, fieldless) + "\{}", "nil", "path", "hive.JsonJsonError")
         close(em, "}")
     }
     line(em, "key, inner, jerr := hive.JsonVariant(v, path)")
@@ -4724,10 +4781,10 @@ proc emitDecoder(em: mut Emit, name: Str, info: types.TypeInfo): void {
         bailOut(em, "nil")
         fields := withShared(variant.fields, info.shared)
         decodeFields(em, fields, here, "nil")
-        line(em, "return " + goVariant(name, variant.name) + "\{" + fieldInits(fields) + "}, nil")
+        returnKept(em, name, goVariant(name, variant.name) + "\{" + fieldInits(fields) + "}", "nil", "path", "hive.JsonJsonError")
         close(em, "}")
     }
-    line(em, "return nil, &hive.JsonJsonError\{Path: path, Expected: " + quoted("one of " + join(names, ", ")) + ", Found: hive.JsonEncodeStr(key)}")
+    line(em, "return nil, &hive.JsonJsonError\{Reason: \"Mismatch\", Path: path, Expected: " + quoted("one of " + join(names, ", ")) + ", Found: hive.JsonEncodeStr(key)}")
     close(em, "}")
 }
 
@@ -4751,6 +4808,55 @@ func firstFieldless(info: types.TypeInfo): Str {
         }
     }
     return ""
+}
+
+// Each type's laws, as `Type<tab>law`, read off the checks the law pass left in
+// the program for them.
+func typeLawsIn(t: types.Table, decls: ast.Decl[]): Str[dyn] {
+    mut Str[dyn] out = []
+    for each d in decls {
+        if d is ast.Decl.CallableDecl(kind, name, params, _, _, _) {
+            if kind is ast.CallableKind.TypeLawKind {
+                for each p in params {
+                    if types.resolve(t, p.declared) is types.Ty.TNamed(owner) {
+                        append(out, owner + "\t" + name)
+                    }
+                }
+            }
+        }
+    }
+    return out
+}
+
+func lawsOfType(em: Emit, name: Str): Str[dyn] {
+    mut Str[dyn] out = []
+    for each entry in em.typeLaws {
+        if text.startsWith(entry, name + "\t") {
+            cs := text.chars(entry)
+            append(out, text.span(cs, len(name) + 1, len(cs) - 1))
+        }
+    }
+    return out
+}
+
+// `return value, nil` — once the value is seen to keep each of its type's laws.
+// Nothing the compiler saw built a value that was read, so this is the one place
+// a law is checked as the program runs, and a value breaking one is refused as
+// `Broken`, the way a value of the wrong shape is refused as `Mismatch`.
+proc returnKept(em: mut Emit, name: Str, value: Str, zero: Str, path: Str, errorType: Str): void {
+    laws := lawsOfType(em, name)
+    if len(laws) == 0 {
+        line(em, "return " + value + ", nil")
+        return
+    }
+    line(em, "kept := " + value)
+    for each l in laws {
+        expected := "a `" + types.shownName(name) + "` keeping `" + ast.lawShown(types.shownName(l)) + "`"
+        open(em, "if why := " + goIdent(l) + "(kept); why != \"\" \{")
+        line(em, "return " + zero + ", &" + errorType + "\{Reason: \"Broken\", Path: " + path + ", Expected: " + quoted(expected) + ", Found: " + quoted("one where ") + " + why + " + quoted(" is false") + "}")
+        close(em, "}")
+    }
+    line(em, "return kept, nil")
 }
 
 proc bailOut(em: mut Emit, zero: Str): void {
@@ -4876,7 +4982,7 @@ proc decoderRef(em: mut Emit, ty: types.Ty): Str {
         }
         return "func(v hive.JsonValue, p string) (" + goType(ty) + ", *hive.JsonJsonError) \{ return " + call + " }"
     }
-    return "func(v hive.JsonValue, p string) (" + goType(ty) + ", *hive.JsonJsonError) \{ var zero " + goType(ty) + "; return zero, &hive.JsonJsonError\{Path: p, Expected: " + quoted("a type JSON can carry") + ", Found: " + quoted(types.show(ty)) + "} }"
+    return "func(v hive.JsonValue, p string) (" + goType(ty) + ", *hive.JsonJsonError) \{ var zero " + goType(ty) + "; return zero, &hive.JsonJsonError\{Reason: \"Mismatch\", Path: p, Expected: " + quoted("a type JSON can carry") + ", Found: " + quoted(types.show(ty)) + "} }"
 }
 
 // --- Encoding ----------------------------------------------------------------
@@ -5123,7 +5229,7 @@ proc emitFlatDecoder(em: mut Emit, format: Str, name: Str, fields: ast.Field[]):
     if format == "term" {
         emitTermShape(em, name, fields)
     }
-    open(em, "func " + flatDecoderName(format, name) + "(q []" + prefix + "Pair) (" + goType(whole) + ", *" + goType(stdlib.codecErrorOf(format)) + ") \{")
+    open(em, "func " + flatDecoderName(format, name) + "(q []" + prefix + "Pair) (" + goType(whole) + ", *" + stdlib.codecRuntimeError(format) + ") \{")
     line(em, "_ = q")
     for each f in fields {
         ty := types.resolve(em.table, f.declared)
@@ -5156,7 +5262,7 @@ proc emitFlatDecoder(em: mut Emit, format: Str, name: Str, fields: ast.Field[]):
             close(em, "}")
         }
     }
-    line(em, "return " + goIdent(name) + "\{" + fieldInits(fields) + "}, nil")
+    returnKept(em, name, goIdent(name) + "\{" + fieldInits(fields) + "}", zero, quoted("$"), stdlib.codecRuntimeError(format))
     close(em, "}")
 }
 
@@ -5222,9 +5328,9 @@ func flatReader(format: Str, ty: types.Ty): Str {
     if format == "term" {
         source = "s hive.TermFlagPair"
     }
-    errorType := goType(stdlib.codecErrorOf(format))
+    errorType := stdlib.codecRuntimeError(format)
     head := "func(" + source + ", p string) (" + goType(ty) + ", *" + errorType + ") \{ "
-    refused := "return 0, &" + errorType + "\{Path: p, Expected: " + quoted(types.show(ty))
+    refused := "return 0, &" + errorType + "\{Reason: \"Mismatch\", Path: p, Expected: " + quoted(types.show(ty))
     if ty is types.Ty.TFloat32 {
         return head + "f, err := " + prefix + "Float(s, p); if err != nil \{ return 0, err }; if v, ok := hive.FitsFloat32(f); ok \{ return v, nil }; " + refused + ", Found: hive.FloatText(f)} }"
     }
@@ -5329,7 +5435,7 @@ proc runtimeLibraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, wr
     }
     // SQL assembled at run time has a shape nothing can know, so it comes back
     // as a Table, header row and all.
-    if module == "sql" && name == "raw" {
+    if module == "sql" && name == "unsafe" {
         return "hive.SqlQuery(" + expr(em, env, argExpr(args, 0), types.Ty.TUnknown()) + ", " + expr(em, env, argExpr(args, 1), types.Ty.TStr()) + ")"
     }
     if module == "sql" && name == "run" {
@@ -5461,7 +5567,7 @@ proc emitCheckedTests(m: ast.Module, atoms: Str[], codecs: Str[], rows: Str[], m
     t := types.tableOf(m)
     // What `main.go` already wrote or asked for is seeded rather than repeated:
     // the two files are one Go package.
-    mut Emit em = Emit(t, [], 0, copiedNames(atoms), copiedNames(modules), [], [], lentFuncs(t, m.decls), copiedNames(rows), copiedNames(codecs), 0, [], [], [], [], true, false, false, -1, [], writes.writtenShapes(m), [], token.nowhere(), "", false, [], handingBackFuncs(t, m.decls), "", [], [], landings)
+    mut Emit em = Emit(t, [], 0, copiedNames(atoms), copiedNames(modules), [], [], lentFuncs(t, m.decls), copiedNames(rows), copiedNames(codecs), 0, [], [], [], [], true, false, false, -1, [], writes.writtenShapes(m), [], token.nowhere(), "", false, [], handingBackFuncs(t, m.decls), "", [], [], landings, typeLawsIn(t, m.decls))
     written := len(codecs)
     mapped := len(rows)
     mut found := false

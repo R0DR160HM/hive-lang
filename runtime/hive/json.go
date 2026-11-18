@@ -19,6 +19,9 @@ func JsonCodec() CodecCodec[JsonJsonError] { return CodecCodec[JsonJsonError]{} 
 // JsonJsonError says why a document didn't hold what was asked of it: the
 // path that failed, what was expected there, and what was found.
 type JsonJsonError struct {
+	// The variant of the program's union: `Mismatch`, or `Broken` where the
+	// value was read whole but does not keep its type's law.
+	Reason   string
 	Path     string
 	Expected string
 	Found    string
@@ -125,10 +128,10 @@ func JsonParse[T any](text string, dec func(JsonValue, string) (T, *JsonJsonErro
 	d.UseNumber()
 	v, err := parseJsonValue(d)
 	if err != nil {
-		return Err[T, JsonJsonError](JsonJsonError{Path: "$", Expected: "valid JSON", Found: err.Error()})
+		return Err[T, JsonJsonError](JsonJsonError{Reason: "Mismatch", Path: "$", Expected: "valid JSON", Found: err.Error()})
 	}
 	if _, err := d.Token(); err != io.EOF {
-		return Err[T, JsonJsonError](JsonJsonError{Path: "$", Expected: "the end of the document", Found: "more text after it"})
+		return Err[T, JsonJsonError](JsonJsonError{Reason: "Mismatch", Path: "$", Expected: "the end of the document", Found: "more text after it"})
 	}
 	out, jerr := dec(v, "$")
 	if jerr != nil {
@@ -141,7 +144,7 @@ func JsonStr(v JsonValue, path string) (string, *JsonJsonError) {
 	if v.Kind == 's' {
 		return v.Str, nil
 	}
-	return "", &JsonJsonError{Path: path, Expected: "Str", Found: jsonKindName(v)}
+	return "", &JsonJsonError{Reason: "Mismatch", Path: path, Expected: "Str", Found: jsonKindName(v)}
 }
 
 // A field read into a Secret that did not decode: what was wanted and
@@ -161,7 +164,11 @@ func JsonSecretError(e *JsonJsonError, v JsonValue) *JsonJsonError {
 	case 'a':
 		found = "an array"
 	}
-	return &JsonJsonError{Path: e.Path, Expected: e.Expected, Found: found}
+	if e.Reason == "Broken" {
+		// What a broken law says is the claim that failed, never the value.
+		return e
+	}
+	return &JsonJsonError{Reason: e.Reason, Path: e.Path, Expected: e.Expected, Found: found}
 }
 
 func JsonInt(v JsonValue, path string) (int, *JsonJsonError) {
@@ -170,7 +177,7 @@ func JsonInt(v JsonValue, path string) (int, *JsonJsonError) {
 			return i, nil
 		}
 	}
-	return 0, &JsonJsonError{Path: path, Expected: "Int", Found: jsonKindName(v)}
+	return 0, &JsonJsonError{Reason: "Mismatch", Path: path, Expected: "Int", Found: jsonKindName(v)}
 }
 
 func JsonSized[T Whole](v JsonValue, path string, signed bool, bits int, name string) (T, *JsonJsonError) {
@@ -183,7 +190,7 @@ func JsonSized[T Whole](v JsonValue, path string, signed bool, bits int, name st
 			return T(n), nil
 		}
 	}
-	return 0, &JsonJsonError{Path: path, Expected: name, Found: jsonKindName(v)}
+	return 0, &JsonJsonError{Reason: "Mismatch", Path: path, Expected: name, Found: jsonKindName(v)}
 }
 
 func JsonFloat32(v JsonValue, path string) (float32, *JsonJsonError) {
@@ -192,7 +199,7 @@ func JsonFloat32(v JsonValue, path string) (float32, *JsonJsonError) {
 			return float32(f), nil
 		}
 	}
-	return 0, &JsonJsonError{Path: path, Expected: "Float32", Found: jsonKindName(v)}
+	return 0, &JsonJsonError{Reason: "Mismatch", Path: path, Expected: "Float32", Found: jsonKindName(v)}
 }
 
 func JsonFloat(v JsonValue, path string) (float64, *JsonJsonError) {
@@ -201,14 +208,14 @@ func JsonFloat(v JsonValue, path string) (float64, *JsonJsonError) {
 			return f, nil
 		}
 	}
-	return 0, &JsonJsonError{Path: path, Expected: "Float", Found: jsonKindName(v)}
+	return 0, &JsonJsonError{Reason: "Mismatch", Path: path, Expected: "Float", Found: jsonKindName(v)}
 }
 
 func JsonBool(v JsonValue, path string) (bool, *JsonJsonError) {
 	if v.Kind == 'b' {
 		return v.Bool, nil
 	}
-	return false, &JsonJsonError{Path: path, Expected: "Bool", Found: jsonKindName(v)}
+	return false, &JsonJsonError{Reason: "Mismatch", Path: path, Expected: "Bool", Found: jsonKindName(v)}
 }
 
 // JsonAtom decodes a JSON string holding an atom's visual form.
@@ -220,14 +227,14 @@ func JsonAtom(v JsonValue, path string) (Atom, *JsonJsonError) {
 			}
 		}
 	}
-	return 0, &JsonJsonError{Path: path, Expected: "a known atom", Found: jsonKindName(v)}
+	return 0, &JsonJsonError{Reason: "Mismatch", Path: path, Expected: "a known atom", Found: jsonKindName(v)}
 }
 
 func JsonObject(v JsonValue, path string) ([]JsonMember, *JsonJsonError) {
 	if v.Kind == 'o' {
 		return v.Obj, nil
 	}
-	return nil, &JsonJsonError{Path: path, Expected: "an object", Found: jsonKindName(v)}
+	return nil, &JsonJsonError{Reason: "Mismatch", Path: path, Expected: "an object", Found: jsonKindName(v)}
 }
 
 func JsonField(obj []JsonMember, key string, path string) (JsonValue, *JsonJsonError) {
@@ -236,7 +243,7 @@ func JsonField(obj []JsonMember, key string, path string) (JsonValue, *JsonJsonE
 			return m.Value, nil
 		}
 	}
-	return JsonValue{}, &JsonJsonError{Path: path + "." + key, Expected: "a value", Found: "nothing"}
+	return JsonValue{}, &JsonJsonError{Reason: "Mismatch", Path: path + "." + key, Expected: "a value", Found: "nothing"}
 }
 
 // JsonLook is JsonField for a field with somewhere to fall back to: a key
@@ -256,12 +263,12 @@ func JsonVariant(v JsonValue, path string) (string, JsonValue, *JsonJsonError) {
 	if v.Kind == 'o' && len(v.Obj) == 1 {
 		return v.Obj[0].Key, v.Obj[0].Value, nil
 	}
-	return "", JsonValue{}, &JsonJsonError{Path: path, Expected: "an object with a single variant key", Found: jsonKindName(v)}
+	return "", JsonValue{}, &JsonJsonError{Reason: "Mismatch", Path: path, Expected: "an object with a single variant key", Found: jsonKindName(v)}
 }
 
 func JsonVec[T any](v JsonValue, path string, elem func(JsonValue, string) (T, *JsonJsonError)) ([]T, *JsonJsonError) {
 	if v.Kind != 'a' {
-		return nil, &JsonJsonError{Path: path, Expected: "a vector", Found: jsonKindName(v)}
+		return nil, &JsonJsonError{Reason: "Mismatch", Path: path, Expected: "a vector", Found: jsonKindName(v)}
 	}
 	out := make([]T, 0, len(v.Arr))
 	for i, item := range v.Arr {
@@ -277,7 +284,7 @@ func JsonVec[T any](v JsonValue, path string, elem func(JsonValue, string) (T, *
 // JsonVecN also enforces the static length of e.g. Str[3].
 func JsonVecN[T any](v JsonValue, path string, n int, elem func(JsonValue, string) (T, *JsonJsonError)) ([]T, *JsonJsonError) {
 	if v.Kind != 'a' || len(v.Arr) != n {
-		return nil, &JsonJsonError{Path: path, Expected: "a vector of length " + strconv.Itoa(n), Found: jsonKindName(v)}
+		return nil, &JsonJsonError{Reason: "Mismatch", Path: path, Expected: "a vector of length " + strconv.Itoa(n), Found: jsonKindName(v)}
 	}
 	return JsonVec(v, path, elem)
 }

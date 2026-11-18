@@ -175,7 +175,7 @@ could otherwise observe each other's writes
 ### Table
 
 `Table` is an alias for `Str[dyn][dyn]` — a vector of rows of cells. It is what
-`hive.file.csv` yields, what `hive.sql.raw` answers with, and what
+`hive.file.csv` yields, what `hive.sql.unsafe` answers with, and what
 `hive.map.toTable` builds.
 
 ## 3.4 Declared types

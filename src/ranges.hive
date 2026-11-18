@@ -39,17 +39,119 @@ type Proofs {
     // search and its match are two statements, so which vector the answer
     // indexes has to survive the gap between them.
     searches: Str[dyn]
+    // What the types' laws prove, as `Type<tab>key` with the value the law is
+    // about written `@`: every value keeps its type's laws, so what their
+    // `assert`s would prove as guards is known wherever one is read.
+    lawFacts: Str[dyn]
+    // The type whose law is being walked, which is the one type whose laws that
+    // body may not lean on.
+    lawOwner: Str
 }
 
 // Prove every access in a flattened program, or say which one cannot be.
 proc checkModule(m: ast.Module): diag.Diagnostic[dyn] {
     t := types.tableOf(m)
-    mut Proofs bo = Proofs(t, [], "", token.nowhere(), [], [], [], [])
+    mut Proofs bo = Proofs(t, [], "", token.nowhere(), [], [], [], [], [], "")
     env := infer.newEnv(t)
+    for each d in m.decls {
+        for each fact in lawFactsOf(t, env, d) {
+            append(bo.lawFacts, fact)
+        }
+    }
     for each d in m.decls {
         checkDecl(bo, env, d)
     }
     return bo.errors
+}
+
+// What a type's law proves about the value it is about: each `assert` at the top
+// of its body, learned as a guard is, with the value written `@`.
+proc lawFactsOf(t: types.Table, env: infer.Env, d: ast.Decl): Str[dyn] {
+    mut Str[dyn] out = []
+    if d is ast.Decl.CallableDecl(kind, _, params, _, body, _) {
+        if kind is ast.CallableKind.TypeLawKind {
+            for each p in params {
+                if types.resolve(t, p.declared) is types.Ty.TNamed(owner) {
+                    mut Proofs asserted = Proofs(t, [], "", token.nowhere(), [], [], [], [], [], owner)
+                    inner := infer.boundParams(env, params, 0)
+                    for each s in body.stmts {
+                        if s is ast.Stmt.AssertStmt(condition, _) {
+                            learn(asserted, inner, condition)
+                        }
+                    }
+                    for each key in asserted.proved {
+                        about := rerooted(key, p.name)
+                        if aboutTheValue(about) {
+                            append(out, owner + "\t" + about)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return out
+}
+
+// Whether every side of a law's key is the value it is about, or a literal.
+func aboutTheValue(key: Str): Bool {
+    for each side in split(key, "|") {
+        if side != "+" && side != "@" && text.startsWith(side, "@.") == false && text.startsWith(side, "@[") == false && isNumeral(side) == false {
+            return false
+        }
+    }
+    return true
+}
+
+func isNumeral(s: Str): Bool {
+    if s == "" {
+        return false
+    }
+    for each c in text.chars(s) {
+        if text.isDigit(c) == false {
+            return false
+        }
+    }
+    return true
+}
+
+// `key`, with each side that is `prefix` or a path under it rewritten to start
+// with `@` instead.
+func rerooted(key: Str, prefix: Str): Str {
+    mut Str[dyn] sides = []
+    for each side in split(key, "|") {
+        if side == prefix {
+            append(sides, "@")
+        } else if text.startsWith(side, prefix + ".") || text.startsWith(side, prefix + "[") {
+            cs := text.chars(side)
+            append(sides, "@" + text.span(cs, len(prefix), len(cs) - 1))
+        } else {
+            append(sides, side)
+        }
+    }
+    return join(sides, "|")
+}
+
+// Whether some value along `base` — `base` itself, or what holds it — has a type
+// whose law says `key`.
+func lawSays(bo: Proofs, env: infer.Env, base: ast.Expr, key: Str): Bool {
+    if len(bo.lawFacts) == 0 || key == "" {
+        return false
+    }
+    prefix := pathKey(base)
+    if prefix != "" {
+        if infer.typeOf(env, base) is types.Ty.TNamed(name) {
+            if name != bo.lawOwner && indexOf(bo.lawFacts, name + "\t" + rerooted(key, prefix)) is Result.Ok(_) {
+                return true
+            }
+        }
+    }
+    if base is ast.Expr.Member(inner, _, _) {
+        return lawSays(bo, env, inner, key)
+    }
+    if base is ast.Expr.Index(inner, _, _) {
+        return lawSays(bo, env, inner, key)
+    }
+    return false
 }
 
 proc report(bo: mut Proofs, message: Str): void {
@@ -59,9 +161,17 @@ proc report(bo: mut Proofs, message: Str): void {
 // --- Declarations ------------------------------------------------------------
 
 proc checkDecl(bo: mut Proofs, env: infer.Env, d: ast.Decl): void {
-    if d is ast.Decl.CallableDecl(_, name, params, _, body, line) {
+    if d is ast.Decl.CallableDecl(kind, name, params, _, body, line) {
         bo.inside = name
         bo.at = d.at
+        bo.lawOwner = ""
+        if kind is ast.CallableKind.TypeLawKind {
+            for each p in params {
+                if types.resolve(bo.table, p.declared) is types.Ty.TNamed(owner) {
+                    bo.lawOwner = owner
+                }
+            }
+        }
         bo.proved = []
         bo.lost = []
         bo.promised = []
@@ -75,6 +185,7 @@ proc checkDecl(bo: mut Proofs, env: infer.Env, d: ast.Decl): void {
     } else if d is ast.Decl.QueryDecl(name, params, _, sql, line) {
         bo.inside = name
         bo.at = d.at
+        bo.lawOwner = ""
         bo.proved = []
         bo.lost = []
         bo.promised = []
@@ -88,6 +199,7 @@ proc checkDecl(bo: mut Proofs, env: infer.Env, d: ast.Decl): void {
     } else if d is ast.Decl.TestDecl(title, body, line) {
         bo.inside = "\"{title}\""
         bo.at = d.at
+        bo.lawOwner = ""
         bo.proved = []
         bo.lost = []
         bo.promised = []
@@ -379,7 +491,7 @@ proc proveIndex(bo: mut Proofs, env: infer.Env, vector: ast.Expr, index: ast.Exp
         return
     }
     key := pathKey(index)
-    if key != "" && (indexOf(bo.proved, "+|" + key) is Result.Ok(_) || types.isUnsigned(infer.typeOf(env, index))) {
+    if key != "" && (indexOf(bo.proved, "+|" + key) is Result.Ok(_) || types.isUnsigned(infer.typeOf(env, index)) || lawSays(bo, env, index, "+|" + key)) {
         prove(bo, vector, index)
     }
 }
@@ -1047,6 +1159,10 @@ proc checkBound(bo: mut Proofs, env: infer.Env, subject: ast.Expr, bound: ast.Ex
 func provable(bo: Proofs, env: infer.Env, subject: ast.Expr, index: ast.Expr): Bool {
     // A guard in scope, or an index that came from `indexOf`.
     if isProved(bo, subject, index) {
+        return true
+    }
+    // What a law of the type holding the vector says.
+    if lawSays(bo, env, subject, pairKey(subject, index)) {
         return true
     }
     // A literal index into a vector whose length is known is decided outright.
