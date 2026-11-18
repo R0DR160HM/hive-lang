@@ -2,45 +2,47 @@
 
 Twenty-seven programs, and between them every feature the language has. Each one
 compiles and runs on the compiler in [`../src`](../src) — that is what `./run`
-checks, and what makes these examples rather than illustrations.
+checks, and what makes these examples rather than illustrations. They are in the
+order someone learning the language would read them: the language itself first,
+then the standard library, then programs built out of all of it.
 
 ```
 ./examples/run              all of them
-./examples/run 05 11        only the ones whose directory starts like that
+./examples/run 03 15        only the ones whose directory starts like that
 
 hive run  examples/02-types/types.hive
-hive test examples/15-testing/cart.test.hive
+hive test examples/11-testing/cart.test.hive
 ```
 
 | | | |
 | --- | --- | --- |
 | 01 | [basic-io](01-basic-io) | `echo`, a type with variants, and a CSV read with `hive.file.csv` |
 | 02 | [types](02-types) | every type there is: strings, vectors, atoms, numbers, bools, `mut`, and a `query` |
-| 03 | [networking](03-networking) | an HTTP server and client, raw TCP, WebSockets, and HTTP and WebSockets on one port |
-| 04 | [crypto](04-crypto) | hashing, HMAC, base64, password encryption, and JWTs |
-| 05 | [sql](05-sql) | `query` declarations, typed rows, optional filters, and `hive.sql.unsafe` |
-| 06 | [value-semantics](06-value-semantics) | why two names never observe each other's writes, and the one case where they do |
-| 07 | [pattern-matching](07-pattern-matching) | the four kinds of pattern, and binding through `&&` |
-| 08 | [first-class-functions](08-first-class-functions) | bare references, partial application, the vector walks, shadowing a builtin |
-| 09 | [online-cache](09-online-cache) | an HTTP cache over a cluster: `hive.net`, `hive.sql` and `hive.syslink` at once |
-| 10 | [concurrency](10-concurrency) | all five spellings of a call, and what a thread does to `mut` |
-| 11 | [modules](11-modules) | a program in four files, one of them Go |
-| 12 | [files-and-spreadsheets](12-files-and-spreadsheets) | `hive.file.xlsx` and `hive.file.ods`, and the whole of `hive.file` |
-| 13 | [distributed-actors](13-distributed-actors) | two nodes, one statement to reach either, and a crash that stays local |
-| 14 | [generics](14-generics) | type variables, monomorphization, and generic types |
-| 15 | [testing](15-testing) | `test` declarations, `assert` with both sides, and coverage |
-| 16 | [password-vault](16-password-vault) | a vault sealed with `hive.crypto`, read with a hidden prompt |
-| 17 | [chat](17-chat) | a window, a mailbox, and two nodes talking |
-| 18 | [maps](18-maps) | `hive.map`: order, values, tables, composite keys |
-| 19 | [multiplayer-fps](19-multiplayer-fps) | a 3D scene, sixty frames a second, and a client and a server over a websocket |
-| 20 | [advent-2025-day-2](20-advent-2025-day-2) | Advent of Code, and `assert` as a program's own check |
-| 21 | [advent-2025-day-3](21-advent-2025-day-3) | day 3, where every index is proved in range |
-| 22 | [formula-kart](22-formula-kart) | a ten-car race on a circuit rolled from a number, with a landscape round it, a server, a map and a dial |
-| 23 | [every-widget](23-every-widget) | every `hive.ui` widget but the 3D ones, with every attribute and event among them, in one window |
-| 24 | [streaming-answer](24-streaming-answer) | a language model's answer read as it arrives, and a looping one stopped by hanging up |
-| 25 | [programs-alongside](25-programs-alongside) | a program started, talked to, and stopped with everything it started — the program being itself |
-| 26 | [pictures](26-pictures) | Hive's logo read from inside the executable, decoded, scaled and drawn in characters |
-| 27 | [laws](27-laws) | a chat app with a `law` of each kind: a read message never goes back, proved for every message and receipt while the program compiles; every message has a body and goes to someone else, kept wherever one is written; and a contact reads only their own chats, in every query on the table |
+| 03 | [pattern-matching](03-pattern-matching) | the four kinds of pattern, and binding through `&&` |
+| 04 | [value-semantics](04-value-semantics) | why two names never observe each other's writes, and the one case where they do |
+| 05 | [first-class-functions](05-first-class-functions) | bare references, partial application, the vector walks, shadowing a builtin |
+| 06 | [generics](06-generics) | type variables, monomorphization, and generic types |
+| 07 | [maps](07-maps) | `hive.map`: order, values, tables, composite keys |
+| 08 | [advent-2025-day-2](08-advent-2025-day-2) | Advent of Code, and `assert` as a program's own check |
+| 09 | [advent-2025-day-3](09-advent-2025-day-3) | day 3, where every index is proved in range |
+| 10 | [modules](10-modules) | a program in four files, one of them Go |
+| 11 | [testing](11-testing) | `test` declarations, `assert` with both sides, and coverage |
+| 12 | [concurrency](12-concurrency) | all five spellings of a call, and what a thread does to `mut` |
+| 13 | [files-and-spreadsheets](13-files-and-spreadsheets) | `hive.file.xlsx` and `hive.file.ods`, and the whole of `hive.file` |
+| 14 | [sql](14-sql) | `query` declarations, typed rows, optional filters, and `hive.sql.unsafe` |
+| 15 | [laws](15-laws) | a chat app with a `law` of each kind: a read message never goes back, proved for every message and receipt while the program compiles; every message has a body and goes to someone else, kept wherever one is written; and a contact reads only their own chats, in every query on the table |
+| 16 | [crypto](16-crypto) | hashing, HMAC, base64, password encryption, and JWTs |
+| 17 | [password-vault](17-password-vault) | a vault sealed with `hive.crypto`, read with a hidden prompt |
+| 18 | [pictures](18-pictures) | Hive's logo read from inside the executable, decoded, scaled and drawn in characters |
+| 19 | [programs-alongside](19-programs-alongside) | a program started, talked to, and stopped with everything it started — the program being itself |
+| 20 | [networking](20-networking) | an HTTP server and client, raw TCP, WebSockets, and HTTP and WebSockets on one port |
+| 21 | [streaming-answer](21-streaming-answer) | a language model's answer read as it arrives, and a looping one stopped by hanging up |
+| 22 | [distributed-actors](22-distributed-actors) | two nodes, one statement to reach either, and a crash that stays local |
+| 23 | [online-cache](23-online-cache) | an HTTP cache over a cluster: `hive.net`, `hive.sql` and `hive.syslink` at once |
+| 24 | [every-widget](24-every-widget) | every `hive.ui` widget but the 3D ones, with every attribute and event among them, in one window |
+| 25 | [chat](25-chat) | a window, a mailbox, and two nodes talking |
+| 26 | [multiplayer-fps](26-multiplayer-fps) | a 3D scene, sixty frames a second, and a client and a server over a websocket |
+| 27 | [formula-kart](27-formula-kart) | a ten-car race on a circuit rolled from a number, with a landscape round it, a server, a map and a dial |
 
 ## What `./run` does with them
 
@@ -50,10 +52,10 @@ prints. `./run` compares the two, so an example that stops being true stops
 passing.
 
 Ten of them are **compiled but not run**, and the reason is the same in each
-case: they do not finish. A server blocks forever (03, and the two games' own
-servers in 19 and 22), a window waits for somebody to close it (17, 23, and the
-two games' clients), a distributed pair waits for the other node (09, 13), and a
-vault waits for somebody to type a password (16). Compiling one is what can be
+case: they do not finish. A server blocks forever (20, and the two games' own
+servers in 26 and 27), a window waits for somebody to close it (24, 25, and the
+two games' clients), a distributed pair waits for the other node (22, 23), and a
+vault waits for somebody to type a password (17). Compiling one is what can be
 checked without a person — and seven of those ten carry test suites that exercise
 the rest, across the cache, the vault, the chat, the shooter's two halves, the
 race and the widgets.
