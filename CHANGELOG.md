@@ -12,6 +12,10 @@
 * **`law` is a keyword**, so a name spelled `law` no longer compiles.
 * **`axiom` is reserved**: any use of it is a compile error, so a later version can give it a meaning without breaking a name.
 
+### Fixes
+
+* **An assignment never lets a write through one name reach another**: `rec.f = xs` copies an immutable `xs`, as a binding does.
+
 ## v0.3.9
 
 ### Tooling

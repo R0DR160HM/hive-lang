@@ -115,6 +115,7 @@ different route, or does not quite do it.
   specification allows an alias in a mixed pair when it is *provably*
   indistinguishable; this compiler does not attempt that proof for a **binding**,
   so it copies where a cleverer one would not. That is slower and never wrong.
+  An assignment from an immutable source is a mixed pair and copies the same way.
 
   It does attempt it one level down, for the fields of a copy
   ([8.5](08-mutability-and-values.md#85-what-a-copy-copies)) and for what a

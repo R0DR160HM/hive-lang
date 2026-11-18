@@ -124,6 +124,11 @@ function call or a constructed value, where a returned or embedded slice might
 alias its backing array, it is treated as possibly-mutated and the binding
 copies.
 
+An **assignment** is classified the same way, and its target is always `mut`:
+`v = xs`, `v[i] = xs` and `rec.f = xs` copy what an immutable `xs` names,
+unless it lands in a field that a copy of the record would share
+([8.5](#85-what-a-copy-copies)).
+
 An in-place `sort` counts as a write, so it forces the copy too:
 
 ```hive
