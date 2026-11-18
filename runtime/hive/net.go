@@ -1057,6 +1057,9 @@ func NetUrlEncode(s string) string {
 }
 
 type NetQueryParamsError struct {
+	// The variant of the program's union: `Mismatch`, or `Broken` where the
+	// value was read whole but does not keep its type's law.
+	Reason   string
 	Path     string
 	Expected string
 	Found    string
@@ -1087,7 +1090,7 @@ func NetQueryParse[T any](text string, dec func([]NetQueryPair) (T, *NetQueryPar
 		key, kerr := url.QueryUnescape(rawKey)
 		value, verr := url.QueryUnescape(rawValue)
 		if kerr != nil || verr != nil {
-			return Err[T, NetQueryParamsError](NetQueryParamsError{Path: "$", Expected: "a query string", Found: strconv.Quote(part)})
+			return Err[T, NetQueryParamsError](NetQueryParamsError{Reason: "Mismatch", Path: "$", Expected: "a query string", Found: strconv.Quote(part)})
 		}
 		pairs = append(pairs, NetQueryPair{Key: key, Value: value})
 	}
@@ -1124,10 +1127,10 @@ func NetQueryOne[T any](q []NetQueryPair, key string, read func(string, string) 
 	path := "$." + key
 	values := netQueryValues(q, key)
 	if len(values) == 0 {
-		return zero, &NetQueryParamsError{Path: path, Expected: "a value", Found: "nothing"}
+		return zero, &NetQueryParamsError{Reason: "Mismatch", Path: path, Expected: "a value", Found: "nothing"}
 	}
 	if len(values) > 1 {
-		return zero, &NetQueryParamsError{Path: path, Expected: "one value", Found: netQueryCount(len(values))}
+		return zero, &NetQueryParamsError{Reason: "Mismatch", Path: path, Expected: "one value", Found: netQueryCount(len(values))}
 	}
 	return read(values[0], path)
 }
@@ -1137,7 +1140,7 @@ func NetQueryVec[T any](q []NetQueryPair, key string, n int, read func(string, s
 	path := "$." + key
 	values := netQueryValues(q, key)
 	if n >= 0 && len(values) != n {
-		return nil, &NetQueryParamsError{Path: path, Expected: netQueryCount(n), Found: netQueryCount(len(values))}
+		return nil, &NetQueryParamsError{Reason: "Mismatch", Path: path, Expected: netQueryCount(n), Found: netQueryCount(len(values))}
 	}
 	out := make([]T, 0, len(values))
 	for i, v := range values {
@@ -1157,7 +1160,7 @@ func NetQueryStr(s string, path string) (string, *NetQueryParamsError) {
 func NetQueryInt(s string, path string) (int, *NetQueryParamsError) {
 	n, err := strconv.Atoi(s)
 	if err != nil {
-		return 0, &NetQueryParamsError{Path: path, Expected: "Int", Found: strconv.Quote(s)}
+		return 0, &NetQueryParamsError{Reason: "Mismatch", Path: path, Expected: "Int", Found: strconv.Quote(s)}
 	}
 	return n, nil
 }
@@ -1165,7 +1168,7 @@ func NetQueryInt(s string, path string) (int, *NetQueryParamsError) {
 func NetQueryFloat(s string, path string) (float64, *NetQueryParamsError) {
 	f, err := strconv.ParseFloat(s, 64)
 	if err != nil {
-		return 0, &NetQueryParamsError{Path: path, Expected: "Float", Found: strconv.Quote(s)}
+		return 0, &NetQueryParamsError{Reason: "Mismatch", Path: path, Expected: "Float", Found: strconv.Quote(s)}
 	}
 	return f, nil
 }
@@ -1174,7 +1177,7 @@ func NetQueryBool(s string, path string) (bool, *NetQueryParamsError) {
 	if s == "true" || s == "false" {
 		return s == "true", nil
 	}
-	return false, &NetQueryParamsError{Path: path, Expected: "Bool", Found: strconv.Quote(s)}
+	return false, &NetQueryParamsError{Reason: "Mismatch", Path: path, Expected: "Bool", Found: strconv.Quote(s)}
 }
 
 func NetQueryAtom(s string, path string) (Atom, *NetQueryParamsError) {
@@ -1183,7 +1186,7 @@ func NetQueryAtom(s string, path string) (Atom, *NetQueryParamsError) {
 			return Atom(i), nil
 		}
 	}
-	return 0, &NetQueryParamsError{Path: path, Expected: "a known atom", Found: strconv.Quote(s)}
+	return 0, &NetQueryParamsError{Reason: "Mismatch", Path: path, Expected: "a known atom", Found: strconv.Quote(s)}
 }
 
 // Encoding: each field is a group of pairs, and a vector's group is its key

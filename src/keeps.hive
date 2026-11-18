@@ -1,0 +1,966 @@
+// Keeping a type's laws
+// =====================
+// A law written inside a type is what every value of that type keeps. Nothing
+// proves it once: it is kept at every place a value of the type is built or
+// written, in every callable and test, and it is known at every place one is
+// read.
+//
+// What is known at a place is what the callable itself says before it — the
+// guards around it, the early returns above it, its own bindings, and the laws of
+// every value in scope — and nothing a call does inside: a call's result is a
+// value of its type, keeping that type's laws, and no more. So this works on any
+// body, one that reads files included, the way the bounds pass does.
+import ./ast
+import ./diag
+import ./infer
+import ./prove
+import ./solve
+import ./terms
+import ./text
+import ./token
+import ./types
+import hive.map
+
+// A walk through one body, and everything it has found wrong.
+type Keeping {
+    inside: Str
+    errors: diag.Diagnostic[dyn]
+    // Where each error was found and what it says, so a place reached twice on the
+    // way to an answer says it once.
+    said: Str[dyn]
+    // The body's `mut` names, which a `mut` bound to storage under one of them
+    // shares rather than copies.
+    muts: Str[dyn]
+    // Each such sharing, as `name<tab>root`: a write through either is a write
+    // to both.
+    shared: Str[dyn]
+    // Each `mut` that shares a part of a value whose type has laws, as
+    // `name<tab>law<tab>what it shares`.
+    parts: Str[dyn]
+    // The body's `mut` parameters: the caller's storage, so even rebinding one
+    // writes it.
+    lent: Str[dyn]
+}
+
+proc checkModule(m: ast.Module, cx: prove.Context): diag.Diagnostic[dyn] {
+    mut Keeping kp = Keeping("", [], [], [], [], [], [])
+    if hive.map.keys(cx.typeLaws) is [] {
+        return kp.errors
+    }
+    for each d in m.decls {
+        if d is ast.Decl.CallableDecl(kind, name, params, _, body, _) {
+            // A type's law is the one body that may hold a value which does not
+            // keep it: the value it is asked about.
+            if (kind is ast.CallableKind.TypeLawKind) == false {
+                kp.inside = name
+                walkBody(kp, cx, params, body)
+            }
+        } else if d is ast.Decl.TestDecl(title, body, _) {
+            kp.inside = "\"{title}\""
+            walkBody(kp, cx, [], body)
+        }
+    }
+    return kp.errors
+}
+
+proc walkBody(kp: mut Keeping, cx: prove.Context, params: ast.Param[], body: ast.Block): void {
+    kp.muts = []
+    kp.shared = []
+    kp.parts = []
+    kp.lent = []
+    for each p in params {
+        if p.mutable {
+            append(kp.muts, p.name)
+            append(kp.lent, p.name)
+        }
+    }
+    mut pr := prove.newProver(50000)
+    mut hive.map.Map<Str, terms.Term> env = hive.map.new()
+    mut hive.map.Map<Str, terms.Term> shapes = hive.map.new()
+    mut prove.Path path = prove.Path(env, [], shapes, [], prove.End.Running(), [], prove.Frame(kp.inside, []), 0, [], [])
+    for each p in params {
+        v := prove.fresh(pr, types.resolve(cx.base.table, p.declared), p.name)
+        path = prove.withValue(path, p.name, v)
+        path = prove.withTypeLaws(pr, cx, path, v)
+    }
+    _ := walkStmts(kp, pr, cx, infer.boundParams(cx.base, params, 0), path, body.stmts, 0)
+}
+
+// --- Statements -------------------------------------------------------------------
+
+proc walkStmts(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: infer.Env, path: prove.Path, stmts: ast.Stmt[], at: Int): prove.Path {
+    if stmts bounds at {
+        s := stmts[at]
+        after := walkStmt(kp, pr, cx, scope, path, s)
+        return walkStmts(kp, pr, cx, prove.scopeAfter(scope, s), after, stmts, at + 1)
+    }
+    return path
+}
+
+proc walkStmt(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: infer.Env, path: prove.Path, s: ast.Stmt): prove.Path {
+    if s is ast.Stmt.VarDecl(name, value, mutable, _, _) {
+        held := termOf(kp, pr, cx, scope, path, value)
+        bound(kp, cx, scope, name, value, mutable)
+        return prove.withValue(held.path, name, held.value)
+    } else if s is ast.Stmt.TypedDecl(_, name, value, mutable, _, _) {
+        held := termOf(kp, pr, cx, scope, path, value)
+        bound(kp, cx, scope, name, value, mutable)
+        return prove.withValue(held.path, name, held.value)
+    } else if s is ast.Stmt.Assign(target, value, at) {
+        held := termOf(kp, pr, cx, scope, path, value)
+        rebinding := target is ast.Expr.Ident(_, _)
+        return writeAt(kp, pr, cx, scope, held.path, target, held.value, at, "this write to `" + prove.exprText(target) + "`", rebinding)
+    } else if s is ast.Stmt.IfChain(branches, otherwise, hasElse, _) {
+        return walkIf(kp, pr, cx, scope, path, branches, otherwise, hasElse)
+    } else if s is ast.Stmt.SwitchStmt(lets, _, arms, _, _) {
+        lowered := ast.switchBlock(lets, arms)
+        return walkStmts(kp, pr, cx, scope, path, lowered.stmts, 0)
+    } else if s is ast.Stmt.ForEach(name, _, subject, body, _) {
+        held := termOf(kp, pr, cx, scope, path, subject)
+        element := types.elementOf(infer.typeOf(scope, subject))
+        mut prove.Path p = forgetWritten(kp, pr, cx, scope, held.path, body.stmts)
+        item := prove.fresh(pr, element, name)
+        p = prove.withTypeLaws(pr, cx, prove.withValue(p, name, item), item)
+        sharedBefore := sharingOf(kp)
+        mut Sharing added = Sharing([], [])
+        _ := walkStmts(kp, pr, cx, infer.bound(scope, name, element), p, body.stmts, 0)
+        backTo(kp, sharedBefore, added)
+        settle(kp, sharedBefore, added)
+        return forgetWritten(kp, pr, cx, scope, held.path, body.stmts)
+    } else if s is ast.Stmt.ForLoop(init, cond, post, body, _) {
+        started := walkStmt(kp, pr, cx, scope, path, init)
+        inner := prove.scopeAfter(scope, init)
+        mut ast.Stmt[dyn] written = []
+        for each b in body.stmts {
+            append(written, b)
+        }
+        append(written, post)
+        p := forgetWritten(kp, pr, cx, inner, started, written)
+        held := termOf(kp, pr, cx, inner, p, cond)
+        looping := knowing(pr, cx, held.path, held.value)
+        sharedBefore := sharingOf(kp)
+        mut Sharing added = Sharing([], [])
+        afterBody := walkStmts(kp, pr, cx, inner, looping, body.stmts, 0)
+        _ := walkStmt(kp, pr, cx, inner, afterBody, post)
+        backTo(kp, sharedBefore, added)
+        settle(kp, sharedBefore, added)
+        return forgetWritten(kp, pr, cx, inner, started, written)
+    } else if s is ast.Stmt.ReturnStmt(value, _) {
+        if (value is ast.Expr.Absent) == false {
+            _ := termOf(kp, pr, cx, scope, path, value)
+        }
+        return path
+    } else if s is ast.Stmt.AssertStmt(condition, _) {
+        held := termOf(kp, pr, cx, scope, path, condition)
+        return knowing(pr, cx, held.path, held.value)
+    } else if s is ast.Stmt.EchoStmt(value, _) {
+        return termOf(kp, pr, cx, scope, path, value).path
+    } else if s is ast.Stmt.PanicStmt(value, _) {
+        return termOf(kp, pr, cx, scope, path, value).path
+    } else if s is ast.Stmt.Expression(value, _) {
+        return termOf(kp, pr, cx, scope, path, value).path
+    } else if s is ast.Stmt.AsyncStmt(call, _) {
+        return termOf(kp, pr, cx, scope, path, call).path
+    }
+    return path
+}
+
+// The path, knowing `condition` too — or as it was, where the two cannot be
+// told apart from what a fact can say.
+proc knowing(pr: mut prove.Prover, cx: prove.Context, path: prove.Path, condition: terms.Term): prove.Path {
+    if prove.assume(pr, cx, path, condition) is Result.Ok(p) {
+        return p
+    }
+    return path
+}
+
+// Every variable a block writes, told nothing about any more but its type's laws:
+// what a loop leaves in it depends on how many times it ran.
+proc forgetWritten(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: infer.Env, path: prove.Path, stmts: ast.Stmt[]): prove.Path {
+    mut prove.Path p = path
+    mut Str[dyn] names = []
+    for each name in prove.assignedInStmts(stmts) + lentNames(cx, scope, stmts) {
+        append(names, name)
+        for each other in sharers(kp, name) {
+            append(names, other)
+        }
+    }
+    for each name in names {
+        if name != "" && hive.map.has(p.env, name) {
+            v := prove.fresh(pr, infer.lookup(scope, name), name)
+            p = prove.withTypeLaws(pr, cx, prove.withValue(p, name, v), v)
+        }
+    }
+    return p
+}
+
+// The variables at the root of everything a block writes in place: what it hands
+// to a `mut` parameter, and what `append`, `drop`, `sort` and `hive.map.set` change
+// where it lies. A function value the block itself declares may write any of its
+// arguments.
+func lentNames(cx: prove.Context, scope: infer.Env, stmts: ast.Stmt[]): Str[dyn] {
+    declared := prove.declaredInStmts(stmts)
+    mut Str[dyn] out = []
+    for each s in stmts {
+        for each e in prove.exprsOfStmt(s) {
+            for each call in prove.callsIn(e) {
+                if call is ast.Expr.Call(callee, args, _) {
+                    shape := inPlace(cx, scope, callee, args)
+                    mut local := false
+                    if callee is ast.Expr.Ident(name, _) {
+                        local = indexOf(declared, name) is Result.Ok(_)
+                    }
+                    mut i := 0
+                    for each a in shape.args {
+                        if local || writes(shape, i) {
+                            append(out, prove.rootOf(a.value))
+                        }
+                        i = i + 1
+                    }
+                }
+            }
+        }
+        for each b in prove.blocksOfStmt(s) {
+            for each name in lentNames(cx, scope, b.stmts) {
+                append(out, name)
+            }
+        }
+    }
+    return out
+}
+
+// --- Writes in place --------------------------------------------------------------
+
+// A call, as far as what it writes: its arguments in the callee's own order, which
+// of them it writes where they lie, and what it is called in a message.
+type InPlace {
+    what: Str
+    builtin: Bool
+    args: ast.Arg[dyn]
+    written: Bool[dyn]
+}
+
+func writes(shape: InPlace, at: Int): Bool {
+    if shape.written bounds at {
+        return shape.written[at]
+    }
+    return false
+}
+
+func inPlace(cx: prove.Context, scope: infer.Env, callee: ast.Expr, args: ast.Arg[]): InPlace {
+    mut Bool[dyn] none = []
+    mut ast.Arg[dyn] given = []
+    for each a in args {
+        append(given, a)
+    }
+    if infer.hasHole(args) {
+        // A function value is made, and nothing is called yet.
+        return InPlace("", false, given, none)
+    }
+    if callee is ast.Expr.Ident(name, _) {
+        if infer.isBound(scope, name) {
+            if infer.lookup(scope, name) is types.Ty.TFn(_, _, mutables, _) {
+                mut Bool[dyn] written = []
+                for each m in mutables {
+                    append(written, m)
+                }
+                return InPlace(name, false, given, written)
+            }
+            return InPlace(name, false, given, none)
+        }
+        if hive.map.get(cx.callables, name) is Result.Ok(d) {
+            if d is ast.Decl.CallableDecl(_, _, params, _, _, _) {
+                mut Str[dyn] names = []
+                mut Bool[dyn] written = []
+                for each p in params {
+                    append(names, p.name)
+                    append(written, p.mutable)
+                }
+                return InPlace(name, false, ast.positional(args, names), written)
+            }
+        }
+        return builtinInPlace(name, args, given)
+    }
+    if callee is ast.Expr.Member(subject, field, _) {
+        if subject is ast.Expr.Ident(head, _) {
+            if head == "hive" && infer.isBound(scope, head) == false {
+                return builtinInPlace(field, args, given)
+            }
+        }
+        if subject is ast.Expr.Member(inner, module, _) {
+            if inner is ast.Expr.Ident(head, _) {
+                if head == "hive" && module == "map" && (field == "set" || field == "delete") {
+                    return InPlace("hive.map." + field, true, ast.positional(args, ["m", "key", "value"]), [true])
+                }
+            }
+        }
+    }
+    return InPlace("", false, given, none)
+}
+
+func builtinInPlace(name: Str, args: ast.Arg[], given: ast.Arg[]): InPlace {
+    if name == "append" || name == "prepend" || name == "drop" || name == "sort" {
+        return InPlace(name, true, infer.builtinArgs(name, args), [true])
+    }
+    mut Bool[dyn] none = []
+    mut ast.Arg[dyn] kept = []
+    for each a in given {
+        append(kept, a)
+    }
+    return InPlace(name, infer.isBuiltin(name), kept, none)
+}
+
+// What a call leaves where it wrote: `append` and `prepend` the vector one longer
+// at an end, `drop` and `sort` one of a length it can say, and anything else a
+// value of the type that keeps its type's laws — which the callee itself was held
+// to, being checked as any other body is.
+proc writtenValue(pr: mut prove.Prover, cx: prove.Context, scope: infer.Env, path: prove.Path, shape: InPlace, values: terms.Term[], at: Int, target: ast.Expr): prove.Out {
+    ty := infer.typeOf(scope, target)
+    old := terms.nth(values, at)
+    if shape.builtin && (shape.what == "append" || shape.what == "prepend") {
+        item := terms.Term.VecK([terms.nth(values, 1)])
+        if shape.what == "prepend" {
+            return prove.Out(path, prove.concat(item, old, ty))
+        }
+        return prove.Out(path, prove.concat(old, item, ty))
+    }
+    v := prove.fresh(pr, ty, "new " + prove.exprText(target))
+    mut prove.Path p = prove.withTypeLaws(pr, cx, path, v)
+    if shape.builtin && shape.what == "sort" {
+        p = knowing(pr, cx, p, prove.equal(prove.lengthOf(v), prove.lengthOf(old)))
+    } else if shape.builtin && shape.what == "drop" && len(values) >= 3 {
+        taken := prove.arith("add", prove.arith("sub", terms.nth(values, 2), terms.nth(values, 1)), terms.Term.IntK(1))
+        p = knowing(pr, cx, p, prove.equal(prove.lengthOf(v), prove.arith("sub", prove.lengthOf(old), taken)))
+    }
+    return prove.Out(p, v)
+}
+
+proc walkIf(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: infer.Env, path: prove.Path, branches: ast.Branch[], otherwise: ast.Block, hasElse: Bool): prove.Path {
+    mut prove.Path before = path
+    mut ast.Stmt[dyn] touched = []
+    sharedBefore := sharingOf(kp)
+    mut Sharing added = Sharing([], [])
+    for each b in branches {
+        held := conditionOf(kp, pr, cx, scope, before, b.condition)
+        inner := infer.narrowed(scope, b.condition)
+        _ := walkStmts(kp, pr, cx, inner, knowing(pr, cx, held.path, held.value), b.body.stmts, 0)
+        backTo(kp, sharedBefore, added)
+        for each st in b.body.stmts {
+            append(touched, st)
+        }
+        // A later branch, and what follows a chain whose every branch leaves, is
+        // where this one's condition did not hold.
+        before = knowing(pr, cx, before, terms.negation(held.value))
+    }
+    if hasElse {
+        _ := walkStmts(kp, pr, cx, scope, before, otherwise.stmts, 0)
+        backTo(kp, sharedBefore, added)
+        for each st in otherwise.stmts {
+            append(touched, st)
+        }
+    }
+    settle(kp, sharedBefore, added)
+    // After the chain: what a branch that runs on to the end could have written is
+    // no longer known; a branch that always leaves wrote nothing anyone after sees.
+    mut ast.Stmt[dyn] carried = []
+    mut allLeave := true
+    for each b in branches {
+        if leavesAlways(b.body.stmts) == false {
+            allLeave = false
+            for each st in b.body.stmts {
+                append(carried, st)
+            }
+        }
+    }
+    if hasElse && leavesAlways(otherwise.stmts) == false {
+        allLeave = false
+        for each st in otherwise.stmts {
+            append(carried, st)
+        }
+    }
+    if hasElse == false {
+        allLeave = false
+    }
+    mut prove.Path after = path
+    // Where every branch but the fall-through leaves, the fall-through's conditions
+    // hold after the chain.
+    if hasElse == false && allBranchesLeave(branches) {
+        after = before
+    }
+    if allLeave {
+        return after
+    }
+    return forgetWritten(kp, pr, cx, scope, after, carried)
+}
+
+func allBranchesLeave(branches: ast.Branch[]): Bool {
+    for each b in branches {
+        if leavesAlways(b.body.stmts) == false {
+            return false
+        }
+    }
+    return true
+}
+
+// Whether a block always ends by leaving: `return`, `panic`, `break`, `continue`,
+// or an `if`/`else` whose every branch does.
+func leavesAlways(stmts: ast.Stmt[]): Bool {
+    for each s in stmts {
+        if s is ast.Stmt.ReturnStmt(_, _) || s is ast.Stmt.PanicStmt(_, _) || s is ast.Stmt.BreakStmt(_) || s is ast.Stmt.ContinueStmt(_) {
+            return true
+        }
+        if s is ast.Stmt.IfChain(branches, otherwise, hasElse, _) {
+            if hasElse && allBranchesLeave(branches) && leavesAlways(otherwise.stmts) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// --- Writes -----------------------------------------------------------------------
+
+// A `mut` bound to storage under another `mut` name shares it (8.4): noted, and,
+// where what it shares is part of a value whose type has laws, noted as that.
+proc bound(kp: mut Keeping, cx: prove.Context, scope: infer.Env, name: Str, value: ast.Expr, mutable: Bool): void {
+    if mutable == false {
+        return
+    }
+    root := prove.rootOf(value)
+    if root != "" && indexOf(kp.muts, root) is Result.Ok(_) {
+        append(kp.shared, name + "\t" + root)
+        holder := lawAlong(cx, scope, value)
+        if holder != "" {
+            append(kp.parts, name + "\t" + holder + "\t" + prove.exprText(value))
+        }
+    }
+    append(kp.muts, name)
+}
+
+// What is noted about sharing at one place. A branch or a loop's body may not have
+// run, so what follows it keeps every sharing noted before it, whatever the block
+// did to them, together with every one the block added.
+type Sharing {
+    shared: Str[dyn]
+    parts: Str[dyn]
+}
+
+func sharingOf(kp: Keeping): Sharing {
+    return Sharing(joined(kp.shared, []), joined(kp.parts, []))
+}
+
+// Back to what held before a block, keeping what it added.
+proc backTo(kp: mut Keeping, before: Sharing, added: mut Sharing): void {
+    for each e in kp.shared {
+        if (indexOf(before.shared, e) is Result.Ok(_)) == false && (indexOf(added.shared, e) is Result.Ok(_)) == false {
+            append(added.shared, e)
+        }
+    }
+    for each e in kp.parts {
+        if (indexOf(before.parts, e) is Result.Ok(_)) == false && (indexOf(added.parts, e) is Result.Ok(_)) == false {
+            append(added.parts, e)
+        }
+    }
+    kp.shared = joined(before.shared, [])
+    kp.parts = joined(before.parts, [])
+}
+
+proc settle(kp: mut Keeping, before: Sharing, added: Sharing): void {
+    kp.shared = joined(before.shared, added.shared)
+    kp.parts = joined(before.parts, added.parts)
+}
+
+func joined(a: Str[], b: Str[]): Str[dyn] {
+    mut Str[dyn] out = []
+    for each e in a {
+        append(out, e)
+    }
+    for each e in b {
+        append(out, e)
+    }
+    return out
+}
+
+// The first law of a value that `e` is a part of, or "".
+func lawAlong(cx: prove.Context, scope: infer.Env, e: ast.Expr): Str {
+    if e is ast.Expr.Member(subject, _, _) {
+        if lawsOf(cx, infer.typeOf(scope, subject)) != "" {
+            return lawsOf(cx, infer.typeOf(scope, subject))
+        }
+        return lawAlong(cx, scope, subject)
+    }
+    if e is ast.Expr.Index(subject, _, _) {
+        if lawsOf(cx, infer.typeOf(scope, subject)) != "" {
+            return lawsOf(cx, infer.typeOf(scope, subject))
+        }
+        return lawAlong(cx, scope, subject)
+    }
+    return ""
+}
+
+// Every name sharing storage with `name`, however many sharings away.
+func sharers(kp: Keeping, name: Str): Str[dyn] {
+    mut Str[dyn] group = [name]
+    mut grew := true
+    for ; grew; {
+        grew = false
+        for each pair in kp.shared {
+            sides := split(pair, "\t")
+            a := text.charAt(sides, 0)
+            b := text.charAt(sides, 1)
+            hasA := indexOf(group, a) is Result.Ok(_)
+            hasB := indexOf(group, b) is Result.Ok(_)
+            if hasA && hasB == false {
+                append(group, b)
+                grew = true
+            } else if hasB && hasA == false {
+                append(group, a)
+                grew = true
+            }
+        }
+    }
+    mut Str[dyn] out = []
+    for each other in group {
+        if other != name {
+            append(out, other)
+        }
+    }
+    return out
+}
+
+// A write, as a statement or a call makes it. Rebinding a name gives it storage
+// of its own; anything else writes the storage it shares, so what was known about
+// every other name holding that storage is known no longer — and a write through
+// a name sharing part of a value with laws is one those laws cannot see.
+proc writeAt(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: infer.Env, path: prove.Path, target: ast.Expr, value: terms.Term, at: token.Pos, how: Str, rebinding: Bool): prove.Path {
+    root := prove.rootOf(target)
+    if rebinding && (indexOf(kp.lent, root) is Result.Ok(_)) == false {
+        mut Str[dyn] keptShared = []
+        for each pair in kp.shared {
+            sides := split(pair, "\t")
+            if text.charAt(sides, 0) != root && text.charAt(sides, 1) != root {
+                append(keptShared, pair)
+            }
+        }
+        kp.shared = keptShared
+        mut Str[dyn] keptParts = []
+        for each entry in kp.parts {
+            if text.charAt(split(entry, "\t"), 0) != root {
+                append(keptParts, entry)
+            }
+        }
+        kp.parts = keptParts
+        return write(kp, pr, cx, scope, path, target, value, at, how)
+    }
+    for each entry in kp.parts {
+        fields := split(entry, "\t")
+        if text.charAt(fields, 0) == root {
+            source := text.charAt(fields, 2)
+            report(kp, at, "cannot prove `" + text.charAt(fields, 1) + "` for " + how + ": `" + root + "` shares the storage of `" + source + "`, so this writes into a value whose law cannot see it\n    write through `" + source + "` itself")
+        }
+    }
+    mut prove.Path p = write(kp, pr, cx, scope, path, target, value, at, how)
+    for each other in sharers(kp, root) {
+        if hive.map.has(p.env, other) {
+            v := prove.fresh(pr, infer.lookup(scope, other), other)
+            p = prove.withTypeLaws(pr, cx, prove.withValue(p, other, v), v)
+        }
+    }
+    return p
+}
+
+// `target = value`: the variable at the root of the target holds its new value,
+// and every value along the way whose type has laws is checked as built anew —
+// as each variant it may be, where it is a union.
+proc write(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: infer.Env, path: prove.Path, target: ast.Expr, value: terms.Term, at: token.Pos, how: Str): prove.Path {
+    if target is ast.Expr.Ident(name, _) {
+        return prove.withValue(path, name, value)
+    }
+    if target is ast.Expr.Member(subject, field, _) {
+        old := termOf(kp, pr, cx, scope, path, subject)
+        outs := prove.materialize(pr, cx, old.path, old.value, [], "")
+        mut prove.Path[dyn] after = []
+        for each m in outs {
+            v := prove.normIn(cx, m.path, m.value)
+            if v is terms.Term.RecK(typeName, variant, fields) {
+                mut terms.Term[dyn] changed = []
+                mut i := 0
+                for each f in prove.fieldsFor(cx.base.table, typeName, variant) {
+                    if f.name == field {
+                        append(changed, value)
+                    } else {
+                        append(changed, terms.nth(fields, i))
+                    }
+                    i = i + 1
+                }
+                built := terms.Term.RecK(typeName, variant, changed)
+                kept := keep(kp, pr, cx, m.path, built, at, how)
+                append(after, write(kp, pr, cx, scope, kept, subject, built, at, how))
+            } else if lawsOf(cx, infer.typeOf(scope, subject)) != "" {
+                report(kp, at, "cannot prove `" + lawsOf(cx, infer.typeOf(scope, subject)) + "` for " + how + ": what it writes into cannot be followed")
+            }
+        }
+        if len(after) == 1 {
+            for each p in after {
+                return p
+            }
+        }
+        return forgetRoot(pr, cx, scope, old.path, target)
+    }
+    if target is ast.Expr.Index(subject, _, _) {
+        // One element is new: the vector it is in is still as long as it was, and
+        // whatever holds that vector is checked with it changed.
+        old := termOf(kp, pr, cx, scope, path, subject)
+        v := prove.fresh(pr, infer.typeOf(scope, subject), "new " + prove.exprText(subject))
+        p := knowing(pr, cx, prove.withTypeLaws(pr, cx, old.path, v), prove.equal(prove.lengthOf(v), prove.lengthOf(old.value)))
+        return write(kp, pr, cx, scope, p, subject, v, at, how)
+    }
+    return forgetRoot(pr, cx, scope, path, target)
+}
+
+// The first law of a type, as an error names it, or "" where the type has none.
+func lawsOf(cx: prove.Context, ty: types.Ty): Str {
+    if ty is types.Ty.TNamed(name) {
+        if hive.map.get(cx.typeLaws, name) is Result.Ok(lawNames) {
+            for each l in lawNames {
+                return ast.lawShown(types.shownName(l))
+            }
+        }
+    }
+    return ""
+}
+
+proc report(kp: mut Keeping, at: token.Pos, message: Str): void {
+    key := "{at.file}:{at.line}:{at.col}: {message}"
+    if indexOf(kp.said, key) is Result.Ok(_) {
+        return
+    }
+    append(kp.said, key)
+    append(kp.errors, diag.on(at, diag.inDecl(types.shownName(kp.inside), message)))
+}
+
+// The value at the root of `target`, told nothing any more but its type's laws.
+proc forgetRoot(pr: mut prove.Prover, cx: prove.Context, scope: infer.Env, path: prove.Path, target: ast.Expr): prove.Path {
+    root := prove.rootOf(target)
+    if root == "" {
+        return path
+    }
+    v := prove.fresh(pr, infer.lookup(scope, root), root)
+    return prove.withTypeLaws(pr, cx, prove.withValue(path, root, v), v)
+}
+
+// The laws of `built`'s type, proved for it from what this place knows. Each one
+// that is not is an error here, and the path goes on knowing them all the same.
+proc keep(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, path: prove.Path, built: terms.Term, at: token.Pos, what: Str): prove.Path {
+    mut owner := ""
+    if built is terms.Term.RecK(typeName, _, _) {
+        owner = typeName
+    }
+    if hive.map.get(cx.typeLaws, owner) is Result.Ok(lawNames) {
+        for each lawName in lawNames {
+            if hive.map.get(cx.callables, lawName) is Result.Ok(d) {
+                if d is ast.Decl.CallableDecl(_, _, params, _, body, _) {
+                    mut hive.map.Map<Str, terms.Term> env = hive.map.new()
+                    for each p in params {
+                        hive.map.set(env, p.name, built)
+                    }
+                    mut check := prove.newProver(20000)
+                    check.infos = pr.infos
+                    check.parts = pr.parts
+                    begin := prove.Path(env, path.facts, path.shapes, path.lemmas, prove.End.Running(), path.cases, prove.Frame(lawName, [built]), 1, [], path.assumed)
+                    paths := prove.execBlock(check, cx, infer.boundParams(cx.base, params, 0), begin, body.stmts)
+                    pr.infos = check.infos
+                    pr.parts = check.parts
+                    mut Str[dyn] why = []
+                    for each problem in check.problems {
+                        append(why, problem.message)
+                    }
+                    for each p in paths {
+                        if p.ended is prove.End.Lost(reason, _) {
+                            append(why, "the law cannot be followed: " + reason)
+                        }
+                    }
+                    for each reason in why {
+                        named := "`" + ast.lawShown(types.shownName(lawName)) + "`"
+                        mut said := what + " does not keep " + named + ": " + reason
+                        if text.contains(reason, ": it is false") {
+                            mut first := reason
+                            for each piece in split(reason, ": it is false") {
+                                first = piece
+                                break
+                            }
+                            said = what + " does not keep " + named + ": " + prove.after(first, 13) + " is false"
+                        } else if text.startsWith(reason, "cannot prove ") {
+                            said = "cannot prove " + named + " for " + what + ": nothing here shows " + prove.after(reason, 13) + "\n    guard it, so that the law holds here"
+                        }
+                        report(kp, at, said)
+                        break
+                    }
+                }
+            }
+        }
+    }
+    return prove.withTypeLaws(pr, cx, path, built)
+}
+
+// --- Expressions --------------------------------------------------------------------
+
+// What an expression comes to here, as one term: worked out where it can be, and
+// otherwise an unknown of its type that keeps the type's laws.
+proc termOf(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: infer.Env, path: prove.Path, e: ast.Expr): prove.Out {
+    if e is ast.Expr.IntLit(v, _) {
+        return prove.Out(path, terms.Term.IntK(v))
+    } else if e is ast.Expr.StrLit(v, _) {
+        return prove.Out(path, terms.Term.StrK(v))
+    } else if e is ast.Expr.BoolLit(v, _) {
+        return prove.Out(path, terms.Term.BoolK(v))
+    } else if e is ast.Expr.AtomLit(v, _) {
+        return prove.Out(path, terms.Term.AtomK(v))
+    } else if e is ast.Expr.FloatLit(v, _) {
+        return prove.Out(path, terms.Term.FloatK(v))
+    } else if e is ast.Expr.Ident(name, _) {
+        if hive.map.get(path.env, name) is Result.Ok(v) {
+            return prove.Out(path, v)
+        }
+        return unknownOf(pr, cx, scope, path, e)
+    } else if e is ast.Expr.Not(x, _) {
+        held := termOf(kp, pr, cx, scope, path, x)
+        return prove.Out(held.path, terms.negation(prove.normIn(cx, held.path, held.value)))
+    } else if e is ast.Expr.Negate(x, _) {
+        held := termOf(kp, pr, cx, scope, path, x)
+        if infer.typeOf(scope, x) is types.Ty.TInt {
+            return prove.Out(held.path, prove.negate(prove.normIn(cx, held.path, held.value)))
+        }
+        return unknownOf(pr, cx, scope, held.path, e)
+    } else if e is ast.Expr.Binary(op, l, r, _) {
+        left := termOf(kp, pr, cx, scope, path, l)
+        right := termOf(kp, pr, cx, infer.narrowed(scope, l), left.path, r)
+        a := prove.normIn(cx, right.path, left.value)
+        b := prove.normIn(cx, right.path, right.value)
+        if op is ast.BinOp.And {
+            return prove.Out(right.path, terms.both(a, b))
+        }
+        if op is ast.BinOp.Or {
+            return prove.Out(right.path, terms.either(a, b))
+        }
+        if prove.combine(op, infer.typeOf(scope, l), a, b) is Result.Ok(v) {
+            return prove.Out(right.path, v)
+        }
+        return unknownOf(pr, cx, scope, right.path, e)
+    } else if e is ast.Expr.Member(subject, field, _) {
+        held := termOf(kp, pr, cx, scope, path, subject)
+        for each o in prove.project(pr, cx, held.path, held.value, field, infer.typeOf(scope, e)) {
+            return o
+        }
+        return unknownOf(pr, cx, scope, held.path, e)
+    } else if e is ast.Expr.Call(callee, args, at) {
+        return callOf(kp, pr, cx, scope, path, e, callee, args, at)
+    } else if e is ast.Expr.VectorLit(items, _) {
+        mut prove.Path p = path
+        mut terms.Term[dyn] values = []
+        for each item in items {
+            held := termOf(kp, pr, cx, scope, p, item)
+            p = held.path
+            append(values, held.value)
+        }
+        return prove.Out(p, terms.Term.VecK(values))
+    } else if e is ast.Expr.IsMatch(subject, _, _) {
+        held := termOf(kp, pr, cx, scope, path, subject)
+        return unknownOf(pr, cx, scope, held.path, e)
+    }
+    // Whatever else it is, what it builds is still checked.
+    mut prove.Path p = path
+    for each inner in subExprs(e) {
+        p = termOf(kp, pr, cx, scope, p, inner).path
+    }
+    return unknownOf(pr, cx, scope, p, e)
+}
+
+func subExprs(e: ast.Expr): ast.Expr[dyn] {
+    mut ast.Expr[dyn] out = []
+    if e is ast.Expr.Index(subject, index, _) {
+        append(out, subject)
+        append(out, index)
+    } else if e is ast.Expr.Slice(subject, low, high, _) {
+        append(out, subject)
+        append(out, low)
+        append(out, high)
+    } else if e is ast.Expr.Interp(parts, _) {
+        for each part in parts {
+            if part is ast.InterpPart.Expression(value) {
+                append(out, value)
+            }
+        }
+    } else if e is ast.Expr.AwaitAll(calls, timeout, _) {
+        for each c in calls {
+            append(out, c)
+        }
+        append(out, timeout)
+    } else if e is ast.Expr.Timed(call, ms, _) {
+        append(out, call)
+        append(out, ms)
+    } else if e is ast.Expr.BitNot(x, _) {
+        append(out, x)
+    }
+    return out
+}
+
+proc unknownOf(pr: mut prove.Prover, cx: prove.Context, scope: infer.Env, path: prove.Path, e: ast.Expr): prove.Out {
+    v := prove.fresh(pr, infer.typeOf(scope, e), prove.exprText(e))
+    return prove.Out(prove.withTypeLaws(pr, cx, path, v), v)
+}
+
+// A call: a value built, checked against its type's laws; anything else, an
+// unknown of the type it answers with, and every variable it lent to a `mut`
+// parameter told nothing any more but its type's laws.
+proc callOf(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: infer.Env, path: prove.Path, e: ast.Expr, callee: ast.Expr, args: ast.Arg[], at: token.Pos): prove.Out {
+    mut typeName := ""
+    mut variant := ""
+    mut ast.Field[dyn] fields = []
+    if callee is ast.Expr.Ident(name, _) {
+        if infer.isBound(scope, name) == false && hive.map.has(cx.callables, name) == false {
+            if types.fieldsOfStruct(scope.table, name) is Result.Ok(found) {
+                typeName = name
+                fields = found
+            }
+        }
+    } else if callee is ast.Expr.Member(subject, field, _) {
+        if subject is ast.Expr.Ident(head, _) {
+            if infer.isBound(scope, head) == false {
+                if types.findVariant(scope.table, head, field) is Result.Ok(found) {
+                    typeName = head
+                    variant = field
+                    fields = found
+                }
+            }
+        }
+    }
+    if typeName != "" && infer.hasHole(args) == false {
+        mut Str[dyn] names = []
+        for each f in fields {
+            append(names, f.name)
+        }
+        mut prove.Path p = path
+        mut terms.Term[dyn] values = []
+        for each a in ast.positional(args, names) {
+            held := termOf(kp, pr, cx, scope, p, a.value)
+            p = held.path
+            append(values, prove.normIn(cx, p, held.value))
+        }
+        built := terms.Term.RecK(typeName, variant, values)
+        return prove.Out(keep(kp, pr, cx, p, built, at, "this `" + prove.exprText(callee) + "(...)`"), built)
+    }
+    shape := inPlace(cx, scope, callee, args)
+    if shape.builtin && shape.what == "len" && len(shape.args) == 1 {
+        // A length is what guards and laws say most about, so it is the one call
+        // whose answer is worked out rather than left unknown.
+        for each a in shape.args {
+            held := termOf(kp, pr, cx, scope, path, a.value)
+            return prove.Out(held.path, prove.lengthOf(prove.normIn(cx, held.path, held.value)))
+        }
+    }
+    mut prove.Path p = path
+    mut terms.Term[dyn] values = []
+    for each a in shape.args {
+        held := termOf(kp, pr, cx, scope, p, a.value)
+        p = held.path
+        append(values, prove.normIn(cx, p, held.value))
+    }
+    mut i := 0
+    for each a in shape.args {
+        if writes(shape, i) {
+            now := writtenValue(pr, cx, scope, p, shape, values, i, a.value)
+            p = writeAt(kp, pr, cx, scope, now.path, a.value, now.value, at, "this `" + shape.what + "` on `" + prove.exprText(a.value) + "`", false)
+        }
+        i = i + 1
+    }
+    return unknownOf(pr, cx, scope, p, e)
+}
+
+// A branch's condition as one term, its matches binding what they bind: a match
+// against a value whose shape is known is decided, and one against a value that is
+// not becomes a fact about it, with what it binds as parts of it.
+proc conditionOf(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: infer.Env, path: prove.Path, condition: ast.Expr): prove.Out {
+    mut prove.Path p = path
+    mut terms.Term all = terms.Term.BoolK(true)
+    mut infer.Env inner = scope
+    for each part in ast.conjuncts(condition) {
+        if part is ast.Expr.IsMatch(subject, pattern, at) {
+            held := termOf(kp, pr, cx, inner, p, subject)
+            p = held.path
+            outs := prove.matchPattern(pr, cx, inner, p, held.value, pattern, at)
+            mut decided := false
+            for each o in outs {
+                if len(outs) == 1 && prove.running(o.path) {
+                    p = o.path
+                    all = terms.both(all, prove.normIn(cx, o.path, o.value))
+                    decided = true
+                }
+            }
+            if decided == false {
+                p = bindUnknown(pr, cx, inner, p, held.value, pattern)
+                all = terms.both(all, testOf(held.value, pattern))
+            }
+        } else {
+            held := termOf(kp, pr, cx, inner, p, part)
+            p = held.path
+            all = terms.both(all, prove.normIn(cx, p, held.value))
+        }
+        inner = infer.narrowed(inner, part)
+    }
+    return prove.Out(p, all)
+}
+
+// What a match stands for as a fact, where the subject cannot be split.
+func testOf(subject: terms.Term, pattern: ast.Pattern): terms.Term {
+    if pattern is ast.Pattern.Constructor(names, _, _) {
+        return terms.op("is:" + join(names, "."), [subject], terms.boolean())
+    }
+    if pattern is ast.Pattern.VectorPat(elements, rest) {
+        if len(elements) > 0 {
+            return terms.op("cons", [subject], terms.boolean())
+        }
+        if rest == "" {
+            return terms.op("nil", [subject], terms.boolean())
+        }
+    }
+    return terms.Term.BoolK(true)
+}
+
+// What a match binds, as unknowns of the types the pattern gives them — and, for
+// a variant's fields, the very parts of the subject the prover takes apart, so what
+// the subject's own laws say about them is said about these names.
+proc bindUnknown(pr: mut prove.Prover, cx: prove.Context, scope: infer.Env, path: prove.Path, subject: terms.Term, pattern: ast.Pattern): prove.Path {
+    after := infer.afterPattern(scope, prove.termType(subject), pattern)
+    mut prove.Path p = path
+    mut ast.Field[dyn] fields = []
+    mut variant := ""
+    mut id := -1
+    if subject is terms.Term.Unknown(uid, ty) {
+        if pattern is ast.Pattern.Constructor(names, _, _) {
+            if ty is types.Ty.TNamed(typeName) {
+                variant = prove.nameAt(names, 1)
+                if types.findVariant(cx.base.table, typeName, variant) is Result.Ok(found) {
+                    fields = found
+                    id = uid
+                }
+            }
+        }
+    }
+    mut i := 0
+    for each name in ast.boundBy(pattern) {
+        if name != "" && name != "_" {
+            held := infer.lookup(after, name)
+            mut terms.Term v = terms.Term.VoidK()
+            if id >= 0 && fields bounds i {
+                f := fields[i]
+                v = prove.part(pr, "u{id}:{variant}.{f.name}", held, name)
+            } else {
+                v = prove.fresh(pr, held, name)
+            }
+            p = prove.withTypeLaws(pr, cx, prove.withValue(p, name, v), v)
+        }
+        i = i + 1
+    }
+    return p
+}

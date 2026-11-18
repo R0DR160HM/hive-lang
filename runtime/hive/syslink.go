@@ -108,7 +108,7 @@ func JsonAddress(v JsonValue, path string) (SyslinkAddress, *JsonJsonError) {
 	}
 	parts := strings.Split(text, "|")
 	if len(parts) != 3 {
-		return SyslinkAddress{}, &JsonJsonError{Path: path, Expected: "a syslink address", Found: JsonEncodeStr(text)}
+		return SyslinkAddress{}, &JsonJsonError{Reason: "Mismatch", Path: path, Expected: "a syslink address", Found: JsonEncodeStr(text)}
 	}
 	addr := SyslinkAddress{Endpoint: parts[0], Name: atomNone}
 	if parts[1] != "" {

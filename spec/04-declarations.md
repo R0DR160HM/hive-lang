@@ -269,7 +269,7 @@ Two things a `WHERE` block deliberately cannot do. A **column name or sort
 direction** can never be a parameter — `ORDER BY {col}` would sort by a constant
 string — so make the choices a variant type and dispatch to one query per
 ordering. And **SQL you genuinely assemble yourself** goes through
-`hive.sql.raw`, which is untyped by construction and greppable by design.
+`hive.sql.unsafe`, which is untyped by construction and greppable by design.
 
 ## 4.6 `test`
 
@@ -299,6 +299,14 @@ A law is a claim the compiler proves for every value its parameters can take; on
 it cannot prove is a compile error. It has no return type and no `mut`
 parameter, only another law may call it, and it is never emitted. See
 [19](19-laws.md).
+
+A law written inside a type, with one parameter of that type, is what **every
+value of the type keeps**: it is checked wherever one is built or written, and
+known wherever one is read. See [19.6](19-laws.md#196-a-types-laws).
+
+A law written `for table <name>`, with one parameter, has a SQL filter for a body,
+and **every `query` on that table carries it**. See
+[19.7](19-laws.md#197-a-tables-laws).
 
 ## 4.8 Nothing about a declaration says how it runs
 

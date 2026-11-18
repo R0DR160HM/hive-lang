@@ -61,7 +61,7 @@ file, plus a generated `hive` runtime package.
 | `f(b: g(), a: h())` (named, out of order) | a function literal called on the spot with `g()` and `h()` in written order, which calls `f` in parameter order |
 | `_ := e` / `_ := async f()` | `_ = e` / a `hive.Spawn` nobody waits for |
 | `func f(v: T[]): T` at `T = Str` | `func f_Str(v []string) string` — one copy per instantiation |
-| `hive.file.csv(p, s)` / `hive.sql.run(conn, q(..))` / `hive.sql.raw(conn, t)` | `hive.ReadCsv(..)` / `hive.SqlRows(..)` — `hive.SqlTable(..)` for a query declared as a `Table` — / `hive.SqlQuery(..)`, each → a `Result` |
+| `hive.file.csv(p, s)` / `hive.sql.run(conn, q(..))` / `hive.sql.unsafe(conn, t)` | `hive.ReadCsv(..)` / `hive.SqlRows(..)` — `hive.SqlTable(..)` for a query declared as a `Table` — / `hive.SqlQuery(..)`, each → a `Result` |
 | a `hive.*` library call | a call of the same name on the generated `hive` runtime package (`hive.time.now` → `hive.TimeNow`) |
 | `T.decode(t, c)` / `T.Variant.decode(t, c)` | `hive.JsonParse(t, jsonDecode_T)` / `hive.JsonParse(t, jsonDecode_T_Variant)` — `c` names the format and is not itself evaluated |
 | `encode(v, c)` | `jsonEncode_T(v)` for a declared `T`, else the encoder for the scalar or vector it is — written at the call site from the format `c` names, never a runtime call |

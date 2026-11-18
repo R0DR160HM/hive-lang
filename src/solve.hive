@@ -216,7 +216,9 @@ proc arithmetic(facts: terms.Term[], goal: terms.Term): Verdict {
             return Verdict.Holds()
         }
     }
-    base := constraintsOf(facts)
+    known := constraintsOf(facts)
+    // The goal's own products are held to their ranges as the facts' are.
+    base := known + productBounds([goal], rangesOf(known))
     if refutes(base, terms.negation(goal), facts) {
         return Verdict.Holds()
     }
@@ -402,7 +404,120 @@ func modScale(a: Lin, by: Int): Lin {
 proc constraintsOf(facts: terms.Term[]): Lin[dyn] {
     mut hive.map.Map<Str, Range> none = hive.map.new()
     first := withLengths(constraintsWithin(facts, none))
-    return withLengths(constraintsWithin(facts, rangesOf(first)))
+    second := withLengths(constraintsWithin(facts, rangesOf(first)))
+    return second + productBounds(facts, rangesOf(second))
+}
+
+// A product of two unknowns, or a quotient by a positive literal, is an atom the
+// difference constraints cannot see into. Where its operands' ranges are known and
+// its own range is an `Int`, that range is what it is held to: such a product
+// cannot have wrapped, so it is the number the range says.
+func productBounds(facts: terms.Term[], limits: hive.map.Map<Str, Range>): Lin[dyn] {
+    mut Lin[dyn] out = []
+    mut Str[dyn] seen = []
+    for each f in facts {
+        for each t in nonlinearIn(f) {
+            k := terms.key(t)
+            if (indexOf(seen, k) is Result.Ok(_)) == false {
+                append(seen, k)
+                if intervalOf(t, limits, 0) is Result.Ok(r) {
+                    append(out, Lin([k], [-1], r.low))
+                    if terms.safeNeg(r.high) is Result.Ok(nh) {
+                        append(out, Lin([k], [1], nh))
+                    }
+                }
+            }
+        }
+    }
+    return out
+}
+
+// The products and quotients a fact mentions, at any depth.
+func nonlinearIn(t: terms.Term): terms.Term[dyn] {
+    mut terms.Term[dyn] out = []
+    if t is terms.Term.Op(name, args, _) {
+        a := terms.nth(args, 0)
+        b := terms.nth(args, 1)
+        if name == "mul" && len(args) == 2 && (a is terms.Term.IntK(_)) == false && (b is terms.Term.IntK(_)) == false {
+            append(out, t)
+        }
+        if name == "div" && len(args) == 2 {
+            append(out, t)
+        }
+        for each x in args {
+            for each n in nonlinearIn(x) {
+                append(out, n)
+            }
+        }
+    }
+    return out
+}
+
+// The range a term's value lies in, worked out from the ranges of what it is made
+// of, wherever no step of working it out wraps.
+func intervalOf(t: terms.Term, limits: hive.map.Map<Str, Range>, depth: Int): Result<Range, Bool> {
+    if depth > 6 {
+        return Result.Error(false)
+    }
+    if t is terms.Term.IntK(v) {
+        return Result.Ok(Range(v, v))
+    }
+    if t is terms.Term.Op(name, args, _) {
+        if len(args) == 2 && (name == "add" || name == "sub" || name == "mul" || name == "div") {
+            left := intervalOf(terms.nth(args, 0), limits, depth + 1)
+            right := intervalOf(terms.nth(args, 1), limits, depth + 1)
+            if left is Result.Ok(a) && right is Result.Ok(b) {
+                if name == "add" {
+                    lo := terms.safeAdd(a.low, b.low)
+                    hi := terms.safeAdd(a.high, b.high)
+                    if lo is Result.Ok(l) && hi is Result.Ok(h) {
+                        return Result.Ok(Range(l, h))
+                    }
+                } else if name == "sub" {
+                    lo := terms.safeAdd(a.low, 0 - b.high)
+                    hi := terms.safeAdd(a.high, 0 - b.low)
+                    if b.high != terms.intMin() && b.low != terms.intMin() && lo is Result.Ok(l) && hi is Result.Ok(h) {
+                        return Result.Ok(Range(l, h))
+                    }
+                } else if name == "mul" {
+                    return productRange(a, b)
+                } else if b.low > 0 && b.low == b.high {
+                    // A quotient by a positive literal keeps the order of what is divided.
+                    return Result.Ok(Range(a.low / b.low, a.high / b.low))
+                }
+            }
+            return Result.Error(false)
+        }
+    }
+    r := atomRange(terms.key(t), limits)
+    if r.low == terms.intMin() && r.high == terms.intMax() {
+        return Result.Error(false)
+    }
+    return Result.Ok(r)
+}
+
+func productRange(a: Range, b: Range): Result<Range, Bool> {
+    mut Int[dyn] corners = []
+    for each x in [a.low, a.high] {
+        for each y in [b.low, b.high] {
+            if terms.safeMul(x, y) is Result.Ok(p) {
+                append(corners, p)
+            } else {
+                return Result.Error(false)
+            }
+        }
+    }
+    mut low := terms.intMax()
+    mut high := terms.intMin()
+    for each c in corners {
+        if c < low {
+            low = c
+        }
+        if c > high {
+            high = c
+        }
+    }
+    return Result.Ok(Range(low, high))
 }
 
 // The longest a vector or a string is taken to be: 2^60 elements. No machine can hold
@@ -725,6 +840,81 @@ proc infeasible(cs: Lin[]): Bool {
             return true
         }
     }
+    if negativeCycle(cs) {
+        return true
+    }
+    return eliminates(cs)
+}
+
+// Fourier–Motzkin: each atom in turn taken out by adding every pair of
+// constraints that bound it from opposite sides, until what is left either has no
+// atoms and cannot hold, or cannot be taken further. What it finds is a
+// contradiction over the rationals, and so over the integers too. A pair whose
+// sum would overflow the prover's own arithmetic is left out, which only ever
+// makes a contradiction harder to find.
+proc eliminates(cs: Lin[]): Bool {
+    mut Lin[dyn] current = []
+    for each c in cs {
+        append(current, c)
+    }
+    for round := 0; round < 12; round++ {
+        mut atom := ""
+        for each c in current {
+            if len(c.atoms) == 0 && c.constant > 0 {
+                return true
+            }
+            for each a in c.atoms {
+                if atom == "" {
+                    atom = a
+                }
+            }
+        }
+        if atom == "" {
+            return false
+        }
+        mut Lin[dyn] above = []
+        mut Lin[dyn] below = []
+        mut Lin[dyn] next = []
+        for each c in current {
+            k := coefficientOf(c, atom)
+            if k > 0 {
+                append(above, c)
+            } else if k < 0 {
+                append(below, c)
+            } else {
+                append(next, c)
+            }
+        }
+        for each a in above {
+            for each b in below {
+                ka := coefficientOf(a, atom)
+                kb := 0 - coefficientOf(b, atom)
+                if linScale(a, kb) is Result.Ok(sa) && linScale(b, ka) is Result.Ok(sb) {
+                    if linAdd(sa, sb) is Result.Ok(sum) {
+                        append(next, sum)
+                    }
+                }
+                if len(next) > 400 {
+                    return false
+                }
+            }
+        }
+        current = next
+    }
+    return false
+}
+
+func coefficientOf(c: Lin, atom: Str): Int {
+    if indexOf(c.atoms, atom) is Result.Ok(at) {
+        if c.coeffs bounds at {
+            return c.coeffs[at]
+        }
+    }
+    return 0
+}
+
+// The difference constraints among `cs`, as a graph with a negative cycle.
+proc negativeCycle(cs: Lin[]): Bool {
     edges := edgesOf(cs)
     mut Str[dyn] nodes = ["0"]
     for each e in edges {

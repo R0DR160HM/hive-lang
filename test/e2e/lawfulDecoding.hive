@@ -1,0 +1,85 @@
+// What a decoder hands over keeps its type's laws: a value read from outside was
+// built by nothing the compiler saw, so its laws are checked where it arrives, and
+// one that breaks a law is refused as `Broken`.
+type Booking {
+    room: Str
+    checkInDay: Int
+    checkOutDay: Int
+
+    law atLeastOneNight(b: Booking) {
+        assert b.checkInDay >= 0 && b.checkInDay < b.checkOutDay
+    }
+
+}
+
+type Stay {
+    guest: Str
+    booking: Booking
+}
+
+type Window {
+    width: Int
+    height: Int
+
+    law onScreen(w: Window) {
+        assert w.width > 0 && w.height > 0
+    }
+
+}
+
+type Guest {
+    name: Str
+    age: Int
+
+    law grownUp(g: Guest) {
+        assert g.age >= 18
+    }
+
+}
+
+query guests(): Guest[dyn] {
+    SELECT name, age FROM guests
+}
+
+func nights(b: Booking): Int {
+    return b.checkOutDay - b.checkInDay
+}
+
+proc main(): void {
+    if Booking.decode(`\{"room": "12", "checkInDay": 4, "checkOutDay": 6}`, hive.json.codec()) is Result.Ok(b) {
+        echo "room {b.room}, {nights(b)} nights"
+    }
+
+    stay := Stay.decode(`\{"guest": "Ada", "booking": \{"room": "12", "checkInDay": 6, "checkOutDay": 6}}`, hive.json.codec())
+    if stay is Result.Error(e) {
+        echo e
+        echo e.path
+        echo e is hive.json.JsonError.Broken
+    }
+
+    // A document of the wrong shape is still the failure it always was.
+    if Booking.decode(`\{"room": 12}`, hive.json.codec()) is Result.Error(e) {
+        echo e is hive.json.JsonError.Mismatch
+        echo e
+    }
+
+    echo Window.decode("--width 0 --height 3", hive.term.codec())
+    echo Window.decode("width=640&height=480", hive.net.queryParamsCodec())
+    if Window.decode("width=640&height=-1", hive.net.queryParamsCodec()) is Result.Error(e) {
+        echo e is hive.net.QueryParamsError.Broken
+    }
+
+    opened := hive.sql.pool(hive.sql.DatabaseDriver.SQLite(), ":memory:", 1, 1)
+    if opened is Result.Ok(db) {
+        _ := hive.sql.unsafe(db, "CREATE TABLE guests (name TEXT, age INTEGER)")
+        _ := hive.sql.unsafe(db, "INSERT INTO guests VALUES ('Grace', 45), ('Ada', 36)")
+        echo hive.sql.run(db, guests())
+        _ := hive.sql.unsafe(db, "INSERT INTO guests VALUES ('Tim', 9)")
+        got := hive.sql.run(db, guests())
+        echo got
+        if got is Result.Error(e) {
+            echo e is hive.sql.SqlError.Broken
+        }
+        hive.sql.close(db)
+    }
+}

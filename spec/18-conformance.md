@@ -84,9 +84,11 @@ All of it.
 | patterns | all five kinds, with narrowing through `&&`; a binary pattern's fields read in one pass, its alignment checked at compile time; a string template's holes both ways, with its regexes read at compile time and the whole template compiled once ([07](07-patterns.md)) |
 | builtins | all of [13](13-builtins.md) |
 | standard library | every module of [14](14-stdlib.md): `hive.conv`, `hive.math`, `hive.map`, `hive.file`, `hive.env`, `hive.term`, `hive.task`, `hive.time`, `hive.json`, `hive.crypto`, `hive.net`, `hive.syslink`, `hive.sql`, `hive.ui` and `hive.ui.scene` |
-| reading tables | every reader: `hive.file.csv`, `hive.file.xlsx`, `hive.file.ods`, `hive.sql.run` on a declared `query`, and `hive.sql.raw` ([14.6](14-stdlib.md#146-reading-tables)) |
+| reading tables | every reader: `hive.file.csv`, `hive.file.xlsx`, `hive.file.ods`, `hive.sql.run` on a declared `query`, and `hive.sql.unsafe` ([14.6](14-stdlib.md#146-reading-tables)) |
 | testing | `test` declarations, `assert` with both sides, per-declaration coverage, the report ([16](16-testing.md)) |
 | laws | `law` declarations, proved before anything is written: counterexamples, every value of a small type, a run on unknowns with case splits and integer reasoning, lemmas, written and automatic induction ([19](19-laws.md)) |
+| table laws | a law `for table` a table, whose filter every `query` on the table carries — in what it reads, changes and deletes, and in every row it writes — read off the query's SQL, with `hive.sql.unsafe` outside it ([19.7](19-laws.md#197-a-tables-laws)) |
+| type laws | a law inside a type, kept at every construction and write, known at every read and by the bounds pass, and checked by every decoder, which refuses a value breaking one as `Broken` ([19.6](19-laws.md#196-a-types-laws)) |
 
 A module nothing reaches for is still not in the build: what a program links is
 what it named. `hive.sql` is the one that carries dependencies (its two drivers)

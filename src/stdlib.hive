@@ -193,6 +193,14 @@ func declarationsOf(module: Str): Str {
             	Object \{ properties: hive.map.Map<Str, JsonValue> }
             	Null
             }
+
+            type JsonError \{
+            	Mismatch
+            	Broken
+            	path: Str
+            	expected: Str
+            	found: Str
+            }
         `
     }
     if module == "file" {
@@ -238,6 +246,14 @@ func declarationsOf(module: Str): Str {
             	Receive
             	message: Str
             }
+
+            type QueryParamsError \{
+            	Mismatch
+            	Broken
+            	path: Str
+            	expected: Str
+            	found: Str
+            }
         `
     }
     if module == "sql" {
@@ -247,6 +263,7 @@ func declarationsOf(module: Str): Str {
             	Statement
             	Shape
             	Convert
+            	Broken
             	message: Str
             }
         `
@@ -259,6 +276,14 @@ func declarationsOf(module: Str): Str {
             	LimitExceeded
             	Unsupported
             	message: Str
+            }
+
+            type JwtError \{
+            	Mismatch
+            	Broken
+            	path: Str
+            	expected: Str
+            	found: Str
             }
         `
     }
@@ -293,6 +318,14 @@ func declarationsOf(module: Str): Str {
             	Receive
             	message: Str
             }
+
+            type FlagError \{
+            	Mismatch
+            	Broken
+            	path: Str
+            	expected: Str
+            	found: Str
+            }
         `
     }
     if module == "" {
@@ -323,6 +356,15 @@ func errorModulesFor(module: Str): Str[dyn] {
     return []
 }
 
+// The one declaration of a module that comes with it without the rest: JSON's
+// codec fails with a `JsonError`, while a `JsonValue` is there only where named.
+func errorTypesFor(module: Str): Str[dyn] {
+    if module == "json" {
+        return ["JsonError"]
+    }
+    return []
+}
+
 // Whether a flattened name is one of the error unions above, which the runtime
 // reports as a struct with a `Reason` and the program reads as a union.
 func isErrorUnion(name: Str): Bool {
@@ -331,7 +373,7 @@ func isErrorUnion(name: Str): Bool {
         return false
     }
     module := text.charAt(parts, 1)
-    return module != "json" && indexOf(declaringModules(), module) is Result.Ok(_)
+    return (module != "json" || text.charAt(parts, 2) == "JsonError") && indexOf(declaringModules(), module) is Result.Ok(_)
 }
 
 // The runtime's struct for one of those, which the union is lifted from.
@@ -367,10 +409,18 @@ func tableHasNoDecoder(): Str {
 
 // What decoding in a format fails with: each module that carries a codec owns it.
 func codecErrorOf(format: Str): types.Ty {
-    if format == "jwt" { return types.Ty.TLib("crypto", "JwtError") }
-    if format == "query" { return types.Ty.TLib("net", "QueryParamsError") }
-    if format == "term" { return types.Ty.TLib("term", "FlagError") }
-    return types.Ty.TLib("json", "JsonError")
+    if format == "jwt" { return types.libraryError("crypto", "JwtError") }
+    if format == "query" { return types.libraryError("net", "QueryParamsError") }
+    if format == "term" { return types.libraryError("term", "FlagError") }
+    return types.libraryError("json", "JsonError")
+}
+
+// The runtime's struct for that, which the program's union is lifted from.
+func codecRuntimeError(format: Str): Str {
+    if codecErrorOf(format) is types.Ty.TNamed(name) {
+        return runtimeErrorType(name)
+    }
+    return "hive.JsonJsonError"
 }
 
 // The format a codec's type names, read off the error its decoding fails with,

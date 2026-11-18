@@ -1,11 +1,14 @@
-// A hotel's bookings, and a law they keep: a cancelled booking stays cancelled,
-// whatever happens to it afterwards. The `law` is proved while this file compiles —
-// for every booking and every event, not for the few a test would pick — so if
-// `apply` ever let one come back, the program would stop compiling and say which
-// booking and which event do it.
+// A hotel's bookings, and three laws they keep. A cancelled booking stays
+// cancelled, whatever happens to it afterwards: that `law` is proved while this file
+// compiles — for every booking and every event, not for the few a test would pick —
+// so if `apply` ever let one come back, the program would stop compiling and say
+// which booking and which event do it. Every booking names a guest and a room: that
+// one lives in the type, so every place that makes a booking or changes one has to
+// keep it. And a guest only ever sees their own bookings: that one is about a table,
+// so every query on it has to say so in its SQL.
 //
-// Nothing runs a law: `hive run` prints what `main` prints, and the law was settled
-// before any of it was written.
+// Nothing runs a law: `hive run` prints what `main` prints, and the laws were
+// settled before any of it was written.
 
 type Status {
     Requested
@@ -26,6 +29,11 @@ type Booking {
     guest: Str
     room: Str
     status: Status
+
+    law named(b: Booking) {
+        assert b.guest != "" && b.room != ""
+    }
+
 }
 
 // What one event does to a booking, written into it. A cancelled or finished
@@ -76,6 +84,27 @@ func statusName(s: Status): Str {
     }
 }
 
+type Guest {
+    name: Str
+}
+
+type Stay {
+    room: Str
+    status: Str
+}
+
+law ownBookingsOnly(guest: Guest) for table bookings {
+    guest_name = {guest.name}
+}
+
+query saved(guest: Guest, room: Str, status: Str): void {
+    INSERT INTO bookings (guest_name, room, status) VALUES ({guest.name}, {room}, {status})
+}
+
+query staysOf(guest: Guest): Stay[dyn] {
+    SELECT room, status FROM bookings WHERE guest_name = {guest.name} ORDER BY room
+}
+
 proc replay(booking: mut Booking, log: Event[]): void {
     for each event in log {
         apply(booking, event)
@@ -89,4 +118,14 @@ proc main(): void {
 
     mut grace := Booking("Grace", "14", Status.Requested())
     replay(grace, [Event.Confirm(), Event.Cancel("flight moved"), Event.Arrive()])
+
+    opened := hive.sql.pool(hive.sql.DatabaseDriver.SQLite(), ":memory:", 1, 1)
+    if opened is Result.Ok(db) {
+        _ := hive.sql.unsafe(db, "CREATE TABLE bookings (guest_name TEXT, room TEXT, status TEXT)")
+        for each b in [ada, grace] {
+            _ := hive.sql.run(db, saved(Guest(b.guest), b.room, statusName(b.status)))
+        }
+        echo hive.sql.run(db, staysOf(Guest("Ada")))
+        hive.sql.close(db)
+    }
 }

@@ -234,6 +234,9 @@ func CryptoJwtCodec(secret Secret) CodecCodec[CryptoJwtError] {
 }
 
 type CryptoJwtError struct {
+	// The variant of the program's union: `Mismatch`, or `Broken` where the
+	// value was read whole but does not keep its type's law.
+	Reason   string
 	Path     string
 	Expected string
 	Found    string
@@ -286,6 +289,7 @@ func CryptoJwtParse[T any](token string, secret Secret, dec func(JsonValue, stri
 	if claims.IsError() {
 		why := claims.Err()
 		return Err[T, CryptoJwtError](CryptoJwtError{
+			Reason:   "Mismatch",
 			Path:     "$",
 			Expected: "a JWT signed with this secret",
 			Found:    why.Reason + ": " + why.Message,
@@ -294,7 +298,7 @@ func CryptoJwtParse[T any](token string, secret Secret, dec func(JsonValue, stri
 	read := JsonParse(claims.Ok(), dec)
 	if read.IsError() {
 		why := read.Err()
-		return Err[T, CryptoJwtError](CryptoJwtError{Path: why.Path, Expected: why.Expected, Found: why.Found})
+		return Err[T, CryptoJwtError](CryptoJwtError{Reason: why.Reason, Path: why.Path, Expected: why.Expected, Found: why.Found})
 	}
 	return Ok[T, CryptoJwtError](read.Ok())
 }

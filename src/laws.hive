@@ -19,6 +19,8 @@
 import ./ast
 import ./diag
 import ./infer
+import ./keeps
+import ./tables
 import ./prove
 import ./ranges
 import ./terms
@@ -27,14 +29,91 @@ import ./types
 import hive.map
 
 // The module the emitter is handed: everything but the laws, which never run.
+// What reaches the emitter. A function law is proved, and nothing calls one, so
+// none is left. A type's law is left as the check a decoder runs on what it read:
+// nothing the compiler saw built such a value, so its law is checked where it
+// arrives — answering `""` where it holds, and otherwise the claim that did not.
 func without(m: ast.Module): ast.Module {
+    mut Str[dyn] lawNames = []
+    for each d in m.decls {
+        if d is ast.Decl.CallableDecl(kind, name, _, _, _, _) {
+            if kind is ast.CallableKind.LawKind {
+                append(lawNames, name)
+            }
+        }
+    }
     mut ast.Decl[dyn] kept = []
     for each d in m.decls {
-        if ast.isLaw(d) == false {
+        if d is ast.Decl.CallableDecl(kind, name, params, _, body, at) {
+            if kind is ast.CallableKind.TypeLawKind {
+                mut ast.Stmt[dyn] stmts = runnable(lawNames, body.stmts)
+                append(stmts, ast.Stmt.ReturnStmt(ast.Expr.StrLit("", at), at))
+                append(kept, ast.Decl.CallableDecl(kind, name, params, ast.TypeExpr.Named("", "Str", [], []), ast.Block(stmts), at))
+            } else if ast.isLaw(d) == false {
+                append(kept, d)
+            }
+        } else if ast.isLaw(d) == false {
             append(kept, d)
         }
     }
     return ast.Module(m.imports, kept, m.foreign, m.library)
+}
+
+// A law's statements as a check: each `assert` answers with its first claim that
+// does not hold, and a call to a function law, which holds for every value, is
+// left out.
+func runnable(lawNames: Str[], stmts: ast.Stmt[]): ast.Stmt[dyn] {
+    mut ast.Stmt[dyn] out = []
+    for each s in stmts {
+        if s is ast.Stmt.AssertStmt(condition, at) {
+            parts := ast.conjuncts(condition)
+            mut ast.Expr[dyn] claims = []
+            if ast.conjunctsBind(parts) {
+                append(claims, condition)
+            } else {
+                for each part in parts {
+                    append(claims, part)
+                }
+            }
+            for each c in claims {
+                said := "`" + prove.exprText(c) + "`"
+                answer := ast.Block([ast.Stmt.ReturnStmt(ast.Expr.StrLit(said, at), at)])
+                append(out, ast.Stmt.IfChain([ast.Branch(ast.Expr.Not(c, at), answer)], ast.Block([]), false, at))
+            }
+        } else if s is ast.Stmt.Expression(value, at) && callsLaw(lawNames, value) {
+            append(out, ast.Stmt.Nothing(at))
+        } else if s is ast.Stmt.ReturnStmt(value, at) && value is ast.Expr.Absent {
+            append(out, ast.Stmt.ReturnStmt(ast.Expr.StrLit("", at), at))
+        } else if s is ast.Stmt.IfChain(branches, otherwise, hasElse, at) {
+            append(out, ast.Stmt.IfChain(runnableBranches(lawNames, branches), ast.Block(runnable(lawNames, otherwise.stmts)), hasElse, at))
+        } else if s is ast.Stmt.SwitchStmt(lets, subjects, arms, binds, at) {
+            append(out, ast.Stmt.SwitchStmt(lets, subjects, runnableBranches(lawNames, arms), binds, at))
+        } else if s is ast.Stmt.ForEach(name, declared, subject, body, at) {
+            append(out, ast.Stmt.ForEach(name, declared, subject, ast.Block(runnable(lawNames, body.stmts)), at))
+        } else if s is ast.Stmt.ForLoop(init, cond, post, body, at) {
+            append(out, ast.Stmt.ForLoop(init, cond, post, ast.Block(runnable(lawNames, body.stmts)), at))
+        } else {
+            append(out, s)
+        }
+    }
+    return out
+}
+
+func runnableBranches(lawNames: Str[], branches: ast.Branch[]): ast.Branch[dyn] {
+    mut ast.Branch[dyn] out = []
+    for each b in branches {
+        append(out, ast.Branch(b.condition, ast.Block(runnable(lawNames, b.body.stmts))))
+    }
+    return out
+}
+
+func callsLaw(lawNames: Str[], e: ast.Expr): Bool {
+    if e is ast.Expr.Call(callee, _, _) {
+        if callee is ast.Expr.Ident(name, _) {
+            return indexOf(lawNames, name) is Result.Ok(_)
+        }
+    }
+    return false
 }
 
 func count(m: ast.Module): Int {
@@ -74,6 +153,16 @@ proc checkModule(expanded: ast.Module): diag.Diagnostic[dyn] {
         return out
     }
     for each d in expanded.decls {
+        if d is ast.Decl.CallableDecl(kind, name, _, _, body, at) {
+            // A type's law is not proved: it is kept, wherever a value of the type is
+            // built or written. Its body is held to what any law may reach.
+            if kind is ast.CallableKind.TypeLawKind {
+                reach := reachProblem(cx, name, body, at)
+                if reach != "" {
+                    append(out, diag.on(at, inLaw(name, reach)))
+                }
+            }
+        }
         if d is ast.Decl.CallableDecl(kind, name, params, _, body, at) {
             if kind is ast.CallableKind.LawKind {
                 reach := reachProblem(cx, name, body, at)
@@ -93,11 +182,19 @@ proc checkModule(expanded: ast.Module): diag.Diagnostic[dyn] {
             }
         }
     }
+    // Every value of a type with laws, built or written anywhere, keeps them.
+    for each e in keeps.checkModule(expanded, cx) {
+        append(out, e)
+    }
+    // Every query on a table with a law carries its filter.
+    for each e in tables.checkModule(expanded, cx) {
+        append(out, e)
+    }
     return out
 }
 
 func inLaw(name: Str, message: Str): Str {
-    return "in law `" + types.shownName(name) + "`: " + message
+    return "in law `" + ast.lawShown(types.shownName(name)) + "`: " + message
 }
 
 // --- The stages -----------------------------------------------------------------
@@ -291,7 +388,11 @@ proc start(pr: mut prove.Prover, cx: prove.Context, name: Str, params: ast.Param
     for each a in args {
         append(held, a)
     }
-    begin := prove.Path(env, [], shapes, [], prove.End.Running(), [], prove.Frame(name, held), 0, [])
+    mut prove.Path begin = prove.Path(env, [], shapes, [], prove.End.Running(), [], prove.Frame(name, held), 0, [], [])
+    // A parameter whose type has laws is a value that keeps them.
+    for each a in args {
+        begin = prove.withTypeLaws(pr, cx, begin, a)
+    }
     scope := infer.boundParams(cx.base, params, 0)
     return prove.execBlock(pr, cx, scope, begin, body.stmts)
 }

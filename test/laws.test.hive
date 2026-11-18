@@ -8,6 +8,7 @@ import ../src/check
 import ../src/laws
 import ../src/loader
 import ../src/mono
+import ../src/ranges
 import ../src/solve
 import ../src/terms
 import ../src/text
@@ -25,6 +26,9 @@ proc verdict(source: Str): Str {
     }
     for each e in check.checkModule(expanded.module) {
         return "check: " + e.message
+    }
+    for each e in ranges.checkModule(expanded.module) {
+        return e.message
     }
     for each e in laws.checkModule(expanded.module) {
         return e.message
@@ -628,4 +632,486 @@ test "what a proc writes through a mut parameter reaches the variable it was han
             assert replay(booking, log).room == booking.room
         }
     `))
+}
+
+// --- Type laws ------------------------------------------------------------------------
+
+func stays(): Str {
+    return `
+        type Booking \{
+            room: Str
+            checkInDay: Int
+            checkOutDay: Int
+            law atLeastOneNight(b: Booking) \{
+                assert b.checkInDay >= 0 && b.checkInDay < b.checkOutDay
+            }
+        }
+    `
+}
+
+test "a value built behind the right guards keeps its type's law" {
+    assert proves(withMain(stays() + `
+        func book(room: Str, firstDay: Int, nights: Int): Result<Booking, Str> \{
+            if firstDay < 0 || firstDay > 100000 || nights < 1 || nights > 365 \{
+                return Result.Error("dates out of range")
+            }
+            return Result.Ok(Booking(room, firstDay, firstDay + nights))
+        }
+    `))
+}
+
+test "a value built without them is refused where it is built" {
+    got := verdict(withMain(stays() + `
+        func moveEarlier(b: Booking, days: Int): Booking \{
+            return Booking(b.room, b.checkInDay - days, b.checkOutDay - days)
+        }
+    `))
+    assert opens(got, "in `moveEarlier`: cannot prove `Booking.atLeastOneNight` for this `Booking(...)`: nothing here shows `0 <= b.checkInDay - days`")
+}
+
+test "a write that may break the law is refused where it is written" {
+    got := verdict(withMain(stays() + `
+        proc shorten(b: mut Booking): void \{
+            b.checkOutDay = b.checkOutDay - 1
+        }
+    `))
+    assert opens(got, "in `shorten`: cannot prove `Booking.atLeastOneNight` for this write to `b.checkOutDay`")
+}
+
+test "a write the guards keep in range keeps the law" {
+    assert proves(withMain(stays() + `
+        proc extendStay(b: mut Booking, extra: Int): void \{
+            if extra > 0 && extra <= 365 && b.checkOutDay <= 100000 \{
+                b.checkOutDay += extra
+            }
+        }
+    `))
+}
+
+test "a value that plainly breaks the law says so" {
+    got := verdict(withMain(stays() + `
+        func empty(): Booking \{
+            return Booking("12", 5, 5)
+        }
+    `))
+    assert opens(got, "in `empty`: this `Booking(...)` does not keep `Booking.atLeastOneNight`: `b.checkInDay < b.checkOutDay` is false")
+}
+
+test "a function law may rely on the laws of its parameters' types" {
+    assert proves(withMain(stays() + `
+        func nights(b: Booking): Int \{
+            return b.checkOutDay - b.checkInDay
+        }
+        law aStayHasNights(b: Booking) \{
+            assert nights(b) > 0
+        }
+    `))
+}
+
+test "a law inside a type takes one value of it" {
+    got := verdict(withMain(`
+        type Pair \{
+            a: Int
+            b: Int
+            law same(x: Pair, y: Pair) \{
+                assert x.a == y.a
+            }
+        }
+    `))
+    assert opens(got, "loader: a law inside `Pair` is about one value of it, so it takes exactly one parameter, of type `Pair`")
+}
+
+test "a type's law is held to what any law may reach" {
+    got := verdict(withMain(`
+        type Stamp \{
+            at: Int
+            law recent(s: Stamp) \{
+                assert s.at <= hive.time.now()
+            }
+        }
+    `))
+    assert opens(got, "in law `Stamp.recent`: it calls `hive.time.now`")
+}
+
+func orders(): Str {
+    return `
+        type Order \{
+            lines: Str[dyn]
+            law hasLines(o: Order) \{
+                assert len(o.lines) > 0
+            }
+        }
+    `
+}
+
+test "growing a field in place keeps a law about its length" {
+    assert proves(withMain(orders() + `
+        proc addLine(o: mut Order, line: Str): void \{
+            append(o.lines, line)
+        }
+    `))
+}
+
+test "shrinking a field in place is a write the law is held to" {
+    got := verdict(withMain(orders() + `
+        proc removeFirst(o: mut Order): void \{
+            if o.lines bounds 0 \{
+                _ := drop(o.lines, 0, 0)
+            }
+        }
+    `))
+    assert opens(got, "in `removeFirst`: cannot prove `Order.hasLines` for this `drop` on `o.lines`: nothing here shows `0 < len(new o.lines)`")
+}
+
+test "shrinking it behind a guard that leaves enough keeps the law" {
+    assert proves(withMain(orders() + `
+        proc removeFirst(o: mut Order): void \{
+            if len(o.lines) > 1 && o.lines bounds 0 \{
+                _ := drop(o.lines, 0, 0)
+            }
+        }
+    `))
+}
+
+test "a field handed to a mut parameter may come back as anything" {
+    got := verdict(withMain(orders() + `
+        proc clearAll(lines: mut Str[dyn]): void \{
+            lines = []
+        }
+        proc emptyOut(o: mut Order): void \{
+            clearAll(o.lines)
+        }
+    `))
+    assert opens(got, "in `emptyOut`: cannot prove `Order.hasLines` for this `clearAll` on `o.lines`")
+}
+
+test "an index a type's law guarantees needs no guard" {
+    assert proves(withMain(orders() + `
+        type Picker \{
+            rooms: Str[dyn]
+            selected: Int
+            law inRange(p: Picker) \{
+                assert p.rooms bounds p.selected
+            }
+        }
+        func chosen(p: Picker): Str \{
+            return p.rooms[p.selected]
+        }
+        func firstLine(o: Order): Str \{
+            return o.lines[0]
+        }
+    `))
+}
+
+test "an index past what the law guarantees still needs one" {
+    got := verdict(withMain(orders() + `
+        func secondLine(o: Order): Str \{
+            return o.lines[1]
+        }
+    `))
+    assert opens(got, "in `secondLine`: cannot prove `1` is in range")
+}
+
+test "a mut sharing part of a value with laws may not write it" {
+    got := verdict(withMain(orders() + `
+        proc trim(o: mut Order): void \{
+            mut lines := o.lines
+            append(lines, "extra")
+        }
+    `))
+    assert opens(got, "in `trim`: cannot prove `Order.hasLines` for this `append` on `lines`: `lines` shares the storage of `o.lines`")
+}
+
+test "a mut given storage of its own may" {
+    assert proves(withMain(orders() + `
+        proc trim(o: mut Order): void \{
+            mut lines := o.lines
+            lines = ["fresh"]
+            append(lines, "extra")
+        }
+    `))
+}
+
+test "a write through one name is a write through every name sharing it" {
+    got := verdict(withMain(stays() + `
+        proc reschedule(b: mut Booking): void \{
+            mut same := b
+            if b.checkInDay == 0 && b.checkOutDay == 10 \{
+                same.checkOutDay = 1
+                b.checkInDay = 5
+            }
+        }
+    `))
+    assert opens(got, "in `reschedule`: cannot prove `Booking.atLeastOneNight` for this write to `b.checkInDay`")
+}
+
+test "a law cannot follow a mut that shares a path into another" {
+    got := verdict(withMain(`
+        type Box \{
+            items: Int[dyn]
+        }
+        func emptied(b: Box): Int \{
+            mut copy := b
+            mut items := copy.items
+            append(items, 1)
+            return len(copy.items)
+        }
+        law emptiedCounts(b: Box) \{
+            assert emptied(b) == len(b.items)
+        }
+    `))
+    assert opens(got, "in law `emptiedCounts`: ")
+    assert text.contains(got, "shares `copy`'s storage")
+}
+
+test "a name rebound in one branch still shares in the other" {
+    got := verdict(withMain(stays() + `
+        proc reschedule(b: mut Booking): void \{
+            mut same := b
+            if b.room == "12" \{
+                same = Booking("14", 0, 1)
+            }
+            if b.checkInDay == 0 && b.checkOutDay == 10 && same.checkInDay == 0 \{
+                same.checkOutDay = 1
+                b.checkInDay = 5
+            }
+        }
+    `))
+    assert opens(got, "in `reschedule`: cannot prove `Booking.atLeastOneNight` for this write to `b.checkInDay`")
+}
+
+// --- Table laws -----------------------------------------------------------------------
+
+func tenants(): Str {
+    return `
+        type Session \{
+            userId: Int
+            orgId: Int
+        }
+        type Person \{
+            id: Int
+            name: Str
+        }
+        law sameOrganization(session: Session) for table users \{
+            org_id = \{session.orgId}
+        }
+    `
+}
+
+func chats(): Str {
+    return `
+        type Contact \{
+            id: Int
+        }
+        type Chat \{
+            id: Int
+            body: Str
+        }
+        law ownChatsOnly(contact: Contact) for table chats \{
+            fk_contact_from_id = \{contact.id} or
+            fk_contact_to_id = \{contact.id}
+        }
+    `
+}
+
+test "a query carrying a table's filter compiles" {
+    assert proves(withMain(tenants() + `
+        query colleagues(session: Session): Person[dyn] \{
+            SELECT id, name FROM users WHERE org_id = \{session.orgId} ORDER BY name
+        }
+        query rename(session: Session, id: Int, name: Str): void \{
+            UPDATE users SET name = \{name} WHERE id = \{id} AND org_id = \{session.orgId}
+        }
+        query remove(session: Session, id: Int): void \{
+            DELETE FROM users WHERE org_id = \{session.orgId} AND id = \{id}
+        }
+    `))
+}
+
+test "a query without it is refused, and told what to carry" {
+    got := verdict(withMain(tenants() + `
+        query everyoneActive(session: Session): Person[dyn] \{
+            SELECT id, name FROM users WHERE active = 1
+        }
+    `))
+    assert opens(got, "in `everyoneActive`: this query reads `users` without the filter law `sameOrganization` keeps on it\n    its WHERE has to carry `org_id = \{session.orgId}`")
+}
+
+test "a query on the table has to take the law's parameter" {
+    got := verdict(withMain(tenants() + `
+        query everyone(): Person[dyn] \{
+            SELECT id, name FROM users
+        }
+    `))
+    assert opens(got, "in `everyone`: this query touches `users`, which law `sameOrganization` filters by a `Session`, so it has to take one")
+}
+
+test "a join names the table's columns through its alias" {
+    assert proves(withMain(tenants() + `
+        query withTeams(session: Session): Person[dyn] \{
+            SELECT u.id, u.name FROM users u JOIN teams t ON t.id = u.team_id WHERE u.org_id = \{session.orgId}
+        }
+    `))
+    got := verdict(withMain(tenants() + `
+        query withTeams(session: Session): Person[dyn] \{
+            SELECT u.id, u.name FROM users u JOIN teams t ON t.id = u.team_id WHERE org_id = \{session.orgId}
+        }
+    `))
+    assert opens(got, "in `withTeams`: this query reads `users` without the filter law `sameOrganization` keeps on it\n    its WHERE has to carry `u.org_id = \{session.orgId}`")
+}
+
+test "a subquery carries the filter on its own" {
+    assert proves(withMain(tenants() + `
+        query titles(session: Session): Str[dyn] \{
+            SELECT title FROM posts WHERE author IN (SELECT id FROM users WHERE org_id = \{session.orgId})
+        }
+    `))
+    got := verdict(withMain(tenants() + `
+        query titles(session: Session): Str[dyn] \{
+            SELECT title FROM posts WHERE author IN (SELECT id FROM users)
+        }
+    `))
+    assert opens(got, "in `titles`: this query reads `users` without the filter law `sameOrganization` keeps on it")
+}
+
+test "a part that says more carries a filter of alternatives" {
+    assert proves(withMain(chats() + `
+        query conversation(contact: Contact): Chat[dyn] \{
+            SELECT id, body FROM chats WHERE (fk_contact_from_id = \{contact.id} OR fk_contact_to_id = \{contact.id}) AND body <> ''
+        }
+        query sent(contact: Contact): Chat[dyn] \{
+            SELECT id, body FROM chats WHERE fk_contact_from_id = \{contact.id}
+        }
+    `))
+    got := verdict(withMain(chats() + `
+        query theirs(contact: Contact, other: Int): Chat[dyn] \{
+            SELECT id, body FROM chats WHERE fk_contact_from_id = \{other}
+        }
+    `))
+    assert opens(got, "in `theirs`: this query reads `chats` without the filter law `ownChatsOnly` keeps on it")
+}
+
+test "an insert writes a value the filter keeps" {
+    assert proves(withMain(chats() + `
+        query send(contact: Contact, to: Int, body: Str): void \{
+            INSERT INTO chats (fk_contact_from_id, fk_contact_to_id, body) VALUES (\{contact.id}, \{to}, \{body})
+        }
+    `))
+    got := verdict(withMain(chats() + `
+        query forge(contact: Contact, from: Int, to: Int, body: Str): void \{
+            INSERT INTO chats (fk_contact_from_id, fk_contact_to_id, body) VALUES (\{from}, \{to}, \{body})
+        }
+    `))
+    assert opens(got, "in `forge`: this query inserts a row into `chats` that law `ownChatsOnly`'s filter does not keep\n    it has to write one of `fk_contact_from_id` as `\{contact.id}`, or `fk_contact_to_id` as `\{contact.id}`")
+}
+
+test "an update may not move a row out of the filter" {
+    assert proves(withMain(chats() + `
+        query redirect(contact: Contact, id: Int, to: Int): void \{
+            UPDATE chats SET fk_contact_to_id = \{to} WHERE id = \{id} AND fk_contact_from_id = \{contact.id}
+        }
+    `))
+    got := verdict(withMain(tenants() + `
+        query move(session: Session, id: Int, org: Int): void \{
+            UPDATE users SET org_id = \{org} WHERE id = \{id} AND org_id = \{session.orgId}
+        }
+    `))
+    assert opens(got, "in `move`: this query moves a row of `users` out of law `sameOrganization`'s filter: it sets `org_id` to something the filter does not keep")
+}
+
+test "a law's if is carried by a query whose if it implies" {
+    base := `
+        type User \{
+            Admin
+            Regular
+            id: Int
+            orgId: Int
+        }
+        type Session \{
+            user: User
+        }
+        type Person \{
+            id: Int
+            name: Str
+        }
+        law sameOrganization(session: Session) for table users \{
+            if session.user is User.Regular \{
+                org_id = \{session.user.orgId}
+            }
+        }
+    `
+    assert proves(withMain(base + `
+        query people(session: Session, everything: Bool): Person[dyn] \{
+            SELECT id, name FROM users
+            WHERE \{
+                if session.user is User.Regular || everything == false \{ org_id = \{session.user.orgId} }
+            }
+        }
+    `))
+    got := verdict(withMain(base + `
+        query people(session: Session): Person[dyn] \{
+            SELECT id, name FROM users
+            WHERE \{
+                if session.user is User.Admin \{ org_id = \{session.user.orgId} }
+            }
+        }
+    `))
+    assert opens(got, "in `people`: this query reads `users` without the filter law `sameOrganization` keeps on it")
+}
+
+test "hive.sql.unsafe is not a query, and no law reads it" {
+    assert proves(withMain(tenants() + `
+        proc wipe(db: hive.sql.SqlConnection): void \{
+            _ := hive.sql.unsafe(db, "DELETE FROM users")
+        }
+    `))
+}
+
+test "a law about a table takes one parameter, and says `for table`" {
+    got := verdict(withMain(`
+        type A \{
+            id: Int
+        }
+        law twoThings(a: A, b: A) for table users \{
+            id = \{a.id}
+        }
+    `))
+    assert opens(got, "loader: a law about a table is about the one value a query is run for, so it takes exactly one parameter")
+    missing := verdict(withMain(`
+        type A \{
+            id: Int
+        }
+        law noTable(a: A) for users \{
+            id = \{a.id}
+        }
+    `))
+    assert opens(missing, "loader: a law about a table is written `law noTable(...) for table <name> \{ ... }`")
+}
+
+test "table is a word only after a law's for" {
+    assert proves(withMain(`
+        proc total(): Int \{
+            mut sum := 0
+            for table := 0; table < 3; table++ \{
+                sum = sum + table
+            }
+            return sum
+        }
+    `))
+}
+
+test "a law's filter is SQL or one WHERE block's ifs, and never an or block" {
+    got := verdict(withMain(`
+        type Contact \{
+            id: Int
+            admin: Bool
+        }
+        law choices(contact: Contact) for table chats \{
+            or \{
+                if contact.admin \{ public = 1 }
+                if true \{ owner = \{contact.id} }
+            }
+        }
+    `))
+    assert opens(got, "in `choices`: a law's filter cannot hold an `or \{ }` block, which says nothing about any one row")
 }

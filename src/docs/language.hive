@@ -82,7 +82,7 @@ func index(): Str {
         | [tables](tables.md) | CSV, spreadsheets, and the ~BT~Table~BT~ type |
         | [queries](queries.md) | ~BT~query~BT~ declarations and the SQL in them |
         | [testing](testing.md) | ~BT~test~BT~, ~BT~assert~BT~, coverage |
-        | [laws](laws.md) | ~BT~law~BT~: claims the compiler proves for every value, and what a law may reach |
+        | [laws](laws.md) | ~BT~law~BT~: claims the compiler proves for every value, what a law may reach, a type's laws and a table's |
         | [cli](cli.md) | every ~BT~hive~BT~ command |
         | [lsp](lsp.md) | the language server: what to ask it instead of reading files, and how to connect it |
         | [pitfalls](pitfalls.md) | **the mistakes that do not compile** — read this one first |
@@ -147,9 +147,10 @@ func syntax(): Str {
         ~BT~Return~BT~, a type may be called ~BT~Query~BT~, and a variable ~BT~proC~BT~. A field cannot
         be called ~BT~type~BT~, since that is the keyword itself.
 
-        Two words are keywords only where they are written and are ordinary names
-        everywhere else: ~BT~as~BT~ (after an import path) and ~BT~timeout~BT~ (in
-        ~BT~with timeout~BT~). So a variable may be called ~BT~timeout~BT~.
+        Three words are keywords only where they are written and are ordinary names
+        everywhere else: ~BT~as~BT~ (after an import path), ~BT~timeout~BT~ (in
+        ~BT~with timeout~BT~) and ~BT~table~BT~ (in a law's ~BT~for table~BT~). So a variable may be
+        called ~BT~timeout~BT~ or ~BT~table~BT~.
 
         ## Names have shapes, and the shape is enforced
 
@@ -682,6 +683,11 @@ func declarations(): Str {
         A claim the compiler proves for every value of its parameters; one it cannot
         prove is a compile error. No return type, no ~BT~mut~BT~ parameter, only another law
         may call it, and it is never emitted. See [laws](laws.md).
+
+        Written inside a type, with one parameter of it, a law is what every value of
+        the type keeps: see [a type's laws](laws.md#a-types-laws). Written
+        ~BT~for table <name>~BT~, it is a SQL filter every query on the table carries: see
+        [a table's laws](laws.md#a-tables-laws).
 
         ## ~BT~import~BT~
 
@@ -2092,7 +2098,7 @@ func tables(): Str {
         # Tables
 
         ~BT~Table~BT~ is an alias for ~BT~Str[dyn][dyn]~BT~ — a vector of rows of cells. It is what
-        ~BT~hive.file.csv~BT~ yields, what ~BT~hive.sql.raw~BT~ answers with, and what
+        ~BT~hive.file.csv~BT~ yields, what ~BT~hive.sql.unsafe~BT~ answers with, and what
         ~BT~hive.map.toTable~BT~ builds. Two builtins read one by name, and a third cuts a
         flat vector of cells into one:
 
@@ -2114,7 +2120,7 @@ func tables(): Str {
         hive.file.xlsx("./book.xlsx")        // every sheet of a workbook
         hive.file.ods("./book.ods")          // every table of an ODS
         hive.sql.run(db, allUsers())         // a declared query, typed rows
-        hive.sql.raw(db, someSqlText)        // SQL built at run time
+        hive.sql.unsafe(db, someSqlText)        // SQL built at run time
         ~CODE~
 
         | call | yields |
@@ -2122,7 +2128,7 @@ func tables(): Str {
         | ~BT~hive.file.csv(path, separator)~BT~ | ~BT~Result<Table, hive.file.TableError>~BT~ |
         | ~BT~hive.file.xlsx(path)~BT~ / ~BT~hive.file.ods(path)~BT~ | ~BT~Result<Table[dyn], hive.file.TableError>~BT~ |
         | ~BT~hive.sql.run(connection, query)~BT~ | whatever the query declared its rows to be |
-        | ~BT~hive.sql.raw(connection, text)~BT~ | ~BT~Result<Table, hive.sql.SqlError>~BT~ |
+        | ~BT~hive.sql.unsafe(connection, text)~BT~ | ~BT~Result<Table, hive.sql.SqlError>~BT~ |
 
         A CSV is a single table, so it comes back as one ~BT~Table~BT~. **A spreadsheet holds
         many**, so xlsx and ods come back as a ~BT~Table[dyn]~BT~ — one per sheet, in document
@@ -2244,8 +2250,8 @@ func queries(): Str {
         A **column name or sort direction can never be a parameter** — ~BT~ORDER BY \{col}~BT~
         would sort by a constant string — so make the choices a variant type and dispatch
         to one query per ordering. And **SQL you genuinely assemble yourself** goes
-        through ~BT~hive.sql.raw~BT~, which is untyped by construction and greppable by
-        design.
+        through ~BT~hive.sql.unsafe~BT~, which is untyped by construction, greppable by
+        design, and outside every [table law](laws.md#a-tables-laws).
 
         ## Inside a query body
 
@@ -2366,7 +2372,8 @@ func laws(): Str {
         compiles. Its parameters take every value of their types, and every ~BT~assert~BT~ its
         body reaches has to hold for all of them. **A law the compiler cannot prove is a
         compile error**, and nothing accepts one anyway. A law is never emitted and never
-        runs.
+        runs — but for [a type's](#a-types-laws), which a decoder runs on what it reads.
+        [A table's](#a-tables-laws) is a filter, held to every query's SQL.
 
         ~CODE~hive
         law cancelledIsFinal(booking: Booking, event: Event) \{
@@ -2450,6 +2457,86 @@ func laws(): Str {
         A counterexample, an open goal with its case and what was known, or what could
         not be followed. **An open goal is helped in the law's body** — split the case, or
         call a law that settles what is missing — or the law is narrowed with an ~BT~if~BT~.
+
+        ## A type's laws
+
+        A law written **inside a type**, with one parameter of that type, is what every
+        value of the type keeps. A message names it ~BT~Type.law~BT~.
+
+        ~CODE~hive
+        type Booking \{
+        	room: Str
+        	checkInDay: Int
+        	checkOutDay: Int
+
+        	law atLeastOneNight(b: Booking) \{
+        		assert b.checkInDay >= 0 && b.checkInDay < b.checkOutDay
+        	}
+
+        }
+        ~CODE~
+
+        * **Every construction and every write keeps it, each on its own**: ~BT~T(...)~BT~,
+          ~BT~x.f = e~BT~, a write further down a path, ~BT~append~BT~, ~BT~drop~BT~, ~BT~sort~BT~ or
+          ~BT~hive.map.set~BT~ on a field, and a field handed to a ~BT~mut~BT~ parameter. Two
+          fields that move together move as one new value: ~BT~b = Booking(b.room, 10, 12)~BT~.
+        * **A ~BT~mut~BT~ sharing part of a value with laws may not write it**: after
+          ~BT~mut lines := o.lines~BT~ with ~BT~o~BT~ a ~BT~mut~BT~, ~BT~append(lines, x)~BT~ is refused, since
+          ~BT~o~BT~'s law cannot see it. Write ~BT~o.lines~BT~ itself.
+        * **What proves it is what that function knows there**: its guards, early
+          returns, bindings and the ~BT~assert~BT~s it passed, and the laws of the values it
+          holds. A call's answer is known only by the laws of its type.
+        * **Wherever a value is read, its laws hold.** A function law relies on them,
+          and the [bounds](bounds.md) pass takes each ~BT~assert~BT~ at the top of one as a
+          guard, so ~BT~p.rooms[p.selected]~BT~ needs none under
+          ~BT~assert p.rooms bounds p.selected~BT~.
+        * **A decoder checks them as it runs**, since nothing the compiler saw built what
+          it read, and refuses a value breaking one as ~BT~Broken~BT~: a variant of
+          ~BT~JsonError~BT~, ~BT~JwtError~BT~, ~BT~QueryParamsError~BT~, ~BT~FlagError~BT~ and ~BT~SqlError~BT~.
+
+        ~CODE~
+        main.hive:24: in ~BT~moveEarlier~BT~: cannot prove ~BT~Booking.atLeastOneNight~BT~ for this ~BT~Booking(...)~BT~: nothing here shows ~BT~0 <= b.checkInDay - days~BT~
+            known: 0 <= b.checkInDay; b.checkInDay < b.checkOutDay
+            guard it, so that the law holds here
+        ~CODE~
+
+        ## A table's laws
+
+        A law written ~BT~for table <name>~BT~ takes **one parameter**, the value a query is
+        run for, and its body is **a SQL filter** — read as a query body is, Hive only in
+        ~BT~\{…}~BT~ values and ~BT~if~BT~ conditions:
+
+        ~CODE~hive
+        law ownChatsOnly(contact: Contact) for table chats \{
+        	fk_contact_from_id = \{contact.id} or
+        	fk_contact_to_id = \{contact.id}
+        }
+        ~CODE~
+
+        A body opening with ~BT~if~BT~, ~BT~or~BT~ or ~BT~and~BT~ is a ~BT~WHERE \{ }~BT~ block, whose filter applies
+        where its ~BT~if~BT~s hold (an ~BT~or \{ }~BT~ block is refused); any other body always
+        applies. **Every ~BT~query~BT~ touching the table takes a parameter of the law's type**,
+        and in each statement:
+
+        * **what it reads, changes or deletes carries the filter**: an ANDed part of its
+          WHERE, or of the ON of an inner or left JOIN bringing the table in, is the
+          filter's, or says more — ~BT~fk_contact_from_id = \{contact.id}~BT~ alone carries the
+          law above. Under a ~BT~WHERE \{ }~BT~ block's ~BT~if~BT~, it counts where that condition
+          follows from the law's.
+        * **a row it inserts lands inside it**: it writes, into one of a part's
+          ~BT~column = value~BT~ alternatives, that value. A filter with a part that is not
+          ~BT~column = value~BT~ refuses inserts.
+        * **a row it updates stays inside it**: a SET of a filtered column sets it to the
+          filter's value, or leaves alone an alternative the WHERE guaranteed.
+
+        A column is the table's when named through the table's alias, or bare in a
+        statement reading that table alone. Subqueries, ~BT~WITH~BT~ and each ~BT~UNION~BT~ side
+        carry the filter on their own. **~BT~hive.sql.unsafe~BT~ is not held to any law.**
+
+        ~CODE~
+        main.hive:31: in ~BT~forge~BT~: this query inserts a row into ~BT~chats~BT~ that law ~BT~ownChatsOnly~BT~'s filter does not keep
+            it has to write one of ~BT~fk_contact_from_id~BT~ as ~BT~\{contact.id}~BT~, or ~BT~fk_contact_to_id~BT~ as ~BT~\{contact.id}~BT~
+        ~CODE~
 
         ## How it is proved
 
@@ -2662,6 +2749,10 @@ func cli(): Str {
         every character, and a backtick string or a query body only loses its tabs in the
         indentation the compiler strips from it anyway. A file that does not lex is left as
         it was and named, and the command exits non-zero.
+
+        The one line it adds is an empty one around a type's law: a law never touches a
+        field, a variant or the type's own braces, though two laws may touch, and the
+        comment lines right above a law move with it.
 
         ## ~BT~hive lsp~BT~
 

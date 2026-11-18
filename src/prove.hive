@@ -55,6 +55,8 @@ type Path {
     depth: Int
     // The names bound `mut` on this path, which a `mut x := y` shares rather than copies.
     muts: Str[dyn]
+    // The values whose type's laws this path already knows.
+    assumed: Str[dyn]
 }
 
 type Out {
@@ -90,6 +92,8 @@ type Context {
     mayFail: hive.map.Map<Str, Bool>
     // The callables that call themselves.
     recursive: hive.map.Map<Str, Bool>
+    // The laws written inside each type, by the type's flattened name.
+    typeLaws: hive.map.Map<Str, Str[dyn]>
     base: infer.Env
 }
 
@@ -109,6 +113,9 @@ type Prover {
     // The unknowns a law has called itself on: a recursive callable handed one is
     // left unopened, so it is the same term the induction says something about.
     frontier: Str[dyn]
+    // The facts a law being assumed learned from its own `assert`s, which are its
+    // conclusions rather than conditions on the ones after them.
+    asserted: Str[dyn]
     // While a law is assumed: the path's facts and shapes when it started, and
     // what it concluded since.
     baseFacts: Int
@@ -159,7 +166,24 @@ proc newContext(m: ast.Module, t: types.Table): Context {
             }
         }
     }
-    return Context(callables, loopParam, loopAt, failing(m), recursive, infer.newEnv(t))
+    mut hive.map.Map<Str, Str[dyn]> typeLaws = hive.map.new()
+    for each d in m.decls {
+        if d is ast.Decl.CallableDecl(kind, name, params, _, _, _) {
+            if kind is ast.CallableKind.TypeLawKind {
+                for each p in params {
+                    if types.resolve(t, p.declared) is types.Ty.TNamed(owner) {
+                        mut Str[dyn] known = []
+                        if hive.map.get(typeLaws, owner) is Result.Ok(already) {
+                            known = already
+                        }
+                        append(known, name)
+                        hive.map.set(typeLaws, owner, known)
+                    }
+                }
+            }
+        }
+    }
+    return Context(callables, loopParam, loopAt, failing(m), recursive, typeLaws, infer.newEnv(t))
 }
 
 // Every callable with an `assert` or a `panic` in it, or a call to one that has.
@@ -226,7 +250,7 @@ func blockMayFail(cx: Context, stmts: ast.Stmt[]): Bool {
 
 proc newProver(budget: Int): Prover {
     mut hive.map.Map<Str, Int> parts = hive.map.new()
-    return Prover([], parts, 0, budget, true, [], 0, "", [], 0, [], [])
+    return Prover([], parts, 0, budget, true, [], 0, "", [], [], 0, [], [])
 }
 
 func place(at: token.Pos): Str {
@@ -307,6 +331,28 @@ func lostOut(p: Path, why: Str, at: token.Pos): Out[dyn] {
 
 func one(p: Path, value: terms.Term): Out[dyn] {
     return [Out(p, value)]
+}
+
+// The type a term's value has, as far as the term itself says.
+func termType(t: terms.Term): types.Ty {
+    if t is terms.Term.Unknown(_, ty) {
+        return ty
+    } else if t is terms.Term.Op(_, _, ty) {
+        return ty
+    } else if t is terms.Term.IntK(_) {
+        return types.Ty.TInt()
+    } else if t is terms.Term.StrK(_) {
+        return types.Ty.TStr()
+    } else if t is terms.Term.BoolK(_) {
+        return types.Ty.TBool()
+    } else if t is terms.Term.AtomK(_) {
+        return types.Ty.TAtom()
+    } else if t is terms.Term.FloatK(_) {
+        return types.Ty.TFloat()
+    } else if t is terms.Term.RecK(typeName, _, _) {
+        return types.Ty.TNamed(typeName)
+    }
+    return types.Ty.TUnknown()
 }
 
 // --- Normal forms ---------------------------------------------------------------
@@ -916,6 +962,16 @@ proc execStmt(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, s: ast.
         // It writes, but nothing a law can see depends on what.
         return [path]
     } else if s is ast.Stmt.AssertStmt(condition, at) {
+        // `assert a && b` claims `a`, and then `b` knowing `a`: one claim each, so
+        // a law being assumed concludes both rather than `b` only where `a` held.
+        parts := ast.conjuncts(condition)
+        if len(parts) > 1 && ast.conjunctsBind(parts) == false {
+            mut ast.Stmt[dyn] claims = []
+            for each part in parts {
+                append(claims, ast.Stmt.AssertStmt(part, at))
+            }
+            return execBlock(pr, cx, scope, path, claims)
+        }
         mut Path[dyn] out = []
         for each o in eval(pr, cx, scope, path, condition) {
             if running(o.path) {
@@ -953,10 +1009,9 @@ proc declare(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, name: St
         return [lost(path, "it cannot reason about `async`: what runs alongside is not a value", at)]
     }
     if mutable {
-        if value is ast.Expr.Ident(other, _) {
-            if indexOf(path.muts, other) is Result.Ok(_) {
-                return [lost(path, "it cannot follow `mut {name} := {other}`, which shares `{other}`'s storage rather than copying it", at)]
-            }
+        other := rootOf(value)
+        if other != "" && indexOf(path.muts, other) is Result.Ok(_) {
+            return [lost(path, "it cannot follow `mut {name} := " + exprText(value) + "`, which shares `{other}`'s storage rather than copying it", at)]
         }
     }
     mut Path[dyn] out = []
@@ -1421,6 +1476,7 @@ proc checkAssert(pr: mut Prover, cx: Context, path: Path, value: terms.Term, wri
         }
     } else {
         append(pr.concluded, solve.Lemma(guardsSince(pr, cx, path), c))
+        append(pr.asserted, terms.key(c))
     }
     if assume(pr, cx, path, c) is Result.Ok(p) {
         return [p]
@@ -1500,6 +1556,7 @@ proc assumeLaw(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, name: 
                 pr.baseFacts = len(o.path.facts)
                 pr.baseShapes = hive.map.keys(o.path.shapes)
                 pr.concluded = []
+                pr.asserted = []
                 lawScope := infer.boundParams(cx.base, params, 0)
                 _ := execBlock(pr, cx, lawScope, start, withoutHints(cx, body.stmts))
                 pr.claiming = true
@@ -1575,13 +1632,98 @@ func keepsToItself(cx: Context, stmts: ast.Stmt[]): Bool {
     return true
 }
 
+// The path, knowing what the laws of `value`'s type say about it: each law's body
+// run on the value, its `assert`s kept as lemmas. Once per value and path. The
+// prover's own state is put back afterwards, since this can happen while another
+// law is being assumed.
+proc withTypeLaws(pr: mut Prover, cx: Context, path: Path, value: terms.Term): Path {
+    // What is known to be inside the value keeps its own laws too.
+    mut Path inner = path
+    if value is terms.Term.RecK(_, _, fields) {
+        inner = withAllLaws(pr, cx, path, fields)
+    } else if value is terms.Term.VecK(items) {
+        inner = withAllLaws(pr, cx, path, items)
+    } else if value is terms.Term.OkK(payload) {
+        inner = withTypeLaws(pr, cx, path, payload)
+    } else if value is terms.Term.ErrK(payload) {
+        inner = withTypeLaws(pr, cx, path, payload)
+    }
+    return withOwnLaws(pr, cx, inner, value)
+}
+
+proc withOwnLaws(pr: mut Prover, cx: Context, path: Path, value: terms.Term): Path {
+    mut owner := ""
+    if value is terms.Term.Unknown(_, ty) {
+        if ty is types.Ty.TNamed(name) {
+            owner = name
+        }
+    } else if value is terms.Term.RecK(typeName, _, _) {
+        owner = typeName
+    } else if value is terms.Term.Op(_, _, ty) {
+        if ty is types.Ty.TNamed(name) {
+            owner = name
+        }
+    }
+    if owner == "" {
+        return path
+    }
+    if hive.map.get(cx.typeLaws, owner) is Result.Ok(lawNames) {
+        k := terms.key(value)
+        if indexOf(path.assumed, k) is Result.Ok(_) {
+            return path
+        }
+        mut Path kept = path
+        append(kept.assumed, k)
+        wasClaiming := pr.claiming
+        wasFacts := pr.baseFacts
+        wasShapes := pr.baseShapes
+        wasConcluded := pr.concluded
+        wasAsserted := pr.asserted
+        for each lawName in lawNames {
+            if hive.map.get(cx.callables, lawName) is Result.Ok(d) {
+                if d is ast.Decl.CallableDecl(_, _, params, _, body, _) {
+                    mut hive.map.Map<Str, terms.Term> env = hive.map.new()
+                    for each p in params {
+                        hive.map.set(env, p.name, value)
+                    }
+                    pr.claiming = false
+                    pr.baseFacts = len(kept.facts)
+                    pr.baseShapes = hive.map.keys(kept.shapes)
+                    pr.concluded = []
+                    pr.asserted = []
+                    begin := Path(env, kept.facts, kept.shapes, kept.lemmas, End.Running(), kept.cases, Frame(lawName, [value]), path.depth + 1, [], kept.assumed)
+                    _ := execBlock(pr, cx, infer.boundParams(cx.base, params, 0), begin, body.stmts)
+                    for each l in pr.concluded {
+                        append(kept.lemmas, l)
+                    }
+                }
+            }
+        }
+        pr.claiming = wasClaiming
+        pr.baseFacts = wasFacts
+        pr.baseShapes = wasShapes
+        pr.concluded = wasConcluded
+        pr.asserted = wasAsserted
+        return kept
+    }
+    return path
+}
+
+proc withAllLaws(pr: mut Prover, cx: Context, path: Path, values: terms.Term[]): Path {
+    mut Path p = path
+    for each v in values {
+        p = withTypeLaws(pr, cx, p, v)
+    }
+    return p
+}
+
 // What a path assumed since a law being assumed started: the facts it learned, and
 // the case splits it took, each as a condition.
 proc guardsSince(pr: mut Prover, cx: Context, path: Path): terms.Term[dyn] {
     mut terms.Term[dyn] out = []
     mut i := 0
     for each f in path.facts {
-        if i >= pr.baseFacts {
+        if i >= pr.baseFacts && (indexOf(pr.asserted, terms.key(f)) is Result.Ok(_)) == false {
             append(out, normIn(cx, path, f))
         }
         i = i + 1
@@ -1745,7 +1887,7 @@ proc materialize(pr: mut Prover, cx: Context, path: Path, value: terms.Term, lab
                         append(fields, part(pr, "u{id}.{f.name}", types.resolve(cx.base.table, f.declared), label + "." + f.name))
                     }
                     shaped := terms.Term.RecK(typeName, "", fields)
-                    return one(withShape(path, id, shaped, ""), shaped)
+                    return one(withAllLaws(pr, cx, withShape(path, id, shaped, ""), fields), shaped)
                 }
                 mut Out[dyn] out = []
                 for each variant in info.variants {
@@ -1766,7 +1908,7 @@ proc materialize(pr: mut Prover, cx: Context, path: Path, value: terms.Term, lab
                     }
                     shaped := terms.Term.RecK(typeName, variant.name, fields)
                     if checked(pr, cx, withShape(path, id, shaped, label + " is " + types.shownName(typeName) + "." + variant.name)) is Result.Ok(p) {
-                        append(out, Out(p, shaped))
+                        append(out, Out(withAllLaws(pr, cx, p, fields), shaped))
                     }
                 }
                 return out
@@ -1869,7 +2011,7 @@ proc prefixed(pr: mut Prover, cx: Context, path: Path, value: terms.Term, n: Int
             head := part(pr, "u{id}:head", element, headLabel)
             rest := part(pr, "u{id}:tail", types.Ty.TVec(element, ast.Dim.Dynamic()), tailLabel)
             consed := terms.Term.VecS([head], rest)
-            if checked(pr, cx, withShape(path, id, consed, label + " is [" + headLabel + ", ..." + tailLabel + "]")) is Result.Ok(p) {
+            if checked(pr, cx, withTypeLaws(pr, cx, withShape(path, id, consed, label + " is [" + headLabel + ", ..." + tailLabel + "]"), head)) is Result.Ok(p) {
                 if position + 1 >= n && exact == false {
                     append(out, Out(p, vecJoin(known, consed)))
                 } else {
@@ -2670,7 +2812,7 @@ proc callUser(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, d: ast.
                 how = End.Running()
                 value = v
             }
-            back := Path(env2, p.facts, p.shapes, p.lemmas, how, p.cases, callerFrame, path.depth, callerMuts)
+            back := Path(env2, p.facts, p.shapes, p.lemmas, how, p.cases, callerFrame, path.depth, callerMuts, p.assumed)
             append(out, Out(back, value))
         }
         return out
@@ -3344,13 +3486,15 @@ func caseText(path: Path): Str {
 proc knownText(pr: mut Prover, cx: Context, path: Path): Str {
     mut Str[dyn] shown = []
     for each f in normFacts(cx, path) {
-        if len(shown) < 4 {
-            append(shown, render(pr, f))
+        said := render(pr, f)
+        if len(shown) < 4 && (indexOf(shown, said) is Result.Ok(_)) == false {
+            append(shown, said)
         }
     }
     for each l in normLemmas(cx, path) {
-        if len(shown) < 6 && solve.guardsHold(normFacts(cx, path), l.guards) {
-            append(shown, render(pr, l.conclusion))
+        said := render(pr, l.conclusion)
+        if len(shown) < 6 && said != "true" && (indexOf(shown, said) is Result.Ok(_)) == false && solve.guardsHold(normFacts(cx, path), l.guards) {
+            append(shown, said)
         }
     }
     if len(shown) == 0 {

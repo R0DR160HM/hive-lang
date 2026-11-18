@@ -440,7 +440,7 @@ hive.file.csv("./data.tsv", "\t")    // the separator is always named
 hive.file.xlsx("./book.xlsx")        // every sheet of a workbook
 hive.file.ods("./book.ods")          // every table of an ODS
 hive.sql.run(db, allUsers())         // a declared query, typed rows
-hive.sql.raw(db, someSqlText)        // SQL built at run time, a Table
+hive.sql.unsafe(db, someSqlText)        // SQL built at run time, a Table
 ```
 
 | call | yields |
@@ -448,7 +448,7 @@ hive.sql.raw(db, someSqlText)        // SQL built at run time, a Table
 | `hive.file.csv(path, separator)` | `Result<Table, hive.file.TableError>` |
 | `hive.file.xlsx(path)` / `hive.file.ods(path)` | `Result<Table[dyn], hive.file.TableError>` |
 | `hive.sql.run(connection, query)` | whatever the query declared its rows to be |
-| `hive.sql.raw(connection, text)` | `Result<Table, hive.sql.SqlError>` |
+| `hive.sql.unsafe(connection, text)` | `Result<Table, hive.sql.SqlError>` |
 
 **The separator is always written.** There are no optional parameters in Hive,
 and a comma is a choice like any other rather than the one the language makes on
@@ -936,7 +936,7 @@ from then on, so the database parses and plans a query once per pooled
 connection rather than once per call. A connection keeps 512 of them, which
 `close` releases; a text past that — a `WHERE` block writes one per combination
 of its conditions — runs unprepared, as does one the database will not prepare
-(PostgreSQL refuses a script of several statements). `raw` is never prepared.
+(PostgreSQL refuses a script of several statements). `unsafe` is never prepared.
 
 A runtime failure is a `SqlError`: `Connection` (the database could not be
 opened or reached, or the connection is closed), `Statement` (the database

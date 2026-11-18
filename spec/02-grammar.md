@@ -38,7 +38,8 @@ The path is one of four kinds, and the path itself says which — see
 declaration = type-decl | func-decl | proc-decl | query-decl | test-decl | law-decl ;
 
 type-decl   = "type" IDENT "{" type-body "}" ;
-type-body   = { field } { variant } { field } ;
+type-body   = { field | type-law } { variant | type-law } { field | type-law } ;
+type-law    = law-decl ;              (* one parameter, of the type: 19.6 *)
 variant     = IDENT [ "{" { field } "}" ] ;
 field       = IDENT ":" type [ annotations ] ;
 
@@ -49,7 +50,8 @@ func-decl   = "func" IDENT "(" [ params ] ")" ":" type block ;
 proc-decl   = "proc" IDENT "(" [ params ] ")" ":" type block ;
 query-decl  = "query" IDENT "(" [ params ] ")" ":" type SQL ;
 test-decl   = "test" STRING block ;
-law-decl    = "law" IDENT "(" [ params ] ")" block ;
+law-decl    = "law" IDENT "(" [ params ] ")" ( block | table-law ) ;
+table-law   = "for" "table" IDENT { "." IDENT } SQL ;   (* one parameter: 19.7 *)
 
 params      = param { "," param } ;
 param       = IDENT ":" [ "mut" ] type ;

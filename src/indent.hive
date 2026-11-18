@@ -4,11 +4,13 @@
 // multiple of four. Only what says where a line sits is rewritten, never what a
 // literal holds — a `"..."` string spanning lines keeps every character, and a
 // backtick string or a query body loses only the indentation the lexer strips from
-// it anyway, so the program reads the same text before and after.
+// it anyway, so the program reads the same text before and after. The one line
+// it adds is an empty one around a type's law.
 import ./diag
 import ./lexer
 import ./project
 import ./text
+import ./token
 import hive.file
 
 // What one run did.
@@ -62,7 +64,139 @@ proc indentSource(source: Str): Result<Str, Str> {
         first := lexed.errors[0]
         return Result.Error("it does not lex, so its strings cannot be told from its code — line {first.line}: {first.message}")
     }
-    return Result.Ok(reindented(source, lexed.literals))
+    return Result.Ok(lawsApart(reindented(source, lexed.literals), lexed.tokens))
+}
+
+// --- A type's laws stand apart --------------------------------------------------
+
+// One law inside a type, by the lines it runs over, and whether it has those lines
+// to itself: a law sharing a line with something else has no line of its own to
+// put an empty one beside.
+type LawSpan {
+    first: Int
+    last: Int
+    opensLine: Bool
+    closesLine: Bool
+}
+
+// An empty line between each law in a type and whatever else touches it — a field,
+// a variant, the type's own braces — though laws may touch each other. The comment
+// lines right above a law are its own, so the empty line goes above them.
+func lawsApart(source: Str, tokens: token.Token[]): Str {
+    spans := lawSpans(tokens)
+    if len(spans) == 0 {
+        return source
+    }
+    lines := split(source, "\n")
+    mut Int[dyn] firsts = []
+    mut Int[dyn] lasts = []
+    for each s in spans {
+        mut first := s.first
+        for ; first > 1 && isComment(lineAt(lines, first - 1)); first-- {
+        }
+        append(firsts, first)
+        append(lasts, s.last)
+    }
+    mut Int[dyn] before = []
+    mut i := 0
+    for each s in spans {
+        if firsts bounds i && lasts bounds i {
+            first := firsts[i]
+            last := lasts[i]
+            above := first - 1
+            if s.opensLine && above >= 1 && isBlank(lineAt(lines, above)) == false && (indexOf(lasts, above) is Result.Ok(_)) == false {
+                append(before, first)
+            }
+            below := last + 1
+            if s.closesLine && below <= len(lines) && isBlank(lineAt(lines, below)) == false && (indexOf(firsts, below) is Result.Ok(_)) == false {
+                append(before, below)
+            }
+        }
+        i = i + 1
+    }
+    mut Str[dyn] out = []
+    mut k := 1
+    for each line in lines {
+        if indexOf(before, k) is Result.Ok(_) {
+            mut ending := ""
+            if text.endsWith(line, "\r") {
+                ending = "\r"
+            }
+            append(out, ending)
+        }
+        append(out, line)
+        k = k + 1
+    }
+    return join(out, "\n")
+}
+
+// Each law inside a type, read off the tokens: a `law` at a type's top level, up to
+// the brace that closes its body.
+func lawSpans(tokens: token.Token[]): LawSpan[dyn] {
+    mut LawSpan[dyn] out = []
+    mut depth := 0
+    mut typeDepth := -1
+    mut awaitingType := false
+    mut lawFirst := -1
+    mut lawDepth := -1
+    mut lawAlone := false
+    mut previousLine := 0
+    mut closingAt := -1
+    mut i := 0
+    for each t in tokens {
+        // The closing brace of the law just read owns its line only if nothing
+        // follows it there.
+        if closingAt >= 0 {
+            if out bounds closingAt {
+                out[closingAt].closesLine = t.line != previousLine
+            }
+            closingAt = -1
+        }
+        if t.kind is token.Kind.KwType && depth == 0 {
+            awaitingType = true
+        } else if t.kind is token.Kind.LBrace {
+            depth = depth + 1
+            if awaitingType {
+                awaitingType = false
+                typeDepth = depth
+            } else if lawFirst >= 0 && lawDepth < 0 && depth == typeDepth + 1 {
+                lawDepth = depth
+            }
+        } else if t.kind is token.Kind.RBrace {
+            if lawDepth >= 0 && depth == lawDepth {
+                append(out, LawSpan(lawFirst, t.line, lawAlone, true))
+                closingAt = len(out) - 1
+                lawFirst = -1
+                lawDepth = -1
+            }
+            if depth == typeDepth {
+                typeDepth = -1
+            }
+            depth = depth - 1
+        } else if t.kind is token.Kind.KwLaw && typeDepth >= 0 && depth == typeDepth && lawFirst < 0 {
+            lawFirst = t.line
+            lawAlone = i == 0 || t.line != previousLine
+        }
+        previousLine = t.line
+        i = i + 1
+    }
+    return out
+}
+
+func lineAt(lines: Str[], row: Int): Str {
+    at := row - 1
+    if lines bounds at {
+        return lines[at]
+    }
+    return ""
+}
+
+func isBlank(line: Str): Bool {
+    return text.trim(text.replace(line, "\r", "")) == ""
+}
+
+func isComment(line: Str): Bool {
+    return text.startsWith(text.trim(text.replace(line, "\r", "")), "//")
 }
 
 // One literal's indentation, as `text.dedent` reads it: the blanks it strips from

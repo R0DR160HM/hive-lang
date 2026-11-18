@@ -1,0 +1,97 @@
+// Table laws, kept the way a program keeps them. This file compiles only while every
+// query on a table with a law carries its filter, and every row a query writes lands
+// inside it.
+type Contact {
+    id: Int
+    name: Str
+}
+
+type Chat {
+    from: Int
+    body: Str
+}
+
+law ownChatsOnly(contact: Contact) for table chats {
+    fk_contact_from_id = {contact.id} or
+    fk_contact_to_id = {contact.id}
+}
+
+query conversation(contact: Contact): Chat[dyn] {
+    SELECT fk_contact_from_id AS "from", body FROM chats
+    WHERE fk_contact_from_id = {contact.id} OR fk_contact_to_id = {contact.id}
+    ORDER BY id
+}
+
+query sent(contact: Contact): Chat[dyn] {
+    SELECT fk_contact_from_id AS "from", body FROM chats
+    WHERE fk_contact_from_id = {contact.id}
+    ORDER BY id
+}
+
+query send(contact: Contact, to: Int, body: Str): void {
+    INSERT INTO chats (fk_contact_from_id, fk_contact_to_id, body) VALUES ({contact.id}, {to}, {body})
+}
+
+query forward(contact: Contact, id: Int, to: Int): void {
+    UPDATE chats SET fk_contact_to_id = {to} WHERE id = {id} AND fk_contact_from_id = {contact.id}
+}
+
+proc withChats(check: proc(hive.sql.SqlConnection): void): void {
+    opened := hive.sql.pool(hive.sql.DatabaseDriver.SQLite(), ":memory:", 1, 1)
+    if opened is Result.Ok(db) {
+        _ := hive.sql.unsafe(db, "CREATE TABLE chats (id INTEGER PRIMARY KEY, fk_contact_from_id INTEGER, fk_contact_to_id INTEGER, body TEXT)")
+        check(db)
+        hive.sql.close(db)
+    } else {
+        assert false
+    }
+}
+
+proc talk(db: hive.sql.SqlConnection): void {
+    ada := Contact(1, "Ada")
+    grace := Contact(2, "Grace")
+    tim := Contact(3, "Tim")
+    _ := hive.sql.run(db, send(ada, grace.id, "lunch?"))
+    _ := hive.sql.run(db, send(grace, ada.id, "noon"))
+    _ := hive.sql.run(db, send(tim, grace.id, "the report"))
+    if hive.sql.run(db, conversation(ada)) is Result.Ok(chats) {
+        assert len(chats) == 2
+    } else {
+        assert false
+    }
+    if hive.sql.run(db, conversation(tim)) is Result.Ok(chats) {
+        assert len(chats) == 1
+    } else {
+        assert false
+    }
+    if hive.sql.run(db, sent(grace)) is Result.Ok(chats) {
+        assert len(chats) == 1
+    } else {
+        assert false
+    }
+}
+
+proc forwarding(db: hive.sql.SqlConnection): void {
+    ada := Contact(1, "Ada")
+    grace := Contact(2, "Grace")
+    _ := hive.sql.run(db, send(ada, grace.id, "the plan"))
+    // Only the one who sent a chat forwards it.
+    if hive.sql.run(db, forward(grace, 1, 3)) is Result.Ok(changed) {
+        assert changed == 0
+    } else {
+        assert false
+    }
+    if hive.sql.run(db, forward(ada, 1, 3)) is Result.Ok(changed) {
+        assert changed == 1
+    } else {
+        assert false
+    }
+}
+
+test "a contact reads the chats they sent and the ones sent to them, and no others" {
+    withChats(talk)
+}
+
+test "a chat is forwarded only by the contact who sent it" {
+    withChats(forwarding)
+}

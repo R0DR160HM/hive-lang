@@ -18,7 +18,7 @@ hive test examples/15-testing/cart.test.hive
 | 02 | [types](02-types) | every type there is: strings, vectors, atoms, numbers, bools, `mut`, and a `query` |
 | 03 | [networking](03-networking) | an HTTP server and client, raw TCP, WebSockets, and HTTP and WebSockets on one port |
 | 04 | [crypto](04-crypto) | hashing, HMAC, base64, password encryption, and JWTs |
-| 05 | [sql](05-sql) | `query` declarations, typed rows, optional filters, and `hive.sql.raw` |
+| 05 | [sql](05-sql) | `query` declarations, typed rows, optional filters, and `hive.sql.unsafe` |
 | 06 | [value-semantics](06-value-semantics) | why two names never observe each other's writes, and the one case where they do |
 | 07 | [pattern-matching](07-pattern-matching) | the four kinds of pattern, and binding through `&&` |
 | 08 | [first-class-functions](08-first-class-functions) | bare references, partial application, the vector walks, shadowing a builtin |
@@ -40,7 +40,7 @@ hive test examples/15-testing/cart.test.hive
 | 24 | [streaming-answer](24-streaming-answer) | a language model's answer read as it arrives, and a looping one stopped by hanging up |
 | 25 | [programs-alongside](25-programs-alongside) | a program started, talked to, and stopped with everything it started — the program being itself |
 | 26 | [pictures](26-pictures) | Hive's logo read from inside the executable, decoded, scaled and drawn in characters |
-| 27 | [laws](27-laws) | a `law`: a cancelled booking stays cancelled, proved for every booking and event while the program compiles |
+| 27 | [laws](27-laws) | a `law` of each kind: a cancelled booking stays cancelled, proved for every booking and event while the program compiles; every booking names a guest and a room, kept wherever one is made or changed; and a guest reads only their own bookings, in every query on the table |
 
 ## What `./run` does with them
 

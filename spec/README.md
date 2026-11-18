@@ -34,7 +34,7 @@ Source files end in **`.hive`**. The standard library is reached as **`hive.*`**
 | [16 — Testing](16-testing.md) | `test`, `assert` inside one, coverage |
 | [17 — Diagnostics](17-diagnostics.md) | the error format and what an editor can do with it |
 | [18 — Conformance](18-conformance.md) | what an implementation must do, and this repository's status |
-| [19 — Laws](19-laws.md) | `law`: what it claims, what it may reach, and when it is refused |
+| [19 — Laws](19-laws.md) | `law`: what it claims, what it may reach, when it is refused, and the laws of a type and of a table |
 
 ## How to read this
 
