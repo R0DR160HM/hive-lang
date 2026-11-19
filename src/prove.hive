@@ -2888,9 +2888,18 @@ proc evalBuiltin(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, name
                 append(out, Out(o.path, terms.Term.VoidK()))
                 continue
             }
-            done := concreteBuiltin(name, normAll(cx.base.table, o.path.shapes, o.values))
+            known := normAll(cx.base.table, o.path.shapes, o.values)
+            done := concreteBuiltin(name, known)
             if done is Result.Ok(v) {
                 append(out, Out(o.path, v))
+            } else if name == "indexOf" && terms.nth(known, 0) is terms.Term.VecK(items) {
+                for each r in searched(pr, cx, o.path, items, false, terms.nth(known, 1), 0, at) {
+                    append(out, r)
+                }
+            } else if name == "indexOf" && terms.nth(known, 0) is terms.Term.VecS(items, _) {
+                for each r in searched(pr, cx, o.path, items, true, terms.nth(known, 1), 0, at) {
+                    append(out, r)
+                }
             } else {
                 append(out, Out(lost(o.path, "it can follow `{name}` only on values it knows", at), terms.Term.VoidK()))
             }
@@ -2917,6 +2926,37 @@ proc evalBuiltin(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, name
         return out
     }
     return lostOut(path, "it cannot reason about `{name}` yet", at)
+}
+
+// `indexOf` over the elements of a vector it knows, from element `at` on. Where
+// the search cannot tell whether an element is the one sought, the path splits:
+// in one case it is, and the search ends there; in the other it is not. Past
+// them, a vector with more it does not know (`more`) cannot be searched.
+proc searched(pr: mut Prover, cx: Context, path: Path, items: terms.Term[], more: Bool, sought: terms.Term, at: Int, where: token.Pos): Out[dyn] {
+    if items bounds at {
+        same := normIn(cx, path, equal(items[at], sought))
+        found := terms.Term.OkK(terms.Term.IntK(at))
+        if terms.isTrue(same) {
+            return one(path, found)
+        }
+        if terms.isFalse(same) {
+            return searched(pr, cx, path, items, more, sought, at + 1, where)
+        }
+        mut Out[dyn] out = []
+        if assume(pr, cx, path, same) is Result.Ok(yes) {
+            append(out, Out(yes, found))
+        }
+        if assume(pr, cx, path, terms.negation(same)) is Result.Ok(no) {
+            for each r in searched(pr, cx, no, items, more, sought, at + 1, where) {
+                append(out, r)
+            }
+        }
+        return out
+    }
+    if more {
+        return lostOut(path, "it can follow `indexOf` only on values it knows", where)
+    }
+    return one(path, terms.Term.ErrK(terms.Term.BoolK(false)))
 }
 
 func concreteBuiltin(name: Str, args: terms.Term[]): Result<terms.Term, Bool> {

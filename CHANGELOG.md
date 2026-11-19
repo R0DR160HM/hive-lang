@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.1
+
+### Fixes
+
+* **A `!=` between integers is two cases to the prover**, below and above: `n != 0` beside `n >= 0` shows `n > 0`, and `len(v) != 0` shows `len(v) > 0`. A type law needing `0 < len(items)` was refused after `if len(items) == 0 { panic … }`, with `0 != len(items)` among what was known.
+* **A law follows `indexOf` through the elements a vector is known to hold**, splitting the case at each one that may be the one sought. It needed every element and the one sought known, so `indexOf([], ip)` was refused for an unknown `ip`, and so was `indexOf(allowed, "*")` under `allowed is ["*", ..._]`.
+
 ## v0.4.0
 
 ### Laws

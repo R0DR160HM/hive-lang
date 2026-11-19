@@ -33,6 +33,13 @@ type Lin {
     constant: Int
 }
 
+// A fact `a != b`, which no one constraint can say: the case `a < b` and the case
+// `b < a`.
+type Split {
+    below: Lin[dyn]
+    above: Lin[dyn]
+}
+
 type Range {
     low: Int
     high: Int
@@ -111,7 +118,8 @@ proc contradictory(facts: terms.Term[]): Bool {
             return true
         }
     }
-    return infeasible(constraintsOf(facts))
+    cs := constraintsOf(facts)
+    return infeasibleSplit(cs, splitsOf(facts, rangesOf(cs)), 0)
 }
 
 proc judge(facts: terms.Term[], goal: terms.Term, depth: Int): Verdict {
@@ -232,12 +240,13 @@ proc arithmetic(facts: terms.Term[], goal: terms.Term): Verdict {
 // both have to be impossible.
 proc refutes(base: Lin[], condition: terms.Term, facts: terms.Term[]): Bool {
     limits := rangesOf(base)
+    splits := splitsOf(facts, limits)
     if condition is terms.Term.Op(name, args, _) {
         if name == "ne" && len(args) == 2 {
             below := comparison("lt", terms.nth(args, 0), terms.nth(args, 1), limits)
             above := comparison("lt", terms.nth(args, 1), terms.nth(args, 0), limits)
             if below is Result.Ok(b) && above is Result.Ok(a) {
-                return infeasible(withLengths(base + b)) && infeasible(withLengths(base + a))
+                return infeasibleSplit(withLengths(base + b), splits, 0) && infeasibleSplit(withLengths(base + a), splits, 0)
             }
             return false
         }
@@ -266,7 +275,7 @@ proc refutes(base: Lin[], condition: terms.Term, facts: terms.Term[]): Bool {
         }
         if len(args) == 2 {
             if comparison(name, terms.nth(args, 0), terms.nth(args, 1), limits) is Result.Ok(more) {
-                return infeasible(withLengths(base + more))
+                return infeasibleSplit(withLengths(base + more), splits, 0)
             }
         }
     }
@@ -581,6 +590,57 @@ func factConstraints(f: terms.Term, limits: hive.map.Map<Str, Range>): Lin[dyn] 
         }
     }
     return none
+}
+
+// The most `!=` facts split into their cases at once, each split doubling the
+// work of finding a contradiction.
+func splitLimit(): Int {
+    return 4
+}
+
+// Every fact `a != b` between integers, as its two cases, up to `splitLimit()`.
+func splitsOf(facts: terms.Term[], limits: hive.map.Map<Str, Range>): Split[dyn] {
+    mut Split[dyn] out = []
+    for each f in facts {
+        if len(out) >= splitLimit() {
+            return out
+        }
+        mut terms.Term[dyn] sides = []
+        if f is terms.Term.Op(name, args, _) {
+            if name == "ne" {
+                sides = args
+            } else if name == "not" {
+                for each inner in args {
+                    if inner is terms.Term.Op(innerName, innerArgs, _) {
+                        if innerName == "eq" {
+                            sides = innerArgs
+                        }
+                    }
+                }
+            }
+        }
+        if len(sides) == 2 && isIntTerm(terms.nth(sides, 0)) {
+            a := terms.nth(sides, 0)
+            b := terms.nth(sides, 1)
+            if comparison("lt", a, b, limits) is Result.Ok(below) && comparison("lt", b, a, limits) is Result.Ok(above) {
+                append(out, Split(below, above))
+            }
+        }
+    }
+    return out
+}
+
+// Whether `cs` cannot hold in any case of the splits from `at` on: so `0 <= n`
+// beside `n != 0` cannot hold with `n <= 0`, since neither `n < 0` nor `0 < n` can.
+proc infeasibleSplit(cs: Lin[], splits: Split[], at: Int): Bool {
+    if infeasible(cs) {
+        return true
+    }
+    if splits bounds at {
+        s := splits[at]
+        return infeasibleSplit(withLengths(cs + s.below), splits, at + 1) && infeasibleSplit(withLengths(cs + s.above), splits, at + 1)
+    }
+    return false
 }
 
 func okOrNone(r: Result<Lin[dyn], Bool>): Lin[dyn] {

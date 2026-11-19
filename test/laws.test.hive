@@ -4,6 +4,7 @@
 // with a counterexample, or refused with what it could not follow. The assertion
 // is on the opening of the message, so a message can be improved without a test
 // being rewritten.
+import ../src/ast
 import ../src/check
 import ../src/laws
 import ../src/loader
@@ -91,6 +92,20 @@ test "a lemma whose guards hold adds its conclusion" {
     lemma := solve.Lemma([cmp("lt", a, terms.Term.IntK(3))], hidden)
     assert solve.decide([cmp("lt", a, terms.Term.IntK(1))], [lemma], hidden) is solve.Verdict.Holds
     assert solve.decide([], [lemma], hidden) is solve.Verdict.Open
+}
+
+test "an integer that is neither below nor equal to zero is above it" {
+    n := int("n", 0)
+    facts := [cmp("le", terms.Term.IntK(0), n), terms.negation(cmp("eq", terms.Term.IntK(0), n))]
+    assert solve.decide(facts, [], cmp("lt", terms.Term.IntK(0), n)) is solve.Verdict.Holds
+    assert solve.decide([terms.negation(cmp("eq", terms.Term.IntK(0), n))], [], cmp("lt", terms.Term.IntK(0), n)) is solve.Verdict.Open
+}
+
+test "a length that is not zero is above it" {
+    v := terms.Term.Unknown(0, types.Ty.TVec(types.Ty.TInt(), ast.Dim.Dynamic()))
+    size := terms.op("len", [v], terms.integer())
+    facts := [terms.negation(cmp("eq", terms.Term.IntK(0), size))]
+    assert solve.decide(facts, [], cmp("lt", terms.Term.IntK(0), size)) is solve.Verdict.Holds
 }
 
 // --- Laws over small types ----------------------------------------------------------
@@ -402,6 +417,59 @@ test "a guard keeps a panic from being reached" {
     `))
 }
 
+// --- Searching ---------------------------------------------------------------------------
+
+func admits(): Str {
+    return `
+        func admits(allowed: Str[], ip: Str): Bool \{
+            return indexOf(allowed, "*") is Result.Ok(_) || indexOf(allowed, ip) is Result.Ok(_)
+        }
+    `
+}
+
+test "indexOf finds nothing in an empty vector, whatever it is asked for" {
+    assert proves(withMain(admits() + `
+        law nobody(ip: Str) \{
+            Str[dyn] none = []
+            assert !admits(none, ip)
+        }
+    `))
+}
+
+test "indexOf splits the case at each element it cannot settle" {
+    assert proves(withMain(admits() + `
+        law onlyTheListed(ip: Str) \{
+            Str[dyn] one = ["10.0.0.1"]
+            if ip == "10.0.0.1" \{
+                assert admits(one, ip)
+            } else \{
+                assert !admits(one, ip)
+            }
+        }
+    `))
+}
+
+test "indexOf searches the elements a vector is known to open with" {
+    assert proves(withMain(admits() + `
+        law wildcard(allowed: Str[dyn], ip: Str) \{
+            if allowed is ["*", ..._] \{
+                assert admits(allowed, ip)
+            }
+        }
+    `))
+}
+
+test "indexOf cannot search past the elements it knows" {
+    got := verdict(withMain(admits() + `
+        law listed(allowed: Str[dyn], ip: Str) \{
+            if allowed is [_, ..._] \{
+                assert admits(allowed, ip) || true
+            }
+        }
+    `))
+    assert opens(got, "in law `listed`: cannot prove this law: it can follow `indexOf` only on values it knows")
+}
+
 // --- What a law may reach -----------------------------------------------------------------
 
 test "a law may not reach a library call" {
@@ -656,6 +724,43 @@ test "a value built behind the right guards keeps its type's law" {
                 return Result.Error("dates out of range")
             }
             return Result.Ok(Booking(room, firstDay, firstDay + nights))
+        }
+    `))
+}
+
+test "a guard that a value is not zero shows it is above zero, beside one that it is not below" {
+    assert proves(withMain(`
+        type Count \{
+            n: Int
+            law positive(c: Count) \{
+                assert c.n > 0
+            }
+        }
+        func count(n: Int): Count \{
+            if n < 0 \{
+                panic "negative"
+            }
+            if n == 0 \{
+                panic "zero"
+            }
+            return Count(n)
+        }
+    `))
+}
+
+test "a guard that a vector is not empty shows its length is above zero" {
+    assert proves(withMain(`
+        type Some \{
+            items: Int[dyn]
+            law nonEmpty(s: Some) \{
+                assert len(s.items) > 0
+            }
+        }
+        func some(items: Int[dyn]): Some \{
+            if len(items) == 0 \{
+                panic "empty"
+            }
+            return Some(items)
         }
     `))
 }
