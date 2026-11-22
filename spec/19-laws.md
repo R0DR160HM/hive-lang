@@ -326,13 +326,18 @@ counts steps, never time, so a law proved on one machine is proved on every one.
    integers by difference constraints wherever a sum provably cannot wrap, and
    equalities modulo 2^64 everywhere. A fact `a != b` between integers is the two
    cases `a < b` and `b < a`, the first four such facts on a path split at once, so
-   `n >= 0` and `n != 0` together show `n > 0`.
+   `n >= 0` and `n != 0` together show `n > 0`. `x / k` and `x % k` by a positive
+   literal are tied back to `x` as Go's truncating division does, the cases
+   `x < 0` and `x >= 0` split the same way, so `n % 2 == 1` shows `0 <= n / 2 < n`.
 4. **Induction.** Where that leaves a goal open, the law is run again as if it had
    called itself on the rest of each vector parameter in turn.
 
-A callable is followed into, three levels deep into itself; past that, or on the
-part of a vector an induction is about, its call stays a term of its own, which
-is allowed only where nothing it reaches can panic. A `for each` over a vector of
+A callable is followed into, three levels deep into itself, or to its end where
+every argument is known; past that, or on the part of a vector an induction is
+about, its call stays a term of its own, which is allowed only where nothing it
+reaches can panic. A call with no `mut` parameter answers on a path what it
+answered there before, so a guard `if unique(pages)` is what a type law asking
+`unique(u.pages)` of the value built under it is told. A `for each` over a vector of
 unknown length is followed through the part that is known, and the rest of it
 is a term of its own: the callable called again, where the loop is all the
 callable does, or otherwise what the loop leaves in each variable it writes,
@@ -341,5 +346,6 @@ given the rest of the vector and what the loop reads.
 `indexOf` on a vector is followed through the elements the path knows it to
 hold, splitting the path at each one that may or may not be the one sought, so
 `indexOf([], x)` is `Error` for every `x`. Past those elements, in a vector
-whose rest is unknown, it is not followed. On strings it is followed only where
+whose rest is unknown, it is one unknown `Result`, the same each time that
+vector and value are searched. On strings it is followed only where
 both are known.

@@ -1467,7 +1467,7 @@ proc checkAssert(pr: mut Prover, cx: Context, path: Path, value: terms.Term, wri
         verdict := solve.decide(normFacts(cx, path), normLemmas(cx, path), c)
         if verdict is solve.Verdict.Holds {
             pr.proved = pr.proved + 1
-        } else if pr.witness != "" {
+        } else if pr.witness != "" && verdict is solve.Verdict.Fails {
             append(pr.problems, Problem(at, "it does not hold for " + pr.witness + ": `" + exprText(written) + "` is false", true, false))
         } else if verdict is solve.Verdict.Fails {
             append(pr.problems, Problem(at, "cannot prove `" + exprText(written) + "`: it is false" + caseText(path), false, false))
@@ -1729,7 +1729,7 @@ proc guardsSince(pr: mut Prover, cx: Context, path: Path): terms.Term[dyn] {
         i = i + 1
     }
     for each k in hive.map.keys(path.shapes) {
-        if (indexOf(pr.baseShapes, k) is Result.Ok(_)) == false {
+        if text.startsWith(k, "u") && (indexOf(pr.baseShapes, k) is Result.Ok(_)) == false {
             if hive.map.get(path.shapes, k) is Result.Ok(shape) {
                 id := idOf(k)
                 if pr.infos bounds id {
@@ -2729,7 +2729,16 @@ proc callUser(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, d: ast.
                 anyMut = true
             }
         }
-        if path.depth >= depthLimit() || timesInside(path, name) >= unfoldLimit() || onFrontier(pr, cx, path, name, args) {
+        // A call with nothing `mut` answers what it answered before on this path, so
+        // a guard and a law asking the same question see the same answer.
+        remembered := "call:" + name + "(" + terms.keys(normAll(cx.base.table, path.shapes, args)) + ")"
+        if anyMut == false {
+            if hive.map.get(path.shapes, remembered) is Result.Ok(answer) {
+                return one(path, answer)
+            }
+        }
+        // On values it knows, a call is run however deep it goes: the step budget is what stops it.
+        if path.depth >= depthLimit() || (timesInside(path, name) >= unfoldLimit() && terms.allKnown(normAll(cx.base.table, path.shapes, args)) == false) || onFrontier(pr, cx, path, name, args) {
             if anyMut {
                 return lostOut(path, "it cannot follow `" + types.shownName(name) + "` any deeper", at)
             }
@@ -2812,7 +2821,10 @@ proc callUser(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, d: ast.
                 how = End.Running()
                 value = v
             }
-            back := Path(env2, p.facts, p.shapes, p.lemmas, how, p.cases, callerFrame, path.depth, callerMuts, p.assumed)
+            mut back := Path(env2, p.facts, p.shapes, p.lemmas, how, p.cases, callerFrame, path.depth, callerMuts, p.assumed)
+            if anyMut == false && how is End.Running {
+                hive.map.set(back.shapes, remembered, value)
+            }
             append(out, Out(back, value))
         }
         return out
@@ -2893,13 +2905,15 @@ proc evalBuiltin(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, name
             if done is Result.Ok(v) {
                 append(out, Out(o.path, v))
             } else if name == "indexOf" && terms.nth(known, 0) is terms.Term.VecK(items) {
-                for each r in searched(pr, cx, o.path, items, false, terms.nth(known, 1), 0, at) {
+                for each r in searched(pr, cx, o.path, terms.nth(known, 0), items, false, terms.nth(known, 1), 0, at) {
                     append(out, r)
                 }
             } else if name == "indexOf" && terms.nth(known, 0) is terms.Term.VecS(items, _) {
-                for each r in searched(pr, cx, o.path, items, true, terms.nth(known, 1), 0, at) {
+                for each r in searched(pr, cx, o.path, terms.nth(known, 0), items, true, terms.nth(known, 1), 0, at) {
                     append(out, r)
                 }
+            } else if name == "indexOf" && terms.nth(known, 0) is terms.Term.Unknown(_, _) {
+                append(out, Out(o.path, unseenSearch(pr, terms.nth(known, 0), terms.nth(known, 1))))
             } else {
                 append(out, Out(lost(o.path, "it can follow `{name}` only on values it knows", at), terms.Term.VoidK()))
             }
@@ -2932,7 +2946,7 @@ proc evalBuiltin(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, name
 // the search cannot tell whether an element is the one sought, the path splits:
 // in one case it is, and the search ends there; in the other it is not. Past
 // them, a vector with more it does not know (`more`) cannot be searched.
-proc searched(pr: mut Prover, cx: Context, path: Path, items: terms.Term[], more: Bool, sought: terms.Term, at: Int, where: token.Pos): Out[dyn] {
+proc searched(pr: mut Prover, cx: Context, path: Path, whole: terms.Term, items: terms.Term[], more: Bool, sought: terms.Term, at: Int, where: token.Pos): Out[dyn] {
     if items bounds at {
         same := normIn(cx, path, equal(items[at], sought))
         found := terms.Term.OkK(terms.Term.IntK(at))
@@ -2940,23 +2954,29 @@ proc searched(pr: mut Prover, cx: Context, path: Path, items: terms.Term[], more
             return one(path, found)
         }
         if terms.isFalse(same) {
-            return searched(pr, cx, path, items, more, sought, at + 1, where)
+            return searched(pr, cx, path, whole, items, more, sought, at + 1, where)
         }
         mut Out[dyn] out = []
         if assume(pr, cx, path, same) is Result.Ok(yes) {
             append(out, Out(yes, found))
         }
         if assume(pr, cx, path, terms.negation(same)) is Result.Ok(no) {
-            for each r in searched(pr, cx, no, items, more, sought, at + 1, where) {
+            for each r in searched(pr, cx, no, whole, items, more, sought, at + 1, where) {
                 append(out, r)
             }
         }
         return out
     }
     if more {
-        return lostOut(path, "it can follow `indexOf` only on values it knows", where)
+        return one(path, unseenSearch(pr, whole, sought))
     }
     return one(path, terms.Term.ErrK(terms.Term.BoolK(false)))
+}
+
+// A search through elements the prover cannot see: some `Result`, the same one
+// for the same vector and value every time it is asked for.
+proc unseenSearch(pr: mut Prover, v: terms.Term, sought: terms.Term): terms.Term {
+    return part(pr, "indexOf(" + terms.key(v) + "," + terms.key(sought) + ")", types.Ty.TResult(types.Ty.TInt(), types.Ty.TBool()), "indexOf")
 }
 
 func concreteBuiltin(name: Str, args: terms.Term[]): Result<terms.Term, Bool> {

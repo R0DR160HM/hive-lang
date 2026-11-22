@@ -459,15 +459,14 @@ test "indexOf searches the elements a vector is known to open with" {
     `))
 }
 
-test "indexOf cannot search past the elements it knows" {
-    got := verdict(withMain(admits() + `
+test "indexOf searches past the elements it knows" {
+    assert proves(withMain(admits() + `
         law listed(allowed: Str[dyn], ip: Str) \{
             if allowed is [_, ..._] \{
                 assert admits(allowed, ip) || true
             }
         }
     `))
-    assert opens(got, "in law `listed`: cannot prove this law: it can follow `indexOf` only on values it knows")
 }
 
 // --- What a law may reach -----------------------------------------------------------------
@@ -511,6 +510,139 @@ test "a recursion that does not shrink is refused" {
         }
     `))
     assert opens(got, "in law `loops`: it reaches `forever` (line 1), which calls itself, and its call to itself (line 2) is not on something smaller")
+}
+
+test "a recursion on a known vector is followed to its end" {
+    assert proves(withMain(`
+        func allPositive(v: Int[]): Bool \{
+            if v is [x, ...rest] \{
+                return x > 0 && allPositive(rest)
+            }
+            return true
+        }
+        law fiveArePositive() \{
+            assert allPositive([1, 2, 3, 4, 5])
+        }
+    `))
+}
+
+test "a known value the prover gives up on is not a counterexample" {
+    mut Str[dyn] ones = []
+    for i := 0; i < 60; i++ {
+        append(ones, "1")
+    }
+    got := verdict(withMain(`
+        func allPositive(v: Int[]): Bool \{
+            if v is [x, ...rest] \{
+                return x > 0 && allPositive(rest)
+            }
+            return true
+        }
+        law sixtyArePositive() \{
+            assert allPositive([` + join(ones, ", ") + `])
+        }
+    `))
+    assert opens(got, "in law `sixtyArePositive`: cannot prove")
+}
+
+test "a quotient and a remainder by a literal are tied back to what was divided" {
+    assert proves(withMain(`
+        law halfIsInside(n: Int) \{
+            if n % 2 == 1 \{
+                assert n / 2 >= 0 && n / 2 < n
+                assert n > 0
+            }
+        }
+        law remainderSmallerThanDivisor(n: Int) \{
+            assert n % 7 < 7 && n % 7 > -7
+        }
+    `))
+    assert opens(verdict(withMain(`
+        law remainderNeverNegative(n: Int) \{
+            assert n % 3 >= 0
+        }
+    `)), "in law `remainderNeverNegative`: it does not hold for n = -1")
+}
+
+test "a quotient of a length is still followed once something is known about it" {
+    assert proves(withMain(`
+        type Update \{
+            pages: Int[dyn]
+
+            law hasAMiddle(u: Update) \{
+                assert len(u.pages) % 2 == 1
+            }
+
+        }
+        law middleIsInside(u: Update) \{
+            assert len(u.pages) / 2 >= 0
+            assert len(u.pages) / 2 < len(u.pages)
+        }
+    `))
+}
+
+test "indexOf on a vector of unknown length is the same answer each time it is asked" {
+    source := `
+        type Rule \{
+            before: Int
+            after: Int
+        }
+        func keeps(r: Rule, pages: Int[]): Bool \{
+            if indexOf(pages, r.before) is Result.Ok(first) && indexOf(pages, r.after) is Result.Ok(second) \{
+                return first < second
+            }
+            return true
+        }
+    `
+    assert proves(withMain(source + `
+        law ignored(r: Rule, pages: Int[dyn]) \{
+            if indexOf(pages, r.after) is Result.Error(_) \{
+                assert keeps(r, pages)
+            }
+        }
+    `))
+    assert opens(verdict(withMain(source + `
+        law always(r: Rule, pages: Int[dyn]) \{
+            assert keeps(r, pages)
+        }
+    `)), "in law `always`: it does not hold for r = Rule(before: 0, after: 0), pages = [0]")
+}
+
+test "a guard on a call a type law makes is what the law is told" {
+    source := `
+        type Update \{
+            pages: Int[dyn]
+
+            law printsEachPageOnce(u: Update) \{
+                assert unique(u.pages)
+            }
+
+        }
+        func unique(pages: Int[]): Bool \{
+            if pages is [first, ...rest] \{
+                return indexOf(rest, first) is Result.Error(_) && unique(rest)
+            }
+            return true
+        }
+    `
+    assert proves(withMain(source + `
+        func guarded(pages: Int[dyn]): Result<Update, Bool> \{
+            if unique(pages) \{
+                return Result.Ok(Update(pages))
+            }
+            return Result.Error(false)
+        }
+    `))
+    assert text.contains(verdict(withMain(source + `
+        func grown(pages: Int[dyn]): Result<Update, Bool> \{
+            mut Int[dyn] more = pages
+            if unique(more) \{
+                append(more, 1)
+                return Result.Ok(Update(more))
+            }
+            return Result.Error(false)
+        }
+    `)), "does not keep `Update.printsEachPageOnce`")
 }
 
 test "two callables calling each other round in a circle are refused" {

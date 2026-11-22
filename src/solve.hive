@@ -119,7 +119,8 @@ proc contradictory(facts: terms.Term[]): Bool {
         }
     }
     cs := constraintsOf(facts)
-    return infeasibleSplit(cs, splitsOf(facts, rangesOf(cs)), 0)
+    limits := rangesOf(cs)
+    return infeasibleSplit(cs, splitsOf(facts, limits) + divisionSplits(facts, limits), 0)
 }
 
 proc judge(facts: terms.Term[], goal: terms.Term, depth: Int): Verdict {
@@ -240,7 +241,7 @@ proc arithmetic(facts: terms.Term[], goal: terms.Term): Verdict {
 // both have to be impossible.
 proc refutes(base: Lin[], condition: terms.Term, facts: terms.Term[]): Bool {
     limits := rangesOf(base)
-    splits := splitsOf(facts, limits)
+    splits := splitsOf(facts, limits) + divisionSplits(facts + [condition], limits)
     if condition is terms.Term.Op(name, args, _) {
         if name == "ne" && len(args) == 2 {
             below := comparison("lt", terms.nth(args, 0), terms.nth(args, 1), limits)
@@ -630,6 +631,76 @@ func splitsOf(facts: terms.Term[], limits: hive.map.Map<Str, Range>): Split[dyn]
     return out
 }
 
+// Every `x / k` and `x % k` by a positive literal, tied back to `x` as Go's
+// truncating division does, one split per dividend: `x < 0` and `x >= 0`.
+func divisionSplits(ts: terms.Term[], limits: hive.map.Map<Str, Range>): Split[dyn] {
+    mut Split[dyn] out = []
+    mut Str[dyn] seen = []
+    for each t in ts {
+        for each d in divisionsIn(t) {
+            if d is terms.Term.Op(name, args, _) && terms.nth(args, 1) is terms.Term.IntK(k) {
+                x := terms.nth(args, 0)
+                q := terms.op("div", [x, terms.Term.IntK(k)], terms.integer())
+                id := terms.key(d)
+                if (indexOf(seen, id) is Result.Ok(_)) == false && isIntTerm(x) {
+                    append(seen, id)
+                    if divisionCases(name, d, x, q, k, limits) is Result.Ok(s) {
+                        append(out, s)
+                    }
+                }
+            }
+        }
+    }
+    return out
+}
+
+func divisionCases(name: Str, d: terms.Term, x: terms.Term, q: terms.Term, k: Int, limits: hive.map.Map<Str, Range>): Result<Split, Bool> {
+    lx := linear(x, limits)
+    lq := Lin([terms.key(q)], [1], 0)
+    kq := linScale(lq, k)
+    negative := shifted(lx, 1)
+    nonNegative := linScale(lx, -1)
+    if kq is Result.Ok(m) && negative is Result.Ok(xNeg) && nonNegative is Result.Ok(xPos) {
+        xMinusKq := linSub(lx, m)
+        kqMinusX := linSub(m, lx)
+        if xMinusKq is Result.Ok(a) && kqMinusX is Result.Ok(b) && shifted(a, 1 - k) is Result.Ok(aSlack) && shifted(b, 1 - k) is Result.Ok(bSlack) {
+            // x >= 0: k·q <= x <= k·q + k - 1; x < 0: k·q - (k - 1) <= x <= k·q. q
+            // takes x's sign, which the rationals these are solved over would not see.
+            mut Lin[dyn] above = [xPos, b, aSlack, Lin([terms.key(q)], [-1], 0)]
+            mut Lin[dyn] below = [xNeg, a, bSlack, lq]
+            if name == "mod" {
+                lr := Lin([terms.key(d)], [1], 0)
+                if linSub(lr, a) is Result.Ok(rIs) && linSub(a, lr) is Result.Ok(isR) && linScale(lr, -1) is Result.Ok(rNeg) && shifted(lr, 1 - k) is Result.Ok(rTop) && shifted(rNeg, 1 - k) is Result.Ok(rBottom) {
+                    // r = x - k·q, with the sign of x.
+                    above = above + [rIs, isR, rNeg, rTop]
+                    below = below + [rIs, isR, lr, rBottom]
+                } else {
+                    return Result.Error(false)
+                }
+            }
+            return Result.Ok(Split(below, above))
+        }
+    }
+    return Result.Error(false)
+}
+
+func divisionsIn(t: terms.Term): terms.Term[dyn] {
+    mut terms.Term[dyn] out = []
+    if t is terms.Term.Op(name, args, _) {
+        if (name == "div" || name == "mod") && len(args) == 2 {
+            if terms.nth(args, 1) is terms.Term.IntK(k) {
+                if k > 0 {
+                    append(out, t)
+                }
+            }
+        }
+        for each a in args {
+            out = out + divisionsIn(a)
+        }
+    }
+    return out
+}
+
 // Whether `cs` cannot hold in any case of the splits from `at` on: so `0 <= n`
 // beside `n != 0` cannot hold with `n <= 0`, since neither `n < 0` nor `0 < n` can.
 proc infeasibleSplit(cs: Lin[], splits: Split[], at: Int): Bool {
@@ -903,7 +974,23 @@ proc infeasible(cs: Lin[]): Bool {
     if negativeCycle(cs) {
         return true
     }
-    return eliminates(cs)
+    if eliminates(cs) {
+        return true
+    }
+    // The 2^60 a length is held under, scaled a few times, overflows what
+    // `eliminates` can add up, and the pair it needed is left out. A contradiction
+    // among the rest is one among all of them.
+    mut Lin[dyn] small = []
+    for each c in cs {
+        if c.constant > 0 - huge() && c.constant < huge() {
+            append(small, c)
+        }
+    }
+    return len(small) < len(cs) && eliminates(small)
+}
+
+func huge(): Int {
+    return 1099511627776
 }
 
 // Fourier–Motzkin: each atom in turn taken out by adding every pair of

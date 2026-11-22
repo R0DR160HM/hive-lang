@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.4.2
+
+### Fixes
+
+* **A `[` or `(` that opens a line starts a new statement**, so `[a, b] := …` under `x := "…"` is no longer read as an index into the string.
+* **A law on known values follows a recursion to its end**, and one the prover gives up on is reported as unproved rather than as a counterexample.
+* **`x / k` and `x % k` by a positive literal are tied back to `x`**, so `n % 2 == 1` shows `0 <= n / 2 < n`.
+* **`indexOf` past the elements a law knows is one unknown `Result`**, the same for the same vector and value, instead of a law that cannot be followed.
+* **A guard on a call is what a type law asking the same call is told**, so `if unique(pages) { Update(pages) }` keeps a law asserting `unique(u.pages)`.
+
 ## v0.4.1
 
 ### Fixes
