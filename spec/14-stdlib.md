@@ -111,6 +111,8 @@ A dictionary: keys paired with values, looked up by key. Type-level rules are in
 | `get(m, key)` | `(Map<K, T>, K): Result<T, Bool>` | the value, or `Error(false)` |
 | `has(m, key)` | `(Map<K, T>, K): Bool` | the same question without the value |
 | `delete(m, key)` | `(mut Map<K, T>, K): void` | removes a pair |
+| `plus(m, key, value)` | `(Map<K, T>, K, T): Map<K, T>` | a new map with the pair added or replaced |
+| `minus(m, key)` | `(Map<K, T>, K): Map<K, T>` | a new map without the pair |
 | `keys(m)` | `(Map<K, T>): K[dyn]` | its keys, in order |
 | `values(m)` | `(Map<K, T>): T[dyn]` | its values, in the same order |
 | `fromTable(t)` | `(Table): Map<Str, Str>` | reads rows as key/value pairs |
@@ -123,6 +125,10 @@ A dictionary: keys paired with values, looked up by key. Type-level rules are in
   twice, which is what makes it testable.
 * **Only a `mut` map can be written to.** `set` and `delete` follow `append`'s
   rule exactly, and a `proc` can take a `m: mut hive.map.Map<K, T>` parameter.
+* **`plus` and `minus` are `set` and `delete` answering a new map.** The map
+  they are handed is left as it was, so it needs no `mut`, and the new one shares
+  no storage with it. A key `plus` replaces keeps its place in the order, as with
+  `set`; one `minus` takes out leaves the rest in theirs.
 * **A map is a value**, and so is what comes out of it: `keys` and `values` are
   fresh vectors.
 * **`==` compares the pairs** and ignores the order they were set in. There is no

@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.4.3
+
+### Laws
+
+* **A law follows `hive.*` calls, builtins and queries, and never runs them**: a call that answers the same for the same arguments is worked out on known ones and one unknown otherwise, and any other answers whatever its type allows.
+* **`async`, the await-all and `with timeout` are followed**: a call run alongside is the call, and a wait with a timeout is both outcomes.
+* **A law follows a `hive.map.Map` write by write**, so `get` after a `set` of the same key is what was set, and a type's law about a map field is kept by `set` and `delete`.
+* **An interpolation of something unknown is a string a law can still reason about**, rather than a law that cannot be followed.
+
+### hive.map
+
+* **`hive.map.plus` and `hive.map.minus` are `set` and `delete` answering a new map**, leaving the one they were handed as it was.
+
 ## v0.4.2
 
 ### Fixes
