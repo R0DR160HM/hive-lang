@@ -94,9 +94,8 @@ the claim last, so a reader can stop at the claim.
 
 ## 19.4 What a law may reach
 
-A law may reach, through the callables it calls, only code that gives the same
-answer every time and comes to an end. Everything else is a compile error that
-names the path from the law to it:
+A law may reach, through the callables it calls, only code that comes to an
+end. Everything else is a compile error that names the path from the law to it:
 
 | reached | |
 | --- | --- |
@@ -105,14 +104,64 @@ names the path from the law to it:
 | `for each`, and a counting `for` loop of the shape [10](10-bounds.md) trusts | allowed |
 | any other loop | refused |
 | two callables calling each other round in a circle | refused |
-| a `hive.*` library call | refused: its body is not Hive |
-| `async`, the await-all, `with timeout` | refused: timing is not a value |
-| `spawn`, `at`, `kill`, `hide`, `encode` | refused |
-| a `query`, or a function from an imported Go file | refused: its body is not Hive the prover can read |
+| a `hive.*` library call, a builtin, a `query` | allowed: [19.4.1](#1941-library-calls) |
+| `async`, the await-all, `with timeout` | allowed: [19.4.1](#1941-library-calls) |
+| a function from an imported Go file | refused: its body is not Hive the prover can read |
 | `echo` | allowed, and ignored |
 
 Only what a law actually reaches is held to this. What a `func` may do does not
 change ([04](04-declarations.md#42-func)).
+
+### 19.4.1 Library calls
+
+**The compiler never runs anything a law reaches.** A law is proved by reading the
+program, and a call into the library, which is not Hive, is known by what kind of
+call it is:
+
+* **Settled** — a call that answers the same for the same arguments on every
+  machine: all of `hive.conv`, `hive.math` and `hive.map`, `sha256`, `sha512`,
+  `hmacSha256`, the base64 and JWT readers and `jwtCodec` in `hive.crypto`,
+  `hive.json.codec`, `hive.image`, `hive.net.urlEncode` and `queryParamsCodec`,
+  `hive.term.codec` and `positional`, every `hive.ui` call but `window`, `webview`
+  and `measure`, the builtins but those below, and a call to a `query`, which is
+  its text and the values bound beside it. Where every argument is known the
+  compiler **works the answer out** with the runtime the program links —
+  `hive.conv.sti("42")` is `Result.Ok(42)`, `len(hive.crypto.sha256(s))` is `64` on
+  a known `s` — and where one is not, the answer is **one unknown for the same
+  arguments**, the same on every path and in every callable, so a guard and a
+  law asking the same question are told the same thing.
+* **The world's** — every other call: what reads the clock, a file, the network,
+  the terminal, the environment, a random source, a service, or the machine's
+  time zone (`hive.time.format`, `dateFrom` and `dateTimeFrom`), and what changes
+  any of them. Each call **answers anything its type allows, afresh**, and a law
+  reaching one has to hold whatever it answers. Writing, printing, running a
+  command, sleeping and exiting are allowed and never performed. Among the
+  builtins, `encode`, `spawn`, `at`, `kill` and `hide`'s failure are the world's,
+  and so is the reply to a request to a service.
+
+What follows from that:
+
+* **A function handed to the library may not fail** an `assert` or reach a `panic`
+  — nor may one handed to `map`, `filter`, `filterMap` or `sort` over a vector
+  whose length is not known — since it is called on values the prover never sees.
+* **`hive.net.httpServe`, `wsServe`, `httpWsServe` and `socketServe` panic** when
+  they cannot listen on their port, and `hive.syslink.setKey` on an empty key. A
+  law reaching one is not proved.
+* **A sine and its kind are never worked out** — `sin`, `cos`, `tan`, `asin`, `acos`,
+  `atan2`, `hypot` — only kept the same for the same arguments, since a machine
+  that fuses a multiply and an add may round them otherwise; nor is `ceil`,
+  `floor` or `round` of a number past the range of an `Int`.
+* **`async f(x)` and `x := async f(x)` are the call itself**: the call runs on
+  copies of its arguments, so when it runs changes nothing a law can see. The
+  await-all is the vector of its calls.
+* **`with timeout` is both outcomes**: the call's value, and a `TimeoutError`
+  that may say anything. On a request to a service it is the request's own error.
+* **A map is followed write by write.** `get` and `has` answer what the last
+  `set`, `delete`, `plus` or `minus` of the same key left; where whether two keys
+  are the same is not settled, the case splits. A map nothing is known about —
+  a parameter, a field, what a call answered — has a key or not, and holds one
+  value at it, the same every time it is asked. `keys`, `values` and `len` are
+  worked out on a map built from `hive.map.new()` whose keys are all known.
 
 A law with a type variable among its parameters' types is proved **on each copy**,
 like every other check ([11](11-generics.md)): at every set of types the program
@@ -132,6 +181,8 @@ A law is refused, as a compile error at the law, when:
 
 ```
 bookings.hive:12: in law `grows`: it does not hold for a = 9223372036854775807: `a + 1 > a` is false
+bookings.hive:19: in law `inTime`: it does not hold for n = 0: `double(n) with timeout 100 is Result.Ok` is false
+    in the case the wait at line 19 ran out
 bookings.hive:30: in law `replayKeepsTheRoom`: cannot prove `(current after the loop at line 24 over the rest of log, starting from current = ...).room == booking.room`
     in the case log is [the first of log, ...the rest of log], and booking.status is Status.Requested, and the first of log is Event.Cancel
     known: ...

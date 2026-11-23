@@ -13,6 +13,7 @@
 import ./ast
 import ./diag
 import ./infer
+import ./library
 import ./prove
 import ./solve
 import ./terms
@@ -323,6 +324,13 @@ proc writtenValue(pr: mut prove.Prover, cx: prove.Context, scope: infer.Env, pat
             return prove.Out(path, prove.concat(item, old, ty))
         }
         return prove.Out(path, prove.concat(old, item, ty))
+    }
+    // A map written is the map it was, with one key set or taken out.
+    if shape.builtin && shape.what == "hive.map.set" {
+        return prove.Out(path, prove.mapWrite(old, terms.nth(values, 1), terms.nth(values, 2)))
+    }
+    if shape.builtin && shape.what == "hive.map.delete" {
+        return prove.Out(path, prove.mapWrite(old, terms.nth(values, 1), terms.Term.Hole()))
     }
     v := prove.fresh(pr, ty, "new " + prove.exprText(target))
     mut prove.Path p = prove.withTypeLaws(pr, cx, path, v)
@@ -850,6 +858,34 @@ proc callOf(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: inf
         built := terms.Term.RecK(typeName, variant, values)
         return prove.Out(keep(kp, pr, cx, p, built, at, "this `" + prove.exprText(callee) + "(...)`"), built)
     }
+    // A library call that answers the same for the same arguments answers what
+    // the prover makes of it, so a law asking the same question is told this.
+    if settledLibrary(cx, scope, callee, args) is Result.Ok(called) {
+        if split(called, ".") is [module, name] {
+            mut prove.Path p = path
+            mut terms.Term[dyn] values = []
+            for each a in ast.positional(args, types.callNames(cx.base.table, module, name)) {
+                held := termOf(kp, pr, cx, scope, p, a.value)
+                p = held.path
+                append(values, prove.normIn(cx, p, held.value))
+            }
+            ty := infer.typeOf(scope, e)
+            if module == "map" {
+                mut types.Ty mapTy = types.Ty.TUnknown()
+                for each a in ast.positional(args, types.callNames(cx.base.table, module, name)) {
+                    mapTy = infer.typeOf(scope, a.value)
+                    break
+                }
+                outs := prove.mapAnswer(pr, cx, p, name, values, mapTy, ty)
+                if outs is [only] {
+                    return only
+                }
+                return unknownOf(pr, cx, scope, p, e)
+            }
+            v := prove.libraryAnswer(pr, cx, module, name, values, ty)
+            return prove.Out(prove.withTypeLaws(pr, cx, p, v), v)
+        }
+    }
     shape := inPlace(cx, scope, callee, args)
     if shape.builtin && shape.what == "len" && len(shape.args) == 1 {
         // A length is what guards and laws say most about, so it is the one call
@@ -884,6 +920,24 @@ proc callOf(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: inf
         return prove.Out(q, answer.value)
     }
     return answer
+}
+
+// `module.name` for a call into the library that answers the same for the same
+// arguments and writes nothing.
+func settledLibrary(cx: prove.Context, scope: infer.Env, callee: ast.Expr, args: ast.Arg[]): Result<Str, Bool> {
+    if infer.hasHole(args) {
+        return Result.Error(false)
+    }
+    if callee is ast.Expr.Member(subject, field, _) {
+        if subject is ast.Expr.Member(inner, module, _) {
+            if inner is ast.Expr.Ident(head, _) {
+                if head == "hive" && library.settled(module, field) && (module == "map" && (field == "set" || field == "delete")) == false {
+                    return Result.Ok(module + "." + field)
+                }
+            }
+        }
+    }
+    return Result.Error(false)
 }
 
 // The name of the callable a call runs, where it is one the program declared and

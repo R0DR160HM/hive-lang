@@ -1,6 +1,9 @@
 // Laws, written as a program writes them. This file compiles only while every law in
 // it is proved, so a change to the prover that loses one fails the suite here, at
 // the law it lost.
+import hive.conv
+import hive.map
+import hive.time
 type Status {
     Requested
     Confirmed
@@ -124,6 +127,61 @@ law replayKeepsTheRoom(booking: Booking, log: Event[dyn]) {
     assert replay(booking, log).room == booking.room
 }
 
+// Which guest is in which room, by room.
+func checkIn(occupied: hive.map.Map<Str, Str>, room: Str, guest: Str): Result<hive.map.Map<Str, Str>, Str> {
+    if hive.map.get(occupied, room) is Result.Ok(already) {
+        return Result.Error("room {room} is taken by {already}")
+    }
+    return Result.Ok(hive.map.plus(occupied, room, guest))
+}
+
+func checkOut(occupied: hive.map.Map<Str, Str>, room: Str): hive.map.Map<Str, Str> {
+    return hive.map.minus(occupied, room)
+}
+
+func doorSign(floor: Int, door: Int): Str {
+    return hive.conv.its(floor) + "-" + hive.conv.its(door)
+}
+
+proc logged(booking: Booking, event: Event): Booking {
+    echo "{hive.time.now()}: {booking.room}"
+    return apply(booking, event)
+}
+
+law checkInSeatsTheGuest(occupied: hive.map.Map<Str, Str>, room: Str, guest: Str) {
+    if checkIn(occupied, room, guest) is Result.Ok(after) {
+        assert hive.map.get(after, room) == Result.Ok(guest)
+    }
+}
+
+law checkInMovesNobodyElse(occupied: hive.map.Map<Str, Str>, room: Str, other: Str, guest: Str) {
+    if room != other {
+        if checkIn(occupied, room, guest) is Result.Ok(after) {
+            assert hive.map.get(after, other) == hive.map.get(occupied, other)
+        }
+    }
+}
+
+law aTakenRoomStaysTaken(occupied: hive.map.Map<Str, Str>, room: Str, guest: Str) {
+    if hive.map.has(occupied, room) {
+        assert checkIn(occupied, room, guest) is Result.Error(_)
+    }
+}
+
+law checkOutFreesTheRoom(occupied: hive.map.Map<Str, Str>, room: Str) {
+    assert hive.map.has(checkOut(occupied, room), room) == false
+}
+
+law doorSignsAreReadable(floor: Int, door: Int) {
+    if floor == 3 && door == 12 {
+        assert doorSign(floor, door) == "3-12"
+    }
+}
+
+law loggingChangesNothing(booking: Booking, event: Event) {
+    assert logged(booking, event) == apply(booking, event)
+}
+
 test "a booking checks in and out in order" {
     b := Booking("12", 4, 6, Status.Requested())
     done := replay(b, [Event.Confirm(), Event.Arrive(), Event.Leave()])
@@ -135,4 +193,15 @@ test "a cancelled booking ignores what follows" {
     b := Booking("12", 4, 6, Status.Requested())
     done := replay(b, [Event.Cancel("change of plans"), Event.Confirm(), Event.Arrive()])
     assert done.status == Status.Cancelled()
+}
+
+test "a guest checks in, and the room is theirs until they leave" {
+    hive.map.Map<Str, Str> empty = hive.map.new()
+    if checkIn(empty, doorSign(3, 12), "Ada") is Result.Ok(occupied) {
+        assert hive.map.get(occupied, "3-12") == Result.Ok("Ada")
+        assert checkIn(occupied, "3-12", "Grace") is Result.Error(_)
+        assert hive.map.has(checkOut(occupied, "3-12"), "3-12") == false
+    } else {
+        assert false
+    }
 }

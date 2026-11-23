@@ -471,17 +471,186 @@ test "indexOf searches past the elements it knows" {
 
 // --- What a law may reach -----------------------------------------------------------------
 
-test "a law may not reach a library call" {
-    got := verdict(withMain(`
+test "a law reaches a library call that reads the world, and holds whatever it answers" {
+    assert proves(withMain(`
+        import hive.time
+        import hive.term
+
         func stamp(n: Int): Int \{
             t := hive.time.now()
+            hive.term.println("stamped \{t}")
             return n
         }
         law stamped(n: Int) \{
             assert stamp(n) == n
         }
     `))
-    assert opens(got, "in law `stamped`: it reaches `stamp` (line 1), where it calls `hive.time.now` (line 2)")
+}
+
+test "two reads of the world are two answers" {
+    got := verdict(withMain(`
+        import hive.time
+
+        law steadyClock(n: Int) \{
+            assert hive.time.now() == hive.time.now()
+        }
+    `))
+    assert opens(got, "in law `steadyClock`: cannot prove `hive.time.now() == hive.time.now()`")
+}
+
+test "a call that answers the same for the same arguments is one answer" {
+    assert proves(withMain(`
+        import hive.conv
+
+        func label(n: Int): Str \{
+            return "#" + hive.conv.its(n)
+        }
+        law labelled(n: Int) \{
+            assert label(n) == "#" + hive.conv.its(n)
+        }
+    `))
+}
+
+test "a settled call on known arguments is worked out" {
+    assert proves(withMain(`
+        import hive.conv
+        import hive.crypto
+
+        law worked(n: Int) \{
+            if n == 42 \{
+                assert hive.conv.its(n) == "42"
+                assert hive.conv.sti("42") == Result.Ok(42)
+                assert hive.conv.sti("forty") is Result.Error(_)
+                assert len(hive.crypto.sha256("abc")) == 64
+            }
+        }
+    `))
+}
+
+test "a settled call is not taken to answer what it does not" {
+    got := verdict(withMain(`
+        import hive.conv
+
+        law parses(text: Str) \{
+            assert hive.conv.sti(text) is Result.Ok(_)
+        }
+    `))
+    assert opens(got, "in law `parses`: it does not hold for text = \"\"")
+}
+
+test "a case of a settled answer nobody worked out is no counterexample" {
+    got := verdict(withMain(`
+        import hive.math
+
+        law sine(n: Int) \{
+            if hive.math.sin(0.5) < 0.4 \{
+                assert false
+            }
+        }
+    `))
+    assert opens(got, "in law `sine`: cannot prove `false`: it is false\n    known: hive.math.sin(0.5) < 0.4")
+}
+
+test "a server that may not listen is a panic a law cannot rule out" {
+    got := verdict(withMain(`
+        import hive.net
+
+        proc handle(request: hive.net.HttpRequest): hive.net.HttpResponse \{
+            return hive.net.HttpResponse(status: 200, headers: [], body: "ok")
+        }
+        law serves(port: Int) \{
+            hive.net.httpServe(port, handle)
+        }
+    `))
+    assert opens(got, "in law `serves`: cannot prove `hive.net.httpServe` never panics: it does when it cannot listen on its port")
+}
+
+test "a function handed over to be called may not fail" {
+    got := verdict(withMain(`
+        func positive(n: Int): Bool \{
+            assert n > 0
+            return true
+        }
+        law walks(v: Int[dyn]) \{
+            if len(v) > 100 \{
+                _ := filter(v, positive)
+            }
+        }
+    `))
+    assert opens(got, "in law `walks`: cannot prove this law: it hands `positive` to `filter`")
+}
+
+test "a call run alongside is the call" {
+    assert proves(withMain(`
+        func double(n: Int): Int \{
+            return n * 2
+        }
+        law awaited(n: Int) \{
+            later := async double(n)
+            assert later == n * 2
+            both := await [double(n), double(n)]
+            assert both[0] == both[1]
+            if double(n) with timeout 100 is Result.Ok(d) \{
+                assert d == n * 2
+            }
+        }
+    `))
+}
+
+test "a wait with a timeout may run out" {
+    got := verdict(withMain(`
+        func double(n: Int): Int \{
+            return n * 2
+        }
+        law inTime(n: Int) \{
+            assert double(n) with timeout 100 is Result.Ok(_)
+        }
+    `))
+    assert opens(got, "in law `inTime`: it does not hold for n = 0: `double(n) with timeout 100 is Result.Ok` is false\n    in the case the wait at line 5 ran out")
+}
+
+test "the rest of the builtins are followed" {
+    assert proves(withMain(`
+        func half(n: Int): Result<Int, Bool> \{
+            if n % 2 == 0 \{
+                return Result.Ok(n / 2)
+            }
+            return Result.Error(false)
+        }
+        law builtins(s: Str, v: Int[dyn]) \{
+            assert sort([3, 1, 2]) == [1, 2, 3]
+            assert len(sort(v)) == len(v)
+            assert filterMap([2, 3, 4], half) == [1, 2]
+            assert reveal(bypass(s)) == s
+            if hide(s) is Result.Ok(kept) \{
+                assert reveal(kept) == s
+            }
+            assert UInt8.checked(300) is Result.Error(_)
+            mut Int[dyn] w = [1, 2, 3, 4]
+            if w bounds 2 \{
+                assert drop(w, 1, 2) == [2, 3]
+                assert w == [1, 4]
+            }
+        }
+    `))
+}
+
+test "a loop is still refused in what the library is handed" {
+    got := verdict(withMain(`
+        import hive.conv
+
+        func spin(n: Int): Int \{
+            mut x := n
+            for ; x > 0; \{
+                x = x - 1
+            }
+            return x
+        }
+        law spins(n: Int) \{
+            assert hive.conv.its(spin(n)) == hive.conv.its(spin(n))
+        }
+    `))
+    assert opens(got, "in law `spins`: it reaches `spin` (line 3), where it has a loop (line 5)")
 }
 
 test "a law may not reach a loop nothing shows ends" {
@@ -739,6 +908,120 @@ test "a generic law nothing instantiates is not copied, and so not checked" {
     `))
 }
 
+// --- Maps -------------------------------------------------------------------------------
+
+func maps(): Str {
+    return "import hive.map\n\n"
+}
+
+test "a key set is the key got" {
+    assert proves(withMain(maps() + `
+        law setThenGet(m: hive.map.Map<Str, Int>, k: Str, v: Int) \{
+            mut copy := m
+            hive.map.set(copy, k, v)
+            assert hive.map.get(copy, k) == Result.Ok(v)
+            assert hive.map.has(copy, k)
+            assert hive.map.get(hive.map.plus(m, k, v), k) == Result.Ok(v)
+            assert hive.map.has(hive.map.minus(m, k), k) == false
+        }
+    `))
+}
+
+test "a key set leaves every other key as it was" {
+    assert proves(withMain(maps() + `
+        law otherKeys(m: hive.map.Map<Str, Int>, k: Str, j: Str, v: Int) \{
+            if k != j \{
+                assert hive.map.get(hive.map.plus(m, k, v), j) == hive.map.get(m, j)
+                assert hive.map.has(hive.map.minus(m, k), j) == hive.map.has(m, j)
+            }
+        }
+    `))
+}
+
+test "a map built from nothing is known whole, in the order its keys were set" {
+    assert proves(withMain(maps() + `
+        law built(n: Int) \{
+            hive.map.Map<Str, Int> empty = hive.map.new()
+            m := hive.map.plus(hive.map.plus(hive.map.plus(empty, "b", 1), "a", 2), "b", n)
+            assert hive.map.keys(m) == ["b", "a"]
+            assert hive.map.values(m) == [n, 2]
+            assert len(m) == 2
+            assert hive.map.minus(m, "b") == hive.map.plus(empty, "a", 2)
+        }
+    `))
+}
+
+test "a map parameter is tried empty and with one pair" {
+    got := verdict(withMain(maps() + `
+        law grows(m: hive.map.Map<Str, Int>, k: Str) \{
+            assert len(hive.map.plus(m, k, 1)) > len(m)
+        }
+    `))
+    assert opens(got, "in law `grows`: it does not hold for m = \{\"\": 0}, k = \"\"")
+}
+
+test "a type's law about a map is kept by every write to it" {
+    shelf := `
+        import hive.map
+
+        type Shelf \{
+            counts: hive.map.Map<Str, Int>
+
+            law hasTotal(s: Shelf) \{
+                assert hive.map.has(s.counts, "total")
+            }
+
+        }
+    `
+    assert proves(withMain(shelf + `
+        func empty(): Shelf \{
+            hive.map.Map<Str, Int> none = hive.map.new()
+            return Shelf(hive.map.plus(none, "total", 0))
+        }
+        proc restock(s: mut Shelf, item: Str, n: Int): void \{
+            hive.map.set(s.counts, item, n)
+        }
+    `))
+    got := verdict(withMain(shelf + `
+        proc clear(s: mut Shelf, item: Str): void \{
+            hive.map.delete(s.counts, item)
+        }
+    `))
+    assert opens(got, "in `clear`: this `hive.map.delete` on `s.counts` does not keep `Shelf.hasTotal`")
+}
+
+test "a guard asking a settled call is what the type's law is told" {
+    port := `
+        import hive.conv
+
+        type Port \{
+            text: Str
+
+            law numeric(p: Port) \{
+                assert hive.conv.sti(p.text) is Result.Ok(_)
+            }
+
+        }
+    `
+    assert proves(withMain(port + `
+        func http(): Port \{
+            return Port("80")
+        }
+        func parsed(text: Str): Result<Port, Bool> \{
+            if hive.conv.sti(text) is Result.Ok(_) \{
+                return Result.Ok(Port(text))
+            }
+            return Result.Error(false)
+        }
+    `))
+    got := verdict(withMain(port + `
+        func any(text: Str): Port \{
+            return Port(text)
+        }
+    `))
+    assert opens(got, "in `any`: this `Port(...)` does not keep `Port.numeric`")
+}
+
 // --- What only a law may do -----------------------------------------------------------------
 
 test "only a law may call a law" {
@@ -958,16 +1241,21 @@ test "a law inside a type takes one value of it" {
     assert opens(got, "loader: a law inside `Pair` is about one value of it, so it takes exactly one parameter, of type `Pair`")
 }
 
-test "a type's law is held to what any law may reach" {
+test "a type's law may read the world, and holds whatever it answers" {
     got := verdict(withMain(`
+        import hive.time
+
         type Stamp \{
             at: Int
             law recent(s: Stamp) \{
                 assert s.at <= hive.time.now()
             }
         }
+        func start(): Stamp \{
+            return Stamp(0)
+        }
     `))
-    assert opens(got, "in law `Stamp.recent`: it calls `hive.time.now`")
+    assert opens(got, "in `start`: ")
 }
 
 func orders(): Str {

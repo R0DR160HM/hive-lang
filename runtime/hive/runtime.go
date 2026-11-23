@@ -1282,6 +1282,20 @@ func (d *Dict[K, V]) Delete(key K) {
 	}
 }
 
+// Plus and Minus are Set and Delete on a copy, which they answer with: the map
+// they were called on keeps what it had. clone copies a value that owns storage.
+func (d Dict[K, V]) Plus(clone func(V) V, key K, value V) Dict[K, V] {
+	out := d.Clone(clone)
+	out.Set(key, value)
+	return out
+}
+
+func (d Dict[K, V]) Minus(clone func(V) V, key K) Dict[K, V] {
+	out := d.Clone(clone)
+	out.Delete(key)
+	return out
+}
+
 func (d Dict[K, V]) Keys() []K { return CloneVec(d.order) }
 
 func (d Dict[K, V]) Values() []V {

@@ -13,8 +13,8 @@
 // 4. where that is stuck, the same again with an induction on each vector
 //    parameter, as if the law had called itself on that vector's rest.
 //
-// Before any of that, what the law reaches has to be something the prover can
-// treat as an equation: the same answer every time, and an end. Nothing here runs
+// Before any of that, what the law reaches has to come to an end. A call into the
+// library is taken at whatever it may answer (`library`), since nothing here runs
 // the program, and a law is never emitted.
 import ./ast
 import ./diag
@@ -489,6 +489,21 @@ func edgeValues(t: types.Table, ty: types.Ty, depth: Int): terms.Term[dyn] {
         }
         return out
     }
+    // The empty map, and a map of one pair for each of the first two keys.
+    if ty is types.Ty.TMap(key, value) {
+        append(out, prove.emptyMap())
+        if depth < 2 {
+            values := edgeValues(t, value, depth + 1)
+            mut k := 0
+            for each kv in edgeValues(t, key, depth + 1) {
+                if k < 2 && values bounds 0 {
+                    append(out, prove.mapWrite(prove.emptyMap(), kv, values[0]))
+                }
+                k = k + 1
+            }
+        }
+        return out
+    }
     if ty is types.Ty.TResult(ok, bad) {
         mut k := 0
         for each e in edgeValues(t, ok, depth + 1) {
@@ -747,12 +762,21 @@ func valueText(t: types.Table, v: terms.Term): Str {
     if v is terms.Term.FloatK(f) {
         return "{f}"
     }
+    if v is terms.Term.MapK(_, ks, vs) {
+        mut Str[dyn] out = []
+        mut i := 0
+        for each k in ks {
+            append(out, valueText(t, k) + ": " + valueText(t, terms.nth(vs, i)))
+            i = i + 1
+        }
+        return "\{" + join(out, ", ") + "}"
+    }
     return terms.key(v)
 }
 
 // --- What a law may reach ---------------------------------------------------------
 
-// Why what the law reaches cannot be treated as an equation, or `""`.
+// Why what the law reaches may not come to an end, or `""`.
 proc reachProblem(cx: prove.Context, lawName: Str, body: ast.Block, at: token.Pos): Str {
     mut Str[dyn] queue = [lawName]
     mut Str[dyn] seen = [lawName]
@@ -791,106 +815,19 @@ proc blockProblem(cx: prove.Context, stmts: ast.Stmt[]): Str {
     return ""
 }
 
+// A loop nothing shows comes to an end is what a law may not reach. A call into
+// the library, or one running alongside, is followed for whatever it may answer
+// (`prove`), and a law has to hold for every one.
 proc stmtProblem(cx: prove.Context, s: ast.Stmt): Str {
-    if s is ast.Stmt.AsyncStmt(_, at) {
-        return "it runs something `async` (line {at.line}), and what runs alongside is not a value"
-    }
-    if s is ast.Stmt.VarDecl(_, _, _, deferred, at) {
-        if deferred {
-            return "it runs something `async` (line {at.line}), and what runs alongside is not a value"
-        }
-    }
     if s is ast.Stmt.ForLoop(init, cond, post, _, at) {
         if ranges.countsUp(init, cond, post) == "" {
             return "it has a loop (line {at.line}) that nothing shows comes to an end: only `for each`, and a counting loop that starts at a literal, steps by one and stays below a bound, can be reached by a law"
-        }
-    }
-    for each e in prove.exprsOfStmt(s) {
-        problem := exprProblem(cx, e)
-        if problem != "" {
-            return problem
         }
     }
     for each b in prove.blocksOfStmt(s) {
         problem := blockProblem(cx, b.stmts)
         if problem != "" {
             return problem
-        }
-    }
-    return ""
-}
-
-proc exprProblem(cx: prove.Context, e: ast.Expr): Str {
-    if e is ast.Expr.AwaitAll(_, _, at) {
-        return "it waits on calls running alongside (line {at.line}), and what runs alongside is not a value"
-    }
-    if e is ast.Expr.Timed(_, _, at) {
-        return "it times a call (line {at.line}), and how long something takes is not a value"
-    }
-    if e is ast.Expr.Call(callee, args, at) {
-        word := libraryPath(callee)
-        if word != "" {
-            return "it calls `{word}` (line {at.line}), and the prover cannot read the body of a library call"
-        }
-        if callee is ast.Expr.Ident(name, _) {
-            if hive.map.has(cx.callables, name) == false && (name == "spawn" || name == "at" || name == "kill" || name == "hide" || name == "encode") {
-                return "it calls `{name}` (line {at.line}), whose answer depends on more than its arguments"
-            }
-        }
-        for each a in args {
-            problem := exprProblem(cx, a.value)
-            if problem != "" {
-                return problem
-            }
-        }
-        return exprProblem(cx, callee)
-    }
-    if e is ast.Expr.Binary(_, l, r, _) {
-        left := exprProblem(cx, l)
-        if left != "" {
-            return left
-        }
-        return exprProblem(cx, r)
-    }
-    if e is ast.Expr.Not(x, _) {
-        return exprProblem(cx, x)
-    }
-    if e is ast.Expr.Negate(x, _) {
-        return exprProblem(cx, x)
-    }
-    if e is ast.Expr.Member(subject, _, _) {
-        return exprProblem(cx, subject)
-    }
-    if e is ast.Expr.Index(subject, index, _) {
-        left := exprProblem(cx, subject)
-        if left != "" {
-            return left
-        }
-        return exprProblem(cx, index)
-    }
-    if e is ast.Expr.IsMatch(subject, _, _) {
-        return exprProblem(cx, subject)
-    }
-    if e is ast.Expr.VectorLit(items, _) {
-        for each item in items {
-            problem := exprProblem(cx, item)
-            if problem != "" {
-                return problem
-            }
-        }
-    }
-    return ""
-}
-
-// `hive.file.read` for a library call written that way, `""` otherwise.
-func libraryPath(callee: ast.Expr): Str {
-    if callee is ast.Expr.Member(subject, field, _) {
-        if subject is ast.Expr.Member(inner, module, _) {
-            if inner is ast.Expr.Ident(head, _) {
-                if head == "hive" {
-                    return "hive.{module}.{field}"
-                }
-            }
         }
     }
     return ""

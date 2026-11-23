@@ -15,6 +15,7 @@
 // prover understood.
 import ./ast
 import ./infer
+import ./library
 import ./solve
 import ./terms
 import ./text
@@ -94,6 +95,9 @@ type Context {
     recursive: hive.map.Map<Str, Bool>
     // The laws written inside each type, by the type's flattened name.
     typeLaws: hive.map.Map<Str, Str[dyn]>
+    // The program's queries, and the Go functions it imports, by name.
+    queries: hive.map.Map<Str, Bool>
+    imported: hive.map.Map<Str, Bool>
     base: infer.Env
 }
 
@@ -121,6 +125,10 @@ type Prover {
     baseFacts: Int
     baseShapes: Str[dyn]
     concluded: solve.Lemma[dyn]
+    // The unknowns that are one value the prover was not told — a settled call on
+    // known arguments it does not work out — by `u<id>`. A case split on one may be
+    // a case that never happens, so it is no counterexample.
+    fixed: Str[dyn]
 }
 
 func unfoldLimit(): Int {
@@ -183,7 +191,16 @@ proc newContext(m: ast.Module, t: types.Table): Context {
             }
         }
     }
-    return Context(callables, loopParam, loopAt, failing(m), recursive, typeLaws, infer.newEnv(t))
+    mut hive.map.Map<Str, Bool> queries = hive.map.new()
+    mut hive.map.Map<Str, Bool> imported = hive.map.new()
+    for each d in m.decls {
+        if d is ast.Decl.QueryDecl(name, _, _, _, _) {
+            hive.map.set(queries, name, true)
+        } else if d is ast.Decl.ForeignDecl(name, _, _, _, _, _, _) {
+            hive.map.set(imported, name, true)
+        }
+    }
+    return Context(callables, loopParam, loopAt, failing(m), recursive, typeLaws, queries, imported, infer.newEnv(t))
 }
 
 // Every callable with an `assert` or a `panic` in it, or a call to one that has.
@@ -250,7 +267,7 @@ func blockMayFail(cx: Context, stmts: ast.Stmt[]): Bool {
 
 proc newProver(budget: Int): Prover {
     mut hive.map.Map<Str, Int> parts = hive.map.new()
-    return Prover([], parts, 0, budget, true, [], 0, "", [], [], 0, [], [])
+    return Prover([], parts, 0, budget, true, [], 0, "", [], [], 0, [], [], [])
 }
 
 func place(at: token.Pos): Str {
@@ -277,6 +294,70 @@ proc part(pr: mut Prover, k: Str, ty: types.Ty, label: Str): terms.Term {
         hive.map.set(pr.parts, k, id)
     }
     return t
+}
+
+// `part`, for one value the prover is not told: a settled call on known
+// arguments that it does not work out.
+proc fixedPart(pr: mut Prover, k: Str, ty: types.Ty, label: Str): terms.Term {
+    t := part(pr, k, ty, label)
+    if t is terms.Term.Unknown(id, _) {
+        if (indexOf(pr.fixed, "u{id}") is Result.Ok(_)) == false {
+            append(pr.fixed, "u{id}")
+        }
+    }
+    return t
+}
+
+// Whether what a path knows was taken, somewhere, on a case of a fixed unknown:
+// a case that may never happen, which no counterexample may rest on.
+proc leansOnFixed(pr: mut Prover, cx: Context, path: Path): Bool {
+    if len(pr.fixed) == 0 {
+        return false
+    }
+    for each k in hive.map.keys(path.shapes) {
+        if indexOf(pr.fixed, k) is Result.Ok(_) {
+            return true
+        }
+    }
+    for each f in path.facts {
+        if mentions(f, pr.fixed) {
+            return true
+        }
+    }
+    return false
+}
+
+// Whether a term holds any of the unknowns `ids` names.
+func mentions(t: terms.Term, ids: Str[]): Bool {
+    if t is terms.Term.Unknown(id, _) {
+        return indexOf(ids, "u{id}") is Result.Ok(_)
+    } else if t is terms.Term.Op(_, args, _) {
+        return mentionsAny(args, ids)
+    } else if t is terms.Term.VecK(items) {
+        return mentionsAny(items, ids)
+    } else if t is terms.Term.VecS(known, rest) {
+        return mentionsAny(known, ids) || mentions(rest, ids)
+    } else if t is terms.Term.RecK(_, _, fields) {
+        return mentionsAny(fields, ids)
+    } else if t is terms.Term.OkK(payload) {
+        return mentions(payload, ids)
+    } else if t is terms.Term.ErrK(payload) {
+        return mentions(payload, ids)
+    } else if t is terms.Term.FnK(_, args) {
+        return mentionsAny(args, ids)
+    } else if t is terms.Term.MapK(base, ks, vs) {
+        return mentions(base, ids) || mentionsAny(ks, ids) || mentionsAny(vs, ids)
+    }
+    return false
+}
+
+func mentionsAny(ts: terms.Term[], ids: Str[]): Bool {
+    for each t in ts {
+        if mentions(t, ids) {
+            return true
+        }
+    }
+    return false
 }
 
 proc labelOf(pr: mut Prover, id: Int): Str {
@@ -379,6 +460,16 @@ func norm(t: types.Table, shapes: hive.map.Map<Str, terms.Term>, term: terms.Ter
         return terms.Term.ErrK(norm(t, shapes, payload))
     } else if term is terms.Term.FnK(name, args) {
         return terms.Term.FnK(name, normAll(t, shapes, args))
+    } else if term is terms.Term.MapK(base, ks, vs) {
+        // Written again from the start, so keys that have since become known
+        // settle which writes are the same key.
+        mut terms.Term m = terms.Term.MapK(norm(t, shapes, base), [], [])
+        mut i := 0
+        for each k in ks {
+            m = mapWrite(m, norm(t, shapes, k), norm(t, shapes, terms.nth(vs, i)))
+            i = i + 1
+        }
+        return m
     }
     return term
 }
@@ -622,6 +713,9 @@ func mayHoldFloat(t: terms.Term): Bool {
     if t is terms.Term.FnK(_, args) {
         return anyFloat(args)
     }
+    if t is terms.Term.MapK(base, ks, vs) {
+        return mayHoldFloat(base) || anyFloat(ks) || anyFloat(vs)
+    }
     return false
 }
 
@@ -688,6 +782,31 @@ func sameValue(a: terms.Term, b: terms.Term): Bool {
     if a is terms.Term.ErrK(pa) && b is terms.Term.ErrK(pb) {
         return sameValue(pa, pb)
     }
+    // Two maps are the same pairs, whatever order they were set in.
+    if a is terms.Term.MapK(_, ka, va) && b is terms.Term.MapK(_, kb, vb) {
+        if len(ka) != len(kb) {
+            return false
+        }
+        mut i := 0
+        for each k in ka {
+            mut matched := false
+            mut j := 0
+            for each other in kb {
+                if matched == false && sameValue(k, other) {
+                    matched = true
+                    if sameValue(terms.nth(va, i), terms.nth(vb, j)) == false {
+                        return false
+                    }
+                }
+                j = j + 1
+            }
+            if matched == false {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
     return terms.key(a) == terms.key(b)
 }
 
@@ -729,6 +848,11 @@ func lengthOf(a: terms.Term): terms.Term {
     }
     if a is terms.Term.StrK(s) {
         return terms.Term.IntK(len(s))
+    }
+    if a is terms.Term.MapK(base, ks, _) {
+        if base is terms.Term.Hole && terms.allKnown(ks) {
+            return terms.Term.IntK(len(ks))
+        }
     }
     if a is terms.Term.Op(name, args, _) {
         if name == "cat" {
@@ -989,11 +1113,31 @@ proc execStmt(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, s: ast.
         return [ended(path, End.Broke())]
     } else if s is ast.Stmt.ContinueStmt(_) {
         return [ended(path, End.Continued())]
-    } else if s is ast.Stmt.AsyncStmt(_, at) {
-        return [lost(path, "it cannot reason about `async`: what runs alongside is not a value", at)]
+    } else if s is ast.Stmt.AsyncStmt(call, _) {
+        // Its arguments are copies, so what it does is what the call does, whenever
+        // it runs.
+        mut Path[dyn] out = []
+        for each o in eval(pr, cx, scope, path, call) {
+            append(out, o.path)
+        }
+        return out
     } else if s is ast.Stmt.Expression(value, at) {
         if lawCalled(cx, value) is Result.Ok(name) {
             return assumeLaw(pr, cx, scope, path, name, value, at)
+        }
+        // A `sort` standing on its own sorts its `mut` vector where it lies.
+        if sortsInPlace(cx, scope, value) is Result.Ok(target) {
+            mut Path[dyn] out = []
+            for each o in eval(pr, cx, scope, path, value) {
+                if running(o.path) {
+                    for each p in store(pr, cx, scope, o.path, target, o.value, at) {
+                        append(out, p)
+                    }
+                } else {
+                    append(out, o.path)
+                }
+            }
+            return out
         }
         mut Path[dyn] out = []
         for each o in eval(pr, cx, scope, path, value) {
@@ -1004,10 +1148,9 @@ proc execStmt(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, s: ast.
     return [path]
 }
 
+// `x := async f(a)` binds what `f(a)` answers: the call runs on copies of its
+// arguments, so when it runs changes nothing a law can see.
 proc declare(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, name: Str, value: ast.Expr, mutable: Bool, deferred: Bool, at: token.Pos): Path[dyn] {
-    if deferred {
-        return [lost(path, "it cannot reason about `async`: what runs alongside is not a value", at)]
-    }
     if mutable {
         other := rootOf(value)
         if other != "" && indexOf(path.muts, other) is Result.Ok(_) {
@@ -1467,10 +1610,10 @@ proc checkAssert(pr: mut Prover, cx: Context, path: Path, value: terms.Term, wri
         verdict := solve.decide(normFacts(cx, path), normLemmas(cx, path), c)
         if verdict is solve.Verdict.Holds {
             pr.proved = pr.proved + 1
-        } else if pr.witness != "" && verdict is solve.Verdict.Fails {
-            append(pr.problems, Problem(at, "it does not hold for " + pr.witness + ": `" + exprText(written) + "` is false", true, false))
+        } else if pr.witness != "" && verdict is solve.Verdict.Fails && leansOnFixed(pr, cx, path) == false {
+            append(pr.problems, Problem(at, "it does not hold for " + pr.witness + ": `" + exprText(written) + "` is false" + caseText(path), true, false))
         } else if verdict is solve.Verdict.Fails {
-            append(pr.problems, Problem(at, "cannot prove `" + exprText(written) + "`: it is false" + caseText(path), false, false))
+            append(pr.problems, Problem(at, "cannot prove `" + exprText(written) + "`: it is false" + caseText(path) + knownText(pr, cx, path), false, false))
         } else {
             append(pr.problems, Problem(at, "cannot prove `" + render(pr, c) + "`" + caseText(path) + knownText(pr, cx, path), false, false))
         }
@@ -1489,8 +1632,8 @@ proc panicked(pr: mut Prover, cx: Context, path: Path, at: token.Pos): Path[dyn]
     mut Path[dyn] none = []
     if pr.claiming {
         if solve.impossible(normFacts(cx, path), normLemmas(cx, path)) == false {
-            if pr.witness != "" {
-                append(pr.problems, Problem(at, "it does not hold for " + pr.witness + ": this `panic` is reached", true, false))
+            if pr.witness != "" && leansOnFixed(pr, cx, path) == false {
+                append(pr.problems, Problem(at, "it does not hold for " + pr.witness + ": this `panic` is reached" + caseText(path), true, false))
             } else {
                 append(pr.problems, Problem(at, "cannot prove this `panic` is never reached" + caseText(path), false, false))
             }
@@ -1918,11 +2061,11 @@ proc materialize(pr: mut Prover, cx: Context, path: Path, value: terms.Term, lab
             mut Out[dyn] out = []
             good := terms.Term.OkK(part(pr, "u{id}:ok", ok, firstLabel(labels, label + "'s value")))
             if checked(pr, cx, withShape(path, id, good, label + " is Result.Ok")) is Result.Ok(p) {
-                append(out, Out(p, good))
+                append(out, Out(withTypeLaws(pr, cx, p, good), good))
             }
             bad2 := terms.Term.ErrK(part(pr, "u{id}:error", bad, firstLabel(labels, label + "'s error")))
             if checked(pr, cx, withShape(path, id, bad2, label + " is Result.Error")) is Result.Ok(p) {
-                append(out, Out(p, bad2))
+                append(out, Out(withTypeLaws(pr, cx, p, bad2), bad2))
             }
             return out
         }
@@ -2123,6 +2266,44 @@ proc eval(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, e: ast.Expr
             }
         }
         return out
+    } else if e is ast.Expr.AwaitAll(calls, timeout, at) {
+        mut Out[dyn] out = []
+        for each o in evalAll(pr, cx, scope, path, calls, 0, []) {
+            if running(o.path) == false {
+                append(out, Out(o.path, terms.Term.VoidK()))
+                continue
+            }
+            if timeout is ast.Expr.Absent {
+                append(out, Out(o.path, terms.Term.VecK(o.values)))
+                continue
+            }
+            for each r in timedOut(pr, cx, scope, o.path, terms.Term.VecK(o.values), timeout, infer.typeOf(scope, e), at) {
+                append(out, r)
+            }
+        }
+        return out
+    } else if e is ast.Expr.Timed(call, ms, at) {
+        ty := infer.typeOf(scope, e)
+        // A request to a service folds the timeout into its own error, and is
+        // anything its type allows already.
+        if types.same(infer.typeOf(scope, call), ty) {
+            mut Out[dyn] out = []
+            for each o in evalAll(pr, cx, scope, path, [call, ms], 0, []) {
+                append(out, Out(o.path, terms.nth(o.values, 0)))
+            }
+            return out
+        }
+        mut Out[dyn] out = []
+        for each o in eval(pr, cx, scope, path, call) {
+            if running(o.path) == false {
+                append(out, o)
+                continue
+            }
+            for each r in timedOut(pr, cx, scope, o.path, o.value, ms, ty, at) {
+                append(out, r)
+            }
+        }
+        return out
     } else if e is ast.Expr.Hole(_) {
         return one(path, terms.Term.Hole())
     } else if e is ast.Expr.Absent(_) {
@@ -2294,11 +2475,15 @@ func compared(op: ast.BinOp, a: terms.Term, b: terms.Term): Result<terms.Term, B
     return Result.Error(false)
 }
 
+// An interpolation is its pieces joined: a value that is not a `Str` is its text,
+// the same text for the same value.
 proc evalInterp(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, parts: ast.InterpPart[], at: token.Pos): Out[dyn] {
     mut ast.Expr[dyn] holes = []
+    mut types.Ty[dyn] held = []
     for each p in parts {
         if p is ast.InterpPart.Expression(value) {
             append(holes, value)
+            append(held, infer.typeOf(scope, value))
         }
     }
     mut Out[dyn] out = []
@@ -2307,31 +2492,30 @@ proc evalInterp(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, parts
             append(out, Out(o.path, terms.Term.VoidK()))
             continue
         }
-        mut written := ""
-        mut whole := true
+        mut terms.Term written = terms.Term.StrK("")
         mut i := 0
         for each p in parts {
             if p is ast.InterpPart.Literal(t) {
-                written = written + t
+                written = concat(written, terms.Term.StrK(t), types.Ty.TStr())
             } else {
                 v := normIn(cx, o.path, terms.nth(o.values, i))
-                if v is terms.Term.StrK(s) {
-                    written = written + s
+                mut terms.Term piece = terms.op("text", [v], types.Ty.TStr())
+                if v is terms.Term.StrK(_) {
+                    piece = v
                 } else if v is terms.Term.IntK(n) {
-                    written = written + "{n}"
+                    piece = terms.Term.StrK("{n}")
                 } else if v is terms.Term.BoolK(b) {
-                    written = written + "{b}"
-                } else {
-                    whole = false
+                    piece = terms.Term.StrK("{b}")
+                } else if held bounds i {
+                    if held[i] is types.Ty.TStr {
+                        piece = v
+                    }
                 }
+                written = concat(written, piece, types.Ty.TStr())
                 i = i + 1
             }
         }
-        if whole {
-            append(out, Out(o.path, terms.Term.StrK(written)))
-        } else {
-            append(out, Out(lost(o.path, "it cannot reason about an interpolation of something it does not know", at), terms.Term.VoidK()))
-        }
+        append(out, Out(o.path, written))
     }
     return out
 }
@@ -2594,6 +2778,28 @@ func bindAll(path: Path, bindings: Str[], values: terms.Term[]): Path {
 // --- Calls ------------------------------------------------------------------------
 
 proc evalCall(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, callee: ast.Expr, args: ast.Arg[], at: token.Pos): Out[dyn] {
+    // A request to a service is answered by whatever state the service holds.
+    if infer.typeOf(scope, callee) is types.Ty.TAddress(_) {
+        ty := infer.typeOf(scope, ast.Expr.Call(callee, args, at))
+        mut Out[dyn] out = []
+        for each o in evalAll(pr, cx, scope, path, [callee] + argValues(args), 0, []) {
+            if running(o.path) == false {
+                append(out, Out(o.path, terms.Term.VoidK()))
+                continue
+            }
+            append(out, kept(pr, cx, o.path, anyValue(pr, ty, "the reply to " + exprText(callee) + "(...)")))
+        }
+        return out
+    }
+    if callee is ast.Expr.Member(subject, field, _) {
+        if subject is ast.Expr.Member(inner, module, _) {
+            if inner is ast.Expr.Ident(head, _) {
+                if head == "hive" {
+                    return evalLibrary(pr, cx, scope, path, module, field, args, infer.typeOf(scope, ast.Expr.Call(callee, args, at)), at)
+                }
+            }
+        }
+    }
     if callee is ast.Expr.Ident(name, _) {
         if hive.map.get(path.env, name) is Result.Ok(held) {
             mut Out[dyn] out = []
@@ -2636,6 +2842,24 @@ proc evalCall(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, callee:
         if types.fieldsOfStruct(scope.table, name) is Result.Ok(fields) {
             return construct(pr, cx, scope, path, name, "", fields, args)
         }
+        // A query is its text and the values bound beside it: the same for the
+        // same arguments. Running it is `hive.sql.run`'s business.
+        if hive.map.has(cx.queries, name) {
+            ty := infer.typeOf(scope, ast.Expr.Call(callee, args, at))
+            mut Out[dyn] out = []
+            for each o in evalAll(pr, cx, scope, path, argValues(args), 0, []) {
+                if running(o.path) == false {
+                    append(out, Out(o.path, terms.Term.VoidK()))
+                    continue
+                }
+                known := normAll(cx.base.table, o.path.shapes, o.values)
+                append(out, Out(o.path, fixedPart(pr, "query:" + name + "(" + terms.keys(known) + ")", ty, types.shownName(name) + "(" + renderAll(pr, known) + ")")))
+            }
+            return out
+        }
+        if hive.map.has(cx.imported, name) {
+            return lostOut(path, "it calls `" + types.shownName(name) + "`, a Go function, and the prover cannot read Go", at)
+        }
         return evalBuiltin(pr, cx, scope, path, name, args, at)
     }
     if callee is ast.Expr.Member(subject, field, _) {
@@ -2655,6 +2879,9 @@ proc evalCall(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, callee:
             if head == "hive" {
                 return evalBuiltin(pr, cx, scope, path, field, args, at)
             }
+            if field == "checked" && infer.isBound(scope, head) == false && infer.isConversion(head) {
+                return checkedConversion(pr, cx, scope, path, head, args, infer.typeOf(scope, ast.Expr.Call(callee, args, at)))
+            }
             if infer.isBound(scope, head) == false {
                 if types.findVariant(scope.table, head, field) is Result.Ok(fields) {
                     return construct(pr, cx, scope, path, head, field, fields, args)
@@ -2672,6 +2899,45 @@ func argValues(args: ast.Arg[]): ast.Expr[dyn] {
         append(out, a.value)
     }
     return out
+}
+
+// A wait bounded by `ms`: whether the deadline came first is up to the machine, so
+// it is both — the value, and a `TimeoutError` that may say anything.
+proc timedOut(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, value: terms.Term, ms: ast.Expr, ty: types.Ty, at: token.Pos): Out[dyn] {
+    mut Out[dyn] out = []
+    for each o in eval(pr, cx, scope, path, ms) {
+        if running(o.path) == false {
+            append(out, o)
+            continue
+        }
+        append(out, Out(o.path, terms.Term.OkK(value)))
+        if ty is types.Ty.TResult(_, bad) {
+            mut Path late = o.path
+            append(late.cases, "the wait at line {at.line} ran out")
+            append(out, Out(late, terms.Term.ErrK(fresh(pr, bad, "the timeout at line {at.line}"))))
+        }
+    }
+    return out
+}
+
+// The `mut` storage a `sort` standing as a statement reorders, where it is one.
+func sortsInPlace(cx: Context, scope: infer.Env, e: ast.Expr): Result<ast.Expr, Bool> {
+    if e is ast.Expr.Call(callee, args, _) {
+        mut builtin := false
+        if callee is ast.Expr.Ident(name, _) {
+            builtin = name == "sort" && hive.map.has(cx.callables, name) == false && infer.isBound(scope, name) == false
+        } else if callee is ast.Expr.Member(subject, field, _) {
+            if subject is ast.Expr.Ident(head, _) {
+                builtin = head == "hive" && field == "sort"
+            }
+        }
+        if builtin {
+            for each a in infer.builtinArgs("sort", args) {
+                return Result.Ok(a.value)
+            }
+        }
+    }
+    return Result.Error(false)
 }
 
 proc construct(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, typeName: Str, variant: Str, fields: ast.Field[], args: ast.Arg[]): Out[dyn] {
@@ -2920,7 +3186,8 @@ proc evalBuiltin(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, name
         }
         return out
     }
-    if name == "map" || name == "filter" {
+    ty := infer.typeOf(scope, ast.Expr.Call(ast.Expr.Member(ast.Expr.Ident("hive", at), name, at), args, at))
+    if name == "map" || name == "filter" || name == "filterMap" {
         mut Out[dyn] out = []
         for each o in evalAll(pr, cx, scope, path, values, 0, []) {
             if running(o.path) == false {
@@ -2930,16 +3197,559 @@ proc evalBuiltin(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, name
             v := normIn(cx, o.path, terms.nth(o.values, 0))
             fn := normIn(cx, o.path, terms.nth(o.values, 1))
             if v is terms.Term.VecK(items) {
-                for each r in mapped(pr, cx, o.path, items, fn, name == "filter", 0, [], at) {
+                for each r in mapped(pr, cx, o.path, items, fn, name, 0, [], at) {
                     append(out, r)
                 }
+                continue
+            }
+            // Over a vector of a length it does not know, a walk whose function
+            // cannot fail is the same walk for the same vector.
+            handed := handedOver(cx, [fn], name)
+            if handed != "" {
+                append(out, Out(lost(o.path, handed, at), terms.Term.VoidK()))
+                continue
+            }
+            walked := part(pr, "walk:" + name + "(" + terms.key(v) + "," + terms.key(fn) + ")", ty, name + "(" + render(pr, v) + ", " + render(pr, fn) + ")")
+            if name == "map" {
+                for each p in sameLength(pr, cx, o.path, walked, v) {
+                    append(out, Out(p, walked))
+                }
             } else {
-                append(out, Out(lost(o.path, "it can follow `{name}` only over a vector whose length it knows", at), terms.Term.VoidK()))
+                append(out, Out(o.path, walked))
+            }
+        }
+        return out
+    }
+    if name == "sort" || name == "drop" || name == "bytes" || name == "row" || name == "column" || name == "toTable"
+        || name == "encode" || name == "spawn" || name == "at" || name == "kill" || name == "hide" || name == "bypass"
+        || name == "reveal" || infer.isConversion(name) {
+        mut Out[dyn] out = []
+        for each o in evalAll(pr, cx, scope, path, values, 0, []) {
+            if running(o.path) == false {
+                append(out, Out(o.path, terms.Term.VoidK()))
+                continue
+            }
+            known := normAll(cx.base.table, o.path.shapes, o.values)
+            if name == "drop" {
+                if values bounds 0 {
+                    for each r in dropped(pr, cx, scope, o.path, values[0], known, ty, at) {
+                        append(out, r)
+                    }
+                }
+                continue
+            }
+            for each r in builtinAnswer(pr, cx, o.path, name, known, ty, at) {
+                append(out, r)
             }
         }
         return out
     }
     return lostOut(path, "it cannot reason about `{name}` yet", at)
+}
+
+// What one of the rest of the builtins answers, on arguments already worked out.
+proc builtinAnswer(pr: mut Prover, cx: Context, path: Path, name: Str, args: terms.Term[], ty: types.Ty, at: token.Pos): Out[dyn] {
+    a := terms.nth(args, 0)
+    shown := name + "(" + renderAll(pr, args) + ")"
+    mut settled := part(pr, "builtin:" + name + "(" + terms.keys(args) + ")", ty, shown)
+    if terms.allKnown(args) {
+        settled = fixedPart(pr, "builtin:" + name + "(" + terms.keys(args) + ")", ty, shown)
+    }
+    if name == "sort" {
+        handed := handedOver(cx, args, name)
+        if handed != "" {
+            return lostOut(path, handed, at)
+        }
+        if len(args) == 1 && a is terms.Term.VecK(items) {
+            if sortedKnown(items) is Result.Ok(v) {
+                return one(path, v)
+            }
+        }
+        mut Out[dyn] out = []
+        for each p in sameLength(pr, cx, path, settled, a) {
+            append(out, Out(p, settled))
+        }
+        return out
+    }
+    if name == "bytes" {
+        if a is terms.Term.StrK(s) {
+            return one(path, terms.Term.IntK(bytes(s)))
+        }
+        return one(path, settled)
+    }
+    if name == "row" || name == "column" || name == "toTable" {
+        return one(path, settled)
+    }
+    // A secret holds what it was given; keeping it out of swap is what may fail.
+    if name == "bypass" {
+        return one(path, terms.op("secret", [a], ty))
+    }
+    if name == "hide" {
+        mut Out[dyn] out = [Out(path, terms.Term.OkK(terms.op("secret", [a], types.Ty.TSecret(termType(a)))))]
+        if ty is types.Ty.TResult(_, bad) {
+            mut Path refused = path
+            append(refused.cases, "hide at line {at.line} failed")
+            append(out, Out(refused, terms.Term.ErrK(fresh(pr, bad, "the error of hide at line {at.line}"))))
+        }
+        return out
+    }
+    if name == "reveal" {
+        if a is terms.Term.Op(op, held, _) {
+            if op == "secret" {
+                return one(path, terms.nth(held, 0))
+            }
+        }
+        return [kept(pr, cx, path, settled)]
+    }
+    if infer.isConversion(name) {
+        return one(path, converted(infer.conversionType(name), a, settled))
+    }
+    // `encode`, and a service started, sought or stopped: the world's business.
+    return [kept(pr, cx, path, anyValue(pr, ty, shown))]
+}
+
+// The elements in order, where every one is a known `Int` or every one a known
+// `Str`: `Error` otherwise.
+func sortedKnown(items: terms.Term[]): Result<terms.Term, Bool> {
+    mut Int[dyn] ints = []
+    mut Str[dyn] strs = []
+    for each item in items {
+        if item is terms.Term.IntK(n) {
+            append(ints, n)
+        } else if item is terms.Term.StrK(s) {
+            append(strs, s)
+        } else {
+            return Result.Error(false)
+        }
+    }
+    mut terms.Term[dyn] out = []
+    if len(ints) > 0 && len(strs) > 0 {
+        return Result.Error(false)
+    }
+    for each n in sort(ints) {
+        append(out, terms.Term.IntK(n))
+    }
+    for each s in sort(strs) {
+        append(out, terms.Term.StrK(s))
+    }
+    return Result.Ok(terms.Term.VecK(out))
+}
+
+// `drop(v, low, high)`: the elements from `low` to `high`, both kept within `v`,
+// taken out of it and handed back.
+proc dropped(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, target: ast.Expr, args: terms.Term[], ty: types.Ty, at: token.Pos): Out[dyn] {
+    v := terms.nth(args, 0)
+    if v is terms.Term.VecK(items) && terms.nth(args, 1) is terms.Term.IntK(from) && terms.nth(args, 2) is terms.Term.IntK(to) {
+        mut low := from
+        mut high := to
+        if low < 0 {
+            low = 0
+        }
+        if high >= len(items) {
+            high = len(items) - 1
+        }
+        mut terms.Term[dyn] taken = []
+        mut terms.Term[dyn] rest = []
+        mut i := 0
+        for each item in items {
+            if low <= high && i >= low && i <= high {
+                append(taken, item)
+            } else {
+                append(rest, item)
+            }
+            i = i + 1
+        }
+        mut Out[dyn] out = []
+        for each p in store(pr, cx, scope, path, target, terms.Term.VecK(rest), at) {
+            append(out, Out(p, terms.Term.VecK(taken)))
+        }
+        return out
+    }
+    k := terms.keys(args)
+    rest := part(pr, "dropRest(" + k + ")", infer.typeOf(scope, target), render(pr, v) + " after drop")
+    taken := part(pr, "dropTaken(" + k + ")", ty, "what drop took from " + render(pr, v))
+    mut Out[dyn] out = []
+    if assume(pr, cx, path, equal(arith("add", lengthOf(rest), lengthOf(taken)), lengthOf(v))) is Result.Ok(p) {
+        for each q in store(pr, cx, scope, p, target, rest, at) {
+            append(out, Out(q, taken))
+        }
+    }
+    return out
+}
+
+// `ty(x)`, a number kept to a type: worked out on a known integer, `otherwise`
+// where it cannot be.
+func converted(ty: types.Ty, x: terms.Term, otherwise: terms.Term): terms.Term {
+    if x is terms.Term.IntK(n) {
+        if ty is types.Ty.TInt {
+            return x
+        }
+        if ty is types.Ty.TFloat {
+            return terms.Term.FloatK(hive.conv.itf(n))
+        }
+        if ty is types.Ty.TSized(signed, bits) {
+            if wrapped(n, signed, bits) is Result.Ok(w) {
+                return terms.Term.IntK(w)
+            }
+        }
+    }
+    if x is terms.Term.FloatK(_) && ty is types.Ty.TFloat {
+        return x
+    }
+    return otherwise
+}
+
+// `n` kept to `bits` bits, wrapping as the type does: `Error` past what an `Int`
+// can hold the arithmetic for.
+func wrapped(n: Int, signed: Bool, bits: Int): Result<Int, Bool> {
+    if bits <= 0 || bits >= 62 {
+        return Result.Error(false)
+    }
+    m := 2 ** bits
+    mut u := n % m
+    if u < 0 {
+        u = u + m
+    }
+    if signed && u >= m / 2 {
+        u = u - m
+    }
+    return Result.Ok(u)
+}
+
+// `UInt8.checked(x)`: the value where it fits, `Error(x)` where it does not.
+proc checkedConversion(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, typeName: Str, args: ast.Arg[], ty: types.Ty): Out[dyn] {
+    target := infer.conversionType(typeName)
+    mut Out[dyn] out = []
+    for each o in evalAll(pr, cx, scope, path, argValues(args), 0, []) {
+        if running(o.path) == false {
+            append(out, Out(o.path, terms.Term.VoidK()))
+            continue
+        }
+        x := normIn(cx, o.path, terms.nth(o.values, 0))
+        settled := part(pr, "checked:" + typeName + "(" + terms.key(x) + ")", ty, typeName + ".checked(" + render(pr, x) + ")")
+        mut terms.Term answer = settled
+        if x is terms.Term.IntK(n) {
+            if target is types.Ty.TInt {
+                answer = terms.Term.OkK(x)
+            } else if target is types.Ty.TSized(_, _) {
+                if converted(target, x, settled) is terms.Term.IntK(w) {
+                    if w == n {
+                        answer = terms.Term.OkK(x)
+                    } else {
+                        answer = terms.Term.ErrK(x)
+                    }
+                }
+            }
+        }
+        append(out, Out(o.path, answer))
+    }
+    return out
+}
+
+// `walked` known to be as long as `v`.
+proc sameLength(pr: mut Prover, cx: Context, path: Path, walked: terms.Term, v: terms.Term): Path[dyn] {
+    if assume(pr, cx, path, equal(lengthOf(walked), lengthOf(v))) is Result.Ok(p) {
+        return [p]
+    }
+    mut Path[dyn] none = []
+    return none
+}
+
+// --- The standard library ---------------------------------------------------------
+// See `library`: a settled call is worked out or the same unknown for the same
+// arguments, and any other answers anything its type allows. A map is followed
+// write by write.
+
+proc evalLibrary(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, module: Str, name: Str, args: ast.Arg[], ty: types.Ty, at: token.Pos): Out[dyn] {
+    word := "hive.{module}.{name}"
+    if infer.hasHole(args) {
+        return lostOut(path, "it cannot follow `{word}` applied in part", at)
+    }
+    values := argValues(ast.positional(args, types.callNames(cx.base.table, module, name)))
+    if module == "map" {
+        return evalMap(pr, cx, scope, path, name, values, ty, at)
+    }
+    mut Out[dyn] out = []
+    for each o in evalAll(pr, cx, scope, path, values, 0, []) {
+        if running(o.path) == false {
+            append(out, Out(o.path, terms.Term.VoidK()))
+            continue
+        }
+        known := normAll(cx.base.table, o.path.shapes, o.values)
+        handed := handedOver(cx, known, word)
+        if handed != "" {
+            append(out, Out(lost(o.path, handed, at), terms.Term.VoidK()))
+            continue
+        }
+        when := library.panicsWhen(module, name)
+        if when != "" && pr.claiming && solve.impossible(normFacts(cx, o.path), normLemmas(cx, o.path)) == false {
+            append(pr.problems, Problem(at, "cannot prove `{word}` never panics: " + when + caseText(o.path), false, false))
+        }
+        append(out, kept(pr, cx, o.path, libraryAnswer(pr, cx, module, name, known, ty)))
+    }
+    return out
+}
+
+proc libraryAnswer(pr: mut Prover, cx: Context, module: Str, name: Str, args: terms.Term[], ty: types.Ty): terms.Term {
+    word := "hive.{module}.{name}"
+    if ty is types.Ty.TVoid {
+        return terms.Term.VoidK()
+    }
+    shown := word + "(" + renderAll(pr, args) + ")"
+    if library.settled(module, name) {
+        k := "lib:" + word + "(" + terms.keys(args) + ")"
+        if terms.allKnown(args) {
+            if library.computed(cx.base.table, module, name, args) is Result.Ok(v) {
+                if v is terms.Term.ErrK(payload) && payload is terms.Term.Hole && ty is types.Ty.TResult(_, bad) {
+                    return terms.Term.ErrK(fixedPart(pr, k + ":error", bad, "the error of " + shown))
+                }
+                return v
+            }
+            return fixedPart(pr, k, ty, shown)
+        }
+        return part(pr, k, ty, shown)
+    }
+    return fresh(pr, ty, shown)
+}
+
+// Anything a value of `ty` could be: a new unknown.
+proc anyValue(pr: mut Prover, ty: types.Ty, label: Str): terms.Term {
+    if ty is types.Ty.TVoid {
+        return terms.Term.VoidK()
+    }
+    return fresh(pr, ty, label)
+}
+
+// `value`, with what its type's laws say about it known.
+proc kept(pr: mut Prover, cx: Context, path: Path, value: terms.Term): Out {
+    return Out(withTypeLaws(pr, cx, path, value), value)
+}
+
+// Why a function handed to `word` stops the law, or `""`: the library calls it on
+// values the prover never sees, so it may fail nowhere.
+func handedOver(cx: Context, args: terms.Term[], word: Str): Str {
+    for each a in args {
+        if a is terms.Term.FnK(name, _) {
+            if hive.map.has(cx.mayFail, name) {
+                return "it hands `" + types.shownName(name) + "` to `{word}`, which calls it on values the prover cannot see, and `" + types.shownName(name) + "` may fail an `assert` or reach a `panic`"
+            }
+        } else if a is terms.Term.Unknown(_, ty) {
+            if ty is types.Ty.TFn(_, _, _, _) {
+                return "it hands `{word}` a function it does not know"
+            }
+        }
+    }
+    return ""
+}
+
+proc evalMap(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, name: Str, values: ast.Expr[], ty: types.Ty, at: token.Pos): Out[dyn] {
+    mut types.Ty mapTy = types.Ty.TUnknown()
+    if values bounds 0 {
+        mapTy = infer.typeOf(scope, values[0])
+    }
+    mut Out[dyn] out = []
+    for each o in evalAll(pr, cx, scope, path, values, 0, []) {
+        if running(o.path) == false {
+            append(out, Out(o.path, terms.Term.VoidK()))
+            continue
+        }
+        known := normAll(cx.base.table, o.path.shapes, o.values)
+        if name == "set" || name == "delete" {
+            mut terms.Term written = terms.Term.Hole()
+            if name == "set" {
+                written = terms.nth(known, 2)
+            }
+            changed := mapWrite(terms.nth(known, 0), terms.nth(known, 1), written)
+            if values bounds 0 {
+                for each p in store(pr, cx, scope, o.path, values[0], changed, at) {
+                    append(out, Out(p, terms.Term.VoidK()))
+                }
+            }
+            continue
+        }
+        for each r in mapAnswer(pr, cx, o.path, name, known, mapTy, ty) {
+            append(out, r)
+        }
+    }
+    return out
+}
+
+proc mapAnswer(pr: mut Prover, cx: Context, path: Path, name: Str, args: terms.Term[], mapTy: types.Ty, ty: types.Ty): Out[dyn] {
+    m := terms.nth(args, 0)
+    k := terms.nth(args, 1)
+    if name == "new" {
+        return one(path, emptyMap())
+    }
+    if name == "plus" {
+        return one(path, mapWrite(m, k, terms.nth(args, 2)))
+    }
+    if name == "minus" {
+        return one(path, mapWrite(m, k, terms.Term.Hole()))
+    }
+    if name == "get" || name == "has" {
+        mut types.Ty valueTy = types.Ty.TUnknown()
+        if mapTy is types.Ty.TMap(_, v) {
+            valueTy = v
+        }
+        found := mapLookup(pr, cx, path, m, k, valueTy, 0)
+        if name == "get" {
+            return found
+        }
+        mut Out[dyn] out = []
+        for each f in found {
+            append(out, Out(f.path, terms.Term.BoolK(f.value is terms.Term.OkK(_))))
+        }
+        return out
+    }
+    if name == "keys" || name == "values" {
+        if m is terms.Term.MapK(base, ks, vs) {
+            if base is terms.Term.Hole && terms.allKnown(ks) {
+                if name == "keys" {
+                    return one(path, terms.Term.VecK(ks))
+                }
+                return one(path, terms.Term.VecK(vs))
+            }
+        }
+        return one(path, part(pr, name + ":" + terms.key(m), ty, "hive.map.{name}(" + render(pr, m) + ")"))
+    }
+    return one(path, libraryAnswer(pr, cx, "map", name, args, ty))
+}
+
+func emptyMap(): terms.Term {
+    return terms.Term.MapK(terms.Term.Hole(), [], [])
+}
+
+// `m` with `key` set to `value`, or taken out where `value` is a `Hole`. A key
+// already there, with every key set after it known to be another, is written in
+// its place — which is where the runtime keeps it too.
+func mapWrite(m: terms.Term, key: terms.Term, value: terms.Term): terms.Term {
+    mut terms.Term base = m
+    mut terms.Term[dyn] ks = []
+    mut terms.Term[dyn] vs = []
+    if m is terms.Term.MapK(b, k, v) {
+        base = b
+        for each x in k {
+            append(ks, x)
+        }
+        for each x in v {
+            append(vs, x)
+        }
+    }
+    n := len(ks)
+    mut found := -1
+    mut settled := true
+    for j := 0; j < n; j++ {
+        i := n - 1 - j
+        if ks bounds i {
+            same := equal(ks[i], key)
+            if terms.isTrue(same) {
+                found = i
+                break
+            }
+            if terms.isFalse(same) == false {
+                settled = false
+                break
+            }
+        }
+    }
+    gone := value is terms.Term.Hole
+    if found >= 0 {
+        if gone && base is terms.Term.Hole {
+            mut terms.Term[dyn] keptKeys = []
+            mut terms.Term[dyn] keptValues = []
+            mut i := 0
+            for each x in ks {
+                if i != found {
+                    append(keptKeys, x)
+                    append(keptValues, terms.nth(vs, i))
+                }
+                i = i + 1
+            }
+            return terms.Term.MapK(base, keptKeys, keptValues)
+        }
+        if vs bounds found {
+            vs[found] = value
+        }
+        return terms.Term.MapK(base, ks, vs)
+    }
+    if settled && gone && base is terms.Term.Hole {
+        return terms.Term.MapK(base, ks, vs)
+    }
+    append(ks, key)
+    append(vs, value)
+    return terms.Term.MapK(base, ks, vs)
+}
+
+// What `hive.map.get` answers: the last write to a key the same as `key`, or the
+// map it started from where none is. A write whose key may or may not be that one
+// splits the path. `passed` counts the writes already looked at, from the last.
+proc mapLookup(pr: mut Prover, cx: Context, path: Path, m: terms.Term, key: terms.Term, valueTy: types.Ty, passed: Int): Out[dyn] {
+    v := normIn(cx, path, m)
+    k := normIn(cx, path, key)
+    if v is terms.Term.MapK(base, ks, vs) {
+        i := len(ks) - 1 - passed
+        if ks bounds i && vs bounds i {
+            mut terms.Term found = terms.Term.ErrK(terms.Term.BoolK(false))
+            if (vs[i] is terms.Term.Hole) == false {
+                found = terms.Term.OkK(vs[i])
+            }
+            same := normIn(cx, path, equal(ks[i], k))
+            if terms.isTrue(same) {
+                return one(path, found)
+            }
+            if terms.isFalse(same) {
+                return mapLookup(pr, cx, path, v, k, valueTy, passed + 1)
+            }
+            mut Out[dyn] out = []
+            if assume(pr, cx, path, same) is Result.Ok(yes) {
+                append(out, Out(yes, found))
+            }
+            if assume(pr, cx, path, terms.negation(same)) is Result.Ok(no) {
+                for each r in mapLookup(pr, cx, no, v, k, valueTy, passed + 1) {
+                    append(out, r)
+                }
+            }
+            return out
+        }
+        return baseLookup(pr, cx, path, base, k, valueTy)
+    }
+    return baseLookup(pr, cx, path, v, k, valueTy)
+}
+
+// A key looked up in a map nothing is known about: it has it or it does not, the
+// same for the same map and key on every path.
+proc baseLookup(pr: mut Prover, cx: Context, path: Path, base: terms.Term, key: terms.Term, valueTy: types.Ty): Out[dyn] {
+    missing := terms.Term.ErrK(terms.Term.BoolK(false))
+    if base is terms.Term.Hole {
+        return one(path, missing)
+    }
+    said := render(pr, base) + " has " + render(pr, key)
+    asked := part(pr, "has:" + terms.key(base) + "|" + terms.key(key), types.Ty.TBool(), said)
+    value := part(pr, "get:" + terms.key(base) + "|" + terms.key(key), valueTy, "what " + render(pr, base) + " holds at " + render(pr, key))
+    has := normIn(cx, path, asked)
+    if terms.isTrue(has) {
+        return [kept(pr, cx, path, terms.Term.OkK(value))]
+    }
+    if terms.isFalse(has) {
+        return one(path, missing)
+    }
+    mut Out[dyn] out = []
+    if has is terms.Term.Unknown(id, _) {
+        if checked(pr, cx, withShape(path, id, terms.Term.BoolK(true), said)) is Result.Ok(yes) {
+            append(out, kept(pr, cx, yes, terms.Term.OkK(value)))
+        }
+        if checked(pr, cx, withShape(path, id, terms.Term.BoolK(false), "not " + said)) is Result.Ok(no) {
+            append(out, Out(no, missing))
+        }
+        return out
+    }
+    if assume(pr, cx, path, has) is Result.Ok(yes) {
+        append(out, kept(pr, cx, yes, terms.Term.OkK(value)))
+    }
+    if assume(pr, cx, path, terms.negation(has)) is Result.Ok(no) {
+        append(out, Out(no, missing))
+    }
+    return out
 }
 
 // `indexOf` over the elements of a vector it knows, from element `at` on. Where
@@ -3037,7 +3847,8 @@ func concreteBuiltin(name: Str, args: terms.Term[]): Result<terms.Term, Bool> {
     return Result.Error(false)
 }
 
-proc mapped(pr: mut Prover, cx: Context, path: Path, items: terms.Term[], fn: terms.Term, keeping: Bool, at: Int, done: terms.Term[], where: token.Pos): Out[dyn] {
+proc mapped(pr: mut Prover, cx: Context, path: Path, items: terms.Term[], fn: terms.Term, walk: Str, at: Int, done: terms.Term[], where: token.Pos): Out[dyn] {
+    keeping := walk == "filter"
     if items bounds at {
         mut Out[dyn] out = []
         for each r in applyFn(pr, cx, path, fn, [items[at]], where) {
@@ -3046,29 +3857,44 @@ proc mapped(pr: mut Prover, cx: Context, path: Path, items: terms.Term[], fn: te
                 continue
             }
             v := normIn(cx, r.path, r.value)
-            if keeping {
+            if walk == "filterMap" {
+                for each m in materialize(pr, cx, r.path, v, [], "") {
+                    shaped := normIn(cx, m.path, m.value)
+                    if shaped is terms.Term.OkK(good) {
+                        for each n in mapped(pr, cx, m.path, items, fn, walk, at + 1, done + [good], where) {
+                            append(out, n)
+                        }
+                    } else if shaped is terms.Term.ErrK(_) {
+                        for each n in mapped(pr, cx, m.path, items, fn, walk, at + 1, done, where) {
+                            append(out, n)
+                        }
+                    } else {
+                        append(out, Out(lost(m.path, "it cannot look inside `" + render(pr, shaped) + "`", where), terms.Term.VoidK()))
+                    }
+                }
+            } else if keeping {
                 if terms.isTrue(v) {
-                    for each m in mapped(pr, cx, r.path, items, fn, keeping, at + 1, done + [items[at]], where) {
+                    for each m in mapped(pr, cx, r.path, items, fn, walk, at + 1, done + [items[at]], where) {
                         append(out, m)
                     }
                 } else if terms.isFalse(v) {
-                    for each m in mapped(pr, cx, r.path, items, fn, keeping, at + 1, done, where) {
+                    for each m in mapped(pr, cx, r.path, items, fn, walk, at + 1, done, where) {
                         append(out, m)
                     }
                 } else {
                     if assume(pr, cx, r.path, v) is Result.Ok(yes) {
-                        for each m in mapped(pr, cx, yes, items, fn, keeping, at + 1, done + [items[at]], where) {
+                        for each m in mapped(pr, cx, yes, items, fn, walk, at + 1, done + [items[at]], where) {
                             append(out, m)
                         }
                     }
                     if assume(pr, cx, r.path, terms.negation(v)) is Result.Ok(no) {
-                        for each m in mapped(pr, cx, no, items, fn, keeping, at + 1, done, where) {
+                        for each m in mapped(pr, cx, no, items, fn, walk, at + 1, done, where) {
                             append(out, m)
                         }
                     }
                 }
             } else {
-                for each m in mapped(pr, cx, r.path, items, fn, keeping, at + 1, done + [v], where) {
+                for each m in mapped(pr, cx, r.path, items, fn, walk, at + 1, done + [v], where) {
                     append(out, m)
                 }
             }
@@ -3423,6 +4249,8 @@ proc render(pr: mut Prover, t: terms.Term): Str {
             return types.shownName(after(name, 5)) + "(" + renderAll(pr, args) + ")"
         } else if text.startsWith(name, "loop:") {
             return loopText(pr, name, args)
+        } else if name == "secret" {
+            return "a secret holding " + render(pr, a)
         }
         return name + "(" + renderAll(pr, args) + ")"
     }
@@ -3450,6 +4278,28 @@ proc render(pr: mut Prover, t: terms.Term): Str {
     }
     if t is terms.Term.FnK(name, _) {
         return types.shownName(name)
+    }
+    if t is terms.Term.FloatK(f) {
+        return "{f}"
+    }
+    if t is terms.Term.MapK(base, ks, vs) {
+        mut Str[dyn] pairs = []
+        mut i := 0
+        for each k in ks {
+            if terms.nth(vs, i) is terms.Term.Hole {
+                append(pairs, render(pr, k) + " taken out")
+            } else {
+                append(pairs, render(pr, k) + ": " + render(pr, terms.nth(vs, i)))
+            }
+            i = i + 1
+        }
+        if base is terms.Term.Hole {
+            return "\{" + join(pairs, ", ") + "}"
+        }
+        if len(pairs) == 0 {
+            return render(pr, base)
+        }
+        return render(pr, base) + " with \{" + join(pairs, ", ") + "}"
     }
     return terms.key(t)
 }
@@ -3614,6 +4464,17 @@ func exprText(e: ast.Expr): Str {
         return exprText(subject) + " is ..."
     } else if e is ast.Expr.Hole(_) {
         return "_"
+    } else if e is ast.Expr.Timed(call, ms, _) {
+        return exprText(call) + " with timeout " + exprText(ms)
+    } else if e is ast.Expr.AwaitAll(calls, timeout, _) {
+        mut Str[dyn] out = []
+        for each c in calls {
+            append(out, exprText(c))
+        }
+        if timeout is ast.Expr.Absent {
+            return "await [" + join(out, ", ") + "]"
+        }
+        return "await [" + join(out, ", ") + "] with timeout " + exprText(timeout)
     }
     return "..."
 }

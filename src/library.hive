@@ -1,0 +1,183 @@
+// Library calls
+// =============
+// What the law prover knows of a call into the standard library. Nothing here makes
+// one: a law is proved by reading the program, never by running it.
+//
+// A call that answers the same for the same arguments, on every machine, is
+// settled. Where its arguments are known the compiler works the answer out with the
+// runtime the program links, and where they are not it is one unknown, the same
+// for the same arguments. Any other call — one that reads the clock, a file, the
+// network or the terminal, or changes them — answers anything its type allows, a
+// new unknown each time, so a law reaching one holds whatever the world answers.
+import ./terms
+import ./types
+import hive.conv
+import hive.crypto
+import hive.math
+import hive.net
+import hive.term
+
+// Whether a call answers the same for the same arguments, wherever it runs. The
+// calendar in `hive.time` does not: it reads the machine's own time zone.
+func settled(module: Str, name: Str): Bool {
+    if module == "conv" || module == "math" || module == "map" || module == "json" || module == "image" {
+        return true
+    }
+    if module == "crypto" {
+        return name == "sha256" || name == "sha512" || name == "hmacSha256" || name == "base64Encode"
+            || name == "base64Decode" || name == "jwtHeader" || name == "jwtDecode" || name == "jwtCodec"
+    }
+    if module == "net" {
+        return name == "urlEncode" || name == "queryParamsCodec"
+    }
+    if module == "term" {
+        return name == "codec" || name == "positional"
+    }
+    if module == "ui" {
+        // A window runs until it is closed, and how wide words are is up to the fonts.
+        return name != "window" && name != "webview" && name != "measure"
+    }
+    return false
+}
+
+// When a call stops the program with a panic, or `""` for one that never does.
+func panicsWhen(module: Str, name: Str): Str {
+    if module == "net" && (name == "httpServe" || name == "wsServe" || name == "httpWsServe" || name == "socketServe") {
+        return "it does when it cannot listen on its port"
+    }
+    if module == "syslink" && name == "setKey" {
+        return "it does when the key is empty"
+    }
+    return ""
+}
+
+// The answer to a settled call whose arguments are all known, where the compiler
+// works it out: `Error` where it leaves it to the unknown. A sine is left there,
+// since a machine that fuses a multiply and an add may round it differently.
+func computed(t: types.Table, module: Str, name: Str, args: terms.Term[]): Result<terms.Term, Bool> {
+    a := terms.nth(args, 0)
+    b := terms.nth(args, 1)
+    c := terms.nth(args, 2)
+    if module == "conv" {
+        if name == "its" && a is terms.Term.IntK(n) {
+            return Result.Ok(terms.Term.StrK(hive.conv.its(n)))
+        }
+        if name == "fts" && a is terms.Term.FloatK(f) {
+            return Result.Ok(terms.Term.StrK(hive.conv.fts(f)))
+        }
+        if name == "itf" && a is terms.Term.IntK(n) {
+            return Result.Ok(terms.Term.FloatK(hive.conv.itf(n)))
+        }
+        // Past the range of an `Int`, and for what is not a number, each machine
+        // answers its own way.
+        if (name == "ceil" || name == "floor" || name == "round") && a is terms.Term.FloatK(f) {
+            if f > -9000000000000000000.0 && f < 9000000000000000000.0 {
+                if name == "ceil" {
+                    return Result.Ok(terms.Term.IntK(hive.conv.ceil(f)))
+                }
+                if name == "floor" {
+                    return Result.Ok(terms.Term.IntK(hive.conv.floor(f)))
+                }
+                return Result.Ok(terms.Term.IntK(hive.conv.round(f)))
+            }
+        }
+        if name == "sti" && a is terms.Term.StrK(s) {
+            parsed := hive.conv.sti(s)
+            if parsed is Result.Ok(n) {
+                return Result.Ok(terms.Term.OkK(terms.Term.IntK(n)))
+            }
+            if parsed is Result.Error(e) {
+                return failed(t, "conv", "ConversionError", "", ["input", "message"], [terms.Term.StrK(e.input), terms.Term.StrK(e.message)])
+            }
+        }
+        if name == "stf" && a is terms.Term.StrK(s) {
+            parsed := hive.conv.stf(s)
+            if parsed is Result.Ok(f) {
+                return Result.Ok(terms.Term.OkK(terms.Term.FloatK(f)))
+            }
+            if parsed is Result.Error(e) {
+                return failed(t, "conv", "ConversionError", "", ["input", "message"], [terms.Term.StrK(e.input), terms.Term.StrK(e.message)])
+            }
+        }
+    }
+    if module == "math" {
+        if name == "pi" {
+            return Result.Ok(terms.Term.FloatK(hive.math.pi()))
+        }
+        if a is terms.Term.FloatK(x) {
+            if name == "sqrt" {
+                return Result.Ok(terms.Term.FloatK(hive.math.sqrt(x)))
+            }
+            if name == "abs" {
+                return Result.Ok(terms.Term.FloatK(hive.math.abs(x)))
+            }
+            if b is terms.Term.FloatK(y) {
+                if name == "min" {
+                    return Result.Ok(terms.Term.FloatK(hive.math.min(x, y)))
+                }
+                if name == "max" {
+                    return Result.Ok(terms.Term.FloatK(hive.math.max(x, y)))
+                }
+                if name == "clamp" && c is terms.Term.FloatK(z) {
+                    return Result.Ok(terms.Term.FloatK(hive.math.clamp(x, y, z)))
+                }
+            }
+        }
+    }
+    if module == "crypto" && a is terms.Term.StrK(s) {
+        if name == "sha256" {
+            return Result.Ok(terms.Term.StrK(hive.crypto.sha256(s)))
+        }
+        if name == "sha512" {
+            return Result.Ok(terms.Term.StrK(hive.crypto.sha512(s)))
+        }
+        if name == "base64Encode" {
+            return Result.Ok(terms.Term.StrK(hive.crypto.base64Encode(s)))
+        }
+        if name == "base64Decode" {
+            decoded := hive.crypto.base64Decode(s)
+            if decoded is Result.Ok(text) {
+                return Result.Ok(terms.Term.OkK(terms.Term.StrK(text)))
+            }
+            if decoded is Result.Error(e) {
+                return failed(t, "crypto", "CryptoError", "Malformed", ["message"], [terms.Term.StrK(e.message)])
+            }
+        }
+    }
+    if module == "net" && name == "urlEncode" && a is terms.Term.StrK(s) {
+        return Result.Ok(terms.Term.StrK(hive.net.urlEncode(s)))
+    }
+    if module == "term" && name == "positional" && a is terms.Term.StrK(s) {
+        mut terms.Term[dyn] words = []
+        for each w in hive.term.positional(s) {
+            append(words, terms.Term.StrK(w))
+        }
+        return Result.Ok(terms.Term.VecK(words))
+    }
+    return Result.Error(false)
+}
+
+// `Result.Error` of a library error, its fields given by name. Where the type is
+// the library's own, with nothing in it the program can name, the error is a
+// `Hole`: one the prover knows nothing about.
+func failed(t: types.Table, module: Str, typeName: Str, variant: Str, names: Str[], values: terms.Term[]): Result<terms.Term, Bool> {
+    ty := types.libraryError(module, typeName)
+    if ty is types.Ty.TNamed(flat) {
+        mut fields := types.fieldsOfStruct(t, flat)
+        if variant != "" {
+            fields = types.findVariant(t, flat, variant)
+        }
+        if fields is Result.Ok(declared) {
+            mut terms.Term[dyn] out = []
+            for each f in declared {
+                if indexOf(names, f.name) is Result.Ok(at) {
+                    append(out, terms.nth(values, at))
+                } else {
+                    return Result.Ok(terms.Term.ErrK(terms.Term.Hole()))
+                }
+            }
+            return Result.Ok(terms.Term.ErrK(terms.Term.RecK(flat, variant, out)))
+        }
+    }
+    return Result.Ok(terms.Term.ErrK(terms.Term.Hole()))
+}
