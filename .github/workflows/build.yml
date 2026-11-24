@@ -447,6 +447,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # For the build provenance GitHub attests to, once the files are final.
+      id-token: write
+      attestations: write
 
     steps:
       # For CHANGELOG/, which is what the release says about itself. Ahead of
@@ -469,6 +472,9 @@ jobs:
           # Named rather than read off the checkout's remote, since which
           # repository is being released to is not a thing to leave to inference.
           GH_REPO: ${{ github.repository }}
+          # The release key's private half, PEM. `hive use` and the installer
+          # carry the public half and refuse a SHA256SUMS it did not sign.
+          HIVE_RELEASE_KEY: ${{ secrets.HIVE_RELEASE_KEY }}
         run: |
           tag="$GITHUB_REF_NAME"
 
@@ -505,6 +511,21 @@ jobs:
           cd dist
           sha256sum -c SHA256SUMS
           sha256sum hive-windows.msi >> SHA256SUMS
+
+          # Signed last, once SHA256SUMS names every file, as base64 of the raw
+          # Ed25519 signature. A release with no key is not published at all.
+          if [ -z "$HIVE_RELEASE_KEY" ]; then
+            echo "::error::The HIVE_RELEASE_KEY secret is not set, so SHA256SUMS cannot be signed and hive use would refuse this release."
+            exit 1
+          fi
+          key="$RUNNER_TEMP/release-key.pem"
+          printf '%s\n' "$HIVE_RELEASE_KEY" > "$key"
+          openssl pkeyutl -sign -rawin -inkey "$key" -in SHA256SUMS -out SHA256SUMS.raw
+          openssl pkey -in "$key" -pubout -out "$RUNNER_TEMP/release-key.pub"
+          rm -f "$key"
+          openssl pkeyutl -verify -rawin -pubin -inkey "$RUNNER_TEMP/release-key.pub" -in SHA256SUMS -sigfile SHA256SUMS.raw
+          base64 -w0 SHA256SUMS.raw > SHA256SUMS.sig
+          rm -f SHA256SUMS.raw
           seed=$(awk '$2=="hivec-linux-amd64"{print $1}' SHA256SUMS)
 
           # Then the next pin, because the first thing anyone does with a release
@@ -518,9 +539,21 @@ jobs:
           } > notes.md
 
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" hivec-* hive-scene* hive-windows.msi SHA256SUMS --clobber
+            gh release upload "$tag" hivec-* hive-scene* hive-windows.msi SHA256SUMS SHA256SUMS.sig --clobber
             gh release edit "$tag" --notes-file notes.md
           else
-            gh release create "$tag" hivec-* hive-scene* hive-windows.msi SHA256SUMS \
+            gh release create "$tag" hivec-* hive-scene* hive-windows.msi SHA256SUMS SHA256SUMS.sig \
               --title "$tag" --notes-file notes.md
           fi
+
+      # Provenance for every file the release carries: which workflow, at which
+      # commit, built it. `gh attestation verify <file> --repo R0DR160HM/hive-lang`
+      # checks one by hand.
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/hivec-*
+            dist/hive-scene*
+            dist/hive-windows.msi
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sig

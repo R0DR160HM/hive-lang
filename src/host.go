@@ -3,6 +3,7 @@ package host
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -24,6 +25,29 @@ import (
 
 // A whole-download deadline would fail a slow line that is still making progress.
 const stalled = 60 * time.Second
+
+// releaseKey is the public half of the key the release job signs SHA256SUMS
+// with, as hex. installer/windows/setup/signature.go carries the same one, and
+// a test there holds them equal.
+const releaseKey = "7cd76f70e5ec6d610efe887b932b543aae9c476fcb2ef164f3472909778ff0f9"
+
+// VerifySums answers whether signature is the release key's signature of sums,
+// as the release job writes it: the raw Ed25519 signature in base64.
+func VerifySums(sums string, signature string) bool {
+	return VerifySumsWith(releaseKey, sums, signature)
+}
+
+func VerifySumsWith(publicKey string, sums string, signature string) bool {
+	key, err := hex.DecodeString(publicKey)
+	if err != nil || len(key) != ed25519.PublicKeySize {
+		return false
+	}
+	sig, err := base64.StdEncoding.DecodeString(strings.TrimSpace(signature))
+	if err != nil {
+		return false
+	}
+	return ed25519.Verify(ed25519.PublicKey(key), []byte(sums), sig)
+}
 
 var client = &http.Client{Transport: &http.Transport{
 	Proxy:                 http.ProxyFromEnvironment,
