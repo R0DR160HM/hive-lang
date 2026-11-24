@@ -12,6 +12,7 @@
 // The scan holds a cursor and takes it as `mut`. Everything that only reads takes
 // the characters and an index instead, so no reader costs a copy of the source.
 import ./diag
+import ./messages
 import ./naming
 import ./text
 import ./token
@@ -177,6 +178,14 @@ proc scanOperator(cs: Str[], s: mut Scan): void {
         take(s, token.Kind.Ellipsis(), 3)
         return
     }
+    if text.matchesAt(cs, s.pos, "<<<") {
+        take(s, token.Kind.BitsOpen(), 3)
+        return
+    }
+    if text.matchesAt(cs, s.pos, ">>>") {
+        take(s, token.Kind.BitsClose(), 3)
+        return
+    }
     if text.matchesAt(cs, s.pos, "<<=") {
         take(s, token.Kind.ShlEq(), 3)
         return
@@ -236,9 +245,9 @@ proc scanOperator(cs: Str[], s: mut Scan): void {
     else if one == "!" { take(s, token.Kind.Bang(), 1) return }
 
     if s.pos == 0 && bytes(one) == 3 {
-        fail(s, "the file opens with `{one}`, which Hive source cannot hold. If nothing shows between those quotes it is a byte-order mark: save the file as \"UTF-8\" rather than \"UTF-8 with BOM\"")
+        fail(s, messages.lexFileOpensWithBom(one))
     } else {
-        fail(s, "unexpected character `{one}`")
+        fail(s, messages.lexUnexpectedCharacter(one))
     }
     s.pos = s.pos + 1
 }
@@ -255,7 +264,7 @@ proc scanWord(cs: Str[], s: mut Scan): void {
     if token.keywordOf(word) is Result.Ok(kw) {
         // Reserved now so that giving it a meaning later breaks no name.
         if kw is token.Kind.KwAxiom {
-            fail(s, "`axiom` is reserved for a later version of Hive: nothing may be written with it yet")
+            fail(s, messages.lexAxiomReserved())
         }
         emit(s, kw)
         // The body that follows a `query` header is raw SQL, and what follows
@@ -309,7 +318,7 @@ proc scanNumber(cs: Str[], s: mut Scan): void {
         if hive.conv.stf(text.replace(written, "_", "")) is Result.Ok(f) {
             emit(s, token.Kind.FloatLit(f))
         } else {
-            fail(s, "`{written}` is not a number this machine can hold")
+            fail(s, messages.lexNumberTooLarge(written))
         }
         return
     }
@@ -317,7 +326,7 @@ proc scanNumber(cs: Str[], s: mut Scan): void {
     if hive.conv.sti(text.replace(written, "_", "")) is Result.Ok(n) {
         emit(s, token.Kind.IntLit(n))
     } else {
-        fail(s, "`{written}` is not a number this machine can hold")
+        fail(s, messages.lexNumberTooLarge(written))
     }
 }
 
@@ -344,11 +353,11 @@ func digitValue(c: Str, radix: Int): Int {
 proc scanRadix(cs: Str[], s: mut Scan): void {
     start := s.pos
     mut radix := 16
-    mut name := "hexadecimal"
+    mut name := messages.lexBaseHexadecimal()
     mut bits := 4
     if text.charAt(cs, s.pos + 1) == "b" {
         radix = 2
-        name = "binary"
+        name = messages.lexBaseBinary()
         bits = 1
     }
     s.pos = s.pos + 2
@@ -365,7 +374,7 @@ proc scanRadix(cs: Str[], s: mut Scan): void {
         }
         d := digitValue(c, radix)
         if d < 0 {
-            fail(s, "`{written}` is not a {name} number: `{c}` is not one of its digits")
+            fail(s, messages.lexDigitNotInBase(written, name, c))
             return
         }
         value = value * radix + d
@@ -375,11 +384,11 @@ proc scanRadix(cs: Str[], s: mut Scan): void {
         }
     }
     if digits == 0 {
-        fail(s, "`{written}` has no digits after its `{text.charAt(cs, start + 1)}`")
+        fail(s, messages.lexNoDigitsAfterMarker(written, text.charAt(cs, start + 1)))
         return
     }
     if width > 64 {
-        fail(s, "`{written}` needs more than 64 bits, and no integer type in Hive has more")
+        fail(s, messages.lexIntegerOver64Bits(written))
         return
     }
     emit(s, token.Kind.IntLit(value))
@@ -396,7 +405,7 @@ proc scanAtom(cs: Str[], s: mut Scan): void {
     }
     name := text.span(cs, start, s.pos - 1)
     if name == "" {
-        fail(s, "expected an atom name after `#`")
+        fail(s, messages.lexExpectedAtomName())
         return
     }
     if naming.check(naming.Role.Atom(), name) is Result.Error(why) {
@@ -449,7 +458,7 @@ proc scanString(cs: Str[], s: mut Scan): void {
             s.pos = s.pos + 1
         }
     }
-    append(s.errors, diag.at(opened, "unterminated string literal"))
+    append(s.errors, diag.at(opened, messages.lexUnterminatedString()))
 }
 
 // `\{name is (regex)}`, captured raw. Answers whether it was there: anything not
@@ -483,7 +492,7 @@ proc scanRegexHole(cs: Str[], s: mut Scan, b: mut StrPartBuf): Bool {
         c := text.charAt(cs, i)
         if c == "\n" {
             s.pos = i
-            return failedHole(s, "this hole's regex is never closed — it runs to the end of the line")
+            return failedHole(s, messages.lexHoleRegexRunsToLineEnd())
         }
         if c == "\\" {
             i = i + 1
@@ -500,7 +509,7 @@ proc scanRegexHole(cs: Str[], s: mut Scan, b: mut StrPartBuf): Bool {
             if depth == 0 {
                 if text.charAt(cs, i + 1) != "}" {
                     s.pos = i + 1
-                    return failedHole(s, "this hole closes its regex and then goes on: a `\{{name} is (...)}` ends at the `}` right after the `)`")
+                    return failedHole(s, messages.lexHoleGoesOnAfterRegex(name))
                 }
                 pushLiteral(b)
                 append(b.parts, token.StrPart.Hole(name, text.span(cs, open + 1, i - 1)))
@@ -510,7 +519,7 @@ proc scanRegexHole(cs: Str[], s: mut Scan, b: mut StrPartBuf): Bool {
         }
     }
     s.pos = start
-    return failedHole(s, "this hole's regex is never closed: `\{{name} is (` opens one and nothing closes it")
+    return failedHole(s, messages.lexHoleRegexNeverClosed(name))
 }
 
 // A hole that went wrong. Answers `true` — the characters are consumed and the
@@ -573,7 +582,7 @@ proc scanInterpolation(cs: Str[], s: mut Scan, b: mut StrPartBuf, opened: Int, p
             s.line = s.line + 1
         }
     }
-    append(s.errors, diag.at(opened, "unterminated `\{` interpolation in a string"))
+    append(s.errors, diag.at(opened, messages.lexUnterminatedInterpolation()))
     return false
 }
 
@@ -597,7 +606,7 @@ proc scanBacktick(cs: Str[], s: mut Scan): void {
             s.line = s.line + 1
         }
     }
-    append(s.errors, diag.at(opened, "this backtick string never closes"))
+    append(s.errors, diag.at(opened, messages.lexBacktickNeverCloses()))
 }
 
 // A backtick string's dedented text, in pieces. Literal text is taken a run at a
@@ -707,7 +716,7 @@ proc scanSqlBody(cs: Str[], s: mut Scan): void {
             s.line = s.line + 1
         }
     }
-    append(s.errors, diag.at(opened, "this query body never closes"))
+    append(s.errors, diag.at(opened, messages.lexQueryBodyNeverCloses()))
     s.mode = Mode.Normal()
 }
 
@@ -729,7 +738,7 @@ proc scanImportPath(cs: Str[], s: mut Scan): void {
     path := text.span(cs, start, s.pos - 1)
     s.mode = Mode.Normal()
     if path == "" {
-        fail(s, "expected a module path after `import`")
+        fail(s, messages.lexExpectedImportPath())
         return
     }
     emit(s, token.Kind.PathLit(path))
@@ -745,7 +754,7 @@ proc scanQuotedImportPath(cs: Str[], s: mut Scan): void {
         // lines, so the error lands on the line the quote was opened on.
         if c == "\n" {
             s.mode = Mode.Normal()
-            append(s.errors, diag.at(opened, "this `import` path opens with a quote and never closes it — add the closing `\"`"))
+            append(s.errors, diag.at(opened, messages.lexImportPathUnclosed()))
             return
         }
         if c == "\"" {
@@ -753,7 +762,7 @@ proc scanQuotedImportPath(cs: Str[], s: mut Scan): void {
             s.pos = s.pos + 1
             s.mode = Mode.Normal()
             if path == "" {
-                append(s.errors, diag.at(opened, "`import \"\"` names no module: put the path between the quotes"))
+                append(s.errors, diag.at(opened, messages.lexImportPathEmpty()))
                 return
             }
             append(s.tokens, token.Token(token.Kind.PathLit(path), opened, s.col))
@@ -761,7 +770,7 @@ proc scanQuotedImportPath(cs: Str[], s: mut Scan): void {
         }
     }
     s.mode = Mode.Normal()
-    append(s.errors, diag.at(opened, "this `import` path opens with a quote and never closes it — add the closing `\"`"))
+    append(s.errors, diag.at(opened, messages.lexImportPathUnclosed()))
 }
 
 func isBlank(c: Str): Bool {

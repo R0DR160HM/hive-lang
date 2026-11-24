@@ -1106,7 +1106,7 @@ all.
 | Focus and size | `onFocus(Msg)` `onBlur(Msg)` — the focus arriving in a widget or anything in it, and leaving; `onScroll(f)` `onSize(f)` |
 | Carrying | `carry(Str)` lets a widget be dragged, and `onDrop(f)` hears the word where it lands; `onFile(f)` hears a file's name and bytes, chosen or dropped |
 | Look, more | `opacity(Float)` `shadow(Int)` `ease(ms)` — a change arrives over that many milliseconds |
-| Keys | `keys(Str[dyn])` — which keys a widget takes for its `onKey`; the innermost around the focus wins |
+| Keys | `keys(Str[])` — which keys a widget takes for its `onKey`; the innermost around the focus wins |
 
 A scene takes attributes of its own — a camera, a sky, and the events a game
 needs — and so do the shapes in one. They are [14.16](#1416-hiveuiscene).

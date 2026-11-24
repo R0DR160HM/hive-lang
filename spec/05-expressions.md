@@ -195,7 +195,7 @@ or, and `!` its not.
 
 ### Building bytes
 
-`<<a, b, c>>` is a `UInt8[dyn]` built from its parts in order, most significant
+`<<<a, b, c>>>` is a `UInt8[dyn]` built from its parts in order, most significant
 bit first. Each part is as wide as its type: a `UInt4` writes four bits, a
 `UInt16` two bytes, an `Int` eight, and a `UInt8[]` or a `Str` its bytes. A literal
 is one byte unless it says otherwise, `0x0D0A: UInt16`. Only a literal says its
@@ -203,8 +203,8 @@ type there: a value of another width is converted, `UInt16(x)`. `little` after a
 part writes its bytes least significant first.
 
 ```hive
-UInt8[dyn] header = <<UInt4(4), UInt4(5), 0, length, payload>>
-UInt8[dyn] size = <<UInt32(n) little>>
+UInt8[dyn] header = <<<UInt4(4), UInt4(5), 0, length, payload>>>
+UInt8[dyn] size = <<<UInt32(n) little>>>
 ```
 
 The parts have to come to whole bytes, and a run of bytes or a `little` number has

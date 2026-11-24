@@ -158,6 +158,24 @@ append(w, "d")                   // fine
 That keeps one question answerable by reading a declaration alone: *does this
 vector have a length the compiler knows?*
 
+A **parameter** declared `Str[dyn]` takes only a vector declared `[dyn]`. A
+static vector, or a literal, handed to one is a compile error, `mut` or not: it
+would become dynamic by being passed along, and a `mut Str[dyn]` parameter could
+grow storage its caller still holds as `Str[3]`. A parameter that only reads is
+`Str[]`, which takes either kind:
+
+```hive
+func count(v: Int[dyn]): Int { return len(v) }
+func size(v: Int[]): Int { return len(v) }
+
+Int[2] pair = [1, 2]
+echo count(pair)                 // compile error: `pair` has a fixed length
+echo size(pair)                  // fine
+```
+
+A declaration, a field or a return declared `[dyn]` still takes a static vector:
+there the `[dyn]` is written at the very place the vector lands.
+
 ### Operations
 
 * `+` concatenates into a **new** vector, and adds the two lengths.

@@ -17,6 +17,7 @@
 import ./ast
 import ./diag
 import ./infer
+import ./messages
 import ./paths
 import ./regex
 import ./runtime
@@ -1444,7 +1445,7 @@ func widthOfType(ty: types.Ty): Int {
     return 64
 }
 
-// `<<a, b: UInt16, payload>>`, written into a buffer in order.
+// `<<<a, b: UInt16, payload>>>`, written into a buffer in order.
 proc bitsLiteral(em: mut Emit, env: infer.Env, parts: ast.BitPart[]): Str {
     writer := fresh(em, "wr")
     mut Str[dyn] body = ["var " + writer + " hive.BitWriter"]
@@ -1779,7 +1780,7 @@ proc exprTail(em: mut Emit, env: infer.Env, e: ast.Expr, want: types.Ty): Str {
         // answer is a `Result` around the vector, two wrappers deep.
         return awaitAll(em, env, calls, timeout, infer.typeOf(env, e))
     }
-    fail(em, "this expression has no lowering yet")
+    fail(em, messages.expressionHasNoLowering())
     return "nil"
 }
 
@@ -2151,7 +2152,7 @@ proc running(em: mut Emit, env: infer.Env, args: ast.Arg[]): Str {
         }
         return "hive.SqlRows(" + connection + ", " + fragment + ", " + rowReader(em, rows) + ")"
     }
-    fail(em, "`hive.sql.run` runs a `hive.sql.Fragment`, and this is " + types.show(held))
+    fail(em, messages.emitSqlRunNotFragment(types.show(held)))
     return "nil"
 }
 
@@ -2283,7 +2284,7 @@ proc standaloneMatch(em: mut Emit, env: infer.Env, subject: ast.Expr, pattern: a
         append(held, matched)
         return "func() bool \{ " + join(held, ", ") + " := " + bitsReader(em, env, written, infer.typeOf(env, subject), fields, rest) + "; return " + matched + " }()"
     }
-    fail(em, "a vector pattern outside an `if` condition binds nothing, so it has no value to give")
+    fail(em, messages.vectorPatternOutsideIf())
     return "false"
 }
 // A condition outside an `if` whose `is` binds for the rest of it. The guards an
@@ -3405,7 +3406,7 @@ proc builtin(em: mut Emit, env: infer.Env, name: Str, written: ast.Arg[], want: 
         codec := argExpr(args, 1)
         format := formatOf(env, codec)
         if format == "" {
-            fail(em, "`encode` needs a codec whose type says its format, so the encoder can be written from the declaration")
+            fail(em, messages.encodeCodecWithoutFormat())
             return "\"\""
         }
         if stdlib.isFlatFormat(format) {
@@ -3414,7 +3415,7 @@ proc builtin(em: mut Emit, env: infer.Env, name: Str, written: ast.Arg[], want: 
                 needCodec(em, format + ":" + typeName)
                 return withCodec(em, env, flatEncoderName(format, typeName) + "(" + a + ")", codec)
             }
-            fail(em, stdlib.flatCarrier(format) + " is a declared type's fields, so `encode` cannot write " + types.show(firstType) + " as one")
+            fail(em, messages.encodeFlatNotDeclaredType(stdlib.flatCarrier(format), types.show(firstType)))
             return "\"\""
         }
         // A token is the same derived encoder with a signature around it.
@@ -3467,10 +3468,10 @@ proc walkBuiltin(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[], a: St
     // `append` and `prepend` hand nothing back — the vector you gave them is the
     // result — so they may only stand as a statement of their own.
     if name == "append" || name == "prepend" {
-        fail(em, "`{name}` hands nothing back: the vector you gave it is the result, so it stands as a statement of its own rather than inside an expression")
+        fail(em, messages.appendInsideExpression(name))
         return "nil"
     }
-    fail(em, "`{name}` is not a builtin this compiler carries")
+    fail(em, messages.unknownBuiltin(name))
     return "nil"
 }
 
@@ -5141,7 +5142,7 @@ proc secretPutter(em: mut Emit, ty: types.Ty): Str {
     if ty is types.Ty.TMap(key, value) {
         return head + "hive.SecretPutDict(b, x, " + secretPutter(em, key) + ", " + secretPutter(em, value) + ") }"
     }
-    fail(em, "a `Secret` cannot keep " + types.show(ty))
+    fail(em, messages.emitSecretCannotKeep(types.show(ty)))
     return "nil"
 }
 
@@ -5167,7 +5168,7 @@ proc secretTaker(em: mut Emit, ty: types.Ty): Str {
     if ty is types.Ty.TMap(key, value) {
         return head + "hive.SecretTakeDict(r, " + secretTaker(em, key) + ", " + secretTaker(em, value) + ") }"
     }
-    fail(em, "a `Secret` cannot keep " + types.show(ty))
+    fail(em, messages.emitSecretCannotKeep(types.show(ty)))
     return "nil"
 }
 
@@ -5207,13 +5208,13 @@ func flatKey(format: Str, f: ast.Field): Str {
 
 proc emitFlatCodec(em: mut Emit, format: Str, name: Str, info: types.TypeInfo): void {
     if len(info.variants) > 0 {
-        fail(em, stdlib.flatCarrier(format) + " is one flat set of parameters, so `" + types.shownName(name) + "`, which has variants, cannot travel as one")
+        fail(em, messages.flatCodecHasVariants(stdlib.flatCarrier(format), types.shownName(name)))
         return
     }
     for each f in info.shared {
         ty := types.resolve(em.table, f.declared)
         if stdlib.isFlatValue(types.elementOf(ty)) == false && stdlib.isFlatValue(ty) == false {
-            fail(em, "`{name}.{f.name}` is " + types.show(ty) + ", which a " + stdlib.flatUnit(format) + " cannot hold")
+            fail(em, messages.flatFieldCannotHold(name, f.name, types.show(ty), stdlib.flatUnit(format)))
             return
         }
     }
@@ -5361,7 +5362,7 @@ proc libraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, written: 
 // A library call as the runtime answers it, before any error union is lifted.
 proc runtimeLibraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, written: ast.Arg[], want: types.Ty): Str {
     if stdlib.isKnownModule(module) == false {
-        fail(em, "this compiler does not carry `hive.{module}`")
+        fail(em, messages.moduleNotCarried(module))
         return "nil"
     }
     useModule(em, module)
@@ -5369,12 +5370,7 @@ proc runtimeLibraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, wr
     if len(stdlib.fieldsOf(env.table, module, name)) == 0 && writtenOutOfOrder(written, names) {
         answer := infer.typeOf(env, ast.Expr.Call(ast.Expr.Member(ast.Expr.Member(ast.Expr.Ident("hive", em.at), module, em.at), name, em.at), copiedArgs(written), em.at))
         if answer is types.Ty.TVoid || concrete(answer) {
-            // The map `set` and `delete` write into is the caller's own.
-            mut Bool[dyn] mutables = []
-            if module == "map" && (name == "set" || name == "delete") {
-                mutables = [true]
-            }
-            h := hoist(em, env, written, names, infer.typesOfArgs(env, stdlib.libraryArgs(env.table, module, name, written)), mutables, true)
+            h := hoist(em, env, written, names, infer.typesOfArgs(env, stdlib.libraryArgs(env.table, module, name, written)), types.callMutables(env.table, module, name), true)
             mut asAnswered := goResult(answer)
             if answer is types.Ty.TVoid {
             } else {
@@ -5412,7 +5408,7 @@ proc runtimeLibraryCall(em: mut Emit, env: infer.Env, module: Str, name: Str, wr
         if want is types.Ty.TMap(key, value) {
             return "hive.NewDict[" + goType(key) + ", " + goType(value) + "]()"
         }
-        fail(em, "`hive.map.new()` has to land somewhere that says what it holds: a declaration, a return, or an argument to a parameter declared as a map")
+        fail(em, messages.mapNewWithoutTarget())
         return "nil"
     }
     if module == "map" {

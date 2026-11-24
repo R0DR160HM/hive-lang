@@ -20,6 +20,7 @@ import ./ast
 import ./diag
 import ./infer
 import ./keeps
+import ./messages
 import ./tables
 import ./prove
 import ./ranges
@@ -194,7 +195,7 @@ proc checkModule(expanded: ast.Module): diag.Diagnostic[dyn] {
 }
 
 func inLaw(name: Str, message: Str): Str {
-    return "in law `" + ast.lawShown(types.shownName(name)) + "`: " + message
+    return messages.lawsInLaw(ast.lawShown(types.shownName(name)), message)
 }
 
 // --- The stages -----------------------------------------------------------------
@@ -254,7 +255,7 @@ proc proveLaw(cx: prove.Context, name: Str, params: ast.Param[], body: ast.Block
             }
         }
         if settled {
-            mut prove.Problem[dyn] none = []
+            prove.Problem[0] none = []
             return none
         }
     }
@@ -281,7 +282,7 @@ proc proveLaw(cx: prove.Context, name: Str, params: ast.Param[], body: ast.Block
                 if (dim is ast.Dim.Fixed(_)) == false {
                     attempt := symbolic(cx, name, params, inducted(name, params, body, i, at))
                     if len(attempt) == 0 {
-                        mut prove.Problem[dyn] none = []
+                        prove.Problem[0] none = []
                         return none
                     }
                     if len(closest) == 0 {
@@ -370,7 +371,7 @@ proc symbolic(cx: prove.Context, name: Str, params: ast.Param[], body: ast.Block
     }
     for each p in paths {
         if p.ended is prove.End.Lost(why, where) {
-            append(out, prove.Problem(where, "cannot prove this law: " + why, false, true))
+            append(out, prove.Problem(where, messages.lawsCannotProve(why), false, true))
         }
     }
     return out
@@ -551,7 +552,7 @@ func diagonal(t: types.Table, typeName: Str, variant: Str, fields: ast.Field[], 
     for each f in fields {
         values := edgeValues(t, types.resolve(t, f.declared), depth + 1)
         if len(values) == 0 {
-            mut terms.Term[dyn] none = []
+            terms.Term[0] none = []
             return none
         }
         if len(values) > widest {
@@ -724,7 +725,7 @@ func witnessText(t: types.Table, params: ast.Param[], args: terms.Term[]): Str {
         i = i + 1
     }
     if len(out) == 0 {
-        return "every value"
+        return messages.lawsEveryValue()
     }
     return join(out, ", ")
 }
@@ -790,7 +791,7 @@ proc reachProblem(cx: prove.Context, lawName: Str, body: ast.Block, at: token.Po
                         if name == lawName {
                             return problem
                         }
-                        return "it reaches `" + types.shownName(name) + "` (line {declaredAt.line}), where " + problem
+                        return messages.lawsReachesWhere(types.shownName(name), declaredAt.line, problem)
                     }
                     for each callee in calleesOf(b.stmts) {
                         if (indexOf(seen, callee) is Result.Ok(_)) == false {
@@ -821,7 +822,7 @@ proc blockProblem(cx: prove.Context, stmts: ast.Stmt[]): Str {
 proc stmtProblem(cx: prove.Context, s: ast.Stmt): Str {
     if s is ast.Stmt.ForLoop(init, cond, post, _, at) {
         if ranges.countsUp(init, cond, post) == "" {
-            return "it has a loop (line {at.line}) that nothing shows comes to an end: only `for each`, and a counting loop that starts at a literal, steps by one and stays below a bound, can be reached by a law"
+            return messages.lawsLoopMayNotEnd(at.line)
         }
     }
     for each b in prove.blocksOfStmt(s) {
@@ -869,11 +870,11 @@ proc recursionProblem(cx: prove.Context, lawName: Str, reached: Str[]): Str {
                     if callee == name {
                         problem := shrinkProblem(name, params, body)
                         if problem != "" {
-                            return "it reaches `" + types.shownName(name) + "` (line {at.line}), which calls itself, and " + problem
+                            return messages.lawsReachesSelfCaller(types.shownName(name), at.line, problem)
                         }
                     } else if callee != lawName && indexOf(reached, callee) is Result.Ok(_) {
                         if calls(cx, callee, name, []) {
-                            return "it reaches `" + types.shownName(name) + "` and `" + types.shownName(callee) + "`, which call each other round in a circle: a law may only reach a callable that calls itself, on something smaller"
+                            return messages.lawsReachesCircle(types.shownName(name), types.shownName(callee))
                         }
                     }
                 }
@@ -1009,7 +1010,7 @@ func callsShrink(name: Str, params: ast.Param[], e: ast.Expr, smaller: Str[], of
                     i = i + 1
                 }
                 if ok == false {
-                    return "its call to itself (line {at.line}) is not on something smaller: pass, in a parameter's place, a part a pattern took from that parameter — `if xs is [_, ...rest] \{ " + types.shownName(name) + "(rest, ...) }`"
+                    return messages.lawsCallNotSmaller(at.line, types.shownName(name))
                 }
             }
         }
@@ -1057,7 +1058,7 @@ proc lawCycles(m: ast.Module): diag.Diagnostic[dyn] {
         if d is ast.Decl.CallableDecl(kind, name, _, _, _, at) {
             if kind is ast.CallableKind.LawKind {
                 if circles(callsOf, laws, name, name, []) {
-                    append(out, diag.on(at, inLaw(name, "it calls another law that, in turn, calls it: each would be assumed to prove the other. Only a law calling itself, on something smaller, is an induction")))
+                    append(out, diag.on(at, inLaw(name, messages.lawsCallEachOther())))
                 }
             }
         }

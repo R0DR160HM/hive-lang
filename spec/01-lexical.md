@@ -73,16 +73,17 @@ reserved, a variable may be called `timeout` or `table`.
 | | |
 | --- | --- |
 | two-character | `:=` `>=` `<=` `==` `!=` `**` `&&` `\|\|` `++` `--` `+=` `-=` `*=` `/=` `&=` `\|=` `^=` `<<` `>>` `\|>` |
-| three-character | `...` (the vector-pattern rest marker), `<<=` `>>=` |
+| three-character | `...` (the vector-pattern rest marker), `<<=` `>>=`, `<<<` `>>>` (the [binary](05-expressions.md#building-bytes) brackets) |
 | one-character | `{` `}` `(` `)` `[` `]` `:` `;` `,` `.` `>` `<` `=` `+` `-` `*` `/` `%` `\|` `&` `^` `~` `!` |
 
-`...` must be matched before `.`, and each two-character operator before its
-prefix. `!=` is therefore looked for before `!`, and a `!` reaching the
+Each three-character operator must be matched before its prefix — `...` before
+`.`, `<<<` before `<<` — and each two-character operator before its prefix. `!=` is therefore looked for before `!`, and a `!` reaching the
 one-character row is one standing on its own: the negation. `||`, `|>` and `|=`
 are looked for before `|` the same way, and a `|` reaching that row is bitwise or.
 
 A `>>` is one token, and also two `>` closing two lists of type arguments —
-`Map<Str, Result<Int, Str>>` — which the parser takes one half at a time.
+`Map<Str, Result<Int, Str>>` — which the parser takes one half at a time. A
+`>>>` is three the same way.
 
 ### Literals
 

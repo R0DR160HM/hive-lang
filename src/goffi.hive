@@ -16,7 +16,7 @@
 //     int                    <-> Int      (int64 is refused: Hive's Int *is* Go's int)
 //     float64                <-> Float
 //     bool                   <-> Bool
-//     []T                    <-> T[dyn]
+//     []T                    <-> T[dyn]   (a parameter takes T[], any length)
 //     map[K]V                <-> hive.map.Map<K, T>   (K a scalar)
 //     a struct in the file   <-> a Hive type mirroring it
 //     (T, error)              -> Result<T, Str>
@@ -219,7 +219,7 @@ proc foreignFn(symbol: Str, params: Str, results: Str, structs: Str[], packageNa
                 return Result.Error("the parameter `{paramName}` of `{symbol}` in {display} cannot be named in Hive, where a parameter is camelCase. Rename it in the Go file.")
             }
             if mapped is Result.Ok(declared) {
-                append(out, ast.Param(lowered, declared, false, token.Pos(display, 0, 0)))
+                append(out, ast.Param(lowered, anyLength(declared), false, token.Pos(display, 0, 0)))
             }
         }
     }
@@ -358,6 +358,25 @@ proc mapType(goType: Str, structs: Str[]): Result<ast.TypeExpr, Str> {
         return Result.Error(why)
     }
     return Result.Error("is a Go map this compiler could not read.")
+}
+
+// A Go function cannot change the length of the slice it is handed, so a slice
+// parameter takes a vector of any length rather than only a declared `[dyn]` one.
+func anyLength(t: ast.TypeExpr): ast.TypeExpr {
+    if t is ast.TypeExpr.Named(pkg, name, args, dims) && dims bounds 0 {
+        if dims[0] is ast.Dim.Dynamic {
+            mut ast.Dim[dyn] out = [ast.Dim.Any()]
+            mut i := 0
+            for each d in dims {
+                if i > 0 {
+                    append(out, d)
+                }
+                i = i + 1
+            }
+            return ast.TypeExpr.Named(pkg, name, args, out)
+        }
+    }
+    return t
 }
 
 func vectorOf(element: ast.TypeExpr): Result<ast.TypeExpr, Str> {

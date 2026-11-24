@@ -11,6 +11,7 @@
 //
 // The syntax accepted is Go's, which is RE2 — no backreferences, no lookaround.
 // Both are refused by name here rather than by the Go toolchain later.
+import ./messages
 import ./text
 
 // A regex read left to right. `out` is the rewritten pattern, a piece at a
@@ -31,13 +32,13 @@ type Scan {
 // the file this sat and this does not.
 proc check(pattern: Str): Result<Str, Str> {
     if pattern == "" {
-        return Result.Error("this hole's regex is empty, so it matches nothing and binds nothing. A hole that takes any text is written `\{name}`, with no `is`")
+        return Result.Error(messages.regexEmpty())
     }
     mut Scan s = Scan(text.chars(pattern), 0, 0, [], "", false)
     alternation(s)
     if s.problem == "" && s.pos < len(s.cs) {
         // Only an unmatched `)` leaves the walk early with nothing said.
-        fault(s, "this `)` closes a group that was never opened")
+        fault(s, messages.regexUnopenedClose())
     }
     if s.problem != "" {
         return Result.Error(s.problem)
@@ -111,7 +112,7 @@ proc atom(s: mut Scan): void {
         return
     }
     if c == "*" || c == "+" || c == "?" {
-        fault(s, "this `{c}` has nothing before it to repeat")
+        fault(s, messages.regexNothingToRepeat(c))
         return
     }
     // A `\{` opening a real count here has nothing in front of it to apply to;
@@ -119,7 +120,7 @@ proc atom(s: mut Scan): void {
     // is text and `\{2}` is a mistake.
     if c == "\{" {
         if countEndsAt(s, s.pos) >= 0 {
-            fault(s, "this `\{...}` has nothing before it to repeat")
+            fault(s, messages.regexCountNothingToRepeat())
             return
         }
     }
@@ -151,7 +152,7 @@ proc group(s: mut Scan): void {
     }
     if here(s) != ")" {
         s.pos = opened
-        fault(s, "this `(` is never closed")
+        fault(s, messages.regexGroupNeverClosed())
         return
     }
     emit(s, ")")
@@ -169,20 +170,20 @@ proc groupFlags(s: mut Scan): Bool {
         return true
     }
     if next == "=" || next == "!" {
-        fault(s, "lookaround (`(?{next}`) is not part of this regex syntax: a match here never backtracks, so how long it takes is a fact about the text's length and not about the pattern. Say it with the literal text around the hole instead")
+        fault(s, messages.regexLookaround(next))
         return false
     }
     if next == "<" {
         after := at(s, s.pos + 2)
         if after == "=" || after == "!" {
-            fault(s, "lookbehind (`(?<{after}`) is not part of this regex syntax: a match here never backtracks. Say it with the literal text before the hole instead")
+            fault(s, messages.regexLookbehind(after))
             return false
         }
-        fault(s, "a named group is not written inside a hole — the hole's own name is what the text binds to. Write `(...)` for grouping alone")
+        fault(s, messages.regexNamedGroup())
         return false
     }
     if next == "P" {
-        fault(s, "a named group is not written inside a hole — the hole's own name is what the text binds to. Write `(...)` for grouping alone")
+        fault(s, messages.regexNamedGroup())
         return false
     }
     // `(?i)`, `(?is)`, `(?i:...)` — a flag setting. The letters are RE2's own.
@@ -194,7 +195,7 @@ proc groupFlags(s: mut Scan): Bool {
             seen = seen + c
         } else if c == ")" || c == ":" {
             if seen == "" {
-                fault(s, "`(?{c}` says nothing: a `(?` opens a flag setting, a `(?:` a group that does not capture")
+                fault(s, messages.regexEmptyFlags(c))
                 return false
             }
             emit(s, "(?" + seen + c)
@@ -207,11 +208,11 @@ proc groupFlags(s: mut Scan): Bool {
             }
             return true
         } else {
-            fault(s, "`{c}` is not one of the flags a regex takes — those are `i` (ignore case), `m` (multi-line), `s` (`.` matches a newline) and `U` (ungreedy)")
+            fault(s, messages.regexUnknownFlag(c))
             return false
         }
     }
-    fault(s, "this `(` is never closed")
+    fault(s, messages.regexGroupNeverClosed())
     return false
 }
 
@@ -250,20 +251,20 @@ proc characterClass(s: mut Scan): void {
         }
     }
     s.pos = opened
-    fault(s, "this `[` is never closed")
+    fault(s, messages.regexClassNeverClosed())
 }
 
 // `\d`, `\w`, `\.`, `\n` — one backslash and what it applies to.
 proc escape(s: mut Scan): void {
     c := at(s, s.pos + 1)
     if c == "" {
-        fault(s, "this `\\` is the last character, so there is nothing for it to escape")
+        fault(s, messages.regexTrailingBackslash())
         return
     }
     // A digit after a backslash is a backreference everywhere that backtracks,
     // and nowhere here. Named, rather than left to read as an octal escape.
     if text.isDigit(c) && c != "0" {
-        fault(s, "`\\{c}` is a backreference, and this regex syntax has none: a match here never backtracks. Repeat the pattern instead of pointing back at it")
+        fault(s, messages.regexBackreference(c))
         return
     }
     emit(s, "\\" + c)
@@ -278,7 +279,7 @@ proc quantifier(s: mut Scan): void {
     c := here(s)
     if c == "*" || c == "+" || c == "?" {
         if s.repeatable == false {
-            fault(s, "this `{c}` has nothing before it to repeat")
+            fault(s, messages.regexNothingToRepeat(c))
             return
         }
         emit(s, c)
@@ -309,7 +310,7 @@ proc counted(s: mut Scan): void {
     // A bound left out is "and up", which cannot run backwards.
     if high != "" {
         if asInt(high) < asInt(low) {
-            fault(s, "`\{{low},{high}}` counts down: a repeat's high bound cannot be below its low one")
+            fault(s, messages.regexCountsDown(low, high))
             return
         }
     }
@@ -348,7 +349,7 @@ proc lazy(s: mut Scan): void {
         return
     }
     if c == "*" || c == "+" {
-        fault(s, "this `{c}` repeats a repeat, which says nothing the first one did not")
+        fault(s, messages.regexRepeatsRepeat(c))
         return
     }
     s.repeatable = false

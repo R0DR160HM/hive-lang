@@ -14,6 +14,7 @@
 import ./ast
 import ./diag
 import ./infer
+import ./messages
 import ./text
 import ./token
 import ./types
@@ -1237,7 +1238,7 @@ func refusal(bo: Proofs, env: infer.Env, subject: ast.Expr, index: ast.Expr): St
     // `t[r][c]` with `r` a variable names a different row whenever `r` moves, so
     // there is no one row for a guard to be about.
     if subject is ast.Expr.Index(outer, _, _) && pathKey(subject) == "" && pathKey(outer) != "" {
-        return "cannot prove this is in range: `" + pathKey(outer) + "[...]` is a different row each time its index moves, so no guard can be about it. Bind the row to a name first — `row := " + pathKey(outer) + "[r]` — and guard that"
+        return messages.rangeRowMoves(pathKey(outer))
     }
     written := describe(bo, env, subject)
     // A `Str` is indexed by character and never carries a declared length, so the
@@ -1245,20 +1246,20 @@ func refusal(bo: Proofs, env: infer.Env, subject: ast.Expr, index: ast.Expr): St
     str := infer.typeOf(env, subject) is types.Ty.TStr
     if index is ast.Expr.IntLit(at, _) {
         if knownLength(bo, env, subject) is Result.Ok(n) {
-            return "`{written}` holds {n}, so `{at}` is not a position it has"
+            return messages.rangeLiteralPastLength(written, n, at)
         }
         if str {
-            return "cannot prove `{at}` is in range: `{written}` is a `Str`, whose length is only ever known at runtime. Guard it — `if {written} bounds {at} \{ ... }`"
+            return messages.rangeLiteralInStr(at, written)
         }
-        return "cannot prove `{at}` is in range: `{written}` has no length the compiler knows. Guard it — `if {written} bounds {at} \{ ... }` — or declare the vector with a length"
+        return messages.rangeLiteralNoLength(at, written)
     }
     if index is ast.Expr.Ident(name, _) {
         if str {
-            return "cannot prove `{name}` is in range for `{written}`. Guard it — `if {written} bounds {name} \{ ... }` — or take it from `indexOf`, whose `Ok` payload is always a position the string really has"
+            return messages.rangeNameInStr(name, written)
         }
-        return "cannot prove `{name}` is in range for `{written}`. Guard it — `if {written} bounds {name} \{ ... }` — or take it from `indexOf`, whose `Ok` payload is always a position the vector really has"
+        return messages.rangeNameInVector(name, written)
     }
-    return "cannot prove this index is in range: it is a computed expression, and there is nothing to hang a guard on. Bind it to a name first, then guard that"
+    return messages.rangeComputedIndex()
 }
 
 // What to call the vector in a message: the whole path where there is one, so a
@@ -1272,9 +1273,9 @@ func describe(bo: Proofs, env: infer.Env, e: ast.Expr): Str {
     name := rootOf(e)
     if name == "" {
         if infer.typeOf(env, e) is types.Ty.TStr {
-            return "this string"
+            return messages.rangeThisString()
         }
-        return "this vector"
+        return messages.rangeThisVector()
     }
     return name
 }
