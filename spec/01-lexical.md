@@ -19,8 +19,9 @@ and no statement is terminated by a newline: an expression carries on across
 lines, so a long one is broken before an operator, `||` or `+` opening the next
 line. Three tokens are the exception, because each can also open an expression:
 a `(`, a `[` or a `-` that opens a line starts a new statement rather than
-continuing the one above. To break a subtraction across lines, end the line
-with the `-`.
+continuing the one above. Inside brackets, where no statement can start, a
+leading `-` carries on as usual. To break a subtraction across lines elsewhere,
+end the line with the `-`.
 
 A comment runs from `//` to the end of the line. The newline itself is not part
 of the comment, so line counting is unaffected. There is no block comment
