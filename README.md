@@ -55,5 +55,5 @@ extension colours a Hive file too.
 * [examples/](examples): Complete programs, from `echo` to a multiplayer
   shooter, every one compiled and run by `./examples/run`.
 * [spec/](spec/): the specification.
-* [CHANGELOG.md](CHANGELOG.md): what changed, release by release.
+* [CHANGELOG/](CHANGELOG): what changed, one file per release.
 

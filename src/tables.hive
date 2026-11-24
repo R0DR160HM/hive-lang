@@ -13,6 +13,7 @@
 import ./ast
 import ./diag
 import ./infer
+import ./messages
 import ./prove
 import ./terms
 import ./text
@@ -472,7 +473,7 @@ proc readStatement(rd: mut Reader, lo: Int, hi: Int): void {
     } else if isWord(first, "delete") {
         readDelete(rd, lo, hi)
     } else if mentions(rd, lo, hi) {
-        append(rd.unread, "it names `{rd.table}` in a `" + text.upper(first.text) + "` statement, which says nothing about which of its rows it takes")
+        append(rd.unread, messages.sqlStatementSaysNothing(rd.table, text.upper(first.text)))
     }
 }
 
@@ -591,7 +592,7 @@ proc readOneSelect(rd: mut Reader, lo: Int, hi: Int): void {
     readNested(rd, fromEnd, hi)
     for each item in items {
         if item.isTable {
-            append(rd.refs, Ref(item.alias, "reads", len(items) == 1, knownOf(rd, rest, item, len(items) == 1)))
+            append(rd.refs, Ref(item.alias, messages.sqlVerbReads(), len(items) == 1, knownOf(rd, rest, item, len(items) == 1)))
         }
     }
 }
@@ -668,7 +669,7 @@ proc readFrom(rd: mut Reader, lo: Int, hi: Int): Item[dyn] {
             if isWord(tokAt(rd.toks, i + 1), "select") || isWord(tokAt(rd.toks, i + 1), "with") {
                 readStatement(rd, i + 1, shut)
             } else if mentions(rd, i + 1, shut) {
-                append(rd.unread, "it takes rows from `{rd.table}` inside parentheses in a FROM list, which this reader does not follow")
+                append(rd.unread, messages.sqlParenthesesInFrom(rd.table))
             }
             i = shut + 1
             named := aliasAt(rd, i, hi)
@@ -740,7 +741,7 @@ proc readUpdate(rd: mut Reader, lo: Int, hi: Int): void {
     i = named.next
     if isWord(tokAt(rd.toks, i), "set") == false {
         if isTable(rd, last) {
-            append(rd.unread, "it updates `{rd.table}` without a SET this reader can find")
+            append(rd.unread, messages.sqlUpdateWithoutSet(rd.table))
         }
         return
     }
@@ -759,12 +760,12 @@ proc readUpdate(rd: mut Reader, lo: Int, hi: Int): void {
     target := Item(alias, isTable(rd, last), "first", Range(0, 0))
     if target.isTable {
         facts := knownOf(rd, where, target, only)
-        append(rd.refs, Ref(alias, "changes", only, facts))
+        append(rd.refs, Ref(alias, messages.sqlVerbChanges(), only, facts))
         append(rd.writes, assignments(rd, Range(setLo, setHi), alias, only, facts))
     }
     for each item in others {
         if item.isTable {
-            append(rd.refs, Ref(item.alias, "reads", false, knownOf(rd, where, item, false)))
+            append(rd.refs, Ref(item.alias, messages.sqlVerbReads(), false, knownOf(rd, where, item, false)))
         }
     }
 }
@@ -781,7 +782,7 @@ proc assignments(rd: mut Reader, r: Range, alias: Str, only: Bool, facts: Fact[]
     for each piece in pieces(rd.toks, r, ",") {
         name := tokAt(rd.toks, piece.lo)
         if isPunct(name, "(") {
-            readable = "it sets several columns at once, `(a, b) = ...`"
+            readable = messages.sqlSetsSeveralColumns()
         } else {
             mut column := name.text
             mut eq := piece.lo + 1
@@ -839,11 +840,11 @@ proc readDelete(rd: mut Reader, lo: Int, hi: Int): void {
     readNested(rd, i, hi)
     only := len(others) == 0
     if isTable(rd, last) {
-        append(rd.refs, Ref(alias, "deletes from", only, knownOf(rd, where, Item(alias, true, "first", Range(0, 0)), only)))
+        append(rd.refs, Ref(alias, messages.sqlVerbDeletesFrom(), only, knownOf(rd, where, Item(alias, true, "first", Range(0, 0)), only)))
     }
     for each item in others {
         if item.isTable {
-            append(rd.refs, Ref(item.alias, "reads", false, knownOf(rd, where, item, false)))
+            append(rd.refs, Ref(item.alias, messages.sqlVerbReads(), false, knownOf(rd, where, item, false)))
         }
     }
 }
@@ -894,7 +895,7 @@ proc readInsert(rd: mut Reader, lo: Int, hi: Int): void {
             if into {
                 mut readable := ""
                 if named == false {
-                    readable = "it names no columns, so which value lands in which cannot be read"
+                    readable = messages.sqlInsertNamesNoColumns()
                 }
                 append(rd.writes, Written(false, columns, values, [], readable))
             }
@@ -906,11 +907,11 @@ proc readInsert(rd: mut Reader, lo: Int, hi: Int): void {
     } else {
         readStatement(rd, i, conflict)
         if into {
-            mut what := "inserts what a SELECT answers with"
+            mut what := messages.sqlInsertsSelect()
             if isWord(source, "default") {
-                what = "inserts a row of defaults"
+                what = messages.sqlInsertsDefaults()
             }
-            append(rd.writes, Written(false, columns, [], [], "it {what}, so what lands in each column cannot be read"))
+            append(rd.writes, Written(false, columns, [], [], messages.sqlInsertUnreadable(what)))
         }
     }
     // `ON CONFLICT ... DO UPDATE SET ...` changes a row already there: one the
@@ -923,7 +924,7 @@ proc readInsert(rd: mut Reader, lo: Int, hi: Int): void {
             setHi := nextStop(rd.toks, set + 1, hi, false)
             where := whereOf(rd, setHi, hi)
             facts := knownOf(rd, where, Item(alias, true, "first", Range(0, 0)), true)
-            append(rd.refs, Ref(alias, "changes", true, facts))
+            append(rd.refs, Ref(alias, messages.sqlVerbChanges(), true, facts))
             append(rd.writes, assignments(rd, Range(set + 1, setHi), alias, true, facts))
         }
         readNested(rd, conflict, hi)
@@ -1067,12 +1068,12 @@ func filterShape(filter: ast.SqlPart[]): Str {
         if part is ast.SqlPart.Where(group) {
             groups = groups + 1
             if hasOr(group) {
-                return "a law's filter cannot hold an `or \{ }` block, which says nothing about any one row\n    write the alternatives in its SQL: `a = \{x} OR b = \{x}`"
+                return messages.lawFilterHoldsOr()
             }
         }
     }
     if groups > 0 && len(filter) > 1 {
-        return "a law's filter is SQL, or one `WHERE \{ }` block's `if`s, and not both"
+        return messages.lawFilterMixesSqlAndBlock()
     }
     return ""
 }
@@ -1091,14 +1092,14 @@ func hasOr(group: ast.SqlGroup): Bool {
 // What is wrong with one query under one law: nothing, where some parameter of
 // the law's type makes the query carry the filter everywhere it touches the table.
 proc checkQuery(cx: prove.Context, lawName: Str, lawParams: ast.Param[], table: Str, filter: ast.SqlPart[], queryName: Str, params: ast.Param[], sql: ast.SqlPart[]): Str[dyn] {
-    mut Str[dyn] none = []
+    Str[0] none = []
     rd := readQuery(lastPart(table), sql)
     if len(rd.refs) == 0 && len(rd.writes) == 0 && len(rd.unread) == 0 {
         return none
     }
     shownLaw := "`" + types.shownName(lawName) + "`"
     for each why in rd.unread {
-        return ["cannot hold this query to law {shownLaw}: {why}"]
+        return [messages.lawCannotHoldQuery(shownLaw, why)]
     }
     mut lawParam := ""
     mut types.Ty lawType = types.Ty.TUnknown()
@@ -1121,7 +1122,7 @@ proc checkQuery(cx: prove.Context, lawName: Str, lawParams: ast.Param[], table: 
         }
     }
     if tried == false {
-        return ["this query touches `{table}`, which law {shownLaw} filters by a `" + types.show(lawType) + "`, so it has to take one"]
+        return [messages.lawQueryTakesNoLawParam(table, shownLaw, types.show(lawType))]
     }
     return first
 }
@@ -1138,9 +1139,9 @@ proc underParam(cx: prove.Context, rd: Reader, shownLaw: Str, lawParam: Str, par
             if carried(cx, params, ref.facts, want) == false {
                 mut where := "`" + want.written + "`"
                 if len(want.conds) > 0 {
-                    where = where + " wherever `" + condText(want.conds) + "` holds: `WHERE \{ if " + condText(want.conds) + " \{ " + want.written + " } }`"
+                    where = messages.lawFilterUnderConditions(want.written, condText(want.conds))
                 }
-                append(out, "this query {ref.verb} `{table}` without the filter law {shownLaw} keeps on it\n    its WHERE has to carry {where}")
+                append(out, messages.lawQueryMissesFilter(ref.verb, table, shownLaw, where))
                 return out
             }
         }
@@ -1196,7 +1197,7 @@ proc keepsRow(cx: prove.Context, params: ast.Param[], w: Written, want: Wanted, 
             return ""
         }
         if w.readable != "" {
-            return "cannot hold this query to law {shownLaw}: {w.readable}"
+            return messages.lawCannotHoldQuery(shownLaw, w.readable)
         }
         if writesOne(w, want) {
             return ""
@@ -1214,18 +1215,18 @@ proc keepsRow(cx: prove.Context, params: ast.Param[], w: Written, want: Wanted, 
                 return ""
             }
         }
-        return "this query moves a row of `{table}` out of law {shownLaw}'s filter: it sets " + columnList(w, want) + " to something the filter does not keep\n    the row has to stay inside `" + want.written + "`"
+        return messages.lawUpdateMovesRow(table, shownLaw, columnList(w, want), want.written)
     }
     if w.readable != "" {
-        return "cannot hold this query to law {shownLaw}: {w.readable}"
+        return messages.lawCannotHoldQuery(shownLaw, w.readable)
     }
     if len(want.eqColumns) == 0 {
-        return "this query inserts into `{table}`, and law {shownLaw}'s filter `" + want.written + "` is not `column = value`, so no row an insert writes can be held to it"
+        return messages.lawInsertFilterNotEquality(table, shownLaw, want.written)
     }
     if writesOne(w, want) {
         return ""
     }
-    return "this query inserts a row into `{table}` that law {shownLaw}'s filter does not keep\n    it has to write " + eqList(want)
+    return messages.lawInsertOutsideFilter(table, shownLaw, eqList(want))
 }
 
 func writesOne(w: Written, want: Wanted): Bool {
@@ -1253,7 +1254,7 @@ func eqList(want: Wanted): Str {
     mut i := 0
     for each c in want.eqColumns {
         if want.eqValues bounds i {
-            append(out, "`" + bare(c) + "` as `" + want.eqValues[i] + "`")
+            append(out, messages.lawColumnAsValue(bare(c), want.eqValues[i]))
         }
         i = i + 1
     }
@@ -1262,7 +1263,7 @@ func eqList(want: Wanted): Str {
             return one
         }
     }
-    return "one of " + join(out, ", or ")
+    return messages.lawOneOf(join(out, ", or "))
 }
 
 func columnList(w: Written, want: Wanted): Str {

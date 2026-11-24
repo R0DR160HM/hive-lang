@@ -315,15 +315,15 @@ can never run, and is refused with nothing to move it above.
 
 ## 7.9 Binary patterns
 
-`<<...>>` reads its subject's bits in order, most significant first, each field
+`<<<...>>>` reads its subject's bits in order, most significant first, each field
 as many as its type has:
 
 ```hive
-if packet is <<version: UInt4, ihl: UInt4, _: UInt8, length: UInt16, ...rest>> {
+if packet is <<<version: UInt4, ihl: UInt4, _: UInt8, length: UInt16, ...rest>>> {
 	echo "IPv{version}, {length} bytes"
 }
 
-if file is <<0x89, "PNG", 0x0D0A_1A0A: UInt32, size: UInt32, body: UInt8[size], ...more>> {
+if file is <<<0x89, "PNG", 0x0D0A_1A0A: UInt32, size: UInt32, body: UInt8[size], ...more>>> {
 	...
 }
 ```
@@ -345,7 +345,7 @@ reserved nowhere.
 
 The subject is a `UInt8[]`, a `Str` — by its bytes, so a `Str` is matched without
 a copy — or an integer of any size, whose bits the fields have to take every one
-of: `op is <<code: UInt4, reg: UInt4>>` on a `UInt8`. An integer has no rest, no
+of: `op is <<<code: UInt4, reg: UInt4>>>` on a `UInt8`. An integer has no rest, no
 run of bytes and no string to match.
 
 **The match checks the length**, so a field needs no bounds proof. Without
@@ -358,4 +358,4 @@ that starts mid-byte, and a `little` field that is not whole bytes at a byte's
 start are each a compile error naming the bits that finish the byte.
 
 A binary pattern is never exhaustive, so a `switch` over one ends with `_`. The
-way to build what one reads is [`<<...>>` as a value](05-expressions.md#building-bytes).
+way to build what one reads is [`<<<...>>>` as a value](05-expressions.md#building-bytes).

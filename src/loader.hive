@@ -14,6 +14,7 @@ import ./fetch
 import ./goffi
 import ./infer
 import ./lexer
+import ./messages
 import ./parser
 import ./paths
 import ./pinned
@@ -132,7 +133,7 @@ proc loadFile(l: mut Load, key: Str, display: Str, asked: token.Pos): void {
     }
     read := hive.file.read(display)
     if read is Result.Error(why) {
-        append(l.errors, diag.on(asked, "cannot read `{display}`: {why.message}"))
+        append(l.errors, diag.on(asked, messages.importCannotRead(display, why.message)))
         return
     }
     if read is Result.Ok(source) {
@@ -195,7 +196,7 @@ proc resolveImport(l: mut Load, dir: Str, line: ast.ImportLine, display: Str): S
     // Checked here rather than at flattening time so it is reported instead of
     // whatever the import would have failed to load.
     if line.alias == "hive" {
-        append(l.errors, diag.on(line.at, "an import cannot be named `hive`: that name belongs to the standard library"))
+        append(l.errors, diag.on(line.at, messages.importNamedHive()))
         return ""
     }
     if namesStdlib(path) {
@@ -208,12 +209,12 @@ proc resolveImport(l: mut Load, dir: Str, line: ast.ImportLine, display: Str): S
         // got it wrong.
         segments := split(path, ".")
         if len(segments) > 2 {
-            append(l.errors, diag.on(line.at, "`{path}` names more than a module. An import of the standard library is the module and nothing in it: `import hive.ui`, never `import hive.ui.View`"))
+            append(l.errors, diag.on(line.at, messages.stdlibImportNamesMember(path)))
             return ""
         }
         module := stdlibModuleOf(path)
         if stdlib.isKnownModule(module) == false {
-            append(l.errors, diag.on(line.at, "this compiler does not carry `hive.{module}`"))
+            append(l.errors, diag.on(line.at, messages.moduleNotCarried(module)))
         }
         return ""
     }
@@ -253,7 +254,7 @@ proc fetchRemote(l: mut Load, path: Str, line: ast.ImportLine, display: Str): St
             }
             written := inside + ".hive"
             if hive.file.exists(written) == false {
-                append(l.errors, diag.on(line.at, "`{repo.url}` has no `" + repo.inner + ".hive` at " + here.commit))
+                append(l.errors, diag.on(line.at, messages.remoteImportMissingModule(repo.url, repo.inner, here.commit)))
                 return ""
             }
             return written
@@ -280,19 +281,17 @@ proc popStack(l: mut Load): void {
 // The loop that was found, printed as the chain that closed it.
 func cycleMessage(l: Load, key: Str): Str {
     mut Str[dyn] lines = []
-    append(lines, "this import forms a cycle:")
-    append(lines, "")
     mut seen := false
     for each entry in l.stack {
         if entry == key {
             seen = true
         }
         if seen {
-            append(lines, "    " + arrow(entry, len(lines) > 2) )
+            append(lines, "    " + arrow(entry, len(lines) > 0) )
         }
     }
     append(lines, "    " + arrow(key, true))
-    return join(lines, "\n")
+    return messages.importCycle(join(lines, "\n"))
 }
 
 func arrow(entry: Str, indented: Bool): Str {
@@ -503,7 +502,7 @@ proc bindImports(rw: mut Rw, src: Source, known: hive.map.Map<Str, Bool>): void 
                 continue
             }
         }
-        append(rw.errors, diag.on(line.at, "could not resolve `import {line.path}`"))
+        append(rw.errors, diag.on(line.at, messages.importUnresolved(line.path)))
     }
     for each module in stdlib.modules() {
         if hive.map.has(rw.aliasKeys, module) == false && hive.map.has(rw.stdlibAliases, module) == false
@@ -776,7 +775,7 @@ proc namedType(rw: mut Rw, pkg: Str, name: Str, args: ast.TypeExpr[dyn], dims: a
         return ast.TypeExpr.Named("hive." + module, name, args, dims)
     }
     if hive.map.has(rw.aliasKeys, pkg) {
-        append(rw.errors, diag.on(rw.at, "the module imported as `{pkg}` has no `{name}`"))
+        append(rw.errors, diag.on(rw.at, messages.importedModuleLacksName(pkg, name)))
     }
     return ast.TypeExpr.Named(pkg, name, args, dims)
 }
@@ -994,7 +993,7 @@ proc member(rw: mut Rw, subject: ast.Expr, field: Str, at: token.Pos): ast.Expr 
                 return ast.Expr.Member(ast.Expr.Member(ast.Expr.Ident("hive", subject.at), module, subject.at), field, at)
             }
             if hive.map.has(rw.aliasKeys, alias) {
-                append(rw.errors, diag.on(at, "the module imported as `{alias}` has no `{field}`"))
+                append(rw.errors, diag.on(at, messages.importedModuleLacksName(alias, field)))
                 return ast.Expr.Member(subject, field, at)
             }
         }
@@ -1081,7 +1080,7 @@ proc rewritePatternPath(rw: mut Rw, path: Str[]): Str[dyn] {
         }
         imported := importedFlat(rw, first, text.charAt(path, 1))
         if imported != "" {
-            append(rw.errors, diag.on(rw.at, "`" + join(out, ".") + "` does not name a pattern: it names a type, so a variant of it has to be named too"))
+            append(rw.errors, diag.on(rw.at, messages.patternNamesImportedType(join(out, "."))))
         }
         return out
     }

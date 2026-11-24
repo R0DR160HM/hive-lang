@@ -14,6 +14,7 @@ import ./ast
 import ./diag
 import ./infer
 import ./library
+import ./messages
 import ./prove
 import ./solve
 import ./terms
@@ -110,7 +111,7 @@ proc walkStmt(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: i
     } else if s is ast.Stmt.Assign(target, value, at) {
         held := termOf(kp, pr, cx, scope, path, value)
         rebinding := target is ast.Expr.Ident(_, _)
-        return writeAt(kp, pr, cx, scope, held.path, target, held.value, at, "this write to `" + prove.exprText(target) + "`", rebinding)
+        return writeAt(kp, pr, cx, scope, held.path, target, held.value, at, messages.keepsThisWriteTo(prove.exprText(target)), rebinding)
     } else if s is ast.Stmt.IfChain(branches, otherwise, hasElse, _) {
         return walkIf(kp, pr, cx, scope, path, branches, otherwise, hasElse)
     } else if s is ast.Stmt.SwitchStmt(lets, _, arms, _, _) {
@@ -564,7 +565,7 @@ proc writeAt(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: in
         fields := split(entry, "\t")
         if text.charAt(fields, 0) == root {
             source := text.charAt(fields, 2)
-            report(kp, at, "cannot prove `" + text.charAt(fields, 1) + "` for " + how + ": `" + root + "` shares the storage of `" + source + "`, so this writes into a value whose law cannot see it\n    write through `" + source + "` itself")
+            report(kp, at, messages.keepsWriteThroughSharer(text.charAt(fields, 1), how, root, source))
         }
     }
     mut prove.Path p = write(kp, pr, cx, scope, path, target, value, at, how)
@@ -605,7 +606,7 @@ proc write(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: infe
                 kept := keep(kp, pr, cx, m.path, built, at, how)
                 append(after, write(kp, pr, cx, scope, kept, subject, built, at, how))
             } else if lawsOf(cx, infer.typeOf(scope, subject)) != "" {
-                report(kp, at, "cannot prove `" + lawsOf(cx, infer.typeOf(scope, subject)) + "` for " + how + ": what it writes into cannot be followed")
+                report(kp, at, messages.keepsWriteNotFollowed(lawsOf(cx, infer.typeOf(scope, subject)), how))
             }
         }
         if len(after) == 1 {
@@ -685,21 +686,21 @@ proc keep(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, path: prove.
                     }
                     for each p in paths {
                         if p.ended is prove.End.Lost(reason, _) {
-                            append(why, "the law cannot be followed: " + reason)
+                            append(why, messages.keepsLawNotFollowed(reason))
                         }
                     }
                     for each reason in why {
-                        named := "`" + ast.lawShown(types.shownName(lawName)) + "`"
-                        mut said := what + " does not keep " + named + ": " + reason
+                        named := ast.lawShown(types.shownName(lawName))
+                        mut said := messages.keepsDoesNotKeep(what, named, reason)
                         if text.contains(reason, ": it is false") {
                             mut first := reason
                             for each piece in split(reason, ": it is false") {
                                 first = piece
                                 break
                             }
-                            said = what + " does not keep " + named + ": " + prove.after(first, 13) + " is false"
+                            said = messages.keepsLawFalse(what, named, prove.after(first, 13))
                         } else if text.startsWith(reason, "cannot prove ") {
-                            said = "cannot prove " + named + " for " + what + ": nothing here shows " + prove.after(reason, 13) + "\n    guard it, so that the law holds here"
+                            said = messages.keepsNothingShows(named, what, prove.after(reason, 13))
                         }
                         report(kp, at, said)
                         break
@@ -856,7 +857,7 @@ proc callOf(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: inf
             append(values, prove.normIn(cx, p, held.value))
         }
         built := terms.Term.RecK(typeName, variant, values)
-        return prove.Out(keep(kp, pr, cx, p, built, at, "this `" + prove.exprText(callee) + "(...)`"), built)
+        return prove.Out(keep(kp, pr, cx, p, built, at, messages.keepsThisConstruction(prove.exprText(callee))), built)
     }
     // A library call that answers the same for the same arguments answers what
     // the prover makes of it, so a law asking the same question is told this.
@@ -906,7 +907,7 @@ proc callOf(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: inf
     for each a in shape.args {
         if writes(shape, i) {
             now := writtenValue(pr, cx, scope, p, shape, values, i, a.value)
-            p = writeAt(kp, pr, cx, scope, now.path, a.value, now.value, at, "this `" + shape.what + "` on `" + prove.exprText(a.value) + "`", false)
+            p = writeAt(kp, pr, cx, scope, now.path, a.value, now.value, at, messages.keepsThisCallOn(shape.what, prove.exprText(a.value)), false)
         }
         i = i + 1
     }

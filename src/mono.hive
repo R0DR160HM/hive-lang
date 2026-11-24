@@ -17,6 +17,7 @@
 import ./ast
 import ./diag
 import ./infer
+import ./messages
 import ./progress
 import ./text
 import ./token
@@ -99,7 +100,7 @@ proc expand(m: ast.Module, from: Int): Expanded {
             progress.step(from, "  {at} copies of generics made")
         }
         if len(mo.wantedNames) > expansionLimit() {
-            append(mo.errors, diag.on(mo.at, "this program's generics expand without settling: more than {expansionLimit()} copies were asked for. A generic that instantiates itself at a larger type every time round never finishes"))
+            append(mo.errors, diag.on(mo.at, messages.genericsExpandWithoutSettling(expansionLimit())))
             return Expanded(ast.Module([], out, m.foreign, m.library), mo.errors)
         }
         copy := instantiate(mo, env, at)
@@ -490,7 +491,7 @@ proc instantiate(mo: mut Mono, env: infer.Env, at: Int): Result<ast.Decl, Bool> 
             mo.at = d.at
             variables := variablesOfDecl(mo.table, d)
             if len(variables) != len(args.written) {
-                append(mo.errors, diag.on(mo.at, "`{name}` is generic in " + countWord(len(variables)) + ", and this use gives " + countWord(len(args.written))))
+                append(mo.errors, diag.on(mo.at, messages.genericArgumentCountMismatch(name, countWord(len(variables)), countWord(len(args.written)))))
                 return Result.Error(false)
             }
             return Result.Ok(substituteDecl(mo, env, d, flat, variables, args))
@@ -507,15 +508,15 @@ func variablesOfDecl(t: types.Table, d: ast.Decl): Str[dyn] {
     if types.findType(t, name) is Result.Ok(info) {
         return variablesOf(t, info.parameters)
     }
-    mut Str[dyn] none = []
+    Str[0] none = []
     return none
 }
 
 func countWord(n: Int): Str {
     if n == 1 {
-        return "1 type"
+        return messages.genericTypeCountOne()
     }
-    return "{n} types"
+    return messages.genericTypeCount(n)
 }
 
 proc substituteDecl(mo: mut Mono, env: infer.Env, d: ast.Decl, flat: Str, variables: Str[], args: ArgList): ast.Decl {
@@ -872,7 +873,7 @@ proc substituteExpr(mo: mut Mono, env: infer.Env, e: ast.Expr, variables: Str[],
         // callee never gets here — `substituteCall` reads it first. Only a
         // callable: a bare type name is always part of a constructor path.
         if isGeneric(mo.generics, name) && types.findCallable(env.table, name) is Result.Ok(_) {
-            append(mo.errors, diag.on(mo.at, "`{name}` is generic, so it cannot be used as a value: which copy a call reaches is decided by the argument types, and a value carries none. Call it, or wrap it in a callable of your own that is not generic"))
+            append(mo.errors, diag.on(mo.at, messages.genericUsedAsValue(name)))
         }
         return e
     }
@@ -972,14 +973,14 @@ proc solve(mo: mut Mono, env: infer.Env, callee: Str, params: ast.Param[], callA
     // A variable appearing only in the return type has nothing to be inferred
     // from, and would otherwise produce a copy nobody meant.
     if mentioned == false {
-        append(mo.errors, diag.on(mo.at, "`{variable}` appears nowhere in the parameters, so there is nothing at a call to read it off. A type variable is pinned down by what is passed, never written at the call site"))
+        append(mo.errors, diag.on(mo.at, messages.typeVariableNotInParameters(variable)))
         return standIn()
     }
     // A `_` is a parameter of the function value the call makes, and a value
     // carries no types. Where the holes are the only places the variable could
     // be read off, there is no copy for the value to call.
     if held && supplied == false {
-        append(mo.errors, diag.on(mo.at, "`_` stands where `{callee}` reads `{variable}` from, so the function value this makes could not say which copy it calls: a partial application of something generic has to fix every type variable with what it does pass. Pass that argument, or wrap the call in a callable of your own that is not generic"))
+        append(mo.errors, diag.on(mo.at, messages.partialLeavesTypeVariable(callee, variable)))
         return standIn()
     }
     // Passed, but as something that says nothing about it: an empty `[]`, or a

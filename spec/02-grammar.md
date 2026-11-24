@@ -240,7 +240,7 @@ primary     = INT | FLOAT | STRING | INTERP | ATOM | "true" | "false"
             | "(" expression ")" ;
 
 vector-lit  = "[" [ expression { "," expression } ] "]" ;
-bits-lit    = "<<" [ part { "," part } ] ">>" ;
+bits-lit    = "<<<" [ part { "," part } ] ">>>" ;
 part        = expression [ ":" type ] [ "little" ] ;
 await-all   = "await" "[" call { "," call } "]" ;
 ```
@@ -253,9 +253,9 @@ of its own ([13](13-builtins.md#a-declaration-of-your-own-wins)).
 The right side of a `|>` has to be a call, a callable's name or a constructor —
 `x |> f` is `f(x)` — and everything after the parser sees the call it stands for.
 
-Inside `<<...>>` a `>>` closes it, so a shift there is written in parentheses:
-`<<(x >> 2): UInt8>>`. Outside it, one `>>` also closes two lists of type
-arguments: `hive.map.Map<Str, Result<Int, Str>>`.
+`<<<...>>>` brackets are their own tokens, so a shift inside one needs no
+parentheses: `<<<x >> 2, y>>>`. One `>>` also closes two lists of type
+arguments, `hive.map.Map<Str, Result<Int, Str>>`, and one `>>>` three.
 
 `_` is a **hole**, legal only as a call argument, where it makes the call a
 partial application ([05](05-expressions.md#54-function-values)), and as a
@@ -286,8 +286,8 @@ element     = INT | FLOAT | STRING | ATOM | "true" | "false"
 
 string-pattern = STRING | INTERP ;   (* holes are {name} or {name is (re)} *)
 
-bits-pattern= "<<" [ field { "," field } [ "," "..." IDENT ] ] ">>"
-            | "<<" "..." IDENT ">>" ;
+bits-pattern= "<<<" [ field { "," field } [ "," "..." IDENT ] ] ">>>"
+            | "<<<" "..." IDENT ">>>" ;
 field       = ( IDENT | "_" | [ "-" ] INT | STRING )
               [ ":" ( type | IDENT "[" expression "]" ) ] [ "little" ] ;
 ```

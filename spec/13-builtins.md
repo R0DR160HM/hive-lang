@@ -200,10 +200,9 @@ desugars to `hive.len(v)`.
 Each takes a vector and a [function value](05-expressions.md#54-function-values)
 over its elements, and hands back a new vector.
 
-The function is a **`func`, never a `proc`**. A walk says nothing about the order
-its function runs in or how often, so there is nowhere to hang a side effect —
-and that is also what lets a `func` body use one. To walk a vector with a proc,
-write a `for each` loop, which does say.
+The function is a `func` or a `proc`, but **never one that takes its element
+`mut`**: a walk hands each element over as a value, so there is no storage for it
+to write. To change a vector's elements in place, write a `for each` loop.
 
 Each is specific about what its function answers with, and a mismatch is a
 compile error: `filter` wants a `Bool`, `filterMap` a `Result`, and `map` wants

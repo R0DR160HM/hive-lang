@@ -13,6 +13,7 @@
 import ./ast
 import ./diag
 import ./lexer
+import ./messages
 import ./naming
 import ./regex
 import ./text
@@ -39,10 +40,8 @@ type Parse {
     // Carried into sub-parses too, so no two hidden names in a file meet.
     parts: Int
     tests: ast.Expr[dyn]
-    // The `>>` at the cursor has closed one list of type arguments already.
-    split: Bool
-    // Directly inside `<<...>>`, where a `>>` closes it rather than shifting.
-    inBits: Bool
+    // How many lists of type arguments the `>>` or `>>>` at the cursor has closed already.
+    split: Int
     file: Str
     // The string an interpolation or a query's value is parsed out of, where its nodes are placed.
     within: token.Pos
@@ -57,7 +56,7 @@ proc parse(ts: token.Token[]): Parsed {
 }
 
 proc parseFile(ts: token.Token[], file: Str): Parsed {
-    mut Parse p = Parse(0, false, false, [], 0, [], false, false, file, token.nowhere(), token.nowhere(), [])
+    mut Parse p = Parse(0, false, false, [], 0, [], 0, file, token.nowhere(), token.nowhere(), [])
     mut ast.ImportLine[dyn] imports = []
     mut ast.Decl[dyn] decls = []
 
@@ -184,7 +183,7 @@ proc failAt(ts: token.Token[], p: mut Parse, at: Int, message: Str): void {
 
 // `expected X but found Y` — the message nine failures in ten want.
 proc expected(ts: token.Token[], p: mut Parse, what: Str): void {
-    fail(ts, p, "expected {what} but found " + token.describe(kindAt(ts, p.pos)))
+    fail(ts, p, messages.parseExpectedButFound(what, token.describe(kindAt(ts, p.pos))))
 }
 
 // One of the words that are keywords only where they are written. Taken when it
@@ -212,7 +211,7 @@ proc expect(ts: token.Token[], p: mut Parse, k: token.Kind): Bool {
 proc expectIdent(ts: token.Token[], p: mut Parse, role: naming.Role): Str {
     name := wordAt(ts, p.pos)
     if name == "" {
-        expected(ts, p, "an identifier")
+        expected(ts, p, messages.wantedIdentifier())
         return ""
     }
     advance(p)
@@ -278,7 +277,7 @@ proc wordOfPath(ts: token.Token[], p: mut Parse): Str {
         advance(p)
         return path
     }
-    expected(ts, p, "a module path after `import`")
+    expected(ts, p, messages.wantedModulePathAfterImport())
     return ""
 }
 
@@ -304,9 +303,9 @@ proc defaultAlias(ts: token.Token[], p: mut Parse, path: Str, line: token.Pos): 
             // library: naming something *inside* a module is the mistake there, and
             // no alias makes it one.
             if text.startsWith(path, "hive.") {
-                append(p.errors, diag.on(line, "`{path}` names more than a module. An import of the standard library is the module and nothing in it: `import hive.ui`, never `import hive.ui.View`"))
+                append(p.errors, diag.on(line, messages.importStdlibNamesMember(path)))
             } else {
-                append(p.errors, diag.on(line, "`import {path}` needs a name of its own: `{last}` cannot be used as one — write `import {path} as <name>`"))
+                append(p.errors, diag.on(line, messages.importNeedsOwnName(path, last)))
             }
         }
         p.failed = true
@@ -338,7 +337,7 @@ proc parseDecl(ts: token.Token[], p: mut Parse): ast.Decl {
     } else if k == token.Kind.KwLaw() {
         return parseLawDecl(ts, p)
     }
-    fail(ts, p, "expected a declaration — `type`, `proc`, `func`, `query`, `test` or `law` — but found " + token.describe(k))
+    fail(ts, p, messages.parseExpectedDeclaration(token.describe(k)))
     return ast.Decl.TestDecl("", ast.Block([]), place(ts, p))
 }
 
@@ -374,7 +373,7 @@ proc parseSqlParts(body: Str, p: mut Parse): ast.SqlPart[dyn] {
         if c == "\{" {
             shut := matchingBrace(cs, at)
             if shut < 0 {
-                sqlFail(p, "this `\{` in the query body never closes")
+                sqlFail(p, messages.sqlBraceNeverCloses())
                 return parts
             }
             inside := text.span(cs, at + 1, shut - 1)
@@ -414,20 +413,20 @@ proc parseSqlGroup(inside: Str, conjunction: Bool, p: mut Parse): ast.SqlGroup {
         }
         word := sqlWord(cs, at)
         if word == "" {
-            sqlFail(p, "a WHERE block holds `if`, `or` and `and` blocks, and this is none of them")
+            sqlFail(p, messages.sqlWhereBlockNotAnItem())
             return ast.SqlGroup(conjunction, items)
         }
         at = at + len(word)
         if word == "if" {
             opens := nextBrace(cs, at)
             if opens < 0 {
-                sqlFail(p, "this `if` in a WHERE block has no `\{ ... }` after its condition")
+                sqlFail(p, messages.sqlIfHasNoBlock())
                 return ast.SqlGroup(conjunction, items)
             }
             condition := parseSqlExpr(text.span(cs, at, opens - 1), p)
             shut := matchingBrace(cs, opens)
             if shut < 0 {
-                sqlFail(p, "this `if` in a WHERE block never closes")
+                sqlFail(p, messages.sqlIfNeverCloses())
                 return ast.SqlGroup(conjunction, items)
             }
             append(items, ast.SqlItem.Cond(condition, parseSqlParts(text.span(cs, opens + 1, shut - 1), p)))
@@ -439,13 +438,13 @@ proc parseSqlGroup(inside: Str, conjunction: Bool, p: mut Parse): ast.SqlGroup {
                 shut = matchingBrace(cs, opens)
             }
             if shut < 0 {
-                sqlFail(p, "this `{word}` in a WHERE block has no `\{ ... }` after it")
+                sqlFail(p, messages.sqlConnectiveHasNoBlock(word))
                 return ast.SqlGroup(conjunction, items)
             }
             append(items, ast.SqlItem.Nested(parseSqlGroup(text.span(cs, opens + 1, shut - 1), word == "and", p)))
             at = shut + 1
         } else {
-            sqlFail(p, "a WHERE block holds `if`, `or` and `and` blocks, and `{word}` is none of them")
+            sqlFail(p, messages.sqlWhereBlockUnknownWord(word))
             return ast.SqlGroup(conjunction, items)
         }
     }
@@ -459,7 +458,7 @@ proc parseSqlExpr(source: Str, p: mut Parse): ast.Expr {
     for each e in lexed.errors {
         append(p.errors, e)
     }
-    mut Parse inner = Parse(0, false, false, [], p.parts, [], false, false, p.file, p.within, token.nowhere(), [])
+    mut Parse inner = Parse(0, false, false, [], p.parts, [], 0, p.file, p.within, token.nowhere(), [])
     written := parseExpr(lexed.tokens, inner)
     p.parts = inner.parts
     for each e in inner.errors {
@@ -572,7 +571,7 @@ proc parseTypeDecl(ts: token.Token[], p: mut Parse): ast.Decl {
         skipCommas(ts, p)
     }
     if p.failed == false {
-        expected(ts, p, "`}` to close this type")
+        expected(ts, p, messages.wantedCloseType())
     }
     return ast.Decl.TypeDecl(name, fields, variants, line)
 }
@@ -615,34 +614,34 @@ proc parseMarks(ts: token.Token[], p: mut Parse): ast.Marks {
         if kind == "JSON" {
             advance(p)
             if json != "" {
-                failAt(ts, p, at, "this field says `JSON as` twice, and a field has one name on the wire")
+                failAt(ts, p, at, messages.markJsonTwice())
                 return ast.Marks(json, url, flag, short, fallback)
             }
-            json = parseMarkName(ts, p, "JSON", "JSON key")
+            json = parseMarkName(ts, p, "JSON", messages.markWhatJsonKey())
         } else if kind == "URL" {
             advance(p)
             if url != "" {
-                failAt(ts, p, at, "this field says `URL as` twice, and a field has one name in a query string")
+                failAt(ts, p, at, messages.markUrlTwice())
                 return ast.Marks(json, url, flag, short, fallback)
             }
-            url = parseMarkName(ts, p, "URL", "query parameter")
+            url = parseMarkName(ts, p, "URL", messages.markWhatQueryParameter())
         } else if kind == "Flag" {
             advance(p)
             if flag != "" {
-                failAt(ts, p, at, "this field says `Flag as` twice, and a field has one name on a command line")
+                failAt(ts, p, at, messages.markFlagTwice())
                 return ast.Marks(json, url, flag, short, fallback)
             }
-            flag = parseMarkName(ts, p, "Flag", "flag")
+            flag = parseMarkName(ts, p, "Flag", messages.markWhatFlag())
             // A second name is a short one, read after a single dash: whichever
             // of the two is shorter, so they may come in either order.
             if p.failed == false && opensMarkWord(ts, p) {
-                other := parseMarkWord(ts, p, "Flag", "flag")
+                other := parseMarkWord(ts, p, "Flag", messages.markWhatFlag())
                 if len(other) == len(flag) {
-                    failAt(ts, p, at, "`Flag as {flag} {other};` gives two names of one length, and the shorter of the two is the one read after a single dash")
+                    failAt(ts, p, at, messages.markFlagNamesSameLength(flag, other))
                     return ast.Marks(json, url, flag, short, fallback)
                 }
                 if opensMarkWord(ts, p) {
-                    failAt(ts, p, at, "`Flag as` takes two names at most: the flag's, and a shorter one read after a single dash")
+                    failAt(ts, p, at, messages.markFlagTooManyNames())
                     return ast.Marks(json, url, flag, short, fallback)
                 }
                 short = other
@@ -653,14 +652,14 @@ proc parseMarks(ts: token.Token[], p: mut Parse): ast.Marks {
             }
             dashed := kindAt(ts, p.pos) == token.Kind.Minus() || kindAt(ts, p.pos) == token.Kind.MinusMinus()
             if dashed || text.startsWith(flag, "-") || text.startsWith(short, "-") {
-                failAt(ts, p, at, "`Flag as` names a flag without its dashes, since they are added wherever it is written")
+                failAt(ts, p, at, messages.markFlagWithDashes())
                 return ast.Marks(json, url, flag, short, fallback)
             }
         } else if kind == "Default" {
             advance(p)
             if fallback is ast.Expr.Absent {
             } else {
-                failAt(ts, p, at, "this field says `Default as` twice, and a field has one value to fall back to")
+                failAt(ts, p, at, messages.markDefaultTwice())
                 return ast.Marks(json, url, flag, short, fallback)
             }
             fallback = parseMarkLiteral(ts, p)
@@ -712,14 +711,14 @@ proc parseMarkWord(ts: token.Token[], p: mut Parse, clause: Str, what: Str): Str
     if kindAt(ts, p.pos) is token.Kind.StrLit(written) {
         advance(p)
         if written == "" {
-            fail(ts, p, "`{clause} as \"\"` names no field: a {what} is at least one character")
+            fail(ts, p, messages.markNameEmpty(clause, what))
             return ""
         }
         return written
     }
     name := markWord(ts, p.pos)
     if name == "" {
-        expected(ts, p, "the {what} this field is written as, as a word or a quoted string")
+        expected(ts, p, messages.wantedMarkName(what))
         return ""
     }
     advance(p)
@@ -776,12 +775,12 @@ proc parseMarkLiteral(ts: token.Token[], p: mut Parse): ast.Expr {
     }
     // A negative number is unary minus over a literal everywhere else in the
     // language, and it is the same two tokens here.
-    if refusesWide(ts, p, "a `Default`") {
+    if refusesWide(ts, p, messages.wideWhereDefault()) {
         return ast.absent()
     }
     if kindAt(ts, p.pos) == token.Kind.Minus() {
         advance(p)
-        if refusesWide(ts, p, "a `Default`") {
+        if refusesWide(ts, p, messages.wideWhereDefault()) {
             return ast.absent()
         }
         negative := kindAt(ts, p.pos)
@@ -793,7 +792,7 @@ proc parseMarkLiteral(ts: token.Token[], p: mut Parse): ast.Expr {
             advance(p)
             return ast.Expr.FloatLit(0.0 - v, at)
         }
-        expected(ts, p, "a number after the `-`")
+        expected(ts, p, messages.wantedNumberAfterMinus())
         return ast.absent()
     }
     k := kindAt(ts, p.pos)
@@ -803,13 +802,13 @@ proc parseMarkLiteral(ts: token.Token[], p: mut Parse): ast.Expr {
     if k is token.Kind.AtomLit(a) { advance(p) return ast.Expr.AtomLit(a, at) }
     if k == token.Kind.KwTrue() { advance(p) return ast.Expr.BoolLit(true, at) }
     if k == token.Kind.KwFalse() { advance(p) return ast.Expr.BoolLit(false, at) }
-    expected(ts, p, "a literal for this field to fall back to")
+    expected(ts, p, messages.wantedDefaultLiteral())
     return ast.absent()
 }
 
 // What was written where a clause was expected.
 func unknownMark(ts: token.Token[], p: Parse): Str {
-    return "a field's annotations are `JSON as <name>;`, `URL as <name>;`, `Flag as <name> <short name>;` — the short name may be left out — and `Default as <literal>;`, in any order, and " + token.describe(kindAt(ts, p.pos)) + " is none of them"
+    return messages.markUnknown(token.describe(kindAt(ts, p.pos)))
 }
 
 proc parseVariant(ts: token.Token[], p: mut Parse): ast.Variant {
@@ -829,7 +828,7 @@ proc parseVariant(ts: token.Token[], p: mut Parse): ast.Variant {
         skipCommas(ts, p)
     }
     if p.failed == false {
-        expected(ts, p, "`}` to close this variant")
+        expected(ts, p, messages.wantedCloseVariant())
     }
     return ast.Variant(name, fields, at)
 }
@@ -858,7 +857,7 @@ proc parseLawDecl(ts: token.Token[], p: mut Parse): ast.Decl {
     name := expectIdent(ts, p, naming.Role.Callable())
     params := parseParams(ts, p)
     if p.failed == false && kindAt(ts, p.pos) == token.Kind.Colon() {
-        fail(ts, p, "a law has no return type: it answers with nothing, and what it claims is the `assert`s in its body")
+        fail(ts, p, messages.lawHasReturnType())
     }
     if p.failed == false && kindAt(ts, p.pos) == token.Kind.KwFor() {
         return parseTableLaw(ts, p, name, params, line)
@@ -882,7 +881,7 @@ proc parseTableLaw(ts: token.Token[], p: mut Parse, name: Str, params: ast.Param
         }
     }
     if sawTable == false {
-        fail(ts, p, "a law about a table is written `law {name}(...) for table <name> \{ ... }`")
+        fail(ts, p, messages.tableLawShape(name))
         return ast.Decl.TableLawDecl(name, params, table, filter, line)
     }
     if kindAt(ts, p.pos) is token.Kind.Ident(first) {
@@ -894,16 +893,16 @@ proc parseTableLaw(ts: token.Token[], p: mut Parse, name: Str, params: ast.Param
                 table = table + "." + more
                 advance(p)
             } else {
-                expected(ts, p, "the rest of the table's name after `.`")
+                expected(ts, p, messages.wantedTableNameRest())
                 return ast.Decl.TableLawDecl(name, params, table, filter, line)
             }
         }
     } else {
-        expected(ts, p, "the name of the table after `for table`")
+        expected(ts, p, messages.wantedTableName())
         return ast.Decl.TableLawDecl(name, params, table, filter, line)
     }
     if len(params) != 1 && p.quiet == false {
-        append(p.errors, diag.on(line, "a law about a table is about the one value a query is run for, so it takes exactly one parameter: `law {name}(session: Session) for table {table} \{ ... }`"))
+        append(p.errors, diag.on(line, messages.tableLawOneParam(name, table)))
         p.failed = true
     }
     if kindAt(ts, p.pos) is token.Kind.SqlBody(body) {
@@ -912,7 +911,7 @@ proc parseTableLaw(ts: token.Token[], p: mut Parse, name: Str, params: ast.Param
         filter = lawFilter(body, p)
         p.within = token.nowhere()
     } else if p.failed == false {
-        expected(ts, p, "a `\{ ... }` filter after the table's name")
+        expected(ts, p, messages.wantedTableLawFilter())
     }
     return ast.Decl.TableLawDecl(name, params, table, filter, line)
 }
@@ -946,7 +945,7 @@ proc parseTypeLaw(ts: token.Token[], p: mut Parse, typeName: Str): ast.Decl {
         }
         if ok == false {
             if p.quiet == false {
-                append(p.errors, diag.on(at, "a law inside `{typeName}` is about one value of it, so it takes exactly one parameter, of type `{typeName}`: `law {name}(value: {typeName}) \{ ... }`"))
+                append(p.errors, diag.on(at, messages.typeLawOneParam(typeName, name)))
             }
             p.failed = true
             return d
@@ -970,7 +969,7 @@ proc parseQueryDecl(ts: token.Token[], p: mut Parse): ast.Decl {
         sql = parseSqlBody(body, p)
         p.within = token.nowhere()
     } else if p.failed == false {
-        expected(ts, p, "a `\{ ... }` SQL body after the query's return type")
+        expected(ts, p, messages.wantedQueryBody())
     }
     return ast.Decl.QueryDecl(name, params, result, sql, line)
 }
@@ -987,10 +986,10 @@ proc parseTestDecl(ts: token.Token[], p: mut Parse): ast.Decl {
         advance(p)
         title = t
     } else if k is token.Kind.StrParts(_) {
-        fail(ts, p, "a test's name is prose, not a value: it is written once and read by whoever runs the suite, so there is nothing in scope for an interpolation to reach")
+        fail(ts, p, messages.testNameInterpolated())
         return ast.Decl.TestDecl("", ast.Block([]), line)
     } else {
-        expected(ts, p, "a name in quotes after `test`")
+        expected(ts, p, messages.wantedTestName())
         return ast.Decl.TestDecl("", ast.Block([]), line)
     }
     return ast.Decl.TestDecl(title, parseBlock(ts, p), line)
@@ -1021,7 +1020,7 @@ proc parseParams(ts: token.Token[], p: mut Parse): ast.Param[dyn] {
         if kindAt(ts, p.pos) == token.Kind.Comma() {
             advance(p)
         } else if kindAt(ts, p.pos) != token.Kind.RParen() && p.failed == false {
-            expected(ts, p, "`,` or `)` in a parameter list")
+            expected(ts, p, messages.wantedParamListSeparator())
             return params
         }
     }
@@ -1067,7 +1066,7 @@ proc parseFnType(ts: token.Token[], p: mut Parse, pure: Bool): ast.TypeExpr {
         }
         mutable := kindAt(ts, p.pos) == token.Kind.KwMut()
         if mutable && pure {
-            fail(ts, p, "a `func` type cannot take a `mut` parameter: what a `func` promises is that it cannot write to storage its caller can see. Write `proc(mut ...)`")
+            fail(ts, p, messages.funcTypeTakesMut())
             return ast.TypeExpr.Fn(pure, params, mutables, ast.TypeExpr.VoidType())
         }
         if mutable {
@@ -1078,7 +1077,7 @@ proc parseFnType(ts: token.Token[], p: mut Parse, pure: Bool): ast.TypeExpr {
         if kindAt(ts, p.pos) == token.Kind.Comma() {
             advance(p)
         } else if kindAt(ts, p.pos) != token.Kind.RParen() && p.failed == false {
-            expected(ts, p, "`,` or `)` in a function type")
+            expected(ts, p, messages.wantedFnTypeSeparator())
             return ast.TypeExpr.Fn(pure, params, mutables, ast.TypeExpr.VoidType())
         }
     }
@@ -1091,7 +1090,7 @@ proc parseNamedType(ts: token.Token[], p: mut Parse): ast.TypeExpr {
     mut Str[dyn] segments = []
     name := wordAt(ts, p.pos)
     if name == "" {
-        expected(ts, p, "a type")
+        expected(ts, p, messages.wantedType())
         return ast.TypeExpr.VoidType()
     }
     advance(p)
@@ -1100,7 +1099,7 @@ proc parseNamedType(ts: token.Token[], p: mut Parse): ast.TypeExpr {
         advance(p)
         next := wordAt(ts, p.pos)
         if next == "" {
-            expected(ts, p, "a name after `.` in a type")
+            expected(ts, p, messages.wantedTypeMemberName())
             return ast.TypeExpr.VoidType()
         }
         advance(p)
@@ -1143,18 +1142,17 @@ proc parseTypeArgs(ts: token.Token[], p: mut Parse): ast.TypeExpr[dyn] {
         } else if kindAt(ts, p.pos) == token.Kind.Gt() {
             advance(p)
             return args
-        } else if kindAt(ts, p.pos) == token.Kind.Shr() {
-            // `Map<Str, Result<Int, Str>>`: the inner list takes the first `>`, this
-            // one the second.
-            if p.split {
-                p.split = false
+        } else if closers(kindAt(ts, p.pos)) > 1 {
+            // `Map<Str, Result<Int, Str>>`: the inner list takes the first `>`, the
+            // next one the second, and the last to close moves past the token.
+            p.split = p.split + 1
+            if p.split == closers(kindAt(ts, p.pos)) {
+                p.split = 0
                 advance(p)
-            } else {
-                p.split = true
             }
             return args
         } else if p.failed == false {
-            expected(ts, p, "`,` or `>` in a type's arguments")
+            expected(ts, p, messages.wantedTypeArgsSeparator())
             return args
         }
     }
@@ -1178,7 +1176,7 @@ proc parseDims(ts: token.Token[], p: mut Parse): ast.Dim[dyn] {
             }
             append(dims, ast.Dim.Dynamic())
         } else if inner is token.Kind.IntLit(size) {
-            if refusesWide(ts, p, "a vector's length") {
+            if refusesWide(ts, p, messages.wideWhereVectorLength()) {
                 return dims
             }
             advance(p)
@@ -1187,7 +1185,7 @@ proc parseDims(ts: token.Token[], p: mut Parse): ast.Dim[dyn] {
             }
             append(dims, ast.Dim.Fixed(size))
         } else {
-            expected(ts, p, "`]`, `dyn` or a length in a vector type")
+            expected(ts, p, messages.wantedVectorDim())
             return dims
         }
     }
@@ -1219,7 +1217,7 @@ proc parseRest(ts: token.Token[], p: mut Parse): ast.Block {
         }
         if p.pos == before {
             append(stmts, s)
-            expected(ts, p, "a statement")
+            expected(ts, p, messages.wantedStatement())
             return ast.Block(stmts)
         }
         if s is ast.Stmt.SwitchStmt(lets, subjects, arms, binds, line) && binds {
@@ -1229,7 +1227,7 @@ proc parseRest(ts: token.Token[], p: mut Parse): ast.Block {
         append(stmts, s)
     }
     if p.failed == false {
-        expected(ts, p, "`}` to close this block")
+        expected(ts, p, messages.wantedCloseBlock())
     }
     return ast.Block(stmts)
 }
@@ -1238,7 +1236,7 @@ proc parseRest(ts: token.Token[], p: mut Parse): ast.Block {
 func fieldHint(taken: ast.Expr): Str {
     if taken is ast.Expr.IsMatch(_, pattern, _) {
         if pattern is ast.Pattern.Constructor(path, _, parenthesised) && parenthesised == false {
-            return ". To assign to `" + join(path, ".") + "`, write `=`"
+            return messages.fieldAssignHint(join(path, "."))
         }
     }
     return ""
@@ -1309,7 +1307,6 @@ proc bindsAPattern(ts: token.Token[], p: mut Parse): Bool {
     start := p.pos
     parts := p.parts
     tests := p.tests
-    inBits := p.inBits
     wasSplit := p.split
     p.quiet = true
     _ := parseMatch(ts, p, ast.absent())
@@ -1319,7 +1316,6 @@ proc bindsAPattern(ts: token.Token[], p: mut Parse): Bool {
     p.pos = start
     p.parts = parts
     p.tests = tests
-    p.inBits = inBits
     p.split = wasSplit
     return found
 }
@@ -1336,7 +1332,7 @@ proc parseBinding(ts: token.Token[], p: mut Parse): ast.Stmt {
         return ast.nothing()
     }
     if kindAt(ts, p.pos) != token.Kind.KwElse() {
-        fail(ts, p, "a pattern on the left of `:=` binds only the values it takes, so it needs an `else` with an arm for every other one: `Result.Ok(v) := f() else \{ Result.Error(why) \{ return ... } }`" + fieldHint(taken))
+        fail(ts, p, messages.patternBindingNeedsElse(fieldHint(taken)))
         return ast.nothing()
     }
     advance(p)
@@ -1348,20 +1344,20 @@ proc parseBinding(ts: token.Token[], p: mut Parse): ast.Stmt {
         skipSemicolons(ts, p)
         if kindAt(ts, p.pos) == token.Kind.RBrace() {
             if len(arms) == 1 {
-                fail(ts, p, "this `else` has no arms, and it needs one for every value the pattern does not take — an arm of `_` takes anything")
+                fail(ts, p, messages.bindingElseHasNoArms())
                 return ast.nothing()
             }
             advance(p)
             return switchOf([subject], [hidden], arms, at, true)
         }
-        condition := parseArm(ts, p, [hidden], "the `else`")
+        condition := parseArm(ts, p, [hidden], messages.armTesterElse())
         if p.failed {
             return ast.nothing()
         }
         append(arms, ast.Branch(condition, parseBlock(ts, p)))
     }
     if p.failed == false {
-        expected(ts, p, "`}` to close this `else`")
+        expected(ts, p, messages.wantedCloseElse())
     }
     return ast.nothing()
 }
@@ -1401,7 +1397,7 @@ proc parseMut(ts: token.Token[], p: mut Parse): ast.Stmt {
     }
     name := wordAt(ts, p.pos)
     if name == "" || kindAt(ts, p.pos + 1) != token.Kind.Assign() {
-        fail(ts, p, "expected `name := value` or `Type name = value` after `mut`")
+        fail(ts, p, messages.mutExpectsDeclaration())
         return ast.nothing()
     }
     bound := expectIdent(ts, p, naming.Role.MutVariable())
@@ -1419,7 +1415,7 @@ proc refuseMutAsync(ts: token.Token[], p: mut Parse): Bool {
     if kindAt(ts, p.pos) != token.Kind.KwAsync() {
         return false
     }
-    fail(ts, p, "`mut` and `async` cannot be combined: `x := async f()` names work that is still running, and the wait for it happens wherever the name is read — there is no storage of its own to assign to afterwards. Drop the `mut`, or wait for the call (`mut x := f()`) and reassign that.")
+    fail(ts, p, messages.mutAsyncCombined())
     return true
 }
 
@@ -1428,7 +1424,7 @@ proc refuseMutAsync(ts: token.Token[], p: mut Parse): Bool {
 // with a value and the next with a timeout.
 proc refuseDeferredTimeout(ts: token.Token[], p: mut Parse): void {
     if kindAt(ts, p.pos) == token.Kind.KwWith() && wordAt(ts, p.pos + 1) == "timeout" {
-        fail(ts, p, "`with timeout` cannot bound an `async` binding: the wait happens wherever the name is read, so there is no one moment for the bound to run from — two reads would get two different answers. Bound the wait itself instead: `r := f(x) with timeout 500`.")
+        fail(ts, p, messages.asyncBindingTimeout())
     }
 }
 
@@ -1444,7 +1440,7 @@ proc parseAsyncCall(ts: token.Token[], p: mut Parse): ast.Expr {
     if operand is ast.Expr.Call(_, _, _) {
         return operand
     }
-    fail(ts, p, "`async` takes a call — `async slowThing(x)` runs it on its own virtual thread and does not wait for it. There is nothing else to fire off: every other expression is already finished by the time it is written.")
+    fail(ts, p, messages.asyncTakesCall())
     return ast.absent()
 }
 
@@ -1462,7 +1458,7 @@ proc parseTypedOrExpr(ts: token.Token[], p: mut Parse): ast.Stmt {
         && kindAt(ts, p.pos + 1) == token.Kind.Assign()
     p.quiet = false
     p.failed = false
-    p.split = false
+    p.split = 0
 
     if committed {
         name := expectIdent(ts, p, naming.Role.Variable())
@@ -1591,7 +1587,7 @@ proc parseFor(ts: token.Token[], p: mut Parse): ast.Stmt {
     mut ast.Stmt post = ast.nothing()
     if kindAt(ts, p.pos) != token.Kind.LBrace() {
         post = parseStmt(ts, p)
-        refuseClauseAsync(ts, p, post, "post")
+        refuseClauseAsync(ts, p, post, messages.loopClausePost())
     }
     return ast.Stmt.ForLoop(init, cond, post, parseBlock(ts, p), at)
 }
@@ -1609,16 +1605,16 @@ proc asCounter(ts: token.Token[], p: mut Parse, s: ast.Stmt): ast.Stmt {
         checkCounterName(ts, p, name)
         return ast.Stmt.TypedDecl(declared, name, value, true, deferred, s.at)
     }
-    refuseClauseAsync(ts, p, s, "init")
+    refuseClauseAsync(ts, p, s, messages.loopClauseInit())
     return s
 }
 
 proc refuseClauseAsync(ts: token.Token[], p: mut Parse, s: ast.Stmt, clause: Str): void {
     if s is ast.Stmt.AsyncStmt(_, _) {
-        fail(ts, p, "a loop's {clause} clause cannot be an `async` statement: it is there to set up and advance the condition, and work running on another thread has nothing to advance it with")
+        fail(ts, p, messages.loopClauseAsync(clause))
     }
     if s is ast.Stmt.SwitchStmt(_, _, _, binds, _) && binds {
-        fail(ts, p, "a loop's {clause} clause cannot bind with a pattern: what a pattern binds is for the rest of its block, and a clause has none. Bind it at the top of the loop's body")
+        fail(ts, p, messages.loopClausePattern(clause))
     }
 }
 
@@ -1630,7 +1626,7 @@ proc checkCounterName(ts: token.Token[], p: mut Parse, name: Str): void {
 
 proc refuseCounterAsync(ts: token.Token[], p: mut Parse, deferred: Bool): void {
     if deferred {
-        fail(ts, p, "an `async` binding cannot be a loop's init clause: the counter that clause sets up is advanced by the loop itself, and work running on another thread is not. Start it before the loop and read the name inside.")
+        fail(ts, p, messages.loopInitAsyncBinding())
     }
 }
 
@@ -1657,7 +1653,7 @@ proc parseSwitch(ts: token.Token[], p: mut Parse): ast.Stmt {
     mut Str[dyn] hidden = []
     for ; p.failed == false; {
         if wordAt(ts, p.pos) == "_" {
-            fail(ts, p, "a `switch` tests a value, and `_` is none: it is what an arm writes to take any value")
+            fail(ts, p, messages.switchOnUnderscore())
             return ast.nothing()
         }
         append(written, parseExpr(ts, p))
@@ -1677,14 +1673,14 @@ proc parseSwitch(ts: token.Token[], p: mut Parse): ast.Stmt {
             advance(p)
             return switchOf(written, hidden, arms, line, false)
         }
-        condition := parseArm(ts, p, hidden, "the `switch`")
+        condition := parseArm(ts, p, hidden, messages.armTesterSwitch())
         if p.failed {
             return ast.nothing()
         }
         append(arms, ast.Branch(condition, parseBlock(ts, p)))
     }
     if p.failed == false {
-        expected(ts, p, "`}` to close this `switch`")
+        expected(ts, p, messages.wantedCloseSwitch())
     }
     return ast.nothing()
 }
@@ -1696,7 +1692,7 @@ proc parseArm(ts: token.Token[], p: mut Parse, hidden: Str[], tester: Str): ast.
     for each name in hidden {
         if first == false {
             if kindAt(ts, p.pos) != token.Kind.Comma() {
-                fail(ts, p, "this arm is short of patterns: {tester} tests " + valueCount(len(hidden)) + ", and an arm has one for each — `_` takes any value")
+                fail(ts, p, messages.armShortOfPatterns(tester, valueCount(len(hidden))))
                 return ast.absent()
             }
             advance(p)
@@ -1711,7 +1707,7 @@ proc parseArm(ts: token.Token[], p: mut Parse, hidden: Str[], tester: Str): ast.
         }
     }
     if kindAt(ts, p.pos) == token.Kind.Comma() {
-        fail(ts, p, "this arm has too many patterns: {tester} tests " + valueCount(len(hidden)) + ", and an arm has one for each")
+        fail(ts, p, messages.armTooManyPatterns(tester, valueCount(len(hidden))))
         return ast.absent()
     }
     mut ast.Expr out = ast.Expr.BoolLit(true, at)
@@ -1726,16 +1722,16 @@ proc parseArm(ts: token.Token[], p: mut Parse, hidden: Str[], tester: Str): ast.
     }
     twice := boundTwice(ast.bindingsIn(out))
     if twice != "" {
-        fail(ts, p, "this arm binds `{twice}` twice, and the two would take parts of different values. Give them different names")
+        fail(ts, p, messages.armBindsTwice(twice))
     }
     return out
 }
 
 func valueCount(n: Int): Str {
     if n == 1 {
-        return "one value"
+        return messages.armOneValue()
     }
-    return "{n} values"
+    return messages.armNValues(n)
 }
 
 proc parsePosition(ts: token.Token[], p: mut Parse, subject: ast.Expr): ast.Expr {
@@ -1750,7 +1746,7 @@ proc parsePosition(ts: token.Token[], p: mut Parse, subject: ast.Expr): ast.Expr
     if startsLiteral(ts, p.pos) {
         return ast.Expr.Binary(ast.BinOp.Eq(), subject, parseLiteral(ts, p), at)
     }
-    expected(ts, p, "a pattern, a literal or `_`")
+    expected(ts, p, messages.wantedArmPosition())
     return ast.absent()
 }
 
@@ -1933,7 +1929,7 @@ proc parseBitwise(ts: token.Token[], p: mut Parse): ast.Expr {
     mut ast.Expr left = parseAdditive(ts, p)
     mut first := ""
     for ; p.failed == false; {
-        op := bitwiseAt(ts, p.pos, p.inBits)
+        op := bitwiseAt(ts, p.pos)
         if op is Result.Ok(found) {
             spelled := ast.opSpelling(found)
             if first == "" {
@@ -1942,7 +1938,7 @@ proc parseBitwise(ts: token.Token[], p: mut Parse): ast.Expr {
                     return left
                 }
             } else if spelled != first {
-                fail(ts, p, "`{first}` and `{spelled}` sit side by side with nothing to say which goes first. Bitwise operators have no order among themselves, so write the parentheses: `(a {first} b) {spelled} c` or `a {first} (b {spelled} c)`")
+                fail(ts, p, messages.bitwiseOperatorsMixed(first, spelled))
                 return left
             }
             at := place(ts, p)
@@ -1960,14 +1956,22 @@ proc parseBitwise(ts: token.Token[], p: mut Parse): ast.Expr {
     return left
 }
 
-func bitwiseAt(ts: token.Token[], at: Int, inBits: Bool): Result<ast.BinOp, Bool> {
+func bitwiseAt(ts: token.Token[], at: Int): Result<ast.BinOp, Bool> {
     k := kindAt(ts, at)
     if k == token.Kind.Amp() { return Result.Ok(ast.BinOp.BitAnd()) }
     if k == token.Kind.Pipe() { return Result.Ok(ast.BinOp.BitOr()) }
     if k == token.Kind.Caret() { return Result.Ok(ast.BinOp.BitXor()) }
     if k == token.Kind.Shl() { return Result.Ok(ast.BinOp.Shl()) }
-    if k == token.Kind.Shr() && inBits == false { return Result.Ok(ast.BinOp.Shr()) }
+    if k == token.Kind.Shr() { return Result.Ok(ast.BinOp.Shr()) }
     return Result.Error(false)
+}
+
+// How many lists of type arguments a token can close.
+func closers(k: token.Kind): Int {
+    if k == token.Kind.Gt() { return 1 }
+    if k == token.Kind.Shr() { return 2 }
+    if k == token.Kind.BitsClose() { return 3 }
+    return 0
 }
 
 // An operand of a bitwise operator holding arithmetic outside any parentheses.
@@ -1976,7 +1980,7 @@ proc refusesMixing(ts: token.Token[], p: mut Parse, from: Int, to: Int, spelled:
     if arithmetic == "" {
         return false
     }
-    failAt(ts, p, from, "`{spelled}` and `{arithmetic}` sit side by side with nothing to say which goes first. A bitwise operator has no order against arithmetic, so write the parentheses: `(a {arithmetic} b) {spelled} c` or `a {arithmetic} (b {spelled} c)`")
+    failAt(ts, p, from, messages.bitwiseBesideArithmetic(spelled, arithmetic))
     return true
 }
 
@@ -2078,7 +2082,7 @@ proc pipedInto(ts: token.Token[], p: mut Parse, value: ast.Expr, stage: ast.Expr
         return ast.Expr.Call(stage, [ast.Arg("", value)], stage.at)
     }
     if p.failed == false {
-        failAt(ts, p, at, "`|>` pipes the value on its left in as the first argument of a call, so what stands on the right has to be one: a callable's name (`x |> f`), a call with the rest of its arguments written out (`x |> f(a)`), or a constructor (`x |> Shout.Loud`). Anything computed goes in parentheses on the left instead — `(a + b) |> f`")
+        failAt(ts, p, at, messages.pipeNeedsCall())
     }
     return stage
 }
@@ -2130,7 +2134,7 @@ func holdsMatch(e: ast.Expr): Bool {
 }
 
 func negatedMatch(): Str {
-    return "a match cannot be negated: `is` narrows the value it matched and binds parts of it, and a `!` in front of that would leave those bindings with nothing to mean. Put the other case in the `else`, or match the variant you actually want"
+    return messages.matchNegated()
 }
 
 // `**` is right-associative: `2 ** 3 ** 2` is `2 ** (3 ** 2)`. Its exponent is
@@ -2154,7 +2158,7 @@ proc parseWith(ts: token.Token[], p: mut Parse): ast.Expr {
         return value
     }
     if wordAt(ts, p.pos + 1) != "timeout" {
-        expected(ts, p, "`timeout` after `with`")
+        expected(ts, p, messages.wantedTimeoutAfterWith())
         return value
     }
     advance(p)
@@ -2174,17 +2178,17 @@ proc timed(ts: token.Token[], p: mut Parse, value: ast.Expr, ms: ast.Expr): ast.
         if existing is ast.Expr.Absent {
             return ast.Expr.AwaitAll(calls, ms, value.at)
         }
-        fail(ts, p, "this `await` already has a `with timeout` clause")
+        fail(ts, p, messages.awaitTimeoutTwice())
         return value
     }
     if value is ast.Expr.Call(_, _, _) {
         return ast.Expr.Timed(value, ms, value.at)
     }
     if value is ast.Expr.Timed(_, _, _) {
-        fail(ts, p, "this call already has a `with timeout` clause")
+        fail(ts, p, messages.callTimeoutTwice())
         return value
     }
-    fail(ts, p, "`with timeout <ms>` bounds how long a wait may take, so it belongs on something that waits: a call (`f(x) with timeout 500`) or an await-all (`await [f(a), f(b)] with timeout 500`)")
+    fail(ts, p, messages.timeoutNeedsWait())
     return value
 }
 
@@ -2198,19 +2202,15 @@ proc parsePostfix(ts: token.Token[], p: mut Parse): ast.Expr {
         }
         if k == token.Kind.LParen() {
             advance(p)
-            was := enclose(p)
             subject = ast.Expr.Call(subject, parseArgs(ts, p), subject.at)
-            p.inBits = was
         } else if k == token.Kind.LBracket() {
             advance(p)
-            was := enclose(p)
             subject = parseIndexOrSlice(ts, p, subject)
-            p.inBits = was
         } else if k == token.Kind.Dot() {
             advance(p)
             field := wordAt(ts, p.pos)
             if field == "" {
-                expected(ts, p, "a name after `.`")
+                expected(ts, p, messages.wantedMemberName())
                 return subject
             }
             at := place(ts, p)
@@ -2237,7 +2237,7 @@ proc parseArgs(ts: token.Token[], p: mut Parse): ast.Arg[dyn] {
             advance(p)
             return args
         } else if p.failed == false {
-            expected(ts, p, "`,` or `)` in an argument list")
+            expected(ts, p, messages.wantedArgListSeparator())
             return args
         }
     }
@@ -2318,18 +2318,13 @@ proc parsePrimary(ts: token.Token[], p: mut Parse): ast.Expr {
     else if k == token.Kind.KwFalse() { advance(p) return ast.Expr.BoolLit(false, began) }
     else if k == token.Kind.LBracket() {
         advance(p)
-        was := enclose(p)
-        items := parseVectorLit(ts, p)
-        p.inBits = was
-        return items
+        return parseVectorLit(ts, p)
     }
     else if k == token.Kind.KwAwait() { return parseAwaitAll(ts, p) }
-    else if k == token.Kind.Shl() { return parseBitsLit(ts, p) }
+    else if k == token.Kind.BitsOpen() { return parseBitsLit(ts, p) }
     else if k == token.Kind.LParen() {
         advance(p)
-        was := enclose(p)
         inner := parseExpr(ts, p)
-        p.inBits = was
         expect(ts, p, token.Kind.RParen())
         return inner
     }
@@ -2337,19 +2332,12 @@ proc parsePrimary(ts: token.Token[], p: mut Parse): ast.Expr {
     // be asked as a statement of its own or on the value side of a declaration.
     // Anywhere else the value is wanted right there.
     else if k == token.Kind.KwAsync() {
-        fail(ts, p, "`async` has no value of its own: it says how a call runs, not what it evaluates to, so it cannot sit inside a larger expression. Give it a name and read the name here — `x := async f(a)` starts the call now and waits at the first place `x` is read — or drop the `async` to wait for the result on the spot.")
+        fail(ts, p, messages.asyncInExpression())
         return ast.absent()
     }
 
-    fail(ts, p, "unexpected " + token.describe(k) + " in an expression")
+    fail(ts, p, messages.unexpectedInExpression(token.describe(k)))
     return ast.absent()
-}
-
-// A bracket inside `<<...>>` makes a `>>` a shift again until it closes.
-proc enclose(p: mut Parse): Bool {
-    was := p.inBits
-    p.inBits = false
-    return was
 }
 
 // A literal of 2^63 or more, which the lexer hands over as the negative `Int` its
@@ -2363,18 +2351,14 @@ func wideLiteral(v: Int, at: token.Pos): ast.Expr {
     return ast.Expr.Call(ast.Expr.Member(ast.Expr.Ident("hive", at), "UInt64", at), [ast.Arg("", bits)], at)
 }
 
-// `<<version, length: UInt16, payload>>`. A `>>` closes it, so a shift inside one
-// goes in parentheses.
+// `<<<version, length: UInt16, payload>>>`.
 proc parseBitsLit(ts: token.Token[], p: mut Parse): ast.Expr {
     at := place(ts, p)
     advance(p)
-    was := p.inBits
-    p.inBits = true
     mut ast.BitPart[dyn] parts = []
     for ; p.failed == false && atEnd(ts, p) == false; {
-        if kindAt(ts, p.pos) == token.Kind.Shr() {
+        if kindAt(ts, p.pos) == token.Kind.BitsClose() {
             advance(p)
-            p.inBits = was
             return ast.Expr.Bits(parts, at)
         }
         value := parseExpr(ts, p)
@@ -2386,11 +2370,10 @@ proc parseBitsLit(ts: token.Token[], p: mut Parse): ast.Expr {
         append(parts, ast.BitPart(value, declared, littleAt(ts, p)))
         if kindAt(ts, p.pos) == token.Kind.Comma() {
             advance(p)
-        } else if kindAt(ts, p.pos) != token.Kind.Shr() && p.failed == false {
-            expected(ts, p, "`,` or `>>` in `<<...>>`")
+        } else if kindAt(ts, p.pos) != token.Kind.BitsClose() && p.failed == false {
+            expected(ts, p, messages.wantedBitsSeparator())
         }
     }
-    p.inBits = was
     return ast.Expr.Bits(parts, at)
 }
 
@@ -2418,7 +2401,7 @@ proc parseVectorLit(ts: token.Token[], p: mut Parse): ast.Expr {
             advance(p)
             return ast.Expr.VectorLit(items, at)
         } else if p.failed == false {
-            expected(ts, p, "`,` or `]` in a vector literal")
+            expected(ts, p, messages.wantedVectorLitSeparator())
             return ast.Expr.VectorLit(items, at)
         }
     }
@@ -2432,7 +2415,7 @@ proc parseAwaitAll(ts: token.Token[], p: mut Parse): ast.Expr {
     advance(p)
     mut ast.Expr[dyn] calls = []
     if kindAt(ts, p.pos) != token.Kind.LBracket() {
-        fail(ts, p, "`await` takes a list of calls to run all at once — `await [f(a), f(b)]` — but found " + token.describe(kindAt(ts, p.pos)) + ". One call on its own needs no `await`: calling it already blocks until it answers.")
+        fail(ts, p, messages.awaitNeedsList(token.describe(kindAt(ts, p.pos))))
         return ast.absent()
     }
     advance(p)
@@ -2440,7 +2423,7 @@ proc parseAwaitAll(ts: token.Token[], p: mut Parse): ast.Expr {
         if kindAt(ts, p.pos) == token.Kind.RBracket() {
             advance(p)
             if len(calls) == 0 {
-                fail(ts, p, "`await []` waits for nothing at all. List the calls to run together: `await [f(a), f(b)]`.")
+                fail(ts, p, messages.awaitEmpty())
             }
             return ast.Expr.AwaitAll(calls, ast.absent(), where)
         }
@@ -2451,13 +2434,13 @@ proc parseAwaitAll(ts: token.Token[], p: mut Parse): ast.Expr {
         if item is ast.Expr.Call(_, _, _) {
             append(calls, item)
         } else {
-            fail(ts, p, "`await` runs each of its calls on its own virtual thread, so every entry has to be a call — this one is not. A value that is already in hand has nothing to wait for.")
+            fail(ts, p, messages.awaitEntryNotCall())
             return ast.absent()
         }
         if kindAt(ts, p.pos) == token.Kind.Comma() {
             advance(p)
         } else if kindAt(ts, p.pos) != token.Kind.RBracket() && p.failed == false {
-            expected(ts, p, "`,` or `]` in an `await` list")
+            expected(ts, p, messages.wantedAwaitListSeparator())
             return ast.absent()
         }
     }
@@ -2478,7 +2461,7 @@ proc parseInterp(ts: token.Token[], p: mut Parse, parts: token.StrPart[]): ast.E
         } else if part is token.StrPart.Hole(name, _) {
             // `\{name is (regex)}` asks a question, and a string being built has
             // nobody to answer it.
-            fail(ts, p, "`\{{name} is (...)}` is a pattern's hole, not something a string can hold: it says what the text there has to look like, which only means anything on the right of an `is`. To put a `\{` in a string, write `\\\{`")
+            fail(ts, p, messages.holeInBuiltString(name))
         }
     }
     return ast.Expr.Interp(out, at)
@@ -2489,14 +2472,14 @@ proc parseInterp(ts: token.Token[], p: mut Parse, parts: token.StrPart[]): ast.E
 proc parseSubExpr(ts: token.Token[], p: mut Parse, source: Str, line: token.Pos, base: token.Pos): ast.Expr {
     lexed := lexer.lex(source)
     if len(lexed.errors) > 0 {
-        reportSub(ts, p, line, source, "does not lex")
+        reportSub(ts, p, line, source, messages.interpDoesNotLex())
         return ast.absent()
     }
-    mut Parse inner = Parse(0, false, false, [], p.parts, [], false, false, p.file, line, base, [])
+    mut Parse inner = Parse(0, false, false, [], p.parts, [], 0, p.file, line, base, [])
     value := parseExpr(lexed.tokens, inner)
     p.parts = inner.parts
     if inner.failed || kindAt(lexed.tokens, inner.pos) != token.Kind.Eof() {
-        reportSub(ts, p, line, source, "is not one expression")
+        reportSub(ts, p, line, source, messages.interpNotOneExpression())
         return ast.absent()
     }
     return value
@@ -2504,7 +2487,7 @@ proc parseSubExpr(ts: token.Token[], p: mut Parse, source: Str, line: token.Pos,
 
 proc reportSub(ts: token.Token[], p: mut Parse, line: token.Pos, source: Str, why: Str): void {
     if p.quiet == false && p.failed == false {
-        append(p.errors, diag.on(line, "the interpolated expression `{source}` {why}"))
+        append(p.errors, diag.on(line, messages.interpolationProblem(source, why)))
     }
     p.failed = true
 }
@@ -2560,7 +2543,7 @@ proc freshPart(p: mut Parse): Str {
 
 func opensPattern(ts: token.Token[], i: Int): Bool {
     k := kindAt(ts, i)
-    if k is token.Kind.StrParts(_) || k == token.Kind.LBracket() || k == token.Kind.Shl() {
+    if k is token.Kind.StrParts(_) || k == token.Kind.LBracket() || k == token.Kind.BitsOpen() {
         return true
     }
     return wordAt(ts, i) != "" && kindAt(ts, i + 1) == token.Kind.Dot()
@@ -2576,7 +2559,7 @@ func startsLiteral(ts: token.Token[], i: Int): Bool {
 proc parseLiteral(ts: token.Token[], p: mut Parse): ast.Expr {
     at := place(ts, p)
     k := kindAt(ts, p.pos)
-    if refusesWide(ts, p, "a pattern") {
+    if refusesWide(ts, p, messages.wideWherePattern()) {
         return ast.absent()
     }
     advance(p)
@@ -2586,14 +2569,14 @@ proc parseLiteral(ts: token.Token[], p: mut Parse): ast.Expr {
     else if k is token.Kind.AtomLit(atom) { return ast.Expr.AtomLit(atom, at) }
     else if k == token.Kind.KwTrue() { return ast.Expr.BoolLit(true, at) }
     else if k == token.Kind.KwFalse() { return ast.Expr.BoolLit(false, at) }
-    if refusesWide(ts, p, "a pattern") {
+    if refusesWide(ts, p, messages.wideWherePattern()) {
         return ast.absent()
     }
     if kindAt(ts, p.pos) is token.Kind.IntLit(v) {
         advance(p)
         return ast.Expr.Negate(ast.Expr.IntLit(v, at), at)
     }
-    expected(ts, p, "a number after `-` in a pattern")
+    expected(ts, p, messages.wantedPatternNumberAfterMinus())
     return ast.absent()
 }
 
@@ -2602,7 +2585,7 @@ proc parseLiteral(ts: token.Token[], p: mut Parse): ast.Expr {
 proc refusesWide(ts: token.Token[], p: mut Parse, where: Str): Bool {
     if kindAt(ts, p.pos) is token.Kind.IntLit(v) {
         if v < 0 {
-            fail(ts, p, "a literal past `Int`'s largest cannot be written in {where}: it is a `UInt64`, built where it is written, and only an expression has room for that")
+            fail(ts, p, messages.wideLiteralNotAllowed(where))
             return true
         }
     }
@@ -2612,7 +2595,7 @@ proc refusesWide(ts: token.Token[], p: mut Parse, where: Str): Bool {
 proc refuseRebinding(ts: token.Token[], p: mut Parse, bound: Str[]): void {
     name := boundTwice(bound)
     if name != "" {
-        fail(ts, p, "this pattern binds `{name}` twice, and the two would take different parts of the value. Give them different names")
+        fail(ts, p, messages.patternBindsTwice(name))
     }
 }
 
@@ -2637,7 +2620,7 @@ proc parsePattern(ts: token.Token[], p: mut Parse): ast.Pattern {
         // A hole that arrived as literal text was written behind an escaped `\{`,
         // so it would match the characters rather than the shape, and never match.
         if looksLikeHole(t) {
-            fail(ts, p, "this pattern holds `\{name is (...)}` as literal text rather than as a hole, so it would match those characters and never match at all. A hole opens at a bare `\{`, and a `\\\{` asked for the brace itself")
+            fail(ts, p, messages.holeAsLiteralText())
             return ast.Pattern.StrTemplate([token.StrPart.Literal(t)])
         }
         // A hole-less template is an exact match, which is the whole of what a
@@ -2652,32 +2635,32 @@ proc parsePattern(ts: token.Token[], p: mut Parse): ast.Pattern {
         advance(p)
         return parseVectorPattern(ts, p)
     }
-    if k == token.Kind.Shl() {
+    if k == token.Kind.BitsOpen() {
         advance(p)
         return parseBitsPattern(ts, p)
     }
     return parseConstructorPattern(ts, p)
 }
 
-// `<<version: UInt4, 0x45, "PNG", body: UInt8[size], ...rest>>`.
+// `<<<version: UInt4, 0x45, "PNG", body: UInt8[size], ...rest>>>`.
 proc parseBitsPattern(ts: token.Token[], p: mut Parse): ast.Pattern {
     mut ast.BitField[dyn] fields = []
     for ; p.failed == false && atEnd(ts, p) == false; {
-        if kindAt(ts, p.pos) == token.Kind.Shr() {
+        if kindAt(ts, p.pos) == token.Kind.BitsClose() {
             advance(p)
             return ast.Pattern.BitsPat(fields, "")
         }
         if kindAt(ts, p.pos) == token.Kind.Ellipsis() {
             advance(p)
             rest := expectIdent(ts, p, naming.Role.Binding())
-            expect(ts, p, token.Kind.Shr())
+            expect(ts, p, token.Kind.BitsClose())
             return ast.Pattern.BitsPat(fields, rest)
         }
         append(fields, parseBitField(ts, p))
         if kindAt(ts, p.pos) == token.Kind.Comma() {
             advance(p)
-        } else if kindAt(ts, p.pos) != token.Kind.Shr() && p.failed == false {
-            expected(ts, p, "`,` or `>>` in a binary pattern")
+        } else if kindAt(ts, p.pos) != token.Kind.BitsClose() && p.failed == false {
+            expected(ts, p, messages.wantedBitsPatternSeparator())
         }
     }
     return ast.Pattern.BitsPat(fields, "")
@@ -2720,13 +2703,13 @@ proc stringPattern(ts: token.Token[], p: mut Parse, parts: token.StrPart[]): ast
         if part is token.StrPart.Code(source, _, _) {
             name := text.trim(source)
             if naming.fits(naming.Role.Binding(), name) == false || name == "_" {
-                fail(ts, p, "a string pattern's `\{{source}}` has to be a plain name to bind the text to — it is a hole, not an expression")
+                fail(ts, p, messages.stringPatternHoleNotName(source))
                 return ast.Pattern.StrTemplate(parts)
             }
             // Two plain holes side by side have no split point. A hole that says
             // what it matches does, so the rule is about the open ones only.
             if wasHole {
-                fail(ts, p, "two holes that take any text may not sit side by side in a string pattern: with no literal text between them there is nothing to say where one ends and the next begins. Give one of them a regex — `\{{name} is (...)}` — and it says where it ends itself")
+                fail(ts, p, messages.holesSideBySide(name))
                 return ast.Pattern.StrTemplate(parts)
             }
             if duplicateHole(named, name, ts, p) {
@@ -2737,7 +2720,7 @@ proc stringPattern(ts: token.Token[], p: mut Parse, parts: token.StrPart[]): ast
             wasHole = true
         } else if part is token.StrPart.Hole(name, pattern) {
             if naming.fits(naming.Role.Binding(), name) == false || name == "_" {
-                fail(ts, p, "`\{{name} is (...)}` binds the text it matches to `{name}`, so `{name}` has to be a plain binding name — `camelCase`")
+                fail(ts, p, messages.holeNameNotBinding(name))
                 return ast.Pattern.StrTemplate(parts)
             }
             if duplicateHole(named, name, ts, p) {
@@ -2751,7 +2734,7 @@ proc stringPattern(ts: token.Token[], p: mut Parse, parts: token.StrPart[]): ast
                 append(named, name)
                 append(out, token.StrPart.Hole(name, compiled))
             } else if regex.check(pattern) is Result.Error(why) {
-                fail(ts, p, "in the hole `\{{name} is (...)}`: " + why)
+                fail(ts, p, messages.holeRegexProblem(name, why))
                 return ast.Pattern.StrTemplate(parts)
             }
             wasHole = false
@@ -2767,7 +2750,7 @@ proc stringPattern(ts: token.Token[], p: mut Parse, parts: token.StrPart[]): ast
 // text, and the second would quietly win.
 proc duplicateHole(named: Str[], name: Str, ts: token.Token[], p: mut Parse): Bool {
     if indexOf(named, name) is Result.Ok(_) {
-        fail(ts, p, "this pattern binds `{name}` twice, and the two holes would take different text. Give them different names")
+        fail(ts, p, messages.holeBindsTwice(name))
         return true
     }
     return false
@@ -2829,7 +2812,7 @@ proc parseVectorPattern(ts: token.Token[], p: mut Parse): ast.Pattern {
         if kindAt(ts, p.pos) == token.Kind.Comma() {
             advance(p)
         } else if kindAt(ts, p.pos) != token.Kind.RBracket() && p.failed == false {
-            expected(ts, p, "`,` or `]` in a vector pattern")
+            expected(ts, p, messages.wantedVectorPatternSeparator())
             return ast.Pattern.VectorPat(elements, rest)
         }
     }
@@ -2862,7 +2845,7 @@ proc parseConstructorPattern(ts: token.Token[], p: mut Parse): ast.Pattern {
     mut Str[dyn] bindings = []
     first := wordAt(ts, p.pos)
     if first == "" {
-        expected(ts, p, "a pattern")
+        expected(ts, p, messages.wantedPattern())
         return ast.Pattern.Constructor(path, bindings, false)
     }
     advance(p)
@@ -2871,7 +2854,7 @@ proc parseConstructorPattern(ts: token.Token[], p: mut Parse): ast.Pattern {
         advance(p)
         next := wordAt(ts, p.pos)
         if next == "" {
-            expected(ts, p, "a name after `.` in a pattern")
+            expected(ts, p, messages.wantedPatternMemberName())
             return ast.Pattern.Constructor(path, bindings, false)
         }
         advance(p)
@@ -2890,7 +2873,7 @@ proc parseConstructorPattern(ts: token.Token[], p: mut Parse): ast.Pattern {
         if kindAt(ts, p.pos) == token.Kind.Comma() {
             advance(p)
         } else if kindAt(ts, p.pos) != token.Kind.RParen() && p.failed == false {
-            expected(ts, p, "`,` or `)` in a pattern's bindings")
+            expected(ts, p, messages.wantedPatternBindingsSeparator())
             return ast.Pattern.Constructor(path, bindings, true)
         }
     }
