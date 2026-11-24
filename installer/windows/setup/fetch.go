@@ -34,6 +34,13 @@ func fetchHive(version string, dir string) error {
 	if err != nil {
 		return fmt.Errorf("could not read the checksums of Hive %s: %w", tag, err)
 	}
+	signature, err := get(releases + tag + "/SHA256SUMS.sig")
+	if err != nil {
+		return fmt.Errorf("could not read the signature of Hive %s's checksums: %w", tag, err)
+	}
+	if err := verifySums(sums, signature); err != nil {
+		return fmt.Errorf("Hive %s was not installed: %w", tag, err)
+	}
 	want := digestIn(string(sums), asset)
 	if want == "" {
 		return fmt.Errorf("Hive %s has no %s", tag, asset)

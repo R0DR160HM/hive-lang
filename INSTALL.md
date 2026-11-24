@@ -66,6 +66,21 @@ it works
 release's `SHA256SUMS`. It reaches back to v0.3.3, the first release with
 `hive use`.
 
+## Checking a download
+
+From v0.5.0 on, every release's `SHA256SUMS` is signed with Hive's release key,
+and the signature is published beside it as `SHA256SUMS.sig`. `hive use` and the
+Windows installer check it before they trust a line of `SHA256SUMS`, and refuse
+a release whose signature is missing or wrong; releases before v0.5.0 were never
+signed, and `hive use` takes them on their checksums alone.
+
+GitHub also attests to every file a release carries: which workflow, at which
+commit, built it. To check one by hand:
+
+```sh
+gh attestation verify hivec-linux-amd64 --repo R0DR160HM/hive-lang
+```
+
 If `run` says `go` is not on the `PATH`, the compiler is installed and Go is not:
 [go.dev/dl](https://go.dev/dl/) has it.
 

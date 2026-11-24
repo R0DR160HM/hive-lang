@@ -76,6 +76,34 @@ func tagOf(release: Release): Str {
     return "v{release.major}.{release.minor}.{release.patch}"
 }
 
+// The first release whose SHA256SUMS is signed. One from before it is taken on
+// its checksums alone, since it never had a signature to check.
+func firstSigned(): Release {
+    return Release(0, 5, 0)
+}
+
+// Why release's SHA256SUMS cannot be trusted, or "" when its signature checks.
+proc signatureRefusal(release: Release, sums: Str): Str {
+    if older(release, firstSigned()) {
+        return ""
+    }
+    tag := tagOf(release)
+    url := releaseUrl(tag, "SHA256SUMS.sig")
+    fetched := hive.net.httpRequest(hive.net.HttpRequest("GET", url, [], ""))
+    if fetched is Result.Error(why) {
+        return "could not reach " + url + ": " + why.message
+    }
+    if fetched is Result.Ok(response) {
+        if response.status != 200 {
+            return tag + "'s SHA256SUMS has no signature (" + url + " answered {response.status}), so nothing was replaced."
+        }
+        if host.verifySums(sums, response.body) == false {
+            return tag + "'s SHA256SUMS is not signed by Hive's release key, so nothing was replaced."
+        }
+    }
+    return ""
+}
+
 func older(a: Release, b: Release): Bool {
     if a.major != b.major {
         return a.major < b.major
@@ -132,6 +160,10 @@ proc switchTo(typed: Str): Result<Str, Str> {
             }
             if response.status != 200 {
                 return Result.Error("could not read " + releaseUrl(tag, "SHA256SUMS") + ": GitHub answered {response.status}")
+            }
+            unsigned := signatureRefusal(release, response.body)
+            if unsigned != "" {
+                return Result.Error(unsigned)
             }
             want := digestIn(response.body, asset)
             if want == "" {

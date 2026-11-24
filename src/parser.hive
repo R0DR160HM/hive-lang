@@ -42,6 +42,8 @@ type Parse {
     tests: ast.Expr[dyn]
     // How many lists of type arguments the `>>` or `>>>` at the cursor has closed already.
     split: Int
+    // How many brackets the cursor is inside, where no statement can start.
+    nest: Int
     file: Str
     // The string an interpolation or a query's value is parsed out of, where its nodes are placed.
     within: token.Pos
@@ -56,7 +58,7 @@ proc parse(ts: token.Token[]): Parsed {
 }
 
 proc parseFile(ts: token.Token[], file: Str): Parsed {
-    mut Parse p = Parse(0, false, false, [], 0, [], 0, file, token.nowhere(), token.nowhere(), [])
+    mut Parse p = Parse(0, false, false, [], 0, [], 0, 0, file, token.nowhere(), token.nowhere(), [])
     mut ast.ImportLine[dyn] imports = []
     mut ast.Decl[dyn] decls = []
 
@@ -458,7 +460,7 @@ proc parseSqlExpr(source: Str, p: mut Parse): ast.Expr {
     for each e in lexed.errors {
         append(p.errors, e)
     }
-    mut Parse inner = Parse(0, false, false, [], p.parts, [], 0, p.file, p.within, token.nowhere(), [])
+    mut Parse inner = Parse(0, false, false, [], p.parts, [], 0, 0, p.file, p.within, token.nowhere(), [])
     written := parseExpr(lexed.tokens, inner)
     p.parts = inner.parts
     for each e in inner.errors {
@@ -2022,10 +2024,11 @@ proc parseAdditive(ts: token.Token[], p: mut Parse): ast.Expr {
         if k == token.Kind.Plus() {
             advance(p)
             left = ast.Expr.Binary(ast.BinOp.Add(), left, parseMultiplicative(ts, p), at)
-        } else if k == token.Kind.Minus() && startsLine(ts, p.pos) == false {
+        } else if k == token.Kind.Minus() && (startsLine(ts, p.pos) == false || p.nest > 0) {
             // A `-` that opens a line opens a new statement, the way a `(` or a
             // `[` does: it is the one operator that is also a prefix, so a line
-            // break before it decides which one it is.
+            // break before it decides which one it is. Inside brackets no
+            // statement can start, so there it carries on.
             advance(p)
             left = ast.Expr.Binary(ast.BinOp.Sub(), left, parseMultiplicative(ts, p), at)
         } else {
@@ -2205,10 +2208,14 @@ proc parsePostfix(ts: token.Token[], p: mut Parse): ast.Expr {
         }
         if k == token.Kind.LParen() {
             advance(p)
+            p.nest = p.nest + 1
             subject = ast.Expr.Call(subject, parseArgs(ts, p), subject.at)
+            p.nest = p.nest - 1
         } else if k == token.Kind.LBracket() {
             advance(p)
+            p.nest = p.nest + 1
             subject = parseIndexOrSlice(ts, p, subject)
+            p.nest = p.nest - 1
         } else if k == token.Kind.Dot() {
             advance(p)
             field := wordAt(ts, p.pos)
@@ -2321,13 +2328,18 @@ proc parsePrimary(ts: token.Token[], p: mut Parse): ast.Expr {
     else if k == token.Kind.KwFalse() { advance(p) return ast.Expr.BoolLit(false, began) }
     else if k == token.Kind.LBracket() {
         advance(p)
-        return parseVectorLit(ts, p)
+        p.nest = p.nest + 1
+        items := parseVectorLit(ts, p)
+        p.nest = p.nest - 1
+        return items
     }
     else if k == token.Kind.KwAwait() { return parseAwaitAll(ts, p) }
     else if k == token.Kind.BitsOpen() { return parseBitsLit(ts, p) }
     else if k == token.Kind.LParen() {
         advance(p)
+        p.nest = p.nest + 1
         inner := parseExpr(ts, p)
+        p.nest = p.nest - 1
         expect(ts, p, token.Kind.RParen())
         return inner
     }
@@ -2478,7 +2490,7 @@ proc parseSubExpr(ts: token.Token[], p: mut Parse, source: Str, line: token.Pos,
         reportSub(ts, p, line, source, messages.interpDoesNotLex())
         return ast.absent()
     }
-    mut Parse inner = Parse(0, false, false, [], p.parts, [], 0, p.file, line, base, [])
+    mut Parse inner = Parse(0, false, false, [], p.parts, [], 0, 0, p.file, line, base, [])
     value := parseExpr(lexed.tokens, inner)
     p.parts = inner.parts
     if inner.failed || kindAt(lexed.tokens, inner.pos) != token.Kind.Eof() {
