@@ -1,6 +1,6 @@
 # Examples
 
-Twenty-seven programs, and between them every feature the language has. Each one
+Twenty-eight programs, and between them every feature the language has. Each one
 compiles and runs on the compiler in [`../src`](../src) — that is what `./run`
 checks, and what makes these examples rather than illustrations. They are in the
 order someone learning the language would read them: the language itself first,
@@ -43,6 +43,7 @@ hive test examples/11-testing/cart.test.hive
 | 25 | [chat](25-chat) | a window, a mailbox, and two nodes talking |
 | 26 | [multiplayer-fps](26-multiplayer-fps) | a 3D scene, sixty frames a second, and a client and a server over a websocket |
 | 27 | [formula-kart](27-formula-kart) | a ten-car race on a circuit rolled from a number, with a landscape round it, a server, a map and a dial |
+| 28 | [comptime](28-comptime) | a table of countries read by `with compiler` while the program builds, and carried by it rather than the file |
 
 ## What `./run` does with them
 

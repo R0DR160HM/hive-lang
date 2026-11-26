@@ -21,6 +21,7 @@ column below; a position overloaded by type answers to each of its names, so
 | `split(str, sep)` | `split(Str, Str): Str[dyn]` | splits on `sep` (the inverse of `join`) |
 | `replaceFirst(str, from, to)` | `replaceFirst(Str, Str, Str): Str` | the first occurrence of `from`, rewritten |
 | `replaceAll(str, from, to)` | `replaceAll(Str, Str, Str): Str` | every occurrence of `from`, rewritten |
+| `trim(str)` | `trim(Str): Str` | without the white space at either end |
 | `indexOf(vector, value)` | `indexOf(T[], T): Result<Int, Bool>` | position of the first equal element |
 | `indexOf(str, sub)` | `indexOf(Str, Str): Result<Int, Bool>` | position, in characters, of the first occurrence |
 | `row(table, key)` | `row(Table, Str): Str[dyn]` | the row whose first cell equals `key`, else `[]` |
@@ -55,6 +56,12 @@ than a pattern — to rewrite by shape, match with a
 [string pattern](07-patterns.md#74-string-patterns) and build the answer from
 what its holes bound. Neither is an error when `from` is not there; the string
 comes back as it was.
+
+`trim` answers with the string less the white space at both ends, and every
+character Unicode counts as white space is taken: a space, a tab, a line end, a
+carriage return, a vertical tab, a form feed, a no-break space and the rest. The
+middle is left as it is, so `trim(" a  b\n")` is `"a  b"`. A string of nothing
+but white space trims to `""`.
 
 `toTable` fills its rows left to right and takes what is left for the last one,
 so `toTable(["1", "2", "3", "4", "5", "6", "7"], 3)` is

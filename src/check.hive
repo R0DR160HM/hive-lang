@@ -11,6 +11,7 @@
 // A message says which declaration it is in and is reported against the line of
 // what is wrong (spec 17.3). This is the last pass that may refuse a program.
 import ./ast
+import ./bake
 import ./cover
 import ./diag
 import ./infer
@@ -57,6 +58,8 @@ type Check {
     // law may call a law, and none is ever a value.
     laws: Str[dyn]
     inLaw: Bool
+    // The names the body walked binds once to a `with compiler` call, which another may be handed.
+    baked: bake.Constant[dyn]
 }
 
 type Checked {
@@ -76,12 +79,16 @@ proc checkProgram(m: ast.Module): Checked {
 
 proc checkWatching(m: ast.Module, file: Str): Checked {
     t := types.tableOf(m)
-    mut Check c = Check([], "", token.nowhere(), false, types.Ty.TVoid(), false, 0, [], [], 0, false, [], [], false, [], file, [], [], lawsOf(m), false)
+    mut Check c = Check([], "", token.nowhere(), false, types.Ty.TVoid(), false, 0, [], [], 0, false, [], [], false, [], file, [], [], lawsOf(m), false, [])
     env := infer.newEnv(t)
     checkTestTitles(c, m)
     for each d in m.decls {
         checkDecl(c, env, d)
         settleMaps(c)
+    }
+    if bake.cycleIn(m) is Result.Ok(stuck) {
+        c.inside = stuck.decl
+        reportAt(c, stuck.at, messages.bakedCycle(bake.shown(stuck.call)))
     }
     return Checked(c.errors, c.landings, c.uses, c.scopes)
 }
@@ -221,6 +228,7 @@ proc checkDecl(c: mut Check, env: infer.Env, d: ast.Decl): void {
         c.inTest = false
         c.loops = 0
         c.mutable = []
+        c.baked = bake.constants(params, body)
         checkCallable(c, env, name, params, body)
     } else if d is ast.Decl.QueryDecl(name, params, result, sql, at) {
         c.inside = name
@@ -233,6 +241,7 @@ proc checkDecl(c: mut Check, env: infer.Env, d: ast.Decl): void {
         c.inTest = false
         c.loops = 0
         c.mutable = []
+        c.baked = []
         checkQuery(c, env, params, result, sql)
     } else if d is ast.Decl.TableLawDecl(name, params, _, filter, at) {
         c.inside = name
@@ -243,6 +252,7 @@ proc checkDecl(c: mut Check, env: infer.Env, d: ast.Decl): void {
         c.inTest = false
         c.loops = 0
         c.mutable = []
+        c.baked = []
         for each p in params {
             if p.mutable {
                 report(c, messages.lawTakesMut(p.name))
@@ -258,6 +268,7 @@ proc checkDecl(c: mut Check, env: infer.Env, d: ast.Decl): void {
         c.inTest = true
         c.loops = 0
         c.mutable = []
+        c.baked = bake.constants([], body)
         c.declared = []
         c.blockStart = 0
         checkBlock(c, env, body)
@@ -1616,6 +1627,9 @@ proc checkWritten(c: mut Check, env: infer.Env, e: ast.Expr): void {
         if infer.isSendExpr(env, call) == false && infer.typeOf(env, call) is types.Ty.TVoid {
             report(c, messages.timeoutOnVoidCall())
         }
+    } else if e is ast.Expr.Baked(call, _) {
+        checkExpr(c, env, call)
+        checkBaked(c, env, call)
     } else if e is ast.Expr.Not(operand, _) {
         checkExpr(c, env, operand)
         checkNegated(c, env, operand)
@@ -2738,6 +2752,10 @@ proc checkBuiltinCall(c: mut Check, env: infer.Env, name: Str, written: ast.Arg[
             fits(c, types.Ty.TStr(), typeOfArg(c, env, args, 0), messages.splitWhat())
             fits(c, types.Ty.TStr(), typeOfArg(c, env, args, 1), messages.splitSeparatorWhat())
         }
+    } else if name == "trim" {
+        if arity(c, name, args, 1) {
+            fits(c, types.Ty.TStr(), typeOfArg(c, env, args, 0), messages.trimWhat())
+        }
     } else if name == "replaceFirst" || name == "replaceAll" {
         if arity(c, name, args, 3) {
             fits(c, types.Ty.TStr(), typeOfArg(c, env, args, 0), messages.rewritesWhat(name))
@@ -3071,6 +3089,36 @@ proc checkStatementExpr(c: mut Check, env: infer.Env, value: ast.Expr): void {
                 report(c, messages.sortStatementNotMut(root))
             }
         }
+    }
+}
+
+// --- `with compiler` ---------------------------------------------------------
+
+// The call runs while the program builds, so which function it is and everything
+// it is handed are known by then, and what it answers can be built in.
+proc checkBaked(c: mut Check, env: infer.Env, call: ast.Expr): void {
+    if call is ast.Expr.Call(callee, args, _) {
+        root := rootName(callee)
+        if root != "" && hive.map.has(env.names, root) {
+            report(c, messages.bakedCalleeVariable(root))
+        }
+        for each a in args {
+            found := bake.unsettled(a.value, c.baked)
+            if found == "*" {
+                reportAt(c, a.value.at, messages.bakedArgNotKnown())
+            } else if found != "" {
+                reportAt(c, a.value.at, messages.bakedNameNotKnown(found))
+            }
+        }
+    }
+    answer := infer.typeOf(env, call)
+    if answer is types.Ty.TVoid {
+        report(c, messages.bakedVoid())
+        return
+    }
+    held := bake.notData(env.table, answer)
+    if held != "" {
+        report(c, messages.bakedNotData(types.show(answer), held))
     }
 }
 

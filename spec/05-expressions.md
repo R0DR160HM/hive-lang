@@ -325,8 +325,11 @@ call or an await-all. It turns the result into
 `Result<T, hive.task.TimeoutError>`. See
 [09](09-concurrency.md#94-with-timeout).
 
-`timeout` is **not** a reserved word: it means something only in this two-token
-clause, so it stays usable as an ordinary variable name.
+**`with compiler`** runs a call while the program builds, and builds its answer
+into the executable in place of the call: see [5.10](#510-with-compiler).
+
+Neither `timeout` nor `compiler` is a reserved word: each means something only in
+its clause, so both stay usable as ordinary variable names.
 
 A decode target is not written here. Reading a document into a declared type is
 `T.decode(text, codec)`, the decoder that type derives named directly
@@ -342,3 +345,94 @@ side matched.
 Every expression is evaluated **exactly once** per time control reaches it. In
 particular, an operand of `assert` runs once, whether the assertion holds or not
 ([16](16-testing.md#assert-evaluates-once)).
+
+## 5.10 `with compiler`
+
+`f(x) with compiler` runs `f(x)` once, while the program builds, and the program
+reads its answer as a value built into the executable. Running the program does
+nothing else for it: no file is read again, nothing is fetched again, and nothing
+is worked out again.
+
+```hive
+proc main(): void {
+	names := countries() with compiler
+	if hive.map.get(names, "BR") is Result.Ok(name) {
+		echo name
+	}
+}
+```
+
+### Where it is written
+
+* **Only in the entrypoint**, the file handed to `hive build`. A file the
+  entrypoint imports may not write one, so whatever a build runs on the building
+  machine is named in that one file; the function called may be any module's.
+* **On a call**, as `with timeout` is, binding as tightly: `x |> f() with compiler`
+  is `f(x) with compiler`. It is an expression and stands wherever a value does.
+  It does not combine with `async`, in either of `async`'s positions, and a clause
+  on something that is not a call is a parse error.
+* **The function is named**: a callee that is a variable, or a path into one, is
+  refused, since what it holds is only known as the program runs.
+
+### What it is handed
+
+Every argument is known before the program runs. An argument is one of:
+
+* a literal: an `Int`, `Float`, `Bool` or atom, a string with nothing interpolated,
+  and any of the numbers negated;
+* a vector of arguments, or a constructor of them — a call whose last name is
+  PascalCase: a type, a variant, `Result.Ok`, a sized number such as `UInt8(3)`;
+* another `with compiler` call, written in place;
+* a name the body binds **exactly once**, without `mut` and not as an `async`
+  binding, to a `with compiler` call. Every binding counts — a parameter, a
+  declaration, a `for each`, a pattern's — in every block of the body, so a name
+  shadowed anywhere in it is refused rather than guessed at.
+
+Anything else — a name bound to a value worked out as the program runs, an
+operator, an interpolation — is a compile error at the argument.
+
+### What it answers
+
+The answer is built in, so it is **data**: `Int`, `Float`, the sized numbers,
+`Str`, `Bool`, `Atom`, vectors (packed ones included), `hive.map.Map`, `Result`,
+and declared types whose every field is one of these, the library's error unions
+among them. A call answering with nothing is refused, and so is one whose answer
+holds, at any depth:
+
+| holds | why |
+| --- | --- |
+| a function | its code is the program's, not a value to write down |
+| an `Address` | it names a service that only exists while the program runs |
+| a `Secret` | built into the executable, it is readable by anyone holding the file |
+| a codec or a query | each is a recipe for the program to follow, not a value |
+| a type the library owns (`hive.json.JsonValue`, `hive.net.HttpResponse`) | the library holds its insides |
+
+Its type is the type the call declares, whatever the value turns out to be: a
+`Str[dyn]` answer is never read as a `Str[3]`. Every read of it is the reader's
+own copy, so a `mut` binding of one changes nothing for the next read.
+
+### When it runs
+
+`hive build`, `hive run`, `hive test` and `hive export` run every `with compiler`
+call of the program on every build, after every check and before the program
+itself is compiled. `hive check`, `hive emit` and the language server never run
+one.
+
+* It runs **on the building machine**, whatever the target, and **from the
+  entrypoint's folder**, as `hive run` runs the program: a relative path reads
+  what the author sees beside the file.
+* **A call runs after every call it waits on**: one written in its arguments, or
+  bound to a name it reads, and one inside any callable its own run may reach —
+  every callable its callee and arguments name, and every callable those name, as
+  a call or as a value. Calls that wait on each other are a compile error at the
+  first. Otherwise they run in the order they are written.
+* Inside that run, a callable it reaches reads its own `with compiler` calls'
+  answers as the program will.
+* **A panic or a failed `assert`** in the call is a compile error at the call,
+  naming the call and what it panicked with. A run that ends any other way —
+  `hive.term.exit`, a crash on another thread — is a compile error at the call
+  that was running, with what the run wrote.
+* **What the call prints**, to standard output or to standard error, is shown
+  by the compiler on standard error, each line under the place the call is
+  written: `main.hive:12: read 7 countries`.
+* Nothing is kept from one build to the next.

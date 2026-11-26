@@ -1108,3 +1108,48 @@ test "a packed element lent to a `mut` parameter is copied out and written back"
     got := go(bump + "proc main(): void \{ mut UInt4[dyn] v = [1]  if v bounds 0 \{ bump(v[0]) } }")
     assert has(got, "_p1 := &v; _i2 := 0; _t3 := _p1.At(_i2); bump(&_t3); hive.PutBack(_p1, _i2, _t3)")
 }
+
+// --- `with compiler` ---------------------------------------------------------
+
+test "a `with compiler` call is read as a variable, and `bake.go` runs it" {
+    p := loader.loadText("main.hive", "func seven(): Int \{ return 7 }\nfunc twice(n: Int): Int \{ return n * 2 }\nproc main(): void \{\n    n := seven() with compiler\n    echo twice(n) with compiler\n}")
+    out := emit.emitModule(p.module)
+    assert has(out.source, "if hiveBaking \{ hiveBake(); return }")
+    assert has(out.source, "var n int = _baked_main_4_10")
+    assert has(out.source, "hive.Echo(_baked_main_5_10)")
+    assert has(out.bakeSource, "//go:build hivebake")
+    assert has(out.bakeSource, "_baked_main_4_10 = seven()")
+    assert has(out.bakeSource, "_baked_main_5_10 = twice(_baked_main_4_10)")
+    assert len(out.bakes) == 2
+}
+
+test "a program running nothing while it builds has no `bake.go` and no hook" {
+    p := loader.loadText("main.hive", "proc main(): void \{ echo 1 }")
+    out := emit.emitModule(p.module)
+    assert out.bakeSource == ""
+    assert has(out.source, "hiveBaking") == false
+}
+
+test "a declared type a call answers with is written down by a printer of its own" {
+    p := loader.loadText("main.hive", "type Shape \{\n    Circle \{ radius: Float }\n    Point\n}\nfunc shapes(): Shape[dyn] \{ return [Shape.Circle(1.0), Shape.Point()] }\nproc main(): void \{ echo shapes() with compiler }")
+    out := emit.emitModule(p.module)
+    assert has(out.bakeSource, "func bake_Shape(b *hive.Baker, v Shape) \{")
+    assert has(out.bakeSource, "case ShapeCircle:")
+    assert has(out.bakeSource, "hive.BakeVec(b, \"[]Shape\", v, bake_Shape)")
+}
+
+test "a call reaching a function with a `with compiler` call of its own runs after it" {
+    p := loader.loadText("main.hive", "proc main(): void \{\n    echo stamped() with compiler\n}\nfunc stamped(): Str \{ return \"v\" + version() }\nfunc version(): Str \{\n    return raw() with compiler\n}\nfunc raw(): Str \{ return \"1\" }")
+    out := emit.emitModule(p.module)
+    first := indexOf(split(out.bakeSource, "\n"), "\t\t_baked_version_6_12 = raw()")
+    second := indexOf(split(out.bakeSource, "\n"), "\t\t_baked_main_2_10 = stamped()")
+    assert first is Result.Ok(_)
+    assert second is Result.Ok(_)
+    if first is Result.Ok(early) && second is Result.Ok(late) {
+        assert early < late
+    }
+}
+
+test "trim is the runtime's" {
+    assert has(stmt("echo trim(\" a \")"), "hive.Trim(\" a \")")
+}

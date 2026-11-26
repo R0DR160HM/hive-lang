@@ -69,10 +69,11 @@ type Stmt {
 A field cannot be called `type` or `query`, since those are the keywords
 themselves.
 
-Three words are keywords **only where they are written**, and are ordinary
+Four words are keywords **only where they are written**, and are ordinary
 identifiers everywhere else: `as` (after an import path), `timeout` (in
-`with timeout`) and `table` (in a law's `for table`). Because they are not
-reserved, a variable may be called `timeout` or `table`.
+`with timeout`), `compiler` (in `with compiler`) and `table` (in a law's
+`for table`). Because they are not reserved, a variable may be called `timeout`,
+`compiler` or `table`.
 
 ### Operators and punctuation
 
