@@ -200,35 +200,42 @@ func displayOf(sources: loader.Source[], flat: Str): Str {
 // is never reached; what is reached may hide a little that is not.
 
 proc refsOf(d: ast.Decl, r: mut Refs): void {
-    if d is ast.Decl.TypeDecl(_, shared, variants, _) {
-        fields(shared, r)
-        for each v in variants {
-            fields(v.fields, r)
+    switch d {
+        ast.Decl.TypeDecl(_, shared, variants, _) {
+            fields(shared, r)
+            for each v in variants {
+                fields(v.fields, r)
+            }
         }
-    } else if d is ast.Decl.CallableDecl(_, _, params, result, body, _) {
-        for each p in params {
-            typeExpr(p.declared, r)
+        ast.Decl.CallableDecl(_, _, params, result, body, _) {
+            for each p in params {
+                typeExpr(p.declared, r)
+            }
+            typeExpr(result, r)
+            block(body, r)
         }
-        typeExpr(result, r)
-        block(body, r)
-    } else if d is ast.Decl.ForeignDecl(_, params, result, _, _, _, _) {
-        for each p in params {
-            typeExpr(p.declared, r)
+        ast.Decl.ForeignDecl(_, params, result, _, _, _, _) {
+            for each p in params {
+                typeExpr(p.declared, r)
+            }
+            typeExpr(result, r)
         }
-        typeExpr(result, r)
-    } else if d is ast.Decl.QueryDecl(_, params, result, parts, _) {
-        for each p in params {
-            typeExpr(p.declared, r)
+        ast.Decl.QueryDecl(_, params, result, parts, _) {
+            for each p in params {
+                typeExpr(p.declared, r)
+            }
+            typeExpr(result, r)
+            sql(parts, r)
         }
-        typeExpr(result, r)
-        sql(parts, r)
-    } else if d is ast.Decl.TableLawDecl(_, params, _, parts, _) {
-        for each p in params {
-            typeExpr(p.declared, r)
+        ast.Decl.TableLawDecl(_, params, _, parts, _) {
+            for each p in params {
+                typeExpr(p.declared, r)
+            }
+            sql(parts, r)
         }
-        sql(parts, r)
-    } else if d is ast.Decl.TestDecl(_, body, _) {
-        block(body, r)
+        ast.Decl.TestDecl(_, body, _) {
+            block(body, r)
+        }
     }
 }
 
@@ -240,18 +247,22 @@ proc fields(fs: ast.Field[], r: mut Refs): void {
 }
 
 proc typeExpr(t: ast.TypeExpr, r: mut Refs): void {
-    if t is ast.TypeExpr.Named(pkg, name, args, _) {
-        if pkg == "" {
-            append(r.names, name)
+    switch t {
+        ast.TypeExpr.Named(pkg, name, args, _) {
+            if pkg == "" {
+                append(r.names, name)
+            }
+            for each a in args {
+                typeExpr(a, r)
+            }
         }
-        for each a in args {
-            typeExpr(a, r)
+        ast.TypeExpr.Fn(_, params, _, result) {
+            for each p in params {
+                typeExpr(p, r)
+            }
+            typeExpr(result, r)
         }
-    } else if t is ast.TypeExpr.Fn(_, params, _, result) {
-        for each p in params {
-            typeExpr(p, r)
-        }
-        typeExpr(result, r)
+        _ { }
     }
 }
 
@@ -262,107 +273,140 @@ proc block(b: ast.Block, r: mut Refs): void {
 }
 
 proc stmt(s: ast.Stmt, r: mut Refs): void {
-    if s is ast.Stmt.VarDecl(_, value, _, _, _) {
-        expr(value, r)
-    } else if s is ast.Stmt.TypedDecl(declared, _, value, _, _, _) {
-        typeExpr(declared, r)
-        expr(value, r)
-    } else if s is ast.Stmt.Assign(target, value, _) {
-        expr(target, r)
-        expr(value, r)
-    } else if s is ast.Stmt.IfChain(branches, otherwise, _, _) {
-        for each b in branches {
-            expr(b.condition, r)
-            block(b.body, r)
+    switch s {
+        ast.Stmt.VarDecl(_, value, _, _, _) {
+            expr(value, r)
         }
-        block(otherwise, r)
-    } else if s is ast.Stmt.SwitchStmt(lets, subjects, arms, _, _) {
-        for each subject in subjects {
+        ast.Stmt.TypedDecl(declared, _, value, _, _, _) {
+            typeExpr(declared, r)
+            expr(value, r)
+        }
+        ast.Stmt.Assign(target, value, _) {
+            expr(target, r)
+            expr(value, r)
+        }
+        ast.Stmt.IfChain(branches, otherwise, _, _) {
+            for each b in branches {
+                expr(b.condition, r)
+                block(b.body, r)
+            }
+            block(otherwise, r)
+        }
+        ast.Stmt.SwitchStmt(lets, subjects, arms, _, _) {
+            for each subject in subjects {
+                expr(subject, r)
+            }
+            block(ast.switchBlock(lets, arms), r)
+        }
+        ast.Stmt.ForLoop(init, cond, post, body, _) {
+            stmt(init, r)
+            expr(cond, r)
+            stmt(post, r)
+            block(body, r)
+        }
+        ast.Stmt.ForEach(_, declared, subject, body, _) {
+            typeExpr(declared, r)
             expr(subject, r)
+            block(body, r)
         }
-        block(ast.switchBlock(lets, arms), r)
-    } else if s is ast.Stmt.ForLoop(init, cond, post, body, _) {
-        stmt(init, r)
-        expr(cond, r)
-        stmt(post, r)
-        block(body, r)
-    } else if s is ast.Stmt.ForEach(_, declared, subject, body, _) {
-        typeExpr(declared, r)
-        expr(subject, r)
-        block(body, r)
-    } else if s is ast.Stmt.ReturnStmt(value, _) {
-        expr(value, r)
-    } else if s is ast.Stmt.EchoStmt(value, _) {
-        expr(value, r)
-    } else if s is ast.Stmt.AssertStmt(value, _) {
-        expr(value, r)
-    } else if s is ast.Stmt.PanicStmt(value, _) {
-        expr(value, r)
-    } else if s is ast.Stmt.AsyncStmt(value, _) {
-        expr(value, r)
-    } else if s is ast.Stmt.Expression(value, _) {
-        expr(value, r)
+        ast.Stmt.ReturnStmt(value, _) {
+            expr(value, r)
+        }
+        ast.Stmt.EchoStmt(value, _) {
+            expr(value, r)
+        }
+        ast.Stmt.AssertStmt(value, _) {
+            expr(value, r)
+        }
+        ast.Stmt.PanicStmt(value, _) {
+            expr(value, r)
+        }
+        ast.Stmt.AsyncStmt(value, _) {
+            expr(value, r)
+        }
+        ast.Stmt.Expression(value, _) {
+            expr(value, r)
+        }
+        _ { }
     }
 }
 
 proc expr(e: ast.Expr, r: mut Refs): void {
-    if e is ast.Expr.Ident(name, _) {
-        append(r.names, name)
-        append(r.values, name)
-    } else if e is ast.Expr.Call(callee, args, _) {
-        if callee is ast.Expr.Ident(name, _) {
+    switch e {
+        ast.Expr.Ident(name, _) {
             append(r.names, name)
-        } else {
-            expr(callee, r)
+            append(r.values, name)
         }
-        for each a in args {
-            expr(a.value, r)
-        }
-    } else if e is ast.Expr.Interp(parts, _) {
-        for each part in parts {
-            if part is ast.InterpPart.Expression(value) {
-                expr(value, r)
+        ast.Expr.Call(callee, args, _) {
+            if callee is ast.Expr.Ident(name, _) {
+                append(r.names, name)
+            } else {
+                expr(callee, r)
+            }
+            for each a in args {
+                expr(a.value, r)
             }
         }
-    } else if e is ast.Expr.VectorLit(items, _) {
-        for each item in items {
-            expr(item, r)
+        ast.Expr.Interp(parts, _) {
+            for each part in parts {
+                if part is ast.InterpPart.Expression(value) {
+                    expr(value, r)
+                }
+            }
         }
-    } else if e is ast.Expr.Negate(operand, _) {
-        expr(operand, r)
-    } else if e is ast.Expr.Not(operand, _) {
-        expr(operand, r)
-    } else if e is ast.Expr.BitNot(operand, _) {
-        expr(operand, r)
-    } else if e is ast.Expr.Bits(parts, _) {
-        for each part in parts {
-            expr(part.value, r)
+        ast.Expr.VectorLit(items, _) {
+            for each item in items {
+                expr(item, r)
+            }
         }
-    } else if e is ast.Expr.Binary(_, left, right, _) {
-        expr(left, r)
-        expr(right, r)
-    } else if e is ast.Expr.Member(subject, _, _) {
-        expr(subject, r)
-    } else if e is ast.Expr.Index(subject, index, _) {
-        expr(subject, r)
-        expr(index, r)
-    } else if e is ast.Expr.Slice(subject, low, high, _) {
-        expr(subject, r)
-        expr(low, r)
-        expr(high, r)
-    } else if e is ast.Expr.IsMatch(subject, p, _) {
-        expr(subject, r)
-        pattern(p, r)
-    } else if e is ast.Expr.AwaitAll(calls, timeout, _) {
-        for each c in calls {
-            expr(c, r)
+        ast.Expr.Negate(operand, _) {
+            expr(operand, r)
         }
-        expr(timeout, r)
-    } else if e is ast.Expr.Timed(call, ms, _) {
-        expr(call, r)
-        expr(ms, r)
-    } else if e is ast.Expr.Baked(call, _) {
-        expr(call, r)
+        ast.Expr.Not(operand, _) {
+            expr(operand, r)
+        }
+        ast.Expr.BitNot(operand, _) {
+            expr(operand, r)
+        }
+        ast.Expr.Bits(parts, _) {
+            for each part in parts {
+                expr(part.value, r)
+            }
+        }
+        ast.Expr.Binary(_, left, right, _) {
+            expr(left, r)
+            expr(right, r)
+        }
+        ast.Expr.Member(subject, _, _) {
+            expr(subject, r)
+        }
+        ast.Expr.Index(subject, index, _) {
+            expr(subject, r)
+            expr(index, r)
+        }
+        ast.Expr.Slice(subject, low, high, _) {
+            expr(subject, r)
+            expr(low, r)
+            expr(high, r)
+        }
+        ast.Expr.IsMatch(subject, p, _) {
+            expr(subject, r)
+            pattern(p, r)
+        }
+        ast.Expr.AwaitAll(calls, timeout, _) {
+            for each c in calls {
+                expr(c, r)
+            }
+            expr(timeout, r)
+        }
+        ast.Expr.Timed(call, ms, _) {
+            expr(call, r)
+            expr(ms, r)
+        }
+        ast.Expr.Baked(call, _) {
+            expr(call, r)
+        }
+        _ { }
     }
 }
 
@@ -380,21 +424,28 @@ proc pattern(p: ast.Pattern, r: mut Refs): void {
 
 proc sql(parts: ast.SqlPart[], r: mut Refs): void {
     for each part in parts {
-        if part is ast.SqlPart.Param(value) {
-            expr(value, r)
-        } else if part is ast.SqlPart.Where(group) {
-            sqlGroup(group, r)
+        switch part {
+            ast.SqlPart.Param(value) {
+                expr(value, r)
+            }
+            ast.SqlPart.Where(group) {
+                sqlGroup(group, r)
+            }
+            _ { }
         }
     }
 }
 
 proc sqlGroup(group: ast.SqlGroup, r: mut Refs): void {
     for each item in group.items {
-        if item is ast.SqlItem.Cond(condition, body) {
-            expr(condition, r)
-            sql(body, r)
-        } else if item is ast.SqlItem.Nested(inner) {
-            sqlGroup(inner, r)
+        switch item {
+            ast.SqlItem.Cond(condition, body) {
+                expr(condition, r)
+                sql(body, r)
+            }
+            ast.SqlItem.Nested(inner) {
+                sqlGroup(inner, r)
+            }
         }
     }
 }

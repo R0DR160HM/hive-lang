@@ -59,14 +59,18 @@ func isName(t: Tok): Bool {
 func tokens(parts: ast.SqlPart[]): Tok[dyn] {
     mut Tok[dyn] out = []
     for each part in parts {
-        if part is ast.SqlPart.Lit(written) {
-            for each t in lexSql(written) {
-                append(out, t)
+        switch part {
+            ast.SqlPart.Lit(written) {
+                for each t in lexSql(written) {
+                    append(out, t)
+                }
             }
-        } else if part is ast.SqlPart.Param(value) {
-            append(out, Tok("h", "\{" + prove.exprText(value) + "}", value, ast.SqlGroup(true, [])))
-        } else if part is ast.SqlPart.Where(group) {
-            append(out, Tok("g", "where", ast.absent(), group))
+            ast.SqlPart.Param(value) {
+                append(out, Tok("h", "\{" + prove.exprText(value) + "}", value, ast.SqlGroup(true, [])))
+            }
+            ast.SqlPart.Where(group) {
+                append(out, Tok("g", "where", ast.absent(), group))
+            }
         }
     }
     return out
@@ -359,14 +363,17 @@ proc groupFacts(group: ast.SqlGroup, conds: ast.Expr[], alias: Str, only: Bool, 
         return
     }
     for each item in group.items {
-        if item is ast.SqlItem.Cond(condition, body) {
-            inner := exprs(conds, [condition])
-            bodyToks := tokens(body)
-            for each f in factsOf(bodyToks, Range(0, len(bodyToks)), inner, alias, only) {
-                append(into, f)
+        switch item {
+            ast.SqlItem.Cond(condition, body) {
+                inner := exprs(conds, [condition])
+                bodyToks := tokens(body)
+                for each f in factsOf(bodyToks, Range(0, len(bodyToks)), inner, alias, only) {
+                    append(into, f)
+                }
             }
-        } else if item is ast.SqlItem.Nested(nested) {
-            groupFacts(nested, conds, alias, only, into)
+            ast.SqlItem.Nested(nested) {
+                groupFacts(nested, conds, alias, only, into)
+            }
         }
     }
 }
@@ -526,19 +533,22 @@ proc readGroups(rd: mut Reader, lo: Int, hi: Int): void {
 
 proc readGroupBodies(rd: mut Reader, group: ast.SqlGroup): void {
     for each item in group.items {
-        if item is ast.SqlItem.Cond(_, body) {
-            inner := readQuery(rd.table, body)
-            for each r in inner.refs {
-                append(rd.refs, r)
+        switch item {
+            ast.SqlItem.Cond(_, body) {
+                inner := readQuery(rd.table, body)
+                for each r in inner.refs {
+                    append(rd.refs, r)
+                }
+                for each w in inner.writes {
+                    append(rd.writes, w)
+                }
+                for each u in inner.unread {
+                    append(rd.unread, u)
+                }
             }
-            for each w in inner.writes {
-                append(rd.writes, w)
+            ast.SqlItem.Nested(nested) {
+                readGroupBodies(rd, nested)
             }
-            for each u in inner.unread {
-                append(rd.unread, u)
-            }
-        } else if item is ast.SqlItem.Nested(nested) {
-            readGroupBodies(rd, nested)
         }
     }
 }
@@ -980,16 +990,19 @@ proc wantedOf(table: Str, filter: ast.SqlPart[], prefix: Str): Wanted[dyn] {
 
 proc wantedOfGroup(group: ast.SqlGroup, conds: ast.Expr[], alias: Str, prefix: Str, into: mut Wanted[dyn]): void {
     for each item in group.items {
-        if item is ast.SqlItem.Cond(condition, body) {
-            inner := exprs(conds, [condition])
-            toks := tokens(body)
-            for each c in pieces(toks, Range(0, len(toks)), "and") {
-                if c.hi > c.lo {
-                    append(into, wantedPart(toks, c, inner, alias, prefix))
+        switch item {
+            ast.SqlItem.Cond(condition, body) {
+                inner := exprs(conds, [condition])
+                toks := tokens(body)
+                for each c in pieces(toks, Range(0, len(toks)), "and") {
+                    if c.hi > c.lo {
+                        append(into, wantedPart(toks, c, inner, alias, prefix))
+                    }
                 }
             }
-        } else if item is ast.SqlItem.Nested(nested) {
-            wantedOfGroup(nested, conds, alias, prefix, into)
+            ast.SqlItem.Nested(nested) {
+                wantedOfGroup(nested, conds, alias, prefix, into)
+            }
         }
     }
 }
@@ -1350,12 +1363,16 @@ func allOf(es: ast.Expr[]): ast.Expr {
 func renameParts(parts: ast.SqlPart[], from: Str, to: Str): ast.SqlPart[dyn] {
     mut ast.SqlPart[dyn] out = []
     for each part in parts {
-        if part is ast.SqlPart.Param(value) {
-            append(out, ast.SqlPart.Param(renamed(value, from, to)))
-        } else if part is ast.SqlPart.Where(group) {
-            append(out, ast.SqlPart.Where(renameGroup(group, from, to)))
-        } else {
-            append(out, part)
+        switch part {
+            ast.SqlPart.Param(value) {
+                append(out, ast.SqlPart.Param(renamed(value, from, to)))
+            }
+            ast.SqlPart.Where(group) {
+                append(out, ast.SqlPart.Where(renameGroup(group, from, to)))
+            }
+            _ {
+                append(out, part)
+            }
         }
     }
     return out
@@ -1364,10 +1381,13 @@ func renameParts(parts: ast.SqlPart[], from: Str, to: Str): ast.SqlPart[dyn] {
 func renameGroup(group: ast.SqlGroup, from: Str, to: Str): ast.SqlGroup {
     mut ast.SqlItem[dyn] items = []
     for each item in group.items {
-        if item is ast.SqlItem.Cond(condition, body) {
-            append(items, ast.SqlItem.Cond(renamed(condition, from, to), renameParts(body, from, to)))
-        } else if item is ast.SqlItem.Nested(nested) {
-            append(items, ast.SqlItem.Nested(renameGroup(nested, from, to)))
+        switch item {
+            ast.SqlItem.Cond(condition, body) {
+                append(items, ast.SqlItem.Cond(renamed(condition, from, to), renameParts(body, from, to)))
+            }
+            ast.SqlItem.Nested(nested) {
+                append(items, ast.SqlItem.Nested(renameGroup(nested, from, to)))
+            }
         }
     }
     return ast.SqlGroup(group.conjunction, items)
@@ -1377,45 +1397,59 @@ func renamed(e: ast.Expr, from: Str, to: Str): ast.Expr {
     if from == to {
         return e
     }
-    if e is ast.Expr.Ident(name, at) {
-        if name == from {
-            return ast.Expr.Ident(to, at)
-        }
-        return e
-    } else if e is ast.Expr.Interp(parts, at) {
-        mut ast.InterpPart[dyn] out = []
-        for each part in parts {
-            if part is ast.InterpPart.Expression(value) {
-                append(out, ast.InterpPart.Expression(renamed(value, from, to)))
-            } else {
-                append(out, part)
+    switch e {
+        ast.Expr.Ident(name, at) {
+            if name == from {
+                return ast.Expr.Ident(to, at)
             }
+            return e
         }
-        return ast.Expr.Interp(out, at)
-    } else if e is ast.Expr.VectorLit(items, at) {
-        return ast.Expr.VectorLit(renamedAll(items, from, to), at)
-    } else if e is ast.Expr.Negate(x, at) {
-        return ast.Expr.Negate(renamed(x, from, to), at)
-    } else if e is ast.Expr.Not(x, at) {
-        return ast.Expr.Not(renamed(x, from, to), at)
-    } else if e is ast.Expr.BitNot(x, at) {
-        return ast.Expr.BitNot(renamed(x, from, to), at)
-    } else if e is ast.Expr.Binary(op, l, r, at) {
-        return ast.Expr.Binary(op, renamed(l, from, to), renamed(r, from, to), at)
-    } else if e is ast.Expr.Call(callee, args, at) {
-        mut ast.Arg[dyn] out = []
-        for each a in args {
-            append(out, ast.Arg(a.name, renamed(a.value, from, to)))
+        ast.Expr.Interp(parts, at) {
+            mut ast.InterpPart[dyn] out = []
+            for each part in parts {
+                if part is ast.InterpPart.Expression(value) {
+                    append(out, ast.InterpPart.Expression(renamed(value, from, to)))
+                } else {
+                    append(out, part)
+                }
+            }
+            return ast.Expr.Interp(out, at)
         }
-        return ast.Expr.Call(renamed(callee, from, to), out, at)
-    } else if e is ast.Expr.Member(subject, field, at) {
-        return ast.Expr.Member(renamed(subject, from, to), field, at)
-    } else if e is ast.Expr.Index(subject, index, at) {
-        return ast.Expr.Index(renamed(subject, from, to), renamed(index, from, to), at)
-    } else if e is ast.Expr.Slice(subject, low, high, at) {
-        return ast.Expr.Slice(renamed(subject, from, to), renamed(low, from, to), renamed(high, from, to), at)
-    } else if e is ast.Expr.IsMatch(subject, pattern, at) {
-        return ast.Expr.IsMatch(renamed(subject, from, to), renamedPattern(pattern, from, to), at)
+        ast.Expr.VectorLit(items, at) {
+            return ast.Expr.VectorLit(renamedAll(items, from, to), at)
+        }
+        ast.Expr.Negate(x, at) {
+            return ast.Expr.Negate(renamed(x, from, to), at)
+        }
+        ast.Expr.Not(x, at) {
+            return ast.Expr.Not(renamed(x, from, to), at)
+        }
+        ast.Expr.BitNot(x, at) {
+            return ast.Expr.BitNot(renamed(x, from, to), at)
+        }
+        ast.Expr.Binary(op, l, r, at) {
+            return ast.Expr.Binary(op, renamed(l, from, to), renamed(r, from, to), at)
+        }
+        ast.Expr.Call(callee, args, at) {
+            mut ast.Arg[dyn] out = []
+            for each a in args {
+                append(out, ast.Arg(a.name, renamed(a.value, from, to)))
+            }
+            return ast.Expr.Call(renamed(callee, from, to), out, at)
+        }
+        ast.Expr.Member(subject, field, at) {
+            return ast.Expr.Member(renamed(subject, from, to), field, at)
+        }
+        ast.Expr.Index(subject, index, at) {
+            return ast.Expr.Index(renamed(subject, from, to), renamed(index, from, to), at)
+        }
+        ast.Expr.Slice(subject, low, high, at) {
+            return ast.Expr.Slice(renamed(subject, from, to), renamed(low, from, to), renamed(high, from, to), at)
+        }
+        ast.Expr.IsMatch(subject, pattern, at) {
+            return ast.Expr.IsMatch(renamed(subject, from, to), renamedPattern(pattern, from, to), at)
+        }
+        _ { }
     }
     return e
 }

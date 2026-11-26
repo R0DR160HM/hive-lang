@@ -267,10 +267,14 @@ proc markEscaped(w: mut Written, shape: Str, by: Str): void {
 // from a parameter. That is why a builder is not caught by it.
 proc markLeaks(w: mut Written, decls: ast.Decl[]): void {
     for each d in decls {
-        if d is ast.Decl.CallableDecl(_, name, params, result, _, _) {
-            leaksFrom(w, name, params, types.resolve(w.table, result))
-        } else if d is ast.Decl.QueryDecl(name, params, result, _, _) {
-            leaksFrom(w, name, params, types.resolve(w.table, result))
+        switch d {
+            ast.Decl.CallableDecl(_, name, params, result, _, _) {
+                leaksFrom(w, name, params, types.resolve(w.table, result))
+            }
+            ast.Decl.QueryDecl(name, params, result, _, _) {
+                leaksFrom(w, name, params, types.resolve(w.table, result))
+            }
+            _ { }
         }
     }
 }
@@ -365,18 +369,23 @@ proc shapesOf(t: types.Table, ty: types.Ty, out: mut Str[dyn], seen: Str[]): voi
 
 proc walkDecl(w: mut Written, env: infer.Env, d: ast.Decl): void {
     w.mutables = []
-    if d is ast.Decl.CallableDecl(_, _, params, _, body, _) {
-        for each p in params {
-            if p.mutable {
-                append(w.mutables, p.name)
+    switch d {
+        ast.Decl.CallableDecl(_, _, params, _, body, _) {
+            for each p in params {
+                if p.mutable {
+                    append(w.mutables, p.name)
+                }
             }
+            walkBlock(w, infer.boundParams(env, params, 0), body)
         }
-        walkBlock(w, infer.boundParams(env, params, 0), body)
-    } else if d is ast.Decl.QueryDecl(_, _, _, _, _) {
-        // A query body holds no assignment: its bound values are expressions, and
-        // an expression writes nothing.
-    } else if d is ast.Decl.TestDecl(_, body, _) {
-        walkBlock(w, env, body)
+        ast.Decl.QueryDecl(_, _, _, _, _) {
+            // A query body holds no assignment: its bound values are expressions, and
+            // an expression writes nothing.
+        }
+        ast.Decl.TestDecl(_, body, _) {
+            walkBlock(w, env, body)
+        }
+        _ { }
     }
 }
 
@@ -555,16 +564,20 @@ proc markPath(w: mut Written, env: infer.Env, target: ast.Expr): void {
 proc markThrough(w: mut Written, env: infer.Env, e: ast.Expr): void {
     if e is ast.Expr.Member(subject, field, _) {
         ty := infer.typeOf(env, subject)
-        if ty is types.Ty.TNamed(owner) {
-            markField(w, owner, field)
-        } else if ty is types.Ty.TUnknown {
-            w.blind = true
-            return
-        } else {
-            // A field of something that is not a declared type — a library value.
-            // It has no generated clone to share anything, but this cannot prove
-            // it, so it takes the safe end.
-            markShape(w, infer.typeOf(env, e))
+        switch ty {
+            types.Ty.TNamed(owner) {
+                markField(w, owner, field)
+            }
+            types.Ty.TUnknown {
+                w.blind = true
+                return
+            }
+            _ {
+                // A field of something that is not a declared type — a library value.
+                // It has no generated clone to share anything, but this cannot prove
+                // it, so it takes the safe end.
+                markShape(w, infer.typeOf(env, e))
+            }
         }
         markThrough(w, env, subject)
         return

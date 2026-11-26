@@ -498,14 +498,20 @@ func goZero(ty: types.Ty): Str {
 // --- Declarations ------------------------------------------------------------
 
 proc emitDecl(em: mut Emit, env: infer.Env, d: ast.Decl): void {
-    if d is ast.Decl.TypeDecl(name, fields, variants, _) {
-        emitTypeDecl(em, name, fields, variants)
-    } else if d is ast.Decl.CallableDecl(_, name, params, result, body, _) {
-        emitCallable(em, env, name, params, result, body)
-    } else if d is ast.Decl.QueryDecl(name, params, result, sql, _) {
-        emitQuery(em, env, name, params, result, sql)
-    } else if d is ast.Decl.ForeignDecl(name, params, result, packageName, symbol, goResults, _) {
-        emitForeign(em, name, params, result, packageName, symbol, goResults)
+    switch d {
+        ast.Decl.TypeDecl(name, fields, variants, _) {
+            emitTypeDecl(em, name, fields, variants)
+        }
+        ast.Decl.CallableDecl(_, name, params, result, body, _) {
+            emitCallable(em, env, name, params, result, body)
+        }
+        ast.Decl.QueryDecl(name, params, result, sql, _) {
+            emitQuery(em, env, name, params, result, sql)
+        }
+        ast.Decl.ForeignDecl(name, params, result, packageName, symbol, goResults, _) {
+            emitForeign(em, name, params, result, packageName, symbol, goResults)
+        }
+        _ { }
     }
     // A `test` is generated into a file of its own, by `emitTests`.
 }
@@ -991,137 +997,156 @@ proc emitStmt(em: mut Emit, env: infer.Env, s: ast.Stmt, result: types.Ty): infe
     if (s is ast.Stmt.Nothing) == false {
         em.at = s.at
     }
-    if s is ast.Stmt.VarDecl(name, value, mutable, deferred, _) {
-        ty := infer.typeOf(env, value)
-        // `x := async f(a)` starts the call now; the wait happens wherever `x` is
-        // read, and only if the call has not finished — which is why the name is
-        // bound to the work rather than to a value.
-        if deferred {
-            // `_` starts the work like any binding and keeps nothing to wait for.
-            mut held := name
-            if name == "_" {
-                held = fresh(em, "discard")
-            }
-            // A named send goes out now: the wait moves to the name, not the
-            // sending, so only the answer waits for where the name is read.
-            if isSend(env, value) {
-                pending := "_pending_" + goIdent(held)
-                if value is ast.Expr.Call(address, sent, _) {
-                    line(em, pending + " := " + pendingSend(em, env, address, sent))
+    switch s {
+        ast.Stmt.VarDecl(name, value, mutable, deferred, _) {
+            ty := infer.typeOf(env, value)
+            // `x := async f(a)` starts the call now; the wait happens wherever `x` is
+            // read, and only if the call has not finished — which is why the name is
+            // bound to the work rather than to a value.
+            if deferred {
+                // `_` starts the work like any binding and keeps nothing to wait for.
+                mut held := name
+                if name == "_" {
+                    held = fresh(em, "discard")
                 }
-                line(em, taskName(held) + " := hive.Spawn(func() any \{ return " + answered("hive.SyslinkAwait(" + pending + ", 0)") + " })")
-            } else {
-                work := onThread(em, env, value, ty)
-                line(em, taskName(held) + " := hive.Spawn(func() any \{ return " + work + " })")
+                // A named send goes out now: the wait moves to the name, not the
+                // sending, so only the answer waits for where the name is read.
+                if isSend(env, value) {
+                    pending := "_pending_" + goIdent(held)
+                    if value is ast.Expr.Call(address, sent, _) {
+                        line(em, pending + " := " + pendingSend(em, env, address, sent))
+                    }
+                    line(em, taskName(held) + " := hive.Spawn(func() any \{ return " + answered("hive.SyslinkAwait(" + pending + ", 0)") + " })")
+                } else {
+                    work := onThread(em, env, value, ty)
+                    line(em, taskName(held) + " := hive.Spawn(func() any \{ return " + work + " })")
+                }
+                line(em, "_ = " + taskName(held))
+                if name == "_" {
+                    return env
+                }
+                append(em.deferred, name)
+                return infer.bound(env, name, ty)
             }
-            line(em, "_ = " + taskName(held))
             if name == "_" {
+                line(em, "_ = " + expr(em, env, value, ty))
                 return env
             }
-            append(em.deferred, name)
+            // Written with the type rather than `:=`: the two do not always agree.
+            // `s := Shape.Circle(9)` binds a `Shape` in Hive but the variant's own
+            // struct in Go, and a later `is` would assert on a non-interface.
+            written := bindingValue(em, env, name, value, ty, mutable)
+            if mutable {
+                append(em.mutables, name)
+            }
+            if written == "" {
+                // The second of two `mut` names for one storage: it takes the cell
+                // the first holds, so both write through it.
+                line(em, goIdent(name) + " := " + goIdent(rootOf(value)))
+            } else if isCell(em, name) {
+                line(em, goIdent(name) + " := " + inCell(em, ty, written))
+            } else if ty is types.Ty.TUnknown {
+                line(em, goIdent(name) + " := " + written)
+            } else {
+                line(em, "var " + goIdent(name) + " " + goType(ty) + " = " + written)
+            }
+            line(em, "_ = " + goIdent(name))
             return infer.bound(env, name, ty)
         }
-        if name == "_" {
-            line(em, "_ = " + expr(em, env, value, ty))
+        ast.Stmt.TypedDecl(declared, name, value, mutable, _, _) {
+            ty := types.resolve(env.table, declared)
+            if name == "_" {
+                line(em, "var _ " + goType(ty) + " = " + expr(em, env, value, ty))
+                return env
+            }
+            written := bindingValue(em, env, name, value, ty, mutable)
+            if mutable {
+                append(em.mutables, name)
+            }
+            if written == "" {
+                line(em, goIdent(name) + " := " + goIdent(rootOf(value)))
+            } else if isCell(em, name) {
+                line(em, "var " + goIdent(name) + " *" + goType(ty) + " = " + inCell(em, ty, written))
+            } else {
+                line(em, "var " + goIdent(name) + " " + goType(ty) + " = " + written)
+            }
+            line(em, "_ = " + goIdent(name))
+            return infer.bound(env, name, ty)
+        }
+        ast.Stmt.Assign(target, value, _) {
+            emitAssign(em, env, target, value)
             return env
         }
-        // Written with the type rather than `:=`: the two do not always agree.
-        // `s := Shape.Circle(9)` binds a `Shape` in Hive but the variant's own
-        // struct in Go, and a later `is` would assert on a non-interface.
-        written := bindingValue(em, env, name, value, ty, mutable)
-        if mutable {
-            append(em.mutables, name)
-        }
-        if written == "" {
-            // The second of two `mut` names for one storage: it takes the cell
-            // the first holds, so both write through it.
-            line(em, goIdent(name) + " := " + goIdent(rootOf(value)))
-        } else if isCell(em, name) {
-            line(em, goIdent(name) + " := " + inCell(em, ty, written))
-        } else if ty is types.Ty.TUnknown {
-            line(em, goIdent(name) + " := " + written)
-        } else {
-            line(em, "var " + goIdent(name) + " " + goType(ty) + " = " + written)
-        }
-        line(em, "_ = " + goIdent(name))
-        return infer.bound(env, name, ty)
-    } else if s is ast.Stmt.TypedDecl(declared, name, value, mutable, _, _) {
-        ty := types.resolve(env.table, declared)
-        if name == "_" {
-            line(em, "var _ " + goType(ty) + " = " + expr(em, env, value, ty))
+        ast.Stmt.IfChain(branches, otherwise, hasElse, _) {
+            emitIf(em, env, branches, otherwise, hasElse, result)
             return env
         }
-        written := bindingValue(em, env, name, value, ty, mutable)
-        if mutable {
-            append(em.mutables, name)
+        ast.Stmt.SwitchStmt(lets, _, arms, _, _) {
+            emitStmts(em, env, ast.switchBlock(lets, arms), result)
+            return env
         }
-        if written == "" {
-            line(em, goIdent(name) + " := " + goIdent(rootOf(value)))
-        } else if isCell(em, name) {
-            line(em, "var " + goIdent(name) + " *" + goType(ty) + " = " + inCell(em, ty, written))
-        } else {
-            line(em, "var " + goIdent(name) + " " + goType(ty) + " = " + written)
+        ast.Stmt.ReturnStmt(value, _) {
+            if value is ast.Expr.Absent {
+                line(em, "return")
+            } else {
+                line(em, "return " + expr(em, env, value, result))
+            }
+            return env
         }
-        line(em, "_ = " + goIdent(name))
-        return infer.bound(env, name, ty)
-    } else if s is ast.Stmt.Assign(target, value, _) {
-        emitAssign(em, env, target, value)
-        return env
-    } else if s is ast.Stmt.IfChain(branches, otherwise, hasElse, _) {
-        emitIf(em, env, branches, otherwise, hasElse, result)
-        return env
-    } else if s is ast.Stmt.SwitchStmt(lets, _, arms, _, _) {
-        emitStmts(em, env, ast.switchBlock(lets, arms), result)
-        return env
-    } else if s is ast.Stmt.ReturnStmt(value, _) {
-        if value is ast.Expr.Absent {
-            line(em, "return")
-        } else {
-            line(em, "return " + expr(em, env, value, result))
+        ast.Stmt.EchoStmt(value, _) {
+            line(em, "hive.Echo(" + expr(em, env, value, types.Ty.TUnknown()) + ")")
+            return env
         }
-        return env
-    } else if s is ast.Stmt.EchoStmt(value, _) {
-        line(em, "hive.Echo(" + expr(em, env, value, types.Ty.TUnknown()) + ")")
-        return env
-    } else if s is ast.Stmt.AssertStmt(condition, _) {
-        if em.inTest {
-            emitTestAssert(em, env, condition)
-        } else {
-            emitAssert(em, env, condition)
+        ast.Stmt.AssertStmt(condition, _) {
+            if em.inTest {
+                emitTestAssert(em, env, condition)
+            } else {
+                emitAssert(em, env, condition)
+            }
+            return env
         }
-        return env
-    } else if s is ast.Stmt.PanicStmt(value, _) {
-        line(em, "panic(hive.Show(" + expr(em, env, value, types.Ty.TUnknown()) + "))")
-        return env
-    } else if s is ast.Stmt.BreakStmt {
-        line(em, "break")
-        return env
-    } else if s is ast.Stmt.ContinueStmt {
-        line(em, "continue")
-        return env
+        ast.Stmt.PanicStmt(value, _) {
+            line(em, "panic(hive.Show(" + expr(em, env, value, types.Ty.TUnknown()) + "))")
+            return env
+        }
+        ast.Stmt.BreakStmt {
+            line(em, "break")
+            return env
+        }
+        ast.Stmt.ContinueStmt {
+            line(em, "continue")
+            return env
+        }
+        _ { }
     }
     return emitStmtTail(em, env, s, result)
 }
 
 proc emitStmtTail(em: mut Emit, env: infer.Env, s: ast.Stmt, result: types.Ty): infer.Env {
-    if s is ast.Stmt.ForLoop(init, cond, post, body, _) {
-        emitFor(em, env, init, cond, post, body, result)
-        return env
-    } else if s is ast.Stmt.ForEach(name, declared, subject, body, _) {
-        emitForEach(em, env, name, declared, subject, body, result)
-        return env
-    } else if s is ast.Stmt.AsyncStmt(call, _) {
-        // A send nothing waits for is a cast: it never blocks and never fails,
-        // which is what keeps a local send and a remote one the same statement.
-        if isSend(env, call) {
-            line(em, sendOnly(em, env, call))
+    switch s {
+        ast.Stmt.ForLoop(init, cond, post, body, _) {
+            emitFor(em, env, init, cond, post, body, result)
             return env
         }
-        line(em, "go " + onThread(em, env, call, types.Ty.TUnknown()))
-        return env
-    } else if s is ast.Stmt.Expression(value, _) {
-        emitExprStmt(em, env, value)
-        return env
+        ast.Stmt.ForEach(name, declared, subject, body, _) {
+            emitForEach(em, env, name, declared, subject, body, result)
+            return env
+        }
+        ast.Stmt.AsyncStmt(call, _) {
+            // A send nothing waits for is a cast: it never blocks and never fails,
+            // which is what keeps a local send and a remote one the same statement.
+            if isSend(env, call) {
+                line(em, sendOnly(em, env, call))
+                return env
+            }
+            line(em, "go " + onThread(em, env, call, types.Ty.TUnknown()))
+            return env
+        }
+        ast.Stmt.Expression(value, _) {
+            emitExprStmt(em, env, value)
+            return env
+        }
+        _ { }
     }
     return env
 }
@@ -1540,12 +1565,17 @@ proc bitsReader(em: mut Emit, env: infer.Env, written: Str, subjectType: types.T
     mut Str[dyn] results = []
     mut Str[dyn] body = []
     mut opening := "hive.ReadBytes(" + written + ")"
-    if subjectType is types.Ty.TStr {
-        opening = "hive.ReadText(" + written + ")"
-    } else if subjectType is types.Ty.TSized(_, bits) {
-        opening = "hive.ReadWord(" + written + ", {bits})"
-    } else if subjectType is types.Ty.TInt {
-        opening = "hive.ReadWord(" + written + ", 64)"
+    switch subjectType {
+        types.Ty.TStr {
+            opening = "hive.ReadText(" + written + ")"
+        }
+        types.Ty.TSized(_, bits) {
+            opening = "hive.ReadWord(" + written + ", {bits})"
+        }
+        types.Ty.TInt {
+            opening = "hive.ReadWord(" + written + ", 64)"
+        }
+        _ { }
     }
     append(body, reader + " := " + opening)
     mut scope := env
@@ -1771,10 +1801,14 @@ proc templateMatch(em: mut Emit, written: Str, parts: token.StrPart[]): Str {
 func holeNames(parts: token.StrPart[]): Str[dyn] {
     mut Str[dyn] out = []
     for each part in parts {
-        if part is token.StrPart.Code(source, _, _) {
-            append(out, text.trim(source))
-        } else if part is token.StrPart.Hole(name, _) {
-            append(out, name)
+        switch part {
+            token.StrPart.Code(source, _, _) {
+                append(out, text.trim(source))
+            }
+            token.StrPart.Hole(name, _) {
+                append(out, name)
+            }
+            _ { }
         }
     }
     return out
@@ -1789,12 +1823,16 @@ func holeNames(parts: token.StrPart[]): Str[dyn] {
 func wholePattern(parts: token.StrPart[]): Str {
     mut Str[dyn] out = ["(?s)\\A"]
     for each part in parts {
-        if part is token.StrPart.Literal(t) {
-            append(out, regex.quoteMeta(t))
-        } else if part is token.StrPart.Code(_, _, _) {
-            append(out, "(.*?)")
-        } else if part is token.StrPart.Hole(_, pattern) {
-            append(out, "(" + pattern + ")")
+        switch part {
+            token.StrPart.Literal(t) {
+                append(out, regex.quoteMeta(t))
+            }
+            token.StrPart.Code(_, _, _) {
+                append(out, "(.*?)")
+            }
+            token.StrPart.Hole(_, pattern) {
+                append(out, "(" + pattern + ")")
+            }
         }
     }
     append(out, "\\z")
@@ -1912,40 +1950,49 @@ proc bareExpr(em: mut Emit, env: infer.Env, e: ast.Expr, want: types.Ty): Str {
 }
 
 proc exprTail(em: mut Emit, env: infer.Env, e: ast.Expr, want: types.Ty): Str {
-    if e is ast.Expr.Call(callee, args, _) {
-        return call(em, env, callee, args, want)
-    } else if e is ast.Expr.Member(subject, field, _) {
-        return member(em, env, subject, field)
-    } else if e is ast.Expr.Index(subject, index, _) {
-        // A `Str` is addressed by character and Go addresses it by byte, so one
-        // position of it is a walk rather than a subscript.
-        subjectType := infer.typeOf(env, subject)
-        if subjectType is types.Ty.TStr {
-            return "hive.IndexStr(" + expr(em, env, subject, types.Ty.TStr()) + ", " + expr(em, env, index, types.Ty.TInt()) + ")"
+    switch e {
+        ast.Expr.Call(callee, args, _) {
+            return call(em, env, callee, args, want)
         }
-        return elementIn(subjectType, expr(em, env, subject, types.Ty.TUnknown()), expr(em, env, index, types.Ty.TInt()))
-    } else if e is ast.Expr.Slice(subject, low, high, _) {
-        return slice(em, env, subject, low, high)
-    } else if e is ast.Expr.Baked(_, _) {
-        return cloned(em.table, infer.typeOf(env, e), bake.varOf(em.decl, e.at))
-    } else if e is ast.Expr.Timed(call, ms, _) {
-        // A bounded send is the same send with the patience written down.
-        if isSend(env, call) {
-            return sendAndWait(em, env, call, expr(em, env, ms, types.Ty.TInt()))
+        ast.Expr.Member(subject, field, _) {
+            return member(em, env, subject, field)
         }
-        // The type argument is written out: Go cannot read it off a Task, whose
-        // value is an `any` by the time it is waited for.
-        return "hive.AwaitTimeout[" + goType(infer.typeOf(env, call)) + "](" + spawned(em, env, call) + ", " + expr(em, env, ms, types.Ty.TInt()) + ")"
-    } else if e is ast.Expr.AwaitAll(calls, timeout, _) {
-        // A barrier over sends is syslink's own: every request goes out, one
-        // deadline across all of them, each answer on its own connection's
-        // reader — so nothing is spawned.
-        if allSends(em, env, calls) {
-            return awaitAllSends(em, env, calls, timeout)
+        ast.Expr.Index(subject, index, _) {
+            // A `Str` is addressed by character and Go addresses it by byte, so one
+            // position of it is a walk rather than a subscript.
+            subjectType := infer.typeOf(env, subject)
+            if subjectType is types.Ty.TStr {
+                return "hive.IndexStr(" + expr(em, env, subject, types.Ty.TStr()) + ", " + expr(em, env, index, types.Ty.TInt()) + ")"
+            }
+            return elementIn(subjectType, expr(em, env, subject, types.Ty.TUnknown()), expr(em, env, index, types.Ty.TInt()))
         }
-        // Asked of the inferrer rather than read off `want`: with a deadline the
-        // answer is a `Result` around the vector, two wrappers deep.
-        return awaitAll(em, env, calls, timeout, infer.typeOf(env, e))
+        ast.Expr.Slice(subject, low, high, _) {
+            return slice(em, env, subject, low, high)
+        }
+        ast.Expr.Baked(_, _) {
+            return cloned(em.table, infer.typeOf(env, e), bake.varOf(em.decl, e.at))
+        }
+        ast.Expr.Timed(call, ms, _) {
+            // A bounded send is the same send with the patience written down.
+            if isSend(env, call) {
+                return sendAndWait(em, env, call, expr(em, env, ms, types.Ty.TInt()))
+            }
+            // The type argument is written out: Go cannot read it off a Task, whose
+            // value is an `any` by the time it is waited for.
+            return "hive.AwaitTimeout[" + goType(infer.typeOf(env, call)) + "](" + spawned(em, env, call) + ", " + expr(em, env, ms, types.Ty.TInt()) + ")"
+        }
+        ast.Expr.AwaitAll(calls, timeout, _) {
+            // A barrier over sends is syslink's own: every request goes out, one
+            // deadline across all of them, each answer on its own connection's
+            // reader — so nothing is spawned.
+            if allSends(em, env, calls) {
+                return awaitAllSends(em, env, calls, timeout)
+            }
+            // Asked of the inferrer rather than read off `want`: with a deadline the
+            // answer is a `Result` around the vector, two wrappers deep.
+            return awaitAll(em, env, calls, timeout, infer.typeOf(env, e))
+        }
+        _ { }
     }
     fail(em, messages.expressionHasNoLowering())
     return "nil"
@@ -2233,15 +2280,18 @@ func rootOf(e: ast.Expr): Str {
 proc interpolation(em: mut Emit, env: infer.Env, parts: ast.InterpPart[]): Str {
     mut Str[dyn] out = []
     for each part in parts {
-        if part is ast.InterpPart.Literal(t) {
-            append(out, quoted(t))
-        } else if part is ast.InterpPart.Expression(value) {
-            ty := infer.typeOf(env, value)
-            mut written := expr(em, env, value, ty)
-            if ty is types.Ty.TStr {
-                append(out, written)
-            } else {
-                append(out, "hive.ToStr(" + written + ")")
+        switch part {
+            ast.InterpPart.Literal(t) {
+                append(out, quoted(t))
+            }
+            ast.InterpPart.Expression(value) {
+                ty := infer.typeOf(env, value)
+                mut written := expr(em, env, value, ty)
+                if ty is types.Ty.TStr {
+                    append(out, written)
+                } else {
+                    append(out, "hive.ToStr(" + written + ")")
+                }
             }
         }
     }
@@ -4228,20 +4278,24 @@ proc threadStarters(t: types.Table, decls: ast.Decl[]): Str[dyn] {
     // below to ask.
     mut hive.map.Map<Str, Bool> isStarter = hive.map.new()
     for each d in decls {
-        if d is ast.Decl.CallableDecl(_, name, params, _, body, _) {
-            mut Scan sc = Scan(false, [])
-            scanBlock(body, sc, infer.boundParams(infer.newEnv(t), params, 0))
-            if sc.spawns {
-                append(found, name)
-                hive.map.set(isStarter, name, true)
+        switch d {
+            ast.Decl.CallableDecl(_, name, params, _, body, _) {
+                mut Scan sc = Scan(false, [])
+                scanBlock(body, sc, infer.boundParams(infer.newEnv(t), params, 0))
+                if sc.spawns {
+                    append(found, name)
+                    hive.map.set(isStarter, name, true)
+                }
             }
-        } else if d is ast.Decl.QueryDecl(name, params, _, sql, _) {
-            mut Scan sc2 = Scan(false, [])
-            scanSql(sql, sc2, infer.boundParams(infer.newEnv(t), params, 0))
-            if sc2.spawns {
-                append(found, name)
-                hive.map.set(isStarter, name, true)
+            ast.Decl.QueryDecl(name, params, _, sql, _) {
+                mut Scan sc2 = Scan(false, [])
+                scanSql(sql, sc2, infer.boundParams(infer.newEnv(t), params, 0))
+                if sc2.spawns {
+                    append(found, name)
+                    hive.map.set(isStarter, name, true)
+                }
             }
+            _ { }
         }
     }
     if len(found) == 0 {
@@ -4277,20 +4331,24 @@ proc callGraph(t: types.Table, decls: ast.Decl[]): Graph {
     mut Str[dyn] from = []
     mut Str[dyn] to = []
     for each d in decls {
-        if d is ast.Decl.CallableDecl(_, name, params, _, body, _) {
-            mut Scan sc = Scan(false, [])
-            scanBlock(body, sc, infer.boundParams(infer.newEnv(t), params, 0))
-            for each called in sc.calls {
-                append(from, name)
-                append(to, called)
+        switch d {
+            ast.Decl.CallableDecl(_, name, params, _, body, _) {
+                mut Scan sc = Scan(false, [])
+                scanBlock(body, sc, infer.boundParams(infer.newEnv(t), params, 0))
+                for each called in sc.calls {
+                    append(from, name)
+                    append(to, called)
+                }
             }
-        } else if d is ast.Decl.QueryDecl(name, params, _, sql, _) {
-            mut Scan sc2 = Scan(false, [])
-            scanSql(sql, sc2, infer.boundParams(infer.newEnv(t), params, 0))
-            for each called in sc2.calls {
-                append(from, name)
-                append(to, called)
+            ast.Decl.QueryDecl(name, params, _, sql, _) {
+                mut Scan sc2 = Scan(false, [])
+                scanSql(sql, sc2, infer.boundParams(infer.newEnv(t), params, 0))
+                for each called in sc2.calls {
+                    append(from, name)
+                    append(to, called)
+                }
             }
+            _ { }
         }
     }
     return Graph(from, to)
@@ -4316,114 +4374,145 @@ proc scanStmts(stmts: ast.Stmt[], sc: mut Scan, env: infer.Env, at: Int): void {
 // What matters about a thread is what it is handed. A send's message is copied on
 // the way out, and a call handed nothing that carries storage holds none of ours.
 proc scanStmt(s: ast.Stmt, sc: mut Scan, env: infer.Env): infer.Env {
-    if s is ast.Stmt.VarDecl(name, value, _, deferred, _) {
-        if deferred && handsThread(env, value) { sc.spawns = true }
-        scanExpr(value, sc, env)
-        return infer.bound(env, name, infer.typeOf(env, value))
-    } else if s is ast.Stmt.TypedDecl(declared, name, value, _, deferred, _) {
-        if deferred && handsThread(env, value) { sc.spawns = true }
-        scanExpr(value, sc, env)
-        return infer.bound(env, name, types.resolve(env.table, declared))
-    } else if s is ast.Stmt.Assign(target, value, _) {
-        scanExpr(target, sc, env)
-        scanExpr(value, sc, env)
-    } else if s is ast.Stmt.IfChain(branches, otherwise, _, _) {
-        for each b in branches {
-            scanExpr(b.condition, sc, env)
-            scanBlock(b.body, sc, infer.narrowed(env, b.condition))
+    switch s {
+        ast.Stmt.VarDecl(name, value, _, deferred, _) {
+            if deferred && handsThread(env, value) { sc.spawns = true }
+            scanExpr(value, sc, env)
+            return infer.bound(env, name, infer.typeOf(env, value))
         }
-        scanBlock(otherwise, sc, env)
-    } else if s is ast.Stmt.SwitchStmt(lets, _, arms, _, _) {
-        scanBlock(ast.switchBlock(lets, arms), sc, env)
-    } else if s is ast.Stmt.ForLoop(init, cond, post, body, _) {
-        inner := scanStmt(init, sc, env)
-        scanExpr(cond, sc, inner)
-        scanStmt(post, sc, inner)
-        scanBlock(body, sc, inner)
-    } else if s is ast.Stmt.ForEach(name, declared, subject, body, _) {
-        scanExpr(subject, sc, env)
-        mut element := types.elementOf(infer.typeOf(env, subject))
-        if declared is ast.TypeExpr.VoidType {
-        } else {
-            element = types.resolve(env.table, declared)
+        ast.Stmt.TypedDecl(declared, name, value, _, deferred, _) {
+            if deferred && handsThread(env, value) { sc.spawns = true }
+            scanExpr(value, sc, env)
+            return infer.bound(env, name, types.resolve(env.table, declared))
         }
-        scanBlock(body, sc, infer.bound(env, name, element))
-    } else if s is ast.Stmt.ReturnStmt(value, _) {
-        scanExpr(value, sc, env)
-    } else if s is ast.Stmt.EchoStmt(value, _) {
-        scanExpr(value, sc, env)
-    } else if s is ast.Stmt.AssertStmt(condition, _) {
-        scanExpr(condition, sc, env)
-    } else if s is ast.Stmt.PanicStmt(value, _) {
-        scanExpr(value, sc, env)
-    } else if s is ast.Stmt.AsyncStmt(call, _) {
-        if handsThread(env, call) { sc.spawns = true }
-        scanExpr(call, sc, env)
-    } else if s is ast.Stmt.Expression(value, _) {
-        scanExpr(value, sc, env)
+        ast.Stmt.Assign(target, value, _) {
+            scanExpr(target, sc, env)
+            scanExpr(value, sc, env)
+        }
+        ast.Stmt.IfChain(branches, otherwise, _, _) {
+            for each b in branches {
+                scanExpr(b.condition, sc, env)
+                scanBlock(b.body, sc, infer.narrowed(env, b.condition))
+            }
+            scanBlock(otherwise, sc, env)
+        }
+        ast.Stmt.SwitchStmt(lets, _, arms, _, _) {
+            scanBlock(ast.switchBlock(lets, arms), sc, env)
+        }
+        ast.Stmt.ForLoop(init, cond, post, body, _) {
+            inner := scanStmt(init, sc, env)
+            scanExpr(cond, sc, inner)
+            scanStmt(post, sc, inner)
+            scanBlock(body, sc, inner)
+        }
+        ast.Stmt.ForEach(name, declared, subject, body, _) {
+            scanExpr(subject, sc, env)
+            mut element := types.elementOf(infer.typeOf(env, subject))
+            if declared is ast.TypeExpr.VoidType {
+            } else {
+                element = types.resolve(env.table, declared)
+            }
+            scanBlock(body, sc, infer.bound(env, name, element))
+        }
+        ast.Stmt.ReturnStmt(value, _) {
+            scanExpr(value, sc, env)
+        }
+        ast.Stmt.EchoStmt(value, _) {
+            scanExpr(value, sc, env)
+        }
+        ast.Stmt.AssertStmt(condition, _) {
+            scanExpr(condition, sc, env)
+        }
+        ast.Stmt.PanicStmt(value, _) {
+            scanExpr(value, sc, env)
+        }
+        ast.Stmt.AsyncStmt(call, _) {
+            if handsThread(env, call) { sc.spawns = true }
+            scanExpr(call, sc, env)
+        }
+        ast.Stmt.Expression(value, _) {
+            scanExpr(value, sc, env)
+        }
+        _ { }
     }
     return env
 }
 
 proc scanExpr(e: ast.Expr, sc: mut Scan, env: infer.Env): void {
-    if e is ast.Expr.Call(callee, args, _) {
-        if callee is ast.Expr.Ident(name, _) {
-            append(sc.calls, name)
-        } else {
-            scanExpr(callee, sc, env)
-        }
-        for each a in args {
-            scanExpr(a.value, sc, env)
-        }
-    } else if e is ast.Expr.Interp(parts, _) {
-        for each part in parts {
-            if part is ast.InterpPart.Expression(inner) {
-                scanExpr(inner, sc, env)
+    switch e {
+        ast.Expr.Call(callee, args, _) {
+            if callee is ast.Expr.Ident(name, _) {
+                append(sc.calls, name)
+            } else {
+                scanExpr(callee, sc, env)
+            }
+            for each a in args {
+                scanExpr(a.value, sc, env)
             }
         }
-    } else if e is ast.Expr.VectorLit(items, _) {
-        for each item in items {
-            scanExpr(item, sc, env)
+        ast.Expr.Interp(parts, _) {
+            for each part in parts {
+                if part is ast.InterpPart.Expression(inner) {
+                    scanExpr(inner, sc, env)
+                }
+            }
         }
-    } else if e is ast.Expr.Negate(operand, _) {
-        scanExpr(operand, sc, env)
-    } else if e is ast.Expr.Not(operand, _) {
-        scanExpr(operand, sc, env)
-    } else if e is ast.Expr.BitNot(operand, _) {
-        scanExpr(operand, sc, env)
-    } else if e is ast.Expr.Bits(parts, _) {
-        for each part in parts {
-            scanExpr(part.value, sc, env)
+        ast.Expr.VectorLit(items, _) {
+            for each item in items {
+                scanExpr(item, sc, env)
+            }
         }
-    } else if e is ast.Expr.Binary(_, left, right, _) {
-        scanExpr(left, sc, env)
-        scanExpr(right, sc, env)
-    } else if e is ast.Expr.Member(subject, _, _) {
-        scanExpr(subject, sc, env)
-    } else if e is ast.Expr.Index(subject, index, _) {
-        scanExpr(subject, sc, env)
-        scanExpr(index, sc, env)
-    } else if e is ast.Expr.Slice(subject, low, high, _) {
-        scanExpr(subject, sc, env)
-        scanExpr(low, sc, env)
-        scanExpr(high, sc, env)
-    } else if e is ast.Expr.IsMatch(subject, pattern, _) {
-        scanExpr(subject, sc, env)
-        for each held in ast.patternExprs(pattern) {
-            scanExpr(held, sc, env)
+        ast.Expr.Negate(operand, _) {
+            scanExpr(operand, sc, env)
         }
-    } else if e is ast.Expr.AwaitAll(calls, timeout, _) {
-        // A barrier runs every call in it on a thread of its own.
-        if anyHandsThread(env, calls) { sc.spawns = true }
-        for each c in calls {
-            scanExpr(c, sc, env)
+        ast.Expr.Not(operand, _) {
+            scanExpr(operand, sc, env)
         }
-        scanExpr(timeout, sc, env)
-    } else if e is ast.Expr.Timed(call, ms, _) {
-        // `f(x) with timeout ms` waits on a thread, so it starts one.
-        if handsThread(env, call) { sc.spawns = true }
-        scanExpr(call, sc, env)
-        scanExpr(ms, sc, env)
+        ast.Expr.BitNot(operand, _) {
+            scanExpr(operand, sc, env)
+        }
+        ast.Expr.Bits(parts, _) {
+            for each part in parts {
+                scanExpr(part.value, sc, env)
+            }
+        }
+        ast.Expr.Binary(_, left, right, _) {
+            scanExpr(left, sc, env)
+            scanExpr(right, sc, env)
+        }
+        ast.Expr.Member(subject, _, _) {
+            scanExpr(subject, sc, env)
+        }
+        ast.Expr.Index(subject, index, _) {
+            scanExpr(subject, sc, env)
+            scanExpr(index, sc, env)
+        }
+        ast.Expr.Slice(subject, low, high, _) {
+            scanExpr(subject, sc, env)
+            scanExpr(low, sc, env)
+            scanExpr(high, sc, env)
+        }
+        ast.Expr.IsMatch(subject, pattern, _) {
+            scanExpr(subject, sc, env)
+            for each held in ast.patternExprs(pattern) {
+                scanExpr(held, sc, env)
+            }
+        }
+        ast.Expr.AwaitAll(calls, timeout, _) {
+            // A barrier runs every call in it on a thread of its own.
+            if anyHandsThread(env, calls) { sc.spawns = true }
+            for each c in calls {
+                scanExpr(c, sc, env)
+            }
+            scanExpr(timeout, sc, env)
+        }
+        ast.Expr.Timed(call, ms, _) {
+            // `f(x) with timeout ms` waits on a thread, so it starts one.
+            if handsThread(env, call) { sc.spawns = true }
+            scanExpr(call, sc, env)
+            scanExpr(ms, sc, env)
+        }
+        _ { }
     }
 }
 
@@ -4473,21 +4562,28 @@ func libraryOf(callee: ast.Expr): Str[dyn] {
 
 proc scanSql(parts: ast.SqlPart[], sc: mut Scan, env: infer.Env): void {
     for each part in parts {
-        if part is ast.SqlPart.Param(value) {
-            scanExpr(value, sc, env)
-        } else if part is ast.SqlPart.Where(group) {
-            scanSqlGroup(group, sc, env)
+        switch part {
+            ast.SqlPart.Param(value) {
+                scanExpr(value, sc, env)
+            }
+            ast.SqlPart.Where(group) {
+                scanSqlGroup(group, sc, env)
+            }
+            _ { }
         }
     }
 }
 
 proc scanSqlGroup(group: ast.SqlGroup, sc: mut Scan, env: infer.Env): void {
     for each item in group.items {
-        if item is ast.SqlItem.Cond(condition, body) {
-            scanExpr(condition, sc, env)
-            scanSql(body, sc, env)
-        } else if item is ast.SqlItem.Nested(inner) {
-            scanSqlGroup(inner, sc, env)
+        switch item {
+            ast.SqlItem.Cond(condition, body) {
+                scanExpr(condition, sc, env)
+                scanSql(body, sc, env)
+            }
+            ast.SqlItem.Nested(inner) {
+                scanSqlGroup(inner, sc, env)
+            }
         }
     }
 }
@@ -4521,23 +4617,27 @@ proc emitQuery(em: mut Emit, env: infer.Env, name: Str, params: ast.Param[], res
 
 proc emitSqlParts(em: mut Emit, env: infer.Env, parts: ast.SqlPart[]): void {
     for each part in parts {
-        if part is ast.SqlPart.Lit(written) {
-            if written != "" {
-                line(em, "_sql += " + quoted(written))
+        switch part {
+            ast.SqlPart.Lit(written) {
+                if written != "" {
+                    line(em, "_sql += " + quoted(written))
+                }
             }
-        } else if part is ast.SqlPart.Param(value) {
-            line(em, "_sql += \"?\"")
-            line(em, "_args = append(_args, " + expr(em, env, value, types.Ty.TUnknown()) + ")")
-        } else if part is ast.SqlPart.Where(group) {
-            into := "_where{em.temp}"
-            em.temp = em.temp + 1
-            emitSqlGroup(em, env, group, into)
-            // A block that gathered nothing leaves no WHERE behind, which is why
-            // there is no `WHERE 1 = 1` to write in Hive.
-            open(em, "if " + into + ".Text != \"\" \{")
-            line(em, "_sql += \" WHERE \" + " + into + ".Text")
-            line(em, "_args = append(_args, " + into + ".Args...)")
-            close(em, "}")
+            ast.SqlPart.Param(value) {
+                line(em, "_sql += \"?\"")
+                line(em, "_args = append(_args, " + expr(em, env, value, types.Ty.TUnknown()) + ")")
+            }
+            ast.SqlPart.Where(group) {
+                into := "_where{em.temp}"
+                em.temp = em.temp + 1
+                emitSqlGroup(em, env, group, into)
+                // A block that gathered nothing leaves no WHERE behind, which is why
+                // there is no `WHERE 1 = 1` to write in Hive.
+                open(em, "if " + into + ".Text != \"\" \{")
+                line(em, "_sql += \" WHERE \" + " + into + ".Text")
+                line(em, "_args = append(_args, " + into + ".Args...)")
+                close(em, "}")
+            }
         }
     }
 }
@@ -4550,17 +4650,20 @@ proc emitSqlGroup(em: mut Emit, env: infer.Env, group: ast.SqlGroup, into: Str):
     em.temp = em.temp + 1
     line(em, gathered + " := []hive.SqlFragment\{}")
     for each item in group.items {
-        if item is ast.SqlItem.Cond(condition, body) {
-            open(em, "if " + expr(em, env, condition, types.Ty.TBool()) + " \{")
-            line(em, gathered + " = append(" + gathered + ", hive.SqlFragment\{Text: " + predicateText(em, env, body) + ", Args: []any\{" + predicateArgs(em, env, body) + "}})")
-            close(em, "}")
-        } else if item is ast.SqlItem.Nested(inner) {
-            nested := "_where{em.temp}"
-            em.temp = em.temp + 1
-            emitSqlGroup(em, env, inner, nested)
-            open(em, "if " + nested + ".Text != \"\" \{")
-            line(em, gathered + " = append(" + gathered + ", " + nested + ")")
-            close(em, "}")
+        switch item {
+            ast.SqlItem.Cond(condition, body) {
+                open(em, "if " + expr(em, env, condition, types.Ty.TBool()) + " \{")
+                line(em, gathered + " = append(" + gathered + ", hive.SqlFragment\{Text: " + predicateText(em, env, body) + ", Args: []any\{" + predicateArgs(em, env, body) + "}})")
+                close(em, "}")
+            }
+            ast.SqlItem.Nested(inner) {
+                nested := "_where{em.temp}"
+                em.temp = em.temp + 1
+                emitSqlGroup(em, env, inner, nested)
+                open(em, "if " + nested + ".Text != \"\" \{")
+                line(em, gathered + " = append(" + gathered + ", " + nested + ")")
+                close(em, "}")
+            }
         }
     }
     mut connective := " OR "
@@ -4576,10 +4679,14 @@ proc emitSqlGroup(em: mut Emit, env: infer.Env, group: ast.SqlGroup, into: Str):
 proc predicateText(em: mut Emit, env: infer.Env, body: ast.SqlPart[]): Str {
     mut Str[dyn] out = []
     for each part in body {
-        if part is ast.SqlPart.Lit(written) {
-            append(out, quoted(written))
-        } else if part is ast.SqlPart.Param(_) {
-            append(out, "\"?\"")
+        switch part {
+            ast.SqlPart.Lit(written) {
+                append(out, quoted(written))
+            }
+            ast.SqlPart.Param(_) {
+                append(out, "\"?\"")
+            }
+            _ { }
         }
     }
     if len(out) == 0 {
@@ -5888,10 +5995,13 @@ func sourceOf(e: ast.Expr): Str {
     if e is ast.Expr.Interp(parts, _) {
         mut Str[dyn] out = []
         for each part in parts {
-            if part is ast.InterpPart.Literal(t) {
-                append(out, t)
-            } else if part is ast.InterpPart.Expression(value) {
-                append(out, "\{" + sourceOf(value) + "}")
+            switch part {
+                ast.InterpPart.Literal(t) {
+                    append(out, t)
+                }
+                ast.InterpPart.Expression(value) {
+                    append(out, "\{" + sourceOf(value) + "}")
+                }
             }
         }
         return quoted(join(out, ""))

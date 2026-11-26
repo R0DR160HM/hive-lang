@@ -78,48 +78,57 @@ func typeOf(env: Env, e: ast.Expr): types.Ty {
 }
 
 func typeOfTail(env: Env, e: ast.Expr): types.Ty {
-    if e is ast.Expr.Call(callee, args, _) {
-        return callType(env, callee, args)
-    } else if e is ast.Expr.Member(subject, field, _) {
-        return memberType(env, subject, field)
-    } else if e is ast.Expr.Index(subject, _, _) {
-        // One position of a `Str` is a one-character `Str`: there is no character
-        // type, and that is what `split(s, "")` already hands out.
-        if typeOf(env, subject) is types.Ty.TStr {
-            return types.Ty.TStr()
+    switch e {
+        ast.Expr.Call(callee, args, _) {
+            return callType(env, callee, args)
         }
-        return types.elementOf(typeOf(env, subject))
-    } else if e is ast.Expr.Slice(subject, _, _, _) {
-        if typeOf(env, subject) is types.Ty.TStr {
-            return types.Ty.TStr()
+        ast.Expr.Member(subject, field, _) {
+            return memberType(env, subject, field)
         }
-        // A slice's length is whatever the two bounds worked out to, which is not
-        // a promise the type can keep — so what comes back is dynamic.
-        return types.Ty.TVec(types.elementOf(typeOf(env, subject)), ast.Dim.Dynamic())
-    } else if e is ast.Expr.AwaitAll(calls, timeout, _) {
-        // One barrier resolves to one vector, statically sized: three calls are
-        // three results, in order.
-        mut element := firstCallType(env, calls)
-        whole := types.Ty.TVec(element, ast.Dim.Fixed(len(calls)))
-        // A barrier over *sends* is already a vector of Results, each send
-        // reporting its own failure, so a deadline bounds the waiting rather
-        // than adding an answer.
-        if allSends(env, calls) {
-            return whole
+        ast.Expr.Index(subject, _, _) {
+            // One position of a `Str` is a one-character `Str`: there is no character
+            // type, and that is what `split(s, "")` already hands out.
+            if typeOf(env, subject) is types.Ty.TStr {
+                return types.Ty.TStr()
+            }
+            return types.elementOf(typeOf(env, subject))
         }
-        if timeout is ast.Expr.Absent {
-            return whole
+        ast.Expr.Slice(subject, _, _, _) {
+            if typeOf(env, subject) is types.Ty.TStr {
+                return types.Ty.TStr()
+            }
+            // A slice's length is whatever the two bounds worked out to, which is not
+            // a promise the type can keep — so what comes back is dynamic.
+            return types.Ty.TVec(types.elementOf(typeOf(env, subject)), ast.Dim.Dynamic())
         }
-        return timedResult(whole)
-    } else if e is ast.Expr.Timed(call, _, _) {
-        // `with timeout` on a send is the patience written down rather than a
-        // second answer: a send already answers with a Result.
-        if isSendExpr(env, call) {
+        ast.Expr.AwaitAll(calls, timeout, _) {
+            // One barrier resolves to one vector, statically sized: three calls are
+            // three results, in order.
+            mut element := firstCallType(env, calls)
+            whole := types.Ty.TVec(element, ast.Dim.Fixed(len(calls)))
+            // A barrier over *sends* is already a vector of Results, each send
+            // reporting its own failure, so a deadline bounds the waiting rather
+            // than adding an answer.
+            if allSends(env, calls) {
+                return whole
+            }
+            if timeout is ast.Expr.Absent {
+                return whole
+            }
+            return timedResult(whole)
+        }
+        ast.Expr.Timed(call, _, _) {
+            // `with timeout` on a send is the patience written down rather than a
+            // second answer: a send already answers with a Result.
+            if isSendExpr(env, call) {
+                return typeOf(env, call)
+            }
+            return timedResult(typeOf(env, call))
+        }
+        ast.Expr.Baked(call, _) {
             return typeOf(env, call)
         }
-        return timedResult(typeOf(env, call))
-    } else if e is ast.Expr.Baked(call, _) {
-        return typeOf(env, call)
+        _ { }
     }
     return types.Ty.TUnknown()
 }

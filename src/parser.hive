@@ -984,15 +984,19 @@ proc parseTestDecl(ts: token.Token[], p: mut Parse): ast.Decl {
     advance(p)
     mut title := ""
     k := kindAt(ts, p.pos)
-    if k is token.Kind.StrLit(t) {
-        advance(p)
-        title = t
-    } else if k is token.Kind.StrParts(_) {
-        fail(ts, p, messages.testNameInterpolated())
-        return ast.Decl.TestDecl("", ast.Block([]), line)
-    } else {
-        expected(ts, p, messages.wantedTestName())
-        return ast.Decl.TestDecl("", ast.Block([]), line)
+    switch k {
+        token.Kind.StrLit(t) {
+            advance(p)
+            title = t
+        }
+        token.Kind.StrParts(_) {
+            fail(ts, p, messages.testNameInterpolated())
+            return ast.Decl.TestDecl("", ast.Block([]), line)
+        }
+        _ {
+            expected(ts, p, messages.wantedTestName())
+            return ast.Decl.TestDecl("", ast.Block([]), line)
+        }
     }
     return ast.Decl.TestDecl(title, parseBlock(ts, p), line)
 }
@@ -1607,14 +1611,18 @@ proc parseFor(ts: token.Token[], p: mut Parse): ast.Stmt {
 // it, which the mutability check would otherwise reject. Its name is rechecked
 // for the same reason — a counter is not a constant.
 proc asCounter(ts: token.Token[], p: mut Parse, s: ast.Stmt): ast.Stmt {
-    if s is ast.Stmt.VarDecl(name, value, _, deferred, _) {
-        refuseCounterAsync(ts, p, deferred)
-        checkCounterName(ts, p, name)
-        return ast.Stmt.VarDecl(name, value, true, deferred, s.at)
-    } else if s is ast.Stmt.TypedDecl(declared, name, value, _, deferred, _) {
-        refuseCounterAsync(ts, p, deferred)
-        checkCounterName(ts, p, name)
-        return ast.Stmt.TypedDecl(declared, name, value, true, deferred, s.at)
+    switch s {
+        ast.Stmt.VarDecl(name, value, _, deferred, _) {
+            refuseCounterAsync(ts, p, deferred)
+            checkCounterName(ts, p, name)
+            return ast.Stmt.VarDecl(name, value, true, deferred, s.at)
+        }
+        ast.Stmt.TypedDecl(declared, name, value, _, deferred, _) {
+            refuseCounterAsync(ts, p, deferred)
+            checkCounterName(ts, p, name)
+            return ast.Stmt.TypedDecl(declared, name, value, true, deferred, s.at)
+        }
+        _ { }
     }
     refuseClauseAsync(ts, p, s, messages.loopClauseInit())
     return s
@@ -2323,26 +2331,29 @@ proc parsePrimary(ts: token.Token[], p: mut Parse): ast.Expr {
     began := place(ts, p)
     k := kindAt(ts, p.pos)
 
-    if k is token.Kind.IntLit(v) {
-        advance(p)
-        if v < 0 {
-            return wideLiteral(v, began)
+    switch k {
+        token.Kind.IntLit(v) {
+            advance(p)
+            if v < 0 {
+                return wideLiteral(v, began)
+            }
+            return ast.Expr.IntLit(v, began)
         }
-        return ast.Expr.IntLit(v, began)
-    }
-    else if k is token.Kind.FloatLit(v) { advance(p) return ast.Expr.FloatLit(v, began) }
-    else if k is token.Kind.StrLit(t) { advance(p) return ast.Expr.StrLit(t, began) }
-    else if k is token.Kind.AtomLit(atom) { advance(p) return ast.Expr.AtomLit(atom, began) }
-    else if k is token.Kind.StrParts(parts) { return parseInterp(ts, p, parts) }
-    else if k is token.Kind.Ident(name) {
-        advance(p)
-        // `_` is a hole where a call's argument was expected and a discarding
-        // binding everywhere else. Where it landed decides, so it is carried as
-        // itself and read later.
-        if name == "_" {
-            return ast.Expr.Hole(began)
+        token.Kind.FloatLit(v) { advance(p) return ast.Expr.FloatLit(v, began) }
+        token.Kind.StrLit(t) { advance(p) return ast.Expr.StrLit(t, began) }
+        token.Kind.AtomLit(atom) { advance(p) return ast.Expr.AtomLit(atom, began) }
+        token.Kind.StrParts(parts) { return parseInterp(ts, p, parts) }
+        token.Kind.Ident(name) {
+            advance(p)
+            // `_` is a hole where a call's argument was expected and a discarding
+            // binding everywhere else. Where it landed decides, so it is carried as
+            // itself and read later.
+            if name == "_" {
+                return ast.Expr.Hole(began)
+            }
+            return ast.Expr.Ident(name, began)
         }
-        return ast.Expr.Ident(name, began)
+        _ { }
     }
 
     if k == token.Kind.KwTrue() { advance(p) return ast.Expr.BoolLit(true, began) }
@@ -2490,14 +2501,18 @@ proc parseInterp(ts: token.Token[], p: mut Parse, parts: token.StrPart[]): ast.E
     advance(p)
     mut ast.InterpPart[dyn] out = []
     for each part in parts {
-        if part is token.StrPart.Literal(t) {
-            append(out, ast.InterpPart.Literal(t))
-        } else if part is token.StrPart.Code(source, line, col) {
-            append(out, ast.InterpPart.Expression(parseSubExpr(ts, p, source, at, codeAt(p, line, col))))
-        } else if part is token.StrPart.Hole(name, _) {
-            // `\{name is (regex)}` asks a question, and a string being built has
-            // nobody to answer it.
-            fail(ts, p, messages.holeInBuiltString(name))
+        switch part {
+            token.StrPart.Literal(t) {
+                append(out, ast.InterpPart.Literal(t))
+            }
+            token.StrPart.Code(source, line, col) {
+                append(out, ast.InterpPart.Expression(parseSubExpr(ts, p, source, at, codeAt(p, line, col))))
+            }
+            token.StrPart.Hole(name, _) {
+                // `\{name is (regex)}` asks a question, and a string being built has
+                // nobody to answer it.
+                fail(ts, p, messages.holeInBuiltString(name))
+            }
         }
     }
     return ast.Expr.Interp(out, at)
@@ -2736,47 +2751,51 @@ proc stringPattern(ts: token.Token[], p: mut Parse, parts: token.StrPart[]): ast
     mut token.StrPart[dyn] out = []
     mut Str[dyn] named = []
     for each part in parts {
-        if part is token.StrPart.Code(source, _, _) {
-            name := text.trim(source)
-            if naming.fits(naming.Role.Binding(), name) == false || name == "_" {
-                fail(ts, p, messages.stringPatternHoleNotName(source))
-                return ast.Pattern.StrTemplate(parts)
-            }
-            // Two plain holes side by side have no split point. A hole that says
-            // what it matches does, so the rule is about the open ones only.
-            if wasHole {
-                fail(ts, p, messages.holesSideBySide(name))
-                return ast.Pattern.StrTemplate(parts)
-            }
-            if duplicateHole(named, name, ts, p) {
-                return ast.Pattern.StrTemplate(parts)
-            }
-            append(named, name)
-            append(out, part)
-            wasHole = true
-        } else if part is token.StrPart.Hole(name, pattern) {
-            if naming.fits(naming.Role.Binding(), name) == false || name == "_" {
-                fail(ts, p, messages.holeNameNotBinding(name))
-                return ast.Pattern.StrTemplate(parts)
-            }
-            if duplicateHole(named, name, ts, p) {
-                return ast.Pattern.StrTemplate(parts)
-            }
-            // Read here, once, so a malformed regex is a compile error naming what
-            // is wrong rather than something the Go toolchain says about a file
-            // nobody wrote. What comes back is the same pattern with its capturing
-            // groups made plain.
-            if regex.check(pattern) is Result.Ok(compiled) {
+        switch part {
+            token.StrPart.Code(source, _, _) {
+                name := text.trim(source)
+                if naming.fits(naming.Role.Binding(), name) == false || name == "_" {
+                    fail(ts, p, messages.stringPatternHoleNotName(source))
+                    return ast.Pattern.StrTemplate(parts)
+                }
+                // Two plain holes side by side have no split point. A hole that says
+                // what it matches does, so the rule is about the open ones only.
+                if wasHole {
+                    fail(ts, p, messages.holesSideBySide(name))
+                    return ast.Pattern.StrTemplate(parts)
+                }
+                if duplicateHole(named, name, ts, p) {
+                    return ast.Pattern.StrTemplate(parts)
+                }
                 append(named, name)
-                append(out, token.StrPart.Hole(name, compiled))
-            } else if regex.check(pattern) is Result.Error(why) {
-                fail(ts, p, messages.holeRegexProblem(name, why))
-                return ast.Pattern.StrTemplate(parts)
+                append(out, part)
+                wasHole = true
             }
-            wasHole = false
-        } else {
-            append(out, part)
-            wasHole = false
+            token.StrPart.Hole(name, pattern) {
+                if naming.fits(naming.Role.Binding(), name) == false || name == "_" {
+                    fail(ts, p, messages.holeNameNotBinding(name))
+                    return ast.Pattern.StrTemplate(parts)
+                }
+                if duplicateHole(named, name, ts, p) {
+                    return ast.Pattern.StrTemplate(parts)
+                }
+                // Read here, once, so a malformed regex is a compile error naming what
+                // is wrong rather than something the Go toolchain says about a file
+                // nobody wrote. What comes back is the same pattern with its capturing
+                // groups made plain.
+                if regex.check(pattern) is Result.Ok(compiled) {
+                    append(named, name)
+                    append(out, token.StrPart.Hole(name, compiled))
+                } else if regex.check(pattern) is Result.Error(why) {
+                    fail(ts, p, messages.holeRegexProblem(name, why))
+                    return ast.Pattern.StrTemplate(parts)
+                }
+                wasHole = false
+            }
+            _ {
+                append(out, part)
+                wasHole = false
+            }
         }
     }
     return ast.Pattern.StrTemplate(out)

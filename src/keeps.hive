@@ -50,16 +50,20 @@ proc checkModule(m: ast.Module, cx: prove.Context): diag.Diagnostic[dyn] {
         return kp.errors
     }
     for each d in m.decls {
-        if d is ast.Decl.CallableDecl(kind, name, params, _, body, _) {
-            // A type's law is the one body that may hold a value which does not
-            // keep it: the value it is asked about.
-            if (kind is ast.CallableKind.TypeLawKind) == false {
-                kp.inside = name
-                walkBody(kp, cx, params, body)
+        switch d {
+            ast.Decl.CallableDecl(kind, name, params, _, body, _) {
+                // A type's law is the one body that may hold a value which does not
+                // keep it: the value it is asked about.
+                if (kind is ast.CallableKind.TypeLawKind) == false {
+                    kp.inside = name
+                    walkBody(kp, cx, params, body)
+                }
             }
-        } else if d is ast.Decl.TestDecl(title, body, _) {
-            kp.inside = "\"{title}\""
-            walkBody(kp, cx, [], body)
+            ast.Decl.TestDecl(title, body, _) {
+                kp.inside = "\"{title}\""
+                walkBody(kp, cx, [], body)
+            }
+            _ { }
         }
     }
     return kp.errors
@@ -100,69 +104,84 @@ proc walkStmts(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: 
 }
 
 proc walkStmt(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: infer.Env, path: prove.Path, s: ast.Stmt): prove.Path {
-    if s is ast.Stmt.VarDecl(name, value, mutable, _, _) {
-        held := termOf(kp, pr, cx, scope, path, value)
-        bound(kp, cx, scope, name, value, mutable)
-        return prove.withValue(held.path, name, held.value)
-    } else if s is ast.Stmt.TypedDecl(_, name, value, mutable, _, _) {
-        held := termOf(kp, pr, cx, scope, path, value)
-        bound(kp, cx, scope, name, value, mutable)
-        return prove.withValue(held.path, name, held.value)
-    } else if s is ast.Stmt.Assign(target, value, at) {
-        held := termOf(kp, pr, cx, scope, path, value)
-        rebinding := target is ast.Expr.Ident(_, _)
-        return writeAt(kp, pr, cx, scope, held.path, target, held.value, at, messages.keepsThisWriteTo(prove.exprText(target)), rebinding)
-    } else if s is ast.Stmt.IfChain(branches, otherwise, hasElse, _) {
-        return walkIf(kp, pr, cx, scope, path, branches, otherwise, hasElse)
-    } else if s is ast.Stmt.SwitchStmt(lets, _, arms, _, _) {
-        lowered := ast.switchBlock(lets, arms)
-        return walkStmts(kp, pr, cx, scope, path, lowered.stmts, 0)
-    } else if s is ast.Stmt.ForEach(name, _, subject, body, _) {
-        held := termOf(kp, pr, cx, scope, path, subject)
-        element := types.elementOf(infer.typeOf(scope, subject))
-        mut prove.Path p = forgetWritten(kp, pr, cx, scope, held.path, body.stmts)
-        item := prove.fresh(pr, element, name)
-        p = prove.withTypeLaws(pr, cx, prove.withValue(p, name, item), item)
-        sharedBefore := sharingOf(kp)
-        mut Sharing added = Sharing([], [])
-        _ := walkStmts(kp, pr, cx, infer.bound(scope, name, element), p, body.stmts, 0)
-        backTo(kp, sharedBefore, added)
-        settle(kp, sharedBefore, added)
-        return forgetWritten(kp, pr, cx, scope, held.path, body.stmts)
-    } else if s is ast.Stmt.ForLoop(init, cond, post, body, _) {
-        started := walkStmt(kp, pr, cx, scope, path, init)
-        inner := prove.scopeAfter(scope, init)
-        mut ast.Stmt[dyn] written = []
-        for each b in body.stmts {
-            append(written, b)
+    switch s {
+        ast.Stmt.VarDecl(name, value, mutable, _, _) {
+            held := termOf(kp, pr, cx, scope, path, value)
+            bound(kp, cx, scope, name, value, mutable)
+            return prove.withValue(held.path, name, held.value)
         }
-        append(written, post)
-        p := forgetWritten(kp, pr, cx, inner, started, written)
-        held := termOf(kp, pr, cx, inner, p, cond)
-        looping := knowing(pr, cx, held.path, held.value)
-        sharedBefore := sharingOf(kp)
-        mut Sharing added = Sharing([], [])
-        afterBody := walkStmts(kp, pr, cx, inner, looping, body.stmts, 0)
-        _ := walkStmt(kp, pr, cx, inner, afterBody, post)
-        backTo(kp, sharedBefore, added)
-        settle(kp, sharedBefore, added)
-        return forgetWritten(kp, pr, cx, inner, started, written)
-    } else if s is ast.Stmt.ReturnStmt(value, _) {
-        if (value is ast.Expr.Absent) == false {
-            _ := termOf(kp, pr, cx, scope, path, value)
+        ast.Stmt.TypedDecl(_, name, value, mutable, _, _) {
+            held := termOf(kp, pr, cx, scope, path, value)
+            bound(kp, cx, scope, name, value, mutable)
+            return prove.withValue(held.path, name, held.value)
         }
-        return path
-    } else if s is ast.Stmt.AssertStmt(condition, _) {
-        held := termOf(kp, pr, cx, scope, path, condition)
-        return knowing(pr, cx, held.path, held.value)
-    } else if s is ast.Stmt.EchoStmt(value, _) {
-        return termOf(kp, pr, cx, scope, path, value).path
-    } else if s is ast.Stmt.PanicStmt(value, _) {
-        return termOf(kp, pr, cx, scope, path, value).path
-    } else if s is ast.Stmt.Expression(value, _) {
-        return termOf(kp, pr, cx, scope, path, value).path
-    } else if s is ast.Stmt.AsyncStmt(call, _) {
-        return termOf(kp, pr, cx, scope, path, call).path
+        ast.Stmt.Assign(target, value, at) {
+            held := termOf(kp, pr, cx, scope, path, value)
+            rebinding := target is ast.Expr.Ident(_, _)
+            return writeAt(kp, pr, cx, scope, held.path, target, held.value, at, messages.keepsThisWriteTo(prove.exprText(target)), rebinding)
+        }
+        ast.Stmt.IfChain(branches, otherwise, hasElse, _) {
+            return walkIf(kp, pr, cx, scope, path, branches, otherwise, hasElse)
+        }
+        ast.Stmt.SwitchStmt(lets, _, arms, _, _) {
+            lowered := ast.switchBlock(lets, arms)
+            return walkStmts(kp, pr, cx, scope, path, lowered.stmts, 0)
+        }
+        ast.Stmt.ForEach(name, _, subject, body, _) {
+            held := termOf(kp, pr, cx, scope, path, subject)
+            element := types.elementOf(infer.typeOf(scope, subject))
+            mut prove.Path p = forgetWritten(kp, pr, cx, scope, held.path, body.stmts)
+            item := prove.fresh(pr, element, name)
+            p = prove.withTypeLaws(pr, cx, prove.withValue(p, name, item), item)
+            sharedBefore := sharingOf(kp)
+            mut Sharing added = Sharing([], [])
+            _ := walkStmts(kp, pr, cx, infer.bound(scope, name, element), p, body.stmts, 0)
+            backTo(kp, sharedBefore, added)
+            settle(kp, sharedBefore, added)
+            return forgetWritten(kp, pr, cx, scope, held.path, body.stmts)
+        }
+        ast.Stmt.ForLoop(init, cond, post, body, _) {
+            started := walkStmt(kp, pr, cx, scope, path, init)
+            inner := prove.scopeAfter(scope, init)
+            mut ast.Stmt[dyn] written = []
+            for each b in body.stmts {
+                append(written, b)
+            }
+            append(written, post)
+            p := forgetWritten(kp, pr, cx, inner, started, written)
+            held := termOf(kp, pr, cx, inner, p, cond)
+            looping := knowing(pr, cx, held.path, held.value)
+            sharedBefore := sharingOf(kp)
+            mut Sharing added = Sharing([], [])
+            afterBody := walkStmts(kp, pr, cx, inner, looping, body.stmts, 0)
+            _ := walkStmt(kp, pr, cx, inner, afterBody, post)
+            backTo(kp, sharedBefore, added)
+            settle(kp, sharedBefore, added)
+            return forgetWritten(kp, pr, cx, inner, started, written)
+        }
+        ast.Stmt.ReturnStmt(value, _) {
+            if (value is ast.Expr.Absent) == false {
+                _ := termOf(kp, pr, cx, scope, path, value)
+            }
+            return path
+        }
+        ast.Stmt.AssertStmt(condition, _) {
+            held := termOf(kp, pr, cx, scope, path, condition)
+            return knowing(pr, cx, held.path, held.value)
+        }
+        ast.Stmt.EchoStmt(value, _) {
+            return termOf(kp, pr, cx, scope, path, value).path
+        }
+        ast.Stmt.PanicStmt(value, _) {
+            return termOf(kp, pr, cx, scope, path, value).path
+        }
+        ast.Stmt.Expression(value, _) {
+            return termOf(kp, pr, cx, scope, path, value).path
+        }
+        ast.Stmt.AsyncStmt(call, _) {
+            return termOf(kp, pr, cx, scope, path, call).path
+        }
+        _ { }
     }
     return path
 }
@@ -717,65 +736,80 @@ proc keep(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, path: prove.
 // What an expression comes to here, as one term: worked out where it can be, and
 // otherwise an unknown of its type that keeps the type's laws.
 proc termOf(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: infer.Env, path: prove.Path, e: ast.Expr): prove.Out {
-    if e is ast.Expr.IntLit(v, _) {
-        return prove.Out(path, terms.Term.IntK(v))
-    } else if e is ast.Expr.StrLit(v, _) {
-        return prove.Out(path, terms.Term.StrK(v))
-    } else if e is ast.Expr.BoolLit(v, _) {
-        return prove.Out(path, terms.Term.BoolK(v))
-    } else if e is ast.Expr.AtomLit(v, _) {
-        return prove.Out(path, terms.Term.AtomK(v))
-    } else if e is ast.Expr.FloatLit(v, _) {
-        return prove.Out(path, terms.Term.FloatK(v))
-    } else if e is ast.Expr.Ident(name, _) {
-        if hive.map.get(path.env, name) is Result.Ok(v) {
-            return prove.Out(path, v)
+    switch e {
+        ast.Expr.IntLit(v, _) {
+            return prove.Out(path, terms.Term.IntK(v))
         }
-        return unknownOf(pr, cx, scope, path, e)
-    } else if e is ast.Expr.Not(x, _) {
-        held := termOf(kp, pr, cx, scope, path, x)
-        return prove.Out(held.path, terms.negation(prove.normIn(cx, held.path, held.value)))
-    } else if e is ast.Expr.Negate(x, _) {
-        held := termOf(kp, pr, cx, scope, path, x)
-        if infer.typeOf(scope, x) is types.Ty.TInt {
-            return prove.Out(held.path, prove.negate(prove.normIn(cx, held.path, held.value)))
+        ast.Expr.StrLit(v, _) {
+            return prove.Out(path, terms.Term.StrK(v))
         }
-        return unknownOf(pr, cx, scope, held.path, e)
-    } else if e is ast.Expr.Binary(op, l, r, _) {
-        left := termOf(kp, pr, cx, scope, path, l)
-        right := termOf(kp, pr, cx, infer.narrowed(scope, l), left.path, r)
-        a := prove.normIn(cx, right.path, left.value)
-        b := prove.normIn(cx, right.path, right.value)
-        if op is ast.BinOp.And {
-            return prove.Out(right.path, terms.both(a, b))
+        ast.Expr.BoolLit(v, _) {
+            return prove.Out(path, terms.Term.BoolK(v))
         }
-        if op is ast.BinOp.Or {
-            return prove.Out(right.path, terms.either(a, b))
+        ast.Expr.AtomLit(v, _) {
+            return prove.Out(path, terms.Term.AtomK(v))
         }
-        if prove.combine(op, infer.typeOf(scope, l), a, b) is Result.Ok(v) {
-            return prove.Out(right.path, v)
+        ast.Expr.FloatLit(v, _) {
+            return prove.Out(path, terms.Term.FloatK(v))
         }
-        return unknownOf(pr, cx, scope, right.path, e)
-    } else if e is ast.Expr.Member(subject, field, _) {
-        held := termOf(kp, pr, cx, scope, path, subject)
-        for each o in prove.project(pr, cx, held.path, held.value, field, infer.typeOf(scope, e)) {
-            return o
+        ast.Expr.Ident(name, _) {
+            if hive.map.get(path.env, name) is Result.Ok(v) {
+                return prove.Out(path, v)
+            }
+            return unknownOf(pr, cx, scope, path, e)
         }
-        return unknownOf(pr, cx, scope, held.path, e)
-    } else if e is ast.Expr.Call(callee, args, at) {
-        return callOf(kp, pr, cx, scope, path, e, callee, args, at)
-    } else if e is ast.Expr.VectorLit(items, _) {
-        mut prove.Path p = path
-        mut terms.Term[dyn] values = []
-        for each item in items {
-            held := termOf(kp, pr, cx, scope, p, item)
-            p = held.path
-            append(values, held.value)
+        ast.Expr.Not(x, _) {
+            held := termOf(kp, pr, cx, scope, path, x)
+            return prove.Out(held.path, terms.negation(prove.normIn(cx, held.path, held.value)))
         }
-        return prove.Out(p, terms.Term.VecK(values))
-    } else if e is ast.Expr.IsMatch(subject, _, _) {
-        held := termOf(kp, pr, cx, scope, path, subject)
-        return unknownOf(pr, cx, scope, held.path, e)
+        ast.Expr.Negate(x, _) {
+            held := termOf(kp, pr, cx, scope, path, x)
+            if infer.typeOf(scope, x) is types.Ty.TInt {
+                return prove.Out(held.path, prove.negate(prove.normIn(cx, held.path, held.value)))
+            }
+            return unknownOf(pr, cx, scope, held.path, e)
+        }
+        ast.Expr.Binary(op, l, r, _) {
+            left := termOf(kp, pr, cx, scope, path, l)
+            right := termOf(kp, pr, cx, infer.narrowed(scope, l), left.path, r)
+            a := prove.normIn(cx, right.path, left.value)
+            b := prove.normIn(cx, right.path, right.value)
+            if op is ast.BinOp.And {
+                return prove.Out(right.path, terms.both(a, b))
+            }
+            if op is ast.BinOp.Or {
+                return prove.Out(right.path, terms.either(a, b))
+            }
+            if prove.combine(op, infer.typeOf(scope, l), a, b) is Result.Ok(v) {
+                return prove.Out(right.path, v)
+            }
+            return unknownOf(pr, cx, scope, right.path, e)
+        }
+        ast.Expr.Member(subject, field, _) {
+            held := termOf(kp, pr, cx, scope, path, subject)
+            for each o in prove.project(pr, cx, held.path, held.value, field, infer.typeOf(scope, e)) {
+                return o
+            }
+            return unknownOf(pr, cx, scope, held.path, e)
+        }
+        ast.Expr.Call(callee, args, at) {
+            return callOf(kp, pr, cx, scope, path, e, callee, args, at)
+        }
+        ast.Expr.VectorLit(items, _) {
+            mut prove.Path p = path
+            mut terms.Term[dyn] values = []
+            for each item in items {
+                held := termOf(kp, pr, cx, scope, p, item)
+                p = held.path
+                append(values, held.value)
+            }
+            return prove.Out(p, terms.Term.VecK(values))
+        }
+        ast.Expr.IsMatch(subject, _, _) {
+            held := termOf(kp, pr, cx, scope, path, subject)
+            return unknownOf(pr, cx, scope, held.path, e)
+        }
+        _ { }
     }
     // Whatever else it is, what it builds is still checked.
     mut prove.Path p = path
@@ -787,31 +821,40 @@ proc termOf(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: inf
 
 func subExprs(e: ast.Expr): ast.Expr[dyn] {
     mut ast.Expr[dyn] out = []
-    if e is ast.Expr.Index(subject, index, _) {
-        append(out, subject)
-        append(out, index)
-    } else if e is ast.Expr.Slice(subject, low, high, _) {
-        append(out, subject)
-        append(out, low)
-        append(out, high)
-    } else if e is ast.Expr.Interp(parts, _) {
-        for each part in parts {
-            if part is ast.InterpPart.Expression(value) {
-                append(out, value)
+    switch e {
+        ast.Expr.Index(subject, index, _) {
+            append(out, subject)
+            append(out, index)
+        }
+        ast.Expr.Slice(subject, low, high, _) {
+            append(out, subject)
+            append(out, low)
+            append(out, high)
+        }
+        ast.Expr.Interp(parts, _) {
+            for each part in parts {
+                if part is ast.InterpPart.Expression(value) {
+                    append(out, value)
+                }
             }
         }
-    } else if e is ast.Expr.AwaitAll(calls, timeout, _) {
-        for each c in calls {
-            append(out, c)
+        ast.Expr.AwaitAll(calls, timeout, _) {
+            for each c in calls {
+                append(out, c)
+            }
+            append(out, timeout)
         }
-        append(out, timeout)
-    } else if e is ast.Expr.Timed(call, ms, _) {
-        append(out, call)
-        append(out, ms)
-    } else if e is ast.Expr.Baked(call, _) {
-        append(out, call)
-    } else if e is ast.Expr.BitNot(x, _) {
-        append(out, x)
+        ast.Expr.Timed(call, ms, _) {
+            append(out, call)
+            append(out, ms)
+        }
+        ast.Expr.Baked(call, _) {
+            append(out, call)
+        }
+        ast.Expr.BitNot(x, _) {
+            append(out, x)
+        }
+        _ { }
     }
     return out
 }
@@ -828,23 +871,27 @@ proc callOf(kp: mut Keeping, pr: mut prove.Prover, cx: prove.Context, scope: inf
     mut typeName := ""
     mut variant := ""
     mut ast.Field[dyn] fields = []
-    if callee is ast.Expr.Ident(name, _) {
-        if infer.isBound(scope, name) == false && hive.map.has(cx.callables, name) == false {
-            if types.fieldsOfStruct(scope.table, name) is Result.Ok(found) {
-                typeName = name
-                fields = found
-            }
-        }
-    } else if callee is ast.Expr.Member(subject, field, _) {
-        if subject is ast.Expr.Ident(head, _) {
-            if infer.isBound(scope, head) == false {
-                if types.findVariant(scope.table, head, field) is Result.Ok(found) {
-                    typeName = head
-                    variant = field
+    switch callee {
+        ast.Expr.Ident(name, _) {
+            if infer.isBound(scope, name) == false && hive.map.has(cx.callables, name) == false {
+                if types.fieldsOfStruct(scope.table, name) is Result.Ok(found) {
+                    typeName = name
                     fields = found
                 }
             }
         }
+        ast.Expr.Member(subject, field, _) {
+            if subject is ast.Expr.Ident(head, _) {
+                if infer.isBound(scope, head) == false {
+                    if types.findVariant(scope.table, head, field) is Result.Ok(found) {
+                        typeName = head
+                        variant = field
+                        fields = found
+                    }
+                }
+            }
+        }
+        _ { }
     }
     if typeName != "" && infer.hasHole(args) == false {
         mut Str[dyn] names = []
