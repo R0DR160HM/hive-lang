@@ -20,7 +20,7 @@ Source files end in **`.hive`**. The standard library is reached as **`hive.*`**
 | [02 — Grammar](02-grammar.md) | the whole surface syntax, in EBNF |
 | [03 — Types](03-types.md) | scalars, vectors, `Result`, declared types, function types, maps |
 | [04 — Declarations](04-declarations.md) | `type`, `func`, `proc`, `query`, `test`, `law`, `import` |
-| [05 — Expressions](05-expressions.md) | operators, precedence, calls, interpolation, arithmetic at the edges |
+| [05 — Expressions](05-expressions.md) | operators, precedence, calls, interpolation, arithmetic at the edges, `with compiler` |
 | [06 — Statements](06-statements.md) | bindings, assignment, control flow, `switch`, `echo` / `assert` / `panic` |
 | [07 — Patterns](07-patterns.md) | `is`, its four pattern kinds, the two kinds of string hole, narrowing and exhaustiveness, a `switch`'s coverage |
 | [08 — Mutability and value semantics](08-mutability-and-values.md) | `mut`, `mut` parameters, copy-on-binding |

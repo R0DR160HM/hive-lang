@@ -1945,3 +1945,57 @@ test "an empty map takes the type of the slot it lands in, through what is writt
     assert problemCount("func make(): Result<hive.map.Map<Str, Int>, Str> \{ return Result.Ok(hive.map.new()) }\n" + inMain("if make() is Result.Ok(m) \{ echo 1 }")) == 0
     assert problemCount(inMain("mut hive.map.Map<Str, hive.map.Map<Str, Int>> outer = hive.map.new()  hive.map.set(outer, \"a\", hive.map.new())  echo 1")) == 0
 }
+
+// --- `with compiler` ---------------------------------------------------------
+
+test "a `with compiler` call may be handed literals and what other such calls answered" {
+    defs := "type Point \{ x: Int  y: Int }\nfunc sum(v: Int[], p: Point, s: Str): Int \{ return len(v) + p.x + len(s) }\nfunc three(): Int \{ return 3 }\n"
+    assert problemCount(defs + inMain("echo sum([1, -2], Point(1, 2), \"a\") with compiler")) == 0
+    assert problemCount(defs + inMain("n := three() with compiler\necho sum([n, three() with compiler], Point(n, 0), `b`) with compiler")) == 0
+}
+
+test "an argument worked out when the program runs is refused" {
+    defs := "func twice(n: Int): Int \{ return n * 2 }\n"
+    assert opens(problem(defs + inMain("n := 2\necho twice(n) with compiler")), "in `main`: `n` is not known while the program builds")
+    assert opens(problem(defs + inMain("echo twice(1 + 1) with compiler")), "in `main`: an argument of a `with compiler` call has to be known")
+    assert opens(problem(defs + inMain("mut n := twice(1) with compiler\necho twice(n) with compiler")), "in `main`: `n` is not known while the program builds")
+}
+
+test "a name bound twice in the body is not trusted, even to a `with compiler` call" {
+    defs := "func twice(n: Int): Int \{ return n * 2 }\n"
+    body := "n := twice(1) with compiler\nif n > 0 \{ n := 5\necho twice(n) with compiler }"
+    assert opens(problem(defs + inMain(body)), "in `main`: `n` is not known while the program builds")
+}
+
+test "a `with compiler` call names the function it calls" {
+    defs := "func twice(n: Int): Int \{ return n * 2 }\n"
+    assert opens(problem(defs + inMain("f := twice\necho f(1) with compiler")), "in `main`: `f` is a variable")
+}
+
+test "what a `with compiler` call answers has to be data" {
+    assert opens(problem("func log(): void \{ echo 1 }\n" + inMain("x := log() with compiler")), "in `main`: `with compiler` builds what the call answers into the program, and this call answers with nothing")
+    pick := "func twice(n: Int): Int \{ return n * 2 }\nfunc pick(): func(Int): Int \{ return twice }\n"
+    assert opens(problem(pick + inMain("f := pick() with compiler")), "in `main`: `with compiler` builds what the call answers into the program, so it has to be data, and `func(Int): Int` holds a function")
+    held := "type Held \{ key: Secret<Str> }\nfunc held(): Held \{ return Held(bypass(\"k\")) }\n"
+    assert text.contains(problem(held + inMain("h := held() with compiler")), "holds a `Secret`")
+}
+
+test "a `with compiler` call in a test may be handed what another answered" {
+    defs := "func three(): Int \{ return 3 }\nfunc twice(n: Int): Int \{ return n * 2 }\n"
+    assert problemCount(defs + "test \"six\" \{ n := three() with compiler\nassert twice(n) with compiler == 6 }") == 0
+}
+
+test "two `with compiler` calls that wait on each other are refused" {
+    defs := "func a(): Int \{ return b() with compiler }\nfunc b(): Int \{ return a() + 1 }\n"
+    assert opens(problem(defs + inMain("echo a()")), "in `a`: the build cannot run `b()`")
+}
+
+test "trim takes one Str" {
+    assert problemCount(inMain("echo trim(\"  a  \")")) == 0
+    assert problemCount(inMain("echo trim(str: \" a\")")) == 0
+    assert opens(problem(inMain("echo trim(12)")), "in `main`: what `trim` takes the ends off wants Str and this is Int")
+}
+
+test "a declaration of your own called trim is the one called" {
+    assert problemCount("func trim(n: Int): Int \{ return n }\n" + inMain("echo trim(3) + 1")) == 0
+}

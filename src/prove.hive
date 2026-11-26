@@ -2309,6 +2309,9 @@ proc eval(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, e: ast.Expr
         return one(path, terms.Term.Hole())
     } else if e is ast.Expr.Absent(_) {
         return one(path, terms.Term.VoidK())
+    } else if e is ast.Expr.Baked(call, _) {
+        // What was built in is what the call answered, once.
+        return eval(pr, cx, scope, path, call)
     }
     return lostOut(path, messages.proveNotYet(exprText(e)), e.at)
 }
@@ -3160,7 +3163,7 @@ proc evalBuiltin(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, name
         }
         return lostOut(path, messages.proveOntoVariableOnly(name), at)
     }
-    if name == "join" || name == "split" || name == "replaceFirst" || name == "replaceAll" || name == "indexOf" {
+    if name == "join" || name == "split" || name == "replaceFirst" || name == "replaceAll" || name == "indexOf" || name == "trim" {
         mut Out[dyn] out = []
         for each o in evalAll(pr, cx, scope, path, values, 0, []) {
             if running(o.path) == false {
@@ -3181,6 +3184,9 @@ proc evalBuiltin(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, name
                 }
             } else if name == "indexOf" && terms.nth(known, 0) is terms.Term.Unknown(_, _) {
                 append(out, Out(o.path, unseenSearch(pr, terms.nth(known, 0), terms.nth(known, 1))))
+            } else if name == "trim" {
+                // The same unknown for the same text, so a guard and a law asking agree.
+                append(out, Out(o.path, part(pr, "trim(" + terms.key(terms.nth(known, 0)) + ")", types.Ty.TStr(), "trim")))
             } else {
                 append(out, Out(lost(o.path, messages.proveKnownValuesOnly(name), at), terms.Term.VoidK()))
             }
@@ -3790,6 +3796,21 @@ proc unseenSearch(pr: mut Prover, v: terms.Term, sought: terms.Term): terms.Term
     return part(pr, "indexOf(" + terms.key(v) + "," + terms.key(sought) + ")", types.Ty.TResult(types.Ty.TInt(), types.Ty.TBool()), "indexOf")
 }
 
+// Whether `trim` would stop where `text.trim` stopped: the program trims every
+// space Unicode names, and an end that is plain printable ASCII is none of them.
+func plainEnds(s: Str): Bool {
+    cs := text.chars(s)
+    last := len(cs) - 1
+    if last < 0 {
+        return true
+    }
+    return plainChar(text.charAt(cs, 0)) && plainChar(text.charAt(cs, last))
+}
+
+func plainChar(c: Str): Bool {
+    return bytes(c) == 1 && c > " "
+}
+
 func concreteBuiltin(name: Str, args: terms.Term[]): Result<terms.Term, Bool> {
     a := terms.nth(args, 0)
     b := terms.nth(args, 1)
@@ -3814,6 +3835,14 @@ func concreteBuiltin(name: Str, args: terms.Term[]): Result<terms.Term, Bool> {
                 }
             }
             return Result.Ok(terms.Term.StrK(join(pieces, sep)))
+        }
+    }
+    if name == "trim" {
+        if a is terms.Term.StrK(s) {
+            trimmed := text.trim(s)
+            if plainEnds(trimmed) {
+                return Result.Ok(terms.Term.StrK(trimmed))
+            }
         }
     }
     if name == "replaceFirst" || name == "replaceAll" {
@@ -4122,6 +4151,8 @@ func namesIn(e: ast.Expr): Str[dyn] {
         }
     } else if e is ast.Expr.Timed(call, ms, _) {
         return namesIn(call) + namesIn(ms)
+    } else if e is ast.Expr.Baked(call, _) {
+        return namesIn(call)
     }
     return out
 }
@@ -4467,6 +4498,8 @@ func exprText(e: ast.Expr): Str {
         return "_"
     } else if e is ast.Expr.Timed(call, ms, _) {
         return exprText(call) + " with timeout " + exprText(ms)
+    } else if e is ast.Expr.Baked(call, _) {
+        return exprText(call) + " with compiler"
     } else if e is ast.Expr.AwaitAll(calls, timeout, _) {
         mut Str[dyn] out = []
         for each c in calls {

@@ -17,6 +17,7 @@ import ./infer
 import ./emit
 import ./laws
 import ./loader
+import ./messages
 import ./mono
 import ./paths
 import ./progress
@@ -180,11 +181,11 @@ proc checked(entry: Str, from: Int): Compiled {
             return refused(loader.placed(program, entry, unproved))
         }
     }
-    return Compiled(laws.without(expanded.module), emit.Emitted("", [], [], [], [], [], false, []), [], program.sources, program.module, found.landings)
+    return Compiled(laws.without(expanded.module), emit.Emitted("", [], [], [], [], [], false, [], [], ""), [], program.sources, program.module, found.landings)
 }
 
 func refused(errors: diag.Diagnostic[dyn]): Compiled {
-    return Compiled(ast.Module([], [], [], ast.noLibrary()), emit.Emitted("", [], [], [], [], [], false, []), errors, [], ast.Module([], [], [], ast.noLibrary()), [])
+    return Compiled(ast.Module([], [], [], ast.noLibrary()), emit.Emitted("", [], [], [], [], [], false, [], [], ""), errors, [], ast.Module([], [], [], ast.noLibrary()), [])
 }
 
 // Compile `entry` and write the Go project for it, with the tests titled in `titles`.
@@ -288,7 +289,80 @@ proc build(entry: Str, titles: Str[], from: Int): Written {
         // can say what coverage is *of* — and name what no test reached.
         put(directory, "declarations.tsv", join(emitted.spans, "\n") + "\n", written, errors)
     }
+    if len(emitted.bakes) > 0 && len(errors) == 0 {
+        baked(entry, directory, emitted, linksForeign(made.module.foreign), from, written, errors)
+    }
     return Written(directory, written, linksForeign(made.module.foreign), emitted.window, errors)
+}
+
+// --- Calls run while the program builds ----------------------------------------
+
+// Every `with compiler` call, run, and its answer built in: the project is built
+// once with `bake.go`, that run writes each answer down as Go, and `baked.go` holds
+// them for the program's own build. It runs on this machine whatever the target,
+// from the entrypoint's folder, as `hive run` runs the program.
+proc baked(entry: Str, directory: Str, emitted: emit.Emitted, thirdParty: Bool, from: Int, written: mut Str[dyn], errors: mut diag.Diagnostic[dyn]): void {
+    answers := paths.joinPath(directory, "baked")
+    put(directory, "bake.go", emitted.bakeSource, written, errors)
+    put(directory + "/hive", "bake.go", runtime.moduleSource("bake") + "\n", written, errors)
+    put(answers, "", "", written, errors)
+    if len(errors) > 0 {
+        return
+    }
+    if resolveDeps(Written(directory, written, thirdParty, false, []), from) is Result.Error(why) {
+        append(errors, why)
+        return
+    }
+    progress.step(from, "go build — what runs while the program builds")
+    runner := "bake" + goExe("")
+    made := toolchain(["build", "-tags", "hivebake", "-o", runner, "."], directory, "")
+    if made.code != 0 {
+        append(errors, goFailed(entry, made))
+        return
+    }
+    progress.step(from, "running " + progress.counted(len(emitted.bakes), "call") + " with compiler")
+    // From the entrypoint's folder, where the build directory is one step down.
+    beside := paths.baseOf(directory)
+    mut hive.map.Map<Str, Str> told = hive.map.new()
+    hive.map.set(told, "HIVE_BAKE_OUT", paths.joinPath(beside, "baked"))
+    mut said := ""
+    ran := hive.term.execWith(paths.joinPath(".", paths.joinPath(beside, runner)), [], paths.dirOf(entry), told)
+    if ran is Result.Error(why) {
+        said = text.trim(why.output)
+    }
+    mut Str[dyn] lines = ["//go:build !hivebake", "", "package main", "", "import \"hiveapp/hive\"", "", "const hiveBaking = false", "", "func hiveBake() \{}", "", "var _ hive.Atom"]
+    mut index := 0
+    for each b in emitted.bakes {
+        place := paths.joinPath(answers, "{index}")
+        if hive.file.read(place + ".said") is Result.Ok(printed) {
+            tellPrinted(b, printed)
+        }
+        if hive.file.read(place + ".value") is Result.Ok(literal) {
+            append(lines, "")
+            append(lines, "var " + b.name + " " + b.goType + " = " + literal)
+        } else if hive.file.read(place + ".panic") is Result.Ok(why) {
+            append(errors, diag.on(b.at, messages.bakedPanicked(b.shown, why)))
+            return
+        } else {
+            mut shown := ""
+            if said != "" {
+                shown = indented(said)
+            }
+            append(errors, diag.on(b.at, messages.bakedStopped(b.shown, shown)))
+            return
+        }
+        index = index + 1
+    }
+    put(directory, "baked.go", join(lines, "\n") + "\n", written, errors)
+}
+
+// What a call printed while it ran, each line under the place it was written.
+proc tellPrinted(b: emit.Bake, printed: Str): void {
+    for each piece in split(text.replace(printed, "\r\n", "\n"), "\n") {
+        if piece != "" {
+            hive.term.status("{b.at.file}:{b.at.line}: " + piece)
+        }
+    }
 }
 
 func onlyTests(module: ast.Module, titles: Str[]): ast.Module {

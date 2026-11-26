@@ -26,6 +26,7 @@ func pages(): page.Page[dyn] {
         page.Page("patterns.md", patterns()),
         page.Page("mutability.md", mutability()),
         page.Page("concurrency.md", concurrency()),
+        page.Page("build-time.md", buildTime()),
         page.Page("bounds.md", proofs()),
         page.Page("generics.md", generics()),
         page.Page("modules.md", modules()),
@@ -75,6 +76,7 @@ func index(): Str {
         | [patterns](patterns.md) | ~BT~is~BT~, its four pattern kinds, nesting them, narrowing, exhaustiveness, a ~BT~switch~BT~'s coverage |
         | [mutability](mutability.md) | ~BT~mut~BT~, ~BT~mut~BT~ parameters, why a binding sometimes copies |
         | [concurrency](concurrency.md) | ~BT~async~BT~, the await-all, ~BT~with timeout~BT~ |
+        | [build-time](build-time.md) | ~BT~with compiler~BT~: a call run while the program builds, its answer built in |
         | [bounds](bounds.md) | how every index and slice is proved in range |
         | [generics](generics.md) | type variables and monomorphization |
         | [modules](modules.md) | ~BT~import~BT~, the four path kinds, importing Go, the library's short names |
@@ -151,10 +153,10 @@ func syntax(): Str {
         ~BT~Return~BT~, a type may be called ~BT~Query~BT~, and a variable ~BT~proC~BT~. A field cannot
         be called ~BT~type~BT~, since that is the keyword itself.
 
-        Three words are keywords only where they are written and are ordinary names
+        Four words are keywords only where they are written and are ordinary names
         everywhere else: ~BT~as~BT~ (after an import path), ~BT~timeout~BT~ (in
-        ~BT~with timeout~BT~) and ~BT~table~BT~ (in a law's ~BT~for table~BT~). So a variable may be
-        called ~BT~timeout~BT~ or ~BT~table~BT~.
+        ~BT~with timeout~BT~), ~BT~compiler~BT~ (in ~BT~with compiler~BT~) and ~BT~table~BT~ (in a law's
+        ~BT~for table~BT~). So a variable may be called ~BT~timeout~BT~, ~BT~compiler~BT~ or ~BT~table~BT~.
 
         ## Names have shapes, and the shape is enforced
 
@@ -945,6 +947,8 @@ func expressions(): Str {
 
         * **~BT~with timeout <ms>~BT~** bounds a wait and turns its result into
           ~BT~Result<T, hive.task.TimeoutError>~BT~. See [concurrency](concurrency.md).
+        * **~BT~with compiler~BT~** runs the call while the program builds and builds its
+          answer in. See [build-time](build-time.md).
 
         A decode target is not written here: reading a document into a declared type
         is ~BT~User.decode(text, hive.json.codec())~BT~, the decoder that type derives
@@ -1569,6 +1573,86 @@ func concurrency(): Str {
     `)
 }
 
+func buildTime(): Str {
+    return page.backticked(`
+        # Build time
+
+        **~BT~f(x) with compiler~BT~ runs the call while the program builds**, and its answer is
+        built into the executable in place of the call. Running the program reads the
+        value and nothing else: no file is opened, nothing is fetched, nothing is worked
+        out again.
+
+        ~CODE~hive
+        proc main(): void \{
+        	// countries.csv, read once by the build: the program carries the map, not the file.
+        	names := countries() with compiler
+        	if hive.map.get(names, "BR") is Result.Ok(name) \{
+        		echo name
+        	}
+        }
+        ~CODE~
+
+        ## Where one is written
+
+        * **Only in the entrypoint**, the file handed to ~BT~hive build~BT~, so whatever runs on
+          the building machine is named in that one file. The function it calls may come
+          from any module.
+        * **After a call**, like ~BT~with timeout~BT~, and as tightly: ~BT~x |> f() with compiler~BT~
+          is ~BT~f(x) with compiler~BT~. It is an expression and stands wherever a value does,
+          but never beside ~BT~async~BT~.
+        * **The function is named.** A variable holding one is only known when the program
+          runs.
+
+        ## What it is handed
+
+        Every argument is known before the program runs:
+
+        * a literal — ~BT~3~BT~, ~BT~-1.5~BT~, ~BT~"a"~BT~ with nothing interpolated, ~BT~true~BT~, ~BT~#Ready~BT~;
+        * a vector or a constructor of them — ~BT~[1, 2]~BT~, ~BT~Point(1, 2)~BT~, ~BT~Result.Ok(1)~BT~,
+          ~BT~UInt8(3)~BT~;
+        * what another ~BT~with compiler~BT~ call answers, written in place or through a name
+          the body binds **once**, without ~BT~mut~BT~:
+
+        ~CODE~hive
+        listing := releases() with compiler
+        readmes := readmesOf(listing) with compiler    // handed what the first answered
+        ~CODE~
+
+        A name the body binds twice anywhere — shadowed in an inner block, say — is not
+        taken, since which of the two is meant is settled only as the program runs.
+
+        ## What it answers
+
+        **Data**: numbers, text, ~BT~Bool~BT~, atoms, vectors, maps, ~BT~Result~BT~s, and declared types
+        made of them, the library's error unions included. A function, an ~BT~Address~BT~, a
+        ~BT~Secret~BT~ (readable by anyone holding the executable), a codec, a query, or a type
+        the library owns — ~BT~hive.json.JsonValue~BT~, ~BT~hive.net.HttpResponse~BT~ — is a compile
+        error, and so is a call answering with nothing.
+
+        Every read of the value is the program's own copy, so a ~BT~mut~BT~ binding of one
+        changes nothing for the next read.
+
+        ## When it runs
+
+        * **~BT~hive build~BT~, ~BT~run~BT~, ~BT~test~BT~ and ~BT~export~BT~ run every call**, each build, before
+          the program itself is compiled: on this machine whatever the target, and **from
+          the entrypoint's folder**, so a relative path reads as it would under ~BT~hive run~BT~.
+          Nothing is kept from one build to the next.
+        * **~BT~hive check~BT~, ~BT~hive emit~BT~ and the language server never run one.** The type is
+          what the function declares it answers.
+        * **A call runs after every one it waits on**: one written in its arguments, and one
+          inside any function its own run may reach. Two that wait on each other are a
+          compile error.
+        * **A panic or a failed ~BT~assert~BT~ in one is a compile error** at the call, saying what
+          it panicked with. A run that ends any other way — ~BT~hive.term.exit~BT~, a crash on
+          another thread — is reported with what it printed.
+        * What a call prints is shown under the line it is written on:
+          ~BT~main.hive:12: read 7 countries~BT~.
+
+        *From ~BT~spec/05-expressions.md~BT~.*
+    `)
+}
+
 func proofs(): Str {
     return page.backticked(`
         # Bounds
@@ -1962,6 +2046,7 @@ func builtins(): Str {
         | ~BT~split~BT~ | ~BT~(Str, Str): Str[dyn]~BT~ | splits on ~BT~sep~BT~ |
         | ~BT~replaceFirst~BT~ | ~BT~(Str, Str, Str): Str~BT~ | the first ~BT~from~BT~, rewritten |
         | ~BT~replaceAll~BT~ | ~BT~(Str, Str, Str): Str~BT~ | every ~BT~from~BT~, rewritten |
+        | ~BT~trim~BT~ | ~BT~(Str): Str~BT~ | without the white space at either end |
         | ~BT~indexOf~BT~ | ~BT~(T[], T): Result<Int, Bool>~BT~ / ~BT~(Str, Str): …~BT~ | position of the first match |
         | ~BT~row~BT~ | ~BT~(Table, Str): Str[dyn]~BT~ | the row whose first cell equals ~BT~key~BT~, else ~BT~[]~BT~ |
         | ~BT~column~BT~ | ~BT~(Table, Str): Str[dyn]~BT~ | the column whose top cell equals ~BT~key~BT~, else ~BT~[]~BT~ |
@@ -1983,6 +2068,8 @@ func builtins(): Str {
         ~BT~len~BT~ and ~BT~bytes~BT~ differ only for strings: for ~BT~"café"~BT~, ~BT~len~BT~ is ~BT~4~BT~ and ~BT~bytes~BT~
         is ~BT~5~BT~. ~BT~replaceFirst~BT~ and ~BT~replaceAll~BT~ **answer with a new string**, take plain
         text rather than a pattern, and are not an error when ~BT~from~BT~ is absent.
+        ~BT~trim~BT~ takes off every white space Unicode names — spaces, tabs, line ends,
+        no-break spaces — and leaves the middle alone: ~BT~trim(" a b\n")~BT~ is ~BT~"a b"~BT~.
 
         ~BT~toTable~BT~ fills its rows left to right and takes what is left for the last:
         ~BT~toTable(["1", "2", "3", "4", "5", "6", "7"], 3)~BT~ is
@@ -3078,6 +3165,21 @@ func pitfalls(): Str {
 
         **What went wrong is a library error's variant**, matched like any union's →
         ~BT~why is file.FileError.NotFound~BT~, or a ~BT~switch~BT~ over every one.
+
+        ## Build time
+
+        **~BT~with compiler~BT~ is written in the entrypoint only.** A file the entrypoint imports
+        may not run anything while the program builds. → make the call from the
+        entrypoint and hand its answer down.
+
+        **What a ~BT~with compiler~BT~ call is handed has to be known before the program runs**:
+        literals, vectors and constructors of them, and the answers of other such calls.
+        ~BT~n := 2~BT~ then ~BT~f(n) with compiler~BT~ is an error. → ~BT~f(2) with compiler~BT~, or
+        ~BT~n := two() with compiler~BT~ first.
+
+        **What it answers has to be data.** A function, an ~BT~Address~BT~, a ~BT~Secret~BT~ or a type
+        the library owns, such as ~BT~hive.json.JsonValue~BT~, is an error, and so is a call
+        answering with nothing.
 
         ## Collections and modules
 

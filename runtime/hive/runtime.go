@@ -737,6 +737,9 @@ func Join(v []string, sep string) string { return strings.Join(v, sep) }
 // a program reaches a string's characters at all.
 func Split(s, sep string) []string { return strings.Split(s, sep) }
 
+// Trim is a Str without the white space at either end, Unicode's included.
+func Trim(s string) string { return strings.TrimSpace(s) }
+
 // ReplaceFirst rewrites the first occurrence of from, and ReplaceAll every
 // one of them. Both answer with a new string: a Str is a value, so nothing
 // is written through.
@@ -1307,6 +1310,21 @@ func (d Dict[K, V]) Values() []V {
 }
 
 func (d Dict[K, V]) Len() int { return len(d.order) }
+
+// DictOf is a map given its keys and values in order: how a `with compiler`
+// call's answer is built back into the program.
+func DictOf[K comparable, V any](keys []K, values []V) Dict[K, V] {
+	d := NewDict[K, V]()
+	for i, k := range keys {
+		d.Set(k, values[i])
+	}
+	return d
+}
+
+// FloatBits and Float32Bits are a float no decimal spells: an infinity, a NaN, -0.
+func FloatBits(bits uint64) float64 { return math.Float64frombits(bits) }
+
+func Float32Bits(bits uint32) float32 { return math.Float32frombits(bits) }
 
 // Clone copies a map's key order and its lookup. A value that owns storage
 // of its own is passed through clone, so the copy shares nothing.

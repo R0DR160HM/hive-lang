@@ -1,0 +1,692 @@
+// Calls run while the program builds
+// ==================================
+// `f(x) with compiler` runs once, while the program builds, and its answer is built
+// into the executable in place of the call. What may be built in and what such a
+// call may be handed are decided here, for the checker and the emitter alike.
+//
+// An argument has to be known before the program runs: a literal, a vector or a
+// constructor of them, another such call, or a name bound once to one. A name is
+// trusted only where the body binds it exactly once, so no shadowing inner name can
+// be the one meant.
+import ./ast
+import ./text
+import ./token
+import ./types
+
+// A name bound once, without `mut`, to a `with compiler` call.
+type Constant {
+    name: Str
+    value: ast.Expr
+}
+
+// One `with compiler` call of the program. `call` is as written but for each
+// argument naming a constant, which is that constant's call instead.
+type Site {
+    key: Str
+    decl: Str
+    at: token.Pos
+    call: ast.Expr
+}
+
+// What identifies a call: the declaration it is written in and where.
+func keyOf(decl: Str, at: token.Pos): Str {
+    return "{decl}@{at.line}:{at.col}"
+}
+
+// The Go variable a call's answer is held in, named for where the call is written,
+// so the program and its tests, emitted apart, read the same one.
+func varOf(decl: Str, at: token.Pos): Str {
+    mut Str[dyn] kept = []
+    for each c in text.chars(decl) {
+        if text.isAlnum(c) && bytes(c) == 1 {
+            append(kept, c)
+        } else {
+            append(kept, "_")
+        }
+    }
+    return "_baked_" + join(kept, "") + "_{at.line}_{at.col}"
+}
+
+// --- What may be built in ----------------------------------------------------
+
+// `""` when a value of `ty` can be written down and built in, or what in it cannot.
+func notData(t: types.Table, ty: types.Ty): Str {
+    return notDataIn(t, ty, [])
+}
+
+func notDataIn(t: types.Table, ty: types.Ty, seen: Str[]): Str {
+    switch ty {
+        types.Ty.TVec(element, _) {
+            return notDataIn(t, element, seen)
+        }
+        types.Ty.TResult(ok, bad) {
+            first := notDataIn(t, ok, seen)
+            if first != "" {
+                return first
+            }
+            return notDataIn(t, bad, seen)
+        }
+        types.Ty.TMap(key, value) {
+            first := notDataIn(t, key, seen)
+            if first != "" {
+                return first
+            }
+            return notDataIn(t, value, seen)
+        }
+        types.Ty.TNamed(name) {
+            return notDataInNamed(t, name, seen)
+        }
+        types.Ty.TFn(_, _, _, _) { return "a function" }
+        types.Ty.TAddress(_) { return "an `Address`, which names a service that only exists while the program runs" }
+        types.Ty.TSecret(_) { return "a `Secret`, which built into the executable would be readable by anyone holding the file" }
+        types.Ty.TCodec(_) { return "a codec" }
+        types.Ty.TFragment(_) { return "a query" }
+        types.Ty.TLib(_, _) { return "`" + types.show(ty) + "`, which the standard library owns" }
+        _ { return "" }
+    }
+}
+
+func notDataInNamed(t: types.Table, name: Str, seen: Str[]): Str {
+    if indexOf(seen, name) is Result.Ok(_) {
+        return ""
+    }
+    if types.findType(t, name) is Result.Ok(info) {
+        next := seen + [name]
+        for each f in info.shared {
+            found := notDataIn(t, types.resolve(t, f.declared), next)
+            if found != "" {
+                return found
+            }
+        }
+        for each v in info.variants {
+            for each f in v.fields {
+                found := notDataIn(t, types.resolve(t, f.declared), next)
+                if found != "" {
+                    return found
+                }
+            }
+        }
+    }
+    return ""
+}
+
+// --- What may be handed to one -----------------------------------------------
+
+// The names `body` binds exactly once, without `mut`, to a `with compiler` call.
+func constants(params: ast.Param[], body: ast.Block): Constant[dyn] {
+    mut Str[dyn] bound = []
+    for each p in params {
+        append(bound, p.name)
+    }
+    mut Constant[dyn] candidates = []
+    bindingsOf(body.stmts, bound, candidates)
+    mut Constant[dyn] out = []
+    for each c in candidates {
+        if timesIn(bound, c.name) == 1 {
+            append(out, c)
+        }
+    }
+    return out
+}
+
+func timesIn(names: Str[], name: Str): Int {
+    mut n := 0
+    for each one in names {
+        if one == name {
+            n = n + 1
+        }
+    }
+    return n
+}
+
+// Every name the statements bind, however deep and whichever way, and the
+// bindings of a `with compiler` call among them.
+proc bindingsOf(stmts: ast.Stmt[], bound: mut Str[dyn], candidates: mut Constant[dyn]): void {
+    for each s in stmts {
+        bindingOf(s, bound, candidates)
+    }
+}
+
+proc bindingOf(s: ast.Stmt, bound: mut Str[dyn], candidates: mut Constant[dyn]): void {
+    switch s {
+        ast.Stmt.VarDecl(name, value, mutable, deferred, _) {
+            declared(name, value, mutable || deferred, bound, candidates)
+        }
+        ast.Stmt.TypedDecl(_, name, value, mutable, deferred, _) {
+            declared(name, value, mutable || deferred, bound, candidates)
+        }
+        ast.Stmt.Assign(target, value, _) {
+            matchesIn(target, bound)
+            matchesIn(value, bound)
+        }
+        ast.Stmt.IfChain(branches, otherwise, _, _) {
+            for each b in branches {
+                matchesIn(b.condition, bound)
+                bindingsOf(b.body.stmts, bound, candidates)
+            }
+            bindingsOf(otherwise.stmts, bound, candidates)
+        }
+        ast.Stmt.SwitchStmt(lets, subjects, arms, _, _) {
+            bindingsOf(lets, bound, candidates)
+            for each subject in subjects {
+                matchesIn(subject, bound)
+            }
+            for each arm in arms {
+                matchesIn(arm.condition, bound)
+                bindingsOf(arm.body.stmts, bound, candidates)
+            }
+        }
+        ast.Stmt.ForLoop(init, cond, post, body, _) {
+            bindingOf(init, bound, candidates)
+            matchesIn(cond, bound)
+            bindingOf(post, bound, candidates)
+            bindingsOf(body.stmts, bound, candidates)
+        }
+        ast.Stmt.ForEach(name, _, subject, body, _) {
+            append(bound, name)
+            matchesIn(subject, bound)
+            bindingsOf(body.stmts, bound, candidates)
+        }
+        ast.Stmt.ReturnStmt(value, _) { matchesIn(value, bound) }
+        ast.Stmt.EchoStmt(value, _) { matchesIn(value, bound) }
+        ast.Stmt.AssertStmt(condition, _) { matchesIn(condition, bound) }
+        ast.Stmt.PanicStmt(value, _) { matchesIn(value, bound) }
+        ast.Stmt.AsyncStmt(call, _) { matchesIn(call, bound) }
+        ast.Stmt.Expression(value, _) { matchesIn(value, bound) }
+        _ { }
+    }
+}
+
+// A name declared, and a candidate where it holds a `with compiler` call and may never change.
+proc declared(name: Str, value: ast.Expr, changes: Bool, bound: mut Str[dyn], candidates: mut Constant[dyn]): void {
+    append(bound, name)
+    if changes == false && value is ast.Expr.Baked(_, _) {
+        append(candidates, Constant(name, value))
+    }
+    matchesIn(value, bound)
+}
+
+// The names every match inside `e` binds.
+proc matchesIn(e: ast.Expr, bound: mut Str[dyn]): void {
+    for each inner in partsOf(e) {
+        matchesIn(inner, bound)
+    }
+    if e is ast.Expr.IsMatch(_, pattern, _) {
+        for each name in ast.boundBy(pattern) {
+            append(bound, name)
+        }
+    }
+}
+
+// The expressions directly inside `e`.
+func partsOf(e: ast.Expr): ast.Expr[dyn] {
+    mut ast.Expr[dyn] out = []
+    switch e {
+        ast.Expr.Interp(parts, _) {
+            for each part in parts {
+                if part is ast.InterpPart.Expression(value) {
+                    append(out, value)
+                }
+            }
+        }
+        ast.Expr.VectorLit(items, _) {
+            for each item in items {
+                append(out, item)
+            }
+        }
+        ast.Expr.Negate(operand, _) { append(out, operand) }
+        ast.Expr.Not(operand, _) { append(out, operand) }
+        ast.Expr.BitNot(operand, _) { append(out, operand) }
+        ast.Expr.Bits(parts, _) {
+            for each part in parts {
+                append(out, part.value)
+            }
+        }
+        ast.Expr.Binary(_, left, right, _) {
+            append(out, left)
+            append(out, right)
+        }
+        ast.Expr.Call(callee, args, _) {
+            append(out, callee)
+            for each a in args {
+                append(out, a.value)
+            }
+        }
+        ast.Expr.Member(subject, _, _) { append(out, subject) }
+        ast.Expr.Index(subject, index, _) {
+            append(out, subject)
+            append(out, index)
+        }
+        ast.Expr.Slice(subject, low, high, _) {
+            append(out, subject)
+            append(out, low)
+            append(out, high)
+        }
+        ast.Expr.IsMatch(subject, pattern, _) {
+            append(out, subject)
+            for each held in ast.patternExprs(pattern) {
+                append(out, held)
+            }
+        }
+        ast.Expr.AwaitAll(calls, timeout, _) {
+            for each c in calls {
+                append(out, c)
+            }
+            append(out, timeout)
+        }
+        ast.Expr.Timed(call, ms, _) {
+            append(out, call)
+            append(out, ms)
+        }
+        ast.Expr.Baked(call, _) { append(out, call) }
+        _ { }
+    }
+    return out
+}
+
+// `""` when an argument is known while the program builds. Otherwise the name it
+// reads that is not, or `"*"` for anything else that has to be worked out.
+func unsettled(e: ast.Expr, known: Constant[]): Str {
+    switch e {
+        ast.Expr.IntLit(_, _) { return "" }
+        ast.Expr.FloatLit(_, _) { return "" }
+        ast.Expr.StrLit(_, _) { return "" }
+        ast.Expr.BoolLit(_, _) { return "" }
+        ast.Expr.AtomLit(_, _) { return "" }
+        ast.Expr.Baked(_, _) { return "" }
+        ast.Expr.Negate(operand, _) { return unsettled(operand, known) }
+        ast.Expr.VectorLit(items, _) {
+            for each item in items {
+                found := unsettled(item, known)
+                if found != "" {
+                    return found
+                }
+            }
+            return ""
+        }
+        ast.Expr.Interp(parts, _) {
+            for each part in parts {
+                if part is ast.InterpPart.Expression(_) {
+                    return "*"
+                }
+            }
+            return ""
+        }
+        ast.Expr.Ident(name, _) {
+            if constantNamed(known, name) is Result.Ok(_) {
+                return ""
+            }
+            return name
+        }
+        // A type, a variant or a sized number is spelled in PascalCase and nothing
+        // else is, so a call whose last name is is a constructor.
+        ast.Expr.Call(callee, args, _) {
+            if isConstructor(callee) == false {
+                return "*"
+            }
+            for each a in args {
+                found := unsettled(a.value, known)
+                if found != "" {
+                    return found
+                }
+            }
+            return ""
+        }
+        _ { return "*" }
+    }
+}
+
+func isConstructor(callee: ast.Expr): Bool {
+    switch callee {
+        ast.Expr.Ident(name, _) { return startsUpper(name) }
+        ast.Expr.Member(_, field, _) { return startsUpper(field) }
+        _ { return false }
+    }
+}
+
+func startsUpper(name: Str): Bool {
+    return text.isUpper(text.charAt(text.chars(name), 0))
+}
+
+func constantNamed(known: Constant[], name: Str): Result<ast.Expr, Bool> {
+    for each c in known {
+        if c.name == name {
+            return Result.Ok(c.value)
+        }
+    }
+    return Result.Error(false)
+}
+
+// The call as the build runs it: a name it reads is the call that name was bound to.
+func settled(e: ast.Expr, known: Constant[]): ast.Expr {
+    switch e {
+        ast.Expr.Ident(name, _) {
+            if constantNamed(known, name) is Result.Ok(value) {
+                return value
+            }
+            return e
+        }
+        ast.Expr.Negate(operand, at) {
+            return ast.Expr.Negate(settled(operand, known), at)
+        }
+        ast.Expr.VectorLit(items, at) {
+            mut ast.Expr[dyn] out = []
+            for each item in items {
+                append(out, settled(item, known))
+            }
+            return ast.Expr.VectorLit(out, at)
+        }
+        ast.Expr.Call(callee, args, at) {
+            mut ast.Arg[dyn] out = []
+            for each a in args {
+                append(out, ast.Arg(a.name, settled(a.value, known)))
+            }
+            return ast.Expr.Call(callee, out, at)
+        }
+        _ { return e }
+    }
+}
+
+// --- Every call the build runs ------------------------------------------------
+
+// In the order the build has to run them: a call before any that is handed its
+// answer, or that reaches a function reading it.
+func sitesOf(m: ast.Module): Site[dyn] {
+    found := writtenSites(m)
+    if ordered(m, found) is Result.Ok(sites) {
+        return sites
+    }
+    return found
+}
+
+// A call whose run reaches, however indirectly, one that waits on its own answer.
+func cycleIn(m: ast.Module): Result<Site, Bool> {
+    found := writtenSites(m)
+    if ordered(m, found) is Result.Error(stuck) {
+        return Result.Ok(stuck)
+    }
+    return Result.Error(false)
+}
+
+// Each call after every one it waits on, the order written otherwise. A call waits
+// on one written in its arguments, and on every one inside a callable it may reach:
+// whatever its callee and arguments name, and whatever those name in turn, called
+// or handed along as a value alike.
+func ordered(m: ast.Module, sites: Site[]): Result<Site[dyn], Site> {
+    callables := callableNames(m)
+    named := namedBy(m, callables)
+    mut Site[dyn] out = []
+    mut Str[dyn] done = []
+    mut moved := true
+    for ; moved && len(out) < len(sites); {
+        moved = false
+        for each s in sites {
+            if indexOf(done, s.key) is Result.Ok(_) {
+                continue
+            }
+            if waitsOnNone(s, sites, done, reached(namesIn(s.call, callables), named)) {
+                append(out, s)
+                append(done, s.key)
+                moved = true
+            }
+        }
+    }
+    for each s in sites {
+        if indexOf(done, s.key) is Result.Error(_) {
+            return Result.Error(s)
+        }
+    }
+    return Result.Ok(out)
+}
+
+func waitsOnNone(s: Site, sites: Site[], done: Str[], reach: Str[]): Bool {
+    inline := bakedIn(s.call, s.decl)
+    for each t in sites {
+        waits := indexOf(reach, t.decl) is Result.Ok(_) || indexOf(inline, t.key) is Result.Ok(_)
+        if waits && (t.key == s.key || indexOf(done, t.key) is Result.Error(_)) {
+            return false
+        }
+    }
+    return true
+}
+
+// The keys of the `with compiler` calls written inside `e`, a constant's included.
+func bakedIn(e: ast.Expr, decl: Str): Str[dyn] {
+    mut Str[dyn] out = []
+    if e is ast.Expr.Baked(_, _) {
+        append(out, keyOf(decl, e.at))
+    }
+    for each inner in partsOf(e) {
+        for each key in bakedIn(inner, decl) {
+            append(out, key)
+        }
+    }
+    return out
+}
+
+type Named {
+    decl: Str
+    names: Str[dyn]
+}
+
+func callableNames(m: ast.Module): Str[dyn] {
+    mut Str[dyn] out = []
+    for each d in m.decls {
+        if d is ast.Decl.CallableDecl(_, name, _, _, _, _) {
+            append(out, name)
+        }
+    }
+    return out
+}
+
+// The callables each callable's body names.
+func namedBy(m: ast.Module, callables: Str[]): Named[dyn] {
+    mut Named[dyn] out = []
+    for each d in m.decls {
+        if d is ast.Decl.CallableDecl(_, name, _, _, body, _) {
+            mut Str[dyn] names = []
+            for each e in exprsIn(body.stmts) {
+                for each n in namesIn(e, callables) {
+                    if indexOf(names, n) is Result.Error(_) {
+                        append(names, n)
+                    }
+                }
+            }
+            append(out, Named(name, names))
+        }
+    }
+    return out
+}
+
+// Every callable reachable from `start`, `start` included.
+func reached(start: Str[], named: Named[]): Str[dyn] {
+    mut Str[dyn] out = []
+    for each s in start {
+        append(out, s)
+    }
+    for i := 0; i < len(out); i++ {
+        if out bounds i {
+            here := out[i]
+            for each n in named {
+                if n.decl == here {
+                    for each next in n.names {
+                        if indexOf(out, next) is Result.Error(_) {
+                            append(out, next)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return out
+}
+
+// The callables an expression names, anywhere inside it.
+func namesIn(e: ast.Expr, callables: Str[]): Str[dyn] {
+    mut Str[dyn] out = []
+    if e is ast.Expr.Ident(name, _) {
+        if indexOf(callables, name) is Result.Ok(_) {
+            append(out, name)
+        }
+    }
+    for each inner in partsOf(e) {
+        for each n in namesIn(inner, callables) {
+            append(out, n)
+        }
+    }
+    return out
+}
+
+// Every expression the statements hold, however deep.
+func exprsIn(stmts: ast.Stmt[]): ast.Expr[dyn] {
+    mut ast.Expr[dyn] out = []
+    for each s in stmts {
+        for each e in exprsOfStmt(s) {
+            append(out, e)
+        }
+    }
+    return out
+}
+
+func exprsOfStmt(s: ast.Stmt): ast.Expr[dyn] {
+    switch s {
+        ast.Stmt.VarDecl(_, value, _, _, _) { return [value] }
+        ast.Stmt.TypedDecl(_, _, value, _, _, _) { return [value] }
+        ast.Stmt.Assign(target, value, _) { return [target, value] }
+        ast.Stmt.ReturnStmt(value, _) { return [value] }
+        ast.Stmt.EchoStmt(value, _) { return [value] }
+        ast.Stmt.AssertStmt(condition, _) { return [condition] }
+        ast.Stmt.PanicStmt(value, _) { return [value] }
+        ast.Stmt.AsyncStmt(call, _) { return [call] }
+        ast.Stmt.Expression(value, _) { return [value] }
+        ast.Stmt.IfChain(branches, otherwise, _, _) {
+            mut ast.Expr[dyn] out = []
+            for each b in branches {
+                append(out, b.condition)
+                for each e in exprsIn(b.body.stmts) {
+                    append(out, e)
+                }
+            }
+            return out + exprsIn(otherwise.stmts)
+        }
+        ast.Stmt.SwitchStmt(lets, subjects, arms, _, _) {
+            mut ast.Expr[dyn] out = exprsIn(lets)
+            for each subject in subjects {
+                append(out, subject)
+            }
+            for each arm in arms {
+                append(out, arm.condition)
+                for each e in exprsIn(arm.body.stmts) {
+                    append(out, e)
+                }
+            }
+            return out
+        }
+        ast.Stmt.ForLoop(init, cond, post, body, _) {
+            return exprsOfStmt(init) + [cond] + exprsOfStmt(post) + exprsIn(body.stmts)
+        }
+        ast.Stmt.ForEach(_, _, subject, body, _) {
+            return [subject] + exprsIn(body.stmts)
+        }
+        _ { return [] }
+    }
+}
+
+// Every `with compiler` call, in the order written: what a call is handed before the call.
+func writtenSites(m: ast.Module): Site[dyn] {
+    mut Site[dyn] out = []
+    for each d in m.decls {
+        switch d {
+            ast.Decl.CallableDecl(kind, name, params, _, body, _) {
+                if (kind is ast.CallableKind.LawKind || kind is ast.CallableKind.TypeLawKind) == false {
+                    sitesInBlock(name, constants(params, body), body, out)
+                }
+            }
+            ast.Decl.TestDecl(_, body, _) {
+                sitesInBlock(ast.declName(d), constants([], body), body, out)
+            }
+            _ { }
+        }
+    }
+    return out
+}
+
+proc sitesInBlock(decl: Str, known: Constant[], body: ast.Block, out: mut Site[dyn]): void {
+    for each s in body.stmts {
+        sitesInStmt(decl, known, s, out)
+    }
+}
+
+proc sitesInStmt(decl: Str, known: Constant[], s: ast.Stmt, out: mut Site[dyn]): void {
+    switch s {
+        ast.Stmt.IfChain(branches, otherwise, _, _) {
+            for each b in branches {
+                sitesInExpr(decl, known, b.condition, out)
+                sitesInBlock(decl, known, b.body, out)
+            }
+            sitesInBlock(decl, known, otherwise, out)
+        }
+        ast.Stmt.SwitchStmt(lets, subjects, arms, _, _) {
+            for each l in lets {
+                sitesInStmt(decl, known, l, out)
+            }
+            for each subject in subjects {
+                sitesInExpr(decl, known, subject, out)
+            }
+            for each arm in arms {
+                sitesInExpr(decl, known, arm.condition, out)
+                sitesInBlock(decl, known, arm.body, out)
+            }
+        }
+        ast.Stmt.ForLoop(init, cond, post, body, _) {
+            sitesInStmt(decl, known, init, out)
+            sitesInExpr(decl, known, cond, out)
+            sitesInStmt(decl, known, post, out)
+            sitesInBlock(decl, known, body, out)
+        }
+        ast.Stmt.ForEach(_, _, subject, body, _) {
+            sitesInExpr(decl, known, subject, out)
+            sitesInBlock(decl, known, body, out)
+        }
+        _ {
+            for each e in exprsOfStmt(s) {
+                sitesInExpr(decl, known, e, out)
+            }
+        }
+    }
+}
+
+// What a call is handed is run before the call itself.
+proc sitesInExpr(decl: Str, known: Constant[], e: ast.Expr, out: mut Site[dyn]): void {
+    for each inner in partsOf(e) {
+        sitesInExpr(decl, known, inner, out)
+    }
+    if e is ast.Expr.Baked(call, _) {
+        key := keyOf(decl, e.at)
+        for each site in out {
+            if site.key == key {
+                return
+            }
+        }
+        append(out, Site(key, decl, e.at, settled(call, known)))
+    }
+}
+
+// How a message names the call: what it calls, with its arguments left out.
+func shown(call: ast.Expr): Str {
+    if call is ast.Expr.Call(callee, args, _) {
+        if len(args) == 0 {
+            return calleeName(callee) + "()"
+        }
+        return calleeName(callee) + "(…)"
+    }
+    return "this call"
+}
+
+func calleeName(callee: ast.Expr): Str {
+    switch callee {
+        ast.Expr.Ident(name, _) { return name }
+        ast.Expr.Member(subject, field, _) { return calleeName(subject) + "." + field }
+        _ { return "…" }
+    }
+}

@@ -15,6 +15,7 @@
 // because Hive allows a binding nothing reads and Go does not; and every value goes
 // through the generated `hive` package, so the file imports exactly one thing.
 import ./ast
+import ./bake
 import ./diag
 import ./infer
 import ./messages
@@ -51,6 +52,19 @@ type Emitted {
     // `hive.ui.html` alone is not that, so the module list cannot answer it.
     window: Bool
     errors: diag.Diagnostic[dyn]
+    // Every `with compiler` call, in the order the build runs them, and `bake.go`,
+    // the Go that runs them. Both empty for a program that runs nothing while it builds.
+    bakes: Bake[dyn]
+    bakeSource: Str
+}
+
+// A call the build runs before the program does: where it is written, how a
+// message names it, and the variable its answer is built into the program as.
+type Bake {
+    at: token.Pos
+    shown: Str
+    name: Str
+    goType: Str
 }
 
 type Emit {
@@ -130,6 +144,10 @@ type Emit {
     // Each type's laws, as `Type<tab>law`: what a decoder checks a value it read
     // keeps before handing it over.
     typeLaws: Str[dyn]
+    // The `with compiler` calls, and the declared types one answers with that a
+    // printer has been asked for.
+    sites: bake.Site[dyn]
+    printers: Str[dyn]
 }
 
 // For a test of this pass: a program nothing has checked.
@@ -139,7 +157,7 @@ proc emitModule(m: ast.Module): Emitted {
 
 proc emitChecked(m: ast.Module, landings: infer.Landing[]): Emitted {
     t := types.tableOf(m)
-    mut Emit em = Emit(t, [], 0, ["Nil"], [], [], [], [], [], [], 0, [], [], [], [], false, false, false, -1, [], writes.writtenShapes(m), [], token.nowhere(), "", false, [], [], "", [], [], landings, typeLawsIn(t, m.decls))
+    mut Emit em = Emit(t, [], 0, ["Nil"], [], [], [], [], [], [], 0, [], [], [], [], false, false, false, -1, [], writes.writtenShapes(m), [], token.nowhere(), "", false, [], [], "", [], [], landings, typeLawsIn(t, m.decls), bake.sitesOf(m), [])
 
     line(em, "package main")
     line(em, "")
@@ -175,6 +193,8 @@ proc emitChecked(m: ast.Module, landings: infer.Landing[]): Emitted {
         emitDecl(em, env, d)
     }
     em.decl = ""
+    // Before the codecs and the atom table: the calls the build runs may ask for either.
+    baking := emitBakes(em, env)
     // A codec is asked for wherever a program encodes or decodes something,
     // which can be anywhere — so they are written after everything that could
     // ask has been walked. A row mapper is the same story.
@@ -189,9 +209,14 @@ proc emitChecked(m: ast.Module, landings: infer.Landing[]): Emitted {
         blank(em)
         open(em, "func main() \{")
         line(em, "hive.InitAtoms(" + atomTable(em) + ")")
+        bakeHook(em)
         close(em, "}")
     }
-    return Emitted(join(em.out, "\n") + "\n", em.spans, em.atoms, em.modules, em.codecs, em.rows, em.window, em.errors)
+    mut Bake[dyn] bakes = []
+    for each site in em.sites {
+        append(bakes, Bake(site.at, bake.shown(site.call), bake.varOf(site.decl, site.at), goType(infer.typeOf(env, site.call))))
+    }
+    return Emitted(join(em.out, "\n") + "\n", em.spans, em.atoms, em.modules, em.codecs, em.rows, em.window, em.errors, bakes, baking)
 }
 
 func hasMain(m: ast.Module): Bool {
@@ -645,6 +670,7 @@ proc emitCallable(em: mut Emit, env: infer.Env, name: Str, params: ast.Param[], 
         // it yet, so only where the line sits is worth remembering.
         em.atomLine = len(em.out)
         line(em, "hive.InitAtoms(" + atomTable(em) + ")")
+        bakeHook(em)
         // A panic runs it too, so a terminal left raw is put back either way.
         line(em, "defer hive.Ending()")
         // Returning from the body waits for open windows; a panic skips the wait.
@@ -676,6 +702,145 @@ proc patchAtoms(em: mut Emit): void {
     if em.out bounds at {
         em.out[at] = text.repeat("\t", 1) + "hive.InitAtoms(" + atomTable(em) + ")"
     }
+}
+
+// --- Calls run while the program builds -------------------------------------
+//
+// The program reads each `with compiler` call as a variable, which one of two files
+// declares. Built with the `hivebake` tag, `bake.go` runs every call and writes its
+// answer down as the Go that builds it again; the build puts those into `baked.go`,
+// and the program is built with that. One `main.go` serves both, so the atoms a
+// call answers with are numbered as the program numbers them.
+
+// The run comes first thing in `main`, and only where there is one to make.
+proc bakeHook(em: mut Emit): void {
+    if len(em.sites) > 0 {
+        line(em, "if hiveBaking \{ hiveBake(); return }")
+    }
+}
+
+// `bake.go`, or `""` for a program that runs nothing while it builds.
+proc emitBakes(em: mut Emit, env: infer.Env): Str {
+    if len(em.sites) == 0 {
+        return ""
+    }
+    outer := em.out
+    outerIndent := em.indent
+    em.out = []
+    em.indent = 0
+    line(em, "//go:build hivebake")
+    blank(em)
+    line(em, "package main")
+    blank(em)
+    line(em, "import \"hiveapp/hive\"")
+    blank(em)
+    line(em, "const hiveBaking = true")
+    blank(em)
+    for each site in em.sites {
+        line(em, "var " + bake.varOf(site.decl, site.at) + " " + goType(infer.typeOf(env, site.call)))
+    }
+    blank(em)
+    open(em, "func hiveBake() \{")
+    mut index := 0
+    for each site in em.sites {
+        em.decl = site.decl
+        em.at = site.at
+        enterBody(em)
+        ty := infer.typeOf(env, site.call)
+        name := bake.varOf(site.decl, site.at)
+        open(em, "hive.BakeSite({index}, func(b *hive.Baker) \{")
+        line(em, name + " = " + expr(em, env, site.call, ty))
+        line(em, printerOf(em, ty) + "(b, " + name + ")")
+        close(em, "})")
+        index = index + 1
+    }
+    close(em, "}")
+    // Printing one type can ask for another's printer, so the list grows as it is walked.
+    for next := 0; next < len(em.printers); next++ {
+        if em.printers bounds next {
+            named := em.printers[next]
+            emitPrinter(em, named)
+        }
+    }
+    source := join(em.out, "\n") + "\n"
+    em.out = outer
+    em.indent = outerIndent
+    em.decl = ""
+    return source
+}
+
+// The Go function that writes a value of `ty` down as the Go that builds it again.
+proc printerOf(em: mut Emit, ty: types.Ty): Str {
+    if ty is types.Ty.TStr { return "hive.BakeStr" }
+    if ty is types.Ty.TInt { return "hive.BakeInt" }
+    if ty is types.Ty.TFloat { return "hive.BakeFloat" }
+    if ty is types.Ty.TFloat32 { return "hive.BakeFloat32" }
+    if ty is types.Ty.TBool { return "hive.BakeBool" }
+    if ty is types.Ty.TAtom { return "hive.BakeAtom" }
+    if ty is types.Ty.TNamed(name) {
+        if indexOf(em.printers, name) is Result.Error(_) {
+            append(em.printers, name)
+        }
+        return "bake_" + goIdent(name)
+    }
+    written := goType(ty)
+    opening := "func(b *hive.Baker, v " + written + ") \{ "
+    if ty is types.Ty.TSized(_, _) {
+        return opening + "hive.BakeWhole(b, " + quoted(written) + ", v) }"
+    }
+    if ty is types.Ty.TVec(element, _) {
+        if isPacked(ty) {
+            return opening + "hive.BakePacked(b, " + quoted(goType(element)) + ", {packedBits(ty)}, v, " + printerOf(em, element) + ") }"
+        }
+        return opening + "hive.BakeVec(b, " + quoted(written) + ", v, " + printerOf(em, element) + ") }"
+    }
+    if ty is types.Ty.TResult(ok, bad) {
+        return opening + "hive.BakeResult(b, " + quoted(goType(ok)) + ", " + quoted(goType(bad)) + ", v, " + printerOf(em, ok) + ", " + printerOf(em, bad) + ") }"
+    }
+    if ty is types.Ty.TMap(key, value) {
+        return opening + "hive.BakeDict(b, " + quoted(goType(key)) + ", " + quoted(goType(value)) + ", v, " + printerOf(em, key) + ", " + printerOf(em, value) + ") }"
+    }
+    fail(em, messages.expressionHasNoLowering())
+    return "nil"
+}
+
+// One `bake_T` per declared type a call answers with, however deep inside the answer.
+proc emitPrinter(em: mut Emit, name: Str): void {
+    blank(em)
+    open(em, "func bake_" + goIdent(name) + "(b *hive.Baker, v " + goIdent(name) + ") \{")
+    if types.findType(em.table, name) is Result.Ok(info) {
+        if len(info.variants) == 0 {
+            printFields(em, goIdent(name), info.shared, "v.")
+        } else {
+            open(em, "switch x := v.(type) \{")
+            for each variant in info.variants {
+                line(em, "case " + goVariant(name, variant.name) + ":")
+                em.indent = em.indent + 1
+                line(em, "_ = x")
+                printFields(em, goVariant(name, variant.name), variant.fields + info.shared, "x.")
+                em.indent = em.indent - 1
+            }
+            line(em, "default:")
+            line(em, "\tb.W(\"nil\")")
+            close(em, "}")
+        }
+    }
+    close(em, "}")
+}
+
+proc printFields(em: mut Emit, written: Str, fields: ast.Field[], from: Str): void {
+    line(em, "b.W(" + quoted(written + "\{") + ")")
+    mut first := true
+    for each f in fields {
+        mut opening := goField(f.name) + ": "
+        if first == false {
+            opening = ", " + opening
+        }
+        first = false
+        line(em, "b.W(" + quoted(opening) + ")")
+        line(em, printerOf(em, types.resolve(em.table, f.declared)) + "(b, " + from + goField(f.name) + ")")
+    }
+    line(em, "b.W(\"}\")")
 }
 
 // --- Copying -----------------------------------------------------------------
@@ -1761,6 +1926,8 @@ proc exprTail(em: mut Emit, env: infer.Env, e: ast.Expr, want: types.Ty): Str {
         return elementIn(subjectType, expr(em, env, subject, types.Ty.TUnknown()), expr(em, env, index, types.Ty.TInt()))
     } else if e is ast.Expr.Slice(subject, low, high, _) {
         return slice(em, env, subject, low, high)
+    } else if e is ast.Expr.Baked(_, _) {
+        return cloned(em.table, infer.typeOf(env, e), bake.varOf(em.decl, e.at))
     } else if e is ast.Expr.Timed(call, ms, _) {
         // A bounded send is the same send with the patience written down.
         if isSend(env, call) {
@@ -3345,6 +3512,9 @@ proc builtin(em: mut Emit, env: infer.Env, name: Str, written: ast.Arg[], want: 
     }
     if name == "split" {
         return "hive.Split(" + a + ", " + expr(em, env, argExpr(args, 1), types.Ty.TStr()) + ")"
+    }
+    if name == "trim" {
+        return "hive.Trim(" + a + ")"
     }
     if name == "replaceFirst" || name == "replaceAll" {
         from := expr(em, env, argExpr(args, 1), types.Ty.TStr())
@@ -5571,7 +5741,7 @@ proc emitCheckedTests(m: ast.Module, atoms: Str[], codecs: Str[], rows: Str[], m
     t := types.tableOf(m)
     // What `main.go` already wrote or asked for is seeded rather than repeated:
     // the two files are one Go package.
-    mut Emit em = Emit(t, [], 0, copiedNames(atoms), copiedNames(modules), [], [], lentFuncs(t, m.decls), copiedNames(rows), copiedNames(codecs), 0, [], [], [], [], true, false, false, -1, [], writes.writtenShapes(m), [], token.nowhere(), "", false, [], handingBackFuncs(t, m.decls), "", [], [], landings, typeLawsIn(t, m.decls))
+    mut Emit em = Emit(t, [], 0, copiedNames(atoms), copiedNames(modules), [], [], lentFuncs(t, m.decls), copiedNames(rows), copiedNames(codecs), 0, [], [], [], [], true, false, false, -1, [], writes.writtenShapes(m), [], token.nowhere(), "", false, [], handingBackFuncs(t, m.decls), "", [], [], landings, typeLawsIn(t, m.decls), [], [])
     written := len(codecs)
     mapped := len(rows)
     mut found := false
@@ -5581,7 +5751,7 @@ proc emitCheckedTests(m: ast.Module, atoms: Str[], codecs: Str[], rows: Str[], m
         }
     }
     if found == false {
-        return Emitted("", [], em.atoms, em.modules, em.codecs, em.rows, false, [])
+        return Emitted("", [], em.atoms, em.modules, em.codecs, em.rows, false, [], [], "")
     }
 
     line(em, "package main")
@@ -5613,7 +5783,7 @@ proc emitCheckedTests(m: ast.Module, atoms: Str[], codecs: Str[], rows: Str[], m
     emitRowsFrom(em, mapped)
     emitCodecsFrom(em, written)
     emitPatterns(em)
-    return Emitted(join(em.out, "\n") + "\n", [], em.atoms, em.modules, em.codecs, em.rows, false, em.errors)
+    return Emitted(join(em.out, "\n") + "\n", [], em.atoms, em.modules, em.codecs, em.rows, false, em.errors, [], "")
 }
 
 func copiedNames(names: Str[]): Str[dyn] {

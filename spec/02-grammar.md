@@ -220,7 +220,7 @@ pipe-expr   = unary-expr { "|>" unary-expr } ;
 unary-expr  = "-" unary-expr | "!" unary-expr | "~" unary-expr | pow-expr ;
 pow-expr    = with-expr [ "**" unary-expr ] ;
 
-with-expr   = postfix-expr [ "with" "timeout" add-expr ] ;
+with-expr   = postfix-expr [ "with" ( "timeout" add-expr | "compiler" ) ] ;
 
 postfix-expr= primary { call-suffix | index-suffix | member-suffix } ;
 call-suffix = "(" [ args ] ")" ;

@@ -1288,7 +1288,9 @@ proc parseStmt(ts: token.Token[], p: mut Parse): ast.Stmt {
         advance(p)
         return ast.Stmt.ContinueStmt(at)
     } else if k == token.Kind.KwAsync() {
-        return ast.Stmt.AsyncStmt(parseAsyncCall(ts, p), at)
+        fired := parseAsyncCall(ts, p)
+        refuseAsyncBaked(ts, p)
+        return ast.Stmt.AsyncStmt(fired, at)
     } else if k == token.Kind.KwMut() {
         return parseMut(ts, p)
     }
@@ -1427,6 +1429,13 @@ proc refuseMutAsync(ts: token.Token[], p: mut Parse): Bool {
 proc refuseDeferredTimeout(ts: token.Token[], p: mut Parse): void {
     if kindAt(ts, p.pos) == token.Kind.KwWith() && wordAt(ts, p.pos + 1) == "timeout" {
         fail(ts, p, messages.asyncBindingTimeout())
+    }
+    refuseAsyncBaked(ts, p)
+}
+
+proc refuseAsyncBaked(ts: token.Token[], p: mut Parse): void {
+    if kindAt(ts, p.pos) == token.Kind.KwWith() && wordAt(ts, p.pos + 1) == "compiler" {
+        fail(ts, p, messages.asyncBaked())
     }
 }
 
@@ -2083,6 +2092,9 @@ proc pipedInto(ts: token.Token[], p: mut Parse, value: ast.Expr, stage: ast.Expr
     if stage is ast.Expr.Timed(call, ms, _) {
         return ast.Expr.Timed(pipedInto(ts, p, value, call, at), ms, stage.at)
     }
+    if stage is ast.Expr.Baked(call, _) {
+        return ast.Expr.Baked(pipedInto(ts, p, value, call, at), stage.at)
+    }
     // A name, a module member or a constructor: the call with nothing else in it.
     if stage is ast.Expr.Ident(_, _) || stage is ast.Expr.Member(_, _, _) {
         return ast.Expr.Call(stage, [ast.Arg("", value)], stage.at)
@@ -2155,12 +2167,21 @@ proc parsePower(ts: token.Token[], p: mut Parse): ast.Expr {
     return base
 }
 
-// `with timeout <ms>` bounds a wait, and is the only thing `with` introduces.
-// `timeout` is read here rather than reserved, so it stays an ordinary
-// identifier everywhere else.
+// `with timeout <ms>` bounds a wait and `with compiler` runs a call while the
+// program builds. Both words are read here rather than reserved, so each stays
+// an ordinary identifier everywhere else.
 proc parseWith(ts: token.Token[], p: mut Parse): ast.Expr {
     value := parsePostfix(ts, p)
     if p.failed || kindAt(ts, p.pos) != token.Kind.KwWith() {
+        return value
+    }
+    if wordAt(ts, p.pos + 1) == "compiler" {
+        advance(p)
+        advance(p)
+        if value is ast.Expr.Call(_, _, _) {
+            return ast.Expr.Baked(value, value.at)
+        }
+        fail(ts, p, messages.bakedNeedsCall())
         return value
     }
     if wordAt(ts, p.pos + 1) != "timeout" {

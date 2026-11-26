@@ -37,6 +37,7 @@ file, plus a generated `hive` runtime package.
 | `f(x)` / `async f(x)` | a plain call / `go f(x)` |
 | `x := async f(a)` | `_task_x := hive.Spawn(..)`, and every read of `x` becomes `_task_x.Await()` |
 | `f(x) with timeout ms` | `hive.AwaitTimeout(hive.Spawn(..), ms)` → a `Result` |
+| `f(x) with compiler` | a read of `_baked_<decl>_<line>_<col>`, copied: `baked.go` declares it as the Go literal of the answer, which `bake.go` — built with the `hivebake` tag, and run by the build — wrote down |
 | `await [f(a), f(b)]` | `hive.AwaitAll(..)` over one `hive.Spawn` each → a statically-sized vector |
 | `addr(m)` / `async addr(m)` | a send that waits for its answer / `hive.SyslinkSend(..)`, which cannot fail |
 | `append(v, x)` (a statement) | `v = append(v, x)` — Go's own, with the new header written back |
