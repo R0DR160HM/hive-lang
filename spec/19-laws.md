@@ -65,6 +65,10 @@ Two assumptions are allowed, and nothing else is:
   compare them, but an implementation need not prove anything that depends on
   what an operation on floats comes to.
 
+**A value equals itself** when no `Float` or `Float32` is anywhere inside it, in
+any field, variant or element. One that holds a float may hold `NaN`, which is not
+equal to itself, so it is never taken to be.
+
 ## 19.3 Calling a law
 
 **Only a law may call a law**, as a statement of its own; anywhere else it is a

@@ -18,6 +18,7 @@ import ./page
 func pages(): page.Page[dyn] {
     return [
         page.Page("README.md", index()),
+        page.Page("practices.md", practices()),
         page.Page("syntax.md", syntax()),
         page.Page("types.md", types()),
         page.Page("declarations.md", declarations()),
@@ -55,12 +56,15 @@ func index(): Str {
         syntax; every refusal on these pages is a compile error. New to Hive: read
         [pitfalls](pitfalls.md) first.
 
+        **Before building anything, you must read the [best practices](practices.md).**
+
         **If you have a language-server tool, ask it before reading a file**: ~BT~hive lsp~BT~
         answers what a name is and where it is declared in one line, where the file
         costs the whole file. See [lsp](lsp.md).
 
         | page | what is on it |
         | --- | --- |
+        | [practices](practices.md) | **how to build a program here** — you must read it before starting one |
         | [syntax](syntax.md) | comments, keywords, how a name must be spelled, both string forms |
         | [types](types.md) | scalars, vectors, ~BT~Result~BT~, declared types, maps, what may be assigned to what |
         | [declarations](declarations.md) | ~BT~type~BT~ ~BT~func~BT~ ~BT~proc~BT~ ~BT~query~BT~ ~BT~test~BT~ ~BT~law~BT~, and returning on every path |
@@ -104,6 +108,233 @@ func index(): Str {
         Each page is condensed from ~BT~spec/~BT~ in the Hive repository (the normative
         reference) and ends with its source chapters; read those when a page leaves a
         question open.
+    `)
+}
+
+// --- Building a program ------------------------------------------------------
+
+// The one page about how to work rather than what compiles.
+func practices(): Str {
+    return page.backticked(`
+        # Best practices
+
+        Build so that **the compiler, not a reviewer, keeps the program right**: write
+        the laws first, put the logic in the types, use the library's secure defaults,
+        run ~BT~hive analyze~BT~ after every feature, and cut the code down until nothing
+        more can go. The examples are one shop's orders.
+
+        ## First, the laws
+
+        **Before writing any code, find the rules that must always be true**, the ones
+        anybody would call a bug if broken. One plain claim each:
+
+        - a line orders at least one item, at a price that is not negative;
+        - a cancelled order stays cancelled, whatever happens to it next;
+        - a customer reads only their own orders.
+
+        **Write each as a [~BT~law~BT~](laws.md) before the code it governs.** The compiler
+        proves it for every value on every ~BT~hive check~BT~ and refuses any later edit
+        that breaks it; a test covers only the values somebody thought of.
+
+        | the rule is about | write | kept |
+        | --- | --- | --- |
+        | one value: a field's range, fields that agree | a law **inside the type** | at every construction and write, and by every decoder at run time |
+        | what a function does: a transition, a total, a round trip | a **top-level** law over its arguments | for every argument |
+        | which rows a caller may touch | a law ~BT~for table~BT~ | in the SQL of every query on the table |
+
+        ~CODE~hive
+        type Line \{
+        	sku: Str
+        	quantity: Int
+        	unitCents: Int
+
+        	law somethingOrdered(line: Line) \{
+        		assert line.quantity > 0 && line.unitCents >= 0
+        	}
+        }
+
+        law cancelledStaysCancelled(order: Order, event: Event) \{
+        	if order is Order.Cancelled(_) \{
+        		assert apply(order, event) == order
+        	}
+        }
+
+        law ownOrdersOnly(customer: CustomerId) for table orders \{
+        	customer_id = \{customer.value}
+        }
+        ~CODE~
+
+        - **A refused law is a bug report with a counterexample**: ~BT~it does not hold
+          for order = Order.Cancelled(reason: "a"), event = Event.Cancel(reason: "a")~BT~.
+          Fix the code. Narrow the law with an ~BT~if~BT~ only when the rule really has that
+          exception.
+        - **Never delete or weaken a law to get a build through.**
+        - **Name a law for what it claims**, so its refusal names the broken rule.
+        - **A type's law validates input**: JSON, a JWT, a query string, flags and SQL
+          rows decoded into the type arrive checked, or are refused as ~BT~Broken~BT~.
+        - **When you fix a bug, write the rule it broke as a law**, so it cannot return.
+
+        ## Logic in the types
+
+        **A rule the types carry is checked everywhere the value goes**, not only where
+        somebody remembered to check it. Move as much of the program into them as they
+        can hold.
+
+        - **A state is a variant, not a flag.** A ~BT~status: Str~BT~ beside fields only some
+          statuses use lets every combination exist; a union allows only the real ones.
+          Here no order has a tracking code before it ships:
+
+        ~CODE~hive
+        type Order \{
+        	Cart \{ lines: Line[dyn] }
+        	Paid \{ lines: Line[dyn], paidAt: Int }
+        	Shipped \{ lines: Line[dyn], tracking: Str }
+        	Cancelled \{ reason: Str }
+        }
+        ~CODE~
+
+        - **Name every variant of your own union in a ~BT~switch~BT~**; never cover the rest
+          with ~BT~_~BT~. A variant added later is then a compile error at each place that
+          must decide about it.
+        - **One type per meaning**: ~BT~type CustomerId \{ value: Int }~BT~ and
+          ~BT~type OrderId \{ value: Int }~BT~ cannot be passed for each other; two ~BT~Int~BT~s can.
+        - **A closed set of choices is a union, never an ~BT~Atom~BT~ or a ~BT~Str~BT~**: a union
+          is covered, and a misspelt one does not compile.
+        - **A fixed count is a static length** (~BT~Float[3]~BT~), indexed without a guard.
+          **A width the format fixes is a sized number** (~BT~port: UInt16~BT~). A range such
+          as "at least one" is a type's law, because sized numbers wrap.
+        - **A failure the caller must handle is a ~BT~Result~BT~ with a union error**, one
+          variant per way it fails, never ~BT~-1~BT~ or ~BT~""~BT~.
+        - **Decode input into your own types** with ~BT~T.decode~BT~ ([JSON](stdlib/json.md),
+          [a JWT](stdlib/crypto-jwt.md), [a query string](stdlib/net-urls.md),
+          [flags](stdlib/term.md)) instead of picking fields out by hand.
+        - **SQL is a [~BT~query~BT~](queries.md) with a row type**, whose columns are checked
+          and values bound; ~BT~hive.sql.unsafe~BT~ does neither.
+        - **A service takes one message union**, and its ~BT~Address<M>~BT~ is typed by it
+          ([syslink](stdlib/syslink.md)).
+
+        ## The secure defaults
+
+        **The library already makes the safe choice. Use it; never write your own.**
+
+        | to | use | never |
+        | --- | --- | --- |
+        | hold a password, key, token or private record | [~BT~Secret<T>~BT~](types.md#secret), from ~BT~hive.env.getSecret~BT~ or ~BT~hive.term.readSecret~BT~ | a ~BT~Str~BT~, which can be echoed, logged and interpolated |
+        | make a session id, reset token or key | ~BT~hive.crypto.randomSecret~BT~, or ~BT~randomHex(16)~BT~ or more | the time, a counter, a hash of something known |
+        | encrypt what is stored | [~BT~hive.crypto.encrypt~BT~ and ~BT~decrypt~BT~](stdlib/crypto-encrypt.md) | a cipher of your own; base64 or a hash as "encryption" |
+        | sign a user in or issue a token | [~BT~hive.crypto.jwtCodec~BT~](stdlib/crypto-jwt.md) with a claims type holding ~BT~exp~BT~ | a token format of your own; authorising on ~BT~jwtDecode~BT~ |
+        | prove a message unchanged | ~BT~hive.crypto.hmacSha256~BT~ with a ~BT~Secret~BT~ key | ~BT~sha256(key + message)~BT~ |
+        | check a presented token | ~BT~bypass(presented) == stored~BT~: ~BT~==~BT~ on secrets takes constant time | ~BT~==~BT~ on two ~BT~Str~BT~s |
+        | run SQL | [~BT~query~BT~](queries.md) declarations | ~BT~hive.sql.unsafe~BT~ on text built from input |
+        | keep each customer to their own rows | a [~BT~for table~BT~ law](laws.md#a-tables-laws) | a ~BT~WHERE~BT~ every query must remember |
+        | run another program | ~BT~hive.term.exec~BT~ with an argument vector | a shell handed a string holding input |
+        | join nodes into a cluster | ~BT~hive.syslink.setKey~BT~ with a key from ~BT~getSecret~BT~ | a key written in the source |
+
+        ~CODE~hive
+        type Session \{
+        	sub: Int
+        	exp: Int
+        }
+
+        func sessionFor(customer: CustomerId, key: Secret<Str>): Str \{
+        	return encode(Session(customer.value, hive.time.now() / 1000 + 3600), hive.crypto.jwtCodec(key))
+        }
+
+        proc main(): void \{
+        	Result.Ok(key) := hive.env.getSecret("SESSION_KEY") else \{
+        		Result.Error(why) \{ panic "SESSION_KEY is not set: \{why.message}" }
+        	}
+        	// ...
+        }
+        ~CODE~
+
+        - **Keep a secret a ~BT~Secret~BT~ from where it is read to the call that uses it.**
+          ~BT~reveal~BT~ it inside the expression that needs the text, never into a name, a
+          field or a message.
+        - **Keep keys out of the source**: in the environment, or in a ~BT~.env~BT~ that git and
+          ~BT~.dockerignore~BT~ leave out. ~BT~bypass~BT~ on a literal is for tests.
+        - **Never tell a client which of two failures happened** when knowing helps an
+          attacker: a failed sign-in says only that it failed, as ~BT~decrypt~BT~ answers
+          ~BT~BadSignature~BT~ for a wrong password and an edited message alike.
+        - **Answer a client with a status and a short reason**; ~BT~why.message~BT~ goes to
+          the log.
+
+        ## Measuring with ~BT~hive analyze~BT~
+
+        **Run ~BT~hive analyze <entrypoint.hive>~BT~ after every feature, and before calling
+        any change done.** It runs nothing, takes about as long as ~BT~check~BT~, scores each
+        callable out of 100 and says what to change for each finding
+        ([cli](cli.md#hive-analyze)):
+
+        | finding | the usual fix |
+        | --- | --- |
+        | a deep copy | lend the value to a ~BT~mut~BT~ parameter if the callee writes it; otherwise pass only the field it needs |
+        | a loop in a loop, a linear search in one | a ~BT~hive.map.Map~BT~ built once before the loop |
+        | a name rebuilt from itself each turn | ~BT~append~BT~ to a ~BT~[dyn]~BT~ and ~BT~join~BT~ once, after the loop |
+        | a wait inside a loop | ask once, before the loop, for everything it needs |
+        | a call handed nothing the loop changes | bind it before the loop |
+
+        - **Fix the worst finding first, then run it again.** A finding your change added
+          is yours to fix.
+        - **Delete every declaration it lists as never reached, and every parameter never
+          read**, unless it was meant to be used; then use it. Nothing runs that code, so
+          nothing tells you when it breaks.
+        - **Habits that never become findings**: open one ~BT~SqlConnection~BT~ in ~BT~main~BT~ and
+          pass it along; start independent waits together with ~BT~await [...]~BT~ or
+          ~BT~async~BT~; read data known before the program runs at build time with
+          [~BT~with compiler~BT~](build-time.md); never call ~BT~encrypt~BT~ per field in a loop,
+          since it is slow on purpose.
+
+        ## Less code
+
+        **Code is a liability.** Every line is one more to read, test, prove and keep
+        right, so when a problem can be solved with less code, just as fast, write less.
+
+        - **Reuse before you write**: a builtin, a ~BT~hive.*~BT~ call or a function the
+          program already has. Extend an existing function rather than copying it.
+        - **Keep each rule in one place.** Two copies of the same logic drift apart, and
+          a law over one says nothing about the other.
+        - **Let the types remove cases**: a value the types or a law rule out needs no
+          check and no code to handle it.
+        - **Write nothing for a need nobody has yet**: no parameter, option or layer
+          "for later".
+        - **Never trade speed for brevity**: a shorter version that ~BT~hive analyze~BT~
+          scores lower is not simpler. Keep the faster one.
+        - **A feature is never done while its code can still be reduced or
+          simplified.** Reread every line it added and remove it, merge it with another,
+          or replace it with a call to something that already exists, until none of
+          those is left to do.
+
+        ## The order of work
+
+        1. **Write the laws** for the change, and **the types** that make its wrong states
+           impossible to write.
+        2. **Write the code**, running ~BT~hive check <entrypoint.hive>~BT~ after every edit.
+        3. **Test what a law cannot say**: an exact output, a handler's response, what
+           reaches a file or the network ([testing](testing.md)).
+        4. **Run ~BT~hive analyze~BT~** and fix what it found.
+        5. **Reduce the code** until nothing more can be removed or simplified, then run
+           ~BT~hive check~BT~, ~BT~hive test~BT~ and ~BT~hive analyze~BT~ again.
+        6. **Before finishing, check** that no secret passed through a ~BT~Str~BT~, no input
+           reached ~BT~hive.sql.unsafe~BT~, and no law was deleted or weakened.
+
+        ## Smaller habits
+
+        - **~BT~switch~BT~ over one value's variants**, not an ~BT~if~BT~ / ~BT~else if~BT~ chain: every
+          case covered, every arm reachable.
+        - **~BT~P := x else \{ … }~BT~ for the failure path**, so the rest of the body reads
+          straight down ([statements](statements.md#binding-with-a-pattern)).
+        - **A ~BT~func~BT~, unless the callable must write its caller's storage**; then a
+          ~BT~proc~BT~ with that one ~BT~mut~BT~ parameter.
+        - **Long-lived state that several handlers share is a
+          [service](stdlib/syslink.md)**; a handler shares nothing.
+        - **~BT~for each~BT~ rather than an index**; where an index is needed, ~BT~if v bounds i~BT~.
+        - **Name the arguments when two of one type sit side by side**:
+          ~BT~transfer(from: payer, to: payee, cents: 500)~BT~.
+        - **Small modules with their tests beside them**; ~BT~hive test .~BT~ runs them all.
+
+        *Each rule these lean on is stated in full on the page for its feature; start at
+        [README](README.md).*
     `)
 }
 
@@ -1962,7 +2193,7 @@ func laws(): Str {
     return page.backticked(`
         # Laws
 
-        A ~BT~law~BT~ is a claim the compiler proves for every value of its parameters: each ~BT~assert~BT~ its body reaches must always hold. **An unprovable law is a compile error**, with no override. Laws never run, except [a type's](#a-types-laws), which decoders check on what they read; [a table's](#a-tables-laws) is a filter every query's SQL must keep.
+        A ~BT~law~BT~ is a claim the compiler proves for every value of its parameters: each ~BT~assert~BT~ its body reaches must always hold. **An unprovable law is a compile error**, with no override. Laws never run, except [a type's](#a-types-laws), which decoders check on what they read; [a table's](#a-tables-laws) is a filter every query's SQL must keep. Which rules to make laws, and when: [best practices](practices.md#first-the-laws).
 
         ~CODE~hive
         law cancelledIsFinal(booking: Booking, event: Event) \{
@@ -2029,6 +2260,7 @@ func laws(): Str {
         - **~BT~Int~BT~ wraps** as at run time: ~BT~a + 1 > a~BT~ fails at ~BT~a = 9223372036854775807~BT~. Division by zero is ~BT~0~BT~.
         - **No vector or string holds over 2^60 elements**, so ~BT~len(v) + 1~BT~ does not wrap.
         - **A ~BT~Float~BT~ is carried and compared**; nothing about float arithmetic is proved.
+        - **A value equals itself unless it holds a ~BT~Float~BT~ somewhere**, which may be ~BT~NaN~BT~: ~BT~order == order~BT~ is proved for a record or union with no float in any field or variant.
 
         ## When a law is refused
 
@@ -2172,7 +2404,7 @@ func cli(): Str {
 
         ## ~BT~hive analyze~BT~
 
-        Takes an entrypoint, no flags; builds and runs nothing, so it is about as fast as ~BT~check~BT~. Scores every ~BT~proc~BT~ and ~BT~func~BT~ out of 100, prints the worst, writes ~BT~<entrypoint>-analysis.html~BT~ beside the entrypoint:
+        **Run it after every feature** ([best practices](practices.md#measuring-with-hive-analyze)). Takes an entrypoint, no flags; builds and runs nothing, so it is about as fast as ~BT~check~BT~. Scores every ~BT~proc~BT~ and ~BT~func~BT~ out of 100, prints the worst, writes ~BT~<entrypoint>-analysis.html~BT~ beside the entrypoint:
 
         ~CODE~
           chat.hive scores 93/100 over 37 callables

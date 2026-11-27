@@ -501,7 +501,7 @@ func norm(t: types.Table, shapes: hive.map.Map<Str, terms.Term>, term: terms.Ter
             mut terms.Term m = terms.Term.MapK(norm(t, shapes, base), [], [])
             mut i := 0
             for each k in ks {
-                m = mapWrite(m, norm(t, shapes, k), norm(t, shapes, terms.nth(vs, i)))
+                m = mapWrite(t, m, norm(t, shapes, k), norm(t, shapes, terms.nth(vs, i)))
                 i = i + 1
             }
             return m
@@ -563,9 +563,9 @@ func rebuild(t: types.Table, name: Str, args: terms.Term[], ty: types.Ty): terms
     } else if name == "neg" {
         return negate(a)
     } else if name == "eq" {
-        return equal(a, b)
+        return equal(t, a, b)
     } else if name == "lt" || name == "le" {
-        return order(name, a, b)
+        return order(t, name, a, b)
     } else if name == "not" {
         return terms.negation(a)
     } else if name == "and" {
@@ -661,22 +661,22 @@ func negate(a: terms.Term): terms.Term {
 
 // `a == b`, structurally as far as both are known. Two floats compare as floats
 // do, so a float is never taken to equal itself without being known.
-func equal(a: terms.Term, b: terms.Term): terms.Term {
+func equal(t: types.Table, a: terms.Term, b: terms.Term): terms.Term {
     if terms.known(a) && terms.known(b) {
         return terms.Term.BoolK(sameValue(a, b))
     }
-    if terms.key(a) == terms.key(b) && mayHoldFloat(a) == false {
+    if terms.key(a) == terms.key(b) && mayHoldFloat(t, a) == false {
         return terms.Term.BoolK(true)
     }
     if a is terms.Term.RecK(ta, va, fa) && b is terms.Term.RecK(tb, vb, fb) {
         if ta != tb || va != vb || len(fa) != len(fb) {
             return terms.Term.BoolK(false)
         }
-        return pairwise(fa, fb)
+        return pairwise(t, fa, fb)
     }
     if a is terms.Term.OkK(pa) {
         if b is terms.Term.OkK(pb) {
-            return equal(pa, pb)
+            return equal(t, pa, pb)
         }
         if b is terms.Term.ErrK(_) {
             return terms.Term.BoolK(false)
@@ -684,7 +684,7 @@ func equal(a: terms.Term, b: terms.Term): terms.Term {
     }
     if a is terms.Term.ErrK(pa) {
         if b is terms.Term.ErrK(pb) {
-            return equal(pa, pb)
+            return equal(t, pa, pb)
         }
         if b is terms.Term.OkK(_) {
             return terms.Term.BoolK(false)
@@ -694,7 +694,7 @@ func equal(a: terms.Term, b: terms.Term): terms.Term {
         if len(ia) != len(ib) {
             return terms.Term.BoolK(false)
         }
-        return pairwise(ia, ib)
+        return pairwise(t, ia, ib)
     }
     if a is terms.Term.BoolK(x) {
         if x {
@@ -711,74 +711,96 @@ func equal(a: terms.Term, b: terms.Term): terms.Term {
     return terms.op("eq", terms.ordered(a, b), terms.boolean())
 }
 
-func pairwise(a: terms.Term[], b: terms.Term[]): terms.Term {
+func pairwise(t: types.Table, a: terms.Term[], b: terms.Term[]): terms.Term {
     mut terms.Term all = terms.Term.BoolK(true)
     mut i := 0
     for each x in a {
-        all = terms.both(all, equal(x, terms.nth(b, i)))
+        all = terms.both(all, equal(t, x, terms.nth(b, i)))
         i = i + 1
     }
     return all
 }
 
 // Whether a term is, or holds anywhere inside it, something that could be a float.
-func mayHoldFloat(t: terms.Term): Bool {
-    if t is terms.Term.Unknown(_, ty) {
-        return holdsFloat(ty)
+func mayHoldFloat(t: types.Table, term: terms.Term): Bool {
+    if term is terms.Term.Unknown(_, ty) {
+        return holdsFloat(t, ty, [])
     }
-    if t is terms.Term.Op(_, _, ty) {
-        return holdsFloat(ty)
+    if term is terms.Term.Op(_, _, ty) {
+        return holdsFloat(t, ty, [])
     }
-    if t is terms.Term.FloatK(_) {
+    if term is terms.Term.FloatK(_) {
         return true
     }
-    if t is terms.Term.OkK(payload) {
-        return mayHoldFloat(payload)
+    if term is terms.Term.OkK(payload) {
+        return mayHoldFloat(t, payload)
     }
-    if t is terms.Term.ErrK(payload) {
-        return mayHoldFloat(payload)
+    if term is terms.Term.ErrK(payload) {
+        return mayHoldFloat(t, payload)
     }
-    if t is terms.Term.VecK(items) {
-        return anyFloat(items)
+    if term is terms.Term.VecK(items) {
+        return anyFloat(t, items)
     }
-    if t is terms.Term.VecS(known, rest) {
-        return anyFloat(known) || mayHoldFloat(rest)
+    if term is terms.Term.VecS(known, rest) {
+        return anyFloat(t, known) || mayHoldFloat(t, rest)
     }
-    if t is terms.Term.RecK(_, _, fields) {
-        return anyFloat(fields)
+    if term is terms.Term.RecK(_, _, fields) {
+        return anyFloat(t, fields)
     }
-    if t is terms.Term.FnK(_, args) {
-        return anyFloat(args)
+    if term is terms.Term.FnK(_, args) {
+        return anyFloat(t, args)
     }
-    if t is terms.Term.MapK(base, ks, vs) {
-        return mayHoldFloat(base) || anyFloat(ks) || anyFloat(vs)
+    if term is terms.Term.MapK(base, ks, vs) {
+        return mayHoldFloat(t, base) || anyFloat(t, ks) || anyFloat(t, vs)
     }
     return false
 }
 
-func anyFloat(ts: terms.Term[]): Bool {
-    for each t in ts {
-        if mayHoldFloat(t) {
+func anyFloat(t: types.Table, ts: terms.Term[]): Bool {
+    for each one in ts {
+        if mayHoldFloat(t, one) {
             return true
         }
     }
     return false
 }
 
-// Whether a value of `ty` could be or hold a float. A declared type is taken to,
-// which only ever costs a proof, never makes a false one.
-func holdsFloat(ty: types.Ty): Bool {
-    if ty is types.Ty.TFloat || ty is types.Ty.TFloat32 || ty is types.Ty.TNamed(_) || ty is types.Ty.TUnknown || ty is types.Ty.TVar(_) {
+// Whether a value of `ty` could be or hold a float. A declared type does when a
+// field of it or of one of its variants does; `seen` stops a type that holds itself.
+func holdsFloat(t: types.Table, ty: types.Ty, seen: Str[]): Bool {
+    if ty is types.Ty.TFloat || ty is types.Ty.TFloat32 || ty is types.Ty.TUnknown || ty is types.Ty.TVar(_) {
+        return true
+    }
+    if ty is types.Ty.TNamed(name) {
+        if indexOf(seen, name) is Result.Ok(_) {
+            return false
+        }
+        if types.findType(t, name) is Result.Ok(info) {
+            inside := seen + [name]
+            for each f in info.shared {
+                if holdsFloat(t, types.resolve(t, f.declared), inside) {
+                    return true
+                }
+            }
+            for each v in info.variants {
+                for each f in v.fields {
+                    if holdsFloat(t, types.resolve(t, f.declared), inside) {
+                        return true
+                    }
+                }
+            }
+            return false
+        }
         return true
     }
     if ty is types.Ty.TVec(element, _) {
-        return holdsFloat(element)
+        return holdsFloat(t, element, seen)
     }
     if ty is types.Ty.TResult(ok, bad) {
-        return holdsFloat(ok) || holdsFloat(bad)
+        return holdsFloat(t, ok, seen) || holdsFloat(t, bad, seen)
     }
     if ty is types.Ty.TMap(k, v) {
-        return holdsFloat(k) || holdsFloat(v)
+        return holdsFloat(t, k, seen) || holdsFloat(t, v, seen)
     }
     return false
 }
@@ -848,7 +870,7 @@ func sameValue(a: terms.Term, b: terms.Term): Bool {
 }
 
 // `a < b` or `a <= b`, worked out where both are known.
-func order(name: Str, a: terms.Term, b: terms.Term): terms.Term {
+func order(t: types.Table, name: Str, a: terms.Term, b: terms.Term): terms.Term {
     if a is terms.Term.IntK(x) && b is terms.Term.IntK(y) {
         if name == "lt" {
             return terms.Term.BoolK(x < y)
@@ -867,10 +889,10 @@ func order(name: Str, a: terms.Term, b: terms.Term): terms.Term {
         }
         return terms.Term.BoolK(x <= y)
     }
-    if name == "le" && terms.key(a) == terms.key(b) && mayHoldFloat(a) == false {
+    if name == "le" && terms.key(a) == terms.key(b) && mayHoldFloat(t, a) == false {
         return terms.Term.BoolK(true)
     }
-    if name == "lt" && terms.key(a) == terms.key(b) && mayHoldFloat(a) == false {
+    if name == "lt" && terms.key(a) == terms.key(b) && mayHoldFloat(t, a) == false {
         return terms.Term.BoolK(false)
     }
     return terms.op(name, [a, b], terms.boolean())
@@ -1959,7 +1981,7 @@ proc guardsSince(pr: mut Prover, cx: Context, path: Path): terms.Term[dyn] {
             if hive.map.get(path.shapes, k) is Result.Ok(shape) {
                 id := idOf(k)
                 if pr.infos bounds id {
-                    g := shapeGuard(terms.Term.Unknown(id, pr.infos[id].ty), shape)
+                    g := shapeGuard(cx.base.table, terms.Term.Unknown(id, pr.infos[id].ty), shape)
                     if g is Result.Ok(guard) {
                         append(out, guard)
                     }
@@ -1987,7 +2009,7 @@ func digit(c: Str): Int {
 
 // The condition a case split decided, or `Error` where deciding it took nothing —
 // a struct is the one shape its type has.
-func shapeGuard(u: terms.Term, shape: terms.Term): Result<terms.Term, Bool> {
+func shapeGuard(t: types.Table, u: terms.Term, shape: terms.Term): Result<terms.Term, Bool> {
     if shape is terms.Term.RecK(typeName, variant, _) {
         if variant == "" {
             return Result.Error(false)
@@ -2017,7 +2039,7 @@ func shapeGuard(u: terms.Term, shape: terms.Term): Result<terms.Term, Bool> {
         return Result.Ok(terms.op("cons", [u], terms.boolean()))
     }
     if terms.known(shape) {
-        return Result.Ok(equal(u, shape))
+        return Result.Ok(equal(t, u, shape))
     }
     return Result.Error(false)
 }
@@ -2507,7 +2529,7 @@ proc evalBinary(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, op: a
         }
         a := normIn(cx, o.path, terms.nth(o.values, 0))
         b := normIn(cx, o.path, terms.nth(o.values, 1))
-        combined := combine(op, ty, a, b)
+        combined := combine(cx.base.table, op, ty, a, b)
         if combined is Result.Ok(v) {
             append(out, Out(o.path, v))
         } else {
@@ -2517,12 +2539,12 @@ proc evalBinary(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, op: a
     return out
 }
 
-func combine(op: ast.BinOp, ty: types.Ty, a: terms.Term, b: terms.Term): Result<terms.Term, Bool> {
+func combine(t: types.Table, op: ast.BinOp, ty: types.Ty, a: terms.Term, b: terms.Term): Result<terms.Term, Bool> {
     if op is ast.BinOp.Eq {
-        return Result.Ok(equal(a, b))
+        return Result.Ok(equal(t, a, b))
     }
     if op is ast.BinOp.Neq {
-        return Result.Ok(terms.negation(equal(a, b)))
+        return Result.Ok(terms.negation(equal(t, a, b)))
     }
     if ty is types.Ty.TInt {
         switch op {
@@ -2546,13 +2568,13 @@ func combine(op: ast.BinOp, ty: types.Ty, a: terms.Term, b: terms.Term): Result<
             }
             _ { }
         }
-        return compared(op, a, b)
+        return compared(t, op, a, b)
     }
     if ty is types.Ty.TStr {
         if op is ast.BinOp.Add {
             return Result.Ok(concat(a, b, ty))
         }
-        return compared(op, a, b)
+        return compared(t, op, a, b)
     }
     if ty is types.Ty.TFloat {
         if a is terms.Term.FloatK(x) && b is terms.Term.FloatK(y) {
@@ -2575,7 +2597,7 @@ func combine(op: ast.BinOp, ty: types.Ty, a: terms.Term, b: terms.Term): Result<
         if op is ast.BinOp.Add || op is ast.BinOp.Sub || op is ast.BinOp.Mul || op is ast.BinOp.Div {
             return Result.Ok(terms.op("f" + ast.opSpelling(op), [a, b], ty))
         }
-        return compared(op, a, b)
+        return compared(t, op, a, b)
     }
     if ty is types.Ty.TVec(_, _) {
         if op is ast.BinOp.Add {
@@ -2585,19 +2607,19 @@ func combine(op: ast.BinOp, ty: types.Ty, a: terms.Term, b: terms.Term): Result<
     return Result.Error(false)
 }
 
-func compared(op: ast.BinOp, a: terms.Term, b: terms.Term): Result<terms.Term, Bool> {
+func compared(t: types.Table, op: ast.BinOp, a: terms.Term, b: terms.Term): Result<terms.Term, Bool> {
     switch op {
         ast.BinOp.Lt {
-            return Result.Ok(order("lt", a, b))
+            return Result.Ok(order(t, "lt", a, b))
         }
         ast.BinOp.Le {
-            return Result.Ok(order("le", a, b))
+            return Result.Ok(order(t, "le", a, b))
         }
         ast.BinOp.Gt {
-            return Result.Ok(order("lt", b, a))
+            return Result.Ok(order(t, "lt", b, a))
         }
         ast.BinOp.Ge {
-            return Result.Ok(order("le", b, a))
+            return Result.Ok(order(t, "le", b, a))
         }
         _ { }
     }
@@ -2893,7 +2915,7 @@ proc matchVector(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, v: t
         mut terms.Term all = holds
         mut j := 0
         for each pos in positions {
-            all = terms.both(all, equal(terms.nth(known, pos), normIn(cx, o.path, terms.nth(o.values, j))))
+            all = terms.both(all, equal(cx.base.table, terms.nth(known, pos), normIn(cx, o.path, terms.nth(o.values, j))))
             j = j + 1
         }
         append(out, Out(o.path, all))
@@ -3525,7 +3547,7 @@ proc dropped(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, target: 
     rest := part(pr, "dropRest(" + k + ")", infer.typeOf(scope, target), messages.proveLabelAfterDrop(render(pr, v)))
     taken := part(pr, "dropTaken(" + k + ")", ty, messages.proveLabelDropTaken(render(pr, v)))
     mut Out[dyn] out = []
-    if assume(pr, cx, path, equal(arith("add", lengthOf(rest), lengthOf(taken)), lengthOf(v))) is Result.Ok(p) {
+    if assume(pr, cx, path, equal(cx.base.table, arith("add", lengthOf(rest), lengthOf(taken)), lengthOf(v))) is Result.Ok(p) {
         for each q in store(pr, cx, scope, p, target, rest, at) {
             append(out, Out(q, taken))
         }
@@ -3608,7 +3630,7 @@ proc checkedConversion(pr: mut Prover, cx: Context, scope: infer.Env, path: Path
 
 // `walked` known to be as long as `v`.
 proc sameLength(pr: mut Prover, cx: Context, path: Path, walked: terms.Term, v: terms.Term): Path[dyn] {
-    if assume(pr, cx, path, equal(lengthOf(walked), lengthOf(v))) is Result.Ok(p) {
+    if assume(pr, cx, path, equal(cx.base.table, lengthOf(walked), lengthOf(v))) is Result.Ok(p) {
         return [p]
     }
     Path[0] none = []
@@ -3723,7 +3745,7 @@ proc evalMap(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, name: St
             if name == "set" {
                 written = terms.nth(known, 2)
             }
-            changed := mapWrite(terms.nth(known, 0), terms.nth(known, 1), written)
+            changed := mapWrite(cx.base.table, terms.nth(known, 0), terms.nth(known, 1), written)
             if values bounds 0 {
                 for each p in store(pr, cx, scope, o.path, values[0], changed, at) {
                     append(out, Out(p, terms.Term.VoidK()))
@@ -3745,10 +3767,10 @@ proc mapAnswer(pr: mut Prover, cx: Context, path: Path, name: Str, args: terms.T
         return one(path, emptyMap())
     }
     if name == "plus" {
-        return one(path, mapWrite(m, k, terms.nth(args, 2)))
+        return one(path, mapWrite(cx.base.table, m, k, terms.nth(args, 2)))
     }
     if name == "minus" {
-        return one(path, mapWrite(m, k, terms.Term.Hole()))
+        return one(path, mapWrite(cx.base.table, m, k, terms.Term.Hole()))
     }
     if name == "get" || name == "has" {
         mut types.Ty valueTy = types.Ty.TUnknown()
@@ -3786,7 +3808,7 @@ func emptyMap(): terms.Term {
 // `m` with `key` set to `value`, or taken out where `value` is a `Hole`. A key
 // already there, with every key set after it known to be another, is written in
 // its place — which is where the runtime keeps it too.
-func mapWrite(m: terms.Term, key: terms.Term, value: terms.Term): terms.Term {
+func mapWrite(t: types.Table, m: terms.Term, key: terms.Term, value: terms.Term): terms.Term {
     mut terms.Term base = m
     mut terms.Term[dyn] ks = []
     mut terms.Term[dyn] vs = []
@@ -3805,7 +3827,7 @@ func mapWrite(m: terms.Term, key: terms.Term, value: terms.Term): terms.Term {
     for j := 0; j < n; j++ {
         i := n - 1 - j
         if ks bounds i {
-            same := equal(ks[i], key)
+            same := equal(t, ks[i], key)
             if terms.isTrue(same) {
                 found = i
                 break
@@ -3857,7 +3879,7 @@ proc mapLookup(pr: mut Prover, cx: Context, path: Path, m: terms.Term, key: term
             if (vs[i] is terms.Term.Hole) == false {
                 found = terms.Term.OkK(vs[i])
             }
-            same := normIn(cx, path, equal(ks[i], k))
+            same := normIn(cx, path, equal(cx.base.table, ks[i], k))
             if terms.isTrue(same) {
                 return one(path, found)
             }
@@ -3922,7 +3944,7 @@ proc baseLookup(pr: mut Prover, cx: Context, path: Path, base: terms.Term, key: 
 // them, a vector with more it does not know (`more`) cannot be searched.
 proc searched(pr: mut Prover, cx: Context, path: Path, whole: terms.Term, items: terms.Term[], more: Bool, sought: terms.Term, at: Int, where: token.Pos): Out[dyn] {
     if items bounds at {
-        same := normIn(cx, path, equal(items[at], sought))
+        same := normIn(cx, path, equal(cx.base.table, items[at], sought))
         found := terms.Term.OkK(terms.Term.IntK(at))
         if terms.isTrue(same) {
             return one(path, found)
