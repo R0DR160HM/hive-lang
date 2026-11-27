@@ -59,7 +59,7 @@ proc writtenShapes(m: ast.Module): Str[dyn] {
     t := types.tableOf(m)
     mut Written w = Written([], [], hive.map.new(), hive.map.new(), t, false, [])
     env := infer.newEnv(t)
-    markLeaks(w, m.decls)
+    markLeaks(w, t, m.decls)
     for each d in m.decls {
         walkDecl(w, env, d)
     }
@@ -82,7 +82,7 @@ proc writtenShapes(m: ast.Module): Str[dyn] {
 // write, and a write has no signature to point at.
 proc leakedBy(t: types.Table, decls: ast.Decl[]): hive.map.Map<Str, Str> {
     mut Written w = Written([], [], hive.map.new(), hive.map.new(), t, false, [])
-    markLeaks(w, decls)
+    markLeaks(w, t, decls)
     return w.leakedBy
 }
 
@@ -265,31 +265,31 @@ proc markEscaped(w: mut Written, shape: Str, by: Str): void {
 //
 // Read off the signature: a shape leaks when it is reachable from the result and
 // from a parameter. That is why a builder is not caught by it.
-proc markLeaks(w: mut Written, decls: ast.Decl[]): void {
+proc markLeaks(w: mut Written, t: types.Table, decls: ast.Decl[]): void {
     for each d in decls {
         switch d {
             ast.Decl.CallableDecl(_, name, params, result, _, _) {
-                leaksFrom(w, name, params, types.resolve(w.table, result))
+                leaksFrom(w, t, name, params, types.resolve(t, result))
             }
             ast.Decl.QueryDecl(name, params, result, _, _) {
-                leaksFrom(w, name, params, types.resolve(w.table, result))
+                leaksFrom(w, t, name, params, types.resolve(t, result))
             }
             _ { }
         }
     }
 }
 
-proc leaksFrom(w: mut Written, by: Str, params: ast.Param[], result: types.Ty): void {
-    if types.ownsStorage(w.table, result) == false {
+proc leaksFrom(w: mut Written, t: types.Table, by: Str, params: ast.Param[], result: types.Ty): void {
+    if types.ownsStorage(t, result) == false {
         // Nothing that owns storage comes back, so nothing can come back out of
         // what went in. This is the case `lentFuncs` already relies on.
         return
     }
     mut Str[dyn] answered = []
-    leakShapes(w.table, result, answered)
+    leakShapes(t, result, answered)
     for each p in params {
         mut Str[dyn] given = []
-        shapesOf(w.table, types.resolve(w.table, p.declared), given, [])
+        shapesOf(t, types.resolve(t, p.declared), given, [])
         mut hive.map.Map<Str, Bool> wasGiven = hive.map.new()
         for each shape in given {
             hive.map.set(wasGiven, shape, true)
@@ -333,9 +333,11 @@ proc shapesOf(t: types.Table, ty: types.Ty, out: mut Str[dyn], seen: Str[]): voi
         return
     }
     shape := shapeOf(ty)
-    if indexOf(out, shape) is Result.Error(_) {
-        append(out, shape)
+    // Already there means already walked, or being walked further up.
+    if indexOf(out, shape) is Result.Ok(_) {
+        return
     }
+    append(out, shape)
     if ty is types.Ty.TVec(element, _) { shapesOf(t, element, out, seen) return }
     if ty is types.Ty.TMap(_, value) { shapesOf(t, value, out, seen) return }
     if ty is types.Ty.TResult(ok, bad) {
@@ -363,6 +365,186 @@ proc shapesOf(t: types.Table, ty: types.Ty, out: mut Str[dyn], seen: Str[]): voi
             }
         }
     }
+}
+
+// --- What a copy weighs ---------------------------------------------------------
+
+// How long a `[dyn]` is taken to be when weighing a copy of one.
+func assumedLength(): Int {
+    return 8
+}
+
+// Past any real copy, and far enough from overflow for a sum of them.
+func unweighed(): Int {
+    return 1000000000
+}
+
+// What a deep copy of `ty` walks, no more than `cap`.
+func weight(t: types.Table, written: Str[], ty: types.Ty, seen: Str[], cap: Int): Int {
+    if types.ownsStorage(t, ty) == false {
+        return 0
+    }
+    if ty is types.Ty.TVec(element, dim) {
+        return atMost(howMany(dim, cap) * (1 + weight(t, written, element, seen, cap)), cap)
+    }
+    if ty is types.Ty.TMap(_, value) {
+        return atMost(assumedLength() * (1 + weight(t, written, value, seen, cap)), cap)
+    }
+    // Nothing writes inside a `Result`, so a copy hands one on as it stands.
+    if ty is types.Ty.TResult(_, _) {
+        return 0
+    }
+    if ty is types.Ty.TNamed(name) {
+        if indexOf(seen, name) is Result.Ok(_) {
+            return assumedLength()
+        }
+        mut Str[dyn] deeper = []
+        for each one in seen {
+            append(deeper, one)
+        }
+        append(deeper, name)
+        if types.findType(t, name) is Result.Ok(info) {
+            mut Int sum = 0
+            for each f in info.shared {
+                sum = sum + fieldWeight(t, written, name, f, deeper, cap)
+            }
+            mut Int worst = 0
+            for each v in info.variants {
+                mut Int here = 0
+                for each f in v.fields {
+                    here = here + fieldWeight(t, written, name, f, deeper, cap)
+                }
+                if here > worst {
+                    worst = here
+                }
+            }
+            return atMost(sum + worst, cap)
+        }
+        return assumedLength()
+    }
+    return 0
+}
+
+// A copied answer is the one copy that opens a `Result`.
+func answerWeight(t: types.Table, written: Str[], ty: types.Ty, cap: Int): Int {
+    if ty is types.Ty.TResult(ok, bad) {
+        heavier := weight(t, written, ok, [], cap)
+        other := weight(t, written, bad, [], cap)
+        if other > heavier {
+            return other
+        }
+        return heavier
+    }
+    return weight(t, written, ty, [], cap)
+}
+
+func fieldWeight(t: types.Table, written: Str[], owner: Str, f: ast.Field, seen: Str[], cap: Int): Int {
+    ty := types.resolve(t, f.declared)
+    if ty is types.Ty.TResult(_, _) || mustCopy(t, written, owner, f.name, ty) == false {
+        return 0
+    }
+    return 1 + weight(t, written, ty, seen, cap)
+}
+
+func howMany(dim: ast.Dim, cap: Int): Int {
+    if dim is ast.Dim.Fixed(size) {
+        if size < 1 {
+            return 1
+        }
+        return atMost(size, cap)
+    }
+    return assumedLength()
+}
+
+func atMost(value: Int, cap: Int): Int {
+    if value > cap {
+        return cap
+    }
+    return value
+}
+
+// --- Copying an answer instead of its arguments ---------------------------------
+
+// `0`: copy the arguments. `1`: copy nothing, since the answer shares no storage
+// shape with them. `2`: copy the answer, which weighs less than they do.
+func answerPlan(t: types.Table, written: Str[], copied: types.Ty[], answer: types.Ty): Int {
+    if len(copied) == 0 {
+        return 0
+    }
+    mut Str[dyn] given = []
+    for each ty in copied {
+        shapesOf(t, ty, given, [])
+    }
+    mut hive.map.Map<Str, Bool> wasGiven = hive.map.new()
+    for each shape in given {
+        hive.map.set(wasGiven, shape, true)
+    }
+    mut Str[dyn] answered = []
+    shapesOf(t, answer, answered, [])
+    mut shares := false
+    for each shape in answered {
+        if hive.map.has(wasGiven, shape) {
+            shares = true
+        }
+    }
+    if shares == false {
+        return 1
+    }
+    if copyable(t, answer) == false {
+        return 0
+    }
+    mut Int handed = 0
+    for each ty in copied {
+        handed = handed + weight(t, written, ty, [], unweighed())
+    }
+    if answerWeight(t, written, answer, unweighed()) < handed {
+        return 2
+    }
+    return 0
+}
+
+// `clone_T` shares a field holding a `Result`, so only a top-level one is copied.
+func copyable(t: types.Table, ty: types.Ty): Bool {
+    if ty is types.Ty.TResult(ok, bad) {
+        return resultFree(t, ok, []) && resultFree(t, bad, [])
+    }
+    return resultFree(t, ty, [])
+}
+
+func resultFree(t: types.Table, ty: types.Ty, seen: Str[]): Bool {
+    if types.ownsStorage(t, ty) == false {
+        return true
+    }
+    if ty is types.Ty.TResult(_, _) { return false }
+    if ty is types.Ty.TVec(element, _) { return resultFree(t, element, seen) }
+    if ty is types.Ty.TMap(_, value) { return resultFree(t, value, seen) }
+    if ty is types.Ty.TNamed(name) {
+        if indexOf(seen, name) is Result.Ok(_) {
+            return true
+        }
+        mut Str[dyn] deeper = []
+        for each one in seen {
+            append(deeper, one)
+        }
+        append(deeper, name)
+        if types.findType(t, name) is Result.Ok(info) {
+            for each f in info.shared {
+                if resultFree(t, types.resolve(t, f.declared), deeper) == false {
+                    return false
+                }
+            }
+            for each v in info.variants {
+                for each f in v.fields {
+                    if resultFree(t, types.resolve(t, f.declared), deeper) == false {
+                        return false
+                    }
+                }
+            }
+            return true
+        }
+        return false
+    }
+    return true
 }
 
 // --- Declarations -------------------------------------------------------------
@@ -433,7 +615,7 @@ proc walkStmt(w: mut Written, env: infer.Env, s: ast.Stmt): infer.Env {
             markThrough(w, env, value)
             append(w.mutables, name)
         }
-        return infer.bound(env, name, types.resolve(w.table, declared))
+        return infer.bound(env, name, types.resolve(env.table, declared))
     }
     if s is ast.Stmt.IfChain(branches, otherwise, _, _) {
         for each b in branches {
@@ -459,7 +641,7 @@ proc walkStmt(w: mut Written, env: infer.Env, s: ast.Stmt): infer.Env {
         mut element := types.elementOf(infer.typeOf(env, subject))
         if declared is ast.TypeExpr.VoidType {
         } else {
-            element = types.resolve(w.table, declared)
+            element = types.resolve(env.table, declared)
         }
         walkBlock(w, infer.bound(env, name, element), body)
         return env

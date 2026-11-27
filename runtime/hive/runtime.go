@@ -6,6 +6,7 @@ package hive
 import (
 	"crypto/subtle"
 	"embed"
+	"flag"
 	"fmt"
 	"math"
 	"reflect"
@@ -57,6 +58,15 @@ func (r Result[T, E]) IsOk() bool    { return r.ok }
 func (r Result[T, E]) IsError() bool { return !r.ok }
 func (r Result[T, E]) Ok() T         { return r.value }
 func (r Result[T, E]) Err() E        { return r.bad }
+
+func CloneResult[T any, E any](r Result[T, E], ok func(T) T, bad func(E) E) Result[T, E] {
+	if r.ok {
+		r.value = ok(r.value)
+	} else {
+		r.bad = bad(r.bad)
+	}
+	return r
+}
 
 // Every Error comes before every Ok; two of a kind compare by their
 // payloads.
@@ -369,6 +379,17 @@ func Bytes[T any](v []T) int {
 // vectors are equal when they are the same length and equal element by
 // element; a Dict compares its pairs and ignores the order they were set in.
 func Eq(a, b any) bool {
+	switch x := a.(type) {
+	case string:
+		y, ok := b.(string)
+		return ok && x == y
+	case int:
+		y, ok := b.(int)
+		return ok && x == y
+	case bool:
+		y, ok := b.(bool)
+		return ok && x == y
+	}
 	if d, ok := a.(interface{ equalTo(any) bool }); ok {
 		return d.equalTo(b)
 	}
@@ -822,8 +843,23 @@ func IndexOfStr(s, sub string) Result[int, bool] {
 // IndexOfVec is the position of the first element equal to value, compared
 // the way == compares it — so a vector of vectors matches structurally.
 func IndexOfVec[T any](v []T, value T) Result[int, bool] {
+	switch vs := any(v).(type) {
+	case []string:
+		return indexOfScalar(vs, any(value).(string))
+	case []int:
+		return indexOfScalar(vs, any(value).(int))
+	}
 	for i := range v {
 		if Eq(v[i], value) {
+			return Ok[int, bool](i)
+		}
+	}
+	return Err[int, bool](false)
+}
+
+func indexOfScalar[T comparable](v []T, value T) Result[int, bool] {
+	for i := range v {
+		if v[i] == value {
 			return Ok[int, bool](i)
 		}
 	}
@@ -1626,6 +1662,13 @@ func TestAssertCmp(t T, ok bool, source, left, right string) {
 	t.Helper()
 	if !ok {
 		t.Errorf("assert %s\n  left:  %s\n  right: %s", source, left, right)
+	}
+}
+
+// One thread keeps the tests in the order they were written.
+func TestParallel(t interface{ Parallel() }) {
+	if f := flag.Lookup("test.parallel"); f != nil && f.Value.String() != "1" {
+		t.Parallel()
 	}
 }
 

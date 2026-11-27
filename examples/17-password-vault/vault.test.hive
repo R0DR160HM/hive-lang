@@ -7,7 +7,7 @@
 // The second is about the vault as a file, and really does encrypt, write, read
 // and decrypt: `hive test` builds and runs inside `vault.test.hive-build/`, so
 // what those write lands in a throwaway folder rather than on top of a vault
-// anybody is using.
+// anybody is using. Tests run side by side, so each writes a file of its own.
 
 import ./vault
 
@@ -84,12 +84,13 @@ test "deleting a name that was never there changes nothing" {
 // --- The vault as a file ----------------------------------------------------
 
 test "a vault survives being sealed, written, read and opened" {
-    hive.file.delete(vault.file())
+    path := "round-trip.dat"
+    hive.file.delete(path)
 
     stored := vault.replace(vault.Vault([]), "github", "s3cr3t")
-    vault.save(stored, master())
+    vault.save(path, stored, master())
 
-    opened := vault.open(master())
+    opened := vault.open(path, master())
     if opened is Result.Ok(reopened) {
         assert entries(reopened) == 1
         if vault.secretOf(reopened.entries, "github") is Result.Ok(secret) {
@@ -103,10 +104,11 @@ test "a vault survives being sealed, written, read and opened" {
 }
 
 test "nothing readable is left on disk" {
-    hive.file.delete(vault.file())
-    vault.save(vault.replace(vault.Vault([]), "github", "s3cr3t"), master())
+    path := "unreadable.dat"
+    hive.file.delete(path)
+    vault.save(path, vault.replace(vault.Vault([]), "github", "s3cr3t"), master())
 
-    if hive.file.read(vault.file()) is Result.Ok(onDisk) {
+    if hive.file.read(path) is Result.Ok(onDisk) {
         // `indexOf` on a string answers with where the text is, or Error(false)
         // if it is not there at all — which is the answer wanted for both of
         // these. The name is as much a secret as the password is.
@@ -118,38 +120,41 @@ test "nothing readable is left on disk" {
 }
 
 test "the wrong master password does not open the vault" {
-    hive.file.delete(vault.file())
-    vault.save(vault.replace(vault.Vault([]), "github", "s3cr3t"), master())
+    path := "wrong-password.dat"
+    hive.file.delete(path)
+    vault.save(path, vault.replace(vault.Vault([]), "github", "s3cr3t"), master())
 
-    assert vault.open(bypass("not the master password")) is Result.Error(_)
+    assert vault.open(path, bypass("not the master password")) is Result.Error(_)
 }
 
 test "a vault changed behind the program's back is refused" {
-    hive.file.delete(vault.file())
-    vault.save(vault.replace(vault.Vault([]), "github", "s3cr3t"), master())
+    path := "tampered.dat"
+    hive.file.delete(path)
+    vault.save(path, vault.replace(vault.Vault([]), "github", "s3cr3t"), master())
 
-    if hive.file.read(vault.file()) is Result.Ok(sealed) {
+    if hive.file.read(path) is Result.Ok(sealed) {
         // Four more base64 characters is three more bytes of ciphertext. The
         // key still derives and the file still decodes; it is GCM's
         // authentication tag that refuses it.
-        hive.file.write(vault.file(), sealed + "AAAA")
+        hive.file.write(path, sealed + "AAAA")
     } else {
         assert false
     }
 
-    assert vault.open(master()) is Result.Error(_)
+    assert vault.open(path, master()) is Result.Error(_)
 }
 
 test "two saves of the same entries look nothing alike on disk" {
     // A fresh salt and nonce every time. Without them, an onlooker holding two
     // copies of the file would learn that nothing had changed between them.
-    hive.file.delete(vault.file())
+    path := "two-saves.dat"
+    hive.file.delete(path)
     stored := vault.replace(vault.Vault([]), "github", "s3cr3t")
 
-    vault.save(stored, master())
-    first := hive.file.read(vault.file())
-    vault.save(stored, master())
-    second := hive.file.read(vault.file())
+    vault.save(path, stored, master())
+    first := hive.file.read(path)
+    vault.save(path, stored, master())
+    second := hive.file.read(path)
 
     if first is Result.Ok(before) && second is Result.Ok(after) {
         assert before != after
@@ -159,8 +164,9 @@ test "two saves of the same entries look nothing alike on disk" {
 }
 
 test "an absent vault is a failure to open, not a crash" {
-    hive.file.delete(vault.file())
-    assert vault.open(master()) is Result.Error(_)
+    path := "absent.dat"
+    hive.file.delete(path)
+    assert vault.open(path, master()) is Result.Error(_)
 }
 
 // The run ends with

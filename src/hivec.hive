@@ -27,6 +27,7 @@ import ./agents
 import ./analyzereport
 import ./container
 import ./diag
+import ./host.go
 import ./icon
 import ./indent
 import ./install
@@ -38,6 +39,7 @@ import ./testreport
 import ./text
 import ./use
 import ./version
+import hive.conv
 import hive.file
 import hive.term
 
@@ -96,7 +98,7 @@ proc main(): void {
         }
     }
     // Something typed and then ignored is a command that quietly disobeyed.
-    if command != "build" && command != "export" && command != "run" && command != "install" && len(args) > 2 {
+    if command != "build" && command != "export" && command != "run" && command != "install" && command != "test" && len(args) > 2 {
         refuse("`hive {command}` takes an entrypoint and nothing else. `" + at(args, 2) + "` was given to it.")
     }
 
@@ -113,10 +115,11 @@ proc main(): void {
     } else if command == "install" {
         installProgram(entry, rest(args, 2), from)
     } else if command == "test" {
+        threads := threadsFor(rest(args, 2))
         if hive.file.list(entry) is Result.Ok(_) {
-            suites(entry, from)
+            suites(entry, threads, from)
         } else {
-            suite(entry, from)
+            suite(entry, threads, from)
         }
     } else if command == "analyze" {
         score(entry, from)
@@ -166,14 +169,15 @@ proc build(entry: Str, flags: Str[], from: Int): void {
             }
         }
     }
-    written := project.compile(entry, asked.target, from)
+    platform := project.platformOf(asked.target)
+    written := project.compile(entry, asked.target, platform, from)
     if len(written.errors) > 0 {
         complain(written.errors)
         return
     }
     // What it cost is part of the answer, so this goes to standard output and is
     // said whether anybody was watching or not.
-    echo "Compiled {entry} -> " + project.executableOf(entry, asked.target) + " (" + progress.took(progress.since(from)) + ")"
+    echo "Compiled {entry} -> " + project.executableNamed(entry, asked.target, platform) + " (" + progress.took(progress.since(from)) + ")"
 }
 
 // The program wrapped in an app that can be installed. The one format it knows
@@ -236,13 +240,14 @@ proc installProgram(entry: Str, flags: Str[], from: Int): void {
         installApp(entry, asked.target, from)
         return
     }
-    written := project.compile(entry, "", from)
+    platform := project.platformOf("")
+    written := project.compile(entry, "", platform, from)
     if len(written.errors) > 0 {
         complain(written.errors)
         return
     }
     // The build writes the program beside its entrypoint, under this name.
-    built := paths.joinPath(paths.dirOf(entry), project.executableOf(entry, ""))
+    built := paths.joinPath(paths.dirOf(entry), project.executableNamed(entry, "", platform))
     if asked.desktop && written.windowed == false {
         hive.file.delete(built)
         refuse("`{paths.baseOf(entry)}` opens no window, so a launcher would start it with nowhere to show anything. `hive install` without `--desktop` puts it where a shell finds it.")
@@ -291,9 +296,9 @@ proc installApp(entry: Str, target: Str, from: Int): void {
 }
 
 // Named `suite` rather than `test`, because `test` is a keyword.
-proc suite(entry: Str, from: Int): void {
+proc suite(entry: Str, threads: Int, from: Int): void {
     titles := project.testTitles(entry)
-    answered := project.runTests(entry, titles, from)
+    answered := project.runTests(entry, titles, threads, from)
     if answered is Result.Error(errors) {
         complain(errors)
         return
@@ -311,7 +316,7 @@ proc suite(entry: Str, from: Int): void {
 
 // `hive test <directory>`: every test under it, and every test outside it that a
 // file under it imports, each file's tests run once.
-proc suites(directory: Str, from: Int): void {
+proc suites(directory: Str, threads: Int, from: Int): void {
     progress.step(from, "finding the tests under {directory}")
     mut project.Reached[dyn] reached = []
     mut broken := 0
@@ -332,29 +337,99 @@ proc suites(directory: Str, from: Int): void {
         echo "No tests under {directory} (" + progress.took(progress.since(from)) + ")"
         return
     }
-    mut passed := 0
-    mut failed := 0
-    for each p in planned {
-        echo p.entry
-        answered := project.runTests(p.entry, p.titles, from)
-        switch answered {
-            Result.Error(errors) {
-                tell(errors)
-                broken = broken + 1
-            }
-            Result.Ok(said) {
-                echo testreport.render(project.buildDirOf(p.entry), p.titles, said)
-                missed := testreport.failures(p.titles, said)
-                failed = failed + missed
-                passed = passed + len(p.titles) - missed
-            }
-        }
-        echo ""
+    mut workers := threads
+    if workers > len(planned) {
+        workers = len(planned)
     }
-    echo totals(len(planned), passed, failed, broken)
-    if failed > 0 || broken > 0 {
+    done := stripes(planned, 0, workers, workers, threads, from)
+    echo totals(len(planned), done.passed, done.failed, broken + done.broken)
+    if done.failed > 0 || broken + done.broken > 0 {
         hive.term.exit(1)
     }
+}
+
+type Tally {
+    passed: Int
+    failed: Int
+    broken: Int
+}
+
+// Stripe `k` runs every `every`th program from `k`, each stripe on a thread of its own.
+proc stripes(planned: project.Planned[], first: Int, count: Int, every: Int, threads: Int, from: Int): Tally {
+    if count <= 1 {
+        return stripe(planned, first, every, threads, from)
+    }
+    half := count / 2
+    both := await [stripes(planned, first, half, every, threads, from), stripes(planned, first + half, count - half, every, threads, from)]
+    left := both[0]
+    right := both[1]
+    return Tally(left.passed + right.passed, left.failed + right.failed, left.broken + right.broken)
+}
+
+proc stripe(planned: project.Planned[], first: Int, every: Int, threads: Int, from: Int): Tally {
+    mut passed := 0
+    mut failed := 0
+    mut broken := 0
+    // Several programs' passes at once would interleave, so only their starts are said.
+    mut clock := from
+    if every > 1 {
+        clock = 0
+    }
+    for i := first; i < len(planned); i = i + every {
+        if planned bounds i {
+            p := planned[i]
+            if every > 1 {
+                progress.step(from, "testing " + p.entry)
+            }
+            answered := project.runTests(p.entry, p.titles, threads, clock)
+            switch answered {
+                Result.Error(errors) {
+                    echo p.entry
+                    tell(errors)
+                    echo ""
+                    broken = broken + 1
+                }
+                Result.Ok(said) {
+                    // One write, so programs finishing together cannot interleave.
+                    echo p.entry + "\n" + testreport.render(project.buildDirOf(p.entry), p.titles, said) + "\n"
+                    missed := testreport.failures(p.titles, said)
+                    failed = failed + missed
+                    passed = passed + len(p.titles) - missed
+                }
+            }
+        }
+    }
+    return Tally(passed, failed, broken)
+}
+
+proc threadsFor(flags: Str[]): Int {
+    mut asked := ""
+    mut wants := false
+    mut given := false
+    for each flag in flags {
+        if wants {
+            asked = flag
+            wants = false
+        } else if flag == "--threads" {
+            wants = true
+            given = true
+        } else if text.startsWith(flag, "--threads=") {
+            asked = text.span(text.chars(flag), len("--threads="), len(flag) - 1)
+            given = true
+        } else {
+            refuse("`" + flag + "` is not something `hive test` takes. The one flag here is `--threads <count>`.")
+        }
+    }
+    if given == false {
+        return host.cores()
+    }
+    if hive.conv.sti(asked) is Result.Ok(count) {
+        if count > 0 {
+            return count
+        }
+    }
+    refuse("`--threads` takes how many tests may run at once, a whole number from 1 up: `hive test . --threads 4`.")
+    return 1
 }
 
 func totals(programs: Int, passed: Int, failed: Int, broken: Int): Str {
@@ -601,4 +676,6 @@ proc usage(): void {
     echo "                                         which `install` puts on a phone over USB."
     echo "  --name <name>                          What `install` puts the program in as."
     echo "  --desktop                              Have `install` add it to the app launcher too."
+    echo "  --threads <count>                      How many tests `test` runs at once, and how many"
+    echo "                                         programs under a directory. Every core by default."
 }

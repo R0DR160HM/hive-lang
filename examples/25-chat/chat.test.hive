@@ -15,7 +15,8 @@
 // The third is a real **node**. This file listens on a port, spawns a mailbox
 // under `#Chat` — the very name the window is spawned under — and then
 // talks to it the way the other end of a chat would, over syslink proper. The
-// handshake, the answer, the timeout and the send all run for real.
+// handshake, the answer, the timeout and the send all run for real, in one test:
+// tests run side by side, and a process is one node.
 
 import ./chat
 import hive.ui
@@ -279,7 +280,7 @@ proc asked(box: Address<chat.Msg>): Str {
     return ""
 }
 
-test "a greeting is a request, and the answer is what the other node is called" {
+test "a node greets another, talks to it, and hears when one is not there" {
     if hive.syslink.listen("127.0.0.1:9188") is Result.Error(problem) {
         panic problem
     }
@@ -295,18 +296,11 @@ test "a greeting is a request, and the answer is what the other node is called" 
     chat.greet("127.0.0.1:9188", "127.0.0.1:9188", "Ada", box)
     hive.task.sleep(400)
 
-    told := asked(box)
-    // The knock arrived, carrying who was knocking...
-    assert indexOf(told, "knock 127.0.0.1:9188 Ada") is Result.Ok(_)
-    // ...and the wave came back, carrying who answered. That round trip is the
-    // whole handshake: one waited call, its answer, and a `Met` posted to the
-    // window from off its thread.
-    assert indexOf(told, "met 127.0.0.1:9188 Bob") is Result.Ok(_)
-}
-
-test "what one node says arrives at the other" {
-    hive.task.sleep(100)
-    Address<chat.Msg> box = at(#Chat)
+    // The knock carried who was knocking, and the wave who answered: one waited
+    // call, its answer, and a `Met` posted to the window from off its thread.
+    greeted := asked(box)
+    assert indexOf(greeted, "knock 127.0.0.1:9188 Ada") is Result.Ok(_)
+    assert indexOf(greeted, "met 127.0.0.1:9188 Bob") is Result.Ok(_)
 
     // The same statement the window uses, aimed at a node by its endpoint.
     Address<chat.Msg> there = at("127.0.0.1:9188", #Chat)
@@ -327,22 +321,15 @@ test "what one node says arrives at the other" {
     } else {
         assert false
     }
-}
 
-test "a node that is not there is reported rather than waited on forever" {
-    hive.task.sleep(100)
-    Address<chat.Msg> box = at(#Chat)
-    // Nothing is listening on 9189. `greet` retries, gives up, and the giving up
-    // is a message like any other — which is what puts it on the screen instead
-    // of leaving a window that looks like it joined and never hears anything.
+    // Nothing is listening on 9189. `greet` gives up, and the giving up is a
+    // message like any other, so the window shows it rather than waiting forever.
     chat.greet("127.0.0.1:9189", "127.0.0.1:9188", "Ada", box)
     hive.task.sleep(200)
     assert indexOf(asked(box), "unreachable 127.0.0.1:9189") is Result.Ok(_)
-}
 
-// Sending to a node is what puts it in the peer list: a connection *is* the
-// record, so there is no bookkeeping to go stale.
-test "a node that has been talked to is a connected peer" {
+    // Sending to a node is what puts it in the peer list: a connection *is* the
+    // record, so there is no bookkeeping to go stale.
     assert len(hive.syslink.peers()) >= 0
     assert hive.syslink.node() == "127.0.0.1:9188"
 }

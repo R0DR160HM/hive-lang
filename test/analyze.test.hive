@@ -400,12 +400,43 @@ test "a copy inside a loop is worth eight times the same copy outside one" {
     assert looped == flat * 8
 }
 
-test "a copy weighs a Result by the worse of its two sides" {
+test "a Result is handed on as it stands, so holding one costs a copy nothing" {
     source := "type Box \{ held: Result<Str[dyn], Bool> }\n"
-        + "proc main(): void \{ mut Box b = Box(Result.Ok([])) if b.held is Result.Ok(v) \{ append(v, \"x\") } kept := b echo \"\{kept.held is Result.Ok(_)}\" }"
+        + "proc main(): void \{ mut Box b = Box(Result.Ok([])) kept := b b = Box(Result.Error(true)) echo \"\{kept.held is Result.Ok(_)}\" }"
+    assert finds(source, "main", "deep copy") == false
     assert analyze.larger(3, 7) == 7
     assert analyze.larger(7, 3) == 7
-    assert len(found(source, "main")) >= 0
+}
+
+proc copiedAt(source: Str, name: Str): Str[dyn] {
+    mut Str[dyn] out = []
+    for each f in found(source, name) {
+        if f.kind is analyze.Kind.Copy(_, where, _, _) {
+            append(out, where)
+        }
+    }
+    return out
+}
+
+test "a lookup that can keep nothing is lent its argument, and its answer is the copy" {
+    source := "type Bag \{ items: Str[dyn] }\nproc fill(b: mut Bag): void \{ append(b.items, \"x\") }\n"
+        + "func itemsOf(b: Bag): Str[dyn] \{ return b.items }\n"
+        + "proc main(): void \{ mut Bag b = Bag([]) fill(b) v := itemsOf(b) fill(b) echo len(v) }"
+    where := copiedAt(source, "main")
+    assert indexOf(where, "the answer of `itemsOf`") is Result.Ok(_)
+    assert indexOf(where, "an argument to `itemsOf`") is Result.Error(_)
+}
+
+test "an answer that cannot hold the argument's storage is not copied either" {
+    source := "type Bag \{ items: Str[dyn] }\nproc fill(b: mut Bag): void \{ append(b.items, \"x\") }\n"
+        + "func lengths(b: Bag): Int[dyn] \{ mut Int[dyn] out = [] for each s in b.items \{ append(out, len(s)) } return out }\n"
+        + "proc main(): void \{ mut Bag b = Bag([]) fill(b) n := lengths(b) fill(b) echo len(n) }"
+    assert finds(source, "main", "deep copy") == false
+}
+
+test "a mut name bound twice in one body copies rather than sharing a cell" {
+    assert finds(boxed("mut Box b = Box([]) if len(b.items) == 0 \{ mut Box c = b append(c.items, \"x\") } else \{ mut Box c = b append(c.items, \"y\") } echo len(b.items)"),
+        "main", "deep copy")
 }
 
 test "a scalar owns no storage, so binding one is never a copy" {

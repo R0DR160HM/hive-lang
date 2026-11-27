@@ -47,7 +47,7 @@ proc main(): void {
         if typed is Result.Error(why) {
             echo why.message
         } else if typed is Result.Ok(master) {
-            opened := open(master)
+            opened := open(file(), master)
             if opened is Result.Error(problem) {
                 echo problem
             } else if opened is Result.Ok(vault) {
@@ -116,7 +116,7 @@ proc run(vault: Vault, master: Secret<Str>): void {
             } else if typed is Result.Ok(secret) && reveal(secret) == "" {
                 echo "nothing typed — {name} left alone"
             } else if typed is Result.Ok(secret) {
-                open = save(replace(open, name, reveal(secret)), master)
+                open = save(file(), replace(open, name, reveal(secret)), master)
                 echo "{name} saved"
             }
             continue
@@ -126,7 +126,7 @@ proc run(vault: Vault, master: Secret<Str>): void {
             // 24 random bytes as hex. `randomHex` is the cryptographically
             // random one, which is the only kind worth putting in a vault.
             secret := hive.crypto.randomHex(24)
-            open = save(replace(open, name, secret), master)
+            open = save(file(), replace(open, name, secret), master)
             echo "{name}: {secret}"
             continue
         }
@@ -136,7 +136,7 @@ proc run(vault: Vault, master: Secret<Str>): void {
                 echo "no entry named {name}"
                 continue
             }
-            open = save(Vault(without(open.entries, name)), master)
+            open = save(file(), Vault(without(open.entries, name)), master)
             echo "{name} deleted"
             continue
         }
@@ -159,7 +159,7 @@ proc create(): Result<Secret<Str>, Str> {
         }
         echo "Type it again:"
         if hive.term.readSecret() is Result.Ok(again) && again == master {
-            save(Vault([]), master)
+            save(file(), Vault([]), master)
             echo "created."
             return Result.Ok(master)
         }
@@ -167,24 +167,24 @@ proc create(): Result<Secret<Str>, Str> {
     }
 }
 
-// Reads the vault and opens it, or says what went wrong in a sentence.
-proc open(master: Secret<Str>): Result<Vault, Str> {
-    read := hive.file.read(file())
+// Reads the vault at `path` and opens it, or says what went wrong in a sentence.
+proc open(path: Str, master: Secret<Str>): Result<Vault, Str> {
+    read := hive.file.read(path)
     if read is Result.Error(problem) {
-        return Result.Error("could not read {file()}: {problem.message}")
+        return Result.Error("could not read {path}: {problem.message}")
     } else if read is Result.Ok(sealed) {
         // A wrong password and a file edited since it was written both fail the
         // authentication tag, and it cannot say which of the two happened — so
         // neither can this.
         opened := hive.crypto.decrypt(sealed, master)
         if opened is Result.Error(_) {
-            return Result.Error("wrong master password, or {file()} has been tampered with")
+            return Result.Error("wrong master password, or {path} has been tampered with")
         } else if opened is Result.Ok(plain) {
             parsed := Vault.decode(reveal(plain), hive.json.codec())
             if parsed is Result.Ok(vault) {
                 return Result.Ok(vault)
             } else if parsed is Result.Error(problem) {
-                return Result.Error("{file()} decrypted but did not hold a vault ({problem.path}: expected {problem.expected})")
+                return Result.Error("{path} decrypted but did not hold a vault ({problem.path}: expected {problem.expected})")
             }
         }
     }
@@ -199,13 +199,13 @@ proc open(master: Secret<Str>): Result<Vault, Str> {
 //
 // The ciphertext goes through `bypass`: it is safe to be seen, so it needs no
 // locked memory, and `writeSecret` only takes a `Secret`.
-proc save(vault: Vault, master: Secret<Str>): Vault {
+proc save(path: Str, vault: Vault, master: Secret<Str>): Vault {
     plain := hide(encode(vault, hive.json.codec()))
     if plain is Result.Error(why) {
         panic why
     } else if plain is Result.Ok(text) {
         sealed := hive.crypto.encrypt(text, master)
-        if hive.file.writeSecret(file(), bypass(sealed)) is Result.Error(problem) {
+        if hive.file.writeSecret(path, bypass(sealed)) is Result.Error(problem) {
             // Carrying on would leave the entry in memory only, and the next `get`
             // would answer with something the file does not have.
             panic problem

@@ -148,6 +148,7 @@ type Emit {
     // printer has been asked for.
     sites: bake.Site[dyn]
     printers: Str[dyn]
+    plans: hive.map.Map<Str, Int>
 }
 
 // For a test of this pass: a program nothing has checked.
@@ -157,7 +158,7 @@ proc emitModule(m: ast.Module): Emitted {
 
 proc emitChecked(m: ast.Module, landings: infer.Landing[]): Emitted {
     t := types.tableOf(m)
-    mut Emit em = Emit(t, [], 0, ["Nil"], [], [], [], [], [], [], 0, [], [], [], [], false, false, false, -1, [], writes.writtenShapes(m), [], token.nowhere(), "", false, [], [], "", [], [], landings, typeLawsIn(t, m.decls), bake.sitesOf(m), [])
+    mut Emit em = Emit(t, [], 0, ["Nil"], [], [], [], [], [], [], 0, [], [], [], [], false, false, false, -1, [], writes.writtenShapes(m), [], token.nowhere(), "", false, [], [], "", [], [], landings, typeLawsIn(t, m.decls), bake.sitesOf(m), [], hive.map.new())
 
     line(em, "package main")
     line(em, "")
@@ -1381,7 +1382,7 @@ proc emitForEach(em: mut Emit, env: infer.Env, name: Str, declared: ast.TypeExpr
     } else {
         elementType = types.resolve(env.table, declared)
     }
-    mut inner := infer.bound(env, name, elementType)
+    inner := infer.bound(env, name, elementType)
     mut walked := expr(em, env, subject, types.Ty.TUnknown())
     if isPacked(subjectType) {
         walked = walked + ".All"
@@ -1464,7 +1465,7 @@ proc emitGuards(em: mut Emit, env: infer.Env, parts: ast.Expr[], index: Int, bod
         part = parts[index]
     }
     if part is ast.Expr.IsMatch(subject, pattern, _) {
-        mut inner := emitPatternGuard(em, env, subject, pattern)
+        inner := emitPatternGuard(em, env, subject, pattern)
         emitGuards(em, inner, parts, index + 1, body, flag, result)
         close(em, "}")
         return
@@ -2865,10 +2866,15 @@ proc namedCall(em: mut Emit, env: infer.Env, name: Str, args: ast.Arg[], want: t
                 append(mutables, p.mutable)
             }
             h := hoist(em, env, args, names, tys, mutables, lends(em, name))
-            inner := lendingCall(em, goIdent(name) + "(" + orderedArgs(em, h.env, info, h.args) + ")", answer)
+            inner := lendingCall(em, goIdent(name) + "(" + orderedArgs(em, h.env, info, h.args, false) + ")", answer)
             return inWrittenOrder(h, goResult(answer), inner)
         }
-        return lendingCall(em, goIdent(name) + "(" + orderedArgs(em, env, info, args) + ")", answer)
+        plan := answering(em, env, info, args, answer)
+        mut called := goIdent(name) + "(" + orderedArgs(em, env, info, args, plan > 0) + ")"
+        if plan == 2 {
+            called = copiedAnswer(env.table, answer, called)
+        }
+        return lendingCall(em, called, answer)
     }
     if target is infer.CallTarget.Struct(fields) {
         return structLiteral(em, env, name, fields, args)
@@ -3279,7 +3285,7 @@ proc fieldArgs(em: mut Emit, env: infer.Env, fields: ast.Field[], args: ast.Arg[
     return join(out, ", ")
 }
 
-proc orderedArgs(em: mut Emit, env: infer.Env, info: types.CallableInfo, args: ast.Arg[]): Str {
+proc orderedArgs(em: mut Emit, env: infer.Env, info: types.CallableInfo, args: ast.Arg[], answered: Bool): Str {
     ferry := takeFerry(em)
     handing := em.handing
     em.handing = ""
@@ -3317,7 +3323,7 @@ proc orderedArgs(em: mut Emit, env: infer.Env, info: types.CallableInfo, args: a
             // it already holds.
             written = addressOf(em, found, written)
         } else if isMutableSource(em, found) && types.ownsStorage(env.table, ty) && lends(em, info.name) == false {
-            if handing == "" || pathOf(found) != handing {
+            if (handing == "" || pathOf(found) != handing) && answered == false {
                 written = cloned(env.table, ty, written)
             }
         }
@@ -3326,6 +3332,65 @@ proc orderedArgs(em: mut Emit, env: infer.Env, info: types.CallableInfo, args: a
     em.fronts = fronts
     em.backs = backs
     return join(out, ", ")
+}
+
+proc answering(em: mut Emit, env: infer.Env, info: types.CallableInfo, args: ast.Arg[], answer: types.Ty): Int {
+    if em.ferrying || em.spawning || lends(em, info.name) || indexOf(em.handsBack, info.name) is Result.Error(_) {
+        return 0
+    }
+    copied := copiedParams(info, args, env.table, em.mutables, em.handing)
+    if len(copied) == 0 {
+        return 0
+    }
+    mut Str[dyn] positions = []
+    mut types.Ty[dyn] tys = []
+    for each c in copied {
+        append(positions, "{c.position}")
+        append(tys, c.ty)
+    }
+    key := info.name + "|" + join(positions, ",")
+    if hive.map.get(em.plans, key) is Result.Ok(known) {
+        return known
+    }
+    plan := writes.answerPlan(env.table, em.written, tys, types.resolve(env.table, info.result))
+    hive.map.set(em.plans, key, plan)
+    return plan
+}
+
+type CopiedParam {
+    position: Int
+    ty: types.Ty
+}
+
+func copiedParams(info: types.CallableInfo, args: ast.Arg[], t: types.Table, mutables: Str[], handing: Str): CopiedParam[dyn] {
+    mut CopiedParam[dyn] out = []
+    mut open := 0
+    mut position := 0
+    for each p in info.params {
+        found := ast.argFor(args, p.name, open)
+        if ast.claimedByName(args, p.name) == false {
+            open = open + 1
+        }
+        ty := types.resolve(t, p.declared)
+        root := rootOf(found)
+        if p.mutable == false && root != "" && indexOf(mutables, root) is Result.Ok(_) && types.ownsStorage(t, ty) {
+            if handing == "" || pathOf(found) != handing {
+                append(out, CopiedParam(position, ty))
+            }
+        }
+        position = position + 1
+    }
+    return out
+}
+
+// `cloned` leaves a `Result` as it stands.
+func copiedAnswer(t: types.Table, ty: types.Ty, written: Str): Str {
+    if ty is types.Ty.TResult(ok, bad) {
+        if types.ownsStorage(t, ty) {
+            return "hive.CloneResult(" + written + ", " + cloneFn(t, ok) + ", " + cloneFn(t, bad) + ")"
+        }
+    }
+    return cloned(t, ty, written)
 }
 
 func packedElement(env: infer.Env, e: ast.Expr): Bool {
@@ -5848,7 +5913,7 @@ proc emitCheckedTests(m: ast.Module, atoms: Str[], codecs: Str[], rows: Str[], m
     t := types.tableOf(m)
     // What `main.go` already wrote or asked for is seeded rather than repeated:
     // the two files are one Go package.
-    mut Emit em = Emit(t, [], 0, copiedNames(atoms), copiedNames(modules), [], [], lentFuncs(t, m.decls), copiedNames(rows), copiedNames(codecs), 0, [], [], [], [], true, false, false, -1, [], writes.writtenShapes(m), [], token.nowhere(), "", false, [], handingBackFuncs(t, m.decls), "", [], [], landings, typeLawsIn(t, m.decls), [], [])
+    mut Emit em = Emit(t, [], 0, copiedNames(atoms), copiedNames(modules), [], [], lentFuncs(t, m.decls), copiedNames(rows), copiedNames(codecs), 0, [], [], [], [], true, false, false, -1, [], writes.writtenShapes(m), [], token.nowhere(), "", false, [], handingBackFuncs(t, m.decls), "", [], [], landings, typeLawsIn(t, m.decls), [], [], hive.map.new())
     written := len(codecs)
     mapped := len(rows)
     mut found := false
@@ -5879,6 +5944,7 @@ proc emitCheckedTests(m: ast.Module, atoms: Str[], codecs: Str[], rows: Str[], m
             enterBody(em)
             em.cells = cellNames(t, env, [], body)
             open(em, testingT() + ".Run(" + quoted(title) + ", func(" + testingT() + " *testing.T) \{")
+            line(em, "hive.TestParallel(" + testingT() + ")")
             line(em, "defer hive.TestRecover(" + testingT() + ")")
             emitTestStmts(em, env, body)
             close(em, "})")
