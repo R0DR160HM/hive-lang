@@ -84,14 +84,40 @@ type Table {
     types: TypeInfo[dyn]
     callables: CallableInfo[dyn]
     library: ast.Library
+    typeAt: hive.map.Map<Str, Int>
+    callableAt: hive.map.Map<Str, Int>
 }
 
 proc emptyTable(): Table {
-    return Table([], [], ast.noLibrary())
+    return Table([], [], ast.noLibrary(), typeIndex([]), callableIndex([]))
 }
 
 func withDeclarations(t: Table, types: TypeInfo[], callables: CallableInfo[]): Table {
-    return Table(types, callables, t.library)
+    return Table(types, callables, t.library, typeIndex(types), callableIndex(callables))
+}
+
+func typeIndex(types: TypeInfo[]): hive.map.Map<Str, Int> {
+    mut hive.map.Map<Str, Int> out = hive.map.new()
+    mut at := 0
+    for each info in types {
+        if hive.map.has(out, info.name) == false {
+            hive.map.set(out, info.name, at)
+        }
+        at = at + 1
+    }
+    return out
+}
+
+func callableIndex(callables: CallableInfo[]): hive.map.Map<Str, Int> {
+    mut hive.map.Map<Str, Int> out = hive.map.new()
+    mut at := 0
+    for each info in callables {
+        if hive.map.has(out, info.name) == false {
+            hive.map.set(out, info.name, at)
+        }
+        at = at + 1
+    }
+    return out
 }
 
 // Read a flattened module's declarations into a table.
@@ -99,26 +125,32 @@ proc tableOf(m: ast.Module): Table {
     mut TypeInfo[dyn] types = []
     mut CallableInfo[dyn] callables = []
     for each d in m.decls {
-        if d is ast.Decl.TypeDecl(name, fields, variants, _) {
-            append(types, TypeInfo(name, variants, fields, variablesOfType(fields, variants)))
-        } else if d is ast.Decl.CallableDecl(kind, name, params, result, _, _) {
-            pure := (kind is ast.CallableKind.ProcKind) == false
-            append(callables, CallableInfo(name, pure, params, result, variablesOfSignature(params, result)))
-        } else if d is ast.Decl.ForeignDecl(name, params, result, _, _, _, _) {
-            // A Go function is a `func`: the boundary copies in both directions,
-            // so nothing on the far side writes where the caller can see.
-            append(callables, CallableInfo(name, true, params, result, variablesOfSignature(params, result)))
-        } else if d is ast.Decl.QueryDecl(name, params, result, _, _) {
-            // A query is a func whose body happens to be SQL, and what calling
-            // one answers with is the query — text, and the values bound beside
-            // it — rather than the rows. `hive.sql.run` is what turns one into
-            // rows, and the type it needs to do that is the declared row type
-            // travelling along inside `Fragment<...>`.
-            held := queryResult(result)
-            append(callables, CallableInfo(name, true, params, held, variablesOfSignature(params, held)))
+        switch d {
+            ast.Decl.TypeDecl(name, fields, variants, _) {
+                append(types, TypeInfo(name, variants, fields, variablesOfType(fields, variants)))
+            }
+            ast.Decl.CallableDecl(kind, name, params, result, _, _) {
+                pure := (kind is ast.CallableKind.ProcKind) == false
+                append(callables, CallableInfo(name, pure, params, result, variablesOfSignature(params, result)))
+            }
+            ast.Decl.ForeignDecl(name, params, result, _, _, _, _) {
+                // A Go function is a `func`: the boundary copies in both directions,
+                // so nothing on the far side writes where the caller can see.
+                append(callables, CallableInfo(name, true, params, result, variablesOfSignature(params, result)))
+            }
+            ast.Decl.QueryDecl(name, params, result, _, _) {
+                // A query is a func whose body happens to be SQL, and what calling
+                // one answers with is the query — text, and the values bound beside
+                // it — rather than the rows. `hive.sql.run` is what turns one into
+                // rows, and the type it needs to do that is the declared row type
+                // travelling along inside `Fragment<...>`.
+                held := queryResult(result)
+                append(callables, CallableInfo(name, true, params, held, variablesOfSignature(params, held)))
+            }
+            _ { }
         }
     }
-    return Table(types, callables, m.library)
+    return Table(types, callables, m.library, typeIndex(types), callableIndex(callables))
 }
 
 // --- What the standard library declares ---------------------------------------
@@ -359,18 +391,18 @@ func substituted(bound: hive.map.Map<Str, Ty>, ty: Ty): Ty {
 }
 
 func findType(t: Table, name: Str): Result<TypeInfo, Bool> {
-    for each info in t.types {
-        if info.name == name {
-            return Result.Ok(info)
+    if hive.map.get(t.typeAt, name) is Result.Ok(at) {
+        if t.types bounds at {
+            return Result.Ok(t.types[at])
         }
     }
     return Result.Error(false)
 }
 
 func findCallable(t: Table, name: Str): Result<CallableInfo, Bool> {
-    for each info in t.callables {
-        if info.name == name {
-            return Result.Ok(info)
+    if hive.map.get(t.callableAt, name) is Result.Ok(at) {
+        if t.callables bounds at {
+            return Result.Ok(t.callables[at])
         }
     }
     return Result.Error(false)
@@ -848,8 +880,11 @@ func shownName(name: Str): Str {
 }
 
 func showDim(d: ast.Dim): Str {
-    if d is ast.Dim.Fixed(size) { return "[{size}]" }
-    else if d is ast.Dim.Dynamic { return "[dyn]" }
+    switch d {
+        ast.Dim.Fixed(size) { return "[{size}]" }
+        ast.Dim.Dynamic { return "[dyn]" }
+        _ { }
+    }
     return "[]"
 }
 

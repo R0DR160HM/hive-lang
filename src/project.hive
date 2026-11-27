@@ -56,10 +56,14 @@ func buildDirOf(entry: Str): Str {
 // its extension, and `.exe` where the platform wants one. A cross build says which
 // platform in the name, so it never silently replaces the local one.
 proc executableOf(entry: Str, target: Str): Str {
+    return executableNamed(entry, target, platformOf(target))
+}
+
+func executableNamed(entry: Str, target: Str, platform: Platform): Str {
     if target == "" {
-        return paths.stem(entry) + goExe("")
+        return paths.stem(entry) + platform.exe
     }
-    return paths.stem(entry) + "-" + text.replace(target, "/", "-") + goExe(target)
+    return paths.stem(entry) + "-" + text.replace(target, "/", "-") + platform.exe
 }
 
 // What the app a program is packaged into is called. An app is always for a
@@ -68,31 +72,25 @@ func apkOf(entry: Str, target: Str): Str {
     return paths.stem(entry) + "-" + text.replace(target, "/", "-") + ".apk"
 }
 
-// What the Go toolchain calls an executable for `target` — `""` everywhere but
-// Windows. Asked *for the target*, since a Windows program built on Linux
-// still wants its `.exe`.
+// Asked for the target: a Windows program built on Linux still wants its `.exe`.
+type Platform {
+    exe: Str
+    arch: Str
+    os: Str
+}
+
+proc platformOf(target: Str): Platform {
+    if hive.term.execWith("go", ["env", "GOEXE", "GOARCH", "GOOS"], "", crossing(target)) is Result.Ok(said) {
+        lines := split(text.replace(said, "\r\n", "\n"), "\n")
+        if lines bounds 0 && lines bounds 1 && lines bounds 2 {
+            return Platform(text.trim(lines[0]), text.trim(lines[1]), text.trim(lines[2]))
+        }
+    }
+    return Platform("", "", "")
+}
+
 proc goExe(target: Str): Str {
-    if hive.term.execWith("go", ["env", "GOEXE"], "", crossing(target)) is Result.Ok(said) {
-        return text.trim(said)
-    }
-    return ""
-}
-
-// Which architecture a build is for, asked for the *target*: the resource object
-// carrying the program's icon is machine specific, and an empty target is this
-// machine, which only `go env` knows.
-proc goArch(target: Str): Str {
-    if hive.term.execWith("go", ["env", "GOARCH"], "", crossing(target)) is Result.Ok(said) {
-        return text.trim(said)
-    }
-    return ""
-}
-
-proc goOs(target: Str): Str {
-    if hive.term.execWith("go", ["env", "GOOS"], "", crossing(target)) is Result.Ok(said) {
-        return text.trim(said)
-    }
-    return ""
+    return platformOf(target).exe
 }
 
 // The environment the toolchain is given for `target`. An empty target is an empty
@@ -467,13 +465,13 @@ proc placeIcon(entry: Str, into: Str, written: mut Str[dyn], errors: mut diag.Di
 
 // A window that draws a scene itself carries the engine that draws it, for the
 // platform being built for. Where there is none the window is a page.
-proc placeEngine(entry: Str, written: Written, target: Str, from: Int): Result<Bool, diag.Diagnostic> {
+proc placeEngine(entry: Str, written: Written, platform: Platform, from: Int): Result<Bool, diag.Diagnostic> {
     into := paths.joinPath(written.directory, "hive")
     if hive.file.exists(paths.joinPath(into, "uinative_scene.go")) == false {
         return Result.Ok(false)
     }
-    os := goOs(target)
-    arch := goArch(target)
+    os := platform.os
+    arch := platform.arch
     found := vendor.engineFor(os, arch)
     if found is Result.Error(why) {
         return Result.Error(diag.about(entry, why))
@@ -504,12 +502,12 @@ proc placeEngine(entry: Str, written: Written, target: Str, from: Int): Result<B
 // Run for this machine rather than the target — a cross build's generator would
 // be a program this one cannot run — and its answer named for the target, which
 // is what keeps it out of every other platform's build.
-proc placeResource(entry: Str, written: Written, target: Str, from: Int): Result<Bool, diag.Diagnostic> {
+proc placeResource(entry: Str, written: Written, platform: Platform, from: Int): Result<Bool, diag.Diagnostic> {
     source := icon.iconOf(entry)
     if source == "" {
         return Result.Ok(false)
     }
-    arch := goArch(target)
+    arch := platform.arch
     if icon.carriesResource(arch) == false {
         return Result.Ok(false)
     }
@@ -679,7 +677,7 @@ proc windowsTarget(target: Str): Bool {
 // Compile `entry` all the way to a native executable beside it. An empty `target`
 // is this machine, anything else a `goos/goarch` pair. The command line asks
 // `buildsFor` first, so an unknown platform is a mistake in what was typed.
-proc compile(entry: Str, target: Str, from: Int): Written {
+proc compile(entry: Str, target: Str, platform: Platform, from: Int): Written {
     written := build(entry, [], from)
     if len(written.errors) > 0 {
         return written
@@ -689,19 +687,17 @@ proc compile(entry: Str, target: Str, from: Int): Written {
     if resolveDeps(written, from) is Result.Error(why) {
         return Written(written.directory, written.files, written.thirdParty, written.windowed, [why])
     }
-    if placeEngine(entry, written, target, from) is Result.Error(why) {
+    if placeEngine(entry, written, platform, from) is Result.Error(why) {
         return Written(written.directory, written.files, written.thirdParty, written.windowed, [why])
     }
-    // Asked once: it is a question with a `go env` behind it, and both answers
-    // below are the same one.
-    windows := windowsTarget(target)
+    windows := platform.exe == ".exe"
     if windows {
-        if placeResource(entry, written, target, from) is Result.Error(why) {
+        if placeResource(entry, written, platform, from) is Result.Error(why) {
             return Written(written.directory, written.files, written.thirdParty, written.windowed, [why])
         }
     }
     progress.step(from, "go build" + saying(target))
-    made := toolchain(["build"] + compact(written.windowed && windows) + ["-o", paths.joinPath("..", executableOf(entry, target)), "."], written.directory, target)
+    made := toolchain(["build"] + compact(written.windowed && windows) + ["-o", paths.joinPath("..", executableNamed(entry, target, platform)), "."], written.directory, target)
     if made.code != 0 {
         return Written(written.directory, written.files, written.thirdParty, written.windowed, [goFailed(entry, made)])
     }
@@ -751,17 +747,18 @@ proc run(entry: Str, args: Str[], from: Int): Result<Int, diag.Diagnostic[dyn]> 
     if resolveDeps(written, from) is Result.Error(why) {
         return Result.Error([why])
     }
-    if placeEngine(entry, written, "", from) is Result.Error(why) {
+    platform := platformOf("")
+    if placeEngine(entry, written, platform, from) is Result.Error(why) {
         return Result.Error([why])
     }
     progress.step(from, "go build")
-    made := toolchain(["build"] + compact(false) + ["-o", "app" + goExe(""), "."], written.directory, "")
+    made := toolchain(["build"] + compact(false) + ["-o", "app" + platform.exe, "."], written.directory, "")
     if made.code != 0 {
         return Result.Error([goFailed(entry, made)])
     }
     // The build directory sits beside the entrypoint, so from the entrypoint's
     // own folder the program is one step down.
-    program := paths.joinPath(".", paths.joinPath(paths.baseOf(written.directory), "app" + goExe("")))
+    program := paths.joinPath(".", paths.joinPath(paths.baseOf(written.directory), "app" + platform.exe))
     // The last thing said before the program's own output, so a silence after
     // this one is the program's rather than the compiler's.
     progress.step(from, "running " + paths.stem(entry))
@@ -770,7 +767,7 @@ proc run(entry: Str, args: Str[], from: Int): Result<Int, diag.Diagnostic[dyn]> 
 
 // Compile `entry` with the tests titled in `titles` alongside and run them.
 // Answers with what the toolchain said, which the report reads.
-proc runTests(entry: Str, titles: Str[], from: Int): Result<Str, diag.Diagnostic[dyn]> {
+proc runTests(entry: Str, titles: Str[], threads: Int, from: Int): Result<Str, diag.Diagnostic[dyn]> {
     written := build(entry, titles, from)
     if len(written.errors) > 0 {
         return Result.Error(written.errors)
@@ -781,7 +778,7 @@ proc runTests(entry: Str, titles: Str[], from: Int): Result<Str, diag.Diagnostic
         return Result.Error([why])
     }
     progress.step(from, "go test")
-    made := toolchain(["test", "-v", "-coverprofile=coverage.out", "./..."], written.directory, "")
+    made := toolchain(["test", "-v", "-parallel", "{threads}", "-coverprofile=coverage.out", "./..."], written.directory, "")
     // A failing suite is an answer rather than a malfunction, so its output comes
     // back either way. Two things are not answers: a toolchain that could not run
     // at all, and one that refused what this compiler wrote. Neither ran a test,

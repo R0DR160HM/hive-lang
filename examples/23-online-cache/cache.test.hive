@@ -18,9 +18,9 @@
 //      whoever names it, so `file:<name>?mode=memory&cache=shared` gives each
 //      test a private one and no test can be made to pass, or fail, by the test
 //      before it.
-//   2. Every test that spawns #Cache kills the service before it ends. A name is
-//      registered once per node, and a test process is one node — a service left
-//      running would take the name with it into the next test.
+//   2. Everything that needs #Cache is one test. Tests run side by side, a name
+//      is registered once per node, and a test process is one node — two tests
+//      spawning #Cache at once would fight over it.
 
 import ./cache
 
@@ -250,14 +250,12 @@ test "a store the database refuses is not reported as stored" {
 // The front door
 // ---------------------------------------------------------------------------
 // `handler` is an ordinary proc: `httpServe` calls it once per request, and so
-// can a test. It finds the service through `at(#Cache)`, so these tests spawn
-// one under that name — and kill it again, since the name outlives the test
-// otherwise.
+// can a test. It finds the service through `at(#Cache)`, so this one test spawns
+// it under that name, walks every route in order, and kills it again.
 
-test "the front door stores and reads back through the service" {
-    db := freshDb("front-door")
+test "the front door answers every route through the service" {
     Str[0] alone = []
-    registered := spawn(cache.cache, cache.Node(db, alone), #Cache)
+    registered := spawn(cache.cache, cache.Node(freshDb("front-door"), alone), #Cache)
     assert registered is Result.Ok(_)
     Address<cache.Cache> node = at(#Cache)
 
@@ -269,78 +267,38 @@ test "the front door stores and reads back through the service" {
     assert got.status == 200
     assert got.body == "from A"
 
-    kill(node)
-}
+    missing := cache.handler(hive.net.HttpRequest("GET", "/get/nobody", [], ""), alone)
+    assert missing.status == 404
+    assert missing.body == "no node has nobody\n"
 
-test "a name no node has is a 404" {
-    db := freshDb("front-door-missing")
-    Str[0] alone = []
-    registered := spawn(cache.cache, cache.Node(db, alone), #Cache)
-    assert registered is Result.Ok(_)
-    Address<cache.Cache> node = at(#Cache)
-
-    got := cache.handler(hive.net.HttpRequest("GET", "/get/nobody", [], ""), alone)
-    assert got.status == 404
-    assert got.body == "no node has nobody\n"
-
-    kill(node)
-}
-
-// A peer that is not there comes back as a Result.Error rather than an answer,
-// and the search moves on to the next one. Nothing is listening in a test
-// process, so this peer fails immediately — which is the point: the front door
-// treats "could not ask" and "asked, hasn't got it" the same way, and neither
-// one hangs.
-test "a peer that cannot be reached ends the search instead of hanging" {
-    db := freshDb("front-door-dead-peer")
-    Str[0] alone = []
+    // A peer that is not there is a Result.Error, and the search moves on rather
+    // than hanging: "could not ask" and "asked, hasn't got it" end the same way.
     Str[1] peers = ["127.0.0.1:59999"]
-    registered := spawn(cache.cache, cache.Node(db, alone), #Cache)
-    assert registered is Result.Ok(_)
-    Address<cache.Cache> node = at(#Cache)
+    unreached := cache.handler(hive.net.HttpRequest("GET", "/get/nobody", [], ""), peers)
+    assert unreached.status == 404
 
-    got := cache.handler(hive.net.HttpRequest("GET", "/get/nobody", [], ""), peers)
-    assert got.status == 404
-
-    kill(node)
-}
-
-// A client is never told "stored" for something that was not — here because the
-// database has been closed underneath the service.
-test "a store the cache refused is a 500, not a 200" {
-    db := freshDb("front-door-broken")
-    Str[0] alone = []
-    registered := spawn(cache.cache, cache.Node(db, alone), #Cache)
-    assert registered is Result.Ok(_)
-    Address<cache.Cache> node = at(#Cache)
-    hive.sql.close(db)
-
-    set := cache.handler(hive.net.HttpRequest("POST", "/set/greeting", [], "from A"), alone)
-    assert set.status == 500
-    assert set.body == "the cache refused to store that\n"
-
-    kill(node)
-}
-
-// Only two routes exist, and anything else says so rather than falling through
-// to a stack trace or a blank 200.
-test "an unrecognised route is turned away" {
-    db := freshDb("front-door-routes")
-    Str[0] alone = []
-    registered := spawn(cache.cache, cache.Node(db, alone), #Cache)
-    assert registered is Result.Ok(_)
-    Address<cache.Cache> node = at(#Cache)
-
-    got := cache.handler(hive.net.HttpRequest("GET", "/", [], ""), alone)
-    assert got.status == 404
-    assert got.body == "try POST /set/<name> or GET /get/<name>\n"
-
-    // A `/set` that arrives as a GET is not a store, and a `/get` that arrives as
-    // a POST is not a read: the method is part of the route.
+    // Only two routes exist, and the method is part of the route.
+    lost := cache.handler(hive.net.HttpRequest("GET", "/", [], ""), alone)
+    assert lost.status == 404
+    assert lost.body == "try POST /set/<name> or GET /get/<name>\n"
     wrong := cache.handler(hive.net.HttpRequest("GET", "/set/greeting", [], "from A"), alone)
     assert wrong.status == 404
 
     kill(node)
+
+    // A client is never told "stored" for something that was not: here the
+    // database is closed underneath the service.
+    broken := freshDb("front-door-broken")
+    respawned := spawn(cache.cache, cache.Node(broken, alone), #Cache)
+    assert respawned is Result.Ok(_)
+    Address<cache.Cache> again = at(#Cache)
+    hive.sql.close(broken)
+
+    refused := cache.handler(hive.net.HttpRequest("POST", "/set/greeting", [], "from A"), alone)
+    assert refused.status == 500
+    assert refused.body == "the cache refused to store that\n"
+
+    kill(again)
 }
 
 // The one function in the app that needs nothing behind it, tested the way

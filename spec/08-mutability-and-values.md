@@ -16,6 +16,13 @@ A `mut` value passed into such a parameter is **copied** on the way in, so the c
 immutable view really is one: it cannot see the caller's later writes, whether
 the two run in sequence or, for an `async` call, at the same time.
 
+That copy is skipped where nobody could tell. A callee with no `mut` parameter,
+that starts no thread and answers with no function, can keep nothing it was
+handed past the call except through its answer. So the caller's storage is lent
+instead, and the **answer** is copied where it could hold some of it — when that
+copy weighs less than the ones it replaces. `find(shop.catalog, sku)` copies the
+one `Product` it answers with rather than the whole catalog.
+
 `mut` may not appear anywhere else a type can: not on a field, not on a return,
 not in a `func(...)` type. Each of those binds nothing. A `proc(...)` type may mark
 a parameter `mut`, which is a `mut` parameter of whatever value it describes.

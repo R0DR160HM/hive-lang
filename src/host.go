@@ -68,6 +68,10 @@ func Platform() string {
 	return runtime.GOOS + "/" + runtime.GOARCH
 }
 
+func Cores() int {
+	return runtime.NumCPU()
+}
+
 func MakeExecutable(path string) error {
 	return os.Chmod(path, 0o755)
 }

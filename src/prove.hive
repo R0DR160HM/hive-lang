@@ -195,10 +195,14 @@ proc newContext(m: ast.Module, t: types.Table): Context {
     mut hive.map.Map<Str, Bool> queries = hive.map.new()
     mut hive.map.Map<Str, Bool> imported = hive.map.new()
     for each d in m.decls {
-        if d is ast.Decl.QueryDecl(name, _, _, _, _) {
-            hive.map.set(queries, name, true)
-        } else if d is ast.Decl.ForeignDecl(name, _, _, _, _, _, _) {
-            hive.map.set(imported, name, true)
+        switch d {
+            ast.Decl.QueryDecl(name, _, _, _, _) {
+                hive.map.set(queries, name, true)
+            }
+            ast.Decl.ForeignDecl(name, _, _, _, _, _, _) {
+                hive.map.set(imported, name, true)
+            }
+            _ { }
         }
     }
     return Context(callables, loopParam, loopAt, failing(m), recursive, typeLaws, queries, imported, infer.newEnv(t))
@@ -330,24 +334,35 @@ proc leansOnFixed(pr: mut Prover, cx: Context, path: Path): Bool {
 
 // Whether a term holds any of the unknowns `ids` names.
 func mentions(t: terms.Term, ids: Str[]): Bool {
-    if t is terms.Term.Unknown(id, _) {
-        return indexOf(ids, "u{id}") is Result.Ok(_)
-    } else if t is terms.Term.Op(_, args, _) {
-        return mentionsAny(args, ids)
-    } else if t is terms.Term.VecK(items) {
-        return mentionsAny(items, ids)
-    } else if t is terms.Term.VecS(known, rest) {
-        return mentionsAny(known, ids) || mentions(rest, ids)
-    } else if t is terms.Term.RecK(_, _, fields) {
-        return mentionsAny(fields, ids)
-    } else if t is terms.Term.OkK(payload) {
-        return mentions(payload, ids)
-    } else if t is terms.Term.ErrK(payload) {
-        return mentions(payload, ids)
-    } else if t is terms.Term.FnK(_, args) {
-        return mentionsAny(args, ids)
-    } else if t is terms.Term.MapK(base, ks, vs) {
-        return mentions(base, ids) || mentionsAny(ks, ids) || mentionsAny(vs, ids)
+    switch t {
+        terms.Term.Unknown(id, _) {
+            return indexOf(ids, "u{id}") is Result.Ok(_)
+        }
+        terms.Term.Op(_, args, _) {
+            return mentionsAny(args, ids)
+        }
+        terms.Term.VecK(items) {
+            return mentionsAny(items, ids)
+        }
+        terms.Term.VecS(known, rest) {
+            return mentionsAny(known, ids) || mentions(rest, ids)
+        }
+        terms.Term.RecK(_, _, fields) {
+            return mentionsAny(fields, ids)
+        }
+        terms.Term.OkK(payload) {
+            return mentions(payload, ids)
+        }
+        terms.Term.ErrK(payload) {
+            return mentions(payload, ids)
+        }
+        terms.Term.FnK(_, args) {
+            return mentionsAny(args, ids)
+        }
+        terms.Term.MapK(base, ks, vs) {
+            return mentions(base, ids) || mentionsAny(ks, ids) || mentionsAny(vs, ids)
+        }
+        _ { }
     }
     return false
 }
@@ -417,22 +432,32 @@ func one(p: Path, value: terms.Term): Out[1] {
 
 // The type a term's value has, as far as the term itself says.
 func termType(t: terms.Term): types.Ty {
-    if t is terms.Term.Unknown(_, ty) {
-        return ty
-    } else if t is terms.Term.Op(_, _, ty) {
-        return ty
-    } else if t is terms.Term.IntK(_) {
-        return types.Ty.TInt()
-    } else if t is terms.Term.StrK(_) {
-        return types.Ty.TStr()
-    } else if t is terms.Term.BoolK(_) {
-        return types.Ty.TBool()
-    } else if t is terms.Term.AtomK(_) {
-        return types.Ty.TAtom()
-    } else if t is terms.Term.FloatK(_) {
-        return types.Ty.TFloat()
-    } else if t is terms.Term.RecK(typeName, _, _) {
-        return types.Ty.TNamed(typeName)
+    switch t {
+        terms.Term.Unknown(_, ty) {
+            return ty
+        }
+        terms.Term.Op(_, _, ty) {
+            return ty
+        }
+        terms.Term.IntK(_) {
+            return types.Ty.TInt()
+        }
+        terms.Term.StrK(_) {
+            return types.Ty.TStr()
+        }
+        terms.Term.BoolK(_) {
+            return types.Ty.TBool()
+        }
+        terms.Term.AtomK(_) {
+            return types.Ty.TAtom()
+        }
+        terms.Term.FloatK(_) {
+            return types.Ty.TFloat()
+        }
+        terms.Term.RecK(typeName, _, _) {
+            return types.Ty.TNamed(typeName)
+        }
+        _ { }
     }
     return types.Ty.TUnknown()
 }
@@ -442,35 +467,46 @@ func termType(t: terms.Term): types.Ty {
 // `t` with every unknown a case split has decided replaced by what it was decided
 // to be, and every operation that can now be worked out worked out.
 func norm(t: types.Table, shapes: hive.map.Map<Str, terms.Term>, term: terms.Term): terms.Term {
-    if term is terms.Term.Unknown(id, _) {
-        if hive.map.get(shapes, "u{id}") is Result.Ok(s) {
-            return norm(t, shapes, s)
+    switch term {
+        terms.Term.Unknown(id, _) {
+            if hive.map.get(shapes, "u{id}") is Result.Ok(s) {
+                return norm(t, shapes, s)
+            }
+            return term
         }
-        return term
-    } else if term is terms.Term.Op(name, args, ty) {
-        return rebuild(t, name, normAll(t, shapes, args), ty)
-    } else if term is terms.Term.VecK(items) {
-        return terms.Term.VecK(normAll(t, shapes, items))
-    } else if term is terms.Term.VecS(known, rest) {
-        return vecJoin(normAll(t, shapes, known), norm(t, shapes, rest))
-    } else if term is terms.Term.RecK(typeName, variant, fields) {
-        return terms.Term.RecK(typeName, variant, normAll(t, shapes, fields))
-    } else if term is terms.Term.OkK(payload) {
-        return terms.Term.OkK(norm(t, shapes, payload))
-    } else if term is terms.Term.ErrK(payload) {
-        return terms.Term.ErrK(norm(t, shapes, payload))
-    } else if term is terms.Term.FnK(name, args) {
-        return terms.Term.FnK(name, normAll(t, shapes, args))
-    } else if term is terms.Term.MapK(base, ks, vs) {
-        // Written again from the start, so keys that have since become known
-        // settle which writes are the same key.
-        mut terms.Term m = terms.Term.MapK(norm(t, shapes, base), [], [])
-        mut i := 0
-        for each k in ks {
-            m = mapWrite(m, norm(t, shapes, k), norm(t, shapes, terms.nth(vs, i)))
-            i = i + 1
+        terms.Term.Op(name, args, ty) {
+            return rebuild(t, name, normAll(t, shapes, args), ty)
         }
-        return m
+        terms.Term.VecK(items) {
+            return terms.Term.VecK(normAll(t, shapes, items))
+        }
+        terms.Term.VecS(known, rest) {
+            return vecJoin(normAll(t, shapes, known), norm(t, shapes, rest))
+        }
+        terms.Term.RecK(typeName, variant, fields) {
+            return terms.Term.RecK(typeName, variant, normAll(t, shapes, fields))
+        }
+        terms.Term.OkK(payload) {
+            return terms.Term.OkK(norm(t, shapes, payload))
+        }
+        terms.Term.ErrK(payload) {
+            return terms.Term.ErrK(norm(t, shapes, payload))
+        }
+        terms.Term.FnK(name, args) {
+            return terms.Term.FnK(name, normAll(t, shapes, args))
+        }
+        terms.Term.MapK(base, ks, vs) {
+            // Written again from the start, so keys that have since become known
+            // settle which writes are the same key.
+            mut terms.Term m = terms.Term.MapK(norm(t, shapes, base), [], [])
+            mut i := 0
+            for each k in ks {
+                m = mapWrite(m, norm(t, shapes, k), norm(t, shapes, terms.nth(vs, i)))
+                i = i + 1
+            }
+            return m
+        }
+        _ { }
     }
     return term
 }
@@ -1019,10 +1055,14 @@ proc execScoped(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, stmts
         append(names, n)
     }
     for each s in stmts {
-        if s is ast.Stmt.VarDecl(name, _, _, _, _) {
-            append(names, name)
-        } else if s is ast.Stmt.TypedDecl(_, name, _, _, _, _) {
-            append(names, name)
+        switch s {
+            ast.Stmt.VarDecl(name, _, _, _, _) {
+                append(names, name)
+            }
+            ast.Stmt.TypedDecl(_, name, _, _, _, _) {
+                append(names, name)
+            }
+            _ { }
         }
     }
     mut Path[dyn] out = []
@@ -1045,89 +1085,14 @@ func restored(later: Path, before: Path, names: Str[]): Path {
 }
 
 proc execStmt(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, s: ast.Stmt): Path[dyn] {
-    if s is ast.Stmt.VarDecl(name, value, mutable, deferred, at) {
-        return declare(pr, cx, scope, path, name, value, mutable, deferred, at)
-    } else if s is ast.Stmt.TypedDecl(_, name, value, mutable, deferred, at) {
-        return declare(pr, cx, scope, path, name, value, mutable, deferred, at)
-    } else if s is ast.Stmt.Assign(target, value, at) {
-        mut Path[dyn] out = []
-        for each o in eval(pr, cx, scope, path, value) {
-            if running(o.path) {
-                for each p in store(pr, cx, scope, o.path, target, o.value, at) {
-                    append(out, p)
-                }
-            } else {
-                append(out, o.path)
-            }
+    switch s {
+        ast.Stmt.VarDecl(name, value, mutable, deferred, at) {
+            return declare(pr, cx, scope, path, name, value, mutable, deferred, at)
         }
-        return out
-    } else if s is ast.Stmt.IfChain(branches, otherwise, hasElse, _) {
-        return execIf(pr, cx, scope, path, branches, 0, otherwise, hasElse)
-    } else if s is ast.Stmt.SwitchStmt(lets, _, arms, _, _) {
-        lowered := ast.switchBlock(lets, arms)
-        return execScoped(pr, cx, scope, path, lowered.stmts, [])
-    } else if s is ast.Stmt.ForEach(name, _, subject, body, at) {
-        return execEach(pr, cx, scope, path, name, subject, body, at)
-    } else if s is ast.Stmt.ForLoop(init, cond, post, body, at) {
-        return execCounting(pr, cx, scope, path, init, cond, post, body, at)
-    } else if s is ast.Stmt.ReturnStmt(value, _) {
-        if value is ast.Expr.Absent {
-            return [ended(path, End.Returned(terms.Term.VoidK()))]
+        ast.Stmt.TypedDecl(_, name, value, mutable, deferred, at) {
+            return declare(pr, cx, scope, path, name, value, mutable, deferred, at)
         }
-        mut Path[dyn] out = []
-        for each o in eval(pr, cx, scope, path, value) {
-            if running(o.path) {
-                append(out, ended(o.path, End.Returned(o.value)))
-            } else {
-                append(out, o.path)
-            }
-        }
-        return out
-    } else if s is ast.Stmt.EchoStmt(_, _) {
-        // It writes, but nothing a law can see depends on what.
-        return [path]
-    } else if s is ast.Stmt.AssertStmt(condition, at) {
-        // `assert a && b` claims `a`, and then `b` knowing `a`: one claim each, so
-        // a law being assumed concludes both rather than `b` only where `a` held.
-        parts := ast.conjuncts(condition)
-        if len(parts) > 1 && ast.conjunctsBind(parts) == false {
-            mut ast.Stmt[dyn] claims = []
-            for each part in parts {
-                append(claims, ast.Stmt.AssertStmt(part, at))
-            }
-            return execBlock(pr, cx, scope, path, claims)
-        }
-        mut Path[dyn] out = []
-        for each o in eval(pr, cx, scope, path, condition) {
-            if running(o.path) {
-                for each p in checkAssert(pr, cx, o.path, o.value, condition, at) {
-                    append(out, p)
-                }
-            } else {
-                append(out, o.path)
-            }
-        }
-        return out
-    } else if s is ast.Stmt.PanicStmt(_, at) {
-        return panicked(pr, cx, path, at)
-    } else if s is ast.Stmt.BreakStmt(_) {
-        return [ended(path, End.Broke())]
-    } else if s is ast.Stmt.ContinueStmt(_) {
-        return [ended(path, End.Continued())]
-    } else if s is ast.Stmt.AsyncStmt(call, _) {
-        // Its arguments are copies, so what it does is what the call does, whenever
-        // it runs.
-        mut Path[dyn] out = []
-        for each o in eval(pr, cx, scope, path, call) {
-            append(out, o.path)
-        }
-        return out
-    } else if s is ast.Stmt.Expression(value, at) {
-        if lawCalled(cx, value) is Result.Ok(name) {
-            return assumeLaw(pr, cx, scope, path, name, value, at)
-        }
-        // A `sort` standing on its own sorts its `mut` vector where it lies.
-        if sortsInPlace(cx, scope, value) is Result.Ok(target) {
+        ast.Stmt.Assign(target, value, at) {
             mut Path[dyn] out = []
             for each o in eval(pr, cx, scope, path, value) {
                 if running(o.path) {
@@ -1140,11 +1105,103 @@ proc execStmt(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, s: ast.
             }
             return out
         }
-        mut Path[dyn] out = []
-        for each o in eval(pr, cx, scope, path, value) {
-            append(out, o.path)
+        ast.Stmt.IfChain(branches, otherwise, hasElse, _) {
+            return execIf(pr, cx, scope, path, branches, 0, otherwise, hasElse)
         }
-        return out
+        ast.Stmt.SwitchStmt(lets, _, arms, _, _) {
+            lowered := ast.switchBlock(lets, arms)
+            return execScoped(pr, cx, scope, path, lowered.stmts, [])
+        }
+        ast.Stmt.ForEach(name, _, subject, body, at) {
+            return execEach(pr, cx, scope, path, name, subject, body, at)
+        }
+        ast.Stmt.ForLoop(init, cond, post, body, at) {
+            return execCounting(pr, cx, scope, path, init, cond, post, body, at)
+        }
+        ast.Stmt.ReturnStmt(value, _) {
+            if value is ast.Expr.Absent {
+                return [ended(path, End.Returned(terms.Term.VoidK()))]
+            }
+            mut Path[dyn] out = []
+            for each o in eval(pr, cx, scope, path, value) {
+                if running(o.path) {
+                    append(out, ended(o.path, End.Returned(o.value)))
+                } else {
+                    append(out, o.path)
+                }
+            }
+            return out
+        }
+        ast.Stmt.EchoStmt(_, _) {
+            // It writes, but nothing a law can see depends on what.
+            return [path]
+        }
+        ast.Stmt.AssertStmt(condition, at) {
+            // `assert a && b` claims `a`, and then `b` knowing `a`: one claim each, so
+            // a law being assumed concludes both rather than `b` only where `a` held.
+            parts := ast.conjuncts(condition)
+            if len(parts) > 1 && ast.conjunctsBind(parts) == false {
+                mut ast.Stmt[dyn] claims = []
+                for each part in parts {
+                    append(claims, ast.Stmt.AssertStmt(part, at))
+                }
+                return execBlock(pr, cx, scope, path, claims)
+            }
+            mut Path[dyn] out = []
+            for each o in eval(pr, cx, scope, path, condition) {
+                if running(o.path) {
+                    for each p in checkAssert(pr, cx, o.path, o.value, condition, at) {
+                        append(out, p)
+                    }
+                } else {
+                    append(out, o.path)
+                }
+            }
+            return out
+        }
+        ast.Stmt.PanicStmt(_, at) {
+            return panicked(pr, cx, path, at)
+        }
+        ast.Stmt.BreakStmt(_) {
+            return [ended(path, End.Broke())]
+        }
+        ast.Stmt.ContinueStmt(_) {
+            return [ended(path, End.Continued())]
+        }
+        ast.Stmt.AsyncStmt(call, _) {
+            // Its arguments are copies, so what it does is what the call does, whenever
+            // it runs.
+            mut Path[dyn] out = []
+            for each o in eval(pr, cx, scope, path, call) {
+                append(out, o.path)
+            }
+            return out
+        }
+        ast.Stmt.Expression(value, at) {
+            if lawCalled(cx, value) is Result.Ok(name) {
+                return assumeLaw(pr, cx, scope, path, name, value, at)
+            }
+            // A `sort` standing on its own sorts its `mut` vector where it lies.
+            if sortsInPlace(cx, scope, value) is Result.Ok(target) {
+                mut Path[dyn] out = []
+                for each o in eval(pr, cx, scope, path, value) {
+                    if running(o.path) {
+                        for each p in store(pr, cx, scope, o.path, target, o.value, at) {
+                            append(out, p)
+                        }
+                    } else {
+                        append(out, o.path)
+                    }
+                }
+                return out
+            }
+            mut Path[dyn] out = []
+            for each o in eval(pr, cx, scope, path, value) {
+                append(out, o.path)
+            }
+            return out
+        }
+        _ { }
     }
     return [path]
 }
@@ -1285,17 +1342,21 @@ proc execEach(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, name: S
         }
         for each m in fixedLength(pr, cx, o.path, o.value) {
             v := normIn(cx, m.path, m.value)
-            if v is terms.Term.VecK(items) {
-                for each p in eachItem(pr, cx, inner, m.path, name, items, terms.Term.VecK([]), body, 0, at) {
-                    append(out, restored(p, path, [name]))
+            switch v {
+                terms.Term.VecK(items) {
+                    for each p in eachItem(pr, cx, inner, m.path, name, items, terms.Term.VecK([]), body, 0, at) {
+                        append(out, restored(p, path, [name]))
+                    }
                 }
-            } else if v is terms.Term.VecS(known, rest) {
-                for each p in eachItem(pr, cx, inner, m.path, name, known, rest, body, 0, at) {
-                    append(out, restored(p, path, [name]))
+                terms.Term.VecS(known, rest) {
+                    for each p in eachItem(pr, cx, inner, m.path, name, known, rest, body, 0, at) {
+                        append(out, restored(p, path, [name]))
+                    }
                 }
-            } else {
-                for each p in eachItem(pr, cx, inner, m.path, name, [], v, body, 0, at) {
-                    append(out, restored(p, path, [name]))
+                _ {
+                    for each p in eachItem(pr, cx, inner, m.path, name, [], v, body, 0, at) {
+                        append(out, restored(p, path, [name]))
+                    }
                 }
             }
         }
@@ -1515,34 +1576,44 @@ func lentBy(cx: Context, call: ast.Expr): Result<Str[dyn], Bool> {
 // Every call in an expression, the expression's own included.
 func callsIn(e: ast.Expr): ast.Expr[dyn] {
     mut ast.Expr[dyn] out = []
-    if e is ast.Expr.Call(callee, args, _) {
-        append(out, e)
-        for each c in callsIn(callee) {
-            append(out, c)
-        }
-        for each a in args {
-            for each c in callsIn(a.value) {
+    switch e {
+        ast.Expr.Call(callee, args, _) {
+            append(out, e)
+            for each c in callsIn(callee) {
                 append(out, c)
             }
-        }
-    } else if e is ast.Expr.Binary(_, l, r, _) {
-        return callsIn(l) + callsIn(r)
-    } else if e is ast.Expr.Not(x, _) {
-        return callsIn(x)
-    } else if e is ast.Expr.Negate(x, _) {
-        return callsIn(x)
-    } else if e is ast.Expr.Member(x, _, _) {
-        return callsIn(x)
-    } else if e is ast.Expr.Index(x, i, _) {
-        return callsIn(x) + callsIn(i)
-    } else if e is ast.Expr.IsMatch(x, _, _) {
-        return callsIn(x)
-    } else if e is ast.Expr.VectorLit(items, _) {
-        for each item in items {
-            for each c in callsIn(item) {
-                append(out, c)
+            for each a in args {
+                for each c in callsIn(a.value) {
+                    append(out, c)
+                }
             }
         }
+        ast.Expr.Binary(_, l, r, _) {
+            return callsIn(l) + callsIn(r)
+        }
+        ast.Expr.Not(x, _) {
+            return callsIn(x)
+        }
+        ast.Expr.Negate(x, _) {
+            return callsIn(x)
+        }
+        ast.Expr.Member(x, _, _) {
+            return callsIn(x)
+        }
+        ast.Expr.Index(x, i, _) {
+            return callsIn(x) + callsIn(i)
+        }
+        ast.Expr.IsMatch(x, _, _) {
+            return callsIn(x)
+        }
+        ast.Expr.VectorLit(items, _) {
+            for each item in items {
+                for each c in callsIn(item) {
+                    append(out, c)
+                }
+            }
+        }
+        _ { }
     }
     return out
 }
@@ -1783,30 +1854,41 @@ func keepsToItself(cx: Context, stmts: ast.Stmt[]): Bool {
 proc withTypeLaws(pr: mut Prover, cx: Context, path: Path, value: terms.Term): Path {
     // What is known to be inside the value keeps its own laws too.
     mut Path inner = path
-    if value is terms.Term.RecK(_, _, fields) {
-        inner = withAllLaws(pr, cx, path, fields)
-    } else if value is terms.Term.VecK(items) {
-        inner = withAllLaws(pr, cx, path, items)
-    } else if value is terms.Term.OkK(payload) {
-        inner = withTypeLaws(pr, cx, path, payload)
-    } else if value is terms.Term.ErrK(payload) {
-        inner = withTypeLaws(pr, cx, path, payload)
+    switch value {
+        terms.Term.RecK(_, _, fields) {
+            inner = withAllLaws(pr, cx, path, fields)
+        }
+        terms.Term.VecK(items) {
+            inner = withAllLaws(pr, cx, path, items)
+        }
+        terms.Term.OkK(payload) {
+            inner = withTypeLaws(pr, cx, path, payload)
+        }
+        terms.Term.ErrK(payload) {
+            inner = withTypeLaws(pr, cx, path, payload)
+        }
+        _ { }
     }
     return withOwnLaws(pr, cx, inner, value)
 }
 
 proc withOwnLaws(pr: mut Prover, cx: Context, path: Path, value: terms.Term): Path {
     mut owner := ""
-    if value is terms.Term.Unknown(_, ty) {
-        if ty is types.Ty.TNamed(name) {
-            owner = name
+    switch value {
+        terms.Term.Unknown(_, ty) {
+            if ty is types.Ty.TNamed(name) {
+                owner = name
+            }
         }
-    } else if value is terms.Term.RecK(typeName, _, _) {
-        owner = typeName
-    } else if value is terms.Term.Op(_, _, ty) {
-        if ty is types.Ty.TNamed(name) {
-            owner = name
+        terms.Term.RecK(typeName, _, _) {
+            owner = typeName
         }
+        terms.Term.Op(_, _, ty) {
+            if ty is types.Ty.TNamed(name) {
+                owner = name
+            }
+        }
+        _ { }
     }
     if owner == "" {
         return path
@@ -2181,137 +2263,160 @@ proc eval(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, e: ast.Expr
     if pr.steps > pr.budget {
         return lostOut(path, messages.proveGaveUp(pr.budget), e.at)
     }
-    if e is ast.Expr.IntLit(v, _) {
-        return one(path, terms.Term.IntK(v))
-    } else if e is ast.Expr.FloatLit(v, _) {
-        return one(path, terms.Term.FloatK(v))
-    } else if e is ast.Expr.StrLit(v, _) {
-        return one(path, terms.Term.StrK(v))
-    } else if e is ast.Expr.BoolLit(v, _) {
-        return one(path, terms.Term.BoolK(v))
-    } else if e is ast.Expr.AtomLit(v, _) {
-        return one(path, terms.Term.AtomK(v))
-    } else if e is ast.Expr.Ident(name, at) {
-        if hive.map.get(path.env, name) is Result.Ok(v) {
-            return one(path, v)
+    switch e {
+        ast.Expr.IntLit(v, _) {
+            return one(path, terms.Term.IntK(v))
         }
-        if hive.map.has(cx.callables, name) {
-            return one(path, terms.Term.FnK(name, []))
+        ast.Expr.FloatLit(v, _) {
+            return one(path, terms.Term.FloatK(v))
         }
-        return lostOut(path, messages.proveCannotReasonAbout(name), at)
-    } else if e is ast.Expr.Interp(parts, at) {
-        return evalInterp(pr, cx, scope, path, parts, at)
-    } else if e is ast.Expr.VectorLit(items, _) {
-        mut Out[dyn] out = []
-        for each o in evalAll(pr, cx, scope, path, items, 0, []) {
-            append(out, Out(o.path, terms.Term.VecK(o.values)))
+        ast.Expr.StrLit(v, _) {
+            return one(path, terms.Term.StrK(v))
         }
-        return out
-    } else if e is ast.Expr.Negate(operand, at) {
-        ty := infer.typeOf(scope, operand)
-        mut Out[dyn] out = []
-        for each o in eval(pr, cx, scope, path, operand) {
-            v := normIn(cx, o.path, o.value)
-            if ty is types.Ty.TInt {
-                append(out, Out(o.path, negate(v)))
-            } else if v is terms.Term.FloatK(f) {
-                append(out, Out(o.path, terms.Term.FloatK(-f)))
-            } else if ty is types.Ty.TFloat {
-                append(out, Out(o.path, terms.op("fneg", [v], ty)))
-            } else {
-                append(out, Out(lost(o.path, messages.proveNegation(), at), terms.Term.VoidK()))
+        ast.Expr.BoolLit(v, _) {
+            return one(path, terms.Term.BoolK(v))
+        }
+        ast.Expr.AtomLit(v, _) {
+            return one(path, terms.Term.AtomK(v))
+        }
+        ast.Expr.Ident(name, at) {
+            if hive.map.get(path.env, name) is Result.Ok(v) {
+                return one(path, v)
             }
+            if hive.map.has(cx.callables, name) {
+                return one(path, terms.Term.FnK(name, []))
+            }
+            return lostOut(path, messages.proveCannotReasonAbout(name), at)
         }
-        return out
-    } else if e is ast.Expr.Not(operand, _) {
-        mut Out[dyn] out = []
-        for each o in eval(pr, cx, scope, path, operand) {
-            append(out, Out(o.path, terms.negation(normIn(cx, o.path, o.value))))
+        ast.Expr.Interp(parts, at) {
+            return evalInterp(pr, cx, scope, path, parts, at)
         }
-        return out
-    } else if e is ast.Expr.Binary(op, left, right, at) {
-        return evalBinary(pr, cx, scope, path, op, left, right, at)
-    } else if e is ast.Expr.Call(callee, args, at) {
-        return evalCall(pr, cx, scope, path, callee, args, at)
-    } else if e is ast.Expr.Member(subject, field, _) {
-        ty := infer.typeOf(scope, e)
-        mut Out[dyn] out = []
-        for each o in eval(pr, cx, scope, path, subject) {
-            if running(o.path) == false {
-                append(out, o)
-                continue
-            }
-            for each r in project(pr, cx, o.path, o.value, field, ty) {
-                append(out, r)
-            }
-        }
-        return out
-    } else if e is ast.Expr.Index(subject, index, _) {
-        ty := infer.typeOf(scope, e)
-        mut Out[dyn] out = []
-        for each o in evalAll(pr, cx, scope, path, [subject, index], 0, []) {
-            append(out, Out(o.path, element(normIn(cx, o.path, terms.nth(o.values, 0)), normIn(cx, o.path, terms.nth(o.values, 1)), ty)))
-        }
-        return out
-    } else if e is ast.Expr.Slice(subject, low, high, at) {
-        return evalSlice(pr, cx, scope, path, subject, low, high, at)
-    } else if e is ast.Expr.IsMatch(subject, pattern, at) {
-        mut Out[dyn] out = []
-        for each o in eval(pr, cx, scope, path, subject) {
-            if running(o.path) == false {
-                append(out, o)
-                continue
-            }
-            for each r in matchPattern(pr, cx, scope, o.path, o.value, pattern, at) {
-                append(out, r)
-            }
-        }
-        return out
-    } else if e is ast.Expr.AwaitAll(calls, timeout, at) {
-        mut Out[dyn] out = []
-        for each o in evalAll(pr, cx, scope, path, calls, 0, []) {
-            if running(o.path) == false {
-                append(out, Out(o.path, terms.Term.VoidK()))
-                continue
-            }
-            if timeout is ast.Expr.Absent {
-                append(out, Out(o.path, terms.Term.VecK(o.values)))
-                continue
-            }
-            for each r in timedOut(pr, cx, scope, o.path, terms.Term.VecK(o.values), timeout, infer.typeOf(scope, e), at) {
-                append(out, r)
-            }
-        }
-        return out
-    } else if e is ast.Expr.Timed(call, ms, at) {
-        ty := infer.typeOf(scope, e)
-        // A request to a service folds the timeout into its own error, and is
-        // anything its type allows already.
-        if types.same(infer.typeOf(scope, call), ty) {
+        ast.Expr.VectorLit(items, _) {
             mut Out[dyn] out = []
-            for each o in evalAll(pr, cx, scope, path, [call, ms], 0, []) {
-                append(out, Out(o.path, terms.nth(o.values, 0)))
+            for each o in evalAll(pr, cx, scope, path, items, 0, []) {
+                append(out, Out(o.path, terms.Term.VecK(o.values)))
             }
             return out
         }
-        mut Out[dyn] out = []
-        for each o in eval(pr, cx, scope, path, call) {
-            if running(o.path) == false {
-                append(out, o)
-                continue
+        ast.Expr.Negate(operand, at) {
+            ty := infer.typeOf(scope, operand)
+            mut Out[dyn] out = []
+            for each o in eval(pr, cx, scope, path, operand) {
+                v := normIn(cx, o.path, o.value)
+                if ty is types.Ty.TInt {
+                    append(out, Out(o.path, negate(v)))
+                } else if v is terms.Term.FloatK(f) {
+                    append(out, Out(o.path, terms.Term.FloatK(-f)))
+                } else if ty is types.Ty.TFloat {
+                    append(out, Out(o.path, terms.op("fneg", [v], ty)))
+                } else {
+                    append(out, Out(lost(o.path, messages.proveNegation(), at), terms.Term.VoidK()))
+                }
             }
-            for each r in timedOut(pr, cx, scope, o.path, o.value, ms, ty, at) {
-                append(out, r)
-            }
+            return out
         }
-        return out
-    } else if e is ast.Expr.Hole(_) {
-        return one(path, terms.Term.Hole())
-    } else if e is ast.Expr.Absent(_) {
-        return one(path, terms.Term.VoidK())
-    } else if e is ast.Expr.Baked(call, _) {
-        // What was built in is what the call answered, once.
-        return eval(pr, cx, scope, path, call)
+        ast.Expr.Not(operand, _) {
+            mut Out[dyn] out = []
+            for each o in eval(pr, cx, scope, path, operand) {
+                append(out, Out(o.path, terms.negation(normIn(cx, o.path, o.value))))
+            }
+            return out
+        }
+        ast.Expr.Binary(op, left, right, at) {
+            return evalBinary(pr, cx, scope, path, op, left, right, at)
+        }
+        ast.Expr.Call(callee, args, at) {
+            return evalCall(pr, cx, scope, path, callee, args, at)
+        }
+        ast.Expr.Member(subject, field, _) {
+            ty := infer.typeOf(scope, e)
+            mut Out[dyn] out = []
+            for each o in eval(pr, cx, scope, path, subject) {
+                if running(o.path) == false {
+                    append(out, o)
+                    continue
+                }
+                for each r in project(pr, cx, o.path, o.value, field, ty) {
+                    append(out, r)
+                }
+            }
+            return out
+        }
+        ast.Expr.Index(subject, index, _) {
+            ty := infer.typeOf(scope, e)
+            mut Out[dyn] out = []
+            for each o in evalAll(pr, cx, scope, path, [subject, index], 0, []) {
+                append(out, Out(o.path, element(normIn(cx, o.path, terms.nth(o.values, 0)), normIn(cx, o.path, terms.nth(o.values, 1)), ty)))
+            }
+            return out
+        }
+        ast.Expr.Slice(subject, low, high, at) {
+            return evalSlice(pr, cx, scope, path, subject, low, high, at)
+        }
+        ast.Expr.IsMatch(subject, pattern, at) {
+            mut Out[dyn] out = []
+            for each o in eval(pr, cx, scope, path, subject) {
+                if running(o.path) == false {
+                    append(out, o)
+                    continue
+                }
+                for each r in matchPattern(pr, cx, scope, o.path, o.value, pattern, at) {
+                    append(out, r)
+                }
+            }
+            return out
+        }
+        ast.Expr.AwaitAll(calls, timeout, at) {
+            mut Out[dyn] out = []
+            for each o in evalAll(pr, cx, scope, path, calls, 0, []) {
+                if running(o.path) == false {
+                    append(out, Out(o.path, terms.Term.VoidK()))
+                    continue
+                }
+                if timeout is ast.Expr.Absent {
+                    append(out, Out(o.path, terms.Term.VecK(o.values)))
+                    continue
+                }
+                for each r in timedOut(pr, cx, scope, o.path, terms.Term.VecK(o.values), timeout, infer.typeOf(scope, e), at) {
+                    append(out, r)
+                }
+            }
+            return out
+        }
+        ast.Expr.Timed(call, ms, at) {
+            ty := infer.typeOf(scope, e)
+            // A request to a service folds the timeout into its own error, and is
+            // anything its type allows already.
+            if types.same(infer.typeOf(scope, call), ty) {
+                mut Out[dyn] out = []
+                for each o in evalAll(pr, cx, scope, path, [call, ms], 0, []) {
+                    append(out, Out(o.path, terms.nth(o.values, 0)))
+                }
+                return out
+            }
+            mut Out[dyn] out = []
+            for each o in eval(pr, cx, scope, path, call) {
+                if running(o.path) == false {
+                    append(out, o)
+                    continue
+                }
+                for each r in timedOut(pr, cx, scope, o.path, o.value, ms, ty, at) {
+                    append(out, r)
+                }
+            }
+            return out
+        }
+        ast.Expr.Hole(_) {
+            return one(path, terms.Term.Hole())
+        }
+        ast.Expr.Absent(_) {
+            return one(path, terms.Term.VoidK())
+        }
+        ast.Expr.Baked(call, _) {
+            // What was built in is what the call answered, once.
+            return eval(pr, cx, scope, path, call)
+        }
+        _ { }
     }
     return lostOut(path, messages.proveNotYet(exprText(e)), e.at)
 }
@@ -2420,18 +2525,26 @@ func combine(op: ast.BinOp, ty: types.Ty, a: terms.Term, b: terms.Term): Result<
         return Result.Ok(terms.negation(equal(a, b)))
     }
     if ty is types.Ty.TInt {
-        if op is ast.BinOp.Add {
-            return Result.Ok(arith("add", a, b))
-        } else if op is ast.BinOp.Sub {
-            return Result.Ok(arith("sub", a, b))
-        } else if op is ast.BinOp.Mul {
-            return Result.Ok(arith("mul", a, b))
-        } else if op is ast.BinOp.Div {
-            return Result.Ok(arith("div", a, b))
-        } else if op is ast.BinOp.Mod {
-            return Result.Ok(arith("mod", a, b))
-        } else if op is ast.BinOp.Pow {
-            return Result.Ok(arith("pow", a, b))
+        switch op {
+            ast.BinOp.Add {
+                return Result.Ok(arith("add", a, b))
+            }
+            ast.BinOp.Sub {
+                return Result.Ok(arith("sub", a, b))
+            }
+            ast.BinOp.Mul {
+                return Result.Ok(arith("mul", a, b))
+            }
+            ast.BinOp.Div {
+                return Result.Ok(arith("div", a, b))
+            }
+            ast.BinOp.Mod {
+                return Result.Ok(arith("mod", a, b))
+            }
+            ast.BinOp.Pow {
+                return Result.Ok(arith("pow", a, b))
+            }
+            _ { }
         }
         return compared(op, a, b)
     }
@@ -2443,14 +2556,20 @@ func combine(op: ast.BinOp, ty: types.Ty, a: terms.Term, b: terms.Term): Result<
     }
     if ty is types.Ty.TFloat {
         if a is terms.Term.FloatK(x) && b is terms.Term.FloatK(y) {
-            if op is ast.BinOp.Add {
-                return Result.Ok(terms.Term.FloatK(x + y))
-            } else if op is ast.BinOp.Sub {
-                return Result.Ok(terms.Term.FloatK(x - y))
-            } else if op is ast.BinOp.Mul {
-                return Result.Ok(terms.Term.FloatK(x * y))
-            } else if op is ast.BinOp.Div {
-                return Result.Ok(terms.Term.FloatK(x / y))
+            switch op {
+                ast.BinOp.Add {
+                    return Result.Ok(terms.Term.FloatK(x + y))
+                }
+                ast.BinOp.Sub {
+                    return Result.Ok(terms.Term.FloatK(x - y))
+                }
+                ast.BinOp.Mul {
+                    return Result.Ok(terms.Term.FloatK(x * y))
+                }
+                ast.BinOp.Div {
+                    return Result.Ok(terms.Term.FloatK(x / y))
+                }
+                _ { }
             }
         }
         if op is ast.BinOp.Add || op is ast.BinOp.Sub || op is ast.BinOp.Mul || op is ast.BinOp.Div {
@@ -2467,14 +2586,20 @@ func combine(op: ast.BinOp, ty: types.Ty, a: terms.Term, b: terms.Term): Result<
 }
 
 func compared(op: ast.BinOp, a: terms.Term, b: terms.Term): Result<terms.Term, Bool> {
-    if op is ast.BinOp.Lt {
-        return Result.Ok(order("lt", a, b))
-    } else if op is ast.BinOp.Le {
-        return Result.Ok(order("le", a, b))
-    } else if op is ast.BinOp.Gt {
-        return Result.Ok(order("lt", b, a))
-    } else if op is ast.BinOp.Ge {
-        return Result.Ok(order("le", b, a))
+    switch op {
+        ast.BinOp.Lt {
+            return Result.Ok(order("lt", a, b))
+        }
+        ast.BinOp.Le {
+            return Result.Ok(order("le", a, b))
+        }
+        ast.BinOp.Gt {
+            return Result.Ok(order("lt", b, a))
+        }
+        ast.BinOp.Ge {
+            return Result.Ok(order("le", b, a))
+        }
+        _ { }
     }
     return Result.Error(false)
 }
@@ -2538,16 +2663,20 @@ proc evalSlice(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, subjec
         mut isVector := false
         mut terms.Term[dyn] elements = []
         mut Str[dyn] cs = []
-        if v is terms.Term.VecK(all) {
-            elements = all
-            items = len(all)
-            isVector = true
-        } else if v is terms.Term.StrK(s) {
-            cs = text.chars(s)
-            items = len(cs)
-        } else {
-            append(out, Out(lost(o.path, messages.proveSliceLengthUnknown(), at), terms.Term.VoidK()))
-            continue
+        switch v {
+            terms.Term.VecK(all) {
+                elements = all
+                items = len(all)
+                isVector = true
+            }
+            terms.Term.StrK(s) {
+                cs = text.chars(s)
+                items = len(cs)
+            }
+            _ {
+                append(out, Out(lost(o.path, messages.proveSliceLengthUnknown(), at), terms.Term.VoidK()))
+                continue
+            }
         }
         mut first := 0
         mut last := items - 1
@@ -2621,26 +2750,31 @@ proc matchPattern(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, val
         }
         for each m in materialize(pr, cx, path, value, labels, variant) {
             shaped := normIn(cx, m.path, m.value)
-            if shaped is terms.Term.RecK(tn, vn, fields) {
-                if tn == typeName && vn == variant {
-                    append(out, Out(bindAll(m.path, bindings, fields), terms.Term.BoolK(true)))
-                } else {
-                    append(out, Out(m.path, terms.Term.BoolK(false)))
+            switch shaped {
+                terms.Term.RecK(tn, vn, fields) {
+                    if tn == typeName && vn == variant {
+                        append(out, Out(bindAll(m.path, bindings, fields), terms.Term.BoolK(true)))
+                    } else {
+                        append(out, Out(m.path, terms.Term.BoolK(false)))
+                    }
                 }
-            } else if shaped is terms.Term.OkK(payload) {
-                if typeName == "Result" && variant == "Ok" {
-                    append(out, Out(bindAll(m.path, bindings, [payload]), terms.Term.BoolK(true)))
-                } else {
-                    append(out, Out(m.path, terms.Term.BoolK(false)))
+                terms.Term.OkK(payload) {
+                    if typeName == "Result" && variant == "Ok" {
+                        append(out, Out(bindAll(m.path, bindings, [payload]), terms.Term.BoolK(true)))
+                    } else {
+                        append(out, Out(m.path, terms.Term.BoolK(false)))
+                    }
                 }
-            } else if shaped is terms.Term.ErrK(payload) {
-                if typeName == "Result" && variant == "Error" {
-                    append(out, Out(bindAll(m.path, bindings, [payload]), terms.Term.BoolK(true)))
-                } else {
-                    append(out, Out(m.path, terms.Term.BoolK(false)))
+                terms.Term.ErrK(payload) {
+                    if typeName == "Result" && variant == "Error" {
+                        append(out, Out(bindAll(m.path, bindings, [payload]), terms.Term.BoolK(true)))
+                    } else {
+                        append(out, Out(m.path, terms.Term.BoolK(false)))
+                    }
                 }
-            } else {
-                append(out, Out(lost(m.path, messages.proveCannotLookInside(render(pr, shaped)), at), terms.Term.VoidK()))
+                _ {
+                    append(out, Out(lost(m.path, messages.proveCannotLookInside(render(pr, shaped)), at), terms.Term.VoidK()))
+                }
             }
         }
         return out
@@ -2700,12 +2834,16 @@ proc matchVector(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, v: t
     mut terms.Term[dyn] known = []
     mut terms.Term tail = terms.Term.VecK([])
     mut closed := true
-    if v is terms.Term.VecK(items) {
-        known = items
-    } else if v is terms.Term.VecS(front, more) {
-        known = front
-        tail = more
-        closed = false
+    switch v {
+        terms.Term.VecK(items) {
+            known = items
+        }
+        terms.Term.VecS(front, more) {
+            known = front
+            tail = more
+            closed = false
+        }
+        _ { }
     }
     if len(known) < n {
         if closed {
@@ -2722,13 +2860,16 @@ proc matchVector(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, v: t
     mut ast.Expr[dyn] literals = []
     mut Int[dyn] positions = []
     for each el in elements {
-        if el is ast.VecElem.Bind(name) {
-            if name != "_" && name != "" {
-                p = withValue(p, name, terms.nth(known, i))
+        switch el {
+            ast.VecElem.Bind(name) {
+                if name != "_" && name != "" {
+                    p = withValue(p, name, terms.nth(known, i))
+                }
             }
-        } else if el is ast.VecElem.Match(value) {
-            append(literals, value)
-            append(positions, i)
+            ast.VecElem.Match(value) {
+                append(literals, value)
+                append(positions, i)
+            }
         }
         i = i + 1
     }
@@ -2928,12 +3069,16 @@ proc timedOut(pr: mut Prover, cx: Context, scope: infer.Env, path: Path, value: 
 func sortsInPlace(cx: Context, scope: infer.Env, e: ast.Expr): Result<ast.Expr, Bool> {
     if e is ast.Expr.Call(callee, args, _) {
         mut builtin := false
-        if callee is ast.Expr.Ident(name, _) {
-            builtin = name == "sort" && hive.map.has(cx.callables, name) == false && infer.isBound(scope, name) == false
-        } else if callee is ast.Expr.Member(subject, field, _) {
-            if subject is ast.Expr.Ident(head, _) {
-                builtin = head == "hive" && field == "sort"
+        switch callee {
+            ast.Expr.Ident(name, _) {
+                builtin = name == "sort" && hive.map.has(cx.callables, name) == false && infer.isBound(scope, name) == false
             }
+            ast.Expr.Member(subject, field, _) {
+                if subject is ast.Expr.Ident(head, _) {
+                    builtin = head == "hive" && field == "sort"
+                }
+            }
+            _ { }
         }
         if builtin {
             for each a in infer.builtinArgs("sort", args) {
@@ -3321,12 +3466,16 @@ func sortedKnown(items: terms.Term[]): Result<terms.Term, Bool> {
     mut Int[dyn] ints = []
     mut Str[dyn] strs = []
     for each item in items {
-        if item is terms.Term.IntK(n) {
-            append(ints, n)
-        } else if item is terms.Term.StrK(s) {
-            append(strs, s)
-        } else {
-            return Result.Error(false)
+        switch item {
+            terms.Term.IntK(n) {
+                append(ints, n)
+            }
+            terms.Term.StrK(s) {
+                append(strs, s)
+            }
+            _ {
+                return Result.Error(false)
+            }
         }
     }
     mut terms.Term[dyn] out = []
@@ -3436,16 +3585,20 @@ proc checkedConversion(pr: mut Prover, cx: Context, scope: infer.Env, path: Path
         settled := part(pr, "checked:" + typeName + "(" + terms.key(x) + ")", ty, typeName + ".checked(" + render(pr, x) + ")")
         mut terms.Term answer = settled
         if x is terms.Term.IntK(n) {
-            if target is types.Ty.TInt {
-                answer = terms.Term.OkK(x)
-            } else if target is types.Ty.TSized(_, _) {
-                if converted(target, x, settled) is terms.Term.IntK(w) {
-                    if w == n {
-                        answer = terms.Term.OkK(x)
-                    } else {
-                        answer = terms.Term.ErrK(x)
+            switch target {
+                types.Ty.TInt {
+                    answer = terms.Term.OkK(x)
+                }
+                types.Ty.TSized(_, _) {
+                    if converted(target, x, settled) is terms.Term.IntK(w) {
+                        if w == n {
+                            answer = terms.Term.OkK(x)
+                        } else {
+                            answer = terms.Term.ErrK(x)
+                        }
                     }
                 }
+                _ { }
             }
         }
         append(out, Out(o.path, answer))
@@ -3536,14 +3689,18 @@ proc kept(pr: mut Prover, cx: Context, path: Path, value: terms.Term): Out {
 // values the prover never sees, so it may fail nowhere.
 func handedOver(cx: Context, args: terms.Term[], word: Str): Str {
     for each a in args {
-        if a is terms.Term.FnK(name, _) {
-            if hive.map.has(cx.mayFail, name) {
-                return messages.proveHandsMayFail(types.shownName(name), word)
+        switch a {
+            terms.Term.FnK(name, _) {
+                if hive.map.has(cx.mayFail, name) {
+                    return messages.proveHandsMayFail(types.shownName(name), word)
+                }
             }
-        } else if a is terms.Term.Unknown(_, ty) {
-            if ty is types.Ty.TFn(_, _, _, _) {
-                return messages.proveHandsUnknownFunction(word)
+            terms.Term.Unknown(_, ty) {
+                if ty is types.Ty.TFn(_, _, _, _) {
+                    return messages.proveHandsUnknownFunction(word)
+                }
             }
+            _ { }
         }
     }
     return ""
@@ -3890,16 +4047,20 @@ proc mapped(pr: mut Prover, cx: Context, path: Path, items: terms.Term[], fn: te
             if walk == "filterMap" {
                 for each m in materialize(pr, cx, r.path, v, [], "") {
                     shaped := normIn(cx, m.path, m.value)
-                    if shaped is terms.Term.OkK(good) {
-                        for each n in mapped(pr, cx, m.path, items, fn, walk, at + 1, done + [good], where) {
-                            append(out, n)
+                    switch shaped {
+                        terms.Term.OkK(good) {
+                            for each n in mapped(pr, cx, m.path, items, fn, walk, at + 1, done + [good], where) {
+                                append(out, n)
+                            }
                         }
-                    } else if shaped is terms.Term.ErrK(_) {
-                        for each n in mapped(pr, cx, m.path, items, fn, walk, at + 1, done, where) {
-                            append(out, n)
+                        terms.Term.ErrK(_) {
+                            for each n in mapped(pr, cx, m.path, items, fn, walk, at + 1, done, where) {
+                                append(out, n)
+                            }
                         }
-                    } else {
-                        append(out, Out(lost(m.path, messages.proveCannotLookInside(render(pr, shaped)), where), terms.Term.VoidK()))
+                        _ {
+                            append(out, Out(lost(m.path, messages.proveCannotLookInside(render(pr, shaped)), where), terms.Term.VoidK()))
+                        }
                     }
                 }
             } else if keeping {
@@ -4022,137 +4183,175 @@ func namesInStmt(s: ast.Stmt): Str[dyn] {
 
 func exprsOfStmt(s: ast.Stmt): ast.Expr[dyn] {
     mut ast.Expr[dyn] out = []
-    if s is ast.Stmt.VarDecl(_, value, _, _, _) {
-        append(out, value)
-    } else if s is ast.Stmt.TypedDecl(_, _, value, _, _, _) {
-        append(out, value)
-    } else if s is ast.Stmt.Assign(target, value, _) {
-        append(out, target)
-        append(out, value)
-    } else if s is ast.Stmt.IfChain(branches, _, _, _) {
-        for each b in branches {
-            append(out, b.condition)
+    switch s {
+        ast.Stmt.VarDecl(_, value, _, _, _) {
+            append(out, value)
         }
-    } else if s is ast.Stmt.SwitchStmt(lets, subjects, arms, _, _) {
-        for each subject in subjects {
-            append(out, subject)
+        ast.Stmt.TypedDecl(_, _, value, _, _, _) {
+            append(out, value)
         }
-        for each l in lets {
-            for each e in exprsOfStmt(l) {
+        ast.Stmt.Assign(target, value, _) {
+            append(out, target)
+            append(out, value)
+        }
+        ast.Stmt.IfChain(branches, _, _, _) {
+            for each b in branches {
+                append(out, b.condition)
+            }
+        }
+        ast.Stmt.SwitchStmt(lets, subjects, arms, _, _) {
+            for each subject in subjects {
+                append(out, subject)
+            }
+            for each l in lets {
+                for each e in exprsOfStmt(l) {
+                    append(out, e)
+                }
+            }
+            for each a in arms {
+                append(out, a.condition)
+            }
+        }
+        ast.Stmt.ForLoop(init, cond, post, _, _) {
+            append(out, cond)
+            for each e in exprsOfStmt(init) {
+                append(out, e)
+            }
+            for each e in exprsOfStmt(post) {
                 append(out, e)
             }
         }
-        for each a in arms {
-            append(out, a.condition)
+        ast.Stmt.ForEach(_, _, subject, _, _) {
+            append(out, subject)
         }
-    } else if s is ast.Stmt.ForLoop(init, cond, post, _, _) {
-        append(out, cond)
-        for each e in exprsOfStmt(init) {
-            append(out, e)
+        ast.Stmt.ReturnStmt(value, _) {
+            append(out, value)
         }
-        for each e in exprsOfStmt(post) {
-            append(out, e)
+        ast.Stmt.EchoStmt(value, _) {
+            append(out, value)
         }
-    } else if s is ast.Stmt.ForEach(_, _, subject, _, _) {
-        append(out, subject)
-    } else if s is ast.Stmt.ReturnStmt(value, _) {
-        append(out, value)
-    } else if s is ast.Stmt.EchoStmt(value, _) {
-        append(out, value)
-    } else if s is ast.Stmt.AssertStmt(value, _) {
-        append(out, value)
-    } else if s is ast.Stmt.PanicStmt(value, _) {
-        append(out, value)
-    } else if s is ast.Stmt.AsyncStmt(value, _) {
-        append(out, value)
-    } else if s is ast.Stmt.Expression(value, _) {
-        append(out, value)
+        ast.Stmt.AssertStmt(value, _) {
+            append(out, value)
+        }
+        ast.Stmt.PanicStmt(value, _) {
+            append(out, value)
+        }
+        ast.Stmt.AsyncStmt(value, _) {
+            append(out, value)
+        }
+        ast.Stmt.Expression(value, _) {
+            append(out, value)
+        }
+        _ { }
     }
     return out
 }
 
 func blocksOfStmt(s: ast.Stmt): ast.Block[dyn] {
     mut ast.Block[dyn] out = []
-    if s is ast.Stmt.IfChain(branches, otherwise, _, _) {
-        for each b in branches {
-            append(out, b.body)
+    switch s {
+        ast.Stmt.IfChain(branches, otherwise, _, _) {
+            for each b in branches {
+                append(out, b.body)
+            }
+            append(out, otherwise)
         }
-        append(out, otherwise)
-    } else if s is ast.Stmt.SwitchStmt(_, _, arms, _, _) {
-        for each a in arms {
-            append(out, a.body)
+        ast.Stmt.SwitchStmt(_, _, arms, _, _) {
+            for each a in arms {
+                append(out, a.body)
+            }
         }
-    } else if s is ast.Stmt.ForLoop(_, _, _, body, _) {
-        append(out, body)
-    } else if s is ast.Stmt.ForEach(_, _, _, body, _) {
-        append(out, body)
+        ast.Stmt.ForLoop(_, _, _, body, _) {
+            append(out, body)
+        }
+        ast.Stmt.ForEach(_, _, _, body, _) {
+            append(out, body)
+        }
+        _ { }
     }
     return out
 }
 
 func namesIn(e: ast.Expr): Str[dyn] {
     mut Str[dyn] out = []
-    if e is ast.Expr.Ident(name, _) {
-        append(out, name)
-    } else if e is ast.Expr.Interp(parts, _) {
-        for each p in parts {
-            if p is ast.InterpPart.Expression(value) {
-                for each n in namesIn(value) {
+    switch e {
+        ast.Expr.Ident(name, _) {
+            append(out, name)
+        }
+        ast.Expr.Interp(parts, _) {
+            for each p in parts {
+                if p is ast.InterpPart.Expression(value) {
+                    for each n in namesIn(value) {
+                        append(out, n)
+                    }
+                }
+            }
+        }
+        ast.Expr.VectorLit(items, _) {
+            for each item in items {
+                for each n in namesIn(item) {
                     append(out, n)
                 }
             }
         }
-    } else if e is ast.Expr.VectorLit(items, _) {
-        for each item in items {
-            for each n in namesIn(item) {
+        ast.Expr.Negate(x, _) {
+            return namesIn(x)
+        }
+        ast.Expr.Not(x, _) {
+            return namesIn(x)
+        }
+        ast.Expr.BitNot(x, _) {
+            return namesIn(x)
+        }
+        ast.Expr.Binary(_, l, r, _) {
+            return namesIn(l) + namesIn(r)
+        }
+        ast.Expr.Call(callee, args, _) {
+            for each n in namesIn(callee) {
+                append(out, n)
+            }
+            for each a in args {
+                for each n in namesIn(a.value) {
+                    append(out, n)
+                }
+            }
+        }
+        ast.Expr.Member(subject, _, _) {
+            return namesIn(subject)
+        }
+        ast.Expr.Index(subject, index, _) {
+            return namesIn(subject) + namesIn(index)
+        }
+        ast.Expr.Slice(subject, low, high, _) {
+            return namesIn(subject) + namesIn(low) + namesIn(high)
+        }
+        ast.Expr.IsMatch(subject, pattern, _) {
+            for each n in namesIn(subject) {
+                append(out, n)
+            }
+            for each x in ast.patternExprs(pattern) {
+                for each n in namesIn(x) {
+                    append(out, n)
+                }
+            }
+        }
+        ast.Expr.AwaitAll(calls, timeout, _) {
+            for each c in calls {
+                for each n in namesIn(c) {
+                    append(out, n)
+                }
+            }
+            for each n in namesIn(timeout) {
                 append(out, n)
             }
         }
-    } else if e is ast.Expr.Negate(x, _) {
-        return namesIn(x)
-    } else if e is ast.Expr.Not(x, _) {
-        return namesIn(x)
-    } else if e is ast.Expr.BitNot(x, _) {
-        return namesIn(x)
-    } else if e is ast.Expr.Binary(_, l, r, _) {
-        return namesIn(l) + namesIn(r)
-    } else if e is ast.Expr.Call(callee, args, _) {
-        for each n in namesIn(callee) {
-            append(out, n)
+        ast.Expr.Timed(call, ms, _) {
+            return namesIn(call) + namesIn(ms)
         }
-        for each a in args {
-            for each n in namesIn(a.value) {
-                append(out, n)
-            }
+        ast.Expr.Baked(call, _) {
+            return namesIn(call)
         }
-    } else if e is ast.Expr.Member(subject, _, _) {
-        return namesIn(subject)
-    } else if e is ast.Expr.Index(subject, index, _) {
-        return namesIn(subject) + namesIn(index)
-    } else if e is ast.Expr.Slice(subject, low, high, _) {
-        return namesIn(subject) + namesIn(low) + namesIn(high)
-    } else if e is ast.Expr.IsMatch(subject, pattern, _) {
-        for each n in namesIn(subject) {
-            append(out, n)
-        }
-        for each x in ast.patternExprs(pattern) {
-            for each n in namesIn(x) {
-                append(out, n)
-            }
-        }
-    } else if e is ast.Expr.AwaitAll(calls, timeout, _) {
-        for each c in calls {
-            for each n in namesIn(c) {
-                append(out, n)
-            }
-        }
-        for each n in namesIn(timeout) {
-            append(out, n)
-        }
-    } else if e is ast.Expr.Timed(call, ms, _) {
-        return namesIn(call) + namesIn(ms)
-    } else if e is ast.Expr.Baked(call, _) {
-        return namesIn(call)
+        _ { }
     }
     return out
 }
@@ -4160,14 +4359,19 @@ func namesIn(e: ast.Expr): Str[dyn] {
 func declaredInStmts(stmts: ast.Stmt[]): Str[dyn] {
     mut Str[dyn] out = []
     for each s in stmts {
-        if s is ast.Stmt.VarDecl(name, _, _, _, _) {
-            append(out, name)
-        } else if s is ast.Stmt.TypedDecl(_, name, _, _, _, _) {
-            append(out, name)
-        } else if s is ast.Stmt.ForLoop(init, _, _, _, _) {
-            for each n in declaredInStmts([init]) {
-                append(out, n)
+        switch s {
+            ast.Stmt.VarDecl(name, _, _, _, _) {
+                append(out, name)
             }
+            ast.Stmt.TypedDecl(_, name, _, _, _, _) {
+                append(out, name)
+            }
+            ast.Stmt.ForLoop(init, _, _, _, _) {
+                for each n in declaredInStmts([init]) {
+                    append(out, n)
+                }
+            }
+            _ { }
         }
         for each b in blocksOfStmt(s) {
             for each n in declaredInStmts(b.stmts) {
@@ -4182,19 +4386,23 @@ func declaredInStmts(stmts: ast.Stmt[]): Str[dyn] {
 func assignedInStmts(stmts: ast.Stmt[]): Str[dyn] {
     mut Str[dyn] out = []
     for each s in stmts {
-        if s is ast.Stmt.Assign(target, _, _) {
-            append(out, rootOf(target))
-        } else if s is ast.Stmt.Expression(value, _) {
-            if value is ast.Expr.Call(callee, args, _) {
-                if callee is ast.Expr.Ident(name, _) {
-                    if name == "append" || name == "prepend" || name == "drop" || name == "sort" {
-                        for each a in args {
-                            append(out, rootOf(a.value))
-                            break
+        switch s {
+            ast.Stmt.Assign(target, _, _) {
+                append(out, rootOf(target))
+            }
+            ast.Stmt.Expression(value, _) {
+                if value is ast.Expr.Call(callee, args, _) {
+                    if callee is ast.Expr.Ident(name, _) {
+                        if name == "append" || name == "prepend" || name == "drop" || name == "sort" {
+                            for each a in args {
+                                append(out, rootOf(a.value))
+                                break
+                            }
                         }
                     }
                 }
             }
+            _ { }
         }
         for each b in blocksOfStmt(s) {
             for each n in assignedInStmts(b.stmts) {
@@ -4447,68 +4655,88 @@ proc knownText(pr: mut Prover, cx: Context, path: Path): Str {
 
 // An expression as it was written, near enough for a message.
 func exprText(e: ast.Expr): Str {
-    if e is ast.Expr.IntLit(v, _) {
-        return "{v}"
-    } else if e is ast.Expr.FloatLit(v, _) {
-        return "{v}"
-    } else if e is ast.Expr.StrLit(v, _) {
-        return "\"" + v + "\""
-    } else if e is ast.Expr.BoolLit(v, _) {
-        return "{v}"
-    } else if e is ast.Expr.AtomLit(v, _) {
-        return "#" + v
-    } else if e is ast.Expr.Ident(name, _) {
-        return types.shownName(name)
-    } else if e is ast.Expr.VectorLit(items, _) {
-        mut Str[dyn] out = []
-        for each item in items {
-            append(out, exprText(item))
+    switch e {
+        ast.Expr.IntLit(v, _) {
+            return "{v}"
         }
-        return "[" + join(out, ", ") + "]"
-    } else if e is ast.Expr.Negate(x, _) {
-        return "-" + exprText(x)
-    } else if e is ast.Expr.Not(x, _) {
-        return "!" + exprText(x)
-    } else if e is ast.Expr.Binary(op, l, r, _) {
-        return exprText(l) + " " + ast.opSpelling(op) + " " + exprText(r)
-    } else if e is ast.Expr.Call(callee, args, _) {
-        mut Str[dyn] out = []
-        for each a in args {
-            if a.name != "" {
-                append(out, a.name + ": " + exprText(a.value))
-            } else {
-                append(out, exprText(a.value))
+        ast.Expr.FloatLit(v, _) {
+            return "{v}"
+        }
+        ast.Expr.StrLit(v, _) {
+            return "\"" + v + "\""
+        }
+        ast.Expr.BoolLit(v, _) {
+            return "{v}"
+        }
+        ast.Expr.AtomLit(v, _) {
+            return "#" + v
+        }
+        ast.Expr.Ident(name, _) {
+            return types.shownName(name)
+        }
+        ast.Expr.VectorLit(items, _) {
+            mut Str[dyn] out = []
+            for each item in items {
+                append(out, exprText(item))
             }
+            return "[" + join(out, ", ") + "]"
         }
-        return exprText(callee) + "(" + join(out, ", ") + ")"
-    } else if e is ast.Expr.Member(subject, field, _) {
-        return exprText(subject) + "." + field
-    } else if e is ast.Expr.Index(subject, index, _) {
-        return exprText(subject) + "[" + exprText(index) + "]"
-    } else if e is ast.Expr.IsMatch(subject, pattern, _) {
-        if pattern is ast.Pattern.Constructor(names, _, _) {
-            mut Str[dyn] shown = []
-            for each n in names {
-                append(shown, types.shownName(n))
+        ast.Expr.Negate(x, _) {
+            return "-" + exprText(x)
+        }
+        ast.Expr.Not(x, _) {
+            return "!" + exprText(x)
+        }
+        ast.Expr.Binary(op, l, r, _) {
+            return exprText(l) + " " + ast.opSpelling(op) + " " + exprText(r)
+        }
+        ast.Expr.Call(callee, args, _) {
+            mut Str[dyn] out = []
+            for each a in args {
+                if a.name != "" {
+                    append(out, a.name + ": " + exprText(a.value))
+                } else {
+                    append(out, exprText(a.value))
+                }
             }
-            return exprText(subject) + " is " + join(shown, ".")
+            return exprText(callee) + "(" + join(out, ", ") + ")"
         }
-        return exprText(subject) + " is ..."
-    } else if e is ast.Expr.Hole(_) {
-        return "_"
-    } else if e is ast.Expr.Timed(call, ms, _) {
-        return exprText(call) + " with timeout " + exprText(ms)
-    } else if e is ast.Expr.Baked(call, _) {
-        return exprText(call) + " with compiler"
-    } else if e is ast.Expr.AwaitAll(calls, timeout, _) {
-        mut Str[dyn] out = []
-        for each c in calls {
-            append(out, exprText(c))
+        ast.Expr.Member(subject, field, _) {
+            return exprText(subject) + "." + field
         }
-        if timeout is ast.Expr.Absent {
-            return "await [" + join(out, ", ") + "]"
+        ast.Expr.Index(subject, index, _) {
+            return exprText(subject) + "[" + exprText(index) + "]"
         }
-        return "await [" + join(out, ", ") + "] with timeout " + exprText(timeout)
+        ast.Expr.IsMatch(subject, pattern, _) {
+            if pattern is ast.Pattern.Constructor(names, _, _) {
+                mut Str[dyn] shown = []
+                for each n in names {
+                    append(shown, types.shownName(n))
+                }
+                return exprText(subject) + " is " + join(shown, ".")
+            }
+            return exprText(subject) + " is ..."
+        }
+        ast.Expr.Hole(_) {
+            return "_"
+        }
+        ast.Expr.Timed(call, ms, _) {
+            return exprText(call) + " with timeout " + exprText(ms)
+        }
+        ast.Expr.Baked(call, _) {
+            return exprText(call) + " with compiler"
+        }
+        ast.Expr.AwaitAll(calls, timeout, _) {
+            mut Str[dyn] out = []
+            for each c in calls {
+                append(out, exprText(c))
+            }
+            if timeout is ast.Expr.Absent {
+                return "await [" + join(out, ", ") + "]"
+            }
+            return "await [" + join(out, ", ") + "] with timeout " + exprText(timeout)
+        }
+        _ { }
     }
     return "..."
 }

@@ -43,6 +43,17 @@ totals them:
 It exits non-zero when any test fails, any program it compiles is refused, or any
 file under the directory cannot be read.
 
+## Tests run side by side
+
+A program's tests **run at the same time**, as many as the machine has cores,
+and under a directory that many programs compile and run at once, each report
+printed whole as its program finishes. **`--threads N`** sets the number;
+`--threads 1` runs everything one after another, in order.
+
+A test shares nothing with another through the language, so the only way two can
+collide is outside it: two tests writing the same file, or the same directory,
+race. Each should write under a name of its own.
+
 ## `assert` means the same thing, and does something different
 
 `assert` says what it always says: this must hold. What changes is the

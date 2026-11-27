@@ -137,15 +137,21 @@ proc read(entry: Str, held: hive.map.Map<Str, Str>): Reading {
 proc declared(t: types.Table, m: ast.Module): Named[dyn] {
     mut Named[dyn] out = []
     for each d in m.decls {
-        if d is ast.Decl.TypeDecl(name, fields, variants, at) {
-            append(out, Named(name, typeShown(t, name, fields, variants), Kind.TypeName(), at))
-        } else if d is ast.Decl.CallableDecl(kind, name, params, result, _, at) {
-            word := ast.kindWord(kind)
-            append(out, Named(name, word + " " + name + signature(t, params, result), Kind.Callable(), at))
-        } else if d is ast.Decl.QueryDecl(name, params, result, _, at) {
-            append(out, Named(name, "query " + name + signature(t, params, result), Kind.Callable(), at))
-        } else if d is ast.Decl.ForeignDecl(name, params, result, _, _, _, at) {
-            append(out, Named(name, "func " + name + signature(t, params, result), Kind.Callable(), at))
+        switch d {
+            ast.Decl.TypeDecl(name, fields, variants, at) {
+                append(out, Named(name, typeShown(t, name, fields, variants), Kind.TypeName(), at))
+            }
+            ast.Decl.CallableDecl(kind, name, params, result, _, at) {
+                word := ast.kindWord(kind)
+                append(out, Named(name, word + " " + name + signature(t, params, result), Kind.Callable(), at))
+            }
+            ast.Decl.QueryDecl(name, params, result, _, at) {
+                append(out, Named(name, "query " + name + signature(t, params, result), Kind.Callable(), at))
+            }
+            ast.Decl.ForeignDecl(name, params, result, _, _, _, at) {
+                append(out, Named(name, "func " + name + signature(t, params, result), Kind.Callable(), at))
+            }
+            _ { }
         }
     }
     return out
@@ -800,16 +806,20 @@ func firstLine(shown: Str): Str {
 
 func members(r: Reading, ty: types.Ty): Offered[dyn] {
     mut Offered[dyn] out = []
-    if ty is types.Ty.TNamed(name) {
-        if types.findType(r.table, name) is Result.Ok(info) {
-            for each f in info.shared {
-                append(out, Offered(f.name, spelt(r, types.show(types.resolve(r.table, f.declared))), Kind.Field()))
+    switch ty {
+        types.Ty.TNamed(name) {
+            if types.findType(r.table, name) is Result.Ok(info) {
+                for each f in info.shared {
+                    append(out, Offered(f.name, spelt(r, types.show(types.resolve(r.table, f.declared))), Kind.Field()))
+                }
             }
         }
-    } else if ty is types.Ty.TLib(module, name) {
-        for each f in stdlib.fieldsOf(r.table, module, name) {
-            append(out, Offered(f.name, types.show(stdlib.fieldTypeOf(r.table, module, name, f.name)), Kind.Field()))
+        types.Ty.TLib(module, name) {
+            for each f in stdlib.fieldsOf(r.table, module, name) {
+                append(out, Offered(f.name, types.show(stdlib.fieldTypeOf(r.table, module, name, f.name)), Kind.Field()))
+            }
         }
+        _ { }
     }
     return out
 }
@@ -881,24 +891,31 @@ proc outline(entry: Str, source: Str): Result<Outlined[dyn], Bool> {
             last = parsed.module.decls[next].at.line - 1
         }
         i = next
-        if d is ast.Decl.TypeDecl(name, fields, variants, at) {
-            mut Outlined[dyn] inside = []
-            for each f in fields {
-                append(inside, Outlined(f.name, written(f.declared), Kind.Field(), f.at.line, f.at.col, f.at.line, []))
+        switch d {
+            ast.Decl.TypeDecl(name, fields, variants, at) {
+                mut Outlined[dyn] inside = []
+                for each f in fields {
+                    append(inside, Outlined(f.name, written(f.declared), Kind.Field(), f.at.line, f.at.col, f.at.line, []))
+                }
+                for each v in variants {
+                    append(inside, Outlined(v.name, "", Kind.Variant(), v.at.line, v.at.col, v.at.line, []))
+                }
+                append(out, Outlined(name, "type", Kind.TypeName(), at.line, at.col, last, inside))
             }
-            for each v in variants {
-                append(inside, Outlined(v.name, "", Kind.Variant(), v.at.line, v.at.col, v.at.line, []))
+            ast.Decl.CallableDecl(kind, name, params, result, _, at) {
+                word := ast.kindWord(kind)
+                append(out, Outlined(name, word + signature(t, params, result), Kind.Callable(), at.line, at.col, last, []))
             }
-            append(out, Outlined(name, "type", Kind.TypeName(), at.line, at.col, last, inside))
-        } else if d is ast.Decl.CallableDecl(kind, name, params, result, _, at) {
-            word := ast.kindWord(kind)
-            append(out, Outlined(name, word + signature(t, params, result), Kind.Callable(), at.line, at.col, last, []))
-        } else if d is ast.Decl.QueryDecl(name, params, result, _, at) {
-            append(out, Outlined(name, "query" + signature(t, params, result), Kind.Callable(), at.line, at.col, last, []))
-        } else if d is ast.Decl.TableLawDecl(name, _, table, _, at) {
-            append(out, Outlined(name, "law for table " + table, Kind.Callable(), at.line, at.col, last, []))
-        } else if d is ast.Decl.TestDecl(title, _, at) {
-            append(out, Outlined(title, "test", Kind.Callable(), at.line, at.col, last, []))
+            ast.Decl.QueryDecl(name, params, result, _, at) {
+                append(out, Outlined(name, "query" + signature(t, params, result), Kind.Callable(), at.line, at.col, last, []))
+            }
+            ast.Decl.TableLawDecl(name, _, table, _, at) {
+                append(out, Outlined(name, "law for table " + table, Kind.Callable(), at.line, at.col, last, []))
+            }
+            ast.Decl.TestDecl(title, _, at) {
+                append(out, Outlined(title, "test", Kind.Callable(), at.line, at.col, last, []))
+            }
+            _ { }
         }
     }
     return Result.Ok(out)

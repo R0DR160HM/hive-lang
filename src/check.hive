@@ -104,14 +104,19 @@ func lawsOf(m: ast.Module): Str[dyn] {
 }
 
 proc see(c: mut Check, env: infer.Env, e: ast.Expr): void {
-    if e is ast.Expr.Ident(name, at) {
-        append(c.uses, infer.Use(at, c.inside, name, "", types.Ty.TUnknown(), infer.typeOf(env, e), infer.isBound(env, name), false))
-    } else if e is ast.Expr.Member(subject, field, at) {
-        append(c.uses, infer.Use(at, c.inside, field, pathOf(env, subject), infer.typeOf(env, subject), infer.typeOf(env, e), false, true))
-    } else if e is ast.Expr.Call(callee, _, _) {
-        if callee is ast.Expr.Ident(_, _) || callee is ast.Expr.Member(_, _, _) {
-            see(c, env, callee)
+    switch e {
+        ast.Expr.Ident(name, at) {
+            append(c.uses, infer.Use(at, c.inside, name, "", types.Ty.TUnknown(), infer.typeOf(env, e), infer.isBound(env, name), false))
         }
+        ast.Expr.Member(subject, field, at) {
+            append(c.uses, infer.Use(at, c.inside, field, pathOf(env, subject), infer.typeOf(env, subject), infer.typeOf(env, e), false, true))
+        }
+        ast.Expr.Call(callee, _, _) {
+            if callee is ast.Expr.Ident(_, _) || callee is ast.Expr.Member(_, _, _) {
+                see(c, env, callee)
+            }
+        }
+        _ { }
     }
 }
 
@@ -202,76 +207,83 @@ proc reportAt(c: mut Check, at: token.Pos, message: Str): void {
 // --- Declarations ------------------------------------------------------------
 
 proc checkDecl(c: mut Check, env: infer.Env, d: ast.Decl): void {
-    if d is ast.Decl.TypeDecl(name, fields, variants, at) {
-        c.inside = name
-        c.at = at
-        checkTypeDecl(c, env, fields, variants)
-        checkHoldsItself(c, env.table, name)
-        for each f in fields {
-            checkLibTypes(c, env, types.resolve(env.table, f.declared))
-        }
-        for each v in variants {
-            for each f in v.fields {
+    switch d {
+        ast.Decl.TypeDecl(name, fields, variants, at) {
+            c.inside = name
+            c.at = at
+            checkTypeDecl(c, env, fields, variants)
+            checkHoldsItself(c, env.table, name)
+            for each f in fields {
                 checkLibTypes(c, env, types.resolve(env.table, f.declared))
             }
-        }
-    } else if d is ast.Decl.CallableDecl(kind, name, params, result, body, at) {
-        c.inside = name
-        c.at = at
-        c.pure = kind is ast.CallableKind.FuncKind
-        c.inLaw = kind is ast.CallableKind.LawKind || kind is ast.CallableKind.TypeLawKind
-        c.result = types.resolve(env.table, result)
-        checkLibTypes(c, env, c.result)
-        for each p in params {
-            checkLibTypes(c, env, types.resolve(env.table, p.declared))
-        }
-        c.inTest = false
-        c.loops = 0
-        c.mutable = []
-        c.baked = bake.constants(params, body)
-        checkCallable(c, env, name, params, body)
-    } else if d is ast.Decl.QueryDecl(name, params, result, sql, at) {
-        c.inside = name
-        c.at = at
-        // A query is a `func` whose body happens to be SQL: nothing in one could
-        // write to storage its caller can see.
-        c.pure = true
-        c.inLaw = false
-        c.result = types.resolve(env.table, result)
-        c.inTest = false
-        c.loops = 0
-        c.mutable = []
-        c.baked = []
-        checkQuery(c, env, params, result, sql)
-    } else if d is ast.Decl.TableLawDecl(name, params, _, filter, at) {
-        c.inside = name
-        c.at = at
-        c.pure = true
-        c.inLaw = false
-        c.result = types.Ty.TVoid()
-        c.inTest = false
-        c.loops = 0
-        c.mutable = []
-        c.baked = []
-        for each p in params {
-            if p.mutable {
-                report(c, messages.lawTakesMut(p.name))
+            for each v in variants {
+                for each f in v.fields {
+                    checkLibTypes(c, env, types.resolve(env.table, f.declared))
+                }
             }
         }
-        checkSql(c, infer.boundParams(env, params, 0), filter)
-    } else if d is ast.Decl.TestDecl(title, body, at) {
-        c.inside = "\"{title}\""
-        c.at = at
-        c.pure = false
-        c.inLaw = false
-        c.result = types.Ty.TVoid()
-        c.inTest = true
-        c.loops = 0
-        c.mutable = []
-        c.baked = bake.constants([], body)
-        c.declared = []
-        c.blockStart = 0
-        checkBlock(c, env, body)
+        ast.Decl.CallableDecl(kind, name, params, result, body, at) {
+            c.inside = name
+            c.at = at
+            c.pure = kind is ast.CallableKind.FuncKind
+            c.inLaw = kind is ast.CallableKind.LawKind || kind is ast.CallableKind.TypeLawKind
+            c.result = types.resolve(env.table, result)
+            checkLibTypes(c, env, c.result)
+            for each p in params {
+                checkLibTypes(c, env, types.resolve(env.table, p.declared))
+            }
+            c.inTest = false
+            c.loops = 0
+            c.mutable = []
+            c.baked = bake.constants(params, body)
+            checkCallable(c, env, name, params, body)
+        }
+        ast.Decl.QueryDecl(name, params, result, sql, at) {
+            c.inside = name
+            c.at = at
+            // A query is a `func` whose body happens to be SQL: nothing in one could
+            // write to storage its caller can see.
+            c.pure = true
+            c.inLaw = false
+            c.result = types.resolve(env.table, result)
+            c.inTest = false
+            c.loops = 0
+            c.mutable = []
+            c.baked = []
+            checkQuery(c, env, params, result, sql)
+        }
+        ast.Decl.TableLawDecl(name, params, _, filter, at) {
+            c.inside = name
+            c.at = at
+            c.pure = true
+            c.inLaw = false
+            c.result = types.Ty.TVoid()
+            c.inTest = false
+            c.loops = 0
+            c.mutable = []
+            c.baked = []
+            for each p in params {
+                if p.mutable {
+                    report(c, messages.lawTakesMut(p.name))
+                }
+            }
+            checkSql(c, infer.boundParams(env, params, 0), filter)
+        }
+        ast.Decl.TestDecl(title, body, at) {
+            c.inside = "\"{title}\""
+            c.at = at
+            c.pure = false
+            c.inLaw = false
+            c.result = types.Ty.TVoid()
+            c.inTest = true
+            c.loops = 0
+            c.mutable = []
+            c.baked = bake.constants([], body)
+            c.declared = []
+            c.blockStart = 0
+            checkBlock(c, env, body)
+        }
+        _ { }
     }
 }
 
@@ -503,22 +515,29 @@ func wordAt(cs: Str[], from: Int): Str {
 
 proc checkSql(c: mut Check, env: infer.Env, parts: ast.SqlPart[]): void {
     for each part in parts {
-        if part is ast.SqlPart.Param(value) {
-            checkExpr(c, env, value)
-            checkBoundValue(c, env, value)
-        } else if part is ast.SqlPart.Where(group) {
-            checkSqlGroup(c, env, group)
+        switch part {
+            ast.SqlPart.Param(value) {
+                checkExpr(c, env, value)
+                checkBoundValue(c, env, value)
+            }
+            ast.SqlPart.Where(group) {
+                checkSqlGroup(c, env, group)
+            }
+            _ { }
         }
     }
 }
 
 proc checkSqlGroup(c: mut Check, env: infer.Env, group: ast.SqlGroup): void {
     for each item in group.items {
-        if item is ast.SqlItem.Cond(condition, body) {
-            checkCondition(c, env, condition)
-            checkSql(c, env, body)
-        } else if item is ast.SqlItem.Nested(inner) {
-            checkSqlGroup(c, env, inner)
+        switch item {
+            ast.SqlItem.Cond(condition, body) {
+                checkCondition(c, env, condition)
+                checkSql(c, env, body)
+            }
+            ast.SqlItem.Nested(inner) {
+                checkSqlGroup(c, env, inner)
+            }
         }
     }
 }
@@ -536,36 +555,45 @@ proc checkBoundValue(c: mut Check, env: infer.Env, value: ast.Expr): void {
 }
 
 proc checkLibTypes(c: mut Check, env: infer.Env, ty: types.Ty): void {
-    if ty is types.Ty.TLib(module, name) {
-        if stdlib.isLibType(env.table, module, name) == false {
-            report(c, messages.libTypeMissing(module, name))
+    switch ty {
+        types.Ty.TLib(module, name) {
+            if stdlib.isLibType(env.table, module, name) == false {
+                report(c, messages.libTypeMissing(module, name))
+            }
         }
-    } else if ty is types.Ty.TVec(element, _) {
-        checkLibTypes(c, env, element)
-    } else if ty is types.Ty.TResult(ok, bad) {
-        checkLibTypes(c, env, ok)
-        checkLibTypes(c, env, bad)
-    } else if ty is types.Ty.TMap(key, value) {
-        checkLibTypes(c, env, key)
-        checkLibTypes(c, env, value)
-    } else if ty is types.Ty.TFn(_, params, _, result) {
-        for each p in params {
-            checkLibTypes(c, env, p)
+        types.Ty.TVec(element, _) {
+            checkLibTypes(c, env, element)
         }
-        checkLibTypes(c, env, result)
-    } else if ty is types.Ty.TAddress(message) {
-        if message is types.Ty.TUnknown {
-            report(c, messages.addressNeedsMessageType())
-        } else {
-            checkLibTypes(c, env, message)
+        types.Ty.TResult(ok, bad) {
+            checkLibTypes(c, env, ok)
+            checkLibTypes(c, env, bad)
         }
-    } else if ty is types.Ty.TSecret(held) {
-        if held is types.Ty.TUnknown {
-            report(c, messages.secretNeedsHeldType())
-        } else {
-            checkLibTypes(c, env, held)
-            checkKeepable(c, env, messages.secretAsKeeper(), held)
+        types.Ty.TMap(key, value) {
+            checkLibTypes(c, env, key)
+            checkLibTypes(c, env, value)
         }
+        types.Ty.TFn(_, params, _, result) {
+            for each p in params {
+                checkLibTypes(c, env, p)
+            }
+            checkLibTypes(c, env, result)
+        }
+        types.Ty.TAddress(message) {
+            if message is types.Ty.TUnknown {
+                report(c, messages.addressNeedsMessageType())
+            } else {
+                checkLibTypes(c, env, message)
+            }
+        }
+        types.Ty.TSecret(held) {
+            if held is types.Ty.TUnknown {
+                report(c, messages.secretNeedsHeldType())
+            } else {
+                checkLibTypes(c, env, held)
+                checkKeepable(c, env, messages.secretAsKeeper(), held)
+            }
+        }
+        _ { }
     }
 }
 
@@ -1061,61 +1089,69 @@ proc checkStmt(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
 }
 
 proc checkWrittenStmt(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
-    if s is ast.Stmt.VarDecl(name, value, mutable, deferred, _) {
-        checkExpr(c, env, value)
-        ty := infer.typeOf(env, value)
-        // `hive.map.new()` says empty and nothing about what it holds, so it has
-        // to land somewhere that says.
-        if infer.isEmptyMap(value) {
-            // Said here, in full, so it is not said again when the declaration ends.
-            append(c.landings, infer.Landing(c.inside, infer.emptyMapAt(value), types.Ty.TUnknown()))
-            report(c, messages.mapNewBindingNeedsLanding(name))
+    switch s {
+        ast.Stmt.VarDecl(name, value, mutable, deferred, _) {
+            checkExpr(c, env, value)
+            ty := infer.typeOf(env, value)
+            // `hive.map.new()` says empty and nothing about what it holds, so it has
+            // to land somewhere that says.
+            if infer.isEmptyMap(value) {
+                // Said here, in full, so it is not said again when the declaration ends.
+                append(c.landings, infer.Landing(c.inside, infer.emptyMapAt(value), types.Ty.TUnknown()))
+                report(c, messages.mapNewBindingNeedsLanding(name))
+            }
+            // A name says where a service is, and nothing about what it takes.
+            if isAtCall(value) && ty is types.Ty.TAddress(types.Ty.TUnknown) {
+                report(c, messages.atBindingNeedsLanding(name))
+            }
+            // `Result.Ok(v)` says one half of what it is, and the other has to be said.
+            if infer.isResultLiteral(value) {
+                checkResultHalves(c, name, ty)
+            }
+            checkHoldsValue(c, name, ty, deferred)
+            declareName(c, name)
+            if mutable {
+                append(c.mutable, name)
+            }
+            return infer.bound(env, name, ty)
         }
-        // A name says where a service is, and nothing about what it takes.
-        if isAtCall(value) && ty is types.Ty.TAddress(types.Ty.TUnknown) {
-            report(c, messages.atBindingNeedsLanding(name))
+        ast.Stmt.TypedDecl(declared, name, value, mutable, deferred, _) {
+            checkExpr(c, env, value)
+            ty := types.resolve(env.table, declared)
+            checkLibTypes(c, env, ty)
+            checkHoldsValue(c, name, infer.typeOf(env, value), deferred)
+            if deferred == false {
+                fitsValue(c, env, ty, value, messages.declarationOfWhat(name))
+            }
+            declareName(c, name)
+            if mutable {
+                append(c.mutable, name)
+            }
+            return infer.bound(env, name, ty)
         }
-        // `Result.Ok(v)` says one half of what it is, and the other has to be said.
-        if infer.isResultLiteral(value) {
-            checkResultHalves(c, name, ty)
+        ast.Stmt.Assign(target, value, _) {
+            checkAssign(c, env, target, value)
+            return env
         }
-        checkHoldsValue(c, name, ty, deferred)
-        declareName(c, name)
-        if mutable {
-            append(c.mutable, name)
+        ast.Stmt.ReturnStmt(value, _) {
+            checkReturn(c, env, value)
+            return env
         }
-        return infer.bound(env, name, ty)
-    } else if s is ast.Stmt.TypedDecl(declared, name, value, mutable, deferred, _) {
-        checkExpr(c, env, value)
-        ty := types.resolve(env.table, declared)
-        checkLibTypes(c, env, ty)
-        checkHoldsValue(c, name, infer.typeOf(env, value), deferred)
-        if deferred == false {
-            fitsValue(c, env, ty, value, messages.declarationOfWhat(name))
+        ast.Stmt.IfChain(branches, otherwise, hasElse, _) {
+            for each b in branches {
+                checkGuard(c, env, b.condition)
+                checkBlock(c, afterCondition(env, b.condition), b.body)
+            }
+            if hasElse {
+                checkBlock(c, env, otherwise)
+            }
+            return env
         }
-        declareName(c, name)
-        if mutable {
-            append(c.mutable, name)
+        ast.Stmt.SwitchStmt(lets, subjects, arms, binds, where) {
+            checkSwitch(c, env, lets, subjects, arms, where, binds)
+            return env
         }
-        return infer.bound(env, name, ty)
-    } else if s is ast.Stmt.Assign(target, value, _) {
-        checkAssign(c, env, target, value)
-        return env
-    } else if s is ast.Stmt.ReturnStmt(value, _) {
-        checkReturn(c, env, value)
-        return env
-    } else if s is ast.Stmt.IfChain(branches, otherwise, hasElse, _) {
-        for each b in branches {
-            checkGuard(c, env, b.condition)
-            checkBlock(c, afterCondition(env, b.condition), b.body)
-        }
-        if hasElse {
-            checkBlock(c, env, otherwise)
-        }
-        return env
-    } else if s is ast.Stmt.SwitchStmt(lets, subjects, arms, binds, where) {
-        checkSwitch(c, env, lets, subjects, arms, where, binds)
-        return env
+        _ { }
     }
     return checkStmtTail(c, env, s)
 }
@@ -1300,10 +1336,14 @@ proc checkStmtTail(c: mut Check, env: infer.Env, s: ast.Stmt): infer.Env {
         subjectType := infer.typeOf(env, subject)
         // A turn of the loop would have to be handed a map's key or its value,
         // and the syntax never said which.
-        if subjectType is types.Ty.TMap(_, _) {
-            report(c, messages.forEachOverMap())
-        } else if subjectType is types.Ty.TStr {
-            report(c, messages.forEachOverStr())
+        switch subjectType {
+            types.Ty.TMap(_, _) {
+                report(c, messages.forEachOverMap())
+            }
+            types.Ty.TStr {
+                report(c, messages.forEachOverStr())
+            }
+            _ { }
         }
         mut elementType := types.elementOf(subjectType)
         if declared is ast.TypeExpr.VoidType {
@@ -1594,84 +1634,102 @@ func isConjunction(e: ast.Expr): Bool {
 }
 
 proc checkWritten(c: mut Check, env: infer.Env, e: ast.Expr): void {
-    if e is ast.Expr.Call(callee, args, _) {
-        if infer.isEmptyMap(e) {
-            append(c.empties, infer.emptyMapAt(e))
-        }
-        checkCall(c, env, callee, args)
-    } else if e is ast.Expr.Binary(op, left, right, _) {
-        checkExpr(c, env, left)
-        // A binding an `is` made is usable in the rest of the same condition after
-        // `&&`, which is why the two are told apart here.
-        if op is ast.BinOp.And {
-            narrowed := afterCondition(env, left)
-            checkExpr(c, narrowed, right)
-            checkOperands(c, narrowed, op, left, right)
-        } else {
-            checkExpr(c, env, right)
-            checkOperands(c, env, op, left, right)
-        }
-    } else if e is ast.Expr.Negate(operand, _) {
-        checkExpr(c, env, operand)
-        ty := infer.typeOf(env, operand)
-        if types.isUnsigned(ty) {
-            report(c, messages.negateUnsigned(types.show(ty)))
-        } else if (types.isNumber(ty) || ty is types.Ty.TUnknown) == false {
-            report(c, messages.negateNotNumber(types.show(ty)))
-        }
-    } else if e is ast.Expr.AwaitAll(calls, timeout, _) {
-        checkAwaitAll(c, env, calls, timeout)
-    } else if e is ast.Expr.Timed(call, ms, _) {
-        checkExpr(c, env, call)
-        fits(c, types.Ty.TInt(), infer.typeOf(env, ms), messages.timeoutMillisWhat())
-        if infer.isSendExpr(env, call) == false && infer.typeOf(env, call) is types.Ty.TVoid {
-            report(c, messages.timeoutOnVoidCall())
-        }
-    } else if e is ast.Expr.Baked(call, _) {
-        checkExpr(c, env, call)
-        checkBaked(c, env, call)
-    } else if e is ast.Expr.Not(operand, _) {
-        checkExpr(c, env, operand)
-        checkNegated(c, env, operand)
-    } else if e is ast.Expr.BitNot(operand, _) {
-        checkExpr(c, env, operand)
-        ty := infer.typeOf(env, operand)
-        if (types.isInteger(ty) || ty is types.Ty.TUnknown) == false {
-            mut instead := ""
-            if ty is types.Ty.TBool {
-                instead = messages.bitNotBoolHint()
+    switch e {
+        ast.Expr.Call(callee, args, _) {
+            if infer.isEmptyMap(e) {
+                append(c.empties, infer.emptyMapAt(e))
             }
-            report(c, messages.bitNotNotInteger(types.show(ty), instead))
+            checkCall(c, env, callee, args)
         }
-    } else if e is ast.Expr.Bits(parts, _) {
-        checkBitsLit(c, env, parts)
-    } else if e is ast.Expr.Index(subject, index, _) {
-        checkExpr(c, env, subject)
-        checkExpr(c, env, index)
-        checkIndexable(c, env, subject)
-    } else if e is ast.Expr.Slice(subject, low, high, _) {
-        checkExpr(c, env, subject)
-        checkExpr(c, env, low)
-        checkExpr(c, env, high)
-        checkIndexable(c, env, subject)
-    } else if e is ast.Expr.VectorLit(items, _) {
-        for each item in items {
-            checkExpr(c, env, item)
-        }
-    } else if e is ast.Expr.Interp(parts, _) {
-        for each part in parts {
-            if part is ast.InterpPart.Expression(value) {
-                checkExpr(c, env, value)
-                checkShown(c, env, value, messages.interpolationShows())
+        ast.Expr.Binary(op, left, right, _) {
+            checkExpr(c, env, left)
+            // A binding an `is` made is usable in the rest of the same condition after
+            // `&&`, which is why the two are told apart here.
+            if op is ast.BinOp.And {
+                narrowed := afterCondition(env, left)
+                checkExpr(c, narrowed, right)
+                checkOperands(c, narrowed, op, left, right)
+            } else {
+                checkExpr(c, env, right)
+                checkOperands(c, env, op, left, right)
             }
         }
-    } else if e is ast.Expr.IsMatch(subject, pattern, _) {
-        checkExpr(c, env, subject)
-        checkPattern(c, env, subject, pattern)
-    } else if e is ast.Expr.Ident(name, _) {
-        checkName(c, env, name)
-    } else if e is ast.Expr.Member(subject, field, _) {
-        checkMember(c, env, subject, field)
+        ast.Expr.Negate(operand, _) {
+            checkExpr(c, env, operand)
+            ty := infer.typeOf(env, operand)
+            if types.isUnsigned(ty) {
+                report(c, messages.negateUnsigned(types.show(ty)))
+            } else if (types.isNumber(ty) || ty is types.Ty.TUnknown) == false {
+                report(c, messages.negateNotNumber(types.show(ty)))
+            }
+        }
+        ast.Expr.AwaitAll(calls, timeout, _) {
+            checkAwaitAll(c, env, calls, timeout)
+        }
+        ast.Expr.Timed(call, ms, _) {
+            checkExpr(c, env, call)
+            fits(c, types.Ty.TInt(), infer.typeOf(env, ms), messages.timeoutMillisWhat())
+            if infer.isSendExpr(env, call) == false && infer.typeOf(env, call) is types.Ty.TVoid {
+                report(c, messages.timeoutOnVoidCall())
+            }
+        }
+        ast.Expr.Baked(call, _) {
+            checkExpr(c, env, call)
+            checkBaked(c, env, call)
+        }
+        ast.Expr.Not(operand, _) {
+            checkExpr(c, env, operand)
+            checkNegated(c, env, operand)
+        }
+        ast.Expr.BitNot(operand, _) {
+            checkExpr(c, env, operand)
+            ty := infer.typeOf(env, operand)
+            if (types.isInteger(ty) || ty is types.Ty.TUnknown) == false {
+                mut instead := ""
+                if ty is types.Ty.TBool {
+                    instead = messages.bitNotBoolHint()
+                }
+                report(c, messages.bitNotNotInteger(types.show(ty), instead))
+            }
+        }
+        ast.Expr.Bits(parts, _) {
+            checkBitsLit(c, env, parts)
+        }
+        ast.Expr.Index(subject, index, _) {
+            checkExpr(c, env, subject)
+            checkExpr(c, env, index)
+            checkIndexable(c, env, subject)
+        }
+        ast.Expr.Slice(subject, low, high, _) {
+            checkExpr(c, env, subject)
+            checkExpr(c, env, low)
+            checkExpr(c, env, high)
+            checkIndexable(c, env, subject)
+        }
+        ast.Expr.VectorLit(items, _) {
+            for each item in items {
+                checkExpr(c, env, item)
+            }
+        }
+        ast.Expr.Interp(parts, _) {
+            for each part in parts {
+                if part is ast.InterpPart.Expression(value) {
+                    checkExpr(c, env, value)
+                    checkShown(c, env, value, messages.interpolationShows())
+                }
+            }
+        }
+        ast.Expr.IsMatch(subject, pattern, _) {
+            checkExpr(c, env, subject)
+            checkPattern(c, env, subject, pattern)
+        }
+        ast.Expr.Ident(name, _) {
+            checkName(c, env, name)
+        }
+        ast.Expr.Member(subject, field, _) {
+            checkMember(c, env, subject, field)
+        }
+        _ { }
     }
 }
 
@@ -2060,24 +2118,31 @@ proc checkNamedCall(c: mut Check, env: infer.Env, name: Str, args: ast.Arg[]): v
     // through one calls whatever the binding holds. That order is `callTarget`,
     // which inference and the emitter read the same call through.
     target := infer.callTarget(env, name)
-    if target is infer.CallTarget.Bound {
-        checkCallableValue(c, env, name)
-        if infer.typeOf(env, ast.Expr.Ident(name, c.at)) is types.Ty.TFn(_, params, mutables, _) {
-            checkValueArguments(c, env, messages.backticked(name), params, mutables, args)
+    switch target {
+        infer.CallTarget.Bound {
+            checkCallableValue(c, env, name)
+            if infer.typeOf(env, ast.Expr.Ident(name, c.at)) is types.Ty.TFn(_, params, mutables, _) {
+                checkValueArguments(c, env, messages.backticked(name), params, mutables, args)
+            }
         }
-    } else if target is infer.CallTarget.Declared(info) {
-        if c.inLaw == false && indexOf(c.laws, name) is Result.Ok(_) {
-            report(c, messages.lawCalledOutsideLaw(types.shownName(name)))
+        infer.CallTarget.Declared(info) {
+            if c.inLaw == false && indexOf(c.laws, name) is Result.Ok(_) {
+                report(c, messages.lawCalledOutsideLaw(types.shownName(name)))
+            }
+            checkArguments(c, env, name, info, args)
         }
-        checkArguments(c, env, name, info, args)
-    } else if target is infer.CallTarget.Struct(fields) {
-        checkFieldArguments(c, env, name, fields, args)
-    } else if target is infer.CallTarget.Builtin {
-        checkBuiltinCall(c, env, name, args)
-    } else if target is infer.CallTarget.Union {
-        report(c, messages.unionCalled(types.shownName(name)))
-    } else {
-        report(c, messages.nameNotDeclared(name))
+        infer.CallTarget.Struct(fields) {
+            checkFieldArguments(c, env, name, fields, args)
+        }
+        infer.CallTarget.Builtin {
+            checkBuiltinCall(c, env, name, args)
+        }
+        infer.CallTarget.Union {
+            report(c, messages.unionCalled(types.shownName(name)))
+        }
+        _ {
+            report(c, messages.nameNotDeclared(name))
+        }
     }
 }
 
@@ -3071,14 +3136,18 @@ proc checkStatementExpr(c: mut Check, env: infer.Env, value: ast.Expr): void {
     }
     if value is ast.Expr.Call(callee, args, _) {
         mut name := ""
-        if callee is ast.Expr.Ident(bare, _) {
-            name = bare
-        } else if callee is ast.Expr.Member(head, member, _) {
-            if head is ast.Expr.Ident(hiveName, _) {
-                if hiveName == "hive" {
-                    name = member
+        switch callee {
+            ast.Expr.Ident(bare, _) {
+                name = bare
+            }
+            ast.Expr.Member(head, member, _) {
+                if head is ast.Expr.Ident(hiveName, _) {
+                    if hiveName == "hive" {
+                        name = member
+                    }
                 }
             }
+            _ { }
         }
         if name == "sort" && infer.isBound(env, name) == false && len(args) >= 1 {
             target := ast.argFor(infer.builtinArgs("sort", args), "", 0)
@@ -3170,10 +3239,14 @@ proc checkAsync(c: mut Check, env: infer.Env, call: ast.Expr): void {
                 report(c, messages.asyncBuiltin(name))
                 return
             }
-            if target is infer.CallTarget.Struct(_) {
-                report(c, messages.asyncConstructor(name))
-            } else if target is infer.CallTarget.Union {
-                report(c, messages.asyncConstructor(name))
+            switch target {
+                infer.CallTarget.Struct(_) {
+                    report(c, messages.asyncConstructor(name))
+                }
+                infer.CallTarget.Union {
+                    report(c, messages.asyncConstructor(name))
+                }
+                _ { }
             }
         }
         if callee is ast.Expr.Member(head, variant, _) {
@@ -3190,20 +3263,25 @@ proc checkAsync(c: mut Check, env: infer.Env, call: ast.Expr): void {
 
 proc checkPattern(c: mut Check, env: infer.Env, subject: ast.Expr, p: ast.Pattern): void {
     subjectType := infer.typeOf(env, subject)
-    if p is ast.Pattern.Constructor(path, bindings, parenthesised) {
-        checkConstructorPattern(c, env, subjectType, path, bindings, parenthesised)
-    } else if p is ast.Pattern.VectorPat(_, _) {
-        if subjectType is types.Ty.TVec(_, _) || subjectType is types.Ty.TUnknown {
-            return
+    switch p {
+        ast.Pattern.Constructor(path, bindings, parenthesised) {
+            checkConstructorPattern(c, env, subjectType, path, bindings, parenthesised)
         }
-        report(c, messages.vectorPatternWrongSubject(types.show(subjectType)))
-    } else if p is ast.Pattern.StrTemplate(_) {
-        if subjectType is types.Ty.TStr || subjectType is types.Ty.TUnknown {
-            return
+        ast.Pattern.VectorPat(_, _) {
+            if subjectType is types.Ty.TVec(_, _) || subjectType is types.Ty.TUnknown {
+                return
+            }
+            report(c, messages.vectorPatternWrongSubject(types.show(subjectType)))
         }
-        report(c, messages.strPatternWrongSubject(types.show(subjectType)))
-    } else if p is ast.Pattern.BitsPat(fields, rest) {
-        checkBitsPattern(c, env, subjectType, fields, rest)
+        ast.Pattern.StrTemplate(_) {
+            if subjectType is types.Ty.TStr || subjectType is types.Ty.TUnknown {
+                return
+            }
+            report(c, messages.strPatternWrongSubject(types.show(subjectType)))
+        }
+        ast.Pattern.BitsPat(fields, rest) {
+            checkBitsPattern(c, env, subjectType, fields, rest)
+        }
     }
 }
 

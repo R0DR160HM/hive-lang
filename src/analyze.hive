@@ -24,11 +24,6 @@ func loopWeight(depth: Int): Int {
     return 512
 }
 
-// How long a `[dyn]` is taken to be when weighing a copy of one.
-func assumedLength(): Int {
-    return 8
-}
-
 // The most any one type may be said to cost to copy.
 func heaviestCopy(): Int {
     return 512
@@ -162,12 +157,14 @@ proc analyzeModule(m: ast.Module, found: unreached.Found): Report {
 
     mut Scored[dyn] scored = []
     mut deepest := 0
+    mut hive.map.Map<Str, Int> plans = hive.map.new()
     for each d in m.decls {
         if d is ast.Decl.CallableDecl(kind, name, params, _, body, line) {
             env := infer.boundParams(infer.newEnv(t), params, 0)
-            mut Walk w = Walk(t, written, leaked, lent, loud, settled, [], [], 0, handsBack, emit.cellNames(t, env, params, body), "")
+            mut Walk w = Walk(t, written, leaked, lent, loud, settled, [], [], 0, handsBack, emit.cellNames(t, env, params, body), "", plans)
             at := At(env, mutableParams(params), 0, [], false)
             walkBlock(w, at, body)
+            plans = w.plans
             if w.deepest > deepest {
                 deepest = w.deepest
             }
@@ -354,106 +351,138 @@ proc reachBlock(r: mut Reaching, b: ast.Block): void {
 }
 
 proc reachStmt(r: mut Reaching, s: ast.Stmt): void {
-    if s is ast.Stmt.VarDecl(_, value, _, deferred, _) {
-        if deferred { r.acts = true }
-        reachExpr(r, value)
-    } else if s is ast.Stmt.TypedDecl(_, _, value, _, deferred, _) {
-        if deferred { r.acts = true }
-        reachExpr(r, value)
-    } else if s is ast.Stmt.Assign(target, value, _) {
-        reachExpr(r, target)
-        reachExpr(r, value)
-    } else if s is ast.Stmt.IfChain(branches, otherwise, _, _) {
-        for each br in branches {
-            reachExpr(r, br.condition)
-            reachBlock(r, br.body)
+    switch s {
+        ast.Stmt.VarDecl(_, value, _, deferred, _) {
+            if deferred { r.acts = true }
+            reachExpr(r, value)
         }
-        reachBlock(r, otherwise)
-    } else if s is ast.Stmt.SwitchStmt(lets, _, arms, _, _) {
-        reachBlock(r, ast.switchBlock(lets, arms))
-    } else if s is ast.Stmt.ForLoop(init, cond, post, body, _) {
-        reachStmt(r, init)
-        reachExpr(r, cond)
-        reachStmt(r, post)
-        reachBlock(r, body)
-    } else if s is ast.Stmt.ForEach(_, _, subject, body, _) {
-        reachExpr(r, subject)
-        reachBlock(r, body)
-    } else if s is ast.Stmt.ReturnStmt(value, _) {
-        reachExpr(r, value)
-    } else if s is ast.Stmt.EchoStmt(value, _) {
-        // Printing is the plainest thing a hoist would do fewer of.
-        r.acts = true
-        reachExpr(r, value)
-    } else if s is ast.Stmt.AssertStmt(condition, _) {
-        r.acts = true
-        reachExpr(r, condition)
-    } else if s is ast.Stmt.PanicStmt(value, _) {
-        r.acts = true
-        reachExpr(r, value)
-    } else if s is ast.Stmt.AsyncStmt(c, _) {
-        r.acts = true
-        reachExpr(r, c)
-    } else if s is ast.Stmt.Expression(value, _) {
-        reachExpr(r, value)
+        ast.Stmt.TypedDecl(_, _, value, _, deferred, _) {
+            if deferred { r.acts = true }
+            reachExpr(r, value)
+        }
+        ast.Stmt.Assign(target, value, _) {
+            reachExpr(r, target)
+            reachExpr(r, value)
+        }
+        ast.Stmt.IfChain(branches, otherwise, _, _) {
+            for each br in branches {
+                reachExpr(r, br.condition)
+                reachBlock(r, br.body)
+            }
+            reachBlock(r, otherwise)
+        }
+        ast.Stmt.SwitchStmt(lets, _, arms, _, _) {
+            reachBlock(r, ast.switchBlock(lets, arms))
+        }
+        ast.Stmt.ForLoop(init, cond, post, body, _) {
+            reachStmt(r, init)
+            reachExpr(r, cond)
+            reachStmt(r, post)
+            reachBlock(r, body)
+        }
+        ast.Stmt.ForEach(_, _, subject, body, _) {
+            reachExpr(r, subject)
+            reachBlock(r, body)
+        }
+        ast.Stmt.ReturnStmt(value, _) {
+            reachExpr(r, value)
+        }
+        ast.Stmt.EchoStmt(value, _) {
+            // Printing is the plainest thing a hoist would do fewer of.
+            r.acts = true
+            reachExpr(r, value)
+        }
+        ast.Stmt.AssertStmt(condition, _) {
+            r.acts = true
+            reachExpr(r, condition)
+        }
+        ast.Stmt.PanicStmt(value, _) {
+            r.acts = true
+            reachExpr(r, value)
+        }
+        ast.Stmt.AsyncStmt(c, _) {
+            r.acts = true
+            reachExpr(r, c)
+        }
+        ast.Stmt.Expression(value, _) {
+            reachExpr(r, value)
+        }
+        _ { }
     }
 }
 
 proc reachExpr(r: mut Reaching, e: ast.Expr): void {
-    if e is ast.Expr.Call(callee, args, _) {
-        reachCallee(r, callee)
-        for each a in args {
-            reachExpr(r, a.value)
-        }
-    } else if e is ast.Expr.Member(subject, _, _) {
-        reachExpr(r, subject)
-    } else if e is ast.Expr.Index(subject, index, _) {
-        reachExpr(r, subject)
-        reachExpr(r, index)
-    } else if e is ast.Expr.Slice(subject, low, high, _) {
-        reachExpr(r, subject)
-        reachExpr(r, low)
-        reachExpr(r, high)
-    } else if e is ast.Expr.Binary(_, left, right, _) {
-        reachExpr(r, left)
-        reachExpr(r, right)
-    } else if e is ast.Expr.Negate(operand, _) {
-        reachExpr(r, operand)
-    } else if e is ast.Expr.Not(operand, _) {
-        reachExpr(r, operand)
-    } else if e is ast.Expr.BitNot(operand, _) {
-        reachExpr(r, operand)
-    } else if e is ast.Expr.Bits(parts, _) {
-        for each part in parts {
-            reachExpr(r, part.value)
-        }
-    } else if e is ast.Expr.IsMatch(subject, pattern, _) {
-        reachExpr(r, subject)
-        for each held in ast.patternExprs(pattern) {
-            reachExpr(r, held)
-        }
-    } else if e is ast.Expr.VectorLit(items, _) {
-        for each i in items {
-            reachExpr(r, i)
-        }
-    } else if e is ast.Expr.Interp(parts, _) {
-        for each p in parts {
-            if p is ast.InterpPart.Expression(value) {
-                reachExpr(r, value)
+    switch e {
+        ast.Expr.Call(callee, args, _) {
+            reachCallee(r, callee)
+            for each a in args {
+                reachExpr(r, a.value)
             }
         }
-    } else if e is ast.Expr.AwaitAll(calls, timeout, _) {
-        r.acts = true
-        for each c in calls {
+        ast.Expr.Member(subject, _, _) {
+            reachExpr(r, subject)
+        }
+        ast.Expr.Index(subject, index, _) {
+            reachExpr(r, subject)
+            reachExpr(r, index)
+        }
+        ast.Expr.Slice(subject, low, high, _) {
+            reachExpr(r, subject)
+            reachExpr(r, low)
+            reachExpr(r, high)
+        }
+        ast.Expr.Binary(_, left, right, _) {
+            reachExpr(r, left)
+            reachExpr(r, right)
+        }
+        ast.Expr.Negate(operand, _) {
+            reachExpr(r, operand)
+        }
+        ast.Expr.Not(operand, _) {
+            reachExpr(r, operand)
+        }
+        ast.Expr.BitNot(operand, _) {
+            reachExpr(r, operand)
+        }
+        ast.Expr.Bits(parts, _) {
+            for each part in parts {
+                reachExpr(r, part.value)
+            }
+        }
+        ast.Expr.IsMatch(subject, pattern, _) {
+            reachExpr(r, subject)
+            for each held in ast.patternExprs(pattern) {
+                reachExpr(r, held)
+            }
+        }
+        ast.Expr.VectorLit(items, _) {
+            for each i in items {
+                reachExpr(r, i)
+            }
+        }
+        ast.Expr.Interp(parts, _) {
+            for each p in parts {
+                if p is ast.InterpPart.Expression(value) {
+                    reachExpr(r, value)
+                }
+            }
+        }
+        ast.Expr.AwaitAll(calls, timeout, _) {
+            r.acts = true
+            for each c in calls {
+                reachExpr(r, c)
+            }
+            reachExpr(r, timeout)
+        }
+        ast.Expr.Timed(c, ms, _) {
+            r.acts = true
+            reachExpr(r, c)
+            reachExpr(r, ms)
+        }
+        ast.Expr.Baked(c, _) {
             reachExpr(r, c)
         }
-        reachExpr(r, timeout)
-    } else if e is ast.Expr.Timed(c, ms, _) {
-        r.acts = true
-        reachExpr(r, c)
-        reachExpr(r, ms)
-    } else if e is ast.Expr.Baked(c, _) {
-        reachExpr(r, c)
+        _ { }
     }
 }
 
@@ -507,6 +536,7 @@ type Walk {
     handsBack: Str[dyn]
     cells: Str[dyn]
     handing: Str
+    plans: hive.map.Map<Str, Int>
 }
 
 // Where in a body the walk is. A value, so a block that ends restores it.
@@ -546,14 +576,14 @@ proc walkStmt(w: mut Walk, at: At, s: ast.Stmt): At {
         inner := starting(at, deferred)
         walkExpr(w, inner, value)
         ty := infer.typeOf(at.env, value)
-        binding(w, inner, value, ty, mutable)
+        binding(w, inner, name, value, ty, mutable)
         return declared(at, name, ty, mutable)
     }
     if s is ast.Stmt.TypedDecl(written, name, value, mutable, deferred, _) {
         inner := starting(at, deferred)
         walkExpr(w, inner, value)
         ty := types.resolve(w.table, written)
-        binding(w, inner, value, ty, mutable)
+        binding(w, inner, name, value, ty, mutable)
         return declared(at, name, ty, mutable)
     }
     if s is ast.Stmt.Assign(target, value, _) {
@@ -790,6 +820,18 @@ func calledName(t: types.Table, at: At, callee: ast.Expr): Str {
 proc arguments(w: mut Walk, at: At, info: types.CallableInfo, args: ast.Arg[]): void {
     handing := w.handing
     w.handing = ""
+    plan := answerPlanOf(w, at, info, args, handing)
+    if plan == 2 {
+        answer := types.resolve(at.env.table, info.result)
+        weight := writes.answerWeight(w.table, w.written, answer, heaviestCopy())
+        if weight > 0 {
+            note(w, at, Kind.Copy(shownType(answer), "the answer of `" + spelled(info.name) + "`", weight, whyCopied(w, answer)),
+                sketch(ast.Expr.Call(ast.Expr.Ident(info.name, token.nowhere()), copiedArgs(args), token.nowhere())))
+        }
+    }
+    if plan > 0 {
+        return
+    }
     mut Int open = 0
     for each p in info.params {
         found := ast.argFor(args, p.name, open)
@@ -820,6 +862,35 @@ proc arguments(w: mut Walk, at: At, info: types.CallableInfo, args: ast.Arg[]): 
                 weight, whyCopied(w, ty)), sketch(found))
         }
     }
+}
+
+// What `emit.answering` decides for this call.
+proc answerPlanOf(w: mut Walk, at: At, info: types.CallableInfo, args: ast.Arg[], handing: Str): Int {
+    if at.spawning || hive.map.has(w.lent, info.name) || indexOf(w.handsBack, info.name) is Result.Error(_) {
+        return 0
+    }
+    answer := types.resolve(at.env.table, info.result)
+    // Written out of order, the emitter copies each argument as it hoists it.
+    if (answer is types.Ty.TVoid || emit.concrete(answer)) && emit.writtenOutOfOrder(args, emit.paramNames(info.params)) {
+        return 0
+    }
+    copied := emit.copiedParams(info, args, at.env.table, at.mutables, handing)
+    if len(copied) == 0 {
+        return 0
+    }
+    mut Str[dyn] positions = []
+    mut types.Ty[dyn] tys = []
+    for each c in copied {
+        append(positions, "{c.position}")
+        append(tys, c.ty)
+    }
+    key := info.name + "|" + join(positions, ",")
+    if hive.map.get(w.plans, key) is Result.Ok(known) {
+        return known
+    }
+    plan := writes.answerPlan(at.env.table, w.written, tys, answer)
+    hive.map.set(w.plans, key, plan)
+    return plan
 }
 
 // A call inside a loop that the loop changes nothing of.
@@ -985,8 +1056,8 @@ func waitsOn(module: Str, name: Str): Str {
 
 // A binding that has to copy, by 8.4's rule. The two halves of it that take a
 // judgement are asked of `emit` rather than restated, so the two cannot drift.
-proc binding(w: mut Walk, at: At, value: ast.Expr, ty: types.Ty, mutable: Bool): void {
-    if emit.namesStorage(value) == false {
+proc binding(w: mut Walk, at: At, name: Str, value: ast.Expr, ty: types.Ty, mutable: Bool): void {
+    if name == "_" || emit.namesStorage(value) == false {
         return
     }
     if types.ownsStorage(w.table, ty) == false {
@@ -999,8 +1070,15 @@ proc binding(w: mut Walk, at: At, value: ast.Expr, ty: types.Ty, mutable: Bool):
         }
         return
     }
-    if mutable == mutableSource(at, value) {
+    sourceMut := mutableSource(at, value)
+    if mutable == false && sourceMut == false {
         return
+    }
+    // A name bound twice in one body cannot hold the cell the two would share.
+    if mutable && sourceMut {
+        if (value is ast.Expr.Ident(_, _)) == false || indexOf(w.cells, name) is Result.Ok(_) {
+            return
+        }
     }
     weight := copyWeight(w.table, w.written, ty, [])
     if weight == 0 {
@@ -1029,54 +1107,13 @@ func mutableSource(at: At, value: ast.Expr): Bool {
     return indexOf(at.mutables, root) is Result.Ok(_)
 }
 
-// What a deep copy of `ty` will really walk. Nought means `writes` proved every
-// piece of storage in it is shared, so `clone_T` copies no field.
+// What a deep copy of `ty` will really walk, as `writes` weighs it.
 func copyWeight(t: types.Table, written: Str[], ty: types.Ty, seen: Str[]): Int {
-    if types.ownsStorage(t, ty) == false {
-        return 0
-    }
-    if ty is types.Ty.TVec(element, dim) {
-        return capped(howMany(dim) * (1 + copyWeight(t, written, element, seen)))
-    }
-    if ty is types.Ty.TMap(_, value) {
-        return capped(assumedLength() * (1 + copyWeight(t, written, value, seen)))
-    }
-    if ty is types.Ty.TResult(ok, bad) {
-        return larger(copyWeight(t, written, ok, seen), copyWeight(t, written, bad, seen))
-    }
-    if ty is types.Ty.TNamed(name) {
-        if indexOf(seen, name) is Result.Ok(_) {
-            return assumedLength()
-        }
-        deeper := withName(seen, name)
-        if types.findType(t, name) is Result.Ok(info) {
-            mut Int sum = 0
-            for each f in info.shared {
-                sum = sum + fieldWeight(t, written, name, f, deeper)
-            }
-            mut Int worst = 0
-            for each v in info.variants {
-                mut Int here = 0
-                for each f in v.fields {
-                    here = here + fieldWeight(t, written, name, f, deeper)
-                }
-                if here > worst {
-                    worst = here
-                }
-            }
-            return capped(sum + worst)
-        }
-        return assumedLength()
-    }
-    return 0
+    return writes.weight(t, written, ty, seen, heaviestCopy())
 }
 
 func fieldWeight(t: types.Table, written: Str[], owner: Str, f: ast.Field, seen: Str[]): Int {
-    ty := types.resolve(t, f.declared)
-    if writes.mustCopy(t, written, owner, f.name, ty) == false {
-        return 0
-    }
-    return 1 + copyWeight(t, written, ty, seen)
+    return writes.fieldWeight(t, written, owner, f, seen, heaviestCopy())
 }
 
 // Why a copy of `ty` cannot be shared, or `""` when there is nothing to say
@@ -1161,27 +1198,6 @@ func escapedBecause(w: Walk, named: Str, shape: Str): Str {
             + spelt + " is shared anywhere while that signature stands."
     }
     return head + spelt + " escaped through a write the pass could not follow back to any field."
-}
-
-// How many elements a copy of a vector walks.
-func howMany(dim: ast.Dim): Int {
-    if dim is ast.Dim.Fixed(size) {
-        if size > heaviestCopy() {
-            return heaviestCopy()
-        }
-        if size < 1 {
-            return 1
-        }
-        return size
-    }
-    return assumedLength()
-}
-
-func capped(weight: Int): Int {
-    if weight > heaviestCopy() {
-        return heaviestCopy()
-    }
-    return weight
 }
 
 // --- A name rebuilt from itself ------------------------------------------------
@@ -1501,10 +1517,14 @@ proc boundByPattern(p: ast.Pattern, out: mut Str[dyn]): void {
     }
     if p is ast.Pattern.StrTemplate(parts) {
         for each part in parts {
-            if part is token.StrPart.Code(source, _, _) {
-                put(out, text.trim(source))
-            } else if part is token.StrPart.Hole(name, _) {
-                put(out, name)
+            switch part {
+                token.StrPart.Code(source, _, _) {
+                    put(out, text.trim(source))
+                }
+                token.StrPart.Hole(name, _) {
+                    put(out, name)
+                }
+                _ { }
             }
         }
         return
